@@ -1,30 +1,43 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Coroutine
 import inspect
 import json
 import logging
 import os
 import re
-import sys
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
   from .memory import MemoryStore
+  from watchdog.events import (
+    FileSystemEvent,
+    FileSystemEventHandler,
+    FileSystemEventHandler as _WatchdogEventHandler,
+    FileSystemMovedEvent,
+  )
+  from watchdog.observers import Observer
+  from watchdog.observers.api import BaseObserver
 else:
   MemoryStore = Any
-
-try:
-  from watchdog.events import FileSystemEvent, FileSystemEventHandler, FileSystemMovedEvent
-  from watchdog.observers import Observer
-except Exception:  # pragma: no cover - exercised when watchdog is unavailable
-  FileSystemEvent = object  # type: ignore[assignment]
-  FileSystemMovedEvent = object  # type: ignore[assignment]
-  FileSystemEventHandler = object  # type: ignore[assignment]
-  Observer = None  # type: ignore[assignment]
+  try:
+    from watchdog.events import (
+      FileSystemEvent,
+      FileSystemEventHandler,
+      FileSystemEventHandler as _WatchdogEventHandler,
+      FileSystemMovedEvent,
+    )
+    from watchdog.observers import Observer
+  except Exception:  # pragma: no cover - exercised when watchdog is unavailable
+    FileSystemEvent = object
+    FileSystemEventHandler = object
+    FileSystemMovedEvent = object
+    _WatchdogEventHandler = object
+    Observer = None
 
 
 log = logging.getLogger("agent_gateway.memory")
@@ -33,13 +46,10 @@ _SYNC_HEADER_PREFIX = "<!-- gateway-memory:"
 _TEMP_SUFFIXES = {".tmp", ".swp", ".swx", ".bak", ".part"}
 _WRITING_LOCK = threading.Lock()
 _WRITING_PATHS: set[Path] = set()
-
-
-def _compat_global(name: str, default: Any) -> Any:
-  parent = sys.modules.get("agent_gateway.memory")
-  if parent is not None and hasattr(parent, name):
-    return getattr(parent, name)
-  return default
+_WatchCallback = Callable[
+  [dict[str, Any]],
+  Coroutine[Any, Any, Any] | None,
+]
 
 
 def _normalize_path(path: Path | str) -> Path:
@@ -48,10 +58,9 @@ def _normalize_path(path: Path | str) -> Path:
 
 @contextmanager
 def _writing_path(path: Path | str):
-  normalize_path = _compat_global("_normalize_path", _normalize_path)
-  writing_lock = _compat_global("_WRITING_LOCK", _WRITING_LOCK)
-  writing_paths = _compat_global("_WRITING_PATHS", _WRITING_PATHS)
-  normalized = normalize_path(path)
+  writing_lock = _WRITING_LOCK
+  writing_paths = _WRITING_PATHS
+  normalized = _normalize_path(path)
   with writing_lock:
     writing_paths.add(normalized)
   try:
@@ -62,20 +71,16 @@ def _writing_path(path: Path | str):
 
 
 def _is_self_write(path: Path) -> bool:
-  normalize_path = _compat_global("_normalize_path", _normalize_path)
-  writing_lock = _compat_global("_WRITING_LOCK", _WRITING_LOCK)
-  writing_paths = _compat_global("_WRITING_PATHS", _WRITING_PATHS)
-  normalized = normalize_path(path)
-  with writing_lock:
-    return normalized in writing_paths
+  normalized = _normalize_path(path)
+  with _WRITING_LOCK:
+    return normalized in _WRITING_PATHS
 
 
 def _is_ignored_path(path: Path) -> bool:
-  temp_suffixes = _compat_global("_TEMP_SUFFIXES", _TEMP_SUFFIXES)
   name = path.name.lower()
   if name.startswith("."):
     return True
-  return path.suffix.lower() in temp_suffixes
+  return path.suffix.lower() in _TEMP_SUFFIXES
 
 
 def _is_markdown_path(path: Path) -> bool:
@@ -90,29 +95,28 @@ def _slugify(value: str) -> str:
 def _atomic_write(path: Path, content: str) -> None:
   path.parent.mkdir(parents=True, exist_ok=True)
   tmp_path = path.with_suffix(path.suffix + ".tmp")
-  writing_path = _compat_global("_writing_path", _writing_path)
-  with writing_path(path):
+  with _writing_path(path):
     tmp_path.write_text(content, encoding="utf-8")
     os.replace(tmp_path, path)
 
 
-class _SyncEventHandler(FileSystemEventHandler):
+class _SyncEventHandler(_WatchdogEventHandler):
   def __init__(self, manager: "MarkdownSyncManager") -> None:
     super().__init__()
     self._manager = manager
 
   def on_created(self, event: FileSystemEvent) -> None:
-    self._manager._handle_watch_path(Path(event.src_path))
+    self._manager._handle_watch_path(Path(os.fsdecode(event.src_path)))
 
   def on_modified(self, event: FileSystemEvent) -> None:
-    self._manager._handle_watch_path(Path(event.src_path))
+    self._manager._handle_watch_path(Path(os.fsdecode(event.src_path)))
 
   def on_deleted(self, event: FileSystemEvent) -> None:
-    self._manager._handle_watch_path(Path(event.src_path))
+    self._manager._handle_watch_path(Path(os.fsdecode(event.src_path)))
 
   def on_moved(self, event: FileSystemMovedEvent) -> None:
-    self._manager._handle_watch_path(Path(event.src_path))
-    self._manager._handle_watch_path(Path(event.dest_path))
+    self._manager._handle_watch_path(Path(os.fsdecode(event.src_path)))
+    self._manager._handle_watch_path(Path(os.fsdecode(event.dest_path)))
 
 
 class MarkdownSyncManager:
@@ -121,17 +125,15 @@ class MarkdownSyncManager:
   def __init__(self, store: MemoryStore, workspace_dir: str | Path):
     self._store = store
     self._workspace_dir = Path(workspace_dir)
-    self._observer: Observer | None = None  # type: ignore[type-arg]
+    self._observer: BaseObserver | None = None
     self._timers: dict[Path, threading.Timer] = {}
     self._timers_lock = threading.Lock()
-    self._watch_callback: Callable | None = None
+    self._watch_callback: _WatchCallback | None = None
 
   def _entity_path(self, name: str, entity_type: str) -> Path:
-    slugify = _compat_global("_slugify", _slugify)
-    return self._workspace_dir / slugify(entity_type) / f"{slugify(name)}.md"
+    return self._workspace_dir / _slugify(entity_type) / f"{_slugify(name)}.md"
 
   def _render_entity_file(self, entity: dict[str, Any]) -> str:
-    sync_header_prefix = _compat_global("_SYNC_HEADER_PREFIX", _SYNC_HEADER_PREFIX)
     metadata = {
       "name": str(entity["name"]),
       "entity_type": str(entity["entity_type"]),
@@ -140,11 +142,10 @@ class MarkdownSyncManager:
     header = json.dumps(metadata, ensure_ascii=False, sort_keys=True)
     content = str(entity["content"]).rstrip()
     if content:
-      return f"{sync_header_prefix} {header} -->\n\n{content}\n"
-    return f"{sync_header_prefix} {header} -->\n"
+      return f"{_SYNC_HEADER_PREFIX} {header} -->\n\n{content}\n"
+    return f"{_SYNC_HEADER_PREFIX} {header} -->\n"
 
   def _parse_entity_file(self, path: Path) -> dict[str, Any] | None:
-    sync_header_prefix = _compat_global("_SYNC_HEADER_PREFIX", _SYNC_HEADER_PREFIX)
     try:
       raw = path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -157,8 +158,8 @@ class MarkdownSyncManager:
     tags: list[str] = []
     content = raw
 
-    if lines and lines[0].startswith(sync_header_prefix) and lines[0].rstrip().endswith("-->"):
-      payload = lines[0][len(sync_header_prefix):]
+    if lines and lines[0].startswith(_SYNC_HEADER_PREFIX) and lines[0].rstrip().endswith("-->"):
+      payload = lines[0][len(_SYNC_HEADER_PREFIX):]
       payload = payload.rsplit("-->", 1)[0].strip()
       try:
         metadata = json.loads(payload)
@@ -184,10 +185,9 @@ class MarkdownSyncManager:
 
   async def import_from_files(self, glob_pattern: str = "**/*.md") -> dict:
     self._workspace_dir.mkdir(parents=True, exist_ok=True)
-    is_markdown_path = _compat_global("_is_markdown_path", _is_markdown_path)
     files = sorted(
       path for path in self._workspace_dir.glob(glob_pattern)
-      if path.is_file() and is_markdown_path(path)
+      if path.is_file() and _is_markdown_path(path)
     )
 
     actual_relative_paths = {
@@ -227,9 +227,6 @@ class MarkdownSyncManager:
 
   async def export_to_files(self) -> dict:
     self._workspace_dir.mkdir(parents=True, exist_ok=True)
-    atomic_write = _compat_global("_atomic_write", _atomic_write)
-    sync_header_prefix = _compat_global("_SYNC_HEADER_PREFIX", _SYNC_HEADER_PREFIX)
-    writing_path = _compat_global("_writing_path", _writing_path)
     entities = await self._store.list_entities()
     written_files: list[str] = []
     expected_paths: set[Path] = set()
@@ -237,7 +234,7 @@ class MarkdownSyncManager:
     for entity in entities:
       path = self._entity_path(entity["name"], entity["entity_type"])
       expected_paths.add(path.resolve(strict=False))
-      atomic_write(path, self._render_entity_file(entity))
+      _atomic_write(path, self._render_entity_file(entity))
       written_files.append(path.relative_to(self._workspace_dir).as_posix())
 
     for path in sorted(self._workspace_dir.rglob("*.md")):
@@ -247,22 +244,18 @@ class MarkdownSyncManager:
         first_line = path.read_text(encoding="utf-8").splitlines()[0]
       except (IndexError, OSError):
         first_line = ""
-      if not first_line.startswith(sync_header_prefix):
+      if not first_line.startswith(_SYNC_HEADER_PREFIX):
         continue
-      with writing_path(path):
+      with _writing_path(path):
         path.unlink(missing_ok=True)
 
     return {"written": len(written_files), "files": written_files}
 
   def _handle_watch_path(self, path: Path) -> None:
-    normalize_path = _compat_global("_normalize_path", _normalize_path)
-    is_ignored_path = _compat_global("_is_ignored_path", _is_ignored_path)
-    is_self_write = _compat_global("_is_self_write", _is_self_write)
-    is_markdown_path = _compat_global("_is_markdown_path", _is_markdown_path)
-    normalized = normalize_path(path)
-    if is_ignored_path(normalized) or is_self_write(normalized):
+    normalized = _normalize_path(path)
+    if _is_ignored_path(normalized) or _is_self_write(normalized):
       return
-    if not is_markdown_path(normalized):
+    if not _is_markdown_path(normalized):
       return
     try:
       normalized.relative_to(self._workspace_dir.resolve())
@@ -283,7 +276,7 @@ class MarkdownSyncManager:
 
   def _run_import_timer(self) -> None:
     key = self._workspace_dir.resolve()
-    callback = getattr(self, "_watch_callback", None)
+    callback = self._watch_callback
     try:
       summary = asyncio.run(self.import_from_files())
       if callback is not None:
@@ -296,19 +289,17 @@ class MarkdownSyncManager:
       with self._timers_lock:
         self._timers.pop(key, None)
 
-  def watch(self, callback: Callable | None = None) -> None:
+  def watch(self, callback: _WatchCallback | None = None) -> None:
     self._watch_callback = callback
-    observer_cls = _compat_global("Observer", Observer)
-    if observer_cls is None:
+    if Observer is None:
       log.warning("Markdown sync watch disabled: watchdog dependency unavailable")
       return
     if self._observer is not None:
       return
 
     self._workspace_dir.mkdir(parents=True, exist_ok=True)
-    event_handler_cls = _compat_global("_SyncEventHandler", _SyncEventHandler)
-    observer = observer_cls()
-    observer.schedule(event_handler_cls(self), str(self._workspace_dir), recursive=True)
+    observer = Observer()
+    observer.schedule(_SyncEventHandler(self), str(self._workspace_dir), recursive=True)
     observer.start()
     self._observer = observer
 

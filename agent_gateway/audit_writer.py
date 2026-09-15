@@ -5,7 +5,6 @@ import base64
 import fcntl
 import hashlib
 import json
-import logging
 import os
 import stat
 import tarfile
@@ -13,16 +12,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from .approval_audit import ApprovalAuditEntry
+from .approval_audit import APPROVAL_AUDIT_RETENTION_DAYS, ApprovalAuditEntry
+from .artifact_paths import user_data_dir
 
 
 APPROVAL_AUDIT_MAX_FILE_BYTES = 16 * 1024 * 1024
 APPROVAL_AUDIT_MAX_RECORD_BYTES = 512 * 1024
 APPROVAL_AUDIT_MAX_RECORDS = 32_768
-_APPROVAL_AUDIT_CAPACITY_WARNING_BYTES = (
-  APPROVAL_AUDIT_MAX_FILE_BYTES * 4 // 5
-)
-log = logging.getLogger("agent_gateway.audit_writer")
 
 
 class AuditWriter(Protocol):
@@ -51,8 +47,9 @@ class AuditWriter(Protocol):
 
 
 class JSONLAuditWriter:
-  def __init__(self, root: str | os.PathLike[str] = "data/audit/approvals") -> None:
-    self.root = Path(os.path.abspath(os.fspath(root)))
+  def __init__(self, root: str | os.PathLike[str] | None = None) -> None:
+    selected_root = user_data_dir() / "audit" / "approvals" if root is None else root
+    self.root = Path(os.path.abspath(os.fspath(selected_root)))
     self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
     self._require_private_directory(self.root)
 
@@ -84,37 +81,84 @@ class JSONLAuditWriter:
     await asyncio.to_thread(self._write_sync, entry)
 
   def _write_sync(self, entry: ApprovalAuditEntry) -> None:
-    path = self._path_for_ts(entry.ts)
-    parent_stat = self._require_private_directory(path.parent)
+    payload = entry.to_json_dict()
+    encoded = (
+      json.dumps(
+        payload,
+        sort_keys=True,
+        default=str,
+      )
+      + "\n"
+    ).encode("utf-8")
+    if len(encoded) > APPROVAL_AUDIT_MAX_RECORD_BYTES:
+      raise RuntimeError(
+        "approval audit record exceeds its byte limit"
+      )
+    parent_stat = self._require_private_directory(self.root)
     directory_fd = os.open(
-      path.parent,
+      self.root,
       os.O_RDONLY
       | getattr(os, "O_DIRECTORY", 0)
       | getattr(os, "O_CLOEXEC", 0),
     )
-    fd = -1
     try:
       opened_parent_stat = self._require_private_directory_stat(
         os.fstat(directory_fd),
-        path=path.parent,
+        path=self.root,
       )
       if (
         opened_parent_stat.st_dev != parent_stat.st_dev
         or opened_parent_stat.st_ino != parent_stat.st_ino
       ):
         raise RuntimeError(
-          f"approval audit directory identity changed: {path.parent}"
+          f"approval audit directory identity changed: {self.root}"
         )
-      fd = os.open(
-        path.name,
-        os.O_RDWR
-        | os.O_CREAT
-        | os.O_APPEND
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
-        dir_fd=directory_fd,
-      )
+      segment = 0
+      while True:
+        path = self._segment_path(entry.ts, segment)
+        if self._append_to_segment(
+          directory_fd=directory_fd,
+          parent_stat=parent_stat,
+          path=path,
+          payload=payload,
+          encoded=encoded,
+          entry_id=entry.entry_id,
+        ):
+          return
+        # The segment is at capacity: roll to the next segment for the same
+        # day instead of refusing the append.
+        segment += 1
+    finally:
+      os.close(directory_fd)
+
+  def _append_to_segment(
+    self,
+    *,
+    directory_fd: int,
+    parent_stat: os.stat_result,
+    path: Path,
+    payload: dict[str, Any],
+    encoded: bytes,
+    entry_id: str,
+  ) -> bool:
+    """Append one record into a day segment.
+
+    Returns True when the record was appended (or an identical record with
+    the same entry_id already exists) and False when the segment has no
+    capacity left, in which case the caller rolls to the next segment.
+    """
+
+    fd = os.open(
+      path.name,
+      os.O_RDWR
+      | os.O_CREAT
+      | os.O_APPEND
+      | getattr(os, "O_CLOEXEC", 0)
+      | getattr(os, "O_NOFOLLOW", 0),
+      0o600,
+      dir_fd=directory_fd,
+    )
+    try:
       file_stat = os.fstat(fd)
       if (
         not stat.S_ISREG(file_stat.st_mode)
@@ -127,19 +171,6 @@ class JSONLAuditWriter:
       if stat.S_IMODE(file_stat.st_mode) != 0o600:
         os.fchmod(fd, 0o600)
         file_stat = os.fstat(fd)
-      payload = entry.to_json_dict()
-      encoded = (
-        json.dumps(
-          payload,
-          sort_keys=True,
-          default=str,
-        )
-        + "\n"
-      ).encode("utf-8")
-      if len(encoded) > APPROVAL_AUDIT_MAX_RECORD_BYTES:
-        raise RuntimeError(
-          "approval audit record exceeds its byte limit"
-        )
 
       def require_bound_state(file_fd: int) -> None:
         current_parent_stat = self._require_private_directory_stat(
@@ -181,88 +212,70 @@ class JSONLAuditWriter:
       with os.fdopen(fd, "r+b") as handle:
         fd = -1
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        original_size = os.fstat(handle.fileno()).st_size
-        if original_size > APPROVAL_AUDIT_MAX_FILE_BYTES:
-          raise RuntimeError(
-            "approval audit file exceeds its byte limit"
-          )
-        handle.seek(0)
-        record_count = 0
-        while True:
-          line = handle.readline(
-            APPROVAL_AUDIT_MAX_RECORD_BYTES + 1
-          )
-          if not line:
-            break
-          record_count += 1
-          if record_count > APPROVAL_AUDIT_MAX_RECORDS:
-            raise RuntimeError(
-              "approval audit file exceeds its record limit"
-            )
-          if len(line) > APPROVAL_AUDIT_MAX_RECORD_BYTES:
-            raise RuntimeError(
-              "approval audit record exceeds its byte limit"
-            )
-          if not line.endswith(b"\n"):
-            raise RuntimeError(
-              "approval audit file has an incomplete record"
-            )
-          if not line.strip():
-            continue
-          existing = json.loads(line)
-          if not isinstance(existing, dict):
-            raise RuntimeError(
-              "approval audit file contains a non-object record"
-            )
-          if existing.get("entry_id") != entry.entry_id:
-            continue
-          if existing != payload:
-            raise RuntimeError(
-              "approval audit entry_id was reused with different content"
-            )
-          os.fsync(handle.fileno())
-          require_bound_state(handle.fileno())
-          os.fsync(directory_fd)
-          fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-          return
-        if original_size + len(encoded) > APPROVAL_AUDIT_MAX_FILE_BYTES:
-          raise RuntimeError(
-            "approval audit file reached its byte capacity"
-          )
-        if record_count >= APPROVAL_AUDIT_MAX_RECORDS:
-          raise RuntimeError(
-            "approval audit file reached its record capacity"
-          )
-        if (
-          original_size + len(encoded)
-          >= _APPROVAL_AUDIT_CAPACITY_WARNING_BYTES
-        ):
-          log.warning(
-            "Approval audit file is above 80%% capacity: %s",
-            path,
-          )
-        handle.seek(0, os.SEEK_END)
         try:
-          handle.write(encoded)
-          handle.flush()
-          os.fsync(handle.fileno())
-          require_bound_state(handle.fileno())
-          os.fsync(directory_fd)
-        except BaseException:
+          original_size = os.fstat(handle.fileno()).st_size
+          handle.seek(0)
+          record_count = 0
+          while True:
+            line = handle.readline(
+              APPROVAL_AUDIT_MAX_RECORD_BYTES + 1
+            )
+            if not line:
+              break
+            record_count += 1
+            if len(line) > APPROVAL_AUDIT_MAX_RECORD_BYTES:
+              raise RuntimeError(
+                "approval audit record exceeds its byte limit"
+              )
+            if not line.endswith(b"\n"):
+              raise RuntimeError(
+                "approval audit file has an incomplete record"
+              )
+            if not line.strip():
+              continue
+            existing = json.loads(line)
+            if not isinstance(existing, dict):
+              raise RuntimeError(
+                "approval audit file contains a non-object record"
+              )
+            if existing.get("entry_id") != entry_id:
+              continue
+            if existing != payload:
+              raise RuntimeError(
+                "approval audit entry_id was reused with different content"
+              )
+            os.fsync(handle.fileno())
+            require_bound_state(handle.fileno())
+            os.fsync(directory_fd)
+            return True
+          if (
+            original_size + len(encoded) > APPROVAL_AUDIT_MAX_FILE_BYTES
+            or record_count >= APPROVAL_AUDIT_MAX_RECORDS
+          ):
+            return False
+          handle.seek(0, os.SEEK_END)
           try:
-            handle.seek(original_size)
-            handle.truncate()
+            handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+            require_bound_state(handle.fileno())
             os.fsync(directory_fd)
           except BaseException:
-            pass
-          raise
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            try:
+              handle.seek(original_size)
+              handle.truncate()
+              handle.flush()
+              os.fsync(handle.fileno())
+              os.fsync(directory_fd)
+            except BaseException:
+              pass
+            raise
+          return True
+        finally:
+          fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     finally:
       if fd != -1:
         os.close(fd)
-      os.close(directory_fd)
 
   async def flush(self) -> None:
     return None
@@ -356,7 +369,9 @@ class JSONLAuditWriter:
         continue
       if any(entry.legal_hold for entry in entries):
         continue
-      retention_days = max(_retention_days(entry.retention_class) for entry in entries)
+      retention_days = max(
+        APPROVAL_AUDIT_RETENTION_DAYS[entry.retention_class] for entry in entries
+      )
       newest = max(entry.ts for entry in entries)
       if newest + timedelta(days=retention_days) < now:
         path.unlink(missing_ok=True)
@@ -380,10 +395,12 @@ class JSONLAuditWriter:
     os.chmod(archive_path, 0o600)
     return str(archive_path)
 
-  def _path_for_ts(self, ts: datetime) -> Path:
+  def _segment_path(self, ts: datetime, index: int) -> Path:
     if ts.tzinfo is None:
       ts = ts.astimezone()
-    return self.root / f"{ts.astimezone().date().isoformat()}.jsonl"
+    day = ts.astimezone().date().isoformat()
+    name = f"{day}.jsonl" if index == 0 else f"{day}.{index}.jsonl"
+    return self.root / name
 
   def _read_file(self, path: Path) -> list[ApprovalAuditEntry]:
     entries: list[ApprovalAuditEntry] = []
@@ -394,9 +411,7 @@ class JSONLAuditWriter:
     for line in lines:
       if not line.strip():
         continue
-      payload = json.loads(line)
-      payload["ts"] = datetime.fromisoformat(payload["ts"])
-      entries.append(ApprovalAuditEntry(**payload))
+      entries.append(ApprovalAuditEntry.from_json_dict(json.loads(line)))
     return entries
 
 
@@ -426,14 +441,6 @@ def _matches(entry: ApprovalAuditEntry, **filters: Any) -> bool:
     if entry.ts < start or entry.ts > end:
       return False
   return True
-
-
-def _retention_days(retention_class: str) -> int:
-  if retention_class == "dev":
-    return 30
-  if retention_class == "compliance":
-    return 2555
-  return 365
 
 
 def _dt_text(value: datetime) -> str:

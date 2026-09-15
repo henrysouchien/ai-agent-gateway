@@ -120,7 +120,9 @@ def anthropic_token_is_expiring(record: Mapping[str, Any], *, now: float | None 
   try:
     expires_at = float(record.get("expires_at") or 0)
   except (TypeError, ValueError):
-    return False
+    # A corrupt expiry in the store must surface as "renew soon", not as a
+    # token that silently never expires.
+    return True
   return bool(expires_at and expires_at <= (time.time() if now is None else now) + 5 * 24 * 60 * 60)
 
 

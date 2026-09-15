@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from agent_gateway.control_plane.middleware import CONTROL_PLANE_VERSION_HEADER
@@ -39,6 +40,7 @@ def test_approval_delivery_fatal_state_fails_health(
   client: TestClient,
   control_health_url: str,
 ) -> None:
+  assert isinstance(client.app, FastAPI)
   coordinator = (
     client.app.state.autonomous_approval_delivery_coordinator
   )

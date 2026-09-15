@@ -324,7 +324,7 @@ def test_delegated_portfolio_config_and_irreversible_request_user_approval() -> 
       )
       request, payload = _request_and_payload(
         run_context=run_context,
-        tool_class=tool_class,  # type: ignore[arg-type]
+        tool_class=tool_class,
         tool_name=f"{tool_class}_tool",
       )
 

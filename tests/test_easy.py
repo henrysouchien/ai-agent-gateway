@@ -5,6 +5,7 @@ import json
 import sys
 import threading
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
@@ -19,17 +20,25 @@ if str(PKG_DIR) not in sys.path:
 import agent_gateway.mcp_client as mcp_client_module
 import agent_gateway.sub_agent as sub_agent_module
 from agent_gateway import EventLog, McpClientManager, ToolResultContext, create_agent
+from agent_gateway.tool_result_spill import SpillSink, TOOL_RESULT_READ_TOOL_DEF
 from agent_gateway.auth import AuthConfig, ResolverResult
 from agent_gateway._provider_utils import _resolve_provider
 from agent_gateway.capability_binding import CapabilityResolutionError
+from agent_gateway.commercial_claims import VerifiedCommercialClaim
+from agent_gateway.commercial_work_authorization import VerifiedWorkAuthorization
+from agent_gateway.commercial_work_start import CommercialWorkStartContext
 from agent_gateway.commercial_authority_cache import CommercialAuthorityStateCache
 from agent_gateway.commercial_authority_subscriber import CommercialAuthoritySubscriber
 from agent_gateway.model_registry import (
   INITIAL_MODEL_REGISTRY,
 )
 from agent_gateway.providers import AnthropicProvider, CodexProvider, OpenAIProvider, XAIProvider
+from agent_gateway.skills import SkillStateStore
 from agent_gateway.server import ChatRequest, ChatTurnInputs
 from agent_gateway.server_chat_helpers import prepare_session_driver_turn
+from agent_gateway.work_authorization_consumption import (
+  WorkAuthorizationConsumptionRecord,
+)
 
 DEFAULT_MODEL_KEY = "anthropic.claude-opus-5"
 DEFAULT_ANTHROPIC_MODEL = INITIAL_MODEL_REGISTRY.require(
@@ -38,11 +47,97 @@ DEFAULT_ANTHROPIC_MODEL = INITIAL_MODEL_REGISTRY.require(
 
 
 class _EmptyOperationCatalog:
-  def resolve_operation(self, _selector):
+  def resolve_operation(self, selector):
     raise FileNotFoundError("no operations")
 
   def list_callable_operations_with_descriptions(self):
     return []
+
+
+def _verified_commercial_work_start() -> CommercialWorkStartContext:
+  now = 1_780_000_000
+  context_id = UUID("00000000-0000-0000-0000-000000000001")
+  authorization_id = UUID("00000000-0000-0000-0000-000000000002")
+  workflow_run_id = UUID("00000000-0000-0000-0000-000000000003")
+  funding_route_id = UUID("00000000-0000-0000-0000-000000000004")
+  reservation_id = UUID("00000000-0000-0000-0000-000000000005")
+  claim = VerifiedCommercialClaim(
+    schema_version=1,
+    key_id="commercial-signing-v1",
+    subject="user:alice",
+    environment="prod",
+    surface="hp1",
+    commercial_account_id=UUID("00000000-0000-0000-0000-000000000006"),
+    agreement_id=UUID("00000000-0000-0000-0000-000000000007"),
+    agreement_terms_revision=2,
+    offer_code="hp1_pro",
+    effective_scopes=("read",),
+    entitlement_revision=42,
+    payer_policy_version="hp1_customer_host@v1",
+    budget_policy_version="hp1_pro_budget@v1",
+    shadow_rate_version="commercial_rates@2026-09-01",
+    manifest_version="mcp_exposure@2026-09-01",
+    authorized_work_start_deadline=now + 300,
+    usage_accept_until=now + 3600,
+    issued_at=now,
+    expires_at=now + 300,
+    context_id=context_id,
+  )
+  authorization = VerifiedWorkAuthorization(
+    schema_version=1,
+    key_id="work-signing-v1",
+    token_sha256="sha256:" + "a" * 64,
+    authorization_id=authorization_id,
+    environment="prod",
+    execution_context_id=context_id,
+    workflow_run_id=workflow_run_id,
+    workflow_attempt_group_id=workflow_run_id,
+    workflow_attempt_number=1,
+    retry_of_workflow_run_id=None,
+    workflow_attempt_kind="initial",
+    primary_inference_observability="hank_metered",
+    funding_route_id=funding_route_id,
+    provider="anthropic",
+    billing_mode="metered",
+    reservation_id=reservation_id,
+    operation="messages.create",
+    capability_id="session.driver",
+    request_id="request-1",
+    session_id="session-1",
+    issued_at=now,
+    expires_at=now + 120,
+  )
+  consumption = WorkAuthorizationConsumptionRecord(
+    authorization_id=authorization_id,
+    schema_version=1,
+    token_sha256=authorization.token_sha256,
+    content_sha256="sha256:" + "b" * 64,
+    key_id=authorization.key_id,
+    environment="prod",
+    execution_context_id=context_id,
+    workflow_run_id=workflow_run_id,
+    workflow_attempt_group_id=workflow_run_id,
+    workflow_attempt_number=1,
+    retry_of_workflow_run_id=None,
+    workflow_attempt_kind="initial",
+    primary_inference_observability="hank_metered",
+    funding_route_id=funding_route_id,
+    provider="anthropic",
+    billing_mode="metered",
+    reservation_id=reservation_id,
+    operation="messages.create",
+    capability_id="session.driver",
+    request_id="request-1",
+    session_id="session-1",
+    issued_at=now,
+    expires_at=now + 120,
+    attached_at="2026-09-01T00:00:00+00:00",
+  )
+  return CommercialWorkStartContext(
+    claim=claim,
+    authorization=authorization,
+    consumption=consumption,
+  )
 
 
 def _run(coro):
@@ -129,11 +224,11 @@ def _build_runtime(
   runtime, _request = _prepare_runtime_for_session(
     app,
     session=session,
-    request=ChatRequest(
-      messages=[{"role": "user", "content": "hello"}],
-      context={},
-      model_key=request_model,
-    ),
+    request=ChatRequest.model_validate({
+      "messages": [{"role": "user", "content": "hello"}],
+      "context": {},
+      "model_key": request_model,
+    }),
   )
   return session, runtime
 
@@ -195,11 +290,11 @@ def test_commercial_usage_producer_factory_is_request_scoped() -> None:
   )
   runtimes = []
   for session, request_id in ((first_session, "req-a"), (second_session, "req-b")):
-    request = ChatRequest(
-      messages=[{"role": "user", "content": "hello"}],
-      context={},
-      request_id=request_id,
-    )
+    request = ChatRequest.model_validate({
+      "messages": [{"role": "user", "content": "hello"}],
+      "context": {},
+      "request_id": request_id,
+    })
     runtime, _prepared_request = _prepare_runtime_for_session(
       app,
       session=session,
@@ -235,11 +330,11 @@ def test_commercial_usage_factory_receives_verified_work_start_context() -> None
     api_key="test-key",
     commercial_usage_producer_factory=factory,
   )
-  request = ChatRequest(
-    messages=[{"role": "user", "content": "hello"}],
-    request_id="request-1",
-  )
-  verified_context = object()
+  request = ChatRequest.model_validate({
+    "messages": [{"role": "user", "content": "hello"}],
+    "request_id": "request-1",
+  })
+  verified_context = _verified_commercial_work_start()
   request._bind_commercial_work_start(verified_context)
   session, _, prepared_request = _build_runtime_with_request(
     app,
@@ -247,7 +342,14 @@ def test_commercial_usage_factory_receives_verified_work_start_context() -> None
     channel="mcp",
   )
 
-  assert produced == [(session, prepared_request, "mcp", verified_context)]
+  assert len(produced) == 1
+  produced_session, produced_request, produced_channel, produced_context = produced[0]
+  assert (produced_session, produced_request, produced_channel) == (
+    session,
+    prepared_request,
+    "mcp",
+  )
+  assert produced_context is verified_context
 
 
 def test_commercial_usage_factory_preserves_legacy_positional_args_with_kwargs() -> None:
@@ -262,7 +364,9 @@ def test_commercial_usage_factory_preserves_legacy_positional_args_with_kwargs()
     api_key="test-key",
     commercial_usage_producer_factory=factory,
   )
-  request = ChatRequest(messages=[{"role": "user", "content": "hello"}])
+  request = ChatRequest.model_validate({
+    "messages": [{"role": "user", "content": "hello"}],
+  })
   session, _, prepared_request = _build_runtime_with_request(
     app,
     request=request,
@@ -289,7 +393,9 @@ def test_commercial_usage_factory_preserves_legacy_varargs_arity() -> None:
     api_key="test-key",
     commercial_usage_producer_factory=factory,
   )
-  request = ChatRequest(messages=[{"role": "user", "content": "hello"}])
+  request = ChatRequest.model_validate({
+    "messages": [{"role": "user", "content": "hello"}],
+  })
   session, _, prepared_request = _build_runtime_with_request(
     app,
     request=request,
@@ -300,10 +406,10 @@ def test_commercial_usage_factory_preserves_legacy_varargs_arity() -> None:
 
 
 def test_default_off_chat_request_accepts_large_benign_context() -> None:
-  request = ChatRequest(
-    messages=[{"role": "user", "content": "hello"}],
-    context={"cells": [{"value": index} for index in range(10_001)]},
-  )
+  request = ChatRequest.model_validate({
+    "messages": [{"role": "user", "content": "hello"}],
+    "context": {"cells": [{"value": index} for index in range(10_001)]},
+  })
 
   assert len(request.context["cells"]) == 10_001
 
@@ -424,7 +530,7 @@ def _write_skill(skills_dir: Path, name: str, body: str) -> None:
 def test_create_agent_exposes_default_routes_and_open_defaults() -> None:
   app = create_agent("test")
 
-  route_paths = {route.path for route in app.routes}
+  route_paths = set(app.openapi()["paths"])
   assert "/api/chat/init" in route_paths
   assert "/api/chat" in route_paths
   assert "/api/health" in route_paths
@@ -591,11 +697,11 @@ def test_create_agent_refuses_unsupported_configured_effort() -> None:
 
 def test_create_agent_threads_request_metadata_to_runner() -> None:
   app = create_agent("test")
-  request = ChatRequest(
-    messages=[{"role": "user", "content": "hello"}],
-    request_id="req-123",
-    context={"channel": "web"},
-  )
+  request = ChatRequest.model_validate({
+    "messages": [{"role": "user", "content": "hello"}],
+    "request_id": "req-123",
+    "context": {"channel": "web"},
+  })
   config = app.state.gateway_config
   session = app.state.auth.session_store.create_session(
     api_key_hash="hash",
@@ -639,11 +745,11 @@ def test_create_agent_runner_binds_session_whose_slug_differs_from_owner() -> No
   """
 
   app = create_agent("test")
-  request = ChatRequest(
-    messages=[{"role": "user", "content": "hello"}],
-    request_id="req-owner",
-    context={"channel": "web"},
-  )
+  request = ChatRequest.model_validate({
+    "messages": [{"role": "user", "content": "hello"}],
+    "request_id": "req-owner",
+    "context": {"channel": "web"},
+  })
   config = app.state.gateway_config
   session = app.state.auth.session_store.create_session(
     api_key_hash="hash",
@@ -941,7 +1047,12 @@ def test_create_agent_valid_api_keys_and_jwt_secret() -> None:
     assert client.post("/api/chat/init", json={"api_key": "k1", "user_id": "test-user"}).status_code == 200
 
 
-def test_create_agent_inline_mcp_uses_inline_only_config_and_builtin_filtering() -> None:
+def test_create_agent_inline_mcp_uses_inline_only_config_and_builtin_filtering(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  monkeypatch.setenv("MCP_CONFIG_PATH", str(tmp_path / "mcp.production.json"))
+
   async def _tool(_tool_input, **_kwargs):
     return {"ok": True}, None
 
@@ -1036,14 +1147,18 @@ def test_create_agent_forwards_outputs_dir(
   skills_dir = tmp_path / "skills"
   outputs_dir = tmp_path / "outputs"
   skills_dir.mkdir(parents=True, exist_ok=True)
-  captured: dict[str, object] = {}
+  captured_outputs_dirs: list[Path | None] = []
 
   async def _fake_run_agent(_tool_input, **_kwargs):
     return {"response": "ok"}, None
 
-  def _fake_make_run_agent_handler(*args, **kwargs):
-    _ = args
-    captured["kwargs"] = kwargs
+  def _fake_make_run_agent_handler(
+    *args: object,
+    outputs_dir: Path | None = None,
+    **kwargs: object,
+  ):
+    _ = args, kwargs
+    captured_outputs_dirs.append(outputs_dir)
     return _fake_run_agent
 
   monkeypatch.setattr(sub_agent_module, "make_run_agent_handler", _fake_make_run_agent_handler)
@@ -1057,7 +1172,7 @@ def test_create_agent_forwards_outputs_dir(
 
   _build_runtime(app)
 
-  assert captured["kwargs"]["outputs_dir"] == outputs_dir
+  assert captured_outputs_dirs == [outputs_dir]
 
 
 def test_create_agent_forwards_skill_state_file(
@@ -1067,14 +1182,18 @@ def test_create_agent_forwards_skill_state_file(
   skills_dir = tmp_path / "skills"
   state_file = tmp_path / "skill_state.json"
   skills_dir.mkdir(parents=True, exist_ok=True)
-  captured: dict[str, object] = {}
+  captured_skill_state_stores: list[SkillStateStore | None] = []
 
   async def _fake_run_agent(_tool_input, **_kwargs):
     return {"response": "ok"}, None
 
-  def _fake_make_run_agent_handler(*args, **kwargs):
-    _ = args
-    captured["kwargs"] = kwargs
+  def _fake_make_run_agent_handler(
+    *args: object,
+    skill_state_store: SkillStateStore | None = None,
+    **kwargs: object,
+  ):
+    _ = args, kwargs
+    captured_skill_state_stores.append(skill_state_store)
     return _fake_run_agent
 
   monkeypatch.setattr(sub_agent_module, "make_run_agent_handler", _fake_make_run_agent_handler)
@@ -1088,7 +1207,8 @@ def test_create_agent_forwards_skill_state_file(
 
   _build_runtime(app)
 
-  store = captured["kwargs"]["skill_state_store"]
+  [store] = captured_skill_state_stores
+  assert store is not None
   assert store.state_file == state_file
 
 
@@ -1227,7 +1347,7 @@ Research deeply.
     captured.update(kwargs)
     return {"response": "ok"}, None
 
-  runner.spawn_sub_agent = _fake_spawn_sub_agent  # type: ignore[method-assign]
+  runner.spawn_sub_agent = _fake_spawn_sub_agent
 
   result, error = _run(
     runner._dispatcher._local["run_agent"]({
@@ -1256,7 +1376,7 @@ def test_create_agent_rejects_request_model_outside_driver_policy(
 
   with pytest.raises(CapabilityResolutionError) as exc_info:
     _build_runtime(app, request_model="anthropic.claude-opus-5")
-  assert exc_info.value.receipt() == {
+  assert exc_info.value.to_error() == {
     "error_code": "capability_model_not_allowed",
     "capability_id": "session.driver",
     "model_key": "anthropic.claude-opus-5",
@@ -1333,7 +1453,7 @@ def test_create_agent_registers_local_tool_handlers_and_definitions() -> None:
   runner = runtime.build_runner(EventLog(), session.session_id)
 
   assert runner._dispatcher._local["t"] is _tool
-  assert runtime.get_tool_definitions() == [tool_def]
+  assert runtime.get_tool_definitions() == [tool_def, TOOL_RESULT_READ_TOOL_DEF]
   assert runner._dispatcher._request_approval is not None
 
 
@@ -1350,13 +1470,18 @@ def test_create_agent_code_execution_wires_hooks_approval_and_expiry_cleanup(tmp
   session, runtime = _build_runtime(app)
   runner = runtime.build_runner(EventLog(), session.session_id)
 
-  assert {"code_execute", "code_execute_status"} <= set(runner._dispatcher._local)
+  assert {"code_execute", "code_execute_status", "tool_result_read"} <= set(
+    runner._dispatcher._local
+  )
   assert {tool["name"] for tool in runtime.get_tool_definitions()} == {
     "code_execute",
     "code_execute_status",
+    "tool_result_read",
   }
   assert runner._dispatcher._request_approval is not None
   assert runner._dispatcher._approved_tool_types is session.approved_tool_types
+  assert session.tool_result_spill_sink is runner._spill_dir_provider
+  assert session.tool_result_spill_sink.capabilities.spill_read
   valid_code_execute_input = {"code": "print(1)", "host": "subprocess"}
   assert runner._dispatcher._should_request_approval("code_execute", valid_code_execute_input, "subprocess") is True
 
@@ -1366,6 +1491,7 @@ def test_create_agent_code_execution_wires_hooks_approval_and_expiry_cleanup(tmp
   ctx = ToolResultContext(
     tool_name="code_execute",
     tool_input={},
+    redacted_tool_input={},
     result={"images": [{"filename": "plot.png", "data_base64": "abc"}]},
     error=None,
     duration_ms=5,
@@ -1375,6 +1501,7 @@ def test_create_agent_code_execution_wires_hooks_approval_and_expiry_cleanup(tmp
     result_entry={"content": json.dumps({"images": [{"filename": "plot.png", "data_base64": "abc"}]})},
   )
   extra_blocks = _run(runner._on_tool_result(ctx))
+  assert ctx.result_entry is not None
   payload = json.loads(ctx.result_entry["content"])
 
   assert extra_blocks == [{"type": "text", "text": "extra"}]
@@ -1385,6 +1512,7 @@ def test_create_agent_code_execution_wires_hooks_approval_and_expiry_cleanup(tmp
   session.code_execution_work_dir = str(work_dir)
   _run(app.state.auth.session_store.expire_session_async(session.session_id))
   assert not work_dir.exists()
+  assert session.tool_result_spill_sink is None
 
 
 def test_create_agent_code_execution_cleans_up_active_sessions_on_shutdown(tmp_path: Path) -> None:
@@ -1410,3 +1538,50 @@ def test_create_agent_model_and_cors_configuration() -> None:
 
   empty_cors_app = create_agent("test", cors_origins=[])
   assert empty_cors_app.state.gateway_config.cors_origins == []
+
+
+def test_create_agent_file_read_without_code_execution_receives_owner_spill_sink(
+  tmp_path: Path,
+) -> None:
+  async def _file_read(_tool_input, **_kwargs):
+    return {"content": "evidence"}, None
+
+  app = create_agent(
+    "test",
+    api_key="test-key",
+    session_log_base_dir=tmp_path,
+    tool_handlers={"file_read": _file_read},
+    tool_definitions=[
+      {
+        "name": "file_read",
+        "description": "Read exact test evidence.",
+        "input_schema": {"type": "object", "properties": {}},
+      }
+    ],
+  )
+  session, runtime = _build_runtime(app)
+  runner = runtime.build_runner(EventLog(), session.session_id)
+  sink = runner._spill_dir_provider
+
+  assert isinstance(sink, SpillSink)
+  assert sink.capabilities.file_read
+  assert not sink.capabilities.code_execute
+  assert not sink.capabilities.file_grep
+
+
+def test_create_agent_code_execution_uses_owner_sink_not_ce_bundle_shortcut(
+  tmp_path: Path,
+) -> None:
+  app = create_agent(
+    "test",
+    api_key="test-key",
+    code_execution=True,
+    session_log_base_dir=tmp_path,
+  )
+  session, runtime = _build_runtime(app)
+  runner = runtime.build_runner(EventLog(), session.session_id)
+  sink = runner._spill_dir_provider
+
+  assert isinstance(sink, SpillSink)
+  assert sink.capabilities.code_execute
+  assert sink is not getattr(session, "code_execution_work_dir", None)

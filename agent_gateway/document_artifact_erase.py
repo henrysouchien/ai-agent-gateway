@@ -3,11 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 import errno
 import json
+import logging
 import os
 from pathlib import Path
 import re
 import stat
-from typing import Any, Callable
+from typing import Any, Callable, SupportsInt
 
 from schema.canvas_artifact import CanvasArtifact
 from schema.dashboard_artifact import DashboardArtifact
@@ -18,6 +19,8 @@ from .artifact_sidecar_index import (
   list_artifact_sidecar_index_rows,
 )
 
+
+log = logging.getLogger(__name__)
 
 _ARTIFACT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _STORE_ARTIFACT_ID_RE = re.compile(r"^[A-Za-z0-9-]{1,128}$")
@@ -77,7 +80,6 @@ def purge_ui_blocks_payloads(
   }
   paths: list[Path] = []
   keys: list[tuple[str, str]] = []
-  expected_identities: dict[Path, _FileIdentity] = {}
   for ui_blocks_id in normalized_ids:
     expected_ref = f"artifacts/_ui_blocks/{ui_blocks_id}.json"
     row = indexed.get(ui_blocks_id)
@@ -85,20 +87,24 @@ def purge_ui_blocks_payloads(
       row.get("artifact_ref") != ui_blocks_id
       or row.get("payload_ref") != expected_ref
     ):
-      raise ValueError("ui blocks index identity is invalid")
-    path = workspace / expected_ref
-    if os.path.lexists(path):
-      envelope, identity = _read_json_object(path, workspace=workspace)
-      if envelope.get("ui_blocks_id") != ui_blocks_id:
-        raise ValueError("ui blocks envelope identity is invalid")
-      expected_identities[path] = identity
-    paths.append(path)
+      # The typed anchor names the erase target; the index row and envelope
+      # field are duplicated derivations of the same identity, and a
+      # self-inconsistency must not pin user data after an erase request.
+      # _delete_exact_paths still verifies the opened file's identity before
+      # any unlink.
+      log.warning(
+        "ui blocks index row for %s disagrees with its canonical path"
+        " (artifact_ref=%r payload_ref=%r); erasing the canonical path",
+        ui_blocks_id,
+        row.get("artifact_ref"),
+        row.get("payload_ref"),
+      )
+    paths.append(workspace / expected_ref)
     keys.append(("ui_blocks", ui_blocks_id))
 
   _delete_exact_paths(
     tuple(paths),
     workspace=workspace,
-    expected_identities=expected_identities,
   )
   delete_artifact_sidecar_index_rows(
     workspace_dir=workspace,
@@ -220,7 +226,11 @@ def _scan_store_records(
   *,
   artifact_kind: str,
   directory_name: str,
-  model: Callable[..., Any],
+  model: (
+    type[CanvasArtifact]
+    | type[DashboardArtifact]
+    | type[HtmlArtifact]
+  ),
   payload_suffixes: tuple[str, ...],
 ) -> tuple[_TypedArtifact, ...]:
   directory = workspace / "artifacts" / directory_name
@@ -564,7 +574,9 @@ def _optional_ticker(value: object) -> str | None:
   return _required_ticker(value)
 
 
-def _optional_research_file_id(value: object) -> int | None:
+def _optional_research_file_id(
+  value: str | bytes | bytearray | SupportsInt | None,
+) -> int | None:
   if value is None or isinstance(value, bool):
     return None
   try:

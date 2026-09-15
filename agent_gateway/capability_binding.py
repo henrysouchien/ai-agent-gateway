@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Literal, Mapping, NoReturn, TypeAlias, get_args
+from typing import Any, Final, Literal, Mapping, NoReturn, TypeAlias, get_args
 
 from agent_workflow_contracts import CapabilityBind
 
 from .model_registry import (
   CAPABILITY_IDS,
+  SESSION_DRIVER_CAPABILITY,
   CapabilitySelectionPolicy,
   ModelRegistryEntry,
   ProductModelRegistry,
@@ -21,6 +22,22 @@ from .thinking import EffortResolution, parse_effort
 
 CapabilityId: TypeAlias = str
 RunMode: TypeAlias = Literal["interactive", "fleet", "batch", "autonomous", "cron"]
+CapabilityEffort: TypeAlias = Literal[
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]
+
+# Non-interactive modes are derived by exclusion: interactive is the marked
+# case (see AuthContext.credential_handles), so a future mode is
+# non-interactive without consumer edits.
+NON_INTERACTIVE_RUN_MODES: Final[frozenset[str]] = frozenset(
+  get_args(RunMode)
+) - {"interactive"}
 CredentialPrincipal: TypeAlias = Literal["user", "service"]
 IntentSource: TypeAlias = Literal["explicit_user", "saved_preference"]
 CapabilityResolutionCode: TypeAlias = Literal[
@@ -36,6 +53,7 @@ CapabilityResolutionCode: TypeAlias = Literal[
   "capability_effort_unsupported",
   "capability_entitlement_required",
   "capability_externally_executed",
+  "capability_selection_invalid",
   "credential_unavailable",
   "default_not_eligible",
   "parent_binding_required",
@@ -52,7 +70,7 @@ CAPABILITY_RESOLUTION_CODES: frozenset[str] = frozenset(
   get_args(CapabilityResolutionCode)
 )
 
-_RUN_MODES = frozenset({"interactive", "fleet", "batch", "autonomous", "cron"})
+_RUN_MODES = frozenset(get_args(RunMode))
 _CREDENTIAL_PRINCIPALS = frozenset({"user", "service"})
 
 
@@ -80,22 +98,22 @@ class CapabilityResolutionError(ValueError):
     self.eligible_model_keys = eligible_model_keys
     self.catalog_revision = catalog_revision
 
-  def receipt(self) -> dict[str, object]:
-    receipt: dict[str, object] = {
+  def to_error(self) -> dict[str, object]:
+    payload: dict[str, object] = {
       "error_code": self.code,
       "capability_id": self.capability_id,
     }
     if self.model_key is not None:
-      receipt["model_key"] = self.model_key
+      payload["model_key"] = self.model_key
     if self.provider is not None:
-      receipt["provider"] = self.provider
+      payload["provider"] = self.provider
     if self.upstream_model is not None:
-      receipt["upstream_model"] = self.upstream_model
+      payload["upstream_model"] = self.upstream_model
     if self.eligible_model_keys:
-      receipt["eligible_model_keys"] = list(self.eligible_model_keys)
+      payload["eligible_model_keys"] = list(self.eligible_model_keys)
     if self.catalog_revision is not None:
-      receipt["catalog_revision"] = self.catalog_revision
-    return receipt
+      payload["catalog_revision"] = self.catalog_revision
+    return payload
 
 
 def _required_text(value: object, *, field_name: str) -> str:
@@ -115,7 +133,11 @@ def _provider_family(value: object, *, field_name: str = "provider") -> str:
   return provider
 
 
-def _canonical_effort(value: object, *, field_name: str) -> str:
+def _canonical_effort(
+  value: object,
+  *,
+  field_name: str,
+) -> CapabilityEffort:
   _required_text(value, field_name=field_name)
   effort = parse_effort(value, field_name=field_name)
   if effort is None:
@@ -273,7 +295,7 @@ class AuthContext:
       handles.append(user)
     service = self.service_provider_handles.get(family)
     if service is not None and (
-      self.run_mode in {"fleet", "batch", "autonomous", "cron"}
+      self.run_mode in NON_INTERACTIVE_RUN_MODES
       or (self.run_mode == "interactive" and self.allow_service_for_interactive)
     ):
       handles.append(service)
@@ -725,7 +747,7 @@ def _selection_candidate(
 
   entry = registry.require(policy.default.model_key or "")
   source: SelectionSource = (
-    "capability_default" if capability_id == "session.driver" else "internal_policy"
+    "capability_default" if capability_id == SESSION_DRIVER_CAPABILITY else "internal_policy"
   )
   return entry, policy.default.effort or entry.default_effort, source
 
@@ -944,7 +966,7 @@ def _inherit_parent_binding_whole(
   entry: ModelRegistryEntry,
   auth: AuthContext,
   parent_bind: CapabilityBind,
-  resolved_effort: str,
+  resolved_effort: CapabilityEffort,
 ) -> CapabilityBind:
   """Copy the exact parent binding whole for the inheriting capability.
 

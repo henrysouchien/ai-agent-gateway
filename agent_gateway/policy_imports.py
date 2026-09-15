@@ -1,24 +1,14 @@
 from __future__ import annotations
 
 import importlib
-from typing import Any
-
-
-_AGENT_POLICY_MODULE_NAMES = frozenset({"agent", "agent.shared", "agent.shared.server_policies"})
-_API_POLICY_MODULE_NAMES = frozenset({"api", "api.agent", "api.agent.shared", "api.agent.shared.server_policies"})
+from typing import Any, Literal, Mapping
 
 
 def load_server_policy_module() -> Any | None:
   try:
     return importlib.import_module("agent.shared.server_policies")
   except ModuleNotFoundError as exc:
-    if exc.name not in _AGENT_POLICY_MODULE_NAMES:
-      raise
-
-  try:
-    return importlib.import_module("api.agent.shared.server_policies")
-  except ModuleNotFoundError as exc:
-    if exc.name not in _API_POLICY_MODULE_NAMES:
+    if exc.name not in {"agent", "agent.shared", "agent.shared.server_policies"}:
       raise
     return None
 
@@ -39,6 +29,17 @@ def load_server_policy_helpers(*, require_tool_class: bool = False) -> tuple[Any
   )
 
 
+def update_mcp_tool_metadata(
+  server_name: str,
+  tool_metadata: Mapping[str, Mapping[str, Any] | None],
+) -> None:
+  """Publish accepted catalog metadata through the synchronous host-policy bridge."""
+  policy_module = load_server_policy_module()
+  update = getattr(policy_module, "update_mcp_tool_metadata", None)
+  if update is not None:
+    update(server_name, tool_metadata)
+
+
 def resolve_effective_role(role: str | None) -> str:
   """Normalize authority without allowing owner-by-omission."""
   policy_module = load_server_policy_module()
@@ -49,7 +50,7 @@ def resolve_effective_role(role: str | None) -> str:
   return "owner" if (role or "").strip().lower() == "owner" else "invite"
 
 
-def require_inherited_role(parent_session: Any | None) -> str:
+def require_inherited_role(parent_session: Any | None) -> Literal["owner", "invite"]:
   """Inherit an exact valid role; a null legacy parent remains invite."""
   if parent_session is None:
     return "invite"
@@ -61,7 +62,7 @@ def require_inherited_role(parent_session: Any | None) -> str:
   )
   if normalized not in {"owner", "invite"}:
     raise ValueError("parent session must carry an explicit valid role")
-  return normalized
+  return "owner" if normalized == "owner" else "invite"
 
 
 def role_denied_tools_for_session(session: Any | None) -> frozenset[str]:

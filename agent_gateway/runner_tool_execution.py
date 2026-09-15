@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from datetime import datetime, timezone
 import hashlib
-import importlib
 import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import AbstractSet, TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Tuple, runtime_checkable
 
 from agent_workflow_contracts import AgentCompletionEnvelope, TaskResult
 
@@ -21,20 +21,24 @@ from .runner_session_events import (
   build_tool_call_start_event as _build_tool_call_start_event,
 )
 from .runner_session_lifecycle import _runner_attr
+from .policy_imports import load_server_policy_module
 from .runner_state import ToolResultContext
-from .runner_tool_audit import redact_tool_input_for_event as _redact_tool_input_for_event
 from .secret_boundary import (
+  SecretBoundary,
   sanitize_boundary_value,
   sanitize_tool_event,
   sanitization_failure_tool_input,
 )
 from .tool_display import resolve_display
+from .tool_policy_registry import PreparedToolCall, ToolInputPreparationError
+from .tool_dispatcher_helpers import LocalToolHandler, ToolResult
 from .tool_dispatch_classification import (
+  DispatchEntry,
   DEFAULT_MAX_TOOL_RETRIES as _MAX_TOOL_DISPATCH_RETRIES,
   RETRYABLE_OUTCOMES as _RETRYABLE_DISPATCH_OUTCOMES,
-  build_dispatch_record,
+  ToolResultSettlement,
+  build_dispatch_record_from_sources,
   classify_semantic_tool_error,
-  classify_tool_outcome,
   resolve_dispatch_entry,
   retry_backoff_seconds,
   retry_decision,
@@ -50,6 +54,11 @@ from .workflow_output_attachment import (
   record_workflow_output_attachment,
 )
 
+if TYPE_CHECKING:
+  from .approval_policy import RunContext
+  from .mcp_client import McpClientManager
+
+
 
 log = logging.getLogger("agent_gateway.runner")
 _RUN_AGENT_DISPATCH_TIMEOUT_SECONDS = 2100.0
@@ -59,6 +68,119 @@ _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY = "_active_skill_report_doors"
 _READABLE_RESOURCE_SNAPSHOT_RESULT_KEY = "_readable_resource_snapshot"
 _READABLE_RESOURCE_MAX_CONTENT_BYTES = 2_000_000
 _REPEATED_TOOL_EXCLUDED_STOP_AFTER_COUNT = 2
+
+@runtime_checkable
+class _OutputFileToolsGetter(Protocol):
+  def __call__(self) -> Iterable[object]: ...
+
+
+@runtime_checkable
+class _AsyncToolCallPreparer(Protocol):
+  async def __call__(
+    self,
+    tool_name: str,
+    tool_input: Dict[str, Any],
+  ) -> PreparedToolCall: ...
+
+
+@runtime_checkable
+class _EffectiveToolInputResolver(Protocol):
+  def __call__(
+    self,
+    tool_name: str,
+    tool_input: Dict[str, Any],
+  ) -> Dict[str, Any]: ...
+
+
+
+
+class AgentRunnerDispatcher(Protocol):
+  """Dispatcher surface consumed by the runner and tool-execution mixin."""
+
+  def bind_secret_boundary(self, boundary: SecretBoundary) -> None: ...
+
+  @property
+  def run_context(self) -> RunContext | None: ...
+
+  def with_scoped_local_handler(
+    self,
+    tool_name: str,
+    scope: Callable[[LocalToolHandler], LocalToolHandler],
+  ) -> AgentRunnerDispatcher: ...
+
+  async def dispatch(
+    self,
+    tool_call_id: str,
+    tool_name: str,
+    tool_input: Dict[str, Any],
+    *,
+    call_index: int = 0,
+    advertised_tool_names: AbstractSet[str] | None = None,
+    abort_event: asyncio.Event | None = None,
+    skill_run_id: str | None = None,
+    workspace_dir: str | None = None,
+    batch_id: int | str | None = None,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: (
+      Callable[[PreparedToolCall], None] | None
+    ) = None,
+  ) -> ToolResult: ...
+
+  def prepare_tool_call(
+    self,
+    tool_name: str,
+    tool_input: Dict[str, Any],
+  ) -> PreparedToolCall: ...
+
+  async def dispatch_prepared(
+    self,
+    tool_call_id: str,
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+    *,
+    call_index: int = 0,
+    advertised_tool_names: AbstractSet[str] | None = None,
+    abort_event: asyncio.Event | None = None,
+    skill_run_id: str | None = None,
+    workspace_dir: str | None = None,
+    batch_id: int | str | None = None,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: (
+      Callable[[PreparedToolCall], None] | None
+    ) = None,
+  ) -> ToolResult: ...
+
+  def redact_prepared_tool_input(
+    self,
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+  ) -> dict[str, object]: ...
+
+  def route_origin_for_tool(self, tool_name: str) -> str | None: ...
+
+  def requires_approval(
+    self,
+    tool_name: str,
+    tool_input: Dict[str, Any],
+  ) -> bool: ...
+
+  def requires_approval_prepared(
+    self,
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+  ) -> bool: ...
+
+  def settle_tool_result(
+    self,
+    tool_name: str,
+    dispatch_entry: DispatchEntry | None,
+    result: Any,
+    error: Mapping[str, Any] | None,
+    semantic_error: Mapping[str, Any] | None = None,
+    *,
+    prepared_call: PreparedToolCall,
+  ) -> ToolResultSettlement: ...
+
 _FMS_WRITER_TOOL_FALLBACKS = frozenset({
   "fms_link_thesis",
   "fms_persist_business_model",
@@ -205,49 +327,57 @@ def _readable_resource_event_from_snapshot(
   tool_name: str,
   timestamp: float,
 ) -> dict[str, Any] | None:
-  if not isinstance(snapshot, dict):
+  def _drop(reason: str) -> None:
+    # One bounded warning per dropped snapshot: the producer is our own
+    # memory_write handler (_memory_write_readable_resource_snapshot), so a
+    # drop here is a producer/consumer contract break that must be visible.
+    log.warning(
+      "Dropping readable-resource snapshot from tool %s (%s): %s",
+      tool_name,
+      tool_call_id,
+      reason,
+    )
     return None
+
+  if not isinstance(snapshot, dict):
+    return _drop("snapshot is not a mapping")
   content = snapshot.get("content")
   if not isinstance(content, str) or not content.strip():
-    return None
+    return _drop("content is missing or empty")
   content_bytes_payload = content.encode("utf-8")
   if len(content_bytes_payload) > _READABLE_RESOURCE_MAX_CONTENT_BYTES:
-    return None
+    return _drop("content exceeds the readable-resource byte bound")
   content_sha256 = snapshot.get("content_sha256")
   if not isinstance(content_sha256, str) or not content_sha256.strip():
-    return None
+    return _drop("content_sha256 is missing")
   normalized_sha256 = content_sha256.lower()
   if hashlib.sha256(content_bytes_payload).hexdigest() != normalized_sha256:
-    return None
+    return _drop("content_sha256 does not match the content")
   source_path = snapshot.get("source_path")
   if not isinstance(source_path, str) or not source_path.strip():
-    return None
+    return _drop("source_path is missing")
   contract_name = snapshot.get("contract_name")
   if not isinstance(contract_name, str) or not contract_name.strip():
-    return None
+    return _drop("contract_name is missing")
   content_type = snapshot.get("content_type")
-  if content_type not in {"text/markdown", "text/plain"}:
-    return None
   content_class = snapshot.get("content_class")
-  if content_class != "human_readable":
-    return None
   content_snapshot_id = snapshot.get("content_snapshot_id")
   if not isinstance(content_snapshot_id, str) or not content_snapshot_id.strip():
-    return None
+    return _drop("content_snapshot_id is missing")
   truncated = snapshot.get("truncated")
   if not isinstance(truncated, bool):
-    return None
+    return _drop("truncated is not a bool")
   control_run_id = str(os.getenv("AGENT_AUTONOMOUS_CONTROL_RUN_ID") or getattr(runner, "_full_session_id", "")).strip()
   if not control_run_id:
-    return None
+    return _drop("control_run_id is unavailable")
   seed = "\0".join([control_run_id, tool_call_id, source_path, normalized_sha256])
   resource_id = f"rr:{hashlib.sha256(seed.encode('utf-8')).hexdigest()}"
   skill_run_id = str(getattr(runner, "_skill_run_id", "") or "").strip() or f"tool:{tool_call_id}"
   content_bytes = snapshot.get("content_bytes")
   if not isinstance(content_bytes, int) or isinstance(content_bytes, bool):
-    return None
+    return _drop("content_bytes is not an int")
   if content_bytes != len(content_bytes_payload):
-    return None
+    return _drop("content_bytes does not match the encoded content length")
   event: dict[str, Any] = {
     "type": "readable_resource_ready",
     "resource_id": resource_id,
@@ -277,41 +407,33 @@ def _readable_resource_event_from_snapshot(
 
 
 def _fms_commit_tool_names() -> frozenset[str]:
-  for module_name in ("agent.shared.server_policies", "api.agent.shared.server_policies"):
+  server_policies = load_server_policy_module()
+  if server_policies is None:
+    return _FMS_WRITER_TOOL_FALLBACKS
+  names: set[str] = set()
+  for attr_name in ("FMS_MODEL_WRITER_TOOLS", "FMS_THESIS_WRITER_TOOLS"):
+    raw_names = getattr(server_policies, attr_name, frozenset())
     try:
-      server_policies = importlib.import_module(module_name)
-    except Exception:
+      names.update(str(tool_name) for tool_name in raw_names if str(tool_name or "").strip())
+    except TypeError:
       continue
-    names: set[str] = set()
-    for attr_name in ("FMS_MODEL_WRITER_TOOLS", "FMS_THESIS_WRITER_TOOLS"):
-      raw_names = getattr(server_policies, attr_name, frozenset())
-      try:
-        names.update(str(tool_name) for tool_name in raw_names if str(tool_name or "").strip())
-      except TypeError:
-        continue
-    if names:
-      return frozenset(names)
+  if names:
+    return frozenset(names)
   return _FMS_WRITER_TOOL_FALLBACKS
 
 
 def _output_file_gated_tool_names() -> frozenset[str]:
-  for module_name in ("agent.shared.server_policies", "api.agent.shared.server_policies"):
-    try:
-      server_policies = importlib.import_module(module_name)
-    except Exception:
-      continue
-    getter = getattr(server_policies, "get_output_file_tools", None)
-    if not callable(getter):
-      continue
-    try:
-      names = getter()
-    except Exception:
-      continue
-    try:
-      return frozenset(str(tool_name) for tool_name in names if str(tool_name or "").strip())
-    except TypeError:
-      continue
-  return _OUTPUT_FILE_GATED_TOOL_FALLBACKS
+  server_policies = load_server_policy_module()
+  if server_policies is None:
+    return _OUTPUT_FILE_GATED_TOOL_FALLBACKS
+  getter = getattr(server_policies, "get_output_file_tools", None)
+  if not isinstance(getter, _OutputFileToolsGetter):
+    return _OUTPUT_FILE_GATED_TOOL_FALLBACKS
+  names = getter()
+  try:
+    return frozenset(str(tool_name) for tool_name in names if str(tool_name or "").strip())
+  except TypeError:
+    return _OUTPUT_FILE_GATED_TOOL_FALLBACKS
 
 
 def _fms_commit_blocker_error(tool_name: str) -> Dict[str, Any] | None:
@@ -407,6 +529,108 @@ def _error_with_model_error_data(error: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class RunnerToolExecutionMixin:
+  if TYPE_CHECKING:
+    _batch_id: str | None
+    _dispatcher: AgentRunnerDispatcher
+    _dispatcher_accepts_abort_event: bool
+    _dispatcher_accepts_skill_run_context: bool
+    _full_session_id: str
+    _last_assistant_message_seq: int | None
+    _mcp_client: McpClientManager | None
+    _pending_background_result_acks: dict[
+      str,
+      tuple[str, int],
+    ]
+    _pending_workflow_output_attachments: dict[
+      str,
+      WorkflowOutputAttachment,
+    ]
+    _request_id: str
+    _sid: str
+    _skill_run_id: str | None
+    _tool_abort_event: asyncio.Event
+    _tool_call_timeout: float | None
+    _workspace_dir: str | None
+
+    def _activate_skill_allow(
+      self,
+      tool_names: Any,
+      base_kwargs: Dict[str, Any],
+    ) -> None: ...
+
+    def _activate_skill_deny(
+      self,
+      tool_names: Any,
+      base_kwargs: Dict[str, Any],
+    ) -> None: ...
+
+    def _activate_skill_report_doors(self, value: Any) -> None: ...
+
+    @staticmethod
+    def _annotate_result(
+      result: Any,
+      tool_name: str = "",
+    ) -> Any: ...
+
+    def _append(self, event: Dict[str, Any]) -> Any | None: ...
+
+    async def _append_durable_event(
+      self,
+      event: Dict[str, Any],
+    ) -> Any | None: ...
+
+    async def _call_on_tool_result(
+      self,
+      ctx: ToolResultContext,
+    ) -> List[Dict[str, Any]]: ...
+
+    def _call_on_tool_timing(
+      self,
+      *,
+      tool_name: str,
+      server: str | None,
+      duration_ms: int,
+      is_error: bool,
+      result_bytes: int,
+      tool_call_id: str | None = None,
+      request_id: str | None = None,
+    ) -> None: ...
+
+    def _clear_active_skill_if_report_door_completed(
+      self,
+      event: Dict[str, Any],
+      base_kwargs: Dict[str, Any],
+    ) -> bool: ...
+
+    def _compact_model_tool_result_entry(
+      self,
+      result_entry: Dict[str, Any],
+      *,
+      tool_name: str,
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]: ...
+
+    def _effective_excluded_tools(self) -> set[str]: ...
+
+    @staticmethod
+    def _make_error_result(
+      tool_use_id: str,
+      code: str,
+      message: str,
+      sub_code: str = "",
+      data: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]: ...
+
+    def _rebuild_filtered_tool_definitions(
+      self,
+      base_kwargs: Dict[str, Any],
+    ) -> None: ...
+
+    def _refresh_tools(
+      self,
+      base_kwargs: Dict[str, Any],
+      _new_servers: List[str],
+    ) -> None: ...
+
   async def _execute_single_tool(
     self,
     tool_id: str,
@@ -422,56 +646,105 @@ class RunnerToolExecutionMixin:
     timeout_error_type = getattr(asyncio_module, "TimeoutError", asyncio.TimeoutError)
     cancelled_error_type = getattr(asyncio_module, "CancelledError", asyncio.CancelledError)
 
-    effective_tool_input = tool_input
-    resolve_effective_tool_input = getattr(self._dispatcher, "resolve_effective_tool_input", None)
-    if callable(resolve_effective_tool_input):
+    prepared_call = PreparedToolCall(tool_input)
+    preparation_failed = False
+    preparation_error: Dict[str, Any] | None = None
+    prepare_tool_call_async = getattr(
+      self._dispatcher,
+      "prepare_tool_call_async",
+      None,
+    )
+    prepare_tool_call = getattr(self._dispatcher, "prepare_tool_call", None)
+    dispatch_prepared = getattr(self._dispatcher, "dispatch_prepared", None)
+    if (
+      (
+        isinstance(prepare_tool_call_async, _AsyncToolCallPreparer)
+        or callable(prepare_tool_call)
+      )
+      and callable(dispatch_prepared)
+    ):
       try:
-        effective_tool_input = resolve_effective_tool_input(tool_name, tool_input)
-      except Exception:
-        effective_tool_input = tool_input
-    tool_input = effective_tool_input
-
-    redacted_tool_input = _runner_attr(self, "_redact_tool_input_for_event", _redact_tool_input_for_event)(
-      tool_name,
-      tool_input,
-    )
-    redacted_tool_input = sanitize_boundary_value(
-      redacted_tool_input,
-      sink="tool_input",
-      boundary=getattr(self, "_secret_boundary", None),
-    )
-    if not isinstance(redacted_tool_input, dict):
-      redacted_tool_input = sanitization_failure_tool_input()
-    tool_input_preview = json_module.dumps(redacted_tool_input, default=str)[:200]
-    logger.info(
-      "[%s] Tool call: %s | input=%s",
-      self._sid,
-      tool_name,
-      tool_input_preview,
-      extra={
-        "data": {
-          "event": "tool_call",
-          "session_id": self._sid,
-          "tool": tool_name,
-          "input_preview": tool_input_preview,
-        }
-      },
-    )
-    if tool_name == "emit_canvas_artifact":
-      from .canvas_kit_contract import limits as canvas_kit_limits
-
-      source_bytes = len((tool_input.get("tsx_source") or "").encode("utf-8"))
-      source_cap = canvas_kit_limits()["source_max_bytes"]
-      if source_bytes > source_cap:
-        return (
-          self._make_error_result(
-            tool_id,
-            "invalid_input",
-            f"emit_canvas_artifact: tsx_source payload {source_bytes} bytes exceeds {source_cap} byte limit",
-          ),
+        if isinstance(prepare_tool_call_async, _AsyncToolCallPreparer):
+          candidate = await prepare_tool_call_async(tool_name, tool_input)
+        else:
+          candidate = self._dispatcher.prepare_tool_call(tool_name, tool_input)
+        if type(candidate) is not PreparedToolCall:
+          raise TypeError("prepare_tool_call must return exact PreparedToolCall")
+        prepared_call = candidate
+        tool_input = prepared_call.materialize_input()
+      except ToolInputPreparationError as exc:
+        tool_input = {}
+        preparation_error = exc.materialize_error()
+        preparation_failed = True
+      except Exception as exc:
+        logger.error(
+          "[%s] Tool input preparation failed for %s | exception_type=%s",
+          self._sid,
           tool_name,
-          [],
+          type(exc).__name__,
         )
+        tool_input = {}
+        preparation_failed = True
+    else:
+      effective_tool_input = tool_input
+      resolve_effective_tool_input = getattr(
+        self._dispatcher,
+        "resolve_effective_tool_input",
+        None,
+      )
+      if isinstance(resolve_effective_tool_input, _EffectiveToolInputResolver):
+        try:
+          effective_tool_input = resolve_effective_tool_input(
+            tool_name,
+            tool_input,
+          )
+        except Exception:
+          effective_tool_input = tool_input
+      tool_input = effective_tool_input
+      prepared_call = PreparedToolCall(tool_input)
+    executed_prepared_call = prepared_call
+
+    def capture_executed_prepared_call(call: PreparedToolCall) -> None:
+      nonlocal executed_prepared_call
+      if type(call) is not PreparedToolCall:
+        raise TypeError("executed call must be an exact PreparedToolCall")
+      executed_prepared_call = call
+
+    redacted_tool_input: dict[str, Any] | None = None
+    if not preparation_failed:
+      redacted = self._dispatcher.redact_prepared_tool_input(
+        tool_name,
+        prepared_call,
+      )
+      redacted = sanitize_boundary_value(
+        redacted,
+        sink="tool_input",
+        boundary=getattr(self, "_secret_boundary", None),
+      )
+      redacted_tool_input = (
+        redacted
+        if isinstance(redacted, dict)
+        else sanitization_failure_tool_input()
+      )
+      tool_input_preview = json_module.dumps(
+        redacted_tool_input,
+        default=str,
+      )[:200]
+      logger.info(
+        "[%s] Tool call: %s | input=%s",
+        self._sid,
+        tool_name,
+        tool_input_preview,
+        extra={
+          "data": {
+            "event": "tool_call",
+            "session_id": self._sid,
+            "tool": tool_name,
+            "input_preview": tool_input_preview,
+          }
+        },
+      )
+
     if tool_name == "emit_dashboard_artifact":
       payload_bytes = len(json_module.dumps(tool_input.get("payload") or {}).encode("utf-8"))
       if payload_bytes > 256 * 1024:
@@ -491,32 +764,67 @@ class RunnerToolExecutionMixin:
       if self._mcp_client is not None
       else None
     )
-    provider_id = get_provider_id(tool_name) if callable(get_provider_id) else None
+    provider_id = (
+      self._mcp_client.get_provider_id_for_tool(tool_name)
+      if callable(get_provider_id) and self._mcp_client is not None
+      else None
+    )
+    get_policy_tool_name = (
+      getattr(self._mcp_client, "get_policy_tool_name", None)
+      if self._mcp_client is not None
+      else None
+    )
+    original_tool_name = (
+      self._mcp_client.get_policy_tool_name(tool_name)
+      if (
+        callable(get_policy_tool_name)
+        and self._mcp_client is not None
+        and server is not None
+      )
+      else tool_name
+    )
+    route_origin = None
+    route_origin_for_tool = getattr(self._dispatcher, "route_origin_for_tool", None)
+    if callable(route_origin_for_tool):
+      route_origin = self._dispatcher.route_origin_for_tool(tool_name)
     dispatch_entry = resolve_dispatch_entry(
       tool_name,
+      origin=route_origin,
       server=server,
+      original_tool_name=original_tool_name,
       provider_id=provider_id,
     )
-    display = _runner_attr(self, "resolve_display", resolve_display)(tool_name, redacted_tool_input)
-    tool_start_event = _runner_attr(self, "_build_tool_call_start_event", _build_tool_call_start_event)(
-      tool_call_id=tool_id,
-      tool_name=tool_name,
-      tool_input=redacted_tool_input,
-      call_index=call_index,
-      server=server,
-      started_at=tool_t0,
-      parent_assistant_message_seq=self._last_assistant_message_seq,
-    )
-    if display is not None:
-      tool_start_event["display"] = display
-    await self._append_durable_event(tool_start_event)
-    self._append(tool_start_event)
+    if not preparation_failed:
+      assert redacted_tool_input is not None
+      display = _runner_attr(self, "resolve_display", resolve_display)(
+        tool_name,
+        redacted_tool_input,
+      )
+      tool_start_event = _runner_attr(
+        self,
+        "_build_tool_call_start_event",
+        _build_tool_call_start_event,
+      )(
+        tool_call_id=tool_id,
+        tool_name=tool_name,
+        tool_input=redacted_tool_input,
+        call_index=call_index,
+        server=server,
+        started_at=tool_t0,
+        parent_assistant_message_seq=self._last_assistant_message_seq,
+      )
+      if display is not None:
+        tool_start_event["display"] = display
+      await self._append_durable_event(tool_start_event)
+      self._append(tool_start_event)
     result: Optional[Any] = None
     error: Optional[Dict[str, Any]] = None
     semantic_error: Optional[Dict[str, Any]] = None
     cancelled_exc: BaseException | None = None
     dispatch_attempts = 1
     dispatch_retries_exhausted = False
+    settled_result: ToolResultSettlement | None = None
+    outcome_inputs_changed = False
     result_bytes = 0
     duration_ms = 0
     load_servers_signal: Optional[List[str]] = None
@@ -528,7 +836,14 @@ class RunnerToolExecutionMixin:
     superseded_continuation_run_id: str | None = None
 
     try:
-      if tool_name in self._effective_excluded_tools():
+      if preparation_failed:
+        error = preparation_error or {
+          "code": "tool_input_preparation_failed",
+          "message": (
+            f"Tool '{tool_name}' input could not be prepared for dispatch."
+          ),
+        }
+      elif tool_name in self._effective_excluded_tools():
         error = _fms_commit_blocker_error(tool_name) or _output_file_gated_tool_error(tool_name) or {
           "code": "tool_excluded",
           "message": f"Tool '{tool_name}' is not available in this context",
@@ -548,6 +863,7 @@ class RunnerToolExecutionMixin:
           dispatch_kwargs["advertised_tool_names"] = base_kwargs.get(
             "_request_advertised_tool_names"
           )
+        dispatch_kwargs["allow_uncertain_mcp_replay"] = False
         if self._dispatcher_accepts_abort_event:
           dispatch_kwargs["abort_event"] = self._tool_abort_event
         if self._dispatcher_accepts_skill_run_context:
@@ -557,11 +873,21 @@ class RunnerToolExecutionMixin:
             dispatch_kwargs["batch_id"] = self._batch_id
         if getattr(self, "_dispatcher_accepts_readable_resource_snapshot", False) and tool_name == "memory_write":
           dispatch_kwargs["capture_readable_resource_snapshot"] = True
+        dispatch_kwargs["on_executed_prepared_call"] = (
+          capture_executed_prepared_call
+        )
         needs_approval = False
-        requires_approval_fn = getattr(self._dispatcher, "requires_approval", None)
+        requires_approval_fn = (
+          getattr(self._dispatcher, "requires_approval_prepared", None)
+          if callable(dispatch_prepared)
+          else getattr(self._dispatcher, "requires_approval", None)
+        )
         if requires_approval_fn is not None:
           try:
-            needs_approval = requires_approval_fn(tool_name, tool_input)
+            needs_approval = requires_approval_fn(
+              tool_name,
+              prepared_call if callable(dispatch_prepared) else tool_input,
+            )
           except Exception:
             pass
         # MCP tools already carry per-server read timeouts in McpClientManager.
@@ -608,11 +934,20 @@ class RunnerToolExecutionMixin:
         while True:
           result = None
           error = None
-          dispatch_coro = self._dispatcher.dispatch(
-            tool_id,
-            tool_name,
-            tool_input,
-            **dispatch_kwargs,
+          dispatch_coro = (
+            self._dispatcher.dispatch_prepared(
+              tool_id,
+              tool_name,
+              prepared_call,
+              **dispatch_kwargs,
+            )
+            if callable(dispatch_prepared)
+            else self._dispatcher.dispatch(
+              tool_id,
+              tool_name,
+              tool_input,
+              **dispatch_kwargs,
+            )
           )
           if effective_tool_timeout is not None and not skip_timeout:
             try:
@@ -634,7 +969,15 @@ class RunnerToolExecutionMixin:
           else:
             result, error = await dispatch_coro
 
-          attempt_outcome = classify_tool_outcome(dispatch_entry, result, error)
+          attempt_result = self._dispatcher.settle_tool_result(
+            tool_name,
+            dispatch_entry,
+            result,
+            error,
+            prepared_call=executed_prepared_call,
+          )
+          attempt_outcome = attempt_result.outcome
+          settled_result = attempt_result
           abort_event = getattr(self, "_tool_abort_event", None)
           aborted = bool(abort_event is not None and abort_event.is_set())
           wall_clock_exhausted = bool(
@@ -666,12 +1009,18 @@ class RunnerToolExecutionMixin:
           dispatch_attempts += 1
 
       if error is None:
-        result, child_evidence = _canonical_agent_result_payload(result)
+        canonical_result, child_evidence = _canonical_agent_result_payload(
+          result
+        )
+        if canonical_result is not result:
+          outcome_inputs_changed = True
+        result = canonical_result
 
       # Strip private control fields from result before logging, event capture, and
       # model-bound tool_result content. _load_servers is a control signal -- capture
       # it for _refresh_tools (called after finally), then remove from result.
       if error is None and isinstance(result, dict):
+        result_keys_before_control_projection = set(result)
         popped_background_result_ack = result.pop(
           _BACKGROUND_RESULT_ACK_RESULT_KEY,
           None,
@@ -730,6 +1079,8 @@ class RunnerToolExecutionMixin:
         self._activate_skill_report_doors(result.pop(report_doors_key, None))
         self._activate_skill_allow(result.pop(skill_allow_key, None), base_kwargs)
         self._activate_skill_deny(result.pop(skill_deny_key, None), base_kwargs)
+        if set(result) != result_keys_before_control_projection:
+          outcome_inputs_changed = True
 
       tool_elapsed = time_module.time() - tool_t0
       if error is None:
@@ -738,6 +1089,8 @@ class RunnerToolExecutionMixin:
           "classify_semantic_tool_error",
           classify_semantic_tool_error,
         )(result)
+        if semantic_error is not None:
+          outcome_inputs_changed = True
       if error is None and semantic_error is None:
         superseded_continuation_run_id = accepted_workflow_continuation_run_id(
           tool_name,
@@ -754,6 +1107,7 @@ class RunnerToolExecutionMixin:
             "code": "workflow_output_attachment_invalid",
             "message": str(exc),
           }
+          outcome_inputs_changed = True
       if semantic_error is None and _is_accepted_ui_blocks_result(tool_name, result, error):
         setattr(self, "_stop_after_tool_results_reason", "accepted_ui_blocks")
         setattr(self, "_stop_after_tool_results_tool_name", tool_name)
@@ -771,7 +1125,6 @@ class RunnerToolExecutionMixin:
       result_bytes = len(result_json)
       result_preview = result_json[:150] if result_json else "null"
       if error or semantic_error:
-        error_detail = error if error is not None else semantic_error
         logger.warning(
           "[%s] Tool %s error (%.1fs): %s",
           self._sid,
@@ -814,6 +1167,7 @@ class RunnerToolExecutionMixin:
     except cancelled_error_type as exc:
       cancelled_exc = exc
       error = {"code": "cancelled", "message": "Task was cancelled"}
+      outcome_inputs_changed = True
     except Exception as exc:
       safe_exc = sanitize_boundary_value(
         str(exc),
@@ -822,19 +1176,34 @@ class RunnerToolExecutionMixin:
       )
       logger.error("[%s] Tool %s unhandled error: %s", self._sid, tool_name, safe_exc)
       error = {"code": "internal_error", "message": str(exc)}
+      outcome_inputs_changed = True
     finally:
       duration_ms = int((time_module.time() - tool_t0) * 1000)
       if isinstance(error, dict):
-        error = _error_with_model_error_data(error)
+        enriched_error = _error_with_model_error_data(error)
+        if enriched_error is not error:
+          outcome_inputs_changed = True
+        error = enriched_error
       # Every exit path funnels here — normal, semantic error, exclusion,
       # timeout, cancellation, unhandled exception — so the dispatch record
       # settles unconditionally, and it is on the event before the cancelled
       # arm's early append below.
-      dispatch_record = build_dispatch_record(
+      final_result = (
+        self._dispatcher.settle_tool_result(
+          tool_name,
+          dispatch_entry,
+          result,
+          error,
+          semantic_error,
+          prepared_call=executed_prepared_call,
+        )
+        if settled_result is None or outcome_inputs_changed
+        else settled_result
+      )
+      dispatch_record = build_dispatch_record_from_sources(
         entry=dispatch_entry,
-        result=result,
-        error=error,
-        semantic_error=semantic_error,
+        outcome=final_result.outcome,
+        sources=final_result.sources,
         attempts=dispatch_attempts,
         retries_exhausted=dispatch_retries_exhausted,
       )
@@ -917,13 +1286,14 @@ class RunnerToolExecutionMixin:
         "tool_use_id": tool_id,
         "content": json_module.dumps(model_result, default=str),
       }
-      if semantic_error is not None:
+      if tool_complete_event["is_error"]:
         result_entry["is_error"] = True
 
     extra_blocks = await self._call_on_tool_result(
       _runner_attr(self, "ToolResultContext", ToolResultContext)(
         tool_name=tool_name,
         tool_input=dict(tool_input),
+        redacted_tool_input=copy.deepcopy(redacted_tool_input),
         result=result,
         error=error,
         duration_ms=duration_ms,

@@ -74,7 +74,7 @@ def test_custom_gateway_examples_consume_exact_session_driver_bind(
   request = prepared.request
   bind = request.capability_bind
   assert bind is not None
-  assert bind.receipt() == {
+  assert bind.to_json() == {
     "schema_version": "1.0",
     "capability_id": "session.driver",
     "model_key": "anthropic.claude-opus-5",
@@ -119,6 +119,8 @@ def test_custom_gateway_examples_consume_exact_session_driver_bind(
     session.session_id,
     float(session.created_at),
   )
+  bound_auth_config = request.bound_auth_config
+  assert bound_auth_config is not None
   assert runner._provider is request.bound_provider
-  assert runner._auth_config == dict(request.bound_auth_config)
+  assert runner._auth_config == dict(bound_auth_config)
   assert runner._capability_execution is request.capability_execution

@@ -14,7 +14,6 @@ from agent_gateway.runner_tool_audit import get_tool_risk_value, redact_tool_inp
 
 def test_runner_preserves_tool_audit_helper_aliases() -> None:
   assert gateway_runner._get_tool_risk_value is get_tool_risk_value
-  assert gateway_runner._redact_tool_input_for_event is redact_tool_input_for_event
 
 
 def test_tool_risk_value_fallback_classifies_common_patterns(monkeypatch) -> None:

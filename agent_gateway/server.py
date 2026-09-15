@@ -1,3 +1,13 @@
+"""Generic FastAPI and SSE composition root for the agent gateway.
+
+``create_gateway_app`` turns application-supplied auth, model policy, runtime
+factories, and lifecycle hooks into the package's HTTP surface. Route modules
+and ``control_plane/`` own endpoint implementations; ``AgentRunner`` and
+``ToolDispatcher`` own model/tool execution. The embedding product remains the
+authority for domain policy and resolved capabilities. See
+``packages/agent-gateway/README.md``.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +19,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, TYPE_CHECKING
 
 from fastapi import APIRouter, Body, FastAPI, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
@@ -18,8 +28,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
+if TYPE_CHECKING:
+  from .mcp_client import McpClientManager
+
 from .artifact_paths import (
-  ArtifactPath as ArtifactPath,
   ArtifactPathError as ArtifactPathError,
   artifact_json_paths_for_request as artifact_json_paths_for_request,
   artifact_json_path_for_request as artifact_json_path_for_request,
@@ -36,6 +48,12 @@ from .auth import (
 )
 from .autonomous_runner import AutonomousRegistry
 from .skills import SkillLoader
+from .directory_control_skill_catalog import DirectoryControlSkillCatalog
+from .skill_limits import (
+  AutonomousSkillAdmissionPolicy,
+  AutonomousSkillAdmissionPolicyResolver,
+  SkillExecutionLimits,
+)
 from .control_plane import create_control_plane_router
 from .control_plane.middleware import add_control_plane_version_header_middleware
 from .control_plane.session import _resolve_control_identity
@@ -45,15 +63,15 @@ from .commercial_work_start import (
   CommercialWorkStartError,
 )
 from .capability_binding import (
-  CAPABILITY_IDS,
   CapabilityResolutionError,
   eligible_model_choices,
 )
 from .model_registry import GATEWAY_EXECUTED_CAPABILITY_IDS
 from .event_log import EventLog, UserEventBus
+from .approval_route import bind_session_approval_route
 from .dispatcher_factory import GatewayDispatcherDeps
 from .approvals import ApprovalActionError, _record_vote_and_unblock  # noqa: F401
-from .approval_store import expire_pending_loop  # noqa: F401
+from .approval_store import expire_pending_loop
 from .package_info import (
   CONTRACT_CHAT_ATTACHMENTS_V1,
   CONTRACT_INVESTMENT_SELECTED_CONTENT_V1,
@@ -64,7 +82,6 @@ from .investment_capability_claim import (
 )
 from .providers import (
   ModelProvider,
-  StreamEvent,
   installed_adapter_providers,
 )
 from .runner_introspection import exception_traceback_already_logged
@@ -81,33 +98,20 @@ from .ui_blocks_store import read_ui_blocks_payload as read_ui_blocks_payload
 
 from . import server_chat_helpers as _server_chat_helpers  # noqa: F401 - dynamic streaming deps alias
 from . import server_chat_control_routes as _server_chat_control_routes
-from . import server_artifact_routes as _server_artifact_routes  # noqa: F401 - dynamic artifact route deps alias
+from . import server_artifact_routes as _server_artifact_routes
 from . import server_streaming as _server_streaming
 from . import server_tool_routes as _server_tool_routes
 from . import server_workflow_output_routes as _server_workflow_output_routes
 from .server_models import (  # noqa: F401
   SystemPrompt,
-  ExecutionLocationResolver,
   BuildChatRuntime,
   RequestApproval,
   BuildRunner,
   _AGENT_API_CLAIM_AUDIENCE,
-  _AGENT_API_CLAIM_CLOCK_SKEW_SECONDS,
-  _AGENT_API_CLAIM_NONCE_HEX_LENGTH,
-  _AGENT_API_CLAIM_HEADERS,
-  _AGENT_API_CLAIM_MAX_TTL_SECONDS_DEFAULT,
   _ARTIFACT_DOCX_MEDIA_TYPE,
-  _ARTIFACT_ORIGIN_VALUES,
-  _ARTIFACT_ORIGIN_FILTER_VALUES,
-  _ARTIFACT_VISIBILITY_VALUES,
-  _ARTIFACT_VISIBILITY_FILTER_VALUES,
   _ARTIFACT_INDEX_RECENT_LIMIT,
-  _DEFAULT_CHAT_PROFILE,
-  _CHAT_PROFILE_ALIASES,
-  _ACTIVE_TURN_GRACE_SECONDS,
   _STREAM_SUBSCRIBER_QUEUE_MAX,
   _STREAM_SUBSCRIBER_KEEPALIVE_SECONDS,
-  _SIDECAR_SLUG_RE,
   _STREAM_SUBSCRIBER_DONE,
   ChatInitRequest,
   ChatInitResponse,
@@ -115,7 +119,6 @@ from .server_models import (  # noqa: F401
   ChatRequest,
   ChatRecapRequest,
   ChatCancelRequest,
-  _resolve_chat_profile_name,
   ChatTurnInputs,
   ChatTurnResult,
   PreparedChatTurn,
@@ -124,44 +127,26 @@ from .server_models import (  # noqa: F401
   ChatRuntime,
   ModelPreferenceResponse,
   ModelPreferenceUpdate,
-  _build_runner_with_started_at,
   _call_build_chat_runtime,
   RequestContext,
   GatewayServerConfig,
   MaterializedCredential,
 )
 from .server_artifact_helpers import (  # noqa: F401
-  _model_to_dict,
   _normalize_prefix,
   _route_path,
   _default_control_skills_dir,
   _default_autonomous_api_dir,
   _default_autonomous_log_dir,
   _resolve_compaction_trigger,
-  _sanitize_for_json,
   _json_dumps,
-  _claim_ttl_ceiling_seconds,
-  _verify_signed_user_claim,
   _artifact_auth_dependency,
-  _extract_agent_claim_headers,
-  _verify_agent_claim_headers,
   _artifact_json_response,
   _artifact_payload_from_path,
   _decorate_artifact_payload,
-  _artifact_effective_fields,
-  _artifact_research_file_classification,
-  _artifact_sidecar_classification,
-  _artifact_origin_kind,
-  _artifact_origin_kind_filter,
-  _artifact_visibility,
-  _artifact_visibility_filter,
-  _artifact_origin_ref,
   _artifact_request_filters,
   _artifact_payload_matches_filters,
   _int_or_none,
-  _artifact_research_file_id_token_present,
-  _query_int_or_none,
-  _query_str_or_none,
   _assert_artifact_path_still_safe,
   _file_cache_headers,
   _letter_filename,
@@ -170,10 +155,7 @@ from .server_artifact_helpers import (  # noqa: F401
   _error_payload,
 )
 from .server_chat_helpers import (  # noqa: F401
-  _drain_result_queue,
   _now_iso,
-  _sidecar_slug,
-  _maybe_write_chat_log_meta,
   _write_transcript,
   _cleanup_old_transcripts,
   _compute_session_recap_payload,
@@ -181,20 +163,13 @@ from .server_chat_helpers import (  # noqa: F401
   _redact_tool_input_for_event,
   _cleanup_sessions_loop,
   _maybe_await,
-  _cancel_active_turn_cleanup_handle,
   _clear_active_turn,
   _active_turn_is_running,
-  _schedule_active_turn_clear,
   _cancel_active_turn_runner,
   _cleanup_active_turn_on_expiry,
   _event_for_wire,
   _resolve_schema_version,
-  _stream_envelope,
-  _legacy_request_approval,
   _make_request_approval,
-  _chat_turn_state_from_events,
-  _chat_run_state_event,
-  _latest_chat_run_state,
   bind_init_capability_selections,
   build_capability_choices,
   _capability_execution_resolver_for_session,
@@ -204,17 +179,24 @@ from .server_chat_helpers import (  # noqa: F401
 )
 
 
-def _generic_skill_resume_allowed_resolver(
+def _generic_skill_admission_policy_resolver(
   skills_dir: Path,
-) -> Callable[[str], bool]:
+) -> AutonomousSkillAdmissionPolicyResolver:
   loader = SkillLoader(skills_dir)
 
-  def resolve(skill: str) -> bool:
-    try:
-      profile = loader.load(skill)
-    except (FileNotFoundError, ValueError):
-      return False
-    return bool(profile.resumable) and profile.mutation_mode != "model_writer"
+  def resolve(skill_name: str) -> AutonomousSkillAdmissionPolicy:
+    profile = loader.load(skill_name)
+    return AutonomousSkillAdmissionPolicy(
+      skill_resume_allowed=(
+        bool(profile.resumable)
+        and profile.mutation_mode != "model_writer"
+      ),
+      execution_limits=SkillExecutionLimits(
+        max_turns=profile.max_turns,
+        max_tokens=profile.max_tokens,
+        max_budget_usd=profile.max_budget_usd,
+      ),
+    )
 
   return resolve
 
@@ -280,7 +262,9 @@ async def _drain_shielded_lifecycle_task(
         return
 
 
-def _has_investment_selected_content_reader(mcp_client: Any) -> bool:
+def _has_investment_selected_content_reader(
+  mcp_client: McpClientManager | None,
+) -> bool:
   """Project the optional Investment reader from the loaded MCP catalog."""
 
   if not investment_capability_signing_available():
@@ -336,7 +320,8 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   Returns:
     A FastAPI application ready to serve the gateway HTTP API.
   """
-  if config.build_chat_runtime is None:
+  build_chat_runtime = config.build_chat_runtime
+  if build_chat_runtime is None:
     raise ValueError("GatewayServerConfig.build_chat_runtime is required")
   if (
     config.session_execution_policy_resolver is not None
@@ -352,11 +337,13 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     raise ValueError(
       "allow_service_credentials_for_interactive must be a bool"
     )
-  if config.model_registry is None or config.model_selection_policy is None:
+  model_registry = config.model_registry
+  model_selection_policy = config.model_selection_policy
+  if model_registry is None or model_selection_policy is None:
     raise ValueError("model_registry and model_selection_policy are required")
   if not str(config.tenant_id or "").strip():
     raise ValueError("tenant_id is required with model-selection authority")
-  config.model_selection_policy.admit_registry(config.model_registry)
+  model_selection_policy.admit_registry(model_registry)
 
   # Adapter support comes from the installed adapters' own declarations, never
   # a hand-maintained table.  `installed_adapter_providers()` maps each
@@ -375,7 +362,10 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       (
         adapter_id
         for adapter_id, provider_class in installed_providers.items()
-        if provider_class.adapter_route_support().provider == configured_family
+        if (
+          (support := provider_class.adapter_route_support()) is not None
+          and support.provider == configured_family
+        )
       ),
       None,
     )
@@ -404,7 +394,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         provider = factory()
     expected_providers = {
       entry.provider
-      for entry in config.model_registry.models.values()
+      for entry in model_registry.models.values()
       if entry.adapter == normalized_adapter
     }
     resolved_family = str(getattr(provider, "name", "") or "").strip().lower()
@@ -424,8 +414,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     # declaration check; the packaged/deployment-selected INITIAL artifacts
     # are still closed against installed declarations at import admission.
     if not deployment_vouched:
-      declared = getattr(provider, "adapter_route_support", None)
-      declaration = declared() if callable(declared) else None
+      declaration = provider.adapter_route_support()
       if declaration is None:
         raise ValueError(
           f"capability adapter {normalized_adapter!r} declares no protocol support"
@@ -435,7 +424,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
           f"capability adapter {normalized_adapter!r} resolved an "
           f"implementation declaring {declaration.adapter!r}"
         )
-      for entry in config.model_registry.models.values():
+      for entry in model_registry.models.values():
         if entry.adapter != normalized_adapter:
           continue
         if not (set(entry.capabilities) & GATEWAY_EXECUTED_CAPABILITY_IDS):
@@ -458,7 +447,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   # explicit designation, not silently skipped.
   for adapter_id in sorted({
     entry.adapter
-    for entry in config.model_registry.models.values()
+    for entry in model_registry.models.values()
     if set(entry.capabilities) & GATEWAY_EXECUTED_CAPABILITY_IDS
   }):
     _resolve_capability_adapter(adapter_id)
@@ -735,21 +724,19 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
 
   app.state.auth = auth
   app.state.gateway_config = config
+  dispatcher_deps: GatewayDispatcherDeps | None = None
   async def _build_chat_runtime_for_dispatch(
-    *,
     session: GatewaySession,
     request: ChatRequest,
     channel: str | None,
     auth_manager: AuthManager | None,
+    *,
+    # The app-owned autonomous root below is authoritative.
+    storage_root: Path | None = None,
   ) -> ChatRuntime:
-    _ = auth_manager
-    dispatcher_deps = getattr(
-      _build_chat_runtime_for_dispatch,
-      "_gateway_dispatcher_deps",
-      None,
-    )
+    _ = auth_manager, storage_root
     if dispatcher_deps is not None:
-      setattr(session, "_gateway_dispatcher_deps", dispatcher_deps)
+      session._gateway_dispatcher_deps = dispatcher_deps
     try:
       from .control_plane.valuation_ready_tools import make_valuation_ready_skill_tool_bundle
 
@@ -759,7 +746,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     except Exception:
       log.warning("Gateway-local skill tool injection failed", exc_info=True)
     runtime = await _call_build_chat_runtime(
-      config.build_chat_runtime,
+      build_chat_runtime,
       session=session,
       request=request,
       channel=channel,
@@ -773,12 +760,12 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   setattr(
     _build_chat_runtime_for_dispatch,
     "_gateway_model_registry",
-    config.model_registry,
+    model_registry,
   )
   setattr(
     _build_chat_runtime_for_dispatch,
     "_gateway_model_selection_policy",
-    config.model_selection_policy,
+    model_selection_policy,
   )
   setattr(
     _build_chat_runtime_for_dispatch,
@@ -828,25 +815,54 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     mcp_meta_inject_servers=(
       config.mcp_meta_inject_servers or frozenset()
     ),
+    tool_registration_catalog=config.tool_registration_catalog,
+    tool_policy_implementations=config.tool_policy_implementations,
+    redaction_context_factory=config.redaction_context_factory,
   )
   app.state.gateway_dispatcher_deps = dispatcher_deps
-  setattr(
-    _build_chat_runtime_for_dispatch,
-    "_gateway_dispatcher_deps",
-    dispatcher_deps,
-  )
   app.state.gateway_claim_signing_authority = (
     config.claim_signing_authority
   )
+  app.state.gateway_skill_application = config.skill_application
   autonomous_storage_root = _default_autonomous_log_dir()
-  control_skills_root = (
-    config.control_skills_dir or _default_control_skills_dir()
+  if (
+    config.control_skill_catalog is not None
+    and config.control_skills_dir is not None
+  ):
+    raise ValueError(
+      "control_skill_catalog and control_skills_dir are mutually exclusive"
+    )
+  control_skills_root: Path | None = None
+  if config.control_skill_catalog is not None:
+    control_skill_catalog = config.control_skill_catalog
+  else:
+    control_skills_root = (
+      config.control_skills_dir or _default_control_skills_dir()
+    )
+    control_skill_catalog = DirectoryControlSkillCatalog(
+      control_skills_root
+    )
+  autonomous_skill_admission_policy_resolver = (
+    config.autonomous_skill_admission_policy_resolver
   )
-  skill_resume_allowed_resolver = (
-    config.autonomous_skill_resume_allowed_resolver
-    if config.autonomous_skill_resume_allowed_resolver is not None
-    else _generic_skill_resume_allowed_resolver(control_skills_root)
-  )
+  if autonomous_skill_admission_policy_resolver is None:
+    if control_skills_root is None:
+      control_skills_root = _default_control_skills_dir()
+    autonomous_skill_admission_policy_resolver = (
+      _generic_skill_admission_policy_resolver(control_skills_root)
+    )
+
+  def _issue_autonomous_session_token(session) -> str:
+    auth.session_store.register_session(session)
+    try:
+      return auth.issue_token(session)
+    except BaseException:
+      auth.session_store.expire_session(session.session_id)
+      raise
+
+  async def _expire_autonomous_session(session_id: str) -> None:
+    await auth.session_store.expire_session_async(session_id)
+
   app.state.autonomous_storage_root = autonomous_storage_root
   app.state.subprocess_registry = AutonomousRegistry(
     api_dir=(
@@ -859,12 +875,17 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     log_dir=autonomous_storage_root,
     max_running=int(os.getenv("AGENT_GATEWAY_AUTONOMOUS_MAX_RUNNING", "2") or "2"),
     approval_store=app.state.gateway_approval_store,
+    approval_policy=app.state.gateway_approval_policy,
     service_provider_handles=config.service_provider_handles,
     autonomous_capability_binding_resolver=(
       config.autonomous_capability_binding_resolver
     ),
-    skill_resume_allowed_resolver=skill_resume_allowed_resolver,
+    autonomous_skill_admission_policy_resolver=(
+      autonomous_skill_admission_policy_resolver
+    ),
     claim_signing_authority=config.claim_signing_authority,
+    autonomous_session_token_issuer=_issue_autonomous_session_token,
+    autonomous_session_expirer=_expire_autonomous_session,
   )
   from .control_plane.autonomous_approval_drainer import (
     AutonomousApprovalDeliveryCoordinator,
@@ -888,6 +909,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     store_for=app.state.agent_run_schedule_store_for,
     users_root=agent_run_schedule_users_root(),
     autonomous_registry=app.state.subprocess_registry,
+    profile_loader=config.control_profile_loader,
     user_event_bus_factory=lambda: getattr(app.state, "user_event_bus", None),
   )
 
@@ -921,7 +943,10 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   router = APIRouter(prefix=route_prefix)
 
   @router.post("/chat/init", response_model=ChatInitResponse)
-  async def chat_init(payload: ChatInitRequest, response: Response) -> ChatInitResponse:
+  async def chat_init(
+    payload: ChatInitRequest,
+    response: Response,
+  ) -> ChatInitResponse | JSONResponse:
     auth.validate_api_key(payload.api_key)
     try:
       schema_version = _resolve_schema_version(payload.schema_version)
@@ -1047,7 +1072,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       user_id=resolved_user_id,
       user_email=identity.user_email,
       risk_user_id=identity.risk_user_id,
-      role=resolved_role,  # type: ignore[arg-type]
+      role=resolved_role,
       capabilities=resolved_capabilities,
       model_entitled_capabilities=resolved_model_entitled_capabilities,
       model_entitled_keys=resolved_model_entitled_keys,
@@ -1064,8 +1089,11 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     )
     session.channel = resolved_channel
     session.is_public = resolved_channel == "public"
-    session.approval_store = app.state.gateway_approval_store
-    session.approval_policy = app.state.gateway_approval_policy
+    bind_session_approval_route(
+      session,
+      app.state.gateway_approval_store,
+      app.state.gateway_approval_policy,
+    )
     try:
       if config.on_session_created is not None:
         config.on_session_created(session, payload.api_key, payload)
@@ -1091,7 +1119,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       auth.session_store.expire_session(session.session_id)
       return JSONResponse(
         {
-          **exc.receipt(),
+          **exc.to_error(),
           "message": str(exc),
         },
         status_code=422,
@@ -1132,13 +1160,13 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     capability_id: str,
     request: Request,
     body: ModelPreferenceUpdate,
-  ) -> ModelPreferenceResponse:
+  ) -> ModelPreferenceResponse | JSONResponse:
     session = _model_preference_session(request)
     store = config.model_preference_store
     if store is None:
       raise HTTPException(status_code=503, detail="model preference store is unavailable")
     normalized_capability = str(capability_id or "").strip()
-    policy = config.model_selection_policy.capabilities.get(normalized_capability)
+    policy = model_selection_policy.capabilities.get(normalized_capability)
     if policy is None or not policy.allow_saved_preference:
       raise HTTPException(
         status_code=422,
@@ -1236,7 +1264,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     if store is None:
       raise HTTPException(status_code=503, detail="model preference store is unavailable")
     normalized_capability = str(capability_id or "").strip()
-    policy = config.model_selection_policy.capabilities.get(normalized_capability)
+    policy = model_selection_policy.capabilities.get(normalized_capability)
     if policy is None or not policy.allow_saved_preference:
       raise HTTPException(
         status_code=422,
@@ -1257,8 +1285,11 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       effort=None,
     )
 
-  @router.post("/chat")
-  async def chat_stream(request: Request, body: ChatRequest = Body(...)) -> StreamingResponse:
+  @router.post("/chat", response_model=None)
+  async def chat_stream(
+    request: Request,
+    body: ChatRequest = Body(...),
+  ) -> StreamingResponse | JSONResponse:
     token = AuthManager.get_bearer_token(request.headers.get("Authorization"))
     if isinstance(body.user_id, str):
       try:
@@ -1411,7 +1442,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         session._commercial_dispatch_owner = None
       return JSONResponse(
         {
-          **exc.receipt(),
+          **exc.to_error(),
           "message": str(exc),
         },
         status_code=400,
@@ -1443,17 +1474,21 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       "X-Accel-Buffering": "no",
       "Connection": "keep-alive",
     }
-    user_event_bus = app.state.user_event_bus
+    user_event_bus: UserEventBus = app.state.user_event_bus
     event_owner_user_id = session_owner_user_id(session)
-    publish_event = getattr(user_event_bus, "publish", None)
-    cleanup_event_run = getattr(user_event_bus, "cleanup_run", None)
+    if TYPE_CHECKING:
+      publish_event = user_event_bus.publish
+      cleanup_event_run = user_event_bus.cleanup_run
+    else:
+      publish_event = getattr(user_event_bus, "publish", None)
+      cleanup_event_run = getattr(user_event_bus, "cleanup_run", None)
     if not callable(publish_event) or not callable(cleanup_event_run):
       raise RuntimeError(
         "session event delivery bus does not implement its bound domain"
       )
 
-    async def _on_chat_event(event: StreamEvent) -> None:
-      event_dict = dict(event)  # type: ignore[arg-type]
+    async def _on_chat_event(event: dict[str, Any]) -> None:
+      event_dict = dict(event)
       event_dict.setdefault("run_id", sid)
       try:
         await publish_event(
@@ -1705,7 +1740,9 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         config.allow_service_credentials_for_interactive
       ),
       route_prefix=route_prefix,
-      skills_dir=control_skills_root,
+      control_skill_catalog=control_skill_catalog,
+      control_profile_names_provider=config.control_profile_names_provider,
+      control_profile_loader=config.control_profile_loader,
       artifact_auth_dependency=_artifact_auth_dependency,
       autonomous_registry=app.state.subprocess_registry,
       agent_schedule_store_for=app.state.agent_run_schedule_store_for,

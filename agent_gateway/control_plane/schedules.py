@@ -20,6 +20,7 @@ from fastapi import APIRouter, Body, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationInfo, field_validator, model_validator
 
 from agent_gateway.artifact_paths import user_data_dir
+from agent_gateway.autonomous_runner import AutonomousRegistry
 from agent_gateway.session import AuthManager, GatewaySession
 from agent_gateway.role_validation import require_exact_role
 
@@ -35,9 +36,9 @@ logger = logging.getLogger(__name__)
 
 
 ScheduleSource = Literal["launchd", "jobs-mcp"]
-JobsFrequency = Literal["daily", "weekly", "monthly", "quarterly"]
 AgentScheduleSource = Literal["agent-gateway"]
 _AGENT_RUN_SCHEDULE_KIND = "agent_run_schedule"
+
 _AGENT_RUN_SCHEDULE_BACKEND = "agent-gateway"
 _AGENT_RUN_SCHEDULE_FILENAME = "agent-run-schedules.json"
 _SCHEDULE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -146,7 +147,6 @@ def _jobs_api():
 
 
 class ScheduleBaseResponse(BaseModel):
-  source: ScheduleSource
   name: str
   enabled: bool
   schedule_description: str
@@ -167,7 +167,7 @@ class JobsMcpScheduleResponse(ScheduleBaseResponse):
   source: Literal["jobs-mcp"]
   schedule_id: str
   job_type: str
-  frequency: JobsFrequency
+  frequency: str
   time_of_day: str | None = None
   day_of_week: int | None = None
   day_of_month: int | None = None
@@ -429,7 +429,8 @@ class BrowserSafeScheduleResponse(BaseModel):
     raise ValueError("schedule_id, id, or name must be a non-empty string")
 
 
-ScheduleResponse = Union[LaunchdScheduleResponse, JobsMcpScheduleResponse, BrowserSafeScheduleResponse]
+OperatorScheduleResponse = Union[LaunchdScheduleResponse, JobsMcpScheduleResponse]
+ScheduleResponse = Union[OperatorScheduleResponse, BrowserSafeScheduleResponse]
 
 
 class SchedulesListResponse(BaseModel):
@@ -469,11 +470,24 @@ class CreateJobsMcpScheduleRequest(BaseModel):
   source: Literal["jobs-mcp"]
   name: str = Field(..., min_length=1)
   job_type: str = Field(..., min_length=1)
-  frequency: JobsFrequency
+  frequency: str = Field(..., min_length=1)
   time_of_day: str | None = None
   day_of_week: StrictInt | None = None
   day_of_month: StrictInt | None = None
   params: dict[str, Any] = Field(default_factory=dict)
+
+  @field_validator("frequency")
+  @classmethod
+  def _frequency_admitted_by_jobs_backend(cls, value: str) -> str:
+    # The jobs backend owns the frequency vocabulary; admit exactly its set
+    # at the boundary where caller input enters. Resolved lazily so the
+    # autonomous child never imports investment_tools at module import.
+    admitted = _jobs_api().VALID_FREQUENCIES
+    if value not in admitted:
+      raise ValueError(
+        f"frequency must be one of: {', '.join(sorted(admitted))}"
+      )
+    return value
 
 
 CreateScheduleRequest = Annotated[
@@ -990,14 +1004,16 @@ class AgentRunScheduleRunner:
     *,
     store_for: Callable[[object], AgentRunScheduleStore] = schedule_store_for,
     users_root: Path | None = None,
-    autonomous_registry: Any | None,
+    autonomous_registry: AutonomousRegistry,
+    profile_loader: Callable[[str], Any] | None = None,
     user_event_bus_factory: Callable[[], Any | None] | None = None,
     poll_interval_seconds: float | None = None,
   ) -> None:
     self.store_for = store_for
     self.users_root = users_root or agent_run_schedule_users_root()
     self._stores_by_path: dict[Path, AgentRunScheduleStore] = {}
-    self.autonomous_registry = autonomous_registry
+    self.autonomous_registry: AutonomousRegistry = autonomous_registry
+    self.profile_loader = profile_loader
     self.user_event_bus_factory = user_event_bus_factory
     self.poll_interval_seconds = (
       poll_interval_seconds
@@ -1006,6 +1022,16 @@ class AgentRunScheduleRunner:
     )
     self._task: asyncio.Task[Any] | None = None
     self._stopped = asyncio.Event()
+
+  def _require_autonomous_profile(self, profile_name: str) -> None:
+    if self.profile_loader is None:
+      return
+    try:
+      profile = self.profile_loader(profile_name)
+    except Exception as exc:
+      raise ValueError(f"Unknown autonomous profile: {profile_name}") from exc
+    if not profile.supports_autonomous_execution:
+      raise ValueError(f"Profile {profile_name!r} is interactive-only")
 
   def _configured_poll_interval_seconds(self) -> float:
     raw = os.getenv(_AGENT_SCHEDULE_POLL_INTERVAL_ENV, "").strip()
@@ -1042,8 +1068,6 @@ class AgentRunScheduleRunner:
         continue
 
   async def fire_due(self, *, now: datetime | None = None) -> list[dict[str, Any]]:
-    if self.autonomous_registry is None:
-      return []
     results: list[dict[str, Any]] = []
     for store in self._existing_stores():
       try:
@@ -1147,7 +1171,7 @@ class AgentRunScheduleRunner:
       dispatch_role = "owner"
     dispatch = record.get("dispatch")
     if not isinstance(dispatch, dict):
-      result = {"schedule_id": schedule_id, "status": "failed", "error": "Schedule dispatch is missing"}
+      result: dict[str, str | bool] = {"schedule_id": schedule_id, "status": "failed", "error": "Schedule dispatch is missing"}
       try:
         store.record_fire_result(
           schedule_id,
@@ -1170,6 +1194,7 @@ class AgentRunScheduleRunner:
           if isinstance(record.get("dispatch_scope"), dict)
           else None
         )
+      self._require_autonomous_profile(str(dispatch.get("profile") or ""))
       registry.set_user_event_bus(self.user_event_bus_factory() if self.user_event_bus_factory else None)
       start_payload = await registry.start(
         role=dispatch_role,
@@ -1304,6 +1329,13 @@ def _error_message(result: dict[str, Any], fallback: str) -> str:
   return str(raw)
 
 
+def _backend_error_code(result: dict[str, Any]) -> str:
+  raw = result.get("code")
+  if isinstance(raw, str) and raw.strip():
+    return raw.strip()
+  return ""
+
+
 def _require_backend_success(
   result: dict[str, Any],
   *,
@@ -1316,7 +1348,7 @@ def _require_backend_success(
     return result
 
   message = _error_message(result, f"{action} failed")
-  status_code = not_found_status if "not found" in message.lower() else status.HTTP_400_BAD_REQUEST
+  status_code = not_found_status if _backend_error_code(result) == "not_found" else status.HTTP_400_BAD_REQUEST
   raise HTTPException(status_code=status_code, detail=message)
 
 
@@ -1349,10 +1381,8 @@ def _launchd_name(raw: dict[str, Any]) -> str:
   return label[len(prefix):] if label.startswith(prefix) else label
 
 
-def _normalize_schedule(raw: dict[str, Any]) -> ScheduleResponse:
+def _normalize_operator_schedule(raw: dict[str, Any]) -> OperatorScheduleResponse:
   source = raw.get("source")
-  if raw.get("kind") == "agent_run_schedule":
-    return BrowserSafeScheduleResponse(**_project_schedule_for_web(raw))
   if source == "launchd":
     return LaunchdScheduleResponse(
       source="launchd",
@@ -1369,9 +1399,6 @@ def _normalize_schedule(raw: dict[str, Any]) -> ScheduleResponse:
     )
 
   if source == "jobs-mcp":
-    frequency = raw.get("frequency")
-    if frequency not in {"daily", "weekly", "monthly", "quarterly"}:
-      raise HTTPException(status_code=400, detail="jobs-mcp schedule missing supported frequency")
     return JobsMcpScheduleResponse(
       source="jobs-mcp",
       name=str(raw.get("name") or ""),
@@ -1381,7 +1408,7 @@ def _normalize_schedule(raw: dict[str, Any]) -> ScheduleResponse:
       next_run_at=_optional_text(raw.get("next_run_at")),
       schedule_id=str(raw.get("schedule_id") or raw.get("name") or ""),
       job_type=str(raw.get("job_type") or ""),
-      frequency=frequency,
+      frequency=str(raw.get("frequency") or ""),
       time_of_day=_optional_text(raw.get("time_of_day")),
       day_of_week=_optional_int(raw.get("day_of_week")),
       day_of_month=_optional_int(raw.get("day_of_month")),
@@ -1391,14 +1418,20 @@ def _normalize_schedule(raw: dict[str, Any]) -> ScheduleResponse:
   raise HTTPException(status_code=400, detail=f"Unsupported schedule source: {source!r}")
 
 
-def _show_schedule(name: str, *, source: ScheduleSource | None = None) -> ScheduleResponse:
+def _normalize_schedule(raw: dict[str, Any]) -> ScheduleResponse:
+  if raw.get("kind") == "agent_run_schedule":
+    return _project_schedule_for_web(raw)
+  return _normalize_operator_schedule(raw)
+
+
+def _show_schedule(name: str, *, source: ScheduleSource | None = None) -> OperatorScheduleResponse:
   result = _scheduler_mcp().schedule_show(name, source=source)
-  return _normalize_schedule(
+  return _normalize_operator_schedule(
     _require_backend_success(result, action="schedule_show", not_found_status=status.HTTP_404_NOT_FOUND)
   )
 
 
-def _show_schedule_or_none(name: str, *, source: ScheduleSource | None = None) -> ScheduleResponse | None:
+def _show_schedule_or_none(name: str, *, source: ScheduleSource | None = None) -> OperatorScheduleResponse | None:
   try:
     return _show_schedule(name, source=source)
   except HTTPException as exc:
@@ -1421,7 +1454,7 @@ def _list_schedules(source: ScheduleSource | None) -> list[ScheduleResponse]:
   for raw in payload.get("schedules") or []:
     if not isinstance(raw, dict):
       continue
-    schedules.append(_normalize_schedule(raw))
+    schedules.append(_normalize_operator_schedule(raw))
   return schedules
 
 
@@ -1431,7 +1464,7 @@ def _schedule_to_dict(schedule: ScheduleResponse | dict[str, Any]) -> dict[str, 
   return dict(schedule)
 
 
-def _project_schedule_for_web(schedule: ScheduleResponse | dict[str, Any]) -> dict[str, Any]:
+def _project_schedule_for_web(schedule: ScheduleResponse | dict[str, Any]) -> BrowserSafeScheduleResponse:
   raw = _schedule_to_dict(schedule)
   projected = {
     key: value
@@ -1449,7 +1482,7 @@ def _project_schedule_for_web(schedule: ScheduleResponse | dict[str, Any]) -> di
     projected["can_enable"] = False
     projected["can_disable"] = False
     projected["can_run_now"] = False
-  return projected
+  return BrowserSafeScheduleResponse(**projected)
 
 
 def build_schedules_router(
@@ -1656,8 +1689,8 @@ def build_schedules_router(
       raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
     if payload.dispatch is not None:
       dispatch = await _validated_agent_schedule_dispatch(payload.dispatch, session=session)
+      _require_agent_schedule_dispatch_allowed(session, dispatch)
       payload = payload.model_copy(update={"dispatch": dispatch})
-      _require_agent_schedule_dispatch_allowed(session, payload.dispatch)
     updated = agent_store.update(
       owner_user_id,
       name,

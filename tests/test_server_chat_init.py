@@ -16,6 +16,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from dataclasses import replace
+from agent_gateway import AgentRunner, McpClientManager, ToolDispatcher
 
 from agent_gateway.auth import AuthConfig, ResolverResult
 from agent_gateway.capability_binding import ModelSelectionIntent
@@ -70,10 +71,19 @@ def _make_app(
   model_registry=None,
   model_selection_policy=None,
 ):
-  async def _build_chat_runtime(_session, request, _channel, _auth_manager):
+  async def _build_chat_runtime(_session, request, _channel, _auth_manager, *, storage_root: Path | None = None):
+    def _build_runner(event_log, session_id, started_at):
+      return AgentRunner(
+        event_log,
+        ToolDispatcher(mcp_client=McpClientManager(config_path=None)),
+        session_id,
+        capability_execution=request.capability_execution,
+        started_at=started_at,
+      )
+
     return ChatRuntime(
       system_prompt="test",
-      build_runner=lambda *_args: None,
+      build_runner=_build_runner,
       capability_execution=request.capability_execution,
     )
 
@@ -515,6 +525,7 @@ def test_chat_init_returns_only_session_executable_stable_key_choices() -> None:
   }
   assert {choice["model_key"] for choice in driver["choices"]} == {
     "anthropic.claude-fable-5",
+    "anthropic.claude-fable-5-1",
     "anthropic.claude-haiku-4-5",
     "anthropic.claude-mythos-5",
     "anthropic.claude-opus-5",
@@ -559,7 +570,7 @@ def test_chat_init_normalizes_and_freezes_capability_selections() -> None:
     ),
   }
   with pytest.raises(TypeError):
-    session.capability_run_overrides["node.verify"] = ModelSelectionIntent(  # type: ignore[index]
+    session.capability_run_overrides["node.verify"] = ModelSelectionIntent(
       model_key="anthropic.claude-opus-5",
       effort="none",
       source="explicit_user",

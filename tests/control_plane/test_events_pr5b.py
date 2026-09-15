@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+from functools import cache
 from itertools import count
 import json
 import logging
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from fastapi import FastAPI
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
+from agent_gateway.control_skill_catalog import ControlSkillCatalog
 from agent_gateway.autonomous_capability_handoff import AutonomousCapabilityBinding
 from agent_gateway.autonomous_event_channel import (
   adopt_inherited_autonomous_event_channel,
@@ -35,12 +39,32 @@ from agent_gateway.control_plane.events import (
   _projected_control_event_chunks,
   _shielded_aclose,
 )
+from agent_gateway.runner import AgentRunner
 from agent_gateway.server import (
   ChatRuntime,
   GatewayServerConfig,
   MaterializedCredential,
   create_gateway_app,
 )
+from agent.skills.composition import compile_skill_application
+from agent.shared.tool_registration import (
+  build_product_tool_registration_composition,
+)
+
+
+ROOT = Path(__file__).resolve().parents[4]
+
+
+@cache
+def _skill_application():
+  tool_registration = build_product_tool_registration_composition()
+  return compile_skill_application(
+    skills_root=ROOT / "api" / "memory" / "workspace" / "notes" / "skills",
+    source_prefix=PurePosixPath(
+      "api/memory/workspace/notes/skills"
+    ),
+    tool_registration_catalog=tool_registration.catalog,
+  )
 
 
 API_KEY = "events-pr5b-key"
@@ -164,29 +188,48 @@ class _CompletedProcess:
     self.returncode = -9
 
 
-class _NoopRunner:
+class _NoopRunner(AgentRunner):
   def __init__(self, capability_execution: Any) -> None:
-    self.capability_execution = capability_execution
+    self._capability_execution = capability_execution
+
+  def bind_selected_content(self, bindings) -> None:
+    _ = bindings
+
+  def set_purpose(self, purpose) -> None:
+    _ = purpose
+
+  def set_credential_refresher(self, callback) -> None:
+    _ = callback
+
+  async def on_disconnect(self) -> None:
+    return None
+
+  def release_research_file_activity_lease_if_owned(self) -> None:
+    return None
+
+  def release_selected_content_activity_lease_if_owned(self) -> None:
+    return None
 
   async def run(
     self,
-    *,
     messages: list[dict[str, Any]],
-    system_prompt: str | None = None,
+    system_prompt: str | list[tuple[str, bool]] | None = None,
     max_turns: int | None = None,
+    *,
+    resume_initial_messages=None,
   ) -> None:
-    _ = messages, system_prompt, max_turns
+    _ = messages, system_prompt, max_turns, resume_initial_messages
 
 
 def _make_app(monkeypatch, tmp_path: Path, events: list[dict[str, Any]]):
   monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
   monkeypatch.setenv("AGENT_GATEWAY_AUTONOMOUS_LOG_DIR", str(tmp_path / "logs"))
 
-  async def _build_chat_runtime(*, session, request, channel, auth_manager):
+  async def _build_chat_runtime(session, request, channel, auth_manager, *, storage_root: Path | None = None):
     _ = session, channel, auth_manager
     return ChatRuntime(
       system_prompt="system",
-      build_runner=lambda *_args: _NoopRunner(
+      build_runner=lambda _event_log, _session_id, _started_at: _NoopRunner(
         request.capability_execution
       ),
       capability_execution=request.capability_execution,
@@ -213,6 +256,9 @@ def _make_app(monkeypatch, tmp_path: Path, events: list[dict[str, Any]]):
       _FAKE_PROCESSES[process_group_id], "returncode", -signal_number
     ),
   )
+  skill_application = _skill_application()
+  control_catalog = skill_application.control_catalog
+  assert isinstance(control_catalog, ControlSkillCatalog)
   return create_gateway_app(
     GatewayServerConfig(
       jwt_secret="events-pr5b-test-secret-0123456789",
@@ -224,6 +270,11 @@ def _make_app(monkeypatch, tmp_path: Path, events: list[dict[str, Any]]):
       service_provider_handles={"anthropic": _SERVICE_HANDLE},
       service_auth_config_resolver=_materialize_service_credential,
       build_chat_runtime=_build_chat_runtime,
+      control_skill_catalog=control_catalog,
+      autonomous_skill_admission_policy_resolver=(
+        skill_application.resolve_autonomous_skill_admission_policy
+      ),
+      skill_application=skill_application,
       autonomous_capability_binding_resolver=_autonomous_capability_binding,
       claim_signing_authority=GatewayClaimSigningAuthority(HMAC_KEY),
     )
@@ -237,11 +288,13 @@ def _control_session(client: TestClient, user_id: str, *, channel: str = "tui") 
   )
   assert response.status_code == 200, response.text
   payload = response.json()
-  session = client.app.state.auth.session_store.get_session(payload["session_id"])
+  app = client.app
+  assert isinstance(app, FastAPI)
+  session = app.state.auth.session_store.get_session(payload["session_id"])
   assert session is not None
   session.model_entitled_capabilities = CAPABILITY_IDS
   session.model_entitled_keys = frozenset(INITIAL_MODEL_REGISTRY.models)
-  payload["session_token"] = client.app.state.auth.issue_token(session)
+  payload["session_token"] = app.state.auth.issue_token(session)
   return payload
 
 
@@ -335,7 +388,8 @@ def test_control_event_serialization_failure_logs_traceback(
       route = next(
         route
         for route in app.routes
-        if getattr(route, "path", None) == "/api/control/events"
+        if isinstance(route, APIRoute)
+        and route.path == "/api/control/events"
       )
       request = Request(
         {
@@ -422,7 +476,12 @@ def test_control_events_cancelled_aclose_does_not_leave_pending_close_task() -> 
 
 
 async def _collect_control_events(app, token: str, *, control_run_id: str, count: int) -> list[dict[str, Any]]:
-  route = next(route for route in app.routes if getattr(route, "path", None) == "/api/control/events")
+  route = next(
+    route
+    for route in app.routes
+    if isinstance(route, APIRoute)
+    and route.path == "/api/control/events"
+  )
   request = Request(
     {
       "type": "http",
@@ -441,9 +500,7 @@ async def _collect_control_events(app, token: str, *, control_run_id: str, count
       chunk = await asyncio.wait_for(iterator.__anext__(), timeout=0.5)
       events.append(_decode_sse_chunk(chunk))
   finally:
-    close = getattr(response.body_iterator, "aclose", None)
-    if callable(close):
-      await close()
+    await _shielded_aclose(response.body_iterator)
     if response.background is not None:
       await response.background()
   return events
@@ -464,6 +521,8 @@ def test_control_events_replays_autonomous_buffered_events(monkeypatch, tmp_path
   app = _make_app(monkeypatch, tmp_path, typed_events)
 
   with TestClient(app) as client:
+    portal = client.portal
+    assert portal is not None
     bus = app.state.user_event_bus
     app.state.user_event_bus = None
     alice = _control_session(client, "alice")
@@ -491,7 +550,7 @@ def test_control_events_replays_autonomous_buffered_events(monkeypatch, tmp_path
       for event in typed_events:
         await registry._record_and_publish_event(record, event)
 
-    client.portal.call(finish_and_inject)
+    portal.call(finish_and_inject)
     app.state.user_event_bus = bus
     registry.set_user_event_bus(bus)
 
@@ -500,7 +559,7 @@ def test_control_events_replays_autonomous_buffered_events(monkeypatch, tmp_path
         app, alice["session_token"], control_run_id=run_id, count=6
       )
 
-    received = client.portal.call(collect)
+    received = portal.call(collect)
 
     received_types = [event["type"] for event in received]
     for expected in ["skill_run_started", "skill_result_captured", "artifact_ready", "artifact_failed"]:
@@ -514,6 +573,8 @@ def test_control_events_fast_run_race_replays_late_subscriber(monkeypatch, tmp_p
   app = _make_app(monkeypatch, tmp_path, fast_events)
 
   with TestClient(app) as client:
+    portal = client.portal
+    assert portal is not None
     bus = app.state.user_event_bus
     app.state.user_event_bus = None
     alice = _control_session(client, "alice")
@@ -534,7 +595,7 @@ def test_control_events_fast_run_race_replays_late_subscriber(monkeypatch, tmp_p
       for event in fast_events:
         await registry._record_and_publish_event(record, event)
 
-    client.portal.call(finish_and_inject)
+    portal.call(finish_and_inject)
     app.state.user_event_bus = bus
     registry.set_user_event_bus(bus)
 
@@ -543,7 +604,7 @@ def test_control_events_fast_run_race_replays_late_subscriber(monkeypatch, tmp_p
         app, alice["session_token"], control_run_id=run_id, count=5
       )
 
-    received = client.portal.call(collect)
+    received = portal.call(collect)
 
     seqs = [event.get("seq") for event in received if event.get("type") == "fast_event"]
     assert seqs == [0, 1, 2]

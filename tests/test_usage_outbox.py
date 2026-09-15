@@ -30,6 +30,7 @@ def _mode(path: Path) -> int:
 def test_outbox_requires_an_owner_private_storage_directory(tmp_path) -> None:
   storage = tmp_path / "broad-storage"
   storage.mkdir(mode=0o755)
+  storage.chmod(0o755)
 
   with pytest.raises(CommercialUsageOutboxError, match="owner-private"):
     CommercialUsageOutbox(storage / "usage.sqlite3")
@@ -131,7 +132,7 @@ def _v3_payload(event_id: str) -> dict:
     registry_revision="test-v1",
     policy_revision="test-v1",
     selection_source="explicit_user",
-  ).receipt()
+  ).to_json()
   payload = {
     **_payload(event_id),
     "schema_version": 3,
@@ -202,13 +203,17 @@ def test_atomic_batch_idempotency_and_conflict_rollback(tmp_path) -> None:
   assert equivalent["source_payload_sha256"] == canonical_usage_payload_sha256(equivalent)
   outbox.enqueue_batch([equivalent], created_at=NOW + timedelta(seconds=2))
   assert outbox.health(now=NOW)["counts"] == {"pending": 2}
-  assert outbox.get("evt_001").payload == first
+  stored_first = outbox.get("evt_001")
+  assert stored_first is not None
+  assert stored_first.payload == first
 
   conflicting = _payload("evt_002", request_id="req_conflict")
   with pytest.raises(CommercialUsageOutboxConflict):
     outbox.enqueue_batch([_payload("evt_003"), conflicting], created_at=NOW)
   assert outbox.get("evt_003") is None
-  assert outbox.get("evt_002").payload == second
+  stored_second = outbox.get("evt_002")
+  assert stored_second is not None
+  assert stored_second.payload == second
 
 
 def test_source_partition_uses_normalized_reconciliation_identity(tmp_path) -> None:
@@ -233,13 +238,16 @@ def test_payload_bytes_are_immutable_across_fenced_state_transitions(tmp_path) -
   outbox = CommercialUsageOutbox(tmp_path / "usage.sqlite3")
   payload = _v3_payload("evt_001")
   outbox.enqueue_batch([payload], created_at=NOW)
-  original_json = outbox.get("evt_001").payload_json
+  stored = outbox.get("evt_001")
+  assert stored is not None
+  original_json = stored.payload_json
 
   leased = outbox.lease_batch(limit=10, lease_for=timedelta(seconds=30), now=NOW)
   assert len(leased) == 1
   row = leased[0]
   assert row.state == "sending"
   assert row.attempt_count == 1
+  assert row.sending_lease_token is not None
   with sqlite3.connect(outbox.path) as connection:
     with pytest.raises(sqlite3.IntegrityError, match="source evidence is immutable"):
       connection.execute(
@@ -255,6 +263,7 @@ def test_payload_bytes_are_immutable_across_fenced_state_transitions(tmp_path) -
     accepted_at=NOW + timedelta(seconds=1),
   ) is True
   accepted = outbox.get("evt_001")
+  assert accepted is not None
   assert accepted.state == "accepted"
   assert accepted.payload_json == original_json
   assert accepted.ingest_status == "accepted"
@@ -315,8 +324,10 @@ def test_lease_dead_letters_non_v3_payloads_instead_of_shipping(
 
   # Only the v3 payload ships; older queued payloads are refused loudly.
   assert [row.event_id for row in leased] == ["evt_v3"]
+  assert leased[0].sending_lease_token is not None
   for event_id, version in (("evt_v1", 1), ("evt_v2", 2)):
     row = outbox.get(event_id)
+    assert row is not None
     assert row.state == "dead"
     assert row.last_error == f"unshippable_payload_schema_version:{version}"
     assert row.sending_lease_token is None
@@ -337,7 +348,9 @@ def test_lease_dead_letters_non_v3_payloads_instead_of_shipping(
     limit=10, lease_for=timedelta(seconds=30), now=NOW + timedelta(minutes=5)
   ) == []
   # Evidence bytes remain immutable in place.
-  assert outbox.get("evt_v1").payload["schema_version"] == 1
+  legacy = outbox.get("evt_v1")
+  assert legacy is not None
+  assert legacy.payload["schema_version"] == 1
 
 
 def test_retry_dead_and_expired_lease_recovery(tmp_path) -> None:
@@ -346,6 +359,7 @@ def test_retry_dead_and_expired_lease_recovery(tmp_path) -> None:
     [_v3_payload("evt_001"), _v3_payload("evt_002")], created_at=NOW
   )
   first = outbox.lease_batch(limit=1, lease_for=timedelta(seconds=5), now=NOW)[0]
+  assert first.sending_lease_token is not None
   assert outbox.mark_retryable(
     first.event_id,
     first.sending_lease_token,
@@ -354,6 +368,7 @@ def test_retry_dead_and_expired_lease_recovery(tmp_path) -> None:
   ) is True
   second = outbox.lease_batch(limit=2, lease_for=timedelta(seconds=5), now=NOW)[0]
   assert second.event_id == "evt_002"
+  assert second.sending_lease_token is not None
   assert outbox.mark_dead(second.event_id, second.sending_lease_token, error="malformed")
 
   assert outbox.lease_batch(
@@ -362,6 +377,7 @@ def test_retry_dead_and_expired_lease_recovery(tmp_path) -> None:
   retried = outbox.lease_batch(
     limit=2, lease_for=timedelta(seconds=5), now=NOW + timedelta(seconds=11)
   )[0]
+  assert retried.sending_lease_token is not None
   assert retried.event_id == "evt_001"
   assert retried.attempt_count == 2
 
@@ -442,8 +458,11 @@ def test_valid_v1_rows_upgrade_with_explicit_legacy_acceptance_evidence(tmp_path
     connection.execute("PRAGMA user_version=1")
 
   outbox = CommercialUsageOutbox(path)
-  assert outbox.get("evt_pending").state == "pending"
+  migrated_pending = outbox.get("evt_pending")
+  assert migrated_pending is not None
+  assert migrated_pending.state == "pending"
   migrated = outbox.get("evt_accepted")
+  assert migrated is not None
   assert migrated.ingest_status == "legacy_unknown"
   assert migrated.canonical_event_id is None
   assert migrated.environment == "prod"

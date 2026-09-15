@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from collections.abc import Callable
 from contextlib import nullcontext
+from dataclasses import replace
 import fcntl
 import hashlib
 import json
@@ -15,61 +17,16 @@ import sys
 import threading
 from itertools import count
 from pathlib import Path
-from types import SimpleNamespace
+from typing import TYPE_CHECKING, TypedDict
 
 import pytest
 
 from .control_plane.manifest_helpers import write_v6_manifest
 
-# The agent-claim verifier (settings + utils.agent_claim) lives in the separate
-# risk_module repo. The root conftest resolves RISK_MODULE_CHECKOUT first and
-# retains sibling inference for local checkouts. When risk_module is unavailable,
-# the cross-repo contract tests below skip; gateway-side tests still run.
-RISK_MODULE_ROOT = Path(os.environ["RISK_MODULE_CHECKOUT"]).expanduser().resolve() \
-  if os.environ.get("RISK_MODULE_CHECKOUT") else Path(__file__).resolve().parents[3].parent / "risk_module"
-_risk_root_text = str(RISK_MODULE_ROOT)
-_risk_root_original_index = (
-  sys.path.index(_risk_root_text) if _risk_root_text in sys.path else None
-)
-if _risk_root_original_index is not None:
-  sys.path.pop(_risk_root_original_index)
-if RISK_MODULE_ROOT.is_dir():
-  sys.path.insert(0, _risk_root_text)
-_prior_config_module = sys.modules.pop("config", None)
-
-try:
-  from settings import AGENT_API_CLAIM_MAX_TTL_SECONDS
-  from utils.agent_claim import AGENT_API_CLAIM_HEADERS, verify
-
-  _RISK_MODULE_AVAILABLE = True
-except ModuleNotFoundError as exc:
-  # Only treat the risk_module top-level modules being absent as "unavailable".
-  # A present-but-broken risk_module (one of ITS transitive deps missing) raises
-  # ModuleNotFoundError with a different name and must surface as a real failure.
-  if (exc.name or "").split(".")[0] not in {"settings", "utils"}:
-    raise
-  AGENT_API_CLAIM_MAX_TTL_SECONDS = None  # type: ignore[assignment]
-  AGENT_API_CLAIM_HEADERS = None  # type: ignore[assignment]
-  verify = None  # type: ignore[assignment]
-  _RISK_MODULE_AVAILABLE = False
-finally:
-  if sys.path and sys.path[0] == _risk_root_text:
-    sys.path.pop(0)
-  if _risk_root_original_index is not None:
-    sys.path.insert(_risk_root_original_index, _risk_root_text)
-  sys.modules.pop("config", None)
-  if _prior_config_module is not None:
-    sys.modules["config"] = _prior_config_module
-
-_requires_risk_module = pytest.mark.skipif(
-  not _RISK_MODULE_AVAILABLE,
-  reason=(
-    "risk_module verifier (settings.AGENT_API_CLAIM_MAX_TTL_SECONDS + "
-    "utils.agent_claim) not importable; set RISK_MODULE_CHECKOUT to run the "
-    "cross-repo agent-claim contract tests"
-  ),
-)
-
+if TYPE_CHECKING:
+  from agent_gateway.capability_binding import RunMode
+  from agent_gateway.autonomous_runner import AutonomousRegistry
+  from agent_gateway.skill_limits import AutonomousSkillAdmissionPolicyResolver
 
 HMAC_KEY = "test-hmac-key-at-least-32-bytes-long"
 USER_ID = "1"
@@ -87,7 +44,7 @@ CLAIM_ENV_KEYS = {
 }
 
 
-def _test_capability_bind(run_mode: str):
+def _test_capability_bind(run_mode: RunMode):
   from agent_gateway.capability_binding import CapabilityBind
   from agent_gateway.model_registry import (
     INITIAL_MODEL_REGISTRY,
@@ -193,18 +150,18 @@ class _FakeProcessIdentity:
     if _LAST_FAKE_EVENT_CHANNEL is not None:
       _LAST_FAKE_EVENT_CHANNEL.notify_process_exit(self, value)
 
+  def terminate(self) -> None:
+    self.returncode = -15
+
+  def kill(self) -> None:
+    self.returncode = -9
+
 
 class FakeProcess(_FakeProcessIdentity):
 
   async def wait(self) -> int:
     self.returncode = 0
     return 0
-
-  def terminate(self) -> None:
-    self.returncode = -15
-
-  def kill(self) -> None:
-    self.returncode = -9
 
 
 class SlowFakeProcess(_FakeProcessIdentity):
@@ -214,12 +171,6 @@ class SlowFakeProcess(_FakeProcessIdentity):
       await asyncio.sleep(0.01)
     return self.returncode
 
-  def terminate(self) -> None:
-    self.returncode = -15
-
-  def kill(self) -> None:
-    self.returncode = -9
-
 
 class FailingFakeProcess(_FakeProcessIdentity):
 
@@ -227,23 +178,11 @@ class FailingFakeProcess(_FakeProcessIdentity):
     self.returncode = 1
     return 1
 
-  def terminate(self) -> None:
-    self.returncode = -15
-
-  def kill(self) -> None:
-    self.returncode = -9
-
 
 class RaisingFakeProcess(_FakeProcessIdentity):
 
   async def wait(self) -> int:
     raise RuntimeError("reap boom")
-
-  def terminate(self) -> None:
-    self.returncode = -15
-
-  def kill(self) -> None:
-    self.returncode = -9
 
 
 class _FakeEventChannelChild:
@@ -455,6 +394,19 @@ class RecordingEventBus:
       )
     )
 
+  async def cleanup_run(
+    self,
+    user_id: str,
+    control_run_id: str,
+  ) -> None:
+    self.calls.append((
+      "cleanup",
+      {
+        "user_id": user_id,
+        "control_run_id": control_run_id,
+      },
+    ))
+
 
 class ManifestObservingEventBus(RecordingEventBus):
   def __init__(self, manifest_path: Path) -> None:
@@ -512,13 +464,28 @@ class ManifestObservingEventBus(RecordingEventBus):
 def _registry(
   tmp_path: Path,
   *,
-  approval_store=None,
-  skill_resume_allowed_resolver=lambda _skill: False,
-):
+  skill_resume_allowed_resolver: Callable[[str], bool] = lambda _skill: False,
+  autonomous_skill_admission_policy_resolver: (
+    AutonomousSkillAdmissionPolicyResolver | None
+  ) = None,
+) -> AutonomousRegistry:
   from agent_gateway.autonomous_runner import AutonomousRegistry
   from agent_gateway.claim_signing_authority import (
     GatewayClaimSigningAuthority,
   )
+  from agent_gateway.skill_limits import (
+    AutonomousSkillAdmissionPolicy,
+    SkillExecutionLimits,
+  )
+
+  if autonomous_skill_admission_policy_resolver is None:
+    def admission_policy(skill_name: str) -> AutonomousSkillAdmissionPolicy:
+      return AutonomousSkillAdmissionPolicy(
+        skill_resume_allowed=skill_resume_allowed_resolver(skill_name),
+        execution_limits=SkillExecutionLimits(None, None, None),
+      )
+  else:
+    admission_policy = autonomous_skill_admission_policy_resolver
 
   return AutonomousRegistry(
     api_dir=API_DIR,
@@ -530,9 +497,8 @@ def _registry(
       "anthropic": _test_service_credential_handle(),
     },
     autonomous_capability_binding_resolver=_test_autonomous_capability_binding,
-    skill_resume_allowed_resolver=skill_resume_allowed_resolver,
+    autonomous_skill_admission_policy_resolver=admission_policy,
     claim_signing_authority=GatewayClaimSigningAuthority(HMAC_KEY),
-    approval_store=approval_store,
   )
 
 
@@ -543,34 +509,49 @@ def test_owner_capacity_counts_only_live_processes_for_exact_owner(
     resolve_autonomous_owner_run_limit,
   )
 
+  _write_manifest(tmp_path)
+
   registry = _registry(tmp_path)
+  base_record = registry._tasks["bg_0"]
+  alice_live_1 = SlowFakeProcess()
+  alice_live_2 = SlowFakeProcess()
+  alice_finished = SlowFakeProcess()
+  alice_finished.returncode = 0
+  bob_live = SlowFakeProcess()
+  unowned_live = SlowFakeProcess()
   registry._tasks = {
-    "alice-live-1": SimpleNamespace(
+    "alice-live-1": replace(
+      base_record,
       owner_user_id="alice",
       user_id="alice-raw",
-      proc=SimpleNamespace(returncode=None),
+      proc=alice_live_1,
     ),
-    "alice-live-2": SimpleNamespace(
+    "alice-live-2": replace(
+      base_record,
       owner_user_id="alice",
       user_id="alice-raw",
-      proc=SimpleNamespace(returncode=None),
+      proc=alice_live_2,
     ),
-    "alice-finished": SimpleNamespace(
+    "alice-finished": replace(
+      base_record,
       owner_user_id="alice",
       user_id="alice-raw",
-      proc=SimpleNamespace(returncode=0),
+      proc=alice_finished,
     ),
-    "bob-live": SimpleNamespace(
+    "bob-live": replace(
+      base_record,
       owner_user_id="bob",
       user_id="bob-raw",
-      proc=SimpleNamespace(returncode=None),
+      proc=bob_live,
     ),
-    "unowned-live": SimpleNamespace(
+    "unowned-live": replace(
+      base_record,
       owner_user_id=None,
       user_id="alice",
-      proc=SimpleNamespace(returncode=None),
+      proc=unowned_live,
     ),
   }
+  registry._tasks["unowned-live"].owner_user_id = None
   resolver_calls: list[tuple[str, int]] = []
   registry._owner_run_limit_resolver = (
     lambda owner, count: resolver_calls.append((owner, count)) or None
@@ -654,6 +635,7 @@ def test_autonomous_approval_relay_is_exact_and_idempotent(
       assert replay.decision == received.decision
       assert first["delivery_status"] == "delivered"
       assert duplicate["delivery_status"] == "duplicate"
+      assert record.event_lines is not None
       relayed_events = [
         event
         for event in record.event_lines
@@ -823,7 +805,6 @@ def test_real_owned_sentinel_redacts_child_stdout_and_stderr_from_run_log(
 def test_real_owned_sentinel_output_projection_failure_is_value_free(
   tmp_path: Path,
 ) -> None:
-  from agent_gateway.autonomous_runner import AutonomousRegistry
   from agent_gateway.ui_blocks_metrics import snapshot as metrics_snapshot
 
   status, persisted = _run_real_owned_sentinel_output_canary(
@@ -843,9 +824,16 @@ def test_real_owned_sentinel_output_projection_failure_is_value_free(
     async def readline(self) -> bytes:
       return json.dumps(status).encode("utf-8") + b"\n"
 
+  class StatusFakeProcess(SlowFakeProcess):
+    def __init__(self) -> None:
+      super().__init__()
+      self.stderr = AsyncStatus()
+
   before = metrics_snapshot().get("secret_boundary_sanitization_failed", 0)
-  registry = object.__new__(AutonomousRegistry)
-  record = SimpleNamespace(proc=SimpleNamespace(stderr=AsyncStatus()))
+  _write_manifest(tmp_path, state="interrupted")
+  registry = _registry(tmp_path)
+  record = registry._tasks["bg_0"]
+  record.proc = StatusFakeProcess()
   with pytest.raises(RuntimeError, match="child_output_projection_failed"):
     asyncio.run(registry._read_owned_process_sentinel_status(record))
   assert metrics_snapshot()["secret_boundary_sanitization_failed"] == before + 1
@@ -865,7 +853,7 @@ def test_autonomous_runner_event_helper_preserves_parent_override_seams(tmp_path
       return None
     return ("custom", str(marker))
 
-  registry._event_duplicate_key = duplicate_key  # type: ignore[method-assign]
+  registry._event_duplicate_key = duplicate_key
   assert registry._event_already_recorded(record, {"type": "other", "marker": "same"})
 
   registry._operator_inbox_record_for_message_id = (  # type: ignore[method-assign]
@@ -927,6 +915,20 @@ def test_autonomous_runner_status_tail_lines_counts_and_tails(tmp_path) -> None:
   assert autonomous_runner_status.tail_lines(log_path, 2) == (["two", "three"], 3)
   assert autonomous_runner_status.tail_lines(log_path, 0) == ([], 3)
   assert autonomous_runner_status.tail_lines(tmp_path / "missing.log", 10) == ([], 0)
+
+  spill_dir = (tmp_path / "bg_0.tool_result_spill").resolve()
+  _write_manifest(tmp_path, tool_result_spill_dir=str(spill_dir))
+  record = _registry(tmp_path)._tasks["bg_0"]
+  payload = autonomous_runner_status.status_payload(
+    record,
+    status_tail_lines=2,
+  )
+  assert payload["record_paths"] == {
+    "task_manifest": str(record.log_path.with_name(f"{record.task_id}.task.json")),
+    "log": str(record.log_path),
+    "events": str(record.events_path),
+    "tool_result_spill": str(record.tool_result_spill_dir),
+  }
 
 
 def test_autonomous_runner_command_helper_preserves_profile_normalization_seam(monkeypatch, tmp_path) -> None:
@@ -1070,7 +1072,7 @@ def _write_manifest(tmp_path: Path, task_id: str = "bg_0", **overrides) -> dict:
     "user_email": USER_EMAIL,
     "context": "Review current packet",
     "ticker": "AAPL",
-    "capability_bind": _test_capability_bind("autonomous").receipt(),
+    "capability_bind": _test_capability_bind("autonomous").to_json(),
   }
   manifest_overrides.update(overrides)
   return write_v6_manifest(tmp_path, task_id, **manifest_overrides)
@@ -1093,18 +1095,6 @@ def _write_run_files(tmp_path: Path, task_id: str) -> None:
 
 def _run_files_exist(tmp_path: Path, task_id: str) -> bool:
   return any(tmp_path.glob(f"{task_id}.*"))
-
-
-def _claim_headers_from_env(env: dict[str, str]) -> dict[str, str]:
-  return {
-    AGENT_API_CLAIM_HEADERS["audience"]: env["AGENT_API_CLAIM_AUDIENCE"],
-    AGENT_API_CLAIM_HEADERS["issued_at"]: env["AGENT_API_CLAIM_ISSUED_AT"],
-    AGENT_API_CLAIM_HEADERS["expiry"]: env["AGENT_API_CLAIM_EXPIRY"],
-    AGENT_API_CLAIM_HEADERS["user_id"]: env["AGENT_API_CLAIM_USER_ID"],
-    AGENT_API_CLAIM_HEADERS["user_email"]: env["AGENT_API_CLAIM_USER_EMAIL"],
-    AGENT_API_CLAIM_HEADERS["nonce"]: env["AGENT_API_CLAIM_NONCE"],
-    AGENT_API_CLAIM_HEADERS["signature"]: env["AGENT_API_CLAIM_SIGNATURE"],
-  }
 
 
 async def _start_and_capture_env(
@@ -1161,7 +1151,6 @@ def test_autonomous_manifest_fixture_omits_unconfigured_approval_bridge(
   manifest = _write_manifest(tmp_path)
 
   assert manifest["approval_decisions_path"] is None
-  assert manifest["control_authority"]["approval_decisions_path"] is None
   assert not (tmp_path / "bg_0.approval-decisions.jsonl").exists()
 
 
@@ -1228,12 +1217,10 @@ def test_autonomous_start_omits_unconfigured_approval_bridge(
   assert "AGENT_AUTONOMOUS_APPROVAL_DECISIONS_PATH" not in env
   assert "AGENT_AUTONOMOUS_APPROVALS_DB_PATH" not in env
   assert "AGENT_AUTONOMOUS_CONTROL_RUN_ID" not in env
-  authority = verify_autonomous_launch_envelope(
+  verify_autonomous_launch_envelope(
     HMAC_KEY,
     env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
   ).control_authority
-  assert authority.approval_decisions_path is None
-  assert authority.approval_store_path is None
 
 
 def test_autonomous_start_keeps_approval_store_parent_only_and_inherits_channel(
@@ -1303,13 +1290,13 @@ def test_autonomous_start_keeps_approval_store_parent_only_and_inherits_channel(
   assert "AGENT_AUTONOMOUS_APPROVALS_DB_PATH" not in env
   assert "AGENT_AUTONOMOUS_APPROVAL_DECISIONS_PATH" not in env
   approval_channel_fd = int(env[AUTONOMOUS_APPROVAL_CHANNEL_FD_ENV])
-  assert approval_channel_fd in captured["pass_fds"]
-  authority = verify_autonomous_launch_envelope(
+  pass_fds = captured["pass_fds"]
+  assert isinstance(pass_fds, tuple)
+  assert approval_channel_fd in pass_fds
+  verify_autonomous_launch_envelope(
     HMAC_KEY,
     env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
   ).control_authority
-  assert authority.approval_store_path is None
-  assert authority.approval_decisions_path is None
   assert str(approval_store_path) not in json.dumps(env, sort_keys=True)
 
 
@@ -1362,6 +1349,7 @@ def test_autonomous_start_signs_exact_session_authority_only(
         "pack": None,
         "context": None,
         "ticker": None,
+        "research_file_id": None,
         "dev_mode": False,
         "max_budget_usd": None,
         "deliver": True,
@@ -1377,6 +1365,7 @@ def test_autonomous_start_signs_exact_session_authority_only(
         "pack": None,
         "context": None,
         "ticker": None,
+        "research_file_id": None,
         "dev_mode": False,
         "max_budget_usd": None,
         "deliver": True,
@@ -1392,6 +1381,7 @@ def test_autonomous_start_signs_exact_session_authority_only(
         "pack": "daily-risk",
         "context": None,
         "ticker": None,
+        "research_file_id": None,
         "dev_mode": False,
         "max_budget_usd": None,
         "deliver": True,
@@ -1415,6 +1405,7 @@ def test_autonomous_start_signs_exact_session_authority_only(
         "pack": None,
         "context": "compare guidance",
         "ticker": "MSFT",
+        "research_file_id": None,
         "dev_mode": False,
         "max_budget_usd": 12.5,
         "deliver": False,
@@ -1449,7 +1440,19 @@ def test_autonomous_start_signs_exact_executable_workload(
   session_log_authority = workload_receipt.pop(
     "session_log_authority"
   )
+  admitted_limits = workload_receipt.pop(
+    "admitted_skill_execution_limits"
+  )
   assert workload_receipt == expected_workload
+  assert admitted_limits == (
+    {
+      "max_turns": None,
+      "max_tokens": None,
+      "max_budget_usd": None,
+    }
+    if expected_workload["mode"] == "skill"
+    else None
+  )
   assert session_log_authority["layout"] == "v1"
   assert session_log_authority["base_path"] == env[
     "AGENT_SESSION_LOG_BASE_DIR"
@@ -1599,6 +1602,7 @@ def test_autonomous_start_does_not_clobber_existing_run_files_after_restart(monk
   record = registry._tasks[payload["task_id"]]
   assert record.log_path.read_bytes() == b""
   assert record.events_path == tmp_path / f"{payload['task_id']}.events.jsonl"
+  assert record.events_path is not None
   assert record.events_path.exists()
   assert stat.S_IMODE(record.events_path.stat().st_mode) == 0o600
   assert record.operator_inbox_path is not None
@@ -1751,7 +1755,7 @@ def test_autonomous_manifest_names_platform_containment_expectation(
     "expected_backend": expected_backend,
     "expected_degraded": expected_degraded,
   }
-  assert manifest["manifest_version"] == 7
+  assert manifest["manifest_version"] == 8
 
 
 def test_autonomous_v7_manifest_without_containment_expectation_loads(
@@ -1762,7 +1766,7 @@ def test_autonomous_v7_manifest_without_containment_expectation_loads(
 
   registry = _registry(tmp_path)
 
-  assert registry._tasks["bg_0"].manifest_version == 7
+  assert registry._tasks["bg_0"].manifest_version == 8
 
 
 @pytest.mark.parametrize("resolved", [False, True])
@@ -1772,6 +1776,7 @@ def test_missing_v7_skill_resume_fact_is_resolved_once_and_frozen(
 ) -> None:
   manifest = _write_manifest(tmp_path, skill="legacy-skill")
   manifest.pop("skill_resume_allowed")
+  manifest.pop("admitted_skill_execution_limits")
   _replace_manifest_payload(tmp_path, manifest)
   calls: list[str] = []
 
@@ -1795,6 +1800,134 @@ def test_missing_v7_skill_resume_fact_is_resolved_once_and_frozen(
     ),
   )
   assert second._tasks["bg_0"].skill_resume_allowed is resolved
+
+
+def test_missing_v7_admission_siblings_resolve_once_and_freeze_together(
+  tmp_path,
+) -> None:
+  from agent_gateway.skill_limits import (
+    AutonomousSkillAdmissionPolicy,
+    SkillExecutionLimits,
+  )
+
+  manifest = _write_manifest(tmp_path, skill="legacy-skill")
+  manifest.pop("skill_resume_allowed")
+  manifest.pop("admitted_skill_execution_limits")
+  old_bytes = _replace_manifest_payload(tmp_path, manifest)
+  calls: list[str] = []
+  expected_limits = SkillExecutionLimits(20, 32_000, 20.0)
+
+  def resolver(skill_name: str) -> AutonomousSkillAdmissionPolicy:
+    calls.append(skill_name)
+    return AutonomousSkillAdmissionPolicy(True, expected_limits)
+
+  registry = _registry(
+    tmp_path,
+    autonomous_skill_admission_policy_resolver=resolver,
+  )
+
+  assert calls == ["legacy-skill"]
+  record = registry._tasks["bg_0"]
+  assert record.skill_resume_allowed is True
+  assert record.admitted_skill_execution_limits == expected_limits
+  frozen = _read_manifest(tmp_path)
+  assert frozen["skill_resume_allowed"] is True
+  assert frozen["admitted_skill_execution_limits"] == {
+    "max_turns": 20,
+    "max_tokens": 32_000,
+    "max_budget_usd": 20.0,
+  }
+  assert _manifest_path(tmp_path).read_bytes() != old_bytes
+
+  second = _registry(
+    tmp_path,
+    autonomous_skill_admission_policy_resolver=lambda skill_name: (
+      _ for _ in ()
+    ).throw(AssertionError("frozen siblings must not reread source")),
+  )
+  assert second._tasks["bg_0"].admitted_skill_execution_limits == expected_limits
+
+
+def test_missing_v7_limits_preserves_present_resume_sibling(tmp_path) -> None:
+  from agent_gateway.skill_limits import (
+    AutonomousSkillAdmissionPolicy,
+    SkillExecutionLimits,
+  )
+
+  manifest = _write_manifest(
+    tmp_path,
+    skill="legacy-skill",
+    skill_resume_allowed=True,
+  )
+  manifest.pop("admitted_skill_execution_limits")
+  _replace_manifest_payload(tmp_path, manifest)
+  calls: list[str] = []
+  expected_limits = SkillExecutionLimits(7, 900, 3.5)
+
+  registry = _registry(
+    tmp_path,
+    autonomous_skill_admission_policy_resolver=lambda skill_name: (
+      calls.append(skill_name)
+      or AutonomousSkillAdmissionPolicy(False, expected_limits)
+    ),
+  )
+
+  assert calls == ["legacy-skill"]
+  assert registry._tasks["bg_0"].skill_resume_allowed is True
+  assert registry._tasks["bg_0"].admitted_skill_execution_limits == expected_limits
+  assert _read_manifest(tmp_path)["skill_resume_allowed"] is True
+
+
+@pytest.mark.parametrize(
+  "value",
+  [
+    None,
+    {},
+    {"max_turns": None, "max_tokens": None},
+    {"max_turns": True, "max_tokens": None, "max_budget_usd": None},
+    {"max_turns": None, "max_tokens": None, "max_budget_usd": 0},
+  ],
+)
+def test_present_v7_skill_limits_are_strict_and_never_rederived(
+  tmp_path,
+  value,
+) -> None:
+  _write_manifest(
+    tmp_path,
+    admitted_skill_execution_limits=value,
+  )
+
+  registry = _registry(
+    tmp_path,
+    autonomous_skill_admission_policy_resolver=lambda skill_name: (
+      _ for _ in ()
+    ).throw(AssertionError("malformed present limits must not be rederived")),
+  )
+
+  assert registry._tasks == {}
+
+
+def test_missing_v7_non_skill_limits_freeze_null_without_resolver(
+  tmp_path,
+) -> None:
+  manifest = _write_manifest(
+    tmp_path,
+    mode="task",
+    task="summarize",
+    skill=None,
+  )
+  manifest.pop("admitted_skill_execution_limits")
+  _replace_manifest_payload(tmp_path, manifest)
+
+  registry = _registry(
+    tmp_path,
+    autonomous_skill_admission_policy_resolver=lambda skill_name: (
+      _ for _ in ()
+    ).throw(AssertionError("non-skill migration must not resolve source")),
+  )
+
+  assert registry._tasks["bg_0"].admitted_skill_execution_limits is None
+  assert _read_manifest(tmp_path)["admitted_skill_execution_limits"] is None
 
 
 def test_noncanonical_manifest_filename_cannot_resolve_or_overwrite_task(
@@ -1884,6 +2017,7 @@ def test_missing_v7_resume_freeze_pre_replace_failure_preserves_old_bytes(
 
   manifest = _write_manifest(tmp_path, skill="legacy-skill")
   manifest.pop("skill_resume_allowed")
+  manifest.pop("admitted_skill_execution_limits")
   old_bytes = _replace_manifest_payload(tmp_path, manifest)
 
   def fail_replace(_source: Path, _destination: Path) -> None:
@@ -1893,7 +2027,7 @@ def test_missing_v7_resume_freeze_pre_replace_failure_preserves_old_bytes(
 
   with pytest.raises(
     RuntimeError,
-    match="failed to persist autonomous skill resume compatibility fact",
+    match="failed to persist autonomous skill admission compatibility facts",
   ):
     _registry(tmp_path, skill_resume_allowed_resolver=lambda _skill: True)
 
@@ -1905,6 +2039,7 @@ def test_missing_v7_resume_resolver_failure_preserves_old_bytes(
 ) -> None:
   manifest = _write_manifest(tmp_path, skill="legacy-skill")
   manifest.pop("skill_resume_allowed")
+  manifest.pop("admitted_skill_execution_limits")
   old_bytes = _replace_manifest_payload(tmp_path, manifest)
 
   with pytest.raises(RuntimeError, match="unexpected resolver failure"):
@@ -1926,6 +2061,7 @@ def test_missing_v7_resume_freeze_post_replace_failure_aborts_then_rehydrates(
 
   manifest = _write_manifest(tmp_path, skill="legacy-skill")
   manifest.pop("skill_resume_allowed")
+  manifest.pop("admitted_skill_execution_limits")
   _replace_manifest_payload(tmp_path, manifest)
   original_fsync = autonomous_runner_state.os.fsync
 
@@ -1941,11 +2077,16 @@ def test_missing_v7_resume_freeze_post_replace_failure_aborts_then_rehydrates(
   )
   with pytest.raises(
     RuntimeError,
-    match="failed to persist autonomous skill resume compatibility fact",
+    match="failed to persist autonomous skill admission compatibility facts",
   ):
     _registry(tmp_path, skill_resume_allowed_resolver=lambda _skill: True)
 
   assert _read_manifest(tmp_path)["skill_resume_allowed"] is True
+  assert _read_manifest(tmp_path)["admitted_skill_execution_limits"] == {
+    "max_turns": None,
+    "max_tokens": None,
+    "max_budget_usd": None,
+  }
   monkeypatch.setattr(autonomous_runner_state.os, "fsync", original_fsync)
   registry = _registry(
     tmp_path,
@@ -1969,6 +2110,7 @@ def test_missing_v7_resume_freeze_refuses_active_prior_owner(
     completed_at=None if state == "running" else 125.0,
   )
   manifest.pop("skill_resume_allowed")
+  manifest.pop("admitted_skill_execution_limits")
   old_bytes = _replace_manifest_payload(tmp_path, manifest)
   lease_fd = os.open(manifest["owner_lease_path"], os.O_RDONLY)
   fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1986,10 +2128,11 @@ def test_missing_v7_resume_freeze_refuses_active_prior_owner(
   assert _manifest_path(tmp_path).read_bytes() == old_bytes
 
 
-def test_gateway_generic_legacy_resume_resolver_preserves_source_semantics(
+def test_gateway_generic_admission_resolver_preserves_source_semantics(
   tmp_path,
 ) -> None:
-  from agent_gateway.server import _generic_skill_resume_allowed_resolver
+  from agent_gateway.server import _generic_skill_admission_policy_resolver
+  from agent_gateway.skill_limits import SkillExecutionLimits
 
   skills_dir = tmp_path / "skills"
   skills_dir.mkdir()
@@ -2020,12 +2163,17 @@ Do writer work.
     "---\nname: malformed\nresumable: []\n---\nMalformed policy.\n",
     encoding="utf-8",
   )
-  resolver = _generic_skill_resume_allowed_resolver(skills_dir)
+  resolver = _generic_skill_admission_policy_resolver(skills_dir)
 
-  assert resolver("read-only") is True
-  assert resolver("writer") is False
-  assert resolver("missing") is False
-  assert resolver("malformed") is False
+  assert resolver("read-only").skill_resume_allowed is True
+  assert resolver("read-only").execution_limits == (
+    SkillExecutionLimits(None, None, None)
+  )
+  assert resolver("writer").skill_resume_allowed is False
+  with pytest.raises(FileNotFoundError):
+    resolver("missing")
+  with pytest.raises(ValueError):
+    resolver("malformed")
 
 
 def test_effective_resume_projection_preserves_dynamic_narrowing_order(
@@ -2065,11 +2213,16 @@ def test_initial_direct_and_scheduled_skill_starts_freeze_resolver_fact(
   schedule_id,
 ) -> None:
   from agent_gateway import autonomous_runner
+  from agent_gateway.skill_limits import (
+    AutonomousSkillAdmissionPolicy,
+    SkillExecutionLimits,
+  )
 
   async def fake_exec(*_args, **_kwargs):
     return FakeProcess()
 
   calls: list[str] = []
+  expected_limits = SkillExecutionLimits(20, 32_000, 20.0)
   monkeypatch.setattr(
     autonomous_runner.asyncio,
     "create_subprocess_exec",
@@ -2078,7 +2231,10 @@ def test_initial_direct_and_scheduled_skill_starts_freeze_resolver_fact(
   monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
   registry = _registry(
     tmp_path,
-    skill_resume_allowed_resolver=lambda skill: calls.append(skill) or True,
+    autonomous_skill_admission_policy_resolver=lambda skill_name: (
+      calls.append(skill_name)
+      or AutonomousSkillAdmissionPolicy(True, expected_limits)
+    ),
   )
 
   async def run_case() -> None:
@@ -2094,9 +2250,17 @@ def test_initial_direct_and_scheduled_skill_starts_freeze_resolver_fact(
     try:
       record = registry._tasks[payload["task_id"]]
       assert record.skill_resume_allowed is True
+      assert record.admitted_skill_execution_limits == expected_limits
       assert _read_manifest(tmp_path, record.task_id)[
         "skill_resume_allowed"
       ] is True
+      assert _read_manifest(tmp_path, record.task_id)[
+        "admitted_skill_execution_limits"
+      ] == {
+        "max_turns": 20,
+        "max_tokens": 32_000,
+        "max_budget_usd": 20.0,
+      }
       assert record.capability_bind is not None
       assert record.capability_bind.run_mode == (
         "cron" if schedule_id is not None else "autonomous"
@@ -2139,6 +2303,7 @@ def test_resumed_start_inherits_frozen_resume_fact_without_source_resolution(
   tmp_path,
 ) -> None:
   from agent_gateway import autonomous_runner
+  from agent_gateway.skill_limits import SkillExecutionLimits
 
   async def fake_exec(*_args, **_kwargs):
     return FakeProcess()
@@ -2149,6 +2314,11 @@ def test_resumed_start_inherits_frozen_resume_fact_without_source_resolution(
     state="interrupted",
     skill="frozen-skill",
     skill_resume_allowed=True,
+    admitted_skill_execution_limits={
+      "max_turns": 20,
+      "max_tokens": 32_000,
+      "max_budget_usd": 20.0,
+    },
   )
   monkeypatch.setattr(
     autonomous_runner.asyncio,
@@ -2176,9 +2346,15 @@ def test_resumed_start_inherits_frozen_resume_fact_without_source_resolution(
     try:
       resumed = registry._tasks[payload["task_id"]]
       assert resumed.skill_resume_allowed is True
+      assert resumed.admitted_skill_execution_limits == (
+        SkillExecutionLimits(20, 32_000, 20.0)
+      )
       assert _read_manifest(tmp_path, resumed.task_id)[
         "skill_resume_allowed"
       ] is True
+      assert _read_manifest(tmp_path, resumed.task_id)[
+        "admitted_skill_execution_limits"
+      ]["max_budget_usd"] == 20.0
     finally:
       await registry.cancel(payload["task_id"])
       await registry.shutdown(grace_sec=0.1)
@@ -3058,11 +3234,13 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
         "pack",
           "deliver",
           "skill_resume_allowed",
+          "admitted_skill_execution_limits",
         "context",
         "ticker",
         "channel",
         "dev_mode",
         "max_budget_usd",
+        "research_file_id",
         "dispatch_scope",
         "containment_expectation",
         "cmd",
@@ -3087,7 +3265,7 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
         "capability_bind",
         "tool_result_spill_dir",
       }
-      assert manifest["manifest_version"] == 7
+      assert manifest["manifest_version"] == 8
       assert manifest["task_id"] == payload["task_id"] == "bg_0"
       assert manifest["control_run_id"] == "run-custom"
       assert payload["run_id"] == "run-custom"
@@ -3109,6 +3287,11 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
       assert manifest["pack"] is None
       assert manifest["deliver"] is True
       assert manifest["skill_resume_allowed"] is False
+      assert manifest["admitted_skill_execution_limits"] == {
+        "max_turns": None,
+        "max_tokens": None,
+        "max_budget_usd": None,
+      }
       assert manifest["context"] == "inspect current book"
       assert manifest["ticker"] == "MSFT"
       assert manifest["channel"] == "tui"
@@ -3141,8 +3324,6 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
         manifest["control_authority"]["operator_inbox_path"]
         == manifest["operator_inbox_path"]
       )
-      assert manifest["control_authority"]["approval_decisions_path"] is None
-      assert manifest["control_authority"]["approval_store_path"] is None
       assert isinstance(manifest["started_at"], float)
       assert manifest["state"] == "running"
       assert manifest["exit_code"] is None
@@ -3155,7 +3336,7 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
       assert manifest["schedule_name"] is None
       assert manifest["capability_bind"] == _test_capability_bind(
         "autonomous"
-      ).receipt()
+      ).to_json()
       assert manifest["tool_result_spill_dir"] == str(tmp_path / "bg_0.tool_result_spill")
       assert "proc" not in manifest
       assert "reaper_task" not in manifest
@@ -3263,7 +3444,7 @@ def test_autonomous_initial_manifest_failure_refuses_before_spawn(
         return False
       return original_write(record, checked=checked)
 
-    registry._write_task_manifest = fail_initial_once  # type: ignore[method-assign]
+    registry._write_task_manifest = fail_initial_once
     with pytest.raises(
       RuntimeError,
       match="failed to persist starting autonomous task manifest",
@@ -3316,7 +3497,7 @@ def test_autonomous_post_spawn_manifest_failure_terminates_child_and_cleans_spil
         return False
       return original_write(record, checked=checked)
 
-    registry._write_task_manifest = fail_running_commit  # type: ignore[method-assign]
+    registry._write_task_manifest = fail_running_commit
     with pytest.raises(RuntimeError, match="commit running autonomous task manifest"):
       await registry.start(
         role="owner",
@@ -3824,6 +4005,7 @@ def test_pre_ack_cancellation_interrupts_signals_and_settles(
     status = await registry.cancel(payload["task_id"])
     record = registry._tasks[payload["task_id"]]
 
+    assert record.event_channel_task is not None
     assert observations[:2] == ["interrupt", "SIGTERM"]
     assert status["state"] == "killed"
     assert record.event_channel_task.done()
@@ -4109,7 +4291,9 @@ def test_autonomous_manifest_updates_on_cancel(monkeypatch, tmp_path) -> None:
     assert manifest["exit_code"] == -15
     assert manifest["error"] == "Process terminated by user"
     assert isinstance(manifest["completed_at"], float)
-    assert registry._tasks[payload["task_id"]].reaper_task.done()
+    reaper_task = registry._tasks[payload["task_id"]].reaper_task
+    assert reaper_task is not None
+    assert reaper_task.done()
 
     await registry.shutdown(grace_sec=0.1)
 
@@ -4154,7 +4338,7 @@ def test_autonomous_cancel_manifest_failure_does_not_suppress_process_kill(
         raise OSError("injected cancellation manifest failure")
       return original_write(record, checked=checked)
 
-    registry._write_task_manifest = raise_on_cancellation_request  # type: ignore[method-assign]
+    registry._write_task_manifest = raise_on_cancellation_request
 
     status = await registry.cancel(payload["task_id"])
 
@@ -4236,7 +4420,7 @@ def test_autonomous_shutdown_manifest_failure_does_not_suppress_process_kill(
         raise OSError("injected shutdown manifest failure")
       return original_write(record, checked=checked)
 
-    registry._write_task_manifest = raise_on_shutdown_request  # type: ignore[method-assign]
+    registry._write_task_manifest = raise_on_shutdown_request
 
     await registry.shutdown(grace_sec=0.1)
 
@@ -4363,6 +4547,7 @@ def test_autonomous_operator_message_idempotency_is_concurrent_safe(monkeypatch,
       )
       assert sorted(delivery["delivery_status"] for delivery in deliveries) == ["delivered", "duplicate"]
       record = registry._tasks[payload["task_id"]]
+      assert record.event_lines is not None
       assert record.operator_inbox_path is not None
       lines = record.operator_inbox_path.read_text(encoding="utf-8").splitlines()
       assert len(lines) == 1
@@ -5110,54 +5295,6 @@ def test_autonomous_start_fails_without_installed_claim_authority(
   assert not _manifest_path(tmp_path).exists()
 
 
-@_requires_risk_module
-def test_authority_claim_uses_verifier_ttl_ceiling() -> None:
-  from agent_gateway.claim_signing_authority import (
-    GatewayClaimSigningAuthority,
-  )
-
-  assert AGENT_API_CLAIM_MAX_TTL_SECONDS == 600
-
-  env = GatewayClaimSigningAuthority(HMAC_KEY).sign_user_claim(
-    user_id=USER_ID,
-    user_email=USER_EMAIL,
-    ttl_seconds=600,
-  )
-
-  issued_at = int(env["AGENT_API_CLAIM_ISSUED_AT"])
-  expiry = int(env["AGENT_API_CLAIM_EXPIRY"])
-  assert expiry - issued_at == 600
-  assert verify(
-    HMAC_KEY,
-    _claim_headers_from_env(env),
-    ttl_ceiling=600,
-    now=issued_at,
-  ) is not None
-
-
-@_requires_risk_module
-def test_authority_claim_above_verifier_ceiling_is_rejected() -> None:
-  from agent_gateway.claim_signing_authority import (
-    GatewayClaimSigningAuthority,
-  )
-
-  env = GatewayClaimSigningAuthority(HMAC_KEY).sign_user_claim(
-    user_id=USER_ID,
-    user_email=USER_EMAIL,
-    ttl_seconds=900,
-  )
-
-  issued_at = int(env["AGENT_API_CLAIM_ISSUED_AT"])
-  expiry = int(env["AGENT_API_CLAIM_EXPIRY"])
-  assert expiry - issued_at == 900
-  assert verify(
-    HMAC_KEY,
-    _claim_headers_from_env(env),
-    ttl_ceiling=600,
-    now=issued_at,
-  ) is None
-
-
 def test_event_evidence_concurrent_callers_are_durable_before_publish(
   monkeypatch,
   tmp_path,
@@ -5205,6 +5342,7 @@ def test_event_evidence_concurrent_callers_are_durable_before_publish(
 
   assert append_order == [1, 2]
   assert [payload["event"]["idx"] for name, payload in bus.calls if name == "publish"] == [1, 2]
+  assert record.events_path is not None
   assert [json.loads(line)["idx"] for line in record.events_path.read_text().splitlines()] == [1, 2]
 
 
@@ -5297,6 +5435,8 @@ def test_event_evidence_cancellation_waits_for_worker_before_unlock(
   asyncio.run(case())
 
   assert append_order == [1, 2]
+  assert record.events_path is not None
+  assert record.event_lines is not None
   assert [json.loads(line)["idx"] for line in record.events_path.read_text().splitlines()] == [1, 2]
   assert [event["idx"] for event in record.event_lines if event.get("type") == "cancel"] == [2]
 
@@ -5376,6 +5516,8 @@ def test_event_evidence_any_live_append_failure_fences_strict_false(
     )
 
   assert record.cancellation_requested is True
+  assert record.error is not None
+  assert record.event_lines is not None
   assert "Autonomous event evidence append failure" in record.error
   assert signals == [signal.SIGTERM]
   assert not any(event.get("type") == "fence" for event in record.event_lines)
@@ -5421,6 +5563,7 @@ def test_torn_event_tail_is_repaired_on_adoption_and_next_restart_recovers_appen
   )
 
   second_record = _registry(tmp_path)._tasks["bg_0"]
+  assert second_record.event_lines is not None
   assert [event["type"] for event in second_record.event_lines] == ["before", "after"]
 
 
@@ -5478,6 +5621,7 @@ def test_oversized_event_evidence_tail_load_is_structured(
 
   record = _registry(tmp_path)._tasks["bg_0"]
   assert record.events_evidence_status == "tail_truncated"
+  assert record.event_lines is not None
   assert [event["idx"] for event in record.event_lines] == [5, 6, 7]
 
 
@@ -5692,19 +5836,20 @@ class ParkedSentinelFakeProcess(_FakeProcessIdentity):
       await asyncio.sleep(0.01)
     return self.returncode
 
-  def terminate(self) -> None:
-    self.returncode = -15
 
-  def kill(self) -> None:
-    self.returncode = -9
+class _StartKwargs(TypedDict):
+  role: str
+  profile: str
+  mode: str
+  task: str
 
 
-_START_KWARGS = dict(
-  role="owner",
-  profile="analyst",
-  mode="task",
-  task="summarize",
-)
+_START_KWARGS: _StartKwargs = {
+  "role": "owner",
+  "profile": "analyst",
+  "mode": "task",
+  "task": "summarize",
+}
 
 
 def test_autonomous_child_death_before_any_events_reaches_failed_terminal_state(
@@ -5740,6 +5885,7 @@ def test_autonomous_child_death_before_any_events_reaches_failed_terminal_state(
     status = await registry.wait(payload["task_id"], timeout_sec=2)
 
     record = registry._tasks[payload["task_id"]]
+    assert record.reaper_task is not None
     # wait() returns as soon as the record is terminal; the reaper may still
     # be finishing its terminal publish. It must complete without raising.
     await asyncio.wait_for(asyncio.shield(record.reaper_task), timeout=5)
@@ -5797,6 +5943,7 @@ def test_autonomous_reaper_absorbs_killpg_eperm_and_fails_run(
     status = await registry.wait(payload["task_id"], timeout_sec=5)
 
     record = registry._tasks[payload["task_id"]]
+    assert record.reaper_task is not None
     await asyncio.wait_for(asyncio.shield(record.reaper_task), timeout=5)
     assert status["state"] == "failed"
     assert record.reaper_task.done()
@@ -5856,6 +6003,7 @@ def test_autonomous_reaper_crash_still_commits_terminal_failure(
     status = await registry.wait(payload["task_id"], timeout_sec=5)
 
     record = registry._tasks[payload["task_id"]]
+    assert record.reaper_task is not None
     await asyncio.wait_for(asyncio.shield(record.reaper_task), timeout=5)
     assert status["state"] == "failed"
     assert record.reaper_task.done()
@@ -5924,6 +6072,7 @@ def test_autonomous_cancel_survives_process_group_signal_failure(
     status = await registry.cancel(payload["task_id"])
 
     record = registry._tasks[payload["task_id"]]
+    assert record.reaper_task is not None
     await asyncio.wait_for(asyncio.shield(record.reaper_task), timeout=5)
     assert status["state"] == "killed"
     assert "Process terminated by user" in (record.error or "")

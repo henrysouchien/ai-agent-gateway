@@ -1,10 +1,11 @@
 # ruff: noqa: E402
+from __future__ import annotations
 
 import inspect
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import pytest
 
@@ -13,41 +14,9 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.event_log import EventLog
-from agent_gateway import (
-  CAPABILITY_IDS,
-  CapabilityDefault,
-  CapabilitySelectionPolicy,
-  CredentialHandle,
-  ModelRegistryEntry,
-  ProductModelRegistry,
-  ProductModelSelectionPolicy,
-)
-from agent_gateway.auth import AuthConfig, ResolverResult
-from agent_gateway.providers.agent_sdk import AgentSDKConfig
-from agent_gateway.providers import AnthropicProvider
-from agent_gateway.runner import AgentRunner
-from agent_gateway.sdk_runner import AgentSDKRunner
-from agent_gateway.server import (
-  ChatRuntime,
-  GatewayServerConfig,
-  MaterializedCredential,
-  create_gateway_app,
-)
-from agent_gateway.tool_dispatcher import ToolDispatcher
-
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
-    return False
-
-  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
-    return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
-
-  def get_tool_definitions(self) -> list[dict[str, Any]]:
-    return []
-
-  def get_server_for_tool(self, _name: str) -> str | None:
-    return None
+if TYPE_CHECKING:
+  from agent_gateway.event_log import EventLog
+  from agent_gateway.server import ChatRuntime
 
 
 @dataclass
@@ -66,6 +35,34 @@ def auth_config_model_free() -> dict[str, Any]:
 
 @pytest.fixture
 def make_test_app():
+  from agent_gateway.event_log import EventLog
+  from agent_gateway import (
+    CAPABILITY_IDS,
+    CapabilityDefault,
+    CapabilitySelectionPolicy,
+    CredentialHandle,
+    ModelRegistryEntry,
+    ProductModelRegistry,
+    ProductModelSelectionPolicy,
+  )
+  from agent_gateway.auth import AuthConfig, ResolverResult
+  from agent_gateway.providers.agent_sdk import AgentSDKConfig
+  from agent_gateway.providers import AnthropicProvider
+  from agent_gateway.mcp_client import McpClientManager
+  from agent_gateway.runner import AgentRunner
+  from agent_gateway.sdk_runner import AgentSDKRunner
+  from agent_gateway.server import (
+    ChatRuntime,
+    GatewayServerConfig,
+    MaterializedCredential,
+    create_gateway_app,
+  )
+  from agent_gateway.tool_dispatcher import ToolDispatcher
+
+  class _NullMcpClient(McpClientManager):
+    def __init__(self) -> None:
+      super().__init__(config_path=None)
+
   def _make_test_app(
     *,
     provider: Any = None,
@@ -243,7 +240,7 @@ def make_test_app():
         model_entitled_keys=frozenset({model_key}),
       )
 
-    async def _build_chat_runtime(session, request, channel, auth_manager):
+    async def _build_chat_runtime(session, request, channel, auth_manager, *, storage_root: Path | None = None):
       _ = channel, auth_manager
       state.session = session
 
@@ -355,7 +352,7 @@ def make_test_app():
           else AnthropicProvider()
         ),
         build_chat_runtime=_build_chat_runtime,
-        transcript_dir=transcript_dir,
+        transcript_dir=Path(transcript_dir) if transcript_dir is not None else None,
       )
     )
     app.state.test_state = state

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 import time
 import uuid
 from typing import Any
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from agent_gateway.approval_audit import ApprovalAuditEmitter
@@ -14,18 +16,22 @@ from agent_gateway.audit_writer import JSONLAuditWriter
 from agent_gateway.capability_binding import (
   CredentialHandle,
 )
+from agent_gateway.capability_execution import BoundCapabilityExecution
 from agent_gateway.model_registry import (
   CAPABILITY_IDS,
   INITIAL_MODEL_REGISTRY,
   INITIAL_MODEL_SELECTION_POLICY,
 )
 from agent_gateway.event_log import EventLog
+from agent_gateway.runner import AgentRunner
 from agent_gateway.server import (
+  ChatRequest,
   ChatRuntime,
   GatewayServerConfig,
   MaterializedCredential,
   create_gateway_app,
 )
+from agent_gateway.session import AuthManager, GatewaySession
 
 
 API_KEY = "chat-delete-pr5b-key"
@@ -86,30 +92,32 @@ class _NoopPolicy:
     return decider_role == "owner"
 
 
-class _ApprovalHoldingRunner:
+class _ApprovalHoldingRunner(AgentRunner):
   def __init__(
     self,
     *,
     event_log: EventLog,
-    session,
+    session: GatewaySession,
     store: SQLiteApprovalStore,
     approval_id_holder: list[str],
-    capability_execution: Any,
+    capability_execution: BoundCapabilityExecution,
   ) -> None:
     self._event_log = event_log
     self._session = session
     self._store = store
     self._approval_id_holder = approval_id_holder
-    self.capability_execution = capability_execution
+    self._capability_execution = capability_execution
+    self._selected_content_bindings_bound = False
 
   async def run(
     self,
-    *,
     messages: list[dict[str, Any]],
-    system_prompt: str | None = None,
+    system_prompt: str | list[tuple[str, bool]] | None = None,
     max_turns: int | None = None,
+    *,
+    resume_initial_messages: list[dict[str, Any]] | None = None,
   ) -> None:
-    _ = messages, system_prompt, max_turns
+    _ = messages, system_prompt, max_turns, resume_initial_messages
     tool_call_id = f"tool-{uuid.uuid4().hex}"
     approval_id = f"appr-{uuid.uuid4().hex}"
     self._approval_id_holder.append(approval_id)
@@ -188,8 +196,17 @@ def _make_app(tmp_path):
   approval_ids: list[str] = []
   app_holder: dict[str, Any] = {}
 
-  async def _build_chat_runtime(*, session, request, channel, auth_manager):
+  async def _build_chat_runtime(
+    session: GatewaySession,
+    request: ChatRequest,
+    channel: str | None,
+    auth_manager: AuthManager | None,
+    *,
+    storage_root: Path | None = None,
+  ) -> ChatRuntime:
     _ = channel, auth_manager
+    capability_execution = request.capability_execution
+    assert capability_execution is not None
     return ChatRuntime(
       system_prompt="system",
       build_runner=lambda event_log, _sid, _started_at: _ApprovalHoldingRunner(
@@ -197,9 +214,9 @@ def _make_app(tmp_path):
         session=session,
         store=app_holder["app"].state.gateway_approval_store,
         approval_id_holder=approval_ids,
-        capability_execution=request.capability_execution,
+        capability_execution=capability_execution,
       ),
-      capability_execution=request.capability_execution,
+      capability_execution=capability_execution,
     )
 
   def _on_event(event: dict[str, Any], _session_id: str) -> None:
@@ -235,18 +252,22 @@ def _make_app(tmp_path):
   return app, store, policy, seen_events, approval_ids
 
 
-def _control_session(client: TestClient, user_id: str) -> dict[str, Any]:
+def _control_session(
+  app: FastAPI,
+  client: TestClient,
+  user_id: str,
+) -> dict[str, Any]:
   response = client.post(
     "/api/control/session",
     json={"api_key": API_KEY, "user_id": user_id, "context": {"channel": "tui"}},
   )
   assert response.status_code == 200, response.text
   payload = response.json()
-  session = client.app.state.auth.session_store.get_session(payload["session_id"])
+  session = app.state.auth.session_store.get_session(payload["session_id"])
   assert session is not None
   session.model_entitled_capabilities = CAPABILITY_IDS
   session.model_entitled_keys = frozenset(INITIAL_MODEL_REGISTRY.models)
-  payload["session_token"] = client.app.state.auth.issue_token(session)
+  payload["session_token"] = app.state.auth.issue_token(session)
   return payload
 
 
@@ -254,7 +275,7 @@ def _headers(session_payload: dict[str, Any]) -> dict[str, str]:
   return {"Authorization": f"Bearer {session_payload['session_token']}"}
 
 
-def _with_role(app, session_payload: dict[str, Any], role: str) -> dict[str, Any]:
+def _with_role(app: FastAPI, session_payload: dict[str, Any], role: str) -> dict[str, Any]:
   session = app.state.auth.session_store.get_session(session_payload["session_id"])
   assert session is not None
   session.role = role
@@ -266,7 +287,7 @@ def _with_role(app, session_payload: dict[str, Any], role: str) -> dict[str, Any
 def test_chat_delete_denies_pending_approval_unblocks_loop_and_expires_session(tmp_path) -> None:
   app, store, policy, seen_events, approval_ids = _make_app(tmp_path)
   with TestClient(app) as client:
-    control = _with_role(app, _control_session(client, "alice"), "invite")
+    control = _with_role(app, _control_session(app, client, "alice"), "invite")
     dispatch = client.post(
       "/api/control/runs",
       headers=_headers(control),

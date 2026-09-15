@@ -6,13 +6,10 @@ from agent_gateway.autonomous_runner_commands import build_autonomous_cmd
 
 
 def _build(**overrides):
-  arguments = {
-    "python_executable": "/usr/bin/python3",
-    "profile": "research_producer",
-    "mode": "once",
-  }
-  arguments.update(overrides)
-  return build_autonomous_cmd(**arguments)
+  overrides.setdefault("python_executable", "/usr/bin/python3")
+  overrides.setdefault("profile", "research_producer")
+  overrides.setdefault("mode", "once")
+  return build_autonomous_cmd(**overrides)
 
 
 def test_skill_command_carries_budget_and_delivery_suppression() -> None:

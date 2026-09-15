@@ -20,12 +20,9 @@ def _run(coro):
   return asyncio.run(coro)
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
-    return False
-
-  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
-    return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
+class _NullMcpClient(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
 
 
 class _CaptureProvider(ModelProvider):

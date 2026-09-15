@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import AsyncGenerator
 import json
 import os
 import stat
@@ -20,12 +21,12 @@ for path in (PKG_DIR, TESTS_DIR):
 from agent_gateway import AgentRunner, AgentSessionLog, EventLog  # noqa: E402
 from agent_gateway.agent_session_log_records import EVENT_SCHEMA_VERSION  # noqa: E402
 import agent_gateway.skill_completion_wal as completion_wal_module  # noqa: E402
-from agent_gateway.autonomous import run_session  # noqa: E402
 from agent_gateway.providers import StreamEvent  # noqa: E402
 from agent_gateway.runner_session_events import (  # noqa: E402
   build_skill_run_started_event,
 )
 from agent_gateway.skill_lifecycle import (  # noqa: E402
+  TopLevelServerTerminalCause,
   TopLevelSkillAdmission,
   TopLevelSkillCompletionPlan,
   TopLevelSkillLifecycleMetadata,
@@ -253,16 +254,18 @@ def _runner(
   lifecycle = lifecycle or _metadata()
   policy = policy or _policy(lifecycle)
   active_event_log = event_log or EventLog()
+  active_dispatcher = dispatcher or _make_dispatcher(
+    event_log=active_event_log
+  )
   admission = TopLevelSkillAdmission.acquire(log.path)
   return AgentRunner(
     event_log=active_event_log,
-    dispatcher=dispatcher or _make_dispatcher(
-      event_log=active_event_log
-    ),
+    dispatcher=active_dispatcher,
     session_id="sess-parent",
     capability_execution=_runner_execution(provider),
     agent_session_log=log,
     context_capture=context_capture,
+    get_tool_definitions=active_dispatcher.get_tool_definitions,
     top_level_skill_admission=admission,
     top_level_skill_lifecycle=lifecycle,
     top_level_skill_result_policy=policy,
@@ -397,8 +400,8 @@ def test_result_normalizer_rejects_nested_cycle() -> None:
   ],
 )
 def test_server_terminal_cause_keeps_first_authoritative_trigger(
-  causes: tuple[str, ...],
-  authoritative_cause: str,
+  causes: tuple[TopLevelServerTerminalCause, ...],
+  authoritative_cause: TopLevelServerTerminalCause,
 ) -> None:
   seen_terminal_events: list[dict[str, Any]] = []
 
@@ -414,7 +417,7 @@ def test_server_terminal_cause_keeps_first_authoritative_trigger(
     prepare_completion=_prepare_completion,
   )
   for index, cause in enumerate(causes):
-    accepted = policy.set_server_terminal_cause(  # type: ignore[arg-type]
+    accepted = policy.set_server_terminal_cause(
       cause
     )
     assert accepted is (index == 0)
@@ -439,7 +442,7 @@ def test_server_terminal_cause_keeps_first_authoritative_trigger(
     "server_terminal_cause": authoritative_cause,
     "usage": {"cost_usd": 0.1},
   }]
-  assert policy.set_server_terminal_cause(  # type: ignore[arg-type]
+  assert policy.set_server_terminal_cause(
     authoritative_cause
   )
 
@@ -796,71 +799,6 @@ def test_live_callback_cannot_mutate_committed_result(
   assert live_result["artifact_refs"] == []
 
 
-def test_startup_error_uses_exact_deferred_terminal_for_result(
-  tmp_path: Path,
-) -> None:
-  log = AgentSessionLog(
-    path=tmp_path / "sessions" / "startup-error.jsonl"
-  )
-  event_log = EventLog()
-  provider = _ScriptedProvider([])
-  runner = _runner(
-    log=log,
-    provider=provider,
-    event_log=event_log,
-  )
-  def _fail_client_creation(
-    _config: dict[str, Any],
-    *,
-    timeout: float | None = None,
-  ) -> Any:
-    _ = timeout
-    raise RuntimeError("provider client creation failed")
-
-  provider.create_client = _fail_client_creation  # type: ignore[method-assign]
-
-  _run(
-    runner.run(
-      messages=[{"role": "user", "content": "Run the skill"}]
-    )
-  )
-
-  entries, _ = _run(log.query(order="asc"))
-  durable_events = [entry.event for entry in entries]
-  durable_types = [event["type"] for event in durable_events]
-  assert durable_types == [
-    "attach",
-    "user_message",
-    "skill_run_started",
-    "skill_result_captured",
-    "error",
-    "detach",
-  ]
-  result_event = next(
-    event
-    for event in durable_events
-    if event["type"] == "skill_result_captured"
-  )
-  error_event = next(
-    event for event in durable_events if event["type"] == "error"
-  )
-  assert result_event["error"] == error_event["error"]
-  assert error_event["error"] == (
-    "Provider startup failed: could not create client for provider=stub."
-  )
-  detach_event = next(
-    event
-    for event in durable_events
-    if event["type"] == "detach"
-  )
-  assert detach_event["reason"] == "error"
-
-  live_types = [entry.event["type"] for entry in event_log.entries]
-  assert live_types.index("skill_result_captured") < live_types.index(
-    "error"
-  )
-  assert live_types.count("skill_result_captured") == 1
-  assert live_types.count("error") == 1
 
 
 @pytest.mark.parametrize("prepared", [False, True])
@@ -1856,12 +1794,179 @@ def test_completion_effect_failure_leaves_recoverable_intent(
     )
 
   assert runner.committed_top_level_skill_result_event is None
+  with pytest.raises(OSError, match="atomic state write failed"):
+    _run(runner.wait_for_top_level_skill_settlement())
   wal_path = (
     log.path.parent
     / f".{log.path.name}.skill_completion"
     / "completion.json"
   )
   assert wal_path.exists()
+  entries, _ = _run(log.query(order="asc"))
+  assert entries[-1].event["type"] == "detach"
+  assert entries[-1].event["reason"] == "error"
+  assert any(
+    entry.event["type"] == "run_error"
+    and "atomic state write failed" in entry.event["error"]
+    for entry in entries
+  )
+
+  monkeypatch.setattr(
+    "agent_gateway.runner_session_lifecycle.apply_completion_effect",
+    apply_completion_effect,
+  )
+  recovered_lifecycle = TopLevelSkillLifecycleMetadata(
+    skill_run_id="skill-after-effect-recovery", skill="fundamental-research",
+    scope="ticker", ticker="PCTY", portfolio_id=None,
+  )
+  recovered = _runner(
+    log=log, provider=_ScriptedProvider([_text_turn("next")]),
+    lifecycle=recovered_lifecycle, policy=_policy(recovered_lifecycle),
+  )
+  _run(recovered.run(messages=[{"role": "user", "content": "Next skill"}]))
+  assert _run(recovered.wait_for_top_level_skill_settlement())
+  entries, _ = _run(log.query(order="asc"))
+  pair = [
+    entry.event for entry in entries
+    if entry.event.get("skill_run_id") == lifecycle.skill_run_id
+    and entry.event["type"] in {"skill_result_captured", "error", "stream_complete"}
+  ]
+  assert [event["type"] for event in pair] == ["skill_result_captured", "stream_complete"]
+  assert pair[0]["outcome"] == "success"
+  assert pair[1]["terminal_disposition"] == "completed"
+
+
+@pytest.mark.parametrize(
+  ("failed_event", "server_cause"),
+  [
+    (None, None),
+    (None, "shutdown"),
+    (None, "timeout"),
+    ("terminal_receipt", None),
+    ("detach", None),
+    ("detach", "shutdown"),
+    ("detach", "timeout"),
+  ],
+)
+def test_named_skill_closure_keeps_one_pair_across_storage_recovery(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  server_cause: TopLevelServerTerminalCause | None,
+  failed_event: str | None,
+) -> None:
+  async def case() -> None:
+    log = AgentSessionLog(tmp_path / "sessions" / "closure.jsonl")
+    runner = _runner(log=log, provider=_ScriptedProvider([_text_turn("done")]))
+    if server_cause is not None:
+      assert runner.set_server_terminal_cause(server_cause)
+    append_sync = log.append_sync
+    failed = False
+
+    def fail_once(event: dict[str, Any]) -> Any:
+      nonlocal failed
+      if event["type"] == failed_event and not failed:
+        failed = True
+        # Nothing in the live stream may expose a partially drained closure.
+        assert not any(
+          entry.event["type"] in {"skill_result_captured", "error", "stream_complete"}
+          for entry in runner._log.entries
+        )
+        raise OSError(f"{failed_event} append failed before write")
+      return append_sync(event)
+
+    async def before_terminal(_log: Any, _terminal: dict[str, Any]) -> None:
+      runner._terminal_success_staged_events.append({
+        "type": "terminal_receipt", "receipt_id": "required", "outcome": "success",
+      })
+
+    monkeypatch.setattr(log, "append_sync", fail_once)
+    runner._on_before_stream_complete = before_terminal
+    await runner.run(messages=[{"role": "user", "content": "Run the skill"}])
+    assert await runner.wait_for_top_level_skill_settlement()
+    entries, _ = await log.query(order="asc")
+    live_pair = [
+      entry.event for entry in runner._log.entries
+      if entry.event["type"] in {"skill_result_captured", "error", "stream_complete"}
+    ]
+    durable_pair = [
+      entry.event for entry in entries
+      if entry.event.get("skill_run_id") == _metadata().skill_run_id
+      and entry.event["type"] in {"skill_result_captured", "error", "stream_complete"}
+    ]
+    assert len(live_pair) == len(durable_pair) == 2
+    for live, durable in zip(live_pair, durable_pair):
+      assert live == {key: durable[key] for key in live}
+    result, terminal = live_pair
+    assert runner.committed_top_level_skill_result_event == result
+    assert result["outcome"] == (
+      "timeout" if server_cause == "timeout"
+      else "error" if server_cause or failed_event == "terminal_receipt"
+      else "success"
+    )
+    if server_cause:
+      assert terminal["terminal_disposition"] == "interrupted"
+      assert terminal["server_terminal_cause"] == server_cause
+    elif failed_event == "terminal_receipt":
+      assert terminal["type"] == "error"
+    else:
+      assert terminal["terminal_disposition"] == "completed"
+    assert entries[-1].event["type"] == "detach"
+
+    # A new admitted runner must reuse the exact old pair, not reconstruct
+    # another outcome from a leftover completion intent.
+    recovered_lifecycle = TopLevelSkillLifecycleMetadata(
+      skill_run_id="skill-after-recovery", skill="fundamental-research",
+      scope="ticker", ticker="PCTY", portfolio_id=None,
+    )
+    recovered = _runner(
+      log=log, provider=_ScriptedProvider([_text_turn("next")]),
+      lifecycle=recovered_lifecycle, policy=_policy(recovered_lifecycle),
+    )
+    await recovered.run(messages=[{"role": "user", "content": "Next skill"}])
+    assert await recovered.wait_for_top_level_skill_settlement()
+    after, _ = await log.query(order="asc")
+    assert [
+      entry.event for entry in after
+      if entry.event.get("skill_run_id") == _metadata().skill_run_id
+      and entry.event["type"] in {"skill_result_captured", "error", "stream_complete"}
+    ] == durable_pair
+
+  _run(case())
+
+
+def test_failed_detach_retry_records_error_without_replacing_committed_outcome(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def case() -> None:
+    log = AgentSessionLog(tmp_path / "sessions" / "detach-retry.jsonl")
+    runner = _runner(log=log, provider=_ScriptedProvider([_text_turn("done")]))
+    append_sync = log.append_sync
+    remaining_failures = 2
+
+    def fail_completed_detach(event: dict[str, Any]) -> Any:
+      nonlocal remaining_failures
+      if event["type"] == "detach" and remaining_failures:
+        remaining_failures -= 1
+        raise OSError("completed detach cannot persist")
+      return append_sync(event)
+
+    monkeypatch.setattr(log, "append_sync", fail_completed_detach)
+    await runner.run(messages=[{"role": "user", "content": "Run the skill"}])
+    assert await runner.wait_for_top_level_skill_settlement()
+    entries, _ = await log.query(order="asc")
+    live_pair = [
+      entry.event for entry in runner._log.entries
+      if entry.event["type"] in {"skill_result_captured", "stream_complete", "error"}
+    ]
+    assert [event["type"] for event in live_pair] == ["skill_result_captured", "stream_complete"]
+    assert live_pair[0]["outcome"] == "success"
+    assert entries[-1].event["type"] == "detach"
+    assert entries[-1].event["reason"] == "persistence"
+    assert "completed detach cannot persist" in entries[-1].event["error"]
+    assert entries[-1].event["committed_terminal"] == live_pair[1]
+
+  _run(case())
 
 
 def test_conflicting_partial_result_blocks_before_recovery_effect(
@@ -1919,6 +2024,8 @@ def test_conflicting_partial_result_blocks_before_recovery_effect(
     target_path=state_path,
     update=lambda _exists, _before: {"state": "after"},
   )
+  admission = runner._top_level_skill_admission
+  assert admission is not None
   SkillCompletionWal(log.path).store({
     "record_type": "intent",
     "skill_run_id": stale_lifecycle.skill_run_id,
@@ -1926,7 +2033,7 @@ def test_conflicting_partial_result_blocks_before_recovery_effect(
     "result": durable_result,
     "terminal": durable_terminal,
     "effect": effect.durable_payload(),
-    "fence": runner._top_level_skill_admission.fence,
+    "fence": admission.fence,
   })
 
   with pytest.raises(
@@ -2003,179 +2110,11 @@ class _BlockingProvider(_ScriptedProvider):
     self,
     client: Any,
     params: dict[str, Any],
-  ) -> Any:
+  ) -> AsyncGenerator[StreamEvent, Any]:
     _ = client, params
     self.stream_entered.set()
     await asyncio.Event().wait()
     yield StreamEvent(type="message_end", stop_reason="end_turn")
-
-
-def test_real_timeout_cause_agrees_across_settlement_artifacts(
-  tmp_path: Path,
-) -> None:
-  async def _case() -> None:
-    log = AgentSessionLog(
-      path=tmp_path / "sessions" / "real-timeout.jsonl"
-    )
-    event_log = EventLog()
-    provider = _BlockingProvider()
-    runner = _runner(
-      log=log,
-      provider=provider,
-      event_log=event_log,
-    )
-
-    # A real (non-mocked) session timeout must interrupt a run that is stably
-    # blocked inside the provider stream. A 10ms timeout instead races session
-    # STARTUP under CPU starvation: the cancel lands at an arbitrary early
-    # await (attach-event append, settlement enrollment, the completion
-    # handshake), cancelling the handshake task itself so
-    # drain_owned_lifecycle_task's shield re-raises CancelledError. The 2s
-    # timeout still fires promptly (the provider blocks forever) but leaves
-    # startup ample time to finish first; the stream_entered gate asserts that
-    # precondition event-wise instead of relying on the clock.
-    session_task = asyncio.create_task(
-      run_session(
-        runner,
-        event_log,
-        max_turns=4,
-        timeout_seconds=2.0,
-        initial_message="Run the skill",
-        system_prompt=None,
-      )
-    )
-    await asyncio.wait_for(
-      provider.stream_entered.wait(),
-      timeout=30.0,
-    )
-    output = await asyncio.wait_for(session_task, timeout=120.0)
-
-    assert output.timed_out
-    assert runner._top_level_skill_settlement_complete.is_set()
-    assert runner._write_lease_file is None
-    events, _ = await log.query(order="asc")
-    by_type = {
-      event_type: [
-        entry.event
-        for entry in events
-        if entry.event["type"] == event_type
-      ]
-      for event_type in {
-        "skill_result_captured",
-        "stream_complete",
-        "run_error",
-        "interrupted",
-        "detach",
-      }
-    }
-    assert by_type["skill_result_captured"][0]["exit_code"] == 124
-    assert by_type["skill_result_captured"][0]["outcome"] == "timeout"
-    for event_type in (
-      "stream_complete",
-      "run_error",
-      "interrupted",
-      "detach",
-    ):
-      assert by_type[event_type][0]["reason"] == "timeout"
-    for event_type in (
-      "stream_complete",
-      "run_error",
-      "interrupted",
-    ):
-      assert (
-        by_type[event_type][0]["server_terminal_cause"]
-        == "timeout"
-      )
-
-  _run(_case())
-
-
-def test_caller_cancel_during_timeout_plan_drain_keeps_timeout(
-  tmp_path: Path,
-) -> None:
-  async def _case() -> None:
-    log = AgentSessionLog(
-      path=tmp_path / "sessions" / "timeout-drain.jsonl"
-    )
-    event_log = EventLog()
-    lifecycle = _metadata()
-    plan_entered = asyncio.Event()
-    plan_release = asyncio.Event()
-
-    async def _prepare_completion(
-      _event_log: Any,
-      terminal_event: dict[str, Any],
-    ) -> TopLevelSkillCompletionPlan:
-      plan_entered.set()
-      await plan_release.wait()
-      return _completion_plan(
-        _result_event(lifecycle, terminal_event),
-        terminal_event,
-      )
-
-    provider = _BlockingProvider()
-    runner = _runner(
-      log=log,
-      provider=provider,
-      event_log=event_log,
-      lifecycle=lifecycle,
-      policy=TopLevelSkillResultPolicy(
-        prepare_provider=lambda proposed: proposed,
-        prepare_completion=_prepare_completion,
-      ),
-    )
-    # Same de-flake as test_real_timeout_cause_agrees_across_settlement_artifacts:
-    # a 10ms session timeout races session STARTUP under CPU starvation, so the
-    # cancel can land before settlement enrollment and prepare_completion is
-    # never reached (plan_entered never fires). The 2s timeout still fires
-    # promptly against the forever-blocking provider, and the stream_entered
-    # gate asserts the run reached the steady blocked-stream state first. The
-    # generous wait_for bounds only cap how long the test waits — the plan gate
-    # itself stays event-driven.
-    task = asyncio.create_task(
-      run_session(
-        runner,
-        event_log,
-        max_turns=4,
-        timeout_seconds=2.0,
-        initial_message="Run the skill",
-        system_prompt=None,
-      )
-    )
-    await asyncio.wait_for(
-      provider.stream_entered.wait(),
-      timeout=30.0,
-    )
-    await asyncio.wait_for(
-      plan_entered.wait(),
-      timeout=30.0,
-    )
-    task.cancel()
-    await asyncio.sleep(0)
-    assert not task.done()
-    plan_release.set()
-    with pytest.raises(asyncio.CancelledError):
-      await asyncio.wait_for(task, timeout=30.0)
-
-    assert runner._top_level_skill_settlement_complete.is_set()
-    assert runner._write_lease_file is None
-    events, _ = await log.query(order="asc")
-    result = next(
-      entry.event
-      for entry in events
-      if entry.event["type"] == "skill_result_captured"
-    )
-    terminal = next(
-      entry.event
-      for entry in events
-      if entry.event["type"] == "stream_complete"
-    )
-    assert result["exit_code"] == 124
-    assert result["outcome"] == "timeout"
-    assert terminal["reason"] == "timeout"
-    assert terminal["server_terminal_cause"] == "timeout"
-
-  _run(_case())
 
 
 def test_repeated_cancellation_during_plan_drain_commits_once(
@@ -2395,7 +2334,9 @@ def test_top_level_start_requires_exact_writer_acknowledgement(
       with pytest.raises(RuntimeError, match="envelope mismatch"):
         await runner._persist_top_level_skill_started(event)
     finally:
-      runner._top_level_skill_admission.release()
+      admission = runner._top_level_skill_admission
+      assert admission is not None
+      admission.release()
 
   _run(_case())
 

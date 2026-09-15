@@ -3,7 +3,7 @@
 import asyncio
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -11,8 +11,10 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from agent_gateway.approval_route import DurableLocalApprovalRoute
 from agent_gateway import (
   EventLog,
+  McpClientManager,
   PolicyApprovalDecision,
   RunContext,
   SessionStore,
@@ -20,20 +22,27 @@ from agent_gateway import (
 )
 from agent_gateway.approval_store import SQLiteApprovalStore
 import agent_gateway.tool_dispatcher_helpers as dispatcher_helpers
+from agent_gateway.tool_policy_registry import PreparedToolCall
 
 
 def _run(coro):
   return asyncio.run(coro)
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _tool_name: str) -> bool:
-    return False
+class _NullMcpClient(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
 
-  def get_server_for_tool(self, _tool_name: str) -> str | None:
-    return None
-
-  async def call_tool(self, _tool_name: str, _tool_input: dict[str, Any], **_kwargs: Any):
+  async def call_tool(
+    self,
+    name: str,
+    tool_input: dict[str, Any] | PreparedToolCall,
+    meta: object | None = None,
+    abort_event: asyncio.Event | None = None,
+    gateway_session: object | None = None,
+    allow_uncertain_replay: bool = True,
+    trusted_dispatch_scope: object | None = None,
+  ) -> NoReturn:
     raise AssertionError("MCP should not execute")
 
 
@@ -285,7 +294,7 @@ def test_local_tool_schema_validation_allows_valid_input() -> None:
   assert result == {"received": {"judgment": {"ticker": "PAYC"}}}
 
 
-def test_local_tool_schema_validation_blocks_unadvertised_local_tool() -> None:
+def test_request_snapshot_blocks_unadvertised_local_tool() -> None:
   dispatcher = ToolDispatcher(
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"hidden_write": _unexpected_handler},
@@ -293,11 +302,99 @@ def test_local_tool_schema_validation_blocks_unadvertised_local_tool() -> None:
     role="owner",
   )
 
-  result, error = _run(dispatcher.dispatch("call-1", "hidden_write", {}))
+  result, error = _run(
+    dispatcher.dispatch(
+      "call-1",
+      "hidden_write",
+      {},
+      advertised_tool_names=frozenset(),
+    )
+  )
 
   assert result is None
   assert error is not None
   assert error["code"] == "tool_not_advertised"
+
+
+def test_snapshot_admitted_local_tool_requires_live_schema_for_input_validation() -> None:
+  live_definitions = [
+    {
+      "name": "hidden_write",
+      "input_schema": {"type": "object"},
+    }
+  ]
+  request_snapshot = frozenset({"hidden_write"})
+  dispatcher = ToolDispatcher(
+    mcp_client=_NullMcpClient(),
+    local_tool_handlers={"hidden_write": _unexpected_handler},
+    get_tool_definitions=lambda: list(live_definitions),
+    role="owner",
+  )
+  live_definitions.clear()
+
+  result, error = _run(
+    dispatcher.dispatch(
+      "call-1",
+      "hidden_write",
+      {"payload": "accepted without a live schema"},
+      advertised_tool_names=request_snapshot,
+    )
+  )
+
+  assert result is None
+  assert error == {
+    "code": "tool_schema_unavailable",
+    "message": (
+      "Cannot validate local tool 'hidden_write': its definition is absent "
+      "from the active tool catalog."
+    ),
+    "details": {
+      "tool_name": "hidden_write",
+      "reason": "tool_definition_missing",
+    },
+    "fix": "Retry after the active tool definition is available.",
+  }
+
+
+def test_snapshot_admitted_local_tool_requires_schema_in_live_definition() -> None:
+  dispatcher = ToolDispatcher(
+    mcp_client=_NullMcpClient(),
+    local_tool_handlers={"hidden_write": _unexpected_handler},
+    get_tool_definitions=lambda: [{"name": "hidden_write"}],
+    role="owner",
+  )
+
+  result, error = _run(
+    dispatcher.dispatch(
+      "call-1",
+      "hidden_write",
+      {},
+      advertised_tool_names=frozenset({"hidden_write"}),
+    )
+  )
+
+  assert result is None
+  assert error is not None
+  assert error["code"] == "tool_schema_unavailable"
+  assert error["details"] == {
+    "tool_name": "hidden_write",
+    "reason": "input_schema_missing",
+  }
+
+
+def test_catalog_free_local_caller_remains_supported_without_request_snapshot() -> None:
+  dispatcher = ToolDispatcher(
+    mcp_client=_NullMcpClient(),
+    local_tool_handlers={"package_read": _ok_handler},
+    role="owner",
+  )
+
+  result, error = _run(
+    dispatcher.dispatch("call-1", "package_read", {"ticker": "PAYC"})
+  )
+
+  assert error is None
+  assert result == {"received": {"ticker": "PAYC"}}
 
 
 def test_local_tool_schema_validation_rechecks_approval_modified_args(tmp_path: Path) -> None:
@@ -317,10 +414,12 @@ def test_local_tool_schema_validation_rechecks_approval_modified_args(tmp_path: 
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"structured_write": _handler},
     needs_approval=lambda _name, _tool_input, _qualifier: True,
-    session=session,
     role="owner",
-    store=store,
-    policy=_ModifiedArgsPolicy(),
+    approval_route=DurableLocalApprovalRoute(
+      store,
+      _ModifiedArgsPolicy(),
+      session,
+    ),
     run_context=RunContext(
       user_id="alice",
       request_id="request-1",

@@ -2,7 +2,7 @@
 
 ## Development Setup
 
-From `packages/agent-gateway/`:
+From the package root:
 
 ```bash
 pip install -e ".[dev,anthropic,openai]"
@@ -12,7 +12,7 @@ If you only need one provider, install the matching extra instead.
 
 ## Running Tests
 
-From `packages/agent-gateway/`:
+From the package root:
 
 ```bash
 pytest tests
@@ -30,8 +30,8 @@ When you update docs in this package:
 
 - keep code blocks copy-paste runnable
 - prefer `curl` plus standard library Python over extra CLI dependencies such as `jq`
-- say clearly when `create_agent()` is Anthropic-only
-- use `create_gateway_app()` examples for multi-provider or custom approval scenarios
+- use stable registry `model_key` values and install the matching provider extra
+- use `create_gateway_app()` examples for custom assembly or approval scenarios
 - note Docker preference and subprocess fallback anywhere code execution is shown
 
 When you update examples:
@@ -60,12 +60,6 @@ If you change MCP, approval, or SSE behavior:
 
 ## Publishing And Sync
 
-The package lives in this monorepo under `packages/agent-gateway/`.
-
-The standalone distribution repo is synced with:
-
-```bash
-../../scripts/sync_agent_gateway.sh
-```
-
-That script copies the full package directory, including `docs/` and `examples/`.
+Release automation copies the complete package tree, including `docs/` and
+`examples/`, into the standalone distribution. Keep package documentation
+self-contained: do not link to files outside this tree.

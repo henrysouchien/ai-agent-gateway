@@ -4,7 +4,6 @@ import asyncio
 import logging
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -15,6 +14,8 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 import agent_gateway.runner_usage as runner_usage  # noqa: E402
+from agent_gateway.commercial_usage import CommercialUsageProducer  # noqa: E402
+from agent_gateway.multi_user.billing import SessionUsageSummary  # noqa: E402
 from agent_workflow_contracts import CapabilityBind  # noqa: E402
 
 
@@ -23,8 +24,11 @@ class _Aggregator:
     return True
 
 
-class _FailingProducer:
-  async def reconcile(self, _summary) -> None:
+class _FailingProducer(CommercialUsageProducer):
+  def __init__(self) -> None:
+    super().__init__(enabled=False, claim=None, lineage=None, sink=None)
+
+  async def reconcile(self, summary) -> None:
     raise RuntimeError("CUSTOM-ACTIVE-CREDENTIAL-usage-observer-8f21d7")
 
 
@@ -47,7 +51,7 @@ def _usage_event():
     registry_revision="test-runner-usage-secret-boundary.1",
     policy_revision="test-runner-usage-secret-boundary.1",
     selection_source="capability_default",
-  ).receipt()
+  ).to_json()
   totals["provider_reported_model"] = None
   return runner_usage.build_usage_event(
     user_id="alice",
@@ -62,6 +66,23 @@ def _usage_event():
     rate_table_version="v1",
     billing_mode="byok",
     channel="excel",
+  )
+
+
+def _session_summary() -> SessionUsageSummary:
+  return SessionUsageSummary(
+    user_id="alice",
+    session_id="session-1",
+    request_id="request-1",
+    input_tokens=0,
+    output_tokens=0,
+    cache_read_tokens=0,
+    cache_creation_tokens=0,
+    cost=0.0,
+    turns=0,
+    channel="excel",
+    started_at=1.0,
+    ended_at=2.0,
   )
 
 
@@ -91,7 +112,7 @@ def test_usage_observer_and_durability_failure_logs_are_value_free(
     )
     await runner_usage.call_session_summary_hook(
       fail,
-      SimpleNamespace(),
+      _session_summary(),
       log_session_id="safe-session",
       logger=logger,
       commercial_usage_producer=_FailingProducer(),

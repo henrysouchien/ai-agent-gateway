@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import stat
 import time
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Mapping, TypeAlias
 from urllib.parse import urlparse
 
 import httpx
@@ -44,6 +44,9 @@ _REAUTH_REQUIRED_MESSAGE = (
   "xAI OAuth refresh did not complete previously; the refresh token may be invalidated — "
   "run `python3 -m agent_gateway.cli auth login xai`."
 )
+JSONValue: TypeAlias = bool | int | float | str | None | list["JSONValue"] | dict[str, "JSONValue"]
+XAIOAuthTokenRecord: TypeAlias = dict[str, JSONValue]
+
 
 
 @dataclass(frozen=True)
@@ -112,7 +115,7 @@ def resolve_xai_auth_mode(
   return "oauth" if record and str(record.get("refresh_token") or "").strip() else "api"
 
 
-def load_xai_token_record(path: Path) -> dict[str, Any] | None:
+def load_xai_token_record(path: Path) -> XAIOAuthTokenRecord | None:
   try:
     raw = path.read_text(encoding="utf-8")
   except FileNotFoundError:
@@ -252,7 +255,7 @@ def _record_is_valid(rec: Mapping[str, Any], settings: XAIOAuthSettings) -> bool
       return False
     if not isinstance(refresh_token, str) or not refresh_token.strip():
       return False
-    expires_at = float(rec.get("expires_at"))
+    expires_at = float(rec["expires_at"])
     if not math.isfinite(expires_at) or expires_at <= 0:
       return False
     if rec.get("issuer") != settings.issuer or rec.get("client_id") != settings.client_id:
@@ -282,22 +285,22 @@ def oauth_record_from_config(
   stored = load_xai_token_record(settings.store_path) or {}
   access_token = str(cfg.get("auth_token") or env.get("XAI_AUTH_TOKEN") or stored.get("access_token") or "").strip()
   refresh_token = str(cfg.get("refresh_token") or env.get("XAI_REFRESH_TOKEN") or stored.get("refresh_token") or "").strip()
-  raw_expires = cfg.get("token_expires_at") or env.get("XAI_TOKEN_EXPIRES_AT") or stored.get("expires_at")
-  try:
-    expires_at = float(raw_expires) if raw_expires not in {None, ""} else 0.0
-  except (TypeError, ValueError):
-    expires_at = 0.0
-  if not access_token and not refresh_token:
-    return None, settings
   record = {
     **stored,
     "access_token": access_token,
     "refresh_token": refresh_token,
-    "expires_at": expires_at,
+    "expires_at": cfg.get("token_expires_at") or env.get("XAI_TOKEN_EXPIRES_AT") or stored.get("expires_at"),
     "scope": str(stored.get("scope") or settings.scope),
     "issuer": str(stored.get("issuer") or settings.issuer),
     "client_id": str(stored.get("client_id") or settings.client_id),
   }
+  try:
+    raw_expires = record["expires_at"]
+    record["expires_at"] = float(raw_expires) if raw_expires not in {None, ""} else 0.0
+  except (TypeError, ValueError):
+    record["expires_at"] = 0.0
+  if not access_token and not refresh_token:
+    return None, settings
   return record, settings
 
 
@@ -305,7 +308,10 @@ def token_needs_refresh(record: Mapping[str, Any], *, now: float | None = None) 
   try:
     expires_at = float(record.get("expires_at") or 0)
   except (TypeError, ValueError):
-    return False
+    # A corrupt expiry in the own-written store must trigger a proactive
+    # refresh (which rewrites a clean record) instead of silently disabling
+    # refresh forever.
+    return True
   return bool(expires_at and expires_at <= (time.time() if now is None else now) + EXPIRY_MARGIN_SECONDS)
 
 
@@ -678,6 +684,7 @@ __all__ = [
   "DEFAULT_XAI_OAUTH_SCOPE",
   "XAIDeviceCode",
   "XAIOAuthSettings",
+  "XAIOAuthTokenRecord",
   "discover_xai_oauth",
   "load_xai_token_record",
   "login_xai_device_code",

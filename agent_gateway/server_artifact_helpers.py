@@ -6,6 +6,7 @@ import json as json_mod
 import math
 import os
 import time
+import logging
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
@@ -27,6 +28,8 @@ from .server_models import (
   _ARTIFACT_VISIBILITY_FILTER_VALUES,
   _ARTIFACT_VISIBILITY_VALUES,
 )
+
+log = logging.getLogger("agent_gateway.server_artifact_helpers")
 
 def _model_to_dict(model: Any) -> Dict[str, Any]:
   if hasattr(model, "model_dump"):
@@ -92,7 +95,7 @@ def _sanitize_for_json(obj: Any) -> Any:
 
 def _json_dumps(payload: Dict[str, Any]) -> str:
   sanitized = _sanitize_for_json(payload)
-  return JSONResponse(content=sanitized).body.decode("utf-8")
+  return bytes(JSONResponse(content=sanitized).body).decode("utf-8")
 
 
 def _claim_ttl_ceiling_seconds() -> int:
@@ -269,6 +272,12 @@ def _artifact_research_file_classification(*, user_id: str, research_file_id: in
 
     row = get_repository_factory().get(user_id).get_file(int(research_file_id))
   except Exception:
+    log.warning(
+      "research-file classification lookup failed for research_file_id=%s;"
+      " falling back to sidecar classification",
+      research_file_id,
+      exc_info=True,
+    )
     return None
   if row is None:
     return None
@@ -300,25 +309,28 @@ def _artifact_sidecar_classification(
       "classification_source": "legacy_default",
     }
   try:
-    return {
-      "origin_kind": _artifact_origin_kind(payload.get("origin_kind")),
-      "visibility": _artifact_visibility(payload.get("visibility")),
-      "origin_ref": _artifact_origin_ref(payload.get("origin_ref")),
-      "classification_source": "sidecar",
-    }
+    origin_ref = _artifact_origin_ref(payload.get("origin_ref"))
   except ValueError:
-    return {
-      "origin_kind": "import",
-      "visibility": "archived",
-      "origin_ref": None,
-      "classification_source": "invalid_sidecar",
-    }
+    log.warning(
+      "artifact sidecar origin_ref is unreadable; carrying classification without it",
+      exc_info=True,
+    )
+    origin_ref = None
+  return {
+    "origin_kind": _artifact_origin_kind(payload.get("origin_kind")),
+    "visibility": _artifact_visibility(payload.get("visibility")),
+    "origin_ref": origin_ref,
+    "classification_source": "sidecar",
+  }
 
 
 def _artifact_origin_kind(value: object | None) -> str:
   normalized = str(value if value is not None else "product").strip().lower()
   if normalized not in _ARTIFACT_ORIGIN_VALUES:
-    raise ValueError("invalid artifact origin_kind")
+    # The vocabulary is owned by the producers (research repository CHECK
+    # constraints and the artifact schema models). A value this consumer does
+    # not know yet must be carried, not silently demoted out of visibility.
+    log.warning("artifact classification carries unknown origin_kind %r", normalized)
   return normalized
 
 
@@ -332,7 +344,7 @@ def _artifact_origin_kind_filter(value: object | None) -> str:
 def _artifact_visibility(value: object | None) -> str:
   normalized = str(value if value is not None else "default").strip().lower()
   if normalized not in _ARTIFACT_VISIBILITY_VALUES:
-    raise ValueError("invalid artifact visibility")
+    log.warning("artifact classification carries unknown visibility %r", normalized)
   return normalized
 
 

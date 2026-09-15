@@ -162,6 +162,10 @@ class EventLog:
       await self._updated.wait()
 
   @property
+  def session_id(self) -> str:
+    return self._session_id
+
+  @property
   def entries(self) -> List[LogEntry]:
     return [_copy_log_entry(entry) for entry in self._entries]
 
@@ -772,14 +776,6 @@ class UserEventBus:
     return any(
       subscriber.matches(user_id, control_run_id)
       for subscriber in self._subscribers.get(user_id, ())
-    )
-
-  def _has_run_state_locked(self, key: Tuple[str, str]) -> bool:
-    return (
-      key in self._replay_buffers
-      or key in self._next_seq_by_run
-      or key in self._terminated_runs
-      or key in self._cleanup_tasks
     )
 
   def _cancel_user_cleanup_locked(self, user_id: str) -> None:

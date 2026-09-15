@@ -12,7 +12,7 @@ import re
 from typing import Iterable
 from uuid import UUID
 
-from agent_workflow_contracts import AdmittedTask
+from agent_workflow_contracts import AdmittedTask, sha256_digest
 
 from .agent_session_log import (
   AgentSessionLog,
@@ -40,16 +40,6 @@ RESEARCH_FILE_CURRENT_PROJECTION_UNAVAILABLE_EVENT_TYPE = (
 _CURRENT_PROJECTION_EVENT_VERSION = 1
 _DISCOVERY_LIMIT = 10_000
 _DOCUMENT_ID_RE = re.compile(r"^doc:[0-9a-f]{32}$")
-_MARKER_KEYS = frozenset({
-  "type",
-  "event_schema_version",
-  "current_projection_event_version",
-  "invalidated_through_seq",
-  "research_file_ids",
-  "document_id",
-  "document_generation",
-  "reason",
-})
 
 
 class ResearchFileCurrentProjectionUnavailable(RuntimeError):
@@ -99,10 +89,6 @@ def project_research_file_current_projection(
   cutoff_seq = 0
   for entry in marker_entries:
     event = entry.event
-    if frozenset(event) != _MARKER_KEYS:
-      raise ResearchFileCurrentProjectionUnavailable(
-        "current projection cutoff has an invalid schema"
-      )
     if event.get("type") != RESEARCH_FILE_CURRENT_PROJECTION_UNAVAILABLE_EVENT_TYPE:
       raise ResearchFileCurrentProjectionUnavailable(
         "current projection discovery returned an unexpected event"
@@ -350,12 +336,11 @@ def _select_owner_locations(
   try:
     selected_layout = resolve_agent_session_log_layout()
     trusted_product_id = gateway_product_id()
-    allowed_product_ids = frozenset({trusted_product_id})
+    allowed_product_ids = frozenset()
     if selected_layout == SESSION_LOG_LAYOUT_V1:
-      allowed_product_ids = frozenset({
-        trusted_product_id,
-        *resolve_agent_session_log_archive_product_ids(),
-      })
+      allowed_product_ids = resolve_agent_session_log_archive_product_ids()
+    if trusted_product_id is not None:
+      allowed_product_ids = allowed_product_ids | frozenset({trusted_product_id})
     inventory = enumerate_selected_agent_session_logs(
       base_dir,
       layout=selected_layout,
@@ -430,8 +415,13 @@ def _event_matches_research_file_scope(
     )
   if not matches:
     return False
-  admitted_id = matches[0].context.content
-  return type(admitted_id) is int and admitted_id in target_ids
+  # The admitted content handle is the identity of record: every context view
+  # (inline, excerpt, content-read) must address it, and a research-file id's
+  # content is its canonical JSON integer, so its digest decides scope for any
+  # selector or materialization.
+  return matches[0].source.content.content_id in {
+    sha256_digest(value) for value in target_ids
+  }
 
 
 def _canonical_document_generation(value: object) -> str:

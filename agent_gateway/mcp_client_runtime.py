@@ -171,8 +171,9 @@ async def close_contexts(
   suppress_warnings: Callable[[], Any],
   wait_for: Callable[..., Any],
 ) -> None:
-  while contexts:
-    ctx = contexts.pop()
+  pending_contexts = list(contexts)
+  contexts.clear()
+  for ctx in reversed(pending_contexts):
     try:
       with suppress_warnings():
         await wait_for(

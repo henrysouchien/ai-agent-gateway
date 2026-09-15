@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from typing import Any
+from typing import Any, Protocol, TypedDict
 
+from agent_gateway.approval_policy import ApprovalRequest
 from agent_gateway.autonomous_runner import (
   AutonomousRegistry,
   AutonomousTask,
@@ -23,6 +24,64 @@ AUTONOMOUS_APPROVAL_DRAIN_BATCH_LIMIT = 64
 AUTONOMOUS_APPROVAL_DRAIN_SHUTDOWN_SECONDS = 5.0
 AUTONOMOUS_APPROVAL_FALLBACK_RETRY_MAX_ATTEMPTS = 5
 AUTONOMOUS_APPROVAL_FALLBACK_RETRY_WINDOW_SECONDS = 60.0
+
+class _AutonomousApprovalDelivery(TypedDict):
+  delivery_sequence: int
+  approval_id: str
+  tool_call_id: str
+  nonce: str
+  task_id: str
+  control_run_id: str
+  session_id: str
+  channel_id: str
+  approved: bool
+  decided_at_ns: int
+  next_attempt_ns: int
+  last_attempt_ns: int | None
+  state: str
+  attempt_count: int
+
+
+class _ReadAutonomousApprovalDeliveryRecoveryWindow(Protocol):
+  async def __call__(self) -> dict[str, int]: ...
+
+
+class _SelectPendingAutonomousApprovalDeliveries(Protocol):
+  async def __call__(
+    self,
+    *,
+    limit: int,
+    after_sequence: int,
+    through_sequence: int | None,
+  ) -> list[_AutonomousApprovalDelivery]: ...
+
+
+class _GetApprovalRequest(Protocol):
+  async def __call__(
+    self,
+    approval_id: str,
+  ) -> ApprovalRequest | None: ...
+
+
+class _GetAutonomousApprovalDelivery(Protocol):
+  async def __call__(
+    self,
+    approval_id: str,
+    *,
+    tool_call_id: str,
+    nonce: str,
+  ) -> _AutonomousApprovalDelivery | None: ...
+
+
+class _WriteAutonomousApprovalDeliveryFailure(Protocol):
+  async def __call__(
+    self,
+    approval_id: str,
+    *,
+    tool_call_id: str,
+    nonce: str,
+    error: str,
+  ) -> _AutonomousApprovalDelivery: ...
 
 
 class PermanentAutonomousApprovalDeliveryError(RuntimeError):
@@ -211,12 +270,12 @@ class AutonomousApprovalDeliveryCoordinator:
     )
 
   async def drain_once(self) -> int:
-    recovery_window_reader = getattr(
+    recovery_window_reader: _ReadAutonomousApprovalDeliveryRecoveryWindow | None = getattr(
       self._store,
       "autonomous_approval_delivery_recovery_window",
       None,
     )
-    selector = getattr(
+    selector: _SelectPendingAutonomousApprovalDeliveries | None = getattr(
       self._store,
       "list_pending_autonomous_approval_deliveries",
       None,
@@ -377,8 +436,8 @@ class AutonomousApprovalDeliveryCoordinator:
 
   @staticmethod
   def _delivery_identity(
-    delivery: dict[str, Any],
-  ) -> tuple[object, object, object]:
+    delivery: _AutonomousApprovalDelivery,
+  ) -> tuple[str, str, str]:
     return (
       delivery.get("approval_id"),
       delivery.get("tool_call_id"),
@@ -387,7 +446,7 @@ class AutonomousApprovalDeliveryCoordinator:
 
   def _clear_fallback_failure(
     self,
-    delivery: dict[str, Any],
+    delivery: _AutonomousApprovalDelivery,
   ) -> None:
     self._fallback_failures.pop(
       self._delivery_identity(delivery),
@@ -396,7 +455,7 @@ class AutonomousApprovalDeliveryCoordinator:
 
   async def _fallback_retry_or_fail(
     self,
-    delivery: dict[str, Any],
+    delivery: _AutonomousApprovalDelivery,
     failure: Exception,
   ) -> None:
     identity = self._delivery_identity(delivery)
@@ -429,7 +488,7 @@ class AutonomousApprovalDeliveryCoordinator:
 
   async def _deliver_one(
     self,
-    delivery: dict[str, Any],
+    delivery: _AutonomousApprovalDelivery,
   ) -> None:
     if not isinstance(delivery, dict):
       raise PermanentAutonomousApprovalDeliveryError(
@@ -478,7 +537,7 @@ class AutonomousApprovalDeliveryCoordinator:
       raise PermanentAutonomousApprovalDeliveryError(
         "autonomous approval pending row has invalid decision authority"
       )
-    get_request = getattr(self._store, "get", None)
+    get_request: _GetApprovalRequest | None = getattr(self._store, "get", None)
     if not callable(get_request):
       raise PermanentAutonomousApprovalDeliveryError(
         "autonomous approval request lookup is unavailable"
@@ -504,15 +563,15 @@ class AutonomousApprovalDeliveryCoordinator:
 
   async def _record_failure(
     self,
-    delivery: object,
+    delivery: _AutonomousApprovalDelivery,
     failure: Exception,
-  ) -> dict[str, Any] | None:
+  ) -> _AutonomousApprovalDelivery | None:
     if not isinstance(delivery, dict):
       log.error(
         "Malformed autonomous approval pending row could not be recorded"
       )
       return None
-    record_failure = getattr(
+    record_failure: _WriteAutonomousApprovalDeliveryFailure | None = getattr(
       self._store,
       "record_autonomous_approval_delivery_failure",
       None,
@@ -523,7 +582,7 @@ class AutonomousApprovalDeliveryCoordinator:
       )
       return None
     try:
-      get_delivery = getattr(
+      get_delivery: _GetAutonomousApprovalDelivery | None = getattr(
         self._store,
         "get_autonomous_approval_delivery",
         None,
@@ -559,12 +618,12 @@ class AutonomousApprovalDeliveryCoordinator:
 
   async def _quarantine_failure(
     self,
-    delivery: object,
+    delivery: _AutonomousApprovalDelivery,
     failure: Exception,
-  ) -> dict[str, Any] | None:
+  ) -> _AutonomousApprovalDelivery | None:
     if not isinstance(delivery, dict):
       return None
-    quarantine = getattr(
+    quarantine: _WriteAutonomousApprovalDeliveryFailure | None = getattr(
       self._store,
       "quarantine_autonomous_approval_delivery",
       None,
@@ -590,7 +649,7 @@ class AutonomousApprovalDeliveryCoordinator:
 
   async def _fail_quarantined_owner(
     self,
-    delivery: dict[str, Any],
+    delivery: _AutonomousApprovalDelivery,
     failure: Exception,
   ) -> None:
     fail_owner = getattr(

@@ -1,24 +1,30 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from agent_gateway.capability_binding import (
   CredentialHandle,
 )
+from agent_gateway.capability_execution import BoundCapabilityExecution
 from agent_gateway.model_registry import (
   CAPABILITY_IDS,
   INITIAL_MODEL_REGISTRY,
   INITIAL_MODEL_SELECTION_POLICY,
 )
 from agent_gateway.event_log import EventLog
+from agent_gateway.runner import AgentRunner
 from agent_gateway.server import (
+  ChatRequest,
   ChatRuntime,
   GatewayServerConfig,
   MaterializedCredential,
   create_gateway_app,
 )
+from agent_gateway.session import AuthManager, GatewaySession
 
 
 API_KEY = "dispatch-pr5b-key"
@@ -48,25 +54,27 @@ def _materialize_service_credential(
   return _SERVICE_MATERIAL
 
 
-class _EchoRunner:
+class _EchoRunner(AgentRunner):
   def __init__(
     self,
     event_log: EventLog,
     captured: dict[str, Any],
-    capability_execution: Any,
+    capability_execution: BoundCapabilityExecution,
   ) -> None:
     self._event_log = event_log
     self._captured = captured
-    self.capability_execution = capability_execution
+    self._capability_execution = capability_execution
+    self._selected_content_bindings_bound = False
 
   async def run(
     self,
-    *,
     messages: list[dict[str, Any]],
-    system_prompt: str | None = None,
+    system_prompt: str | list[tuple[str, bool]] | None = None,
     max_turns: int | None = None,
+    *,
+    resume_initial_messages: list[dict[str, Any]] | None = None,
   ) -> None:
-    _ = system_prompt, max_turns
+    _ = system_prompt, max_turns, resume_initial_messages
     self._captured["messages"] = messages
     last_user = next((message["content"] for message in reversed(messages) if message.get("role") == "user"), "")
     self._event_log.append({"type": "text_delta", "text": f"echo:{last_user}"})
@@ -77,22 +85,31 @@ class _EchoRunner:
     })
 
 
-def _make_app(captured: dict[str, Any] | None = None):
+def _make_app(captured: dict[str, Any] | None = None) -> FastAPI:
   captured = captured if captured is not None else {}
 
-  async def _build_chat_runtime(*, session, request, channel, auth_manager):
+  async def _build_chat_runtime(
+    session: GatewaySession,
+    request: ChatRequest,
+    channel: str | None,
+    auth_manager: AuthManager | None,
+    *,
+    storage_root: Path | None = None,
+  ) -> ChatRuntime:
     _ = auth_manager
     captured["request_context"] = dict(request.context or {})
     captured["channel"] = channel
     captured["session_id"] = session.session_id
+    capability_execution = request.capability_execution
+    assert capability_execution is not None
     return ChatRuntime(
       system_prompt="system",
       build_runner=lambda event_log, _sid, _started_at: _EchoRunner(
         event_log,
         captured,
-        request.capability_execution,
+        capability_execution,
       ),
-      capability_execution=request.capability_execution,
+      capability_execution=capability_execution,
     )
 
   return create_gateway_app(
@@ -110,36 +127,36 @@ def _make_app(captured: dict[str, Any] | None = None):
   )
 
 
-def _control_session(client: TestClient, user_id: str) -> dict[str, Any]:
+def _control_session(app: FastAPI, client: TestClient, user_id: str) -> dict[str, Any]:
   response = client.post(
     "/api/control/session",
     json={"api_key": API_KEY, "user_id": user_id, "context": {"channel": "tui"}},
   )
   assert response.status_code == 200, response.text
-  return _with_model_entitlements(client, response.json())
+  return _with_model_entitlements(app, response.json())
 
 
-def _chat_session(client: TestClient, user_id: str) -> dict[str, Any]:
+def _chat_session(app: FastAPI, client: TestClient, user_id: str) -> dict[str, Any]:
   response = client.post(
     "/api/chat/init",
     json={"api_key": API_KEY, "user_id": user_id, "context": {"channel": "tui"}},
   )
   assert response.status_code == 200, response.text
-  return _with_model_entitlements(client, response.json())
+  return _with_model_entitlements(app, response.json())
 
 
 def _with_model_entitlements(
-  client: TestClient,
+  app: FastAPI,
   session_payload: dict[str, Any],
 ) -> dict[str, Any]:
-  session = client.app.state.auth.session_store.get_session(
+  session = app.state.auth.session_store.get_session(
     session_payload["session_id"]
   )
   assert session is not None
   session.model_entitled_capabilities = CAPABILITY_IDS
   session.model_entitled_keys = frozenset(INITIAL_MODEL_REGISTRY.models)
   payload = dict(session_payload)
-  payload["session_token"] = client.app.state.auth.issue_token(session)
+  payload["session_token"] = app.state.auth.issue_token(session)
   return payload
 
 
@@ -151,7 +168,7 @@ def test_chat_dispatch_mints_chat_session_token_and_returns_chat_run() -> None:
   captured: dict[str, Any] = {}
   app = _make_app(captured)
   with TestClient(app) as client:
-    control = _control_session(client, "alice")
+    control = _control_session(app, client, "alice")
 
     response = client.post(
       "/api/control/runs",
@@ -205,7 +222,7 @@ def test_chat_dispatch_mints_chat_session_token_and_returns_chat_run() -> None:
 def test_chat_dispatch_requires_control_session_token() -> None:
   app = _make_app()
   with TestClient(app) as client:
-    chat = _chat_session(client, "alice")
+    chat = _chat_session(app, client, "alice")
 
     response = client.post(
       "/api/control/runs",

@@ -68,11 +68,11 @@ def _config_base_url(config: dict[str, Any]) -> str | None:
 
 
 def _credential_token(config: dict[str, Any]) -> str:
+  # auth_mode is owned by api/credentials.py get_codex_config, which only
+  # ever writes "oauth" or "api"; the oauth ordering is the default arm.
   mode = str(config.get("auth_mode", "")).strip().lower()
   auth_token = str(config.get("auth_token", "") or "").strip()
   api_key = str(config.get("api_key", "") or "").strip()
-  if mode == "oauth":
-    return auth_token or api_key
   if mode == "api":
     return api_key or auth_token
   return auth_token or api_key
@@ -503,8 +503,11 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
   event_type = event.get("type")
   if not isinstance(event_type, str):
     return []
+  raw_response_envelope = event.get("response")
   response_envelope = (
-    event.get("response") if isinstance(event.get("response"), dict) else {}
+    raw_response_envelope
+    if isinstance(raw_response_envelope, dict)
+    else {}
   )
   reported_model = str(response_envelope.get("model") or "").strip() or None
   if reported_model is not None:
@@ -683,8 +686,8 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
     # otherwise a backend that both seeds and streams yields the arguments twice over.
     # Mirrors the replace-on-first-delta guard in openai_responses_helpers.py. The mappers are
     # NOT identical past this point: OpenAI suppresses the event for an empty delta and this
-    # one still emits it. Filed, not silently aligned -- see the residuals note in
-    # docs/design/gateway-codex-reasoning-separator-fix.md.
+    # one still emits it. Keep that observable difference explicit rather than
+    # silently aligning the two providers.
     # `delta and` matters: an empty delta must NOT discard a valid seeded snapshot, which
     # would degrade the call to "{}" when output_item.done omits arguments.
     if delta and not state.saw_argument_delta:
@@ -750,24 +753,18 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
       # openai_responses_helpers.py uses. function_call_arguments.done is the contract's
       # finalization event and lands in current_tool_json, so item-first lets a stale
       # output_item.done.arguments overwrite explicitly finalized arguments. The two mappers
-      # genuinely disagree here; OpenAI's order is the suspect one. See the residual note in
-      # docs/design/gateway-codex-reasoning-separator-fix.md.
+      # genuinely disagree here; OpenAI's item-first order can overwrite the explicitly
+      # finalized arguments, so Codex deliberately preserves the accumulator-first order.
       args_source = state.current_tool_json or str(item.get("arguments") or "{}")
       tool_input = _parse_streaming_json(args_source)
       call_id = str(item.get("call_id") or "")
       item_id = str(item.get("id") or "")
       tool_id = f"{call_id}|{item_id}" if item_id else call_id
-      from ..runner_tool_audit import redact_tool_input_for_event
-
-      redacted_tool_input = redact_tool_input_for_event(
-        str(item.get("name") or ""),
-        tool_input,
-      )
       raw_block = {
         "type": "tool_use",
         "id": tool_id,
         "name": str(item.get("name") or ""),
-        "input": redacted_tool_input,
+        "input": tool_input,
       }
       state.current_block_type = None
       state.current_item = None

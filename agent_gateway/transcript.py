@@ -254,7 +254,7 @@ def _tool_result_blocks_from_event(event: dict[str, Any]) -> list[ToolResultBloc
         "is_error": True,
       }
     ]
-  block = {
+  block: ToolResultBlock = {
     "type": "tool_result",
     "tool_use_id": tool_call_id,
     "content": json.dumps(event.get("result"), default=str),

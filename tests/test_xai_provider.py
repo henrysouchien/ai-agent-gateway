@@ -166,7 +166,7 @@ def test_xai_config_has_no_selection_defaults_and_registry_owns_models(monkeypat
     if entry.provider == "xai"
     and entry.capabilities.get("session.driver") == "user_selectable"
   }
-  assert xai_models == {"grok-4.5": "Grok 4.5"}
+  assert xai_models == {"grok-4.5": "Grok 4.5", "grok-4.6": "Grok 4.6"}
 
 
 def test_xai_effort_and_thinking_env_are_not_auth_authority(monkeypatch) -> None:
@@ -188,6 +188,8 @@ def test_xai_effort_and_thinking_env_are_not_auth_authority(monkeypatch) -> None
     ("grok-4.5", ThinkingLevel.LOW, ThinkingLevel.LOW, True, {"reasoning": {"effort": "low"}}),
     ("grok-4.5", ThinkingLevel.MEDIUM, ThinkingLevel.MEDIUM, True, {"reasoning": {"effort": "medium"}}),
     ("grok-4.5", ThinkingLevel.HIGH, ThinkingLevel.HIGH, True, {"reasoning": {"effort": "high"}}),
+    ("grok-4.5", ThinkingLevel.XHIGH, ThinkingLevel.XHIGH, True, {"reasoning": {"effort": "xhigh"}}),
+    ("grok-4.6", ThinkingLevel.XHIGH, ThinkingLevel.XHIGH, True, {"reasoning": {"effort": "xhigh"}}),
     ("grok-4.3", ThinkingLevel.NONE, ThinkingLevel.NONE, False, {"reasoning": {"effort": "none"}}),
     ("grok-4.3-fast", ThinkingLevel.HIGH, ThinkingLevel.HIGH, True, {"reasoning": {"effort": "high"}}),
   ],
@@ -214,7 +216,6 @@ def test_effort_resolution_preserves_supported_effort_exactly(
     # Formerly silently clamped/upgraded; unsupported effort now refuses.
     ("grok-4.5", ThinkingLevel.NONE),
     ("grok-4.5", ThinkingLevel.MINIMAL),
-    ("grok-4.5", ThinkingLevel.XHIGH),
     ("grok-4.5", ThinkingLevel.MAX),
     ("grok-4.3-fast", ThinkingLevel.MAX),
     ("grok-build-0.1", ThinkingLevel.HIGH),
@@ -323,7 +324,18 @@ def test_responses_url_uses_xai_v1_default() -> None:
   assert resolve_responses_url("https://proxy.example/v1/") == "https://proxy.example/v1/responses"
 
 
-def test_whole_chunk_tool_call_maps_full_tool_lifecycle() -> None:
+def test_whole_chunk_tool_call_maps_raw_full_tool_lifecycle(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  import agent_gateway.runner_tool_audit as runner_tool_audit
+
+  monkeypatch.setattr(
+    runner_tool_audit,
+    "redact_tool_input_for_event",
+    lambda *_args, **_kwargs: (_ for _ in ()).throw(
+      AssertionError("xAI mapper cannot own history redaction")
+    ),
+  )
   state = _ResponsesStreamState()
   added = map_event(
     {
@@ -360,6 +372,7 @@ def test_whole_chunk_tool_call_maps_full_tool_lifecycle() -> None:
   )
   assert [event.type for event in added + done] == ["tool_use_start", "tool_use_delta", "tool_use_end"]
   assert done[0].tool_input == {"ticker": "XAI"}
+  assert done[0].raw_block["input"] == {"ticker": "XAI"}
   assert completed[-1].type == "message_end"
   assert completed[-1].stop_reason == "tool_use"
 

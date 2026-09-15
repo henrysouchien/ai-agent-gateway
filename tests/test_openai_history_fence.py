@@ -53,6 +53,7 @@ def _openai_bound_execution(model: str = "gpt-5.6") -> dict:
         "api_key": "test-openai-key",
       },
     ),
+    "admitted_skill_execution_limits": None,
     "session": _gateway_session(),
   }
 

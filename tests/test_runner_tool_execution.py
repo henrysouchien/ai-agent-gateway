@@ -1,10 +1,11 @@
 import asyncio
+from datetime import timedelta
 import hashlib
 import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Never
 
 import pytest
 
@@ -30,7 +31,8 @@ from agent_workflow_contracts import (  # noqa: E402
   TranscriptHandle,
   sha256_digest,
 )
-from agent_gateway import AgentRunner, AgentSessionLog, EventLog, SessionContextBuilder, TaskState  # noqa: E402
+from agent_gateway import AgentRunner, AgentSessionLog, EventLog, SessionContextBuilder, TaskState, ToolDispatcher  # noqa: E402
+from agent_gateway.mcp_client import McpClientManager, _ServerState  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 import agent_gateway.runner_tool_execution as runner_tool_execution  # noqa: E402
 from agent_gateway.runner_background_tasks import (  # noqa: E402
@@ -39,9 +41,28 @@ from agent_gateway.runner_background_tasks import (  # noqa: E402
   ordinary_parent_result_policy,
 )
 from agent_gateway.runner_tool_execution import RunnerToolExecutionMixin  # noqa: E402
+from agent_gateway.runner_tool_audit import redact_tool_input_for_event  # noqa: E402
+from agent_gateway.tool_policy_registry import PreparedToolCall  # noqa: E402
+from agent_gateway.tool_dispatch_classification import (  # noqa: E402
+  ToolResultSettlement,
+  settle_catalogless_tool_result,
+)
 from tests.capability_execution_test_support import (  # noqa: E402
   stub_runner_capability_execution,
 )
+
+
+class _UnusedMcpSession:
+  async def call_tool(
+    self,
+    name: str,
+    arguments: dict[str, object],
+    *,
+    read_timeout_seconds: timedelta,
+    meta: dict[str, object] | None = None,
+  ) -> Never:
+    _ = name, arguments, read_timeout_seconds, meta
+    raise AssertionError("MCP session is not used in this test")
 
 
 class _Provider:
@@ -65,23 +86,69 @@ def _capability_execution():
 
 
 class _Dispatcher:
-  async def dispatch(self, tool_id: str, tool_name: str, tool_input: dict[str, Any], *, call_index: int = 0):
+  def redact_prepared_tool_input(
+    self,
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+  ) -> dict[str, Any]:
+    return redact_tool_input_for_event(
+      tool_name,
+      prepared_call.materialize_input(),
+    )
+
+  def settle_tool_result(
+    self,
+    tool_name: str,
+    dispatch_entry: Any,
+    result: Any,
+    error: Any,
+    semantic_error: Any = None,
+    *,
+    prepared_call: PreparedToolCall,
+  ) -> ToolResultSettlement:
+    _ = prepared_call
+    return settle_catalogless_tool_result(
+      entry=dispatch_entry,
+      result=result,
+      error=error,
+      semantic_error=semantic_error,
+    )
+
+  async def dispatch(
+    self,
+    tool_id: str,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    call_index: int = 0,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: Any | None = None,
+  ) -> tuple[Any | None, dict[str, Any] | None]:
     _ = tool_id, tool_name, call_index
     return {"status": "ok", "echo": dict(tool_input)}, None
 
 
-class _SecretResultDispatcher:
+class _SecretResultDispatcher(_Dispatcher):
   def __init__(self, secret: str) -> None:
     self.secret = secret
     self.inputs: list[dict[str, Any]] = []
 
-  async def dispatch(self, tool_id: str, tool_name: str, tool_input: dict[str, Any], *, call_index: int = 0):
+  async def dispatch(
+    self,
+    tool_id: str,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    call_index: int = 0,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: Any | None = None,
+  ):
     _ = tool_id, tool_name, call_index
     self.inputs.append(dict(tool_input))
     return {"status": "ok", "credential": self.secret}, None
 
 
-class _TaskResultDispatcher:
+class _TaskResultDispatcher(_Dispatcher):
   def __init__(self, result: Any) -> None:
     self.result = result
 
@@ -92,14 +159,25 @@ class _TaskResultDispatcher:
     tool_input: dict[str, Any],
     *,
     call_index: int = 0,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: Any | None = None,
   ):
     _ = tool_id, tool_input, call_index
     assert tool_name == "run_agent"
     return self.result, None
 
 
-class _UiBlocksDispatcher:
-  async def dispatch(self, tool_id: str, tool_name: str, tool_input: dict[str, Any], *, call_index: int = 0):
+class _UiBlocksDispatcher(_Dispatcher):
+  async def dispatch(
+    self,
+    tool_id: str,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    call_index: int = 0,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: Any | None = None,
+  ):
     _ = tool_id, call_index
     assert tool_name == "emit_ui_blocks"
     if tool_input.get("valid") is False:
@@ -107,14 +185,32 @@ class _UiBlocksDispatcher:
     return {"accepted": {"ui_blocks_id": "ub_test", "emission_index": 0}}, None
 
 
-class _ExplodingDispatcher:
-  async def dispatch(self, tool_id: str, tool_name: str, tool_input: dict[str, Any], *, call_index: int = 0):
+class _ExplodingDispatcher(_Dispatcher):
+  async def dispatch(
+    self,
+    tool_id: str,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    call_index: int = 0,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: Any | None = None,
+  ):
     _ = tool_id, tool_input, call_index
     raise AssertionError(f"dispatch should not be called for excluded tool {tool_name}")
 
 
-class _UnavailableDispatcher:
-  async def dispatch(self, tool_id: str, tool_name: str, tool_input: dict[str, Any], *, call_index: int = 0):
+class _UnavailableDispatcher(_Dispatcher):
+  async def dispatch(
+    self,
+    tool_id: str,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    call_index: int = 0,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: Any | None = None,
+  ):
     _ = tool_id, tool_name, tool_input, call_index
     return None, {
       "code": "tool_unavailable",
@@ -132,8 +228,17 @@ class _UnavailableDispatcher:
     }
 
 
-class _HintedErrorDispatcher:
-  async def dispatch(self, tool_id: str, tool_name: str, tool_input: dict[str, Any], *, call_index: int = 0):
+class _HintedErrorDispatcher(_Dispatcher):
+  async def dispatch(
+    self,
+    tool_id: str,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    call_index: int = 0,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: Any | None = None,
+  ):
     _ = tool_id, call_index
     assert tool_name == "get_price_target"
     assert tool_input == {"ticker": "MSCI"}
@@ -145,8 +250,17 @@ class _HintedErrorDispatcher:
     }
 
 
-class _ApprovalTimeoutDispatcher:
-  async def dispatch(self, tool_id: str, tool_name: str, tool_input: dict[str, Any], *, call_index: int = 0):
+class _ApprovalTimeoutDispatcher(_Dispatcher):
+  async def dispatch(
+    self,
+    tool_id: str,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    call_index: int = 0,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: Any | None = None,
+  ):
     _ = tool_id, tool_name, tool_input, call_index
     return None, {
       "code": "approval_timeout",
@@ -154,8 +268,17 @@ class _ApprovalTimeoutDispatcher:
     }
 
 
-class _ReadableResourceDispatcher:
-  async def dispatch(self, tool_id: str, tool_name: str, tool_input: dict[str, Any], *, call_index: int = 0):
+class _ReadableResourceDispatcher(_Dispatcher):
+  async def dispatch(
+    self,
+    tool_id: str,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    call_index: int = 0,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: Any | None = None,
+  ):
     _ = tool_id, tool_name, tool_input, call_index
     content = "## Daily note\n\nCaptured markdown.\n"
     content_bytes = content.encode("utf-8")
@@ -183,7 +306,7 @@ class _ReadableResourceDispatcher:
     }, None
 
 
-class _BackgroundResultDispatcher:
+class _BackgroundResultDispatcher(_Dispatcher):
   def __init__(self, result: dict[str, Any]) -> None:
     self.result = result
 
@@ -194,13 +317,15 @@ class _BackgroundResultDispatcher:
     tool_input: dict[str, Any],
     *,
     call_index: int = 0,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: Any | None = None,
   ):
     _ = tool_id, tool_input, call_index
     assert tool_name == "get_background_result"
     return dict(self.result), None
 
 
-class _WorkflowResultDispatcher:
+class _WorkflowResultDispatcher(_Dispatcher):
   def __init__(self, result: dict[str, Any]) -> None:
     self.result = result
 
@@ -211,6 +336,8 @@ class _WorkflowResultDispatcher:
     tool_input: dict[str, Any],
     *,
     call_index: int = 0,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: Any | None = None,
   ):
     _ = tool_id, tool_input, call_index
     assert tool_name == "workflow_run"
@@ -279,10 +406,10 @@ def _canonical_narrative_task_result() -> TaskResult:
   )
 
 
-def _runner() -> AgentRunner:
+def _runner(dispatcher: _Dispatcher | None = None) -> AgentRunner:
   return AgentRunner(
     event_log=EventLog(session_id="test"),
-    dispatcher=_Dispatcher(),  # type: ignore[arg-type]
+    dispatcher=dispatcher or _Dispatcher(),  # type: ignore[arg-type]
     session_id="test-tool-execution",
     capability_execution=_capability_execution(),
     user_id="alice",
@@ -347,7 +474,7 @@ def test_unhandled_tool_exception_is_raw_for_hook_but_sanitized_at_all_boundarie
   )
   hook_errors: list[Any] = []
 
-  class _SecretExceptionDispatcher:
+  class _SecretExceptionDispatcher(_Dispatcher):
     async def dispatch(
       self,
       tool_id: str,
@@ -355,6 +482,8 @@ def test_unhandled_tool_exception_is_raw_for_hook_but_sanitized_at_all_boundarie
       tool_input: dict[str, Any],
       *,
       call_index: int = 0,
+      allow_uncertain_mcp_replay: bool = True,
+      on_executed_prepared_call: Any | None = None,
     ):
       _ = tool_id, tool_name, tool_input, call_index
       raise RuntimeError(f"privileged failure: {secret}")
@@ -442,9 +571,8 @@ def test_runner_tool_execution_method_is_inherited_from_mixin() -> None:
 
 
 def test_incomplete_workflow_result_does_not_stage_final_attachment() -> None:
-  runner = _runner()
-  runner._dispatcher = _WorkflowResultDispatcher(
-    _workflow_result("incomplete")
+  runner = _runner(
+    _WorkflowResultDispatcher(_workflow_result("incomplete"))
   )
 
   _run(runner._execute_single_tool(
@@ -460,8 +588,7 @@ def test_incomplete_workflow_result_does_not_stage_final_attachment() -> None:
 def test_malformed_complete_workflow_result_fails_tool_call_closed() -> None:
   result = _workflow_result("complete")
   result["primary_output_reference"]["content_sha256"] = "c" * 64
-  runner = _runner()
-  runner._dispatcher = _WorkflowResultDispatcher(result)
+  runner = _runner(_WorkflowResultDispatcher(result))
 
   _run(runner._execute_single_tool(
     "workflow-result-invalid",
@@ -516,13 +643,20 @@ def test_execute_single_tool_resolves_parent_module_helpers(monkeypatch: Any) ->
     semantic_calls.append(result)
     return None
 
-  monkeypatch.setattr(gateway_runner, "_redact_tool_input_for_event", _redact)
+  runner = _runner()
+  monkeypatch.setattr(
+    runner._dispatcher,
+    "redact_prepared_tool_input",
+    lambda tool_name, prepared: _redact(
+      tool_name,
+      prepared.materialize_input(),
+    ),
+  )
   monkeypatch.setattr(gateway_runner, "resolve_display", lambda name, tool_input: {"name": name, "input": tool_input})
   monkeypatch.setattr(gateway_runner, "_build_tool_call_start_event", _start_event)
   monkeypatch.setattr(gateway_runner, "_build_tool_call_complete_event", _complete_event)
   monkeypatch.setattr(gateway_runner, "classify_semantic_tool_error", _semantic)
 
-  runner = _runner()
   live_entry, tool_name, extra_blocks = _run(
     runner._execute_single_tool(
       "tool-1",
@@ -591,10 +725,44 @@ def test_execute_single_tool_emits_readable_resource_event_without_model_leak() 
   assert resource["content_sha256"] == hashlib.sha256(resource["content"].encode("utf-8")).hexdigest()
 
 
+def test_readable_resource_snapshot_copies_producer_stamped_type(caplog) -> None:
+  content = "## Daily note\n\nCaptured markdown.\n"
+  snapshot = {
+    "contract_name": "MarkdownNote",
+    "content_type": "application/json",
+    "content_class": "human_readable",
+    "source_path": "daily/2026-06-12.md",
+    "content_snapshot_id": "sha256:deadbeef",
+    "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    "content_bytes": len(content.encode("utf-8")),
+    "content": content,
+    "truncated": False,
+  }
+  runner = SimpleNamespace(_full_session_id="control-run-readable", _skill_run_id="")
+
+  with caplog.at_level("WARNING", logger="agent_gateway.runner"):
+    event = runner_tool_execution._readable_resource_event_from_snapshot(
+      runner,
+      snapshot,
+      tool_call_id="tool-readable",
+      tool_name="memory_write",
+      timestamp=1.0,
+    )
+
+  assert event is not None
+  assert event["content_type"] == "application/json"
+  assert event["content_class"] == "human_readable"
+  assert not [
+    record for record in caplog.records if "Dropping readable-resource snapshot" in record.getMessage()
+  ]
+
+
+
 def test_background_result_queues_ack_only_after_durable_tool_result() -> None:
+  dispatcher = _BackgroundResultDispatcher({})
   runner = AgentRunner(
     event_log=EventLog(session_id="background-result-ack"),
-    dispatcher=_BackgroundResultDispatcher({}),  # type: ignore[arg-type]
+    dispatcher=dispatcher,  # type: ignore[arg-type]
     session_id="background-result-ack",
     capability_execution=_capability_execution(),
     user_id="alice",
@@ -609,7 +777,7 @@ def test_background_result_queues_ack_only_after_durable_tool_result() -> None:
     result={"status": "completed", "value": 42},
   )
   entry.notification_delivery_state = "queue_omitted"
-  runner._dispatcher.result = {
+  dispatcher.result = {
     "status": "completed",
     "value": 42,
     _BACKGROUND_RESULT_ACK_RESULT_KEY: {
@@ -647,9 +815,10 @@ def test_background_result_queues_ack_only_after_durable_tool_result() -> None:
 
 
 def test_background_result_durable_failure_retains_omitted_payload() -> None:
+  dispatcher = _BackgroundResultDispatcher({})
   runner = AgentRunner(
     event_log=EventLog(session_id="background-result-ack-failure"),
-    dispatcher=_BackgroundResultDispatcher({}),  # type: ignore[arg-type]
+    dispatcher=dispatcher,  # type: ignore[arg-type]
     session_id="background-result-ack-failure",
     capability_execution=_capability_execution(),
     user_id="alice",
@@ -664,7 +833,7 @@ def test_background_result_durable_failure_retains_omitted_payload() -> None:
     result={"status": "completed", "value": 42},
   )
   entry.notification_delivery_state = "queue_omitted"
-  runner._dispatcher.result = {
+  dispatcher.result = {
     "status": "completed",
     "value": 42,
     _BACKGROUND_RESULT_ACK_RESULT_KEY: {
@@ -679,7 +848,7 @@ def test_background_result_durable_failure_retains_omitted_payload() -> None:
       raise RuntimeError("durable tool-result write failed")
     await append_durable_event(event)
 
-  runner._append_durable_event = _fail_tool_result_persistence  # type: ignore[method-assign]
+  runner._append_durable_event = _fail_tool_result_persistence
 
   with pytest.raises(
     RuntimeError,
@@ -699,9 +868,10 @@ def test_background_result_durable_failure_retains_omitted_payload() -> None:
 
 
 def test_background_result_ack_cannot_target_a_different_task() -> None:
+  dispatcher = _BackgroundResultDispatcher({})
   runner = AgentRunner(
     event_log=EventLog(session_id="background-result-ack-forgery"),
-    dispatcher=_BackgroundResultDispatcher({}),  # type: ignore[arg-type]
+    dispatcher=dispatcher,  # type: ignore[arg-type]
     session_id="background-result-ack-forgery",
     capability_execution=_capability_execution(),
     user_id="alice",
@@ -718,7 +888,7 @@ def test_background_result_ack_cannot_target_a_different_task() -> None:
       result={"status": "completed"},
     )
     entry.notification_delivery_state = "queue_omitted"
-  runner._dispatcher.result = {
+  dispatcher.result = {
     "status": "completed",
     _BACKGROUND_RESULT_ACK_RESULT_KEY: {
       "task_id": target.task_id,
@@ -744,9 +914,10 @@ def test_background_result_ack_cannot_target_a_different_task() -> None:
 
 
 def test_background_result_generation_change_blocks_stale_ack() -> None:
+  dispatcher = _BackgroundResultDispatcher({})
   runner = AgentRunner(
     event_log=EventLog(session_id="background-result-generation"),
-    dispatcher=_BackgroundResultDispatcher({}),  # type: ignore[arg-type]
+    dispatcher=dispatcher,  # type: ignore[arg-type]
     session_id="background-result-generation",
     capability_execution=_capability_execution(),
     user_id="alice",
@@ -762,7 +933,7 @@ def test_background_result_generation_change_blocks_stale_ack() -> None:
   )
   entry.notification_delivery_state = "queue_omitted"
   interrupted_generation = entry.notification_generation
-  runner._dispatcher.result = {
+  dispatcher.result = {
     "status": "interrupted",
     _BACKGROUND_RESULT_ACK_RESULT_KEY: {
       "task_id": entry.task_id,
@@ -786,7 +957,7 @@ def test_background_result_generation_change_blocks_stale_ack() -> None:
       )
     await append_durable_event(event)
 
-  runner._append_durable_event = (  # type: ignore[method-assign]
+  runner._append_durable_event = (
     _finalize_during_tool_result_persistence
   )
 
@@ -1205,8 +1376,17 @@ def _aggregate_workflow_result_payload() -> dict[str, Any]:
   ).model_dump(mode="json")
 
 
-class _WorkflowEvidenceDispatcher:
-  async def dispatch(self, tool_id: str, tool_name: str, tool_input: dict[str, Any], *, call_index: int = 0):
+class _WorkflowEvidenceDispatcher(_Dispatcher):
+  async def dispatch(
+    self,
+    tool_id: str,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    call_index: int = 0,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: Any | None = None,
+  ):
     _ = tool_id, tool_name, tool_input, call_index
     return {
       "ok": True,
@@ -1409,7 +1589,7 @@ def test_foreground_completion_without_child_evidence_leaves_the_channel_empty()
 # --- B-1 / B-2: the dispatch record and the retry loop ---------------------
 
 
-class _RecordedDispatcher:
+class _RecordedDispatcher(_Dispatcher):
   """Return a scripted sequence of (result, error) pairs, one per attempt."""
 
   def __init__(self, script: list[tuple[Any, dict[str, Any] | None]]) -> None:
@@ -1423,14 +1603,184 @@ class _RecordedDispatcher:
     tool_input: dict[str, Any],
     *,
     call_index: int = 0,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: Any | None = None,
   ):
     _ = tool_id, tool_name, tool_input, call_index
     index = min(self.calls, len(self.script) - 1)
     self.calls += 1
     return self.script[index]
 
+  @staticmethod
+  def route_origin_for_tool(tool_name: str) -> str | None:
+    return "mcp" if tool_name == "filings_search" else "local"
 
-class _HangingDispatcher:
+
+class _PreparedRecordedDispatcher(_RecordedDispatcher):
+  def __init__(self, script: list[tuple[Any, dict[str, Any] | None]]) -> None:
+    super().__init__(script)
+    self.prepare_calls = 0
+    self.prepared_call_ids: list[int] = []
+    self.redacted_call_ids: list[int] = []
+    self.dispatched_inputs: list[dict[str, Any]] = []
+
+  def prepare_tool_call(
+    self,
+    tool_name: str,
+    tool_input: dict[str, Any],
+  ) -> PreparedToolCall:
+    self.prepare_calls += 1
+    return PreparedToolCall({**tool_input, "prepared": tool_name})
+
+  def redact_prepared_tool_input(
+    self,
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+  ) -> dict[str, Any]:
+    self.redacted_call_ids.append(id(prepared_call))
+    return {
+      **prepared_call.materialize_input(),
+      "credential": "<registered-redaction>",
+      "nested": {"labels": ["registered"]},
+    }
+
+  async def dispatch_prepared(
+    self,
+    tool_id: str,
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+    *,
+    call_index: int = 0,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: Any | None = None,
+  ):
+    _ = tool_id, tool_name, call_index
+    self.prepared_call_ids.append(id(prepared_call))
+    self.dispatched_inputs.append(prepared_call.materialize_input())
+    return await super().dispatch(
+      tool_id,
+      tool_name,
+      prepared_call.materialize_input(),
+      call_index=call_index,
+    )
+
+
+class _RegisteredOutcomeDispatcher(_PreparedRecordedDispatcher):
+  def __init__(self, script: list[tuple[Any, dict[str, Any] | None]]) -> None:
+    super().__init__(script)
+    self.settlement_calls: list[tuple[Any, Any, Any]] = []
+    self.settlement_prepared_call_ids: list[int] = []
+
+  def settle_tool_result(
+    self,
+    tool_name: str,
+    dispatch_entry: Any,
+    result: Any,
+    error: Any,
+    semantic_error: Any = None,
+    *,
+    prepared_call: PreparedToolCall,
+  ) -> ToolResultSettlement:
+    assert tool_name == "filings_search"
+    assert type(prepared_call) is PreparedToolCall
+    self.settlement_prepared_call_ids.append(id(prepared_call))
+    self.settlement_calls.append((result, error, semantic_error))
+    if isinstance(result, dict) and result.get("registered_outcome") == "retry":
+      return ToolResultSettlement("error_transport")
+    outcome = (
+      "error_semantic"
+      if isinstance(result, dict)
+      and result.get("registered_outcome") == "semantic"
+      else "ok"
+    )
+    return ToolResultSettlement(
+      outcome,
+      ({
+        "document_id": "edgar:0000789019-26-000012",
+        "source_kind": "filing",
+        "source_url": "https://www.sec.gov/Archives/msft-10k.htm",
+      },) if outcome == "ok" else (),
+    )
+
+
+class _ExecutedInputDispatcher(_RegisteredOutcomeDispatcher):
+  def __init__(self) -> None:
+    super().__init__([({"status": "success", "registered_outcome": "ok"}, None)])
+    self.executed_call_ids: list[int] = []
+
+  async def dispatch_prepared(
+    self,
+    tool_id: str,
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+    *,
+    call_index: int = 0,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call=None,
+  ):
+    self.prepared_call_ids.append(id(prepared_call))
+    executed = PreparedToolCall({
+      **prepared_call.materialize_input(),
+      "_session_id": "executed-session",
+    })
+    self.executed_call_ids.append(id(executed))
+    assert on_executed_prepared_call is not None
+    on_executed_prepared_call(executed)
+    return await _RecordedDispatcher.dispatch(
+      self,
+      tool_id,
+      tool_name,
+      executed.materialize_input(),
+      call_index=call_index,
+    )
+
+
+class _FailingPreparationDispatcher(_Dispatcher):
+  def __init__(self) -> None:
+    self.dispatch_calls = 0
+
+  def prepare_tool_call(
+    self,
+    _tool_name: str,
+    _tool_input: dict[str, Any],
+  ) -> PreparedToolCall:
+    raise RuntimeError("resolver unavailable")
+
+  async def dispatch_prepared(self, *_args: Any, **_kwargs: Any):
+    self.dispatch_calls += 1
+    raise AssertionError("failed preparation must not dispatch")
+
+  async def dispatch(self, *_args: Any, **_kwargs: Any):
+    self.dispatch_calls += 1
+    raise AssertionError("failed preparation must not dispatch")
+
+  def redact_prepared_tool_input(
+    self,
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+  ) -> dict[str, Any]:
+    raise AssertionError("failed preparation must not emit a tool start")
+
+  @staticmethod
+  def route_origin_for_tool(_tool_name: str) -> str:
+    return "mcp"
+
+
+class _RecordedMcpRoutes:
+  @staticmethod
+  def get_server_for_tool(tool_name: str) -> str | None:
+    return "research-corpus-mcp" if tool_name == "filings_search" else None
+
+  @staticmethod
+  def get_provider_id_for_tool(_tool_name: str) -> None:
+    return None
+
+  @staticmethod
+  def get_policy_tool_name(tool_name: str) -> str | None:
+    return tool_name if tool_name == "filings_search" else None
+
+
+class _HangingDispatcher(_Dispatcher):
   def __init__(self) -> None:
     self.calls = 0
 
@@ -1441,6 +1791,8 @@ class _HangingDispatcher:
     tool_input: dict[str, Any],
     *,
     call_index: int = 0,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: Any | None = None,
   ):
     _ = tool_id, tool_name, tool_input, call_index
     self.calls += 1
@@ -1449,6 +1801,8 @@ class _HangingDispatcher:
 
 
 def _dispatch_runner(dispatcher: Any, **kwargs: Any) -> AgentRunner:
+  if isinstance(dispatcher, _RecordedDispatcher):
+    kwargs.setdefault("mcp_client", _RecordedMcpRoutes())
   return AgentRunner(
     event_log=EventLog(session_id="dispatch"),
     dispatcher=dispatcher,  # type: ignore[arg-type]
@@ -1524,7 +1878,7 @@ def test_dispatch_record_is_emitted_on_the_ok_exit_path() -> None:
   dispatch = _complete_event(runner)["dispatch"]
   assert dispatch["outcome"] == "ok"
   assert dispatch["attempts"] == 1
-  assert dispatch["route_id"] == "local/filings_search"
+  assert dispatch["route_id"] == "mcp:research-corpus-mcp/filings_search"
   assert dispatch["sources"] == [
     {
       "document_id": "edgar:0000789019-26-000012",
@@ -1573,8 +1927,17 @@ def test_dispatch_record_is_emitted_on_the_rate_limited_exit_path() -> None:
 
 
 def test_dispatch_record_is_emitted_on_the_transport_exit_path() -> None:
-  class _Boom:
-    async def dispatch(self, tool_id, tool_name, tool_input, *, call_index=0):
+  class _Boom(_Dispatcher):
+    async def dispatch(
+      self,
+      tool_id,
+      tool_name,
+      tool_input,
+      *,
+      call_index=0,
+      allow_uncertain_mcp_replay=True,
+      on_executed_prepared_call=None,
+    ):
       _ = tool_id, tool_name, tool_input, call_index
       raise RuntimeError("connection reset by peer")
 
@@ -1599,8 +1962,17 @@ def test_dispatch_record_is_emitted_on_the_timeout_exit_path() -> None:
 
 
 def test_dispatch_record_is_on_the_event_before_the_cancelled_arm_appends() -> None:
-  class _Cancelling:
-    async def dispatch(self, tool_id, tool_name, tool_input, *, call_index=0):
+  class _Cancelling(_Dispatcher):
+    async def dispatch(
+      self,
+      tool_id,
+      tool_name,
+      tool_input,
+      *,
+      call_index=0,
+      allow_uncertain_mcp_replay=True,
+      on_executed_prepared_call=None,
+    ):
       _ = tool_id, tool_name, tool_input, call_index
       raise asyncio.CancelledError()
 
@@ -1636,6 +2008,172 @@ def test_transient_read_failure_is_retried_and_settles_ok(
   assert _start_event_count(runner) == 1
 
 
+def test_prepared_call_executes_once_and_is_reused_across_retry(
+  declared_read_effects: None,
+) -> None:
+  contexts: list[Any] = []
+
+  async def _capture(ctx: Any) -> list[dict[str, Any]]:
+    contexts.append(ctx)
+    assert ctx.redacted_tool_input is not None
+    ctx.redacted_tool_input["nested"]["labels"].append("hook-mutation")
+    return []
+
+  dispatcher = _PreparedRecordedDispatcher([
+    (None, {"code": "internal_error", "message": "connection reset"}),
+    ({"status": "success", "hits": []}, None),
+  ])
+  runner = _dispatch_runner(dispatcher, on_tool_result=_capture)
+
+  _run(runner._execute_single_tool(
+    "tool-1",
+    "filings_search",
+    {"ticker": "MSFT"},
+    {"tools": []},
+  ))
+
+  assert dispatcher.prepare_calls == 1
+  assert dispatcher.redacted_call_ids == [dispatcher.prepared_call_ids[0]]
+  assert len(set(dispatcher.prepared_call_ids)) == 1
+  assert dispatcher.dispatched_inputs == [
+    {"prepared": "filings_search", "ticker": "MSFT"},
+    {"prepared": "filings_search", "ticker": "MSFT"},
+  ]
+  start = next(
+    entry.event
+    for entry in runner._log.entries
+    if entry.event.get("type") == "tool_call_start"
+  )
+  assert start["tool_input"] == {
+    "prepared": "filings_search",
+    "ticker": "MSFT",
+    "credential": "<registered-redaction>",
+    "nested": {"labels": ["registered"]},
+  }
+  assert contexts[0].redacted_tool_input["nested"]["labels"] == [
+    "registered",
+    "hook-mutation",
+  ]
+
+
+def test_registered_outcome_policy_owns_retry_and_final_record(
+  declared_read_effects: None,
+) -> None:
+  source = {
+    "document_id": "edgar:0000789019-26-000012",
+    "ticker": "MSFT",
+    "source": "filing",
+    "source_url": "https://www.sec.gov/Archives/msft-10k.htm",
+  }
+  dispatcher = _RegisteredOutcomeDispatcher([
+    ({"status": "success", "registered_outcome": "retry"}, None),
+    ({
+      "status": "success",
+      "registered_outcome": "ok",
+      "hits": [source],
+    }, None),
+  ])
+  runner = _dispatch_runner(dispatcher)
+
+  result_entry, _tool_name, _extra = _run(runner._execute_single_tool(
+    "tool-1",
+    "filings_search",
+    {},
+    {"tools": []},
+  ))
+
+  event = _complete_event(runner)
+  assert dispatcher.calls == 2
+  assert event["dispatch"]["outcome"] == "ok"
+  assert event["dispatch"]["attempts"] == 2
+  assert event["dispatch"]["sources"] == [{
+    "document_id": source["document_id"],
+    "source_kind": "filing",
+    "source_url": source["source_url"],
+  }]
+  assert event["is_error"] is False
+  assert "is_error" not in result_entry
+  assert len(dispatcher.settlement_calls) == 2
+  assert len(set(dispatcher.settlement_prepared_call_ids)) == 1
+  assert dispatcher.settlement_prepared_call_ids == dispatcher.prepared_call_ids
+
+
+def test_registered_settlement_uses_the_exact_executed_call() -> None:
+  dispatcher = _ExecutedInputDispatcher()
+  runner = _dispatch_runner(dispatcher)
+
+  _run(runner._execute_single_tool(
+    "tool-1",
+    "filings_search",
+    {"ticker": "MSFT"},
+    {"tools": []},
+  ))
+
+  assert dispatcher.settlement_prepared_call_ids == dispatcher.executed_call_ids
+  assert dispatcher.settlement_prepared_call_ids != dispatcher.prepared_call_ids
+
+
+def test_registered_semantic_outcome_keeps_existing_sources_empty() -> None:
+  dispatcher = _RegisteredOutcomeDispatcher([({
+    "status": "success",
+    "registered_outcome": "semantic",
+    "hits": [{
+      "document_id": "edgar:0000789019-26-000012",
+      "source": "filing",
+      "source_url": "https://www.sec.gov/Archives/msft-10k.htm",
+    }],
+  }, None)])
+  runner = _dispatch_runner(dispatcher)
+
+  result_entry, _tool_name, _extra = _run(runner._execute_single_tool(
+    "tool-1",
+    "filings_search",
+    {},
+    {"tools": []},
+  ))
+
+  event = _complete_event(runner)
+  dispatch = event["dispatch"]
+  assert dispatch["outcome"] == "error_semantic"
+  assert dispatch["sources"] == []
+  assert event["is_error"] is True
+  assert result_entry["is_error"] is True
+  assert len(dispatcher.settlement_calls) == 1
+
+
+def test_preparation_failure_returns_typed_error_without_dispatch() -> None:
+  dispatcher = _FailingPreparationDispatcher()
+  contexts: list[Any] = []
+
+  async def _capture(ctx: Any) -> list[dict[str, Any]]:
+    contexts.append(ctx)
+    return []
+
+  runner = _dispatch_runner(dispatcher, on_tool_result=_capture)
+
+  result_entry, _tool_name, _extra = _run(runner._execute_single_tool(
+    "tool-1",
+    "filings_search",
+    {"secret": "must-not-cross-preparation"},
+    {"tools": []},
+  ))
+
+  assert dispatcher.dispatch_calls == 0
+  assert json.loads(result_entry["content"])["error"]["code"] == (
+    "tool_input_preparation_failed"
+  )
+  assert _complete_event(runner)["error"]["code"] == (
+    "tool_input_preparation_failed"
+  )
+  start_events = [
+    entry.event
+    for entry in runner._log.entries
+    if entry.event.get("type") == "tool_call_start"
+  ]
+  assert start_events == []
+  assert contexts[0].redacted_tool_input is None
+
+
 def test_retries_stop_at_two_and_emit_retries_exhausted(
   declared_read_effects: None,
 ) -> None:
@@ -1652,6 +2190,81 @@ def test_retries_stop_at_two_and_emit_retries_exhausted(
   assert event["dispatch"]["attempts"] == 3
   assert event["dispatch"]["retries_exhausted"] is True
   assert _start_event_count(runner) == 1
+
+
+@pytest.mark.parametrize(
+  ("failures", "expected_attempts", "expected_outcome"),
+  [
+    (1, 2, "ok"),
+    (3, 3, "error_transport"),
+  ],
+)
+def test_fred_runner_owns_every_physical_attempt_with_real_dispatcher_manager(
+  monkeypatch: pytest.MonkeyPatch,
+  failures: int,
+  expected_attempts: int,
+  expected_outcome: str,
+) -> None:
+  manager = McpClientManager(config_path=None)
+  definition = {
+    "name": "fred_search",
+    "description": "Search FRED.",
+    "input_schema": {"type": "object"},
+  }
+  manager._servers = {
+    "fred-mcp": _ServerState(
+      name="fred-mcp",
+      session=_UnusedMcpSession(),
+      exit_contexts=[object()],
+      tool_definitions=[definition],
+      tool_names={"fred_search"},
+      config={"type": "stdio", "command": "fred-mcp"},
+    ),
+  }
+  manager._tool_to_server = {"fred_search": "fred-mcp"}
+  manager._mcp_tool_names = {"fred_search"}
+  manager._tool_definitions = [definition]
+  physical_sends = 0
+
+  async def invoke_once(**_kwargs):
+    nonlocal physical_sends
+    physical_sends += 1
+    if physical_sends <= failures:
+      raise EOFError("connection closed")
+    return SimpleNamespace(
+      isError=False,
+      structuredContent={"status": "success", "seriess": []},
+      content=[],
+    )
+
+  monkeypatch.setattr(manager, "_call_tool_once", invoke_once)
+  monkeypatch.setattr(
+    manager,
+    "_reconnect_stdio_server_for_future",
+    lambda **_kwargs: asyncio.sleep(0, result=True),
+  )
+  dispatcher = ToolDispatcher(
+    mcp_client=manager,
+    local_tool_handlers={},
+    role="owner",
+    get_tool_definitions=lambda: [definition],
+    allowed_mcp_tools_by_server={"fred-mcp": {"fred_search"}},
+  )
+  runner = _dispatch_runner(dispatcher, mcp_client=manager)
+  monkeypatch.setattr(runner_tool_execution, "retry_backoff_seconds", lambda _attempt: 0.0)
+
+  _run(runner._execute_single_tool(
+    "fred-call",
+    "fred_search",
+    {"query": "inflation"},
+    {"tools": [], "_request_advertised_tool_names": frozenset({"fred_search"})},
+  ))
+
+  event = _complete_event(runner)
+  assert physical_sends == expected_attempts
+  assert event["dispatch"]["attempts"] == expected_attempts
+  assert event["dispatch"]["outcome"] == expected_outcome
+  assert event["dispatch"]["route_id"] == "mcp:fred-mcp/fred_search"
 
 
 def test_semantic_failures_are_never_retried(declared_read_effects: None) -> None:

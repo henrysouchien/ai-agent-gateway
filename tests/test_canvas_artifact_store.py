@@ -23,7 +23,7 @@ from agent_gateway.canvas_artifact_store import (
   read_canvas_artifact_source,
   write_canvas_artifact,
 )
-from schema.canvas_artifact import CanvasArtifact, StaticExports
+from schema.canvas_artifact import CanvasArtifact, CanvasArtifactPurpose, StaticExports
 
 
 SOURCE = "export default function Artifact() { return <div>PCTY</div>; }\n"
@@ -103,6 +103,31 @@ def test_canvas_artifact_store_lists_newest_first_with_filters(tmp_path: Path) -
   assert [item.artifact_id for item in list_canvas_artifacts(tmp_path, since=250)] == ["new"]
 
 
+def test_canvas_artifact_store_list_skips_corrupt_sidecar_visibly(
+  tmp_path: Path,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  workspace = tmp_path / "users" / "alice" / "workspace"
+  write_canvas_artifact(workspace_dir=workspace, artifact=_artifact("good", ticker="PCTY"), source=SOURCE, bundle=BUNDLE)
+  write_canvas_artifact(workspace_dir=workspace, artifact=_artifact("bad", ticker="PCTY"), source=SOURCE, bundle=BUNDLE)
+  (workspace / "artifacts" / "_canvas" / "bad.json").write_text("{corrupt", encoding="utf-8")
+
+  with caplog.at_level(logging.WARNING, logger="agent_gateway.artifact_sidecar_index"):
+    listed = list_canvas_artifacts(workspace)
+
+  assert [item.artifact_id for item in listed] == ["good"]
+  assert any(record.message == "artifact_sidecar_unreadable" for record in caplog.records)
+  row = get_artifact_sidecar_index_row(
+    workspace_dir=workspace,
+    artifact_kind="canvas",
+    artifact_id="bad",
+    user_id="alice",
+  )
+  assert row is not None
+  assert row["stale_ts"] is not None
+  assert row["last_error"] == "corrupt_sidecar"
+
+
 def test_canvas_artifact_store_rejects_traversal_and_symlink_escape(tmp_path: Path) -> None:
   with pytest.raises(ValueError, match="invalid canvas artifact_id"):
     write_canvas_artifact(
@@ -169,7 +194,7 @@ def _artifact(
   artifact_id: str,
   *,
   ticker: str | None,
-  purpose: str = "exploration",
+  purpose: CanvasArtifactPurpose = "exploration",
 ) -> CanvasArtifact:
   return CanvasArtifact(
     artifact_id=artifact_id,

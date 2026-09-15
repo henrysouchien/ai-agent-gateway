@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Awaitable, Protocol, runtime_checkable
 
 from agent_workflow_contracts import (
   AdmittedTask,
@@ -24,13 +24,22 @@ from .final_narrative_artifact import (
 from .mechanical_outcome import derive_mechanical_outcome
 from .sub_agent_result_contract import (
   FinalNarrativeArtifactReference,
+  TERMINAL_TOOL_RESULT_RETURN_CONTRACT,
   build_task_result,
+  canonical_projection,
+  report_contract_ref,
 )
 from .sub_agent_result_evidence import (
   SubAgentResultEvidence,
   collect_sub_agent_result_evidence,
   fold_dispatch_failures,
   merge_sub_agent_result_evidence,
+)
+from .sub_agent_skill_state import (
+  accepted_declared_terminal_tool_result_value,
+  classify_declared_door_outcome,
+  declared_terminal_doors_from_grant,
+  latest_successful_declared_terminal_tool_result,
 )
 
 
@@ -44,6 +53,14 @@ _TERMINAL_REASON_PRECEDENCE = (
   "retries_exhausted",
   "runtime_error",
 )
+
+
+@runtime_checkable
+class _NarrativeQuery(Protocol):
+  def __call__(
+    self,
+    **kwargs: Any,
+  ) -> Awaitable[tuple[Sequence[Any], str | None]]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,9 +138,9 @@ def _narrative_query_filters(
 
 
 async def _materialize_lineaged_response(
-  query: Any,
+  query: _NarrativeQuery,
   *,
-  terminal_entry: Any,
+  terminal_seq: int,
   terminal_event: Mapping[str, Any],
   query_filters: Mapping[str, Any],
 ) -> str:
@@ -131,11 +148,6 @@ async def _materialize_lineaged_response(
   if identity is None:
     raise RuntimeError("logical response metadata unexpectedly absent")
   response_id, terminal_ordinal = identity
-  terminal_seq = _entry_seq(terminal_entry)
-  if terminal_seq is None:
-    raise RuntimeError(
-      "assistant logical response terminal event has no durable sequence"
-    )
   segments: dict[int, tuple[int, Mapping[str, Any]]] = {
     terminal_ordinal: (terminal_seq, terminal_event)
   }
@@ -237,7 +249,7 @@ async def final_child_visible_text(
   """Materialize the child's final durable logical assistant response."""
 
   query = getattr(session_log, "query", None)
-  if not callable(query):
+  if not isinstance(query, _NarrativeQuery):
     raise TypeError(
       "narrative child execution requires a queryable durable session log"
     )
@@ -274,18 +286,22 @@ async def final_child_visible_text(
     raise RuntimeError(
       "terminal assistant message has no durable logical-response lineage"
     )
+  terminal_event_seq = _entry_seq(entry)
+  if terminal_event_seq is None:
+    raise RuntimeError(
+      "assistant logical response terminal event has no durable sequence"
+    )
   text = await _materialize_lineaged_response(
     query,
-    terminal_entry=entry,
+    terminal_seq=terminal_event_seq,
     terminal_event=event,
     query_filters=query_filters,
   )
   if text.strip():
-    event_seq = _entry_seq(entry)
     final_narrative = publish_final_narrative(
       workspace_dir=workspace_dir,
       sub_agent_id=sub_session_id,
-      terminal_event_seq=event_seq,
+      terminal_event_seq=terminal_event_seq,
       text=text,
     )
     return FinalChildVisibleText(
@@ -349,6 +365,7 @@ def task_result_from_execution(
   external_terminal_signals: Sequence[str] = (),
   prior_evidence: SubAgentResultEvidence | None = None,
   admitted_task: AdmittedTask | None = None,
+  prior_terminal_tool_result: Mapping[str, Any] | None = None,
 ) -> TaskResult:
   """Materialize a typed runtime result from the exact terminal message.
 
@@ -376,6 +393,15 @@ def task_result_from_execution(
     raise TypeError("task result requires exact admitted provenance")
 
   entry_list = list(entries)
+  event_list = [
+    event
+    for entry in entry_list
+    if isinstance((event := getattr(entry, "event", entry)), Mapping)
+  ]
+  evidence = merge_sub_agent_result_evidence(
+    prior_evidence,
+    collect_sub_agent_result_evidence(entry_list, durable=False),
+  )
   allowed_signals = {
     "turns_exhausted",
     "retries_exhausted",
@@ -386,7 +412,35 @@ def task_result_from_execution(
     "budget_exhausted",
     "runtime_error",
   }
-  signals = [str(signal) for signal in external_terminal_signals]
+  grant = admitted_task.tool_grant if admitted_task is not None else None
+  declared_doors = declared_terminal_doors_from_grant(grant)
+  validated_prior_terminal_tool_result = (
+    accepted_declared_terminal_tool_result_value(
+      prior_terminal_tool_result,
+      declared_terminal_doors=declared_doors,
+    )
+    if prior_terminal_tool_result is not None
+    else None
+  )
+  if (
+    prior_terminal_tool_result is not None
+    and validated_prior_terminal_tool_result is None
+  ):
+    raise ValueError(
+      "prior terminal tool result does not match admitted authority"
+    )
+  terminal_tool_result = None if evidence.admission_rejected else (
+    latest_successful_declared_terminal_tool_result(
+      event_list,
+      declared_terminal_doors=declared_doors,
+    )
+    or validated_prior_terminal_tool_result
+  )
+  signals = (
+    []
+    if terminal_tool_result is not None
+    else [str(signal) for signal in external_terminal_signals]
+  )
   if any(signal not in allowed_signals for signal in signals):
     raise ValueError("task result received an unknown terminal signal")
   error_detail = (
@@ -394,13 +448,10 @@ def task_result_from_execution(
     if runtime_error_detail is not None
     else None
   )
-  event_list: list[Mapping[str, Any]] = []
-  for entry in entry_list:
-    event = getattr(entry, "event", entry)
-    if not isinstance(event, Mapping):
-      continue
-    event_list.append(event)
+  for event in event_list:
     event_type = event.get("type")
+    if terminal_tool_result is not None:
+      continue
     if event_type == "max_turns_reached":
       signals.append("turns_exhausted")
     elif event_type == "budget_exceeded":
@@ -410,7 +461,7 @@ def task_result_from_execution(
       if error_detail is None:
         raw = str(event.get("error") or event.get("message") or "").strip()
         error_detail = raw or None
-  if timed_out:
+  if timed_out and terminal_tool_result is None:
     signals.append("timeout")
     if error_detail is None:
       error_detail = (
@@ -418,20 +469,26 @@ def task_result_from_execution(
         if timeout is not None
         else "sub-agent timed out"
       )
-  if runtime_error_detail is not None:
+  if runtime_error_detail is not None and terminal_tool_result is None:
     signals.append("runtime_error")
-  if budget_exceeded_reason is not None:
+  if budget_exceeded_reason is not None and terminal_tool_result is None:
     signals.append("budget_exhausted")
 
-  evidence = merge_sub_agent_result_evidence(
-    prior_evidence,
-    collect_sub_agent_result_evidence(entry_list, durable=False),
-  )
   if evidence.admission_rejected:
     signals.append("runtime_error")
     error_detail = "child evidence failed canonical admission"
 
   projection = None
+  runtime_projection = (
+    canonical_projection(
+      contract=report_contract_ref(
+        TERMINAL_TOOL_RESULT_RETURN_CONTRACT
+      ),
+      value=dict(terminal_tool_result),
+    )
+    if terminal_tool_result is not None
+    else None
+  )
   acquired_outcome = outcome
   if not signals and requirement.mode != "narrative":
     signals.append("runtime_error")
@@ -444,6 +501,7 @@ def task_result_from_execution(
     not signals
     and requirement.terminal_narrative == "required"
     and final_narrative is None
+    and runtime_projection is None
   ):
     signals.append("runtime_error")
     error_detail = "durable terminal assistant narrative was not available"
@@ -477,13 +535,51 @@ def task_result_from_execution(
   if execution.status != "succeeded":
     final_narrative = None
     projection = None
+    runtime_projection = None
     acquired_outcome = None
+  elif runtime_projection is not None:
+    final_narrative = None
+  door_classification = None
+  if execution.status == "succeeded" and declared_doors:
+    door_classification = classify_declared_door_outcome(
+      declared_terminal_doors=declared_doors,
+      tools_used=evidence.tools_used,
+      door_results=evidence.fms_results,
+    )
+    if not door_classification.succeeded:
+      reason = (
+        door_classification.error["code"]
+        if door_classification.error is not None
+        else "terminal_door_not_invoked"
+      )
+      detail = (
+        door_classification.error["message"]
+        if door_classification.error is not None
+        else "declared terminal door was not invoked"
+      )
+      execution = ExecutionSettlement(
+        status="failed",
+        terminal_reason=f"{reason}: {detail}",
+      )
+      acquired_outcome = None
   runtime_outcome = None
-  if execution.status == "succeeded" and acquired_outcome is None:
+  if (
+    door_classification is not None
+    and not door_classification.succeeded
+    and door_classification.error is not None
+  ):
+    rationale = str(door_classification.error["message"])
+    if door_classification.semantic == "stop" and "STOP" not in rationale:
+      rationale = f"STOP: {rationale}"
+    runtime_outcome = AnalyticalOutcome(
+      disposition="blocked",
+      assessment_source="mechanically_derived",
+      assessment_rationale=rationale,
+      unmet_requirements=tuple(sorted(declared_doors)),
+    )
+  elif execution.status == "succeeded" and acquired_outcome is None:
     runtime_outcome = derive_mechanical_outcome(
-      grant=(
-        admitted_task.tool_grant if admitted_task is not None else None
-      ),
+      grant=grant,
       bindings=(
         admitted_task.capability_bindings
         if admitted_task is not None
@@ -493,9 +589,6 @@ def task_result_from_execution(
       sources=evidence.observed_sources,
       narrative_present=final_narrative is not None,
       turns_exhausted=honest_partial,
-      # D-B3-1: the only "unavailable input" fact at this HEAD settles through
-      # ``terminal_task_result`` (status ``skipped``), which forbids an
-      # outcome; the derivation's missing-inputs arm stays live but unreached.
       missing_inputs=(),
     )
   return build_task_result(
@@ -507,17 +600,12 @@ def task_result_from_execution(
     outcome=acquired_outcome,
     terminal_narrative=final_narrative,
     projection=projection,
+    runtime_projection=runtime_projection,
     observed_sources=evidence.observed_sources,
     tools_used=evidence.tools_used,
     usage=evidence.usage,
     runtime_outcome=runtime_outcome,
   )
-
-
-def task_result_payload_from_execution(*args: Any, **kwargs: Any) -> dict[str, Any]:
-  """Serialize :func:`task_result_from_execution` at dictionary seams."""
-
-  return task_result_from_execution(*args, **kwargs).model_dump(mode="json")
 
 
 def read_task_result_terminal_narrative(
@@ -543,5 +631,4 @@ __all__ = [
   "final_child_visible_text",
   "read_task_result_terminal_narrative",
   "task_result_from_execution",
-  "task_result_payload_from_execution",
 ]

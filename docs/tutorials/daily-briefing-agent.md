@@ -1,11 +1,15 @@
 # Build a Daily Briefing Agent
 
 This tutorial uses the complete project in `examples/10-daily-briefing/`.
+Complete the provider credential and private `USER_DATA_DIR` setup in the
+[quickstart](../quickstart.md) first.
 
 ## 1. Open The Example
 
+From the package root:
+
 ```bash
-cd packages/agent-gateway/examples/10-daily-briefing
+cd examples/10-daily-briefing
 ```
 
 The project includes:

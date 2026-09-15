@@ -12,21 +12,12 @@ GATEWAY_DIR = ROOT / "packages" / "agent-gateway"
 if str(GATEWAY_DIR) not in sys.path:
   sys.path.insert(0, str(GATEWAY_DIR))
 
-from agent_gateway.event_adapter import (  # noqa: E402
-  CONTROL_V1_FIELD_PROJECTION,
-  CONTROL_V1_WIRE_EVENT_TYPES,
-  V1_FIELD_PROJECTION,
-  V1_WIRE_EVENT_TYPES,
-)
 from agent_gateway.mcp_activation import (  # noqa: E402
-  MCP_SERVER_ACTIVATED_EVENT,
   McpActivationError,
   McpActivationFold,
   derive_live_surface,
-  fold_mcp_activations,
-  mcp_server_activated_event,
+  live_tool_surface,
 )
-from agent_gateway.secret_boundary import sanitize_tool_event  # noqa: E402
 
 
 CHANNEL_TIERS = {
@@ -91,74 +82,6 @@ def test_whole_server_activation_is_distinct_from_a_scoped_one() -> None:
   assert fold.granted_tools("market-data-mcp") == frozenset()
 
 
-def test_the_fold_replays_exactly_from_its_durable_events() -> None:
-  live = McpActivationFold()
-  live.record("market-data-mcp", tools=["screen_stocks"], source="load_tools")
-  live.record("portfolio-reads-mcp", tools=None, source="run_agent")
-
-  events = [
-    mcp_server_activated_event(
-      server_id="market-data-mcp",
-      tools=["screen_stocks"],
-      source="load_tools",
-    ),
-    mcp_server_activated_event(
-      server_id="portfolio-reads-mcp",
-      tools=None,
-      source="run_agent",
-    ),
-  ]
-
-  assert fold_mcp_activations(events) == live
-
-
-def test_replay_skips_refusals_and_foreign_events() -> None:
-  events = [
-    {"type": "tool_call_complete", "server_id": "market-data-mcp"},
-    mcp_server_activated_event(
-      server_id="market-data-mcp",
-      source="run_agent",
-      error={"code": "mcp_server_denied", "message": "denied by profile"},
-    ),
-    mcp_server_activated_event(
-      server_id="portfolio-reads-mcp",
-      tools=["get_positions"],
-      source="load_tools",
-    ),
-  ]
-
-  fold = fold_mcp_activations(events)
-
-  assert fold.activated_servers == frozenset({"portfolio-reads-mcp"})
-
-
-def test_activation_is_session_log_only_with_no_wire_projection() -> None:
-  # D-B7-1: no client needs the record, so it is deliberately absent from both
-  # wire vocabularies. An older binary replaying a newer log ignores it.
-  assert MCP_SERVER_ACTIVATED_EVENT not in V1_WIRE_EVENT_TYPES
-  assert MCP_SERVER_ACTIVATED_EVENT not in CONTROL_V1_WIRE_EVENT_TYPES
-  assert MCP_SERVER_ACTIVATED_EVENT not in V1_FIELD_PROJECTION
-  assert MCP_SERVER_ACTIVATED_EVENT not in CONTROL_V1_FIELD_PROJECTION
-
-
-def test_the_secret_boundary_sanitizes_the_activation_refusal_message() -> None:
-  event = mcp_server_activated_event(
-    server_id="market-data-mcp",
-    source="run_agent",
-    error={
-      "code": "mcp_server_unavailable",
-      "message": "token sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLL",
-    },
-  )
-
-  sanitized = sanitize_tool_event(event, sink="session_log")
-
-  assert "sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLL" not in str(
-    sanitized["error"]
-  )
-  assert sanitized["server_id"] == "market-data-mcp"
-
-
 def test_empty_fold_surface_is_the_tier_always_set_under_the_profile_ceiling() -> None:
   profile = _Profile(core_mcp_tools={"portfolio-reads-mcp": {"get_positions"}})
 
@@ -176,6 +99,37 @@ def test_empty_fold_surface_is_the_tier_always_set_under_the_profile_ceiling() -
     "mcp__market-data-mcp__screen_stocks",
     "mcp__market-data-mcp__compare_peers",
   })
+
+
+def test_live_surface_detaches_and_freezes_nested_authority_inputs() -> None:
+  catalog = {
+    "research-corpus-mcp": {
+      "tools": ["corpus_search"],
+      "metadata": {"labels": ["research"]},
+    },
+  }
+  allowed = {"research-corpus-mcp": {"corpus_search"}}
+
+  surface = live_tool_surface(
+    active_servers={"research-corpus-mcp"},
+    server_catalog=catalog,
+    allowed_mcp_tools_by_server=allowed,
+  )
+  catalog["research-corpus-mcp"]["tools"].append("corpus_write")
+  allowed["research-corpus-mcp"].add("corpus_write")
+
+  assert surface.server_catalog["research-corpus-mcp"]["tools"] == (
+    "corpus_search",
+  )
+  assert surface.allowed_mcp_tools_by_server["research-corpus-mcp"] == (
+    frozenset({"corpus_search"})
+  )
+  with pytest.raises(TypeError):
+    surface.server_catalog["other-mcp"] = {}  # type: ignore[index]
+  with pytest.raises(TypeError):
+    surface.server_catalog["research-corpus-mcp"]["metadata"]["extra"] = True
+  with pytest.raises(TypeError):
+    surface.allowed_mcp_tools_by_server["research-corpus-mcp"] = frozenset()  # type: ignore[index]
 
 
 def test_one_activation_moves_advertised_and_allowed_together() -> None:

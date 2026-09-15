@@ -89,6 +89,50 @@ def test_is_checklist_empty(tmp_path: Path) -> None:
   assert heartbeat.is_checklist_empty(headers_only_path) is True
   assert heartbeat.is_checklist_empty(content_path) is False
   assert heartbeat.is_checklist_empty(missing_path) is True
+  unreadable_path = tmp_path / "unreadable.d"
+  unreadable_path.mkdir()
+  with pytest.raises(OSError):
+    heartbeat.is_checklist_empty(unreadable_path)
+
+
+def test_tick_checklist_read_failure_is_error_not_skip(tmp_path: Path) -> None:
+  unreadable_path = tmp_path / "unreadable.d"
+  unreadable_path.mkdir()
+
+  async def case() -> None:
+    run_calls = 0
+    tick_results: list[TickResult] = []
+    error_calls: list[RunOutput | Exception] = []
+
+    async def run_fn() -> RunOutput:
+      nonlocal run_calls
+      run_calls += 1
+      return _output()
+
+    async def on_error(error: RunOutput | Exception, _state: dict[str, Any]) -> None:
+      error_calls.append(error)
+
+    async def on_tick(result: TickResult, _state: dict[str, Any]) -> None:
+      tick_results.append(result)
+
+    loop = HeartbeatLoop(
+      run_fn,
+      HeartbeatConfig(checklist_path=unreadable_path, max_ticks=1),
+      on_error=on_error,
+      on_tick=on_tick,
+    )
+    await loop.start()
+
+    assert run_calls == 0
+    assert len(error_calls) == 1
+    assert isinstance(error_calls[0], OSError)
+    assert len(tick_results) == 1
+    assert tick_results[0].skipped is False
+    assert tick_results[0].skip_reason is None
+    assert tick_results[0].error is not None
+    assert loop.state["consecutive_errors"] == 1
+
+  _run(case())
 
 
 def test_is_within_active_hours() -> None:

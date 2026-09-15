@@ -9,14 +9,12 @@ from the deferred set, its server added to the loaded set, so the model sees the
 tools) while the dispatcher allowlist never learned the grant, and the very next
 call was rejected: the pack-loaded-but-rejected desync.
 
-This module replaces the three views with one append-only fact and two pure
+This module replaces the three views with one session-owned fact and two pure
 derivations:
 
 ``McpActivationFold``
     The single writer.  One ``record`` per activation, in order, never removed.
-    It is the in-memory projection of the durable ``mcp_server_activated``
-    session-log events, so a replay of the log rebuilds exactly the live state
-    (:func:`fold_mcp_activations`).
+    The live session and its runners share this exact instance.
 
 ``derive_live_surface``
     The whole prompt-facing surface — active servers, deferred tool names,
@@ -25,32 +23,39 @@ derivations:
     three projections come out of one function over one fact, they cannot
     disagree: a tool is advertised exactly when it is allowed.
 
-``derive_dispatcher_allowlist``
-    Lives in :mod:`agent_gateway.capability_resolution` and accepts either a
-    frozen ``ResolvedAuthority`` (the delegation path) or a
-    :class:`LiveToolSurface` (the interactive path), so the dispatcher's scope
-    has one derivation for both.
-
-The durable event is **session-log-only** (D-B7-1): it is deliberately absent
-from ``event_adapter.V1_WIRE_EVENT_TYPES`` and ``V1_FIELD_PROJECTION``, so no
-client contract changes and an older binary replaying a newer log simply ignores
-an event type it does not know — degrade, not corrupt.
+``LiveToolSurface``
+    The immutable result. Interactive prompt, catalog, and dispatcher readers
+    consume its exact per-server map; delegation projects its separate frozen
+    ``ResolvedAuthority`` without converting between authority shapes.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping, Sequence, Set as AbstractSet
+from collections.abc import Callable, Iterable, Mapping, Set as AbstractSet
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal, TypeVar, TypedDict
 
-MCP_SERVER_ACTIVATED_EVENT = "mcp_server_activated"
+_SetElementT = TypeVar("_SetElementT")
+
 
 # Activation sources, recorded for provenance only. The fold's arithmetic never
 # branches on them: one activation is one activation.
 ACTIVATION_SOURCE_LOAD_TOOLS = "load_tools"
 ACTIVATION_SOURCE_RUN_AGENT = "run_agent"
-ACTIVATION_SOURCE_STAGE_SCOPE = "stage_tool_scope"
+
+RunAgentMcpActivationErrorCode = Literal[
+  "mcp_server_denied",
+  "mcp_server_unavailable",
+  "mcp_tool_unavailable",
+]
+
+
+class RunAgentMcpActivationError(TypedDict):
+  """Visible refusal returned by a named-operation MCP activator."""
+
+  code: RunAgentMcpActivationErrorCode
+  message: str
 
 
 class McpActivationError(ValueError):
@@ -79,7 +84,7 @@ def _exact_tool_names(tools: Any) -> frozenset[str]:
 
 @dataclass(frozen=True)
 class McpServerActivation:
-  """One durable activation fact.
+  """One session activation fact.
 
   ``whole_server`` records an activation that granted the server's entire
   advertised surface (the ``load_tools(servers=[...])`` and undeclared-tools
@@ -175,8 +180,7 @@ class McpActivationFold:
     """Whether this activation would change nothing.
 
     Activation is monotone, so a repeat of a grant the fold already carries is
-    a no-op.  Callers use this to keep the durable log to the activations that
-    actually moved the surface.
+    a no-op. Callers use this to avoid redundant records.
     """
 
     wanted = str(server_id or "").strip()
@@ -233,79 +237,54 @@ class McpActivationFold:
     return f"McpActivationFold({self._records!r})"
 
 
-def mcp_server_activated_event(
-  *,
-  server_id: str,
-  tools: Iterable[Any] | None = None,
-  whole_server: bool = False,
-  source: str = "",
-  agent_name: str | None = None,
-  profile_name: str | None = None,
-  error: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-  """Build the durable ``mcp_server_activated`` payload.
-
-  A refused activation is recorded too — with ``error`` and no tools — so the
-  log says why a declared server never became routable instead of leaving a
-  silent gap.  The fold ignores errored records by construction: they are built
-  through :func:`fold_mcp_activations`'s error branch, never appended.
-  """
-
-  payload: dict[str, Any] = {
-    "type": MCP_SERVER_ACTIVATED_EVENT,
-    "server_id": _exact_server_id(server_id),
-  }
-  if agent_name:
-    payload["agent_name"] = str(agent_name)
-  if profile_name:
-    payload["profile_name"] = str(profile_name)
-  if source:
-    payload["source"] = str(source)
-  if error is not None:
-    payload["error"] = {
-      "code": str(error.get("code") or ""),
-      "message": str(error.get("message") or ""),
-    }
-    return payload
-  payload["tools"] = sorted(_exact_tool_names(tools))
-  payload["whole_server"] = bool(whole_server) or tools is None
-  return payload
+def _freeze_surface_value(value: Any) -> Any:
+  if isinstance(value, Mapping):
+    return MappingProxyType({
+      key: _freeze_surface_value(item)
+      for key, item in value.items()
+    })
+  if isinstance(value, (list, tuple)):
+    return tuple(_freeze_surface_value(item) for item in value)
+  if isinstance(value, (set, frozenset)):
+    return frozenset(_freeze_surface_value(item) for item in value)
+  return value
 
 
-def fold_mcp_activations(events: Iterable[Mapping[str, Any]]) -> McpActivationFold:
-  """Rebuild the live fold from durable ``mcp_server_activated`` events."""
-
-  fold = McpActivationFold()
-  for event in events:
-    if not isinstance(event, Mapping):
-      continue
-    if str(event.get("type") or "") != MCP_SERVER_ACTIVATED_EVENT:
-      continue
-    if event.get("error") is not None:
-      continue
-    server_id = str(event.get("server_id") or "").strip()
-    if not server_id:
-      continue
-    raw_tools = event.get("tools")
-    tools = raw_tools if isinstance(raw_tools, Sequence) and not isinstance(raw_tools, str) else ()
-    fold.record(
-      server_id,
-      tools=tools,
-      whole_server=bool(event.get("whole_server")),
-      source=str(event.get("source") or ""),
-    )
-  return fold
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class LiveToolSurface:
   """The whole derived MCP surface for one session, from one fold."""
 
   active_servers: frozenset[str]
-  server_catalog: dict[str, Any]
+  server_catalog: Mapping[str, Any]
   deferred_mcp_tools: frozenset[str]
   deferred_mcp_tool_ids: frozenset[str]
-  allowed_mcp_tools_by_server: dict[str, frozenset[str]]
+  allowed_mcp_tools_by_server: Mapping[str, frozenset[str]]
+
+  def __post_init__(self) -> None:
+    object.__setattr__(self, "active_servers", frozenset(self.active_servers))
+    object.__setattr__(
+      self,
+      "server_catalog",
+      _freeze_surface_value(self.server_catalog),
+    )
+    object.__setattr__(
+      self,
+      "deferred_mcp_tools",
+      frozenset(self.deferred_mcp_tools),
+    )
+    object.__setattr__(
+      self,
+      "deferred_mcp_tool_ids",
+      frozenset(self.deferred_mcp_tool_ids),
+    )
+    object.__setattr__(
+      self,
+      "allowed_mcp_tools_by_server",
+      MappingProxyType({
+        str(server_name): frozenset(tool_names)
+        for server_name, tool_names in self.allowed_mcp_tools_by_server.items()
+      }),
+    )
 
 
 def live_tool_surface(
@@ -352,7 +331,7 @@ def derive_live_surface(
   server_catalog: Mapping[str, Any],
   activation_fold: McpActivationFold | None,
   denied_mcp_servers: Iterable[str] | None = None,
-  stage_tool_scope: Any | None = None,
+  stage_authority: Any | None = None,
 ) -> LiveToolSurface:
   """Derive the live MCP surface from the activation fold.
 
@@ -360,14 +339,14 @@ def derive_live_surface(
   fully advertised and nothing is deferred, which is what a scope-less caller
   used to get by passing ``deferred_mcp_tools=None``.
 
-  A ``stage_tool_scope`` replaces the profile ceiling outright: the stage's
+  A ``stage_authority`` replaces the profile ceiling outright: the stage's
   exact per-server map is the allowlist, and only the stage's own servers
   contribute deferred names.
   """
 
-  if stage_tool_scope is not None:
-    return _stage_scoped_surface(
-      stage_tool_scope=stage_tool_scope,
+  if stage_authority is not None:
+    return _stage_authority_surface(
+      stage_authority=stage_authority,
       channel_tiers=channel_tiers,
       channel_context=channel_context,
       server_catalog=server_catalog,
@@ -451,9 +430,9 @@ def derive_live_surface(
   )
 
 
-def _stage_scoped_surface(
+def _stage_authority_surface(
   *,
-  stage_tool_scope: Any,
+  stage_authority: Any,
   channel_tiers: Mapping[str | None, Mapping[str, Any]],
   channel_context: str | None,
   server_catalog: Mapping[str, Any],
@@ -472,12 +451,12 @@ def _stage_scoped_surface(
   fold = activation_fold if activation_fold is not None else McpActivationFold()
   stage_servers = {
     str(server_name)
-    for server_name in getattr(stage_tool_scope, "mcp_server_names", ()) or ()
+    for server_name in getattr(stage_authority, "mcp_server_names", ()) or ()
   }
   allowed_mcp_tools_by_server = {
     str(server_name): frozenset(str(tool_name) for tool_name in tool_names)
     for server_name, tool_names in (
-      getattr(stage_tool_scope, "mcp_tools_by_server", {}) or {}
+      getattr(stage_authority, "mcp_tools_by_server", {}) or {}
     ).items()
   }
   catalog = {
@@ -521,7 +500,10 @@ class DerivedToolNames(AbstractSet):
     self._compute = compute
 
   @classmethod
-  def _from_iterable(cls, iterable: Iterable[str]) -> set[str]:
+  def _from_iterable(
+    cls,
+    iterable: Iterable[_SetElementT],
+  ) -> set[_SetElementT]:
     # Set algebra over a derived view produces an ordinary set, not another
     # view: the result is a value, and values do not re-derive.
     return set(iterable)
@@ -592,10 +574,9 @@ class SessionToolSurface:
     "_channel_tiers",
     "_mcp_client_manager",
     "_denied_mcp_servers",
-    "_stage_tool_scope",
+    "_stage_authority",
     "_defers_mcp_tools",
     "_fold",
-    "_session_log",
   )
 
   def __init__(
@@ -607,10 +588,9 @@ class SessionToolSurface:
     channel_tiers: Mapping[str | None, Mapping[str, Any]],
     mcp_client_manager: Any,
     denied_mcp_servers: Iterable[str] | None = None,
-    stage_tool_scope: Any | None = None,
+    stage_authority: Any | None = None,
     defers_mcp_tools: bool = True,
     activation_fold: McpActivationFold | None = None,
-    session_log: Any | None = None,
   ) -> None:
     self._session = session
     self._profile = profile
@@ -620,10 +600,9 @@ class SessionToolSurface:
     self._denied_mcp_servers = (
       None if denied_mcp_servers is None else set(denied_mcp_servers)
     )
-    self._stage_tool_scope = stage_tool_scope
+    self._stage_authority = stage_authority
     self._defers_mcp_tools = bool(defers_mcp_tools)
     self._fold = activation_fold
-    self._session_log = session_log
 
   @property
   def defers_mcp_tools(self) -> bool:
@@ -649,20 +628,11 @@ class SessionToolSurface:
     whole_server: bool = False,
     source: str = "",
   ) -> McpServerActivation:
-    """Append one activation, durably where a session log is bound.
+    """Append one activation to the shared session fold.
 
     This is the only write on the interactive path: the surface, the deferred
     set and the dispatcher allowlist all move together because they are all
     read back out of this one record.
-
-    Known asymmetry: the durable event is appended here, at record time, while
-    `LoadToolsSDKTransactionManager` may `take_since` the record back out of
-    the live fold and only re-`extend` it on commit. A discarded SDK load
-    therefore leaves an `mcp_server_activated` event behind that the live fold
-    no longer carries. This is latent — `fold_mcp_activations` has no
-    production caller, so nothing rehydrates a fold from the log today — but
-    the append must move behind the commit before any replay reader lands, or
-    the log stops agreeing with the fold.
     """
 
     fold = self.activation_fold
@@ -673,23 +643,12 @@ class SessionToolSurface:
         whole_server=bool(whole_server) or tools is None,
         source=str(source or ""),
       )
-    activation = fold.record(
+    return fold.record(
       server_id,
       tools=tools,
       whole_server=whole_server,
       source=source,
     )
-    append_sync = getattr(self._session_log, "append_sync", None)
-    if callable(append_sync):
-      append_sync(
-        mcp_server_activated_event(
-          server_id=activation.server_id,
-          tools=sorted(activation.tools),
-          whole_server=activation.whole_server,
-          source=activation.source,
-        )
-      )
-    return activation
 
   def _server_catalog(self) -> Mapping[str, Any]:
     get_server_catalog = getattr(self._mcp_client_manager, "get_server_catalog", None)
@@ -706,7 +665,7 @@ class SessionToolSurface:
       server_catalog=self._server_catalog(),
       activation_fold=self.activation_fold,
       denied_mcp_servers=self._denied_mcp_servers,
-      stage_tool_scope=self._stage_tool_scope,
+      stage_authority=self._stage_authority,
     )
 
   @property
@@ -724,6 +683,15 @@ class SessionToolSurface:
   @property
   def allowed_mcp_tools_by_server(self) -> DerivedToolScope:
     return DerivedToolScope(lambda: self.surface().allowed_mcp_tools_by_server)
+
+  @property
+  def known_mcp_tools_by_server(self) -> DerivedToolScope:
+    """Connected catalog routes, independent of session activation."""
+
+    return DerivedToolScope(lambda: {
+      server_name: _catalog_tool_names(payload)
+      for server_name, payload in self.surface().server_catalog.items()
+    })
 
 
 class _EmptyMcpClientManager:
@@ -803,19 +771,17 @@ def coerce_tool_surface(value: Any) -> Any:
 __all__ = [
   "ACTIVATION_SOURCE_LOAD_TOOLS",
   "ACTIVATION_SOURCE_RUN_AGENT",
-  "ACTIVATION_SOURCE_STAGE_SCOPE",
   "DerivedToolNames",
   "DerivedToolScope",
   "LiveToolSurface",
-  "MCP_SERVER_ACTIVATED_EVENT",
   "McpActivationError",
   "McpActivationFold",
   "McpServerActivation",
+  "RunAgentMcpActivationError",
+  "RunAgentMcpActivationErrorCode",
   "SessionToolSurface",
   "coerce_tool_surface",
   "derive_live_surface",
   "detached_tool_surface",
-  "fold_mcp_activations",
   "live_tool_surface",
-  "mcp_server_activated_event",
 ]

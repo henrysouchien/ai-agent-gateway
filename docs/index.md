@@ -9,7 +9,8 @@ Start with the [Quickstart](quickstart.md) if you want a running agent in a few 
 - [Architecture](architecture.md) explains the request lifecycle and runtime boundaries.
 - [API Reference](api-reference.md) covers the main Python entry points.
 - [HTTP API](http-api.md) documents the session, chat, approval, and health endpoints.
-- [MCP Server Catalog](mcp-server-catalog.md) lists the MCP servers intended for the public mono-repo.
+- [MCP Server Catalog](mcp-server-catalog.md) lists plugin distributions that
+  complement the standalone gateway.
 
 ## Tutorials
 

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from fastapi import FastAPI
 
 from agent_gateway.approval_store import resolve_approval_db_path
 from agent_gateway import server_chat_helpers
+from agent_gateway.server import GatewayServerConfig
 
 
 def test_approval_db_path_requires_an_authoritative_state_root() -> None:
@@ -131,8 +132,8 @@ def test_gateway_approval_subsystem_uses_configured_campaign_db(
     lambda: None,
   )
   monkeypatch.setattr(server_chat_helpers, "resolve_policy", lambda *, store: ("policy", store))
-  app = SimpleNamespace(state=SimpleNamespace())
-  config = SimpleNamespace(
+  app = FastAPI()
+  config = GatewayServerConfig(
     audit_hmac_secret_resolver=lambda: b"secret",
     audit_hmac_key_id_resolver=lambda: "key-1",
     tool_input_redactor=lambda *_args, **_kwargs: {},

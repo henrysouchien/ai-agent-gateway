@@ -7,7 +7,11 @@ from pathlib import Path
 import re
 
 from .artifact_paths import canonicalize_ticker
-from .artifact_sidecar_index import artifact_sidecar_index_path, register_canvas_artifact_sidecar
+from .artifact_sidecar_index import (
+  artifact_sidecar_index_path,
+  mark_unreadable_artifact_sidecar_stale,
+  register_canvas_artifact_sidecar,
+)
 from schema.canvas_artifact import CanvasArtifact
 
 
@@ -120,15 +124,22 @@ def list_canvas_artifacts(
   for sidecar_path in sorted(directory.glob("*.json"), key=lambda path: path.name):
     try:
       artifact_id = _validate_canvas_artifact_id(sidecar_path.stem)
-      safe_sidecar_path = _ensure_under_workspace(sidecar_path, workspace_dir)
     except ValueError:
+      # Not a canvas artifact sidecar name (foreign file); not ours to report.
       continue
     if artifact_id != sidecar_path.stem:
       continue
     try:
+      safe_sidecar_path = _ensure_under_workspace(sidecar_path, workspace_dir)
       sidecar_stat = safe_sidecar_path.stat()
       artifact = CanvasArtifact.model_validate_json(safe_sidecar_path.read_bytes())
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+      mark_unreadable_artifact_sidecar_stale(
+        workspace_dir=workspace_dir,
+        artifact_kind="canvas",
+        sidecar_path=sidecar_path,
+        error=exc,
+      )
       continue
     if ticker is not None and artifact.ticker != ticker:
       continue

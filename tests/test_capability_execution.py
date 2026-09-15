@@ -8,7 +8,9 @@ from agent_gateway.capability_binding import (
   AuthContext,
   CapabilityResolutionError,
   CredentialHandle,
+  CredentialPrincipal,
   ModelSelectionIntent,
+  RunMode,
 )
 from agent_gateway.capability_execution import (
   BoundCapabilityExecution,
@@ -43,7 +45,7 @@ class _ExactProvider(ModelProvider):
 def _handle(
   provider: str = "anthropic",
   *,
-  principal: str = "user",
+  principal: CredentialPrincipal = "user",
 ) -> CredentialHandle:
   return CredentialHandle(
     handle_id=f"{principal}:tenant:{provider}",
@@ -57,8 +59,8 @@ def _handle(
 def _auth(
   *,
   providers: tuple[str, ...] = ("anthropic",),
-  run_mode: str = "interactive",
-  principal: str = "user",
+  run_mode: RunMode = "interactive",
+  principal: CredentialPrincipal = "user",
 ) -> AuthContext:
   handles = {provider: _handle(provider, principal=principal) for provider in providers}
   return AuthContext(

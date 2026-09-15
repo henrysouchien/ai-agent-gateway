@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 from agent_gateway.ui_blocks_contract import fallback_projection_table
@@ -81,3 +83,22 @@ def test_empty_and_partial_props_are_total_and_deterministic() -> None:
   assert _fallback({"block": "metric-card", "props": {}}) == "**:** "
   assert _fallback({"block": "sparkline-chart", "props": {}}) == "Series: 0 points, n/a–n/a"
   assert _fallback({"block": "data-table", "props": {}}) == ""
+
+
+def test_unknown_block_renders_loud_generic_projection_instead_of_dropping() -> None:
+  output = _fallback({"block": "brand-new-primitive", "props": {"label": "X"}})
+  assert output == "_[unrenderable block: brand-new-primitive]_"
+
+
+def test_manifest_named_block_projects_from_owner_table_without_local_wiring() -> None:
+  table = copy.deepcopy(TABLE)
+  table["projections"]["confidence-badge"] = "{label}: {value}"
+  output = text_fallback(
+    {
+      "kind": "hank_ui_blocks.v1",
+      "contract_version": 1,
+      "blocks": [{"block": "confidence-badge", "props": {"label": "Conf", "value": "High"}}],
+    },
+    table,
+  )
+  assert output == "Conf: High"

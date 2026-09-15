@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -10,9 +11,21 @@ import sys
 def test_installed_wheel_runs_with_packaged_redaction_and_raw_schema_boundary(
   tmp_path: Path,
 ) -> None:
-  package_root = Path(__file__).resolve().parents[1]
+  source_root = Path(__file__).resolve().parents[1]
+  package_root = tmp_path / "agent-gateway"
+  package_root.mkdir()
+  for filename in ("pyproject.toml", "README.md", "LICENSE"):
+    shutil.copy2(source_root / filename, package_root / filename)
+  for package_name in ("agent_gateway", "agent_workflow_contracts"):
+    shutil.copytree(
+      source_root / package_name,
+      package_root / package_name,
+      ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
   wheel_dir = tmp_path / "wheel"
   wheel_dir.mkdir()
+  build_env = os.environ.copy()
+  build_env["PIP_CACHE_DIR"] = str(tmp_path / "pip-cache")
   builder_python = Path(sys.base_prefix) / (
     "python.exe" if os.name == "nt" else "bin/python3"
   )
@@ -28,6 +41,7 @@ def test_installed_wheel_runs_with_packaged_redaction_and_raw_schema_boundary(
       str(package_root),
     ],
     check=True,
+    env=build_env,
     capture_output=True,
     text=True,
   )

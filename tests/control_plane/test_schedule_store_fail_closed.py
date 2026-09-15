@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agent_gateway.control_plane import schedules as schedules_module
+from agent_gateway.autonomous_runner import AutonomousRegistry
 
 from .test_schedules_pr6 import (
   _agent_run_schedule_payload,
@@ -94,12 +95,17 @@ def _create_request(*, request_id: str = "request-1") -> Any:
   )
 
 
-class _Registry:
+class _Registry(AutonomousRegistry):
   def __init__(self, on_start: Callable[[], None] | None = None) -> None:
+    super().__init__(
+      api_dir=Path(__file__).resolve().parents[4] / "api",
+      log_dir=Path(__file__).with_name("_unused_autonomous_logs"),
+    )
     self.on_start = on_start
     self.starts: list[dict[str, Any]] = []
 
-  def set_user_event_bus(self, _event_bus: Any | None) -> None:
+  def set_user_event_bus(self, user_event_bus: Any | None) -> None:
+    _ = user_event_bus
     return None
 
   async def start(self, **kwargs: Any) -> dict[str, Any]:
@@ -414,7 +420,10 @@ def test_started_run_survives_result_persistence_failure(
   path = _per_user_store_path(tmp_path)
   record = _record()
   _write_payload(path, record)
-  registry = _Registry(on_start=lambda: path.write_bytes(b"{"))
+  def _corrupt_store() -> None:
+    path.write_bytes(b"{")
+
+  registry = _Registry(on_start=_corrupt_store)
   runner = _runner_for_store(
     schedules_module.AgentRunScheduleStore(path),
     registry,
@@ -524,7 +533,10 @@ def test_run_now_route_returns_success_after_started_result_persistence_failure(
   path = _per_user_store_path(fake_schedule_backends["tmp_path"])
   _write_payload(path, _record())
   app = _make_app()
-  registry = _Registry(on_start=lambda: path.write_bytes(b"{"))
+  def _corrupt_store() -> None:
+    path.write_bytes(b"{")
+
+  registry = _Registry(on_start=_corrupt_store)
   app.state.agent_run_schedule_runner.autonomous_registry = registry
   task = types.SimpleNamespace(
     task_id="bg_1",

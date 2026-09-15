@@ -12,6 +12,8 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from agent_gateway.session import SessionStore
+from agent_gateway.approval_route import DurableLocalApprovalRoute
 from agent_gateway.approval_notifications import ApprovalNotificationDestination  # noqa: E402
 from agent_gateway.approval_policy import (  # noqa: E402
   ApprovalDecision as PolicyApprovalDecision,
@@ -52,7 +54,7 @@ def _request(
       channel="web",
     ),
   )
-  return replace(request, notification_policy=notification_policy)  # type: ignore[arg-type]
+  return replace(request, notification_policy=notification_policy)
 
 
 async def _persist_pending(store: SQLiteApprovalStore, request: ApprovalRequest) -> ApprovalRequest:
@@ -336,12 +338,19 @@ def test_lifecycle_persistence_failure_emits_no_notification_intent() -> None:
         )
 
     store = _FailingStore()
+    session = SessionStore(ttl=3600).create_session(
+      api_key_hash="hash",
+      user_id="alice",
+    )
 
     with pytest.raises(RuntimeError, match="approval persistence failed"):
       await run_approval_lifecycle(
-        store=store,
-        policy=_Policy(),
-        session=object(),
+        route=DurableLocalApprovalRoute(
+          store,
+          _Policy(),
+          session,
+        ),
+        session=session,
         tool_call_id="tool-1",
         tool_name="execute_trade",
         tool_input={"preview_id": "raw-preview"},
@@ -349,7 +358,7 @@ def test_lifecycle_persistence_failure_emits_no_notification_intent() -> None:
         reason="needs approval",
         allow_persistent=False,
         resolve_run_context_fn=lambda: RunContext(user_id="alice", request_id="request-1"),
-        current_skill_fn=lambda: None,
+        current_skill_admission_fn=lambda: None,
         redact_for_approval_request_fn=lambda _tool_name, _tool_input: ({}, "hash"),
         resolve_tool_class_fn=lambda _tool_name: "irreversible",
         effective_trade_approval_decision_fn=lambda _tool_name, _tool_args, decision: decision,

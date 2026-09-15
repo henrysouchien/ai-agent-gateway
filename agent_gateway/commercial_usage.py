@@ -8,7 +8,7 @@ from decimal import Decimal
 import inspect
 import json
 import re
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Awaitable, Callable, Protocol
 from uuid import NAMESPACE_URL, uuid5
 
 from jsonschema import Draft202012Validator
@@ -20,11 +20,30 @@ from .commercial_contract import (
   packaged_usage_v3_contract_directory,
 )
 from .commercial_work_start import CommercialWorkStartContext
-from .multi_user.billing import UsageEvent
+from .multi_user.billing import (
+  BillingMode,
+  SessionUsageSummary,
+  UsageEvent,
+  UsageState,
+)
+from .usage_reconciliation import (
+  CommercialUsageReconciliationReport,
+  CommercialUsageReconciliationTracker,
+  UsageDurability,
+)
 
 
 _CODE = re.compile(r"^[a-z][a-z0-9._:-]{0,127}$")
-CommercialUsageSink = Callable[[list[dict[str, Any]]], Awaitable[None] | None]
+CommercialUsageSink = Callable[
+  [list[dict[str, Any]]],
+  UsageDurability | Awaitable[UsageDurability],
+]
+
+class CommercialUsageReconciler(Protocol):
+  async def reconcile(
+    self,
+    summary: SessionUsageSummary,
+  ) -> CommercialUsageReconciliationReport | None: ...
 
 
 @dataclass(frozen=True)
@@ -95,7 +114,9 @@ class CommercialUsageProducer:
     self._lineage = lineage
     self._work_start = work_start
     self._sink = sink
-    self._reconciliation_tracker = reconciliation_tracker
+    self._reconciliation_tracker: CommercialUsageReconciliationTracker | None = (
+      reconciliation_tracker
+    )
     self._on_reconciliation = on_reconciliation
     self._reconciliation_summary: Any | None = None
     schema = (
@@ -110,7 +131,7 @@ class CommercialUsageProducer:
   def enabled(self) -> bool:
     return self._enabled
 
-  def assert_work_allowed(self, billing_mode: Literal["byok", "metered"]) -> None:
+  def assert_work_allowed(self, billing_mode: BillingMode) -> None:
     if not self._enabled or self._sink is None:
       return
     guard = getattr(self._sink, "assert_work_allowed", None)
@@ -118,20 +139,24 @@ class CommercialUsageProducer:
       guard(billing_mode)
 
   async def mark_late(self, root_source_event_id: str) -> Any | None:
-    if self._reconciliation_tracker is not None:
-      self._reconciliation_tracker.mark_late(root_source_event_id)
+    tracker = self._reconciliation_tracker
+    if tracker is not None:
+      tracker.mark_late(root_source_event_id)
       if self._reconciliation_summary is not None:
-        return await self._publish_reconciliation(self._reconciliation_summary)
+        return await self._publish_reconciliation(
+          self._reconciliation_summary, tracker
+        )
     return None
 
   async def reconcile(self, summary: Any) -> Any | None:
     self._ensure_reconciliation_tracker(
       request_id=str(summary.request_id), session_id=str(summary.session_id)
     )
-    if self._reconciliation_tracker is None:
+    tracker = self._reconciliation_tracker
+    if tracker is None:
       return None
     self._reconciliation_summary = summary
-    return await self._publish_reconciliation(summary)
+    return await self._publish_reconciliation(summary, tracker)
 
   def _ensure_reconciliation_tracker(
     self, *, request_id: str, session_id: str
@@ -142,7 +167,6 @@ class CommercialUsageProducer:
     lineage = self._lineage
     if claim is None or lineage is None:
       return
-    from .usage_reconciliation import CommercialUsageReconciliationTracker
 
     self._reconciliation_tracker = CommercialUsageReconciliationTracker(
       request_id=request_id,
@@ -153,8 +177,10 @@ class CommercialUsageProducer:
       workflow_run_id=lineage.workflow_run_id,
     )
 
-  async def _publish_reconciliation(self, summary: Any) -> Any:
-    report = self._reconciliation_tracker.compare(summary)
+  async def _publish_reconciliation(
+    self, summary: Any, tracker: CommercialUsageReconciliationTracker
+  ) -> Any:
+    report = tracker.compare(summary)
     if self._on_reconciliation is not None:
       result = self._on_reconciliation(report)
       if inspect.isawaitable(result):
@@ -165,9 +191,7 @@ class CommercialUsageProducer:
     self,
     event: UsageEvent,
     *,
-    usage_state: Literal[
-      "succeeded", "failed_billable", "failed_unbilled", "canceled"
-    ] = "succeeded",
+    usage_state: UsageState = "succeeded",
   ) -> dict[str, Any] | None:
     if not self._enabled:
       return None
@@ -186,8 +210,8 @@ class CommercialUsageProducer:
     if event.provider is None or not _CODE.fullmatch(event.provider):
       raise ValueError("commercial usage provider is required")
     if event.capability_bind is None:
-      raise ValueError("commercial Usage V3 requires a capability bind receipt")
-    bind = CapabilityBind.from_receipt(event.capability_bind)
+      raise ValueError("commercial Usage V3 requires capability bind JSON")
+    bind = CapabilityBind.from_json(event.capability_bind)
     if event.provider != bind.provider:
       raise ValueError("commercial usage provider projection differs from capability bind")
     if event.model != bind.upstream_model:
@@ -242,7 +266,7 @@ class CommercialUsageProducer:
       "operation": lineage.operation,
       "model": bind.upstream_model,
       "capability_id": bind.capability_id,
-      "capability_bind": bind.receipt(),
+      "capability_bind": bind.to_json(),
       "provider_reported_model": event.provider_reported_model,
       "usage_state": usage_state,
       "uncached_input_tokens": event.input_tokens,
@@ -317,6 +341,5 @@ class CommercialUsageProducer:
       request_id=event.request_id, session_id=event.session_id
     )
     if self._reconciliation_tracker is not None:
-      durability = result if result in {"outbox", "emergency_spool", "lost"} else "outbox"
-      self._reconciliation_tracker.record_batch(payloads, durability=durability)
+      self._reconciliation_tracker.record_batch(payloads, durability=result)
     return payload

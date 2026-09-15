@@ -156,10 +156,12 @@ def test_parent_json_file_key_value_routes_replace_and_time_through_parent_modul
 
 def test_parent_json_file_key_value_active_value_keeps_class_level_call_shape(
   monkeypatch,
+  tmp_path: Path,
 ) -> None:
   monkeypatch.setattr(mcp_client_module, "time", SimpleNamespace(time=lambda: 100.0))
+  storage = _JsonFileKeyValue(tmp_path / "tokens.json")
 
-  assert _JsonFileKeyValue._active_value({"value": {"token": "a"}, "expires_at": 101.0}) == {
+  assert storage._active_value({"value": {"token": "a"}, "expires_at": 101.0}) == {
     "token": "a"
   }
-  assert _JsonFileKeyValue._active_value({"value": {"token": "a"}, "expires_at": 99.0}) is None
+  assert storage._active_value({"value": {"token": "a"}, "expires_at": 99.0}) is None

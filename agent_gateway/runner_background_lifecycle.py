@@ -8,7 +8,8 @@ import math
 import secrets
 import sys
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple, Union
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple, TypeGuard, Union
 
 from agent_workflow_contracts import (
   AdmittedTask,
@@ -16,6 +17,7 @@ from agent_workflow_contracts import (
   ContentReadGrant,
   ParentResultPolicy,
   TaskResult,
+  TaskResultRef,
   UsageObservation,
   sha256_digest,
   terminal_task_result,
@@ -72,18 +74,22 @@ from .runner_notifications import (
 from .runner_run_loop_defaults import MAX_NOTIFICATIONS_PER_TURN as _MAX_NOTIFICATIONS_PER_TURN
 from .runner_session_events import build_agent_completion_event as _build_agent_completion_event
 from .runner_session_lifecycle import _exact_value_match, _runner_attr
-from .events import AgentCompletionEvent, event_from_dict
-from .runner_state import BackgroundTask
+from .session import GatewaySession
+from .events import AgentCompletionEvent, TypedEvent, event_from_dict
+from .final_narrative_artifact import FinalNarrativeArtifactError
 from .skill_result_events import build_skill_result_captured_event
+from .runner_state import BackgroundTask
 from .skill_lifecycle import TopLevelSkillLifecycleMetadata
 from .sub_agent_narrative_result import (
   read_task_result_terminal_narrative,
 )
 from .tool_result_compaction import model_tool_result_max_chars
 from .task_registry import (
+  NotificationQueue,
   RequiredSkillResultMarkerValidationError,
   ResumeSuccessorConflictError,
   TaskEntry,
+  TaskRegistry,
   TaskState,
   TerminationIntent,
   resolve_required_skill_result_marker,
@@ -216,6 +222,14 @@ def _terminal_task_result(
     ),
   )
 
+def _all_agent_completion_events(
+  events: list[TypedEvent],
+) -> TypeGuard[list[AgentCompletionEvent]]:
+  return all(
+    isinstance(event, AgentCompletionEvent)
+    for event in events
+  )
+
 
 def _runner_module_attr(name: str, fallback: Any) -> Any:
   module = sys.modules.get("agent_gateway.runner")
@@ -225,6 +239,45 @@ def _runner_module_attr(name: str, fallback: Any) -> Any:
 
 
 class RunnerBackgroundLifecycleMixin:
+  if TYPE_CHECKING:
+    _background_notifications_enabled: bool
+    _gateway_session_id: str
+    _max_concurrent_sub_agents: int | None
+    _max_resume_chain_depth: int
+    _notification_queue: NotificationQueue
+    _parent_turn_id: str | None
+    _role: str
+    _runner_id: str | None
+    _sid: str
+    _task_registry: TaskRegistry
+    _workspace_dir: str | None
+
+    async def _append_durable_event(
+      self,
+      event: Dict[str, Any],
+    ) -> Any | None: ...
+
+    async def _confirm_durable_skill_event(
+      self,
+      event: Dict[str, Any],
+    ) -> Dict[str, Any] | None: ...
+
+    async def _lookup_task_in_log(
+      self,
+      task_id: str,
+    ) -> TaskEntry | None: ...
+
+    def _lookup_task_in_log_current_sync(
+      self,
+      task_id: str,
+    ) -> TaskEntry | None: ...
+
+    def _operator_pause_requested(self) -> bool: ...
+
+    async def _rebuild_task_registry_from_log(self) -> None: ...
+
+    def _release_write_lease(self) -> None: ...
+
   def _ensure_sub_agent_semaphore(self) -> asyncio.Semaphore | None:
     asyncio_module = _runner_attr(self, "asyncio", asyncio)
     self._sub_agent_semaphore = _runner_attr(self, "_ensure_sub_agent_semaphore", _ensure_sub_agent_semaphore)(
@@ -340,7 +393,7 @@ class RunnerBackgroundLifecycleMixin:
     registry_get = getattr(registry, "get", None)
     if callable(registry_get):
       for notification in notifications:
-        entry = registry_get(notification.task_id)
+        entry = self._task_registry.get(notification.task_id)
         if (
           entry is not None
           and entry.notification_delivery_state == "queued"
@@ -363,7 +416,7 @@ class RunnerBackgroundLifecycleMixin:
   def _consume_notifications(self, max_count: int) -> int:
     peek = getattr(self._notification_queue, "peek", None)
     notifications = (
-      list(peek(max_count=max_count))
+      list(self._notification_queue.peek(max_count=max_count))
       if callable(peek)
       else []
     )
@@ -403,7 +456,7 @@ class RunnerBackgroundLifecycleMixin:
       None,
     )
     if callable(drain_delivered):
-      consumed = list(drain_delivered(notifications))
+      consumed = list(self._notification_queue.drain_delivered(notifications))
     else:
       # Duck-typed queues without identity draining keep the historical
       # front-slice contract.
@@ -422,9 +475,17 @@ class RunnerBackgroundLifecycleMixin:
   def _workflow_settlement_obstructions(self) -> tuple[Any, ...]:
     """Read the session's unsettled workflow obligations, failing open."""
 
-    session = getattr(self, "_gateway_session", None)
-    query = getattr(session, "workflow_settlement_obstruction", None)
-    if not callable(query):
+    session: GatewaySession | None = getattr(
+      self,
+      "_gateway_session",
+      None,
+    )
+    query = (
+      session.workflow_settlement_obstruction
+      if session is not None
+      else None
+    )
+    if query is None:
       return ()
     try:
       return tuple(query())
@@ -637,7 +698,7 @@ class RunnerBackgroundLifecycleMixin:
       normalized = _normalize_required_skill_lifecycle(raw_lifecycle)
       if normalized is not None:
         resolve_required_skill_result_marker(
-          lifecycle=dict(raw_lifecycle),
+          lifecycle=normalized,
           task_id=bg_task.task_id,
           registration_seq=0,
           completion_seq=0,
@@ -1209,11 +1270,14 @@ class RunnerBackgroundLifecycleMixin:
 
     if append_task not in done:
       timeout = self._background_completion_persist_timeout()
-      error = asyncio.TimeoutError(
+      timeout_error = asyncio.TimeoutError(
         f"task completion persistence exceeded {timeout:.3f}s"
       )
-      self._record_completion_persistence_uncertainty(bg_task, error)
-      raise error
+      self._record_completion_persistence_uncertainty(
+        bg_task,
+        timeout_error,
+      )
+      raise timeout_error
 
     try:
       append_task.result()
@@ -1251,7 +1315,7 @@ class RunnerBackgroundLifecycleMixin:
       raise RuntimeError(
         f"Task {task_id} has a malformed durable agent completion"
       ) from exc
-    if any(not isinstance(event, AgentCompletionEvent) for event in typed):
+    if not _all_agent_completion_events(typed):
       raise RuntimeError(
         f"Task {task_id} has an invalid durable agent completion type"
       )
@@ -1274,20 +1338,29 @@ class RunnerBackgroundLifecycleMixin:
     task_result = bg_task.task_result
     if task_result is None or _workflow_owns_terminal_notification(bg_task):
       return
-    if not (
-      task_result.values.terminal_narrative
-      or task_result.values.projection
-      or task_result.values.artifacts
-    ):
+    durable = await self._durable_agent_completion(bg_task.task_id)
+    if durable is not None:
+      if durable.task_result_ref != TaskResultRef.from_result(task_result):
+        raise RuntimeError(
+          f"Task {bg_task.task_id} completion replay conflicts with durable result identity"
+        )
+      # Publication owns its bytes. Re-materializing under today's policy
+      # would rewrite history (and needlessly require the source content).
+      bg_task.completion_envelope = durable
       return
     policy = bg_task.parent_result_policy or _ordinary_parent_result_policy(
       task_result
     )
 
     def _read_terminal(result: TaskResult) -> str:
+      workspace_dir = self._workspace_dir
+      if workspace_dir is None:
+        raise FinalNarrativeArtifactError(
+          "durable workspace root is unavailable"
+        )
       return read_task_result_terminal_narrative(
         result,
-        workspace_dir=self._workspace_dir,
+        workspace_dir=workspace_dir,
       )
 
     def _read_grant(source: ContentHandle) -> ContentReadGrant:
@@ -1311,14 +1384,6 @@ class RunnerBackgroundLifecycleMixin:
       read_grant_factory=_read_grant,
       message_id=_agent_completion_message_id(task_result),
     )
-    durable = await self._durable_agent_completion(bg_task.task_id)
-    if durable is not None:
-      if durable != envelope:
-        raise RuntimeError(
-          f"Task {bg_task.task_id} completion replay conflicts with durable bytes"
-        )
-      bg_task.completion_envelope = durable
-      return
     await self._append_durable_event(
       _build_agent_completion_event(
         task_id=bg_task.task_id,
@@ -1447,17 +1512,20 @@ class RunnerBackgroundLifecycleMixin:
         finalizer_task.result()
       else:
         timeout = self._background_completion_persist_timeout()
-        error = asyncio.TimeoutError(
+        timeout_error = asyncio.TimeoutError(
           f"background finalizer exceeded {timeout:.3f}s after cancellation"
         )
-        self._record_completion_persistence_uncertainty(bg_task, error)
+        self._record_completion_persistence_uncertainty(
+          bg_task,
+          timeout_error,
+        )
         finalizer_task.cancel()
         finalizer_task.add_done_callback(self._consume_background_task_exception)
         await self._reconcile_background_agent(
           bg_task,
           default_intent=bg_task.termination_intent or "cancelled",
         )
-        raise error
+        raise timeout_error
     finally:
       if (
         bg_task.completion_persistence_state == "committed"
@@ -1547,7 +1615,7 @@ class RunnerBackgroundLifecycleMixin:
       return None
     lookup_override = vars(self).get("_lookup_task_in_log")
     if callable(lookup_override):
-      durable_entry = await lookup_override(bg_task.task_id)
+      durable_entry = await self._lookup_task_in_log(bg_task.task_id)
     else:
       lookup_sync = getattr(
         self,
@@ -1555,7 +1623,7 @@ class RunnerBackgroundLifecycleMixin:
         None,
       )
       durable_entry = (
-        lookup_sync(bg_task.task_id)
+        self._lookup_task_in_log_current_sync(bg_task.task_id)
         if callable(lookup_sync)
         else await self._lookup_task_in_log(bg_task.task_id)
       )
@@ -1853,7 +1921,7 @@ class RunnerBackgroundLifecycleMixin:
       and callable(getattr(asyncio_task, "done", None))
       and asyncio_task.done()
     )
-    if task_done:
+    if task_done and asyncio_task is not None:
       task_error: BaseException | None = None
       cancelled = getattr(asyncio_task, "cancelled", None)
       task_cancelled = bool(cancelled()) if callable(cancelled) else False
@@ -2775,15 +2843,13 @@ class RunnerBackgroundLifecycleMixin:
 
     selected_wildcard_entries: list[TaskEntry] | None = None
     if self._background_notifications_enabled:
-      candidate_entries = (
-        self._task_registry.list_tasks()
-        if task_id == "*"
-        else [self._task_registry.get(task_id)]
-      )
+      candidate_entries: Sequence[TaskEntry | None]
       if task_id == "*":
+        wildcard_entries = self._task_registry.list_tasks()
+        candidate_entries = wildcard_entries
         selected_wildcard_entries = [
           entry
-          for entry in candidate_entries
+          for entry in wildcard_entries
           if (
             entry.notification_delivery_state in {
               "payload_omitted",
@@ -2795,6 +2861,8 @@ class RunnerBackgroundLifecycleMixin:
             )
           )
         ]
+      else:
+        candidate_entries = [self._task_registry.get(task_id)]
       blocked_task_ids = [
         entry.task_id
         for entry in candidate_entries
@@ -2802,8 +2870,7 @@ class RunnerBackgroundLifecycleMixin:
           entry is not None
           and (
             _is_current_run_reconstruction(entry)
-            or
-            entry.notification_delivery_state in {
+            or entry.notification_delivery_state in {
               "queued",
               "delivered",
             }
@@ -3008,7 +3075,7 @@ class RunnerBackgroundLifecycleMixin:
     obligations: dict[tuple[str, int, str], int] = {}
     peek = getattr(self._notification_queue, "peek", None)
     queued_notifications = (
-      list(peek())
+      list(self._notification_queue.peek())
       if callable(peek)
       else []
     )
@@ -3303,8 +3370,9 @@ class RunnerBackgroundLifecycleMixin:
         state=TaskState.PENDING,
       )
       if (
-        getattr(entry, "initialization_task", None) is not None
-        and not entry.initialization_task.done()
+        (initialization_task := entry.initialization_task)
+        is not None
+        and not initialization_task.done()
       )
     ]
     for entry in initializing_entries:

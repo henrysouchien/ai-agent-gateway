@@ -7,17 +7,21 @@ from agent_gateway import (
   AgentRunner,
   AnthropicProvider,
   ApprovalDecision,
+  AuthManager,
   ChatRuntime,
   CredentialHandle,
   GatewayServerConfig,
+  GatewaySession,
   INITIAL_MODEL_REGISTRY,
   INITIAL_MODEL_SELECTION_POLICY,
   McpClientManager,
   ToolDispatcher,
+  ToolResult,
   create_gateway_app,
   load_rate_table,
 )
-from agent_gateway.server import MaterializedCredential
+from agent_gateway.tool_dispatcher import LocalToolHandler
+from agent_gateway.server import ChatRequest, MaterializedCredential
 
 
 BASE_DIR = Path(__file__).parent
@@ -62,7 +66,7 @@ def _safe_path(filename: str) -> Path:
   return NOTES_DIR / cleaned
 
 
-async def write_note(tool_input, **_kwargs):
+async def write_note(tool_input, **_kwargs) -> ToolResult:
   filename = str(tool_input.get("filename") or "").strip()
   text = str(tool_input.get("text") or "").strip()
   if not filename or not text:
@@ -130,7 +134,7 @@ provider = AnthropicProvider(rate_table=rate_table)
 mcp_client = McpClientManager(config_path=None)
 AUTH_CONFIG = build_auth_config(rate_table_version=rate_table.version)
 TOOL_DEFINITIONS = [write_note_tool_def()]
-LOCAL_HANDLERS = {"write_note": write_note}
+LOCAL_HANDLERS: dict[str, LocalToolHandler] = {"write_note": write_note}
 
 
 def admit_demo_session(session, _api_key, _request) -> None:
@@ -148,8 +152,16 @@ def materialize_service_credential(
   return MaterializedCredential(handle=handle, auth_config=AUTH_CONFIG)
 
 
-async def build_chat_runtime(session, request, channel, auth_manager) -> ChatRuntime:
-  _ = auth_manager
+async def build_chat_runtime(
+  session: GatewaySession,
+  request: ChatRequest,
+  channel: str | None,
+  auth_manager: AuthManager | None,
+  /,
+  *,
+  storage_root: Path | None = None,
+) -> ChatRuntime:
+  _ = auth_manager, storage_root
   capability_execution = request.capability_execution
   if capability_execution is None:
     raise RuntimeError("Runtime requires a prepared session.driver turn")

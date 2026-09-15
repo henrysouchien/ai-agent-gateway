@@ -2,7 +2,10 @@
 
 This gets you from `pip install` to a streaming agent response in about five minutes.
 
-`create_agent()` uses Anthropic by default. Switch to OpenAI with `provider="openai"` after installing the OpenAI extra, or move to `create_gateway_app()` when you need more runtime control.
+`create_agent()` uses the `session.driver` default from the packaged model
+registry. Anthropic, Codex, OpenAI, and XAI are built in; pass a stable
+`model_key` when you need a non-default choice. Move to `create_gateway_app()`
+when you need custom runtime assembly.
 
 ## 1. Install
 
@@ -29,6 +32,19 @@ For OpenAI:
 ```bash
 export OPENAI_API_KEY="your-openai-api-key"
 ```
+
+The gateway's approval ledger needs an absolute, private state directory. For
+local development:
+
+```bash
+export USER_DATA_DIR="$PWD/.agent-data"
+mkdir -p "$USER_DATA_DIR/gateway"
+chmod 700 "$USER_DATA_DIR" "$USER_DATA_DIR/gateway"
+```
+
+Keep `USER_DATA_DIR` stable across restarts. In production, also set a stable,
+deployment-specific `GATEWAY_AUDIT_HMAC_SECRET` rather than relying on the
+development fallback.
 
 ## 3. Create an Agent Project
 
@@ -74,6 +90,7 @@ from agent_gateway import create_agent
 app = create_agent(
   "You are a concise assistant. Answer clearly and use short paragraphs.",
   provider="openai",
+  model_key="openai.gpt-5-6",
 )
 ```
 
@@ -98,25 +115,35 @@ The chat API is session-based. First, exchange an API key for a JWT session toke
 ```bash
 curl -s http://127.0.0.1:8000/api/chat/init \
   -H 'Content-Type: application/json' \
-  -d '{"api_key":"local-demo-key"}'
+  -d '{"api_key":"local-demo-key","user_id":"demo-user"}'
 ```
 
 Example response:
 
 ```json
 {
+  "user_id": "demo-user",
   "session_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   "session_id": "sess_1234abcd...",
-  "expires_at": 1770000000
+  "expires_at": 1770000000,
+  "schema_version": 1,
+  "capability_choices": {
+    "plan.author": {},
+    "session.driver": {}
+  }
 }
 ```
+
+The capability entries are abbreviated here; each includes revisions,
+selection notices, and authenticated stable-key choices. See the
+[HTTP API](./http-api.md) for the full shape.
 
 Capture the token for the next step:
 
 ```bash
 SESSION_TOKEN=$(curl -s http://127.0.0.1:8000/api/chat/init \
   -H 'Content-Type: application/json' \
-  -d '{"api_key":"local-demo-key"}' \
+  -d '{"api_key":"local-demo-key","user_id":"demo-user"}' \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_token"])')
 ```
 
@@ -129,6 +156,7 @@ curl -N http://127.0.0.1:8000/api/chat \
   -H "Authorization: Bearer $SESSION_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
+    "user_id": "demo-user",
     "messages": [
       {"role": "user", "content": "Explain in two sentences what this package does."}
     ],
@@ -141,12 +169,15 @@ curl -N http://127.0.0.1:8000/api/chat \
 You will see SSE events like this:
 
 ```text
-data: {"type":"text_delta","text":"This package turns an agent into an HTTP service with sessions, streaming, and tool dispatch built in. "}
+data: {"seq":1,"session_id":"sess_1234abcd...","schema_version":1,"event":{"type":"text_delta","text":"This package turns an agent into an HTTP service with sessions, streaming, and tool dispatch built in. "}}
 
-data: {"type":"text_delta","text":"It lets you start simple with a prompt and then add MCP tools, local tools, skills, approvals, and code execution."}
+data: {"seq":2,"session_id":"sess_1234abcd...","schema_version":1,"event":{"type":"text_delta","text":"It lets you start simple with a prompt and then add MCP tools, local tools, skills, approvals, and code execution."}}
 
-data: {"type":"stream_complete","usage":{"input_tokens":123,"output_tokens":45,"estimated_cost":0.0012}}
+data: {"seq":3,"session_id":"sess_1234abcd...","schema_version":1,"event":{"type":"stream_complete","usage":{"input_tokens":123,"output_tokens":45,"estimated_cost":0.0012}}}
 ```
+
+Every SSE `data:` value is an envelope. Read the event type and payload from
+its `event` member; use `seq` for resumption and de-duplication.
 
 The most important client-visible event types are:
 
@@ -191,3 +222,9 @@ That is expected when Docker is unavailable or the configured image is missing. 
 ### Session init fails with 401
 
 If you configured `valid_api_keys`, `/api/chat/init` will reject any API key not in that allowlist.
+
+### Startup says `approval database requires USER_DATA_DIR`
+
+Set the absolute local state directory and create its private `gateway/`
+subdirectory as shown in step 2. The gateway intentionally does not create or
+weaken permissions on that trusted parent directory.

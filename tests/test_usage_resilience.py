@@ -180,11 +180,21 @@ def test_spool_size_limit_models_disk_full_failure(tmp_path) -> None:
 
 
 def test_resilient_sink_spools_primary_failure_trips_and_never_raises(tmp_path) -> None:
-  class FailedOutbox:
-    def enqueue_batch(self, payloads):
+  class FailedOutbox(CommercialUsageOutbox):
+    def __init__(self) -> None:
+      super().__init__(tmp_path / "failed-outbox.sqlite3")
+
+    def enqueue_batch(
+      self,
+      payloads: list[dict[str, object]],
+      *,
+      created_at: datetime | None = None,
+    ) -> None:
+      _ = payloads, created_at
       raise OSError("disk full")
 
-    def health(self):
+    def health(self, *, now: datetime | None = None) -> dict[str, object]:
+      _ = now
       return {"backlog_count": 0, "storage_bytes": 0}
 
   alerts = []
@@ -209,17 +219,29 @@ def test_resilient_sink_spools_primary_failure_trips_and_never_raises(tmp_path) 
 
 
 def test_all_durability_failure_still_preserves_paid_result_and_blocks_future_work(tmp_path) -> None:
-  class FailedOutbox:
-    def enqueue_batch(self, payloads):
+  class FailedOutbox(CommercialUsageOutbox):
+    def __init__(self) -> None:
+      super().__init__(tmp_path / "failed-outbox.sqlite3")
+
+    def enqueue_batch(
+      self,
+      payloads: list[dict[str, object]],
+      *,
+      created_at: datetime | None = None,
+    ) -> None:
+      _ = payloads, created_at
       raise OSError("primary failed")
 
-    def health(self):
+    def health(self, *, now: datetime | None = None) -> dict[str, object]:
+      _ = now
       return {"backlog_count": 0, "storage_bytes": 0}
 
-  class FailedSpool:
-    path = tmp_path / "missing.spool"
+  class FailedSpool(CommercialUsageEmergencySpool):
+    def __init__(self) -> None:
+      super().__init__(tmp_path / "missing.spool")
 
-    def append_batch(self, payloads):
+    def append_batch(self, payloads: list[dict[str, object]]) -> None:
+      _ = payloads
       raise OSError("spool failed")
 
   alerts = []
@@ -233,7 +255,9 @@ def test_all_durability_failure_still_preserves_paid_result_and_blocks_future_wo
   )
 
   assert sink([_payload("evt_001")]) == "lost"
-  assert breaker.snapshot.reason.startswith("all commercial usage durability failed")
+  reason = breaker.snapshot.reason
+  assert reason is not None
+  assert reason.startswith("all commercial usage durability failed")
   with pytest.raises(CommercialUsageCircuitOpen):
     sink.assert_work_allowed("metered")
   with pytest.raises(CommercialUsageCircuitOpen):
@@ -262,8 +286,12 @@ def test_backlog_and_storage_high_water_trip_before_new_metered_work(tmp_path) -
 def test_reconciliation_shipment_high_water_trips_before_new_metered_work(
   tmp_path,
 ) -> None:
-  class ReconciliationBacklog:
-    def health(self):
+  class ReconciliationBacklog(CommercialUsageOutbox):
+    def __init__(self) -> None:
+      super().__init__(tmp_path / "reconciliation-backlog.sqlite3")
+
+    def health(self, *, now: datetime | None = None) -> dict[str, object]:
+      _ = now
       return {
         "ok": True,
         "backlog_count": 0,
@@ -286,8 +314,12 @@ def test_reconciliation_shipment_high_water_trips_before_new_metered_work(
 
 
 def test_outbox_health_failure_trips_shared_breaker_and_alerts(tmp_path) -> None:
-  class BrokenHealthOutbox:
-    def health(self):
+  class BrokenHealthOutbox(CommercialUsageOutbox):
+    def __init__(self) -> None:
+      super().__init__(tmp_path / "broken-health.sqlite3")
+
+    def health(self, *, now: datetime | None = None) -> dict[str, object]:
+      _ = now
       raise OSError("database corrupt")
 
   alerts = []
@@ -307,15 +339,24 @@ def test_outbox_health_failure_trips_shared_breaker_and_alerts(tmp_path) -> None
 def test_replay_must_drain_emergency_spool_before_guarded_reset_allows_work(tmp_path) -> None:
   durable = CommercialUsageOutbox(tmp_path / "usage.sqlite3")
 
-  class FlakyOutbox:
+  class FlakyOutbox(CommercialUsageOutbox):
     failed = True
 
-    def enqueue_batch(self, payloads):
+    def __init__(self) -> None:
+      super().__init__(tmp_path / "flaky-outbox.sqlite3")
+
+    def enqueue_batch(
+      self,
+      payloads: list[dict[str, object]],
+      *,
+      created_at: datetime | None = None,
+    ) -> None:
       if self.failed:
         raise OSError("temporary primary outage")
-      durable.enqueue_batch(payloads)
+      durable.enqueue_batch(payloads, created_at=created_at)
 
-    def health(self):
+    def health(self, *, now: datetime | None = None) -> dict[str, object]:
+      _ = now
       return durable.health(now=NOW)
 
   primary = FlakyOutbox()

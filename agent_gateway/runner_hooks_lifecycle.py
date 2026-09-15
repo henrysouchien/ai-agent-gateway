@@ -2,11 +2,24 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, List
+from typing import (
+  TYPE_CHECKING,
+  Any,
+  Awaitable,
+  Callable,
+  Dict,
+  List,
+)
 
 from .auth import ProviderCredentialFailure
 from .capability_execution import BoundCapabilityExecution
-from .multi_user.billing import SessionUsageSummary, UsageEvent
+from .multi_user.billing import (
+  BillingMode,
+  SessionUsageSummary,
+  UsageEvent,
+  UsageState,
+  UsageTotals as _UsageTotals,
+)
 from .runner_auth import (
   call_credential_refresher as _call_credential_refresher,
   merge_refreshed_auth_config as _merge_refreshed_auth_config,
@@ -31,11 +44,62 @@ from .runner_usage import (
   usage_has_tokens as _usage_has_tokens,
 )
 
+if TYPE_CHECKING:
+  from pathlib import Path
+
+  from .event_log import EventLog
+  from .multi_user.billing import _UsageAggregator
 
 log = logging.getLogger("agent_gateway.runner")
 
 
 class RunnerHooksLifecycleMixin:
+  if TYPE_CHECKING:
+    _aggregator: _UsageAggregator
+    _auth_config: Dict[str, Any]
+    _billing_mode: BillingMode
+    _channel: str | None
+    _context_surface_records: Callable[[], List[Dict[str, Any]]]
+    _full_session_id: str
+    _log: EventLog
+    _on_before_stream_complete: (
+      Callable[..., Awaitable[None] | None] | None
+    )
+    _on_credential_failure: (
+      Callable[
+        [ProviderCredentialFailure],
+        Awaitable[Dict[str, Any] | None]
+        | Dict[str, Any]
+        | None,
+      ]
+      | None
+    )
+    _on_late_usage_event: (
+      Callable[[UsageEvent], Awaitable[None] | None] | None
+    )
+    _on_metric: Callable[[str, int], None] | None
+    _on_session_summary: (
+      Callable[[SessionUsageSummary], Awaitable[None] | None] | None
+    )
+    _on_tool_result: (
+      Callable[
+        [ToolResultContext],
+        Awaitable[List[Dict[str, Any]] | None],
+      ]
+      | None
+    )
+    _on_tool_timing: Callable[..., None] | None
+    _on_tool_timing_accepts_context_surfaces: bool
+    _on_tool_timing_accepts_user_id: bool
+    _on_usage: Callable[[UsageEvent], Awaitable[None] | None] | None
+    _parent_turn_id: str | None
+    _rate_table_version: str
+    _request_id: str
+    _sid: str
+    _summary_emitted: bool
+    _usage_ledger_dlq_path: Path
+    _usage_user_id: str
+
   async def _call_on_tool_result(self, ctx: ToolResultContext) -> List[Dict[str, Any]]:
     return await _runner_attr(self, "_call_tool_result_hook", _call_tool_result_hook)(
       self._on_tool_result,
@@ -159,7 +223,7 @@ class RunnerHooksLifecycleMixin:
   def _usage_delta(before: Dict[str, int], after: Dict[str, int]) -> Dict[str, int]:
     return _runner_module_attr("_usage_delta", _usage_delta)(before, after)
 
-  def _build_usage_event(self, *, model: str, usage_totals: Dict[str, int]) -> UsageEvent:
+  def _build_usage_event(self, *, model: str, usage_totals: _UsageTotals) -> UsageEvent:
     cost = self._estimate_usage_cost(model, usage_totals)
     return _runner_attr(self, "_build_usage_event", _build_usage_event)(
       user_id=self._usage_user_id,
@@ -177,7 +241,7 @@ class RunnerHooksLifecycleMixin:
     )
 
   async def _call_on_usage(
-    self, usage_event: UsageEvent, *, usage_state: str = "succeeded"
+    self, usage_event: UsageEvent, *, usage_state: UsageState = "succeeded"
   ) -> None:
     await _runner_attr(self, "_call_usage_event_hook", _call_usage_event_hook)(
       self._aggregator,
@@ -211,5 +275,5 @@ class RunnerHooksLifecycleMixin:
       emit_metric=self._call_metric,
     )
 
-  def _estimate_usage_cost(self, model: str, usage_totals: Dict[str, int]):
+  def _estimate_usage_cost(self, model: str, usage_totals: _UsageTotals):
     return _runner_attr(self, "_estimate_usage_cost", _estimate_usage_cost)(self._provider, model, usage_totals)

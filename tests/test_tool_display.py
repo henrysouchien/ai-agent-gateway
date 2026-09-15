@@ -1,39 +1,22 @@
 from __future__ import annotations
 
-import ast
-from pathlib import Path
+import asyncio
+from types import SimpleNamespace
+from typing import Any
 
+from agent_gateway import AgentRunner, EventLog
 from agent_gateway.event_adapter import adapt_control_event, adapt_event
 from agent_gateway.tool_display import DETAIL_MAX_CHARS, resolve_display
+from agent_gateway.tool_dispatch_classification import (
+  ToolResultSettlement,
+  settle_catalogless_tool_result,
+)
+from agent_gateway.tool_policy_registry import PreparedToolCall
+from tests.capability_execution_test_support import (
+  stub_runner_capability_execution,
+)
 
 
-def _imports_tool_display_owner(source: str) -> bool:
-  for node in ast.walk(ast.parse(source)):
-    if not isinstance(node, ast.ImportFrom) or node.level != 1:
-      continue
-    if node.module == "tool_display" and any(
-      alias.name == "resolve_display" for alias in node.names
-    ):
-      return True
-    if node.module is None and any(alias.name == "tool_display" for alias in node.names):
-      return True
-  return False
-
-
-def _assigns_display_from_redacted_input(source: str) -> bool:
-  for node in ast.walk(ast.parse(source)):
-    if not isinstance(node, ast.Assign):
-      continue
-    if not any(isinstance(target, ast.Name) and target.id == "display" for target in node.targets):
-      continue
-    if not isinstance(node.value, ast.Call) or len(node.value.args) != 2:
-      continue
-    tool_name_arg, tool_input_arg = node.value.args
-    if not isinstance(tool_name_arg, ast.Name) or tool_name_arg.id != "tool_name":
-      continue
-    if isinstance(tool_input_arg, ast.Name) and tool_input_arg.id == "redacted_tool_input":
-      return True
-  return False
 
 
 def test_resolve_display_seed_map_renders_product_label_and_detail() -> None:
@@ -224,25 +207,107 @@ def test_absent_display_keeps_existing_projection_shape() -> None:
 
 
 def test_clean_emission_sites_stamp_display_from_redacted_input() -> None:
-  repo_root = Path(__file__).resolve().parents[3]
-  runner_tool_execution = (
-    repo_root / "packages/agent-gateway/agent_gateway/runner_tool_execution.py"
-  ).read_text(encoding="utf-8")
-  sdk_runner_stream = (
-    repo_root / "packages/agent-gateway/agent_gateway/sdk_runner_stream.py"
-  ).read_text(encoding="utf-8")
-  addin_runtime = (repo_root / "api/agent/interactive/runtime.py").read_text(encoding="utf-8")
-  addin_execution = (repo_root / "api/agent/interactive/addin_execution.py").read_text(encoding="utf-8")
+  raw_input = {
+    "file": "secret.txt",
+    "mode": "append",
+    "content": "raw secret should not be read",
+  }
+  redacted_input = {
+    "file": "<redacted>",
+    "mode": "append",
+    "content": "<redacted>",
+  }
 
-  assert "from .tool_display import resolve_display" in runner_tool_execution
-  assert '_runner_attr(self, "resolve_display", resolve_display)(tool_name, redacted_tool_input)' in runner_tool_execution
-  assert 'tool_start_event["display"] = display' in runner_tool_execution
+  class _Provider:
+    name = "stub"
 
-  assert _imports_tool_display_owner(sdk_runner_stream)
-  assert _assigns_display_from_redacted_input(sdk_runner_stream)
-  assert 'tool_start_event["display"] = display' in sdk_runner_stream
+    def get_model_info(self, model: str) -> SimpleNamespace:
+      return SimpleNamespace(
+        model_id=model,
+        context_window=200_000,
+        max_output_tokens=8192,
+      )
 
-  assert "from agent_gateway.tool_display import resolve_display" in addin_runtime
-  assert "redacted_tool_input = redact_tool_input_fn(" in addin_execution
-  assert "display = resolve_display_fn(payload.tool_name, redacted_tool_input)" in addin_execution
-  assert 'tool_execute_event["display"] = display' in addin_execution
+    def estimate_cost(
+      self,
+      model: str,
+      uncached: int,
+      cache_read: int,
+      cache_write: int,
+      output: int,
+    ) -> SimpleNamespace:
+      _ = model, uncached, cache_read, cache_write, output
+      return SimpleNamespace(total_usd=0.0, breakdown={})
+
+  class _Dispatcher:
+    @staticmethod
+    def redact_prepared_tool_input(
+      tool_name: str,
+      prepared_call: PreparedToolCall,
+    ) -> dict[str, object]:
+      assert tool_name == "memory_write"
+      assert prepared_call.materialize_input() == raw_input
+      return dict(redacted_input)
+
+    @staticmethod
+    def settle_tool_result(
+      _tool_name: str,
+      dispatch_entry: Any,
+      result: Any,
+      error: Any,
+      semantic_error: Any = None,
+      **_kwargs: Any,
+    ) -> ToolResultSettlement:
+      return settle_catalogless_tool_result(
+        entry=dispatch_entry,
+        result=result,
+        error=error,
+        semantic_error=semantic_error,
+      )
+
+    async def dispatch(
+      self,
+      tool_id: str,
+      tool_name: str,
+      tool_input: dict[str, Any],
+      *,
+      call_index: int = 0,
+    ):
+      _ = tool_id, tool_name, tool_input, call_index
+      return {"status": "ok"}, None
+
+    def requires_approval(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
+      _ = tool_name, tool_input
+      return False
+
+  runner = AgentRunner(
+    event_log=EventLog(session_id="display-redaction"),
+    dispatcher=_Dispatcher(),  # type: ignore[arg-type]
+    session_id="display-redaction",
+    capability_execution=stub_runner_capability_execution(
+      provider=_Provider(),
+      model="stub-model",
+      effort="none",
+      auth_config={"api_key": "k"},
+    ),
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+  asyncio.run(runner._execute_single_tool(
+    "tool-1",
+    "memory_write",
+    raw_input,
+    {"tools": []},
+  ))
+
+  start = next(
+    entry.event
+    for entry in runner._log.entries
+    if entry.event.get("type") == "tool_call_start"
+  )
+  serialized = str(start)
+  assert start["tool_input"] == redacted_input
+  assert start["display"] == resolve_display("memory_write", redacted_input)
+  assert "raw secret" not in serialized
+  assert "secret.txt" not in serialized

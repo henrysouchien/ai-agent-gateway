@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 
@@ -42,6 +44,10 @@ def test_generated_capability_resolution_codes_match_gateway_literal() -> None:
 
 
 def test_delivery_envelope_goldens_are_valid_in_python_schema_and_typescript() -> None:
+    tsc = os.environ.get("TSC") or shutil.which("tsc") or str(
+        ROOT / "node_modules" / ".bin" / "tsc"
+    )
+    assert Path(tsc).is_file(), "TypeScript compiler is not installed"
     schema = json.loads(
         (GENERATED / "delivery-envelope.schema.json").read_text(encoding="utf-8")
     )
@@ -56,8 +62,7 @@ def test_delivery_envelope_goldens_are_valid_in_python_schema_and_typescript() -
 
         result = subprocess.run(
             [
-                "npx",
-                "tsc",
+                tsc,
                 "--noEmit",
                 "--skipLibCheck",
                 "--target",

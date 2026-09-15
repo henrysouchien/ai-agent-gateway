@@ -14,6 +14,7 @@ import pytest
 from agent_gateway.capability_resolution import (
   CapabilityResolutionInputError,
   OperationDeclaration,
+  admitted_tool_routes,
   admitted_catalog_routes,
   declarative_platform_catalog,
   derive_dispatcher_allowlist,
@@ -29,9 +30,9 @@ from agent_gateway.semantic_capabilities import (
   compile_semantic_capabilities,
 )
 from agent_gateway.semantic_capability_routing import capability_for_tool
+from agent_gateway.tool_dispatch_declarations import ToolDispatchDecl
 from agent_gateway.sub_agent_scope_receipt import (
   admit_operation_tools,
-  semantic_tool_routes,
 )
 from agent_gateway.skills import compile_agent_operation, generic_explore_profile
 from agent_gateway.tool_dispatch_declarations import (
@@ -45,7 +46,11 @@ from agent_workflow_contracts import (
   PlatformToolCatalog,
   ResolvedAuthority,
   SemanticCapabilityRequirement,
+  ToolGrant,
+  ToolGrantEntry,
+  sha256_digest,
 )
+from agent_workflow_contracts.models import CatalogToolEffect
 
 
 _MCP_ROUTES = {
@@ -68,9 +73,21 @@ class _Mcp:
   def get_original_tool_name(self, name: str) -> str:
     return name
 
+  def get_policy_tool_name(self, name: str) -> str | None:
+    return name if name in self.routes else None
 
-def _effect(tool_id: str, _server: str | None, _local: bool) -> str | None:
-  if tool_id in {"web_search", "web_fetch", "filings_search", "transcripts_search"}:
+
+def _effect(
+  tool_id: str,
+  _server: str | None,
+  _local: bool,
+) -> CatalogToolEffect | None:
+  if tool_id in {
+    "web_search",
+    "web_fetch",
+    "filings_search",
+    "transcripts_search",
+  }:
     return "read"
   if tool_id == "compare_peers":
     return "propose"
@@ -143,6 +160,8 @@ def test_declarative_snapshot_is_seeded_from_the_dispatch_declaration_table() ->
     assert (entry.source_identity is None) == (row.source_identity is None)
     # A seeded snapshot names no server: routes are a live fact, not a
     # declaration.
+    assert entry.origin is None
+    assert "origin" not in entry.model_dump(mode="json")
     assert entry.server_id is None
     # `capability` is SINGULAR (D-B5-2) and B-8 populates it from the one
     # derivation the codegen also reads.
@@ -151,9 +170,15 @@ def test_declarative_snapshot_is_seeded_from_the_dispatch_declaration_table() ->
       server_id=entry.server_id,
       effect=entry.effect,
     )
-  assert catalog.entry("filings_search").capability == "filings.read/v1"
-  assert catalog.entry("transcripts_search").capability == "transcripts.read/v1"
-  assert catalog.entry("web_fetch").capability == "web.read/v1"
+  filings_search = catalog.entry("filings_search")
+  transcripts_search = catalog.entry("transcripts_search")
+  web_fetch = catalog.entry("web_fetch")
+  assert filings_search is not None
+  assert transcripts_search is not None
+  assert web_fetch is not None
+  assert filings_search.capability == "filings.read/v1"
+  assert transcripts_search.capability == "transcripts.read/v1"
+  assert web_fetch.capability == "web.read/v1"
 
 
 def test_declarative_snapshot_normalizes_descriptors_into_exact_json() -> None:
@@ -173,12 +198,140 @@ def test_declarative_snapshot_normalizes_descriptors_into_exact_json() -> None:
   }
 
 
-def test_declarative_catalog_lookup_canonicalizes_namespaced_names() -> None:
-  assert (
-    lookup_catalog_entry("mcp__research-corpus-mcp__filings_search")
-    == lookup_catalog_entry("filings_search")
+def test_dispatch_lookup_requires_exact_live_route_and_policy_owner() -> None:
+  entry = lookup_catalog_entry(
+    "mcp__research-corpus-mcp__filings_search",
+    origin="mcp",
+    server="research-corpus-mcp",
+    original_tool_name="filings_search",
   )
-  assert lookup_catalog_entry("not_a_declared_tool") is None
+
+  assert entry is not None
+  assert entry.origin == "mcp"
+  assert entry.server_id == "research-corpus-mcp"
+  assert entry.canonical_name == "filings_search"
+  assert lookup_catalog_entry(
+    "mcp__wrong-mcp__filings_search",
+    origin="mcp",
+    server="research-corpus-mcp",
+    original_tool_name="filings_search",
+  ) is None
+
+  logical_alias = lookup_catalog_entry(
+    "fetch_financials",
+    origin="mcp",
+    server="market-data-mcp",
+    original_tool_name="fetch_financials",
+  )
+  assert logical_alias is not None
+  assert logical_alias.server_id == "market-data-mcp"
+  assert lookup_catalog_entry(
+    "fmp_fetch",
+    origin="mcp",
+    server="fmp-mcp",
+    original_tool_name="fmp_fetch",
+  ) is None
+  assert lookup_catalog_entry(
+    "mcp__research-corpus-mcp__transcripts_search",
+    origin="mcp",
+    server="research-corpus-mcp",
+    original_tool_name="filings_search",
+  ) is None
+
+
+def test_dispatch_lookup_refuses_unroutable_local_and_policy_unavailability(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  assert lookup_catalog_entry(
+    "web_fetch",
+    origin="local",
+    server=None,
+    original_tool_name="web_fetch",
+  ) is not None
+  assert lookup_catalog_entry(
+    "web_search",
+    origin="local",
+    server=None,
+    original_tool_name="web_fetch",
+  ) is None
+  assert lookup_catalog_entry(
+    "web_fetch",
+    origin="mcp",
+    server="research-corpus-mcp",
+    original_tool_name="web_fetch",
+  ) is None
+  assert lookup_catalog_entry(
+    "filings_search",
+    origin="local",
+    server=None,
+    original_tool_name="filings_search",
+  ) is None
+
+  import agent_gateway.capability_resolution as resolution
+
+  monkeypatch.setattr(resolution, "load_server_policy_module", lambda: None)
+  assert lookup_catalog_entry(
+    "filings_search",
+    origin="mcp",
+    server="research-corpus-mcp",
+    original_tool_name="filings_search",
+  ) is None
+
+
+def test_routed_snapshot_keeps_route_effect_but_withholds_wrong_owner_declaration() -> None:
+  catalog = snapshot_platform_catalog(
+    tool_ids=("filings_search",),
+    local_tool_handlers={},
+    mcp_client=_Mcp({"filings_search": "wrong-mcp"}),
+    effect_resolver=lambda _name, _server, _local: "read",
+  )
+  entry = catalog.entry("filings_search")
+
+  assert entry is not None
+  assert entry.effect == "read"
+  assert entry.server_id == "wrong-mcp"
+  assert entry.idempotent is None
+  assert entry.success_signal is None
+  assert entry.source_identity is None
+
+
+def test_routed_snapshot_uses_injected_declaration_table_after_owner_match() -> None:
+  custom = {
+    "corpus_inventory": ToolDispatchDecl(
+      success_signal={"kind": "status_equals", "field": "status", "values": ("ok",)},
+      source_identity=None,
+      effect="read",
+      idempotent=True,
+    ),
+  }
+  catalog = snapshot_platform_catalog(
+    tool_ids=("corpus_inventory",),
+    local_tool_handlers={},
+    mcp_client=_Mcp({"corpus_inventory": "research-corpus-mcp"}),
+    declarations=custom,
+    effect_resolver=lambda _name, _server, _local: "read",
+  )
+  entry = catalog.entry("corpus_inventory")
+
+  assert entry is not None
+  assert entry.idempotent is True
+  assert entry.success_signal == {
+    "kind": "status_equals",
+    "field": "status",
+    "values": ["ok"],
+  }
+
+  empty = snapshot_platform_catalog(
+    tool_ids=("filings_search",),
+    local_tool_handlers={},
+    mcp_client=_Mcp(),
+    declarations={},
+    effect_resolver=lambda _name, _server, _local: "read",
+  ).entry("filings_search")
+  assert empty is not None
+  assert empty.idempotent is None
+  assert empty.success_signal is None
+  assert empty.source_identity is None
 
 
 def test_declarative_catalog_cache_follows_the_declaration_table_identity(
@@ -209,7 +362,9 @@ def test_routed_snapshot_describes_local_and_mcp_routes_exactly() -> None:
   by_id = {entry.tool_id: entry for entry in catalog.tools}
 
   assert by_id["web_search"].server_id is None
+  assert by_id["web_search"].origin == "local"
   assert by_id["filings_search"].server_id == "research-corpus-mcp"
+  assert by_id["filings_search"].origin == "mcp"
   assert by_id["compare_peers"].server_id == "market-data-mcp"
   assert by_id["filings_search"].effect == "read"
   assert by_id["compare_peers"].effect == "propose"
@@ -268,6 +423,28 @@ def test_platform_catalog_rejects_unsorted_or_duplicate_entries() -> None:
     PlatformToolCatalog(tools=(other, other))
 
 
+def test_catalog_route_origin_and_server_are_one_coherent_fact() -> None:
+  with pytest.raises(ValueError, match="unrouted catalog entries"):
+    CatalogToolEntry(
+      tool_id="filings_search",
+      canonical_name="filings_search",
+      server_id="research-corpus-mcp",
+    )
+  with pytest.raises(ValueError, match="local catalog routes"):
+    CatalogToolEntry(
+      tool_id="web_search",
+      canonical_name="web_search",
+      origin="local",
+      server_id="research-corpus-mcp",
+    )
+  with pytest.raises(ValueError, match="MCP catalog routes require"):
+    CatalogToolEntry(
+      tool_id="filings_search",
+      canonical_name="filings_search",
+      origin="mcp",
+    )
+
+
 # --- the resolver ----------------------------------------------------------
 
 
@@ -298,18 +475,20 @@ def test_resolver_verdict_is_exactly_compile_semantic_capabilities() -> None:
   assert isinstance(authority, ResolvedAuthority)
 
   admitted = admitted_catalog_routes(declaration, catalog=catalog)
+  semantic_routes: list[SemanticToolRoute] = []
+  for entry in admitted:
+    effect = entry.effect
+    assert effect is not None
+    semantic_routes.append(SemanticToolRoute(
+      tool_id=entry.tool_id,
+      effect=effect,
+      server_id=entry.server_id,
+      capability=entry.capability,
+    ))
   legacy = compile_semantic_capabilities(
     declaration.required_capabilities,
     grant_id=declaration.grant_id,
-    tool_routes=tuple(
-      SemanticToolRoute(
-        tool_id=entry.tool_id,
-        effect=str(entry.effect),
-        server_id=entry.server_id,
-        capability=entry.capability,
-      )
-      for entry in admitted
-    ),
+    tool_routes=tuple(semantic_routes),
     registry=DEFAULT_SEMANTIC_CAPABILITY_REGISTRY,
   )
 
@@ -370,41 +549,6 @@ def test_admit_operation_tools_is_now_the_resolver_itself() -> None:
   assert granted_tool_ids(authority) == granted_tool_ids(legacy)
   assert derive_dispatcher_allowlist(authority) == derive_dispatcher_allowlist(
     legacy
-  )
-
-
-def test_resolver_reuses_the_live_semantic_tool_routes_facts() -> None:
-  """The catalog's routing facts are the receipt's, not a second dialect."""
-
-  local = {"web_search": object()}
-  mcp = _Mcp()
-  ceiling = ("web_search", "filings_search", "memory_read")
-  legacy_routes = semantic_tool_routes(
-    ceiling,
-    local_tool_handlers=local,
-    mcp_client=mcp,
-    effect_resolver=_effect,
-  )
-  catalog = snapshot_platform_catalog(
-    tool_ids=ceiling,
-    local_tool_handlers=local,
-    mcp_client=mcp,
-    effect_resolver=_effect,
-  )
-  declaration = OperationDeclaration(
-    operation_name="explore",
-    grant_id="grant:routes",
-    workspace_scope="model_write",
-    required_capabilities=(),
-    tool_ceiling=frozenset(ceiling),
-  )
-
-  admitted = admitted_catalog_routes(declaration, catalog=catalog)
-
-  assert tuple(
-    (entry.tool_id, entry.effect, entry.server_id) for entry in admitted
-  ) == tuple(
-    (route.tool_id, route.effect, route.server_id) for route in legacy_routes
   )
 
 
@@ -563,6 +707,70 @@ def test_resolved_routes_are_exactly_the_granted_tools() -> None:
       bindings=authority.bindings,
       routes=(),
     )
+  with pytest.raises(ValueError, match="exact physical origin"):
+    ResolvedAuthority(
+      operation_name="explore",
+      grant=authority.grant,
+      bindings=authority.bindings,
+      routes=tuple(
+        route.model_copy(
+          update={"origin": None, "server_id": None},
+        )
+        for route in authority.routes
+      ),
+    )
+
+
+def test_admitted_route_projection_uses_grant_order_and_frozen_origin() -> None:
+  tools = (
+    ToolGrantEntry(tool_id="web_search", route_id="local", effect="read"),
+    ToolGrantEntry(
+      tool_id="filings_search",
+      route_id="research-corpus-mcp",
+      effect="read",
+    ),
+  )
+  grant_id = "grant:route-order"
+  grant = ToolGrant(
+    grant_id=grant_id,
+    tools=tools,
+    digest=sha256_digest({
+      "grant_id": grant_id,
+      "tools": [entry.model_dump(mode="json") for entry in tools],
+    }),
+  )
+  authority = ResolvedAuthority(
+    operation_name="explore",
+    grant=grant,
+    # ResolvedAuthority keeps catalog order; the admitted projection follows
+    # the grant that provider definitions and dispatch consume.
+    routes=(
+      CatalogToolEntry(
+        tool_id="filings_search",
+        canonical_name="filings_search",
+        effect="read",
+        origin="mcp",
+        server_id="server-a",
+      ),
+      CatalogToolEntry(
+        tool_id="web_search",
+        canonical_name="web_search",
+        effect="read",
+        origin="local",
+      ),
+    ),
+  )
+
+  routes = admitted_tool_routes(authority)
+
+  assert tuple(route.tool_id for route in routes) == (
+    "web_search",
+    "filings_search",
+  )
+  assert routes[0].origin == "local"
+  assert routes[0].server_id is None
+  assert routes[1].origin == "mcp"
+  assert routes[1].server_id == "server-a"
 
 
 def test_dispatcher_allowlist_groups_granted_tools_by_server() -> None:

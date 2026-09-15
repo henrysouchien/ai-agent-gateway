@@ -1,27 +1,45 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from types import SimpleNamespace
 from uuid import uuid4
 
 from agent_gateway import ApprovalDecision, ToolDispatcher
+from agent_gateway.mcp_client import McpClientManager
 
 
-class _Mcp:
-  def __init__(self, sequence=None) -> None:
-    self.calls = []
+class _Mcp(McpClientManager):
+  def __init__(self, sequence: list[str] | None = None) -> None:
+    super().__init__(config_path=None)
+    self.calls: list[tuple[str, object, dict[str, object]]] = []
     self.sequence = sequence
 
-  def is_mcp_tool(self, _name: str) -> bool:
+  def is_mcp_tool(self, name: str) -> bool:
+    _ = name
     return True
 
-  def get_server_for_tool(self, _name: str) -> str:
+  def get_server_for_tool(self, name: str) -> str:
+    _ = name
     return "portfolio-trades-mcp"
 
-  async def call_tool(self, name, tool_input, **kwargs):
+  async def call_tool(
+    self,
+    name: str,
+    tool_input: object,
+    meta: dict[str, object] | None = None,
+    abort_event: asyncio.Event | None = None,
+    gateway_session: object | None = None,
+    allow_uncertain_replay: bool = True,
+    trusted_dispatch_scope: Mapping[str, object] | None = None,
+  ) -> tuple[object | None, dict[str, object] | None]:
+    _ = abort_event, gateway_session, allow_uncertain_replay, trusted_dispatch_scope
     if self.sequence is not None:
       self.sequence.append("mcp")
-    self.calls.append((name, tool_input, kwargs))
+    call_options: dict[str, object] = {}
+    if meta is not None:
+      call_options["meta"] = meta
+    self.calls.append((name, tool_input, call_options))
     return {"ok": True}, None
 
 
@@ -81,7 +99,10 @@ def test_irreversible_rechecks_after_approval_and_injects_token_free_lineage() -
   assert result == {"ok": True}
   assert rechecks == [commercial]
   assert sequence == ["approval", "recheck", "mcp"]
-  meta = mcp.calls[0][2]["meta"]["hank_commercial"]
+  meta_payload = mcp.calls[0][2]["meta"]
+  assert isinstance(meta_payload, dict)
+  meta = meta_payload["hank_commercial"]
+  assert isinstance(meta, dict)
   assert meta == {
     "tool_name": "execute_trade",
     "execution_context_id": str(commercial.claim.context_id),
@@ -150,6 +171,7 @@ def test_commercial_dispatch_denies_untrusted_mcp_without_metadata_leak() -> Non
   )
 
   assert result is None
+  assert error is not None
   assert error["code"] == "commercial_mcp_destination_denied"
   assert mcp.calls == []
 
@@ -174,6 +196,7 @@ def test_missing_irreversible_recheck_fails_closed() -> None:
   )
 
   assert result is None
+  assert error is not None
   assert error["code"] == "commercial_irreversible_authority_unavailable"
   assert mcp.calls == []
 

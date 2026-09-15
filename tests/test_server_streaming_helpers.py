@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from types import AsyncGeneratorType
+
 
 import pytest
 
 from agent_gateway import server as gateway_server
 from agent_gateway import server_chat_helpers
 from agent_gateway import server_streaming
+from agent_gateway.event_log import EventLog
+from agent_gateway.session import GatewaySession, SessionStream, StreamSubscriber
+
 
 
 def test_streaming_parent_aliases_are_available() -> None:
@@ -109,15 +114,30 @@ def test_chat_helpers_stream_sse_closes_core_generator_on_outer_aclose(monkeypat
   monkeypatch.setattr(server_chat_helpers._chat_stream_core, "stream_subscriber_sse", fake_core_sse)
 
   async def run() -> None:
+    session = GatewaySession(
+      session_id="session-1",
+      api_key_hash="hash",
+      created_at=1,
+      expires_at=2,
+      user_id="user-1",
+    )
+    active_turn = SessionStream(event_log=EventLog(), runner_task=None)
+    subscriber = StreamSubscriber(
+      subscriber_id="subscriber-1",
+      connected_at=1.0,
+      last_sent_seq=0,
+      queue=asyncio.Queue(),
+    )
     stream = server_chat_helpers._stream_subscriber_sse(
-      session=object(),
-      active_turn=object(),
-      subscriber=object(),
+      session=session,
+      active_turn=active_turn,
+      subscriber=subscriber,
       transcript_dir=None,
       channel=None,
       write_transcript=False,
       log=logging.getLogger("test.server_chat_helpers"),
     )
+    assert isinstance(stream, AsyncGeneratorType)
     assert await stream.__anext__() == b"data: first\n\n"
     await stream.aclose()
 

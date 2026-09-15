@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os  # noqa: F401 - compatibility alias for autonomous_runner_state
+import os
 import secrets
 import signal
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, ContextManager, Mapping
+from typing import Any, Awaitable, Callable, ContextManager, Mapping, Protocol, runtime_checkable
 
 from .autonomous_capability_handoff import AutonomousCapabilityBindingResolver
 from .autonomous_approval_channel import (
@@ -19,6 +19,7 @@ from .autonomous_approval_channel import (
   AutonomousApprovalDecision,
 )
 from .autonomous_approval_ack import (
+  _AutonomousApprovalAckStore,
   require_durable_autonomous_approval_acknowledgement,
 )
 from .autonomous_control_files import (
@@ -28,7 +29,6 @@ from .autonomous_control_files import (
   append_open_json_record,
   fsync_owned_file_directory,
   iter_closed_json_records,
-  require_appendable_owned_file,
 )
 from .autonomous_control_contract import (
   AUTONOMOUS_OPERATOR_AGGREGATE_BYTES_LIMIT,
@@ -39,6 +39,7 @@ from .autonomous_control_contract import (
 from .autonomous_launch_envelope import AutonomousControlAuthority
 from .claim_signing_authority import GatewayClaimSigningAuthority
 from .capability_binding import CredentialHandle
+from .session import GatewaySession
 from .autonomous_event_channel import (
   AutonomousEventRecord,
   ReceivedAutonomousEventStream,
@@ -47,8 +48,8 @@ from .autonomous_runner_claims import (
   _AGENT_API_CLAIM_AUDIENCE as _AGENT_API_CLAIM_AUDIENCE,
   _AGENT_API_CLAIM_ENV_VARS as _AGENT_API_CLAIM_ENV_VARS,
   _AGENT_API_CLAIM_TTL_SECONDS_DEFAULT as _AGENT_API_CLAIM_TTL_SECONDS_DEFAULT,
-  get_agent_api_claim_ttl_seconds as get_agent_api_claim_ttl_seconds,  # noqa: F401 - compatibility alias
-  sign_user_claim as sign_user_claim,  # noqa: F401 - compatibility alias
+  get_agent_api_claim_ttl_seconds as get_agent_api_claim_ttl_seconds,
+  sign_user_claim as sign_user_claim,
 )
 from .autonomous_runner_state import (
   AUTONOMOUS_TERMINAL_STATES,
@@ -79,6 +80,7 @@ from .autonomous_runner_start import (
   AutonomousRegistryStartMixin,
 )
 from .autonomous_run_lock import AutonomousRunMutationLock
+from .skill_limits import AutonomousSkillAdmissionPolicyResolver
 from .ui_blocks_metrics import record as record_package_counter
 
 _STATUS_TAIL_LINES = 40
@@ -86,9 +88,6 @@ _POST_EXIT_SETTLE_SECONDS = 5.0
 _AUTONOMOUS_PROFILE_NAME_RE = _runner_commands._AUTONOMOUS_PROFILE_NAME_RE
 _LOGGER = logging.getLogger(__name__)
 _APPROVAL_DECISION_AUTONOMOUS_STATES = {"running", "approval_pending", "remediating"}
-
-SkillResumeAllowedResolver = Callable[[str], bool]
-
 
 def _required_control_text(
   value: Any,
@@ -135,22 +134,6 @@ def _control_endpoint_identity(
       "autonomous control append endpoint does not match signed authority"
     )
   return path, expected_device, expected_inode
-
-
-def _require_control_append_endpoint(
-  record: AutonomousTask,
-  *,
-  endpoint: str,
-) -> None:
-  path, expected_device, expected_inode = _control_endpoint_identity(
-    record,
-    endpoint=endpoint,
-  )
-  require_appendable_owned_file(
-    path,
-    expected_device=expected_device,
-    expected_inode=expected_inode,
-  )
 
 
 def _control_record_snapshot(
@@ -237,6 +220,33 @@ def _record_owner_user_id(record: AutonomousTask) -> str:
   return owner_user_id
 
 
+@runtime_checkable
+class _ReplaySeedUserEventBus(Protocol):
+  async def seed_replay_buffer(
+    self,
+    user_id: str,
+    control_run_id: str,
+    events: list[dict],
+    *,
+    terminated: bool = False,
+  ) -> int: ...
+
+
+class _AutonomousUserEventBus(Protocol):
+  async def publish(
+    self,
+    user_id: str,
+    control_run_id: str,
+    event: dict,
+  ) -> None: ...
+
+  async def cleanup_run(
+    self,
+    user_id: str,
+    control_run_id: str,
+  ) -> None: ...
+
+
 class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMixin):
   def __init__(
     self,
@@ -246,15 +256,24 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     python_executable: str | None = None,
     log_dir: Path | None = None,
     max_running: int = 2,
-    user_event_bus: Any | None = None,
-    approval_store: Any | None = None,
+    user_event_bus: _AutonomousUserEventBus | None = None,
+    approval_store: _AutonomousApprovalAckStore | None = None,
+    approval_policy: Any | None = None,
     service_provider_handles: Mapping[str, CredentialHandle] | None = None,
     autonomous_capability_binding_resolver: (
       AutonomousCapabilityBindingResolver | None
     ) = None,
-    skill_resume_allowed_resolver: SkillResumeAllowedResolver | None = None,
+    autonomous_skill_admission_policy_resolver: (
+      AutonomousSkillAdmissionPolicyResolver | None
+    ) = None,
     claim_signing_authority: (
       GatewayClaimSigningAuthority | None
+    ) = None,
+    autonomous_session_token_issuer: (
+      Callable[[GatewaySession], str] | None
+    ) = None,
+    autonomous_session_expirer: (
+      Callable[[str], Awaitable[None]] | None
     ) = None,
     owner_run_limit_resolver: Callable[[str, int], int | None] = (
       resolve_autonomous_owner_run_limit
@@ -266,7 +285,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     self._log_dir = (log_dir or Path("~/.cache/agent-gateway/autonomous").expanduser()).expanduser()
     self._max_running = max_running
     self._owner_run_limit_resolver = owner_run_limit_resolver
-    self._user_event_bus = user_event_bus
+    self._user_event_bus: _AutonomousUserEventBus | None = user_event_bus
     if approval_store is not None:
       required_store_methods = (
         "get",
@@ -281,16 +300,21 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
           "approval_store does not implement autonomous delivery authority"
         )
     self._approval_store = approval_store
+    self._approval_policy = approval_policy
     self._service_provider_handles = dict(service_provider_handles or {})
     self._autonomous_capability_binding_resolver = (
       autonomous_capability_binding_resolver
     )
     if (
-      skill_resume_allowed_resolver is not None
-      and not callable(skill_resume_allowed_resolver)
+      autonomous_skill_admission_policy_resolver is not None
+      and not callable(autonomous_skill_admission_policy_resolver)
     ):
-      raise TypeError("skill_resume_allowed_resolver must be callable or None")
-    self._skill_resume_allowed_resolver = skill_resume_allowed_resolver
+      raise TypeError(
+        "autonomous_skill_admission_policy_resolver must be callable or None"
+      )
+    self._autonomous_skill_admission_policy_resolver = (
+      autonomous_skill_admission_policy_resolver
+    )
     if (
       claim_signing_authority is not None
       and type(claim_signing_authority)
@@ -300,6 +324,22 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
         "claim_signing_authority must be exact"
       )
     self._claim_signing_authority = claim_signing_authority
+    if (autonomous_session_token_issuer is None) != (
+      autonomous_session_expirer is None
+    ):
+      raise ValueError(
+        "autonomous session token issuer and expirer must be configured together"
+      )
+    if autonomous_session_token_issuer is not None and not callable(
+      autonomous_session_token_issuer
+    ):
+      raise TypeError("autonomous session token issuer must be callable")
+    if autonomous_session_expirer is not None and not callable(
+      autonomous_session_expirer
+    ):
+      raise TypeError("autonomous session expirer must be callable")
+    self._autonomous_session_token_issuer = autonomous_session_token_issuer
+    self._autonomous_session_expirer = autonomous_session_expirer
     self._tasks: dict[str, AutonomousTask] = {}
     self.run_mutation_lock = AutonomousRunMutationLock(self._log_dir)
     self._seq = self._initial_task_seq()
@@ -308,7 +348,25 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     self._cleanup_uncommitted_spill_starts()
     self.rehydrate()
 
-  def set_user_event_bus(self, user_event_bus: Any | None) -> None:
+  async def _expire_autonomous_gateway_session(
+    self,
+    record: AutonomousTask,
+  ) -> None:
+    expirer = self._autonomous_session_expirer
+    if expirer is None:
+      return
+    try:
+      await expirer(record.session_id)
+    except Exception:
+      _LOGGER.exception(
+        "Autonomous gateway session expiry failed for %s",
+        record.task_id,
+      )
+
+  def set_user_event_bus(
+    self,
+    user_event_bus: _AutonomousUserEventBus | None,
+  ) -> None:
     self._user_event_bus = user_event_bus
 
   def _next_task_id(self) -> str:
@@ -328,6 +386,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     pack: str | None = None,
     deliver: bool = True,
     ticker: str | None = None,
+    research_file_id: int | None = None,
     max_budget_usd: float | None = None,
   ) -> list[str]:
     return _runner_commands.build_autonomous_cmd(
@@ -340,6 +399,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
       deliver=deliver,
       context=context,
       ticker=ticker,
+      research_file_id=research_file_id,
       max_budget_usd=max_budget_usd,
       normalize_autonomous_profile_func=normalize_autonomous_profile,
     )
@@ -380,9 +440,9 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
   ) -> None:
     if self._user_event_bus is None:
       return
-    seed = getattr(self._user_event_bus, "seed_replay_buffer", None)
-    if not callable(seed):
+    if not isinstance(self._user_event_bus, _ReplaySeedUserEventBus):
       return
+    seed = self._user_event_bus.seed_replay_buffer
     if strict:
       await seed(
         _record_owner_user_id(record),
@@ -747,13 +807,45 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
           if result.event.get("type") == (
             "approval_delivery_acknowledged"
           ):
+            store = self._approval_store
+            if store is None:
+              raise RuntimeError(
+                "approval_delivery_acknowledged violated the spawn invariant: "
+                "the approval channel requires an approval store"
+              )
             async with record.approval_decision_lock:
               await (
                 require_durable_autonomous_approval_acknowledgement(
-                  store=self._approval_store,
+                  store=store,
                   record=record,
                   event=result.event,
                 )
+              )
+          elif (
+            result.event.get("type") == "tool_approval_request"
+            and record.approval_channel is not None
+          ):
+            # The delegated route's ledger writer, keyed on the run's route:
+            # the channel exists exactly when this parent owns the ledger. The
+            # durable row must exist before the frame is published, because
+            # that is when an operator can list and vote on it. A failure here
+            # fails the run loudly rather than dropping a request the child is
+            # waiting on.
+            if result.event.get("durable_request") is None:
+              raise RuntimeError(
+                "delegated autonomous approval request is missing its "
+                "durable projection"
+              )
+            from .control_plane.autonomous_approval_delivery import (
+              create_delegated_autonomous_approval,
+            )
+
+            async with record.approval_decision_lock:
+              await create_delegated_autonomous_approval(
+                store=self._approval_store,
+                policy=self._approval_policy,
+                record=record,
+                event=result.event,
               )
           projected_event = await self._record_and_publish_event(
             record,
@@ -1057,6 +1149,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
         )
       finally:
         record.claim_broker = None
+    await self._expire_autonomous_gateway_session(record)
     if record.exit_code is None and record.proc is not None:
       observed_returncode = record.proc.returncode
       if isinstance(observed_returncode, int):
@@ -1169,7 +1262,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
         elif task is channel_task:
           channel_settled = True
           try:
-            channel_task.result()
+            task.result()
           except BaseException as exc:
             if channel_error is None:
               channel_error = exc
@@ -1315,6 +1408,8 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
           cleanup_error = exc
       finally:
         record.claim_broker = None
+
+    await self._expire_autonomous_gateway_session(record)
 
     record.exit_code = exit_code
     if self._is_active_process_state(record):

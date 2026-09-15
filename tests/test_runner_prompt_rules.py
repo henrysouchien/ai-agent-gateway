@@ -119,4 +119,4 @@ def test_messages_detect_tool_only_turn_instruction_in_any_message_content() -> 
     )
     is True
   )
-  assert messages_require_tool_only_turns([{"role": "user", "content": "ordinary"}, "bad"]) is False
+  assert messages_require_tool_only_turns([{"role": "user", "content": "ordinary"}, "bad"]) is False  # pyright: ignore[reportArgumentType]  # negative: non-dict message ignored

@@ -60,6 +60,7 @@ def test_tool_result_context_defaults_are_optional() -> None:
   ctx = ToolResultContext(
     tool_name="lookup",
     tool_input={"symbol": "MSFT"},
+    redacted_tool_input={"symbol": "MSFT"},
     result={"ok": True},
     error=None,
     duration_ms=12,
@@ -79,6 +80,7 @@ def test_tool_result_context_carries_trusted_routing_provider() -> None:
   ctx = ToolResultContext(
     tool_name="fetch_financials",
     tool_input={"symbol": "MSFT"},
+    redacted_tool_input={"symbol": "MSFT"},
     result={"provider_id": "spoofed"},
     error=None,
     duration_ms=12,

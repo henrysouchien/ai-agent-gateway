@@ -18,6 +18,7 @@ from typing import Any, AsyncIterator, Callable, Iterable, Literal, overload
 import fcntl
 
 from .agent_session_log_cache import ActiveFileIdentity, ActiveFileOffsetCache
+from .agent_session_log_layout import AgentSessionLogLayoutError, validate_v2_stream_path
 from . import agent_session_log_sidecars as _sidecar_helpers
 from . import agent_session_log_rotation as _rotation_helpers
 from .agent_session_log_records import (
@@ -230,7 +231,7 @@ def _normalized_log_path_for_lease(
     raise AgentSessionLogEnumerationError(
       "durable session-log lease requires an exact absolute log path"
     )
-  path = _absolute_lexical_path(raw_path)
+  path = _absolute_lexical_path(os.fspath(raw_path))
   if path.name in {"", ".", ".."}:
     raise AgentSessionLogEnumerationError(
       "durable session-log lease requires an exact absolute log path"
@@ -562,9 +563,15 @@ def _validate_segment_files_at(
       if not child_name.endswith(".jsonl"):
         continue
       if _SEGMENT_FILE_RE.fullmatch(child_name) is None:
-        raise AgentSessionLogEnumerationError(
-          "durable session-log segment filename is invalid"
+        # Not a segment: only the writer in this module names segments
+        # (per _SEGMENT_FILE_RE); a foreign .jsonl must not refuse the
+        # enumeration of every valid segment.
+        log.warning(
+          "durable session-log segments directory contains a foreign"
+          " .jsonl file %r; ignoring it",
+          child_name,
         )
+        continue
       child_info = os.stat(
         child_name,
         dir_fd=descriptor,
@@ -596,6 +603,8 @@ def _canonical_idempotent_event(
 
 class AgentSessionLog:
   """Durable JSONL-backed event log for one `(user_id, agent_id)` pair."""
+  _max_active_bytes: int | None
+
 
   def __init__(
     self,
@@ -632,7 +641,7 @@ class AgentSessionLog:
       else path
     )
     assert raw_path is not None
-    self.path = _absolute_lexical_path(raw_path)
+    self.path = _absolute_lexical_path(os.fspath(raw_path))
     self.segments_dir = self.path.with_name(f"{self.path.stem}.segments")
     self.manifest_path = self.segments_dir / "manifest.json"
     self.write_lease_path = self.path.with_name(f"{self.path.name}.write_lease")
@@ -1334,17 +1343,11 @@ class AgentSessionLog:
           handle.seek(0, os.SEEK_END)
           file_size = handle.tell()
           latest_seq = self._latest_seq_for_append(handle)
-          needs_separator = False
-          if file_size > 0:
-            handle.seek(file_size - 1)
-            needs_separator = handle.read(1) != b"\n"
-
           seq = latest_seq + 1
           timestamp = time.time()
           entry = LogEntry(seq=seq, timestamp=timestamp, event=event_payload)
-          prefix = b"\n" if needs_separator else b""
-          line_offset = file_size + len(prefix)
-          payload = prefix + self._encode_entry(entry)
+          line_offset = file_size
+          payload = self._encode_entry(entry)
 
           handle.seek(0, os.SEEK_END)
           handle.write(payload)
@@ -1592,7 +1595,7 @@ class AgentSessionLog:
         "durable session-log current sequence is invalid"
       )
     if (
-      type(timestamp) not in {int, float}
+      (type(timestamp) is not int and type(timestamp) is not float)
       or not math.isfinite(timestamp)
     ):
       raise AgentSessionLogCurrentIntegrityError(
@@ -1803,10 +1806,17 @@ class AgentSessionLog:
     return value
 
   def _logical_stream_id(self) -> str:
-    # ``self.path`` is already an absolute lexical path whose directory chain
-    # was descriptor-bound at construction. Re-resolving it would re-enter
-    # mutable ambient ancestors.
-    return str(self.path)
+    if not hasattr(self, "_logical_stream_identity"):
+      # V2 selection validates this sidecar against the authenticated namespace.
+      # Preserve its creation-time lineage across moves; only self.path is I/O
+      # authority. Cache the stable identity, not the changing active generation.
+      base = self._load_sidecar_payload()
+      self._logical_stream_identity = (
+        str(base["logical_stream_id"])
+        if base is not None and base.get("storage_layout") == 2
+        else str(self.path)
+      )
+    return self._logical_stream_identity
 
   def _stream_hash(self) -> str:
     return _sidecar_helpers.stream_hash(logical_stream_id_fn=self._logical_stream_id)
@@ -2583,9 +2593,14 @@ class AgentSessionLog:
       if not name.endswith(".jsonl"):
         continue
       if _SEGMENT_FILE_RE.fullmatch(name) is None:
-        raise AgentSessionLogStorageSecurityError(
-          "durable session-log segment filename is invalid"
+        # Not a segment (writer-owned name grammar); ignore with a log
+        # instead of refusing the whole log over one foreign file.
+        log.warning(
+          "durable session-log segments directory contains a foreign"
+          " .jsonl file %r; ignoring it",
+          name,
         )
+        continue
       path = self.segments_dir / name
       opened = self._open_segment_file(path)
       assert opened is not None
@@ -2759,11 +2774,28 @@ class AgentSessionLog:
       "rotated_from_source_id",
       "rotated_from_file_identity",
     )
+    if sidecar.get("storage_layout") == 2:
+      try:
+        validate_v2_stream_path(
+          sidecar.get("rotated_from_path"),
+          active=self.path,
+          field_name="rotated_from_path",
+        )
+      except AgentSessionLogLayoutError as exc:
+        raise AgentSessionLogStorageSecurityError(
+          "durable session-log retirement rotation locator is invalid"
+        ) from exc
+    elif sidecar.get("rotated_from_path") != self._logical_stream_id():
+      raise AgentSessionLogStorageSecurityError(
+        "durable session-log retirement rotation locator contradicts its stream"
+      )
     if (
       sidecar.get("schema_version") != 2
       or sidecar.get("file_role") != "segment"
       or sidecar.get("logical_stream_id") != self._logical_stream_id()
-      or sidecar.get("rotated_from_path") != self._logical_stream_id()
+      or descriptor.get("rotated_from_path") not in {
+        sidecar.get("rotated_from_path"), f"../{self.path.name}",
+      }
       or sidecar.get("active_generation") != generation
       or any(
         not self._json_values_match(sidecar.get(key), descriptor.get(key))
@@ -3105,20 +3137,21 @@ class AgentSessionLog:
     path = self._segment_path_from_manifest(descriptor.get("path"))
     filename_parts = self._segment_filename_parts(path)
     identity = descriptor.get("rotated_from_file_identity")
+    descriptor_bytes = descriptor.get("bytes")
     if (
       filename_parts is None
       or descriptor.get("segment_id") != filename_parts[0]
       or descriptor.get("first_seq") != filename_parts[1]
       or descriptor.get("last_seq") != filename_parts[2]
-      or type(descriptor.get("bytes")) is not int
-      or descriptor.get("bytes") < 0
+      or type(descriptor_bytes) is not int
+      or descriptor_bytes < 0
       or not isinstance(identity, Mapping)
       or set(identity) != {"st_dev", "st_ino", "size", "mtime_ns"}
       or any(
         type(identity.get(key)) is not int
         for key in ("st_dev", "st_ino", "size", "mtime_ns")
       )
-      or identity.get("size") != descriptor.get("bytes")
+      or identity.get("size") != descriptor_bytes
     ):
       raise AgentSessionLogStorageSecurityError(
         "durable session-log retirement descriptor identity is invalid"
@@ -3501,10 +3534,62 @@ class AgentSessionLog:
       active_generation=generation,
       rotated_from_file_identity=clean_identity,
     )
+    rotated_from_path = descriptor.get("rotated_from_path")
+    if isinstance(rotated_from_path, str) and Path(rotated_from_path).is_absolute():
+      meta["rotated_from_path"] = rotated_from_path
     self._atomic_write_segments_json(sidecar_path.name, meta)
     return meta
 
+  def _recover_torn_active_tail_locked(self) -> None:
+    """Settle the writer's own unacknowledged tail before repair reads it.
+
+    Appends acknowledge only after a full newline-terminated line has been
+    fsynced, so a non-newline tail is an unacknowledged partial write left
+    by a writer that died mid-append. A complete final line missing only
+    its terminator is adopted by terminating it; torn bytes are truncated
+    away so neither rotation nor strict current reads inherit ambiguous
+    source bytes.
+    """
+
+    opened = self._open_active_file(writable=True)
+    assert opened is not None
+    handle, _info, _created = opened
+    with handle:
+      file_size = handle.seek(0, os.SEEK_END)
+      if file_size == 0:
+        return
+      handle.seek(file_size - 1)
+      if handle.read(1) == b"\n":
+        return
+      line_start = 0
+      scan_end = file_size
+      while scan_end > 0:
+        read_size = min(_REVERSE_SCAN_CHUNK_SIZE, scan_end)
+        scan_start = scan_end - read_size
+        handle.seek(scan_start)
+        newline = handle.read(read_size).rfind(b"\n")
+        if newline >= 0:
+          line_start = scan_start + newline + 1
+          break
+        scan_end = scan_start
+      handle.seek(line_start)
+      fragment = handle.read(file_size - line_start)
+      try:
+        self._parse_entry_current_strict(fragment)
+      except AgentSessionLogCurrentIntegrityError:
+        handle.truncate(line_start)
+        log.warning(
+          "Truncated %d torn unacknowledged tail bytes in %s",
+          file_size - line_start,
+          self.path,
+        )
+      else:
+        handle.write(b"\n")
+      handle.flush()
+      os.fsync(handle.fileno())
+
   def _repair_manifest_locked(self) -> None:
+    self._recover_torn_active_tail_locked()
     segment_paths = list(self._safe_segment_paths())
     segment_path_set = set(segment_paths)
     manifest = self._load_manifest()

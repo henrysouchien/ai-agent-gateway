@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
 import asyncio
 import json
 import logging
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from fastapi import HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
+from fastapi.routing import APIRoute
 
 from agent_gateway.auth import AuthConfig, ResolverResult
+from agent_gateway.capability_execution import BoundCapabilityExecution
 from agent_gateway.capability_binding import CredentialHandle
 from agent_gateway.model_registry import (
   CAPABILITY_IDS,
@@ -19,11 +23,11 @@ from agent_gateway.model_registry import (
   INITIAL_MODEL_SELECTION_POLICY,
 )
 from agent_gateway.control_plane.runs_chat_helpers import _finalize_control_chat_task
-from agent_gateway.control_run_lifecycle import (
-  is_control_run_resumable_state,
-  is_control_run_terminal_state,
-)
+from agent_gateway.control_run_lifecycle import is_control_run_terminal_state
 from agent_gateway.event_log import EventLog
+from agent_gateway.mcp_client import McpClientManager
+from agent_gateway.runner import AgentRunner
+from agent_gateway.tool_dispatcher import ToolDispatcher
 from agent_gateway.server import (
   ChatMessage,
   ChatRequest,
@@ -65,58 +69,91 @@ def _test_gateway_config(**kwargs: Any) -> GatewayServerConfig:
   )
 
 
-class _EchoTurnRunner:
-  def __init__(self, event_log: EventLog, capability_execution: Any) -> None:
-    self._event_log = event_log
-    self.capability_execution = capability_execution
+class _TestTurnRunner(AgentRunner):
+  def __init__(
+    self,
+    event_log: EventLog,
+    session_id: str,
+    started_at: float,
+    capability_execution: BoundCapabilityExecution,
+  ) -> None:
+    super().__init__(
+      event_log=event_log,
+      dispatcher=ToolDispatcher(
+        mcp_client=McpClientManager(config_path=None),
+        local_tool_handlers={},
+        event_log=event_log,
+        session_id=session_id,
+      ),
+      session_id=session_id,
+      capability_execution=capability_execution,
+      started_at=started_at,
+      user_id="test-user",
+      rate_table_version="test",
+      billing_mode="byok",
+      channel="tui",
+    )
 
+
+class _EchoTurnRunner(_TestTurnRunner):
   async def run(
     self,
-    *,
     messages: list[dict[str, Any]],
-    system_prompt: str | None = None,
+    system_prompt: str | list[tuple[str, bool]] | None = None,
     max_turns: int | None = None,
+    *,
+    resume_initial_messages: list[dict[str, Any]] | None = None,
   ) -> None:
-    _ = system_prompt, max_turns
+    _ = system_prompt, max_turns, resume_initial_messages
     last_user = next((message["content"] for message in reversed(messages) if message.get("role") == "user"), "")
-    self._event_log.append({"type": "text_delta", "text": f"echo:{last_user}"})
-    self._event_log.append({
+    self._log.append({"type": "text_delta", "text": f"echo:{last_user}"})
+    self._log.append({
       "type": "stream_complete",
       "terminal_disposition": "completed",
       "usage": {},
     })
 
 
-
-class _FailingTurnRunner:
-  def __init__(self, capability_execution: Any) -> None:
-    self.capability_execution = capability_execution
-
+class _FailingTurnRunner(_TestTurnRunner):
   async def run(
     self,
-    *,
     messages: list[dict[str, Any]],
-    system_prompt: str | None = None,
+    system_prompt: str | list[tuple[str, bool]] | None = None,
     max_turns: int | None = None,
+    *,
+    resume_initial_messages: list[dict[str, Any]] | None = None,
   ) -> None:
-    _ = messages, system_prompt, max_turns
+    _ = messages, system_prompt, max_turns, resume_initial_messages
     raise RuntimeError("provider stream failed")
 
 
-class _HangingTurnRunner:
-  def __init__(self) -> None:
+class _HangingTurnRunner(_TestTurnRunner):
+  def __init__(
+    self,
+    event_log: EventLog,
+    session_id: str,
+    started_at: float,
+    capability_execution: BoundCapabilityExecution,
+  ) -> None:
+    super().__init__(
+      event_log,
+      session_id,
+      started_at,
+      capability_execution,
+    )
     self.started = threading.Event()
     self.cancelled = threading.Event()
     self.disconnected = threading.Event()
 
   async def run(
     self,
-    *,
     messages: list[dict[str, Any]],
-    system_prompt: str | None = None,
+    system_prompt: str | list[tuple[str, bool]] | None = None,
     max_turns: int | None = None,
+    *,
+    resume_initial_messages: list[dict[str, Any]] | None = None,
   ) -> None:
-    _ = messages, system_prompt, max_turns
+    _ = messages, system_prompt, max_turns, resume_initial_messages
     self.started.set()
     try:
       await asyncio.Event().wait()
@@ -130,25 +167,29 @@ class _HangingTurnRunner:
 
 
 class _StreamingHangingTurnRunner(_HangingTurnRunner):
-  def __init__(self, event_log: EventLog) -> None:
-    super().__init__()
-    self._event_log = event_log
-
   async def run(
     self,
-    *,
     messages: list[dict[str, Any]],
-    system_prompt: str | None = None,
+    system_prompt: str | list[tuple[str, bool]] | None = None,
     max_turns: int | None = None,
+    *,
+    resume_initial_messages: list[dict[str, Any]] | None = None,
   ) -> None:
-    _ = messages, system_prompt, max_turns
+    _ = messages, system_prompt, max_turns, resume_initial_messages
     self.started.set()
-    self._event_log.append({"type": "text_delta", "text": "started"})
+    self._log.append({"type": "text_delta", "text": "started"})
     try:
       await asyncio.Event().wait()
     except asyncio.CancelledError:
       self.cancelled.set()
       raise
+
+def _bound_capability_execution(
+  request: ChatRequest,
+) -> BoundCapabilityExecution:
+  capability_execution = request.capability_execution
+  assert capability_execution is not None
+  return capability_execution
 
 
 def _make_app(
@@ -158,18 +199,28 @@ def _make_app(
   on_startup: Any | None = None,
   on_shutdown: Any | None = None,
   credentials_resolver: Any | None = None,
-):
-  async def _build_chat_runtime(*, session, request, channel, auth_manager):
+) -> FastAPI:
+  async def _build_chat_runtime(
+    session: GatewaySession,
+    request: ChatRequest,
+    channel: str | None,
+    auth_manager: AuthManager | None,
+    *,
+    storage_root: Path | None = None,
+  ) -> ChatRuntime:
     _ = session, channel, auth_manager
+    capability_execution = _bound_capability_execution(request)
     if captured_contexts is not None:
       captured_contexts.append(dict(request.context))
     return ChatRuntime(
       system_prompt="system",
-      build_runner=lambda event_log, _sid, _started_at: _EchoTurnRunner(
+      build_runner=lambda event_log, sid, started_at: _EchoTurnRunner(
         event_log,
-        request.capability_execution,
+        sid,
+        started_at,
+        capability_execution,
       ),
-      capability_execution=request.capability_execution,
+      capability_execution=capability_execution,
     )
 
   return create_gateway_app(
@@ -185,7 +236,7 @@ def _make_app(
   )
 
 
-def _make_capability_app(captured_requests: list[ChatRequest]):
+def _make_capability_app(captured_requests: list[ChatRequest]) -> FastAPI:
   async def _credentials_resolver(_api_key: str, _request: Any) -> ResolverResult:
     return ResolverResult(
       user_id="alice",
@@ -203,16 +254,26 @@ def _make_capability_app(captured_requests: list[ChatRequest]):
       model_entitled_keys=frozenset(INITIAL_MODEL_REGISTRY.models),
     )
 
-  async def _build_chat_runtime(*, session, request, channel, auth_manager):
+  async def _build_chat_runtime(
+    session: GatewaySession,
+    request: ChatRequest,
+    channel: str | None,
+    auth_manager: AuthManager | None,
+    *,
+    storage_root: Path | None = None,
+  ) -> ChatRuntime:
     _ = session, channel, auth_manager
+    capability_execution = _bound_capability_execution(request)
     captured_requests.append(request)
     return ChatRuntime(
       system_prompt="system",
-      build_runner=lambda event_log, _sid, _started_at: _EchoTurnRunner(
+      build_runner=lambda event_log, sid, started_at: _EchoTurnRunner(
         event_log,
-        request.capability_execution,
+        sid,
+        started_at,
+        capability_execution,
       ),
-      capability_execution=request.capability_execution,
+      capability_execution=capability_execution,
     )
 
   return create_gateway_app(
@@ -228,15 +289,26 @@ def _make_capability_app(captured_requests: list[ChatRequest]):
   )
 
 
-def _make_failing_app():
-  async def _build_chat_runtime(*, session, request, channel, auth_manager):
+def _make_failing_app() -> FastAPI:
+  async def _build_chat_runtime(
+    session: GatewaySession,
+    request: ChatRequest,
+    channel: str | None,
+    auth_manager: AuthManager | None,
+    *,
+    storage_root: Path | None = None,
+  ) -> ChatRuntime:
     _ = session, channel, auth_manager
+    capability_execution = _bound_capability_execution(request)
     return ChatRuntime(
       system_prompt="system",
-      build_runner=lambda _event_log, _sid, _started_at: _FailingTurnRunner(
-        request.capability_execution
+      build_runner=lambda event_log, sid, started_at: _FailingTurnRunner(
+        event_log,
+        sid,
+        started_at,
+        capability_execution,
       ),
-      capability_execution=request.capability_execution,
+      capability_execution=capability_execution,
     )
 
   return create_gateway_app(
@@ -248,8 +320,15 @@ def _make_failing_app():
   )
 
 
-def _make_setup_failing_app():
-  async def _build_chat_runtime(*, session, request, channel, auth_manager):
+def _make_setup_failing_app() -> FastAPI:
+  async def _build_chat_runtime(
+    session: GatewaySession,
+    request: ChatRequest,
+    channel: str | None,
+    auth_manager: AuthManager | None,
+    *,
+    storage_root: Path | None = None,
+  ) -> ChatRuntime:
     _ = session, request, channel, auth_manager
     raise RuntimeError("runtime setup failed")
 
@@ -262,17 +341,39 @@ def _make_setup_failing_app():
   )
 
 
-def _make_hanging_app() -> tuple[Any, _HangingTurnRunner]:
-  runner = _HangingTurnRunner()
+def _make_hanging_app() -> tuple[FastAPI, dict[str, _HangingTurnRunner]]:
+  captured: dict[str, _HangingTurnRunner] = {}
 
-  async def _build_chat_runtime(*, session, request, channel, auth_manager):
+  async def _build_chat_runtime(
+    session: GatewaySession,
+    request: ChatRequest,
+    channel: str | None,
+    auth_manager: AuthManager | None,
+    *,
+    storage_root: Path | None = None,
+  ) -> ChatRuntime:
     _ = session, channel, auth_manager
-    runner.capability_execution = request.capability_execution
+    capability_execution = _bound_capability_execution(request)
+
+    def _build_runner(
+      event_log: EventLog,
+      session_id: str,
+      started_at: float,
+    ) -> _HangingTurnRunner:
+      runner = _HangingTurnRunner(
+        event_log,
+        session_id,
+        started_at,
+        capability_execution,
+      )
+      captured["runner"] = runner
+      return runner
+
     return ChatRuntime(
       system_prompt="system",
-      build_runner=lambda _event_log, _sid, _started_at: runner,
-      disconnect_handler=runner.on_disconnect,
-      capability_execution=request.capability_execution,
+      build_runner=_build_runner,
+      disconnect_handler=lambda: captured["runner"].on_disconnect(),
+      capability_execution=capability_execution,
     )
 
   app = create_gateway_app(
@@ -282,22 +383,34 @@ def _make_hanging_app() -> tuple[Any, _HangingTurnRunner]:
       build_chat_runtime=_build_chat_runtime,
     )
   )
-  return app, runner
+  return app, captured
 
 
-def _make_streaming_hanging_app() -> tuple[Any, dict[str, _StreamingHangingTurnRunner]]:
+def _make_streaming_hanging_app() -> tuple[FastAPI, dict[str, _StreamingHangingTurnRunner]]:
   captured: dict[str, _StreamingHangingTurnRunner] = {}
 
-  async def _build_chat_runtime(*, session, request, channel, auth_manager):
+  async def _build_chat_runtime(
+    session: GatewaySession,
+    request: ChatRequest,
+    channel: str | None,
+    auth_manager: AuthManager | None,
+    *,
+    storage_root: Path | None = None,
+  ) -> ChatRuntime:
     _ = session, channel, auth_manager
+    capability_execution = _bound_capability_execution(request)
 
     def _build_runner(
       event_log: EventLog,
-      _sid: str,
-      _started_at: float,
+      session_id: str,
+      started_at: float,
     ) -> _StreamingHangingTurnRunner:
-      runner = _StreamingHangingTurnRunner(event_log)
-      runner.capability_execution = request.capability_execution
+      runner = _StreamingHangingTurnRunner(
+        event_log,
+        session_id,
+        started_at,
+        capability_execution,
+      )
       captured["runner"] = runner
       return runner
 
@@ -305,7 +418,7 @@ def _make_streaming_hanging_app() -> tuple[Any, dict[str, _StreamingHangingTurnR
       system_prompt="system",
       build_runner=_build_runner,
       disconnect_handler=lambda: captured["runner"].on_disconnect(),
-      capability_execution=request.capability_execution,
+      capability_execution=capability_execution,
     )
 
   app = create_gateway_app(
@@ -325,13 +438,15 @@ def _control_session(client: TestClient, user_id: str) -> dict[str, Any]:
   )
   assert response.status_code == 200, response.text
   payload = response.json()
-  session = client.app.state.auth.session_store.get_session(payload["session_id"])
+  app = client.app
+  assert isinstance(app, FastAPI)
+  session = app.state.auth.session_store.get_session(payload["session_id"])
   assert session is not None
   session.tenant_id = session.tenant_id or _TEST_TENANT_ID
   session.allow_service_for_interactive = True
   session.model_entitled_capabilities = CAPABILITY_IDS
   session.model_entitled_keys = frozenset(INITIAL_MODEL_REGISTRY.models)
-  payload["session_token"] = client.app.state.auth.issue_token(session)
+  payload["session_token"] = app.state.auth.issue_token(session)
   return payload
 
 
@@ -342,13 +457,15 @@ def _chat_session(client: TestClient, user_id: str, *, channel: str = "tui") -> 
   )
   assert response.status_code == 200, response.text
   payload = response.json()
-  session = client.app.state.auth.session_store.get_session(payload["session_id"])
+  app = client.app
+  assert isinstance(app, FastAPI)
+  session = app.state.auth.session_store.get_session(payload["session_id"])
   assert session is not None
   session.tenant_id = session.tenant_id or _TEST_TENANT_ID
   session.allow_service_for_interactive = True
   session.model_entitled_capabilities = CAPABILITY_IDS
   session.model_entitled_keys = frozenset(INITIAL_MODEL_REGISTRY.models)
-  payload["session_token"] = client.app.state.auth.issue_token(session)
+  payload["session_token"] = app.state.auth.issue_token(session)
   return payload
 
 
@@ -759,6 +876,7 @@ def test_chat_stream_body_iterator_close_keeps_dispatch_task_until_session_expir
     )
     token = auth.issue_token(session)
     route = next(route for route in app.routes if getattr(route, "path", None) == "/api/chat")
+    assert isinstance(route, APIRoute)
     request = Request(
       {
         "type": "http",
@@ -779,9 +897,9 @@ def test_chat_stream_body_iterator_close_keeps_dispatch_task_until_session_expir
 
     chunk = await asyncio.wait_for(response.body_iterator.__anext__(), timeout=0.5)
     assert b"text_delta" in chunk
-    close = getattr(response.body_iterator, "aclose", None)
-    assert callable(close)
-    await close()
+    body_iterator = response.body_iterator
+    assert isinstance(body_iterator, AsyncGenerator)
+    await body_iterator.aclose()
 
     await asyncio.sleep(0)
     running = [
@@ -948,7 +1066,6 @@ def test_chat_budget_stop_projects_budget_limited_control_state() -> None:
     state = response.json()["state"]
     assert state == "budget_limited"
     assert is_control_run_terminal_state(state) is True
-    assert is_control_run_resumable_state(state) is False
     # The wire vocabulary is frozen: only the recorded run state is remapped.
     assert logs.status_code == 200, logs.text
     logged = [json.loads(line) for line in logs.json()["log_lines"]]
@@ -1524,8 +1641,43 @@ def test_active_later_chat_turn_overrides_prior_terminal_lifecycle() -> None:
     assert payload["ended_at"] is None
 
 
+def test_get_run_projects_status_while_chat_turn_is_still_running() -> None:
+  app, captured = _make_hanging_app()
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    response = client.post(
+      "/api/control/runs",
+      headers=_headers(control),
+      json={
+        "kind": "chat",
+        "message": "keep running",
+        "channel": "tui",
+        "deadline_sec": 1,
+      },
+    )
+    assert response.status_code == 200, response.text
+    runner = captured["runner"]
+    assert runner.started.is_set()
+    chat_session_id = response.json()["chat_session_id"]
+
+    status = client.get(
+      f"/api/control/runs/{chat_session_id}",
+      headers=_headers(control),
+    )
+
+    assert status.status_code == 200, status.text
+    assert status.json()["state"] == "running"
+    assert runner.cancelled.is_set() is False
+
+    deleted = client.delete(
+      f"/api/control/runs/{chat_session_id}",
+      headers=_headers(control),
+    )
+    assert deleted.status_code == 200, deleted.text
+
+
 def test_delete_running_control_chat_cancels_background_task_and_disconnects() -> None:
-  app, runner = _make_hanging_app()
+  app, captured = _make_hanging_app()
   with TestClient(app) as client:
     control = _control_session(client, "alice")
 
@@ -1540,6 +1692,7 @@ def test_delete_running_control_chat_cancels_background_task_and_disconnects() -
       },
     )
     assert response.status_code == 200, response.text
+    runner = captured["runner"]
     payload = response.json()
     assert payload["run"]["state"] == "running"
     assert runner.started.is_set()
@@ -1565,7 +1718,7 @@ def test_delete_running_control_chat_cancels_background_task_and_disconnects() -
 
 
 def test_listing_elapsed_running_chat_is_read_only_until_explicit_cancel() -> None:
-  app, runner = _make_hanging_app()
+  app, captured = _make_hanging_app()
   with TestClient(app) as client:
     control = _control_session(client, "alice")
 
@@ -1580,6 +1733,7 @@ def test_listing_elapsed_running_chat_is_read_only_until_explicit_cancel() -> No
       },
     )
     assert response.status_code == 200, response.text
+    runner = captured["runner"]
     payload = response.json()
     assert payload["run"]["state"] == "running"
     assert runner.started.is_set()

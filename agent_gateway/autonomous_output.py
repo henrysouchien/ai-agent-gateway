@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Pattern, Sequence
+from typing import Any, Callable, Iterable, Pattern, Sequence
 
 from ._io import _atomic_write_json, _read_json_object
 
@@ -227,8 +227,8 @@ def build_state_payload(
   run_output: RunOutput,
   model_name: str = "",
   briefing_file: str = "",
-  connected_servers: Sequence[str] | None = None,
-  active_servers: Sequence[str] | None = None,
+  connected_servers: Iterable[str] | None = None,
+  active_servers: Iterable[str] | None = None,
   extract_summary_fn: Callable[[str], str] | None = None,
   ensure_string_list_fn: Callable[[Any], list[str]] | None = None,
 ) -> dict[str, Any]:

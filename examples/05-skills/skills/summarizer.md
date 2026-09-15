@@ -1,6 +1,5 @@
 ---
 name: summarizer
-model: claude-sonnet-4-6
 max_turns: 4
 timeout: 120
 ---

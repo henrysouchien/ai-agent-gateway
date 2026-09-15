@@ -167,6 +167,7 @@ def _declared_semantic_requirements(
         name = raw.strip()
         required = True
         binding_modes = ("live_tool",)
+        raw_contracts = ()
       elif isinstance(raw, dict):
         name = str(raw.get("name") or "").strip()
         required = raw.get("required", True)
@@ -186,17 +187,17 @@ def _declared_semantic_requirements(
         raise ValueError("semantic capability requirements must be strings or mappings")
       if not name:
         raise ValueError("semantic capability requirement name must be non-empty")
-      requirement = SemanticCapabilityRequirement(
-        name=name,
-        required=required,
-        binding_modes=binding_modes,
-        compatible_input_contracts=tuple(
+      requirement = SemanticCapabilityRequirement.model_validate({
+        "name": name,
+        "required": required,
+        "binding_modes": binding_modes,
+        "compatible_input_contracts": tuple(
           ContractRef.model_validate(item)
           for item in (
             raw_contracts if isinstance(raw, dict) else ()
           )
         ),
-      )
+      })
       if name in requirements and requirements[name] != requirement:
         raise ValueError(f"conflicting semantic capability requirement: {name}")
       requirements[name] = requirement
@@ -235,17 +236,18 @@ def declared_ceiling_catalog(profile: "SkillProfile") -> PlatformToolCatalog:
     effect = _server_owned_effect(tool_id, server_id, is_local)
     if effect is None:
       continue
-    entries[tool_id] = CatalogToolEntry(
-      tool_id=tool_id,
-      canonical_name=tool_id,
-      effect=effect,
-      server_id=server_id,
-      capability=capability_for_tool(
+    entries[tool_id] = CatalogToolEntry.model_validate({
+      "tool_id": tool_id,
+      "canonical_name": tool_id,
+      "effect": effect,
+      "origin": "local" if is_local else "mcp",
+      "server_id": server_id,
+      "capability": capability_for_tool(
         canonical_name=tool_id,
         server_id=server_id,
         effect=effect,
       ),
-    )
+    })
   return PlatformToolCatalog(
     tools=tuple(entries[name] for name in sorted(entries))
   )
@@ -495,7 +497,6 @@ class SkillProfile:
   max_budget_usd: float | None = None
   max_tokens: int | None = None
   thinking: bool | None = None
-  max_retries: int | None = None
   initial_message: str | None = None
   delivery_label: str | None = None
   agent_callable: bool = False
@@ -781,13 +782,12 @@ def resolve_blocks(content: str, blocks_dir: Path) -> str:
   return working.replace(_ESCAPE_SENTINEL, "{{")
 
 
-def parse_skill_file(path: Path) -> SkillProfile:
-  """Parse a markdown skill file into a `SkillProfile`.
+def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
+  """Parse one skill source snapshot into a `SkillProfile`.
 
   The parser accepts optional YAML frontmatter delimited by `---` and treats the
   remaining markdown body as the skill prompt.
   """
-  text = path.read_text(encoding="utf-8")
   frontmatter, body = _split_frontmatter(text, path=path)
 
   raw_name = frontmatter.pop("name", None)
@@ -838,7 +838,6 @@ def parse_skill_file(path: Path) -> SkillProfile:
   raw_max_tokens = metadata.pop("max_tokens", None)
   raw_thinking = metadata.pop("thinking", None)
   raw_effort = metadata.pop("effort", None)
-  raw_max_retries = metadata.pop("max_retries", None)
   raw_initial_message = metadata.pop("initial_message", None)
   raw_delivery_label = metadata.pop("delivery_label", None)
   raw_mcp_tools = metadata.pop("mcp_tools", None)
@@ -885,11 +884,6 @@ def parse_skill_file(path: Path) -> SkillProfile:
   )
   coerced_effort_level = resolve_effort_pair(effort=raw_effort, thinking=coerced_thinking)
   coerced_effort = coerced_effort_level.value if coerced_effort_level is not None else None
-  coerced_max_retries = _coerce_optional_int(
-    raw_max_retries,
-    field_name="max_retries",
-    path=path,
-  )
   coerced_initial_message = _clean_string(raw_initial_message)
   coerced_delivery_label = _clean_string(raw_delivery_label)
   coerced_agent_callable = _coerce_optional_bool(
@@ -943,7 +937,6 @@ def parse_skill_file(path: Path) -> SkillProfile:
     ("max_budget_usd", coerced_max_budget_usd),
     ("thinking", coerced_thinking),
     ("effort", coerced_effort),
-    ("max_retries", coerced_max_retries),
     ("initial_message", coerced_initial_message),
     ("delivery_label", coerced_delivery_label),
   ]:
@@ -976,7 +969,6 @@ def parse_skill_file(path: Path) -> SkillProfile:
     max_budget_usd=coerced_max_budget_usd,
     max_tokens=coerced_max_tokens,
     thinking=coerced_thinking,
-    max_retries=coerced_max_retries,
     initial_message=coerced_initial_message,
     delivery_label=coerced_delivery_label,
     agent_callable=coerced_agent_callable,
@@ -996,6 +988,12 @@ def parse_skill_file(path: Path) -> SkillProfile:
       path=path,
     ),
   )
+
+
+def parse_skill_file(path: Path) -> SkillProfile:
+  """Read and parse a Markdown skill file into a `SkillProfile`."""
+
+  return parse_skill_source(path.read_text(encoding="utf-8"), path=path)
 
 
 def _warn_agent_description_if_needed(profile: SkillProfile) -> None:
@@ -1045,6 +1043,13 @@ class SkillLoader:
       available_label = ", ".join(available) if available else "(none)"
       raise FileNotFoundError(f"Skill '{name}' not found. Available: {available_label}")
     profile = parse_skill_file(path)
+    _warn_agent_description_if_needed(profile)
+    return profile
+
+  def load_source(self, source: str, *, path: Path) -> SkillProfile:
+    """Parse one caller-owned source snapshot with normal loader warnings."""
+
+    profile = parse_skill_source(source, path=path)
     _warn_agent_description_if_needed(profile)
     return profile
 
@@ -1272,15 +1277,16 @@ class SkillStateStore:
         payload = normalize(deepcopy(payload))
         if not isinstance(payload, dict):
           raise TypeError("normalize must return a dict")
-      requires_backup = raw is not None and (
-        not source_is_object or payload != original
-      )
-      if backup is not None and requires_backup:
-        self._write_backup_once(
-          target=target,
-          backup_name=backup.name,
-          raw=raw,
+      if raw is not None:
+        requires_backup = (
+          not source_is_object or payload != original
         )
+        if backup is not None and requires_backup:
+          self._write_backup_once(
+            target=target,
+            backup_name=backup.name,
+            raw=raw,
+          )
       replacement = mutation(deepcopy(payload))
       if not isinstance(replacement, dict):
         raise TypeError("mutation must return a dict")

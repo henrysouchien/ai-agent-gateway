@@ -4,8 +4,64 @@ import asyncio
 import copy
 import os
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
-from typing import Any, Callable, Mapping, MutableMapping, Sequence
+from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
+
+
+class McpToolCallResult(Protocol):
+  @property
+  def isError(self) -> bool: ...
+
+  @property
+  def content(self) -> object: ...
+
+  @property
+  def structuredContent(self) -> object | None: ...
+
+
+class McpListedTool(Protocol):
+  @property
+  def name(self) -> str: ...
+
+  @property
+  def description(self) -> str | None: ...
+
+  @property
+  def inputSchema(self) -> Mapping[str, object] | None: ...
+
+
+class McpListToolsResult(Protocol):
+  @property
+  def tools(self) -> Sequence[McpListedTool] | None: ...
+
+  @property
+  def nextCursor(self) -> str | None: ...
+
+
+class McpClientSession(Protocol):
+  async def call_tool(
+    self,
+    name: str,
+    arguments: dict[str, object],
+    *,
+    read_timeout_seconds: timedelta,
+    meta: dict[str, object] | None = None,
+  ) -> McpToolCallResult: ...
+
+
+class _McpCallableServerState(Protocol):
+  session: McpClientSession
+
+
+class McpConnectionSession(McpClientSession, Protocol):
+  async def initialize(self) -> object: ...
+
+  async def list_tools(
+    self,
+    *,
+    cursor: str | None = None,
+  ) -> McpListToolsResult: ...
 
 
 @dataclass(frozen=True)
@@ -310,7 +366,7 @@ async def initialize_session_state(
   manager: Any,
   *,
   name: str,
-  session: Any,
+  session: McpConnectionSession,
   exit_contexts: list[Any],
   tool_prefix: str,
   allowed_tools: tuple[str, ...] | None,
@@ -329,6 +385,10 @@ async def initialize_session_state(
     if listed.nextCursor is None:
       break
     cursor = listed.nextCursor
+
+  # Carry audience metadata with the candidate until its catalog is accepted.
+  # It must never enter Anthropic/OpenAI tool definitions.
+  tool_metadata = {str(tool.name): getattr(tool, "meta", None) for tool in tools}
 
   advertised_names = {str(tool.name) for tool in tools}
   if allowed_tools is not None:
@@ -358,13 +418,15 @@ async def initialize_session_state(
     exit_contexts=exit_contexts,
     tool_definitions=tool_definitions,
     tool_names={tool["name"] for tool in tool_definitions},
+    exported_tool_names=frozenset(advertised_names),
+    tool_metadata=tool_metadata,
     tool_prefix=tool_prefix,
   )
 
 
 async def verify_stdio_session_stable(
   manager: Any,
-  session: Any,
+  session: McpConnectionSession,
   runtime: McpConnectionRuntime,
 ) -> None:
   delay = runtime.stdio_connect_stabilize_delay()
@@ -377,6 +439,11 @@ async def verify_stdio_session_stable(
 
 
 __all__ = [
+  "McpClientSession",
+  "McpConnectionSession",
+  "McpListToolsResult",
+  "McpListedTool",
+  "McpToolCallResult",
   "McpConnectionRuntime",
   "build_http_auth",
   "connect",

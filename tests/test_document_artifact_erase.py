@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import errno
 import json
+import sqlite3
 import hashlib
 import os
 from pathlib import Path
@@ -16,6 +18,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway.artifact_sidecar_index import (  # noqa: E402
+  artifact_sidecar_index_path,
   delete_artifact_sidecar_index_rows,
   get_artifact_sidecar_index_row,
   register_skill_artifact_sidecar,
@@ -126,8 +129,6 @@ def _with_file_id(artifact, research_file_id: int):
   return artifact.model_copy(update={"research_file_id": research_file_id})
 
 
-def _open_descriptor_count() -> int:
-  return len(tuple(Path("/dev/fd").iterdir()))
 
 
 def _write_skill_artifact(
@@ -351,6 +352,58 @@ def test_ui_blocks_purge_uses_exact_anchor_with_and_without_index(
   ) is None
 
 
+def test_ui_blocks_purge_erases_despite_own_id_inconsistencies(tmp_path: Path) -> None:
+  """The typed anchor is the erase authority: a disagreeing index row, a
+
+  mismatched envelope id, or corrupt envelope bytes must not pin user data
+  after an erase request."""
+  workspace = tmp_path / "users" / "alice" / "workspace"
+  directory = workspace / "artifacts" / "_ui_blocks"
+  directory.mkdir(parents=True)
+  mismatched_id = "ub_4444444444444444"
+  corrupt_id = "ub_5555555555555555"
+  indexed_id = "ub_6666666666666666"
+  (directory / f"{mismatched_id}.json").write_text(
+    json.dumps({"ui_blocks_id": "ub_9999999999999999"}),
+    encoding="utf-8",
+  )
+  (directory / f"{corrupt_id}.json").write_text("{not-json", encoding="utf-8")
+  (directory / f"{indexed_id}.json").write_text(
+    json.dumps({"ui_blocks_id": indexed_id}),
+    encoding="utf-8",
+  )
+  register_ui_blocks_payload_sidecar(
+    workspace_dir=workspace,
+    user_id="alice",
+    ui_blocks_id=indexed_id,
+    path=directory / f"{indexed_id}.json",
+    session_id="session-1",
+    turn_key="turn-1",
+    emission_index=0,
+    ts=1.0,
+  )
+  with sqlite3.connect(artifact_sidecar_index_path(workspace)) as conn:
+    conn.execute(
+      "UPDATE artifact_sidecar_index SET payload_ref=? WHERE artifact_id=?",
+      ("artifacts/_ui_blocks/other.json", indexed_id),
+    )
+
+  purge_ui_blocks_payloads(
+    workspace,
+    user_id="alice",
+    ui_blocks_ids=(mismatched_id, corrupt_id, indexed_id),
+  )
+
+  for ui_blocks_id in (mismatched_id, corrupt_id, indexed_id):
+    assert not (directory / f"{ui_blocks_id}.json").exists()
+  assert get_artifact_sidecar_index_row(
+    workspace_dir=workspace,
+    artifact_kind="ui_blocks",
+    artifact_id=indexed_id,
+    user_id="alice",
+  ) is None
+
+
 def test_purge_validates_all_targets_before_effects_and_rejects_symlinks(
   tmp_path: Path,
 ) -> None:
@@ -555,14 +608,22 @@ def test_json_fdopen_failure_does_not_leak_descriptor(
     html_content="<p>private</p>",
   )
   sidecar = workspace / "artifacts" / "_html" / "target-html.json"
-  descriptor_count = _open_descriptor_count()
+  read_descriptor: int | None = None
 
-  def fail_fdopen(*_args: Any, **_kwargs: Any) -> None:
+  def fail_fdopen(
+    descriptor: int,
+    *_args: Any,
+    **_kwargs: Any,
+  ) -> None:
+    nonlocal read_descriptor
+    read_descriptor = descriptor
     raise OSError("injected fdopen failure")
 
   monkeypatch.setattr(erase_module.os, "fdopen", fail_fdopen)
-  for _index in range(20):
-    with pytest.raises(OSError, match="injected fdopen failure"):
-      erase_module._read_json_object(sidecar, workspace=workspace)
+  with pytest.raises(OSError, match="injected fdopen failure"):
+    erase_module._read_json_object(sidecar, workspace=workspace)
 
-  assert _open_descriptor_count() == descriptor_count
+  assert read_descriptor is not None
+  with pytest.raises(OSError) as exc_info:
+    os.fstat(read_descriptor)
+  assert exc_info.value.errno == errno.EBADF

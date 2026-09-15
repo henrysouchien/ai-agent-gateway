@@ -10,13 +10,16 @@ from agent_workflow_contracts import (
   AgentExecutionSnapshot,
   CapabilityBind,
   ExecuteTaskDisposition,
+  OrdinaryDelegationTaskRef,
   ToolGrant,
+  ToolGrantEntry,
   canonical_json_bytes,
   sha256_digest,
 )
 from agent_gateway.skills import SkillLoader
 from agent_gateway.execution_snapshot import (
   build_agent_execution_snapshot,
+  provider_tool_definitions_for_grant,
   render_result_instructions,
   resume_agent_execution_snapshot,
 )
@@ -26,6 +29,30 @@ from agent_gateway.sub_agent import (
   seal_admitted_task_payload,
 )
 from agent_gateway.sub_agent_helpers import make_run_agent_tool_def
+
+
+def test_provider_definitions_follow_exact_grant_order_and_require_coverage() -> None:
+  tools = (
+    ToolGrantEntry(tool_id="tool_b", route_id="local", effect="read"),
+    ToolGrantEntry(tool_id="tool_a", route_id="local", effect="read"),
+  )
+  grant = ToolGrant(
+    grant_id="grant:ordered-definitions",
+    tools=tools,
+    digest=sha256_digest([
+      entry.model_dump(mode="json") for entry in tools
+    ]),
+  )
+  definitions = (
+    {"name": "tool_a", "input_schema": {"type": "object"}},
+    {"name": "tool_b", "input_schema": {"type": "object"}},
+  )
+
+  snapshot = provider_tool_definitions_for_grant(definitions, grant=grant)
+
+  assert tuple(item.name for item in snapshot) == ("tool_b", "tool_a")
+  with pytest.raises(ValueError, match="missing for grant: tool_b"):
+    provider_tool_definitions_for_grant(definitions[:1], grant=grant)
 
 
 def _write_operation(path: Path) -> None:
@@ -149,6 +176,7 @@ Explore the admitted question.
     client_timeout_seconds=90,
     max_tokens=64_000,
     cost_observation_threshold_usd=50,
+    provider_tool_definitions=(),
     max_resume_chain_depth=3,
   )
   first = _ordinary_admitted_task_factory(
@@ -156,6 +184,7 @@ Explore the admitted question.
     execution_snapshot=execution_snapshot,
     capability_bindings=(),
     tool_grant=grant,
+    tool_routes=(),
     model_bind=bind,
     result_requirement=requirement,
     objective={
@@ -164,6 +193,7 @@ Explore the admitted question.
     },
     parent_session=None,
   )(SimpleNamespace(task_id="bg_1"))
+  assert isinstance(first.logical_task, OrdinaryDelegationTaskRef)
   resumed = _ordinary_admitted_task_factory(
     operation=operation,
     execution_snapshot=resume_agent_execution_snapshot(
@@ -172,6 +202,7 @@ Explore the admitted question.
     ),
     capability_bindings=(),
     tool_grant=grant,
+    tool_routes=(),
     model_bind=bind,
     result_requirement=requirement,
     objective="Resume the admitted question.",
@@ -183,6 +214,7 @@ Explore the admitted question.
 
   assert isinstance(first.execution_disposition, ExecuteTaskDisposition)
   assert isinstance(resumed.execution_disposition, ExecuteTaskDisposition)
+  assert isinstance(first.objective, dict)
   assert first.objective["reference"] == "../selected/FY2026.md"
   assert first.execution_snapshot is not None
   assert first.execution_snapshot.persisted_methodology_state == {
@@ -227,6 +259,116 @@ Explore the admitted question.
   )
   assert budgeted_task.admitted_task_digest != first.admitted_task_digest
 
+  assert first.schema_version == "1.2"
+  assert first.tool_routes == ()
+
+  v12_payload = first.model_dump(mode="json")
+  v12_payload.pop("admitted_task_digest")
+  v12_payload["schema_version"] = "1.2"
+  v12_payload["tool_routes"] = []
+  v12_task = AdmittedTask.model_validate(
+    seal_admitted_task_payload(dict(v12_payload))
+  )
+  assert v12_task.schema_version == "1.2"
+  assert v12_task.tool_routes == ()
+  assert v12_task.admitted_task_digest == first.admitted_task_digest
+
+  missing_routes = dict(v12_payload)
+  missing_routes.pop("tool_routes")
+  with pytest.raises(ValueError, match="schema 1.2 requires tool routes"):
+    AdmittedTask.model_validate(seal_admitted_task_payload(missing_routes))
+
+  v12_without_definitions = dict(v12_payload)
+  v12_without_definitions["execution_snapshot"] = dict(
+    v12_payload["execution_snapshot"]
+  )
+  v12_without_definitions["execution_snapshot"].pop(
+    "provider_tool_definitions"
+  )
+  with pytest.raises(ValueError, match="schema 1.2 requires provider"):
+    AdmittedTask.model_validate(
+      seal_admitted_task_payload(v12_without_definitions)
+    )
+
+  v11_with_routes = first.model_dump(mode="json")
+  v11_with_routes.pop("admitted_task_digest")
+  v11_with_routes["schema_version"] = "1.1"
+  with pytest.raises(ValueError, match="schema 1.1 cannot carry tool routes"):
+    AdmittedTask.model_validate(seal_admitted_task_payload(v11_with_routes))
+
+  v11_without_definitions = first.model_dump(mode="json")
+  v11_without_definitions.pop("admitted_task_digest")
+  v11_without_definitions["schema_version"] = "1.1"
+  v11_without_definitions.pop("tool_routes")
+  v11_without_definitions["execution_snapshot"].pop(
+    "provider_tool_definitions"
+  )
+  with pytest.raises(ValueError, match="schema 1.1 requires provider"):
+    AdmittedTask.model_validate(
+      seal_admitted_task_payload(v11_without_definitions)
+    )
+
+  v10_payload = first.model_dump(mode="json")
+  v10_payload.pop("admitted_task_digest")
+  v10_payload["schema_version"] = "1.0"
+  v10_payload.pop("tool_routes")
+  v10_payload["execution_snapshot"].pop("provider_tool_definitions")
+  v10_task = AdmittedTask.model_validate(seal_admitted_task_payload(v10_payload))
+  assert v10_task.schema_version == "1.0"
+  assert v10_task.execution_snapshot is not None
+  assert v10_task.execution_snapshot.provider_tool_definitions is None
+
+  v10_with_routes = v10_task.model_dump(mode="json")
+  v10_with_routes.pop("admitted_task_digest")
+  v10_with_routes["tool_routes"] = []
+  with pytest.raises(ValueError, match="schema 1.0 cannot carry tool routes"):
+    AdmittedTask.model_validate(seal_admitted_task_payload(v10_with_routes))
+
+  v10_with_definitions = first.model_dump(mode="json")
+  v10_with_definitions.pop("admitted_task_digest")
+  v10_with_definitions["schema_version"] = "1.0"
+  v10_with_definitions.pop("tool_routes")
+  with pytest.raises(ValueError, match="schema 1.0 cannot carry"):
+    AdmittedTask.model_validate(
+      seal_admitted_task_payload(v10_with_definitions)
+    )
+
+  grant_tools = [
+    {"tool_id": "file_read", "route_id": "local", "effect": "read"},
+    {"tool_id": "web_search", "route_id": "web", "effect": "read"},
+  ]
+  grant_id = "grant:route-coverage"
+  grant_payload = {
+    "kind": "tool_grant",
+    "grant_id": grant_id,
+    "tools": grant_tools,
+    "digest": sha256_digest({"grant_id": grant_id, "tools": grant_tools}),
+  }
+  ordered_payload = dict(v12_payload)
+  ordered_payload["tool_grant"] = grant_payload
+  ordered_payload["tool_grant_digest"] = grant_payload["digest"]
+  ordered_payload["execution_snapshot"] = {
+    **v12_payload["execution_snapshot"],
+    "provider_tool_definitions": [
+      {"definition": {"name": "file_read"}},
+      {"definition": {"name": "web_search"}},
+    ],
+  }
+  ordered_payload["tool_routes"] = [
+    {"tool_id": "file_read", "origin": "local", "server_id": None},
+    {"tool_id": "web_search", "origin": "mcp", "server_id": "server-a"},
+  ]
+  AdmittedTask.model_validate(
+    seal_admitted_task_payload(dict(ordered_payload))
+  )
+
+  reversed_routes = dict(ordered_payload)
+  reversed_routes["tool_routes"] = list(
+    reversed(ordered_payload["tool_routes"])
+  )
+  with pytest.raises(ValueError, match="exact ordered tool grant"):
+    AdmittedTask.model_validate(seal_admitted_task_payload(reversed_routes))
+
 
 @pytest.mark.parametrize(
   "value",
@@ -253,6 +395,7 @@ def test_execution_snapshot_rejects_invalid_budget(
       client_timeout_seconds=1,
       max_tokens=1,
       cost_observation_threshold_usd=None,
+      provider_tool_definitions=(),
       max_resume_chain_depth=0,
       max_budget_usd=value,  # type: ignore[arg-type]
     )

@@ -16,6 +16,7 @@ import pytest
 import agent_gateway.runner as gateway_runner
 import agent_gateway.server as gateway_server
 from agent_gateway.event_log import EventLog
+from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.providers import AnthropicProvider, OpenAIProvider
 from agent_gateway.providers.agent_sdk import AgentSDKConfig, SDK_PINNED_VERSION
 from agent_gateway.providers.base import ModelInfo, ModelProvider, StreamEvent
@@ -25,6 +26,12 @@ from agent_gateway.sdk_runner import AgentSDKRunner
 from agent_gateway.server import ChatRuntime
 from agent_gateway.session import SessionStream
 from agent_gateway.tool_dispatcher import ToolDispatcher
+from agent_gateway.runner_tool_audit import redact_tool_input_for_event
+from agent_gateway.tool_dispatch_classification import (
+  ToolResultSettlement,
+  settle_catalogless_tool_result,
+)
+from agent_gateway.tool_policy_registry import PreparedToolCall
 from starlette.requests import ClientDisconnect
 from tests.capability_execution_test_support import (
   stub_bound_capability_execution,
@@ -252,18 +259,8 @@ def _find_free_port() -> int:
     return int(sock.getsockname()[1])
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
-    return False
-
-  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
-    return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
-
-  def get_tool_definitions(self) -> list[dict[str, Any]]:
-    return []
-
-  def get_server_for_tool(self, _name: str) -> str | None:
-    return None
+def _null_mcp_client() -> McpClientManager:
+  return McpClientManager(inline_servers={})
 
 
 class _TrackingClient:
@@ -321,12 +318,15 @@ class _ObservedAgentRunner(AgentRunner):
     messages: list[dict[str, Any]],
     system_prompt: str | list[tuple[str, bool]] | None = None,
     max_turns: int | None = None,
+    *,
+    resume_initial_messages=None,
   ) -> None:
     try:
       await super().run(
         messages=messages,
         system_prompt=system_prompt,
         max_turns=max_turns,
+        resume_initial_messages=resume_initial_messages,
       )
     except asyncio.CancelledError:
       self.cancelled_calls += 1
@@ -576,6 +576,8 @@ class _HangingDispatcher:
     tool_input: dict[str, Any],
     *,
     call_index: int = 0,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: Any | None = None,
     abort_event: asyncio.Event | None = None,
   ):
     _ = tool_call_id, tool_name, tool_input, call_index
@@ -594,6 +596,32 @@ class _HangingDispatcher:
   def requires_approval(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
     _ = tool_name, tool_input
     return False
+
+  @staticmethod
+  def redact_prepared_tool_input(
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+  ) -> dict[str, Any]:
+    return redact_tool_input_for_event(
+      tool_name,
+      prepared_call.materialize_input(),
+    )
+
+  @staticmethod
+  def settle_tool_result(
+    _tool_name: str,
+    dispatch_entry: Any,
+    result: Any,
+    error: Any,
+    semantic_error: Any = None,
+    **_kwargs: Any,
+  ) -> ToolResultSettlement:
+    return settle_catalogless_tool_result(
+      entry=dispatch_entry,
+      result=result,
+      error=error,
+      semantic_error=semantic_error,
+    )
 
 
 class _ManualAsyncIterator:
@@ -639,16 +667,18 @@ def _install_fake_agent_sdk(monkeypatch: pytest.MonkeyPatch, iterator_factory) -
       self.kwargs = kwargs
 
   module = types.ModuleType("claude_agent_sdk")
-  module.__version__ = SDK_PINNED_VERSION
-  module.HookMatcher = _HookMatcher
-  module.ClaudeAgentOptions = _ClaudeAgentOptions
-  module.query = lambda prompt, options: iterator_factory(prompt, options)
+  module.__dict__.update({
+    "__version__": SDK_PINNED_VERSION,
+    "HookMatcher": _HookMatcher,
+    "ClaudeAgentOptions": _ClaudeAgentOptions,
+    "query": lambda prompt, options: iterator_factory(prompt, options),
+  })
   monkeypatch.setitem(sys.modules, "claude_agent_sdk", module)
 
 
 def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
   return ToolDispatcher(
-    mcp_client=_NullMcpClient(),
+    mcp_client=_null_mcp_client(),
     local_tool_handlers={},
     event_log=event_log or EventLog(),
     session_id="sess-stream-lifecycle",
@@ -914,7 +944,15 @@ def test_no_double_disconnect_firing(make_test_app) -> None:
 def test_on_disconnect_default_no_op() -> None:
   runtime = ChatRuntime(
     system_prompt="test",
-    build_runner=lambda _event_log, _sid, _started_at: None,
+    build_runner=lambda event_log, sid, _started_at: AgentRunner(
+      event_log=event_log,
+      dispatcher=_make_dispatcher(event_log),
+      session_id=sid,
+      capability_execution=_native_execution(),
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    ),
     capability_execution=_native_execution(),
   )
 
@@ -995,7 +1033,15 @@ def test_on_disconnect_idempotent() -> None:
 
   runtime = ChatRuntime(
     system_prompt="test",
-    build_runner=lambda _event_log, _sid, _started_at: None,
+    build_runner=lambda event_log, sid, _started_at: AgentRunner(
+      event_log=event_log,
+      dispatcher=_make_dispatcher(event_log),
+      session_id=sid,
+      capability_execution=_native_execution(),
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    ),
     capability_execution=_native_execution(),
     disconnect_handler=_handler,
   )
@@ -1624,7 +1670,7 @@ def test_credential_refresh_retries_stream_with_new_auth_config(monkeypatch: pyt
     runner = AgentRunner(
       event_log=event_log,
       dispatcher=ToolDispatcher(
-        mcp_client=_NullMcpClient(),
+        mcp_client=_null_mcp_client(),
         local_tool_handlers={},
         event_log=event_log,
         session_id="sess-refresh",
@@ -1700,7 +1746,7 @@ def test_runner_apply_refreshed_auth_config_updates_request_and_runner_config() 
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=ToolDispatcher(
-      mcp_client=_NullMcpClient(),
+      mcp_client=_null_mcp_client(),
       local_tool_handlers={},
       event_log=event_log,
       session_id="sess-refresh",

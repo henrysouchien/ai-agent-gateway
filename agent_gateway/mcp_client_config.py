@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+from enum import Enum
 import os
 import re
 import random
 import shutil
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Final, Literal, Mapping, Sequence
 
 
-UNSET = object()
+class _McpConfigPathUnset(Enum):
+  TOKEN = "unset"
+
+
+McpConfigPathUnset = Literal[_McpConfigPathUnset.TOKEN]
+McpConfigPathInput = Path | str | None | McpConfigPathUnset
+UNSET: Final[McpConfigPathUnset] = _McpConfigPathUnset.TOKEN
 ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 STREAMABLE_HTTP_TYPES = {"streamable-http", "streamable_http", "http", "streamable"}
 SUPPORTED_SERVER_TYPES = {"stdio"} | STREAMABLE_HTTP_TYPES
@@ -49,9 +56,9 @@ STDIO_SHELL_EXEC_ENV_RE = re.compile(
 
 
 def resolve_mcp_config_path(
-  config_path: Path | str | None | object = UNSET,
+  config_path: McpConfigPathInput = UNSET,
   *,
-  unset: object = UNSET,
+  unset: McpConfigPathUnset = UNSET,
   environ: Mapping[str, str] | None = None,
 ) -> Path | None:
   env = os.environ if environ is None else environ
@@ -344,6 +351,8 @@ __all__ = [
   "MCP_STDIO_CONNECT_RETRIES_ENV",
   "MCP_STDIO_CONNECT_STABILIZE_DEFAULT",
   "MCP_STDIO_CONNECT_STABILIZE_ENV",
+  "McpConfigPathInput",
+  "McpConfigPathUnset",
   "MCP_STDIO_RETRYABLE_EXCEPTION_NAMES",
   "MCP_STDIO_RETRYABLE_MESSAGE_MARKERS",
   "STDIO_SHELL_COMMAND_NAMES",

@@ -1,14 +1,18 @@
 import asyncio
 import json
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import sys
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
-from agent_workflow_contracts import (  # noqa: E402
+from agent_workflow_contracts import (
   AgentOperationRef,
   AttemptRef,
   OrdinaryDelegationTaskRef,
@@ -33,13 +37,15 @@ from agent_gateway import (  # noqa: E402
   ToolDispatcher,
 )
 from agent_gateway.capability_execution import BoundCapabilityExecution  # noqa: E402
+from agent_gateway.commercial_usage import CommercialUsageProducer  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.multi_user.billing import (  # noqa: E402
   SessionUsageSummary,
   UsageEvent,
   _UsageAggregator,
 )
-from agent_gateway.providers import CostEstimate, StreamEvent  # noqa: E402
+from agent_gateway.mcp_client import McpClientManager  # noqa: E402
+from agent_gateway.providers import CodexProvider, CostEstimate, OpenAIProvider, StreamEvent  # noqa: E402
 from agent_gateway.runner_usage import (  # noqa: E402
   apply_message_start_usage,
   apply_usage_update,
@@ -55,6 +61,8 @@ from agent_gateway.runner_usage import (  # noqa: E402
   usage_has_tokens,
   usage_snapshot,
 )
+from agent_gateway.runner_budget import CostAccumulator  # noqa: E402
+from agent_gateway.task_registry import TaskRegistry, TaskState  # noqa: E402
 from tests.capability_execution_test_support import (  # noqa: E402
   stub_bound_capability_execution,
 )
@@ -72,7 +80,7 @@ def test_runner_usage_wrappers_resolve_parent_module_helpers(monkeypatch: pytest
   runner._full_session_id = "sess"
   runner._request_id = "req"
   runner._parent_turn_id = "turn"
-  runner._provider = SimpleNamespace(name="stub")
+  runner._provider = _UsageProvider()
   runner._rate_table_version = "v1"
   runner._billing_mode = "metered"
   runner._channel = "web"
@@ -85,6 +93,7 @@ def test_runner_usage_wrappers_resolve_parent_module_helpers(monkeypatch: pytest
   )
 
   event = AgentRunner._build_usage_event(runner, model="model", usage_totals={"input_tokens": 1})
+  assert isinstance(event, dict)
 
   assert event["patched"]["timestamp"] == 42.0
   assert event["patched"]["cost_total"] == 0.5
@@ -221,7 +230,7 @@ def _usage_event() -> UsageEvent:
     billing_mode="metered",
     channel="web",
     provider=bind.provider,
-    capability_bind=bind.receipt(),
+    capability_bind=bind.to_json(),
     provider_reported_model=None,
   )
 
@@ -243,7 +252,7 @@ def _session_summary() -> SessionUsageSummary:
     ended_at=123.0,
     model="claude-sonnet-4-6",
     provider="stub",
-    capability_bind=bind.receipt(),
+    capability_bind=bind.to_json(),
     usage_event_count=1,
     usage_event_ids=("usage-summary-event-1",),
     rate_table_version="2026-04-08",
@@ -261,15 +270,8 @@ class _RecordingUsageAggregator:
     return self.recorded
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
-    return False
-
-  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
-    return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
-
-  def get_tool_definitions(self) -> list[dict[str, Any]]:
-    return []
+def _null_mcp_client() -> McpClientManager:
+  return McpClientManager(config_path=None)
 
 
 class _UsageProvider(ModelProvider):
@@ -693,7 +695,7 @@ def test_build_usage_event_helper_sets_billing_fields() -> None:
       "output_tokens": 50,
       "cache_read_input_tokens": 10,
       "cache_creation_input_tokens": 5,
-      "capability_bind": bind.receipt(),
+      "capability_bind": bind.to_json(),
       "provider_reported_model": None,
     },
     cost_total=0.25,
@@ -709,7 +711,7 @@ def test_build_usage_event_helper_sets_billing_fields() -> None:
   assert event.timestamp == 123.5
   assert event.model == "claude-sonnet-4-6"
   assert event.provider == "stub"
-  assert event.capability_bind == bind.receipt()
+  assert event.capability_bind == bind.to_json()
   assert event.provider_reported_model is None
   assert event.input_tokens == 100
   assert event.output_tokens == 50
@@ -876,8 +878,8 @@ def test_reconciliation_failure_is_nonfatal_observable_and_summary_still_runs() 
   summaries = []
   metrics = []
 
-  class Producer:
-    async def reconcile(self, summary):
+  class Producer(CommercialUsageProducer):
+    async def reconcile(self, summary: SessionUsageSummary) -> None:
       raise RuntimeError("comparison failed")
 
   _run(call_session_summary_hook(
@@ -885,7 +887,12 @@ def test_reconciliation_failure_is_nonfatal_observable_and_summary_still_runs() 
     _session_summary(),
     log_session_id="sess-parent",
     logger=logging.getLogger("test_runner_on_usage"),
-    commercial_usage_producer=Producer(),
+    commercial_usage_producer=Producer(
+      enabled=False,
+      claim=None,
+      lineage=None,
+      sink=None,
+    ),
     emit_metric=lambda name, value: metrics.append((name, value)),
   ))
 
@@ -944,7 +951,7 @@ def _make_dispatcher(
   event_log: EventLog | None = None,
 ) -> ToolDispatcher:
   return ToolDispatcher(
-    mcp_client=_NullMcpClient(),
+    mcp_client=_null_mcp_client(),
     local_tool_handlers={},
     event_log=event_log or EventLog(),
     session_id="sess-parent",
@@ -1045,7 +1052,7 @@ def test_runner_build_usage_event_preserves_timestamp_and_cost_delegates(
       "output_tokens": 50,
       "cache_read_input_tokens": 10,
       "cache_creation_input_tokens": 5,
-      "capability_bind": runner.capability_execution.bind.receipt(),
+      "capability_bind": runner.capability_execution.bind.to_json(),
       "provider_reported_model": None,
     },
   )
@@ -1074,7 +1081,7 @@ def test_no_tool_final_answer_completes_in_one_provider_request_without_guard() 
     durable_events.append(dict(event))
     return SimpleNamespace(seq=len(durable_events))
 
-  runner._append_durable_event = _append_durable_event  # type: ignore[method-assign]
+  runner._append_durable_event = _append_durable_event
 
   _run(runner.run(messages=[{"role": "user", "content": "compare margin bps"}]))
 
@@ -1125,6 +1132,127 @@ def test_on_usage_fires_once_per_turn_with_usage_event_fields() -> None:
   assert event.billing_mode == "metered"
   assert event.channel == "web"
   assert event.provider == "stub"
+
+
+@pytest.mark.parametrize("budget", [None, 4.0])
+def test_session_cost_sums_request_tiers_instead_of_repricing_total_tokens(budget) -> None:
+  priced_provider = OpenAIProvider()
+
+  class _TieredUsageProvider(_UsageProvider):
+    name = "openai"
+
+    def __init__(self) -> None:
+      self.calls = 0
+
+    def get_model_info(self, model: str) -> ModelInfo:
+      return priced_provider.get_model_info(model)
+
+    async def stream(self, client: Any, params: dict[str, Any]):
+      self.calls += 1
+      yield StreamEvent(type="message_start", input_tokens=150_000)
+      yield StreamEvent(type="text_delta", text="response")
+      yield StreamEvent(type="text_end", raw_block={"type": "text", "text": "response"})
+      yield StreamEvent(type="usage_update", output_tokens=1_000)
+      yield StreamEvent(type="message_end", stop_reason="max_tokens" if self.calls == 1 else "end_turn")
+
+  usage_events: list[UsageEvent] = []
+  event_log = EventLog()
+  provider = _TieredUsageProvider()
+  accumulator = CostAccumulator(budget) if budget is not None else None
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log),
+    session_id="sess-request-tiers",
+    capability_execution=stub_bound_capability_execution(
+      provider=provider, model="gpt-6-astra", effort="low", auth_config={"api_key": "k"},
+    ),
+    _cost_accumulator=accumulator,
+    on_usage=usage_events.append,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="2026-09-11",
+  )
+  _run(runner.run(messages=[{"role": "user", "content": "continue until complete"}]))
+
+  assert [event.cost_usd for event in usage_events] == pytest.approx([1.55, 1.55])
+  completion = next(entry.event for entry in event_log.entries if entry.event.get("type") == "stream_complete")
+  assert completion["usage"]["estimated_cost"] == pytest.approx(3.10)
+  assert completion["terminal_disposition"] == "completed"
+  if accumulator is not None:
+    assert accumulator.total == pytest.approx(3.10)
+
+
+def test_portable_compaction_cost_keeps_request_tiers_separate(tmp_path: Path) -> None:
+  priced_provider = CodexProvider()
+
+  class _CompactionUsageProvider(_UsageProvider):
+    name = "codex"
+
+    def __init__(self) -> None:
+      self.calls = 0
+
+    def get_model_info(self, model: str) -> ModelInfo:
+      return replace(priced_provider.get_model_info(model), context_window=30_000)
+
+    async def stream(self, client: Any, params: dict[str, Any]):
+      self.calls += 1
+      is_compaction = self.calls == 1
+      text = (
+        "<summary>" + "Keep the prior research and continue the task. " * 10 + "</summary>"
+        if is_compaction else "Research complete."
+      )
+      yield StreamEvent(type="message_start", input_tokens=260_000 if is_compaction else 15_000)
+      yield StreamEvent(type="text_delta", text=text)
+      yield StreamEvent(type="text_end", raw_block={"type": "text", "text": text})
+      yield StreamEvent(type="usage_update", output_tokens=1_000)
+      yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+  usage_events: list[UsageEvent] = []
+  summaries: list[SessionUsageSummary] = []
+  event_log = EventLog()
+  durable_log = AgentSessionLog(path=tmp_path / "compaction-pricing.jsonl")
+  provider = _CompactionUsageProvider()
+  accumulator = CostAccumulator(4.0)
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log),
+    session_id="sess-compaction-tiers",
+    capability_execution=stub_bound_capability_execution(
+      provider=provider, model="gpt-6-astra", effort="low", auth_config={"api_key": "k"},
+    ),
+    _cost_accumulator=accumulator,
+    on_usage=usage_events.append,
+    on_session_summary=summaries.append,
+    agent_session_log=durable_log,
+    compaction_trigger=24_000,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="2026-09-11",
+  )
+  _run(runner.run(messages=[{"role": "user", "content": "Earlier research. " * 6_000}]))
+
+  events = [entry.event for entry in event_log.entries]
+  completion = next(event for event in events if event.get("type") == "stream_complete")
+  assert (completion["usage"]["estimated_cost"], completion["terminal_disposition"]) == (
+    pytest.approx(2.85), "completed",
+  )
+  assert not any(event.get("type") == "budget_exceeded" for event in events)
+  assert accumulator.total == pytest.approx(2.85)
+  assert [event.cost_usd for event in usage_events] == pytest.approx([2.65, 0.20])
+  assert [(event.input_tokens, event.output_tokens) for event in usage_events] == [
+    (260_000, 1_000), (15_000, 1_000),
+  ]
+  assert len(summaries) == 1
+  assert summaries[0].cost == pytest.approx(2.85)
+  assert summaries[0].compaction_count == 1
+  turn_complete = next(event for event in events if event.get("type") == "turn_complete")
+  for usage in (completion["usage"], turn_complete["usage"]):
+    assert usage["input_tokens"] == 275_000
+    assert usage["output_tokens"] == 2_000
+    assert usage["estimated_cost"] == pytest.approx(2.85)
+  assistant_messages, _ = _run(durable_log.query(event_types={"assistant_message"}, order="asc"))
+  assert assistant_messages[0].event["usage"]["estimated_cost"] == pytest.approx(2.85)
+  assert assistant_messages[0].event["content_blocks"][0]["type"] == "compaction"
 
 
 def test_runner_preserves_cumulative_typed_provider_unit_deltas(
@@ -1270,6 +1398,141 @@ def test_stream_turn_failure_emits_partial_usage_and_rolls_back_totals() -> None
   assert "stream exploded" in error_events[0]["error"]
 
 
+@pytest.mark.parametrize("cancel_during_settlement", [False, True])
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_standalone_stream_error_closes_client_after_settlement(
+  monkeypatch: pytest.MonkeyPatch,
+  caplog: pytest.LogCaptureFixture,
+  cancel_during_settlement: bool,
+  close_fails: bool,
+) -> None:
+  async def case() -> None:
+    connection_closed = asyncio.Event()
+
+    async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+      try:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        await writer.drain()
+        await reader.read()
+      finally:
+        writer.close()
+        await writer.wait_closed()
+        connection_closed.set()
+
+    server = await asyncio.start_server(serve, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+
+    class HttpFailureProvider(_FailingAfterUsageProvider):
+      async def stream(self, client: Any, params: dict[str, Any]):
+        response = await client.get(f"http://127.0.0.1:{port}/")
+        assert response.content == b"ok"
+        async for event in super().stream(client, params):
+          yield event
+
+      async def close_client(self, client: Any, timeout: float = 2.0) -> None:
+        await client.aclose()
+        if close_fails:
+          raise RuntimeError("provider close exploded")
+
+    provider = HttpFailureProvider()
+    event_log = EventLog()
+    usage_events: list[UsageEvent] = []
+    runner = AgentRunner(
+      event_log=event_log,
+      dispatcher=_make_dispatcher(event_log),
+      session_id="standalone-error-cleanup",
+      capability_execution=_runner_execution(provider),
+      on_usage=usage_events.append,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    client = httpx.AsyncClient(trust_env=False)
+    runner._set_client(client)
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+    release_executor = threading.Event()
+    blocker = loop.run_in_executor(None, release_executor.wait)
+    settlement_started = asyncio.Event()
+    settle = runner._run_durable_session_settlement
+
+    async def observed_settlement(*args: Any, **kwargs: Any) -> Any:
+      settlement_started.set()
+      return await settle(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_run_durable_session_settlement", observed_settlement)
+    usage_totals = empty_usage_totals()
+    task = asyncio.create_task(runner._stream_turn(
+      client=client,
+      config={
+        "model": "claude-sonnet-4-6",
+        "effort": "none",
+        "auth_mode": "api",
+      },
+      model_info=provider.get_model_info("claude-sonnet-4-6"),
+      system_prompt=None,
+      current_messages=[{"role": "user", "content": "hello"}],
+      base_kwargs={"tools": []},
+      max_tokens=1024,
+      turn_count=1,
+      turn_t0=gateway_runner.time.time(),
+      turn_t0_mono=gateway_runner.time.monotonic(),
+      system_chars=0,
+      tools_chars=0,
+      usage_totals=usage_totals,
+    ))
+    try:
+      await asyncio.wait_for(settlement_started.wait(), timeout=5.0)
+      pool = client._transport._pool
+      assert (client.is_closed, len(pool.connections), runner._active_client is client) == (
+        False, 1, True,
+      )
+      if cancel_during_settlement:
+        for _ in range(2):
+          task.cancel()
+          await asyncio.sleep(0)
+        assert not task.done()
+      release_executor.set()
+      if cancel_during_settlement:
+        with pytest.raises(asyncio.CancelledError):
+          await asyncio.wait_for(task, timeout=5.0)
+        assert task.cancelled()
+        if close_fails:
+          assert any(
+            record.name == "agent_gateway.runner"
+            and record.levelno >= logging.WARNING
+            and "provider close exploded" in record.getMessage()
+            for record in caplog.records
+          )
+      elif close_fails:
+        with pytest.raises(RuntimeError, match="provider close exploded"):
+          await asyncio.wait_for(task, timeout=5.0)
+        assert not task.cancelled()
+      else:
+        assert await asyncio.wait_for(task, timeout=5.0) is None
+      assert (client.is_closed, len(pool.connections), runner._active_client) == (
+        True, 0, None,
+      )
+      await asyncio.wait_for(connection_closed.wait(), timeout=5.0)
+      errors = [entry.event for entry in event_log.entries if entry.event["type"] == "error"]
+      assert len(errors) == 1
+      assert "stream exploded" in errors[0]["error"]
+      assert [(event.input_tokens, event.output_tokens) for event in usage_events] == [(40, 7)]
+      assert usage_totals == empty_usage_totals()
+    finally:
+      release_executor.set()
+      await blocker
+      task.cancel()
+      await asyncio.gather(task, return_exceptions=True)
+      await client.aclose()
+      server.close()
+      await server.wait_closed()
+      await asyncio.wait_for(connection_closed.wait(), timeout=5.0)
+
+  _run(case())
+
+
 def test_on_usage_failure_does_not_block_chat_response(tmp_path: Path) -> None:
   event_log = EventLog()
 
@@ -1325,7 +1588,7 @@ def test_on_usage_failure_writes_to_dlq_spool(tmp_path: Path) -> None:
   assert payload["event"]["session_id"] == "sess-parent"
   assert payload["event"]["input_tokens"] == 100
   assert payload["event"]["output_tokens"] == 50
-  assert payload["event"]["capability_bind"] == runner.capability_execution.bind.receipt()
+  assert payload["event"]["capability_bind"] == runner.capability_execution.bind.to_json()
   assert payload["event"]["provider_reported_model"] is None
 
 
@@ -1394,7 +1657,7 @@ def test_run_appends_turn_complete_event_to_event_log() -> None:
     durable_events.append(dict(event))
     return SimpleNamespace(seq=len(durable_events))
 
-  runner._append_durable_event = _append_durable_event  # type: ignore[method-assign]
+  runner._append_durable_event = _append_durable_event
 
   _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
 
@@ -1412,7 +1675,7 @@ def test_run_appends_turn_complete_event_to_event_log() -> None:
     "cache_read_input_tokens": 10,
     "cache_creation_input_tokens": 5,
     "estimated_cost": 0.0002,
-    "capability_bind": runner.capability_execution.bind.receipt(),
+    "capability_bind": runner.capability_execution.bind.to_json(),
   }
   assert assistant_messages[0]["model"] == "claude-sonnet-4-6"
   assert assistant_messages[0]["provider"] == "stub"
@@ -1584,53 +1847,49 @@ def test_runner_emits_session_summary_once_after_run() -> None:
 
 
 def test_runner_session_summary_reports_failed_drain_and_in_flight_tasks() -> None:
-  summaries: list[SessionUsageSummary] = []
-  pending_task = SimpleNamespace(done=lambda: False)
-  pending_entry = SimpleNamespace(
-    task_id="bg-pending",
-    agent_name=None,
-    asyncio_task=pending_task,
-    started_at=0.0,
-    completed_at=None,
-    notification_delivery_state="not_queued",
-    progress=SimpleNamespace(
-      tool_use_count=0,
-      last_tool_name=None,
-    ),
-  )
-  provider = _UsageProvider()
-  runner = AgentRunner(
-    event_log=EventLog(),
-    dispatcher=_make_dispatcher(),
-    session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
-    user_id="alice",
-    request_id="req-summary-drain",
-    on_session_summary=summaries.append,
-    billing_mode="byok",
-    rate_table_version="unknown",
-  )
+  class _DrainFailureRunner(AgentRunner):
+    async def _shutdown_background_tasks(self, was_cancelled: bool) -> None:
+      _ = was_cancelled
+      raise RuntimeError("drain failed")
 
-  async def _raise_shutdown(was_cancelled: bool) -> None:
-    _ = was_cancelled
-    raise RuntimeError("drain failed")
+  async def case() -> None:
+    summaries: list[SessionUsageSummary] = []
+    pending_task = asyncio.create_task(asyncio.Event().wait())
+    task_registry = TaskRegistry()
+    pending_entry = task_registry.register("run_agent", task_id="bg-pending")
+    pending_entry.asyncio_task = pending_task
+    pending_entry.started_at = 0.0
+    task_registry.transition("bg-pending", TaskState.RUNNING)
 
-  def _list_running_tasks(*, state: Any = None) -> list[Any]:
-    _ = state
-    return [pending_entry]
+    provider = _UsageProvider()
+    runner = _DrainFailureRunner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(),
+      session_id="sess-parent",
+      capability_execution=_runner_execution(provider),
+      user_id="alice",
+      request_id="req-summary-drain",
+      on_session_summary=summaries.append,
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    runner._task_registry = task_registry
 
-  runner._shutdown_background_tasks = _raise_shutdown  # type: ignore[method-assign]
-  runner._task_registry = SimpleNamespace(
-    admission_count=1,
-    list_tasks=_list_running_tasks,
-  )
+    try:
+      with pytest.raises(RuntimeError, match="drain failed"):
+        await runner.run(
+          messages=[{"role": "user", "content": "hello"}],
+          max_turns=1,
+        )
 
-  with pytest.raises(RuntimeError, match="drain failed"):
-    _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
+      assert len(summaries) == 1
+      assert summaries[0].drain_complete is False
+      assert summaries[0].in_flight_task_count == 1
+    finally:
+      pending_task.cancel()
+      await asyncio.gather(pending_task, return_exceptions=True)
 
-  assert len(summaries) == 1
-  assert summaries[0].drain_complete is False
-  assert summaries[0].in_flight_task_count == 1
+  _run(case())
 
 
 def test_runner_is_single_use() -> None:

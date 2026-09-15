@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from pydantic import JsonValue
 
 from agent_workflow_contracts import (
   ActivityHandle,
@@ -41,7 +42,7 @@ def _contract() -> ContractRef:
 
 
 def _result(task_id: str = "bg_7") -> TaskResult:
-  value = {"status": "complete"}
+  value: JsonValue = {"status": "complete"}
   raw = canonical_json_bytes(value)
   content_sha = hashlib.sha256(raw).hexdigest()
   handle = ContentHandle(

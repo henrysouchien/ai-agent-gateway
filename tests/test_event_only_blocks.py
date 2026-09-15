@@ -1,4 +1,5 @@
 import asyncio
+from datetime import timedelta
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -14,6 +15,9 @@ from agent_gateway import (
   ToolDispatcher,
   ToolResultContext,
 )
+from agent_gateway.mcp_client import _ServerState
+from agent_gateway.mcp_client_connections import McpToolCallResult
+from agent_gateway.tool_dispatcher_helpers import ToolResult
 from agent_gateway.providers import StreamEvent
 from agent_gateway.transcript import _tool_result_blocks_from_event
 from tests.capability_execution_test_support import (
@@ -22,18 +26,56 @@ from tests.capability_execution_test_support import (
 from tests.sdk_capability_execution_test_support import stub_sdk_capability_execution
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
+class _NullMcpClient(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
+
+  def is_mcp_tool(self, name: str) -> bool:
+    _ = name
     return False
 
-  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
-    return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
+  async def call_tool(
+    self,
+    name: str,
+    tool_input: object,
+    meta: object | None = None,
+    abort_event: asyncio.Event | None = None,
+    gateway_session: object | None = None,
+    allow_uncertain_replay: bool = True,
+    trusted_dispatch_scope: object | None = None,
+  ) -> ToolResult:
+    _ = (
+      tool_input,
+      meta,
+      abort_event,
+      gateway_session,
+      allow_uncertain_replay,
+      trusted_dispatch_scope,
+    )
+    return None, {
+      "code": "unknown_tool",
+      "message": f"Unknown tool: {name}",
+    }
 
   def get_tool_definitions(self) -> list[dict[str, Any]]:
     return []
 
-  def get_server_for_tool(self, _name: str) -> str | None:
+  def get_server_for_tool(self, name: str) -> str | None:
+    _ = name
     return None
+
+
+class _UnusedMcpSession:
+  async def call_tool(
+    self,
+    name: str,
+    arguments: dict[str, object],
+    *,
+    read_timeout_seconds: timedelta,
+    meta: dict[str, object] | None = None,
+  ) -> McpToolCallResult:
+    _ = name, arguments, read_timeout_seconds, meta
+    raise AssertionError("MCP session should not execute in event-only tests")
 
 
 class _RecordingProvider(ModelProvider):
@@ -149,9 +191,9 @@ def _trusted_market_data_manager() -> McpClientManager:
     provider_ids_by_server={"fmp-mcp": "fmp"},
   )
   manager._servers = {
-    "fmp-mcp": SimpleNamespace(
+    "fmp-mcp": _ServerState(
       name="fmp-mcp",
-      session=object(),
+      session=_UnusedMcpSession(),
       exit_contexts=[],
       tool_definitions=[_tool_def("fmp_fetch")],
       tool_names={"fmp_fetch"},
@@ -171,7 +213,7 @@ def _trusted_market_data_manager() -> McpClientManager:
     )
 
   manager._call_tool_once = call_tool_once  # type: ignore[method-assign]
-  manager._translate_provider_symbol = lambda _name, payload: payload  # type: ignore[method-assign]
+  manager._translate_provider_symbol = lambda _server, _name, payload: payload  # type: ignore[method-assign]
   return manager
 
 

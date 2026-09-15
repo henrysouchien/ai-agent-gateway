@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Callable, Mapping
 import hashlib
 import inspect
 import json
@@ -6,7 +7,7 @@ import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -25,6 +26,7 @@ from agent_gateway import (  # noqa: E402
   ModelProvider,
   TaskNotification,
   TaskState,
+  ToolResultContext,
   ToolDispatcher,
 )
 from agent_gateway.capability_binding import (  # noqa: E402
@@ -33,8 +35,10 @@ from agent_gateway.capability_binding import (  # noqa: E402
 )
 from agent_gateway.fork_request_handoff import ForkRequestHandoff  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
+from agent_gateway.mcp_client import McpClientManager  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 import agent_gateway.runner_run_loop as gateway_run_loop  # noqa: E402
+import agent_gateway.runner_background_lifecycle as gateway_background_lifecycle  # noqa: E402
 from agent_gateway.runner import StreamTurnResult  # noqa: E402
 from agent_gateway.runner_budget import (  # noqa: E402
   CostAccumulator,
@@ -51,6 +55,7 @@ from agent_gateway.runner_state import (  # noqa: E402
   StreamTurnFailure,
   ToolUseLoopResult,
 )
+from agent_gateway.tool_policy_registry import PreparedToolCall  # noqa: E402
 from tests.capability_execution_test_support import (  # noqa: E402
   stub_bound_capability_execution,
 )
@@ -64,7 +69,6 @@ from agent_workflow_contracts import (  # noqa: E402
   ResultHandle,
   SettlementProjection,
   TaskResultRef,
-  ParentResultPolicy,
   AdmittedPlanRef,
   AuthoredDeliverySummary,
   ContentHandle,
@@ -81,6 +85,7 @@ from agent_workflow_contracts import (  # noqa: E402
   TranscriptHandle,
   WorkflowDeliverySpecV1,
   WorkflowResult,
+  WorkflowView,
 )
 
 
@@ -91,13 +96,22 @@ def _workflow_view(
   phase_number: int,
   revision: int,
   digest: str,
-  delivery_status: str = "complete",
-  state: str = "terminal",
-  terminal_status: str | None = "succeeded",
-):
+  delivery_status: Literal["pending", "complete", "failed", "not_required"] = "complete",
+  state: Literal[
+    "authoring",
+    "running",
+    "awaiting_action",
+    "cancel_requested",
+    "terminal",
+  ] = "terminal",
+  terminal_status: Literal[
+    "succeeded",
+    "failed",
+    "interrupted",
+    "cancelled",
+  ] | None = "succeeded",
+) -> WorkflowView:
   """The canonical view every composed WorkflowResult carries (A-M5)."""
-
-  from agent_workflow_contracts import WorkflowView
 
   return WorkflowView(
     workflow_run_id="workflow-1",
@@ -234,7 +248,7 @@ def test_shared_log_sub_agent_success_ignores_foreign_unfinished_skill_lifecycle
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
       max_turns=None,
@@ -258,15 +272,9 @@ def test_shared_log_sub_agent_success_ignores_foreign_unfinished_skill_lifecycle
   asyncio.run(_case())
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
-    return False
-
-  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
-    return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
-
-  def get_tool_definitions(self) -> list[dict[str, Any]]:
-    return []
+class _NullMcpClient(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
 
 
 class _NoCredentialProvider(ModelProvider):
@@ -299,7 +307,7 @@ def _make_no_credential_runner(
   )
   model = auth_model if auth_model is not None else "bound-model"
   execution = stub_bound_capability_execution(
-    provider=provider,  # type: ignore[arg-type]
+    provider=provider,
     model=model,
     effort="none",
     auth_config={"api_key": "k"},
@@ -340,13 +348,18 @@ class _CredentialProvider(ModelProvider):
   def estimate_cost(
     self,
     model: str,
-    uncached: int,
-    output: int,
-    *,
+    input_tokens: int,
+    output_tokens: int,
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
   ) -> CostEstimate:
-    _ = model, uncached, output, cache_read_tokens, cache_creation_tokens
+    _ = (
+      model,
+      input_tokens,
+      output_tokens,
+      cache_read_tokens,
+      cache_creation_tokens,
+    )
     return CostEstimate()
 
 
@@ -378,9 +391,18 @@ def _make_credential_runner(
   api_key: str = "k",
   allow_stub_response: bool = True,
   coordinator: CoordinatorConfig | None = None,
-  max_budget_usd: float | None = None,
+  cost_accumulator: CostAccumulator | None = None,
   gateway_session: GatewaySession | None = None,
   local_tool_handlers: dict[str, Any] | None = None,
+  role: Literal["owner", "invite"] | None = None,
+  raw_history_input_redactor: Callable[
+    [str, Mapping[str, object]],
+    dict[str, object],
+  ] = ToolDispatcher._redact_catalogless_raw_history_input,
+  prepared_tool_input_redactor: Callable[
+    [str, PreparedToolCall],
+    dict[str, object],
+  ] = ToolDispatcher._redact_catalogless_prepared_tool_input,
   user_id: str | None = "alice",
   channel: str | None = None,
 ) -> AgentRunner:
@@ -390,7 +412,22 @@ def _make_credential_runner(
     local_tool_handlers=local_tool_handlers or {},
     event_log=event_log,
     session_id="sess_run_loop",
+    role=role,
   )
+  def redact_raw_history_input(
+    tool_name: str,
+    tool_input: Mapping[str, object],
+  ) -> dict[str, object]:
+    return raw_history_input_redactor(tool_name, tool_input)
+
+  def redact_prepared_tool_input(
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+  ) -> dict[str, object]:
+    return prepared_tool_input_redactor(tool_name, prepared_call)
+
+  dispatcher._raw_history_input_redactor = redact_raw_history_input
+  dispatcher._prepared_tool_input_redactor = redact_prepared_tool_input
   selected_provider = provider or _CredentialProvider()
   return AgentRunner(
     event_log=event_log,
@@ -398,7 +435,7 @@ def _make_credential_runner(
     gateway_session=gateway_session,
     session_id="sess_run_loop",
     capability_execution=stub_bound_capability_execution(
-      provider=selected_provider,  # type: ignore[arg-type]
+      provider=selected_provider,
       model="stub-model",
       effort="none",
       auth_config={"api_key": api_key},
@@ -406,7 +443,7 @@ def _make_credential_runner(
     allow_stub_response=allow_stub_response,
     get_tool_definitions=lambda: [],
     coordinator=coordinator,
-    max_budget_usd=max_budget_usd,
+    _cost_accumulator=cost_accumulator,
     user_id=user_id,
     channel=channel,
     billing_mode="byok",
@@ -441,8 +478,8 @@ def test_runner_sanitizes_exact_credential_from_assistant_tool_history_before_ne
     runner = _make_credential_runner(
       api_key=secret,
       local_tool_handlers={"lookup": lookup_handler},
+      role="owner",
     )
-    runner._dispatcher._role = "owner"
     runner._get_tool_definitions = lambda: [
       {
         "name": "lookup",
@@ -480,7 +517,7 @@ def test_runner_sanitizes_exact_credential_from_assistant_tool_history_before_ne
         advertised_tool_names=frozenset({"lookup"}),
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "look it up"}],
       max_turns=2,
@@ -502,6 +539,106 @@ def test_runner_sanitizes_exact_credential_from_assistant_tool_history_before_ne
       "api_key_set": True,
       "path": "/Users/alice/Documents/report.xlsx",
     }
+
+  asyncio.run(case())
+
+
+def test_runner_keeps_semantic_tool_input_in_session_and_redacts_persistence(
+  tmp_path: Path,
+) -> None:
+  async def case() -> None:
+    raw_title = "[hank] AH01-J7-DELETE-ME — PYPL 2026-08-24 01"
+    redacted_title = "hmac-sha256-v1:test-key:sheet-title"
+    raw_input = {"spreadsheet_id": "source-sheet", "title": raw_title}
+    dispatched_inputs: list[dict[str, Any]] = []
+    second_request_messages: list[dict[str, Any]] = []
+
+    async def lookup_sheet_handler(
+      tool_input: dict[str, Any],
+      **_kwargs: Any,
+    ) -> tuple[dict[str, Any], None]:
+      dispatched_inputs.append(dict(tool_input))
+      return {"status": "success", "spreadsheet_id": "destination"}, None
+
+    runner = _make_credential_runner(
+      local_tool_handlers={"lookup_sheet_copy": lookup_sheet_handler},
+      role="owner",
+      raw_history_input_redactor=lambda _name, value: {
+        **dict(value),
+        "title": redacted_title,
+      },
+      prepared_tool_input_redactor=lambda _name, prepared: {
+        **prepared.materialize_input(),
+        "title": redacted_title,
+      },
+    )
+    durable_log = AgentSessionLog(
+      tmp_path / "semantic-tool-history.jsonl"
+    )
+    runner._agent_session_log = durable_log
+    runner._get_tool_definitions = lambda: [{
+      "name": "lookup_sheet_copy",
+      "description": "Copy a sheet for analysis",
+      "input_schema": {"type": "object"},
+    }]
+    turn_number = 0
+
+    async def stream_turn(**kwargs: Any):
+      nonlocal turn_number
+      turn_number += 1
+      if turn_number == 1:
+        return object(), StreamTurnResult(
+          stop_reason="tool_use",
+          content_blocks=[{
+            "type": "tool_use",
+            "id": "tool-copy",
+            "name": "lookup_sheet_copy",
+            "input": dict(raw_input),
+          }],
+          tool_uses=[(
+            "tool-copy",
+            "lookup_sheet_copy",
+            dict(raw_input),
+          )],
+          advertised_tool_names=frozenset({"lookup_sheet_copy"}),
+        )
+      second_request_messages.extend(
+        json.loads(json.dumps(kwargs["current_messages"]))
+      )
+      return object(), StreamTurnResult(
+        full_text="done",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "done"}],
+        advertised_tool_names=frozenset({"lookup_sheet_copy"}),
+      )
+
+    runner._stream_turn = stream_turn
+    await runner.run(
+      messages=[{"role": "user", "content": "Copy the source sheet."}],
+      max_turns=2,
+    )
+
+    assert dispatched_inputs == [raw_input]
+    assistant_message = next(
+      message
+      for message in second_request_messages
+      if message.get("role") == "assistant"
+    )
+    assert assistant_message["content"][0]["input"] == raw_input
+    assert redacted_title not in json.dumps(second_request_messages)
+
+    durable_entries, _ = await durable_log.query(order="asc")
+    durable_payload = json.dumps([
+      entry.event for entry in durable_entries
+    ])
+    assert raw_title not in durable_payload
+    assert redacted_title in durable_payload
+
+    presentation_payload = json.dumps([
+      entry.event for entry in runner._log.entries
+    ])
+    assert raw_title not in presentation_payload
+    assert redacted_title in presentation_payload
 
   asyncio.run(case())
 
@@ -550,7 +687,7 @@ def test_native_runner_denies_tool_added_after_provider_request_snapshot() -> No
       dispatcher=dispatcher,
       session_id="sess-request-snapshot",
       capability_execution=stub_bound_capability_execution(
-        provider=provider,  # type: ignore[arg-type]
+        provider=provider,
         model="stub-model",
         effort="none",
         auth_config={"api_key": "k"},
@@ -588,7 +725,7 @@ def test_native_runner_denies_tool_added_after_provider_request_snapshot() -> No
         advertised_tool_names=frozenset(mcp.live_tools),
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "write to corpus"}],
       max_turns=2,
@@ -631,13 +768,13 @@ def _seed_fork_request_snapshot(
   marker: tuple[int, int] | None = (0, 0),
 ) -> None:
   runner._last_request_system_blocks = (("system", True),)
-  runner._last_request_wire_tools = (
+  runner._last_request_wire_tools = [
     {
       "name": "run_agent",
       "description": "Delegate",
       "input_schema": {"type": "object"},
     },
-  )
+  ]
   runner._last_request_message_marker_position = marker
   runner._last_request_max_tokens = 4096
 
@@ -656,7 +793,7 @@ def test_post_turn_capture_without_identity_is_non_fatal_and_logged_once(
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     with caplog.at_level("INFO", logger="agent_gateway.runner"):
       await runner.run(messages=[{"role": "user", "content": "first"}])
 
@@ -687,7 +824,7 @@ def test_bound_gateway_session_builds_post_turn_handoff() -> None:
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(messages=[{"role": "user", "content": "finish"}])
 
     handoff = runner._post_turn_fork_handoff
@@ -808,7 +945,7 @@ def test_unexpected_post_turn_capture_error_does_not_fail_turn(
     def fail_build(*_args: Any, **_kwargs: Any):
       raise RuntimeError("unexpected handoff build failure")
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     monkeypatch.setattr(
       gateway_run_loop,
       "build_post_turn_handoff",
@@ -900,7 +1037,7 @@ def test_mid_turn_capture_unavailable_reaches_model_and_siblings_continue() -> N
         content_blocks=[{"type": "text", "text": "continued"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(messages=[{"role": "user", "content": "delegate"}])
 
     assert "fork_handoff_unavailable" in str(model_messages)
@@ -964,7 +1101,7 @@ def test_mid_turn_capture_builds_and_failed_rebuild_clears_snapshot() -> None:
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(messages=[{"role": "user", "content": "delegate"}])
 
     assert runner._mid_turn_fork_handoff is None
@@ -1018,7 +1155,7 @@ def test_mid_turn_capture_builds_through_run_loop() -> None:
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(messages=[{"role": "user", "content": "delegate"}])
 
     handoff = runner._mid_turn_fork_handoff
@@ -1162,7 +1299,7 @@ def test_run_loop_uses_bound_upstream_model() -> None:
       content_blocks=[{"type": "text", "text": "done"}],
     )
 
-  runner._stream_turn = stream_turn  # type: ignore[method-assign]
+  runner._stream_turn = stream_turn
 
   asyncio.run(
     runner.run(
@@ -1275,6 +1412,7 @@ def test_real_run_preserves_cancellation_across_release_and_close_failures(
   monkeypatch.setattr(runner, "_stream_turn", _cancel_stream)
   monkeypatch.setattr(runner, "_release_write_lease", _release_write_lease)
   monkeypatch.setattr(runner, "force_close", _force_close)
+  runner._write_lease_file = object()
 
   with pytest.raises(asyncio.CancelledError) as exc_info:
     asyncio.run(
@@ -1308,10 +1446,18 @@ def test_context_manifest_persists_before_stream_and_uses_both_regular_paths() -
     def __init__(self) -> None:
       self.calls: list[dict[str, Any]] = []
 
-    def persist(self, **kwargs: Any) -> str:
-      self.calls.append({**kwargs, "thread": threading.get_ident()})
+    def persist(
+      self,
+      *,
+      surfaces: list[dict[str, Any]],
+      rendered_system_prompt: str | list[tuple[str, bool]] | None,
+    ) -> None:
+      self.calls.append({
+        "surfaces": surfaces,
+        "rendered_system_prompt": rendered_system_prompt,
+        "thread": threading.get_ident(),
+      })
       order.append("persist")
-      return "sha256:prompt"
 
   async def case() -> None:
     runner = _make_credential_runner()
@@ -1336,8 +1482,8 @@ def test_context_manifest_persists_before_stream_and_uses_both_regular_paths() -
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    runner._append_durable_event = append_durable  # type: ignore[method-assign]
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._append_durable_event = append_durable
+    runner._stream_turn = stream_turn
     main_thread = threading.get_ident()
     await runner.run(
       messages=[{"role": "user", "content": "hello"}],
@@ -1358,7 +1504,13 @@ def test_context_manifest_persists_before_stream_and_uses_both_regular_paths() -
 
 def test_context_capture_failure_suppresses_manifest_and_turn_continues() -> None:
   class Capture:
-    def persist(self, **_kwargs: Any) -> str:
+    def persist(
+      self,
+      *,
+      surfaces: list[dict[str, Any]],
+      rendered_system_prompt: str | list[tuple[str, bool]] | None,
+    ) -> None:
+      _ = surfaces, rendered_system_prompt
       raise RuntimeError("unresolved")
 
   async def case() -> None:
@@ -1375,7 +1527,7 @@ def test_context_capture_failure_suppresses_manifest_and_turn_continues() -> Non
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(messages=[{"role": "user", "content": "hello"}], system_prompt="system")
     assert streamed
     assert not any(entry.event.get("type") == "context_manifest" for entry in runner._log.entries)
@@ -1522,7 +1674,7 @@ def test_completed_workflow_output_attaches_to_final_summary_and_replays(
         advertised_tool_names=frozenset({"workflow_run"}),
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "run the workflow"}],
       max_turns=2,
@@ -1799,7 +1951,7 @@ def test_accepted_continuation_invalidates_stale_pending_attachment(
         advertised_tool_names=frozenset({"workflow_run"}),
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "run and continue the workflow"}],
       max_turns=4,
@@ -1855,7 +2007,7 @@ def test_successful_final_turn_consumes_notifications_already_shown() -> None:
         content_blocks=[{"type": "text", "text": "Integrated the review."}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
 
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
@@ -1901,7 +2053,7 @@ def test_noncommittal_pause_repeats_notification_until_completed_turn(
         content_blocks=[{"type": "text", "text": "Integrated the review."}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
 
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
@@ -1940,8 +2092,8 @@ def test_persistence_failure_does_not_acknowledge_notification() -> None:
     async def fail_persistence(**_kwargs: Any) -> None:
       raise RuntimeError("assistant persistence failed")
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
-    runner._append_assistant_message_event = fail_persistence  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
+    runner._append_assistant_message_event = fail_persistence
 
     with pytest.raises(RuntimeError, match="assistant persistence failed"):
       await runner.run(
@@ -1977,7 +2129,7 @@ def test_provider_error_turn_retains_inline_notification_and_fails_terminally() 
         content_blocks=[],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
       max_turns=2,
@@ -2054,7 +2206,7 @@ def test_empty_tool_use_turn_acks_inline_notification_it_rendered() -> None:
         }],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
       max_turns=3,
@@ -2083,7 +2235,7 @@ def test_provider_error_turn_retains_exact_result_ack() -> None:
         content_blocks=[],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(messages=messages, max_turns=2)
 
     events = [item.event for item in runner._log.entries]
@@ -2131,7 +2283,7 @@ def test_empty_tool_use_turn_retains_exact_ack_until_end_turn() -> None:
         }],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(messages=messages, max_turns=3)
 
     assert len(seen_messages) == 2
@@ -2205,7 +2357,7 @@ def test_tool_use_turn_acks_notification_before_the_tool_batch(
         tools_used=["lookup"],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     monkeypatch.setattr(
       gateway_runner,
       "_execute_tool_use_loop",
@@ -2259,7 +2411,7 @@ def test_notification_arriving_during_final_turn_gets_one_follow_up() -> None:
         content_blocks=[{"type": "text", "text": text}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
 
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
@@ -2301,7 +2453,7 @@ def test_max_turn_delivery_grace_shows_inline_notification() -> None:
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
       max_turns=1,
@@ -2356,7 +2508,7 @@ def test_delivery_grace_reconciles_generation_finalized_during_last_request() ->
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
       max_turns=1,
@@ -2444,7 +2596,7 @@ def test_natural_finish_delivery_epoch_exhausts_bounded_notification_credits(
         tools_used=["lookup"],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     monkeypatch.setattr(
       gateway_runner,
       "_execute_tool_use_loop",
@@ -2512,7 +2664,7 @@ def test_delivery_epoch_freezes_admission_but_allows_exact_omitted_retrieval() -
     async def forbidden_handler(
       _tool_input: dict[str, Any],
       **_kwargs: Any,
-    ) -> dict[str, Any]:
+    ) -> tuple[Any | None, dict[str, Any] | None]:
       nonlocal handler_called
       handler_called = True
       raise AssertionError("delivery-only admission must fail before start")
@@ -2577,7 +2729,7 @@ def test_delivery_epoch_freezes_admission_but_allows_exact_omitted_retrieval() -
         ],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
       max_turns=1,
@@ -2662,7 +2814,7 @@ def test_live_run_working_turns_do_not_spend_delivery_credits(
         tools_used=["lookup"],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     monkeypatch.setattr(
       gateway_runner,
       "_execute_tool_use_loop",
@@ -2759,7 +2911,7 @@ def test_live_run_delivery_does_not_freeze_background_admission() -> None:
         content_blocks=[{"type": "text", "text": "integrated"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "five tracks"}],
       max_turns=None,
@@ -2910,7 +3062,7 @@ def test_natural_finish_reminds_once_for_unread_handle_result(
       path=tmp_path / "sessions" / "unread-handle.jsonl",
     )
     runner._agent_session_log = durable_log
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "five tracks"}],
       max_turns=None,
@@ -3027,7 +3179,7 @@ def test_omitted_payload_nudge_is_durably_recorded(tmp_path: Path) -> None:
       path=tmp_path / "sessions" / "omitted-nudge.jsonl",
     )
     runner._agent_session_log = durable_log
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "one track"}],
       max_turns=None,
@@ -3098,7 +3250,7 @@ def test_unread_handle_reminder_suppressed_after_content_read() -> None:
         content_blocks=[{"type": "text", "text": "integrated"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "five tracks"}],
       max_turns=None,
@@ -3156,7 +3308,7 @@ def test_unread_handle_reminder_yields_when_finish_lands_on_max_turns() -> None:
         content_blocks=[{"type": "text", "text": "wrapping up"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "one track"}],
       max_turns=2,
@@ -3231,7 +3383,7 @@ def test_unread_handle_reminder_answer_survives_compelled_continuation() -> None
         content_blocks=[{"type": "text", "text": "integrated fully"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "one track"}],
       max_turns=None,
@@ -3314,7 +3466,7 @@ def test_tools_then_end_turn_stop_still_reminds_for_unread_handle(
         content_blocks=[{"type": "text", "text": "wrapping up"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     monkeypatch.setattr(
       gateway_runner,
       "_execute_tool_use_loop",
@@ -3376,7 +3528,7 @@ def test_inline_delivery_never_triggers_unread_handle_reminder() -> None:
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "one track"}],
       max_turns=None,
@@ -3511,7 +3663,7 @@ def test_delivery_epoch_requires_provider_to_commit_new_regular_tool_result(
         tools_used=[tool_name],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     monkeypatch.setattr(
       gateway_runner,
       "_execute_tool_use_loop",
@@ -3624,7 +3776,7 @@ def test_omitted_notification_forces_exact_retrieval_and_consumption(
         tools_used=["get_background_result"],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     monkeypatch.setattr(
       gateway_runner,
       "_execute_tool_use_loop",
@@ -3680,11 +3832,9 @@ def test_compaction_dropped_ack_gets_exactly_one_recovery_cycle(
         and block.get("type") == "tool_result"
         and block.get("tool_use_id") == tool_use_id
         for message in messages
-        for block in (
-          message.get("content")
-          if isinstance(message.get("content"), list)
-          else []
-        )
+        for blocks in (message.get("content"),)
+        if isinstance(blocks, list)
+        for block in blocks
       )
 
     async def compact_messages(
@@ -3825,7 +3975,7 @@ def test_compaction_dropped_ack_gets_exactly_one_recovery_cycle(
         tools_used=["get_background_result"],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     monkeypatch.setattr(
       "agent_gateway.runner_run_loop.maybe_compact_current_messages",
       compact_messages,
@@ -3939,7 +4089,7 @@ def test_run_loop_context_reminder_uses_actual_post_compaction_request(
       "agent_gateway.runner_run_loop.maybe_compact_current_messages",
       compact_messages,
     )
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
 
     await runner.run(
       messages=[{"role": "user", "content": "large context"}],
@@ -4050,11 +4200,10 @@ def test_run_loop_reactive_compaction_rebuilds_reminder_and_manifest(
         self,
         *,
         surfaces: list[dict[str, Any]],
-        rendered_system_prompt: Any,
-      ) -> str:
+        rendered_system_prompt: str | list[tuple[str, bool]] | None,
+      ) -> None:
         _ = surfaces
         self.prompts.append(rendered_system_prompt)
-        return f"prompt-{len(self.prompts)}"
 
     capture = _Capture()
     runner._context_capture = capture
@@ -4077,7 +4226,7 @@ def test_run_loop_reactive_compaction_rebuilds_reminder_and_manifest(
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    runner._append_durable_event = append_durable  # type: ignore[method-assign]
+    runner._append_durable_event = append_durable
     monkeypatch.setattr(
       gateway_runner,
       "_token_estimate_snapshot",
@@ -4087,7 +4236,7 @@ def test_run_loop_reactive_compaction_rebuilds_reminder_and_manifest(
       "agent_gateway.runner_run_loop.maybe_compact_current_messages",
       compact_messages,
     )
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
 
     await runner.run(
       messages=[{"role": "user", "content": "large context"}],
@@ -4181,7 +4330,7 @@ def test_run_loop_context_pressure_estimate_includes_fixed_turn_reminder(
       "_token_estimate_snapshot",
       token_snapshot,
     )
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
 
     await runner.run(
       messages=[{"role": "user", "content": "near threshold"}],
@@ -4266,7 +4415,7 @@ def test_run_loop_context_pressure_requires_full_ten_point_hysteresis(
       "_token_estimate_snapshot",
       token_snapshot,
     )
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
 
     await runner.run(
       messages=[{"role": "user", "content": "continue"}],
@@ -4368,7 +4517,7 @@ def test_two_omitted_notifications_require_both_exact_results(
         tools_used=["get_background_result"],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     monkeypatch.setattr(
       gateway_runner,
       "_execute_tool_use_loop",
@@ -4392,7 +4541,8 @@ def test_budget_stop_after_retrieval_retains_pending_ack(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   async def case() -> None:
-    runner = _make_credential_runner(max_budget_usd=0.5)
+    cost_accumulator = CostAccumulator(0.5)
+    runner = _make_credential_runner(cost_accumulator=cost_accumulator)
     entry = runner._task_registry.register("background_agent")
     runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
     runner._task_registry.transition(
@@ -4448,7 +4598,7 @@ def test_budget_stop_after_retrieval_retains_pending_ack(
         acknowledgement["task_id"],
         acknowledgement["notification_generation"],
       )
-      runner._cost_accumulator.add(1.0)
+      cost_accumulator.add(1.0)
       return ToolUseLoopResult(
         tool_results_content=[
           {
@@ -4460,7 +4610,7 @@ def test_budget_stop_after_retrieval_retains_pending_ack(
         tools_used=["get_background_result"],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     monkeypatch.setattr(
       gateway_runner,
       "_execute_tool_use_loop",
@@ -4510,7 +4660,7 @@ def test_cost_observation_threshold_records_usage_without_stopping_run() -> None
       kwargs["usage_totals"]["input_tokens"] += 100
       kwargs["usage_totals"]["output_tokens"] += 50
       kwargs["usage_totals"]["capability_bind"] = (
-        runner._capability_execution.bind.receipt()
+        runner._capability_execution.bind.to_json()
       )
       return object(), StreamTurnResult(
         full_text="complete despite crossing the estimate",
@@ -4521,7 +4671,7 @@ def test_cost_observation_threshold_records_usage_without_stopping_run() -> None
         }],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish the workflow node"}],
       max_turns=None,
@@ -4574,7 +4724,7 @@ def test_final_turn_waits_event_first_for_running_child_notification() -> None:
       wait_started.set()
       return await original_wait()
 
-    runner._wait_for_background_notification = tracked_wait  # type: ignore[method-assign]
+    runner._wait_for_background_notification = tracked_wait
     seen_prompts: list[str] = []
     seen_messages: list[list[dict[str, Any]]] = []
 
@@ -4592,7 +4742,7 @@ def test_final_turn_waits_event_first_for_running_child_notification() -> None:
         content_blocks=[{"type": "text", "text": text}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish after review"}],
       system_prompt="base",
@@ -4648,9 +4798,9 @@ def test_auto_notify_false_and_exhausted_turn_limit_skip_background_wait() -> No
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    runner._wait_for_background_notification = unexpected_wait  # type: ignore[method-assign]
+    runner._wait_for_background_notification = unexpected_wait
     runner._shutdown_background_tasks = cleanup_background_tasks  # type: ignore[method-assign]
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
       max_turns=max_turns,
@@ -4667,13 +4817,14 @@ def test_auto_notify_false_and_exhausted_turn_limit_skip_background_wait() -> No
 
 def test_background_child_budget_crossing_blocks_notification_follow_up() -> None:
   async def case() -> None:
-    runner = _make_credential_runner(max_budget_usd=1.0)
+    cost_accumulator = CostAccumulator(1.0)
+    runner = _make_credential_runner(cost_accumulator=cost_accumulator)
     entry = runner._task_registry.register("background_agent")
     wait_started = asyncio.Event()
 
     async def child() -> None:
       await wait_started.wait()
-      runner._cost_accumulator.add(1.0)
+      cost_accumulator.add(1.0)
       runner._task_registry.transition(
         entry.task_id,
         TaskState.COMPLETED,
@@ -4693,7 +4844,7 @@ def test_background_child_budget_crossing_blocks_notification_follow_up() -> Non
       wait_started.set()
       return await original_wait()
 
-    runner._wait_for_background_notification = tracked_wait  # type: ignore[method-assign]
+    runner._wait_for_background_notification = tracked_wait
     stream_calls = 0
 
     async def stream_turn(**_kwargs: Any):
@@ -4705,7 +4856,7 @@ def test_background_child_budget_crossing_blocks_notification_follow_up() -> Non
         content_blocks=[{"type": "text", "text": "draft"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish within budget"}],
       max_turns=3,
@@ -4762,7 +4913,7 @@ def test_post_tool_end_turn_waits_for_custom_provider_background_child(
       wait_started.set()
       return await original_wait()
 
-    runner._wait_for_background_notification = tracked_wait  # type: ignore[method-assign]
+    runner._wait_for_background_notification = tracked_wait
     stream_calls = 0
 
     async def stream_turn(**_kwargs: Any):
@@ -4806,7 +4957,7 @@ def test_post_tool_end_turn_waits_for_custom_provider_background_child(
         tools_used=["lookup"],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     monkeypatch.setattr(
       gateway_runner,
       "_execute_tool_use_loop",
@@ -4865,7 +5016,7 @@ def test_run_loop_stops_after_tool_results_when_runner_requests_it(monkeypatch) 
         tools_used=["fms_report_sniff_test"],
       )
 
-    runner._stream_turn = fake_stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = fake_stream_turn
     monkeypatch.setattr(gateway_runner, "_execute_tool_use_loop", fake_execute_tool_use_loop)
 
     await runner.run(messages=[{"role": "user", "content": "Run sniff test"}], system_prompt="x")
@@ -4939,7 +5090,7 @@ def test_run_loop_stops_after_expired_approval_tool_result(monkeypatch) -> None:
         tools_used=["file_write"],
       )
 
-    runner._stream_turn = fake_stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = fake_stream_turn
     monkeypatch.setattr(
       gateway_runner,
       "_execute_tool_use_loop",
@@ -4965,6 +5116,8 @@ def test_run_loop_stops_after_expired_approval_tool_result(monkeypatch) -> None:
 def test_terminal_tool_result_wins_over_post_tool_budget_boundary(monkeypatch) -> None:
   async def _case() -> None:
     runner = _make_credential_runner()
+    terminal_tool_name = "fms_propose_managing_risk"
+    runner._terminal_tool_result_ids = frozenset({terminal_tool_name})
     stream_calls = {"count": 0}
     exceeded_state = SimpleNamespace(
       total_cost=2.6353,
@@ -5009,8 +5162,23 @@ def test_terminal_tool_result_wins_over_post_tool_budget_boundary(monkeypatch) -
 
     async def fake_execute_tool_use_loop(*args: Any, **kwargs: Any) -> ToolUseLoopResult:
       _ = args, kwargs
-      runner._stop_after_tool_results_reason = "terminal_tool_result"
-      runner._stop_after_tool_results_tool_name = "fms_propose_managing_risk"
+      await runner._call_on_tool_result(ToolResultContext(
+        tool_name=terminal_tool_name,
+        tool_input={"judgment": {"ticker": "PCTY"}},
+        redacted_tool_input={"judgment": {"ticker": "PCTY"}},
+        result={"status": "staged", "proposal_id": "proposal-1"},
+        error=None,
+        duration_ms=10,
+        tool_call_id="tool-1",
+        session_id=runner._full_session_id,
+        server=None,
+        result_entry={
+          "type": "tool_result",
+          "tool_use_id": "tool-1",
+          "content": '{"status":"staged","proposal_id":"proposal-1"}',
+        },
+        dispatch={"outcome": "ok"},
+      ))
       return ToolUseLoopResult(
         tool_results_content=[
           {
@@ -5022,12 +5190,13 @@ def test_terminal_tool_result_wins_over_post_tool_budget_boundary(monkeypatch) -
         tools_used=["fms_propose_managing_risk"],
       )
 
-    runner._stream_turn = fake_stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = fake_stream_turn
     monkeypatch.setattr(gateway_runner, "_execute_tool_use_loop", fake_execute_tool_use_loop)
 
     await runner.run(messages=[{"role": "user", "content": "Run managing risk"}], system_prompt="x")
 
     assert stream_calls["count"] == 1
+    assert runner._stop_after_tool_results_reason == "terminal_tool_result"
     events = [entry.event for entry in runner._log.entries]
     assert events[-1]["type"] == "stream_complete"
     assert not any(event.get("type") == "budget_exceeded" for event in events)
@@ -5035,6 +5204,67 @@ def test_terminal_tool_result_wins_over_post_tool_budget_boundary(monkeypatch) -
       event.get("type") == "run_interrupted" and event.get("reason") == "budget_exceeded"
       for event in events
     )
+
+  asyncio.run(_case())
+
+
+@pytest.mark.parametrize(
+  ("result", "dispatch_outcome", "result_entry_is_error"),
+  [
+    ({"gate_code": "STOP"}, "ok", False),
+    (
+      {
+        "status": "error",
+        "subcommand": "propose_demo",
+        "mutation_mode": "preview",
+        "error": {"recoverable": False},
+      },
+      "error_semantic",
+      True,
+    ),
+    (
+      {
+        "status": "error",
+        "subcommand": "propose_demo",
+        "mutation_mode": "preview",
+        "error": {"recoverable": True},
+      },
+      "error_semantic",
+      True,
+    ),
+  ],
+)
+def test_named_child_terminal_failure_keeps_narrative_path(
+  result: dict[str, Any],
+  dispatch_outcome: str,
+  result_entry_is_error: bool,
+) -> None:
+  async def _case() -> None:
+    runner = _make_credential_runner()
+    tool_name = "fms_propose_demo"
+    runner._terminal_tool_result_ids = frozenset({tool_name})
+
+    await runner._call_on_tool_result(ToolResultContext(
+      tool_name=tool_name,
+      tool_input={},
+      redacted_tool_input={},
+      result=result,
+      error=None,
+      duration_ms=10,
+      tool_call_id="tool-1",
+      session_id=runner._full_session_id,
+      server=None,
+      result_entry={
+        "type": "tool_result",
+        "tool_use_id": "tool-1",
+        "content": "terminal failure",
+        "is_error": result_entry_is_error,
+      },
+      dispatch={"outcome": dispatch_outcome},
+    ))
+
+    assert getattr(runner, "_stop_after_tool_results_reason", None) is None
+    assert getattr(runner, "_stop_after_tool_results_tool_name", None) is None
 
   asyncio.run(_case())
 
@@ -5063,7 +5293,7 @@ def test_max_tokens_exhaustion_cannot_commit_with_queued_notification() -> None:
         content_blocks=[{"type": "text", "text": "partial"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
       max_turns=None,
@@ -5137,7 +5367,7 @@ def test_terminal_tool_cannot_commit_with_mid_batch_notification(
         tools_used=["fms_report_demo"],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     monkeypatch.setattr(
       gateway_runner,
       "_execute_tool_use_loop",
@@ -5222,7 +5452,7 @@ def test_terminal_tool_commits_cleanly_after_acking_delivered_notification(
         tools_used=["fms_report_demo"],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     monkeypatch.setattr(
       gateway_runner,
       "_execute_tool_use_loop",
@@ -5254,8 +5484,16 @@ def test_terminal_tool_with_running_child_fails_before_shutdown_notification(
 ) -> None:
   async def _case() -> None:
     runner = _make_credential_runner()
-    runner._background_grace_wait_timeout_seconds = 0.0
-    runner._background_kill_drain_timeout_seconds = 0.05
+    monkeypatch.setattr(
+      gateway_background_lifecycle,
+      "_BACKGROUND_GRACE_WAIT_TIMEOUT_SECONDS",
+      0.0,
+    )
+    monkeypatch.setattr(
+      gateway_background_lifecycle,
+      "_BACKGROUND_KILL_DRAIN_TIMEOUT_SECONDS",
+      0.05,
+    )
     entry = runner._task_registry.register("background_agent")
     runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
     release = asyncio.Event()
@@ -5292,7 +5530,7 @@ def test_terminal_tool_with_running_child_fails_before_shutdown_notification(
         tools_used=["fms_report_demo"],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     monkeypatch.setattr(
       gateway_runner,
       "_execute_tool_use_loop",
@@ -5349,7 +5587,7 @@ def test_pre_terminal_hook_notification_is_rechecked_before_success() -> None:
         )
         await asyncio.sleep(0)
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     runner._on_before_stream_complete = before_terminal
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
@@ -5392,7 +5630,7 @@ def test_success_rejects_queued_entry_when_queue_bookkeeping_is_empty() -> None:
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
       max_turns=None,
@@ -5426,7 +5664,7 @@ def test_success_rejects_malformed_pending_background_ack() -> None:
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
       max_turns=None,
@@ -5458,7 +5696,7 @@ def test_success_rejects_pending_initializer() -> None:
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
       max_turns=None,
@@ -5524,7 +5762,7 @@ def test_terminal_snapshot_detects_generation_published_and_drained_in_hook() ->
       assert runner._notification_queue.pending_count == 0
       await asyncio.sleep(0)
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     runner._on_before_stream_complete = before_terminal
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
@@ -5569,8 +5807,8 @@ def test_staged_success_receipt_is_durable_before_live_terminal(
       timeline.append(("durable", str(event.get("type"))))
       return original_append_sync(event)
 
-    durable_log.append_sync = tracked_append_sync  # type: ignore[method-assign]
-    runner._log._on_event = lambda event, _session_id: timeline.append(  # type: ignore[attr-defined]
+    durable_log.append_sync = tracked_append_sync
+    runner._log._on_event = lambda event, _session_id: timeline.append(
       ("live", str(event.get("type")))
     )
 
@@ -5595,7 +5833,7 @@ def test_staged_success_receipt_is_durable_before_live_terminal(
         "outcome": "success",
       })
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     runner._on_before_stream_complete = before_terminal
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
@@ -5650,7 +5888,7 @@ def test_staged_success_receipt_persistence_failure_refuses_success(
     ) -> None:
       raise OSError("disk unavailable")
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     runner._on_before_stream_complete = before_terminal
     monkeypatch.setattr(
       runner,
@@ -5680,6 +5918,170 @@ def test_staged_success_receipt_persistence_failure_refuses_success(
   asyncio.run(_case())
 
 
+def test_failed_terminal_settlement_returns_learning_receipt_to_pending(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  from agent_gateway.fork_ledger import ForkLedger
+  from agent_gateway.learning_fork_trigger import LearningReceiptDelivery
+
+  async def case() -> None:
+    runner = _make_credential_runner()
+    runner._agent_session_log = AgentSessionLog(tmp_path / "failed-settlement.jsonl")
+    ledger = ForkLedger(tmp_path / "learning.sqlite3", process_instance_id="test")
+    ledger.write_receipt(
+      fork_id="fork-1", session_id="session-1", owner="owner-1",
+      receipt_text="Learned a preference",
+    )
+    claims = ledger.claim_pending_receipts(
+      session_id="session-1", owner="owner-1", claiming_turn_id="turn-1", limit=1,
+    )
+    monkeypatch.setattr(
+      gateway_run_loop, "claim_learning_receipts",
+      lambda _runner: LearningReceiptDelivery(ledger=ledger, claims=tuple(claims)),
+    )
+    forks: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+      gateway_run_loop, "submit_learning_fork_after_turn",
+      lambda _runner, **kwargs: forks.append(kwargs),
+    )
+
+    async def stream_turn(**_kwargs: Any):
+      return object(), StreamTurnResult(
+        full_text="done", stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "done"}],
+      )
+
+    async def before_terminal(_log: Any, event: dict[str, Any]) -> None:
+      if event["type"] == "stream_complete":
+        runner._terminal_success_staged_events.append({
+          "type": "terminal_receipt", "receipt_id": "receipt-1", "outcome": "success",
+        })
+
+    append_sync = runner._agent_session_log.append_sync
+
+    def fail_settlement(event: dict[str, Any]):
+      if event["type"] in {"terminal_receipt", "interrupted", "detach"}:
+        raise OSError("settlement disk unavailable")
+      return append_sync(event)
+
+    runner._stream_turn = stream_turn
+    runner._on_before_stream_complete = before_terminal
+    monkeypatch.setattr(runner._agent_session_log, "append_sync", fail_settlement)
+    try:
+      await runner.run(messages=[{"role": "user", "content": "finish"}])
+    except OSError:
+      pass
+    redelivery = ledger.claim_pending_receipts(
+      session_id="session-1", owner="owner-1", claiming_turn_id="turn-2", limit=1,
+    )
+    assert [claim.fork_id for claim in redelivery] == ["fork-1"]
+    assert forks == []
+    assert not any(e.event["type"] == "stream_complete" for e in runner._log.entries)
+
+  asyncio.run(case())
+
+
+def test_transient_error_append_preserves_failure_history(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def case() -> None:
+    runner = _make_credential_runner()
+    durable_log = AgentSessionLog(tmp_path / "transient-error.jsonl")
+    runner._agent_session_log = durable_log
+    existing = await durable_log.append({
+      "type": "run_error", "runner_id": "previous-runner",
+      "error": "already durable failure",
+    })
+
+    async def stream_turn(**_kwargs: Any):
+      return StreamTurnFailure(
+        error=RuntimeError("provider exploded"), formatted_error="provider exploded",
+      )
+
+    append_sync = durable_log.append_sync
+    failed = False
+
+    def fail_first_error(event: dict[str, Any]):
+      nonlocal failed
+      if event["type"] == "error" and not failed:
+        failed = True
+        raise OSError("transient error append")
+      return append_sync(event)
+
+    runner._stream_turn = stream_turn
+    monkeypatch.setattr(durable_log, "append_sync", fail_first_error)
+    await runner.run(messages=[{"role": "user", "content": "finish"}])
+    entries, _ = await durable_log.query(order="asc")
+    assert entries[0] == existing
+    current = [e.event for e in entries if e.event.get("runner_id") == runner._runner_id]
+    assert current[-1]["type"] == "detach" and current[-1]["reason"] == "error"
+    assert any(e["type"] == "run_error" for e in current)
+    assert any(e["type"] == "interrupted" for e in current)
+    assert any(e["type"] == "error" and "provider exploded" in e["error"] for e in current)
+
+  asyncio.run(case())
+
+
+def test_failed_success_append_retains_staging_until_error_closure_commits(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def case() -> None:
+    runner = _make_credential_runner()
+    durable_log = AgentSessionLog(tmp_path / "fallback-staging.jsonl")
+    runner._agent_session_log = durable_log
+    staged: list[dict[str, Any]] = []
+
+    async def stream_turn(**_kwargs: Any):
+      return object(), StreamTurnResult(
+        full_text="done", stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "done"}],
+      )
+
+    async def before_terminal(_log: Any, _event: dict[str, Any]) -> None:
+      nonlocal staged
+      staged = runner._terminal_success_staged_events
+      staged.append({"type": "terminal_receipt", "receipt_id": "kept", "outcome": "success"})
+
+    failed = False
+    fallback_started = asyncio.Event()
+    release_fallback = threading.Event()
+    loop = asyncio.get_running_loop()
+    append_sync = durable_log.append_sync
+
+    def fail_first_detach(event: dict[str, Any]):
+      nonlocal failed
+      if event["type"] == "detach" and not failed:
+        failed = True
+        raise OSError("transient detach failure")
+      if failed and event["type"] == "run_error":
+        loop.call_soon_threadsafe(fallback_started.set)
+        release_fallback.wait(timeout=5.0)
+      return append_sync(event)
+
+    monkeypatch.setattr(durable_log, "append_sync", fail_first_detach)
+    runner._stream_turn = stream_turn
+    runner._on_before_stream_complete = before_terminal
+    task = asyncio.create_task(runner.run(messages=[{"role": "user", "content": "finish"}]))
+    try:
+      await asyncio.wait_for(fallback_started.wait(), timeout=5.0)
+      assert [event["receipt_id"] for event in staged] == ["kept"]
+      assert not runner._log.has_terminal
+    finally:
+      release_fallback.set()
+      await task
+    entries, _ = await durable_log.query(order="asc")
+    assert [e.event["receipt_id"] for e in entries if e.event["type"] == "terminal_receipt"] == ["kept"]
+    assert entries[-1].event["reason"] == "error"
+    assert any(e.event["type"] == "interrupted" and e.event["reason"] == "persistence" for e in entries)
+    assert not staged
+    assert [e.event["type"] for e in runner._log.entries if e.event["type"] in {"error", "stream_complete"}] == ["error"]
+
+  asyncio.run(case())
+
+
 def test_terminal_hook_failure_warns_and_run_still_succeeds() -> None:
   async def _case() -> None:
     runner = _make_credential_runner()
@@ -5702,7 +6104,7 @@ def test_terminal_hook_failure_warns_and_run_still_succeeds() -> None:
       ):
         raise RuntimeError("capture failed")
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     runner._on_before_stream_complete = failing_hook
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
@@ -5811,7 +6213,7 @@ def test_child_result_trust_policy_persists_for_foreground_tool_result(
         tools_used=["run_agent"],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     monkeypatch.setattr(
       gateway_runner,
       "_execute_tool_use_loop",
@@ -5832,32 +6234,6 @@ def test_child_result_trust_policy_persists_for_foreground_tool_result(
   asyncio.run(_case())
 
 
-def test_terminal_event_has_one_guarded_commit_owner() -> None:
-  source = inspect.getsource(RunnerRunLoopMixin.run)
-
-  assert source.count("self._append(terminal_event)") == 1
-  commit_index = source.index("self._append(terminal_event)")
-  final_guard_index = source.rindex(
-    ") = _background_success_snapshot(self)",
-    0,
-    commit_index,
-  )
-  durable_receipt_index = source.index(
-    "self._append_durable_event_sync(",
-    final_guard_index,
-    commit_index,
-  )
-  live_receipt_index = source.index(
-    "self._append(staged_event)",
-    durable_receipt_index,
-    commit_index,
-  )
-  assert (
-    final_guard_index
-    < durable_receipt_index
-    < live_receipt_index
-    < commit_index
-  )
 
 
 def test_workflow_obstruction_blocks_settlement_maps_states() -> None:
@@ -5889,8 +6265,10 @@ def test_workflow_obstruction_blocks_settlement_maps_states() -> None:
 def test_both_hold_open_sites_consult_workflow_obstruction() -> None:
   # Both end_turn hold-open sites extend RUNNING-task keying with the
   # workflow settlement obstruction (§5.3, T2-I04).
-  source = inspect.getsource(RunnerRunLoopMixin.run)
-  assert source.count("self._workflow_settlement_obstructed()") == 2
+  no_tool_source = inspect.getsource(RunnerRunLoopMixin._handle_no_tool_turn)
+  tool_source = inspect.getsource(RunnerRunLoopMixin._finish_tool_turn)
+  assert no_tool_source.count("self._workflow_settlement_obstructed()") == 1
+  assert tool_source.count("self._workflow_settlement_obstructed()") == 1
 
 
 def test_workflow_obstruction_holds_final_turn_until_drive_settles() -> None:
@@ -5900,11 +6278,10 @@ def test_workflow_obstruction_holds_final_turn_until_drive_settles() -> None:
   # run terminally without any notification.
   def run_case(state: str) -> None:
     async def case() -> None:
-      runner = _make_credential_runner()
       rows: list[SimpleNamespace] = []
-      runner._gateway_session = SimpleNamespace(
-        workflow_settlement_obstruction=lambda: tuple(rows),
-      )
+      session = _fork_gateway_session()
+      session.workflow_settlement_obstruction = lambda: tuple(rows)
+      runner = _make_credential_runner(gateway_session=session)
       release = asyncio.Event()
 
       async def drive() -> None:
@@ -5927,7 +6304,7 @@ def test_workflow_obstruction_holds_final_turn_until_drive_settles() -> None:
         release.set()
         return await original_wait()
 
-      runner._wait_for_background_notification = tracked_wait  # type: ignore[method-assign]
+      runner._wait_for_background_notification = tracked_wait
 
       async def stream_turn(**_kwargs: Any):
         return object(), StreamTurnResult(
@@ -5936,7 +6313,7 @@ def test_workflow_obstruction_holds_final_turn_until_drive_settles() -> None:
           content_blocks=[{"type": "text", "text": "done"}],
         )
 
-      runner._stream_turn = stream_turn  # type: ignore[method-assign]
+      runner._stream_turn = stream_turn
       await runner.run(
         messages=[{"role": "user", "content": "finish"}],
         max_turns=3,
@@ -5966,7 +6343,6 @@ def test_unacked_workflow_boundary_delivers_reminder_then_acks_on_completed_turn
   # parked. T3-I02: the callback fires exactly once per consumed
   # notification, under the ack path, never at build.
   async def case() -> None:
-    runner = _make_credential_runner()
     rows: list[SimpleNamespace] = [
       SimpleNamespace(
         state="awaiting_action",
@@ -5974,9 +6350,9 @@ def test_unacked_workflow_boundary_delivers_reminder_then_acks_on_completed_turn
         wake=None,
       ),
     ]
-    runner._gateway_session = SimpleNamespace(
-      workflow_settlement_obstruction=lambda: tuple(rows),
-    )
+    session = _fork_gateway_session()
+    session.workflow_settlement_obstruction = lambda: tuple(rows)
+    runner = _make_credential_runner(gateway_session=session)
     acked: list[bool] = []
 
     def acknowledge() -> None:
@@ -6021,7 +6397,7 @@ def test_unacked_workflow_boundary_delivers_reminder_then_acks_on_completed_turn
         ],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "run the workflow"}],
       system_prompt="base",
@@ -6048,7 +6424,6 @@ def test_unacked_workflow_boundary_acks_on_tool_use_turn(
   # exactly once and the §5.3 obstruction clears — §5.3's "once the parent
   # has been told and has responded", now honoured on `tool_use` too.
   async def case() -> None:
-    runner = _make_credential_runner()
     rows: list[SimpleNamespace] = [
       SimpleNamespace(
         state="awaiting_action",
@@ -6056,9 +6431,9 @@ def test_unacked_workflow_boundary_acks_on_tool_use_turn(
         wake=None,
       ),
     ]
-    runner._gateway_session = SimpleNamespace(
-      workflow_settlement_obstruction=lambda: tuple(rows),
-    )
+    session = _fork_gateway_session()
+    session.workflow_settlement_obstruction = lambda: tuple(rows)
+    runner = _make_credential_runner(gateway_session=session)
     acked: list[bool] = []
 
     def acknowledge() -> None:
@@ -6133,7 +6508,7 @@ def test_unacked_workflow_boundary_acks_on_tool_use_turn(
         tools_used=["lookup"],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     monkeypatch.setattr(
       gateway_runner,
       "_execute_tool_use_loop",
@@ -6161,7 +6536,6 @@ def test_rendered_but_unanswered_workflow_boundary_still_obstructs() -> None:
   # delivering request is still in flight the boundary is rendered but
   # unanswered, so the callback has not fired and the §5.3 guard still
   # obstructs settlement.
-  runner = _make_credential_runner()
   rows: list[SimpleNamespace] = [
     SimpleNamespace(
       state="awaiting_action",
@@ -6169,9 +6543,9 @@ def test_rendered_but_unanswered_workflow_boundary_still_obstructs() -> None:
       wake=None,
     ),
   ]
-  runner._gateway_session = SimpleNamespace(
-    workflow_settlement_obstruction=lambda: tuple(rows),
-  )
+  session = _fork_gateway_session()
+  session.workflow_settlement_obstruction = lambda: tuple(rows)
+  runner = _make_credential_runner(gateway_session=session)
   acked: list[bool] = []
 
   notification = TaskNotification(
@@ -6205,7 +6579,6 @@ def test_background_wait_blocks_on_unacked_boundary_until_notification() -> None
   # boundary with no RUNNING task and wakes on the boundary notification
   # push (the queue is the wake channel, §5.3).
   async def case() -> None:
-    runner = _make_credential_runner()
     rows = [
       SimpleNamespace(
         state="awaiting_action",
@@ -6213,9 +6586,9 @@ def test_background_wait_blocks_on_unacked_boundary_until_notification() -> None
         wake=None,
       ),
     ]
-    runner._gateway_session = SimpleNamespace(
-      workflow_settlement_obstruction=lambda: tuple(rows),
-    )
+    session = _fork_gateway_session()
+    session.workflow_settlement_obstruction = lambda: tuple(rows)
+    runner = _make_credential_runner(gateway_session=session)
 
     waiter = asyncio.create_task(runner._wait_for_background_notification())
     await asyncio.sleep(0.01)
@@ -6258,7 +6631,7 @@ def test_turn_exhaustion_grants_the_synthesis_credit_without_pending_results() -
         content_blocks=[{"type": "text", "text": "committal answer"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "work"}],
       max_turns=1,
@@ -6289,7 +6662,7 @@ def test_the_exhaustion_synthesis_credit_is_still_capped_at_one() -> None:
         content_blocks=[{"type": "text", "text": "still thinking"}],
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "work"}],
       max_turns=1,

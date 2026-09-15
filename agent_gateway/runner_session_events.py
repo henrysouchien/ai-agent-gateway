@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import asyncio
 from collections.abc import Mapping
+from copy import deepcopy
 import json
-from typing import Any, Callable, Dict, Iterable, List
+from typing import Any, Callable, Dict, Iterable, List, Literal
 
 from agent_workflow_contracts import AgentCompletionEnvelope
 
 from .events import AgentCompletionEvent, event_to_dict
+from .skill_completion_wal import TopLevelSkillCompletionEffectPlan
 from .skill_lifecycle import TopLevelSkillLifecycleMetadata
+from .tool_dispatch_classification import OUTCOME_OK
 from .workflow_output_attachment import WorkflowOutputAttachment
 
 
@@ -302,6 +306,7 @@ def build_tool_call_complete_event(
   evidence fold to the block-reading fallback (D-B1-1).
   """
 
+  settled_dispatch = _normalized_dispatch_record(dispatch)
   payload: Dict[str, Any] = {
     "type": "tool_call_complete",
     "tool_call_id": tool_call_id,
@@ -310,11 +315,11 @@ def build_tool_call_complete_event(
     "error": error,
     "duration_ms": duration_ms,
     "server": server,
-    "is_error": error is not None or semantic_error is not None,
+    "is_error": settled_dispatch["outcome"] != OUTCOME_OK,
   }
   if semantic_error is not None:
     payload["semantic_error"] = dict(semantic_error)
-  payload["dispatch"] = _normalized_dispatch_record(dispatch)
+  payload["dispatch"] = settled_dispatch
   return payload
 
 
@@ -391,6 +396,8 @@ def build_stream_complete_event(
   *,
   usage_totals: Dict[str, int],
   estimated_cost: float,
+  est_system_tokens: int,
+  est_tools_tokens: int,
 ) -> Dict[str, Any]:
   return {
     "type": "stream_complete",
@@ -401,6 +408,8 @@ def build_stream_complete_event(
       "cache_creation_input_tokens": usage_totals["cache_creation_input_tokens"],
       "cache_read_input_tokens": usage_totals["cache_read_input_tokens"],
       "estimated_cost": round(estimated_cost, 4),
+      "est_system_tokens": est_system_tokens,
+      "est_tools_tokens": est_tools_tokens,
     },
   }
 
@@ -506,12 +515,59 @@ def build_chat_done_log_data(
   }
 
 
+_PROVIDER_ERROR_PROJECTION_FIELDS = (
+  "status_code",
+  "provider_request_id",
+  "rate_limit_representative_claim",
+  "rate_limit_5h_status",
+  "rate_limit_5h_utilization",
+  "rate_limit_5h_reset",
+  "rate_limit_7d_status",
+  "rate_limit_7d_utilization",
+  "rate_limit_7d_reset",
+  "retry_after",
+)
+
+
+class _ErrorWithProviderProjection(str):
+  _provider_error_projection: dict[str, str | int | float]
+
+
+def error_with_provider_projection(error: str, exc: BaseException) -> str:
+  projection = {
+    name: value
+    for name in _PROVIDER_ERROR_PROJECTION_FIELDS
+    if (value := getattr(exc, name, None)) is not None
+    and not isinstance(value, bool)
+    and isinstance(value, (str, int, float))
+  }
+  if not projection:
+    return error
+  projected_error = _ErrorWithProviderProjection(error)
+  projected_error._provider_error_projection = projection
+  return projected_error
+
+
+def _provider_error_event_fields(error: str) -> Dict[str, Any]:
+  projection = getattr(error, "_provider_error_projection", None)
+  return dict(projection) if isinstance(projection, Mapping) else {}
+
+
 def build_stream_retry_event(*, attempt: int, error: str) -> Dict[str, Any]:
-  return {"type": "stream_retry", "attempt": attempt, "error": error}
+  return {
+    "type": "stream_retry",
+    "attempt": attempt,
+    "error": str(error),
+    **_provider_error_event_fields(error),
+  }
 
 
 def build_error_event(error: str) -> Dict[str, Any]:
-  return {"type": "error", "error": error}
+  return {
+    "type": "error",
+    "error": str(error),
+    **_provider_error_event_fields(error),
+  }
 
 
 def build_run_error_event(
@@ -564,12 +620,24 @@ def build_orphan_tool_call_interrupted_events(
   resolved_tool_ids: set[str] = set()
   for entry in orphan_entries:
     event = entry.event
+    event_type = str(event.get("type") or "")
+    if event_type == "assistant_message":
+      for block in event.get("content_blocks") or []:
+        if block.get("type") == "tool_use" and block.get("id"):
+          starts.setdefault(str(block["id"]), {
+            "tool_name": block.get("name"),
+            "tool_input": block.get("input"),
+            "runner_id": event.get("runner_id"),
+            "role": event.get("role", "writer"),
+            **({"sub_agent_id": event["sub_agent_id"]} if "sub_agent_id" in event else {}),
+          })
+      continue
     tool_call_id = str(event.get("tool_call_id") or "")
     if not tool_call_id:
       continue
-    event_type = str(event.get("type") or "")
     if event_type == "tool_call_start":
-      starts.setdefault(tool_call_id, event)
+      if tool_call_id not in starts or "started_at" not in starts[tool_call_id]:
+        starts[tool_call_id] = event
     elif event_type in {"tool_call_complete", "tool_call_interrupted"}:
       resolved_tool_ids.add(tool_call_id)
 
@@ -587,6 +655,17 @@ def build_orphan_tool_call_interrupted_events(
       "tool_risk": tool_risk_for_tool(str(start_event.get("tool_name") or "")),
       "runner_id": start_event.get("runner_id"),
       "role": start_event.get("role", "writer"),
+      "final_tool_result_blocks": [{
+        "type": "tool_result",
+        "tool_use_id": tool_call_id,
+        "is_error": True,
+        "content": json.dumps({
+          "error": {
+            "code": "tool_interrupted",
+            "message": "The run ended without a tool result; execution may not have completed.",
+          },
+        }),
+      }],
     }
     if start_event.get("sub_agent_id") is not None:
       synthetic_event["sub_agent_id"] = start_event.get("sub_agent_id")
@@ -617,12 +696,116 @@ def build_detach_event(*, reason: str, ended_at: float) -> Dict[str, Any]:
   }
 
 
-def run_detach_reason(*, clean_detach_reason: str, run_error: BaseException | None) -> str:
-  if isinstance(run_error, asyncio.CancelledError):
-    return "cancelled"
-  if run_error is not None:
-    return "error"
-  return clean_detach_reason
+@dataclass(frozen=True)
+class NamedSkillClosure:
+  result: Dict[str, Any]
+  terminal: Dict[str, Any]
+  effect: TopLevelSkillCompletionEffectPlan
+
+
+@dataclass(frozen=True)
+class TerminalClosureDecision:
+  disposition: Literal["success", "error", "cancelled"]
+  reason: str
+  cause: BaseException | None = None
+  terminal: Dict[str, Any] | None = None
+  skill_result: Dict[str, Any] | None = None
+  skill_effect: TopLevelSkillCompletionEffectPlan | None = None
+
+  def require_named_skill_closure(self) -> NamedSkillClosure:
+    """Return the canonical named-skill pair and its completion effect."""
+    if (
+      self.skill_result is None
+      or self.terminal is None
+      or self.skill_effect is None
+    ):
+      raise RuntimeError(
+        "Named-skill closure requires a prepared result, terminal, and effect plan"
+      )
+    return NamedSkillClosure(self.skill_result, self.terminal, self.skill_effect)
+
+
+def terminal_closure_decision(
+  *,
+  clean_detach_reason: str,
+  run_error: BaseException | None,
+  terminal_event: Dict[str, Any] | None,
+  server_terminal_cause: str | None,
+  persistence_error: Exception | None = None,
+  persistence_failure_code: str = "terminal_persistence_failed",
+  skill_lifecycle: TopLevelSkillLifecycleMetadata | None = None,
+  skill_result: Dict[str, Any] | None = None,
+  skill_effect: TopLevelSkillCompletionEffectPlan | None = None,
+) -> TerminalClosureDecision:
+  """Decide one canonical pair from execution facts before durable publication."""
+  cause = run_error
+  disposition: Literal["success", "error", "cancelled"]
+  if persistence_error is not None:
+    disposition, reason, cause = "error", "persistence", persistence_error
+  elif isinstance(run_error, asyncio.CancelledError):
+    disposition, reason = "cancelled", server_terminal_cause or "cancelled"
+  elif run_error is not None:
+    disposition, reason = "error", "error"
+  elif terminal_event is not None and terminal_event.get("type") == "error":
+    disposition, reason = "error", "error"
+    cause = RuntimeError(str(terminal_event.get("error", "")))
+  elif clean_detach_reason == "error":
+    disposition, reason = "error", "error"
+  elif server_terminal_cause is not None or clean_detach_reason != "completed":
+    disposition, reason = "cancelled", server_terminal_cause or clean_detach_reason
+  else:
+    disposition, reason = "success", "completed"
+
+  terminal = terminal_event
+  if persistence_error is not None:
+    terminal = {
+      **build_error_event(
+        f"{persistence_failure_code}: terminal persistence failed "
+        f"({type(persistence_error).__name__}: {persistence_error})."
+      ),
+      "reason": reason,
+    }
+    if server_terminal_cause is not None:
+      terminal["server_terminal_cause"] = server_terminal_cause
+  elif (
+    terminal is not None
+    and terminal.get("type") == "stream_complete"
+    and terminal.get("terminal_disposition") != "interrupted"
+    and disposition != "success"
+  ):
+    terminal = (
+      {**terminal, "terminal_disposition": "interrupted", "reason": reason}
+      if disposition == "cancelled"
+      else build_error_event(str(cause or reason))
+    )
+    if server_terminal_cause is not None:
+      terminal["server_terminal_cause"] = server_terminal_cause
+
+  if skill_lifecycle is not None:
+    if persistence_error is not None or (
+      disposition != "success"
+      and skill_result is not None
+      and skill_result.get("outcome") == "success"
+    ):
+      error = str(
+        (terminal.get("error") or terminal.get("reason") if terminal is not None else None)
+        or reason
+      )
+      if skill_result is None:
+        skill_result = build_skill_result_failure_event(skill_lifecycle, error=error)
+      else:
+        skill_result = {
+          **deepcopy(skill_result),
+          "exit_code": 1, "outcome": "error", "status": "error", "error": error,
+        }
+      skill_effect = TopLevelSkillCompletionEffectPlan.noop()
+    if terminal is not None:
+      terminal = {**terminal, **skill_lifecycle.identity_fields()}
+  return TerminalClosureDecision(
+    disposition, reason, cause, terminal, skill_result, skill_effect,
+  )
+
+
 
 
 def run_interrupted_reason(
@@ -653,7 +836,10 @@ def build_stub_response_events(
   last_user = next((msg for msg in reversed(messages) if msg.get("role") == "user"), {})
   prompt = last_user.get("content") or "your request"
   response = f"Stub response (no {provider_name.title()} credential configured). You asked: {prompt}"
-  events = [{"type": "text_delta", "text": token + " "} for token in response.split()]
+  events: List[Dict[str, Any]] = [
+    {"type": "text_delta", "text": token + " "}
+    for token in response.split()
+  ]
   events.append({
     "type": "stream_complete",
     "terminal_disposition": "completed",

@@ -5,6 +5,9 @@ from typing import Any
 
 import pytest
 
+from agent_gateway.approval_route import DurableLocalApprovalRoute
+from agent_gateway.agent_session_log import AgentSessionLog
+from agent_gateway.agent_session_log_records import LogEntry as SessionLogEntry, QueryCursor
 from agent_gateway.mcp_activation import McpActivationFold
 from agent_gateway import AgentRunner, ToolDispatcher
 from agent_gateway.capability_execution import BoundCapabilityExecution
@@ -15,8 +18,11 @@ from agent_gateway.runner_budget import (
   ChildCostAccumulator,
   ObservationOnlyCostAccumulator,
 )
+from agent_gateway.mcp_client import McpClientManager
+from agent_gateway.multi_user.billing import _UsageAggregator
 import agent_gateway.runner as gateway_runner
 from agent_gateway.runner_sub_agents import RunnerSubAgentMixin
+from agent_gateway.sub_agent_result_evidence import SubAgentResultEvidence
 from agent_gateway.task_registry import TaskEntry
 from agent_workflow_contracts import (
   AgentOperationRef,
@@ -94,7 +100,7 @@ def _execution(capability_id: str = "node.explore") -> BoundCapabilityExecution:
   )
 
 
-class _Dispatcher:
+class _Dispatcher(ToolDispatcher):
   def __init__(self) -> None:
     self._event_log = EventLog()
     self._session_id = "parent-session"
@@ -107,46 +113,40 @@ class _Dispatcher:
     }]
 
 
-class _NullMcp:
-  def is_mcp_tool(self, _name: str) -> bool:
-    return False
-
+class _ParentProvider(ModelProvider):
+  name = "parent-provider"
 
 def _approval_dispatcher(session: GatewaySession) -> ToolDispatcher:
   return ToolDispatcher(
-    mcp_client=_NullMcp(),
+    mcp_client=McpClientManager(),
     event_log=EventLog(),
     session_id="parent-session",
-    session=session,
-    store=object(),
-    policy=object(),
+    approval_route=DurableLocalApprovalRoute(
+      object(),
+      object(),
+      session,
+    ),
     get_tool_definitions=_Dispatcher().get_tool_definitions,
   )
 
 
-class _EventLog:
-  def __init__(self, *, on_event: Any, session_id: str) -> None:
-    self._on_event = on_event
-    self.session_id = session_id
-    self.entries: list[SimpleNamespace] = []
-
-  def append(self, event: dict[str, Any]) -> None:
-    self.entries.append(SimpleNamespace(event=event))
-    if self._on_event is not None:
-      self._on_event(event, self.session_id)
+class _EventLog(EventLog):
+  pass
 
 
 class _ChildRunner:
   instances: list["_ChildRunner"] = []
+  approval_result: dict[str, object]
+
 
   def __init__(self, **kwargs: Any) -> None:
     self.kwargs = kwargs
     self._runner_id = f"runner-{kwargs['session_id']}"
-    self.run_kwargs: dict[str, Any] | None = None
+    self.run_kwargs: dict[str, object] | None = None
     self.closed = False
     self.instances.append(self)
 
-  async def run(self, **kwargs: Any) -> None:
+  async def run(self, **kwargs: object) -> None:
     self.run_kwargs = kwargs
     self.kwargs["event_log"].append({
       "type": "stream_complete",
@@ -161,7 +161,7 @@ class _ChildRunner:
 class _FailedRetrievalChildRunner(_ChildRunner):
   """A child whose only granted source-capability retrieval failed."""
 
-  async def run(self, **kwargs: Any) -> None:
+  async def run(self, **kwargs: object) -> None:
     self.run_kwargs = kwargs
     self.kwargs["event_log"].append({
       "type": "tool_call_complete",
@@ -175,10 +175,47 @@ class _FailedRetrievalChildRunner(_ChildRunner):
     })
 
 
+_TERMINAL_TOOL = "fms_propose_position_initiation_predecision"
+_TERMINAL_RESULT = {
+  "status": "staged",
+  "proposal_id": "proposal-1",
+  "artifact_ref": "artifacts/PCTY/predecision.json",
+}
+
+
+class _TerminalToolChildRunner(_ChildRunner):
+  async def run(self, **kwargs: object) -> None:
+    self.run_kwargs = kwargs
+    assert self.kwargs["terminal_tool_result_ids"] == {_TERMINAL_TOOL}
+    self.kwargs["event_log"].append({
+      "type": "tool_call_start",
+      "tool_name": _TERMINAL_TOOL,
+    })
+    self.kwargs["event_log"].append({
+      "type": "tool_call_complete",
+      "tool_name": _TERMINAL_TOOL,
+      "result": dict(_TERMINAL_RESULT),
+      "dispatch": {"outcome": "ok"},
+      "is_error": False,
+      "error": None,
+      "semantic_error": None,
+    })
+    self.kwargs["event_log"].append({
+      "type": "stream_complete",
+      "usage": {"input_tokens": 11, "output_tokens": 7},
+    })
+
+
+class _CancelledAfterTerminalChildRunner(_TerminalToolChildRunner):
+  async def run(self, **kwargs: object) -> None:
+    await super().run(**kwargs)
+    raise asyncio.CancelledError
+
+
 class _ApprovalChildRunner(_ChildRunner):
   approved = True
 
-  async def run(self, **kwargs: Any) -> None:
+  async def run(self, **kwargs: object) -> None:
     self.run_kwargs = kwargs
     dispatcher = self.kwargs["dispatcher"]
     approval_task = asyncio.create_task(
@@ -226,13 +263,13 @@ class _ApprovalChildRunner(_ChildRunner):
     })
 
 
-class _SessionLog:
+class _SessionLog(AgentSessionLog):
   def __init__(self, text: str) -> None:
     self.text = text
 
-  async def query(self, **kwargs: Any) -> tuple[list[Any], None]:
+  async def query(self, **kwargs: Any) -> tuple[list[SessionLogEntry], QueryCursor | None]:
     assert kwargs["event_types"] == {"assistant_message"}
-    return [SimpleNamespace(seq=41, event={
+    return [SessionLogEntry(seq=41, timestamp=0.0, event={
       "type": "assistant_message",
       "stop_reason": "end_turn",
       "logical_response_id": "logical-test-response",
@@ -244,10 +281,10 @@ class _SessionLog:
 def _parent(tmp_path: Path, *, session_log: _SessionLog | None) -> AgentRunner:
   runner = object.__new__(AgentRunner)
   runner._sub_agent_config = None
-  runner._provider = SimpleNamespace(name="parent-provider")
+  runner._provider = _ParentProvider()
   runner._auth_config = {"api_key": "parent"}
   runner._full_session_id = "parent-session"
-  runner._log = SimpleNamespace(_on_event=None)
+  runner._log = EventLog()
   runner._per_turn_timeout = 11.0
   runner._stream_stall_timeout = 12.0
   runner._mcp_client = None
@@ -262,12 +299,19 @@ def _parent(tmp_path: Path, *, session_log: _SessionLog | None) -> AgentRunner:
   runner._billing_mode = "metered"
   runner._rate_table_version = "v1"
   runner._channel = "web"
-  runner._usage_ledger_dlq_path = None
+  runner._usage_ledger_dlq_path = tmp_path / "usage-ledger-dlq.jsonl"
   runner._on_metric = None
-  runner._compaction_trigger = 0.8
+  runner._compaction_trigger = 80
   runner._tool_call_timeout = 13.0
   runner._on_max_turns = None
-  runner._aggregator = object()
+  runner._aggregator = _UsageAggregator(
+    user_id="alice",
+    session_id="parent-session",
+    request_id="req-1",
+    channel="web",
+    rate_table_version="v1",
+    billing_mode="metered",
+  )
   runner._max_concurrent_sub_agents = 2
   runner._agent_session_log = session_log
   runner._max_resume_chain_depth = 3
@@ -371,6 +415,118 @@ def test_spawn_sub_agent_never_injects_a_result_submission_tool(
     for tool in _ChildRunner.instances[-1].kwargs["get_tool_definitions"]()
   }
   assert "submit_report" not in names
+
+
+@pytest.mark.parametrize("method", ["spawn", "resume"])
+def test_named_child_projects_accepted_terminal_tool_result(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  method: str,
+) -> None:
+  _TerminalToolChildRunner.instances.clear()
+  admitted = sealed_admitted_task(
+    logical_task=_LOGICAL_TASK,
+    attempt=_ATTEMPT,
+    result_requirement=_RESULT,
+    tool_id=_TERMINAL_TOOL,
+  )
+  parent = _parent(tmp_path, session_log=_SessionLog("must not be read"))
+  monkeypatch.setattr(gateway_runner, "AgentRunner", _TerminalToolChildRunner)
+  monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)
+
+  result, error = (
+    _spawn(
+      parent,
+      admitted_task=admitted,
+      result_provenance=provenance_of(admitted),
+    )
+    if method == "spawn"
+    else _resume(
+      parent,
+      admitted_task=admitted,
+      result_provenance=provenance_of(admitted),
+    )
+  )
+
+  assert error is None
+  assert result is not None
+  assert result.execution.status == "succeeded"
+  assert result.values.terminal_narrative is None
+  assert result.values.projection is not None
+  assert result.values.projection.inline_view == {
+    "tool_name": _TERMINAL_TOOL,
+    "result": _TERMINAL_RESULT,
+  }
+
+
+def test_resume_short_circuits_prior_terminal_success_before_provider(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  _ChildRunner.instances.clear()
+  admitted = sealed_admitted_task(
+    logical_task=_LOGICAL_TASK,
+    attempt=_ATTEMPT,
+    result_requirement=_RESULT,
+    tool_id=_TERMINAL_TOOL,
+  )
+  parent = _parent(tmp_path, session_log=_SessionLog("must not be read"))
+  monkeypatch.setattr(gateway_runner, "AgentRunner", _ChildRunner)
+
+  result, error = _resume(
+    parent,
+    admitted_task=admitted,
+    result_provenance=provenance_of(admitted),
+    prior_evidence=SubAgentResultEvidence(
+      usage={"tool_calls": 1},
+      tools_used=(_TERMINAL_TOOL,),
+      fms_results=({"tool_name": _TERMINAL_TOOL, **_TERMINAL_RESULT},),
+      artifact_events=(),
+      warning_parts=(),
+    ),
+    prior_terminal_tool_result={
+      "tool_name": _TERMINAL_TOOL,
+      "result": _TERMINAL_RESULT,
+    },
+  )
+
+  assert error is None
+  assert result is not None
+  assert result.execution.status == "succeeded"
+  assert result.values.projection is not None
+  assert isinstance(result.values.projection.inline_view, dict)
+  assert result.values.projection.inline_view["result"] == _TERMINAL_RESULT
+  assert _ChildRunner.instances == []
+
+
+def test_terminal_success_wins_cancellation_after_durable_tool_event(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  admitted = sealed_admitted_task(
+    logical_task=_LOGICAL_TASK,
+    attempt=_ATTEMPT,
+    result_requirement=_RESULT,
+    tool_id=_TERMINAL_TOOL,
+  )
+  parent = _parent(tmp_path, session_log=_SessionLog("must not be read"))
+  monkeypatch.setattr(
+    gateway_runner,
+    "AgentRunner",
+    _CancelledAfterTerminalChildRunner,
+  )
+  monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)
+
+  result, error = _spawn(
+    parent,
+    admitted_task=admitted,
+    result_provenance=provenance_of(admitted),
+  )
+
+  assert error is None
+  assert result is not None
+  assert result.execution.status == "succeeded"
+  assert result.values.projection is not None
 
 
 def test_spawn_sub_agent_uses_exact_child_skill_run_identity(
@@ -567,6 +723,7 @@ def test_spawn_settlement_derives_the_outcome_from_admitted_authority(
   # result carries no outcome at all.
   _ChildRunner.instances.clear()
   entry = _admitted_entry()
+  assert entry.admitted_task is not None
   parent = _parent(tmp_path, session_log=_SessionLog("Partial findings."))
   monkeypatch.setattr(gateway_runner, "AgentRunner", _FailedRetrievalChildRunner)
   monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)
@@ -617,6 +774,7 @@ def test_resume_settlement_derives_the_outcome_from_admitted_authority(
   # authority, so a resumed segment settles with a mechanical qualifier too.
   _ChildRunner.instances.clear()
   entry = _admitted_entry()
+  assert entry.admitted_task is not None
   parent = _parent(tmp_path, session_log=_SessionLog("Partial findings."))
   monkeypatch.setattr(gateway_runner, "AgentRunner", _FailedRetrievalChildRunner)
   monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)

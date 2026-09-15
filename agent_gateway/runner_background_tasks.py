@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import html
 import math
-import time
 from typing import Any, Awaitable, Callable, Dict, Iterable, Mapping
 
 from agent_workflow_contracts import (
@@ -30,12 +30,13 @@ from .skill_lifecycle import (
   SkillLifecycleArtifactIdentity,
   TopLevelSkillLifecycleMetadata,
 )
-from .task_registry import NotificationQueue, TaskNotification, TaskState
+from .task_registry import TaskNotification, TaskState
 from .workflow_evidence_provenance import build_child_evidence_projection
 
 _BACKGROUND_RESULT_ACK_RESULT_KEY = "_background_result_ack"
 _BACKGROUND_ERROR_CODE_MAX_CHARS = 128
 _BACKGROUND_ERROR_MESSAGE_MAX_CHARS = 2_000
+_COMPLETION_TERMINAL_REASON_MAX_BYTES = 2_000
 REQUIRED_SKILL_LIFECYCLE_METADATA_KEY = "required_skill_lifecycle"
 _REQUIRED_SKILL_LIFECYCLE_SCHEMA_VERSION = 2
 _REQUIRED_SKILL_LIFECYCLE_ID_MAX_CHARS = 128
@@ -165,7 +166,7 @@ class WorkflowTaskMetadata:
     }
 
   @classmethod
-  def from_payload(cls, value: Mapping[str, Any]) -> "WorkflowTaskMetadata":
+  def from_payload(cls, value: object) -> "WorkflowTaskMetadata":
     if not isinstance(value, Mapping):
       raise ValueError("workflow task metadata must be an object")
     expected_fields = {
@@ -285,7 +286,7 @@ def agent_completion_message_id(task_result: TaskResult) -> str:
   return f"agent-completion:{digest.removeprefix('sha256:')}"
 
 
-def _primary_result_content(task_result: TaskResult) -> ContentHandle:
+def _primary_result_content(task_result: TaskResult) -> ContentHandle | None:
   values = task_result.values
   if values.terminal_narrative is not None:
     return values.terminal_narrative
@@ -295,9 +296,7 @@ def _primary_result_content(task_result: TaskResult) -> ContentHandle:
     raise ParentResultMaterializationError(
       "artifact-only result content has no registered direct-parent reader"
     )
-  raise ParentResultMaterializationError(
-    "task result has no canonical value for parent delivery"
-  )
+  return None
 
 
 def _direct_parent_read_grant(
@@ -315,6 +314,33 @@ def _direct_parent_read_grant(
       "parent read grant must address the exact result content"
     )
   return grant
+
+
+def _completion_terminal_reason(reason: str | None) -> str | None:
+  """Bound the notification projection; the TaskResult keeps the exact reason."""
+  if reason is None:
+    return None
+  limit = _COMPLETION_TERMINAL_REASON_MAX_BYTES
+  prefix = reason[:limit]
+
+  def notification_bytes(text: str) -> int:
+    return len(html.escape(
+      canonical_json_bytes(text).decode("utf-8")
+    ).encode("utf-8"))
+
+  if len(reason) <= limit and notification_bytes(prefix) <= limit:
+    return reason
+  marker = "...[truncated]"
+  low, high = 0, len(prefix)
+  # Account for UTF-8, JSON and XML expansion without encoding an unbounded
+  # upstream failure or cutting through a code point.
+  while low < high:
+    middle = (low + high + 1) // 2
+    if notification_bytes(prefix[:middle] + marker) <= limit:
+      low = middle
+    else:
+      high = middle - 1
+  return prefix[:low] + marker
 
 
 def build_agent_completion_envelope(
@@ -345,7 +371,7 @@ def build_agent_completion_envelope(
   values = task_result.values
   source = _primary_result_content(task_result)
 
-  def result_handle() -> ResultHandle:
+  def result_handle(source: ContentHandle) -> ResultHandle:
     return ResultHandle(
       source=source,
       read_grant=_direct_parent_read_grant(
@@ -354,7 +380,7 @@ def build_agent_completion_envelope(
       ),
     )
 
-  def summary_with_handle() -> AuthoredSummaryWithResultHandle:
+  def summary_with_handle(source: ContentHandle) -> AuthoredSummaryWithResultHandle:
     summary = authored_summary.strip() if isinstance(authored_summary, str) else ""
     if not summary:
       raise ParentResultMaterializationError(
@@ -369,25 +395,30 @@ def build_agent_completion_envelope(
       ),
     )
 
-  def overflow_materialization() -> AuthoredSummaryWithResultHandle | ResultHandle:
+  def overflow_materialization(
+    source: ContentHandle,
+  ) -> AuthoredSummaryWithResultHandle | ResultHandle:
     if policy.on_overflow == "authored_summary_with_result_handle":
-      return summary_with_handle()
+      return summary_with_handle(source)
     if policy.on_overflow == "result_handle":
-      return result_handle()
+      return result_handle(source)
     raise ParentResultMaterializationError(
       "canonical result exceeds the admitted parent inline limit"
     )
 
   preferred = policy.preferred
-  if preferred == "terminal_narrative_inline_exact":
+  if source is None:
+    # Non-success TaskResults legitimately carry only settlement/evidence.
+    # Deliver those facts, not a fabricated narrative or an unreadable handle.
+    materialization = None
+  elif preferred == "terminal_narrative_inline_exact":
     narrative = values.terminal_narrative
     if narrative is None:
       raise ParentResultMaterializationError(
         "terminal narrative policy requires a canonical narrative"
       )
-    source = narrative
     if narrative.content_bytes > policy.max_inline_bytes:
-      materialization = overflow_materialization()
+      materialization = overflow_materialization(narrative)
     else:
       exact_text = terminal_narrative_reader(task_result)
       if not isinstance(exact_text, str):
@@ -404,9 +435,8 @@ def build_agent_completion_envelope(
       raise ParentResultMaterializationError(
         "projection-inline policy requires an exact inline projection"
       )
-    source = projection.content
     if projection.content.content_bytes > policy.max_inline_bytes:
-      materialization = overflow_materialization()
+      materialization = overflow_materialization(projection.content)
     else:
       materialization = ProjectionInline(
         source=projection.content,
@@ -414,9 +444,9 @@ def build_agent_completion_envelope(
         value=projection.inline_view,
       )
   elif preferred == "authored_summary_with_result_handle":
-    materialization = summary_with_handle()
+    materialization = summary_with_handle(source)
   else:
-    materialization = result_handle()
+    materialization = result_handle(source)
 
   child_evidence_payload = build_child_evidence_projection(task_result)
   return AgentCompletionEnvelope(
@@ -424,6 +454,9 @@ def build_agent_completion_envelope(
     task_result_ref=TaskResultRef.from_result(task_result),
     settlement_projection=SettlementProjection(
       execution_status=task_result.execution.status,
+      terminal_reason=_completion_terminal_reason(
+        task_result.execution.terminal_reason
+      ),
       outcome_disposition=(
         task_result.outcome.disposition
         if task_result.outcome is not None
@@ -493,6 +526,12 @@ def _completion_notification_summary(
   already in the payload.
   """
   materialization = getattr(envelope, "parent_materialization", None)
+  if materialization is None:
+    settlement = envelope.settlement_projection
+    return (
+      f"Agent {settlement.execution_status} without result content. "
+      f"Reason: {settlement.terminal_reason}"
+    )
   if getattr(materialization, "kind", None) != "result_handle":
     return _INLINE_COMPLETION_SUMMARY
   source = getattr(materialization, "source", None)
@@ -568,165 +607,6 @@ class BackgroundResultRequest:
   wait: bool
   timeout: float
   cursor: str | None
-
-
-@dataclass(frozen=True)
-class PlanProgressSnapshot:
-  plan_id: str
-  phase: str
-  nodes_total: int
-  nodes_complete: int
-  items_total: int
-  items_complete: int
-  current_node: str | None
-  status: str
-
-  def __post_init__(self) -> None:
-    for field_name in ("plan_id", "phase", "status"):
-      value = getattr(self, field_name)
-      if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{field_name} must be non-empty text")
-    if self.current_node is not None and (
-      not isinstance(self.current_node, str)
-      or not self.current_node.strip()
-    ):
-      raise ValueError("current_node must be null or non-empty text")
-    for complete_name, total_name in (
-      ("nodes_complete", "nodes_total"),
-      ("items_complete", "items_total"),
-    ):
-      complete = getattr(self, complete_name)
-      total = getattr(self, total_name)
-      if (
-        isinstance(complete, bool)
-        or isinstance(total, bool)
-        or not isinstance(complete, int)
-        or not isinstance(total, int)
-        or complete < 0
-        or total < 0
-        or complete > total
-      ):
-        raise ValueError(
-          f"{complete_name} and {total_name} must satisfy "
-          f"0 <= {complete_name} <= {total_name}"
-        )
-
-  def payload(self) -> dict[str, Any]:
-    return {
-      "plan_id": self.plan_id,
-      "phase": self.phase,
-      "nodes_total": self.nodes_total,
-      "nodes_complete": self.nodes_complete,
-      "items_total": self.items_total,
-      "items_complete": self.items_complete,
-      "current_node": self.current_node,
-      "status": self.status,
-    }
-
-
-class PlanNotificationProducer:
-  """Emit bounded plan notifications through the existing task queue."""
-
-  def __init__(
-    self,
-    *,
-    queue: NotificationQueue,
-    entry: Any,
-    item_cadence: int = 5,
-    seconds_cadence: float = 15.0,
-    monotonic: Callable[[], float] = time.monotonic,
-    wall_clock: Callable[[], float] = time.time,
-  ) -> None:
-    if (
-      isinstance(item_cadence, bool)
-      or not isinstance(item_cadence, int)
-      or item_cadence <= 0
-    ):
-      raise ValueError("item_cadence must be a positive integer")
-    if (
-      isinstance(seconds_cadence, bool)
-      or not isinstance(seconds_cadence, (int, float))
-      or not math.isfinite(float(seconds_cadence))
-      or seconds_cadence <= 0
-    ):
-      raise ValueError("seconds_cadence must be positive and finite")
-    if getattr(entry, "task_type", None) != "plan_run":
-      raise ValueError("plan notifications require task_type='plan_run'")
-    self._queue = queue
-    self._entry = entry
-    self._item_cadence = item_cadence
-    self._seconds_cadence = float(seconds_cadence)
-    self._monotonic = monotonic
-    self._wall_clock = wall_clock
-    self._last_progress_at = monotonic()
-    self._last_items_complete = 0
-
-  def _notification(
-    self,
-    *,
-    event: str,
-    snapshot: PlanProgressSnapshot,
-  ) -> TaskNotification:
-    self._entry.notification_generation += 1
-    return TaskNotification(
-      task_id=self._entry.task_id,
-      agent_name=self._entry.agent_name,
-      event=event,
-      summary=(
-        f"Plan {snapshot.plan_id}: {snapshot.status}; "
-        f"{snapshot.nodes_complete}/{snapshot.nodes_total} nodes, "
-        f"{snapshot.items_complete}/{snapshot.items_total} items"
-      ),
-      timestamp=self._wall_clock(),
-      payload=snapshot.payload(),
-      notification_generation=self._entry.notification_generation,
-    )
-
-  def emit_transition(self, snapshot: PlanProgressSnapshot) -> bool:
-    return self._emit_progress(snapshot)
-
-  def emit_item_completion(
-    self,
-    snapshot: PlanProgressSnapshot,
-  ) -> bool:
-    now = self._monotonic()
-    item_delta = snapshot.items_complete - self._last_items_complete
-    if (
-      item_delta < self._item_cadence
-      and now - self._last_progress_at < self._seconds_cadence
-    ):
-      return False
-    return self._emit_progress(snapshot, emitted_at=now)
-
-  def flush(self, snapshot: PlanProgressSnapshot) -> bool:
-    return self._emit_progress(snapshot)
-
-  def emit_approval_pending(
-    self,
-    snapshot: PlanProgressSnapshot,
-  ) -> bool:
-    return self._queue.push(
-      self._notification(
-        event="plan_approval_pending",
-        snapshot=snapshot,
-      )
-    )
-
-  def _emit_progress(
-    self,
-    snapshot: PlanProgressSnapshot,
-    *,
-    emitted_at: float | None = None,
-  ) -> bool:
-    self._last_progress_at = (
-      self._monotonic()
-      if emitted_at is None
-      else emitted_at
-    )
-    self._last_items_complete = snapshot.items_complete
-    return self._queue.push_or_replace_pending(
-      self._notification(event="plan_progress", snapshot=snapshot)
-    )
 
 
 def background_timeout_value(raw_timeout: Any) -> float:
@@ -1089,6 +969,11 @@ def background_task_payload(
 
   if getattr(bg_task, "state", None) == TaskState.INTERRUPTED:
     metadata = getattr(bg_task, "metadata", {}) if isinstance(getattr(bg_task, "metadata", None), dict) else {}
+    capability_bind_receipt = getattr(
+      bg_task,
+      "capability_bind_receipt",
+      None,
+    )
     resumed_as = list(resumed_task_ids or [])
     interrupted_error = (
       bounded_background_error(bg_task.error)
@@ -1113,8 +998,8 @@ def background_task_payload(
         "call_index": metadata.get("call_index"),
         "task_type": metadata.get("task_type", getattr(bg_task, "task_type", None)),
         "capability_bind": (
-          dict(getattr(bg_task, "capability_bind_receipt", None))
-          if isinstance(getattr(bg_task, "capability_bind_receipt", None), dict)
+          dict(capability_bind_receipt)
+          if isinstance(capability_bind_receipt, dict)
           else metadata.get("capability_bind")
         ),
         "original_task_id": getattr(bg_task, "original_task_id", None),
@@ -1187,7 +1072,7 @@ def bounded_background_error(
     or code
   )
   message = str(raw_message)
-  bounded = {
+  bounded: dict[str, str | bool | int] = {
     "code": code,
     "message": message[:_BACKGROUND_ERROR_MESSAGE_MAX_CHARS],
   }

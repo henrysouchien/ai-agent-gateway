@@ -11,7 +11,7 @@ import time
 from array import array
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Protocol, TypeVar, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 
 from . import memory_markdown_sync as _memory_markdown_sync
 from .memory_markdown_sync import (  # noqa: F401
@@ -36,7 +36,6 @@ from .memory_markdown_sync import (  # noqa: F401
 
 log = logging.getLogger("agent_gateway.memory")
 
-T = TypeVar("T")
 _CORRUPTION_SIGNATURES = (
   "malformed",
   "corrupt",
@@ -56,13 +55,16 @@ class EmbeddingProvider(Protocol):
 
   async def embed(self, text: str) -> list[float]:
     """Generate an embedding vector for a single text."""
+    ...
 
   async def embed_batch(self, texts: list[str]) -> list[list[float]]:
     """Generate embedding vectors for multiple texts."""
+    ...
 
   @property
   def dimensions(self) -> int:
     """Embedding vector dimensions."""
+    ...
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -77,18 +79,6 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
   if norm_a == 0.0 or norm_b == 0.0:
     return 0.0
   return dot / (norm_a * norm_b)
-
-
-def rank_by_similarity(
-  query_embedding: list[float],
-  candidates: list[tuple[T, list[float]]],
-) -> list[tuple[T, float]]:
-  ranked = [
-    (item, cosine_similarity(query_embedding, candidate_embedding))
-    for item, candidate_embedding in candidates
-  ]
-  ranked.sort(key=lambda row: row[1], reverse=True)
-  return ranked
 
 
 def _now_ts() -> float:
@@ -252,7 +242,7 @@ class MemoryStore:
     )
     conn.commit()
 
-  def _serialize_embedding(self, vector: list[float]) -> bytes:
+  def _serialize_embedding(self, vector: list[float]) -> memoryview:
     return sqlite3.Binary(array("f", [float(value) for value in vector]).tobytes())
 
   def _deserialize_embedding(self, blob: bytes | bytearray | memoryview) -> list[float]:
@@ -273,23 +263,6 @@ class MemoryStore:
     if result is None:
       return None
     return [float(value) for value in result]
-
-  async def _embed_batch(self, texts: list[str]) -> list[list[float]]:
-    if not texts or self._embedding_fn is None:
-      return []
-
-    if isinstance(self._embedding_fn, EmbeddingProvider):
-      vectors = await self._embedding_fn.embed_batch(texts)
-      return [[float(value) for value in vector] for vector in vectors]
-
-    vectors: list[list[float]] = []
-    for text in texts:
-      vector = await self._embed_text(text)
-      if vector is None:
-        vectors.append([])
-      else:
-        vectors.append(vector)
-    return vectors
 
   def _clean_tags(self, tags: list[str] | None) -> list[str]:
     if not tags:

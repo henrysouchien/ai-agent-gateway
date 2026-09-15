@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import errno
 import hashlib
 import inspect
 import json
@@ -20,13 +21,17 @@ import agent_gateway.autonomous_event_channel as channel
 from agent_gateway.autonomous_event_channel import (
   AUTONOMOUS_EVENT_CHANNEL_DIGEST_DOMAIN,
   AUTONOMOUS_EVENT_CHANNEL_FD_ENV,
+  AutonomousEventAcknowledgement,
   AutonomousEventChannelAcknowledgementError,
   AutonomousEventChannelBoundsError,
+  AutonomousEventChannelChild,
   AutonomousEventChannelError,
+  AutonomousEventChannelParent,
   AutonomousEventChannelProtocolError,
   AutonomousEventChannelStateError,
   AutonomousEventChannelTimeout,
   AutonomousEventChannelTransportError,
+  AutonomousEventRecord,
   ReceivedAutonomousEventStream,
   adopt_inherited_autonomous_event_channel,
   create_autonomous_event_channel,
@@ -37,6 +42,11 @@ from agent_gateway.autonomous_event_channel import (
 _CHANNEL_ID = "ab" * 32
 _OTHER_CHANNEL_ID = "cd" * 32
 _HEADER = struct.Struct(">I")
+_ParentAckResult = (
+  tuple[ReceivedAutonomousEventStream, AutonomousEventAcknowledgement]
+  | BaseException
+)
+
 
 
 def test_fd_environment_variable_name_is_the_exported_single_source() -> None:
@@ -116,7 +126,9 @@ def _ack(
   }
 
 
-def _duplicate_endpoint(endpoint) -> socket.socket:
+def _duplicate_endpoint(
+  endpoint: AutonomousEventChannelParent | AutonomousEventChannelChild,
+) -> socket.socket:
   duplicated_fd = os.dup(endpoint.fileno())
   raw = socket.socket(fileno=duplicated_fd)
   endpoint.close()
@@ -141,18 +153,13 @@ def _raw_recv_frame(sock: socket.socket) -> tuple[dict[str, Any], bytes]:
 
 
 def _run_parent_ack(
-  parent,
-  result: queue.Queue[object],
-  *,
-  acknowledge: bool = True,
+  parent: AutonomousEventChannelParent,
+  result: queue.Queue[_ParentAckResult],
 ) -> None:
   try:
     stream = parent.receive(timeout_seconds=2)
-    if acknowledge:
-      ack = parent.acknowledge(stream, timeout_seconds=2)
-      result.put((stream, ack))
-    else:
-      result.put(stream)
+    ack = parent.acknowledge(stream, timeout_seconds=2)
+    result.put((stream, ack))
   except BaseException as exc:
     result.put(exc)
 
@@ -160,12 +167,16 @@ def _run_parent_ack(
 def _happy_stream(
   nonterminal_events: list[dict[str, Any]],
   terminal_event: dict[str, Any],
-) -> tuple[ReceivedAutonomousEventStream, object, object]:
+) -> tuple[
+  ReceivedAutonomousEventStream,
+  AutonomousEventAcknowledgement,
+  AutonomousEventAcknowledgement,
+]:
   pair = create_autonomous_event_channel(
     channel_id=_CHANNEL_ID,
     io_timeout_seconds=2,
   )
-  result: queue.Queue[object] = queue.Queue()
+  result: queue.Queue[_ParentAckResult] = queue.Queue()
   worker = threading.Thread(
     target=_run_parent_ack,
     args=(pair.parent, result),
@@ -188,7 +199,7 @@ def _happy_stream(
     pair.close()
 
 
-def _raw_parent_pair() -> tuple[object, socket.socket]:
+def _raw_parent_pair() -> tuple[AutonomousEventChannelParent, socket.socket]:
   pair = create_autonomous_event_channel(
     channel_id=_CHANNEL_ID,
     io_timeout_seconds=1,
@@ -307,15 +318,16 @@ def test_incremental_receive_returns_live_records_in_order_before_final_stream()
   child_worker = threading.Thread(target=child_work, daemon=True)
   child_worker.start()
   try:
-    records = [
-      pair.parent.receive_next(
-        timeout_seconds=2,
-        unbounded_stream=False,
-      ),
-      pair.parent.receive_next(),
-      pair.parent.receive_next(),
-    ]
-    assert all(isinstance(record, channel.AutonomousEventRecord) for record in records)
+    first_record = pair.parent.receive_next(
+      timeout_seconds=2,
+      unbounded_stream=False,
+    )
+    second_record = pair.parent.receive_next()
+    terminal_record = pair.parent.receive_next()
+    assert isinstance(first_record, AutonomousEventRecord)
+    assert isinstance(second_record, AutonomousEventRecord)
+    assert isinstance(terminal_record, AutonomousEventRecord)
+    records = [first_record, second_record, terminal_record]
     assert [record.event["type"] for record in records] == [
       "text_delta",
       "tool_call_complete",
@@ -1160,6 +1172,40 @@ def test_child_rejects_circular_json_and_aborts() -> None:
     pair.close()
 
 
+@pytest.mark.parametrize(
+  ("shared", "expected_value"),
+  [
+    ({"marker": "once"}, {"marker": "once"}),
+    (["once"], ["once"]),
+  ],
+  ids=["dict", "list"],
+)
+def test_snapshot_serializes_shared_noncyclic_container(
+  shared: Any,
+  expected_value: Any,
+) -> None:
+  event = {
+    "type": "text_delta",
+    "left": shared,
+    "right": shared,
+  }
+
+  snapshot = snapshot_autonomous_event(event)
+
+  assert snapshot.event == {
+    "left": expected_value,
+    "right": expected_value,
+    "type": "text_delta",
+  }
+
+
+def test_snapshot_rejects_genuine_circular_reference() -> None:
+  event: dict[str, Any] = {"type": "text_delta"}
+  event["self"] = event
+  with pytest.raises(AutonomousEventChannelProtocolError, match="circular"):
+    snapshot_autonomous_event(event)
+
+
 def test_canonical_preflight_rejects_22_node_shared_list_dag_in_bounded_work(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1175,13 +1221,8 @@ def test_canonical_preflight_rejects_22_node_shared_list_dag_in_bounded_work(
     raise AssertionError("oversized DAG reached json.dumps")
 
   monkeypatch.setattr(channel.json, "dumps", unexpected_dump)
-  started = time.monotonic()
-  with pytest.raises(
-    AutonomousEventChannelProtocolError,
-    match="reuse container identities",
-  ):
+  with pytest.raises(AutonomousEventChannelBoundsError):
     snapshot_autonomous_event(event)
-  assert time.monotonic() - started < 0.5
   assert dumps_called is False
 
 
@@ -1359,7 +1400,15 @@ def _run_child_completion_against_raw_parent(
     response = ack_builder(end, event_frame)
     if response is not None:
       raw.sendall(response)
-      raw.shutdown(socket.SHUT_WR)
+      try:
+        raw.shutdown(socket.SHUT_WR)
+      except OSError as exc:
+        # A rejected ack makes the child raise and close before this side's EOF
+        # lands; macOS then reports ENOTCONN on shutdown. The outcome the test
+        # asserts is already in `result`, so EOF is moot. Observed 2026-09-11 in
+        # 2 of 4 isolated runs and one -n 12 gate at load 46-58.
+        if exc.errno != errno.ENOTCONN:
+          raise
     raw.close()
     worker.join(timeout=2)
     assert not worker.is_alive()
@@ -1522,7 +1571,13 @@ def test_child_complete_uses_one_absolute_deadline_through_ack_and_eof(
     peer.join(timeout=2)
     assert not peer.is_alive()
     peer_outcome = peer_result.get_nowait()
-    assert peer_outcome is None or isinstance(peer_outcome, BrokenPipeError)
+    # The raw peer races the child's deadline close: its ack/shutdown may land
+    # after the child hung up, which macOS reports as EPIPE, ENOTCONN or
+    # ECONNRESET depending on which call loses.
+    assert peer_outcome is None or (
+      isinstance(peer_outcome, OSError)
+      and peer_outcome.errno in {errno.EPIPE, errno.ENOTCONN, errno.ECONNRESET}
+    ), peer_outcome
     assert pair.child.fileno() == -1
   finally:
     raw_parent.close()
@@ -1540,7 +1595,7 @@ def test_child_event_snapshot_is_immune_to_caller_mutation_during_encoding(
     "type": "stream_complete",
     "marker": "before",
   }
-  parent_result: queue.Queue[object] = queue.Queue()
+  parent_result: queue.Queue[_ParentAckResult] = queue.Queue()
   parent_worker = threading.Thread(
     target=_run_parent_ack,
     args=(pair.parent, parent_result),

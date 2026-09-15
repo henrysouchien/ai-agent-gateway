@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import hashlib
 from itertools import count
 import json
@@ -16,6 +17,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from agent_gateway import AgentRunner
 from agent_gateway.autonomous_capability_handoff import (
   AutonomousCapabilityBinding,
 )
@@ -40,14 +42,20 @@ from agent_gateway.control_plane import runs_chat_helpers as chat_helpers_module
 from agent_gateway.control_plane import runs_helpers as helpers_module
 from agent_gateway.control_plane import runs_models as models_module
 from agent_gateway.control_plane import runs_resume_helpers as resume_helpers_module
-from agent_gateway.control_plane.runs import (
+from agent_gateway.control_plane.runs_helpers import (
   _AUTONOMOUS_RESUME_CONTEXT_MAX_CHARS,
   _AUTONOMOUS_RESUME_TOOL_RESULT_BLOCK_MAX_CHARS,
+)
+from agent_gateway.control_plane.runs_resume_helpers import (
   _completed_tool_result_tail,
   _render_completed_tool_result_tail,
 )
 from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
 from agent_gateway.event_log import EventLog
+from agent_gateway.skill_limits import (
+  AutonomousSkillAdmissionPolicy,
+  SkillExecutionLimits,
+)
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 from agent_gateway.session import GatewaySession
 
@@ -57,6 +65,7 @@ from .manifest_helpers import TASK_MANIFEST_VERSION, write_v6_manifest
 API_KEY = "autonomous-pr5a-key"
 HMAC_KEY = "autonomous-pr5a-hmac-key-at-least-32-bytes"
 API_DIR = Path(__file__).resolve().parents[4] / "api"
+_UNSET = object()
 _MODEL_ENTRY = INITIAL_MODEL_REGISTRY.require("anthropic.claude-opus-5")
 _SERVICE_HANDLE = CredentialHandle(
   handle_id="service:test-product:anthropic",
@@ -104,8 +113,6 @@ def test_control_plane_runs_parent_aliases_moved_helpers() -> None:
   assert helpers_module.ChatDispatchRequest is models_module.ChatDispatchRequest
   assert helpers_module.RunEnvelopeResponse is models_module.RunEnvelopeResponse
   assert runs_module._autonomous_state is helpers_module._autonomous_state
-  assert runs_module._completed_tool_result_tail is resume_helpers_module._completed_tool_result_tail
-  assert runs_module._render_completed_tool_result_tail is resume_helpers_module._render_completed_tool_result_tail
   assert runs_module._build_autonomous_resume_context is resume_helpers_module._build_autonomous_resume_context
   assert runs_module.cleanup_control_chat_tasks is chat_helpers_module.cleanup_control_chat_tasks
   assert runs_module._dispatch_control_chat_turn is chat_helpers_module._dispatch_control_chat_turn
@@ -257,15 +264,22 @@ Run the resumable test skill.
   )
 
 
-class _NoopRunner:
+class _NoopRunner(AgentRunner):
+  def __init__(self) -> None:
+    pass
+
+  def bind_selected_content(self, bindings) -> None:
+    _ = bindings
+
   async def run(
     self,
+    messages,
+    system_prompt=None,
+    max_turns=None,
     *,
-    messages: list[dict[str, Any]],
-    system_prompt: str | None = None,
-    max_turns: int | None = None,
+    resume_initial_messages=None,
   ) -> None:
-    _ = messages, system_prompt, max_turns
+    _ = messages, system_prompt, max_turns, resume_initial_messages
 
 
 def _make_app(
@@ -273,20 +287,36 @@ def _make_app(
   tmp_path: Path,
   *,
   control_skills_dir: Path | None = None,
+  control_skill_catalog: Any | None = None,
+  control_profile_names_provider: Any | None = None,
+  control_profile_loader: Any | None = None,
+  admission_policy_resolver: Any = _UNSET,
   dispatch_scope_validator: Any | None = None,
   claim_signing_authority_installed: bool = True,
-  autonomous_api_dir: Path = API_DIR,
+  autonomous_api_dir: Path | None = API_DIR,
 ):
   monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
   monkeypatch.setenv("AGENT_GATEWAY_AUTONOMOUS_LOG_DIR", str(tmp_path / "autonomous-logs"))
 
-  async def _build_chat_runtime(*, session, request, channel, auth_manager):
+  async def _build_chat_runtime(session, request, channel, auth_manager, *, storage_root: Path | None = None):
     _ = session, channel, auth_manager
     return ChatRuntime(
       system_prompt="system",
-      build_runner=lambda event_log, _sid: _runner_with_log(event_log),
+      build_runner=lambda event_log, _sid, _started_at: _runner_with_log(event_log),
       capability_execution=request.capability_execution,
     )
+
+  if admission_policy_resolver is _UNSET:
+    default_admission_resolver = (
+      None
+      if control_skills_dir is not None
+      else lambda skill_name: AutonomousSkillAdmissionPolicy(
+        False,
+        SkillExecutionLimits(None, None, None),
+      )
+    )
+  else:
+    default_admission_resolver = admission_policy_resolver
 
   return create_gateway_app(
     GatewayServerConfig(
@@ -297,8 +327,14 @@ def _make_app(
       model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
       build_chat_runtime=_build_chat_runtime,
       autonomous_capability_binding_resolver=_autonomous_capability_binding,
+      autonomous_skill_admission_policy_resolver=(
+        default_admission_resolver
+      ),
       autonomous_api_dir=autonomous_api_dir,
       control_skills_dir=control_skills_dir,
+      control_skill_catalog=control_skill_catalog,
+      control_profile_names_provider=control_profile_names_provider,
+      control_profile_loader=control_profile_loader,
       dispatch_scope_validator=dispatch_scope_validator,
       claim_signing_authority=(
         GatewayClaimSigningAuthority(HMAC_KEY)
@@ -307,6 +343,95 @@ def _make_app(
       ),
     )
   )
+
+
+class _EmptyControlSkillCatalog:
+  def list_skills(self) -> tuple:
+    return ()
+
+  def resolve_skill(self, _name: object) -> object:
+    raise AssertionError("empty control catalog has no detail")
+
+
+def test_control_catalog_and_explicit_directory_are_mutually_exclusive(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  with pytest.raises(ValueError, match="mutually exclusive"):
+    _make_app(
+      monkeypatch,
+      tmp_path,
+      control_skills_dir=tmp_path / "skills",
+      control_skill_catalog=_EmptyControlSkillCatalog(),
+    )
+
+
+def test_injected_control_and_admission_avoid_directory_fallback(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from agent_gateway import server as server_module
+
+  def fail_directory_fallback(*_args, **_kwargs):
+    raise AssertionError("injected product catalogs must not use a directory")
+
+  monkeypatch.setattr(
+    server_module,
+    "_default_control_skills_dir",
+    fail_directory_fallback,
+  )
+  monkeypatch.setattr(
+    server_module,
+    "DirectoryControlSkillCatalog",
+    fail_directory_fallback,
+  )
+  def resolver(_skill: str) -> AutonomousSkillAdmissionPolicy:
+    return AutonomousSkillAdmissionPolicy(
+      False,
+      SkillExecutionLimits(None, None, None),
+    )
+
+  app = _make_app(
+    monkeypatch,
+    tmp_path,
+    control_skill_catalog=_EmptyControlSkillCatalog(),
+    admission_policy_resolver=resolver,
+  )
+
+  assert (
+    app.state.subprocess_registry._autonomous_skill_admission_policy_resolver
+    is resolver
+  )
+
+
+def test_external_control_and_admission_share_one_resolved_default_root(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from agent_gateway import server as server_module
+
+  calls: list[bool] = []
+  skills_dir = tmp_path / "external-skills"
+  skills_dir.mkdir()
+
+  def resolve_default() -> Path:
+    calls.append(True)
+    return skills_dir
+
+  monkeypatch.setattr(
+    server_module,
+    "_default_control_skills_dir",
+    resolve_default,
+  )
+
+  app = _make_app(
+    monkeypatch,
+    tmp_path,
+    admission_policy_resolver=None,
+  )
+
+  assert calls == [True]
+  assert app.state.subprocess_registry is not None
 
 
 def _autonomous_log_dir(tmp_path: Path) -> Path:
@@ -384,7 +509,7 @@ def _write_rehydrate_manifest(
     exit_code=exit_code,
     error=error,
     completed_at=completed_at,
-    capability_bind=capability_bind.receipt(),
+    capability_bind=capability_bind.to_json(),
   )
 
 
@@ -628,7 +753,11 @@ def test_autonomous_control_endpoints_spawn_read_logs_cancel_and_enforce_user_sc
 
     detail = client.get("/api/control/runs/bg_0", headers=_headers(alice))
     assert detail.status_code == 200, detail.text
-    assert detail.json()["user_id"] == "alice"
+    body = detail.json()
+    task_id = record.task_id
+    assert body["user_id"] == "alice"
+    assert body["record_paths"]["events"].endswith(f"{task_id}.events.jsonl")
+    assert body["record_paths"]["log"].endswith(f"{task_id}.log")
 
     logs = client.get("/api/control/runs/bg_0/logs?tail=1", headers=_headers(alice))
     assert logs.status_code == 200, logs.text
@@ -695,6 +824,8 @@ def test_live_two_user_run_matrix_is_disjoint_and_cross_user_actions_are_404(
       capability_bind=None,
       max_budget_usd=kwargs.get("max_budget_usd"),
       log_path=log_path,
+      events_path=None,
+      tool_result_spill_dir=None,
       cmd=["recorded-fake-run"],
     )
     return {"task_id": task_id, "run_id": task_id}
@@ -861,7 +992,7 @@ def test_autonomous_control_route_requires_and_uses_installed_claim_authority(
       json=payload,
     )
 
-  assert rejected.status_code == 409
+  assert rejected.status_code == 500
   assert rejected.json() == {
     "detail": "autonomous dispatch requires installed claim-signing authority"
   }
@@ -924,8 +1055,16 @@ def get_mcp_user_key_entry(user_id, user_email=None):
     assert henry_mcp["user_id"] == "1"
     assert henry_mcp["user_slug"] == "henry"
     assert henry_web["user_id"] == "1"
-    monkeypatch.setattr(sys, "path", list(sys.path))
-    monkeypatch.delitem(sys.modules, "user_identity", raising=False)
+    identity_module_path = application_api_dir / "user_identity.py"
+    identity_spec = importlib.util.spec_from_file_location(
+      "user_identity",
+      identity_module_path,
+    )
+    assert identity_spec is not None
+    assert identity_spec.loader is not None
+    identity_api = importlib.util.module_from_spec(identity_spec)
+    monkeypatch.setitem(sys.modules, "user_identity", identity_api)
+    identity_spec.loader.exec_module(identity_api)
 
     start = client.post(
       "/api/control/runs",
@@ -1039,6 +1178,7 @@ def test_autonomous_dispatch_persists_redacted_dispatch_scope(monkeypatch, tmp_p
       HMAC_KEY,
       envs[0][AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
     )
+    assert envelope.session_authority.dispatch_scope is not None
     assert envelope.session_authority.dispatch_scope.receipt() == dispatch_scope
 
     manifest = json.loads((_autonomous_log_dir(tmp_path) / "bg_0.task.json").read_text(encoding="utf-8"))
@@ -1580,7 +1720,7 @@ def test_autonomous_state_maps_budget_aliases_to_budget_limited() -> None:
 def _interrupted_terminal_detail(
   monkeypatch,
   tmp_path,
-) -> None:
+) -> httpx.Response:
   skills_dir = tmp_path / "skills"
   _write_resumable_skill(skills_dir)
   _write_rehydrate_manifest(
@@ -1677,7 +1817,7 @@ def test_autonomous_messageable_matches_operator_message_acceptance(
   assert detail.status_code == 200, detail.text
   assert detail.json()["state"] == projected_state
   assert detail.json()["messageable"] is False
-  assert message.status_code == 409, message.text
+  assert message.status_code == 500, message.text
   assert message.json()["detail"] == "Autonomous run is not accepting messages"
 
 
@@ -1905,7 +2045,7 @@ def test_frozen_true_resume_fact_survives_source_deletion_and_control_reads(
       ),
       encoding="utf-8",
     )
-    app.state.subprocess_registry._skill_resume_allowed_resolver = (
+    app.state.subprocess_registry._autonomous_skill_admission_policy_resolver = (
       lambda _skill: (_ for _ in ()).throw(
         AssertionError("control and resume must not consult current source")
       )
@@ -1937,7 +2077,7 @@ def test_frozen_true_resume_fact_survives_source_deletion_and_control_reads(
     assert next(
       item for item in listing.json()["runs"] if item["run_id"] == "bg_0"
     )["resumable"] is True
-    assert message.status_code == 409, message.text
+    assert message.status_code == 500, message.text
     assert resumed.status_code == 200, resumed.text
     successor = app.state.subprocess_registry._tasks["bg_1"]
     assert successor.skill_resume_allowed is True
@@ -2699,6 +2839,50 @@ def test_autonomous_dispatch_validation_error_returns_422_and_releases_slot(monk
     assert "ANALYST_DEV_MODE" not in envs[-1]
 
 
+def test_autonomous_dispatch_refuses_out_of_domain_research_file_id(monkeypatch, tmp_path) -> None:
+  """The safety case: no run is started for a value outside the supported range.
+
+  2**63 is not a research file id. Before the domain rule got one owner it passed the
+  schema, was signed into the launch envelope, written to the manifest and crossed argv,
+  and only died with a bare ValueError inside the child — after the process was spawned.
+  """
+  processes, _envs = _install_fake_spawn(monkeypatch)
+  app = _make_app(monkeypatch, tmp_path)
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice")
+
+    for rejected in (0, -1, 1.5, True, "1", 1 << 63):
+      response = client.post(
+        "/api/control/runs",
+        headers=_headers(alice),
+        json={
+          "kind": "autonomous",
+          "profile": "analyst",
+          "mode": "skill",
+          "skill": "earnings-review",
+          "research_file_id": rejected,
+        },
+      )
+      assert response.status_code == 422, (rejected, response.text)
+
+    assert processes == []
+    assert app.state.subprocess_registry._tasks == {}
+
+    accepted = client.post(
+      "/api/control/runs",
+      headers=_headers(alice),
+      json={
+        "kind": "autonomous",
+        "profile": "analyst",
+        "mode": "skill",
+        "skill": "earnings-review",
+        "research_file_id": (1 << 63) - 1,
+      },
+    )
+    assert accepted.status_code == 200, accepted.text
+
+
 def test_autonomous_dispatch_accepts_module_safe_profile_names(monkeypatch, tmp_path) -> None:
   _processes, _envs = _install_fake_spawn(monkeypatch)
   app = _make_app(monkeypatch, tmp_path)
@@ -2731,7 +2915,34 @@ def test_autonomous_dispatch_accepts_module_safe_profile_names(monkeypatch, tmp_
 
 def test_control_profiles_lists_backend_available_profiles(monkeypatch, tmp_path) -> None:
   _install_fake_spawn(monkeypatch)
-  app = _make_app(monkeypatch, tmp_path)
+  profiles = {
+    "analyst": SimpleNamespace(
+      name="analyst",
+      channel_context="excel",
+      supports_autonomous_execution=True,
+    ),
+    "advisor": SimpleNamespace(
+      name="advisor",
+      channel_context="excel",
+      supports_autonomous_execution=True,
+    ),
+    "research_producer": SimpleNamespace(
+      name="research_producer",
+      channel_context="excel",
+      supports_autonomous_execution=True,
+    ),
+    "community": SimpleNamespace(
+      name="community",
+      channel_context="discord",
+      supports_autonomous_execution=False,
+    ),
+  }
+  app = _make_app(
+    monkeypatch,
+    tmp_path,
+    control_profile_names_provider=lambda: profiles,
+    control_profile_loader=profiles.__getitem__,
+  )
 
   with TestClient(app) as client:
     alice = _control_session(client, "alice")
@@ -2740,7 +2951,43 @@ def test_control_profiles_lists_backend_available_profiles(monkeypatch, tmp_path
 
     assert response.status_code == 200, response.text
     profile_names = {entry["name"] for entry in response.json()["profiles"]}
-    assert {"analyst", "advisor", "research_producer"} <= profile_names
+    assert profile_names == {"analyst", "advisor", "research_producer"}
+
+
+def test_autonomous_dispatch_rejects_interactive_profile_before_spawn(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  processes, _envs = _install_fake_spawn(monkeypatch)
+  profiles = {
+    "community": SimpleNamespace(
+      name="community",
+      supports_autonomous_execution=False,
+    ),
+  }
+  app = _make_app(
+    monkeypatch,
+    tmp_path,
+    control_profile_names_provider=lambda: profiles,
+    control_profile_loader=profiles.__getitem__,
+  )
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice")
+    response = client.post(
+      "/api/control/runs",
+      headers=_headers(alice),
+      json={
+        "kind": "autonomous",
+        "profile": "community",
+        "mode": "task",
+        "task": "summarize",
+      },
+    )
+
+  assert response.status_code == 422
+  assert "interactive-only" in response.text
+  assert processes == []
 
 
 def test_autonomous_run_response_preserves_waiting_and_queued_states(monkeypatch, tmp_path) -> None:
@@ -2842,6 +3089,41 @@ def test_autonomous_dispatch_concurrency_limit_returns_429(monkeypatch, tmp_path
     )
     assert second.status_code == 429
     assert second.json()["detail"] == "Autonomous concurrency limit reached (1)"
+
+
+def test_autonomous_resume_of_slot_exhausted_run_returns_429(monkeypatch, tmp_path) -> None:
+  processes, _envs = _install_fake_spawn(monkeypatch)
+  monkeypatch.setenv("AGENT_GATEWAY_AUTONOMOUS_MAX_RUNNING", "1")
+  skills_dir = tmp_path / "skills"
+  _write_resumable_skill(skills_dir)
+  app = _make_app(monkeypatch, tmp_path, control_skills_dir=skills_dir)
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice", email="alice@example.com")
+    started = client.post(
+      "/api/control/runs",
+      headers=_headers(alice),
+      json={
+        "kind": "autonomous",
+        "profile": "analyst",
+        "mode": "skill",
+        "skill": "resumable-skill",
+      },
+    )
+    assert started.status_code == 200, started.text
+    original = app.state.subprocess_registry._tasks["bg_0"]
+    original.state = "interrupted"
+    original.completed_at = time.time()
+    processes[0].returncode = 1
+
+    resumed = client.post(
+      "/api/control/runs/bg_0/resume",
+      headers=_headers(alice),
+      json={},
+    )
+
+  assert resumed.status_code == 429
+  assert resumed.json()["detail"] == "Autonomous concurrency limit reached (1)"
 
 
 def test_autonomous_run_reads_logs_and_cancel_are_channel_scoped(monkeypatch, tmp_path) -> None:
@@ -3004,6 +3286,7 @@ def test_autonomous_dispatch_once_mode_rejects_task_skill_ticker_and_context(mon
     for field, value in (
       ("skill", "earnings-review"),
       ("task", "summarize"),
+      ("pack", "daily-risk-pack"),
       ("ticker", "AAPL"),
       ("context", "extra background"),
     ):
@@ -3019,7 +3302,7 @@ def test_autonomous_dispatch_once_mode_rejects_task_skill_ticker_and_context(mon
       )
 
       assert response.status_code == 422, response.text
-      assert "mode='once' does not accept skill, task, ticker, or context" in response.text
+      assert "mode='once' does not accept skill, task, pack, ticker, or context" in response.text
 
   assert app.state.subprocess_registry._tasks == {}
   assert processes == []
@@ -3156,3 +3439,82 @@ def test_agent_run_schedule_dispatch_rejects_the_opposite_mode_field() -> None:
       skill="earnings-review",
       task="summarize",
     )
+
+
+def test_control_dispatch_carries_pack_workload_to_the_child_argv(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  """A scheduled pack workload survives the whole carrier chain.
+
+  `AutonomousRunner.start` and `build_autonomous_cmd` have always accepted
+  `mode="pack"`; the HTTP request model and the route dropped it, so the only
+  way to run a pack was to hand-compose `python -m agent.autonomous --pack`
+  outside the gateway. This pins the dispatch path as the single lane.
+  """
+
+  _install_fake_spawn(monkeypatch)
+  app = _make_app(monkeypatch, tmp_path)
+
+  with TestClient(app) as client:
+    session = _control_session(client, "alice")
+    started = client.post(
+      "/api/control/runs",
+      headers=_headers(session),
+      json={
+        "kind": "autonomous",
+        "profile": "advisor",
+        "mode": "pack",
+        "pack": "daily-risk-pack",
+      },
+    )
+
+    assert started.status_code == 200, started.text
+    record = app.state.subprocess_registry._tasks[started.json()["task_id"]]
+    assert record.pack == "daily-risk-pack"
+    assert record.cmd[1:] == [
+      "-m",
+      "agent.autonomous",
+      "--profile",
+      "advisor",
+      "--pack",
+      "daily-risk-pack",
+    ]
+
+
+def test_control_dispatch_keeps_pack_mode_exclusive(monkeypatch, tmp_path) -> None:
+  app = _make_app(monkeypatch, tmp_path)
+
+  with TestClient(app) as client:
+    session = _control_session(client, "alice")
+    missing_pack = client.post(
+      "/api/control/runs",
+      headers=_headers(session),
+      json={"kind": "autonomous", "profile": "advisor", "mode": "pack"},
+    )
+    with_skill = client.post(
+      "/api/control/runs",
+      headers=_headers(session),
+      json={
+        "kind": "autonomous",
+        "profile": "advisor",
+        "mode": "pack",
+        "pack": "daily-risk-pack",
+        "skill": "risk-review",
+      },
+    )
+    pack_on_once = client.post(
+      "/api/control/runs",
+      headers=_headers(session),
+      json={
+        "kind": "autonomous",
+        "profile": "advisor",
+        "mode": "once",
+        "pack": "daily-risk-pack",
+      },
+    )
+
+  assert missing_pack.status_code == 422, missing_pack.text
+  assert "mode='pack' requires pack" in missing_pack.text
+  assert with_skill.status_code == 422, with_skill.text
+  assert pack_on_once.status_code == 422, pack_on_once.text

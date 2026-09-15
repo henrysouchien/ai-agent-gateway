@@ -223,8 +223,8 @@ def _bounded_tool_summary(summary: dict[str, Any]) -> dict[str, Any]:
   return bounded
 
 
-def _minimal_tool_summary(summary: dict[str, Any]) -> dict[str, Any]:
-  minimal = {"tool_name": _clip_resume_value_text(str(summary.get("tool_name") or ""), limit=120)}
+def _minimal_tool_summary(summary: dict[str, Any]) -> dict[str, object]:
+  minimal: dict[str, object] = {"tool_name": _clip_resume_value_text(str(summary.get("tool_name") or ""), limit=120)}
   if summary.get("tool_call_id"):
     minimal["tool_call_id"] = _clip_resume_value_text(str(summary.get("tool_call_id")), limit=120)
   if summary.get("is_error") is not None:

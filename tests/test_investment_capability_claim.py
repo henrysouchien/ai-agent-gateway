@@ -9,7 +9,7 @@ import inspect
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import pytest
 from cryptography.exceptions import InvalidSignature
@@ -23,6 +23,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 import agent_gateway.investment_capability_claim as claim_module
+from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.approval_policy import RunContext
 from agent_gateway.investment_capability_claim import (
   INVESTMENT_CAPABILITY_FACADE_TOOLS,
@@ -34,6 +35,10 @@ from agent_gateway.investment_capability_claim import (
   issue_investment_capability_claim,
   issue_investment_selected_content_claim,
   investment_capability_signing_available,
+)
+from agent_gateway.skill_limits import (
+  ActiveSkillAdmission,
+  SkillExecutionLimits,
 )
 from agent_gateway.skill_context import reset_current_skill, set_current_skill
 from agent_gateway.tool_dispatcher import ToolDispatcher
@@ -57,6 +62,16 @@ _PUBLIC_KEY_MATERIAL = base64.urlsafe_b64encode(
 ).rstrip(b"=").decode("ascii")
 _KEY_ID = f"ed25519-sha256:{hashlib.sha256(_PUBLIC_KEY_BYTES).hexdigest()}"
 _POLICY_BUNDLE_HASH = hashlib.sha256(b"test-policy-bundle").hexdigest()
+
+
+def _limits_for_skill(
+  skill: str | None,
+) -> SkillExecutionLimits | None:
+  if skill is None:
+    return None
+  if skill == "quant-research":
+    return SkillExecutionLimits(20, 32_000, 20.0)
+  return SkillExecutionLimits(None, None, None)
 
 
 def _set_signing_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -89,13 +104,14 @@ def _decode_claim(token: str) -> tuple[dict[str, Any], dict[str, Any]]:
   return _decode_segment(header), _decode_segment(payload)
 
 
-class _FakeMcpClient:
+class _FakeMcpClient(McpClientManager):
   def __init__(
     self,
     *,
     tool_name: str,
     original_tool_name: str | None = None,
   ) -> None:
+    super().__init__(config_path=None)
     self.tool_name = tool_name
     self.original_tool_name = original_tool_name or tool_name
     self.calls: list[dict[str, Any]] = []
@@ -112,9 +128,14 @@ class _FakeMcpClient:
   async def call_tool(
     self,
     name: str,
-    tool_input: dict[str, Any],
+    tool_input: object,
     meta: dict[str, Any] | None = None,
-  ):
+    abort_event: asyncio.Event | None = None,
+    gateway_session: object | None = None,
+    allow_uncertain_replay: bool = True,
+    trusted_dispatch_scope: Mapping[str, object] | None = None,
+  ) -> tuple[object | None, dict[str, object] | None]:
+    _ = abort_event, gateway_session, allow_uncertain_replay, trusted_dispatch_scope
     self.calls.append({"name": name, "tool_input": tool_input, "meta": meta})
     return {"ok": True}, None
 
@@ -127,7 +148,7 @@ def _dispatcher(
   *,
   skill: str | None = "quant-research",
   policy_bundle_hash: str = _POLICY_BUNDLE_HASH,
-  research_file_id: object = 2,
+  research_file_id: int | None = 2,
 ) -> ToolDispatcher:
   return ToolDispatcher(
     mcp_client=mcp,
@@ -145,6 +166,7 @@ def _dispatcher(
       profile=skill or "quant-research",
       channel="excel",
       skill=skill,
+      admitted_skill_execution_limits=_limits_for_skill(skill),
       research_file_id=research_file_id,
       policy_bundle_hash=policy_bundle_hash,
     ),
@@ -173,6 +195,82 @@ def _dispatch(
       skill_run_id="skill-run-123",
     )
   )
+
+
+def _assert_names_grant_and_issuance_route(error: dict[str, Any], *, subject: str) -> None:
+  assert error["code"] == "investment_capability_claim_unavailable"
+  message = error["message"]
+  assert subject in message
+  assert "market-scan" in message
+  assert "quant-research" in message
+  assert "run_agent" in message
+  assert "agent-operation/market-scan" in message
+  assert "agent-operation/quant-research" in message
+  assert error["required_grants"] == ["market-scan", "quant-research"]
+  assert error["route"] == "run_agent"
+  assert error["operations"] == [
+    "agent-operation/market-scan",
+    "agent-operation/quant-research",
+  ]
+
+
+def test_claim_unavailable_error_names_grant_and_issuance_route() -> None:
+  from agent_gateway.investment_capability_claim import (
+    investment_capability_claim_unavailable_error,
+  )
+
+  error = investment_capability_claim_unavailable_error(
+    subject="tool 'get_investment_run'",
+  )
+  _assert_names_grant_and_issuance_route(
+    error,
+    subject="tool 'get_investment_run'",
+  )
+
+
+def test_server_load_refuses_without_admitted_grant() -> None:
+  from agent_gateway.investment_capability_claim import (
+    investment_capability_server_load_error,
+  )
+
+  token = set_current_skill(None)
+  try:
+    error = investment_capability_server_load_error("idea-workbench-mcp")
+  finally:
+    reset_current_skill(token)
+
+  assert error is not None
+  _assert_names_grant_and_issuance_route(
+    error,
+    subject="server 'idea-workbench-mcp'",
+  )
+
+
+@pytest.mark.parametrize("skill", ["market-scan", "quant-research"])
+def test_server_load_allows_when_session_holds_grant(skill: str) -> None:
+  from agent_gateway.investment_capability_claim import (
+    investment_capability_server_load_error,
+  )
+
+  token = set_current_skill(ActiveSkillAdmission(
+    skill,
+    _limits_for_skill(skill),  # type: ignore[arg-type]
+  ))
+  try:
+    error = investment_capability_server_load_error("idea-workbench-mcp")
+  finally:
+    reset_current_skill(token)
+
+  assert error is None
+
+
+def test_server_load_does_not_gate_unrelated_servers() -> None:
+  from agent_gateway.investment_capability_claim import (
+    investment_capability_server_load_error,
+  )
+
+  assert investment_capability_server_load_error("portfolio-reads-mcp") is None
+
 
 
 def test_facade_tool_boundary_is_exact() -> None:
@@ -317,6 +415,7 @@ def test_market_scan_claim_is_exact_and_has_no_quant_budget_or_origin(
     request_id="request-123",
     jti="tool-call-market-scan",
     skill="market-scan",
+    admitted_skill_execution_limits=_limits_for_skill("market-scan"),
     policy_bundle_hash=_POLICY_BUNDLE_HASH,
     now=1_800_000_000,
   )
@@ -375,6 +474,7 @@ def test_cross_skill_submission_tools_fail_closed_before_signing(
       request_id="request-123",
       jti="tool-call-cross-skill",
       skill=skill,
+      admitted_skill_execution_limits=_limits_for_skill(skill),
       policy_bundle_hash=_POLICY_BUNDLE_HASH,
       research_file_id=research_file_id,
     )
@@ -394,6 +494,7 @@ def test_claim_is_canonical_signed_short_lived_and_exactly_bound(
     request_id="request-123",
     jti="tool-call-123",
     skill="quant-research",
+    admitted_skill_execution_limits=_limits_for_skill("quant-research"),
     policy_bundle_hash=_POLICY_BUNDLE_HASH,
     research_file_id=2,
     now=1_800_000_000,
@@ -453,10 +554,11 @@ def test_dispatch_fails_closed_for_every_facade_tool_without_private_key(
   )
 
   assert result is None
-  assert error == {
-    "code": "investment_capability_claim_unavailable",
-    "message": f"Trusted investment capability identity is unavailable for tool '{tool_name}'.",
-  }
+  assert error is not None
+  _assert_names_grant_and_issuance_route(
+    error,
+    subject=f"tool '{tool_name}'",
+  )
   assert mcp.calls == []
 
 
@@ -570,9 +672,14 @@ def test_quant_invalid_request_is_returned_after_one_signed_mcp_call(
     async def call_tool(
       self,
       name: str,
-      tool_input: dict[str, Any],
+      tool_input: object,
       meta: dict[str, Any] | None = None,
-    ):
+      abort_event: asyncio.Event | None = None,
+      gateway_session: object | None = None,
+      allow_uncertain_replay: bool = True,
+      trusted_dispatch_scope: Mapping[str, object] | None = None,
+    ) -> tuple[object | None, dict[str, object] | None]:
+      _ = abort_event, gateway_session, allow_uncertain_replay, trusted_dispatch_scope
       self.calls.append({
         "name": name,
         "tool_input": tool_input,
@@ -725,8 +832,9 @@ def test_quant_claim_rejects_missing_or_malformed_trusted_research_origin(
       request_id="request-123",
       jti="tool-call-123",
       skill="quant-research",
+      admitted_skill_execution_limits=_limits_for_skill("quant-research"),
       policy_bundle_hash=_POLICY_BUNDLE_HASH,
-      research_file_id=research_file_id,
+      research_file_id=research_file_id,  # pyright: ignore[reportArgumentType]  # negative: malformed research origin rejection
     )
 
 
@@ -767,7 +875,7 @@ def test_quant_dispatch_rejects_malformed_trusted_origin_before_mcp(
   mcp = _FakeMcpClient(tool_name="start_quant_research")
 
   result, error = _dispatch(
-    _dispatcher(mcp, research_file_id=trusted_research_file_id),
+    _dispatcher(mcp, research_file_id=trusted_research_file_id),  # pyright: ignore[reportArgumentType]  # negative: malformed trusted origin rejection
     tool_call_id="call-invalid-trusted-origin",
     tool_name="start_quant_research",
     tool_input={"request": {"research_file_id": 2}},
@@ -809,6 +917,43 @@ def test_issuer_rejects_malformed_gateway_budget_policy(
       request_id="request-123",
       jti="tool-call-123",
       skill="quant-research",
+      admitted_skill_execution_limits=_limits_for_skill("quant-research"),
+      policy_bundle_hash=_POLICY_BUNDLE_HASH,
+      research_file_id=2,
+    )
+
+
+@pytest.mark.parametrize(
+  "limits",
+  [
+    SkillExecutionLimits(10_001, 32_000, 20.0),
+    SkillExecutionLimits(20, 100_000_001, 20.0),
+    SkillExecutionLimits(20, 32_000, 10_000.01),
+    SkillExecutionLimits(None, 32_000, 20.0),
+    SkillExecutionLimits(20, None, 20.0),
+    SkillExecutionLimits(20, 32_000, None),
+  ],
+)
+def test_quant_claim_retains_consumer_budget_ceilings(
+  monkeypatch: pytest.MonkeyPatch,
+  limits: SkillExecutionLimits,
+) -> None:
+  _set_signing_key(monkeypatch)
+
+  with pytest.raises(
+    InvestmentCapabilityClaimError,
+    match="invalid approved budget",
+  ):
+    issue_investment_capability_claim(
+      user_id="42",
+      session_id="session-123",
+      skill_run_id="skill-run-123",
+      channel="excel",
+      tool_name="start_quant_research",
+      request_id="request-123",
+      jti="tool-call-123",
+      skill="quant-research",
+      admitted_skill_execution_limits=limits,
       policy_bundle_hash=_POLICY_BUNDLE_HASH,
       research_file_id=2,
     )
@@ -835,7 +980,10 @@ def test_facade_dispatch_fails_closed_without_a_known_trusted_skill(
 
   assert result is None
   assert error is not None
-  assert error["code"] == "investment_capability_claim_unavailable"
+  _assert_names_grant_and_issuance_route(
+    error,
+    subject=f"tool '{tool_name}'",
+  )
   assert mcp.calls == []
 
 
@@ -843,7 +991,10 @@ def test_active_gateway_skill_context_can_supply_missing_run_context_skill(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   _set_signing_key(monkeypatch)
-  token = set_current_skill("quant-research")
+  token = set_current_skill(ActiveSkillAdmission(
+    "quant-research",
+    _limits_for_skill("quant-research"),  # type: ignore[arg-type]
+  ))
   try:
     mcp = _FakeMcpClient(tool_name="get_investment_run")
     result, error = _dispatch(
@@ -866,7 +1017,10 @@ def test_conflicting_trusted_skill_contexts_fail_closed(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   _set_signing_key(monkeypatch)
-  token = set_current_skill("different-skill")
+  token = set_current_skill(ActiveSkillAdmission(
+    "different-skill",
+    SkillExecutionLimits(20, 32_000, 20.0),
+  ))
   try:
     mcp = _FakeMcpClient(tool_name="get_investment_run")
     result, error = _dispatch(
@@ -919,6 +1073,7 @@ def test_signed_grant_tampering_invalidates_signature(
     request_id="request-123",
     jti="tool-call-123",
     skill="market-scan",
+    admitted_skill_execution_limits=_limits_for_skill("market-scan"),
     policy_bundle_hash=_POLICY_BUNDLE_HASH,
     now=1_800_000_000,
   )
@@ -982,6 +1137,7 @@ def test_private_key_validation_error_never_echoes_key_material(
       request_id="request-123",
       jti="tool-call-123",
       skill="quant-research",
+      admitted_skill_execution_limits=_limits_for_skill("quant-research"),
       policy_bundle_hash=_POLICY_BUNDLE_HASH,
     )
 
@@ -1014,6 +1170,7 @@ def test_legacy_shared_secret_and_public_key_cannot_enable_signing(
       request_id="request-123",
       jti="tool-call-123",
       skill="quant-research",
+      admitted_skill_execution_limits=_limits_for_skill("quant-research"),
       policy_bundle_hash=_POLICY_BUNDLE_HASH,
     )
 
@@ -1041,6 +1198,7 @@ def test_claim_rejects_fields_the_server_cannot_accept(
     "request_id": "request-123",
     "jti": "tool-call-123",
     "skill": "quant-research",
+    "admitted_skill_execution_limits": _limits_for_skill("quant-research"),
     "policy_bundle_hash": _POLICY_BUNDLE_HASH,
   }
   inputs[field] = value

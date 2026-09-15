@@ -1,6 +1,8 @@
 # Add a Custom MCP Server
 
 This tutorial starts from a generated project and registers a filesystem MCP server.
+Complete the provider credential and private `USER_DATA_DIR` setup in the
+[quickstart](../quickstart.md) first.
 
 ## 1. Create A Project
 

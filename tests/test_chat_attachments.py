@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from pathlib import Path
 
 import pytest
 from agent_gateway import server_models
@@ -62,7 +63,9 @@ def test_ai_decodes_attachment_base64_once(
 
 
 def test_requests_without_attachments_keep_empty_tuple() -> None:
-  request = ChatRequest(messages=[{"role": "user", "content": "hello"}])
+  request = ChatRequest.model_validate({
+    "messages": [{"role": "user", "content": "hello"}],
+  })
 
   assert request.attachments == ()
 
@@ -191,7 +194,7 @@ def test_attachment_count_item_and_turn_limits_fail_closed() -> None:
 
 
 def test_gateway_validation_error_does_not_reflect_attachment_bytes() -> None:
-  async def _unused_runtime(*_args, **_kwargs):
+  async def _unused_runtime(*_args, storage_root: Path | None = None, **_kwargs):
     raise AssertionError("invalid requests must not reach runtime construction")
 
   sensitive_text = "PRIVATE-ATTACHMENT-BYTES-DO-NOT-REFLECT"

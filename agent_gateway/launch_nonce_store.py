@@ -1,9 +1,13 @@
-"""Durable one-time admission for verified ordinary autonomous launches.
+"""Durable one-time launch-nonce consume for verified ordinary launches.
 
 The parent prepares one dedicated SQLite database and signs the returned
 path/device/inode identity into every launch envelope.  The child reconstructs
 that identity from the verified envelope and must consume the envelope nonce
 here before it performs any autonomous side effect.
+
+The persisted SQLite schema (table, index, and trigger names plus their
+RAISE message text) predates this module's rename and is frozen: it is
+exact-compared against live databases at ``_validate_schema``.
 """
 
 from __future__ import annotations
@@ -23,26 +27,22 @@ from .autonomous_launch_envelope import (
   AutonomousLaunchEnvelope,
 )
 
+from .named_refusal import NamedRefusal, NamedRefusalTransport
 
-AUTONOMOUS_ADMISSION_LEDGER_SCHEMA_VERSION = 1
-AUTONOMOUS_ADMISSION_LEDGER_BUSY_TIMEOUT_MS = 5_000
-AUTONOMOUS_ADMISSION_LEDGER_PAGE_SIZE = 4_096
-AUTONOMOUS_ADMISSION_LEDGER_MAX_PAGE_COUNT = 65_536
-AUTONOMOUS_ADMISSION_LEDGER_MAX_ROWS = 100_000
-AUTONOMOUS_ADMISSION_LEDGER_CLEANUP_BATCH_SIZE = 512
+
+LAUNCH_NONCE_STORE_SCHEMA_VERSION = 2
+LAUNCH_NONCE_STORE_BUSY_TIMEOUT_MS = 5_000
+LAUNCH_NONCE_STORE_PAGE_SIZE = 4_096
+LAUNCH_NONCE_STORE_MAX_PAGE_COUNT = 65_536
+LAUNCH_NONCE_STORE_MAX_ROWS = 100_000
+LAUNCH_NONCE_STORE_CLEANUP_BATCH_SIZE = 512
 
 _MAX_SQLITE_INTEGER = (1 << 63) - 1
 _MAX_PATH_BYTES = 4_096
 _MAX_ID_TEXT_LENGTH = 512
 _NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
 _CHANNEL_ID_RE = re.compile(r"^[0-9a-f]{64}$")
-_IDENTITY_FIELDS = frozenset({
-  "schema_version",
-  "path",
-  "device",
-  "inode",
-})
-_RECEIPT_FIELDS = frozenset({
+_FACTS_FIELDS = frozenset({
   "audience",
   "nonce",
   "task_id",
@@ -52,15 +52,17 @@ _RECEIPT_FIELDS = frozenset({
   "issued_at_ns",
   "expires_at_ns",
 })
-_ADMISSION_RECORD_FIELDS = frozenset({
+_CONSUMED_NONCE_WIRE_FIELDS = frozenset({
   "receipt",
   "admitted_at_ns",
 })
 
-_METADATA_TABLE_SQL = """
+_METADATA_TABLE_SQL = f"""
   CREATE TABLE IF NOT EXISTS autonomous_admission_ledger_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    schema_version INTEGER NOT NULL CHECK (
+      schema_version = {LAUNCH_NONCE_STORE_SCHEMA_VERSION}
+    ),
     page_size INTEGER NOT NULL CHECK (page_size > 0),
     max_page_count INTEGER NOT NULL CHECK (max_page_count > 0),
     max_rows INTEGER NOT NULL CHECK (max_rows > 0),
@@ -85,11 +87,12 @@ _ADMISSIONS_TABLE_SQL = f"""
     ),
     schema_version INTEGER NOT NULL CHECK (
       typeof(schema_version) = 'integer'
-      AND schema_version = {AUTONOMOUS_ADMISSION_LEDGER_SCHEMA_VERSION}
+      AND schema_version = {LAUNCH_NONCE_STORE_SCHEMA_VERSION}
     ),
     audience TEXT NOT NULL CHECK (
       typeof(audience) = 'text'
-      AND audience = '{AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE}'
+      AND length(audience) BETWEEN 1 AND {_MAX_ID_TEXT_LENGTH}
+      AND audience = trim(audience)
     ),
     task_id TEXT NOT NULL CHECK (
       typeof(task_id) = 'text'
@@ -194,48 +197,67 @@ _SCHEMA_OBJECTS = {
 }
 
 
-class AutonomousAdmissionLedgerError(RuntimeError):
+class LaunchNonceStoreError(NamedRefusal):
   """An autonomous launch could not be safely admitted."""
 
+  def __init__(
+    self,
+    message: str,
+    *,
+    code: str = "launch_nonce_store",
+    transport: NamedRefusalTransport = "internal",
+  ) -> None:
+    super().__init__(code, message, transport=transport)
 
-class AutonomousAdmissionLedgerIdentityError(
-  AutonomousAdmissionLedgerError
+
+class LaunchNonceStoreIdentityError(
+  LaunchNonceStoreError
 ):
-  """The signed admission-ledger file identity is no longer authoritative."""
+  """The signed store file identity is no longer authoritative."""
+
+  def __init__(self, message: str) -> None:
+    super().__init__(message, code="launch_nonce_store_identity", transport="unavailable")
 
 
-class AutonomousAdmissionLedgerUnavailable(
-  AutonomousAdmissionLedgerError
+class LaunchNonceStoreUnavailable(
+  LaunchNonceStoreError
 ):
-  """The durable ledger cannot currently earn an admission decision."""
+  """The durable store cannot currently earn a consume decision."""
+
+  def __init__(self, message: str) -> None:
+    super().__init__(message, code="launch_nonce_store_unavailable", transport="unavailable")
 
 
-class AutonomousAdmissionLedgerDuplicate(
-  AutonomousAdmissionLedgerError
+class LaunchNonceReplay(
+  LaunchNonceStoreError
 ):
   """The launch nonce has already been consumed."""
 
+  def __init__(self, message: str) -> None:
+    super().__init__(message, code="launch_nonce_replay", transport="conflict")
 
-class AutonomousAdmissionLedgerExpired(
-  AutonomousAdmissionLedgerError
+
+class LaunchNonceExpired(
+  LaunchNonceStoreError
 ):
   """The launch envelope is not live at the durable admission boundary."""
 
   def __init__(self, message: str, *, consumed: bool) -> None:
     self.consumed = consumed
-    super().__init__(message)
+    super().__init__(message, code="launch_nonce_expired", transport="conflict")
 
 
-class AutonomousAdmissionLedgerCapacityExceeded(
-  AutonomousAdmissionLedgerError
+class LaunchNonceStoreCapacityExceeded(
+  LaunchNonceStoreError
 ):
-  """The fixed ledger capacity was reached; admission failed closed."""
+  """The fixed store capacity was reached; the consume failed closed."""
 
 
-class AutonomousAdmissionLedgerClockRollback(
-  AutonomousAdmissionLedgerError
+class LaunchNonceClockRollback(
+  LaunchNonceStoreError
 ):
   """The wall clock moved behind a durably observed admission time."""
+
 
 
 def _closed_mapping(
@@ -291,7 +313,7 @@ def _canonical_absolute_path(value: object) -> str:
   elif type(value) is str:
     raw_path = value
   else:
-    raise TypeError("autonomous admission ledger path must be str or Path")
+    raise TypeError("launch nonce store path must be str or Path")
   if (
     not raw_path
     or raw_path != raw_path.strip()
@@ -300,7 +322,7 @@ def _canonical_absolute_path(value: object) -> str:
     or any(ord(character) < 0x20 for character in raw_path)
   ):
     raise ValueError(
-      "autonomous admission ledger path must be a canonical absolute path"
+      "launch nonce store path must be a canonical absolute path"
     )
   path = Path(raw_path)
   if (
@@ -310,13 +332,13 @@ def _canonical_absolute_path(value: object) -> str:
     or path.name in {"", ".", ".."}
   ):
     raise ValueError(
-      "autonomous admission ledger path must be a canonical absolute path"
+      "launch nonce store path must be a canonical absolute path"
     )
   return raw_path
 
 
 @dataclass(frozen=True, slots=True)
-class AutonomousAdmissionLedgerIdentity:
+class LaunchNonceStoreIdentity:
   """Immutable file identity intended for the signed launch envelope."""
 
   schema_version: int
@@ -328,10 +350,10 @@ class AutonomousAdmissionLedgerIdentity:
     if (
       type(self.schema_version) is not int
       or self.schema_version
-      != AUTONOMOUS_ADMISSION_LEDGER_SCHEMA_VERSION
+      != LAUNCH_NONCE_STORE_SCHEMA_VERSION
     ):
       raise ValueError(
-        "autonomous admission ledger schema version is unsupported"
+        "launch nonce store schema version is unsupported"
       )
     object.__setattr__(
       self,
@@ -340,55 +362,36 @@ class AutonomousAdmissionLedgerIdentity:
     )
     _exact_integer(
       self.device,
-      field_name="autonomous admission ledger device",
+      field_name="launch nonce store device",
       minimum=0,
     )
     _exact_integer(
       self.inode,
-      field_name="autonomous admission ledger inode",
+      field_name="launch nonce store inode",
       minimum=1,
     )
-
-  @classmethod
-  def from_receipt(
-    cls,
-    value: object,
-  ) -> "AutonomousAdmissionLedgerIdentity":
-    return cls(**_closed_mapping(
-      value,
-      field_name="autonomous admission ledger identity",
-      expected_fields=_IDENTITY_FIELDS,
-    ))
 
   @classmethod
   def from_verified_envelope(
     cls,
     envelope: AutonomousLaunchEnvelope,
-  ) -> "AutonomousAdmissionLedgerIdentity":
+  ) -> "LaunchNonceStoreIdentity":
     if type(envelope) is not AutonomousLaunchEnvelope:
       raise TypeError(
         "autonomous admission identity requires a verified launch envelope"
       )
-    control_authority = envelope.control_authority
+    file_authority = envelope.control_authority.file_authority()
     return cls(
-      schema_version=AUTONOMOUS_ADMISSION_LEDGER_SCHEMA_VERSION,
-      path=control_authority.admission_ledger_path,
-      device=control_authority.admission_ledger_device,
-      inode=control_authority.admission_ledger_inode,
+      schema_version=LAUNCH_NONCE_STORE_SCHEMA_VERSION,
+      path=file_authority.admission_ledger_path,
+      device=file_authority.admission_ledger_device,
+      inode=file_authority.admission_ledger_inode,
     )
-
-  def receipt(self) -> dict[str, int | str]:
-    return {
-      "schema_version": self.schema_version,
-      "path": self.path,
-      "device": self.device,
-      "inode": self.inode,
-    }
 
 
 @dataclass(frozen=True, slots=True)
-class OrdinaryAutonomousAdmissionReceipt:
-  """Closed security receipt copied from a verified ordinary envelope."""
+class LaunchNonceFacts:
+  """Closed security facts copied from a verified ordinary envelope."""
 
   audience: str
   nonce: str
@@ -457,21 +460,21 @@ class OrdinaryAutonomousAdmissionReceipt:
       )
 
   @classmethod
-  def from_receipt(
+  def from_mapping(
     cls,
     value: object,
-  ) -> "OrdinaryAutonomousAdmissionReceipt":
+  ) -> "LaunchNonceFacts":
     return cls(**_closed_mapping(
       value,
-      field_name="ordinary autonomous admission receipt",
-      expected_fields=_RECEIPT_FIELDS,
+      field_name="launch nonce facts",
+      expected_fields=_FACTS_FIELDS,
     ))
 
   @classmethod
   def from_verified_envelope(
     cls,
     envelope: AutonomousLaunchEnvelope,
-  ) -> "OrdinaryAutonomousAdmissionReceipt":
+  ) -> "LaunchNonceFacts":
     if type(envelope) is not AutonomousLaunchEnvelope:
       raise TypeError(
         "ordinary autonomous admission requires a verified launch envelope"
@@ -487,7 +490,7 @@ class OrdinaryAutonomousAdmissionReceipt:
       expires_at_ns=envelope.exp_ns,
     )
 
-  def receipt(self) -> dict[str, int | str]:
+  def to_mapping(self) -> dict[str, int | str]:
     return {
       "audience": self.audience,
       "nonce": self.nonce,
@@ -501,16 +504,16 @@ class OrdinaryAutonomousAdmissionReceipt:
 
 
 @dataclass(frozen=True, slots=True)
-class AutonomousAdmissionRecord:
-  """Durably committed one-time admission."""
+class ConsumedLaunchNonce:
+  """Durably committed one-time launch-nonce consume."""
 
-  receipt: OrdinaryAutonomousAdmissionReceipt
+  facts: LaunchNonceFacts
   admitted_at_ns: int
 
   def __post_init__(self) -> None:
-    if type(self.receipt) is not OrdinaryAutonomousAdmissionReceipt:
+    if type(self.facts) is not LaunchNonceFacts:
       raise TypeError(
-        "autonomous admission record requires exact ordinary receipt"
+        "consumed launch nonce requires exact launch nonce facts"
       )
     admitted_at_ns = _exact_integer(
       self.admitted_at_ns,
@@ -518,34 +521,34 @@ class AutonomousAdmissionRecord:
       minimum=1,
     )
     if not (
-      self.receipt.issued_at_ns
+      self.facts.issued_at_ns
       <= admitted_at_ns
-      < self.receipt.expires_at_ns
+      < self.facts.expires_at_ns
     ):
       raise ValueError(
         "autonomous admission record time is outside its launch lifetime"
       )
 
   @classmethod
-  def from_authority_receipt(
+  def from_wire(
     cls,
     value: object,
-  ) -> "AutonomousAdmissionRecord":
+  ) -> "ConsumedLaunchNonce":
     payload = _closed_mapping(
       value,
-      field_name="autonomous admission record",
-      expected_fields=_ADMISSION_RECORD_FIELDS,
+      field_name="consumed launch nonce",
+      expected_fields=_CONSUMED_NONCE_WIRE_FIELDS,
     )
     return cls(
-      receipt=OrdinaryAutonomousAdmissionReceipt.from_receipt(
+      facts=LaunchNonceFacts.from_mapping(
         payload["receipt"]
       ),
       admitted_at_ns=payload["admitted_at_ns"],
     )
 
-  def authority_receipt(self) -> dict[str, object]:
+  def to_wire(self) -> dict[str, object]:
     return {
-      "receipt": self.receipt.receipt(),
+      "receipt": self.facts.to_mapping(),
       "admitted_at_ns": self.admitted_at_ns,
     }
 
@@ -576,44 +579,44 @@ def _add_exception_note(primary: BaseException, note: str) -> None:
 def _expected_metadata() -> tuple[int, int, int, int, int, int]:
   return (
     1,
-    AUTONOMOUS_ADMISSION_LEDGER_SCHEMA_VERSION,
-    AUTONOMOUS_ADMISSION_LEDGER_PAGE_SIZE,
-    AUTONOMOUS_ADMISSION_LEDGER_MAX_PAGE_COUNT,
-    AUTONOMOUS_ADMISSION_LEDGER_MAX_ROWS,
-    AUTONOMOUS_ADMISSION_LEDGER_CLEANUP_BATCH_SIZE,
+    LAUNCH_NONCE_STORE_SCHEMA_VERSION,
+    LAUNCH_NONCE_STORE_PAGE_SIZE,
+    LAUNCH_NONCE_STORE_MAX_PAGE_COUNT,
+    LAUNCH_NONCE_STORE_MAX_ROWS,
+    LAUNCH_NONCE_STORE_CLEANUP_BATCH_SIZE,
   )
 
 
 def _validate_policy_constants() -> None:
   policies = (
     (
-      AUTONOMOUS_ADMISSION_LEDGER_BUSY_TIMEOUT_MS,
+      LAUNCH_NONCE_STORE_BUSY_TIMEOUT_MS,
       1,
       60_000,
       "busy timeout",
     ),
     (
-      AUTONOMOUS_ADMISSION_LEDGER_PAGE_SIZE,
+      LAUNCH_NONCE_STORE_PAGE_SIZE,
       512,
       65_536,
       "page size",
     ),
     (
-      AUTONOMOUS_ADMISSION_LEDGER_MAX_PAGE_COUNT,
+      LAUNCH_NONCE_STORE_MAX_PAGE_COUNT,
       16,
       1_073_741_823,
       "max page count",
     ),
     (
-      AUTONOMOUS_ADMISSION_LEDGER_MAX_ROWS,
+      LAUNCH_NONCE_STORE_MAX_ROWS,
       1,
       1_000_000,
       "max rows",
     ),
     (
-      AUTONOMOUS_ADMISSION_LEDGER_CLEANUP_BATCH_SIZE,
+      LAUNCH_NONCE_STORE_CLEANUP_BATCH_SIZE,
       1,
-      AUTONOMOUS_ADMISSION_LEDGER_MAX_ROWS,
+      LAUNCH_NONCE_STORE_MAX_ROWS,
       "cleanup batch size",
     ),
   )
@@ -622,14 +625,14 @@ def _validate_policy_constants() -> None:
       type(value) is not int
       or not minimum <= value <= maximum
     ):
-      raise AutonomousAdmissionLedgerError(
-        "autonomous admission ledger "
+      raise LaunchNonceStoreError(
+        "launch nonce store "
         f"{field_name} is outside its fixed bound"
       )
-  page_size = AUTONOMOUS_ADMISSION_LEDGER_PAGE_SIZE
+  page_size = LAUNCH_NONCE_STORE_PAGE_SIZE
   if page_size & (page_size - 1):
-    raise AutonomousAdmissionLedgerError(
-      "autonomous admission ledger page size must be a power of two"
+    raise LaunchNonceStoreError(
+      "launch nonce store page size must be a power of two"
     )
 
 
@@ -638,16 +641,16 @@ def _verify_parent_directory(path: Path) -> None:
     resolved_parent = path.parent.resolve(strict=True)
     parent_stat = os.lstat(path.parent)
   except OSError as exc:
-    raise AutonomousAdmissionLedgerIdentityError(
-      "autonomous admission ledger parent directory is unavailable"
+    raise LaunchNonceStoreIdentityError(
+      "launch nonce store parent directory is unavailable"
     ) from exc
   if resolved_parent != path.parent or not stat.S_ISDIR(parent_stat.st_mode):
-    raise AutonomousAdmissionLedgerIdentityError(
-      "autonomous admission ledger parent path is not canonical"
+    raise LaunchNonceStoreIdentityError(
+      "launch nonce store parent path is not canonical"
     )
   if parent_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-    raise AutonomousAdmissionLedgerIdentityError(
-      "autonomous admission ledger parent directory is writable by others"
+    raise LaunchNonceStoreIdentityError(
+      "launch nonce store parent directory is writable by others"
     )
 
 
@@ -655,31 +658,31 @@ def _database_stat(path: Path) -> os.stat_result:
   try:
     file_stat = os.lstat(path)
   except OSError as exc:
-    raise AutonomousAdmissionLedgerIdentityError(
-      "autonomous admission ledger file is unavailable"
+    raise LaunchNonceStoreIdentityError(
+      "launch nonce store file is unavailable"
     ) from exc
   if stat.S_ISLNK(file_stat.st_mode):
-    raise AutonomousAdmissionLedgerIdentityError(
-      "autonomous admission ledger must not be a symlink"
+    raise LaunchNonceStoreIdentityError(
+      "launch nonce store must not be a symlink"
     )
   if not stat.S_ISREG(file_stat.st_mode):
-    raise AutonomousAdmissionLedgerIdentityError(
-      "autonomous admission ledger must be a regular file"
+    raise LaunchNonceStoreIdentityError(
+      "launch nonce store must be a regular file"
     )
   if file_stat.st_nlink != 1:
-    raise AutonomousAdmissionLedgerIdentityError(
-      "autonomous admission ledger must have exactly one hard link"
+    raise LaunchNonceStoreIdentityError(
+      "launch nonce store must have exactly one hard link"
     )
   if (
     hasattr(os, "geteuid")
     and file_stat.st_uid != os.geteuid()
   ):
-    raise AutonomousAdmissionLedgerIdentityError(
-      "autonomous admission ledger must be owned by the current user"
+    raise LaunchNonceStoreIdentityError(
+      "launch nonce store must be owned by the current user"
     )
   if stat.S_IMODE(file_stat.st_mode) != 0o600:
-    raise AutonomousAdmissionLedgerIdentityError(
-      "autonomous admission ledger mode must be 0600"
+    raise LaunchNonceStoreIdentityError(
+      "launch nonce store mode must be 0600"
     )
   return file_stat
 
@@ -692,8 +695,8 @@ def _verify_sidecars(path: Path) -> None:
     except FileNotFoundError:
       continue
     except OSError as exc:
-      raise AutonomousAdmissionLedgerIdentityError(
-        "autonomous admission ledger sidecar cannot be inspected"
+      raise LaunchNonceStoreIdentityError(
+        "launch nonce store sidecar cannot be inspected"
       ) from exc
     if (
       not stat.S_ISREG(sidecar_stat.st_mode)
@@ -704,15 +707,15 @@ def _verify_sidecars(path: Path) -> None:
         and sidecar_stat.st_uid != os.geteuid()
       )
     ):
-      raise AutonomousAdmissionLedgerIdentityError(
-        "autonomous admission ledger sidecar identity is unsafe"
+      raise LaunchNonceStoreIdentityError(
+        "launch nonce store sidecar identity is unsafe"
       )
 
 
 def _verify_identity(
-  identity: AutonomousAdmissionLedgerIdentity,
+  identity: LaunchNonceStoreIdentity,
 ) -> os.stat_result:
-  if type(identity) is not AutonomousAdmissionLedgerIdentity:
+  if type(identity) is not LaunchNonceStoreIdentity:
     raise TypeError(
       "autonomous admission requires an exact signed ledger identity"
     )
@@ -723,8 +726,8 @@ def _verify_identity(
     file_stat.st_dev != identity.device
     or file_stat.st_ino != identity.inode
   ):
-    raise AutonomousAdmissionLedgerIdentityError(
-      "autonomous admission ledger file identity changed"
+    raise LaunchNonceStoreIdentityError(
+      "launch nonce store file identity changed"
     )
   _verify_sidecars(path)
   return file_stat
@@ -736,8 +739,8 @@ def _open_parent_fd(parent: Path) -> int:
     not hasattr(os, flag)
     for flag in required_flags
   ):
-    raise AutonomousAdmissionLedgerIdentityError(
-      "secure autonomous admission ledger preparation requires POSIX"
+    raise LaunchNonceStoreIdentityError(
+      "secure launch nonce store preparation requires POSIX"
     )
   flags = (
     os.O_RDONLY
@@ -748,8 +751,8 @@ def _open_parent_fd(parent: Path) -> int:
   try:
     return os.open(parent, flags)
   except OSError as exc:
-    raise AutonomousAdmissionLedgerIdentityError(
-      "autonomous admission ledger parent cannot be opened securely"
+    raise LaunchNonceStoreIdentityError(
+      "launch nonce store parent cannot be opened securely"
     ) from exc
 
 
@@ -771,8 +774,8 @@ def _prepare_database_file(path: Path) -> os.stat_result:
         dir_fd=parent_fd,
       )
     except OSError as exc:
-      raise AutonomousAdmissionLedgerIdentityError(
-        "autonomous admission ledger cannot be opened securely"
+      raise LaunchNonceStoreIdentityError(
+        "launch nonce store cannot be opened securely"
       ) from exc
     try:
       file_stat = os.fstat(file_fd)
@@ -784,22 +787,22 @@ def _prepare_database_file(path: Path) -> os.stat_result:
           and file_stat.st_uid != os.geteuid()
         )
       ):
-        raise AutonomousAdmissionLedgerIdentityError(
-          "autonomous admission ledger file identity is unsafe"
+        raise LaunchNonceStoreIdentityError(
+          "launch nonce store file identity is unsafe"
         )
       os.fchmod(file_fd, 0o600)
       os.fsync(file_fd)
       secured_stat = os.fstat(file_fd)
       if stat.S_IMODE(secured_stat.st_mode) != 0o600:
-        raise AutonomousAdmissionLedgerIdentityError(
-          "autonomous admission ledger mode could not be secured"
+        raise LaunchNonceStoreIdentityError(
+          "launch nonce store mode could not be secured"
         )
     finally:
       os.close(file_fd)
     os.fsync(parent_fd)
   except OSError as exc:
-    raise AutonomousAdmissionLedgerUnavailable(
-      "autonomous admission ledger preparation is not durable"
+    raise LaunchNonceStoreUnavailable(
+      "launch nonce store preparation is not durable"
     ) from exc
   finally:
     os.close(parent_fd)
@@ -808,15 +811,15 @@ def _prepare_database_file(path: Path) -> os.stat_result:
     path_stat.st_dev != secured_stat.st_dev
     or path_stat.st_ino != secured_stat.st_ino
   ):
-    raise AutonomousAdmissionLedgerIdentityError(
-      "autonomous admission ledger changed during preparation"
+    raise LaunchNonceStoreIdentityError(
+      "launch nonce store changed during preparation"
     )
   return path_stat
 
 
 def _configure_connection(connection: sqlite3.Connection) -> None:
   connection.execute(
-    f"PRAGMA busy_timeout={AUTONOMOUS_ADMISSION_LEDGER_BUSY_TIMEOUT_MS}"
+    f"PRAGMA busy_timeout={LAUNCH_NONCE_STORE_BUSY_TIMEOUT_MS}"
   )
   connection.execute("PRAGMA foreign_keys=ON")
   connection.execute("PRAGMA trusted_schema=OFF")
@@ -828,62 +831,61 @@ def _configure_connection(connection: sqlite3.Connection) -> None:
     "PRAGMA synchronous"
   ).fetchone()[0]
   connection.execute(
-    f"PRAGMA page_size={AUTONOMOUS_ADMISSION_LEDGER_PAGE_SIZE}"
+    f"PRAGMA page_size={LAUNCH_NONCE_STORE_PAGE_SIZE}"
   )
   page_size = connection.execute("PRAGMA page_size").fetchone()[0]
   max_page_count = connection.execute(
     "PRAGMA max_page_count="
-    f"{AUTONOMOUS_ADMISSION_LEDGER_MAX_PAGE_COUNT}"
+    f"{LAUNCH_NONCE_STORE_MAX_PAGE_COUNT}"
   ).fetchone()[0]
   page_count = connection.execute("PRAGMA page_count").fetchone()[0]
   if (
     str(journal_mode).lower() != "delete"
     or synchronous != 2
-    or page_size != AUTONOMOUS_ADMISSION_LEDGER_PAGE_SIZE
+    or page_size != LAUNCH_NONCE_STORE_PAGE_SIZE
     or max_page_count
-    != AUTONOMOUS_ADMISSION_LEDGER_MAX_PAGE_COUNT
+    != LAUNCH_NONCE_STORE_MAX_PAGE_COUNT
     or page_count > max_page_count
   ):
-    raise AutonomousAdmissionLedgerUnavailable(
-      "autonomous admission ledger durability bounds are unavailable"
+    raise LaunchNonceStoreUnavailable(
+      "launch nonce store durability bounds are unavailable"
     )
 
 
 def _connect(
-  identity: AutonomousAdmissionLedgerIdentity,
+  identity: LaunchNonceStoreIdentity,
 ) -> sqlite3.Connection:
   _verify_identity(identity)
+  connection = sqlite3.connect(
+    Path(identity.path).as_uri() + "?mode=rw",
+    uri=True,
+    timeout=(
+      LAUNCH_NONCE_STORE_BUSY_TIMEOUT_MS / 1_000
+    ),
+    isolation_level=None,
+  )
   try:
-    connection = sqlite3.connect(
-      Path(identity.path).as_uri() + "?mode=rw",
-      uri=True,
-      timeout=(
-        AUTONOMOUS_ADMISSION_LEDGER_BUSY_TIMEOUT_MS / 1_000
-      ),
-      isolation_level=None,
-    )
     connection.row_factory = sqlite3.Row
     _configure_connection(connection)
     _verify_identity(identity)
     return connection
   except BaseException as exc:
-    if "connection" in locals():
-      try:
-        connection.close()
-      except sqlite3.Error as close_error:
-        _add_exception_note(
-          exc,
-          "autonomous admission connection close also failed: "
-          f"{close_error!r}",
-        )
+    try:
+      connection.close()
+    except sqlite3.Error as close_error:
+      _add_exception_note(
+        exc,
+        "autonomous admission connection close also failed: "
+        f"{close_error!r}",
+      )
     raise
 
 
 def _validate_schema(connection: sqlite3.Connection) -> None:
   user_version = connection.execute("PRAGMA user_version").fetchone()[0]
-  if user_version != AUTONOMOUS_ADMISSION_LEDGER_SCHEMA_VERSION:
-    raise AutonomousAdmissionLedgerUnavailable(
-      "autonomous admission ledger schema version is incompatible"
+  if user_version != LAUNCH_NONCE_STORE_SCHEMA_VERSION:
+    raise LaunchNonceStoreUnavailable(
+      "launch nonce store schema version is incompatible"
     )
   rows = connection.execute(
     """
@@ -898,8 +900,8 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
   ).fetchall()
   observed = {row["name"]: (row["type"], row["sql"]) for row in rows}
   if set(observed) != set(_SCHEMA_OBJECTS):
-    raise AutonomousAdmissionLedgerUnavailable(
-      "autonomous admission ledger schema objects are incompatible"
+    raise LaunchNonceStoreUnavailable(
+      "launch nonce store schema objects are incompatible"
     )
   for name, (expected_type, expected_sql) in _SCHEMA_OBJECTS.items():
     observed_type, observed_sql = observed[name]
@@ -908,8 +910,8 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
       or _normalized_ddl(observed_sql)
       != _normalized_ddl(expected_sql)
     ):
-      raise AutonomousAdmissionLedgerUnavailable(
-        "autonomous admission ledger schema constraints are incompatible"
+      raise LaunchNonceStoreUnavailable(
+        "launch nonce store schema constraints are incompatible"
       )
   metadata = connection.execute(
     """
@@ -922,8 +924,8 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
     len(metadata) != 1
     or tuple(metadata[0]) != _expected_metadata()
   ):
-    raise AutonomousAdmissionLedgerUnavailable(
-      "autonomous admission ledger bounds are incompatible"
+    raise LaunchNonceStoreUnavailable(
+      "launch nonce store bounds are incompatible"
     )
   clock_rows = connection.execute(
     """
@@ -937,8 +939,8 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
     or clock_rows[0]["singleton"] != 1
     or clock_rows[0]["last_admitted_wall_ns"] < 0
   ):
-    raise AutonomousAdmissionLedgerUnavailable(
-      "autonomous admission ledger clock state is incompatible"
+    raise LaunchNonceStoreUnavailable(
+      "launch nonce store clock state is incompatible"
     )
 
 
@@ -983,7 +985,7 @@ def _initialize_or_validate_schema(
       )
       connection.execute(
         "PRAGMA user_version="
-        f"{AUTONOMOUS_ADMISSION_LEDGER_SCHEMA_VERSION}"
+        f"{LAUNCH_NONCE_STORE_SCHEMA_VERSION}"
       )
     _validate_schema(connection)
     connection.commit()
@@ -999,16 +1001,16 @@ def _initialize_or_validate_schema(
     raise
 
 
-def prepare_autonomous_admission_ledger(
+def prepare_launch_nonce_store(
   path: str | Path,
-) -> AutonomousAdmissionLedgerIdentity:
+) -> LaunchNonceStoreIdentity:
   """Create or validate the sole canonical ledger and return its identity."""
 
   _validate_policy_constants()
   canonical_path = Path(_canonical_absolute_path(path))
   file_stat = _prepare_database_file(canonical_path)
-  identity = AutonomousAdmissionLedgerIdentity(
-    schema_version=AUTONOMOUS_ADMISSION_LEDGER_SCHEMA_VERSION,
+  identity = LaunchNonceStoreIdentity(
+    schema_version=LAUNCH_NONCE_STORE_SCHEMA_VERSION,
     path=str(canonical_path),
     device=file_stat.st_dev,
     inode=file_stat.st_ino,
@@ -1016,16 +1018,16 @@ def prepare_autonomous_admission_ledger(
   try:
     connection = _connect(identity)
   except sqlite3.Error as exc:
-    raise AutonomousAdmissionLedgerUnavailable(
-      "autonomous admission ledger cannot be prepared"
+    raise LaunchNonceStoreUnavailable(
+      "launch nonce store cannot be prepared"
     ) from exc
   primary_error: BaseException | None = None
   try:
     _initialize_or_validate_schema(connection)
     _verify_identity(identity)
   except sqlite3.Error as exc:
-    error = AutonomousAdmissionLedgerUnavailable(
-      "autonomous admission ledger schema preparation failed"
+    error = LaunchNonceStoreUnavailable(
+      "launch nonce store schema preparation failed"
     )
     primary_error = error
     raise error from exc
@@ -1043,7 +1045,7 @@ def prepare_autonomous_admission_ledger(
           f"{close_error!r}",
         )
       else:
-        raise AutonomousAdmissionLedgerUnavailable(
+        raise LaunchNonceStoreUnavailable(
           "autonomous admission connection could not be closed"
         ) from close_error
   _verify_identity(identity)
@@ -1060,18 +1062,18 @@ def _wall_time_ns(clock_ns: Callable[[], int]) -> int:
 
 
 def _ensure_live(
-  receipt: OrdinaryAutonomousAdmissionReceipt,
+  facts: LaunchNonceFacts,
   *,
   now_ns: int,
   consumed: bool,
 ) -> None:
-  if now_ns < receipt.issued_at_ns:
-    raise AutonomousAdmissionLedgerExpired(
+  if now_ns < facts.issued_at_ns:
+    raise LaunchNonceExpired(
       "autonomous launch is not yet valid at durable admission",
       consumed=consumed,
     )
-  if now_ns >= receipt.expires_at_ns:
-    raise AutonomousAdmissionLedgerExpired(
+  if now_ns >= facts.expires_at_ns:
+    raise LaunchNonceExpired(
       "autonomous launch expired at durable admission",
       consumed=consumed,
     )
@@ -1091,8 +1093,8 @@ def _rollback_preserving(
     )
 
 
-def _record_from_row(row: sqlite3.Row) -> AutonomousAdmissionRecord:
-  receipt = OrdinaryAutonomousAdmissionReceipt(
+def _record_from_row(row: sqlite3.Row) -> ConsumedLaunchNonce:
+  facts = LaunchNonceFacts(
     audience=row["audience"],
     nonce=row["nonce"],
     task_id=row["task_id"],
@@ -1107,34 +1109,34 @@ def _record_from_row(row: sqlite3.Row) -> AutonomousAdmissionRecord:
     field_name="autonomous admission admitted_at_ns",
     minimum=1,
   )
-  return AutonomousAdmissionRecord(
-    receipt=receipt,
+  return ConsumedLaunchNonce(
+    facts=facts,
     admitted_at_ns=admitted_at_ns,
   )
 
 
-def consume_ordinary_autonomous_launch_once(
-  expected_identity: AutonomousAdmissionLedgerIdentity,
-  receipt: OrdinaryAutonomousAdmissionReceipt,
+def consume_launch_nonce(
+  expected_identity: LaunchNonceStoreIdentity,
+  facts: LaunchNonceFacts,
   *,
   clock_ns: Callable[[], int] = time.time_ns,
-) -> AutonomousAdmissionRecord:
+) -> ConsumedLaunchNonce:
   """Atomically consume one verified ordinary launch before child admission."""
 
   _validate_policy_constants()
-  if type(expected_identity) is not AutonomousAdmissionLedgerIdentity:
+  if type(expected_identity) is not LaunchNonceStoreIdentity:
     raise TypeError(
       "autonomous admission requires an exact signed ledger identity"
     )
-  if type(receipt) is not OrdinaryAutonomousAdmissionReceipt:
+  if type(facts) is not LaunchNonceFacts:
     raise TypeError(
-      "autonomous admission requires an exact ordinary receipt"
+      "launch nonce consume requires exact launch nonce facts"
     )
   if not callable(clock_ns):
     raise TypeError("autonomous admission clock must be callable")
   _verify_identity(expected_identity)
   _ensure_live(
-    receipt,
+    facts,
     now_ns=_wall_time_ns(clock_ns),
     consumed=False,
   )
@@ -1142,8 +1144,8 @@ def consume_ordinary_autonomous_launch_once(
   try:
     connection = _connect(expected_identity)
   except sqlite3.Error as exc:
-    raise AutonomousAdmissionLedgerUnavailable(
-      "autonomous admission ledger cannot be opened"
+    raise LaunchNonceStoreUnavailable(
+      "launch nonce store cannot be opened"
     ) from exc
   committed = False
   admitted_at_ns = 0
@@ -1155,7 +1157,7 @@ def consume_ordinary_autonomous_launch_once(
       _validate_schema(connection)
       admitted_at_ns = _wall_time_ns(clock_ns)
       _ensure_live(
-        receipt,
+        facts,
         now_ns=admitted_at_ns,
         consumed=False,
       )
@@ -1170,12 +1172,12 @@ def consume_ordinary_autonomous_launch_once(
         clock_row is None
         or type(clock_row["last_admitted_wall_ns"]) is not int
       ):
-        raise AutonomousAdmissionLedgerUnavailable(
-          "autonomous admission ledger clock state is unavailable"
+        raise LaunchNonceStoreUnavailable(
+          "launch nonce store clock state is unavailable"
         )
       last_admitted_wall_ns = clock_row["last_admitted_wall_ns"]
       if admitted_at_ns < last_admitted_wall_ns:
-        raise AutonomousAdmissionLedgerClockRollback(
+        raise LaunchNonceClockRollback(
           "autonomous admission wall clock moved backward"
         )
       clock_update = connection.execute(
@@ -1188,8 +1190,8 @@ def consume_ordinary_autonomous_launch_once(
         (admitted_at_ns, last_admitted_wall_ns),
       )
       if clock_update.rowcount != 1:
-        raise AutonomousAdmissionLedgerUnavailable(
-          "autonomous admission ledger clock update was not exclusive"
+        raise LaunchNonceStoreUnavailable(
+          "launch nonce store clock update was not exclusive"
         )
       connection.execute(
         """
@@ -1204,7 +1206,7 @@ def consume_ordinary_autonomous_launch_once(
         """,
         (
           admitted_at_ns,
-          AUTONOMOUS_ADMISSION_LEDGER_CLEANUP_BATCH_SIZE,
+          LAUNCH_NONCE_STORE_CLEANUP_BATCH_SIZE,
         ),
       )
       try:
@@ -1217,15 +1219,15 @@ def consume_ordinary_autonomous_launch_once(
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           """,
           (
-            receipt.nonce,
-            AUTONOMOUS_ADMISSION_LEDGER_SCHEMA_VERSION,
-            receipt.audience,
-            receipt.task_id,
-            receipt.control_run_id,
-            receipt.owner_user_id,
-            receipt.channel_id,
-            receipt.issued_at_ns,
-            receipt.expires_at_ns,
+            facts.nonce,
+            LAUNCH_NONCE_STORE_SCHEMA_VERSION,
+            facts.audience,
+            facts.task_id,
+            facts.control_run_id,
+            facts.owner_user_id,
+            facts.channel_id,
+            facts.issued_at_ns,
+            facts.expires_at_ns,
             admitted_at_ns,
           ),
         )
@@ -1236,10 +1238,10 @@ def consume_ordinary_autonomous_launch_once(
             FROM ordinary_autonomous_launch_admissions
            WHERE nonce = ?
           """,
-          (receipt.nonce,),
+          (facts.nonce,),
         ).fetchone()
         if existing_nonce is not None:
-          raise AutonomousAdmissionLedgerDuplicate(
+          raise LaunchNonceReplay(
             "autonomous launch nonce has already been consumed"
           ) from exc
         raise
@@ -1248,10 +1250,10 @@ def consume_ordinary_autonomous_launch_once(
       ).fetchone()[0]
       if (
         type(row_count) is not int
-        or row_count > AUTONOMOUS_ADMISSION_LEDGER_MAX_ROWS
+        or row_count > LAUNCH_NONCE_STORE_MAX_ROWS
       ):
-        raise AutonomousAdmissionLedgerCapacityExceeded(
-          "autonomous admission ledger reached its fixed row capacity"
+        raise LaunchNonceStoreCapacityExceeded(
+          "launch nonce store reached its fixed row capacity"
         )
       _verify_identity(expected_identity)
       connection.commit()
@@ -1269,35 +1271,35 @@ def consume_ordinary_autonomous_launch_once(
         FROM ordinary_autonomous_launch_admissions
        WHERE nonce = ?
       """,
-      (receipt.nonce,),
+      (facts.nonce,),
     ).fetchone()
     if row is None:
-      raise AutonomousAdmissionLedgerUnavailable(
+      raise LaunchNonceStoreUnavailable(
         "committed autonomous admission is not visible"
       )
     record = _record_from_row(row)
     if (
-      record.receipt != receipt
+      record.facts != facts
       or record.admitted_at_ns != admitted_at_ns
     ):
-      raise AutonomousAdmissionLedgerUnavailable(
-        "committed autonomous admission receipt changed"
+      raise LaunchNonceStoreUnavailable(
+        "committed launch nonce facts changed"
       )
     observed_after_commit_ns = _wall_time_ns(clock_ns)
     if observed_after_commit_ns < admitted_at_ns:
-      raise AutonomousAdmissionLedgerClockRollback(
+      raise LaunchNonceClockRollback(
         "autonomous admission wall clock moved backward"
       )
     _ensure_live(
-      receipt,
+      facts,
       now_ns=observed_after_commit_ns,
       consumed=True,
     )
     _verify_identity(expected_identity)
     return record
   except sqlite3.Error as exc:
-    error = AutonomousAdmissionLedgerUnavailable(
-      "autonomous admission ledger transaction failed"
+    error = LaunchNonceStoreUnavailable(
+      "launch nonce store transaction failed"
     )
     primary_error = error
     raise error from exc
@@ -1315,42 +1317,23 @@ def consume_ordinary_autonomous_launch_once(
           f"{close_error!r}",
         )
       else:
-        raise AutonomousAdmissionLedgerUnavailable(
+        raise LaunchNonceStoreUnavailable(
           "autonomous admission connection could not be closed"
         ) from close_error
 
 
-def consume_verified_ordinary_autonomous_launch_once(
-  envelope: AutonomousLaunchEnvelope,
-  *,
-  clock_ns: Callable[[], int] = time.time_ns,
-) -> AutonomousAdmissionRecord:
-  """Consume identity and nonce bound by the same verified envelope."""
-
-  if type(envelope) is not AutonomousLaunchEnvelope:
-    raise TypeError(
-      "ordinary autonomous admission requires a verified launch envelope"
-    )
-  return consume_ordinary_autonomous_launch_once(
-    AutonomousAdmissionLedgerIdentity.from_verified_envelope(envelope),
-    OrdinaryAutonomousAdmissionReceipt.from_verified_envelope(envelope),
-    clock_ns=clock_ns,
-  )
-
-
 __all__ = [
-  "AUTONOMOUS_ADMISSION_LEDGER_SCHEMA_VERSION",
-  "AutonomousAdmissionLedgerCapacityExceeded",
-  "AutonomousAdmissionLedgerClockRollback",
-  "AutonomousAdmissionLedgerDuplicate",
-  "AutonomousAdmissionLedgerError",
-  "AutonomousAdmissionLedgerExpired",
-  "AutonomousAdmissionLedgerIdentity",
-  "AutonomousAdmissionLedgerIdentityError",
-  "AutonomousAdmissionLedgerUnavailable",
-  "AutonomousAdmissionRecord",
-  "OrdinaryAutonomousAdmissionReceipt",
-  "consume_ordinary_autonomous_launch_once",
-  "consume_verified_ordinary_autonomous_launch_once",
-  "prepare_autonomous_admission_ledger",
+  "LAUNCH_NONCE_STORE_SCHEMA_VERSION",
+  "ConsumedLaunchNonce",
+  "LaunchNonceClockRollback",
+  "LaunchNonceExpired",
+  "LaunchNonceFacts",
+  "LaunchNonceReplay",
+  "LaunchNonceStoreCapacityExceeded",
+  "LaunchNonceStoreError",
+  "LaunchNonceStoreIdentity",
+  "LaunchNonceStoreIdentityError",
+  "LaunchNonceStoreUnavailable",
+  "consume_launch_nonce",
+  "prepare_launch_nonce_store",
 ]

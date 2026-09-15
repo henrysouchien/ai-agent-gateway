@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Callable, Mapping
+from collections.abc import Iterable
+from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
 from .sub_agent_helpers import _ARTIFACT_EMIT_TOOLS
+
+
+@runtime_checkable
+class _ToolDefinitionsGetter(Protocol):
+  def __call__(self) -> Iterable[dict[str, Any]]: ...
 
 
 def child_tool_definitions_getter(
@@ -29,16 +35,16 @@ def child_tool_definitions_getter(
   mcp_get_tool_definitions = getattr(mcp_client, "get_tool_definitions", None)
   mcp_is_mcp_tool = getattr(mcp_client, "is_mcp_tool", None)
   if (
-    not callable(parent_get_tool_definitions)
-    and not callable(mcp_get_tool_definitions)
+    not isinstance(parent_get_tool_definitions, _ToolDefinitionsGetter)
+    and not isinstance(mcp_get_tool_definitions, _ToolDefinitionsGetter)
     and not extra_definitions
   ):
     return None
 
   def _child_tool_definitions() -> list[dict[str, Any]]:
-    if callable(parent_get_tool_definitions):
+    if isinstance(parent_get_tool_definitions, _ToolDefinitionsGetter):
       definitions = list(parent_get_tool_definitions())
-    elif callable(mcp_get_tool_definitions):
+    elif isinstance(mcp_get_tool_definitions, _ToolDefinitionsGetter):
       definitions = list(mcp_get_tool_definitions())
     else:
       definitions = []
@@ -106,48 +112,37 @@ def artifact_emit_tool_definitions(
   requested = set(installed_tool_names) & set(artifact_emit_tools)
   if not requested:
     return []
+  from .canvas_build_environment import canvas_build_enabled
+
+  definitions: dict[str, Any] = {}
+  if "emit_canvas_artifact" in requested and canvas_build_enabled():
+    # No ImportError fallback: the canvas definition publishes SourceRecord's own
+    # generated `sources` schema, and a hand-written stand-in would be a second,
+    # false answer to what a caller may author. Every canvas handler imports api
+    # modules, so the tool cannot be requested where `agent.shared.tool_defs` is
+    # unimportable — an ImportError here must raise loudly.
+    from agent.shared.tool_defs.canvas_artifact import CANVAS_ARTIFACT_TOOL_DEF
+
+    definitions["emit_canvas_artifact"] = CANVAS_ARTIFACT_TOOL_DEF
   try:
     from agent.shared.tool_defs.html_artifact import (
       DASHBOARD_ARTIFACT_TOOL_DEF,
     )
-    from agent.shared.tool_defs.canvas_artifact import CANVAS_ARTIFACT_TOOL_DEF
-    from .canvas_build_environment import canvas_build_enabled
 
-    definitions = {
-      "emit_dashboard_artifact": DASHBOARD_ARTIFACT_TOOL_DEF,
-    }
-    if canvas_build_enabled():
-      definitions["emit_canvas_artifact"] = CANVAS_ARTIFACT_TOOL_DEF
+    definitions["emit_dashboard_artifact"] = DASHBOARD_ARTIFACT_TOOL_DEF
   except ImportError:
-    definitions = {
-      "emit_dashboard_artifact": {
-        "name": "emit_dashboard_artifact",
-        "description": "Emit a typed dashboard artifact for the current named skill run.",
-        "input_schema": {
-          "type": "object",
-          "properties": {
-            "payload": {"type": "object"},
-            "summary": {"type": "string"},
-            "profile": {"type": "string"},
-            "research_file_id": {"type": ["integer", "string", "null"]},
-          },
-          "required": ["payload", "summary"],
+    definitions["emit_dashboard_artifact"] = {
+      "name": "emit_dashboard_artifact",
+      "description": "Emit a typed dashboard artifact for the current named skill run.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "payload": {"type": "object"},
+          "summary": {"type": "string"},
+          "profile": {"type": "string"},
+          "research_file_id": {"type": ["integer", "string", "null"]},
         },
+        "required": ["payload", "summary"],
       },
     }
-    from .canvas_build_environment import canvas_build_enabled
-    if canvas_build_enabled():
-      definitions["emit_canvas_artifact"] = {
-        "name": "emit_canvas_artifact",
-        "description": "Emit a compiled Canvas artifact for the current named skill run.",
-        "input_schema": {
-          "type": "object",
-          "properties": {
-            "title": {"type": "string"}, "purpose": {"type": "string"},
-            "summary": {"type": "string"}, "tsx_source": {"type": "string"},
-            "copy_as_markdown": {"type": "string"},
-          },
-          "required": ["title", "purpose", "summary", "tsx_source", "copy_as_markdown"],
-        },
-      }
   return [copy.deepcopy(definitions[name]) for name in sorted(requested) if name in definitions]

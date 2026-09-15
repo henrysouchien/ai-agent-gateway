@@ -20,7 +20,8 @@ if str(PKG_DIR) not in sys.path:
 from agent_gateway import AnthropicProvider, ModelInfo, ThinkingLevel
 import agent_gateway.providers.anthropic as anthropic_provider_module
 import agent_gateway.providers.anthropic_helpers as anthropic_helpers
-from agent_gateway.providers.anthropic import _MODEL_INFO_BY_TAG, _format_anthropic_rejection_detail
+from agent_gateway.providers.anthropic import _format_anthropic_rejection_detail
+from agent_gateway.providers import StreamEvent
 
 
 def test_server_tool_usage_preserves_known_billable_units_and_rejects_unknown_positive() -> None:
@@ -35,7 +36,7 @@ def test_server_tool_usage_preserves_known_billable_units_and_rejects_unknown_po
     "web_search_requests": 1, "future_paid_requests": 2,
   })
   with pytest.raises(ValueError, match="unrecognized separately billed"):
-    anthropic_provider_module._server_tool_units(unknown)
+    anthropic_provider_module._server_tool_unit_deltas(unknown)
   with pytest.raises(ValueError, match="invalid Anthropic"):
     anthropic_provider_module._server_tool_unit_deltas(SimpleNamespace(
       server_tool_use={"web_search_requests": True, "web_fetch_requests": 0},
@@ -467,7 +468,6 @@ def test_model_info_defaults_derive_thinking_mode_from_supports_thinking() -> No
     ("claude-3.7-sonnet-20250219", False),
     ("claude-sonnet-4-60", False),
     ("claude-sonnet-4-6x", False),
-    ("claude-zenith-9", False),
   ],
 )
 def test_native_compaction_capability_is_model_specific_and_fail_closed(
@@ -486,7 +486,6 @@ def test_native_compaction_capability_is_model_specific_and_fail_closed(
     ("claude-haiku-4-5", False),
     ("claude-sonnet-4-60", False),
     ("claude-sonnet-4-6x", False),
-    ("claude-zenith-9", False),
   ],
 )
 def test_compaction_request_is_emitted_only_for_supported_models(
@@ -552,6 +551,29 @@ def test_fable_model_info_uses_bundled_rates_and_adaptive_thinking() -> None:
   assert info.cache_write_cost_per_mtok == 12.5
   assert info.supports_thinking is True
   assert info.thinking_mode == "adaptive"
+
+
+def test_fable_revision_uses_its_exact_cached_token_price() -> None:
+  provider = AnthropicProvider()
+
+  assert provider.estimate_cost("claude-fable-5-1", 0, 0, cache_read_tokens=1_000_000).total == 0.25
+  assert provider.estimate_cost("claude-fable-5", 0, 0, cache_read_tokens=1_000_000).total == 1.0
+
+
+def test_anthropic_prefers_specific_model_metadata_over_family(monkeypatch) -> None:
+  from dataclasses import replace
+
+  family = AnthropicProvider().get_model_info("claude-fable-5")
+  specific = replace(family, id="claude-fable-5-1", supports_native_compaction=False)
+  monkeypatch.setattr(anthropic_helpers, "_MODEL_INFO_BY_TAG", [
+    (("claude-fable-5",), family),
+    (("claude-fable-5-1",), specific),
+  ])
+
+  provider = AnthropicProvider()
+  assert provider.get_model_info("claude-fable-5").supports_native_compaction is True
+  assert provider.get_model_info("claude-fable-5-1").supports_native_compaction is False
+  assert provider.get_model_info("claude-fable-5-1-20260911").supports_native_compaction is False
 
 
 def test_opus48_model_info_uses_bundled_rates_and_adaptive_thinking() -> None:
@@ -660,31 +682,116 @@ def test_thinking_param_matches_existing_model_capability_mapping(
   assert AnthropicProvider.thinking_param(model, 12_000) == expected
 
 
-def test_thinking_param_mapping_covers_anthropic_model_info_table() -> None:
-  mapped_models = {tag for tags, _info in _MODEL_INFO_BY_TAG for tag in tags}
-
-  assert {
-    "claude-fable-5",
-    "claude-opus-4-8",
-    "claude-opus-4-7",
-    "claude-sonnet-4-6",
-    "claude-opus-4-6",
-    "claude-sonnet-4-5",
-    "claude-opus-4-5",
-    "claude-sonnet-4",
-    "claude-haiku-4-5",
-    "claude-3",
-  } <= mapped_models
 
 
-def test_unknown_claude_model_defaults_to_adaptive_thinking() -> None:
+def test_registry_unadmitted_claude_model_is_rejected() -> None:
   provider = AnthropicProvider()
 
-  info = provider.get_model_info("claude-zenith-9")
+  with pytest.raises(ValueError, match="product model registry does not admit"):
+    provider.get_model_info("claude-zenith-9")
+  with pytest.raises(ValueError, match="product model registry does not admit"):
+    AnthropicProvider.thinking_param("claude-zenith-9", 4096)
+
+
+def test_thinking_param_defers_foreign_model_ids_to_registry_owner() -> None:
+  # No prefix pre-check: a non-claude id routed here is decided by the
+  # product model registry (raise), not silently degraded to no-thinking.
+  with pytest.raises(ValueError, match="product model registry does not admit"):
+    AnthropicProvider.thinking_param("gpt-5.2", 4096)
+
+
+def _registry_entry(**overrides):
+  from agent_gateway.model_registry import ModelRegistryEntry
+
+  fields = {
+    "key": "anthropic.claude-nova-6",
+    "label": "Nova 6",
+    "provider": "anthropic",
+    "upstream_model": "claude-nova-6",
+    "adapter": "anthropic.messages",
+    "protocol_profile": "messages.adaptive",
+    "route": "anthropic.public",
+    "lifecycle": "active",
+    "capabilities": {"session.driver": "user_selectable"},
+    "supported_efforts": frozenset({"low", "medium", "high", "xhigh", "max"}),
+    "default_effort": "high",
+    "features": frozenset({"tools", "streaming"}),
+    "reported_identities": frozenset({"claude-nova-6"}),
+  }
+  fields.update(overrides)
+  return ModelRegistryEntry(**fields)
+
+
+def test_registry_admitted_claude_model_without_row_derives_from_registry(
+  monkeypatch,
+) -> None:
+  # Config-only model addition (plan §8): a registry-admitted model is served
+  # before the capability table gains a row, with thinking and effort facts
+  # derived from the registry owner — no generic substitution that would drop
+  # xhigh/max efforts or misreport disable semantics.
+  from agent_gateway.model_registry import ProductModelRegistry
+  import agent_gateway.providers.base as provider_base
+
+  entry = _registry_entry()
+  monkeypatch.setattr(
+    provider_base,
+    "INITIAL_MODEL_REGISTRY",
+    ProductModelRegistry(
+      schema="product-model-registry/v1",
+      revision="test",
+      models={entry.key: entry},
+    ),
+  )
+  provider = AnthropicProvider()
+
+  info = provider.get_model_info("claude-nova-6")
 
   assert info.supports_thinking is True
   assert info.thinking_mode == "adaptive"
-  assert AnthropicProvider.thinking_param("claude-zenith-9", 4096) == {"type": "adaptive"}
+  compat = info.compat or {}
+  assert compat["effort_values"] == ("low", "medium", "high", "xhigh", "max")
+  assert compat["thinking_default_effort"] == "high"
+  assert compat["thinking_default_when_omitted"] == "on"
+  # No "none" effort admitted => thinking cannot be explicitly disabled.
+  assert compat["thinking_disable"] == "unsupported"
+  assert AnthropicProvider.thinking_param("claude-nova-6", 4096) == {"type": "adaptive"}
+
+
+@pytest.mark.parametrize(
+  ("model", "expected_disable", "expected_omitted"),
+  [
+    ("claude-fable-5", "unsupported", "on"),
+    ("claude-mythos-5", "unsupported", "on"),
+    ("claude-opus-5", "disabled", "on"),
+    ("claude-sonnet-5", "disabled", "on"),
+  ],
+)
+def test_registry_derivation_reproduces_cataloged_adaptive_compat(
+  model: str,
+  expected_disable: str,
+  expected_omitted: str,
+) -> None:
+  # Oracle for the derivation rules: for every adaptive model that has BOTH a
+  # registry entry and a catalog row, deriving from the registry entry must
+  # reproduce the catalog row's thinking compat exactly.
+  from agent_gateway.model_registry import INITIAL_MODEL_REGISTRY
+  from agent_gateway.providers.anthropic_helpers import (
+    _model_info_from_registry_entry,
+  )
+
+  entry = next(
+    e for e in INITIAL_MODEL_REGISTRY.models.values()
+    if e.provider == "anthropic" and e.upstream_model == model
+  )
+  catalog = AnthropicProvider().get_model_info(model)
+
+  derived = _model_info_from_registry_entry(model, entry)
+  assert derived.compat is not None
+
+  assert derived.compat == catalog.compat
+  assert derived.compat["thinking_disable"] == expected_disable
+  assert derived.compat["thinking_default_when_omitted"] == expected_omitted
+  assert derived.thinking_mode == catalog.thinking_mode
 
 
 @pytest.mark.parametrize("model", ["claude-haiku-4-5", "claude-3.7-sonnet-20250219"])
@@ -975,8 +1082,57 @@ async def _collect_stream_types(provider: AnthropicProvider, client: object, par
   return [event.type async for event in provider.stream(client, params)]
 
 
-async def _collect_stream_events(provider: AnthropicProvider, client: object, params: dict[str, object]) -> list[object]:
+async def _collect_stream_events(
+  provider: AnthropicProvider,
+  client: object,
+  params: dict[str, object],
+) -> list[StreamEvent]:
   return [event async for event in provider.stream(client, params)]
+
+
+def test_tool_use_mapper_emits_raw_input_without_redactor_dependency(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  import agent_gateway.runner_tool_audit as runner_tool_audit
+
+  monkeypatch.setattr(
+    runner_tool_audit,
+    "redact_tool_input_for_event",
+    lambda *_args, **_kwargs: (_ for _ in ()).throw(
+      AssertionError("provider mapper cannot own history redaction")
+    ),
+  )
+  provider_block = SimpleNamespace(
+    type="tool_use",
+    id="call-1",
+    name="registered_write",
+    input={},
+  )
+  client = _FakeStreamingClient([
+    SimpleNamespace(
+      type="content_block_start",
+      content_block=provider_block,
+    ),
+    SimpleNamespace(
+      type="content_block_delta",
+      delta=SimpleNamespace(
+        type="input_json_delta",
+        partial_json='{\"credential\":\"raw-secret\"}',
+      ),
+    ),
+    SimpleNamespace(type="content_block_stop"),
+  ])
+
+  events = asyncio.run(_collect_stream_events(
+    AnthropicProvider(),
+    client,
+    {"model": "claude-sonnet-4-6", "messages": []},
+  ))
+  tool_event = next(event for event in events if event.type == "tool_use_end")
+
+  assert tool_event.tool_input == {"credential": "raw-secret"}
+  assert tool_event.raw_block["input"] == {"credential": "raw-secret"}
+  assert provider_block.input == {}
 
 
 @pytest.mark.parametrize(

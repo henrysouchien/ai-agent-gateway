@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 import fcntl
+from functools import partial
 import logging
 import socket
 import sys
 import time
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any, Callable, Dict, List
 
 from .agent_session_log_records import (
   EVENT_SCHEMA_VERSION,
@@ -19,6 +20,7 @@ from .research_file_current_projection import (
   load_research_file_current_projection_sync,
 )
 from .runner_introspection import format_exc as _format_exc
+from .runner_session_events import TerminalClosureDecision, terminal_closure_decision
 from .runner_session_events import (
   build_assistant_message_event as _build_assistant_message_event,
   build_attach_event as _build_attach_event,
@@ -35,6 +37,7 @@ from .runner_session_events import (
   build_workflow_output_attached_event as _build_workflow_output_attached_event,
   durable_event_payload as _durable_event_payload,
   release_write_lease as _release_write_lease,
+  run_interrupted_reason as _run_interrupted_reason,
   shutdown_interrupted_reason as _shutdown_interrupted_reason,
   write_lease_metadata as _write_lease_metadata,
 )
@@ -58,6 +61,13 @@ from .selected_content import serialize_selected_content_bindings
 from .secret_boundary import sanitize_tool_event
 from .task_registry import ParentMessage, TaskEntry, TaskRegistry, TaskState
 from .workflow_output_attachment import WorkflowOutputAttachment
+
+if TYPE_CHECKING:
+  from .agent_session_log import AgentSessionLog
+  from .event_log import EventLog
+  from .providers import ModelProvider
+  from .skill_lifecycle import TopLevelSkillResultPolicy
+
 
 
 log = logging.getLogger("agent_gateway.runner")
@@ -107,6 +117,63 @@ def _exact_value_match(expected: Any, actual: Any) -> bool:
 
 
 class RunnerSessionLifecycleMixin:
+  _run_closure_deferred: bool = False
+  _terminal_closure_event: Dict[str, Any] | None = None
+  _terminal_closure_receipts: list[Dict[str, Any]] | None = None
+  _terminal_closure_interruption: tuple[str, Dict[str, Any] | None] | None = None
+
+  if TYPE_CHECKING:
+    _agent_session_log: AgentSessionLog | None
+    _client_kind: str
+    _gateway_session_id: str
+    _log: EventLog
+    _pending_workflow_output_attachments: dict[
+      str,
+      WorkflowOutputAttachment,
+    ]
+    _provider: ModelProvider
+    _role: str
+    _runner_id: str | None
+    _shutdown_signal_provider: (
+      Callable[[], Dict[str, Any] | None] | None
+    )
+    _sid: str
+    _skill_run_id: str | None
+    _sub_agent_id: str | None
+    _task_registry: TaskRegistry
+    _task_registry_rebuild_lock: asyncio.Lock
+    _top_level_skill_lifecycle: (
+      TopLevelSkillLifecycleMetadata | None
+    )
+    _top_level_skill_result_policy: (
+      TopLevelSkillResultPolicy | None
+    )
+    _top_level_skill_settlement_complete: asyncio.Event
+    _workspace_dir: str | None
+
+    def _append(self, event: Dict[str, Any]) -> Any | None: ...
+
+    async def _call_on_before_stream_complete(
+      self,
+      terminal_event: Dict[str, Any] | None = None,
+    ) -> None: ...
+
+    async def _durable_required_skill_result_event(
+      self,
+      bg_task: TaskEntry,
+      lifecycle: dict[str, Any],
+    ) -> dict[str, Any] | None: ...
+
+    async def _ensure_required_skill_result_settled(
+      self,
+      bg_task: TaskEntry,
+    ) -> bool: ...
+
+    @staticmethod
+    def _required_skill_lifecycle(
+      bg_task: TaskEntry,
+    ) -> dict[str, Any] | None: ...
+
   def _durable_event_for_append(
     self,
     event: Dict[str, Any],
@@ -136,10 +203,11 @@ class RunnerSessionLifecycleMixin:
     )
 
   async def _append_durable_event(self, event: Dict[str, Any]) -> Any | None:
+    durable_log = self._agent_session_log
     payload = self._durable_event_for_append(deepcopy(event))
-    if payload is None:
+    if payload is None or durable_log is None:
       return None
-    entry = await self._agent_session_log.append(payload)
+    entry = await durable_log.append(payload)
     self._last_durable_seq = max(
       int(getattr(self, "_last_durable_seq", 0) or 0),
       entry.seq,
@@ -196,12 +264,16 @@ class RunnerSessionLifecycleMixin:
     return deepcopy(confirmed)
 
   def _append_durable_event_sync(self, event: Dict[str, Any]) -> Any | None:
-    """Commit a terminal receipt without yielding after settlement proof."""
+    """Append a durable fact within settlement or attach recovery."""
 
     payload = self._durable_event_for_append(deepcopy(event))
     if payload is None:
       return None
-    append_sync = getattr(self._agent_session_log, "append_sync", None)
+    append_sync = (
+      self._agent_session_log.append_sync
+      if self._agent_session_log is not None
+      else None
+    )
     if not callable(append_sync):
       raise RuntimeError(
         "durable session log does not support synchronous terminal settlement"
@@ -524,12 +596,14 @@ class RunnerSessionLifecycleMixin:
       deepcopy(plan.result_event)
     )
 
-  async def _assert_no_top_level_skill_result(self) -> None:
+  async def _assert_no_top_level_skill_result(
+    self,
+    lifecycle: TopLevelSkillLifecycleMetadata,
+  ) -> None:
     entries = await self._top_level_skill_entries(
       event_types={"skill_result_captured"},
     )
     if entries:
-      lifecycle = self._top_level_skill_lifecycle
       raise RuntimeError(
         "Stale top-level skill_result_captured already exists for "
         f"{lifecycle.skill_run_id}"
@@ -549,7 +623,9 @@ class RunnerSessionLifecycleMixin:
       raise RuntimeError(
         "Top-level skill result was already committed"
       )
-    await self._assert_no_top_level_skill_result()
+    await self._assert_no_top_level_skill_result(
+      self._top_level_skill_lifecycle
+    )
     event = await self._build_top_level_skill_result_event(
       terminal_event
     )
@@ -617,10 +693,10 @@ class RunnerSessionLifecycleMixin:
       raise RuntimeError(
         "Exact durable top-level envelope has an invalid schema"
       )
-    append_sync = getattr(
-      self._agent_session_log,
-      "append_sync",
-      None,
+    append_sync = (
+      self._agent_session_log.append_sync
+      if self._agent_session_log is not None
+      else None
     )
     if not callable(append_sync):
       raise RuntimeError(
@@ -634,10 +710,10 @@ class RunnerSessionLifecycleMixin:
     self,
     event: Dict[str, Any],
   ) -> Dict[str, Any] | None:
-    query_sync = getattr(
-      self._agent_session_log,
-      "query_sync",
-      None,
+    query_sync = (
+      self._agent_session_log.query_sync
+      if self._agent_session_log is not None
+      else None
     )
     if not callable(query_sync):
       raise RuntimeError(
@@ -719,7 +795,7 @@ class RunnerSessionLifecycleMixin:
       )
     return SkillCompletionWal(self._agent_session_log.path)
 
-  def _require_top_level_admission_fence(self) -> Any:
+  def _require_top_level_writer_lease_fence(self) -> Any:
     admission = getattr(
       self,
       "_top_level_skill_admission",
@@ -738,10 +814,10 @@ class RunnerSessionLifecycleMixin:
   ) -> bool:
     if record.get("record_type") != "settled":
       return False
-    query_sync = getattr(
-      self._agent_session_log,
-      "query_sync",
-      None,
+    query_sync = (
+      self._agent_session_log.query_sync
+      if self._agent_session_log is not None
+      else None
     )
     if not callable(query_sync):
       raise RuntimeError(
@@ -1044,7 +1120,7 @@ class RunnerSessionLifecycleMixin:
     durable_terminal: Dict[str, Any],
     reason: str,
   ) -> Dict[str, Any]:
-    admission = self._require_top_level_admission_fence()
+    admission = self._require_top_level_writer_lease_fence()
     return wal.store(
       {
         "record_type": record_type,
@@ -1111,7 +1187,7 @@ class RunnerSessionLifecycleMixin:
       raise RuntimeError(
         "Durable envelope overrides require a recovery wrapper"
       )
-    admission = self._require_top_level_admission_fence()
+    admission = self._require_top_level_writer_lease_fence()
     canonical_result = lifecycle.normalize_result_event(
       deepcopy(result)
     )
@@ -1218,7 +1294,7 @@ class RunnerSessionLifecycleMixin:
       current = wal.store(intent)
     self._exact_top_level_durable_event_sync(current["result"])
     self._exact_top_level_durable_event_sync(current["terminal"])
-    self._require_top_level_admission_fence()
+    self._require_top_level_writer_lease_fence()
     try:
       apply_completion_effect(
         current["effect"],
@@ -1238,7 +1314,7 @@ class RunnerSessionLifecycleMixin:
         reason="effect_target_digest_conflict",
       )
       raise
-    self._require_top_level_admission_fence()
+    self._require_top_level_writer_lease_fence()
     durable_result = self._append_and_readback_top_level_event_sync(
       current["result"]
     )
@@ -1254,45 +1330,21 @@ class RunnerSessionLifecycleMixin:
       reason=settlement_reason,
     )
     if project_live:
-      self._top_level_skill_result_event = deepcopy(
-        canonical_result
-      )
-      self._top_level_skill_result_committed = True
-      self._project_top_level_skill_event(
-        deepcopy(canonical_result)
-      )
-      self._deferred_top_level_terminal_event = deepcopy(
-        canonical_terminal
-      )
-      self._top_level_skill_terminal_committed = True
-      if not getattr(self._log, "has_terminal", False):
-        self._append(deepcopy(canonical_terminal))
-      terminal_entries = [
-        entry.event
-        for entry in getattr(self._log, "entries", ())
-        if (
-          isinstance(getattr(entry, "event", None), dict)
-          and entry.event.get("type")
-          in {"error", "stream_complete"}
-        )
-      ]
-      if (
-        len(terminal_entries) != 1
-        or not _exact_value_match(
-          terminal_entries[0],
-          canonical_terminal,
-        )
-      ):
-        # Operator ruling 2026-08-03: a projection discrepancy in the JSON
-        # session log is a diary problem — warn, never veto completed work.
-        log.warning(
-          "Live EventLog terminal projection is not exact "
-          "(%d terminal entries) — proceeding; bookkeeping never vetoes "
-          "completed work",
-          len(terminal_entries),
-        )
-      self._deferred_top_level_terminal_flushed = True
+      self._project_top_level_closure(canonical_result, canonical_terminal)
     return durable_result, durable_terminal
+
+  def _project_top_level_closure(
+    self,
+    result: Dict[str, Any],
+    terminal: Dict[str, Any],
+  ) -> None:
+    self._top_level_skill_result_event = deepcopy(result)
+    self._top_level_skill_result_committed = True
+    self._project_top_level_skill_event(deepcopy(result))
+    self._deferred_top_level_terminal_event = deepcopy(terminal)
+    self._top_level_skill_terminal_committed = True
+    self._append(deepcopy(terminal))
+    self._deferred_top_level_terminal_flushed = True
 
   def _top_level_skill_failure_result_event(
     self,
@@ -1355,7 +1407,7 @@ class RunnerSessionLifecycleMixin:
       ),
     }
 
-  async def _build_and_persist_final_top_level_skill_result(
+  async def _prepare_final_top_level_skill_result(
     self,
     terminal_event: Dict[str, Any],
   ) -> bool:
@@ -1369,7 +1421,7 @@ class RunnerSessionLifecycleMixin:
       if self._top_level_skill_result_event is not None
       else None
     )
-    if failure is None:
+    if failure is None and event is None:
       try:
         event = await self._build_top_level_skill_result_event(
           terminal_event
@@ -1392,10 +1444,9 @@ class RunnerSessionLifecycleMixin:
           )
           effective_terminal = deepcopy(prepared_terminal)
       else:
-        prepared_terminal = self._prepared_top_level_terminal_event
-        if isinstance(prepared_terminal, dict):
-          effective_terminal = deepcopy(prepared_terminal)
         self._top_level_skill_result_event = deepcopy(event)
+    if failure is None and self._prepared_top_level_terminal_event is not None:
+      effective_terminal = deepcopy(self._prepared_top_level_terminal_event)
     if failure is not None:
       failure_code = (
         self._top_level_skill_result_failure_code
@@ -1433,18 +1484,12 @@ class RunnerSessionLifecycleMixin:
       effective_terminal,
       lifecycle=lifecycle,
     )
-    self._defer_top_level_terminal_event(effective_terminal)
+    self._deferred_top_level_terminal_event = effective_terminal
     self._top_level_skill_result_event = deepcopy(event)
-    self._commit_top_level_skill_plan_sync(
-      lifecycle=lifecycle,
-      result=deepcopy(event),
-      terminal=deepcopy(effective_terminal),
-      effect=effect,
-      project_live=True,
-    )
+    self._top_level_skill_completion_effect_plan = effect
     return True
 
-  async def _finalize_top_level_skill_result(
+  async def _prepare_top_level_skill_closure(
     self,
     *,
     run_error: BaseException | None,
@@ -1494,7 +1539,7 @@ class RunnerSessionLifecycleMixin:
           ),
         }
       self._top_level_skill_result_task = asyncio.create_task(
-        self._build_and_persist_final_top_level_skill_result(
+        self._prepare_final_top_level_skill_result(
           final_terminal_event
         ),
         name=(
@@ -1508,109 +1553,11 @@ class RunnerSessionLifecycleMixin:
         )
       )
     except asyncio.CancelledError:
-      return bool(
-        await drain_owned_lifecycle_task(
-          self._top_level_skill_result_task
-        )
-      )
+      await drain_owned_lifecycle_task(self._top_level_skill_result_task)
+      raise
 
-  def _defer_top_level_terminal_event(
-    self,
-    event: Dict[str, Any],
-  ) -> bool:
-    lifecycle = self._top_level_skill_lifecycle
-    if lifecycle is None:
-      return False
-    event = self._bind_top_level_terminal_identity(
-      event,
-      lifecycle=lifecycle,
-    )
-    event_type = event.get("type")
-    if event_type not in {"error", "stream_complete"}:
-      raise RuntimeError(
-        "Top-level named-skill terminal must be an error or "
-        "stream_complete event"
-      )
-    deferred = self._deferred_top_level_terminal_event
-    if deferred is not None:
-      if _exact_value_match(deferred, event):
-        return True
-      raise RuntimeError(
-        "Top-level named-skill run attempted to emit more than one "
-        "terminal event"
-      )
-    self._deferred_top_level_terminal_event = deepcopy(event)
-    return True
 
-  def _defer_prepared_top_level_terminal_event(
-    self,
-    proposed_event: Dict[str, Any],
-  ) -> bool:
-    prepared = self._prepared_top_level_terminal_event
-    return self._defer_top_level_terminal_event(
-      deepcopy(
-        prepared
-        if isinstance(prepared, dict)
-        else proposed_event
-      )
-    )
 
-  async def _flush_deferred_top_level_terminal_event(self) -> bool:
-    event = self._deferred_top_level_terminal_event
-    if event is None or self._deferred_top_level_terminal_flushed:
-      return False
-    if (
-      not self._top_level_skill_result_committed
-      or not self._top_level_skill_result_projected
-    ):
-      raise RuntimeError(
-        "Cannot flush top-level terminal event before its required "
-        "skill result is committed and projected"
-      )
-    if self._top_level_skill_terminal_committed:
-      if self._exact_top_level_durable_event_sync(event) is None:
-        raise RuntimeError(
-          "Committed top-level terminal lacks exact durable readback"
-        )
-    else:
-      durable_entry = await self._append_durable_event(
-        deepcopy(event)
-      )
-      if durable_entry is None:
-        raise RuntimeError(
-          "Durable top-level terminal target is unavailable"
-        )
-      self._require_append_acknowledgement(
-        durable_entry,
-        event,
-        target="durable top-level terminal",
-      )
-      self._top_level_skill_terminal_committed = True
-    if not getattr(self._log, "has_terminal", False):
-      self._append(deepcopy(event))
-      if not getattr(self._log, "has_terminal", False):
-        raise RuntimeError(
-          "Live EventLog rejected deferred top-level terminal event"
-        )
-    terminal_entries = [
-      entry
-      for entry in getattr(self._log, "entries", ())
-      if isinstance(getattr(entry, "event", None), dict)
-      and entry.event.get("type") in {"error", "stream_complete"}
-    ]
-    if (
-      len(terminal_entries) != 1
-      or not _exact_value_match(
-        terminal_entries[0].event,
-        event,
-      )
-    ):
-      raise RuntimeError(
-        "Live EventLog did not acknowledge the exact deferred "
-        "top-level terminal event"
-      )
-    self._deferred_top_level_terminal_flushed = True
-    return True
 
   async def _rebuild_task_registry_from_log(self) -> None:
     if self._task_registry_rebuilt:
@@ -2132,6 +2079,9 @@ class RunnerSessionLifecycleMixin:
 
   async def _emit_error_event(self, error: str) -> None:
     event = _runner_attr(self, "_build_error_event", _build_error_event)(error)
+    # Hooks keep the same staging contract, but an error can never publish
+    # a proposed success receipt.
+    self._terminal_success_staged_events = []
     try:
       await self._call_on_before_stream_complete(event)
     except Exception as exc:
@@ -2140,11 +2090,15 @@ class RunnerSessionLifecycleMixin:
         self._sid,
         exc,
       )
-    if self._top_level_skill_lifecycle is not None:
-      self._defer_top_level_terminal_event(event)
-      return
-    await self._append_durable_event(event)
-    self._append(event)
+    finally:
+      self._terminal_success_staged_events = None
+    self._terminal_closure_event = event
+    if not self._run_closure_deferred:
+      # A standalone turn has no run finalizer to drain its staged closure.
+      await self._settle_run_closure(
+        clean_detach_reason="error",
+        run_error=None,
+      )
 
   async def _emit_run_error_event(
     self,
@@ -2200,6 +2154,32 @@ class RunnerSessionLifecycleMixin:
     recovered_at: float | None = None,
     extra_fields: Dict[str, Any] | None = None,
   ) -> None:
+    if recovered_by_runner_id is not None or recovered_at is not None:
+      await self._run_durable_session_settlement(partial(
+        self._emit_interrupted_event_sync,
+        reason,
+        runner_id=runner_id,
+        role=role,
+        last_completed_seq=last_completed_seq,
+        recovered_by_runner_id=recovered_by_runner_id,
+        recovered_at=recovered_at,
+        extra_fields=extra_fields,
+      ))
+    else:
+      self._terminal_closure_interruption = (reason, extra_fields)
+
+  def _emit_interrupted_event_sync(
+    self,
+    reason: str,
+    *,
+    runner_id: str | None = None,
+    role: str | None = None,
+    last_completed_seq: int | None = None,
+    recovered_by_runner_id: str | None = None,
+    recovered_at: float | None = None,
+    extra_fields: Dict[str, Any] | None = None,
+  ) -> None:
+    self._settle_unresolved_tool_calls_sync()
     event = _runner_attr(
       self,
       "_build_interrupted_event",
@@ -2222,17 +2202,8 @@ class RunnerSessionLifecycleMixin:
       and recovered_by_runner_id is None
       and recovered_at is None
     ):
-      deferred = self._deferred_top_level_interrupted_event
-      if deferred is not None:
-        if _exact_value_match(deferred, event):
-          return
-        raise RuntimeError(
-          "Top-level named-skill run attempted to emit more than "
-          "one interruption marker"
-        )
       self._deferred_top_level_interrupted_event = deepcopy(event)
-      return
-    entry = await self._append_durable_event(event)
+    entry = self._append_durable_event_sync(event)
     if self._top_level_skill_lifecycle is not None:
       if entry is None:
         raise RuntimeError(
@@ -2243,40 +2214,8 @@ class RunnerSessionLifecycleMixin:
         event,
         target="durable top-level interrupted",
       )
+      self._deferred_top_level_interrupted_flushed = True
 
-  async def _flush_deferred_top_level_interrupted_event(
-    self,
-  ) -> bool:
-    if self._top_level_skill_lifecycle is None:
-      return False
-    if (
-      not self._top_level_skill_result_committed
-      or not self._top_level_skill_result_projected
-      or not self._deferred_top_level_terminal_flushed
-    ):
-      raise RuntimeError(
-        "Cannot flush top-level interruption or detach before its "
-        "exact result and terminal event"
-      )
-    event = self._deferred_top_level_interrupted_event
-    if event is None:
-      return False
-    if self._deferred_top_level_interrupted_flushed:
-      return False
-    entry = await self._append_durable_event(
-      deepcopy(event)
-    )
-    if entry is None:
-      raise RuntimeError(
-        "Top-level skill durable interruption target is unavailable"
-      )
-    self._require_append_acknowledgement(
-      entry,
-      event,
-      target="durable top-level interrupted",
-    )
-    self._deferred_top_level_interrupted_flushed = True
-    return True
 
   def _shutdown_interrupted_reason(self) -> tuple[str, Dict[str, Any]]:
     if self._shutdown_signal_provider is None:
@@ -2445,7 +2384,11 @@ class RunnerSessionLifecycleMixin:
         "Settled completion WAL lacks exact durable proof"
       )
 
-    query_sync = getattr(self._agent_session_log, "query_sync", None)
+    query_sync = (
+      self._agent_session_log.query_sync
+      if self._agent_session_log is not None
+      else None
+    )
     if not callable(query_sync):
       raise RuntimeError(
         "Durable session log lacks synchronous lifecycle recovery"
@@ -2707,9 +2650,272 @@ class RunnerSessionLifecycleMixin:
         expected_interruption
       )
 
-  async def _emit_detach_event(self, reason: str) -> None:
-    if not self._durable_attach_emitted:
+  async def _settle_run_closure(
+    self,
+    *,
+    clean_detach_reason: str,
+    run_error: BaseException | None,
+  ) -> bool:
+    """Commit one closure before projecting it; cancellation cannot split its writes."""
+    server_cause = self._top_level_server_terminal_cause()
+    terminal = self._terminal_closure_event
+    preparation_cancellation: asyncio.CancelledError | None = None
+    try:
+      await self._prepare_top_level_skill_closure(
+        run_error=run_error,
+        clean_detach_reason=clean_detach_reason,
+        terminal_event=terminal,
+      )
+    except asyncio.CancelledError as exc:
+      preparation_cancellation = exc
+      run_error = run_error or exc
+    terminal = (
+      self._deferred_top_level_terminal_event
+      if self._top_level_skill_lifecycle is not None
+      else self._terminal_closure_event
+    )
+    decision = terminal_closure_decision(
+      clean_detach_reason=clean_detach_reason,
+      run_error=run_error,
+      terminal_event=terminal,
+      server_terminal_cause=server_cause,
+      skill_lifecycle=self._top_level_skill_lifecycle,
+      skill_result=self._top_level_skill_result_event,
+      skill_effect=self._top_level_skill_completion_effect_plan,
+    )
+    interruption = self._terminal_closure_interruption
+    if run_error is not None:
+      shutdown_reason, shutdown_fields = self._shutdown_interrupted_reason()
+      interruption = (
+        (server_cause, {"server_terminal_cause": server_cause})
+        if server_cause is not None
+        else _run_interrupted_reason(
+          run_error=run_error, role=self._role,
+          shutdown_reason=shutdown_reason, shutdown_extra_fields=shutdown_fields,
+        )
+      )
+    elif decision.disposition == "error" and interruption is None:
+      interruption = (decision.reason, None)
+    receipts = self._terminal_closure_receipts or []
+
+    def project(committed: TerminalClosureDecision) -> None:
+      if committed.disposition == "success":
+        for receipt in receipts:
+          self._append(receipt)
+      if committed.terminal is not None:
+        if committed.skill_result is not None:
+          self._project_top_level_closure(
+            committed.skill_result, committed.terminal,
+          )
+        else:
+          self._append(committed.terminal)
+      # Keep staging intact until the entire closure append has returned.
+      receipts.clear()
+      self._terminal_closure_event = committed.terminal
+    committed = await self._run_durable_session_settlement(
+      partial(
+        self._append_terminal_closure_sync,
+        decision=decision, receipts=receipts, interruption=interruption,
+      ),
+      on_committed=project,
+    )
+    if preparation_cancellation is not None:
+      raise preparation_cancellation
+    return (
+      committed.disposition == "success"
+      and self._agent_session_log is not None
+      and self._durable_attach_emitted
+    )
+
+  def _append_terminal_closure_sync(
+    self,
+    *,
+    decision: TerminalClosureDecision,
+    receipts: list[Dict[str, Any]],
+    interruption: tuple[str, Dict[str, Any] | None] | None,
+  ) -> TerminalClosureDecision:
+    """Drain receipts, the canonical pair, interruption and detach before projection."""
+    attached = self._agent_session_log is not None and self._durable_attach_emitted
+    lifecycle = (
+      self._top_level_skill_lifecycle
+      if self._top_level_skill_started_committed
+      else None
+    )
+
+    def append_failure(cause: BaseException | None, reason: str) -> None:
+      if cause is not None:
+        self._append_durable_event_sync(_build_run_error_event(
+          phase="run", error_type=type(cause).__name__, error=_format_exc(cause),
+        ))
+      if (
+        decision.terminal is not None
+        and decision.terminal.get("type") == "error"
+        and lifecycle is None
+      ):
+        self._append_durable_event_sync(decision.terminal)
+      self._emit_interrupted_event_sync(
+        interruption[0] if decision.disposition != "error" and interruption is not None else reason,
+        extra_fields=interruption[1] if interruption is not None else None,
+      )
+      self._emit_detach_event_sync("error" if decision.disposition == "error" else decision.reason)
+
+    try:
+      if decision.disposition == "success":
+        for receipt in receipts:
+          if self._append_durable_event_sync(receipt) is None:
+            raise RuntimeError("durable terminal receipt target is unavailable")
+    except Exception as exc:
+      # No completion intent or effect exists yet. Decide the failed pair once;
+      # the same WAL and projection path carries it to every consumer.
+      decision = terminal_closure_decision(
+        clean_detach_reason=decision.reason, run_error=decision.cause,
+        terminal_event=decision.terminal,
+        server_terminal_cause=self._top_level_server_terminal_cause(),
+        persistence_error=exc,
+        persistence_failure_code="terminal_receipt_persistence_failed",
+        skill_lifecycle=lifecycle, skill_result=decision.skill_result,
+        skill_effect=decision.skill_effect,
+      )
+      interruption = ("persistence", None)
+
+    if attached and lifecycle is not None:
+      try:
+        closure = decision.require_named_skill_closure()
+        self._commit_top_level_skill_plan_sync(
+          lifecycle=lifecycle, result=closure.result,
+          terminal=closure.terminal, effect=closure.effect,
+          project_live=False,
+        )
+      except Exception as exc:
+        # The WAL owns any effect already attempted. Do not overwrite its
+        # recoverable intent or swallow an effect exception as a log failure.
+        decision = terminal_closure_decision(
+          clean_detach_reason="error", run_error=exc,
+          terminal_event=decision.terminal, server_terminal_cause=None,
+        )
+        try:
+          append_failure(exc, "error")
+        except Exception as closure_error:
+          raise exc from closure_error
+        raise
+      self._top_level_skill_result_event = decision.skill_result
+      self._top_level_skill_result_committed = True
+      self._top_level_skill_terminal_committed = True
+
+    try:
+      if attached:
+        if (
+          lifecycle is None and decision.terminal is not None
+          and decision.terminal.get("type") == "error"
+        ):
+          self._append_durable_event_sync(decision.terminal)
+        if decision.cause is not None:
+          self._append_durable_event_sync(_build_run_error_event(
+            phase="run", error_type=type(decision.cause).__name__,
+            error=_format_exc(decision.cause),
+          ))
+        if interruption is not None:
+          self._emit_interrupted_event_sync(
+            interruption[0], extra_fields=interruption[1],
+          )
+        else:
+          self._settle_unresolved_tool_calls_sync()
+        self._emit_detach_event_sync("error" if decision.disposition == "error" else decision.reason)
+    except Exception as exc:
+      if lifecycle is not None:
+        # Once the WAL pair commits, its outcome is immutable. Finish the
+        # bookkeeping without publishing a competing terminal on either rail.
+        self._append_durable_event_sync(_build_run_error_event(
+          phase="closure", error_type=type(exc).__name__, error=_format_exc(exc),
+        ))
+        if interruption is not None:
+          self._emit_interrupted_event_sync(
+            interruption[0], extra_fields=interruption[1],
+          )
+        else:
+          self._settle_unresolved_tool_calls_sync()
+        try:
+          self._emit_detach_event_sync(decision.reason)
+        except Exception as detach_error:
+          self._emit_detach_event_sync(
+            "persistence", failure=detach_error,
+            committed_terminal=decision.terminal,
+          )
+        return decision
+      if decision.disposition == "success":
+        decision = terminal_closure_decision(
+          clean_detach_reason=decision.reason, run_error=None,
+          terminal_event=decision.terminal, server_terminal_cause=None,
+          persistence_error=exc,
+          persistence_failure_code=(
+            "terminal_receipt_persistence_failed" if receipts else "terminal_persistence_failed"
+          ),
+        )
+      if attached:
+        append_failure(decision.cause or exc, decision.reason)
+    return decision
+
+  async def _run_durable_session_settlement(
+    self,
+    settle: Callable[[], Any],
+    *,
+    on_committed: Callable[[Any], None] | None = None,
+  ) -> Any:
+    # Shield only the durable settlement, not the run that awaits it.
+    # An executor future also survives portal shutdown cancelling every Task,
+    # while keeping journal I/O off the event loop and the writer lease held.
+    settlement = asyncio.get_running_loop().run_in_executor(None, settle)
+    cancellation: asyncio.CancelledError | None = None
+    try:
+      result = await asyncio.shield(settlement)
+    except asyncio.CancelledError as exc:
+      cancellation = exc
+      try:
+        result = await drain_owned_lifecycle_task(settlement)
+      except Exception as failure:
+        raise cancellation from failure
+    if on_committed is not None:
+      on_committed(result)
+    if cancellation is not None:
+      raise cancellation
+    return result
+
+  def _settle_unresolved_tool_calls_sync(self) -> None:
+    """Close the durable tool batch before terminal append."""
+    if self._agent_session_log is None or self._runner_id is None:
       return
+    assistants, _ = self._agent_session_log.query_current_strict_sync(
+      event_types={"assistant_message"},
+      runner_id=self._runner_id,
+      order="desc",
+      limit=1,
+    )
+    if not assistants or not any(
+      block.get("type") == "tool_use"
+      for block in assistants[0].event.get("content_blocks") or []
+    ):
+      return
+    entries, _ = self._agent_session_log.query_current_strict_sync(
+      event_types={"assistant_message", "tool_call_start", "tool_call_complete", "tool_call_interrupted"},
+      runner_id=self._runner_id,
+      after_seq=assistants[0].seq,
+      order="asc",
+    )
+    for event in _build_orphan_tool_call_interrupted_events(
+      entries,
+      discovered_at=_runner_attr(self, "time", time).time(),
+      tool_risk_for_tool=_runner_attr(self, "_get_tool_risk_value", _get_tool_risk_value),
+    ):
+      self._append_durable_event_sync(event)
+
+
+  def _emit_detach_event_sync(
+    self,
+    reason: str,
+    *,
+    failure: BaseException | None = None,
+    committed_terminal: Dict[str, Any] | None = None,
+  ) -> None:
     event = _runner_attr(
       self,
       "_build_detach_event",
@@ -2718,7 +2924,10 @@ class RunnerSessionLifecycleMixin:
       reason=reason,
       ended_at=_runner_attr(self, "time", time).time(),
     )
-    entry = await self._append_durable_event(event)
+    if failure is not None:
+      event["error"] = _format_exc(failure)
+      event["committed_terminal"] = deepcopy(committed_terminal)
+    entry = self._append_durable_event_sync(event)
     if self._top_level_skill_lifecycle is not None:
       if entry is None:
         raise RuntimeError(
@@ -2798,7 +3007,7 @@ class RunnerSessionLifecycleMixin:
       prior_writer_runner_id = str(writer_lifecycle[0].event.get("runner_id") or "")
 
     orphan_entries, _ = await self._agent_session_log.query_current_strict(
-      event_types={"tool_call_start", "tool_call_complete", "tool_call_interrupted"},
+      event_types={"assistant_message", "tool_call_start", "tool_call_complete", "tool_call_interrupted"},
       after_seq=last_known_safe_seq + 1,
       before_seq=snapshot_max_seq,
       order="asc",
@@ -3018,9 +3227,7 @@ class RunnerSessionLifecycleMixin:
           "Cannot publish incomplete top-level settlement: "
           + ", ".join(missing)
         )
-        if settlement_error is not None:
-          incomplete_error.__cause__ = settlement_error
-        settlement_error = incomplete_error
+        settlement_error = settlement_error or incomplete_error
     except BaseException as publish_error:
       if settlement_error is not None:
         publish_error.__cause__ = settlement_error

@@ -31,12 +31,13 @@ def test_chat_runtime_shim_forwards_storage_root_to_extension_builder(
   tmp_path: Path,
 ) -> None:
   async def builder(
-    *,
     session: Any,
     request: Any,
     channel: Any,
     auth_manager: Any,
-    storage_root: Path,
+    /,
+    *,
+    storage_root: Path | None = None,
   ) -> tuple[Any, ...]:
     return session, request, channel, auth_manager, storage_root
 
@@ -49,61 +50,24 @@ def test_chat_runtime_shim_forwards_storage_root_to_extension_builder(
   )
 
 
-def test_chat_runtime_shim_degrades_for_positional_legacy_builder(
-  tmp_path: Path,
-) -> None:
+def test_chat_runtime_shim_forwards_absent_storage_root_as_none() -> None:
   async def builder(
     session: Any,
     request: Any,
     channel: Any,
     auth_manager: Any,
     /,
-  ) -> tuple[Any, ...]:
-    return session, request, channel, auth_manager
-
-  assert _call(builder, storage_root=tmp_path) == (
-    "session",
-    "request",
-    "web",
-    "auth",
-  )
-
-
-def test_chat_runtime_shim_degrades_for_keyword_only_legacy_builder(
-  tmp_path: Path,
-) -> None:
-  async def builder(
     *,
-    session: Any,
-    request: Any,
-    channel: Any,
-    auth_manager: Any,
+    storage_root: Path | None = None,
   ) -> tuple[Any, ...]:
-    return session, request, channel, auth_manager
-
-  assert _call(builder, storage_root=tmp_path) == (
-    "session",
-    "request",
-    "web",
-    "auth",
-  )
-
-
-def test_secondary_direct_shim_call_without_extension_is_unchanged() -> None:
-  async def builder(
-    *,
-    session: Any,
-    request: Any,
-    channel: Any,
-    auth_manager: Any,
-  ) -> tuple[Any, ...]:
-    return session, request, channel, auth_manager
+    return session, request, channel, auth_manager, storage_root
 
   assert _call(builder, storage_root=None) == (
     "session",
     "request",
     "web",
     "auth",
+    None,
   )
 
 

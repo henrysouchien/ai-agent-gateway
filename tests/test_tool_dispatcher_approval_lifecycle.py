@@ -8,11 +8,12 @@ import hashlib
 import json
 import logging
 import sys
-from dataclasses import replace
+import time
+from dataclasses import fields as dataclass_fields, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Awaitable, Callable, Mapping
 
 import pytest
 
@@ -27,12 +28,19 @@ from agent_gateway import tool_dispatcher as dispatcher_module
 from agent_gateway import tool_dispatcher_approval_lifecycle as lifecycle_helpers
 from agent_gateway.approval_policy import (
   ApprovalDecision as PolicyApprovalDecision,
+  ApprovalRequest as PolicyApprovalRequest,
+  ApprovalState,
   PersistentGrant,
   RunContext,
   build_approval_request,
   utc_now,
 )
+from agent_gateway.approval_route import (
+  DurableLocalApprovalRoute,
+  NoApprovalRoute,
+)
 from agent_gateway.approval_store import SQLiteApprovalStore
+from agent_gateway.session import GatewaySession
 from agent_gateway.prepared_business_model_store import PreparedBusinessModelLifecycle
 from agent_gateway.batch_approval_projection import (
   BatchApprovalProjectionRegistry,
@@ -40,10 +48,21 @@ from agent_gateway.batch_approval_projection import (
 )
 from agent_gateway.single_user_policy import SingleUserApprovalPolicy
 from agent_gateway.secret_boundary import SecretBoundary
+from agent_gateway.skill_limits import (
+  ActiveSkillAdmission,
+  SkillExecutionLimits,
+)
 from agent_gateway.tool_dispatcher_helpers import (
+  LocalToolHandler,
   PlannedWritePlanningRejected,
+  ToolResult,
   TrustedToolPlan,
 )
+from agent_gateway.mcp_client import McpClientManager, RegisteredMcpDirectToolCall
+from agent_gateway.tool_definition import LiveToolRouteBinding, OriginatedToolDefinition
+from agent_gateway.tool_registration import RegisteredMcpToolDescriptor
+from agent_gateway.tool_policy_registry import PlanDecision, PreparedToolCall
+from agent_workflow_contracts.tool_registration import RegisteredToolIdentity
 from api.fms.core.change_set import (
   ArtifactOnlyPlan,
   ArtifactPayload,
@@ -65,14 +84,37 @@ from api.fms.core.change_set import (
 )
 
 
-class _NullMcp:
-  def is_mcp_tool(self, _name: str) -> bool:
+class _NullMcp(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
+
+  def is_mcp_tool(self, name: str) -> bool:
+    _ = name
     return False
 
-  def get_server_for_tool(self, _name: str) -> str | None:
+  def get_server_for_tool(self, name: str) -> str | None:
+    _ = name
     return None
 
-  async def call_tool(self, _name: str, _tool_input: dict[str, Any], **_kwargs: Any):
+  async def call_tool(
+    self,
+    name: str,
+    tool_input: object,
+    meta: dict[str, Any] | None = None,
+    abort_event: asyncio.Event | None = None,
+    gateway_session: object | None = None,
+    allow_uncertain_replay: bool = True,
+    trusted_dispatch_scope: Mapping[str, object] | None = None,
+  ) -> ToolResult:
+    _ = (
+      name,
+      tool_input,
+      meta,
+      abort_event,
+      gateway_session,
+      allow_uncertain_replay,
+      trusted_dispatch_scope,
+    )
     return {"ok": True}, None
 
 
@@ -92,6 +134,30 @@ class _NoMcpLookup:
     return {"ok": True}, None
 
 
+class _PlanningHandlerDouble:
+  """Callable local handler with the complete optional planning-hook surface."""
+
+  PLANNING_IDENTITY: str | None
+  plan_change: Callable[..., Awaitable[object]] | None
+  execute_prepared_change: Callable[..., Awaitable[ToolResult]] | None
+
+  def __init__(
+    self,
+    handler: LocalToolHandler,
+    *,
+    planning_identity: str | None = None,
+    plan_change: Callable[..., Awaitable[object]] | None = None,
+    execute_prepared_change: Callable[..., Awaitable[ToolResult]] | None = None,
+  ) -> None:
+    self._handler = handler
+    self.PLANNING_IDENTITY = planning_identity
+    self.plan_change = plan_change
+    self.execute_prepared_change = execute_prepared_change
+
+  async def __call__(self, *args: object, **kwargs: object) -> ToolResult:
+    return await self._handler(*args, **kwargs)
+
+
 class _SessionLog:
   def __init__(self) -> None:
     self.events: list[dict[str, Any]] = []
@@ -100,24 +166,100 @@ class _SessionLog:
     self.events.append(dict(event))
 
 
-def _request() -> SimpleNamespace:
-  return SimpleNamespace(
+def _request(
+  *,
+  state: ApprovalState = "pending_user",
+  state_version: int = 0,
+) -> PolicyApprovalRequest:
+  return PolicyApprovalRequest(
     approval_id="approval-1",
     tool_call_id="call-1",
+    parent_approval_id=None,
+    approval_chain_id="approval-1",
+    request_id="request-1",
+    session_id="session-1",
+    run_id="run-1",
+    user_id="1",
+    profile="chat",
+    channel="tui",
     tool_name="place_order",
+    tool_class="state_write",
     tool_args_redacted={"ticker": "MSFT"},
+    args_hash="args-1",
+    reason="needs approval",
+    blast_radius_summary="state_write:place_order",
+    state=state,
+    requested_at=datetime(2026, 1, 1, tzinfo=UTC),
+    state_version=state_version,
   )
 
 
-def _decision() -> SimpleNamespace:
-  return SimpleNamespace(
+def _decision() -> PolicyApprovalDecision:
+  return PolicyApprovalDecision(
+    outcome="request_user_approval",
     reason="needs approval",
     allow_persistent_grant=True,
   )
 
 
+class _ApprovalWaitStoreFake:
+  def __init__(
+    self,
+    *,
+    request: PolicyApprovalRequest,
+    transition_error: Exception | None = None,
+    transition_request: PolicyApprovalRequest | None = None,
+    transition_event: asyncio.Event | None = None,
+  ) -> None:
+    self.request = request
+    self.transition_error = transition_error
+    self.transition_request = transition_request
+    self.transition_event = transition_event
+    self.transitions: list[dict[str, object]] = []
+
+  async def get(self, approval_id: str) -> PolicyApprovalRequest:
+    assert approval_id == self.request.approval_id
+    return self.request
+
+  async def transition_state(
+    self,
+    approval_id: str,
+    state: ApprovalState,
+    *,
+    expected_state_version: int | None = None,
+    expires_at: datetime | None = None,
+    decider_id: str | None = None,
+    decider_role: str | None = None,
+    decision: str | None = None,
+    decision_reason: str | None = None,
+  ) -> PolicyApprovalRequest:
+    assert approval_id == self.request.approval_id
+    assert state == "expired"
+    assert expected_state_version == self.request.state_version
+    self.transitions.append({
+      "approval_id": approval_id,
+      "state": state,
+      "expected_state_version": expected_state_version,
+      "decision_reason": decision_reason,
+    })
+    _ = (expires_at, decider_id, decider_role, decision)
+    if self.transition_request is not None:
+      self.request = self.transition_request
+    if self.transition_event is not None:
+      self.transition_event.set()
+    if self.transition_error is not None:
+      raise self.transition_error
+    self.request = replace(
+      self.request,
+      state=state,
+      state_version=self.request.state_version + 1,
+      decision_reason=decision_reason,
+    )
+    return self.request
+
+
 def test_resolve_run_context_uses_canonical_session_owner_for_approval_identity() -> None:
-  session = SimpleNamespace(
+  session = _gateway_session(
     user_id="henry",
     owner_user_id="1",
     request_id="request-1",
@@ -214,7 +356,11 @@ def test_tool_dispatcher_resolve_tool_class_does_not_require_mcp_lookup_methods(
     lambda name: policy_module if name == "agent.shared.server_policies" else None,
   )
 
-  dispatcher = ToolDispatcher(mcp_client=_NoMcpLookup(), local_tool_handlers={}, event_log=EventLog())
+  dispatcher = ToolDispatcher(
+    mcp_client=_NoMcpLookup(),  # pyright: ignore[reportArgumentType]  # negative: MCP lookup absence is the behavior under test
+    local_tool_handlers={},
+    event_log=EventLog(),
+  )
 
   assert dispatcher._resolve_tool_class("record_workflow_action") == "state_write"
 
@@ -319,7 +465,7 @@ def test_tool_dispatcher_resolve_tool_class_raises_when_policy_module_lacks_clas
     dispatcher._resolve_tool_class("execute_trade")
 
 
-async def _wait_for_queue(session: SimpleNamespace, tool_call_id: str) -> asyncio.Queue:
+async def _wait_for_queue(session: GatewaySession, tool_call_id: str) -> asyncio.Queue:
   for _ in range(100):
     queue = session.approval_queues.get(tool_call_id)
     if queue is not None:
@@ -354,14 +500,14 @@ def test_non_batch_approval_keeps_global_wait_ceiling() -> None:
 def test_durable_interactive_approval_event_carries_stable_id_and_cleans_up() -> None:
   async def scenario() -> None:
     session_log = _SessionLog()
-    session = SimpleNamespace(pending_tools={}, approval_queues={}, agent_session_log=session_log)
+    session = _gateway_session(pending_tools={}, approval_queues={}, agent_session_log=session_log)
     event_log = EventLog()
     request = _request()
     task = asyncio.create_task(
       lifecycle_helpers.await_user_approval_via_pending_tools(
         session=session,
         approval_store=None,
-        event_log=event_log,
+        append_event_fn=event_log.append,
         request=request,
         decision=_decision(),
         nonce="nonce-1",
@@ -399,7 +545,7 @@ def test_durable_interactive_approval_event_carries_stable_id_and_cleans_up() ->
 
 def test_pending_tool_exposes_only_trusted_planned_change_projection() -> None:
   async def scenario() -> None:
-    session = SimpleNamespace(pending_tools={}, approval_queues={}, agent_session_log=None)
+    session = _gateway_session(pending_tools={}, approval_queues={}, agent_session_log=None)
     event_log = EventLog()
     planned_change = {
       "schema_version": "planned-change-review.v1",
@@ -408,20 +554,20 @@ def test_pending_tool_exposes_only_trusted_planned_change_projection() -> None:
       "intent": {"subcommand": "persist_business_model"},
       "target": {"ticker": "MSFT", "research_file_id": 1},
     }
-    request = SimpleNamespace(
-      approval_id="approval-1",
-      tool_call_id="call-1",
+    request = replace(
+      _request(),
       tool_name="fms_persist_business_model",
       tool_args_redacted={
         "judgment": {"ticker": "MSFT", "large": "x" * 10_000},
         "planned_change": planned_change,
       },
+      blast_radius_summary="state_write:fms_persist_business_model",
     )
     task = asyncio.create_task(
       lifecycle_helpers.await_user_approval_via_pending_tools(
         session=session,
         approval_store=None,
-        event_log=event_log,
+        append_event_fn=event_log.append,
         request=request,
         decision=_decision(),
         nonce="nonce-1",
@@ -449,7 +595,7 @@ def test_pending_tool_exposes_only_trusted_planned_change_projection() -> None:
 def test_projected_pending_tool_binds_stage_identity_to_projection_and_event() -> None:
   async def scenario() -> None:
     session_log = _SessionLog()
-    session = SimpleNamespace(
+    session = _gateway_session(
       pending_tools={},
       approval_queues={},
       agent_session_log=session_log,
@@ -465,7 +611,7 @@ def test_projected_pending_tool_binds_stage_identity_to_projection_and_event() -
     result = await lifecycle_helpers.await_user_approval_via_pending_tools(
       session=session,
       approval_store=None,
-      event_log=event_log,
+      append_event_fn=event_log.append,
       request=request,
       decision=_decision(),
       nonce="nonce-1",
@@ -489,7 +635,7 @@ def test_projected_pending_tool_binds_stage_identity_to_projection_and_event() -
 def test_projected_pending_tool_rejects_invalid_stage_identity(
   stage_run_seq: object,
 ) -> None:
-  session = SimpleNamespace(
+  session = _gateway_session(
     pending_tools={},
     approval_queues={},
     batch_stage_run_seq=stage_run_seq,
@@ -503,7 +649,7 @@ def test_projected_pending_tool_rejects_invalid_stage_identity(
       lifecycle_helpers.await_user_approval_via_pending_tools(
         session=session,
         approval_store=None,
-        event_log=None,
+        append_event_fn=None,
         request=_request(),
         decision=_decision(),
         nonce="nonce-1",
@@ -519,26 +665,15 @@ def test_projected_pending_tool_rejects_invalid_stage_identity(
 
 
 def test_pending_tool_helper_expires_store_request_on_timeout() -> None:
-  class Store:
-    def __init__(self) -> None:
-      self.transitions: list[dict[str, Any]] = []
-
-    async def get(self, approval_id: str) -> SimpleNamespace:
-      assert approval_id == "approval-1"
-      return SimpleNamespace(approval_id=approval_id, state="pending_user", state_version=7)
-
-    async def transition_state(self, approval_id: str, state: str, **kwargs: Any) -> SimpleNamespace:
-      self.transitions.append({"approval_id": approval_id, "state": state, **kwargs})
-      return SimpleNamespace(approval_id=approval_id, state=state, state_version=8)
 
   async def scenario() -> None:
-    store = Store()
-    session = SimpleNamespace(pending_tools={}, approval_queues={}, agent_session_log=None)
+    store = _ApprovalWaitStoreFake(request=_request(state_version=7))
+    session = _gateway_session(pending_tools={}, approval_queues={}, agent_session_log=None)
 
     result = await lifecycle_helpers.await_user_approval_via_pending_tools(
       session=session,
       approval_store=store,
-      event_log=None,
+      append_event_fn=None,
       request=_request(),
       decision=_decision(),
       nonce="nonce-1",
@@ -566,43 +701,24 @@ def test_pending_tool_helper_expires_store_request_on_timeout() -> None:
 def test_pending_tool_timeout_observes_concurrent_durable_vote() -> None:
   async def scenario() -> None:
     vote_won = asyncio.Event()
-    session = SimpleNamespace(
+    session = _gateway_session(
       pending_tools={},
       approval_queues={},
       agent_session_log=None,
     )
 
-    class Store:
-      state = "pending_user"
-      state_version = 7
 
-      async def get(self, approval_id: str) -> SimpleNamespace:
-        assert approval_id == "approval-1"
-        return SimpleNamespace(
-          approval_id=approval_id,
-          state=self.state,
-          state_version=self.state_version,
-        )
-
-      async def transition_state(
-        self,
-        approval_id: str,
-        state: str,
-        **kwargs: Any,
-      ) -> SimpleNamespace:
-        assert approval_id == "approval-1"
-        assert state == "expired"
-        assert kwargs["expected_state_version"] == 7
-        self.state = "approved"
-        self.state_version = 8
-        vote_won.set()
-        raise RuntimeError("approval request state_version changed")
-
+    store = _ApprovalWaitStoreFake(
+      request=_request(state_version=7),
+      transition_error=RuntimeError("approval request state_version changed"),
+      transition_request=_request(state="approved", state_version=8),
+      transition_event=vote_won,
+    )
     task = asyncio.create_task(
       lifecycle_helpers.await_user_approval_via_pending_tools(
         session=session,
-        approval_store=Store(),
-        event_log=None,
+        approval_store=store,
+        append_event_fn=None,
         request=_request(),
         decision=_decision(),
         nonce="nonce-1",
@@ -637,38 +753,23 @@ def test_pending_tool_timeout_observes_concurrent_durable_vote() -> None:
 
 def test_pending_tool_timeout_rejects_mismatched_vote_delivery() -> None:
   async def scenario() -> None:
-    session = SimpleNamespace(
+    session = _gateway_session(
       pending_tools={},
       approval_queues={},
       agent_session_log=None,
     )
 
-    class Store:
-      state = "pending_user"
-      state_version = 7
 
-      async def get(self, approval_id: str) -> SimpleNamespace:
-        return SimpleNamespace(
-          approval_id=approval_id,
-          state=self.state,
-          state_version=self.state_version,
-        )
-
-      async def transition_state(
-        self,
-        _approval_id: str,
-        _state: str,
-        **_kwargs: Any,
-      ) -> SimpleNamespace:
-        self.state = "denied"
-        self.state_version = 8
-        raise RuntimeError("approval request state_version changed")
-
+    store = _ApprovalWaitStoreFake(
+      request=_request(state_version=7),
+      transition_error=RuntimeError("approval request state_version changed"),
+      transition_request=_request(state="denied", state_version=8),
+    )
     task = asyncio.create_task(
       lifecycle_helpers.await_user_approval_via_pending_tools(
         session=session,
-        approval_store=Store(),
-        event_log=None,
+        approval_store=store,
+        append_event_fn=None,
         request=_request(),
         decision=_decision(),
         nonce="nonce-1",
@@ -702,20 +803,16 @@ def test_pending_tool_timeout_bounds_missing_winner_delivery(
   monkeypatch,
 ) -> None:
   async def scenario() -> None:
-    session = SimpleNamespace(
+    session = _gateway_session(
       pending_tools={},
       approval_queues={},
       agent_session_log=None,
     )
 
-    class Store:
-      async def get(self, approval_id: str) -> SimpleNamespace:
-        return SimpleNamespace(
-          approval_id=approval_id,
-          state="approved",
-          state_version=8,
-        )
 
+    store = _ApprovalWaitStoreFake(
+      request=_request(state="approved", state_version=8),
+    )
     monkeypatch.setattr(
       lifecycle_helpers,
       "_APPROVAL_WINNER_DELIVERY_TIMEOUT_SECONDS",
@@ -727,8 +824,8 @@ def test_pending_tool_timeout_bounds_missing_winner_delivery(
     ):
       await lifecycle_helpers.await_user_approval_via_pending_tools(
         session=session,
-        approval_store=Store(),
-        event_log=None,
+        approval_store=store,
+        append_event_fn=None,
         request=_request(),
         decision=_decision(),
         nonce="nonce-1",
@@ -755,17 +852,12 @@ def test_tool_dispatcher_pending_approval_wrapper_threads_instance_state(monkeyp
     "await_user_approval_via_pending_tools",
     fake_await_user_approval_via_pending_tools,
   )
-  session = SimpleNamespace(
-    pending_tools={},
-    approval_queues={},
-    approval_store="store",
-    approval_policy="policy",
-  )
+  session = _gateway_session(pending_tools={}, approval_queues={})
   dispatcher = ToolDispatcher(
     mcp_client=_NullMcp(),
     local_tool_handlers={},
     event_log=EventLog(),
-    session=session,
+    approval_route=DurableLocalApprovalRoute("store", "policy", session),
   )
   request = _request()
   decision = _decision()
@@ -784,7 +876,7 @@ def test_tool_dispatcher_pending_approval_wrapper_threads_instance_state(monkeyp
   assert result == {"approved": True}
   assert captured["session"] is session
   assert captured["approval_store"] == "store"
-  assert captured["event_log"] is dispatcher._boundary_event_log
+  assert captured["append_event_fn"] == dispatcher._boundary_event_log.append
   assert captured["request"] is request
   assert captured["decision"] is decision
   assert captured["nonce"] == "nonce-1"
@@ -837,9 +929,11 @@ def test_native_approval_store_event_are_sanitized_while_policy_and_execution_re
       mcp_client=_NullMcp(),
       local_tool_handlers={},
       event_log=event_log,
-      session=session,
-      store=store,
-      policy=policy,
+      approval_route=DurableLocalApprovalRoute(
+        store,
+        policy,
+        session,
+      ),
       run_context=RunContext(
         user_id="alice",
         request_id="request-secret",
@@ -882,6 +976,9 @@ def test_native_approval_store_event_are_sanitized_while_policy_and_execution_re
 
     assert policy.raw_args == raw_input
     assert result["tool_input"] == raw_modified
+    assert approval_event["allow_persistent_approval"] is False
+    assert stored_pending.persistent_grant_scope is None
+    assert stored_pending.grant_reference is None
     durable_projection = json.dumps({
       "event": approval_event,
       "tool_args": stored_pending.tool_args_redacted,
@@ -942,17 +1039,13 @@ def test_tool_dispatcher_run_approval_lifecycle_wrapper_threads_instance_state(m
     "run_approval_lifecycle",
     fake_run_approval_lifecycle,
   )
-  session = SimpleNamespace(
-    pending_tools={},
-    approval_queues={},
-    approval_store="store",
-    approval_policy="policy",
-  )
+  session = _gateway_session(pending_tools={}, approval_queues={})
+  route = DurableLocalApprovalRoute("store", "policy", session)
   dispatcher = ToolDispatcher(
     mcp_client=_NullMcp(),
     local_tool_handlers={},
     event_log=EventLog(),
-    session=session,
+    approval_route=route,
   )
 
   result = asyncio.run(
@@ -967,8 +1060,7 @@ def test_tool_dispatcher_run_approval_lifecycle_wrapper_threads_instance_state(m
   )
 
   assert result == {"approved": True}
-  assert captured["store"] == "store"
-  assert captured["policy"] == "policy"
+  assert captured["route"] is route
   assert captured["session"] is session
   assert captured["tool_call_id"] == "call-1"
   assert captured["tool_name"] == "place_order"
@@ -981,8 +1073,30 @@ def test_tool_dispatcher_run_approval_lifecycle_wrapper_threads_instance_state(m
   assert captured["resolve_tool_class_fn"].__self__ is dispatcher
   assert captured["effective_trade_approval_decision_fn"].__self__ is dispatcher
   assert captured["await_user_approval_via_pending_tools_fn"].__self__ is dispatcher
-  assert callable(captured["current_skill_fn"])
+  assert callable(captured["current_skill_admission_fn"])
   assert callable(captured["approval_queue_timeout_seconds_fn"])
+
+
+def _gateway_session(**overrides: Any) -> GatewaySession:
+  """A real GatewaySession: the route the ledger row binds to is type-exact."""
+
+  now = time.time()
+  defaults: dict[str, Any] = {
+    "session_id": "sess-1",
+    "api_key_hash": "hash",
+    "created_at": now,
+    "expires_at": now + 600,
+    "user_id": "alice",
+    "channel": "web",
+    "role": "owner",
+  }
+  field_names = {f.name for f in dataclass_fields(GatewaySession)}
+  init_kwargs = {**defaults, **{k: v for k, v in overrides.items() if k in field_names}}
+  session = GatewaySession(**init_kwargs)
+  for key, value in overrides.items():
+    if key not in field_names:
+      setattr(session, key, value)
+  return session
 
 
 def _planned_change_set() -> ChangeSet:
@@ -1110,14 +1224,17 @@ def _planned_handler(
     assert call_index == 3
     return {"ok": True, "approval_id": approval_id}, None
 
-  legacy_handler.PLANNING_IDENTITY = "change_set"
-  legacy_handler.plan_change = plan_change
-  legacy_handler.execute_prepared_change = execute_prepared_change
-  return legacy_handler, change_set, prepared
+  handler = _PlanningHandlerDouble(
+    legacy_handler,
+    planning_identity="change_set",
+    plan_change=plan_change,
+    execute_prepared_change=execute_prepared_change,
+  )
+  return handler, change_set, prepared
 
 
-def _planned_session() -> SimpleNamespace:
-  return SimpleNamespace(
+def _planned_session() -> GatewaySession:
+  return _gateway_session(
     session_id="sess-1",
     user_id="alice",
     channel="web",
@@ -1134,9 +1251,11 @@ def test_requires_approval_includes_durable_planned_write_wait() -> None:
     local_tool_handlers={"planned_tool": handler},
     needs_approval=lambda *_args: False,
     approved_tool_types=set(),
-    session=_planned_session(),
-    store=object(),
-    policy=object(),
+    approval_route=DurableLocalApprovalRoute(
+      object(),
+      object(),
+      _planned_session(),
+    ),
   )
 
   assert dispatcher.requires_approval("planned_tool", {"x": 1}) is True
@@ -1214,10 +1333,13 @@ def _business_model_planned_handler(
       }, None
     return {"status": "staged", "receipt": receipt}, None
 
-  legacy_handler.PLANNING_IDENTITY = "change_set"
-  legacy_handler.plan_change = plan_change
-  legacy_handler.execute_prepared_change = execute_prepared_change
-  return legacy_handler, change_set, gateway_prepared
+  handler = _PlanningHandlerDouble(
+    legacy_handler,
+    planning_identity="change_set",
+    plan_change=plan_change,
+    execute_prepared_change=execute_prepared_change,
+  )
+  return handler, change_set, gateway_prepared
 
 
 def test_fms_business_model_non_accept_uses_generic_exact_plan() -> None:
@@ -1268,9 +1390,11 @@ def test_fms_business_model_approval_row_uses_prepared_owner_scope(
     local_tool_handlers={"fms_persist_business_model": handler},
     needs_approval=lambda *_args: True,
     approved_tool_types=set(),
-    session=session,
-    store=store,
-    policy=Policy(),
+    approval_route=DurableLocalApprovalRoute(
+      store,
+      Policy(),
+      session,
+    ),
     run_context=RunContext(
       user_id="henry",
       request_id="skill-run-phase6",
@@ -1299,6 +1423,7 @@ def test_fms_business_model_approval_row_uses_prepared_owner_scope(
     )
   )
   assert prepared is not None
+  assert prepared.approval_id is not None
   approval = asyncio.run(store.get(prepared.approval_id))
   assert approval is not None
   assert approval.user_id == "1"
@@ -1341,9 +1466,11 @@ def test_fms_business_model_exact_write_persists_attempt_lifecycle(
     local_tool_handlers={"fms_persist_business_model": handler},
     needs_approval=lambda *_args: True,
     approved_tool_types=set(),
-    session=_planned_session(),
-    store=store,
-    policy=Policy(),
+    approval_route=DurableLocalApprovalRoute(
+      store,
+      Policy(),
+      _planned_session(),
+    ),
     run_context=RunContext(
       user_id="alice",
       request_id="skill-run-phase6",
@@ -1386,6 +1513,7 @@ def test_fms_business_model_exact_write_persists_attempt_lifecycle(
       )
     )
     assert replay_error is None
+    assert replay_result is not None
     assert replay_result["status"] == "staged"
     assert policy_calls == 1
   else:
@@ -1399,6 +1527,7 @@ def test_fms_business_model_exact_write_persists_attempt_lifecycle(
       )
     )
     assert retry_result is None
+    assert retry_error is not None
     assert retry_error["code"] == "planned_write_replan_and_reauthorize_required"
     assert policy_calls == 1
 
@@ -1447,9 +1576,11 @@ def test_fms_business_model_missing_restoration_proof_does_not_supersede(
     local_tool_handlers={"fms_persist_business_model": handler},
     needs_approval=lambda *_args: True,
     approved_tool_types=set(),
-    session=_planned_session(),
-    store=store,
-    policy=Policy(),
+    approval_route=DurableLocalApprovalRoute(
+      store,
+      Policy(),
+      _planned_session(),
+    ),
     run_context=RunContext(
       user_id="alice",
       request_id="skill-run-phase6",
@@ -1470,6 +1601,7 @@ def test_fms_business_model_missing_restoration_proof_does_not_supersede(
   )
 
   assert result is None
+  assert error is not None
   assert error["code"] == "planned_write_recovery_evidence_missing"
   stored = asyncio.run(
     store.get_prepared_business_model_change(
@@ -1503,7 +1635,7 @@ def test_fms_business_model_missing_restoration_proof_does_not_supersede(
 )
 def test_fms_business_model_pending_record_reconciles_original_approval(
   tmp_path: Path,
-  resolved_state: str,
+  resolved_state: ApprovalState,
   prepared_ttl_elapsed: bool,
   concurrent_sweep: bool,
   expected_lifecycle: PreparedBusinessModelLifecycle,
@@ -1537,9 +1669,11 @@ def test_fms_business_model_pending_record_reconciles_original_approval(
     local_tool_handlers={"fms_persist_business_model": handler},
     needs_approval=lambda *_args: True,
     approved_tool_types=set(),
-    session=_planned_session(),
-    store=store,
-    policy=Policy(),
+    approval_route=DurableLocalApprovalRoute(
+      store,
+      Policy(),
+      _planned_session(),
+    ),
     run_context=RunContext(
       user_id="alice",
       request_id="skill-run-phase6",
@@ -1559,6 +1693,7 @@ def test_fms_business_model_pending_record_reconciles_original_approval(
     )
   )
   assert first_result is None
+  assert first_error is not None
   assert first_error["code"] == "approval_timeout"
   pending = asyncio.run(
     store.get_prepared_business_model_change(
@@ -1570,6 +1705,7 @@ def test_fms_business_model_pending_record_reconciles_original_approval(
   assert pending is not None
   assert pending.lifecycle is PreparedBusinessModelLifecycle.PENDING
   original_approval_id = pending.approval_id
+  assert original_approval_id is not None
   original = asyncio.run(store.get(original_approval_id))
   assert original is not None
   if prepared_ttl_elapsed:
@@ -1615,9 +1751,11 @@ def test_fms_business_model_pending_record_reconciles_original_approval(
 
   if expect_execution:
     assert error is None
+    assert result is not None
     assert result["status"] == "staged"
   else:
     assert result is None
+    assert error is not None
     assert error["code"] == "planned_write_authorization_state_invalid"
   reconciled = asyncio.run(
     store.get_prepared_business_model_change(
@@ -1659,7 +1797,7 @@ def test_batch_admission_cancel_between_pending_commit_and_publish_cleans_all_re
     store = SQLiteApprovalStore(tmp_path / "admission-abort.sqlite3")
     policy = Policy()
     registry = BatchApprovalProjectionRegistry()
-    session = SimpleNamespace(
+    session = _gateway_session(
       session_id="batch-stage-admission-abort",
       user_id="alice",
       channel="tui",
@@ -1682,9 +1820,11 @@ def test_batch_admission_cancel_between_pending_commit_and_publish_cleans_all_re
       mcp_client=_NullMcp(),
       local_tool_handlers={},
       event_log=EventLog(),
-      session=session,
-      store=store,
-      policy=policy,
+      approval_route=DurableLocalApprovalRoute(
+        store,
+        policy,
+        session,
+      ),
       run_context=RunContext(
         user_id="alice",
         request_id="batch_41",
@@ -1704,7 +1844,7 @@ def test_batch_admission_cancel_between_pending_commit_and_publish_cleans_all_re
       await asyncio.Event().wait()
       return result
 
-    store.enqueue_pending_approval_notification = pause_after_notification_commit  # type: ignore[method-assign]
+    store.enqueue_pending_approval_notification = pause_after_notification_commit
     lifecycle_task = asyncio.create_task(
       dispatcher._run_approval_lifecycle(
         tool_call_id="tool-admission-abort",
@@ -1778,7 +1918,7 @@ def test_batch_admission_requires_cleanup_store_contract(
     setattr(store, missing_capability, None)
     policy = Policy()
     registry = BatchApprovalProjectionRegistry()
-    session = SimpleNamespace(
+    session = _gateway_session(
       session_id="batch-stage-missing-abort",
       user_id="alice",
       channel="tui",
@@ -1800,9 +1940,11 @@ def test_batch_admission_requires_cleanup_store_contract(
     dispatcher = ToolDispatcher(
       mcp_client=_NullMcp(),
       local_tool_handlers={},
-      session=session,
-      store=store,
-      policy=policy,
+      approval_route=DurableLocalApprovalRoute(
+        store,
+        policy,
+        session,
+      ),
       run_context=RunContext(
         user_id="alice",
         request_id="batch_42",
@@ -1886,9 +2028,11 @@ def test_planned_dispatch_persists_identity_and_executes_exact_objects(
     needs_approval=lambda *_args: True,
     approved_tool_types=set(),
     event_log=EventLog() if with_event_log else None,
-    session=_planned_session(),
-    store=store,
-    policy=Policy(),
+    approval_route=DurableLocalApprovalRoute(
+      store,
+      Policy(),
+      _planned_session(),
+    ),
     run_context=RunContext(
       user_id="alice",
       request_id="req-1",
@@ -1904,6 +2048,7 @@ def test_planned_dispatch_persists_identity_and_executes_exact_objects(
   )
 
   assert error is None
+  assert result is not None
   assert result["ok"] is True
   assert events == ["plan", "row", "policy", "execute"]
   assert len(resolved) == 1
@@ -1945,9 +2090,11 @@ def test_planned_dispatch_releases_private_snapshot_when_executor_raises(
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
-    session=_planned_session(),
-    store=SQLiteApprovalStore(tmp_path / "approvals.sqlite3"),
-    policy=Policy(),
+    approval_route=DurableLocalApprovalRoute(
+      SQLiteApprovalStore(tmp_path / "approvals.sqlite3"),
+      Policy(),
+      _planned_session(),
+    ),
   )
 
   with pytest.raises(RuntimeError, match="execution failed"):
@@ -1981,9 +2128,11 @@ def test_planned_dispatch_session_cache_still_creates_bound_row(tmp_path: Path) 
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
     approved_tool_types={"planned"},
-    session=_planned_session(),
-    store=store,
-    policy=Policy(),
+    approval_route=DurableLocalApprovalRoute(
+      store,
+      Policy(),
+      _planned_session(),
+    ),
   )
 
   result, error = asyncio.run(
@@ -1991,6 +2140,7 @@ def test_planned_dispatch_session_cache_still_creates_bound_row(tmp_path: Path) 
   )
 
   assert error is None
+  assert result is not None
   assert result["ok"] is True
   assert events == ["plan", "execute"]
   assert len(resolved) == 1
@@ -2012,9 +2162,11 @@ def test_planned_dispatch_persistent_grant_still_creates_bound_row(
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
-    session=_planned_session(),
-    store=store,
-    policy=policy,
+    approval_route=DurableLocalApprovalRoute(
+      store,
+      policy,
+      _planned_session(),
+    ),
   )
   scope_hint = f"{dispatcher._resolve_tool_class('planned')}:planned"
   prior_approval = replace(
@@ -2058,6 +2210,7 @@ def test_planned_dispatch_persistent_grant_still_creates_bound_row(
   )
 
   assert error is None
+  assert result is not None
   assert result["ok"] is True
   assert events == ["plan", "execute"]
   request = asyncio.run(store.get(result["approval_id"]))
@@ -2097,9 +2250,11 @@ def test_planned_dispatch_headless_denial_still_creates_bound_row(tmp_path: Path
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
     should_avoid_permission_prompts=True,
-    session=_planned_session(),
-    store=store,
-    policy=Policy(),
+    approval_route=DurableLocalApprovalRoute(
+      store,
+      Policy(),
+      _planned_session(),
+    ),
   )
 
   result, error = asyncio.run(
@@ -2107,6 +2262,7 @@ def test_planned_dispatch_headless_denial_still_creates_bound_row(tmp_path: Path
   )
 
   assert result is None
+  assert error is not None
   assert error["code"] == "headless_auto_deny"
   assert events == ["plan"]
   assert len(resolved) == 1
@@ -2138,9 +2294,11 @@ def test_planned_dispatch_headless_autonomous_allow_creates_bound_row(
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: False,
     should_avoid_permission_prompts=True,
-    session=_planned_session(),
-    store=store,
-    policy=Policy(),
+    approval_route=DurableLocalApprovalRoute(
+      store,
+      Policy(),
+      _planned_session(),
+    ),
   )
 
   result, error = asyncio.run(
@@ -2148,6 +2306,7 @@ def test_planned_dispatch_headless_autonomous_allow_creates_bound_row(
   )
 
   assert error is None
+  assert result is not None
   assert result["ok"] is True
   assert events == ["plan", "execute"]
   assert len(resolved) == 1
@@ -2192,9 +2351,11 @@ def test_planned_dispatch_timeout_preserves_bound_row_and_skips_executor(
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
-    session=session,
-    store=store,
-    policy=Policy(),
+    approval_route=DurableLocalApprovalRoute(
+      store,
+      Policy(),
+      session,
+    ),
   )
 
   result, error = asyncio.run(
@@ -2202,6 +2363,7 @@ def test_planned_dispatch_timeout_preserves_bound_row_and_skips_executor(
   )
 
   assert result is None
+  assert error is not None
   assert error["code"] == "approval_timeout"
   assert events == ["plan"]
   assert len(planned_requests) == 1
@@ -2216,16 +2378,18 @@ def test_planned_dispatch_timeout_preserves_bound_row_and_skips_executor(
 
 
 @pytest.mark.parametrize(
-  ("callback", "expected_code"),
-  [
-    (None, "planned_write_authorization_unavailable"),
-    (lambda _request: None, "planned_write_callback_transport_unsupported"),
-  ],
+  "callback",
+  [None, lambda _request: None],
 )
-def test_planned_dispatch_fails_closed_without_durable_lifecycle(
+def test_planned_dispatch_fails_closed_without_an_admitted_route(
   callback: Any,
-  expected_code: str,
 ) -> None:
+  """S1: a run whose admitted route is 'none' refuses at the door.
+
+  The refusal is a statement about the run's topology, not about which handle
+  this process happens to hold, so an approval callback does not change it.
+  """
+
   events: list[str] = []
   handler, _change_set, _prepared = _planned_handler(events=events)
   dispatcher = ToolDispatcher(
@@ -2236,16 +2400,61 @@ def test_planned_dispatch_fails_closed_without_durable_lifecycle(
     request_approval=callback,
   )
 
+  assert isinstance(dispatcher._approval_route, NoApprovalRoute)
+
   result, error = asyncio.run(
     dispatcher.dispatch("call-1", "planned", {"x": 1}, call_index=3)
   )
 
   assert result is None
-  assert error["code"] == expected_code
+  assert error is not None
+  assert error["code"] == "approval_route_absent"
   assert events == ["plan"]
 
 
-def test_raw_patch_mcp_dry_run_bypasses_write_planning_and_authorization() -> None:
+@pytest.mark.parametrize(
+  "tool_input",
+  (
+    {"research_file_id": 42, "ops": [], "dry_run": True},
+    {"research_file_id": 42, "ops": [], "authorization_ref": "opaque-ref"},
+  ),
+)
+def test_registered_raw_patch_nonplanning_inputs_execute_without_approval(
+  tool_input: dict[str, Any],
+) -> None:
+  from agent.shared.tool_policy_implementations import (
+    product_redaction_context_factory,
+  )
+  from agent.shared.tool_registration import (
+    build_product_tool_registration_composition,
+  )
+
+  composition = build_product_tool_registration_composition()
+  declaration = composition.catalog.by_identity(RegisteredToolIdentity(
+    "mcp",
+    "apply_patch_ops",
+    "portfolio-writes-mcp",
+  ))
+  server = composition.catalog.server("portfolio-writes-mcp")
+  descriptor = RegisteredMcpToolDescriptor(
+    declaration=declaration,
+    server=server,
+    live_binding=LiveToolRouteBinding(
+      originated_definition=OriginatedToolDefinition(
+        definition={
+          "name": "apply_patch_ops",
+          "input_schema": {"type": "object"},
+        },
+        origin="mcp",
+        server_id="portfolio-writes-mcp",
+      ),
+      route_kind="physical",
+      logical_name="apply_patch_ops",
+      transport_server_id=server.transport_server_id,
+      provider_original_name="apply_patch_ops",
+      provider_id="test-provider",
+    ),
+  )
   calls: list[dict[str, Any]] = []
 
   class Mcp(_NullMcp):
@@ -2255,30 +2464,82 @@ def test_raw_patch_mcp_dry_run_bypasses_write_planning_and_authorization() -> No
     def get_server_for_tool(self, name: str) -> str | None:
       return "portfolio-writes-mcp" if name == "apply_patch_ops" else None
 
-    async def call_tool(self, _name: str, tool_input: dict, **_kwargs: Any):
-      calls.append(dict(tool_input))
-      return {"dry_run": True}, None
+    def uses_registered_tool_catalog(self) -> bool:
+      return True
+
+    def get_registered_mcp_tool_descriptor(
+      self,
+      exposed_name: str,
+    ) -> RegisteredMcpToolDescriptor:
+      assert exposed_name == "apply_patch_ops"
+      return descriptor
+
+    def classify_registered_mcp_prepared_tool_call(
+      self,
+      exposed_name: str,
+      prepared_call: PreparedToolCall,
+      trusted_dispatch_scope: object | None,
+      registered_approval_overlay: object | None = None,
+    ) -> RegisteredMcpDirectToolCall:
+      assert exposed_name == "apply_patch_ops"
+      _ = trusted_dispatch_scope, registered_approval_overlay
+      return RegisteredMcpDirectToolCall(
+        descriptor,
+        prepared_call,
+        PlanDecision("none"),
+        False,
+        None,
+      )
+
+    async def call_tool(
+      self,
+      name: str,
+      tool_input: object,
+      meta: dict[str, Any] | None = None,
+      abort_event: asyncio.Event | None = None,
+      gateway_session: object | None = None,
+      allow_uncertain_replay: bool = True,
+      trusted_dispatch_scope: Mapping[str, object] | None = None,
+    ) -> ToolResult:
+      assert name == "apply_patch_ops"
+      assert isinstance(tool_input, PreparedToolCall)
+      _ = (
+        meta,
+        abort_event,
+        gateway_session,
+        allow_uncertain_replay,
+        trusted_dispatch_scope,
+      )
+      calls.append(tool_input.materialize_input())
+      return {"received": calls[-1]}, None
 
   dispatcher = ToolDispatcher(
     role="owner",
     mcp_client=Mcp(),
-    needs_approval=lambda *_args: True,
+    needs_approval=lambda *_args: (_ for _ in ()).throw(
+      AssertionError("registered approval must own this route")
+    ),
+    request_approval=lambda *_args: (_ for _ in ()).throw(
+      AssertionError("nonplanning raw patch must not request approval")
+    ),
+    tool_registration_catalog=composition.catalog,
+    tool_policy_implementations=composition.policy_implementations,
+    approval_predicate_context_factory=lambda *_args: None,
+    redaction_context_factory=product_redaction_context_factory,
   )
-  tool_input = {"research_file_id": 42, "ops": [], "dry_run": True}
 
   result, error = asyncio.run(
-    dispatcher.dispatch(
-      "dry-run-call",
+    dispatcher.dispatch_prepared(
+      "raw-patch-call",
       "apply_patch_ops",
-      tool_input,
+      PreparedToolCall(tool_input),
       advertised_tool_names=frozenset({"apply_patch_ops"}),
     )
   )
 
   assert error is None
-  assert result == {"dry_run": True}
+  assert result == {"received": tool_input}
   assert calls == [tool_input]
-  assert "authorization_ref" not in calls[0]
 
 
 def _missing_catalog_module(name: str) -> ModuleNotFoundError:
@@ -2315,7 +2576,7 @@ def test_catalog_planning_identity_prefers_fms_layout(
 
 
 @pytest.mark.parametrize("missing_name", ["fms", "fms.action_catalog"])
-def test_catalog_planning_identity_falls_back_to_api_layout_only_for_candidate_absence(
+def test_catalog_planning_identity_fails_closed_when_catalog_layout_is_absent(
   monkeypatch: pytest.MonkeyPatch,
   missing_name: str,
 ) -> None:
@@ -2323,29 +2584,6 @@ def test_catalog_planning_identity_falls_back_to_api_layout_only_for_candidate_a
 
   def fake_import_module(name: str) -> Any:
     calls.append(name)
-    if name == "fms.action_catalog":
-      raise _missing_catalog_module(missing_name)
-    return _catalog_module("planned")
-
-  monkeypatch.setattr(dispatcher_module, "import_module", fake_import_module)
-
-  assert ToolDispatcher._catalog_planning_identity("planned") == "change_set"
-  assert calls == ["fms.action_catalog", "api.fms.action_catalog"]
-
-
-@pytest.mark.parametrize(
-  "api_missing_name",
-  ["api", "api.fms", "api.fms.action_catalog"],
-)
-def test_catalog_planning_identity_fails_closed_when_both_layouts_are_absent(
-  monkeypatch: pytest.MonkeyPatch,
-  api_missing_name: str,
-) -> None:
-  calls: list[str] = []
-
-  def fake_import_module(name: str) -> Any:
-    calls.append(name)
-    missing_name = "fms" if name == "fms.action_catalog" else api_missing_name
     raise _missing_catalog_module(missing_name)
 
   monkeypatch.setattr(dispatcher_module, "import_module", fake_import_module)
@@ -2355,7 +2593,7 @@ def test_catalog_planning_identity_fails_closed_when_both_layouts_are_absent(
     match="trusted FMS action catalog is unavailable",
   ):
     ToolDispatcher._catalog_planning_identity("planned")
-  assert calls == ["fms.action_catalog", "api.fms.action_catalog"]
+  assert calls == ["fms.action_catalog"]
 
 
 def test_catalog_planning_identity_rethrows_nested_dependency_failure(
@@ -2374,26 +2612,6 @@ def test_catalog_planning_identity_rethrows_nested_dependency_failure(
     ToolDispatcher._catalog_planning_identity("planned")
   assert exc_info.value is error
   assert calls == ["fms.action_catalog"]
-
-
-def test_catalog_planning_identity_rethrows_fallback_nested_dependency_failure(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  error = _missing_catalog_module("catalog_dependency")
-  calls: list[str] = []
-
-  def fake_import_module(name: str) -> Any:
-    calls.append(name)
-    if name == "fms.action_catalog":
-      raise _missing_catalog_module("fms")
-    raise error
-
-  monkeypatch.setattr(dispatcher_module, "import_module", fake_import_module)
-
-  with pytest.raises(ModuleNotFoundError) as exc_info:
-    ToolDispatcher._catalog_planning_identity("planned")
-  assert exc_info.value is error
-  assert calls == ["fms.action_catalog", "api.fms.action_catalog"]
 
 
 def test_catalog_planning_identity_rethrows_other_import_failure(
@@ -2467,6 +2685,7 @@ def test_missing_catalog_blocks_even_generic_local_handler(
   result, error = asyncio.run(dispatcher.dispatch("call-ordinary", "ordinary", {}))
 
   assert result is None
+  assert error is not None
   assert error["code"] == "planned_write_contract_invalid"
   assert calls == []
 
@@ -2546,9 +2765,11 @@ def test_promotion_saga_generic_dispatch_requires_owner_control_route_before_app
   )
   if approval_path != "no_lifecycle":
     dispatcher_kwargs.update(
-      session=_planned_session(),
-      store=Store(tmp_path / "approvals.sqlite3"),
-      policy=Policy(),
+      approval_route=DurableLocalApprovalRoute(
+        Store(tmp_path / "approvals.sqlite3"),
+        Policy(),
+        _planned_session(),
+      ),
     )
   if approval_path == "session_cache":
     dispatcher_kwargs["approved_tool_types"] = {"promote_reviewed_change"}
@@ -2565,6 +2786,7 @@ def test_promotion_saga_generic_dispatch_requires_owner_control_route_before_app
   )
 
   assert result is None
+  assert error is not None
   assert error["code"] == "owner_control_route_required"
   assert "authenticated owner control-plane route" in error["message"].lower()
   assert calls == []
@@ -2594,18 +2816,19 @@ def test_planned_dispatch_partial_hook_triplet_fails_closed(
   async def executor(*_args: Any, **_kwargs: Any):
     calls.append("execute")
     return {}, None
+  handler_double = _PlanningHandlerDouble(handler)
 
   if "identity" in declared:
-    handler.PLANNING_IDENTITY = "change_set"
+    handler_double.PLANNING_IDENTITY = "change_set"
   if "planner" in declared:
-    handler.plan_change = planner
+    handler_double.plan_change = planner
   if "executor" in declared:
-    handler.execute_prepared_change = executor
+    handler_double.execute_prepared_change = executor
 
   dispatcher = ToolDispatcher(
     role="owner",
     mcp_client=_NullMcp(),
-    local_tool_handlers={"planned": handler},
+    local_tool_handlers={"planned": handler_double},
   )
 
   result, error = asyncio.run(
@@ -2613,6 +2836,7 @@ def test_planned_dispatch_partial_hook_triplet_fails_closed(
   )
 
   assert result is None
+  assert error is not None
   assert error["code"] == "planned_write_contract_invalid"
   assert calls == []
 
@@ -2641,6 +2865,7 @@ def test_catalogued_exact_write_cannot_fall_back_to_legacy_handler(
   )
 
   assert result is None
+  assert error is not None
   assert error["code"] == "planned_write_contract_invalid"
   assert calls == []
 
@@ -2668,13 +2893,16 @@ def test_planned_dispatch_preserves_trusted_planning_rejection() -> None:
     calls.append("execute")
     return {}, None
 
-  handler.PLANNING_IDENTITY = "change_set"
-  handler.plan_change = plan_change
-  handler.execute_prepared_change = execute_prepared_change
+  handler_double = _PlanningHandlerDouble(
+    handler,
+    planning_identity="change_set",
+    plan_change=plan_change,
+    execute_prepared_change=execute_prepared_change,
+  )
   dispatcher = ToolDispatcher(
     role="owner",
     mcp_client=_NullMcp(),
-    local_tool_handlers={"planned": handler},
+    local_tool_handlers={"planned": handler_double},
     needs_approval=lambda *_args: True,
   )
 
@@ -2713,9 +2941,11 @@ def test_planned_dispatch_fails_closed_on_row_persistence_error(tmp_path: Path) 
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
-    session=_planned_session(),
-    store=Store(tmp_path / "approvals.sqlite3"),
-    policy=Policy(),
+    approval_route=DurableLocalApprovalRoute(
+      Store(tmp_path / "approvals.sqlite3"),
+      Policy(),
+      _planned_session(),
+    ),
   )
 
   result, error = asyncio.run(
@@ -2723,6 +2953,7 @@ def test_planned_dispatch_fails_closed_on_row_persistence_error(tmp_path: Path) 
   )
 
   assert result is None
+  assert error is not None
   assert error["code"] == "planned_write_authorization_persistence_failed"
   assert events == ["plan"]
   assert not prepared_path.exists()
@@ -2751,9 +2982,11 @@ def test_planned_dispatch_rejects_trusted_context_loss(tmp_path: Path) -> None:
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
-    session=_planned_session(),
-    store=SQLiteApprovalStore(tmp_path / "approvals.sqlite3"),
-    policy=Policy(),
+    approval_route=DurableLocalApprovalRoute(
+      SQLiteApprovalStore(tmp_path / "approvals.sqlite3"),
+      Policy(),
+      _planned_session(),
+    ),
   )
 
   result, error = asyncio.run(
@@ -2761,6 +2994,7 @@ def test_planned_dispatch_rejects_trusted_context_loss(tmp_path: Path) -> None:
   )
 
   assert result is None
+  assert error is not None
   assert error["code"] == "planned_write_trusted_plan_lost"
   assert events == ["plan"]
   assert not prepared_path.exists()
@@ -2794,9 +3028,11 @@ def test_planned_dispatch_requires_reinvocation_for_policy_modified_args(
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
-    session=_planned_session(),
-    store=store,
-    policy=Policy(),
+    approval_route=DurableLocalApprovalRoute(
+      store,
+      Policy(),
+      _planned_session(),
+    ),
   )
 
   result, error = asyncio.run(
@@ -2804,6 +3040,7 @@ def test_planned_dispatch_requires_reinvocation_for_policy_modified_args(
   )
 
   assert result is None
+  assert error is not None
   assert error["code"] == "planned_write_reinvocation_required"
   assert events == ["plan"]
   assert len(resolved) == 1
@@ -2837,9 +3074,11 @@ def test_planned_dispatch_releases_private_snapshot_on_final_input_failure(
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
-    session=_planned_session(),
-    store=SQLiteApprovalStore(tmp_path / "approvals.sqlite3"),
-    policy=Policy(),
+    approval_route=DurableLocalApprovalRoute(
+      SQLiteApprovalStore(tmp_path / "approvals.sqlite3"),
+      Policy(),
+      _planned_session(),
+    ),
   )
   validation_calls = 0
 
@@ -2928,11 +3167,11 @@ def test_fresh_owner_lifecycle_blocks_every_automatic_source(
 
   store = SQLiteApprovalStore(tmp_path / "fresh-owner.sqlite3")
   policy = AutoPolicy()
+  session = _gateway_session()
   result = asyncio.run(
     lifecycle_helpers.run_approval_lifecycle(
-      store=store,
-      policy=policy,
-      session=SimpleNamespace(),
+      route=DurableLocalApprovalRoute(store, policy, session),
+      session=session,
       tool_call_id="promotion-call",
       tool_name="apply_proposal_series",
       tool_input={"proposal_ids": ["proposal-1"]},
@@ -2949,7 +3188,7 @@ def test_fresh_owner_lifecycle_blocks_every_automatic_source(
         request_id="request-1",
         decider_role="owner",
       ),
-      current_skill_fn=lambda: None,
+      current_skill_admission_fn=lambda: None,
       redact_for_approval_request_fn=lambda *_args: ({}, "args-hash"),
       resolve_tool_class_fn=lambda _tool_name: "state_write",
       effective_trade_approval_decision_fn=lambda _name, _args, decision: decision,
@@ -2969,3 +3208,88 @@ def test_fresh_owner_lifecycle_blocks_every_automatic_source(
   assert request.required_owner_user_id == "owner-1"
   assert policy.decide_calls == 1
   assert policy.resolved == [request.approval_id]
+
+
+def test_native_approval_refuses_inline_limit_mismatch_before_policy(
+  tmp_path: Path,
+) -> None:
+  calls: list[str] = []
+
+  class Policy:
+    async def decide(self, **_kwargs: Any) -> PolicyApprovalDecision:
+      calls.append("policy")
+      raise AssertionError("mismatched admission must precede policy")
+
+  limits = SkillExecutionLimits(20, 32_000, 20.0)
+  with pytest.raises(ValueError, match="do not match"):
+    asyncio.run(
+      lifecycle_helpers.run_approval_lifecycle(
+        route=DurableLocalApprovalRoute(
+          SQLiteApprovalStore(tmp_path / "admission-mismatch.sqlite3"),
+          Policy(),
+          _gateway_session(),
+        ),
+        session=_gateway_session(),
+        tool_call_id="call-mismatch",
+        tool_name="file_write",
+        tool_input={"path": "x"},
+        qualifier="",
+        reason="write",
+        allow_persistent=False,
+        resolve_run_context_fn=lambda: RunContext(
+          user_id="owner-1",
+          request_id="request-1",
+          skill="quant-research",
+          admitted_skill_execution_limits=limits,
+        ),
+        current_skill_admission_fn=lambda: ActiveSkillAdmission(
+          "quant-research",
+          SkillExecutionLimits(19, 32_000, 20.0),
+        ),
+        redact_for_approval_request_fn=lambda *_args: (_ for _ in ()).throw(
+          AssertionError("mismatch must precede redaction")
+        ),
+        resolve_tool_class_fn=lambda _tool_name: "state_write",
+        effective_trade_approval_decision_fn=(
+          lambda _name, _args, decision: decision
+        ),
+        await_user_approval_via_pending_tools_fn=lambda *_args: None,
+        approval_queue_timeout_seconds_fn=lambda _expiry: 1.0,
+      )
+    )
+
+  assert calls == []
+
+
+def test_model_writer_undo_review_derives_from_staged_snapshots() -> None:
+  # The FMS owner retired after-commit durable Undo issuance (persist_runner
+  # 1dac98bc1); the review must report honestly instead of raising on a
+  # deleted private capability constant.
+  from agent_gateway.tool_dispatcher_helpers import _model_writer_undo_review
+
+  assert _model_writer_undo_review(
+    snapshot_store_ids=frozenset(),
+    model_write_store_ids=frozenset(),
+  ) == {
+    "scope": "workbook_and_ticker_override_state",
+    "status": "not_required",
+    "reason": "plan_has_no_workbook_or_ticker_override_state_write",
+  }
+
+  covered = _model_writer_undo_review(
+    snapshot_store_ids=frozenset({"workbook"}),
+    model_write_store_ids=frozenset({"workbook"}),
+  )
+  assert covered == {
+    "scope": "workbook_and_ticker_override_state",
+    "status": "not_available_for_this_subcommand",
+    "reason": "subcommand_does_not_issue_durable_undo",
+    "missing_snapshot_store_ids": [],
+  }
+
+  missing = _model_writer_undo_review(
+    snapshot_store_ids=frozenset(),
+    model_write_store_ids=frozenset({"workbook", "valuation_override"}),
+  )
+  assert missing["reason"] == "precommit_snapshot_missing"
+  assert missing["missing_snapshot_store_ids"] == ["valuation_override", "workbook"]

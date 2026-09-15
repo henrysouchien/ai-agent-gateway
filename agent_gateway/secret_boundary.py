@@ -14,13 +14,22 @@ REDACTED_SECRET = "<redacted-secret>"
 SANITIZATION_FAILED = "<secret-sanitization-failed>"
 UNSUPPORTED_VALUE = "<unsupported-boundary-value>"
 
-_CREDENTIAL_FIELDS = frozenset({
-  "access_token",
-  "api_key",
-  "auth_token",
-  "client_secret",
-  "id_token",
-  "refresh_token",
+# Redaction fails closed: every string value in an auth_config registers as
+# secret material unless its key is a provably non-secret selection/config
+# field. A provider adding a new credential key is redacted by default instead
+# of silently escaping the boundary. These key names mirror the auth_config
+# reads in providers/*, capability_binding.py, runner_auth.py, and easy.py.
+_NON_SECRET_AUTH_CONFIG_FIELDS = frozenset({
+  "auth_mode",
+  "auth_store_path",
+  "base_url",
+  "baseURL",
+  "billing_mode",
+  "compat",
+  "max_tokens",
+  "provider",
+  "rate_table_version",
+  "token_expires_at",
 })
 _MIN_SUBSTRING_SECRET_LENGTH = 8
 _MAX_DEPTH = 32
@@ -39,6 +48,10 @@ _HIGH_CONFIDENCE_PATTERNS = (
     re.DOTALL,
   ),
 )
+
+
+class _SanitizationLimitExceeded(Exception):
+  """Stop the whole traversal when its shared resource budget is exhausted."""
 
 
 class SecretBoundary:
@@ -86,7 +99,7 @@ class SecretBoundary:
     values = tuple(
       value.strip()
       for key, value in auth_config.items()
-      if key in _CREDENTIAL_FIELDS
+      if key not in _NON_SECRET_AUTH_CONFIG_FIELDS
       and isinstance(value, str)
       and value.strip()
     )
@@ -108,7 +121,11 @@ class SecretBoundary:
   def sanitize(self, value: Any, *, sink: str) -> Any:
     del sink  # Sink is explicit at call sites and reserved for value-free metrics.
     remaining = [_MAX_NODES]
-    return self._sanitize(value, depth=0, remaining=remaining, active=set())
+    try:
+      return self._sanitize(value, depth=0, remaining=remaining, active=set())
+    except _SanitizationLimitExceeded as exc:
+      _observe_sanitization_failure(reason=str(exc))
+      return SANITIZATION_FAILED
 
   def _sanitize(
     self,
@@ -119,9 +136,10 @@ class SecretBoundary:
     active: set[int],
   ) -> Any:
     remaining[0] -= 1
-    if remaining[0] < 0 or depth > _MAX_DEPTH:
-      _observe_sanitization_failure()
-      return SANITIZATION_FAILED
+    if remaining[0] < 0:
+      raise _SanitizationLimitExceeded("node_limit")
+    if depth > _MAX_DEPTH:
+      raise _SanitizationLimitExceeded("depth_limit")
     if value is None or isinstance(value, (bool, int, float)):
       return value
     if isinstance(value, str):
@@ -200,12 +218,13 @@ def sanitize_boundary_value(
     return SANITIZATION_FAILED
 
 
-def _observe_sanitization_failure() -> None:
+def _observe_sanitization_failure(*, reason: str = "projection_failure") -> None:
   """Emit value-free evidence that a boundary projection failed closed."""
 
   record_package_counter("secret_boundary_sanitization_failed")
   _LOG.warning(
-    "Secret boundary sanitization failed; fixed tombstone emitted"
+    "Secret boundary sanitization failed; fixed tombstone emitted",
+    extra={"data": {"reason": reason}},
   )
 
 
@@ -231,14 +250,9 @@ def sanitization_failure_tool_input() -> dict[str, str]:
   return {"_boundary_error": SANITIZATION_FAILED}
 
 
-def sanitization_failure_tool_block(
-  block_type: str,
-  *,
-  correlation_value: Any = None,
-) -> dict[str, Any]:
+def sanitization_failure_tool_block(block_type: str) -> dict[str, Any]:
   """Return a structurally valid, value-free typed block tombstone."""
 
-  del correlation_value
   safe_id = "boundary-sanitization-failed"
   if block_type in {"tool_use", "server_tool_use"}:
     return {
@@ -334,6 +348,12 @@ def sanitize_approval_decision_projection(
     ),
     "modified_tool_args": None,
   }
+  if raw_modified is not None:
+    updates.update({
+      "allow_persistent_grant": False,
+      "persistent_grant_scope_hint": None,
+      "grant_reference": None,
+    })
   try:
     return replace(decision, **updates), raw_modified
   except Exception:
@@ -379,12 +399,6 @@ def sanitize_tool_event(
       "final_tool_result_blocks",
       "dispatch",
     )
-  elif event_type == "mcp_server_activated":
-    # Session-log-only activation record (D-B7-1). `error.message` names the
-    # server and tools an agent declared, which is operator-supplied config
-    # text, so it is sanitized like any other tool-derived field. `server_id`,
-    # `tools` and `whole_server` are catalog identifiers, never payload.
-    fields = ("error",)
   elif event_type == "tool_output_chunk":
     fields = ("text", "content")
   elif event_type in {"error", "run_error", "stream_retry"}:
@@ -400,6 +414,11 @@ def sanitize_tool_event(
 
   for field in fields:
     if field in projected:
+      if field == "final_tool_result_blocks" and isinstance(projected[field], list):
+        projected[field] = _sanitize_typed_blocks(
+          projected[field], sink=sink, boundary=boundary, sanitize_untyped=True,
+        )
+        continue
       projected[field] = sanitize_boundary_value(
         projected[field],
         sink=sink,
@@ -431,35 +450,36 @@ def _sanitize_typed_blocks(
   *,
   sink: str,
   boundary: SecretBoundary | None,
+  sanitize_untyped: bool = False,
 ) -> list[Any]:
   projected: list[Any] = []
   for block in blocks:
-    if not isinstance(block, Mapping):
-      projected.append(block)
-      continue
-    block_type = str(block.get("type") or "")
+    block_type = str(block.get("type") or "") if isinstance(block, Mapping) else ""
     if block_type not in {"tool_use", "server_tool_use", "tool_result"}:
-      projected.append(dict(block))
+      projected.append(
+        sanitize_boundary_value(block, sink=sink, boundary=boundary)
+        if sanitize_untyped
+        else dict(block) if isinstance(block, Mapping) else block
+      )
       continue
-    safe_block = sanitize_boundary_value(
-      block,
-      sink=sink,
-      boundary=boundary,
-    )
+
+    safe_block = sanitize_boundary_value(block, sink=sink, boundary=boundary)
     if isinstance(safe_block, dict):
       projected.append(safe_block)
       continue
-    _observe_sanitization_failure()
-    projected.append(
-      sanitization_failure_tool_block(
-        block_type,
-        correlation_value=(
-          block.get("id")
-          if block_type in {"tool_use", "server_tool_use"}
-          else block.get("tool_use_id")
-        ),
-      )
-    )
+
+    # Correlation belongs to the envelope, not the resource-limited payload.
+    # Sanitize it independently so tombstoning a body cannot rename a call.
+    identity = {
+      key: block[key]
+      for key in ("type", "id", "name", "tool_use_id", "tool_call_id", "tool_name")
+      if key in block
+    }
+    safe_identity = sanitize_boundary_value(identity, sink=sink, boundary=boundary)
+    tombstone = sanitization_failure_tool_block(block_type)
+    if isinstance(safe_identity, dict):
+      tombstone.update(safe_identity)
+    projected.append(tombstone)
   return projected
 
 

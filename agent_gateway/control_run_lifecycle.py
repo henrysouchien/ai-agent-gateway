@@ -79,13 +79,10 @@ def _normalized_state_text(value: object) -> str | None:
 CONTROL_RUN_STATES = frozenset(CONTROL_RUN_STATE_CLASSIFICATION)
 CONTROL_ACTIVE_RUN_STATES = _states_where("active")
 CONTROL_TERMINAL_RUN_STATES = _states_where("terminal")
-CONTROL_RESUMABLE_RUN_STATES = _states_where("resumable")
-CONTROL_CANCELLABLE_RUN_STATES = _states_where("cancellable")
 
 # Chat-kind control runs are continuable conversations. Unlike autonomous runs,
 # a completed chat response is still a valid parent for the next user message.
 CONTROL_CHAT_MESSAGEABLE_RUN_STATES = CONTROL_ACTIVE_RUN_STATES | frozenset({"completed"})
-CONTROL_CHAT_TOKEN_FORGET_STATES = CONTROL_TERMINAL_RUN_STATES - CONTROL_CHAT_MESSAGEABLE_RUN_STATES
 
 
 def coerce_control_run_state(value: object) -> ControlRunState | None:
@@ -100,12 +97,11 @@ def coerce_control_run_state(value: object) -> ControlRunState | None:
   return None
 
 
-def canonical_control_run_state(value: object, *, default: ControlRunState = "running") -> ControlRunState:
-  return coerce_control_run_state(value) or default
-
-
-def is_control_run_state(value: object) -> bool:
-  return isinstance(value, str) and value in CONTROL_RUN_STATES
+def canonical_control_run_state(value: object) -> ControlRunState:
+  state = coerce_control_run_state(value)
+  if state is None:
+    raise ValueError(f"unknown control run state: {value!r}")
+  return state
 
 
 def is_control_run_active_state(value: object) -> bool:
@@ -114,22 +110,6 @@ def is_control_run_active_state(value: object) -> bool:
 
 def is_control_run_terminal_state(value: object) -> bool:
   return isinstance(value, str) and value in CONTROL_TERMINAL_RUN_STATES
-
-
-def is_control_run_resumable_state(value: object) -> bool:
-  return isinstance(value, str) and value in CONTROL_RESUMABLE_RUN_STATES
-
-
-def is_control_run_cancellable_state(value: object) -> bool:
-  return isinstance(value, str) and value in CONTROL_CANCELLABLE_RUN_STATES
-
-
-def is_control_chat_messageable_state(value: object) -> bool:
-  return isinstance(value, str) and value in CONTROL_CHAT_MESSAGEABLE_RUN_STATES
-
-
-def should_forget_control_chat_token(value: object) -> bool:
-  return isinstance(value, str) and value in CONTROL_CHAT_TOKEN_FORGET_STATES
 
 
 def is_autonomous_run_internal_resumable_state(value: object) -> bool:

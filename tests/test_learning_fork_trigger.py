@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent_gateway.approval_policy import RunContext
 from agent_gateway.fork_ledger import ForkLedger
 from agent_gateway.fork_task_registry import ForkTaskRegistry
 from agent_gateway.learning_fork_trigger import (
@@ -16,6 +18,7 @@ from agent_gateway.learning_fork_trigger import (
   settle_learning_receipts,
   submit_learning_fork_after_turn,
 )
+from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.runner_fork_agents import (
   LEARNING_FORK_ALLOWED_TOOLS,
   build_learning_fork_tool_decisions,
@@ -24,6 +27,20 @@ from agent_gateway.runner_fork_agents import (
 from agent_gateway.runner_notifications import build_notification_reminder
 from agent_gateway.sub_agent_result_contract import LearningReport
 from agent_gateway.task_registry import NotificationQueue
+from agent_gateway.tool_dispatcher import ToolDispatcher
+
+ROOT = Path(__file__).resolve().parents[3]
+API_DIR = ROOT / "api"
+if str(API_DIR) not in sys.path:
+  sys.path.insert(0, str(API_DIR))
+
+import memory  # noqa: E402
+from agent.interactive.tool_dispatcher import ExcelToolDispatcher  # noqa: E402
+from agent.shared.tool_handlers import fork_memory_write  # noqa: E402
+from agent.shared.tool_handlers.fork_memory_write import (  # noqa: E402
+  scope_fork_memory_write_handler,
+)
+from excel_mcp.relay import ChannelRegistry  # noqa: E402
 
 
 def _clock() -> int:
@@ -62,7 +79,7 @@ def _runner(
   )
   dispatcher = SimpleNamespace(
     _session=session,
-    _run_context=SimpleNamespace(profile=profile),
+    run_context=SimpleNamespace(profile=profile),
   )
   return SimpleNamespace(
     _gateway_session=session,
@@ -386,3 +403,104 @@ async def test_trigger_failure_is_best_effort_and_non_owner_byok_default_off(
     aborted=False,
     cancelled=False,
   ) is None
+
+
+async def _unused_spawn(_fork_id, _handoff):
+  raise AssertionError("no fork is launched here")
+
+
+@pytest.mark.asyncio
+async def test_excel_wrapper_is_eligible_and_fork_clone_writes_its_note(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """The two seams that kept the fork wired shut on the Excel path.
+
+  Eligibility must read the profile through the wrapper, and the fork clone
+  must scope ``memory_write`` where dispatch actually reads it, so the note
+  lands through the real wrapper while the parent keeps its stock handler.
+  """
+
+  workspace = tmp_path / "tenant-workspace"
+  index_calls: list[Path] = []
+
+  class _Store:
+    def index_memory_file(self, file_path, memory_dir, *, metadata=None):
+      del memory_dir, metadata
+      index_calls.append(file_path)
+      return {"indexed": True, "chunks": 1}
+
+  monkeypatch.setattr(memory, "get_workspace_dir", lambda _user_id=None: workspace)
+  monkeypatch.setattr(memory, "get_memory_store", lambda _user_id=None: _Store())
+  monkeypatch.setattr(fork_memory_write, "_utc_date", lambda: "2026-09-05")
+  stock_calls: list[dict[str, object]] = []
+
+  async def stock_memory_write(tool_input, **_kwargs):
+    stock_calls.append(dict(tool_input))
+    return {"file": tool_input["file"]}, None
+
+  base = ToolDispatcher(
+    mcp_client=McpClientManager(config_path=None),
+    local_tool_handlers={"memory_write": stock_memory_write},
+    role="owner",
+    run_context=RunContext(
+      user_id="owner-1",
+      request_id="turn-1",
+      profile="analyst",
+    ),
+  )
+
+  async def _no_addin_route(_request):
+    raise AssertionError("no Excel route is exercised")
+
+  wrapper = ExcelToolDispatcher(
+    base=base,
+    channel_registry=ChannelRegistry(),
+    execute_addin=_no_addin_route,
+  )
+  ledger = _ledger(tmp_path)
+  registry = ForkTaskRegistry(ledger, spawn_fork=_unused_spawn, enabled=True)
+  runner = _runner(ledger, registry)
+  runner._dispatcher = wrapper
+
+  assert owner_operated_interactive_analyst(runner, runner._gateway_session)
+
+  fork_id = "learn-0123abcd"
+  fork_dispatcher = runner._dispatcher.with_scoped_local_handler(
+    "memory_write",
+    lambda stock: scope_fork_memory_write_handler(
+      stock,
+      fork_id=fork_id,
+      user_id="owner-1",
+    ),
+  )
+  assert isinstance(fork_dispatcher, ExcelToolDispatcher)
+  assert fork_dispatcher.run_context is wrapper.run_context
+
+  result, error = await fork_dispatcher.dispatch(
+    "call-1",
+    "memory_write",
+    {"file": "daily/requested.md", "content": "learned: prefer FCF yield"},
+  )
+  assert error is None
+  assert result is not None
+  note = workspace / "notes" / result["file"]
+  assert note.name == f"2026-09-05-{fork_id}-1.md"
+  assert "learned: prefer FCF yield" in note.read_text(encoding="utf-8")
+  assert index_calls == [note]
+  assert stock_calls == []
+
+  result, error = await wrapper.dispatch(
+    "call-2",
+    "memory_write",
+    {"file": "daily/parent.md", "content": "parent write"},
+  )
+  assert error is None
+  assert result == {"file": "daily/parent.md"}
+  assert stock_calls == [{"file": "daily/parent.md", "content": "parent write"}]
+  assert sorted(p.name for p in (workspace / "notes" / "learning").glob("*.md")) == [
+    f"2026-09-05-{fork_id}-1.md",
+  ]
+
+  with pytest.raises(KeyError):
+    wrapper.with_scoped_local_handler("file_write", lambda stock: stock)

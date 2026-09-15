@@ -301,6 +301,7 @@ def test_billing_ledger() -> None:
   import tempfile
   import time
   from agent_gateway.multi_user.billing import (
+    BillingMode,
     SqliteUsageLedger,
     UsageEvent,
     write_dlq,
@@ -315,12 +316,13 @@ def test_billing_ledger() -> None:
 
     # Record some events
     events = []
-    for i, (user, mode, model, inp, out) in enumerate([
+    rows: list[tuple[str, BillingMode, str, int, int]] = [
       ("alice_42", "metered", "claude-sonnet-4-6", 1000, 500),
       ("alice_42", "metered", "claude-opus-4-6", 2000, 300),
       ("bob_99", "byok", "claude-sonnet-4-6", 500, 200),
       ("alice_42", "metered", "claude-sonnet-4-6", 800, 400),
-    ]):
+    ]
+    for i, (user, mode, model, inp, out) in enumerate(rows):
       evt = UsageEvent(
         user_id=user,
         session_id=f"sess_{i}",

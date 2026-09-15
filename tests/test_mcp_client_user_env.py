@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import timedelta
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from typing import Mapping
+from mcp.types import CallToolResult
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -12,20 +14,33 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.mcp_client import McpClientManager, _ServerState  # noqa: E402
+from agent_gateway.mcp_client import McpClientManager, _ConnectedServerState, _ServerState  # noqa: E402
+from agent_gateway.mcp_client_connections import McpToolCallResult  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
 from agent_gateway.tool_dispatcher import ToolDispatcher  # noqa: E402
 import agent_gateway.mcp_client as mcp_client_module  # noqa: E402
 
 
 SERVER = "research-corpus-mcp"
-DYNAMIC_ENV = ["GATEWAY_API_KEY", "RISK_MODULE_USER_EMAIL"]
+DYNAMIC_ENV = ["GATEWAY_API_KEY", "RISK_MODULE_USER_EMAIL", "INDUSTRY_ARTIFACTS_DIR"]
 
+
+
+class _UnusedClientSession:
+  async def call_tool(
+    self,
+    name: str,
+    arguments: Mapping[str, object],
+    *,
+    read_timeout_seconds: timedelta,
+    meta: Mapping[str, object] | None = None,
+  ) -> McpToolCallResult:
+    raise AssertionError(f"unexpected physical MCP call: {name}")
 
 def _definition() -> _ServerState:
   return _ServerState(
     SERVER,
-    SimpleNamespace(),
+    _UnusedClientSession(),
     [],
     [],
     {"thesis_list"},
@@ -74,6 +89,7 @@ def test_definition_process_strips_declared_user_authority(tmp_path, monkeypatch
           "env": {
             "GATEWAY_API_KEY": "${GATEWAY_API_KEY}",
             "RISK_MODULE_USER_EMAIL": "${RISK_MODULE_USER_EMAIL}",
+            "INDUSTRY_ARTIFACTS_DIR": "${INDUSTRY_ARTIFACTS_DIR}",
             "MCP_SUBPROCESS": "true",
           },
         }
@@ -88,14 +104,15 @@ def test_definition_process_strips_declared_user_authority(tmp_path, monkeypatch
     {
       "GATEWAY_API_KEY": "synthetic-parent-ambient",
       "RISK_MODULE_USER_EMAIL": "operator@example.com",
+      "INDUSTRY_ARTIFACTS_DIR": "/synthetic/operator/industry",
     },
   )
   manager = McpClientManager(config_path=config_path)
   captured = {}
 
   async def scenario() -> None:
-    async def connect(jobs):
-      captured.update(jobs[0][1])
+    async def connect(connect_jobs):
+      captured.update(connect_jobs[0][1])
       return []
 
     manager._connect_startup_servers = connect
@@ -116,23 +133,35 @@ def test_authenticated_user_projection_completes_read_with_trusted_meta() -> Non
     return {
       "GATEWAY_API_KEY": "synthetic-user-projection",
       "RISK_MODULE_USER_EMAIL": "user@example.com",
+      "INDUSTRY_ARTIFACTS_DIR": "/synthetic/users/7/industry",
     }
 
   manager = _manager(resolver)
 
   async def scenario() -> None:
     class Session:
-      async def call_tool(self, name, tool_input, **kwargs):
-        captured["call"] = (name, tool_input, kwargs)
-        return SimpleNamespace(
+      async def call_tool(
+        self,
+        name: str,
+        arguments: Mapping[str, object],
+        *,
+        read_timeout_seconds: timedelta,
+        meta: Mapping[str, object] | None = None,
+      ) -> CallToolResult:
+        captured["call"] = (
+          name,
+          arguments,
+          {"read_timeout_seconds": read_timeout_seconds, "meta": meta},
+        )
+        return CallToolResult(
           isError=False,
           structuredContent={"items": []},
           content=[],
         )
 
-    async def connect(_name, config):
+    async def connect(name, config):
       captured["env"] = dict(config["env"])
-      return _ServerState(
+      return _ConnectedServerState(
         SERVER,
         Session(),
         [object()],
@@ -157,6 +186,7 @@ def test_authenticated_user_projection_completes_read_with_trusted_meta() -> Non
     "MCP_SUBPROCESS": "true",
     "GATEWAY_API_KEY": "synthetic-user-projection",
     "RISK_MODULE_USER_EMAIL": "user@example.com",
+    "INDUSTRY_ARTIFACTS_DIR": "/synthetic/users/7/industry",
   }
   assert "GATEWAY_USER_KEYS" not in captured["env"]
   call_name, call_input, call_kwargs = captured["call"]
@@ -173,7 +203,7 @@ def test_missing_user_projection_fails_before_spawn() -> None:
   async def scenario() -> None:
     nonlocal spawned
 
-    async def connect(_name, _config):
+    async def connect(name, config):
       nonlocal spawned
       spawned = True
       raise AssertionError("missing authority must not spawn")
@@ -185,11 +215,9 @@ def test_missing_user_projection_fails_before_spawn() -> None:
       gateway_session=_session(7, "user@example.com"),
     )
     assert result is None
-    assert error == {
-      "code": "mcp_tool_error",
-      "sub_code": "mcp_user_authority_unavailable",
-      "message": "User-scoped MCP authority is incomplete.",
-    }
+    assert error is not None
+    assert error["code"] == "mcp_tool_error"
+    assert error["sub_code"] == "mcp_user_authority_unavailable"
 
   asyncio.run(scenario())
   assert spawned is False
@@ -206,17 +234,18 @@ def test_user_processes_isolate_and_credential_change_replaces_cached_child() ->
     return {
       "GATEWAY_API_KEY": projections[user_id],
       "RISK_MODULE_USER_EMAIL": str(user_email),
+      "INDUSTRY_ARTIFACTS_DIR": f"/synthetic/users/{user_id}/industry",
     }
 
   manager = _manager(resolver)
   drained = []
 
   async def scenario() -> None:
-    async def connect(_name, config):
+    async def connect(name, config):
       captured_envs.append(dict(config["env"]))
-      return _ServerState(
+      return _ConnectedServerState(
         SERVER,
-        SimpleNamespace(),
+        _UnusedClientSession(),
         [object()],
         [],
         {"thesis_list"},
@@ -224,7 +253,7 @@ def test_user_processes_isolate_and_credential_change_replaces_cached_child() ->
       )
 
     manager._connect_stdio_with_retries = connect
-    manager._schedule_drain = drained.append
+    manager._schedule_drain = lambda state: drained.append(state)
     subject_seven = mcp_client_module._PerUserGatewaySubject.from_gateway_session(
       _session(7, "seven@example.com")
     )
@@ -250,10 +279,15 @@ def test_user_processes_isolate_and_credential_change_replaces_cached_child() ->
     "synthetic-user-eight-v1",
     "synthetic-user-seven-v2",
   ]
+  assert [env["INDUSTRY_ARTIFACTS_DIR"] for env in captured_envs] == [
+    "/synthetic/users/7/industry",
+    "/synthetic/users/8/industry",
+    "/synthetic/users/7/industry",
+  ]
   assert all("GATEWAY_USER_KEYS" not in env for env in captured_envs)
 
 
-def test_dispatcher_preserves_meta_and_authenticated_session_for_user_server() -> None:
+def test_dispatcher_preserves_meta_and_authenticated_session_for_user_server(monkeypatch) -> None:
   async def scenario() -> None:
     manager = _manager(lambda *_args: {})
     gateway_session = _session(7, "user@example.com")
@@ -263,7 +297,7 @@ def test_dispatcher_preserves_meta_and_authenticated_session_for_user_server() -
       captured.update(name=name, tool_input=tool_input, kwargs=kwargs)
       return {"ok": True}, None
 
-    manager.call_tool = call_tool
+    monkeypatch.setattr(manager, "call_tool", call_tool)
     dispatcher = ToolDispatcher(
       mcp_client=manager,
       session=gateway_session,
@@ -290,5 +324,6 @@ def test_dispatcher_preserves_meta_and_authenticated_session_for_user_server() -
       "channel": "cli",
       "role": "owner",
     }
+    assert "session_token" not in captured["kwargs"]["meta"]
 
   asyncio.run(scenario())

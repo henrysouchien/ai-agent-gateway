@@ -1,6 +1,7 @@
 import asyncio
 import sys
 from pathlib import Path
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -9,8 +10,14 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 import agent_gateway.autonomous as autonomous  # noqa: E402
+from agent_workflow_contracts.tool_registration import McpInputPreparationRoute  # noqa: E402
+from agent_workflow_contracts import AgentOperationRef  # noqa: E402
 from agent_gateway import BoundCapabilityExecution, EventLog  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
+from agent_gateway.operation_catalog import (  # noqa: E402
+  AgentOperationCatalog,
+  ResolvedOperationRuntime,
+)
 from tests.capability_execution_test_support import (  # noqa: E402
   stub_capability_execution_resolver,
 )
@@ -20,11 +27,17 @@ def _run(coro):
   return asyncio.run(coro)
 
 
-class _EmptyOperationCatalog:
-  def resolve_operation(self, _selector):
+class _EmptyOperationCatalog(AgentOperationCatalog):
+  def resolve_operation(
+    self,
+    selector: AgentOperationRef | Mapping[str, Any] | None,
+  ) -> ResolvedOperationRuntime:
+    _ = selector
     raise FileNotFoundError("no operations")
 
-  def list_callable_operations_with_descriptions(self):
+  def list_callable_operations_with_descriptions(
+    self,
+  ) -> Sequence[tuple[AgentOperationRef, str]]:
     return []
 
 
@@ -42,6 +55,7 @@ def _bound_execution() -> dict[str, Any]:
   )
   return {
     "capability_execution": execution,
+    "admitted_skill_execution_limits": None,
     "capability_execution_resolver": resolver,
     "session": GatewaySession(
       session_id="autonomous-mcp-test",
@@ -216,6 +230,12 @@ def test_run_autonomous_forwards_mcp_timeout_overrides_to_manager(
   monkeypatch.setattr(autonomous, "AgentRunner", _StubRunner)
   monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
 
+  route = McpInputPreparationRoute(
+    logical_server_id="market-data-mcp",
+    logical_name="fetch_financials",
+    mode="scalar",
+    keys=("symbol",),
+  )
   _run(
     autonomous.run_autonomous(
       "You are helpful.",
@@ -224,6 +244,7 @@ def test_run_autonomous_forwards_mcp_timeout_overrides_to_manager(
       mcp_servers={"browser": {"command": "python3", "args": ["run_server.py"]}},
       trusted_mcp_allowed_servers={"browser"},
       mcp_timeout_overrides={"browser": 90},
+      mcp_input_preparation_routes=(route,),
       user_id="alice",
       billing_mode="byok",
       rate_table_version="unknown",
@@ -231,6 +252,7 @@ def test_run_autonomous_forwards_mcp_timeout_overrides_to_manager(
   )
 
   assert _FakeMcpClientManager.instances[0].kwargs["timeout_overrides"] == {"browser": 90}
+  assert _FakeMcpClientManager.instances[0].kwargs["input_preparation_routes"] == (route,)
 
 
 def test_run_autonomous_defaults_to_no_injection_and_no_timeout_overrides(
@@ -268,6 +290,7 @@ def test_run_autonomous_defaults_to_no_injection_and_no_timeout_overrides(
 
   assert captured["dispatcher_kwargs"]["mcp_session_inject_servers"] is None
   assert _FakeMcpClientManager.instances[0].kwargs["timeout_overrides"] is None
+  assert _FakeMcpClientManager.instances[0].kwargs["input_preparation_routes"] == ()
 
 
 def test_run_autonomous_forwards_mcp_session_inject_servers_to_sub_agents(

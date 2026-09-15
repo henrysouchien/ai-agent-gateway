@@ -15,6 +15,8 @@ from agent_gateway.tool_dispatch_classification import (  # noqa: E402
   DispatchEntry,
   RetryPolicy,
   build_dispatch_record,
+  build_dispatch_record_for_outcome,
+  build_dispatch_record_from_sources,
   build_route_id,
   classify_semantic_tool_error,
   classify_tool_outcome,
@@ -31,19 +33,28 @@ from agent_gateway.capability_resolution import (  # noqa: E402
 from agent_gateway.tool_dispatch_declarations import (  # noqa: E402
   build_tool_dispatch_declarations,
 )
+from agent_gateway.tool_dispatch_source_identity import (  # noqa: E402
+  read_source_identities,
+)
 from agent_workflow_contracts import CatalogToolEntry  # noqa: E402
+from agent_workflow_contracts.models import CatalogToolEffect  # noqa: E402
 
 
 def _entry(
   tool_name: str = "filings_search",
   *,
-  effect: str | None = "read",
+  effect: CatalogToolEffect | None = "read",
   idempotent: bool | None = True,
   success_signal: dict[str, Any] | None = None,
   source_identity: dict[str, Any] | None = None,
 ) -> DispatchEntry:
-  described = lookup_catalog_entry(tool_name)
   canonical = canonical_dispatch_tool_name(tool_name)
+  described = lookup_catalog_entry(
+    tool_name,
+    origin="mcp",
+    server="research-corpus-mcp",
+    original_tool_name=canonical,
+  )
   return DispatchEntry(
     tool_name=tool_name,
     canonical_name=canonical,
@@ -211,7 +222,9 @@ def test_dispatch_record_carries_outcome_attempts_route_and_plural_sources() -> 
   }
   entry = resolve_dispatch_entry(
     "mcp__research-corpus-mcp__filings_search",
+    origin="mcp",
     server="research-corpus-mcp",
+    original_tool_name="filings_search",
     provider_id=None,
   )
 
@@ -231,12 +244,37 @@ def test_dispatch_record_carries_outcome_attempts_route_and_plural_sources() -> 
   }
 
 
+def test_dispatch_record_detaches_nested_registered_source_fields() -> None:
+  nested = {"factors": {"momentum": "MTUM"}, "peers": ("PAYC", "ADP")}
+
+  record = build_dispatch_record_from_sources(
+    entry=None,
+    outcome="ok",
+    sources=({
+      "document_id": "fms:compute_quantifying_risk:ticker=PCTY",
+      "source_kind": "computation",
+      "key_fields": nested,
+    },),
+  )
+
+  assert record["sources"][0]["key_fields"] == {
+    "factors": {"momentum": "MTUM"},
+    "peers": ["PAYC", "ADP"],
+  }
+  assert record["sources"][0]["key_fields"] is not nested
+
+
 def test_dispatch_record_sources_stay_empty_unless_the_outcome_is_ok() -> None:
   result = {
     "status": "success",
     "hits": [{"document_id": "edgar:0000789019-26-000012", "source": "filing"}],
   }
-  entry = resolve_dispatch_entry("filings_search")
+  entry = resolve_dispatch_entry(
+    "filings_search",
+    origin="mcp",
+    server="research-corpus-mcp",
+    original_tool_name="filings_search",
+  )
 
   ok_record = build_dispatch_record(entry=entry, result=result, error=None)
   failed_record = build_dispatch_record(
@@ -262,6 +300,20 @@ def test_dispatch_record_marks_retries_exhausted_when_asked() -> None:
   assert record["outcome"] == "error_timeout"
   assert record["attempts"] == 3
   assert record["retries_exhausted"] is True
+
+
+def test_dispatch_record_accepts_a_route_owned_settled_outcome() -> None:
+  record = build_dispatch_record_for_outcome(
+    entry=_entry(success_signal={
+      "kind": "status_equals",
+      "field": "status",
+      "values": ["success"],
+    }),
+    result={"status": "partial"},
+    outcome="ok",
+  )
+
+  assert record["outcome"] == "ok"
 
 
 def test_route_id_names_the_route_actually_taken() -> None:
@@ -296,7 +348,7 @@ def test_reads_retry_by_default(outcome: str) -> None:
 
 
 @pytest.mark.parametrize("effect", ["write", "propose", "external_effect", None])
-def test_writes_never_retry(effect: str | None) -> None:
+def test_writes_never_retry(effect: CatalogToolEffect | None) -> None:
   assert retry_decision(_entry(effect=effect), "error_transport", 1) == "settle"
 
 
@@ -327,6 +379,11 @@ def test_retries_are_bounded_at_two() -> None:
   assert retry_decision(entry, "error_transport", 1) == "retry"
   assert retry_decision(entry, "error_transport", 2) == "retry"
   assert retry_decision(entry, "error_transport", 3) == "settle"
+
+  for name in ("fred_list_series", "fred_search"):
+    unavailable = _entry(name, effect=None, idempotent=True)
+    assert unavailable.effect is None
+    assert retry_decision(unavailable, "error_transport", 1) == "settle"
   assert DEFAULT_TOOL_RETRY_POLICY.max_retries == 2
 
 
@@ -361,7 +418,7 @@ def test_backoff_is_jittered_and_bounded() -> None:
 def test_declaration_table_derives_effect_and_never_restates_it() -> None:
   seen: list[str] = []
 
-  def _resolver(tool_name: str) -> str | None:
+  def _resolver(tool_name: str) -> CatalogToolEffect | None:
     seen.append(tool_name)
     return "read"
 
@@ -376,6 +433,8 @@ def test_declaration_table_covers_the_recognized_source_population() -> None:
   table = build_tool_dispatch_declarations(effect_resolver=lambda _name: "read")
 
   recognized = {
+    "code_execute",
+    "code_execute_status",
     "web_fetch",
     "filings_search",
     "transcripts_search",
@@ -396,6 +455,10 @@ def test_declaration_table_covers_the_recognized_source_population() -> None:
 
   assert recognized <= set(table)
   assert all(table[name].source_identity is not None for name in recognized)
+  for name in ("code_execute", "code_execute_status"):
+    assert table[name].source_identity == {"kind": "sandbox_computations"}
+    assert table[name].idempotent is False
+    assert table[name].success_signal is None
   assert table["gsheets_read_range"].success_signal == {
     "kind": "status_equals",
     "field": "status",
@@ -403,8 +466,132 @@ def test_declaration_table_covers_the_recognized_source_population() -> None:
   }
 
 
-def test_declaration_lookup_canonicalizes_namespaced_tool_names() -> None:
-  assert (
-    lookup_catalog_entry("mcp__research-corpus-mcp__filings_search")
-    == lookup_catalog_entry("filings_search")
+def test_sandbox_computation_source_reader_preserves_order_and_current_gates() -> None:
+  descriptor = {"kind": "sandbox_computations"}
+  load = {
+    "function": " load_statements ",
+    "output_sha256": f" {'a' * 64} ",
+    "tool_version": " sourced-statements-v1 ",
+  }
+  render = {
+    "function": "render_sourced_table",
+    "output_sha256": "b" * 64,
+    "tool_version": "sourced-tables-v1",
+  }
+
+  assert read_source_identities(
+    descriptor,
+    {
+      "return_code": 0,
+      "timed_out": False,
+      "computations": [load, {"malformed": True}, render],
+    },
+  ) == (
+    {
+      "document_id": "sandbox:load_statements:sha=aaaaaaaaaaaa",
+      "source_kind": "computation",
+    },
+    {
+      "document_id": "sandbox:render_sourced_table:sha=bbbbbbbbbbbb",
+      "source_kind": "computation",
+    },
   )
+
+  non_sources = (
+    {"status": "running"},
+    {"return_code": 1, "timed_out": False, "computations": [load]},
+    {"return_code": 0, "timed_out": True, "computations": [load]},
+    {
+      "return_code": 0,
+      "timed_out": False,
+      "computations": [{**load, "function": "unknown_helper"}],
+    },
+    {
+      "return_code": 0,
+      "timed_out": False,
+      "computations": [{**load, "output_sha256": " "}],
+    },
+    {
+      "return_code": 0,
+      "timed_out": False,
+      "computations": [{**load, "tool_version": " "}],
+    },
+  )
+  assert all(
+    read_source_identities(descriptor, result) == ()
+    for result in non_sources
+  )
+
+
+def test_fred_declaration_population_marks_only_data_reads_as_vendor_sources() -> None:
+  from api.agent.shared.server_policies import MCP_SERVER_POLICIES
+
+  table = build_tool_dispatch_declarations(
+    effect_resolver=lambda name: "read" if name.startswith("fred_") else None
+  )
+  fred_names = {
+    "fred_get_multiple",
+    "fred_get_series",
+    "fred_list_series",
+    "fred_search",
+  }
+
+  assert {name for name in table if name.startswith("fred_")} == fred_names
+  assert MCP_SERVER_POLICIES["fred-mcp"].read_tools == fred_names
+  for name in fred_names:
+    row = table[name]
+    assert row.effect == "read"
+    assert row.idempotent is True
+    assert row.success_signal is None
+    assert row.source_identity is None
+
+  entry = resolve_dispatch_entry(
+    "fred_search",
+    origin="mcp",
+    server="fred-mcp",
+    original_tool_name="fred_search",
+  )
+  assert entry.catalog_entry is not None
+  assert entry.catalog_entry.capability == "market-data.read/v1"
+  assert classify_tool_outcome(
+    entry,
+    {"status": "error", "error": {"code": "not_found"}},
+    None,
+  ) == "error_semantic"
+  assert retry_decision(entry, "error_transport", 1) == "retry"
+  assert retry_decision(entry, "error_timeout", 1) == "retry"
+  assert retry_decision(entry, "error_rate_limited", 1) == "retry"
+  assert retry_decision(entry, "error_transport", 3) == "settle"
+
+
+def test_broker_session_expired_is_outer_retryable_only_for_declared_reads() -> None:
+  read_entry = _entry(effect="read", idempotent=True)
+  outcome = classify_tool_outcome(
+    read_entry,
+    None,
+    {
+      "code": "mcp_tool_error",
+      "sub_code": "broker_session_expired",
+      "message": "The broker session expired.",
+    },
+  )
+
+  assert outcome == "error_transport"
+  assert retry_decision(read_entry, outcome, 1) == "retry"
+  assert retry_decision(_entry(effect="write"), outcome, 1) == "settle"
+  assert retry_decision(_entry(effect=None), outcome, 1) == "settle"
+
+
+def test_declaration_lookup_requires_explicit_exact_route() -> None:
+  assert lookup_catalog_entry(
+    "mcp__research-corpus-mcp__filings_search",
+    origin="mcp",
+    server="research-corpus-mcp",
+    original_tool_name="filings_search",
+  ) is not None
+  assert lookup_catalog_entry(
+    "filings_search",
+    origin=None,
+    server=None,
+    original_tool_name="filings_search",
+  ) is None

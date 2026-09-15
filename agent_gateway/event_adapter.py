@@ -1,10 +1,18 @@
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Final, Literal, Protocol, get_args
 
 from .control_run_lifecycle import canonical_control_run_state
 from .events import DEFAULT_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
 
+
+# Terminal disposition vocabulary for the stream_complete wire event.  This is
+# the single owner; consumers pivot on "completed" vs everything-else and must
+# not enumerate the set.
+TerminalDisposition = Literal["completed", "interrupted"]
+TERMINAL_DISPOSITIONS: Final[frozenset[str]] = frozenset(
+  get_args(TerminalDisposition)
+)
 
 def _fields(*names: str) -> frozenset[str]:
   return frozenset({"type", "product_id", *names})

@@ -5,11 +5,8 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Mapping, Sequence, Set, Tuple
 
 from .runner_budget import (
-  BudgetCostProgress as BudgetCostProgress,
-  BudgetExceededState as BudgetExceededState,
   ChildCostAccumulator as ChildCostAccumulator,
   CostAccumulator as CostAccumulator,
-  ProviderRequestBudgetAdmission as ProviderRequestBudgetAdmission,
   ProviderRequestBudgetError as ProviderRequestBudgetError,
   admit_provider_request_budget as admit_provider_request_budget,
   budget_cost_progress as budget_cost_progress,
@@ -20,7 +17,7 @@ from .thinking import parse_effort
 
 
 def normalized_run_config(
-  auth_config: Dict[str, Any],
+  auth_config: Mapping[str, Any],
   *,
   upstream_model: str,
   effort: str,
@@ -745,13 +742,15 @@ class RegistryScope:
 class ToolResultContext:
   """Context passed to `on_tool_result` hooks.
 
-  Hooks can inspect the original tool input, the normalized tool result, the
-  emitted result entry, and timing metadata before the runner forwards the tool
-  result back into the model conversation.
+  Hooks can inspect the executed tool input, the runner-owned persistence
+  projection of that input, the normalized tool result, the emitted result
+  entry, and timing metadata before the runner forwards the tool result back
+  into the model conversation.
   """
 
   tool_name: str
   tool_input: Dict[str, Any]
+  redacted_tool_input: Dict[str, Any] | None
   result: Any | None
   error: Dict[str, Any] | None
   duration_ms: int

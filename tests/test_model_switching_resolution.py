@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from fastapi.testclient import TestClient
 
+from agent_gateway import AgentRunner, EventLog, McpClientManager, ToolDispatcher
 from agent_gateway.auth import AuthConfig, ResolverResult
 from agent_gateway.capability_binding import CredentialHandle
-from agent_gateway.capability_execution import MaterializedCredential
+from agent_gateway.capability_execution import (
+  BoundCapabilityExecution,
+  MaterializedCredential,
+)
 from agent_gateway.model_registry import (
   CAPABILITY_IDS,
   INITIAL_MODEL_REGISTRY,
@@ -32,15 +37,44 @@ class _ExactProvider(ModelProvider):
     )
 
 
-class _CompleteRunner:
-  def __init__(self, event_log: Any, calls: list[dict[str, Any]], execution: Any) -> None:
-    self._event_log = event_log
+class _CompleteRunner(AgentRunner):
+  def __init__(
+    self,
+    event_log: EventLog,
+    calls: list[dict[str, Any]],
+    execution: BoundCapabilityExecution,
+    session_id: str,
+  ) -> None:
+    mcp_client = McpClientManager(config_path=None)
+    super().__init__(
+      event_log=event_log,
+      dispatcher=ToolDispatcher(
+        mcp_client=mcp_client,
+        local_tool_handlers={},
+        event_log=event_log,
+        session_id=session_id,
+      ),
+      session_id=session_id,
+      capability_execution=execution,
+      mcp_client=mcp_client,
+      get_tool_definitions=lambda: [],
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="test",
+    )
     self._calls = calls
-    self.capability_execution = execution
 
-  async def run(self, **_: Any) -> None:
-    self._calls.append(self.capability_execution.bind.receipt())
-    self._event_log.append({"type": "stream_complete", "usage": {}})
+  async def run(
+    self,
+    messages: list[dict[str, Any]],
+    system_prompt: str | list[tuple[str, bool]] | None = None,
+    max_turns: int | None = None,
+    *,
+    resume_initial_messages: list[dict[str, Any]] | None = None,
+  ) -> None:
+    _ = messages, system_prompt, max_turns, resume_initial_messages
+    self._calls.append(self.capability_execution.bind.to_json())
+    self._log.append({"type": "stream_complete", "usage": {}})
 
 
 def _make_app():
@@ -89,15 +123,25 @@ def _make_app():
       },
     )
 
-  async def _build_chat_runtime(session, request, channel, auth_manager):
+  async def _build_chat_runtime(session, request, channel, auth_manager, *, storage_root: Path | None = None):
     _ = session, channel, auth_manager
-    return ChatRuntime(
-      system_prompt="system",
-      build_runner=lambda event_log, *_args: _CompleteRunner(
+
+    def _build_runner(
+      event_log: EventLog,
+      session_id: str,
+      started_at: float,
+    ) -> AgentRunner:
+      _ = started_at
+      return _CompleteRunner(
         event_log,
         calls,
         request.capability_execution,
-      ),
+        session_id,
+      )
+
+    return ChatRuntime(
+      system_prompt="system",
+      build_runner=_build_runner,
       capability_execution=request.capability_execution,
     )
 

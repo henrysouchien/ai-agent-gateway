@@ -105,7 +105,7 @@ def rotate_active_if_needed_locked(owner: _RotationOwner) -> None:
       "bytes": active_size,
       "telemetry_source_id": owner._telemetry_source_id("segment", segment_id),
       "rotated_from_source_id": owner._telemetry_source_id("active", f"{active_generation:06d}"),
-      "rotated_from_path": f"../{owner.path.name}",
+      "rotated_from_path": str(owner.path),
       "rotated_from_file_identity": file_identity,
       "created_at": _now_iso(),
       "closed_at": _now_iso(),

@@ -8,7 +8,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 import agent_gateway.runner as gateway_runner  # noqa: E402
-from agent_gateway import AgentRunner, EventLog, ToolDispatcher  # noqa: E402
+from agent_gateway import AgentRunner, EventLog, McpClientManager, ToolDispatcher  # noqa: E402
 from agent_gateway.runner_skill_gate import (  # noqa: E402
   default_tool_definitions,
   effective_excluded_tools,
@@ -22,19 +22,14 @@ from tests.capability_execution_test_support import (  # noqa: E402
 )
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
-    return False
-
-  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
-    return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
-
-  def get_tool_definitions(self) -> list[dict[str, Any]]:
-    return []
+class _NullMcpClient(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
 
 
-class _McpClientWithTools:
+class _McpClientWithTools(McpClientManager):
   def __init__(self, tools: list[dict[str, Any]]) -> None:
+    super().__init__(config_path=None)
     self._tools = tools
 
   def get_tool_definitions(self) -> list[dict[str, Any]]:

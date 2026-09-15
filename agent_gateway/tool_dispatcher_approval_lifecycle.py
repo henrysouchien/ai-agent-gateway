@@ -5,26 +5,35 @@ from copy import deepcopy
 import logging
 import os
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from dataclasses import replace
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, Protocol, TYPE_CHECKING
 
 from . import approval_settings
 from .approval_policy import (
   ApprovalConstraint,
+  ApprovalReuseMode,
+  ApprovalState,
   ApprovalDecision as PolicyApprovalDecision,
   ApprovalRequest as PolicyApprovalRequest,
   RunContext,
   apply_decision_to_request,
   approval_is_executable,
+  approval_reuse_scope_authorized,
+  approval_request_projection,
   build_approval_request,
   call_policy_safely,
   constrain_approval_decision,
-  sha256_args,
   utc_now,
 )
 from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich_trade_approval_args
+from .approval_route import (
+  ApprovalRoute,
+  DurableLocalApprovalRoute,
+  ParentDelegatedApprovalRoute,
+)
 from .batch_approval_projection import (
+  BatchApprovalAdmissionStore,
   abort_unpublished_batch_approval_admission,
   acquire_batch_approval_admission,
   require_batch_stage_run_seq,
@@ -37,6 +46,104 @@ from .secret_boundary import (
   sanitize_boundary_value,
   sanitization_failure_tool_input,
 )
+from .skill_limits import reconcile_skill_admission
+from .tool_redaction import resolve_redaction_provider
+
+if TYPE_CHECKING:
+  from .prepared_business_model_store import PreparedBusinessModelChange
+
+
+class ApprovalWaitStore(Protocol):
+  """Durable methods called while waiting for an approval winner."""
+
+  async def get(
+    self,
+    approval_id: str,
+  ) -> PolicyApprovalRequest | None: ...
+
+  async def transition_state(
+    self,
+    approval_id: str,
+    state: ApprovalState,
+    *,
+    expected_state_version: int | None = None,
+    expires_at: datetime | None = None,
+    decider_id: str | None = None,
+    decider_role: str | None = None,
+    decision: str | None = None,
+    decision_reason: str | None = None,
+  ) -> PolicyApprovalRequest: ...
+
+
+class ApprovalLifecycleStore(ApprovalWaitStore, Protocol):
+  """Durable methods called by one local approval lifecycle."""
+
+  async def create(
+    self,
+    request: PolicyApprovalRequest,
+  ) -> PolicyApprovalRequest: ...
+
+  async def create_raw_patch_authorization(
+    self,
+    request: PolicyApprovalRequest,
+    *,
+    prepared_payload: bytes,
+  ) -> PolicyApprovalRequest: ...
+
+  async def create_or_get_with_prepared_business_model_change(
+    self,
+    request: PolicyApprovalRequest,
+    record: PreparedBusinessModelChange,
+  ) -> tuple[
+    PolicyApprovalRequest,
+    PreparedBusinessModelChange,
+    bool,
+  ]: ...
+
+  async def update_request(
+    self,
+    request: PolicyApprovalRequest,
+  ) -> PolicyApprovalRequest: ...
+
+  async def get_prepared_business_model_change(
+    self,
+    *,
+    caller_kind: str,
+    user_scope: str,
+    idempotency_locator: str,
+  ) -> PreparedBusinessModelChange | None: ...
+
+  async def enqueue_pending_approval_notification(
+    self,
+    request: PolicyApprovalRequest,
+  ) -> dict[str, Any] | None: ...
+
+  def schedule_approval_notification_delivery(
+    self,
+    *,
+    limit: int = 50,
+  ) -> bool: ...
+
+
+class ApprovalLifecyclePolicy(Protocol):
+  """Policy callback invoked after this lifecycle resolves a request."""
+
+  async def on_resolve(
+    self,
+    *,
+    request: PolicyApprovalRequest,
+  ) -> None: ...
+
+
+class _ApprovalLifecycleAuthority(
+  ApprovalLifecycleStore,
+  BatchApprovalAdmissionStore,
+  Protocol,
+):
+  """The route aggregate needed to reach both lifecycle-local gates."""
+
+
+_redaction = resolve_redaction_provider()
 
 
 _APPROVAL_EXECUTABLE_STATES = frozenset({
@@ -48,6 +155,13 @@ _APPROVAL_DENIED_STATES = frozenset({
   "auto_denied",
 })
 _APPROVAL_WINNER_DELIVERY_TIMEOUT_SECONDS = 30.0
+# The durable pending_user window the parent's ledger already applies; the
+# delegated wait is bounded by the same expiry the operator sees.
+_DELEGATED_APPROVAL_EXPIRY_SECONDS = 600.0
+
+
+class ApprovalSkillAdmissionMismatch(ValueError):
+  pass
 
 
 def _approval_wait_timeout_seconds(
@@ -101,7 +215,7 @@ def _require_exact_reconciled_approval(
 
 async def _reconcile_approval_timeout_winner(
   *,
-  approval_store: Any,
+  approval_store: ApprovalWaitStore,
   approval_queue: asyncio.Queue,
   request: PolicyApprovalRequest,
 ) -> dict[str, Any] | None:
@@ -170,10 +284,84 @@ async def _reconcile_approval_timeout_winner(
   )
 
 
+async def _run_delegated_approval_lifecycle(
+  *,
+  request: PolicyApprovalRequest,
+  tool_input: dict[str, Any],
+  qualifier: str,
+  reason: str | None,
+  await_user_approval_via_pending_tools_fn: Any,
+  utc_now_fn: Any,
+  os_urandom_fn: Any,
+  run_context: RunContext,
+) -> dict[str, Any]:
+  """Author the request here; the parent records the row and decides it.
+
+  This run owns no ledger and no policy, so nothing durable is written and no
+  policy is evaluated: the request is projected onto the event frame the parent
+  drains, and the wait is bounded by the same durable expiry the operator sees.
+  """
+
+  expires_at = request.requested_at + timedelta(
+    seconds=_DELEGATED_APPROVAL_EXPIRY_SECONDS
+  )
+  request = replace(
+    request,
+    state="pending_user",
+    expires_at=expires_at,
+    authorization_mode="HUMAN",
+  )
+  decision = PolicyApprovalDecision(
+    outcome="request_user_approval",
+    reason=reason or "",
+    expiry_seconds=_DELEGATED_APPROVAL_EXPIRY_SECONDS,
+    allow_persistent_grant=False,
+  )
+  nonce = os_urandom_fn(8).hex()
+  approval = await await_user_approval_via_pending_tools_fn(
+    request,
+    decision,
+    nonce=nonce,
+    resolved_qualifier=qualifier,
+    allow_persistent=False,
+    timeout_seconds=_DELEGATED_APPROVAL_EXPIRY_SECONDS,
+    durable_request=approval_request_projection(request),
+  )
+  if approval is None:
+    return {
+      "approved": False,
+      "allow_tool_type": False,
+      "request": request,
+      "timeout": True,
+    }
+  if approval.get("approval_id") != request.approval_id:
+    raise RuntimeError(
+      "delegated approval decision named a different approval"
+    )
+  approved = approval.get("approved")
+  if type(approved) is not bool:
+    raise RuntimeError(
+      "delegated approval decision carried an invalid outcome"
+    )
+  request = replace(
+    request,
+    state="approved" if approved else "denied",
+    decision="approved" if approved else "denied",
+    decided_at=utc_now_fn(),
+    decider_id=run_context.user_id,
+    decider_role=run_context.decider_role,
+  )
+  return {
+    "approved": approved,
+    "allow_tool_type": False,
+    "request": request,
+    "tool_input": tool_input,
+  }
+
+
 async def run_approval_lifecycle(
   *,
-  store: Any | None,
-  policy: Any | None,
+  route: ApprovalRoute,
   session: Any | None,
   tool_call_id: str,
   tool_name: str,
@@ -183,6 +371,8 @@ async def run_approval_lifecycle(
   allow_persistent: bool,
   approval_constraint: ApprovalConstraint = "standard",
   required_owner_user_id: str | None = None,
+  approval_reuse_mode: ApprovalReuseMode = "legacy",
+  approval_reuse_key: str | None = None,
   approval_identity: Mapping[str, Any] | None = None,
   prepared_authorization_payload: bytes | None = None,
   prepared_business_model_change: Mapping[str, Any] | None = None,
@@ -194,7 +384,7 @@ async def run_approval_lifecycle(
   automatic_denial_reason: str | None = None,
   deny_user_prompt: bool = False,
   resolve_run_context_fn: Any,
-  current_skill_fn: Any,
+  current_skill_admission_fn: Any,
   redact_for_approval_request_fn: Any,
   resolve_tool_class_fn: Any,
   effective_trade_approval_decision_fn: Any,
@@ -223,8 +413,10 @@ async def run_approval_lifecycle(
 
 async def _run_approval_lifecycle_impl(
   *,
-  store: Any | None,
-  policy: Any | None,
+  route: ApprovalRoute[
+    _ApprovalLifecycleAuthority,
+    ApprovalLifecyclePolicy,
+  ],
   session: Any | None,
   tool_call_id: str,
   tool_name: str,
@@ -234,6 +426,8 @@ async def _run_approval_lifecycle_impl(
   allow_persistent: bool,
   approval_constraint: ApprovalConstraint = "standard",
   required_owner_user_id: str | None = None,
+  approval_reuse_mode: ApprovalReuseMode = "legacy",
+  approval_reuse_key: str | None = None,
   approval_identity: Mapping[str, Any] | None = None,
   prepared_authorization_payload: bytes | None = None,
   prepared_business_model_change: Mapping[str, Any] | None = None,
@@ -245,7 +439,7 @@ async def _run_approval_lifecycle_impl(
   automatic_denial_reason: str | None = None,
   deny_user_prompt: bool = False,
   resolve_run_context_fn: Any,
-  current_skill_fn: Any,
+  current_skill_admission_fn: Any,
   redact_for_approval_request_fn: Any,
   resolve_tool_class_fn: Any,
   effective_trade_approval_decision_fn: Any,
@@ -259,12 +453,32 @@ async def _run_approval_lifecycle_impl(
   batch_admission: Any | None = None,
   secret_boundary: SecretBoundary | None = None,
 ) -> dict[str, Any]:
-  if store is None or policy is None:
-    raise RuntimeError("approval lifecycle is not configured")
+  if isinstance(route, ParentDelegatedApprovalRoute):
+    store = None
+    policy = None
+  elif isinstance(route, DurableLocalApprovalRoute):
+    store = route.store
+    policy = route.policy
+  else:
+    raise RuntimeError("approval lifecycle has no admitted route")
   run_context = resolve_run_context_fn()
-  active_skill = current_skill_fn()
-  if active_skill and run_context.skill is None:
-    run_context = replace(run_context, skill=active_skill)
+  active_admission = current_skill_admission_fn()
+  try:
+    reconciled_admission = reconcile_skill_admission(
+      skill_name=run_context.skill,
+      execution_limits=run_context.admitted_skill_execution_limits,
+      active_admission=active_admission,
+    )
+  except (TypeError, ValueError) as exc:
+    raise ApprovalSkillAdmissionMismatch(str(exc)) from exc
+  if reconciled_admission is not None:
+    run_context = replace(
+      run_context,
+      skill=reconciled_admission.skill_name,
+      admitted_skill_execution_limits=(
+        reconciled_admission.execution_limits
+      ),
+    )
   if (approval_args_redacted is None) is not (approval_args_hash is None):
     raise ValueError("approval argument override requires redacted args and hash")
   if approval_args_hash is None:
@@ -296,6 +510,8 @@ async def _run_approval_lifecycle_impl(
     "reason": safe_reason,
     "approval_constraint": approval_constraint,
     "required_owner_user_id": required_owner_user_id,
+    "approval_reuse_mode": approval_reuse_mode,
+    "approval_reuse_key": approval_reuse_key,
   }
   if approval_identity is not None:
     build_request_kwargs["approval_identity"] = approval_identity
@@ -307,6 +523,8 @@ async def _run_approval_lifecycle_impl(
   if resume_approval_request is not None and (
     request.approval_constraint != approval_constraint
     or request.required_owner_user_id != required_owner_user_id
+    or request.approval_reuse_mode != approval_reuse_mode
+    or request.approval_reuse_key != approval_reuse_key
   ):
     raise RuntimeError(
       "prepared approval constraint changed; replan and reauthorize"
@@ -318,6 +536,9 @@ async def _run_approval_lifecycle_impl(
   elif request.approval_constraint == "fresh_human_owner":
     session_cache_approved = False
     automatic_approval_reason = None
+    allow_persistent = False
+  if request.approval_reuse_mode == "disabled":
+    session_cache_approved = False
     allow_persistent = False
   if batch_admission is not None:
     batch_admission.bind_request(request=request, store=store)
@@ -338,13 +559,33 @@ async def _run_approval_lifecycle_impl(
       policy_version=str(policy_version),
     )
     if session_cache_approved:
+      cache_reference = (
+        request.approval_reuse_key
+        if request.approval_reuse_mode == "exact"
+        else f"session-cache:{tool_name}:{qualifier}"
+      )
       request = replace(
         request,
         authorization_mode="CACHE_HIT",
-        cache_reference=f"session-cache:{tool_name}:{qualifier}",
+        cache_reference=cache_reference,
       )
     elif automatic_approval_reason is not None:
       request = replace(request, authorization_mode="AUTO_ALLOW")
+  if isinstance(route, ParentDelegatedApprovalRoute):
+    return await _run_delegated_approval_lifecycle(
+      request=request,
+      tool_input=tool_input,
+      qualifier=qualifier,
+      reason=safe_reason,
+      await_user_approval_via_pending_tools_fn=(
+        await_user_approval_via_pending_tools_fn
+      ),
+      utc_now_fn=utc_now_fn,
+      os_urandom_fn=os_urandom_fn,
+      run_context=run_context,
+    )
+  store = route.store
+  policy = route.policy
   if resume_approval_request is not None:
     if prepared_business_model_change is None:
       raise RuntimeError("prepared approval resume requires its BusinessModel identity")
@@ -411,7 +652,7 @@ async def _run_approval_lifecycle_impl(
     create_bound = getattr(store, "create_raw_patch_authorization", None)
     if not callable(create_bound):
       raise RuntimeError("approval store cannot persist prepared authorization bytes")
-    await create_bound(
+    await store.create_raw_patch_authorization(
       request,
       prepared_payload=prepared_authorization_payload,
     )
@@ -487,6 +728,7 @@ async def _run_approval_lifecycle_impl(
     sink="approval_decision",
     boundary=secret_boundary,
   )
+  policy_modified_tool_args = raw_modified_tool_args is not None
   request = apply_decision_to_request_fn(request, decision)
   await store.update_request(request)
   final_tool_input = (
@@ -494,7 +736,7 @@ async def _run_approval_lifecycle_impl(
     if raw_modified_tool_args is not None
     else tool_input
   )
-  policy_modified_tool_args = raw_modified_tool_args is not None
+  allow_persistent = allow_persistent and not policy_modified_tool_args
 
   if decision.outcome == "auto_approve":
     request = await store.transition_state(
@@ -593,6 +835,7 @@ async def _run_approval_lifecycle_impl(
     "allow_tool_type": (
       executable
       and request.approval_constraint == "standard"
+      and approval_reuse_scope_authorized(request)
       and bool(approval.get("allow_tool_type"))
     ),
     "request": request,
@@ -604,8 +847,8 @@ async def _run_approval_lifecycle_impl(
 async def await_user_approval_via_pending_tools(
   *,
   session: Any | None,
-  approval_store: Any | None,
-  event_log: Any | None,
+  approval_store: ApprovalWaitStore | None,
+  append_event_fn: Callable[[dict[str, Any]], Any] | None,
   request: PolicyApprovalRequest,
   decision: PolicyApprovalDecision,
   nonce: str,
@@ -614,6 +857,7 @@ async def await_user_approval_via_pending_tools(
   timeout_seconds: float,
   log: logging.Logger,
   batch_admission: Any | None = None,
+  durable_request: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
   if session is None:
     return None
@@ -658,8 +902,12 @@ async def await_user_approval_via_pending_tools(
   }
   if batch_admission is not None:
     approval_event["stage_run_seq"] = pending_entry["stage_run_seq"]
-  if event_log is not None:
-    event_log.append(approval_event)
+  if durable_request is not None:
+    # The delegated route's up-path: the parent creates the durable row from
+    # this projection before the frame becomes operator-visible.
+    approval_event["durable_request"] = durable_request
+  if append_event_fn is not None:
+    append_event_fn(approval_event)
   session_log = getattr(session, "agent_session_log", None)
   if session_log is not None:
     try:
@@ -691,25 +939,29 @@ def redact_for_approval_request(
   *,
   event_log: Any | None,
   enrich_trade_approval_args_fn: Any = enrich_trade_approval_args,
-  sha256_args_fn: Any = sha256_args,
 ) -> tuple[dict[str, Any], str]:
-  try:
-    from agent.shared.tool_redaction import get_audit_hmac_secret, get_audit_hmac_key_id, hmac_value, redact_tool_input
+  secret = _redaction.get_audit_hmac_secret()
+  key_id = _redaction.get_audit_hmac_key_id()
+  redacted = _redaction.redact_tool_input(
+    tool_name,
+    tool_input,
+    deployment_secret=secret,
+    key_id=key_id,
+    redaction_scope="fresh_raw",
+  )
+  redacted = enrich_trade_approval_args_fn(tool_name, redacted, event_log=event_log)
+  args_hash = hash_approval_arguments(tool_input)
+  return redacted, args_hash
 
-    secret = get_audit_hmac_secret()
-    key_id = get_audit_hmac_key_id()
-    redacted = redact_tool_input(
-      tool_name,
-      tool_input,
-      deployment_secret=secret,
-      key_id=key_id,
-      redaction_scope="fresh_raw",
-    )
-    redacted = enrich_trade_approval_args_fn(tool_name, redacted, event_log=event_log)
-    args_hash = hmac_value(tool_input, deployment_secret=secret, key_id=key_id)
-    return redacted, args_hash
-  except Exception:
-    return {}, sha256_args_fn(tool_input)
+
+def hash_approval_arguments(tool_input: dict[str, Any]) -> str:
+  secret = _redaction.get_audit_hmac_secret()
+  key_id = _redaction.get_audit_hmac_key_id()
+  return _redaction.hmac_value(
+    tool_input,
+    deployment_secret=secret,
+    key_id=key_id,
+  )
 
 
 def approval_transport_input(
@@ -730,7 +982,7 @@ def resolve_run_context(
   channel: str | None,
   role: str | None,
   session_id: str,
-  approval_policy: Any | None,
+  approval_policy: object | None,
 ) -> RunContext:
   if run_context is not None:
     owner_user_id = str(getattr(session, "owner_user_id", None) or "").strip()
@@ -781,13 +1033,6 @@ def resolve_tool_class(
   )
   if cls:
     return cls
-  try:
-    from agent.shared.tool_catalog import GATED_ADDIN_TOOLS
-
-    if tool_name in GATED_ADDIN_TOOLS:
-      return "artifact_write"
-  except Exception:
-    pass
   return "state_write"
 
 

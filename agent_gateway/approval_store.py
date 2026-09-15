@@ -13,7 +13,7 @@ import stat
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Protocol
+from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, TYPE_CHECKING
 
 from . import approval_store_rows as _rows
 from . import prepared_business_model_store as _prepared_bm
@@ -28,6 +28,7 @@ from .approval_notifications import (
 )
 from .approval_policy import (
   ApprovalRequest,
+  ApprovalReuseMode,
   ApprovalState,
   ApprovalVote,
   DelegationGrant,
@@ -35,6 +36,28 @@ from .approval_policy import (
   revalidate_approval_request,
   utc_now,
 )
+
+if TYPE_CHECKING:
+  from .approval_audit import AuditEventType
+
+
+class _ApprovalAuditEmitter(Protocol):
+  async def emit_audit_for_lifecycle_event(
+    self,
+    *,
+    event_type: AuditEventType,
+    request: ApprovalRequest,
+    raw_tool_args: dict[str, Any],
+    vote: ApprovalVote | None = None,
+    grant: PersistentGrant | None = None,
+    outcome: Literal["success", "tool_error", "cancelled"] | None = None,
+    error_summary: str | None = None,
+    pending_tools_nonce: str | None = None,
+    skill: str | None = None,
+    entry_id: str | None = None,
+    event_ts: datetime | None = None,
+    boundary_sanitizer: Callable[[Any, str], Any] | None = None,
+  ) -> None: ...
 
 
 TERMINAL_STATES = frozenset({"auto_approved", "auto_denied", "approved", "denied", "expired"})
@@ -525,7 +548,10 @@ def _autonomous_approval_audit_entry_id(
 def _approval_vote_from_row(row: sqlite3.Row) -> ApprovalVote:
   decision = str(row["decision"])
   decided_at = _dt_from_text(str(row["decided_at"]))
-  if decision not in {"approved", "denied"} or decided_at is None:
+  if (
+    decision != "approved"
+    and decision != "denied"
+  ) or decided_at is None:
     raise RuntimeError(
       "autonomous approval delivery vote row is invalid"
     )
@@ -869,14 +895,6 @@ class ApprovalRequestStore(Protocol):
     decision: str | None = None,
     decision_reason: str | None = None,
   ) -> ApprovalRequest: ...
-  async def force_deny_pending(
-    self,
-    approval_id: str,
-    *,
-    decider_id: str,
-    decider_role: str | None = None,
-    decision_reason: str | None = None,
-  ) -> tuple[ApprovalRequest, bool]: ...
   async def terminalize_pending_for_cancellation(
     self,
     approval_id: str,
@@ -914,6 +932,8 @@ class ApprovalRequestStore(Protocol):
     scope_hint: str,
     now: datetime | None = None,
     approval_constraint: str = "standard",
+    approval_reuse_mode: ApprovalReuseMode = "legacy",
+    approval_reuse_key: str | None = None,
   ) -> PersistentGrant | None: ...
   async def revoke_persistent_grant(self, grant_id: str, *, revoked_at: datetime | None = None) -> None: ...
   async def revoke_persistent_grants_for_approval(
@@ -969,7 +989,7 @@ class SQLiteApprovalStore:
     self,
     path: str | os.PathLike[str],
     *,
-    audit_emitter: Any | None = None,
+    audit_emitter: _ApprovalAuditEmitter | None = None,
     notification_destination_resolver: ApprovalNotificationDestinationResolver | None = None,
     notification_sender: ApprovalNotificationSender | None = None,
     expected_device: int | None = None,
@@ -1007,7 +1027,7 @@ class SQLiteApprovalStore:
       raise RuntimeError("approval store file identity changed")
     self._device = initial_stat.st_dev
     self._inode = initial_stat.st_ino
-    self._audit_emitter = audit_emitter
+    self._audit_emitter: _ApprovalAuditEmitter | None = audit_emitter
     self._notification_destination_resolver = notification_destination_resolver
     self._notification_sender = notification_sender
     self._notification_delivery_task: asyncio.Task | None = None
@@ -1015,7 +1035,7 @@ class SQLiteApprovalStore:
     self._init_schema()
 
   @property
-  def audit_emitter(self) -> Any | None:
+  def audit_emitter(self) -> _ApprovalAuditEmitter | None:
     return self._audit_emitter
 
   def _require_bound_file(self) -> os.stat_result:
@@ -1145,6 +1165,17 @@ class SQLiteApprovalStore:
           authorization_mode TEXT NOT NULL DEFAULT 'HUMAN',
           grant_reference TEXT,
           cache_reference TEXT,
+          approval_reuse_mode TEXT NOT NULL DEFAULT 'legacy'
+            CHECK (approval_reuse_mode IN ('legacy', 'disabled', 'exact')),
+          approval_reuse_key TEXT,
+          CHECK (
+            (approval_reuse_mode = 'exact'
+              AND approval_reuse_key IS NOT NULL
+              AND length(trim(approval_reuse_key)) > 0)
+            OR
+            (approval_reuse_mode IN ('legacy', 'disabled')
+              AND approval_reuse_key IS NULL)
+          ),
           CHECK (
             (approval_constraint = 'fresh_human_owner'
               AND required_owner_user_id IS NOT NULL
@@ -1392,6 +1423,8 @@ class SQLiteApprovalStore:
         "authorization_mode": "TEXT NOT NULL DEFAULT 'HUMAN'",
         "grant_reference": "TEXT",
         "cache_reference": "TEXT",
+        "approval_reuse_mode": "TEXT NOT NULL DEFAULT 'legacy'",
+        "approval_reuse_key": "TEXT",
       }
       for column_name, column_type in identity_columns.items():
         if column_name not in columns:
@@ -1420,7 +1453,8 @@ class SQLiteApprovalStore:
             identity_source, change_set_id, change_hash,
             base_vector_hash, reviewed_change_binding_digest,
             review_reference_json, execution_semantics_digest,
-            authorization_mode, grant_reference, cache_reference
+            authorization_mode, grant_reference, cache_reference,
+            approval_reuse_mode, approval_reuse_key
           ) VALUES (
             :approval_id, :tool_call_id, :parent_approval_id, :approval_chain_id,
             :delegation_id, :request_id, :session_id, :run_id, :user_id, :profile, :channel,
@@ -1433,7 +1467,8 @@ class SQLiteApprovalStore:
             :identity_source, :change_set_id, :change_hash,
             :base_vector_hash, :reviewed_change_binding_digest,
             :review_reference_json, :execution_semantics_digest,
-            :authorization_mode, :grant_reference, :cache_reference
+            :authorization_mode, :grant_reference, :cache_reference,
+            :approval_reuse_mode, :approval_reuse_key
           )
       """,
       self._request_to_row(request),
@@ -1500,6 +1535,8 @@ class SQLiteApprovalStore:
           if (
             stored.approval_constraint != request.approval_constraint
             or stored.required_owner_user_id != request.required_owner_user_id
+            or stored.approval_reuse_mode != request.approval_reuse_mode
+            or stored.approval_reuse_key != request.approval_reuse_key
           ):
             raise ValueError(
               "approval constraint conflicts with existing tool-call identity"
@@ -1549,6 +1586,10 @@ class SQLiteApprovalStore:
               != request.approval_constraint
               or stored_request.required_owner_user_id
               != request.required_owner_user_id
+              or stored_request.approval_reuse_mode
+              != request.approval_reuse_mode
+              or stored_request.approval_reuse_key
+              != request.approval_reuse_key
             ):
               raise _prepared_bm.PreparedBusinessModelError(
                 "approval tool-call identity conflicts with prepared BusinessModel intent"
@@ -1621,6 +1662,8 @@ class SQLiteApprovalStore:
           "reviewed_change_binding_digest",
           "review_reference",
           "execution_semantics_digest",
+          "approval_reuse_mode",
+          "approval_reuse_key",
         )
         if any(
           getattr(current, field_name) != getattr(request, field_name)
@@ -1720,72 +1763,6 @@ class SQLiteApprovalStore:
         conn.commit()
     await self._emit(self._event_type_for_state(updated.state), updated)
     return updated
-
-  async def force_deny_pending(
-    self,
-    approval_id: str,
-    *,
-    decider_id: str,
-    decider_role: str | None = None,
-    decision_reason: str | None = None,
-  ) -> tuple[ApprovalRequest, bool]:
-    """Atomically deny a still-pending request for terminal runtime teardown.
-
-    This is deliberately distinct from a vote: cancelling the runtime that owns
-    an approval must close the durable request regardless of its quorum size.
-    A terminal decision that wins the store lock is never overwritten.
-    """
-    transitioned = False
-    async with self._lock:
-      with self._connection() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        current_row = conn.execute(
-          "SELECT * FROM approval_requests WHERE approval_id = ?",
-          (approval_id,),
-        ).fetchone()
-        if current_row is None:
-          raise KeyError(f"approval request not found: {approval_id}")
-        current = self._row_to_request(current_row)
-        if current.state in TERMINAL_STATES:
-          conn.commit()
-          return current, False
-        if current.state != "pending_user":
-          raise RuntimeError(
-            f"approval request is not pending_user: {approval_id} ({current.state})"
-          )
-        if _raw_patch_auth.get_claim(conn, approval_id=approval_id) is not None:
-          raise _raw_patch_auth.RawPatchAuthorizationError(
-            "claimed raw patch approval cannot transition"
-          )
-        updated = replace(
-          current,
-          state="denied",
-          state_version=current.state_version + 1,
-          decided_at=utc_now(),
-          decider_id=decider_id,
-          decider_role=decider_role,
-          decision="denied",
-          decision_reason=decision_reason,
-        )
-        conn.execute(
-          """
-          UPDATE approval_requests SET
-            state = :state,
-            state_version = :state_version,
-            decided_at = :decided_at,
-            decider_id = :decider_id,
-            decider_role = :decider_role,
-            decision = :decision,
-            decision_reason = :decision_reason
-          WHERE approval_id = :approval_id
-          """,
-          self._request_to_row(updated),
-        )
-        conn.commit()
-        transitioned = True
-    if transitioned:
-      await self._emit(self._event_type_for_state(updated.state), updated)
-    return updated, transitioned
 
   async def terminalize_pending_for_cancellation(
     self,
@@ -2394,17 +2371,13 @@ class SQLiteApprovalStore:
             "autonomous approval delivery audit receipt mismatch"
           )
 
-    emit = getattr(
-      self._audit_emitter,
-      "emit_audit_for_lifecycle_event",
-      None,
-    )
-    if not callable(emit):
+    emitter = self._audit_emitter
+    if emitter is None:
       raise RuntimeError(
         "autonomous approval delivery durable audit is unavailable"
       )
     if vote is not None:
-      await emit(
+      await emitter.emit_audit_for_lifecycle_event(
         event_type="vote_recorded",
         request=request,
         raw_tool_args={},
@@ -2414,7 +2387,7 @@ class SQLiteApprovalStore:
         entry_id=expected_vote_entry_id,
         event_ts=vote.decided_at,
       )
-    await emit(
+    await emitter.emit_audit_for_lifecycle_event(
       event_type=expected_state,
       request=request,
       raw_tool_args={},
@@ -3287,6 +3260,11 @@ class SQLiteApprovalStore:
           or source.user_id != grant.user_id
           or source.tool_name != grant.tool_name
           or source.persistent_grant_scope != grant.scope_hint
+          or source.approval_reuse_mode == "disabled"
+          or (
+            source.approval_reuse_mode == "exact"
+            and source.approval_reuse_key != grant.scope_hint
+          )
         ):
           raise ValueError(
             "approval constraint does not permit persistent grant minting"
@@ -3327,20 +3305,46 @@ class SQLiteApprovalStore:
     scope_hint: str,
     now: datetime | None = None,
     approval_constraint: str = "standard",
+    approval_reuse_mode: ApprovalReuseMode = "legacy",
+    approval_reuse_key: str | None = None,
   ) -> PersistentGrant | None:
     if approval_constraint != "standard":
       return None
+    if approval_reuse_mode == "disabled":
+      return None
+    if approval_reuse_mode == "exact":
+      if (
+        not isinstance(approval_reuse_key, str)
+        or not approval_reuse_key
+        or approval_reuse_key != approval_reuse_key.strip()
+      ):
+        raise ValueError("exact approval reuse requires a non-empty key")
+      source_clause = (
+        "AND source.approval_reuse_mode = 'exact' "
+        "AND source.approval_reuse_key = ?"
+      )
+      source_parameters: tuple[str, ...] = (approval_reuse_key,)
+    elif approval_reuse_mode == "legacy":
+      if approval_reuse_key is not None:
+        raise ValueError("legacy approval reuse cannot carry a key")
+      source_clause = "AND source.approval_reuse_mode = 'legacy'"
+      source_parameters = ()
+    else:
+      raise ValueError("unsupported approval_reuse_mode")
     now_text = _dt_to_text(now or utc_now())
     async with self._lock:
       with self._connection() as conn:
         row = conn.execute(
-          """
+          f"""
           SELECT grants.* FROM persistent_grants AS grants
+          JOIN approval_requests AS source
+            ON source.approval_id = grants.granted_via_approval_id
           WHERE grants.user_id = ?
             AND grants.tool_name = ?
             AND grants.scope_hint = ?
             AND grants.revoked_at IS NULL
             AND (grants.expires_at IS NULL OR grants.expires_at > ?)
+            {source_clause}
             AND NOT EXISTS (
               SELECT 1 FROM persistent_grant_cancellation_fences AS fences
               WHERE fences.approval_id = grants.granted_via_approval_id
@@ -3348,7 +3352,7 @@ class SQLiteApprovalStore:
           ORDER BY grants.granted_at DESC
           LIMIT 1
           """,
-          (user_id, tool_name, scope_hint, now_text),
+          (user_id, tool_name, scope_hint, now_text, *source_parameters),
         ).fetchone()
     return self._row_to_grant(row) if row is not None else None
 
@@ -4641,11 +4645,9 @@ async def expire_pending_loop(store: ApprovalRequestStore, *, interval_seconds: 
   prepared_cursor: PreparedReconciliationCursor | None = None
   while True:
     await asyncio.sleep(interval_seconds)
-    maintain = getattr(store, "maintain_pending", None)
-    if not callable(maintain):
-      await store.expire_pending()
-      continue
-    result = await maintain(prepared_cursor=prepared_cursor)
+    result = await store.maintain_pending(
+      prepared_cursor=prepared_cursor
+    )
     prepared_cursor = result.prepared.cursor
     fields = {
       "approvals_expired": result.approvals_expired,

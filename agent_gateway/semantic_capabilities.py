@@ -23,6 +23,7 @@ from agent_workflow_contracts import (
   TypedInputCapabilityBinding,
   sha256_digest,
 )
+from agent_workflow_contracts.models import CatalogToolEffect
 
 
 class SemanticCapabilityCompilationError(ValueError):
@@ -32,7 +33,7 @@ class SemanticCapabilityCompilationError(ValueError):
 @dataclass(frozen=True, slots=True)
 class SemanticCapabilitySpec:
   name: str
-  live_tool_effects: frozenset[str] = frozenset()
+  live_tool_effects: frozenset[CatalogToolEffect] = frozenset()
   typed_input_contracts: tuple[ContractRef, ...] = ()
 
 
@@ -41,7 +42,7 @@ class SemanticToolRoute:
   """One exact, server-private tool route inside an operation ceiling."""
 
   tool_id: str
-  effect: str
+  effect: CatalogToolEffect
   server_id: str | None = None
   capability: str | None = None
 

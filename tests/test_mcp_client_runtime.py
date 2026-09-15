@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 
 import asyncio
+import logging
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -16,16 +17,19 @@ from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.mcp_client_runtime import extract_text, read_claude_config
 
 
-class _CaptureLogger:
+class _CaptureLogger(logging.Logger):
   def __init__(self) -> None:
+    super().__init__("_capture")
     self.debugs: list[tuple[object, ...]] = []
     self.warnings: list[tuple[object, ...]] = []
 
-  def debug(self, message, *args) -> None:
-    self.debugs.append((message, *args))
+  def debug(self, msg: object, *args: object, **kwargs: object) -> None:
+    _ = kwargs
+    self.debugs.append((msg, *args))
 
-  def warning(self, message, *args) -> None:
-    self.warnings.append((message, *args))
+  def warning(self, msg: object, *args: object, **kwargs: object) -> None:
+    _ = kwargs
+    self.warnings.append((msg, *args))
 
 
 def test_extract_text_matches_parent_private_wrapper() -> None:
@@ -97,8 +101,10 @@ def test_parent_suppression_wrapper_uses_parent_filter_alias_and_logger(monkeypa
 
   assert events[0] == ("logger", "mcp.os.posix.utilities")
   assert events[1] == "filter_init"
+  assert isinstance(events[2], tuple)
   assert events[2][0] == "add"
   assert events[3] == "inside"
+  assert isinstance(events[4], tuple)
   assert events[4][0] == "remove"
   assert events[2][1] is events[4][1]
 
@@ -109,6 +115,7 @@ def test_parent_cancel_tool_call_uses_parent_consume_callback(monkeypatch) -> No
   async def stubborn_task() -> str:
     try:
       await asyncio.sleep(60)
+      return "completed"
     except asyncio.CancelledError:
       await asyncio.sleep(0.02)
       return "late"

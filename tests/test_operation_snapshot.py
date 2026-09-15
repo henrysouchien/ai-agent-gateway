@@ -178,11 +178,9 @@ def test_builder_rejects_non_sequence_or_unordered_collection_shapes(
     "execution_class": "analysis",
   }
 
+  arguments[field_name] = malformed_value
   with pytest.raises(TypeError, match=field_name):
-    build_agent_operation_snapshot(
-      **arguments,
-      **{field_name: malformed_value},
-    )
+    build_agent_operation_snapshot(**arguments)
 
 
 def test_composed_prompt_accepts_exact_snapshot_text_bound() -> None:

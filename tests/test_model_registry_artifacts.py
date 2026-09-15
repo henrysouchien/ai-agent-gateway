@@ -115,16 +115,20 @@ def _auth(model_keys: frozenset[str]) -> AuthContext:
 
 
 _EXPECTED_EXECUTION_IDENTITIES = {
+  "anthropic.claude-fable-5-1": ("anthropic", "claude-fable-5-1", "anthropic.messages", "messages.adaptive", "anthropic.public", "active", "high"),
   "anthropic.claude-fable-5": ("anthropic", "claude-fable-5", "anthropic.messages", "messages.adaptive", "anthropic.public", "active", "high"),
   "anthropic.claude-haiku-4-5": ("anthropic", "claude-haiku-4-5", "anthropic.messages", "messages.standard", "anthropic.public", "active", "none"),
   "anthropic.claude-mythos-5": ("anthropic", "claude-mythos-5", "anthropic.messages", "messages.adaptive", "anthropic.public", "active", "high"),
   "anthropic.claude-opus-5": ("anthropic", "claude-opus-5", "anthropic.messages", "messages.adaptive", "anthropic.public", "active", "high"),
   "anthropic.claude-sonnet-5": ("anthropic", "claude-sonnet-5", "anthropic.messages", "messages.adaptive", "anthropic.public", "active", "high"),
+  "openai.gpt-6-astra": ("openai", "gpt-6-astra", "openai.responses", "responses.reasoning", "openai.public", "active", "medium"),
   "openai.gpt-5-6": ("openai", "gpt-5.6", "openai.responses", "responses.reasoning", "openai.public", "active", "medium"),
+  "codex.gpt-6-astra": ("codex", "gpt-6-astra", "codex.responses", "codex.reasoning", "codex.chatgpt", "active", "medium"),
   "codex.gpt-5-6-luna": ("codex", "gpt-5.6-luna", "codex.responses", "codex.reasoning", "codex.chatgpt", "active", "medium"),
   "codex.gpt-5-6-sol": ("codex", "gpt-5.6-sol", "codex.responses", "codex.reasoning", "codex.chatgpt", "active", "medium"),
   "codex.gpt-5-6-terra": ("codex", "gpt-5.6-terra", "codex.responses", "codex.reasoning", "codex.chatgpt", "active", "medium"),
-  "xai.grok-4-5": ("xai", "grok-4.5", "xai.responses", "responses.reasoning", "xai.public", "active", "medium"),
+  "xai.grok-4-6": ("xai", "grok-4.6", "xai.responses", "responses.reasoning", "xai.public", "active", "high"),
+  "xai.grok-4-5": ("xai", "grok-4.5", "xai.responses", "responses.reasoning", "xai.public", "active", "high"),
   "anthropic.claude-sonnet-4-6-sdk": ("anthropic", "claude-sonnet-4-6", "anthropic.sdk.messages", "messages.standard", "anthropic.byok", "hidden", "none"),
   "anthropic.claude-haiku-4-5-20251001-sdk": ("anthropic", "claude-haiku-4-5-20251001", "anthropic.sdk.messages", "messages.standard", "anthropic.byok", "hidden", "none"),
   "anthropic.claude-haiku-4-5-20251001-gateway": ("anthropic", "claude-haiku-4-5-20251001", "anthropic.messages", "messages.standard", "anthropic.public", "hidden", "none"),
@@ -157,15 +161,19 @@ _EXPECTED_DEFAULTS = {
 }
 
 _DRIVER_KEYS = frozenset({
+  "anthropic.claude-fable-5-1",
   "anthropic.claude-fable-5",
   "anthropic.claude-haiku-4-5",
   "anthropic.claude-mythos-5",
   "anthropic.claude-opus-5",
   "anthropic.claude-sonnet-5",
+  "openai.gpt-6-astra",
   "openai.gpt-5-6",
+  "codex.gpt-6-astra",
   "codex.gpt-5-6-luna",
   "codex.gpt-5-6-sol",
   "codex.gpt-5-6-terra",
+  "xai.grok-4-6",
   "xai.grok-4-5",
 })
 
@@ -201,7 +209,7 @@ def test_packaged_registry_artifact_matches_frozen_inventory() -> None:
   oauth = INITIAL_MODEL_REGISTRY.require("anthropic.claude-opus-4-8-oauth")
   assert oauth.features == frozenset({"vision"})
   assert INITIAL_MODEL_REGISTRY.require("xai.grok-4-5").supported_efforts == (
-    frozenset({"low", "medium", "high"})
+    frozenset({"low", "medium", "high", "xhigh"})
   )
   assert INITIAL_MODEL_REGISTRY.require(
     "anthropic.claude-fable-5"
@@ -232,6 +240,7 @@ def test_packaged_selection_artifact_matches_frozen_policy() -> None:
   ].allowed_model_keys == _DRIVER_KEYS
   review = INITIAL_MODEL_SELECTION_POLICY.capabilities["citation.review"]
   assert review.allowed_model_keys == frozenset({
+    "anthropic.claude-fable-5-1",
     "anthropic.claude-fable-5",
     "anthropic.claude-haiku-4-5",
     "anthropic.claude-mythos-5",
@@ -242,6 +251,7 @@ def test_packaged_selection_artifact_matches_frozen_policy() -> None:
   assert review.allow_saved_preference is False
   assert review.allow_authenticated_run_override is False
   node_keys = frozenset({
+    "anthropic.claude-fable-5-1",
     "anthropic.claude-fable-5",
     "anthropic.claude-mythos-5",
     "anthropic.claude-opus-5",
@@ -326,6 +336,7 @@ def _run_module_import(env_overrides: dict[str, str]) -> subprocess.CompletedPro
       (
         "from agent_gateway.model_registry import INITIAL_MODEL_REGISTRY, "
         "INITIAL_MODEL_SELECTION_POLICY\n"
+        "import agent_gateway.providers\n"
         "print(','.join(sorted(INITIAL_MODEL_REGISTRY.models)))\n"
         "print(','.join(sorted(INITIAL_MODEL_SELECTION_POLICY.capabilities["
         "'session.driver'].allowed_model_keys)))\n"
@@ -629,7 +640,7 @@ def test_omitted_channel_default_kind_is_rejected(tmp_path: Path) -> None:
 
 
 def _server_config(registry, policy) -> "GatewayServerConfig":
-  async def _build_chat_runtime(session, request, channel, auth_manager):
+  async def _build_chat_runtime(session, request, channel, auth_manager, *, storage_root: Path | None = None):
     raise NotImplementedError("closure tests never run a chat turn")
 
   return GatewayServerConfig(
@@ -747,7 +758,7 @@ def test_server_construction_admits_artifact_loaded_registry(tmp_path: Path) -> 
   assert app is not None
 
 
-def test_import_time_closure_rejects_env_selected_registry_with_missing_adapter(
+def test_provider_import_rejects_env_selected_registry_with_missing_adapter(
   tmp_path: Path,
 ) -> None:
   document = _registry_document()

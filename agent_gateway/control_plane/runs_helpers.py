@@ -4,15 +4,20 @@ import asyncio
 import json
 import math
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
 from fastapi import HTTPException, Request
 
+from agent_gateway.approval_route import bind_session_approval_route
 from agent_gateway.approvals import (
   ApprovalActionError,
   _cancel_pending_approval_and_unblock,
+)
+from agent_gateway.autonomous_launch_envelope import (
+  AUTONOMOUS_RUNTIME_SESSION_PURPOSE,
 )
 from agent_gateway.autonomous_runner import AutonomousRegistry, AutonomousTask
 from agent_gateway.autonomous_runner_state import (
@@ -20,9 +25,9 @@ from agent_gateway.autonomous_runner_state import (
   is_root_terminal_event,
 )
 from agent_gateway.session import AuthManager, GatewaySession
+from agent_gateway.session_recap import _verdict_summary_from_skill_result
 from agent_gateway.control_run_lifecycle import (
   CONTROL_ACTIVE_RUN_STATES,
-  CONTROL_RUN_STATES,
   CONTROL_TERMINAL_RUN_STATES,
   canonical_control_run_state,
   coerce_control_run_state,
@@ -43,6 +48,7 @@ from .runs_models import (
   AutonomousResultReference,
   AutonomousResumeRequest,
   AutonomousRunMessageRequest,
+  AutonomousRunRecordPaths,
   AutonomousRunResponse,
   AutonomousRunState,
   AutonomousTerminalReceipt,
@@ -72,6 +78,7 @@ __all__ = [
   "AutonomousResultReference",
   "AutonomousResumeRequest",
   "AutonomousRunMessageRequest",
+  "AutonomousRunRecordPaths",
   "AutonomousRunResponse",
   "AutonomousRunState",
   "AutonomousTerminalReceipt",
@@ -95,7 +102,6 @@ __all__ = [
 ]
 
 
-_CHAT_RUN_STATES = set(CONTROL_RUN_STATES)
 _TERMINAL_RUN_STATES = set(CONTROL_TERMINAL_RUN_STATES)
 _CONTROL_CHAT_TASK_PREFIX = "control_chat_turn:"
 _AUTONOMOUS_RESUME_EVENT_TAIL = 40
@@ -324,20 +330,28 @@ def _stage_receipt_status(
   readback: dict[str, Any],
   typed_outputs: dict[str, Any],
 ) -> str | None:
+  raw_business_model_receipt = typed_outputs.get("business_model_stage_receipt")
   business_model_receipt = (
-    typed_outputs.get("business_model_stage_receipt")
-    if isinstance(typed_outputs.get("business_model_stage_receipt"), dict)
+    raw_business_model_receipt
+    if isinstance(raw_business_model_receipt, dict)
     else {}
   )
+  raw_readback_receipt = readback.get("stage_receipt")
   readback_receipt = (
-    readback.get("stage_receipt")
-    if isinstance(readback.get("stage_receipt"), dict)
+    raw_readback_receipt
+    if isinstance(raw_readback_receipt, dict)
     else {}
   )
-  result_receipt = result.get("receipt") if isinstance(result.get("receipt"), dict) else {}
+  raw_result_receipt = result.get("receipt")
+  result_receipt = (
+    raw_result_receipt
+    if isinstance(raw_result_receipt, dict)
+    else {}
+  )
+  raw_persisted_receipt = result_receipt.get("stage_receipt")
   persisted_receipt = (
-    result_receipt.get("stage_receipt")
-    if isinstance(result_receipt.get("stage_receipt"), dict)
+    raw_persisted_receipt
+    if isinstance(raw_persisted_receipt, dict)
     else {}
   )
   candidates = [
@@ -366,40 +380,29 @@ def _latest_tool_result(events: list[dict[str, Any]]) -> ToolResultSummaryRespon
     tool_name = _bounded_summary_text(event.get("tool_name"), limit=256)
     if tool_call_id is None or tool_name is None:
       continue
-    result = event.get("result") if isinstance(event.get("result"), dict) else {}
-    result_error = result.get("error") if isinstance(result.get("error"), dict) else None
-    event_error = event.get("error") if isinstance(event.get("error"), dict) else None
-    semantic_error = (
-      event.get("semantic_error")
-      if isinstance(event.get("semantic_error"), dict)
-      else None
-    )
+    raw_result = event.get("result")
+    result = raw_result if isinstance(raw_result, dict) else {}
+    raw_result_error = result.get("error")
+    result_error = raw_result_error if isinstance(raw_result_error, dict) else None
+    raw_event_error = event.get("error")
+    event_error = raw_event_error if isinstance(raw_event_error, dict) else None
+    raw_semantic_error = event.get("semantic_error")
+    semantic_error = raw_semantic_error if isinstance(raw_semantic_error, dict) else None
     error = result_error or event_error or semantic_error
     status = _bounded_summary_text(result.get("status"), limit=128)
-    status_is_error = (status or "").lower() in {"error", "failed", "failure"}
-    succeeded = not (
-      bool(event.get("is_error"))
-      or status_is_error
-      or result_error is not None
-      or event_error is not None
-      or semantic_error is not None
-    )
-    verdict_echo = (
-      result.get("verdict_echo")
-      if isinstance(result.get("verdict_echo"), dict)
-      else {}
-    )
-    readback = result.get("readback") if isinstance(result.get("readback"), dict) else {}
+    succeeded = not bool(event.get("is_error"))
+    raw_verdict_echo = result.get("verdict_echo")
+    verdict_echo = raw_verdict_echo if isinstance(raw_verdict_echo, dict) else {}
+    raw_readback = result.get("readback")
+    readback = raw_readback if isinstance(raw_readback, dict) else {}
+    raw_readback_verdict = readback.get("verdict")
     readback_verdict = (
-      readback.get("verdict")
-      if isinstance(readback.get("verdict"), dict)
+      raw_readback_verdict
+      if isinstance(raw_readback_verdict, dict)
       else {}
     )
-    typed_outputs = (
-      readback.get("typed_outputs")
-      if isinstance(readback.get("typed_outputs"), dict)
-      else {}
-    )
+    raw_typed_outputs = readback.get("typed_outputs")
+    typed_outputs = raw_typed_outputs if isinstance(raw_typed_outputs, dict) else {}
     verdict = next(
       (
         token
@@ -478,7 +481,12 @@ def _staged_proposals(events: list[dict[str, Any]]) -> list[StagedProposalRespon
           expires_at_iso = None
       readback = result.get("readback")
       raw_research_file_id = readback.get("research_file_id") if isinstance(readback, dict) else None
-      research_file_id_is_int = isinstance(raw_research_file_id, int) and not isinstance(raw_research_file_id, bool)
+      research_file_id: int | None = (
+        int(raw_research_file_id)
+        if isinstance(raw_research_file_id, int)
+        and not isinstance(raw_research_file_id, bool)
+        else None
+      )
       subcommand = result.get("subcommand")
       ticker = result.get("ticker")
       staged[proposal_id] = StagedProposalResponse(
@@ -487,7 +495,7 @@ def _staged_proposals(events: list[dict[str, Any]]) -> list[StagedProposalRespon
         expires_at=expires_at_iso,
         subcommand=str(subcommand) if subcommand else None,
         ticker=str(ticker) if ticker else None,
-        research_file_id=int(raw_research_file_id) if research_file_id_is_int else None,
+        research_file_id=research_file_id,
         skill_run_id=skill_run_id if isinstance(skill_run_id, str) else None,
       )
   return [proposal for proposal_id, proposal in staged.items() if proposal_id not in applied]
@@ -553,33 +561,6 @@ def _events_cost_usd(events: list[dict[str, Any]]) -> float | None:
   return None
 
 
-def _verdict_summary_from_skill_result(event: dict[str, Any]) -> dict[str, Any] | None:
-  verdict_echo = event.get("verdict_echo")
-  if not isinstance(verdict_echo, dict):
-    verdict_echo = None
-    fms_results = event.get("fms_results")
-    if isinstance(fms_results, list):
-      for result in reversed(fms_results):
-        if isinstance(result, dict) and isinstance(result.get("verdict_echo"), dict):
-          verdict_echo = result["verdict_echo"]
-          break
-  if not isinstance(verdict_echo, dict):
-    return None
-  token = verdict_echo.get("verdict_token") or verdict_echo.get("verdict")
-  if not token:
-    return None
-  return {
-    "verdict_token": str(token),
-    "confidence": verdict_echo.get("confidence"),
-    "one_line_summary": (
-      verdict_echo.get("one_line_summary")
-      or verdict_echo.get("summary")
-      or verdict_echo.get("message")
-      or str(token)
-    ),
-  }
-
-
 def _autonomous_state(state: str) -> AutonomousRunState:
   return canonical_control_run_state(state)
 
@@ -606,6 +587,13 @@ def _pending_approval(session: GatewaySession) -> PendingApprovalResponse | None
       requested_at=_iso_from_unix(pending.get("requested_at")),
     )
   return None
+
+def _dispatch_scope_response(
+  dispatch_scope: dict[str, Any] | None,
+) -> DispatchScope | None:
+  if dispatch_scope is None:
+    return None
+  return DispatchScope.model_validate(dispatch_scope)
 
 
 def _chat_run_from_session(session: GatewaySession) -> ChatRunResponse:
@@ -636,7 +624,7 @@ def _chat_run_from_session(session: GatewaySession) -> ChatRunResponse:
     current_verdict=_current_verdict(events),
     pending_approval=_pending_approval(session),
     latest_tool_result=_latest_tool_result(events),
-    dispatch_scope=session.dispatch_scope,
+    dispatch_scope=_dispatch_scope_response(session.dispatch_scope),
   )
 
 
@@ -736,7 +724,7 @@ async def _deny_autonomous_pending_approvals_for_cancel(
     nonce = str(event.get("nonce") or "")
     if not approval_id or not tool_call_id or not nonce:
       continue
-    get_delivery = getattr(
+    get_delivery: Callable[..., Awaitable[dict[str, Any] | None]] | None = getattr(
       store,
       "get_autonomous_approval_delivery",
       None,
@@ -760,8 +748,7 @@ async def _deny_autonomous_pending_approvals_for_cancel(
       kind="chat",
       channel=record.channel,
     )
-    shim_session.approval_store = store
-    shim_session.approval_policy = policy
+    bind_session_approval_route(shim_session, store, policy)
     shim_session.pending_tools[tool_call_id] = pending_entry
     shim_session.approval_queues[tool_call_id] = approval_queue
 
@@ -882,6 +869,14 @@ def _autonomous_run_from_task(record: AutonomousTask) -> AutonomousRunResponse:
     exit_code=record.exit_code,
     error=record.error,
     terminal_receipt=_autonomous_terminal_receipt(record, state=state, events=events),
+    record_paths=AutonomousRunRecordPaths(
+      task_manifest=str(record.log_path.with_name(f"{record.task_id}.task.json")),
+      log=str(record.log_path),
+      events=str(record.events_path) if record.events_path else None,
+      tool_result_spill=(
+        str(record.tool_result_spill_dir) if record.tool_result_spill_dir else None
+      ),
+    ),
     messageable=_autonomous_task_messageable(record, state=state, events=events),
     started_at=_iso_from_unix(record.started_at),
     ended_at=_iso_from_unix(record.completed_at) if record.completed_at is not None else None,
@@ -894,20 +889,95 @@ def _autonomous_run_from_task(record: AutonomousTask) -> AutonomousRunResponse:
     resumed_from=record.resumed_from,
     resumed_as=resumed_as,
     latest_resume_run_id=resumed_as[-1] if resumed_as else None,
-    dispatch_scope=record.dispatch_scope,
+    dispatch_scope=_dispatch_scope_response(record.dispatch_scope),
     schedule_id=record.schedule_id,
     schedule_name=record.schedule_name,
   )
 
 
-def _chat_session_for_user(auth: AuthManager, run_id: str, user_id: str) -> GatewaySession:
+def _interactive_chat_session(
+  auth: AuthManager,
+  run_id: str,
+  *,
+  require_run_activity: bool,
+) -> GatewaySession | None:
+  """Resolve only user-facing chat runs, never auth-only runtime sessions."""
+
   session = auth.session_store.get_session(run_id)
   if (
     session is None
     or session.kind != "chat"
-    or not _session_matches_owner(session, user_id)
-    or not _chat_session_has_run_activity(session)
+    or session.purpose == AUTONOMOUS_RUNTIME_SESSION_PURPOSE
+    or (
+      require_run_activity
+      and not _chat_session_has_run_activity(session)
+    )
   ):
+    return None
+  return session
+
+
+def _interactive_chat_session_for_user(
+  auth: AuthManager,
+  run_id: str,
+  user_id: str,
+  *,
+  require_run_activity: bool,
+) -> GatewaySession | None:
+  session = _interactive_chat_session(
+    auth,
+    run_id,
+    require_run_activity=require_run_activity,
+  )
+  if session is None or not _session_matches_owner(session, user_id):
+    return None
+  return session
+
+
+def _message_delivery_target(
+  auth: AuthManager,
+  registry: AutonomousRegistry | None,
+  run_id: str,
+  user_id: str,
+) -> GatewaySession | AutonomousTask:
+  """Resolve the sole control-run owner for operator message delivery.
+
+  Chat sessions authenticate by session id rather than owner match, so only the
+  autonomous side carries a tenancy filter. Filtering after the collision check
+  keeps a foreign-owned task that collides with a chat session a real collision,
+  and refusing here rather than at delivery keeps another operator's run as
+  opaque as a run id that was never issued.
+  """
+
+  chat_session = _interactive_chat_session(
+    auth,
+    run_id,
+    require_run_activity=True,
+  )
+  autonomous_task = (
+    registry._find_by_control_run_id(run_id)
+    if registry is not None
+    else None
+  )
+  if chat_session is not None and autonomous_task is not None:
+    raise RuntimeError(
+      "control run id is owned by both chat and autonomous delivery targets"
+    )
+  if chat_session is not None:
+    return chat_session
+  if autonomous_task is not None and _record_owner_user_id(autonomous_task) == user_id:
+    return autonomous_task
+  raise HTTPException(status_code=404, detail="Run not found")
+
+
+def _chat_session_for_user(auth: AuthManager, run_id: str, user_id: str) -> GatewaySession:
+  session = _interactive_chat_session_for_user(
+    auth,
+    run_id,
+    user_id,
+    require_run_activity=True,
+  )
+  if session is None:
     raise HTTPException(status_code=404, detail="Run not found")
   return session
 

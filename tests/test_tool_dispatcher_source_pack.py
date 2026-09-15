@@ -11,6 +11,7 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.tool_dispatcher import ToolDispatcher
 from agent_gateway import tool_dispatcher_source_pack as source_pack_helpers
 
@@ -116,10 +117,10 @@ def test_capture_filing_source_pack_adapts_and_stores_pack(monkeypatch) -> None:
   )
   fake_agent = ModuleType("agent")
   fake_agent_shared = ModuleType("agent.shared")
-  fake_agent_shared.source_pack_session = fake_source_pack_session
+  setattr(fake_agent_shared, "source_pack_session", fake_source_pack_session)
   fake_schema = ModuleType("schema")
   fake_schema_source_pack = ModuleType("schema.source_pack")
-  fake_schema_source_pack.SourcePack = FakeSourcePack
+  setattr(fake_schema_source_pack, "SourcePack", FakeSourcePack)
   monkeypatch.setitem(sys.modules, "agent", fake_agent)
   monkeypatch.setitem(sys.modules, "agent.shared", fake_agent_shared)
   monkeypatch.setitem(sys.modules, "schema", fake_schema)
@@ -149,11 +150,33 @@ def test_capture_filing_source_pack_adapts_and_stores_pack(monkeypatch) -> None:
 
 
 def test_call_mcp_tool_captures_get_filing_evidence_source_pack(monkeypatch) -> None:
-  class FakeMcp:
-    def get_server_for_tool(self, _tool_name):
+  class FakeMcp(McpClientManager):
+    def __init__(self) -> None:
+      super().__init__(config_path=None)
+
+    def get_server_for_tool(self, name):
+      _ = name
       return "edgar-parser-mcp"
 
-    async def call_tool(self, tool_name, tool_input, **_kwargs):
+    async def call_tool(
+      self,
+      name,
+      tool_input,
+      meta=None,
+      abort_event=None,
+      gateway_session=None,
+      allow_uncertain_replay=True,
+      trusted_dispatch_scope=None,
+    ):
+      _ = (
+        name,
+        tool_input,
+        meta,
+        abort_event,
+        gateway_session,
+        allow_uncertain_replay,
+        trusted_dispatch_scope,
+      )
       return {"source_pack": _planner_payload()}, None
 
   captured = {}

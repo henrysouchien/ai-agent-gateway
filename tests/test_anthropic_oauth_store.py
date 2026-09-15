@@ -73,7 +73,9 @@ def test_anthropic_cli_import_does_not_modify_claude_login(
   )
   assert code == 0
   assert subprocess_calls == []
-  assert load_anthropic_oauth_record(store)["auth_token"] == "sk-ant-oat01-ci-token"
+  record = load_anthropic_oauth_record(store)
+  assert record is not None
+  assert record["auth_token"] == "sk-ant-oat01-ci-token"
   assert "Existing Claude Code and gateway sessions were not modified" in stdout.getvalue()
 
   logout = io.StringIO()
@@ -100,7 +102,9 @@ def test_anthropic_cli_uses_setup_token_without_logout(
     ["auth", "login", "anthropic", "--store", str(store)], stdout=io.StringIO()
   ) == 0
   assert calls == [["claude", "setup-token"]]
-  assert load_anthropic_oauth_record(store)["auth_token"] == "sk-ant-oat01-pasted"
+  record = load_anthropic_oauth_record(store)
+  assert record is not None
+  assert record["auth_token"] == "sk-ant-oat01-pasted"
 
 
 def test_importing_store_does_not_mutate_existing_gateway_session_config(
@@ -199,3 +203,11 @@ def test_store_path_defaults_under_user_data_dir(tmp_path: Path) -> None:
   assert resolve_anthropic_auth_store_path(environ={"USER_DATA_DIR": str(tmp_path)}) == (
     tmp_path / "anthropic" / "oauth.json"
   )
+
+
+def test_corrupt_expires_at_reports_expiring() -> None:
+  from agent_gateway.providers.anthropic_oauth import anthropic_token_is_expiring
+
+  assert anthropic_token_is_expiring({"expires_at": "not-a-number"}) is True
+  # Absent expiry means a legacy record with no expiry contract: not expiring.
+  assert anthropic_token_is_expiring({}) is False

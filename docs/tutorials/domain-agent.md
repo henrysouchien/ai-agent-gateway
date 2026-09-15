@@ -19,7 +19,7 @@ domain app
 GatewayServerConfig
         |
         v
-build_chat_runtime(session, request, channel, auth_manager)
+build_chat_runtime(session, request, channel, auth_manager, *, storage_root=None)
         |
         v
 ChatRuntime
@@ -56,8 +56,10 @@ this contract:
 from agent_gateway import AgentRunner, ChatRuntime, ToolDispatcher
 
 
-async def build_chat_runtime(session, request, channel, auth_manager):
-  _ = auth_manager
+async def build_chat_runtime(session, request, channel, auth_manager, *, storage_root=None):
+  # The gateway always passes storage_root by keyword; ignore it if your
+  # runtime does not persist per-user state.
+  _ = auth_manager, storage_root
   capability_execution = request.capability_execution
   if capability_execution is None:
     raise RuntimeError("Runtime requires a prepared session.driver turn")

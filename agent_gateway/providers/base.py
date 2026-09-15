@@ -5,7 +5,12 @@ import re
 from typing import Any, AsyncIterator, Literal
 
 from ..auth import ProviderCredentialFailure
-from ..model_registry import AdapterRouteSupport
+from ..model_registry import (
+  INITIAL_MODEL_REGISTRY,
+  AdapterRouteSupport,
+  ModelRegistryEntry,
+)
+from ..rates import ContextRateTier
 from ..thinking import EffortResolution, ThinkingLevel
 
 
@@ -61,12 +66,42 @@ class ModelInfo:
   cache_write_cost_per_mtok: float = 0.0
   thinking_mode: ThinkingMode | None = None
   compat: dict[str, Any] | None = None
+  rate_tiers: tuple[ContextRateTier, ...] = ()
 
   def __post_init__(self) -> None:
     if self.thinking_mode is None:
       self.thinking_mode = "adaptive" if self.supports_thinking else "none"
     if self.thinking_mode != "none":
       self.supports_thinking = True
+
+
+def registry_entry_for_model(provider: str, model_id: str) -> ModelRegistryEntry | None:
+  """Locate the product-model-registry entry admitting one provider model id.
+
+  The deployment-selected registry artifact is the single owner of which
+  models exist and of their effort/feature facts; provider capability tables
+  only refine wire metadata (windows, costs, probed protocol quirks) for the
+  models they know.  An exact ``upstream_model`` match wins over a
+  ``reported_identities`` alias; iteration is key-ordered for determinism.
+  """
+  family = str(provider or "").strip().lower()
+  alias_match: ModelRegistryEntry | None = None
+  for key in sorted(INITIAL_MODEL_REGISTRY.models):
+    entry = INITIAL_MODEL_REGISTRY.models[key]
+    if entry.provider != family:
+      continue
+    if entry.upstream_model == model_id:
+      return entry
+    if alias_match is None and model_id in entry.reported_identities:
+      alias_match = entry
+  return alias_match
+
+
+def registry_effort_values(entry: ModelRegistryEntry) -> tuple[str, ...]:
+  """The entry's supported efforts in canonical ``ThinkingLevel`` order."""
+  return tuple(
+    level.value for level in ThinkingLevel if level.value in entry.supported_efforts
+  )
 
 
 @dataclass
@@ -360,7 +395,7 @@ class ModelProvider:
   def normalize_messages(self, messages: list[dict[str, Any]], model_info: ModelInfo) -> list[dict[str, Any]]:
     return list(messages)
 
-  async def stream(self, client: Any, params: dict[str, Any]) -> AsyncIterator[StreamEvent]:
+  def stream(self, client: Any, params: dict[str, Any]) -> AsyncIterator[StreamEvent]:
     raise NotImplementedError
 
   def is_retryable_error(self, exc: Exception) -> bool:
@@ -381,10 +416,17 @@ class ModelProvider:
     cache_creation_tokens: int = 0,
   ) -> CostEstimate:
     info = self.get_model_info(model)
-    input_cost = input_tokens * info.input_cost_per_mtok / 1_000_000
-    output_cost = output_tokens * info.output_cost_per_mtok / 1_000_000
-    cache_read_cost = cache_read_tokens * info.cache_read_cost_per_mtok / 1_000_000
-    cache_write_cost = cache_creation_tokens * info.cache_write_cost_per_mtok / 1_000_000
+    # Normalized input/cache counts are disjoint; tier thresholds use the full prompt.
+    prompt_tokens = input_tokens + cache_read_tokens + cache_creation_tokens
+    prices: ModelInfo | ContextRateTier = info
+    for tier in info.rate_tiers:
+      if prompt_tokens >= tier.min_input_tokens:
+        prices = tier
+        break
+    input_cost = input_tokens * prices.input_cost_per_mtok / 1_000_000
+    output_cost = output_tokens * prices.output_cost_per_mtok / 1_000_000
+    cache_read_cost = cache_read_tokens * prices.cache_read_cost_per_mtok / 1_000_000
+    cache_write_cost = cache_creation_tokens * prices.cache_write_cost_per_mtok / 1_000_000
     return CostEstimate(
       input_cost=input_cost,
       output_cost=output_cost,

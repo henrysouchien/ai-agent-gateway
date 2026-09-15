@@ -13,6 +13,8 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from agent_gateway.providers.anthropic import AnthropicProvider  # noqa: E402
+from agent_gateway.providers.base import ModelInfo  # noqa: E402
 from agent_gateway.secret_boundary import (  # noqa: E402
   REDACTED_SECRET,
   SANITIZATION_FAILED,
@@ -20,7 +22,6 @@ from agent_gateway.secret_boundary import (  # noqa: E402
   sanitize_boundary_value,
   sanitize_tool_event,
 )
-from agent_gateway.ui_blocks_metrics import snapshot as metrics_snapshot  # noqa: E402
 from tests.capability_execution_test_support import (  # noqa: E402
   stub_runner_capability_execution,
 )
@@ -75,6 +76,24 @@ def test_auth_config_registration_uses_exact_material_without_global_retention()
     sink="autonomous_log",
   ) == {"value": REDACTED_SECRET, "api_key_set": True}
   assert SecretBoundary().sanitize(secret, sink="other_lifecycle") == secret
+
+
+def test_unknown_auth_config_keys_register_as_secrets_and_config_fields_do_not() -> None:
+  novel_secret = "CUSTOM-NOVEL-PROVIDER-CREDENTIAL-8f21d7"
+  boundary = SecretBoundary.from_auth_config({
+    "provider": "anthropic",
+    "auth_mode": "oauth",
+    "base_url": "https://api.example.test",
+    "max_tokens": 16_000,
+    "session_credential": novel_secret,
+  })
+
+  assert boundary.sanitize(
+    {"value": novel_secret},
+    sink="autonomous_log",
+  ) == {"value": REDACTED_SECRET}
+  prose = "provider anthropic via https://api.example.test in oauth mode"
+  assert boundary.sanitize(prose, sink="autonomous_log") == prose
 
 
 def test_high_confidence_material_is_removed_without_scanning_prose_or_key_names() -> None:
@@ -139,14 +158,157 @@ def test_sanitizer_failure_returns_fixed_tombstone(monkeypatch: pytest.MonkeyPat
   ) == SANITIZATION_FAILED
 
 
-def test_typed_tool_block_failure_is_structurally_valid_and_observable(
+def test_oversized_financial_lineage_stops_after_one_failed_projection(
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  # fetch_financials emitted 42,606 value records in the buyer live cohort.
+  value = {
+    "result_key": "income",
+    "row_index": 0,
+    "field": "revenue",
+    "value_kind": "number",
+    "canonical_value": "123",
+    "concept": "Revenue",
+    "period": "2025",
+  }
+  event = {
+    "type": "tool_call_complete",
+    "tool_name": "fetch_financials",
+    "result": {
+      "lineage_descriptor": {"values": [dict(value) for _ in range(42_606)]},
+      "hint": "Financial data is available by reference.",
+    },
+  }
+
+  projected = sanitize_tool_event(event, sink="tool_complete")
+
+  failures = [
+    record for record in caplog.records
+    if record.name == "agent_gateway.secret_boundary"
+  ]
+  assert len(failures) == 1
+  assert failures[0].data["reason"] == "node_limit"
+  assert projected["result"] == SANITIZATION_FAILED
+  assert projected["tool_name"] == "fetch_financials"
+  caplog.clear()
+  assert sanitize_tool_event(projected, sink="session_log") == projected
+  assert not caplog.records
+  assert event["result"]["lineage_descriptor"]["values"][-1] == value
+
+
+@pytest.mark.parametrize("limit", ["depth", "nodes"])
+def test_resource_limited_arguments_preserve_completed_results(limit: str) -> None:
+  value: object = "ordinary"
+  if limit == "depth":
+    for _ in range(33):
+      value = {"nested": value}
+  else:
+    value = ["ordinary"] * 100_000
+  assistant = sanitize_tool_event(
+    {
+      "type": "assistant_message",
+      "content_blocks": [
+        {"type": "tool_use", "id": "tool-lookup", "name": "lookup", "input": {"value": value}},
+        {"type": "tool_use", "id": "tool-other", "name": "lookup", "input": {}},
+      ],
+    },
+    sink="model_history",
+  )
+  results = [
+    {"type": "tool_result", "tool_use_id": "tool-lookup", "content": '{"answer": 42}'},
+    {"type": "tool_result", "tool_use_id": "tool-other", "content": '{"answer": 7}'},
+  ]
+
+  normalized = AnthropicProvider().normalize_messages(
+    [
+      {"role": "assistant", "content": assistant["content_blocks"]},
+      {"role": "user", "content": results},
+    ],
+    ModelInfo(id="test-model", provider="anthropic"),
+  )
+
+  assert normalized[-1]["content"] == results
+  assert assistant["content_blocks"][0]["name"] == "lookup"
+  assert assistant["content_blocks"][0]["input"] == {"_boundary_error": SANITIZATION_FAILED}
+
+
+def test_depth_limit_tombstones_a_typed_block_with_one_failure(
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  value = {"content": "ordinary"}
+  for _ in range(33):
+    value = {"nested": value}
+  event = {
+    "type": "user_message",
+    "content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": value}],
+  }
+  boundary = SecretBoundary()
+
+  projected = sanitize_tool_event(event, sink="model", boundary=boundary)
+
+  assert projected["content"][0]["tool_use_id"] == "tool-1"
+  assert projected["content"][0]["content"] == SANITIZATION_FAILED
+  assert projected["content"][0]["is_error"] is True
+
+  failures = [
+    record for record in caplog.records
+    if record.name == "agent_gateway.secret_boundary"
+  ]
+  assert len(failures) == 1
+  assert failures[0].data["reason"] == "depth_limit"
+  assert boundary.sanitize({"content": "ordinary"}, sink="model") == {
+    "content": "ordinary",
+  }
+
+
+def test_resource_limited_durable_result_keeps_replay_identity() -> None:
+  from agent_gateway.transcript import _tool_result_blocks_from_event
+
+  secret = "CUSTOM-ACTIVE-CREDENTIAL-RESULT-8f21d7"
+  value: object = secret
+  for _ in range(33):
+    value = {"nested": value}
+  event = {
+    "type": "tool_call_complete",
+    "tool_call_id": "tool-lookup",
+    "tool_name": "lookup",
+    "result": {"answer": 42},
+    "final_tool_result_blocks": [
+      {"type": "tool_result", "tool_use_id": "tool-lookup", "tool_name": secret, "content": value},
+      {"type": "text", "text": secret},
+    ],
+  }
+  projected = sanitize_tool_event(
+    event, sink="durable_event", boundary=SecretBoundary((secret,)),
+  )
+  replay = _tool_result_blocks_from_event(projected)
+  normalized = AnthropicProvider().normalize_messages(
+    [
+      {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "tool-lookup", "name": "lookup", "input": {}},
+      ]},
+      {"role": "user", "content": replay},
+    ],
+    ModelInfo(id="test-model", provider="anthropic"),
+  )
+
+  assert projected["tool_call_id"] == "tool-lookup"
+  assert normalized[-1]["content"] == [
+    {
+      "type": "tool_result",
+      "tool_use_id": "tool-lookup",
+      "content": SANITIZATION_FAILED,
+      "is_error": True,
+    },
+    {"type": "text", "text": REDACTED_SECRET},
+  ]
+  assert secret not in json.dumps(projected)
+
+
+def test_typed_tool_block_failure_is_structurally_valid(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   secret = "CUSTOM-ACTIVE-CREDENTIAL-TYPED-FAILURE-8f21d7"
-  before = metrics_snapshot().get(
-    "secret_boundary_sanitization_failed",
-    0,
-  )
 
   def _fail(self, _value, *, sink):
     _ = self, sink
@@ -175,22 +337,16 @@ def test_typed_tool_block_failure_is_structurally_valid_and_observable(
     boundary=boundary,
   )
 
-  assert projected["content_blocks"] == [
-    {
-      "type": "tool_use",
-      "id": "boundary-sanitization-failed",
-      "name": "boundary_sanitization_failed",
-      "input": {"_boundary_error": SANITIZATION_FAILED},
-    },
-    {
-      "type": "tool_result",
-      "tool_use_id": "boundary-sanitization-failed",
-      "content": SANITIZATION_FAILED,
-      "is_error": True,
-    },
-  ]
+  call, result = projected["content_blocks"]
+  assert call["type"] == "tool_use"
+  assert isinstance(call["id"], str) and call["id"]
+  assert isinstance(call["name"], str) and call["name"]
+  assert isinstance(call["input"], dict)
+  assert result["type"] == "tool_result"
+  assert result["tool_use_id"] == call["id"]
+  assert result["content"] == SANITIZATION_FAILED
+  assert result["is_error"] is True
   assert secret not in json.dumps(projected)
-  assert metrics_snapshot()["secret_boundary_sanitization_failed"] >= before + 2
 
 
 def test_dispatch_record_is_sanitized_on_tool_call_complete() -> None:

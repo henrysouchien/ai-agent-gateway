@@ -1,11 +1,10 @@
 """OpenAI Responses history markers and durable session epoch helpers.
 
-These primitives are defined by
-`docs/design/gateway-openai-responses-migration-plan.md` (section 10, "Durable
-history and rollback fence"). They are intentionally self-contained. The
-current runtime is Responses-native. The marker predicate now routes
-durable persistence and distinguishes legacy Chat history from native replay;
-it is not a rejecting fence in this release.
+These self-contained primitives distinguish legacy Chat history from native
+Responses replay and namespace durable OpenAI sessions across deployments. The
+marker predicate routes persistence; it is not a rejecting fence in this
+release. Provider execution remains in ``providers/openai.py`` and gateway
+ownership is mapped in ``packages/agent-gateway/README.md``.
 
 Two independent concerns live here:
 
@@ -26,7 +25,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-# --- History version markers (section 10) ---------------------------------
+# --- History version markers ----------------------------------------------
 
 REASONING_SIGNATURE_MARKER = "openai.responses.reasoning.v1"
 TEXT_SIGNATURE_MARKER = "openai.responses.text.v1"
@@ -40,7 +39,7 @@ _SIGNATURE_MARKERS = frozenset({REASONING_SIGNATURE_MARKER, TEXT_SIGNATURE_MARKE
 # Bound the walk so a hostile or pathological payload cannot exhaust the stack.
 _MAX_SCAN_DEPTH = 12
 
-# --- Durable session epoch (section 10) -----------------------------------
+# --- Durable session epoch -------------------------------------------------
 
 OPENAI_SESSION_EPOCH_ENV = "OPENAI_SESSION_EPOCH"
 _EPOCH_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,31}$")

@@ -8,6 +8,7 @@ from fastapi import HTTPException
 
 from agent_gateway.skill_context import current_skill
 from agent_gateway.artifact_paths import canonicalize_ticker
+from agent_gateway.tool_dispatcher_helpers import LocalToolHandler, ToolExecutionContext
 
 from . import batches
 from .corpus_readiness import CorpusReadinessGateError
@@ -16,9 +17,6 @@ from .runs_helpers import _session_owner_user_id
 VALUATION_READY_SKILL = "valuation-ready"
 VALUATION_READY_TEMPLATE = "valuation-ready"
 EXPLICIT_TICKER_SOURCE = "explicit_ticker"
-
-_DILIGENCE_TRACKS_MODULE_NAMES = frozenset({"agent", "agent.skills", "agent.skills.diligence_tracks"})
-
 
 VALUATION_READY_BATCH_DISPATCH_TOOL_DEF: dict[str, Any] = {
   "name": "valuation_ready_batch_dispatch",
@@ -85,6 +83,7 @@ VALUATION_READY_BATCH_READ_TOOL_DEF: dict[str, Any] = {
 ToolHandler = Callable[[dict[str, Any]], Awaitable[tuple[Any | None, dict[str, Any] | None]]]
 
 
+
 def make_valuation_ready_skill_tool_bundle(*, app_state: Any, session: Any) -> dict[str, Any]:
   return {
     "skill_name": VALUATION_READY_SKILL,
@@ -127,18 +126,28 @@ def _normalize_ticker(value: Any) -> str | None:
     return None
 
 
-def _valuation_ready_defaults() -> dict[str, Any]:
-  try:
-    from agent.skills.diligence_tracks import batch_workflow_defaults
-  except ModuleNotFoundError as exc:
-    if exc.name not in _DILIGENCE_TRACKS_MODULE_NAMES:
-      raise
-    from api.agent.skills.diligence_tracks import batch_workflow_defaults
+def _valuation_ready_defaults(app_state: Any) -> dict[str, Any]:
+  skill_application = getattr(
+    app_state,
+    "gateway_skill_application",
+    None,
+  )
+  if skill_application is None:
+    raise RuntimeError("batch compiled skill application is unavailable")
+  defaults = batches._controller().batch_workflow_defaults(
+    VALUATION_READY_TEMPLATE,
+    skill_application=skill_application,
+  )
+  if type(defaults) is not dict:
+    raise TypeError("batch workflow defaults must be an exact dict")
+  return defaults
 
-  return batch_workflow_defaults(VALUATION_READY_TEMPLATE)
 
-
-def _dispatch_spec(tool_input: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+def _dispatch_spec(
+  tool_input: dict[str, Any],
+  *,
+  app_state: Any,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
   ticker = _normalize_ticker((tool_input or {}).get("ticker"))
   if ticker is None:
     return None, {
@@ -146,7 +155,7 @@ def _dispatch_spec(tool_input: dict[str, Any]) -> tuple[dict[str, Any] | None, d
       "message": "valuation_ready_batch_dispatch requires a valid explicit ticker.",
       "details": {"verdict": "INSUFFICIENT_DATA", "reason": "missing_or_invalid_ticker"},
     }
-  defaults = _valuation_ready_defaults()
+  defaults = _valuation_ready_defaults(app_state)
   budget_raw = (tool_input or {}).get("budget_usd")
   if budget_raw is None:
     budget_usd = float(defaults.get("suggested_budget_usd_per_name") or 25.0)
@@ -197,17 +206,26 @@ def _dispatch_spec(tool_input: dict[str, Any]) -> tuple[dict[str, Any] | None, d
   }, None
 
 
-def _make_dispatch_handler(*, app_state: Any, session: Any) -> ToolHandler:
+def _make_dispatch_handler(*, app_state: Any, session: Any) -> LocalToolHandler:
   async def _handle(
     tool_input: dict[str, Any],
     *,
-    tool_ctx: Any,
-    **_: Any,
+    tool_ctx: ToolExecutionContext,
+    **_: object,
   ) -> tuple[Any | None, dict[str, Any] | None]:
     unsupported = _guard_active_skill()
     if unsupported is not None:
       return None, unsupported
-    spec, error = _dispatch_spec(tool_input or {})
+    try:
+      spec, error = _dispatch_spec(
+        tool_input or {},
+        app_state=app_state,
+      )
+    except (RuntimeError, TypeError, ValueError) as exc:
+      return None, {
+        "code": "batch_dispatch_failed",
+        "message": str(exc),
+      }
     if error is not None:
       return None, error
     assert spec is not None
@@ -217,7 +235,7 @@ def _make_dispatch_handler(*, app_state: Any, session: Any) -> ToolHandler:
         "code": "batch_dispatch_failed",
         "message": "valuation-ready dispatch requires a durable session identity",
       }
-    tool_call_id = str(getattr(tool_ctx, "tool_call_id", "") or "").strip()
+    tool_call_id = tool_ctx.tool_call_id.strip()
     if not tool_call_id:
       return None, {
         "code": "batch_dispatch_failed",
@@ -280,8 +298,8 @@ def _make_read_handler(*, session: Any) -> ToolHandler:
     if unsupported is not None:
       return None, unsupported
     try:
-      batch_id = int((tool_input or {}).get("batch_id"))
-    except (TypeError, ValueError):
+      batch_id = int(tool_input["batch_id"])
+    except (KeyError, TypeError, ValueError):
       return None, {"code": "invalid_batch_id", "message": "batch_id must be a positive integer."}
     if batch_id < 1:
       return None, {"code": "invalid_batch_id", "message": "batch_id must be a positive integer."}

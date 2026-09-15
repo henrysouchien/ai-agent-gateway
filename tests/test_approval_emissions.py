@@ -12,15 +12,20 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from agent_gateway.approval_route import DurableLocalApprovalRoute
 from agent_gateway import SessionStore
 from agent_gateway.approval_policy import (
   ApprovalDecision as PolicyApprovalDecision,
   ApprovalRequest,
   ApprovalRequestPayload,
+  DelegationGrant,
   RunContext,
+  ToolClass,
   build_approval_request,
+  utc_now,
 )
-from agent_gateway.approval_policy import DelegationGrant, utc_now
+from agent_gateway.mcp_client import McpClientManager
+from agent_gateway.tool_dispatcher_helpers import ToolResult
 from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.approvals import _record_vote_and_unblock
 from agent_gateway.event_log import EventLog
@@ -28,14 +33,29 @@ from agent_gateway.single_user_policy import DelegationApprovalPolicy
 from agent_gateway.tool_dispatcher import ApprovalDecision, InterceptDecision, ToolDispatcher
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _tool_name: str) -> bool:
-    return False
+class _NullMcpClient(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
 
-  def get_server_for_tool(self, _tool_name: str) -> str | None:
-    return None
-
-  async def call_tool(self, _tool_name: str, _tool_input: dict[str, Any], **_kwargs: Any):
+  async def call_tool(
+    self,
+    name: str,
+    tool_input: object,
+    meta: object | None = None,
+    abort_event: asyncio.Event | None = None,
+    gateway_session: object | None = None,
+    allow_uncertain_replay: bool = True,
+    trusted_dispatch_scope: object | None = None,
+  ) -> ToolResult:
+    _ = (
+      name,
+      tool_input,
+      meta,
+      abort_event,
+      gateway_session,
+      allow_uncertain_replay,
+      trusted_dispatch_scope,
+    )
     raise AssertionError("MCP should not execute in approval emission tests")
 
 
@@ -44,11 +64,12 @@ async def _ok_handler(_tool_input: dict[str, Any], **_kwargs: Any):
 
 
 class _ClassifiedToolDispatcher(ToolDispatcher):
-  def __init__(self, *args: Any, tool_class: str, **kwargs: Any) -> None:
+  _test_tool_class: ToolClass
+  def __init__(self, *args: Any, tool_class: ToolClass, **kwargs: Any) -> None:
     super().__init__(*args, **kwargs)
     self._test_tool_class = tool_class
 
-  def _resolve_tool_class(self, tool_name: str) -> str:
+  def _resolve_tool_class(self, tool_name: str) -> ToolClass:
     _ = tool_name
     return self._test_tool_class
 
@@ -78,12 +99,20 @@ class _ManualApprovalBasePolicy:
   async def revoke_persistent_grant(self, *, grant_id: str, reason: str) -> None:
     _ = grant_id, reason
 
-  def role_authorized_for_class(self, *, decider_role: str | None, tool_class: str) -> bool:
+  def role_authorized_for_class(
+    self,
+    *,
+    decider_role: str | None,
+    tool_class: ToolClass,
+  ) -> bool:
     _ = decider_role, tool_class
     return True
 
 
-def _delegation_grant(*, ceiling: frozenset[str] = frozenset({"state_write"})) -> DelegationGrant:
+def _delegation_grant(
+  *,
+  ceiling: frozenset[ToolClass] = frozenset({"state_write"}),
+) -> DelegationGrant:
   now = utc_now()
   return DelegationGrant(
     delegation_id="delegation-1",
@@ -286,9 +315,11 @@ def test_lifecycle_approval_request_times_out_without_user_response(monkeypatch,
       role=session.role,
       needs_approval=lambda _name, _tool_input, _qualifier: True,
       event_log=event_log,
-      session=session,
-      store=store,
-      policy=_Policy(),
+      approval_route=DurableLocalApprovalRoute(
+        store,
+        _Policy(),
+        session,
+      ),
       run_context=RunContext(
         user_id="alice",
         request_id="request-1",
@@ -360,9 +391,11 @@ def test_lifecycle_user_denial_emits_ordinary_provenance_and_error(tmp_path: Pat
       role=session.role,
       needs_approval=lambda _name, _tool_input, _qualifier: True,
       event_log=event_log,
-      session=session,
-      store=store,
-      policy=policy,
+      approval_route=DurableLocalApprovalRoute(
+        store,
+        policy,
+        session,
+      ),
       run_context=RunContext(
         user_id="alice",
         request_id="request-1",
@@ -492,9 +525,11 @@ def test_delegated_lifecycle_auto_approval_emits_delegated_source(tmp_path: Path
       role=session.role,
       needs_approval=lambda _name, _tool_input, _qualifier: True,
       event_log=event_log,
-      session=session,
-      store=store,
-      policy=policy,
+      approval_route=DurableLocalApprovalRoute(
+        store,
+        policy,
+        session,
+      ),
       run_context=RunContext(
         user_id="alice",
         request_id="request-1",
@@ -542,9 +577,11 @@ def test_delegated_lifecycle_external_write_escalates_without_auto_approval(monk
       role=session.role,
       needs_approval=lambda _name, _tool_input, _qualifier: True,
       event_log=event_log,
-      session=session,
-      store=store,
-      policy=policy,
+      approval_route=DurableLocalApprovalRoute(
+        store,
+        policy,
+        session,
+      ),
       run_context=RunContext(
         user_id="alice",
         request_id="request-1",

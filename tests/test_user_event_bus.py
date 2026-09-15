@@ -2,11 +2,22 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from typing import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 
 import pytest
 
 from agent_gateway.event_log import UserEventBus
+
+
+def _subscribe(
+  bus: UserEventBus,
+  user_id: str,
+  *,
+  control_run_id: str | None = None,
+) -> AsyncGenerator[dict, None]:
+  iterator = bus.subscribe(user_id, control_run_id=control_run_id)
+  assert isinstance(iterator, AsyncGenerator)
+  return iterator
 
 
 async def _next_event(iterator: AsyncIterator[dict], timeout: float = 0.5) -> dict:
@@ -23,8 +34,8 @@ async def _collect(iterator: AsyncIterator[dict], count: int) -> list[dict]:
 def test_user_event_bus_isolates_users() -> None:
   async def _run() -> None:
     bus = UserEventBus()
-    alice = bus.subscribe("alice")
-    bob = bus.subscribe("bob")
+    alice = _subscribe(bus, "alice")
+    bob = _subscribe(bus, "bob")
     alice_task = asyncio.create_task(alice.__anext__())
     bob_task = asyncio.create_task(bob.__anext__())
     await asyncio.sleep(0)
@@ -48,7 +59,7 @@ def test_user_event_bus_isolates_users() -> None:
 def test_user_event_bus_preserves_order_within_run() -> None:
   async def _run() -> None:
     bus = UserEventBus()
-    subscriber = bus.subscribe("alice", control_run_id="run-1")
+    subscriber = _subscribe(bus, "alice", control_run_id="run-1")
     collector = asyncio.create_task(_collect(subscriber, 4))
     await asyncio.sleep(0)
 
@@ -68,7 +79,7 @@ def test_user_event_bus_preserves_order_within_run() -> None:
 def test_user_event_bus_backpressure_drops_oldest_and_emits_sentinel() -> None:
   async def _run() -> None:
     bus = UserEventBus(subscriber_queue_max=2)
-    subscriber = bus.subscribe("alice", control_run_id="run-1")
+    subscriber = _subscribe(bus, "alice", control_run_id="run-1")
 
     first_task = asyncio.create_task(subscriber.__anext__())
     await asyncio.sleep(0)
@@ -99,7 +110,7 @@ def test_user_event_bus_replays_buffer_before_live_tail() -> None:
     await bus.publish("alice", "run-1", {"type": "message", "seq": 2})
     await bus.publish("alice", "run-1", {"type": "message", "seq": 3})
 
-    subscriber = bus.subscribe("alice", control_run_id="run-1")
+    subscriber = _subscribe(bus, "alice", control_run_id="run-1")
     assert await _next_event(subscriber) == {"type": "message", "seq": 2}
     assert await _next_event(subscriber) == {"type": "message", "seq": 3}
 
@@ -283,7 +294,7 @@ def test_user_event_bus_seed_existing_buffer_can_mark_terminal_for_cleanup() -> 
     assert await bus.seed_replay_buffer("alice", "run-1", [], terminated=True) == 0
     await asyncio.sleep(0.05)
 
-    subscriber = bus.subscribe("alice", control_run_id="run-1")
+    subscriber = _subscribe(bus, "alice", control_run_id="run-1")
     next_task = asyncio.create_task(subscriber.__anext__())
     await asyncio.sleep(0)
     with pytest.raises(asyncio.TimeoutError):
@@ -306,7 +317,7 @@ def test_user_event_bus_fast_run_race_replays_after_termination_before_cleanup()
     await bus.publish("alice", "bg_1", {"type": "run_state_changed", "state": "complete"})
     await bus.cleanup_run("alice", "bg_1")
 
-    subscriber = bus.subscribe("alice", control_run_id="bg_1")
+    subscriber = _subscribe(bus, "alice", control_run_id="bg_1")
     assert await _next_event(subscriber) == {"type": "run_state_changed", "state": "running"}
     assert await _next_event(subscriber) == {"type": "run_state_changed", "state": "complete"}
 
@@ -324,7 +335,7 @@ def test_user_event_bus_drops_replay_buffer_after_cleanup_delay() -> None:
     await bus.cleanup_run("alice", "run-1")
     await asyncio.sleep(0.05)
 
-    subscriber = bus.subscribe("alice", control_run_id="run-1")
+    subscriber = _subscribe(bus, "alice", control_run_id="run-1")
     next_task = asyncio.create_task(subscriber.__anext__())
     await asyncio.sleep(0)
     with pytest.raises(asyncio.TimeoutError):
@@ -342,7 +353,7 @@ def test_user_event_bus_drops_replay_buffer_after_cleanup_delay() -> None:
 def test_user_event_bus_shutdown_and_cancelled_subscriber_cleanup_do_not_leak() -> None:
   async def _run() -> None:
     bus = UserEventBus()
-    subscriber = bus.subscribe("alice", control_run_id="run-1")
+    subscriber = _subscribe(bus, "alice", control_run_id="run-1")
     next_task = asyncio.create_task(subscriber.__anext__())
     await asyncio.sleep(0)
 

@@ -19,11 +19,14 @@ from agent_gateway.commercial_usage import (
 from agent_gateway.multi_user.billing import SessionUsageSummary, UsageEvent
 from agent_gateway.usage_reconciliation import CommercialUsageReconciliationTracker
 from agent_gateway.runner_usage import call_usage_event_hook
-from agent_gateway.providers import ModelInfo, ModelProvider, StreamEvent
+from agent_gateway.providers import CostEstimate, ModelInfo, ModelProvider, StreamEvent
 from agent_gateway.usage_outbox import CommercialUsageOutboxError
 from agent_gateway.usage_resilience import (
   CommercialUsageCircuitOpen,
   CommercialUsageDurability,
+)
+from agent_gateway.work_authorization_consumption import (
+  WorkAuthorizationConsumptionRecord,
 )
 from tests.capability_execution_test_support import stub_bound_capability_execution
 
@@ -89,7 +92,7 @@ def _event(**changes) -> UsageEvent:
     registry_revision="test-v1",
     policy_revision="test-v1",
     selection_source="explicit_user",
-  ).receipt()
+  ).to_json()
   facts = {
     "user_id": "123",
     "session_id": "sess_001",
@@ -144,18 +147,49 @@ def _work_start(*, attempt_number: int = 1) -> CommercialWorkStartContext:
     issued_at=NOW,
     expires_at=NOW + 120,
   )
+  consumption = WorkAuthorizationConsumptionRecord(
+    authorization_id=authorization.authorization_id,
+    schema_version=authorization.schema_version,
+    token_sha256=authorization.token_sha256,
+    content_sha256="sha256:" + "b" * 64,
+    key_id=authorization.key_id,
+    environment="prod",
+    execution_context_id=authorization.execution_context_id,
+    workflow_run_id=authorization.workflow_run_id,
+    workflow_attempt_group_id=authorization.workflow_attempt_group_id,
+    workflow_attempt_number=authorization.workflow_attempt_number,
+    retry_of_workflow_run_id=authorization.retry_of_workflow_run_id,
+    workflow_attempt_kind=authorization.workflow_attempt_kind,
+    primary_inference_observability=authorization.primary_inference_observability,
+    funding_route_id=authorization.funding_route_id,
+    provider=authorization.provider,
+    billing_mode=authorization.billing_mode,
+    reservation_id=authorization.reservation_id,
+    operation=authorization.operation,
+    capability_id=authorization.capability_id,
+    request_id=authorization.request_id,
+    session_id=authorization.session_id,
+    issued_at=authorization.issued_at,
+    expires_at=authorization.expires_at,
+    attached_at="2026-07-11T12:00:00Z",
+  )
   return CommercialWorkStartContext(
     claim=claim,
     authorization=authorization,
-    consumption=object(),
+    consumption=consumption,
   )
 
 
 @pytest.mark.asyncio
 async def test_producer_emits_complete_canonical_delta_without_reasoning_double_count() -> None:
   emitted = []
+
+  def sink(payloads):
+    emitted.extend(payloads)
+    return "outbox"
+
   producer = CommercialUsageProducer(
-    enabled=True, claim=_claim(), lineage=_lineage(), sink=emitted.extend
+    enabled=True, claim=_claim(), lineage=_lineage(), sink=sink
   )
   payload = await producer.emit(_event())
 
@@ -186,7 +220,7 @@ async def test_producer_emits_complete_canonical_delta_without_reasoning_double_
 @pytest.mark.asyncio
 async def test_producer_keeps_reported_model_distinct_from_exact_bind() -> None:
   producer = CommercialUsageProducer(
-    enabled=True, claim=_claim(), lineage=_lineage(), sink=lambda _events: None
+    enabled=True, claim=_claim(), lineage=_lineage(), sink=lambda _events: "outbox"
   )
   payload = await producer.emit(
     _event(provider_reported_model="claude-sonnet-test-20260801")
@@ -204,7 +238,7 @@ async def test_producer_rejects_capability_projection_drift() -> None:
     enabled=True,
     claim=_claim(),
     lineage=_lineage(capability_id="different.capability"),
-    sink=lambda _events: None,
+    sink=lambda _events: "lost",
   )
   with pytest.raises(ValueError, match="capability projection differs"):
     await producer.emit(_event())
@@ -213,12 +247,17 @@ async def test_producer_rejects_capability_projection_drift() -> None:
 @pytest.mark.asyncio
 async def test_verified_work_start_emits_attempt_authoritative_usage_v3() -> None:
   emitted = []
+
+  def sink(payloads):
+    emitted.extend(payloads)
+    return "outbox"
+
   work_start = _work_start(attempt_number=2)
   producer = CommercialUsageProducer(
     enabled=True,
     claim=None,
     lineage=None,
-    sink=emitted.extend,
+    sink=sink,
     work_start=work_start,
   )
 
@@ -258,7 +297,7 @@ async def test_usage_v3_rejects_drift_from_verified_work_start(event_changes) ->
     enabled=True,
     claim=None,
     lineage=None,
-    sink=lambda _events: None,
+    sink=lambda _events: "lost",
     work_start=_work_start(),
   )
   with pytest.raises(ValueError, match="differs"):
@@ -274,7 +313,7 @@ async def test_default_off_is_noop_and_hank_funded_lineage_fails_closed() -> Non
     enabled=True,
     claim=_claim(),
     lineage=_lineage(reservation_id=None),
-    sink=lambda _: None,
+    sink=lambda _: "lost",
   )
   with pytest.raises(ValueError, match="requires reservation lineage"):
     await producer.emit(_event())
@@ -299,7 +338,7 @@ async def test_reasoning_cache_and_sink_failures_are_not_silently_dropped() -> N
 @pytest.mark.asyncio
 async def test_source_identity_and_provider_reported_cost_semantics() -> None:
   producer = CommercialUsageProducer(
-    enabled=True, claim=_claim(), lineage=_lineage(), sink=lambda _: None
+    enabled=True, claim=_claim(), lineage=_lineage(), sink=lambda _: "outbox"
   )
 
   with pytest.raises(ValueError, match="source and request identity"):
@@ -324,8 +363,13 @@ async def test_source_identity_and_provider_reported_cost_semantics() -> None:
 @pytest.mark.asyncio
 async def test_typed_provider_units_are_one_atomic_sink_batch() -> None:
   batches = []
+
+  def sink(payloads):
+    batches.append(payloads)
+    return "outbox"
+
   producer = CommercialUsageProducer(
-    enabled=True, claim=_claim(), lineage=_lineage(), sink=batches.append
+    enabled=True, claim=_claim(), lineage=_lineage(), sink=sink
   )
   await producer.emit(_event(provider_unit_deltas={"web_search": 2, "web_fetch": 1}))
 
@@ -413,11 +457,16 @@ def test_commercial_producer_delegates_pre_spend_work_guard() -> None:
 async def test_session_reconciliation_callback_never_emits_second_cost_event() -> None:
   batches = []
   reports = []
+
+  def sink(payloads):
+    batches.append(payloads)
+    return "outbox"
+
   tracker = CommercialUsageReconciliationTracker(
     request_id="req_001", session_id="sess_001"
   )
   producer = CommercialUsageProducer(
-    enabled=True, claim=_claim(), lineage=_lineage(), sink=batches.append,
+    enabled=True, claim=_claim(), lineage=_lineage(), sink=sink,
     reconciliation_tracker=tracker, on_reconciliation=reports.append,
   )
   await producer.emit(_event())
@@ -430,11 +479,13 @@ async def test_session_reconciliation_callback_never_emits_second_cost_event() -
     capability_bind=_event().capability_bind,
   ))
 
+  assert report is not None
   assert report.status == "match"
   assert reports == [report]
   assert len(batches) == 1
   assert len(batches[0]) == 1
   late_report = await producer.mark_late("evt_001")
+  assert late_report is not None
   assert late_report.status == "mismatch"
   assert late_report.late_source_event_ids == ("evt_001",)
   assert reports == [report, late_report]
@@ -583,11 +634,15 @@ async def test_shared_runner_hook_produces_before_legacy_observer() -> None:
       order.append("aggregate")
       return True
 
+  def sink(_):
+    order.append("commercial")
+    return "outbox"
+
   producer = CommercialUsageProducer(
     enabled=True,
     claim=_claim(),
     lineage=_lineage(),
-    sink=lambda _: order.append("commercial"),
+    sink=sink,
   )
   await call_usage_event_hook(
     Aggregator(), _event(), is_summary_emitted=lambda: False,
@@ -627,13 +682,32 @@ async def test_send_prompt_real_producer_emits_metered_canonical_identity() -> N
       )
       yield StreamEvent(type="message_end", stop_reason="end_turn")
 
-    def estimate_cost(self, model, input_tokens, output_tokens, **kwargs):
-      return type("Cost", (), {"total": 0.0042})()
+    def estimate_cost(
+      self,
+      model: str,
+      input_tokens: int,
+      output_tokens: int,
+      cache_read_tokens: int = 0,
+      cache_creation_tokens: int = 0,
+    ) -> CostEstimate:
+      _ = model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
+      return CostEstimate(
+        input_cost=0.0,
+        output_cost=0.0,
+        cache_read_cost=0.0,
+        cache_write_cost=0.0,
+        total=0.0042,
+      )
 
     async def close_client(self, client, timeout=2.0):
       return None
 
   emitted = []
+
+  def sink(payloads):
+    emitted.extend(payloads)
+    return "outbox"
+
   provider = Provider()
   capability_execution = stub_bound_capability_execution(
     provider=provider,
@@ -650,7 +724,7 @@ async def test_send_prompt_real_producer_emits_metered_canonical_identity() -> N
     enabled=True,
     claim=_claim(),
     lineage=_lineage(capability_id="session.driver"),
-    sink=emitted.extend,
+    sink=sink,
   )
 
   await send_prompt_module.send_prompt(

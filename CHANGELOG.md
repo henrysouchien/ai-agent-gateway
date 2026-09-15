@@ -1,5 +1,210 @@
 # Changelog
 
+## 0.18.0 (2026-09-15)
+
+This is a pre-1.0 breaking-minor release. It describes the complete public
+package delta from 0.17.4, not only the final release-preparation changes.
+This section covers the packaged source through commit `35b5ce9d6`.
+
+### Added
+
+- Added immutable, dependency-neutral originated tool-definition records and
+  an MCP catalog API that preserves each definition's exact local or MCP
+  origin and MCP server owner. The existing dictionary-returning API remains a
+  compatibility wrapper and returns fresh mutable copies in the same order.
+- Added a lazy directory-backed control-skill catalog that identity-checks
+  direct skill files, validates frontmatter and semantic metadata, and returns
+  typed non-enumerating refusals for invalid or unavailable selectors.
+- Added typed admitted-skill context and policy projections for autonomous,
+  batch, control, delegated, and retry/resume execution. New admissions carry
+  the compiler-owned skill identity, limits, capability requirements, prompt
+  projection, and exact tool/server ceiling instead of reparsing product skill
+  files inside the package.
+- Added the closed `pack` control-run mode so a named autonomous pack can cross
+  the HTTP/control carrier into the existing runner without an out-of-band
+  process wrapper. Pack, task, skill, and once fields remain mutually
+  exclusive.
+- Added immutable live MCP route bindings, registered MCP tool descriptors,
+  and policy-implementation registries. `McpClientManager` can expose the
+  exact physical or logical route, provider definition, transport, alias
+  provenance, and registration joined for each advertised tool.
+- Added MCP input-preparation routes to `create_agent()` and
+  `run_autonomous()`. Autonomous and server configuration can also inject the
+  registered tool catalog, policy implementations, and preparation,
+  redaction, planning, and approval context factories; server configuration
+  can inject canonical control-profile list and load providers.
+- Added explicit `DurableLocalApprovalRoute`, `ParentDelegatedApprovalRoute`,
+  and `NoApprovalRoute` contracts plus the exported `ApprovalReuseMode`
+  vocabulary for legacy, disabled, and exact reuse.
+- Added owner-minted `NamedRefusal` transport errors and an
+  `AutonomousFileControlAuthority` projection with required path, device, and
+  inode identities for file-mode launch consumers.
+- Added content-bound `spill:v1:` references and the bounded
+  `tool_result_read` page/search contract. Autonomous spill roots can be
+  selected with `AGENT_AUTONOMOUS_TOOL_RESULT_SPILL_DIR` and expire according
+  to `AGENT_AUTONOMOUS_SPILL_TTL_HOURS`.
+- Added `record_paths` to autonomous run and status responses, covering the
+  task manifest, log, event stream, and tool-result spill directory.
+- Added public `ToolDispatcher.run_context` and
+  `with_scoped_local_handler()`. Scoped clones replace one existing local
+  handler without mutating the parent and raise `KeyError` for an absent
+  route; Excel dispatcher clones retain their Excel transport.
+- Added root exports for `CAPABILITY_RESOLUTION_CODES`,
+  `NON_INTERACTIVE_RUN_MODES`, and `SESSION_DRIVER_CAPABILITY`; capability
+  resolution now includes `capability_selection_invalid`.
+- Added durable learning-fork decision diagnostics, provider rate-limit
+  scalars on `stream_retry` and `error` events, and the chars/4
+  `est_system_tokens` and `est_tools_tokens` projections on
+  `stream_complete.usage`.
+
+### Changed
+
+- **Breaking:** Replaced the exported `ControlSkillDefinition` contract with
+  separate `ControlSkillSummary` and `ControlSkillDetail` contracts. Catalog
+  listing now returns body-free summaries, while exact resolution returns a
+  selected detail with its body; selector validation and the list/resolve
+  protocol return types changed accordingly.
+- Canvas artifact sources now use the source ledger's generated `SourceRecord`
+  schema as their sole tool-definition and runtime authority. Caller-authored
+  source mappings are normalized and validated before bundle construction, and
+  malformed ledgers return typed source-stage diagnostics instead of surfacing
+  as internal errors.
+- Gateway tool assembly now consumes exact originated definitions, rejects
+  incoherent MCP ownership and local/MCP name collisions, and retains provider
+  payloads, catalog order, and fresh-copy behavior at compatibility boundaries.
+- Product composition can now inject one compiled summary/detail catalog and
+  one captured skill-context projection across prompt, control, admission, and
+  lifecycle consumers. The generic package directory catalog remains available
+  only for explicitly configured external clients; it is not unioned with or
+  used as a fallback for the injected product authority.
+- Autonomous launch envelopes, persisted run state, capability claims, and SDK
+  runners now preserve the admitted skill facts needed by retry/resume rather
+  than consulting mutable live definitions. Missing or incoherent new-admission
+  facts fail closed while the explicit legacy resolver remains responsible for
+  already persisted historical state.
+- **Breaking:** `issue_investment_capability_claim()` requires the
+  keyword-only `admitted_skill_execution_limits` argument. Quant-research
+  claims require an exact `SkillExecutionLimits` value; other capability
+  claims may pass `None`.
+- **Breaking:** Moved the admitted-skill contracts from
+  `agent_gateway.skill_admission` to `agent_gateway.skill_limits`, renamed
+  `AdmittedSkillExecutionLimits` to `SkillExecutionLimits`, and renamed its
+  mapping conversion functions accordingly.
+- **Breaking:** Renamed `CapabilityResolutionError.receipt()` to
+  `to_error()`; the returned error payload fields are unchanged.
+- **Breaking:** `ToolDispatcher` now receives one `approval_route` instead of
+  independent `store` and `policy` arguments, no longer accepts
+  `mcp_identity_overrides`, and accepts registered catalog, policy,
+  preparation, redaction, and approval callbacks as explicit construction
+  inputs.
+- **Breaking:** `BuildChatRuntime` is now one protocol: four positional-only
+  arguments `(session, request, channel, auth_manager)` followed by the
+  keyword-only `storage_root`. Signature sniffing and the legacy
+  keyword-call variants were removed.
+- The product MCP environment-passthrough table is now an immutable mapping
+  of `frozenset` values. `McpClientManager` and startup accept
+  `Mapping[str, AbstractSet[str]]`; other manager collection inputs accept
+  abstract sets and mappings, including `Mapping[str, float]` timeout
+  overrides.
+- Public annotations now accept abstract excluded-tool sets, iterable state
+  server collections, cached prompt blocks in `AgentSDKRunner.run()`, and
+  arbitrary input to `WorkflowTaskMetadata.from_payload()`.
+  `VerifiedWorkAuthorization.billing_mode` and ordinary autonomous authority
+  kind expose their enforced literal vocabularies, while `parse_effort()`
+  publishes return-type overloads.
+- `product_config.gateway_product_id()` now reads `PRODUCT_ID` on every call.
+  It is no longer LRU-cached, so consumers must not call
+  `gateway_product_id.cache_clear()`.
+- Dispatch applies the provider-request advertised-name snapshot before
+  policy, schema validation, and interceptors for both local and MCP tools.
+  A name absent from the snapshot returns `tool_not_advertised`; an advertised
+  name with no live route remains `unknown_tool`, and a missing live local
+  definition or input schema returns `tool_schema_unavailable`.
+- Tool preparation, approval, redaction, retry eligibility, dispatch,
+  settlement, and source extraction now derive from the exact registered
+  local or MCP route. Child and resumed runs preserve the admitted route and
+  provider-definition snapshots rather than rebuilding them from a live
+  catalog.
+- Autonomous execution is progress-bound: `timeout_seconds` remains accepted
+  but no longer cancels LLM work, and the default concurrent background-task
+  ceiling is six. Turn, token, budget, and event-gap limits remain active.
+- Durable approval requests now carry `approval_reuse_mode` and an optional
+  exact reuse key. Existing rows use the legacy path; registered requests
+  disable reuse without a safe key and cannot turn one-time or mismatched
+  grants into reusable authority.
+- `run_agent` operation descriptions no longer include non-authoritative
+  grant previews. When a host defers a local tool, `tool_not_advertised`
+  identifies its loadable pack when exactly one pack owns it.
+- The autonomous admission ledger is now the launch-nonce store with schema
+  version 2. Its durable schema no longer embeds the transient launch-envelope
+  audience, and the public store types and functions use `LaunchNonce*`
+  names.
+- Static type checkers now resolve the lazy root exports `create_agent`,
+  `create_gateway_app`, `ChatRuntime`, `ChatTurnInputs`, `ChatTurnResult`,
+  `GatewayServerConfig`, `RequestContext`, and `SessionExecutionPolicy`
+  instead of treating them as `Any`; runtime lazy loading is unchanged.
+- `PreparedBusinessModelChange.approval_id` is required, and dispatcher
+  definition callbacks now return concrete lists of definition dictionaries.
+
+### Fixed
+
+- Terminal settlement now drains receipt, named-skill, and detach writes together
+  under repeated cancellation without blocking other sessions. Learning receipts
+  are acknowledged only after persisted success; error fallback appends failure
+  history without discarding earlier durable records or staged evidence.
+- Publish ordinary child settlements even when budget exhaustion or another
+  terminal failure leaves no canonical content. Foreground and background
+  completions preserve the execution reason and available evidence instead of
+  losing the result to parent materialization.
+- Durable multi-turn replay now keeps a tool batch's results together before
+  source annotations. Interrupted native runs persist terminal error results
+  for unanswered tool calls, including calls not yet dispatched, before
+  releasing the session writer; attach recovery applies the same settlement.
+- Source checkouts now report the adjacent `pyproject.toml` package version in
+  health payloads; installed wheels continue to use distribution metadata.
+- Autonomous event-channel JSON accepts shared, non-cyclic container objects
+  while continuing to reject genuine circular references.
+- Control-run message delivery resolves exactly one chat or autonomous owner,
+  and another user's autonomous run remains indistinguishable from a missing
+  run with a 404 response before payload, token-kind, or state checks.
+- Autonomous `research_producer` children now receive their
+  `RESEARCH_PRODUCER_*` settings, `LOCAL_GATEWAY_CONTROL_STATE_ROOT`, and the
+  production claim-launcher `GATEWAY_URL`.
+- Per-user Risk MCP calls receive only a positive Risk user id in `meta.user_id`;
+  non-positive identities are omitted or refused in strict mode.
+- Workspace-less parents can spawn and resume siblings without constructing
+  `Path(None)`, and inline completion envelopes are published even when no
+  durable workspace exists.
+- Recoverable FMS judgment errors are no longer treated as terminal solely
+  because their envelope also carries `gate_code=STOP`; bounded
+  `error.data.got` details are preserved for the repair turn.
+- MCP readiness now derives required tools only from configured transports
+  and their actual `ListTools` exports. Optional or mode-specific classified
+  tools no longer make a healthy runtime report an incomplete catalog.
+- Claim-signing secret transfer now uses the portable non-inheritable
+  `os.pipe()` contract, so autonomous claim launch works on macOS as well as
+  Linux while exposing only the intended read descriptor to the child.
+- Named child runs settle immediately from an accepted terminal tool result,
+  preserve the deterministic projection across resume, and do not repeat the
+  provider call after a later budget stop.
+- Session-log inventory ignores foreign `.jsonl` files in a segment directory
+  instead of rejecting every valid segment in that stream.
+
+### Removed
+
+- Removed the root and `agent_gateway.retry` exports `RetryConfig`,
+  `classify_outcome`, and `run_autonomous_with_retry`, along with
+  `SkillProfile.max_retries`. Autonomous and standalone skill runs are
+  single-attempt; bounded retry remains at registered idempotent/read tool
+  dispatch.
+- Removed the replay-oriented MCP activation exports
+  `MCP_SERVER_ACTIVATED_EVENT`, `ACTIVATION_SOURCE_STAGE_SCOPE`,
+  `mcp_server_activated_event()`, and `fold_mcp_activations()`. Named-operation
+  activation now returns the typed `RunAgentMcpActivationError` contract.
+- Removed the retired `HANK_FORK_BUDGET_USD` and `HANK_FORK_MAX_TURNS`
+  controls and their `DEFAULT_FORK_*`, `fork_budget_default()`, and
+  `fork_max_turns()` exports.
+
 ## 0.17.4 (2026-08-21)
 
 ### Fixed

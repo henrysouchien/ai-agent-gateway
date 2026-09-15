@@ -2,12 +2,16 @@
 
 import asyncio
 import builtins
+import logging
+from datetime import timedelta
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 from types import ModuleType
+from typing import Mapping
 
 import pytest
+from mcp.types import CallToolResult as _ToolResult, TextContent
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
@@ -16,25 +20,79 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import policy_imports
 import agent_gateway.mcp_client as mcp_client_module
-from agent_gateway.mcp_client import McpClientManager, _ServerState
+from agent_gateway.mcp_client import McpClientManager, _ConnectedServerState, _ServerState
+from agent_gateway.mcp_client_connections import McpClientSession
 from agent_gateway.mcp_client_catalog import apply_collision_filtering
-import api.agent.shared.server_policies as api_server_policies
+from agent_workflow_contracts.tool_registration import (
+  McpInputPreparationRoute,
+  index_mcp_input_preparation_routes,
+)
 
 
-class _CaptureLogger:
+class _CaptureLogger(logging.Logger):
   def __init__(self) -> None:
+    super().__init__("mcp-client-catalog-test")
     self.warnings: list[tuple[object, ...]] = []
     self.infos: list[tuple[object, ...]] = []
     self.errors: list[tuple[object, ...]] = []
 
-  def warning(self, message, *args) -> None:
-    self.warnings.append((message, *args))
+  def warning(self, msg: object, *args: object, **kwargs: object) -> None:
+    self.warnings.append((msg, *args))
 
-  def info(self, message, *args) -> None:
-    self.infos.append((message, *args))
+  def info(self, msg: object, *args: object, **kwargs: object) -> None:
+    self.infos.append((msg, *args))
 
-  def error(self, message, *args) -> None:
-    self.errors.append((message, *args))
+  def error(self, msg: object, *args: object, **kwargs: object) -> None:
+    self.errors.append((msg, *args))
+
+
+class _UnusedClientSession:
+  async def call_tool(
+    self,
+    name: str,
+    arguments: Mapping[str, object],
+    *,
+    read_timeout_seconds: timedelta,
+    meta: Mapping[str, object] | None = None,
+  ) -> _ToolResult:
+    raise AssertionError(f"unexpected physical MCP call: {name}")
+
+
+def _metadata_state(
+  name: str,
+  *,
+  tool_prefix: str = "",
+  tool_definitions: list[dict[str, object]] | None = None,
+) -> _ServerState:
+  definitions = tool_definitions or []
+  return _ServerState(
+    name=name,
+    session=_UnusedClientSession(),
+    exit_contexts=[],
+    tool_definitions=definitions,
+    tool_names={
+      str(definition["name"])
+      for definition in definitions
+      if "name" in definition
+    },
+    tool_prefix=tool_prefix,
+  )
+
+
+def _connected_state(
+  name: str,
+  session: McpClientSession,
+  *,
+  config: dict[str, object] | None = None,
+) -> _ConnectedServerState:
+  return _ConnectedServerState(
+    name=name,
+    session=session,
+    exit_contexts=[object()],
+    tool_definitions=[],
+    tool_names=set(),
+    config=config,
+  )
 
 
 def _run(coro):
@@ -44,8 +102,18 @@ def _run(coro):
 def _install_source_html_resolver(monkeypatch, resolver) -> None:
   research_module = ModuleType("research")
   source_html_module = ModuleType("research.source_html")
-  source_html_module.sec_native_symbol_cached_only = resolver
-  research_module.source_html = source_html_module
+  monkeypatch.setattr(
+    source_html_module,
+    "sec_native_symbol_cached_only",
+    resolver,
+    raising=False,
+  )
+  monkeypatch.setattr(
+    research_module,
+    "source_html",
+    source_html_module,
+    raising=False,
+  )
   monkeypatch.setitem(sys.modules, "research", research_module)
   monkeypatch.setitem(sys.modules, "research.source_html", source_html_module)
 
@@ -56,6 +124,21 @@ def _brk_resolver(value):
     "BRK.B": "BRK-B",
     "BRKB": "BRK-B",
   }.get(str(value))
+
+
+def _inject_provider_routes(
+  manager: McpClientManager,
+  *routes: tuple[str, str, str, tuple[str, ...]],
+) -> None:
+  manager._input_preparation_routes = index_mcp_input_preparation_routes(
+    McpInputPreparationRoute(
+      logical_server_id=server_id,
+      logical_name=logical_name,
+      mode=mode,
+      keys=keys,
+    )
+    for server_id, logical_name, mode, keys in routes
+  )
 
 
 def test_apply_collision_filtering_handles_collisions_prefixes_and_hidden_fields() -> None:
@@ -72,7 +155,7 @@ def test_apply_collision_filtering_handles_collisions_prefixes_and_hidden_fields
   servers = {
     "first": SimpleNamespace(
       tool_prefix="",
-      tool_definitions=[
+      published_tool_definitions=[
         {"name": "builtin_tool", "description": "collision", "input_schema": {}},
         first_tool,
       ],
@@ -80,12 +163,12 @@ def test_apply_collision_filtering_handles_collisions_prefixes_and_hidden_fields
     ),
     "second": SimpleNamespace(
       tool_prefix="",
-      tool_definitions=[{"name": "shared_tool", "description": "duplicate", "input_schema": {}}],
+      published_tool_definitions=[{"name": "shared_tool", "description": "duplicate", "input_schema": {}}],
       tool_names=set(),
     ),
     "prefixed": SimpleNamespace(
       tool_prefix="safe_",
-      tool_definitions=[{"name": "shared_tool", "description": "prefixed", "input_schema": {}}],
+      published_tool_definitions=[{"name": "shared_tool", "description": "prefixed", "input_schema": {}}],
       tool_names=set(),
     ),
   }
@@ -101,13 +184,10 @@ def test_apply_collision_filtering_handles_collisions_prefixes_and_hidden_fields
   assert result.tool_to_server == {"shared_tool": "first", "safe_shared_tool": "prefixed"}
   assert result.prefixed_to_original == {"safe_shared_tool": "shared_tool"}
   assert result.mcp_tool_names == {"shared_tool", "safe_shared_tool"}
-  assert servers["first"].tool_definitions == [first_tool]
-  assert servers["first"].tool_names == {"shared_tool"}
-  assert servers["second"].tool_definitions == []
-  assert servers["second"].tool_names == set()
-  assert servers["prefixed"].tool_definitions[0]["name"] == "safe_shared_tool"
-  assert first_tool["input_schema"]["properties"] == {"visible": {}}
-  assert first_tool["input_schema"]["required"] == ["visible"]
+  assert result.tool_definitions[0]["input_schema"]["properties"] == {"visible": {}}
+  assert result.tool_definitions[0]["input_schema"]["required"] == ["visible"]
+  assert first_tool["input_schema"]["properties"] == {"visible": {}, "_session_id": {}}
+  assert first_tool["input_schema"]["required"] == ["visible", "_session_id"]
   assert len(logger.warnings) == 2
   assert logger.warnings[0][1:3] == ("builtin_tool", "first")
   assert logger.warnings[1][1:4] == ("shared_tool", "second", "first")
@@ -119,7 +199,7 @@ def test_apply_collision_filtering_enriches_filing_table_tool_guidance() -> None
   servers = {
     "edgar": SimpleNamespace(
       tool_prefix="edgar_",
-      tool_definitions=[
+      published_tool_definitions=[
         {
           "name": "search_filing_tables",
           "description": "Search filing table metadata.",
@@ -181,7 +261,7 @@ def test_apply_collision_filtering_enriches_filing_read_and_get_filings_guidance
   servers = {
     "research-corpus": SimpleNamespace(
       tool_prefix="",
-      tool_definitions=[
+      published_tool_definitions=[
         {
           "name": "filings_read",
           "description": "Read filing excerpts.",
@@ -201,7 +281,7 @@ def test_apply_collision_filtering_enriches_filing_read_and_get_filings_guidance
     ),
     "edgar-parser": SimpleNamespace(
       tool_prefix="edgar_",
-      tool_definitions=[
+      published_tool_definitions=[
         {
           "name": "get_filings",
           "description": "Get filings.",
@@ -262,7 +342,7 @@ def test_apply_collision_filtering_enriches_price_target_identity_guidance() -> 
   servers = {
     "portfolio-reads": SimpleNamespace(
       tool_prefix="portfolio_",
-      tool_definitions=[
+      published_tool_definitions=[
         {
           "name": "get_price_target",
           "description": "Read a price target.",
@@ -306,7 +386,7 @@ def test_apply_collision_filtering_enriches_model_insights_identity_guidance() -
   servers = {
     "portfolio-reads": SimpleNamespace(
       tool_prefix="portfolio_",
-      tool_definitions=[
+      published_tool_definitions=[
         {
           "name": "get_model_insights",
           "description": "Read model insights.",
@@ -349,7 +429,7 @@ def test_apply_collision_filtering_enriches_industry_peer_comparison_symbol_guid
   servers = {
     "portfolio-reads": SimpleNamespace(
       tool_prefix="portfolio_",
-      tool_definitions=[
+      published_tool_definitions=[
         {
           "name": "industry_peer_comparison",
           "description": "Compare peers.",
@@ -404,7 +484,7 @@ def test_apply_collision_filtering_enriches_gsheets_canonical_argument_guidance(
   servers = {
     "gsheets-mcp": SimpleNamespace(
       tool_prefix="",
-      tool_definitions=[
+      published_tool_definitions=[
         {
           "name": tool_name,
           "description": f"Original description for {tool_name}.",
@@ -456,7 +536,7 @@ def test_apply_collision_filtering_enriches_filing_document_event_and_transcript
   servers = {
     "research-corpus": SimpleNamespace(
       tool_prefix="",
-      tool_definitions=[
+      published_tool_definitions=[
         {
           "name": "transcripts_read",
           "description": "Read transcript excerpts.",
@@ -476,7 +556,7 @@ def test_apply_collision_filtering_enriches_filing_document_event_and_transcript
     ),
     "edgar-parser": SimpleNamespace(
       tool_prefix="edgar_",
-      tool_definitions=[
+      published_tool_definitions=[
         {
           "name": "get_filing_document",
           "description": "Read filing document.",
@@ -553,7 +633,7 @@ def test_parent_apply_collision_filtering_uses_parent_logger(monkeypatch) -> Non
   manager._servers = {
     "gateway": _ServerState(
       name="gateway",
-      session=object(),
+      session=_UnusedClientSession(),
       exit_contexts=[],
       tool_definitions=[
         {"name": "builtin_tool", "description": "collision", "input_schema": {}},
@@ -563,7 +643,7 @@ def test_parent_apply_collision_filtering_uses_parent_logger(monkeypatch) -> Non
     ),
     "prefixed": _ServerState(
       name="prefixed",
-      session=object(),
+      session=_UnusedClientSession(),
       exit_contexts=[],
       tool_definitions=[
         {"name": "remote_tool", "description": "prefixed", "input_schema": {}},
@@ -596,7 +676,7 @@ def test_policy_owner_prefilter_hides_split_server_duplicates_before_collision_w
   manager._servers = {
     "portfolio-reads-mcp": _ServerState(
       name="portfolio-reads-mcp",
-      session=object(),
+      session=_UnusedClientSession(),
       exit_contexts=[],
       tool_definitions=[
         {"name": "get_mcp_context", "description": "reads owner", "input_schema": {}},
@@ -605,7 +685,7 @@ def test_policy_owner_prefilter_hides_split_server_duplicates_before_collision_w
     ),
     "portfolio-writes-mcp": _ServerState(
       name="portfolio-writes-mcp",
-      session=object(),
+      session=_UnusedClientSession(),
       exit_contexts=[],
       tool_definitions=[
         {"name": "get_mcp_context", "description": "stale residual duplicate", "input_schema": {}},
@@ -639,7 +719,7 @@ def test_policy_owner_mismatch_hides_residual_runtime_tool(monkeypatch) -> None:
   manager._servers = {
     "portfolio-reads-mcp": _ServerState(
       name="portfolio-reads-mcp",
-      session=object(),
+      session=_UnusedClientSession(),
       exit_contexts=[],
       tool_definitions=[
         {"name": "execute_trade", "description": "stale residual", "input_schema": {}},
@@ -668,73 +748,38 @@ def test_policy_owner_mismatch_hides_residual_runtime_tool(monkeypatch) -> None:
   assert logger.errors
 
 
-def test_strict_runtime_tool_set_hides_unclassified_gsheets_tools(monkeypatch) -> None:
-  logger = _CaptureLogger()
-  monkeypatch.setattr(mcp_client_module, "log", logger)
+
+def test_gsheets_exported_tools_reach_catalog_without_closed_world_gate() -> None:
   manager = McpClientManager(config_path=None)
   manager._servers = {
     "gsheets-mcp": _ServerState(
       name="gsheets-mcp",
-      session=object(),
+      session=_UnusedClientSession(),
       exit_contexts=[],
       tool_definitions=[
         {"name": "gsheets_read_range", "description": "broker read", "input_schema": {}},
-        {"name": "gsheets_search_spreadsheets", "description": "local only", "input_schema": {}},
-        {"name": "gsheet_read_range", "description": "removed legacy name", "input_schema": {}},
+        {"name": "gsheets_search_spreadsheets", "description": "local search", "input_schema": {}},
       ],
-      tool_names={"gsheets_read_range", "gsheets_search_spreadsheets", "gsheet_read_range"},
+      tool_names={"gsheets_read_range", "gsheets_search_spreadsheets"},
     ),
   }
 
   manager._apply_collision_filtering()
 
-  assert [tool["name"] for tool in manager.get_tool_definitions()] == ["gsheets_read_range"]
+  assert [tool["name"] for tool in manager.get_tool_definitions()] == [
+    "gsheets_read_range",
+    "gsheets_search_spreadsheets",
+  ]
   assert manager.get_server_for_tool("gsheets_read_range") == "gsheets-mcp"
-  assert manager.get_server_for_tool("gsheets_search_spreadsheets") is None
-  assert manager.get_server_for_tool("gsheet_read_range") is None
-  assert manager._servers["gsheets-mcp"].tool_names == {"gsheets_read_range"}
-  diagnostic = manager.get_startup_diagnostics()["gsheets-mcp"]
-  assert diagnostic["category"] == "strict_runtime_tool_set_mismatch"
-  assert "gsheets_search_spreadsheets->unclassified" in diagnostic["message"]
-  assert "gsheet_read_range->unclassified" in diagnostic["message"]
+  assert manager.get_server_for_tool("gsheets_search_spreadsheets") == "gsheets-mcp"
+  assert manager.get_startup_diagnostics() == {}
 
 
-def test_gsheets_closed_world_survives_shared_policy_import_failure(monkeypatch) -> None:
+def test_gsheets_import_failure_keeps_only_built_in_broker_surface(
+  monkeypatch,
+) -> None:
   logger = _CaptureLogger()
   monkeypatch.setattr(mcp_client_module, "log", logger)
-  monkeypatch.setattr(
-    mcp_client_module,
-    "load_server_policy_helpers",
-    lambda: (None, None, None),
-  )
-  monkeypatch.setattr(mcp_client_module, "load_server_policy_module", lambda: None)
-  manager = McpClientManager(config_path=None)
-  manager._servers = {
-    "gsheets-mcp": _ServerState(
-      name="gsheets-mcp",
-      session=object(),
-      exit_contexts=[],
-      tool_definitions=[
-        {"name": "gsheets_read_range", "description": "broker read", "input_schema": {}},
-        {"name": "gsheets_search_spreadsheets", "description": "local only", "input_schema": {}},
-        {"name": "gsheet_read_range", "description": "removed legacy name", "input_schema": {}},
-      ],
-      tool_names={"gsheets_read_range", "gsheets_search_spreadsheets", "gsheet_read_range"},
-    ),
-  }
-
-  manager._apply_collision_filtering()
-
-  assert [tool["name"] for tool in manager.get_tool_definitions()] == ["gsheets_read_range"]
-  assert manager.get_server_for_tool("gsheets_read_range") == "gsheets-mcp"
-  assert manager.get_server_for_tool("gsheets_search_spreadsheets") is None
-  assert manager.get_server_for_tool("gsheet_read_range") is None
-  diagnostic = manager.get_startup_diagnostics()["gsheets-mcp"]
-  assert diagnostic["category"] == "strict_runtime_tool_set_mismatch"
-  assert any("built-in Google Sheets cutover policy" in str(entry[0]) for entry in logger.warnings)
-
-
-def test_gsheets_read_classification_survives_shared_policy_import_failure(monkeypatch) -> None:
   monkeypatch.setattr(
     mcp_client_module,
     "load_server_policy_helpers",
@@ -744,7 +789,81 @@ def test_gsheets_read_classification_survives_shared_policy_import_failure(monke
   manager._servers = {
     "gsheets-mcp": _ServerState(
       name="gsheets-mcp",
-      session=object(),
+      session=_UnusedClientSession(),
+      exit_contexts=[],
+      tool_definitions=[
+        {"name": "gsheets_read_range", "description": "broker read", "input_schema": {}},
+        {"name": "gsheets_search_spreadsheets", "description": "local search", "input_schema": {}},
+        {"name": "gsheet_read_range", "description": "legacy alias", "input_schema": {}},
+      ],
+      tool_names={
+        "gsheets_read_range",
+        "gsheets_search_spreadsheets",
+        "gsheet_read_range",
+      },
+    ),
+  }
+
+  manager._apply_collision_filtering()
+
+  assert [tool["name"] for tool in manager.get_tool_definitions()] == [
+    "gsheets_read_range",
+  ]
+  assert manager.get_server_for_tool("gsheets_read_range") == "gsheets-mcp"
+  assert manager.get_server_for_tool("gsheets_search_spreadsheets") is None
+  assert manager.get_server_for_tool("gsheet_read_range") is None
+  assert any(
+    "built-in Google Sheets broker surface" in str(entry[0])
+    for entry in logger.warnings
+  )
+
+
+def test_unclassified_configured_server_tools_reach_catalog_merge() -> None:
+  manager = McpClientManager(config_path=None)
+  manager._servers = {
+    "idea-workbench-mcp": _ServerState(
+      name="idea-workbench-mcp",
+      session=_UnusedClientSession(),
+      exit_contexts=[],
+      tool_definitions=[
+        {"name": "get_scan_payload", "description": "classified read", "input_schema": {}},
+        {"name": "unclassified_read_helper", "description": "exported read", "input_schema": {}},
+        {"name": "unclassified_write_helper", "description": "exported write", "input_schema": {}},
+      ],
+      tool_names={
+        "get_scan_payload",
+        "unclassified_read_helper",
+        "unclassified_write_helper",
+      },
+    ),
+  }
+
+  manager._apply_collision_filtering()
+
+  assert [tool["name"] for tool in manager.get_tool_definitions()] == [
+    "get_scan_payload",
+    "unclassified_read_helper",
+    "unclassified_write_helper",
+  ]
+  assert manager.get_server_for_tool("get_scan_payload") == "idea-workbench-mcp"
+  assert manager.get_server_for_tool("unclassified_read_helper") == "idea-workbench-mcp"
+  assert manager.get_server_for_tool("unclassified_write_helper") == "idea-workbench-mcp"
+  assert manager.get_startup_diagnostics() == {}
+
+
+
+
+def test_gsheets_read_classification_survives_policy_import_failure_with_base_state(monkeypatch) -> None:
+  monkeypatch.setattr(
+    mcp_client_module,
+    "load_server_policy_helpers",
+    lambda: (None, None, None),
+  )
+  manager = McpClientManager(config_path=None)
+  manager._servers = {
+    "gsheets-mcp": _ServerState(
+      name="gsheets-mcp",
+      session=_UnusedClientSession(),
       exit_contexts=[object()],
       tool_definitions=[],
       tool_names={"gsheets_read_range"},
@@ -767,6 +886,7 @@ def test_gsheets_read_classification_survives_shared_policy_import_failure(monke
   result, error = _run(manager.call_tool("gsheets_read_range", {}))
 
   assert result is None
+  assert error is not None
   assert error["sub_code"] == "sheets_transport_error"
   assert error["data"]["error"]["outcome"] == {
     "state": "unchanged",
@@ -777,43 +897,6 @@ def test_gsheets_read_classification_survives_shared_policy_import_failure(monke
   assert error["data"]["error"]["retry"]["automatic"] is False
   assert "upstream detail" not in str(error)
   assert reconnects == ["gsheets_read_range"]
-
-
-def test_policy_owner_invariant_falls_back_to_api_import(monkeypatch) -> None:
-  logger = _CaptureLogger()
-  monkeypatch.setattr(mcp_client_module, "log", logger)
-
-  def fake_import_module(name: str):
-    if name == "agent.shared.server_policies":
-      raise ModuleNotFoundError("No module named 'agent'", name="agent")
-    if name == "api.agent.shared.server_policies":
-      return api_server_policies
-    raise AssertionError(f"unexpected import: {name}")
-
-  monkeypatch.setattr(policy_imports.importlib, "import_module", fake_import_module)
-  monkeypatch.setattr(
-    api_server_policies,
-    "get_server_for_policy_tool",
-    lambda tool_name: "portfolio-trades-mcp" if tool_name == "execute_trade" else None,
-  )
-  manager = McpClientManager(config_path=None)
-  manager._servers = {
-    "portfolio-reads-mcp": _ServerState(
-      name="portfolio-reads-mcp",
-      session=object(),
-      exit_contexts=[],
-      tool_definitions=[
-        {"name": "execute_trade", "description": "stale residual", "input_schema": {}},
-      ],
-      tool_names={"execute_trade"},
-    ),
-  }
-
-  manager._apply_collision_filtering()
-
-  assert manager.get_tool_definitions() == []
-  assert manager.is_mcp_tool("execute_trade") is False
-  assert manager.get_startup_diagnostics()["portfolio-reads-mcp"]["category"] == "policy_owner_mismatch"
 
 
 def test_policy_owner_invariant_raises_when_policy_import_dependency_breaks(
@@ -827,35 +910,7 @@ def test_policy_owner_invariant_raises_when_policy_import_dependency_breaks(
   manager._servers = {
     "portfolio-reads-mcp": _ServerState(
       name="portfolio-reads-mcp",
-      session=object(),
-      exit_contexts=[],
-      tool_definitions=[
-        {"name": "execute_trade", "description": "stale residual", "input_schema": {}},
-      ],
-      tool_names={"execute_trade"},
-    ),
-  }
-
-  with pytest.raises(ModuleNotFoundError, match="broken_dependency"):
-    manager._apply_collision_filtering()
-
-
-def test_policy_owner_invariant_raises_when_api_policy_import_dependency_breaks(
-  monkeypatch,
-) -> None:
-  def fake_import_module(name: str):
-    if name == "agent.shared.server_policies":
-      raise ModuleNotFoundError("No module named 'agent'", name="agent")
-    if name == "api.agent.shared.server_policies":
-      raise ModuleNotFoundError("No module named 'broken_dependency'", name="broken_dependency")
-    raise AssertionError(f"unexpected import: {name}")
-
-  monkeypatch.setattr(policy_imports.importlib, "import_module", fake_import_module)
-  manager = McpClientManager(config_path=None)
-  manager._servers = {
-    "portfolio-reads-mcp": _ServerState(
-      name="portfolio-reads-mcp",
-      session=object(),
+      session=_UnusedClientSession(),
       exit_contexts=[],
       tool_definitions=[
         {"name": "execute_trade", "description": "stale residual", "input_schema": {}},
@@ -875,7 +930,7 @@ def test_policy_owner_invariant_uses_original_name_for_prefixed_tools(monkeypatc
   manager._servers = {
     "portfolio-trades-mcp": _ServerState(
       name="portfolio-trades-mcp",
-      session=object(),
+      session=_UnusedClientSession(),
       exit_contexts=[],
       tool_definitions=[
         {"name": "execute_trade", "description": "split", "input_schema": {}},
@@ -905,10 +960,30 @@ def test_policy_owner_invariant_uses_original_name_for_prefixed_tools(monkeypatc
 def test_provider_symbol_translation_allows_scalar_symbol_and_ticker_keys(monkeypatch) -> None:
   _install_source_html_resolver(monkeypatch, _brk_resolver)
   manager = McpClientManager(config_path=None)
+  _inject_provider_routes(
+    manager,
+    ("market-data-mcp", "fetch_financials", "scalar", ("symbol",)),
+    ("edgar-parser-mcp", "get_filings", "scalar", ("ticker",)),
+    (
+      "edgar-parser-mcp",
+      "get_operational_kpi_driver_rows",
+      "scalar",
+      ("ticker",),
+    ),
+  )
 
-  assert manager._translate_provider_symbol("fetch_financials", {"symbol": "BRKB"}) == {"symbol": "BRK-B"}
-  assert manager._translate_provider_symbol("get_filings", {"ticker": "BRKB"}) == {"ticker": "BRK-B"}
   assert manager._translate_provider_symbol(
+    "market-data-mcp",
+    "fetch_financials",
+    {"symbol": "BRKB"},
+  ) == {"symbol": "BRK-B"}
+  assert manager._translate_provider_symbol(
+    "edgar-parser-mcp",
+    "get_filings",
+    {"ticker": "BRKB"},
+  ) == {"ticker": "BRK-B"}
+  assert manager._translate_provider_symbol(
+    "edgar-parser-mcp",
     "get_operational_kpi_driver_rows",
     {"ticker": "BRKB", "year": 2025, "quarter": 4},
   ) == {"ticker": "BRK-B", "year": 2025, "quarter": 4}
@@ -919,33 +994,49 @@ def test_provider_symbol_translation_leaves_non_allowlisted_tool_untouched(monke
   manager = McpClientManager(config_path=None)
   payload = {"symbol": "BRKB"}
 
-  assert manager._translate_provider_symbol("not_a_provider_tool", payload) is payload
+  assert manager._translate_provider_symbol(
+    "market-data-mcp",
+    "not_a_provider_tool",
+    payload,
+  ) is payload
   assert payload == {"symbol": "BRKB"}
 
 
 def test_provider_symbol_translation_uses_original_name_for_prefixed_tool(monkeypatch) -> None:
   _install_source_html_resolver(monkeypatch, _brk_resolver)
   manager = McpClientManager(config_path=None)
+  _inject_provider_routes(
+    manager,
+    ("edgar-parser-mcp", "get_filings", "scalar", ("ticker",)),
+  )
 
   class _Session:
     def __init__(self) -> None:
       self.calls = []
 
-    async def call_tool(self, name, tool_input, *, read_timeout_seconds, meta=None):
+    async def call_tool(
+      self,
+      name: str,
+      arguments: Mapping[str, object],
+      *,
+      read_timeout_seconds: timedelta,
+      meta: Mapping[str, object] | None = None,
+    ) -> _ToolResult:
       self.calls.append(
         {
           "name": name,
-          "tool_input": tool_input,
+          "tool_input": arguments,
           "read_timeout_seconds": read_timeout_seconds,
           "meta": meta,
         }
       )
-      return SimpleNamespace(isError=False, structuredContent={"ok": True}, content=None)
+      return _ToolResult(isError=False, structuredContent={"ok": True}, content=[])
 
   session = _Session()
   manager._tool_to_server = {"safe_get_filings": "edgar-parser-mcp"}
   manager._prefixed_to_original = {"safe_get_filings": "get_filings"}
-  manager._servers = {"edgar-parser-mcp": SimpleNamespace(session=session)}
+  manager._servers = {"edgar-parser-mcp": _connected_state("edgar-parser-mcp", session)}
+  manager.get_policy_tool_name = lambda _name: "get_filings"  # type: ignore[method-assign]
 
   result, error = _run(manager.call_tool("safe_get_filings", {"ticker": "BRKB"}))
 
@@ -958,53 +1049,138 @@ def test_provider_symbol_translation_uses_original_name_for_prefixed_tool(monkey
 def test_provider_symbol_translation_fmp_profile_dual_key_atomicity(monkeypatch) -> None:
   _install_source_html_resolver(monkeypatch, _brk_resolver)
   manager = McpClientManager(config_path=None)
+  _inject_provider_routes(
+    manager,
+    (
+      "market-data-mcp",
+      "fetch_company_profile",
+      "consistent-present-keys",
+      ("symbol", "ticker"),
+    ),
+  )
 
   assert manager._translate_provider_symbol(
+    "market-data-mcp",
     "fetch_company_profile",
     {"symbol": "BRKB", "ticker": "BRK-B"},
   ) == {"symbol": "BRK-B", "ticker": "BRK-B"}
 
   conflicting = {"symbol": "BRKB", "ticker": "AAPL"}
-  assert manager._translate_provider_symbol("fetch_company_profile", conflicting) == conflicting
+  assert manager._translate_provider_symbol(
+    "market-data-mcp",
+    "fetch_company_profile",
+    conflicting,
+  ) == conflicting
 
 
 def test_provider_symbol_translation_comma_tokens(monkeypatch) -> None:
   _install_source_html_resolver(monkeypatch, _brk_resolver)
   manager = McpClientManager(config_path=None)
+  _inject_provider_routes(
+    manager,
+    ("market-data-mcp", "get_news", "comma-separated", ("symbols",)),
+  )
 
-  assert manager._translate_provider_symbol("get_news", {"symbols": "BRKB,AAPL"}) == {
+  assert manager._translate_provider_symbol(
+    "market-data-mcp",
+    "get_news",
+    {"symbols": "BRKB,AAPL"},
+  ) == {
     "symbols": "BRK-B,AAPL",
   }
+
+
+def test_provider_symbol_translation_never_matches_same_bare_name_on_wrong_server(
+  monkeypatch,
+) -> None:
+  _install_source_html_resolver(monkeypatch, _brk_resolver)
+  route = McpInputPreparationRoute(
+    logical_server_id="market-data-mcp",
+    logical_name="fetch_financials",
+    mode="scalar",
+    keys=("symbol",),
+  )
+  manager = McpClientManager(
+    config_path=None,
+    input_preparation_routes=(route,),
+  )
+  original = {"symbol": "BRKB"}
+
+  assert manager._translate_provider_symbol(
+    "edgar-parser-mcp",
+    "fetch_financials",
+    original,
+  ) is original
 
 
 def test_provider_symbol_translation_excludes_list_nested_and_secondary_fields(monkeypatch) -> None:
   _install_source_html_resolver(monkeypatch, _brk_resolver)
   manager = McpClientManager(config_path=None)
+  _inject_provider_routes(
+    manager,
+    ("market-data-mcp", "compare_peers", "scalar", ("symbol",)),
+    (
+      "portfolio-reads-mcp",
+      "industry_peer_comparison",
+      "scalar",
+      ("symbol",),
+    ),
+    ("edgar-parser-mcp", "get_event_filings", "scalar", ("ticker",)),
+    ("edgar-parser-mcp", "get_filing_evidence", "scalar", ("ticker",)),
+  )
 
   compare_concept = {"tickers": ["BRKB", "AAPL"]}
   compare_filing_tables = {"tickers": ["BRKB", "AAPL"]}
   warm_metric_cache = {"items": [{"ticker": "BRKB"}]}
-  assert manager._translate_provider_symbol("compare_concept", compare_concept) is compare_concept
-  assert manager._translate_provider_symbol("compare_filing_tables", compare_filing_tables) is compare_filing_tables
-  assert manager._translate_provider_symbol("warm_metric_cache", warm_metric_cache) is warm_metric_cache
+  assert manager._translate_provider_symbol(
+    "edgar-parser-mcp",
+    "compare_concept",
+    compare_concept,
+  ) is compare_concept
+  assert manager._translate_provider_symbol(
+    "edgar-parser-mcp",
+    "compare_filing_tables",
+    compare_filing_tables,
+  ) is compare_filing_tables
+  assert manager._translate_provider_symbol(
+    "edgar-parser-mcp",
+    "warm_metric_cache",
+    warm_metric_cache,
+  ) is warm_metric_cache
 
   compare_peers = {"symbol": "BRKB", "peers": ["BRKB", "AAPL"]}
-  assert manager._translate_provider_symbol("compare_peers", compare_peers) == {
+  assert manager._translate_provider_symbol(
+    "market-data-mcp",
+    "compare_peers",
+    compare_peers,
+  ) == {
     "symbol": "BRK-B",
     "peers": ["BRKB", "AAPL"],
   }
-  assert manager._translate_provider_symbol("industry_peer_comparison", {"symbol": "BRKB"}) == {
+  assert manager._translate_provider_symbol(
+    "portfolio-reads-mcp",
+    "industry_peer_comparison",
+    {"symbol": "BRKB"},
+  ) == {
     "symbol": "BRK-B",
   }
 
   event_filings = {"ticker": "BRKB", "related_tickers": ["BRKB", "AAPL"]}
-  assert manager._translate_provider_symbol("get_event_filings", event_filings) == {
+  assert manager._translate_provider_symbol(
+    "edgar-parser-mcp",
+    "get_event_filings",
+    event_filings,
+  ) == {
     "ticker": "BRK-B",
     "related_tickers": ["BRKB", "AAPL"],
   }
 
   filing_evidence = {"ticker": "BRKB", "related_tickers": ["BRKB", "AAPL"]}
-  assert manager._translate_provider_symbol("get_filing_evidence", filing_evidence) == {
+  assert manager._translate_provider_symbol(
+    "edgar-parser-mcp",
+    "get_filing_evidence",
+    filing_evidence,
+  ) == {
     "ticker": "BRK-B",
     "related_tickers": ["BRKB", "AAPL"],
   }
@@ -1015,10 +1191,19 @@ def test_provider_symbol_translation_copy_not_mutate_and_retry_reuses_effective_
   manager = McpClientManager(
     config_path=None,
     logical_server_routes={"market-data-mcp": "fmp-mcp"},
+    input_preparation_routes=(
+      McpInputPreparationRoute(
+        logical_server_id="market-data-mcp",
+        logical_name="fetch_financials",
+        mode="scalar",
+        keys=("symbol",),
+      ),
+    ),
   )
   manager._tool_to_server = {"fetch_financials": "market-data-mcp"}
   manager._dispatch_to_original = {"fetch_financials": "fmp_fetch"}
-  manager._servers = {"fmp-mcp": SimpleNamespace(session=object())}
+  manager._servers = {"fmp-mcp": _metadata_state("fmp-mcp")}
+  manager.get_policy_tool_name = lambda _name: "fetch_financials"  # type: ignore[method-assign]
   original_input = {"symbol": "BRKB", "other": {"nested": True}}
   seen_inputs = []
 
@@ -1028,7 +1213,7 @@ def test_provider_symbol_translation_copy_not_mutate_and_retry_reuses_effective_
 
   async def fake_retry_stdio_tool_call_after_reconnect(**kwargs):
     seen_inputs.append(kwargs["tool_input"])
-    return SimpleNamespace(isError=False, structuredContent={"ok": True}, content=None)
+    return _ToolResult(isError=False, structuredContent={"ok": True}, content=[])
 
   manager._call_tool_once = fake_call_tool_once
   manager._retry_stdio_tool_call_after_reconnect = fake_retry_stdio_tool_call_after_reconnect
@@ -1043,8 +1228,118 @@ def test_provider_symbol_translation_copy_not_mutate_and_retry_reuses_effective_
   assert seen_inputs[0] == {"symbol": "BRK-B", "other": {"nested": True}}
 
 
+def test_call_tool_disables_uncertain_replay_but_reconnects_for_future() -> None:
+  manager = McpClientManager(config_path=None)
+  original_session = _UnusedClientSession()
+  replacement_session = _UnusedClientSession()
+  server = _ConnectedServerState(
+    name="fred-mcp",
+    session=original_session,
+    exit_contexts=[object()],
+    tool_definitions=[{"name": "fred_search", "description": "", "input_schema": {}}],
+    tool_names={"fred_search"},
+    config={"type": "stdio", "command": "fred-mcp"},
+  )
+  manager._servers = {"fred-mcp": server}
+  manager._tool_to_server = {"fred_search": "fred-mcp"}
+  physical_calls = []
+
+  async def fail_once(**kwargs):
+    physical_calls.append(kwargs["original_name"])
+    if kwargs["server"].session is original_session:
+      raise EOFError("connection closed")
+    return _ToolResult(isError=False, structuredContent={"status": "success"}, content=[])
+
+  async def connect(name, config):
+    return _ConnectedServerState(
+      name="fred-mcp",
+      session=replacement_session,
+      exit_contexts=[object()],
+      tool_definitions=[{"name": "fred_search", "description": "", "input_schema": {}}],
+      tool_names={"fred_search"},
+      config=config,
+    )
+
+  manager._call_tool_once = fail_once
+  manager._close_contexts = lambda contexts, *, close_timeout_seconds=5.0: asyncio.sleep(0)
+  manager._connect_stdio_with_retries = connect
+
+  result, error = _run(manager.call_tool(
+    "fred_search",
+    {"query": "inflation"},
+    allow_uncertain_replay=False,
+  ))
+
+  assert result is None
+  assert error is not None
+  assert error["sub_code"] == "connection_error"
+  assert physical_calls == ["fred_search"]
+  result, error = _run(manager.call_tool("fred_search", {"query": "inflation"}))
+  assert error is None
+  assert result == {"status": "success"}
+  assert physical_calls == ["fred_search", "fred_search"]
+
+
+def test_call_tool_default_preserves_one_stdio_replay() -> None:
+  manager = McpClientManager(config_path=None)
+  server = _ConnectedServerState(
+    name="fred-mcp",
+    session=_UnusedClientSession(),
+    exit_contexts=[object()],
+    tool_definitions=[],
+    tool_names={"fred_search"},
+    config={"type": "stdio", "command": "fred-mcp"},
+  )
+  manager._servers = {"fred-mcp": server}
+  manager._tool_to_server = {"fred_search": "fred-mcp"}
+  physical_calls = 0
+
+  async def invoke(**_kwargs):
+    nonlocal physical_calls
+    physical_calls += 1
+    if physical_calls == 1:
+      raise EOFError("connection closed")
+    return _ToolResult(
+      isError=False,
+      structuredContent={"status": "success"},
+      content=[],
+    )
+
+  async def connect(name, config):
+    return _ConnectedServerState(
+      name="fred-mcp",
+      session=_UnusedClientSession(),
+      exit_contexts=[object()],
+      tool_definitions=[],
+      tool_names={"fred_search"},
+      config=config,
+    )
+
+  manager._call_tool_once = invoke
+  manager._close_contexts = lambda contexts, *, close_timeout_seconds=5.0: asyncio.sleep(0)
+  manager._connect_stdio_with_retries = connect
+
+  result, error = _run(manager.call_tool("fred_search", {"query": "rates"}))
+
+  assert error is None
+  assert result == {"status": "success"}
+  assert physical_calls == 2
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "false"])
+def test_call_tool_requires_exact_bool_for_uncertain_replay(value) -> None:
+  manager = McpClientManager(config_path=None)
+
+  with pytest.raises(TypeError, match="exact bool"):
+    _run(manager.call_tool("missing", {}, allow_uncertain_replay=value))
+
+
 def test_provider_symbol_translation_import_failure_returns_original(monkeypatch) -> None:
   manager = McpClientManager(config_path=None)
+  _inject_provider_routes(
+    manager,
+    ("market-data-mcp", "fetch_financials", "scalar", ("symbol",)),
+  )
   payload = {"symbol": "BRKB"}
   real_import = builtins.__import__
 
@@ -1055,7 +1350,11 @@ def test_provider_symbol_translation_import_failure_returns_original(monkeypatch
 
   monkeypatch.setattr(builtins, "__import__", fail_research_source_html_import)
 
-  assert manager._translate_provider_symbol("fetch_financials", payload) is payload
+  assert manager._translate_provider_symbol(
+    "market-data-mcp",
+    "fetch_financials",
+    payload,
+  ) is payload
 
 
 def test_provider_symbol_translation_resolver_error_returns_original(monkeypatch) -> None:
@@ -1064,16 +1363,24 @@ def test_provider_symbol_translation_resolver_error_returns_original(monkeypatch
 
   _install_source_html_resolver(monkeypatch, raising_resolver)
   manager = McpClientManager(config_path=None)
+  _inject_provider_routes(
+    manager,
+    ("market-data-mcp", "fetch_financials", "scalar", ("symbol",)),
+  )
   payload = {"symbol": "BRKB"}
 
-  assert manager._translate_provider_symbol("fetch_financials", payload) is payload
+  assert manager._translate_provider_symbol(
+    "market-data-mcp",
+    "fetch_financials",
+    payload,
+  ) is payload
 
 
 def test_generic_stdio_sheets_mutation_transport_loss_reconnects_without_replay() -> None:
   manager = McpClientManager(config_path=None)
-  server = _ServerState(
+  server = _ConnectedServerState(
     name="gsheets-mcp",
-    session=object(),
+    session=_UnusedClientSession(),
     exit_contexts=[object()],
     tool_definitions=[],
     tool_names={"gsheets_write_range"},
@@ -1105,6 +1412,7 @@ def test_generic_stdio_sheets_mutation_transport_loss_reconnects_without_replay(
   ))
 
   assert result is None
+  assert error is not None
   assert error["sub_code"] == "mutation_outcome_uncertain"
   assert error["data"]["error"]["outcome"] == {
     "state": "uncertain",
@@ -1120,9 +1428,9 @@ def test_generic_stdio_sheets_mutation_transport_loss_reconnects_without_replay(
 
 def test_generic_stdio_sheets_mutation_timeout_reconnects_without_replay() -> None:
   manager = McpClientManager(config_path=None)
-  server = _ServerState(
+  server = _ConnectedServerState(
     name="gsheets-mcp",
-    session=object(),
+    session=_UnusedClientSession(),
     exit_contexts=[object()],
     tool_definitions=[],
     tool_names={"gsheets_append_rows"},
@@ -1154,6 +1462,7 @@ def test_generic_stdio_sheets_mutation_timeout_reconnects_without_replay() -> No
   ))
 
   assert result is None
+  assert error is not None
   assert error["sub_code"] == "mutation_outcome_uncertain"
   assert error["data"]["error"]["outcome"] == {
     "state": "uncertain",
@@ -1167,26 +1476,40 @@ def test_generic_stdio_sheets_mutation_timeout_reconnects_without_replay() -> No
   assert reconnects == ["gsheets_append_rows"]
 
 
+
 def test_sheets_requires_direct_structured_result_but_other_servers_keep_json_fallback() -> None:
-  text_result = SimpleNamespace(
+  text_result = _ToolResult(
     isError=False,
     structuredContent=None,
-    content=[SimpleNamespace(text='{"status":"ok","value":1}')],
+    content=[TextContent(type="text", text='{"status":"ok","value":1}')],
   )
 
   sheets = McpClientManager(config_path=None)
-  sheets._servers = {"gsheets-mcp": SimpleNamespace(session=object(), config={"type": "stdio"})}
+  sheets._servers = {
+    "gsheets-mcp": _connected_state(
+      "gsheets-mcp",
+      _UnusedClientSession(),
+      config={"type": "stdio"},
+    ),
+  }
   sheets._tool_to_server = {"gsheets_read_range": "gsheets-mcp"}
   sheets._call_tool_once = lambda **_: asyncio.sleep(0, result=text_result)
 
   sheets_result, sheets_error = _run(sheets.call_tool("gsheets_read_range", {}))
 
   assert sheets_result is None
+  assert sheets_error is not None
   assert sheets_error["sub_code"] == "invalid_sheets_result_contract"
   assert sheets_error["data"]["error"]["outcome"]["state"] == "unchanged"
 
   other = McpClientManager(config_path=None)
-  other._servers = {"other-mcp": SimpleNamespace(session=object(), config={"type": "stdio"})}
+  other._servers = {
+    "other-mcp": _connected_state(
+      "other-mcp",
+      _UnusedClientSession(),
+      config={"type": "stdio"},
+    ),
+  }
   other._tool_to_server = {"other_read": "other-mcp"}
   other._call_tool_once = lambda **_: asyncio.sleep(0, result=text_result)
 
@@ -1194,3 +1517,251 @@ def test_sheets_requires_direct_structured_result_but_other_servers_keep_json_fa
 
   assert other_error is None
   assert other_result == {"status": "ok", "value": 1}
+
+
+def test_server_tool_definition_records_preserve_physical_order_and_prefix() -> None:
+  manager = McpClientManager(config_path=None)
+  manager._servers = {
+    "second-mcp": _metadata_state(
+      "second-mcp",
+      tool_definitions=[
+        {"name": "second_tool", "input_schema": {"type": "object"}},
+      ],
+    ),
+    "first-mcp": _metadata_state(
+      "first-mcp",
+      tool_prefix="prefixed_",
+      tool_definitions=[
+        {"name": "prefixed_first_tool", "input_schema": {"type": "object"}},
+      ],
+    ),
+  }
+  manager._tool_to_server = {
+    "second_tool": "second-mcp",
+    "prefixed_first_tool": "first-mcp",
+  }
+
+  records = manager.get_server_tool_definition_records({
+    "first-mcp",
+    "second-mcp",
+  })
+
+  assert tuple(record.name for record in records) == (
+    "second_tool",
+    "prefixed_first_tool",
+  )
+  assert tuple(record.server_id for record in records) == (
+    "second-mcp",
+    "first-mcp",
+  )
+  assert all(record.origin == "mcp" for record in records)
+  expected = [record.materialize() for record in records]
+  assert manager.get_server_tool_definitions({
+    "first-mcp",
+    "second-mcp",
+  }) == expected
+  materialized = manager.get_server_tool_definitions({"second-mcp"})
+  materialized[0]["name"] = "changed"
+  assert manager.get_server_tool_definitions({"second-mcp"})[0]["name"] == (
+    "second_tool"
+  )
+
+
+def test_server_tool_definition_records_refuse_owner_map_corruption() -> None:
+  manager = McpClientManager(config_path=None)
+  manager._servers = {
+    "server-mcp": _metadata_state(
+      "server-mcp",
+      tool_definitions=[{"name": "owned_tool", "input_schema": {}}],
+    ),
+  }
+  manager._tool_to_server = {"owned_tool": "other-mcp"}
+
+  with pytest.raises(ValueError, match="owner"):
+    manager.get_server_tool_definition_records({"server-mcp"})
+
+
+def test_server_tool_route_bindings_preserve_physical_order_and_routes() -> None:
+  manager = McpClientManager(
+    config_path=None,
+    provider_ids_by_server={
+      "second-mcp": "second-provider",
+      "first-mcp": "first-provider",
+    },
+  )
+  manager._servers = {
+    "second-mcp": _metadata_state(
+      "second-mcp",
+      tool_definitions=[
+        {"name": "second_tool", "input_schema": {"type": "object"}},
+      ],
+    ),
+    "first-mcp": _metadata_state(
+      "first-mcp",
+      tool_prefix="prefixed_",
+      tool_definitions=[
+        {
+          "name": "prefixed_first_tool",
+          "input_schema": {"type": "object"},
+        },
+      ],
+    ),
+  }
+  manager._tool_to_server = {
+    "second_tool": "second-mcp",
+    "prefixed_first_tool": "first-mcp",
+  }
+  manager._prefixed_to_original = {
+    "prefixed_first_tool": "first_tool",
+  }
+  manager._tool_definitions = [
+    *manager._servers["second-mcp"].tool_definitions,
+    *manager._servers["first-mcp"].tool_definitions,
+  ]
+
+  bindings = manager.get_server_tool_route_bindings({
+    "first-mcp",
+    "second-mcp",
+  })
+
+  assert tuple(binding.exposed_name for binding in bindings) == (
+    "second_tool",
+    "prefixed_first_tool",
+  )
+  assert tuple(binding.route_kind for binding in bindings) == (
+    "physical",
+    "physical",
+  )
+  assert tuple(binding.logical_name for binding in bindings) == (
+    "second_tool",
+    "first_tool",
+  )
+  assert tuple(binding.provider_original_name for binding in bindings) == (
+    "second_tool",
+    "first_tool",
+  )
+  assert tuple(binding.transport_server_id for binding in bindings) == (
+    "second-mcp",
+    "first-mcp",
+  )
+  assert tuple(binding.provider_id for binding in bindings) == (
+    "second-provider",
+    "first-provider",
+  )
+  assert manager.get_policy_tool_name("second_tool") == "second_tool"
+  assert manager.get_policy_tool_name("prefixed_first_tool") == "first_tool"
+
+  definitions_before = manager.get_server_tool_definitions({
+    "first-mcp",
+    "second-mcp",
+  })
+  records_before = manager.get_server_tool_definition_records({
+    "first-mcp",
+    "second-mcp",
+  })
+  second_bindings = manager.get_server_tool_route_bindings({
+    "first-mcp",
+    "second-mcp",
+  })
+  assert manager.get_server_tool_definitions({
+    "first-mcp",
+    "second-mcp",
+  }) == definitions_before
+  assert manager.get_server_tool_definition_records({
+    "first-mcp",
+    "second-mcp",
+  }) == records_before
+  assert second_bindings == bindings
+  assert second_bindings is not bindings
+  assert second_bindings[0] is not bindings[0]
+  assert (
+    second_bindings[0].originated_definition
+    is not bindings[0].originated_definition
+  )
+  first_materialized = bindings[0].materialize_provider_definition()
+  second_materialized = bindings[0].materialize_provider_definition()
+  first_materialized["name"] = "changed"
+  assert second_materialized["name"] == "second_tool"
+
+
+@pytest.mark.parametrize(
+  ("corrupt", "match"),
+  [
+    ("owner", "owner"),
+    ("prefix_missing", "mapping is missing"),
+    ("prefix", "mapping is incoherent"),
+    ("prefix_shape", "prefix is incoherent"),
+    ("dispatch", "original"),
+    ("surface_missing", "surface provenance"),
+    ("surface_duplicate", "surface provenance"),
+    ("surface_drift", "definition diverges from surface"),
+  ],
+)
+def test_server_tool_route_bindings_refuse_physical_map_corruption(
+  corrupt: str,
+  match: str,
+  monkeypatch,
+) -> None:
+  manager = McpClientManager(config_path=None)
+  manager._servers = {
+    "server-mcp": _metadata_state(
+      "server-mcp",
+      tool_prefix="prefix_",
+      tool_definitions=[{"name": "prefix_tool", "input_schema": {}}],
+    ),
+  }
+  manager._tool_to_server = {"prefix_tool": "server-mcp"}
+  manager._prefixed_to_original = {"prefix_tool": "tool"}
+  manager._tool_definitions = list(
+    manager._servers["server-mcp"].tool_definitions
+  )
+  if corrupt == "owner":
+    manager._tool_to_server["prefix_tool"] = "other-mcp"
+  elif corrupt == "prefix_missing":
+    manager._prefixed_to_original.pop("prefix_tool")
+  elif corrupt == "prefix":
+    manager._prefixed_to_original["prefix_tool"] = "other"
+  elif corrupt == "prefix_shape":
+    monkeypatch.setattr(manager._servers["server-mcp"], "tool_prefix", 1)
+  elif corrupt == "dispatch":
+    manager._dispatch_to_original["prefix_tool"] = "other_tool"
+  elif corrupt == "surface_missing":
+    manager._tool_definitions = []
+  elif corrupt == "surface_duplicate":
+    manager._tool_definitions.append(dict(manager._tool_definitions[0]))
+  else:
+    divergent_surface = dict(manager._tool_definitions[0])
+    divergent_surface["description"] = "Divergent surface."
+    manager._tool_definitions = [divergent_surface]
+
+  with pytest.raises(ValueError, match=match):
+    manager.get_server_tool_route_bindings({"server-mcp"})
+
+
+@pytest.mark.parametrize(
+  "server_id",
+  ["My_Server", "server_name", "ServerName", "name:port"],
+)
+def test_server_tool_definition_records_preserve_generic_configured_server_ids(
+  server_id: str,
+) -> None:
+  manager = McpClientManager(config_path=None)
+  manager._servers = {
+    server_id: _metadata_state(
+      server_id,
+      tool_definitions=[{"name": "owned_tool", "input_schema": {}}],
+    ),
+  }
+  manager._tool_to_server = {"owned_tool": server_id}
+  manager._tool_definitions = list(manager._servers[server_id].tool_definitions)
+
+  records = manager.get_server_tool_definition_records({server_id})
+
+  assert tuple(record.server_id for record in records) == (server_id,)
+  assert manager.get_server_tool_definitions({server_id}) == [
+    record.materialize() for record in records
+  ]
+
+  bindings = manager.get_server_tool_route_bindings({server_id})
+  assert tuple(binding.logical_server_id for binding in bindings) == (server_id,)
+  assert tuple(binding.transport_server_id for binding in bindings) == (server_id,)

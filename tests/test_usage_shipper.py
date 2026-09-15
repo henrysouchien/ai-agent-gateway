@@ -17,6 +17,8 @@ from agent_gateway.multi_user.billing import SessionUsageSummary
 from agent_gateway.usage_outbox import CommercialUsageOutbox
 from agent_gateway.usage_reconciliation import CommercialUsageReconciliationTracker
 from agent_gateway.usage_shipper import (
+  AcceptanceStatus,
+  CommercialUsageBatchSender,
   CommercialUsageReconciliationIngestClient,
   CommercialUsageReconciliationShipper,
   CommercialUsageIngestClient,
@@ -256,24 +258,33 @@ def test_ingest_client_rejects_partial_unknown_or_duplicate_results(results) -> 
     asyncio.run(exercise())
 
 
-class _Sender:
-  def __init__(self, results=None, error: Exception | None = None):
+class _Sender(CommercialUsageBatchSender):
+  def __init__(self, results: list[UsageAcceptance]):
     self.results = results
+    self.payloads = []
+
+  async def send_batch(self, payloads):
+    self.payloads.append(payloads)
+    return self.results
+
+
+class _ErrorSender(CommercialUsageBatchSender):
+  def __init__(self, error: Exception):
     self.error = error
     self.payloads = []
 
   async def send_batch(self, payloads):
     self.payloads.append(payloads)
-    if self.error:
-      raise self.error
-    return self.results
+    raise self.error
 
 
 def test_shipper_maps_acceptance_duplicate_conflict_retry_and_terminal(tmp_path) -> None:
   outbox = CommercialUsageOutbox(tmp_path / "usage.sqlite3")
   ids = ["accepted", "duplicate", "conflict", "retry", "terminal"]
   outbox.enqueue_batch([_v3_payload(event_id) for event_id in ids], created_at=NOW)
-  statuses = ["accepted", "duplicate", "conflict", "rejected_retryable", "rejected_terminal"]
+  statuses: list[AcceptanceStatus] = [
+    "accepted", "duplicate", "conflict", "rejected_retryable", "rejected_terminal"
+  ]
   sender = _Sender([
     UsageAcceptance(
       "prod", event_id, status,
@@ -290,19 +301,30 @@ def test_shipper_maps_acceptance_duplicate_conflict_retry_and_terminal(tmp_path)
   )
 
   assert asyncio.run(shipper.run_once(now=NOW)) == 5
-  assert outbox.get("accepted").state == "accepted"
-  assert outbox.get("duplicate").state == "accepted"
-  assert outbox.get("conflict").state == "dead"
-  assert outbox.get("terminal").state == "dead"
-  assert outbox.get("retry").state == "retryable"
-  assert outbox.get("retry").next_attempt_at == "2026-07-11T12:00:01.000000Z"
-  assert (outbox.get("accepted").ingest_status,
-          outbox.get("accepted").canonical_event_id) == ("accepted", "canonical")
-  assert outbox.get("duplicate").ingest_status == "duplicate"
-  assert outbox.get("conflict").ingest_status == "conflict"
-  assert outbox.get("conflict").ingest_reason_code == "reason"
-  assert outbox.get("terminal").ingest_status == "rejected_terminal"
-  assert outbox.get("retry").ingest_status is None
+  accepted = outbox.get("accepted")
+  duplicate = outbox.get("duplicate")
+  conflict = outbox.get("conflict")
+  terminal = outbox.get("terminal")
+  retry = outbox.get("retry")
+  assert accepted is not None
+  assert duplicate is not None
+  assert conflict is not None
+  assert terminal is not None
+  assert retry is not None
+  assert accepted.state == "accepted"
+  assert duplicate.state == "accepted"
+  assert conflict.state == "dead"
+  assert terminal.state == "dead"
+  assert retry.state == "retryable"
+  assert retry.next_attempt_at == "2026-07-11T12:00:01.000000Z"
+  assert (accepted.ingest_status, accepted.canonical_event_id) == (
+    "accepted", "canonical"
+  )
+  assert duplicate.ingest_status == "duplicate"
+  assert conflict.ingest_status == "conflict"
+  assert conflict.ingest_reason_code == "reason"
+  assert terminal.ingest_status == "rejected_terminal"
+  assert retry.ingest_status is None
   assert ("commercial_usage.backlog", 5) in metrics
   assert ("commercial_usage.oldest_backlog_age_seconds", 0) in metrics
   assert ("commercial_usage.ingest_lag_seconds", 60) in metrics
@@ -314,7 +336,7 @@ def test_shipper_maps_acceptance_duplicate_conflict_retry_and_terminal(tmp_path)
 def test_transport_error_retries_indefinitely_with_exponential_bounded_jitter(tmp_path) -> None:
   outbox = CommercialUsageOutbox(tmp_path / "usage.sqlite3")
   outbox.enqueue_batch([_v3_payload("evt_001")], created_at=NOW)
-  sender = _Sender(error=TimeoutError("offline"))
+  sender = _ErrorSender(TimeoutError("offline"))
   shipper = CommercialUsageShipper(
     outbox=outbox, sender=sender,
     config=CommercialUsageShipperConfig(
@@ -326,10 +348,12 @@ def test_transport_error_retries_indefinitely_with_exponential_bounded_jitter(tm
 
   asyncio.run(shipper.run_once(now=NOW))
   first = outbox.get("evt_001")
+  assert first is not None
   assert first.state == "retryable"
   assert first.next_attempt_at == "2026-07-11T12:00:02.000000Z"
   asyncio.run(shipper.run_once(now=NOW + timedelta(seconds=2)))
   second = outbox.get("evt_001")
+  assert second is not None
   assert second.state == "retryable"
   assert second.next_attempt_at == "2026-07-11T12:00:06.000000Z"
 
@@ -350,8 +374,10 @@ def test_retryable_result_moves_to_dead_after_attempt_limit(tmp_path) -> None:
   asyncio.run(shipper.run_once(now=NOW))
   asyncio.run(shipper.run_once(now=NOW + timedelta(seconds=1)))
   row = outbox.get("evt_001")
+  assert row is not None
   assert row.state == "dead"
   assert row.attempt_count == 2
+  assert row.last_error is not None
   assert row.last_error.startswith("attempts_exhausted")
 
 
@@ -362,12 +388,16 @@ def test_stale_lease_fence_prevents_late_shipper_completion(tmp_path) -> None:
   fresh = outbox.lease_batch(
     limit=1, lease_for=timedelta(seconds=10), now=NOW + timedelta(seconds=2)
   )[0]
+  stale_token = stale.sending_lease_token
+  fresh_token = fresh.sending_lease_token
+  assert stale_token is not None
+  assert fresh_token is not None
   assert outbox.mark_accepted(
-    "evt_001", stale.sending_lease_token, ingest_status="accepted",
+    "evt_001", stale_token, ingest_status="accepted",
     canonical_event_id="canonical-001", accepted_at=NOW,
   ) is False
   assert outbox.mark_accepted(
-    "evt_001", fresh.sending_lease_token, ingest_status="accepted",
+    "evt_001", fresh_token, ingest_status="accepted",
     canonical_event_id="canonical-001", accepted_at=NOW,
   ) is True
 
@@ -384,7 +414,9 @@ def test_shipper_quarantines_ambiguous_sender_results_for_retry(tmp_path) -> Non
   asyncio.run(shipper.run_once(now=NOW))
 
   row = outbox.get("evt_001")
+  assert row is not None
   assert row.state == "retryable"
+  assert row.last_error is not None
   assert row.last_error.startswith("ambiguous_response")
 
 
@@ -407,8 +439,12 @@ def test_permanent_poison_event_isolated_without_blocking_later_valid_row(tmp_pa
 
   asyncio.run(shipper.run_once(now=NOW))
 
-  assert outbox.get("poison").state == "dead"
-  assert outbox.get("valid").state == "accepted"
+  poison = outbox.get("poison")
+  valid = outbox.get("valid")
+  assert poison is not None
+  assert valid is not None
+  assert poison.state == "dead"
+  assert valid.state == "accepted"
 
 
 def test_reconciliation_shipper_preserves_revision_order_and_terminal_receipts(

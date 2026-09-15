@@ -7,8 +7,8 @@ from dataclasses import replace
 from typing import Any, AsyncIterator, Dict, Literal
 
 from ..rate_limit import get_global_token_bucket
-from ..rates import RateTable, UnknownModelError, load_rate_table
-from .base import CostEstimate, ModelInfo, ModelProvider, StreamEvent, ThinkingLevel, truncate_to_last_compaction
+from ..rates import RateTable, UnknownModelError, load_provider_rate_table
+from .base import ModelInfo, ModelProvider, StreamEvent, ThinkingLevel, truncate_to_last_compaction
 from ..model_registry import AdapterRouteSupport
 from ..thinking import EffortResolution, clamp_effort
 from .anthropic_helpers import (
@@ -79,14 +79,17 @@ def _is_cacheable_message_block(block: Any) -> bool:
 def _message_cache_marker_locations(
   messages: list[dict[str, Any]],
 ) -> list[tuple[int, int]]:
-  return [
-    (message_index, block_index)
-    for message_index, message in enumerate(messages)
-    for block_index, block in enumerate(
-      message.get("content") if isinstance(message.get("content"), list) else []
+  locations: list[tuple[int, int]] = []
+  for message_index, message in enumerate(messages):
+    content = message.get("content")
+    if not isinstance(content, list):
+      continue
+    locations.extend(
+      (message_index, block_index)
+      for block_index, block in enumerate(content)
+      if isinstance(block, dict) and "cache_control" in block
     )
-    if isinstance(block, dict) and "cache_control" in block
-  ]
+  return locations
 
 
 def _assert_message_cache_breakpoint_placement(
@@ -319,14 +322,6 @@ def _server_tool_unit_deltas(usage: Any) -> dict[str, int]:
   }
 
 
-def _server_tool_units(usage: Any) -> int:
-  """Compatibility helper for callers that require exactly one unit kind."""
-  deltas = _server_tool_unit_deltas(usage)
-  if len(deltas) > 1:
-    raise ValueError("multiple separately billed Anthropic unit kinds require distinct events")
-  return next(iter(deltas.values()), 0)
-
-
 def _usage_int(usage: Any, key: str) -> int:
   if usage is None:
     return 0
@@ -447,14 +442,14 @@ class AnthropicProvider(ModelProvider):
     )
 
   def __init__(self, *, rate_table: RateTable | None = None):
-    self._rate_table = rate_table or load_rate_table()
+    self._rate_table = load_provider_rate_table(self.name, rate_table)
 
   @staticmethod
   def thinking_param(model: str, max_tokens: int) -> dict[str, Any] | None:
-    model_id = str(model or "").strip()
-    if not model_id.startswith("claude"):
-      return None
-    return _thinking_param(_model_info_for_model(model_id), max_tokens)
+    # No prefix pre-check: the product model registry (via
+    # _model_info_for_model) is the single owner of which model ids are
+    # admitted, and it raises for anything it does not know.
+    return _thinking_param(_model_info_for_model(str(model or "").strip()), max_tokens)
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
     if str(config.get("auth_mode", "api")).strip().lower() == "oauth":
@@ -539,6 +534,7 @@ class AnthropicProvider(ModelProvider):
       output_cost_per_mtok=rates.output_cost_per_mtok,
       cache_read_cost_per_mtok=rates.cache_read_cost_per_mtok,
       cache_write_cost_per_mtok=rates.cache_write_cost_per_mtok,
+      rate_tiers=rates.tiers,
     )
 
   def build_request_params(
@@ -1065,12 +1061,7 @@ class AnthropicProvider(ModelProvider):
               block = _to_plain_dict(current_tool_block)
               if not isinstance(block, dict):
                 block = {"type": "tool_use", "id": current_tool_id, "name": current_tool_name}
-              from ..runner_tool_audit import redact_tool_input_for_event
-
-              block["input"] = redact_tool_input_for_event(
-                str(current_tool_name or ""),
-                tool_input,
-              )
+              block["input"] = tool_input
               yield StreamEvent(
                 type="tool_use_end",
                 tool_id=str(current_tool_id),
@@ -1171,19 +1162,3 @@ class AnthropicProvider(ModelProvider):
     if isinstance(exc, (httpx.TransportError, httpx.StreamError)):
       return True
     return False
-
-  def estimate_cost(
-    self,
-    model: str,
-    input_tokens: int,
-    output_tokens: int,
-    cache_read_tokens: int = 0,
-    cache_creation_tokens: int = 0,
-  ) -> CostEstimate:
-    return super().estimate_cost(
-      model,
-      input_tokens,
-      output_tokens,
-      cache_read_tokens=cache_read_tokens,
-      cache_creation_tokens=cache_creation_tokens,
-    )

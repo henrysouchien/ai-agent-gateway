@@ -46,7 +46,7 @@ def _bind_receipt(*, provider: str, model: str) -> dict[str, str]:
     registry_revision="test-v1",
     policy_revision="test-v1",
     selection_source="capability_default",
-  ).receipt()
+  ).to_json()
 
 
 def _event(

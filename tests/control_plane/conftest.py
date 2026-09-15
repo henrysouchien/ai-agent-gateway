@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import sys
-from pathlib import Path
+from collections.abc import Iterator
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
@@ -16,20 +17,65 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway.auth import AuthConfig, ResolverResult
+from agent_gateway.capability_execution import BoundCapabilityExecution
+from agent_gateway.control_skill_catalog import ControlSkillCatalog
+from agent_gateway.event_log import EventLog
+from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.model_registry import (
   INITIAL_MODEL_REGISTRY,
   INITIAL_MODEL_SELECTION_POLICY,
 )
+from agent_gateway.runner import AgentRunner
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
+from agent_gateway.session import GatewaySession, session_owner_user_id
+from agent_gateway.tool_dispatcher import ToolDispatcher
+from agent.skills.composition import compile_skill_application
+from agent.shared.tool_registration import (
+  build_product_tool_registration_composition,
+)
 from memory import get_skills_root
 
 
-class _ControlTestRunner:
-  def __init__(self, event_log, capability_execution) -> None:
+class _ControlTestRunner(AgentRunner):
+  def __init__(
+    self,
+    event_log: EventLog,
+    session_id: str,
+    started_at: float,
+    capability_execution: BoundCapabilityExecution,
+    *,
+    gateway_session: GatewaySession,
+    billing_mode: str,
+    channel: str | None,
+  ) -> None:
+    super().__init__(
+      event_log=event_log,
+      dispatcher=ToolDispatcher(
+        mcp_client=McpClientManager(config_path=None),
+        local_tool_handlers={},
+        event_log=event_log,
+        session_id=session_id,
+      ),
+      session_id=session_id,
+      capability_execution=capability_execution,
+      started_at=started_at,
+      gateway_session=gateway_session,
+      user_id=session_owner_user_id(gateway_session),
+      rate_table_version="test",
+      billing_mode=billing_mode,
+      channel=channel,
+    )
     self._event_log = event_log
-    self.capability_execution = capability_execution
 
-  async def run(self, **_kwargs: Any) -> None:
+  async def run(
+    self,
+    messages: list[dict[str, Any]],
+    system_prompt: str | list[tuple[str, bool]] | None = None,
+    max_turns: int | None = None,
+    *,
+    resume_initial_messages: list[dict[str, Any]] | None = None,
+    **_kwargs: Any,
+  ) -> None:
     self._event_log.append({"type": "stream_complete", "usage": {}})
 
 
@@ -134,18 +180,37 @@ def credentials_resolver(test_api_key: str, test_user_id: str, test_channel: str
 
 
 @pytest.fixture
-def control_plane_app(test_api_key: str, credentials_resolver):
-  async def _build_chat_runtime(_session, _request, _channel, _auth_manager):
+def control_plane_app(
+  test_api_key: str,
+  auth_config: AuthConfig,
+  credentials_resolver,
+):
+  async def _build_chat_runtime(session, _request, channel, _auth_manager, *, storage_root: Path | None = None):
     capability_execution = _request.capability_execution
     return ChatRuntime(
       system_prompt="test",
-      build_runner=lambda event_log, _sid, _started_at: _ControlTestRunner(
+      build_runner=lambda event_log, session_id, started_at: _ControlTestRunner(
         event_log,
+        session_id,
+        started_at,
         capability_execution,
+        gateway_session=session,
+        billing_mode=auth_config.billing_mode,
+        channel=channel,
       ),
       capability_execution=capability_execution,
     )
 
+  tool_registration = build_product_tool_registration_composition()
+  skill_application = compile_skill_application(
+    skills_root=get_skills_root(),
+    source_prefix=PurePosixPath(
+      "api/memory/workspace/notes/skills"
+    ),
+    tool_registration_catalog=tool_registration.catalog,
+  )
+  control_catalog = skill_application.control_catalog
+  assert isinstance(control_catalog, ControlSkillCatalog)
   return create_gateway_app(
     GatewayServerConfig(
       jwt_secret="control-plane-test-secret-0123456789",
@@ -155,13 +220,17 @@ def control_plane_app(test_api_key: str, credentials_resolver):
       model_registry=INITIAL_MODEL_REGISTRY,
       model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
       build_chat_runtime=_build_chat_runtime,
-      control_skills_dir=get_skills_root(),
+      control_skill_catalog=control_catalog,
+      autonomous_skill_admission_policy_resolver=(
+        skill_application.resolve_autonomous_skill_admission_policy
+      ),
+      skill_application=skill_application,
     )
   )
 
 
 @pytest.fixture
-def client(control_plane_app):
+def client(control_plane_app) -> Iterator[TestClient]:
   with TestClient(control_plane_app) as test_client:
     yield test_client
 

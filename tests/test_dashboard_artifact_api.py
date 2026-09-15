@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Literal
 
 from fastapi.testclient import TestClient
 
@@ -178,8 +178,8 @@ def _artifact(
   artifact_id: str,
   *,
   ticker: str | None,
-  origin_kind: str | None = None,
-  visibility: str | None = None,
+  origin_kind: Literal["product", "harness", "import"] | None = None,
+  visibility: Literal["default", "sandbox", "archived"] | None = None,
 ) -> DashboardArtifact:
   return DashboardArtifact(
     artifact_id=artifact_id,

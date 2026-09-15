@@ -12,7 +12,7 @@ Fastest way to create a gateway server from a system prompt.
 
 Use it when you want:
 
-- Anthropic- or OpenAI-backed chat
+- Anthropic-, Codex-, OpenAI-, or XAI-backed chat
 - automatic session and SSE endpoints
 - optional MCP tools
 - optional local tools
@@ -55,6 +55,9 @@ Key parameters:
 - `capability_execution`: immutable `BoundCapabilityExecution` for
   `session.driver`, with an `autonomous` or `cron` run mode; it carries the
   exact admitting registry, adapter, credential snapshot, and complete bind
+- `admitted_skill_execution_limits`: required keyword-only argument with no
+  default, typed `agent_gateway.skill_limits.SkillExecutionLimits |
+  None`; callers with no admitted skill limits must still pass `None`
 - `session`: exact `GatewaySession` that owns the authenticated runtime
   identity and mutable lifecycle state
 - `user_id`: required stable user identity for usage accounting
@@ -70,14 +73,23 @@ Key parameters:
   children retain the same stateful instances in the same order as the parent
   dispatcher
 
-Raw `model`, `api_key`, `auth_token`, `auth_config`, `provider_config`, and
-`max_tokens` selectors are not accepted. Split execution inputs are also
-rejected. Bind/config/adapter/registry disagreements and unavailable
-credentials fail before session scoping, MCP construction/startup, or
-provider-client creation. The executor snapshots the bound mapping before its
-first await and passes `allow_stub_response=False`.
+Raw selectors are not accepted: `api_key`, `auth_config`, `auth_token`,
+`bound_auth_config`, `capability_bind`, `execution_transport`, `max_tokens`,
+`model`, `provider`, and `provider_config`. `run_autonomous()` takes no
+`**kwargs`, so they raise `TypeError`; `run_autonomous_sync()` rejects the same
+set explicitly. Provider, model,
+effort, transport, credentials, and runtime identity are therefore all decided
+upstream of this boundary. Split execution inputs are also rejected.
+Bind/config/adapter/registry disagreements and unavailable credentials fail
+before session scoping, MCP construction/startup, or provider-client creation.
+The executor snapshots the bound mapping before its first await and passes
+`allow_stub_response=False`.
 
-Returns `RunOutput` with `response`, `tools_used`, `usage`, `error`, `timed_out`, `budget_exceeded`, `max_turns_reached`.
+`timeout_seconds` is retained for caller compatibility but does not cancel LLM
+work. Liveness is enforced by the event-gap stall watchdog; bound long-running
+work with `max_turns` and `max_budget_usd`.
+
+Returns a `RunOutput`; see the complete field list below.
 
 ### `run_autonomous_sync()`
 
@@ -92,9 +104,14 @@ Result of an autonomous run. Fields:
 - `tools_used: list[str]` — tool names called during the run
 - `usage: dict` — token usage from the provider
 - `error: str | None` — error message if the run failed
-- `timed_out: bool` — True if the run hit the wall-clock timeout
+- `timed_out: bool` — timeout marker retained in the result contract; the
+  current autonomous entry point does not enforce `timeout_seconds`
 - `budget_exceeded: bool` — True if estimated cost exceeded `max_budget_usd`
 - `max_turns_reached: bool` — True if the model loop hit `max_turns`
+- `operator_paused: bool` — True when an operator intentionally paused the run
+- `max_tokens_reached: bool` — True when generation reached its token bound
+- `exit_reason: str | None` — more specific terminal reason, when one exists
+- `post_run_guard: dict | None` — structured post-run guard failure details
 
 ### `DeliveryConfig`
 
@@ -108,7 +125,12 @@ Where results go after a run completes.
 
 ### `run_output_exit_code()` and `run_output_outcome()`
 
-Map a `RunOutput` to process exit codes (0/1/2/3/124) or semantic outcome strings (`"success"`, `"timeout"`, `"error"`, `"budget_exceeded"`, `"max_turns"`). Exit codes are for process semantics; outcomes are for persisted state tracking.
+Map a `RunOutput` to process exit codes: `0` for success or operator pause, `1`
+for errors and post-run guard failures, `2` for budget exhaustion, `3` for
+max turns, `4` for max tokens, and `124` for timeout. Semantic outcomes include
+`success`, `timeout`, `error`, `budget_exceeded`, `max_turns`, `max_tokens`,
+`operator_pause`, or a more specific `exit_reason`. Exit codes are for process
+semantics; outcomes are for persisted state tracking.
 
 ### `HeartbeatLoop`
 
@@ -131,6 +153,8 @@ from agent_gateway import (
     run_autonomous,
 )
 
+# Application/server-owned preparation step; `prepare_autonomous_execution` is
+# the caller's own resolver call, not an `agent_gateway` export.
 capability_execution: BoundCapabilityExecution
 session: GatewaySession
 capability_execution, session = prepare_autonomous_execution()
@@ -141,6 +165,7 @@ loop = HeartbeatLoop(
         system_prompt="...",
         initial_message="...",
         capability_execution=capability_execution,
+        admitted_skill_execution_limits=None,
         session=session,
         user_id="heartbeat-agent",
         billing_mode="byok",
@@ -184,7 +209,9 @@ Result of a single heartbeat tick. Fields: `output`, `skipped`, `skip_reason`, `
 - `deliver(config, output, state)`: dispatch to Telegram + webhook + callback
 - `format_run_summary(output, ...)`: generic run summary formatter
 - `send_telegram(message, bot_token, chat_id)`: async Telegram message via httpx
-- `send_telegram_file(path, bot_token, chat_id)`: send file content as chunked messages
+- `agent_gateway.autonomous.send_telegram_file(path, bot_token, chat_id)`: send
+  file content as chunked messages; this helper is module-level rather than a
+  top-level `agent_gateway` export
 - `strip_heartbeat_ok(text)`: strip leading/trailing HEARTBEAT_OK token, return `(stripped, had_token)`
 
 ### `send_prompt()` and `send_prompt_sync()`
@@ -254,6 +281,17 @@ currently supported deterministic prefix policy. The wheel also includes the
 generated JSON Schemas, TypeScript declarations, frozen historical-v1 golden,
 and complete/truncated v2 goldens under
 `agent_workflow_contracts/generated/`.
+
+### Ordinary agent completion
+
+Foreground results and background notifications use `AgentCompletionEnvelope`.
+`settlement_projection` carries the canonical execution status and, when the
+child did not succeed, its `terminal_reason`. If execution stopped before
+producing canonical content (for example, `budget_exhausted`), the envelope
+still publishes with `parent_materialization: null` and any child evidence.
+Intermediate tool-use prose is not promoted to a completed report. Successful
+results continue to carry exact inline content or a readable content handle;
+their serialized shape is unchanged.
 
 ### Autonomous capability handoff
 
@@ -328,7 +366,8 @@ Key fields:
 
 ### `RequestContext`
 
-Container for mutable request-scoped objects such as the active `Session`, `EventLog`, and approval callback.
+Container for mutable request-scoped objects such as the active
+`GatewaySession`, `EventLog`, and approval callback.
 
 ## Agent Loop
 
@@ -374,7 +413,7 @@ Use this when SDK parity matters more than native-runner control.
 
 ### `UsageEvent`
 
-Per-turn billing event emitted by both `AgentRunner` and `AgentSDKRunner`. Carries token counts, cost, identity (`user_id`, `channel`, `request_id`), and a unique `event_id` (UUID, default-generated). Fed to `UsageLedger.record()` and to user-supplied `on_usage` callbacks.
+Per-provider-request billing event (a portable compaction request emits its own event before the following request) emitted by both `AgentRunner` and `AgentSDKRunner`. Carries token counts, cost, identity (`user_id`, `channel`, `request_id`), and a unique `event_id` (UUID, default-generated). Fed to `UsageLedger.record()` and to user-supplied `on_usage` callbacks.
 
 ### `SessionUsageSummary`
 
@@ -388,7 +427,7 @@ Helper that validates and normalizes identity across `AgentRunner` and `AgentSDK
 
 Both runners accept three usage-related callbacks at construction:
 
-- `on_usage: Callable[[UsageEvent], Awaitable[None] | None]` — fires per-turn for live cost streaming. Use for SSE telemetry, real-time UI updates.
+- `on_usage: Callable[[UsageEvent], Awaitable[None] | None]` — fires per provider request (including compaction requests) for live cost streaming; sum events for a turn or session total. Use for SSE telemetry, real-time UI updates.
 - `on_session_summary: Callable[[SessionUsageSummary], Awaitable[None] | None]` — fires once per chat after drain. Use for billing writes (`record_cost`).
 - `on_late_usage_event: Callable[[UsageEvent], Awaitable[None] | None]` — fires when a `UsageEvent` arrives **after** `on_session_summary` already emitted (e.g., a background sub-agent finished post-stream). Wire this to a spool table for reconciliation.
 
@@ -561,25 +600,49 @@ Factory for the `get_background_result` tool schema. The tool accepts an exact `
 
 ## Typed Events
 
-Added in 0.15.0 and extended by later result-capture work. Frozen dataclasses cover the run/artifact lifecycle events emitted on the `/api/chat` SSE stream when the host wires up a `SkillProfile` and a `skill_run_id`; structured skill results are emitted as `skill_result_captured` wire events. The dataclass event classes plus `event_to_dict` are re-exported from `agent_gateway` top-level; the rest live in `agent_gateway.events`. Wire format (JSON shape on the SSE stream) is documented in `http-api.md` → "Skill Framework Events".
+Frozen dataclasses cover skill runs, artifacts, approvals, workflow output,
+agent completion, UI blocks, and session recaps. Import the complete contract
+from `agent_gateway.events`; selected classes and `event_to_dict` /
+`event_from_dict` are also available at package top level. On SSE, the typed
+event dictionary is the `event` member of the transport envelope documented in
+[HTTP API](./http-api.md).
+
+| Wire type | Purpose |
+| --- | --- |
+| `skill_run_started` | Start of a named skill run |
+| `skill_result_captured` | Structured skill result and execution summary |
+| `artifact_ready` / `artifact_updated` / `artifact_failed` / `artifact_unavailable` | Artifact lifecycle |
+| `ui_blocks_ready` | Renderable UI-block payload |
+| `agent_completion` | Durable direct-parent child result publication |
+| `workflow_output_attached` | Workflow output attached to a chat turn |
+| `typed_recommendations_extracted` | Validated recommendation extraction result |
+| `aggregate_ready` | Aggregate view-model readiness |
+| `tool_approval_request` / `tool_approval_decided` | Approval lifecycle |
+| `session_recap` | Typed recap of a session or turn range |
 
 ### `SkillRunStartedEvent`
 
 Emitted once at the start of a skill-framework sub-agent run.
 
-Fields: `skill_run_id`, `skill`, `ticker`, `ts`. `type` is fixed to `"skill_run_started"`.
+Fields: `skill_run_id`, `skill`, optional `ticker`, `scope`, optional
+`portfolio_id`, and `ts`. `type` is fixed to `"skill_run_started"`.
 
 ### `SkillResultCapturedEvent`
 
 Emitted when a skill run completes with a structured runtime result. This is the display/control-plane source for status, gate code, artifact refs, proposal ids, FMS result envelopes, and verdict echo data.
 
-Fields: `skill_run_id`, `skill`, `ticker`, `exit_code`, `outcome`, `status`, `gate_code`, `artifact_refs`, `proposal_ids`, `verdict_echo`, `fms_results`, `artifact_events`, `output_memory_file`, `cost_usd`, `duration_s`, `compaction_count` (a non-negative per-run count; legacy captures default to `0`), `error`, `warnings`.
+Fields include `skill_run_id`, `skill`, optional `ticker`, `scope`, optional
+`portfolio_id`, execution status/result fields, artifact and proposal refs,
+cost/duration, warnings, `compaction_count`, and optional approval outcome,
+approval id, and approval tool name.
 
 ### `ArtifactReadyEvent`
 
 Emitted when a structured report door or artifact-producing tool writes a JSON sidecar (and optionally a binary artifact such as a `.docx` letter) to per-user workspace storage. Pairs with the artifact read endpoints documented in `http-api.md`.
 
-Fields: `skill_run_id`, `ticker`, `skill`, `artifact_id`, `artifact_path`, `binary_artifact_path` (`str | None`), `contract_name`, `data_source` (`"live" | "fixture"`), `ts`.
+Fields: `skill_run_id`, optional `ticker`, `scope`, optional `portfolio_id`,
+`skill`, `artifact_id`, `artifact_path`, optional `binary_artifact_path`,
+`contract_name`, `data_source` (`"live" | "fixture"`), and `ts`.
 
 ### `AggregateReadyEvent`
 
@@ -591,23 +654,31 @@ Fields: `skill_run_id`, `ticker`, `view_model_id`, `trigger` (`AggregateReadyTri
 
 Emitted when a structured report door or artifact-producing tool fails to produce an artifact.
 
-Fields: `skill_run_id`, `ticker`, `skill`, `error_code` (`"validation" | "missing_contract" | "schema_drift" | "tool_write_failed" | "other"`), `error_detail`, `source_path`, `ts`.
+Fields: `skill_run_id`, optional `ticker`, `skill`, `error_code`
+(`"validation" | "missing_contract" | "schema_drift" | "tool_write_failed" |
+"other"`), `error_detail`, optional `source_path`, optional `tool_call_id`, and
+`ts`.
 
 ### `ArtifactUnavailableEvent`
 
 Renderer-side event. No `skill_run_id` — surfaced when the UI/aggregator looks up an artifact for `(ticker, skill)` and finds it absent.
 
-Fields: `ticker`, `skill`, `reason` (`"no_runs_yet" | "stale" | "fixture_only" | "auth_blocked"`), `affordance` (short user-facing hint), `ts`.
+Fields: optional `ticker`, `skill`, `reason` (`"no_runs_yet" | "stale" |
+"fixture_only" | "auth_blocked"`), `affordance` (short user-facing hint), and
+`ts`.
 
 ### `event_to_dict(event)` and `event_from_dict(payload)`
 
-Serialize a typed event to a JSON-ready dict (with `type` set from the class's frozen `type` field) and parse one back. Round-trips `data_source` literals, `AggregateReadyTrigger` nesting, and optional `binary_artifact_path` / `materiality_cushion` / `confidence`. `event_from_dict` raises `ValueError` on unknown `type`.
+Serialize a typed event to a JSON-ready dict and parse a known type back into
+its frozen dataclass. `event_from_dict` raises `ValueError` on an unknown
+`type`.
 
 ### Helper constants
 
-- `TYPED_EVENT_TYPES` — frozenset of all six event-type strings.
-- `RUN_SCOPED_EVENT_TYPES` — frozenset of the five that carry a `skill_run_id` (excludes `artifact_unavailable`).
-- `TypedEvent` — union over the six event classes.
+- `TYPED_EVENT_TYPES` — frozenset of all 14 event-type strings.
+- `RUN_SCOPED_EVENT_TYPES` — the seven events associated with a skill run or
+  run-local UI/artifact update.
+- `TypedEvent` — union over all typed event classes.
 
 ## Providers
 
@@ -631,6 +702,15 @@ Anthropic adapter used by `create_agent(provider="anthropic")`.
 
 OpenAI-compatible adapter used by `create_agent(provider="openai")` or when you build the app yourself.
 
+### `CodexProvider`
+
+Codex adapter used by `create_agent(provider="codex")`; authentication is
+delegated to the Codex CLI login flow.
+
+### `XAIProvider`
+
+XAI adapter used by `create_agent(provider="xai")`.
+
 ### `ModelInfo`
 
 Per-model metadata such as context window, thinking support, and token pricing.
@@ -649,7 +729,7 @@ Provider-agnostic reasoning intensity hint.
 
 ## Sessions And Events
 
-### `Session`
+### `GatewaySession`
 
 Per-user mutable runtime state.
 

@@ -3,14 +3,46 @@
 from __future__ import annotations
 
 import datetime
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from agent_workflow_contracts import (
   AgentExecutionSnapshot,
   AgentOperationSnapshot,
   AgentResumeMechanics,
+  ProviderToolDefinition,
   ResultRequirement,
+  ToolGrant,
 )
+
+
+def provider_tool_definitions_for_grant(
+  definitions: Sequence[Mapping[str, Any]],
+  *,
+  grant: ToolGrant,
+) -> tuple[ProviderToolDefinition, ...]:
+  """Freeze exactly the provider definitions named by one resolved grant."""
+
+  if not isinstance(grant, ToolGrant):
+    raise TypeError("grant must be a ToolGrant")
+  exact_granted_tools = tuple(entry.tool_id for entry in grant.tools)
+  granted_set = frozenset(exact_granted_tools)
+  by_name: dict[str, ProviderToolDefinition] = {}
+  for definition in definitions:
+    name = definition.get("name")
+    if name not in granted_set:
+      continue
+    if name in by_name:
+      raise ValueError(f"duplicate provider tool definition: {name}")
+    snapshot = ProviderToolDefinition(definition=dict(definition))
+    by_name[snapshot.name] = snapshot
+  missing = granted_set - by_name.keys()
+  if missing:
+    raise ValueError(
+      "provider tool definitions are missing for grant: "
+      + ", ".join(sorted(missing))
+    )
+  return tuple(by_name[name] for name in exact_granted_tools if name in by_name)
 
 
 def render_result_instructions(requirement: ResultRequirement) -> str:
@@ -49,6 +81,7 @@ def build_agent_execution_snapshot(
   client_timeout_seconds: float,
   max_tokens: int,
   cost_observation_threshold_usd: float | None,
+  provider_tool_definitions: tuple[ProviderToolDefinition, ...],
   max_resume_chain_depth: int,
   resume_instruction: str | None = None,
   max_budget_usd: float | None = None,
@@ -99,6 +132,7 @@ def build_agent_execution_snapshot(
     max_tokens=max_tokens,
     cost_observation_threshold_usd=cost_observation_threshold_usd,
     max_budget_usd=max_budget_usd,
+    provider_tool_definitions=provider_tool_definitions,
     resume_mechanics=AgentResumeMechanics(
       resumable=operation.resumable,
       max_chain_depth=(max_resume_chain_depth if operation.resumable else 0),
@@ -130,6 +164,7 @@ def resume_agent_execution_snapshot(
 
 __all__ = [
   "build_agent_execution_snapshot",
+  "provider_tool_definitions_for_grant",
   "render_result_instructions",
   "resume_agent_execution_snapshot",
 ]

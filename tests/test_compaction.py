@@ -279,6 +279,58 @@ def test_generate_and_append_summary_preserves_thinking_blocks(tmp_path: Path) -
   assert "The analyst reached a conclusion." in captured_prompts[0]
 
 
+def test_generate_summary_preserves_projected_tool_input_hmac_bytes(
+  tmp_path: Path,
+) -> None:
+  log = AgentSessionLog(
+    path=tmp_path / "sessions" / "projected-tool-inputs.jsonl"
+  )
+  projected_hmac = "hmac-sha256-v1:key-1:" + ("a" * 64)
+  credential_canary = (
+    "sk-ant-api03-CODEX-COMPACTION-CANARY-DO-NOT-USE-8f21d7"
+  )
+  projected_input = {
+    "quantity": projected_hmac,
+    "credential": credential_canary,
+  }
+  _run(log.append({
+    "type": "assistant_message",
+    "content_blocks": [{
+      "type": "tool_use",
+      "id": "tool_projected",
+      "name": "execute_trade",
+      "input": projected_input,
+    }],
+  }))
+  _run(log.append({
+    "type": "tool_call_start",
+    "tool_call_id": "tool_projected",
+    "tool_name": "execute_trade",
+    "tool_input": projected_input,
+  }))
+  captured_prompts: list[str] = []
+
+  async def _summarize(prompt_text: str) -> str:
+    captured_prompts.append(prompt_text)
+    return "Narrative summary."
+
+  summary = _run(
+    generate_and_append_summary(
+      log,
+      from_seq=1,
+      to_seq=2,
+      prompt="Summarize the analyst session.",
+      capability_execution=_execution(),
+      summarize_fn=_summarize,
+    )
+  )
+
+  assert summary is not None
+  assert captured_prompts[0].count(projected_hmac) == 2
+  assert credential_canary not in captured_prompts[0]
+  assert captured_prompts[0].count("<redacted-secret>") == 2
+
+
 def test_generate_and_append_summary_compacts_bulk_tool_results(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "bulk-tool-result.jsonl")
   _run(

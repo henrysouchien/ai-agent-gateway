@@ -23,7 +23,6 @@ def _responses_compat(
   function_tools: bool = True,
 ) -> dict[str, Any]:
   return {
-    "supportsResponsesStreaming": True,
     "supportsResponsesFunctionTools": function_tools,
     "supportsResponsesReasoningSummary": summary,
     "supportsReasoningEffort": bool(effort_values),
@@ -46,17 +45,14 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
         max_output_tokens=128_000,
         supports_thinking=True,
         supports_vision=True,
-        input_cost_per_mtok=input_cost,
-        output_cost_per_mtok=output_cost,
-        cache_read_cost_per_mtok=cache_cost,
         compat=_responses_compat(effort_values=_GPT56_VALUES, effort_default="medium", summary=True),
       ),
     )
-    for model_id, input_cost, output_cost, cache_cost in (
-      ("gpt-5.6-sol", 5.00, 30.00, 0.50),
-      ("gpt-5.6-terra", 2.50, 15.00, 0.25),
-      ("gpt-5.6-luna", 1.00, 6.00, 0.10),
-      ("gpt-5.6", 5.00, 30.00, 0.50),
+    for model_id in (
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
+      "gpt-5.6",
     )
   ],
   (
@@ -68,9 +64,6 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       max_output_tokens=128_000,
       supports_thinking=True,
       supports_vision=True,
-      input_cost_per_mtok=5.00,
-      output_cost_per_mtok=30.00,
-      cache_read_cost_per_mtok=0.50,
       compat=_responses_compat(effort_values=_GPT55_VALUES, effort_default="medium", summary=True),
     ),
   ),
@@ -83,9 +76,6 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       max_output_tokens=128_000,
       supports_thinking=True,
       supports_vision=True,
-      input_cost_per_mtok=2.50,
-      output_cost_per_mtok=15.00,
-      cache_read_cost_per_mtok=0.25,
       compat=_responses_compat(effort_values=_GPT55_VALUES, effort_default="none", summary=True),
     ),
   ),
@@ -181,14 +171,6 @@ def _is_tool_result_message(message: dict[str, Any]) -> bool:
     and isinstance(content, list)
     and bool(content)
     and all(isinstance(block, dict) and block.get("type") == "tool_result" for block in content)
-  )
-
-
-def _contains_tool_history(messages: list[dict[str, Any]]) -> bool:
-  return any(
-    isinstance(block, dict) and block.get("type") in {"tool_use", "server_tool_use", "tool_result"}
-    for message in messages
-    for block in (message.get("content") if isinstance(message.get("content"), list) else [])
   )
 
 
@@ -408,12 +390,6 @@ def _parse_tool_input(raw: str) -> dict[str, Any]:
   return parsed if isinstance(parsed, dict) else {}
 
 
-def _redacted_tool_input(name: str, value: dict[str, Any]) -> dict[str, Any]:
-  from ..runner_tool_audit import redact_tool_input_for_event
-
-  return redact_tool_input_for_event(name, value)
-
-
 def _terminal_events(response: dict[str, Any], state: _ResponsesStreamState) -> list[StreamEvent]:
   if state.terminal_emitted:
     return []
@@ -422,9 +398,12 @@ def _terminal_events(response: dict[str, Any], state: _ResponsesStreamState) -> 
   reported_model = str(response.get("model") or "").strip() or None
   if reported_model is not None:
     state.provider_reported_model = reported_model
-  usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
-  input_details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
-  output_details = usage.get("output_tokens_details") if isinstance(usage.get("output_tokens_details"), dict) else {}
+  raw_usage = response.get("usage")
+  usage = raw_usage if isinstance(raw_usage, dict) else {}
+  raw_input_details = usage.get("input_tokens_details")
+  input_details = raw_input_details if isinstance(raw_input_details, dict) else {}
+  raw_output_details = usage.get("output_tokens_details")
+  output_details = raw_output_details if isinstance(raw_output_details, dict) else {}
   cached = int(input_details.get("cached_tokens") or 0)
   total_input = int(usage.get("input_tokens") or 0)
   total_output = int(usage.get("output_tokens") or 0)
@@ -447,7 +426,8 @@ def _terminal_events(response: dict[str, Any], state: _ResponsesStreamState) -> 
   if state.saw_tool_use:
     stop_reason = "tool_use"
   elif status == "incomplete":
-    details = response.get("incomplete_details") if isinstance(response.get("incomplete_details"), dict) else {}
+    raw_details = response.get("incomplete_details")
+    details = raw_details if isinstance(raw_details, dict) else {}
     stop_reason = "max_tokens" if details.get("reason") == "max_output_tokens" else "error"
   elif status in {"failed", "cancelled"}:
     stop_reason = "error"
@@ -462,15 +442,16 @@ def map_event(event_value: Any, state: _ResponsesStreamState) -> list[StreamEven
   if not isinstance(event, dict):
     return []
   event_type = event.get("type")
-  response = event.get("response") if isinstance(event.get("response"), dict) else {}
+  raw_response = event.get("response")
+  response = raw_response if isinstance(raw_response, dict) else {}
   reported_model = str(response.get("model") or "").strip() or None
   if reported_model is not None:
     state.provider_reported_model = reported_model
   if event_type == "error":
     raise RuntimeError(f"OpenAI Responses error: {event.get('message') or event.get('code') or 'unknown error'}")
   if event_type == "response.failed":
-    response = event.get("response") if isinstance(event.get("response"), dict) else {}
-    error = response.get("error") if isinstance(response.get("error"), dict) else {}
+    raw_error = response.get("error")
+    error = raw_error if isinstance(raw_error, dict) else {}
     if "status" not in response:
       response = {**response, "status": "failed"}
     terminal_events = _terminal_events(response, state)
@@ -479,13 +460,13 @@ def map_event(event_value: Any, state: _ResponsesStreamState) -> list[StreamEven
     )
     return terminal_events
   if event_type in {"response.completed", "response.incomplete", "response.done"}:
-    response = event.get("response") if isinstance(event.get("response"), dict) else {}
     if event_type == "response.incomplete" and "status" not in response:
       response = {**response, "status": "incomplete"}
     return _terminal_events(response, state)
 
   if event_type == "response.output_item.added":
-    item = event.get("item") if isinstance(event.get("item"), dict) else {}
+    raw_item = event.get("item")
+    item = raw_item if isinstance(raw_item, dict) else {}
     state.current_item = dict(item)
     item_type = item.get("type")
     if item_type == "reasoning":
@@ -563,10 +544,12 @@ def map_event(event_value: Any, state: _ResponsesStreamState) -> list[StreamEven
   if event_type != "response.output_item.done":
     return []
 
-  item = event.get("item") if isinstance(event.get("item"), dict) else {}
+  raw_item = event.get("item")
+  item = raw_item if isinstance(raw_item, dict) else {}
   item_type = item.get("type")
   if item_type == "reasoning":
-    summary = item.get("summary") if isinstance(item.get("summary"), list) else []
+    raw_summary = item.get("summary")
+    summary = raw_summary if isinstance(raw_summary, list) else []
     thinking = "\n\n".join(str(part.get("text") or "") for part in summary if isinstance(part, dict))
     signature = _encode_reasoning_signature(item)
     state.current_block_type = None
@@ -578,7 +561,8 @@ def map_event(event_value: Any, state: _ResponsesStreamState) -> list[StreamEven
       raw_block={"type": "thinking", "thinking": thinking, "signature": signature, "thinkingSignature": signature},
     )]
   if item_type == "message":
-    content = item.get("content") if isinstance(item.get("content"), list) else []
+    raw_content = item.get("content")
+    content = raw_content if isinstance(raw_content, list) else []
     text = "".join(
       str(part.get("text") if part.get("type") == "output_text" else part.get("refusal") or "")
       for part in content if isinstance(part, dict)
@@ -609,7 +593,7 @@ def map_event(event_value: Any, state: _ResponsesStreamState) -> list[StreamEven
     done_events.append(StreamEvent(
       type="tool_use_end", tool_id=tool_id, tool_name=tool_name, tool_input_json=arguments,
       tool_input=tool_input,
-      raw_block={"type": "tool_use", "id": tool_id, "name": tool_name, "input": _redacted_tool_input(tool_name, tool_input)},
+      raw_block={"type": "tool_use", "id": tool_id, "name": tool_name, "input": tool_input},
     ))
     state.saw_argument_delta = False
     return done_events
@@ -619,7 +603,6 @@ def map_event(event_value: Any, state: _ResponsesStreamState) -> list[StreamEven
 __all__ = [
   "_MODEL_INFO_BY_TAG",
   "_ResponsesStreamState",
-  "_contains_tool_history",
   "_convert_messages",
   "_convert_tools",
   "_field",

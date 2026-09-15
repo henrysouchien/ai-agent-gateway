@@ -12,6 +12,15 @@ from agent_workflow_contracts import CapabilityBind
 
 from .multi_user.billing import SessionUsageSummary
 
+UsageDurability = Literal["outbox", "emergency_spool", "lost"]
+# Single owner of the durability vocabulary and its recovery ordering.
+# A durability outside this set is a broken sink contract and fails loudly.
+USAGE_DURABILITY_RANK: dict[str, int] = {
+  "lost": 0,
+  "emergency_spool": 1,
+  "outbox": 2,
+}
+
 
 @dataclass(frozen=True)
 class CommercialUsageReconciliationReport:
@@ -137,8 +146,12 @@ class CommercialUsageReconciliationTracker:
     self,
     payloads: list[dict[str, Any]],
     *,
-    durability: Literal["outbox", "emergency_spool", "lost"] = "outbox",
+    durability: UsageDurability = "outbox",
   ) -> None:
+    if durability not in USAGE_DURABILITY_RANK:
+      raise ValueError(
+        f"commercial usage durability is not admitted: {durability!r}"
+      )
     if not payloads:
       return
     root = str(payloads[0].get("source_event_id") or "")
@@ -178,9 +191,16 @@ class CommercialUsageReconciliationTracker:
         )
         if any(configured) and configured != source_identity:
           raise ValueError("commercial reconciliation source lineage mismatch")
-        source_schema_version = int(payload.get("schema_version") or 1)
-        if source_schema_version not in {1, 2, 3}:
+        raw_source_schema_version = int(payload.get("schema_version") or 1)
+        if raw_source_schema_version not in {1, 2, 3}:
           raise ValueError("commercial reconciliation source schema is unsupported")
+        source_schema_version: Literal[1, 2, 3]
+        if raw_source_schema_version == 1:
+          source_schema_version = 1
+        elif raw_source_schema_version == 2:
+          source_schema_version = 2
+        else:
+          source_schema_version = 3
         if (
           staged_schema_version is not None
           and staged_schema_version != source_schema_version
@@ -188,12 +208,12 @@ class CommercialUsageReconciliationTracker:
           raise ValueError("commercial reconciliation cannot mix usage schema versions")
         if source_schema_version == 3:
           try:
-            bind = CapabilityBind.from_receipt(payload.get("capability_bind"))
+            bind = CapabilityBind.from_json(payload.get("capability_bind"))
           except (TypeError, ValueError) as exc:
             raise ValueError(
               "commercial reconciliation capability bind is invalid"
             ) from exc
-          if payload.get("capability_bind") != bind.receipt():
+          if payload.get("capability_bind") != bind.to_json():
             raise ValueError(
               "commercial reconciliation capability bind is not canonical"
             )
@@ -334,11 +354,11 @@ class CommercialUsageReconciliationTracker:
           staged_conflicts.add(event_id)
           continue
         staged_payloads.setdefault(event_id, dict(payload))
-        durability_rank = {"lost": 0, "emergency_spool": 1, "outbox": 2}
         existing_durability = staged_durability.get(event_id)
         if (
           existing_durability is None
-          or durability_rank[durability] > durability_rank[existing_durability]
+          or USAGE_DURABILITY_RANK[durability]
+          > USAGE_DURABILITY_RANK[existing_durability]
         ):
           staged_durability[event_id] = durability
         batch_ids.add(event_id)

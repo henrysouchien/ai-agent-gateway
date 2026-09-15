@@ -1,7 +1,14 @@
 from __future__ import annotations
 
-from typing import Any
+from contextlib import AbstractContextManager
+from dataclasses import replace
+from datetime import timedelta
+from typing import Any, Mapping, Protocol
 
+from agent_gateway.approval_policy import (
+  approval_request_from_projection,
+  utc_now,
+)
 from agent_gateway.autonomous_runner import (
   AutonomousRegistry,
   AutonomousTask,
@@ -9,6 +16,43 @@ from agent_gateway.autonomous_runner import (
 from agent_gateway.autonomous_approval_channel import (
   AutonomousApprovalChannelParent,
 )
+
+
+class _EnsureAutonomousApprovalDeliveryAudited(Protocol):
+  async def __call__(
+    self,
+    approval_id: str,
+    *,
+    tool_call_id: str,
+    nonce: str,
+  ) -> dict[str, Any]: ...
+
+
+class _AutonomousApprovalDeliveryTransaction(Protocol):
+  def __call__(
+    self,
+    approval_id: str,
+    *,
+    tool_call_id: str,
+    nonce: str,
+    approved: bool,
+  ) -> AbstractContextManager[None]: ...
+
+
+class _RecordAutonomousApprovalDeliveryFailure(Protocol):
+  async def __call__(
+    self,
+    approval_id: str,
+    *,
+    tool_call_id: str,
+    nonce: str,
+    error: str,
+  ) -> dict[str, Any]: ...
+
+
+# The durable pending_user window an operator gets on a delegated request; the
+# child's wait is bounded by the same value.
+DELEGATED_APPROVAL_EXPIRY_SECONDS = 600
 
 
 def autonomous_run_accepts_approval_decisions(
@@ -71,9 +115,96 @@ def autonomous_approval_authoritative_identity(
   }
 
 
+async def create_delegated_autonomous_approval(
+  *,
+  store: Any,
+  policy: Any | None,
+  record: AutonomousTask,
+  event: dict[str, Any],
+) -> Any:
+  """Record the durable row for a request a delegated child authored.
+
+  The child owns no ledger, so this is the only writer of its approval request.
+  Every identity field is stamped from the run record before the row exists: a
+  child cannot name another run, another session or another user's approval.
+  """
+
+  if not isinstance(event, dict):
+    raise RuntimeError("autonomous approval request event is invalid")
+  approval_id = str(event.get("approval_id") or "").strip()
+  tool_call_id = str(event.get("tool_call_id") or "").strip()
+  nonce = str(event.get("nonce") or "").strip()
+  if not approval_id or not tool_call_id or not nonce:
+    raise RuntimeError(
+      "autonomous approval request event is missing its identity"
+    )
+  try:
+    request = approval_request_from_projection(event.get("durable_request"))
+  except (TypeError, ValueError) as exc:
+    raise RuntimeError(
+      "autonomous approval request projection is invalid"
+    ) from exc
+  if (
+    request.approval_id != approval_id
+    or request.tool_call_id != tool_call_id
+  ):
+    raise RuntimeError(
+      "autonomous approval request projection disagrees with its event"
+    )
+  authoritative_identity = autonomous_approval_authoritative_identity(
+    record,
+    approval_id=approval_id,
+    tool_call_id=tool_call_id,
+  )
+  requested_at = utc_now()
+  request = replace(
+    request,
+    **authoritative_identity,
+    state="pending_user",
+    authorization_mode="HUMAN",
+    cache_reference=None,
+    grant_reference=None,
+    requested_at=requested_at,
+    expires_at=requested_at + timedelta(
+      seconds=DELEGATED_APPROVAL_EXPIRY_SECONDS,
+    ),
+    decided_at=None,
+    decider_id=None,
+    decider_role=None,
+    decision=None,
+    decision_reason=None,
+    state_version=0,
+    # The child projects these, and before this they were written into the parent's
+    # ledger verbatim. They are not descriptive: approvals.py mints a durable
+    # PersistentGrant carrying `args_predicate` when the constraint permits reuse, so a
+    # child could name the predicate its own future writes would be pre-approved under.
+    # The parent neutralises every reuse/grant field; a delegated approval is decided
+    # once, for one write, and grants nothing forward.
+    approval_reuse_mode="legacy",
+    approval_reuse_key=None,
+    persistent_grant_scope=None,
+    args_predicate=None,
+    # The child must not choose whether its own write needs a frozen-owner approval.
+    # Pinned to the value delegated requests effectively carry today, so no live flow
+    # changes; the point is that the PARENT decides it. `legacy_unknown` would make
+    # every delegated approval un-approvable (409) and `fresh_human_owner` would add
+    # owner-role checks to every decision, so neither is a safe unilateral default.
+    approval_constraint="standard",
+    required_owner_user_id=None,
+    policy_id=str(
+      getattr(policy, "policy_id", None) or request.policy_id
+    ),
+    policy_version=str(
+      getattr(policy, "policy_version", None) or request.policy_version
+    ),
+  )
+  stored, _created = await store.create_or_get_by_tool_call_id(request)
+  return stored
+
+
 def require_matching_autonomous_delivery(
   record: AutonomousTask,
-  delivery: dict[str, Any],
+  delivery: Mapping[str, Any],
   request_record: Any,
   *,
   approval_id: str,
@@ -130,7 +261,7 @@ async def deliver_autonomous_approval_outbox(
   store: Any,
   record: AutonomousTask,
   request_record: Any,
-  delivery: dict[str, Any],
+  delivery: Mapping[str, Any],
   approval_id: str,
   tool_call_id: str,
   nonce: str,
@@ -154,7 +285,7 @@ async def deliver_autonomous_approval_outbox(
     raise RuntimeError(
       "Autonomous approval delivery outbox state is invalid"
     )
-  ensure_audited = getattr(
+  ensure_audited: _EnsureAutonomousApprovalDeliveryAudited | None = getattr(
     store,
     "ensure_autonomous_approval_delivery_audited",
     None,
@@ -190,7 +321,7 @@ async def deliver_autonomous_approval_outbox(
   unavailable = autonomous_decision_unavailable(record)
   if unavailable is not None:
     raise RuntimeError(unavailable)
-  append_transaction = getattr(
+  append_transaction: _AutonomousApprovalDeliveryTransaction | None = getattr(
     store,
     "autonomous_approval_delivery_append_transaction",
     None,
@@ -199,7 +330,7 @@ async def deliver_autonomous_approval_outbox(
     raise RuntimeError(
       "Autonomous approval cancellation fence unavailable"
     )
-  duplicate_transaction = getattr(
+  duplicate_transaction: _AutonomousApprovalDeliveryTransaction | None = getattr(
     store,
     "autonomous_approval_delivery_duplicate_transaction",
     None,
@@ -237,7 +368,7 @@ async def deliver_autonomous_approval_outbox(
   try:
     await publish_to_child_inbox()
   except BaseException as exc:
-    record_failure = getattr(
+    record_failure: _RecordAutonomousApprovalDeliveryFailure | None = getattr(
       store,
       "record_autonomous_approval_delivery_failure",
       None,
@@ -253,7 +384,9 @@ async def deliver_autonomous_approval_outbox(
 
 
 __all__ = [
+  "DELEGATED_APPROVAL_EXPIRY_SECONDS",
   "autonomous_approval_authoritative_identity",
+  "create_delegated_autonomous_approval",
   "autonomous_approval_delivery_context",
   "autonomous_decision_unavailable",
   "autonomous_run_accepts_approval_decisions",

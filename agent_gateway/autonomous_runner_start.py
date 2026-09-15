@@ -9,14 +9,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 import signal
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, TYPE_CHECKING
 
 from .autonomous_capability_handoff import (
   AutonomousCapabilityBindingRequest,
   resolve_autonomous_capability_binding,
 )
-from .autonomous_admission_ledger import (
-  prepare_autonomous_admission_ledger,
+from .launch_nonce_store import (
+  prepare_launch_nonce_store,
 )
 from .autonomous_control_files import (
   fsync_owned_file_directory,
@@ -66,11 +66,16 @@ from .agent_session_log_layout import (
   resolve_agent_session_log_layout,
 )
 from .claim_signing_authority import GatewayClaimSigningAuthority
-from .autonomous_runner_commands import normalize_autonomous_profile, normalize_max_budget_usd
+from .autonomous_runner_commands import (
+  normalize_autonomous_profile,
+  normalize_max_budget_usd,
+)
 from .artifact_paths import canonicalize_ticker
 from .capability_binding import CredentialHandle
 from .events import DEFAULT_SCHEMA_VERSION
 from .role_validation import require_exact_role
+from .named_refusal import NamedRefusal
+
 from .autonomous_runner_state import (
   AutonomousTask,
   _fallback_identity_payload,
@@ -81,6 +86,18 @@ from .autonomous_runner_state import (
   _user_identity_api,
   autonomous_owner_lease_is_released,
 )
+if TYPE_CHECKING:
+  from collections.abc import Callable
+
+  from .autonomous_approval_ack import _AutonomousApprovalAckStore
+  from .autonomous_capability_handoff import (
+    AutonomousCapabilityBindingResolver,
+  )
+  from .autonomous_event_channel import ReceivedAutonomousEventStream
+  from .session import GatewaySession
+  from .skill_limits import AutonomousSkillAdmissionPolicy
+
+
 
 _SPAWN_CLEANUP_GRACE_SEC = 1.0
 _AUTONOMOUS_SESSION_AUTHORITY_TTL_SECONDS = 24 * 60 * 60
@@ -114,6 +131,10 @@ _AUTONOMOUS_CHILD_BASE_ENV_NAMES = frozenset({
   "GATEWAY_LOG_DIR",
   "MCP_CONFIG_TMP_DIR",
   "MCP_CONFIG_TEMPLATE",
+  "JUPYTER_ROOT",
+  "AI_EXCEL_ADDIN_DOTENV",
+  "INVESTMENT_TOOLS_DOTENV",
+  "RISK_MODULE_DOTENV",
   "MCP_STARTUP_CONCURRENCY",
   "MCP_STDIO_CONNECT_BACKOFF_S",
   "MCP_STDIO_CONNECT_RETRIES",
@@ -121,6 +142,7 @@ _AUTONOMOUS_CHILD_BASE_ENV_NAMES = frozenset({
   "LOCAL_GATEWAY_PYTHON",
   "LOCAL_GATEWAY_CONTROL_GENERATION",
   "LOCAL_GATEWAY_CONTROL_GENERATION_ID",
+  "LOCAL_GATEWAY_CONTROL_STATE_ROOT",
   "LOCAL_GATEWAY_RUNTIME_ROOT",
   "LOCAL_GATEWAY_RUNTIME_MANIFEST",
   "LOCAL_GATEWAY_RUNTIME_VERSION_ROOT",
@@ -175,7 +197,7 @@ _AUTONOMOUS_CHILD_RESEARCH_TOOL_ENV_NAMES = frozenset({
 })
 _AUTONOMOUS_CHILD_PROFILE_TOOL_ENV_NAMES = {
   "analyst": _AUTONOMOUS_CHILD_RESEARCH_TOOL_ENV_NAMES,
-  "research-producer": _AUTONOMOUS_CHILD_RESEARCH_TOOL_ENV_NAMES,
+  "research_producer": _AUTONOMOUS_CHILD_RESEARCH_TOOL_ENV_NAMES,
   "advisor": (
     _AUTONOMOUS_CHILD_RESEARCH_TOOL_ENV_NAMES
     | frozenset({
@@ -205,7 +227,7 @@ _AUTONOMOUS_CHILD_PROFILE_ENV_NAMES = {
   for profile, prefix in (
     ("analyst", "ANALYST"),
     ("advisor", "ADVISOR"),
-    ("research-producer", "RESEARCH_PRODUCER"),
+    ("research_producer", "RESEARCH_PRODUCER"),
   )
 }
 _RETIRED_AUTONOMOUS_CHILD_ENV_NAMES = (
@@ -268,6 +290,7 @@ def _pinned_autonomous_child_pythonpath(
     ai_root / "packages" / "ibkr-relay-client" / "python",
     ai_root / "packages" / "sheets-finance-mcp",
     ai_root / "packages" / "value-semantics-core",
+    ai_root / "packages" / "industry-slice-core",
     risk_root / "brokerage-connect",
     risk_root,
   ))
@@ -689,7 +712,10 @@ def _signal_process_group(process_group_id: int, signal_number: int) -> None:
 
 
 def _create_owner_lifeline() -> tuple[int, int]:
-  pipe2 = getattr(os, "pipe2", None)
+  if TYPE_CHECKING:
+    def pipe2(flags: int) -> tuple[int, int]: ...
+  else:
+    pipe2 = getattr(os, "pipe2", None)
   if callable(pipe2):
     read_fd, write_fd = pipe2(getattr(os, "O_CLOEXEC", 0))
   else:
@@ -780,7 +806,14 @@ def _start_identity_payload(
       raise RuntimeError(
         "autonomous spawn refused: user identity API import failed"
       ) from exc
-    resolver = getattr(api, "resolve_canonical_user_identity", None) if api is not None else None
+    if TYPE_CHECKING:
+      from user_identity import resolve_canonical_user_identity as resolver
+    else:
+      resolver = (
+        getattr(api, "resolve_canonical_user_identity", None)
+        if api is not None
+        else None
+      )
     if callable(resolver):
       try:
         identity = resolver(
@@ -830,6 +863,91 @@ def _start_identity_payload(
 
 
 class AutonomousRegistryStartMixin:
+  if TYPE_CHECKING:
+    _python: str
+    _slot_lock: asyncio.Lock
+    _max_running: int
+    _tasks: dict[str, AutonomousTask]
+    _autonomous_capability_binding_resolver: (
+      AutonomousCapabilityBindingResolver | None
+    )
+    _log_dir: Path
+    _autonomous_session_token_issuer: (
+      Callable[[GatewaySession], str] | None
+    )
+    _api_dir: Path
+    _approval_store: _AutonomousApprovalAckStore | None
+
+    async def _expire_autonomous_gateway_session(
+      self,
+      record: AutonomousTask,
+    ) -> None: ...
+
+    def _remove_registered_tool_result_spill_dir(
+      self,
+      task_id: str,
+      raw_path: object,
+      *,
+      require_starting_manifest: bool = False,
+    ) -> bool: ...
+
+    def _delete_task_manifest(self, task_id: str) -> bool: ...
+
+    def _next_task_id(self) -> str: ...
+
+    def _find_by_control_run_id(
+      self,
+      control_run_id: str,
+    ) -> AutonomousTask | None: ...
+
+    def _build_cmd(
+      self,
+      *,
+      profile: str,
+      mode: str,
+      task: str | None,
+      skill: str | None,
+      context: str | None,
+      pack: str | None = None,
+      deliver: bool = True,
+      ticker: str | None = None,
+      research_file_id: int | None = None,
+      max_budget_usd: float | None = None,
+    ) -> list[str]: ...
+
+    def _resolve_initial_skill_admission_policy(
+      self,
+      *,
+      mode: str,
+      skill: str | None,
+    ) -> AutonomousSkillAdmissionPolicy | None: ...
+
+    def _expected_tool_result_spill_dir(self, task_id: str) -> Path: ...
+
+    def _attach_manifest_tracking(self, record: AutonomousTask) -> None: ...
+
+    def _write_task_manifest(
+      self,
+      record: AutonomousTask,
+      *,
+      checked: bool = False,
+    ) -> bool: ...
+
+    async def _drain_event_channel(
+      self,
+      task_id: str,
+    ) -> ReceivedAutonomousEventStream: ...
+
+    async def _reap(self, task_id: str) -> None: ...
+
+    async def _publish_run_state(
+      self,
+      record: AutonomousTask,
+      state: str,
+    ) -> None: ...
+
+    def _start_payload(self, record: AutonomousTask) -> dict[str, Any]: ...
+
   def _owned_process_sentinel_cmd(
     self,
     target_cmd: list[str],
@@ -876,7 +994,11 @@ class AutonomousRegistryStartMixin:
   async def _reserve_slot(self) -> None:
     async with self._slot_lock:
       if self._reserved_slots >= self._max_running:
-        raise RuntimeError(f"Autonomous concurrency limit reached ({self._max_running})")
+        raise NamedRefusal(
+          "autonomous_concurrency_limit",
+          f"Autonomous concurrency limit reached ({self._max_running})",
+          transport="busy",
+        )
       self._reserved_slots += 1
 
   async def _release_slot(self, record: AutonomousTask | None = None) -> None:
@@ -1064,6 +1186,7 @@ class AutonomousRegistryStartMixin:
       if record is not None:
         record.log_handle = None
         await self._release_slot(record)
+        await self._expire_autonomous_gateway_session(record)
       else:
         await self._release_slot()
       if record is not None and record.tool_result_spill_dir is not None:
@@ -1170,9 +1293,13 @@ class AutonomousRegistryStartMixin:
       pack=record.pack,
       context=record.context,
       ticker=record.ticker,
+      research_file_id=record.research_file_id,
       dev_mode=False,
       max_budget_usd=record.max_budget_usd,
       deliver=record.deliver,
+      admitted_skill_execution_limits=(
+        record.admitted_skill_execution_limits
+      ),
       session_log_authority=session_log_authority,
     )
     control_authority = record.control_authority
@@ -1212,6 +1339,7 @@ class AutonomousRegistryStartMixin:
     deliver: bool = True,
     context: str | None = None,
     ticker: str | None = None,
+    research_file_id: int | None = None,
     max_budget_usd: float | None = None,
     channel: str | None = None,
     dispatch_scope: dict[str, Any] | None = None,
@@ -1281,14 +1409,23 @@ class AutonomousRegistryStartMixin:
       normalized_dispatch_scope = _normalize_dispatch_scope(dispatch_scope)
       if dispatch_scope is not None and normalized_dispatch_scope is None:
         raise ValueError("dispatch_scope must be a redacted portfolio dispatch scope")
+      normalized_research_file_id = research_file_id
       normalized_max_budget_usd = normalize_max_budget_usd(max_budget_usd)
       normalize_profile = _runtime_attr(
         "normalize_autonomous_profile",
         normalize_autonomous_profile,
       )
       normalized_profile = normalize_profile(profile)
-      normalized_mode = mode.strip().lower()
-      if normalized_mode not in {"once", "task", "skill", "pack"}:
+      raw_mode = mode.strip().lower()
+      if raw_mode == "once":
+        normalized_mode = "once"
+      elif raw_mode == "task":
+        normalized_mode = "task"
+      elif raw_mode == "skill":
+        normalized_mode = "skill"
+      elif raw_mode == "pack":
+        normalized_mode = "pack"
+      else:
         raise ValueError("mode must be once, task, skill, or pack")
       normalized_skill = (
         skill.strip() if isinstance(skill, str) and skill.strip() else None
@@ -1349,14 +1486,33 @@ class AutonomousRegistryStartMixin:
         deliver=normalized_deliver,
         context=context,
         ticker=ticker,
+        research_file_id=normalized_research_file_id,
         max_budget_usd=normalized_max_budget_usd,
+      )
+      skill_admission_policy = (
+        None
+        if resumed_record is not None
+        else self._resolve_initial_skill_admission_policy(
+          mode=normalized_mode,
+          skill=normalized_skill,
+        )
       )
       skill_resume_allowed = (
         resumed_record.skill_resume_allowed
         if resumed_record is not None
-        else self._resolve_initial_skill_resume_allowed(
-          mode=normalized_mode,
-          skill=normalized_skill,
+        else (
+          skill_admission_policy.skill_resume_allowed
+          if skill_admission_policy is not None
+          else False
+        )
+      )
+      admitted_skill_execution_limits = (
+        resumed_record.admitted_skill_execution_limits
+        if resumed_record is not None
+        else (
+          skill_admission_policy.execution_limits
+          if skill_admission_policy is not None
+          else None
         )
       )
       os_module = _runtime_attr("os", os)
@@ -1394,12 +1550,6 @@ class AutonomousRegistryStartMixin:
           required_bind=required_bind,
         ),
       )
-      credential_handoff_payload = (
-        encode_autonomous_credential_handoff(
-          capability_binding.materialized_credential
-        )
-      )
-
       self._log_dir.mkdir(parents=True, exist_ok=True)
       canonical_log_dir = self._log_dir.resolve()
       log_path = canonical_log_dir / f"{task_id}.log"
@@ -1411,7 +1561,7 @@ class AutonomousRegistryStartMixin:
       owner_lease_path = (
         canonical_log_dir / f"{task_id}.owner-lease"
       )
-      admission_identity = prepare_autonomous_admission_ledger(
+      admission_identity = prepare_launch_nonce_store(
         canonical_log_dir / ".autonomous-admission-ledger.sqlite3"
       )
 
@@ -1455,12 +1605,6 @@ class AutonomousRegistryStartMixin:
         operator_inbox_path=str(operator_inbox_path),
         operator_inbox_device=operator_stat.st_dev,
         operator_inbox_inode=operator_stat.st_ino,
-        approval_decisions_path=None,
-        approval_decisions_device=None,
-        approval_decisions_inode=None,
-        approval_store_path=None,
-        approval_store_device=None,
-        approval_store_inode=None,
       )
 
       log_fd, log_stat = secure_create_owned_file(log_path)
@@ -1480,6 +1624,7 @@ class AutonomousRegistryStartMixin:
         owner_lifeline_write_fd,
       ) = _create_owner_lifeline()
       time_module = _runtime_attr("time", time)
+      tool_result_spill_dir = self._expected_tool_result_spill_dir(task_id)
       record = AutonomousTask(
         task_id=task_id,
         control_run_id=control_run_id,
@@ -1513,7 +1658,9 @@ class AutonomousRegistryStartMixin:
         owner_lease_inode=owner_lease_stat.st_ino,
         started_at=time_module.time(),
         skill_resume_allowed=skill_resume_allowed,
+        admitted_skill_execution_limits=admitted_skill_execution_limits,
         max_budget_usd=normalized_max_budget_usd,
+        research_file_id=normalized_research_file_id,
         state="starting",
         log_handle=log_handle,
         slot_reserved=True,
@@ -1529,7 +1676,7 @@ class AutonomousRegistryStartMixin:
         resumed_from=normalized_resumed_from,
         schedule_id=normalized_schedule_id,
         schedule_name=schedule_name.strip() if isinstance(schedule_name, str) and schedule_name.strip() else None,
-        tool_result_spill_dir=self._expected_tool_result_spill_dir(task_id),
+        tool_result_spill_dir=tool_result_spill_dir,
         capability_bind=capability_binding.bind,
       )
       owner_lifeline_write_fd = -1
@@ -1541,7 +1688,7 @@ class AutonomousRegistryStartMixin:
         record.tool_result_spill_dir = None
         raise RuntimeError("failed to persist starting autonomous task manifest")
       try:
-        record.tool_result_spill_dir.mkdir(mode=0o700)
+        tool_result_spill_dir.mkdir(mode=0o700)
       except Exception as exc:
         raise RuntimeError(f"autonomous spill directory setup failed: {exc}") from exc
 
@@ -1619,6 +1766,23 @@ class AutonomousRegistryStartMixin:
         raise RuntimeError(
           "signed autonomous launch envelope changed task authority"
         )
+      session_token: str | None = None
+      session_token_issuer = self._autonomous_session_token_issuer
+      if session_token_issuer is not None:
+        session_token = session_token_issuer(child_session)
+        if (
+          type(session_token) is not str
+          or not session_token
+          or session_token != session_token.strip()
+          or child_session.session_token != session_token
+        ):
+          raise RuntimeError(
+            "autonomous session token issuer returned invalid authority"
+          )
+      credential_handoff_payload = encode_autonomous_credential_handoff(
+        capability_binding.materialized_credential,
+        session_token=session_token,
+      )
       env["GATEWAY_USER_KEYS"] = _narrowed_mcp_gateway_user_keys(
         api_dir=self._api_dir,
         user_id=child_session.user_id,
@@ -1709,7 +1873,11 @@ class AutonomousRegistryStartMixin:
       record.event_channel_task = asyncio_module.create_task(
         self._drain_event_channel(task_id)
       )
-      credential_stdin = getattr(record.proc, "stdin", None)
+      if TYPE_CHECKING:
+        def _typed_credential_stdin() -> asyncio.StreamWriter | None: ...
+        credential_stdin = _typed_credential_stdin()
+      else:
+        credential_stdin = getattr(record.proc, "stdin", None)
       if credential_stdin is None:
         raise RuntimeError(
           "autonomous credential handoff pipe is unavailable"
@@ -1719,7 +1887,10 @@ class AutonomousRegistryStartMixin:
         await credential_stdin.drain()
       finally:
         credential_stdin.close()
-        wait_closed = getattr(credential_stdin, "wait_closed", None)
+        if TYPE_CHECKING:
+          wait_closed = credential_stdin.wait_closed
+        else:
+          wait_closed = getattr(credential_stdin, "wait_closed", None)
         if callable(wait_closed):
           await wait_closed()
 
@@ -1732,7 +1903,11 @@ class AutonomousRegistryStartMixin:
       ownership_transferred = True
       return self._start_payload(record)
     except OSError as exc:
-      raise RuntimeError(f"spawn failed: {exc}") from exc
+      raise NamedRefusal(
+        "spawn_failed",
+        f"spawn failed: {exc}",
+        transport="internal",
+      ) from exc
     finally:
       if not ownership_transferred:
         await self._await_cleanup(

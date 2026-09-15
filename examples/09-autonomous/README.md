@@ -55,6 +55,7 @@ loop = HeartbeatLoop(
         system_prompt="Check HEARTBEAT.md. If nothing needs attention, reply HEARTBEAT_OK.",
         initial_message="Check if anything needs attention.",
         capability_execution=capability_execution,
+        admitted_skill_execution_limits=None,
         session=session,
         tool_handlers={...},
         user_id="heartbeat-agent",

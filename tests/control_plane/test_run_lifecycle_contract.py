@@ -7,10 +7,14 @@ import subprocess
 import sys
 from typing import get_args
 
+import pytest
+
 from agent_gateway.control_run_lifecycle import (
   CONTROL_RUN_CONTRACT_VERSION,
   CONTROL_RUN_STATE_CLASSIFICATION,
   ControlRunState,
+  canonical_control_run_state,
+  coerce_control_run_state,
 )
 from agent_gateway.control_run_lifecycle_contract import (
   control_run_lifecycle_contract_payload,
@@ -83,3 +87,18 @@ def test_control_run_response_literals_match_python_owner() -> None:
   assert "budget_limited" in contract_states
   assert "blocked" not in contract_states
   assert "remediating" not in contract_states
+
+
+def test_canonical_control_run_state_refuses_unknown_states() -> None:
+  assert canonical_control_run_state("finished") == "completed"
+  assert canonical_control_run_state("killed") == "cancelled"
+  assert canonical_control_run_state("budget_exceeded") == "budget_limited"
+  assert canonical_control_run_state("blocked") == "failed"
+  assert canonical_control_run_state("remediating") == "running"
+  assert canonical_control_run_state(" Running ") == "running"
+
+  assert coerce_control_run_state("not-a-state") is None
+  with pytest.raises(ValueError, match="unknown control run state"):
+    canonical_control_run_state("not-a-state")
+  with pytest.raises(ValueError, match="unknown control run state"):
+    canonical_control_run_state(None)

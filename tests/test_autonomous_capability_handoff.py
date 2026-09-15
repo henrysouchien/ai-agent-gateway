@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_gateway import AnthropicProvider
+from agent_gateway import OpenAIProvider
 import agent_gateway.autonomous_credential_handoff as credential_handoff
 from agent_gateway.autonomous_capability_handoff import (
   AutonomousCapabilityBinding,
@@ -21,6 +21,7 @@ from agent_gateway.autonomous_credential_handoff import (
   AUTONOMOUS_CREDENTIAL_HANDOFF_ENV,
   AUTONOMOUS_CREDENTIAL_HANDOFF_STDIN,
   read_autonomous_credential_handoff,
+  read_autonomous_launch_secrets,
 )
 from agent_gateway.autonomous_launch_envelope import (
   AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
@@ -33,6 +34,11 @@ from agent_gateway.autonomous_runner_start import (
 )
 from agent_gateway.capability_binding import CapabilityBind, CredentialHandle
 from agent_gateway.capability_execution import MaterializedCredential
+from agent_gateway.skill_limits import (
+  AutonomousSkillAdmissionPolicy,
+  SkillExecutionLimits,
+)
+from agent_gateway.session import AuthManager, SessionStore
 from agent_gateway.claim_signing_authority import (
   GatewayClaimSigningAuthority,
 )
@@ -192,7 +198,11 @@ def _binding_for_request(request: AutonomousCapabilityBindingRequest):
   )
 
 
-def _registry(tmp_path: Path, resolver=_binding_for_request) -> AutonomousRegistry:
+def _registry(
+  tmp_path: Path,
+  resolver=_binding_for_request,
+  **kwargs,
+) -> AutonomousRegistry:
   return AutonomousRegistry(
     api_dir=_API_DIR,
     tenant_id="test-product",
@@ -203,8 +213,14 @@ def _registry(tmp_path: Path, resolver=_binding_for_request) -> AutonomousRegist
       "anthropic": _service_handle(),
     },
     autonomous_capability_binding_resolver=resolver,
-    skill_resume_allowed_resolver=lambda _skill: False,
+    autonomous_skill_admission_policy_resolver=lambda skill_name: (
+      AutonomousSkillAdmissionPolicy(
+        False,
+        SkillExecutionLimits(None, None, None),
+      )
+    ),
     claim_signing_authority=GatewayClaimSigningAuthority(_SECRET),
+    **kwargs,
   )
 
 
@@ -290,7 +306,87 @@ def test_resolver_is_invoked_once_and_signed_exact_envelope_reaches_spawn(
   assert materialized.handle == _service_handle()
   assert materialized.auth_config["api_key"] == "service-secret"
   record = registry._tasks[payload["task_id"]]
-  assert record.capability_bind.credential_ref == materialized.handle.handle_id
+  capability_bind = record.capability_bind
+  assert capability_bind is not None
+  assert capability_bind.credential_ref == materialized.handle.handle_id
+
+
+def test_registered_autonomous_session_token_uses_private_handoff_and_expires(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  captured_env: dict[str, str] = {}
+  child_stdin = _FakeStdin()
+  release_process = asyncio.Event()
+  session_store = SessionStore(ttl=3600)
+  auth = AuthManager(_SECRET, set(), session_store)
+
+  class _HeldProcess(_FakeProcess):
+    async def wait(self) -> int:
+      await release_process.wait()
+      self.returncode = 0
+      return 0
+
+  async def fake_exec(*args, **kwargs):
+    _ = args
+    captured_env.update(kwargs["env"])
+    return _HeldProcess(stdin=child_stdin)
+
+  def issue_session_token(session) -> str:
+    session_store.register_session(session)
+    return auth.issue_token(session)
+
+  async def expire_session(session_id: str) -> None:
+    await session_store.expire_session_async(session_id)
+
+  async def run() -> None:
+    registry = _registry(
+      tmp_path,
+      autonomous_session_token_issuer=issue_session_token,
+      autonomous_session_expirer=expire_session,
+    )
+    payload = await registry.start(
+      role="owner",
+      profile="analyst",
+      mode="skill",
+      skill="risk.scan",
+      user_id="42",
+      user_email="owner@example.com",
+      owner_user_id="42",
+      risk_user_id=42,
+    )
+    envelope = verify_autonomous_launch_envelope(
+      _SECRET,
+      captured_env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+    )
+    launch_secrets = read_autonomous_launch_secrets(
+      expected_handle_id=envelope.bind.credential_ref,
+      expected_provider=envelope.bind.provider,
+      expected_principal=envelope.bind.credential_principal,
+      expected_tenant_id="test-product",
+      expected_actor_id=None,
+      stream=io.BytesIO(bytes(child_stdin.buffer)),
+    )
+    token = launch_secrets.session_token
+    assert token is not None
+    registered = auth.verify_token(token)
+    assert registered.session_id == payload["task_id"]
+    assert registered.user_id == "42"
+    assert registered.risk_user_id == 42
+    assert registered.role == "owner"
+    assert token not in json.dumps(captured_env)
+    assert token not in captured_env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV]
+    assert token not in (
+      tmp_path / f"{payload['task_id']}.task.json"
+    ).read_text(encoding="utf-8")
+
+    release_process.set()
+    await registry.wait(payload["task_id"], timeout_sec=1)
+    assert session_store.get_session(registered.session_id) is None
+
+  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", _SECRET)
+  monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+  asyncio.run(run())
 
 
 def test_invite_role_reaches_record_and_signed_child_authority(
@@ -422,7 +518,7 @@ def test_user_credential_exact_signed_handle_reaches_child_over_stdin(
     tmp_path / f"{payload['task_id']}.task.json"
   ).read_text(encoding="utf-8")
   assert "parent-user-secret" not in manifest_text
-  assert json.loads(manifest_text)["capability_bind"] == envelope.bind.receipt()
+  assert json.loads(manifest_text)["capability_bind"] == envelope.bind.to_json()
 
 
 def test_child_closes_inherited_user_credential_pipe(
@@ -488,6 +584,7 @@ def test_child_environment_is_profile_scoped_and_secret_minimal() -> None:
     "FMP_API_KEY": "research-secret",
     "SEC_BUDGET_SITE": "prod",
     "SEC_USER_AGENT": "host-agent contact@example.com",
+    "RESEARCH_PRODUCER_AGENT_MAX_TOKENS": "24000",
     "IBKR_FLEX_TOKEN": "brokerage-secret",
     "TELEGRAM_BOT_TOKEN": "telegram-secret",
     "TELEGRAM_CHAT_ID": "telegram-chat",
@@ -498,6 +595,7 @@ def test_child_environment_is_profile_scoped_and_secret_minimal() -> None:
     "EDGAR_UPDATER_ROOT": "/opt/hank/edgar-updater",
     "LOCAL_GATEWAY_CONTROL_GENERATION": "/opt/hank/control/generation",
     "LOCAL_GATEWAY_CONTROL_GENERATION_ID": "generation-1",
+    "LOCAL_GATEWAY_CONTROL_STATE_ROOT": "/opt/hank/control/state",
     "LOG_DIR": "/writable/live/logs",
     "MCP_STARTUP_CONCURRENCY": "1",
     "MCP_STDIO_CONNECT_BACKOFF_S": "3",
@@ -542,6 +640,7 @@ def test_child_environment_is_profile_scoped_and_secret_minimal() -> None:
   assert analyst["EDGAR_UPDATER_ROOT"] == "/opt/hank/edgar-updater"
   assert analyst["LOCAL_GATEWAY_CONTROL_GENERATION"] == "/opt/hank/control/generation"
   assert analyst["LOCAL_GATEWAY_CONTROL_GENERATION_ID"] == "generation-1"
+  assert analyst["LOCAL_GATEWAY_CONTROL_STATE_ROOT"] == "/opt/hank/control/state"
   assert analyst["LOG_DIR"] == "/writable/live/logs"
   assert analyst["MCP_STARTUP_CONCURRENCY"] == "1"
   assert analyst["MCP_STDIO_CONNECT_BACKOFF_S"] == "3"
@@ -557,11 +656,13 @@ def test_child_environment_is_profile_scoped_and_secret_minimal() -> None:
   research_producer = _positive_autonomous_child_env(
     source,
     provider="openai",
-    profile="research-producer",
+    profile="research_producer",
     deliver=False,
   )
+  assert research_producer["FMP_API_KEY"] == "research-secret"
   assert research_producer["SEC_BUDGET_SITE"] == "prod"
   assert research_producer["SEC_USER_AGENT"] == "host-agent contact@example.com"
+  assert research_producer["RESEARCH_PRODUCER_AGENT_MAX_TOKENS"] == "24000"
   assert "IBKR_FLEX_TOKEN" not in research_producer
   assert forbidden.isdisjoint(research_producer)
 
@@ -607,7 +708,19 @@ def test_non_anthropic_child_rates_override_reaches_provider_construction(
   rates_path.write_text(json.dumps({
     "version": "child-projected",
     "source": "https://example.test/rates",
-    "providers": {"anthropic": {"models": {}}},
+    "providers": {
+      "openai": {
+        "models": {
+          "gpt-6-astra": {
+            "display_name": "GPT-6 Astra",
+            "input_cost_per_mtok": 2.0,
+            "output_cost_per_mtok": 3.0,
+            "cache_read_cost_per_mtok": 4.0,
+            "cache_write_cost_per_mtok": 5.0,
+          },
+        },
+      },
+    },
   }), encoding="utf-8")
   projected = _positive_autonomous_child_env(
     {"AGENT_GATEWAY_RATES_FILE": str(rates_path)},
@@ -620,9 +733,13 @@ def test_non_anthropic_child_rates_override_reaches_provider_construction(
     projected["AGENT_GATEWAY_RATES_FILE"],
   )
 
-  provider = AnthropicProvider()
+  provider = OpenAIProvider()
+  estimate = provider.estimate_cost(
+    "gpt-6-astra", 1000, 2000, cache_read_tokens=3000, cache_creation_tokens=4000,
+  )
 
-  assert provider._rate_table.version == "child-projected"
+  assert estimate.total == pytest.approx(0.04)
+  assert "child-projected" in provider._rate_table.version
 
 
 def test_pinned_autonomous_child_inherits_exact_runtime_import_roots() -> None:
@@ -631,7 +748,7 @@ def test_pinned_autonomous_child_inherits_exact_runtime_import_roots() -> None:
   projected = _positive_autonomous_child_env(
     {"LOCAL_GATEWAY_RUNTIME_VERSION_ROOT": str(version_root)},
     provider="openai",
-    profile="research-producer",
+    profile="research_producer",
     deliver=False,
   )
 
@@ -645,6 +762,7 @@ def test_pinned_autonomous_child_inherits_exact_runtime_import_roots() -> None:
     str(ai_root / "packages" / "ibkr-relay-client" / "python"),
     str(ai_root / "packages" / "sheets-finance-mcp"),
     str(ai_root / "packages" / "value-semantics-core"),
+    str(ai_root / "packages" / "industry-slice-core"),
     str(risk_root / "brokerage-connect"),
     str(risk_root),
   ]
@@ -657,7 +775,7 @@ def test_pinned_autonomous_child_preserves_explicit_pythonpath() -> None:
       "PYTHONPATH": "/explicit/runtime/path",
     },
     provider="openai",
-    profile="research-producer",
+    profile="research_producer",
     deliver=False,
   )
 
@@ -816,7 +934,7 @@ def test_manifest_persists_and_rehydrates_secret_free_exact_handoff(
   manifest = json.loads(
     (tmp_path / f"{payload['task_id']}.task.json").read_text(encoding="utf-8")
   )
-  assert manifest["capability_bind"] == _bind(run_mode="autonomous").receipt()
+  assert manifest["capability_bind"] == _bind(run_mode="autonomous").to_json()
   assert _SECRET not in json.dumps(manifest)
   assert AUTONOMOUS_CAPABILITY_ENVELOPE_ENV not in manifest
 
@@ -1142,7 +1260,7 @@ def test_schedule_user_bind_uses_secret_free_cron_envelope_and_exact_resume_hand
       tmp_path / f"{payload['task_id']}.task.json"
     ).read_text(encoding="utf-8")
     manifest = json.loads(manifest_text)
-    assert manifest["capability_bind"] == envelope.bind.receipt()
+    assert manifest["capability_bind"] == envelope.bind.to_json()
     assert user_secret not in envelope_json
     assert user_secret not in json.dumps(env)
     assert user_secret not in manifest_text
@@ -1253,8 +1371,13 @@ def test_resolver_helper_rejects_missing_and_mismatched_results() -> None:
     source="start",
     run_mode="autonomous",
   )
+  def invalid_resolver(
+    resolver_request: AutonomousCapabilityBindingRequest,
+  ) -> AutonomousCapabilityBinding:
+    _ = resolver_request
+    return object()  # pyright: ignore[reportReturnType]  # negative: invalid resolver result rejection
 
   with pytest.raises(RuntimeError, match="binding resolver is required"):
     asyncio.run(resolve_autonomous_capability_binding(None, request))
   with pytest.raises(TypeError, match="must return AutonomousCapabilityBinding"):
-    asyncio.run(resolve_autonomous_capability_binding(lambda _request: object(), request))
+    asyncio.run(resolve_autonomous_capability_binding(invalid_resolver, request))

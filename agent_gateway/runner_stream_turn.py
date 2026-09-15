@@ -5,11 +5,12 @@ import copy
 import logging
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
 
 from .auth import ProviderCredentialFailure
 from .capability_binding import validate_reported_identity
 from .providers import ModelInfo, ThinkingLevel
+from .providers.anthropic_helpers import _format_anthropic_rejection_detail
 from .thinking import EffortResolution, parse_effort
 from .runner_introspection import format_exc as _format_exc
 from .runner_limits import (
@@ -20,6 +21,7 @@ from .runner_prompt_rules import (
   messages_require_tool_only_turns as _messages_require_tool_only_turns,
   system_prompt_requires_tool_only_turns as _system_prompt_requires_tool_only_turns,
 )
+from .runner_session_events import error_with_provider_projection
 from .runner_cleanup import attach_cleanup_failure
 from .runner_session_lifecycle import _runner_attr
 from .runner_state import StreamTurnFailure, StreamTurnResult
@@ -38,6 +40,13 @@ from .runner_usage import (
   usage_delta_state as _usage_delta_state,
 )
 
+if TYPE_CHECKING:
+  from .capability_execution import BoundCapabilityExecution
+  from .multi_user.billing import UsageEvent, UsageState
+  from .providers import ModelProvider
+  from .runner_hooks_lifecycle import _UsageTotals
+
+
 
 log = logging.getLogger("agent_gateway.runner")
 STREAM_GUARD_POLL_INTERVAL = 2.0
@@ -53,7 +62,85 @@ def _runner_module_attr(name: str, fallback: Any) -> Any:
   return getattr(module, name, fallback)
 
 
+def _format_error_with_rejection_detail(
+  formatted_error: str,
+  exc: Exception,
+) -> str:
+  rejection_detail = _format_anthropic_rejection_detail(exc)
+  if rejection_detail is None:
+    return formatted_error
+  return f"{formatted_error} | {rejection_detail}"
+
+
 class RunnerStreamTurnMixin:
+  _first_text_at: float | None = None
+
+  if TYPE_CHECKING:
+    _billing_mode: Literal["byok", "metered"]
+    _capability_execution: BoundCapabilityExecution
+    _client_timeout: float | None
+    _compaction_instructions: str | None
+    _compaction_trigger: int | None
+    _disconnected: bool
+    _last_request_max_tokens: int
+    _last_request_message_marker_position: (
+      tuple[int, int] | None
+    )
+    _last_request_system_blocks: tuple[tuple[str, bool], ...]
+    _last_request_wire_tools: list[dict[str, Any]]
+    _per_turn_timeout: float | None
+    _provider: ModelProvider
+    _sid: str
+    _stream_stall_timeout: float | None
+
+    def _append(self, event: Dict[str, Any]) -> Any | None: ...
+
+    def _apply_refreshed_auth_config(
+      self,
+      config: Dict[str, Any],
+      refreshed: Dict[str, Any],
+    ) -> None: ...
+
+    def _build_usage_event(
+      self,
+      *,
+      model: str,
+      usage_totals: _UsageTotals,
+    ) -> UsageEvent: ...
+
+    async def _call_credential_refresher(
+      self,
+      failure: ProviderCredentialFailure,
+    ) -> Dict[str, Any] | None: ...
+
+    def _call_metric(self, name: str, value: int = 1) -> None: ...
+
+    async def _call_on_usage(
+      self,
+      usage_event: UsageEvent,
+      *,
+      usage_state: UsageState = "succeeded",
+    ) -> None: ...
+
+    async def _close_client(
+      self,
+      client: Any,
+      timeout: float = 2.0,
+    ) -> None: ...
+
+    async def _emit_error_event(self, error: str) -> None: ...
+
+    async def _emit_stream_retry_event(
+      self,
+      *,
+      attempt: int,
+      error: str,
+    ) -> None: ...
+
+    def _set_client(self, client: Any) -> None: ...
+
+    async def force_close(self, timeout: float = 2.0) -> None: ...
+
   @staticmethod
   def _thinking_level(enabled: bool) -> ThinkingLevel:
     return _runner_module_attr("thinking_level", thinking_level)(enabled)
@@ -97,6 +184,27 @@ class RunnerStreamTurnMixin:
   ) -> tuple[str, str, str]:
     return _runner_module_attr("classify_guard_outcome", classify_guard_outcome)(guard_reason, attempt, max_attempts)
 
+  async def _finish_failed_stream_turn(self, client: Any, error: str) -> None:
+    cancellation: asyncio.CancelledError | None = None
+    try:
+      await self._emit_error_event(error)
+    except asyncio.CancelledError as exc:
+      cancellation = exc
+      raise
+    finally:
+      # Standalone settlement drains before re-raising cancellation; cleanup
+      # must not replace that cancellation with a provider close failure.
+      try:
+        await self._close_client(client, timeout=5.0)
+      except Exception as exc:
+        if cancellation is None:
+          raise
+        _runner_attr(self, "log", log).warning(
+          "[%s] client close after cancelled stream failed: %s",
+          self._sid,
+          attach_cleanup_failure(cancellation, exc),
+        )
+
   async def _stream_turn(
     self,
     *,
@@ -112,7 +220,7 @@ class RunnerStreamTurnMixin:
     turn_t0_mono: float,
     system_chars: int,
     tools_chars: int,
-    usage_totals: Dict[str, Any],
+    usage_totals: _UsageTotals,
   ) -> Tuple[Any, StreamTurnResult] | StreamTurnFailure | None:
     asyncio_module = _runner_attr(self, "asyncio", asyncio)
     time_module = _runner_attr(self, "time", time)
@@ -215,17 +323,21 @@ class RunnerStreamTurnMixin:
           rendered_system_blocks.append(
             (text, "cache_control" in block)
           )
-      marker_locations = [
-        (message_index, block_index)
-        for message_index, message in enumerate(params.get("messages") or [])
-        for block_index, block in enumerate(
-          message.get("content")
-          if isinstance(message, dict)
-          and isinstance(message.get("content"), list)
-          else []
+      marker_locations: list[tuple[int, int]] = []
+      for message_index, message in enumerate(
+        params.get("messages") or []
+      ):
+        if not isinstance(message, dict):
+          continue
+        content = message.get("content")
+        if not isinstance(content, list):
+          continue
+        marker_locations.extend(
+          (message_index, block_index)
+          for block_index, block in enumerate(content)
+          if isinstance(block, dict)
+          and "cache_control" in block
         )
-        if isinstance(block, dict) and "cache_control" in block
-      ]
       self._last_request_system_blocks = tuple(
         rendered_system_blocks
       )
@@ -258,7 +370,7 @@ class RunnerStreamTurnMixin:
         if event_type == "message_start":
           bind = self._capability_execution.bind
           usage_totals.update({
-            "capability_bind": bind.receipt(),
+            "capability_bind": bind.to_json(),
           })
           if event.provider_reported_model is not None:
             usage_totals["provider_reported_model"] = validate_reported_identity(
@@ -275,15 +387,29 @@ class RunnerStreamTurnMixin:
             provider_unit_deltas=event.provider_unit_deltas,
           )
           if first_turn:
+            uncached_input_tokens = int(
+              getattr(event, "input_tokens", 0) or 0
+            )
+            cache_creation_input_tokens = int(
+              getattr(event, "cache_creation_tokens", 0) or 0
+            )
+            cache_read_input_tokens = int(
+              getattr(event, "cache_read_tokens", 0) or 0
+            )
+            gross_input_tokens = (
+              uncached_input_tokens
+              + cache_creation_input_tokens
+              + cache_read_input_tokens
+            )
             logger.info(
               "[%s] Cache | read=%d create=%d uncached=%d",
               self._sid,
-              event.cache_read_tokens,
-              event.cache_creation_tokens,
-              event.input_tokens,
+              cache_read_input_tokens,
+              cache_creation_input_tokens,
+              uncached_input_tokens,
             )
             breakdown = _runner_attr(self, "_token_breakdown_snapshot", _token_breakdown_snapshot)(
-              input_tokens=event.input_tokens,
+              input_tokens=gross_input_tokens,
               system_chars=system_chars,
               tools_chars=tools_chars,
               messages=current_messages,
@@ -317,9 +443,11 @@ class RunnerStreamTurnMixin:
           continue
 
         if event_type == "text_delta":
-          if result.first_token_t is None:
-            result.first_token_t = time_module.time()
           text = str(event.text or "")
+          if text and result.first_token_t is None:
+            result.first_token_t = time_module.time()
+            if self._first_text_at is None:
+              self._first_text_at = result.first_token_t
           if not suppress_tool_turn_text:
             if text:
               self._append({"type": "text_delta", "text": text})
@@ -353,7 +481,11 @@ class RunnerStreamTurnMixin:
 
         if event_type == "tool_use_end":
           if isinstance(event.raw_block, dict):
-            result.content_blocks.append(event.raw_block)
+            history_block = copy.deepcopy(event.raw_block)
+            history_block["input"] = copy.deepcopy(
+              event.tool_input or {}
+            )
+            result.content_blocks.append(history_block)
           result.tool_uses.append((event.tool_id, event.tool_name or "tool", dict(event.tool_input or {})))
           continue
 
@@ -554,9 +686,7 @@ class RunnerStreamTurnMixin:
               self._build_usage_event(model=config["model"], usage_totals=partial_usage),
               usage_state="failed_billable",
             )
-          await self._emit_error_event(guard_error)
-          await self._close_client(client, timeout=5.0)
-          return None
+          return await self._finish_failed_stream_turn(client, guard_error)
 
         credential_failure: ProviderCredentialFailure | None = None
         try:
@@ -592,6 +722,8 @@ class RunnerStreamTurnMixin:
             continue
 
         formatted_exc = _runner_attr(self, "_format_exc", _format_exc)(exc)
+        logged_exc = _format_error_with_rejection_detail(formatted_exc, exc)
+        event_error = error_with_provider_projection(formatted_exc, exc)
         if self._provider.is_context_length_error(exc):
           logger.error(
             "[%s] Stream error on turn %d after %.1fs (context length): %s",
@@ -616,16 +748,14 @@ class RunnerStreamTurnMixin:
             self._sid,
             turn_count,
             time_module.time() - turn_t0,
-            formatted_exc,
+            logged_exc,
           )
           if partial_usage_state.has_tokens:
             await self._call_on_usage(
               self._build_usage_event(model=config["model"], usage_totals=partial_usage),
               usage_state="failed_billable",
             )
-          await self._emit_error_event(formatted_exc)
-          await self._close_client(client, timeout=5.0)
-          return None
+          return await self._finish_failed_stream_turn(client, event_error)
 
         logger.warning(
           "[%s] Transient stream error on turn %d after %.1fs (attempt %d/%d): %s",
@@ -634,7 +764,7 @@ class RunnerStreamTurnMixin:
           time_module.time() - turn_t0,
           attempt + 1,
           1 + stream_retry_max,
-          formatted_exc,
+          logged_exc,
         )
         if attempt < stream_retry_max:
           if partial_usage_state.has_tokens:
@@ -643,7 +773,7 @@ class RunnerStreamTurnMixin:
               usage_state="canceled" if self._disconnected else "failed_billable",
             )
           _raise_if_disconnected(exc)
-          await self._emit_stream_retry_event(attempt=attempt, error=formatted_exc)
+          await self._emit_stream_retry_event(attempt=attempt, error=event_error)
           continue
         if partial_usage_state.has_tokens:
           await self._call_on_usage(
@@ -686,9 +816,7 @@ class RunnerStreamTurnMixin:
               self._build_usage_event(model=config["model"], usage_totals=partial_usage),
               usage_state="failed_billable",
             )
-          await self._emit_error_event(guard_error)
-          await self._close_client(client, timeout=5.0)
-          return None
+          return await self._finish_failed_stream_turn(client, guard_error)
         if suppress_tool_turn_text:
           if result.tool_uses:
             if result.full_text:
@@ -710,6 +838,8 @@ class RunnerStreamTurnMixin:
 
     if stream_error is not None:
       formatted_exc = _runner_attr(self, "_format_exc", _format_exc)(stream_error)
+      logged_exc = _format_error_with_rejection_detail(formatted_exc, stream_error)
+      event_error = error_with_provider_projection(formatted_exc, stream_error)
       if self._provider.is_context_length_error(stream_error):
         logger.error(
           "[%s] Stream failed on turn %d after %d retries (context length): %s",
@@ -728,8 +858,7 @@ class RunnerStreamTurnMixin:
         self._sid,
         turn_count,
         stream_retry_max,
-        formatted_exc,
+        logged_exc,
       )
-      await self._emit_error_event(formatted_exc)
-      await self._close_client(client, timeout=5.0)
+      return await self._finish_failed_stream_turn(client, event_error)
     return None

@@ -1,7 +1,7 @@
 """Durable receipt delivery and paid-fork admission accounting.
 
 The fork ledger deliberately has its own schema and lifecycle, but reuses the
-autonomous admission ledger's hardened SQLite file and connection primitives.
+launch nonce store's hardened SQLite file and connection primitives.
 All day windows are UTC calendar days.  Money is stored as integer micro-USD so
 budget decisions never depend on SQLite floating-point aggregation.
 
@@ -21,12 +21,12 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 import sqlite3
 import time
-from typing import Callable, Literal, TypeVar
+from typing import Callable, Literal, overload, TypeVar
 from uuid import uuid4
 
-from .autonomous_admission_ledger import (
-  AutonomousAdmissionLedgerError,
-  AutonomousAdmissionLedgerIdentityError,
+from .launch_nonce_store import (
+  LaunchNonceStoreError,
+  LaunchNonceStoreIdentityError,
   _canonical_absolute_path as _canonical_hardened_path,
   _configure_connection as _configure_hardened_connection,
   _database_stat as _hardened_database_stat,
@@ -272,6 +272,14 @@ def _usd_to_micros(
   return micros
 
 
+@overload
+def _micros_to_usd(value: int) -> Decimal: ...
+
+
+@overload
+def _micros_to_usd(value: None) -> None: ...
+
+
 def _micros_to_usd(value: int | None) -> Decimal | None:
   if value is None:
     return None
@@ -305,10 +313,10 @@ class ForkLedger:
     self._prepare()
 
   def _translate_hardening_error(self, exc: BaseException) -> ForkLedgerError:
-    message = str(exc).replace("autonomous admission ledger", "fork ledger")
-    if isinstance(exc, AutonomousAdmissionLedgerIdentityError):
+    message = str(exc).replace("launch nonce store", "fork ledger")
+    if isinstance(exc, LaunchNonceStoreIdentityError):
       return ForkLedgerIdentityError(message)
-    if isinstance(exc, AutonomousAdmissionLedgerError):
+    if isinstance(exc, LaunchNonceStoreError):
       return ForkLedgerUnavailable(message)
     return ForkLedgerUnavailable(message)
 

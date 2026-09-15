@@ -58,13 +58,26 @@ class SingleUserApprovalPolicy:
         allow_persistent_grant=False,
       )
 
-    scope_hint = self._scope_hint(request, payload)
+    if request.approval_reuse_mode == "disabled":
+      return self._request_user(
+        "Tool requires user approval",
+        allow_persistent_grant=False,
+      )
+    scope_hint = (
+      request.approval_reuse_key
+      if request.approval_reuse_mode == "exact"
+      else self._scope_hint(request, payload)
+    )
+    if not scope_hint:
+      raise ValueError("approval reuse scope is unavailable")
     if self._store is not None:
       grant = await self._store.find_persistent_grant(
         user_id=request.user_id,
         tool_name=request.tool_name,
         scope_hint=scope_hint,
         approval_constraint=request.approval_constraint,
+        approval_reuse_mode=request.approval_reuse_mode,
+        approval_reuse_key=request.approval_reuse_key,
       )
       if grant is not None:
         emitter = getattr(self._store, "audit_emitter", None)
@@ -157,6 +170,12 @@ class DelegationApprovalPolicy:
     request: ApprovalRequest,
     run_context: RunContext,
   ) -> ApprovalDecision:
+    if request.approval_reuse_mode != "legacy":
+      return await self._base.decide(
+        payload=payload,
+        request=request,
+        run_context=run_context,
+      )
     if request.approval_constraint != "standard":
       return await self._base.decide(
         payload=payload,
@@ -211,7 +230,3 @@ class DelegationApprovalPolicy:
     if predicate is None:
       return True
     return all(payload.tool_args.get(key) == value for key, value in predicate.items())
-
-
-def make_default_policy(*, store: Any | None = None) -> ApprovalPolicy:
-  return DelegationApprovalPolicy(base=SingleUserApprovalPolicy(store=store))

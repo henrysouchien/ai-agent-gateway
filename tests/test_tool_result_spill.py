@@ -16,7 +16,9 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.mcp_activation import McpActivationFold
+from agent_gateway.mcp_activation import McpActivationFold  # noqa: E402
+from agent_gateway.mcp_client import McpClientManager  # noqa: E402
+from agent_gateway.server import ChatRequest  # noqa: E402
 from agent_gateway import AgentRunner, AgentSessionLog, EventLog, ModelInfo, ModelProvider, SessionStore, ToolDispatcher  # noqa: E402
 from agent_gateway.code_execution import CodeExecutionConfig, DockerBackend, build_code_execution  # noqa: E402
 from agent_gateway.providers import StreamEvent  # noqa: E402
@@ -29,8 +31,15 @@ from agent_gateway.tool_result_compaction import (  # noqa: E402
   truncate_model_tool_result_content,
   write_tool_result_spill,
 )
+from agent_gateway.tool_result_spill import (  # noqa: E402
+  SpillCapabilities,
+  SpillSink,
+  make_tool_result_read_handler,
+  read_spill_result,
+)
 import agent_gateway.tool_result_compaction as tool_result_compaction  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
+import agent_gateway.runner_tool_execution as runner_tool_execution  # noqa: E402
 from tests.capability_execution_test_support import (  # noqa: E402
   stub_capability_execution_resolver,
   stub_runner_capability_execution,
@@ -51,18 +60,9 @@ def _small_tool_result_cap(monkeypatch: pytest.MonkeyPatch) -> None:
   monkeypatch.delenv(gateway_runner.SPILL_TRUNCATED_TOOL_RESULTS_ENV, raising=False)
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
-    return False
-
-  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
-    return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
-
-  def get_tool_definitions(self) -> list[dict[str, Any]]:
-    return []
-
-  def get_server_for_tool(self, _name: str) -> str | None:
-    return None
+class _NullMcpClient(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
 
 
 class _RecordingProvider(ModelProvider):
@@ -72,7 +72,7 @@ class _RecordingProvider(ModelProvider):
     self._turns = list(turns)
     self._stream_index = 0
     self.params_history: list[dict[str, Any]] = []
-    self.last_spill_file: str | None = None
+    self.last_spill_ref: str | None = None
     self.code_read_ok = False
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
@@ -124,9 +124,9 @@ class _RecordingProvider(ModelProvider):
 
   def _observe_messages(self, messages: list[dict[str, Any]]) -> None:
     for payload in _tool_result_payloads(messages):
-      spill_file = payload.get("spill_file")
-      if isinstance(spill_file, str):
-        self.last_spill_file = spill_file
+      spill_ref = payload.get("spill_ref")
+      if isinstance(spill_ref, str):
+        self.last_spill_ref = spill_ref
       if payload.get("stdout") == f"{PAYLOAD_SIZE}\n":
         self.code_read_ok = True
 
@@ -209,6 +209,14 @@ def _dispatcher(
 
 def _runner(spill_provider: Callable[[], str] | None) -> AgentRunner:
   event_log = EventLog()
+  spill_sink = (
+    SpillSink(
+      root_provider=spill_provider,
+      capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+    )
+    if spill_provider is not None
+    else None
+  )
   return AgentRunner(
     event_log=event_log,
     dispatcher=_dispatcher(event_log, {}),
@@ -223,7 +231,7 @@ def _runner(spill_provider: Callable[[], str] | None) -> AgentRunner:
     request_id="req-spill",
     billing_mode="byok",
     rate_table_version="unknown",
-    code_execution_spill_dir_provider=spill_provider,
+    code_execution_spill_dir_provider=spill_sink,
   )
 
 
@@ -243,31 +251,17 @@ class _RecordingLogger:
     self.warnings.append((message, args, kwargs))
 
 
-def test_emit_canvas_artifact_oversize_guard_returns_error_before_dispatch() -> None:
-  # INC-4 retired emit_html_artifact; the pre-dispatch oversize guard now covers
-  # emit_canvas_artifact (tsx_source vs the kit-contract source cap).
-  from agent_gateway.canvas_kit_contract import limits as canvas_kit_limits
+def test_runner_owns_no_canvas_source_cap_vocabulary() -> None:
+  # The pre-dispatch `invalid_input` cap for emit_canvas_artifact was a second
+  # rejection vocabulary competing with the pipeline's own `size_cap` stage. The
+  # pipeline owns it alone now: it reports `validation_failed{stage: "size_cap",
+  # code: "source_size_cap_exceeded"}` on every lane before any node build
+  # (certified in tests/test_canvas_emit_sources_contract.py and by the
+  # oversize-source fixture in tests/test_canvas_artifact_pipeline.py), so the
+  # runner must carry no canvas-specific cap of its own.
+  source = Path(runner_tool_execution.__file__).read_text(encoding="utf-8")
 
-  runner = _runner(None)
-  source_cap = canvas_kit_limits()["source_max_bytes"]
-  tsx_source = "x" * (source_cap + 1)
-
-  result, tool_name, live_events = _run(
-    runner._execute_single_tool(
-      "tool-canvas",
-      "emit_canvas_artifact",
-      {"tsx_source": tsx_source},
-      {},
-    )
-  )
-
-  assert tool_name == "emit_canvas_artifact"
-  assert live_events == []
-  assert result["is_error"] is True
-  payload = json.loads(result["content"])
-  assert payload["error"]["code"] == "invalid_input"
-  assert f"exceeds {source_cap} byte limit" in payload["error"]["message"]
-  assert [entry.event for entry in runner._log.entries] == []
+  assert "emit_canvas_artifact" not in source
 
 
 def test_emit_dashboard_artifact_oversize_guard_returns_error_before_dispatch() -> None:
@@ -367,17 +361,16 @@ def test_truncate_tool_result_embeds_spill_pointer_only_when_provided() -> None:
     content,
     tool_name="lookup",
     max_chars=CAP,
-    spill_filename="lookup_tool-1.json",
-    spill_abspath="/tmp/ce/lookup_tool-1.json",
+    spill_ref="spill:v1:lookup_tool-1.json:" + "a" * 64,
   )
 
   assert was_truncated is True
   assert len(truncated) <= CAP
   payload = json.loads(truncated)
-  assert payload["spill_file"] == "lookup_tool-1.json"
-  assert payload["spill_abspath"] == "/tmp/ce/lookup_tool-1.json"
-  assert "FULL, untruncated result" in payload["spill_hint"]
-  assert "pd.read_json('lookup_tool-1.json')" in payload["spill_hint"]
+  assert payload["spill_ref"] == "spill:v1:lookup_tool-1.json:" + "a" * 64
+  assert "spill_file" not in payload
+  assert "spill_abspath" not in payload
+  assert "spill_hint" not in payload
 
   plain, plain_was_truncated = truncate_model_tool_result_content(
     content,
@@ -387,9 +380,7 @@ def test_truncate_tool_result_embeds_spill_pointer_only_when_provided() -> None:
 
   assert plain_was_truncated is True
   plain_payload = json.loads(plain)
-  assert "spill_file" not in plain_payload
-  assert "spill_abspath" not in plain_payload
-  assert "spill_hint" not in plain_payload
+  assert "spill_ref" not in plain_payload
 
 
 def test_runner_preserves_tool_result_utility_delegates(tmp_path: Path) -> None:
@@ -529,7 +520,10 @@ def test_compact_model_tool_result_entry_helper_spills_live_entry_and_logs(tmp_p
   live_entry, durable_entry = compact_model_tool_result_entry(
     result_entry,
     tool_name="lookup",
-    spill_dir_provider=lambda: str(tmp_path),
+    spill_sink=SpillSink(
+      root_provider=lambda: str(tmp_path),
+      capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+    ),
     log_session_id="sess-direct",
     logger=logger,
     uuid_factory=lambda: SimpleNamespace(hex="e" * 32),
@@ -540,9 +534,12 @@ def test_compact_model_tool_result_entry_helper_spills_live_entry_and_logs(tmp_p
   assert json.loads(spill_files[0].read_text(encoding="utf-8")) == json.loads(content)
   live_payload = json.loads(live_entry["content"])
   durable_payload = json.loads(durable_entry["content"])
-  assert live_payload["spill_file"] == spill_files[0].name
-  assert live_payload["spill_abspath"] == str(spill_files[0])
-  assert "spill_file" not in durable_payload
+  assert live_payload["spill_ref"].startswith(
+    f"spill:v1:{spill_files[0].name}:"
+  )
+  assert "spill_file" not in live_payload
+  assert "spill_abspath" not in live_payload
+  assert "spill_ref" not in durable_payload
   assert logger.warnings == []
   assert logger.infos[0][2]["extra"]["data"]["event"] == "tool_result_compacted"
   assert logger.infos[0][2]["extra"]["data"]["session_id"] == "sess-direct"
@@ -647,11 +644,13 @@ def test_compact_spills_live_entry_and_keeps_durable_pointer_free(tmp_path: Path
   assert json.loads(spill_files[0].read_text(encoding="utf-8")) == json.loads(content)
   live_payload = json.loads(live_entry["content"])
   durable_payload = json.loads(durable_entry["content"])
-  assert live_payload["spill_file"] == spill_files[0].name
-  assert live_payload["spill_abspath"] == str(spill_files[0])
+  assert live_payload["spill_ref"].startswith(
+    f"spill:v1:{spill_files[0].name}:"
+  )
   assert "spill_file" not in durable_payload
   assert "spill_abspath" not in durable_payload
   assert "spill_hint" not in durable_payload
+  assert "spill_ref" not in durable_payload
 
 
 def test_compact_does_not_spill_untruncated_error_missing_provider_or_disabled(
@@ -673,7 +672,10 @@ def test_compact_does_not_spill_untruncated_error_missing_provider_or_disabled(
     error_entry,
     tool_name="lookup",
   )
-  assert "spill_file" not in json.loads(live_entry["content"])
+  error_payload = json.loads(live_entry["content"])
+  assert "spill_file" not in error_payload
+  assert "spill_ref" not in error_payload
+  assert "spill_summary" not in error_payload
   assert live_entry == durable_entry
   assert list(tmp_path.iterdir()) == []
 
@@ -682,7 +684,10 @@ def test_compact_does_not_spill_untruncated_error_missing_provider_or_disabled(
     no_provider_entry,
     tool_name="lookup",
   )
-  assert "spill_file" not in json.loads(live_entry["content"])
+  no_provider_payload = json.loads(live_entry["content"])
+  assert "spill_file" not in no_provider_payload
+  assert "spill_ref" not in no_provider_payload
+  assert "spill_summary" not in no_provider_payload
   assert live_entry == durable_entry
 
   monkeypatch.setenv(gateway_runner.SPILL_TRUNCATED_TOOL_RESULTS_ENV, "no")
@@ -691,7 +696,10 @@ def test_compact_does_not_spill_untruncated_error_missing_provider_or_disabled(
     disabled_entry,
     tool_name="lookup",
   )
-  assert "spill_file" not in json.loads(live_entry["content"])
+  disabled_payload = json.loads(live_entry["content"])
+  assert "spill_file" not in disabled_payload
+  assert "spill_ref" not in disabled_payload
+  assert "spill_summary" not in disabled_payload
   assert live_entry == durable_entry
   assert list(tmp_path.iterdir()) == []
 
@@ -710,8 +718,10 @@ def test_compact_spills_payload_with_falsy_error_field_but_not_truthy(tmp_path: 
   spill_files = list(tmp_path.iterdir())
   assert len(spill_files) == 1
   assert json.loads(spill_files[0].read_text(encoding="utf-8")) == json.loads(null_error)
-  assert json.loads(live_entry["content"])["spill_file"] == spill_files[0].name
-  assert "spill_file" not in json.loads(durable_entry["content"])
+  assert json.loads(live_entry["content"])["spill_ref"].startswith(
+    f"spill:v1:{spill_files[0].name}:"
+  )
+  assert "spill_ref" not in json.loads(durable_entry["content"])
 
   real_error = json.dumps({"error": {"code": "bad", "message": "x" * PAYLOAD_SIZE}}, default=str)
   err_entry = {"type": "tool_result", "tool_use_id": "real-error", "content": real_error}
@@ -719,7 +729,7 @@ def test_compact_spills_payload_with_falsy_error_field_but_not_truthy(tmp_path: 
     err_entry,
     tool_name="lookup",
   )
-  assert "spill_file" not in json.loads(live_entry["content"])
+  assert "spill_ref" not in json.loads(live_entry["content"])
   assert live_entry == durable_entry
   assert len(list(tmp_path.iterdir())) == 1  # no new spill file from the error case
 
@@ -738,7 +748,7 @@ def test_compact_provider_failure_falls_back_without_exception(tmp_path: Path) -
 
   live_payload = json.loads(live_entry["content"])
   assert live_payload["_runner_truncated"] is True
-  assert "spill_file" not in live_payload
+  assert "spill_ref" not in live_payload
   assert live_entry == durable_entry
   assert list(tmp_path.iterdir()) == []
 
@@ -753,8 +763,9 @@ def test_spill_filename_is_sanitized_and_stays_inside_work_dir(tmp_path: Path) -
   )
 
   live_payload = json.loads(live_entry["content"])
-  filename = live_payload["spill_file"]
-  spill_path = Path(live_payload["spill_abspath"])
+  spill_ref = live_payload["spill_ref"]
+  filename = spill_ref.split(":", 3)[2]
+  spill_path = tmp_path / filename
   assert "/" not in filename
   assert ":" not in filename
   assert spill_path.name == filename
@@ -771,7 +782,7 @@ def test_missing_tool_use_id_uses_uuid_fallback(tmp_path: Path, monkeypatch: pyt
     tool_name="lookup",
   )
 
-  filename = json.loads(live_entry["content"])["spill_file"]
+  filename = json.loads(live_entry["content"])["spill_ref"].split(":", 3)[2]
   assert filename == f"lookup_{'f' * 32}.json"
   assert (tmp_path / filename).exists()
 
@@ -787,7 +798,7 @@ def test_existing_spill_file_retries_with_uuid_suffix(tmp_path: Path, monkeypatc
     tool_name="lookup",
   )
 
-  filename = json.loads(live_entry["content"])["spill_file"]
+  filename = json.loads(live_entry["content"])["spill_ref"].split(":", 3)[2]
   assert filename == "lookup_tool-1_12345678.json"
   assert (tmp_path / "lookup_tool-1.json").read_text(encoding="utf-8") == "old"
   assert json.loads((tmp_path / filename).read_text(encoding="utf-8")) == json.loads(content)
@@ -826,7 +837,7 @@ def test_code_execution_ensure_work_dir_is_idempotent_and_concurrency_safe(
   assert Path(results[0]).exists()
 
 
-def test_runner_spills_large_tool_result_and_code_execute_reads_bare_filename(tmp_path: Path) -> None:
+def test_runner_spills_large_tool_result_and_exact_reader_is_retry_safe(tmp_path: Path) -> None:
   async def _run_test() -> None:
     payload = "x" * PAYLOAD_SIZE
 
@@ -839,8 +850,15 @@ def test_runner_spills_large_tool_result_and_code_execute_reads_bare_filename(tm
       session,
       config=CodeExecutionConfig(work_dir_root=str(tmp_path)),
     )
+    spill_sink = SpillSink(
+      root_provider=bundle.ensure_work_dir,
+      capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+    )
     local_handlers = dict(bundle.handlers)
     local_handlers["big_data"] = _big_data
+    local_handlers["tool_result_read"] = make_tool_result_read_handler(
+      lambda: spill_sink
+    )
     event_log = EventLog()
     provider = _RecordingProvider([
       _tool_use_turn("tool-1", "big_data"),
@@ -856,12 +874,16 @@ def test_runner_spills_large_tool_result_and_code_execute_reads_bare_filename(tm
         model="stub-model",
         effort="none",
       ),
-      get_tool_definitions=lambda: [_tool_def("big_data"), *bundle.tool_definitions],
+      get_tool_definitions=lambda: [
+        _tool_def("big_data"),
+        _tool_def("tool_result_read"),
+        *bundle.tool_definitions,
+      ],
       user_id="alice",
       request_id="req-spill",
       billing_mode="byok",
       rate_table_version="unknown",
-      code_execution_spill_dir_provider=bundle.ensure_work_dir,
+      code_execution_spill_dir_provider=spill_sink,
     )
 
     await runner.run(messages=[{"role": "user", "content": "load"}], system_prompt="x", max_turns=2)
@@ -874,14 +896,23 @@ def test_runner_spills_large_tool_result_and_code_execute_reads_bare_filename(tm
 
     live_blocks = _model_bound_tool_result_blocks(provider)
     live_payload = json.loads(live_blocks[0]["content"])
-    assert live_payload["spill_file"] == spill_files[0].name
-    assert live_payload["spill_abspath"] == str(spill_files[0])
+    spill_ref = live_payload["spill_ref"]
+    assert spill_ref.startswith(f"spill:v1:{spill_files[0].name}:")
+    assert "spill_file" not in live_payload
+    assert "spill_abspath" not in live_payload
 
     complete_event = next(entry.event for entry in event_log.entries if entry.event.get("type") == "tool_call_complete")
     durable_payload = json.loads(complete_event["final_tool_result_blocks"][0]["content"])
     assert "spill_file" not in durable_payload
     assert "spill_abspath" not in durable_payload
     assert "spill_hint" not in durable_payload
+    assert "spill_ref" not in durable_payload
+    assert "spill_summary" not in durable_payload
+
+    first_read = read_spill_result(spill_sink, spill_ref=spill_ref)
+    second_read = read_spill_result(spill_sink, spill_ref=spill_ref)
+    assert first_read == second_read
+    assert json.loads(first_read["content"]) == json.loads(expected_content)
 
     code = (
       "import json\n"
@@ -949,8 +980,15 @@ def test_run_agent_sub_runner_spills_into_parent_work_dir(tmp_path: Path) -> Non
       session,
       config=CodeExecutionConfig(register_docker=False, work_dir_root=str(tmp_path)),
     )
+    spill_sink = SpillSink(
+      root_provider=bundle.ensure_work_dir,
+      capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+    )
     local_handlers = dict(bundle.handlers)
     local_handlers["file_read"] = _big_data
+    local_handlers["tool_result_read"] = make_tool_result_read_handler(
+      lambda: spill_sink
+    )
     runner_ref: list[Any] = [None]
     local_handlers["run_agent"] = make_run_agent_handler(
       runner_ref,
@@ -975,6 +1013,7 @@ def test_run_agent_sub_runner_spills_into_parent_work_dir(tmp_path: Path) -> Non
       get_tool_definitions=lambda: [
         _tool_def("run_agent"),
         _tool_def("file_read"),
+        _tool_def("tool_result_read"),
         *bundle.tool_definitions,
       ],
       user_id="alice",
@@ -985,17 +1024,18 @@ def test_run_agent_sub_runner_spills_into_parent_work_dir(tmp_path: Path) -> Non
         path=tmp_path / "spill-agent-session.jsonl"
       ),
       workspace_dir=str(tmp_path),
-      code_execution_spill_dir_provider=bundle.ensure_work_dir,
+      code_execution_spill_dir_provider=spill_sink,
     )
     runner_ref[0] = runner
 
     await runner.run(messages=[{"role": "user", "content": "delegate"}], system_prompt="x", max_turns=2)
 
-    work_dir = Path(session.code_execution_work_dir or "")
-    assert provider.last_spill_file is not None
-    spill_path = work_dir / provider.last_spill_file
-    assert spill_path.exists()
-    assert json.loads(spill_path.read_text(encoding="utf-8")) == {
+    assert provider.last_spill_ref is not None
+    recovered = read_spill_result(
+      spill_sink,
+      spill_ref=provider.last_spill_ref,
+    )
+    assert json.loads(recovered["content"]) == {
       "status": "success",
       "payload": payload,
     }
@@ -1057,12 +1097,13 @@ def test_interactive_model_provider_runner_threads_spill_provider(
     model="stub-model",
     effort="none",
   )
-  request = SimpleNamespace(
+  request = ChatRequest(
+    messages=[],
     user_id="alice",
     request_id="req-runtime",
     context={},
-    capability_execution=capability_execution,
   )
+  request._bind_session_driver(capability_execution=capability_execution)
 
   runner = runtime._build_model_provider_runner(
     EventLog(),

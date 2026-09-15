@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import copy
 import inspect
 import json
-import time
-from typing import Any, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from . import sdk_runner_helpers as _sdk_runner_helpers
 from .model_bound_wire import serialize_model_bound_result
@@ -94,12 +94,17 @@ async def call_on_late_usage_event(runner: Any, usage_event: Any, *, logger: Any
 
 
 async def call_on_session_summary(runner: Any, summary: Any, *, logger: Any) -> None:
-  producer = getattr(runner, "_commercial_usage_producer", None)
+  producer = runner._commercial_usage_producer
   if producer is not None:
     reconcile = getattr(producer, "reconcile", None)
     if callable(reconcile):
       try:
-        await reconcile(summary)
+        result = reconcile(summary)
+        if not inspect.isawaitable(result):
+          raise TypeError(
+            f"object {type(result).__name__} can't be used in 'await' expression"
+          )
+        await result
       except Exception as exc:
         logger.warning(
           "[%s] commercial usage reconciliation failed | exception_type=%s",
@@ -217,6 +222,8 @@ def make_result_entry(
   tool_call_id: str,
   result: Any | None,
   error: dict[str, Any] | None,
+  *,
+  is_error: bool | None = None,
 ) -> dict[str, Any]:
   if error is not None:
     return {
@@ -225,12 +232,14 @@ def make_result_entry(
       "content": serialize_model_bound_result({"error": error}),
       "is_error": True,
     }
-  entry = {
+  entry: dict[str, Any] = {
     "type": "tool_result",
     "tool_use_id": tool_call_id,
     "content": serialize_model_bound_result(result),
   }
-  if classify_semantic_tool_error(result) is not None:
+  if is_error is None:
+    is_error = classify_semantic_tool_error(result) is not None
+  if is_error:
     entry["is_error"] = True
   return entry
 
@@ -277,18 +286,27 @@ async def build_hook_additional_context(
   tool_call_id: str,
   tool_name: str,
   tool_input: dict[str, Any],
+  redacted_tool_input: dict[str, Any],
   result: Any | None,
   error: dict[str, Any] | None,
+  completion_event: Mapping[str, Any],
   logger: Any,
 ) -> str | None:
-  pending = runner._pending_tool_calls.get(tool_call_id)
-  duration_ms = int((time.time() - pending.started_at) * 1000) if pending is not None else 0
-  result_entry = runner._make_result_entry(tool_call_id, result, error)
-  provider_id_for_tool = getattr(runner, "_provider_id_for_tool", None)
+  duration_ms = int(completion_event["duration_ms"])
+  result_entry = runner._make_result_entry(
+    tool_call_id,
+    result,
+    error,
+    is_error=bool(completion_event["is_error"]),
+  )
+  provider_id_for_tool: Callable[[str], str | None] | None = (
+    runner._provider_id_for_tool
+  )
   extra_blocks = await runner._call_on_tool_result(
     ToolResultContext(
       tool_name=tool_name,
       tool_input=dict(tool_input),
+      redacted_tool_input=copy.deepcopy(redacted_tool_input),
       result=result,
       error=error,
       duration_ms=duration_ms,
@@ -300,6 +318,7 @@ async def build_hook_additional_context(
       skill_run_id=runner._skill_run_id,
       workspace_dir=runner._workspace_dir,
       batch_id=getattr(runner, "_batch_id", None),
+      dispatch=completion_event["dispatch"],
       boundary_sanitizer=lambda value, sink: sanitize_boundary_value(
         value,
         sink=sink,

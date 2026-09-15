@@ -12,12 +12,17 @@ This `agent.yaml` project turns a small local source pack into a short research 
 ```bash
 pip install "ai-agent-gateway[anthropic]"
 export ANTHROPIC_API_KEY="your-anthropic-api-key"
+export USER_DATA_DIR="$PWD/.agent-data"
+mkdir -p "$USER_DATA_DIR/gateway"
+chmod 700 "$USER_DATA_DIR" "$USER_DATA_DIR/gateway"
 ```
 
 ## Run
 
+From the package root:
+
 ```bash
-cd packages/agent-gateway/examples/11-research-report
+cd examples/11-research-report
 agent run
 ```
 
@@ -26,7 +31,7 @@ agent run
 ```bash
 SESSION_TOKEN=$(curl -s http://127.0.0.1:8011/api/chat/init \
   -H 'Content-Type: application/json' \
-  -d '{"api_key":"local-demo-key"}' \
+  -d '{"api_key":"local-demo-key","user_id":"demo-user"}' \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_token"])')
 ```
 
@@ -35,6 +40,7 @@ curl -N http://127.0.0.1:8011/api/chat \
   -H "Authorization: Bearer $SESSION_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
+    "user_id": "demo-user",
     "messages": [
       {
         "role": "user",

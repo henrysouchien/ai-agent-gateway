@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -132,6 +133,38 @@ def test_non_us_numeric_tickers_resolve_for_read_and_list(
 
   by_skill = ticker_artifact_paths_for_request("alice", ticker="TAEE11")
   assert "sniff-test" in by_skill
+
+
+def test_foreign_named_entries_are_ignored_loudly_not_silently(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  """Only the artifact writer names entries under artifacts/{ticker}; a
+
+  foreign-named directory or json file is skipped with a warning, never
+  silently, and never refuses the rest of the enumeration."""
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "data"))
+  artifact = artifact_json_path_for_request(
+    "alice",
+    ticker="PCTY",
+    skill="sniff-test",
+    artifact_id="2026-07-09T233509.044-run-a",
+  )
+  artifact.path.parent.mkdir(parents=True, exist_ok=True)
+  artifact.path.write_text("{}", encoding="utf-8")
+  (artifact.path.parent / "bad name!.json").write_text("{}", encoding="utf-8")
+  (artifact.path.parent.parent / "Not_A_Skill").mkdir()
+
+  with caplog.at_level(logging.WARNING, logger="agent_gateway.artifact_paths"):
+    listed = artifact_json_paths_for_request("alice", ticker="PCTY", skill="sniff-test")
+    by_skill = ticker_artifact_paths_for_request("alice", ticker="PCTY")
+
+  assert [entry.path for entry in listed] == [artifact.path]
+  assert list(by_skill) == ["sniff-test"]
+  messages = [record.getMessage() for record in caplog.records]
+  assert any("bad name!.json" in message for message in messages)
+  assert any("Not_A_Skill" in message for message in messages)
 
 
 @pytest.mark.parametrize("ticker,resolved", [("0700", "0700"), ("PETR4", "PETR4"), ("TAEE11.SA", "TAEE11.SA")])

@@ -17,6 +17,9 @@ This example shows the "graduate from `create_agent()`" setup:
 ```bash
 pip install "ai-agent-gateway[anthropic]" uvicorn
 export ANTHROPIC_API_KEY="your-anthropic-api-key"
+export USER_DATA_DIR="$PWD/.agent-data"
+mkdir -p "$USER_DATA_DIR/gateway"
+chmod 700 "$USER_DATA_DIR" "$USER_DATA_DIR/gateway"
 ```
 
 ## Run
@@ -50,6 +53,7 @@ chat_request = urllib.request.Request(
   "http://127.0.0.1:8000/api/chat",
   data=json.dumps(
     {
+      "user_id": "demo-user",
       "messages": [
         {
           "role": "user",
@@ -71,8 +75,9 @@ with urllib.request.urlopen(chat_request) as response:
     if not line.startswith("data: "):
       continue
 
-    event = json.loads(line[6:])
-    print(event)
+    envelope = json.loads(line[6:])
+    print(envelope)
+    event = envelope.get("event", {})
 
     if event.get("type") == "tool_approval_request":
       approval_request = urllib.request.Request(

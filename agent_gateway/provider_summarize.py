@@ -156,7 +156,7 @@ async def provider_summarize(
     usage = _empty_usage()
     bind = capability_execution.bind
     usage.update({
-      "capability_bind": bind.receipt(),
+      "capability_bind": bind.to_json(),
     })
     saw_tool_use = False
     async for event in provider.stream(client, params):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import replace
 from typing import Any, AsyncIterator
 from weakref import WeakKeyDictionary
@@ -13,9 +14,12 @@ from .base import (
   StreamEvent,
   ThinkingLevel,
   _is_context_length_exception,
+  registry_effort_values,
+  registry_entry_for_model,
   truncate_to_last_compaction,
 )
 from ..model_registry import AdapterRouteSupport
+from ..rates import RateTable, UnknownModelError, load_provider_rate_table
 from ..thinking import EffortResolution, clamp_effort
 from .codex_helpers import (
   DEFAULT_INSTRUCTIONS as DEFAULT_INSTRUCTIONS,
@@ -41,6 +45,8 @@ from .codex_helpers import (
   _parse_error_response as _parse_error_response,
 )
 
+log = logging.getLogger(__name__)
+
 
 class CodexProvider(ModelProvider):
   """`ModelProvider` implementation for the ChatGPT Codex responses backend."""
@@ -58,7 +64,8 @@ class CodexProvider(ModelProvider):
       routes=frozenset({"codex.chatgpt"}),
     )
 
-  def __init__(self) -> None:
+  def __init__(self, *, rate_table: RateTable | None = None) -> None:
+    self._rate_table = load_provider_rate_table(self.name, rate_table)
     self._client_state: WeakKeyDictionary[httpx.AsyncClient, dict[str, Any]] = WeakKeyDictionary()
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
@@ -100,23 +107,44 @@ class CodexProvider(ModelProvider):
       raise ValueError("Model is required")
     for tags, info in sorted(_MODEL_INFO_BY_TAG, key=lambda row: max(map(len, row[0])), reverse=True):
       if any(_model_matches_tag(model_id, tag) for tag in tags):
-        return replace(info, id=model_id)
-    if "gpt-5" in model_id:
-      return ModelInfo(
+        model_info = replace(info, id=model_id)
+        break
+    else:
+      entry = registry_entry_for_model(self.name, model_id)
+      if entry is None:
+        raise ValueError(
+          f"the product model registry does not admit codex model {model_id!r}"
+        )
+      efforts = registry_effort_values(entry)
+      reasoning = tuple(value for value in efforts if value != "none")
+      model_info = ModelInfo(
         id=model_id,
         provider=self.name,
-        context_window=272_000,
-        max_output_tokens=128_000,
-        supports_thinking=True,
-        supports_vision=True,
+        supports_thinking=bool(reasoning),
+        supports_vision="vision" in entry.features,
+        supports_tool_use="tools" in entry.features,
         compat={
-          "supportsReasoningEffort": True,
-          "reasoningEffortValues": ("low", "medium", "high"),
-          "reasoningEffortDefault": "medium",
+          "supportsReasoningEffort": bool(reasoning),
+          "reasoningEffortValues": efforts if reasoning else (),
+          "reasoningEffortDefault": entry.default_effort,
           "omitEqualsNone": False,
         },
       )
-    return ModelInfo(id=model_id, provider=self.name)
+    try:
+      rates = self._rate_table.lookup(self.name, model_id)
+    except UnknownModelError:
+      log.warning("Codex model %r has no rate row; using zero-cost estimates", model_id)
+      return model_info
+    return replace(
+      model_info,
+      context_window=rates.context_window or model_info.context_window,
+      max_output_tokens=rates.max_tokens or model_info.max_output_tokens,
+      input_cost_per_mtok=rates.input_cost_per_mtok,
+      output_cost_per_mtok=rates.output_cost_per_mtok,
+      cache_read_cost_per_mtok=rates.cache_read_cost_per_mtok,
+      cache_write_cost_per_mtok=rates.cache_write_cost_per_mtok,
+      rate_tiers=rates.tiers,
+    )
 
   def build_request_params(
     self,

@@ -1,7 +1,11 @@
 from types import MappingProxyType
 from typing import Mapping
 
-from ..model_registry import AdapterRouteSupport
+from ..model_registry import (
+  AdapterRouteSupport,
+  GATEWAY_EXECUTED_CAPABILITY_IDS,
+  INITIAL_MODEL_REGISTRY,
+)
 from .agent_sdk import AgentSDKConfig
 from .anthropic import AnthropicProvider
 from .base import CostEstimate, ModelInfo, ModelProvider, StreamEvent, ThinkingLevel, truncate_to_last_compaction
@@ -50,6 +54,14 @@ def installed_adapter_route_support() -> Mapping[str, AdapterRouteSupport]:
     assert declaration is not None  # installed_adapter_providers guarantees it
     supports[adapter_id] = declaration
   return MappingProxyType(supports)
+
+
+# Admit application adapter support when providers load, not when a standalone
+# controller imports a dependency-free package helper.
+INITIAL_MODEL_REGISTRY.admit_adapter_support(
+  installed_adapter_route_support(),
+  executed_capability_ids=GATEWAY_EXECUTED_CAPABILITY_IDS,
+)
 
 
 __all__ = [

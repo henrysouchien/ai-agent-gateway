@@ -26,6 +26,7 @@ from agent_gateway.server_artifact_helpers import (
   _verify_agent_claim_headers,
 )
 from tests.autonomous_exact_test_support import (
+  ExactAutonomousTestRuntime,
   build_exact_autonomous_test_runtime,
 )
 
@@ -175,7 +176,7 @@ def test_broker_rejects_unbounded_request_configuration() -> None:
 def _broker_with_controlled_clock(
   monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[
-  object,
+  ExactAutonomousTestRuntime,
   dict[str, float],
   AutonomousClaimBroker,
   AutonomousClaimSigner,

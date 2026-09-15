@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from fastapi import APIRouter, Request
 
 from agent_gateway.auth import CredentialsResolver
+from agent_gateway.control_skill_catalog import ControlSkillCatalog
 from agent_gateway.session import AuthManager
 
 from .approvals import build_approvals_router
@@ -29,7 +29,9 @@ def create_control_plane_router(
   tenant_id: str | None,
   allow_service_credentials_for_interactive: bool,
   route_prefix: str,
-  skills_dir: Path,
+  control_skill_catalog: ControlSkillCatalog,
+  control_profile_names_provider: Callable[[], Iterable[str]] | None = None,
+  control_profile_loader: Callable[[str], Any] | None = None,
   artifact_auth_dependency: Callable[[Request], str],
   autonomous_registry: Any | None = None,
   agent_schedule_store_for: Any | None = None,
@@ -51,8 +53,14 @@ def create_control_plane_router(
     approval_policy=approval_policy,
   )
   router.include_router(session_router)
-  router.include_router(build_profiles_router(auth=auth))
-  router.include_router(build_skills_router(auth=auth, skills_dir=skills_dir))
+  router.include_router(build_profiles_router(
+    auth=auth,
+    profile_names_provider=control_profile_names_provider,
+    profile_loader=control_profile_loader,
+  ))
+  router.include_router(
+    build_skills_router(auth=auth, catalog=control_skill_catalog)
+  )
   router.include_router(build_schedules_router(
     auth=auth,
     agent_schedule_store_for=agent_schedule_store_for,
@@ -63,6 +71,7 @@ def create_control_plane_router(
     auth=auth,
     autonomous_registry=autonomous_registry,
     dispatch_scope_validator=dispatch_scope_validator,
+    control_profile_loader=control_profile_loader,
   ))
   router.include_router(build_batches_router(auth=auth))
   router.include_router(build_approvals_router(auth=auth, autonomous_registry=autonomous_registry))

@@ -166,12 +166,12 @@ def test_same_layout_class_swap_cannot_reach_sealed_signing_operation() -> None:
     "AGENT_API_CLAIM_USER_ID": "attacker",
   }
   with pytest.raises(TypeError, match="type changed"):
-    sign_gateway_user_claim(  # type: ignore[arg-type]
+    sign_gateway_user_claim(
       signer,
       ttl_seconds=30,
     )
   with pytest.raises(TypeError, match="type changed"):
-    gateway_user_claim_signer_identity(  # type: ignore[arg-type]
+    gateway_user_claim_signer_identity(
       signer,
     )
 

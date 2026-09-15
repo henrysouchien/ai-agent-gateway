@@ -41,6 +41,19 @@ def status_payload(
     payload["error"] = record.error
   if record.terminal_reason is not None:
     payload["terminal_reason"] = record.terminal_reason
+  record_paths = {
+    "task_manifest": str(record.log_path.with_name(f"{record.task_id}.task.json")),
+    "log": str(record.log_path),
+    "events": str(record.events_path) if record.events_path else None,
+    "tool_result_spill": (
+      str(record.tool_result_spill_dir) if record.tool_result_spill_dir else None
+    ),
+  }
+  populated_record_paths = {
+    name: path for name, path in record_paths.items() if path is not None
+  }
+  if populated_record_paths:
+    payload["record_paths"] = populated_record_paths
   lines, _total = tail_lines_func(record.log_path, status_tail_lines)
   if lines:
     payload["log_tail"] = "\n".join(lines)

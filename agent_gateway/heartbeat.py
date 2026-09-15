@@ -1,3 +1,12 @@
+"""Periodic scheduling around a caller-supplied autonomous execution.
+
+``HeartbeatLoop`` owns active-hour checks, quiet-response suppression, backoff,
+and optional scheduler state. Its ``run_fn`` is the execution ingress; tick
+results and callbacks are the egress. Capability selection and agent execution
+remain with the launcher and ``run_autonomous`` respectively, so retries never
+rebind authority. See ``packages/agent-gateway/README.md``.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -83,14 +92,11 @@ def is_checklist_empty(path: str | Path | None) -> bool:
   if path is None:
     return False
 
-  checklist_path = Path(path)
-  if not checklist_path.exists():
-    return True
-
   try:
-    content = checklist_path.read_text(encoding="utf-8")
-  except Exception as exc:
-    log.warning("Failed to read heartbeat checklist %s: %s", checklist_path, exc)
+    content = Path(path).read_text(encoding="utf-8")
+  except FileNotFoundError:
+    # An absent checklist derives to "empty". Any other read failure must not
+    # fabricate emptiness; it propagates to the tick's error handling.
     return True
 
   for line in content.splitlines():
@@ -136,6 +142,11 @@ class HeartbeatLoop:
   `run_fn` should usually be a `functools.partial(run_autonomous, ..., delivery=None)`.
   If callbacks need the agent state written by `run_autonomous(state_dir=...)`, load it
   inside the callback or capture that state path in a closure.
+
+  ``start`` blocks until stopped or ``max_ticks`` is reached and reports each
+  attempt through ``TickResult`` callbacks. Concurrent starts fail; execution
+  errors become error ticks and drive the configured backoff rather than
+  changing the prebound execution.
   """
 
   def __init__(
@@ -249,21 +260,20 @@ class HeartbeatLoop:
         outcome="skipped",
       )
 
-    if self.config.checklist_path is not None and is_checklist_empty(self.config.checklist_path):
-      return await self._finalize_tick(
-        output=None,
-        skipped=True,
-        skip_reason="empty_checklist",
-        alert=False,
-        error=None,
-        stripped_response="",
-        tick_number=tick_number,
-        started_at=started_at,
-        started_monotonic=started_monotonic,
-        outcome="skipped",
-      )
-
     try:
+      if self.config.checklist_path is not None and is_checklist_empty(self.config.checklist_path):
+        return await self._finalize_tick(
+          output=None,
+          skipped=True,
+          skip_reason="empty_checklist",
+          alert=False,
+          error=None,
+          stripped_response="",
+          tick_number=tick_number,
+          started_at=started_at,
+          started_monotonic=started_monotonic,
+          outcome="skipped",
+        )
       output = await self._run_fn()
     except Exception as exc:
       self._state["consecutive_errors"] = int(self._state.get("consecutive_errors", 0)) + 1

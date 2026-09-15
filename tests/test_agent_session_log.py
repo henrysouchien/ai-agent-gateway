@@ -385,22 +385,60 @@ def test_active_offset_cache_invalidates_after_external_rotation(
   assert [entry.seq for entry in second_entries] == [2]
 
 
-def test_truncated_trailing_line_is_skipped_with_warning(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+def test_torn_trailing_garbage_is_truncated_on_open(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
   path = tmp_path / "truncated.jsonl"
   valid_row = {
     "seq": 1,
     "timestamp": 123.0,
     "event": {"type": "attach", "runner_id": "run-1", "event_schema_version": 1},
   }
-  path.write_text(json.dumps(valid_row) + "\n" + '{"seq": 2, "timestamp": 124.0, "event": {"type": "', encoding="utf-8")
-  log = AgentSessionLog(path)
+  valid_line = json.dumps(valid_row) + "\n"
+  path.write_text(valid_line + '{"seq": 2, "timestamp": 124.0, "event": {"type": "', encoding="utf-8")
 
   with caplog.at_level(logging.WARNING, logger="agent_gateway.agent_session_log"):
-    entries, _ = _run(log.query(order="asc"))
+    log = AgentSessionLog(path)
 
+  assert "torn unacknowledged tail bytes" in caplog.text
+  assert path.read_text(encoding="utf-8") == valid_line
+  entries, _ = _run(log.query(order="asc"))
   assert [entry.seq for entry in entries] == [1]
+  strict_entries, _ = _run(log.query_current_strict(order="asc"))
+  assert [entry.seq for entry in strict_entries] == [1]
   assert _run(log.latest_seq()) == 1
-  assert "Skipping truncated trailing JSONL line" in caplog.text
+
+
+def test_unterminated_complete_trailing_line_is_adopted_on_open(tmp_path: Path) -> None:
+  path = tmp_path / "unterminated.jsonl"
+  rows = [
+    {"seq": 1, "timestamp": 123.0, "event": {"type": "attach", "event_schema_version": 1}},
+    {"seq": 2, "timestamp": 124.0, "event": {"type": "assistant_message", "event_schema_version": 1}},
+  ]
+  path.write_text(json.dumps(rows[0]) + "\n" + json.dumps(rows[1]), encoding="utf-8")
+
+  log = AgentSessionLog(path)
+
+  assert path.read_bytes().endswith(b"}\n")
+  strict_entries, _ = _run(log.query_current_strict(order="asc"))
+  assert [entry.seq for entry in strict_entries] == [1, 2]
+  appended = log.append_sync({"type": "assistant_message", "text": "third"})
+  assert appended.seq == 3
+  assert [row["seq"] for row in _load_jsonl(path)] == [1, 2, 3]
+
+
+def test_append_after_torn_tail_recovers_without_fossilizing(tmp_path: Path) -> None:
+  path = tmp_path / "torn-append.jsonl"
+  log = AgentSessionLog(path)
+  log.append_sync({"type": "attach", "runner_id": "run-1"})
+  with path.open("ab") as handle:
+    handle.write(b'{"seq":2,"timestamp":')
+
+  appended = log.append_sync({"type": "assistant_message", "text": "second"})
+
+  assert appended.seq == 2
+  strict_entries, _ = _run(log.query_current_strict(order="asc"))
+  assert [entry.seq for entry in strict_entries] == [1, 2]
+  rows = _load_jsonl(path)
+  assert [row["seq"] for row in rows] == [1, 2]
 
 
 def test_concurrent_appends_remain_well_formed_jsonl(tmp_path: Path) -> None:

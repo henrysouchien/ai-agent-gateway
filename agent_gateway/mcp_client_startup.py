@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping
+from typing import AbstractSet, Any, Callable, Mapping
 
 
 def apply_server_env_passthrough(
   mcp_servers: dict[str, Any],
-  passthrough: Mapping[str, set[str]],
+  passthrough: Mapping[str, AbstractSet[str]],
   *,
   environ: Mapping[str, str],
 ) -> dict[str, Any]:
@@ -79,26 +79,7 @@ async def startup_manager(
     if allowed_servers is not None
     else None
   )
-
-  if mcp_import_error is not None:
-    logger.warning("MCP runtime unavailable; skipping startup: %s", mcp_import_error)
-    for server_name in sorted(requested_servers or set()):
-      manager._set_startup_diagnostic(
-        server_name,
-        category="runtime_unavailable",
-        message=f"MCP runtime unavailable: {mcp_import_error}",
-        retryable=False,
-        error_type=type(mcp_import_error).__name__,
-      )
-    manager._started = True
-    return
-
-  config = manager._read_claude_config()
-  mcp_servers = config.get("mcpServers", {})
-  if not isinstance(mcp_servers, dict):
-    mcp_servers = {}
-  mcp_servers = dict(mcp_servers)
-  mcp_servers.update(manager._inline_servers)
+  mcp_servers = manager._configured_server_configs()
 
   effective_allowed_servers = manager._allowed_servers
   if requested_servers is not None:
@@ -120,6 +101,23 @@ async def startup_manager(
     if effective_allowed_servers is not None
     else None
   )
+  configured_transports = set(mcp_servers)
+  if transport_allowed_servers is not None:
+    configured_transports &= transport_allowed_servers
+  manager._configured_transport_server_names = configured_transports
+
+  if mcp_import_error is not None:
+    logger.warning("MCP runtime unavailable; skipping startup: %s", mcp_import_error)
+    for server_name in sorted(requested_servers or set()):
+      manager._set_startup_diagnostic(
+        server_name,
+        category="runtime_unavailable",
+        message=f"MCP runtime unavailable: {mcp_import_error}",
+        retryable=False,
+        error_type=type(mcp_import_error).__name__,
+      )
+    manager._started = True
+    return
 
   if not mcp_servers:
     missing_config_targets = transport_allowed_servers if requested_servers is not None else set()
@@ -133,13 +131,11 @@ async def startup_manager(
     manager._started = True
     return
 
-  mcp_servers = manager._canonicalize_server_configs(mcp_servers)
   mcp_servers = apply_server_env_passthrough(
     mcp_servers,
     manager._server_env_passthrough,
     environ=manager._connection_runtime().environ,
   )
-
   if requested_servers is not None and transport_allowed_servers is not None:
     for server_name in sorted(transport_allowed_servers - set(mcp_servers)):
       manager._set_startup_diagnostic(
@@ -188,12 +184,14 @@ async def startup_manager(
 
     connect_jobs.append((server_name, prepared_config))
 
-  if connect_jobs:
-    for state in await manager._connect_startup_servers(connect_jobs):
-      if state is not None:
-        manager._servers[state.name] = state
-
-  manager._apply_collision_filtering()
+  states = await manager._connect_startup_servers(connect_jobs)
+  connected_states = [state for state in states if state is not None]
+  try:
+    await manager._publish_server_states(connected_states)
+  except BaseException:
+    for state in reversed(connected_states):
+      await manager._close_contexts(state.exit_contexts)
+    raise
   manager._started = True
 
 

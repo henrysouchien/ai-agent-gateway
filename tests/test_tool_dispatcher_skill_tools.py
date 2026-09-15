@@ -13,20 +13,14 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import ToolDispatcher
+from agent_gateway import McpClientManager, ToolDispatcher
 from agent_gateway import tool_dispatcher
 from agent_gateway import tool_dispatcher_skill_tools as skill_tools
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _tool_name: str) -> bool:
-    return False
-
-  def get_server_for_tool(self, _tool_name: str) -> str | None:
-    return None
-
-  async def call_tool(self, _tool_name: str, _tool_input: dict[str, Any]):
-    raise AssertionError("MCP should not execute")
+class _NullMcpClient(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
 
 
 async def _handler(_tool_input: dict[str, Any], **_kwargs: Any):

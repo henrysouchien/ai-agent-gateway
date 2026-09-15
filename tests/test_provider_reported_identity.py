@@ -171,7 +171,7 @@ def _bind_receipt() -> dict[str, str]:
     registry_revision="test-v1",
     policy_revision="test-v1",
     selection_source="explicit_user",
-  ).receipt()
+  ).to_json()
 
 
 def _usage_event() -> UsageEvent:
@@ -361,7 +361,7 @@ def test_send_prompt_validates_and_emits_reported_identity_without_rebinding() -
 
   assert result == "ok"
   assert len(events) == 1
-  assert events[0].capability_bind == execution.bind.receipt()
+  assert events[0].capability_bind == execution.bind.to_json()
   assert events[0].provider_reported_model == "claude-opus-5-20260801"
   assert events[0].model == execution.bind.upstream_model
   assert execution.bind.upstream_model == "claude-opus-5"
@@ -397,7 +397,7 @@ def test_provider_summarize_validates_and_carries_reported_identity() -> None:
   )
 
   assert result.text == "ok"
-  assert result.usage["capability_bind"] == execution.bind.receipt()
+  assert result.usage["capability_bind"] == execution.bind.to_json()
   assert result.usage["provider_reported_model"] == "claude-opus-5-20260801"
 
 

@@ -27,6 +27,19 @@ from agent_gateway.session import GatewaySession, SessionStream  # noqa: E402
 from agent_gateway.task_registry import TaskRegistry, TaskState  # noqa: E402
 
 
+class _LifecycleOwner(RunnerBackgroundLifecycleMixin):
+  def __init__(
+    self,
+    task_registry: TaskRegistry,
+    *,
+    cancel_drain_timeout_seconds: float,
+  ) -> None:
+    self._task_registry = task_registry
+    self._background_cancel_drain_timeout_seconds = (
+      cancel_drain_timeout_seconds
+    )
+
+
 def _session(
   *,
   session_id: str,
@@ -105,11 +118,12 @@ async def test_quiesce_matches_storage_owner_and_file_only() -> None:
     assert other_file.active_turn is not None
     assert other_owner.active_turn is not None
   finally:
-    remaining = [
-      session.active_turn.runner_task
-      for session in (other_file, other_owner)
-      if session.active_turn is not None
-    ]
+    remaining: list[asyncio.Task[Any]] = []
+    for session in (other_file, other_owner):
+      active_turn = session.active_turn
+      if active_turn is not None:
+        assert active_turn.runner_task is not None
+        remaining.append(active_turn.runner_task)
     for task in remaining:
       task.cancel()
     await asyncio.gather(*remaining, return_exceptions=True)
@@ -165,23 +179,19 @@ async def test_strict_background_drain_rejects_stubborn_child_then_converges(
   registry.transition(entry.task_id, TaskState.RUNNING)
   child = asyncio.create_task(stubborn_child())
   entry.asyncio_task = child
-  owner = SimpleNamespace(
-    _task_registry=registry,
-    _background_cancel_drain_timeout_seconds=0.01,
-  )
-  strict_drain = (
-    RunnerBackgroundLifecycleMixin
-    .cancel_and_require_background_tasks_drained
+  owner = _LifecycleOwner(
+    registry,
+    cancel_drain_timeout_seconds=0.01,
   )
   try:
     await asyncio.sleep(0)
     with pytest.raises(StrictBackgroundTaskDrainUnavailable):
-      await strict_drain(owner)
+      await owner.cancel_and_require_background_tasks_drained()
     assert child.done() is False
 
     release.set()
     await asyncio.wait_for(child, timeout=1)
-    await strict_drain(owner)
+    await owner.cancel_and_require_background_tasks_drained()
   finally:
     release.set()
     if not child.done():
@@ -202,16 +212,14 @@ async def test_parent_activity_lease_is_held_until_last_child_finishes() -> None
   registry.transition(entry.task_id, TaskState.RUNNING)
   child = asyncio.create_task(child_writer())
   entry.asyncio_task = child
-  owner = SimpleNamespace(_task_registry=registry)
+  owner = _LifecycleOwner(
+    registry,
+    cancel_drain_timeout_seconds=5.0,
+  )
   lease = SimpleNamespace(release=lambda: released_leases.append("released"))
 
-  RunnerBackgroundLifecycleMixin.bind_research_file_activity_lease(
-    owner,
-    lease,
-  )
-  RunnerBackgroundLifecycleMixin._release_research_file_activity_after_children(
-    owner
-  )
+  owner.bind_research_file_activity_lease(lease)
+  owner._release_research_file_activity_after_children()
   assert released_leases == []
 
   release_child.set()
@@ -234,16 +242,14 @@ async def test_selected_content_activity_is_held_until_last_child_finishes(
   registry.transition(entry.task_id, TaskState.RUNNING)
   child = asyncio.create_task(child_writer())
   entry.asyncio_task = child
-  owner = SimpleNamespace(_task_registry=registry)
+  owner = _LifecycleOwner(
+    registry,
+    cancel_drain_timeout_seconds=5.0,
+  )
   lease = SimpleNamespace(release=lambda: released_leases.append("released"))
 
-  RunnerBackgroundLifecycleMixin.bind_selected_content_activity_lease(
-    owner,
-    lease,
-  )
-  RunnerBackgroundLifecycleMixin._release_selected_content_activity_after_children(
-    owner
-  )
+  owner.bind_selected_content_activity_lease(lease)
+  owner._release_selected_content_activity_after_children()
   assert released_leases == []
 
   release_child.set()

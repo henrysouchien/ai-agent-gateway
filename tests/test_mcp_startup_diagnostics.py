@@ -1,8 +1,10 @@
 import asyncio
 import json
 import logging
+from datetime import timedelta
 import time
 
+from mcp.types import CallToolResult
 import agent_gateway.mcp_client as mcp_client_module
 from agent_gateway.mcp_client import McpClientManager
 
@@ -10,7 +12,7 @@ from agent_gateway.mcp_client import McpClientManager
 def test_connect_or_warn_logs_timeout_exception_class(caplog):
   manager = McpClientManager(config_path=None)
 
-  async def _raise_timeout(_name, _config):
+  async def _raise_timeout(name, config):
     raise asyncio.TimeoutError()
 
   manager._connect = _raise_timeout
@@ -135,13 +137,13 @@ def test_stdio_connect_retries_transient_connection_closed_group(monkeypatch, ca
   connected_state = object()
   attempts: list[int] = []
 
-  async def _flaky_connect_stdio(_name, _config):
+  async def _flaky_connect_stdio(name, config):
     attempts.append(1)
     if len(attempts) < 3:
       raise _FakeExceptionGroup(McpError("Connection closed"))
     return connected_state
 
-  manager._connect_stdio = _flaky_connect_stdio
+  monkeypatch.setattr(manager, "_connect_stdio", _flaky_connect_stdio)
   caplog.set_level(logging.WARNING, logger="agent_gateway.mcp_client")
 
   result = asyncio.run(manager._connect("fmp-mcp", {"type": "stdio", "command": "python3"}))
@@ -158,7 +160,7 @@ def test_stdio_connect_exhausts_bounded_retries(monkeypatch, caplog):
   manager = McpClientManager(config_path=None)
   attempts: list[int] = []
 
-  async def _always_closed(_name, _config):
+  async def _always_closed(name, config):
     attempts.append(1)
     raise _FakeExceptionGroup(McpError("Connection closed"))
 
@@ -270,22 +272,36 @@ class ClosedResourceError(Exception):
   pass
 
 
-class _ToolResult:
-  isError = False
-  content = []
-  structuredContent = {"ok": True}
 
 
 def test_stdio_tool_call_reconnects_once_on_closed_transport(monkeypatch, caplog):
   manager = McpClientManager(config_path=None)
 
   class _ClosedSession:
-    async def call_tool(self, _name, _tool_input, **_kwargs):
+    async def call_tool(
+      self,
+      name: str,
+      arguments: dict[str, object],
+      *,
+      read_timeout_seconds: timedelta,
+      meta: dict[str, object] | None = None,
+    ) -> CallToolResult:
       raise ClosedResourceError()
 
   class _ReplacementSession:
-    async def call_tool(self, _name, _tool_input, **_kwargs):
-      return _ToolResult()
+    async def call_tool(
+      self,
+      name: str,
+      arguments: dict[str, object],
+      *,
+      read_timeout_seconds: timedelta,
+      meta: dict[str, object] | None = None,
+    ) -> CallToolResult:
+      return CallToolResult(
+        isError=False,
+        content=[],
+        structuredContent={"ok": True},
+      )
 
   class _CloseContext:
     closed = False
@@ -296,7 +312,7 @@ def test_stdio_tool_call_reconnects_once_on_closed_transport(monkeypatch, caplog
   close_context = _CloseContext()
   config = {"type": "stdio", "command": "fake-mcp-server"}
   manager._servers = {
-    "fmp-mcp": mcp_client_module._ServerState(
+    "fmp-mcp": mcp_client_module._ConnectedServerState(
       name="fmp-mcp",
       session=_ClosedSession(),
       exit_contexts=[close_context],
@@ -308,15 +324,15 @@ def test_stdio_tool_call_reconnects_once_on_closed_transport(monkeypatch, caplog
   manager._tool_to_server = {"fmp_profile": "fmp-mcp"}
   reconnects: list[tuple[str, dict]] = []
 
-  async def _fake_reconnect(name, reconnect_config):
-    reconnects.append((name, reconnect_config))
-    return mcp_client_module._ServerState(
+  async def _fake_reconnect(name, config):
+    reconnects.append((name, config))
+    return mcp_client_module._ConnectedServerState(
       name=name,
       session=_ReplacementSession(),
       exit_contexts=[],
       tool_definitions=[],
       tool_names={"fmp_profile"},
-      config=reconnect_config,
+      config=config,
     )
 
   manager._connect_stdio_with_retries = _fake_reconnect

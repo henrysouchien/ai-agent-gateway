@@ -36,7 +36,6 @@ from .capability_resolution import (
 from .tool_dispatch_source_identity import read_source_identities
 from .tool_result_semantics import (
   classify_semantic_tool_error,
-  is_semantic_tool_error,
   status_error_has_detail,
 )
 
@@ -84,6 +83,7 @@ _TRANSPORT_ERROR_CODES = frozenset(
     "connection_error",
     "server_unavailable",
     "sheets_unavailable",
+    "broker_session_expired",
   }
 )
 # Structural refusals: the call was decided, not attempted.  Never retried.
@@ -103,26 +103,23 @@ _RATE_LIMIT_TEXT_RE = re.compile(
   r"\b(?:429|too many requests|rate[ _-]?limit(?:ed|ing)?|overload(?:ed)?)\b",
   re.IGNORECASE,
 )
-
-
-_CLASSIFICATION_REGEXES: tuple[Any, ...] | None = None
-_STATUS_CODE_REGEX: Any = None
-
-
-def _classification_regexes() -> tuple[tuple[Any, ...], Any]:
-  """Reuse ``retry.py``'s classification regexes (never its run machinery).
-
-  Imported lazily: ``agent_gateway.retry`` pulls in the autonomous run
-  surface, which imports the runner this module is dispatched from.
-  """
-
-  global _CLASSIFICATION_REGEXES, _STATUS_CODE_REGEX
-  if _CLASSIFICATION_REGEXES is None:
-    from .retry import _STATUS_CODE_RE, _TRANSIENT_ERROR_PATTERNS
-
-    _CLASSIFICATION_REGEXES = tuple(_TRANSIENT_ERROR_PATTERNS)
-    _STATUS_CODE_REGEX = _STATUS_CODE_RE
-  return _CLASSIFICATION_REGEXES, _STATUS_CODE_REGEX
+_STATUS_CODE_RE = re.compile(r"\b(400|401|403|404|429|5\d\d)\b")
+_TRANSIENT_ERROR_PATTERNS = (
+  re.compile(r"\b(?:429|5\d\d)\b", re.IGNORECASE),
+  re.compile(r"\btoo many requests\b", re.IGNORECASE),
+  re.compile(r"\brate(?:\s+limit(?:ed|ing)?|\s+limited)\b", re.IGNORECASE),
+  re.compile(r"\boverload(?:ed)?\b", re.IGNORECASE),
+  re.compile(r"\bservice unavailable\b", re.IGNORECASE),
+  re.compile(r"\bserver error\b", re.IGNORECASE),
+  re.compile(r"\binternal server error\b", re.IGNORECASE),
+  re.compile(r"\b(?:api)?connectionerror\b", re.IGNORECASE),
+  re.compile(r"\bapitimeouterror\b", re.IGNORECASE),
+  re.compile(r"\btransporterror\b", re.IGNORECASE),
+  re.compile(r"\bstreamerror\b", re.IGNORECASE),
+  re.compile(r"\btimeout(?:error)?\b", re.IGNORECASE),
+  re.compile(r"\btimed out\b", re.IGNORECASE),
+  re.compile(r"\bconnection (?:reset|aborted|refused|closed)\b", re.IGNORECASE),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +145,14 @@ class DispatchEntry:
     return self.catalog_entry.idempotent if self.catalog_entry is not None else None
 
 
+@dataclass(frozen=True, slots=True)
+class ToolResultSettlement:
+  """One owner-produced outcome and its successful source identities."""
+
+  outcome: str
+  sources: tuple[Mapping[str, Any], ...] = ()
+
+
 def build_route_id(
   *,
   tool_name: str,
@@ -169,18 +174,28 @@ def build_route_id(
 def resolve_dispatch_entry(
   tool_name: str,
   *,
+  origin: str | None = None,
   server: str | None = None,
+  original_tool_name: str | None = None,
   provider_id: str | None = None,
 ) -> DispatchEntry:
+  canonical_name = canonical_dispatch_tool_name(
+    original_tool_name if original_tool_name is not None else tool_name
+  )
   return DispatchEntry(
     tool_name=str(tool_name or ""),
-    canonical_name=canonical_dispatch_tool_name(tool_name),
+    canonical_name=canonical_name,
     route_id=build_route_id(
       tool_name=tool_name,
       server=server,
       provider_id=provider_id,
     ),
-    catalog_entry=lookup_catalog_entry(tool_name),
+    catalog_entry=lookup_catalog_entry(
+      tool_name,
+      origin=origin,
+      server=server,
+      original_tool_name=original_tool_name,
+    ),
   )
 
 
@@ -204,17 +219,36 @@ def _is_rate_limited(code: str, sub_code: str, text: str) -> bool:
 def _is_transport(code: str, sub_code: str, text: str) -> bool:
   if code in _TRANSPORT_ERROR_CODES or sub_code in _TRANSPORT_ERROR_CODES:
     return True
-  transient_patterns, status_code_re = _classification_regexes()
-  match = status_code_re.search(text)
+  match = _STATUS_CODE_RE.search(text)
   if match is not None and match.group(1).startswith("5"):
     return True
-  return any(pattern.search(text) for pattern in transient_patterns)
+  return any(pattern.search(text) for pattern in _TRANSIENT_ERROR_PATTERNS)
 
 
 def _is_policy_refusal(code: str) -> bool:
   if code in _POLICY_ERROR_CODES:
     return True
   return any(code.startswith(prefix) for prefix in _POLICY_ERROR_CODE_PREFIXES)
+
+
+_MCP_VALIDATION_ERROR_CODES = frozenset({"invalid_input", "validation_error"})
+_MCP_VALIDATION_ERROR_MARKERS = (
+  "validation error",
+  "missing required argument",
+  "unexpected keyword argument",
+  "[type=missing_argument]",
+  "[type=unexpected_keyword_argument]",
+)
+
+
+def is_mcp_validation_error(error: Mapping[str, Any]) -> bool:
+  """True iff a tool-error payload describes MCP argument validation failure."""
+  code = str(error.get("code") or "").strip().lower()
+  sub_code = str(error.get("sub_code") or "").strip().lower()
+  if code in _MCP_VALIDATION_ERROR_CODES or sub_code in _MCP_VALIDATION_ERROR_CODES:
+    return True
+  message = str(error.get("message") or "").lower()
+  return any(marker in message for marker in _MCP_VALIDATION_ERROR_MARKERS)
 
 
 def _classify_failure_payload(payload: Mapping[str, Any] | None) -> str:
@@ -311,6 +345,22 @@ def extract_source_identities(
   return read_source_identities(described.source_identity, result)
 
 
+def settle_catalogless_tool_result(
+  *,
+  entry: DispatchEntry | None,
+  result: Any,
+  error: Mapping[str, Any] | None,
+  semantic_error: Mapping[str, Any] | None = None,
+) -> ToolResultSettlement:
+  """Settle the compatibility dispatch contract without a registration."""
+
+  outcome = classify_tool_outcome(entry, result, error, semantic_error)
+  sources: tuple[Mapping[str, Any], ...] = ()
+  if outcome == OUTCOME_OK:
+    sources = extract_source_identities(entry, result)
+  return ToolResultSettlement(outcome=outcome, sources=sources)
+
+
 def build_dispatch_record(
   *,
   entry: DispatchEntry | None,
@@ -326,19 +376,80 @@ def build_dispatch_record(
   sequencing that closes the 429-minting hole.
   """
 
-  outcome = classify_tool_outcome(entry, result, error, semantic_error)
+  settlement = settle_catalogless_tool_result(
+    entry=entry,
+    result=result,
+    error=error,
+    semantic_error=semantic_error,
+  )
+  return build_dispatch_record_from_sources(
+    entry=entry,
+    outcome=settlement.outcome,
+    sources=settlement.sources,
+    attempts=attempts,
+    retries_exhausted=retries_exhausted,
+  )
+
+
+def build_dispatch_record_for_outcome(
+  *,
+  entry: DispatchEntry | None,
+  result: Any,
+  outcome: str,
+  attempts: int = 1,
+  retries_exhausted: bool = False,
+) -> dict[str, Any]:
+  """Build a dispatch block from its route-owned settled outcome."""
+
   sources: tuple[Mapping[str, Any], ...] = ()
   if outcome == OUTCOME_OK:
     sources = extract_source_identities(entry, result)
+  return build_dispatch_record_from_sources(
+    entry=entry,
+    outcome=outcome,
+    sources=sources,
+    attempts=attempts,
+    retries_exhausted=retries_exhausted,
+  )
+
+
+def build_dispatch_record_from_sources(
+  *,
+  entry: DispatchEntry | None,
+  outcome: str,
+  sources: tuple[Mapping[str, Any], ...],
+  attempts: int = 1,
+  retries_exhausted: bool = False,
+) -> dict[str, Any]:
+  """Project a settled outcome and its owner-produced source identities."""
+
   record: dict[str, Any] = {
     "outcome": outcome,
     "attempts": int(attempts),
     "route_id": entry.route_id if entry is not None else "",
-    "sources": [dict(source) for source in sources],
+    "sources": [_materialize_source_identity(source) for source in sources],
   }
   if retries_exhausted:
     record["retries_exhausted"] = True
   return record
+
+
+def _materialize_source_identity(source: Mapping[str, Any]) -> dict[str, Any]:
+  return {
+    str(key): _materialize_source_value(value)
+    for key, value in source.items()
+  }
+
+
+def _materialize_source_value(value: Any) -> Any:
+  if isinstance(value, Mapping):
+    return {
+      str(key): _materialize_source_value(child)
+      for key, child in value.items()
+    }
+  if isinstance(value, (list, tuple)):
+    return [_materialize_source_value(child) for child in value]
+  return value
 
 
 # --------------------------------------------------------------------------
@@ -355,8 +466,8 @@ _BACKOFF_MAX_SECONDS = 8.0
 class RetryPolicy:
   """Bounded, jittered retry at the dispatch site.
 
-  Not ``retry.RetryConfig``: that governs whole autonomous runs with 30–600 s
-  backoff steps.  Only the classification regexes are shared.
+  This policy applies only to one registered tool dispatch. Whole autonomous
+  sessions are single-attempt because replay could repeat completed effects.
   """
 
   max_retries: int = DEFAULT_MAX_TOOL_RETRIES
@@ -439,15 +550,19 @@ __all__ = [
   "OUTCOME_TRANSPORT",
   "RETRYABLE_OUTCOMES",
   "RetryPolicy",
+  "ToolResultSettlement",
   "build_dispatch_record",
+  "build_dispatch_record_for_outcome",
+  "build_dispatch_record_from_sources",
   "build_route_id",
   "classify_semantic_tool_error",
   "classify_tool_outcome",
   "extract_source_identities",
-  "is_semantic_tool_error",
+  "is_mcp_validation_error",
   "resolve_dispatch_entry",
   "retry_backoff_seconds",
   "retry_decision",
   "retry_eligible",
+  "settle_catalogless_tool_result",
   "status_error_has_detail",
 ]

@@ -557,6 +557,26 @@ def _v2_sidecar_payload(
   }
 
 
+def validate_v2_stream_path(
+  value: object,
+  *,
+  active: Path,
+  field_name: str,
+) -> str:
+  """Validate a current or historical stream path, never authorize I/O."""
+  try:
+    path = _canonical_absolute_path(value, field_name=field_name)
+  except ValueError as exc:
+    raise AgentSessionLogLayoutError(
+      f"v2 session-log sidecar {field_name} is not a canonical stream path"
+    ) from exc
+  if "\x00" in path or Path(path).parts[-2:] != active.parts[-2:]:
+    raise AgentSessionLogLayoutError(
+      f"v2 session-log sidecar {field_name} does not match its stream namespace"
+    )
+  return path
+
+
 def validate_v2_sidecar_payload(
   payload: Mapping[str, Any],
   *,
@@ -591,7 +611,6 @@ def validate_v2_sidecar_payload(
     "file_kind": "canonical",
     "profile": workload_profile,
     "file_role": "active",
-    "logical_stream_id": str(active),
     "storage_layout": 2,
     "workload_profile": workload_profile,
     "provider": str(provider).strip().lower(),
@@ -607,12 +626,19 @@ def validate_v2_sidecar_payload(
     raise AgentSessionLogLayoutError(
       "v2 canonical sidecar contains another stream-kind identity"
     )
+  # Creation-time lineage and rotation-time locators may have different roots;
+  # both retain the authenticated stream namespace, neither authorizes I/O.
+  logical_stream_id = validate_v2_stream_path(
+    payload.get("logical_stream_id"),
+    active=active,
+    field_name="logical_stream_id",
+  )
   generation = payload.get("active_generation")
   if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
     raise AgentSessionLogLayoutError(
       "v2 session-log sidecar active_generation is invalid"
     )
-  stream_hash = hashlib.sha1(str(active).encode("utf-8")).hexdigest()[:16]
+  stream_hash = hashlib.sha1(logical_stream_id.encode("utf-8")).hexdigest()[:16]
   expected_source_id = (
     f"agent_session_log:{stream_hash}:active:{generation:06d}"
   )
@@ -885,6 +911,7 @@ def verify_autonomous_session_log(
       raise AgentSessionLogLayoutError("v2 session-log root path was displaced")
     reopened_active = os.open(active.name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=root_chain_fd)
     reopened_meta = os.open(meta.name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=root_chain_fd)
+    active_identity: tuple[int, int] | None = None
     for descriptor, expected, target in (
       (reopened_active, (authority.active_device, authority.active_inode), "active"),
       (reopened_meta, (authority.meta_device, authority.meta_inode), "metadata"),
@@ -894,6 +921,8 @@ def verify_autonomous_session_log(
         raise AgentSessionLogLayoutError(
           f"v2 session-log {target} path was displaced"
         )
+      if target == "active":
+        active_identity = (info.st_dev, info.st_ino)
     validate_v2_sidecar_payload(
       _read_descriptor_json(meta_fd),
       active=active,
@@ -922,7 +951,7 @@ def verify_autonomous_session_log(
     location = AgentSessionLogLocation(
       path=active,
       parent_identity=parent_identity,
-      active_identity=(authority.active_device, authority.active_inode),
+      active_identity=active_identity,
       segments_identity=segments_identity,
     )
     return VerifiedAutonomousSessionLog(
@@ -963,4 +992,5 @@ __all__ = [
   "resolve_agent_session_log_archive_product_ids",
   "verify_autonomous_session_log",
   "validate_v2_sidecar_payload",
+  "validate_v2_stream_path",
 ]

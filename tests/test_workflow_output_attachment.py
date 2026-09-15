@@ -48,7 +48,6 @@ def _view(
   phase_number: int,
   revision: int,
   digest: str,
-  delivery_status: str = "complete",
 ) -> WorkflowView:
   """The canonical view every composed WorkflowResult carries (A-M5)."""
 
@@ -57,7 +56,7 @@ def _view(
     workflow_name="dynamic-workflow",
     state="terminal",
     execution_status="succeeded",
-    delivery_status=delivery_status,
+    delivery_status="complete",
     terminal_status="succeeded",
     legal_actions=(),
     observation_seq=1,
@@ -132,7 +131,11 @@ def _publication(
   )
 
 
-def _workflow_result(*, presentation: str = "attachment") -> WorkflowResult:
+def _workflow_result(
+  *,
+  presentation: str = "attachment",
+) -> WorkflowResult:
+  assert presentation == "attachment" or presentation == "inline"
   primary = _publication("synthesis", "Full report.", inline=False)
   summary_output = _publication(
     "delivery_summary",
@@ -195,7 +198,10 @@ def _workflow_result(*, presentation: str = "attachment") -> WorkflowResult:
   )
 
 
-def _completed_result(*, presentation: str = "attachment") -> dict[str, object]:
+def _completed_result(
+  *,
+  presentation: str = "attachment",
+) -> dict[str, object]:
   return {
     "ok": True,
     "action": "result",
@@ -258,6 +264,10 @@ def _v2_workflow_result(fixture_name: str) -> WorkflowResult:
 
 def test_completed_workflow_result_yields_atomic_authored_delivery() -> None:
   workflow_result = _workflow_result()
+  delivery = workflow_result.delivery
+  assert delivery is not None
+  envelope = delivery.envelope
+  assert isinstance(envelope, DeliveryEnvelopeV1)
   attachment = completed_workflow_output_attachment(
     "workflow_run",
     {
@@ -268,9 +278,10 @@ def test_completed_workflow_result_yields_atomic_authored_delivery() -> None:
   )
 
   assert attachment == WorkflowOutputAttachment(
-    envelope=workflow_result.delivery.envelope,
+    envelope=envelope,
   )
   assert attachment is not None
+  assert isinstance(attachment.envelope, DeliveryEnvelopeV1)
   assert attachment.envelope.summary is not None
   assert attachment.envelope.summary.text == "Grounded authored summary."
   assert attachment.delivery_phase_number == 2
@@ -309,8 +320,12 @@ def test_v2_delivery_stages_preview_and_exact_primary_without_summary(
   assert attachment is not None
   assert isinstance(attachment.envelope, DeliveryEnvelopeV2)
   assert attachment.envelope.primary.preview.complete is preview_complete
+  delivery = workflow_result.delivery
+  assert delivery is not None
+  delivery_envelope = delivery.envelope
+  assert isinstance(delivery_envelope, DeliveryEnvelopeV2)
   assert attachment.published_output_ref == (
-    workflow_result.delivery.envelope.primary.published_output_ref
+    delivery_envelope.primary.published_output_ref
   )
   assert WorkflowOutputAttachment.from_mapping(attachment.to_dict()) == attachment
 
@@ -331,7 +346,9 @@ def test_non_result_response_does_not_attach(
 
 def test_failed_delivery_does_not_attach() -> None:
   result = _completed_result()
-  result["view"]["delivery_status"] = "failed"
+  view = result["view"]
+  assert isinstance(view, dict)
+  view["delivery_status"] = "failed"
   result["delivery"] = {
     "status": "failed",
     "phase_number": 2,
@@ -355,7 +372,13 @@ def test_failed_delivery_does_not_attach() -> None:
 
 def test_malformed_completed_result_fails_closed() -> None:
   result = deepcopy(_completed_result())
-  result["delivery"]["envelope"]["summary"]["text"] = "Invented summary."  # type: ignore[index]
+  delivery = result["delivery"]
+  assert isinstance(delivery, dict)
+  envelope = delivery["envelope"]
+  assert isinstance(envelope, dict)
+  summary = envelope["summary"]
+  assert isinstance(summary, dict)
+  summary["text"] = "Invented summary."
 
   with pytest.raises(
     WorkflowOutputAttachmentError,
@@ -373,15 +396,19 @@ def test_inline_delivery_preserves_inline_mode_without_attachment() -> None:
 
 def test_warned_primary_only_delivery_yields_no_attachment() -> None:
   base = _workflow_result()
-  spec = base.delivery.spec
+  delivery = base.delivery
+  assert delivery is not None
+  spec = delivery.spec
   assert spec is not None
+  base_envelope = delivery.envelope
+  assert isinstance(base_envelope, DeliveryEnvelopeV1)
   envelope = DeliveryEnvelopeV1(
     schema_version="1.0",
     workflow_run_id=base.workflow_run_id,
     phase_number=2,
     revision=2,
     summary=None,
-    primary=base.delivery.envelope.primary,
+    primary=base_envelope.primary,
   )
   degraded = base.model_copy(update={
     "delivery": DeliverySettlement(
@@ -412,8 +439,13 @@ def test_warned_primary_only_delivery_yields_no_attachment() -> None:
 
 
 def test_attachment_mapping_round_trips_exactly_and_rejects_unknown_fields() -> None:
+  workflow_result = _workflow_result()
+  delivery = workflow_result.delivery
+  assert delivery is not None
+  envelope = delivery.envelope
+  assert isinstance(envelope, DeliveryEnvelopeV1)
   attachment = WorkflowOutputAttachment(
-    envelope=_workflow_result().delivery.envelope,
+    envelope=envelope,
   )
   serialized = attachment.to_dict()
 
@@ -442,7 +474,11 @@ def test_historical_literal_assistant_attachment_still_round_trips() -> None:
 
 def test_record_orders_by_phase_and_revision_and_rejects_conflicts() -> None:
   first_result = _workflow_result()
-  first = WorkflowOutputAttachment(envelope=first_result.delivery.envelope)
+  first_delivery = first_result.delivery
+  assert first_delivery is not None
+  first_envelope = first_delivery.envelope
+  assert isinstance(first_envelope, DeliveryEnvelopeV1)
+  first = WorkflowOutputAttachment(envelope=first_envelope)
   pending: dict[str, WorkflowOutputAttachment] = {}
   record_workflow_output_attachment(pending, first)
 
@@ -461,6 +497,7 @@ def test_record_orders_by_phase_and_revision_and_rejects_conflicts() -> None:
   record_workflow_output_attachment(pending, older)
   assert pending == {"workflow-1": first}
 
+  assert isinstance(first.envelope, DeliveryEnvelopeV1)
   conflict_summary = first.envelope.summary
   assert conflict_summary is not None
   conflict = WorkflowOutputAttachment(

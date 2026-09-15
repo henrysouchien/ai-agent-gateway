@@ -4,8 +4,76 @@ import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Literal
+from datetime import datetime
+from typing import Any, Iterator, Literal, Protocol
 
+from .approval_policy import ApprovalRequest
+
+
+class BatchApprovalAdmissionStore(Protocol):
+  """Durable capabilities one admitted batch producer must preserve."""
+
+  async def abort_unpublished_approval(
+    self,
+    approval_id: str,
+    *,
+    expected_tool_call_id: str,
+    expected_user_id: str,
+    expected_request_id: str,
+    expected_run_id: str,
+    expected_session_id: str,
+    expected_channel: str | None,
+    decision_reason: str,
+  ) -> tuple[ApprovalRequest, bool, bool]: ...
+
+  async def fence_persistent_grants_for_cancellation(
+    self,
+    approval_id: str,
+    *,
+    expected_tool_call_id: str,
+    expected_user_id: str,
+    expected_request_id: str,
+    expected_run_id: str,
+    expected_session_id: str,
+    expected_channel: str | None,
+  ) -> tuple[ApprovalRequest, bool]: ...
+
+  async def revoke_persistent_grants_for_approval(
+    self,
+    approval_id: str,
+    *,
+    revoked_at: datetime | None = None,
+  ) -> int: ...
+
+class ApprovalProjectionStore(BatchApprovalAdmissionStore, Protocol):
+  """Capabilities called through a projected store field."""
+
+  async def get(
+    self,
+    approval_id: str,
+  ) -> ApprovalRequest | None: ...
+
+
+class ApprovalProjectionIdentity(Protocol):
+  """Identity fields compared by the durable/live projection join."""
+
+  @property
+  def approval_id(self) -> str: ...
+
+  @property
+  def tool_call_id(self) -> str: ...
+
+  @property
+  def owner_user_id(self) -> str: ...
+
+  @property
+  def run_id(self) -> str: ...
+
+  @property
+  def session_id(self) -> str: ...
+
+  @property
+  def channel(self) -> str | None: ...
 
 def normalize_approval_channel(value: str | None) -> str | None:
   normalized = str(value or "").strip().lower()
@@ -32,8 +100,8 @@ class ApprovalProjection:
   session_id: str
   lifecycle: Literal["live"]
   session: Any
-  store: Any | None
-  policy: Any | None
+  store: ApprovalProjectionStore | None
+  policy: object | None
 
 
 @dataclass(frozen=True)
@@ -49,8 +117,8 @@ class BoundApprovalAuthorizationSubject:
   session_id: str
   request: Any
   session: Any
-  store: Any
-  policy: Any | None
+  store: BatchApprovalAdmissionStore
+  policy: object | None
 
 
 @dataclass(frozen=True)
@@ -60,8 +128,8 @@ class _BatchApprovalCarrier:
   owner_user_id: str
   channel: str | None
   session: Any
-  store: Any | None
-  policy: Any | None
+  store: ApprovalProjectionStore | None
+  policy: object | None
 
 
 @dataclass
@@ -86,9 +154,14 @@ class BatchApprovalAdmission:
   released: bool = False
   published: bool = False
   request: Any | None = None
-  store: Any | None = None
+  store: BatchApprovalAdmissionStore | None = None
 
-  def bind_request(self, *, request: Any, store: Any) -> None:
+  def bind_request(
+    self,
+    *,
+    request: Any,
+    store: BatchApprovalAdmissionStore,
+  ) -> None:
     if self.released:
       raise RuntimeError("batch approval admission is already released")
     expected_session_id = str(
@@ -133,7 +206,7 @@ class BatchApprovalAdmission:
       raise RuntimeError("batch approval admission cannot be aborted safely")
     for attempt in range(2):
       try:
-        result = await abort(
+        result = await self.store.abort_unpublished_approval(
           approval_id,
           expected_tool_call_id=tool_call_id,
           expected_user_id=self.carrier.owner_user_id,
@@ -194,8 +267,8 @@ class BatchApprovalProjectionRegistry:
     owner_user_id: str,
     channel: str | None,
     session: Any,
-    store: Any | None = None,
-    policy: Any | None = None,
+    store: ApprovalProjectionStore | None = None,
+    policy: object | None = None,
   ) -> _BatchApprovalCarrier:
     normalized_batch_id = int(batch_id)
     if normalized_batch_id < 1:
@@ -766,7 +839,7 @@ class BatchApprovalProjectionRegistry:
 
 def approval_record_matches_projection(
   record: Any,
-  projection: ApprovalProjection | BoundApprovalAuthorizationSubject,
+  projection: ApprovalProjectionIdentity,
 ) -> bool:
   """Fail-closed durable/live identity join for a projected approval."""
   return all((
@@ -786,7 +859,7 @@ class BatchApprovalScope:
   owner_user_id: str
   channel: str | None
   store: Any
-  policy: Any
+  policy: object
   registry: BatchApprovalProjectionRegistry
 
   @property

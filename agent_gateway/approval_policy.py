@@ -7,14 +7,14 @@ import importlib
 import json
 import math
 import re
-import time
 import traceback
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime
-from typing import Any, Literal, Mapping, Protocol
+from typing import Any, Literal, Mapping, NoReturn, Protocol
 
 from .ui_blocks_run import UiBlocksRunContext, current_ui_blocks_run
+from .skill_limits import SkillExecutionLimits
 
 
 ToolClass = Literal[
@@ -28,6 +28,7 @@ ToolClass = Literal[
 ]
 
 ApprovalIdentitySource = Literal["change_set", "reviewed_change_binding"]
+ApprovalReuseMode = Literal["legacy", "disabled", "exact"]
 ApprovalConstraint = Literal[
   "standard",
   "fresh_human_owner",
@@ -112,20 +113,15 @@ def _require_plain_json(value: Any) -> None:
 def _reviewed_change_contract() -> Any:
   """Load the monorepo's dependency-light identity owner on exact-plan paths."""
 
-  errors: list[ModuleNotFoundError] = []
-  for module_name in (
-    "research.reviewed_change_binding",
-    "research.reviewed_change_binding",
-  ):
-    try:
-      return importlib.import_module(module_name)
-    except ModuleNotFoundError as exc:
-      if exc.name not in {module_name, module_name.split(".")[0]}:
-        raise
-      errors.append(exc)
-  raise ValueError(
-    "reviewed change identity contract is unavailable"
-  ) from errors[-1]
+  module_name = "research.reviewed_change_binding"
+  try:
+    return importlib.import_module(module_name)
+  except ModuleNotFoundError as exc:
+    if exc.name not in {module_name, module_name.split(".")[0]}:
+      raise
+    raise ValueError(
+      "reviewed change identity contract is unavailable"
+    ) from exc
 
 
 def _normalize_review_reference(value: dict[str, Any]) -> dict[str, Any]:
@@ -156,6 +152,12 @@ class ApprovalRequestPayload:
   """Ephemeral approval payload carrying raw args only in memory."""
 
   __slots__ = ("_approval_id", "_tool_name", "_tool_class", "_tool_args", "_cleared")
+  _approval_id: str
+  _tool_name: str
+  _tool_class: ToolClass
+  _tool_args: dict[str, Any]
+  _cleared: bool
+
 
   def __init__(
     self,
@@ -206,7 +208,7 @@ class ApprovalRequestPayload:
   def __getstate__(self) -> None:
     raise TypeError("ApprovalRequestPayload is not serializable")
 
-  def __reduce__(self) -> None:
+  def __reduce__(self) -> NoReturn:
     raise TypeError("ApprovalRequestPayload is not picklable")
 
   def __copy__(self) -> None:
@@ -225,6 +227,7 @@ class RunContext:
   profile: str = "chat"
   channel: str = "web"
   skill: str | None = None
+  admitted_skill_execution_limits: SkillExecutionLimits | None = None
   research_file_id: int | None = None
   decider_role: str | None = None
   tenant_id: str | None = None
@@ -286,6 +289,8 @@ class ApprovalRequest:
   authorization_mode: AuthorizationMode = "HUMAN"
   grant_reference: str | None = None
   cache_reference: str | None = None
+  approval_reuse_mode: ApprovalReuseMode = "legacy"
+  approval_reuse_key: str | None = None
 
   def __post_init__(self) -> None:
     if self.approval_constraint not in {
@@ -324,6 +329,17 @@ class ApprovalRequest:
       raise ValueError("cache_reference requires CACHE_HIT authorization_mode")
     if self.authorization_mode != "PERSISTENT_GRANT" and self.grant_reference is not None:
       raise ValueError("grant_reference requires PERSISTENT_GRANT authorization_mode")
+    if self.approval_reuse_mode not in {"legacy", "disabled", "exact"}:
+      raise ValueError("unsupported approval_reuse_mode")
+    if self.approval_reuse_mode == "exact":
+      if (
+        not isinstance(self.approval_reuse_key, str)
+        or not self.approval_reuse_key
+        or self.approval_reuse_key != self.approval_reuse_key.strip()
+      ):
+        raise ValueError("exact approval reuse requires a canonical non-empty key")
+    elif self.approval_reuse_key is not None:
+      raise ValueError("approval_reuse_key requires exact approval reuse")
     identity_values = (
       self.change_set_id,
       self.change_hash,
@@ -490,6 +506,8 @@ def build_approval_request(
   approval_identity: Mapping[str, Any] | None = None,
   approval_constraint: ApprovalConstraint = "standard",
   required_owner_user_id: str | None = None,
+  approval_reuse_mode: ApprovalReuseMode = "legacy",
+  approval_reuse_key: str | None = None,
 ) -> ApprovalRequest:
   identity = dict(approval_identity or {})
   allowed_identity_fields = {
@@ -533,6 +551,8 @@ def build_approval_request(
     policy_bundle_hash=run_context.policy_bundle_hash,
     approval_constraint=approval_constraint,
     required_owner_user_id=required_owner_user_id,
+    approval_reuse_mode=approval_reuse_mode,
+    approval_reuse_key=approval_reuse_key,
     identity_source=identity.get("identity_source"),
     change_set_id=identity.get("change_set_id"),
     change_hash=identity.get("change_hash"),
@@ -545,6 +565,52 @@ def build_approval_request(
   )
 
 
+_APPROVAL_REQUEST_TIME_FIELDS = (
+  "requested_at",
+  "decided_at",
+  "expires_at",
+)
+
+
+def approval_request_projection(request: ApprovalRequest) -> dict[str, Any]:
+  """Project an approval request as JSON-safe values for cross-process transport."""
+
+  if not isinstance(request, ApprovalRequest):
+    raise TypeError("request must be an ApprovalRequest")
+  projection = {
+    request_field.name: getattr(request, request_field.name)
+    for request_field in fields(ApprovalRequest)
+  }
+  for field_name in _APPROVAL_REQUEST_TIME_FIELDS:
+    value = projection[field_name]
+    projection[field_name] = value.isoformat() if value is not None else None
+  return json.loads(json.dumps(projection))
+
+
+def approval_request_from_projection(projection: Any) -> ApprovalRequest:
+  """Rebuild an approval request from its transported projection."""
+
+  if not isinstance(projection, Mapping):
+    raise ValueError("approval request projection must be a mapping")
+  known_fields = {request_field.name for request_field in fields(ApprovalRequest)}
+  unexpected = set(projection).difference(known_fields)
+  if unexpected:
+    raise ValueError(
+      f"unsupported approval request projection fields: {sorted(unexpected)!r}"
+    )
+  kwargs = dict(projection)
+  for field_name in _APPROVAL_REQUEST_TIME_FIELDS:
+    value = kwargs.get(field_name)
+    if value is None:
+      continue
+    if not isinstance(value, str):
+      raise ValueError(
+        f"approval request projection {field_name} must be ISO-8601 text"
+      )
+    kwargs[field_name] = datetime.fromisoformat(value)
+  return ApprovalRequest(**kwargs)
+
+
 def constrain_approval_decision(
   request: ApprovalRequest,
   decision: ApprovalDecision,
@@ -552,9 +618,9 @@ def constrain_approval_decision(
   """Apply the durable constraint before policy output can affect lifecycle state."""
 
   if request.approval_constraint == "standard":
-    return decision
-  if request.approval_constraint == "legacy_unknown":
-    return replace(
+    constrained = decision
+  elif request.approval_constraint == "legacy_unknown":
+    constrained = replace(
       decision,
       outcome="auto_deny",
       reason=(
@@ -565,22 +631,74 @@ def constrain_approval_decision(
       grant_reference=None,
       modified_tool_args=None,
     )
-  if decision.outcome == "auto_deny":
-    return replace(
+  elif decision.outcome == "auto_deny":
+    constrained = replace(
       decision,
       allow_persistent_grant=False,
       persistent_grant_scope_hint=None,
       grant_reference=None,
     )
-  return replace(
-    decision,
-    outcome="request_user_approval",
-    reason="Exact promotion requires a fresh decision by its frozen owner",
-    allow_persistent_grant=False,
-    persistent_grant_scope_hint=None,
-    grant_reference=None,
-    modified_tool_args=None,
+  else:
+    constrained = replace(
+      decision,
+      outcome="request_user_approval",
+      reason="Exact promotion requires a fresh decision by its frozen owner",
+      allow_persistent_grant=False,
+      persistent_grant_scope_hint=None,
+      grant_reference=None,
+      modified_tool_args=None,
+    )
+
+  scope = constrained.persistent_grant_scope_hint
+  grant_mismatch = (
+    constrained.grant_reference is not None
+    and (
+      request.approval_reuse_mode == "disabled"
+      or (
+        request.approval_reuse_mode == "exact"
+        and scope != request.approval_reuse_key
+      )
+    )
   )
+  if grant_mismatch and constrained.outcome == "auto_approve":
+    constrained = replace(
+      constrained,
+      outcome="request_user_approval",
+      reason="Persistent approval grant did not match this registered call",
+    )
+  if request.approval_reuse_mode == "disabled":
+    return replace(
+      constrained,
+      allow_persistent_grant=False,
+      persistent_grant_scope_hint=None,
+      grant_reference=None,
+    )
+  if request.approval_reuse_mode == "exact":
+    scope_matches = scope == request.approval_reuse_key
+    return replace(
+      constrained,
+      allow_persistent_grant=(
+        constrained.allow_persistent_grant and scope_matches
+      ),
+      persistent_grant_scope_hint=(
+        scope
+        if scope_matches
+        and (
+          constrained.allow_persistent_grant
+          or constrained.grant_reference is not None
+        )
+        else None
+      ),
+      grant_reference=(
+        constrained.grant_reference if scope_matches else None
+      ),
+    )
+  if (
+    not constrained.allow_persistent_grant
+    and constrained.grant_reference is None
+  ):
+    return replace(constrained, persistent_grant_scope_hint=None)
+  return constrained
 
 
 def approval_is_executable(request: ApprovalRequest) -> bool:
@@ -597,6 +715,19 @@ def approval_is_executable(request: ApprovalRequest) -> bool:
     and request.decider_role == "owner"
     and request.decider_id == request.required_owner_user_id
   )
+
+
+def approval_reuse_scope_authorized(request: ApprovalRequest) -> bool:
+  """Return whether the stored policy decision authorized this request's reuse."""
+
+  scope = request.persistent_grant_scope
+  if not isinstance(scope, str) or not scope:
+    return False
+  if request.approval_reuse_mode == "legacy":
+    return True
+  if request.approval_reuse_mode == "exact":
+    return scope == request.approval_reuse_key
+  return False
 
 
 def apply_decision_to_request(request: ApprovalRequest, decision: ApprovalDecision) -> ApprovalRequest:
@@ -671,7 +802,3 @@ def decision_latency_ms(request: ApprovalRequest, *, now: datetime | None = None
   if decided_at is None:
     return None
   return max(0, int((decided_at.timestamp() - request.requested_at.timestamp()) * 1000))
-
-
-def unix_ms() -> int:
-  return int(time.time() * 1000)

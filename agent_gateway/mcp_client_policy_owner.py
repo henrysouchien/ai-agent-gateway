@@ -20,13 +20,11 @@ def apply_policy_owner_invariant(
   prefixed_to_original: dict[str, str],
   mcp_tool_names: set[str],
   policy_server_for_tool: Callable[[str], str | None],
-  policy_tool_class: Callable[[str, str], str | None] | None = None,
-  strict_runtime_tool_set_for_server: Callable[[str], bool] | None = None,
   transport_server_for_policy_server: Callable[[str], str] | None = None,
   set_startup_diagnostic: Callable[..., None],
   logger: Any,
 ) -> PolicyOwnerInvariantResult:
-  hidden_by_server: dict[str, list[tuple[str, str, str | None, str]]] = {}
+  hidden_by_server: dict[str, list[tuple[str, str, str]]] = {}
   for exposed_name, runtime_server in sorted(tool_to_server.items()):
     original_name = prefixed_to_original.get(exposed_name, exposed_name)
     policy_server = policy_server_for_tool(original_name)
@@ -37,21 +35,9 @@ def apply_policy_owner_invariant(
     )
     if policy_server and policy_runtime_server != runtime_server:
       hidden_by_server.setdefault(runtime_server, []).append(
-        (exposed_name, original_name, policy_server, "owner_mismatch")
+        (exposed_name, original_name, policy_server)
       )
       continue
-    policy_context_server = policy_server or runtime_server
-    strict_runtime = bool(
-      strict_runtime_tool_set_for_server is not None
-      and strict_runtime_tool_set_for_server(policy_context_server)
-    )
-    if strict_runtime and (
-      policy_tool_class is None
-      or policy_tool_class(policy_context_server, original_name) is None
-    ):
-      hidden_by_server.setdefault(runtime_server, []).append(
-        (exposed_name, original_name, None, "unclassified")
-      )
 
   if not hidden_by_server:
     return PolicyOwnerInvariantResult(
@@ -64,7 +50,7 @@ def apply_policy_owner_invariant(
   hidden_names = {
     exposed_name
     for mismatches in hidden_by_server.values()
-    for exposed_name, _original_name, _policy_server, _reason in mismatches
+    for exposed_name, _original_name, _policy_server in mismatches
   }
   filtered_tool_definitions = [
     tool_def
@@ -82,40 +68,27 @@ def apply_policy_owner_invariant(
   for runtime_server, mismatches in hidden_by_server.items():
     server_hidden_names = {
       exposed_name
-      for exposed_name, _original_name, _policy_server, _reason in mismatches
+      for exposed_name, _original_name, _policy_server in mismatches
     }
     state = servers.get(runtime_server)
     if state is not None:
-      state.tool_definitions = [
+      state.published_tool_definitions = [
         tool_def
-        for tool_def in state.tool_definitions
+        for tool_def in state.published_tool_definitions
         if tool_def.get("name") not in server_hidden_names
       ]
       state.tool_names.difference_update(server_hidden_names)
 
-    has_unclassified = any(reason == "unclassified" for *_names, reason in mismatches)
     mismatch_summary = ", ".join(
-      (
-        f"{exposed_name}({original_name}->unclassified)"
-        if reason == "unclassified"
-        else f"{exposed_name}({original_name}->{policy_server})"
-      )
-      for exposed_name, original_name, policy_server, reason in mismatches
+      f"{exposed_name}({original_name}->{policy_server})"
+      for exposed_name, original_name, policy_server in mismatches
     )
-    if has_unclassified:
-      message = (
-        "MCP runtime exposed tools outside its strict gateway policy set; "
-        f"hiding tools: {mismatch_summary}"
-      )
-      category = "strict_runtime_tool_set_mismatch"
-      error_type = "StrictRuntimeToolSetMismatch"
-    else:
-      message = (
-        "MCP runtime owner does not match gateway policy owner; "
-        f"hiding tools: {mismatch_summary}"
-      )
-      category = "policy_owner_mismatch"
-      error_type = "PolicyOwnerMismatch"
+    message = (
+      "MCP runtime owner does not match gateway policy owner; "
+      f"hiding tools: {mismatch_summary}"
+    )
+    category = "policy_owner_mismatch"
+    error_type = "PolicyOwnerMismatch"
     set_startup_diagnostic(
       runtime_server,
       category=category,

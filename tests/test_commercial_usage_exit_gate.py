@@ -94,10 +94,14 @@ def test_process_kill_after_insert_and_lease_loses_no_event(tmp_path) -> None:
   path = str(tmp_path / "usage.sqlite3")
   _run_process(_enqueue_then_exit, path, _payload("evt_001"))
   outbox = CommercialUsageOutbox(path)
-  assert outbox.get("evt_001").state == "pending"
+  inserted = outbox.get("evt_001")
+  assert inserted is not None
+  assert inserted.state == "pending"
 
   _run_process(_lease_then_exit, path)
-  assert outbox.get("evt_001").state == "sending"
+  leased_after_exit = outbox.get("evt_001")
+  assert leased_after_exit is not None
+  assert leased_after_exit.state == "sending"
   reclaimed = outbox.lease_batch(
     limit=1, lease_for=timedelta(seconds=10), now=NOW + timedelta(seconds=2)
   )[0]
@@ -111,7 +115,9 @@ def test_process_kill_after_remote_post_before_response_does_not_double_ingest(t
   outbox = CommercialUsageOutbox(path)
   outbox.enqueue_batch([_payload("evt_001")], created_at=NOW)
   _run_process(_post_then_die_before_response, path, str(remote), expected_exit=23)
-  assert outbox.get("evt_001").state == "sending"
+  posted = outbox.get("evt_001")
+  assert posted is not None
+  assert posted.state == "sending"
   assert len(remote.read_text(encoding="utf-8").splitlines()) == 1
 
   class DuplicateSender:
@@ -123,7 +129,9 @@ def test_process_kill_after_remote_post_before_response_does_not_double_ingest(t
     config=CommercialUsageShipperConfig(batch_size=1, lease_seconds=10, jitter_ratio=0),
   )
   asyncio.run(shipper.run_once(now=NOW + timedelta(seconds=2)))
-  assert outbox.get("evt_001").state == "accepted"
+  accepted = outbox.get("evt_001")
+  assert accepted is not None
+  assert accepted.state == "accepted"
   assert len(remote.read_text(encoding="utf-8").splitlines()) == 1
 
 
@@ -135,7 +143,9 @@ def test_process_kill_after_accept_transition_remains_accepted(tmp_path) -> None
   _run_process(
     _accept_then_exit, path, leased.event_id, leased.sending_lease_token
   )
-  assert outbox.get("evt_001").state == "accepted"
+  accepted = outbox.get("evt_001")
+  assert accepted is not None
+  assert accepted.state == "accepted"
   assert outbox.lease_batch(
     limit=1, lease_for=timedelta(seconds=10), now=NOW + timedelta(seconds=20)
   ) == []

@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable, Coroutine
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -17,6 +17,7 @@ from agent_gateway.control_run_lifecycle import (
 )
 from agent_gateway.event_adapter import adapt_control_event
 from agent_gateway.events import DEFAULT_SCHEMA_VERSION
+from agent_gateway.event_log import UserEventBus
 from agent_gateway.session import (
   AuthManager,
   GatewaySession,
@@ -102,7 +103,7 @@ async def _projected_control_event_chunks(
   pending: dict[str, Any] | None = None
   pending_started = 0.0
   next_keepalive_at = time.monotonic() + _PROJECTED_KEEPALIVE_SECONDS
-  next_entry_task: asyncio.Task[Any] | None = None
+  next_entry_task: asyncio.Future[Any] | None = None
 
   async def flush_pending() -> bytes | None:
     nonlocal pending
@@ -122,7 +123,7 @@ async def _projected_control_event_chunks(
         )
       timeout = max(0.0, min(deadlines) - now)
       if next_entry_task is None:
-        next_entry_task = asyncio.create_task(
+        next_entry_task = asyncio.ensure_future(
           subscription.__anext__()
         )
       done, _waiting = await asyncio.wait(
@@ -310,7 +311,7 @@ def _autonomous_record_is_terminated(record: Any) -> bool:
 
 async def _seed_autonomous_replay_buffer(
   *,
-  user_event_bus: Any,
+  user_event_bus: UserEventBus,
   app_state: Any,
   run_id: str | None,
 ) -> str | None:
@@ -322,12 +323,9 @@ async def _seed_autonomous_replay_buffer(
   control_run_id = getattr(record, "control_run_id", None)
   if not isinstance(control_run_id, str) or not control_run_id:
     return None
-  seed = getattr(user_event_bus, "seed_replay_buffer", None)
-  if not callable(seed):
-    return control_run_id
   events = _autonomous_replay_events_for_record(record)
   if events:
-    await seed(
+    await user_event_bus.seed_replay_buffer(
       _autonomous_record_owner_user_id(record),
       control_run_id,
       events,
@@ -338,7 +336,7 @@ async def _seed_autonomous_replay_buffer(
 
 async def _seed_batch_replay_buffer(
   *,
-  user_event_bus: Any,
+  user_event_bus: UserEventBus,
   run_id: str | None,
   user_id: str,
 ) -> str | None:
@@ -361,17 +359,7 @@ async def _seed_batch_replay_buffer(
     ) from exc
   if event is None:
     return run_id
-  publish_terminal = getattr(
-    user_event_bus,
-    "publish_terminal_if_absent",
-    None,
-  )
-  if not callable(publish_terminal):
-    raise HTTPException(
-      status_code=503,
-      detail="Batch event replay unavailable",
-    )
-  await publish_terminal(
+  await user_event_bus.publish_terminal_if_absent(
     user_id,
     run_id,
     event,
@@ -428,7 +416,7 @@ def _event_visible_to_session(
 
 
 async def _shielded_aclose(iterator: Any) -> None:
-  close = getattr(iterator, "aclose", None)
+  close: Callable[[], Coroutine[Any, Any, None]] | None = getattr(iterator, "aclose", None)
   if not callable(close):
     return
   close_task = asyncio.create_task(close())
@@ -540,7 +528,7 @@ def build_events_router(
       if projected_schema_version is not None
       else 0
     )
-    user_event_bus = getattr(
+    user_event_bus: UserEventBus | None = getattr(
       request.app.state,
       "user_event_bus",
       None,

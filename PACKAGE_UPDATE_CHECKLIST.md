@@ -4,8 +4,8 @@ Reference this checklist when adding features, fixing bugs, or changing the publ
 
 ## Always (every change)
 
-- [ ] **Tests pass** — `make test-agent-gateway` runs the gateway and CLI suites from their standalone package directories
-- [ ] **Existing consumer tests pass** — `pytest tests/test_code_execute.py tests/test_tool_dispatcher.py tests/test_channel_registry.py tests/test_run_agent.py` etc.
+- [ ] **Tests pass** — run `pytest tests` from the package root
+- [ ] **Existing consumer tests pass** — run the embedding application's focused gateway consumer tests
 - [ ] **New code has docstrings** — every new public function/class gets a docstring at write time
 
 ## When adding new public API symbols
@@ -17,7 +17,7 @@ Reference this checklist when adding features, fixing bugs, or changing the publ
 ## When adding new features
 
 - [ ] **`docs/architecture.md`** — update if the feature introduces a new concept, flow, or mental model change
-- [ ] **Tests for the feature** — unit tests in `packages/agent-gateway/tests/`, integration tests if it touches consumer wiring
+- [ ] **Tests for the feature** — unit tests in `tests/`, integration tests if it touches consumer wiring
 - [ ] **Example update or new example** — if the feature is user-facing and changes how someone would use `create_agent()` or `create_gateway_app()`
 
 ## When adding new SSE events or endpoints

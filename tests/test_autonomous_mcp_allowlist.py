@@ -36,6 +36,7 @@ def _bound_execution() -> dict[str, Any]:
   )
   return {
     "capability_execution": execution,
+    "admitted_skill_execution_limits": None,
     "capability_execution_resolver": resolver,
     "session": GatewaySession(
       session_id="autonomous-mcp-allowlist-test",

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
+from agent_gateway.capability_execution import BoundCapabilityExecution
 from agent_gateway.approval_policy import RunContext
 from agent_gateway.capability_binding import (
   CredentialHandle,
@@ -18,6 +20,8 @@ from agent_gateway.model_registry import (
 from agent_gateway.event_log import EventLog
 from agent_gateway.events import UiBlocksReadyEvent, event_from_dict, event_to_dict
 from agent_gateway.providers import AnthropicProvider
+from agent_gateway.mcp_client import McpClientManager
+from agent_gateway.runner import AgentRunner
 from agent_gateway.server import MaterializedCredential
 from agent_gateway.server_chat_helpers import _dispatch_chat_turn
 from agent_gateway.server_models import (
@@ -27,9 +31,9 @@ from agent_gateway.server_models import (
   ChatTurnInputs,
   UiBlocksContractPin,
 )
-from agent_gateway.session import GatewaySession
+from agent_gateway.session import AuthManager, GatewaySession
 from agent_gateway.tool_dispatcher import ToolDispatcher
-from agent_gateway.ui_blocks_run import UiBlocksRunRegistry
+from agent_gateway.ui_blocks_run import UiBlocksRunContext, UiBlocksRunRegistry
 
 
 _SERVICE_HANDLE = CredentialHandle(
@@ -424,16 +428,42 @@ def test_distinct_concurrent_payloads_receive_contiguous_indices() -> None:
   _run(case())
 
 
-class _NullMcp:
-  pass
+class _NullMcp(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
 
 
-class _TerminalRunner:
-  def __init__(self, event_log: EventLog, capability_execution: Any) -> None:
+class _TerminalRunner(AgentRunner):
+  def __init__(
+    self,
+    event_log: EventLog,
+    capability_execution: BoundCapabilityExecution,
+  ) -> None:
+    super().__init__(
+      event_log=event_log,
+      dispatcher=ToolDispatcher(
+        mcp_client=_NullMcp(),
+        event_log=event_log,
+        session_id="sess-ui-blocks",
+      ),
+      session_id="sess-ui-blocks",
+      capability_execution=capability_execution,
+      user_id="alice",
+      rate_table_version="test-v1",
+      billing_mode="byok",
+      channel="web",
+    )
     self._event_log = event_log
-    self.capability_execution = capability_execution
 
-  async def run(self, **_kwargs: Any) -> None:
+  async def run(
+    self,
+    messages: list[dict[str, Any]],
+    system_prompt: str | list[tuple[str, bool]] | None = None,
+    max_turns: int | None = None,
+    *,
+    resume_initial_messages: list[dict[str, Any]] | None = None,
+  ) -> None:
+    _ = messages, system_prompt, max_turns, resume_initial_messages
     self._event_log.append({"type": "stream_complete", "usage": {}})
 
 
@@ -477,10 +507,20 @@ def test_pin_and_run_object_survive_full_gateway_dispatch_chain(tmp_path) -> Non
     )
     captured: dict[str, Any] = {}
 
-    async def build_chat_runtime(*, request, **_kwargs: Any) -> ChatRuntime:
+    async def build_chat_runtime(
+      session: GatewaySession,
+      request: ChatRequest,
+      channel: str | None,
+      auth_manager: AuthManager | None,
+      *,
+      storage_root: Path | None = None,
+    ) -> ChatRuntime:
+      _ = session, channel, auth_manager
       captured["request"] = request
       capability_bind = request.capability_bind
       assert capability_bind is not None
+      capability_execution = request.capability_execution
+      assert capability_execution is not None
       run_context = RunContext(
         user_id="alice",
         request_id=str(request.request_id),
@@ -502,9 +542,9 @@ def test_pin_and_run_object_survive_full_gateway_dispatch_chain(tmp_path) -> Non
         system_prompt="test",
         build_runner=lambda event_log, _sid, _started_at: _TerminalRunner(
           event_log,
-          request.capability_execution,
+          capability_execution,
         ),
-        capability_execution=request.capability_execution,
+        capability_execution=capability_execution,
       )
 
     _configure_runtime_builder(build_chat_runtime)
@@ -544,17 +584,27 @@ def test_unpinned_dispatch_has_none_capability_and_turn_keys_are_per_dispatch(tm
     session = _session()
     captured_runs = []
 
-    async def build_chat_runtime(*, request, **_kwargs: Any) -> ChatRuntime:
+    async def build_chat_runtime(
+      active_session: GatewaySession,
+      request: ChatRequest,
+      channel: str | None,
+      auth_manager: AuthManager | None,
+      *,
+      storage_root: Path | None = None,
+    ) -> ChatRuntime:
+      _ = active_session, channel, auth_manager
       captured_runs.append(request._ui_blocks_run)
       capability_bind = request.capability_bind
       assert capability_bind is not None
+      capability_execution = request.capability_execution
+      assert capability_execution is not None
       return ChatRuntime(
         system_prompt="test",
         build_runner=lambda event_log, _sid, _started_at: _TerminalRunner(
           event_log,
-          request.capability_execution,
+          capability_execution,
         ),
-        capability_execution=request.capability_execution,
+        capability_execution=capability_execution,
       )
 
     _configure_runtime_builder(build_chat_runtime)
@@ -589,36 +639,59 @@ def test_turn_key_and_registry_survive_stream_retry_event(tmp_path) -> None:
   async def case() -> None:
     captured: dict[str, Any] = {}
 
-    class RetryRunner:
+    class RetryRunner(_TerminalRunner):
       def __init__(
         self,
         event_log: EventLog,
-        ui_run,
-        capability_execution: Any,
+        ui_run: UiBlocksRunContext,
+        capability_execution: BoundCapabilityExecution,
       ) -> None:
-        self.event_log = event_log
+        super().__init__(event_log, capability_execution)
         self.ui_run = ui_run
-        self.capability_execution = capability_execution
 
-      async def run(self, **_kwargs: Any) -> None:
+      async def run(
+        self,
+        messages: list[dict[str, Any]],
+        system_prompt: str | list[tuple[str, bool]] | None = None,
+        max_turns: int | None = None,
+        *,
+        resume_initial_messages: list[dict[str, Any]] | None = None,
+      ) -> None:
+        _ = messages, system_prompt, max_turns, resume_initial_messages
         captured["before_retry"] = self.ui_run
-        self.event_log.append({"type": "stream_retry", "attempt": 1, "error": "retry"})
+        self._event_log.append({
+          "type": "stream_retry",
+          "attempt": 1,
+          "error": "retry",
+        })
         await asyncio.sleep(0)
         captured["after_retry"] = self.ui_run
-        self.event_log.append({"type": "stream_complete", "usage": {}})
+        self._event_log.append({"type": "stream_complete", "usage": {}})
 
-    async def build_chat_runtime(*, request, **_kwargs: Any) -> ChatRuntime:
+    async def build_chat_runtime(
+      session: GatewaySession,
+      request: ChatRequest,
+      channel: str | None,
+      auth_manager: AuthManager | None,
+      *,
+      storage_root: Path | None = None,
+    ) -> ChatRuntime:
+      _ = session, channel, auth_manager
       captured["request_run"] = request._ui_blocks_run
       capability_bind = request.capability_bind
+      ui_run = request._ui_blocks_run
+      assert ui_run is not None
       assert capability_bind is not None
+      capability_execution = request.capability_execution
+      assert capability_execution is not None
       return ChatRuntime(
         system_prompt="test",
         build_runner=lambda event_log, _sid, _started_at: RetryRunner(
           event_log,
-          request._ui_blocks_run,
-          request.capability_execution,
+          ui_run,
+          capability_execution,
         ),
-        capability_execution=request.capability_execution,
+        capability_execution=capability_execution,
       )
 
     _configure_runtime_builder(build_chat_runtime)

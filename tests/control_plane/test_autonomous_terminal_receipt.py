@@ -1,60 +1,88 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
+from pathlib import Path
 
+from agent_gateway.autonomous_launch_envelope import AutonomousControlAuthority
+from agent_gateway.autonomous_runner import AutonomousTask
+from agent_gateway.capability_binding import CapabilityBind
+from agent_gateway.skill_limits import SkillExecutionLimits
 from agent_gateway.control_plane.runs_helpers import (
   _autonomous_result_refs,
   _autonomous_run_from_task,
   _autonomous_terminal_receipt,
 )
 
+from .manifest_helpers import write_v6_manifest
+
 
 def _run_record(
+  tmp_path: Path,
   *,
   state: str,
   completed_at: float | None,
   exit_code: int | None,
   error: str | None,
+  terminal_reason: str | None = None,
+  control_run_id: str = "bg_1",
   events: list[dict] | None = None,
-) -> SimpleNamespace:
-  return SimpleNamespace(
+) -> AutonomousTask:
+  manifest = write_v6_manifest(
+    tmp_path / "autonomous",
+    "bg_1",
+  )
+  return AutonomousTask(
     task_id="bg_1",
-    control_run_id="bg_1",
+    control_run_id=control_run_id,
+    session_id="bg_1",
+    channel_id=manifest["channel_id"],
     user_id="user-1",
+    user_email="user@example.com",
+    role="owner",
+    profile="analyst",
+    mode="skill",
+    task=None,
+    skill="thesis-review",
+    pack=None,
+    deliver=True,
+    context=None,
+    ticker="FOO",
+    channel="cli",
+    dev_mode=False,
+    dispatch_scope=None,
+    cmd=list(manifest["cmd"]),
+    log_path=Path(manifest["log_path"]),
+    operator_inbox_path=Path(manifest["operator_inbox_path"]),
+    approval_decisions_path=None,
+    control_authority=AutonomousControlAuthority.from_receipt(
+      manifest["control_authority"]
+    ),
+    owner_lease_path=Path(manifest["owner_lease_path"]),
+    owner_lease_device=manifest["owner_lease_device"],
+    owner_lease_inode=manifest["owner_lease_inode"],
+    started_at=1784980000,
+    skill_resume_allowed=False,
+    admitted_skill_execution_limits=SkillExecutionLimits(None, None, None),
+    state=state,
+    completed_at=completed_at,
+    exit_code=exit_code,
+    error=error,
+    terminal_reason=terminal_reason,
+    event_lines=list(events or []),
     owner_user_id="user-1",
     raw_user_id="raw-user-1",
     user_slug="user-1",
     risk_user_id=1,
-    user_email="user@example.com",
     user_aliases=["user-1"],
     identity_status="resolved",
-    profile="analyst",
-    mode="skill",
-    skill="thesis-review",
-    task=None,
-    ticker="FOO",
-    channel="cli",
-    state=state,
-    started_at=1784980000,
-    completed_at=completed_at,
-    exit_code=exit_code,
-    error=error,
-    terminal_reason=None,
-    max_budget_usd=10.0,
-    event_lines=list(events or []),
-    operator_inbox_path=None,
-    proc=None,
-    capability_bind=None,
-    execution_transport=None,
-    resumed_from=None,
-    resumed_as=[],
-    dispatch_scope=None,
-    schedule_id=None,
-    schedule_name=None,
+    capability_bind=CapabilityBind.model_validate(
+      manifest["capability_bind"]
+    ),
   )
 
 
-def test_terminal_receipt_is_exact_and_carries_stable_result_references() -> None:
+def test_terminal_receipt_is_exact_and_carries_stable_result_references(
+  tmp_path: Path,
+) -> None:
   events = [
     {
       "type": "skill_result_captured",
@@ -70,12 +98,13 @@ def test_terminal_receipt_is_exact_and_carries_stable_result_references() -> Non
       "output_memory_file": "skills/review/output.md",
     },
   ]
-  record = SimpleNamespace(
-    control_run_id="bg/receipt 1",
+  record = _run_record(
+    tmp_path,
+    state="completed",
     completed_at=1784980800,
     exit_code=0,
     error=None,
-    terminal_reason=None,
+    control_run_id="bg/receipt 1",
   )
 
   receipt = _autonomous_terminal_receipt(
@@ -123,13 +152,15 @@ def test_terminal_receipt_is_exact_and_carries_stable_result_references() -> Non
   }
 
 
-def test_terminal_receipt_is_absent_until_record_is_settled() -> None:
-  record = SimpleNamespace(
-    control_run_id="bg_1",
+def test_terminal_receipt_is_absent_until_record_is_settled(
+  tmp_path: Path,
+) -> None:
+  record = _run_record(
+    tmp_path,
+    state="running",
     completed_at=None,
     exit_code=None,
     error=None,
-    terminal_reason=None,
   )
 
   assert _autonomous_terminal_receipt(
@@ -144,9 +175,12 @@ def test_terminal_receipt_is_absent_until_record_is_settled() -> None:
   ) is None
 
 
-def test_terminal_receipt_carries_typed_writer_lease_reason() -> None:
-  record = SimpleNamespace(
-    control_run_id="bg_1",
+def test_terminal_receipt_carries_typed_writer_lease_reason(
+  tmp_path: Path,
+) -> None:
+  record = _run_record(
+    tmp_path,
+    state="completed",
     completed_at=1784980800,
     exit_code=0,
     error=None,
@@ -163,9 +197,12 @@ def test_terminal_receipt_carries_typed_writer_lease_reason() -> None:
   assert receipt.terminal_reason == "writer_lease_already_held"
 
 
-def test_run_projection_exposes_exact_failed_receipt_and_nonterminal_none() -> None:
+def test_run_projection_exposes_exact_failed_receipt_and_nonterminal_none(
+  tmp_path: Path,
+) -> None:
   failed = _autonomous_run_from_task(
     _run_record(
+      tmp_path,
       state="failed",
       completed_at=1784980800,
       exit_code=75,
@@ -208,6 +245,7 @@ def test_run_projection_exposes_exact_failed_receipt_and_nonterminal_none() -> N
 
   running = _autonomous_run_from_task(
     _run_record(
+      tmp_path,
       state="running",
       completed_at=None,
       exit_code=None,

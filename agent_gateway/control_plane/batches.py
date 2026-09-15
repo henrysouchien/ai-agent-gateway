@@ -11,28 +11,37 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request
 
+from agent_gateway.approval_route import (
+  DurableLocalApprovalRoute,
+  bind_session_approval_route,
+)
+from agent_gateway.approval_policy import ApprovalRequest
 from agent_gateway.approvals import (
   ApprovalActionError,
   _cancel_pending_approval_and_unblock,
   _release_cancelled_approval,
 )
 from agent_gateway.batch_approval_projection import (
+  ApprovalProjection,
   BatchApprovalProjectionRegistry,
   BatchApprovalScope,
+  BoundApprovalAuthorizationSubject,
   approval_record_matches_projection,
   bind_batch_approval_scope,
 )
-from agent_gateway.capability_binding import (
+from ..capability_binding import (
   AuthContext,
   CapabilityBind,
   CredentialHandle,
+  SESSION_DRIVER_CAPABILITY,
 )
 from agent_gateway.capability_execution import (
   BoundCapabilityExecution,
+  CapabilityAdapterResolver,
   CapabilityExecutionResolver,
   MaterializedCredential,
 )
@@ -54,15 +63,6 @@ from .corpus_readiness import (
 )
 from .runs import _require_bearer_session, _require_control_session, _session_owner_user_id
 
-_BATCH_CONTROLLER_MODULE_NAMES = frozenset({"agent", "agent.batch", "agent.batch.controller"})
-_BATCH_FINALIZATION_MODULE_NAMES = frozenset({
-  "agent",
-  "agent.batch",
-  "agent.batch.controller_finalization",
-})
-_BATCH_REGISTRY_MODULE_NAMES = frozenset({"agent", "agent.batch", "agent.batch.registry"})
-_BATCH_WORKFLOW_MODULE_NAMES = frozenset({"agent", "agent.skills", "agent.skills.diligence_tracks"})
-_MEMORY_MODULE_NAMES = frozenset({"memory"})
 _TERMINAL_BATCH_STATUSES = frozenset({
   "completed",
   "failed",
@@ -77,6 +77,60 @@ _DURABLE_CORPUS_REJECTION_CODES = frozenset({
 })
 log = logging.getLogger("agent_gateway.control_plane.batches")
 _SERVICE_BATCH_SESSION_LIFETIME_SECONDS = 24 * 60 * 60
+
+
+class _PublishBatchTerminalEvent(Protocol):
+  async def __call__(
+    self,
+    user_id: str,
+    control_run_id: str,
+    event: dict[str, Any],
+  ) -> bool: ...
+
+class BatchCancellationStore(Protocol):
+  """Durable lookup called by the batch cancellation authorization gate."""
+
+  async def get(
+    self,
+    approval_id: str,
+  ) -> ApprovalRequest | None: ...
+
+
+class BatchCancellationPolicy(Protocol):
+  """Role check called by the batch cancellation authorization gate."""
+
+  def role_authorized_for_class(
+    self,
+    *,
+    decider_role: str | None,
+    tool_class: str,
+  ) -> bool: ...
+
+
+class _BatchCancellationProjection(Protocol):
+  @property
+  def approval_id(self) -> str: ...
+
+  @property
+  def run_id(self) -> str: ...
+
+  @property
+  def owner_user_id(self) -> str: ...
+
+  @property
+  def channel(self) -> str | None: ...
+
+  @property
+  def tool_call_id(self) -> str: ...
+
+  @property
+  def session_id(self) -> str: ...
+
+  @property
+  def store(self) -> BatchCancellationStore | None: ...
+
+  @property
+  def policy(self) -> BatchCancellationPolicy | None: ...
 
 
 @dataclass
@@ -204,7 +258,10 @@ class BatchTaskRegistry:
           batch_id=key[1],
         )
       )
-      authorization_by_id = {
+      authorization_by_id: dict[
+        str,
+        BoundApprovalAuthorizationSubject | ApprovalProjection,
+      ] = {
         subject.approval_id: subject
         for subject in bound_subjects
       }
@@ -287,7 +344,11 @@ class BatchTaskRegistry:
     ):
       raise ValueError("batch terminal event requires owner_user_id and positive batch_id")
     self._key(owner_user_id, batch_id)
-    return await _publish_batch_terminal_event(app_state, event)
+    return await _publish_batch_terminal_event_for_user(
+      _require_batch_user_event_bus(app_state),
+      event,
+      user_id=owner_user_id,
+    )
 
   async def shutdown(self, *, app_state: Any | None = None) -> None:
     _ = app_state
@@ -491,7 +552,9 @@ def build_batches_router(*, auth: AuthManager) -> APIRouter:
   async def list_batch_workflows(request: Request) -> dict[str, Any]:
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
-    return {"workflows": _batch_workflow_catalog()}
+    return {
+      "workflows": _batch_workflow_catalog(request.app.state)
+    }
 
   @router.get("/{batch_id}")
   async def get_batch(
@@ -738,7 +801,7 @@ def _batch_capability_execution_context(
           "selected batch session credential has no credential material"
         )
 
-  session_driver_policy = selection_policy.capabilities["session.driver"]
+  session_driver_policy = selection_policy.capabilities[SESSION_DRIVER_CAPABILITY]
 
   auth_context = AuthContext(
     run_mode="batch",
@@ -746,7 +809,7 @@ def _batch_capability_execution_context(
     tenant_id=tenant_id,
     user_provider_handles=user_handles,
     service_provider_handles=service_handles,
-    entitled_capabilities=frozenset({"session.driver"}),
+    entitled_capabilities=frozenset({SESSION_DRIVER_CAPABILITY}),
     entitled_model_keys=session_driver_policy.allowed_model_keys,
     run_scoped_user_providers=frozenset(run_scoped_user_providers),
   )
@@ -755,7 +818,7 @@ def _batch_capability_execution_context(
     "service_auth_config_resolver",
     None,
   )
-  adapter_resolver = getattr(
+  adapter_resolver: CapabilityAdapterResolver | None = getattr(
     gateway_config,
     "capability_adapter_resolver",
     None,
@@ -813,7 +876,7 @@ def _batch_capability_execution_context(
   execution = (
     resolver.materialize_bind(required_bind)
     if required_bind is not None
-    else resolver.resolve("session.driver")
+    else resolver.resolve(SESSION_DRIVER_CAPABILITY)
   )
   if execution.bind.run_mode != "batch":
     raise RuntimeError("batch session.driver resolved with the wrong run mode")
@@ -856,7 +919,7 @@ def build_service_batch_session(
       "service batch execution must be BoundCapabilityExecution"
     )
   session_driver_execution.validate()
-  if session_driver_execution.bind.capability_id != "session.driver":
+  if session_driver_execution.bind.capability_id != SESSION_DRIVER_CAPABILITY:
     raise ValueError(
       "service batch execution must bind session.driver"
     )
@@ -1025,7 +1088,7 @@ async def dispatch_batch_in_process(
   if required_bind is not None:
     if not isinstance(required_bind, CapabilityBind):
       raise TypeError("required_bind must be CapabilityBind")
-    if required_bind.capability_id != "session.driver":
+    if required_bind.capability_id != SESSION_DRIVER_CAPABILITY:
       raise ValueError("batch retry requires a session.driver bind")
     if required_bind.run_mode != "batch":
       raise ValueError("batch retry requires a batch-mode bind")
@@ -1349,6 +1412,13 @@ def _acquire_and_start_batch(
   storage_root = getattr(app_state, "autonomous_storage_root", None)
   if not isinstance(storage_root, Path):
     raise RuntimeError("batch autonomous storage root is unavailable")
+  skill_application = getattr(
+    app_state,
+    "gateway_skill_application",
+    None,
+  )
+  if skill_application is None:
+    raise RuntimeError("batch compiled skill application is unavailable")
 
   try:
     batch_id, _user_id, _user_email = _controller().acquire_batch_run(
@@ -1358,7 +1428,8 @@ def _acquire_and_start_batch(
       pid=os.getpid(),
       dispatch_key=dispatch_key,
       dispatch_request_spec=dispatch_request_spec,
-      capability_bind=session_driver_execution.bind.receipt(),
+      capability_bind=session_driver_execution.bind.to_json(),
+      skill_application=skill_application,
       user_id=user_id,
       user_email=user_email,
     )
@@ -1368,30 +1439,36 @@ def _acquire_and_start_batch(
     raise
   except (TypeError, ValueError) as exc:
     raise _BatchDispatchValidationError(str(exc)) from exc
-  approval_store = getattr(app_state, "gateway_approval_store", None)
-  approval_policy = getattr(app_state, "gateway_approval_policy", None)
+  # One decision, stamped on the batch's own durable owner session: this
+  # process either owns the ledger a batch approval is recorded in or it does
+  # not. Each run's route is folded from this scope at admission.
+  approval_route = bind_session_approval_route(
+    parent_session,
+    getattr(app_state, "gateway_approval_store", None),
+    getattr(app_state, "gateway_approval_policy", None),
+  )
   scope = (
     BatchApprovalScope(
       batch_id=batch_id,
       owner_user_id=user_id,
       channel=channel,
-      store=approval_store,
-      policy=approval_policy,
+      store=approval_route.store,
+      policy=approval_route.policy,
       registry=task_registry.approval_projections,
     )
-    if approval_store is not None and approval_policy is not None
+    if isinstance(approval_route, DurableLocalApprovalRoute)
     else None
   )
 
   run_id = f"batch_{batch_id}"
 
   def _create_batch_task() -> asyncio.Task[Any]:
-    async def _captured_run_admission_factory(
+    async def _captured_run_context_factory(
       *,
       task_id: str,
       session_driver_execution: BoundCapabilityExecution,
     ) -> Any:
-      return await _controller().admit_in_process_runtime_authority(
+      return await _captured_run_opener()(
         parent_session=parent_session,
         origin="batch" if scope is not None else "service",
         run_id=run_id,
@@ -1412,9 +1489,10 @@ def _acquire_and_start_batch(
         _on_finalize=None,
         capability_execution_resolver=capability_execution_resolver,
         session_driver_execution=session_driver_execution,
-        captured_run_admission_factory=(
-          _captured_run_admission_factory
+        captured_run_context_factory=(
+          _captured_run_context_factory
         ),
+        skill_application=skill_application,
       )
     )
 
@@ -1797,7 +1875,7 @@ async def _preflight_batch_approval_cancellation(
 
 async def _authorize_batch_projection_for_user_cancellation(
   *,
-  projection: Any,
+  projection: _BatchCancellationProjection,
   authenticated: Any,
 ) -> None:
   if projection.store is None or projection.policy is None:
@@ -1863,12 +1941,24 @@ def read_batch_for_user(batch_id: int, *, user_id: str, top_n: int = 10) -> dict
 
 
 def _retry_spec(batch_row: dict[str, Any], tickers: list[str]) -> dict[str, Any]:
+  # spec_json is written by the batch registry at admission (json.dumps of a dict in
+  # BatchRegistry.acquire_batch), so a parse failure here is corrupt internal state,
+  # never a client error.
+  batch_id = batch_row.get("batch_id")
   try:
     spec = json.loads(str(batch_row.get("spec_json") or "{}"))
   except json.JSONDecodeError as exc:
-    raise HTTPException(status_code=422, detail="prior batch spec is not valid JSON") from exc
+    log.error("batch %s spec_json in registry is not valid JSON", batch_id, exc_info=True)
+    raise HTTPException(
+      status_code=500,
+      detail=f"stored spec for batch {batch_id} is corrupt (invalid JSON)",
+    ) from exc
   if not isinstance(spec, dict):
-    raise HTTPException(status_code=422, detail="prior batch spec is not an object")
+    log.error("batch %s spec_json in registry is not a JSON object", batch_id)
+    raise HTTPException(
+      status_code=500,
+      detail=f"stored spec for batch {batch_id} is corrupt (not an object)",
+    )
   spec = dict(spec)
   _set_retry_universe(spec, tickers)
   return spec
@@ -1884,7 +1974,7 @@ def _batch_bind_from_row(batch_row: dict[str, Any]) -> CapabilityBind:
       detail="prior batch has no durable capability bind; retry is blocked",
     )
   try:
-    return CapabilityBind.from_receipt(raw_bind)
+    return CapabilityBind.from_json(raw_bind)
   except (TypeError, ValueError) as exc:
     raise HTTPException(
       status_code=409,
@@ -1953,7 +2043,8 @@ def _force_rerun_retry_spec(batch: dict[str, Any], *, ticker: str) -> dict[str, 
     spec = {}
   retry_spec = dict(spec)
   _set_retry_universe(retry_spec, [ticker] if ticker else [])
-  gates = retry_spec.get("gates") if isinstance(retry_spec.get("gates"), dict) else {}
+  gates_value = retry_spec.get("gates")
+  gates = gates_value if isinstance(gates_value, dict) else {}
   retry_spec["gates"] = {**gates, "force_rerun_existing": True}
   retry_spec["force_rerun_existing"] = True
   return retry_spec
@@ -1977,21 +2068,27 @@ def _set_status_if_not_terminal(registry: Any, batch_id: int, status: str, *, er
     return
 
 
-async def _publish_batch_terminal_event(app_state: Any, event: dict[str, Any]) -> bool:
+def _require_batch_user_event_bus(app_state: Any) -> object:
   user_event_bus = getattr(app_state, "user_event_bus", None)
   if user_event_bus is None:
     raise RuntimeError("batch terminal event bus authority is unavailable")
+  return user_event_bus
+
+
+async def _publish_batch_terminal_event_for_user(
+  user_event_bus: object,
+  event: dict[str, Any],
+  *,
+  user_id: str,
+) -> bool:
   batch_id = event.get("batch_id")
   control_run_id = str(event.get("control_run_id") or f"batch_{batch_id}")
-  user_id = str(event.get("user_id") or "").strip()
-  if not user_id:
-    return
   payload = dict(event)
   payload.setdefault("type", "run_state_changed")
   payload.setdefault("run_id", control_run_id)
   payload.setdefault("control_run_id", control_run_id)
   payload.setdefault("ts", time.time())
-  publish_terminal = getattr(
+  publish_terminal: _PublishBatchTerminalEvent | None = getattr(
     user_event_bus,
     "publish_terminal_if_absent",
     None,
@@ -2002,6 +2099,21 @@ async def _publish_batch_terminal_event(app_state: Any, event: dict[str, Any]) -
     user_id,
     control_run_id,
     payload,
+  )
+
+
+async def _publish_batch_terminal_event(
+  app_state: Any,
+  event: dict[str, Any],
+) -> bool | None:
+  user_event_bus = _require_batch_user_event_bus(app_state)
+  user_id = str(event.get("user_id") or "").strip()
+  if not user_id:
+    return None
+  return await _publish_batch_terminal_event_for_user(
+    user_event_bus,
+    event,
+    user_id=user_id,
   )
 
 
@@ -2032,116 +2144,73 @@ def terminal_batch_event_for_user(
 
 
 def _registry_for_user(user_id: str):
-  try:
-    from memory import get_workspace_dir
-    from agent.batch.registry import BatchRegistry
-  except ModuleNotFoundError as exc:
-    if exc.name not in _MEMORY_MODULE_NAMES | _BATCH_REGISTRY_MODULE_NAMES:
-      raise
-    from api.memory import get_workspace_dir
-    from api.agent.batch.registry import BatchRegistry
+  from memory import get_workspace_dir
+  from agent.batch.registry import BatchRegistry
 
   return BatchRegistry(Path(get_workspace_dir(user_id)) / "batch_registry.db")
 
 
-def _read_only_registry_for_user(user_id: str):
-  """Open the already-initialized batch registry without bootstrap writes."""
-
-  try:
-    from memory import get_workspace_path
-    from agent.batch.registry import BatchRegistry
-  except ModuleNotFoundError as exc:
-    if exc.name not in _MEMORY_MODULE_NAMES | _BATCH_REGISTRY_MODULE_NAMES:
-      raise
-    from api.memory import get_workspace_path
-    from api.agent.batch.registry import BatchRegistry
-
-  return BatchRegistry(
-    Path(get_workspace_path(user_id)) / "batch_registry.db",
-    read_only=True,
-  )
-
-
 def _controller():
-  try:
-    from agent.batch import controller
-  except ModuleNotFoundError as exc:
-    if exc.name not in _BATCH_CONTROLLER_MODULE_NAMES:
-      raise
-    from api.agent.batch import controller
+  from agent.batch import controller
 
   return controller
+
+
+def _captured_run_opener():
+  from agent.autonomous.captured_run_context import (
+    open_captured_run_context,
+  )
+
+  return open_captured_run_context
 
 
 def _batch_terminal_event_payload_from_digest(
   batch_id: int,
   digest: dict[str, Any],
 ) -> dict[str, Any]:
-  try:
-    from agent.batch.controller_finalization import (
-      batch_terminal_event_payload_from_digest,
-    )
-  except ModuleNotFoundError as exc:
-    if exc.name not in _BATCH_FINALIZATION_MODULE_NAMES:
-      raise
-    from api.agent.batch.controller_finalization import (
-      batch_terminal_event_payload_from_digest,
-    )
+  from agent.batch.controller_finalization import (
+    batch_terminal_event_payload_from_digest,
+  )
 
   return batch_terminal_event_payload_from_digest(batch_id, digest)
 
 
-def _batch_workflow_catalog() -> dict[str, Any]:
-  try:
-    from agent.skills.diligence_tracks import batch_workflow_catalog
-  except ModuleNotFoundError as exc:
-    if exc.name not in _BATCH_WORKFLOW_MODULE_NAMES:
-      raise
-    from api.agent.skills.diligence_tracks import batch_workflow_catalog
-
-  return batch_workflow_catalog()
+def _batch_workflow_catalog(app_state: Any) -> dict[str, Any]:
+  skill_application = getattr(
+    app_state,
+    "gateway_skill_application",
+    None,
+  )
+  if skill_application is None:
+    raise RuntimeError("batch compiled skill application is unavailable")
+  workflows = _controller().batch_workflow_catalog(
+    skill_application=skill_application,
+  )
+  if type(workflows) is not dict:
+    raise TypeError("batch workflow catalog must be an exact dict")
+  return workflows
 
 
 def _active_batch_error_type():
-  try:
-    from agent.batch.registry import ActiveBatchError
-  except ModuleNotFoundError as exc:
-    if exc.name not in _BATCH_REGISTRY_MODULE_NAMES:
-      raise
-    from api.agent.batch.registry import ActiveBatchError
+  from agent.batch.registry import ActiveBatchError
 
   return ActiveBatchError
 
 
 def _batch_dispatch_replay_type():
-  try:
-    from agent.batch.registry import BatchDispatchReplay
-  except ModuleNotFoundError as exc:
-    if exc.name not in _BATCH_REGISTRY_MODULE_NAMES:
-      raise
-    from api.agent.batch.registry import BatchDispatchReplay
+  from agent.batch.registry import BatchDispatchReplay
 
   return BatchDispatchReplay
 
 
 def _batch_dispatch_rejected_type():
-  try:
-    from agent.batch.registry import BatchDispatchRejected
-  except ModuleNotFoundError as exc:
-    if exc.name not in _BATCH_REGISTRY_MODULE_NAMES:
-      raise
-    from api.agent.batch.registry import BatchDispatchRejected
+  from agent.batch.registry import BatchDispatchRejected
 
   return BatchDispatchRejected
 
 
 def _batch_dispatch_rejection_record_type():
-  try:
-    from agent.batch.registry import BatchDispatchRejection
-  except ModuleNotFoundError as exc:
-    if exc.name not in _BATCH_REGISTRY_MODULE_NAMES:
-      raise
-    from api.agent.batch.registry import BatchDispatchRejection
+  from agent.batch.registry import BatchDispatchRejection
 
   return BatchDispatchRejection
 

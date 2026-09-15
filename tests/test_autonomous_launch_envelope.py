@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import hashlib
 import hmac
 import json
 from pathlib import Path
-from typing import Any
+from typing import Literal, TypedDict
 
 import pytest
 
@@ -15,6 +16,7 @@ from agent_gateway.autonomous_launch_envelope import (
   AUTONOMOUS_RUNTIME_SESSION_PURPOSE,
   AutonomousControlAuthority,
   AutonomousDispatchScope,
+  AutonomousLaunchEnvelope,
   AutonomousLaunchWorkload,
   AutonomousSessionAuthority,
   OrdinaryAutonomousSessionAuthority,
@@ -24,8 +26,11 @@ from agent_gateway.autonomous_launch_envelope import (
 from agent_gateway.capability_binding import (
   CapabilityBind,
   CredentialHandle,
+  CredentialPrincipal,
+  RunMode,
 )
 from agent_gateway.session import GatewaySession
+from agent_gateway.skill_limits import SkillExecutionLimits
 from agent_gateway.agent_session_log_layout import (
   AutonomousSessionLogAuthority,
 )
@@ -36,22 +41,46 @@ _NOW_NS = 1_800_000_000_000_000_000
 _NONCE = "0123456789abcdef0123456789abcdef"
 _CHANNEL_ID = "12" * 32
 
+class _DefaultOverride:
+  pass
 
-def _control_authority() -> AutonomousControlAuthority:
+
+class _WorkloadOverrides(TypedDict, total=False):
+  profile: str
+  mode: Literal["run_once", "task", "skill", "pack"]
+  task: str | None
+  skill: str | None
+  pack: str | None
+  context: str | None
+  ticker: str | None
+  dev_mode: bool
+  max_budget_usd: float | None
+  deliver: bool
+  admitted_skill_execution_limits: SkillExecutionLimits | None
+
+
+class _ControlAuthorityOverrides(TypedDict, total=False):
+  admission_ledger_path: str
+  operator_inbox_path: str
+
+
+_DEFAULT_OVERRIDE = _DefaultOverride()
+
+
+
+def _control_authority(
+  *,
+  admission_ledger_path: str = "/tmp/autonomous-admissions.sqlite3",
+  operator_inbox_path: str = "/tmp/bg_7.operator-messages.jsonl",
+) -> AutonomousControlAuthority:
   return AutonomousControlAuthority(
     control_mode="file",
-    admission_ledger_path="/tmp/autonomous-admissions.sqlite3",
+    admission_ledger_path=admission_ledger_path,
     admission_ledger_device=1,
     admission_ledger_inode=10,
-    operator_inbox_path="/tmp/bg_7.operator-messages.jsonl",
+    operator_inbox_path=operator_inbox_path,
     operator_inbox_device=1,
     operator_inbox_inode=11,
-    approval_decisions_path="/tmp/bg_7.approval-decisions.jsonl",
-    approval_decisions_device=1,
-    approval_decisions_inode=12,
-    approval_store_path="/tmp/autonomous-approvals.sqlite3",
-    approval_store_device=1,
-    approval_store_inode=13,
   )
 
 
@@ -64,19 +93,13 @@ def _memory_control_authority() -> AutonomousControlAuthority:
     operator_inbox_path=None,
     operator_inbox_device=None,
     operator_inbox_inode=None,
-    approval_decisions_path=None,
-    approval_decisions_device=None,
-    approval_decisions_inode=None,
-    approval_store_path=None,
-    approval_store_device=None,
-    approval_store_inode=None,
   )
 
 
 def _workload(
   *,
   profile: str = "analyst",
-  mode: str = "run_once",
+  mode: Literal["run_once", "task", "skill", "pack"] = "run_once",
   task: str | None = None,
   skill: str | None = None,
   pack: str | None = None,
@@ -85,18 +108,27 @@ def _workload(
   dev_mode: bool = False,
   max_budget_usd: float | None = None,
   deliver: bool = True,
+  admitted_skill_execution_limits: SkillExecutionLimits | None = None,
 ) -> AutonomousLaunchWorkload:
+  if mode == "skill" and admitted_skill_execution_limits is None:
+    admitted_skill_execution_limits = SkillExecutionLimits(
+      20,
+      32_000,
+      20.0,
+    )
   return AutonomousLaunchWorkload(
     profile=profile,
-    mode=mode,  # type: ignore[arg-type]
+    mode=mode,
     task=task,
     skill=skill,
     pack=pack,
     context=context,
     ticker=ticker,
+    research_file_id=None,
     dev_mode=dev_mode,
     max_budget_usd=max_budget_usd,
     deliver=deliver,
+    admitted_skill_execution_limits=admitted_skill_execution_limits,
     session_log_authority=AutonomousSessionLogAuthority(
       layout="v1",
       provider_session_epoch=None,
@@ -117,8 +149,8 @@ def _workload(
 
 def _bind(
   *,
-  principal: str = "service",
-  run_mode: str = "autonomous",
+  principal: CredentialPrincipal = "service",
+  run_mode: RunMode = "autonomous",
 ) -> CapabilityBind:
   return CapabilityBind(
     schema_version="1.0",
@@ -130,13 +162,13 @@ def _bind(
     protocol_profile="messages.standard",
     route="anthropic.public",
     effort="high",
-    credential_principal=principal,  # type: ignore[arg-type]
+    credential_principal=principal,
     credential_ref=(
       "autonomous-user:test-handle"
       if principal == "user"
       else "autonomous-service:test-handle"
     ),
-    run_mode=run_mode,  # type: ignore[arg-type]
+    run_mode=run_mode,
     registry_revision="test-registry-1",
     policy_revision="test-policy-1",
     selection_source="capability_default",
@@ -146,7 +178,7 @@ def _bind(
 def _credential_handle(
   *,
   tenant_id: str = "tenant-ordinary",
-  principal: str = "user",
+  principal: CredentialPrincipal = "user",
 ) -> CredentialHandle:
   return CredentialHandle(
     handle_id=(
@@ -155,7 +187,7 @@ def _credential_handle(
       else "autonomous-service:test-handle"
     ),
     provider="anthropic",
-    principal=principal,  # type: ignore[arg-type]
+    principal=principal,
     tenant_id=tenant_id,
     actor_id="42" if principal == "user" else None,
   )
@@ -165,7 +197,7 @@ def _ordinary_session_authority(
   *,
   bind: CapabilityBind | None = None,
   dispatch_scope: AutonomousDispatchScope | None = None,
-  role: object = "owner",
+  role: str = "owner",
 ) -> AutonomousSessionAuthority:
   resolved_bind = bind or _bind()
   handle = _credential_handle(
@@ -182,7 +214,7 @@ def _ordinary_session_authority(
       expires_at=1_800_000_600,
       user_email="owner@example.test",
       risk_user_id=7,
-      role=role,  # type: ignore[arg-type]
+      role=role,
       kind="chat",
       channel="cli",
       purpose=AUTONOMOUS_RUNTIME_SESSION_PURPOSE,
@@ -207,44 +239,69 @@ def test_ordinary_authority_accepts_invite_role_exactly() -> None:
 
 @pytest.mark.parametrize("role", ["Owner", " owner ", "OWNER", "", None, True])
 def test_ordinary_authority_rejects_malformed_role(role: object) -> None:
+  receipt = _ordinary_session_authority().receipt()
+  receipt["ordinary_authority"]["role"] = role
   with pytest.raises(ValueError, match="role must be exactly"):
-    _ordinary_session_authority(role=role)
+    AutonomousSessionAuthority.from_receipt(receipt)
 
 
-def _signed(**overrides: object) -> str:
-  bind = overrides.get("bind", _bind())
-  assert isinstance(bind, CapabilityBind)
-  if "session_authority" in overrides:
-    session_authority = overrides["session_authority"]
-  else:
-    session_authority = _ordinary_session_authority(bind=bind)
-  kwargs: dict[str, object] = {
-    "task_id": "bg_7",
-    "control_run_id": "run-7",
-    "owner_user_id": "42",
-    "channel_id": _CHANNEL_ID,
-    "bind": bind,
-    "workload": _workload(),
-    "control_authority": _control_authority(),
-    "session_authority": session_authority,
-    "ttl_seconds": 60,
-    "now_ns": _NOW_NS,
-    "nonce": _NONCE,
-  }
-  kwargs.update(overrides)
-  return sign_autonomous_launch_envelope(  # type: ignore[arg-type]
+def _signed(
+  *,
+  task_id: str = "bg_7",
+  control_run_id: str = "run-7",
+  owner_user_id: str = "42",
+  channel_id: str = _CHANNEL_ID,
+  bind: CapabilityBind | _DefaultOverride = _DEFAULT_OVERRIDE,
+  workload: AutonomousLaunchWorkload | _DefaultOverride = _DEFAULT_OVERRIDE,
+  control_authority: AutonomousControlAuthority | _DefaultOverride = (
+    _DEFAULT_OVERRIDE
+  ),
+  session_authority: AutonomousSessionAuthority | _DefaultOverride = (
+    _DEFAULT_OVERRIDE
+  ),
+  ttl_seconds: int = 60,
+  now_ns: int | None = _NOW_NS,
+  nonce: str | None = _NONCE,
+) -> str:
+  resolved_bind = _bind() if isinstance(bind, _DefaultOverride) else bind
+  resolved_workload = (
+    _workload() if isinstance(workload, _DefaultOverride) else workload
+  )
+  resolved_control_authority = (
+    _control_authority()
+    if isinstance(control_authority, _DefaultOverride)
+    else control_authority
+  )
+  resolved_session_authority = (
+    _ordinary_session_authority(bind=resolved_bind)
+    if isinstance(session_authority, _DefaultOverride)
+    else session_authority
+  )
+  return sign_autonomous_launch_envelope(
     _SECRET,
-    **kwargs,
+    task_id=task_id,
+    control_run_id=control_run_id,
+    owner_user_id=owner_user_id,
+    channel_id=channel_id,
+    bind=resolved_bind,
+    workload=resolved_workload,
+    control_authority=resolved_control_authority,
+    session_authority=resolved_session_authority,
+    ttl_seconds=ttl_seconds,
+    now_ns=now_ns,
+    nonce=nonce,
   )
 
 
-def _verify(envelope_json: str, **overrides: object):
-  kwargs: dict[str, object] = {"now_ns": _NOW_NS}
-  kwargs.update(overrides)
-  return verify_autonomous_launch_envelope(  # type: ignore[arg-type]
+def _verify(
+  envelope_json: str,
+  *,
+  now_ns: int | None = _NOW_NS,
+) -> AutonomousLaunchEnvelope:
+  return verify_autonomous_launch_envelope(
     _SECRET,
     envelope_json,
-    **kwargs,
+    now_ns=now_ns,
   )
 
 
@@ -270,7 +327,7 @@ def _resign(payload: dict[str, object]) -> str:
   )
 
 
-def test_v5_round_trip_constructs_exact_gateway_session() -> None:
+def test_v6_round_trip_constructs_exact_gateway_session() -> None:
   dispatch_scope = AutonomousDispatchScope(
     kind="portfolio",
     source="user_selected",
@@ -294,7 +351,7 @@ def test_v5_round_trip_constructs_exact_gateway_session() -> None:
 
   envelope = _verify(raw)
   assert envelope.audience == AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE
-  assert envelope.version == AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION == 5
+  assert envelope.version == AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION == 6
   assert envelope.task_id == "bg_7"
   assert envelope.control_run_id == "run-7"
   assert envelope.owner_user_id == "42"
@@ -311,6 +368,76 @@ def test_v5_round_trip_constructs_exact_gateway_session() -> None:
   assert session.owner_user_id == "42"
   assert session.purpose == AUTONOMOUS_RUNTIME_SESSION_PURPOSE
   assert session.dispatch_scope == dispatch_scope.receipt()
+
+
+def test_v6_skill_limits_are_signed_required_and_compare_false() -> None:
+  first = _workload(
+    mode="skill",
+    skill="quant-research",
+    admitted_skill_execution_limits=SkillExecutionLimits(
+      20,
+      32_000,
+      20.0,
+    ),
+  )
+  second = _workload(
+    mode="skill",
+    skill="quant-research",
+    admitted_skill_execution_limits=SkillExecutionLimits(
+      1,
+      2,
+      3.0,
+    ),
+  )
+
+  assert first == second
+  assert first.receipt()["admitted_skill_execution_limits"] == {
+    "max_turns": 20,
+    "max_tokens": 32_000,
+    "max_budget_usd": 20.0,
+  }
+  parsed = AutonomousLaunchWorkload.from_receipt(first.receipt())
+  assert type(parsed.admitted_skill_execution_limits) is SkillExecutionLimits
+  assert parsed.admitted_skill_execution_limits == (
+    SkillExecutionLimits(20, 32_000, 20.0)
+  )
+
+
+@pytest.mark.parametrize(
+  "value",
+  [
+    None,
+    {},
+    {"max_turns": 20, "max_tokens": 32_000},
+    {
+      "max_turns": 20,
+      "max_tokens": 32_000,
+      "max_budget_usd": 20.0,
+      "extra": None,
+    },
+    {"max_turns": True, "max_tokens": 32_000, "max_budget_usd": 20.0},
+  ],
+)
+def test_v6_skill_workload_rejects_malformed_signed_limits(value: object) -> None:
+  payload = json.loads(_signed(
+    workload=_workload(mode="skill", skill="quant-research")
+  ))
+  payload["workload"]["admitted_skill_execution_limits"] = value
+
+  with pytest.raises(ValueError, match="workload is invalid"):
+    _verify(_resign(payload))
+
+
+def test_v6_non_skill_workload_rejects_signed_limits_object() -> None:
+  payload = json.loads(_signed())
+  payload["workload"]["admitted_skill_execution_limits"] = {
+    "max_turns": None,
+    "max_tokens": None,
+    "max_budget_usd": None,
+  }
+
+  with pytest.raises(ValueError, match="workload is invalid"):
+    _verify(_resign(payload))
 
 
 def test_envelope_rejects_tampering_and_wrong_signature() -> None:
@@ -356,7 +483,7 @@ def test_envelope_rejects_hmac_secrets_shorter_than_32_bytes() -> None:
     )
 
 
-def test_v5_sign_rejects_workload_without_session_log_authority() -> None:
+def test_v6_sign_rejects_workload_without_session_log_authority() -> None:
   workload = AutonomousLaunchWorkload(
     profile="analyst",
     mode="run_once",
@@ -365,9 +492,11 @@ def test_v5_sign_rejects_workload_without_session_log_authority() -> None:
     pack=None,
     context=None,
     ticker=None,
+    research_file_id=None,
     dev_mode=False,
     max_budget_usd=None,
     deliver=True,
+    admitted_skill_execution_limits=None,
   )
   with pytest.raises(TypeError, match="requires exact session-log authority"):
     sign_autonomous_launch_envelope(
@@ -385,7 +514,7 @@ def test_v5_sign_rejects_workload_without_session_log_authority() -> None:
     )
 
 
-def test_v5_verify_rejects_missing_session_log_authority() -> None:
+def test_v6_verify_rejects_missing_session_log_authority() -> None:
   payload = json.loads(_signed())
   payload["workload"].pop("session_log_authority")
   with pytest.raises(ValueError, match="workload is invalid"):
@@ -414,7 +543,7 @@ def test_v5_verify_rejects_missing_session_log_authority() -> None:
   ],
 )
 def test_envelope_rejects_closed_contract_changes(
-  mutation: Any,
+  mutation: Callable[[dict[str, object]], object],
   message: str,
 ) -> None:
   payload = json.loads(_signed())
@@ -477,10 +606,10 @@ def test_envelope_round_trips_every_closed_workload_mode(
   ],
 )
 def test_workload_rejects_incompatible_or_noncanonical_fields(
-  kwargs: dict[str, object],
+  kwargs: _WorkloadOverrides,
 ) -> None:
   with pytest.raises(ValueError, match="autonomous launch workload"):
-    _workload(**kwargs)  # type: ignore[arg-type]
+    _workload(**kwargs)
 
 
 def test_workload_free_text_limit_is_measured_in_utf8_bytes() -> None:
@@ -527,36 +656,14 @@ def test_envelope_signature_binds_the_exact_workload() -> None:
   "kwargs",
   [
     {"operator_inbox_path": "relative.jsonl"},
-    {"approval_decisions_path": "/tmp/../tmp/decisions.jsonl"},
-    {
-      "approval_store_path": (
-        "/tmp/bg_7.operator-messages.jsonl"
-      ),
-    },
+    {"admission_ledger_path": "/tmp/../tmp/autonomous-admissions.sqlite3"},
   ],
 )
 def test_control_authority_rejects_noncanonical_or_aliased_paths(
-  kwargs: dict[str, object],
+  kwargs: _ControlAuthorityOverrides,
 ) -> None:
-  values: dict[str, object] = {
-    "control_mode": "file",
-    "admission_ledger_path": "/tmp/autonomous-admissions.sqlite3",
-    "admission_ledger_device": 1,
-    "admission_ledger_inode": 10,
-    "operator_inbox_path": "/tmp/bg_7.operator-messages.jsonl",
-    "operator_inbox_device": 1,
-    "operator_inbox_inode": 11,
-    "approval_decisions_path": "/tmp/bg_7.approval-decisions.jsonl",
-    "approval_decisions_device": 1,
-    "approval_decisions_inode": 12,
-    "approval_store_path": "/tmp/autonomous-approvals.sqlite3",
-    "approval_store_device": 1,
-    "approval_store_inode": 13,
-  }
-  values.update(kwargs)
-
   with pytest.raises(ValueError, match="autonomous control authority"):
-    AutonomousControlAuthority(**values)  # type: ignore[arg-type]
+    _control_authority(**kwargs)
 
 
 @pytest.mark.parametrize("mutation", ["missing", "extra"])

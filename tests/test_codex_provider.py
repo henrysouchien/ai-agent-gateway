@@ -16,7 +16,6 @@ if str(PKG_DIR) not in sys.path:
 from agent_gateway.providers import CodexProvider
 from agent_gateway.providers.base import ThinkingLevel
 import agent_gateway.providers.codex_helpers as codex_helpers
-import agent_gateway.providers.codex_model_info as codex_model_info
 from agent_gateway.providers.codex import (
   _ResponsesStreamState,
   _convert_messages,
@@ -32,16 +31,6 @@ from agent_gateway.providers.codex_helpers import (
 )
 
 
-def test_codex_model_info_helper_exports_are_parent_aliases() -> None:
-  model_info_helper_names = (
-    "_MODEL_INFO_BY_TAG",
-    "_model_matches_tag",
-    "_map_reasoning_effort",
-    "_clamp_reasoning_effort",
-  )
-
-  for name in model_info_helper_names:
-    assert getattr(codex_helpers, name) is getattr(codex_model_info, name)
 
 
 def _fake_jwt(account_id: str) -> str:
@@ -111,14 +100,22 @@ def test_codex_gpt55_uses_gpt5_family_metadata() -> None:
   assert model_info.supports_vision is True
 
 
-@pytest.mark.parametrize("model_id", ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6", "gpt-5.5", "gpt-5.1"])
-def test_codex_gpt5x_family_window_matches_chatgpt_backend(model_id: str) -> None:
-  # ChatGPT backend enforces ~370-385k input (probed live 2026-07-21); the
-  # registry pins 400k total so the proactive compaction trigger (80% of
-  # window) fires before the backend's real wall instead of never.
+@pytest.mark.parametrize(
+  ("model_id", "context_window"),
+  [
+    ("gpt-6-astra", 272_000),
+    ("gpt-5.6-terra", 272_000),
+    ("gpt-5.6-sol", 272_000),
+    ("gpt-5.6-luna", 272_000),
+    ("gpt-5.6", 400_000),
+    ("gpt-5.5", 400_000),
+    ("gpt-5.1", 400_000),
+  ],
+)
+def test_codex_context_window_uses_provider_rate_data(model_id: str, context_window: int) -> None:
   provider = CodexProvider()
 
-  assert provider.get_model_info(model_id).context_window == 400_000
+  assert provider.get_model_info(model_id).context_window == context_window
 
 
 def test_codex_terra_effective_compaction_trigger_is_reachable() -> None:
@@ -128,7 +125,7 @@ def test_codex_terra_effective_compaction_trigger_is_reachable() -> None:
 
   trigger = effective_compaction_trigger(160_000, provider.get_model_info("gpt-5.6-terra"))
 
-  assert trigger == 320_000
+  assert trigger == 217_600
 
 
 def test_codex_gpt55_cost_estimation_is_non_zero() -> None:
@@ -140,6 +137,65 @@ def test_codex_gpt55_cost_estimation_is_non_zero() -> None:
   assert estimate.input_cost > 0
   assert estimate.output_cost > 0
   assert estimate.cache_read_cost > 0
+
+
+def test_registry_unadmitted_model_is_rejected() -> None:
+  # The substring fallback ("gpt-5" in id => guessed 272k thinking metadata,
+  # anything else => bare non-thinking ModelInfo) is gone: identities the
+  # registry owner does not admit are refused loudly.
+  provider = CodexProvider()
+
+  with pytest.raises(ValueError, match="product model registry does not admit"):
+    provider.get_model_info("gpt-5.9-experimental")
+  with pytest.raises(ValueError, match="product model registry does not admit"):
+    provider.get_model_info("gpt-6-nova")
+
+
+def test_registry_admitted_model_without_capability_row_derives_from_registry(
+  monkeypatch,
+) -> None:
+  # Config-only model addition: a model the registry artifact admits is served
+  # before codex_model_info gains a row, with effort facts derived from the
+  # registry owner instead of a name-substring guess.
+  from agent_gateway.model_registry import ModelRegistryEntry, ProductModelRegistry
+  import agent_gateway.providers.base as provider_base
+
+  entry = ModelRegistryEntry(
+    key="codex.gpt-5-7-sol",
+    label="GPT-5.7 Sol",
+    provider="codex",
+    upstream_model="gpt-5.7-sol",
+    adapter="codex.responses",
+    protocol_profile="codex.reasoning",
+    route="codex.chatgpt",
+    lifecycle="active",
+    capabilities={"session.driver": "user_selectable"},
+    supported_efforts=frozenset({"none", "low", "medium", "high", "xhigh", "max"}),
+    default_effort="medium",
+    features=frozenset({"tools", "streaming"}),
+    reported_identities=frozenset({"gpt-5.7-sol"}),
+  )
+  monkeypatch.setattr(
+    provider_base,
+    "INITIAL_MODEL_REGISTRY",
+    ProductModelRegistry(
+      schema="product-model-registry/v1",
+      revision="test",
+      models={entry.key: entry},
+    ),
+  )
+
+  info = CodexProvider().get_model_info("gpt-5.7-sol")
+
+  assert info.provider == "codex"
+  assert info.supports_thinking is True
+  assert info.supports_tool_use is True
+  compat = info.compat or {}
+  assert compat["supportsReasoningEffort"] is True
+  assert compat["reasoningEffortValues"] == (
+    "none", "low", "medium", "high", "xhigh", "max",
+  )
+  assert compat["reasoningEffortDefault"] == "medium"
 
 
 def test_build_request_params_supplies_default_instructions_when_system_prompt_missing() -> None:
@@ -338,7 +394,18 @@ def test_normalize_messages_normalizes_cross_model_tool_ids() -> None:
   }
 
 
-def test_parse_sse_and_map_event_translate_responses_stream() -> None:
+def test_parse_sse_and_map_event_translate_raw_responses_stream(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  import agent_gateway.runner_tool_audit as runner_tool_audit
+
+  monkeypatch.setattr(
+    runner_tool_audit,
+    "redact_tool_input_for_event",
+    lambda *_args, **_kwargs: (_ for _ in ()).throw(
+      AssertionError("provider mapper cannot own history redaction")
+    ),
+  )
   state = _ResponsesStreamState()
   payload = (
     'data: {"type":"response.output_item.added","item":{"type":"reasoning","id":"rs_1","summary":[]}}\n\n'
@@ -405,6 +472,7 @@ def test_parse_sse_and_map_event_translate_responses_stream() -> None:
   assert tool_use_end.tool_id == "call_1|fc_item_1"
   assert tool_use_end.tool_name == "lookup"
   assert tool_use_end.tool_input == {"path": "README.md"}
+  assert tool_use_end.raw_block["input"] == {"path": "README.md"}
   assert tool_use_end.tool_input_json == "{\"path\":\"README.md\"}"
 
   message_start = _only("message_start")
@@ -441,9 +509,10 @@ def test_normalize_messages_converts_compaction_to_text_and_truncates() -> None:
   assert first_block["type"] == "text"
   assert "summary" in first_block["text"]
   assert not any(
-    isinstance(b, dict) and b.get("type") == "compaction"
-    for m in normalized
-    for b in (m.get("content") if isinstance(m.get("content"), list) else [])
+    isinstance(block, dict) and block.get("type") == "compaction"
+    for message in normalized
+    if isinstance(content := message.get("content"), list)
+    for block in content
   )
 
 

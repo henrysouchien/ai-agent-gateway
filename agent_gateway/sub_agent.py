@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime
 import logging
+from functools import partial
 import secrets
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Awaitable, Callable, Mapping
-from collections.abc import Sequence, Set as AbstractSet
+from collections.abc import Collection, Sequence, Set as AbstractSet
+
+from pydantic import JsonValue
 
 from agent_workflow_contracts import (
   AgentCompletionEnvelope,
   AdmittedDataRef,
   AdmittedInputBinding,
   AdmittedTask,
+  AdmittedToolRoute,
   AttemptRef,
   ContentHandle,
   ContentReadGrant,
@@ -29,11 +34,12 @@ from agent_workflow_contracts import (
   OutcomeRequirement,
   OutcomeRoute,
   OwnerBinding,
-  ParentResultPolicy,
+  ProviderToolDefinition,
   RequestedDataRef,
   ResultRequirement,
   TaskResult,
   TaskResultProvenance,
+  UsageObservation,
   WorkspaceGrant,
   canonical_json_bytes,
   sha256_digest,
@@ -46,6 +52,7 @@ from agent_workflow_contracts.ticker_contract import (
 
 from .autonomous_output import extract_state_update
 from .approval_policy import RunContext
+from .approval_route import session_approval_route
 from .agent_result_content import make_get_agent_result_content_handler
 from .capability_binding import (
   CapabilityBind,
@@ -59,10 +66,12 @@ from .commercial_work_start import (
 from .event_log import EventLog
 from .execution_snapshot import (
   build_agent_execution_snapshot,
+  provider_tool_definitions_for_grant,
   render_result_instructions,
   resume_agent_execution_snapshot,
 )
 from .policy_imports import require_inherited_role, role_denied_tools_for_session
+from .mcp_activation import RunAgentMcpActivationError
 from .operation_catalog import (
   AgentOperationCatalog,
   OperationRuntimePolicy,
@@ -84,6 +93,7 @@ from .runner_background_tasks import (
 )
 from .runner_session_events import build_agent_completion_event
 from .session import GatewaySession
+from .skill_limits import SkillExecutionLimits
 from .skills import (
   GENERIC_EXPLORE_OPERATION_NAME,
   ResolvedAgentOperation,
@@ -108,7 +118,9 @@ from .sub_agent_skill_events import (
   DurableSkillEventPersistenceError,
   SkillRunEventEmitter,
 )
+from .tool_definition import validate_live_tool_route_binding
 from .capability_resolution import (
+  admitted_tool_routes,
   derive_dispatcher_allowlist,
   granted_tool_ids,
 )
@@ -117,8 +129,8 @@ from .sub_agent_scope_receipt import (
   ADMITTED_TASK_METADATA_KEY,
   OperationToolAdmissionError,
   admit_operation_tools,
+  dispatcher_scopes_from_admitted_routes,
   reissue_tool_grant,
-  scopes_from_tool_grant,
 )
 from .sub_agent_helpers import (
   DEFAULT_SUB_AGENT_TIMEOUT_SECONDS as DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
@@ -128,23 +140,10 @@ from .sub_agent_helpers import (
   _ARTIFACT_EMIT_TOOLS as _ARTIFACT_EMIT_TOOLS,
   _DEFAULT_SYSTEM_PROMPT_TEMPLATE as _DEFAULT_SYSTEM_PROMPT_TEMPLATE,
   _DEFAULT_EXCLUDED_TOOLS as _DEFAULT_EXCLUDED_TOOLS,
-  _RESUME_AGENT_DESCRIPTION as _RESUME_AGENT_DESCRIPTION,
-  _RUN_AGENT_DESCRIPTION as _RUN_AGENT_DESCRIPTION,
-  _SKILL_SYSTEM_PROMPT_TEMPLATE as _SKILL_SYSTEM_PROMPT_TEMPLATE,
-  _TICKER_STOPWORDS as _TICKER_STOPWORDS,
-  _artifact_storage_user_id as _artifact_storage_user_id,
-  _dashboard_artifact_scope as _dashboard_artifact_scope,
-  _dashboard_artifact_ticker as _dashboard_artifact_ticker,
-  _extract_research_file_id_from_resume_messages as _extract_research_file_id_from_resume_messages,
-  _extract_research_file_id_from_task as _extract_research_file_id_from_task,
   _extract_ticker_from_task as _extract_ticker_from_task,
-  _artifact_scope as _artifact_scope,
-  _artifact_ticker as _artifact_ticker,
   _install_emit_dashboard_artifact_handler as _install_emit_dashboard_artifact_handler,
   _install_emit_canvas_artifact_handler as _install_emit_canvas_artifact_handler,
-  _message_content_text as _message_content_text,
   _optional_research_file_id as _optional_research_file_id,
-  _render_agent_param_description as _render_agent_param_description,
   _resolve_context_ticker as _resolve_context_ticker,
   _skill_extra_excluded_tool_names as _skill_extra_excluded_tool_names,
   _skill_artifact_excluded_tools as _skill_artifact_excluded_tools,
@@ -195,8 +194,9 @@ def _child_run_context(
   *,
   parent_session: GatewaySession | None,
   tool_ctx: Any,
-  skill_run_id: str,
+  skill_run_id: str | None,
   skill_name: str | None,
+  admitted_skill_execution_limits: SkillExecutionLimits | None,
   research_file_id: int | None,
   user_id: str | None,
   session_id: str,
@@ -217,6 +217,7 @@ def _child_run_context(
     profile=str(skill_name or "sub_agent"),
     channel=str(getattr(parent_session, "channel", None) or "web"),
     skill=skill_name,
+    admitted_skill_execution_limits=admitted_skill_execution_limits,
     research_file_id=research_file_id,
     decider_role=require_inherited_role(parent_session),
     policy_bundle_hash=str(
@@ -243,8 +244,16 @@ def _durable_skill_event_transport(
 ] | None:
   """Resolve the required runner protocol for named-skill lifecycle events."""
 
-  appender = getattr(runner, "_append_durable_event", None)
-  confirmer = getattr(runner, "_confirm_durable_skill_event", None)
+  appender: DurableSkillEventAppender | None = getattr(
+    runner,
+    "_append_durable_event",
+    None,
+  )
+  confirmer: DurableSkillEventConfirmer | None = getattr(
+    runner,
+    "_confirm_durable_skill_event",
+    None,
+  )
   if not callable(appender) or not callable(confirmer):
     return None
   return appender, confirmer
@@ -311,10 +320,24 @@ def _child_tool_definitions_getter(
   return _declared_tool_definitions
 
 
+def _admitted_tool_definitions_getter(
+  definitions: Sequence[ProviderToolDefinition],
+) -> Callable[[], list[dict[str, Any]]]:
+  admitted = tuple(
+    copy.deepcopy(definition.definition)
+    for definition in definitions
+  )
+
+  def _tool_definitions() -> list[dict[str, Any]]:
+    return [copy.deepcopy(definition) for definition in admitted]
+
+  return _tool_definitions
+
+
 def _operation_private_mcp_tool_definitions(
   *,
   profile: SkillProfile | None = None,
-  mcp_tools_by_server: Mapping[str, AbstractSet[str]] | None = None,
+  mcp_tools_by_server: Mapping[str, Collection[str]] | None = None,
   mcp_client: Any,
   exact_tool_ids: frozenset[str],
   tool_definition_projector: (
@@ -329,7 +352,9 @@ def _operation_private_mcp_tool_definitions(
     else (profile.mcp_tools if profile is not None else {})
   )
 
-  get_server_definitions = getattr(
+  get_server_definitions: (
+    Callable[[set[str]], Sequence[dict[str, Any]]] | None
+  ) = getattr(
     mcp_client,
     "get_server_tool_definitions",
     None,
@@ -357,7 +382,7 @@ def _operation_private_mcp_tool_definitions(
 
 
 def _operation_private_mcp_tool_ids(
-  mcp_tools_by_server: Mapping[str, AbstractSet[str]],
+  mcp_tools_by_server: Mapping[str, Collection[str]],
   *,
   exact_tool_ids: frozenset[str],
 ) -> frozenset[str]:
@@ -370,7 +395,7 @@ def _operation_private_mcp_tool_ids(
 
 
 def _operation_has_investment_claim_routes(
-  mcp_tools_by_server: Mapping[str, AbstractSet[str]],
+  mcp_tools_by_server: Mapping[str, Collection[str]],
   *,
   exact_tool_ids: frozenset[str] | None,
 ) -> bool:
@@ -421,46 +446,51 @@ def _runtime_policy_dispatch_projection(
     **canonical_exact_mcp_ids,
     **canonical_excluded_mcp_ids,
   }
+  live_routes_by_identity: dict[tuple[str, str], str] = {}
   if canonical_mcp_ids:
-    resolve_tool_name = getattr(mcp_client, "resolve_tool_name", None)
-    get_server_for_tool = getattr(mcp_client, "get_server_for_tool", None)
-    get_original_tool_name = getattr(mcp_client, "get_original_tool_name", None)
-    if not all(callable(item) for item in (
-      resolve_tool_name,
-      get_server_for_tool,
-      get_original_tool_name,
-    )):
+    get_route_bindings: (
+      Callable[[set[str]], Sequence[object]] | None
+    ) = getattr(
+      mcp_client,
+      "get_server_tool_route_bindings",
+      None,
+    )
+    if not callable(get_route_bindings):
       raise ValueError(
         "operation MCP identities require exact live route resolution"
       )
+    first_canonical_id = sorted(canonical_mcp_ids)[0]
+    try:
+      route_bindings = get_route_bindings({
+        server_id
+        for server_id, _tool_id in canonical_mcp_ids.values()
+      })
+      for raw_binding in route_bindings:
+        binding = validate_live_tool_route_binding(raw_binding)
+        identity = (
+          binding.logical_server_id,
+          binding.logical_name,
+        )
+        live_routes_by_identity[identity] = binding.exposed_name
+    except Exception as exc:
+      raise ValueError(
+        f"canonical MCP identity {first_canonical_id!r} "
+        "live route resolution failed"
+      ) from exc
 
   canonical_to_exposed: dict[str, str] = {}
   canonical_by_exposed: dict[str, str] = {}
   for canonical_id, (server_id, original_tool_id) in sorted(
     canonical_mcp_ids.items()
   ):
-    try:
-      exposed_tool_id = resolve_tool_name(server_id, original_tool_id)
-      reverse_server_id = (
-        get_server_for_tool(exposed_tool_id)
-        if type(exposed_tool_id) is str
-        else None
-      )
-      reverse_original_tool_id = (
-        get_original_tool_name(exposed_tool_id)
-        if type(exposed_tool_id) is str
-        else None
-      )
-    except Exception as exc:
-      raise ValueError(
-        f"canonical MCP identity {canonical_id!r} live route resolution failed"
-      ) from exc
+    exposed_tool_id = live_routes_by_identity.get((
+      server_id,
+      original_tool_id,
+    ))
     if (
       type(exposed_tool_id) is not str
       or not exposed_tool_id
       or exposed_tool_id != exposed_tool_id.strip()
-      or reverse_server_id != server_id
-      or reverse_original_tool_id != original_tool_id
     ):
       raise ValueError(
         f"canonical MCP identity {canonical_id!r} has no exact live route"
@@ -544,7 +574,7 @@ def _capability_resolution_error(exc: CapabilityResolutionError) -> dict[str, An
   return {
     "code": exc.code,
     "message": str(exc),
-    "details": exc.receipt(),
+    "details": exc.to_error(),
   }
 
 
@@ -583,20 +613,6 @@ def _ordinary_outcome_policy() -> OutcomePolicy:
       "not_assessed",
     )
   ))
-
-
-def _ordinary_parent_result_policy(
-  requirement: ResultRequirement,
-) -> ParentResultPolicy:
-  return ParentResultPolicy(
-    preferred=(
-      "terminal_narrative_inline_exact"
-      if requirement.terminal_narrative == "required"
-      else "projection_inline"
-    ),
-    max_inline_bytes=20_000,
-    on_overflow="result_handle",
-  )
 
 
 def _foreground_completion_transport_ready(runner: Any) -> bool:
@@ -895,6 +911,7 @@ def _research_file_id_from_admitted_inputs(
   )
   if (
     not isinstance(selector, LiteralSelector)
+    or not isinstance(context, InlineExactContextView)
     or request.name != "research_file_id"
     or selector_research_file_id != context.content
     or request.context_policy is not None
@@ -904,7 +921,6 @@ def _research_file_id_from_admitted_inputs(
     or source.actual_contract != _RESEARCH_FILE_ID_INPUT_CONTRACT
     or source.content.contract != _RESEARCH_FILE_ID_INPUT_CONTRACT
     or source.read_grant is not None
-    or not isinstance(context, InlineExactContextView)
   ):
     raise ValueError(
       "admission contains a non-canonical typed research-file binding"
@@ -1004,14 +1020,22 @@ def _ticker_from_admitted_inputs(
   return ticker
 
 
-def _ordinary_logical_invocation_owner(admitted_task: AdmittedTask) -> str:
+def _ordinary_logical_task(
+  admitted_task: AdmittedTask,
+) -> OrdinaryDelegationTaskRef:
   logical_task = admitted_task.logical_task
   if not isinstance(logical_task, OrdinaryDelegationTaskRef):
     raise ValueError("ordinary ticker admission requires a delegation identity")
   delegation_id = str(logical_task.delegation_id or "").strip()
   if not delegation_id:
     raise ValueError("ordinary ticker admission has no logical invocation owner")
-  return delegation_id
+  return logical_task
+
+
+def _ordinary_logical_invocation_owner(
+  logical_task: OrdinaryDelegationTaskRef,
+) -> str:
+  return str(logical_task.delegation_id or "").strip()
 
 
 def _ordinary_admitted_task_factory(
@@ -1020,9 +1044,10 @@ def _ordinary_admitted_task_factory(
   execution_snapshot: Any,
   capability_bindings: tuple[Any, ...],
   tool_grant: Any,
+  tool_routes: tuple[AdmittedToolRoute, ...],
   model_bind: CapabilityBind,
   result_requirement: ResultRequirement,
-  objective: str,
+  objective: JsonValue,
   parent_session: Any | None,
   inputs: tuple[AdmittedInputBinding, ...] = (),
   attempt_number: int = 1,
@@ -1058,7 +1083,7 @@ def _ordinary_admitted_task_factory(
       scope=operation.workspace_scope,
     )
     payload = {
-      "schema_version": "1.0",
+      "schema_version": "1.2",
       "admitted_task_id": f"admitted:{task_id}",
       "logical_task": logical_task.model_dump(mode="json"),
       "attempt": attempt.model_dump(mode="json"),
@@ -1075,6 +1100,9 @@ def _ordinary_admitted_task_factory(
         for binding in capability_bindings
       ],
       "tool_grant": tool_grant.model_dump(mode="json"),
+      "tool_routes": [
+        route.model_dump(mode="json") for route in tool_routes
+      ],
       "content_read_grants": [],
       "workspace_grant": workspace.model_dump(mode="json"),
       "model_bind": model_bind.model_dump(mode="json"),
@@ -1147,7 +1175,7 @@ async def _finalize_resume_abandoned(
     status="failed",
     reason=f"resume_abandoned:{code}: {message}",
     tools_used=retained.tools_used,
-    usage=retained.usage,
+    usage=UsageObservation(**retained.usage),
   )
   result_payload = task_result.model_dump(mode="json")
 
@@ -1256,7 +1284,7 @@ async def _finalize_resume_abandoned(
   try:
     return await asyncio.shield(finalizer_task)
   except asyncio.CancelledError:
-    timeout_getter = getattr(
+    timeout_getter: Callable[[], float] | None = getattr(
       runner,
       "_background_completion_persist_timeout",
       None,
@@ -1325,13 +1353,19 @@ def make_run_agent_handler(
   skill_state_store: SkillStateStore | None = None,
   coordinator_config: CoordinatorConfig | None = None,
   approval_key_qualifier: Callable[[str, dict[str, Any]], str] | None = None,
+  tool_registration_catalog: Any | None = None,
+  tool_policy_implementations: Any | None = None,
+  input_preparation_context_factory: Callable[..., Any] | None = None,
+  redaction_context_factory: Callable[..., Any] | None = None,
+  approval_predicate_context_factory: Callable[..., Any] | None = None,
+  registered_approval_overlay: Callable[..., bool] | None = None,
   commercial_work_start: Any | None = None,
   commercial_irreversible_recheck: Callable[[Any], None] | None = None,
   commercial_mcp_servers: frozenset[str] | None = None,
   operation_mcp_activator: (
     Callable[
       [SkillProfile | ResolvedOperationRuntime],
-      dict[str, Any] | None,
+      RunAgentMcpActivationError | None,
     ]
     | None
   ) = None,
@@ -1399,7 +1433,6 @@ def make_run_agent_handler(
     task = tool_input.get("objective", "")
     if not task or not isinstance(task, str):
       return None, {"code": "invalid_input", "message": "objective is required"}
-    derived_research_file_id = _extract_research_file_id_from_task(task)
     raw_research_file_id = tool_input.get("research_file_id")
     if raw_research_file_id is not None:
       try:
@@ -1411,19 +1444,7 @@ def make_run_agent_handler(
           "code": "invalid_input",
           "message": "research_file_id must be a positive integer",
         }
-      if (
-        derived_research_file_id is not None
-        and raw_research_file_id != derived_research_file_id
-      ):
-        return None, {
-          "code": "context_research_file_id_mismatch",
-          "message": (
-            "research_file_id must match the exact ID stated in objective"
-          ),
-        }
-    asserted_research_file_id = (
-      raw_research_file_id or derived_research_file_id
-    )
+    asserted_research_file_id = raw_research_file_id
     raw_context_ticker = tool_input.get("ticker")
     raw_operation = tool_input.get("operation")
     named_operation = raw_operation is not None
@@ -1437,7 +1458,8 @@ def make_run_agent_handler(
 
     profile: SkillProfile | None
     runtime_policy: OperationRuntimePolicy | None
-    resolved_runtime: ResolvedOperationRuntime | None
+    operation_activation_target: SkillProfile | ResolvedOperationRuntime
+    mcp_tools_by_server: Mapping[str, Collection[str]]
     if operation_catalog is not None:
       try:
         canonical_operation = operation_catalog.resolve_operation(raw_operation)
@@ -1447,7 +1469,7 @@ def make_run_agent_handler(
           )
         operation = canonical_operation.snapshot
         runtime_policy = canonical_operation.policy
-        resolved_runtime = canonical_operation
+        operation_activation_target = canonical_operation
       except FileNotFoundError as exc:
         return None, {"code": "not_found", "message": str(exc)}
       except Exception as exc:
@@ -1457,6 +1479,13 @@ def make_run_agent_handler(
       runtime_extra_excluded = frozenset()
       canonical_to_exposed_mcp_tool_ids = MappingProxyType({})
       mcp_tools_by_server = runtime_policy.mcp_tools_by_server
+      operation_scope = runtime_policy.semantic_scope
+      operation_persist_state = runtime_policy.persist_state
+      operation_version = operation.operation.version
+      configured_max_turns = runtime_policy.max_turns
+      configured_timeout = runtime_policy.timeout_seconds
+      configured_max_tokens = runtime_policy.max_tokens
+      configured_max_budget_usd = runtime_policy.max_budget_usd
     elif skill_loader is not None:
       try:
         resolved_operation = skill_loader.resolve_operation(raw_operation)
@@ -1467,11 +1496,20 @@ def make_run_agent_handler(
       operation = resolved_operation.snapshot
       profile = resolved_operation.methodology_profile
       runtime_policy = None
-      resolved_runtime = None
+      operation_activation_target = profile
       operation_dispatch_tool_ids = operation_tool_ids(profile)
       runtime_extra_excluded = frozenset()
       canonical_to_exposed_mcp_tool_ids = MappingProxyType({})
       mcp_tools_by_server = profile.mcp_tools or {}
+      operation_scope = profile.scope
+      operation_persist_state = profile.persist_state
+      operation_version = profile.version
+      configured_max_turns = profile.max_turns
+      configured_timeout = profile.timeout
+      configured_max_tokens = profile.max_tokens
+      configured_max_budget_usd = (
+        profile.max_budget_usd if named_operation else None
+      )
     elif raw_operation is not None:
       return None, {
         "code": "not_available",
@@ -1489,28 +1527,20 @@ def make_run_agent_handler(
       operation = resolved_operation.snapshot
       profile = resolved_operation.methodology_profile
       runtime_policy = None
-      resolved_runtime = None
+      operation_activation_target = profile
       operation_dispatch_tool_ids = operation_tool_ids(profile)
       runtime_extra_excluded = frozenset()
       canonical_to_exposed_mcp_tool_ids = MappingProxyType({})
       mcp_tools_by_server = profile.mcp_tools or {}
+      operation_scope = profile.scope
+      operation_persist_state = profile.persist_state
+      operation_version = profile.version
+      configured_max_turns = profile.max_turns
+      configured_timeout = profile.timeout
+      configured_max_tokens = profile.max_tokens
+      configured_max_budget_usd = None
     registered_runtime = runtime_policy is not None or named_operation
     agent_name = operation.operation.name
-    operation_scope = (
-      runtime_policy.semantic_scope
-      if runtime_policy is not None
-      else profile.scope
-    )
-    operation_persist_state = (
-      runtime_policy.persist_state
-      if runtime_policy is not None
-      else profile.persist_state
-    )
-    operation_version = (
-      operation.operation.version
-      if runtime_policy is not None
-      else profile.version
-    )
     ticker_required = "ticker" in operation.required_context
     research_file_required = (
       "research_file_id" in operation.required_context
@@ -1607,7 +1637,9 @@ def make_run_agent_handler(
       return _ticker_from_admitted_inputs(
         admitted_task.inputs,
         required=ticker_required,
-        owner_invocation_id=_ordinary_logical_invocation_owner(admitted_task),
+        owner_invocation_id=_ordinary_logical_invocation_owner(
+          _ordinary_logical_task(admitted_task)
+        ),
       )
 
     def _admitted_context_research_file_id() -> int | None:
@@ -1617,7 +1649,9 @@ def make_run_agent_handler(
       return _research_file_id_from_admitted_inputs(
         admitted_task.inputs,
         required=trusted_research_origin_required,
-        owner_invocation_id=_ordinary_logical_invocation_owner(admitted_task),
+        owner_invocation_id=_ordinary_logical_invocation_owner(
+          _ordinary_logical_task(admitted_task)
+        ),
       ) or context_research_file_id
 
     skill_run_id: str | None = None
@@ -1686,7 +1720,7 @@ def make_run_agent_handler(
     if registered_runtime and operation_mcp_activator is not None:
       try:
         activation_error = operation_mcp_activator(
-          resolved_runtime if resolved_runtime is not None else profile
+          operation_activation_target
         )
       except Exception as exc:
         log.exception(
@@ -1746,21 +1780,6 @@ def make_run_agent_handler(
         agent_name,
         previous_state,
       )
-    configured_max_turns = (
-      runtime_policy.max_turns
-      if runtime_policy is not None
-      else profile.max_turns
-    )
-    configured_timeout = (
-      runtime_policy.timeout_seconds
-      if runtime_policy is not None
-      else profile.timeout
-    )
-    configured_max_tokens = (
-      runtime_policy.max_tokens
-      if runtime_policy is not None
-      else profile.max_tokens
-    )
     effective_max_turns = (
       configured_max_turns
       if configured_max_turns is not None
@@ -1776,27 +1795,6 @@ def make_run_agent_handler(
       if configured_max_tokens is not None
       else default_max_tokens
     )
-    execution_snapshot = build_agent_execution_snapshot(
-      operation=operation,
-      result_instructions=render_result_instructions(
-        admitted_result_requirement
-      ),
-      persisted_methodology_state=previous_state,
-      methodology_state_instructions=methodology_state_instructions,
-      max_turns=effective_max_turns,
-      timeout_seconds=effective_timeout,
-      client_timeout_seconds=90,
-      max_tokens=effective_max_tokens,
-      cost_observation_threshold_usd=cost_observation_threshold_usd,
-      max_resume_chain_depth=getattr(runner, "_max_resume_chain_depth", 3),
-      max_budget_usd=(
-        runtime_policy.max_budget_usd
-        if runtime_policy is not None
-        else (profile.max_budget_usd if named_operation else None)
-      ),
-    )
-    system_prompt = execution_snapshot.system_prompt
-
     operation_private_mcp_tool_ids = (
       (
         frozenset(
@@ -1821,18 +1819,10 @@ def make_run_agent_handler(
     role_denied_tools = role_denied_tools_for_session(parent_session)
     if effective_coordinator is not None and effective_coordinator.worker_excluded_tools:
       effective_excluded = effective_excluded | effective_coordinator.worker_excluded_tools
-    if profile is not None and not named_operation:
-      # Unnamed delegation retains the legacy Phase-0 deny surface. Registered
-      # operations instead compile authority from their exact source-owned
-      # ceiling, workspace scope, live server effects, and semantic needs.
-      from agent.shared.mutation_enforcement import apply_skill_mutation_mode_exclusions
-
-      effective_excluded = apply_skill_mutation_mode_exclusions(
-        profile,
-        effective_excluded,
-        role_denied_tools=role_denied_tools,
-        local_tool_names=set(local_tool_handlers or {}) | set(_ARTIFACT_EMIT_TOOLS),
-      )
+    # Unnamed generic delegation has no named-skill definition authority. Its
+    # package-owned operation declaration and the exact grant admitted below
+    # constrain tools without translating ProfileConfig into an application
+    # SkillDefinition or importing an application policy helper.
     if runtime_policy is not None:
       effective_excluded |= runtime_extra_excluded
     elif profile is not None:
@@ -1964,6 +1954,11 @@ def make_run_agent_handler(
       extra_tool_definitions=extra_tool_definitions,
       local_tool_handlers=sub_local,
     )
+    candidate_definitions = (
+      candidate_definitions_getter()
+      if candidate_definitions_getter is not None
+      else []
+    )
     # D-B6-2: the caller's exclusions are an INPUT to authority resolution,
     # not a subtraction applied to a grant that already exists. An excluded
     # tool is never granted, so no later pass has to take it back.
@@ -1971,11 +1966,7 @@ def make_run_agent_handler(
       operation,
       grant_id=f"grant:{ordinary_task_id}",
       operation_tool_ids=operation_dispatch_tool_ids,
-      definitions=(
-        candidate_definitions_getter()
-        if candidate_definitions_getter is not None
-        else ()
-      ),
+      definitions=candidate_definitions,
       local_tool_handlers=sub_local,
       mcp_client=mcp_client,
       identity=execution_identity_from_session(parent_session),
@@ -2017,11 +2008,33 @@ def make_run_agent_handler(
       if name in admitted_dispatch_tools
     }
     child_excluded |= candidate_local_names - admitted_dispatch_tools
+    admitted_provider_definitions = provider_tool_definitions_for_grant(
+      candidate_definitions,
+      grant=operation_authority.grant,
+    )
+    execution_snapshot = build_agent_execution_snapshot(
+      operation=operation,
+      result_instructions=render_result_instructions(
+        admitted_result_requirement
+      ),
+      persisted_methodology_state=previous_state,
+      methodology_state_instructions=methodology_state_instructions,
+      max_turns=effective_max_turns,
+      timeout_seconds=effective_timeout,
+      client_timeout_seconds=90,
+      max_tokens=effective_max_tokens,
+      cost_observation_threshold_usd=cost_observation_threshold_usd,
+      provider_tool_definitions=admitted_provider_definitions,
+      max_resume_chain_depth=getattr(runner, "_max_resume_chain_depth", 3),
+      max_budget_usd=configured_max_budget_usd,
+    )
+    system_prompt = execution_snapshot.system_prompt
     admitted_task_factory = _ordinary_admitted_task_factory(
       operation=operation,
       execution_snapshot=execution_snapshot,
       capability_bindings=operation_authority.bindings,
       tool_grant=operation_authority.grant,
+      tool_routes=admitted_tool_routes(operation_authority),
       model_bind=execution.bind,
       result_requirement=admitted_result_requirement,
       objective=task,
@@ -2094,6 +2107,12 @@ def make_run_agent_handler(
       session_id=getattr(runner, "_full_session_id", ""),
       should_avoid_permission_prompts=background,
       approval_key_qualifier=approval_key_qualifier,
+      tool_registration_catalog=tool_registration_catalog,
+      tool_policy_implementations=tool_policy_implementations,
+      input_preparation_context_factory=input_preparation_context_factory,
+      redaction_context_factory=redaction_context_factory,
+      approval_predicate_context_factory=approval_predicate_context_factory,
+      registered_approval_overlay=registered_approval_overlay,
       mcp_session_inject_servers=effective_session_inject_servers,
       mcp_meta_inject_servers=mcp_meta_inject_servers,
       # D-B6-1: one identity value, carrying the authority's frozen
@@ -2106,33 +2125,29 @@ def make_run_agent_handler(
         credentials_resolver_active=credentials_resolver_active,
       ),
       role=require_inherited_role(parent_session),
-      store=getattr(parent_session, "approval_store", None),
-      policy=getattr(parent_session, "approval_policy", None),
+      approval_route=session_approval_route(parent_session),
       run_context=_child_run_context(
         parent_session=parent_session,
         tool_ctx=tool_ctx,
         skill_run_id=skill_run_id,
         skill_name=agent_name,
+        admitted_skill_execution_limits=SkillExecutionLimits(
+          max_turns=execution_snapshot.max_turns,
+          max_tokens=execution_snapshot.max_tokens,
+          max_budget_usd=execution_snapshot.max_budget_usd,
+        ),
         research_file_id=_admitted_context_research_file_id(),
         user_id=effective_parent_user_id,
         session_id=getattr(runner, "_full_session_id", ""),
         approval_policy=getattr(parent_session, "approval_policy", None),
       ),
       allowed_mcp_tools_by_server=admitted_mcp_scope,
-      get_tool_definitions=_child_tool_definitions_getter(
-        runner=runner,
-        mcp_client=mcp_client,
-        excluded_tools=child_excluded,
-        extra_tool_definitions=extra_tool_definitions,
-        local_tool_handlers=sub_local,
-        granted_tools=admitted_dispatch_tools,
+      get_tool_definitions=_admitted_tool_definitions_getter(
+        admitted_provider_definitions,
       ),
-      **({"commercial_work_start": commercial_work_start} if commercial_work_start is not None else {}),
-      **(
-        {"commercial_irreversible_recheck": commercial_irreversible_recheck}
-        if commercial_irreversible_recheck is not None else {}
-      ),
-      **({"commercial_mcp_servers": commercial_mcp_servers} if commercial_mcp_servers is not None else {}),
+      commercial_work_start=commercial_work_start,
+      commercial_irreversible_recheck=commercial_irreversible_recheck,
+      commercial_mcp_servers=commercial_mcp_servers,
     )
 
     async def _dispatch_sub_agent(_background_input: dict[str, Any], **background_kwargs: Any):
@@ -2192,6 +2207,7 @@ def make_run_agent_handler(
         parent_turn_id=parent_turn_id,
         task_entry=task_entry,
         on_sub_event=_record_sub_event,
+        admitted_task=admitted_task,
       )
 
     if background:
@@ -2242,18 +2258,19 @@ def make_run_agent_handler(
           error,
         )
 
-      return await runner._register_background_task(
+      result, error = await runner._register_background_task(
         tool_input=enriched_tool_input,
         handler=_dispatch_sub_agent,
         agent_name=agent_name,
         parent_turn_id=parent_turn_id,
-        capability_bind_receipt=execution.bind.receipt(),
+        capability_bind_receipt=execution.bind.to_json(),
         admitted_task=admitted_task,
-        parent_result_policy=_ordinary_parent_result_policy(
-          admitted_result_requirement
-        ),
         task_id_override=ordinary_task_id,
-        on_before_start=(lambda: on_before_background(agent_name)) if on_before_background else None,
+        on_before_start=(
+          partial(on_before_background, agent_name)
+          if on_before_background is not None
+          else None
+        ),
         on_complete=_on_background_complete if (skill_run_id or on_background_complete is not None) else None,
         required_skill_lifecycle=(
           skill_event_emitter.required_lifecycle_metadata()
@@ -2271,6 +2288,12 @@ def make_run_agent_handler(
           else None
         ),
       )
+      if error is None and isinstance(result, dict):
+        result = {
+          **result,
+          "granted_tools": list(sorted(admitted_dispatch_tools)),
+        }
+      return result, error
     result, error = await _dispatch_sub_agent(tool_input, call_index=call_index)
     if (
       isinstance(error, dict)
@@ -2288,6 +2311,7 @@ def make_run_agent_handler(
       and result is not None
       and _foreground_completion_transport_ready(runner)
     ):
+      canonical_result = None
       try:
         canonical_result = TaskResult.model_validate(result)
         result = await _publish_foreground_completion(
@@ -2295,16 +2319,25 @@ def make_run_agent_handler(
           result=canonical_result,
           admitted_task=admitted_task,
           agent_name=agent_name,
-          capability_bind_receipt=execution.bind.receipt(),
+          capability_bind_receipt=execution.bind.to_json(),
           parent_turn_id=parent_turn_id,
           call_index=call_index,
         )
       except Exception as exc:
         log.exception("Foreground agent completion publication failed")
+        execution_settlement = getattr(
+          canonical_result, "execution", None
+        )
+        status = getattr(execution_settlement, "status", None)
+        reason = getattr(execution_settlement, "terminal_reason", None)
+        if status and status != "succeeded":
+          happened = f"{status} ({reason})" if reason else status
+        else:
+          happened = "completed"
         return None, {
           "code": "agent_completion_materialization_failed",
           "message": (
-            "Foreground agent completed but its exact parent-readable result "
+            f"Foreground agent {happened} but its exact parent-readable result "
             f"could not be published: {type(exc).__name__}"
           ),
         }
@@ -2334,6 +2367,12 @@ def make_resume_handler(
   default_max_tokens: int = 64000,
   capability_execution_resolver: CapabilityExecutionResolver,
   coordinator_config: CoordinatorConfig | None = None,
+  tool_registration_catalog: Any | None = None,
+  tool_policy_implementations: Any | None = None,
+  input_preparation_context_factory: Callable[..., Any] | None = None,
+  redaction_context_factory: Callable[..., Any] | None = None,
+  approval_predicate_context_factory: Callable[..., Any] | None = None,
+  registered_approval_overlay: Callable[..., bool] | None = None,
   commercial_work_start: Any | None = None,
   commercial_irreversible_recheck: Callable[[Any], None] | None = None,
   commercial_mcp_servers: frozenset[str] | None = None,
@@ -2474,7 +2513,7 @@ def make_resume_handler(
     if raw_bind_receipt is None and isinstance(getattr(entry, "metadata", None), dict):
       raw_bind_receipt = entry.metadata.get("capability_bind")
     try:
-      original_bind = CapabilityBind.from_receipt(raw_bind_receipt)
+      original_bind = CapabilityBind.from_json(raw_bind_receipt)
     except (TypeError, ValueError) as exc:
       return await _abandon(
         "invalid_task_metadata",
@@ -2520,8 +2559,9 @@ def make_resume_handler(
       for entry in original_admitted_task.tool_grant.tools
     )
     try:
+      original_logical_task = _ordinary_logical_task(original_admitted_task)
       logical_invocation_owner = _ordinary_logical_invocation_owner(
-        original_admitted_task
+        original_logical_task
       )
       _ticker_from_admitted_inputs(
         original_admitted_task.inputs,
@@ -2547,6 +2587,22 @@ def make_resume_handler(
         "invalid_task_metadata",
         f"Task {task_id} has no immutable execution snapshot",
       )
+    persisted_tool_routes = original_admitted_task.tool_routes
+    if persisted_tool_routes is None:
+      if original_admitted_task.tool_grant.tools:
+        return await _abandon(
+          "durable_tool_routes_unavailable",
+          f"Task {task_id} predates durable routes for its tool grant",
+        )
+      persisted_tool_routes = ()
+    if (
+      original_execution_snapshot.provider_tool_definitions is None
+      and original_admitted_task.tool_grant.tools
+    ):
+      return await _abandon(
+        "durable_tool_definitions_unavailable",
+        f"Task {task_id} predates durable definitions for its tool grant",
+      )
     max_depth = original_execution_snapshot.resume_mechanics.max_chain_depth
     agent_name = operation.methodology.name
     if not operation.resumable:
@@ -2557,14 +2613,8 @@ def make_resume_handler(
     # Resume executes the immutable admitted operation. Methodology files may
     # have changed or disappeared since the original attempt and are never
     # reloaded as execution authority.
-    profile = SimpleNamespace(
-      name=agent_name,
-      scope=("ticker" if "ticker" in operation.required_context else None),
-      mutation_mode=operation.workspace_scope,
-      extra_excluded_tools=(),
-      max_turns=None,
-      timeout=None,
-      max_tokens=None,
+    operation_semantic_scope = (
+      "ticker" if "ticker" in operation.required_context else None
     )
     if operation.workspace_scope == "model_write":
       return await _abandon(
@@ -2737,6 +2787,20 @@ def make_resume_handler(
       if lineage
       else SubAgentResultEvidence.empty()
     )
+    prior_terminal_tool_result = (
+      _sub_agent_skill_state.latest_successful_declared_terminal_tool_result(
+        (
+          log_entry
+          for segment in lineage
+          for log_entry in segment.entries
+        ),
+        declared_terminal_doors=(
+          _sub_agent_skill_state.declared_terminal_doors_from_grant(
+            original_admitted_task.tool_grant
+          )
+        ),
+      )
+    )
     if not lineage or lineage[-1].task_id != task_id:
       result = await _abandon(
         "invalid_task_metadata",
@@ -2769,6 +2833,14 @@ def make_resume_handler(
       original_execution_snapshot,
       resume_instruction=exact_resume_instruction,
     )
+    if successor_execution_snapshot.provider_tool_definitions is None:
+      successor_execution_snapshot = successor_execution_snapshot.model_copy(
+        update={"provider_tool_definitions": ()}
+      )
+    successor_provider_definitions = (
+      successor_execution_snapshot.provider_tool_definitions
+    )
+    assert successor_provider_definitions is not None
     system_prompt = successor_execution_snapshot.system_prompt
     effective_excluded = set(_DEFAULT_EXCLUDED_TOOLS | excluded_tools_resolver())
     if effective_coordinator is not None and effective_coordinator.worker_excluded_tools:
@@ -2799,15 +2871,6 @@ def make_resume_handler(
     call_index = int(kwargs.get("call_index", 0) or 0)
     skill_run_id = secrets.token_hex(16)
     context_research_file_id = admitted_research_file_id
-    if (
-      context_research_file_id is None
-      and not trusted_research_origin_required
-    ):
-      context_research_file_id = _extract_research_file_id_from_resume_messages(
-        reconstructed_messages,
-        parent_messages,
-        additional_context,
-      )
     if context_research_file_id == 0:
       context_research_file_id = None
     if fms_rebinder is not None and context_research_file_id is not None and context_research_file_id > 0:
@@ -2848,7 +2911,10 @@ def make_resume_handler(
 
     if "emit_canvas_artifact" not in child_excluded:
       _install_emit_canvas_artifact_handler(
-        sub_local=sub_local, profile=profile, skill_run_id=skill_run_id,
+        sub_local=sub_local,
+        skill_name=agent_name,
+        semantic_scope=operation_semantic_scope,
+        skill_run_id=skill_run_id,
         context_ticker=_successor_context_ticker,
         context_research_file_id=context_research_file_id,
         parent_session=parent_session,
@@ -2858,7 +2924,8 @@ def make_resume_handler(
     if "emit_dashboard_artifact" not in child_excluded:
       _install_emit_dashboard_artifact_handler(
         sub_local=sub_local,
-        profile=profile,
+        skill_name=agent_name,
+        semantic_scope=operation_semantic_scope,
         skill_run_id=skill_run_id,
         context_ticker=_successor_context_ticker,
         context_research_file_id=context_research_file_id,
@@ -2867,12 +2934,14 @@ def make_resume_handler(
         emit_parent_event=_emit_parent_event,
       )
     child_excluded |= role_denied_tools
-    extra_tool_definitions = _artifact_emit_tool_definitions(set(sub_local))
     try:
-      admitted_tool_ids, admitted_mcp_scope = scopes_from_tool_grant(
+      (
+        admitted_tool_ids,
+        admitted_local_tool_ids,
+        admitted_mcp_scope,
+      ) = dispatcher_scopes_from_admitted_routes(
         original_admitted_task.tool_grant,
-        local_tool_handlers=sub_local,
-        mcp_client=mcp_client,
+        persisted_tool_routes,
       )
     except OperationToolAdmissionError as exc:
       return await _abandon("admitted_tool_route_unavailable", str(exc))
@@ -2884,22 +2953,14 @@ def make_resume_handler(
         + ", ".join(sorted(denied_admitted_servers)),
       )
     admitted_dispatch_tools = admitted_tool_ids
-    resumed_mcp_profile = SimpleNamespace(mcp_tools={
-      server_name: tuple(admitted_dispatch_tools)
-      for server_name in admitted_mcp_scope
-    })
-    extra_tool_definitions.extend(_operation_private_mcp_tool_definitions(
-      profile=resumed_mcp_profile,
-      mcp_client=mcp_client,
-      exact_tool_ids=frozenset(admitted_dispatch_tools),
-      tool_definition_projector=tool_definition_projector,
-    ))
     candidate_local_names = set(sub_local)
     sub_local = {
       name: handler
       for name, handler in sub_local.items()
-      if name in admitted_dispatch_tools
+      if name in admitted_local_tool_ids
     }
+    # A current local handler may share the ID of a persisted MCP route. Drop
+    # that handler, but keep the ID dispatchable through its admitted server.
     child_excluded |= candidate_local_names - admitted_dispatch_tools
     successor_factory = _ordinary_admitted_task_factory(
       operation=operation,
@@ -2909,13 +2970,14 @@ def make_resume_handler(
         original_admitted_task.tool_grant,
         grant_id=f"grant:{successor_task_id}",
       ),
+      tool_routes=persisted_tool_routes,
       model_bind=execution.bind,
       result_requirement=result_requirement,
       objective=f"Resume interrupted delegation {task_id}",
       parent_session=parent_session,
       attempt_number=successor_attempt.attempt_number,
       resume_of_task_id=task_id,
-      logical_task_override=original_admitted_task.logical_task,
+      logical_task_override=original_logical_task,
       inputs=original_admitted_task.inputs,
     )
     successor_admitted_task = successor_factory(
@@ -2934,8 +2996,8 @@ def make_resume_handler(
     sub_log = EventLog()
     skill_event_emitter = SkillRunEventEmitter(
       skill_run_id=skill_run_id,
-      profile=profile,
-      semantic_scope=profile.scope,
+      skill_name=agent_name,
+      semantic_scope=operation_semantic_scope,
       context_ticker=context_ticker,
       portfolio_id=parent_portfolio_id,
       event_log_getter=lambda: sub_log,
@@ -2962,6 +3024,12 @@ def make_resume_handler(
       interceptors=interceptors,
       session_id=getattr(runner, "_full_session_id", ""),
       should_avoid_permission_prompts=True,
+      tool_registration_catalog=tool_registration_catalog,
+      tool_policy_implementations=tool_policy_implementations,
+      input_preparation_context_factory=input_preparation_context_factory,
+      redaction_context_factory=redaction_context_factory,
+      approval_predicate_context_factory=approval_predicate_context_factory,
+      registered_approval_overlay=registered_approval_overlay,
       mcp_session_inject_servers=effective_session_inject_servers,
       mcp_meta_inject_servers=mcp_meta_inject_servers,
       # Resume keeps its authority exactly as persisted (the reissued grant);
@@ -2972,33 +3040,29 @@ def make_resume_handler(
         credentials_resolver_active=credentials_resolver_active,
       ),
       role=require_inherited_role(parent_session),
-      store=getattr(parent_session, "approval_store", None),
-      policy=getattr(parent_session, "approval_policy", None),
+      approval_route=session_approval_route(parent_session),
       run_context=_child_run_context(
         parent_session=parent_session,
         tool_ctx=tool_ctx,
         skill_run_id=skill_run_id,
         skill_name=agent_name,
+        admitted_skill_execution_limits=SkillExecutionLimits(
+          max_turns=successor_execution_snapshot.max_turns,
+          max_tokens=successor_execution_snapshot.max_tokens,
+          max_budget_usd=successor_execution_snapshot.max_budget_usd,
+        ),
         research_file_id=context_research_file_id,
         user_id=user_id or getattr(parent_session, "user_id", None),
         session_id=getattr(runner, "_full_session_id", ""),
         approval_policy=getattr(parent_session, "approval_policy", None),
       ),
       allowed_mcp_tools_by_server=admitted_mcp_scope,
-      get_tool_definitions=_child_tool_definitions_getter(
-        runner=runner,
-        mcp_client=mcp_client,
-        excluded_tools=child_excluded,
-        extra_tool_definitions=extra_tool_definitions,
-        local_tool_handlers=sub_local,
-        granted_tools=admitted_dispatch_tools,
+      get_tool_definitions=_admitted_tool_definitions_getter(
+        successor_provider_definitions,
       ),
-      **({"commercial_work_start": commercial_work_start} if commercial_work_start is not None else {}),
-      **(
-        {"commercial_irreversible_recheck": commercial_irreversible_recheck}
-        if commercial_irreversible_recheck is not None else {}
-      ),
-      **({"commercial_mcp_servers": commercial_mcp_servers} if commercial_mcp_servers is not None else {}),
+      commercial_work_start=commercial_work_start,
+      commercial_irreversible_recheck=commercial_irreversible_recheck,
+      commercial_mcp_servers=commercial_mcp_servers,
     )
 
     async def _dispatch_resume(_background_input: dict[str, Any], **background_kwargs: Any):
@@ -3031,6 +3095,7 @@ def make_resume_handler(
         result_requirement=result_requirement,
         result_provenance=successor_provenance,
         prior_evidence=prior_evidence,
+        prior_terminal_tool_result=prior_terminal_tool_result,
         system_prompt=system_prompt,
         dispatcher=sub_dispatcher,
         sub_session=sub_session,
@@ -3053,6 +3118,7 @@ def make_resume_handler(
           if child_activity_lease_ref[0] is not None
           else None
         ),
+        admitted_task=successor_admitted_task,
       )
 
     def _bind_child_research_file_activity(sub_runner: Any) -> None:
@@ -3103,11 +3169,8 @@ def make_resume_handler(
         agent_name=agent_name,
         parent_turn_id=parent_turn_id,
         on_complete=_release_outer_activity,
-        capability_bind_receipt=execution.bind.receipt(),
+        capability_bind_receipt=execution.bind.to_json(),
         admitted_task=successor_admitted_task,
-        parent_result_policy=_ordinary_parent_result_policy(
-          result_requirement
-        ),
         task_id_override=successor_task_id,
         required_skill_lifecycle=(
           skill_event_emitter.required_lifecycle_metadata()

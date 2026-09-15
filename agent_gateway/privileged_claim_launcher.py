@@ -49,9 +49,6 @@ _TARGET_ENV = {
     "/mnt/hank-data/agent_gateway/data/agent-sessions"
   ),
   "AGENT_SESSION_LOG_ARCHIVE_PRODUCT_IDS": "hank-dev",
-  "AGENT_GATEWAY_SKILLS_DIR": (
-    "/var/www/agent_gateway/api/memory/workspace/notes/skills"
-  ),
   "GATEWAY_APPROVAL_DB_PATH": (
     "/mnt/hank-data/agent_gateway/data/gateway/approvals.sqlite3"
   ),
@@ -59,6 +56,7 @@ _TARGET_ENV = {
     "/mnt/hank-data/agent_gateway/data/commercial"
   ),
   "GATEWAY_LOG_DIR": "/mnt/hank-data/agent_gateway/logs",
+  "GATEWAY_URL": "http://127.0.0.1:8001",
   "MCP_CONFIG_PATH": (
     "/var/www/agent_gateway/deploy/mcp.production.json"
   ),
@@ -231,9 +229,11 @@ def _consume_session_log_layout(
 
 
 def _anonymous_secret_fd(secret: bytes) -> int:
-  read_fd, write_fd = os.pipe2(
-    getattr(os, "O_CLOEXEC", 0)
-  )
+  # os.pipe() returns both ends non-inheritable (PEP 446), which is exactly the
+  # close-on-exec default this transfer wants; os.pipe2 is Linux-only and raises
+  # AttributeError on macOS. The read end is opted back in below so the exec'd
+  # child inherits that one descriptor and nothing else.
+  read_fd, write_fd = os.pipe()
   try:
     view = memoryview(secret)
     while view:
@@ -370,6 +370,7 @@ def launch_with_claim_signing_fd(
     env.pop("AGENT_API_USER_CLAIM_HMAC_KEY", None)
     env.pop("CREDENTIALS_DIRECTORY", None)
     env.pop("AGENT_SESSION_LOG_LAYOUT", None)
+    env.pop("AGENT_GATEWAY_SKILLS_DIR", None)
     env.update(_TARGET_ENV)
     env["AGENT_SESSION_LOG_LAYOUT"] = session_log_layout
     argv = [

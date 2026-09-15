@@ -13,6 +13,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 import agent_gateway.memory as memory_module  # noqa: E402
+import agent_gateway.memory_markdown_sync as memory_markdown_sync_module  # noqa: E402
 from agent_gateway.memory import MarkdownSyncManager, MemoryStore  # noqa: E402
 
 
@@ -67,6 +68,51 @@ def test_markdown_sync_round_trips_through_memory_import_surface(tmp_path: Path)
     store.close()
 
 
+def test_markdown_sync_refuses_malformed_import_and_preserves_unowned_export_files(
+  tmp_path: Path,
+) -> None:
+  import_store = MemoryStore(tmp_path / "import-memory.db")
+  import_workspace = tmp_path / "import-workspace"
+  import_manager = MarkdownSyncManager(import_store, import_workspace)
+  malformed_path = import_workspace / "notes" / "malformed.md"
+  malformed_content = "<!-- gateway-memory: {not-json} -->\n\nkeep me\n"
+
+  export_store = MemoryStore(tmp_path / "export-memory.db")
+  export_workspace = tmp_path / "export-workspace"
+  export_manager = MarkdownSyncManager(export_store, export_workspace)
+  unowned_path = export_workspace / "notes" / "unowned.md"
+  unowned_content = "# User-owned note\n\nkeep me\n"
+  owned_path = export_workspace / "notes" / "stale.md"
+  owned_content = (
+    '<!-- gateway-memory: {"entity_type": "note", "name": "stale", "tags": []} -->\n'
+    "\nStale content\n"
+  )
+
+  try:
+    malformed_path.parent.mkdir(parents=True)
+    malformed_path.write_text(malformed_content, encoding="utf-8")
+
+    imported = _run(import_manager.import_from_files())
+
+    assert imported == {"upserted": 0, "deleted": 0, "files": []}
+    assert malformed_path.read_text(encoding="utf-8") == malformed_content
+
+    unowned_path.parent.mkdir(parents=True)
+    unowned_path.write_text(unowned_content, encoding="utf-8")
+    owned_path.write_text(owned_content, encoding="utf-8")
+
+    exported = _run(export_manager.export_to_files())
+
+    assert exported == {"written": 0, "files": []}
+    assert unowned_path.read_text(encoding="utf-8") == unowned_content
+    assert not owned_path.exists()
+  finally:
+    import_manager.stop_watch()
+    import_store.close()
+    export_manager.stop_watch()
+    export_store.close()
+
+
 def test_markdown_sync_self_writes_do_not_schedule_import(tmp_path: Path) -> None:
   store = MemoryStore(tmp_path / "memory.db")
   manager = MarkdownSyncManager(store, tmp_path / "workspace")
@@ -84,7 +130,7 @@ def test_markdown_sync_self_writes_do_not_schedule_import(tmp_path: Path) -> Non
     store.close()
 
 
-def test_markdown_sync_watch_uses_memory_observer_monkeypatch(
+def test_markdown_sync_watch_uses_canonical_observer_binding(
   monkeypatch,
   tmp_path: Path,
 ) -> None:
@@ -110,7 +156,7 @@ def test_markdown_sync_watch_uses_memory_observer_monkeypatch(
   store = MemoryStore(tmp_path / "memory.db")
   manager = MarkdownSyncManager(store, tmp_path / "workspace")
   try:
-    monkeypatch.setattr(memory_module, "Observer", _FakeObserver)
+    monkeypatch.setattr(memory_markdown_sync_module, "Observer", _FakeObserver)
 
     manager.watch()
 
@@ -138,14 +184,14 @@ def test_markdown_sync_type_hints_resolve_memory_store() -> None:
   assert hints["store"] is MemoryStore
 
 
-def test_markdown_sync_helpers_use_memory_reexported_state(
+def test_markdown_sync_helpers_use_canonical_writing_state(
   monkeypatch,
   tmp_path: Path,
 ) -> None:
   path = tmp_path / "workspace" / "note.md"
   writing_paths: set[Path] = set()
-  monkeypatch.setattr(memory_module, "_WRITING_LOCK", threading.Lock())
-  monkeypatch.setattr(memory_module, "_WRITING_PATHS", writing_paths)
+  monkeypatch.setattr(memory_markdown_sync_module, "_WRITING_LOCK", threading.Lock())
+  monkeypatch.setattr(memory_markdown_sync_module, "_WRITING_PATHS", writing_paths)
 
   with memory_module._writing_path(path):
     assert path.resolve(strict=False) in writing_paths
@@ -154,8 +200,16 @@ def test_markdown_sync_helpers_use_memory_reexported_state(
   assert writing_paths == set()
   assert memory_module._is_self_write(path) is False
 
+  with pytest.raises(RuntimeError, match="intentional writing failure"):
+    with memory_module._writing_path(path):
+      assert path.resolve(strict=False) in writing_paths
+      raise RuntimeError("intentional writing failure")
 
-def test_markdown_sync_ignored_path_uses_memory_temp_suffixes(
+  assert memory_markdown_sync_module._WRITING_PATHS == set()
+  assert memory_module._is_self_write(path) is False
+
+
+def test_markdown_sync_watch_uses_canonical_temp_suffixes_and_workspace_boundary(
   monkeypatch,
   tmp_path: Path,
 ) -> None:
@@ -163,15 +217,19 @@ def test_markdown_sync_ignored_path_uses_memory_temp_suffixes(
   manager = MarkdownSyncManager(store, tmp_path / "workspace")
   scheduled: list[bool] = []
   try:
-    manager._schedule_import = lambda: scheduled.append(True)  # type: ignore[method-assign]
-    monkeypatch.setattr(memory_module, "_TEMP_SUFFIXES", {".md"})
+    manager._schedule_import = lambda: scheduled.append(True)
+    monkeypatch.setattr(memory_markdown_sync_module, "_TEMP_SUFFIXES", {".md"})
 
     manager._handle_watch_path(tmp_path / "workspace" / "note.md")
 
     assert scheduled == []
 
-    monkeypatch.setattr(memory_module, "_TEMP_SUFFIXES", set())
+    monkeypatch.setattr(memory_markdown_sync_module, "_TEMP_SUFFIXES", set())
     manager._handle_watch_path(tmp_path / "workspace" / "note.md")
+
+    assert scheduled == [True]
+
+    manager._handle_watch_path(tmp_path / "outside.md")
 
     assert scheduled == [True]
   finally:
@@ -179,7 +237,7 @@ def test_markdown_sync_ignored_path_uses_memory_temp_suffixes(
     store.close()
 
 
-def test_markdown_sync_atomic_write_uses_memory_writing_path_monkeypatch(
+def test_markdown_sync_atomic_write_uses_canonical_writing_path(
   monkeypatch,
   tmp_path: Path,
 ) -> None:
@@ -191,7 +249,7 @@ def test_markdown_sync_atomic_write_uses_memory_writing_path_monkeypatch(
     yield
 
   path = tmp_path / "workspace" / "note.md"
-  monkeypatch.setattr(memory_module, "_writing_path", _fake_writing_path)
+  monkeypatch.setattr(memory_markdown_sync_module, "_writing_path", _fake_writing_path)
 
   memory_module._atomic_write(path, "hello")
 

@@ -20,6 +20,7 @@ import agent_gateway
 from agent_gateway import AgentRunner, EventLog, ToolDispatcher
 from agent_gateway.agent_session_log import AgentSessionLog
 from agent_gateway.capability_execution import BoundCapabilityExecution
+from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.model_registry import ModelRegistryEntry, ProductModelRegistry
 from agent_gateway.providers import OpenAIProvider
 from agent_workflow_contracts import CapabilityBind
@@ -77,6 +78,7 @@ class _Responses:
 
 class _Provider(OpenAIProvider):
   def __init__(self, responses: _Responses) -> None:
+    super().__init__()
     self._responses = responses
 
   def create_client(
@@ -92,12 +94,29 @@ class _Provider(OpenAIProvider):
     _ = client, timeout
 
 
-class _Mcp:
-  def is_mcp_tool(self, _name: str) -> bool:
-    return False
+class _Mcp(McpClientManager):
+  pass
 
-  def get_server_for_tool(self, _name: str) -> None:
-    return None
+
+class _HostRedactionModule(ModuleType):
+  @staticmethod
+  def get_audit_hmac_secret() -> bytes:
+    return b"broken-host-secret"
+
+  @staticmethod
+  def redact_tool_input(
+    *_args: object,
+    **_kwargs: object,
+  ) -> dict[str, object]:
+    raise RuntimeError("broken selected host redactor")
+
+
+class _SharedModule(ModuleType):
+  tool_redaction: _HostRedactionModule
+
+
+class _AgentModule(ModuleType):
+  shared: _SharedModule
 
 
 def _execution(provider: OpenAIProvider) -> BoundCapabilityExecution:
@@ -289,17 +308,14 @@ async def _main() -> None:
   _ = secret_loader
   fallback = await _run_scenario("fallback", VALID_INPUT)
 
-  agent_module = ModuleType("agent")
+  agent_module = _AgentModule("agent")
   agent_module.__path__ = []
-  shared_module = ModuleType("agent.shared")
+  shared_module = _SharedModule("agent.shared")
   shared_module.__path__ = []
-  host_redaction_module = ModuleType("agent.shared.tool_redaction")
-  host_redaction_module.get_audit_hmac_secret = lambda: b"broken-host-secret"
+  host_redaction_module = _HostRedactionModule(
+    "agent.shared.tool_redaction"
+  )
 
-  def broken_redactor(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-    raise RuntimeError("broken selected host redactor")
-
-  host_redaction_module.redact_tool_input = broken_redactor
   agent_module.shared = shared_module
   shared_module.tool_redaction = host_redaction_module
   sys.modules["agent"] = agent_module

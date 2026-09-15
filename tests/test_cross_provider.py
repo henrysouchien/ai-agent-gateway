@@ -1,10 +1,11 @@
 # ruff: noqa: E402
 
 import asyncio
-import datetime
+import inspect
 import sys
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -27,10 +28,17 @@ from agent_gateway import (
 from agent_gateway.capability_binding import (
   CapabilityResolutionError,
 )
-from agent_gateway.capability_execution import BoundCapabilityExecution
+from agent_gateway.capability_execution import (
+  BoundCapabilityExecution,
+  CapabilityExecutionResolver,
+)
+from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.providers import StreamEvent
+from tests.capability_execution_test_support import (
+  stub_bound_capability_execution,
+  stub_capability_execution_resolver,
+)
 from tests.tool_catalog_test_support import OWNER_GATEWAY_SESSION
-from tests.capability_execution_test_support import stub_bound_capability_execution
 
 
 def _run(coro):
@@ -119,23 +127,6 @@ def _execution(
   )
 
 
-class _ExactResolver:
-  def __init__(self) -> None:
-    self.providers = {
-      "anthropic": _RecordingProvider("anthropic"),
-      "openai": _RecordingProvider("openai"),
-    }
-    self.calls: list[dict[str, Any]] = []
-
-  def resolve(self, capability_id: str, **kwargs: Any) -> BoundCapabilityExecution:
-    self.calls.append({"capability_id": capability_id, **kwargs})
-    return _execution(
-      self.providers["anthropic"],
-      "claude-sonnet-4-6",
-      capability_id=capability_id,
-    )
-
-
 class _StubRunner:
   def __init__(self) -> None:
     self._full_session_id = "session-cross-provider"
@@ -174,7 +165,7 @@ def _make_dispatcher(
   get_tool_definitions: Any | None = None,
 ) -> ToolDispatcher:
   return ToolDispatcher(
-    mcp_client=_NullMcpClient(),
+    mcp_client=McpClientManager(config_path=None),
     local_tool_handlers={},
     event_log=event_log or EventLog(),
     session_id="sess-parent",
@@ -205,15 +196,17 @@ def _write_skill(skills_dir: Path, name: str, body: str) -> None:
 
 def test_spawn_sub_agent_requires_bound_execution_instead_of_parent_fallback() -> None:
   runner = _make_runner(_RecordingProvider("anthropic"))
+  spawn_signature = inspect.signature(runner.spawn_sub_agent)
+  capability_execution = spawn_signature.parameters["capability_execution"]
 
+  assert capability_execution.kind is inspect.Parameter.KEYWORD_ONLY
+  assert capability_execution.default is inspect.Parameter.empty
   with pytest.raises(TypeError, match="capability_execution"):
-    _run(
-      runner.spawn_sub_agent(  # type: ignore[call-arg]
-        "Collect context",
-        dispatcher=_make_dispatcher(),
-        max_turns=1,
-        timeout=5.0,
-      )
+    spawn_signature.bind(
+      "Collect",
+      dispatcher=_make_dispatcher(),
+      max_turns=1,
+      timeout=5.0,
     )
 
 
@@ -230,7 +223,7 @@ def test_bound_execution_rejects_provider_family_mismatch() -> None:
 
 def test_run_agent_rejects_raw_provider_and_model_selection_before_spawn() -> None:
   runner = _StubRunner()
-  resolver = _ExactResolver()
+  resolver = stub_capability_execution_resolver()
   handler = make_run_agent_handler(
     [runner],
     parent_session=OWNER_GATEWAY_SESSION,
@@ -240,22 +233,29 @@ def test_run_agent_rejects_raw_provider_and_model_selection_before_spawn() -> No
     capability_execution_resolver=resolver,
   )
 
-  result, error = _run(handler({
-    "background": False,
-    "task": "Collect",
-    "provider": "openai",
-    "model": "gpt-4o-mini",
-  }))
+  with patch.object(
+    CapabilityExecutionResolver,
+    "resolve",
+    autospec=True,
+    side_effect=CapabilityExecutionResolver.resolve,
+  ) as resolve_spy:
+    result, error = _run(handler({
+      "background": False,
+      "task": "Collect",
+      "provider": "openai",
+      "model": "gpt-4o-mini",
+    }))
 
   assert result is None
+  assert error is not None
   assert error["code"] == "invalid_input"
-  assert resolver.calls == []
+  resolve_spy.assert_not_called()
   assert runner.calls == []
 
 
 def test_run_agent_rejects_provider_only_before_resolver_or_spawn() -> None:
   runner = _StubRunner()
-  resolver = _ExactResolver()
+  resolver = stub_capability_execution_resolver()
   handler = make_run_agent_handler(
     [runner],
     skill_loader=None,
@@ -264,17 +264,24 @@ def test_run_agent_rejects_provider_only_before_resolver_or_spawn() -> None:
     capability_execution_resolver=resolver,
   )
 
-  result, error = _run(handler({"task": "Collect", "provider": "openai"}))
+  with patch.object(
+    CapabilityExecutionResolver,
+    "resolve",
+    autospec=True,
+    side_effect=CapabilityExecutionResolver.resolve,
+  ) as resolve_spy:
+    result, error = _run(handler({"task": "Collect", "provider": "openai"}))
 
   assert result is None
+  assert error is not None
   assert error["code"] == "invalid_input"
-  assert resolver.calls == []
+  resolve_spy.assert_not_called()
   assert runner.calls == []
 
 
 def test_run_agent_rejects_bare_upstream_model() -> None:
   runner = _StubRunner()
-  resolver = _ExactResolver()
+  resolver = stub_capability_execution_resolver()
   handler = make_run_agent_handler(
     [runner],
     skill_loader=None,
@@ -283,15 +290,22 @@ def test_run_agent_rejects_bare_upstream_model() -> None:
     capability_execution_resolver=resolver,
   )
 
-  result, error = _run(handler({
-    "background": False,
-    "task": "Collect",
-    "model": "gpt-4o-mini",
-  }))
+  with patch.object(
+    CapabilityExecutionResolver,
+    "resolve",
+    autospec=True,
+    side_effect=CapabilityExecutionResolver.resolve,
+  ) as resolve_spy:
+    result, error = _run(handler({
+      "background": False,
+      "task": "Collect",
+      "model": "gpt-4o-mini",
+    }))
 
   assert result is None
+  assert error is not None
   assert error["code"] == "invalid_input"
-  assert resolver.calls == []
+  resolve_spy.assert_not_called()
   assert runner.calls == []
 
 
@@ -319,7 +333,7 @@ def test_run_agent_rejects_legacy_skill_and_task_selectors(tmp_path: Path) -> No
     ),
   )
   runner = _StubRunner()
-  resolver = _ExactResolver()
+  resolver = stub_capability_execution_resolver()
   handler = make_run_agent_handler(
     [runner],
     skill_loader=SkillLoader(skills_dir),
@@ -328,15 +342,22 @@ def test_run_agent_rejects_legacy_skill_and_task_selectors(tmp_path: Path) -> No
     capability_execution_resolver=resolver,
   )
 
-  result, error = _run(handler({
-    "agent": "openai-worker",
-    "task": "Collect",
-    "background": False,
-  }))
+  with patch.object(
+    CapabilityExecutionResolver,
+    "resolve",
+    autospec=True,
+    side_effect=CapabilityExecutionResolver.resolve,
+  ) as resolve_spy:
+    result, error = _run(handler({
+      "agent": "openai-worker",
+      "task": "Collect",
+      "background": False,
+    }))
 
   assert result is None
+  assert error is not None
   assert error["code"] == "invalid_input"
-  assert resolver.calls == []
+  resolve_spy.assert_not_called()
   assert runner.calls == []
 
 

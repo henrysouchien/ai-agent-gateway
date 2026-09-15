@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 from agent_gateway.control_plane.runs_helpers import _latest_tool_result, _pending_approval
+from agent_gateway.session import GatewaySession
 
 
 def test_pending_approval_projects_trusted_change_without_agent_judgment() -> None:
@@ -13,7 +12,12 @@ def test_pending_approval_projects_trusted_change_without_agent_judgment() -> No
     "intent": {"subcommand": "persist_business_model"},
     "target": {"ticker": "MSFT", "research_file_id": 1},
   }
-  session = SimpleNamespace(
+  session = GatewaySession(
+    session_id="pending-approval-projection",
+    api_key_hash="hash",
+    created_at=1,
+    expires_at=4_000_000_000,
+    user_id="alice",
     pending_tools={
       "call-1": {
         "status": "approval_pending",
@@ -25,7 +29,7 @@ def test_pending_approval_projects_trusted_change_without_agent_judgment() -> No
         "allow_persistent_approval": False,
         "requested_at": 1_786_233_600,
       }
-    }
+    },
   )
 
   response = _pending_approval(session)
@@ -66,6 +70,34 @@ def test_latest_tool_result_is_bounded_and_preserves_terminal_outcome() -> None:
   assert summary.verdict == "BM_CONSTRUCTED"
   assert summary.stage_receipt_status == "accepted"
   assert "readback" not in summary.model_dump()
+
+
+def test_latest_tool_result_consumes_is_error_and_keeps_diagnostic_detail() -> None:
+  summary = _latest_tool_result(
+    [
+      {
+        "type": "tool_call_complete",
+        "tool_call_id": "tool-1",
+        "tool_name": "lookup",
+        "is_error": False,
+        "error": {"code": "diagnostic_only", "message": "kept for display"},
+        "semantic_error": {
+          "code": "semantic_diagnostic",
+          "message": "not a second outcome",
+        },
+        "result": {
+          "status": "failure",
+          "error": {"code": "result_diagnostic", "message": "result detail"},
+        },
+      }
+    ]
+  )
+
+  assert summary is not None
+  assert summary.succeeded is True
+  assert summary.status == "failure"
+  assert summary.error_code == "result_diagnostic"
+  assert summary.error_message == "result detail"
 
 
 def test_latest_tool_result_extracts_verdict_from_business_model_envelope() -> None:

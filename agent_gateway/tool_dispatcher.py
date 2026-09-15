@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime
 import asyncio
+import copy
 import hashlib
 import inspect
 import json
@@ -8,19 +10,26 @@ import logging
 import os
 import time
 from importlib import import_module
-from typing import AbstractSet, Any, Callable, Dict, get_args, Literal, Mapping, Optional, Sequence, Set, TYPE_CHECKING
+from typing import AbstractSet, Any, Callable, cast, Dict, get_args, Mapping, Optional, Protocol, Sequence, Set, TYPE_CHECKING, TypeGuard
+
+from agent_workflow_contracts.tool_registration import (
+  RegisteredToolIdentity,
+  ToolRegistrationCatalog,
+  ToolRegistrationDeclaration,
+  validate_tool_registration_catalog,
+  validate_tool_registration_declaration,
+)
 
 from . import approval_settings
 from .approval_policy import (
   ApprovalConstraint,
   ApprovalConstraintError,
+  ApprovalReuseMode,
   ApprovalDecision as PolicyApprovalDecision,
-  ApprovalPolicy,
   ApprovalRequest as PolicyApprovalRequest,
   RunContext,
   ToolClass,
   approval_is_executable,
-  sha256_args,
   utc_now,
 )
 from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich_trade_approval_args
@@ -28,14 +37,26 @@ from .approval_constraints import (
   constraint_for_catalog_action,
   trusted_catalog_action,
 )
+from .approval_route import (
+  NO_APPROVAL_ROUTE,
+  ApprovalRoute,
+  DurableLocalApprovalRoute,
+  NoApprovalRoute,
+  ParentDelegatedApprovalRoute,
+  route_policy,
+  route_store,
+)
 from .event_log import EventLog
 from .execution_identity import DispatchIdentity
 from .investment_capability_claim import (
+  INVESTMENT_CAPABILITY_CLAIM_SERVER,
   INVESTMENT_CAPABILITY_FACADE_TOOLS,
   InvestmentCapabilityClaimError,
+  investment_capability_claim_unavailable_error,
   issue_investment_capability_claim,
 )
 from .mcp_client_catalog import tool_argument_guidance
+from .mcp_client import RegisteredMcpPlannedToolCall, RegisteredMcpToolCall, registered_mcp_dispatch_scope
 from .policy_imports import (
   authority_policy_denies_tool,
   resolve_effective_role,
@@ -54,7 +75,19 @@ from .secret_boundary import (
   SecretBoundary,
   sanitize_boundary_value,
 )
-from .skill_context import current_skill
+from .tool_policy_registry import (
+  ApprovalCacheKeyCall,
+  ApprovalPredicateCall,
+  InputPreparationCall,
+  OutcomeCall,
+  PreparedToolCall,
+  RedactionCall,
+  SourceIdentityCall,
+  ToolInputPreparationError,
+  ToolPolicyImplementationRegistry,
+)
+from .skill_context import current_skill, current_skill_admission
+from .skill_limits import reconcile_skill_admission
 from . import tool_dispatcher_audit as _audit_helpers
 from . import tool_dispatcher_approval_lifecycle as _approval_lifecycle_helpers
 from . import tool_dispatcher_runtime as _runtime_helpers
@@ -89,33 +122,135 @@ from .tool_dispatcher_helpers import (
   validate_against_local_schema as _validate_against_local_schema_helper,
   validate_local_tool_input as _validate_local_tool_input_helper,
 )
-if TYPE_CHECKING:
-  from .mcp_client import McpClientManager
+from .tool_dispatch_classification import (
+  DispatchEntry,
+  OUTCOME_OK,
+  ToolResultSettlement,
+  is_mcp_validation_error as _is_mcp_validation_error,
+  settle_catalogless_tool_result,
+)
 
+if TYPE_CHECKING:
+  from .approval_store import TargetedPreparedReconciliationResult
+  from .mcp_client import McpClientManager
+  from .prepared_business_model_store import (
+    PreparedBusinessModelChange,
+    PreparedBusinessModelLifecycle,
+  )
 
 log = logging.getLogger("agent_gateway.dispatcher")
 
 
-_MCP_VALIDATION_ERROR_CODES = {"invalid_input", "validation_error"}
-_MCP_VALIDATION_ERROR_MARKERS = (
-  "validation error",
-  "missing required argument",
-  "unexpected keyword argument",
-  "[type=missing_argument]",
-  "[type=unexpected_keyword_argument]",
-)
 _PORTFOLIO_SCOPE_FIELDS = frozenset({"portfolio_id", "portfolio_name"})
 _CATALOG_ACTION_UNSET = object()
 _TOOL_CLASSES = frozenset(get_args(ToolClass))
 
+class ToolDispatcherApprovalStore(Protocol):
+  """Prepared-plan methods called by the dispatch gate."""
 
-def _is_mcp_validation_error(error: Mapping[str, Any]) -> bool:
-  code = str(error.get("code") or "").strip().lower()
-  sub_code = str(error.get("sub_code") or "").strip().lower()
-  if code in _MCP_VALIDATION_ERROR_CODES or sub_code in _MCP_VALIDATION_ERROR_CODES:
-    return True
-  message = str(error.get("message") or "").lower()
-  return any(marker in message for marker in _MCP_VALIDATION_ERROR_MARKERS)
+  async def get(
+    self,
+    approval_id: str,
+  ) -> PolicyApprovalRequest | None: ...
+
+  async def get_prepared_business_model_change(
+    self,
+    *,
+    caller_kind: str,
+    user_scope: str,
+    idempotency_locator: str,
+  ) -> PreparedBusinessModelChange | None: ...
+
+  async def reconcile_prepared_business_model_change(
+    self,
+    *,
+    caller_kind: str,
+    user_scope: str,
+    idempotency_locator: str,
+    now: datetime | None = None,
+  ) -> TargetedPreparedReconciliationResult: ...
+
+  async def transition_prepared_business_model_change(
+    self,
+    *,
+    caller_kind: str,
+    user_scope: str,
+    idempotency_locator: str,
+    expected: PreparedBusinessModelLifecycle,
+    target: PreparedBusinessModelLifecycle,
+    approval_id: str | None = None,
+    approval_chain_id: str | None = None,
+    execution_receipt: bytes | None = None,
+    restoration_digest: str | None = None,
+    checkpoint_id: str | None = None,
+    consumed_at: str | None = None,
+  ) -> PreparedBusinessModelChange: ...
+
+
+class _ToolDispatcherApprovalAuthority(
+  ToolDispatcherApprovalStore,
+  _approval_lifecycle_helpers._ApprovalLifecycleAuthority,
+  Protocol,
+):
+  """The route aggregate needed by dispatch and its lifecycle delegate."""
+
+
+class RegisteredApprovalPolicyError(RuntimeError):
+  """A registered approval policy could not produce a safe decision."""
+
+
+def resolve_registered_addin_declaration(
+  catalog: ToolRegistrationCatalog | None,
+  tool_name: str,
+) -> ToolRegistrationDeclaration | None:
+  """Resolve one exact add-in declaration without bare-name fallback."""
+
+  if catalog is None:
+    return None
+  try:
+    declaration = catalog.by_identity(RegisteredToolIdentity(
+      route_kind="addin_relay",
+      logical_server_id=None,
+      logical_name=tool_name,
+    ))
+  except LookupError:
+    return None
+  policy = declaration.semantics.input_preparation_policy
+  if (
+    declaration.identity.route_kind != "addin_relay"
+    or policy.policy_id != "addin-workbook-context"
+    or policy.version != "v1"
+  ):
+    raise RuntimeError(
+      "registered add-in route lacks exact workbook preparation"
+    )
+  return declaration
+
+
+def execute_registered_addin_input_preparation(
+  catalog: ToolRegistrationCatalog,
+  registry: ToolPolicyImplementationRegistry,
+  declaration: ToolRegistrationDeclaration,
+  tool_input: Mapping[str, Any],
+  trusted_context: object | None,
+) -> PreparedToolCall:
+  """Execute one authoritative registered add-in input policy."""
+
+  canonical = validate_tool_registration_declaration(declaration)
+  exact = resolve_registered_addin_declaration(
+    catalog,
+    canonical.identity.logical_name,
+  )
+  if exact is None or exact != canonical:
+    raise RuntimeError("registered add-in declaration is not authoritative")
+  return registry.execute_input_preparation(
+    exact.semantics.input_preparation_policy,
+    InputPreparationCall(
+      exact.identity,
+      tool_input,
+      trusted_context,
+    ),
+  )
 
 
 def _schema_properties(schema: Any) -> dict[str, Any]:
@@ -177,7 +312,6 @@ class ToolDispatcher:
     on_headless_ask: HeadlessAskCallback | None = None,
     mcp_session_inject_servers: set[str] | None = None,
     mcp_meta_inject_servers: frozenset[str] | None = None,
-    mcp_identity_overrides: Mapping[str, str | int] | None = None,
     identity: DispatchIdentity | None = None,
     user_id: str | None = None,
     risk_user_id: int | None = None,
@@ -186,11 +320,10 @@ class ToolDispatcher:
     credentials_resolver_active: bool = False,
     session_cache_denied_tools: frozenset[str] | None = None,
     session: Any | None = None,
-    store: Any | None = None,
-    policy: ApprovalPolicy | None = None,
+    approval_route: ApprovalRoute = NO_APPROVAL_ROUTE,
     run_context: RunContext | None = None,
-    get_tool_definitions: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
-    allowed_mcp_tools_by_server: Mapping[str, Set[str]] | None = None,
+    get_tool_definitions: Callable[[], list[dict[str, Any]]] | None = None,
+    allowed_mcp_tools_by_server: Mapping[str, AbstractSet[str]] | None = None,
     mcp_scope_context: str = "skill",
     describe_mcp_scope_block: Callable[[str | None, str], str | None] | None = None,
     commercial_work_start: Any | None = None,
@@ -198,6 +331,23 @@ class ToolDispatcher:
     commercial_mcp_servers: frozenset[str] | None = None,
     local_tool_class_resolver: Callable[[str], ToolClass] | None = None,
     local_catalog_action_resolver: Callable[[str], Any | None] | None = None,
+    tool_registration_catalog: ToolRegistrationCatalog | None = None,
+    tool_policy_implementations: ToolPolicyImplementationRegistry | None = None,
+    input_preparation_context_factory: (
+      Callable[[ToolRegistrationDeclaration], object | None] | None
+    ) = None,
+    redaction_context_factory: (
+      Callable[[ToolRegistrationDeclaration], object | None] | None
+    ) = None,
+    approval_predicate_context_factory: (
+      Callable[
+        [ToolRegistrationDeclaration, PreparedToolCall],
+        object | None,
+      ] | None
+    ) = None,
+    registered_approval_overlay: (
+      Callable[[ToolRegistrationDeclaration, PreparedToolCall], bool] | None
+    ) = None,
   ) -> None:
     self._mcp = mcp_client
     self._local = local_tool_handlers or {}
@@ -213,6 +363,104 @@ class ToolDispatcher:
       )
     self._local_tool_classes: dict[str, ToolClass] | None = None
     self._local_catalog_actions: dict[str, Any | None] | None = None
+    if (tool_registration_catalog is None) != (
+      tool_policy_implementations is None
+    ):
+      raise ValueError(
+        "tool registration catalog and policy implementations must be provided together"
+      )
+    self._tool_registration_catalog = (
+      validate_tool_registration_catalog(tool_registration_catalog)
+      if tool_registration_catalog is not None
+      else None
+    )
+    if (
+      tool_policy_implementations is not None
+      and type(tool_policy_implementations)
+      is not ToolPolicyImplementationRegistry
+    ):
+      raise TypeError(
+        "tool_policy_implementations must be an exact ToolPolicyImplementationRegistry"
+      )
+    if tool_policy_implementations is not None:
+      assert self._tool_registration_catalog is not None
+      tool_policy_implementations.validate_catalog(
+        self._tool_registration_catalog
+      )
+    if (
+      input_preparation_context_factory is not None
+      and not callable(input_preparation_context_factory)
+    ):
+      raise TypeError("input_preparation_context_factory must be callable")
+    if (
+      input_preparation_context_factory is not None
+      and tool_policy_implementations is None
+    ):
+      raise ValueError(
+        "input preparation context requires registered policy implementations"
+      )
+    if (
+      redaction_context_factory is not None
+      and not callable(redaction_context_factory)
+    ):
+      raise TypeError("redaction_context_factory must be callable")
+    if (
+      redaction_context_factory is not None
+      and tool_policy_implementations is None
+    ):
+      raise ValueError(
+        "redaction context requires registered policy implementations"
+      )
+    if (
+      self._tool_registration_catalog is not None
+      and redaction_context_factory is None
+    ):
+      raise ValueError(
+        "registered tool catalog requires a redaction context factory"
+      )
+    if (
+      approval_predicate_context_factory is not None
+      and not callable(approval_predicate_context_factory)
+    ):
+      raise TypeError("approval_predicate_context_factory must be callable")
+    if (
+      approval_predicate_context_factory is not None
+      and tool_policy_implementations is None
+    ):
+      raise ValueError(
+        "approval predicate context requires registered policy implementations"
+      )
+    if (
+      registered_approval_overlay is not None
+      and not callable(registered_approval_overlay)
+    ):
+      raise TypeError("registered_approval_overlay must be callable")
+    if (
+      registered_approval_overlay is not None
+      and approval_predicate_context_factory is None
+    ):
+      raise ValueError(
+        "registered approval overlay requires registered approval runtime"
+      )
+    self._tool_policy_implementations = tool_policy_implementations
+    self._input_preparation_context_factory = (
+      input_preparation_context_factory
+    )
+    self._redaction_context_factory = redaction_context_factory
+    self._prepared_tool_input_redactor = (
+      self._redact_catalogless_prepared_tool_input
+      if self._tool_registration_catalog is None
+      else self._redact_registered_prepared_tool_input
+    )
+    self._raw_history_input_redactor = (
+      self._redact_catalogless_raw_history_input
+      if self._tool_registration_catalog is None
+      else self._redact_registered_raw_history_input
+    )
+    self._approval_predicate_context_factory = (
+      approval_predicate_context_factory
+    )
+    self._registered_approval_overlay = registered_approval_overlay
     if (
       local_tool_class_resolver is not None
       and local_catalog_action_resolver is not None
@@ -232,7 +480,7 @@ class ToolDispatcher:
           local_handler,
           catalog_action=catalog_action,
         )
-        local_tool_classes[local_tool_name] = tool_class  # type: ignore[assignment]
+        local_tool_classes[local_tool_name] = tool_class
         local_catalog_actions[local_tool_name] = catalog_action
       self._local_tool_classes = local_tool_classes
       self._local_catalog_actions = local_catalog_actions
@@ -248,7 +496,7 @@ class ToolDispatcher:
     self._on_headless_ask = on_headless_ask
     self._mcp_session_inject_servers = mcp_session_inject_servers or set()
     self._mcp_meta_inject_servers = mcp_meta_inject_servers or frozenset()
-    self._mcp_identity_overrides = dict(mcp_identity_overrides or {})
+    supplied_session = session
     if identity is not None:
       # D-B6-1: one identity value, not five arguments assembled per call
       # site. Passing both would let the two disagree, so it is refused.
@@ -278,11 +526,25 @@ class ToolDispatcher:
     self._channel = channel
     self._role = resolve_effective_role(role)
     self._credentials_resolver_active = credentials_resolver_active
+    self._approval_route = approval_route
+    if not isinstance(self._approval_route, NoApprovalRoute):
+      # D-B6-1, applied to the other value that carries a session: a live
+      # approval route already names the GatewaySession whose ledger row,
+      # pending-tools entry and single-slot decision queue record the
+      # decision, so that session cannot also arrive separately.
+      if supplied_session is not None:
+        raise ValueError(
+          "approval route supersedes the separate session argument"
+        )
+      route_session = self._approval_route.session
+      if identity is not None and identity.session is not route_session:
+        raise ValueError(
+          "dispatch identity and approval route name different sessions"
+        )
+      session = route_session
     self._session_cache_denied = session_cache_denied_tools or frozenset()
     self._source_pack_session = session
     self._session = session
-    self._approval_store = store or getattr(session, "approval_store", None)
-    self._approval_policy = policy or getattr(session, "approval_policy", None)
     self._run_context = run_context
     self._get_tool_definitions = get_tool_definitions
     self._mcp_scope_context = mcp_scope_context
@@ -291,7 +553,6 @@ class ToolDispatcher:
     self._commercial_irreversible_recheck = commercial_irreversible_recheck
     self._commercial_mcp_servers = commercial_mcp_servers or frozenset()
     self._secret_boundary = SecretBoundary()
-    self._mcp_accepts_abort_event = self._callable_accepts_kw(getattr(self._mcp, "call_tool", None), "abort_event")
     if allowed_mcp_tools_by_server is None:
       self._allowed_mcp_tools_by_server = None
     elif isinstance(allowed_mcp_tools_by_server, Mapping):
@@ -305,12 +566,60 @@ class ToolDispatcher:
         for server_name, tool_names in allowed_mcp_tools_by_server.items()
       }
 
+  @property
+  def _approval_store(self) -> _ToolDispatcherApprovalAuthority | None:
+    """The durable ledger the admitted route owns, if it owns one."""
+
+    return route_store(self._approval_route)
+
+  def _durable_business_model_store(self) -> ToolDispatcherApprovalStore:
+    """Return the ledger admitted for the prepared BusinessModel path."""
+
+    route = self._approval_route
+    if isinstance(route, DurableLocalApprovalRoute):
+      return route.store
+    raise TrustedToolPlanError(
+      "prepared BusinessModel lifecycle requires durable local approval custody"
+    )
+
+  @property
+  def _approval_policy(
+    self,
+  ) -> _approval_lifecycle_helpers.ApprovalLifecyclePolicy | None:
+    """The opaque policy handle the admitted route owns, if it owns one."""
+
+    return route_policy(self._approval_route)
+
   def bind_secret_boundary(self, boundary: SecretBoundary) -> None:
     """Bind lifecycle-local secret knowledge supplied by the owning runner."""
 
     if not isinstance(boundary, SecretBoundary):
       raise TypeError("dispatcher secret boundary must be SecretBoundary")
     self._secret_boundary = boundary
+
+  @property
+  def run_context(self) -> RunContext | None:
+    """The run context policy is enforced against; ``None`` outside a run."""
+
+    return self._run_context
+
+  def with_scoped_local_handler(
+    self,
+    tool_name: str,
+    scope: Callable[[LocalToolHandler], LocalToolHandler],
+  ) -> "ToolDispatcher":
+    """Return a shallow clone whose local ``tool_name`` handler is ``scope(stock)``.
+
+    A fork narrows what its parent already dispatches locally; it never adds a
+    route the parent lacks, so a missing stock handler raises ``KeyError``.
+    """
+
+    stock = self._local.get(tool_name)
+    if not callable(stock):
+      raise KeyError(tool_name)
+    clone = copy.copy(self)
+    clone._local = {**self._local, tool_name: scope(stock)}
+    return clone
 
   def _append_event(self, event: dict[str, Any]) -> Any | None:
     if self._event_log is None:
@@ -442,7 +751,7 @@ class ToolDispatcher:
     server_name: str | None,
     advertised_tool_names: AbstractSet[str] | None,
   ) -> Dict[str, Any] | None:
-    """Reject MCP calls absent from the exact provider-request tool snapshot."""
+    """Materialize an MCP provider-request snapshot failure."""
 
     if advertised_tool_names is None:
       return {
@@ -450,8 +759,6 @@ class ToolDispatcher:
         "sub_code": "advertisement_unavailable",
         "message": "The advertised MCP tool snapshot is unavailable; dispatch was denied.",
       }
-    if tool_name in advertised_tool_names:
-      return None
     advertised_scope = (
       {server_name: set(advertised_tool_names)}
       if server_name
@@ -464,6 +771,136 @@ class ToolDispatcher:
       scope_context=self._mcp_scope_context,
       describe_scope_block=self._describe_mcp_scope_block,
     )
+
+  def _deferred_local_pack_for_unadvertised_tool(
+    self,
+    tool_name: str,
+    advertised_tool_names: AbstractSet[str],
+  ) -> str | None:
+    """Return the one catalog-owned pack this session can load for a local tool."""
+
+    if (
+      self._session is None
+      or self._role != "owner"
+      or tool_name not in self._local
+      or "load_tools" not in self._local
+      or "load_tools" not in advertised_tool_names
+    ):
+      return None
+    profile_name = (
+      str(getattr(self._run_context, "profile", "") or "") or None
+    )
+    if (
+      authority_policy_denies_tool(
+        session=self._session,
+        role=self._role,
+        tool_name=tool_name,
+        is_local=True,
+        profile_name=profile_name,
+      )
+      or authority_policy_denies_tool(
+        session=self._session,
+        role=self._role,
+        tool_name="load_tools",
+        is_local=True,
+        profile_name=profile_name,
+      )
+    ):
+      return None
+    loaded_local_tools = getattr(
+      self._session,
+      "loaded_local_tools",
+      None,
+    )
+    if loaded_local_tools is None or tool_name in loaded_local_tools:
+      return None
+
+    try:
+      if TYPE_CHECKING:
+        from agent.shared import tool_catalog
+      else:
+        tool_catalog = import_module("agent.shared.tool_catalog")
+    except ModuleNotFoundError as exc:
+      if exc.name not in {
+        "agent",
+        "agent.shared",
+        "agent.shared.tool_catalog",
+      }:
+        raise
+      return None
+    if TYPE_CHECKING:
+      get_deferred_local_tool_names = (
+        tool_catalog.get_deferred_local_tool_names
+      )
+      tool_packs = tool_catalog.FMS_LOCAL_TOOL_PACKS
+    else:
+      get_deferred_local_tool_names = getattr(
+        tool_catalog,
+        "get_deferred_local_tool_names",
+        None,
+      )
+      tool_packs = getattr(tool_catalog, "FMS_LOCAL_TOOL_PACKS", None)
+    if (
+      not callable(get_deferred_local_tool_names)
+      or not isinstance(tool_packs, Mapping)
+      or tool_name not in get_deferred_local_tool_names(self._channel)
+    ):
+      return None
+    pack_names = [
+      str(pack_name)
+      for pack_name, pack in sorted(tool_packs.items())
+      if isinstance(pack, Mapping)
+      and tool_name in (pack.get("local_tools") or ())
+    ]
+    return pack_names[0] if len(pack_names) == 1 else None
+
+  def _request_advertisement_error(
+    self,
+    tool_name: str,
+    advertised_tool_names: AbstractSet[str] | None,
+    *,
+    is_mcp: bool,
+    server_name: str | None,
+  ) -> Dict[str, Any] | None:
+    """Apply one provider-request tool-name snapshot to local and MCP routes."""
+
+    if advertised_tool_names is None:
+      return (
+        self._wire_mcp_scope_error(
+          tool_name,
+          server_name,
+          advertised_tool_names,
+        )
+        if is_mcp
+        else None
+      )
+    if tool_name in advertised_tool_names:
+      return None
+    if is_mcp:
+      return self._wire_mcp_scope_error(
+        tool_name,
+        server_name,
+        advertised_tool_names,
+      )
+    deferred_pack = self._deferred_local_pack_for_unadvertised_tool(
+      tool_name,
+      advertised_tool_names,
+    )
+    return {
+      "code": "tool_not_advertised",
+      "message": (
+        f"Tool '{tool_name}' was not advertised for this provider request"
+      ),
+      "details": {"tool_name": tool_name},
+      "fix": (
+        "Call only tools advertised for this provider request."
+        if deferred_pack is None
+        else (
+          f"This tool is in deferred tool pack '{deferred_pack}'; "
+          f'call load_tools(pack="{deferred_pack}") before retrying.'
+        )
+      ),
+    }
 
   @staticmethod
   def _catalog_action(tool_name: str) -> Any | None:
@@ -502,18 +939,21 @@ class ToolDispatcher:
     identity_marker = getattr(handler, "PLANNING_IDENTITY", None)
     planner = getattr(handler, "plan_change", None)
     executor = getattr(handler, "execute_prepared_change", None)
-    declared = (
-      identity_marker is not None,
-      callable(planner),
-      callable(executor),
-    )
-    if not any(declared):
+    if (
+      identity_marker is None
+      and not callable(planner)
+      and not callable(executor)
+    ):
       if required_identity is not None:
         raise TrustedToolPlanError(
           f"catalogued exact-write tool {tool_name!r} lost its planning hooks"
         )
       return None
-    if not all(declared):
+    if (
+      identity_marker is None
+      or not callable(planner)
+      or not callable(executor)
+    ):
       raise TrustedToolPlanError(
         "planned local handler must declare identity, planner, and exact executor"
       )
@@ -568,7 +1008,7 @@ class ToolDispatcher:
     finalizer = getattr(completion, "finalizer", None)
     prepared_accept = getattr(finalizer, "prepared_accept", None)
     serializer = getattr(prepared_accept, "to_canonical_bytes", None)
-    if not callable(serializer):
+    if prepared_accept is None or not callable(serializer):
       # Blocked/non-success verdicts intentionally carry no accepted business
       # model. They still execute through the generic exact-plan lifecycle;
       # only an actual accept is eligible for the stronger durable replay row.
@@ -595,51 +1035,6 @@ class ToolDispatcher:
       "change_hash": trusted_plan.change_hash,
       "base_vector_hash": trusted_plan.base_vector_hash,
     }
-
-  def _plan_raw_patch_mcp_write(
-    self,
-    tool_input: Dict[str, Any],
-    *,
-    tool_ctx: ToolExecutionContext,
-    own_prepared: Callable[[Any], None] | None = None,
-  ) -> TrustedToolPlan:
-    """Plan the shipped raw MCP write locally before any approval is created."""
-
-    from research.patch_engine import prepare_raw_patch_apply
-    from research.repository import get_repository_factory
-    from research.workspace_paths import route_workspace_dir
-
-    run_context = self._resolve_run_context()
-    user_id = str(run_context.user_id or "").strip()
-    if not user_id:
-      raise TrustedToolPlanError("raw patch planning requires a trusted user")
-    research_file_id = tool_input.get("research_file_id")
-    if isinstance(research_file_id, bool) or not isinstance(research_file_id, int):
-      raise TrustedToolPlanError("raw patch planning requires research_file_id")
-    raw_ops = tool_input.get("ops")
-    if not isinstance(raw_ops, list):
-      raise TrustedToolPlanError("raw patch planning requires an ops list")
-    workspace_dir = route_workspace_dir(user_id, tool_input.get("workspace_dir"))
-    repo = get_repository_factory().get(user_id)
-    prepared = prepare_raw_patch_apply(
-      repo,
-      research_file_id,
-      {"ops": raw_ops},
-      skill_run_id=tool_input.get("skill_run_id"),
-      workspace_dir=workspace_dir,
-      allow_business_overview_replacement=(
-        tool_input.get("allow_business_overview_replacement") is True
-      ),
-    )
-    if own_prepared is not None:
-      own_prepared(prepared)
-    trusted_plan = TrustedToolPlan.create(
-      identity_source="reviewed_change_binding",
-      identity=prepared.binding,
-      prepared=prepared,
-    )
-    tool_ctx.trusted_plan = trusted_plan
-    return trusted_plan
 
   def _new_tool_execution_context(
     self,
@@ -688,8 +1083,572 @@ class ToolDispatcher:
     workspace_dir: str | None = None,
     batch_id: int | str | None = None,
     capture_readable_resource_snapshot: bool = False,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: (
+      Callable[[PreparedToolCall], None] | None
+    ) = None,
   ) -> ToolResult:
     """Execute one tool call while owning any private planning snapshot."""
+    if type(allow_uncertain_mcp_replay) is not bool:
+      raise TypeError("allow_uncertain_mcp_replay must be an exact bool")
+    try:
+      prepared_call = self.prepare_tool_call(
+        tool_name,
+        tool_input,
+      )
+    except ToolInputPreparationError as exc:
+      return None, exc.materialize_error()
+    except Exception as exc:
+      log.error(
+        "Tool input preparation failed for %s | exception_type=%s",
+        tool_name,
+        type(exc).__name__,
+      )
+      return None, {
+        "code": "tool_input_preparation_failed",
+        "message": f"Tool '{tool_name}' input could not be prepared for dispatch.",
+      }
+    return await self.dispatch_prepared(
+      tool_call_id,
+      tool_name,
+      prepared_call,
+      call_index=call_index,
+      advertised_tool_names=advertised_tool_names,
+      abort_event=abort_event,
+      skill_run_id=skill_run_id,
+      step_id=step_id,
+      workspace_dir=workspace_dir,
+      batch_id=batch_id,
+      capture_readable_resource_snapshot=capture_readable_resource_snapshot,
+      allow_uncertain_mcp_replay=allow_uncertain_mcp_replay,
+      on_executed_prepared_call=on_executed_prepared_call,
+    )
+
+  def prepare_tool_call(
+    self,
+    tool_name: str,
+    tool_input: Mapping[str, Any],
+  ) -> PreparedToolCall:
+    """Prepare one immutable call before redaction, approval, and retry."""
+
+    if (
+      tool_name not in self._local
+      and self._mcp.is_mcp_tool(tool_name)
+      and callable(getattr(self._mcp, "uses_registered_tool_catalog", None))
+      and self._mcp.uses_registered_tool_catalog()
+    ):
+      return self._mcp.prepare_registered_tool_input(
+        tool_name,
+        tool_input,
+        self._portfolio_dispatch_scope(),
+      )
+    declaration = self._registered_code_declaration(tool_name)
+    if declaration is not None:
+      registry = self._tool_policy_implementations
+      context_factory = self._input_preparation_context_factory
+      if registry is None or context_factory is None:
+        raise RuntimeError(
+          "registered code input-preparation runtime is not configured"
+        )
+      return registry.execute_input_preparation(
+        declaration.semantics.input_preparation_policy,
+        InputPreparationCall(
+          declaration.identity,
+          tool_input,
+          context_factory(declaration),
+        ),
+      )
+    return PreparedToolCall(
+      self.resolve_effective_tool_input(tool_name, dict(tool_input))
+    )
+
+  def _registered_code_declaration(
+    self,
+    tool_name: str,
+  ) -> ToolRegistrationDeclaration | None:
+    if tool_name != "code_execute" or tool_name not in self._local:
+      return None
+    declaration = self.registered_tool_declaration(tool_name)
+    if declaration is None:
+      return None
+    if declaration.identity.route_kind != "local_handler":
+      raise RuntimeError(
+        "registered code_execute route must be an exact local_handler"
+      )
+    if (
+      declaration.semantics.input_preparation_policy.policy_id
+      != "code-execution-backend"
+    ):
+      raise RuntimeError(
+        "registered code_execute route lacks exact backend preparation"
+      )
+    return declaration
+
+  def registered_tool_declaration(
+    self,
+    tool_name: str,
+  ) -> ToolRegistrationDeclaration | None:
+    """Resolve one exact installed local or live MCP declaration."""
+
+    catalog = self._tool_registration_catalog
+    if catalog is None:
+      return None
+    if tool_name in self._local:
+      try:
+        return catalog.by_identity(RegisteredToolIdentity(
+          route_kind="local_handler",
+          logical_server_id=None,
+          logical_name=tool_name,
+        ))
+      except LookupError:
+        return None
+    if (
+      not self._mcp.is_mcp_tool(tool_name)
+      or not callable(getattr(self._mcp, "uses_registered_tool_catalog", None))
+      or not self._mcp.uses_registered_tool_catalog()
+    ):
+      return None
+    if TYPE_CHECKING:
+      get_descriptor = self._mcp.get_registered_mcp_tool_descriptor
+    else:
+      get_descriptor = getattr(
+        self._mcp,
+        "get_registered_mcp_tool_descriptor",
+        None,
+      )
+    if not callable(get_descriptor):
+      raise RuntimeError("registered MCP descriptor lookup is not configured")
+    declaration = validate_tool_registration_declaration(
+      get_descriptor(tool_name).declaration
+    )
+    if catalog.by_identity(declaration.identity) != declaration:
+      raise RuntimeError(
+        "live registered MCP declaration does not match dispatcher catalog"
+      )
+    return declaration
+
+  def redact_prepared_tool_input(
+    self,
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+  ) -> dict[str, object]:
+    """Redact through the live route, or generically when no route is active."""
+
+    if type(prepared_call) is not PreparedToolCall:
+      raise TypeError("prepared_call must be an exact PreparedToolCall")
+    return self._prepared_tool_input_redactor(tool_name, prepared_call)
+
+  def redact_raw_tool_input_for_history(
+    self,
+    tool_name: str,
+    tool_input: Mapping[str, object],
+  ) -> dict[str, object]:
+    """Project raw provider input through the construction-selected owner."""
+
+    return self._raw_history_input_redactor(tool_name, tool_input)
+
+  @staticmethod
+  def _redact_catalogless_prepared_tool_input(
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+  ) -> dict[str, object]:
+    from .runner_tool_audit import redact_tool_input_for_event
+
+    return redact_tool_input_for_event(
+      tool_name,
+      prepared_call.materialize_input(),
+    )
+
+  @staticmethod
+  def _redact_catalogless_raw_history_input(
+    tool_name: str,
+    tool_input: Mapping[str, object],
+  ) -> dict[str, object]:
+    from .runner_tool_audit import redact_tool_input_for_event
+
+    return redact_tool_input_for_event(tool_name, dict(tool_input))
+
+  def _redact_registered_prepared_tool_input(
+    self,
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+  ) -> dict[str, object]:
+    self.ensure_gateway_local_tool_handler(tool_name)
+    if tool_name in self._local:
+      declaration = self._required_registered_tool_declaration(tool_name)
+      return self._redact_registered_declaration_input(
+        declaration,
+        prepared_call.materialize_input(),
+      )
+    if self._mcp.is_mcp_tool(tool_name):
+      return self._mcp.redact_registered_tool_input(
+        tool_name,
+        prepared_call,
+      )
+    return self._redact_catalogless_prepared_tool_input(
+      tool_name,
+      prepared_call,
+    )
+
+  def _redact_registered_raw_history_input(
+    self,
+    tool_name: str,
+    tool_input: Mapping[str, object],
+  ) -> dict[str, object]:
+    self.ensure_gateway_local_tool_handler(tool_name)
+    if tool_name not in self._local:
+      return self._mcp.redact_registered_raw_tool_input(
+        tool_name,
+        tool_input,
+      )
+    declaration = self._required_registered_tool_declaration(tool_name)
+    return self._redact_registered_declaration_input(
+      declaration,
+      tool_input,
+    )
+
+  def _redact_registered_declaration_input(
+    self,
+    declaration: ToolRegistrationDeclaration,
+    tool_input: Mapping[str, object],
+  ) -> dict[str, object]:
+    registry = cast(
+      ToolPolicyImplementationRegistry,
+      self._tool_policy_implementations,
+    )
+    context_factory = cast(
+      Callable[[ToolRegistrationDeclaration], object | None],
+      self._redaction_context_factory,
+    )
+    result = registry.execute_redaction(
+      declaration.semantics.redaction_policy,
+      RedactionCall(
+        declaration.identity,
+        tool_input,
+        context_factory(declaration),
+      ),
+    )
+    return result.materialize_input()
+
+  def _required_registered_tool_declaration(
+    self,
+    tool_name: str,
+  ) -> ToolRegistrationDeclaration:
+    catalog = cast(ToolRegistrationCatalog, self._tool_registration_catalog)
+    if tool_name in self._local:
+      return catalog.by_identity(RegisteredToolIdentity(
+        route_kind="local_handler",
+        logical_server_id=None,
+        logical_name=tool_name,
+      ))
+    descriptor = self._mcp.get_registered_mcp_tool_descriptor(tool_name)
+    declaration = validate_tool_registration_declaration(
+      descriptor.declaration
+    )
+    if catalog.by_identity(declaration.identity) != declaration:
+      raise RuntimeError(
+        "live registered MCP declaration does not match dispatcher catalog"
+      )
+    return declaration
+
+  def settle_tool_result(
+    self,
+    tool_name: str,
+    dispatch_entry: DispatchEntry | None,
+    result: Any,
+    error: Mapping[str, Any] | None,
+    semantic_error: Mapping[str, Any] | None = None,
+    *,
+    prepared_call: PreparedToolCall,
+  ) -> ToolResultSettlement:
+    """Settle outcome and sources through one route-owned policy mode."""
+
+    declaration = self.registered_tool_declaration(tool_name)
+    if declaration is None:
+      return settle_catalogless_tool_result(
+        entry=dispatch_entry,
+        result=result,
+        error=error,
+        semantic_error=semantic_error,
+      )
+    outcome = self.settle_registered_outcome(
+      declaration,
+      result,
+      error,
+      semantic_error,
+    )
+    if outcome != OUTCOME_OK:
+      return ToolResultSettlement(outcome=outcome)
+    registry = self._tool_policy_implementations
+    assert registry is not None
+    sources = registry.execute_source_identity(
+      declaration.semantics.source_identity_policy,
+      SourceIdentityCall(
+        declaration.identity,
+        result,
+        prepared_call.materialize_input(),
+        tool_name,
+      ),
+    )
+    return ToolResultSettlement(outcome=outcome, sources=sources.identities)
+
+  def registered_outcomes_configured(self) -> bool:
+    """Return whether this dispatcher was built with registered policy owners."""
+
+    return self._tool_policy_implementations is not None
+
+  def uses_registered_tool_catalog(self) -> bool:
+    """Return whether this dispatcher owns registered tool policy."""
+
+    return self._tool_registration_catalog is not None
+
+  def settle_registered_outcome(
+    self,
+    declaration: ToolRegistrationDeclaration,
+    result: Any,
+    error: Mapping[str, Any] | None,
+    semantic_error: Mapping[str, Any] | None = None,
+  ) -> str:
+    """Execute the outcome policy owned by one exact registered route."""
+
+    registry = self._tool_policy_implementations
+    if registry is None:
+      raise RuntimeError("registered outcome implementations are not configured")
+    return registry.execute_outcome(
+      declaration.semantics.outcome_policy,
+      OutcomeCall(result, error, semantic_error),
+    )
+
+  def settle_registered_addin_outcome(
+    self,
+    tool_name: str,
+    result: Any,
+    error: Mapping[str, Any] | None,
+    semantic_error: Mapping[str, Any] | None = None,
+  ) -> str:
+    """Execute outcome semantics for one exact registered add-in route."""
+
+    catalog = cast(ToolRegistrationCatalog, self._tool_registration_catalog)
+    declaration = catalog.by_identity(RegisteredToolIdentity(
+      route_kind="addin_relay",
+      logical_server_id=None,
+      logical_name=tool_name,
+    ))
+    return self.settle_registered_outcome(
+      declaration,
+      result,
+      error,
+      semantic_error,
+    )
+
+  def _registered_approval_declaration(
+    self,
+    tool_name: str,
+  ) -> ToolRegistrationDeclaration | None:
+    """Return the exact installed route declaration when approval is bound."""
+
+    if self._approval_predicate_context_factory is None:
+      return None
+    return self.registered_tool_declaration(tool_name)
+
+  def registered_approval_requirement(
+    self,
+    declaration: ToolRegistrationDeclaration,
+    prepared_call: PreparedToolCall,
+    trusted_plan: TrustedToolPlan | None = None,
+  ) -> tuple[bool, str | None, bool]:
+    """Return (approval required, safe cache key, cache hit)."""
+
+    registry = self._tool_policy_implementations
+    context_factory = self._approval_predicate_context_factory
+    if registry is None:
+      raise RuntimeError("registered approval runtime is not configured")
+    if type(prepared_call) is not PreparedToolCall:
+      raise TypeError("prepared_call must be an exact PreparedToolCall")
+
+    policy = declaration.semantics.approval
+    if policy.mode == "never":
+      intrinsic_required = False
+    elif policy.mode == "always":
+      intrinsic_required = True
+    else:
+      assert policy.predicate is not None
+      if context_factory is None:
+        raise RuntimeError(
+          "registered approval predicate context is not configured"
+        )
+      try:
+        intrinsic_required = registry.execute_approval_predicate(
+          policy.predicate,
+          ApprovalPredicateCall(
+            declaration.identity,
+            prepared_call.prepared_input,
+            context_factory(declaration, prepared_call),
+          ),
+        )
+      except Exception as exc:
+        log.error(
+          "Registered approval predicate failed for %s | exception_type=%s",
+          declaration.identity.registration_key,
+          type(exc).__name__,
+        )
+        raise RegisteredApprovalPolicyError(
+          "registered approval predicate failed"
+        ) from exc
+
+    overlay_required = False
+    overlay = self._registered_approval_overlay
+    if overlay is not None:
+      try:
+        overlay_result = overlay(declaration, prepared_call)
+        if type(overlay_result) is not bool:
+          raise TypeError("registered approval overlay must return an exact bool")
+        overlay_required = overlay_result
+      except Exception as exc:
+        log.error(
+          "Registered approval overlay failed for %s | exception_type=%s",
+          declaration.identity.registration_key,
+          type(exc).__name__,
+        )
+        raise RegisteredApprovalPolicyError(
+          "registered approval overlay failed"
+        ) from exc
+
+    approval_required = intrinsic_required or overlay_required
+    if not approval_required:
+      return False, None, False
+    if (
+      policy.cache_key is None
+      or overlay_required
+    ):
+      return True, None, False
+
+    try:
+      prepared_plan = (
+        trusted_plan.approval_identity()
+        if trusted_plan is not None
+        else None
+      )
+      cache_key = registry.execute_approval_cache_key(
+        policy.cache_key,
+        ApprovalCacheKeyCall(
+          declaration.identity,
+          prepared_call.prepared_input,
+          prepared_call.exact_backend,
+          prepared_plan,
+        ),
+      )
+    except Exception as exc:
+      log.error(
+        "Registered approval cache key failed for %s | exception_type=%s",
+        declaration.identity.registration_key,
+        type(exc).__name__,
+      )
+      raise RegisteredApprovalPolicyError(
+        "registered approval cache key failed"
+      ) from exc
+
+    cache_hit = cache_key in self._approved_tool_types
+    return not cache_hit, cache_key, cache_hit
+
+  def registered_addin_declaration(
+    self,
+    tool_name: str,
+  ) -> ToolRegistrationDeclaration | None:
+    """Return the exact registered add-in declaration when configured."""
+
+    return resolve_registered_addin_declaration(
+      self._tool_registration_catalog,
+      tool_name,
+    )
+
+  def required_registered_addin_declaration(
+    self,
+    tool_name: str,
+  ) -> ToolRegistrationDeclaration:
+    declaration = resolve_registered_addin_declaration(
+      self._tool_registration_catalog,
+      tool_name,
+    )
+    if declaration is None:
+      raise LookupError(f"registered add-in tool not found: {tool_name}")
+    return declaration
+
+  def redact_registered_addin_tool_input(
+    self,
+    declaration: ToolRegistrationDeclaration,
+    prepared_call: PreparedToolCall,
+  ) -> dict[str, object]:
+    exact = self.required_registered_addin_declaration(
+      declaration.identity.logical_name
+    )
+    if exact != declaration:
+      raise RuntimeError(
+        "registered add-in declaration is not authoritative"
+      )
+    return self._redact_registered_declaration_input(
+      exact,
+      prepared_call.materialize_input(),
+    )
+
+  def redact_registered_addin_raw_tool_input(
+    self,
+    tool_name: str,
+    tool_input: Mapping[str, object],
+  ) -> dict[str, object]:
+    declaration = self.required_registered_addin_declaration(tool_name)
+    return self._redact_registered_declaration_input(
+      declaration,
+      tool_input,
+    )
+
+  def prepare_registered_addin_tool_call(
+    self,
+    declaration: ToolRegistrationDeclaration,
+    tool_input: Mapping[str, Any],
+    trusted_context: object | None,
+  ) -> PreparedToolCall:
+    """Execute one exact add-in input policy in the gateway registry."""
+
+    catalog = self._tool_registration_catalog
+    registry = self._tool_policy_implementations
+    if catalog is None or registry is None:
+      raise RuntimeError(
+        "registered add-in policy implementations are not configured"
+      )
+    return execute_registered_addin_input_preparation(
+      catalog,
+      registry,
+      declaration,
+      tool_input,
+      trusted_context,
+    )
+
+  async def dispatch_prepared(
+    self,
+    tool_call_id: str,
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+    *,
+    call_index: int = 0,
+    advertised_tool_names: AbstractSet[str] | None = None,
+    abort_event: asyncio.Event | None = None,
+    skill_run_id: str | None = None,
+    step_id: str | None = None,
+    workspace_dir: str | None = None,
+    batch_id: int | str | None = None,
+    capture_readable_resource_snapshot: bool = False,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: (
+      Callable[[PreparedToolCall], None] | None
+    ) = None,
+  ) -> ToolResult:
+    """Dispatch one exact prepared call without executing preparation again."""
+
+    if type(prepared_call) is not PreparedToolCall:
+      raise TypeError("prepared_call must be an exact PreparedToolCall")
+    if type(allow_uncertain_mcp_replay) is not bool:
+      raise TypeError("allow_uncertain_mcp_replay must be an exact bool")
     prepared_to_close: Any | None = None
 
     def own_prepared(prepared: Any) -> None:
@@ -700,7 +1659,7 @@ class ToolDispatcher:
       return await self._dispatch(
         tool_call_id,
         tool_name,
-        tool_input,
+        prepared_call.materialize_input(),
         call_index=call_index,
         advertised_tool_names=advertised_tool_names,
         abort_event=abort_event,
@@ -709,12 +1668,42 @@ class ToolDispatcher:
         workspace_dir=workspace_dir,
         batch_id=batch_id,
         capture_readable_resource_snapshot=capture_readable_resource_snapshot,
+        allow_uncertain_mcp_replay=allow_uncertain_mcp_replay,
+        on_executed_prepared_call=on_executed_prepared_call,
+        registered_prepared_call=(
+          prepared_call
+          if (
+            self._registered_code_declaration(tool_name) is not None
+            or self._registered_approval_declaration(tool_name) is not None
+            or (
+              tool_name not in self._local
+              and self._mcp.is_mcp_tool(tool_name)
+              and callable(
+                getattr(self._mcp, "uses_registered_tool_catalog", None)
+              )
+              and self._mcp.uses_registered_tool_catalog()
+            )
+          )
+          else None
+        ),
         own_prepared=own_prepared,
       )
     finally:
       close = getattr(prepared_to_close, "close", None)
       if callable(close):
         close()
+
+  def route_origin_for_tool(self, tool_name: str) -> str | None:
+    """Return the exact live dispatcher route kind, or ``None`` if ambiguous."""
+
+    is_local = tool_name in self._local
+    try:
+      is_mcp = bool(self._mcp.is_mcp_tool(tool_name))
+    except Exception:
+      return None
+    if is_local == is_mcp:
+      return None
+    return "local" if is_local else "mcp"
 
   async def _dispatch(
     self,
@@ -730,6 +1719,11 @@ class ToolDispatcher:
     workspace_dir: str | None = None,
     batch_id: int | str | None = None,
     capture_readable_resource_snapshot: bool = False,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: (
+      Callable[[PreparedToolCall], None] | None
+    ) = None,
+    registered_prepared_call: PreparedToolCall | None = None,
     own_prepared: Callable[[Any], None],
   ) -> ToolResult:
     """Execute one tool call and return `(result, error)`.
@@ -750,6 +1744,24 @@ class ToolDispatcher:
         `_interceptor_warnings`.
     """
     self.ensure_gateway_local_tool_handler(tool_name)
+    is_local_tool = tool_name in self._local
+    is_mcp_tool = (
+      not is_local_tool
+      and self._mcp.is_mcp_tool(tool_name)
+    )
+    mcp_server_name = (
+      self._mcp.get_server_for_tool(tool_name)
+      if is_mcp_tool
+      else None
+    )
+    advertisement_error = self._request_advertisement_error(
+      tool_name,
+      advertised_tool_names,
+      is_mcp=is_mcp_tool,
+      server_name=mcp_server_name,
+    )
+    if advertisement_error is not None:
+      return None, advertisement_error
     lifecycle_tool_name = tool_name
     get_original_tool_name = getattr(self._mcp, "get_original_tool_name", None)
     if callable(get_original_tool_name):
@@ -763,7 +1775,7 @@ class ToolDispatcher:
       session=self._session,
       role=self._role,
       tool_name=tool_name,
-      is_local=tool_name in self._local,
+      is_local=is_local_tool,
       profile_name=str(getattr(self._run_context, "profile", "") or "") or None,
     ):
       return None, {
@@ -799,8 +1811,6 @@ class ToolDispatcher:
     if input_schema_error is not None:
       return None, input_schema_error
 
-    tool_input = self.resolve_effective_tool_input(tool_name, tool_input)
-
     ir = await self._run_interceptors(
       tool_call_id,
       tool_name,
@@ -808,21 +1818,51 @@ class ToolDispatcher:
     )
     if not ir.proceed:
       return None, ir.error
+    if (
+      registered_prepared_call is not None
+      and tool_input != registered_prepared_call.materialize_input()
+    ):
+      return None, {
+        "code": "tool_input_preparation_failed",
+        "message": (
+          f"Tool '{tool_name}' input changed after preparation; dispatch was denied."
+        ),
+      }
 
-    if tool_name not in self._local and self._mcp.is_mcp_tool(tool_name):
-      server_name = self._mcp.get_server_for_tool(tool_name)
-      scope_error = self._wire_mcp_scope_error(
-        tool_name,
-        server_name,
-        advertised_tool_names,
-      )
-      if scope_error is None:
-        scope_error = self._mcp_scope_error(tool_name, server_name)
+    if is_mcp_tool:
+      scope_error = self._mcp_scope_error(tool_name, mcp_server_name)
       if scope_error is not None:
         return None, scope_error
 
-    qualifier = ""
-    if self._approval_key_qualifier is not None:
+    registered_code_declaration = self._registered_code_declaration(tool_name)
+    registered_approval_declaration = (
+      self._registered_approval_declaration(tool_name)
+    )
+    if (
+      registered_approval_declaration is not None
+      and registered_prepared_call is None
+    ):
+      return None, {
+        "code": "tool_input_preparation_failed",
+        "message": (
+          f"Tool '{tool_name}' lacks its exact prepared call; dispatch was denied."
+        ),
+      }
+    qualifier = (
+      registered_prepared_call.exact_backend
+      if registered_code_declaration is not None
+      and registered_prepared_call is not None
+      else ""
+    )
+    if qualifier is None:
+      return None, {
+        "code": "tool_input_preparation_failed",
+        "message": "Registered code execution lost its exact backend.",
+      }
+    if (
+      registered_code_declaration is None
+      and self._approval_key_qualifier is not None
+    ):
       try:
         qualifier = self._approval_key_qualifier(tool_name, tool_input) or ""
       except Exception:
@@ -836,8 +1876,12 @@ class ToolDispatcher:
     )
     tool_ctx: ToolExecutionContext | None = None
     trusted_plan: TrustedToolPlan | None = None
+    registered_mcp_call: RegisteredMcpToolCall | None = None
     planned_executor: Callable[..., Any] | None = None
-    prepared_business_model_record: Any | None = None
+    prepared_business_model_record: PreparedBusinessModelChange | None = None
+    prepared_business_model_context: (
+      tuple[ToolDispatcherApprovalStore, dict[str, Any]] | None
+    ) = None
     if local_handler is not None:
       tool_ctx = self._new_tool_execution_context(
         tool_call_id=tool_call_id,
@@ -851,7 +1895,7 @@ class ToolDispatcher:
       )
       if (
         tool_name == "fms_persist_business_model"
-        and self._approval_store is not None
+        and isinstance(self._approval_route, DurableLocalApprovalRoute)
         and str(skill_run_id or "").strip()
       ):
         from .prepared_business_model_store import PreparedBusinessModelLifecycle
@@ -863,7 +1907,7 @@ class ToolDispatcher:
             "code": "planned_write_authorization_unavailable",
             "message": "BusinessModel exact planning requires a trusted user scope.",
           }
-        durable = await self._approval_store.get_prepared_business_model_change(
+        durable = await self._approval_route.store.get_prepared_business_model_change(
           caller_kind="fms_persist",
           user_scope=user_scope,
           idempotency_locator=str(skill_run_id).strip(),
@@ -931,62 +1975,124 @@ class ToolDispatcher:
           "message": f"Tool '{tool_name}' could not produce a trusted exact-write plan.",
         }
     elif (
-      tool_name == "apply_patch_ops"
-      and self._mcp.is_mcp_tool(tool_name)
-      and "authorization_ref" not in tool_input
-      and tool_input.get("dry_run") is not True
+      registered_approval_declaration is not None
+      and registered_approval_declaration.identity.route_kind == "mcp"
+      and registered_approval_declaration.semantics.planning_policy.policy_id
+      != "none"
     ):
-      tool_ctx = self._new_tool_execution_context(
-        tool_call_id=tool_call_id,
-        tool_name=tool_name,
-        qualifier=qualifier,
-        abort_event=abort_event,
-        skill_run_id=skill_run_id,
-        step_id=resolved_step_id,
-        workspace_dir=workspace_dir,
-        batch_id=batch_id,
-      )
       try:
-        trusted_plan = self._plan_raw_patch_mcp_write(
-          tool_input,
-          tool_ctx=tool_ctx,
-          own_prepared=own_prepared,
+        assert registered_prepared_call is not None
+        trusted_scope = registered_mcp_dispatch_scope(
+          user_id=self._resolve_run_context().user_id,
+          dispatch_scope=self._portfolio_dispatch_scope(),
         )
-      except TrustedToolPlanError as exc:
-        log.error(
-          "Invalid raw MCP exact-plan contract | exception_type=%s",
-          type(exc).__name__,
+        registered_mcp_call = (
+          self._mcp.classify_registered_mcp_prepared_tool_call(
+            tool_name,
+            registered_prepared_call,
+            trusted_scope,
+            self._registered_approval_overlay,
+          )
         )
-        return None, {
-          "code": "planned_write_contract_invalid",
-          "message": "Tool 'apply_patch_ops' has an invalid exact-write plan.",
-        }
       except Exception as exc:
         log.error(
-          "Exact-write planning failed for apply_patch_ops | exception_type=%s",
+          "Registered MCP planning failed for %s | exception_type=%s",
+          tool_name,
           type(exc).__name__,
         )
         return None, {
           "code": "planned_write_planning_failed",
-          "message": "Tool 'apply_patch_ops' could not produce a trusted exact-write plan.",
+          "message": (
+            f"Tool '{tool_name}' could not produce its registered exact plan."
+          ),
         }
 
-    static_needs_approval = self._should_request_approval(tool_name, tool_input, qualifier)
-    if tool_name == "apply_patch_ops" and (
-      "authorization_ref" in tool_input or tool_input.get("dry_run") is True
-    ):
-      # The opaque reference is revalidated and claimed by the write service;
-      # a retry must not mint a second generic approval around it.
-      static_needs_approval = False
+    registered_approval_cache_key: str | None = None
+    registered_approval_cache_hit = False
+    if registered_approval_declaration is not None:
+      assert registered_prepared_call is not None
+      try:
+        if registered_mcp_call is not None:
+          static_needs_approval = registered_mcp_call.approval_required
+          registered_approval_cache_key = (
+            registered_mcp_call.approval_reuse_key
+          )
+          registered_approval_cache_hit = (
+            registered_approval_cache_key is not None
+            and registered_approval_cache_key in self._approved_tool_types
+          )
+          if registered_approval_cache_hit:
+            static_needs_approval = False
+        else:
+          (
+            static_needs_approval,
+            registered_approval_cache_key,
+            registered_approval_cache_hit,
+          ) = self.registered_approval_requirement(
+            registered_approval_declaration,
+            registered_prepared_call,
+            trusted_plan,
+          )
+      except RegisteredApprovalPolicyError:
+        return None, {
+          "code": "registered_approval_policy_failed",
+          "message": (
+            f"Tool '{tool_name}' approval policy could not be evaluated."
+          ),
+        }
+    else:
+      static_needs_approval = self._should_request_approval(
+        tool_name,
+        tool_input,
+        qualifier,
+      )
     dynamic_ask = ir.pending_ask is not None
+    approval_reuse_mode: ApprovalReuseMode
+    approval_reuse_key: str | None
+    if registered_approval_declaration is None:
+      approval_reuse_mode = "legacy"
+      approval_reuse_key = None
+    elif dynamic_ask or registered_approval_cache_key is None:
+      approval_reuse_mode = "disabled"
+      approval_reuse_key = None
+    else:
+      approval_reuse_mode = "exact"
+      approval_reuse_key = registered_approval_cache_key
+    session_approval_cache_key = (
+      approval_reuse_key
+      if approval_reuse_mode == "exact"
+      else (
+        (
+          None
+          if tool_name in self._session_cache_denied
+          else self._qualified_key(tool_name, qualifier)
+        )
+        if approval_reuse_mode == "legacy"
+        else None
+      )
+    )
     final_tool_input = tool_input
+    approval_modified_prepared_input = False
     approval_request_record: PolicyApprovalRequest | None = None
+    registered_prepared_authorization = (
+      registered_mcp_call.prepared_authorization
+      if registered_mcp_call is not None
+      else None
+    )
+    exact_plan_active = (
+      trusted_plan is not None
+      or registered_prepared_authorization is not None
+    )
 
     if (
-      trusted_plan is None
+      not exact_plan_active
       and not static_needs_approval
       and not dynamic_ask
-      and self._tool_was_cache_hit(tool_name, qualifier)
+      and (
+        registered_approval_cache_hit
+        if registered_approval_declaration is not None
+        else self._tool_was_cache_hit(tool_name, qualifier)
+      )
     ):
       self._emit_approval_decided(
         tool_call_id,
@@ -996,17 +2102,28 @@ class ToolDispatcher:
         allow_tool_type_applied=False,
       )
 
-    if trusted_plan is not None:
-      if not self._approval_lifecycle_configured():
-        code = (
-          "planned_write_callback_transport_unsupported"
-          if self._request_approval is not None
-          else "planned_write_authorization_unavailable"
-        )
+    if exact_plan_active:
+      if isinstance(self._approval_route, NoApprovalRoute):
         return None, {
-          "code": code,
+          "code": "approval_route_absent",
           "message": (
-            f"Tool '{tool_name}' requires a durable approval store for its exact-write plan."
+            f"Tool '{tool_name}' has no admitted approval route for its "
+            "exact-write plan."
+          ),
+        }
+      if isinstance(
+        self._approval_route,
+        ParentDelegatedApprovalRoute,
+      ) and self._plan_requires_prepared_custody(
+        tool_name,
+        trusted_plan,
+        registered_prepared_authorization,
+      ):
+        return None, {
+          "code": "planned_write_prepared_custody_unsupported",
+          "message": (
+            f"Tool '{tool_name}' needs durable prepared-payload custody, "
+            "which the parent-delegated approval route does not carry."
           ),
         }
 
@@ -1015,7 +2132,11 @@ class ToolDispatcher:
       cache_approved = (
         not static_needs_approval
         and not dynamic_ask
-        and self._tool_was_cache_hit(tool_name, qualifier)
+        and (
+          registered_approval_cache_hit
+          if registered_approval_declaration is not None
+          else self._tool_was_cache_hit(tool_name, qualifier)
+        )
       )
       automatic_approval_reason: str | None = None
       automatic_denial_reason: str | None = None
@@ -1064,18 +2185,29 @@ class ToolDispatcher:
 
       try:
         prepared_authorization_payload: bytes | None = None
-        prepared_business_model_change = self._prepared_business_model_authorization(
-          tool_name,
-          trusted_plan,
+        prepared_business_model_change = (
+          self._prepared_business_model_authorization(
+            tool_name,
+            trusted_plan,
+          )
+          if trusted_plan is not None
+          else None
         )
         resume_approval_request = None
         skip_approval_lifecycle = False
         if prepared_business_model_change is not None:
+          prepared_business_model_store = self._durable_business_model_store()
+          prepared_business_model_context = (
+            prepared_business_model_store,
+            prepared_business_model_change,
+          )
           from .approval_store import PreparedReconciliationConflict
           from .prepared_business_model_store import PreparedBusinessModelLifecycle
 
-          async def reconcile_pending_business_model_record(record: Any) -> Any:
-            reconciliation = await self._approval_store.reconcile_prepared_business_model_change(
+          async def reconcile_pending_business_model_record(
+            record: PreparedBusinessModelChange,
+          ) -> PreparedBusinessModelChange:
+            reconciliation = await prepared_business_model_store.reconcile_prepared_business_model_change(
               caller_kind=record.caller_kind,
               user_scope=record.user_scope,
               idempotency_locator=record.idempotency_locator,
@@ -1102,7 +2234,7 @@ class ToolDispatcher:
               )
             return reconciliation.record
 
-          prepared_business_model_record = await self._approval_store.get_prepared_business_model_change(
+          prepared_business_model_record = await prepared_business_model_store.get_prepared_business_model_change(
             caller_kind=str(prepared_business_model_change["caller_kind"]),
             user_scope=str(prepared_business_model_change["user_scope"]),
             idempotency_locator=str(
@@ -1173,7 +2305,7 @@ class ToolDispatcher:
                     else "The durable BusinessModel plan expired."
                   ),
                 }
-            resume_approval_request = await self._approval_store.get(
+            resume_approval_request = await prepared_business_model_store.get(
               prepared_business_model_record.approval_id
             )
             if resume_approval_request is None:
@@ -1211,7 +2343,7 @@ class ToolDispatcher:
                     else "The durable BusinessModel plan expired."
                   ),
                 }
-              resume_approval_request = await self._approval_store.get(
+              resume_approval_request = await prepared_business_model_store.get(
                 prepared_business_model_record.approval_id
               )
               if resume_approval_request is None:
@@ -1229,30 +2361,32 @@ class ToolDispatcher:
               skip_approval_lifecycle = True
         approval_args_redacted: dict[str, Any] | None = None
         approval_args_hash: str | None = None
-        if (
-          tool_name == "apply_patch_ops"
-          and trusted_plan.identity_source == "reviewed_change_binding"
+        if registered_prepared_authorization is not None:
+          prepared_authorization_payload = (
+            registered_prepared_authorization.prepared_payload
+          )
+          approval_args_redacted = (
+            registered_prepared_authorization.materialize_approval_arguments()
+          )
+          approval_args_hash = (
+            registered_prepared_authorization.approval_arguments_hash
+          )
+        elif (
+          trusted_plan is not None
+          and trusted_plan.identity_source == "change_set"
         ):
-          from research.patch_engine import raw_patch_authorization_args
-
-          serializer = getattr(trusted_plan.prepared, "to_canonical_bytes", None)
-          if not callable(serializer):
-            raise TrustedToolPlanError(
-              "raw patch plan cannot serialize its prepared authorization bytes"
+          if registered_approval_declaration is not None:
+            assert registered_prepared_call is not None
+            approval_args_redacted, approval_args_hash = (
+              self._redact_registered_prepared_for_approval(
+                tool_name,
+                registered_prepared_call,
+              )
             )
-          prepared_authorization_payload = serializer()
-          if not isinstance(prepared_authorization_payload, bytes):
-            raise TrustedToolPlanError(
-              "raw patch prepared authorization payload is not immutable bytes"
+          else:
+            approval_args_redacted, approval_args_hash = (
+              self._redact_for_approval_request(tool_name, tool_input)
             )
-          approval_args_redacted = raw_patch_authorization_args(
-            trusted_plan.prepared
-          )
-          approval_args_hash = sha256_args(approval_args_redacted)
-        elif trusted_plan.identity_source == "change_set":
-          approval_args_redacted, approval_args_hash = (
-            self._redact_for_approval_request(tool_name, tool_input)
-          )
           approval_args_redacted = {
             **approval_args_redacted,
             "planned_change": trusted_plan.approval_review(),
@@ -1273,7 +2407,15 @@ class ToolDispatcher:
             qualifier=qualifier,
             reason=approval_reason,
             allow_persistent=allow_persistent,
-            approval_identity=trusted_plan.approval_identity(),
+            approval_reuse_mode=approval_reuse_mode,
+            approval_reuse_key=approval_reuse_key,
+            approval_identity=(
+              registered_prepared_authorization.approval_identity
+              if registered_prepared_authorization is not None
+              else trusted_plan.approval_identity()
+              if trusted_plan is not None
+              else None
+            ),
             prepared_authorization_payload=prepared_authorization_payload,
             prepared_business_model_change=prepared_business_model_change,
             resume_approval_request=resume_approval_request,
@@ -1299,11 +2441,14 @@ class ToolDispatcher:
         }
 
       approval_request_record = lifecycle.get("request")
-      if prepared_business_model_change is not None:
+      if prepared_business_model_context is not None:
+        prepared_business_model_store, prepared_business_model_change = (
+          prepared_business_model_context
+        )
         from .prepared_business_model_store import PreparedBusinessModelLifecycle
 
         prepared_business_model_record = (
-          await self._approval_store.get_prepared_business_model_change(
+          await prepared_business_model_store.get_prepared_business_model_change(
             caller_kind=str(prepared_business_model_change["caller_kind"]),
             user_scope=str(prepared_business_model_change["user_scope"]),
             idempotency_locator=str(
@@ -1320,7 +2465,7 @@ class ToolDispatcher:
             prepared_business_model_record.lifecycle
             is PreparedBusinessModelLifecycle.PENDING
           ):
-            prepared_business_model_record = await self._approval_store.transition_prepared_business_model_change(
+            prepared_business_model_record = await prepared_business_model_store.transition_prepared_business_model_change(
               caller_kind=prepared_business_model_record.caller_kind,
               user_scope=prepared_business_model_record.user_scope,
               idempotency_locator=prepared_business_model_record.idempotency_locator,
@@ -1354,7 +2499,7 @@ class ToolDispatcher:
             and prepared_business_model_record.approval_id
             != getattr(approval_request_record, "approval_id", None)
           ):
-            original_request = await self._approval_store.get(
+            original_request = await prepared_business_model_store.get(
               prepared_business_model_record.approval_id
             )
             if original_request is None or original_request.state not in {
@@ -1373,7 +2518,7 @@ class ToolDispatcher:
           and prepared_business_model_record.approval_id
           == getattr(approval_request_record, "approval_id", None)
         ):
-          prepared_business_model_record = await self._approval_store.transition_prepared_business_model_change(
+          prepared_business_model_record = await prepared_business_model_store.transition_prepared_business_model_change(
             caller_kind=prepared_business_model_record.caller_kind,
             user_scope=prepared_business_model_record.user_scope,
             idempotency_locator=prepared_business_model_record.idempotency_locator,
@@ -1385,7 +2530,25 @@ class ToolDispatcher:
       try:
         if approval_request_record is None:
           raise TrustedToolPlanError("approval lifecycle returned no durable request")
-        trusted_plan.verify_approval_request(approval_request_record)
+        if trusted_plan is not None:
+          trusted_plan.verify_approval_request(approval_request_record)
+        else:
+          assert registered_prepared_authorization is not None
+          expected_identity = dict(
+            registered_prepared_authorization.approval_identity
+          )
+          actual_identity = {
+            field_name: getattr(
+              approval_request_record,
+              field_name,
+              None,
+            )
+            for field_name in expected_identity
+          }
+          if actual_identity != expected_identity:
+            raise TrustedToolPlanError(
+              "approval row is not bound to the registered MCP plan"
+            )
       except TrustedToolPlanError as exc:
         log.error(
           "Unbound exact-write approval for %s | exception_type=%s",
@@ -1397,8 +2560,9 @@ class ToolDispatcher:
           "message": f"Tool '{tool_name}' approval did not bind the exact planned identity.",
         }
 
-      tool_ctx.approval_id = approval_request_record.approval_id
-      tool_ctx.approval_chain_id = approval_request_record.approval_chain_id
+      if tool_ctx is not None:
+        tool_ctx.approval_id = approval_request_record.approval_id
+        tool_ctx.approval_chain_id = approval_request_record.approval_chain_id
       if lifecycle.get("policy_modified_tool_args"):
         self._emit_approval_decided(
           tool_call_id,
@@ -1406,12 +2570,6 @@ class ToolDispatcher:
           outcome="approved",
           decision_source="planned_write_reinvocation_required",
           allow_tool_type_applied=False,
-        )
-        await self._emit_execution_audit(
-          approval_request_record,
-          tool_input,
-          outcome="reinvocation_required",
-          error_summary="Policy returned modified arguments for an exact planned write",
         )
         return None, {
           "code": "planned_write_reinvocation_required",
@@ -1450,17 +2608,25 @@ class ToolDispatcher:
         return None, error_dict
 
       final_tool_input = lifecycle.get("tool_input", tool_input)
-      if tool_name == "apply_patch_ops" and planned_executor is None:
-        from .raw_patch_authorization_store import encode_reference
-
-        final_tool_input = {
-          **tool_input,
-          "authorization_ref": encode_reference(tool_call_id),
+      approval_modified_prepared_input = final_tool_input != tool_input
+      if (
+        registered_prepared_call is not None
+        and approval_modified_prepared_input
+      ):
+        return None, {
+          "code": "tool_input_preparation_failed",
+          "message": (
+            f"Tool '{tool_name}' input changed after preparation; dispatch was denied."
+          ),
         }
+      if isinstance(registered_mcp_call, RegisteredMcpPlannedToolCall):
+        final_tool_input = registered_mcp_call.materialize_authorized_input(
+          tool_call_id
+        )
       will_install = (
         bool(lifecycle.get("allow_tool_type"))
         and allow_persistent
-        and tool_name not in self._session_cache_denied
+        and session_approval_cache_key is not None
       )
       self._emit_approval_decided(
         tool_call_id,
@@ -1477,7 +2643,8 @@ class ToolDispatcher:
         allow_tool_type_applied=will_install,
       )
       if will_install:
-        self._approved_tool_types.add(self._qualified_key(tool_name, qualifier))
+        assert session_approval_cache_key is not None
+        self._approved_tool_types.add(session_approval_cache_key)
 
     elif static_needs_approval or dynamic_ask:
       if self._should_avoid_permission_prompts:
@@ -1564,9 +2731,19 @@ class ToolDispatcher:
           allow_tool_type_applied=False,
         )
       else:
-        if self._approval_lifecycle_configured():
+        if not isinstance(self._approval_route, NoApprovalRoute):
           allow_persistent = not dynamic_ask
           approval_reason = ir.pending_ask.message if ir.pending_ask is not None else ""
+          approval_args_redacted: dict[str, Any] | None = None
+          approval_args_hash: str | None = None
+          if registered_approval_declaration is not None:
+            assert registered_prepared_call is not None
+            approval_args_redacted, approval_args_hash = (
+              self._redact_registered_prepared_for_approval(
+                tool_name,
+                registered_prepared_call,
+              )
+            )
           lifecycle = await self._run_approval_lifecycle(
             tool_call_id=tool_call_id,
             tool_name=tool_name,
@@ -1574,6 +2751,10 @@ class ToolDispatcher:
             qualifier=qualifier,
             reason=approval_reason,
             allow_persistent=allow_persistent,
+            approval_reuse_mode=approval_reuse_mode,
+            approval_reuse_key=approval_reuse_key,
+            approval_args_redacted=approval_args_redacted,
+            approval_args_hash=approval_args_hash,
           )
           approval_request_record = lifecycle.get("request")
           if lifecycle.get("timeout"):
@@ -1597,10 +2778,21 @@ class ToolDispatcher:
             )
             return None, error_dict
           final_tool_input = lifecycle["tool_input"] if "tool_input" in lifecycle else tool_input
+          approval_modified_prepared_input = final_tool_input != tool_input
+          if (
+            registered_prepared_call is not None
+            and approval_modified_prepared_input
+          ):
+            return None, {
+              "code": "tool_input_preparation_failed",
+              "message": (
+                f"Tool '{tool_name}' input changed after preparation; dispatch was denied."
+              ),
+            }
           will_install = (
             bool(lifecycle.get("allow_tool_type"))
             and allow_persistent
-            and tool_name not in self._session_cache_denied
+            and session_approval_cache_key is not None
           )
           self._emit_approval_decided(
             tool_call_id,
@@ -1614,7 +2806,8 @@ class ToolDispatcher:
             allow_tool_type_applied=will_install,
           )
           if will_install:
-            self._approved_tool_types.add(self._qualified_key(tool_name, qualifier))
+            assert session_approval_cache_key is not None
+            self._approved_tool_types.add(session_approval_cache_key)
         elif self._request_approval is None:
           return None, {
             "code": "approval_required",
@@ -1648,7 +2841,7 @@ class ToolDispatcher:
             decision.approved
             and decision.allow_tool_type
             and allow_persistent
-            and tool_name not in self._session_cache_denied
+            and session_approval_cache_key is not None
           )
           self._emit_approval_decided(
             tool_call_id,
@@ -1660,7 +2853,8 @@ class ToolDispatcher:
           if not decision.approved:
             return None, {"code": "user_denied", "message": "User denied execution"}
           if will_install:
-            self._approved_tool_types.add(self._qualified_key(tool_name, qualifier))
+            assert session_approval_cache_key is not None
+            self._approved_tool_types.add(session_approval_cache_key)
 
     result: Optional[Any]
     error: Optional[Dict[str, Any]]
@@ -1679,6 +2873,17 @@ class ToolDispatcher:
             "code": "commercial_irreversible_authority_invalid",
             "message": "Fresh commercial authority is invalid or expired.",
           }
+    if (
+      registered_prepared_call is not None
+      and approval_modified_prepared_input
+    ):
+      return None, {
+        "code": "tool_input_preparation_failed",
+        "message": (
+          f"Tool '{tool_name}' input changed after preparation; dispatch was denied."
+        ),
+      }
+
     if local_handler is not None:
       input_schema_error = self._validate_local_tool_input(tool_call_id, tool_name, final_tool_input)
       if input_schema_error is not None:
@@ -1754,6 +2959,13 @@ class ToolDispatcher:
           local_kwargs["capture_readable_resource_snapshot"] = True
         result, error = await local_handler(final_tool_input, **local_kwargs)
     elif self._mcp.is_mcp_tool(tool_name):
+      if approval_modified_prepared_input:
+        return None, {
+          "code": "tool_input_preparation_failed",
+          "message": (
+            f"Tool '{tool_name}' input changed after preparation; dispatch was denied."
+          ),
+        }
       server = self._mcp.get_server_for_tool(tool_name)
       if (
         self._commercial_work_start is not None
@@ -1769,13 +2981,23 @@ class ToolDispatcher:
         and self._mcp.is_per_user_server(server)
       )
       if server and server in self._mcp_meta_inject_servers:
-        resolved_risk_user_id = self._mcp_identity_overrides.get(
-          server,
-          self._risk_user_id,
+        resolved_risk_user_id = (
+          self._risk_user_id
+          if (
+            isinstance(self._risk_user_id, int)
+            and not isinstance(self._risk_user_id, bool)
+            and self._risk_user_id > 0
+          )
+          else None
         )
-        if resolved_risk_user_id is None and self._user_id is not None and str(self._user_id).isdigit():
-          resolved_risk_user_id = int(str(self._user_id))
-        if self._credentials_resolver_active and not resolved_risk_user_id:
+        if (
+          resolved_risk_user_id is None
+          and self._user_id is not None
+          and str(self._user_id).isdigit()
+        ):
+          numeric_user_id = int(str(self._user_id))
+          resolved_risk_user_id = numeric_user_id if numeric_user_id > 0 else None
+        if self._credentials_resolver_active and resolved_risk_user_id is None:
           raise RuntimeError("MCP meta user_id is required in strict mode")
         meta = {
           "session_id": self._session_id,
@@ -1783,6 +3005,9 @@ class ToolDispatcher:
           "channel": self._channel,
           "role": self._role,
         }
+        caller_session_token = getattr(self._session, "session_token", None)
+        if caller_session_token is not None:
+          meta["session_token"] = caller_session_token
         routed_skill_run_id = mcp_metadata_skill_run_id(
           lifecycle_tool_name,
           skill_run_id,
@@ -1794,7 +3019,7 @@ class ToolDispatcher:
         if batch_id is not None:
           meta["batch_id"] = str(batch_id)
         if (
-          server == "idea-workbench-mcp"
+          server == INVESTMENT_CAPABILITY_CLAIM_SERVER
           and lifecycle_tool_name in INVESTMENT_CAPABILITY_FACADE_TOOLS
         ):
           run_context = self._resolve_run_context()
@@ -1809,21 +3034,23 @@ class ToolDispatcher:
                 "the model."
               ),
             }
-          run_context_skill = str(run_context.skill or "").strip()
-          active_skill = str(current_skill() or "").strip()
-          if (
-            run_context_skill
-            and active_skill
-            and run_context_skill != active_skill
-          ):
-            return None, {
-              "code": "investment_capability_claim_unavailable",
-              "message": (
-                "Trusted investment capability identity is unavailable for "
-                f"tool '{lifecycle_tool_name}'."
+          try:
+            reconciled_admission = reconcile_skill_admission(
+              skill_name=run_context.skill,
+              execution_limits=(
+                run_context.admitted_skill_execution_limits
               ),
-            }
-          trusted_skill = run_context_skill or active_skill
+              active_admission=current_skill_admission(),
+            )
+          except (TypeError, ValueError):
+            return None, investment_capability_claim_unavailable_error(
+              subject=f"tool '{lifecycle_tool_name}'",
+            )
+          if reconciled_admission is None:
+            return None, investment_capability_claim_unavailable_error(
+              subject=f"tool '{lifecycle_tool_name}'",
+            )
+          trusted_skill = reconciled_admission.skill_name
           trusted_research_file_id: int | None = None
           if lifecycle_tool_name == "start_quant_research":
             trusted_research_file_id = run_context.research_file_id
@@ -1841,13 +3068,9 @@ class ToolDispatcher:
               or not isinstance(request_research_file_id, int)
               or request_research_file_id != trusted_research_file_id
             ):
-              return None, {
-                "code": "investment_capability_claim_unavailable",
-                "message": (
-                  "Trusted investment capability identity is unavailable for "
-                  f"tool '{lifecycle_tool_name}'."
-                ),
-              }
+              return None, investment_capability_claim_unavailable_error(
+                subject=f"tool '{lifecycle_tool_name}'",
+              )
           try:
             meta["investment_capability_claim"] = (
               issue_investment_capability_claim(
@@ -1859,33 +3082,38 @@ class ToolDispatcher:
                 request_id=str(run_context.request_id or ""),
                 jti=str(tool_call_id or ""),
                 skill=trusted_skill,
+                admitted_skill_execution_limits=(
+                  reconciled_admission.execution_limits
+                ),
                 policy_bundle_hash=str(run_context.policy_bundle_hash or ""),
                 research_file_id=trusted_research_file_id,
               )
             )
           except InvestmentCapabilityClaimError:
-            return None, {
-              "code": "investment_capability_claim_unavailable",
-              "message": (
-                "Trusted investment capability identity is unavailable for "
-                f"tool '{lifecycle_tool_name}'."
-              ),
-            }
+            return None, investment_capability_claim_unavailable_error(
+              subject=f"tool '{lifecycle_tool_name}'",
+            )
         result, error = await ToolDispatcher._call_mcp_tool(
           self,
           tool_name,
           final_tool_input,
+          prepared_call=registered_prepared_call,
           meta=meta,
           abort_event=abort_event,
           gateway_session=self._session if per_user_server else None,
+          allow_uncertain_replay=allow_uncertain_mcp_replay,
+          on_executed_prepared_call=on_executed_prepared_call,
         )
       elif server and per_user_server:
         result, error = await ToolDispatcher._call_mcp_tool(
           self,
           tool_name,
           final_tool_input,
+          prepared_call=registered_prepared_call,
           abort_event=abort_event,
           gateway_session=self._session,
+          allow_uncertain_replay=allow_uncertain_mcp_replay,
+          on_executed_prepared_call=on_executed_prepared_call,
         )
       elif server and server in self._mcp_session_inject_servers:
         final_tool_input = {**final_tool_input, "_session_id": self._session_id}
@@ -1893,14 +3121,20 @@ class ToolDispatcher:
           self,
           tool_name,
           final_tool_input,
+          prepared_call=registered_prepared_call,
           abort_event=abort_event,
+          allow_uncertain_replay=allow_uncertain_mcp_replay,
+          on_executed_prepared_call=on_executed_prepared_call,
         )
       else:
         result, error = await ToolDispatcher._call_mcp_tool(
           self,
           tool_name,
           final_tool_input,
+          prepared_call=registered_prepared_call,
           abort_event=abort_event,
+          allow_uncertain_replay=allow_uncertain_mcp_replay,
+          on_executed_prepared_call=on_executed_prepared_call,
         )
     else:
       result, error = None, {"code": "unknown_tool", "message": f"Unknown tool: {tool_name}"}
@@ -1910,11 +3144,13 @@ class ToolDispatcher:
       result["_interceptor_warnings"] = ir.warnings
 
     if (
-      prepared_business_model_record is not None
+      prepared_business_model_context is not None
+      and prepared_business_model_record is not None
       and prepared_business_model_record.lifecycle.value == "AUTHORIZED"
       and isinstance(result, dict)
       and isinstance(result.get("receipt"), dict)
     ):
+      prepared_business_model_store, _ = prepared_business_model_context
       from .prepared_business_model_store import PreparedBusinessModelLifecycle
 
       receipt_payload = dict(result["receipt"])
@@ -1969,7 +3205,7 @@ class ToolDispatcher:
             ensure_ascii=False,
             allow_nan=False,
           ).encode("utf-8")
-          prepared_business_model_record = await self._approval_store.transition_prepared_business_model_change(
+          prepared_business_model_record = await prepared_business_model_store.transition_prepared_business_model_change(
             caller_kind=prepared_business_model_record.caller_kind,
             user_scope=prepared_business_model_record.user_scope,
             idempotency_locator=prepared_business_model_record.idempotency_locator,
@@ -1997,7 +3233,7 @@ class ToolDispatcher:
           None,
         ) if isinstance(child_refs, list) else None
         if checkpoint_id is not None:
-          prepared_business_model_record = await self._approval_store.transition_prepared_business_model_change(
+          prepared_business_model_record = await prepared_business_model_store.transition_prepared_business_model_change(
             caller_kind=prepared_business_model_record.caller_kind,
             user_scope=prepared_business_model_record.user_scope,
             idempotency_locator=prepared_business_model_record.idempotency_locator,
@@ -2010,11 +3246,17 @@ class ToolDispatcher:
             consumed_at=utc_now().isoformat(),
           )
 
-    await self._emit_execution_audit(
+    await _audit_helpers.emit_execution_audit(
       approval_request_record,
       final_tool_input,
+      approval_store=self._approval_store,
       outcome="tool_error" if error is not None else "success",
       error_summary=str(error)[:500] if error is not None else None,
+      boundary_sanitizer=lambda value, sink: sanitize_boundary_value(
+        value,
+        sink=sink,
+        boundary=self._secret_boundary,
+      ),
     )
     return result, error
 
@@ -2026,17 +3268,113 @@ class ToolDispatcher:
     wrap that lifecycle in its generic tool timeout; the approval lifecycle has
     its own expiry and returns an approval-specific result.
     """
-    if self._request_approval is None and not self._approval_lifecycle_configured():
+    route_absent = isinstance(self._approval_route, NoApprovalRoute)
+    if self._request_approval is None and route_absent:
       return False
+    try:
+      registered_declaration = self._registered_approval_declaration(tool_name)
+    except Exception:
+      return True
+    if registered_declaration is not None:
+      registered_static_needs_approval = (
+        registered_declaration.semantics.approval.mode != "never"
+        or self._registered_approval_overlay is not None
+      )
+      return self._requires_approval_with_qualifier(
+        tool_name,
+        tool_input,
+        "",
+        registered_static_needs_approval=registered_static_needs_approval,
+      )
     qualifier = ""
-    if self._approval_key_qualifier is not None:
+    if (
+      self._registered_code_declaration(tool_name) is None
+      and self._approval_key_qualifier is not None
+    ):
       try:
         qualifier = self._approval_key_qualifier(tool_name, tool_input) or ""
       except Exception:
         qualifier = ""
-    if self._should_request_approval(tool_name, tool_input, qualifier):
+    return self._requires_approval_with_qualifier(
+      tool_name,
+      tool_input,
+      qualifier,
+    )
+
+  def requires_approval_prepared(
+    self,
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+  ) -> bool:
+    """Classify one already-prepared call without selecting its route again."""
+
+    if type(prepared_call) is not PreparedToolCall:
+      raise TypeError("prepared_call must be an exact PreparedToolCall")
+    tool_input = prepared_call.materialize_input()
+    try:
+      registered_declaration = self._registered_approval_declaration(tool_name)
+      if registered_declaration is not None:
+        if (
+          registered_declaration.semantics.planning_policy.policy_id != "none"
+        ):
+          # Exact-write planning happens inside dispatch.  Timeout
+          # classification runs before that boundary and therefore cannot
+          # derive a plan-bound approval reuse key yet.  Such calls may enter
+          # the approval lifecycle, so classify them conservatively without
+          # executing the cache-key policy against an absent plan.
+          return True
+        registered_static_needs_approval = (
+          self.registered_approval_requirement(
+            registered_declaration,
+            prepared_call,
+          )[0]
+        )
+        return self._requires_approval_with_qualifier(
+          tool_name,
+          tool_input,
+          prepared_call.exact_backend or "",
+          registered_static_needs_approval=registered_static_needs_approval,
+        )
+    except Exception as exc:
+      log.error(
+        "Registered approval classification failed for %s | exception_type=%s",
+        tool_name,
+        type(exc).__name__,
+      )
       return True
-    if not self._approval_lifecycle_configured():
+    if self._registered_code_declaration(tool_name) is not None:
+      qualifier = prepared_call.exact_backend
+      if qualifier is None:
+        raise RuntimeError("registered code call lacks its exact backend")
+    else:
+      qualifier = ""
+      if self._approval_key_qualifier is not None:
+        try:
+          qualifier = self._approval_key_qualifier(tool_name, tool_input) or ""
+        except Exception:
+          qualifier = ""
+    return self._requires_approval_with_qualifier(
+      tool_name,
+      tool_input,
+      qualifier,
+    )
+
+  def _requires_approval_with_qualifier(
+    self,
+    tool_name: str,
+    tool_input: Dict[str, Any],
+    qualifier: str,
+    *,
+    registered_static_needs_approval: bool | None = None,
+  ) -> bool:
+    if registered_static_needs_approval is True:
+      return True
+    if (
+      registered_static_needs_approval is None
+      and self._should_request_approval(tool_name, tool_input, qualifier)
+    ):
+      return True
+    if isinstance(self._approval_route, NoApprovalRoute):
       return False
 
     try:
@@ -2060,8 +3398,27 @@ class ToolDispatcher:
     except TrustedToolPlanError:
       return True
 
-  def _approval_lifecycle_configured(self) -> bool:
-    return self._approval_store is not None and self._approval_policy is not None and self._session is not None
+  def _plan_requires_prepared_custody(
+    self,
+    tool_name: str,
+    trusted_plan: TrustedToolPlan | None,
+    registered_prepared_authorization: Any | None,
+  ) -> bool:
+    """Report whether this door needs a prepared payload to survive attempts.
+
+    These plans resume across attempts from a durable prepared row only the
+    process owning the ledger can write, so a route without that custody must
+    refuse rather than mint an approval with nothing behind it.
+    """
+
+    if tool_name == "fms_persist_business_model":
+      return True
+    if registered_prepared_authorization is not None:
+      return True
+    return (
+      trusted_plan is not None
+      and trusted_plan.identity_source == "reviewed_change_binding"
+    )
 
   async def _run_approval_lifecycle(
     self,
@@ -2074,6 +3431,8 @@ class ToolDispatcher:
     allow_persistent: bool,
     approval_constraint: ApprovalConstraint = "standard",
     required_owner_user_id: str | None = None,
+    approval_reuse_mode: ApprovalReuseMode = "legacy",
+    approval_reuse_key: str | None = None,
     approval_identity: Mapping[str, Any] | None = None,
     prepared_authorization_payload: bytes | None = None,
     prepared_business_model_change: Mapping[str, Any] | None = None,
@@ -2086,8 +3445,7 @@ class ToolDispatcher:
     deny_user_prompt: bool = False,
   ) -> dict[str, Any]:
     return await _approval_lifecycle_helpers.run_approval_lifecycle(
-      store=self._approval_store,
-      policy=self._approval_policy,
+      route=self._approval_route,
       session=self._session,
       tool_call_id=tool_call_id,
       tool_name=tool_name,
@@ -2097,6 +3455,8 @@ class ToolDispatcher:
       allow_persistent=allow_persistent,
       approval_constraint=approval_constraint,
       required_owner_user_id=required_owner_user_id,
+      approval_reuse_mode=approval_reuse_mode,
+      approval_reuse_key=approval_reuse_key,
       approval_identity=approval_identity,
       prepared_authorization_payload=prepared_authorization_payload,
       prepared_business_model_change=prepared_business_model_change,
@@ -2108,9 +3468,57 @@ class ToolDispatcher:
       automatic_denial_reason=automatic_denial_reason,
       deny_user_prompt=deny_user_prompt,
       resolve_run_context_fn=self._resolve_run_context,
-      current_skill_fn=current_skill,
+      current_skill_admission_fn=current_skill_admission,
       redact_for_approval_request_fn=self._redact_for_approval_request,
       resolve_tool_class_fn=self._resolve_tool_class,
+      effective_trade_approval_decision_fn=self._effective_trade_approval_decision,
+      await_user_approval_via_pending_tools_fn=self._await_user_approval_via_pending_tools,
+      approval_queue_timeout_seconds_fn=_approval_queue_timeout_seconds,
+      secret_boundary=getattr(self, "_secret_boundary", None),
+    )
+
+  async def run_registered_addin_approval_lifecycle(
+    self,
+    *,
+    declaration: ToolRegistrationDeclaration,
+    tool_call_id: str,
+    prepared_call: PreparedToolCall,
+    reason: str,
+    allow_persistent: bool,
+    approval_reuse_mode: ApprovalReuseMode,
+    approval_reuse_key: str | None,
+    session_cache_approved: bool = False,
+  ) -> dict[str, Any]:
+    """Run approval with the exact add-in declaration's registered effect."""
+
+    tool_input = prepared_call.materialize_input()
+    approval_args_redacted, approval_args_hash = (
+      self._redact_registered_declaration_for_approval(
+        declaration,
+        prepared_call,
+      )
+    )
+
+    return await _approval_lifecycle_helpers.run_approval_lifecycle(
+      route=self._approval_route,
+      session=self._session,
+      tool_call_id=tool_call_id,
+      tool_name=declaration.identity.logical_name,
+      tool_input=tool_input,
+      qualifier="",
+      reason=reason,
+      allow_persistent=allow_persistent,
+      approval_reuse_mode=approval_reuse_mode,
+      approval_reuse_key=approval_reuse_key,
+      approval_args_redacted=approval_args_redacted,
+      approval_args_hash=approval_args_hash,
+      session_cache_approved=session_cache_approved,
+      resolve_run_context_fn=self._resolve_run_context,
+      current_skill_admission_fn=current_skill_admission,
+      redact_for_approval_request_fn=self._redact_for_approval_request,
+      resolve_tool_class_fn=(
+        lambda _tool_name: cast(ToolClass, declaration.semantics.effect)
+      ),
       effective_trade_approval_decision_fn=self._effective_trade_approval_decision,
       await_user_approval_via_pending_tools_fn=self._await_user_approval_via_pending_tools,
       approval_queue_timeout_seconds_fn=_approval_queue_timeout_seconds,
@@ -2127,11 +3535,12 @@ class ToolDispatcher:
     allow_persistent: bool,
     timeout_seconds: float,
     batch_admission: Any | None = None,
+    durable_request: dict[str, Any] | None = None,
   ) -> dict[str, Any] | None:
     return await _approval_lifecycle_helpers.await_user_approval_via_pending_tools(
       session=self._session,
       approval_store=self._approval_store,
-      event_log=self._boundary_event_log,
+      append_event_fn=self._boundary_event_log.append,
       request=request,
       decision=decision,
       nonce=nonce,
@@ -2140,6 +3549,7 @@ class ToolDispatcher:
       timeout_seconds=timeout_seconds,
       log=log,
       batch_admission=batch_admission,
+      durable_request=durable_request,
     )
 
   def _resolve_run_context(self) -> RunContext:
@@ -2166,7 +3576,49 @@ class ToolDispatcher:
       tool_input,
       event_log=self._event_log,
       enrich_trade_approval_args_fn=enrich_trade_approval_args,
-      sha256_args_fn=sha256_args,
+    )
+
+  def _redact_registered_prepared_for_approval(
+    self,
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+  ) -> tuple[dict[str, Any], str]:
+    return self._registered_approval_projection(
+      tool_name,
+      prepared_call,
+      self.redact_prepared_tool_input(tool_name, prepared_call),
+    )
+
+  def _redact_registered_declaration_for_approval(
+    self,
+    declaration: ToolRegistrationDeclaration,
+    prepared_call: PreparedToolCall,
+  ) -> tuple[dict[str, Any], str]:
+    return self._registered_approval_projection(
+      declaration.identity.logical_name,
+      prepared_call,
+      self._redact_registered_declaration_input(
+        declaration,
+        prepared_call.materialize_input(),
+      ),
+    )
+
+  def _registered_approval_projection(
+    self,
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+    redacted: Mapping[str, object],
+  ) -> tuple[dict[str, Any], str]:
+    enriched = enrich_trade_approval_args(
+      tool_name,
+      dict(redacted),
+      event_log=self._event_log,
+    )
+    return (
+      enriched,
+      _approval_lifecycle_helpers.hash_approval_arguments(
+        prepared_call.materialize_input()
+      ),
     )
 
   def _approval_transport_input(self, tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
@@ -2220,7 +3672,7 @@ class ToolDispatcher:
     return {**tool_input, **additions}
 
   @staticmethod
-  def _is_portfolio_mcp_server(server: str | None) -> bool:
+  def _is_portfolio_mcp_server(server: str | None) -> TypeGuard[str]:
     return (
       isinstance(server, str)
       and server.startswith("portfolio-")
@@ -2300,35 +3752,19 @@ class ToolDispatcher:
       utc_now_fn=utc_now,
     )
 
-  async def _emit_execution_audit(
-    self,
-    request: PolicyApprovalRequest | None,
-    raw_tool_args: Dict[str, Any],
-    *,
-    outcome: Literal["success", "tool_error", "cancelled"],
-    error_summary: str | None = None,
-  ) -> None:
-    await _audit_helpers.emit_execution_audit(
-      request,
-      raw_tool_args,
-      approval_store=self._approval_store,
-      outcome=outcome,
-      error_summary=error_summary,
-      boundary_sanitizer=lambda value, sink: sanitize_boundary_value(
-        value,
-        sink=sink,
-        boundary=self._secret_boundary,
-      ),
-    )
-
   async def _call_mcp_tool(
     self,
     tool_name: str,
     tool_input: Dict[str, Any],
     *,
+    prepared_call: PreparedToolCall | None = None,
     meta: Dict[str, Any] | None = None,
     abort_event: asyncio.Event | None = None,
     gateway_session: Any | None = None,
+    allow_uncertain_replay: bool = True,
+    on_executed_prepared_call: (
+      Callable[[PreparedToolCall], None] | None
+    ) = None,
   ) -> ToolResult:
     kwargs: Dict[str, Any] = {}
     effective_meta = dict(meta or {})
@@ -2352,11 +3788,31 @@ class ToolDispatcher:
       }
     if effective_meta:
       kwargs["meta"] = effective_meta
-    if abort_event is not None and self._mcp_accepts_abort_event:
+    if abort_event is not None:
       kwargs["abort_event"] = abort_event
     if gateway_session is not None:
       kwargs["gateway_session"] = gateway_session
-    result, error = await self._mcp.call_tool(tool_name, tool_input, **kwargs)
+    kwargs["allow_uncertain_replay"] = allow_uncertain_replay
+    transport_input: Dict[str, Any] | PreparedToolCall = tool_input
+    if prepared_call is not None:
+      if type(prepared_call) is not PreparedToolCall:
+        raise TypeError("prepared_call must be an exact PreparedToolCall")
+      transport_input = PreparedToolCall(
+        tool_input,
+        prepared_call.exact_backend,
+      )
+    if on_executed_prepared_call is not None:
+      executed_prepared_call = (
+        transport_input
+        if isinstance(transport_input, PreparedToolCall)
+        else PreparedToolCall(transport_input)
+      )
+      on_executed_prepared_call(executed_prepared_call)
+    result, error = await self._mcp.call_tool(
+      tool_name,
+      transport_input,
+      **kwargs,
+    )
     if isinstance(error, dict) and "tool_usage_hint" not in error and _is_mcp_validation_error(error):
       hint = self._mcp_tool_argument_guidance(tool_name)
       if hint:
@@ -2409,10 +3865,6 @@ class ToolDispatcher:
       planner_result,
       payload_get_fn=cls._payload_get,
     )
-
-  @staticmethod
-  def _callable_accepts_kw(callback: Any, keyword: str) -> bool:
-    return _runtime_helpers.callable_accepts_kw(callback, keyword)
 
   @staticmethod
   def _normalize_needs_approval(

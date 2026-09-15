@@ -13,6 +13,8 @@ pydantic
 # Optional deps we use locally (must match pyproject.toml [project.optional-dependencies])
 anthropic>=0.93.0
 openai>=1.0.0
+# Supported version is enforced by agent_gateway/providers/agent_sdk.py.
+claude-agent-sdk==0.1.50
 
 # Build-system deps (used with --no-isolation to keep builds inside the hashed env)
 setuptools>=68

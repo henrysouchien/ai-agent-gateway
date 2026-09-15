@@ -24,6 +24,8 @@ from .skill_completion_wal import (
   TopLevelSkillCompletionEffectPlan,
   canonical_json_bytes,
 )
+from .named_refusal import NamedRefusal
+
 
 
 SkillLifecycleScope = Literal["ticker", "portfolio"]
@@ -102,8 +104,11 @@ _LEASE_FENCE_SCHEMA_VERSION = 1
 _MAX_LEASE_FENCE_BYTES = 4 * 1024 * 1024
 
 
-class WriterLeaseAlreadyHeldError(RuntimeError):
+class WriterLeaseAlreadyHeldError(NamedRefusal):
   """Raised when another writer owns the durable session lease."""
+
+  def __init__(self, message: str) -> None:
+    super().__init__("writer_lease_already_held", message, transport="conflict")
 
 
 def _normalized_absolute_path(path: str | Path) -> Path:
@@ -621,6 +626,11 @@ def _require_optional_exact_string(
     return None
   return _require_exact_nonempty_string(value, field_name=field_name)
 
+def _require_skill_lifecycle_scope(value: str) -> SkillLifecycleScope:
+  if value not in ("ticker", "portfolio"):
+    raise ValueError("scope must be exactly 'ticker' or 'portfolio'")
+  return value
+
 
 @dataclass(frozen=True, slots=True)
 class SkillLifecycleArtifactIdentity:
@@ -630,9 +640,22 @@ class SkillLifecycleArtifactIdentity:
   ticker: str | None
   portfolio_id: str | None
 
+  def __init__(
+    self,
+    scope: str,
+    ticker: str | None,
+    portfolio_id: str | None,
+  ) -> None:
+    object.__setattr__(
+      self,
+      "scope",
+      _require_skill_lifecycle_scope(scope),
+    )
+    object.__setattr__(self, "ticker", ticker)
+    object.__setattr__(self, "portfolio_id", portfolio_id)
+    self.__post_init__()
+
   def __post_init__(self) -> None:
-    if self.scope not in ("ticker", "portfolio"):
-      raise ValueError("scope must be exactly 'ticker' or 'portfolio'")
     _require_optional_exact_string(self.ticker, field_name="ticker")
     _require_optional_exact_string(
       self.portfolio_id,
@@ -730,9 +753,12 @@ def _require_nonnegative_number(
 ) -> None:
   if value is None and optional:
     return
-  if type(value) not in {int, float}:
+  if type(value) is int:
+    number = float(value)
+  elif type(value) is float:
+    number = value
+  else:
     raise RuntimeError(f"{field_name} must be a number")
-  number = float(value)
   if not math.isfinite(number) or number < 0:
     raise RuntimeError(
       f"{field_name} must be finite and non-negative"
@@ -1169,7 +1195,7 @@ class TopLevelSkillResultPolicy:
     cause = self._server_terminal_cause
     if cause is None:
       return deepcopy(proposed)
-    effective = {
+    effective: dict[str, Any] = {
       "type": "stream_complete",
       "terminal_disposition": "interrupted",
       "reason": cause,

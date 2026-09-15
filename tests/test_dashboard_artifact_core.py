@@ -130,34 +130,32 @@ def test_fixture_validation_matrix() -> None:
 
 
 def test_numeric_scalar_gap_and_inline_string_marker() -> None:
-  payload = _minimal_payload(
-    {
-      "type": "metric_tiles",
-      "title": "Metrics",
-      "data": {"items": [{"label": "Upside", "value": 42}]},
-    }
-  )
+  payload = _minimal_payload(_metric_module(42))
 
   report = validate_dashboard_payload(payload, "production")
   assert report["status"] == "fail"
   assert any("citation gap" in failure for failure in report["hard_failures"])
 
-  payload["sections"][0]["modules"][0]["data"]["items"][0]["value"] = "42 [src_1]"
+  payload = _minimal_payload(_metric_module("42 [src_1]"))
   report = validate_dashboard_payload(payload, "production")
   assert report["status"] == "pass"
   assert report["hard_failures"] == []
 
 
 def test_freeze_time_parse_and_source_freshness_are_strict_failures() -> None:
-  payload = _minimal_payload(_decision_module())
-  payload["metadata"]["freeze_time"] = "not-a-date"
+  payload = _minimal_payload(
+    _decision_module(),
+    freeze_time="not-a-date",
+  )
   report = validate_dashboard_payload(payload, "production")
   assert report["status"] == "fail"
   assert any("freeze_time" in failure for failure in report["hard_failures"])
 
-  payload = _minimal_payload(_decision_module())
-  payload["metadata"]["freeze_time"] = "2026-06-06T12:00:00Z"
-  payload["sources"][0]["retrieved_at"] = "2026-06-06T12:00:01Z"
+  payload = _minimal_payload(
+    _decision_module(),
+    freeze_time="2026-06-06T12:00:00Z",
+    source_retrieved_at="2026-06-06T12:00:01Z",
+  )
   report = validate_dashboard_payload(payload, "production")
   assert report["status"] == "fail"
   assert any("postdates" in failure for failure in report["hard_failures"])
@@ -192,8 +190,12 @@ def test_chart_minimums_are_hard_in_strict_and_warning_in_draft() -> None:
   assert strict_report["status"] == "fail"
   assert any("bar_chart requires at least 2 items" in failure for failure in strict_report["hard_failures"])
 
-  draft_payload = _minimal_payload(module, readiness_posture="draft", citation_policy="warn")
-  draft_payload["metadata"]["decision_context"] = None
+  draft_payload = _minimal_payload(
+    module,
+    readiness_posture="draft",
+    citation_policy="warn",
+    decision_context=None,
+  )
   draft_payload["hero"] = None
   draft_payload["snapshot"] = []
   draft_report = validate_dashboard_payload(draft_payload, "draft")
@@ -239,12 +241,22 @@ def _decision_module(summary: str = "The cited view has 10% upside [src_1].") ->
     "data": {"stance": "constructive", "summary": summary},
   }
 
+def _metric_module(value: int | str) -> dict[str, object]:
+  return {
+    "type": "metric_tiles",
+    "title": "Metrics",
+    "data": {"items": [{"label": "Upside", "value": value}]},
+  }
+
 
 def _minimal_payload(
   module: dict[str, object],
   *,
   readiness_posture: str = "decision_ready",
   citation_policy: str = "strict",
+  freeze_time: str = "2026-06-06T18:00:00Z",
+  decision_context: str | None = "Production validation test.",
+  source_retrieved_at: str = "2026-06-06T12:00:00Z",
 ) -> dict[str, object]:
   return {
     "kind": "hank_dashboard.v1",
@@ -254,8 +266,8 @@ def _minimal_payload(
     "scope_label": None,
     "metadata": {
       "readiness_posture": readiness_posture,
-      "freeze_time": "2026-06-06T18:00:00Z",
-      "decision_context": "Production validation test.",
+      "freeze_time": freeze_time,
+      "decision_context": decision_context,
       "citation_policy": citation_policy,
     },
     "hero": {
@@ -283,7 +295,7 @@ def _minimal_payload(
         "type": "filing",
         "source_id": "source-1",
         "text": "Source supports the cited value.",
-        "retrieved_at": "2026-06-06T12:00:00Z",
+        "retrieved_at": source_retrieved_at,
       }
     ],
   }

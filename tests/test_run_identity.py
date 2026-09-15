@@ -48,6 +48,8 @@ class _McpClient:
     tool_input: dict[str, Any],
     *,
     meta: dict[str, Any] | None = None,
+    abort_event: asyncio.Event | None = None,
+    allow_uncertain_replay: bool = True,
   ) -> tuple[dict[str, Any], None]:
     self.calls.append({"name": name, "tool_input": tool_input, "meta": meta})
     return {"ok": True}, None
@@ -65,20 +67,20 @@ class _McpClient:
 class _Provider(ModelProvider):
   name = "run-identity-test"
 
-  def has_active_credential(self, _config: dict[str, Any]) -> bool:
+  def has_active_credential(self, config: dict[str, Any]) -> bool:
     return True
 
   def create_client(
     self,
-    _config: dict[str, Any],
+    config: dict[str, Any],
     *,
     timeout: float | None = None,
   ) -> object:
-    _ = timeout
+    _ = config, timeout
     return object()
 
-  async def close_client(self, _client: Any, timeout: float = 2.0) -> None:
-    _ = timeout
+  async def close_client(self, client: Any, timeout: float = 2.0) -> None:
+    _ = client, timeout
 
   def get_model_info(self, model: str) -> ModelInfo:
     return ModelInfo(id=model, provider=self.name)
@@ -86,13 +88,18 @@ class _Provider(ModelProvider):
   def estimate_cost(
     self,
     model: str,
-    uncached: int,
-    output: int,
-    *,
+    input_tokens: int,
+    output_tokens: int,
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
   ) -> CostEstimate:
-    _ = model, uncached, output, cache_read_tokens, cache_creation_tokens
+    _ = (
+      model,
+      input_tokens,
+      output_tokens,
+      cache_read_tokens,
+      cache_creation_tokens,
+    )
     return CostEstimate()
 
 
@@ -233,7 +240,7 @@ def test_custom_runner_preserves_request_snapshot_and_run_identity() -> None:
       dispatcher=dispatcher,
       session_id="session-runner",
       capability_execution=stub_bound_capability_execution(
-        provider=provider,  # type: ignore[arg-type]
+        provider=provider,
         model="stub-model",
         effort="none",
         auth_config={"api_key": "test"},
@@ -268,7 +275,7 @@ def test_custom_runner_preserves_request_snapshot_and_run_identity() -> None:
         advertised_tool_names=frozenset({"build_model"}),
       )
 
-    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "build the model"}],
       max_turns=2,

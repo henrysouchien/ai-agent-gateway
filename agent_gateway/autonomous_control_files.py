@@ -69,29 +69,6 @@ def fsync_owned_file_directory(path: Path) -> None:
     os.close(directory_fd)
 
 
-def require_existing_owned_file_identity(
-  path: Path,
-  *,
-  field_name: str,
-) -> os.stat_result:
-  try:
-    file_stat = os.lstat(path)
-  except OSError as exc:
-    raise RuntimeError(
-      f"autonomous {field_name} must be a preexisting regular file"
-    ) from exc
-  if (
-    not stat.S_ISREG(file_stat.st_mode)
-    or stat.S_IMODE(file_stat.st_mode) != 0o600
-    or file_stat.st_nlink != 1
-    or file_stat.st_uid != os.geteuid()
-  ):
-    raise RuntimeError(
-      f"autonomous {field_name} has unsafe file identity"
-    )
-  return file_stat
-
-
 def unlink_created_owned_file(
   path: Path,
   *,
@@ -275,21 +252,6 @@ def append_open_json_record(
     os.close(fd)
 
 
-def require_appendable_owned_file(
-  path: Path,
-  *,
-  expected_device: int,
-  expected_inode: int,
-) -> None:
-  fd, _file_stat = _open_verified(
-    path,
-    flags=os.O_WRONLY | os.O_APPEND,
-    expected_device=expected_device,
-    expected_inode=expected_inode,
-  )
-  os.close(fd)
-
-
 def iter_closed_json_records(
   path: Path,
   *,
@@ -359,8 +321,6 @@ __all__ = [
   "find_closed_json_record",
   "fsync_owned_file_directory",
   "iter_closed_json_records",
-  "require_appendable_owned_file",
-  "require_existing_owned_file_identity",
   "secure_create_owned_file",
   "unlink_created_owned_file",
 ]

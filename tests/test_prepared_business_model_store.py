@@ -131,7 +131,7 @@ async def test_approval_and_prepared_change_are_created_atomically(
       profile="research_http",
       channel="web",
     ),
-    state="pending",
+    state="pending_user",
   )
   request = replace(
     request,
@@ -190,7 +190,7 @@ async def test_prepared_change_without_finite_expiry_is_rejected_atomically(tmp_
       profile="research_http",
       channel="web",
     ),
-    state="pending",
+    state="pending_user",
   )
   record = _record(
     locator="no-expiry",
@@ -417,7 +417,9 @@ async def test_maintenance_expires_approval_and_reconciles_prepared_in_one_pass(
   assert result.approvals_expired == 1
   assert result.prepared.scanned == 1
   assert result.prepared.expired == 1
-  assert (await store.get(request.approval_id)).state == "expired"
+  expired = await store.get(request.approval_id)
+  assert expired is not None
+  assert expired.state == "expired"
   reconciled = await store.get_prepared_business_model_change(
     caller_kind=record.caller_kind,
     user_scope=record.user_scope,
@@ -553,6 +555,7 @@ async def test_two_store_reconcilers_authorize_once_without_duplicate_transition
 async def test_maintenance_loop_logs_bounded_summary_and_typed_conflicts(
   monkeypatch: pytest.MonkeyPatch,
   caplog: pytest.LogCaptureFixture,
+  tmp_path,
 ) -> None:
   class StopLoop(RuntimeError):
     pass
@@ -571,7 +574,7 @@ async def test_maintenance_loop_logs_bounded_summary_and_typed_conflicts(
     idempotency_locator="sensitive-request-locator",
   )
 
-  class Store:
+  class Store(SQLiteApprovalStore):
     async def maintain_pending(self, **_kwargs) -> ApprovalMaintenanceResult:
       return ApprovalMaintenanceResult(
         approvals_expired=2,
@@ -592,7 +595,10 @@ async def test_maintenance_loop_logs_bounded_summary_and_typed_conflicts(
   )
   with caplog.at_level(logging.INFO, logger="agent_gateway.approval_store"):
     with pytest.raises(StopLoop):
-      await approval_store_module.expire_pending_loop(Store(), interval_seconds=0)
+      await approval_store_module.expire_pending_loop(
+        Store(tmp_path / "loop.sqlite3"),
+        interval_seconds=0,
+      )
 
   summary = next(
     record for record in caplog.records
@@ -602,11 +608,11 @@ async def test_maintenance_loop_logs_bounded_summary_and_typed_conflicts(
     record for record in caplog.records
     if record.message == "prepared BusinessModel reconciliation conflicts"
   )
-  assert summary.approvals_expired == 2
-  assert summary.prepared_scanned == 4
-  assert summary.prepared_cursor == cursor.log_token
-  assert summary.prepared_cursor_wrapped is True
-  assert warning.prepared_missing_approval == 1
+  assert summary.__dict__["approvals_expired"] == 2
+  assert summary.__dict__["prepared_scanned"] == 4
+  assert summary.__dict__["prepared_cursor"] == cursor.log_token
+  assert summary.__dict__["prepared_cursor_wrapped"] is True
+  assert warning.__dict__["prepared_missing_approval"] == 1
   assert "sensitive-user-scope" not in summary.message
   assert "sensitive-request-locator" not in warning.message
 

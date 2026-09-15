@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from dataclasses import replace
 from typing import Any, AsyncIterator
 from weakref import WeakKeyDictionary
 
 import httpx
 
 from ..model_registry import AdapterRouteSupport
+from ..rates import RateTable, UnknownModelError, load_provider_rate_table
 from ..thinking import EffortResolution, ThinkingLevel
-from .base import ModelInfo, ModelProvider, StreamEvent, _is_context_length_exception
+from .base import (
+  ModelInfo, ModelProvider, StreamEvent, _is_context_length_exception,
+  registry_effort_values, registry_entry_for_model,
+)
 from .codex import CodexProvider
 from .xai_helpers import (
   DEFAULT_INSTRUCTIONS,
@@ -32,10 +38,12 @@ from .xai_oauth import (
   xai_record_requires_reauth,
 )
 
+log = logging.getLogger(__name__)
+
 
 def _bound_xai_base_url(config: dict[str, Any]) -> str:
   configured = {
-    str(config[key]).strip()
+    str(config.get(key)).strip()
     for key in ("base_url", "baseURL")
     if str(config.get(key) or "").strip()
   }
@@ -81,9 +89,13 @@ def _oauth_material_from_config(
   if not access_token and not refresh_token:
     return None, None
   settings = resolve_xai_oauth_settings(config, environ={})
-  raw_expires = config.get("token_expires_at")
+  raw_expires: str | int | float | None = config.get("token_expires_at")
   try:
-    expires_at = float(raw_expires) if raw_expires not in {None, ""} else 0.0
+    expires_at = (
+      float(raw_expires)
+      if raw_expires is not None and raw_expires != ""
+      else 0.0
+    )
   except (TypeError, ValueError):
     expires_at = 0.0
   record: dict[str, Any] = {
@@ -117,7 +129,8 @@ class XAIProvider(ModelProvider):
       routes=frozenset({"xai.public"}),
     )
 
-  def __init__(self) -> None:
+  def __init__(self, *, rate_table: RateTable | None = None) -> None:
+    self._rate_table = load_provider_rate_table(self.name, rate_table)
     self._client_state: WeakKeyDictionary[httpx.AsyncClient, dict[str, Any]] = WeakKeyDictionary()
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
@@ -156,8 +169,9 @@ class XAIProvider(ModelProvider):
     client_kwargs: dict[str, Any] = {
       "timeout": httpx.Timeout(timeout=timeout or 120.0, connect=10.0),
     }
-    if isinstance(config.get("_transport"), httpx.AsyncBaseTransport):
-      client_kwargs["transport"] = config["_transport"]
+    transport = config.get("_transport")
+    if isinstance(transport, httpx.AsyncBaseTransport):
+      client_kwargs["transport"] = transport
     client = httpx.AsyncClient(**client_kwargs)
     self._client_state[client] = {
       "token": token,
@@ -188,64 +202,78 @@ class XAIProvider(ModelProvider):
     # grok-latest is not a documented alias — conservatively assume it resolves
     # to grok-4.5 (500k) so compaction fires before any real wall.
     # xAI publishes NO max-output cap; 128k is an internal assumption.
-    common = dict(
-      id=model_id,
-      provider=self.name,
-      context_window=1_000_000,
-      max_output_tokens=128_000,
-      supports_vision=False,
-      supports_tool_use=True,
-    )
+    context_window = 1_000_000
+    supports_thinking = True
+    compat: dict[str, bool | str | tuple[str, ...]]
     if model_id == "grok-4.3" or model_id.startswith("grok-4.3-"):
-      return ModelInfo(
-        **common,
-        supports_thinking=True,
-        compat={
-          "supportsReasoningEffort": True,
-          "reasoningEffortValues": ("none", "low", "medium", "high"),
-          "reasoningEffortDefault": "medium",
-        },
-      )
-    if model_id == "grok-latest":
-      return ModelInfo(
-        **{**common, "context_window": 500_000},
-        supports_thinking=True,
-        compat={
-          "supportsReasoningEffort": True,
-          "reasoningEffortValues": ("none", "low", "medium", "high"),
-          "reasoningEffortDefault": "medium",
-        },
-      )
-    if model_id == "grok-4.5" or model_id.startswith("grok-4.5-"):
-      return ModelInfo(
-        **{**common, "context_window": 500_000},
-        supports_thinking=True,
-        compat={
-          "supportsReasoningEffort": True,
-          "reasoningEffortValues": ("low", "medium", "high"),
-          "reasoningEffortDefault": "medium",
-        },
-      )
-    if model_id in {
+      compat = {
+        "supportsReasoningEffort": True,
+        "reasoningEffortValues": ("none", "low", "medium", "high"),
+        "reasoningEffortDefault": "medium",
+      }
+    elif model_id == "grok-latest":
+      context_window = 500_000
+      compat = {
+        "supportsReasoningEffort": True,
+        "reasoningEffortValues": ("none", "low", "medium", "high"),
+        "reasoningEffortDefault": "medium",
+      }
+    elif model_id == "grok-4.5" or model_id.startswith("grok-4.5-"):
+      context_window = 500_000
+      compat = {
+        "supportsReasoningEffort": True,
+        "reasoningEffortValues": ("low", "medium", "high"),
+        "reasoningEffortDefault": "medium",
+      }
+    elif model_id in {
       "grok-build-0.1",
       "grok-4.20-beta-latest-reasoning",
       "grok-4.20-beta-latest-non-reasoning",
     }:
-      return ModelInfo(
-        **{**common, "context_window": 256_000 if model_id == "grok-build-0.1" else 1_000_000},
-        supports_thinking=model_id.endswith("-reasoning"),
-        compat={"supportsReasoningEffort": False},
-      )
-    # Allowlist enforcement happens above the provider. Unknown explicitly
-    # allowlisted Grok models use the spec's conservative reasoning dial.
-    return ModelInfo(
-      **common,
-      supports_thinking=True,
-      compat={
+      context_window = 256_000 if model_id == "grok-build-0.1" else 1_000_000
+      supports_thinking = model_id.endswith("-reasoning")
+      compat = {"supportsReasoningEffort": False}
+    else:
+      # Allowlist enforcement happens above the provider. Unknown explicitly
+      # allowlisted Grok models use the spec's conservative reasoning dial.
+      compat = {
         "supportsReasoningEffort": True,
         "reasoningEffortValues": ("low", "medium", "high"),
         "reasoningEffortDefault": "medium",
-      },
+      }
+    entry = registry_entry_for_model(self.name, model_id)
+    if entry is not None:
+      efforts = registry_effort_values(entry)
+      supports_thinking = any(value != "none" for value in efforts)
+      compat = {
+        "supportsReasoningEffort": supports_thinking,
+        "reasoningEffortValues": efforts,
+        "reasoningEffortDefault": entry.default_effort,
+      }
+    model_info = ModelInfo(
+      id=model_id,
+      provider=self.name,
+      context_window=context_window,
+      max_output_tokens=128_000,
+      supports_thinking=supports_thinking,
+      supports_vision="vision" in entry.features if entry is not None else False,
+      supports_tool_use="tools" in entry.features if entry is not None else True,
+      compat=compat,
+    )
+    try:
+      rates = self._rate_table.lookup(self.name, model_id)
+    except UnknownModelError:
+      log.warning("xAI model %r has no rate row; using zero-cost estimates", model_id)
+      return model_info
+    return replace(
+      model_info,
+      context_window=rates.context_window or model_info.context_window,
+      max_output_tokens=rates.max_tokens or model_info.max_output_tokens,
+      input_cost_per_mtok=rates.input_cost_per_mtok,
+      output_cost_per_mtok=rates.output_cost_per_mtok,
+      cache_read_cost_per_mtok=rates.cache_read_cost_per_mtok,
+      cache_write_cost_per_mtok=rates.cache_write_cost_per_mtok,
+      rate_tiers=rates.tiers,
     )
 
   def resolve_effort(

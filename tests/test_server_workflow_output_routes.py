@@ -57,6 +57,11 @@ def _request() -> Request:
     "headers": [(b"authorization", b"Bearer session-token")],
   })
 
+def _log_data(record: logging.LogRecord) -> dict[str, object]:
+  data = record.__dict__["data"]
+  assert isinstance(data, dict)
+  return data
+
 
 def _session(tmp_path: Path) -> tuple[GatewaySession, AgentSessionLog]:
   session = GatewaySession(
@@ -70,7 +75,7 @@ def _session(tmp_path: Path) -> tuple[GatewaySession, AgentSessionLog]:
     tmp_path / "session.jsonl",
     gateway_session=session,
   )
-  session.agent_session_log = session_log  # type: ignore[attr-defined]
+  session.agent_session_log = session_log
   return session, session_log
 
 
@@ -380,7 +385,7 @@ async def test_legacy_workflow_run_tool_envelope_dialect_is_rejected(
       "end": end,
     }
 
-  session.workflow_output_reader = envelope_reader
+  session.workflow_output_reader = envelope_reader  # pyright: ignore[reportAttributeAccessIssue]  # negative: legacy page envelope rejection
   with caplog.at_level(
     logging.WARNING,
     logger="agent_gateway.server_workflow_output_routes",
@@ -395,7 +400,7 @@ async def test_legacy_workflow_run_tool_envelope_dialect_is_rejected(
   assert response.status_code == 409
   assert b"workflow_output_integrity_failed" in response.body
   assert [
-    record.data["reason_code"]
+    _log_data(record)["reason_code"]
     for record in caplog.records
     if getattr(record, "data", {}).get("event")
     == "workflow_output_integrity_failed"
@@ -615,6 +620,7 @@ async def test_each_integrity_variant_logs_its_distinct_internal_reason(
     )
 
   assert response.status_code == 409
+  assert isinstance(response.body, bytes)
   assert json.loads(response.body) == {
     "error": "workflow_output_integrity_failed",
     "message": "Canonical workflow output failed identity verification.",
@@ -625,10 +631,10 @@ async def test_each_integrity_variant_logs_its_distinct_internal_reason(
     if getattr(record, "data", {}).get("event")
     == "workflow_output_integrity_failed"
   ]
-  assert [record.data["reason_code"] for record in records] == [
+  assert [_log_data(record)["reason_code"] for record in records] == [
     expected_reason
   ]
-  assert records[0].data == {
+  assert _log_data(records[0]) == {
     "event": "workflow_output_integrity_failed",
     "stage": "materialize_verified_content",
     "reason_code": expected_reason,
@@ -667,7 +673,7 @@ async def test_empty_source_page_logs_empty_page_reason(
 
   assert response.status_code == 409
   assert [
-    record.data["reason_code"]
+    _log_data(record)["reason_code"]
     for record in caplog.records
     if getattr(record, "data", {}).get("event")
     == "workflow_output_integrity_failed"
@@ -701,7 +707,7 @@ async def test_invalid_page_shape_logs_its_internal_reason(
 
   assert response.status_code == 409
   assert [
-    record.data["reason_code"]
+    _log_data(record)["reason_code"]
     for record in caplog.records
     if getattr(record, "data", {}).get("event")
     == "workflow_output_integrity_failed"
@@ -732,7 +738,7 @@ async def test_materialized_hash_mismatch_logs_its_internal_reason(
 
   assert response.status_code == 409
   assert [
-    record.data["reason_code"]
+    _log_data(record)["reason_code"]
     for record in caplog.records
     if getattr(record, "data", {}).get("event")
     == "workflow_output_integrity_failed"
@@ -748,6 +754,7 @@ async def test_durable_attachment_conflict_logs_lookup_stage_reason(
   session, session_log = _session(tmp_path)
   attachment = _attachment(canonical)
   _record_attachment(session_log, attachment)
+  assert isinstance(attachment.envelope, DeliveryEnvelopeV1)
   summary = attachment.envelope.summary
   assert summary is not None
   conflicting_text = "Different executive summary"
@@ -793,6 +800,7 @@ async def test_durable_attachment_conflict_logs_lookup_stage_reason(
     )
 
   assert response.status_code == 409
+  assert isinstance(response.body, bytes)
   assert json.loads(response.body) == {
     "error": "workflow_output_integrity_failed",
     "message": "Canonical workflow output failed identity verification.",
@@ -803,7 +811,7 @@ async def test_durable_attachment_conflict_logs_lookup_stage_reason(
     if getattr(record, "data", {}).get("event")
     == "workflow_output_integrity_failed"
   ]
-  assert [record.data["reason_code"] for record in records] == [
+  assert [_log_data(record)["reason_code"] for record in records] == [
     "durable_attachment_identity_conflict"
   ]
-  assert records[0].data["stage"] == "durable_attachment_lookup"
+  assert _log_data(records[0])["stage"] == "durable_attachment_lookup"

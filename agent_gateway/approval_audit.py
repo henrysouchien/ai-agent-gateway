@@ -6,7 +6,7 @@ import hmac
 import logging
 import traceback
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 from typing import Any, Callable, Literal
 
@@ -42,6 +42,18 @@ AuditEventType = Literal[
   "tool_executed_error",
   "tool_cancelled",
 ]
+
+RetentionClass = Literal["dev", "operational", "compliance"]
+
+#: Retention policy is owned beside its vocabulary: every retention_class the
+#: writer can stamp has exactly one retention period, and a persisted row with
+#: a class this map does not know fails retention loudly instead of being
+#: silently destroyed on an assumed schedule.
+APPROVAL_AUDIT_RETENTION_DAYS: dict[str, int] = {
+  "dev": 30,
+  "operational": 365,
+  "compliance": 2555,
+}
 
 
 class AuditBuildError(RuntimeError):
@@ -91,7 +103,7 @@ class ApprovalAuditEntry:
   tenant_id: str | None = None
   kept_paths: list[str] | None = None
   dropped_paths: list[str] | None = None
-  retention_class: Literal["dev", "operational", "compliance"] = "operational"
+  retention_class: RetentionClass = "operational"
   legal_hold: bool = False
 
   def to_json_dict(self) -> dict[str, Any]:
@@ -102,6 +114,27 @@ class ApprovalAuditEntry:
       payload.pop("dropped_paths")
     payload["ts"] = self.ts.isoformat()
     return payload
+
+  @classmethod
+  def from_json_dict(cls, payload: dict[str, Any]) -> "ApprovalAuditEntry":
+    """Rebuild one durable audit row through the current schema.
+
+    The durable JSONL bytes remain the authority. Rows written by an earlier
+    shape of this dataclass take the declared defaults for fields added since;
+    rows written by a later shape keep their extra fields in the durable bytes
+    and are projected through the current schema with a warning.
+    """
+    known = {field.name for field in fields(cls)}
+    unknown = sorted(set(payload) - known)
+    if unknown:
+      log.warning(
+        "approval audit row %r carries fields outside the current schema: %s",
+        payload.get("entry_id"),
+        ", ".join(unknown),
+      )
+    values = {key: value for key, value in payload.items() if key in known}
+    values["ts"] = datetime.fromisoformat(str(values["ts"]))
+    return cls(**values)
 
 
 def _args_hash_version(args_hash: str, *, key_id: str) -> str:
@@ -129,7 +162,7 @@ def build_audit_entry(
   skill: str | None = None,
   kept_paths: list[str] | None = None,
   dropped_paths: list[str] | None = None,
-  retention_class: Literal["dev", "operational", "compliance"] = "operational",
+  retention_class: RetentionClass = "operational",
   legal_hold: bool = False,
   tool_input_redactor: Callable[..., dict[str, Any]] | None = None,
   boundary_sanitizer: Callable[[Any, str], Any] | None = None,
@@ -363,6 +396,11 @@ class ApprovalAuditEmitter:
     request: ApprovalRequest | None = None,
   ) -> None:
     if request is None:
+      log.warning(
+        "Grant audit skipped: no approval request found for grant %s (%s) | failure=true",
+        getattr(grant, "grant_id", "?"),
+        event_type,
+      )
       return
     await self.emit_audit_for_lifecycle_event(
       event_type=event_type,

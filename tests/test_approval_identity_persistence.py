@@ -549,6 +549,8 @@ def test_old_schema_migrates_existing_row_with_null_identity(tmp_path: Path) -> 
     "execution_semantics_digest",
     "approval_constraint",
     "required_owner_user_id",
+    "approval_reuse_mode",
+    "approval_reuse_key",
   } <= columns
 
   loaded = _run(store.get("legacy-before-migration"))
@@ -558,6 +560,10 @@ def test_old_schema_migrates_existing_row_with_null_identity(tmp_path: Path) -> 
     "approval_constraint": "legacy_unknown",
     "required_owner_user_id": None,
   }
+  assert (loaded.approval_reuse_mode, loaded.approval_reuse_key) == (
+    "legacy",
+    None,
+  )
 
 
 def test_legacy_insert_and_update_sql_preserve_new_identity_columns(tmp_path: Path) -> None:
@@ -593,6 +599,10 @@ def test_legacy_insert_and_update_sql_preserve_new_identity_columns(tmp_path: Pa
     "approval_constraint": "legacy_unknown",
     "required_owner_user_id": None,
   }
+  assert (
+    legacy_insert.approval_reuse_mode,
+    legacy_insert.approval_reuse_key,
+  ) == ("legacy", None)
 
 
 @pytest.mark.parametrize(
@@ -712,7 +722,7 @@ def test_review_reference_rejects_lossy_non_json_shapes(
     identity_source="reviewed_change_binding",
   )
   with pytest.raises(ValueError, match="strict JSON values"):
-    replace(request, review_reference=review_reference)  # type: ignore[arg-type]
+    replace(request, review_reference=review_reference)
 
 
 def test_review_reference_rejects_untyped_plain_json() -> None:
@@ -886,7 +896,7 @@ def test_audit_entry_echoes_approval_identity_without_aliasing(
     raw_tool_args={},
     deployment_secret=b"test-secret",
     key_id="test-key",
-    event_type="approval_requested",
+    event_type="request_created",
     request=request,
   )
 

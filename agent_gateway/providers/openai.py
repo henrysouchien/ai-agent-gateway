@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import logging
 import re
 from dataclasses import replace
 from typing import Any, AsyncIterator, Dict
 from urllib.parse import urlparse
 
 from ..model_registry import AdapterRouteSupport
+from ..rates import RateTable, UnknownModelError, load_provider_rate_table
 from ..thinking import EffortResolution, clamp_effort
 from .base import (
-  CostEstimate,
   ModelInfo,
   ModelProvider,
   StreamEvent,
   ThinkingLevel,
+  registry_effort_values,
+  registry_entry_for_model,
   truncate_to_last_compaction,
 )
 from .openai_responses_helpers import (
@@ -24,11 +28,14 @@ from .openai_responses_helpers import (
   _is_tool_result_message,
   _model_matches_tag,
   _normalize_tool_call_id,
+  _responses_compat,
   _same_model_message,
   _synthetic_tool_result,
   _system_prompt_text,
   map_event,
 )
+
+log = logging.getLogger(__name__)
 
 
 _BASE_URL_KEYS = ("base_url", "baseURL", "api_base_url", "api_base")
@@ -120,6 +127,9 @@ class OpenAIProvider(ModelProvider):
       routes=frozenset({"openai.public"}),
     )
 
+  def __init__(self, *, rate_table: RateTable | None = None) -> None:
+    self._rate_table = load_provider_rate_table(self.name, rate_table)
+
   def has_active_credential(self, config: dict[str, Any]) -> bool:
     if str(config.get("auth_mode", "api")).strip().lower() == "oauth":
       return bool(str(config.get("auth_token", "")).strip())
@@ -173,11 +183,45 @@ class OpenAIProvider(ModelProvider):
       raise ValueError("Model is required")
     for tags, info in sorted(_MODEL_INFO_BY_TAG, key=lambda row: max(map(len, row[0])), reverse=True):
       if any(_model_matches_tag(model_id, tag) for tag in tags):
-        resolved = replace(info, id=model_id)
-        if not bool((resolved.compat or {}).get("supportsResponsesStreaming")):
-          raise ValueError(f"OpenAI model {model_id!r} has no verified Responses streaming capability")
-        return resolved
-    raise ValueError(f"OpenAIProvider has no verified Responses capability row for model: {model_id}")
+        model_info = replace(info, id=model_id)
+        break
+    else:
+      entry = registry_entry_for_model(self.name, model_id)
+      if entry is None:
+        raise ValueError(
+          f"the product model registry does not admit OpenAI model {model_id!r}"
+        )
+      efforts = registry_effort_values(entry)
+      reasoning = tuple(value for value in efforts if value != "none")
+      supports_tools = "tools" in entry.features
+      model_info = ModelInfo(
+        id=model_id,
+        provider=self.name,
+        supports_thinking=bool(reasoning),
+        supports_vision="vision" in entry.features,
+        supports_tool_use=supports_tools,
+        compat=_responses_compat(
+          effort_values=efforts if reasoning else (),
+          effort_default=entry.default_effort,
+          summary=bool(reasoning),
+          function_tools=supports_tools,
+        ),
+      )
+    try:
+      rates = self._rate_table.lookup(self.name, model_id)
+    except UnknownModelError:
+      log.warning("OpenAI model %r has no rate row; using zero-cost estimates", model_id)
+      return model_info
+    return replace(
+      model_info,
+      context_window=rates.context_window or model_info.context_window,
+      max_output_tokens=rates.max_tokens or model_info.max_output_tokens,
+      input_cost_per_mtok=rates.input_cost_per_mtok,
+      output_cost_per_mtok=rates.output_cost_per_mtok,
+      cache_read_cost_per_mtok=rates.cache_read_cost_per_mtok,
+      cache_write_cost_per_mtok=rates.cache_write_cost_per_mtok,
+      rate_tiers=rates.tiers,
+    )
 
   def resolve_effort(
     self,
@@ -338,7 +382,12 @@ class OpenAIProvider(ModelProvider):
     create = getattr(responses, "create", None)
     if not callable(create):
       raise RuntimeError("OpenAI client does not expose responses.create; openai>=2.31.0 is required")
-    stream = await create(**params)
+    stream_result = create(**params)
+    if not inspect.isawaitable(stream_result):
+      raise TypeError(
+        f"object {type(stream_result).__name__} can't be used in 'await' expression"
+      )
+    stream = await stream_result
     state = _ResponsesStreamState()
     async for event in stream:
       for mapped in map_event(event, state):
@@ -352,11 +401,11 @@ class OpenAIProvider(ModelProvider):
     try:
       import httpx
     except ImportError:
-      httpx = None  # type: ignore[assignment]
+      httpx = None
     try:
       from openai import APIConnectionError, APIStatusError, RateLimitError
     except ImportError:
-      APIConnectionError = APIStatusError = RateLimitError = None  # type: ignore[assignment]
+      APIConnectionError = APIStatusError = RateLimitError = None
     status_code = getattr(exc, "status_code", None)
     response = getattr(exc, "response", None)
     if status_code is None and response is not None:
@@ -408,22 +457,6 @@ class OpenAIProvider(ModelProvider):
     if _OPENAI_OUTPUT_TOKEN_PARAMETER_PATTERN.search(searchable):
       return False
     return any(pattern.search(searchable) for pattern in _OPENAI_CONTEXT_LENGTH_PATTERNS)
-
-  def estimate_cost(
-    self,
-    model: str,
-    input_tokens: int,
-    output_tokens: int,
-    cache_read_tokens: int = 0,
-    cache_creation_tokens: int = 0,
-  ) -> CostEstimate:
-    return super().estimate_cost(
-      model,
-      input_tokens,
-      output_tokens,
-      cache_read_tokens=cache_read_tokens,
-      cache_creation_tokens=cache_creation_tokens,
-    )
 
 
 __all__ = ["OpenAIConfigurationError", "OpenAIProvider"]

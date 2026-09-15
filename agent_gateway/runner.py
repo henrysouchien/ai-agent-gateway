@@ -10,7 +10,7 @@ import socket  # noqa: F401 - compatibility alias for runner session lifecycle m
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
+from typing import AbstractSet, Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from agent_workflow_contracts import ResultRequirement
 
@@ -24,6 +24,7 @@ from .mcp_activation import McpActivationFold
 from .mcp_client import McpClientManager
 from .multi_user.billing import (
   DEFAULT_USAGE_DLQ_PATH,
+  BillingMode,
   SessionUsageSummary,
   UsageEvent,
   _UsageAggregator,
@@ -35,6 +36,7 @@ from .runner_introspection import (
   derive_sub_agent_id as _derive_sub_agent_id,  # noqa: F401 - compatibility alias
   detect_keyword_param as _detect_keyword_param,
   detect_user_id_param as _detect_user_id_param,
+  is_sub_agent_session_id as _is_sub_agent_session_id,
 )
 from .runner_limits import (
   CONTEXT_PRESSURE_REMINDER_PCT as CONTEXT_PRESSURE_REMINDER_PCT,
@@ -61,7 +63,7 @@ from .runner_background_tasks import (
   drain_cancelled_background_tasks as _drain_cancelled_background_tasks,  # noqa: F401 - compatibility alias
   drain_still_pending_background_tasks as _drain_still_pending_background_tasks,  # noqa: F401 - compatibility alias
   entry_aware_background_handler as _entry_aware_background_handler,  # noqa: F401 - compatibility alias
-  kill_background_tasks as _kill_background_tasks,  # noqa: F401 - compatibility alias
+  kill_background_tasks as _kill_background_tasks,
   kill_background_tasks_for_asyncio_tasks as _kill_background_tasks_for_asyncio_tasks,
   prepare_background_task_registration as _prepare_background_task_registration,  # noqa: F401 - compatibility alias
   task_registered_event_payload as _task_registered_event_payload,  # noqa: F401 - compatibility alias
@@ -83,11 +85,17 @@ from .skill_lifecycle import (
   TopLevelServerTerminalCause,
 )
 from .runner_sub_agents import RunnerSubAgentMixin
-from .sub_agent_skill_state import result_response_text
+from .sub_agent_skill_state import (
+  declared_terminal_tool_result_disposition,
+  result_response_text,
+)
 from .runner_stream_turn import RunnerStreamTurnMixin
 from .selected_content import SelectedContentBinding
 from .runner_run_loop import RunnerRunLoopMixin
-from .runner_tool_execution import RunnerToolExecutionMixin
+from .runner_tool_execution import (
+  AgentRunnerDispatcher,
+  RunnerToolExecutionMixin,
+)
 from .workflow_output_attachment import WorkflowOutputAttachment
 from .runner_session_events import (
   build_attach_event as _build_attach_event,  # noqa: F401 - compatibility alias
@@ -129,12 +137,11 @@ from .runner_streaming import (
 )
 from .runner_tool_audit import (
   get_tool_risk_value as _get_tool_risk_value,  # noqa: F401 - compatibility alias
-  redact_tool_input_for_event as _redact_tool_input_for_event,  # noqa: F401 - compatibility alias
 )
 from .secret_boundary import SecretBoundary, sanitize_tool_event
 from .runner_usage import (
   build_usage_event as _build_usage_event,  # noqa: F401 - compatibility alias
-  record_compaction as _record_compaction,  # noqa: F401 - compatibility alias
+  record_compaction as _record_compaction,
   usage_delta as _usage_delta,  # noqa: F401 - compatibility alias
   usage_has_tokens as _usage_has_tokens,  # noqa: F401 - compatibility alias
 )
@@ -149,7 +156,7 @@ from .task_registry import (
   TaskRegistry,
   TaskState,
 )
-from .tool_dispatcher import ToolDispatcher
+from .thinking import EffortResolution
 from .tool_display import resolve_display  # noqa: F401 - compatibility alias
 from .tool_result_compaction import (
   MODEL_TOOL_RESULT_MAX_CHARS_ENV as MODEL_TOOL_RESULT_MAX_CHARS_ENV,
@@ -160,10 +167,7 @@ from .tool_result_compaction import (
   make_error_result,
   write_tool_result_spill,
 )
-from .tool_result_semantics import (
-  classify_semantic_tool_error,  # noqa: F401 - compatibility alias
-  is_semantic_tool_error as _is_soft_error,
-)
+from .tool_result_semantics import classify_semantic_tool_error  # noqa: F401 - compatibility alias
 from .tool_result_spill import SpillSink, normalize_spill_sink
 
 
@@ -192,6 +196,10 @@ _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY = "_active_skill_report_doors"
 # Report doors are the only auto-clear doors in scope and normally return noop;
 # staged is included defensively for preview-mode doors that stage artifacts.
 _REPORT_DOOR_CLEAR_SUCCESS_STATUSES = frozenset({"noop", "staged"})
+
+
+
+
 OnToolResult = Callable[[ToolResultContext], Awaitable[List[Dict[str, Any]] | None]]
 OnUsage = Callable[[UsageEvent], Awaitable[None] | None]
 OnSessionSummary = Callable[[SessionUsageSummary], Awaitable[None] | None]
@@ -204,6 +212,9 @@ OnMetric = Callable[[str, int], None]
 OnCredentialRefresh = Callable[[ProviderCredentialFailure], Awaitable[Dict[str, Any] | None] | Dict[str, Any] | None]
 ShutdownSignalProvider = Callable[[], Dict[str, Any] | None]
 
+
+# certified by VRT at 4 tracks; re-run owed at 7
+DEFAULT_MAX_BACKGROUND_TASKS = 6
 
 class AgentRunner(
   RunnerSessionLifecycleMixin,
@@ -230,6 +241,8 @@ class AgentRunner(
   - `on_tool_result`, `on_usage`, and `on_tool_timing` are observability hooks.
   - `max_budget_usd` and `max_turns` stop the loop before it runs away.
   """
+  _billing_mode: BillingMode
+
 
   @property
   def _max_background_tasks(self) -> int:
@@ -261,7 +274,7 @@ class AgentRunner(
   def __init__(
     self,
     event_log: EventLog,
-    dispatcher: ToolDispatcher,
+    dispatcher: AgentRunnerDispatcher,
     session_id: str,
     *,
     capability_execution: BoundCapabilityExecution,
@@ -272,7 +285,7 @@ class AgentRunner(
     stream_stall_timeout: float | None = None,
     mcp_client: McpClientManager | None = None,
     mcp_activation_fold: McpActivationFold | None = None,
-    excluded_tools: Set[str] | None = None,
+    excluded_tools: AbstractSet[str] | None = None,
     purpose: str | None = None,
     get_tool_definitions: Callable[[], List[Dict[str, Any]]] | None = None,
     on_tool_result: OnToolResult | None = None,
@@ -298,7 +311,7 @@ class AgentRunner(
     max_budget_usd: float | None = None,
     _cost_accumulator: CostAccumulator | None = None,
     _parent_aggregator: _UsageAggregator | None = None,
-    max_concurrent_sub_agents: int | None = 4,
+    max_concurrent_sub_agents: int | None = DEFAULT_MAX_BACKGROUND_TASKS,
     result_requirement: ResultRequirement | None = None,
     agent_session_log: AgentSessionLog | None = None,
     context_builder: SessionContextBuilder | None = None,
@@ -322,6 +335,7 @@ class AgentRunner(
     commercial_usage_producer: Any | None = None,
     gateway_session: GatewaySession | None = None,
     context_research_file_id: int | None = None,
+    terminal_tool_result_ids: Set[str] | None = None,
   ) -> None:
     if (
       gateway_session is not None
@@ -370,6 +384,18 @@ class AgentRunner(
         "context_research_file_id must be a positive signed 64-bit integer"
       )
     self._context_research_file_id = context_research_file_id
+    self._terminal_tool_result_ids = frozenset(
+      terminal_tool_result_ids or ()
+    )
+    if any(
+      type(tool_id) is not str
+      or not tool_id
+      or tool_id != tool_id.strip()
+      for tool_id in self._terminal_tool_result_ids
+    ):
+      raise ValueError(
+        "terminal_tool_result_ids must contain canonical tool IDs"
+      )
     if (
       result_requirement is not None
       and not isinstance(result_requirement, ResultRequirement)
@@ -432,13 +458,12 @@ class AgentRunner(
       raise ValueError(
         "Durable top-level skills require a pre-acquired admission"
       )
-    if (
-      top_level_skill_admission is not None
-      and agent_session_log is None
-    ):
-      raise ValueError(
-        "top_level_skill_admission requires an agent session log"
-      )
+    if top_level_skill_admission is not None:
+      if agent_session_log is None:
+        raise ValueError(
+          "top_level_skill_admission requires an agent session log"
+        )
+      self._top_level_skill_session_log = agent_session_log
     if (
       top_level_skill_admission is not None
       and top_level_skill_admission.state != "held"
@@ -500,7 +525,7 @@ class AgentRunner(
     self._batch_id = str(batch_id).strip() if batch_id is not None and str(batch_id).strip() else None
     self._auth_config = dict(capability_execution.auth_config)
     self._allow_stub_response = bool(allow_stub_response)
-    self._effort_resolution = None
+    self._effort_resolution: EffortResolution | None = None
     self._client_timeout = client_timeout
     self._max_tokens_override = max_tokens_override
     self._per_turn_timeout = per_turn_timeout
@@ -580,7 +605,9 @@ class AgentRunner(
     self._coordinator = coordinator
     self._max_resume_chain_depth = max_resume_chain_depth
     self._max_concurrent_sub_agents = max_concurrent_sub_agents
-    self._max_background_tasks = max_concurrent_sub_agents or 4
+    self._max_background_tasks = (
+      max_concurrent_sub_agents or DEFAULT_MAX_BACKGROUND_TASKS
+    )
     self._result_requirement = result_requirement
     self._sub_agent_semaphore: asyncio.Semaphore | None = None
     self._active_client: Any | None = None
@@ -629,10 +656,11 @@ class AgentRunner(
       else self._max_background_tasks_seed
     )
     notification_queue = self._notification_queue
+    runner = self
 
     class _NotificationListener:
-      def on_transition(self_listener, entry: TaskEntry, old_state: TaskState, new_state: TaskState) -> None:
-        _ = self_listener, old_state
+      def on_transition(self, entry: TaskEntry, old_state: TaskState, new_state: TaskState) -> None:
+        _ = self, old_state
         if _workflow_owns_terminal_notification(entry):
           return
         if new_state in (
@@ -660,7 +688,7 @@ class AgentRunner(
           ):
             payload = _bounded_background_error(entry.error)
           elif new_state == TaskState.INTERRUPTED:
-            payload = self._background_task_payload(entry)
+            payload = runner._background_task_payload(entry)
           summary = ""
           if entry.result and isinstance(entry.result, dict):
             summary = result_response_text(entry.result)
@@ -693,14 +721,14 @@ class AgentRunner(
     self._background_notifications_enabled = notifications_enabled
     if notifications_enabled:
       self._task_registry.add_listener(_NotificationListener())
-    self._agent_session_log = agent_session_log
+    self._agent_session_log: AgentSessionLog | None = agent_session_log
     self._context_builder = context_builder
     self._gateway_session_id = (
       gateway_session.session_id
       if gateway_session is not None
       else self._full_session_id
     )
-    self._role = "sub_agent" if self._full_session_id.startswith("sub") and ":" in self._full_session_id else "writer"
+    self._role = "sub_agent" if _is_sub_agent_session_id(self._full_session_id) else "writer"
     self._sub_agent_id = self._full_session_id if self._role == "sub_agent" else None
     self._client_kind = self._channel or ("cron" if self._agent_session_log is not None else "cli")
     self._runner_id: str | None = None
@@ -758,10 +786,14 @@ class AgentRunner(
       BaseException | None
     ) = None
     if top_level_skill_admission is not None:
-      self._write_lease_file = top_level_skill_admission.transfer(
-        log_path=agent_session_log.path,
-        write_lease_path=agent_session_log.write_lease_path,
+      top_level_skill_session_log = (
+        self._top_level_skill_session_log
       )
+      self._write_lease_file = top_level_skill_admission.transfer(
+        log_path=top_level_skill_session_log.path,
+        write_lease_path=top_level_skill_session_log.write_lease_path,
+      )
+      del self._top_level_skill_session_log
 
   @property
   def _background_tasks(self) -> Dict[str, TaskEntry]:
@@ -882,6 +914,36 @@ class AgentRunner(
       self,
       ctx,
     )
+    tool_name = str(getattr(ctx, "tool_name", "") or "")
+    result = getattr(ctx, "result", None)
+    dispatch = getattr(ctx, "dispatch", None)
+    result_entry = getattr(ctx, "result_entry", None)
+    candidate_terminal_disposition = (
+      declared_terminal_tool_result_disposition(
+        declared_terminal_doors=self._terminal_tool_result_ids,
+        tool_name=tool_name,
+        result=result,
+      )
+      if getattr(ctx, "error", None) is None
+      else None
+    )
+    terminal_disposition = None
+    if (
+      candidate_terminal_disposition == "success"
+      and isinstance(dispatch, dict)
+      and dispatch.get("outcome") == "ok"
+      and isinstance(result_entry, dict)
+      and result_entry.get("is_error") is not True
+    ):
+      terminal_disposition = "success"
+    if terminal_disposition is not None:
+      self._stop_after_tool_results_reason = "terminal_tool_result"
+      self._stop_after_tool_results_tool_name = tool_name
+      self._stop_after_tool_results_status = (
+        result.get("status")
+        if isinstance(result, dict)
+        else None
+      )
     policy = self._top_level_skill_result_policy
     observer = (
       policy.terminal_tool_result_observer
@@ -1023,10 +1085,6 @@ class AgentRunner(
       content=content,
       uuid_factory=uuid.uuid4,
     )
-
-  @staticmethod
-  def _is_soft_error(result: Any) -> bool:
-    return _is_soft_error(result)
 
   def _default_tool_definitions(self) -> List[Dict[str, Any]]:
     return _default_tool_definitions(self._get_tool_definitions, self._mcp_client)

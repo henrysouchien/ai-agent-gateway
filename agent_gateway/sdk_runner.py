@@ -4,30 +4,30 @@ import asyncio
 from fnmatch import fnmatchcase
 import json
 import logging
-import os
 import time
 import uuid
-from dataclasses import replace
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Sequence
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Literal, Mapping, Sequence
 
 from .approval_policy import (
   ApprovalDecision as PolicyApprovalDecision,
-  ApprovalPolicy,
   ApprovalRequest as PolicyApprovalRequest,
   RunContext,
-  apply_decision_to_request,
-  build_approval_request,
-  call_policy_safely,
-  sha256_args,
   utc_now,
 )
 from . import approval_settings
+from .agent_session_log import AgentSessionLog
 from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich_trade_approval_args
+from .approval_route import (
+  NO_APPROVAL_ROUTE,
+  ApprovalRoute,
+  route_policy,
+  route_store,
+)
+from .capability_binding import SESSION_DRIVER_CAPABILITY
 from .capability_execution import BoundCapabilityExecution
 from .event_log import EventLog
 from .context_capture import ContextCapture, build_context_manifest_event, canonical_manifest_digest
-from .multi_user.billing import SessionUsageSummary, UsageEvent, _UsageAggregator, normalize_identity
-from .policy_imports import resolve_server_policy_tool_class
+from .multi_user.billing import BillingMode, SessionUsageSummary, UsageEvent, _UsageAggregator, normalize_identity
 from .product_config import gateway_product_id
 from .providers.agent_sdk import AgentSDKConfig, estimate_cost, _validate_sdk_version
 from .providers.anthropic import _server_tool_unit_deltas
@@ -55,15 +55,30 @@ from .selected_content import (
   serialize_selected_content_bindings,
 )
 from .session_recap import emit_recap_then_terminal
-from .secret_boundary import SecretBoundary, sanitize_boundary_value, sanitize_tool_event
-from .skill_context import clear_current_skill, current_skill
+from .secret_boundary import (
+  SecretBoundary,
+  sanitization_failure_tool_input,
+  sanitize_boundary_value,
+  sanitize_tool_event,
+)
+from .skill_context import (
+  clear_current_skill,
+  current_skill,
+  current_skill_admission,
+)
 from .workflow_evidence_provenance import (
   WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY as _WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY,
+)
+from .tool_dispatch_classification import (
+  DispatchEntry,
+  ToolResultSettlement,
+  settle_catalogless_tool_result,
 )
 from . import sdk_runner_approval as _sdk_runner_approval
 from . import sdk_runner_context as _sdk_runner_context
 from . import sdk_runner_helpers as _sdk_runner_helpers
 from . import sdk_runner_stream as _sdk_runner_stream
+from . import tool_dispatcher_approval_lifecycle as _approval_lifecycle_helpers
 
 
 log = logging.getLogger("agent_gateway.sdk_runner")
@@ -72,29 +87,43 @@ OnToolResult = Callable[[ToolResultContext], Awaitable[List[Dict[str, Any]] | No
 OnUsage = Callable[[UsageEvent], Awaitable[None] | None]
 OnSessionSummary = Callable[[SessionUsageSummary], Awaitable[None] | None]
 OnToolTiming = Callable[..., None]
+RegisteredMcpToolResultSettlement = Callable[
+  [
+    str,
+    Mapping[str, object],
+    object,
+    Mapping[str, object] | None,
+    Mapping[str, object] | None,
+  ],
+  ToolResultSettlement,
+]
+RegisteredMcpToolInputRedactor = Callable[
+  [str, Mapping[str, object]],
+  dict[str, object],
+]
+RegisteredMcpSdkToolCallPreparer = Callable[
+  [str, Mapping[str, object], object | None, Callable[..., bool] | None],
+  Any,
+]
 
 
 _PATCH_OP_RAW_INPUT_TOOLS = _sdk_runner_helpers.PATCH_OP_RAW_INPUT_TOOLS
 _TRUSTED_SDK_LOAD_TOOLS_ID = "mcp__gateway-tools__load_tools"
+_TRUSTED_SDK_INVOKE_SKILL_ID = "invoke_skill"
 _as_dict = _sdk_runner_helpers.as_dict
 _as_plain_dict = _sdk_runner_helpers.as_plain_dict
+_catalogless_tool_name = _sdk_runner_helpers.catalogless_tool_name
 _extract_text = _sdk_runner_helpers.extract_text
 _get_attr = _sdk_runner_helpers.get_attr
 _join_system_prompt = _sdk_runner_helpers.join_system_prompt
 _parse_result_payload = _sdk_runner_helpers.parse_result_payload
-_policy_owner_mismatch = _sdk_runner_helpers.policy_owner_mismatch
-_policy_tool_name = _sdk_runner_helpers.policy_tool_name
-_redact_tool_input_for_event = _sdk_runner_helpers.redact_tool_input_for_event
 _server_for_tool = _sdk_runner_helpers.server_for_tool
 _should_escrow_raw_tool_input = _sdk_runner_helpers.should_escrow_raw_tool_input
 _summarize_error_payload = _sdk_runner_helpers.summarize_error_payload
 
 
 def _approval_queue_timeout_seconds(expiry_seconds: float | int | None) -> float:
-  return _sdk_runner_approval.approval_queue_timeout_seconds(
-    expiry_seconds,
-    approval_wait_seconds_fn=approval_settings.approval_wait_seconds,
-  )
+  return min(float(expiry_seconds or 600), approval_settings.approval_wait_seconds())
 
 
 def _agent_sdk_credential_env(
@@ -213,7 +242,7 @@ class _SDKSegmentQueryIterator:
     self._sdk = sdk_module
     self._initial_prompt = initial_prompt
     self._options_kwargs = options_kwargs
-    self._iterator: Any = None
+    self._iterator: AsyncIterator[Any] | None = None
     self._closed = False
     self._prior_usage = {
       "input_tokens": 0,
@@ -237,6 +266,8 @@ class _SDKSegmentQueryIterator:
     self._run_max_turns = options_kwargs.get("max_turns")
     self._run_max_budget = options_kwargs.get("max_budget_usd")
     self._accounting_projected = False
+    self._last_rebuild_context: str | None = None
+    self._rebuild_transcript_cursor = len(runner._sdk_rebuild_transcript)
 
   def __aiter__(self) -> "_SDKSegmentQueryIterator":
     return self
@@ -399,8 +430,20 @@ class _SDKSegmentQueryIterator:
       remaining_budget = float(self._run_max_budget) - self._prior_cost_usd
     return remaining_turns, remaining_budget
 
+  def _provider_tool_surface_changed(self) -> bool:
+    advertised = set(self._options_kwargs.get("disallowed_tools") or [])
+    return advertised != set(self._runner._effective_disallowed_tools())
+
+  def _rebuild_required(self) -> bool:
+    return (
+      bool(self._runner._pending_sdk_load)
+      or self._provider_tool_surface_changed()
+    )
+
   async def _rebuild(self, result_message: Any | None = None) -> None:
     self._finalize_interrupted_segment(result_message)
+    pending_load = bool(self._runner._pending_sdk_load)
+    surface_changed = self._provider_tool_surface_changed()
     try:
       if not self._resume_session_id:
         self._resume_session_id = self._runner._sdk_resume_session_id
@@ -417,49 +460,64 @@ class _SDKSegmentQueryIterator:
         raise RuntimeError(
           "sdk_tool_rebuild_limits_exhausted: no run-scoped budget remains"
         )
-      pending_error = self._runner._pending_sdk_load_error(
-        self._runner._pending_sdk_load
-      )
-      if pending_error is not None:
-        raise RuntimeError(
-          f"{pending_error['code']}: {pending_error['message']}"
+      if pending_load:
+        pending_error = self._runner._pending_sdk_load_error(
+          self._runner._pending_sdk_load
         )
-      changed, error = self._runner._apply_pending_sdk_load()
-      if error is not None or not changed:
-        raise RuntimeError(error or "sdk_tool_rebuild_failed")
+        if pending_error is not None:
+          raise RuntimeError(
+            f"{pending_error['code']}: {pending_error['message']}"
+          )
+        changed, error = self._runner._apply_pending_sdk_load()
+        if error is not None or not changed:
+          raise RuntimeError(error or "sdk_tool_rebuild_failed")
+      elif not surface_changed:
+        raise RuntimeError(
+          "sdk_tool_rebuild_failed: provider options did not change"
+        )
     except Exception:
       self._runner._discard_pending_sdk_load()
       await self._project_interrupted_accounting()
       raise
     await self._close_current()
     self._options_kwargs["mcp_servers"] = dict(self._runner._mcp_server_configs)
-    self._options_kwargs["disallowed_tools"] = list(self._runner._disallowed_tools)
+    self._options_kwargs["disallowed_tools"] = sorted(
+      self._runner._effective_disallowed_tools()
+    )
     self._options_kwargs["resume"] = self._resume_session_id
     self._options_kwargs["continue_conversation"] = False
     if remaining_turns is not None:
       self._options_kwargs["max_turns"] = remaining_turns
     if remaining_budget is not None:
       self._options_kwargs["max_budget_usd"] = remaining_budget
+    new_context = self._runner._sdk_rebuild_transcript[
+      self._rebuild_transcript_cursor:
+    ]
+    self._last_rebuild_context = "\n".join(new_context) or None
+    self._rebuild_transcript_cursor = len(self._runner._sdk_rebuild_transcript)
 
   def _continuation_prompt(self) -> str:
-    load_results = "\n".join(self._runner._sdk_rebuild_transcript)
-    return (
-      "The SDK query was rebuilt after load_tools changed the advertised MCP tool set. "
-      "Continue the resumed run without repeating completed work. The load result was:\n\n"
-      f"{load_results}"
+    prompt = (
+      "The SDK query was rebuilt after the available tool set changed. "
+      "Continue the resumed run without repeating completed work."
     )
+    if self._last_rebuild_context:
+      prompt += f" The triggering tool result was:\n\n{self._last_rebuild_context}"
+    return prompt
 
-  def _start_segment(self) -> None:
+  def _start_segment(self) -> AsyncIterator[Any]:
     prompt_text = (
       self._initial_prompt
       if self._iterator is None and self._prior_turns == 0
       else self._continuation_prompt()
     )
     options = getattr(self._sdk, "ClaudeAgentOptions")(**self._options_kwargs)
-    self._iterator = getattr(self._sdk, "query")(
+    iterator = getattr(self._sdk, "query")(
       prompt=_PromptMessages(prompt_text),
       options=options,
     )
+    self._iterator = iterator
+    return iterator
 
   def _aggregate_result(self, message: Any) -> Any:
     result_usage = _as_dict(_get_attr(message, "usage"))
@@ -482,19 +540,20 @@ class _SDKSegmentQueryIterator:
     if self._closed:
       raise StopAsyncIteration
     while True:
-      if self._runner._pending_sdk_load and self._iterator is None:
+      if self._rebuild_required() and self._iterator is None:
         await self._rebuild()
-      if self._iterator is None:
-        self._start_segment()
+      iterator = self._iterator
+      if iterator is None:
+        iterator = self._start_segment()
       try:
-        message = await self._iterator.__anext__()
+        message = await iterator.__anext__()
       except StopAsyncIteration:
-        if self._runner._pending_sdk_load:
+        if self._rebuild_required():
           await self._rebuild()
           continue
         raise
       self._observe_message(message)
-      if self._runner._pending_sdk_load:
+      if self._rebuild_required():
         if hasattr(message, "duration_ms") and hasattr(message, "num_turns"):
           await self._rebuild(message)
           continue
@@ -535,10 +594,21 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     on_tool_result: Callable[..., Any] | None = None,
     on_tool_timing: Callable[..., Any] | None = None,
     provider_id_for_tool: Callable[[str], str | None] | None = None,
+    registered_mcp_descriptor_for_sdk_tool: Callable[[str], Any] | None = None,
+    prepare_registered_mcp_tool_call_for_sdk_tool: (
+      RegisteredMcpSdkToolCallPreparer | None
+    ) = None,
+    registered_approval_overlay: Callable[..., bool] | None = None,
+    redact_registered_mcp_tool_input_for_sdk_tool: (
+      RegisteredMcpToolInputRedactor | None
+    ) = None,
+    settle_registered_mcp_tool_result_for_sdk_tool: (
+      RegisteredMcpToolResultSettlement | None
+    ) = None,
     _parent_aggregator: _UsageAggregator | None = None,
     session: Any | None = None,
-    store: Any | None = None,
-    policy: ApprovalPolicy | None = None,
+    approval_route: ApprovalRoute = NO_APPROVAL_ROUTE,
+    approval_lifecycle: Literal["required", "not_required"] = "required",
     run_context: RunContext | None = None,
     skill_run_id: str | None = None,
     mcp_run_identity_servers: frozenset[str] | None = None,
@@ -549,7 +619,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     context_surfaces: list[dict[str, Any]] | Callable[[], list[dict[str, Any]]] | None = None,
     context_capture: ContextCapture | None = None,
     commercial_usage_producer: Any | None = None,
-    agent_session_log: Any | None = None,
+    agent_session_log: AgentSessionLog | None = None,
   ) -> None:
     if not isinstance(capability_execution, BoundCapabilityExecution):
       raise TypeError(
@@ -557,7 +627,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       )
     capability_execution.validate()
     capability_bind = capability_execution.bind
-    if capability_bind.capability_id != "session.driver":
+    if capability_bind.capability_id != SESSION_DRIVER_CAPABILITY:
       raise RuntimeError(
         "AgentSDKRunner requires a session.driver capability execution"
       )
@@ -690,6 +760,60 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     self._on_tool_result = on_tool_result
     self._on_tool_timing = on_tool_timing
     self._provider_id_for_tool = provider_id_for_tool
+    registered_sdk_mcp_owners = (
+      registered_mcp_descriptor_for_sdk_tool,
+      prepare_registered_mcp_tool_call_for_sdk_tool,
+      redact_registered_mcp_tool_input_for_sdk_tool,
+      settle_registered_mcp_tool_result_for_sdk_tool,
+    )
+    if any(owner is not None for owner in registered_sdk_mcp_owners) and not all(
+      owner is not None for owner in registered_sdk_mcp_owners
+    ):
+      raise ValueError(
+        "registered SDK MCP descriptor, preparation, redaction, and settlement "
+        "owners must be provided together"
+      )
+    if (
+      registered_approval_overlay is not None
+      and not callable(registered_approval_overlay)
+    ):
+      raise TypeError("registered_approval_overlay must be callable")
+    self._registered_mcp_descriptor_for_sdk_tool = (
+      registered_mcp_descriptor_for_sdk_tool
+    )
+    self._prepare_registered_mcp_tool_call_for_sdk_tool = (
+      prepare_registered_mcp_tool_call_for_sdk_tool
+    )
+    self._registered_approval_overlay = registered_approval_overlay
+    self._redact_registered_mcp_tool_input_for_sdk_tool = (
+      redact_registered_mcp_tool_input_for_sdk_tool
+    )
+    self._settle_registered_mcp_tool_result_for_sdk_tool = (
+      settle_registered_mcp_tool_result_for_sdk_tool
+    )
+    self._catalogless_mcp_tool_ids = frozenset(
+      getattr(mcp_config_metadata, "catalogless_mcp_tool_ids", ())
+    )
+    self._resolve_sdk_approval_identity = (
+      _sdk_runner_approval.resolve_catalogless_approval_identity
+    )
+    if registered_mcp_descriptor_for_sdk_tool is None:
+      self._sdk_policy_owner_mismatch = (
+        _sdk_runner_helpers.catalogless_policy_owner_mismatch
+      )
+      self._redact_sdk_tool_input_for_event = (
+        _sdk_runner_helpers.redact_tool_input_for_event
+      )
+      self._redact_for_approval_request = (
+        _sdk_runner_approval.redact_for_approval_request
+      )
+    else:
+      self._sdk_policy_owner_mismatch = (
+        lambda tool_name: _sdk_runner_approval.registered_policy_owner_mismatch(
+          self,
+          tool_name,
+        )
+      )
     self._on_tool_timing_accepts_user_id = _detect_user_id_param(on_tool_timing)
     self._on_tool_timing_accepts_context_surfaces = _detect_keyword_param(on_tool_timing, "context_surfaces")
     self._on_tool_timing_accepts_tool_call_id = _detect_keyword_param(on_tool_timing, "tool_call_id")
@@ -707,7 +831,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     self._active_skill_report_doors: dict[str, str] = {}
     self._query_iter: Any = None
     self._usage: Dict[str, Any] = {
-      "capability_bind": capability_bind.receipt(),
+      "capability_bind": capability_bind.to_json(),
       "provider_reported_model": None,
       "input_tokens": 0,
       "output_tokens": 0,
@@ -721,6 +845,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     self._stream_terminal_emitted = False
     self._effective_model = capability_bind.upstream_model
     self._request_id = str(sdk_config.request_id or uuid.uuid4())
+    self._billing_mode: BillingMode
     (
       self._usage_user_id,
       self._rate_table_version,
@@ -748,8 +873,14 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     self._selected_content_bindings_bound = False
     self._research_file_activity_lease: Any | None = None
     self._selected_content_activity_lease: Any | None = None
-    self._approval_store = store or getattr(session, "approval_store", None)
-    self._approval_policy = policy or getattr(session, "approval_policy", None)
+    # One admitted route, read as a value; the handles below are its
+    # projection and nothing infers authority from them.
+    self._approval_route = approval_route
+    self._approval_store = route_store(approval_route)
+    self._approval_policy = route_policy(approval_route)
+    if approval_lifecycle not in {"required", "not_required"}:
+      raise ValueError("approval_lifecycle must be 'required' or 'not_required'")
+    self._approval_lifecycle = approval_lifecycle
     self._run_context = run_context
     self._skill_run_id = skill_run_id
     self._workspace_dir = workspace_dir
@@ -880,8 +1011,15 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     tool_call_id: str,
     result: Any | None,
     error: Dict[str, Any] | None,
+    *,
+    is_error: bool | None = None,
   ) -> Dict[str, Any]:
-    return _sdk_runner_context.make_result_entry(tool_call_id, result, error)
+    return _sdk_runner_context.make_result_entry(
+      tool_call_id,
+      result,
+      error,
+      is_error=is_error,
+    )
 
   def _format_additional_context(
     self,
@@ -902,18 +1040,70 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     tool_call_id: str,
     tool_name: str,
     tool_input: Dict[str, Any],
+    redacted_tool_input: Dict[str, Any],
     result: Any | None,
     error: Dict[str, Any] | None,
+    completion_event: Mapping[str, Any],
   ) -> str | None:
     return await _sdk_runner_context.build_hook_additional_context(
       self,
       tool_call_id=tool_call_id,
       tool_name=tool_name,
       tool_input=tool_input,
+      redacted_tool_input=redacted_tool_input,
       result=result,
       error=error,
+      completion_event=completion_event,
       logger=log,
     )
+
+  def _settle_sdk_tool_result(
+    self,
+    tool_name: str,
+    tool_input: Mapping[str, object],
+    dispatch_entry: DispatchEntry,
+    result: object,
+    error: Mapping[str, object] | None,
+    semantic_error: Mapping[str, object] | None,
+  ) -> ToolResultSettlement:
+    if (
+      self._settle_registered_mcp_tool_result_for_sdk_tool is None
+      or _sdk_runner_approval.is_catalogless_approval_route(self, tool_name)
+    ):
+      return settle_catalogless_tool_result(
+        entry=dispatch_entry,
+        result=result,
+        error=error,
+        semantic_error=semantic_error,
+      )
+    return self._settle_registered_mcp_tool_result_for_sdk_tool(
+      tool_name,
+      tool_input,
+      result,
+      error,
+      semantic_error,
+    )
+
+  def _redact_sdk_tool_input_for_event(
+    self,
+    tool_name: str,
+    tool_input: Dict[str, Any],
+  ) -> Dict[str, Any]:
+    if _sdk_runner_approval.is_catalogless_approval_route(self, tool_name):
+      return _sdk_runner_helpers.redact_tool_input_for_event(
+        tool_name,
+        tool_input,
+      )
+    redactor = self._redact_registered_mcp_tool_input_for_sdk_tool
+    assert redactor is not None
+    try:
+      return dict(redactor(tool_name, tool_input))
+    except Exception as exc:
+      log.error(
+        "Registered SDK MCP event redaction failed | exception_type=%s",
+        type(exc).__name__,
+      )
+      return sanitization_failure_tool_input()
 
   def _effective_disallowed_tools(self) -> set[str]:
     return _SDKToolAdmissionSet(
@@ -1199,9 +1389,13 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       # This runtime citation projection is private, so strip it before the
       # result reaches the model or the durable transcript.
       result.pop(_WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY, None)
-      self._activate_skill_report_doors(result.pop(_ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY, None))
-      self._activate_skill_allow(result.pop(_ACTIVE_SKILL_ALLOW_RESULT_KEY, None))
-      self._activate_skill_deny(result.pop(_ACTIVE_SKILL_DENY_RESULT_KEY, None))
+      report_doors = result.pop(_ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY, None)
+      allowed_tools = result.pop(_ACTIVE_SKILL_ALLOW_RESULT_KEY, None)
+      denied_tools = result.pop(_ACTIVE_SKILL_DENY_RESULT_KEY, None)
+      if tool_name == _TRUSTED_SDK_INVOKE_SKILL_ID:
+        self._activate_skill_report_doors(report_doors)
+        self._activate_skill_allow(allowed_tools)
+        self._activate_skill_deny(denied_tools)
       if tool_name is not None:
         self._clear_active_skill_if_report_door_completed(
           tool_name=tool_name,
@@ -1242,7 +1436,20 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       and isinstance(result, dict)
       and "_load_servers" in result
     )
+    private_skill_keys = {
+      _ACTIVE_SKILL_ALLOW_RESULT_KEY,
+      _ACTIVE_SKILL_DENY_RESULT_KEY,
+      _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY,
+    }
+    had_private_skill_signal = (
+      isinstance(result, dict)
+      and bool(private_skill_keys.intersection(result))
+    )
+    effective_disallowed_before = set(self._effective_disallowed_tools())
     result = self._consume_private_tool_result_fields(result, tool_name=tool_name)
+    tool_surface_changed = (
+      effective_disallowed_before != set(self._effective_disallowed_tools())
+    )
     rebuild_error: dict[str, Any] | None = None
     if had_private_load_signal and not self._sdk_resume_session_id:
       self._discard_pending_sdk_load()
@@ -1259,12 +1466,24 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       if rebuild_error is not None:
         self._discard_pending_sdk_load()
         result = {"error": rebuild_error}
-    additional_context = await self._build_hook_additional_context(
-      tool_call_id=str(tool_use_id or input_data.get("tool_use_id") or ""),
-      tool_name=tool_name,
-      tool_input=tool_input,
+    settled_tool_call_id = str(
+      tool_use_id or input_data.get("tool_use_id") or ""
+    )
+    completed_call = self._pending_tool_calls[settled_tool_call_id]
+    completion_event = self._complete_tool_call(
+      settled_tool_call_id,
+      executed_tool_input=tool_input,
       result=result,
       error=None,
+    )
+    additional_context = await self._build_hook_additional_context(
+      tool_call_id=settled_tool_call_id,
+      tool_name=tool_name,
+      tool_input=tool_input,
+      redacted_tool_input=completed_call.redacted_tool_input,
+      result=result,
+      error=None,
+      completion_event=completion_event,
     )
     safe_result = sanitize_boundary_value(
       result,
@@ -1280,27 +1499,40 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       if additional_context
       else None
     )
+    if tool_surface_changed:
+      self._sdk_rebuild_transcript.append(
+        f"TOOL {tool_name} RESULT: "
+        + json.dumps(safe_result, sort_keys=True, default=str)
+      )
     if (
       safe_result == result
       and not safe_additional_context
       and not had_private_load_signal
+      and not had_private_skill_signal
+      and not tool_surface_changed
     ):
       return {}
     response: dict[str, Any] = {}
     hook_output: dict[str, Any] = {
       "hookEventName": "PostToolUse",
     }
-    if safe_result != result or had_private_load_signal:
+    if (
+      safe_result != result
+      or had_private_load_signal
+      or had_private_skill_signal
+    ):
       hook_output["updatedMCPToolOutput"] = safe_result
     if safe_additional_context:
       hook_output["additionalContext"] = safe_additional_context
-    if had_private_load_signal:
-      if rebuild_error is None:
-        response["continue_"] = False
-        response["stopReason"] = (
-          "load_tools changed the advertised MCP tool set; the gateway will resume "
-          "this SDK session with rebuilt options"
-        )
+    if (
+      tool_surface_changed
+      or (had_private_load_signal and rebuild_error is None)
+    ):
+      response["continue_"] = False
+      response["stopReason"] = (
+        "the available tool set changed; the gateway will resume this SDK "
+        "session with rebuilt options"
+      )
     response["hookSpecificOutput"] = hook_output
     return response
 
@@ -1319,12 +1551,24 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       "code": str(input_data.get("code") or "tool_error"),
       "message": error_message,
     }
-    additional_context = await self._build_hook_additional_context(
-      tool_call_id=str(tool_use_id or input_data.get("tool_use_id") or ""),
-      tool_name=tool_name,
-      tool_input=tool_input,
+    settled_tool_call_id = str(
+      tool_use_id or input_data.get("tool_use_id") or ""
+    )
+    completed_call = self._pending_tool_calls[settled_tool_call_id]
+    completion_event = self._complete_tool_call(
+      settled_tool_call_id,
+      executed_tool_input=tool_input,
       result=None,
       error=error,
+    )
+    additional_context = await self._build_hook_additional_context(
+      tool_call_id=settled_tool_call_id,
+      tool_name=tool_name,
+      tool_input=tool_input,
+      redacted_tool_input=completed_call.redacted_tool_input,
+      result=None,
+      error=error,
+      completion_event=completion_event,
     )
     safe_error = sanitize_boundary_value(
       error,
@@ -1361,13 +1605,6 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     hooks["PostToolUseFailure"] = [hook_matcher_cls(hooks=[self._post_tool_use_failure_hook])]
     return hooks
 
-  def _approval_lifecycle_configured(self) -> bool:
-    return _sdk_runner_approval.approval_lifecycle_configured(
-      store=self._approval_store,
-      policy=self._approval_policy,
-      session=self._session,
-    )
-
   def _resolve_run_context(self) -> RunContext:
     return _sdk_runner_approval.resolve_run_context(
       run_context=self._run_context,
@@ -1384,19 +1621,17 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       channel=self._channel,
     )
 
-  def _resolve_tool_class(self, tool_name: str) -> str:
-    return _sdk_runner_approval.resolve_tool_class(
-      tool_name,
-      policy_tool_name_fn=_policy_tool_name,
-      server_for_tool_fn=_server_for_tool,
-      resolve_server_policy_tool_class_fn=resolve_server_policy_tool_class,
-    )
-
   def _redact_for_approval_request(self, tool_name: str, tool_input: Dict[str, Any]) -> tuple[dict[str, Any], str]:
+    if not _sdk_runner_approval.is_catalogless_approval_route(self, tool_name):
+      redactor = self._redact_registered_mcp_tool_input_for_sdk_tool
+      assert redactor is not None
+      return (
+        dict(redactor(tool_name, tool_input)),
+        _sdk_runner_approval.approval_args_hash(tool_input),
+      )
     return _sdk_runner_approval.redact_for_approval_request(
       tool_name,
       tool_input,
-      sha256_args_fn=sha256_args,
     )
 
   async def _await_user_approval_via_pending_tools(
@@ -1405,20 +1640,45 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     decision: PolicyApprovalDecision,
     *,
     nonce: str,
+    resolved_qualifier: str,
+    allow_persistent: bool,
+    timeout_seconds: float,
     batch_admission: Any | None = None,
-  ) -> tuple[str, dict[str, Any] | None]:
-    return await _sdk_runner_approval.await_user_approval_via_pending_tools(
+  ) -> dict[str, Any] | None:
+    return await _approval_lifecycle_helpers.await_user_approval_via_pending_tools(
       session=self._session,
       approval_store=self._approval_store,
+      append_event_fn=self._append,
       request=request,
       decision=decision,
       nonce=nonce,
-      append_event_fn=self._append,
-      timeout_seconds=_approval_queue_timeout_seconds(decision.expiry_seconds),
+      resolved_qualifier=resolved_qualifier,
+      allow_persistent=allow_persistent,
+      timeout_seconds=timeout_seconds,
       log=log,
-      time_fn=time.time,
       batch_admission=batch_admission,
     )
+
+  def _effective_trade_approval_decision(
+    self,
+    tool_name: str,
+    tool_args_redacted: Dict[str, Any],
+    decision: PolicyApprovalDecision,
+  ) -> PolicyApprovalDecision:
+    return _approval_lifecycle_helpers.effective_trade_approval_decision(
+      tool_name,
+      tool_args_redacted,
+      decision,
+      effective_trade_approval_expiry_seconds_fn=effective_trade_approval_expiry_seconds,
+      approval_wait_seconds_fn=approval_settings.approval_wait_seconds,
+      utc_now_fn=utc_now,
+    )
+
+  def _approval_queue_timeout_seconds(
+    self,
+    expiry_seconds: float | int | None,
+  ) -> float:
+    return _approval_queue_timeout_seconds(expiry_seconds)
 
   async def _can_use_tool_callback(self, tool_name: str, input_data: dict[str, Any], _context: Any) -> Any:
     if tool_name in MODEL_RUN_IDENTITY_LOCAL_TOOLS:
@@ -1447,19 +1707,9 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       tool_name,
       input_data,
       _context,
-      policy_owner_mismatch_fn=_policy_owner_mismatch,
-      policy_tool_name_fn=_policy_tool_name,
-      current_skill_fn=current_skill,
-      replace_fn=replace,
+      current_skill_admission_fn=current_skill_admission,
       enrich_trade_approval_args_fn=enrich_trade_approval_args,
-      build_approval_request_fn=build_approval_request,
-      call_policy_safely_fn=call_policy_safely,
-      apply_decision_to_request_fn=apply_decision_to_request,
-      effective_trade_approval_expiry_seconds_fn=effective_trade_approval_expiry_seconds,
-      approval_wait_seconds_fn=approval_settings.approval_wait_seconds,
-      utc_now_fn=utc_now,
       uuid_hex_fn=lambda: uuid.uuid4().hex,
-      os_urandom_fn=os.urandom,
     )
 
   async def _close_query_iterator(self) -> None:
@@ -1540,7 +1790,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       timestamp=time.time(),
       model=self._effective_model,
       provider=self._capability_execution.bind.provider,
-      capability_bind=self._capability_execution.bind.receipt(),
+      capability_bind=self._capability_execution.bind.to_json(),
       provider_reported_model=(
         str(self._usage["provider_reported_model"])
         if self._usage.get("provider_reported_model") is not None else None
@@ -1588,7 +1838,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       timestamp=time.time(),
       model=model,
       provider=self._capability_execution.bind.provider,
-      capability_bind=self._capability_execution.bind.receipt(),
+      capability_bind=self._capability_execution.bind.to_json(),
       provider_reported_model=(
         str(usage["provider_reported_model"])
         if usage.get("provider_reported_model") is not None else None
@@ -1678,13 +1928,14 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
   async def run(
     self,
     messages: list[dict],
-    system_prompt: str | None = None,
+    system_prompt: str | List[tuple[str, bool]] | None = None,
     max_turns: int | None = None,
   ) -> None:
     if self._summary_emitted:
       raise RuntimeError("AgentSDKRunner is single-use; construct a new runner for subsequent runs")
     if self._selected_content_bindings:
-      append = getattr(self._agent_session_log, "append", None)
+      agent_session_log = self._agent_session_log
+      append = getattr(agent_session_log, "append", None)
       user_content = next(
         (
           message.get("content")
@@ -1693,11 +1944,11 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
         ),
         None,
       )
-      if not callable(append) or user_content is None:
+      if agent_session_log is None or not callable(append) or user_content is None:
         raise RuntimeError(
           "Selected content was not durably committed before model work."
         )
-      await append(build_user_message_event(
+      await agent_session_log.append(build_user_message_event(
         content=user_content,
         client_kind=self._channel or "chat",
         received_at=time.time(),
@@ -1765,7 +2016,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       "continue_conversation": False,
       "max_turns": max_turns if max_turns is not None else self._max_turns,
       "max_budget_usd": self._sdk_config.max_budget_usd,
-      "disallowed_tools": list(self._disallowed_tools),
+      "disallowed_tools": sorted(self._effective_disallowed_tools()),
       "model": effective_model or None,
       "cwd": str(self._sdk_config.cwd) if self._sdk_config.cwd is not None else None,
       "include_partial_messages": True,
@@ -1849,7 +2100,9 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
             # the single commercial observation for the whole query.
             self._sdk_provider_call_usage = None
           if result_succeeded:
-            self._flush_pending_tool_calls(outcome="success")
+            self._flush_pending_tool_calls(
+              outcome="tool_completion_unobserved"
+            )
             self._emit_stream_complete()
           elif result_subtype == "error_max_turns":
             self._flush_pending_tool_calls(outcome="cancelled")
@@ -1899,9 +2152,6 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
         if hasattr(message, "model") and hasattr(message, "content"):
           self._handle_assistant_message(message)
           continue
-
-        if hasattr(message, "content"):
-          self._handle_user_message(message)
 
       if result_error is not None:
         raise result_error

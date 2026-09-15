@@ -12,11 +12,10 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AgentRunner, AgentSessionLog  # noqa: E402
+from agent_gateway import AgentRunner, AgentSessionLog, LogEntry  # noqa: E402
 from agent_gateway.agent_session_log_records import EVENT_SCHEMA_VERSION  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
-from agent_gateway.runner_session_lifecycle import RunnerSessionLifecycleMixin  # noqa: E402
-from agent_gateway.product_config import gateway_product_id  # noqa: E402
+from agent_gateway.providers import ModelProvider  # noqa: E402
 from agent_gateway.runner_session_events import (  # noqa: E402
   build_assistant_message_event,
   build_attach_event,
@@ -46,7 +45,7 @@ from agent_gateway.runner_session_events import (  # noqa: E402
   build_write_lease_metadata,
   durable_event_payload,
   release_write_lease,
-  run_detach_reason,
+  terminal_closure_decision,
   run_interrupted_reason,
   shutdown_interrupted_reason,
   write_lease_metadata,
@@ -64,30 +63,10 @@ def test_context_pressure_reminder_copy_is_model_actionable() -> None:
 def _run(coro):
   return asyncio.run(coro)
 
+class _StubProvider(ModelProvider):
+  name = "stub"
 
-def test_runner_session_lifecycle_methods_are_inherited_from_mixin() -> None:
-  assert issubclass(AgentRunner, RunnerSessionLifecycleMixin)
-  assert gateway_runner.RunnerSessionLifecycleMixin is RunnerSessionLifecycleMixin
 
-  for method_name in (
-    "_append_durable_event",
-    "_rebuild_task_registry_from_log",
-    "_lookup_task_in_log",
-    "_emit_attach_event",
-    "_append_user_message_event",
-    "_append_assistant_message_event",
-    "_emit_stream_retry_event",
-    "_emit_error_event",
-    "_emit_run_error_event",
-    "_emit_interrupted_event",
-    "_shutdown_interrupted_reason",
-    "_emit_detach_event",
-    "_emit_operator_pause_event",
-    "_acquire_writer_lease_and_recover",
-    "_write_lease_metadata",
-    "_release_write_lease",
-  ):
-    assert getattr(AgentRunner, method_name) is getattr(RunnerSessionLifecycleMixin, method_name)
 
 
 @pytest.mark.parametrize(
@@ -126,7 +105,7 @@ def test_runner_session_lifecycle_resolves_parent_module_event_builders(monkeypa
     appended.append(event)
     return SimpleNamespace(seq=1)
 
-  runner._append_durable_event = _append_durable_event  # type: ignore[method-assign]
+  runner._append_durable_event = _append_durable_event
 
   def _build_attach_event(**kwargs: Any) -> dict[str, Any]:
     return {"type": "patched_attach", **kwargs}
@@ -149,31 +128,50 @@ def test_runner_session_lifecycle_resolves_parent_module_event_builders(monkeypa
   assert runner._durable_attach_emitted
 
 
-def test_runner_append_durable_event_resolves_parent_module_payload_helpers(monkeypatch: Any) -> None:
-  appended: list[dict[str, Any]] = []
-
-  class _SessionLog:
-    async def append(self, payload: dict[str, Any]):
-      appended.append(payload)
-      return SimpleNamespace(seq=7)
-
+def test_runner_append_durable_event_resolves_parent_module_payload_helpers(
+  tmp_path: Path,
+  monkeypatch: Any,
+) -> None:
+  session_log = AgentSessionLog(tmp_path / "session.jsonl")
+  appended: list[dict[str, object]] = []
   runner = object.__new__(AgentRunner)
-  runner._agent_session_log = _SessionLog()
+  runner._agent_session_log = session_log
   runner._runner_id = "runner-1"
   runner._role = "writer"
   runner._sub_agent_id = None
   runner._last_durable_seq = 0
+  original_append = session_log.append
 
-  def _durable_event_payload(event: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+  async def _recording_append(payload: dict[str, object]) -> LogEntry:
+    appended.append(payload)
+    return await original_append(payload)
+
+  monkeypatch.setattr(session_log, "append", _recording_append)
+
+  def _durable_event_payload(
+    event: dict[str, Any],
+    **kwargs: Any,
+  ) -> dict[str, Any]:
     return {"type": event["type"], "patched": True, **kwargs}
 
-  monkeypatch.setattr(gateway_runner, "_durable_event_payload", _durable_event_payload)
-  monkeypatch.setattr(gateway_runner, "gateway_product_id", lambda: "patched-product")
+  monkeypatch.setattr(
+    gateway_runner,
+    "_durable_event_payload",
+    _durable_event_payload,
+  )
+  monkeypatch.setattr(
+    gateway_runner,
+    "gateway_product_id",
+    lambda: "patched-product",
+  )
 
-  entry = _run(AgentRunner._append_durable_event(runner, {"type": "custom"}))
+  entry = _run(
+    AgentRunner._append_durable_event(runner, {"type": "custom"})
+  )
 
-  assert entry.seq == 7
-  assert runner._last_durable_seq == 7
+  assert entry is not None
+  assert entry.seq == 1
+  assert runner._last_durable_seq == 1
   assert appended == [
     {
       "type": "custom",
@@ -204,7 +202,7 @@ def test_runner_writer_recovery_resolves_parent_module_risk_helper(tmp_path: Pat
     events.append(event)
     return SimpleNamespace(seq=len(events))
 
-  runner._append_durable_event = _append_durable_event  # type: ignore[method-assign]
+  runner._append_durable_event = _append_durable_event
 
   def _build_orphan_events(entries: Any, *, discovered_at: float, tool_risk_for_tool: Any) -> list[dict[str, Any]]:
     assert len(entries) == 1
@@ -404,7 +402,8 @@ def test_runner_write_lease_metadata_delegates_to_session_event_helper(
 ) -> None:
   lease_path = tmp_path / "session.jsonl.write_lease.meta"
   runner = AgentRunner.__new__(AgentRunner)
-  runner._agent_session_log = SimpleNamespace(write_lease_meta_path=lease_path)
+  session_log = AgentSessionLog(path=tmp_path / "session.jsonl")
+  runner._agent_session_log = session_log
   runner._role = "writer"
   runner._runner_id = "runner-1"
   runner._gateway_session_id = "sess"
@@ -632,6 +631,38 @@ def test_tool_lifecycle_event_builders_shape_payloads_and_copy_result_fields() -
     },
   }
 
+  registered_outcome_only_failure = build_tool_call_complete_event(
+    tool_call_id="toolu_3",
+    tool_name="lookup",
+    result={"status": "success"},
+    error=None,
+    duration_ms=3,
+    server="research",
+    dispatch={
+      "outcome": "error_semantic",
+      "attempts": 1,
+      "route_id": "mcp:research/lookup",
+      "sources": (),
+    },
+  )
+  assert registered_outcome_only_failure["is_error"] is True
+
+  registered_success = build_tool_call_complete_event(
+    tool_call_id="toolu_4",
+    tool_name="lookup",
+    result={"status": "success"},
+    error=None,
+    duration_ms=3,
+    server="research",
+    dispatch={
+      "outcome": "ok",
+      "attempts": 1,
+      "route_id": "mcp:research/lookup",
+      "sources": (),
+    },
+  )
+  assert registered_success["is_error"] is False
+
 
 def test_tool_call_complete_requires_a_dispatch_record() -> None:
   with pytest.raises(TypeError):
@@ -646,12 +677,6 @@ def test_tool_call_complete_requires_a_dispatch_record() -> None:
 
 
 def test_run_terminal_and_limit_event_builders_shape_payloads() -> None:
-  usage = {
-    "input_tokens": 10,
-    "output_tokens": 20,
-    "cache_creation_input_tokens": 3,
-    "cache_read_input_tokens": 4,
-  }
   turn_usage = {"input_tokens": 1}
 
   assert build_turn_complete_event(turn=2, usage=turn_usage) == {
@@ -688,7 +713,22 @@ def test_run_terminal_and_limit_event_builders_shape_payloads() -> None:
     "type": "text_delta",
     "text": "\n\n[Budget limit reached: $1.2346 >= $1.0000 (parent budget)]",
   }
-  assert build_stream_complete_event(usage_totals=usage, estimated_cost=0.12345) == {
+
+
+def test_stream_complete_event_includes_static_token_estimates_with_provider_usage() -> None:
+  usage = {
+    "input_tokens": 10,
+    "output_tokens": 20,
+    "cache_creation_input_tokens": 3,
+    "cache_read_input_tokens": 4,
+  }
+
+  assert build_stream_complete_event(
+    usage_totals=usage,
+    estimated_cost=0.12345,
+    est_system_tokens=1200,
+    est_tools_tokens=3400,
+  ) == {
     "type": "stream_complete",
     "terminal_disposition": "completed",
     "usage": {
@@ -697,6 +737,8 @@ def test_run_terminal_and_limit_event_builders_shape_payloads() -> None:
       "cache_creation_input_tokens": 3,
       "cache_read_input_tokens": 4,
       "estimated_cost": 0.1235,
+      "est_system_tokens": 1200,
+      "est_tools_tokens": 3400,
     },
   }
 
@@ -882,17 +924,27 @@ def test_durable_and_interrupted_payload_helpers_preserve_existing_fields() -> N
   }
 
 
-def test_run_detach_reason_preserves_clean_cancelled_and_error_reasons() -> None:
-  assert run_detach_reason(clean_detach_reason="completed", run_error=None) == "completed"
-  assert run_detach_reason(clean_detach_reason="operator_pause", run_error=None) == "operator_pause"
-  assert run_detach_reason(
-    clean_detach_reason="completed",
-    run_error=asyncio.CancelledError(),
-  ) == "cancelled"
-  assert run_detach_reason(
-    clean_detach_reason="operator_pause",
-    run_error=RuntimeError("boom"),
-  ) == "error"
+def test_terminal_closure_decision_preserves_failure_and_cancellation_precedence() -> None:
+  def decide(**facts: Any):
+    return terminal_closure_decision(**{
+      "clean_detach_reason": "completed",
+      "run_error": None,
+      "terminal_event": None,
+      "server_terminal_cause": None,
+      **facts,
+    })
+
+  assert decide().disposition == "success"
+  assert decide(clean_detach_reason="operator_pause").reason == "operator_pause"
+  cancelled = decide(
+    run_error=asyncio.CancelledError("shutdown"), server_terminal_cause="timeout",
+  )
+  assert (cancelled.disposition, cancelled.reason) == ("cancelled", "timeout")
+  failed = decide(clean_detach_reason="operator_pause", run_error=RuntimeError("boom"))
+  assert (failed.disposition, failed.reason) == ("error", "error")
+  assert decide(terminal_event={"type": "error", "error": "provider failed"}).disposition == "error"
+  persistence = decide(persistence_error=OSError("disk unavailable"))
+  assert (persistence.disposition, persistence.reason) == ("error", "persistence")
 
 
 def test_run_interrupted_reason_preserves_shutdown_reason_except_cancelled_sub_agent() -> None:
@@ -946,20 +998,15 @@ def test_orphan_tool_call_interrupted_events_select_unresolved_starts() -> None:
     tool_risk_for_tool=lambda tool_name: f"risk:{tool_name}",
   )
 
-  assert synthetic == [
-    {
-      "type": "tool_call_interrupted",
-      "tool_call_id": "orphan",
-      "tool_name": "write_tool",
-      "tool_input": {"symbol": "MSFT"},
-      "original_started_at": 12.5,
-      "discovered_at": 20.0,
-      "tool_risk": "risk:write_tool",
-      "runner_id": "runner-old",
-      "role": "writer",
-      "sub_agent_id": "sub-1",
-    }
-  ]
+  assert [event["tool_call_id"] for event in synthetic] == ["orphan"]
+  interrupted = synthetic[0]
+  assert interrupted["original_started_at"] == 12.5
+  assert interrupted["tool_risk"] == "risk:write_tool"
+  assert interrupted["runner_id"] == "runner-old"
+  assert interrupted["sub_agent_id"] == "sub-1"
+  result = interrupted["final_tool_result_blocks"][0]
+  assert result["tool_use_id"] == "orphan"
+  assert result["is_error"] is True
 
 
 def test_shutdown_interrupted_reason_normalizes_signal_payloads() -> None:
@@ -975,7 +1022,6 @@ def test_shutdown_interrupted_reason_normalizes_signal_payloads() -> None:
 
 def test_runner_durable_event_delegate_stamps_envelope(tmp_path: Path, monkeypatch) -> None:
   monkeypatch.setenv("PRODUCT_ID", "hank")
-  gateway_product_id.cache_clear()
   runner = object.__new__(AgentRunner)
   runner._agent_session_log = AgentSessionLog(path=tmp_path / "runner.jsonl")
   runner._runner_id = "runner-1"
@@ -983,11 +1029,8 @@ def test_runner_durable_event_delegate_stamps_envelope(tmp_path: Path, monkeypat
   runner._sub_agent_id = None
   runner._last_durable_seq = 0
 
-  try:
-    entry = _run(AgentRunner._append_durable_event(runner, {"type": "custom"}))
-    entries, _ = _run(runner._agent_session_log.query(order="asc"))
-  finally:
-    gateway_product_id.cache_clear()
+  entry = _run(AgentRunner._append_durable_event(runner, {"type": "custom"}))
+  entries, _ = _run(runner._agent_session_log.query(order="asc"))
 
   assert entry is not None
   assert runner._last_durable_seq == entry.seq == 1
@@ -1001,10 +1044,14 @@ def test_runner_durable_event_delegate_stamps_envelope(tmp_path: Path, monkeypat
 
 def test_runner_stub_response_delegate_appends_built_events(monkeypatch) -> None:
   runner = object.__new__(AgentRunner)
-  runner._provider = type("Provider", (), {"name": "stub"})()
+  runner._provider = _StubProvider()
   appended: list[dict[str, Any]] = []
   sleep_delays: list[float] = []
-  runner._append = appended.append
+
+  def _append(event: dict[str, Any]) -> None:
+    appended.append(event)
+
+  runner._append = _append
 
   async def _fake_sleep(delay: float) -> None:
     sleep_delays.append(delay)

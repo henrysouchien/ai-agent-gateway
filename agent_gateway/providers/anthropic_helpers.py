@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from dataclasses import replace
 from typing import Any
 
-from .base import ModelInfo
+from .base import ModelInfo, registry_effort_values, registry_entry_for_model
+from ..model_registry import ModelRegistryEntry
+
+log = logging.getLogger(__name__)
 
 
 def _adaptive_compat(
@@ -261,9 +265,59 @@ def _model_matches_tag(model_id: str, tag: str) -> bool:
 
 
 def _model_info_for_model(model_id: str) -> ModelInfo:
-  for tags, info in _MODEL_INFO_BY_TAG:
+  for tags, info in sorted(_MODEL_INFO_BY_TAG, key=lambda row: max(map(len, row[0])), reverse=True):
     if any(_model_matches_tag(model_id, tag) for tag in tags):
       return replace(info, id=model_id)
+  entry = registry_entry_for_model("anthropic", model_id)
+  if entry is None:
+    raise ValueError(
+      f"the product model registry does not admit Anthropic model {model_id!r}"
+    )
+  return _model_info_from_registry_entry(model_id, entry)
+
+
+def _model_info_from_registry_entry(
+  model_id: str,
+  entry: ModelRegistryEntry,
+) -> ModelInfo:
+  """Derive Messages wire metadata for a registry-admitted, uncataloged model.
+
+  The registry artifact owns existence, efforts, and features; this maps them
+  onto the Messages compat shape: the ``messages.adaptive`` protocol profile
+  means adaptive thinking, ``"none" in supported_efforts`` means thinking can
+  be explicitly disabled (else disabling is unsupported), and a non-``none``
+  default effort means thinking is on when the parameter is omitted.  Windows
+  and costs come from the rate table when it knows the model and stay at
+  conservative defaults otherwise.
+  """
+  log.warning(
+    "Anthropic model %r has no capability row; deriving metadata from product "
+    "model registry entry %r. Add a row to "
+    "anthropic_helpers._MODEL_INFO_BY_TAG for exact wire quirks and costs.",
+    model_id,
+    entry.key,
+  )
+  effort_values = tuple(
+    value for value in registry_effort_values(entry) if value != "none"
+  )
+  if entry.protocol_profile != "messages.adaptive" or not effort_values:
+    return ModelInfo(
+      id=model_id,
+      provider="anthropic",
+      supports_thinking=False,
+      thinking_mode="none",
+      input_cost_per_mtok=3.00,
+      output_cost_per_mtok=15.00,
+      cache_read_cost_per_mtok=0.30,
+      cache_write_cost_per_mtok=3.75,
+      compat={
+        "thinking_disable": "unsupported",
+        "thinking_default_when_omitted": "off",
+        "thinking_default_effort": "none",
+        "effort_values": (),
+        "supports_output_config_effort": False,
+      },
+    )
   return ModelInfo(
     id=model_id,
     provider="anthropic",
@@ -273,7 +327,12 @@ def _model_info_for_model(model_id: str) -> ModelInfo:
     output_cost_per_mtok=15.00,
     cache_read_cost_per_mtok=0.30,
     cache_write_cost_per_mtok=3.75,
-    compat=_adaptive_compat(disable="omit", omitted="off", default_effort="none", values=_EFFORT_46),
+    compat=_adaptive_compat(
+      disable="disabled" if "none" in entry.supported_efforts else "unsupported",
+      omitted="on" if entry.default_effort != "none" else "off",
+      default_effort=entry.default_effort,
+      values=effort_values,
+    ),
   )
 
 
@@ -382,8 +441,28 @@ def _exception_body(exc: Exception) -> Any:
 
 def _format_anthropic_rejection_detail(exc: Exception) -> str | None:
   status_code = _exception_status_code(exc)
-  if status_code is None or status_code < 400 or status_code == 429 or status_code >= 500:
+  if status_code is None or status_code < 400 or status_code >= 500:
     return None
+  if status_code == 429:
+    parts = [f"status={status_code}", f"provider_error={type(exc).__name__}"]
+    for label, attribute in (
+      ("request_id", "provider_request_id"),
+      ("limiter", "rate_limit_representative_claim"),
+      ("5h_status", "rate_limit_5h_status"),
+      ("5h_utilization", "rate_limit_5h_utilization"),
+      ("5h_reset", "rate_limit_5h_reset"),
+      ("7d_status", "rate_limit_7d_status"),
+      ("7d_utilization", "rate_limit_7d_utilization"),
+      ("7d_reset", "rate_limit_7d_reset"),
+      ("retry_after", "retry_after"),
+    ):
+      value = getattr(exc, attribute, None)
+      if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        continue
+      detail = _truncate_error_detail(value, limit=160)
+      if detail:
+        parts.append(f"{label}={detail}")
+    return "; ".join(parts)
 
   parts = [f"status={status_code}", f"provider_error={type(exc).__name__}"]
   body = _redact_error_body(_exception_body(exc))

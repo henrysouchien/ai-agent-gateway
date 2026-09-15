@@ -29,6 +29,9 @@ from agent_gateway import (  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 import agent_gateway.runner_background_lifecycle as runner_background_lifecycle  # noqa: E402
 import agent_gateway.task_registry as task_registry_module  # noqa: E402
+from agent_gateway.mcp_client import McpClientManager  # noqa: E402
+from agent_gateway.task_registry import NotificationDeliveryState  # noqa: E402
+from agent_gateway.tool_dispatcher_helpers import ToolResult  # noqa: E402
 from agent_gateway.runner_notifications import (  # noqa: E402
   build_notification_reminder,
   consume_notifications,
@@ -43,16 +46,36 @@ from tests.capability_execution_test_support import (  # noqa: E402
 )
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
+class _NullMcpClient(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
+
+  def is_mcp_tool(self, name: str) -> bool:
+    _ = name
     return False
 
-  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
+  async def call_tool(
+    self,
+    name: str,
+    tool_input: object,
+    meta: object | None = None,
+    abort_event: asyncio.Event | None = None,
+    gateway_session: object | None = None,
+    allow_uncertain_replay: bool = True,
+    trusted_dispatch_scope: object | None = None,
+  ) -> ToolResult:
+    _ = (
+      tool_input,
+      meta,
+      abort_event,
+      gateway_session,
+      allow_uncertain_replay,
+      trusted_dispatch_scope,
+    )
     return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
 
   def get_tool_definitions(self) -> list[dict[str, Any]]:
     return []
-
 
 class _StubProvider:
   name = "stub"
@@ -1282,7 +1305,7 @@ def test_queue_omitted_result_stays_pinned_after_aggregate_marker_consumed() -> 
   ["payload_omitted", "queue_omitted"],
 )
 def test_age_eviction_preserves_notification_retrieval_ownership(
-  notification_delivery_state: str,
+  notification_delivery_state: NotificationDeliveryState,
 ) -> None:
   registry = TaskRegistry()
   entry = registry.register("background_agent")
@@ -1606,6 +1629,7 @@ def test_background_kill_notifies_once_with_canonical_child_return() -> None:
     await started.wait()
 
     assert runner._task_registry.kill(entry.task_id) is True
+    assert entry.asyncio_task is not None
     await entry.asyncio_task
 
     notifications = runner._notification_queue.peek()

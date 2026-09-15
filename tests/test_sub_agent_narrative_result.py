@@ -5,18 +5,26 @@ from types import SimpleNamespace
 import pytest
 from agent_workflow_contracts import (
   AgentOperationRef,
+  AdmittedToolRoute,
+  AgentExecutionSnapshot,
+  AgentOperationSnapshot,
+  AgentResumeMechanics,
   AttemptRef,
   LiveToolCapabilityBinding,
+  CapabilityBind,
+  ContractRef,
   OrdinaryDelegationTaskRef,
   OutcomeRequirement,
   ResultRequirement,
   TaskResultProvenance,
   ToolGrant,
   ToolGrantEntry,
+  ProviderToolDefinition,
   sha256_digest,
 )
 
 from agent_gateway.final_narrative_artifact import read_final_narrative
+from agent_gateway.sub_agent import _ordinary_admitted_task_factory
 from agent_gateway.sub_agent_narrative_result import (
   final_child_visible_text,
   read_task_result_terminal_narrative,
@@ -357,16 +365,59 @@ async def test_no_citation_context_child_yields_no_fabricated_citations(
 
 
 def _admitted_task(*, tool_ids: tuple[str, ...] = ("filings_search",)):
-  """The two authority fields the settlement site reads, and nothing else."""
+  """Build the real admission contract consumed by settlement."""
 
-  return SimpleNamespace(
-    tool_grant=ToolGrant(
-      grant_id="grant-1",
-      tools=tuple(
-        ToolGrantEntry(tool_id=tool_id, route_id="route-1", effect="read")
+  logical, _, _ = _task_identity()
+  digest = sha256_digest({"fixture": "admission"})
+  grant = ToolGrant(
+    grant_id="grant-1",
+    tools=tuple(
+      ToolGrantEntry(tool_id=tool_id, route_id="route-1", effect="read")
+      for tool_id in tool_ids
+    ),
+    digest=sha256_digest({"grant": list(tool_ids)}),
+  )
+  result_instructions = "Return one exact terminal narrative."
+  factory = _ordinary_admitted_task_factory(
+    operation=AgentOperationSnapshot(
+      operation=logical.operation,
+      methodology=ContractRef(
+        namespace="test",
+        name="methodology",
+        version="1.0",
+        digest=digest,
+      ),
+      prompt=ContractRef(
+        namespace="test",
+        name="prompt",
+        version="1.0",
+        digest=digest,
+      ),
+      description="Narrative settlement fixture.",
+      instructions="Complete the delegated research task.",
+      execution_class="test",
+      workspace_scope="read_only",
+      result_modes=("narrative",),
+    ),
+    execution_snapshot=AgentExecutionSnapshot(
+      system_prompt=f"2026-09-01\n{result_instructions}",
+      admission_date="2026-09-01",
+      persisted_methodology_state=None,
+      result_instructions=result_instructions,
+      client_timeout_seconds=30.0,
+      max_tokens=1_024,
+      provider_tool_definitions=tuple(
+        ProviderToolDefinition(definition={"name": tool_id})
         for tool_id in tool_ids
       ),
-      digest=sha256_digest({"grant": list(tool_ids)}),
+      resume_mechanics=AgentResumeMechanics(
+        resumable=False,
+        max_chain_depth=0,
+        transcript_strategy="durable_reconstruction",
+        prompt_strategy="reuse_exact",
+        tool_grant_strategy="reissue_exact",
+        control_message_strategy="admitted_exact",
+      ),
     ),
     capability_bindings=(
       LiveToolCapabilityBinding(
@@ -375,7 +426,34 @@ def _admitted_task(*, tool_ids: tuple[str, ...] = ("filings_search",)):
         tool_ids=tool_ids,
       ),
     ),
+    tool_grant=grant,
+    tool_routes=tuple(
+      AdmittedToolRoute(tool_id=tool_id, origin="local", server_id=None)
+      for tool_id in tool_ids
+    ),
+    model_bind=CapabilityBind(
+      schema_version="1.0",
+      capability_id="test",
+      model_key="test.model",
+      provider="anthropic",
+      upstream_model="test-model",
+      adapter="native",
+      protocol_profile="messages",
+      route="test",
+      effort="none",
+      credential_principal="user",
+      credential_ref="test",
+      run_mode="interactive",
+      registry_revision="1.0",
+      policy_revision="1.0",
+      selection_source="internal_policy",
+    ),
+    result_requirement=_narrative_requirement(),
+    objective="Complete the delegated research task.",
+    parent_session=None,
+    logical_task_override=logical,
   )
+  return factory(SimpleNamespace(task_id="child-1"))
 
 
 async def _narrative(tmp_path, text: str = "Partial but real answer."):
@@ -462,6 +540,7 @@ async def test_turns_exhausted_beside_another_signal_keeps_failing(
   )
 
   assert result.execution.status == "interrupted"
+  assert result.execution.terminal_reason is not None
   assert result.execution.terminal_reason.startswith("timeout:")
   assert result.outcome is None
   assert result.values.terminal_narrative is None
@@ -548,3 +627,172 @@ async def test_settlement_without_an_admitted_task_derives_no_outcome(
 
   assert result.execution.status == "succeeded"
   assert result.outcome is None
+
+
+def _fms_complete(tool_name: str, **result_fields: object) -> dict[str, object]:
+  payload = {
+    "subcommand": tool_name.removeprefix("fms_"),
+    "mutation_mode": "model_writer",
+    **result_fields,
+  }
+  return {
+    "type": "tool_call_complete",
+    "tool_name": tool_name,
+    "result": payload,
+  }
+
+
+@pytest.mark.asyncio
+async def test_terminal_tool_success_projects_exact_result_without_narrative(
+  tmp_path,
+) -> None:
+  logical, attempt, provenance = _task_identity()
+  tool_name = "fms_propose_position_initiation_predecision"
+  tool_result = {
+    "status": "staged",
+    "proposal_id": "proposal-1",
+    "artifact_ref": "artifacts/PCTY/predecision.json",
+  }
+
+  result = task_result_from_execution(
+    (
+      {"type": "tool_call_start", "tool_name": tool_name},
+      {
+        "type": "tool_call_complete",
+        "tool_name": tool_name,
+        "result": tool_result,
+        "dispatch": {"outcome": "ok"},
+        "is_error": False,
+        "error": None,
+        "semantic_error": None,
+      },
+      {"type": "budget_exceeded", "reason": "post_tool_budget"},
+    ),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=None,
+    timed_out=False,
+    timeout=None,
+    admitted_task=_admitted_task(tool_ids=(tool_name,)),
+  )
+
+  assert result.execution.status == "succeeded"
+  assert result.values.terminal_narrative is None
+  assert result.values.projection is not None
+  assert result.values.projection.inline_view == {
+    "tool_name": tool_name,
+    "result": tool_result,
+  }
+
+
+@pytest.mark.asyncio
+async def test_named_operation_without_terminal_door_does_not_succeed(
+  tmp_path,
+) -> None:
+  logical, attempt, provenance = _task_identity()
+
+  result = task_result_from_execution(
+    (
+      {"type": "tool_call_start", "tool_name": "prepare_model_build"},
+      {
+        "type": "tool_call_complete",
+        "tool_name": "prepare_model_build",
+        "dispatch": {"outcome": "ok"},
+      },
+      {"type": "tool_call_start", "tool_name": "list_research_files"},
+      {
+        "type": "tool_call_complete",
+        "tool_name": "list_research_files",
+        "dispatch": {"outcome": "ok"},
+      },
+    ),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=await _narrative(tmp_path, "STATUS: BLOCKED"),
+    timed_out=False,
+    timeout=None,
+    admitted_task=_admitted_task(tool_ids=(
+      "prepare_model_build",
+      "list_research_files",
+      "fms_report_build_model",
+    )),
+  )
+
+  assert result.execution.status != "succeeded"
+  assert result.outcome is not None
+  assert result.outcome.disposition == "blocked"
+  assert result.outcome.assessment_source == "mechanically_derived"
+  assert result.values.terminal_narrative is not None
+
+
+@pytest.mark.asyncio
+async def test_named_operation_terminal_stop_is_not_succeeded(
+  tmp_path,
+) -> None:
+  logical, attempt, provenance = _task_identity()
+
+  result = task_result_from_execution(
+    (
+      {"type": "tool_call_start", "tool_name": "fms_persist_postcompile_valuation"},
+      _fms_complete(
+        "fms_persist_postcompile_valuation",
+        status="error",
+        gate_code="STOP",
+        error={
+          "type": "INVALID_JUDGMENT",
+          "message": "postcompile-valuation persistence requires the active research file",
+        },
+      ),
+    ),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=await _narrative(tmp_path, "STOP: missing research file"),
+    timed_out=False,
+    timeout=None,
+    admitted_task=_admitted_task(tool_ids=(
+      "fms_persist_postcompile_valuation",
+    )),
+  )
+
+  assert result.execution.status != "succeeded"
+  assert result.outcome is not None
+  assert result.outcome.disposition == "blocked"
+  assert result.outcome.assessment_source == "mechanically_derived"
+  assert "STOP" in (result.outcome.assessment_rationale or "")
+  assert result.values.terminal_narrative is not None
+
+
+@pytest.mark.asyncio
+async def test_ordinary_child_without_declared_door_stays_succeeded(
+  tmp_path,
+) -> None:
+  logical, attempt, provenance = _task_identity()
+
+  result = task_result_from_execution(
+    (
+      {"type": "tool_call_start", "tool_name": "filings_search"},
+      {
+        "type": "tool_call_complete",
+        "tool_name": "filings_search",
+        "dispatch": {"outcome": "ok"},
+      },
+    ),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=await _narrative(tmp_path, "Ordinary child answer."),
+    timed_out=False,
+    timeout=None,
+    admitted_task=_admitted_task(),
+  )
+
+  assert result.execution.status == "succeeded"
+  assert result.outcome is not None
+  assert result.outcome.disposition == "complete"

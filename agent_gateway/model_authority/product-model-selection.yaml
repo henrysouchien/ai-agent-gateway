@@ -7,7 +7,7 @@
 # startup on a missing or invalid artifact. The environment variable names
 # which artifact file to load — it is never model or default authority itself.
 #
-# Content is frozen per docs/design/model-selection-authority-product-
+# Content is frozen per docs/reference/model-selection-authority-product-
 # decisions-2026-08-13.md section 6. Unknown fields are rejected by the loader.
 schema: "product-model-selection/v1"
 revision: "2026-08-18.1"
@@ -16,15 +16,19 @@ capabilities:
     default: {kind: "model", model_key: "anthropic.claude-opus-5", effort: "high"}
     by_channel: {}
     allowed_model_keys:
+      - "anthropic.claude-fable-5-1"
       - "anthropic.claude-fable-5"
       - "anthropic.claude-haiku-4-5"
       - "anthropic.claude-mythos-5"
       - "anthropic.claude-opus-5"
       - "anthropic.claude-sonnet-5"
+      - "openai.gpt-6-astra"
       - "openai.gpt-5-6"
+      - "codex.gpt-6-astra"
       - "codex.gpt-5-6-luna"
       - "codex.gpt-5-6-sol"
       - "codex.gpt-5-6-terra"
+      - "xai.grok-4-6"
       - "xai.grok-4-5"
     allow_saved_preference: true
     allow_explicit_user: true
@@ -33,15 +37,19 @@ capabilities:
     default: {kind: "inherit_parent"}
     by_channel: {}
     allowed_model_keys:
+      - "anthropic.claude-fable-5-1"
       - "anthropic.claude-fable-5"
       - "anthropic.claude-haiku-4-5"
       - "anthropic.claude-mythos-5"
       - "anthropic.claude-opus-5"
       - "anthropic.claude-sonnet-5"
+      - "openai.gpt-6-astra"
       - "openai.gpt-5-6"
+      - "codex.gpt-6-astra"
       - "codex.gpt-5-6-luna"
       - "codex.gpt-5-6-sol"
       - "codex.gpt-5-6-terra"
+      - "xai.grok-4-6"
       - "xai.grok-4-5"
     allow_authenticated_run_override: true
 
@@ -49,6 +57,7 @@ capabilities:
     default: {kind: "model", model_key: "anthropic.claude-opus-5", effort: "high"}
     by_channel: {}
     allowed_model_keys:
+      - "anthropic.claude-fable-5-1"
       - "anthropic.claude-fable-5"
       - "anthropic.claude-mythos-5"
       - "anthropic.claude-opus-5"
@@ -58,6 +67,7 @@ capabilities:
     default: {kind: "model", model_key: "anthropic.claude-opus-5", effort: "high"}
     by_channel: {}
     allowed_model_keys:
+      - "anthropic.claude-fable-5-1"
       - "anthropic.claude-fable-5"
       - "anthropic.claude-mythos-5"
       - "anthropic.claude-opus-5"
@@ -67,6 +77,7 @@ capabilities:
     default: {kind: "model", model_key: "anthropic.claude-opus-5", effort: "high"}
     by_channel: {}
     allowed_model_keys:
+      - "anthropic.claude-fable-5-1"
       - "anthropic.claude-fable-5"
       - "anthropic.claude-mythos-5"
       - "anthropic.claude-opus-5"
@@ -76,21 +87,26 @@ capabilities:
     default: {kind: "inherit_parent"}
     by_channel: {}
     allowed_model_keys:
+      - "anthropic.claude-fable-5-1"
       - "anthropic.claude-fable-5"
       - "anthropic.claude-haiku-4-5"
       - "anthropic.claude-mythos-5"
       - "anthropic.claude-opus-5"
       - "anthropic.claude-sonnet-5"
+      - "openai.gpt-6-astra"
       - "openai.gpt-5-6"
+      - "codex.gpt-6-astra"
       - "codex.gpt-5-6-luna"
       - "codex.gpt-5-6-sol"
       - "codex.gpt-5-6-terra"
+      - "xai.grok-4-6"
       - "xai.grok-4-5"
 
   node.verify:
     default: {kind: "model", model_key: "anthropic.claude-opus-5", effort: "high"}
     by_channel: {}
     allowed_model_keys:
+      - "anthropic.claude-fable-5-1"
       - "anthropic.claude-fable-5"
       - "anthropic.claude-mythos-5"
       - "anthropic.claude-opus-5"
@@ -100,6 +116,7 @@ capabilities:
     default: {kind: "model", model_key: "anthropic.claude-opus-5", effort: "high"}
     by_channel: {}
     allowed_model_keys:
+      - "anthropic.claude-fable-5-1"
       - "anthropic.claude-fable-5"
       - "anthropic.claude-mythos-5"
       - "anthropic.claude-opus-5"
@@ -109,6 +126,7 @@ capabilities:
     default: {kind: "model", model_key: "anthropic.claude-haiku-4-5", effort: "none"}
     by_channel: {}
     allowed_model_keys:
+      - "anthropic.claude-fable-5-1"
       - "anthropic.claude-fable-5"
       - "anthropic.claude-haiku-4-5"
       - "anthropic.claude-mythos-5"
@@ -153,7 +171,7 @@ capabilities:
   investment.quant_worker:
     default: {kind: "model", model_key: "openai.gpt-5-6", effort: "high"}
     by_channel: {}
-    allowed_model_keys: ["openai.gpt-5-6"]
+    allowed_model_keys: ["openai.gpt-6-astra", "openai.gpt-5-6"]
 
   investment.newsletter:
     default: {kind: "model", model_key: "anthropic.claude-haiku-4-5-20251001-gateway", effort: "none"}

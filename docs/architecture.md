@@ -1,6 +1,6 @@
 # Architecture
 
-**Last verified:** 2026-08-05 (docs-program unit pass against package source)
+**Last verified:** 2026-08-21 (docs-program unit pass against package source)
 
 `ai-agent-gateway` is a server runtime for tool-using agents. It combines session management, SSE streaming, tool dispatch, approval handling, and provider abstraction in one package so you can ship an agent backend without rebuilding that infrastructure yourself.
 
@@ -32,7 +32,7 @@ A single request usually moves through these stages:
 3. The server constructs `AuthContext` from the authenticated session and
    server-owned credential handles, then resolves and materializes one
    immutable `session.driver` execution.
-4. The server calls `build_chat_runtime(session, request, channel, auth_manager)`.
+4. The server calls `build_chat_runtime(session, request, channel, auth_manager, storage_root=...)` — four positional arguments and a keyword-only `storage_root` (`None` unless the app has a storage root).
 5. `ChatRuntime.build_runner()` constructs the runner with that exact bind,
    admitting registry, provider adapter, and credential snapshot.
 6. The runner streams model output, dispatches tools, and appends events to `EventLog`.
@@ -40,6 +40,18 @@ A single request usually moves through these stages:
    or `error`. `stream_complete.terminal_disposition` distinguishes successful
    completion from an intentional interruption while preserving one canonical
    transport-closing event.
+   Terminal success is published only after the lifecycle owner's off-loop
+   durable closure (including named-skill result, interruption, and detach).
+   Repeated cancellation drains that closure before propagating; learning
+   receipts are acknowledged only for a successfully persisted success.
+   Persistence failures append error history without resetting staged evidence.
+
+For native sessions using `AgentSessionLog`, the session lifecycle writer
+settles unanswered assistant tool calls as durable interrupted results before
+interruption/detach; attach recovery also includes calls not yet dispatched.
+An interrupted result reports missing completion, not that side effects were
+rolled back. `SessionContextBuilder` replays each batch as one user message
+with all tool results before supplemental text, matching the live tool loop.
 
 ## Core Concepts
 
@@ -49,7 +61,7 @@ A single request usually moves through these stages:
 
 It wires together:
 
-- a resolved `ModelProvider` (`AnthropicProvider`, `OpenAIProvider`, or your own instance)
+- a resolved `ModelProvider` (`AnthropicProvider`, `CodexProvider`, `OpenAIProvider`, `XAIProvider`, or your own instance)
 - a server-owned model registry, selection policy, and credential provenance
 - `GatewayServerConfig`
 - `ChatRuntime`
@@ -58,7 +70,8 @@ It wires together:
 - optional code execution
 - optional skills and `run_agent`
 
-Use it when you want the shortest path to a working Anthropic- or OpenAI-backed agent server.
+Use it when you want the shortest path to a working Anthropic-, Codex-,
+OpenAI-, or XAI-backed agent server.
 
 ### `run_autonomous()`
 
@@ -358,10 +371,12 @@ Skills are markdown files loaded by `SkillLoader`.
 Each skill can specify:
 
 - a system prompt
-- a model override
 - max turns
 - timeout
 - metadata
+
+The capability resolver, not skill frontmatter, owns provider and model
+selection.
 
 When `skills_dir` is configured:
 
@@ -391,20 +406,22 @@ Key details:
 - on runner shutdown, pending background tasks are awaited (up to 30 seconds) or cancelled
 - `on_before_background` and `on_background_complete` callbacks let consumers hook into the lifecycle
 
-### Typed Event Contract (0.15.0+)
+### Typed Event Contract
 
-Skill-framework sub-agent runs emit typed lifecycle and result events onto the parent `EventLog`, where they flow through the standard SSE channel alongside `text_delta` / `tool_call_complete` / etc. The contract is opt-in — events only fire when both `skill_run_id` and `SkillProfile` are wired into the sub-agent dispatch.
-
-The six events split into two scopes:
-
-- **Run-scoped** (carry `skill_run_id` for correlation): `SkillRunStartedEvent`, `skill_result_captured`, `ArtifactReadyEvent`, `AggregateReadyEvent`, `ArtifactFailedEvent`.
-- **Renderer-only** (no skill run): `ArtifactUnavailableEvent`, surfaced when a UI lookup for `(ticker, skill)` finds nothing.
+Typed lifecycle and result events flow through the parent `EventLog` alongside
+ordinary runner events. The 14-event union covers skill runs, artifacts, UI
+blocks, direct-parent agent completion, workflow output, recommendations,
+approvals, and session recaps. Seven event types are run-scoped; the remainder
+have their own correlation keys. The canonical union and scope sets live in
+`agent_gateway.events`.
 
 Why typed: renderers (Excel taskpane, web demo surface, etc.) need a stable shape to react to skill state transitions without parsing free-form `tool_call_complete` blocks. The dataclasses are frozen where event classes exist, the `type` discriminator is fixed, and `event_to_dict` / `event_from_dict` round-trip the dataclass wire format. Renderers can drive UI state machines off `skill_run_started` → `skill_result_captured` → `artifact_ready` without doing tool-call introspection.
 
 Verdict display data comes from `skill_result_captured.verdict_echo` or structured FMS artifact events. Runtime code does not parse final markdown, fenced YAML, or `memory_write` payloads to infer verdict state.
 
-See `agent_gateway.events` for the dataclasses, `docs/api-reference.md` for the public surface, and `docs/http-api.md` → "Skill Framework Events" for wire format.
+See `agent_gateway.events` for the dataclasses, [API reference](./api-reference.md)
+for the public surface, and [HTTP API](./http-api.md) for the SSE envelope and
+wire format.
 
 ## Providers
 
@@ -413,9 +430,11 @@ The provider abstraction lives under `ModelProvider`.
 Built-in providers:
 
 - `AnthropicProvider`
+- `CodexProvider`
 - `OpenAIProvider`
+- `XAIProvider`
 
-Both normalize messages, build request params, stream events, and estimate costs through the same contract.
+All four normalize messages, build request params, stream events, and estimate costs through the same contract.
 
 `create_agent()` can resolve the built-in provider strings or accept a `ModelProvider` instance directly. `create_gateway_app()` remains the escape hatch when you need custom runtime assembly around that provider.
 
@@ -437,7 +456,7 @@ Why it exists:
 Start with `create_agent()` when you want:
 
 - one prompt
-- Anthropic or OpenAI
+- Anthropic, Codex, OpenAI, or XAI
 - optional MCP tools
 - optional local tools
 - optional code execution

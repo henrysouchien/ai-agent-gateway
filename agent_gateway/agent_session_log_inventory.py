@@ -11,6 +11,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import logging
+import math
 import re
 import stat
 from typing import Any, Literal, Mapping
@@ -28,6 +30,7 @@ from .agent_session_log_layout import (
   derive_v2_agent_session_log_paths,
   resolve_agent_session_log_layout,
   validate_v2_sidecar_payload,
+  validate_v2_stream_path,
 )
 from .agent_session_log_records import (
   _SEGMENT_FILE_RE,
@@ -41,6 +44,8 @@ from .agent_session_log_sidecars import (
   V2_STORAGE_IDENTITY_FIELDS,
 )
 
+
+log = logging.getLogger("agent_gateway.agent_session_log_inventory")
 
 _MAX_SIDECAR_BYTES = 64 * 1024
 _SUPPORTED_SIDECAR_SCHEMAS = frozenset({1, 2})
@@ -61,6 +66,12 @@ SessionLogStorageLayout = Literal["v1", "v2"]
 SessionLogStreamKind = Literal["canonical", "batch", "pipeline", "ephemeral", "unknown"]
 SessionLogFileRole = Literal["active", "segment"]
 SessionLogSidecarStatus = Literal["valid", "missing", "invalid", "unsupported"]
+
+# Selectable stream kinds ("unknown" names unclassifiable files and is never
+# a valid selection). Consumers must import this instead of re-typing it.
+SUPPORTED_SESSION_LOG_STREAM_KINDS: frozenset[SessionLogStreamKind] = frozenset(
+  {"canonical", "batch", "pipeline", "ephemeral"}
+)
 
 
 class SessionLogInventoryError(RuntimeError):
@@ -108,94 +119,35 @@ class SelectedAgentSessionLog:
     return self.location.path
 
 
-def read_session_log_physical_range(
-  physical: SessionLogPhysicalFile,
-  *,
-  offset_lo: int,
-  offset_hi: int,
-) -> bytes:
-  """Read one exact inventoried file range without reopening a free path."""
-
-  if type(physical) is not SessionLogPhysicalFile:
-    raise SessionLogInventoryError("session-log physical file must be exact")
-  if (
-    isinstance(offset_lo, bool)
-    or isinstance(offset_hi, bool)
-    or not isinstance(offset_lo, int)
-    or not isinstance(offset_hi, int)
-    or offset_lo < 0
-    or offset_hi < offset_lo
-    or offset_hi > physical.file_identity.size
-  ):
-    raise SessionLogInventoryError("session-log physical range is invalid")
-  try:
-    parent_descriptor, parent_identity = open_directory_chain(
-      physical.path.parent
-    )
-  except DirectoryChainSecurityError as exc:
-    raise SessionLogInventoryError(
-      "session-log physical parent is unavailable"
-    ) from exc
-  descriptor = -1
-  try:
-    if parent_identity != physical.parent_identity:
-      raise SessionLogInventoryError(
-        "session-log physical parent identity changed"
-      )
-    named = os.stat(
-      physical.path.name,
-      dir_fd=parent_descriptor,
-      follow_symlinks=False,
-    )
-    _require_safe_file(named, target="session-log physical file")
-    descriptor = os.open(
-      physical.path.name,
-      os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-      dir_fd=parent_descriptor,
-    )
-    opened = os.fstat(descriptor)
-    _require_safe_file(opened, target="session-log physical file")
-    expected = physical.file_identity
-    observed = _identity(opened)
-    if observed != expected or (
-      opened.st_dev,
-      opened.st_ino,
-    ) != (named.st_dev, named.st_ino):
-      raise SessionLogInventoryError(
-        "session-log physical file identity changed"
-      )
-    os.lseek(descriptor, offset_lo, os.SEEK_SET)
-    remaining = offset_hi - offset_lo
-    chunks: list[bytes] = []
-    while remaining:
-      chunk = os.read(descriptor, remaining)
-      if not chunk:
-        raise SessionLogInventoryError(
-          "session-log physical file ended before its bound range"
-        )
-      chunks.append(chunk)
-      remaining -= len(chunk)
-    return b"".join(chunks)
-  except FileNotFoundError as exc:
-    raise SessionLogInventoryError(
-      "session-log physical file is missing"
-    ) from exc
-  except OSError as exc:
-    raise SessionLogInventoryError(
-      "session-log physical range is unavailable"
-    ) from exc
-  finally:
-    if descriptor >= 0:
-      os.close(descriptor)
-    os.close(parent_descriptor)
-
-
 def _identity(info: os.stat_result) -> SessionLogFileIdentity:
   return SessionLogFileIdentity(
     device=int(info.st_dev),
     inode=int(info.st_ino),
     size=int(info.st_size),
     mtime_ns=int(info.st_mtime_ns),
+  )
+
+
+def _rotated_identity_matches(
+  recorded: Mapping[str, Any],
+  physical: SessionLogFileIdentity,
+  *,
+  historical_lineage: bool,
+) -> bool:
+  if recorded["size"] != physical.size:
+    return False
+  if not historical_lineage:
+    return (
+      recorded["st_dev"] == physical.device
+      and recorded["st_ino"] == physical.inode
+      and recorded["mtime_ns"] == physical.mtime_ns
+    )
+  # Relocation can round timestamps through floating-point seconds.
+  # One ULP in seconds, converted to ns (~238 ns in 2026), bounds
+  # that representation loss; size remains exact, not a byte digest.
+  return (
+    abs(recorded["mtime_ns"] - physical.mtime_ns)
+    <= math.ulp(physical.mtime_ns / 1_000_000_000) * 1_000_000_000
   )
 
 
@@ -395,7 +347,15 @@ def _physical_files(location: AgentSessionLogLocation) -> tuple[SessionLogPhysic
         if not name.endswith(".jsonl"):
           continue
         if _SEGMENT_FILE_RE.fullmatch(name) is None:
-          raise SessionLogInventoryError("session-log segment filename is invalid")
+          # Not a segment: only the session-log writer names segments (per
+          # _SEGMENT_FILE_RE); a foreign .jsonl must not refuse the whole
+          # physical inventory of every valid file.
+          log.warning(
+            "session-log segments directory contains a foreign .jsonl"
+            " file %r; ignoring it",
+            name,
+          )
+          continue
         named_segment = os.stat(
           name,
           dir_fd=segment_descriptor,
@@ -452,16 +412,9 @@ def _v1_lineage_source_id(
   return f"agent_session_log:{stream_hash}:{role}:{suffix}"
 
 
-def _require_v1_active_lineage(
-  item: SelectedAgentSessionLog,
-  payload: Mapping[str, Any],
-) -> tuple[str, int | None]:
-  """Validate v1 telemetry lineage without treating it as path authority."""
+def _require_v1_lineage_path(logical_stream_id: Any, *, active: Path) -> str:
+  """Validate historical namespace/basename, never open a lineage as a locator."""
 
-  if payload.get("schema_version") != 2:
-    return str(item.path), None
-  logical_stream_id = payload.get("logical_stream_id")
-  active_generation = payload.get("active_generation")
   if (
     not isinstance(logical_stream_id, str)
     or not logical_stream_id
@@ -480,9 +433,29 @@ def _require_v1_active_lineage(
   if (
     not lineage_path.is_absolute()
     or canonical_lineage_path != logical_stream_id
-    or lineage_path.parent.name != item.path.parent.name
-    or lineage_path.name != item.path.name
-    or isinstance(active_generation, bool)
+    or lineage_path.parent.name != active.parent.name
+    or lineage_path.name != active.name
+  ):
+    raise SessionLogInventoryError(
+      "retained flat metadata has inconsistent historical lineage"
+    )
+  return logical_stream_id
+
+
+def _require_v1_active_lineage(
+  item: SelectedAgentSessionLog,
+  payload: Mapping[str, Any],
+) -> tuple[str, int | None]:
+  """Validate v1 telemetry lineage without treating it as path authority."""
+
+  if payload.get("schema_version") != 2:
+    return str(item.path), None
+  logical_stream_id = _require_v1_lineage_path(
+    payload.get("logical_stream_id"), active=item.path,
+  )
+  active_generation = payload.get("active_generation")
+  if (
+    isinstance(active_generation, bool)
     or not isinstance(active_generation, int)
     or active_generation < 0
     or payload.get("telemetry_source_id")
@@ -576,7 +549,6 @@ def _require_v2_canonical(
     or payload.get("storage_layout") != 2
     or payload.get("file_role") != "active"
     or _classify_sidecar(payload) != "canonical"
-    or payload.get("logical_stream_id") != str(location.path)
     or payload.get("tenant_id") != trusted_product_id
     or payload.get("product_id") != trusted_product_id
   ):
@@ -620,6 +592,7 @@ def _require_v2_canonical(
     )
   except (AgentSessionLogLayoutError, TypeError, ValueError) as exc:
     raise SessionLogInventoryError("v2 canonical metadata is invalid") from exc
+  logical_stream_id = payload["logical_stream_id"]
   if not strict_rotated:
     return
   identity_fields = {
@@ -649,17 +622,15 @@ def _require_v2_canonical(
     if any(segment_payload.get(key) != payload.get(key) for key in shared_fields):
       raise SessionLogInventoryError("v2 segment classification is inconsistent")
     identity = segment_payload.get("rotated_from_file_identity")
-    expected_identity = {
-      "st_dev": physical.file_identity.device,
-      "st_ino": physical.file_identity.inode,
-      "size": physical.file_identity.size,
-      "mtime_ns": physical.file_identity.mtime_ns,
-    }
     if (
       not isinstance(identity, Mapping)
       or set(identity) != _FILE_IDENTITY_FIELDS
       or any(type(identity.get(key)) is not int for key in _FILE_IDENTITY_FIELDS)
-      or any(identity.get(key) != value for key, value in expected_identity.items())
+      or not _rotated_identity_matches(
+        identity,
+        physical.file_identity,
+        historical_lineage=logical_stream_id != str(location.path),
+      )
     ):
       raise SessionLogInventoryError("v2 segment metadata does not match its physical file")
     filename_match = _SEGMENT_FILE_RE.fullmatch(physical.path.name)
@@ -667,11 +638,18 @@ def _require_v2_canonical(
     segment_id = physical.path.stem
     generation = int(filename_match.group("generation"))
     stream_prefix = str(payload["telemetry_source_id"]).rsplit(":", 2)[0]
+    try:
+      validate_v2_stream_path(
+        segment_payload.get("rotated_from_path"),
+        active=location.path,
+        field_name="rotated_from_path",
+      )
+    except AgentSessionLogLayoutError as exc:
+      raise SessionLogInventoryError("v2 segment rotation locator is invalid") from exc
     if (
       segment_payload.get("schema_version") != 2
       or segment_payload.get("file_role") != "segment"
-      or segment_payload.get("logical_stream_id") != str(location.path)
-      or segment_payload.get("rotated_from_path") != str(location.path)
+      or segment_payload.get("logical_stream_id") != logical_stream_id
       or segment_payload.get("segment_id") != segment_id
       or segment_payload.get("first_seq") != int(filename_match.group("first"))
       or segment_payload.get("last_seq") != int(filename_match.group("last"))
@@ -681,7 +659,7 @@ def _require_v2_canonical(
       or _classify_sidecar(segment_payload) != "canonical"
     ):
       raise SessionLogInventoryError("v2 segment metadata contradicts storage")
-  if location.segments_identity is None:
+  if not segment_names and manifest_status == "missing":
     return
   if manifest_status != "valid" or manifest_payload is None:
     raise SessionLogInventoryError("v2 rotated storage requires a valid manifest")
@@ -695,7 +673,7 @@ def _require_v2_canonical(
     raise SessionLogInventoryError("v2 manifest identity is inconsistent")
   if (
     manifest_payload.get("schema_version") != 1
-    or manifest_payload.get("logical_stream_id") != str(location.path)
+    or manifest_payload.get("logical_stream_id") != logical_stream_id
     or manifest_payload.get("agent_session_id") != payload.get("agent_session_id")
     or manifest_payload.get("active_path") != f"../{location.path.name}"
     or manifest_payload.get("active_generation") != payload.get("active_generation")
@@ -736,7 +714,7 @@ def _require_v2_canonical(
       or descriptor.get("rotated_from_source_id") != segment_payload.get("rotated_from_source_id")
       or descriptor.get("rotated_from_file_identity") != segment_payload.get("rotated_from_file_identity")
       or descriptor.get("rotated_from_path") not in {
-        str(location.path), f"../{location.path.name}",
+        segment_payload.get("rotated_from_path"), f"../{location.path.name}",
       }
     ):
       raise SessionLogInventoryError("v2 manifest segment contradicts physical storage")
@@ -856,12 +834,6 @@ def _require_flat_stream(
     assert filename_match is not None
     segment_id = physical.path.stem
     generation = int(filename_match.group("generation"))
-    expected_identity = {
-      "st_dev": physical.file_identity.device,
-      "st_ino": physical.file_identity.inode,
-      "size": physical.file_identity.size,
-      "mtime_ns": physical.file_identity.mtime_ns,
-    }
     rotated_identity = segment_payload.get("rotated_from_file_identity")
     historical_lineage = logical_stream_id != str(item.path)
     rotated_identity_valid = (
@@ -876,16 +848,10 @@ def _require_flat_stream(
       and int(rotated_identity["st_ino"]) > 0
       and int(rotated_identity["size"]) >= 0
       and int(rotated_identity["mtime_ns"]) >= 0
-      and (
-        (
-          historical_lineage
-          and rotated_identity.get("size") == expected_identity["size"]
-          and rotated_identity.get("mtime_ns") == expected_identity["mtime_ns"]
-        )
-        or (
-          not historical_lineage
-          and rotated_identity == expected_identity
-        )
+      and _rotated_identity_matches(
+        rotated_identity,
+        physical.file_identity,
+        historical_lineage=historical_lineage,
       )
     )
     if (
@@ -909,17 +875,19 @@ def _require_flat_stream(
       raise SessionLogInventoryError(
         "retained flat segment metadata does not match physical storage"
       )
-  if item.location.segments_identity is not None:
+  if segment_names or item.manifest_status != "missing":
     manifest = item.manifest_payload
     if item.manifest_status != "valid" or manifest is None:
       raise SessionLogInventoryError(
         "retained flat rotated storage requires a valid manifest"
       )
+    # Repair may have recorded a different then-current root from the
+    # sidecar's creation root. Both remain historical after a later move.
+    manifest_lineage = _require_v1_lineage_path(
+      manifest.get("logical_stream_id"), active=item.path,
+    )
     if (
       manifest.get("schema_version") != 1
-      or manifest.get("logical_stream_id") not in {
-        str(item.path), logical_stream_id,
-      }
       or manifest.get("agent_session_id") not in {
         None, payload.get("agent_session_id"),
       }
@@ -930,7 +898,7 @@ def _require_flat_stream(
           manifest.get("active_generation") != active_generation
           or manifest.get("active_telemetry_source_id")
           != _v1_lineage_source_id(
-            str(manifest.get("logical_stream_id")),
+            manifest_lineage,
             "active",
             f"{active_generation:06d}",
           )
@@ -1080,8 +1048,7 @@ def enumerate_selected_agent_session_logs(
   selected_layout = resolve_agent_session_log_layout() if layout is None else layout
   if selected_layout not in {SESSION_LOG_LAYOUT_V1, SESSION_LOG_LAYOUT_V2}:
     raise SessionLogInventoryError("session-log layout is unsupported")
-  supported_kinds = frozenset({"canonical", "batch", "pipeline", "ephemeral"})
-  if not allowed_stream_kinds or not allowed_stream_kinds.issubset(supported_kinds):
+  if not allowed_stream_kinds or not allowed_stream_kinds.issubset(SUPPORTED_SESSION_LOG_STREAM_KINDS):
     raise SessionLogInventoryError("selected session-log stream kinds are invalid")
   if (
     not trusted_product_id

@@ -5,6 +5,11 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from .tool_definition import (
+  OriginatedToolDefinition,
+  validate_originated_tool_definition,
+)
+
 
 _MCP_TOOL_DESCRIPTION_GUIDANCE: dict[str, str] = {
   "filings_read": (
@@ -216,6 +221,64 @@ def tool_argument_guidance(tool_name: str) -> str | None:
   return _MCP_TOOL_DESCRIPTION_GUIDANCE.get(str(tool_name or "").strip())
 
 
+def _exact_generation_text(value: object, *, field_name: str) -> str:
+  if type(value) is not str:
+    raise TypeError(f"{field_name} must be an exact str")
+  if not value or value != value.strip():
+    raise ValueError(f"{field_name} must be non-empty trimmed text")
+  return value
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalToolAliasProvenance:
+  """Detached source and result facts for one generated logical alias."""
+
+  logical_server_id: str
+  exposed_name: str
+  transport_server_id: str
+  provider_original_name: str
+  physical_definition: OriginatedToolDefinition
+  logical_definition: OriginatedToolDefinition
+
+  def __post_init__(self) -> None:
+    logical_server_id = _exact_generation_text(
+      self.logical_server_id,
+      field_name="logical_server_id",
+    )
+    exposed_name = _exact_generation_text(
+      self.exposed_name,
+      field_name="exposed_name",
+    )
+    transport_server_id = _exact_generation_text(
+      self.transport_server_id,
+      field_name="transport_server_id",
+    )
+    _exact_generation_text(
+      self.provider_original_name,
+      field_name="provider_original_name",
+    )
+    physical_definition = validate_originated_tool_definition(
+      self.physical_definition
+    )
+    logical_definition = validate_originated_tool_definition(
+      self.logical_definition
+    )
+    if (
+      physical_definition.origin != "mcp"
+      or physical_definition.server_id != transport_server_id
+    ):
+      raise ValueError("physical definition must belong to its transport")
+    if (
+      logical_definition.origin != "mcp"
+      or logical_definition.server_id != logical_server_id
+    ):
+      raise ValueError("logical definition must belong to its logical server")
+    if logical_definition.name != exposed_name:
+      raise ValueError("logical definition name must equal exposed_name")
+    object.__setattr__(self, "physical_definition", physical_definition)
+    object.__setattr__(self, "logical_definition", logical_definition)
+
+
 @dataclass
 class CollisionFilterResult:
   tool_definitions: list[dict[str, Any]]
@@ -231,6 +294,7 @@ class LogicalToolAliasResult:
   dispatch_to_original: dict[str, str]
   mcp_tool_names: set[str]
   logical_tool_definitions: dict[str, list[dict[str, Any]]]
+  alias_generation: tuple[LogicalToolAliasProvenance, ...]
 
 
 def add_logical_tool_aliases(
@@ -249,7 +313,34 @@ def add_logical_tool_aliases(
   dispatch_names = dict(prefixed_to_original)
   names = set(mcp_tool_names)
   logical_definitions: dict[str, list[dict[str, Any]]] = {}
+  alias_generation: list[LogicalToolAliasProvenance] = []
   transport_only = set(transport_only_servers or set())
+
+  def record_alias_generation(
+    *,
+    logical_server_id: str,
+    exposed_name: str,
+    transport_server_id: str,
+    provider_original_name: str,
+    physical_definition: dict[str, Any],
+    logical_definition: dict[str, Any],
+  ) -> None:
+    alias_generation.append(LogicalToolAliasProvenance(
+      logical_server_id=logical_server_id,
+      exposed_name=exposed_name,
+      transport_server_id=transport_server_id,
+      provider_original_name=provider_original_name,
+      physical_definition=OriginatedToolDefinition(
+        definition=physical_definition,
+        origin="mcp",
+        server_id=transport_server_id,
+      ),
+      logical_definition=OriginatedToolDefinition(
+        definition=logical_definition,
+        origin="mcp",
+        server_id=logical_server_id,
+      ),
+    ))
 
   definitions_by_owner_and_original: dict[tuple[str, str], dict[str, Any]] = {}
   for tool_definition in tool_definitions:
@@ -348,6 +439,14 @@ def add_logical_tool_aliases(
         promoted_owners[alias_name] = logical_server
         promoted_dispatch_names[alias_name] = original_name
         available_names.add(alias_name)
+        record_alias_generation(
+          logical_server_id=logical_server,
+          exposed_name=alias_name,
+          transport_server_id=physical_server,
+          provider_original_name=original_name,
+          physical_definition=tool_definition,
+          logical_definition=alias_definition,
+        )
 
       merged = [
         promoted_by_physical_name.get(
@@ -401,6 +500,14 @@ def add_logical_tool_aliases(
       dispatch_names[alias_name] = original_name
       names.add(alias_name)
       logical_definitions.setdefault(logical_server, []).append(alias_definition)
+      record_alias_generation(
+        logical_server_id=logical_server,
+        exposed_name=alias_name,
+        transport_server_id=physical_server,
+        provider_original_name=original_name,
+        physical_definition=source,
+        logical_definition=alias_definition,
+      )
 
   return LogicalToolAliasResult(
     tool_definitions=merged,
@@ -408,6 +515,7 @@ def add_logical_tool_aliases(
     dispatch_to_original=dispatch_names,
     mcp_tool_names=names,
     logical_tool_definitions=logical_definitions,
+    alias_generation=tuple(alias_generation),
   )
 
 
@@ -429,7 +537,7 @@ def apply_collision_filtering(
     filtered: list[dict[str, Any]] = []
     filtered_names: set[str] = set()
 
-    for tool in state.tool_definitions:
+    for tool in state.published_tool_definitions:
       original_name = tool["name"]
       tool_name = f"{prefix}{original_name}" if prefix else original_name
       if tool_name in existing_names:
@@ -458,12 +566,14 @@ def apply_collision_filtering(
       tool_to_server[tool_name] = server_name
       if prefix:
         prefixed_to_original[tool_name] = original_name
-        tool = {**tool, "name": tool_name}
-      _apply_tool_definition_guidance(tool, original_name)
-      filtered.append(tool)
+      filtered.append(materialize_published_tool_definition(
+        tool,
+        prefix=prefix,
+        strip_input_fields=strip_input_fields,
+      ))
       filtered_names.add(tool_name)
 
-    state.tool_definitions = filtered
+    state.published_tool_definitions = filtered
     state.tool_names = filtered_names
     merged.extend(filtered)
 
@@ -474,7 +584,6 @@ def apply_collision_filtering(
       sorted(filtered_names),
     )
 
-  _strip_hidden_input_fields(merged, strip_input_fields)
   return CollisionFilterResult(
     tool_definitions=merged,
     tool_to_server=tool_to_server,
@@ -483,20 +592,27 @@ def apply_collision_filtering(
   )
 
 
-def _strip_hidden_input_fields(
-  tool_definitions: list[dict[str, Any]],
+def materialize_published_tool_definition(
+  advertised_definition: dict[str, Any],
+  *,
+  prefix: str,
   strip_input_fields: set[str],
-) -> None:
-  if not strip_input_fields:
-    return
-  for tool_def in tool_definitions:
-    schema = tool_def.get("input_schema", {})
+) -> dict[str, Any]:
+  """Project one advertised tool without changing its transport-owned input."""
+  definition = copy.deepcopy(advertised_definition)
+  original_name = definition["name"]
+  if prefix:
+    definition["name"] = f"{prefix}{original_name}"
+  _apply_tool_definition_guidance(definition, original_name)
+  if strip_input_fields:
+    schema = definition.get("input_schema", {})
     props = schema.get("properties", {})
     required = schema.get("required", [])
     for field in strip_input_fields:
       props.pop(field, None)
       if field in required:
         required.remove(field)
+  return definition
 
 
 def _append_sentence(existing: Any, addition: str) -> str:
@@ -531,4 +647,5 @@ __all__ = [
   "LogicalToolAliasResult",
   "add_logical_tool_aliases",
   "apply_collision_filtering",
+  "materialize_published_tool_definition",
 ]

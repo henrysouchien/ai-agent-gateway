@@ -287,12 +287,24 @@ def test_trust_inventory_requires_exact_retirement_and_manifest_maps() -> None:
 
 def test_verifier_freezes_mutable_trust_inputs_at_construction() -> None:
   private, public = _keypair()
-  trust = _trust(public)
+  retired_at_by_key_id = {"work-signing-v1": NOW + 60}
+  capability_required_scopes = {
+    "portfolio.review": frozenset({"read"}),
+  }
+  capability_allowed_operations = {
+    "portfolio.review": frozenset({"messages.create"}),
+  }
+  trust = _trust(
+    public,
+    retired_at_by_key_id=retired_at_by_key_id,
+    capability_required_scopes=capability_required_scopes,
+    capability_allowed_operations=capability_allowed_operations,
+  )
   verifier = WorkAuthorizationVerifier(trust, clock=lambda: NOW + 62)
 
-  trust.retired_at_by_key_id["work-signing-v1"] = NOW + 600
-  trust.capability_required_scopes["portfolio.review"] = frozenset({"trade"})
-  trust.capability_allowed_operations["portfolio.review"] = frozenset({
+  retired_at_by_key_id["work-signing-v1"] = NOW + 600
+  capability_required_scopes["portfolio.review"] = frozenset({"trade"})
+  capability_allowed_operations["portfolio.review"] = frozenset({
     "trades.execute"
   })
 

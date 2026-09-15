@@ -3,13 +3,16 @@
 This example serves the same gateway shape through `provider="openai"` on `create_agent()`.
 
 It shows the first-party, Responses-only OpenAI setup:
-`create_agent(..., provider="openai", model="gpt-5.6")`.
+`create_agent(..., provider="openai", model_key="openai.gpt-5-6")`.
 
 ## Install
 
 ```bash
 pip install "ai-agent-gateway[openai]" uvicorn
 export OPENAI_API_KEY="your-openai-api-key"
+export USER_DATA_DIR="$PWD/.agent-data"
+mkdir -p "$USER_DATA_DIR/gateway"
+chmod 700 "$USER_DATA_DIR" "$USER_DATA_DIR/gateway"
 ```
 
 `OpenAIProvider` uses `POST /v1/responses` at the official OpenAI API. Other
@@ -26,7 +29,7 @@ uvicorn agent:app --reload --port 8000
 ```bash
 SESSION_TOKEN=$(curl -s http://127.0.0.1:8000/api/chat/init \
   -H 'Content-Type: application/json' \
-  -d '{"api_key":"demo-key"}' \
+  -d '{"api_key":"demo-key","user_id":"demo-user"}' \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_token"])')
 ```
 
@@ -35,11 +38,11 @@ curl -N http://127.0.0.1:8000/api/chat \
   -H "Authorization: Bearer $SESSION_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
+    "user_id": "demo-user",
     "messages": [
       {"role": "user", "content": "Explain in two sentences why provider abstractions matter."}
     ],
-    "context": {"channel": "web"},
-    "model": "gpt-5.6"
+    "context": {"channel": "web"}
   }'
 ```
 

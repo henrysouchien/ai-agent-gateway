@@ -7,7 +7,7 @@ import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from agent_workflow_contracts import (
   AgentOperationRef,
@@ -38,7 +38,6 @@ from .runner_introspection import derive_sub_agent_id
 from .runner_session_lifecycle import _runner_attr
 from .runner_state import ChildCostAccumulator
 from .runner_sub_agents import (
-  _authoritative_child_tool_getter,
   _close_sub_runner,
   _runtime_exception_detail,
 )
@@ -52,6 +51,10 @@ from .transcript import (
   detect_orphan_tool_uses,
 )
 
+if TYPE_CHECKING:
+  from .context_builder import Message
+  from .runner import AgentRunner
+
 
 log = logging.getLogger("agent_gateway.runner")
 FORK_PLACEHOLDER = "Fork started — processing continues in the parent."
@@ -59,8 +62,6 @@ FORK_SUFFIX_WRAP_UP_REMINDER = (
   "Fork suffix limit reached. Stop expanding the investigation and finish "
   "now with a complete normal final assistant message."
 )
-DEFAULT_FORK_BUDGET_USD = 5.0
-DEFAULT_FORK_MAX_TURNS = 20
 DEFAULT_FORK_SUFFIX_MAX_TOKENS = 20_000
 FORK_SCOPE_RECEIPT_EVENT_TYPE = "fork_scope_receipt"
 FORK_MARKER_EVENT_FIELD = "fork"
@@ -95,7 +96,7 @@ _LEARNING_FORK_OPERATION = AgentOperationRef(
 class LearningForkWorkItem:
   """Runtime-only owner plus the immutable handoff retained by the registry."""
 
-  parent: Any
+  parent: AgentRunner
   handoff: ForkRequestHandoff
   ledger: ForkLedger
   session_id: str
@@ -125,7 +126,7 @@ def _bind_learning_fork_execution(
   parent = parent_execution.bind
   return BoundCapabilityExecution(
     bind=CapabilityBind.model_validate({
-      **parent.receipt(),
+      **parent.to_json(),
       "capability_id": "node.fork",
       "selection_source": "parent_binding",
     }),
@@ -148,28 +149,11 @@ def _positive_env_int(name: str, default: int) -> int:
   return value
 
 
-def fork_max_turns() -> int:
-  return _positive_env_int("HANK_FORK_MAX_TURNS", DEFAULT_FORK_MAX_TURNS)
-
-
 def fork_suffix_max_tokens() -> int:
   return _positive_env_int(
     "HANK_FORK_SUFFIX_MAX_TOKENS",
     DEFAULT_FORK_SUFFIX_MAX_TOKENS,
   )
-
-
-def fork_budget_default() -> float:
-  raw = os.getenv("HANK_FORK_BUDGET_USD")
-  if raw is None:
-    return DEFAULT_FORK_BUDGET_USD
-  try:
-    value = float(raw)
-  except (TypeError, ValueError) as exc:
-    raise ValueError("HANK_FORK_BUDGET_USD must be finite and positive") from exc
-  if value <= 0 or value == float("inf") or value != value:
-    raise ValueError("HANK_FORK_BUDGET_USD must be finite and positive")
-  return value
 
 
 def build_side_quest_tool_decisions(
@@ -276,7 +260,7 @@ class ForkPolicyDispatcher:
     self,
     dispatcher: Any,
     *,
-    wire_tools: Sequence[Mapping[str, Any]],
+    wire_tools: Sequence[dict[str, Any]],
     receipt: ForkScopeReceipt,
   ) -> None:
     self._dispatcher = dispatcher
@@ -304,8 +288,12 @@ class ForkPolicyDispatcher:
     tool_call_id: str,
     tool_name: str,
     tool_input: dict[str, Any],
+    *,
+    allow_uncertain_mcp_replay: bool = True,
     **kwargs: Any,
   ) -> tuple[Any | None, dict[str, Any] | None]:
+    if type(allow_uncertain_mcp_replay) is not bool:
+      raise TypeError("allow_uncertain_mcp_replay must be an exact bool")
     decision = self._decisions.get(str(tool_name or "").strip())
     if decision is None or decision.decision != "allow":
       normalized = str(tool_name or "").strip() or "<unknown>"
@@ -326,6 +314,7 @@ class ForkPolicyDispatcher:
       tool_call_id,
       tool_name,
       tool_input,
+      allow_uncertain_mcp_replay=allow_uncertain_mcp_replay,
       **kwargs,
     )
 
@@ -362,7 +351,7 @@ def _tool_result_ids(message: Mapping[str, Any]) -> set[str]:
 
 
 def _sanitize_earlier_orphans(
-  messages: Sequence[Mapping[str, Any]],
+  messages: Sequence[Message],
   *,
   preserve_last: bool,
   marker_message_index: int,
@@ -479,7 +468,7 @@ def _build_fork_context(
 
 
 def fork_suffix_messages(
-  messages: Sequence[Mapping[str, Any]],
+  messages: Sequence[Message],
   marker_position: tuple[int, int],
 ) -> list[dict[str, Any]]:
   message_index, block_index = marker_position
@@ -605,9 +594,8 @@ async def spawn_fork_agent(
     wire_tools=handoff.wire_tools,
     receipt=receipt,
   )
-  child_get_tool_definitions = _authoritative_child_tool_getter(
-    policy_dispatcher,
-    operation="spawn_fork_agent",
+  child_get_tool_definitions = (
+    policy_dispatcher.get_tool_definitions
   )
   sub_log.append({
     "type": FORK_SCOPE_RECEIPT_EVENT_TYPE,
@@ -881,18 +869,19 @@ async def spawn_learning_fork(
     outcome=OutcomeRequirement(required=False, source="none"),
   )
   event_log_box: list[EventLog] = []
-  parent_dispatcher = parent._dispatcher
-  dispatcher = copy.copy(parent_dispatcher)
-  local_handlers = dict(getattr(parent_dispatcher, "_local", {}))
-  base_memory_write = local_handlers.get("memory_write")
-  if not callable(base_memory_write):
-    raise RuntimeError("learning fork requires the stock memory_write handler")
-  local_handlers["memory_write"] = scope_fork_memory_write_handler(
-    base_memory_write,
-    fork_id=fork_id,
-    user_id=work_item.user_id,
-  )
-  dispatcher._local = local_handlers
+  try:
+    dispatcher = parent._dispatcher.with_scoped_local_handler(
+      "memory_write",
+      lambda stock: scope_fork_memory_write_handler(
+        stock,
+        fork_id=fork_id,
+        user_id=work_item.user_id,
+      ),
+    )
+  except KeyError:
+    raise RuntimeError(
+      "learning fork requires the stock memory_write handler"
+    ) from None
 
   budget = float(learn_fork_budget_usd())
   suffix_ceiling = fork_suffix_max_tokens()
@@ -944,8 +933,6 @@ async def spawn_learning_fork(
 
 
 __all__ = [
-  "DEFAULT_FORK_BUDGET_USD",
-  "DEFAULT_FORK_MAX_TURNS",
   "DEFAULT_FORK_SUFFIX_MAX_TOKENS",
   "FORK_PLACEHOLDER",
   "FORK_SUFFIX_WRAP_UP_REMINDER",
@@ -957,8 +944,6 @@ __all__ = [
   "build_learning_fork_tool_decisions",
   "build_side_quest_tool_decisions",
   "cross_check_learning_memory_writes",
-  "fork_budget_default",
-  "fork_max_turns",
   "fork_suffix_max_tokens",
   "fork_suffix_messages",
   "learning_fork_result_provenance",

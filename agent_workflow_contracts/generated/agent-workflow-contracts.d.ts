@@ -39,6 +39,13 @@ export type AdmittedPlanRef = {
   readonly "workflow_run_id": string;
 };
 
+/** The exact physical route retained with one admitted tool grant. */
+export type AdmittedToolRoute = {
+  readonly "origin": "local" | "mcp";
+  readonly "server_id": (string) | (null);
+  readonly "tool_id": string;
+};
+
 export type AdmittedWorkflowNodeIdentity = {
   readonly "item_key"?: (string) | (null);
   readonly "node_id": string;
@@ -57,6 +64,7 @@ export type AgentExecutionSnapshot = {
   readonly "max_tokens": number;
   readonly "max_turns"?: (number) | (null);
   readonly "persisted_methodology_state": (JsonValue) | (null);
+  readonly "provider_tool_definitions"?: (ReadonlyArray<ProviderToolDefinition>) | (null);
   readonly "result_instructions": string;
   readonly "resume_instruction"?: (string) | (null);
   readonly "resume_mechanics": AgentResumeMechanics;
@@ -420,6 +428,13 @@ export type ProjectionInline = {
   readonly "value": JsonValue;
 };
 
+/** One exact provider-facing tool definition frozen for child execution. */
+export type ProviderToolDefinition = {
+  readonly "definition": {
+  readonly [key: string]: JsonValue;
+};
+};
+
 export type PublishedInlineView = {
   readonly "complete"?: true;
   readonly "kind"?: "inline_exact";
@@ -496,6 +511,7 @@ export type SettleWithoutExecutionDisposition = {
 export type SettlementProjection = {
   readonly "execution_status": "succeeded" | "failed" | "interrupted" | "cancelled" | "skipped";
   readonly "outcome_disposition"?: ("complete" | "partial" | "insufficient_evidence" | "blocked" | "not_assessed") | (null);
+  readonly "terminal_reason"?: (string) | (null);
 };
 
 export type TaskObservation = {
@@ -738,9 +754,10 @@ export type AdmittedTask = {
   readonly "operation": AgentOperationSnapshot;
   readonly "outcome_policy": OutcomePolicy;
   readonly "result_requirement": ResultRequirement;
-  readonly "schema_version"?: "1.0";
+  readonly "schema_version"?: "1.0" | "1.1" | "1.2";
   readonly "tool_grant": ToolGrant;
   readonly "tool_grant_digest": string;
+  readonly "tool_routes"?: (ReadonlyArray<AdmittedToolRoute>) | (null);
   readonly "workflow_identity"?: (AdmittedWorkflowNodeIdentity) | (null);
   readonly "workspace_grant": WorkspaceGrant;
 };
@@ -748,7 +765,7 @@ export type AdmittedTask = {
 export type AgentCompletionEnvelope = {
   readonly "child_evidence"?: (ChildEvidenceProjection) | (null);
   readonly "message_id": string;
-  readonly "parent_materialization": (TerminalNarrativeInlineExact) | (ProjectionInline) | (AuthoredSummaryWithResultHandle) | (ResultHandle);
+  readonly "parent_materialization": ((TerminalNarrativeInlineExact) | (ProjectionInline) | (AuthoredSummaryWithResultHandle) | (ResultHandle)) | (null);
   readonly "schema_version"?: "1.0";
   readonly "settlement_projection": SettlementProjection;
   readonly "task_result_ref": TaskResultRef;

@@ -181,19 +181,32 @@ class _GatewayUserClaimBinding(NamedTuple):
 
 _gateway_user_claim_bindings: dict[
   int,
-  tuple[weakref.ReferenceType[object], _GatewayUserClaimBinding],
+  tuple[weakref.ReferenceType[GatewayUserClaimSigner], _GatewayUserClaimBinding],
 ] = {}
 _gateway_user_claim_bindings_lock = threading.Lock()
 
 
 def _discard_gateway_user_claim_binding(
   signer_identity: int,
-  signer_reference: weakref.ReferenceType[object],
+  signer_reference: weakref.ReferenceType[GatewayUserClaimSigner],
 ) -> None:
   with _gateway_user_claim_bindings_lock:
     current = _gateway_user_claim_bindings.get(signer_identity)
     if current is not None and current[0] is signer_reference:
       _gateway_user_claim_bindings.pop(signer_identity, None)
+
+
+def _gateway_user_claim_reference(
+  signer: GatewayUserClaimSigner,
+  signer_identity: int,
+) -> weakref.ReferenceType[GatewayUserClaimSigner]:
+  return weakref.ref(
+    signer,
+    lambda reference: _discard_gateway_user_claim_binding(
+      signer_identity,
+      reference,
+    ),
+  )
 
 
 def _gateway_user_claim_binding(
@@ -245,12 +258,9 @@ class GatewayUserClaimSigner:
       user_id=user_id,
     )
     signer_identity = id(self)
-    signer_reference = weakref.ref(
+    signer_reference = _gateway_user_claim_reference(
       self,
-      lambda reference: _discard_gateway_user_claim_binding(
-        signer_identity,
-        reference,
-      ),
+      signer_identity,
     )
     with _gateway_user_claim_bindings_lock:
       current = _gateway_user_claim_bindings.get(signer_identity)

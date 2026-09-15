@@ -1,5 +1,3 @@
-# ruff: noqa: E402
-
 from __future__ import annotations
 
 import asyncio
@@ -18,6 +16,8 @@ from agent_gateway import (
   ToolDispatcher,
 )
 from agent_gateway.providers import AnthropicProvider, CodexProvider, OpenAIProvider, StreamEvent, ThinkingLevel, XAIProvider
+from agent_gateway.capability_binding import CapabilityEffort
+from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.providers.base import truncate_to_last_compaction
 from agent_gateway.server_compaction import (
   CONTINUATION_NUDGE,
@@ -56,15 +56,9 @@ ANCHOR_SUMMARY = LONG_SUMMARY.strip()
 LONG_INPUT = "x" * 3_000
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
-    return False
-
-  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
-    return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
-
-  def get_tool_definitions(self) -> list[dict[str, Any]]:
-    return []
+class _NullMcpClient(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
 
 
 def _make_dispatcher(
@@ -387,7 +381,7 @@ def _run_runner(
   agent_session_log: AgentSessionLog | None = None,
   max_turns: int | None = None,
   compaction_trigger: int = 20,
-  effort: str = "high",
+  effort: CapabilityEffort = "high",
   model: str = "model",
 ) -> EventLog:
   log = event_log or EventLog()
@@ -458,7 +452,7 @@ def test_server_compaction_apply_truncate_roundtrip() -> None:
 def test_server_compaction_codex_normalize_text() -> None:
   provider = CodexProvider()
   model_info = provider.get_model_info("gpt-5.5")
-  normalized = provider.normalize_messages(
+  normalized: list[dict[str, Any]] = provider.normalize_messages(
     [{"role": "user", "content": "old"}, *apply_compaction_anchor([], LONG_SUMMARY, provider="codex", model="gpt-5.5")],
     model_info,
   )
@@ -468,7 +462,9 @@ def test_server_compaction_codex_normalize_text() -> None:
   assert all(
     not (isinstance(block, dict) and block.get("type") == "compaction")
     for message in normalized
-    for block in (message.get("content") if isinstance(message.get("content"), list) else [])
+    for block in (
+      lambda content: content if isinstance(content, list) else []
+    )(message.get("content"))
   )
 
 

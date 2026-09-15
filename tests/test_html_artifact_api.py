@@ -5,11 +5,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import sys
+from typing import Literal
 
 from fastapi.testclient import TestClient
 
 from agent_gateway.html_artifact_store import write_html_artifact
-from schema.html_artifact import HtmlArtifact, StaticExports
+from schema.html_artifact import HtmlArtifact, HtmlArtifactPurpose, StaticExports
 
 TESTS_DIR = Path(__file__).resolve().parent
 if str(TESTS_DIR) not in sys.path:
@@ -175,9 +176,9 @@ def _artifact(
   artifact_id: str,
   *,
   ticker: str | None,
-  purpose: str = "exploration",
-  origin_kind: str | None = None,
-  visibility: str | None = None,
+  purpose: HtmlArtifactPurpose = "exploration",
+  origin_kind: Literal["product", "harness", "import"] | None = None,
+  visibility: Literal["default", "sandbox", "archived"] | None = None,
 ) -> HtmlArtifact:
   return HtmlArtifact(
     artifact_id=artifact_id,

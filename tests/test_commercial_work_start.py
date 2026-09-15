@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import threading
 from types import SimpleNamespace
 from typing import Any
+from uuid import UUID
 
 from fastapi.testclient import TestClient
 import pytest
 
+from agent_gateway import AgentRunner, EventLog
 from agent_gateway.capability_binding import (
   CredentialHandle,
 )
@@ -21,7 +24,15 @@ from agent_gateway.model_registry import (
   INITIAL_MODEL_REGISTRY,
   INITIAL_MODEL_SELECTION_POLICY,
 )
-from agent_gateway.commercial_claims import CommercialClaimError
+from agent_gateway.commercial_claims import (
+  CommercialClaimError,
+  CommercialClaimVerifier,
+  VerifiedCommercialClaim,
+)
+from agent_gateway.commercial_work_authorization import (
+  VerifiedWorkAuthorization,
+  WorkAuthorizationVerifier,
+)
 from agent_gateway.commercial_work_start import (
   COMMERCIAL_CLAIM_HEADER,
   COMMERCIAL_WORK_AUTHORIZATION_HEADER,
@@ -41,6 +52,8 @@ from agent_gateway.work_authorization_consumption import (
   WorkAuthorizationAlreadyAttached,
   WorkAuthorizationConsumptionConflict,
   WorkAuthorizationConsumptionError,
+  WorkAuthorizationConsumptionRecord,
+  WorkAuthorizationConsumptionStore,
 )
 
 
@@ -54,6 +67,90 @@ _SERVICE_HANDLE = CredentialHandle(
   tenant_id="commercial-work-start-tests",
   actor_id=None,
 )
+
+def _verified_claim() -> VerifiedCommercialClaim:
+  return VerifiedCommercialClaim(
+    schema_version=1,
+    key_id="test-key",
+    subject="user:101",
+    environment="dev",
+    surface="mcp",
+    commercial_account_id=UUID(int=1),
+    agreement_id=UUID(int=2),
+    agreement_terms_revision=1,
+    offer_code="test-offer",
+    effective_scopes=("portfolio.review",),
+    entitlement_revision=1,
+    payer_policy_version="payer-v1",
+    budget_policy_version="budget-v1",
+    shadow_rate_version="shadow-v1",
+    manifest_version="manifest-v1",
+    authorized_work_start_deadline=2_000_000_000,
+    usage_accept_until=2_000_000_100,
+    issued_at=1_900_000_000,
+    expires_at=2_000_000_000,
+    context_id=UUID(int=3),
+  )
+
+
+def _verified_authorization(
+  *,
+  request_id: str = "request-1",
+) -> VerifiedWorkAuthorization:
+  return VerifiedWorkAuthorization(
+    schema_version=1,
+    key_id="test-key",
+    token_sha256=f"token-{request_id}",
+    authorization_id=UUID(int=4),
+    environment="dev",
+    execution_context_id=UUID(int=5),
+    workflow_run_id=UUID(int=6),
+    workflow_attempt_group_id=UUID(int=7),
+    workflow_attempt_number=1,
+    retry_of_workflow_run_id=None,
+    workflow_attempt_kind="initial",
+    primary_inference_observability="standard",
+    funding_route_id=UUID(int=8),
+    provider="anthropic",
+    billing_mode="metered",
+    reservation_id=None,
+    operation="messages.create",
+    capability_id="portfolio.review",
+    request_id=request_id,
+    session_id="session-1",
+    issued_at=1_900_000_000,
+    expires_at=2_000_000_000,
+  )
+
+
+def _consumption_record() -> WorkAuthorizationConsumptionRecord:
+  authorization = _verified_authorization()
+  return WorkAuthorizationConsumptionRecord(
+    authorization_id=authorization.authorization_id,
+    schema_version=authorization.schema_version,
+    token_sha256=authorization.token_sha256,
+    content_sha256="content-sha256",
+    key_id=authorization.key_id,
+    environment="dev",
+    execution_context_id=authorization.execution_context_id,
+    workflow_run_id=authorization.workflow_run_id,
+    workflow_attempt_group_id=authorization.workflow_attempt_group_id,
+    workflow_attempt_number=authorization.workflow_attempt_number,
+    retry_of_workflow_run_id=authorization.retry_of_workflow_run_id,
+    workflow_attempt_kind=authorization.workflow_attempt_kind,
+    primary_inference_observability=authorization.primary_inference_observability,
+    funding_route_id=authorization.funding_route_id,
+    provider=authorization.provider,
+    billing_mode=authorization.billing_mode,
+    reservation_id=authorization.reservation_id,
+    operation=authorization.operation,
+    capability_id=authorization.capability_id,
+    request_id=authorization.request_id,
+    session_id=authorization.session_id,
+    issued_at=authorization.issued_at,
+    expires_at=authorization.expires_at,
+    attached_at="2026-01-01T00:00:00+00:00",
+  )
 
 
 def _materialize_service_credential(
@@ -114,13 +211,24 @@ def _gateway_config(
   )
 
 
-class _ClaimVerifier:
-  def __init__(self, order: list[str], claim: object) -> None:
+class _ClaimVerifier(CommercialClaimVerifier):
+  def __init__(
+    self,
+    order: list[str],
+    claim: VerifiedCommercialClaim,
+  ) -> None:
     self.order = order
     self.claim = claim
     self.error: Exception | None = None
 
-  def verify_for_work_start(self, token: str):
+  def verify_for_work_start(
+    self,
+    token: str,
+    *,
+    now: int | None = None,
+    require_live_context: bool = False,
+  ) -> VerifiedCommercialClaim:
+    _ = now, require_live_context
     self.order.append("verify_claim")
     assert token == CLAIM_TOKEN
     if self.error is not None:
@@ -128,40 +236,72 @@ class _ClaimVerifier:
     return self.claim
 
 
-class _AuthorizationVerifier:
-  def __init__(self, order: list[str], authorization: object) -> None:
+class _AuthorizationVerifier(WorkAuthorizationVerifier):
+  def __init__(
+    self,
+    order: list[str],
+    authorization: VerifiedWorkAuthorization,
+  ) -> None:
     self.order = order
     self.authorization = authorization
-    self.calls: list[dict[str, Any]] = []
+    self.calls: list[dict[str, object]] = []
 
-  def verify_for_attach(self, token: str, **facts):
+  def verify_for_attach(
+    self,
+    token: str,
+    *,
+    execution_claim: VerifiedCommercialClaim,
+    request_id: str,
+    session_id: str,
+    operation: str,
+    provider: str,
+    billing_mode: str,
+    capability_id: str | None,
+  ) -> VerifiedWorkAuthorization:
     self.order.append("verify_authorization")
     assert token in {WORK_TOKEN, WORK_TOKEN_2}
+    facts: dict[str, object] = {
+      "execution_claim": execution_claim,
+      "request_id": request_id,
+      "session_id": session_id,
+      "operation": operation,
+      "provider": provider,
+      "billing_mode": billing_mode,
+      "capability_id": capability_id,
+    }
     self.calls.append(facts)
-    return SimpleNamespace(
-      name=f"{self.authorization.name}:{len(self.calls)}:{facts['request_id']}"
+    return replace(
+      self.authorization,
+      token_sha256=f"token-{len(self.calls)}",
+      request_id=request_id,
     )
 
 
-class _ConsumptionStore:
-  def __init__(self, order: list[str], record: object) -> None:
+class _ConsumptionStore(WorkAuthorizationConsumptionStore):
+  def __init__(
+    self,
+    order: list[str],
+    record: WorkAuthorizationConsumptionRecord,
+  ) -> None:
     self.order = order
     self.record = record
     self.error: Exception | None = None
-    self.attached: list[object] = []
+    self.attached: list[VerifiedWorkAuthorization] = []
 
-  def attach_once(self, authorization):
+  def attach_once(
+    self,
+    authorization: VerifiedWorkAuthorization,
+  ) -> WorkAuthorizationConsumptionRecord:
     self.order.append("consume")
     self.attached.append(authorization)
     if self.error is not None:
       raise self.error
     return self.record
 
-
 def _gate(order: list[str], *, pre_consume=None):
-  claim = SimpleNamespace(name="verified-claim", subject="user:101")
-  authorization = SimpleNamespace(name="verified-authorization")
-  record = SimpleNamespace(name="consumption-record")
+  claim = _verified_claim()
+  authorization = _verified_authorization()
+  record = _consumption_record()
   claim_verifier = _ClaimVerifier(order, claim)
   authorization_verifier = _AuthorizationVerifier(order, authorization)
   store = _ConsumptionStore(order, record)
@@ -187,6 +327,12 @@ def _gate(order: list[str], *, pre_consume=None):
     pre_consume=pre_consume,
   )
   return gate, claim_verifier, authorization_verifier, store
+
+
+def _require_raw_child_provider(work_start, provider):
+  return require_commercial_child_provider(work_start, provider)
+
+
 
 
 def _request_facts():
@@ -307,9 +453,9 @@ def test_gate_runs_durability_preflight_before_consuming_authority() -> None:
 
 def test_child_provider_must_match_verified_root_authority() -> None:
   work_start = CommercialWorkStartContext(
-    claim=SimpleNamespace(),
-    authorization=SimpleNamespace(provider="anthropic"),
-    consumption=SimpleNamespace(),
+    claim=_verified_claim(),
+    authorization=_verified_authorization(),
+    consumption=_consumption_record(),
   )
 
   require_commercial_child_provider(work_start, "anthropic")
@@ -319,7 +465,7 @@ def test_child_provider_must_match_verified_root_authority() -> None:
   assert mismatch.value.status_code == 403
 
   with pytest.raises(CommercialWorkStartError) as invalid:
-    require_commercial_child_provider(SimpleNamespace(), "anthropic")
+    _require_raw_child_provider(SimpleNamespace(), "anthropic")
   assert invalid.value.code == "commercial_child_authority_invalid"
   assert invalid.value.status_code == 503
 
@@ -343,7 +489,7 @@ def test_gate_maps_invalid_replay_conflict_and_storage_failure_to_no_start() -> 
   )
   cases = (
     (
-      WorkAuthorizationAlreadyAttached(SimpleNamespace()),
+      WorkAuthorizationAlreadyAttached(_consumption_record()),
       "commercial_work_authority_already_consumed",
       409,
     ),
@@ -366,10 +512,10 @@ def test_gate_maps_invalid_replay_conflict_and_storage_failure_to_no_start() -> 
     assert raised.value.status_code == status
 
 
-class _CompleteRunner:
+class _CompleteRunner(AgentRunner):
   def __init__(
     self,
-    event_log,
+    event_log: EventLog,
     order: list[str],
     delay: float,
     capability_execution,
@@ -377,14 +523,24 @@ class _CompleteRunner:
     self._event_log = event_log
     self._order = order
     self._delay = delay
-    self.capability_execution = capability_execution
+    self._capability_execution = capability_execution
 
-  async def run(self, **_kwargs) -> None:
+  def bind_selected_content(self, bindings) -> None:
+    _ = bindings
+
+  async def run(
+    self,
+    messages,
+    system_prompt=None,
+    max_turns=None,
+    *,
+    resume_initial_messages=None,
+  ) -> None:
+    _ = messages, system_prompt, max_turns, resume_initial_messages
     self._order.append("provider_start")
     if self._delay:
       await asyncio.sleep(self._delay)
     self._event_log.append({"type": "stream_complete", "usage": {}})
-
 
 def _server_app(tmp_path: Path, *, provider_delay: float = 0):
   order: list[str] = []
@@ -404,7 +560,7 @@ def _server_app(tmp_path: Path, *, provider_delay: float = 0):
 
   gate._facts_resolver = facts_resolver
 
-  async def build_runtime(_session, request, _channel, _auth_manager):
+  async def build_runtime(_session, request, _channel, _auth_manager, *, storage_root: Path | None = None):
     order.append("runtime")
     observed_contexts.append(request.commercial_work_start)
     assert order.index("consume") < order.index("runtime")
@@ -502,7 +658,7 @@ def test_server_rejects_missing_or_replayed_authority_before_runtime(
     assert missing.json()["error"] == "commercial_work_authority_required"
     assert "runtime" not in order
 
-    store.error = WorkAuthorizationAlreadyAttached(SimpleNamespace())
+    store.error = WorkAuthorizationAlreadyAttached(_consumption_record())
     replay = client.post(
       "/api/chat",
       headers=_chat_headers(token),
@@ -670,7 +826,7 @@ def _nested_string_values(value: object) -> list[str]:
 def test_unconfigured_server_rejects_commercial_headers() -> None:
   runtime_calls: list[str] = []
 
-  async def build_runtime(*_args, **_kwargs):
+  async def build_runtime(*_args, storage_root: Path | None = None, **_kwargs):
     runtime_calls.append("runtime")
     raise AssertionError("runtime must not be constructed")
 

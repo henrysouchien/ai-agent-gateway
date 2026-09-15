@@ -21,6 +21,7 @@ from agent_gateway.sub_agent_result_contract import (
   CompactReport,
   ContractValidationError,
   ContractValidationResult,
+  Finding,
   FinalNarrativeArtifactReference,
   FmsArtifactReference,
   REPORT_FINDINGS_MAX_ITEMS,
@@ -97,14 +98,14 @@ def test_report_contracts_enforce_semantic_shape_and_caps() -> None:
   with pytest.raises(ValidationError):
     CompactReport(
       summary="bounded",
-      findings=[{"claim": "finding"}] * (REPORT_FINDINGS_MAX_ITEMS + 1),
+      findings=[Finding(claim="finding")] * (REPORT_FINDINGS_MAX_ITEMS + 1),
     )
 
   with pytest.raises(ValidationError):
     VerifyFindingReport(
-      **_compact_payload(),
+      summary="The filing supports the claim.",
       target_claim="Revenue accelerated.",
-      verdict="mostly_supported",
+      verdict="mostly_supported",  # pyright: ignore[reportArgumentType]  # negative: illegal verdict rejection
       recommended_action="keep",
     )
 
@@ -152,6 +153,42 @@ def test_narrative_task_result_keeps_exact_unbounded_terminal_handle() -> None:
   assert result.values.terminal_narrative.content_bytes == len(text.encode("utf-8"))
   assert result.evidence.tools_used == ("web_search", "read_file")
   assert result.observation.usage.cost_usd == 0.125
+
+
+def test_runtime_projection_satisfies_success_without_model_narrative() -> None:
+  value = {
+    "tool_name": "fms_propose_demo",
+    "result": {"status": "staged", "proposal_id": "proposal-1"},
+  }
+  result = _build(
+    terminal_narrative=None,
+    runtime_projection=canonical_projection(
+      contract=report_contract_ref("terminal-tool-result-v1"),
+      value=value,
+    ),
+  )
+
+  assert result.execution.status == "succeeded"
+  assert result.values.terminal_narrative is None
+  assert result.values.projection is not None
+  assert result.values.projection.inline_view == value
+
+
+def test_runtime_projection_does_not_relax_authored_projection_contract() -> None:
+  runtime_projection = canonical_projection(
+    contract=report_contract_ref("terminal-tool-result-v1"),
+    value={"tool_name": "fms_propose_demo", "result": {"status": "ok"}},
+  )
+  authored_projection = canonical_projection(
+    contract=report_contract_ref("report-base-v1"),
+    value={"summary": "authored"},
+  )
+
+  with pytest.raises(ValueError, match="both authored and runtime"):
+    _build(
+      projection=authored_projection,
+      runtime_projection=runtime_projection,
+    )
 
 
 def test_evidence_admission_is_bounded_and_never_materializes_cycles() -> None:
@@ -241,26 +278,31 @@ def test_runtime_outcome_rejects_any_non_mechanical_assessment_source() -> None:
     with pytest.raises(ValueError, match="must be mechanically derived"):
       _build(
         runtime_outcome=AnalyticalOutcome(
-          disposition=disposition,  # type: ignore[arg-type]
-          assessment_source=source,  # type: ignore[arg-type]
+          disposition=disposition,
+          assessment_source=source,
         )
       )
 
 
-def test_non_succeeded_settlement_cannot_carry_a_runtime_outcome() -> None:
-  # T3-I08: non-succeeded results carry no outcome, structurally.
-  with pytest.raises(ValueError, match="non-successful execution cannot carry"):
-    _build(
-      execution=ExecutionSettlement(
-        status="failed",
-        terminal_reason="run_error: boom",
-      ),
-      terminal_narrative=None,
-      runtime_outcome=AnalyticalOutcome(
-        disposition="complete",
-        assessment_source="mechanically_derived",
-      ),
-    )
+def test_failed_named_operation_can_carry_blocked_runtime_outcome() -> None:
+  derived = AnalyticalOutcome(
+    disposition="blocked",
+    assessment_source="mechanically_derived",
+    assessment_rationale="Named agent-operation ended without invoking its declared terminal door",
+    unmet_requirements=("fms_report_build_model",),
+  )
+
+  result = _build(
+    execution=ExecutionSettlement(
+      status="failed",
+      terminal_reason="terminal_door_not_invoked: door missing",
+    ),
+    terminal_narrative=None,
+    runtime_outcome=derived,
+  )
+
+  assert result.execution.status == "failed"
+  assert result.outcome == derived
 
 
 def test_authored_outcome_door_stays_welded_shut() -> None:

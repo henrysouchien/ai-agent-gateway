@@ -17,7 +17,17 @@ from agent_gateway.model_registry import (
   INITIAL_MODEL_SELECTION_POLICY,
 )
 from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
+from agent_gateway.event_log import EventLog
+from agent_gateway.runner import AgentRunner
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
+
+
+def _unused_runner(
+  _event_log: EventLog,
+  _session_id: str,
+  _started_at: float,
+) -> AgentRunner:
+  raise AssertionError("artifact API tests never run a chat turn")
 
 
 HMAC_KEY = "artifact-api-test-hmac-key-at-least-32-bytes"
@@ -46,10 +56,10 @@ def artifact_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ArtifactApi
   monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
   monkeypatch.setenv("AGENT_API_CLAIM_MAX_TTL_SECONDS", "600")
 
-  async def _build_chat_runtime(_session, request, _channel, _auth_manager):
+  async def _build_chat_runtime(_session, request, _channel, _auth_manager, *, storage_root: Path | None = None):
     return ChatRuntime(
       system_prompt="test",
-      build_runner=lambda *_args: None,
+      build_runner=_unused_runner,
       capability_execution=request.capability_execution,
     )
 

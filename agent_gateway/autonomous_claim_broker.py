@@ -12,12 +12,12 @@ import time
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from .autonomous_admission_ledger import (
-  AutonomousAdmissionRecord,
-  AutonomousAdmissionLedgerError,
-  AutonomousAdmissionLedgerIdentity,
-  OrdinaryAutonomousAdmissionReceipt,
-  consume_ordinary_autonomous_launch_once,
+from .launch_nonce_store import (
+  ConsumedLaunchNonce,
+  LaunchNonceStoreError,
+  LaunchNonceStoreIdentity,
+  LaunchNonceFacts,
+  consume_launch_nonce,
 )
 from .autonomous_launch_envelope import (
   AutonomousLaunchEnvelope,
@@ -491,17 +491,17 @@ class AutonomousClaimBroker:
           "autonomous claim broker admission binding is invalid"
         )
       envelope = self._binding.envelope
-      ordinary_admission = consume_ordinary_autonomous_launch_once(
-        AutonomousAdmissionLedgerIdentity.from_verified_envelope(
+      ordinary_admission = consume_launch_nonce(
+        LaunchNonceStoreIdentity.from_verified_envelope(
           envelope
         ),
-        OrdinaryAutonomousAdmissionReceipt.from_verified_envelope(
+        LaunchNonceFacts.from_verified_envelope(
           envelope
         ),
       )
-      if type(ordinary_admission) is not AutonomousAdmissionRecord:
+      if type(ordinary_admission) is not ConsumedLaunchNonce:
         raise AutonomousClaimBrokerError(
-          "autonomous claim broker admission ledger returned "
+          "autonomous claim broker launch nonce store returned "
           "invalid authority"
         )
       _send_frame(
@@ -513,7 +513,7 @@ class AutonomousClaimBroker:
           "ok": True,
           "op": "admit",
           "ordinary_admission": (
-            ordinary_admission.authority_receipt()
+            ordinary_admission.to_wire()
           ),
           "task_id": envelope.task_id,
           "user_email": self._binding.user_email,
@@ -588,7 +588,7 @@ class AutonomousClaimBroker:
         )
         request_count += 1
       self._reject("request_limit_exhausted")
-    except (AutonomousClaimBrokerError, AutonomousAdmissionLedgerError):
+    except (AutonomousClaimBrokerError, LaunchNonceStoreError):
       self._reject("broker_rejected_request")
     except (OSError, ValueError):
       self._reject("broker_failure")
@@ -606,7 +606,7 @@ class AutonomousClaimSigner:
     "_envelope",
     "_io_timeout_seconds",
     "_lock",
-    "_ordinary_admission",
+    "_consumed_launch_nonce",
     "_socket",
     "_task_id",
     "_user_email",
@@ -713,12 +713,12 @@ class AutonomousClaimSigner:
       ordinary_admission_payload = response["ordinary_admission"]
       try:
         ordinary_admission = (
-          AutonomousAdmissionRecord.from_authority_receipt(
+          ConsumedLaunchNonce.from_wire(
             ordinary_admission_payload
           )
         )
-        expected_receipt = (
-          OrdinaryAutonomousAdmissionReceipt.from_verified_envelope(
+        expected_facts = (
+          LaunchNonceFacts.from_verified_envelope(
             envelope
           )
         )
@@ -726,13 +726,13 @@ class AutonomousClaimSigner:
         raise AutonomousClaimBrokerError(
           "autonomous claim broker ordinary admission is invalid"
         ) from exc
-      if ordinary_admission.receipt != expected_receipt:
+      if ordinary_admission.facts != expected_facts:
         raise AutonomousClaimBrokerError(
           "autonomous claim broker ordinary admission changed "
           "launch authority"
         )
       self._envelope = envelope
-      self._ordinary_admission = ordinary_admission
+      self._consumed_launch_nonce = ordinary_admission
       self._task_id = envelope.task_id
       self._control_run_id = envelope.control_run_id
       self._channel_id = envelope.channel_id
@@ -748,10 +748,10 @@ class AutonomousClaimSigner:
     return self._envelope
 
   @property
-  def consumed_ordinary_admission(
+  def consumed_launch_nonce(
     self,
-  ) -> AutonomousAdmissionRecord:
-    return self._ordinary_admission
+  ) -> ConsumedLaunchNonce:
+    return self._consumed_launch_nonce
 
   @property
   def user_id(self) -> str:

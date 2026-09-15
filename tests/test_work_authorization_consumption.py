@@ -151,7 +151,7 @@ def test_attach_rechecks_expiry_after_verification(tmp_path) -> None:
   assert store.health()["consumption_count"] == 0
 
   with pytest.raises(TypeError):
-    store.attach_once(authority, attached_at=NOW)
+    store.attach_once(authority, attached_at=NOW)  # pyright: ignore[reportCallIssue]  # negative: forged attachment timestamp rejection
 
 
 def test_fsync_crossing_expiry_returns_no_allow_and_consumes_authority(tmp_path) -> None:
@@ -220,7 +220,7 @@ def test_store_configuration_is_fail_closed(tmp_path, busy_timeout) -> None:
     )
   with pytest.raises(ValueError, match="synchronous"):
     WorkAuthorizationConsumptionStore(
-      tmp_path / "usage.sqlite3", synchronous="NORMAL"
+      tmp_path / "usage.sqlite3", synchronous="NORMAL"  # pyright: ignore[reportArgumentType]  # negative: unsupported SQLite mode rejection
     )
 
 

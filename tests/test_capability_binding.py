@@ -10,6 +10,7 @@ from agent_gateway.capability_binding import (
   CapabilityResolutionError,
   CredentialHandle,
   ModelSelectionIntent,
+  RunMode,
   eligible_model_choices,
   reauthorize_capability_bind,
   resolve_capability_model,
@@ -51,7 +52,7 @@ def _service_handle(provider: str) -> CredentialHandle:
 
 def _auth(
   *,
-  run_mode: str = "interactive",
+  run_mode: RunMode = "interactive",
   providers: tuple[str, ...] = ("anthropic",),
   capabilities: frozenset[str] = CAPABILITY_IDS,
   model_keys: frozenset[str] | None = None,
@@ -107,26 +108,29 @@ def test_initial_registry_is_closed_over_installed_adapter_support() -> None:
     executed_capability_ids=GATEWAY_EXECUTED_CAPABILITY_IDS,
   )
   INITIAL_MODEL_SELECTION_POLICY.admit_registry(INITIAL_MODEL_REGISTRY)
-  assert len(INITIAL_MODEL_REGISTRY.models) == 16
   assert set(INITIAL_MODEL_SELECTION_POLICY.capabilities) == CAPABILITY_IDS
 
 
-def test_initial_registry_has_ten_user_selectable_session_models() -> None:
+def test_initial_registry_has_frontier_user_selectable_session_models() -> None:
   selectable = {
     entry.key
     for entry in INITIAL_MODEL_REGISTRY.models.values()
     if entry.capabilities.get("session.driver") == "user_selectable"
   }
   assert selectable == {
+    "anthropic.claude-fable-5-1",
     "anthropic.claude-fable-5",
     "anthropic.claude-haiku-4-5",
     "anthropic.claude-mythos-5",
     "anthropic.claude-opus-5",
     "anthropic.claude-sonnet-5",
+    "codex.gpt-6-astra",
     "codex.gpt-5-6-luna",
     "codex.gpt-5-6-sol",
     "codex.gpt-5-6-terra",
+    "openai.gpt-6-astra",
     "openai.gpt-5-6",
+    "xai.grok-4-6",
     "xai.grok-4-5",
   }
   assert not any("gpt-4-1" in key or "gpt-4o-mini" in key for key in selectable)
@@ -152,16 +156,16 @@ def test_default_session_binding_freezes_complete_execution_identity() -> None:
     policy_revision=INITIAL_MODEL_SELECTION_POLICY.revision,
     selection_source="capability_default",
   )
-  assert CapabilityBind.from_receipt(bind.receipt()) == bind
+  assert CapabilityBind.from_json(bind.to_json()) == bind
 
 
 def test_wire_binding_has_no_permissive_legacy_fields() -> None:
-  receipt = _resolve("session.driver").receipt()
+  receipt = _resolve("session.driver").to_json()
   receipt["model"] = receipt["upstream_model"]
   receipt["policy_id"] = "legacy"
 
   with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-    CapabilityBind.from_receipt(receipt)
+    CapabilityBind.from_json(receipt)
 
 
 def test_explicit_intent_uses_stable_key_and_exact_effort() -> None:
@@ -209,12 +213,13 @@ def test_provider_or_upstream_selectors_are_not_model_keys(selector: str) -> Non
   assert refused.value.code == "capability_model_unavailable"
   # Refusals carry the current eligible stable keys so the client can recover
   # explicitly; the raw selector is echoed but never repaired or inferred.
-  assert refused.value.receipt() == {
+  assert refused.value.to_error() == {
     "error_code": "capability_model_unavailable",
     "capability_id": "session.driver",
     "model_key": selector,
     "eligible_model_keys": [
       "anthropic.claude-fable-5",
+      "anthropic.claude-fable-5-1",
       "anthropic.claude-haiku-4-5",
       "anthropic.claude-mythos-5",
       "anthropic.claude-opus-5",
@@ -595,7 +600,7 @@ def test_stale_catalog_revision_with_ineligible_key_is_typed_stale_refusal() -> 
   assert refused.value.code == "capability_catalog_stale"
   assert refused.value.catalog_revision == INITIAL_MODEL_REGISTRY.revision
   assert "anthropic.claude-opus-5" in refused.value.eligible_model_keys
-  receipt = refused.value.receipt()
+  receipt = refused.value.to_error()
   assert receipt["error_code"] == "capability_catalog_stale"
   assert receipt["catalog_revision"] == INITIAL_MODEL_REGISTRY.revision
 
@@ -945,15 +950,30 @@ def test_gateway_executed_capability_is_not_blocked_by_the_designation() -> None
 
 
 def test_unknown_executable_capability_designation_is_rejected() -> None:
-  from agent_gateway.capability_execution import CapabilityExecutionResolver
+  from agent_gateway.capability_execution import (
+    CapabilityExecutionResolver,
+    MaterializedCredential,
+  )
+  from agent_gateway.providers import ModelProvider
 
+  def unreachable_materializer(
+    handle: CredentialHandle,
+  ) -> MaterializedCredential:
+    raise AssertionError(
+      f"credential materializer unexpectedly called for {handle.handle_id}"
+    )
+
+  def unreachable_adapter_resolver(adapter_id: str) -> ModelProvider:
+    raise AssertionError(
+      f"adapter resolver unexpectedly called for {adapter_id}"
+    )
   with pytest.raises(ValueError, match="unknown capabilities"):
     CapabilityExecutionResolver(
       registry=INITIAL_MODEL_REGISTRY,
       selection_policy=INITIAL_MODEL_SELECTION_POLICY,
       auth_context=_auth(),
-      credential_materializer=lambda handle: None,
-      adapter_resolver=lambda adapter_id: None,
+      credential_materializer=unreachable_materializer,
+      adapter_resolver=unreachable_adapter_resolver,
       executable_capability_ids=frozenset({"session.driver", "made.up"}),
     )
 

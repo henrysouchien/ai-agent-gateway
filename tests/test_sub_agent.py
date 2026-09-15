@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import JsonValue
 
 from agent_workflow_contracts import (
   ActivityHandle,
@@ -19,6 +20,7 @@ from agent_workflow_contracts import (
   ContentHandle,
   ContractRef,
   ExecutionSettlement,
+  ResolvedAuthority,
   SemanticCapabilityRequirement,
   TaskObservation,
   TaskResult,
@@ -30,11 +32,19 @@ from agent_workflow_contracts import (
   sha256_digest,
 )
 from agent_workflow_contracts.ticker_contract import TICKER_INPUT_CONTRACT
+from agent_gateway.capability_execution import CapabilityExecutionResolver
 from agent_gateway.agent_result_content import (
   make_get_agent_result_content_handler,
 )
 from agent_gateway.agent_session_log import AgentSessionLog
+from agent_gateway.approval_route import (
+  DurableLocalApprovalRoute,
+  bind_session_approval_route,
+)
 from agent_gateway.event_log import EventLog
+from agent_gateway.runner_background_tasks import (
+  ParentResultMaterializationError,
+)
 from agent_gateway.final_narrative_artifact import publish_final_narrative
 from agent_gateway.operation_catalog import (
   OperationRuntimePolicy,
@@ -43,7 +53,7 @@ from agent_gateway.operation_catalog import (
 from agent_gateway.operation_snapshot import build_agent_operation_snapshot
 from agent_gateway.tool_dispatcher_helpers import ToolExecutionContext
 from agent_gateway.session import GatewaySession
-from agent_gateway.skills import SkillLoader
+from agent_gateway.skills import SkillLoader, operation_tool_ids
 from agent_gateway.sub_agent import (
   _ticker_admitted_input,
   _ticker_from_admitted_inputs,
@@ -55,14 +65,27 @@ from agent_gateway.sub_agent import (
   make_resume_tool_def,
   make_resume_handler,
 )
-from agent_gateway.sub_agent_helpers import _resolve_context_ticker
-from agent_gateway.sub_agent_scope_receipt import ADMITTED_TASK_METADATA_KEY
+from agent_gateway.sub_agent_helpers import (
+  _catalog_operation_entries,
+  _resolve_context_ticker,
+)
+from agent_gateway.capability_resolution import granted_tool_ids
+from agent_gateway.sub_agent_scope_receipt import (
+  ADMITTED_TASK_METADATA_KEY,
+  admit_operation_tools,
+)
 from agent_gateway.sub_agent_result_contract import (
   terminal_narrative_content_handle,
 )
+from agent_gateway.sub_agent_narrative_result import task_result_from_execution
 from agent_gateway.sub_agent_skill_events import (
   DurableSkillEventPersistenceError,
   SkillRunEventEmitter,
+)
+from agent_gateway.tool_definition import (
+  LiveToolRouteBinding,
+  LiveToolRouteKind,
+  OriginatedToolDefinition,
 )
 from tests.capability_execution_test_support import (
   stub_capability_execution_resolver,
@@ -73,13 +96,38 @@ async def _tool(_tool_input: dict[str, Any], **_kwargs: Any):
   return {"ok": True}, None
 
 
+def _mcp_route_binding(
+  *,
+  server_id: str,
+  logical_name: str,
+  exposed_name: str,
+  transport_server_id: str | None = None,
+  provider_original_name: str | None = None,
+  route_kind: LiveToolRouteKind = "physical",
+) -> LiveToolRouteBinding:
+  return LiveToolRouteBinding(
+    originated_definition=OriginatedToolDefinition(
+      definition={
+        "name": exposed_name,
+        "description": "Exact live test route.",
+        "input_schema": {"type": "object"},
+      },
+      origin="mcp",
+      server_id=server_id,
+    ),
+    route_kind=route_kind,
+    logical_name=logical_name,
+    transport_server_id=transport_server_id or server_id,
+    provider_original_name=provider_original_name or logical_name,
+    provider_id=None,
+  )
+
+
 class _McpClient:
-  @staticmethod
-  def is_mcp_tool(_name: str) -> bool:
+  def is_mcp_tool(self, _name: str) -> bool:
     return False
 
-  @staticmethod
-  def get_tool_definitions() -> list[dict[str, Any]]:
+  def get_tool_definitions(self) -> list[dict[str, Any]]:
     return []
 
   async def call_tool(self, name: str, _tool_input: dict[str, Any]):
@@ -87,20 +135,21 @@ class _McpClient:
 
 
 class _InvestmentMcpClient(_McpClient):
-  @staticmethod
-  def is_mcp_tool(name: str) -> bool:
+  def is_mcp_tool(self, name: str) -> bool:
     return name == "start_quant_research"
 
-  @staticmethod
-  def get_server_for_tool(name: str) -> str | None:
+  def get_server_for_tool(self, name: str) -> str | None:
     return (
       "idea-workbench-mcp"
       if name == "start_quant_research"
       else None
     )
 
-  @staticmethod
+  def get_policy_tool_name(self, name: str) -> str | None:
+    return name if name == "start_quant_research" else None
+
   def get_server_tool_definitions(
+    self,
     server_names: set[str],
   ) -> list[dict[str, Any]]:
     if "idea-workbench-mcp" not in server_names:
@@ -111,25 +160,35 @@ class _InvestmentMcpClient(_McpClient):
       "input_schema": {"type": "object"},
     }]
 
-  @staticmethod
-  def get_tool_definitions() -> list[dict[str, Any]]:
-    return _InvestmentMcpClient.get_server_tool_definitions({
-      "idea-workbench-mcp"
-    })
+  def get_tool_definitions(self) -> list[dict[str, Any]]:
+    return self.get_server_tool_definitions({"idea-workbench-mcp"})
 
 
-class _CapabilityResolver:
+class _CapabilityResolver(CapabilityExecutionResolver):
+  __slots__ = ("calls",)
+  calls: list[dict[str, Any]]
+
   def __init__(self) -> None:
-    self._resolver = stub_capability_execution_resolver(
+    resolver = stub_capability_execution_resolver(
       default_provider="openai",
       default_model="gpt-5.6-sol",
       default_effort="high",
     )
-    self.calls: list[dict[str, Any]] = []
+    super().__init__(
+      registry=resolver.registry,
+      selection_policy=resolver.selection_policy,
+      auth_context=resolver.auth_context,
+      credential_materializer=resolver.credential_materializer,
+      adapter_resolver=resolver.adapter_resolver,
+      trusted_channel=resolver.trusted_channel,
+      authenticated_run_overrides=resolver.authenticated_run_overrides,
+      executable_capability_ids=resolver.executable_capability_ids,
+    )
+    object.__setattr__(self, "calls", [])
 
   def resolve(self, capability_id: str, **kwargs: Any) -> Any:
     self.calls.append({"capability_id": capability_id, **kwargs})
-    return self._resolver.resolve(capability_id, **kwargs)
+    return super().resolve(capability_id, **kwargs)
 
 
 def _content(
@@ -176,7 +235,7 @@ def _spawn_result(kwargs: dict[str, Any]) -> TaskResult:
   )
   projection = None
   if requirement.projection is not None:
-    inline = {"summary": "Canonical child summary."}
+    inline: JsonValue = {"summary": "Canonical child summary."}
     projection = CanonicalProjection(
       contract=requirement.projection.contract,
       content=_content(inline, requirement.projection.contract),
@@ -245,7 +304,7 @@ class _Runner:
   async def spawn_sub_agent(self, task: str, **kwargs: Any):
     call = {"task": task, **kwargs}
     self.spawn_calls.append(call)
-    return _spawn_result(call).model_dump(mode="json"), None
+    return _spawn_result(call), None
 
   async def _register_background_task(self, **kwargs: Any):
     self.background_calls.append(dict(kwargs))
@@ -291,8 +350,7 @@ def _handler(
     channel="cli",
     auth_config={"provider": "openai", "api_key": "opaque"},
   )
-  parent_session.approval_store = approval_store
-  parent_session.approval_policy = approval_policy
+  bind_session_approval_route(parent_session, approval_store, approval_policy)
   parent_session.approved_tool_types = set(approved_tool_types or ())
   return make_run_agent_handler(
     [runner],
@@ -498,6 +556,11 @@ class _PrefixedMcpClient(_McpClient):
       else name
     )
 
+  def get_policy_tool_name(self, name: str) -> str | None:
+    if not self.is_mcp_tool(name):
+      return None
+    return self.get_original_tool_name(name)
+
   def is_mcp_tool(self, name: str) -> bool:
     return self.get_server_for_tool(name) is not None
 
@@ -515,6 +578,18 @@ class _PrefixedMcpClient(_McpClient):
 
   def get_tool_definitions(self) -> list[dict[str, Any]]:
     return self.get_server_tool_definitions({"research-corpus-mcp"})
+
+  def get_server_tool_route_bindings(
+    self,
+    server_names: set[str],
+  ) -> tuple[LiveToolRouteBinding, ...]:
+    if not self.active or "research-corpus-mcp" not in server_names:
+      return ()
+    return (_mcp_route_binding(
+      server_id="research-corpus-mcp",
+      logical_name="thesis_read",
+      exposed_name="private_thesis_read",
+    ),)
 
 
 def test_run_agent_tool_schema_is_operation_first(tmp_path: Path) -> None:
@@ -537,6 +612,73 @@ def test_run_agent_tool_schema_is_operation_first(tmp_path: Path) -> None:
   assert "task" not in schema["properties"]
 
 
+def _dispatch_grant_for_runtime(runtime: ResolvedOperationRuntime) -> frozenset[str]:
+  ceiling = runtime.policy.exact_tool_ids
+  authority = admit_operation_tools(
+    runtime.snapshot,
+    grant_id="grant:catalog-render",
+    operation_tool_ids=ceiling,
+    definitions=tuple({"name": name} for name in sorted(ceiling)),
+    local_tool_handlers={name: object() for name in ceiling},
+    mcp_client=_McpClient(),
+  )
+  assert isinstance(authority, ResolvedAuthority)
+  return granted_tool_ids(authority)
+
+
+def test_catalog_dispatch_grant_filters_child_surface_not_ceiling() -> None:
+  class _CeilingRunner(_Runner):
+    def _get_tool_definitions(self) -> list[dict[str, Any]]:
+      return [{
+        "name": name,
+        "description": f"Definition for {name}.",
+        "input_schema": {"type": "object"},
+      } for name in ("file_read", "web_search", "write_record")]
+
+  runtime = _catalog_runtime(
+    exact_tool_ids=frozenset({"file_read", "web_search", "write_record"}),
+    required_capabilities=(
+      SemanticCapabilityRequirement(
+        name="web.read/v1",
+        required=True,
+        binding_modes=("live_tool",),
+      ),
+      SemanticCapabilityRequirement(
+        name="corpus.read/v1",
+        required=True,
+        binding_modes=("live_tool",),
+      ),
+    ),
+  )
+  runner = _CeilingRunner()
+  result, error = asyncio.run(_handler(
+    runner,
+    loader=None,
+    operation_catalog=_Catalog(runtime),
+    background_handlers={"file_read": _tool, "write_record": _tool},
+  )({
+    "operation": runtime.snapshot.operation.model_dump(mode="json"),
+    "objective": "Review canonical evidence.",
+    "background": False,
+  }))
+
+  assert error is None
+  assert result is not None
+  spawn = runner.spawn_calls[0]
+  expected = _dispatch_grant_for_runtime(runtime)
+  admitted = frozenset(
+    entry.tool_id for entry in spawn["admitted_task"].tool_grant.tools
+  )
+  assert admitted == expected
+  assert set(spawn["dispatcher"]._local) == expected
+  assert {
+    definition["name"]
+    for definition in spawn["dispatcher"].get_tool_definitions()
+  } == expected
+  assert "write_record" in runtime.policy.exact_tool_ids
+  assert "write_record" not in admitted
+
+
 def test_run_agent_handler_rejects_catalog_and_loader_together(
   tmp_path: Path,
 ) -> None:
@@ -554,6 +696,7 @@ def test_falsey_catalog_has_same_schema_and_handler_operation_view() -> None:
 
   runtime = _catalog_runtime()
   catalog = _FalseyCatalog(runtime)
+  entries = _catalog_operation_entries(catalog)
   schema = make_run_agent_tool_def(catalog)["input_schema"]
   runner = _Runner()
 
@@ -572,8 +715,12 @@ def test_falsey_catalog_has_same_schema_and_handler_operation_view() -> None:
   ]
   assert error is None
   assert result is not None
+  assert entries == [(
+    runtime.snapshot.operation,
+    runtime.snapshot.description,
+  )]
   assert catalog.selectors == [
-    runtime.snapshot.operation.model_dump(mode="json")
+    runtime.snapshot.operation.model_dump(mode="json"),
   ]
 
 
@@ -605,6 +752,61 @@ def test_injected_catalog_admission_consumes_snapshot_and_policy_directly() -> N
   assert TaskResult.model_validate(result).logical_task.operation == (
     resolved.snapshot.operation
   )
+
+
+def test_child_provider_definitions_reuse_the_admission_snapshot() -> None:
+  class _ChangingRunner(_Runner):
+    def __init__(self) -> None:
+      super().__init__()
+      self.definition_reads = 0
+
+    def _get_tool_definitions(self) -> list[dict[str, Any]]:
+      self.definition_reads += 1
+      return [{
+        "name": "web_search",
+        "description": f"schema read {self.definition_reads}",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            f"query_{self.definition_reads}": {"type": "string"},
+          },
+        },
+      }]
+
+  resolved = _catalog_runtime(
+    required_capabilities=(SemanticCapabilityRequirement(
+      name="web.read/v1",
+      required=True,
+      binding_modes=("live_tool",),
+    ),),
+  )
+  runner = _ChangingRunner()
+  result, error = asyncio.run(_handler(
+    runner,
+    loader=None,
+    operation_catalog=_Catalog(resolved),
+  )({
+    "operation": resolved.snapshot.operation.model_dump(mode="json"),
+    "objective": "Review canonical evidence.",
+    "background": False,
+  }))
+
+  assert error is None
+  assert result is not None
+  assert runner.definition_reads == 1
+  dispatcher = runner.spawn_calls[0]["dispatcher"]
+  first = dispatcher.get_tool_definitions()
+  first[0]["description"] = "caller mutation"
+  second = dispatcher.get_tool_definitions()
+  assert runner.definition_reads == 1
+  assert second == [{
+    "name": "web_search",
+    "description": "schema read 1",
+    "input_schema": {
+      "type": "object",
+      "properties": {"query_1": {"type": "string"}},
+    },
+  }]
 
 
 def test_default_catalog_explore_activates_prefixed_mcp_before_projection() -> None:
@@ -705,7 +907,9 @@ def test_default_catalog_explore_has_explicit_ref_lifecycle_parity() -> None:
       binding_modes=("live_tool",),
     ),),
   )
-  runs: list[tuple[_Runner, dict[str, Any]]] = []
+  runs: list[
+    tuple[_Runner, dict[str, Any] | AgentCompletionEnvelope]
+  ] = []
   for selector in (
     None,
     runtime.snapshot.operation.model_dump(mode="json"),
@@ -749,22 +953,19 @@ def test_policy_projection_preserves_distinct_prefixed_same_name_routes() -> Non
       ("server-b", "shared_tool"): "b_shared_tool",
     }
 
-    def resolve_tool_name(self, server: str, original: str) -> str | None:
-      return self.routes.get((server, original))
-
-    def get_server_for_tool(self, exposed: str) -> str | None:
-      return next((
-        server
-        for (server, _original), candidate in self.routes.items()
-        if candidate == exposed
-      ), None)
-
-    def get_original_tool_name(self, exposed: str) -> str:
-      return next((
-        original
-        for (_server, original), candidate in self.routes.items()
-        if candidate == exposed
-      ), exposed)
+    def get_server_tool_route_bindings(
+      self,
+      server_names: set[str],
+    ) -> tuple[LiveToolRouteBinding, ...]:
+      return tuple(
+        _mcp_route_binding(
+          server_id=server,
+          logical_name=original,
+          exposed_name=exposed,
+        )
+        for (server, original), exposed in self.routes.items()
+        if server in server_names
+      )
 
   runtime = _catalog_runtime(
     exact_tool_ids=frozenset({
@@ -792,13 +993,55 @@ def test_policy_projection_preserves_distinct_prefixed_same_name_routes() -> Non
   }
 
 
+def test_policy_projection_uses_logical_live_route_identity() -> None:
+  class _LogicalRouteMcpClient:
+    @staticmethod
+    def get_server_tool_route_bindings(
+      server_names: set[str],
+    ) -> tuple[LiveToolRouteBinding, ...]:
+      if "market-data-mcp" not in server_names:
+        return ()
+      return (_mcp_route_binding(
+        server_id="market-data-mcp",
+        logical_name="fetch_company_profile",
+        exposed_name="fetch_company_profile",
+        transport_server_id="fmp-mcp",
+        provider_original_name="fmp_profile",
+        route_kind="logical",
+      ),)
+
+  runtime = _catalog_runtime(
+    exact_tool_ids=frozenset({
+      "mcp__market-data-mcp__fetch_company_profile",
+    }),
+    mcp_tools_by_server={
+      "market-data-mcp": frozenset({"fetch_company_profile"}),
+    },
+  )
+
+  exact, excluded, canonical_to_exposed = (
+    _runtime_policy_dispatch_projection(
+      runtime.policy,
+      mcp_client=_LogicalRouteMcpClient(),
+    )
+  )
+
+  assert exact == frozenset({"fetch_company_profile"})
+  assert excluded == frozenset()
+  assert canonical_to_exposed == {
+    "mcp__market-data-mcp__fetch_company_profile": (
+      "fetch_company_profile"
+    ),
+  }
+
+
 def test_catalog_projection_callback_failure_is_operation_unavailable() -> None:
   class _FailingMcpClient(_PrefixedMcpClient):
-    def resolve_tool_name(
+    def get_server_tool_route_bindings(
       self,
-      _server_name: str,
-      _original_name: str,
-    ) -> str | None:
+      server_names: set[str],
+    ) -> tuple[LiveToolRouteBinding, ...]:
+      _ = server_names
       raise RuntimeError("route registry failed")
 
   runtime = _catalog_runtime(
@@ -848,18 +1091,17 @@ def test_catalog_mcp_alias_cannot_impersonate_live_local_handler(
   extra_excluded_tools: frozenset[str],
 ) -> None:
   class _LocalAliasMcpClient(_PrefixedMcpClient):
-    def resolve_tool_name(
+    def get_server_tool_route_bindings(
       self,
-      server_name: str,
-      original_name: str,
-    ) -> str | None:
-      if (
-        self.active
-        and server_name == "research-corpus-mcp"
-        and original_name == "thesis_read"
-      ):
-        return "web_search"
-      return None
+      server_names: set[str],
+    ) -> tuple[LiveToolRouteBinding, ...]:
+      if not self.active or "research-corpus-mcp" not in server_names:
+        return ()
+      return (_mcp_route_binding(
+        server_id="research-corpus-mcp",
+        logical_name="thesis_read",
+        exposed_name="web_search",
+      ),)
 
     def get_server_for_tool(self, name: str) -> str | None:
       return (
@@ -901,11 +1143,11 @@ def test_catalog_mcp_alias_cannot_impersonate_live_local_handler(
 
 def test_policy_projection_does_not_mask_base_exceptions() -> None:
   class _InterruptedMcpClient(_PrefixedMcpClient):
-    def resolve_tool_name(
+    def get_server_tool_route_bindings(
       self,
-      _server_name: str,
-      _original_name: str,
-    ) -> str | None:
+      server_names: set[str],
+    ) -> tuple[LiveToolRouteBinding, ...]:
+      _ = server_names
       raise KeyboardInterrupt
 
   runtime = _catalog_runtime(
@@ -1130,7 +1372,8 @@ def test_direct_handler_typed_ticker_bypasses_prose_and_is_admitted(
   }))
 
   assert error is None
-  assert result is not None and result["status"] == "running"
+  assert isinstance(result, dict)
+  assert result["status"] == "running"
   assert extractor_calls == 0
   admitted = runner.background_calls[0]["admitted_task"]
   assert len(admitted.inputs) == 1
@@ -1226,7 +1469,8 @@ def test_investment_start_route_requires_verified_turn_despite_metadata_drift(
   }))
 
   assert trusted_error is None
-  assert trusted_result is not None and trusted_result["status"] == "running"
+  assert isinstance(trusted_result, dict)
+  assert trusted_result["status"] == "running"
   registration = trusted_runner.background_calls[0]
   admitted_task = registration["admitted_task"]
   assert len(admitted_task.inputs) == 1
@@ -1340,30 +1584,36 @@ def test_direct_handler_unambiguous_legacy_prose_is_promoted_once(
   }))
 
   assert error is None
-  assert result is not None and result["status"] == "running"
+  assert isinstance(result, dict)
+  assert result["status"] == "running"
   admitted = runner.background_calls[0]["admitted_task"]
   assert admitted.inputs[0].context.content == ticker
 
 
-def test_direct_handler_rejects_research_file_that_conflicts_with_objective(
+def test_direct_handler_binds_typed_research_file_over_objective_prose(
   tmp_path: Path,
 ) -> None:
   loader = _write_operation(tmp_path)
   runner = _Runner()
+  rebound: list[int] = []
 
-  result, error = asyncio.run(_handler(runner, loader=loader)({
+  result, error = asyncio.run(_handler(
+    runner,
+    loader=loader,
+    fms_rebinder=lambda _handlers, research_file_id: rebound.append(
+      research_file_id
+    ),
+  )({
     "operation": _operation(loader),
     "objective": "Review MSFT with research_file_id=42.",
     "research_file_id": 43,
     "background": False,
   }))
 
-  assert result is None
-  assert error == {
-    "code": "context_research_file_id_mismatch",
-    "message": "research_file_id must match the exact ID stated in objective",
-  }
-  assert runner.spawn_calls == []
+  assert error is None
+  assert TaskResult.model_validate(result).execution.status == "succeeded"
+  # The typed assertion is the only binding channel; objective prose is inert.
+  assert rebound == [43]
 
 
 def test_generic_delegation_uses_exact_canonical_contracts(tmp_path: Path) -> None:
@@ -1406,15 +1656,16 @@ def test_foreground_delegation_returns_readable_completion_handle(
       self._role = "writer"
       self._workspace_dir = tmp_path / "workspace"
       self._workspace_dir.mkdir()
-      self._agent_session_log = AgentSessionLog(
+      self.session_log = AgentSessionLog(
         tmp_path / "agent-session.jsonl"
       )
+      self._agent_session_log = self.session_log
 
     async def _append_durable_event(
       self,
       event: dict[str, Any],
     ) -> object:
-      return await self._agent_session_log.append(dict(event))
+      return await self.session_log.append(dict(event))
 
     async def spawn_sub_agent(self, task: str, **kwargs: Any):
       call = {"task": task, **kwargs}
@@ -1457,7 +1708,7 @@ def test_foreground_delegation_returns_readable_completion_handle(
   assert page is not None
   assert page["content"] == terminal_text
   assert page["end"] is True
-  events, _cursor = asyncio.run(runner._agent_session_log.query(
+  events, _cursor = asyncio.run(runner.session_log.query(
     event_types={
       "task_registered",
       "task_completed",
@@ -1470,6 +1721,246 @@ def test_foreground_delegation_returns_readable_completion_handle(
     "task_completed",
     "agent_completion",
   ]
+
+
+def test_foreground_delegation_publishes_budget_exhaustion_without_narrative(
+  tmp_path: Path,
+) -> None:
+  class _BudgetExhaustedRunner(_Runner):
+    def __init__(self) -> None:
+      super().__init__()
+      self._gateway_session_id = "session-test"
+      self._runner_id = "parent-runner"
+      self._role = "writer"
+      self._workspace_dir = tmp_path
+      self._agent_session_log = AgentSessionLog(tmp_path / "session.jsonl")
+
+    async def _append_durable_event(self, event: dict[str, Any]) -> object:
+      return await self._agent_session_log.append(event)
+
+    async def spawn_sub_agent(self, task: str, **kwargs: Any):
+      # Buyer 3.3: the child stopped after tool use, before any end_turn.
+      result = task_result_from_execution(
+        [
+          {
+            "type": "assistant_message",
+            "stop_reason": "tool_use",
+            "content_blocks": [{"type": "text", "text": "Pulling peer filings."}],
+          },
+          {"type": "tool_call_start", "tool_name": "fetch_financials"},
+          {"type": "budget_exceeded"},
+        ],
+        logical_task=kwargs["logical_task"],
+        attempt=kwargs["attempt"],
+        requirement=kwargs["result_requirement"],
+        provenance=kwargs["result_provenance"],
+        final_narrative=None,
+        timed_out=False,
+        timeout=None,
+      )
+      return result, None
+
+  runner = _BudgetExhaustedRunner()
+  result, error = asyncio.run(_handler(
+    runner,
+    loader=SkillLoader(tmp_path / "skills"),
+  )({
+    "objective": "Sweep MSCI peer disclosures.",
+    "background": False,
+  }))
+
+  assert error is None
+  envelope = AgentCompletionEnvelope.model_validate(result)
+  assert envelope.settlement_projection.execution_status == "failed"
+  assert envelope.settlement_projection.terminal_reason == "budget_exhausted"
+  assert envelope.parent_materialization is None
+  assert envelope.child_evidence.evidence_tools == ("fetch_financials",)
+  events, _ = asyncio.run(runner._agent_session_log.query(
+    event_types={"task_completed", "agent_completion"},
+    order="asc",
+  ))
+  assert [entry.event["type"] for entry in events] == [
+    "task_completed", "agent_completion",
+  ]
+  persisted = AgentCompletionEnvelope.model_validate(events[-1].event["envelope"])
+  assert persisted == envelope
+  assert "Pulling peer filings." not in persisted.model_dump_json()
+
+
+class _UnpublishableForegroundRunner(_Runner):
+  def __init__(self, tmp_path: Path) -> None:
+    super().__init__()
+    self._gateway_session_id = "session-test"
+    self._runner_id = "parent-runner"
+    self._role = "writer"
+    self._workspace_dir = tmp_path
+
+  async def _append_durable_event(self, event: dict[str, Any]) -> object:
+    if event.get("type") in {
+      "task_registered",
+      "task_completed",
+      "agent_completion",
+    }:
+      raise ParentResultMaterializationError("forced publication failure")
+    self.durable_events.append(dict(event))
+    return object()
+
+
+@pytest.mark.parametrize(
+  ("interrupt_events", "external_signals", "expected_status", "expected_reason"),
+  [
+    ([{"type": "budget_exceeded"}], (), "failed", "budget_exhausted"),
+    ([{"type": "max_turns_reached"}], (), "failed", "turns_exhausted"),
+    ([], ("cancelled",), "cancelled", "cancelled"),
+  ],
+)
+def test_foreground_interrupt_publication_failure_names_terminal_reason(
+  tmp_path: Path,
+  interrupt_events: list[dict[str, Any]],
+  external_signals: tuple[str, ...],
+  expected_status: str,
+  expected_reason: str,
+) -> None:
+  class _InterruptedRunner(_UnpublishableForegroundRunner):
+    async def spawn_sub_agent(self, task: str, **kwargs: Any):
+      result = task_result_from_execution(
+        list(interrupt_events),
+        logical_task=kwargs["logical_task"],
+        attempt=kwargs["attempt"],
+        requirement=kwargs["result_requirement"],
+        provenance=kwargs["result_provenance"],
+        final_narrative=None,
+        timed_out=False,
+        timeout=None,
+        external_terminal_signals=external_signals,
+      )
+      return result, None
+
+  result, error = asyncio.run(_handler(
+    _InterruptedRunner(tmp_path),
+    loader=SkillLoader(tmp_path / "skills"),
+  )({
+    "objective": "Sweep MSCI peer disclosures.",
+    "background": False,
+  }))
+
+  assert result is None
+  assert error == {
+    "code": "agent_completion_materialization_failed",
+    "message": (
+      f"Foreground agent {expected_status} ({expected_reason}) but its exact "
+      "parent-readable result could not be published: "
+      "ParentResultMaterializationError"
+    ),
+  }
+  assert "completed" not in error["message"]
+
+
+def test_foreground_completed_publication_failure_keeps_completed_wording(
+  tmp_path: Path,
+) -> None:
+  projection_value: dict[str, Any] = {"summary": "Canonical child summary."}
+  projection_contract = ContractRef(
+    namespace="agent-gateway",
+    name="terminal-tool-result",
+    version="1.0",
+    digest=sha256_digest({"contract": "terminal-tool-result"}),
+  )
+
+  class _CompletedRunner(_UnpublishableForegroundRunner):
+    async def spawn_sub_agent(self, task: str, **kwargs: Any):
+      call = {"task": task, **kwargs}
+      self.spawn_calls.append(call)
+      result = _spawn_result(call).model_copy(update={
+        "values": TaskResultValues(
+          terminal_narrative=None,
+          projection=CanonicalProjection(
+            contract=projection_contract,
+            content=_content(projection_value, projection_contract),
+            inline_view=projection_value,
+          ),
+        ),
+      })
+      return result, None
+
+  result, error = asyncio.run(_handler(
+    _CompletedRunner(tmp_path),
+    loader=SkillLoader(tmp_path / "skills"),
+  )({
+    "objective": "Return the complete evidence report.",
+    "background": False,
+  }))
+
+  assert result is None
+  assert error == {
+    "code": "agent_completion_materialization_failed",
+    "message": (
+      "Foreground agent completed but its exact parent-readable result "
+      "could not be published: ParentResultMaterializationError"
+    ),
+  }
+
+
+def test_foreground_delegation_materializes_projection_only_result(
+  tmp_path: Path,
+) -> None:
+  projection_value = {
+    "tool_name": "fms_propose_demo",
+    "result": {"status": "staged", "proposal_id": "proposal-1"},
+  }
+  projection_contract = ContractRef(
+    namespace="agent-gateway",
+    name="terminal-tool-result",
+    version="1.0",
+    digest=sha256_digest({"contract": "terminal-tool-result"}),
+  )
+
+  class _DurableForegroundRunner(_Runner):
+    def __init__(self) -> None:
+      super().__init__()
+      self._gateway_session_id = "session-test"
+      self._runner_id = "parent-runner"
+      self._role = "writer"
+      self._workspace_dir = tmp_path / "workspace"
+      self._workspace_dir.mkdir()
+      self.session_log = AgentSessionLog(
+        tmp_path / "agent-session.jsonl"
+      )
+      self._agent_session_log = self.session_log
+
+    async def _append_durable_event(
+      self,
+      event: dict[str, Any],
+    ) -> object:
+      return await self.session_log.append(dict(event))
+
+    async def spawn_sub_agent(self, task: str, **kwargs: Any):
+      call = {"task": task, **kwargs}
+      self.spawn_calls.append(call)
+      result = _spawn_result(call).model_copy(update={
+        "values": TaskResultValues(
+          terminal_narrative=None,
+          projection=CanonicalProjection(
+            contract=projection_contract,
+            content=_content(projection_value, projection_contract),
+            inline_view=projection_value,
+          ),
+        ),
+      })
+      return result, None
+
+  result, error = asyncio.run(_handler(
+    _DurableForegroundRunner(),
+    loader=SkillLoader(tmp_path / "skills"),
+  )({
+    "objective": "Return the exact structured result.",
+    "background": False,
+  }))
+
+  assert error is None
+  envelope = AgentCompletionEnvelope.model_validate(result)
+  assert envelope.parent_materialization.kind == "projection_inline"
+  assert envelope.parent_materialization.value == projection_value
 
 
 def test_registered_operation_requires_full_ref_and_emits_lifecycle(
@@ -1520,7 +2011,7 @@ def test_registered_operation_captures_recoverable_fms_error_without_internal_er
     })
     return result, error
 
-  runner.spawn_sub_agent = _spawn_with_fms_error  # type: ignore[method-assign]
+  runner.spawn_sub_agent = _spawn_with_fms_error
   result, error = asyncio.run(_handler(runner, loader=loader)({
     "operation": _operation(loader),
     "objective": "Review MSFT filing evidence.",
@@ -1586,6 +2077,14 @@ def test_registered_foreground_operation_inherits_parent_approval_lifecycle(
   assert error is None
   assert TaskResult.model_validate(result).execution.status == "succeeded"
   dispatcher = runner.spawn_calls[0]["dispatcher"]
+  # The child inherits the parent's admitted route as a value — the same object
+  # the parent session carries — rather than re-deriving one from handles. The
+  # headless flag is decided independently, so a background child pairs
+  # should_avoid_permission_prompts with this same live durable route.
+  parent_route = dispatcher._session.approval_route
+  assert isinstance(parent_route, DurableLocalApprovalRoute)
+  assert dispatcher._approval_route is parent_route
+  assert parent_route.session is dispatcher._session
   assert dispatcher._approval_store is approval_store
   assert dispatcher._approval_policy is approval_policy
   assert dispatcher._session is not None
@@ -1601,7 +2100,7 @@ def test_registered_foreground_operation_inherits_parent_approval_lifecycle(
   assert dispatcher._run_context.profile == "filing-review"
 
 
-def test_registered_operation_rebinds_fms_to_objective_research_file(
+def test_registered_operation_never_rebinds_fms_from_objective_prose(
   tmp_path: Path,
 ) -> None:
   loader = _write_operation(tmp_path)
@@ -1623,7 +2122,8 @@ def test_registered_operation_rebinds_fms_to_objective_research_file(
 
   assert error is None
   assert TaskResult.model_validate(result).execution.status == "succeeded"
-  assert rebound == [(42, {"web_search"})]
+  # No typed assertion and no verified turn: the child runs unbound.
+  assert rebound == []
 
 
 def test_registered_operation_binds_explicit_research_file_to_child_run(
@@ -1748,10 +2248,15 @@ def test_background_registration_persists_exact_admitted_task(
   }))
 
   assert error is None
-  assert result is not None and result["status"] == "running"
+  assert isinstance(result, dict)
+  assert result["status"] == "running"
   registration = runner.background_calls[0]
   admitted = registration["admitted_task"]
   assert isinstance(admitted, AdmittedTask)
+  assert admitted.execution_snapshot is not None
+  assert result["granted_tools"] == sorted(
+    entry.tool_id for entry in admitted.tool_grant.tools
+  )
   assert admitted.execution_disposition.kind == "execute"
   assert admitted.operation.operation.name == "filing-review"
   assert admitted.execution_snapshot.cost_observation_threshold_usd == 3.25
@@ -1783,6 +2288,9 @@ def test_unnamed_delegation_does_not_infer_a_skill_budget(tmp_path: Path) -> Non
   assert error is None
   assert result is not None
   assert runner.spawn_calls[0]["max_budget_usd"] is None
+  assert "agent.shared.mutation_enforcement" not in inspect.getsource(
+    make_run_agent_handler
+  )
 
 
 @pytest.mark.parametrize("objective", [None, "", 0])

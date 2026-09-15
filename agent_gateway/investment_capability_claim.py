@@ -3,20 +3,17 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import math
 import os
 import re
 import time
-from functools import cache
-from pathlib import Path
 from types import MappingProxyType
-from typing import Final, Mapping, NamedTuple
+from typing import Any, Final, Mapping, NamedTuple
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from .skills import SkillLoader
-
+from .skill_limits import SkillExecutionLimits
+from .skill_context import current_skill
 
 INVESTMENT_CAPABILITY_CLAIM_PRIVATE_KEY_ENV: Final = (
   "INVESTMENT_CAPABILITY_CLAIM_ED25519_PRIVATE_KEY"
@@ -45,6 +42,8 @@ INVESTMENT_CAPABILITY_FACADE_TOOLS: Final = frozenset({
   "start_investment_run",
   "start_quant_research",
 })
+
+INVESTMENT_CAPABILITY_CLAIM_SERVER: Final = "idea-workbench-mcp"
 
 
 class InvestmentCapabilitySkillGrant(NamedTuple):
@@ -97,6 +96,49 @@ INVESTMENT_CAPABILITY_SKILL_GRANTS: Final[Mapping[str, InvestmentCapabilitySkill
 
 class InvestmentCapabilityClaimError(RuntimeError):
   """A trusted investment-capability claim could not be issued."""
+
+
+def investment_capability_claim_unavailable_error(
+  *,
+  subject: str,
+) -> dict[str, Any]:
+  """Named refusal for a missing investment-capability grant.
+
+  The grant set and issuance route are derived from
+  ``INVESTMENT_CAPABILITY_SKILL_GRANTS``. Callers carry this payload; they
+  do not restate the grants.
+  """
+
+  grants = tuple(sorted(INVESTMENT_CAPABILITY_SKILL_GRANTS))
+  operations = tuple(f"agent-operation/{name}" for name in grants)
+  grant_list = " or ".join(grants)
+  operation_list = " or ".join(operations)
+  return {
+    "code": "investment_capability_claim_unavailable",
+    "message": (
+      f"Trusted investment capability identity is unavailable for {subject}. "
+      f"Requires an admitted investment-capability grant ({grant_list}) "
+      f"issued inside run_agent with {operation_list}."
+    ),
+    "required_grants": list(grants),
+    "route": "run_agent",
+    "operations": list(operations),
+  }
+
+
+def investment_capability_server_load_error(
+  server_name: str,
+) -> dict[str, Any] | None:
+  """Refuse loading a claim-gated server the session cannot hold a grant for."""
+
+  if server_name != INVESTMENT_CAPABILITY_CLAIM_SERVER:
+    return None
+  if current_skill() in INVESTMENT_CAPABILITY_SKILL_GRANTS:
+    return None
+  return investment_capability_claim_unavailable_error(
+    subject=f"server '{server_name}'",
+  )
+
 
 
 def _b64url(value: bytes) -> str:
@@ -188,57 +230,28 @@ def investment_capability_signing_available() -> bool:
   return True
 
 
-def _skills_dir() -> Path:
-  configured = os.environ.get("AGENT_GATEWAY_SKILLS_DIR", "").strip()
-  if configured:
-    return Path(configured).expanduser()
-  return (
-    Path(__file__).resolve().parents[3]
-    / "api"
-    / "memory"
-    / "workspace"
-    / "notes"
-    / "skills"
-  )
-
-
-@cache
-def _skill_budget(skill: str, skills_dir: str) -> tuple[float, int, int]:
-  try:
-    profile = SkillLoader(Path(skills_dir)).load(skill)
-  except Exception as exc:
-    raise InvestmentCapabilityClaimError(
-      "investment capability skill policy is unavailable"
-    ) from exc
-  if profile.name != skill:
+def _approved_budget(
+  execution_limits: SkillExecutionLimits,
+  grant: InvestmentCapabilitySkillGrant,
+) -> dict[str, int | float]:
+  if type(execution_limits) is not SkillExecutionLimits:
     raise InvestmentCapabilityClaimError(
       "investment capability skill policy is unavailable"
     )
-  max_cost_usd = profile.max_budget_usd
-  max_tokens = profile.max_tokens
-  max_turns = profile.max_turns
+  max_cost_usd = execution_limits.max_budget_usd
+  max_tokens = execution_limits.max_tokens
+  max_turns = execution_limits.max_turns
   if (
-    isinstance(max_cost_usd, bool)
-    or not isinstance(max_cost_usd, int | float)
-    or not math.isfinite(float(max_cost_usd))
+    max_cost_usd is None
     or not 0 < max_cost_usd <= 10_000
-    or isinstance(max_tokens, bool)
-    or not isinstance(max_tokens, int)
+    or max_tokens is None
     or not 1 <= max_tokens <= 100_000_000
-    or isinstance(max_turns, bool)
-    or not isinstance(max_turns, int)
+    or max_turns is None
     or not 1 <= max_turns <= 10_000
   ):
     raise InvestmentCapabilityClaimError(
       "investment capability skill policy has an invalid approved budget"
     )
-  return float(max_cost_usd), max_tokens, max_turns
-
-
-def _approved_budget(
-  skill: str,
-  grant: InvestmentCapabilitySkillGrant,
-) -> dict[str, int | float]:
   wall_clock = grant.max_wall_clock_seconds
   if (
     isinstance(wall_clock, bool)
@@ -248,12 +261,8 @@ def _approved_budget(
     raise InvestmentCapabilityClaimError(
       "investment capability skill policy has an invalid approved budget"
     )
-  max_cost_usd, max_tokens, max_turns = _skill_budget(
-    skill,
-    str(_skills_dir().resolve()),
-  )
   return {
-    "max_cost_usd": max_cost_usd,
+    "max_cost_usd": float(max_cost_usd),
     "max_tokens": max_tokens,
     "max_turns": max_turns,
     "max_wall_clock_seconds": wall_clock,
@@ -270,6 +279,7 @@ def issue_investment_capability_claim(
   request_id: str,
   jti: str,
   skill: str,
+  admitted_skill_execution_limits: SkillExecutionLimits | None,
   policy_bundle_hash: str,
   research_file_id: int | None = None,
   now: int | None = None,
@@ -313,11 +323,17 @@ def issue_investment_capability_claim(
     raise InvestmentCapabilityClaimError(
       "investment capability claim cannot bind an unsupported tool"
     )
-  approved_budget = (
-    _approved_budget(trusted_skill, grant)
-    if "quant_research" in grant.allowed_capability_ids
-    else None
-  )
+  if "quant_research" in grant.allowed_capability_ids:
+    if type(admitted_skill_execution_limits) is not SkillExecutionLimits:
+      raise InvestmentCapabilityClaimError(
+        "investment capability skill policy is unavailable"
+      )
+    approved_budget = _approved_budget(
+      admitted_skill_execution_limits,
+      grant,
+    )
+  else:
+    approved_budget = None
   if routed_tool == "start_quant_research":
     if (
       isinstance(research_file_id, bool)
@@ -439,6 +455,7 @@ __all__ = [
   "INVESTMENT_CAPABILITY_CLAIM_KEY_BYTES",
   "INVESTMENT_CAPABILITY_CLAIM_PRIVATE_KEY_ENV",
   "INVESTMENT_CAPABILITY_CLAIM_PUBLIC_KEY_ENV",
+  "INVESTMENT_CAPABILITY_CLAIM_SERVER",
   "INVESTMENT_CAPABILITY_CLAIM_TTL_SECONDS",
   "INVESTMENT_SELECTED_CONTENT_CLAIM_PURPOSE",
   "INVESTMENT_CAPABILITY_FACADE_TOOLS",
@@ -447,5 +464,7 @@ __all__ = [
   "InvestmentCapabilityClaimError",
   "issue_investment_capability_claim",
   "issue_investment_selected_content_claim",
+  "investment_capability_claim_unavailable_error",
+  "investment_capability_server_load_error",
   "investment_capability_signing_available",
 ]

@@ -8,9 +8,11 @@ from agent_gateway import (
   AgentRunner,
   AnthropicProvider,
   ApprovalDecision,
+  AuthManager,
   ChatRuntime,
   CredentialHandle,
   GatewayServerConfig,
+  GatewaySession,
   INITIAL_MODEL_REGISTRY,
   INITIAL_MODEL_SELECTION_POLICY,
   McpClientManager,
@@ -19,7 +21,7 @@ from agent_gateway import (
   create_gateway_app,
   load_rate_table,
 )
-from agent_gateway.server import MaterializedCredential
+from agent_gateway.server import ChatRequest, MaterializedCredential
 
 
 BASE_DIR = Path(__file__).parent
@@ -209,8 +211,16 @@ def materialize_service_credential(
   return MaterializedCredential(handle=handle, auth_config=AUTH_CONFIG)
 
 
-async def build_chat_runtime(session, request, channel, auth_manager) -> ChatRuntime:
-  _ = auth_manager
+async def build_chat_runtime(
+  session: GatewaySession,
+  request: ChatRequest,
+  channel: str | None,
+  auth_manager: AuthManager | None,
+  /,
+  *,
+  storage_root: Path | None = None,
+) -> ChatRuntime:
+  _ = auth_manager, storage_root
   capability_execution = request.capability_execution
   if capability_execution is None:
     raise RuntimeError("Runtime requires a prepared session.driver turn")

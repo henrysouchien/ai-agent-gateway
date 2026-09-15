@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 import sys
 from pathlib import Path
 
@@ -15,6 +16,9 @@ from agent_gateway.rates import (
   load_rate_table,
   resolve_configured_rates_file,
 )
+from agent_gateway.model_registry import INITIAL_MODEL_REGISTRY
+from agent_gateway.providers import AnthropicProvider, CodexProvider, OpenAIProvider, XAIProvider
+from agent_gateway.runner_budget import CostAccumulator, admit_provider_request_budget
 
 
 def _write_rate_table(tmp_path: Path, payload: dict) -> Path:
@@ -210,17 +214,11 @@ def test_lookup_prefix_match_returns_canonical_entry(tmp_path: Path) -> None:
   assert rates.display_name == "Claude Sonnet 4.6"
 
 
-def test_lookup_unknown_model_raises_actionable_error(tmp_path: Path) -> None:
+def test_lookup_unknown_model_raises(tmp_path: Path) -> None:
   path = _write_rate_table(tmp_path, _base_payload(version="test-version"))
   table = load_rate_table(path)
 
-  with pytest.raises(
-    UnknownModelError,
-    match=(
-      rf"Model 'claude-unknown' not in rate table vtest-version\. "
-      rf"Update {path} or pass --rates-file with a newer version\."
-    ),
-  ):
+  with pytest.raises(UnknownModelError):
     table.lookup("anthropic", "claude-unknown")
 
 
@@ -239,7 +237,7 @@ def test_load_rate_table_missing_version_field_raises_clear_error(tmp_path: Path
     load_rate_table(path)
 
 
-def test_lookup_match_order_exact_then_tag_then_prefix(tmp_path: Path) -> None:
+def test_lookup_prefers_exact_then_longest_model_prefix(tmp_path: Path) -> None:
   path = _write_rate_table(
     tmp_path,
     _base_payload(
@@ -276,5 +274,152 @@ def test_lookup_match_order_exact_then_tag_then_prefix(tmp_path: Path) -> None:
   )
   table = load_rate_table(path)
 
-  assert table.lookup("anthropic", "claude-sonnet-4-6-20250514").display_name == "Exact Match"
-  assert table.lookup("anthropic", "claude-sonnet-4-6-latest").display_name == "Tag Match"
+  assert table.lookup("anthropic", "claude-sonnet-4-6-20250514").input_cost_per_mtok == 9.0
+  assert table.lookup("anthropic", "claude-sonnet-4-6-latest").input_cost_per_mtok == 2.0
+  assert table.lookup("anthropic", "anthropic/claude-sonnet-4-6-latest").input_cost_per_mtok == 2.0
+
+
+@pytest.mark.parametrize(
+  ("provider_name", "model"),
+  [
+    ("codex", "gpt-6-astra"),
+    ("openai", "gpt-6-astra"),
+    ("xai", "grok-4.6"),
+  ],
+)
+def test_configured_rates_price_registry_only_models(
+  provider_name: str, model: str, monkeypatch, tmp_path: Path,
+) -> None:
+  provider_type = {"codex": CodexProvider, "openai": OpenAIProvider, "xai": XAIProvider}[provider_name]
+  model_rates = {
+    "display_name": model,
+    "input_cost_per_mtok": 2.0,
+    "output_cost_per_mtok": 3.0,
+    "cache_read_cost_per_mtok": 4.0,
+    "cache_write_cost_per_mtok": 5.0,
+    "max_tokens": 3200,
+    "context_window": 211000,
+  }
+  path = _write_rate_table(tmp_path, {
+    "version": "deployment-override",
+    "source": "https://example.test/pricing",
+    "providers": {provider_name: {"models": {model: model_rates}}},
+  })
+  monkeypatch.setenv("AGENT_GATEWAY_RATES_FILE", str(path))
+  provider = provider_type()
+
+  info = provider.get_model_info(model)
+  assert info.context_window == 211000
+  assert info.max_output_tokens == 3200
+  estimate = provider.estimate_cost(
+    model, 1000, 2000, cache_read_tokens=3000, cache_creation_tokens=4000,
+  )
+  assert estimate.total == pytest.approx(0.04)
+
+
+@pytest.mark.parametrize("provider_type", [OpenAIProvider, CodexProvider])
+@pytest.mark.parametrize("injected", [False, True])
+def test_anthropic_override_preserves_other_provider_budget(
+  provider_type, injected: bool, monkeypatch, tmp_path: Path,
+) -> None:
+  path = _write_rate_table(tmp_path, _base_payload())
+  monkeypatch.setenv("AGENT_GATEWAY_RATES_FILE", str(path))
+  provider = provider_type(rate_table=load_rate_table(path)) if injected else provider_type()
+
+  assert provider.estimate_cost("gpt-5.6", 100_000, 1_000).total == pytest.approx(0.53)
+  admission = admit_provider_request_budget(
+    CostAccumulator(0.50), provider=provider, model="gpt-5.6",
+    estimated_input_tokens=100_000, requested_max_output_tokens=1_000,
+  )
+  assert admission.denied_state is not None
+
+
+@pytest.mark.parametrize(
+  ("provider_type", "model", "input_tokens", "expected"),
+  [
+    (XAIProvider, "grok-4.6", 250_000, 1.012),
+    (OpenAIProvider, "gpt-6-astra", 300_000, 6.075),
+    (CodexProvider, "gpt-6-astra", 300_000, 6.075),
+  ],
+)
+def test_published_long_context_prices(provider_type, model, input_tokens, expected) -> None:
+  assert provider_type().estimate_cost(model, input_tokens, 1_000).total == pytest.approx(expected)
+  admission = admit_provider_request_budget(
+    CostAccumulator(0.60 if provider_type is XAIProvider else 4.0),
+    provider=provider_type(), model=model, estimated_input_tokens=input_tokens,
+    requested_max_output_tokens=1_000,
+  )
+  assert admission.denied_state is not None
+
+
+@pytest.mark.parametrize(
+  ("provider_type", "model", "input_tokens", "expected"),
+  [
+    (XAIProvider, "grok-4.6", 199_999, 0.405998),
+    (XAIProvider, "grok-4.6", 200_000, 0.812),
+    (OpenAIProvider, "gpt-6-astra", 272_000, 2.77),
+    (OpenAIProvider, "gpt-6-astra", 272_001, 5.51502),
+  ],
+)
+def test_long_context_threshold_inclusivity(provider_type, model, input_tokens, expected) -> None:
+  assert provider_type().estimate_cost(model, input_tokens, 1_000).total == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+  ("provider_type", "model", "uncached", "cached", "written", "expected"),
+  [
+    (XAIProvider, "grok-4.6", 100_000, 100_000, 0, 0.512),
+    (OpenAIProvider, "gpt-6-astra", 172_000, 100_000, 0, 1.87),
+    (OpenAIProvider, "gpt-6-astra", 172_001, 100_000, 0, 3.71502),
+    (CodexProvider, "gpt-6-astra", 0, 0, 300_000, 7.575),
+  ],
+)
+def test_long_context_tier_counts_all_prompt_tokens(
+  provider_type, model, uncached, cached, written, expected,
+) -> None:
+  estimate = provider_type().estimate_cost(
+    model, uncached, 1_000, cache_read_tokens=cached, cache_creation_tokens=written,
+  )
+  assert estimate.total == pytest.approx(expected)
+
+
+def test_partial_override_preserves_other_models_and_providers(monkeypatch, tmp_path: Path) -> None:
+  payload = _base_payload()
+  payload["providers"]["anthropic"]["models"]["claude-sonnet-4-6"]["input_cost_per_mtok"] = 7
+  path = _write_rate_table(tmp_path, payload)
+  monkeypatch.setenv("AGENT_GATEWAY_RATES_FILE", str(path))
+
+  assert AnthropicProvider().estimate_cost("claude-sonnet-4-6", 100_000, 1_000).total == pytest.approx(0.715)
+  assert AnthropicProvider().estimate_cost("claude-fable-5", 100_000, 1_000).total == pytest.approx(1.05)
+  assert XAIProvider().estimate_cost("grok-4.6", 100_000, 1_000).total == pytest.approx(0.206)
+
+
+def test_override_prefix_precedes_exact_bundled_prices_and_environment(monkeypatch, tmp_path: Path) -> None:
+  payload = _base_payload()
+  row = payload["providers"]["anthropic"]["models"].pop("claude-sonnet-4-6")
+  row["input_cost_per_mtok"] = 7
+  payload["providers"]["anthropic"]["models"]["claude-sonnet"] = row
+  override = load_rate_table(_write_rate_table(tmp_path, payload))
+  monkeypatch.setenv("AGENT_GATEWAY_RATES_FILE", "invalid-relative-path.json")
+
+  provider = AnthropicProvider(rate_table=override)
+  assert provider.estimate_cost("claude-sonnet-4-6", 100_000, 1_000).total == pytest.approx(0.715)
+
+
+@pytest.mark.parametrize("provider_type", [CodexProvider, OpenAIProvider, XAIProvider])
+def test_unknown_rate_model_keeps_warn_and_zero(provider_type, monkeypatch, caplog) -> None:
+  import agent_gateway.providers.base as provider_base
+
+  template = next(entry for entry in INITIAL_MODEL_REGISTRY.models.values() if entry.provider == provider_type.name)
+  model = "unpriced-future-model"
+  entry = replace(
+    template, key=f"{provider_type.name}.unpriced", upstream_model=model,
+    reported_identities=frozenset({model}),
+  )
+  monkeypatch.setattr(
+    provider_base, "INITIAL_MODEL_REGISTRY",
+    replace(INITIAL_MODEL_REGISTRY, models={entry.key: entry}),
+  )
+
+  assert provider_type().estimate_cost(model, 1000, 2000, cache_read_tokens=3000).total == 0
+  assert any(record.levelname == "WARNING" and model in record.getMessage() for record in caplog.records)

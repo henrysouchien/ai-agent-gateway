@@ -21,6 +21,7 @@ from agent_gateway.code_execution._provenance import (
   AGENT_CODE_EXECUTE_WORK_DIR_ENV,
   collect_computation_sidecars,
 )
+from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.event_log import EventLog
 from agent_gateway.runner import ToolResultContext
 
@@ -29,11 +30,11 @@ def _run(coro):
   return asyncio.run(coro)
 
 
-class _FakeMcp:
-  def is_mcp_tool(self, _tool_name: str) -> bool:
-    return False
+class _FakeMcp(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
 
-  async def call_tool(self, _tool_name: str, _tool_input: Dict[str, Any]):
+  async def call_tool(self, *_args, **_kwargs):
     raise AssertionError("MCP should not execute in code_execution provenance tests")
 
 
@@ -472,6 +473,7 @@ def test_background_cancel_while_running_deletes_sidecars_without_attaching() ->
     )
 
     assert error is None
+    assert result is not None
     assert result == {"status": "cancelled", "task_id": task_id}
     assert "computations" not in result
     assert not sidecar_dir.exists()
@@ -549,6 +551,7 @@ def test_sanitize_hook_strips_computations_from_result_entry_only_for_code_execu
     ctx = ToolResultContext(
       tool_name=tool_name,
       tool_input={},
+      redacted_tool_input={},
       result=dict(result),
       error=None,
       duration_ms=1,
@@ -565,6 +568,7 @@ def test_sanitize_hook_strips_computations_from_result_entry_only_for_code_execu
     visible = json.loads(result_entry["content"])
     assert "computations" not in visible
     assert "computations_dropped" not in visible
+    assert ctx.result is not None
     assert ctx.result["computations"] == result["computations"]
     assert ctx.result["computations_dropped"] == 1
 

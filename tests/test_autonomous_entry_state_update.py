@@ -1,7 +1,10 @@
+# ruff: noqa: E402
+
 import asyncio
+from dataclasses import replace
 import os
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any
 
@@ -28,6 +31,12 @@ from tests.autonomous_exact_test_support import (
 # a real value; nothing in the suite asserts PRODUCT_ID-unset behavior.
 os.environ.setdefault("PRODUCT_ID", "hank-test")
 from api.agent.autonomous import entry as autonomous_entry
+from api.agent.autonomous import run_once_runner
+from api.agent.autonomous.storage_layout import (
+  AutonomousStorageLayout,
+  FallbackRenderer,
+)
+from api.agent.profiles import ProfileComposition, load_profile_composition
 
 
 @pytest.fixture(autouse=True)
@@ -53,6 +62,7 @@ def _exact_runtime_kwargs(
   runtime: ExactAutonomousTestRuntime,
 ) -> dict[str, Any]:
   return {
+    "mcp_render": runtime.mcp_render,
     "claim_signer": runtime.claim_signer,
     "capability_execution_resolver": (
       runtime.capability_execution_resolver
@@ -60,41 +70,41 @@ def _exact_runtime_kwargs(
     "session_driver_execution": runtime.session_driver_execution,
     "gateway_session": runtime.gateway_session,
     "event_owner": runtime.event_owner,
+    "skill_application": runtime.skill_application,
   }
 
 
-def _analyst_run_once_profile(**overrides: Any) -> SimpleNamespace:
-  profile = SimpleNamespace(
-    name="analyst",
-    run_once_session_id_template="{profile}:{today}",
-    briefing_file_template="analyst/{date}.md",
-    run_once_excluded_tools=None,
-    run_once_allowed_run_bash_commands=None,
-    excluded_tools=set(),
-    model="claude-sonnet-4-6",
-    max_turns=5,
-    timeout_seconds=60.0,
-    per_turn_timeout=None,
-    max_tokens=16000,
-    client_timeout=30.0,
-    max_budget_usd=2.0,
-    compaction_instructions=None,
-    build_workspace_context=lambda: "",
-    tool_packs=None,
-    run_once_use_tool_packs=False,
-    build_system_prompt=lambda **kwargs: "system prompt",
-    build_initial_user_message=lambda today, briefing_file: "Run the analyst loop.",
-    describe_market_status=lambda: "closed",
-    on_fallback=None,
-    retry_config=None,
-    state_subdir="analyst",
-    state_file_name="state.json",
-    format_tool_catalog=lambda *args, **kwargs: "",
-    build_tool_packs_section=lambda *args, **kwargs: "",
+def _analyst_run_once_profile(
+  *,
+  build_initial_user_message: Any = None,
+) -> ProfileComposition:
+  composition = load_profile_composition("analyst")
+  return replace(
+    composition,
+    prompt_implementation=replace(
+      composition.prompt_implementation,
+      build_workspace_context=lambda: "",
+      build_system_prompt=lambda **_kwargs: "system prompt",
+      build_initial_user_message=(
+        build_initial_user_message
+        or (lambda _today, _briefing_file: "Run the analyst loop.")
+      ),
+      describe_market_status=lambda: "closed",
+      format_tool_catalog=lambda *_args, **_kwargs: "",
+      build_tool_packs_section=lambda *_args, **_kwargs: "",
+    ),
   )
-  for key, value in overrides.items():
-    setattr(profile, key, value)
-  return profile
+
+
+def _analyst_storage_layout(
+  *,
+  fallback_renderer: FallbackRenderer | None = None,
+) -> AutonomousStorageLayout:
+  return AutonomousStorageLayout(
+    state_dir=PurePosixPath("analyst"),
+    briefing_file_template="analyst/{date}.md",
+    fallback_renderer=fallback_renderer,
+  )
 
 
 def test_append_state_update_event_persists_payload(tmp_path: Path) -> None:
@@ -127,19 +137,21 @@ def test_run_once_does_not_read_or_write_state_json_and_appends_state_update(
   log = AgentSessionLog(path=tmp_path / "sessions" / "run-once.jsonl")
   captured: dict[str, Any] = {}
   workspace = tmp_path / "workspace"
-  state_dir = workspace / "notes" / "analyst"
+  storage_layout = _analyst_storage_layout()
+  state_dir = workspace / "notes" / storage_layout.state_dir
   state_dir.mkdir(parents=True, exist_ok=True)
-  state_path = state_dir / "state.json"
+  state_path = workspace / "notes" / storage_layout.state_file
   state_path.write_text("{not valid json", encoding="utf-8")
 
   async def _fake_build_runtime_context(*args: Any, **kwargs: Any):
-    _ = args, kwargs
+    _ = kwargs
     return SimpleNamespace(
       workspace=workspace,
       tool_catalog="catalog",
       tool_packs_section="",
       connected_servers={"fmp-mcp", "macro-mcp"},
       active_servers={"fmp-mcp"},
+      runtime_config=args[1],
     )
 
   def _fake_create_session_objects(*args: Any, **kwargs: Any):
@@ -177,35 +189,15 @@ def test_run_once_does_not_read_or_write_state_json_and_appends_state_update(
     captured["briefing_file"] = briefing_file
     return "Run the analyst loop."
 
-  profile = SimpleNamespace(
-    name="analyst",
-    run_once_session_id_template="{profile}:{today}",
-    briefing_file_template="analyst/{date}.md",
-    run_once_excluded_tools=None,
-    run_once_allowed_run_bash_commands=None,
-    excluded_tools=set(),
-    model="claude-sonnet-4-6",
-    max_turns=5,
-    timeout_seconds=60.0,
-    per_turn_timeout=None,
-    max_tokens=16000,
-    client_timeout=30.0,
-    max_budget_usd=2.0,
-    compaction_instructions=None,
-    build_workspace_context=lambda: "",
-    tool_packs=None,
-    run_once_use_tool_packs=False,
-    build_system_prompt=lambda **kwargs: "system prompt",
+  profile = _analyst_run_once_profile(
     build_initial_user_message=_build_initial_user_message,
-    describe_market_status=lambda: "closed",
-    on_fallback=None,
-    retry_config=None,
-    state_subdir="analyst",
-    state_file_name="state.json",
-    format_tool_catalog=lambda *args, **kwargs: "",
-    build_tool_packs_section=lambda *args, **kwargs: "",
   )
 
+  monkeypatch.setattr(
+    run_once_runner,
+    "autonomous_storage_layout",
+    lambda _profile_name: storage_layout,
+  )
   monkeypatch.setattr(autonomous_entry, "build_agent_session_log", lambda **kwargs: log)
   monkeypatch.setattr(autonomous_entry, "_build_runtime_context", _fake_build_runtime_context)
   monkeypatch.setattr(autonomous_entry, "create_session_objects", _fake_create_session_objects)
@@ -242,19 +234,21 @@ def test_run_once_skips_state_update_on_interrupted_run(
 ) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "run-once-interrupted.jsonl")
   workspace = tmp_path / "workspace"
-  state_dir = workspace / "notes" / "analyst"
+  storage_layout = _analyst_storage_layout()
+  state_dir = workspace / "notes" / storage_layout.state_dir
   state_dir.mkdir(parents=True, exist_ok=True)
-  state_path = state_dir / "state.json"
+  state_path = workspace / "notes" / storage_layout.state_file
   state_path.write_text("{still invalid json", encoding="utf-8")
 
   async def _fake_build_runtime_context(*args: Any, **kwargs: Any):
-    _ = args, kwargs
+    _ = kwargs
     return SimpleNamespace(
       workspace=workspace,
       tool_catalog="catalog",
       tool_packs_section="",
       connected_servers={"fmp-mcp"},
       active_servers={"fmp-mcp"},
+      runtime_config=args[1],
     )
 
   def _fake_create_session_objects(*args: Any, **kwargs: Any):
@@ -280,35 +274,13 @@ def test_run_once_skips_state_update_on_interrupted_run(
   def _unexpected_write(_path: Path, _payload: dict[str, Any]) -> None:
     raise AssertionError("state.json should not be written")
 
-  profile = SimpleNamespace(
-    name="analyst",
-    run_once_session_id_template="{profile}:{today}",
-    briefing_file_template="analyst/{date}.md",
-    run_once_excluded_tools=None,
-    run_once_allowed_run_bash_commands=None,
-    excluded_tools=set(),
-    model="claude-sonnet-4-6",
-    max_turns=5,
-    timeout_seconds=60.0,
-    per_turn_timeout=None,
-    max_tokens=16000,
-    client_timeout=30.0,
-    max_budget_usd=2.0,
-    compaction_instructions=None,
-    build_workspace_context=lambda: "",
-    tool_packs=None,
-    run_once_use_tool_packs=False,
-    build_system_prompt=lambda **kwargs: "system prompt",
-    build_initial_user_message=lambda today, briefing_file: "Run the analyst loop.",
-    describe_market_status=lambda: "closed",
-    on_fallback=None,
-    retry_config=None,
-    state_subdir="analyst",
-    state_file_name="state.json",
-    format_tool_catalog=lambda *args, **kwargs: "",
-    build_tool_packs_section=lambda *args, **kwargs: "",
-  )
+  profile = _analyst_run_once_profile()
 
+  monkeypatch.setattr(
+    run_once_runner,
+    "autonomous_storage_layout",
+    lambda _profile_name: storage_layout,
+  )
   monkeypatch.setattr(autonomous_entry, "build_agent_session_log", lambda **kwargs: log)
   monkeypatch.setattr(autonomous_entry, "_build_runtime_context", _fake_build_runtime_context)
   monkeypatch.setattr(autonomous_entry, "create_session_objects", _fake_create_session_objects)
@@ -342,13 +314,14 @@ def test_run_once_budget_exceeded_with_fresh_briefing_returns_degraded_success(
   workspace = tmp_path / "workspace"
 
   async def _fake_build_runtime_context(*args: Any, **kwargs: Any):
-    _ = args, kwargs
+    _ = kwargs
     return SimpleNamespace(
       workspace=workspace,
       tool_catalog="catalog",
       tool_packs_section="",
       connected_servers={"fmp-mcp"},
       active_servers={"fmp-mcp"},
+      runtime_config=args[1],
     )
 
   def _fake_create_session_objects(*args: Any, **kwargs: Any):
@@ -373,11 +346,17 @@ def test_run_once_budget_exceeded_with_fresh_briefing_returns_degraded_success(
     captured["fallback_state"] = state
     return f"# Analyst Briefing - {today} (AUTO-RECOVERY)\nRecovered from budget cap.\n"
 
-  def _fake_send_telegram_summary(_profile: Any, run_output: Any, _briefing_file: str, **kwargs: Any) -> None:
+  def _fake_send_telegram_summary(_profile_name: str, run_output: Any, _briefing_file: str, **kwargs: Any) -> None:
     captured["summary_output"] = run_output
     captured["summary_state"] = kwargs["state"]
 
-  profile = _analyst_run_once_profile(on_fallback=_fallback)
+  profile = _analyst_run_once_profile()
+  storage_layout = _analyst_storage_layout(fallback_renderer=_fallback)
+  monkeypatch.setattr(
+    run_once_runner,
+    "autonomous_storage_layout",
+    lambda _profile_name: storage_layout,
+  )
   monkeypatch.setattr(autonomous_entry, "build_agent_session_log", lambda **kwargs: log)
   monkeypatch.setattr(autonomous_entry, "_build_runtime_context", _fake_build_runtime_context)
   monkeypatch.setattr(autonomous_entry, "create_session_objects", _fake_create_session_objects)
@@ -394,7 +373,9 @@ def test_run_once_budget_exceeded_with_fresh_briefing_returns_degraded_success(
   )
 
   assert exit_code == 0
-  briefing_files = list((workspace / "notes" / "analyst").glob("*.md"))
+  briefing_files = list(
+    (workspace / "notes" / storage_layout.state_dir).glob("*.md")
+  )
   assert len(briefing_files) == 1
   assert "Recovered from budget cap." in briefing_files[0].read_text(encoding="utf-8")
   assert captured["summary_output"].budget_exceeded is True
@@ -414,13 +395,14 @@ def test_run_once_budget_exceeded_without_fresh_briefing_returns_budget_exit(
   workspace = tmp_path / "workspace"
 
   async def _fake_build_runtime_context(*args: Any, **kwargs: Any):
-    _ = args, kwargs
+    _ = kwargs
     return SimpleNamespace(
       workspace=workspace,
       tool_catalog="catalog",
       tool_packs_section="",
       connected_servers={"fmp-mcp"},
       active_servers={"fmp-mcp"},
+      runtime_config=args[1],
     )
 
   def _fake_create_session_objects(*args: Any, **kwargs: Any):
@@ -441,7 +423,15 @@ def test_run_once_budget_exceeded_without_fresh_briefing_returns_budget_exit(
   async def _fake_shutdown_session(_session_id: str, _mcp_client_manager: object = None) -> None:
     return None
 
-  profile = _analyst_run_once_profile(on_fallback=lambda _state, _today: "")
+  profile = _analyst_run_once_profile()
+  storage_layout = _analyst_storage_layout(
+    fallback_renderer=lambda _state, _today: "",
+  )
+  monkeypatch.setattr(
+    run_once_runner,
+    "autonomous_storage_layout",
+    lambda _profile_name: storage_layout,
+  )
   monkeypatch.setattr(autonomous_entry, "build_agent_session_log", lambda **kwargs: log)
   monkeypatch.setattr(autonomous_entry, "_build_runtime_context", _fake_build_runtime_context)
   monkeypatch.setattr(autonomous_entry, "create_session_objects", _fake_create_session_objects)
@@ -457,7 +447,7 @@ def test_run_once_budget_exceeded_without_fresh_briefing_returns_budget_exit(
   )
 
   assert exit_code == 2
-  assert not (workspace / "notes" / "analyst").exists()
+  assert not (workspace / "notes" / storage_layout.state_dir).exists()
 
 
 def test_run_output_allows_state_update_rejects_interrupted_outputs() -> None:

@@ -47,7 +47,7 @@ def test_linux_path_walk_uses_lookup_only_ancestors_and_readable_target(
   observed: list[tuple[str, int]] = []
 
   def tracked_open(
-    path: str | bytes | int,
+    path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
     flags: int,
     mode: int = 0o777,
     *,
@@ -98,7 +98,7 @@ def test_platform_fallback_uses_readable_descriptors_for_entire_chain(
   observed: list[int] = []
 
   def tracked_open(
-    path: str | bytes | int,
+    path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
     flags: int,
     mode: int = 0o777,
     *,

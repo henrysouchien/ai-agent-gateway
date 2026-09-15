@@ -18,6 +18,7 @@ export const CAPABILITY_RESOLUTION_CODES = [
   "capability_model_revoked",
   "capability_model_unavailable",
   "capability_policy_missing",
+  "capability_selection_invalid",
   "credential_unavailable",
   "default_not_eligible",
   "parent_binding_incompatible",

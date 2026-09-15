@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from agent_gateway.autonomous_admission_ledger import prepare_autonomous_admission_ledger
+from agent_gateway.launch_nonce_store import prepare_launch_nonce_store
 from agent_gateway.autonomous_launch_envelope import AutonomousControlAuthority
 from agent_gateway.capability_binding import CapabilityBind
 from agent_gateway.model_registry import (
@@ -14,7 +14,7 @@ from agent_gateway.model_registry import (
 )
 
 
-TASK_MANIFEST_VERSION = 7
+TASK_MANIFEST_VERSION = 8
 DEFAULT_CREDENTIAL_HANDLE_ID = "service:test-product:anthropic"
 _DEFAULT_MODEL_ENTRY = INITIAL_MODEL_REGISTRY.require("anthropic.claude-opus-5")
 
@@ -34,7 +34,7 @@ def write_v6_manifest(
   owner_lease_path.touch(exist_ok=True)
   owner_lease_path.chmod(0o600)
   owner_lease_stat = owner_lease_path.stat()
-  ledger = prepare_autonomous_admission_ledger(
+  ledger = prepare_launch_nonce_store(
     (log_dir / ".autonomous-admission-ledger.sqlite3").resolve()
   )
   control_authority = AutonomousControlAuthority(
@@ -45,12 +45,6 @@ def write_v6_manifest(
     operator_inbox_path=str(operator_path),
     operator_inbox_device=operator_stat.st_dev,
     operator_inbox_inode=operator_stat.st_ino,
-    approval_decisions_path=None,
-    approval_decisions_device=None,
-    approval_decisions_inode=None,
-    approval_store_path=None,
-    approval_store_device=None,
-    approval_store_inode=None,
   )
   default_bind = CapabilityBind(
     schema_version="1.0",
@@ -85,6 +79,11 @@ def write_v6_manifest(
     "pack": None,
     "deliver": True,
     "skill_resume_allowed": False,
+    "admitted_skill_execution_limits": {
+      "max_turns": None,
+      "max_tokens": None,
+      "max_budget_usd": None,
+    },
     "context": "Original work packet",
     "ticker": "MSFT",
     "channel": "tui",
@@ -105,9 +104,19 @@ def write_v6_manifest(
     "completed_at": 125.0,
     "resumed_from": None,
     "resumed_as": [],
-    "capability_bind": default_bind.receipt(),
+    "capability_bind": default_bind.to_json(),
   }
   manifest.update(overrides)
+  if "admitted_skill_execution_limits" not in overrides:
+    manifest["admitted_skill_execution_limits"] = (
+      {
+        "max_turns": None,
+        "max_tokens": None,
+        "max_budget_usd": None,
+      }
+      if manifest.get("mode") == "skill"
+      else None
+    )
   (log_dir / f"{task_id}.task.json").write_text(
     json.dumps(manifest, sort_keys=True) + "\n",
     encoding="utf-8",

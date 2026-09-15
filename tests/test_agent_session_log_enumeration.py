@@ -10,10 +10,12 @@ import stat
 import sys
 import threading
 import time
+from typing import Literal
 
 import pytest
 
 import agent_gateway.agent_session_log as session_log_module
+from agent_gateway.agent_session_log_records import LogEntry
 from agent_gateway.agent_session_log import (
   AgentSessionLog,
   AgentSessionLogEnumerationError,
@@ -259,19 +261,25 @@ def test_symlink_candidate_fails_closed(
     enumerate_agent_session_log_paths(base)
 
 
-def test_malformed_or_non_regular_segment_fails_closed(tmp_path: Path) -> None:
+def test_foreign_segment_file_is_ignored_and_non_regular_fails_closed(tmp_path: Path) -> None:
   base = tmp_path / "sessions"
   agent_dir = base / "web_advisor"
   segments_dir = agent_dir / "agentsess_session_user.segments"
   segments_dir.mkdir(parents=True)
-  malformed = segments_dir / "unexpected.jsonl"
-  malformed.write_bytes(_entry(seq=1))
+  segment = segments_dir / "000000000001-000000000001-g000000.jsonl"
+  segment.write_bytes(_entry(seq=1))
+  foreign = segments_dir / "unexpected.jsonl"
+  foreign.write_bytes(_entry(seq=1))
+  active = agent_dir / "agentsess_session_user.jsonl"
 
-  with pytest.raises(AgentSessionLogEnumerationError):
-    enumerate_agent_session_log_paths(base)
+  assert tuple(
+    location.path for location in enumerate_agent_session_log_paths(base)
+  ) == (active.resolve(),)
+  log = AgentSessionLog(active)
+  entries, _ = log.query_sync(event_types={"workflow_run_started"})
+  assert [entry.seq for entry in entries] == [1]
 
-  malformed.unlink()
-  fifo = segments_dir / "000000000001-000000000001-g000000.jsonl"
+  fifo = segments_dir / "000000000002-000000000002-g000000.jsonl"
   os.mkfifo(fifo)
   with pytest.raises(AgentSessionLogEnumerationError):
     enumerate_agent_session_log_paths(base)
@@ -486,13 +494,19 @@ def test_segment_swap_between_name_check_and_open_fails_closed(
   real_open = session_log_module.os.open
   swapped = False
 
-  def swap_then_open(path: object, flags: int, *args: object, **kwargs: object):
+  def swap_then_open(
+    path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    flags: int,
+    mode: int = 0o777,
+    *,
+    dir_fd: int | None = None,
+  ) -> int:
     nonlocal swapped
-    if path == segment_name and kwargs.get("dir_fd") is not None and not swapped:
+    if path == segment_name and dir_fd is not None and not swapped:
       swapped = True
       local_segment.unlink()
       local_segment.symlink_to(outside)
-    return real_open(path, flags, *args, **kwargs)
+    return real_open(path, flags, mode, dir_fd=dir_fd)
 
   monkeypatch.setattr(session_log_module.os, "open", swap_then_open)
 
@@ -520,12 +534,17 @@ def test_foreign_owned_segment_file_fails_closed(
   real_stat = session_log_module.os.stat
 
   def foreign_owned_stat(
-    path: object,
-    *args: object,
-    **kwargs: object,
+    path: int | str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    *,
+    dir_fd: int | None = None,
+    follow_symlinks: bool = True,
   ) -> os.stat_result:
-    result = real_stat(path, *args, **kwargs)
-    if path == segment_name and kwargs.get("dir_fd") is not None:
+    result = real_stat(
+      path,
+      dir_fd=dir_fd,
+      follow_symlinks=follow_symlinks,
+    )
+    if path == segment_name and dir_fd is not None:
       values = list(result)
       values[4] = os.geteuid() + 1
       return os.stat_result(values)
@@ -571,13 +590,13 @@ def test_strict_current_scan_holds_rotation_snapshot_mutex(
   release = threading.Event()
   original_parse = reader._parse_entry_current_strict
 
-  def pause_during_scan(raw: bytes):
+  def pause_during_scan(raw: bytes) -> LogEntry | None:
     entered.set()
     assert release.wait(timeout=5)
     return original_parse(raw)
 
   monkeypatch.setattr(reader, "_parse_entry_current_strict", pause_during_scan)
-  query_result: list[object] = []
+  query_result: list[LogEntry] = []
   query_thread = threading.Thread(
     target=lambda: query_result.extend(asyncio.run(
       reader.query_current_strict()
@@ -624,22 +643,28 @@ def test_rotation_directory_swap_cannot_move_active_log_outside(
   swapped = False
 
   def swap_directory_then_replace(
-    source: object,
-    destination: object,
-    *args: object,
-    **kwargs: object,
+    source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    destination: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    *,
+    src_dir_fd: int | None = None,
+    dst_dir_fd: int | None = None,
   ) -> None:
     nonlocal swapped
     if (
       source == log.path.name
-      and kwargs.get("src_dir_fd") is not None
-      and kwargs.get("dst_dir_fd") is not None
+      and src_dir_fd is not None
+      and dst_dir_fd is not None
       and not swapped
     ):
       swapped = True
       log.segments_dir.rename(displaced)
       log.segments_dir.symlink_to(outside, target_is_directory=True)
-    real_replace(source, destination, *args, **kwargs)
+    real_replace(
+      source,
+      destination,
+      src_dir_fd=src_dir_fd,
+      dst_dir_fd=dst_dir_fd,
+    )
 
   monkeypatch.setattr(session_log_module.os, "replace", swap_directory_then_replace)
 
@@ -748,13 +773,19 @@ def test_active_log_swap_after_descriptor_open_fails_closed(
   real_open = session_log_module.os.open
   swapped = False
 
-  def swap_after_open(path: object, flags: int, *args: object, **kwargs: object):
+  def swap_after_open(
+    path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    flags: int,
+    mode: int = 0o777,
+    *,
+    dir_fd: int | None = None,
+  ) -> int:
     nonlocal swapped
-    descriptor = real_open(path, flags, *args, **kwargs)
+    descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
     if (
       path == active.name
       and flags & os.O_ACCMODE == os.O_RDONLY
-      and kwargs.get("dir_fd") is not None
+      and dir_fd is not None
       and not swapped
     ):
       swapped = True
@@ -873,21 +904,22 @@ def test_directory_descriptor_fstat_failures_do_not_leak(
   target_descriptors: set[int] = set()
 
   def track_final_parent(
-    path: object,
+    path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
     flags: int,
-    *args: object,
-    **kwargs: object,
+    mode: int = 0o777,
+    *,
+    dir_fd: int | None = None,
   ) -> int:
-    descriptor = real_open(path, flags, *args, **kwargs)
+    descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
     if (
       path == log.path.parent.name
-      and kwargs.get("dir_fd") is not None
+      and dir_fd is not None
       and flags & os.O_DIRECTORY
     ):
       target_descriptors.add(descriptor)
     return descriptor
 
-  def fail_for_final_parent(descriptor: int):
+  def fail_for_final_parent(descriptor: int) -> os.stat_result:
     if descriptor in target_descriptors:
       target_descriptors.remove(descriptor)
       raise OSError("injected post-open fstat failure")
@@ -932,7 +964,7 @@ def test_strict_current_query_rejects_ambiguous_unterminated_active_tail(
 @pytest.mark.parametrize("order", ("asc", "desc"))
 def test_strict_current_query_streams_full_large_log_with_bounded_page(
   tmp_path: Path,
-  order: str,
+  order: Literal["asc", "desc"],
 ) -> None:
   active = tmp_path / "sessions" / "web_advisor" / "session.jsonl"
   log = AgentSessionLog(active)
@@ -946,7 +978,7 @@ def test_strict_current_query_streams_full_large_log_with_bounded_page(
   excluded = frozenset(range(10, 2_001, 10))
   visited = 0
 
-  def exclude_entry(entry) -> bool:
+  def exclude_entry(entry: LogEntry) -> bool:
     nonlocal visited
     visited += 1
     return entry.seq % 7 == 0

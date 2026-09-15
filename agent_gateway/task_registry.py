@@ -9,7 +9,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 import re
-from typing import Any, Callable, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol, TypeGuard
 
 from agent_workflow_contracts import (
   AdmittedTask,
@@ -23,10 +23,11 @@ from .agent_session_log_records import (
   EVENT_SCHEMA_VERSION,
   is_current_event_schema_version,
 )
-from .events import AgentCompletionEvent, event_from_dict
+from .events import AgentCompletionEvent, TypedEvent, event_from_dict
 from .skill_lifecycle import (
   SKILL_RESULT_CORE_FIELDS,
   SkillLifecycleArtifactIdentity,
+  SkillLifecycleScope,
   TopLevelSkillLifecycleMetadata,
 )
 
@@ -62,6 +63,21 @@ _NOTIFICATION_RETRIEVAL_REQUIRED_STATES = frozenset({
 })
 TASK_NOTIFICATION_INLINE_PAYLOAD_MAX_BYTES = 32_768
 TASK_NOTIFICATION_OVERFLOW_SAMPLE_TASK_IDS = 5
+
+
+def _all_agent_completion_events(
+  events: list[TypedEvent],
+) -> TypeGuard[list[AgentCompletionEvent]]:
+  return all(
+    isinstance(event, AgentCompletionEvent)
+    for event in events
+  )
+
+
+def _is_skill_lifecycle_scope(
+  value: object,
+) -> TypeGuard[SkillLifecycleScope]:
+  return value in ("ticker", "portfolio")
 
 
 def _notification_payload_preflight_reason(payload: Any) -> str | None:
@@ -177,7 +193,7 @@ def task_state_for_result(result: TaskResult) -> TaskState:
 def validate_task_result_settlement(
   result: TaskResult,
   *,
-  final_state: TaskState | str,
+  final_state: object,
   error: dict[str, Any] | None,
 ) -> TaskState:
   """Validate the redundant outer settlement against canonical execution."""
@@ -316,6 +332,8 @@ def _required_skill_lifecycle_identity(
       f"Task {task_id} required skill lifecycle identity is invalid"
     )
   try:
+    if not _is_skill_lifecycle_scope(scope):
+      raise ValueError("scope must be exactly 'ticker' or 'portfolio'")
     artifact_identity = SkillLifecycleArtifactIdentity(
       scope=scope,
       ticker=ticker,
@@ -757,6 +775,11 @@ class TaskNotification:
     repr=False,
     compare=False,
   )
+  workflow_boundary_delivered: Callable[[], None] | None = field(
+    default=None,
+    repr=False,
+    compare=False,
+  )
   _payload_json: str | None = field(init=False, repr=False, compare=False)
   _payload_xml_text: str | None = field(
     init=False,
@@ -888,13 +911,21 @@ class TaskNotification:
     return "\n".join(parts)
 
 
-@dataclass
+@dataclass(frozen=True)
 class CoordinatorConfig:
   enabled: bool = False
   preamble: str | None = None
-  worker_excluded_tools: set[str] | None = None
+  worker_excluded_tools: frozenset[str] | None = None
   auto_notify: bool = True
   max_workers: int = 3
+
+  def __post_init__(self) -> None:
+    if self.worker_excluded_tools is not None:
+      object.__setattr__(
+        self,
+        "worker_excluded_tools",
+        frozenset(self.worker_excluded_tools),
+      )
 
 
 COORDINATOR_DEFAULT_PREAMBLE = """You are operating in coordinator mode. Delegate tasks to workers:
@@ -1321,7 +1352,8 @@ class TaskRegistry:
 
     current = self._tasks.get(task_id)
     if (
-      current is not expected
+      current is None
+      or current is not expected
       or current.state != TaskState.PENDING
       or current.asyncio_task is not None
     ):
@@ -1692,10 +1724,7 @@ class TaskRegistry:
             "message": f"Persisted AgentCompletionEvent is invalid: {exc}",
           }
         else:
-          if any(
-            not isinstance(candidate, AgentCompletionEvent)
-            for candidate in typed_completions
-          ):
+          if not _all_agent_completion_events(typed_completions):
             state = TaskState.FAILED
             error = {
               "code": "invalid_agent_completion",
@@ -1738,8 +1767,10 @@ class TaskRegistry:
         terminal_reason = str(
           task_result.execution.terminal_reason or ""
         ).partition(":")[0]
-        if terminal_reason in {"cancelled", "killed"}:
-          termination_intent = terminal_reason
+        if terminal_reason == "cancelled":
+          termination_intent = "cancelled"
+        elif terminal_reason == "killed":
+          termination_intent = "killed"
 
       required_skill_result_settled = False
       lifecycle = metadata.get("required_skill_lifecycle")

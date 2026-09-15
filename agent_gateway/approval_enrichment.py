@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 import json
+import logging
 import math
 from typing import Any, Mapping
+
+log = logging.getLogger("agent_gateway.approval_enrichment")
 
 
 _TRADE_EXECUTE_TO_PREVIEW_TOOLS = {
@@ -110,6 +113,13 @@ def enrich_trade_approval_args(
   )
   if summary is not None:
     enriched["approval_summary"] = summary
+  else:
+    log.warning(
+      "Trade approval for %s proceeds without preview summary evidence: no "
+      "fresh matching preview found for %s | failure=true",
+      tool_name,
+      preview_ids or preview_id,
+    )
   return enriched
 
 

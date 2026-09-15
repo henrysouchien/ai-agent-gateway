@@ -7,7 +7,7 @@ from pathlib import Path
 import stat
 from typing import Any, Callable
 
-from .agent_session_log_records import _atomic_write_sidecar, _now_iso
+from .agent_session_log_records import _now_iso
 from .descriptor_paths import DirectoryIdentity, open_directory_chain
 
 
@@ -89,52 +89,6 @@ def active_sidecar_payload(
     }
   )
   return payload
-
-
-def write_meta_sidecar(
-  path: Path,
-  session_ref: Any,
-  *,
-  active_sidecar_payload_fn: Callable[[dict[str, Any]], dict[str, Any]],
-  atomic_write_sidecar_fn: Callable[[Path, dict[str, Any]], None] = _atomic_write_sidecar,
-  now_iso_fn: Callable[[], str] = _now_iso,
-  logger: Any | None = None,
-) -> None:
-  meta_path = path.with_suffix(".meta.json")
-  if meta_path.exists():
-    return
-  try:
-    from .product_config import gateway_product_id
-
-    atomic_write_sidecar_fn(
-      meta_path,
-      active_sidecar_payload_fn(
-        {
-          "agent_session_id": session_ref.agent_session_id,
-          "agent_id": session_ref.agent_id,
-          "user_id": session_ref.user_id,
-          "product_id": gateway_product_id() or None,
-          "file_kind": "canonical",
-          "channel": None,
-          "profile": None,
-          "created_at": now_iso_fn(),
-        },
-      ),
-    )
-  except Exception:
-    if logger is not None:
-      logger.warning("Sidecar write failed for %s (telemetry-only)", meta_path, exc_info=True)
-
-
-def load_sidecar_payload(path: Path) -> dict[str, Any] | None:
-  meta_path = path.with_suffix(".meta.json")
-  if not meta_path.exists():
-    return None
-  try:
-    payload = json.loads(meta_path.read_text(encoding="utf-8"))
-  except (OSError, json.JSONDecodeError):
-    return None
-  return payload if isinstance(payload, dict) else None
 
 
 def _strict_json_object(raw: bytes) -> dict[str, Any]:
@@ -289,6 +243,7 @@ def segment_sidecar_payload(
     "first_seq": first_seq,
     "last_seq": last_seq,
     "rotated_from_source_id": telemetry_source_id_fn("active", f"{active_generation:06d}"),
+    # The rotation locator can move independently of creation-time lineage.
     "rotated_from_path": str(path),
     "rotated_from_file_identity": rotated_from_file_identity,
   }

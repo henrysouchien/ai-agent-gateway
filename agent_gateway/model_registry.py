@@ -24,7 +24,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, Mapping, TypeAlias
+from typing import Final, Literal, Mapping, TypeAlias
 
 import yaml
 
@@ -48,8 +48,13 @@ SelectionSource: TypeAlias = Literal[
   "parent_binding",
 ]
 
+# Single spelling of the chat-driver capability id.  Python consumers import
+# this constant; TypeScript consumes the generated projection
+# (scripts/generate_agent_workflow_contracts.py).
+SESSION_DRIVER_CAPABILITY: Final[str] = "session.driver"
+
 CORE_CAPABILITY_IDS = frozenset({
-  "session.driver",
+  SESSION_DRIVER_CAPABILITY,
   "plan.author",
   "node.explore",
   "node.implement",
@@ -399,7 +404,7 @@ class CapabilitySelectionPolicy:
       raise ValueError(f"{capability_id} default must be allowed")
     if self.allow_saved_preference and not self.allow_explicit_user:
       raise ValueError("saved preferences require explicit user selection")
-    if self.allow_explicit_user and capability_id != "session.driver":
+    if self.allow_explicit_user and capability_id != SESSION_DRIVER_CAPABILITY:
       raise ValueError("only session.driver accepts conversational user selection")
     if self.allow_authenticated_run_override and capability_id != "plan.author":
       raise ValueError(f"{capability_id} cannot accept a run-level override")
@@ -827,11 +832,10 @@ MODEL_SELECTION_ARTIFACT_PATH = _selected_artifact_path(
 INITIAL_MODEL_REGISTRY = load_model_registry(MODEL_REGISTRY_ARTIFACT_PATH)
 
 # Adapter support is admitted from installed adapter declarations, never a
-# hand-maintained table.  ``agent_gateway/__init__`` admits the loaded INITIAL
-# artifacts against ``providers.installed_adapter_route_support()`` for the
-# gateway-executed capability set at import (this module cannot import
-# ``providers`` without a cycle), and ``create_gateway_app`` re-runs the full
-# closure over whatever registry the server is actually configured with.
+# hand-maintained table.  ``providers`` admits the loaded INITIAL artifacts
+# against ``installed_adapter_route_support()`` for the gateway-executed
+# capability set when the provider package loads, and ``create_gateway_app``
+# re-runs the full closure over whatever registry the server is configured with.
 
 INITIAL_MODEL_SELECTION_POLICY = load_model_selection_policy(
   MODEL_SELECTION_ARTIFACT_PATH

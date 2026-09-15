@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import json
 import re
 import time
-from typing import Callable, Mapping
+from typing import Callable, Mapping, TypeGuard
 from uuid import UUID
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -36,6 +36,13 @@ class CommercialClaimError(ValueError):
     super().__init__(code)
 
 
+def _load_ed25519_public_key(pem: bytes) -> Ed25519PublicKey:
+  key = load_pem_public_key(pem)
+  if not isinstance(key, Ed25519PublicKey):
+    raise ValueError("commercial verification keys must be Ed25519")
+  return key
+
+
 @dataclass(frozen=True)
 class CommercialContextState:
   active: bool
@@ -61,9 +68,7 @@ class CommercialClaimTrustSnapshot:
     for key_id, pem in self.public_keys_by_id.items():
       if not _STABLE_CODE.fullmatch(key_id):
         raise ValueError("commercial verification key id is invalid")
-      key = load_pem_public_key(pem)
-      if not isinstance(key, Ed25519PublicKey):
-        raise ValueError("commercial verification keys must be Ed25519")
+      _load_ed25519_public_key(pem)
     for versions in (
       self.manifest_versions, self.payer_policy_versions,
       self.budget_policy_versions, self.shadow_rate_versions,
@@ -100,7 +105,7 @@ class CommercialClaimVerifier:
   def __init__(self, trust: CommercialClaimTrustSnapshot) -> None:
     self._trust = trust
     self._keys = {
-      key_id: load_pem_public_key(pem)
+      key_id: _load_ed25519_public_key(pem)
       for key_id, pem in trust.public_keys_by_id.items()
     }
 
@@ -300,7 +305,7 @@ class CommercialClaimVerifier:
     )
 
 
-def _valid_version(value: object) -> bool:
+def _valid_version(value: object) -> TypeGuard[str]:
   return isinstance(value, str) and 1 <= len(value) <= 256 and not value.isspace()
 
 

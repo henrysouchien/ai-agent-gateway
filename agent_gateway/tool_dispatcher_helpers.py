@@ -9,13 +9,20 @@ import json
 import logging
 from collections.abc import Sequence as AbcSequence
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, Literal, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, Dict, Literal, Mapping, Optional, Protocol, Sequence, Tuple, TYPE_CHECKING, TypeGuard
 
 from . import approval_settings
-from .event_log import EventLog
 
 if TYPE_CHECKING:
+  from fms.core.change_set import ChangeSet, SnapshotPayload, StoreWritePayload
+  from research.reviewed_change_binding import ReviewedChangeBinding
+
   from .ui_blocks_run import UiBlocksRunContext
+
+class EventLogWriter(Protocol):
+  """Append-only event surface required by dispatcher helper contracts."""
+
+  def append(self, event: Dict[str, Any]) -> object | None: ...
 
 ToolResult = Tuple[Optional[Any], Optional[Dict[str, Any]]]
 NeedsApprovalCallback = Callable[[str, Dict[str, Any], str], bool]
@@ -204,12 +211,15 @@ def _verified_bundle_member_sha256(
 
 
 def _model_writer_undo_review(
-  contract: Any,
-  change_set: Any,
   *,
   snapshot_store_ids: frozenset[str],
   model_write_store_ids: frozenset[str],
 ) -> dict[str, Any]:
+  # The owner (api/fms/core/persist_runner.py) retired after-commit durable
+  # Undo issuance in 1dac98bc1 ("Cut FMS mutations over to explicit model
+  # scope"); no persist subcommand issues a durable token anymore, so this
+  # review derives availability from the snapshots actually staged in the
+  # exact plan instead of probing a deleted private capability constant.
   scope = "workbook_and_ticker_override_state"
   if not model_write_store_ids:
     return {
@@ -217,37 +227,7 @@ def _model_writer_undo_review(
       "status": "not_required",
       "reason": "plan_has_no_workbook_or_ticker_override_state_write",
     }
-
-  persist_runner_module = f"{contract.__name__.rsplit('.', 1)[0]}.persist_runner"
-  try:
-    persist_runner = importlib.import_module(persist_runner_module)
-  except ModuleNotFoundError as exc:
-    if exc.name not in {
-      persist_runner_module,
-      persist_runner_module.split(".")[0],
-    }:
-      raise
-    raise TrustedToolPlanError(
-      "durable Undo capability contract is unavailable"
-    ) from exc
-  durable_subcommands = getattr(
-    persist_runner,
-    "_DURABLE_UNDO_SUBCOMMANDS",
-    None,
-  )
-  if not isinstance(durable_subcommands, frozenset):
-    raise TrustedToolPlanError("durable Undo capability contract is invalid")
-
   missing_snapshots = sorted(model_write_store_ids.difference(snapshot_store_ids))
-  subcommand = str(change_set.intent.subcommand)
-  if subcommand in durable_subcommands and not missing_snapshots:
-    return {
-      "scope": scope,
-      "status": "durable_token_after_commit",
-      "tool_name": "fms_undo_model_writer_commit",
-      "issued_when": "authorized_commit_succeeds",
-      "covers_store_ids": sorted(model_write_store_ids),
-    }
   return {
     "scope": scope,
     "status": "not_available_for_this_subcommand",
@@ -275,6 +255,53 @@ def _planning_contract_module_for_identity(
     raise TrustedToolPlanError(
       "planned-write identity contract is unavailable"
     ) from exc
+
+def _is_exact_snapshot_payload(
+  payload: object,
+  payload_type: type["SnapshotPayload"],
+) -> TypeGuard["SnapshotPayload"]:
+  return type(payload) is payload_type
+
+
+def _is_exact_store_write_payload(
+  payload: object,
+  payload_type: type["StoreWritePayload"],
+) -> TypeGuard["StoreWritePayload"]:
+  return type(payload) is payload_type
+
+
+def _is_exact_change_set(
+  identity: object,
+  identity_type: type[object],
+) -> TypeGuard["ChangeSet"]:
+  return type(identity) is identity_type
+
+
+def _require_exact_change_set(
+  identity: object,
+  identity_type: type[object],
+) -> "ChangeSet":
+  if not _is_exact_change_set(identity, identity_type):
+    raise TrustedToolPlanError("change_set planner returned the wrong identity type")
+  return identity
+
+
+def _is_exact_reviewed_change_binding(
+  identity: object,
+  identity_type: type[object],
+) -> TypeGuard["ReviewedChangeBinding"]:
+  return type(identity) is identity_type
+
+
+def _require_exact_reviewed_change_binding(
+  identity: object,
+  identity_type: type[object],
+) -> "ReviewedChangeBinding":
+  if not _is_exact_reviewed_change_binding(identity, identity_type):
+    raise TrustedToolPlanError(
+      "reviewed_change_binding planner returned the wrong identity type"
+    )
+  return identity
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,51 +334,48 @@ class TrustedToolPlan:
       contract = _planning_contract_module_for_identity(
         identity,
         "fms.core.change_set",
-        "api.fms.core.change_set",
       )
-      if type(identity) is not contract.ChangeSet:
-        raise TrustedToolPlanError("change_set planner returned the wrong identity type")
-      identity.verify_identity()
-      if getattr(prepared, "change_set", None) is not identity:
+      change_set = _require_exact_change_set(identity, contract.ChangeSet)
+      change_set.verify_identity()
+      if getattr(prepared, "change_set", None) is not change_set:
         raise TrustedToolPlanError("prepared FMS payload is not linked to the exact ChangeSet")
       return cls(
         identity_source="change_set",
-        identity=identity,
+        identity=change_set,
         prepared=prepared,
-        change_set_id=identity.change_set_id,
-        change_hash=identity.change_hash,
-        base_vector_hash=contract.compute_base_vector_hash(identity.base_vector),
+        change_set_id=change_set.change_set_id,
+        change_hash=change_set.change_hash,
+        base_vector_hash=contract.compute_base_vector_hash(change_set.base_vector),
       )
     if identity_source == "reviewed_change_binding":
       contract = _planning_contract_module_for_identity(
         identity,
         "research.reviewed_change_binding",
-        "research.reviewed_change_binding",
       )
-      if type(identity) is not contract.ReviewedChangeBinding:
-        raise TrustedToolPlanError(
-          "reviewed_change_binding planner returned the wrong identity type"
-        )
-      identity.verify_identity()
-      if getattr(prepared, "binding", None) is not identity:
+      reviewed_binding = _require_exact_reviewed_change_binding(
+        identity,
+        contract.ReviewedChangeBinding,
+      )
+      reviewed_binding.verify_identity()
+      if getattr(prepared, "binding", None) is not reviewed_binding:
         raise TrustedToolPlanError(
           "prepared reviewed-change payload is not linked to the exact binding"
         )
       review_reference = (
         None
-        if identity.review_reference is None
-        else identity.review_reference.to_dict()
+        if reviewed_binding.review_reference is None
+        else reviewed_binding.review_reference.to_dict()
       )
       return cls(
         identity_source="reviewed_change_binding",
-        identity=identity,
+        identity=reviewed_binding,
         prepared=prepared,
-        change_set_id=identity.change_set_id,
-        change_hash=identity.change_hash,
-        base_vector_hash=identity.base_vector_hash,
-        reviewed_change_binding_digest=identity.reviewed_change_binding_digest,
+        change_set_id=reviewed_binding.change_set_id,
+        change_hash=reviewed_binding.change_hash,
+        base_vector_hash=reviewed_binding.base_vector_hash,
+        reviewed_change_binding_digest=reviewed_binding.reviewed_change_binding_digest,
         review_reference=review_reference,
-        execution_semantics_digest=identity.execution_semantics_digest,
+        execution_semantics_digest=reviewed_binding.execution_semantics_digest,
       )
     raise TrustedToolPlanError(f"unsupported planning identity: {identity_source!r}")
 
@@ -383,20 +407,28 @@ class TrustedToolPlan:
     contract = _planning_contract_module_for_identity(
       self.identity,
       "fms.core.change_set",
-      "api.fms.core.change_set",
     )
-    change_set = self.identity
+    change_set = _require_exact_change_set(
+      self.identity,
+      contract.ChangeSet,
+    )
     snapshot_store_ids = frozenset(
-      str(effect.payload.store_id)
+      str(payload.store_id)
       for effect in change_set.effects
-      if type(effect.payload) is contract.SnapshotPayload
+      if _is_exact_snapshot_payload(
+        payload := effect.payload,
+        contract.SnapshotPayload,
+      )
     )
     model_write_store_ids = frozenset(
-      str(effect.payload.store_id)
+      str(payload.store_id)
       for effect in change_set.effects
       if (
-        type(effect.payload) is contract.StoreWritePayload
-        and str(effect.payload.store_id) in _MODEL_STATE_STORE_IDS
+        _is_exact_store_write_payload(
+          payload := effect.payload,
+          contract.StoreWritePayload,
+        )
+        and str(payload.store_id) in _MODEL_STATE_STORE_IDS
       )
     )
     workbook_writes = [
@@ -407,8 +439,11 @@ class TrustedToolPlan:
       )
       for effect in change_set.effects
       if (
-        type(effect.payload) is contract.StoreWritePayload
-        and str(effect.payload.store_id) == "workbook"
+        _is_exact_store_write_payload(
+          payload := effect.payload,
+          contract.StoreWritePayload,
+        )
+        and str(payload.store_id) == "workbook"
       )
     ]
     return {
@@ -435,8 +470,6 @@ class TrustedToolPlan:
         "writes": workbook_writes,
       },
       "undo": _model_writer_undo_review(
-        contract,
-        change_set,
         snapshot_store_ids=snapshot_store_ids,
         model_write_store_ids=model_write_store_ids,
       ),
@@ -485,8 +518,14 @@ def active_local_tool_schema(
   except Exception as exc:
     return None, {
       "code": "tool_schema_unavailable",
-      "message": f"Could not load active tool schema for local tool '{tool_name}': {exc}",
-      "details": {"tool_name": tool_name},
+      "message": (
+        f"Cannot validate local tool '{tool_name}': "
+        f"the active tool catalog could not be read: {exc}"
+      ),
+      "details": {
+        "tool_name": tool_name,
+        "reason": "catalog_read_failed",
+      },
       "fix": "Retry after the active tool catalog is available.",
     }
 
@@ -495,16 +534,35 @@ def active_local_tool_schema(
       continue
     if str(definition.get("name") or "") != tool_name:
       continue
-    schema = definition.get("input_schema") or definition.get("parameters")
+    schema = definition.get("input_schema")
+    if schema is None:
+      schema = definition.get("parameters")
     if isinstance(schema, Mapping):
       return schema, None
-    return None, None
+    return None, {
+      "code": "tool_schema_unavailable",
+      "message": (
+        f"Cannot validate local tool '{tool_name}': "
+        "its active definition has no input schema."
+      ),
+      "details": {
+        "tool_name": tool_name,
+        "reason": "input_schema_missing",
+      },
+      "fix": "Retry after the active tool definition includes its input schema.",
+    }
 
   return None, {
-    "code": "tool_not_advertised",
-    "message": f"Local tool '{tool_name}' is not advertised in the active tool definitions for this run",
-    "details": {"tool_name": tool_name},
-    "fix": "Call only tools present in the active tool catalog.",
+    "code": "tool_schema_unavailable",
+    "message": (
+      f"Cannot validate local tool '{tool_name}': "
+      "its definition is absent from the active tool catalog."
+    ),
+    "details": {
+      "tool_name": tool_name,
+      "reason": "tool_definition_missing",
+    },
+    "fix": "Retry after the active tool definition is available.",
   }
 
 
@@ -653,7 +711,7 @@ def validate_local_tool_input(
   *,
   local_tool_handlers: Mapping[str, Callable[..., Awaitable[ToolResult]]],
   get_tool_definitions: Callable[[], Sequence[Mapping[str, Any]]] | None,
-  event_log: EventLog | None,
+  event_log: EventLogWriter | None,
   active_local_tool_schema_fn: Callable[[str], tuple[Mapping[str, Any] | None, Dict[str, Any] | None]] | None = None,
   validate_against_local_schema_fn: Callable[[str, Any, Mapping[str, Any]], Dict[str, Any] | None] | None = None,
 ) -> Dict[str, Any] | None:
@@ -779,7 +837,7 @@ async def run_interceptors(
   tool_input: Dict[str, Any],
   *,
   interceptors: Sequence[ToolInterceptor],
-  event_log: EventLog | None,
+  event_log: EventLogWriter | None,
   session_id: str,
   log: logging.Logger,
 ) -> InterceptResult:
@@ -891,7 +949,7 @@ class ToolExecutionContext:
 
   tool_call_id: str
   tool_name: str
-  event_log: EventLog | None
+  event_log: EventLogWriter | None
   resolved_qualifier: str = ""
   abort_event: asyncio.Event | None = None
   skill_run_id: str | None = None

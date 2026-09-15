@@ -9,17 +9,21 @@ import time
 import uuid
 from dataclasses import replace
 from itertools import count
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from agent_gateway import AgentRunner
 from agent_gateway.autonomous_capability_handoff import AutonomousCapabilityBinding
 from agent_gateway.autonomous_event_channel import (
   adopt_inherited_autonomous_event_channel,
 )
 from agent_gateway.autonomous_launch_envelope import (
   AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+  AUTONOMOUS_RUNTIME_SESSION_PURPOSE,
 )
 from agent_gateway.approval_audit import ApprovalAuditEmitter
 from agent_gateway.approval_notifications import ApprovalNotificationDestination
@@ -235,12 +239,32 @@ class _NoopPolicy:
     return True
 
 
+class _NoopRunner(AgentRunner):
+  def __init__(self) -> None:
+    pass
+
+  def bind_selected_content(self, bindings) -> None:
+    _ = bindings
+
+  async def run(
+    self,
+    messages,
+    system_prompt=None,
+    max_turns=None,
+    *,
+    resume_initial_messages=None,
+  ) -> None:
+    _ = messages, system_prompt, max_turns, resume_initial_messages
+
+
+
+
 def _make_app(tmp_path, policy: _NoopPolicy | None = None):
-  async def _build_chat_runtime(*, session, request, channel, auth_manager):
+  async def _build_chat_runtime(session, request, channel, auth_manager, *, storage_root: Path | None = None):
     _ = session, channel, auth_manager
     return ChatRuntime(
       system_prompt="test",
-      build_runner=lambda *_args: None,
+      build_runner=lambda _event_log, _sid, _started_at: _NoopRunner(),
       capability_execution=request.capability_execution,
     )
 
@@ -294,14 +318,16 @@ def _with_model_entitlements(
   client: TestClient,
   session_payload: dict[str, Any],
 ) -> dict[str, Any]:
-  session = client.app.state.auth.session_store.get_session(
+  app = client.app
+  assert isinstance(app, FastAPI)
+  session = app.state.auth.session_store.get_session(
     session_payload["session_id"]
   )
   assert session is not None
   session.model_entitled_capabilities = CAPABILITY_IDS
   session.model_entitled_keys = frozenset(INITIAL_MODEL_REGISTRY.models)
   payload = dict(session_payload)
-  payload["session_token"] = client.app.state.auth.issue_token(session)
+  payload["session_token"] = app.state.auth.issue_token(session)
   return payload
 
 
@@ -775,10 +801,10 @@ def test_control_approval_notification_retry_requeues_failed_outbox_with_redacte
     raise RuntimeError("telegram down")
 
   app, store, _policy, _writer = _make_app(tmp_path)
-  store._notification_destination_resolver = lambda _request: [  # type: ignore[attr-defined]
+  store._notification_destination_resolver = lambda _request: [
     ApprovalNotificationDestination(channel="telegram", destination="chat-private")
   ]
-  store._notification_sender = failing_sender  # type: ignore[attr-defined]
+  store._notification_sender = failing_sender
   with TestClient(app) as client:
     control = _control_session(client, "alice")
     chat = _chat_session(client, "alice")
@@ -793,7 +819,7 @@ def test_control_approval_notification_retry_requeues_failed_outbox_with_redacte
     failed_rows = _run(store.list_approval_notification_outbox(approval.approval_id))
     assert failed_rows[0]["state"] == "failed_retryable"
     assert failed_rows[0]["destination"] == "chat-private"
-    store._notification_sender = None  # type: ignore[attr-defined]
+    store._notification_sender = None
 
     response = client.post(
       f"/api/control/runs/{chat['session_id']}/approvals/{approval.approval_id}/notifications/retry",
@@ -859,6 +885,11 @@ def test_control_approval_list_resolve_routes_approval_pending_autonomous_decisi
     )
     assert start.status_code == 200, start.text
     run_id = start.json()["run_id"]
+    autonomous_session = app.state.auth.session_store.get_session(run_id)
+    assert autonomous_session is not None
+    assert autonomous_session.kind == "chat"
+    assert autonomous_session.purpose == AUTONOMOUS_RUNTIME_SESSION_PURPOSE
+    assert autonomous_session.pending_tools == {}
     approval = _install_autonomous_pending_approval(
       app=app,
       store=store,
@@ -977,9 +1008,15 @@ def test_batch_approval_endpoints_pin_projection_store_and_policy_across_same_id
     )
 
     assert response.status_code == 200, response.text
-    assert _run(app_store.get(approval.approval_id)).state == "pending_user"
-    assert _run(session_store.get(approval.approval_id)).state == "pending_user"
-    assert _run(projection_store.get(approval.approval_id)).state == "approved"
+    app_record = _run(app_store.get(approval.approval_id))
+    session_record = _run(session_store.get(approval.approval_id))
+    projection_record = _run(projection_store.get(approval.approval_id))
+    assert app_record is not None
+    assert session_record is not None
+    assert projection_record is not None
+    assert app_record.state == "pending_user"
+    assert session_record.state == "pending_user"
+    assert projection_record.state == "approved"
     assert app_policy.resolved == []
     assert session_policy.resolved == []
     assert projection_policy.resolved == [approval.approval_id]
@@ -1017,7 +1054,9 @@ def test_batch_approval_projection_only_store_is_listed_and_resolved(tmp_path) -
       json={"approved": False, "reason": "projection only"},
     )
     assert response.status_code == 200, response.text
-    assert _run(projection_store.get(approval.approval_id)).state == "denied"
+    projection_record = _run(projection_store.get(approval.approval_id))
+    assert projection_record is not None
+    assert projection_record.state == "denied"
     assert _run(app_store.get(approval.approval_id)) is None
     assert projection_policy.resolved == [approval.approval_id]
     assert app_policy.resolved == []
@@ -1089,7 +1128,9 @@ def test_batch_approval_expiry_wins_over_late_vote(tmp_path) -> None:
       json={"approved": True},
     )
     assert response.status_code == 410
-    assert _run(store.get(approval.approval_id)).state == "expired"
+    expired_record = _run(store.get(approval.approval_id))
+    assert expired_record is not None
+    assert expired_record.state == "expired"
     assert queue.empty()
 
 

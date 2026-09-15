@@ -6,7 +6,7 @@ import logging
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from fastapi import HTTPException, Request
 
@@ -29,6 +29,25 @@ from .runs_helpers import (
   _session_has_cancel_event,
   _state_from_session,
 )
+
+
+class _PublishControlEvent(Protocol):
+  async def __call__(
+    self,
+    *,
+    user_id: str,
+    control_run_id: str,
+    event: dict[str, Any],
+  ) -> None: ...
+
+
+class _CleanupControlRun(Protocol):
+  async def __call__(
+    self,
+    user_id: str,
+    control_run_id: str,
+  ) -> None: ...
+
 
 log = logging.getLogger(__name__)
 
@@ -112,7 +131,7 @@ async def _publish_control_event(
   event_copy = _event_for_run(event, control_run_id)
   user_event_bus = getattr(app_state, "user_event_bus", None)
   if user_event_bus is not None:
-    publisher = getattr(user_event_bus, "publish", None)
+    publisher: _PublishControlEvent | None = getattr(user_event_bus, "publish", None)
     if not callable(publisher):
       raise RuntimeError("session event delivery bus is unavailable")
     await publisher(
@@ -131,7 +150,7 @@ async def _cleanup_run_buffer(
 ) -> None:
   user_event_bus = getattr(app_state, "user_event_bus", None)
   if user_event_bus is not None:
-    cleanup = getattr(user_event_bus, "cleanup_run", None)
+    cleanup: _CleanupControlRun | None = getattr(user_event_bus, "cleanup_run", None)
     if not callable(cleanup):
       raise RuntimeError("session event delivery cleanup is unavailable")
     await cleanup(
@@ -297,7 +316,7 @@ async def _dispatch_control_chat_turn(
     raise HTTPException(
       status_code=400,
       detail={
-        **exc.receipt(),
+        **exc.to_error(),
         "message": str(exc),
       },
     ) from exc

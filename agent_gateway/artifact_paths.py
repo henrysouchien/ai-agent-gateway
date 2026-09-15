@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
+from collections.abc import Mapping
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 from urllib.parse import unquote
 
-from agent_workflow_contracts.ticker_contract import normalize_contract_ticker
 
 
 _EXCHANGE_SUFFIXES = (
@@ -49,7 +49,8 @@ _TICKER_RE = re.compile(r"^[A-Z]{1,6}$")
 _EXTENDED_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.]{0,14}$")
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
-_ARTIFACT_INDEX_RECENT_LIMIT = 5
+
+log = logging.getLogger(__name__)
 
 
 class ArtifactPathError(ValueError):
@@ -89,36 +90,6 @@ def artifact_json_path_for_request(
     ticker=normalized_ticker,
     skill=normalized_skill,
     artifact_id=normalized_artifact_id,
-  )
-
-
-def latest_artifact_json_path_for_request(
-  user_id: str,
-  *,
-  ticker: str,
-  skill: str,
-) -> ArtifactPath | None:
-  normalized_ticker = _validate_ticker(ticker)
-  normalized_skill = _validate_skill(skill)
-  workspace_root = user_workspace_root(user_id)
-  directory = _resolve_under_workspace(
-    workspace_root,
-    "artifacts",
-    normalized_ticker,
-    normalized_skill,
-  )
-  if not directory.is_dir():
-    return None
-  artifacts = _safe_json_children(directory, workspace_root)
-  if not artifacts:
-    return None
-  path = artifacts[-1]
-  return ArtifactPath(
-    workspace_root=workspace_root,
-    path=path,
-    ticker=normalized_ticker,
-    skill=normalized_skill,
-    artifact_id=path.stem,
   )
 
 
@@ -165,6 +136,13 @@ def ticker_artifact_paths_for_request(user_id: str, *, ticker: str) -> dict[str,
     try:
       normalized_skill = _validate_skill(skill_dir.name)
     except ArtifactPathError:
+      # Only skill writers create subdirectories here; a foreign-named
+      # directory must not hide, or refuse the listing of, valid skills.
+      log.warning(
+        "artifact ticker directory %s contains a foreign-named subdirectory %r; ignoring it",
+        ticker_dir,
+        skill_dir.name,
+      )
       continue
     safe_skill_dir = _ensure_under_workspace(skill_dir, workspace_root)
     artifacts = _safe_json_children(safe_skill_dir, workspace_root)
@@ -181,35 +159,6 @@ def ticker_artifact_paths_for_request(user_id: str, *, ticker: str) -> dict[str,
       for path in artifacts
     ]
   return by_skill
-
-
-def ticker_artifact_index_for_request(user_id: str, *, ticker: str) -> list[dict[str, Any]]:
-  normalized_ticker = _validate_ticker(ticker)
-  workspace_root = user_workspace_root(user_id)
-  ticker_dir = _resolve_under_workspace(workspace_root, "artifacts", normalized_ticker)
-  if not ticker_dir.is_dir():
-    return []
-
-  index: list[dict[str, Any]] = []
-  for skill_dir in sorted(ticker_dir.iterdir(), key=lambda path: path.name):
-    if not skill_dir.is_dir():
-      continue
-    try:
-      normalized_skill = _validate_skill(skill_dir.name)
-    except ArtifactPathError:
-      continue
-    safe_skill_dir = _ensure_under_workspace(skill_dir, workspace_root)
-    artifacts = _safe_json_children(safe_skill_dir, workspace_root)
-    if not artifacts:
-      continue
-    artifact_ids = [path.stem for path in artifacts]
-    index.append({
-      "skill": normalized_skill,
-      "latest_artifact_id": artifact_ids[-1],
-      "artifact_count": len(artifact_ids),
-      "recent_artifact_ids": list(reversed(artifact_ids[-_ARTIFACT_INDEX_RECENT_LIMIT:])),
-    })
-  return index
 
 
 def letter_docx_path_for_request(
@@ -245,15 +194,21 @@ def user_workspace_root(user_id: str) -> Path:
   return (user_data_dir() / "users" / normalized_user_id / "workspace").resolve()
 
 
-def user_data_dir() -> Path:
-  configured = os.getenv("USER_DATA_DIR", "").strip()
+def user_data_dir(
+  *, environ: Mapping[str, str] | None = None, home: Path | None = None,
+) -> Path:
+  """Resolve durable user data independently of any source checkout."""
+  env = os.environ if environ is None else environ
+  configured = env.get("USER_DATA_DIR", "").strip()
   if configured:
     return Path(configured).expanduser()
-  return _repo_root() / "data"
-
-
-def _repo_root() -> Path:
-  return Path(__file__).resolve().parents[3]
+  state_home = env.get("XDG_STATE_HOME", "").strip()
+  state_root = (
+    Path(state_home).expanduser()
+    if state_home
+    else (Path.home() if home is None else home) / ".local" / "state"
+  )
+  return state_root / "hank" / "data"
 
 
 def _safe_json_children(directory: Path, workspace_root: Path) -> list[Path]:
@@ -265,6 +220,13 @@ def _safe_json_children(directory: Path, workspace_root: Path) -> list[Path]:
     try:
       _validate_artifact_id(safe_path.stem)
     except ArtifactPathError:
+      # Only the artifact writer names .json children here; a foreign-named
+      # file must not vanish silently or refuse the enumeration.
+      log.warning(
+        "artifact directory %s contains a foreign-named json file %r; ignoring it",
+        directory,
+        path.name,
+      )
       continue
     artifacts.append(safe_path)
   return artifacts
@@ -315,6 +277,8 @@ def normalize_ticker_for_artifact_request(ticker: str) -> str:
 
 def canonicalize_ticker(ticker: object) -> str:
   """Canonicalize and validate an explicit ticker without app imports."""
+  from agent_workflow_contracts.ticker_contract import normalize_contract_ticker
+
   return normalize_contract_ticker(ticker)
 
 
@@ -383,11 +347,9 @@ __all__ = [
   "artifact_json_paths_for_request",
   "artifact_json_path_for_request",
   "canonicalize_ticker",
-  "latest_artifact_json_path_for_request",
   "letter_docx_path_for_request",
   "normalize_ticker_for_artifact_request",
   "reject_unsafe_path",
-  "ticker_artifact_index_for_request",
   "ticker_artifact_paths_for_request",
   "user_data_dir",
   "user_workspace_root",

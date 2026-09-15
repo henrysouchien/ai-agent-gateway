@@ -1,3 +1,12 @@
+"""Command-line composition root for package projects and provider login.
+
+``main`` parses the installed ``agent`` command and delegates project
+scaffolding/configuration to ``project.py``, serving to Uvicorn, and provider
+credentials to their token-store owners. It emits an integer process status and
+does not own the gateway run loop or product policy. See
+``packages/agent-gateway/README.md``.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -118,8 +127,14 @@ def main(
   stderr: TextIO | None = None,
   uvicorn_run: Callable[..., Any] | None = None,
 ) -> int:
-  stdout = stdout or sys.stdout
-  stderr = stderr or sys.stderr
+  """Dispatch one ``agent`` CLI invocation and return its process status.
+
+  Project validation failures are rendered to ``stderr`` with status 2.
+  Runtime startup and provider-specific authentication effects are delegated to
+  their owning helpers.
+  """
+  stdout_stream: TextIO = sys.stdout if stdout is None else stdout
+  stderr_stream: TextIO = sys.stderr if stderr is None else stderr
   parser = build_parser()
   args = parser.parse_args(argv)
 
@@ -133,32 +148,37 @@ def main(
         effort=args.effort,
         force=args.force,
       )
-      stdout.write(f"Created agent project in {target}\n")
+      stdout_stream.write(f"Created agent project in {target}\n")
       for path in written:
-        stdout.write(f"  {path.relative_to(target)}\n")
+        stdout_stream.write(f"  {path.relative_to(target)}\n")
       return 0
 
     if args.command == "run":
-      return _run_project(args, stdout=stdout, stderr=stderr, uvicorn_run=uvicorn_run)
+      return _run_project(
+        args,
+        stdout=stdout_stream,
+        stderr=stderr_stream,
+        uvicorn_run=uvicorn_run,
+      )
 
     if args.command == "add":
       if args.add_command == "mcp":
-        return _add_mcp(args, stdout=stdout)
+        return _add_mcp(args, stdout=stdout_stream)
       if args.add_command == "model":
-        return _add_model(args, stdout=stdout)
+        return _add_model(args, stdout=stdout_stream)
 
     if args.command == "auth":
       if args.auth_command == "login":
-        return _auth_login(args, stdout=stdout)
+        return _auth_login(args, stdout=stdout_stream)
       if args.auth_command == "status":
-        return _auth_status(args, stdout=stdout)
+        return _auth_status(args, stdout=stdout_stream)
       if args.auth_command == "logout":
-        return _auth_logout(args, stdout=stdout)
+        return _auth_logout(args, stdout=stdout_stream)
 
     if args.command == "list":
-      return _list_project(args, stdout=stdout)
+      return _list_project(args, stdout=stdout_stream)
   except AgentProjectError as exc:
-    stderr.write(f"agent: {exc}\n")
+    stderr_stream.write(f"agent: {exc}\n")
     return 2
 
   parser.error(f"unknown command: {args.command}")

@@ -7,11 +7,6 @@ from agent_gateway.control_plane import canvas_artifacts
 def test_packaged_canvas_kit_contract_accessors() -> None:
   assert canvas_kit_contract.packaged_contract_directory().is_dir()
   assert canvas_kit_contract.contract_version() == 1
-  assert canvas_kit_contract.externals_map() == {
-    "react": "HankCanvasRuntime.React",
-    "recharts": "HankCanvasRuntime.Recharts",
-    "@hank/canvas-kit": "HankCanvasRuntime.Kit",
-  }
 
 
 def test_route_caps_are_pinned_to_shared_manifest_limits() -> None:
@@ -21,13 +16,6 @@ def test_route_caps_are_pinned_to_shared_manifest_limits() -> None:
   assert canvas_artifacts.CANVAS_RENDER_FAILURE_REPORTS_PER_RENDER == limits["render_error_reports_max_per_render"]
   assert canvas_artifacts.CANVAS_RENDER_FAILURE_MESSAGE_MAX_CHARS == limits["render_error_message_max_chars"]
   assert canvas_artifacts.CANVAS_RENDER_FAILURE_COMPONENT_STACK_MAX_CHARS == limits["render_error_component_stack_max_chars"]
-
-
-def test_bundle_format_pins_classic_iife_compiler_contract() -> None:
-  assert canvas_kit_contract.bundle_format()["compiler"] == {
-    "jsx": "transform", "target": "es2020", "charset": "ascii",
-    "legalComments": "none", "minify": True, "format": "iife",
-  }
 
 
 def test_authoring_manifest_is_generated_from_packaged_types_and_policy() -> None:

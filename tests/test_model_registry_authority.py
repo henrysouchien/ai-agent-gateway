@@ -113,15 +113,19 @@ def test_initial_artifacts_are_complete_and_adapter_closed() -> None:
     for entry in INITIAL_MODEL_REGISTRY.models.values()
     if entry.capabilities.get("session.driver") == "user_selectable"
   } == {
+    "anthropic.claude-fable-5-1",
     "anthropic.claude-fable-5",
     "anthropic.claude-haiku-4-5",
     "anthropic.claude-mythos-5",
     "anthropic.claude-opus-5",
     "anthropic.claude-sonnet-5",
+    "openai.gpt-6-astra",
     "openai.gpt-5-6",
+    "codex.gpt-6-astra",
     "codex.gpt-5-6-luna",
     "codex.gpt-5-6-sol",
     "codex.gpt-5-6-terra",
+    "xai.grok-4-6",
     "xai.grok-4-5",
   }
   assert INITIAL_MODEL_REGISTRY.require("openai.gpt-5-6").label == "GPT-5.6"

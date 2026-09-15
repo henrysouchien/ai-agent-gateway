@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import time
 import inspect
 from typing import Any, Callable
+
+log = logging.getLogger("agent_gateway.tool_dispatcher_audit")
 
 
 async def emit_execution_audit(
@@ -19,6 +22,11 @@ async def emit_execution_audit(
   emitter = getattr(approval_store, "audit_emitter", None)
   emit = getattr(emitter, "emit_execution_outcome", None) if emitter is not None else None
   if emit is None:
+    log.warning(
+      "Execution audit skipped: approval store has no audit emitter for %s (%s) | failure=true",
+      getattr(request, "tool_name", "?"),
+      outcome,
+    )
     return
   raw_args = dict(raw_tool_args)
   try:

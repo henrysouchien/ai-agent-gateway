@@ -12,6 +12,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import AgentRunner, EventLog, ToolDispatcher, ToolResultContext  # noqa: E402
+from agent_gateway.mcp_client import McpClientManager  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.sdk_runner_context import call_on_tool_result  # noqa: E402
 from agent_gateway.runner_callbacks import (  # noqa: E402
@@ -25,15 +26,9 @@ from tests.capability_execution_test_support import (  # noqa: E402
 )
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
-    return False
-
-  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
-    return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
-
-  def get_tool_definitions(self) -> list[dict[str, Any]]:
-    return []
+class _NullMcpClient(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
 
 
 class _StubProvider:
@@ -71,9 +66,19 @@ def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
 
 
 def test_runner_callback_wrappers_resolve_parent_module_helpers(monkeypatch: Any) -> None:
-  runner = object.__new__(AgentRunner)
-  runner._on_metric = object()
-  runner._sid = "sess"
+  def metric_callback(_name: str, _value: int) -> None:
+    raise AssertionError("metric callback should be forwarded, not invoked")
+
+  runner = AgentRunner(
+    event_log=EventLog(),
+    dispatcher=_make_dispatcher(),
+    session_id="sess",
+    capability_execution=_capability_execution(),
+    on_metric=metric_callback,
+    user_id="callback-test",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
   metric_calls: list[dict[str, Any]] = []
 
   def _call_metric_hook(callback: Any, *, name: str, value: int, log_session_id: str, logger: Any) -> None:
@@ -93,7 +98,7 @@ def test_runner_callback_wrappers_resolve_parent_module_helpers(monkeypatch: Any
 
   assert metric_calls == [
     {
-      "callback": runner._on_metric,
+      "callback": metric_callback,
       "name": "gateway.test",
       "value": 3,
       "log_session_id": "sess",
@@ -296,12 +301,24 @@ def test_tool_result_hook_exception_logs_are_value_free_for_native_and_sdk() -> 
     raise RuntimeError(secret)
 
   sdk_logger = _Logger()
+  sdk_ctx = ToolResultContext(
+    tool_name="lookup",
+    tool_input={},
+    redacted_tool_input={},
+    result=None,
+    error=None,
+    duration_ms=1,
+    tool_call_id="tool-sdk",
+    session_id="sess-sdk",
+    server=None,
+    result_entry=None,
+  )
   sdk_runner = SimpleNamespace(
     _on_tool_result=sdk_failure,
     _sid="sess-sdk",
   )
   assert _run(
-    call_on_tool_result(sdk_runner, object(), logger=sdk_logger)
+    call_on_tool_result(sdk_runner, sdk_ctx, logger=sdk_logger)
   ) == []
 
   serialized_logs = repr(native_logger.warnings + sdk_logger.warnings)
@@ -456,6 +473,7 @@ def test_runner_hook_delegates_preserve_log_and_filter_results() -> None:
   ctx = ToolResultContext(
     tool_name="lookup",
     tool_input={"query": "AAPL"},
+    redacted_tool_input={"query": "AAPL"},
     result={"ok": True},
     error=None,
     duration_ms=12,

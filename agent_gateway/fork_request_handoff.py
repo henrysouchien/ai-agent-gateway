@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
-from .capability_binding import CapabilityBind
+from .capability_binding import CapabilityBind, SESSION_DRIVER_CAPABILITY
 from .execution_identity import resolved_execution_identity
 
 
@@ -105,7 +105,7 @@ class ForkRequestHandoff:
       )
     if not isinstance(self.capability_bind, CapabilityBind):
       raise TypeError("fork handoff capability_bind must be a CapabilityBind")
-    if self.capability_bind.capability_id != "session.driver":
+    if self.capability_bind.capability_id != SESSION_DRIVER_CAPABILITY:
       raise ValueError("fork handoff must snapshot the session.driver bind")
     auth_config = self.auth_config
     duplicated_selection = {

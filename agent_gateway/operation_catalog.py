@@ -117,19 +117,16 @@ def _require_optional_positive_int(value: object, *, field_name: str) -> None:
     raise ValueError(f"{field_name} must be a positive integer")
 
 
-def _require_optional_nonnegative_int(value: object, *, field_name: str) -> None:
-  if value is not None and (type(value) is not int or value < 0):
-    raise ValueError(f"{field_name} must be a non-negative integer")
-
-
 def _require_optional_positive_number(value: object, *, field_name: str) -> None:
   if value is None:
     return
-  if (
-    type(value) not in {int, float}
-    or not math.isfinite(value)
-    or value <= 0
-  ):
+  if type(value) is int:
+    number = float(value)
+  elif type(value) is float:
+    number = value
+  else:
+    raise ValueError(f"{field_name} must be a finite positive number")
+  if not math.isfinite(number) or number <= 0:
     raise ValueError(f"{field_name} must be a finite positive number")
 
 
@@ -186,7 +183,6 @@ class OperationRuntimePolicy:
   max_tokens: int | None = None
   max_budget_usd: float | None = None
   effort: Effort | None = None
-  max_retries: int | None = None
   max_structured_reads: int | None = None
   initial_message: str | None = None
   delivery_label: str | None = None
@@ -247,7 +243,6 @@ class OperationRuntimePolicy:
     _require_optional_identifier(self.delivery_label, field_name="delivery_label")
     _require_optional_positive_int(self.max_turns, field_name="max_turns")
     _require_optional_positive_int(self.max_tokens, field_name="max_tokens")
-    _require_optional_nonnegative_int(self.max_retries, field_name="max_retries")
     _require_optional_positive_int(
       self.max_structured_reads,
       field_name="max_structured_reads",

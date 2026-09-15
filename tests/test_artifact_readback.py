@@ -24,6 +24,7 @@ def _success_result(**artifact_overrides):
 
 def test_success_synthesizes_readback_event() -> None:
   event = readback_artifact_ready_event("get_skill_artifact", _success_result(), "toolu_123")
+  assert event is not None
   assert event["type"] == "artifact_ready"
   assert event["skill_run_id"] == "readback-toolu_123"
   assert event["ticker"] == "PCTY"
@@ -41,6 +42,7 @@ def test_success_synthesizes_readback_event() -> None:
 def test_sidecar_artifact_path_wins_over_convention() -> None:
   result = _success_result(artifact_path="artifacts/PCTY/quantifying-risk/custom.json")
   event = readback_artifact_ready_event("get_skill_artifact", result, "t1")
+  assert event is not None
   assert event["artifact_path"] == "artifacts/PCTY/quantifying-risk/custom.json"
 
 
@@ -76,4 +78,5 @@ def test_non_readback_tools_and_bad_results_return_none() -> None:
 
 def test_missing_tool_call_id_still_emits() -> None:
   event = readback_artifact_ready_event("get_skill_artifact", _success_result(), None)
+  assert event is not None
   assert event["skill_run_id"] == "readback-unknown"

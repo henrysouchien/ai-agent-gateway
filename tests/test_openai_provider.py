@@ -9,7 +9,7 @@ import types
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 
@@ -23,11 +23,13 @@ from agent_gateway.capability_binding import CapabilityResolutionError
 from agent_gateway.agent_session_log import AgentSessionLog
 from agent_gateway.openai_history_fence import REASONING_SIGNATURE_MARKER, TEXT_SIGNATURE_MARKER
 from agent_gateway.model_registry import INITIAL_MODEL_REGISTRY, ProductModelRegistry
+from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.provider_summarize import provider_summarize
 from agent_gateway.providers import OpenAIProvider, ThinkingLevel
 from agent_gateway.providers.openai import OpenAIConfigurationError
 from agent_gateway.providers.openai_responses_helpers import _ResponsesStreamState, map_event
-from tests.capability_execution_test_support import (  # noqa: E402
+from agent_gateway.tool_policy_registry import PreparedToolCall
+from tests.capability_execution_test_support import (
   stub_runner_capability_execution,
 )
 
@@ -133,13 +135,15 @@ def _clear_openai_env(monkeypatch: pytest.MonkeyPatch):
 
 
 def _install_fake_openai(monkeypatch: pytest.MonkeyPatch):
-  module = types.ModuleType("openai")
-
   class FakeAsyncOpenAI:
     def __init__(self, **kwargs: Any):
       self.kwargs = kwargs
       self.responses = SimpleNamespace(create=lambda **_kwargs: None)
 
+  class FakeOpenAIModule(types.ModuleType):
+    AsyncOpenAI: type[FakeAsyncOpenAI]
+
+  module = FakeOpenAIModule("openai")
   module.AsyncOpenAI = FakeAsyncOpenAI
   monkeypatch.setitem(sys.modules, "openai", module)
   return FakeAsyncOpenAI
@@ -328,9 +332,55 @@ def test_text_only_model_rejects_required_tools(monkeypatch) -> None:
     )
 
 
-def test_unverified_model_is_rejected() -> None:
-  with pytest.raises(ValueError, match="no verified Responses capability row"):
+def test_registry_unadmitted_model_is_rejected() -> None:
+  with pytest.raises(ValueError, match="product model registry does not admit"):
     OpenAIProvider().get_model_info("gpt-5.2")
+
+
+def test_registry_admitted_model_without_capability_row_derives_from_registry(
+  monkeypatch,
+) -> None:
+  # Config-only model addition (plan §8): a model the registry artifact admits
+  # is served before this adapter's capability table gains a row, with effort
+  # and feature facts derived from the registry owner instead of a guessed or
+  # rejected identity.
+  from agent_gateway.model_registry import ModelRegistryEntry, ProductModelRegistry
+  import agent_gateway.providers.base as provider_base
+
+  entry = ModelRegistryEntry(
+    key="openai.gpt-6",
+    label="GPT-6",
+    provider="openai",
+    upstream_model="gpt-6",
+    adapter="openai.responses",
+    protocol_profile="responses.reasoning",
+    route="openai.public",
+    lifecycle="active",
+    capabilities={"session.driver": "user_selectable"},
+    supported_efforts=frozenset({"none", "low", "medium", "high", "xhigh"}),
+    default_effort="medium",
+    features=frozenset({"tools", "streaming"}),
+    reported_identities=frozenset({"gpt-6"}),
+  )
+  monkeypatch.setattr(
+    provider_base,
+    "INITIAL_MODEL_REGISTRY",
+    ProductModelRegistry(
+      schema="product-model-registry/v1",
+      revision="test",
+      models={entry.key: entry},
+    ),
+  )
+
+  info = OpenAIProvider().get_model_info("gpt-6")
+
+  assert info.supports_thinking is True
+  assert info.supports_tool_use is True
+  compat = info.compat or {}
+  assert compat["supportsReasoningEffort"] is True
+  assert compat["reasoningEffortValues"] == ("none", "low", "medium", "high", "xhigh")
+  assert compat["reasoningEffortDefault"] == "medium"
+  assert compat["supportsResponsesFunctionTools"] is True
 
 
 def test_legacy_and_native_history_conversion() -> None:
@@ -426,7 +476,18 @@ async def _collect(provider: OpenAIProvider, client: _StreamingClient):
   return [event async for event in provider.stream(client, {"model": "gpt-4o"})]
 
 
-def test_complete_function_call_added_and_done_is_not_duplicated() -> None:
+def test_complete_function_call_added_and_done_is_raw_and_not_duplicated(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  import agent_gateway.runner_tool_audit as runner_tool_audit
+
+  monkeypatch.setattr(
+    runner_tool_audit,
+    "redact_tool_input_for_event",
+    lambda *_args, **_kwargs: (_ for _ in ()).throw(
+      AssertionError("provider mapper cannot own history redaction")
+    ),
+  )
   state = _ResponsesStreamState()
   added = map_event({
     "type": "response.output_item.added",
@@ -439,6 +500,7 @@ def test_complete_function_call_added_and_done_is_not_duplicated() -> None:
   assert [event.type for event in added] == ["tool_use_start"]
   assert [event.type for event in done] == ["tool_use_delta", "tool_use_end"]
   assert done[1].tool_input == {"q": "x"}
+  assert done[1].raw_block["input"] == {"q": "x"}
 
 
 def test_empty_argument_delta_does_not_discard_the_seeded_snapshot() -> None:
@@ -587,10 +649,17 @@ def test_private_durable_replay_storage_and_marker(tmp_path: Path) -> None:
 
 
 def test_runner_executes_responses_tool_loop_and_replays_function_output() -> None:
+  tool_input = {
+    "q": {
+      "text": "x",
+      "filters": [{"field": "ticker", "values": ["AAPL", "MSFT"]}],
+    },
+  }
+  tool_arguments = json.dumps(tool_input, separators=(",", ":"))
   response_batches = [
     [
-      {"type": "response.output_item.added", "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": '{"q":"x"}'}},
-      {"type": "response.output_item.done", "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": '{"q":"x"}'}},
+      {"type": "response.output_item.added", "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": tool_arguments}},
+      {"type": "response.output_item.done", "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": tool_arguments}},
       {"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 5, "output_tokens": 2}}},
     ],
     [
@@ -620,19 +689,41 @@ def test_runner_executes_responses_tool_loop_and_replays_function_output() -> No
     async def close_client(self, client: Any, timeout: float = 2.0) -> None:
       return None
 
-  class Dispatcher:
-    async def dispatch(self, tool_id: str, tool_name: str, tool_input: dict[str, Any], *, call_index: int = 0):
-      assert (tool_name, tool_input) == ("lookup", {"q": "x"})
-      return {"ok": True}, None
+  async def dispatch_lookup(
+    tool_input: dict[str, Any],
+    **_kwargs: object,
+  ):
+    assert tool_input == {
+      "q": {
+        "text": "x",
+        "filters": [{"field": "ticker", "values": ["AAPL", "MSFT"]}],
+      },
+    }
+    return {"ok": True}, None
 
-    def requires_approval(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
-      return False
+  class Dispatcher(ToolDispatcher):
+    async def dispatch_prepared(
+      self,
+      tool_call_id: str,
+      tool_name: str,
+      prepared_call: PreparedToolCall,
+      **_kwargs: object,
+    ):
+      _ = tool_call_id
+      assert tool_name == "lookup"
+      return await dispatch_lookup(prepared_call.materialize_input())
 
   event_log = EventLog(session_id="responses-tool-loop")
+  dispatcher = Dispatcher(
+    mcp_client=McpClientManager(config_path=None),
+    local_tool_handlers={"lookup": dispatch_lookup},
+    event_log=event_log,
+    session_id="responses-tool-loop",
+  )
   provider = Provider()
   runner = AgentRunner(
     event_log=event_log,
-    dispatcher=Dispatcher(),  # type: ignore[arg-type]
+    dispatcher=dispatcher,
     session_id="responses-tool-loop",
     capability_execution=stub_runner_capability_execution(
       provider=provider,
@@ -649,7 +740,10 @@ def test_runner_executes_responses_tool_loop_and_replays_function_output() -> No
   asyncio.run(runner.run([{"role": "user", "content": "look up x"}], max_turns=3))
   assert len(responses.requests) == 2
   second_input = responses.requests[1]["input"]
-  assert any(item.get("type") == "function_call" for item in second_input)
+  replayed_call = next(
+    item for item in second_input if item.get("type") == "function_call"
+  )
+  assert json.loads(replayed_call["arguments"]) == tool_input
   assert any(item.get("type") == "function_call_output" and '"ok": true' in item["output"] for item in second_input)
   assert any(entry.event.get("type") == "stream_complete" for entry in event_log.entries)
 
@@ -783,12 +877,6 @@ def test_standalone_runner_keeps_raw_execution_separate_from_safe_history(
     async def close_client(self, client: Any, timeout: float = 2.0) -> None:
       return None
 
-  class Mcp:
-    def is_mcp_tool(self, _name: str) -> bool:
-      return False
-
-    def get_server_for_tool(self, _name: str) -> None:
-      return None
 
   handler_inputs: list[dict[str, Any]] = []
 
@@ -813,7 +901,7 @@ def test_standalone_runner_keeps_raw_execution_separate_from_safe_history(
   }
   event_log = EventLog(session_id="standalone-redaction")
   dispatcher = ToolDispatcher(
-    mcp_client=Mcp(),  # type: ignore[arg-type]
+    mcp_client=McpClientManager(config_path=None),
     local_tool_handlers={"data_historical_prices": handler},
     event_log=event_log,
     session_id="standalone-redaction",
@@ -965,16 +1053,28 @@ def test_shipped_openai_alias_is_retained_by_real_agent_runner_response() -> Non
     async def close_client(self, client: Any, timeout: float = 2.0) -> None:
       _ = client, timeout
 
-  class Dispatcher:
-    async def dispatch(self, *_args: Any, **_kwargs: Any):
+  class Dispatcher(ToolDispatcher):
+    async def dispatch(
+      self,
+      *_args: object,
+      **_kwargs: object,
+    ) -> NoReturn:
       raise AssertionError("no tool dispatch expected")
+
+
 
   execution = _shipped_openai_execution(Provider())
   event_log = EventLog(session_id="openai-reported-identity")
+  dispatcher = Dispatcher(
+    mcp_client=McpClientManager(config_path=None),
+    local_tool_handlers={},
+    event_log=event_log,
+    session_id="openai-reported-identity",
+  )
   usage_events: list[Any] = []
   runner = AgentRunner(
     event_log=event_log,
-    dispatcher=Dispatcher(),  # type: ignore[arg-type]
+    dispatcher=dispatcher,
     session_id="openai-reported-identity",
     capability_execution=execution,
     get_tool_definitions=lambda: [],

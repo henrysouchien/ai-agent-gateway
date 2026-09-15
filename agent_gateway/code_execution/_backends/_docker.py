@@ -305,11 +305,12 @@ class DockerBackend(ExecutionBackend):
       limit=_STREAM_READER_LIMIT,
     )
     stdout_bytes, stderr_bytes = await proc.communicate()
+    return_code = await proc.wait()
     stdout = stdout_bytes.decode("utf-8", errors="replace")
     stderr = stderr_bytes.decode("utf-8", errors="replace")
-    if check and proc.returncode != 0:
+    if check and return_code != 0:
       raise RuntimeError(stderr.strip() or stdout.strip() or f"docker {' '.join(args)} failed")
-    return proc.returncode, stdout, stderr
+    return return_code, stdout, stderr
 
   async def _inspect_container(self, container_id: str) -> None:
     if not container_id:

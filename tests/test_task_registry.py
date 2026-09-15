@@ -16,6 +16,7 @@ from agent_gateway.runner_background_lifecycle import RunnerBackgroundLifecycleM
 from agent_gateway.runner_background_tasks import (
   background_task_payload,
 )
+from agent_gateway.runner_state import BackgroundTask
 from agent_gateway.task_registry import (
   ParentMessage,
   ResumeSuccessorConflictError,
@@ -117,6 +118,11 @@ class _RecordingListener:
 
 
 class _BackgroundLifecycleHarness(RunnerBackgroundLifecycleMixin):
+  _background_completion_persist_timeout_seconds: float
+  _background_grace_wait_timeout_seconds: float
+  _background_kill_drain_timeout_seconds: float
+  _pending_background_initializations: set[asyncio.Task[None]]
+
   def __init__(self) -> None:
     self._task_registry = TaskRegistry()
     self.listener = _RecordingListener()
@@ -126,6 +132,7 @@ class _BackgroundLifecycleHarness(RunnerBackgroundLifecycleMixin):
     self._sid = "session-test"
     self.durable_events: list[dict[str, object]] = []
     self.append_invocations = 0
+    self._pending_background_initializations = set()
 
   def _ensure_sub_agent_semaphore(self) -> None:
     return None
@@ -243,7 +250,9 @@ def test_background_finalizer_persists_canonical_termination_result(
       await asyncio.sleep(60)
       return None, None
 
-    async def _on_complete(completed_entry: TaskEntry) -> None:
+    async def _on_complete(
+      completed_entry: BackgroundTask | TaskEntry,
+    ) -> None:
       completed.append(completed_entry.task_id)
 
     task = asyncio.create_task(
@@ -423,7 +432,10 @@ def test_background_finalizer_marks_real_failed_child_result_failed_and_visible(
   async def _case() -> None:
     harness = _BackgroundLifecycleHarness()
     entry = harness._task_registry.register("background_agent")
-    failed_error = {"code": "provider_error", "message": "provider failed"}
+    failed_error: dict[str, object] = {
+      "code": "provider_error",
+      "message": "provider failed",
+    }
 
     async def _handler(
       _tool_input: dict[str, object],
@@ -431,7 +443,7 @@ def test_background_finalizer_marks_real_failed_child_result_failed_and_visible(
     ) -> tuple[None, dict[str, object]]:
       return None, failed_error
 
-    completed: list[TaskEntry] = []
+    completed: list[BackgroundTask | TaskEntry] = []
     task = asyncio.create_task(
       harness._run_background_agent(
         entry,
@@ -475,7 +487,7 @@ def test_background_finalizer_append_failure_does_not_publish_success() -> None:
     ) -> tuple[dict[str, object], None]:
       return {"response": "accepted"}, None
 
-    completed: list[TaskEntry] = []
+    completed: list[BackgroundTask | TaskEntry] = []
     task = asyncio.create_task(
       harness._run_background_agent(
         entry,
@@ -534,7 +546,7 @@ def test_primary_completion_lookup_uncertainty_does_not_write_fallback(
 
       async def _confirmed_durable_background_completion(
         self,
-        _bg_task: TaskEntry,
+        bg_task: TaskEntry,
       ) -> TaskEntry | None:
         raise lookup_failure_type("durable lookup outcome unknown")
 
@@ -556,7 +568,7 @@ def test_primary_completion_lookup_uncertainty_does_not_write_fallback(
       "artifact_events": None,
       "warning": None,
     }
-    completed: list[TaskEntry] = []
+    completed: list[BackgroundTask | TaskEntry] = []
 
     async def _handler(
       _tool_input: dict[str, object],
@@ -580,7 +592,7 @@ def test_primary_completion_lookup_uncertainty_does_not_write_fallback(
       await task
     await asyncio.sleep(0)
     pending_reconciliations = tuple(
-      getattr(harness, "_pending_background_initializations", ())
+      harness._pending_background_initializations
     )
     if pending_reconciliations:
       await asyncio.gather(
@@ -697,7 +709,7 @@ def test_cancelled_detached_completion_reconciliation_poisons_writer_lease() -> 
     class _BlockedReconciliationHarness(_BackgroundLifecycleHarness):
       async def _confirmed_durable_background_completion(
         self,
-        _bg_task: TaskEntry,
+        bg_task: TaskEntry,
       ) -> TaskEntry | None:
         lookup_started.set()
         await asyncio.Future()
@@ -728,7 +740,7 @@ def test_failed_detached_completion_lookup_poisons_writer_lease() -> None:
     class _FailedReconciliationHarness(_BackgroundLifecycleHarness):
       async def _confirmed_durable_background_completion(
         self,
-        _bg_task: TaskEntry,
+        bg_task: TaskEntry,
       ) -> TaskEntry | None:
         raise RuntimeError("durable lookup failed")
 
@@ -799,6 +811,7 @@ def test_shutdown_routes_intent_and_durably_reconciles(
     assert entry.termination_intent == expected_intent
     assert entry.state == TaskState.KILLED
     assert task.cancel_count == 1
+    assert entry.result is not None
     assert entry.result["reason"] == expected_intent
     assert entry.completion_persistence_state == "committed"
     assert entry.completion_persistence_error is None
@@ -865,6 +878,7 @@ def test_shutdown_drain_error_still_durably_reconciles_once(
     assert entry.termination_intent == expected_intent
     assert entry.state == TaskState.KILLED
     assert entry.error is None
+    assert entry.result is not None
     assert entry.result["reason"] == expected_intent
     assert task.cancel_count == 1
     assert entry.completion_persistence_state == "committed"
@@ -931,6 +945,7 @@ def test_shutdown_reconciles_running_entry_without_asyncio_handle() -> None:
 
     assert entry.state == TaskState.KILLED
     assert entry.termination_intent == "cancelled"
+    assert entry.result is not None
     assert entry.result["reason"] == "cancelled"
     assert entry.completion_persistence_state == "committed"
     assert harness.append_invocations == 1
@@ -954,7 +969,9 @@ def test_late_cancellation_resistant_handler_cannot_replace_shutdown_result() ->
     started = asyncio.Event()
     cancelled = asyncio.Event()
     release_handler = asyncio.Event()
-    late_result = {"response": "late accepted result"}
+    late_result: dict[str, object] = {
+      "response": "late accepted result",
+    }
 
     async def _handler(
       _tool_input: dict[str, object],
@@ -1245,7 +1262,7 @@ def test_admit_is_atomic_under_concurrent_callers() -> None:
       await asyncio.sleep(0)
       entry, rejection = _admit(registry)
       if rejection is not None:
-        refused.append(rejection)  # type: ignore[arg-type]
+        refused.append(rejection)
         return
       assert entry is not None
       admitted.append(entry.task_id)

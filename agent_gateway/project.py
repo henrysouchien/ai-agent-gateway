@@ -4,7 +4,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import yaml
 from fastapi import FastAPI
@@ -37,6 +37,10 @@ _TOP_LEVEL_KEYS = {
 
 class AgentProjectError(ValueError):
   """Raised when an agent project config or scaffold request is invalid."""
+
+class _AgentModelSelection(TypedDict, total=False):
+  model_key: str
+  effort: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,7 +230,7 @@ def load_agent_project_config(config_path: str | Path = DEFAULT_AGENT_CONFIG) ->
 
 def create_agent_from_yaml(config_path: str | Path = DEFAULT_AGENT_CONFIG) -> FastAPI:
   config = load_agent_project_config(config_path)
-  selection: dict[str, str] = {}
+  selection: _AgentModelSelection = {}
   if config.model_key is not None:
     selection["model_key"] = config.model_key
   if config.effort is not None:

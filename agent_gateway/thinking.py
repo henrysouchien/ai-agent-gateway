@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping, overload
 
 
 class ThinkingLevel(str, Enum):
@@ -27,6 +27,42 @@ class EffortResolution:
 
   def __post_init__(self) -> None:
     object.__setattr__(self, "payload_fragments", MappingProxyType(dict(self.payload_fragments)))
+
+
+@overload
+def parse_effort(
+  value: None,
+  *,
+  field_name: str = "effort",
+  blank_is_unset: bool = False,
+) -> None: ...
+
+
+@overload
+def parse_effort(
+  value: str | ThinkingLevel,
+  *,
+  field_name: str = "effort",
+  blank_is_unset: Literal[False] = False,
+) -> ThinkingLevel: ...
+
+
+@overload
+def parse_effort(
+  value: str | ThinkingLevel,
+  *,
+  field_name: str = "effort",
+  blank_is_unset: Literal[True],
+) -> ThinkingLevel | None: ...
+
+
+@overload
+def parse_effort(
+  value: object,
+  *,
+  field_name: str = "effort",
+  blank_is_unset: bool = False,
+) -> ThinkingLevel | None: ...
 
 
 def parse_effort(value: Any, *, field_name: str = "effort", blank_is_unset: bool = False) -> ThinkingLevel | None:
@@ -82,17 +118,6 @@ def resolve_effort_pair(
       f"conflicting {effort_name}={parsed_effort.value!r} and {thinking_name}={parsed_thinking!r}"
     )
   return parsed_effort or alias_effort
-
-
-def canonical_effort_config(config: Mapping[str, Any], *, default: ThinkingLevel = ThinkingLevel.HIGH) -> dict[str, Any]:
-  """Migrate a config layer to canonical requested effort and drop its alias."""
-  normalized = dict(config)
-  requested = resolve_effort_pair(effort=normalized.get("effort"), thinking=normalized.get("thinking"))
-  requested = requested or default
-  normalized.pop("thinking", None)
-  normalized["effort"] = requested.value
-  normalized["thinking_enabled_requested"] = requested != ThinkingLevel.NONE
-  return normalized
 
 
 def clamp_effort(requested: ThinkingLevel, supported: tuple[ThinkingLevel, ...]) -> ThinkingLevel:

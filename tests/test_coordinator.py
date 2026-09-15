@@ -23,9 +23,16 @@ from agent_gateway import (
 )
 from agent_gateway.capability_binding import (
   CapabilityBind,
+  CapabilityId,
+  ModelSelectionIntent,
 )
+from agent_gateway.capability_execution import (
+  BoundCapabilityExecution,
+  CapabilityExecutionResolver,
+)
+from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.model_registry import INITIAL_MODEL_REGISTRY
-from agent_gateway.providers import StreamEvent
+from agent_gateway.providers import AnthropicProvider, StreamEvent
 from agent_gateway.sub_agent import _DEFAULT_EXCLUDED_TOOLS
 from tests.capability_execution_test_support import (
   stub_runner_capability_execution,
@@ -37,21 +44,16 @@ def _run(coro):
   return asyncio.run(coro)
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
-    return False
-
-  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
-    return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
-
-  def get_tool_definitions(self) -> list[dict[str, Any]]:
-    return []
+class _NullMcpClient(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
 
 
 class _PromptCaptureProvider(ModelProvider):
   name = "capture"
 
-  def __init__(self) -> None:
+  def __init__(self, name: str = "capture") -> None:
+    self.name = name
     self.system_prompts: list[str | list[tuple[str, bool]] | None] = []
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
@@ -107,13 +109,27 @@ class _StubRunner:
     ]
 
 
-class _CapabilityResolver:
-  def __init__(self) -> None:
-    self.registry = INITIAL_MODEL_REGISTRY
-    self.calls: list[dict[str, Any]] = []
+class _CapabilityResolver(CapabilityExecutionResolver):
+  calls: list[dict[str, object]]
 
-  def resolve(self, capability_id: str, **kwargs: Any) -> SimpleNamespace:
-    self.calls.append({"capability_id": capability_id, **kwargs})
+  def __init__(self) -> None:
+    object.__setattr__(self, "registry", INITIAL_MODEL_REGISTRY)
+    object.__setattr__(self, "calls", [])
+
+  def resolve(
+    self,
+    capability_id: CapabilityId,
+    *,
+    explicit_intent: ModelSelectionIntent | None = None,
+    saved_preference: ModelSelectionIntent | None = None,
+    parent_bind: CapabilityBind | None = None,
+  ) -> BoundCapabilityExecution:
+    self.calls.append({
+      "capability_id": capability_id,
+      "explicit_intent": explicit_intent,
+      "saved_preference": saved_preference,
+      "parent_bind": parent_bind,
+    })
     entry = INITIAL_MODEL_REGISTRY.require("anthropic.claude-opus-5")
     bind = CapabilityBind(
       schema_version="1.0",
@@ -132,9 +148,10 @@ class _CapabilityResolver:
       policy_revision="test.1",
       selection_source="internal_policy",
     )
-    return SimpleNamespace(
+    return BoundCapabilityExecution(
       bind=bind,
-      provider=SimpleNamespace(name=entry.provider),
+      registry=INITIAL_MODEL_REGISTRY,
+      adapter=AnthropicProvider(),
       auth_config={
         "provider": entry.provider,
         "api_key": "coordinator-test-key",
@@ -154,6 +171,9 @@ def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
     session_id="sess-coordinator",
   )
 
+def _raw_worker_excluded_tools(**worker_excluded_tools):
+  return worker_excluded_tools
+
 
 def test_coordinator_config_defaults() -> None:
   config = CoordinatorConfig()
@@ -163,6 +183,18 @@ def test_coordinator_config_defaults() -> None:
   assert config.max_workers == 3
   assert "do not poll running workers" in COORDINATOR_DEFAULT_PREAMBLE
   assert "automatic completion notifications" in COORDINATOR_DEFAULT_PREAMBLE
+
+
+def test_coordinator_config_owns_immutable_worker_exclusions() -> None:
+  worker_excluded_tools = {"memory_store"}
+  config = CoordinatorConfig(
+    enabled=True,
+    **_raw_worker_excluded_tools(worker_excluded_tools=worker_excluded_tools),
+  )
+
+  worker_excluded_tools.add("late_tool")
+
+  assert config.worker_excluded_tools == frozenset({"memory_store"})
 
 
 def test_coordinator_preamble_injected_into_string_system_prompt() -> None:
@@ -261,7 +293,7 @@ def test_make_run_agent_handler_merges_worker_excluded_tools() -> None:
     excluded_tools={"memory_read"},
     coordinator_config=CoordinatorConfig(
       enabled=True,
-      worker_excluded_tools={"file_glob"},
+      worker_excluded_tools=frozenset({"file_glob"}),
     ),
     capability_execution_resolver=resolver,
   )
@@ -337,6 +369,7 @@ def test_make_run_agent_handler_rejects_provider_selection_input() -> None:
   result, error = _run(handler({"objective": "Collect", "provider": "openai"}))
 
   assert result is None
+  assert error is not None
   assert error["code"] == "invalid_input"
   assert error["message"] == "unknown run_agent input fields: provider"
   assert resolver.calls == []
@@ -358,6 +391,7 @@ def test_make_run_agent_handler_rejects_model_selection_input() -> None:
   result, error = _run(handler({"objective": "Collect", "model": "gpt-4o-mini"}))
 
   assert result is None
+  assert error is not None
   assert error["code"] == "invalid_input"
   assert error["message"] == "unknown run_agent input fields: model"
   assert resolver.calls == []

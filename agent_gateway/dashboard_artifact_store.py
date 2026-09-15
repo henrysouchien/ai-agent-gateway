@@ -6,7 +6,11 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .artifact_sidecar_index import artifact_sidecar_index_path, register_dashboard_artifact_sidecar
+from .artifact_sidecar_index import (
+  artifact_sidecar_index_path,
+  mark_unreadable_artifact_sidecar_stale,
+  register_dashboard_artifact_sidecar,
+)
 from .artifact_paths import canonicalize_ticker
 from schema.dashboard_artifact import DashboardArtifact
 
@@ -103,15 +107,23 @@ def list_dashboard_artifacts(
   for sidecar_path in sorted(directory.glob("*.json"), key=lambda path: path.name):
     try:
       artifact_id = _validate_dashboard_artifact_id(sidecar_path.stem)
-      safe_sidecar_path = _ensure_under_workspace(sidecar_path, workspace_dir)
     except ValueError:
+      # Not a dashboard artifact sidecar name (e.g. companion *.payload.json);
+      # not ours to report.
       continue
     if artifact_id != sidecar_path.stem:
       continue
     try:
+      safe_sidecar_path = _ensure_under_workspace(sidecar_path, workspace_dir)
       sidecar_stat = safe_sidecar_path.stat()
       artifact = DashboardArtifact.model_validate_json(safe_sidecar_path.read_bytes())
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+      mark_unreadable_artifact_sidecar_stale(
+        workspace_dir=workspace_dir,
+        artifact_kind="dashboard",
+        sidecar_path=sidecar_path,
+        error=exc,
+      )
       continue
     if ticker is not None and artifact.ticker != ticker:
       continue

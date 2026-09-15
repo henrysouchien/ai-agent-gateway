@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from agent_gateway.autonomous_capability_handoff import AutonomousCapabilityBinding
@@ -21,6 +22,7 @@ from agent_gateway.capability_binding import (
   CapabilityBind,
   CredentialHandle,
 )
+from agent_gateway.capability_execution import BoundCapabilityExecution
 from agent_gateway.model_registry import (
   CAPABILITY_IDS,
   INITIAL_MODEL_REGISTRY,
@@ -28,12 +30,15 @@ from agent_gateway.model_registry import (
 )
 from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
 from agent_gateway.event_log import EventLog
+from agent_gateway.runner import AgentRunner
 from agent_gateway.server import (
+  ChatRequest,
   ChatRuntime,
   GatewayServerConfig,
   MaterializedCredential,
   create_gateway_app,
 )
+from agent_gateway.session import AuthManager, GatewaySession
 
 
 API_KEY = "messages-pr5b-key"
@@ -81,25 +86,27 @@ def _autonomous_capability_binding(request) -> AutonomousCapabilityBinding:
   )
 
 
-class _EchoRunner:
+class _EchoRunner(AgentRunner):
   def __init__(
     self,
     event_log: EventLog,
     turns: list[list[dict[str, Any]]],
-    capability_execution: Any,
+    capability_execution: BoundCapabilityExecution,
   ) -> None:
     self._event_log = event_log
     self._turns = turns
-    self.capability_execution = capability_execution
+    self._capability_execution = capability_execution
+    self._selected_content_bindings_bound = False
 
   async def run(
     self,
-    *,
     messages: list[dict[str, Any]],
-    system_prompt: str | None = None,
+    system_prompt: str | list[tuple[str, bool]] | None = None,
     max_turns: int | None = None,
+    *,
+    resume_initial_messages: list[dict[str, Any]] | None = None,
   ) -> None:
-    _ = system_prompt, max_turns
+    _ = system_prompt, max_turns, resume_initial_messages
     self._turns.append(list(messages))
     last_user = next((message["content"] for message in reversed(messages) if message.get("role") == "user"), "")
     self._event_log.append({"type": "text_delta", "text": f"echo:{last_user}"})
@@ -202,19 +209,28 @@ def _install_fake_spawn(monkeypatch) -> None:
   )
 
 
-def _make_app(turns: list[list[dict[str, Any]]] | None = None):
+def _make_app(turns: list[list[dict[str, Any]]] | None = None) -> FastAPI:
   turns = turns if turns is not None else []
 
-  async def _build_chat_runtime(*, session, request, channel, auth_manager):
+  async def _build_chat_runtime(
+    session: GatewaySession,
+    request: ChatRequest,
+    channel: str | None,
+    auth_manager: AuthManager | None,
+    *,
+    storage_root: Path | None = None,
+  ) -> ChatRuntime:
     _ = session, channel, auth_manager
+    capability_execution = request.capability_execution
+    assert capability_execution is not None
     return ChatRuntime(
       system_prompt="system",
       build_runner=lambda event_log, _sid, _started_at: _EchoRunner(
         event_log,
         turns,
-        request.capability_execution,
+        capability_execution,
       ),
-      capability_execution=request.capability_execution,
+      capability_execution=capability_execution,
     )
 
   return create_gateway_app(
@@ -241,7 +257,13 @@ def _make_app(turns: list[list[dict[str, Any]]] | None = None):
   )
 
 
-def _control_session(client: TestClient, user_id: str, *, channel: str | None = "tui") -> dict[str, Any]:
+def _control_session(
+  app: FastAPI,
+  client: TestClient,
+  user_id: str,
+  *,
+  channel: str | None = "tui",
+) -> dict[str, Any]:
   payload: dict[str, Any] = {"api_key": API_KEY, "user_id": user_id, "context": {}}
   if channel is not None:
     payload["context"]["channel"] = channel
@@ -251,11 +273,11 @@ def _control_session(client: TestClient, user_id: str, *, channel: str | None = 
   )
   assert response.status_code == 200, response.text
   payload = response.json()
-  session = client.app.state.auth.session_store.get_session(payload["session_id"])
+  session = app.state.auth.session_store.get_session(payload["session_id"])
   assert session is not None
   session.model_entitled_capabilities = CAPABILITY_IDS
   session.model_entitled_keys = frozenset(INITIAL_MODEL_REGISTRY.models)
-  payload["session_token"] = client.app.state.auth.issue_token(session)
+  payload["session_token"] = app.state.auth.issue_token(session)
   return payload
 
 
@@ -283,9 +305,7 @@ async def _collect_available_user_events(app: Any, user_id: str, control_run_id:
       except asyncio.TimeoutError:
         return events
   finally:
-    close = getattr(subscription, "aclose", None)
-    if callable(close):
-      await close()
+    await subscription.aclose()
   return events
 
 
@@ -306,7 +326,7 @@ def test_chat_messages_continue_with_chat_session_token_and_full_transcript() ->
   turns: list[list[dict[str, Any]]] = []
   app = _make_app(turns)
   with TestClient(app) as client:
-    control = _control_session(client, "alice")
+    control = _control_session(app, client, "alice")
     dispatched = _dispatch_chat(client, control, "first")
 
     response = client.post(
@@ -407,7 +427,7 @@ def test_chat_messages_continue_with_chat_session_token_and_full_transcript() ->
 def test_chat_messages_accept_matching_control_session_and_reject_wrong_tokens() -> None:
   app = _make_app()
   with TestClient(app) as client:
-    control = _control_session(client, "alice")
+    control = _control_session(app, client, "alice")
     first = _dispatch_chat(client, control, "first")
     second = _dispatch_chat(client, control, "other")
 
@@ -421,13 +441,13 @@ def test_chat_messages_accept_matching_control_session_and_reject_wrong_tokens()
       headers=_headers(control),
       json={"messages": [{"role": "user", "content": "second via control"}]},
     )
-    wrong_user_control = _control_session(client, "bob")
+    wrong_user_control = _control_session(app, client, "bob")
     wrong_user_response = client.post(
       f"/api/control/runs/{first['chat_session_id']}/messages",
       headers=_headers(wrong_user_control),
       json={"messages": [{"role": "user", "content": "bad user"}]},
     )
-    wrong_channel_control = _control_session(client, "alice", channel="excel")
+    wrong_channel_control = _control_session(app, client, "alice", channel="excel")
     wrong_channel_response = client.post(
       f"/api/control/runs/{first['chat_session_id']}/messages",
       headers=_headers(wrong_channel_control),
@@ -449,7 +469,7 @@ def test_autonomous_messages_deliver_to_operator_inbox(monkeypatch, tmp_path: Pa
   _install_fake_spawn(monkeypatch)
 
   with TestClient(app) as client:
-    control = _control_session(client, "alice")
+    control = _control_session(app, client, "alice")
     start = client.post(
       "/api/control/runs",
       headers=_headers(control),
@@ -497,7 +517,7 @@ def test_autonomous_messages_deliver_to_operator_inbox(monkeypatch, tmp_path: Pa
     assert len(parent_events_after_duplicate) == 1
     assert parent_events_after_duplicate[0]["message"] == "Focus on AWS exposure next."
 
-    other_control = _control_session(client, "bob")
+    other_control = _control_session(app, client, "bob")
     wrong_user = client.post(
       f"/api/control/runs/{start.json()['run_id']}/messages",
       headers=_headers(other_control),
@@ -505,7 +525,7 @@ def test_autonomous_messages_deliver_to_operator_inbox(monkeypatch, tmp_path: Pa
     )
     assert wrong_user.status_code == 404
 
-    wrong_channel = _control_session(client, "alice", channel="excel")
+    wrong_channel = _control_session(app, client, "alice", channel="excel")
     wrong_channel_response = client.post(
       f"/api/control/runs/{start.json()['run_id']}/messages",
       headers=_headers(wrong_channel),
@@ -513,7 +533,7 @@ def test_autonomous_messages_deliver_to_operator_inbox(monkeypatch, tmp_path: Pa
     )
     assert wrong_channel_response.status_code == 404
 
-    no_channel = _control_session(client, "alice", channel=None)
+    no_channel = _control_session(app, client, "alice", channel=None)
     no_channel_response = client.post(
       f"/api/control/runs/{start.json()['run_id']}/messages",
       headers=_headers(no_channel),
@@ -538,7 +558,7 @@ def test_autonomous_messages_reject_terminal_run_with_409(monkeypatch, tmp_path:
   _install_fake_spawn(monkeypatch)
 
   with TestClient(app) as client:
-    control = _control_session(client, "alice")
+    control = _control_session(app, client, "alice")
     start = client.post(
       "/api/control/runs",
       headers=_headers(control),
@@ -566,3 +586,62 @@ def test_autonomous_messages_reject_terminal_run_with_409(monkeypatch, tmp_path:
     )
 
     assert response.status_code == 409
+
+
+def test_autonomous_messages_keep_foreign_runs_indistinguishable_from_missing(
+  monkeypatch, tmp_path: Path
+) -> None:
+  """A non-owner learns nothing about another operator's run that a bad id would not tell them."""
+
+  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+  monkeypatch.setenv("AGENT_GATEWAY_AUTONOMOUS_LOG_DIR", str(tmp_path / "logs"))
+  app = _make_app()
+
+  _install_fake_spawn(monkeypatch)
+
+  with TestClient(app) as client:
+    owner = _control_session(app, client, "alice")
+    start = client.post(
+      "/api/control/runs",
+      headers=_headers(owner),
+      json={"kind": "autonomous", "profile": "analyst", "mode": "task", "task": "summarize"},
+    )
+    assert start.status_code == 200, start.text
+    foreign_run_id = start.json()["run_id"]
+    unknown_run_id = "control-run-that-was-never-issued"
+
+    intruder = _control_session(app, client, "bob")
+    intruder_chat = _dispatch_chat(client, intruder, "bob's own chat")
+    control_headers = _headers(intruder)
+    chat_headers = {"Authorization": f"Bearer {intruder_chat['chat_session_token']}"}
+
+    deliverable = {"message": "take over", "message_id": "probe-message"}
+    chat_shaped = {"messages": [{"role": "user", "content": "take over"}]}
+
+    def _probe(run_id: str, headers: dict[str, str], body: dict[str, Any]) -> int:
+      response = client.post(
+        f"/api/control/runs/{run_id}/messages",
+        headers=headers,
+        json=body,
+      )
+      return response.status_code
+
+    def _assert_opaque(label: str, headers: dict[str, str], body: dict[str, Any]) -> None:
+      unknown_status = _probe(unknown_run_id, headers, body)
+      foreign_status = _probe(foreign_run_id, headers, body)
+      assert unknown_status == 404, f"{label}: unknown run id leaked {unknown_status}"
+      assert foreign_status == unknown_status, (
+        f"{label}: foreign run answered {foreign_status} where a missing run answers {unknown_status}"
+      )
+
+    _assert_opaque("active + control token", control_headers, deliverable)
+    _assert_opaque("active + chat-shaped payload", control_headers, chat_shaped)
+    _assert_opaque("active + chat token", chat_headers, deliverable)
+
+    record = app.state.subprocess_registry._tasks[start.json()["task_id"]]
+    record.state = "completed"
+    record.exit_code = 0
+    record.error = None
+    record.completed_at = time.time()
+
+    _assert_opaque("terminal + control token", control_headers, deliverable)

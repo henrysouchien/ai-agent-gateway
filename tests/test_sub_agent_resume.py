@@ -7,8 +7,7 @@ import re
 import sys
 import threading
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 
 import pytest
 import agent_gateway.sub_agent as sub_agent_module
@@ -26,6 +25,7 @@ from agent_gateway import (
   TaskRegistry,
   TaskState,
   ToolDispatcher,
+  ToolExecutionContext,
 )
 from agent_gateway.capability_binding import (
   CapabilityBind,
@@ -35,6 +35,8 @@ from agent_gateway.execution_snapshot import (
   render_result_instructions,
 )
 from agent_gateway.final_narrative_artifact import publish_final_narrative
+from agent_gateway.mcp_client import McpClientManager
+from agent_gateway.tool_policy_registry import PreparedToolCall
 from agent_gateway.providers import ModelInfo, ModelProvider, StreamEvent
 from agent_gateway.openai_history_fence import TEXT_SIGNATURE_MARKER
 from agent_gateway.research_file_activity_lock import (
@@ -74,12 +76,16 @@ from agent_gateway.agent_session_log_records import LogEntry
 from agent_gateway.task_registry import CoordinatorConfig, ParentMessage, TaskEntry
 from agent_workflow_contracts import (
   ActivityHandle,
+  AdmittedTask,
+  AdmittedToolRoute,
   AgentOperationRef,
   AttemptRef,
   ContentHandle,
   ContractRef,
   ExecutionSettlement,
+  InlineExactContextView,
   OrdinaryDelegationTaskRef,
+  ProviderToolDefinition,
   TaskObservation,
   TaskResult,
   TaskResultProvenance,
@@ -594,11 +600,31 @@ def test_prior_rejected_evidence_survives_lineage_warning_rebuild() -> None:
   )
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
+class _NullMcpClient(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__()
+
+  def is_mcp_tool(self, name: str) -> bool:
     return False
 
-  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
+  async def call_tool(
+    self,
+    name: str,
+    tool_input: dict[str, Any] | PreparedToolCall,
+    meta: dict[str, Any] | None = None,
+    abort_event: asyncio.Event | None = None,
+    gateway_session: Any | None = None,
+    allow_uncertain_replay: bool = True,
+    trusted_dispatch_scope: Mapping[str, object] | None = None,
+  ) -> tuple[Any | None, dict[str, Any] | None]:
+    _ = (
+      tool_input,
+      meta,
+      abort_event,
+      gateway_session,
+      allow_uncertain_replay,
+      trusted_dispatch_scope,
+    )
     return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
 
   def get_tool_definitions(self) -> list[dict[str, Any]]:
@@ -606,20 +632,17 @@ class _NullMcpClient:
 
 
 class _InvestmentMcpClient(_NullMcpClient):
-  @staticmethod
-  def is_mcp_tool(name: str) -> bool:
+  def is_mcp_tool(self, name: str) -> bool:
     return name == "start_quant_research"
 
-  @staticmethod
-  def get_server_for_tool(name: str) -> str | None:
+  def get_server_for_tool(self, name: str) -> str | None:
     return (
       "idea-workbench-mcp"
       if name == "start_quant_research"
       else None
     )
 
-  @staticmethod
-  def get_tool_definitions() -> list[dict[str, Any]]:
+  def get_tool_definitions(self) -> list[dict[str, Any]]:
     return [{
       "name": "start_quant_research",
       "description": "Start exact quant research.",
@@ -629,27 +652,78 @@ class _InvestmentMcpClient(_NullMcpClient):
 
 class _JobsMcpClient(_NullMcpClient):
   def __init__(self) -> None:
+    super().__init__()
     self.call_count = 0
 
-  @staticmethod
-  def is_mcp_tool(name: str) -> bool:
+  def is_mcp_tool(self, name: str) -> bool:
     return name == "list_jobs"
 
-  @staticmethod
-  def get_server_for_tool(name: str) -> str | None:
+  def get_server_for_tool(self, name: str) -> str | None:
     return "jobs-mcp" if name == "list_jobs" else None
 
-  @staticmethod
-  def get_tool_definitions() -> list[dict[str, Any]]:
+  def get_tool_definitions(self) -> list[dict[str, Any]]:
     return [{
       "name": "list_jobs",
       "description": "List operator jobs.",
       "input_schema": {"type": "object"},
     }]
 
-  async def call_tool(self, name: str, tool_input: dict[str, Any]):
+  async def call_tool(
+    self,
+    name: str,
+    tool_input: dict[str, Any] | PreparedToolCall,
+    meta: dict[str, Any] | None = None,
+    abort_event: asyncio.Event | None = None,
+    gateway_session: Any | None = None,
+    allow_uncertain_replay: bool = True,
+    trusted_dispatch_scope: Mapping[str, object] | None = None,
+  ) -> tuple[Any | None, dict[str, Any] | None]:
+    _ = (
+      meta,
+      abort_event,
+      gateway_session,
+      allow_uncertain_replay,
+      trusted_dispatch_scope,
+    )
     self.call_count += 1
     return {"name": name, "input": tool_input}, None
+
+
+class _RouteMcpClient(_NullMcpClient):
+  def __init__(self, routes: dict[str, str]) -> None:
+    super().__init__()
+    self.routes = dict(routes)
+    self.calls: list[tuple[str, dict[str, Any]]] = []
+
+  def is_mcp_tool(self, name: str) -> bool:
+    return name in self.routes
+
+  def get_server_for_tool(self, name: str) -> str | None:
+    return self.routes.get(name)
+
+  def get_original_tool_name(self, name: str) -> str:
+    return name
+
+  async def call_tool(
+    self,
+    name: str,
+    tool_input: dict[str, Any] | PreparedToolCall,
+    meta: dict[str, Any] | None = None,
+    abort_event: asyncio.Event | None = None,
+    gateway_session: Any | None = None,
+    allow_uncertain_replay: bool = True,
+    trusted_dispatch_scope: Mapping[str, object] | None = None,
+  ) -> tuple[Any | None, dict[str, Any] | None]:
+    _ = (
+      meta,
+      abort_event,
+      gateway_session,
+      allow_uncertain_replay,
+      trusted_dispatch_scope,
+    )
+    assert isinstance(tool_input, dict)
+    self.calls.append((name, dict(tool_input)))
+    return {"route": "mcp", "name": name}, None
 
 
 _MODEL_READER_TOOLS = frozenset({
@@ -666,12 +740,10 @@ _MODEL_READER_TOOLS = frozenset({
 
 
 class _ModelMcpClient(_NullMcpClient):
-  @staticmethod
-  def is_mcp_tool(name: str) -> bool:
+  def is_mcp_tool(self, name: str) -> bool:
     return name in _MODEL_READER_TOOLS
 
-  @staticmethod
-  def get_server_for_tool(name: str) -> str | None:
+  def get_server_for_tool(self, name: str) -> str | None:
     return "model-engine" if name in _MODEL_READER_TOOLS else None
 
   @staticmethod
@@ -686,16 +758,19 @@ class _ModelMcpClient(_NullMcpClient):
       },
     }
 
-  @classmethod
-  def get_tool_definitions(cls) -> list[dict[str, Any]]:
-    return [cls._definition(name) for name in sorted(_MODEL_READER_TOOLS)]
+  def get_tool_definitions(self) -> list[dict[str, Any]]:
+    return [self._definition(name) for name in sorted(_MODEL_READER_TOOLS)]
 
-  @classmethod
   def get_server_tool_definitions(
-    cls,
-    server_names: set[str] | frozenset[str],
+    self,
+    server_names: set[str],
   ) -> list[dict[str, Any]]:
-    return cls.get_tool_definitions() if "model-engine" in server_names else []
+    return self.get_tool_definitions() if "model-engine" in server_names else []
+
+
+class _ResumeTestRunner(AgentRunner):
+  _background_cancel_drain_timeout_seconds: float
+  _background_completion_persist_timeout_seconds: float
 
 
 class _ResumeTestProvider(ModelProvider):
@@ -731,9 +806,9 @@ def _runner(
   *,
   max_resume_chain_depth: int = 3,
   max_retained_tasks: int = 50,
-) -> AgentRunner:
+) -> _ResumeTestRunner:
   provider = _ResumeTestProvider()
-  runner = AgentRunner(
+  runner = _ResumeTestRunner(
     event_log=EventLog(),
     dispatcher=_dispatcher(),
     session_id="sess-parent",
@@ -888,13 +963,20 @@ async def _append_interrupted_skill_task(
   original_task_id: str | None = None,
   resumable: bool = True,
   allowed_tools: tuple[str, ...] = (),
+  allowed_tool_routes: tuple[AdmittedToolRoute, ...] = (),
   required_context: tuple[str, ...] = ("ticker",),
   ticker: str | None = "PCTY",
   research_file_id: int | None = None,
   max_budget_usd: float | None = None,
+  provider_tool_definitions: tuple[dict[str, Any], ...] | None = None,
+  legacy_schema_version: str | None = None,
 ) -> None:
+  if tuple(route.tool_id for route in allowed_tool_routes) != tuple(
+    sorted(set(allowed_tools))
+  ):
+    raise ValueError("test route fixture must match allowed_tools exactly")
   receipt = dict(capability_bind_receipt or _bind_receipt())
-  model_bind = CapabilityBind.from_receipt(receipt)
+  model_bind = CapabilityBind.from_json(receipt)
   profile = SkillProfile(
     name=agent_name,
     system_prompt="Resume carefully.",
@@ -939,12 +1021,28 @@ async def _append_interrupted_skill_task(
     client_timeout_seconds=90,
     max_tokens=64_000,
     cost_observation_threshold_usd=5.0,
+    provider_tool_definitions=tuple(
+      ProviderToolDefinition(definition=definition)
+      for definition in (
+        provider_tool_definitions
+        if provider_tool_definitions is not None
+        else tuple({
+          "name": tool_id,
+          "description": f"Test definition for {tool_id}.",
+          "input_schema": {"type": "object"},
+        } for tool_id in sorted(set(allowed_tools)))
+      )
+    ),
     max_resume_chain_depth=3,
     max_budget_usd=max_budget_usd,
   )
-  admission_parent = SimpleNamespace(
-    tenant_id="tenant-test",
+  admission_parent = GatewaySession(
     session_id="session-test",
+    api_key_hash="hash",
+    created_at=10,
+    expires_at=20,
+    user_id="alice",
+    tenant_id="tenant-test",
   )
   admitted_inputs = (
     (
@@ -973,13 +1071,37 @@ async def _append_interrupted_skill_task(
     execution_snapshot=execution_snapshot,
     capability_bindings=(),
     tool_grant=tool_grant,
+    tool_routes=allowed_tool_routes,
     model_bind=model_bind,
     result_requirement=result_requirement,
     objective=user_message,
     parent_session=admission_parent,
     inputs=admitted_inputs,
     attempt_number=1,
-  )(SimpleNamespace(task_id=task_id))
+  )(TaskEntry(task_id=task_id, task_type="background_agent"))
+  if legacy_schema_version is not None:
+    if legacy_schema_version not in {"1.0", "1.1"}:
+      raise ValueError("legacy test schema must be 1.0 or 1.1")
+    legacy_snapshot = admitted_task.execution_snapshot
+    assert legacy_snapshot is not None
+    if legacy_schema_version == "1.0":
+      legacy_snapshot = legacy_snapshot.model_copy(update={
+        "provider_tool_definitions": None,
+      })
+    admitted_task = admitted_task.model_copy(update={
+      "schema_version": legacy_schema_version,
+      "tool_routes": None,
+      "execution_snapshot": legacy_snapshot,
+    })
+    admitted_task = admitted_task.model_copy(update={
+      "admitted_task_digest": sha256_digest(admitted_task.model_dump(
+        mode="json",
+        exclude={"admitted_task_digest"},
+      )),
+    })
+    admitted_task = AdmittedTask.model_validate(
+      admitted_task.model_dump(mode="json")
+    )
   entry = runner._task_registry.register(
     "background_agent",
     agent_name=agent_name,
@@ -1099,7 +1221,7 @@ semantic_metadata:
 
     initial_runner = _runner(tmp_path)
     initial_runner._runner_id = "runner-initial"
-    initial_runner._get_tool_definitions = lambda: [{  # type: ignore[method-assign]
+    initial_runner._get_tool_definitions = lambda: [{
       "name": "web_search",
       "description": "Read-only evidence search.",
       "input_schema": {"type": "object"},
@@ -1144,12 +1266,20 @@ semantic_metadata:
     assert initial_entry.admitted_task.operation.operation.name == (
       "resume-shared-interceptors"
     )
+    assert initial_entry.admitted_task.schema_version == "1.2"
+    assert initial_entry.admitted_task.tool_routes == (
+      AdmittedToolRoute(
+        tool_id="web_search",
+        origin="local",
+        server_id=None,
+      ),
+    )
     await asyncio.wait_for(initial_dispatch_started.wait(), timeout=1.0)
     initial_dispatcher = initial_call["dispatcher"]
 
     resume_runner = _runner(tmp_path)
     resume_runner._runner_id = "runner-resumed"
-    resume_runner._get_tool_definitions = lambda: [{  # type: ignore[method-assign]
+    resume_runner._get_tool_definitions = lambda: [{
       "name": "web_search",
       "description": "Read-only evidence search.",
       "input_schema": {"type": "object"},
@@ -1164,7 +1294,7 @@ semantic_metadata:
         workspace_dir=tmp_path,
       ), None
 
-    resume_runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+    resume_runner.resume_sub_agent = _resume_sub_agent
     resume_handler = make_resume_handler(
       [resume_runner],
       mcp_client=_NullMcpClient(),
@@ -1189,6 +1319,7 @@ semantic_metadata:
       resumed_entry.admitted_task.logical_task
       == initial_entry.admitted_task.logical_task
     )
+    assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
     await resumed_entry.asyncio_task
     resume_dispatcher = resumed["dispatcher"]
 
@@ -1265,7 +1396,7 @@ def test_resume_handler_explicit_none_keeps_empty_interceptors(
         workspace_dir=tmp_path,
       ), None
 
-    runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+    runner.resume_sub_agent = _resume_sub_agent
     handler = make_resume_handler(
       [runner],
       mcp_client=_NullMcpClient(),
@@ -1279,6 +1410,7 @@ def test_resume_handler_explicit_none_keeps_empty_interceptors(
     assert result is not None
     resumed_entry = runner._task_registry.get(result["task_id"])
     assert resumed_entry is not None
+    assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
     await resumed_entry.asyncio_task
     assert captured["dispatcher"]._interceptors == []
 
@@ -1286,15 +1418,15 @@ def test_resume_handler_explicit_none_keeps_empty_interceptors(
 
 
 @pytest.mark.parametrize(
-  ("recovered_id", "expects_rebind"),
+  ("sealed_id", "expects_rebind"),
   [
     (37, True),
-    (0, False),
+    (None, False),
   ],
 )
-def test_resume_handler_rebinds_only_positive_recovered_research_file_id(
+def test_resume_handler_rebinds_only_from_the_sealed_research_file_id(
   tmp_path: Path,
-  recovered_id: int,
+  sealed_id: int | None,
   expects_rebind: bool,
 ) -> None:
   async def _case() -> None:
@@ -1303,10 +1435,20 @@ def test_resume_handler_rebinds_only_positive_recovered_research_file_id(
     runner = _runner(tmp_path)
     await _append_interrupted_skill_task(
       runner,
-      task_id=f"bg_rebind_{recovered_id}",
+      task_id=f"bg_rebind_{sealed_id}",
       agent_name="earnings-review",
-      user_message=f"Ticker: ADI\nRESEARCH_FILE_ID={recovered_id}",
+      # Stale transcript prose must never bind a resumed run.
+      user_message="Ticker: ADI\nRESEARCH_FILE_ID=99",
       allowed_tools=("fms_probe",),
+      allowed_tool_routes=(
+        AdmittedToolRoute(
+          tool_id="fms_probe",
+          origin="local",
+          server_id=None,
+        ),
+      ),
+      required_context=("ticker", "research_file_id"),
+      research_file_id=sealed_id,
     )
     captured: dict[str, Any] = {}
     rebound_calls: list[int] = []
@@ -1329,7 +1471,7 @@ def test_resume_handler_rebinds_only_positive_recovered_research_file_id(
         workspace_dir=tmp_path,
       ), None
 
-    runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+    runner.resume_sub_agent = _resume_sub_agent
     handler = make_resume_handler(
       [runner],
       mcp_client=_NullMcpClient(),
@@ -1338,13 +1480,14 @@ def test_resume_handler_rebinds_only_positive_recovered_research_file_id(
       excluded_tools_resolver=frozenset,
     )
 
-    result, error = await handler({"task_id": f"bg_rebind_{recovered_id}"})
+    result, error = await handler({"task_id": f"bg_rebind_{sealed_id}"})
 
     assert error is None
     assert result is not None
     assert not isinstance(result, TaskResult)
     resumed_entry = runner._task_registry.get(result["task_id"])
     assert resumed_entry is not None
+    assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
     await resumed_entry.asyncio_task
     assert captured["skill_name"] == "earnings-review"
     assert captured["result_requirement"].mode == "narrative"
@@ -1359,7 +1502,7 @@ def test_resume_handler_rebinds_only_positive_recovered_research_file_id(
     )
     resumed_handler = dispatcher._local["fms_probe"]
     if expects_rebind:
-      assert rebound_calls == [recovered_id]
+      assert rebound_calls == [sealed_id]
       assert resumed_handler is _rebound_fms_handler
     else:
       assert rebound_calls == []
@@ -1379,6 +1522,13 @@ def test_required_research_resume_uses_sealed_identity_not_resume_prose(
       agent_name="quant-research",
       user_message="Run the bounded quantitative study.",
       allowed_tools=("start_quant_research",),
+      allowed_tool_routes=(
+        AdmittedToolRoute(
+          tool_id="start_quant_research",
+          origin="mcp",
+          server_id="idea-workbench-mcp",
+        ),
+      ),
       required_context=("research_file_id",),
       ticker=None,
       research_file_id=1,
@@ -1396,7 +1546,7 @@ def test_required_research_resume_uses_sealed_identity_not_resume_prose(
         workspace_dir=tmp_path,
       ), None
 
-    runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+    runner.resume_sub_agent = _resume_sub_agent
     handler = make_resume_handler(
       [runner],
       mcp_client=_InvestmentMcpClient(),
@@ -1413,6 +1563,7 @@ def test_required_research_resume_uses_sealed_identity_not_resume_prose(
     assert isinstance(result, dict)
     resumed_entry = runner._task_registry.get(result["task_id"])
     assert resumed_entry is not None
+    assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
     await resumed_entry.asyncio_task
     dispatcher = captured["dispatcher"]
     assert dispatcher._run_context.research_file_id == 1
@@ -1453,7 +1604,7 @@ def test_resume_holds_recovered_research_file_activity_until_child_terminal(
         workspace_dir=tmp_path,
       ), None
 
-    runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+    runner.resume_sub_agent = _resume_sub_agent
     handler = make_resume_handler(
       [runner],
       mcp_client=_NullMcpClient(),
@@ -1513,7 +1664,7 @@ def test_resume_holds_recovered_activity_through_outer_completion_callback(
         workspace_dir=tmp_path,
       ), None
 
-    runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+    runner.resume_sub_agent = _resume_sub_agent
     callback_started = asyncio.Event()
     release_callback = asyncio.Event()
     invoke_callback = runner._invoke_background_completion_callback
@@ -1561,7 +1712,10 @@ def test_resume_holds_recovered_activity_through_outer_completion_callback(
 
 def test_same_generation_retry_advances_after_canonical_typed_task_registration(
   tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+  monkeypatch.setenv("PRODUCT_ID", "hank-test")
+
   async def _case() -> None:
     canonical_log = AgentSessionLog(
       session_ref=AgentSessionRef(
@@ -1726,6 +1880,13 @@ def test_quant_resume_rejects_missing_sealed_identity_despite_metadata_drift(
       agent_name="quant-research",
       user_message="RESEARCH_FILE_ID=1",
       allowed_tools=("start_quant_research",),
+      allowed_tool_routes=(
+        AdmittedToolRoute(
+          tool_id="start_quant_research",
+          origin="mcp",
+          server_id="idea-workbench-mcp",
+        ),
+      ),
       required_context=required_context,
       ticker=None,
     )
@@ -2187,11 +2348,15 @@ def test_register_background_task_resume_generates_r_suffix(tmp_path: Path) -> N
       agent_name="earnings-review",
       original_task_id="bg_3",
     )
-    await runner._task_registry.get("bg_3_r1").asyncio_task
+    resumed_entry = runner._task_registry.get("bg_3_r1")
+    assert isinstance(resumed_entry, TaskEntry)
+    assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
+    await resumed_entry.asyncio_task
 
     assert error is None
+    assert result is not None
     assert result["task_id"] == "bg_3_r1"
-    assert runner._task_registry.get("bg_3_r1").original_task_id == "bg_3"
+    assert resumed_entry.original_task_id == "bg_3"
 
   _run(_case())
 
@@ -2347,7 +2512,7 @@ def test_required_skill_result_recovers_after_append_failure_and_replay(
           raise RuntimeError("skill marker storage unavailable")
       return await append_event(event)
 
-    runner._append_durable_event = _fail_first_result_marker  # type: ignore[method-assign]
+    runner._append_durable_event = _fail_first_result_marker
 
     async def _handler(
       _tool_input: dict[str, Any],
@@ -2593,7 +2758,7 @@ def test_required_skill_result_rejects_mutated_whole_event_confirmation(
         }
       return await append_durable(event)
 
-    runner._append_durable_event = _append_mutated_marker  # type: ignore[method-assign]
+    runner._append_durable_event = _append_mutated_marker
 
     with pytest.raises(RuntimeError, match="envelope mismatch"):
       await runner._persist_required_skill_result_once(entry)
@@ -3349,7 +3514,7 @@ def test_required_skill_result_owned_append_survives_repeated_cancellation(
           raise
       return await append_event(event)
 
-    runner._append_durable_event = _blocked_marker  # type: ignore[method-assign]
+    runner._append_durable_event = _blocked_marker
     waiter = asyncio.create_task(
       runner._ensure_required_skill_result_settled(entry)
     )
@@ -3409,7 +3574,7 @@ def test_resume_successor_retries_failed_registration_without_ghost(
           raise RuntimeError("registration unavailable")
       return await append_event(event)
 
-    runner._append_durable_event = _fail_first_registration  # type: ignore[method-assign]
+    runner._append_durable_event = _fail_first_registration
 
     async def _handler(
       _tool_input: dict[str, Any],
@@ -3438,7 +3603,7 @@ def test_resume_successor_retries_failed_registration_without_ghost(
       )
 
     ghost = runner._task_registry.get("bg_registration_retry_r1")
-    assert ghost is not None
+    assert isinstance(ghost, TaskEntry)
     assert ghost.state == TaskState.PENDING
     assert ghost.asyncio_task is None
     assert ghost.registration_persistence_state == "uncertain"
@@ -3457,7 +3622,8 @@ def test_resume_successor_retries_failed_registration_without_ghost(
     assert result["task_id"] == "bg_registration_retry_r1"
     entry = runner._task_registry.get(result["task_id"])
     assert entry is ghost
-    assert entry.asyncio_task is not None
+    assert isinstance(entry, TaskEntry)
+    assert isinstance(entry.asyncio_task, asyncio.Task)
     await entry.asyncio_task
     assert entry.state == TaskState.COMPLETED
     assert entry.registration_persistence_state == "committed"
@@ -3465,7 +3631,9 @@ def test_resume_successor_retries_failed_registration_without_ghost(
     assert handler_calls == 1
     assert hook_calls == 1
 
-    registered, _ = await runner._agent_session_log.query(
+    log = runner._agent_session_log
+    assert isinstance(log, AgentSessionLog)
+    registered, _ = await log.query(
       event_types={"task_registered"},
       order="asc",
     )
@@ -3516,7 +3684,7 @@ def test_pending_resume_registration_reserves_capacity_without_durable_ghost(
         await release_registration.wait()
       return await append_event(event)
 
-    runner._append_durable_event = _blocked_registration  # type: ignore[method-assign]
+    runner._append_durable_event = _blocked_registration
 
     async def _resume_handler(
       _tool_input: dict[str, Any],
@@ -3660,7 +3828,7 @@ def test_resume_successor_initialization_survives_caller_cancellation(
         await release_append.wait()
       return await append_event(event)
 
-    runner._append_durable_event = _blocked_registration  # type: ignore[method-assign]
+    runner._append_durable_event = _blocked_registration
 
     async def _handler(
       _tool_input: dict[str, Any],
@@ -3738,7 +3906,7 @@ def test_resume_successor_does_not_start_if_source_settles_during_registration(
         await release_registration.wait()
       return await append_event(event)
 
-    runner._append_durable_event = _blocked_registration  # type: ignore[method-assign]
+    runner._append_durable_event = _blocked_registration
 
     async def _handler(
       _tool_input: dict[str, Any],
@@ -3826,7 +3994,7 @@ def test_shutdown_owns_hung_resume_initialization_without_late_worker(
         await release_append.wait()
       return await append_event(event)
 
-    runner._append_durable_event = _blocked_registration  # type: ignore[method-assign]
+    runner._append_durable_event = _blocked_registration
 
     async def _handler(
       _tool_input: dict[str, Any],
@@ -3993,7 +4161,7 @@ def test_resume_source_reference_survives_retention_eviction(
         workspace_dir=tmp_path,
       ), None
 
-    runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+    runner.resume_sub_agent = _resume_sub_agent
     handler = make_resume_handler(
       [runner],
       mcp_client=_NullMcpClient(),
@@ -4077,6 +4245,7 @@ def test_resume_chain_depth_and_cap(tmp_path: Path) -> None:
     )
 
     assert result is None
+    assert error is not None
     assert error["code"] == "max_resume_chain_depth"
 
   _run(_case())
@@ -4124,6 +4293,7 @@ def test_resume_handler_rejects_non_interrupted_task(tmp_path: Path) -> None:
     result, error = await handler({"task_id": "bg_3"})
 
     assert result is None
+    assert error is not None
     assert error["code"] == "not_interrupted"
 
   _run(_case())
@@ -4208,7 +4378,7 @@ def test_resume_handler_waits_for_same_run_uncertain_completion(
         await release_append.wait()
       return await append_event(event)
 
-    runner._append_durable_event = _blocked_completion  # type: ignore[method-assign]
+    runner._append_durable_event = _blocked_completion
 
     async def _original_handler(
       _tool_input: dict[str, Any],
@@ -4250,9 +4420,10 @@ def test_resume_handler_waits_for_same_run_uncertain_completion(
     result, error = await asyncio.wait_for(
       handler(
         {"task_id": task_id},
-        tool_ctx=SimpleNamespace(
+        tool_ctx=ToolExecutionContext(
           tool_call_id="resume-pending",
-          emit=parent_log.append,
+          tool_name="resume_background_agent",
+          event_log=parent_log,
         ),
       ),
       timeout=0.2,
@@ -4312,7 +4483,7 @@ def test_resume_handler_accepts_responses_log_after_cutover(tmp_path: Path) -> N
         workspace_dir=tmp_path,
       ), None
 
-    runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+    runner.resume_sub_agent = _resume_sub_agent
     handler = make_resume_handler(
       [runner],
       mcp_client=_NullMcpClient(),
@@ -4364,7 +4535,9 @@ def test_resume_handler_rejects_non_resumable_skill(tmp_path: Path) -> None:
       error,
       code="not_resumable",
     )
-    assert runner._task_registry.get("bg_3").state == TaskState.FAILED
+    failed_entry = runner._task_registry.get("bg_3")
+    assert isinstance(failed_entry, TaskEntry)
+    assert failed_entry.state == TaskState.FAILED
     notifications = runner._notification_queue.peek()
     assert len(notifications) == 1
     assert notifications[0].event == "failed"
@@ -4455,7 +4628,9 @@ def test_resume_abandoned_finalization_survives_cancellation_after_durable_commi
       await caller
     assert cancelled.value.args == ("caller-stopped",)
 
-    completed, _ = await runner._agent_session_log.query(
+    log = runner._agent_session_log
+    assert isinstance(log, AgentSessionLog)
+    completed, _ = await log.query(
       event_types={"task_completed"},
       order="asc",
     )
@@ -4483,7 +4658,7 @@ def test_resume_abandoned_finalization_survives_cancellation_after_durable_commi
     assert replay_error is None
     assert replay_result == entry.task_result
     assert append_calls == 1
-    completed_after_retry, _ = await runner._agent_session_log.query(
+    completed_after_retry, _ = await log.query(
       event_types={"task_completed"},
       order="asc",
     )
@@ -4971,7 +5146,9 @@ def test_resume_handler_adopts_old_interrupted_task_before_abandonment(
     adopted = runner._task_registry.get("bg_1")
     assert adopted is not None
     assert adopted.state == TaskState.FAILED
-    assert runner._task_registry.get("bg_2").state == TaskState.INTERRUPTED
+    newer_entry = runner._task_registry.get("bg_2")
+    assert isinstance(newer_entry, TaskEntry)
+    assert newer_entry.state == TaskState.INTERRUPTED
 
   _run(_case())
 
@@ -4987,6 +5164,13 @@ def test_resume_handler_rejects_persisted_grant_for_now_denied_mcp_server(
       agent_name="legacy-job-reader",
       user_message="Inspect an operator job.",
       allowed_tools=("list_jobs",),
+      allowed_tool_routes=(
+        AdmittedToolRoute(
+          tool_id="list_jobs",
+          origin="mcp",
+          server_id="jobs-mcp",
+        ),
+      ),
     )
     skills_dir = tmp_path / "skills"
     _write_skill(skills_dir, "legacy-job-reader")
@@ -5006,7 +5190,180 @@ def test_resume_handler_rejects_persisted_grant_for_now_denied_mcp_server(
       code="admitted_tool_route_unavailable",
     )
     assert mcp_client.call_count == 0
-    assert runner._task_registry.get("bg_jobs").state == TaskState.FAILED
+    failed_entry = runner._task_registry.get("bg_jobs")
+    assert isinstance(failed_entry, TaskEntry)
+    assert failed_entry.state == TaskState.FAILED
+
+  _run(_case())
+
+
+@pytest.mark.parametrize(
+  (
+    "case_name",
+    "persisted_route",
+    "current_server",
+    "install_local",
+    "expected_route",
+  ),
+  [
+    (
+      "server-a-to-b",
+      AdmittedToolRoute(
+        tool_id="route_probe",
+        origin="mcp",
+        server_id="server-a",
+      ),
+      "server-b",
+      False,
+      None,
+    ),
+    (
+      "mcp-to-same-name-local",
+      AdmittedToolRoute(
+        tool_id="route_probe",
+        origin="mcp",
+        server_id="server-a",
+      ),
+      None,
+      True,
+      None,
+    ),
+    (
+      "matching-mcp-with-same-name-local",
+      AdmittedToolRoute(
+        tool_id="route_probe",
+        origin="mcp",
+        server_id="server-a",
+      ),
+      "server-a",
+      True,
+      "mcp",
+    ),
+    (
+      "local-to-mcp",
+      AdmittedToolRoute(
+        tool_id="route_probe",
+        origin="local",
+        server_id=None,
+      ),
+      "server-a",
+      False,
+      None,
+    ),
+    (
+      "matching-local",
+      AdmittedToolRoute(
+        tool_id="route_probe",
+        origin="local",
+        server_id=None,
+      ),
+      "server-a",
+      True,
+      "local",
+    ),
+  ],
+)
+def test_resume_dispatches_only_through_the_persisted_route(
+  tmp_path: Path,
+  case_name: str,
+  persisted_route: AdmittedToolRoute,
+  current_server: str | None,
+  install_local: bool,
+  expected_route: str | None,
+) -> None:
+  async def _case() -> None:
+    case_workspace = tmp_path / case_name
+    runner = _runner(case_workspace)
+    task_id = f"bg_{case_name}"
+    await _append_interrupted_skill_task(
+      runner,
+      task_id=task_id,
+      agent_name="route-review",
+      user_message="Use the admitted route.",
+      allowed_tools=("route_probe",),
+      allowed_tool_routes=(persisted_route,),
+      required_context=(),
+      ticker=None,
+    )
+    original_entry = runner._task_registry.get(task_id)
+    assert original_entry is not None
+    original = original_entry.admitted_task
+    assert original is not None
+    captured: dict[str, Any] = {}
+    local_calls: list[dict[str, Any]] = []
+
+    async def _local_handler(tool_input: dict[str, Any], **_kwargs: Any):
+      local_calls.append(dict(tool_input))
+      return {"route": "local"}, None
+
+    async def _resume_sub_agent(**kwargs: Any):
+      captured.update(kwargs)
+      return await _successful_resume_task_result(
+        kwargs,
+        "continued",
+        workspace_dir=case_workspace,
+      ), None
+
+    runner.resume_sub_agent = _resume_sub_agent
+    mcp_client = _RouteMcpClient(
+      {"route_probe": current_server}
+      if current_server is not None
+      else {}
+    )
+    handler = make_resume_handler(
+      [runner],
+      parent_session=GatewaySession(
+        session_id=f"session-{case_name}",
+        api_key_hash="hash",
+        created_at=10,
+        expires_at=20,
+        user_id="alice",
+        role="owner",
+        auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+      ),
+      mcp_client=mcp_client,
+      local_tool_handlers=(
+        {"route_probe": _local_handler} if install_local else {}
+      ),
+      excluded_tools_resolver=frozenset,
+    )
+
+    resume_result, resume_error = await handler({"task_id": task_id})
+
+    assert resume_error is None
+    assert resume_result is not None
+    successor_entry = runner._task_registry.get(resume_result["task_id"])
+    assert successor_entry is not None
+    assert successor_entry.asyncio_task is not None
+    await successor_entry.asyncio_task
+    successor = successor_entry.admitted_task
+    assert successor is not None
+    assert successor.schema_version == "1.2"
+    assert successor.tool_routes == original.tool_routes
+    assert successor.tool_grant.tools == original.tool_grant.tools
+    assert successor.tool_grant.grant_id != original.tool_grant.grant_id
+    assert successor.tool_grant.digest != original.tool_grant.digest
+
+    result, error = await captured["dispatcher"].dispatch(
+      f"tool_{case_name}",
+      "route_probe",
+      {"case": case_name},
+      advertised_tool_names=frozenset({"route_probe"}),
+    )
+
+    if expected_route is None:
+      assert result is None
+      assert error is not None
+      assert error["code"] in {"mcp_tool_not_allowed", "unknown_tool"}
+    else:
+      assert error is None
+      assert result == {"route": expected_route, **(
+        {"name": "route_probe"} if expected_route == "mcp" else {}
+      )}
+    assert len(local_calls) == (1 if expected_route == "local" else 0)
+    assert len(mcp_client.calls) == (1 if expected_route == "mcp" else 0)
+    if persisted_route.origin == "mcp":
+      assert "route_probe" not in captured["excluded_tools"]
 
   _run(_case())
 
@@ -5044,12 +5401,12 @@ def test_resume_handler_abandons_chain_at_maximum_depth(
       error,
       code="max_resume_chain_depth",
     )
-    assert runner._task_registry.get("bg_depth_root_r1").state == (
-      TaskState.FAILED
-    )
-    assert runner._task_registry.get("bg_depth_root").state == (
-      TaskState.INTERRUPTED
-    )
+    failed_entry = runner._task_registry.get("bg_depth_root_r1")
+    assert isinstance(failed_entry, TaskEntry)
+    assert failed_entry.state == TaskState.FAILED
+    root_entry = runner._task_registry.get("bg_depth_root")
+    assert isinstance(root_entry, TaskEntry)
+    assert root_entry.state == TaskState.INTERRUPTED
 
   _run(_case())
 
@@ -5078,7 +5435,7 @@ def test_resume_handler_preserves_original_bind_despite_legacy_model_knob(
         workspace_dir=tmp_path,
       ), None
 
-    runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+    runner.resume_sub_agent = _resume_sub_agent
     monkeypatch.setenv("SUB_AGENT_DEFAULT_MODEL", "claude-opus-4-8")
     handler = make_resume_handler(
       [runner],
@@ -5092,6 +5449,7 @@ def test_resume_handler_preserves_original_bind_despite_legacy_model_knob(
     assert result is not None
     resumed_entry = runner._task_registry.get(result["task_id"])
     assert resumed_entry is not None
+    assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
     await resumed_entry.asyncio_task
     assert (
       captured["capability_execution"].bind.upstream_model
@@ -5128,6 +5486,7 @@ def test_resume_handler_rejects_hidden_model_and_provider_overrides(
     })
 
     assert result is None
+    assert error is not None
     assert error["code"] == "invalid_input"
     assert error["message"].endswith("model, provider")
 
@@ -5165,7 +5524,7 @@ def test_resume_rebuilds_and_materializes_the_exact_durable_bind(
         workspace_dir=tmp_path,
       ), None
 
-    runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+    runner.resume_sub_agent = _resume_sub_agent
     skills_dir = tmp_path / "skills"
     _write_skill(
       skills_dir,
@@ -5192,9 +5551,10 @@ semantic_metadata:
     resumed_entry = runner._task_registry.get(result["task_id"])
     assert resumed_entry is not None
     assert resumed_entry.capability_bind_receipt == receipt
+    assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
     await resumed_entry.asyncio_task
-    assert resolver.materialize_calls[0].receipt() == receipt
-    assert captured["capability_execution"].bind.receipt() == receipt
+    assert resolver.materialize_calls[0].to_json() == receipt
+    assert captured["capability_execution"].bind.to_json() == receipt
     assert captured["capability_execution"].bind is resolver.materialize_calls[0]
 
     log = runner._agent_session_log
@@ -5349,7 +5709,7 @@ def test_resume_handler_persists_original_bind_with_coordinator_enabled(
       captured.update(kwargs)
       return {"task_id": "bg_default_provider_r1", "status": "running"}, None
 
-    runner._register_background_task = _register_background_task  # type: ignore[method-assign]
+    runner._register_background_task = _register_background_task
     handler = make_resume_handler(
       [runner],
       parent_session=parent_session,
@@ -5396,6 +5756,7 @@ def test_resume_handler_uses_exact_admitted_prompt_after_skill_source_changes(
     )
     source_entry = runner._task_registry.get("bg_block")
     assert source_entry is not None
+    assert source_entry.admitted_task is not None
     source_snapshot = source_entry.admitted_task.execution_snapshot
     assert source_snapshot is not None
     captured: dict[str, Any] = {}
@@ -5408,7 +5769,7 @@ def test_resume_handler_uses_exact_admitted_prompt_after_skill_source_changes(
         workspace_dir=tmp_path,
       ), None
 
-    runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+    runner.resume_sub_agent = _resume_sub_agent
     handler = make_resume_handler(
       [runner],
       mcp_client=_NullMcpClient(),
@@ -5421,7 +5782,9 @@ def test_resume_handler_uses_exact_admitted_prompt_after_skill_source_changes(
     assert result is not None
     resumed_entry = runner._task_registry.get(result["task_id"])
     assert resumed_entry is not None
+    assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
     await resumed_entry.asyncio_task
+    assert resumed_entry.admitted_task is not None
     successor_snapshot = resumed_entry.admitted_task.execution_snapshot
     assert successor_snapshot is not None
     prompt = captured["system_prompt"]
@@ -5476,7 +5839,7 @@ def test_resume_background_emits_skill_run_started_before_completion(tmp_path: P
         workspace_dir=tmp_path,
       ), None
 
-    runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+    runner.resume_sub_agent = _resume_sub_agent
     handler = make_resume_handler(
       [runner],
       parent_session=GatewaySession(
@@ -5493,7 +5856,11 @@ def test_resume_background_emits_skill_run_started_before_completion(tmp_path: P
 
     result, error = await handler(
       {"task_id": "bg_delayed", "additional_context": "Ticker: PCTY"},
-      tool_ctx=SimpleNamespace(tool_call_id="turn-resume", emit=parent_log.append),
+      tool_ctx=ToolExecutionContext(
+        tool_call_id="turn-resume",
+        tool_name="resume_background_agent",
+        event_log=parent_log,
+      ),
     )
 
     assert error is None
@@ -5507,6 +5874,7 @@ def test_resume_background_emits_skill_run_started_before_completion(tmp_path: P
     assert events_before_completion[0]["ticker"] == "PCTY"
 
     release_resume.set()
+    assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
     await resumed_entry.asyncio_task
     assert [entry.event["type"] for entry in parent_log.entries] == [
       "skill_run_started",
@@ -5571,7 +5939,7 @@ def test_resume_copies_admitted_ticker_and_ignores_later_prose(
           workspace_dir=tmp_path,
         ), None
 
-      runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+      runner.resume_sub_agent = _resume_sub_agent
       parent_log = EventLog()
       handler = make_resume_handler(
         [runner],
@@ -5590,12 +5958,17 @@ def test_resume_copies_admitted_ticker_and_ignores_later_prose(
 
       result, error = await handler(
         {"task_id": "bg_scope", "additional_context": "Focus on AAPL."},
-        tool_ctx=SimpleNamespace(tool_call_id="turn-resume", emit=parent_log.append),
+        tool_ctx=ToolExecutionContext(
+          tool_call_id="turn-resume",
+          tool_name="resume_background_agent",
+          event_log=parent_log,
+        ),
       )
       assert error is None
       assert result is not None
       resumed_entry = runner._task_registry.get(result["task_id"])
       assert resumed_entry is not None
+      assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
       await resumed_entry.asyncio_task
 
       # INC-4 retired emit_html_artifact; the resolved ticker/scope is observable
@@ -5616,10 +5989,19 @@ def test_resume_copies_admitted_ticker_and_ignores_later_prose(
     memory.set_memory_store_factory(None)
 
 
-def test_resume_projects_all_private_model_reader_schemas(
+def test_resume_reuses_durable_private_schemas_after_live_mutation(
   tmp_path: Path,
 ) -> None:
   async def _case() -> None:
+    schema_a = tuple({
+      "name": name,
+      "description": "Admitted model reader definition.",
+      "input_schema": {
+        "type": "object",
+        "properties": {"admitted_model": {"type": "object"}},
+        "required": ["admitted_model"],
+      },
+    } for name in sorted(_MODEL_READER_TOOLS))
     runner = _runner(tmp_path)
     await _append_interrupted_skill_task(
       runner,
@@ -5627,6 +6009,15 @@ def test_resume_projects_all_private_model_reader_schemas(
       agent_name="model-review",
       user_message="Resume exact model review.",
       allowed_tools=tuple(sorted(_MODEL_READER_TOOLS)),
+      allowed_tool_routes=tuple(
+        AdmittedToolRoute(
+          tool_id=name,
+          origin="mcp",
+          server_id="model-engine",
+        )
+        for name in sorted(_MODEL_READER_TOOLS)
+      ),
+      provider_tool_definitions=schema_a,
     )
     captured: dict[str, Any] = {}
 
@@ -5638,35 +6029,21 @@ def test_resume_projects_all_private_model_reader_schemas(
         workspace_dir=tmp_path,
       ), None
 
-    runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
-    runner._get_tool_definitions = lambda: []  # type: ignore[method-assign]
-
-    def _project(definition: dict[str, Any]) -> dict[str, Any]:
-      projected = {
-        **definition,
-        "description": "Read the authenticated current model.",
-        "input_schema": {
-          "type": "object",
-          "properties": {
-            "current_model": {"type": "object"},
-          },
-          "required": ["current_model"],
-        },
-      }
-      return projected
+    runner.resume_sub_agent = _resume_sub_agent
+    runner._get_tool_definitions = lambda: []
 
     handler = make_resume_handler(
       [runner],
       mcp_client=_ModelMcpClient(),
       local_tool_handlers={},
       excluded_tools_resolver=frozenset,
-      tool_definition_projector=_project,
     )
     result, error = await handler({"task_id": "bg_model_readers"})
     assert error is None
     assert result is not None
     resumed_entry = runner._task_registry.get(result["task_id"])
     assert resumed_entry is not None
+    assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
     await resumed_entry.asyncio_task
 
     definitions = {
@@ -5677,7 +6054,116 @@ def test_resume_projects_all_private_model_reader_schemas(
     for tool_name in _MODEL_READER_TOOLS:
       schema = definitions[tool_name]["input_schema"]
       assert "file_path" not in schema["properties"]
-      assert schema["required"] == ["current_model"]
+      assert schema["required"] == ["admitted_model"]
+
+  _run(_case())
+
+
+def test_legacy_empty_grant_resume_upgrades_without_live_schema_read(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    runner = _runner(tmp_path)
+    await _append_interrupted_skill_task(
+      runner,
+      task_id="bg_legacy_empty_grant",
+      agent_name="legacy-empty-grant",
+      user_message="Resume the legacy task.",
+      required_context=(),
+      ticker=None,
+      legacy_schema_version="1.0",
+    )
+    captured: dict[str, Any] = {}
+
+    async def _resume_sub_agent(**kwargs: Any):
+      captured.update(kwargs)
+      return await _successful_resume_task_result(
+        kwargs,
+        "continued",
+        workspace_dir=tmp_path,
+      ), None
+
+    runner.resume_sub_agent = _resume_sub_agent
+    handler = make_resume_handler(
+      [runner],
+      mcp_client=_NullMcpClient(),
+      excluded_tools_resolver=frozenset,
+    )
+
+    result, error = await handler({"task_id": "bg_legacy_empty_grant"})
+
+    assert error is None
+    assert result is not None
+    successor = runner._task_registry.get(result["task_id"])
+    assert successor is not None
+    assert isinstance(successor.asyncio_task, asyncio.Task)
+    await successor.asyncio_task
+    assert successor.admitted_task is not None
+    assert successor.admitted_task.schema_version == "1.2"
+    assert successor.admitted_task.tool_routes == ()
+    assert successor.admitted_task.execution_snapshot is not None
+    assert (
+      successor.admitted_task.execution_snapshot.provider_tool_definitions
+      == ()
+    )
+    assert captured["dispatcher"].get_tool_definitions() == []
+
+  _run(_case())
+
+
+@pytest.mark.parametrize("legacy_schema_version", ["1.0", "1.1"])
+def test_legacy_tool_bearing_resume_has_clear_data_integrity_disposition(
+  tmp_path: Path,
+  legacy_schema_version: str,
+) -> None:
+  async def _case() -> None:
+    runner = _runner(tmp_path)
+    await _append_interrupted_skill_task(
+      runner,
+      task_id="bg_legacy_tool_grant",
+      agent_name="legacy-tool-grant",
+      user_message="Resume the legacy task.",
+      allowed_tools=("web_search",),
+      allowed_tool_routes=(
+        AdmittedToolRoute(
+          tool_id="web_search",
+          origin="local",
+          server_id=None,
+        ),
+      ),
+      required_context=(),
+      ticker=None,
+      legacy_schema_version=legacy_schema_version,
+    )
+    legacy_entry = runner._task_registry.get("bg_legacy_tool_grant")
+    assert legacy_entry is not None
+    legacy_task = legacy_entry.admitted_task
+    assert legacy_task is not None
+    assert legacy_task.schema_version == legacy_schema_version
+    assert legacy_task.tool_routes is None
+    legacy_snapshot = legacy_task.execution_snapshot
+    assert legacy_snapshot is not None
+    if legacy_schema_version == "1.0":
+      assert legacy_snapshot.provider_tool_definitions is None
+    else:
+      assert tuple(
+        definition.name
+        for definition in legacy_snapshot.provider_tool_definitions or ()
+      ) == ("web_search",)
+    handler = make_resume_handler(
+      [runner],
+      mcp_client=_NullMcpClient(),
+      local_tool_handlers={"web_search": lambda *_args, **_kwargs: None},
+      excluded_tools_resolver=frozenset,
+    )
+
+    result, error = await handler({"task_id": "bg_legacy_tool_grant"})
+
+    _assert_resume_abandoned(
+      result,
+      error,
+      code="durable_tool_routes_unavailable",
+    )
 
   _run(_case())
 
@@ -5698,7 +6184,9 @@ def test_resume_ticker_owner_survives_two_exact_successor_hops(
     original = runner._task_registry.get("bg_ticker_root")
     assert original is not None and original.admitted_task is not None
     original_inputs = original.admitted_task.inputs
-    logical_owner = original.admitted_task.logical_task.delegation_id
+    original_logical_task = original.admitted_task.logical_task
+    assert isinstance(original_logical_task, OrdinaryDelegationTaskRef)
+    logical_owner = original_logical_task.delegation_id
     first_resolver = _TestResumeCapabilityExecutionResolver()
     dispatches: list[str] = []
     first_dispatch_started = asyncio.Event()
@@ -5734,7 +6222,9 @@ def test_resume_ticker_owner_survives_two_exact_successor_hops(
     await first_dispatch_started.wait()
     assert first_entry.admitted_task is not None
     assert first_entry.admitted_task.inputs == original_inputs
-    assert first_entry.admitted_task.logical_task.delegation_id == logical_owner
+    first_logical_task = first_entry.admitted_task.logical_task
+    assert isinstance(first_logical_task, OrdinaryDelegationTaskRef)
+    assert first_logical_task.delegation_id == logical_owner
 
     # A fresh process recovers the durably registered, incomplete first
     # successor as interrupted. Its exact admission is the second-hop source.
@@ -5750,7 +6240,7 @@ def test_resume_ticker_owner_survives_two_exact_successor_hops(
         workspace_dir=tmp_path,
       ), None
 
-    restarted.resume_sub_agent = _second_resume_sub_agent  # type: ignore[method-assign]
+    restarted.resume_sub_agent = _second_resume_sub_agent
     second_handler = make_resume_handler(
       [restarted],
       parent_session=GatewaySession(
@@ -5783,8 +6273,12 @@ def test_resume_ticker_owner_survives_two_exact_successor_hops(
     assert second_entry.state == TaskState.COMPLETED
     assert second_entry.admitted_task is not None
     assert second_entry.admitted_task.inputs == original_inputs
-    assert second_entry.admitted_task.logical_task.delegation_id == logical_owner
-    assert original_inputs[0].context.content == "PCTY"
+    second_logical_task = second_entry.admitted_task.logical_task
+    assert isinstance(second_logical_task, OrdinaryDelegationTaskRef)
+    assert second_logical_task.delegation_id == logical_owner
+    original_context = original_inputs[0].context
+    assert isinstance(original_context, InlineExactContextView)
+    assert original_context.content == "PCTY"
     assert dispatches == ["bg_ticker_root_r1", "bg_ticker_root_r2"]
     assert len(first_resolver.materialize_calls) == 1
     assert len(second_resolver.materialize_calls) == 1
@@ -5843,7 +6337,7 @@ def test_resume_admitted_ticker_ignores_parent_resume_message_context(
           workspace_dir=tmp_path,
         ), None
 
-      runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+      runner.resume_sub_agent = _resume_sub_agent
       parent_log = EventLog()
       handler = make_resume_handler(
         [runner],
@@ -5862,12 +6356,17 @@ def test_resume_admitted_ticker_ignores_parent_resume_message_context(
 
       result, error = await handler(
         {"task_id": "bg_parent_scope"},
-        tool_ctx=SimpleNamespace(tool_call_id="turn-resume", emit=parent_log.append),
+        tool_ctx=ToolExecutionContext(
+          tool_call_id="turn-resume",
+          tool_name="resume_background_agent",
+          event_log=parent_log,
+        ),
       )
       assert error is None
       assert result is not None
       resumed_entry = runner._task_registry.get(result["task_id"])
       assert resumed_entry is not None
+      assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
       await resumed_entry.asyncio_task
 
       # INC-4 retired emit_html_artifact; the parent-resume-message ticker context
@@ -5918,7 +6417,7 @@ def test_resume_generic_historical_admission_without_ticker_remains_live(
           workspace_dir=tmp_path,
         ), None
 
-      runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+      runner.resume_sub_agent = _resume_sub_agent
       parent_log = EventLog()
       handler = make_resume_handler(
         [runner],
@@ -5937,12 +6436,17 @@ def test_resume_generic_historical_admission_without_ticker_remains_live(
 
       result, error = await handler(
         {"task_id": "bg_no_scope"},
-        tool_ctx=SimpleNamespace(tool_call_id="turn-resume", emit=parent_log.append),
+        tool_ctx=ToolExecutionContext(
+          tool_call_id="turn-resume",
+          tool_name="resume_background_agent",
+          event_log=parent_log,
+        ),
       )
       assert error is None
       assert result is not None
       resumed_entry = runner._task_registry.get(result["task_id"])
       assert resumed_entry is not None
+      assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
       await resumed_entry.asyncio_task
 
       # INC-4 retired emit_html_artifact; the portfolio-scope fallback (no ticker)
@@ -5986,9 +6490,9 @@ def test_resume_ticker_required_historical_admission_without_binding_fails_close
 
     _assert_resume_abandoned(result, error, code="invalid_task_metadata")
     assert resolver.materialize_calls == []
-    assert runner._task_registry.get("bg_missing_ticker_binding").state == (
-      TaskState.FAILED
-    )
+    failed_entry = runner._task_registry.get("bg_missing_ticker_binding")
+    assert isinstance(failed_entry, TaskEntry)
+    assert failed_entry.state == TaskState.FAILED
 
   _run(_case())
 
@@ -6013,6 +6517,13 @@ def test_resume_emit_dashboard_artifact_failure_emits_tool_write_failed(
         agent_name="portfolio-report",
         user_message="Resume portfolio HTML report.",
         allowed_tools=("emit_dashboard_artifact",),
+        allowed_tool_routes=(
+          AdmittedToolRoute(
+            tool_id="emit_dashboard_artifact",
+            origin="local",
+            server_id=None,
+          ),
+        ),
         required_context=("research_file_id",),
         research_file_id=41,
       )
@@ -6026,7 +6537,7 @@ def test_resume_emit_dashboard_artifact_failure_emits_tool_write_failed(
           workspace_dir=tmp_path,
         ), None
 
-      runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+      runner.resume_sub_agent = _resume_sub_agent
       parent_log = EventLog()
       handler = make_resume_handler(
         [runner],
@@ -6045,12 +6556,17 @@ def test_resume_emit_dashboard_artifact_failure_emits_tool_write_failed(
 
       result, error = await handler(
         {"task_id": "bg_portfolio"},
-        tool_ctx=SimpleNamespace(tool_call_id="turn-resume", emit=parent_log.append),
+        tool_ctx=ToolExecutionContext(
+          tool_call_id="turn-resume",
+          tool_name="resume_background_agent",
+          event_log=parent_log,
+        ),
       )
       assert error is None
       assert result is not None
       resumed_entry = runner._task_registry.get(result["task_id"])
       assert resumed_entry is not None
+      assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
       await resumed_entry.asyncio_task
 
       def _raise_build(*_args: Any, **_kwargs: Any):

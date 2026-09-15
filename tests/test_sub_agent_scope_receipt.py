@@ -8,21 +8,27 @@ from agent_gateway.skills import (
   generic_explore_profile,
 )
 from agent_gateway.capability_resolution import (
+  admitted_tool_routes,
   derive_dispatcher_allowlist,
   granted_tool_ids,
 )
 from agent_gateway.sub_agent_scope_receipt import (
   OperationToolAdmissionError,
   admit_operation_tools,
+  dispatcher_scopes_from_admitted_routes,
   parse_tool_grant,
   reissue_tool_grant,
-  scopes_from_tool_grant,
 )
 from agent_workflow_contracts import (
+  AdmittedToolRoute,
   ExecutionIdentity,
   OperationUnavailable,
   ResolvedAuthority,
+  ToolGrant,
+  ToolGrantEntry,
+  sha256_digest,
 )
+from agent_workflow_contracts.models import CatalogToolEffect
 
 
 class _Mcp:
@@ -42,6 +48,9 @@ class _Mcp:
   def get_original_tool_name(self, name: str) -> str:
     return name
 
+  def get_policy_tool_name(self, name: str) -> str | None:
+    return name if name in self.routes else None
+
 
 def _operation():
   return compile_agent_operation(
@@ -50,13 +59,18 @@ def _operation():
   )
 
 
-def _effect(tool_id: str, _server: str | None, _local: bool) -> str | None:
-  return {
-    "file_read": "read",
-    "propose_record": "propose",
-    "web_search": "read",
-    "write_record": "write",
-  }.get(tool_id)
+def _effect(
+  tool_id: str,
+  _server: str | None,
+  _local: bool,
+) -> CatalogToolEffect | None:
+  if tool_id in {"file_read", "web_search"}:
+    return "read"
+  if tool_id == "propose_record":
+    return "propose"
+  if tool_id == "write_record":
+    return "write"
+  return None
 
 
 def test_model_writer_with_artifact_only_contract_compiles_proposal_authority() -> None:
@@ -264,7 +278,7 @@ def test_persisted_grant_digest_is_verified() -> None:
     parse_tool_grant(payload)
 
 
-def test_resume_scopes_come_only_from_persisted_grant() -> None:
+def test_reissued_grant_keeps_persisted_route_scopes() -> None:
   authority = admit_operation_tools(
     _operation(),
     grant_id="grant:task-4",
@@ -280,13 +294,92 @@ def test_resume_scopes_come_only_from_persisted_grant() -> None:
     grant_id="grant:task-4-resume",
   )
 
-  tools, mcp_scope = scopes_from_tool_grant(
+  tools, local_tools, mcp_scope = dispatcher_scopes_from_admitted_routes(
     reissued,
-    local_tool_handlers={"file_read": object()},
-    mcp_client=_Mcp(),
+    admitted_tool_routes(authority),
   )
 
   assert tools == frozenset({"file_read", "web_search"})
+  assert local_tools == frozenset({"file_read"})
   assert mcp_scope == {"web": {"web_search"}}
   assert reissued.grant_id == "grant:task-4-resume"
   assert reissued.digest != authority.grant.digest
+
+
+def test_persisted_routes_project_exact_local_and_mcp_dispatcher_scopes() -> None:
+  entries = (
+    ToolGrantEntry(tool_id="file_read", route_id="local", effect="read"),
+    ToolGrantEntry(tool_id="web_search", route_id="server-a", effect="read"),
+  )
+  grant_id = "grant:persisted-routes"
+  grant = ToolGrant(
+    grant_id=grant_id,
+    tools=entries,
+    digest=sha256_digest({
+      "grant_id": grant_id,
+      "tools": [entry.model_dump(mode="json") for entry in entries],
+    }),
+  )
+  routes = (
+    AdmittedToolRoute(tool_id="file_read", origin="local", server_id=None),
+    AdmittedToolRoute(
+      tool_id="web_search",
+      origin="mcp",
+      server_id="server-a",
+    ),
+  )
+
+  all_tools, local_tools, mcp_scope = dispatcher_scopes_from_admitted_routes(
+    grant,
+    routes,
+  )
+
+  assert all_tools == frozenset({"file_read", "web_search"})
+  assert local_tools == frozenset({"file_read"})
+  assert mcp_scope == {"server-a": {"web_search"}}
+
+  with pytest.raises(OperationToolAdmissionError, match="exact ordered ToolGrant"):
+    dispatcher_scopes_from_admitted_routes(grant, tuple(reversed(routes)))
+
+
+def test_admitted_route_origin_requires_its_exact_server_shape() -> None:
+  with pytest.raises(ValueError, match="local admitted tool routes"):
+    AdmittedToolRoute(
+      tool_id="file_read",
+      origin="local",
+      server_id="server-a",
+    )
+  with pytest.raises(ValueError, match="MCP admitted tool routes require"):
+    AdmittedToolRoute(
+      tool_id="web_search",
+      origin="mcp",
+      server_id=None,
+    )
+  with pytest.raises(ValueError, match="at least 1 character"):
+    AdmittedToolRoute(
+      tool_id="web_search",
+      origin="mcp",
+      server_id=" ",
+    )
+
+
+def test_resolved_authority_projects_into_pure_persisted_route_scopes() -> None:
+  authority = admit_operation_tools(
+    _operation(),
+    grant_id="grant:pure-route-projection",
+    operation_tool_ids=("file_read", "web_search"),
+    definitions=({"name": "file_read"}, {"name": "web_search"}),
+    local_tool_handlers={"file_read": object()},
+    mcp_client=_Mcp(),
+    effect_resolver=_effect,
+  )
+  assert isinstance(authority, ResolvedAuthority)
+
+  all_tools, local_tools, mcp_scope = dispatcher_scopes_from_admitted_routes(
+    authority.grant,
+    admitted_tool_routes(authority),
+  )
+
+  assert all_tools == frozenset({"file_read", "web_search"})
+  assert local_tools == frozenset({"file_read"})
+  assert mcp_scope == {"web": {"web_search"}}

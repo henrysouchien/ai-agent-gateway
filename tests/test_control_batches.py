@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from functools import cache
 import inspect
 import json
 import sys
 import threading
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any
 
@@ -25,12 +26,15 @@ if str(ROOT) not in sys.path:
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import EventLog, ToolDispatcher
+from agent_gateway.approval_route import DurableLocalApprovalRoute
+from agent_gateway import AgentRunner, EventLog, ToolDispatcher
 from agent_gateway import approvals as approvals_module
 from agent_gateway.approval_policy import (
   ApprovalDecision as PolicyApprovalDecision,
+  ApprovalPolicy,
   ApprovalRequest,
   RunContext,
+  ToolClass,
   utc_now,
 )
 from agent_gateway.approval_store import SQLiteApprovalStore
@@ -44,6 +48,7 @@ from agent_gateway.capability_binding import (
 from agent_gateway.capability_execution import MaterializedCredential
 from agent_gateway.control_plane import batches as batches_module
 from agent_gateway.control_plane.valuation_ready_tools import make_valuation_ready_skill_tool_bundle
+from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.providers import ModelInfo, ModelProvider
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 from agent_gateway.claim_signing_authority import (
@@ -51,10 +56,18 @@ from agent_gateway.claim_signing_authority import (
 )
 from agent_gateway.session import GatewaySession
 from agent_gateway.skill_context import clear_current_skill, reset_current_skill, set_current_skill
+from agent_gateway.skill_limits import (
+  ActiveSkillAdmission,
+  SkillExecutionLimits,
+)
 from api.agent.batch.registry import (
   ActiveBatchError,
   BatchDispatchRecord,
   BatchRegistry,
+)
+from agent.skills.composition import compile_skill_application
+from agent.shared.tool_registration import (
+  build_product_tool_registration_composition,
 )
 from tests.capability_execution_test_support import (
   stub_capability_execution_resolver,
@@ -70,6 +83,25 @@ _BATCH_CAPABILITY_RESOLVER = stub_capability_execution_resolver(
 )
 _MODEL_REGISTRY = _BATCH_CAPABILITY_RESOLVER.registry
 _MODEL_SELECTION_POLICY = _BATCH_CAPABILITY_RESOLVER.selection_policy
+
+
+@cache
+def _skill_application():
+  tool_registration = build_product_tool_registration_composition()
+  return compile_skill_application(
+    skills_root=ROOT / "api" / "memory" / "workspace" / "notes" / "skills",
+    source_prefix=PurePosixPath(
+      "api/memory/workspace/notes/skills"
+    ),
+    tool_registration_catalog=tool_registration.catalog,
+  )
+
+
+def _skill_admission(name: str) -> ActiveSkillAdmission:
+  return ActiveSkillAdmission(
+    name,
+    SkillExecutionLimits(None, None, None),
+  )
 
 
 class _BatchTestProvider(ModelProvider):
@@ -227,8 +259,36 @@ class FakeBatchController:
   def __init__(self) -> None:
     self.acquire_calls: list[dict[str, Any]] = []
     self.run_calls: list[dict[str, Any]] = []
+    self.workflow_defaults_calls: list[tuple[str, object]] = []
+    self.workflow_catalog_calls: list[object] = []
     self.raise_active: bool = False
     self.wait_for_cancel: bool = False
+
+  def batch_workflow_defaults(
+    self,
+    workflow: str,
+    *,
+    skill_application: object,
+  ) -> dict[str, Any]:
+    from agent.skills.diligence_tracks import batch_workflow_defaults
+
+    self.workflow_defaults_calls.append((workflow, skill_application))
+    return batch_workflow_defaults(
+      workflow,
+      skill_application.definition_catalog,  # type: ignore[attr-defined]
+    )
+
+  def batch_workflow_catalog(
+    self,
+    *,
+    skill_application: object,
+  ) -> dict[str, dict[str, Any]]:
+    from agent.skills.diligence_tracks import batch_workflow_catalog
+
+    self.workflow_catalog_calls.append(skill_application)
+    return batch_workflow_catalog(
+      skill_application.definition_catalog,  # type: ignore[attr-defined]
+    )
 
   def acquire_batch_run(
     self,
@@ -237,6 +297,7 @@ class FakeBatchController:
     registry: BatchRegistry,
     host: str,
     capability_bind: dict[str, Any],
+    skill_application: object,
     pid: int | None = None,
     dispatch_key: str | None = None,
     dispatch_request_spec: dict[str, Any] | None = None,
@@ -264,6 +325,7 @@ class FakeBatchController:
         "user_email": user_email,
         "dispatch_key": dispatch_key,
         "capability_bind": dict(capability_bind),
+        "skill_application": skill_application,
       }
     )
     return batch_id, resolved_user_id, user_email
@@ -276,7 +338,8 @@ class FakeBatchController:
     registry: BatchRegistry,
     capability_execution_resolver: Any,
     session_driver_execution: Any,
-    captured_run_admission_factory: Any,
+    captured_run_context_factory: Any,
+    skill_application: object,
     _identity: tuple[str, str | None] | None = None,
     _on_finalize=None,
   ) -> dict[str, Any]:
@@ -288,9 +351,10 @@ class FakeBatchController:
       "identity": _identity,
       "capability_execution_resolver": capability_execution_resolver,
       "session_driver_execution": session_driver_execution,
-      "captured_run_admission_factory": (
-        captured_run_admission_factory
+      "captured_run_context_factory": (
+        captured_run_context_factory
       ),
+      "skill_application": skill_application,
     })
     if self.wait_for_cancel:
       for _ in range(50):
@@ -342,11 +406,11 @@ class FakeBatchController:
 
 
 def _make_app(*, mcp_client: Any = None):
-  async def _build_chat_runtime(*, session, request, channel, auth_manager):
+  async def _build_chat_runtime(session, request, channel, auth_manager, *, storage_root: Path | None = None):
     _ = session, channel, auth_manager
     return ChatRuntime(
       system_prompt="test",
-      build_runner=lambda *_args: None,
+      build_runner=lambda *_args: object.__new__(AgentRunner),
       capability_execution=request.capability_execution,
     )
 
@@ -366,6 +430,7 @@ def _make_app(*, mcp_client: Any = None):
       claim_signing_authority=GatewayClaimSigningAuthority(
         "batch-control-test-claim-key-at-least-32-bytes"
       ),
+      skill_application=_skill_application(),
     )
   )
 
@@ -428,7 +493,7 @@ def _acquire_test_batch(
         authenticated_session=None,
       )
     )
-    capability_bind = execution.bind.receipt()
+    capability_bind = execution.bind.to_json()
   return BatchRegistry.acquire_batch(
     registry,
     capability_bind=capability_bind,
@@ -444,10 +509,10 @@ def _install_batch_pending_approval(
   channel: str = "tui",
   request_id_override: str | None = None,
   durable_owner_user_id: str | None = None,
-  tool_class: str = "state_write",
+  tool_class: ToolClass = "state_write",
   persistent_grant_scope: str | None = None,
   stage_run_seq: int = 3,
-) -> tuple[ApprovalRequest, asyncio.Queue, SimpleNamespace]:
+) -> tuple[ApprovalRequest, asyncio.Queue, GatewaySession]:
   suffix = uuid.uuid4().hex
   approval_id = f"approval-batch-{suffix}"
   tool_call_id = f"tool-batch-{suffix}"
@@ -477,22 +542,23 @@ def _install_batch_pending_approval(
   )
   _run(app.state.gateway_approval_store.create(request_record))
   queue: asyncio.Queue = asyncio.Queue(maxsize=1)
-  batch_session = SimpleNamespace(
-    session_id=session_id,
+  batch_session = _gateway_session(
     user_id=owner_user_id,
     channel=channel,
-    approval_store=app.state.gateway_approval_store,
-    approval_policy=app.state.gateway_approval_policy,
-    pending_tools={
-      tool_call_id: {
-        "approval_id": approval_id,
-        "nonce": "cancel-nonce",
-        "status": "approval_pending",
-        "stage_run_seq": stage_run_seq,
-      }
-    },
-    approval_queues={tool_call_id: queue},
   )
+  batch_session.session_id = session_id
+  batch_session.owner_user_id = owner_user_id
+  batch_session.approval_store = app.state.gateway_approval_store
+  batch_session.approval_policy = app.state.gateway_approval_policy
+  batch_session.pending_tools = {
+    tool_call_id: {
+      "approval_id": approval_id,
+      "nonce": "cancel-nonce",
+      "status": "approval_pending",
+      "stage_run_seq": stage_run_seq,
+    }
+  }
+  batch_session.approval_queues = {tool_call_id: queue}
   app.state.batch_task_registry.approval_projections.register_session(
     batch_id=batch_id,
     owner_user_id=owner_user_id,
@@ -512,10 +578,11 @@ def _wait_for_batch_status(
   for _ in range(50):
     response = client.get(f"/api/control/batches/{batch_id}", headers=headers)
     assert response.status_code == 200, response.text
-    last_payload = response.json()
-    status = str(last_payload["batch"]["status"])
+    payload: dict[str, Any] = response.json()
+    last_payload = payload
+    status = str(payload["batch"]["status"])
     if status in expected:
-      return last_payload
+      return payload
     time.sleep(0.02)
   raise AssertionError(f"batch {batch_id} never reached {expected}: {last_payload}")
 
@@ -559,6 +626,8 @@ def test_control_batches_dispatch_list_and_get(fake_batch_control: FakeBatchCont
     assert [item["batch_id"] for item in batches] == [batch_id]
     assert batches[0]["cost_usd"] == pytest.approx(0.125)
     assert fake_batch_control.run_calls[0]["identity"] == ("alice", "alice@example.com")
+    assert fake_batch_control.acquire_calls[0]["skill_application"] is _skill_application()
+    assert fake_batch_control.run_calls[0]["skill_application"] is _skill_application()
 
 
 def test_control_batch_dispatch_replays_same_key_without_duplicate_task(
@@ -1164,6 +1233,7 @@ def test_fresh_key_preserves_locally_owned_active_batch(
     autonomous_storage_root=Path(
       "/tmp/agent-gateway-local-active-batch-test"
     ),
+    gateway_skill_application=_skill_application(),
   )
 
   with pytest.raises(ActiveBatchError) as exc_info:
@@ -1314,6 +1384,7 @@ def test_in_process_batch_task_contains_system_exit(
       autonomous_storage_root=Path(
         "/tmp/agent-gateway-batch-system-exit-test"
       ),
+      gateway_skill_application=_skill_application(),
     )
 
     result = await batches_module.dispatch_batch_in_process(
@@ -1332,7 +1403,9 @@ def test_in_process_batch_task_contains_system_exit(
     assert len(captured_tasks) == 1
     assert await captured_tasks[0] is None
     await asyncio.sleep(0)
-    assert not asyncio.current_task().cancelled()
+    current_task = asyncio.current_task()
+    assert current_task is not None
+    assert not current_task.cancelled()
 
   asyncio.run(run_case())
 
@@ -1383,6 +1456,7 @@ def test_in_process_batch_task_preserves_cancellation(
       autonomous_storage_root=Path(
         "/tmp/agent-gateway-batch-cancellation-test"
       ),
+      gateway_skill_application=_skill_application(),
     )
 
     await batches_module.dispatch_batch_in_process(
@@ -1505,6 +1579,21 @@ def test_retry_spec_narrows_persisted_corpus_requirements_to_failed_tickers() ->
   }]
 
 
+def test_retry_spec_corrupt_registry_state_is_an_internal_error() -> None:
+  """spec_json is gateway-written at admission; corruption is a 500, never a client 422."""
+  from fastapi import HTTPException
+
+  with pytest.raises(HTTPException) as invalid_json:
+    batches_module._retry_spec({"batch_id": 7, "spec_json": "{not json"}, ["ADI"])
+  assert invalid_json.value.status_code == 500
+  assert "batch 7" in invalid_json.value.detail
+
+  with pytest.raises(HTTPException) as non_object:
+    batches_module._retry_spec({"batch_id": 7, "spec_json": json.dumps([1, 2])}, ["ADI"])
+  assert non_object.value.status_code == 500
+  assert "batch 7" in non_object.value.detail
+
+
 def test_gateway_local_valuation_ready_dispatch_uses_batch_helper(
   fake_batch_control: FakeBatchController,
 ) -> None:
@@ -1519,6 +1608,7 @@ def test_gateway_local_valuation_ready_dispatch_uses_batch_helper(
       autonomous_storage_root=Path(
         "/tmp/agent-gateway-valuation-ready-dispatch-test"
       ),
+      gateway_skill_application=_skill_application(),
     )
     session = _gateway_session()
     bundle = make_valuation_ready_skill_tool_bundle(app_state=app_state, session=session)
@@ -1531,7 +1621,7 @@ def test_gateway_local_valuation_ready_dispatch_uses_batch_helper(
       "required_transcripts",
     ]
 
-    token = set_current_skill("valuation-ready")
+    token = set_current_skill(_skill_admission("valuation-ready"))
     try:
       result, error = await dispatch({
         "ticker": "adi",
@@ -1568,6 +1658,9 @@ def test_gateway_local_valuation_ready_dispatch_uses_batch_helper(
   }]
   assert fake_batch_control.run_calls[0]["spec"] == fake_batch_control.acquire_calls[0]["spec"]
   assert fake_batch_control.run_calls[0]["identity"] == ("1", "alice@example.com")
+  assert fake_batch_control.workflow_defaults_calls == [
+    ("valuation-ready", _skill_application())
+  ]
 
 
 def test_batch_admission_to_task_handoff_is_structurally_synchronous() -> None:
@@ -1576,13 +1669,58 @@ def test_batch_admission_to_task_handoff_is_structurally_synchronous() -> None:
 
   assert not inspect.iscoroutinefunction(handoff)
   assert "asyncio.create_task(" in source
-  assert "async def _captured_run_admission_factory(" in source
+  assert "async def _captured_run_context_factory(" in source
   assert source.index("acquire_batch_run") < source.rindex("task_registry.start")
+
+
+def test_valuation_ready_defaults_fail_closed_without_compiled_application(
+  fake_batch_control: FakeBatchController,
+) -> None:
+  async def run_case() -> None:
+    app_state = SimpleNamespace(
+      gateway_config=_gateway_config(mcp_client=ReadyCorpusMcpClient()),
+    )
+    session = _gateway_session()
+    dispatch = make_valuation_ready_skill_tool_bundle(
+      app_state=app_state,
+      session=session,
+    )["handlers"]["valuation_ready_batch_dispatch"]
+    token = set_current_skill(_skill_admission("valuation-ready"))
+    try:
+      result, error = await dispatch(
+        {
+          "ticker": "ADI",
+          "required_filings": ["2025-FY"],
+          "required_transcripts": ["2026-Q2"],
+        },
+        tool_ctx=SimpleNamespace(tool_call_id="missing-app"),
+      )
+    finally:
+      reset_current_skill(token)
+
+    assert result is None
+    assert error == {
+      "code": "batch_dispatch_failed",
+      "message": "batch compiled skill application is unavailable",
+    }
+
+  _run(run_case())
+  assert fake_batch_control.acquire_calls == []
+
+
+def test_batch_workflow_catalog_fails_closed_without_compiled_application() -> None:
+  with pytest.raises(
+    RuntimeError,
+    match="batch compiled skill application is unavailable",
+  ):
+    batches_module._batch_workflow_catalog(SimpleNamespace())
 
 
 def test_gateway_local_valuation_ready_dispatch_propagates_session_channel(
   monkeypatch: pytest.MonkeyPatch,
+  fake_batch_control: FakeBatchController,
 ) -> None:
+  _ = fake_batch_control
   captured: dict[str, Any] = {}
 
   async def fake_dispatch(_spec, **kwargs):
@@ -1590,7 +1728,9 @@ def test_gateway_local_valuation_ready_dispatch_propagates_session_channel(
     return {"batch_id": 7, "status": "running"}
 
   monkeypatch.setattr(batches_module, "dispatch_batch_in_process", fake_dispatch)
-  app_state = SimpleNamespace()
+  app_state = SimpleNamespace(
+    gateway_skill_application=_skill_application(),
+  )
   session = SimpleNamespace(
     session_id="valuation-session-1",
     user_id="henry",
@@ -1602,7 +1742,7 @@ def test_gateway_local_valuation_ready_dispatch_propagates_session_channel(
   bundle = make_valuation_ready_skill_tool_bundle(app_state=app_state, session=session)
 
   async def run_case() -> None:
-    token = set_current_skill("valuation-ready")
+    token = set_current_skill(_skill_admission("valuation-ready"))
     try:
       result, error = await bundle["handlers"]["valuation_ready_batch_dispatch"](
         {
@@ -1625,7 +1765,9 @@ def test_gateway_local_valuation_ready_dispatch_propagates_session_channel(
 
 def test_gateway_local_valuation_ready_dispatch_scopes_key_to_tool_call(
   monkeypatch: pytest.MonkeyPatch,
+  fake_batch_control: FakeBatchController,
 ) -> None:
+  _ = fake_batch_control
   dispatch_keys: list[str] = []
 
   async def fake_dispatch(_spec, **kwargs):
@@ -1642,11 +1784,13 @@ def test_gateway_local_valuation_ready_dispatch_scopes_key_to_tool_call(
     channel="cli",
   )
   dispatch = make_valuation_ready_skill_tool_bundle(
-    app_state=SimpleNamespace(),
+    app_state=SimpleNamespace(
+      gateway_skill_application=_skill_application(),
+    ),
     session=session,
   )["handlers"]["valuation_ready_batch_dispatch"]
   async def run_case() -> None:
-    token = set_current_skill("valuation-ready")
+    token = set_current_skill(_skill_admission("valuation-ready"))
     try:
       for tool_call_id, ticker in (
         ("tool-call-1", "PCTY"),
@@ -1679,11 +1823,12 @@ def test_gateway_local_valuation_ready_dispatch_blocks_before_batch_admission_on
     app_state = SimpleNamespace(
       user_event_bus=None,
       gateway_config=_gateway_config(mcp_client=mcp_client),
+      gateway_skill_application=_skill_application(),
     )
     session = _gateway_session()
     bundle = make_valuation_ready_skill_tool_bundle(app_state=app_state, session=session)
 
-    token = set_current_skill("valuation-ready")
+    token = set_current_skill(_skill_admission("valuation-ready"))
     try:
       result, error = await bundle["handlers"]["valuation_ready_batch_dispatch"]({
         "ticker": "PCTY",
@@ -1900,6 +2045,7 @@ def test_control_batches_workflows_catalog(fake_batch_control: FakeBatchControll
 
   assert response.status_code == 200, response.text
   workflows = response.json()["workflows"]
+  assert fake_batch_control.workflow_catalog_calls == [_skill_application()]
   assert workflows["earnings-review"]["source"] == "estimate_revisions"
   assert workflows["earnings-review"]["pipeline_template"] == "earnings-review"
   assert workflows["valuation-ready"]["pipeline_template"] == "valuation-ready"
@@ -2288,7 +2434,8 @@ def test_http_batch_cancel_cancels_hanging_admitted_producer_before_drain(
     registry: BatchRegistry,
     capability_execution_resolver: Any,
     session_driver_execution: Any,
-    captured_run_admission_factory: Any,
+    captured_run_context_factory: Any,
+    skill_application: object,
     _identity: tuple[str, str | None] | None = None,
     _on_finalize=None,
   ) -> dict[str, Any]:
@@ -2296,31 +2443,31 @@ def test_http_batch_cancel_cancels_hanging_admitted_producer_before_drain(
       spec,
       capability_execution_resolver,
       session_driver_execution,
-      captured_run_admission_factory,
+      captured_run_context_factory,
+      skill_application,
       _identity,
       _on_finalize,
     )
     scope = current_batch_approval_scope()
     assert scope is not None
-    session = SimpleNamespace(
-      session_id="delete-hanging-stage",
-      user_id="alice",
-      channel="tui",
-      role="owner",
-      batch_stage_run_seq=3,
-      pending_tools={},
-      approval_queues={},
-    )
+    session = _gateway_session()
+    session.role = "owner"
+    session.owner_user_id = session.user_id
+    session.session_id = "delete-hanging-stage"
+    session.channel = "tui"
+    session.batch_stage_run_seq = 3
     scope.register_session(session)
     session.batch_approval_scope = scope
     policy.session = session
     dispatcher = ToolDispatcher(
-      mcp_client=SimpleNamespace(),
+      mcp_client=McpClientManager(),
       local_tool_handlers={},
       event_log=EventLog(),
-      session=session,
-      store=app.state.gateway_approval_store,
-      policy=policy,
+      approval_route=DurableLocalApprovalRoute(
+        app.state.gateway_approval_store,
+        policy,
+        session,
+      ),
       run_context=RunContext(
         user_id="alice",
         request_id=f"batch_{batch_id}",
@@ -2432,7 +2579,8 @@ def test_http_batch_cancel_authorizes_bound_durable_request_before_publication(
     registry: BatchRegistry,
     capability_execution_resolver: Any,
     session_driver_execution: Any,
-    captured_run_admission_factory: Any,
+    captured_run_context_factory: Any,
+    skill_application: object,
     _identity: tuple[str, str | None] | None = None,
     _on_finalize=None,
   ) -> dict[str, Any]:
@@ -2440,31 +2588,31 @@ def test_http_batch_cancel_authorizes_bound_durable_request_before_publication(
       spec,
       capability_execution_resolver,
       session_driver_execution,
-      captured_run_admission_factory,
+      captured_run_context_factory,
+      skill_application,
       _identity,
       _on_finalize,
     )
     scope = current_batch_approval_scope()
     assert scope is not None
-    session = SimpleNamespace(
-      session_id="bound-request-preflight-stage",
-      user_id="alice",
-      channel="tui",
-      role="invite",
-      batch_stage_run_seq=3,
-      pending_tools={},
-      approval_queues={},
-    )
+    session = _gateway_session()
+    session.role = "invite"
+    session.owner_user_id = session.user_id
+    session.session_id = "bound-request-preflight-stage"
+    session.channel = "tui"
+    session.batch_stage_run_seq = 3
     scope.register_session(session)
     session.batch_approval_scope = scope
     policy.session = session
     dispatcher = ToolDispatcher(
-      mcp_client=SimpleNamespace(),
+      mcp_client=McpClientManager(),
       local_tool_handlers={},
       event_log=EventLog(),
-      session=session,
-      store=store,
-      policy=policy,
+      approval_route=DurableLocalApprovalRoute(
+        store,
+        policy,
+        session,
+      ),
       run_context=RunContext(
         user_id="alice",
         request_id=f"batch_{batch_id}",
@@ -2677,7 +2825,8 @@ def test_http_batch_cancel_retains_transient_projection_published_during_preflig
     registry: BatchRegistry,
     capability_execution_resolver: Any,
     session_driver_execution: Any,
-    captured_run_admission_factory: Any,
+    captured_run_context_factory: Any,
+    skill_application: object,
     _identity: tuple[str, str | None] | None = None,
     _on_finalize=None,
   ) -> dict[str, Any]:
@@ -2685,31 +2834,31 @@ def test_http_batch_cancel_retains_transient_projection_published_during_preflig
       spec,
       capability_execution_resolver,
       session_driver_execution,
-      captured_run_admission_factory,
+      captured_run_context_factory,
+      skill_application,
       _identity,
       _on_finalize,
     )
     scope = current_batch_approval_scope()
     assert scope is not None
-    session = SimpleNamespace(
-      session_id="delete-transient-publication-stage",
-      user_id="alice",
-      channel="tui",
-      role="owner",
-      batch_stage_run_seq=3,
-      pending_tools={},
-      approval_queues={},
-    )
+    session = _gateway_session()
+    session.role = "owner"
+    session.owner_user_id = session.user_id
+    session.session_id = "delete-transient-publication-stage"
+    session.channel = "tui"
+    session.batch_stage_run_seq = 3
     scope.register_session(session)
     session.batch_approval_scope = scope
     policy.session = session
     dispatcher = ToolDispatcher(
-      mcp_client=SimpleNamespace(),
+      mcp_client=McpClientManager(),
       local_tool_handlers={},
       event_log=EventLog(),
-      session=session,
-      store=app.state.gateway_approval_store,
-      policy=policy,
+      approval_route=DurableLocalApprovalRoute(
+        app.state.gateway_approval_store,
+        policy,
+        session,
+      ),
       run_context=RunContext(
         user_id="alice",
         request_id=f"batch_{batch_id}",
@@ -2753,8 +2902,8 @@ def test_http_batch_cancel_retains_transient_projection_published_during_preflig
 
     assert cancel_response.status_code == 200, cancel_response.text
     assert cancel_response.json()["batch"]["status"] == "cancelled"
-    assert initial_ids == [policy.request.approval_id]
     assert policy.request is not None
+    assert initial_ids == [policy.request.approval_id]
     assert drained_ids == [policy.request.approval_id]
     stored = _run(app.state.gateway_approval_store.get(policy.request.approval_id))
     assert stored is not None and stored.state == "denied"
@@ -2890,6 +3039,7 @@ def test_control_batches_cancel_uses_projection_authoritative_store_not_mutated_
     assert cancel_response.status_code == 200, cancel_response.text
     assert _run(app.state.gateway_approval_store.get(alice_record.approval_id)).state == "denied"
     preserved = _run(bob_store.get(bob_record.approval_id))
+    assert preserved is not None
     assert preserved.user_id == "bob"
     assert preserved.state == "pending_user"
     assert preserved.state_version == 0
@@ -3529,11 +3679,24 @@ def test_batch_approval_cancel_interleaving_never_releases_approved_tool(
   async def run_case() -> None:
     from agent_gateway.approval_store import SQLiteApprovalStore
 
-    class _Policy:
+    class _Policy(ApprovalPolicy):
+      async def decide(self, *, payload, request, run_context) -> PolicyApprovalDecision:
+        raise AssertionError("approval decision is not part of this race")
+
       async def on_resolve(self, *, request: ApprovalRequest) -> None:
         _ = request
 
-      def role_authorized_for_class(self, *, decider_role: str | None, tool_class: str) -> bool:
+      async def revoke_persistent_grant(self, *, grant_id: str, reason: str) -> None:
+        raise AssertionError(
+          f"persistent grant {grant_id} must not be revoked: {reason}"
+        )
+
+      def role_authorized_for_class(
+        self,
+        *,
+        decider_role: str | None,
+        tool_class: ToolClass,
+      ) -> bool:
         _ = decider_role, tool_class
         return True
 
@@ -3567,13 +3730,11 @@ def test_batch_approval_cancel_interleaving_never_releases_approved_tool(
       "nonce": "race-nonce",
       "status": "approval_pending",
     }
-    session = SimpleNamespace(
-      user_id="alice",
-      approval_store=store,
-      approval_policy=policy,
-      pending_tools={request_record.tool_call_id: pending_entry},
-      approval_queues={request_record.tool_call_id: queue},
-    )
+    session = _gateway_session(owner_user_id="1", user_id="alice")
+    session.approval_store = store
+    session.approval_policy = policy
+    session.pending_tools = {request_record.tool_call_id: pending_entry}
+    session.approval_queues = {request_record.tool_call_id: queue}
     durable_approved = asyncio.Event()
     release_vote = asyncio.Event()
     original_record_vote = store.record_vote
@@ -3584,7 +3745,7 @@ def test_batch_approval_cancel_interleaving_never_releases_approved_tool(
       await release_vote.wait()
       return resolved
 
-    store.record_vote = blocked_record_vote  # type: ignore[method-assign]
+    store.record_vote = blocked_record_vote
     approve_task = asyncio.create_task(
       approvals_module._record_vote_and_unblock(
         target_session=session,
@@ -3626,7 +3787,9 @@ def test_batch_approval_cancel_interleaving_never_releases_approved_tool(
 
     assert approval_result["status"] == "cancellation_pending"
     assert cancel_result["quarantined"] is True
-    assert (await store.get(request_record.approval_id)).state == "approved"
+    stored_request = await store.get(request_record.approval_id)
+    assert stored_request is not None
+    assert stored_request.state == "approved"
     assert queue.get_nowait() == {
       "approved": False,
       "allow_tool_type": False,
@@ -3882,7 +4045,7 @@ def test_batch_task_monitor_terminal_transition_cannot_overwrite_concurrent_comp
     registry.set_status(batch_id, "completed")
     return original_transition(*args, **kwargs)
 
-  registry.transition_status_if_current = complete_before_compare_and_set  # type: ignore[method-assign]
+  registry.transition_status_if_current = complete_before_compare_and_set
 
   batches_module._set_status_if_not_terminal(registry, batch_id, "cancelled")
 
@@ -4210,7 +4373,12 @@ def test_batch_task_registry_shutdown_rejects_projection_created_during_teardown
       "approval-late-1",
       "approval-late-2",
     ]
-    assert [(await store.get(record.approval_id)).state for record in records] == [
+    stored_states: list[str] = []
+    for record in records:
+      stored_record = await store.get(record.approval_id)
+      assert stored_record is not None
+      stored_states.append(stored_record.state)
+    assert stored_states == [
       "denied",
       "denied",
     ]
@@ -4259,15 +4427,12 @@ def test_batch_shutdown_cancels_hanging_admitted_producer_before_drain(
     store = SQLiteApprovalStore(tmp_path / "shutdown-hanging-approvals.sqlite3")
     policy = HangingPolicy()
     task_registry = batches_module.BatchTaskRegistry()
-    session = SimpleNamespace(
-      session_id="shutdown-hanging-stage",
-      user_id="alice",
-      channel="tui",
-      role="owner",
-      batch_stage_run_seq=3,
-      pending_tools={},
-      approval_queues={},
-    )
+    session = _gateway_session()
+    session.role = "owner"
+    session.owner_user_id = session.user_id
+    session.session_id = "shutdown-hanging-stage"
+    session.channel = "tui"
+    session.batch_stage_run_seq = 3
     scope = BatchApprovalScope(
       batch_id=batch_id,
       owner_user_id="alice",
@@ -4279,12 +4444,14 @@ def test_batch_shutdown_cancels_hanging_admitted_producer_before_drain(
     scope.register_session(session)
     session.batch_approval_scope = scope
     dispatcher = ToolDispatcher(
-      mcp_client=SimpleNamespace(),
+      mcp_client=McpClientManager(),
       local_tool_handlers={},
       event_log=EventLog(),
-      session=session,
-      store=store,
-      policy=policy,
+      approval_route=DurableLocalApprovalRoute(
+        store,
+        policy,
+        session,
+      ),
       run_context=RunContext(
         user_id="alice",
         request_id=f"batch_{batch_id}",

@@ -20,7 +20,7 @@ from agent_gateway.control_plane.canvas_artifacts import (
   CANVAS_RENDER_FAILURE_STORED_CAP,
   _append_render_failure,
 )
-from schema.canvas_artifact import CanvasArtifact, StaticExports
+from schema.canvas_artifact import CanvasArtifact, CanvasArtifactPurpose, StaticExports
 
 TESTS_DIR = Path(__file__).resolve().parent
 if str(TESTS_DIR) not in sys.path:
@@ -314,7 +314,7 @@ def _artifact(
   artifact_id: str,
   *,
   ticker: str | None,
-  purpose: str = "exploration",
+  purpose: CanvasArtifactPurpose = "exploration",
 ) -> CanvasArtifact:
   return CanvasArtifact(
     artifact_id=artifact_id,

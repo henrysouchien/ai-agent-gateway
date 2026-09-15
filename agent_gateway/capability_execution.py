@@ -14,6 +14,7 @@ from .capability_binding import (
   CapabilityResolutionError,
   CredentialHandle,
   ModelSelectionIntent,
+  SESSION_DRIVER_CAPABILITY,
   reauthorize_capability_bind,
   require_capability_execution_bind,
   resolve_capability_model,
@@ -346,7 +347,7 @@ def derive_batch_capability_execution(
 ) -> tuple[CapabilityExecutionResolver, BoundCapabilityExecution]:
   """Carry the exact session binding into a dedicated batch authorization."""
 
-  if parent_execution.bind.capability_id != "session.driver":
+  if parent_execution.bind.capability_id != SESSION_DRIVER_CAPABILITY:
     raise ValueError("batch derivation requires a session.driver execution")
   parent_execution.validate()
   parent_auth = parent_resolver.auth_context

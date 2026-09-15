@@ -107,8 +107,8 @@ def test_env_and_header_helpers_ignore_non_dict_mappings(monkeypatch) -> None:
     "PATH": "/bin"
   }
   assert mcp_client_config.build_http_headers(mapping, environ={"TOKEN": "secret"}) == {}
-  assert _build_mcp_env(mapping) == {"PATH": "/bin"}
-  assert _build_http_headers(mapping) == {}
+  assert _build_mcp_env(mapping) == {"PATH": "/bin"}  # pyright: ignore[reportArgumentType]  # negative: non-dict environment mapping ignored
+  assert _build_http_headers(mapping) == {}  # pyright: ignore[reportArgumentType]  # negative: non-dict header mapping ignored
 
 
 def test_config_helper_invalid_numeric_logs_warning() -> None:

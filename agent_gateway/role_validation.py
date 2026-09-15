@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, overload
+from typing import Any, Literal, overload
 
 from fastapi import HTTPException, status
+
+
+ExactRole = Literal["owner", "invite"]
 
 
 _MISSING = object()
@@ -10,7 +13,7 @@ _EXACT_ROLES = frozenset({"owner", "invite"})
 
 
 @overload
-def require_exact_role(value: Any) -> str: ...
+def require_exact_role(value: Any) -> ExactRole: ...
 
 
 @overload
@@ -35,19 +38,4 @@ def require_exact_role(value: Any, role: object = _MISSING) -> str | None:
   return None
 
 
-def coerce_stored_role(value: Any) -> str:
-  """Return a usable role for a role read off a PERSISTED record.
-
-  Authorizing a live request is a security decision and stays strict —
-  ``require_exact_role``. Reading a role out of a record we already wrote is
-  not: raising there makes the runtime unable to read its own history, and the
-  callers turn that into a silent skip. Records written before the role plane
-  carry no role; owner is the only role that can own one, so adopt it.
-  """
-
-  if type(value) is str and value in _EXACT_ROLES:
-    return value
-  return "owner"
-
-
-__all__ = ["require_exact_role", "coerce_stored_role"]
+__all__ = ["require_exact_role"]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import hashlib
 import hmac
@@ -10,10 +11,21 @@ import os
 import random
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Sequence, Set, Tuple
+from types import MappingProxyType
+from typing import AbstractSet, Any, Callable, cast, Dict, List, Mapping, Sequence, Set, Tuple, TypedDict, TYPE_CHECKING
+
+from typing_extensions import TypeIs
+
+from agent_workflow_contracts.tool_registration import (
+  McpInputPreparationRoute,
+  ToolRegistrationCatalog,
+  ToolRegistrationDeclaration,
+  index_mcp_input_preparation_routes,
+  validate_tool_registration_catalog,
+)
 
 from . import mcp_client_catalog as _catalog_helpers
 from . import mcp_client_connections as _connection_helpers
@@ -23,15 +35,39 @@ from . import mcp_client_oauth_storage as _oauth_storage
 from . import mcp_client_policy_owner as _policy_owner_helpers
 from . import mcp_client_runtime as _runtime_helpers
 from . import mcp_client_startup as _startup_helpers
-from .policy_imports import load_server_policy_helpers, load_server_policy_module
+from .approval_policy import sha256_args
+from .policy_imports import load_server_policy_helpers, update_mcp_tool_metadata
+from .tool_definition import LiveToolRouteBinding, OriginatedToolDefinition
+from .tool_dispatch_classification import (
+  OUTCOME_OK,
+  ToolResultSettlement,
+)
+from .tool_registration import (
+  RegisteredMcpToolDescriptor,
+  UnknownRegisteredMcpToolDescriptorError,
+  compile_registered_mcp_tool_descriptors,
+)
+from .tool_policy_registry import (
+  ApprovalCacheKeyCall,
+  ApprovalPredicateCall,
+  InputPreparationCall,
+  OutcomeCall,
+  PlanDecision,
+  PlanningCall,
+  PreparedToolCall,
+  RedactionCall,
+  SourceIdentityCall,
+  ToolPolicyImplementationRegistry,
+  ToolPolicyResultError,
+)
 
 try:
   from mcp.client.session import ClientSession
   from mcp.client.stdio import StdioServerParameters, stdio_client
   MCP_IMPORT_ERROR: Exception | None = None
 except Exception as exc:
-  ClientSession = Any  # type: ignore[assignment]
-  StdioServerParameters = Any  # type: ignore[assignment]
+  ClientSession = Any
+  StdioServerParameters = Any
   MCP_IMPORT_ERROR = exc
 
   def stdio_client(*args: Any, **kwargs: Any) -> Any:
@@ -42,26 +78,30 @@ try:
   from mcp.client.streamable_http import streamable_http_client
   STREAMABLE_HTTP_IMPORT_ERROR: Exception | None = None
 except Exception as exc:
-  streamable_http_client = None  # type: ignore[assignment]
+  streamable_http_client = None
   STREAMABLE_HTTP_IMPORT_ERROR = exc
 
 try:
-  import httpx
+  import httpx as _httpx
   HTTPX_IMPORT_ERROR: Exception | None = None
 except Exception as exc:
-  httpx = Any  # type: ignore[assignment]
+  _httpx = None
   HTTPX_IMPORT_ERROR = exc
+if TYPE_CHECKING:
+  import httpx
+else:
+  httpx = _httpx
 
 try:
   from fastmcp.client.auth.oauth import OAuth as FastMCPOAuth
   FASTMCP_OAUTH_IMPORT_ERROR: Exception | None = None
 except Exception as exc:
-  FastMCPOAuth = None  # type: ignore[assignment]
+  FastMCPOAuth = None
   FASTMCP_OAUTH_IMPORT_ERROR = exc
 
 
 log = logging.getLogger("agent_gateway.mcp_client")
-_UNSET = _config_helpers.UNSET
+_UNSET: _config_helpers.McpConfigPathUnset = _config_helpers.UNSET
 _STREAMABLE_HTTP_TYPES = _config_helpers.STREAMABLE_HTTP_TYPES
 _SUPPORTED_SERVER_TYPES = _config_helpers.SUPPORTED_SERVER_TYPES
 _DEFAULT_ENV_ALLOWLIST = _config_helpers.DEFAULT_ENV_ALLOWLIST
@@ -83,69 +123,25 @@ _GSHEETS_BROKER_WRITE_TOOLS = frozenset({
 })
 _GSHEETS_BROKER_TOOLS = _GSHEETS_BROKER_READ_TOOLS | _GSHEETS_BROKER_WRITE_TOOLS
 _READ_ONLY_POLICY_CLASSES = frozenset({"read", "pure_transform"})
+_AUTOMATIC_REPLAY_EFFECTS = frozenset({"read", "pure_transform", "support"})
 PER_USER_SESSION_TTL_SECONDS = 60 * 60
 PER_USER_EXPIRY_MARGIN_SECONDS = 5 * 60
 PER_USER_IDLE_REAP_SECONDS = 30 * 60
 PER_USER_REAPER_INTERVAL_SECONDS = 60.0
 PER_USER_INSTANCE_CAP = 32
 PER_USER_DRAIN_TIMEOUT_SECONDS = 60.0
-_PROVIDER_SYMBOL_SYMBOL_TOOLS = frozenset({
-  "check_market_cap",
-  "compare_peers",
-  "fetch_financials",
-  "get_earnings_transcript",
-  "get_etf_holdings",
-  "get_insider_trades",
-  "get_institutional_ownership",
-  "get_price_performance_windows",
-  "get_technical_analysis",
-  "industry_peer_comparison",
-})
-_PROVIDER_SYMBOL_TICKER_TOOLS = frozenset({
-  "cite_concept",
-  "concept_trend",
-  "describe_filing",
-  "get_concept",
-  "get_estimate_revisions",
-  "get_event_filings",
-  "get_extraction_series",
-  "get_filing_cover_facts",
-  "get_filing_document",
-  "get_filing_evidence",
-  "get_filing_extractions",
-  "get_filing_sections",
-  "get_filing_tables",
-  "get_filings",
-  "get_financials",
-  "get_metric",
-  "get_metric_series",
-  "get_operational_kpi_driver_rows",
-  "get_operational_kpi_drivers",
-  "get_statement",
-  "list_metrics",
-  "search_extractions",
-  "search_filing_tables",
-  "search_filing_text",
-  "search_metrics",
-})
-_PROVIDER_SYMBOL_SCALAR_KEYS: dict[str, tuple[str, ...]] = {
-  **{tool: ("symbol",) for tool in _PROVIDER_SYMBOL_SYMBOL_TOOLS},
-  **{tool: ("ticker",) for tool in _PROVIDER_SYMBOL_TICKER_TOOLS},
-}
-_PROVIDER_SYMBOL_COMMA_KEYS: dict[str, str] = {
-  "get_events_calendar": "symbols",
-  "get_news": "symbols",
-  "get_sector_overview": "symbols",
-  "screen_estimate_revisions": "tickers",
-}
-_PROVIDER_SYMBOL_TOOL_NAMES = (
-  frozenset(_PROVIDER_SYMBOL_SCALAR_KEYS)
-  | frozenset(_PROVIDER_SYMBOL_COMMA_KEYS)
-  | frozenset({"fetch_company_profile"})
-)
 
 
-def _resolve_mcp_config_path(config_path: Path | str | None | object = _UNSET) -> Path | None:
+class _McpCallKwargs(TypedDict, total=False):
+  read_timeout_seconds: timedelta
+  meta: dict[str, object]
+
+
+def _is_exact_prepared_tool_call(value: object) -> TypeIs[PreparedToolCall]:
+  return type(value) is PreparedToolCall
+def _resolve_mcp_config_path(
+  config_path: _config_helpers.McpConfigPathInput = _UNSET,
+) -> Path | None:
   return _config_helpers.resolve_mcp_config_path(
     config_path,
     unset=_UNSET,
@@ -167,23 +163,11 @@ def _build_mcp_env(server_env: Dict[str, Any] | None) -> Dict[str, str]:
   )
 
 
-def _expand_env_refs(value: Any) -> str:
-  return _config_helpers.expand_env_refs(value, environ=os.environ)
-
-
 def _build_http_headers(headers: Dict[str, Any] | None) -> Dict[str, str]:
   return _config_helpers.build_http_headers(
     headers if isinstance(headers, dict) else None,
     environ=os.environ,
   )
-
-
-def _env_nonnegative_int(name: str, default: int) -> int:
-  return _config_helpers.env_nonnegative_int(name, default, environ=os.environ, logger=log)
-
-
-def _env_nonnegative_float(name: str, default: float) -> float:
-  return _config_helpers.env_nonnegative_float(name, default, environ=os.environ, logger=log)
 
 
 def _stdio_connect_retries() -> int:
@@ -234,19 +218,6 @@ class _JsonFileKeyValue(_oauth_storage.JsonFileKeyValue):
   def _time(self) -> float:
     return time.time()
 
-  @staticmethod
-  def _active_value(entry: Any) -> dict[str, Any] | None:
-    if not isinstance(entry, dict):
-      return None
-    expires_at = entry.get("expires_at")
-    if expires_at is not None:
-      try:
-        if float(expires_at) <= time.time():
-          return None
-      except (TypeError, ValueError):
-        return None
-    value = entry.get("value")
-    return dict(value) if isinstance(value, dict) else None
 
 
 def _classify_exception(exc: Exception, msg: str) -> str:
@@ -380,12 +351,29 @@ def _preflight_stdio_executable(
 @dataclass
 class _ServerState:
   name: str
-  session: ClientSession
+  session: _connection_helpers.McpClientSession
   exit_contexts: List[Any]
   tool_definitions: List[Dict[str, Any]]
   tool_names: Set[str]
   tool_prefix: str = ""
   config: Dict[str, Any] | None = None
+  exported_tool_names: frozenset[str] | None = None
+  tool_metadata: Mapping[str, Mapping[str, Any] | None] = field(default_factory=dict)
+  published_tool_definitions: List[Dict[str, Any]] = field(init=False)
+
+  def __post_init__(self) -> None:
+    names = (
+      self.tool_names
+      if self.exported_tool_names is None
+      else self.exported_tool_names
+    )
+    self.exported_tool_names = frozenset(names)
+    self.published_tool_definitions = self.tool_definitions
+
+
+@dataclass
+class _ConnectedServerState(_ServerState):
+  session: _connection_helpers.McpClientSession
 
 
 @dataclass
@@ -430,6 +418,129 @@ class _PerUserMcpError(RuntimeError):
     self.code = code
 
 
+def registered_mcp_dispatch_scope(
+  *,
+  user_id: str,
+  dispatch_scope: Mapping[str, object] | None,
+) -> Mapping[str, object]:
+  """Bind trusted runtime identity to the existing session dispatch scope."""
+
+  normalized_user_id = str(user_id or "").strip()
+  if not normalized_user_id:
+    raise ValueError("registered MCP dispatch scope requires a trusted user")
+  if dispatch_scope is not None and not isinstance(dispatch_scope, Mapping):
+    raise TypeError("registered MCP session dispatch scope must be a mapping")
+  return MappingProxyType({
+    **dict(dispatch_scope or {}),
+    "user_id": normalized_user_id,
+  })
+
+
+@dataclass(frozen=True, slots=True)
+class RegisteredMcpRawPatchAuthorization:
+  """Exact durable authorization material emitted by raw-patch planning."""
+
+  approval_identity: Mapping[str, object]
+  approval_arguments: Mapping[str, object]
+  approval_arguments_hash: str
+  prepared_payload: bytes
+
+  def materialize_approval_arguments(self) -> dict[str, object]:
+    return PreparedToolCall(self.approval_arguments).materialize_input()
+
+  @classmethod
+  def from_plan_decision(
+    cls,
+    decision: PlanDecision,
+  ) -> "RegisteredMcpRawPatchAuthorization":
+    if decision.kind != "prepared_plan" or decision.prepared_plan is None:
+      raise ValueError(
+        "prepared MCP authorization requires an exact prepared-plan decision"
+      )
+    plan = decision.prepared_plan
+    if (
+      plan.get("schema_version")
+      != "registered-mcp-raw-patch-authorization.v1"
+    ):
+      raise ValueError("prepared raw-patch authorization schema is unsupported")
+    approval_identity = plan.get("approval_identity")
+    approval_arguments = plan.get("approval_arguments")
+    encoded_payload = plan.get("prepared_payload_base64")
+    if not isinstance(approval_identity, Mapping):
+      raise TypeError("prepared MCP approval identity must be a mapping")
+    if not isinstance(approval_arguments, Mapping):
+      raise TypeError("prepared MCP approval arguments must be a mapping")
+    if type(encoded_payload) is not str or not encoded_payload:
+      raise TypeError("prepared MCP authorization payload must be base64 text")
+    try:
+      prepared_payload = base64.b64decode(encoded_payload, validate=True)
+    except (ValueError, TypeError) as exc:
+      raise ValueError(
+        "prepared MCP authorization payload is not canonical base64"
+      ) from exc
+    if not prepared_payload:
+      raise ValueError("prepared MCP authorization payload must not be empty")
+    frozen_approval_arguments = PreparedToolCall(approval_arguments)
+    return cls(
+      approval_identity=approval_identity,
+      approval_arguments=frozen_approval_arguments.prepared_input,
+      approval_arguments_hash=sha256_args(
+        frozen_approval_arguments.materialize_input()
+      ),
+      prepared_payload=prepared_payload,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RegisteredMcpDirectToolCall:
+  """One immutable registered MCP call without an executable plan."""
+
+  descriptor: RegisteredMcpToolDescriptor
+  prepared_call: PreparedToolCall
+  planning: PlanDecision
+  approval_required: bool
+  approval_reuse_key: str | None
+
+  @property
+  def prepared_authorization(self) -> None:
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class RegisteredMcpPlannedToolCall:
+  """One immutable registered MCP plan that always uses durable approval."""
+
+  descriptor: RegisteredMcpToolDescriptor
+  prepared_call: PreparedToolCall
+  planning: PlanDecision
+  prepared_authorization: RegisteredMcpRawPatchAuthorization
+  approval_reuse_key: str | None
+
+  @property
+  def approval_required(self) -> bool:
+    return True
+
+  def materialize_authorized_input(
+    self,
+    tool_call_id: str,
+  ) -> dict[str, object]:
+    """Mint the registered post-approval credential into provider input."""
+
+    prepared = self.prepared_call.materialize_input()
+    from .raw_patch_authorization_store import encode_reference
+
+    return {
+      **prepared,
+      "authorization_ref": encode_reference(tool_call_id),
+    }
+
+
+RegisteredMcpToolCall = (
+  RegisteredMcpDirectToolCall | RegisteredMcpPlannedToolCall
+)
+RegisteredSdkMcpToolCall = RegisteredMcpToolCall
+
+
 class McpClientManager:
   """Manage MCP server lifecycles and tool routing.
 
@@ -445,26 +556,39 @@ class McpClientManager:
 
   def __init__(
     self,
-    allowed_servers: Set[str] | None = None,
+    allowed_servers: AbstractSet[str] | None = None,
     builtin_tool_names: Set[str] | None = None,
-    config_path: Path | str | None | object = _UNSET,
+    config_path: _config_helpers.McpConfigPathInput = _UNSET,
     inline_servers: Dict[str, Dict[str, Any]] | None = None,
-    timeout_overrides: Dict[str, int] | None = None,
-    tool_timeout_overrides: Dict[str, int] | None = None,
-    server_aliases: Dict[str, str] | None = None,
-    logical_server_routes: Dict[str, str] | None = None,
-    logical_tool_aliases: Dict[str, Dict[str, str]] | None = None,
+    timeout_overrides: Mapping[str, float] | None = None,
+    tool_timeout_overrides: Mapping[str, float] | None = None,
+    server_aliases: Mapping[str, str] | None = None,
+    logical_server_routes: Mapping[str, str] | None = None,
+    logical_tool_aliases: Mapping[str, Mapping[str, str]] | None = None,
+    input_preparation_routes: Sequence[McpInputPreparationRoute] = (),
     provider_ids_by_server: Dict[str, str] | None = None,
-    server_env_passthrough: Mapping[str, Set[str]] | None = None,
+    server_env_passthrough: Mapping[str, AbstractSet[str]] | None = None,
     per_user_env_resolver: Callable[
       [str, str, str | None], Mapping[str, str]
     ] | None = None,
     startup_timeout: int = 15,
     default_tool_timeout: int = 30,
     strip_input_fields: set[str] | None = None,
+    tool_registration_catalog: ToolRegistrationCatalog | None = None,
+    tool_policy_implementations: ToolPolicyImplementationRegistry | None = None,
+    input_preparation_context_factory: Callable[
+      [RegisteredMcpToolDescriptor, Mapping[str, object] | None], object
+    ] | None = None,
+    planning_context_factory: Callable[
+      [RegisteredMcpToolDescriptor, PreparedToolCall, object | None], object
+    ] | None = None,
+    redaction_context_factory: Callable[
+      [RegisteredMcpToolDescriptor], object
+    ] | None = None,
   ) -> None:
     self._lock = asyncio.Lock()
     self._started = False
+    self._configured_transport_server_names: Set[str] | None = None
     self._servers: Dict[str, _ServerState] = {}
     self._per_user_servers: Dict[tuple[str, str], _PerUserServerState] = {}
     self._per_user_spawn_locks: Dict[tuple[str, str], asyncio.Lock] = {}
@@ -482,6 +606,9 @@ class McpClientManager:
       server_name: dict(aliases)
       for server_name, aliases in dict(logical_tool_aliases or {}).items()
     }
+    self._input_preparation_routes = index_mcp_input_preparation_routes(
+      input_preparation_routes
+    )
     self._provider_ids_by_server = {
       self._canonical_server_name(server_name): str(provider_id).strip()
       for server_name, provider_id in dict(provider_ids_by_server or {}).items()
@@ -494,6 +621,97 @@ class McpClientManager:
     self._per_user_env_resolver = per_user_env_resolver
     self._per_user_binding_hmac_key = os.urandom(32)
     self._logical_tool_definitions: Dict[str, List[Dict[str, Any]]] = {}
+    self._logical_alias_generation: tuple[
+      _catalog_helpers.LogicalToolAliasProvenance,
+      ...,
+    ] = ()
+    self._tool_registration_catalog = (
+      validate_tool_registration_catalog(tool_registration_catalog)
+      if tool_registration_catalog is not None
+      else None
+    )
+    if (tool_policy_implementations is None) != (
+      input_preparation_context_factory is None
+    ):
+      raise ValueError(
+        "tool policy implementations and input-preparation context factory "
+        "must be provided together"
+      )
+    if (
+      tool_policy_implementations is not None
+      and type(tool_policy_implementations)
+      is not ToolPolicyImplementationRegistry
+    ):
+      raise TypeError(
+        "tool_policy_implementations must be an exact "
+        "ToolPolicyImplementationRegistry"
+      )
+    if (
+      input_preparation_context_factory is not None
+      and not callable(input_preparation_context_factory)
+    ):
+      raise TypeError("input_preparation_context_factory must be callable")
+    if planning_context_factory is not None and not callable(
+      planning_context_factory
+    ):
+      raise TypeError("planning_context_factory must be callable")
+    if (
+      planning_context_factory is not None
+      and tool_policy_implementations is None
+    ):
+      raise ValueError(
+        "registered planning context requires tool policy implementations"
+      )
+    if redaction_context_factory is not None and not callable(
+      redaction_context_factory
+    ):
+      raise TypeError("redaction_context_factory must be callable")
+    if (
+      redaction_context_factory is not None
+      and tool_policy_implementations is None
+    ):
+      raise ValueError(
+        "registered redaction context requires tool policy implementations"
+      )
+    if (
+      tool_policy_implementations is not None
+      and redaction_context_factory is None
+    ):
+      raise ValueError(
+        "registered MCP policy runtime requires a redaction context factory"
+      )
+    if (
+      tool_policy_implementations is not None
+      and self._tool_registration_catalog is None
+    ):
+      raise ValueError(
+        "registered input preparation requires a tool registration catalog"
+      )
+    if self._tool_registration_catalog is not None and self._input_preparation_routes:
+      raise ValueError(
+        "registered MCP input preparation cannot use legacy preparation routes"
+      )
+    if tool_policy_implementations is not None:
+      assert self._tool_registration_catalog is not None
+      tool_policy_implementations.validate_catalog(
+        self._tool_registration_catalog
+      )
+    self._tool_policy_implementations = tool_policy_implementations
+    self._input_preparation_context_factory = (
+      input_preparation_context_factory
+    )
+    self._planning_context_factory = planning_context_factory
+    self._redaction_context_factory = redaction_context_factory
+    if self._tool_registration_catalog is not None and (
+      timeout_overrides or tool_timeout_overrides
+    ):
+      raise ValueError(
+        "registered MCP timeouts must come only from the tool registration catalog"
+      )
+    self._registered_mcp_descriptors_by_exposed_name: Mapping[
+      str,
+      RegisteredMcpToolDescriptor,
+    ] = MappingProxyType({})
     self._dispatch_to_original: Dict[str, str] = {}
     self._allowed_servers = self._canonical_server_names(allowed_servers) if allowed_servers is not None else None
     self._builtin_tool_names = set(builtin_tool_names or set())
@@ -514,7 +732,7 @@ class McpClientManager:
   def _canonical_server_name(self, server_name: str) -> str:
     return self._server_aliases.get(server_name, server_name)
 
-  def _canonical_server_names(self, server_names: Set[str]) -> Set[str]:
+  def _canonical_server_names(self, server_names: AbstractSet[str]) -> Set[str]:
     return {self._canonical_server_name(server_name) for server_name in server_names}
 
   def _transport_server_name(self, server_name: str) -> str:
@@ -563,7 +781,17 @@ class McpClientManager:
       payload["error_type"] = error_type
     self._startup_diagnostics[canonical_name] = payload
 
-  def _timeout_for_tool(self, server_name: str, exposed_name: str, original_name: str) -> int:
+  def _timeout_for_tool(self, server_name: str, exposed_name: str, original_name: str) -> float:
+    if self._tool_registration_catalog is not None:
+      descriptor = self.get_registered_mcp_tool_descriptor(exposed_name)
+      if descriptor.server.transport_server_id != server_name:
+        raise ValueError(
+          "registered MCP timeout server does not match the live transport"
+        )
+      return descriptor.server.per_tool_timeout_seconds.get(
+        descriptor.identity.logical_name,
+        descriptor.server.default_timeout_seconds,
+      )
     for key in (
       f"{server_name}.{original_name}",
       f"{server_name}.{exposed_name}",
@@ -584,6 +812,25 @@ class McpClientManager:
       canonical_server_name=self._canonical_server_name,
       logger=log,
     )
+
+  def _configured_server_configs(self) -> Dict[str, Dict[str, Any]]:
+    config = self._read_claude_config()
+    mcp_servers = config.get("mcpServers", {})
+    if not isinstance(mcp_servers, dict):
+      mcp_servers = {}
+    configured = dict(mcp_servers)
+    configured.update(self._inline_servers)
+    return self._canonicalize_server_configs(configured)
+
+  def get_configured_transport_server_names(self) -> Set[str]:
+    """Return the transports captured from this manager's startup config."""
+
+    configured = self._configured_transport_server_names
+    if configured is None:
+      raise RuntimeError(
+        "configured MCP transports are unavailable before manager startup"
+      )
+    return set(configured)
 
   async def startup(self, allowed_servers: Set[str] | None = None) -> None:
     async with self._lock:
@@ -612,7 +859,7 @@ class McpClientManager:
       parse_allowed_tools=_config_helpers.parse_allowed_tools,
       safe_cache_name=_safe_cache_name,
       close_contexts=self._close_contexts,
-      server_state_factory=_ServerState,
+      server_state_factory=_ConnectedServerState,
       stdio_server_parameters_factory=StdioServerParameters,
       stdio_client_factory=stdio_client,
       client_session_factory=ClientSession,
@@ -631,14 +878,61 @@ class McpClientManager:
   async def _connect_startup_servers(
     self,
     connect_jobs: Sequence[tuple[str, Dict[str, Any]]],
-  ) -> list[_ServerState | None]:
+  ) -> list[_ConnectedServerState | None]:
     return await _connection_helpers.connect_startup_servers(
       self,
       connect_jobs,
       self._connection_runtime(),
     )
 
-  async def _connect_or_warn(self, name: str, config: Dict[str, Any]) -> _ServerState | None:
+  async def _publish_server_states(
+    self,
+    states: Sequence[_ServerState],
+    *,
+    replacing: _ServerState | None = None,
+  ) -> bool:
+    """Compile and publish under the caller-held lifecycle lock."""
+    if replacing is not None and self._servers.get(replacing.name) is not replacing:
+      for state in states:
+        await self._close_contexts(state.exit_contexts)
+      return False
+
+    # Compile only projections; live connection identities and their advertised
+    # catalogs survive unrelated publications and rejected replacements.
+    servers = dict(self._servers)
+    servers.update((state.name, state) for state in states)
+    candidate = copy.copy(self)
+    candidate._servers = {
+      name: replace(state, tool_names=set(state.tool_names))
+      for name, state in servers.items()
+    }
+    candidate._startup_diagnostics = dict(self._startup_diagnostics)
+    candidate._apply_collision_filtering()
+
+    for state in states:
+      displaced = self._servers.get(state.name)
+      if displaced is not None and displaced is not state:
+        await self._close_contexts(displaced.exit_contexts)
+    for name, state in servers.items():
+      state.published_tool_definitions = candidate._servers[name].published_tool_definitions
+      state.tool_names = candidate._servers[name].tool_names
+    for state in states:
+      update_mcp_tool_metadata(state.name, state.tool_metadata)
+    self._servers = servers
+    self._startup_diagnostics = candidate._startup_diagnostics
+    self._tool_definitions = candidate._tool_definitions
+    self._tool_to_server = candidate._tool_to_server
+    self._prefixed_to_original = candidate._prefixed_to_original
+    self._dispatch_to_original = candidate._dispatch_to_original
+    self._mcp_tool_names = candidate._mcp_tool_names
+    self._logical_tool_definitions = candidate._logical_tool_definitions
+    self._logical_alias_generation = candidate._logical_alias_generation
+    self._registered_mcp_descriptors_by_exposed_name = (
+      candidate._registered_mcp_descriptors_by_exposed_name
+    )
+    return True
+
+  async def _connect_or_warn(self, name: str, config: Dict[str, Any]) -> _ConnectedServerState | None:
     return await _connection_helpers.connect_or_warn(
       self,
       name,
@@ -646,7 +940,7 @@ class McpClientManager:
       self._connection_runtime(),
     )
 
-  async def _connect(self, name: str, config: Dict[str, Any]) -> _ServerState:
+  async def _connect(self, name: str, config: Dict[str, Any]) -> _ConnectedServerState:
     return await _connection_helpers.connect(
       self,
       name,
@@ -654,7 +948,7 @@ class McpClientManager:
       self._connection_runtime(),
     )
 
-  async def _connect_stdio_with_retries(self, name: str, config: Dict[str, Any]) -> _ServerState:
+  async def _connect_stdio_with_retries(self, name: str, config: Dict[str, Any]) -> _ConnectedServerState:
     return await _connection_helpers.connect_stdio_with_retries(
       self,
       name,
@@ -662,7 +956,7 @@ class McpClientManager:
       self._connection_runtime(),
     )
 
-  async def _connect_stdio(self, name: str, config: Dict[str, Any]) -> _ServerState:
+  async def _connect_stdio(self, name: str, config: Dict[str, Any]) -> _ConnectedServerState:
     return await _connection_helpers.connect_stdio(
       self,
       name,
@@ -670,7 +964,7 @@ class McpClientManager:
       self._connection_runtime(),
     )
 
-  async def _connect_streamable_http(self, name: str, config: Dict[str, Any]) -> _ServerState:
+  async def _connect_streamable_http(self, name: str, config: Dict[str, Any]) -> _ConnectedServerState:
     return await _connection_helpers.connect_streamable_http(
       self,
       name,
@@ -690,11 +984,11 @@ class McpClientManager:
     self,
     *,
     name: str,
-    session: ClientSession,
+    session: _connection_helpers.McpConnectionSession,
     exit_contexts: List[Any],
     tool_prefix: str,
     allowed_tools: tuple[str, ...] | None = None,
-  ) -> _ServerState:
+  ) -> _ConnectedServerState:
     return await _connection_helpers.initialize_session_state(
       self,
       name=name,
@@ -705,7 +999,10 @@ class McpClientManager:
       runtime=self._connection_runtime(),
     )
 
-  async def _verify_stdio_session_stable(self, session: ClientSession) -> None:
+  async def _verify_stdio_session_stable(
+    self,
+    session: _connection_helpers.McpConnectionSession,
+  ) -> None:
     await _connection_helpers.verify_stdio_session_stable(
       self,
       session,
@@ -713,17 +1010,640 @@ class McpClientManager:
     )
 
   def get_tool_definitions(self) -> List[Dict[str, Any]]:
+    if self._tool_registration_catalog is not None:
+      return [
+        self.get_registered_mcp_tool_descriptor(
+          str(definition.get("name"))
+        ).materialize_provider_definition()
+        for definition in self._tool_definitions
+      ]
     return copy.deepcopy(self._tool_definitions)
 
+  def get_registered_mcp_tool_descriptor(
+    self,
+    exposed_name: str,
+  ) -> RegisteredMcpToolDescriptor:
+    """Return the exact live descriptor or fail closed for unknown routes."""
+
+    if type(exposed_name) is not str or not exposed_name:
+      raise UnknownRegisteredMcpToolDescriptorError(
+        "registered MCP exposed name must be a non-empty exact str"
+      )
+    if self._tool_registration_catalog is None:
+      raise UnknownRegisteredMcpToolDescriptorError(
+        "MCP registration catalog is not configured"
+      )
+    descriptor = self._registered_mcp_descriptors_by_exposed_name.get(
+      exposed_name
+    )
+    if descriptor is None:
+      raise UnknownRegisteredMcpToolDescriptorError(
+        f"unknown registered live MCP tool: {exposed_name}"
+      )
+    return descriptor
+
+  def get_registered_mcp_tool_descriptor_for_sdk_tool(
+    self,
+    sdk_tool_name: str,
+  ) -> RegisteredMcpToolDescriptor:
+    """Resolve one exact SDK MCP identity through the live manager topology."""
+
+    _mcp_marker, configured_server, provider_name = sdk_tool_name.split("__", 2)
+    exposed_name = cast(
+      str,
+      self.resolve_tool_name(configured_server, provider_name),
+    )
+    return self.get_registered_mcp_tool_descriptor(exposed_name)
+
+  def prepare_registered_mcp_tool_call_for_sdk_tool(
+    self,
+    sdk_tool_name: str,
+    raw_input: Mapping[str, object],
+    trusted_dispatch_scope: Mapping[str, object] | None,
+    registered_approval_overlay: (
+      Callable[[ToolRegistrationDeclaration, PreparedToolCall], bool] | None
+    ) = None,
+  ) -> RegisteredMcpToolCall:
+    """Prepare and classify one SDK call through its live registration."""
+
+    descriptor = self.get_registered_mcp_tool_descriptor_for_sdk_tool(
+      sdk_tool_name
+    )
+    prepared_call = self.prepare_registered_tool_input(
+      descriptor.exposed_name,
+      raw_input,
+      trusted_dispatch_scope,
+    )
+    return self.classify_registered_mcp_prepared_tool_call(
+      descriptor.exposed_name,
+      prepared_call,
+      trusted_dispatch_scope,
+      registered_approval_overlay,
+    )
+
+  def classify_registered_mcp_prepared_tool_call(
+    self,
+    exposed_name: str,
+    prepared_call: PreparedToolCall,
+    trusted_dispatch_scope: object | None,
+    registered_approval_overlay: (
+      Callable[[ToolRegistrationDeclaration, PreparedToolCall], bool] | None
+    ) = None,
+  ) -> RegisteredMcpToolCall:
+    """Plan and classify one already-prepared exact registered MCP call."""
+
+    if type(prepared_call) is not PreparedToolCall:
+      raise TypeError("prepared_call must be an exact PreparedToolCall")
+    descriptor = self.get_registered_mcp_tool_descriptor(exposed_name)
+    registry = cast(
+      ToolPolicyImplementationRegistry,
+      self._tool_policy_implementations,
+    )
+    planning_policy = descriptor.declaration.semantics.planning_policy
+    planning_context = None
+    if planning_policy.policy_id != "none":
+      context_factory = self._planning_context_factory
+      if context_factory is None:
+        raise RuntimeError(
+          "registered MCP planning context is not configured"
+        )
+      planning_context = context_factory(
+        descriptor,
+        prepared_call,
+        trusted_dispatch_scope,
+      )
+    planning = registry.execute_planning(
+      planning_policy,
+      PlanningCall(
+        descriptor.identity,
+        prepared_call.prepared_input,
+        planning_context,
+      ),
+    )
+    if planning.kind == "authorized_intent":
+      raise ToolPolicyResultError(
+        "registered MCP planning must return none or an exact prepared plan"
+      )
+    if planning.kind == "prepared_plan":
+      if planning_policy.policy_id != "raw-patch-ops":
+        raise ToolPolicyResultError(
+          "registered MCP prepared planning is not executable"
+        )
+      prepared_authorization = (
+        RegisteredMcpRawPatchAuthorization.from_plan_decision(planning)
+      )
+    else:
+      prepared_authorization = None
+    policy = descriptor.declaration.semantics.approval
+    if policy.mode == "never":
+      intrinsic_approval_required = False
+    elif policy.mode == "always":
+      intrinsic_approval_required = True
+    else:
+      assert policy.predicate is not None
+      intrinsic_approval_required = registry.execute_approval_predicate(
+        policy.predicate,
+        ApprovalPredicateCall(
+          descriptor.identity,
+          prepared_call.prepared_input,
+        ),
+      )
+    overlay_approval_required = False
+    if registered_approval_overlay is not None:
+      overlay_result = registered_approval_overlay(
+        descriptor.declaration,
+        prepared_call,
+      )
+      if type(overlay_result) is not bool:
+        raise TypeError(
+          "registered approval overlay must return an exact bool"
+        )
+      overlay_approval_required = overlay_result
+    approval_required = (
+      intrinsic_approval_required or overlay_approval_required
+    )
+    approval_reuse_key = None
+    if (
+      approval_required
+      and not overlay_approval_required
+      and policy.cache_key is not None
+    ):
+      approval_reuse_key = registry.execute_approval_cache_key(
+        policy.cache_key,
+        ApprovalCacheKeyCall(
+          descriptor.identity,
+          prepared_call.prepared_input,
+          prepared_call.exact_backend,
+          (
+            planning.prepared_plan
+            if planning.kind == "prepared_plan"
+            else planning.authorized_intent
+          ),
+        ),
+      )
+    if prepared_authorization is not None:
+      return RegisteredMcpPlannedToolCall(
+        descriptor,
+        prepared_call,
+        planning,
+        prepared_authorization,
+        approval_reuse_key,
+      )
+    return RegisteredMcpDirectToolCall(
+      descriptor,
+      prepared_call,
+      planning,
+      approval_required,
+      approval_reuse_key,
+    )
+
+  def settle_registered_mcp_tool_result_for_sdk_tool(
+    self,
+    sdk_tool_name: str,
+    tool_input: Mapping[str, object],
+    result: object,
+    error: Mapping[str, object] | None,
+    semantic_error: Mapping[str, object] | None = None,
+  ) -> ToolResultSettlement:
+    """Settle one SDK MCP result through its exact live registration."""
+
+    descriptor = self.get_registered_mcp_tool_descriptor_for_sdk_tool(
+      sdk_tool_name
+    )
+    registry = self._tool_policy_implementations
+    if registry is None:
+      raise RuntimeError(
+        "registered MCP outcome implementations are not configured"
+      )
+    outcome = registry.execute_outcome(
+      descriptor.declaration.semantics.outcome_policy,
+      OutcomeCall(result, error, semantic_error),
+    )
+    if outcome != OUTCOME_OK:
+      return ToolResultSettlement(outcome=outcome)
+    sources = registry.execute_source_identity(
+      descriptor.declaration.semantics.source_identity_policy,
+      SourceIdentityCall(
+        descriptor.identity,
+        result,
+        tool_input,
+        sdk_tool_name,
+      ),
+    )
+    return ToolResultSettlement(
+      outcome=outcome,
+      sources=sources.identities,
+    )
+
+  def redact_registered_mcp_tool_input_for_sdk_tool(
+    self,
+    sdk_tool_name: str,
+    tool_input: Mapping[str, object],
+  ) -> dict[str, object]:
+    """Redact one SDK MCP input through its exact live registration."""
+
+    return self._redact_registered_mcp_descriptor_input(
+      self.get_registered_mcp_tool_descriptor_for_sdk_tool(sdk_tool_name),
+      tool_input,
+    )
+
+  def redact_registered_tool_input(
+    self,
+    exposed_name: str,
+    prepared_call: PreparedToolCall,
+  ) -> dict[str, object]:
+    """Redact one native MCP call through its exact live registration."""
+
+    if type(prepared_call) is not PreparedToolCall:
+      raise TypeError("prepared_call must be an exact PreparedToolCall")
+    return self._redact_registered_mcp_descriptor_input(
+      self.get_registered_mcp_tool_descriptor(exposed_name),
+      prepared_call.materialize_input(),
+    )
+
+  def redact_registered_raw_tool_input(
+    self,
+    exposed_name: str,
+    tool_input: Mapping[str, object],
+  ) -> dict[str, object]:
+    """Redact raw native input through its exact live registration."""
+
+    return self._redact_registered_mcp_descriptor_input(
+      self.get_registered_mcp_tool_descriptor(exposed_name),
+      tool_input,
+    )
+
+  def _redact_registered_mcp_descriptor_input(
+    self,
+    descriptor: RegisteredMcpToolDescriptor,
+    tool_input: Mapping[str, object],
+  ) -> dict[str, object]:
+    registry = cast(
+      ToolPolicyImplementationRegistry,
+      self._tool_policy_implementations,
+    )
+    context_factory = cast(
+      Callable[[RegisteredMcpToolDescriptor], object],
+      self._redaction_context_factory,
+    )
+    result = registry.execute_redaction(
+      descriptor.declaration.semantics.redaction_policy,
+      RedactionCall(
+        descriptor.identity,
+        tool_input,
+        context_factory(descriptor),
+      ),
+    )
+    return result.materialize_input()
+
+  def prepare_registered_tool_input(
+    self,
+    exposed_name: str,
+    raw_input: Mapping[str, object],
+    trusted_dispatch_scope: Mapping[str, object] | None,
+  ) -> PreparedToolCall:
+    """Prepare one exact registered MCP call before policy and retry handling."""
+
+    descriptor = self.get_registered_mcp_tool_descriptor(exposed_name)
+    registry = self._tool_policy_implementations
+    context_factory = self._input_preparation_context_factory
+    if registry is None or context_factory is None:
+      raise RuntimeError(
+        "registered MCP input-preparation runtime is not configured"
+      )
+    trusted_context = context_factory(
+      descriptor,
+      trusted_dispatch_scope,
+    )
+    return registry.execute_input_preparation(
+      descriptor.declaration.semantics.input_preparation_policy,
+      InputPreparationCall(
+        descriptor.identity,
+        raw_input,
+        trusted_context,
+      ),
+    )
+
+  def _refresh_registered_mcp_tool_descriptors(self) -> None:
+    """Rebuild the exact live join after the exposed topology is finalized."""
+
+    self._registered_mcp_descriptors_by_exposed_name = MappingProxyType({})
+    catalog = self._tool_registration_catalog
+    if catalog is None:
+      return
+    descriptors = compile_registered_mcp_tool_descriptors(
+      catalog,
+      self.get_server_tool_route_bindings(self.get_server_names()),
+    )
+    by_exposed_name = {
+      descriptor.exposed_name: descriptor
+      for descriptor in descriptors
+    }
+    if set(by_exposed_name) != self._mcp_tool_names:
+      raise ValueError(
+        "registered MCP descriptors do not match the live tool surface"
+      )
+    self._registered_mcp_descriptors_by_exposed_name = MappingProxyType(
+      by_exposed_name
+    )
+
   def get_server_tool_definitions(self, server_names: Set[str]) -> List[Dict[str, Any]]:
+    return [
+      record.materialize()
+      for record in self.get_server_tool_definition_records(server_names)
+    ]
+
+  def get_server_tool_definition_records(
+    self,
+    server_names: Set[str],
+  ) -> tuple[OriginatedToolDefinition, ...]:
     canonical_server_names = self._canonical_server_names(set(server_names))
-    tool_definitions: List[Dict[str, Any]] = []
+    records: list[OriginatedToolDefinition] = []
     for server_name, state in self._servers.items():
       if server_name in canonical_server_names and not self._is_transport_only_server(server_name):
-        tool_definitions.extend(copy.deepcopy(state.tool_definitions))
+        for definition in state.published_tool_definitions:
+          record = OriginatedToolDefinition(
+            definition=definition,
+            origin="mcp",
+            server_id=server_name,
+          )
+          if self._tool_to_server.get(record.name) != server_name:
+            raise ValueError("MCP tool definition owner mapping is incoherent")
+          records.append(record)
     for server_name in canonical_server_names:
-      tool_definitions.extend(copy.deepcopy(self._logical_tool_definitions.get(server_name, [])))
-    return tool_definitions
+      for definition in self._logical_tool_definitions.get(server_name, []):
+        record = OriginatedToolDefinition(
+          definition=definition,
+          origin="mcp",
+          server_id=server_name,
+        )
+        if self._tool_to_server.get(record.name) != server_name:
+          raise ValueError("MCP tool definition owner mapping is incoherent")
+        records.append(record)
+    if self._tool_registration_catalog is not None:
+      registered_records: list[OriginatedToolDefinition] = []
+      for record in records:
+        descriptor = self.get_registered_mcp_tool_descriptor(record.name)
+        registered_record = descriptor.live_binding.originated_definition
+        if registered_record != record:
+          raise ValueError(
+            "registered MCP definition diverges from the live surface"
+          )
+        registered_records.append(registered_record)
+      return tuple(registered_records)
+    return tuple(records)
+
+  def get_server_tool_route_bindings(
+    self,
+    server_names: Set[str],
+  ) -> tuple[LiveToolRouteBinding, ...]:
+    """Return exact live MCP route identities with their provider definitions."""
+
+    canonical_server_names = self._canonical_server_names(set(server_names))
+    selected_logical_definitions = tuple(
+      (server_name, definitions)
+      for server_name, definitions in self._logical_tool_definitions.items()
+      if server_name in canonical_server_names
+    )
+    generation_by_alias: dict[
+      tuple[str, str],
+      list[_catalog_helpers.LogicalToolAliasProvenance],
+    ] = {}
+    for raw_provenance in self._logical_alias_generation:
+      if type(raw_provenance) is not _catalog_helpers.LogicalToolAliasProvenance:
+        raise ValueError("MCP logical alias generation is incoherent")
+      provenance = _catalog_helpers.LogicalToolAliasProvenance(
+        logical_server_id=raw_provenance.logical_server_id,
+        exposed_name=raw_provenance.exposed_name,
+        transport_server_id=raw_provenance.transport_server_id,
+        provider_original_name=raw_provenance.provider_original_name,
+        physical_definition=raw_provenance.physical_definition,
+        logical_definition=raw_provenance.logical_definition,
+      )
+      generation_by_alias.setdefault((
+        provenance.logical_server_id,
+        provenance.exposed_name,
+      ), []).append(provenance)
+    required_physical_servers = {
+      server_name
+      for server_name in canonical_server_names
+      if server_name in self._servers
+    }
+    for server_name, _definitions in selected_logical_definitions:
+      if server_name not in self._logical_server_routes:
+        raise ValueError("MCP logical transport mapping is missing")
+      transport_server_id = self._logical_server_routes[server_name]
+      if (
+        type(transport_server_id) is not str
+        or transport_server_id not in self._servers
+      ):
+        raise ValueError("MCP logical transport mapping is incoherent")
+      required_physical_servers.add(transport_server_id)
+
+    physical_records: list[
+      tuple[str, OriginatedToolDefinition, str]
+    ] = []
+    physical_by_route: dict[
+      tuple[str, str],
+      list[OriginatedToolDefinition],
+    ] = {}
+    for server_name, state in self._servers.items():
+      if server_name not in required_physical_servers:
+        continue
+      tool_prefix = state.tool_prefix
+      if type(tool_prefix) is not str:
+        raise ValueError("MCP physical tool prefix is incoherent")
+      for definition in state.published_tool_definitions:
+        originated_definition = OriginatedToolDefinition(
+          definition=definition,
+          origin="mcp",
+          server_id=server_name,
+        )
+        exposed_name = originated_definition.name
+        if tool_prefix:
+          if exposed_name not in self._prefixed_to_original:
+            raise ValueError("MCP prefixed tool original mapping is missing")
+          provider_original_name = self._prefixed_to_original[exposed_name]
+          if exposed_name != f"{tool_prefix}{provider_original_name}":
+            raise ValueError("MCP prefixed tool original mapping is incoherent")
+        else:
+          if exposed_name in self._prefixed_to_original:
+            raise ValueError("MCP unprefixed tool original mapping is incoherent")
+          provider_original_name = exposed_name
+        route = (server_name, provider_original_name)
+        physical_by_route.setdefault(route, []).append(originated_definition)
+        physical_records.append((
+          server_name,
+          originated_definition,
+          provider_original_name,
+        ))
+
+    bindings: list[LiveToolRouteBinding] = []
+    seen_exposed_names: set[str] = set()
+    seen_binding_ids: set[tuple[str, str, str]] = set()
+
+    def append_binding(binding: LiveToolRouteBinding) -> None:
+      binding_id = (
+        binding.route_kind,
+        binding.logical_server_id,
+        binding.logical_name,
+      )
+      if binding.exposed_name in seen_exposed_names:
+        raise ValueError("duplicate MCP live exposed route")
+      if binding_id in seen_binding_ids:
+        raise ValueError("duplicate MCP live route binding")
+      seen_exposed_names.add(binding.exposed_name)
+      seen_binding_ids.add(binding_id)
+      bindings.append(binding)
+
+    for (
+      server_name,
+      originated_definition,
+      provider_original_name,
+    ) in physical_records:
+      if (
+        server_name not in canonical_server_names
+        or self._is_transport_only_server(server_name)
+      ):
+        continue
+      exposed_name = originated_definition.name
+      if self._tool_to_server.get(exposed_name) != server_name:
+        raise ValueError("MCP tool route owner mapping is incoherent")
+      dispatch_original = self._dispatch_to_original.get(exposed_name)
+      if (
+        dispatch_original is not None
+        and dispatch_original != provider_original_name
+      ):
+        raise ValueError("MCP physical tool original mapping is incoherent")
+      surface_matches = [
+        surface_definition
+        for surface_definition in self._tool_definitions
+        if isinstance(surface_definition, Mapping)
+        and surface_definition.get("name") == exposed_name
+      ]
+      if len(surface_matches) != 1:
+        raise ValueError(
+          "MCP physical tool requires unique surface provenance"
+        )
+      surface_definition = OriginatedToolDefinition(
+        definition=surface_matches[0],
+        origin="mcp",
+        server_id=server_name,
+      )
+      if surface_definition != originated_definition:
+        raise ValueError("MCP physical tool definition diverges from surface")
+      append_binding(LiveToolRouteBinding(
+        originated_definition=originated_definition,
+        route_kind="physical",
+        logical_name=provider_original_name,
+        transport_server_id=server_name,
+        provider_original_name=provider_original_name,
+        provider_id=self._provider_ids_by_server.get(server_name),
+      ))
+
+    for server_name, definitions in selected_logical_definitions:
+      for definition in definitions:
+        originated_definition = OriginatedToolDefinition(
+          definition=definition,
+          origin="mcp",
+          server_id=server_name,
+        )
+        exposed_name = originated_definition.name
+        if self._tool_to_server.get(exposed_name) != server_name:
+          raise ValueError("MCP tool route owner mapping is incoherent")
+        transport_server_id = self._logical_server_routes[server_name]
+        if exposed_name not in self._dispatch_to_original:
+          raise ValueError("MCP logical tool original mapping is missing")
+        provider_original_name = self._dispatch_to_original[exposed_name]
+        declared_aliases = self._logical_tool_aliases.get(server_name, {})
+        declared_original = declared_aliases.get(exposed_name, exposed_name)
+        if provider_original_name != declared_original:
+          raise ValueError("MCP logical tool original mapping is incoherent")
+
+        generation_matches = generation_by_alias.get(
+          (server_name, exposed_name),
+          [],
+        )
+        if len(generation_matches) != 1:
+          raise ValueError(
+            "MCP logical tool requires unique alias generation"
+          )
+        generation = generation_matches[0]
+        if (
+          generation.transport_server_id != transport_server_id
+          or generation.provider_original_name != provider_original_name
+        ):
+          raise ValueError("MCP logical route diverges from alias generation")
+        if generation.logical_definition != originated_definition:
+          raise ValueError(
+            "MCP logical definition diverges from alias generation"
+          )
+
+        physical_provenance = physical_by_route.get(
+          (transport_server_id, provider_original_name),
+          [],
+        )
+        transport_state = self._servers[transport_server_id]
+        advertised_definitions = [
+          advertised
+          for advertised in transport_state.tool_definitions
+          if advertised.get("name") == provider_original_name
+        ]
+        if len(physical_provenance) != 1 or len(advertised_definitions) != 1:
+          raise ValueError(
+            "MCP logical tool requires unique physical provenance"
+          )
+        advertised_projection = OriginatedToolDefinition(
+          definition=_catalog_helpers.materialize_published_tool_definition(
+            advertised_definitions[0],
+            prefix=transport_state.tool_prefix,
+            strip_input_fields=self._strip_input_fields,
+          ),
+          origin="mcp",
+          server_id=transport_server_id,
+        )
+        if (
+          physical_provenance[0] != generation.physical_definition
+          or advertised_projection != generation.physical_definition
+        ):
+          raise ValueError(
+            "MCP physical definition diverges from alias generation"
+          )
+        physical_definition = physical_provenance[0].materialize()
+        logical_definition = originated_definition.materialize()
+        for route_field in ("name", "description"):
+          physical_definition.pop(route_field, None)
+          logical_definition.pop(route_field, None)
+        if logical_definition != physical_definition:
+          raise ValueError("MCP logical tool schema diverges from its transport")
+
+        surface_matches = [
+          surface_definition
+          for surface_definition in self._tool_definitions
+          if isinstance(surface_definition, Mapping)
+          and surface_definition.get("name") == exposed_name
+        ]
+        if len(surface_matches) != 1:
+          raise ValueError(
+            "MCP logical tool requires unique surface provenance"
+          )
+        surface_definition = OriginatedToolDefinition(
+          definition=surface_matches[0],
+          origin="mcp",
+          server_id=server_name,
+        )
+        if surface_definition != generation.logical_definition:
+          raise ValueError("MCP logical tool definition diverges from surface")
+
+        append_binding(LiveToolRouteBinding(
+          originated_definition=originated_definition,
+          route_kind="logical",
+          logical_name=exposed_name,
+          transport_server_id=transport_server_id,
+          provider_original_name=provider_original_name,
+          provider_id=self._provider_ids_by_server.get(transport_server_id),
+        ))
+    return tuple(bindings)
 
   def get_server_names(self) -> Set[str]:
     logical_servers = {
@@ -738,12 +1658,50 @@ class McpClientManager:
     }
     return physical_servers | logical_servers
 
+  def get_exported_server_tool_names(self) -> Dict[str, Set[str]]:
+    """Return per-server ListTools exports before registration or catalog merge."""
+    exported: Dict[str, Set[str]] = {}
+    transport_only_servers = self._transport_only_server_names()
+    for server_name, state in self._servers.items():
+      if server_name in transport_only_servers:
+        continue
+      exported[server_name] = {
+        f"{state.tool_prefix}{tool_name}" if state.tool_prefix else tool_name
+        for tool_name in state.exported_tool_names or ()
+      }
+
+    for logical_server, physical_server in self._logical_server_routes.items():
+      state = self._servers.get(physical_server)
+      if state is None:
+        continue
+      original_names = set(state.exported_tool_names or ())
+      aliases = self._logical_tool_aliases.get(logical_server, {})
+      if physical_server in transport_only_servers:
+        aliases_by_original = {
+          original_name: alias_name
+          for alias_name, original_name in aliases.items()
+        }
+        logical_names = {
+          aliases_by_original.get(original_name, original_name)
+          for original_name in original_names
+        }
+      elif aliases:
+        logical_names = {
+          alias_name
+          for alias_name, original_name in aliases.items()
+          if original_name in original_names
+        }
+      else:
+        continue
+      exported[logical_server] = logical_names
+    return exported
+
   def get_server_catalog(self) -> Dict[str, Dict[str, Any]]:
     catalog: Dict[str, Dict[str, Any]] = {}
     for server_name, state in self._servers.items():
       if self._is_transport_only_server(server_name):
         continue
-      tool_names = sorted(tool["name"] for tool in state.tool_definitions if isinstance(tool.get("name"), str))
+      tool_names = sorted(tool["name"] for tool in state.published_tool_definitions if isinstance(tool.get("name"), str))
       catalog[server_name] = {
         "tool_count": len(tool_names),
         "tools": tool_names,
@@ -766,10 +1724,40 @@ class McpClientManager:
     return copy.deepcopy(self._startup_diagnostics)
 
   def is_mcp_tool(self, name: str) -> bool:
+    if self._tool_registration_catalog is not None:
+      return name in self._registered_mcp_descriptors_by_exposed_name
     return name in self._mcp_tool_names
 
+  def uses_registered_tool_catalog(self) -> bool:
+    """Return whether live MCP routes require exact registered semantics."""
+
+    return self._tool_registration_catalog is not None
+
   def get_server_for_tool(self, name: str) -> str | None:
+    if self._tool_registration_catalog is not None:
+      descriptor = self._registered_mcp_descriptors_by_exposed_name.get(name)
+      return (
+        descriptor.live_binding.logical_server_id
+        if descriptor is not None
+        else None
+      )
     return self._tool_to_server.get(name)
+
+  def get_policy_tool_name(self, name: str) -> str | None:
+    """Return the exact logical policy name attested by the live route binding."""
+
+    server_name = self._tool_to_server.get(name)
+    if server_name is None:
+      return None
+    try:
+      matches = tuple(
+        binding.logical_name
+        for binding in self.get_server_tool_route_bindings({server_name})
+        if binding.exposed_name == name
+      )
+    except (TypeError, ValueError):
+      return None
+    return matches[0] if len(matches) == 1 else None
 
   def get_provider_id_for_tool(self, name: str) -> str | None:
     """Return the trusted provider selected by this tool's transport route."""
@@ -1049,9 +2037,10 @@ class McpClientManager:
         )
         binding_fingerprint = projected_env[1] if projected_env is not None else None
         current = self._per_user_servers.get(key)
-        alive = current is not None and not current.draining and bool(current.server.exit_contexts)
         if (
-          alive
+          current is not None
+          and not current.draining
+          and bool(current.server.exit_contexts)
           and not force
           and current.expires_at - now > PER_USER_EXPIRY_MARGIN_SECONDS
           and current.binding_fingerprint == binding_fingerprint
@@ -1109,8 +2098,6 @@ class McpClientManager:
         self._per_user_spawn_reservations[server_name] = (
           self._per_user_spawn_reservations.get(server_name, 0) + 1
         )
-        replacement = None
-        spawned = False
         try:
           spawn_kwargs: Dict[str, Any] = {"broker_session": broker_session}
           if projected_env is not None:
@@ -1120,16 +2107,8 @@ class McpClientManager:
             subject,
             **spawn_kwargs,
           )
-          spawned = True
-        finally:
-          remaining = self._per_user_spawn_reservations.get(server_name, 0) - 1
-          if remaining > 0:
-            self._per_user_spawn_reservations[server_name] = remaining
-          else:
-            self._per_user_spawn_reservations.pop(server_name, None)
-          if spawned:
-            self._per_user_servers[key] = replacement
-          elif (
+        except BaseException:
+          if (
             not discard_current_on_failure
             and old_state is not None
             and not old_state.draining
@@ -1138,6 +2117,15 @@ class McpClientManager:
             self._per_user_servers[key] = old_state
           elif old_state is not None:
             self._schedule_drain(old_state)
+          raise
+        else:
+          self._per_user_servers[key] = replacement
+        finally:
+          remaining = self._per_user_spawn_reservations.get(server_name, 0) - 1
+          if remaining > 0:
+            self._per_user_spawn_reservations[server_name] = remaining
+          else:
+            self._per_user_spawn_reservations.pop(server_name, None)
         self._ensure_per_user_reaper()
         if old_state is not None and old_state is not replacement:
           self._schedule_drain(old_state)
@@ -1167,11 +2155,15 @@ class McpClientManager:
 
   def _translate_provider_symbol(
     self,
+    logical_server_id: str,
     tool_name: str,
     tool_input: Dict[str, Any],
   ) -> Dict[str, Any]:
     try:
-      if tool_name not in _PROVIDER_SYMBOL_TOOL_NAMES:
+      route = self._input_preparation_routes.get(
+        (logical_server_id, tool_name)
+      )
+      if route is None:
         return tool_input
 
       from research.source_html import sec_native_symbol_cached_only
@@ -1179,27 +2171,29 @@ class McpClientManager:
       def translate(value: Any) -> Any:
         return sec_native_symbol_cached_only(value) or value
 
-      if tool_name == "fetch_company_profile":
+      if route.mode == "consistent-present-keys":
         translated = dict(tool_input)
-        present_keys = [key for key in ("symbol", "ticker") if key in translated]
+        present_keys = [key for key in route.keys if key in translated]
         translated_values = {key: translate(translated[key]) for key in present_keys}
-        if len(present_keys) == 2 and translated_values["symbol"] != translated_values["ticker"]:
+        if (
+          len(present_keys) == len(route.keys)
+          and translated_values[route.keys[0]] != translated_values[route.keys[1]]
+        ):
           return translated
         for key, value in translated_values.items():
           translated[key] = value
         return translated
 
-      scalar_keys = _PROVIDER_SYMBOL_SCALAR_KEYS.get(tool_name)
-      if scalar_keys is not None:
+      if route.mode == "scalar":
         translated = dict(tool_input)
-        for key in scalar_keys:
+        for key in route.keys:
           if key in translated:
             translated[key] = translate(translated[key])
         return translated
 
-      comma_key = _PROVIDER_SYMBOL_COMMA_KEYS.get(tool_name)
-      if comma_key is not None:
+      if route.mode == "comma-separated" and len(route.keys) == 1:
         translated = dict(tool_input)
+        comma_key = route.keys[0]
         value = translated.get(comma_key)
         if isinstance(value, str):
           translated[comma_key] = ",".join(str(translate(token)) for token in value.split(","))
@@ -1235,19 +2229,85 @@ class McpClientManager:
   async def call_tool(
     self,
     name: str,
-    tool_input: Dict[str, Any],
+    tool_input: Dict[str, Any] | PreparedToolCall,
     meta: Dict[str, Any] | None = None,
     abort_event: asyncio.Event | None = None,
     gateway_session: Any | None = None,
+    allow_uncertain_replay: bool = True,
+    trusted_dispatch_scope: Mapping[str, object] | None = None,
   ) -> Tuple[Any | None, Dict[str, Any] | None]:
+    if type(allow_uncertain_replay) is not bool:
+      raise TypeError("allow_uncertain_replay must be an exact bool")
+    registered_descriptor = (
+      self._registered_mcp_descriptors_by_exposed_name.get(name)
+      if self._tool_registration_catalog is not None
+      else None
+    )
+    effective_allow_uncertain_replay = (
+      allow_uncertain_replay
+      and (
+        registered_descriptor is None
+        or (
+          registered_descriptor.declaration.semantics.idempotent
+          and registered_descriptor.declaration.semantics.effect
+          in _AUTOMATIC_REPLAY_EFFECTS
+        )
+      )
+    )
     server_name = self._tool_to_server.get(name)
     if not server_name:
       return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
 
+    if _is_exact_prepared_tool_call(tool_input):
+      if registered_descriptor is None:
+        return None, {
+          "code": "tool_input_preparation_failed",
+          "message": "Prepared MCP input requires an exact registered route.",
+        }
+      effective_input = tool_input.materialize_input()
+    elif registered_descriptor is not None:
+      try:
+        effective_input = self.prepare_registered_tool_input(
+          name,
+          tool_input,
+          trusted_dispatch_scope,
+        ).materialize_input()
+      except Exception as exc:
+        log.error(
+          "Registered MCP input preparation failed for %s | exception_type=%s",
+          name,
+          type(exc).__name__,
+        )
+        return None, {
+          "code": "tool_input_preparation_failed",
+          "message": f"Tool '{name}' input could not be prepared for dispatch.",
+        }
+    else:
+      try:
+        policy_name = self.get_policy_tool_name(name)
+      except Exception:
+        policy_name = None
+      effective_input = self._translate_provider_symbol(
+        server_name,
+        policy_name or "",
+        tool_input,
+      )
+
     original_name = self.get_original_tool_name(name)
     is_sheets = server_name == _GSHEETS_SERVER_NAME
-    policy_class = self._policy_tool_class(server_name, original_name) if is_sheets else None
-    sheets_is_read_only = policy_class in _READ_ONLY_POLICY_CLASSES
+    policy_class = (
+      registered_descriptor.declaration.semantics.effect
+      if is_sheets and registered_descriptor is not None
+      else self._policy_tool_class(server_name, original_name)
+      if is_sheets
+      else None
+    )
+    sheets_is_read_only = (
+      registered_descriptor.declaration.semantics.effect
+      in _AUTOMATIC_REPLAY_EFFECTS
+      if registered_descriptor is not None
+      else policy_class in _READ_ONLY_POLICY_CLASSES
+    )
     sheets_is_mutation = is_sheets and not sheets_is_read_only
 
     transport_server_name = self._transport_server_name(server_name)
@@ -1266,7 +2326,10 @@ class McpClientManager:
           retry_action="retry",
         )
         return None, _sheets_gateway_error(payload)
-      return None, {"code": "mcp_tool_error", "message": f"MCP server unavailable: {server_name}"}
+      return None, {
+        "code": "mcp_tool_error",
+        "message": f"MCP server unavailable: {server_name}",
+      }
     per_user_state: _PerUserServerState | None = None
     per_user_subject: _PerUserGatewaySubject | None = None
     if self.is_per_user_server(transport_server_name):
@@ -1339,9 +2402,6 @@ class McpClientManager:
         return None, _sheets_gateway_error(payload)
       server = per_user_state.server
     timeout_seconds = self._timeout_for_tool(transport_server_name, name, original_name)
-    translation_name = name if name in _PROVIDER_SYMBOL_TOOL_NAMES else original_name
-    effective_input = self._translate_provider_symbol(translation_name, tool_input)
-
     try:
       if per_user_state is not None:
         per_user_state.active_calls += 1
@@ -1435,6 +2495,19 @@ class McpClientManager:
           ),
         )
         return None, _sheets_gateway_error(payload)
+      if not effective_allow_uncertain_replay:
+        await self._reconnect_stdio_server_for_future(
+          server_name=transport_server_name,
+          server=server,
+          original_name=original_name,
+          cause=exc,
+        )
+        msg = str(exc)
+        return None, {
+          "code": "tool_error",
+          "sub_code": _classify_exception(exc, msg),
+          "message": msg,
+        }
       try:
         retry_result = await self._retry_stdio_tool_call_after_reconnect(
           server_name=transport_server_name,
@@ -1493,7 +2566,7 @@ class McpClientManager:
       except Exception:
         return None, _sheets_gateway_error(sheets_error)
 
-      if replay_safe:
+      if replay_safe and effective_allow_uncertain_replay:
         replacement.active_calls += 1
         try:
           result = await self._call_tool_once(
@@ -1609,21 +2682,22 @@ class McpClientManager:
   async def _call_tool_once(
     self,
     *,
-    server: _ServerState,
+    server: _connection_helpers._McpCallableServerState,
     original_name: str,
     tool_input: Dict[str, Any],
     meta: Dict[str, Any] | None,
     abort_event: asyncio.Event | None,
-    timeout_seconds: int,
-  ) -> Any:
+    timeout_seconds: float,
+  ) -> _connection_helpers.McpToolCallResult:
     if abort_event is not None and abort_event.is_set():
       raise asyncio.CancelledError()
-    call_kwargs = {
+    session = server.session
+    call_kwargs: _McpCallKwargs = {
       "read_timeout_seconds": timedelta(seconds=timeout_seconds),
     }
     if meta is not None:
       call_kwargs["meta"] = meta
-    call_task = asyncio.create_task(server.session.call_tool(
+    call_task = asyncio.create_task(session.call_tool(
       original_name,
       tool_input,
       **call_kwargs,
@@ -1696,9 +2770,9 @@ class McpClientManager:
     tool_input: Dict[str, Any],
     meta: Dict[str, Any] | None,
     abort_event: asyncio.Event | None,
-    timeout_seconds: int,
+    timeout_seconds: float,
     cause: Exception,
-  ) -> Any | None:
+  ) -> _connection_helpers.McpToolCallResult | None:
     config = server.config
     if not config:
       return None
@@ -1714,8 +2788,19 @@ class McpClientManager:
       message,
     )
     try:
-      await self._close_contexts(server.exit_contexts)
-      replacement = await self._connect_stdio_with_retries(server_name, config)
+      async with self._lock:
+        retry_server = self._servers.get(server_name)
+        if retry_server is server:
+          await self._close_contexts(server.exit_contexts)
+      if retry_server is server:
+        replacement = await self._connect_stdio_with_retries(server_name, config)
+        try:
+          async with self._lock:
+            await self._publish_server_states([replacement], replacing=server)
+            retry_server = self._servers.get(server_name)
+        except BaseException:
+          await self._close_contexts(replacement.exit_contexts)
+          raise
     except Exception as reconnect_exc:
       reconnect_message = str(reconnect_exc).strip() or type(reconnect_exc).__name__
       log.warning(
@@ -1723,13 +2808,14 @@ class McpClientManager:
         server_name,
         reconnect_message,
       )
-      return None
+      async with self._lock:
+        current = self._servers.get(server_name)
+        retry_server = current if current is not server else None
 
-    server.session = replacement.session
-    server.exit_contexts = replacement.exit_contexts
-    server.config = replacement.config
+    if retry_server is None:
+      return None
     return await self._call_tool_once(
-      server=server,
+      server=retry_server,
       original_name=original_name,
       tool_input=tool_input,
       meta=meta,
@@ -1758,8 +2844,16 @@ class McpClientManager:
       type(cause).__name__,
     )
     try:
-      await self._close_contexts(server.exit_contexts)
+      async with self._lock:
+        await self._close_contexts(server.exit_contexts)
       replacement = await self._connect_stdio_with_retries(server_name, config)
+      try:
+        async with self._lock:
+          if not await self._publish_server_states([replacement], replacing=server):
+            return False
+      except BaseException:
+        await self._close_contexts(replacement.exit_contexts)
+        raise
     except Exception as reconnect_exc:
       log.warning(
         "MCP stdio server %s could not reconnect for future calls (%s)",
@@ -1768,13 +2862,11 @@ class McpClientManager:
       )
       return False
 
-    server.session = replacement.session
-    server.exit_contexts = replacement.exit_contexts
-    server.config = replacement.config
     return True
 
   async def shutdown(self) -> None:
     async with self._lock:
+      self._registered_mcp_descriptors_by_exposed_name = MappingProxyType({})
       if not self._started and not self._servers:
         return
 
@@ -1802,49 +2894,32 @@ class McpClientManager:
       self._dispatch_to_original = {}
       self._mcp_tool_names = set()
       self._logical_tool_definitions = {}
+      self._logical_alias_generation = ()
       self._startup_diagnostics = {}
+      self._configured_transport_server_names = None
       self._started = False
 
   def _apply_collision_filtering(
     self,
     *,
     policy_server_for_tool: Callable[[str], str | None] | None = None,
-    policy_tool_class: Callable[[str, str], str | None] | None = None,
-    strict_runtime_tool_set_for_server: Callable[[str], bool] | None = None,
   ) -> None:
-    if (
-      policy_server_for_tool is None
-      or policy_tool_class is None
-      or strict_runtime_tool_set_for_server is None
-    ):
-      _get_forbidden_tools_for_session, get_server_for_policy_tool, get_tool_class = load_server_policy_helpers()
+    for state in self._servers.values():
+      state.published_tool_definitions = state.tool_definitions
+    self._registered_mcp_descriptors_by_exposed_name = MappingProxyType({})
+    self._logical_alias_generation = ()
+    if policy_server_for_tool is None:
+      _get_forbidden_tools_for_session, get_server_for_policy_tool, _get_tool_class = load_server_policy_helpers()
       if get_server_for_policy_tool is None:
         log.warning(
-          "Shared MCP policy module unavailable; enforcing the built-in Google Sheets cutover policy only"
+          "Shared MCP policy module unavailable; enforcing the built-in Google Sheets broker surface and owner mapping"
         )
-      elif policy_server_for_tool is None:
+        self._prefilter_gsheets_without_shared_policy()
+      else:
         policy_server_for_tool = get_server_for_policy_tool
-      if policy_tool_class is None:
-        policy_tool_class = get_tool_class
-      policy_module = load_server_policy_module()
-      policies = getattr(policy_module, "MCP_SERVER_POLICIES", {}) if policy_module is not None else {}
-      if (
-        strict_runtime_tool_set_for_server is None
-        and policy_module is not None
-        and isinstance(policies, dict)
-      ):
-        def policy_uses_strict_runtime_tool_set(server_name: str) -> bool:
-          return (
-            server_name == _GSHEETS_SERVER_NAME
-            or bool(getattr(policies.get(server_name), "strict_runtime_tool_set", False))
-          )
 
-        strict_runtime_tool_set_for_server = policy_uses_strict_runtime_tool_set
-
-    # Google Sheets is a security-sensitive full cutover. Keep its broker
-    # surface closed-world even if the optional shared policy module cannot be
-    # imported during gateway startup. Other MCP servers retain the existing
-    # best-effort policy-import behavior.
+    # Preserve the Google Sheets broker's built-in owner mapping when the
+    # optional shared policy module cannot be imported during gateway startup.
     if policy_server_for_tool is None:
       def sheets_fallback_policy_server(tool_name: str) -> str | None:
         if tool_name in _GSHEETS_BROKER_TOOLS:
@@ -1855,28 +2930,10 @@ class McpClientManager:
         return None
 
       policy_server_for_tool = sheets_fallback_policy_server
-    if policy_tool_class is None:
-      def sheets_fallback_tool_class(server_name: str, tool_name: str) -> str | None:
-        if server_name != _GSHEETS_SERVER_NAME:
-          return None
-        if tool_name in _GSHEETS_BROKER_READ_TOOLS:
-          return "read"
-        if tool_name in _GSHEETS_BROKER_WRITE_TOOLS:
-          return "external_write"
-        return None
-
-      policy_tool_class = sheets_fallback_tool_class
-    if strict_runtime_tool_set_for_server is None:
-      def sheets_fallback_strict_runtime_tool_set(server_name: str) -> bool:
-        return server_name == _GSHEETS_SERVER_NAME
-
-      strict_runtime_tool_set_for_server = sheets_fallback_strict_runtime_tool_set
 
     if policy_server_for_tool is not None:
       self._prefilter_policy_owner_mismatches(
         policy_server_for_tool=policy_server_for_tool,
-        policy_tool_class=policy_tool_class,
-        strict_runtime_tool_set_for_server=strict_runtime_tool_set_for_server,
       )
 
     result = _catalog_helpers.apply_collision_filtering(
@@ -1892,8 +2949,6 @@ class McpClientManager:
     if policy_server_for_tool is not None:
       self._apply_policy_owner_invariant(
         policy_server_for_tool=policy_server_for_tool,
-        policy_tool_class=policy_tool_class,
-        strict_runtime_tool_set_for_server=strict_runtime_tool_set_for_server,
       )
     alias_result = _catalog_helpers.add_logical_tool_aliases(
       tool_definitions=self._tool_definitions,
@@ -1910,18 +2965,40 @@ class McpClientManager:
     self._dispatch_to_original = alias_result.dispatch_to_original
     self._mcp_tool_names = alias_result.mcp_tool_names
     self._logical_tool_definitions = alias_result.logical_tool_definitions
+    self._logical_alias_generation = alias_result.alias_generation
+    self._refresh_registered_mcp_tool_descriptors()
+
+  def _prefilter_gsheets_without_shared_policy(self) -> None:
+    state = self._servers.get(_GSHEETS_SERVER_NAME)
+    if state is None:
+      return
+
+    kept_tool_definitions = [
+      tool_def
+      for tool_def in state.published_tool_definitions
+      if not str(tool_def.get("name") or "").strip()
+      or str(tool_def.get("name") or "").strip() in _GSHEETS_BROKER_TOOLS
+    ]
+    if len(kept_tool_definitions) == len(state.published_tool_definitions):
+      return
+
+    state.published_tool_definitions = kept_tool_definitions
+    state.tool_names = {
+      f"{state.tool_prefix}{tool_def['name']}" if state.tool_prefix else tool_def["name"]
+      for tool_def in kept_tool_definitions
+      if isinstance(tool_def.get("name"), str)
+    }
+
 
   def _prefilter_policy_owner_mismatches(
     self,
     *,
     policy_server_for_tool: Callable[[str], str | None],
-    policy_tool_class: Callable[[str, str], str | None] | None = None,
-    strict_runtime_tool_set_for_server: Callable[[str], bool] | None = None,
   ) -> None:
     for server_name, state in self._servers.items():
       kept_tool_definitions: list[dict[str, Any]] = []
-      mismatches: list[tuple[str, str, str]] = []
-      for tool_def in state.tool_definitions:
+      mismatches: list[tuple[str, str]] = []
+      for tool_def in state.published_tool_definitions:
         original_name = str(tool_def.get("name") or "").strip()
         if not original_name:
           kept_tool_definitions.append(tool_def)
@@ -1929,25 +3006,14 @@ class McpClientManager:
         policy_server = policy_server_for_tool(original_name)
         policy_runtime_server = self._transport_server_name(policy_server) if policy_server else None
         if policy_server and policy_runtime_server != server_name:
-          mismatches.append((original_name, policy_server, "owner_mismatch"))
-          continue
-        policy_context_server = policy_server or server_name
-        strict_runtime = bool(
-          strict_runtime_tool_set_for_server is not None
-          and strict_runtime_tool_set_for_server(policy_context_server)
-        )
-        if strict_runtime and (
-          policy_tool_class is None
-          or policy_tool_class(policy_context_server, original_name) is None
-        ):
-          mismatches.append((original_name, "unclassified", "unclassified"))
+          mismatches.append((original_name, policy_server))
           continue
         kept_tool_definitions.append(tool_def)
 
       if not mismatches:
         continue
 
-      state.tool_definitions = kept_tool_definitions
+      state.published_tool_definitions = kept_tool_definitions
       state.tool_names = {
         f"{state.tool_prefix}{tool_def['name']}" if state.tool_prefix else tool_def["name"]
         for tool_def in kept_tool_definitions
@@ -1955,23 +3021,14 @@ class McpClientManager:
       }
       mismatch_summary = ", ".join(
         f"{original_name}->{policy_server}"
-        for original_name, policy_server, _reason in mismatches
+        for original_name, policy_server in mismatches
       )
-      has_unclassified = any(reason == "unclassified" for _name, _server, reason in mismatches)
-      if has_unclassified:
-        message = (
-          "MCP runtime exposed tools outside its strict gateway policy set; "
-          f"pre-filtering tools before catalog merge: {mismatch_summary}"
-        )
-        category = "strict_runtime_tool_set_mismatch"
-        error_type = "StrictRuntimeToolSetMismatch"
-      else:
-        message = (
-          "MCP runtime owner does not match gateway policy owner; "
-          f"pre-filtering tools before catalog merge: {mismatch_summary}"
-        )
-        category = "policy_owner_mismatch"
-        error_type = "PolicyOwnerMismatch"
+      message = (
+        "MCP runtime owner does not match gateway policy owner; "
+        f"pre-filtering tools before catalog merge: {mismatch_summary}"
+      )
+      category = "policy_owner_mismatch"
+      error_type = "PolicyOwnerMismatch"
       self._set_startup_diagnostic(
         server_name,
         category=category,
@@ -1985,17 +3042,14 @@ class McpClientManager:
     self,
     *,
     policy_server_for_tool: Callable[[str], str | None] | None = None,
-    policy_tool_class: Callable[[str, str], str | None] | None = None,
-    strict_runtime_tool_set_for_server: Callable[[str], bool] | None = None,
   ) -> None:
-    if policy_server_for_tool is None:
-      _get_forbidden_tools_for_session, get_server_for_policy_tool, get_tool_class = load_server_policy_helpers()
+    resolved_policy_server_for_tool = policy_server_for_tool
+    if resolved_policy_server_for_tool is None:
+      _get_forbidden_tools_for_session, get_server_for_policy_tool, _get_tool_class = load_server_policy_helpers()
       if get_server_for_policy_tool is None:
         log.warning("Skipping MCP policy-owner invariant: server policy module unavailable")
         return
-      policy_server_for_tool = get_server_for_policy_tool
-      if policy_tool_class is None:
-        policy_tool_class = get_tool_class
+      resolved_policy_server_for_tool = get_server_for_policy_tool
 
     result = _policy_owner_helpers.apply_policy_owner_invariant(
       servers=self._servers,
@@ -2003,9 +3057,7 @@ class McpClientManager:
       tool_to_server=self._tool_to_server,
       prefixed_to_original=self._prefixed_to_original,
       mcp_tool_names=self._mcp_tool_names,
-      policy_server_for_tool=policy_server_for_tool,
-      policy_tool_class=policy_tool_class,
-      strict_runtime_tool_set_for_server=strict_runtime_tool_set_for_server,
+      policy_server_for_tool=resolved_policy_server_for_tool,
       transport_server_for_policy_server=self._transport_server_name,
       set_startup_diagnostic=self._set_startup_diagnostic,
       logger=log,

@@ -58,8 +58,8 @@ class PreparedBusinessModelChange:
   prepared_payload_digest: str
   lifecycle: PreparedBusinessModelLifecycle
   created_at: str
+  approval_id: str
   expires_at: str | None = None
-  approval_id: str | None = None
   approval_chain_id: str | None = None
   execution_receipt: bytes | None = None
   execution_receipt_digest: str | None = None

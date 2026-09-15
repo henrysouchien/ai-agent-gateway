@@ -4,7 +4,6 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -17,6 +16,13 @@ if str(PKG_DIR) not in sys.path:
 if str(API_DIR) not in sys.path:
   sys.path.insert(0, str(API_DIR))
 
+from agent_gateway.approval_route import (
+  DurableLocalApprovalRoute,
+  bind_session_approval_route,
+)
+from agent_gateway.session import SessionStore
+from agent_gateway.mcp_client import McpClientManager
+from agent_gateway.providers import StreamEvent
 from agent_gateway import AgentRunner, EventLog, ParentMessage, ToolDispatcher
 from agent_gateway.approval_policy import RunContext
 from agent_gateway.approval_resolver import resolve_policy
@@ -37,22 +43,21 @@ from tests.capability_execution_test_support import (
 )
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
-    return False
-
-  def get_server_for_tool(self, _name: str) -> str | None:
-    return None
-
-  async def call_tool(self, name: str, _tool_input: dict[str, Any], **_kwargs: Any):
-    return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
 
 
-async def _collect(provider: FixtureProvider, client: FixtureClient, params: dict[str, Any]):
+async def _collect(
+  provider: FixtureProvider,
+  client: FixtureClient,
+  params: dict[str, Any],
+) -> list[StreamEvent]:
   return [event async for event in provider.stream(client, params)]
 
 
-async def _collect_terminal_failure_prefix(provider: FixtureProvider, client: FixtureClient, params: dict[str, Any]):
+async def _collect_terminal_failure_prefix(
+  provider: FixtureProvider,
+  client: FixtureClient,
+  params: dict[str, Any],
+) -> list[StreamEvent]:
   stream = provider.stream(client, params)
   events = [await anext(stream), await anext(stream)]
   with pytest.raises(RuntimeError, match="fixture_terminal_failure"):
@@ -146,6 +151,7 @@ def test_fixture_canvas_artifact_stream_emits_complete_canvas_tool_call(monkeypa
   ]
   assert events[2].tool_name == "emit_canvas_artifact"
   assert events[4].tool_name == "emit_canvas_artifact"
+  assert events[4].tool_input is not None
   assert events[4].tool_input["title"] == "Fixture Canvas Artifact"
   assert events[4].tool_input["purpose"] == "exploration"
   assert "@hank/canvas-kit" in events[4].tool_input["tsx_source"]
@@ -283,6 +289,7 @@ def test_fixture_approval_canvas_artifact_stream_requests_approval_with_evidence
   ]
   assert second_turn[2].tool_name == FIXTURE_APPROVAL_TOOL_NAME
   assert second_turn[4].tool_name == FIXTURE_APPROVAL_TOOL_NAME
+  assert second_turn[4].tool_input is not None
   assert second_turn[4].tool_input["evidence_artifact"] == {
     "artifact_id": "artifact-canvas-evidence-1",
     "title": "Fixture Canvas Approval Evidence",
@@ -353,41 +360,35 @@ def test_fixture_runner_reaches_approval_pending_then_completes(monkeypatch, tmp
     event_log = EventLog()
     store = SQLiteApprovalStore(tmp_path / "approvals.sqlite")
     policy = resolve_policy(store=store)
-    session = SimpleNamespace(
+    session = SessionStore(ttl=3600).create_session(
+      api_key_hash="hash",
       user_id="alice",
       user_email="alice@example.com",
-      session_id="fixture-session",
-      request_id="fixture-run",
-      channel="cli",
       role="owner",
-      pending_tools={},
-      approval_queues={},
-      approval_store=store,
-      approval_policy=policy,
-      agent_session_log=None,
-      run_context=RunContext(
-        user_id="alice",
-        request_id="fixture-run",
-        session_id="fixture-session",
-        run_id="fixture-run",
-        profile="_fixture",
-        channel="cli",
-        decider_role="owner",
-        policy_bundle_hash=str(getattr(policy, "policy_bundle_hash", "unknown")),
-      ),
+    )
+    session.channel = "cli"
+    session.session_id = "fixture-session"
+    bind_session_approval_route(session, store, policy)
+    run_context = RunContext(
+      user_id="alice",
+      request_id="fixture-run",
+      session_id="fixture-session",
+      run_id="fixture-run",
+      profile="_fixture",
+      channel="cli",
+      decider_role="owner",
+      policy_bundle_hash=str(getattr(policy, "policy_bundle_hash", "unknown")),
     )
 
     dispatcher = ToolDispatcher(
-      mcp_client=_NullMcpClient(),
+      mcp_client=McpClientManager(config_path=None),
       local_tool_handlers={FIXTURE_APPROVAL_TOOL_NAME: fixture_approval_handler},
       needs_approval=lambda name, _tool_input=None, _qualifier="": name == FIXTURE_APPROVAL_TOOL_NAME,
       event_log=event_log,
       session_id="fixture-session",
-      session=session,
       role=session.role,
-      store=store,
-      policy=policy,
-      run_context=session.run_context,
+      approval_route=DurableLocalApprovalRoute(store, policy, session),
+      run_context=run_context,
     )
     message_inbox: asyncio.Queue[ParentMessage] = asyncio.Queue()
     runner = AgentRunner(

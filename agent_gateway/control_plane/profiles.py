@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import importlib
-import pkgutil
-import sys
-from pathlib import Path
+from collections.abc import Callable, Iterable
+import logging
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -12,7 +10,7 @@ from pydantic import BaseModel
 from agent_gateway.session import AuthManager
 
 
-_AGENT_PROFILES_MODULE_NAMES = frozenset({"agent", "agent.profiles"})
+log = logging.getLogger("agent_gateway.control_plane.profiles")
 
 
 class ProfileMetadataResponse(BaseModel):
@@ -25,57 +23,36 @@ class ProfilesListResponse(BaseModel):
   profiles: list[ProfileMetadataResponse]
 
 
-def _profiles_api() -> Any:
-  api_dir = Path(__file__).resolve().parents[4] / "api"
-  if api_dir.exists() and str(api_dir) not in sys.path:
-    sys.path.insert(0, str(api_dir))
+def _profile_response_from_loader(
+  profile_loader: Callable[[str], Any],
+  name: str,
+) -> ProfileMetadataResponse | None:
   try:
-    return importlib.import_module("agent.profiles")
-  except ModuleNotFoundError as exc:
-    if exc.name not in _AGENT_PROFILES_MODULE_NAMES:
-      raise
-    return importlib.import_module("api.agent.profiles")
-
-
-def _profile_response_from_module(package_name: str, name: str) -> ProfileMetadataResponse | None:
-  try:
-    module = importlib.import_module(f"{package_name}.{name}")
+    profile = profile_loader(name)
   except Exception:
+    log.warning("profile %s failed to load; omitting from listing", name, exc_info=True)
     return None
-
-  get_profile = getattr(module, "get_profile", None)
-  if not callable(get_profile):
-    return None
-
-  try:
-    profile = get_profile()
-  except Exception:
-    return None
-
-  profile_name = getattr(profile, "name", None)
-  if not isinstance(profile_name, str) or not profile_name.strip():
+  if not profile.supports_autonomous_execution:
     return None
 
   return ProfileMetadataResponse(
-    name=profile_name.strip(),
+    name=profile.name,
     model=getattr(profile, "model", None) if isinstance(getattr(profile, "model", None), str) else None,
-    channel_context=getattr(profile, "channel_context", None)
-    if isinstance(getattr(profile, "channel_context", None), str)
-    else None,
+    channel_context=profile.channel_context,
   )
 
 
-def _list_profile_metadata() -> list[ProfileMetadataResponse]:
-  profiles_pkg = _profiles_api()
-  package_paths = getattr(profiles_pkg, "__path__", None)
-  if package_paths is None:
+def _list_profile_metadata(
+  *,
+  profile_names_provider: Callable[[], Iterable[str]] | None,
+  profile_loader: Callable[[str], Any] | None,
+) -> list[ProfileMetadataResponse]:
+  if profile_names_provider is None or profile_loader is None:
     return []
 
   entries: list[ProfileMetadataResponse] = []
-  for module_info in sorted(pkgutil.iter_modules(package_paths), key=lambda entry: entry.name):
-    if module_info.ispkg or module_info.name.startswith("_") or module_info.name == "prompt_loader":
-      continue
-    response = _profile_response_from_module(profiles_pkg.__name__, module_info.name)
+  for name in profile_names_provider():
+    response = _profile_response_from_loader(profile_loader, name)
     if response is not None:
       entries.append(response)
   return sorted(entries, key=lambda entry: entry.name)
@@ -86,13 +63,24 @@ def _require_bearer_session(request: Request, auth: AuthManager) -> None:
   auth.verify_token(token)
 
 
-def build_profiles_router(*, auth: AuthManager) -> APIRouter:
+def build_profiles_router(
+  *,
+  auth: AuthManager,
+  profile_names_provider: Callable[[], Iterable[str]] | None = None,
+  profile_loader: Callable[[str], Any] | None = None,
+) -> APIRouter:
+  if (profile_names_provider is None) != (profile_loader is None):
+    raise ValueError("control profile names provider and loader must be configured together")
+
   router = APIRouter(prefix="/profiles")
 
   @router.get("", response_model=ProfilesListResponse)
   async def list_profiles(request: Request) -> ProfilesListResponse:
     _require_bearer_session(request, auth)
-    return ProfilesListResponse(profiles=_list_profile_metadata())
+    return ProfilesListResponse(profiles=_list_profile_metadata(
+      profile_names_provider=profile_names_provider,
+      profile_loader=profile_loader,
+    ))
 
   return router
 

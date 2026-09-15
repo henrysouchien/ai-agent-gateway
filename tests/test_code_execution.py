@@ -11,19 +11,43 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import SessionStore, ToolDispatcher
 from agent_gateway.code_execution import CodeExecutionConfig, build_code_execution, cleanup_code_execution
+from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.event_log import EventLog
 from agent_gateway.runner import ToolResultContext
+from agent_gateway.tool_dispatcher_helpers import ToolResult
 
 
 def _run(coro):
   return asyncio.run(coro)
 
 
-class _FakeMcp:
-  def is_mcp_tool(self, _tool_name: str) -> bool:
+class _FakeMcp(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
+
+  def is_mcp_tool(self, name: str) -> bool:
+    _ = name
     return False
 
-  async def call_tool(self, _tool_name: str, _tool_input: Dict[str, Any]):
+  async def call_tool(
+    self,
+    name: str,
+    tool_input: object,
+    meta: object | None = None,
+    abort_event: asyncio.Event | None = None,
+    gateway_session: object | None = None,
+    allow_uncertain_replay: bool = True,
+    trusted_dispatch_scope: object | None = None,
+  ) -> ToolResult:
+    _ = (
+      name,
+      tool_input,
+      meta,
+      abort_event,
+      gateway_session,
+      allow_uncertain_replay,
+      trusted_dispatch_scope,
+    )
     raise AssertionError("MCP should not execute in code_execution tests")
 
 
@@ -666,6 +690,7 @@ def test_strip_code_execute_base64_hook_rewrites_model_history() -> None:
   ctx = ToolResultContext(
     tool_name="code_execute",
     tool_input={"code": "print(1)"},
+    redacted_tool_input={"code": "print(1)"},
     result=None,
     error=None,
     duration_ms=1,

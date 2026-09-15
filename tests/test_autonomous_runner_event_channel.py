@@ -135,7 +135,7 @@ def _registry(
     autonomous_capability_binding_resolver=_binding,
     claim_signing_authority=GatewayClaimSigningAuthority(_HMAC_KEY),
   )
-  registry._build_cmd = lambda **_kwargs: [  # type: ignore[method-assign]
+  registry._build_cmd = lambda **_kwargs: [
     sys.executable,
     "-c",
     _CHILD_IMPORT_PREFIX + child_source,
@@ -290,6 +290,7 @@ def test_autonomous_start_uses_private_event_lifeline_and_lease_fds(
     payload = await _start(registry)
     status = await registry.wait(payload["task_id"], timeout_sec=20)
     record = registry._tasks[payload["task_id"]]
+    assert record.proc is not None
 
     assert status["state"] == "completed"
     assert captured["start_new_session"] is True
@@ -305,7 +306,7 @@ def test_autonomous_start_uses_private_event_lifeline_and_lease_fds(
       captured["env"]["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE"]
     )
     log_authority = envelope["workload"]["session_log_authority"]
-    assert envelope["version"] == 5
+    assert envelope["version"] == 6
     assert log_authority["layout"] == "v2"
     assert log_authority["base_path"] == captured["env"][
       "AGENT_SESSION_LOG_BASE_DIR"
@@ -510,23 +511,23 @@ grandchild = subprocess.Popen(
     ],
     close_fds=True,
 )
-report_path.write_text(
-    json.dumps({
-        "target_pid": os.getpid(),
-        "grandchild_pid": grandchild.pid,
-        "lifeline_inherited": inherited_exact_identity(
-            lifeline_fd,
-            lifeline_device,
-            lifeline_inode,
-        ),
-        "lease_inherited": inherited_exact_identity(
-            lease_fd,
-            lease_device,
-            lease_inode,
-        ),
-    }),
-    encoding="utf-8",
-)
+payload = json.dumps({
+    "target_pid": os.getpid(),
+    "grandchild_pid": grandchild.pid,
+    "lifeline_inherited": inherited_exact_identity(
+        lifeline_fd,
+        lifeline_device,
+        lifeline_inode,
+    ),
+    "lease_inherited": inherited_exact_identity(
+        lease_fd,
+        lease_device,
+        lease_inode,
+    ),
+})
+tmp = report_path.with_name(report_path.name + ".tmp")
+tmp.write_text(payload, encoding="utf-8")
+os.replace(tmp, report_path)
 time.sleep(60)
 """
   env = dict(os.environ)
@@ -586,10 +587,17 @@ time.sleep(60)
   owner_write_fd = -1
   try:
     deadline = time.monotonic() + 10
-    while not report_path.exists() and time.monotonic() < deadline:
+    report = None
+    while time.monotonic() < deadline:
+      try:
+        raw = report_path.read_text(encoding="utf-8")
+        if raw:
+          report = json.loads(raw)
+          break
+      except (FileNotFoundError, json.JSONDecodeError):
+        pass
       time.sleep(0.01)
-    assert report_path.exists()
-    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report is not None
     assert report["lifeline_inherited"] is False
     assert report["lease_inherited"] is False
     assert autonomous_owner_lease_is_released(
@@ -702,7 +710,10 @@ def test_terminal_is_delivered_before_ack(monkeypatch, tmp_path: Path) -> None:
 
     payload = await _start(registry)
     record = registry._tasks[payload["task_id"]]
-    await asyncio.wait_for(bus.terminal_started.wait(), timeout=10)
+    assert record.proc is not None
+    # Starting a real child interpreter can exceed short fixed windows on a
+    # CPU-saturated validation host; the event still makes this exit early.
+    await asyncio.wait_for(bus.terminal_started.wait(), timeout=60)
 
     assert record.event_channel_acknowledgement is None
     assert record.proc.returncode is None
@@ -868,11 +879,14 @@ signal.pause()
     )
 
     payload = await _start(registry)
-    await asyncio.wait_for(bus.ready.wait(), timeout=10)
+    # Starting a real child interpreter can exceed short fixed windows on a
+    # CPU-saturated validation host; the event still makes this exit early.
+    await asyncio.wait_for(bus.ready.wait(), timeout=60)
     grandchild_pid = int(pid_path.read_text(encoding="utf-8"))
 
     status = await registry.cancel(payload["task_id"])
     record = registry._tasks[payload["task_id"]]
+    assert record.proc is not None
 
     assert status["state"] == "killed"
     assert record.proc.returncode is not None
@@ -923,6 +937,7 @@ pathlib.Path({str(actual_exit_path)!r}).write_text("done",encoding="utf-8")
 
     def tracked_group_signal(process_group_id: int, signal_number: int) -> None:
       record = registry._tasks["bg_0"]
+      assert record.proc is not None
       signal_observations.append((signal_number, record.proc.returncode))
       assert record.proc.returncode is None
       if signal_number == signal.SIGKILL:
@@ -942,8 +957,11 @@ pathlib.Path({str(actual_exit_path)!r}).write_text("done",encoding="utf-8")
     )
 
     payload = await _start(registry)
-    status = await registry.wait(payload["task_id"], timeout_sec=20)
+    # This starts two real interpreters and must cover startup starvation as
+    # well as the event-channel handshake before inspecting process state.
+    status = await registry.wait(payload["task_id"], timeout_sec=60)
     record = registry._tasks[payload["task_id"]]
+    assert record.proc is not None
     grandchild_pid = int(pid_path.read_text(encoding="utf-8"))
 
     assert signal_observations == [(signal.SIGKILL, None)]
@@ -995,6 +1013,7 @@ time.sleep(1.5)
 
     payload = await _start(registry)
     record = registry._tasks[payload["task_id"]]
+    assert record.proc is not None
     # Generous bound: real child-interpreter startup under a CPU-saturated
     # shard can exceed 2s; the loop exits early on acknowledgement.
     for _ in range(6000):

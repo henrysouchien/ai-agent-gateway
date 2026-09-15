@@ -9,12 +9,11 @@ from __future__ import annotations
 
 import os
 import re
-from functools import lru_cache
+
 
 _PRODUCT_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
-@lru_cache(maxsize=1)
 def gateway_product_id() -> str | None:
   raw = os.environ.get("PRODUCT_ID", "").strip()
   if not raw or not _PRODUCT_ID_RE.match(raw):
@@ -34,5 +33,5 @@ def validate_product_id_or_raise() -> str:
     raise RuntimeError(
       f"PRODUCT_ID={raw!r} does not match ^[a-z][a-z0-9_-]{{0,31}}$"
     )
-  gateway_product_id.cache_clear()
+
   return raw

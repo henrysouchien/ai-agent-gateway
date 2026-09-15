@@ -29,13 +29,15 @@ def test_production_target_bounds_uvicorn_graceful_shutdown() -> None:
   assert _TARGET_ARGV[index + 1] == "30"
 
 
-def test_production_target_uses_deployed_skill_catalog() -> None:
-  assert _TARGET_ENV["AGENT_GATEWAY_SKILLS_DIR"] == (
-    "/var/www/agent_gateway/api/memory/workspace/notes/skills"
-  )
+def test_production_target_publishes_bound_gateway_endpoint() -> None:
+  assert _TARGET_ENV["GATEWAY_URL"] == "http://127.0.0.1:8001"
 
 
-def test_production_target_keeps_foundation_session_log_layout_v1() -> None:
+def test_production_target_does_not_expose_product_catalog_as_generic_directory() -> None:
+  assert "AGENT_GATEWAY_SKILLS_DIR" not in _TARGET_ENV
+
+
+def test_production_target_keeps_foundation_session_log_layout_v2() -> None:
   repo_root = Path(__file__).resolve().parents[3]
   assert "AGENT_SESSION_LOG_LAYOUT" not in _TARGET_ENV
   assert _SESSION_LOG_LAYOUT_PATH == Path(
@@ -43,7 +45,7 @@ def test_production_target_keeps_foundation_session_log_layout_v1() -> None:
   )
   assert (
     repo_root / "deploy" / "agent-session-log-layout.production"
-  ).read_bytes() == b"v1\n"
+  ).read_bytes() == b"v2\n"
   assert _TARGET_ENV["AGENT_SESSION_LOG_ARCHIVE_PRODUCT_IDS"] == "hank-dev"
 
 
@@ -133,7 +135,7 @@ def test_launcher_rejects_untrusted_session_log_layout_source(
     )
 
 
-def test_launcher_ignores_ambient_layout_and_injects_only_trusted_choice(
+def test_launcher_ignores_ambient_product_catalog_and_uses_trusted_layout(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   order: list[str] = []
@@ -157,6 +159,10 @@ def test_launcher_ignores_ambient_layout_and_injects_only_trusted_choice(
     raise RuntimeError("captured exec")
 
   monkeypatch.setenv("AGENT_SESSION_LOG_LAYOUT", "hostile-ambient")
+  monkeypatch.setenv(
+    "AGENT_GATEWAY_SKILLS_DIR",
+    "/var/www/agent_gateway/api/memory/workspace/notes/skills",
+  )
   monkeypatch.setattr(
     launcher_module,
     "_consume_session_log_layout",
@@ -179,6 +185,19 @@ def test_launcher_ignores_ambient_layout_and_injects_only_trusted_choice(
   assert captured["path"] == "/trusted/python"
   assert isinstance(captured["env"], dict)
   assert captured["env"]["AGENT_SESSION_LOG_LAYOUT"] == "v2"
+  assert "AGENT_GATEWAY_SKILLS_DIR" not in captured["env"]
+
+
+def test_anonymous_secret_fd_hands_the_child_one_inheritable_descriptor() -> None:
+  """Exercise the real pipe transfer; every other launcher test stubs it out."""
+
+  fd = launcher_module._anonymous_secret_fd(_SECRET)
+  try:
+    assert os.get_inheritable(fd), "the exec'd child must inherit this descriptor"
+    assert os.read(fd, len(_SECRET) * 2) == _SECRET
+    assert os.read(fd, 1) == b"", "the write end must already be closed"
+  finally:
+    os.close(fd)
 
 
 def _root_launcher_test_available() -> bool:

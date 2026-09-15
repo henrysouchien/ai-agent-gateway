@@ -1,21 +1,26 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import asyncio
+import copy
 import json
 import logging
 import time
+import types
 import uuid
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Awaitable, Callable, Iterable, Literal, Protocol, Sequence, TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 from agent_workflow_contracts import AgentCompletionEnvelope
 
-from .context_capture import build_context_manifest_event, canonical_manifest_digest
+from .context_capture import ContextCapture, build_context_manifest_event, canonical_manifest_digest
 from .fork_request_handoff import (
+  ForkRequestHandoff,
   build_mid_turn_handoff,
   build_post_turn_handoff,
   fork_credential_identity_available,
 )
 from .learning_fork_trigger import (
+  LearningReceiptDelivery,
   claim_learning_receipts,
   settle_learning_receipts,
   submit_learning_fork_after_turn,
@@ -29,6 +34,8 @@ from .runner_limits import (
   CONTEXT_PRESSURE_REMINDER_PCT,
   CONTEXT_PRESSURE_REMINDER_STEP_PCT,
   CONTEXT_WARNING_PCT,
+  ContextPressureReminderDecision,
+  TokenEstimateSnapshot,
   conservative_request_input_token_bound_for_request as _conservative_request_input_token_bound_for_request,
   context_pressure_reminder_decision as _context_pressure_reminder_decision,
   effective_compaction_trigger as _effective_compaction_trigger,
@@ -54,7 +61,10 @@ from .runner_run_loop_defaults import (
   MAX_TOKENS_NUDGE as _MAX_TOKENS_NUDGE,
 )
 from .runner_session_lifecycle import _runner_attr
-from .secret_boundary import sanitize_tool_event
+from .secret_boundary import (
+  sanitize_tool_event,
+  sanitization_failure_tool_input,
+)
 from .skill_completion_wal import TopLevelSkillCompletionEffectPlan
 from .runner_session_events import (
   build_budget_exceeded_event as _build_budget_exceeded_event,
@@ -69,11 +79,13 @@ from .runner_session_events import (
   build_token_estimate_log_data as _build_token_estimate_log_data,
   build_turn_complete_event as _build_turn_complete_event,
   build_turn_complete_log_data as _build_turn_complete_log_data,
-  run_detach_reason as _run_detach_reason,
-  run_interrupted_reason as _run_interrupted_reason,
 )
+from .runner_budget import BudgetExceededState, ProviderRequestBudgetAdmission
 from .runner_state import (
   ProviderRequestBudgetError,
+  NoToolUseTurnOutcome,
+  SessionDrainState,
+  TurnReminderState,
   admit_provider_request_budget as _admit_provider_request_budget,
   assistant_turn_message as _assistant_turn_message,
   background_tasks_completed_user_message as _background_tasks_completed_user_message,
@@ -90,6 +102,7 @@ from .runner_state import (
   turn_reminder_state as _turn_reminder_state,
   usage_cache_status as _usage_cache_status,
   user_turn_message as _user_turn_message,
+  StreamTurnResult,
   StreamTurnFailure,
 )
 from .runner_usage import (
@@ -100,21 +113,204 @@ from .runner_usage import (
 )
 from .task_registry import (
   COORDINATOR_DEFAULT_PREAMBLE,
+  CoordinatorConfig,
+  NotificationQueue,
   ParentMessage,
+  TaskNotification,
   TaskState,
   format_parent_messages_for_model,
 )
+
+if TYPE_CHECKING:
+  from .agent_session_log import AgentSessionLog
+  from .agent_session_log_records import LogEntry
+  from .capability_execution import BoundCapabilityExecution
+  from .context_builder import SessionContextBuilder
+  from .event_log import EventLog
+  from .multi_user.billing import SessionUsageSummary, UsageEvent, _UsageAggregator
+  from .providers.base import CostEstimate, ModelInfo, ModelProvider
+  from .runner_budget import CostAccumulator
+  from .runner_tool_execution import AgentRunnerDispatcher
+  from .skill_lifecycle import TopLevelSkillLifecycleMetadata
+  from .task_registry import TaskRegistry
+  from .workflow_output_attachment import WorkflowOutputAttachment
+
 log = logging.getLogger("agent_gateway.runner")
+
+class _BuildChatDoneLogData(Protocol):
+  def __call__(
+    self,
+    *,
+    session_id: str,
+    elapsed_s: float,
+    turns: int,
+    tools: Iterable[str],
+    usage_totals: Dict[str, int],
+    cost: float,
+  ) -> Dict[str, Any]: ...
+
+
+class _BuildStreamCompleteEvent(Protocol):
+  def __call__(
+    self,
+    *,
+    usage_totals: Dict[str, int],
+    estimated_cost: float,
+    est_system_tokens: int,
+    est_tools_tokens: int,
+  ) -> Dict[str, Any]: ...
+
+
+class _BuildContextWarningLogData(Protocol):
+  def __call__(
+    self,
+    *,
+    session_id: str,
+    est_tokens: int,
+    context_limit: int,
+    turn: int | None = None,
+  ) -> Dict[str, Any]: ...
+
+
+class _BuildTokenEstimateLogData(Protocol):
+  def __call__(
+    self,
+    *,
+    session_id: str,
+    est_system_tokens: int,
+    est_messages_tokens: int,
+    est_tools_tokens: int,
+    est_total_tokens: int,
+    message_count: int,
+    tool_count: int,
+    turn: int | None = None,
+  ) -> Dict[str, Any]: ...
+
+
+class _TokenEstimateSnapshot(Protocol):
+  def __call__(
+    self,
+    *,
+    system_text: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+  ) -> TokenEstimateSnapshot: ...
+
+
+
+
+class _SessionDrainState(Protocol):
+  def __call__(
+    self,
+    running_entries: List[Any],
+    *,
+    shutdown_failed: bool,
+    unsettled_workflow_obstructions: int = 0,
+  ) -> SessionDrainState: ...
+
+
+class _BuildRuntimeGuardEvent(Protocol):
+  def __call__(
+    self,
+    *,
+    guard: str,
+    message: str,
+  ) -> Dict[str, Any]: ...
+
+
+class _AdmitProviderRequestBudget(Protocol):
+  def __call__(
+    self,
+    cost_accumulator: CostAccumulator | None,
+    *,
+    provider: ModelProvider,
+    model: str,
+    estimated_input_tokens: int,
+    requested_max_output_tokens: int,
+  ) -> ProviderRequestBudgetAdmission: ...
+
+
+class _BuildContextPressureReminder(Protocol):
+  def __call__(self, *, pct: int) -> str: ...
+
+
+class _ConservativeRequestInputTokenBoundForRequest(Protocol):
+  def __call__(
+    self,
+    *,
+    system_text: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+  ) -> int: ...
+
+
+class _ContextPressureReminderDecision(Protocol):
+  def __call__(
+    self,
+    *,
+    est_tokens: int,
+    context_limit: int,
+    next_threshold_pct: int,
+    initial_threshold_pct: int = CONTEXT_PRESSURE_REMINDER_PCT,
+    step_pct: int = CONTEXT_PRESSURE_REMINDER_STEP_PCT,
+  ) -> ContextPressureReminderDecision: ...
+
+
+class _NoToolUseTurnOutcome(Protocol):
+  def __call__(
+    self,
+    *,
+    content_blocks: List[Any],
+    provider: str,
+    model: str,
+    stop_reason: str | None,
+    pending_notification_count: int,
+    max_tokens_continuations: int,
+    max_tokens_max_attempts: int,
+    max_tokens_nudge: str,
+    unbounded_max_tokens_continuations: bool = False,
+  ) -> NoToolUseTurnOutcome: ...
+
+
+def _assistant_content_blocks_for_persistence(
+  dispatcher: Any,
+  content_blocks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+  """Project assistant tool inputs for durable and presentation sinks."""
+
+  projected = copy.deepcopy(content_blocks)
+  for block in projected:
+    if (
+      not isinstance(block, dict)
+      or block.get("type") not in {"tool_use", "server_tool_use"}
+    ):
+      continue
+    tool_input = block.get("input")
+    if not isinstance(tool_input, dict):
+      block["input"] = sanitization_failure_tool_input()
+      continue
+    try:
+      redacted = dispatcher.redact_raw_tool_input_for_history(
+        str(block.get("name") or "tool"),
+        tool_input,
+      )
+    except Exception:
+      redacted = sanitization_failure_tool_input()
+    block["input"] = (
+      redacted
+      if isinstance(redacted, dict)
+      else sanitization_failure_tool_input()
+    )
+  return projected
 
 
 def _tool_result_ids(messages: list[dict[str, Any]]) -> set[str]:
   return {
     str(block["tool_use_id"])
     for message in messages
+    for content in (message.get("content"),)
     for block in (
-      message.get("content")
-      if isinstance(message.get("content"), list)
-      else []
+      content if isinstance(content, list) else []
     )
     if (
       isinstance(block, dict)
@@ -628,6 +824,13 @@ def _omitted_background_result_nudge(task_ids: list[str]) -> str:
     "these explicitly omitted results remain retained.]"
   )
 
+def _require_fresh_runner(summary_emitted: bool) -> None:
+  if summary_emitted:
+    raise RuntimeError(
+      "AgentRunner is single-use; construct a new runner for subsequent runs"
+    )
+
+
 
 def _merge_usage_totals(usage_totals: Dict[str, Any], usage: dict[str, Any] | None) -> None:
   if not usage:
@@ -670,7 +873,1937 @@ def _is_anchor_only_compaction_message(message: dict[str, Any] | None) -> bool:
   )
 
 
+@dataclass(frozen=True, slots=True)
+class _NoToolTurnOutcome:
+  action: Literal["break", "continue"]
+  delivery_epoch_active: bool
+  delivery_turn_compelled: bool
+  delivered_notifications: list[TaskNotification]
+  learning_real_final_response: bool
+  max_tokens_continuation_pending: bool
+  max_tokens_continuations: int
+  terminal_failure: tuple[str, str] | None
+  terminal_success_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolTurnOutcome:
+  action: Literal["break", "continue"]
+  delivery_epoch_active: bool
+  delivery_turn_compelled: bool
+  exceeded_state: BudgetExceededState | None
+  terminal_failure: tuple[str, str] | None
+  terminal_success_reason: str | None
+
+
 class RunnerRunLoopMixin:
+  _stream_started_at: float | None = None
+
+  if TYPE_CHECKING:
+    _agent_session_log: AgentSessionLog | None
+    _capability_execution: BoundCapabilityExecution
+    _compaction_instructions: str | None
+    _context_builder: SessionContextBuilder | None
+    _context_capture: ContextCapture | None
+    _context_pressure_next_reminder_pct: int
+    _background_notifications_enabled: bool
+    _notification_queue: NotificationQueue
+    _cost_accumulator: CostAccumulator | None
+    _durable_attach_emitted: bool
+    _fork_suffix_ceiling_triggered: bool
+    _first_text_at: float | None
+    _last_context_manifest_digest: str | None
+    _last_assistant_message_seq: int | None
+    _message_inbox: asyncio.Queue[ParentMessage] | None
+    _last_durable_seq: int
+    _mid_turn_fork_handoff: ForkRequestHandoff | None
+    _role: str
+    _runner_id: str | None
+    _request_id: str
+    _active_skill_allow: set[str]
+    _active_skill_deny: set[str]
+    _active_skill_report_doors: dict[str, str]
+    _aggregator: _UsageAggregator
+    _log: EventLog
+    _parent_aggregator: _UsageAggregator | None
+    _task_registry: TaskRegistry
+    _top_level_skill_started_committed: bool
+    _summary_emitted: bool
+
+    async def _acquire_writer_lease_and_recover(self) -> None: ...
+    def _background_delivery_grace_credit_limit(self) -> int: ...
+    _full_session_id: str
+    _provider: ModelProvider
+    _sid: str
+    _top_level_skill_completion_effect_plan: (
+      TopLevelSkillCompletionEffectPlan | None
+    )
+    _top_level_skill_lifecycle: TopLevelSkillLifecycleMetadata | None
+
+    def _append(self, event: Dict[str, Any]) -> Any | None: ...
+
+    async def _append_durable_event(
+      self,
+      event: Dict[str, Any],
+    ) -> Any | None: ...
+
+    async def _await_write_lease_handoff(self) -> bool: ...
+
+
+    async def _call_on_before_stream_complete(
+      self,
+      terminal_event: Dict[str, Any] | None = None,
+    ) -> None: ...
+
+    async def _call_on_session_summary(
+      self,
+      summary: SessionUsageSummary,
+    ) -> None: ...
+
+    async def _close_client(
+      self,
+      client: object,
+      timeout: float = 2.0,
+    ) -> None: ...
+
+
+
+    async def _emit_operator_pause_event(
+      self,
+      safe_boundary: str,
+    ) -> None: ...
+
+
+    async def _emit_run_error_event(
+      self,
+      exc: BaseException,
+      *,
+      phase: str = "run",
+      server_terminal_cause: str | None = None,
+    ) -> None: ...
+
+
+    async def _emit_interrupted_event(
+      self,
+      reason: str,
+      *,
+      extra_fields: Dict[str, Any] | None = None,
+    ) -> None: ...
+
+    def _estimate_usage_cost(
+      self,
+      model: str,
+      usage_totals: Dict[str, Any],
+    ) -> CostEstimate: ...
+    async def _settle_run_closure(
+      self,
+      *,
+      clean_detach_reason: str,
+      run_error: BaseException | None,
+    ) -> bool: ...
+
+    def _context_surface_records(self) -> list[dict[str, Any]]: ...
+
+    async def force_close(self, timeout: float = 2.0) -> None: ...
+    @staticmethod
+    def _inject_system_prompt_reminder(
+      system_prompt: Optional[Union[str, List[Tuple[str, bool]]]],
+      reminder: str,
+    ) -> Optional[Union[str, List[Tuple[str, bool]]]]: ...
+
+
+
+    async def _prepare_top_level_skill_result(
+      self,
+      terminal_event: Dict[str, Any],
+    ) -> Dict[str, Any] | None: ...
+
+    def _ack_delivered_notifications(
+      self,
+      delivered: Sequence[TaskNotification],
+    ) -> int: ...
+
+    def _operator_pause_requested(self) -> bool: ...
+
+    async def _wait_for_background_notification(self) -> bool: ...
+
+    def _workflow_settlement_obstructed(self) -> bool: ...
+
+    def _publish_top_level_skill_settlement(
+      self,
+      error: BaseException | None,
+    ) -> bool: ...
+
+    def _release_research_file_activity_after_children(self) -> None: ...
+
+    def _release_selected_content_activity_after_children(self) -> None: ...
+
+    async def _shutdown_background_tasks(
+      self,
+      was_cancelled: bool,
+    ) -> None: ...
+
+    def _shutdown_interrupted_reason(
+      self,
+    ) -> tuple[str, Dict[str, Any]]: ...
+
+    def _top_level_server_terminal_cause(self) -> str | None: ...
+
+    def _unsettled_workflow_obstruction_count(self) -> int: ...
+
+
+    def _background_delivery_grace_obligations(
+      self,
+    ) -> dict[tuple[str, int, str], int]: ...
+
+
+    async def _append_user_message_event(
+      self,
+      message: Dict[str, Any],
+    ) -> LogEntry | None: ...
+
+    async def _emit_attach_event(self) -> None: ...
+
+    async def _emit_top_level_skill_started(self) -> bool: ...
+
+    async def _materialize_parent_message_consumption_audits(
+      self,
+      *,
+      assistant_message_seq: int | None = None,
+      expected_messages: list[ParentMessage] | None = None,
+    ) -> None: ...
+
+    async def _prepare_top_level_skill_system_prompt(
+      self,
+      proposed_prompt: Optional[Union[str, List[Tuple[str, bool]]]],
+    ) -> Optional[Union[str, List[Tuple[str, bool]]]]: ...
+
+    async def _rebuild_task_registry_from_log(self) -> None: ...
+
+    def _write_lease_metadata(self) -> None: ...
+
+    _auth_config: Dict[str, Any]
+    _client_timeout: float | None
+    _compaction_trigger: int | None
+    _coordinator: CoordinatorConfig | None
+    _dispatcher: AgentRunnerDispatcher
+    _max_tokens_override: int | None
+    _on_max_turns: (
+      Callable[[List[Dict[str, Any]], int], Awaitable[str | None]] | None
+    )
+    _pending_workflow_output_attachments: dict[
+      str,
+      WorkflowOutputAttachment,
+    ]
+    _portable_compaction_failed_est_at: int | None
+    _portable_compaction_floor_warned: bool
+    _portable_compaction_last_turn: int | None
+    _prepared_top_level_terminal_event: Dict[str, Any] | None
+    _sub_agent_semaphore: asyncio.Semaphore | None
+    _top_level_skill_result_committed: bool
+    _top_level_skill_result_failure: BaseException | None
+    _top_level_skill_result_failure_code: str | None
+
+    async def _acknowledge_parent_messages_consumed(
+      self,
+      parent_messages: list[ParentMessage],
+      *,
+      consumer_turn: int,
+    ) -> None: ...
+
+    async def _append_assistant_message_event(
+      self,
+      *,
+      content_blocks: List[Dict[str, Any]],
+      stop_reason: str | None,
+      model: str,
+      usage: Dict[str, Any],
+      parent_messages: list[ParentMessage] | None = None,
+      consumer_turn: int | None = None,
+      logical_response_id: str | None = None,
+      logical_response_segment_ordinal: int | None = None,
+      continued_from_assistant_message_seq: int | None = None,
+      workflow_output_attachments: (
+        list[WorkflowOutputAttachment] | None
+      ) = None,
+    ) -> LogEntry | None: ...
+
+    def _background_task_reminder_text(self) -> str: ...
+
+    def _build_notification_reminder(self) -> str: ...
+
+    def _build_usage_event(
+      self,
+      *,
+      model: str,
+      usage_totals: Dict[str, Any],
+    ) -> UsageEvent: ...
+
+    async def _call_on_usage(self, usage_event: UsageEvent) -> None: ...
+
+    def _default_tool_definitions(self) -> List[Dict[str, Any]]: ...
+
+    async def _emit_error_event(self, error: str) -> None: ...
+
+    async def _emit_stub_response(
+      self,
+      messages: List[Dict[str, Any]],
+    ) -> None: ...
+
+    def _effective_excluded_tools(self) -> set[str]: ...
+
+    def _ensure_sub_agent_semaphore(self) -> asyncio.Semaphore | None: ...
+
+    async def _execute_single_tool(
+      self,
+      tool_id: str,
+      tool_name: str,
+      tool_input: Dict[str, Any],
+      base_kwargs: Dict[str, Any],
+      call_index: int = 0,
+    ) -> Tuple[Dict[str, Any], str, List[Dict[str, Any]]]: ...
+
+    def _filter_excluded_tool_definitions(
+      self,
+      tools: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]: ...
+
+    @staticmethod
+    def _make_error_result(
+      tool_use_id: str,
+      code: str,
+      message: str,
+      sub_code: str = "",
+      data: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]: ...
+
+    def _notification_delivery_set(
+      self,
+    ) -> Tuple[TaskNotification, ...]: ...
+
+    def _preflight_top_level_skill_run(
+      self,
+      messages: List[Dict[str, Any]],
+      resume_initial_messages: List[Dict[str, Any]] | None,
+    ) -> Dict[str, Any] | None: ...
+
+    def _set_client(self, client: object) -> None: ...
+
+    async def _stream_turn(
+      self,
+      *,
+      client: object,
+      config: Dict[str, Any],
+      model_info: ModelInfo,
+      system_prompt: Optional[Union[str, List[Tuple[str, bool]]]],
+      current_messages: List[Dict[str, Any]],
+      base_kwargs: Dict[str, Any],
+      max_tokens: int,
+      turn_count: int,
+      turn_t0: float,
+      turn_t0_mono: float,
+      system_chars: int,
+      tools_chars: int,
+      usage_totals: Dict[str, Any],
+    ) -> Tuple[object, StreamTurnResult] | StreamTurnFailure | None: ...
+
+  async def _prepare_run_durable_context(
+    self,
+    messages: List[Dict[str, Any]],
+    system_prompt: Optional[Union[str, List[Tuple[str, bool]]]],
+    *,
+    resume_initial_messages: List[Dict[str, Any]] | None,
+    top_level_user_input: dict[str, Any] | None,
+    selected_content_committed: bool,
+    runner_id: str,
+  ) -> tuple[
+    List[Dict[str, Any]],
+    Optional[Union[str, List[Tuple[str, bool]]]],
+    bool,
+  ]:
+    self._runner_id = runner_id
+    self._last_durable_seq = 0
+    self._last_assistant_message_seq = None
+    self._durable_attach_emitted = False
+    if self._role == "writer":
+      await self._acquire_writer_lease_and_recover()
+    await self._emit_attach_event()
+    if self._role == "writer":
+      self._write_lease_metadata()
+    if self._role == "sub_agent":
+      await self._materialize_parent_message_consumption_audits()
+    await self._rebuild_task_registry_from_log()
+    if resume_initial_messages is not None:
+      messages = [dict(message) for message in resume_initial_messages]
+    elif self._context_builder is not None:
+      # Autonomous / server-authoritative path: context_builder is the source
+      # of truth; the incoming `messages` carries only the new user turn.
+      prior_messages = await self._context_builder.build()
+      new_user_input = (
+        top_level_user_input
+        if top_level_user_input is not None
+        else last_user_message(messages)
+      )
+      if new_user_input is not None:
+        user_entry = await self._append_user_message_event(
+          new_user_input
+        )
+        selected_content_committed = user_entry is not None
+        if (
+          top_level_user_input is not None
+          and user_entry is None
+        ):
+          raise RuntimeError(
+            "Top-level skill user_message was not durably "
+            "persisted"
+          )
+      messages = prior_messages + ([new_user_input] if new_user_input is not None else [])
+    else:
+      # Durable-log path without a replay policy: preserve caller-provided
+      # messages without injecting prior durable history.
+      new_user_input = (
+        top_level_user_input
+        if top_level_user_input is not None
+        else last_user_message(messages)
+      )
+      if new_user_input is not None:
+        user_entry = await self._append_user_message_event(
+          new_user_input
+        )
+        selected_content_committed = user_entry is not None
+        if (
+          top_level_user_input is not None
+          and user_entry is None
+        ):
+          raise RuntimeError(
+            "Top-level skill user_message was not durably "
+            "persisted"
+          )
+      messages = [dict(message) for message in messages]
+    if top_level_user_input is not None:
+      await self._emit_top_level_skill_started()
+      system_prompt = (
+        await self._prepare_top_level_skill_system_prompt(
+          system_prompt
+        )
+      )
+    return messages, system_prompt, selected_content_committed
+
+
+  def _prepare_delivery_epoch_turn(
+    self,
+    *,
+    active_delivery_obligation: tuple[str, int, str] | None,
+    delivery_epoch_from_max: bool,
+    delivery_grace_credit_limit: int | None,
+    delivery_grace_credits: dict[tuple[str, int, str], int],
+    delivery_grace_credits_granted: int,
+    delivery_turn_compelled: bool,
+    model_visible_synthesis_credits_granted: int,
+    model_visible_tool_result_generation: int,
+    pending_model_visible_tool_result_ids: set[str],
+  ) -> tuple[
+    int,
+    int,
+    int,
+    bool,
+    bool,
+    dict[tuple[str, int, str], int],
+    tuple[str, int, str] | None,
+  ]:
+    if delivery_grace_credit_limit is None:
+      delivery_grace_credit_limit = (
+        self._background_delivery_grace_credit_limit()
+      )
+    pending_acknowledgements = getattr(
+      self,
+      "_pending_background_result_acks",
+      {},
+    )
+    if isinstance(pending_acknowledgements, dict):
+      for tool_use_id, acknowledgement in list(
+        pending_acknowledgements.items()
+      ):
+        if (
+          not isinstance(acknowledgement, tuple)
+          or len(acknowledgement) != 2
+          or not isinstance(acknowledgement[0], str)
+          or not isinstance(acknowledgement[1], int)
+          or isinstance(acknowledgement[1], bool)
+        ):
+          continue
+        task_id, notification_generation = acknowledgement
+        if acknowledgement in self._background_ack_recovery_pairs:
+          phase = "recovery_acknowledgement"
+        else:
+          phase = "acknowledgement"
+        acknowledgement_obligation = (
+          task_id,
+          notification_generation,
+          phase,
+        )
+        if (
+          phase == "acknowledgement"
+          and acknowledgement_obligation
+          in delivery_grace_credits
+          and delivery_grace_credits[
+            acknowledgement_obligation
+          ] <= 0
+        ):
+          self._background_ack_recovery_pairs.add(
+            acknowledgement
+          )
+          for duplicate_id, duplicate in list(
+            pending_acknowledgements.items()
+          ):
+            if duplicate == acknowledgement:
+              pending_acknowledgements.pop(
+                duplicate_id,
+                None,
+              )
+    obligations = self._background_delivery_grace_obligations()
+    if (
+      (
+        pending_model_visible_tool_result_ids
+        # B-3: at turn exhaustion the synthesis obligation is minted
+        # unconditionally — this is the completion reserve that elicits a
+        # terminal narrative, and without it the honest-partial remap has
+        # no narrative to settle on. Still credit-capped below by the one
+        # synthesis credit and by delivery_grace_credit_limit.
+        or delivery_epoch_from_max
+      )
+      and not obligations
+    ):
+      obligations[
+        (
+          "model_visible_tool_results",
+          model_visible_tool_result_generation,
+          "synthesis",
+        )
+      ] = 1
+    for obligation, requested_credits in obligations.items():
+      if obligation in delivery_grace_credits:
+        continue
+      available_credits = max(
+        0,
+        delivery_grace_credit_limit
+        - delivery_grace_credits_granted,
+      )
+      if obligation[2] == "synthesis":
+        available_credits = min(
+          available_credits,
+          max(
+            0,
+            1 - model_visible_synthesis_credits_granted,
+          ),
+        )
+      granted_credits = min(
+        max(0, int(requested_credits)),
+        available_credits,
+      )
+      delivery_grace_credits[obligation] = granted_credits
+      delivery_grace_credits_granted += granted_credits
+      if obligation[2] == "synthesis":
+        model_visible_synthesis_credits_granted += (
+          granted_credits
+        )
+    # Credits count the turns that *cannot* settle a delivery: the
+    # compelled ones, where the loop re-invokes the provider itself
+    # (a continuation the model never completed, or a delivery nudge
+    # after it tried to stop). A completed turn acks what was rendered
+    # to it, so it makes progress on its own and is not charged --
+    # otherwise a parent that legitimately keeps working between
+    # deliveries, which is exactly what a staged fan-out does, spends a
+    # budget sized for draining a queue and dies mid-flight. The frozen
+    # post-`max_turns` epoch stays metered unconditionally: there the
+    # turn budget is already spent and every turn is a delivery turn.
+    metered_delivery_turn = (
+      delivery_epoch_from_max or delivery_turn_compelled
+    )
+    delivery_turn_compelled = False
+    if metered_delivery_turn:
+      active_delivery_obligation = next(
+        (
+          obligation
+          for obligation in obligations
+          if delivery_grace_credits.get(obligation, 0) > 0
+        ),
+        None,
+      )
+    return (
+      delivery_grace_credit_limit,
+      delivery_grace_credits_granted,
+      model_visible_synthesis_credits_granted,
+      delivery_turn_compelled,
+      metered_delivery_turn,
+      obligations,
+      active_delivery_obligation,
+    )
+
+  async def _prepare_terminal_run(
+    self,
+    *,
+    terminal_assistant_turn_message: Callable[[], Dict[str, Any]],
+    build_chat_done_log_data: _BuildChatDoneLogData,
+    build_stream_complete_event: _BuildStreamCompleteEvent,
+    chat_t0: float,
+    client: object,
+    current_messages: list[dict[str, Any]],
+    emit_terminal_failure: Callable[[str, str], Awaitable[None]],
+    initial_estimate: TokenEstimateSnapshot,
+    logger: logging.Logger,
+    terminal_interruption_reason: str | None,
+    terminal_success_reason: str | None,
+    time_module: types.ModuleType,
+    tools_used: list[str],
+    turn_count: int,
+    estimated_cost: float,
+    usage_cache_status: Callable[[Dict[str, int]], str],
+    usage_totals: Dict[str, Any],
+  ) -> None:
+    terminal_snapshot_before: tuple[Any, ...] | None = None
+    staged_terminal_events: list[dict[str, Any]] = []
+    if terminal_success_reason is not None:
+      (
+        terminal_blockers,
+        terminal_snapshot_before,
+      ) = _background_success_snapshot(self)
+      if terminal_blockers:
+        await emit_terminal_failure(
+          "background_delivery_incomplete",
+          "background_delivery_incomplete: successful completion was "
+          "refused while background work or result delivery remained "
+          f"unsettled ({', '.join(terminal_blockers)}).",
+        )
+        return
+
+    total_elapsed = time_module.time() - chat_t0
+    cache_status = usage_cache_status(usage_totals)
+    completion_event = build_stream_complete_event(
+      usage_totals=usage_totals,
+      estimated_cost=estimated_cost,
+      est_system_tokens=initial_estimate.est_system_tokens,
+      est_tools_tokens=initial_estimate.est_tools_tokens,
+    )
+    terminal_event = completion_event
+    if terminal_interruption_reason is not None:
+      terminal_event["terminal_disposition"] = "interrupted"
+      terminal_event["reason"] = terminal_interruption_reason
+    if terminal_success_reason is not None:
+      # Success hooks may derive durable receipts from the proposed terminal
+      # event. Stage those receipts until the post-hook settlement snapshot
+      # proves that the proposal is still current.
+      self._terminal_success_staged_events = staged_terminal_events
+    terminal_hook_error: Exception | None = None
+    try:
+      await self._call_on_before_stream_complete(terminal_event)
+      if terminal_success_reason is not None:
+        await self._prepare_top_level_skill_result(terminal_event)
+    except Exception as exc:
+      terminal_hook_error = exc
+    finally:
+      if terminal_success_reason is not None:
+        self._terminal_success_staged_events = None
+
+    # Generic bookkeeping hooks cannot veto execution. The lifecycle owner
+    # separately resolves the named-skill policy's prepared result and terminal.
+    if terminal_hook_error is not None:
+      log.warning(
+        "terminal settlement hook failed (%s: %s) — proceeding with the "
+        "run's real result; bookkeeping never vetoes completed work",
+        type(terminal_hook_error).__name__,
+        terminal_hook_error,
+      )
+
+    if terminal_success_reason is not None:
+      # Require a stable, quiescent terminal proposal: a generation published
+      # and drained during the hook is still a change. The lifecycle owner
+      # commits this proposal before publishing its receipts and terminal.
+      (
+        terminal_blockers,
+        terminal_snapshot_after,
+      ) = _background_success_snapshot(self)
+      if (
+        terminal_blockers
+        or terminal_snapshot_after != terminal_snapshot_before
+      ):
+        staged_terminal_events.clear()
+        changed_suffix = (
+          "state changed"
+          if terminal_snapshot_after != terminal_snapshot_before
+          else "state remained unsettled"
+        )
+        await emit_terminal_failure(
+          "background_delivery_incomplete",
+          "background_delivery_incomplete: successful completion was "
+          "refused because background work or result delivery "
+          f"{changed_suffix} at the terminal boundary"
+          + (
+            f" ({', '.join(terminal_blockers)})."
+            if terminal_blockers
+            else "."
+          ),
+        )
+        return
+
+      if (
+        getattr(
+          self,
+          "_last_request_message_marker_position",
+          None,
+        )
+        is not None
+      ):
+        self._post_turn_fork_handoff = None
+        if not fork_credential_identity_available(self):
+          if not getattr(
+            self,
+            "_post_turn_fork_identity_unavailable_logged",
+            False,
+          ):
+            logger.info(
+              "[%s] Post-turn fork capture unavailable: no visible "
+              "credential identity (session_id=%s)",
+              self._sid,
+              self._full_session_id,
+            )
+            self._post_turn_fork_identity_unavailable_logged = True
+        else:
+          try:
+            self._post_turn_fork_handoff = build_post_turn_handoff(
+              self,
+              current_messages,
+              terminal_assistant_turn_message(),
+            )
+          except Exception:
+            logger.warning(
+              "[%s] Post-turn fork capture failed | failure=true",
+              self._sid,
+            )
+
+    if len(staged_terminal_events) > 1:
+      staged_terminal_events.clear()
+      await emit_terminal_failure(
+        "terminal_receipt_cardinality_invalid",
+        "terminal_receipt_cardinality_invalid: terminal settlement "
+        "produced more than one staged success receipt.",
+      )
+      return
+    if any(
+      event.get("type") in {
+        "skill_run_started",
+        "skill_result_captured",
+      }
+      for event in staged_terminal_events
+    ):
+      staged_terminal_events.clear()
+      await emit_terminal_failure(
+        "terminal_receipt_ownership_invalid",
+        "terminal_receipt_ownership_invalid: a generic terminal "
+        "hook attempted to emit an AgentRunner-owned skill "
+        "lifecycle marker.",
+      )
+      return
+    self._terminal_closure_receipts = staged_terminal_events
+    self._terminal_closure_event = terminal_event
+
+    if terminal_success_reason is not None:
+      logger.info(
+        "[%s] Chat done | %.1fs total | %d turns | tools=%s | tokens in=%d out=%d | cache=%s | cost=$%.4f",
+        self._sid,
+        total_elapsed,
+        turn_count,
+        tools_used or "none",
+        usage_totals["input_tokens"],
+        usage_totals["output_tokens"],
+        cache_status,
+        estimated_cost,
+        extra={
+          "data": build_chat_done_log_data(
+            session_id=self._sid,
+            elapsed_s=total_elapsed,
+            turns=turn_count,
+            tools=tools_used,
+            usage_totals=usage_totals,
+            cost=estimated_cost,
+          )
+        },
+      )
+    else:
+      logger.info(
+        "[%s] Chat interrupted | %.1fs total | %d turns | reason=%s",
+        self._sid,
+        total_elapsed,
+        turn_count,
+        terminal_interruption_reason,
+      )
+
+    try:
+      await self._close_client(client, timeout=5.0)
+    except Exception as exc:
+      logger.warning(
+        "[%s] client close after completed stream failed (non-fatal): %s",
+        self._sid,
+        exc,
+      )
+      await self._emit_run_error_event(exc, phase="client_close_after_stream_complete")
+
+  def _consume_parent_messages(
+    self,
+    *,
+    current_messages: list[dict[str, Any]],
+    format_parent_messages: Callable[[list[ParentMessage]], str],
+    is_child_logical_response: bool,
+    max_tokens_continuation_pending: bool,
+    max_tokens_continuations: int,
+    pending_parent_message_acks: dict[tuple[str, int], ParentMessage],
+    queue_empty: type[BaseException],
+    reset_logical_response_lineage: Callable[[], None],
+    user_turn_message: Callable[[Any], Dict[str, Any]],
+  ) -> tuple[bool, int]:
+    parent_messages: list[ParentMessage] = []
+    if self._message_inbox is not None:
+      while not self._message_inbox.empty():
+        try:
+          parent_messages.append(
+            self._message_inbox.get_nowait()
+          )
+        except queue_empty:
+          break
+    if parent_messages:
+      if (
+        is_child_logical_response
+        and max_tokens_continuation_pending
+      ):
+        # Parent/operator guidance changes the task semantics. The next
+        # provider response is not a continuation of the pre-update
+        # partial, even though that partial ended at max_tokens.
+        reset_logical_response_lineage()
+        max_tokens_continuation_pending = False
+        max_tokens_continuations = 0
+      current_messages.append(user_turn_message(
+        format_parent_messages(parent_messages)
+      ))
+      pending_parent_message_acks.update({
+        (message.task_id, message.sent_seq): message
+        for message in parent_messages
+        if (
+          message.task_id is not None
+          and message.sent_seq is not None
+        )
+      })
+    return max_tokens_continuation_pending, max_tokens_continuations
+
+  def _log_turn_context_estimate(
+    self,
+    *,
+    base_kwargs: Dict[str, Any],
+    build_context_warning_log_data: _BuildContextWarningLogData,
+    build_token_estimate_log_data: _BuildTokenEstimateLogData,
+    context_limit: int,
+    context_warning_pct: int,
+    current_messages: list[dict[str, Any]],
+    initial_estimate: TokenEstimateSnapshot,
+    logger: logging.Logger,
+    system_text: str,
+    token_estimate_snapshot: _TokenEstimateSnapshot,
+    turn_count: int,
+  ) -> TokenEstimateSnapshot:
+    estimate_snapshot = initial_estimate
+    if turn_count > 1:
+      current_tools = base_kwargs.get("tools") or []
+      turn_estimate = token_estimate_snapshot(
+        system_text=system_text,
+        messages=current_messages,
+        tools=current_tools,
+      )
+      estimate_snapshot = turn_estimate
+      if turn_estimate.est_total_tokens > context_limit * context_warning_pct / 100:
+        logger.warning(
+          "[%s] Context usage high | est=%d tokens (%.0f%% of %dk limit)",
+          self._sid,
+          turn_estimate.est_total_tokens,
+          turn_estimate.est_total_tokens / context_limit * 100,
+          context_limit // 1000,
+          extra={
+            "data": build_context_warning_log_data(
+              session_id=self._sid,
+              turn=turn_count,
+              est_tokens=turn_estimate.est_total_tokens,
+              context_limit=context_limit,
+            )
+          },
+        )
+      logger.info(
+        "[%s] Turn %d pre-request | est=%d tokens",
+        self._sid,
+        turn_count,
+        turn_estimate.est_total_tokens,
+        extra={
+          "data": build_token_estimate_log_data(
+            session_id=self._sid,
+            turn=turn_count,
+            est_system_tokens=turn_estimate.est_system_tokens,
+            est_messages_tokens=turn_estimate.est_messages_tokens,
+            est_tools_tokens=turn_estimate.est_tools_tokens,
+            est_total_tokens=turn_estimate.est_total_tokens,
+            message_count=turn_estimate.message_count,
+            tool_count=turn_estimate.tool_count,
+          )
+        },
+      )
+    return estimate_snapshot
+
+  async def _finalize_run(
+    self,
+    *,
+    clean_detach_reason: str,
+    learning_real_final_response: bool,
+    learning_receipt_delivery: LearningReceiptDelivery | None,
+    learning_tool_calling_iters: int,
+    logger: logging.Logger,
+    run_error: BaseException | None,
+    session_drain_state: _SessionDrainState,
+    task_state_cls: type[TaskState],
+    terminal_success_reason: str | None,
+    time_module: types.ModuleType,
+    was_cancelled: bool,
+  ) -> None:
+    finalizer_errors: list[BaseException] = []
+    settlement_succeeded = False
+    shutdown_failed = False
+    try:
+      from .skill_context import clear_current_skill
+
+      clear_current_skill()
+    except Exception:
+      pass
+    self._active_skill_allow.clear()
+    self._active_skill_deny.clear()
+    self._active_skill_report_doors.clear()
+    try:
+      await self._shutdown_background_tasks(was_cancelled)
+    except BaseException as exc:
+      finalizer_errors.append(exc)
+      shutdown_failed = True
+    finally:
+      running_entries = self._task_registry.list_tasks(state=task_state_cls.RUNNING)
+      drain_state = session_drain_state(
+        running_entries,
+        shutdown_failed=shutdown_failed,
+        unsettled_workflow_obstructions=(
+          self._unsettled_workflow_obstruction_count()
+        ),
+      )
+      try:
+        settlement_succeeded = await self._settle_run_closure(
+          clean_detach_reason=clean_detach_reason,
+          run_error=run_error or (finalizer_errors[0] if finalizer_errors else None),
+        )
+      except asyncio.CancelledError as exc:
+        was_cancelled = True
+        if not isinstance(run_error, asyncio.CancelledError):
+          run_error = exc
+        if exc.__cause__ is not None:
+          finalizer_errors.append(exc.__cause__)
+      except BaseException as exc:
+        finalizer_errors.append(exc)
+      finally:
+        self._run_closure_deferred = False
+      if self._parent_aggregator is None:
+        try:
+          await self._aggregator.close()
+          summary = await self._aggregator.snapshot(
+            ended_at=time_module.time(),
+            drain_complete=drain_state.drain_complete,
+            in_flight_task_count=drain_state.in_flight_task_count,
+            context_surfaces=self._context_surface_records(),
+            stream_started_at=self._stream_started_at,
+            first_text_at=self._first_text_at,
+          )
+          self._summary_emitted = True
+          await self._call_on_session_summary(summary)
+        except BaseException as exc:
+          if isinstance(exc, asyncio.CancelledError):
+            finalizer_errors.append(exc)
+          logger.error(
+            "[%s] session summary emission failed (non-fatal) | exception_type=%s",
+            self._sid,
+            type(exc).__name__,
+          )
+      else:
+        self._summary_emitted = True
+    try:
+      await self._await_write_lease_handoff()
+    except BaseException as exc:
+      finalizer_errors.append(exc)
+    try:
+      await self.force_close()
+    except BaseException as exc:
+      finalizer_errors.append(exc)
+    try:
+      self._release_research_file_activity_after_children()
+    except BaseException as exc:
+      finalizer_errors.append(exc)
+    try:
+      self._release_selected_content_activity_after_children()
+    except BaseException as exc:
+      finalizer_errors.append(exc)
+    self._background_delivery_grace_active = False
+    self._background_ack_recovery_pairs.clear()
+    cancellation = next(
+      (exc for exc in (run_error, *finalizer_errors) if isinstance(exc, asyncio.CancelledError)),
+      None,
+    )
+    task = asyncio.current_task()
+    if cancellation is None and task is not None and task.cancelling():
+      cancellation = asyncio.CancelledError()
+    if cancellation is not None and not isinstance(run_error, asyncio.CancelledError):
+      run_error = cancellation
+    if self._top_level_skill_lifecycle is not None:
+      settlement_error = (
+        finalizer_errors[0]
+        if finalizer_errors
+        else (
+          run_error
+          if not self._top_level_skill_started_committed
+          else None
+        )
+      )
+      try:
+        self._publish_top_level_skill_settlement(
+          settlement_error
+        )
+      except BaseException as exc:
+        finalizer_errors.append(exc)
+    learning_turn_success = (
+      settlement_succeeded
+      and run_error is None
+      and not was_cancelled
+      and not finalizer_errors
+      and terminal_success_reason is not None
+    )
+    settle_learning_receipts(
+      self,
+      learning_receipt_delivery,
+      success=learning_turn_success,
+    )
+    if learning_turn_success:
+      submit_learning_fork_after_turn(
+        self,
+        handoff=getattr(self, "_post_turn_fork_handoff", None),
+        tool_calling_iters=learning_tool_calling_iters,
+        foreground_memory_write=successful_memory_write_from_events(
+          getattr(self._log, "entries", ()),
+          fork=False,
+        ),
+        completed=True,
+        real_final_response=learning_real_final_response,
+        errored=False,
+        aborted=False,
+        cancelled=False,
+      )
+    if run_error is not None:
+      if finalizer_errors:
+        for finalizer_error in finalizer_errors:
+          cleanup_detail = attach_cleanup_failure(
+            run_error,
+            finalizer_error,
+          )
+          try:
+            self._append({
+              "type": "run_error",
+              "phase": "run_finalizer",
+              "error_type": type(finalizer_error).__name__,
+              "error": cleanup_detail,
+              "message": cleanup_detail,
+            })
+          except Exception:
+            pass
+        raise run_error from finalizer_errors[0]
+      raise run_error
+    if finalizer_errors:
+      primary_finalizer_error = finalizer_errors[0]
+      for finalizer_error in finalizer_errors[1:]:
+        attach_cleanup_failure(
+          primary_finalizer_error,
+          finalizer_error,
+        )
+      raise primary_finalizer_error
+
+  async def _record_provider_request_context(
+    self,
+    *,
+    build_runtime_guard_event: _BuildRuntimeGuardEvent,
+    delivered_notifications: list[TaskNotification],
+    delivered_notifications_recorded: bool,
+    delivery_request_nudge_message: dict[str, Any] | None,
+    delivery_request_nudge_recorded: bool,
+    logger: logging.Logger,
+    pending_notifications_at_render: int,
+    turn_count: int,
+    turn_system_prompt: Optional[Union[str, List[Tuple[str, bool]]]],
+  ) -> tuple[bool, bool]:
+    if self._context_capture is not None:
+      surfaces = self._context_surface_records()
+      try:
+        system_prompt_hash = await asyncio.to_thread(
+          self._context_capture.persist,
+          surfaces=surfaces,
+          rendered_system_prompt=turn_system_prompt,
+        )
+        digest = canonical_manifest_digest(
+          surfaces,
+          system_prompt_hash,
+        )
+        if digest != self._last_context_manifest_digest:
+          manifest_event = build_context_manifest_event(
+            surfaces=surfaces,
+            system_prompt_hash=system_prompt_hash,
+            session_id=self._full_session_id,
+            request_id=self._request_id,
+            turn=turn_count,
+          )
+          await self._append_durable_event(manifest_event)
+          self._append(manifest_event)
+          self._last_context_manifest_digest = digest
+      except Exception as exc:
+        logger.warning(
+          "[%s] context capture failed; manifest suppressed | exception_type=%s",
+          self._sid,
+          type(exc).__name__,
+        )
+    if delivered_notifications and not delivered_notifications_recorded:
+      # Durable render record (CUR-E2E-08 observability): which
+      # request boundary showed each queued notification to the
+      # model. Identifiers only — the notification's summary/payload
+      # is untrusted child content and stays out of unsanitized
+      # event fields. Durable-only, like context_manifest: never on
+      # the client wire, ignored by every fold. Sits after budget
+      # admission so the record means "carried by an issued request";
+      # a request the provider failed to process can still leave a
+      # record whose notifications were never acked, so forensics
+      # dedupe by (task_id, notification_generation). Observability
+      # never vetoes work: append failures are logged and suppressed.
+      delivered_notifications_recorded = True
+      try:
+        await self._append_durable_event({
+          "type": "background_notifications_rendered",
+          "turn": turn_count,
+          "request_id": self._request_id,
+          "pending_count": pending_notifications_at_render,
+          "notifications": [
+            {
+              "task_id": str(getattr(notification, "task_id", "")),
+              "notification_generation": getattr(
+                notification, "notification_generation", None
+              ),
+              "event": str(getattr(notification, "event", "")),
+            }
+            for notification in delivered_notifications
+          ],
+        })
+      except Exception as exc:
+        logger.warning(
+          "[%s] notification render record suppressed | exception_type=%s",
+          self._sid,
+          type(exc).__name__,
+        )
+    if (
+      delivery_request_nudge_message is not None
+      and not delivery_request_nudge_recorded
+    ):
+      # The matching durable record for the request-scoped delivery
+      # nudge — emitted here, after budget admission, so it attests a
+      # nudge an issued request actually carried.
+      delivery_request_nudge_recorded = True
+      try:
+        await self._append_durable_event(
+          build_runtime_guard_event(
+            guard="omitted_background_result_nudge",
+            message=str(
+              (delivery_request_nudge_message.get("content") or "")
+            ),
+          )
+        )
+      except Exception as exc:
+        logger.warning(
+          "[%s] delivery nudge record suppressed | exception_type=%s",
+          self._sid,
+          type(exc).__name__,
+        )
+    return delivered_notifications_recorded, delivery_request_nudge_recorded
+
+  async def _prepare_provider_request(
+    self,
+    *,
+    active_delivery_obligation: tuple[str, int, str] | None,
+    admit_provider_request_budget: _AdmitProviderRequestBudget,
+    base_kwargs: Dict[str, Any],
+    build_context_pressure_reminder: _BuildContextPressureReminder,
+    build_runtime_guard_event: _BuildRuntimeGuardEvent,
+    conservative_request_input_token_bound_for_request: _ConservativeRequestInputTokenBoundForRequest,
+    context_limit: int,
+    context_pressure_reminder_decision: _ContextPressureReminderDecision,
+    current_messages: list[dict[str, Any]],
+    delivered_notifications: list[TaskNotification],
+    delivered_notifications_recorded: bool,
+    delivery_request_nudge_message: dict[str, Any] | None,
+    delivery_request_nudge_recorded: bool,
+    emit_budget_exceeded_stop: Callable[[Any], Awaitable[None]],
+    emit_terminal_failure: Callable[[str, str], Awaitable[None]],
+    fork_suffix_reminder_text: str | None,
+    logger: logging.Logger,
+    max_tokens: int,
+    max_turns: int | None,
+    pending_notifications_at_render: int,
+    system_prompt: Optional[Union[str, List[Tuple[str, bool]]]],
+    system_prompt_estimate_text: Callable[[Any], str],
+    token_estimate_snapshot: _TokenEstimateSnapshot,
+    turn_count: int,
+    turn_reminder: TurnReminderState,
+    user_turn_message: Callable[[Any], Dict[str, Any]],
+    upstream_model: str,
+  ) -> tuple[
+    int | None,
+    str | None,
+    dict[str, Any] | None,
+    Optional[Union[str, List[Tuple[str, bool]]]],
+    int,
+    bool,
+    bool,
+  ] | None:
+    if (
+      bool(getattr(self, "_fork_mode", False))
+      and not bool(
+        getattr(self, "_fork_suffix_ceiling_triggered", False)
+      )
+    ):
+      suffix_messages = fork_suffix_messages(
+        current_messages,
+        getattr(self, "_fork_marker_position"),
+      )
+      suffix_estimate = token_estimate_snapshot(
+        system_text="",
+        messages=suffix_messages,
+        tools=[],
+      )
+      if suffix_estimate.est_messages_tokens > int(
+        getattr(self, "_fork_suffix_max_tokens")
+      ):
+        self._fork_suffix_ceiling_triggered = True
+        fork_suffix_reminder_text = (
+          FORK_SUFFIX_WRAP_UP_REMINDER
+        )
+        max_turns = (
+          turn_count
+          if max_turns is None
+          else min(max_turns, turn_count)
+        )
+    if (
+      active_delivery_obligation is not None
+      and active_delivery_obligation[2]
+      in {"exact_retrieval", "ack_recovery"}
+    ):
+      omitted_nudge_text = _omitted_background_result_nudge(
+        [active_delivery_obligation[0]]
+      )
+      delivery_request_nudge_message = user_turn_message(
+        omitted_nudge_text
+      )
+      current_messages.append(
+        delivery_request_nudge_message
+      )
+
+    combined_reminder = "\n\n".join(
+      part
+      for part in (
+        turn_reminder.text,
+        fork_suffix_reminder_text,
+      )
+      if part
+    )
+    if combined_reminder:
+      provisional_system_prompt = (
+        self._inject_system_prompt_reminder(
+          system_prompt,
+          combined_reminder,
+        )
+      )
+    else:
+      provisional_system_prompt = system_prompt
+    request_estimate = token_estimate_snapshot(
+      system_text=system_prompt_estimate_text(
+        provisional_system_prompt
+      ),
+      messages=current_messages,
+      tools=base_kwargs.get("tools") or [],
+    )
+    context_pressure = context_pressure_reminder_decision(
+      est_tokens=request_estimate.est_total_tokens,
+      context_limit=context_limit,
+      next_threshold_pct=getattr(
+        self,
+        "_context_pressure_next_reminder_pct",
+        CONTEXT_PRESSURE_REMINDER_PCT,
+      ),
+      initial_threshold_pct=CONTEXT_PRESSURE_REMINDER_PCT,
+      step_pct=CONTEXT_PRESSURE_REMINDER_STEP_PCT,
+    )
+    self._context_pressure_next_reminder_pct = (
+      context_pressure.next_threshold_pct
+    )
+    context_pressure_reminder = (
+      build_context_pressure_reminder(
+        pct=context_pressure.reminder_pct,
+      )
+      if context_pressure.reminder_pct is not None
+      else ""
+    )
+    reminder_text = "\n\n".join(
+      filter(
+        None,
+        [
+          context_pressure_reminder,
+          turn_reminder.text,
+          fork_suffix_reminder_text,
+        ],
+      )
+    )
+    if reminder_text:
+      turn_system_prompt = self._inject_system_prompt_reminder(
+        system_prompt,
+        reminder_text,
+      )
+    else:
+      turn_system_prompt = system_prompt
+    try:
+      request_budget_admission = admit_provider_request_budget(
+        self._cost_accumulator,
+        provider=self._provider,
+        model=upstream_model,
+        estimated_input_tokens=(
+          conservative_request_input_token_bound_for_request(
+            system_text=system_prompt_estimate_text(
+              turn_system_prompt
+            ),
+            messages=current_messages,
+            tools=base_kwargs.get("tools") or [],
+          )
+        ),
+        requested_max_output_tokens=max_tokens,
+      )
+    except ProviderRequestBudgetError:
+      await emit_terminal_failure(
+        "budget_authority_invalid",
+        "Provider request budget authority could not be verified.",
+      )
+      return
+    if request_budget_admission.denied_state is not None:
+      await emit_budget_exceeded_stop(
+        request_budget_admission.denied_state
+      )
+      return
+    request_max_tokens = request_budget_admission.max_output_tokens
+    if request_max_tokens is None:  # pragma: no cover - denied above
+      raise RuntimeError("provider request budget admission is invalid")
+    if request_max_tokens < max_tokens:
+      logger.info(
+        "[%s] Provider max_tokens capped by remaining cost authority | requested=%d capped=%d",
+        self._sid,
+        max_tokens,
+        request_max_tokens,
+      )
+    (
+      delivered_notifications_recorded,
+      delivery_request_nudge_recorded,
+    ) = await self._record_provider_request_context(
+      build_runtime_guard_event=build_runtime_guard_event,
+      delivered_notifications=delivered_notifications,
+      delivered_notifications_recorded=(
+        delivered_notifications_recorded
+      ),
+      delivery_request_nudge_message=delivery_request_nudge_message,
+      delivery_request_nudge_recorded=(
+        delivery_request_nudge_recorded
+      ),
+      logger=logger,
+      pending_notifications_at_render=(
+        pending_notifications_at_render
+      ),
+      turn_count=turn_count,
+      turn_system_prompt=turn_system_prompt,
+    )
+    return (
+      max_turns,
+      fork_suffix_reminder_text,
+      delivery_request_nudge_message,
+      turn_system_prompt,
+      request_max_tokens,
+      delivered_notifications_recorded,
+      delivery_request_nudge_recorded,
+    )
+
+  async def _handle_no_tool_turn(
+    self,
+    *,
+    assistant_turn_message: Callable[..., Dict[str, Any]],
+    background_tasks_completed_user_message: Callable[[], Dict[str, Any]],
+    budget_exceeded_state: Callable[
+      [CostAccumulator], BudgetExceededState | None
+    ],
+    build_runtime_guard_event: _BuildRuntimeGuardEvent,
+    current_messages: list[dict[str, Any]],
+    delivered_notifications: list[TaskNotification],
+    delivery_epoch_active: bool,
+    delivery_epoch_from_max: bool,
+    delivery_turn_compelled: bool,
+    emit_budget_exceeded_stop: Callable[
+      [BudgetExceededState], Awaitable[None]
+    ],
+    exceeded_state: BudgetExceededState | None,
+    is_child_logical_response: bool,
+    learning_real_final_response: bool,
+    logger: logging.Logger,
+    mark_terminal_interruption: Callable[[str], None],
+    max_tokens_continuation_pending: bool,
+    max_tokens_continuations: int,
+    max_tokens_continuations_limit: int,
+    max_tokens_nudge: str,
+    max_turns: int | None,
+    no_tool_use_turn_outcome: _NoToolUseTurnOutcome,
+    persist_assistant_message_once: Callable[[], Awaitable[int]],
+    task_state_cls: type[TaskState],
+    terminal_failure: tuple[str, str] | None,
+    terminal_success_reason: str | None,
+    turn: StreamTurnResult,
+    turn_count: int,
+    unread_handle_reminded_task_ids: set[str],
+    upstream_model: str,
+    user_turn_message: Callable[[Any], Dict[str, Any]],
+  ) -> _NoToolTurnOutcome:
+    def finish(action: Literal["break", "continue"]) -> _NoToolTurnOutcome:
+      return _NoToolTurnOutcome(
+        action=action,
+        delivery_epoch_active=delivery_epoch_active,
+        delivery_turn_compelled=delivery_turn_compelled,
+        delivered_notifications=delivered_notifications,
+        learning_real_final_response=learning_real_final_response,
+        max_tokens_continuation_pending=max_tokens_continuation_pending,
+        max_tokens_continuations=max_tokens_continuations,
+        terminal_failure=terminal_failure,
+        terminal_success_reason=terminal_success_reason,
+      )
+
+    if turn.stop_reason == "end_turn" and bool(turn.full_text.strip()):
+      learning_real_final_response = True
+    # Returns the ordinal the assistant message was persisted with, so the
+    # max_tokens warning below names the same segment as the durable record.
+    logical_response_segment_ordinal = await persist_assistant_message_once()
+    if exceeded_state is not None:
+      await emit_budget_exceeded_stop(exceeded_state)
+      return finish("break")
+    if self._operator_pause_requested():
+      logger.info("[%s] Operator pause requested after turn; stopping before tool dispatch", self._sid)
+      mark_terminal_interruption("operator_pause")
+      await self._emit_operator_pause_event("after_turn_before_tools")
+      return finish("break")
+    no_tool_outcome = no_tool_use_turn_outcome(
+      content_blocks=turn.content_blocks,
+      provider=self._provider.name,
+      model=upstream_model,
+      stop_reason=turn.stop_reason,
+      pending_notification_count=0,
+      max_tokens_continuations=max_tokens_continuations,
+      max_tokens_max_attempts=max_tokens_continuations_limit,
+      max_tokens_nudge=max_tokens_nudge,
+      unbounded_max_tokens_continuations=(
+        is_child_logical_response
+      ),
+    )
+    max_tokens_continuations = no_tool_outcome.max_tokens_continuations
+    if turn.stop_reason == "pause_turn":
+      logger.info("[%s] Pause turn — continuing", self._sid)
+    elif turn.stop_reason == "compaction":
+      logger.info("[%s] Compaction pause — continuing", self._sid)
+    elif no_tool_outcome.reason == "max_tokens_continue":
+      if is_child_logical_response:
+        logger.warning(
+          "[%s] Turn %d logical response segment %d hit "
+          "max_tokens; continuing provider transport",
+          self._sid,
+          turn_count,
+          logical_response_segment_ordinal,
+        )
+        max_tokens_continuation_pending = True
+      else:
+        logger.warning(
+          "[%s] Turn %d hit max_tokens with no usable tool call; continuing with truncation nudge (%d/%d)",
+          self._sid,
+          turn_count,
+          max_tokens_continuations,
+          max_tokens_continuations_limit,
+        )
+    elif no_tool_outcome.reason == "max_tokens_terminal":
+      logger.error(
+        "[%s] Turn %d hit max_tokens with no usable tool call after %d continuation attempts; ending run",
+        self._sid,
+        turn_count,
+        max_tokens_continuations_limit,
+      )
+      terminal_failure = (
+        "max_tokens_exhausted",
+        "provider_turn_error: provider exhausted the bounded "
+        "max_tokens continuation attempts before completing the turn.",
+      )
+    if no_tool_outcome.runtime_guard is not None:
+      guard, message = no_tool_outcome.runtime_guard
+      self._append(build_runtime_guard_event(guard=guard, message=message))
+    if no_tool_outcome.action == "continue":
+      current_messages.extend(no_tool_outcome.messages)
+      # The pause/compaction/max_tokens arm cannot ack (D-A7-1): it
+      # re-invokes the provider on a turn the model never completed, so
+      # nothing discharges an outstanding delivery. These are the turns
+      # the bounded credits exist to count.
+      delivery_turn_compelled = True
+      return finish("continue")
+    if terminal_failure is not None:
+      return finish("break")
+    delivery_follow_up_allowed = turn.stop_reason in {
+      "end_turn",
+      "tool_use",
+    }
+    # Ack follows delivery: this response consumed the reminder that
+    # rendered `delivered_notifications`, so the model has seen them
+    # (A-M7, T3-I01). Reached only on a completed model turn — the
+    # `error` arm broke earlier at `terminal_failure`, and the
+    # pause/compaction/max_tokens continuation arm `continue`d above
+    # (D-A7-1).
+    if delivered_notifications:
+      self._ack_delivered_notifications(delivered_notifications)
+      delivered_notifications = []
+    if (
+      turn.stop_reason == "end_turn"
+      and self._background_notifications_enabled
+      and self._notification_queue.pending_count == 0
+      and (
+        self._task_registry.list_tasks(
+          state=task_state_cls.RUNNING
+        )
+        # An unsettled workflow obligation holds the session open
+        # (§5.3, T2-I04): a parked or authoring run has no RUNNING
+        # registry task.
+        or self._workflow_settlement_obstructed()
+      )
+      and (max_turns is None or turn_count < max_turns)
+    ):
+      await self._wait_for_background_notification()
+      if self._cost_accumulator is not None:
+        exceeded_state = (
+          budget_exceeded_state(self._cost_accumulator)
+          or exceeded_state
+        )
+      if exceeded_state is not None:
+        await emit_budget_exceeded_stop(exceeded_state)
+        return finish("break")
+      if self._operator_pause_requested():
+        logger.info(
+          "[%s] Operator pause requested while awaiting background completion",
+          self._sid,
+        )
+        mark_terminal_interruption("operator_pause")
+        await self._emit_operator_pause_event(
+          "awaiting_background_completion"
+        )
+        return finish("break")
+    if (
+      delivery_follow_up_allowed
+      and self._notification_queue.pending_count > 0
+    ):
+      current_messages.append(
+        assistant_turn_message(
+          turn.content_blocks,
+          provider=self._provider.name,
+          model=upstream_model,
+          stop_reason=turn.stop_reason,
+        )
+      )
+      current_messages.append(
+        background_tasks_completed_user_message()
+      )
+      # Metering the delivery turns is all this arm does. It must NOT
+      # latch `_background_delivery_grace_active`: that flag closes
+      # admission of new background tasks and says so in words the run
+      # would be lying about here ("past its normal turn limit" — this
+      # arm runs precisely when `max_turns is None`). Latching it on the
+      # first arriving notification made staged fan-out impossible: a
+      # parent that dispatches its next track once a slot frees had that
+      # dispatch rejected, and did the work inline instead until the
+      # delivery credits ran out. Only the post-`max_turns` epoch and the
+      # end of the loop close admission.
+      if max_turns is None:
+        delivery_epoch_active = True
+        delivery_turn_compelled = True
+      return finish("continue")
+    pending_omitted_task_ids = (
+      _pending_omitted_background_task_ids(self)
+    )
+    if (
+      delivery_follow_up_allowed
+      and pending_omitted_task_ids
+    ):
+      current_messages.append(
+        assistant_turn_message(
+          turn.content_blocks,
+          provider=self._provider.name,
+          model=upstream_model,
+          stop_reason=turn.stop_reason,
+        )
+      )
+      omitted_nudge_text = _omitted_background_result_nudge(
+        pending_omitted_task_ids
+      )
+      current_messages.append(
+        user_turn_message(omitted_nudge_text)
+      )
+      try:
+        await self._append_durable_event(
+          build_runtime_guard_event(
+            guard="omitted_background_result_nudge",
+            message=omitted_nudge_text,
+          )
+        )
+      except Exception as exc:
+        logger.warning(
+          "[%s] delivery nudge record suppressed | exception_type=%s",
+          self._sid,
+          type(exc).__name__,
+        )
+      if max_turns is None:
+        delivery_epoch_active = True
+        delivery_turn_compelled = True
+      return finish("continue")
+    unread_handle_entries = [
+      entry
+      for entry in _unread_settled_handle_entries(self)
+      if entry.task_id not in unread_handle_reminded_task_ids
+    ][:_UNREAD_HANDLE_NUDGE_MAX_TASKS]
+    if (
+      delivery_follow_up_allowed
+      and unread_handle_entries
+      and not delivery_epoch_from_max
+      # The reminder must never consume the run's LAST budgeted turn:
+      # crossing `max_turns` here would latch the from-max epoch and
+      # `_background_delivery_grace_active`, spend the synthesis
+      # credit, and turn an obeying model's read into a
+      # `max_turns_reached` interruption. On a bounded run whose
+      # finish lands on the limit, the reminder yields (fail-open).
+      and (max_turns is None or turn_count < max_turns)
+    ):
+      # CUR-E2E-08: the delivery contract ended at "rendered once and
+      # acked", and a handle-shaped result whose notification landed
+      # while the model was firefighting another child was never read
+      # — the run then closed claiming the settled task was still
+      # outstanding. One reminder turn per task, keyed by the
+      # unexercised read grant (typed ground truth, not claim
+      # parsing). Deliberately UNMETERED and epoch-free: this is not a
+      # delivery obligation, so it must not spend delivery grace
+      # credits (a5fe21207) and must not latch
+      # `_background_delivery_grace_active` (e6b071335). The
+      # reminded-once set is the liveness bound: a model that ignores
+      # the reminder finishes on its next stop.
+      unread_handle_reminded_task_ids.update(
+        entry.task_id for entry in unread_handle_entries
+      )
+      # Every delivery obligation is discharged here (no queued
+      # notifications, no omitted payloads), so the live delivery
+      # epoch is over — close it. Left latched, the model's answer to
+      # this reminder could stop at max_tokens/pause, and that
+      # compelled continuation would hit a metered turn with zero
+      # obligations and commit `background_delivery_settled` success
+      # mid-sentence, truncating the very integration the reminder
+      # asked for. A later arriving notification re-latches the epoch
+      # exactly as the first one did.
+      if (
+        delivery_epoch_active
+        and not delivery_epoch_from_max
+        and not self._background_delivery_grace_obligations()
+      ):
+        delivery_epoch_active = False
+      current_messages.append(
+        assistant_turn_message(
+          turn.content_blocks,
+          provider=self._provider.name,
+          model=upstream_model,
+          stop_reason=turn.stop_reason,
+        )
+      )
+      unread_handle_nudge_text = _unread_result_handle_nudge(
+        unread_handle_entries
+      )
+      current_messages.append(
+        user_turn_message(unread_handle_nudge_text)
+      )
+      try:
+        await self._append_durable_event(
+          build_runtime_guard_event(
+            guard="unread_result_handle_nudge",
+            message=unread_handle_nudge_text,
+          )
+        )
+      except Exception as exc:
+        logger.warning(
+          "[%s] reminder record suppressed | exception_type=%s",
+          self._sid,
+          type(exc).__name__,
+        )
+      return finish("continue")
+    if turn.stop_reason == "end_turn":
+      terminal_success_reason = "end_turn"
+    else:
+      terminal_failure = (
+        "terminal_outcome_unproven",
+        "terminal_outcome_unproven: provider turn ended without a "
+        "recognized successful or interrupted terminal disposition.",
+      )
+    return finish("break")
+
+  def _capture_mid_turn_fork_handoff(
+    self,
+    *,
+    current_messages: list[dict[str, Any]],
+    logger: logging.Logger,
+    turn: StreamTurnResult,
+  ) -> None:
+    if any(
+      tool_name == "run_agent"
+      and isinstance(tool_input, dict)
+      and tool_input.get("fork") is True
+      for _, tool_name, tool_input in turn.tool_uses
+    ):
+      self._mid_turn_fork_handoff = None
+      if not fork_credential_identity_available(self):
+        logger.warning(
+          "[%s] Mid-turn fork capture unavailable: no visible "
+          "credential identity",
+          self._sid,
+        )
+      else:
+        try:
+          self._mid_turn_fork_handoff = build_mid_turn_handoff(
+            self,
+            current_messages,
+          )
+        except Exception:
+          logger.warning(
+            "[%s] Mid-turn fork capture failed | failure=true",
+            self._sid,
+          )
+
+  async def _finish_tool_turn(
+    self,
+    *,
+    background_tasks_completed_user_message: Callable[[], Dict[str, Any]],
+    budget_exceeded_state: Callable[
+      [CostAccumulator], BudgetExceededState | None
+    ],
+    build_runtime_guard_event: _BuildRuntimeGuardEvent,
+    current_messages: list[dict[str, Any]],
+    delivery_epoch_active: bool,
+    delivery_epoch_from_max: bool,
+    delivery_turn_compelled: bool,
+    emit_budget_exceeded_stop: Callable[
+      [BudgetExceededState], Awaitable[None]
+    ],
+    exceeded_state: BudgetExceededState | None,
+    logger: logging.Logger,
+    mark_terminal_interruption: Callable[[str], None],
+    max_turns: int | None,
+    model_visible_tool_result_ids: set[str],
+    pending_model_visible_tool_result_ids: set[str],
+    task_state_cls: type[TaskState],
+    terminal_failure: tuple[str, str] | None,
+    terminal_success_reason: str | None,
+    turn: StreamTurnResult,
+    turn_count: int,
+    unread_handle_reminded_task_ids: set[str],
+    user_turn_message: Callable[[Any], Dict[str, Any]],
+  ) -> _ToolTurnOutcome:
+    def finish(action: Literal["break", "continue"]) -> _ToolTurnOutcome:
+      return _ToolTurnOutcome(
+        action=action,
+        delivery_epoch_active=delivery_epoch_active,
+        delivery_turn_compelled=delivery_turn_compelled,
+        exceeded_state=exceeded_state,
+        terminal_failure=terminal_failure,
+        terminal_success_reason=terminal_success_reason,
+      )
+
+    stop_after_tool_results_reason = getattr(self, "_stop_after_tool_results_reason", None)
+    # A terminal tool settlement has already incurred its model-turn cost;
+    # preserve that explicit settlement at this boundary. Other forced-stop
+    # reasons still yield to the budget guard.
+    if stop_after_tool_results_reason not in {
+      "terminal_tool_result",
+      "terminal_tool_failure",
+      "child_report_accepted",
+    }:
+      if self._cost_accumulator is not None:
+        exceeded_state = budget_exceeded_state(self._cost_accumulator) or exceeded_state
+      if exceeded_state is not None:
+        await emit_budget_exceeded_stop(exceeded_state)
+        return finish("break")
+
+    if stop_after_tool_results_reason:
+      stop_after_tool_results_tool_name = getattr(self, "_stop_after_tool_results_tool_name", None)
+      logger.info(
+        "[%s] Stop-after-tool-results requested after %s (%s); ending run without follow-up model turn",
+        self._sid,
+        stop_after_tool_results_tool_name or "tool result",
+        stop_after_tool_results_reason,
+      )
+      if stop_after_tool_results_reason == "terminal_tool_failure":
+        terminal_failure = (
+          "terminal_tool_failure",
+          "terminal_tool_failure: terminal tool returned an "
+          "unrecoverable failure"
+          + (
+            " with status "
+            f"{getattr(self, '_stop_after_tool_results_status', None)!r}"
+            if getattr(
+              self,
+              "_stop_after_tool_results_status",
+              None,
+            )
+            is not None
+            else ""
+          )
+          + ".",
+        )
+      elif stop_after_tool_results_reason == "approval_timeout":
+        terminal_failure = (
+          "approval_timeout",
+          "approval_timeout: approval expired before the user "
+          "answered; a fresh tool call and approval are required.",
+        )
+      elif stop_after_tool_results_reason in {
+        "terminal_tool_result",
+        "child_report_accepted",
+        "accepted_ui_blocks",
+      }:
+        pending_model_visible_tool_result_ids.difference_update(
+          model_visible_tool_result_ids
+        )
+        terminal_success_reason = (
+          f"tool:{stop_after_tool_results_reason}"
+        )
+      else:
+        terminal_failure = (
+          str(stop_after_tool_results_reason),
+          "terminal_outcome_unproven: stop-after-tool-results ended "
+          "without an accepted terminal result "
+          f"({stop_after_tool_results_reason}).",
+        )
+      return finish("break")
+
+    if turn.stop_reason == "end_turn":
+      if (
+        self._background_notifications_enabled
+        and self._notification_queue.pending_count == 0
+        and (
+          self._task_registry.list_tasks(
+            state=task_state_cls.RUNNING
+          )
+          # An unsettled workflow obligation holds the session open
+          # (§5.3, T2-I04).
+          or self._workflow_settlement_obstructed()
+        )
+        and (max_turns is None or turn_count < max_turns)
+      ):
+        await self._wait_for_background_notification()
+        if self._cost_accumulator is not None:
+          exceeded_state = (
+            budget_exceeded_state(self._cost_accumulator)
+            or exceeded_state
+          )
+        if exceeded_state is not None:
+          await emit_budget_exceeded_stop(exceeded_state)
+          return finish("break")
+        if self._operator_pause_requested():
+          logger.info(
+            "[%s] Operator pause requested while awaiting background completion",
+            self._sid,
+          )
+          mark_terminal_interruption("operator_pause")
+          await self._emit_operator_pause_event(
+            "awaiting_background_completion"
+          )
+          return finish("break")
+      if self._notification_queue.pending_count > 0:
+        current_messages.append(
+          background_tasks_completed_user_message()
+        )
+        if max_turns is None:
+          delivery_epoch_active = True
+          delivery_turn_compelled = True
+        return finish("continue")
+      if (
+        getattr(self, "_pending_background_result_acks", {})
+        or _pending_omitted_background_task_ids(self)
+      ):
+        if max_turns is None:
+          delivery_epoch_active = True
+          delivery_turn_compelled = True
+        return finish("continue")
+      if pending_model_visible_tool_result_ids:
+        return finish("continue")
+      unread_handle_entries = [
+        entry
+        for entry in _unread_settled_handle_entries(self)
+        if entry.task_id not in unread_handle_reminded_task_ids
+      ][:_UNREAD_HANDLE_NUDGE_MAX_TASKS]
+      if (
+        unread_handle_entries
+        and not delivery_epoch_from_max
+        and (max_turns is None or turn_count < max_turns)
+      ):
+        # CUR-E2E-08, tools-then-end_turn stop boundary: same one
+        # reminder per task, same unmetered/epoch-free contract, same
+        # turn-budget guard and epoch close-out as the no-tool arm (the
+        # assistant turn is already in current_messages here).
+        unread_handle_reminded_task_ids.update(
+          entry.task_id for entry in unread_handle_entries
+        )
+        if (
+          delivery_epoch_active
+          and not delivery_epoch_from_max
+          and not self._background_delivery_grace_obligations()
+        ):
+          delivery_epoch_active = False
+        unread_handle_nudge_text = _unread_result_handle_nudge(
+          unread_handle_entries
+        )
+        current_messages.append(
+          user_turn_message(unread_handle_nudge_text)
+        )
+        try:
+          await self._append_durable_event(
+            build_runtime_guard_event(
+              guard="unread_result_handle_nudge",
+              message=unread_handle_nudge_text,
+            )
+          )
+        except Exception as exc:
+          logger.warning(
+            "[%s] reminder record suppressed | exception_type=%s",
+            self._sid,
+            type(exc).__name__,
+          )
+        return finish("continue")
+      terminal_success_reason = "end_turn_after_tools"
+      return finish("break")
+    return finish("continue")
+
   async def run(
     self,
     messages: List[Dict[str, Any]],
@@ -680,8 +2813,9 @@ class RunnerRunLoopMixin:
     resume_initial_messages: List[Dict[str, Any]] | None = None,
   ) -> None:
     """Execute the full chat loop and stream events into `EventLog`."""
-    if self._summary_emitted:
-      raise RuntimeError("AgentRunner is single-use; construct a new runner for subsequent runs")
+    _require_fresh_runner(self._summary_emitted)
+    self._stream_started_at = None
+    self._first_text_at = None
     self._background_delivery_grace_active = False
     self._background_ack_recovery_pairs: set[
       tuple[str, int]
@@ -742,7 +2876,11 @@ class RunnerRunLoopMixin:
     max_notifications_per_turn = _runner_attr(
       self, "_MAX_NOTIFICATIONS_PER_TURN", _MAX_NOTIFICATIONS_PER_TURN
     )
-    user_turn_message = _runner_attr(self, "_user_turn_message", _user_turn_message)
+    user_turn_message: Callable[[Any], Dict[str, Any]] = _runner_attr(
+      self,
+      "_user_turn_message",
+      _user_turn_message,
+    )
     format_parent_messages = _runner_attr(
       self, "format_parent_messages_for_model", format_parent_messages_for_model
     )
@@ -796,15 +2934,16 @@ class RunnerRunLoopMixin:
     )
     task_state_cls = _runner_attr(self, "TaskState", TaskState)
     session_drain_state = _runner_attr(self, "_session_drain_state", _session_drain_state)
-    run_interrupted_reason = _runner_attr(self, "_run_interrupted_reason", _run_interrupted_reason)
-    run_detach_reason = _runner_attr(self, "_run_detach_reason", _run_detach_reason)
     was_cancelled = False
     run_error: BaseException | None = None
     clean_detach_reason = "completed"
+    terminal_success_reason: str | None = None
+    self._terminal_closure_event = None
+    self._terminal_closure_receipts = None
+    self._terminal_closure_interruption = None
     learning_receipt_delivery = claim_learning_receipts(self)
     learning_tool_calling_iters = 0
     learning_real_final_response = False
-    terminal_success_reason: str | None = None
     selected_content_committed = not bool(
       getattr(self, "_selected_content_bindings", ())
     )
@@ -812,78 +2951,25 @@ class RunnerRunLoopMixin:
       messages,
       resume_initial_messages,
     )
+    self._run_closure_deferred = True
     try:
       if self._agent_session_log is None:
         self._runner_id = None
         self._last_assistant_message_seq = None
         self._durable_attach_emitted = False
-      if self._agent_session_log is not None:
-        self._runner_id = f"runner_{uuid_module.uuid4().hex}"
-        self._last_durable_seq = 0
-        self._last_assistant_message_seq = None
-        self._durable_attach_emitted = False
-        if self._role == "writer":
-          await self._acquire_writer_lease_and_recover()
-        await self._emit_attach_event()
-        if self._role == "writer":
-          self._write_lease_metadata()
-        if self._role == "sub_agent":
-          await self._materialize_parent_message_consumption_audits()
-        await self._rebuild_task_registry_from_log()
-        if resume_initial_messages is not None:
-          messages = [dict(message) for message in resume_initial_messages]
-        elif self._context_builder is not None:
-          # Autonomous / server-authoritative path: context_builder is the source
-          # of truth; the incoming `messages` carries only the new user turn.
-          prior_messages = await self._context_builder.build()
-          new_user_input = (
-            top_level_user_input
-            if top_level_user_input is not None
-            else last_user_message(messages)
-          )
-          if new_user_input is not None:
-            user_entry = await self._append_user_message_event(
-              new_user_input
-            )
-            selected_content_committed = user_entry is not None
-            if (
-              top_level_user_input is not None
-              and user_entry is None
-            ):
-              raise RuntimeError(
-                "Top-level skill user_message was not durably "
-                "persisted"
-              )
-          messages = prior_messages + ([new_user_input] if new_user_input is not None else [])
-        else:
-          # Durable-log path without a replay policy: preserve caller-provided
-          # messages without injecting prior durable history.
-          new_user_input = (
-            top_level_user_input
-            if top_level_user_input is not None
-            else last_user_message(messages)
-          )
-          if new_user_input is not None:
-            user_entry = await self._append_user_message_event(
-              new_user_input
-            )
-            selected_content_committed = user_entry is not None
-            if (
-              top_level_user_input is not None
-              and user_entry is None
-            ):
-              raise RuntimeError(
-                "Top-level skill user_message was not durably "
-                "persisted"
-              )
-          messages = [dict(message) for message in messages]
-        if top_level_user_input is not None:
-          await self._emit_top_level_skill_started()
-          system_prompt = (
-            await self._prepare_top_level_skill_system_prompt(
-              system_prompt
-            )
-          )
+      else:
+        (
+          messages,
+          system_prompt,
+          selected_content_committed,
+        ) = await self._prepare_run_durable_context(
+          messages,
+          system_prompt,
+          resume_initial_messages=resume_initial_messages,
+          top_level_user_input=top_level_user_input,
+          selected_content_committed=selected_content_committed,
+          runner_id=f"runner_{uuid_module.uuid4().hex}",
+        )
 
       if not selected_content_committed:
         raise RuntimeError(
@@ -997,6 +3083,7 @@ class RunnerRunLoopMixin:
       logger.info("[%s] Chat start | model=%s max_tokens=%d messages=%d", self._sid, upstream_model, max_tokens, len(messages))
 
       chat_t0 = time_module.time()
+      self._stream_started_at = chat_t0
       system_text = system_prompt_estimate_text(system_prompt)
       initial_estimate = token_estimate_snapshot(
         system_text=system_text,
@@ -1020,7 +3107,7 @@ class RunnerRunLoopMixin:
           },
         )
       logger.info(
-        "[%s] Pre-request estimate | system=%d msgs=%d tools=%d total=%d tokens (est)",
+        "[%s] Pre-request estimate | system=%d msgs=%d tools=%d total=%d (chars/4 proxy, not provider tokens)",
         self._sid,
         initial_estimate.est_system_tokens,
         initial_estimate.est_messages_tokens,
@@ -1040,6 +3127,7 @@ class RunnerRunLoopMixin:
       )
       tools_chars = initial_estimate.tools_chars
       usage_totals = empty_usage_totals()
+      estimated_cost = 0.0
       self._last_reported_cost = 0.0
       self._ensure_sub_agent_semaphore()
       turn_count = 0
@@ -1107,7 +3195,9 @@ class RunnerRunLoopMixin:
         clean_detach_reason = reason
         terminal_interruption_reason = reason
 
-      async def emit_budget_exceeded_stop(exceeded_state: Any) -> None:
+      async def emit_budget_exceeded_stop(
+        exceeded_state: BudgetExceededState,
+      ) -> None:
         logger.warning(
           "[%s] Budget exceeded: $%.4f >= $%.4f%s — stopping",
           self._sid,
@@ -1153,6 +3243,13 @@ class RunnerRunLoopMixin:
         await self._emit_interrupted_event(reason)
         await self._close_client(client, timeout=5.0)
 
+      def terminal_assistant_turn_message() -> Dict[str, Any]:
+        return assistant_turn_message(
+          turn.content_blocks,
+          provider=self._provider.name,
+          model=upstream_model,
+          stop_reason=turn.stop_reason,
+        )
       while True:
         if self._operator_pause_requested():
           logger.info("[%s] Operator pause requested before next turn; stopping at safe boundary", self._sid)
@@ -1160,37 +3257,22 @@ class RunnerRunLoopMixin:
           await self._emit_operator_pause_event("before_turn")
           break
 
-        parent_messages: list[ParentMessage] = []
-        if self._message_inbox is not None:
-          while not self._message_inbox.empty():
-            try:
-              parent_messages.append(
-                self._message_inbox.get_nowait()
-              )
-            except queue_empty:
-              break
-        if parent_messages:
-          if (
-            is_child_logical_response
-            and max_tokens_continuation_pending
-          ):
-            # Parent/operator guidance changes the task semantics. The next
-            # provider response is not a continuation of the pre-update
-            # partial, even though that partial ended at max_tokens.
-            reset_logical_response_lineage()
-            max_tokens_continuation_pending = False
-            max_tokens_continuations = 0
-          current_messages.append(user_turn_message(
-            format_parent_messages(parent_messages)
-          ))
-          pending_parent_message_acks.update({
-            (message.task_id, message.sent_seq): message
-            for message in parent_messages
-            if (
-              message.task_id is not None
-              and message.sent_seq is not None
-            )
-          })
+        (
+          max_tokens_continuation_pending,
+          max_tokens_continuations,
+        ) = self._consume_parent_messages(
+          current_messages=current_messages,
+          format_parent_messages=format_parent_messages,
+          is_child_logical_response=is_child_logical_response,
+          max_tokens_continuation_pending=(
+            max_tokens_continuation_pending
+          ),
+          max_tokens_continuations=max_tokens_continuations,
+          pending_parent_message_acks=pending_parent_message_acks,
+          queue_empty=queue_empty,
+          reset_logical_response_lineage=reset_logical_response_lineage,
+          user_turn_message=user_turn_message,
+        )
 
         continuing_provider_segment = (
           is_child_logical_response
@@ -1209,125 +3291,33 @@ class RunnerRunLoopMixin:
           delivery_epoch_from_max = True
           self._background_delivery_grace_active = True
         if delivery_epoch_active:
-          if delivery_grace_credit_limit is None:
-            delivery_grace_credit_limit = (
-              self._background_delivery_grace_credit_limit()
-            )
-          pending_acknowledgements = getattr(
-            self,
-            "_pending_background_result_acks",
-            {},
-          )
-          if isinstance(pending_acknowledgements, dict):
-            for tool_use_id, acknowledgement in list(
-              pending_acknowledgements.items()
-            ):
-              if (
-                not isinstance(acknowledgement, tuple)
-                or len(acknowledgement) != 2
-                or not isinstance(acknowledgement[0], str)
-                or not isinstance(acknowledgement[1], int)
-                or isinstance(acknowledgement[1], bool)
-              ):
-                continue
-              task_id, notification_generation = acknowledgement
-              if acknowledgement in self._background_ack_recovery_pairs:
-                phase = "recovery_acknowledgement"
-              else:
-                phase = "acknowledgement"
-              acknowledgement_obligation = (
-                task_id,
-                notification_generation,
-                phase,
-              )
-              if (
-                phase == "acknowledgement"
-                and acknowledgement_obligation
-                in delivery_grace_credits
-                and delivery_grace_credits[
-                  acknowledgement_obligation
-                ] <= 0
-              ):
-                self._background_ack_recovery_pairs.add(
-                  acknowledgement
-                )
-                for duplicate_id, duplicate in list(
-                  pending_acknowledgements.items()
-                ):
-                  if duplicate == acknowledgement:
-                    pending_acknowledgements.pop(
-                      duplicate_id,
-                      None,
-                    )
-          obligations = self._background_delivery_grace_obligations()
-          if (
-            (
+          (
+            delivery_grace_credit_limit,
+            delivery_grace_credits_granted,
+            model_visible_synthesis_credits_granted,
+            delivery_turn_compelled,
+            metered_delivery_turn,
+            obligations,
+            active_delivery_obligation,
+          ) = self._prepare_delivery_epoch_turn(
+            active_delivery_obligation=active_delivery_obligation,
+            delivery_epoch_from_max=delivery_epoch_from_max,
+            delivery_grace_credit_limit=delivery_grace_credit_limit,
+            delivery_grace_credits=delivery_grace_credits,
+            delivery_grace_credits_granted=(
+              delivery_grace_credits_granted
+            ),
+            delivery_turn_compelled=delivery_turn_compelled,
+            model_visible_synthesis_credits_granted=(
+              model_visible_synthesis_credits_granted
+            ),
+            model_visible_tool_result_generation=(
+              model_visible_tool_result_generation
+            ),
+            pending_model_visible_tool_result_ids=(
               pending_model_visible_tool_result_ids
-              # B-3: at turn exhaustion the synthesis obligation is minted
-              # unconditionally — this is the completion reserve that elicits a
-              # terminal narrative, and without it the honest-partial remap has
-              # no narrative to settle on. Still credit-capped below by the one
-              # synthesis credit and by delivery_grace_credit_limit.
-              or delivery_epoch_from_max
-            )
-            and not obligations
-          ):
-            obligations[
-              (
-                "model_visible_tool_results",
-                model_visible_tool_result_generation,
-                "synthesis",
-              )
-            ] = 1
-          for obligation, requested_credits in obligations.items():
-            if obligation in delivery_grace_credits:
-              continue
-            available_credits = max(
-              0,
-              delivery_grace_credit_limit
-              - delivery_grace_credits_granted,
-            )
-            if obligation[2] == "synthesis":
-              available_credits = min(
-                available_credits,
-                max(
-                  0,
-                  1 - model_visible_synthesis_credits_granted,
-                ),
-              )
-            granted_credits = min(
-              max(0, int(requested_credits)),
-              available_credits,
-            )
-            delivery_grace_credits[obligation] = granted_credits
-            delivery_grace_credits_granted += granted_credits
-            if obligation[2] == "synthesis":
-              model_visible_synthesis_credits_granted += (
-                granted_credits
-              )
-          # Credits count the turns that *cannot* settle a delivery: the
-          # compelled ones, where the loop re-invokes the provider itself
-          # (a continuation the model never completed, or a delivery nudge
-          # after it tried to stop). A completed turn acks what was rendered
-          # to it, so it makes progress on its own and is not charged --
-          # otherwise a parent that legitimately keeps working between
-          # deliveries, which is exactly what a staged fan-out does, spends a
-          # budget sized for draining a queue and dies mid-flight. The frozen
-          # post-`max_turns` epoch stays metered unconditionally: there the
-          # turn budget is already spent and every turn is a delivery turn.
-          metered_delivery_turn = (
-            delivery_epoch_from_max or delivery_turn_compelled
+            ),
           )
-          delivery_turn_compelled = False
-          if metered_delivery_turn:
-            active_delivery_obligation = next(
-              (
-                obligation
-                for obligation in obligations
-                if delivery_grace_credits.get(obligation, 0) > 0
-              ),
-              None,
-            )
           if not metered_delivery_turn:
             active_delivery_obligation = None
           elif active_delivery_obligation is not None:
@@ -1399,49 +3389,19 @@ class RunnerRunLoopMixin:
         turn_t0 = time_module.time()
         turn_t0_mono = time_module.monotonic()
 
-        estimate_snapshot = initial_estimate
-        if turn_count > 1:
-          current_tools = base_kwargs.get("tools") or []
-          turn_estimate = token_estimate_snapshot(
-            system_text=system_text,
-            messages=current_messages,
-            tools=current_tools,
-          )
-          estimate_snapshot = turn_estimate
-          if turn_estimate.est_total_tokens > context_limit * context_warning_pct / 100:
-            logger.warning(
-              "[%s] Context usage high | est=%d tokens (%.0f%% of %dk limit)",
-              self._sid,
-              turn_estimate.est_total_tokens,
-              turn_estimate.est_total_tokens / context_limit * 100,
-              context_limit // 1000,
-              extra={
-                "data": build_context_warning_log_data(
-                  session_id=self._sid,
-                  turn=turn_count,
-                  est_tokens=turn_estimate.est_total_tokens,
-                  context_limit=context_limit,
-                )
-              },
-            )
-          logger.info(
-            "[%s] Turn %d pre-request | est=%d tokens",
-            self._sid,
-            turn_count,
-            turn_estimate.est_total_tokens,
-            extra={
-              "data": build_token_estimate_log_data(
-                session_id=self._sid,
-                turn=turn_count,
-                est_system_tokens=turn_estimate.est_system_tokens,
-                est_messages_tokens=turn_estimate.est_messages_tokens,
-                est_tools_tokens=turn_estimate.est_tools_tokens,
-                est_total_tokens=turn_estimate.est_total_tokens,
-                message_count=turn_estimate.message_count,
-                tool_count=turn_estimate.tool_count,
-              )
-            },
-          )
+        estimate_snapshot = self._log_turn_context_estimate(
+          base_kwargs=base_kwargs,
+          build_context_warning_log_data=build_context_warning_log_data,
+          build_token_estimate_log_data=build_token_estimate_log_data,
+          context_limit=context_limit,
+          context_warning_pct=context_warning_pct,
+          current_messages=current_messages,
+          initial_estimate=initial_estimate,
+          logger=logger,
+          system_text=system_text,
+          token_estimate_snapshot=token_estimate_snapshot,
+          turn_count=turn_count,
+        )
 
         bg_reminder = self._background_task_reminder_text()
         notif_reminder = self._build_notification_reminder()
@@ -1456,7 +3416,9 @@ class RunnerRunLoopMixin:
         # outer turn (the inner request-preparation loop re-sends the same
         # reminder unchanged) and acked at the response boundary that saw
         # it (A-M7, T3-I01).
-        delivered_notifications: list[Any] = list(turn_reminder.delivered)
+        delivered_notifications: list[TaskNotification] = list(
+          turn_reminder.delivered
+        )
         delivered_notifications_recorded = False
         pending_notifications_at_render = (
           self._notification_queue.pending_count
@@ -1466,6 +3428,7 @@ class RunnerRunLoopMixin:
           est_for_compaction = max(est_for_compaction, last_real_stream_input_tokens)
 
         turn_usage_before = usage_snapshot(usage_totals)
+        turn_cost = 0.0
         pending_compaction_block: dict[str, Any] | None = None
         pending_compaction_usage: dict[str, Any] | None = None
         provisional_anchor_message: dict[str, Any] | None = None
@@ -1505,6 +3468,8 @@ class RunnerRunLoopMixin:
           nonlocal pending_compaction_block
           nonlocal pending_compaction_usage
           nonlocal provisional_anchor_message
+          nonlocal estimated_cost
+          nonlocal turn_cost
           compact_result = await maybe_compact_current_messages(
             current_messages,
             self._compaction_instructions,
@@ -1519,6 +3484,15 @@ class RunnerRunLoopMixin:
           )
           if compact_result.summarize_usage is not None:
             _merge_usage_totals(usage_totals, compact_result.summarize_usage)
+            # Compaction is a separate provider request, even when its
+            # tokens share the following turn's accounting payload.
+            compaction_usage_event = self._build_usage_event(
+              model=upstream_model,
+              usage_totals=compact_result.summarize_usage,
+            )
+            estimated_cost += compaction_usage_event.cost_usd
+            turn_cost += compaction_usage_event.cost_usd
+            await self._call_on_usage(compaction_usage_event)
           if compact_result.applied:
             current_messages = compact_result.messages
             _discard_unavailable_background_result_acks(
@@ -1591,235 +3565,56 @@ class RunnerRunLoopMixin:
         request_tool_result_ids: set[str] = set()
         while True:
           usage_before_stream = usage_snapshot(usage_totals)
-          if (
-            bool(getattr(self, "_fork_mode", False))
-            and not bool(
-              getattr(self, "_fork_suffix_ceiling_triggered", False)
-            )
-          ):
-            suffix_messages = fork_suffix_messages(
-              current_messages,
-              getattr(self, "_fork_marker_position"),
-            )
-            suffix_estimate = token_estimate_snapshot(
-              system_text="",
-              messages=suffix_messages,
-              tools=[],
-            )
-            if suffix_estimate.est_messages_tokens > int(
-              getattr(self, "_fork_suffix_max_tokens")
-            ):
-              self._fork_suffix_ceiling_triggered = True
-              fork_suffix_reminder_text = (
-                FORK_SUFFIX_WRAP_UP_REMINDER
-              )
-              max_turns = (
-                turn_count
-                if max_turns is None
-                else min(max_turns, turn_count)
-              )
-          if (
-            active_delivery_obligation is not None
-            and active_delivery_obligation[2]
-            in {"exact_retrieval", "ack_recovery"}
-          ):
-            omitted_nudge_text = _omitted_background_result_nudge(
-              [active_delivery_obligation[0]]
-            )
-            delivery_request_nudge_message = user_turn_message(
-              omitted_nudge_text
-            )
-            current_messages.append(
-              delivery_request_nudge_message
-            )
-
-          combined_reminder = "\n\n".join(
-            part
-            for part in (
-              turn_reminder.text,
-              fork_suffix_reminder_text,
-            )
-            if part
-          )
-          if combined_reminder:
-            provisional_system_prompt = (
-              self._inject_system_prompt_reminder(
-                system_prompt,
-                combined_reminder,
-              )
-            )
-          else:
-            provisional_system_prompt = system_prompt
-          request_estimate = token_estimate_snapshot(
-            system_text=system_prompt_estimate_text(
-              provisional_system_prompt
+          request_preparation = await self._prepare_provider_request(
+            active_delivery_obligation=active_delivery_obligation,
+            admit_provider_request_budget=admit_provider_request_budget,
+            base_kwargs=base_kwargs,
+            build_context_pressure_reminder=build_context_pressure_reminder,
+            build_runtime_guard_event=build_runtime_guard_event,
+            conservative_request_input_token_bound_for_request=(
+              conservative_request_input_token_bound_for_request
             ),
-            messages=current_messages,
-            tools=base_kwargs.get("tools") or [],
-          )
-          context_pressure = context_pressure_reminder_decision(
-            est_tokens=request_estimate.est_total_tokens,
             context_limit=context_limit,
-            next_threshold_pct=getattr(
-              self,
-              "_context_pressure_next_reminder_pct",
-              CONTEXT_PRESSURE_REMINDER_PCT,
+            context_pressure_reminder_decision=(
+              context_pressure_reminder_decision
             ),
-            initial_threshold_pct=CONTEXT_PRESSURE_REMINDER_PCT,
-            step_pct=CONTEXT_PRESSURE_REMINDER_STEP_PCT,
+            current_messages=current_messages,
+            delivered_notifications=delivered_notifications,
+            delivered_notifications_recorded=(
+              delivered_notifications_recorded
+            ),
+            delivery_request_nudge_message=delivery_request_nudge_message,
+            delivery_request_nudge_recorded=(
+              delivery_request_nudge_recorded
+            ),
+            emit_budget_exceeded_stop=emit_budget_exceeded_stop,
+            emit_terminal_failure=emit_terminal_failure,
+            fork_suffix_reminder_text=fork_suffix_reminder_text,
+            logger=logger,
+            max_tokens=max_tokens,
+            max_turns=max_turns,
+            pending_notifications_at_render=(
+              pending_notifications_at_render
+            ),
+            system_prompt=system_prompt,
+            system_prompt_estimate_text=system_prompt_estimate_text,
+            token_estimate_snapshot=token_estimate_snapshot,
+            turn_count=turn_count,
+            turn_reminder=turn_reminder,
+            user_turn_message=user_turn_message,
+            upstream_model=upstream_model,
           )
-          self._context_pressure_next_reminder_pct = (
-            context_pressure.next_threshold_pct
-          )
-          context_pressure_reminder = (
-            build_context_pressure_reminder(
-              pct=context_pressure.reminder_pct,
-            )
-            if context_pressure.reminder_pct is not None
-            else ""
-          )
-          reminder_text = "\n\n".join(
-            filter(
-              None,
-              [
-                context_pressure_reminder,
-                turn_reminder.text,
-                fork_suffix_reminder_text,
-              ],
-            )
-          )
-          if reminder_text:
-            turn_system_prompt = self._inject_system_prompt_reminder(
-              system_prompt,
-              reminder_text,
-            )
-          else:
-            turn_system_prompt = system_prompt
-          try:
-            request_budget_admission = admit_provider_request_budget(
-              self._cost_accumulator,
-              provider=self._provider,
-              model=upstream_model,
-              estimated_input_tokens=(
-                conservative_request_input_token_bound_for_request(
-                  system_text=system_prompt_estimate_text(
-                    turn_system_prompt
-                  ),
-                  messages=current_messages,
-                  tools=base_kwargs.get("tools") or [],
-                )
-              ),
-              requested_max_output_tokens=max_tokens,
-            )
-          except ProviderRequestBudgetError:
-            await emit_terminal_failure(
-              "budget_authority_invalid",
-              "Provider request budget authority could not be verified.",
-            )
+          if request_preparation is None:
             return
-          if request_budget_admission.denied_state is not None:
-            await emit_budget_exceeded_stop(
-              request_budget_admission.denied_state
-            )
-            return
-          request_max_tokens = request_budget_admission.max_output_tokens
-          if request_max_tokens is None:  # pragma: no cover - denied above
-            raise RuntimeError("provider request budget admission is invalid")
-          if request_max_tokens < max_tokens:
-            logger.info(
-              "[%s] Provider max_tokens capped by remaining cost authority | requested=%d capped=%d",
-              self._sid,
-              max_tokens,
-              request_max_tokens,
-            )
-          if self._context_capture is not None:
-            surfaces = self._context_surface_records()
-            try:
-              system_prompt_hash = await asyncio.to_thread(
-                self._context_capture.persist,
-                surfaces=surfaces,
-                rendered_system_prompt=turn_system_prompt,
-              )
-              digest = canonical_manifest_digest(
-                surfaces,
-                system_prompt_hash,
-              )
-              if digest != self._last_context_manifest_digest:
-                manifest_event = build_context_manifest_event(
-                  surfaces=surfaces,
-                  system_prompt_hash=system_prompt_hash,
-                  session_id=self._full_session_id,
-                  request_id=self._request_id,
-                  turn=turn_count,
-                )
-                await self._append_durable_event(manifest_event)
-                self._append(manifest_event)
-                self._last_context_manifest_digest = digest
-            except Exception as exc:
-              logger.warning(
-                "[%s] context capture failed; manifest suppressed | exception_type=%s",
-                self._sid,
-                type(exc).__name__,
-              )
-          if delivered_notifications and not delivered_notifications_recorded:
-            # Durable render record (CUR-E2E-08 observability): which
-            # request boundary showed each queued notification to the
-            # model. Identifiers only — the notification's summary/payload
-            # is untrusted child content and stays out of unsanitized
-            # event fields. Durable-only, like context_manifest: never on
-            # the client wire, ignored by every fold. Sits after budget
-            # admission so the record means "carried by an issued request";
-            # a request the provider failed to process can still leave a
-            # record whose notifications were never acked, so forensics
-            # dedupe by (task_id, notification_generation). Observability
-            # never vetoes work: append failures are logged and suppressed.
-            delivered_notifications_recorded = True
-            try:
-              await self._append_durable_event({
-                "type": "background_notifications_rendered",
-                "turn": turn_count,
-                "request_id": self._request_id,
-                "pending_count": pending_notifications_at_render,
-                "notifications": [
-                  {
-                    "task_id": str(getattr(notification, "task_id", "")),
-                    "notification_generation": getattr(
-                      notification, "notification_generation", None
-                    ),
-                    "event": str(getattr(notification, "event", "")),
-                  }
-                  for notification in delivered_notifications
-                ],
-              })
-            except Exception as exc:
-              logger.warning(
-                "[%s] notification render record suppressed | exception_type=%s",
-                self._sid,
-                type(exc).__name__,
-              )
-          if (
-            delivery_request_nudge_message is not None
-            and not delivery_request_nudge_recorded
-          ):
-            # The matching durable record for the request-scoped delivery
-            # nudge — emitted here, after budget admission, so it attests a
-            # nudge an issued request actually carried.
-            delivery_request_nudge_recorded = True
-            try:
-              await self._append_durable_event(
-                build_runtime_guard_event(
-                  guard="omitted_background_result_nudge",
-                  message=str(
-                    (delivery_request_nudge_message.get("content") or "")
-                  ),
-                )
-              )
-            except Exception as exc:
-              logger.warning(
-                "[%s] delivery nudge record suppressed | exception_type=%s",
-                self._sid,
-                type(exc).__name__,
-              )
+          (
+            max_turns,
+            fork_suffix_reminder_text,
+            delivery_request_nudge_message,
+            turn_system_prompt,
+            request_max_tokens,
+            delivered_notifications_recorded,
+            delivery_request_nudge_recorded,
+          ) = request_preparation
           request_tool_result_ids = _tool_result_ids(current_messages)
           turn_result = await self._stream_turn(
             client=client,
@@ -1882,6 +3677,20 @@ class RunnerRunLoopMixin:
           break
 
         client, turn = turn_result
+        durable_assistant_projection = sanitize_tool_event(
+          {
+            "type": "assistant_message",
+            "content_blocks": _assistant_content_blocks_for_persistence(
+              self._dispatcher,
+              turn.content_blocks,
+            ),
+          },
+          sink="durable_event",
+          boundary=getattr(self, "_secret_boundary", None),
+        )
+        durable_assistant_content_blocks = list(
+          durable_assistant_projection.get("content_blocks") or []
+        )
         assistant_projection = sanitize_tool_event(
           {
             "type": "assistant_message",
@@ -1899,6 +3708,10 @@ class RunnerRunLoopMixin:
         if pending_compaction_block is not None:
           remove_current_message(provisional_anchor_message)
           turn.content_blocks.insert(0, pending_compaction_block)
+          durable_assistant_content_blocks.insert(
+            0,
+            copy.deepcopy(pending_compaction_block),
+          )
           pending_compaction_block = None
 
         turn_usage_state = usage_delta_state(turn_usage_before, usage_totals)
@@ -1912,19 +3725,27 @@ class RunnerRunLoopMixin:
         )
         if real_stream_input > 0:
           last_real_stream_input_tokens = real_stream_input
+        if stream_usage_state.has_tokens:
+          stream_usage_event = self._build_usage_event(
+            model=upstream_model, usage_totals=stream_usage,
+          )
+          estimated_cost += stream_usage_event.cost_usd
+          turn_cost += stream_usage_event.cost_usd
+          await self._call_on_usage(stream_usage_event)
         turn_usage_payload = turn_usage_payload_fn(turn_usage)
         if turn_usage_state.has_tokens:
-          turn_cost = self._estimate_usage_cost(upstream_model, turn_usage)
-          turn_usage_payload = turn_usage_payload_fn(turn_usage, estimated_cost=turn_cost.total)
-          await self._call_on_usage(self._build_usage_event(model=upstream_model, usage_totals=turn_usage))
+          turn_usage_payload = turn_usage_payload_fn(turn_usage, estimated_cost=turn_cost)
         assistant_message_persisted = False
+        persisted_segment_ordinal = logical_response_segment_ordinal
 
-        async def persist_assistant_message_once() -> None:
+        async def persist_assistant_message_once() -> int:
           nonlocal assistant_message_persisted
+          nonlocal persisted_segment_ordinal
           nonlocal logical_response_segment_ordinal
           nonlocal logical_response_previous_event_seq
           if assistant_message_persisted:
-            return
+            return persisted_segment_ordinal
+          persisted_segment_ordinal = logical_response_segment_ordinal
           workflow_output_attachments = (
             list(self._pending_workflow_output_attachments.values())
             if (
@@ -1934,7 +3755,7 @@ class RunnerRunLoopMixin:
             else None
           )
           entry = await self._append_assistant_message_event(
-            content_blocks=turn.content_blocks,
+            content_blocks=durable_assistant_content_blocks,
             stop_reason=turn.stop_reason,
             model=upstream_model,
             usage=turn_usage_payload,
@@ -1976,6 +3797,7 @@ class RunnerRunLoopMixin:
               self,
               consumed_tool_result_ids=request_tool_result_ids,
             )
+          return persisted_segment_ordinal
 
         self._append(build_turn_complete_event(turn=turn_count, usage=turn_usage_payload))
 
@@ -2009,10 +3831,9 @@ class RunnerRunLoopMixin:
         )
 
         if self._cost_accumulator is not None:
-          running_cost = self._estimate_usage_cost(upstream_model, usage_totals)
           budget_progress = budget_cost_progress(
             self._cost_accumulator,
-            running_total=running_cost.total,
+            running_total=estimated_cost,
             last_reported_cost=self._last_reported_cost,
           )
           self._last_reported_cost = budget_progress.last_reported_cost
@@ -2037,275 +3858,54 @@ class RunnerRunLoopMixin:
           break
 
         if not turn.tool_uses:
-          if turn.stop_reason == "end_turn" and bool(turn.full_text.strip()):
-            learning_real_final_response = True
-          await persist_assistant_message_once()
-          if exceeded_state is not None:
-            await emit_budget_exceeded_stop(exceeded_state)
-            break
-          if self._operator_pause_requested():
-            logger.info("[%s] Operator pause requested after turn; stopping before tool dispatch", self._sid)
-            mark_terminal_interruption("operator_pause")
-            await self._emit_operator_pause_event("after_turn_before_tools")
-            break
-          no_tool_outcome = no_tool_use_turn_outcome(
-            content_blocks=turn.content_blocks,
-            provider=self._provider.name,
-            model=upstream_model,
-            stop_reason=turn.stop_reason,
-            pending_notification_count=0,
-            max_tokens_continuations=max_tokens_continuations,
-            max_tokens_max_attempts=max_tokens_continuations_limit,
-            max_tokens_nudge=max_tokens_nudge,
-            unbounded_max_tokens_continuations=(
-              is_child_logical_response
+          no_tool_turn = await self._handle_no_tool_turn(
+            assistant_turn_message=assistant_turn_message,
+            budget_exceeded_state=budget_exceeded_state,
+            background_tasks_completed_user_message=(
+              background_tasks_completed_user_message
             ),
+            build_runtime_guard_event=build_runtime_guard_event,
+            current_messages=current_messages,
+            delivered_notifications=delivered_notifications,
+            delivery_epoch_active=delivery_epoch_active,
+            delivery_epoch_from_max=delivery_epoch_from_max,
+            delivery_turn_compelled=delivery_turn_compelled,
+            emit_budget_exceeded_stop=emit_budget_exceeded_stop,
+            exceeded_state=exceeded_state,
+            is_child_logical_response=is_child_logical_response,
+            learning_real_final_response=learning_real_final_response,
+            logger=logger,
+            mark_terminal_interruption=mark_terminal_interruption,
+            max_tokens_continuation_pending=max_tokens_continuation_pending,
+            max_tokens_continuations=max_tokens_continuations,
+            max_tokens_continuations_limit=max_tokens_continuations_limit,
+            max_tokens_nudge=max_tokens_nudge,
+            max_turns=max_turns,
+            no_tool_use_turn_outcome=no_tool_use_turn_outcome,
+            persist_assistant_message_once=persist_assistant_message_once,
+            task_state_cls=task_state_cls,
+            terminal_failure=terminal_failure,
+            terminal_success_reason=terminal_success_reason,
+            turn=turn,
+            turn_count=turn_count,
+            unread_handle_reminded_task_ids=unread_handle_reminded_task_ids,
+            upstream_model=upstream_model,
+            user_turn_message=user_turn_message,
           )
-          max_tokens_continuations = no_tool_outcome.max_tokens_continuations
-          if turn.stop_reason == "pause_turn":
-            logger.info("[%s] Pause turn — continuing", self._sid)
-          elif turn.stop_reason == "compaction":
-            logger.info("[%s] Compaction pause — continuing", self._sid)
-          elif no_tool_outcome.reason == "max_tokens_continue":
-            if is_child_logical_response:
-              logger.warning(
-                "[%s] Turn %d logical response segment %d hit "
-                "max_tokens; continuing provider transport",
-                self._sid,
-                turn_count,
-                logical_response_segment_ordinal,
-              )
-              max_tokens_continuation_pending = True
-            else:
-              logger.warning(
-                "[%s] Turn %d hit max_tokens with no usable tool call; continuing with truncation nudge (%d/%d)",
-                self._sid,
-                turn_count,
-                max_tokens_continuations,
-                max_tokens_continuations_limit,
-              )
-          elif no_tool_outcome.reason == "max_tokens_terminal":
-            logger.error(
-              "[%s] Turn %d hit max_tokens with no usable tool call after %d continuation attempts; ending run",
-              self._sid,
-              turn_count,
-              max_tokens_continuations_limit,
-            )
-            terminal_failure = (
-              "max_tokens_exhausted",
-              "provider_turn_error: provider exhausted the bounded "
-              "max_tokens continuation attempts before completing the turn.",
-            )
-          if no_tool_outcome.runtime_guard is not None:
-            guard, message = no_tool_outcome.runtime_guard
-            self._append(build_runtime_guard_event(guard=guard, message=message))
-          if no_tool_outcome.action == "continue":
-            current_messages.extend(no_tool_outcome.messages)
-            # The pause/compaction/max_tokens arm cannot ack (D-A7-1): it
-            # re-invokes the provider on a turn the model never completed, so
-            # nothing discharges an outstanding delivery. These are the turns
-            # the bounded credits exist to count.
-            delivery_turn_compelled = True
-            continue
-          if terminal_failure is not None:
-            break
-          delivery_follow_up_allowed = turn.stop_reason in {
-            "end_turn",
-            "tool_use",
-          }
-          # Ack follows delivery: this response consumed the reminder that
-          # rendered `delivered_notifications`, so the model has seen them
-          # (A-M7, T3-I01). Reached only on a completed model turn — the
-          # `error` arm broke earlier at `terminal_failure`, and the
-          # pause/compaction/max_tokens continuation arm `continue`d above
-          # (D-A7-1).
-          if delivered_notifications:
-            self._ack_delivered_notifications(delivered_notifications)
-            delivered_notifications = []
-          if (
-            turn.stop_reason == "end_turn"
-            and self._background_notifications_enabled
-            and self._notification_queue.pending_count == 0
-            and (
-              self._task_registry.list_tasks(
-                state=task_state_cls.RUNNING
-              )
-              # An unsettled workflow obligation holds the session open
-              # (§5.3, T2-I04): a parked or authoring run has no RUNNING
-              # registry task.
-              or self._workflow_settlement_obstructed()
-            )
-            and (max_turns is None or turn_count < max_turns)
-          ):
-            await self._wait_for_background_notification()
-            if self._cost_accumulator is not None:
-              exceeded_state = (
-                budget_exceeded_state(self._cost_accumulator)
-                or exceeded_state
-              )
-            if exceeded_state is not None:
-              await emit_budget_exceeded_stop(exceeded_state)
-              break
-            if self._operator_pause_requested():
-              logger.info(
-                "[%s] Operator pause requested while awaiting background completion",
-                self._sid,
-              )
-              mark_terminal_interruption("operator_pause")
-              await self._emit_operator_pause_event(
-                "awaiting_background_completion"
-              )
-              break
-          if (
-            delivery_follow_up_allowed
-            and self._notification_queue.pending_count > 0
-          ):
-            current_messages.append(
-              assistant_turn_message(
-                turn.content_blocks,
-                provider=self._provider.name,
-                model=upstream_model,
-                stop_reason=turn.stop_reason,
-              )
-            )
-            current_messages.append(
-              background_tasks_completed_user_message()
-            )
-            # Metering the delivery turns is all this arm does. It must NOT
-            # latch `_background_delivery_grace_active`: that flag closes
-            # admission of new background tasks and says so in words the run
-            # would be lying about here ("past its normal turn limit" — this
-            # arm runs precisely when `max_turns is None`). Latching it on the
-            # first arriving notification made staged fan-out impossible: a
-            # parent that dispatches its next track once a slot frees had that
-            # dispatch rejected, and did the work inline instead until the
-            # delivery credits ran out. Only the post-`max_turns` epoch and the
-            # end of the loop close admission.
-            if max_turns is None:
-              delivery_epoch_active = True
-              delivery_turn_compelled = True
-            continue
-          pending_omitted_task_ids = (
-            _pending_omitted_background_task_ids(self)
+          delivery_epoch_active = no_tool_turn.delivery_epoch_active
+          delivery_turn_compelled = no_tool_turn.delivery_turn_compelled
+          delivered_notifications = no_tool_turn.delivered_notifications
+          learning_real_final_response = (
+            no_tool_turn.learning_real_final_response
           )
-          if (
-            delivery_follow_up_allowed
-            and pending_omitted_task_ids
-          ):
-            current_messages.append(
-              assistant_turn_message(
-                turn.content_blocks,
-                provider=self._provider.name,
-                model=upstream_model,
-                stop_reason=turn.stop_reason,
-              )
-            )
-            omitted_nudge_text = _omitted_background_result_nudge(
-              pending_omitted_task_ids
-            )
-            current_messages.append(
-              user_turn_message(omitted_nudge_text)
-            )
-            try:
-              await self._append_durable_event(
-                build_runtime_guard_event(
-                  guard="omitted_background_result_nudge",
-                  message=omitted_nudge_text,
-                )
-              )
-            except Exception as exc:
-              logger.warning(
-                "[%s] delivery nudge record suppressed | exception_type=%s",
-                self._sid,
-                type(exc).__name__,
-              )
-            if max_turns is None:
-              delivery_epoch_active = True
-              delivery_turn_compelled = True
+          max_tokens_continuation_pending = (
+            no_tool_turn.max_tokens_continuation_pending
+          )
+          max_tokens_continuations = no_tool_turn.max_tokens_continuations
+          terminal_failure = no_tool_turn.terminal_failure
+          terminal_success_reason = no_tool_turn.terminal_success_reason
+          if no_tool_turn.action == "continue":
             continue
-          unread_handle_entries = [
-            entry
-            for entry in _unread_settled_handle_entries(self)
-            if entry.task_id not in unread_handle_reminded_task_ids
-          ][:_UNREAD_HANDLE_NUDGE_MAX_TASKS]
-          if (
-            delivery_follow_up_allowed
-            and unread_handle_entries
-            and not delivery_epoch_from_max
-            # The reminder must never consume the run's LAST budgeted turn:
-            # crossing `max_turns` here would latch the from-max epoch and
-            # `_background_delivery_grace_active`, spend the synthesis
-            # credit, and turn an obeying model's read into a
-            # `max_turns_reached` interruption. On a bounded run whose
-            # finish lands on the limit, the reminder yields (fail-open).
-            and (max_turns is None or turn_count < max_turns)
-          ):
-            # CUR-E2E-08: the delivery contract ended at "rendered once and
-            # acked", and a handle-shaped result whose notification landed
-            # while the model was firefighting another child was never read
-            # — the run then closed claiming the settled task was still
-            # outstanding. One reminder turn per task, keyed by the
-            # unexercised read grant (typed ground truth, not claim
-            # parsing). Deliberately UNMETERED and epoch-free: this is not a
-            # delivery obligation, so it must not spend delivery grace
-            # credits (a5fe21207) and must not latch
-            # `_background_delivery_grace_active` (e6b071335). The
-            # reminded-once set is the liveness bound: a model that ignores
-            # the reminder finishes on its next stop.
-            unread_handle_reminded_task_ids.update(
-              entry.task_id for entry in unread_handle_entries
-            )
-            # Every delivery obligation is discharged here (no queued
-            # notifications, no omitted payloads), so the live delivery
-            # epoch is over — close it. Left latched, the model's answer to
-            # this reminder could stop at max_tokens/pause, and that
-            # compelled continuation would hit a metered turn with zero
-            # obligations and commit `background_delivery_settled` success
-            # mid-sentence, truncating the very integration the reminder
-            # asked for. A later arriving notification re-latches the epoch
-            # exactly as the first one did.
-            if (
-              delivery_epoch_active
-              and not delivery_epoch_from_max
-              and not self._background_delivery_grace_obligations()
-            ):
-              delivery_epoch_active = False
-            current_messages.append(
-              assistant_turn_message(
-                turn.content_blocks,
-                provider=self._provider.name,
-                model=upstream_model,
-                stop_reason=turn.stop_reason,
-              )
-            )
-            unread_handle_nudge_text = _unread_result_handle_nudge(
-              unread_handle_entries
-            )
-            current_messages.append(
-              user_turn_message(unread_handle_nudge_text)
-            )
-            try:
-              await self._append_durable_event(
-                build_runtime_guard_event(
-                  guard="unread_result_handle_nudge",
-                  message=unread_handle_nudge_text,
-                )
-              )
-            except Exception as exc:
-              logger.warning(
-                "[%s] reminder record suppressed | exception_type=%s",
-                self._sid,
-                type(exc).__name__,
-              )
-            continue
-          if turn.stop_reason == "end_turn":
-            terminal_success_reason = "end_turn"
-          else:
-            terminal_failure = (
-              "terminal_outcome_unproven",
-              "terminal_outcome_unproven: provider turn ended without a "
-              "recognized successful or interrupted terminal disposition.",
-            )
           break
 
         await persist_assistant_message_once()
@@ -2326,30 +3926,11 @@ class RunnerRunLoopMixin:
             stop_reason=turn.stop_reason,
           )
         )
-        if any(
-          tool_name == "run_agent"
-          and isinstance(tool_input, dict)
-          and tool_input.get("fork") is True
-          for _, tool_name, tool_input in turn.tool_uses
-        ):
-          self._mid_turn_fork_handoff = None
-          if not fork_credential_identity_available(self):
-            logger.warning(
-              "[%s] Mid-turn fork capture unavailable: no visible "
-              "credential identity",
-              self._sid,
-            )
-          else:
-            try:
-              self._mid_turn_fork_handoff = build_mid_turn_handoff(
-                self,
-                current_messages,
-              )
-            except Exception:
-              logger.warning(
-                "[%s] Mid-turn fork capture failed | failure=true",
-                self._sid,
-              )
+        self._capture_mid_turn_fork_handoff(
+          current_messages=current_messages,
+          logger=logger,
+          turn=turn,
+        )
 
         tool_loop = await execute_tool_use_loop(
           turn.tool_uses,
@@ -2397,170 +3978,41 @@ class RunnerRunLoopMixin:
             model_visible_tool_result_ids
           )
 
-        stop_after_tool_results_reason = getattr(self, "_stop_after_tool_results_reason", None)
-        # A terminal tool settlement has already incurred its model-turn cost;
-        # preserve that explicit settlement at this boundary. Other forced-stop
-        # reasons still yield to the budget guard.
-        if stop_after_tool_results_reason not in {
-          "terminal_tool_result",
-          "terminal_tool_failure",
-          "child_report_accepted",
-        }:
-          if self._cost_accumulator is not None:
-            exceeded_state = budget_exceeded_state(self._cost_accumulator) or exceeded_state
-          if exceeded_state is not None:
-            await emit_budget_exceeded_stop(exceeded_state)
-            break
-
-        if stop_after_tool_results_reason:
-          stop_after_tool_results_tool_name = getattr(self, "_stop_after_tool_results_tool_name", None)
-          logger.info(
-            "[%s] Stop-after-tool-results requested after %s (%s); ending run without follow-up model turn",
-            self._sid,
-            stop_after_tool_results_tool_name or "tool result",
-            stop_after_tool_results_reason,
-          )
-          if stop_after_tool_results_reason == "terminal_tool_failure":
-            terminal_failure = (
-              "terminal_tool_failure",
-              "terminal_tool_failure: terminal tool returned an "
-              "unrecoverable failure"
-              + (
-                " with status "
-                f"{getattr(self, '_stop_after_tool_results_status', None)!r}"
-                if getattr(
-                  self,
-                  "_stop_after_tool_results_status",
-                  None,
-                )
-                is not None
-                else ""
-              )
-              + ".",
-            )
-          elif stop_after_tool_results_reason == "approval_timeout":
-            terminal_failure = (
-              "approval_timeout",
-              "approval_timeout: approval expired before the user "
-              "answered; a fresh tool call and approval are required.",
-            )
-          elif stop_after_tool_results_reason in {
-            "terminal_tool_result",
-            "child_report_accepted",
-            "accepted_ui_blocks",
-          }:
-            pending_model_visible_tool_result_ids.difference_update(
-              model_visible_tool_result_ids
-            )
-            terminal_success_reason = (
-              f"tool:{stop_after_tool_results_reason}"
-            )
-          else:
-            terminal_failure = (
-              str(stop_after_tool_results_reason),
-              "terminal_outcome_unproven: stop-after-tool-results ended "
-              "without an accepted terminal result "
-              f"({stop_after_tool_results_reason}).",
-            )
-          break
-
-        if turn.stop_reason == "end_turn":
-          if (
-            self._background_notifications_enabled
-            and self._notification_queue.pending_count == 0
-            and (
-              self._task_registry.list_tasks(
-                state=task_state_cls.RUNNING
-              )
-              # An unsettled workflow obligation holds the session open
-              # (§5.3, T2-I04).
-              or self._workflow_settlement_obstructed()
-            )
-            and (max_turns is None or turn_count < max_turns)
-          ):
-            await self._wait_for_background_notification()
-            if self._cost_accumulator is not None:
-              exceeded_state = (
-                budget_exceeded_state(self._cost_accumulator)
-                or exceeded_state
-              )
-            if exceeded_state is not None:
-              await emit_budget_exceeded_stop(exceeded_state)
-              break
-            if self._operator_pause_requested():
-              logger.info(
-                "[%s] Operator pause requested while awaiting background completion",
-                self._sid,
-              )
-              mark_terminal_interruption("operator_pause")
-              await self._emit_operator_pause_event(
-                "awaiting_background_completion"
-              )
-              break
-          if self._notification_queue.pending_count > 0:
-            current_messages.append(
-              background_tasks_completed_user_message()
-            )
-            if max_turns is None:
-              delivery_epoch_active = True
-              delivery_turn_compelled = True
-            continue
-          if (
-            getattr(self, "_pending_background_result_acks", {})
-            or _pending_omitted_background_task_ids(self)
-          ):
-            if max_turns is None:
-              delivery_epoch_active = True
-              delivery_turn_compelled = True
-            continue
-          if pending_model_visible_tool_result_ids:
-            continue
-          unread_handle_entries = [
-            entry
-            for entry in _unread_settled_handle_entries(self)
-            if entry.task_id not in unread_handle_reminded_task_ids
-          ][:_UNREAD_HANDLE_NUDGE_MAX_TASKS]
-          if (
-            unread_handle_entries
-            and not delivery_epoch_from_max
-            and (max_turns is None or turn_count < max_turns)
-          ):
-            # CUR-E2E-08, tools-then-end_turn stop boundary: same one
-            # reminder per task, same unmetered/epoch-free contract, same
-            # turn-budget guard and epoch close-out as the no-tool arm (the
-            # assistant turn is already in current_messages here).
-            unread_handle_reminded_task_ids.update(
-              entry.task_id for entry in unread_handle_entries
-            )
-            if (
-              delivery_epoch_active
-              and not delivery_epoch_from_max
-              and not self._background_delivery_grace_obligations()
-            ):
-              delivery_epoch_active = False
-            unread_handle_nudge_text = _unread_result_handle_nudge(
-              unread_handle_entries
-            )
-            current_messages.append(
-              user_turn_message(unread_handle_nudge_text)
-            )
-            try:
-              await self._append_durable_event(
-                build_runtime_guard_event(
-                  guard="unread_result_handle_nudge",
-                  message=unread_handle_nudge_text,
-                )
-              )
-            except Exception as exc:
-              logger.warning(
-                "[%s] reminder record suppressed | exception_type=%s",
-                self._sid,
-                type(exc).__name__,
-              )
-            continue
-          terminal_success_reason = "end_turn_after_tools"
-          break
-
+        tool_turn = await self._finish_tool_turn(
+          background_tasks_completed_user_message=(
+            background_tasks_completed_user_message
+          ),
+          budget_exceeded_state=budget_exceeded_state,
+          build_runtime_guard_event=build_runtime_guard_event,
+          current_messages=current_messages,
+          delivery_epoch_active=delivery_epoch_active,
+          delivery_epoch_from_max=delivery_epoch_from_max,
+          delivery_turn_compelled=delivery_turn_compelled,
+          emit_budget_exceeded_stop=emit_budget_exceeded_stop,
+          exceeded_state=exceeded_state,
+          logger=logger,
+          mark_terminal_interruption=mark_terminal_interruption,
+          max_turns=max_turns,
+          model_visible_tool_result_ids=model_visible_tool_result_ids,
+          pending_model_visible_tool_result_ids=(
+            pending_model_visible_tool_result_ids
+          ),
+          task_state_cls=task_state_cls,
+          terminal_failure=terminal_failure,
+          terminal_success_reason=terminal_success_reason,
+          turn=turn,
+          turn_count=turn_count,
+          unread_handle_reminded_task_ids=unread_handle_reminded_task_ids,
+          user_turn_message=user_turn_message,
+        )
+        delivery_epoch_active = tool_turn.delivery_epoch_active
+        delivery_turn_compelled = tool_turn.delivery_turn_compelled
+        exceeded_state = tool_turn.exceeded_state
+        terminal_failure = tool_turn.terminal_failure
+        terminal_success_reason = tool_turn.terminal_success_reason
+        if tool_turn.action == "continue":
+          continue
+        break
       self._background_delivery_grace_active = True
       if terminal_failure is not None:
         await emit_terminal_failure(*terminal_failure)
@@ -2586,471 +4038,42 @@ class RunnerRunLoopMixin:
           "results.",
         )
         return
-      terminal_snapshot_before: tuple[Any, ...] | None = None
-      staged_terminal_events: list[dict[str, Any]] = []
-      top_level_result_event: dict[str, Any] | None = None
-      if terminal_success_reason is not None:
-        (
-          terminal_blockers,
-          terminal_snapshot_before,
-        ) = _background_success_snapshot(self)
-        if terminal_blockers:
-          await emit_terminal_failure(
-            "background_delivery_incomplete",
-            "background_delivery_incomplete: successful completion was "
-            "refused while background work or result delivery remained "
-            f"unsettled ({', '.join(terminal_blockers)}).",
-          )
-          return
 
-      total_elapsed = time_module.time() - chat_t0
-      cache_status = usage_cache_status(usage_totals)
-      cost = self._estimate_usage_cost(upstream_model, usage_totals)
-      completion_event = build_stream_complete_event(
+      await self._prepare_terminal_run(
+        terminal_assistant_turn_message=terminal_assistant_turn_message,
+        build_chat_done_log_data=build_chat_done_log_data,
+        build_stream_complete_event=build_stream_complete_event,
+        chat_t0=chat_t0,
+        client=client,
+        current_messages=current_messages,
+        emit_terminal_failure=emit_terminal_failure,
+        initial_estimate=initial_estimate,
+        logger=logger,
+        terminal_interruption_reason=terminal_interruption_reason,
+        terminal_success_reason=terminal_success_reason,
+        time_module=time_module,
+        tools_used=tools_used,
+        turn_count=turn_count,
+        estimated_cost=estimated_cost,
+        usage_cache_status=usage_cache_status,
         usage_totals=usage_totals,
-        estimated_cost=cost.total,
       )
-      terminal_event = completion_event
-      if terminal_interruption_reason is not None:
-        terminal_event["terminal_disposition"] = "interrupted"
-        terminal_event["reason"] = terminal_interruption_reason
-      if terminal_success_reason is not None:
-        # Success hooks may derive durable receipts from the proposed terminal
-        # event. Stage those receipts until the post-hook settlement snapshot
-        # proves that the proposal is still current.
-        self._terminal_success_staged_events = staged_terminal_events
-      terminal_hook_error: Exception | None = None
-      terminal_result_mismatch: str | None = None
-      try:
-        await self._call_on_before_stream_complete(terminal_event)
-        if terminal_success_reason is not None:
-          top_level_result_event = (
-            await self._prepare_top_level_skill_result(
-              terminal_event
-            )
-          )
-          if (
-            top_level_result_event is not None
-            and (
-              top_level_result_event.get("exit_code") != 0
-              or top_level_result_event.get("outcome") != "success"
-            )
-          ):
-            terminal_result_mismatch = (
-              "top_level_skill_result_terminal_mismatch: successful "
-              "terminal proposal produced a non-success canonical "
-              "skill result "
-              f"(exit_code={top_level_result_event.get('exit_code')!r}, "
-              f"outcome={top_level_result_event.get('outcome')!r})."
-            )
-      except Exception as exc:
-        terminal_hook_error = exc
-      finally:
-        if terminal_success_reason is not None:
-          self._terminal_success_staged_events = None
-
-      # Operator ruling 2026-08-03: session-log bookkeeping never vetoes
-      # completed work. The durable record is a JSON log behind a lock; a
-      # settlement-hook or projection problem is a diary problem — warn and
-      # deliver the run's real result. (Previously these two branches
-      # rewrote the terminal as a failure and discarded the staged events,
-      # which converted the first-ever completed interactive pipeline drain
-      # into a reported failure and destroyed the original record.)
-      if terminal_hook_error is not None:
-        log.warning(
-          "terminal settlement hook failed (%s: %s) — proceeding with the "
-          "run's real result; bookkeeping never vetoes completed work",
-          type(terminal_hook_error).__name__,
-          terminal_hook_error,
-        )
-      if terminal_result_mismatch is not None:
-        log.warning(
-          "%s — proceeding with the run's real result; bookkeeping never "
-          "vetoes completed work",
-          terminal_result_mismatch,
-        )
-
-      if terminal_success_reason is not None:
-        # The hook above is the last yielding operation before committing
-        # success. Require both quiescence and identity equality: a generation
-        # that was published and drained during the hook is still a change.
-        (
-          terminal_blockers,
-          terminal_snapshot_after,
-        ) = _background_success_snapshot(self)
-        if (
-          terminal_blockers
-          or terminal_snapshot_after != terminal_snapshot_before
-        ):
-          staged_terminal_events.clear()
-          changed_suffix = (
-            "state changed"
-            if terminal_snapshot_after != terminal_snapshot_before
-            else "state remained unsettled"
-          )
-          await emit_terminal_failure(
-            "background_delivery_incomplete",
-            "background_delivery_incomplete: successful completion was "
-            "refused because background work or result delivery "
-            f"{changed_suffix} at the terminal boundary"
-            + (
-              f" ({', '.join(terminal_blockers)})."
-              if terminal_blockers
-              else "."
-            ),
-          )
-          return
-
-        if (
-          getattr(
-            self,
-            "_last_request_message_marker_position",
-            None,
-          )
-          is not None
-        ):
-          self._post_turn_fork_handoff = None
-          if not fork_credential_identity_available(self):
-            if not getattr(
-              self,
-              "_post_turn_fork_identity_unavailable_logged",
-              False,
-            ):
-              logger.info(
-                "[%s] Post-turn fork capture unavailable: no visible "
-                "credential identity (session_id=%s)",
-                self._sid,
-                self._full_session_id,
-              )
-              self._post_turn_fork_identity_unavailable_logged = True
-          else:
-            try:
-              self._post_turn_fork_handoff = build_post_turn_handoff(
-                self,
-                current_messages,
-                assistant_turn_message(
-                  turn.content_blocks,
-                  provider=self._provider.name,
-                  model=upstream_model,
-                  stop_reason=turn.stop_reason,
-                ),
-              )
-            except Exception:
-              logger.warning(
-                "[%s] Post-turn fork capture failed | failure=true",
-                self._sid,
-              )
-
-      if len(staged_terminal_events) > 1:
-        staged_terminal_events.clear()
-        await emit_terminal_failure(
-          "terminal_receipt_cardinality_invalid",
-          "terminal_receipt_cardinality_invalid: terminal settlement "
-          "produced more than one staged success receipt.",
-        )
-        return
-      if any(
-        event.get("type") in {
-          "skill_run_started",
-          "skill_result_captured",
-        }
-        for event in staged_terminal_events
-      ):
-        staged_terminal_events.clear()
-        await emit_terminal_failure(
-          "terminal_receipt_ownership_invalid",
-          "terminal_receipt_ownership_invalid: a generic terminal "
-          "hook attempted to emit an AgentRunner-owned skill "
-          "lifecycle marker.",
-        )
-        return
-      for staged_event in staged_terminal_events:
-        try:
-          durable_entry = self._append_durable_event_sync(
-            staged_event
-          )
-          if durable_entry is None:
-            raise RuntimeError(
-              "durable terminal receipt target is unavailable"
-            )
-        except Exception as exc:
-          staged_terminal_events.clear()
-          await emit_terminal_failure(
-            "terminal_receipt_persistence_failed",
-            "terminal_receipt_persistence_failed: successful completion "
-            "was refused because its required receipt could not be "
-            f"persisted ({type(exc).__name__}: {exc}).",
-          )
-          return
-      for staged_event in staged_terminal_events:
-        self._append(staged_event)
-      if top_level_result_event is not None:
-        lifecycle = self._top_level_skill_lifecycle
-        effect = self._top_level_skill_completion_effect_plan
-        if lifecycle is None or not isinstance(
-          effect,
-          TopLevelSkillCompletionEffectPlan,
-        ):
-          raise RuntimeError(
-            "Top-level completion plan was not retained exactly"
-          )
-        bound_terminal = self._bind_top_level_terminal_identity(
-          terminal_event,
-          lifecycle=lifecycle,
-        )
-        self._defer_top_level_terminal_event(bound_terminal)
-        self._commit_top_level_skill_plan_sync(
-          lifecycle=lifecycle,
-          result=top_level_result_event,
-          terminal=bound_terminal,
-          effect=effect,
-          project_live=True,
-        )
-
-      if terminal_success_reason is not None:
-        logger.info(
-          "[%s] Chat done | %.1fs total | %d turns | tools=%s | tokens in=%d out=%d | cache=%s | cost=$%.4f",
-          self._sid,
-          total_elapsed,
-          turn_count,
-          tools_used or "none",
-          usage_totals["input_tokens"],
-          usage_totals["output_tokens"],
-          cache_status,
-          cost.total,
-          extra={
-            "data": build_chat_done_log_data(
-              session_id=self._sid,
-              elapsed_s=total_elapsed,
-              turns=turn_count,
-              tools=tools_used,
-              usage_totals=usage_totals,
-              cost=cost.total,
-            )
-          },
-        )
-      else:
-        logger.info(
-          "[%s] Chat interrupted | %.1fs total | %d turns | reason=%s",
-          self._sid,
-          total_elapsed,
-          turn_count,
-          terminal_interruption_reason,
-        )
-      if (
-        top_level_result_event is None
-        and not self._defer_prepared_top_level_terminal_event(
-          terminal_event
-        )
-      ):
-        self._append(terminal_event)
-
-      try:
-        await self._close_client(client, timeout=5.0)
-      except Exception as exc:
-        logger.warning(
-          "[%s] client close after completed stream failed (non-fatal): %s",
-          self._sid,
-          exc,
-        )
-        await self._emit_run_error_event(exc, phase="client_close_after_stream_complete")
     except cancelled_error as exc:
       was_cancelled = True
       run_error = exc
     except BaseException as exc:
       run_error = exc
     finally:
-      finalizer_errors: list[BaseException] = []
-      shutdown_failed = False
-      try:
-        from .skill_context import clear_current_skill
-
-        clear_current_skill()
-      except Exception:
-        pass
-      self._active_skill_allow.clear()
-      self._active_skill_deny.clear()
-      self._active_skill_report_doors.clear()
-      try:
-        await self._shutdown_background_tasks(was_cancelled)
-      except BaseException as exc:
-        finalizer_errors.append(exc)
-        shutdown_failed = True
-      finally:
-        running_entries = self._task_registry.list_tasks(state=task_state_cls.RUNNING)
-        drain_state = session_drain_state(
-          running_entries,
-          shutdown_failed=shutdown_failed,
-          unsettled_workflow_obstructions=(
-            self._unsettled_workflow_obstruction_count()
-          ),
-        )
-        try:
-          await self._finalize_top_level_skill_result(
-            run_error=run_error,
-            clean_detach_reason=clean_detach_reason,
-            terminal_event=getattr(
-              self,
-              "_deferred_top_level_terminal_event",
-              None,
-            ),
-          )
-        except BaseException as exc:
-          finalizer_errors.append(exc)
-        try:
-          await self._flush_deferred_top_level_terminal_event()
-        except BaseException as exc:
-          finalizer_errors.append(exc)
-        if self._parent_aggregator is None:
-          try:
-            await self._aggregator.close()
-            summary = await self._aggregator.snapshot(
-              ended_at=time_module.time(),
-              drain_complete=drain_state.drain_complete,
-              in_flight_task_count=drain_state.in_flight_task_count,
-              context_surfaces=self._context_surface_records(),
-            )
-            self._summary_emitted = True
-            await self._call_on_session_summary(summary)
-          except Exception as exc:
-            logger.error(
-              "[%s] session summary emission failed (non-fatal) | exception_type=%s",
-              self._sid,
-              type(exc).__name__,
-            )
-        else:
-          self._summary_emitted = True
-      try:
-        if self._agent_session_log is not None and self._durable_attach_emitted:
-          server_terminal_cause = (
-            self._top_level_server_terminal_cause()
-          )
-          if run_error is not None:
-            await self._emit_run_error_event(
-              run_error,
-              server_terminal_cause=server_terminal_cause,
-            )
-            if server_terminal_cause is not None:
-              reason = server_terminal_cause
-              extra_fields = {
-                "server_terminal_cause": (
-                  server_terminal_cause
-                )
-              }
-            else:
-              (
-                shutdown_reason,
-                shutdown_extra_fields,
-              ) = self._shutdown_interrupted_reason()
-              reason, extra_fields = run_interrupted_reason(
-                run_error=run_error,
-                role=self._role,
-                shutdown_reason=shutdown_reason,
-                shutdown_extra_fields=shutdown_extra_fields,
-              )
-            await self._emit_interrupted_event(
-              reason,
-              extra_fields=extra_fields or None,
-            )
-          if self._top_level_skill_lifecycle is not None:
-            await (
-              self._flush_deferred_top_level_interrupted_event()
-            )
-          await self._emit_detach_event(
-            (
-              server_terminal_cause
-              if server_terminal_cause is not None
-              else run_detach_reason(
-                clean_detach_reason=clean_detach_reason,
-                run_error=run_error,
-              )
-            )
-          )
-      except BaseException as exc:
-        finalizer_errors.append(exc)
-      try:
-        await self._await_write_lease_handoff()
-      except BaseException as exc:
-        finalizer_errors.append(exc)
-      try:
-        await self.force_close()
-      except BaseException as exc:
-        finalizer_errors.append(exc)
-      try:
-        self._release_research_file_activity_after_children()
-      except BaseException as exc:
-        finalizer_errors.append(exc)
-      try:
-        self._release_selected_content_activity_after_children()
-      except BaseException as exc:
-        finalizer_errors.append(exc)
-      self._background_delivery_grace_active = False
-      self._background_ack_recovery_pairs.clear()
-      if self._top_level_skill_lifecycle is not None:
-        settlement_error = (
-          finalizer_errors[0]
-          if finalizer_errors
-          else (
-            run_error
-            if not self._top_level_skill_started_committed
-            else None
-          )
-        )
-        try:
-          self._publish_top_level_skill_settlement(
-            settlement_error
-          )
-        except BaseException as exc:
-          finalizer_errors.append(exc)
-      learning_turn_success = (
-        run_error is None
-        and not finalizer_errors
-        and terminal_success_reason is not None
+      await self._finalize_run(
+        clean_detach_reason=clean_detach_reason,
+        learning_real_final_response=learning_real_final_response,
+        learning_receipt_delivery=learning_receipt_delivery,
+        learning_tool_calling_iters=learning_tool_calling_iters,
+        logger=logger,
+        run_error=run_error,
+        session_drain_state=session_drain_state,
+        task_state_cls=task_state_cls,
+        terminal_success_reason=terminal_success_reason,
+        time_module=time_module,
+        was_cancelled=was_cancelled,
       )
-      settle_learning_receipts(
-        self,
-        learning_receipt_delivery,
-        success=learning_turn_success,
-      )
-      if learning_turn_success:
-        submit_learning_fork_after_turn(
-          self,
-          handoff=getattr(self, "_post_turn_fork_handoff", None),
-          tool_calling_iters=learning_tool_calling_iters,
-          foreground_memory_write=successful_memory_write_from_events(
-            getattr(self._log, "entries", ()),
-            fork=False,
-          ),
-          completed=True,
-          real_final_response=learning_real_final_response,
-          errored=False,
-          aborted=False,
-          cancelled=False,
-        )
-      if run_error is not None:
-        if finalizer_errors:
-          for finalizer_error in finalizer_errors:
-            cleanup_detail = attach_cleanup_failure(
-              run_error,
-              finalizer_error,
-            )
-            try:
-              self._append({
-                "type": "run_error",
-                "phase": "run_finalizer",
-                "error_type": type(finalizer_error).__name__,
-                "error": cleanup_detail,
-                "message": cleanup_detail,
-              })
-            except Exception:
-              pass
-          raise run_error from finalizer_errors[0]
-        raise run_error
-      if finalizer_errors:
-        primary_finalizer_error = finalizer_errors[0]
-        for finalizer_error in finalizer_errors[1:]:
-          attach_cleanup_failure(
-            primary_finalizer_error,
-            finalizer_error,
-          )
-        raise primary_finalizer_error

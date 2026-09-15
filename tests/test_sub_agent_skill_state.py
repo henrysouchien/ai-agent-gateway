@@ -9,6 +9,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+from pydantic import JsonValue
+
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
@@ -25,6 +28,7 @@ from agent_workflow_contracts import (
   CanonicalProjection,
   ContentHandle,
   ContractRef,
+  EvidenceObservation,
   ExecutionSettlement,
   OrdinaryDelegationTaskRef,
   TaskObservation,
@@ -71,19 +75,21 @@ def _task_result(
   *,
   status: str = "succeeded",
   terminal_reason: str | None = None,
+  tools_used: tuple[str, ...] = (),
+  operation_name: str = "skill-a",
 ) -> dict[str, Any]:
   operation = AgentOperationRef(
     namespace="agent-operation",
-    name="skill-a",
+    name=operation_name,
     version="1.0",
-    digest=sha256_digest({"operation": "skill-a"}),
+    digest=sha256_digest({"operation": operation_name}),
   )
   task_id = "bg_skill_state"
   values = TaskResultValues()
   outcome = None
   if status == "succeeded":
     contract = _contract("summary")
-    inline = {"summary": summary}
+    inline: dict[str, JsonValue] = {"summary": summary}
     raw = canonical_json_bytes(inline)
     digest = hashlib.sha256(raw).hexdigest()
     values = TaskResultValues(
@@ -122,6 +128,7 @@ def _task_result(
       terminal_reason=terminal_reason,
     ),
     outcome=outcome,
+    evidence=EvidenceObservation(tools_used=tools_used),
     values=values,
     observation=TaskObservation(
       transcript=TranscriptHandle(
@@ -217,6 +224,209 @@ def test_classify_child_outcome_rejects_success_claim_from_error() -> None:
     "child_outcome": "error",
   }
 
+
+
+def test_named_operation_without_terminal_door_is_not_succeeded() -> None:
+  result = _task_result(
+    "STATUS: BLOCKED — prepare failed",
+    tools_used=("prepare_model_build", "list_research_files"),
+    operation_name="build-model",
+  )
+  classification = skill_state.classify_child_outcome(
+    result,
+    None,
+    declared_terminal_doors=frozenset({"fms_report_build_model", "build_model"}),
+  )
+
+  assert classification.succeeded is False
+  assert classification.outcome == "blocked"
+  assert classification.semantic == "none"
+  assert classification.execution_status != "succeeded"
+
+
+def test_named_operation_terminal_stop_is_not_succeeded() -> None:
+  result = _task_result(
+    "persist returned STOP",
+    tools_used=("fms_persist_postcompile_valuation",),
+    operation_name="postcompile-valuation",
+  )
+  classification = skill_state.classify_child_outcome(
+    result,
+    None,
+    declared_terminal_doors=frozenset({"fms_persist_postcompile_valuation"}),
+    door_results=({
+      "tool_name": "fms_persist_postcompile_valuation",
+      "status": "error",
+      "gate_code": "STOP",
+      "subcommand": "persist_postcompile_valuation",
+      "mutation_mode": "model_writer",
+    },),
+  )
+
+  assert classification.succeeded is False
+  assert classification.semantic == "stop"
+  assert classification.execution_status != "succeeded"
+  assert classification.outcome == "blocked"
+
+
+def test_ordinary_child_without_declared_door_keeps_clean_exit() -> None:
+  result = _task_result("ordinary narrative")
+  classification = skill_state.classify_child_outcome(result, None)
+
+  assert classification.succeeded is True
+  assert classification.outcome == "complete"
+  assert classification.semantic is None
+  assert classification.execution_status == "succeeded"
+
+
+@pytest.mark.parametrize(
+  "result",
+  [
+    {"status": "staged"},
+    {"status": "noop"},
+    {"proposal_id": "proposal-1"},
+    {"readback": {"ok": True}},
+  ],
+)
+def test_declared_terminal_tool_accepts_only_canonical_success(
+  result: dict[str, object],
+) -> None:
+  assert skill_state.declared_terminal_tool_result_disposition(
+    declared_terminal_doors={"fms_propose_demo"},
+    tool_name="fms_propose_demo",
+    result=result,
+  ) == "success"
+
+
+@pytest.mark.parametrize(
+  "result",
+  [
+    {},
+    {"status": "unknown"},
+    {"status": "staged", "error": {"recoverable": True}},
+    {"status": "error", "error": {"recoverable": True}},
+    {"status": "ok", "is_error": True},
+    {"status": "ok", "success": False},
+  ],
+)
+def test_declared_terminal_tool_rejects_unaccepted_result(
+  result: dict[str, object],
+) -> None:
+  assert skill_state.declared_terminal_tool_result_disposition(
+    declared_terminal_doors={"fms_propose_demo"},
+    tool_name="fms_propose_demo",
+    result=result,
+  ) is None
+
+
+def test_declared_terminal_tool_marks_stop_and_unrecoverable_failure() -> None:
+  assert skill_state.declared_terminal_tool_result_disposition(
+    declared_terminal_doors={"fms_propose_demo"},
+    tool_name="fms_propose_demo",
+    result={"gate_code": "STOP"},
+  ) == "failure"
+  assert skill_state.declared_terminal_tool_result_disposition(
+    declared_terminal_doors={"fms_propose_demo"},
+    tool_name="fms_propose_demo",
+    result={
+      "status": "error",
+      "subcommand": "propose_demo",
+      "mutation_mode": "preview",
+      "error": {"recoverable": False, "message": "invalid"},
+    },
+  ) == "failure"
+
+
+def test_terminal_fms_result_disposition_repairs_recoverable_error() -> None:
+  assert skill_state.terminal_fms_result_disposition(
+    {
+      "status": "error",
+      "gate_code": "STOP",
+      "subcommand": "propose_financial_red_flags",
+      "mutation_mode": "preview",
+      "error": {
+        "type": "INVALID_JUDGMENT",
+        "message": "patch ops failed schema validation",
+        "recoverable": True,
+        "data": {},
+      },
+    }
+  ) is None
+
+
+def test_terminal_fms_result_disposition_fails_unrecoverable_error() -> None:
+  assert skill_state.terminal_fms_result_disposition(
+    {
+      "status": "error",
+      "gate_code": "STOP",
+      "subcommand": "propose_financial_red_flags",
+      "mutation_mode": "preview",
+      "error": {
+        "type": "INVALID_JUDGMENT",
+        "message": "patch ops failed schema validation",
+        "recoverable": False,
+        "data": {},
+      },
+    }
+  ) == "failure"
+
+
+def test_terminal_fms_result_disposition_fails_non_error_stop_gate() -> None:
+  assert skill_state.terminal_fms_result_disposition(
+    {
+      "status": "staged",
+      "gate_code": "STOP",
+      "subcommand": "x",
+      "mutation_mode": "preview",
+    }
+  ) == "failure"
+
+
+def test_terminal_result_projection_reads_one_successful_appended_event() -> None:
+  result = {"status": "staged", "proposal_id": "proposal-1"}
+  projected = skill_state.latest_successful_declared_terminal_tool_result(
+    (
+      {
+        "type": "tool_call_complete",
+        "tool_name": "fms_propose_demo",
+        "result": {"status": "error", "error": {"recoverable": True}},
+        "dispatch": {"outcome": "error_semantic"},
+        "is_error": True,
+      },
+      {
+        "type": "tool_call_complete",
+        "tool_name": "fms_propose_demo",
+        "result": result,
+        "dispatch": {"outcome": "ok"},
+        "is_error": False,
+        "error": None,
+        "semantic_error": None,
+      },
+    ),
+    declared_terminal_doors={"fms_propose_demo"},
+  )
+
+  assert projected == {
+    "tool_name": "fms_propose_demo",
+    "result": result,
+  }
+
+
+def test_terminal_result_projection_rejects_multiple_successes() -> None:
+  event = {
+    "type": "tool_call_complete",
+    "tool_name": "fms_propose_demo",
+    "result": {"status": "staged", "proposal_id": "proposal-1"},
+    "dispatch": {"outcome": "ok"},
+    "is_error": False,
+    "error": None,
+    "semantic_error": None,
+  }
+  with pytest.raises(RuntimeError, match="multiple accepted terminal"):
+    skill_state.latest_successful_declared_terminal_tool_result(
+      (event, event),
+      declared_terminal_doors={"fms_propose_demo"},
+    )
 
 def test_persist_skill_state_merges_model_state_only_for_task_success() -> None:
   async def scenario() -> None:

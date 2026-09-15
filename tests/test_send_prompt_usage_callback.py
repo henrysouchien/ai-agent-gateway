@@ -21,6 +21,7 @@ from agent_gateway.capability_binding import (
 from agent_gateway.capability_execution import BoundCapabilityExecution
 from agent_gateway.multi_user.billing import UsageEvent
 from agent_gateway.providers import (
+  CostEstimate,
   ModelInfo,
   ModelProvider,
   StreamEvent,
@@ -142,7 +143,7 @@ def _event() -> UsageEvent:
     billing_mode="byok",
     channel=None,
     provider=bind.provider,
-    capability_bind=bind.receipt(),
+    capability_bind=bind.to_json(),
     provider_reported_model=None,
   )
 
@@ -191,8 +192,15 @@ def test_send_prompt_usage_event_sets_provider() -> None:
       yield StreamEvent(type="usage_update", output_tokens=4)
       yield StreamEvent(type="message_end", stop_reason="end_turn")
 
-    def estimate_cost(self, model: str, input_tokens: int, output_tokens: int, **kwargs: Any):
-      return type("Cost", (), {"total": 0.0042})()
+    def estimate_cost(
+      self,
+      model: str,
+      input_tokens: int,
+      output_tokens: int,
+      cache_read_tokens: int = 0,
+      cache_creation_tokens: int = 0,
+    ) -> CostEstimate:
+      return CostEstimate(total=0.0042)
 
   bind = _resolved_bind()
   provider = _FakeProvider()
@@ -285,10 +293,21 @@ def test_send_prompt_emits_partial_commercial_usage_on_terminal_stream_paths(
       yield StreamEvent(type="usage_update", output_tokens=4, reasoning_tokens=1)
       raise failure
 
-    def estimate_cost(self, model, input_tokens, output_tokens, **kwargs):
+    def estimate_cost(
+      self,
+      model: str,
+      input_tokens: int,
+      output_tokens: int,
+      cache_read_tokens: int = 0,
+      cache_creation_tokens: int = 0,
+    ) -> CostEstimate:
       assert (input_tokens, output_tokens) == (10, 4)
+      kwargs = {
+        "cache_read_tokens": cache_read_tokens,
+        "cache_creation_tokens": cache_creation_tokens,
+      }
       assert kwargs == {"cache_read_tokens": 2, "cache_creation_tokens": 3}
-      return type("Cost", (), {"total": 0.0042})()
+      return CostEstimate(total=0.0042)
 
   class Producer:
     def __init__(self):

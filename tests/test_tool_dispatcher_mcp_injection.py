@@ -8,15 +8,18 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import ToolDispatcher
+from agent_gateway import McpClientManager, ToolDispatcher
+from agent_gateway.tool_policy_registry import PreparedToolCall
+from agent_gateway.tool_dispatcher_helpers import ToolResult
 
 
 def _run(coro):
   return asyncio.run(coro)
 
 
-class _CaptureMcpClient:
+class _CaptureMcpClient(McpClientManager):
   def __init__(self) -> None:
+    super().__init__(config_path=None)
     self.calls: list[tuple[str, dict[str, Any]]] = []
     self.servers = {
       "browser_snapshot": "browser",
@@ -29,7 +32,17 @@ class _CaptureMcpClient:
   def get_server_for_tool(self, name: str) -> str | None:
     return self.servers.get(name)
 
-  async def call_tool(self, name: str, tool_input: dict[str, Any]):
+  async def call_tool(
+    self,
+    name: str,
+    tool_input: dict[str, Any] | PreparedToolCall,
+    meta: object | None = None,
+    abort_event: asyncio.Event | None = None,
+    gateway_session: object | None = None,
+    allow_uncertain_replay: bool = True,
+    trusted_dispatch_scope: object | None = None,
+  ) -> ToolResult:
+    assert isinstance(tool_input, dict)
     self.calls.append((name, dict(tool_input)))
     return {"ok": True}, None
 

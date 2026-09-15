@@ -354,12 +354,13 @@ def test_late_invalid_event_has_no_cache_or_cursor_effect(tmp_path: Path) -> Non
         next_sequence=2,
       )
 
-  class Cache:
+  class Cache(CommercialAuthorityStateCache):
     def __init__(self) -> None:
+      super().__init__(lambda _: pytest.fail("loader must not run"))
       self.applied = []
 
-    def apply_invalidation(self, invalidation) -> None:
-      self.applied.append(invalidation)
+    def apply_invalidation(self, event) -> None:
+      self.applied.append(event)
 
   cache = Cache()
   path = tmp_path / "cursor.json"
@@ -416,8 +417,9 @@ def test_subscriber_health_tracks_success_failure_and_staleness(tmp_path: Path) 
     client.fail = True
     stop = asyncio.Event()
 
-    async def stop_after_failure(seen_stop, _seconds):
-      seen_stop.set()
+    async def stop_after_failure(stop, seconds):
+      _ = seconds
+      stop.set()
 
     subscriber._wait = stop_after_failure
     await subscriber.run_forever(stop)
@@ -448,7 +450,8 @@ def test_subscriber_readiness_fails_while_live_feed_is_behind_high_water(
     stop = asyncio.Event()
     polls = 0
 
-    async def consume_page(_cursor):
+    async def consume_page(cursor):
+      _ = cursor
       nonlocal polls
       polls += 1
       if polls == 1:
@@ -456,8 +459,9 @@ def test_subscriber_readiness_fails_while_live_feed_is_behind_high_water(
       assert subscriber.health(max_staleness_seconds=30.0)["ok"] is False
       return 2, 2
 
-    async def stop_when_caught_up(seen_stop, _seconds):
-      seen_stop.set()
+    async def stop_when_caught_up(stop, seconds):
+      _ = seconds
+      stop.set()
 
     subscriber._consume_page = consume_page
     subscriber._wait = stop_when_caught_up

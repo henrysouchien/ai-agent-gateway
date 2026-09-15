@@ -13,6 +13,7 @@ if str(PKG_DIR) not in sys.path:
 from agent_gateway import (  # noqa: E402
   AgentRunner,
   EventLog,
+  McpClientManager,
   ModelInfo,
   ModelProvider,
   ToolDispatcher,
@@ -25,15 +26,9 @@ from tests.capability_execution_test_support import (  # noqa: E402
 )
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
-    return False
-
-  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
-    return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
-
-  def get_tool_definitions(self) -> list[dict[str, Any]]:
-    return []
+class _NullMcpClient(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
 
 
 class _StubProvider(ModelProvider):

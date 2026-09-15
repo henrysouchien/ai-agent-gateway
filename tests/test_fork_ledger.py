@@ -414,7 +414,9 @@ def test_fresh_boot_recovers_unknown_hard_death_and_redelivers_once(
   child.close()
   assert parent.poll(10)
   assert parent.recv() == "ready"
-  os.kill(process.pid, signal.SIGKILL)
+  pid = process.pid
+  assert pid is not None
+  os.kill(pid, signal.SIGKILL)
   process.join(10)
   assert process.exitcode == -signal.SIGKILL
 

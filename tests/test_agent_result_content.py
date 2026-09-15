@@ -84,25 +84,33 @@ def _task_result(*, values: TaskResultValues, task_id: str = "bg-1") -> TaskResu
   )
 
 
-def _envelope(result: TaskResult, *, principal_id: str = "runner-1") -> AgentCompletionEnvelope:
+def _envelope(
+  result: TaskResult,
+  *,
+  principal_id: str = "runner-1",
+) -> tuple[AgentCompletionEnvelope, ResultHandle]:
   source = (
     result.values.terminal_narrative
     or (result.values.projection.content if result.values.projection is not None else None)
   )
   assert source is not None
-  return AgentCompletionEnvelope(
-    message_id=f"completion:{result.attempt.physical_task_id}",
-    task_result_ref=TaskResultRef.from_result(result),
-    settlement_projection=SettlementProjection(execution_status="succeeded"),
-    parent_materialization=ResultHandle(
-      source=source,
-      read_grant=ContentReadGrant(
-        grant_id=f"grant:{result.attempt.physical_task_id}",
-        content_id=source.content_id,
-        scope="direct_parent",
-        principal_id=principal_id,
-      ),
+  materialization = ResultHandle(
+    source=source,
+    read_grant=ContentReadGrant(
+      grant_id=f"grant:{result.attempt.physical_task_id}",
+      content_id=source.content_id,
+      scope="direct_parent",
+      principal_id=principal_id,
     ),
+  )
+  return (
+    AgentCompletionEnvelope(
+      message_id=f"completion:{result.attempt.physical_task_id}",
+      task_result_ref=TaskResultRef.from_result(result),
+      settlement_projection=SettlementProjection(execution_status="succeeded"),
+      parent_materialization=materialization,
+    ),
+    materialization,
   )
 
 
@@ -169,7 +177,7 @@ def test_terminal_narrative_pages_reassemble_exact_utf8(tmp_path: Path) -> None:
     result = _task_result(values=TaskResultValues(
       terminal_narrative=terminal_narrative_content_handle(reference),
     ))
-    envelope = _envelope(result)
+    envelope, materialization = _envelope(result)
     log = AgentSessionLog(tmp_path / "session.jsonl")
     await _append_completion(log, result, envelope)
     handler = make_get_agent_result_content_handler([_runner(log, workspace)])
@@ -178,8 +186,8 @@ def test_terminal_narrative_pages_reassemble_exact_utf8(tmp_path: Path) -> None:
     after_char = 0
     while True:
       page, error = await handler({
-        "content_id": envelope.parent_materialization.source.content_id,
-        "read_grant_id": envelope.parent_materialization.read_grant.grant_id,
+        "content_id": materialization.source.content_id,
+        "read_grant_id": materialization.read_grant.grant_id,
         "after_char": after_char,
       })
       assert error is None
@@ -205,7 +213,7 @@ def test_projection_json_pages_reassemble_canonical_bytes(tmp_path: Path) -> Non
       value=value,
     )
     result = _task_result(values=TaskResultValues(projection=projection))
-    envelope = _envelope(result)
+    envelope, materialization = _envelope(result)
     log = AgentSessionLog(tmp_path / "session.jsonl")
     await _append_completion(log, result, envelope)
     handler = make_get_agent_result_content_handler([_runner(log, workspace)])
@@ -215,7 +223,7 @@ def test_projection_json_pages_reassemble_canonical_bytes(tmp_path: Path) -> Non
     while True:
       page, error = await handler({
         "content_id": projection.content.content_id,
-        "read_grant_id": envelope.parent_materialization.read_grant.grant_id,
+        "read_grant_id": materialization.read_grant.grant_id,
         "after_char": after_char,
       })
       assert error is None
@@ -240,20 +248,23 @@ def test_read_requires_exact_principal_and_ordinary_registration(tmp_path: Path)
       value={"answer": "exact"},
     )
     result = _task_result(values=TaskResultValues(projection=projection))
-    envelope = _envelope(result, principal_id="different-runner")
+    envelope, materialization = _envelope(
+      result,
+      principal_id="different-runner",
+    )
     log = AgentSessionLog(tmp_path / "session.jsonl")
     await _append_completion(log, result, envelope)
     handler = make_get_agent_result_content_handler([_runner(log, workspace)])
     page, error = await handler({
       "content_id": projection.content.content_id,
-      "read_grant_id": envelope.parent_materialization.read_grant.grant_id,
+      "read_grant_id": materialization.read_grant.grant_id,
     })
     assert page is None
     assert error is not None
     assert error["code"] == "result_content_unavailable"
 
     workflow_log = AgentSessionLog(tmp_path / "workflow-session.jsonl")
-    workflow_envelope = _envelope(result)
+    workflow_envelope, workflow_materialization = _envelope(result)
     await _append_completion(
       workflow_log,
       result,
@@ -265,7 +276,7 @@ def test_read_requires_exact_principal_and_ordinary_registration(tmp_path: Path)
     ])
     page, error = await workflow_handler({
       "content_id": projection.content.content_id,
-      "read_grant_id": workflow_envelope.parent_materialization.read_grant.grant_id,
+      "read_grant_id": workflow_materialization.read_grant.grant_id,
     })
     assert page is None
     assert error is not None
@@ -309,7 +320,7 @@ def test_successful_read_marks_registry_result_content_read(tmp_path: Path) -> N
     result = _task_result(values=TaskResultValues(
       terminal_narrative=terminal_narrative_content_handle(reference),
     ))
-    envelope = _envelope(result)
+    envelope, materialization = _envelope(result)
     log = AgentSessionLog(tmp_path / "session.jsonl")
     await _append_completion(log, result, envelope)
 
@@ -325,8 +336,8 @@ def test_successful_read_marks_registry_result_content_read(tmp_path: Path) -> N
 
     assert entry.result_content_read is False
     page, error = await handler({
-      "content_id": envelope.parent_materialization.source.content_id,
-      "read_grant_id": envelope.parent_materialization.read_grant.grant_id,
+      "content_id": materialization.source.content_id,
+      "read_grant_id": materialization.read_grant.grant_id,
     })
     assert error is None
     assert page is not None
@@ -337,8 +348,8 @@ def test_successful_read_marks_registry_result_content_read(tmp_path: Path) -> N
     bare_runner._task_registry = TaskRegistry()
     bare_handler = make_get_agent_result_content_handler([bare_runner])
     page, error = await bare_handler({
-      "content_id": envelope.parent_materialization.source.content_id,
-      "read_grant_id": envelope.parent_materialization.read_grant.grant_id,
+      "content_id": materialization.source.content_id,
+      "read_grant_id": materialization.read_grant.grant_id,
     })
     assert error is None
     assert page is not None

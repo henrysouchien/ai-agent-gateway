@@ -15,17 +15,48 @@ from agent_gateway.model_registry import (
   INITIAL_MODEL_REGISTRY,
   INITIAL_MODEL_SELECTION_POLICY,
 )
+from agent_gateway.event_log import EventLog
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
+from agent_gateway.server_models import BuildChatRuntime, SystemPrompt
 from agent_gateway.secret_boundary import SecretBoundary
 
 
-async def _build_chat_runtime(*, session, request, channel, auth_manager):
-  _ = session, channel, auth_manager
+class _NoopRunner:
+  async def run(
+    self,
+    *,
+    messages: list[dict[str, object]],
+    system_prompt: SystemPrompt | None = None,
+    max_turns: int | None = None,
+  ) -> None:
+    _ = messages, system_prompt, max_turns
+
+
+def _build_noop_runner(
+  _event_log: EventLog,
+  _session_id: str,
+  _started_at: float,
+) -> _NoopRunner:
+  return _NoopRunner()
+
+
+async def _build_chat_runtime_impl(
+  session,
+  request,
+  channel,
+  auth_manager,
+  *,
+  storage_root: Path | None = None,
+):
+  _ = session, channel, auth_manager, storage_root
   return ChatRuntime(
     system_prompt="test",
-    build_runner=lambda *_args: None,
+    build_runner=_build_noop_runner,
     capability_execution=request.capability_execution,
   )
+
+
+_build_chat_runtime: BuildChatRuntime = _build_chat_runtime_impl
 
 
 def test_leaf_imports_do_not_require_monorepo_schema(tmp_path: Path) -> None:

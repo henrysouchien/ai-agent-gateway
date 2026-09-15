@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -12,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .model_bound_wire import model_bound_result_fits
+
 
 SPILL_LANE_CODE_EXECUTE = "code_execute"
 SPILL_LANE_FILE_TOOLS = "file_tools"
@@ -21,6 +24,67 @@ SPILL_READER_PATTERN_RESERVE = 1024
 SPILL_READER_TARGET_MAX_CHARS = 48_000
 SPILL_READER_TARGET_FRACTION = 0.8
 SPILL_ROOT_CONTROL_FILES = frozenset({".lease", ".spill_fresh"})
+SPILL_REF_PREFIX = "spill:v1:"
+SPILL_READ_DEFAULT_MAX_CHARS = 20_000
+SPILL_READ_MAX_CHARS = 40_000
+SPILL_READ_DEFAULT_MAX_RESULTS = 10
+SPILL_READ_MAX_RESULTS = 20
+SPILL_READ_DEFAULT_CONTEXT_CHARS = 120
+SPILL_READ_MAX_CONTEXT_CHARS = 500
+SPILL_READ_MAX_QUERY_CHARS = 1_024
+SPILL_READ_MAX_WIRE_BYTES = 48_000
+SPILL_READ_DEFAULT_FILE_MAX_BYTES = 64 * 1024 * 1024
+_SPILL_REF_RE = re.compile(
+  r"^spill:v1:([A-Za-z0-9][A-Za-z0-9._-]{0,254}):([0-9a-f]{64})$"
+)
+
+
+TOOL_RESULT_READ_TOOL_DEF: dict[str, Any] = {
+  "name": "tool_result_read",
+  "description": (
+    "Read or search the full content behind an opaque spill_ref from a truncated "
+    "tool result. This tool can access only spill members emitted by this exact "
+    "run; it does not accept filesystem paths. Omit query to read a bounded "
+    "character page. Provide query for a bounded literal search."
+  ),
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "spill_ref": {"type": "string"},
+      "member_ref": {
+        "type": "string",
+        "description": "Optional member_ref from spill_summary; defaults to the referenced root member.",
+      },
+      "offset": {"type": "integer", "minimum": 0, "default": 0},
+      "max_chars": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": SPILL_READ_MAX_CHARS,
+        "default": SPILL_READ_DEFAULT_MAX_CHARS,
+      },
+      "query": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": SPILL_READ_MAX_QUERY_CHARS,
+        "description": "Optional case-sensitive literal search text.",
+      },
+      "max_results": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": SPILL_READ_MAX_RESULTS,
+        "default": SPILL_READ_DEFAULT_MAX_RESULTS,
+      },
+      "context_chars": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": SPILL_READ_MAX_CONTEXT_CHARS,
+        "default": SPILL_READ_DEFAULT_CONTEXT_CHARS,
+      },
+    },
+    "required": ["spill_ref"],
+    "additionalProperties": False,
+  },
+}
 
 
 class SpillError(RuntimeError):
@@ -35,11 +99,28 @@ class SpillPublicationUnsupported(SpillError):
   pass
 
 
+class SpillReadError(SpillError):
+  code = "spill_unavailable"
+
+
+class SpillReadInvalidInput(SpillReadError):
+  code = "invalid_input"
+
+
+class SpillReadAccessDenied(SpillReadError):
+  code = "spill_access_denied"
+
+
+class SpillReadUnavailable(SpillReadError):
+  code = "spill_unavailable"
+
+
 @dataclass(frozen=True)
 class SpillCapabilities:
   code_execute: bool = False
   file_read: bool = False
   file_grep: bool = False
+  spill_read: bool = False
 
   @property
   def lane(self) -> str:
@@ -105,6 +186,7 @@ class SpillSink:
 class SpillPublication:
   filename: str
   abspath: str
+  spill_ref: str
   lane: str
   payload_kind: str
   member_count: int
@@ -236,13 +318,14 @@ def write_spill_set(
     return SpillPublication(
       filename=pointer.filename,
       abspath=str(_contained_member_path(root, pointer.filename)),
+      spill_ref=_format_spill_ref(pointer),
       lane=sink.lane,
       payload_kind=prepared.payload_kind,
       member_count=len(emitted),
       total_chars=sum(member.chars for member in emitted),
       largest_members=tuple(
         {
-          "filename": item["filename"],
+          "member_ref": item["filename"],
           "role": item["role"],
           "chars": item["chars"],
         }
@@ -252,6 +335,358 @@ def write_spill_set(
   if last_collision is not None:
     raise last_collision
   raise FileExistsError(base_stem)
+
+
+def _format_spill_ref(member: _PreparedMember) -> str:
+  return f"{SPILL_REF_PREFIX}{member.filename}:{hashlib.sha256(member.data).hexdigest()}"
+
+
+def _parse_spill_ref(spill_ref: Any) -> tuple[str, str]:
+  if not isinstance(spill_ref, str):
+    raise SpillReadInvalidInput("spill_ref must be a string")
+  match = _SPILL_REF_RE.fullmatch(spill_ref)
+  if match is None:
+    raise SpillReadInvalidInput("spill_ref is malformed")
+  return match.group(1), match.group(2)
+
+
+def _read_int(
+  value: Any,
+  *,
+  name: str,
+  default: int,
+  minimum: int,
+  maximum: int | None = None,
+) -> int:
+  if value is None:
+    return default
+  if isinstance(value, bool) or not isinstance(value, int):
+    raise SpillReadInvalidInput(f"{name} must be an integer")
+  if value < minimum:
+    raise SpillReadInvalidInput(f"{name} must be >= {minimum}")
+  if maximum is not None and value > maximum:
+    raise SpillReadInvalidInput(f"{name} must be <= {maximum}")
+  return value
+
+
+def _read_spill_member_bytes(
+  root: Path,
+  member_ref: str,
+  *,
+  max_bytes: int,
+) -> bytes:
+  if (
+    not isinstance(member_ref, str)
+    or Path(member_ref).name != member_ref
+    or member_ref in {"", ".", ".."}
+    or member_ref in SPILL_ROOT_CONTROL_FILES
+  ):
+    raise SpillReadAccessDenied("spill member is not admitted")
+
+  directory_flags = os.O_RDONLY
+  if hasattr(os, "O_DIRECTORY"):
+    directory_flags |= os.O_DIRECTORY
+  if hasattr(os, "O_NOFOLLOW"):
+    directory_flags |= os.O_NOFOLLOW
+  member_flags = os.O_RDONLY
+  if hasattr(os, "O_NOFOLLOW"):
+    member_flags |= os.O_NOFOLLOW
+  root_fd: int | None = None
+  member_fd: int | None = None
+  try:
+    root_fd = os.open(root, directory_flags)
+    held_root = os.fstat(root_fd)
+    visible_root = os.lstat(root)
+    if (
+      not stat.S_ISDIR(held_root.st_mode)
+      or not stat.S_ISDIR(visible_root.st_mode)
+      or (held_root.st_dev, held_root.st_ino)
+      != (visible_root.st_dev, visible_root.st_ino)
+    ):
+      raise SpillReadUnavailable("spill root identity changed")
+    member_fd = os.open(member_ref, member_flags, dir_fd=root_fd)
+    held_member = os.fstat(member_fd)
+    visible_member = os.stat(
+      member_ref,
+      dir_fd=root_fd,
+      follow_symlinks=False,
+    )
+    if (
+      not stat.S_ISREG(held_member.st_mode)
+      or not stat.S_ISREG(visible_member.st_mode)
+      or (held_member.st_dev, held_member.st_ino)
+      != (visible_member.st_dev, visible_member.st_ino)
+    ):
+      raise SpillReadAccessDenied("spill member is not a regular published file")
+    if held_member.st_size < 0 or held_member.st_size > max_bytes:
+      raise SpillReadUnavailable("spill member exceeds the reader limit")
+    chunks: list[bytes] = []
+    remaining = held_member.st_size
+    while remaining:
+      chunk = os.read(member_fd, min(remaining, 1024 * 1024))
+      if not chunk:
+        raise SpillReadUnavailable("spill member changed while reading")
+      chunks.append(chunk)
+      remaining -= len(chunk)
+    if os.read(member_fd, 1):
+      raise SpillReadUnavailable("spill member changed while reading")
+    return b"".join(chunks)
+  except SpillReadError:
+    raise
+  except FileNotFoundError as exc:
+    raise SpillReadUnavailable("spill is missing or expired") from exc
+  except OSError as exc:
+    if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+      raise SpillReadAccessDenied("spill member is not admitted") from exc
+    raise SpillReadUnavailable("spill is unavailable") from exc
+  finally:
+    if member_fd is not None:
+      os.close(member_fd)
+    if root_fd is not None:
+      os.close(root_fd)
+
+
+def _decode_spill_text(data: bytes) -> str:
+  try:
+    return data.decode("utf-8")
+  except UnicodeDecodeError as exc:
+    raise SpillReadUnavailable("spill member integrity mismatch") from exc
+
+
+def _manifest_member_entry(
+  manifest_data: bytes,
+  *,
+  pointer_ref: str,
+  requested_member_ref: str,
+) -> dict[str, Any] | None:
+  if not pointer_ref.endswith(".manifest.json"):
+    if requested_member_ref != pointer_ref:
+      raise SpillReadAccessDenied("spill member is not admitted by this reference")
+    return None
+  try:
+    manifest = json.loads(_decode_spill_text(manifest_data))
+  except SpillReadError:
+    raise
+  except Exception as exc:
+    raise SpillReadUnavailable("spill manifest integrity mismatch") from exc
+  if (
+    not isinstance(manifest, dict)
+    or manifest.get("schema_version") != SPILL_MANIFEST_VERSION
+    or manifest.get("lane") != SPILL_LANE_FILE_TOOLS
+    or not isinstance(manifest.get("members"), list)
+  ):
+    raise SpillReadUnavailable("spill manifest integrity mismatch")
+  if requested_member_ref == pointer_ref:
+    return None
+  matches = [
+    entry
+    for entry in manifest["members"]
+    if isinstance(entry, dict)
+    and entry.get("filename") == requested_member_ref
+  ]
+  if len(matches) != 1:
+    raise SpillReadAccessDenied("spill member is not admitted by this reference")
+  entry = matches[0]
+  if (
+    not isinstance(entry.get("bytes"), int)
+    or not isinstance(entry.get("chars"), int)
+    or not isinstance(entry.get("sha256"), str)
+    or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])
+  ):
+    raise SpillReadUnavailable("spill manifest integrity mismatch")
+  return entry
+
+
+def _spill_read_result_fits(payload: dict[str, Any]) -> bool:
+  return model_bound_result_fits(
+    payload,
+    max_bytes=SPILL_READ_MAX_WIRE_BYTES,
+  )
+
+
+def read_spill_result(
+  sink: SpillSink,
+  *,
+  spill_ref: Any,
+  member_ref: Any = None,
+  offset: Any = None,
+  max_chars: Any = None,
+  query: Any = None,
+  max_results: Any = None,
+  context_chars: Any = None,
+) -> dict[str, Any]:
+  """Read one content-bound member from the exact sink captured by this run."""
+
+  if not isinstance(sink, SpillSink) or not sink.capabilities.spill_read:
+    raise SpillReadUnavailable("spill reader is unavailable for this run")
+  pointer_ref, pointer_digest = _parse_spill_ref(spill_ref)
+  requested_member_ref = pointer_ref if member_ref is None else member_ref
+  if not isinstance(requested_member_ref, str):
+    raise SpillReadInvalidInput("member_ref must be a string")
+  read_offset = _read_int(offset, name="offset", default=0, minimum=0)
+  page_chars = _read_int(
+    max_chars,
+    name="max_chars",
+    default=SPILL_READ_DEFAULT_MAX_CHARS,
+    minimum=1,
+    maximum=SPILL_READ_MAX_CHARS,
+  )
+  result_limit = _read_int(
+    max_results,
+    name="max_results",
+    default=SPILL_READ_DEFAULT_MAX_RESULTS,
+    minimum=1,
+    maximum=SPILL_READ_MAX_RESULTS,
+  )
+  search_context = _read_int(
+    context_chars,
+    name="context_chars",
+    default=SPILL_READ_DEFAULT_CONTEXT_CHARS,
+    minimum=0,
+    maximum=SPILL_READ_MAX_CONTEXT_CHARS,
+  )
+  if query is not None and (
+    not isinstance(query, str)
+    or not query
+    or len(query) > SPILL_READ_MAX_QUERY_CHARS
+  ):
+    raise SpillReadInvalidInput("query must be a non-empty bounded string")
+  if query is None and (max_results is not None or context_chars is not None):
+    raise SpillReadInvalidInput(
+      "max_results and context_chars require query"
+    )
+  if query is not None and max_chars is not None:
+    raise SpillReadInvalidInput("max_chars is available only for page reads")
+
+  try:
+    root = _validated_root(Path(sink()))
+  except Exception as exc:
+    raise SpillReadUnavailable("spill is missing or expired") from exc
+  file_cap = sink.max_file_bytes or SPILL_READ_DEFAULT_FILE_MAX_BYTES
+  pointer_data = _read_spill_member_bytes(root, pointer_ref, max_bytes=file_cap)
+  if not hmac.compare_digest(
+    hashlib.sha256(pointer_data).hexdigest(),
+    pointer_digest,
+  ):
+    raise SpillReadUnavailable("spill reference integrity mismatch")
+  entry = _manifest_member_entry(
+    pointer_data,
+    pointer_ref=pointer_ref,
+    requested_member_ref=requested_member_ref,
+  )
+  data = (
+    pointer_data
+    if requested_member_ref == pointer_ref
+    else _read_spill_member_bytes(root, requested_member_ref, max_bytes=file_cap)
+  )
+  if entry is not None and (
+    len(data) != entry["bytes"]
+    or not hmac.compare_digest(
+      hashlib.sha256(data).hexdigest(),
+      entry["sha256"],
+    )
+  ):
+    raise SpillReadUnavailable("spill member integrity mismatch")
+  text = _decode_spill_text(data)
+  if entry is not None and len(text) != entry["chars"]:
+    raise SpillReadUnavailable("spill member integrity mismatch")
+  if read_offset > len(text):
+    raise SpillReadInvalidInput("offset exceeds spill member length")
+
+  base = {
+    "spill_ref": spill_ref,
+    "member_ref": requested_member_ref,
+    "offset": read_offset,
+  }
+  if query is None:
+    requested_end = min(len(text), read_offset + page_chars)
+
+    def _page_response(end: int) -> dict[str, Any]:
+      return {
+        **base,
+        "content": text[read_offset:end],
+        "next_offset": end if end < len(text) else None,
+        "truncated": end < len(text),
+      }
+
+    low = read_offset
+    high = requested_end
+    while low < high:
+      candidate_end = (low + high + 1) // 2
+      if _spill_read_result_fits(_page_response(candidate_end)):
+        low = candidate_end
+      else:
+        high = candidate_end - 1
+    response = _page_response(low)
+    if not _spill_read_result_fits(response):
+      raise SpillReadUnavailable("spill reader response metadata exceeds its limit")
+    return response
+
+  matches: list[dict[str, Any]] = []
+  cursor = read_offset
+  budget_resume_offset: int | None = None
+  while len(matches) < result_limit:
+    match_offset = text.find(query, cursor)
+    if match_offset < 0:
+      break
+    start = max(0, match_offset - search_context)
+    end = min(len(text), match_offset + len(query) + search_context)
+    candidate = {
+      "match_offset": match_offset,
+      "start_offset": start,
+      "end_offset": end,
+      "content": text[start:end],
+    }
+    resume_offset = match_offset + max(1, len(query))
+    if not _spill_read_result_fits({
+      **base,
+      "query": query,
+      "matches": [*matches, candidate],
+      "next_offset": resume_offset,
+      "truncated": True,
+    }):
+      budget_resume_offset = match_offset
+      break
+    matches.append(candidate)
+    cursor = resume_offset
+  has_more = (
+    budget_resume_offset is not None
+    or (len(matches) == result_limit and text.find(query, cursor) >= 0)
+  )
+  response = {
+    **base,
+    "query": query,
+    "matches": matches,
+    "next_offset": (
+      budget_resume_offset
+      if budget_resume_offset is not None
+      else cursor if has_more else None
+    ),
+    "truncated": has_more,
+  }
+  if not _spill_read_result_fits(response):
+    raise SpillReadUnavailable("spill reader response metadata exceeds its limit")
+  return response
+
+
+def make_tool_result_read_handler(
+  sink_provider: Callable[[], SpillSink | None],
+) -> Callable[..., Any]:
+  async def _handle(tool_input: dict[str, Any], **_: Any) -> tuple[Any, Any]:
+    try:
+      sink = sink_provider()
+      if sink is None:
+        raise SpillReadUnavailable("spill reader is unavailable for this run")
+      return read_spill_result(sink, **dict(tool_input or {})), None
+    except SpillReadError as exc:
+      return None, {"code": exc.code, "message": str(exc)}
+    except TypeError:
+      return None, {
+        "code": "invalid_input",
+        "message": "tool_result_read received unsupported input fields",
+      }
+
+  return _handle
 
 
 def reconstruct_spill_manifest(manifest_path: str | Path) -> Any:
@@ -864,14 +1299,22 @@ __all__ = [
   "SPILL_LANE_CODE_EXECUTE",
   "SPILL_LANE_FILE_TOOLS",
   "SPILL_LANE_NO_READER",
+  "SPILL_REF_PREFIX",
+  "TOOL_RESULT_READ_TOOL_DEF",
   "SpillBudget",
   "SpillCapabilities",
   "SpillError",
   "SpillLimitExceeded",
   "SpillPublication",
   "SpillPublicationUnsupported",
+  "SpillReadAccessDenied",
+  "SpillReadError",
+  "SpillReadInvalidInput",
+  "SpillReadUnavailable",
   "SpillSink",
+  "make_tool_result_read_handler",
   "normalize_spill_sink",
+  "read_spill_result",
   "reconstruct_spill_manifest",
   "write_spill_set",
 ]

@@ -6,9 +6,10 @@ import logging
 import time
 import uuid
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Protocol, runtime_checkable
 
 from fastapi import FastAPI, HTTPException
+
 
 from .agent_session_log import _atomic_write_sidecar
 from .approval_audit import ApprovalAuditEmitter
@@ -26,6 +27,7 @@ from .capability_binding import (
   CapabilityResolutionError,
   CredentialHandle,
   ModelSelectionIntent,
+  SESSION_DRIVER_CAPABILITY,
   eligible_model_choices,
   resolve_capability_model,
   saved_preference_ineligibility,
@@ -41,7 +43,6 @@ from .event_adapter import adapt_event
 from .event_log import EventLog, log_has_terminal
 from .events import DEFAULT_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
 from .product_config import gateway_product_id
-from .providers import StreamEvent
 from .runner_introspection import exception_traceback_already_logged
 from .runner_background_lifecycle import StrictBackgroundTaskDrainUnavailable
 from .session import (
@@ -66,6 +67,7 @@ from .ui_blocks_run import (
 from .server_artifact_helpers import _json_dumps, _model_to_dict
 from .server_models import (
   BuildChatRuntime,
+  BuildRunner,
   CapabilityChoice,
   CapabilityChoiceNotice,
   CapabilityChoiceResponse,
@@ -280,6 +282,16 @@ class ResearchFileSessionDrainUnavailable(RuntimeError):
   """A matching live turn could not prove all child writers stopped."""
 
 
+@runtime_checkable
+class _StrictBackgroundTaskDrainer(Protocol):
+  def __call__(self) -> Awaitable[None]: ...
+
+
+@runtime_checkable
+class _DisconnectHandler(Protocol):
+  def __call__(self) -> Awaitable[None] | None: ...
+
+
 async def quiesce_research_file_sessions(
   sessions: tuple[GatewaySession, ...],
   *,
@@ -322,7 +334,7 @@ async def quiesce_research_file_sessions(
       "cancel_and_require_background_tasks_drained",
       None,
     )
-    if callable(strict_drain):
+    if isinstance(strict_drain, _StrictBackgroundTaskDrainer):
       try:
         await strict_drain()
       except StrictBackgroundTaskDrainUnavailable as exc:
@@ -602,7 +614,7 @@ def build_capability_choices(
     None,
   )
   for capability_id, policy in sorted(policy_artifact.capabilities.items()):
-    if capability_id != "session.driver" and not policy.allow_authenticated_run_override:
+    if capability_id != SESSION_DRIVER_CAPABILITY and not policy.allow_authenticated_run_override:
       continue
     eligible = eligible_model_choices(
       capability_id,
@@ -611,13 +623,13 @@ def build_capability_choices(
       auth=resolver.auth_context,
     )
     choices = [
-      CapabilityChoice(
-        model_key=choice.key,
-        label=choice.label,
-        supported_efforts=list(choice.supported_efforts),
-        default_effort=choice.default_effort,
-        lifecycle=choice.lifecycle,
-      )
+      CapabilityChoice.model_validate({
+        "model_key": choice.key,
+        "label": choice.label,
+        "supported_efforts": list(choice.supported_efforts),
+        "default_effort": choice.default_effort,
+        "lifecycle": choice.lifecycle,
+      })
       for choice in eligible
     ]
     notices: list[CapabilityChoiceNotice] = []
@@ -629,7 +641,7 @@ def build_capability_choices(
       ))
     else:
       saved_preference = None
-      if capability_id == "session.driver" and preference_store is not None:
+      if capability_id == SESSION_DRIVER_CAPABILITY and preference_store is not None:
         saved_preference = preference_store.get(
           tenant_id=resolver.auth_context.tenant_id,
           actor_id=resolver.auth_context.actor_id,
@@ -779,7 +791,7 @@ def _capability_execution_resolver_for_session(
     raise CapabilityResolutionError(
       "capability_policy_missing",
       "deployment capability policy is not configured",
-      capability_id="session.driver",
+      capability_id=SESSION_DRIVER_CAPABILITY,
     )
 
   configured_tenant = str(
@@ -857,7 +869,7 @@ def bind_init_capability_selections(
     raise CapabilityResolutionError(
       "capability_policy_missing",
       "deployment capability policy is not configured",
-      capability_id="session.driver",
+      capability_id=SESSION_DRIVER_CAPABILITY,
     )
 
   normalized: dict[CapabilityId, CapabilitySelection] = {}
@@ -872,7 +884,7 @@ def bind_init_capability_selections(
     policy = selection_policy.capabilities.get(capability_id)
     if (
       policy is None
-      or capability_id in {"session.driver", "node.fork"}
+      or capability_id in {SESSION_DRIVER_CAPABILITY, "node.fork"}
       or not policy.allow_authenticated_run_override
     ):
       raise CapabilityResolutionError(
@@ -880,7 +892,7 @@ def bind_init_capability_selections(
         f"run selection is not allowed for {capability_id}",
         capability_id=capability_id,
       )
-    normalized[capability_id] = selection  # type: ignore[index]
+    normalized[capability_id] = selection
 
   run_overrides: dict[CapabilityId, ModelSelectionIntent] = {}
   for capability_id, selection in normalized.items():
@@ -918,6 +930,17 @@ def prepare_session_driver_turn(
   )
   request_id = request_id or str(uuid.uuid4())
   context = dict(inputs.context or {})
+  stage_route = getattr(session, "stage_skill_route", None)
+  if isinstance(stage_route, dict):
+    route_kind = str(stage_route.get("route_kind") or "").strip().lower()
+    skill_name = str(stage_route.get("skill_name") or "").strip()
+    if route_kind != "stage" or not skill_name:
+      raise HTTPException(status_code=400, detail="Invalid stage skill route")
+    context["skill"] = skill_name
+    context["stage_skill_route"] = {
+      "route_kind": "stage",
+      "skill_name": skill_name,
+    }
   context["profile"] = _resolve_chat_profile_name(context)
   request = ChatRequest(
     messages=list(inputs.messages),
@@ -1005,13 +1028,13 @@ def prepare_session_driver_turn(
     preference_store.get(
       tenant_id=capability_execution_resolver.auth_context.tenant_id,
       actor_id=capability_execution_resolver.auth_context.actor_id,
-      capability_id="session.driver",
+      capability_id=SESSION_DRIVER_CAPABILITY,
     )
     if preference_store is not None and explicit_intent is None
     else None
   )
   capability_execution = capability_execution_resolver.resolve(
-    "session.driver",
+    SESSION_DRIVER_CAPABILITY,
     explicit_intent=explicit_intent,
     saved_preference=saved_preference,
   )
@@ -1032,7 +1055,7 @@ async def _dispatch_chat_turn(
   inputs: ChatTurnInputs,
   *,
   event_log: EventLog,
-  on_event: Callable[[StreamEvent], Awaitable[None]],
+  on_event: Callable[[dict[str, Any]], Awaitable[None]],
   build_chat_runtime: BuildChatRuntime,
   transcript_dir: Path | None,
   publish_lifecycle_events: bool = False,
@@ -1067,7 +1090,7 @@ async def _dispatch_chat_turn_body(
   inputs: ChatTurnInputs,
   *,
   event_log: EventLog,
-  on_event: Callable[[StreamEvent], Awaitable[None]],
+  on_event: Callable[[dict[str, Any]], Awaitable[None]],
   build_chat_runtime: BuildChatRuntime,
   transcript_dir: Path | None,
   publish_lifecycle_events: bool = False,
@@ -1175,9 +1198,10 @@ async def _dispatch_chat_turn_body(
     _record_event(_chat_run_state_event(sid, "running"), sid)
 
   runtime: ChatRuntime | None = None
-  runner: Any | None = None
+  runner: BuildRunner | None = None
   runner_task: asyncio.Task[Any] | None = None
   selected_content_admission = SelectedContentAdmission()
+  selected_content_activity_lease = selected_content_admission.activity_lease
   selected_content_activity_transferred = False
 
   async def _safe_fire_disconnect() -> None:
@@ -1229,7 +1253,7 @@ async def _dispatch_chat_turn_body(
       _record_event(
         {
           "type": "capability_bound",
-          **capability_bind.receipt(),
+          **capability_bind.to_json(),
         },
         sid,
       )
@@ -1257,6 +1281,7 @@ async def _dispatch_chat_turn_body(
           raise TypeError(
             "selected_content_admitter must return SelectedContentAdmission"
           )
+        selected_content_activity_lease = selected_content_admission.activity_lease
         if selected_content_admission.model_context:
           if isinstance(runtime.system_prompt, str):
             runtime.system_prompt = (
@@ -1295,7 +1320,7 @@ async def _dispatch_chat_turn_body(
     setattr(event_log, "_gateway_execution_location", runtime.execution_location)
     if runtime.disconnect_handler is None:
       runner_on_disconnect = getattr(runner, "on_disconnect", None)
-      if callable(runner_on_disconnect):
+      if isinstance(runner_on_disconnect, _DisconnectHandler):
         runtime.disconnect_handler = runner_on_disconnect
 
     research_file_activity_lease = active_turn.research_file_activity_lease
@@ -1312,9 +1337,6 @@ async def _dispatch_chat_turn_body(
       bind_research_file_activity(research_file_activity_lease)
       active_turn.research_file_activity_lease = None
 
-    selected_content_activity_lease = (
-      selected_content_admission.activity_lease
-    )
     if selected_content_activity_lease is not None:
       bind_selected_content_activity = getattr(
         runner,
@@ -1415,9 +1437,6 @@ async def _dispatch_chat_turn_body(
         if callable(release_activity):
           release_activity()
     if not selected_content_activity_transferred:
-      selected_content_activity_lease = (
-        selected_content_admission.activity_lease
-      )
       if selected_content_activity_lease is not None:
         selected_content_activity_lease.release()
     if runner_task is None:

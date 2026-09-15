@@ -9,13 +9,16 @@ import pytest
 from fastapi import HTTPException
 
 from agent_gateway.capability_binding import CredentialHandle
+from agent_gateway.capability_execution import BoundCapabilityExecution
 from agent_gateway.model_registry import (
   CAPABILITY_IDS,
   INITIAL_MODEL_REGISTRY,
   INITIAL_MODEL_SELECTION_POLICY,
 )
 from agent_gateway.event_log import EventLog
+from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.providers import AnthropicProvider
+from agent_gateway.runner import AgentRunner
 from agent_gateway.runner_introspection import (
   exception_traceback_already_logged,
   mark_exception_traceback_logged,
@@ -24,6 +27,7 @@ from agent_gateway.research_file_activity_lock import (
   try_acquire_research_file_activity,
 )
 from agent_gateway.selected_content import SelectedContentAdmission
+from agent_gateway.tool_dispatcher import ToolDispatcher
 from agent_gateway.server import (
   ChatMessage,
   ChatRuntime,
@@ -112,46 +116,69 @@ def _make_session(user_id: str = "alice") -> GatewaySession:
   )
 
 
-class _CompletingRunner:
+class _TestRunner(AgentRunner):
+  def __init__(
+    self,
+    event_log: EventLog,
+    capability_execution: BoundCapabilityExecution,
+  ) -> None:
+    super().__init__(
+      event_log=event_log,
+      dispatcher=ToolDispatcher(
+        mcp_client=McpClientManager(inline_servers={}),
+        local_tool_handlers={},
+        event_log=event_log,
+        session_id="dispatch-helper-pr4",
+      ),
+      session_id="dispatch-helper-pr4",
+      capability_execution=capability_execution,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="test",
+    )
+
+
+class _CompletingRunner(_TestRunner):
   def __init__(
     self,
     event_log: EventLog,
     captured: dict[str, Any],
-    capability_execution: Any,
+    capability_execution: BoundCapabilityExecution,
   ) -> None:
-    self._event_log = event_log
+    super().__init__(event_log, capability_execution)
     self._captured = captured
-    self.capability_execution = capability_execution
 
   async def run(
     self,
-    *,
     messages: list[dict[str, Any]],
-    system_prompt: str | None = None,
+    system_prompt: str | list[tuple[str, bool]] | None = None,
     max_turns: int | None = None,
+    **_kwargs,
   ) -> None:
     self._captured["messages"] = messages
     self._captured["system_prompt"] = system_prompt
     self._captured["max_turns"] = max_turns
-    self._event_log.append({"type": "text_delta", "text": "ok"})
-    self._event_log.append({
+    self._log.append({"type": "text_delta", "text": "ok"})
+    self._log.append({
       "type": "stream_complete",
       "terminal_disposition": "completed",
       "usage": {},
     })
 
 
-class _FailingRunner:
-  def __init__(self, event_log: EventLog, capability_execution: Any) -> None:
-    self._event_log = event_log
-    self.capability_execution = capability_execution
-
+class _FailingRunner(_TestRunner):
+  def __init__(
+    self,
+    event_log: EventLog,
+    capability_execution: BoundCapabilityExecution,
+  ) -> None:
+    super().__init__(event_log, capability_execution)
   async def run(
     self,
-    *,
     messages: list[dict[str, Any]],
-    system_prompt: str | None = None,
+    system_prompt: str | list[tuple[str, bool]] | None = None,
     max_turns: int | None = None,
+    **_kwargs,
   ) -> None:
     _ = messages, system_prompt, max_turns
     raise RuntimeError("runner failed")
@@ -162,62 +189,58 @@ class _ResearchFileLeaseRunner(_CompletingRunner):
     self,
     event_log: EventLog,
     captured: dict[str, Any],
-    capability_execution: Any,
+    capability_execution: BoundCapabilityExecution,
   ) -> None:
     super().__init__(event_log, captured, capability_execution)
-    self._research_file_activity_lease: Any | None = None
-
-  def bind_research_file_activity_lease(self, lease: Any) -> None:
-    assert self._research_file_activity_lease is None
-    self._research_file_activity_lease = lease
-
-  def release_research_file_activity_lease_if_owned(self) -> None:
-    lease, self._research_file_activity_lease = (
-      self._research_file_activity_lease,
-      None,
-    )
-    if lease is not None:
-      lease.release()
-
+    # Deliberate negatives: this runner cannot accept selected-content state.
+    self.__dict__["bind_selected_content_activity_lease"] = None
+    self.__dict__["bind_selected_content"] = None
 
 class _MarkedFailingRunner(_FailingRunner):
-  def __init__(self, event_log: EventLog, capability_execution: Any) -> None:
+  def __init__(
+    self,
+    event_log: EventLog,
+    capability_execution: BoundCapabilityExecution,
+  ) -> None:
     super().__init__(event_log, capability_execution)
     self._error = RuntimeError("runner failed")
     mark_exception_traceback_logged(self._error)
 
   async def run(
     self,
-    *,
     messages: list[dict[str, Any]],
-    system_prompt: str | None = None,
+    system_prompt: str | list[tuple[str, bool]] | None = None,
     max_turns: int | None = None,
+    **_kwargs,
   ) -> None:
     _ = messages, system_prompt, max_turns
     raise self._error
 
 
-class _SilentRunner:
-  def __init__(self, event_log: EventLog, capability_execution: Any) -> None:
-    self._event_log = event_log
-    self.capability_execution = capability_execution
+class _SilentRunner(_TestRunner):
+  def __init__(
+    self,
+    event_log: EventLog,
+    capability_execution: BoundCapabilityExecution,
+  ) -> None:
+    super().__init__(event_log, capability_execution)
 
   async def run(
     self,
-    *,
     messages: list[dict[str, Any]],
-    system_prompt: str | None = None,
+    system_prompt: str | list[tuple[str, bool]] | None = None,
     max_turns: int | None = None,
+    **_kwargs,
   ) -> None:
     _ = messages, system_prompt, max_turns
-    self._event_log.append({"type": "text_delta", "text": "partial"})
+    self._log.append({"type": "text_delta", "text": "partial"})
 
 
 async def _dispatch_with_runner(runner_type: type[Any]):
   session = _make_session()
   event_log = EventLog()
 
-  async def _build_chat_runtime(*, session, request, channel, auth_manager):
+  async def _build_chat_runtime(session, request, channel, auth_manager, *, storage_root: Path | None = None):
     _ = session, channel, auth_manager
     return ChatRuntime(
       system_prompt="system",
@@ -255,7 +278,7 @@ def test_dispatch_chat_turn_runs_synchronously_and_fans_out_events() -> None:
     captured: dict[str, Any] = {}
     seen_events: list[dict[str, Any]] = []
 
-    async def _build_chat_runtime(*, session, request, channel, auth_manager):
+    async def _build_chat_runtime(session, request, channel, auth_manager, *, storage_root: Path | None = None):
       _ = channel, auth_manager
       captured["request_user_id"] = request.user_id
       captured["session_user_id"] = session.user_id
@@ -319,7 +342,7 @@ def test_dispatch_chat_turn_clears_stream_active_after_runner_failure() -> None:
     event_log = EventLog()
     seen_events: list[dict[str, Any]] = []
 
-    async def _build_chat_runtime(*, session, request, channel, auth_manager):
+    async def _build_chat_runtime(session, request, channel, auth_manager, *, storage_root: Path | None = None):
       _ = session, channel, auth_manager
       return ChatRuntime(
         system_prompt="system",
@@ -441,7 +464,7 @@ def test_dispatch_chat_turn_rejects_concurrent_turn() -> None:
     session = _make_session()
     session.stream_active = True
 
-    async def _build_chat_runtime(*, session, request, channel, auth_manager):
+    async def _build_chat_runtime(session, request, channel, auth_manager, *, storage_root: Path | None = None):
       _ = session, request, channel, auth_manager
       raise AssertionError("should not build runtime")
 
@@ -475,7 +498,7 @@ def test_dispatch_prestart_selected_content_failure_releases_research_file_lock(
     event_log = EventLog()
     captured: dict[str, Any] = {}
 
-    async def _build_chat_runtime(*, session, request, channel, auth_manager):
+    async def _build_chat_runtime(session, request, channel, auth_manager, *, storage_root: Path | None = None):
       _ = channel, auth_manager
       activity = try_acquire_research_file_activity(
         tmp_path,
@@ -551,7 +574,7 @@ def test_dispatch_prestart_activity_handoff_failure_releases_both_leases(
       {"release": lambda self: selected_release.append("released")},
     )()
 
-    async def _build_chat_runtime(*, session, request, channel, auth_manager):
+    async def _build_chat_runtime(session, request, channel, auth_manager, *, storage_root: Path | None = None):
       _ = channel, auth_manager
       activity = try_acquire_research_file_activity(
         tmp_path,

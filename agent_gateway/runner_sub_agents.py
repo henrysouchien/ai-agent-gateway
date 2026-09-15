@@ -2,9 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import (
+  TYPE_CHECKING,
+  Any,
+  Awaitable,
+  Callable,
+  Dict,
+  List,
+  Literal,
+  Mapping,
+  Optional,
+  Set,
+  Tuple,
+)
 
 from agent_workflow_contracts import (
+  AdmittedTask,
   AttemptRef,
   LogicalTaskRef,
   ResultRequirement,
@@ -27,9 +40,22 @@ from .sub_agent_narrative_result import (
   final_child_visible_text,
   task_result_from_execution,
 )
+from .sub_agent_skill_state import (
+  declared_terminal_doors_from_grant,
+  latest_successful_declared_terminal_tool_result,
+)
 from .task_registry import ParentMessage, TaskEntry, make_progress_tracker
 from .tool_dispatcher import ToolDispatcher
 
+if TYPE_CHECKING:
+  from pathlib import Path
+
+  from .agent_session_log import AgentSessionLog
+  from .mcp_activation import McpActivationFold
+  from .mcp_client import McpClientManager
+  from .multi_user.billing import UsageEvent, _UsageAggregator
+  from .runner_state import SubAgentConfig, ToolResultContext
+  from .tool_result_spill import SpillSink
 
 log = logging.getLogger("agent_gateway.runner")
 _MISSING_SUB_AGENT_ID = object()
@@ -98,24 +124,6 @@ def _build_child_event_log(
     "ignore",
   )
 
-  def _composed_prepare_event(
-    event: Dict[str, Any],
-  ) -> Dict[str, Any]:
-    if type(event) is not dict:
-      raise TypeError("sub-agent event must be an exact dictionary")
-    prior_sub_agent_id = event.get(
-      "sub_agent_id",
-      _MISSING_SUB_AGENT_ID,
-    )
-    event["sub_agent_id"] = sub_session_id
-    try:
-      prepared = original_prepare_event(event)
-    finally:
-      if prior_sub_agent_id is _MISSING_SUB_AGENT_ID:
-        event.pop("sub_agent_id", None)
-      else:
-        event["sub_agent_id"] = prior_sub_agent_id
-    return prepared
 
   def _composed_on_event(
     event: Dict[str, Any],
@@ -143,6 +151,25 @@ def _build_child_event_log(
         pass
 
   if original_prepare_event is not None:
+    def _composed_prepare_event(
+      event: Dict[str, Any],
+    ) -> Dict[str, Any]:
+      if type(event) is not dict:
+        raise TypeError("sub-agent event must be an exact dictionary")
+      prior_sub_agent_id = event.get(
+        "sub_agent_id",
+        _MISSING_SUB_AGENT_ID,
+      )
+      event["sub_agent_id"] = sub_session_id
+      try:
+        prepared = original_prepare_event(event)
+      finally:
+        if prior_sub_agent_id is _MISSING_SUB_AGENT_ID:
+          event.pop("sub_agent_id", None)
+        else:
+          event["sub_agent_id"] = prior_sub_agent_id
+      return prepared
+
     return event_log_cls(
       prepare_event=_composed_prepare_event,
       on_event=_composed_on_event,
@@ -160,7 +187,7 @@ def _authoritative_child_tool_getter(
   *,
   operation: str,
 ) -> Callable[[], List[Dict[str, Any]]]:
-  get_tool_definitions = getattr(
+  get_tool_definitions: Callable[[], List[Dict[str, Any]]] | None = getattr(
     dispatcher,
     "get_tool_definitions",
     None,
@@ -173,6 +200,51 @@ def _authoritative_child_tool_getter(
 
 
 class RunnerSubAgentMixin:
+  if TYPE_CHECKING:
+    _agent_session_log: AgentSessionLog | None
+    _aggregator: _UsageAggregator
+    _billing_mode: Literal["byok", "metered"]
+    _channel: str | None
+    _compaction_trigger: int | None
+    _context_surfaces_provider: (
+      Callable[[], list[dict[str, Any]]] | None
+    )
+    _context_surfaces_static: list[dict[str, Any]]
+    _full_session_id: str
+    _log: EventLog
+    _max_concurrent_sub_agents: int | None
+    _max_resume_chain_depth: int
+    _mcp_activation_fold: McpActivationFold
+    _mcp_client: McpClientManager | None
+    _on_late_usage_event: (
+      Callable[[UsageEvent], Awaitable[None] | None] | None
+    )
+    _on_max_turns: (
+      Callable[[List[Dict[str, Any]], int], Awaitable[str | None]]
+      | None
+    )
+    _on_metric: Callable[[str, int], None] | None
+    _on_tool_result: (
+      Callable[
+        [ToolResultContext],
+        Awaitable[List[Dict[str, Any]] | None],
+      ]
+      | None
+    )
+    _on_tool_timing: Callable[..., None] | None
+    _on_usage: Callable[[UsageEvent], Awaitable[None] | None] | None
+    _per_turn_timeout: float | None
+    _rate_table_version: str
+    _request_id: str
+    _skill_run_id: str | None
+    _spill_dir_provider: SpillSink | None
+    _stream_stall_timeout: float | None
+    _sub_agent_config: SubAgentConfig | None
+    _tool_call_timeout: float | None
+    _usage_ledger_dlq_path: Path
+    _usage_user_id: str
+    _workspace_dir: str | None
+
   async def spawn_sub_agent(
     self,
     task: str,
@@ -199,6 +271,7 @@ class RunnerSubAgentMixin:
     max_budget_usd: float | None = None,
     on_sub_event: Optional[Callable[[Dict[str, Any], str], None]] = None,
     skill_run_id: str | None = None,
+    admitted_task: AdmittedTask | None = None,
   ) -> Tuple[Optional[TaskResult], Optional[Dict[str, Any]]]:
     """Run a focused sub-agent task and return its canonical result.
 
@@ -221,8 +294,21 @@ class RunnerSubAgentMixin:
       result_requirement,
       skill_name=skill_name,
     )
-    if task_entry is not None and task_entry.admitted_task is not None:
-      admitted = task_entry.admitted_task
+    entry_admitted_task = (
+      task_entry.admitted_task
+      if task_entry is not None
+      and isinstance(task_entry.admitted_task, AdmittedTask)
+      else None
+    )
+    if (
+      admitted_task is not None
+      and entry_admitted_task is not None
+      and admitted_task != entry_admitted_task
+    ):
+      raise ValueError("spawn_sub_agent received conflicting admitted tasks")
+    resolved_admitted_task = admitted_task or entry_admitted_task
+    if resolved_admitted_task is not None:
+      admitted = resolved_admitted_task
       if (
         admitted.logical_task != logical_task
         or admitted.attempt != attempt
@@ -311,6 +397,13 @@ class RunnerSubAgentMixin:
       workspace_dir=self._workspace_dir,
       batch_id=getattr(self, "_batch_id", None),
       context_surfaces=self._context_surfaces_provider or self._context_surfaces_static,
+      terminal_tool_result_ids=set(
+        declared_terminal_doors_from_grant(
+          resolved_admitted_task.tool_grant
+          if resolved_admitted_task is not None
+          else None
+        )
+      ),
     )
     timed_out = False
     runtime_exception_detail: str | None = None
@@ -373,8 +466,20 @@ class RunnerSubAgentMixin:
         cleanup_warnings=cleanup_warnings,
       )
 
+    terminal_tool_result = latest_successful_declared_terminal_tool_result(
+      sub_log.entries,
+      declared_terminal_doors=declared_terminal_doors_from_grant(
+        resolved_admitted_task.tool_grant
+        if resolved_admitted_task is not None
+        else None
+      ),
+    )
     final_narrative = None
-    if result_requirement.terminal_narrative != "forbidden":
+    if (
+      terminal_tool_result is None
+      and result_requirement.terminal_narrative != "forbidden"
+      and self._workspace_dir is not None
+    ):
       sub_runner_id = getattr(sub_runner, "_runner_id", None)
       if not isinstance(sub_runner_id, str) or not sub_runner_id:
         raise RuntimeError(
@@ -403,11 +508,9 @@ class RunnerSubAgentMixin:
         else []
       ),
       # B-3: the authority frozen at admission, never the ambient catalog.
-      admitted_task=(
-        task_entry.admitted_task if task_entry is not None else None
-      ),
+      admitted_task=resolved_admitted_task,
     )
-    if cancelled_error is not None:
+    if cancelled_error is not None and terminal_tool_result is None:
       if task_entry is not None:
         task_entry.task_result = result
         task_entry.result = result.model_dump(mode="json")
@@ -443,6 +546,8 @@ class RunnerSubAgentMixin:
     max_budget_usd: float | None = None,
     on_sub_event: Optional[Callable[[Dict[str, Any], str], None]] = None,
     skill_run_id: str | None = None,
+    admitted_task: AdmittedTask | None = None,
+    prior_terminal_tool_result: Mapping[str, Any] | None = None,
     bind_research_file_activity_lease_func: (
       Callable[[Any], None] | None
     ) = None,
@@ -458,8 +563,21 @@ class RunnerSubAgentMixin:
       result_requirement,
       skill_name=skill_name,
     )
-    if task_entry is not None and task_entry.admitted_task is not None:
-      admitted = task_entry.admitted_task
+    entry_admitted_task = (
+      task_entry.admitted_task
+      if task_entry is not None
+      and isinstance(task_entry.admitted_task, AdmittedTask)
+      else None
+    )
+    if (
+      admitted_task is not None
+      and entry_admitted_task is not None
+      and admitted_task != entry_admitted_task
+    ):
+      raise ValueError("resume_sub_agent received conflicting admitted tasks")
+    resolved_admitted_task = admitted_task or entry_admitted_task
+    if resolved_admitted_task is not None:
+      admitted = resolved_admitted_task
       if (
         admitted.logical_task != logical_task
         or admitted.attempt != attempt
@@ -471,6 +589,21 @@ class RunnerSubAgentMixin:
       dispatcher,
       operation="resume_sub_agent",
     )
+
+    if prior_terminal_tool_result is not None:
+      return task_result_from_execution(
+        (),
+        logical_task=logical_task,
+        attempt=attempt,
+        requirement=result_requirement,
+        provenance=result_provenance,
+        final_narrative=None,
+        timed_out=False,
+        timeout=timeout,
+        prior_evidence=prior_evidence,
+        admitted_task=resolved_admitted_task,
+        prior_terminal_tool_result=prior_terminal_tool_result,
+      ), None
 
     if task_entry is not None:
       task_entry.delivered_messages.update(message.message_id for message in parent_messages)
@@ -551,6 +684,13 @@ class RunnerSubAgentMixin:
       workspace_dir=self._workspace_dir,
       batch_id=getattr(self, "_batch_id", None),
       context_surfaces=self._context_surfaces_provider or self._context_surfaces_static,
+      terminal_tool_result_ids=set(
+        declared_terminal_doors_from_grant(
+          resolved_admitted_task.tool_grant
+          if resolved_admitted_task is not None
+          else None
+        )
+      ),
     )
     if bind_research_file_activity_lease_func is not None:
       bind_research_file_activity_lease_func(sub_runner)
@@ -617,8 +757,20 @@ class RunnerSubAgentMixin:
         cleanup_warnings=cleanup_warnings,
       )
 
+    terminal_tool_result = latest_successful_declared_terminal_tool_result(
+      sub_log.entries,
+      declared_terminal_doors=declared_terminal_doors_from_grant(
+        resolved_admitted_task.tool_grant
+        if resolved_admitted_task is not None
+        else None
+      ),
+    )
     final_narrative = None
-    if result_requirement.terminal_narrative != "forbidden":
+    if (
+      terminal_tool_result is None
+      and result_requirement.terminal_narrative != "forbidden"
+      and self._workspace_dir is not None
+    ):
       sub_runner_id = getattr(sub_runner, "_runner_id", None)
       if not isinstance(sub_runner_id, str) or not sub_runner_id:
         raise RuntimeError(
@@ -648,11 +800,9 @@ class RunnerSubAgentMixin:
       ),
       prior_evidence=prior_evidence,
       # B-3: the authority frozen at admission, never the ambient catalog.
-      admitted_task=(
-        task_entry.admitted_task if task_entry is not None else None
-      ),
+      admitted_task=resolved_admitted_task,
     )
-    if cancelled_error is not None:
+    if cancelled_error is not None and terminal_tool_result is None:
       if task_entry is not None:
         task_entry.task_result = result
         task_entry.result = result.model_dump(mode="json")

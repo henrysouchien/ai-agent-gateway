@@ -64,7 +64,7 @@ def test_sdk_runner_usage_event_threads_identity() -> None:
   assert event.request_id == "req-sdk"
   assert event.model == "claude-sonnet-4-6"
   assert event.provider == "anthropic"
-  assert event.capability_bind == execution.bind.receipt()
+  assert event.capability_bind == execution.bind.to_json()
   assert event.provider_reported_model == execution.bind.upstream_model
   assert event.input_tokens == 10
   assert event.provider_unit_deltas == {"web_fetch": 1, "web_search": 2}

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 import multiprocessing
+from multiprocessing.queues import Queue
+from multiprocessing.synchronize import Barrier
 import os
 from pathlib import Path
 import stat
@@ -23,7 +26,7 @@ from agent_gateway.providers.xai_oauth import (
   DEFAULT_XAI_OAUTH_SCOPE,
   _record_is_valid,
   _store_lock,
-  load_xai_token_record,
+  XAIOAuthTokenRecord,
   login_xai_device_code,
   oauth_record_from_config,
   refresh_xai_oauth_token,
@@ -34,7 +37,7 @@ from agent_gateway.providers.xai_oauth import (
 
 
 @pytest.fixture(autouse=True)
-def _reset_store_refresh_consumed() -> None:
+def _reset_store_refresh_consumed() -> Iterator[None]:
   xai_oauth._STORE_REFRESH_CONSUMED.clear()
   yield
   xai_oauth._STORE_REFRESH_CONSUMED.clear()
@@ -55,6 +58,12 @@ def _record(**overrides):
     "token_endpoint": "https://auth.x.ai/oauth2/token",
     **overrides,
   }
+def _load_stored_record(path: Path) -> XAIOAuthTokenRecord:
+  record = xai_oauth.load_xai_token_record(path)
+  assert record is not None
+  return record
+
+
 
 
 def _token_form(request: httpx.Request) -> dict[str, list[str]]:
@@ -138,12 +147,14 @@ class _GatedRefreshTransport(httpx.AsyncBaseTransport):
 def _cross_process_refresh_worker(
   store_path: str,
   server_url: str,
-  barrier: multiprocessing.synchronize.Barrier,
-  captured: multiprocessing.queues.Queue,
+  barrier: Barrier,
+  captured: Queue[str],
 ) -> None:
   settings = resolve_xai_oauth_settings({"auth_store_path": store_path})
-  caller_record = load_xai_token_record(Path(store_path))
-  captured.put(caller_record["refresh_token"])
+  caller_record = _load_stored_record(Path(store_path))
+  refresh_token = caller_record["refresh_token"]
+  assert isinstance(refresh_token, str)
+  captured.put(refresh_token)
   barrier.wait()
 
   class ForwardTransport(httpx.AsyncBaseTransport):
@@ -178,7 +189,7 @@ def test_store_defaults_under_user_data_dir_and_is_mode_0600(tmp_path: Path) -> 
   assert settings.store_path == tmp_path / "xai" / "oauth.json"
   save_xai_token_record(settings.store_path, _record())
   assert stat.S_IMODE(settings.store_path.stat().st_mode) == 0o600
-  assert load_xai_token_record(settings.store_path) == _record()
+  assert _load_stored_record(settings.store_path) == _record()
 
 
 def test_explicit_auth_mode_wins_and_auto_detects_refreshable_store(tmp_path: Path) -> None:
@@ -254,7 +265,7 @@ def test_refresh_rotates_tokens_and_updates_store(tmp_path: Path) -> None:
   save_xai_token_record(settings.store_path, old)
 
   def handler(request: httpx.Request) -> httpx.Response:
-    pending = load_xai_token_record(settings.store_path)
+    pending = _load_stored_record(settings.store_path)
     assert pending["refresh_pending"] is True
     assert pending["refresh_token"] == "refresh-1"
     form = parse_qs(request.content.decode())
@@ -274,7 +285,7 @@ def test_refresh_rotates_tokens_and_updates_store(tmp_path: Path) -> None:
     _run(client.aclose())
   assert refreshed["access_token"] == "access-2"
   assert refreshed["refresh_token"] == "refresh-2"
-  stored = load_xai_token_record(settings.store_path)
+  stored = _load_stored_record(settings.store_path)
   assert stored["refresh_token"] == "refresh-2"
   assert "refresh_pending" not in stored
 
@@ -302,7 +313,7 @@ def test_lost_response_quarantines_and_second_refresh_never_posts(
   with pytest.raises(httpx.ReadTimeout):
     _run(refresh())
   assert posts == ["refresh-1", "refresh-1"]
-  assert load_xai_token_record(settings.store_path)["refresh_pending"] is True
+  assert _load_stored_record(settings.store_path)["refresh_pending"] is True
   with pytest.raises(RuntimeError, match="refresh did not complete previously"):
     _run(refresh())
   assert posts == ["refresh-1", "refresh-1"]
@@ -331,7 +342,7 @@ def test_presend_failure_clears_marker_and_next_refresh_succeeds(
 
   with pytest.raises(exception_type):
     _run(first())
-  assert load_xai_token_record(settings.store_path) == original
+  assert _load_stored_record(settings.store_path) == original
   assert not xai_oauth._STORE_REFRESH_CONSUMED
 
   async def succeeded(request: httpx.Request) -> httpx.Response:
@@ -347,7 +358,7 @@ def test_presend_failure_clears_marker_and_next_refresh_succeeds(
 
   _run(second())
   assert posts == ["refresh-1", "refresh-1"]
-  assert load_xai_token_record(settings.store_path)["refresh_token"] == "refresh-2"
+  assert _load_stored_record(settings.store_path)["refresh_token"] == "refresh-2"
 
 
 def test_presend_then_lost_response_quarantines_on_second_invocation(
@@ -374,11 +385,11 @@ def test_presend_then_lost_response_quarantines_on_second_invocation(
 
   with pytest.raises(httpx.ConnectError):
     _run(refresh())
-  assert load_xai_token_record(settings.store_path) == original
+  assert _load_stored_record(settings.store_path) == original
   with pytest.raises(httpx.ReadTimeout):
     _run(refresh())
   assert posts == ["refresh-1", "refresh-1", "refresh-1"]
-  assert load_xai_token_record(settings.store_path)["refresh_pending"] is True
+  assert _load_stored_record(settings.store_path)["refresh_pending"] is True
   with pytest.raises(RuntimeError, match="refresh did not complete previously"):
     _run(refresh())
   assert posts == ["refresh-1", "refresh-1", "refresh-1"]
@@ -426,7 +437,7 @@ def test_grace_recovery_saves_successor_after_lost_response(
     refreshed["device_authorization_endpoint"]
     == original["device_authorization_endpoint"]
   )
-  stored = load_xai_token_record(settings.store_path)
+  stored = _load_stored_record(settings.store_path)
   assert stored["refresh_token"] == "refresh-2"
   assert "refresh_pending" not in stored
 
@@ -457,7 +468,7 @@ def test_grace_recovery_invalid_grant_keeps_marker(
   with pytest.raises(RuntimeError, match="invalid_grant"):
     _run(run())
   assert posts == ["first", "retry"]
-  assert load_xai_token_record(settings.store_path)["refresh_pending"] is True
+  assert _load_stored_record(settings.store_path)["refresh_pending"] is True
 
 
 def test_grace_recovery_double_ambiguous_stops_after_one_retry(
@@ -486,7 +497,7 @@ def test_grace_recovery_double_ambiguous_stops_after_one_retry(
   with pytest.raises(httpx.ReadTimeout, match="retry response lost"):
     _run(run())
   assert posts == ["first", "retry"]
-  assert load_xai_token_record(settings.store_path)["refresh_pending"] is True
+  assert _load_stored_record(settings.store_path)["refresh_pending"] is True
 
 
 def test_grace_recovery_skips_retry_when_initial_budget_is_too_small(
@@ -526,7 +537,7 @@ def test_grace_recovery_skips_retry_when_initial_budget_is_too_small(
   with pytest.raises(httpx.ReadTimeout, match="original ambiguous"):
     _run(run())
   assert retry_posts == 0
-  assert load_xai_token_record(settings.store_path)["refresh_pending"] is True
+  assert _load_stored_record(settings.store_path)["refresh_pending"] is True
 
 
 def test_grace_recovery_charges_client_construction_to_budget(
@@ -573,7 +584,7 @@ def test_grace_recovery_charges_client_construction_to_budget(
   assert len(created) == 1
   assert created[0][0].is_closed
   assert retry_posts == 0
-  assert load_xai_token_record(settings.store_path)["refresh_pending"] is True
+  assert _load_stored_record(settings.store_path)["refresh_pending"] is True
 
 
 def test_grace_retry_deadline_cancels_only_local_retry_task(
@@ -609,11 +620,12 @@ def test_grace_retry_deadline_cancels_only_local_retry_task(
         await refresh_xai_oauth_token(original, settings=settings, client=client, force=True)
       assert retry_started.is_set()
       assert retry_cancelled.is_set()
-      assert asyncio.current_task() is not None
-      assert not asyncio.current_task().cancelled()
+      task = asyncio.current_task()
+      assert task is not None
+      assert not task.cancelled()
 
   _run(run())
-  assert load_xai_token_record(settings.store_path)["refresh_pending"] is True
+  assert _load_stored_record(settings.store_path)["refresh_pending"] is True
 
 
 def test_delayed_first_post_success_beyond_grace_budget_is_preserved(
@@ -658,7 +670,7 @@ def test_delayed_first_post_success_beyond_grace_budget_is_preserved(
   assert _run(run())["refresh_token"] == "refresh-2"
   assert first_posts == 1
   assert retry_posts == 0
-  assert "refresh_pending" not in load_xai_token_record(settings.store_path)
+  assert "refresh_pending" not in _load_stored_record(settings.store_path)
 
 
 @pytest.mark.parametrize("exception_type", xai_oauth._PRESEND_EXC)
@@ -688,7 +700,7 @@ def test_every_presend_failure_keeps_existing_cleanup_semantics(
   with pytest.raises(exception_type):
     _run(run())
   assert posts == 1
-  assert load_xai_token_record(settings.store_path) == original
+  assert _load_stored_record(settings.store_path) == original
   assert (canonical in xai_oauth._STORE_REFRESH_CONSUMED) is was_present
 
 
@@ -762,7 +774,7 @@ def test_explicit_refresh_reject_is_not_grace_retried(
     _run(run())
   assert first_posts == 1
   assert retry_posts == 0
-  assert load_xai_token_record(settings.store_path)["refresh_pending"] is True
+  assert _load_stored_record(settings.store_path)["refresh_pending"] is True
 
 
 def test_first_post_success_never_constructs_grace_client(
@@ -797,7 +809,7 @@ def test_first_post_success_never_constructs_grace_client(
 
   assert _run(run())["refresh_token"] == "refresh-2"
   assert created == []
-  assert "refresh_pending" not in load_xai_token_record(settings.store_path)
+  assert "refresh_pending" not in _load_stored_record(settings.store_path)
 
 
 def test_restart_pending_marker_still_blocks_before_any_post(tmp_path: Path) -> None:
@@ -845,7 +857,7 @@ def test_cancelled_error_during_first_post_propagates_without_retry(
 
   _run(run())
   assert retry_posts == 0
-  assert load_xai_token_record(settings.store_path)["refresh_pending"] is True
+  assert _load_stored_record(settings.store_path)["refresh_pending"] is True
 
 
 def test_cancelled_error_during_grace_retry_propagates_untouched(
@@ -874,7 +886,7 @@ def test_cancelled_error_during_grace_retry_propagates_untouched(
 
   _run(run())
   assert retry_posts == 1
-  assert load_xai_token_record(settings.store_path)["refresh_pending"] is True
+  assert _load_stored_record(settings.store_path)["refresh_pending"] is True
 
 
 def test_success_without_rotated_refresh_token_stays_quarantined(tmp_path: Path) -> None:
@@ -893,7 +905,7 @@ def test_success_without_rotated_refresh_token_stays_quarantined(tmp_path: Path)
 
   with pytest.raises(RuntimeError, match="missing refresh_token"):
     _run(run())
-  stored = load_xai_token_record(settings.store_path)
+  stored = _load_stored_record(settings.store_path)
   assert stored["refresh_pending"] is True
   assert stored["refresh_token"] == "refresh-1"
   assert posts == ["refresh-1"]
@@ -915,7 +927,7 @@ def test_invalid_grant_retains_marker_and_subsequent_refresh_is_gated(tmp_path: 
 
   with pytest.raises(RuntimeError, match="invalid_grant"):
     _run(run())
-  assert load_xai_token_record(settings.store_path)["refresh_pending"] is True
+  assert _load_stored_record(settings.store_path)["refresh_pending"] is True
   with pytest.raises(RuntimeError, match="refresh did not complete previously"):
     _run(run())
   assert posts == ["refresh-1"]
@@ -955,7 +967,7 @@ def test_rotated_token_save_failure_retries_and_retains_marker(
   with pytest.raises(OSError, match="rotated save failed"):
     _run(run())
   assert save_calls == 1 + xai_oauth._SAVE_ATTEMPTS
-  stored = load_xai_token_record(settings.store_path)
+  stored = _load_stored_record(settings.store_path)
   assert stored["refresh_pending"] is True
   assert stored["refresh_token"] == "refresh-1"
   assert posts == ["refresh-1"]
@@ -1055,7 +1067,7 @@ def test_login_clears_refresh_quarantine_and_logout_tombstone(
       await login_xai_device_code(config={"auth_store_path": str(store)}, client=client)
 
   _run(login())
-  stored = load_xai_token_record(store)
+  stored = _load_stored_record(store)
   assert stored["access_token"] == "access-login"
   assert stored["refresh_token"] == "refresh-login"
   assert "refresh_pending" not in stored
@@ -1270,10 +1282,10 @@ def test_presend_failure_never_resets_prior_consuming_history(tmp_path: Path) ->
     raise httpx.ConnectError("not sent", request=request)
 
   with pytest.raises(httpx.ConnectError):
-    _run(refresh(load_xai_token_record(settings.store_path), httpx.MockTransport(presend)))
+    _run(refresh(_load_stored_record(settings.store_path), httpx.MockTransport(presend)))
   canonical = os.path.realpath(settings.store_path)
   assert canonical in xai_oauth._STORE_REFRESH_CONSUMED
-  assert "refresh_pending" not in load_xai_token_record(settings.store_path)
+  assert "refresh_pending" not in _load_stored_record(settings.store_path)
   settings.store_path.unlink()
 
   async def should_not_post(request: httpx.Request) -> httpx.Response:
@@ -1326,7 +1338,7 @@ def test_provider_refreshes_once_on_401_then_retries_response(tmp_path: Path) ->
   assert response_attempts == 2
   assert authorization_headers == ["Bearer access-1", "Bearer access-2"]
   assert events[-1].type == "message_end"
-  assert load_xai_token_record(store)["refresh_token"] == "refresh-2"
+  assert _load_stored_record(store)["refresh_token"] == "refresh-2"
 
 
 def test_untrusted_discovery_override_is_rejected() -> None:
@@ -1410,7 +1422,7 @@ def test_independent_clients_serialize_and_never_reuse_refresh_token(
     assert len(transport.posts) == len(set(transport.posts))
 
   _run(run())
-  assert load_xai_token_record(settings.store_path)["refresh_token"] == "refresh-3"
+  assert _load_stored_record(settings.store_path)["refresh_token"] == "refresh-3"
 
 
 def test_concurrent_proactive_refresh_on_one_client_rotates_once(tmp_path: Path) -> None:
@@ -1557,6 +1569,7 @@ def test_config_overlay_chimera_posts_store_refresh_token(
   save_xai_token_record(store, _record(refresh_token="refresh-store", expires_at=1))
   monkeypatch.setenv("XAI_REFRESH_TOKEN", "refresh-caller")
   caller, settings = oauth_record_from_config({"auth_store_path": str(store)})
+  assert caller is not None
   assert caller["refresh_token"] == "refresh-caller"
   posts: list[str] = []
 
@@ -1746,7 +1759,7 @@ def test_caller_cancellation_during_successful_grace_retry_waits_for_save(
     retry_transport.release_response.set()
     with pytest.raises(asyncio.CancelledError):
       await task
-    assert load_xai_token_record(store)["refresh_token"] == "refresh-2"
+    assert _load_stored_record(store)["refresh_token"] == "refresh-2"
     assert provider.close_started.is_set()
     assert retry_transport.closed.is_set()
     assert retry_transport.aborted is False
@@ -1954,7 +1967,7 @@ def test_provider_stream_entry_paths_drive_grace_recovery(
   assert retry_posts == ["refresh-1"]
   assert inference_attempts == (1 if entry_path == "proactive" else 2)
   assert events[-1].type == "message_end"
-  stored = load_xai_token_record(store)
+  stored = _load_stored_record(store)
   assert stored["refresh_token"] == "refresh-2"
   assert "refresh_pending" not in stored
 
@@ -2035,7 +2048,7 @@ def test_cancelled_summarizer_keeps_client_open_until_rotated_token_is_saved(
     transport.release_response.set()
     with pytest.raises(asyncio.CancelledError):
       await task
-    assert load_xai_token_record(store)["refresh_token"] == "refresh-2"
+    assert _load_stored_record(store)["refresh_token"] == "refresh-2"
     assert provider.close_started.is_set()
     assert transport.closed.is_set()
     assert transport.aborted is False
@@ -2050,16 +2063,16 @@ def test_cancelled_summarizer_keeps_client_open_until_rotated_token_is_saved(
       )
 
     settings = resolve_xai_oauth_settings({"auth_store_path": str(store)})
-    async with httpx.AsyncClient(transport=httpx.MockTransport(next_handler)) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(next_handler)) as refresh_client:
       await refresh_xai_oauth_token(
-        load_xai_token_record(store),
+        _load_stored_record(store),
         settings=settings,
-        client=client,
+        client=refresh_client,
         force=True,
       )
     assert next_posts == ["refresh-2"]
     assert "refresh-1" not in next_posts
-    assert load_xai_token_record(store)["refresh_token"] == "refresh-3"
+    assert _load_stored_record(store)["refresh_token"] == "refresh-3"
 
   _run(run())
 
@@ -2101,7 +2114,7 @@ def test_cancellation_during_rotated_save_finishes_safe_commit(
         await refresh_caller
 
   _run(run())
-  stored = load_xai_token_record(store)
+  stored = _load_stored_record(store)
   assert stored["refresh_token"] == "refresh-2"
   assert "refresh_pending" not in stored
 
@@ -2144,7 +2157,7 @@ def test_cancellation_during_presend_cleanup_never_leaves_clear_but_consumed_sta
         await refresh_caller
 
   _run(run())
-  assert load_xai_token_record(store) == original
+  assert _load_stored_record(store) == original
   assert not xai_oauth._STORE_REFRESH_CONSUMED
 
 
@@ -2200,7 +2213,7 @@ def test_save_failure_after_cancelled_accepted_post_is_retrieved_and_logged(
   caplog.set_level(logging.ERROR, logger=xai_oauth.__name__)
   unhandled, posts = _run(run())
   assert posts == ["refresh-1"]
-  stored = load_xai_token_record(store)
+  stored = _load_stored_record(store)
   assert stored["refresh_token"] == "refresh-1"
   assert stored["refresh_pending"] is True
   assert "durable save failed" in caplog.text
@@ -2263,7 +2276,7 @@ def test_refresh_500_keeps_store_quarantined_and_lock_reacquirable(tmp_path: Pat
       pass
 
   _run(run())
-  stored = load_xai_token_record(settings.store_path)
+  stored = _load_stored_record(settings.store_path)
   assert stored["refresh_token"] == "refresh-1"
   assert stored["refresh_pending"] is True
 
@@ -2336,14 +2349,14 @@ def test_login_and_refresh_saves_are_serialized_without_torn_write(tmp_path: Pat
         )
       )
       await transport.login_token_issued.wait()
-      pending = load_xai_token_record(store)
+      pending = _load_stored_record(store)
       assert pending["refresh_token"] == original["refresh_token"]
       assert pending["refresh_pending"] is True
       transport.release_refresh.set()
       await asyncio.gather(refresh, login)
 
   _run(run())
-  final = load_xai_token_record(store)
+  final = _load_stored_record(store)
   assert final["access_token"] == "access-login"
   assert final["refresh_token"] == "refresh-login"
   assert _record_is_valid(final, settings)
@@ -2478,6 +2491,11 @@ def test_cross_process_refreshers_capture_same_record_but_never_post_same_token(
 
   assert server_state["posts"] == ["refresh-1", "refresh-2"]
   assert len(server_state["posts"]) == len(set(server_state["posts"]))
-  final = load_xai_token_record(store)
+  final = _load_stored_record(store)
   assert final["refresh_token"] == "refresh-3"
   assert _record_is_valid(final, settings)
+
+
+def test_corrupt_expires_at_triggers_proactive_refresh() -> None:
+  assert xai_oauth.token_needs_refresh(_record(expires_at="not-a-number")) is True
+  assert xai_oauth.token_needs_refresh(_record(expires_at=4_000_000_000)) is False

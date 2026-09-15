@@ -18,6 +18,7 @@ from agent_gateway import (
   AgentSessionLog,
   CostEstimate,
   EventLog,
+  McpClientManager,
   ModelInfo,
   ParentMessage,
   TaskRegistry,
@@ -51,15 +52,9 @@ def _run(coro):
   return asyncio.run(coro)
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
-    return False
-
-  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
-    return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
-
-  def get_tool_definitions(self) -> list[dict[str, Any]]:
-    return []
+class _NullMcpClient(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
 
 
 class _RegistryRunner:
@@ -164,6 +159,7 @@ def test_make_send_message_handler_delivers_message_by_task_id() -> None:
   result, error = _run(handler({"to": entry.task_id, "message": "Check the appendix"}))
 
   assert error is None
+  assert result is not None
   assert result["status"] == "queued"
   assert result["task_id"] == entry.task_id
   assert result["message_id"]
@@ -182,6 +178,7 @@ def test_make_send_message_handler_preserves_sub_agent_export() -> None:
   result, error = _run(handler({"to": entry.task_id, "message": "Use direct import"}))
 
   assert error is None
+  assert result is not None
   assert result["status"] == "queued"
   assert result["task_id"] == entry.task_id
   assert result["message_id"]
@@ -210,6 +207,7 @@ def test_make_send_message_handler_emits_parent_message_sent_with_correlation() 
   result, error = _run(handler({"to": entry.task_id, "message": "Check the appendix"}))
 
   assert error is None
+  assert result is not None
   assert len(runner.events) == 1
   event = runner.events[0]
   assert result["status"] == "accepted"
@@ -242,6 +240,7 @@ def test_make_send_message_handler_emits_before_deliver() -> None:
   result, error = _run(handler({"to": entry.task_id, "message": "Check ordering"}))
 
   assert error is None
+  assert result is not None
   assert result["status"] == "accepted"
   assert result["task_id"] == entry.task_id
   assert result["message_id"] == runner.events[0]["message_id"]
@@ -341,7 +340,7 @@ def test_send_message_and_completion_lock_order_is_truthful() -> None:
       await release_append.wait()
       return await original_append(event)
 
-    runner._append_durable_event = _blocking_append  # type: ignore[method-assign]
+    runner._append_durable_event = _blocking_append
     handler = make_send_message_handler([runner])
     send = asyncio.create_task(handler({
       "to": entry.task_id,
@@ -836,6 +835,7 @@ def test_make_send_message_handler_delivers_message_by_agent_name() -> None:
   result, error = _run(handler({"to": "writer", "message": "Focus on the risks"}))
 
   assert error is None
+  assert result is not None
   assert result["status"] == "queued"
   assert result["task_id"] == entry.task_id
   assert result["message_id"]
@@ -989,7 +989,7 @@ def test_run_drains_message_inbox_and_injects_parent_messages_between_turns() ->
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    runner._stream_turn = _fake_stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = _fake_stream_turn
 
     await runner.run(
       messages=[{"role": "user", "content": "Start"}],
@@ -1123,7 +1123,7 @@ def test_send_message_persists_event_and_child_sees_parent_message_envelope(tmp_
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    child_runner._stream_turn = _fake_stream_turn  # type: ignore[method-assign]
+    child_runner._stream_turn = _fake_stream_turn
     await child_runner.run(messages=[{"role": "user", "content": "Start"}])
 
     assert seen_messages[0][-1] == {

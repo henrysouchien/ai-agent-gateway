@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 
 from .autonomous_approval_channel import (
   AutonomousApprovalChannelAuthority,
@@ -50,10 +50,36 @@ def _epoch_ns(value: datetime) -> int:
     + delta.microseconds * 1_000
   )
 
+class _AutonomousApprovalAckStore(Protocol):
+  async def get_autonomous_approval_delivery(
+    self,
+    approval_id: str,
+    *,
+    tool_call_id: str,
+    nonce: str,
+  ) -> dict[str, Any] | None: ...
+
+  async def get(self, approval_id: str) -> object | None: ...
+
+  async def acknowledge_autonomous_approval_delivery(
+    self,
+    approval_id: str,
+    *,
+    task_id: str,
+    control_run_id: str,
+    session_id: str,
+    channel_id: str,
+    tool_call_id: str,
+    nonce: str,
+    approved: bool,
+    decided_at_ns: int,
+  ) -> dict[str, Any]: ...
+
+
 
 async def require_durable_autonomous_approval_acknowledgement(
   *,
-  store: Any,
+  store: _AutonomousApprovalAckStore,
   record: Any,
   event: dict[str, Any],
 ) -> dict[str, Any]:
@@ -107,11 +133,11 @@ async def require_durable_autonomous_approval_acknowledgement(
     )
   try:
     channel_authority = AutonomousApprovalChannelAuthority(
-      launch_nonce=event.get("launch_nonce"),
-      task_id=event.get("task_id"),
-      control_run_id=event.get("control_run_id"),
-      session_id=event.get("session_id"),
-      channel_id=event.get("channel_id"),
+      launch_nonce=event["launch_nonce"],
+      task_id=event["task_id"],
+      control_run_id=event["control_run_id"],
+      session_id=event["session_id"],
+      channel_id=event["channel_id"],
     )
     decision = AutonomousApprovalDecision(
       authority=channel_authority,
@@ -159,7 +185,7 @@ async def require_durable_autonomous_approval_acknowledgement(
     raise RuntimeError(
       "autonomous approval acknowledgement store is unavailable"
     )
-  delivery = await get_delivery(
+  delivery = await store.get_autonomous_approval_delivery(
     approval_id,
     tool_call_id=tool_call_id,
     nonce=nonce,
@@ -186,7 +212,7 @@ async def require_durable_autonomous_approval_acknowledgement(
     raise RuntimeError(
       "autonomous approval acknowledgement has no exact published delivery"
     )
-  request = await get_request(approval_id)
+  request = await store.get(approval_id)
   if request is None:
     raise RuntimeError(
       "autonomous approval acknowledgement request is missing"
@@ -224,7 +250,7 @@ async def require_durable_autonomous_approval_acknowledgement(
       "autonomous approval acknowledgement decision time changed"
     )
   if delivery["state"] == "published":
-    delivery = await acknowledge(
+    delivery = await store.acknowledge_autonomous_approval_delivery(
       approval_id,
       task_id=event["task_id"],
       control_run_id=event["control_run_id"],

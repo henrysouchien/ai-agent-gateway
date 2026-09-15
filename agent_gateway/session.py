@@ -15,12 +15,14 @@ from fastapi import HTTPException
 
 from agent_workflow_contracts import WorkflowContentPage
 
+from .approval_route import NO_APPROVAL_ROUTE, ApprovalRoute
 from .capability_binding import (
   CAPABILITY_IDS,
   CapabilityId,
   CredentialHandle,
   CredentialPrincipal,
   ModelSelectionIntent,
+  SESSION_DRIVER_CAPABILITY,
 )
 from .events import DEFAULT_SCHEMA_VERSION
 from .event_log import EventLog
@@ -29,7 +31,18 @@ from .session_event_history import SessionEventHistory
 from .session_capabilities import normalize_session_capabilities
 
 if TYPE_CHECKING:
+  from agent.batch.run_ref import RunRef
+
+  from .agent_session_log import AgentSessionLog, AgentSessionLogLocation
+  from .agent_session_log_layout import AutonomousSessionLogAuthority
+  from .approval_audit import ApprovalAuditEmitter
+  from .approval_policy import RunContext
+  from .autonomous_approval_channel import AutonomousApprovalChannelChild
+  from .autonomous_launch_envelope import AutonomousControlAuthority
+  from .batch_approval_projection import BatchApprovalScope
   from .multi_user.billing import SessionUsageSummary
+  from .tool_result_spill import SpillSink
+  from .dispatcher_factory import GatewayDispatcherDeps
 
 
 JWT_ALGORITHM = "HS256"
@@ -39,6 +52,7 @@ OnSessionExpiry = Callable[["GatewaySession"], Awaitable[None] | None]
 SessionExpiryBlocker = Callable[["GatewaySession"], int]
 _RESERVED_USER_IDS = {"_default"}
 WorkflowOutputReader = Callable[[str, str, int], Awaitable[WorkflowContentPage]]
+WorkflowSettlementObstructionReader = Callable[[], tuple[Any, ...]]
 
 
 def _normalize_required_user_id(user_id: str | None) -> str:
@@ -179,6 +193,7 @@ class GatewaySession:
   model_entitled_keys: frozenset[str] = field(default_factory=frozenset)
   kind: Literal["chat", "control"] = "chat"
   auth_config: dict[str, Any] | None = field(default=None, repr=False)
+  session_token: str | None = field(default=None, repr=False)
   tenant_id: str | None = None
   session_credential_handle: CredentialHandle | None = None
   allow_service_for_interactive: bool = False
@@ -205,6 +220,17 @@ class GatewaySession:
   mcp_activation_fold: McpActivationFold = field(default_factory=McpActivationFold)
   loaded_local_tools: Set[str] = field(default_factory=set)
   approval_queues: Dict[str, asyncio.Queue] = field(default_factory=dict)
+  gateway_local_skill_tools: list[dict[str, Any]] = field(
+    default_factory=list,
+    init=False,
+    repr=False,
+    compare=False,
+  )
+  # The single admitted answer to "what authorizes this run's exact planned
+  # write, and whose ledger records the decision". `approval_store` /
+  # `approval_policy` below are a projection of this route written only by
+  # admission; no consumer may test them to infer the run's authority.
+  approval_route: ApprovalRoute = NO_APPROVAL_ROUTE
   approval_store: Any | None = None
   approval_policy: Any | None = None
   max_budget_usd: float | None = None
@@ -212,12 +238,46 @@ class GatewaySession:
   tool_sequence: int = 0
   result_queue: Optional[asyncio.Queue] = None
   code_execution_work_dir: Optional[str] = None
+  request_id: str | None = None
+  run_context: RunContext | None = field(default=None, repr=False)
+  agent_session_log: AgentSessionLog | None = field(default=None, repr=False)
+  approval_audit_emitter: ApprovalAuditEmitter | None = field(
+    default=None,
+    repr=False,
+  )
+  autonomous_task_id: str | None = None
+  autonomous_channel_id: str | None = None
+  autonomous_launch_nonce: str | None = None
+  autonomous_control_authority: AutonomousControlAuthority | None = field(
+    default=None,
+    repr=False,
+  )
+  autonomous_approval_channel: AutonomousApprovalChannelChild | None = field(
+    default=None,
+    repr=False,
+  )
+  autonomous_control_event_log: EventLog | None = field(default=None, repr=False)
+  autonomous_session_log_authority: AutonomousSessionLogAuthority | None = field(
+    default=None,
+    repr=False,
+  )
+  autonomous_session_log_location: AgentSessionLogLocation | None = field(
+    default=None,
+    repr=False,
+  )
+  batch_approval_projected: bool | None = None
+  batch_approval_scope: BatchApprovalScope | None = field(default=None, repr=False)
+  batch_run_ref: RunRef | None = None
+  batch_id: int | None = None
+  batch_stage_run_seq: int | None = None
+  tool_result_spill_sink: SpillSink | None = field(default=None, repr=False)
   background_tasks: Dict[str, Any] = field(default_factory=dict)
   control_chat_tasks: Dict[str, asyncio.Task[Any]] = field(default_factory=dict)
   event_history: SessionEventHistory = field(default_factory=SessionEventHistory)
   initial_message: str = ""
   dispatch_scope: dict[str, Any] | None = None
   stage_skill_route: dict[str, str] | None = None
+  control_stage_authority: Any | None = field(default=None, repr=False)
   purpose: str | None = None
   learn_memory_nudge_turns: int = 0
   learn_skill_nudge_iters: int = 0
@@ -226,6 +286,16 @@ class GatewaySession:
   workflow_output_reader: WorkflowOutputReader | None = field(
     default=None,
     repr=False,
+  )
+  workflow_settlement_obstruction: WorkflowSettlementObstructionReader | None = field(
+    default=None,
+    repr=False,
+    compare=False,
+  )
+  _gateway_dispatcher_deps: GatewayDispatcherDeps | None = field(
+    default=None,
+    repr=False,
+    compare=False,
   )
   _commercial_dispatch_owner: object | None = field(default=None, repr=False)
   _capability_selections_bound: bool = field(default=False, repr=False)
@@ -253,7 +323,7 @@ def bind_session_capability_selections(
   for capability_id in normalized:
     if capability_id not in CAPABILITY_IDS:
       raise ValueError(f"unknown capability_id: {capability_id!r}")
-    if capability_id in {"session.driver", "node.fork"}:
+    if capability_id in {SESSION_DRIVER_CAPABILITY, "node.fork"}:
       raise ValueError(f"{capability_id} cannot be selected at session init")
   for capability_id, intent in normalized.items():
     if not isinstance(intent, ModelSelectionIntent):
@@ -469,6 +539,25 @@ class SessionStore:
     self._session_kinds[session_id] = kind
     return session
 
+  def register_session(self, session: GatewaySession) -> None:
+    """Register an already-constructed session with exact caller authority."""
+
+    if type(session) is not GatewaySession:
+      raise TypeError("registered session must be an exact GatewaySession")
+    if (
+      not session.session_id
+      or not session.api_key_hash
+      or session.expires_at <= session.created_at
+      or session.kind not in {"chat", "control"}
+      or session._expired
+    ):
+      raise ValueError("registered session is invalid")
+    existing = self.sessions.get(session.session_id)
+    if existing is not None and not existing._expired:
+      raise ValueError("session_id is already registered")
+    self.sessions[session.session_id] = session
+    self._session_kinds[session.session_id] = session.kind
+
   def get_session(self, session_id: str) -> Optional[GatewaySession]:
     session = self.sessions.get(session_id)
     if session is None or session._expired:
@@ -623,6 +712,7 @@ class SessionStore:
     if session.code_execution_work_dir:
       shutil.rmtree(session.code_execution_work_dir, ignore_errors=True)
       session.code_execution_work_dir = None
+    session.tool_result_spill_sink = None
 
 
 class AuthManager:
@@ -671,7 +761,9 @@ class AuthManager:
       "is_public": session.is_public,
       "schema_version": session.schema_version,
     }
-    return jwt.encode(payload, self._secret, algorithm=JWT_ALGORITHM)
+    token = jwt.encode(payload, self._secret, algorithm=JWT_ALGORITHM)
+    session.session_token = token
+    return token
 
   def _decode_token(self, token: str) -> dict[str, Any]:
     try:
@@ -795,6 +887,7 @@ class AuthManager:
     session = self.session_store.get_session(session_id)
     if session is None:
       raise HTTPException(status_code=401, detail="Unknown session")
+    session.session_token = token
     return session, payload
 
   def verify_token(self, token: str) -> GatewaySession:

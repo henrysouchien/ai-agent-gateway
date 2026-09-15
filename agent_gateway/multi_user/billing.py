@@ -7,9 +7,23 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, TypeAlias
 
 from agent_workflow_contracts import CapabilityBind
+
+BillingMode: TypeAlias = Literal["byok", "metered"]
+UsageState: TypeAlias = Literal[
+  "succeeded", "failed_billable", "failed_unbilled", "canceled"
+]
+UsageValue: TypeAlias = (
+  int
+  | str
+  | dict[str, int]
+  | dict[str, str]
+  | None
+)
+
+UsageTotals: TypeAlias = dict[str, UsageValue]
 
 
 DEFAULT_USAGE_DLQ_PATH = Path("~/.gateway/usage_dlq.jsonl").expanduser()
@@ -36,7 +50,7 @@ class UsageEvent:
   cache_creation_tokens: int
   cost_usd: float
   rate_table_version: str
-  billing_mode: Literal["byok", "metered"]
+  billing_mode: BillingMode
   channel: str | None
   provider: str
   capability_bind: dict[str, str]
@@ -51,12 +65,12 @@ class UsageEvent:
   event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
   def __post_init__(self) -> None:
-    bind = CapabilityBind.from_receipt(self.capability_bind)
+    bind = CapabilityBind.from_json(self.capability_bind)
     if self.model != bind.upstream_model:
       raise ValueError("usage model projection differs from capability bind")
     if self.provider != bind.provider:
       raise ValueError("usage provider projection differs from capability bind")
-    object.__setattr__(self, "capability_bind", bind.receipt())
+    object.__setattr__(self, "capability_bind", bind.to_json())
     if self.provider_reported_model is not None:
       if not isinstance(self.provider_reported_model, str):
         raise ValueError("provider_reported_model must be a string when present")
@@ -73,6 +87,8 @@ class SessionUsageSummary:
   `cost` is the billing total for the completed session. Stream-level
   `estimated_cost` values remain live per-turn estimates and can differ when
   background tasks complete before or after the main stream completes.
+  Wall time includes request drain/finalizers. TTFT measures the first
+  non-empty assistant text from stream start, not provider or tool activity.
   """
 
   user_id: str
@@ -93,13 +109,25 @@ class SessionUsageSummary:
   model: str | None = None
   provider: str | None = None
   rate_table_version: str | None = None
-  billing_mode: Literal["byok", "metered"] | None = None
+  billing_mode: BillingMode | None = None
   context_surfaces: list[dict[str, Any]] = field(default_factory=list)
   usage_event_count: int = 0
   usage_event_ids: tuple[str, ...] = ()
   compaction_count: int = 0
   capability_bind: dict[str, str] | None = None
   provider_reported_model: str | None = None
+  stream_started_at: float | None = None
+  first_text_at: float | None = None
+
+  @property
+  def wall_time_s(self) -> float:
+    return self.ended_at - self.started_at
+
+  @property
+  def ttft_s(self) -> float | None:
+    if self.first_text_at is None or self.stream_started_at is None:
+      return None
+    return self.first_text_at - self.stream_started_at
 
   def __post_init__(self) -> None:
     if self.usage_event_count < 0:
@@ -109,12 +137,12 @@ class SessionUsageSummary:
         raise ValueError(
           "usage summaries with a capability bind require provider observations"
         )
-      bind = CapabilityBind.from_receipt(self.capability_bind)
+      bind = CapabilityBind.from_json(self.capability_bind)
       if self.model is not None and self.model != bind.upstream_model:
         raise ValueError("usage summary model projection differs from capability bind")
       if self.provider is not None and self.provider != bind.provider:
         raise ValueError("usage summary provider projection differs from capability bind")
-      object.__setattr__(self, "capability_bind", bind.receipt())
+      object.__setattr__(self, "capability_bind", bind.to_json())
       object.__setattr__(self, "model", bind.upstream_model)
       object.__setattr__(self, "provider", bind.provider)
     elif (
@@ -153,7 +181,7 @@ def normalize_identity(
   rate_table_version: str | None,
   billing_mode: str | None,
   channel: str | None,
-) -> tuple[str, str, Literal["byok", "metered"], str | None]:
+) -> tuple[str, str, BillingMode, str | None]:
   """Validate and normalize the usage identity attached to billing records."""
   normalized_user_id = str(user_id or "").strip()
   if not normalized_user_id:
@@ -166,11 +194,13 @@ def normalize_identity(
     raise ValueError("rate_table_version is required for usage identity")
 
   normalized_billing_mode_raw = str(billing_mode or "").strip().lower()
-  if normalized_billing_mode_raw not in {"byok", "metered"}:
+  if (
+    normalized_billing_mode_raw != "byok"
+    and normalized_billing_mode_raw != "metered"
+  ):
     raise ValueError("billing_mode must be 'byok' or 'metered'")
-  normalized_billing_mode: Literal["byok", "metered"] = normalized_billing_mode_raw  # type: ignore[assignment]
   normalized_channel = channel.strip() if isinstance(channel, str) and channel.strip() else None
-  return normalized_user_id, normalized_rate_table_version, normalized_billing_mode, normalized_channel
+  return normalized_user_id, normalized_rate_table_version, normalized_billing_mode_raw, normalized_channel
 
 
 class _UsageAggregator:
@@ -188,7 +218,7 @@ class _UsageAggregator:
     request_id: str,
     channel: str | None,
     rate_table_version: str | None = None,
-    billing_mode: Literal["byok", "metered"] | None = None,
+    billing_mode: BillingMode | None = None,
     started_at: float | None = None,
   ) -> None:
     self._lock = asyncio.Lock()
@@ -197,7 +227,7 @@ class _UsageAggregator:
     self._request_id = request_id
     self._channel = channel
     self._rate_table_version = rate_table_version
-    self._billing_mode = billing_mode
+    self._billing_mode: BillingMode | None = billing_mode
     self._started_at = started_at if started_at is not None else time.time()
     self._input_tokens = 0
     self._output_tokens = 0
@@ -252,6 +282,8 @@ class _UsageAggregator:
     drain_complete: bool = True,
     in_flight_task_count: int = 0,
     context_surfaces: list[dict[str, Any]] | None = None,
+    stream_started_at: float | None = None,
+    first_text_at: float | None = None,
   ) -> SessionUsageSummary:
     async with self._lock:
       return SessionUsageSummary(
@@ -267,6 +299,8 @@ class _UsageAggregator:
         channel=self._channel,
         started_at=self._started_at,
         ended_at=ended_at if ended_at is not None else time.time(),
+        stream_started_at=stream_started_at,
+        first_text_at=first_text_at,
         drain_complete=drain_complete,
         in_flight_task_count=in_flight_task_count,
         compaction_count=self._compaction_count,
@@ -295,7 +329,7 @@ class UsageLedger(Protocol):
     *,
     since: float | None = None,
     until: float | None = None,
-    billing_mode: Literal["byok", "metered"] | None = None,
+    billing_mode: BillingMode | None = None,
     model: str | None = None,
     provider: str | None = None,
   ) -> UsageTotal: ...
@@ -428,7 +462,7 @@ class SqliteUsageLedger:
     *,
     since: float | None,
     until: float | None,
-    billing_mode: Literal["byok", "metered"] | None,
+    billing_mode: BillingMode | None,
     model: str | None,
     provider: str | None,
   ) -> UsageTotal:
@@ -483,7 +517,7 @@ class SqliteUsageLedger:
     *,
     since: float | None = None,
     until: float | None = None,
-    billing_mode: Literal["byok", "metered"] | None = None,
+    billing_mode: BillingMode | None = None,
     model: str | None = None,
     provider: str | None = None,
   ) -> UsageTotal:

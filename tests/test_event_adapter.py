@@ -83,7 +83,7 @@ def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
       "sub_agent_id": "sub0:sess_1",
     },
     {"type": "tool_output_chunk", "tool_call_id": "toolu_1", "tool_name": "code_execute", "stream": "stdout", "text": "line", "seq": 1},
-    {"type": "tool_execute_request", "tool_call_id": "toolu_1", "nonce": "nonce", "expires_at": 123, "tool_name": "update_model", "tool_input": {}},
+    {"type": "tool_execute_request", "tool_call_id": "toolu_1", "nonce": "nonce", "expires_at": 123, "tool_name": "persist_workbook_update", "tool_input": {}},
     {"type": "interceptor_decision", "tool_call_id": "toolu_1", "tool_name": "bash", "action": "deny", "code": "blocked", "message": "blocked"},
     {"type": "stream_retry", "attempt": 1, "error": "retry"},
     {"type": "credential_refreshed", "provider": "anthropic", "kind": "auth", "status_code": 401},
@@ -302,6 +302,7 @@ def test_v1_adapter_preserves_artifact_ready_origin() -> None:
       "future_only": "strip-me",
     }
   )
+  assert adapted is not None
 
   assert adapted["origin"] == "readback"
   assert "future_only" not in adapted

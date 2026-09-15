@@ -6,23 +6,23 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
-from typing import Any
+from typing import Any, TypedDict
 
 import pytest
 
-from agent_gateway import autonomous_admission_ledger as ledger_module
-from agent_gateway.autonomous_admission_ledger import (
-  AUTONOMOUS_ADMISSION_LEDGER_SCHEMA_VERSION,
-  AutonomousAdmissionLedgerCapacityExceeded,
-  AutonomousAdmissionLedgerClockRollback,
-  AutonomousAdmissionLedgerDuplicate,
-  AutonomousAdmissionLedgerExpired,
-  AutonomousAdmissionLedgerIdentity,
-  AutonomousAdmissionLedgerIdentityError,
-  AutonomousAdmissionLedgerUnavailable,
-  OrdinaryAutonomousAdmissionReceipt,
-  consume_ordinary_autonomous_launch_once,
-  prepare_autonomous_admission_ledger,
+from agent_gateway import launch_nonce_store as store_module
+from agent_gateway.launch_nonce_store import (
+  LAUNCH_NONCE_STORE_SCHEMA_VERSION,
+  LaunchNonceStoreCapacityExceeded,
+  LaunchNonceClockRollback,
+  LaunchNonceReplay,
+  LaunchNonceExpired,
+  LaunchNonceStoreIdentity,
+  LaunchNonceStoreIdentityError,
+  LaunchNonceStoreUnavailable,
+  LaunchNonceFacts,
+  consume_launch_nonce,
+  prepare_launch_nonce_store,
 )
 from agent_gateway.autonomous_launch_envelope import (
   AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE,
@@ -33,15 +33,21 @@ _ISSUED_AT_NS = 1_785_000_000_000_000_000
 _EXPIRES_AT_NS = _ISSUED_AT_NS + 60_000_000_000
 _ADMISSION_NS = _ISSUED_AT_NS + 1_000_000_000
 
+class _IdentityPayload(TypedDict):
+  schema_version: int
+  path: str
+  device: int
+  inode: int
+
 
 def _path(tmp_path: Path, name: str = "admissions.sqlite3") -> Path:
   return tmp_path.resolve() / name
 
 
-def _receipt(
+def _facts(
   marker: int = 1,
   **changes: Any,
-) -> OrdinaryAutonomousAdmissionReceipt:
+) -> LaunchNonceFacts:
   facts: dict[str, Any] = {
     "audience": AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE,
     "nonce": f"{marker:032x}",
@@ -53,7 +59,7 @@ def _receipt(
     "expires_at_ns": _EXPIRES_AT_NS,
   }
   facts.update(changes)
-  return OrdinaryAutonomousAdmissionReceipt(**facts)
+  return LaunchNonceFacts(**facts)
 
 
 def _row_count(path: Path) -> int:
@@ -64,24 +70,22 @@ def _row_count(path: Path) -> int:
 
 
 def _process_consume(
-  identity_payload: dict[str, int | str],
-  receipt_payload: dict[str, int | str],
+  identity_payload: _IdentityPayload,
+  facts_payload: dict[str, int | str],
   now_ns: int,
   output: multiprocessing.Queue,
 ) -> None:
-  identity = AutonomousAdmissionLedgerIdentity.from_receipt(
-    identity_payload
-  )
-  receipt = OrdinaryAutonomousAdmissionReceipt.from_receipt(
-    receipt_payload
+  identity = LaunchNonceStoreIdentity(**identity_payload)
+  facts = LaunchNonceFacts.from_mapping(
+    facts_payload
   )
   try:
-    consume_ordinary_autonomous_launch_once(
+    consume_launch_nonce(
       identity,
-      receipt,
+      facts,
       clock_ns=lambda: now_ns,
     )
-  except AutonomousAdmissionLedgerDuplicate:
+  except LaunchNonceReplay:
     output.put("duplicate")
   except BaseException as exc:
     output.put(f"error:{type(exc).__name__}:{exc}")
@@ -94,22 +98,22 @@ def test_prepare_creates_closed_durable_canonical_identity(
 ) -> None:
   path = _path(tmp_path)
 
-  identity = prepare_autonomous_admission_ledger(path)
+  identity = prepare_launch_nonce_store(path)
 
-  assert identity == AutonomousAdmissionLedgerIdentity.from_receipt(
-    identity.receipt()
+  assert identity == LaunchNonceStoreIdentity(
+    schema_version=LAUNCH_NONCE_STORE_SCHEMA_VERSION,
+    path=str(path),
+    device=path.stat().st_dev,
+    inode=path.stat().st_ino,
   )
-  assert identity.receipt() == {
-    "schema_version": AUTONOMOUS_ADMISSION_LEDGER_SCHEMA_VERSION,
-    "path": str(path),
-    "device": path.stat().st_dev,
-    "inode": path.stat().st_ino,
-  }
   assert stat.S_IMODE(path.stat().st_mode) == 0o600
   assert path.stat().st_nlink == 1
-  assert prepare_autonomous_admission_ledger(path) == identity
+  assert prepare_launch_nonce_store(path) == identity
   with sqlite3.connect(path) as connection:
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert (
+      connection.execute("PRAGMA user_version").fetchone()[0]
+      == LAUNCH_NONCE_STORE_SCHEMA_VERSION
+    )
     metadata = connection.execute(
       """
       SELECT schema_version, page_size, max_page_count,
@@ -118,11 +122,11 @@ def test_prepare_creates_closed_durable_canonical_identity(
       """
     ).fetchone()
   assert metadata == (
-    ledger_module.AUTONOMOUS_ADMISSION_LEDGER_SCHEMA_VERSION,
-    ledger_module.AUTONOMOUS_ADMISSION_LEDGER_PAGE_SIZE,
-    ledger_module.AUTONOMOUS_ADMISSION_LEDGER_MAX_PAGE_COUNT,
-    ledger_module.AUTONOMOUS_ADMISSION_LEDGER_MAX_ROWS,
-    ledger_module.AUTONOMOUS_ADMISSION_LEDGER_CLEANUP_BATCH_SIZE,
+    store_module.LAUNCH_NONCE_STORE_SCHEMA_VERSION,
+    store_module.LAUNCH_NONCE_STORE_PAGE_SIZE,
+    store_module.LAUNCH_NONCE_STORE_MAX_PAGE_COUNT,
+    store_module.LAUNCH_NONCE_STORE_MAX_ROWS,
+    store_module.LAUNCH_NONCE_STORE_CLEANUP_BATCH_SIZE,
   )
 
 
@@ -132,7 +136,7 @@ def test_prepare_repairs_mode_but_rejects_symlink_hardlink_and_nonregular(
   insecure = _path(tmp_path, "insecure.sqlite3")
   insecure.touch(mode=0o644)
   os.chmod(insecure, 0o644)
-  prepare_autonomous_admission_ledger(insecure)
+  prepare_launch_nonce_store(insecure)
   assert stat.S_IMODE(insecure.stat().st_mode) == 0o600
 
   target = _path(tmp_path, "target.sqlite3")
@@ -140,89 +144,93 @@ def test_prepare_repairs_mode_but_rejects_symlink_hardlink_and_nonregular(
   symlink = _path(tmp_path, "symlink.sqlite3")
   symlink.symlink_to(target)
   with pytest.raises(
-    AutonomousAdmissionLedgerIdentityError,
+    LaunchNonceStoreIdentityError,
     match="securely",
   ):
-    prepare_autonomous_admission_ledger(symlink)
+    prepare_launch_nonce_store(symlink)
 
   hardlink = _path(tmp_path, "hardlink.sqlite3")
   os.link(target, hardlink)
   with pytest.raises(
-    AutonomousAdmissionLedgerIdentityError,
+    LaunchNonceStoreIdentityError,
     match="identity is unsafe",
   ):
-    prepare_autonomous_admission_ledger(target)
+    prepare_launch_nonce_store(target)
 
   directory = _path(tmp_path, "directory.sqlite3")
   directory.mkdir()
-  with pytest.raises(AutonomousAdmissionLedgerIdentityError):
-    prepare_autonomous_admission_ledger(directory)
+  with pytest.raises(LaunchNonceStoreIdentityError):
+    prepare_launch_nonce_store(directory)
 
 
-def test_identity_and_receipt_contracts_are_closed_and_exact(
+def test_identity_and_facts_contracts_are_closed_and_exact(
   tmp_path: Path,
 ) -> None:
-  identity = prepare_autonomous_admission_ledger(_path(tmp_path))
-  receipt = _receipt()
+  identity = prepare_launch_nonce_store(_path(tmp_path))
+  facts = _facts()
 
-  with pytest.raises(ValueError, match="closed contract"):
-    AutonomousAdmissionLedgerIdentity.from_receipt({
-      **identity.receipt(),
-      "extra": 1,
-    })
+  with pytest.raises(ValueError, match="schema version"):
+    LaunchNonceStoreIdentity(
+      schema_version=LAUNCH_NONCE_STORE_SCHEMA_VERSION + 1,
+      path=identity.path,
+      device=identity.device,
+      inode=identity.inode,
+    )
   with pytest.raises(ValueError, match="inode"):
-    AutonomousAdmissionLedgerIdentity(
-      schema_version=1,
+    LaunchNonceStoreIdentity(
+      schema_version=LAUNCH_NONCE_STORE_SCHEMA_VERSION,
       path=identity.path,
       device=identity.device,
       inode=True,
     )
   with pytest.raises(ValueError, match="canonical absolute"):
-    AutonomousAdmissionLedgerIdentity(
-      schema_version=1,
+    LaunchNonceStoreIdentity(
+      schema_version=LAUNCH_NONCE_STORE_SCHEMA_VERSION,
       path="relative.sqlite3",
       device=1,
       inode=1,
     )
   with pytest.raises(ValueError, match="closed contract"):
-    OrdinaryAutonomousAdmissionReceipt.from_receipt({
-      **receipt.receipt(),
+    LaunchNonceFacts.from_mapping({
+      **facts.to_mapping(),
       "extra": None,
     })
   with pytest.raises(ValueError, match="nonce"):
-    replace(receipt, nonce="A" * 32)
+    replace(facts, nonce="A" * 32)
+  with pytest.raises(ValueError, match="audience"):
+    replace(facts, audience="different-audience")
   with pytest.raises(ValueError, match="canonical identifier"):
-    replace(receipt, task_id=" task")
+    replace(facts, task_id=" task")
   with pytest.raises(ValueError, match="channel_id"):
-    replace(receipt, channel_id="A" * 64)
+    replace(facts, channel_id="A" * 64)
   with pytest.raises(ValueError, match="integer"):
-    replace(receipt, issued_at_ns=True)
+    replace(facts, issued_at_ns=True)
   with pytest.raises(ValueError, match="TTL"):
     replace(
-      receipt,
+      facts,
       expires_at_ns=(
-        receipt.issued_at_ns
+        facts.issued_at_ns
         + 301_000_000_000
       ),
     )
   with pytest.raises(TypeError, match="verified launch envelope"):
-    OrdinaryAutonomousAdmissionReceipt.from_verified_envelope(object())
+    LaunchNonceFacts.from_verified_envelope(object())  # pyright: ignore[reportArgumentType]  # negative: unverified envelope rejection
 
 
-def test_consume_commits_closed_receipt_before_return_and_replay_fails(
+def test_consume_commits_closed_facts_before_return_and_replay_fails(
   tmp_path: Path,
 ) -> None:
   path = _path(tmp_path)
-  identity = prepare_autonomous_admission_ledger(path)
-  receipt = _receipt()
+  identity = prepare_launch_nonce_store(path)
+  facts = _facts()
 
-  record = consume_ordinary_autonomous_launch_once(
+  record = consume_launch_nonce(
     identity,
-    receipt,
+    facts,
     clock_ns=lambda: _ADMISSION_NS,
   )
 
-  assert record.receipt == receipt
+  assert record.facts == facts
   assert record.admitted_at_ns == _ADMISSION_NS
   with sqlite3.connect(path) as connection:
     row = connection.execute(
@@ -233,49 +241,114 @@ def test_consume_commits_closed_receipt_before_return_and_replay_fails(
       """
     ).fetchone()
   assert row == (
-    receipt.audience,
-    receipt.nonce,
-    receipt.task_id,
-    receipt.control_run_id,
-    receipt.owner_user_id,
-    receipt.channel_id,
-    receipt.issued_at_ns,
-    receipt.expires_at_ns,
+    facts.audience,
+    facts.nonce,
+    facts.task_id,
+    facts.control_run_id,
+    facts.owner_user_id,
+    facts.channel_id,
+    facts.issued_at_ns,
+    facts.expires_at_ns,
     _ADMISSION_NS,
   )
-  with pytest.raises(AutonomousAdmissionLedgerDuplicate):
-    consume_ordinary_autonomous_launch_once(
+  with pytest.raises(LaunchNonceReplay):
+    consume_launch_nonce(
       identity,
-      receipt,
+      facts,
       clock_ns=lambda: _ADMISSION_NS,
     )
-  with pytest.raises(AutonomousAdmissionLedgerDuplicate):
-    consume_ordinary_autonomous_launch_once(
+  with pytest.raises(LaunchNonceReplay):
+    consume_launch_nonce(
       identity,
-      replace(receipt, task_id="different-task"),
+      replace(facts, task_id="different-task"),
       clock_ns=lambda: _ADMISSION_NS,
     )
   assert _row_count(path) == 1
 
 
+def test_persisted_schema_does_not_redecide_envelope_audience(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  path = _path(tmp_path)
+  identity = prepare_launch_nonce_store(path)
+  next_audience = "agent-gateway.autonomous-capability/v-next"
+  monkeypatch.setattr(
+    store_module,
+    "AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE",
+    next_audience,
+  )
+  facts = _facts(audience=next_audience)
+
+  record = consume_launch_nonce(
+    identity,
+    facts,
+    clock_ns=lambda: _ADMISSION_NS,
+  )
+
+  assert record.facts == facts
+  with sqlite3.connect(path) as connection:
+    persisted_audience = connection.execute(
+      "SELECT audience FROM ordinary_autonomous_launch_admissions"
+    ).fetchone()[0]
+  assert persisted_audience == next_audience
+
+
+def test_audience_revision_does_not_make_existing_ledger_schema_incompatible(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  path = _path(tmp_path)
+  prepare_launch_nonce_store(path)
+  with sqlite3.connect(path) as connection:
+    admissions_sql = connection.execute(
+      """
+      SELECT sql
+        FROM sqlite_master
+       WHERE name = 'ordinary_autonomous_launch_admissions'
+      """
+    ).fetchone()[0]
+  assert AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE not in admissions_sql
+
+  next_audience = "agent-gateway.autonomous-capability/v-next"
+  monkeypatch.setattr(
+    store_module,
+    "AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE",
+    next_audience,
+  )
+
+  identity = prepare_launch_nonce_store(path)
+  record = consume_launch_nonce(
+    identity,
+    _facts(audience=next_audience),
+    clock_ns=lambda: _ADMISSION_NS,
+  )
+
+  assert record.facts.audience == next_audience
+
 @pytest.mark.skipif(
   "fork" not in multiprocessing.get_all_start_methods(),
-  reason="secure admission ledger is POSIX-only",
+  reason="secure launch nonce store is POSIX-only",
 )
 def test_concurrent_processes_using_independent_connections_have_one_winner(
   tmp_path: Path,
 ) -> None:
   path = _path(tmp_path)
-  identity = prepare_autonomous_admission_ledger(path)
-  receipt = _receipt()
+  identity = prepare_launch_nonce_store(path)
+  facts = _facts()
   context = multiprocessing.get_context("fork")
   output = context.Queue()
   processes = [
     context.Process(
       target=_process_consume,
       args=(
-        identity.receipt(),
-        receipt.receipt(),
+        {
+          "schema_version": identity.schema_version,
+          "path": identity.path,
+          "device": identity.device,
+          "inode": identity.inode,
+        },
+        facts.to_mapping(),
         _ADMISSION_NS,
         output,
       ),
@@ -312,15 +385,15 @@ def test_wall_expiry_fails_before_consumption(
   expected_fragment: str,
 ) -> None:
   path = _path(tmp_path)
-  identity = prepare_autonomous_admission_ledger(path)
+  identity = prepare_launch_nonce_store(path)
 
   with pytest.raises(
-    AutonomousAdmissionLedgerExpired,
+    LaunchNonceExpired,
     match=expected_fragment,
   ) as raised:
-    consume_ordinary_autonomous_launch_once(
+    consume_launch_nonce(
       identity,
-      _receipt(),
+      _facts(),
       clock_ns=lambda: now_ns,
     )
 
@@ -332,21 +405,21 @@ def test_expiry_after_commit_fails_closed_and_leaves_nonce_consumed(
   tmp_path: Path,
 ) -> None:
   path = _path(tmp_path)
-  identity = prepare_autonomous_admission_ledger(path)
-  receipt = _receipt()
+  identity = prepare_launch_nonce_store(path)
+  facts = _facts()
   observed_times = iter((
     _ADMISSION_NS,
     _ADMISSION_NS,
-    receipt.expires_at_ns,
+    facts.expires_at_ns,
   ))
 
   with pytest.raises(
-    AutonomousAdmissionLedgerExpired,
+    LaunchNonceExpired,
     match="expired",
   ) as raised:
-    consume_ordinary_autonomous_launch_once(
+    consume_launch_nonce(
       identity,
-      receipt,
+      facts,
       clock_ns=lambda: next(observed_times),
     )
 
@@ -358,8 +431,8 @@ def test_clock_rollback_after_commit_fails_closed_and_consumes_nonce(
   tmp_path: Path,
 ) -> None:
   path = _path(tmp_path)
-  identity = prepare_autonomous_admission_ledger(path)
-  receipt = _receipt()
+  identity = prepare_launch_nonce_store(path)
+  facts = _facts()
   observed_times = iter((
     _ADMISSION_NS,
     _ADMISSION_NS,
@@ -367,12 +440,12 @@ def test_clock_rollback_after_commit_fails_closed_and_consumes_nonce(
   ))
 
   with pytest.raises(
-    AutonomousAdmissionLedgerClockRollback,
+    LaunchNonceClockRollback,
     match="backward",
   ):
-    consume_ordinary_autonomous_launch_once(
+    consume_launch_nonce(
       identity,
-      receipt,
+      facts,
       clock_ns=lambda: next(observed_times),
     )
 
@@ -383,9 +456,9 @@ def test_concurrent_high_water_advance_is_not_a_false_clock_rollback(
   tmp_path: Path,
 ) -> None:
   path = _path(tmp_path)
-  identity = prepare_autonomous_admission_ledger(path)
-  first = _receipt(1)
-  second = _receipt(2)
+  identity = prepare_launch_nonce_store(path)
+  first = _facts(1)
+  second = _facts(2)
   clock_calls = 0
 
   def _first_clock() -> int:
@@ -394,20 +467,20 @@ def test_concurrent_high_water_advance_is_not_a_false_clock_rollback(
     if clock_calls < 3:
       return _ADMISSION_NS
     observed_ns = _ADMISSION_NS + 1
-    consume_ordinary_autonomous_launch_once(
+    consume_launch_nonce(
       identity,
       second,
       clock_ns=lambda: _ADMISSION_NS + 2,
     )
     return observed_ns
 
-  record = consume_ordinary_autonomous_launch_once(
+  record = consume_launch_nonce(
     identity,
     first,
     clock_ns=_first_clock,
   )
 
-  assert record.receipt == first
+  assert record.facts == first
   assert _row_count(path) == 2
 
 
@@ -415,22 +488,22 @@ def test_durable_wall_high_water_prevents_replay_after_cleanup_and_rollback(
   tmp_path: Path,
 ) -> None:
   path = _path(tmp_path)
-  identity = prepare_autonomous_admission_ledger(path)
-  first = _receipt(
+  identity = prepare_launch_nonce_store(path)
+  first = _facts(
     1,
     expires_at_ns=_ISSUED_AT_NS + 15_000_000_000,
   )
-  second = _receipt(
+  second = _facts(
     2,
     issued_at_ns=_ISSUED_AT_NS + 16_000_000_000,
     expires_at_ns=_ISSUED_AT_NS + 30_000_000_000,
   )
-  consume_ordinary_autonomous_launch_once(
+  consume_launch_nonce(
     identity,
     first,
     clock_ns=lambda: _ISSUED_AT_NS + 10_000_000_000,
   )
-  consume_ordinary_autonomous_launch_once(
+  consume_launch_nonce(
     identity,
     second,
     clock_ns=lambda: _ISSUED_AT_NS + 20_000_000_000,
@@ -438,10 +511,10 @@ def test_durable_wall_high_water_prevents_replay_after_cleanup_and_rollback(
   assert _row_count(path) == 1
 
   with pytest.raises(
-    AutonomousAdmissionLedgerClockRollback,
+    LaunchNonceClockRollback,
     match="backward",
   ):
-    consume_ordinary_autonomous_launch_once(
+    consume_launch_nonce(
       identity,
       first,
       clock_ns=lambda: _ISSUED_AT_NS + 12_000_000_000,
@@ -455,12 +528,12 @@ def test_cleanup_is_bounded_and_occurs_in_the_admission_transaction(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   monkeypatch.setattr(
-    ledger_module,
-    "AUTONOMOUS_ADMISSION_LEDGER_CLEANUP_BATCH_SIZE",
+    store_module,
+    "LAUNCH_NONCE_STORE_CLEANUP_BATCH_SIZE",
     2,
   )
   path = _path(tmp_path)
-  identity = prepare_autonomous_admission_ledger(path)
+  identity = prepare_launch_nonce_store(path)
   with sqlite3.connect(path) as connection:
     for marker in range(10, 15):
       connection.execute(
@@ -469,10 +542,11 @@ def test_cleanup_is_bounded_and_occurs_in_the_admission_transaction(
           nonce, schema_version, audience, task_id, control_run_id,
           owner_user_id, channel_id, issued_at_ns, expires_at_ns,
           admitted_at_ns
-        ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
           f"{marker:032x}",
+          LAUNCH_NONCE_STORE_SCHEMA_VERSION,
           AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE,
           f"expired-task-{marker}",
           f"expired-run-{marker}",
@@ -484,9 +558,9 @@ def test_cleanup_is_bounded_and_occurs_in_the_admission_transaction(
         ),
       )
 
-  consume_ordinary_autonomous_launch_once(
+  consume_launch_nonce(
     identity,
-    _receipt(),
+    _facts(),
     clock_ns=lambda: _ADMISSION_NS,
   )
 
@@ -508,27 +582,27 @@ def test_capacity_failure_rolls_back_the_uncommitted_nonce(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   monkeypatch.setattr(
-    ledger_module,
-    "AUTONOMOUS_ADMISSION_LEDGER_MAX_ROWS",
+    store_module,
+    "LAUNCH_NONCE_STORE_MAX_ROWS",
     1,
   )
   monkeypatch.setattr(
-    ledger_module,
-    "AUTONOMOUS_ADMISSION_LEDGER_CLEANUP_BATCH_SIZE",
+    store_module,
+    "LAUNCH_NONCE_STORE_CLEANUP_BATCH_SIZE",
     1,
   )
   path = _path(tmp_path)
-  identity = prepare_autonomous_admission_ledger(path)
-  first = _receipt(1)
-  second = _receipt(2)
-  consume_ordinary_autonomous_launch_once(
+  identity = prepare_launch_nonce_store(path)
+  first = _facts(1)
+  second = _facts(2)
+  consume_launch_nonce(
     identity,
     first,
     clock_ns=lambda: _ADMISSION_NS,
   )
 
-  with pytest.raises(AutonomousAdmissionLedgerCapacityExceeded):
-    consume_ordinary_autonomous_launch_once(
+  with pytest.raises(LaunchNonceStoreCapacityExceeded):
+    consume_launch_nonce(
       identity,
       second,
       clock_ns=lambda: _ADMISSION_NS,
@@ -546,20 +620,20 @@ def test_schema_and_persisted_bound_mismatches_fail_closed(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   path = _path(tmp_path)
-  identity = prepare_autonomous_admission_ledger(path)
+  identity = prepare_launch_nonce_store(path)
   monkeypatch.setattr(
-    ledger_module,
-    "AUTONOMOUS_ADMISSION_LEDGER_MAX_ROWS",
-    ledger_module.AUTONOMOUS_ADMISSION_LEDGER_MAX_ROWS + 1,
+    store_module,
+    "LAUNCH_NONCE_STORE_MAX_ROWS",
+    store_module.LAUNCH_NONCE_STORE_MAX_ROWS + 1,
   )
 
   with pytest.raises(
-    AutonomousAdmissionLedgerUnavailable,
+    LaunchNonceStoreUnavailable,
     match="bounds",
   ):
-    consume_ordinary_autonomous_launch_once(
+    consume_launch_nonce(
       identity,
-      _receipt(),
+      _facts(),
       clock_ns=lambda: _ADMISSION_NS,
     )
   assert _row_count(path) == 0
@@ -569,19 +643,19 @@ def test_schema_object_drift_fails_closed_without_self_migration(
   tmp_path: Path,
 ) -> None:
   path = _path(tmp_path)
-  identity = prepare_autonomous_admission_ledger(path)
+  identity = prepare_launch_nonce_store(path)
   with sqlite3.connect(path) as connection:
     connection.execute(
       "DROP INDEX idx_autonomous_admissions_expiry"
     )
 
   with pytest.raises(
-    AutonomousAdmissionLedgerUnavailable,
+    LaunchNonceStoreUnavailable,
     match="schema objects",
   ):
-    consume_ordinary_autonomous_launch_once(
+    consume_launch_nonce(
       identity,
-      _receipt(),
+      _facts(),
       clock_ns=lambda: _ADMISSION_NS,
     )
 
@@ -592,28 +666,28 @@ def test_missing_or_replaced_database_never_falls_back_to_a_new_ledger(
   tmp_path: Path,
 ) -> None:
   missing_path = _path(tmp_path, "missing.sqlite3")
-  missing_identity = prepare_autonomous_admission_ledger(missing_path)
+  missing_identity = prepare_launch_nonce_store(missing_path)
   missing_path.unlink()
-  with pytest.raises(AutonomousAdmissionLedgerIdentityError):
-    consume_ordinary_autonomous_launch_once(
+  with pytest.raises(LaunchNonceStoreIdentityError):
+    consume_launch_nonce(
       missing_identity,
-      _receipt(),
+      _facts(),
       clock_ns=lambda: _ADMISSION_NS,
     )
   assert not missing_path.exists()
 
   replaced_path = _path(tmp_path, "replaced.sqlite3")
-  replaced_identity = prepare_autonomous_admission_ledger(replaced_path)
+  replaced_identity = prepare_launch_nonce_store(replaced_path)
   old_path = _path(tmp_path, "replaced-old.sqlite3")
   replaced_path.rename(old_path)
   replaced_path.touch(mode=0o600)
   with pytest.raises(
-    AutonomousAdmissionLedgerIdentityError,
+    LaunchNonceStoreIdentityError,
     match="identity changed",
   ):
-    consume_ordinary_autonomous_launch_once(
+    consume_launch_nonce(
       replaced_identity,
-      _receipt(2),
+      _facts(2),
       clock_ns=lambda: _ADMISSION_NS,
     )
   assert replaced_path.stat().st_size == 0
@@ -625,14 +699,14 @@ def test_identity_replacement_after_commit_is_detected_before_admission(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   path = _path(tmp_path)
-  identity = prepare_autonomous_admission_ledger(path)
-  receipt = _receipt()
-  original_verify = ledger_module._verify_identity
+  identity = prepare_launch_nonce_store(path)
+  facts = _facts()
+  original_verify = store_module._verify_identity
   replaced = False
   old_path = _path(tmp_path, "committed-old.sqlite3")
 
   def replace_after_commit(
-    observed_identity: AutonomousAdmissionLedgerIdentity,
+    observed_identity: LaunchNonceStoreIdentity,
   ) -> os.stat_result:
     nonlocal replaced
     if not replaced:
@@ -654,18 +728,18 @@ def test_identity_replacement_after_commit_is_detected_before_admission(
     return original_verify(observed_identity)
 
   monkeypatch.setattr(
-    ledger_module,
+    store_module,
     "_verify_identity",
     replace_after_commit,
   )
 
   with pytest.raises(
-    AutonomousAdmissionLedgerIdentityError,
+    LaunchNonceStoreIdentityError,
     match="identity changed",
   ):
-    consume_ordinary_autonomous_launch_once(
+    consume_launch_nonce(
       identity,
-      receipt,
+      facts,
       clock_ns=lambda: _ADMISSION_NS,
     )
 
@@ -678,43 +752,43 @@ def test_permission_hardlink_and_sidecar_changes_fail_closed(
   tmp_path: Path,
 ) -> None:
   permission_path = _path(tmp_path, "permission.sqlite3")
-  permission_identity = prepare_autonomous_admission_ledger(
+  permission_identity = prepare_launch_nonce_store(
     permission_path
   )
   os.chmod(permission_path, 0o640)
   with pytest.raises(
-    AutonomousAdmissionLedgerIdentityError,
+    LaunchNonceStoreIdentityError,
     match="0600",
   ):
-    consume_ordinary_autonomous_launch_once(
+    consume_launch_nonce(
       permission_identity,
-      _receipt(),
+      _facts(),
       clock_ns=lambda: _ADMISSION_NS,
     )
 
   hardlink_path = _path(tmp_path, "hardlink-live.sqlite3")
-  hardlink_identity = prepare_autonomous_admission_ledger(hardlink_path)
+  hardlink_identity = prepare_launch_nonce_store(hardlink_path)
   os.link(hardlink_path, _path(tmp_path, "second-link.sqlite3"))
   with pytest.raises(
-    AutonomousAdmissionLedgerIdentityError,
+    LaunchNonceStoreIdentityError,
     match="hard link",
   ):
-    consume_ordinary_autonomous_launch_once(
+    consume_launch_nonce(
       hardlink_identity,
-      _receipt(2),
+      _facts(2),
       clock_ns=lambda: _ADMISSION_NS,
     )
 
   sidecar_path = _path(tmp_path, "sidecar.sqlite3")
-  sidecar_identity = prepare_autonomous_admission_ledger(sidecar_path)
+  sidecar_identity = prepare_launch_nonce_store(sidecar_path)
   unsafe_sidecar = Path(str(sidecar_path) + "-journal")
   unsafe_sidecar.symlink_to(permission_path)
   with pytest.raises(
-    AutonomousAdmissionLedgerIdentityError,
+    LaunchNonceStoreIdentityError,
     match="sidecar identity",
   ):
-    consume_ordinary_autonomous_launch_once(
+    consume_launch_nonce(
       sidecar_identity,
-      _receipt(3),
+      _facts(3),
       clock_ns=lambda: _ADMISSION_NS,
     )

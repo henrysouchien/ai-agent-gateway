@@ -13,8 +13,10 @@ import pytest
 
 from agent_gateway.control_skill_catalog import (
   ControlSkillCatalog,
-  ControlSkillDefinition,
+  ControlSkillDetail,
+  ControlSkillSummary,
   ControlSkillUnavailableError,
+  is_control_skill_name,
 )
 
 
@@ -33,7 +35,7 @@ def _assert_package_import_boundary(source: str) -> None:
   for node in ast.walk(tree):
     if isinstance(node, ast.Import):
       assert tuple((alias.name, alias.asname) for alias in node.names) == (
-        ("math", None),
+        ("re", None),
       )
       continue
     if not isinstance(node, ast.ImportFrom):
@@ -46,7 +48,7 @@ def _assert_package_import_boundary(source: str) -> None:
       assert alias.name in allowed
 
 
-def _definition_arguments() -> dict[str, object]:
+def _summary_arguments() -> dict[str, object]:
   return {
     "name": "strict-skill",
     "label": "Strict Skill",
@@ -75,19 +77,24 @@ def _definition_arguments() -> dict[str, object]:
     "can_schedule": True,
     "blocked_reason": None,
     "path": "skills/strict-skill.md",
-    "body": "Resolved methodology.",
   }
 
 
-def _definition(**overrides: object) -> ControlSkillDefinition:
-  return ControlSkillDefinition(**{
-    **_definition_arguments(),
+def _summary(**overrides: object) -> ControlSkillSummary:
+  return ControlSkillSummary(**{
+    **_summary_arguments(),
     **overrides,
   })  # type: ignore[arg-type]
 
 
-def test_control_definition_has_exact_frozen_wire_fields() -> None:
-  expected = (
+def _detail(**overrides: object) -> ControlSkillDetail:
+  values = {**_summary_arguments(), "body": "Resolved methodology."}
+  values.update(overrides)
+  return ControlSkillDetail(**values)
+
+
+def test_control_summary_and_detail_have_exact_frozen_wire_fields() -> None:
+  expected_summary = (
     "name",
     "label",
     "description",
@@ -115,16 +122,24 @@ def test_control_definition_has_exact_frozen_wire_fields() -> None:
     "can_schedule",
     "blocked_reason",
     "path",
+  )
+  assert tuple(field.name for field in fields(ControlSkillSummary)) == (
+    expected_summary
+  )
+  assert tuple(field.name for field in fields(ControlSkillDetail)) == (
+    *expected_summary,
     "body",
   )
-
-  assert tuple(field.name for field in fields(ControlSkillDefinition)) == expected
-  definition = _definition()
+  assert len(expected_summary) == 27
+  summary = _summary()
+  detail = _detail()
   with pytest.raises(FrozenInstanceError):
-    definition.name = "changed"  # type: ignore[misc]
+    summary.name = "changed"  # type: ignore[misc]
+  with pytest.raises(FrozenInstanceError):
+    detail.body = "changed"  # type: ignore[misc]
 
 
-def test_control_definition_snapshots_all_six_sequence_fields() -> None:
+def test_control_wire_snapshots_all_six_sequence_fields() -> None:
   source_values = {
     "required_context": ["ticker"],
     "profiles": ["analyst"],
@@ -133,53 +148,76 @@ def test_control_definition_snapshots_all_six_sequence_fields() -> None:
     "tier_availability": ["paid"],
     "credential_requirements": ["market_data"],
   }
-  definition = _definition(**source_values)
+  summary = _summary(**source_values)
   for values in source_values.values():
     values.append("mutated")
 
-  assert definition.required_context == ("ticker",)
-  assert definition.profiles == ("analyst",)
-  assert definition.modes == ("skill",)
-  assert definition.outputs == ("platform:result@1",)
-  assert definition.tier_availability == ("paid",)
-  assert definition.credential_requirements == ("market_data",)
+  assert summary.required_context == ("ticker",)
+  assert summary.profiles == ("analyst",)
+  assert summary.modes == ("skill",)
+  assert summary.outputs == ("platform:result@1",)
+  assert summary.tier_availability == ("paid",)
+  assert summary.credential_requirements == ("market_data",)
   assert all(
-    type(getattr(definition, field_name)) is tuple
+    type(getattr(summary, field_name)) is tuple
     for field_name in source_values
   )
 
 
 @pytest.mark.parametrize(
   "field_name",
-  [
-    "name",
-    "label",
-    "description",
-    "version",
-    "scope",
-    "action_class",
-    "approval_policy",
-    "path",
-    "body",
-  ],
+  ["name", "label", "scope", "action_class", "approval_policy", "path"],
 )
 @pytest.mark.parametrize("value", [None, 1, b"text", "", " padded "])
-def test_control_definition_rejects_invalid_required_text(
+def test_control_summary_rejects_invalid_canonical_text(
   field_name: str,
   value: object,
 ) -> None:
   with pytest.raises((TypeError, ValueError), match=field_name):
-    _definition(**{field_name: value})
+    _summary(**{field_name: value})
+
+
+@pytest.mark.parametrize("value", ["Bad_Name", "-bad", "bad-", "bad--name"])
+def test_control_name_grammar_is_adapter_owned(value: str) -> None:
+  assert _summary(name=value).name == value
+  assert is_control_skill_name(value) is False
+  assert is_control_skill_name(object()) is False
+  assert is_control_skill_name("1-valid-skill") is True
+
+
+def test_control_wire_preserves_shallow_external_text_and_limit_shapes() -> None:
+  summary = _summary(
+    description="",
+    version=" padded version ",
+    max_turns=-3,
+    max_budget_usd=math.inf,
+    typed_contract="",
+    required_context=(),
+    profiles=(),
+    modes=(),
+    outputs=(),
+    tier_availability=(),
+    credential_requirements=(),
+  )
+  detail = _detail(body="", description="", version="")
+
+  assert summary.description == ""
+  assert summary.version == " padded version "
+  assert summary.max_turns == -3
+  assert summary.max_budget_usd == math.inf
+  assert type(summary.max_budget_usd) is float
+  assert summary.typed_contract == ""
+  assert detail.body == ""
 
 
 @pytest.mark.parametrize("field_name", ["agent_description", "blocked_reason"])
 @pytest.mark.parametrize("value", [1, b"text", "", " padded "])
-def test_control_definition_rejects_invalid_optional_text(
+def test_control_summary_rejects_invalid_optional_text(
   field_name: str,
   value: object,
 ) -> None:
   with pytest.raises((TypeError, ValueError), match=field_name):
-    _definition(**{field_name: value})
+    _summary(**{field_name: value})
 
 
 @pytest.mark.parametrize(
@@ -196,43 +234,43 @@ def test_control_definition_rejects_invalid_optional_text(
   ],
 )
 @pytest.mark.parametrize("value", [0, 1, "true", None])
-def test_control_definition_requires_exact_booleans(
+def test_control_summary_requires_exact_booleans(
   field_name: str,
   value: object,
 ) -> None:
   with pytest.raises(TypeError, match=field_name):
-    _definition(**{field_name: value})
+    _summary(**{field_name: value})
 
 
-def test_control_definition_requires_visible_catalog_entry() -> None:
+def test_control_summary_requires_visible_catalog_entry() -> None:
   with pytest.raises(ValueError, match="catalog must be exactly True"):
-    _definition(catalog=False)
+    _summary(catalog=False)
 
 
-@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "2"])
-def test_control_definition_rejects_invalid_max_turns(value: object) -> None:
-  with pytest.raises((TypeError, ValueError), match="max_turns"):
-    _definition(max_turns=value)
+@pytest.mark.parametrize("value", [True, False, 1.5, "2"])
+def test_control_summary_rejects_non_exact_max_turns(value: object) -> None:
+  with pytest.raises(TypeError, match="max_turns"):
+    _summary(max_turns=value)
 
 
-@pytest.mark.parametrize(
-  "value",
-  [True, False, 0, -1, 0.0, -2.5, math.inf, -math.inf, math.nan, "1.5"],
-)
-def test_control_definition_rejects_invalid_budget(value: object) -> None:
-  with pytest.raises((TypeError, ValueError), match="max_budget_usd"):
-    _definition(max_budget_usd=value)
+@pytest.mark.parametrize("value", [True, False, "1.5", object()])
+def test_control_summary_rejects_invalid_budget_shape(value: object) -> None:
+  with pytest.raises(TypeError, match="max_budget_usd"):
+    _summary(max_budget_usd=value)
 
 
-def test_control_definition_accepts_optional_numeric_limits() -> None:
-  assert _definition(max_turns=None, max_budget_usd=None).max_turns is None
-  assert _definition(max_turns=1, max_budget_usd=2).max_budget_usd == 2
-  assert _definition(max_budget_usd=2.5).max_budget_usd == 2.5
+def test_control_summary_normalizes_budget_to_float() -> None:
+  assert _summary(max_budget_usd=None).max_budget_usd is None
+  assert _summary(max_budget_usd=-2).max_budget_usd == -2.0
+  assert type(_summary(max_budget_usd=2).max_budget_usd) is float
 
 
-def test_control_definition_requires_typed_contract_none() -> None:
+@pytest.mark.parametrize("value", [1, b"contract", object()])
+def test_control_summary_requires_typed_contract_string_or_none(
+  value: object,
+) -> None:
   with pytest.raises(TypeError, match="typed_contract"):
-    _definition(typed_contract="platform:result@1")
+    _summary(typed_contract=value)
 
 
 @pytest.mark.parametrize(
@@ -250,32 +288,30 @@ def test_control_definition_requires_typed_contract_none() -> None:
   "value",
   ["ticker", b"ticker", {"ticker"}, (item for item in ("ticker",)), 1],
 )
-def test_control_definition_rejects_non_sequence_fields(
+def test_control_summary_rejects_non_sequence_fields(
   field_name: str,
   value: object,
 ) -> None:
   with pytest.raises(TypeError, match=field_name):
-    _definition(**{field_name: value})
+    _summary(**{field_name: value})
 
 
-@pytest.mark.parametrize(
-  "value",
-  [(1,), ("",), (" padded ",), (b"ticker",)],
-)
-def test_control_definition_rejects_invalid_sequence_members(value: object) -> None:
+@pytest.mark.parametrize("value", [(1,), ("",), (" padded ",), (b"ticker",)])
+def test_control_summary_rejects_invalid_sequence_members(value: object) -> None:
   with pytest.raises((TypeError, ValueError), match="required_context item"):
-    _definition(required_context=value)
+    _summary(required_context=value)
 
 
 def test_control_catalog_protocol_and_typed_error_are_dependency_neutral() -> None:
-  definition = _definition()
+  summary = _summary()
+  detail = _detail()
 
   class Catalog:
-    def list_skills(self) -> tuple[ControlSkillDefinition, ...]:
-      return (definition,)
+    def list_skills(self) -> tuple[ControlSkillSummary, ...]:
+      return (summary,)
 
-    def resolve_skill(self, _skill_name: object) -> ControlSkillDefinition:
-      return definition
+    def resolve_skill(self, _selector: object) -> ControlSkillDetail:
+      return detail
 
   assert isinstance(Catalog(), ControlSkillCatalog)
   error = ControlSkillUnavailableError(
@@ -323,9 +359,9 @@ def test_control_contract_module_is_stdlib_only_and_not_reexported() -> None:
   "statement",
   [
     "import os",
-    "import math as maths",
+    "import re as regex",
     "from pathlib import Path",
-    "from math import isfinite as math",
+    "from dataclasses import dataclass as record",
   ],
 )
 def test_control_contract_import_guard_rejects_foreign_or_aliased_imports(
@@ -345,8 +381,9 @@ def test_control_contract_imports_without_application_modules() -> None:
       (
         "import json, sys; "
         "from agent_gateway.control_skill_catalog import "
-        "ControlSkillDefinition; "
-        "print(json.dumps({'module': ControlSkillDefinition.__module__, "
+        "ControlSkillDetail, ControlSkillSummary; "
+        "print(json.dumps({'summary': ControlSkillSummary.__module__, "
+        "'detail': ControlSkillDetail.__module__, "
         "'application_modules': sorted(name for name in sys.modules "
         "if name == 'agent' or name.startswith('agent.skills') "
         "or name.startswith('api.agent'))}))"
@@ -360,6 +397,7 @@ def test_control_contract_imports_without_application_modules() -> None:
   )
 
   assert json.loads(result.stdout) == {
-    "module": "agent_gateway.control_skill_catalog",
+    "summary": "agent_gateway.control_skill_catalog",
+    "detail": "agent_gateway.control_skill_catalog",
     "application_modules": [],
   }

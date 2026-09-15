@@ -191,7 +191,8 @@ def _iter_material_values(module_type: str, data: dict[str, Any]) -> Iterable[_M
       if "detail" in item:
         yield _MaterialValue(f"items[{index}].detail", item.get("detail"), item_citations)
   elif module_type == "table":
-    for row_index, row in enumerate(data.get("rows") if isinstance(data.get("rows"), list) else []):
+    rows = data.get("rows")
+    for row_index, row in enumerate(rows if isinstance(rows, list) else []):
       row_citations = _citations(row) or module_citations if isinstance(row, dict) else module_citations
       if isinstance(row, dict):
         for key, value in row.items():

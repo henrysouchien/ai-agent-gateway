@@ -18,7 +18,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, TypedDict
+from typing import Any, Literal, SupportsIndex, TYPE_CHECKING, TypedDict
 
 from .autonomous_event_channel import (
   AutonomousEventAcknowledgement,
@@ -31,8 +31,14 @@ from .autonomous_approval_channel import (
 )
 from .autonomous_launch_envelope import AutonomousControlAuthority
 from .autonomous_claim_broker import AutonomousClaimBroker
-from .capability_binding import CapabilityBind
+from .capability_binding import CapabilityBind, SESSION_DRIVER_CAPABILITY
 from .role_validation import require_exact_role
+from .skill_limits import (
+  AutonomousSkillAdmissionPolicy,
+  SkillExecutionLimits,
+  skill_execution_limits_from_mapping,
+  skill_execution_limits_to_mapping,
+)
 
 _AUTONOMOUS_TASK_ID_RE = re.compile(r"^bg_\d+$")
 _AUTONOMOUS_RUN_FILE_RE = re.compile(r"^bg_(\d+)\..+")
@@ -132,7 +138,7 @@ AUTONOMOUS_TERMINAL_STATES = _autonomous_states_where("terminal")
 _REHYDRATION_INTERRUPTED_ERROR = "gateway restarted while run was active"
 _REHYDRATE_EVENTS_SIZE_CAP_BYTES = 5 * 1024 * 1024
 _REHYDRATE_EVENTS_TAIL_LINES = 2000
-_TASK_MANIFEST_VERSION = 7
+_TASK_MANIFEST_VERSION = 8
 _RUN_SEQUENCE_CURSOR_FILE = ".autonomous-sequence.json"
 _SKIP_WARNED_FILE = ".manifest-skip-warned.json"
 _SKIP_WARNED: set[str] = set()
@@ -292,7 +298,7 @@ class _ManifestTrackedList(list[str]):
     super().extend(values)
     self._changed()
 
-  def insert(self, index: int, item: str) -> None:
+  def insert(self, index: SupportsIndex, item: str) -> None:
     super().insert(index, item)
     self._changed()
 
@@ -300,7 +306,7 @@ class _ManifestTrackedList(list[str]):
     super().remove(item)
     self._changed()
 
-  def pop(self, index: int = -1) -> str:
+  def pop(self, index: SupportsIndex = -1) -> str:
     item = super().pop(index)
     self._changed()
     return item
@@ -340,7 +346,7 @@ class AutonomousTask:
   user_id: str
   user_email: str | None
   profile: str
-  mode: str
+  mode: Literal["once", "task", "skill", "pack"]
   task: str | None
   skill: str | None
   pack: str | None
@@ -360,12 +366,16 @@ class AutonomousTask:
   owner_lease_inode: int
   started_at: float
   skill_resume_allowed: bool = field(kw_only=True)
+  admitted_skill_execution_limits: SkillExecutionLimits | None = field(
+    kw_only=True
+  )
   events_path: Path | None = None
   events_device: int | None = None
   events_inode: int | None = None
   events_evidence_status: str = "missing"
   manifest_version: int = _TASK_MANIFEST_VERSION
   max_budget_usd: float | None = None
+  research_file_id: int | None = None
   state: str = "running"
   exit_code: int | None = None
   error: str | None = None
@@ -465,12 +475,6 @@ class AutonomousTask:
       self.operator_inbox_path is None
       or str(self.operator_inbox_path)
       != self.control_authority.operator_inbox_path
-      or (
-        str(self.approval_decisions_path)
-        if self.approval_decisions_path is not None
-        else None
-      )
-      != self.control_authority.approval_decisions_path
     ):
       raise ValueError(
         "autonomous task control paths do not match signed authority"
@@ -501,6 +505,15 @@ class AutonomousTask:
       raise ValueError("autonomous task skill_resume_allowed must be an exact bool")
     if self.mode != "skill" and self.skill_resume_allowed:
       raise ValueError("non-skill autonomous task cannot enable skill resume")
+    if self.mode == "skill":
+      if type(self.admitted_skill_execution_limits) is not SkillExecutionLimits:
+        raise ValueError(
+          "skill autonomous task requires exact admitted execution limits"
+        )
+    elif self.admitted_skill_execution_limits is not None:
+      raise ValueError(
+        "non-skill autonomous task cannot carry admitted execution limits"
+      )
     if self.pack is not None and (
       not isinstance(self.pack, str)
       or not self.pack
@@ -536,7 +549,7 @@ class AutonomousTask:
         self.user_email,
       )
     if self.capability_bind is not None:
-      if self.capability_bind.capability_id != "session.driver":
+      if self.capability_bind.capability_id != SESSION_DRIVER_CAPABILITY:
         raise ValueError("autonomous task requires a session.driver capability bind")
       if self.capability_bind.run_mode not in {"autonomous", "cron"}:
         raise ValueError("autonomous task bind must use autonomous or cron run mode")
@@ -661,16 +674,9 @@ def _user_identity_api(*, api_dir: Path | None = None) -> Any | None:
   try:
     module = importlib.import_module("user_identity")
   except ModuleNotFoundError as exc:
-    if exc.name not in {"user_identity", "api"}:
+    if exc.name != "user_identity":
       raise
-    if explicit_api_dir:
-      return None
-    try:
-      module = importlib.import_module("api.user_identity")
-    except ModuleNotFoundError as nested_exc:
-      if nested_exc.name not in {"user_identity", "api"}:
-        raise
-      return None
+    return None
   if explicit_api_dir:
     module_origin = getattr(getattr(module, "__spec__", None), "origin", None)
     if not isinstance(module_origin, str):
@@ -735,22 +741,34 @@ def _manifest_identity_payload(manifest: dict[str, Any], *, user_id: str, user_e
 
 
 class AutonomousRegistryStateMixin:
-  def _resolve_initial_skill_resume_allowed(
+  if TYPE_CHECKING:
+    _log_dir: Path
+    _seq: int
+    _tasks: dict[str, AutonomousTask]
+
+  def _resolve_initial_skill_admission_policy(
     self,
     *,
     mode: str,
     skill: str | None,
-  ) -> bool:
+  ) -> AutonomousSkillAdmissionPolicy | None:
     if mode != "skill" or not skill:
-      return False
-    resolver = getattr(self, "_skill_resume_allowed_resolver", None)
+      return None
+    resolver = getattr(
+      self,
+      "_autonomous_skill_admission_policy_resolver",
+      None,
+    )
     if resolver is None:
       raise RuntimeError(
-        "skill resume policy resolver is required for skill admission"
+        "skill admission policy resolver is required for skill admission"
       )
     resolved = resolver(skill)
-    if type(resolved) is not bool:
-      raise TypeError("skill resume policy resolver must return an exact bool")
+    if type(resolved) is not AutonomousSkillAdmissionPolicy:
+      raise TypeError(
+        "skill admission policy resolver must return exact "
+        "AutonomousSkillAdmissionPolicy"
+      )
     return resolved
 
   def _skip_warned_path(self) -> Path:
@@ -1029,14 +1047,6 @@ class AutonomousRegistryStateMixin:
       ):
         self._spill_start_cleanup_skipped.add(task_id)
 
-  def _is_log_dir_child(self, path: Path) -> bool:
-    try:
-      log_dir = self._log_dir.resolve()
-      resolved = path.expanduser().resolve()
-    except OSError:
-      return False
-    return resolved == log_dir or log_dir in resolved.parents
-
   def _manifest_path(self, task_id: str) -> Path:
     return self._log_dir / f"{task_id}.task.json"
 
@@ -1065,11 +1075,19 @@ class AutonomousRegistryStateMixin:
       "pack": record.pack,
       "deliver": record.deliver,
       "skill_resume_allowed": record.skill_resume_allowed,
+      "admitted_skill_execution_limits": (
+        skill_execution_limits_to_mapping(
+          record.admitted_skill_execution_limits
+        )
+        if record.admitted_skill_execution_limits is not None
+        else None
+      ),
       "context": record.context,
       "ticker": record.ticker,
       "channel": record.channel,
       "dev_mode": record.dev_mode,
       "max_budget_usd": record.max_budget_usd,
+      "research_file_id": record.research_file_id,
       "dispatch_scope": _normalize_dispatch_scope(record.dispatch_scope),
       "containment_expectation": {
         "platform": sys.platform,
@@ -1114,7 +1132,7 @@ class AutonomousRegistryStateMixin:
     # on a test-patchable version compare could silently persist bind-less
     # manifests that fail only at rehydrate.
     payload["capability_bind"] = (
-      record.capability_bind.receipt()
+      record.capability_bind.to_json()
       if record.capability_bind is not None
       else None
     )
@@ -1793,7 +1811,7 @@ class AutonomousRegistryStateMixin:
       self._warn_once(manifest_path, "Skipping v7 autonomous manifest without a capability bind: %s")
       return None
     try:
-      capability_bind = CapabilityBind.from_receipt(raw_capability_bind)
+      capability_bind = CapabilityBind.from_json(raw_capability_bind)
     except (TypeError, ValueError):
       _LOGGER.warning(
         "Skipping autonomous manifest with invalid capability bind: %s",
@@ -1801,7 +1819,7 @@ class AutonomousRegistryStateMixin:
         exc_info=True,
       )
       return None
-    if capability_bind.capability_id != "session.driver":
+    if capability_bind.capability_id != SESSION_DRIVER_CAPABILITY:
       self._warn_once(manifest_path, "Skipping autonomous manifest with non-session capability bind: %s")
       return None
     if capability_bind.run_mode not in {"autonomous", "cron"}:
@@ -1829,87 +1847,187 @@ class AutonomousRegistryStateMixin:
         )
         return None
 
-    record_kwargs = dict(
-      task_id=task_id,
-      control_run_id=control_run_id,
-      session_id=session_id,
-      channel_id=channel_id,
-      user_id=str(identity["owner_user_id"]),
-      user_email=user_email,
-      role=manifest.get("role"),
-      profile=profile,
-      mode=mode,
-      task=self._coerce_manifest_str(manifest, "task"),
-      skill=self._coerce_manifest_str(manifest, "skill"),
-      pack=raw_pack,
-      deliver=deliver,
-      context=self._coerce_manifest_str(manifest, "context"),
-      ticker=self._coerce_manifest_str(manifest, "ticker"),
-      channel=self._coerce_manifest_str(manifest, "channel"),
-      dev_mode=bool(manifest.get("dev_mode", False)),
-      dispatch_scope=_normalize_dispatch_scope(manifest.get("dispatch_scope")),
-      cmd=[str(part) for part in cmd] if isinstance(cmd, list) else [],
-      log_path=self._path_from_manifest(
-        manifest,
-        "log_path",
-        fallback=manifest_path.with_name(f"{task_id}.log"),
+    missing_admitted_skill_execution_limits = (
+      "admitted_skill_execution_limits" not in manifest
+    )
+    if missing_admitted_skill_execution_limits:
+      # This validation-only value is replaced before exposure or persistence
+      # after all task/owner invariants have passed.
+      admitted_skill_execution_limits = (
+        SkillExecutionLimits(None, None, None)
+        if mode == "skill"
+        else None
       )
-      or manifest_path.with_name(f"{task_id}.log"),
-      events_path=canonical_events_path,
-      events_device=None,
-      events_inode=None,
-      events_evidence_status=events_evidence_status,
-      operator_inbox_path=self._path_from_manifest(
-        manifest,
-        "operator_inbox_path",
-        fallback=manifest_path.with_name(f"{task_id}.operator-messages.jsonl"),
+    else:
+      raw_admitted_limits = manifest.get("admitted_skill_execution_limits")
+      if mode == "skill":
+        try:
+          admitted_skill_execution_limits = (
+            skill_execution_limits_from_mapping(
+              raw_admitted_limits
+            )
+          )
+        except (TypeError, ValueError):
+          self._warn_once(
+            manifest_path,
+            "Skipping autonomous manifest with invalid admitted skill "
+            "execution limits: %s",
+          )
+          return None
+      else:
+        if raw_admitted_limits is not None:
+          self._warn_once(
+            manifest_path,
+            "Skipping non-skill autonomous manifest with admitted skill "
+            "execution limits: %s",
+          )
+          return None
+        admitted_skill_execution_limits = None
+
+    record_user_id = str(identity["owner_user_id"])
+    if mode == "once":
+      record_mode = "once"
+    elif mode == "task":
+      record_mode = "task"
+    elif mode == "skill":
+      record_mode = "skill"
+    else:
+      record_mode = "pack"
+    record_task = self._coerce_manifest_str(manifest, "task")
+    record_skill = self._coerce_manifest_str(manifest, "skill")
+    record_context = self._coerce_manifest_str(manifest, "context")
+    record_ticker = self._coerce_manifest_str(manifest, "ticker")
+    record_channel = self._coerce_manifest_str(manifest, "channel")
+    record_dev_mode = bool(manifest.get("dev_mode", False))
+    record_dispatch_scope = _normalize_dispatch_scope(
+      manifest.get("dispatch_scope")
+    )
+    record_cmd = [
+      str(part) for part in cmd
+    ] if isinstance(cmd, list) else []
+    record_log_path = self._path_from_manifest(
+      manifest,
+      "log_path",
+      fallback=manifest_path.with_name(f"{task_id}.log"),
+    ) or manifest_path.with_name(f"{task_id}.log")
+    record_operator_inbox_path = self._path_from_manifest(
+      manifest,
+      "operator_inbox_path",
+      fallback=manifest_path.with_name(
+        f"{task_id}.operator-messages.jsonl"
       ),
-      approval_decisions_path=self._path_from_manifest(
-        manifest,
-        "approval_decisions_path",
-        fallback=None,
-      ),
-      control_authority=control_authority,
-      owner_lease_path=owner_lease_path,
-      owner_lease_device=owner_lease_device,
-      owner_lease_inode=owner_lease_inode,
-      started_at=float(started_at) if isinstance(started_at, (int, float)) else rehydrate_time,
-      skill_resume_allowed=skill_resume_allowed,
-      manifest_version=manifest_version,
-      max_budget_usd=_positive_finite_float(manifest.get("max_budget_usd")),
-      state=raw_state,
-      exit_code=exit_code,
-      error=error,
-      terminal_reason=terminal_reason,
-      proc=None,
-      reaper_task=None,
-      completed_at=completed_at,
-      terminal_manifest_committed=(
-        not was_interrupted
-        and raw_state in terminal_states
-      ),
-      log_handle=None,
-      slot_reserved=False,
-      event_lines=events,
-      owner_user_id=str(identity["owner_user_id"]),
-      raw_user_id=identity["raw_user_id"],
-      user_slug=identity["user_slug"],
-      risk_user_id=int(identity["risk_user_id"]),
-      user_aliases=list(identity["user_aliases"]),
-      identity_status=str(identity["identity_status"]),
-      resumed_from=self._coerce_manifest_str(manifest, "resumed_from"),
-      resumed_as=[str(item) for item in resumed_as] if isinstance(resumed_as, list) else [],
-      schedule_id=self._coerce_manifest_str(manifest, "schedule_id"),
-      schedule_name=self._coerce_manifest_str(manifest, "schedule_name"),
-      capability_bind=capability_bind,
-      tool_result_spill_dir=self._registered_tool_result_spill_dir(
+    )
+    record_approval_decisions_path = self._path_from_manifest(
+      manifest,
+      "approval_decisions_path",
+      fallback=None,
+    )
+    record_started_at = (
+      float(started_at)
+      if isinstance(started_at, (int, float))
+      else rehydrate_time
+    )
+    record_max_budget_usd = _positive_finite_float(
+      manifest.get("max_budget_usd")
+    )
+    record_research_file_id = _positive_int(
+      manifest.get("research_file_id")
+    )
+    record_terminal_manifest_committed = (
+      not was_interrupted
+      and raw_state in terminal_states
+    )
+    record_owner_user_id = str(identity["owner_user_id"])
+    record_raw_user_id = identity["raw_user_id"]
+    record_user_slug = identity["user_slug"]
+    record_risk_user_id = int(identity["risk_user_id"])
+    record_user_aliases = list(identity["user_aliases"])
+    record_identity_status = str(identity["identity_status"])
+    record_resumed_from = self._coerce_manifest_str(
+      manifest,
+      "resumed_from",
+    )
+    record_resumed_as = [
+      str(item) for item in resumed_as
+    ] if isinstance(resumed_as, list) else []
+    record_schedule_id = self._coerce_manifest_str(
+      manifest,
+      "schedule_id",
+    )
+    record_schedule_name = self._coerce_manifest_str(
+      manifest,
+      "schedule_name",
+    )
+    record_tool_result_spill_dir = (
+      self._registered_tool_result_spill_dir(
         task_id,
         manifest.get("tool_result_spill_dir"),
         require_exists=False,
-      ),
+      )
     )
     try:
-      record = AutonomousTask(**record_kwargs)
+      record_role = require_exact_role(manifest.get("role"))
+      record = AutonomousTask(
+        task_id=task_id,
+        control_run_id=control_run_id,
+        session_id=session_id,
+        channel_id=channel_id,
+        user_id=record_user_id,
+        user_email=user_email,
+        role=record_role,
+        profile=profile,
+        mode=record_mode,
+        task=record_task,
+        skill=record_skill,
+        pack=raw_pack,
+        deliver=deliver,
+        context=record_context,
+        ticker=record_ticker,
+        channel=record_channel,
+        dev_mode=record_dev_mode,
+        dispatch_scope=record_dispatch_scope,
+        cmd=record_cmd,
+        log_path=record_log_path,
+        events_path=canonical_events_path,
+        events_device=None,
+        events_inode=None,
+        events_evidence_status=events_evidence_status,
+        operator_inbox_path=record_operator_inbox_path,
+        approval_decisions_path=record_approval_decisions_path,
+        control_authority=control_authority,
+        owner_lease_path=owner_lease_path,
+        owner_lease_device=owner_lease_device,
+        owner_lease_inode=owner_lease_inode,
+        started_at=record_started_at,
+        skill_resume_allowed=skill_resume_allowed,
+        admitted_skill_execution_limits=admitted_skill_execution_limits,
+        manifest_version=manifest_version,
+        max_budget_usd=record_max_budget_usd,
+        research_file_id=record_research_file_id,
+        state=raw_state,
+        exit_code=exit_code,
+        error=error,
+        terminal_reason=terminal_reason,
+        proc=None,
+        reaper_task=None,
+        completed_at=completed_at,
+        terminal_manifest_committed=record_terminal_manifest_committed,
+        log_handle=None,
+        slot_reserved=False,
+        event_lines=events,
+        owner_user_id=record_owner_user_id,
+        raw_user_id=record_raw_user_id,
+        user_slug=record_user_slug,
+        risk_user_id=record_risk_user_id,
+        user_aliases=record_user_aliases,
+        identity_status=record_identity_status,
+        resumed_from=record_resumed_from,
+        resumed_as=record_resumed_as,
+        schedule_id=record_schedule_id,
+        schedule_name=record_schedule_name,
+        capability_bind=capability_bind,
+        tool_result_spill_dir=record_tool_result_spill_dir,
+      )
     except (TypeError, ValueError):
       _LOGGER.warning(
         "Skipping autonomous manifest with invalid task invariants: %s",
@@ -1920,7 +2038,11 @@ class AutonomousRegistryStateMixin:
     self._attach_manifest_tracking(record)
     try:
       owner_lease_released = True
-      if was_interrupted or missing_skill_resume_allowed:
+      if (
+        was_interrupted
+        or missing_skill_resume_allowed
+        or missing_admitted_skill_execution_limits
+      ):
         owner_lease_released = autonomous_owner_lease_is_released(
           record.owner_lease_path,
           expected_device=record.owner_lease_device,
@@ -1934,27 +2056,43 @@ class AutonomousRegistryStateMixin:
         exc_info=True,
       )
       return None
-    if missing_skill_resume_allowed:
+    missing_skill_admission_sibling = (
+      missing_skill_resume_allowed
+      or missing_admitted_skill_execution_limits
+    )
+    if missing_skill_admission_sibling:
       if not owner_lease_released:
         raise RuntimeError(
-          "cannot migrate autonomous skill resume policy while the prior owner is active"
+          "cannot migrate autonomous skill admission policy while the prior owner is active"
         )
-      record.skill_resume_allowed = self._resolve_initial_skill_resume_allowed(
+      resolved_policy = self._resolve_initial_skill_admission_policy(
         mode=record.mode,
         skill=record.skill,
       )
-    if missing_skill_resume_allowed and not self._write_task_manifest(
+      if record.mode == "skill":
+        if resolved_policy is None:
+          raise RuntimeError("skill admission policy resolution was unavailable")
+        if missing_skill_resume_allowed:
+          record.skill_resume_allowed = resolved_policy.skill_resume_allowed
+        if missing_admitted_skill_execution_limits:
+          record.admitted_skill_execution_limits = resolved_policy.execution_limits
+      else:
+        if missing_skill_resume_allowed:
+          record.skill_resume_allowed = False
+        if missing_admitted_skill_execution_limits:
+          record.admitted_skill_execution_limits = None
+    if missing_skill_admission_sibling and not self._write_task_manifest(
       record,
       checked=True,
     ):
       raise RuntimeError(
-        "failed to persist autonomous skill resume compatibility fact"
+        "failed to persist autonomous skill admission compatibility facts"
       )
     if (
       (was_interrupted and not owner_cleanup_active)
       or record.state != raw_manifest_state and not owner_cleanup_active
     ):
-      if not missing_skill_resume_allowed:
+      if not missing_skill_admission_sibling:
         self._write_task_manifest(record)
     return record
 

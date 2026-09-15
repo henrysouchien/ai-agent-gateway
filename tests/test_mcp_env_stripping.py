@@ -201,6 +201,7 @@ def test_server_env_passthrough_uses_parent_value_without_literal(
   _run(manager.startup())
 
   jobs_spec = captured["jobs-mcp"]["env"]
+  assert isinstance(jobs_spec, dict)
   assert jobs_spec == {env_name: f"${{{env_name}}}"}
   assert _build_mcp_env(jobs_spec)[env_name] == "parent-secret"
   assert captured["idea-workbench-mcp"]["env"] == {}
@@ -257,7 +258,8 @@ def test_server_env_passthrough_handles_config_when_parent_absent(
   )
   captured: dict[str, object] = {}
 
-  async def _capture(_name, config):
+  async def _capture(name, config):
+    _ = name
     captured.update(config)
     return None
 
@@ -294,7 +296,8 @@ def test_server_env_passthrough_preserves_literal_when_parent_value_is_empty(
   )
   captured: dict[str, object] = {}
 
-  async def _capture(_name, config):
+  async def _capture(name, config):
+    _ = name
     captured.update(config)
     return None
 

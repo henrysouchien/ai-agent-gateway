@@ -40,15 +40,10 @@ def approval_wait_seconds() -> float:
   return min(MAX_APPROVAL_WAIT_SECONDS, max(MIN_APPROVAL_WAIT_SECONDS, value))
 
 
-def read_approval_wait_seconds() -> float:
-  return approval_wait_seconds()
-
-
 __all__ = [
   "APPROVAL_WAIT_SECONDS_ENV",
   "DEFAULT_APPROVAL_WAIT_SECONDS",
   "MAX_APPROVAL_WAIT_SECONDS",
   "MIN_APPROVAL_WAIT_SECONDS",
   "approval_wait_seconds",
-  "read_approval_wait_seconds",
 ]

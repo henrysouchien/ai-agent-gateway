@@ -45,6 +45,12 @@ def derive_sub_agent_id(parent_session: Any, call_index: int) -> str:
   return f"sub{int(call_index)}:{parent_sid}"
 
 
+def is_sub_agent_session_id(session_id: str) -> bool:
+  """True iff session_id has the shape minted by derive_sub_agent_id."""
+  sid = str(session_id or "")
+  return sid.startswith("sub") and ":" in sid
+
+
 def format_exc(exc: BaseException) -> str:
   parts = [f"{type(exc).__name__}: {repr(exc)}"]
   seen = {id(exc)}

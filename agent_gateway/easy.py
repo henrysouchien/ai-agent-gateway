@@ -1,3 +1,13 @@
+"""Convenience composition root for a single generic gateway application.
+
+``create_agent`` accepts prompt, provider, tool, skill, and server settings and
+returns the FastAPI application assembled by ``create_gateway_app``. HTTP and
+session lifecycle stay in ``server.py``; the run loop and tool dispatch stay in
+``runner.py`` and ``dispatcher_factory.py``. This module may choose only an
+eligible stable model key from the supplied gateway policy, never a raw
+upstream model identifier. See ``packages/agent-gateway/README.md``.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -7,8 +17,10 @@ import logging
 import os
 import secrets
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from types import SimpleNamespace
+from typing import Any, Awaitable, Callable, Sequence
 
+from agent_workflow_contracts.tool_registration import McpInputPreparationRoute
 from fastapi import FastAPI
 
 from ._provider_utils import _resolve_provider
@@ -16,6 +28,7 @@ from .agent_session_log import AgentSessionLog, slugify
 from .auth import CredentialsResolver
 from .capability_binding import (
   CredentialHandle,
+  SESSION_DRIVER_CAPABILITY,
 )
 from .capability_execution import MaterializedCredential
 from .code_execution import CodeExecutionConfig, build_code_execution
@@ -38,6 +51,11 @@ from .model_registry import (
 from .providers import AnthropicProvider, ModelProvider
 from .rates import load_rate_table
 from .runner import AgentRunner, ToolResultContext
+from .runtime_spill import build_spill_sink
+from .tool_result_spill import (
+  TOOL_RESULT_READ_TOOL_DEF,
+  make_tool_result_read_handler,
+)
 from .server import (
   ChatRequest,
   ChatRuntime,
@@ -55,7 +73,7 @@ log = logging.getLogger("agent_gateway.easy")
 
 _SESSION_LOG_BASE_DIR_ENV = "AGENT_SESSION_LOG_BASE_DIR"
 _INITIAL_DRIVER_DEFAULT = INITIAL_MODEL_SELECTION_POLICY.capabilities[
-  "session.driver"
+  SESSION_DRIVER_CAPABILITY
 ].default
 if _INITIAL_DRIVER_DEFAULT.kind != "model" or _INITIAL_DRIVER_DEFAULT.model_key is None:
   raise RuntimeError("initial session.driver policy must select a stable model key")
@@ -163,7 +181,7 @@ def _easy_model_selection_policy(
 ) -> tuple[ModelRegistryEntry, ProductModelSelectionPolicy]:
   entry = INITIAL_MODEL_REGISTRY.require(model_key)
   driver_policy = INITIAL_MODEL_SELECTION_POLICY.capabilities[
-    "session.driver"
+    SESSION_DRIVER_CAPABILITY
   ]
   if entry.key not in driver_policy.allowed_model_keys:
     raise ValueError(
@@ -195,7 +213,7 @@ def _easy_model_selection_policy(
     revision=INITIAL_MODEL_SELECTION_POLICY.revision,
     capabilities={
       **INITIAL_MODEL_SELECTION_POLICY.capabilities,
-      "session.driver": replace(
+      SESSION_DRIVER_CAPABILITY: replace(
         driver_policy,
         default=CapabilityDefault(
           kind="model",
@@ -225,6 +243,7 @@ def create_agent(
   mcp_config_path: str | Path | None = None,
   mcp_timeout_overrides: dict[str, int] | None = None,
   mcp_default_tool_timeout: int = 30,
+  mcp_input_preparation_routes: Sequence[McpInputPreparationRoute] = (),
   mcp_session_inject_servers: set[str] | None = None,
   mcp_strip_input_fields: set[str] | None = None,
   tool_handlers: dict[str, LocalToolHandler] | None = None,
@@ -278,10 +297,10 @@ def create_agent(
   - optional code execution
   - optional skills and `run_agent`
 
-  By default it uses Anthropic, but you can switch to the built-in OpenAI
-  adapter with `provider="openai"`, the ChatGPT Codex backend with
-  `provider="codex"`, xAI Grok with `provider="xai"`, or pass a
-  `ModelProvider` instance directly. Use
+  By default it uses the registry's Anthropic model. To switch to the built-in
+  OpenAI, ChatGPT Codex, or xAI adapter, pass both the provider name and a
+  matching eligible stable `model_key`; alternatively, pass a `ModelProvider`
+  instance that agrees with the selected registry entry. Use
   `create_gateway_app()` when you need channel-specific runtimes, approval
   rules for arbitrary tools, or direct control over runner construction.
 
@@ -289,7 +308,8 @@ def create_agent(
     system_prompt: Prompt string, or a list of `(text, should_cache)` blocks for
       providers that support prompt caching.
     provider: Provider name (`"anthropic"`, `"codex"`, `"openai"`, or `"xai"`) or a
-      `ModelProvider` instance. When omitted, the registry entry determines it.
+      `ModelProvider` instance. When supplied, it must agree with `model_key`;
+      when omitted, the registry entry determines it.
     model_key: Stable product-registry key used by the deployment's
       `session.driver` default. Raw upstream model IDs are not accepted.
     effort: Explicit effort for the stable model key. When omitted, the
@@ -307,11 +327,14 @@ def create_agent(
     mcp_servers: Inline MCP server definitions. When provided, the helper uses
       `McpClientManager(config_path=None, inline_servers=...)`.
     mcp_config_path: Alternate Claude desktop config file to read MCP servers
-      from. When omitted, `MCP_CONFIG_PATH` is used if set; otherwise inline
-      `mcp_servers` remain inline-only and no file-backed servers are loaded.
+      from. When omitted without inline `mcp_servers`, `MCP_CONFIG_PATH` is
+      used if set. Inline `mcp_servers` stay file-config-free unless
+      `mcp_config_path` is passed explicitly.
     mcp_timeout_overrides: Optional per-server MCP tool timeout overrides in
       seconds.
     mcp_default_tool_timeout: Default MCP tool timeout in seconds.
+    mcp_input_preparation_routes: Exact logical MCP routes whose inputs the
+      application asks the generic client to prepare before dispatch.
     mcp_session_inject_servers: MCP servers that should receive `_session_id`
       injected into tool inputs at dispatch time.
     mcp_strip_input_fields: Input schema fields removed from advertised MCP
@@ -526,12 +549,16 @@ def create_agent(
     if operation_source is not None
     else None
   )
+  spill_workspace = _resolve_session_log_base_dir(session_log_base_dir)
+  spill_workspace.mkdir(parents=True, exist_ok=True)
   mcp_client: McpClientManager | None = None
   resolved_mcp_config_path = (
-    mcp_config_path if mcp_config_path is not None else _mcp_config_path_from_env()
+    mcp_config_path
+    if mcp_config_path is not None
+    else None if mcp_servers else _mcp_config_path_from_env()
   )
   if mcp_servers or resolved_mcp_config_path:
-    builtin_names = set((tool_handlers or {}).keys())
+    builtin_names = set((tool_handlers or {}).keys()) | {"tool_result_read"}
     if code_execution:
       builtin_names |= {"code_execute", "code_execute_status"}
     if operation_source is not None and "run_agent" not in builtin_names:
@@ -547,6 +574,7 @@ def create_agent(
       builtin_tool_names=builtin_names,
       timeout_overrides=mcp_timeout_overrides,
       default_tool_timeout=mcp_default_tool_timeout,
+      input_preparation_routes=mcp_input_preparation_routes,
       strip_input_fields=mcp_strip_input_fields,
     )
 
@@ -585,9 +613,12 @@ def create_agent(
     session: GatewaySession,
     request: ChatRequest,
     channel: str | None,
-    auth_manager: AuthManager,
+    auth_manager: AuthManager | None,
+    /,
+    *,
+    storage_root: Path | None = None,
   ) -> ChatRuntime:
-    _ = auth_manager
+    _ = auth_manager, storage_root
     capability_execution = request.capability_execution
     capability_execution_resolver = request.capability_execution_resolver
     if (
@@ -615,6 +646,9 @@ def create_agent(
         commercial_usage_producer = await commercial_usage_producer
     local_handlers = dict(tool_handlers or {})
     extra_tool_defs = list(tool_definitions or [])
+    local_handlers["tool_result_read"] = make_tool_result_read_handler(
+      lambda: getattr(session, "tool_result_spill_sink", None)
+    )
     runner_ref: list[Any] = [None]
     user_needs_approval = needs_approval
 
@@ -669,6 +703,11 @@ def create_agent(
       if mcp_client is not None:
         defs.extend(mcp_client.get_tool_definitions())
       defs.extend(extra_tool_defs)
+      if defs and not any(
+        definition.get("name") == "tool_result_read"
+        for definition in defs
+      ):
+        defs.append(TOOL_RESULT_READ_TOOL_DEF)
       return defs
 
     approval_qualifier = ce_bundle.approval_qualifier if ce_bundle is not None else None
@@ -768,6 +807,17 @@ def create_agent(
         ),
         commercial_mcp_servers=commercial_mcp_servers,
       )
+      configured_spill_sink = build_spill_sink(
+        SimpleNamespace(workspace=spill_workspace),
+        run_id=session_id,
+        available_tool_names={
+          name
+          for tool_def in _get_tool_defs()
+          if isinstance(tool_def, dict)
+          and isinstance((name := tool_def.get("name")), str)
+        },
+      )
+      session.tool_result_spill_sink = configured_spill_sink
       runner = AgentRunner(
         event_log=event_log,
         dispatcher=dispatcher,
@@ -793,7 +843,7 @@ def create_agent(
         max_budget_usd=max_budget_usd,
         coordinator=coordinator,
         agent_session_log=agent_session_log,
-        code_execution_spill_dir_provider=ce_bundle.ensure_work_dir if ce_bundle else None,
+        code_execution_spill_dir_provider=configured_spill_sink,
         commercial_usage_producer=commercial_usage_producer,
       )
       runner_ref[0] = runner

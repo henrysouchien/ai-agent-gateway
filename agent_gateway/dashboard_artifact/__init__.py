@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from .registry import MODULE_REGISTRY, ModuleSpec
+
+if TYPE_CHECKING:
+  from .qa import build_dashboard_artifact, validate_dashboard_payload
 
 
 def __getattr__(name: str):

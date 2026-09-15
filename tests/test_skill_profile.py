@@ -4,6 +4,8 @@ from dataclasses import fields
 from pathlib import Path
 
 import pytest
+from agent_workflow_contracts import ResolvedAuthority
+
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
@@ -22,11 +24,10 @@ from agent_gateway.skills import (
   compile_agent_operation,
   operation_tool_ids,
   parse_skill_file,
+  parse_skill_source,
   resolve_blocks,
   validate_operation_tool_coherence,
 )
-from agent.skills.loader import resolve_blocks as api_resolve_blocks
-from agent.shared.tool_handlers import _skill_memory_write_allowed_files
 
 SKILLS_DIR = ROOT / "api" / "memory" / "workspace" / "notes" / "skills"
 COMPACT_ROLLOUT_SKILLS = [
@@ -68,7 +69,9 @@ def _write_named_skill(skills_dir: Path, name: str, frontmatter: str | None, *, 
   (skills_dir / f"{name}.md").write_text(text, encoding="utf-8")
 
 
-def test_package_resolve_blocks_matches_api_resolver(tmp_path: Path) -> None:
+def test_package_resolve_blocks_expands_one_level_and_preserves_escapes(
+  tmp_path: Path,
+) -> None:
   blocks_dir = tmp_path / "_blocks"
   blocks_dir.mkdir()
   (blocks_dir / "citation-contract.md").write_text("Citation content.\n", encoding="utf-8")
@@ -76,13 +79,42 @@ def test_package_resolve_blocks_matches_api_resolver(tmp_path: Path) -> None:
   content = "Start {{CITATION_CONTRACT}} escaped \\{{ESCAPED}} nested {{NESTED}} end"
 
   package_resolved = resolve_blocks(content, blocks_dir)
-  api_resolved = api_resolve_blocks(content, blocks_dir)
 
-  assert package_resolved == api_resolved
   assert package_resolved == (
     "Start Citation content.\n escaped {{ESCAPED}} nested "
     "Nested {{CITATION_CONTRACT}} marker.\n end"
   )
+
+
+def test_source_parser_matches_file_and_loader_parsing(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    name: source-parity
+    version: '2.0'
+    agent_callable: true
+    agent_description: Source parser parity.
+    metadata:
+      required_context: [ticker]
+      max_budget_usd: '1.25'
+    semantic_metadata:
+      allowed_profiles: [advisor]
+    """,
+    body="Source body.\n\nSecond paragraph.",
+  )
+  skill_path.write_bytes(
+    skill_path.read_bytes().replace(b"\n", b"\r\n")
+  )
+  source = skill_path.read_text(encoding="utf-8")
+  assert "\r" not in source
+
+  from_source = parse_skill_source(source, path=skill_path)
+  assert from_source == parse_skill_file(skill_path)
+  assert from_source == SkillLoader(tmp_path).load_source(
+    source,
+    path=skill_path,
+  )
+  assert from_source == SkillLoader(tmp_path).load("test-skill")
 
 
 def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
@@ -109,7 +141,6 @@ def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
       state_dir: daily-scan
       max_budget_usd: "0.75"
       thinking: false
-      max_retries: 2
       initial_message: Run the workflow.
       delivery_label: Daily Scan
     """,
@@ -127,7 +158,6 @@ def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
   assert profile.state_dir == "daily-scan"
   assert profile.max_budget_usd == 0.75
   assert profile.thinking is False
-  assert profile.max_retries == 2
   assert profile.initial_message == "Run the workflow."
   assert profile.delivery_label == "Daily Scan"
   assert profile.metadata == {
@@ -141,7 +171,6 @@ def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
     "state_dir": "daily-scan",
     "max_budget_usd": 0.75,
     "thinking": False,
-    "max_retries": 2,
     "initial_message": "Run the workflow.",
     "delivery_label": "Daily Scan",
   }
@@ -321,7 +350,6 @@ def test_parse_lifts_top_level_keys(tmp_path: Path) -> None:
     state_dir: top-level-state
     max_budget_usd: 1.25
     thinking: "off"
-    max_retries: 3
     initial_message: Run from top level.
     delivery_label: Top Level
     """,
@@ -335,7 +363,6 @@ def test_parse_lifts_top_level_keys(tmp_path: Path) -> None:
   assert profile.state_dir == "top-level-state"
   assert profile.max_budget_usd == 1.25
   assert profile.thinking is False
-  assert profile.max_retries == 3
   assert profile.initial_message == "Run from top level."
   assert profile.delivery_label == "Top Level"
   assert profile.metadata == {
@@ -345,7 +372,6 @@ def test_parse_lifts_top_level_keys(tmp_path: Path) -> None:
     "state_dir": "top-level-state",
     "max_budget_usd": 1.25,
     "thinking": False,
-    "max_retries": 3,
     "initial_message": "Run from top level.",
     "delivery_label": "Top Level",
   }
@@ -598,21 +624,6 @@ def test_max_budget_coercion(tmp_path: Path) -> None:
   assert profile.metadata == {"max_budget_usd": 0.75}
 
 
-def test_max_retries_coercion(tmp_path: Path) -> None:
-  skill_path = _write_skill(
-    tmp_path,
-    """
-    metadata:
-      max_retries: 3.0
-    """,
-  )
-
-  profile = parse_skill_file(skill_path)
-
-  assert profile.max_retries == 3
-  assert profile.metadata == {"max_retries": 3}
-
-
 def test_none_defaults(tmp_path: Path) -> None:
   skill_path = _write_skill(
     tmp_path,
@@ -629,7 +640,6 @@ def test_none_defaults(tmp_path: Path) -> None:
   assert profile.timeout_overrides is None
   assert profile.state_dir is None
   assert profile.max_budget_usd is None
-  assert profile.max_retries is None
   assert profile.initial_message is None
   assert profile.delivery_label is None
   assert profile.agent_callable is False
@@ -651,7 +661,6 @@ def test_dataclass_construction_defaults() -> None:
   assert profile.timeout_overrides is None
   assert profile.state_dir is None
   assert profile.max_budget_usd is None
-  assert profile.max_retries is None
   assert profile.initial_message is None
   assert profile.delivery_label is None
   assert profile.agent_callable is False
@@ -695,7 +704,6 @@ def test_agent_profile_subclass_compat() -> None:
   assert profile.timeout_overrides is None
   assert profile.state_dir is None
   assert profile.max_budget_usd is None
-  assert profile.max_retries is None
   assert profile.initial_message is None
   assert profile.delivery_label is None
 
@@ -841,17 +849,6 @@ def test_scalar_mcp_tool_names_shape_rejected(tmp_path: Path) -> None:
     parse_skill_file(skill_path)
 
 
-def test_fundamental_research_typed_contract_scopes_memory_write_to_standard_artifact() -> None:
-  profile = SkillLoader(SKILLS_DIR).load("fundamental-research")
-
-  assert profile.metadata is not None
-  assert profile.metadata.get("typed_outputs_contract") is not None
-  assert _skill_memory_write_allowed_files(
-    profile,
-    "skills/fundamental-research/2026-06-11T120000.000Z-run123-MSFT.md",
-  ) == {"skills/fundamental-research/2026-06-11T120000.000Z-run123-MSFT.md"}
-
-
 def test_error_extraction_is_registered_as_product_observation_skill() -> None:
   loader = SkillLoader(SKILLS_DIR)
 
@@ -922,6 +919,9 @@ class _StaticMcpClient:
   def get_original_tool_name(self, name: str) -> str:
     return name
 
+  def get_policy_tool_name(self, name: str) -> str | None:
+    return name if name in self._server_by_tool else None
+
 
 def test_evidence_synthesis_compiles_its_declared_evidence_port() -> None:
   # A tool-less integrator states, in the catalog, where upstream results
@@ -946,6 +946,7 @@ def test_evidence_synthesis_compiles_its_declared_evidence_port() -> None:
 
 def test_evidence_port_cannot_reuse_a_required_context_key() -> None:
   profile = SkillLoader(SKILLS_DIR).load("evidence-synthesis")
+  assert profile.metadata is not None
   profile.metadata["evidence_ports"] = [{"name": "ticker"}]
   profile.metadata["required_context"] = ["ticker"]
   with pytest.raises(ValueError, match="cannot reuse required_context"):
@@ -986,6 +987,7 @@ def test_peer_comparison_analysis_compiles_non_empty_tool_grant() -> None:
     mcp_client=_StaticMcpClient(_PEER_COMPARISON_TOOLS_BY_SERVER),
     effect_resolver=lambda tool_id, server_id, is_local: "read",
   )
+  assert isinstance(authority, ResolvedAuthority)
 
   assert authority.grant.tools
   assert {

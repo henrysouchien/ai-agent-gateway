@@ -5,8 +5,14 @@ import inspect
 from pathlib import Path
 from typing import Any, Callable, Dict
 
-from .multi_user.billing import SessionUsageSummary, UsageEvent, write_dlq
-from .commercial_usage import CommercialUsageProducer
+from .multi_user.billing import (
+  BillingMode,
+  SessionUsageSummary,
+  UsageEvent,
+  UsageState,
+  write_dlq,
+)
+from .commercial_usage import CommercialUsageProducer, CommercialUsageReconciler
 
 USAGE_TOKEN_KEYS = (
   "input_tokens",
@@ -54,7 +60,7 @@ def usage_has_tokens(usage_totals: Dict[str, Any]) -> bool:
 
 
 def usage_delta(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
-  delta = {
+  delta: Dict[str, Any] = {
     key: max(0, int(after.get(key, 0) or 0) - int(before.get(key, 0) or 0))
     for key in USAGE_TOKEN_KEYS
   }
@@ -92,14 +98,14 @@ def record_compaction(aggregator: Any) -> None:
 
 
 def apply_message_start_usage(
-  usage_totals: Dict[str, int],
+  usage_totals: Dict[str, Any],
   *,
   input_tokens: int,
   cache_creation_tokens: int,
   cache_read_tokens: int,
   provider_units: int = 0,
   provider_unit_deltas: dict[str, int] | None = None,
-) -> Dict[str, int]:
+) -> Dict[str, Any]:
   usage_totals["input_tokens"] += input_tokens
   usage_totals["cache_creation_input_tokens"] += cache_creation_tokens
   usage_totals["cache_read_input_tokens"] += cache_read_tokens
@@ -111,7 +117,7 @@ def apply_message_start_usage(
 
 
 def apply_usage_update(
-  usage_totals: Dict[str, int],
+  usage_totals: Dict[str, Any],
   *,
   input_tokens: int = 0,
   output_tokens: int,
@@ -120,7 +126,7 @@ def apply_usage_update(
   cache_read_tokens: int = 0,
   provider_units: int = 0,
   provider_unit_deltas: dict[str, int] | None = None,
-) -> Dict[str, int]:
+) -> Dict[str, Any]:
   usage_totals["input_tokens"] += input_tokens
   usage_totals["cache_creation_input_tokens"] += cache_creation_tokens
   usage_totals["cache_read_input_tokens"] += cache_read_tokens
@@ -161,7 +167,7 @@ def build_usage_event(
   *,
   user_id: str,
   session_id: str,
-  request_id: str | None,
+  request_id: str,
   parent_turn_id: str | None,
   timestamp: float,
   model: str,
@@ -169,7 +175,7 @@ def build_usage_event(
   usage_totals: Dict[str, Any],
   cost_total: float,
   rate_table_version: str,
-  billing_mode: str,
+  billing_mode: BillingMode,
   channel: str | None,
 ) -> UsageEvent:
   bind_receipt = usage_totals.get("capability_bind")
@@ -187,7 +193,7 @@ def build_usage_event(
     provider=provider_name,
     capability_bind=dict(bind_receipt),
     provider_reported_model=(
-      str(usage_totals["provider_reported_model"])
+      str(usage_totals.get("provider_reported_model"))
       if usage_totals.get("provider_reported_model") is not None else None
     ),
     input_tokens=int(usage_totals["input_tokens"]),
@@ -231,22 +237,20 @@ async def call_session_summary_hook(
   *,
   log_session_id: str,
   logger: Any,
-  commercial_usage_producer: CommercialUsageProducer | None = None,
+  commercial_usage_producer: CommercialUsageReconciler | None = None,
   emit_metric: Callable[[str, int], None] | None = None,
 ) -> None:
   if commercial_usage_producer is not None:
-    reconcile = getattr(commercial_usage_producer, "reconcile", None)
-    if callable(reconcile):
-      try:
-        await reconcile(summary)
-      except Exception as exc:
-        logger.error(
-          "[%s] commercial usage reconciliation failed | exception_type=%s",
-          log_session_id,
-          type(exc).__name__,
-        )
-        if emit_metric is not None:
-          emit_metric("gateway.commercial_usage_reconciliation_error", 1)
+    try:
+      await commercial_usage_producer.reconcile(summary)
+    except Exception as exc:
+      logger.error(
+        "[%s] commercial usage reconciliation failed | exception_type=%s",
+        log_session_id,
+        type(exc).__name__,
+      )
+      if emit_metric is not None:
+        emit_metric("gateway.commercial_usage_reconciliation_error", 1)
   if on_session_summary is None:
     return
   try:
@@ -273,7 +277,7 @@ async def call_usage_event_hook(
   log_session_id: str,
   logger: Any,
   commercial_usage_producer: CommercialUsageProducer | None = None,
-  usage_state: str = "succeeded",
+  usage_state: UsageState = "succeeded",
 ) -> None:
   if commercial_usage_producer is not None:
     await commercial_usage_producer.emit(usage_event, usage_state=usage_state)

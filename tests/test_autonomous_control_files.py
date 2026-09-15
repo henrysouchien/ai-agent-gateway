@@ -15,6 +15,11 @@ from agent_gateway.autonomous_control_files import (
   append_closed_json_record,
   secure_create_owned_file,
 )
+from agent_gateway.autonomous_launch_envelope import AutonomousControlAuthority
+from agent_gateway.autonomous_runner_state import AutonomousTask
+from tests.capability_execution_test_support import (
+  stub_capability_execution_resolver,
+)
 
 
 def _payload() -> dict[str, object]:
@@ -137,11 +142,54 @@ def test_control_append_reports_unrecoverable_stream(
 
 def test_registry_fences_unrecoverable_control_stream(
   monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
 ) -> None:
-  registry = object.__new__(autonomous_runner.AutonomousRegistry)
-  record = SimpleNamespace(
-    cancellation_requested=False,
-    error=None,
+  registry = autonomous_runner.AutonomousRegistry(
+    api_dir=tmp_path / "api",
+    log_dir=tmp_path / "autonomous",
+  )
+  operator_inbox_path = tmp_path / "operator.jsonl"
+  record = AutonomousTask(
+    task_id="bg_1",
+    control_run_id="run_1",
+    session_id="bg_1",
+    channel_id="a" * 64,
+    user_id="alice",
+    user_email=None,
+    profile="default",
+    mode="task",
+    task="test",
+    skill=None,
+    pack=None,
+    deliver=True,
+    context=None,
+    ticker=None,
+    channel=None,
+    dev_mode=False,
+    dispatch_scope=None,
+    cmd=["python"],
+    log_path=tmp_path / "run.log",
+    operator_inbox_path=operator_inbox_path,
+    approval_decisions_path=None,
+    control_authority=AutonomousControlAuthority(
+      control_mode="file",
+      admission_ledger_path=str(tmp_path / "admission.jsonl"),
+      admission_ledger_device=1,
+      admission_ledger_inode=2,
+      operator_inbox_path=str(operator_inbox_path),
+      operator_inbox_device=1,
+      operator_inbox_inode=3,
+    ),
+    owner_lease_path=tmp_path / "owner.lease",
+    owner_lease_device=1,
+    owner_lease_inode=4,
+    started_at=0.0,
+    skill_resume_allowed=False,
+    admitted_skill_execution_limits=None,
+    role="owner",
+    capability_bind=stub_capability_execution_resolver(
+      run_mode="autonomous",
+    ).resolve("session.driver").bind,
     proc=SimpleNamespace(returncode=None),
   )
   lifeline_closed: list[object] = []

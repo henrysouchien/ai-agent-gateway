@@ -2,21 +2,9 @@ from __future__ import annotations
 
 from .base import ModelInfo, ThinkingLevel
 
-# context_window derivation (two intentional sources — do NOT unify blindly):
-#   400_000  = ChatGPT-backend enforced ceiling, probed live 2026-07-21
-#              (~370k accepted / 385k rejected, rounded up). Applies to the
-#              gpt-5.6 family, gpt-5.5, gpt-5.1 — the models actually runnable
-#              on the ChatGPT backend.
-#   272_000  = OpenAI published catalog context for the codex-specialized
-#              rows (5.1-codex-*, 5.2/-codex, 5.3-codex, 5.4). NOT backend-probed.
-#   128_000  = gpt-5.3-codex-spark catalog context.
-# WHY THIS MATTERS: effective_compaction_trigger = max(window*0.8, 160k). The
-# trigger-above-wall defect (the one fixed for grok in fac666326) only bites
-# when the registered window EXCEEDS the real enforced ceiling. The 272k rows
-# are conservative (below any plausible real ceiling → early trigger, no hedge
-# dependency), so they are SAFE as-is. Do not "fix" them upward to match 400k
-# without a live probe of each model's real ceiling — that would reintroduce
-# the exact defect. To unify, probe each row live and lower/keep, never raise.
+# Legacy protocol metadata for identifiers predating the product registry.
+# CodexProvider overlays current prices and limits from rates/codex.json;
+# new identifiers need only registry YAML and a rate row, not this table.
 _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
   *[
     (
@@ -28,16 +16,13 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
         max_output_tokens=128_000,
         supports_thinking=True,
         supports_vision=True,
-        input_cost_per_mtok=input_cost,
-        output_cost_per_mtok=output_cost,
-        cache_read_cost_per_mtok=cache_cost,
       ),
     )
-    for model_id, input_cost, output_cost, cache_cost in (
-      ("gpt-5.6-sol", 5.00, 30.00, 0.50),
-      ("gpt-5.6-terra", 2.50, 15.00, 0.25),
-      ("gpt-5.6-luna", 1.00, 6.00, 0.10),
-      ("gpt-5.6", 5.00, 30.00, 0.50),
+    for model_id in (
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
+      "gpt-5.6",
     )
   ],
   (
@@ -49,9 +34,6 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       max_output_tokens=128_000,
       supports_thinking=True,
       supports_vision=True,
-      input_cost_per_mtok=5.00,
-      output_cost_per_mtok=30.00,
-      cache_read_cost_per_mtok=0.50,
     ),
   ),
   (
@@ -63,9 +45,6 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       max_output_tokens=128_000,
       supports_thinking=True,
       supports_vision=True,
-      input_cost_per_mtok=1.25,
-      output_cost_per_mtok=10.0,
-      cache_read_cost_per_mtok=0.125,
     ),
   ),
   (
@@ -77,9 +56,6 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       max_output_tokens=128_000,
       supports_thinking=True,
       supports_vision=True,
-      input_cost_per_mtok=1.25,
-      output_cost_per_mtok=10.0,
-      cache_read_cost_per_mtok=0.125,
     ),
   ),
   (
@@ -91,9 +67,6 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       max_output_tokens=128_000,
       supports_thinking=True,
       supports_vision=True,
-      input_cost_per_mtok=0.25,
-      output_cost_per_mtok=2.0,
-      cache_read_cost_per_mtok=0.025,
     ),
   ),
   (
@@ -105,9 +78,6 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       max_output_tokens=128_000,
       supports_thinking=True,
       supports_vision=True,
-      input_cost_per_mtok=1.75,
-      output_cost_per_mtok=14.0,
-      cache_read_cost_per_mtok=0.175,
     ),
   ),
   (
@@ -119,9 +89,6 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       max_output_tokens=128_000,
       supports_thinking=True,
       supports_vision=True,
-      input_cost_per_mtok=1.75,
-      output_cost_per_mtok=14.0,
-      cache_read_cost_per_mtok=0.175,
     ),
   ),
   (
@@ -133,9 +100,6 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       max_output_tokens=128_000,
       supports_thinking=True,
       supports_vision=True,
-      input_cost_per_mtok=1.75,
-      output_cost_per_mtok=14.0,
-      cache_read_cost_per_mtok=0.175,
     ),
   ),
   (
@@ -147,9 +111,6 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       max_output_tokens=128_000,
       supports_thinking=True,
       supports_vision=False,
-      input_cost_per_mtok=0.0,
-      output_cost_per_mtok=0.0,
-      cache_read_cost_per_mtok=0.0,
     ),
   ),
   (
@@ -161,9 +122,6 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       max_output_tokens=128_000,
       supports_thinking=True,
       supports_vision=True,
-      input_cost_per_mtok=2.5,
-      output_cost_per_mtok=15.0,
-      cache_read_cost_per_mtok=0.25,
     ),
   ),
 ]

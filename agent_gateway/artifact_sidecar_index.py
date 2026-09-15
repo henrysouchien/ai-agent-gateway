@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import logging
 import hashlib
 import json
 import sqlite3
@@ -12,6 +13,8 @@ from .artifact_paths import canonicalize_ticker
 
 INDEX_VERSION = 1
 _INDEX_RELATIVE_PATH = ("artifacts", "_index", "artifact_sidecars.sqlite3")
+
+log = logging.getLogger(__name__)
 
 
 def register_dashboard_artifact_sidecar(
@@ -406,6 +409,42 @@ def mark_artifact_sidecar_index_row_stale(
       (_now_ts(), str(error), effective_user_id, str(artifact_kind), str(artifact_ref)),
     )
   return cursor.rowcount > 0
+
+
+def mark_unreadable_artifact_sidecar_stale(
+  *,
+  workspace_dir: Path,
+  artifact_kind: str,
+  sidecar_path: Path,
+  error: BaseException,
+) -> None:
+  """Make a sidecar skipped by a listing loop visible: log it and mark its index row stale."""
+
+  log.warning(
+    "artifact_sidecar_unreadable",
+    extra={
+      "artifact_kind": artifact_kind,
+      "sidecar_path": str(sidecar_path),
+      "error": repr(error),
+    },
+  )
+  try:
+    mark_artifact_sidecar_index_row_stale(
+      workspace_dir=workspace_dir,
+      artifact_kind=artifact_kind,
+      artifact_ref=_relative_to_workspace(workspace_dir, sidecar_path),
+      error="corrupt_sidecar",
+    )
+  except Exception:
+    log.warning(
+      "artifact_index_failure",
+      extra={
+        "artifact_kind": artifact_kind,
+        "sidecar_path": str(sidecar_path),
+        "index_path": str(artifact_sidecar_index_path(workspace_dir)),
+      },
+      exc_info=True,
+    )
 
 
 def delete_artifact_sidecar_index_rows(
@@ -824,6 +863,7 @@ __all__ = [
   "get_artifact_sidecar_index_row_by_ref",
   "list_artifact_sidecar_index_rows",
   "mark_artifact_sidecar_index_row_stale",
+  "mark_unreadable_artifact_sidecar_stale",
   "register_canvas_artifact_sidecar",
   "register_dashboard_artifact_sidecar",
   "register_html_artifact_sidecar",

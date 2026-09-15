@@ -57,6 +57,7 @@ EXPLORE_FINDINGS_RETURN_CONTRACT = "explore-findings-v1"
 VERIFY_FINDING_RETURN_CONTRACT = "verify-finding-v1"
 ARTIFACT_BRIEF_RETURN_CONTRACT = "artifact-brief-v1"
 LEARNING_REPORT_RETURN_CONTRACT = "learning-report-v1"
+TERMINAL_TOOL_RESULT_RETURN_CONTRACT = "terminal-tool-result-v1"
 FUNDAMENTAL_RESEARCH_PROPOSAL_RETURN_CONTRACT = (
   "fundamental-research-proposal-v1"
 )
@@ -191,6 +192,7 @@ def build_task_result(
   outcome: AnalyticalOutcome | None,
   terminal_narrative: FinalNarrativeArtifactReference | None,
   projection: CanonicalProjection | None,
+  runtime_projection: CanonicalProjection | None = None,
   artifacts: Sequence[NamedArtifact] = (),
   observed_sources: Sequence[Any] = (),
   tools_used: Sequence[str] = (),
@@ -209,8 +211,8 @@ def build_task_result(
   own verdict.  ``runtime_outcome`` is the separate *mechanical* door
   (D-B3-4): this function cannot see its caller, so the restriction is
   structural — a distinct keyword, accepted only for a ``mechanically_derived``
-  assessment, mutually exclusive with ``outcome``, never on a non-successful
-  settlement, and pinned to a single non-test caller by
+  assessment, mutually exclusive with ``outcome``, and pinned to a single
+  non-test caller by
   ``packages/agent-gateway/tests/test_runtime_outcome_import_restriction.py``.
   """
 
@@ -221,8 +223,6 @@ def build_task_result(
       )
     if runtime_outcome.assessment_source != "mechanically_derived":
       raise ValueError("runtime outcome must be mechanically derived")
-    if execution.status != "succeeded":
-      raise ValueError("non-successful execution cannot carry a runtime outcome")
   settled_outcome = outcome if outcome is not None else runtime_outcome
 
   narrative_handle = (
@@ -235,10 +235,17 @@ def build_task_result(
     successful
     and requirement.terminal_narrative == "required"
     and narrative_handle is None
+    and runtime_projection is None
   ):
     raise ValueError("result contract requires an exact terminal narrative")
   if requirement.terminal_narrative == "forbidden" and narrative_handle is not None:
     raise ValueError("result contract forbids a terminal narrative")
+  if projection is not None and runtime_projection is not None:
+    raise ValueError(
+      "task result cannot carry both authored and runtime projections"
+    )
+  if runtime_projection is not None and not successful:
+    raise ValueError("runtime projection requires successful execution")
   if requirement.projection is None:
     if projection is not None:
       raise ValueError("result contract does not declare a projection")
@@ -261,14 +268,14 @@ def build_task_result(
       and outcome.assessment_source == "none"
     ):
       raise ValueError("non-assessing result may only carry not_assessed")
-  if execution.status != "succeeded" and (
-    narrative_handle is not None or projection is not None or artifacts
-  ):
-    raise ValueError("non-successful execution cannot publish canonical values")
 
   values = TaskResultValues(
     terminal_narrative=narrative_handle,
-    projection=projection,
+    projection=(
+      runtime_projection
+      if runtime_projection is not None
+      else projection
+    ),
     artifacts=tuple(artifacts),
   )
   evidence_value = EvidenceObservation(
@@ -397,16 +404,6 @@ class FinalNarrativeArtifactReference(BaseModel):
     if not self.artifact_id.startswith("sha256:") or len(self.artifact_id) != 71:
       raise ValueError("final narrative artifact_id must be a sha256 identity")
     return self
-
-
-class SpillFileReference(BaseModel):
-  """Internal spill-store input retained for protected FMS overflow handling."""
-
-  model_config = ConfigDict(extra="forbid", frozen=True)
-
-  kind: Literal["spill_file"] = "spill_file"
-  path: NonEmptyReferenceValue
-  retention: Literal["transient"] = "transient"
 
 
 class PlanJournalReference(BaseModel):

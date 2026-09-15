@@ -88,6 +88,7 @@ if __name__ == "__main__":
     "You are a concise operations assistant. Always call read_status before you reply.",
     "Check the current service status and send a short summary.",
     capability_execution=capability_execution,
+    admitted_skill_execution_limits=None,
     session=GatewaySession(
       session_id="autonomous-example",
       api_key_hash="example",

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Set
+from typing import AbstractSet, Any, Dict, Iterable, List, Set
 
 _MODEL_WRITER_TERMINAL_DOORS = frozenset({"fms_persist_business_model"})
 
@@ -54,7 +54,7 @@ def is_report_door_clear_event(
   event: Dict[str, Any],
   *,
   expected_skill: str | None,
-  success_statuses: set[str],
+  success_statuses: AbstractSet[str],
 ) -> bool:
   if event.get("type") != "tool_call_complete" or event.get("error") is not None:
     return False

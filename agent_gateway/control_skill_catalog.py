@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-import math
+import re
 from typing import Literal, Protocol, runtime_checkable
 
 
@@ -18,12 +18,27 @@ _CONTROL_SKILL_UNAVAILABLE_CODES = frozenset({
   "invalid",
   "unknown",
 })
+_CONTROL_SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def is_control_skill_name(value: object) -> bool:
+  """Return whether *value* is an exact reusable control skill name."""
+
+  return (
+    type(value) is str
+    and _CONTROL_SKILL_NAME_RE.fullmatch(value) is not None
+  )
+
+
+def _require_string(value: object, *, field_name: str) -> str:
+  if type(value) is not str:
+    raise TypeError(f"{field_name} must be an exact str")
+  return value
 
 
 def _require_text(value: object, *, field_name: str) -> None:
-  if type(value) is not str:
-    raise TypeError(f"{field_name} must be an exact str")
-  if not value or value != value.strip():
+  text = _require_string(value, field_name=field_name)
+  if not text or text != text.strip():
     raise ValueError(f"{field_name} must be canonical non-empty text")
 
 
@@ -43,8 +58,8 @@ def _snapshot_text_sequence(value: object, *, field_name: str) -> tuple[str, ...
 
 
 @dataclass(frozen=True, slots=True)
-class ControlSkillDefinition:
-  """Exact immutable data exposed by the control skill catalog."""
+class ControlSkillSummary:
+  """Exact immutable metadata exposed by the control skill list wire."""
 
   name: str
   label: str
@@ -57,9 +72,9 @@ class ControlSkillDefinition:
   agent_callable: bool
   resumable: bool
   max_turns: int | None
-  max_budget_usd: int | float | None
+  max_budget_usd: float | None
   persist_state: bool
-  typed_contract: None
+  typed_contract: str | None
   catalog: bool
   profiles: tuple[str, ...]
   modes: tuple[str, ...]
@@ -73,21 +88,19 @@ class ControlSkillDefinition:
   can_schedule: bool
   blocked_reason: str | None
   path: str
-  body: str
 
   def __post_init__(self) -> None:
     for field_name in (
       "name",
       "label",
-      "description",
-      "version",
       "scope",
       "action_class",
       "approval_policy",
       "path",
-      "body",
     ):
       _require_text(getattr(self, field_name), field_name=field_name)
+    for field_name in ("description", "version"):
+      _require_string(getattr(self, field_name), field_name=field_name)
     for field_name in ("agent_description", "blocked_reason"):
       _require_optional_text(getattr(self, field_name), field_name=field_name)
     for field_name in (
@@ -104,20 +117,20 @@ class ControlSkillDefinition:
         raise TypeError(f"{field_name} must be an exact bool")
     if self.catalog is not True:
       raise ValueError("catalog must be exactly True")
-    if self.max_turns is not None:
-      if type(self.max_turns) is not int:
-        raise TypeError("max_turns must be None or an exact int")
-      if self.max_turns <= 0:
-        raise ValueError("max_turns must be positive")
+    if self.max_turns is not None and type(self.max_turns) is not int:
+      raise TypeError("max_turns must be None or an exact int")
     if self.max_budget_usd is not None:
       if type(self.max_budget_usd) not in {int, float}:
         raise TypeError(
           "max_budget_usd must be None or an exact int or float"
         )
-      if not math.isfinite(self.max_budget_usd) or self.max_budget_usd <= 0:
-        raise ValueError("max_budget_usd must be finite and positive")
-    if self.typed_contract is not None:
-      raise TypeError("typed_contract must be exactly None")
+      object.__setattr__(
+        self,
+        "max_budget_usd",
+        float(self.max_budget_usd),
+      )
+    if self.typed_contract is not None and type(self.typed_contract) is not str:
+      raise TypeError("typed_contract must be None or an exact str")
     for field_name in (
       "required_context",
       "profiles",
@@ -136,11 +149,22 @@ class ControlSkillDefinition:
       )
 
 
+@dataclass(frozen=True, slots=True)
+class ControlSkillDetail(ControlSkillSummary):
+  """One control skill summary plus its selected resolved body."""
+
+  body: str
+
+  def __post_init__(self) -> None:
+    ControlSkillSummary.__post_init__(self)
+    _require_string(self.body, field_name="body")
+
+
 @runtime_checkable
 class ControlSkillCatalog(Protocol):
-  def list_skills(self) -> tuple[ControlSkillDefinition, ...]: ...
+  def list_skills(self) -> tuple[ControlSkillSummary, ...]: ...
 
-  def resolve_skill(self, skill_name: object) -> ControlSkillDefinition: ...
+  def resolve_skill(self, selector: object) -> ControlSkillDetail: ...
 
 
 class ControlSkillUnavailableError(LookupError):
@@ -163,7 +187,9 @@ class ControlSkillUnavailableError(LookupError):
 
 __all__ = [
   "ControlSkillCatalog",
-  "ControlSkillDefinition",
+  "ControlSkillDetail",
+  "ControlSkillSummary",
   "ControlSkillUnavailableCode",
   "ControlSkillUnavailableError",
+  "is_control_skill_name",
 ]

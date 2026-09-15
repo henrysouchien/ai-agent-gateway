@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -106,6 +107,8 @@ def _runtime_builder(runner_factory):
     request,
     channel,
     auth_manager,
+    *,
+    storage_root: Path | None = None,
   ) -> ChatRuntime:
     _ = (session, channel, auth_manager)
     capability_bind = request.capability_bind

@@ -6,7 +6,11 @@ import logging
 import re
 from pathlib import Path
 
-from .artifact_sidecar_index import artifact_sidecar_index_path, register_html_artifact_sidecar
+from .artifact_sidecar_index import (
+  artifact_sidecar_index_path,
+  mark_unreadable_artifact_sidecar_stale,
+  register_html_artifact_sidecar,
+)
 from .artifact_paths import canonicalize_ticker
 from schema.html_artifact import HtmlArtifact
 
@@ -126,15 +130,22 @@ def list_html_artifacts(
   for sidecar_path in sorted(directory.glob("*.json"), key=lambda path: path.name):
     try:
       artifact_id = _validate_html_artifact_id(sidecar_path.stem)
-      safe_sidecar_path = _ensure_under_workspace(sidecar_path, workspace_dir)
     except ValueError:
+      # Not an HTML artifact sidecar name (foreign file); not ours to report.
       continue
     if artifact_id != sidecar_path.stem:
       continue
     try:
+      safe_sidecar_path = _ensure_under_workspace(sidecar_path, workspace_dir)
       sidecar_stat = safe_sidecar_path.stat()
       artifact = HtmlArtifact.model_validate_json(safe_sidecar_path.read_bytes())
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+      mark_unreadable_artifact_sidecar_stale(
+        workspace_dir=workspace_dir,
+        artifact_kind="html",
+        sidecar_path=sidecar_path,
+        error=exc,
+      )
       continue
     if ticker is not None and artifact.ticker != ticker:
       continue

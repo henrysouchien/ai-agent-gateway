@@ -5,6 +5,7 @@ import contextvars
 from datetime import datetime, timezone
 from functools import lru_cache
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,8 @@ from agent_gateway.artifact_paths import (
   user_workspace_root,
 )
 
+
+log = logging.getLogger(__name__)
 
 # Request-scoped cache of research-file classification lookups (research_file_id
 # -> classification dict or None). Set per list call in artifact_responses_for_user
@@ -297,14 +300,17 @@ def _visibility_filter(value: object | None) -> str:
 def _origin_kind(value: object | None) -> str:
   normalized = str(value if value is not None else "product").strip().lower()
   if normalized not in _ORIGIN_VALUES:
-    raise ValueError("invalid origin_kind")
+    # The vocabulary is owned by the producers (research repository CHECK
+    # constraints and the artifact schema models). A value this consumer does
+    # not know yet must be carried, not silently demoted out of visibility.
+    log.warning("artifact classification carries unknown origin_kind %r", normalized)
   return normalized
 
 
 def _visibility(value: object | None) -> str:
   normalized = str(value if value is not None else "default").strip().lower()
   if normalized not in _VISIBILITY_VALUES:
-    raise ValueError("invalid visibility")
+    log.warning("artifact classification carries unknown visibility %r", normalized)
   return normalized
 
 
@@ -361,6 +367,12 @@ def _load_research_file_classification(*, user_id: str, research_file_id: int) -
 
     row = get_repository_factory().get(user_id).get_file(int(research_file_id))
   except Exception:
+    log.warning(
+      "research-file classification lookup failed for research_file_id=%s;"
+      " falling back to sidecar classification",
+      research_file_id,
+      exc_info=True,
+    )
     return None
   if not isinstance(row, dict):
     return None
@@ -392,19 +404,19 @@ def _sidecar_classification(
       "classification_source": "legacy_default",
     }
   try:
-    return {
-      "origin_kind": _origin_kind(payload.get("origin_kind")),
-      "visibility": _visibility(payload.get("visibility")),
-      "origin_ref": _origin_ref(payload.get("origin_ref")),
-      "classification_source": "sidecar",
-    }
+    origin_ref = _origin_ref(payload.get("origin_ref"))
   except ValueError:
-    return {
-      "origin_kind": "import",
-      "visibility": "archived",
-      "origin_ref": None,
-      "classification_source": "invalid_sidecar",
-    }
+    log.warning(
+      "artifact sidecar origin_ref is unreadable; carrying classification without it",
+      exc_info=True,
+    )
+    origin_ref = None
+  return {
+    "origin_kind": _origin_kind(payload.get("origin_kind")),
+    "visibility": _visibility(payload.get("visibility")),
+    "origin_ref": origin_ref,
+    "classification_source": "sidecar",
+  }
 
 
 def _payload_matches_artifact_filters(payload: dict[str, Any], *, filters: dict[str, Any]) -> bool:
@@ -468,8 +480,21 @@ def _raw_sidecar_payload_cached(path_str: str, mtime_ns: int) -> dict[str, Any] 
     with open(path_str, "r", encoding="utf-8") as handle:
       payload = json.load(handle)
   except (OSError, json.JSONDecodeError):
+    # Warns once per (path, mtime_ns) via the lru cache: the sidecar is the
+    # gateway's own artifact and must not vanish from listings silently.
+    log.warning(
+      "artifact sidecar %s is unreadable; omitting it from listings",
+      path_str,
+      exc_info=True,
+    )
     return None
-  return payload if isinstance(payload, dict) else None
+  if not isinstance(payload, dict):
+    log.warning(
+      "artifact sidecar %s is not a JSON object; omitting it from listings",
+      path_str,
+    )
+    return None
+  return payload
 
 
 def _artifact_response_from_sidecar(

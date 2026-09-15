@@ -3,10 +3,13 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import replace
-from typing import Any
+from typing import Any, Protocol
 
-from .event_log import EventLog, LogEntry, log_has_terminal
+from .event_log import LogEntry, log_has_terminal
 from .events import (
+  ApprovalDecisionSource,
+  ApprovalOutcome,
+  Confidence,
   RecapApproval,
   RecapArtifact,
   RecapFailure,
@@ -21,8 +24,26 @@ from .multi_user.billing import SessionUsageSummary
 log = logging.getLogger("agent_gateway.session_recap")
 
 
+class _SessionRecapSource(Protocol):
+  """Event-log surface consumed by recap computation."""
+
+  @property
+  def entries(self) -> list[LogEntry]: ...
+
+  @property
+  def next_seq(self) -> int: ...
+
+
+class SessionRecapEventLog(_SessionRecapSource, Protocol):
+  """Event-log surface consumed by recap and terminal emission."""
+
+  @property
+  def has_terminal(self) -> bool: ...
+
+  def append(self, event: dict[str, Any]) -> object | None: ...
+
 def compute_recap(
-  event_log: EventLog,
+  event_log: _SessionRecapSource,
   *,
   session_id: str,
   started_at: float,
@@ -200,7 +221,7 @@ def _compute_recap_entries(
 
 
 def emit_recap_then_terminal(
-  event_log: EventLog,
+  event_log: SessionRecapEventLog,
   terminal_event: dict[str, Any],
   *,
   session_id: str,
@@ -282,7 +303,7 @@ class _ToolCallAccumulator:
     if tool_call_id and tool_call_id not in self._seen_starts:
       self.total_calls += 1
       self._increment_buckets(event)
-    if bool(event.get("is_error")) or event.get("error") is not None or bool(event.get("semantic_error")):
+    if bool(event.get("is_error")):
       self.errors += 1
     else:
       self.successes += 1
@@ -362,32 +383,41 @@ def _verdict_summary_from_skill_result(event: dict[str, Any]) -> dict[str, Any] 
   }
 
 
-def _confidence(value: Any) -> str | None:
-  if value is None:
-    return None
-  if value in {"HIGH", "MEDIUM", "LOW"}:
-    return str(value)
+def _confidence(value: Any) -> Confidence | None:
+  if value == "HIGH":
+    return "HIGH"
+  if value == "MEDIUM":
+    return "MEDIUM"
+  if value == "LOW":
+    return "LOW"
   return None
 
 
-def _approval_outcome(value: Any) -> str:
-  if value in {"approved", "denied", "timeout"}:
-    return str(value)
+def _approval_outcome(value: Any) -> ApprovalOutcome:
+  if value == "approved":
+    return "approved"
+  if value == "denied":
+    return "denied"
+  if value == "timeout":
+    return "timeout"
   return "timeout"
 
 
-def _approval_decision_source(value: Any) -> str:
-  if value in {
-    "user_approved",
-    "delegated_auto_approved",
-    "user_denied",
-    "relay_policy_denied",
-    "headless_auto_deny",
-    "headless_hook_approved",
-    "session_cache_approved",
-    "approval_timeout",
-  }:
-    return str(value)
+def _approval_decision_source(value: Any) -> ApprovalDecisionSource:
+  if value == "user_approved":
+    return "user_approved"
+  if value == "delegated_auto_approved":
+    return "delegated_auto_approved"
+  if value == "user_denied":
+    return "user_denied"
+  if value == "relay_policy_denied":
+    return "relay_policy_denied"
+  if value == "headless_auto_deny":
+    return "headless_auto_deny"
+  if value == "headless_hook_approved":
+    return "headless_hook_approved"
+  if value == "session_cache_approved":
+    return "session_cache_approved"
   return "approval_timeout"
 
 
@@ -399,4 +429,9 @@ def _failure_detail(event: dict[str, Any]) -> str:
   return str(event.get("type") or "failure")
 
 
-__all__ = ["compute_recap", "compute_recap_from_events", "emit_recap_then_terminal"]
+__all__ = [
+  "SessionRecapEventLog",
+  "compute_recap",
+  "compute_recap_from_events",
+  "emit_recap_then_terminal",
+]

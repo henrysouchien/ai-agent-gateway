@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections.abc import Awaitable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Generic, Protocol, TypeVar
+from typing import Any, Callable, Generic, Protocol, TypeVar
+from typing_extensions import TypeIs
 
 
 class UiBlocksCapability(Protocol):
@@ -16,6 +18,12 @@ class UiBlocksCapability(Protocol):
 ResultT = TypeVar("ResultT")
 CommitFn = Callable[[int, Callable[[], None]], Awaitable[ResultT] | ResultT]
 PostRenameFailureFn = Callable[[BaseException, int], ResultT]
+
+
+def _is_awaitable_result(
+  outcome: Awaitable[ResultT] | ResultT,
+) -> TypeIs[Awaitable[ResultT]]:
+  return inspect.isawaitable(outcome)
 
 
 @dataclass(frozen=True)
@@ -253,7 +261,7 @@ class UiBlocksRunRegistry:
 
       try:
         outcome = commit_fn(emission_index, mark_renamed)
-        if inspect.isawaitable(outcome):
+        if _is_awaitable_result(outcome):
           outcome = await outcome
         if not renamed:
           raise RuntimeError("commit callback returned before atomic rename")

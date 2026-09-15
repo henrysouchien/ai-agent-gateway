@@ -2,8 +2,8 @@ import asyncio
 import inspect
 import logging
 import sys
-import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -17,18 +17,45 @@ import agent_gateway  # noqa: E402
 import agent_gateway.autonomous as autonomous  # noqa: E402
 import agent_gateway.autonomous_output as autonomous_output  # noqa: E402
 from agent_gateway import EventLog  # noqa: E402
-from agent_gateway.capability_binding import CapabilityBind, CredentialHandle  # noqa: E402
+from agent_gateway.capability_binding import (  # noqa: E402
+  CapabilityBind,
+  CapabilityEffort,
+  CredentialHandle,
+)
 from agent_gateway.capability_execution import BoundCapabilityExecution  # noqa: E402
 from agent_gateway.model_registry import (  # noqa: E402
   ModelRegistryEntry,
   ProductModelRegistry,
 )
+from agent_gateway.mcp_client import _ServerState  # noqa: E402
 from agent_gateway.providers import ModelInfo, ModelProvider  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
+from agent_gateway.skill_limits import SkillExecutionLimits  # noqa: E402
+from agent_gateway.tool_policy_registry import (  # noqa: E402
+  ToolPolicyImplementationRegistry,
+)
+from agent_workflow_contracts.tool_registration import (  # noqa: E402
+  ToolRegistrationCatalog,
+)
 
 
 def _run(coro):
   return asyncio.run(coro)
+
+def _raw_capability_execution_resolver(**resolver):
+  return resolver
+
+
+def _raw_interceptors(**interceptors):
+  return interceptors
+
+
+def _raw_mcp_session(**session):
+  return session
+
+
+async def _noop_local_tool(*_args, **_kwargs):
+  return {}, None
 
 
 class _MockResponse:
@@ -81,13 +108,13 @@ def _autonomous_bind(
   *,
   provider: str = "stub",
   model: str = "stub-model",
-  effort: str = "none",
+  effort: CapabilityEffort = "none",
   run_mode: str = "autonomous",
   capability_id: str = "session.driver",
 ) -> CapabilityBind:
   return CapabilityBind(
     schema_version="1.0",
-    capability_id=capability_id,  # type: ignore[arg-type]
+    capability_id=capability_id,
     model_key=f"test.{provider}.{model}",
     provider=provider,
     upstream_model=model,
@@ -178,6 +205,7 @@ def _bound_execution(
         actor_id=None,
       ),
     ),
+    "admitted_skill_execution_limits": None,
   }
 
 
@@ -430,16 +458,24 @@ def test_collect_run_output_first_terminal_error_wins() -> None:
   assert output.usage == {}
 
 
-def test_run_session_timeout() -> None:
+def test_run_session_positive_timeout_does_not_kill_llm_work() -> None:
+  event_log = EventLog()
+
   class _SlowRunner:
     async def run(self, **kwargs: Any) -> None:
       _ = kwargs
-      await asyncio.sleep(0.2)
+      await asyncio.sleep(0.05)
+      event_log.append({"type": "text_delta", "text": "completed"})
+      event_log.append({
+        "type": "stream_complete",
+        "terminal_disposition": "completed",
+        "usage": {},
+      })
 
   output = _run(
     autonomous.run_session(
       _SlowRunner(),  # type: ignore[arg-type]
-      EventLog(),
+      event_log,
       max_turns=3,
       timeout_seconds=0.01,
       initial_message="hello",
@@ -447,54 +483,9 @@ def test_run_session_timeout() -> None:
     )
   )
 
-  assert output.timed_out is True
-  assert output.response == ""
+  assert output.timed_out is False
+  assert output.response == "completed"
   assert output.error is None
-
-
-def test_run_session_timeout_does_not_wait_for_slow_cancellation(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  event_log = EventLog()
-  monkeypatch.setattr(autonomous, "_RUN_SESSION_CANCEL_DRAIN_SECONDS", 0.01)
-  monkeypatch.setattr(autonomous, "_RUN_SESSION_FORCE_CLOSE_SECONDS", 0.01)
-
-  class _SlowCancellationRunner:
-    force_closed = False
-    cancel_seen = False
-
-    async def run(self, **kwargs: Any) -> None:
-      _ = kwargs
-      try:
-        await asyncio.Event().wait()
-      except asyncio.CancelledError:
-        self.cancel_seen = True
-        await asyncio.sleep(1.0)
-
-    async def force_close(self, timeout: float = 2.0) -> None:
-      _ = timeout
-      self.force_closed = True
-
-  async def _exercise() -> tuple[autonomous.RunOutput, float, _SlowCancellationRunner]:
-    runner = _SlowCancellationRunner()
-    started = time.monotonic()
-    output = await autonomous.run_session(
-      runner,  # type: ignore[arg-type]
-      event_log,
-      max_turns=3,
-      timeout_seconds=0.01,
-      initial_message="hello",
-      system_prompt="You are helpful.",
-    )
-    return output, time.monotonic() - started, runner
-
-  output, elapsed, runner = _run(_exercise())
-
-  assert output.timed_out is True
-  assert output.error is None
-  assert runner.cancel_seen is True
-  assert runner.force_closed is True
-  assert elapsed < 0.2
 
 
 def test_enrolled_run_session_waits_for_explicit_settlement_handshake() -> None:
@@ -527,7 +518,7 @@ def test_enrolled_run_session_waits_for_explicit_settlement_handshake() -> None:
         runner,  # type: ignore[arg-type]
         event_log,
         max_turns=3,
-        timeout_seconds=None,
+        timeout_seconds=0.01,
         initial_message="hello",
         system_prompt=None,
       )
@@ -539,140 +530,6 @@ def test_enrolled_run_session_waits_for_explicit_settlement_handshake() -> None:
     output = await asyncio.wait_for(task, timeout=1.0)
     assert output.response == "completed"
     assert output.error is None
-
-  _run(_case())
-
-
-def test_enrolled_timeout_waits_for_owned_result_settlement() -> None:
-  async def _case() -> None:
-    event_log = EventLog()
-
-    class _EnrolledRunner:
-      top_level_skill_enrolled = True
-
-      def __init__(self) -> None:
-        self.causes: list[str] = []
-        self.authoritative_cause: str | None = None
-        self.cancel_seen = asyncio.Event()
-        self.release = asyncio.Event()
-        self.settlement = asyncio.Event()
-
-      def set_server_terminal_cause(self, cause: str) -> bool:
-        self.causes.append(cause)
-        if self.authoritative_cause is None:
-          self.authoritative_cause = cause
-        return self.authoritative_cause == cause
-
-      async def run(self, **kwargs: Any) -> None:
-        _ = kwargs
-        try:
-          await asyncio.Event().wait()
-        except asyncio.CancelledError:
-          self.cancel_seen.set()
-          await self.release.wait()
-          event_log.append({
-            "type": "stream_complete",
-            "terminal_disposition": "interrupted",
-            "reason": "timeout",
-            "server_terminal_cause": "timeout",
-            "usage": {},
-          })
-          self.settlement.set()
-          raise
-
-      async def force_close(self, timeout: float = 2.0) -> None:
-        _ = timeout
-
-      async def wait_for_top_level_skill_settlement(self) -> None:
-        await self.settlement.wait()
-
-    runner = _EnrolledRunner()
-    task = asyncio.create_task(
-      autonomous.run_session(
-        runner,  # type: ignore[arg-type]
-        event_log,
-        max_turns=3,
-        timeout_seconds=0.01,
-        initial_message="hello",
-        system_prompt=None,
-      )
-    )
-    await asyncio.wait_for(runner.cancel_seen.wait(), timeout=1.0)
-    await asyncio.sleep(0)
-    assert not task.done()
-    runner.release.set()
-    output = await asyncio.wait_for(task, timeout=1.0)
-    assert runner.causes == ["timeout"]
-    assert runner.authoritative_cause == "timeout"
-    assert output.timed_out is True
-    assert output.error is None
-
-  _run(_case())
-
-
-def test_caller_cancellation_during_enrolled_timeout_drain_waits_for_settlement(
-) -> None:
-  async def _case() -> None:
-    event_log = EventLog()
-
-    class _EnrolledRunner:
-      top_level_skill_enrolled = True
-
-      def __init__(self) -> None:
-        self.causes: list[str] = []
-        self.authoritative_cause: str | None = None
-        self.cancel_seen = asyncio.Event()
-        self.release = asyncio.Event()
-        self.settlement = asyncio.Event()
-
-      def set_server_terminal_cause(self, cause: str) -> bool:
-        self.causes.append(cause)
-        if self.authoritative_cause is None:
-          self.authoritative_cause = cause
-        return self.authoritative_cause == cause
-
-      def classify_server_cancellation_cause(self) -> str:
-        return "caller_cancellation"
-
-      async def run(self, **kwargs: Any) -> None:
-        _ = kwargs
-        try:
-          await asyncio.Event().wait()
-        except asyncio.CancelledError:
-          self.cancel_seen.set()
-          await self.release.wait()
-          self.settlement.set()
-          raise
-
-      async def force_close(self, timeout: float = 2.0) -> None:
-        _ = timeout
-
-      async def wait_for_top_level_skill_settlement(self) -> None:
-        await self.settlement.wait()
-
-    runner = _EnrolledRunner()
-    task = asyncio.create_task(
-      autonomous.run_session(
-        runner,  # type: ignore[arg-type]
-        event_log,
-        max_turns=3,
-        timeout_seconds=0.01,
-        initial_message="hello",
-        system_prompt=None,
-      )
-    )
-    await asyncio.wait_for(runner.cancel_seen.wait(), timeout=1.0)
-    task.cancel()
-    await asyncio.sleep(0)
-    assert not task.done()
-    runner.release.set()
-    with pytest.raises(asyncio.CancelledError):
-      await asyncio.wait_for(task, timeout=1.0)
-    assert runner.settlement.is_set()
-    assert runner.causes == ["timeout", "caller_cancellation"]
-    assert runner.authoritative_cause == "timeout"
-
-  _run(_case())
 
 
 def test_caller_cancellation_after_completion_fence_does_not_cancel_run(
@@ -739,7 +596,7 @@ def test_caller_cancellation_after_completion_fence_does_not_cancel_run(
   _run(_case())
 
 
-@pytest.mark.parametrize("timeout_seconds", [0, None, -1])
+@pytest.mark.parametrize("timeout_seconds", [0, None, -1, 0.01])
 def test_run_session_no_wall_clock(
   monkeypatch: pytest.MonkeyPatch,
   timeout_seconds: float | None,
@@ -757,7 +614,7 @@ def test_run_session_no_wall_clock(
       })
 
   async def _unexpected_wait_for(*_args: Any, **_kwargs: Any) -> None:
-    raise AssertionError("asyncio.wait_for should not wrap non-positive timeouts")
+    raise AssertionError("asyncio.wait_for must not wrap run_session LLM work")
 
   monkeypatch.setattr(autonomous.asyncio, "wait_for", _unexpected_wait_for)
 
@@ -867,6 +724,9 @@ def test_run_autonomous_binds_trusted_top_level_skill_identity(
 
   monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
   authority = _bound_execution()
+  authority["admitted_skill_execution_limits"] = (
+    SkillExecutionLimits(None, None, None)
+  )
   authority["session"].approval_policy = type(
     "TrustedPolicy",
     (),
@@ -891,6 +751,184 @@ def test_run_autonomous_binds_trusted_top_level_skill_identity(
   assert authority["session"].run_context.skill == "market-scan"
   assert authority["session"].run_context.run_id == "run-skill-market-scan-test"
   assert authority["session"].run_context.policy_bundle_hash == "a" * 64
+
+
+def test_run_autonomous_enforces_exact_top_level_skill_tool_ceiling(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  captured: dict[str, Any] = {}
+  real_manager_type = autonomous.McpClientManager
+
+  def _real_logical_manager(**kwargs: Any):
+    captured["manager_kwargs"] = kwargs
+    manager = real_manager_type(**kwargs)
+    physical_definitions = [
+      {"name": "fmp_fetch", "input_schema": {"type": "object"}},
+      {"name": "fmp_search", "input_schema": {"type": "object"}},
+    ]
+    manager._servers = {
+      "fmp-mcp": _ServerState(
+        name="fmp-mcp",
+        **_raw_mcp_session(session=object()),
+        exit_contexts=[],
+        tool_definitions=physical_definitions,
+        tool_names={
+          definition["name"] for definition in physical_definitions
+        },
+        tool_prefix="",
+        config=None,
+      )
+    }
+    logical_aliases = {
+      "fetch_financials": "fmp_fetch",
+      "search_companies": "fmp_search",
+    }
+    manager._apply_collision_filtering(
+      policy_server_for_tool=lambda tool_name: (
+        "market-data-mcp"
+        if tool_name in logical_aliases
+        else "fmp-mcp"
+      )
+    )
+    manager._started = True
+    return manager
+
+  async def _fake_run_session(runner, event_log, **kwargs: Any) -> autonomous.RunOutput:
+    _ = event_log, kwargs
+    captured["tool_defs"] = {
+      definition["name"] for definition in runner._get_tool_definitions()
+    }
+    captured["local_handlers"] = set(runner._dispatcher._local)
+    captured["mcp_scope"] = runner._dispatcher._allowed_mcp_tools_by_server
+    return autonomous.RunOutput("ok", [], {}, None, False)
+
+  monkeypatch.setattr(
+    autonomous,
+    "McpClientManager",
+    _real_logical_manager,
+  )
+  monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
+  authority = _bound_execution()
+  authority["admitted_skill_execution_limits"] = (
+    SkillExecutionLimits(None, None, None)
+  )
+  authority["session"].approval_policy = type(
+    "TrustedPolicy",
+    (),
+    {"policy_bundle_hash": "a" * 64},
+  )()
+
+  output = _run(
+    autonomous.run_autonomous(
+      "System",
+      "Hello",
+      **authority,
+      mcp_servers={"market-data-mcp": {"command": "unused"}},
+      trusted_mcp_allowed_servers={"market-data-mcp"},
+      mcp_logical_server_routes={"market-data-mcp": "fmp-mcp"},
+      mcp_logical_tool_aliases={
+        "market-data-mcp": {
+          "fetch_financials": "fmp_fetch",
+          "search_companies": "fmp_search",
+        }
+      },
+      tool_handlers={
+        "declared_local": _noop_local_tool,
+        "extra_local": _noop_local_tool,
+      },
+      tool_definitions=[
+        {"name": "declared_local", "input_schema": {"type": "object"}},
+        {"name": "extra_local", "input_schema": {"type": "object"}},
+      ],
+      skill_local_tool_ceiling=frozenset({"declared_local"}),
+      skill_mcp_tool_ceiling={
+        "market-data-mcp": frozenset({"fetch_financials"})
+      },
+      top_level_skill_name="market-scan",
+      skill_run_id="run-skill-market-scan-test",
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+  )
+
+  assert output.response == "ok"
+  assert captured["tool_defs"] == {
+    "declared_local",
+    "fetch_financials",
+  }
+  assert captured["local_handlers"] == {"declared_local"}
+  assert captured["mcp_scope"] == {
+    "market-data-mcp": {"fetch_financials"}
+  }
+  assert captured["manager_kwargs"]["logical_server_routes"] == {
+    "market-data-mcp": "fmp-mcp"
+  }
+  assert set(captured["manager_kwargs"]["inline_servers"]) == {"fmp-mcp"}
+  assert captured["manager_kwargs"]["logical_tool_aliases"] == {
+    "market-data-mcp": {
+      "fetch_financials": "fmp_fetch",
+      "search_companies": "fmp_search",
+    }
+  }
+
+
+def test_run_autonomous_preserves_manager_alias_precedence_without_logical_routes(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  captured: dict[str, Any] = {}
+  real_manager_type = autonomous.McpClientManager
+
+  def _real_alias_manager(**kwargs: Any):
+    captured["inline_servers"] = kwargs["inline_servers"]
+    manager = real_manager_type(**kwargs)
+    captured["canonical_servers"] = manager._canonicalize_server_configs(
+      kwargs["inline_servers"]
+    )
+    manager._started = True
+    return manager
+
+  async def _fake_run_session(
+    _runner: Any,
+    _event_log: EventLog,
+    **_kwargs: Any,
+  ) -> autonomous.RunOutput:
+    return autonomous.RunOutput("ok", [], {}, None, False)
+
+  monkeypatch.setattr(
+    autonomous,
+    "McpClientManager",
+    _real_alias_manager,
+  )
+  monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
+
+  output = _run(
+    autonomous.run_autonomous(
+      "System",
+      "Hello",
+      **_bound_execution(),
+      mcp_servers={
+        "legacy-server": {"command": "legacy"},
+        "canonical-server": {"command": "canonical"},
+      },
+      trusted_mcp_allowed_servers={"canonical-server"},
+      trusted_mcp_server_aliases={
+        "legacy-server": "canonical-server"
+      },
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+  )
+
+  assert output.response == "ok"
+  assert captured["inline_servers"] == {
+    "legacy-server": {"command": "legacy"},
+    "canonical-server": {"command": "canonical"},
+  }
+  assert captured["canonical_servers"] == {
+    "canonical-server": {"command": "canonical"}
+  }
 
 
 def test_run_autonomous_rejects_top_level_skill_without_trusted_policy() -> None:
@@ -1379,6 +1417,16 @@ def test_deliver_callback() -> None:
 def test_run_autonomous_simple(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
   captured: dict[str, Any] = {}
   delivered: dict[str, Any] = {}
+  registration_catalog = ToolRegistrationCatalog((), ())
+  policy_implementations = ToolPolicyImplementationRegistry(())
+  def local_preparation(*_args):
+    return None
+
+  def approval_context(*_args):
+    return None
+
+  def approval_overlay(*_args):
+    return False
 
   class _StubDispatcher:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -1438,7 +1486,7 @@ def test_run_autonomous_simple(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
       "You are helpful.",
       "Run the task.",
       **authority,
-      tool_handlers={"local_tool": lambda *_args, **_kwargs: None},
+      tool_handlers={"local_tool": _noop_local_tool},
       tool_definitions=[{"name": "local_tool", "description": "Local tool", "input_schema": {"type": "object"}}],
       max_turns=7,
       timeout_seconds=12,
@@ -1449,6 +1497,11 @@ def test_run_autonomous_simple(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
       ),
       session_id="session-123",
       mcp_meta_inject_servers=frozenset({"idea-workbench-mcp"}),
+      tool_registration_catalog=registration_catalog,
+      tool_policy_implementations=policy_implementations,
+      local_input_preparation_context_factory=local_preparation,
+      approval_predicate_context_factory=approval_context,
+      registered_approval_overlay=approval_overlay,
       user_id="alice",
       billing_mode="byok",
       rate_table_version="unknown",
@@ -1470,6 +1523,21 @@ def test_run_autonomous_simple(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
   )
   assert captured["dispatcher_kwargs"]["role"] == authority["session"].role
   assert captured["dispatcher_kwargs"]["interceptors"] == ()
+  assert captured["dispatcher_kwargs"]["tool_registration_catalog"] is (
+    registration_catalog
+  )
+  assert captured["dispatcher_kwargs"]["tool_policy_implementations"] is (
+    policy_implementations
+  )
+  assert captured["dispatcher_kwargs"]["input_preparation_context_factory"] is (
+    local_preparation
+  )
+  assert captured["dispatcher_kwargs"]["approval_predicate_context_factory"] is (
+    approval_context
+  )
+  assert captured["dispatcher_kwargs"]["registered_approval_overlay"] is (
+    approval_overlay
+  )
   assert captured["dispatcher_kwargs"]["mcp_meta_inject_servers"] == frozenset(
     {"idea-workbench-mcp"}
   )
@@ -1595,7 +1663,7 @@ def test_run_autonomous_forwards_outputs_dir(
       **authority,
       skills_dir=skills_dir,
       outputs_dir=outputs_dir,
-      capability_execution_resolver=object(),
+      **_raw_capability_execution_resolver(capability_execution_resolver=object()),
       user_id="alice",
       billing_mode="byok",
       rate_table_version="unknown",
@@ -1663,8 +1731,8 @@ def test_run_autonomous_shares_one_interceptor_tuple_with_automatic_child(
       "Run the task.",
       **_bound_execution(),
       skills_dir=skills_dir,
-      interceptors=supplied,
-      capability_execution_resolver=object(),
+      **_raw_interceptors(interceptors=supplied),
+      **_raw_capability_execution_resolver(capability_execution_resolver=object()),
       user_id="alice",
       billing_mode="byok",
       rate_table_version="unknown",
@@ -1733,7 +1801,7 @@ def test_run_autonomous_keeps_custom_run_agent_handler_caller_owned(
       **_bound_execution(),
       skills_dir=skills_dir,
       tool_handlers={"run_agent": custom_run_agent},
-      interceptors=[interceptor],
+      **_raw_interceptors(interceptors=[interceptor]),
       user_id="alice",
       billing_mode="byok",
       rate_table_version="unknown",
@@ -1761,9 +1829,23 @@ def test_run_autonomous_skills_dir_registers_send_message_tool_and_builtin_name(
       config_path: str | Path | None = None,
       builtin_tool_names: set[str] | None = None,
       timeout_overrides: dict[str, int] | None = None,
-      server_aliases: dict[str, str] | None = None,
-    ) -> None:
-      _ = allowed_servers, inline_servers, config_path, timeout_overrides, server_aliases
+        server_aliases: dict[str, str] | None = None,
+        logical_server_routes: dict[str, str] | None = None,
+        logical_tool_aliases: dict[str, dict[str, str]] | None = None,
+        input_preparation_routes: Any = (),
+        tool_registration_catalog: Any = None,
+      ) -> None:
+      _ = (
+        allowed_servers,
+        inline_servers,
+        config_path,
+        timeout_overrides,
+        server_aliases,
+          logical_server_routes,
+          logical_tool_aliases,
+          input_preparation_routes,
+          tool_registration_catalog,
+        )
       self._builtin_tool_names = set(builtin_tool_names or set())
 
     async def startup(self) -> None:
@@ -1808,7 +1890,7 @@ def test_run_autonomous_skills_dir_registers_send_message_tool_and_builtin_name(
       "Run the task.",
       **_bound_execution(),
       skills_dir=skills_dir,
-      capability_execution_resolver=object(),
+      **_raw_capability_execution_resolver(capability_execution_resolver=object()),
       mcp_servers={"filesystem": {"command": "npx", "args": ["-y", "server"]}},
       trusted_mcp_allowed_servers={"filesystem"},
       user_id="alice",

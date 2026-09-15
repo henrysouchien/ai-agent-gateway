@@ -7,7 +7,7 @@ import types
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import pytest
 
@@ -21,7 +21,15 @@ if str(API_DIR) not in sys.path:
 
 from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog, SessionStore  # noqa: E402
 from agent_gateway import policy_imports, sdk_runner_approval  # noqa: E402
-from agent_gateway.approval_policy import ApprovalDecision as PolicyApprovalDecision, ApprovalRequest, ApprovalRequestPayload, RunContext  # noqa: E402
+from agent_gateway.approval_policy import ApprovalDecision as PolicyApprovalDecision, ApprovalRequest, ApprovalRequestPayload, ApprovalState, RunContext, sha256_args  # noqa: E402
+from agent_gateway.approval_route import (
+  DurableLocalApprovalRoute,
+  NoApprovalRoute,
+  ParentDelegatedApprovalRoute,
+)
+from agent_gateway.autonomous_approval_channel import (
+  AutonomousApprovalChannelChild,
+)
 from agent_gateway.approval_store import SQLiteApprovalStore  # noqa: E402
 from agent_gateway.approvals import _record_vote_and_unblock  # noqa: E402
 from agent_gateway.batch_approval_projection import (  # noqa: E402
@@ -35,7 +43,19 @@ from agent_gateway.runner import (  # noqa: E402
   _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY,
 )
 from agent_gateway.skill_context import clear_current_skill, current_skill, set_current_skill  # noqa: E402
+from agent_gateway.skill_limits import ActiveSkillAdmission, SkillExecutionLimits  # noqa: E402
+from agent_gateway.sdk_runner_stream import ToolCallInfo  # noqa: E402
+from agent_gateway.mcp_client import RegisteredMcpRawPatchAuthorization  # noqa: E402
+from agent_gateway.tool_dispatch_classification import ToolResultSettlement  # noqa: E402
+from agent_gateway.tool_policy_registry import PlanDecision, PreparedToolCall  # noqa: E402
 from tests.sdk_capability_execution_test_support import stub_sdk_capability_execution  # noqa: E402
+
+
+def _skill_admission(name: str) -> ActiveSkillAdmission:
+  return ActiveSkillAdmission(
+    name,
+    SkillExecutionLimits(None, None, None),
+  )
 
 
 def _run(coro):
@@ -150,12 +170,14 @@ def _install_fake_agent_sdk(
     return _AsyncMessages([_sdk_result_message()])
 
   module = types.ModuleType("claude_agent_sdk")
-  module.__version__ = SDK_PINNED_VERSION
-  module.HookMatcher = _HookMatcher
-  module.ClaudeAgentOptions = _ClaudeAgentOptions
-  module.PermissionResultAllow = _PermissionResultAllow
-  module.PermissionResultDeny = _PermissionResultDeny
-  module.query = _query
+  module.__dict__.update({
+    "__version__": SDK_PINNED_VERSION,
+    "HookMatcher": _HookMatcher,
+    "ClaudeAgentOptions": _ClaudeAgentOptions,
+    "PermissionResultAllow": _PermissionResultAllow,
+    "PermissionResultDeny": _PermissionResultDeny,
+    "query": _query,
+  })
   monkeypatch.setitem(sys.modules, "claude_agent_sdk", module)
   return state
 
@@ -165,12 +187,23 @@ def _make_runner(
   event_log: EventLog | None = None,
   disallowed_tools: list[str] | None = None,
   mcp_server_configs: dict[str, Any] | None = None,
+  registered_mcp_descriptor_for_sdk_tool: Callable[[str], Any] | None = None,
+  prepare_registered_mcp_tool_call_for_sdk_tool: Callable[..., Any] | None = None,
+  registered_approval_overlay: Callable[..., bool] | None = None,
+  redact_registered_mcp_tool_input_for_sdk_tool: Callable[..., Any] | None = None,
+  settle_registered_mcp_tool_result_for_sdk_tool: Callable[..., Any] | None = None,
   on_tool_result: Any | None = None,
   run_context: RunContext | None = None,
   skill_run_id: str | None = None,
   max_tokens_override: int | None = None,
   api_key: str = "test-secret",
+  approval_lifecycle: Literal["required", "not_required"] = "required",
 ) -> AgentSDKRunner:
+  if (
+    registered_mcp_descriptor_for_sdk_tool is not None
+    and redact_registered_mcp_tool_input_for_sdk_tool is None
+  ):
+    redact_registered_mcp_tool_input_for_sdk_tool = _identity_registered_redaction
   return AgentSDKRunner(
     event_log=event_log or EventLog(),
     session_id="sess-sdk-enforce",
@@ -183,16 +216,456 @@ def _make_runner(
     system_prompt="test",
     disallowed_tools=list(disallowed_tools or []),
     mcp_server_configs=mcp_server_configs,
+    registered_mcp_descriptor_for_sdk_tool=(
+      registered_mcp_descriptor_for_sdk_tool
+    ),
+    prepare_registered_mcp_tool_call_for_sdk_tool=(
+      prepare_registered_mcp_tool_call_for_sdk_tool
+    ),
+    registered_approval_overlay=registered_approval_overlay,
+    redact_registered_mcp_tool_input_for_sdk_tool=(
+      redact_registered_mcp_tool_input_for_sdk_tool
+    ),
+    settle_registered_mcp_tool_result_for_sdk_tool=(
+      settle_registered_mcp_tool_result_for_sdk_tool
+    ),
     on_tool_result=on_tool_result,
     run_context=run_context,
     skill_run_id=skill_run_id,
     max_tokens_override=max_tokens_override,
+    approval_lifecycle=approval_lifecycle,
+  )
+
+
+def _registered_settlement(*_args: Any) -> ToolResultSettlement:
+  return ToolResultSettlement("ok")
+
+
+def _identity_registered_redaction(_tool_name: str, tool_input: dict[str, Any]):
+  return dict(tool_input)
+
+
+def _seed_tool_call(
+  runner: AgentSDKRunner,
+  tool_call_id: str,
+  tool_name: str,
+  tool_input: dict[str, Any],
+) -> None:
+  runner._pending_tool_calls[tool_call_id] = ToolCallInfo(
+    tool_call_id,
+    tool_name,
+    tool_input,
+    0.0,
+    dict(tool_input),
+  )
+
+
+def test_sdk_runner_unconfigured_lifecycle_denies_without_explicit_opt_in(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """S8: an SDK run that reached no local ledger denies; it never fails open.
+
+  `_make_runner()` supplies no route, so this is the un-configured path: the
+  runner holds `NoApprovalRoute`, no store, no policy and no session.
+  """
+
+  _install_fake_agent_sdk(monkeypatch)
+  runner = _make_runner()
+
+  assert isinstance(runner._approval_route, NoApprovalRoute)
+  assert runner._approval_store is None
+  assert runner._approval_policy is None
+
+  denied = _run(runner._can_use_tool_callback("file_write", {"path": "x"}, None))
+
+  assert denied.behavior == "deny"
+  assert "[approval_route_absent]" in denied.message
+
+
+def test_sdk_runner_denies_on_a_route_whose_ledger_it_does_not_own(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """S8, the other half: a live-but-not-local route is still not an allow.
+
+  The SDK runtime evaluates policy and writes the ledger in-process, so only a
+  durable-local route configures it. A parent-delegated route is a real route
+  this runtime cannot serve — the honest answer is a refusal, not an allow.
+  """
+
+  _install_fake_agent_sdk(monkeypatch)
+  runner = _make_runner()
+  session = SessionStore(ttl=3600).create_session(
+    api_key_hash="hash",
+    user_id="alice",
+  )
+  runner._session = session
+  runner._approval_route = ParentDelegatedApprovalRoute(
+    object.__new__(AutonomousApprovalChannelChild),
+    session,
+  )
+
+  denied = _run(runner._can_use_tool_callback("file_write", {"path": "x"}, None))
+
+  assert denied.behavior == "deny"
+  assert "[approval_route_absent]" in denied.message
+  assert runner._approval_store is None
+  assert runner._approval_policy is None
+
+
+def test_sdk_runner_explicit_not_required_lifecycle_allows_without_store(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+  runner = _make_runner(approval_lifecycle="not_required")
+
+  allowed = _run(runner._can_use_tool_callback("file_write", {"path": "x"}, None))
+
+  assert allowed.behavior == "allow"
+
+
+def test_sdk_runner_requires_complete_registered_mcp_owners() -> None:
+  with pytest.raises(ValueError, match="descriptor, preparation, redaction"):
+    _make_runner(
+      registered_mcp_descriptor_for_sdk_tool=lambda _tool_name: object(),
+      settle_registered_mcp_tool_result_for_sdk_tool=_registered_settlement,
+    )
+
+
+def test_sdk_runner_requires_callable_registered_approval_overlay() -> None:
+  with pytest.raises(TypeError, match="registered_approval_overlay"):
+    _make_runner(registered_approval_overlay=object())  # type: ignore[arg-type]
+
+
+def test_sdk_runner_registered_mode_builtin_callback_stays_catalogless(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+
+  def descriptor_for(tool_name: str) -> Any:
+    raise AssertionError(
+      f"builtin {tool_name!r} must not resolve through the MCP manager"
+    )
+
+  def prepare_registered_call(tool_name: str, *_args: Any) -> Any:
+    raise AssertionError(
+      f"builtin {tool_name!r} must not prepare through the MCP manager"
+    )
+
+  runner = _make_runner(
+    registered_mcp_descriptor_for_sdk_tool=descriptor_for,
+    prepare_registered_mcp_tool_call_for_sdk_tool=prepare_registered_call,
+    settle_registered_mcp_tool_result_for_sdk_tool=_registered_settlement,
+    approval_lifecycle="not_required",
+  )
+
+  allowed = _run(
+    runner._can_use_tool_callback("file_write", {"path": "x"}, None)
+  )
+
+  assert allowed.behavior == "allow"
+
+
+def test_sdk_runner_registered_mode_sdk_local_callback_stays_catalogless(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+  local_tool_id = "mcp__gateway-tools__load_tools"
+
+  class LocalMcpConfig(dict[str, Any]):
+    catalogless_mcp_tool_ids = {local_tool_id}
+
+  def descriptor_for(tool_name: str) -> Any:
+    raise AssertionError(
+      f"SDK-local tool {tool_name!r} must not resolve through the MCP manager"
+    )
+
+  def prepare_registered_call(tool_name: str, *_args: Any) -> Any:
+    raise AssertionError(
+      f"SDK-local tool {tool_name!r} must not prepare through the MCP manager"
+    )
+
+  runner = _make_runner(
+    mcp_server_configs=LocalMcpConfig({"gateway-tools": {"type": "sdk"}}),
+    registered_mcp_descriptor_for_sdk_tool=descriptor_for,
+    prepare_registered_mcp_tool_call_for_sdk_tool=prepare_registered_call,
+    settle_registered_mcp_tool_result_for_sdk_tool=_registered_settlement,
+    approval_lifecycle="not_required",
+  )
+
+  allowed = _run(
+    runner._can_use_tool_callback(local_tool_id, {}, None)
+  )
+
+  assert allowed.behavior == "allow"
+
+
+def test_sdk_registered_read_returns_manager_prepared_input_without_approval(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+  identity = SimpleNamespace(
+    logical_name="business_model_validate",
+    materialize=lambda: {
+      "route_kind": "mcp",
+      "logical_server_id": "model-engine",
+      "logical_name": "business_model_validate",
+    },
+  )
+  descriptor = SimpleNamespace(
+    identity=identity,
+    declaration=SimpleNamespace(semantics=SimpleNamespace(effect="read")),
+  )
+  scopes: list[object] = []
+
+  def prepare(
+    _tool_name: str,
+    _input: Any,
+    scope: object,
+    _overlay: object,
+  ) -> Any:
+    scopes.append(scope)
+    return SimpleNamespace(
+      descriptor=descriptor,
+      prepared_call=PreparedToolCall({"ticker": "BRK.B"}),
+      planning=PlanDecision("none"),
+      prepared_authorization=None,
+      approval_required=False,
+      approval_reuse_key=None,
+    )
+
+  runner = _make_runner(
+    registered_mcp_descriptor_for_sdk_tool=lambda _tool_name: descriptor,
+    prepare_registered_mcp_tool_call_for_sdk_tool=prepare,
+    settle_registered_mcp_tool_result_for_sdk_tool=_registered_settlement,
+  )
+  runner._session = SimpleNamespace(
+    dispatch_scope={"portfolio_id": "portfolio-1"}
+  )
+
+  allowed = _run(runner._can_use_tool_callback(
+    "mcp__model-engine__business_model_validate",
+    {"ticker": "BRK/B"},
+    None,
+  ))
+
+  assert allowed.behavior == "allow"
+  assert allowed.updated_input == {"ticker": "BRK.B"}
+  assert scopes == [{
+    "portfolio_id": "portfolio-1",
+    "user_id": "alice",
+  }]
+
+
+def test_sdk_registered_not_required_lifecycle_returns_prepared_input(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+  descriptor = SimpleNamespace(
+    identity=SimpleNamespace(logical_name="manage_proxy_cache"),
+    declaration=SimpleNamespace(
+      semantics=SimpleNamespace(effect="portfolio_config")
+    ),
+  )
+  runner = _make_runner(
+    registered_mcp_descriptor_for_sdk_tool=lambda _tool_name: descriptor,
+    prepare_registered_mcp_tool_call_for_sdk_tool=(
+      lambda _tool_name, _input, _scope, _overlay: SimpleNamespace(
+        descriptor=descriptor,
+        prepared_call=PreparedToolCall({"action": "invalidate"}),
+        planning=PlanDecision("none"),
+        prepared_authorization=None,
+        approval_required=True,
+        approval_reuse_key=None,
+      )
+    ),
+    settle_registered_mcp_tool_result_for_sdk_tool=_registered_settlement,
+    approval_lifecycle="not_required",
+  )
+  runner._session = SimpleNamespace(dispatch_scope=None)
+
+  allowed = _run(runner._can_use_tool_callback(
+    "mcp__portfolio-config-mcp__manage_proxy_cache",
+    {"action": "invalidate", "ignored": True},
+    None,
+  ))
+
+  assert allowed.behavior == "allow"
+  assert allowed.updated_input == {"action": "invalidate"}
+
+
+def test_sdk_registered_write_uses_exact_reuse_and_prepared_identity(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+  identity = SimpleNamespace(
+    logical_name="manage_proxy_cache",
+  )
+  descriptor = SimpleNamespace(
+    identity=identity,
+    declaration=SimpleNamespace(
+      semantics=SimpleNamespace(effect="portfolio_config")
+    ),
+  )
+  captured: dict[str, Any] = {}
+  lifecycle_input = {"action": "invalidate"}
+
+  async def lifecycle(**kwargs: Any) -> dict[str, Any]:
+    captured.update(kwargs)
+    return {
+      "approved": True,
+      "tool_input": lifecycle_input,
+      "policy_modified_tool_args": True,
+    }
+
+  monkeypatch.setattr(
+    sdk_runner_approval._approval_lifecycle_helpers,
+    "run_approval_lifecycle",
+    lifecycle,
+  )
+  monkeypatch.setattr(
+    sdk_runner_approval,
+    "constraint_for_catalog_tool",
+    lambda _tool_name: "standard",
+  )
+  runner = _make_runner(
+    registered_mcp_descriptor_for_sdk_tool=lambda _tool_name: descriptor,
+    prepare_registered_mcp_tool_call_for_sdk_tool=(
+      lambda _tool_name, _input, _scope, _overlay: SimpleNamespace(
+        descriptor=descriptor,
+        prepared_call=PreparedToolCall({"action": "invalidate"}),
+        planning=PlanDecision("none"),
+        prepared_authorization=None,
+        approval_required=True,
+        approval_reuse_key="tool-approval-cache:v1:sha256:exact",
+      )
+    ),
+    settle_registered_mcp_tool_result_for_sdk_tool=_registered_settlement,
+  )
+  runner._session = SessionStore(ttl=3600).create_session(
+    api_key_hash="hash",
+    user_id="alice",
+  )
+  runner._approval_route = DurableLocalApprovalRoute(
+    object(),
+    object(),
+    runner._session,
+  )
+
+  allowed = _run(runner._can_use_tool_callback(
+    "mcp__portfolio-config-mcp__manage_proxy_cache",
+    {"action": "invalidate", "ignored": True},
+    None,
+  ))
+
+  assert allowed.behavior == "allow"
+  assert allowed.updated_input == lifecycle_input
+  assert captured["tool_input"] == {"action": "invalidate"}
+  assert captured["approval_reuse_mode"] == "exact"
+  assert captured["approval_reuse_key"] == (
+    "tool-approval-cache:v1:sha256:exact"
+  )
+
+
+def test_sdk_registered_plan_hands_one_durable_payload_to_same_authorized_ref(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+  descriptor = SimpleNamespace(
+    identity=SimpleNamespace(logical_name="apply_patch_ops"),
+    declaration=SimpleNamespace(
+      semantics=SimpleNamespace(effect="state_write")
+    ),
+  )
+  prepared_input = {"research_file_id": 7, "ops": []}
+  prepared_authorization = RegisteredMcpRawPatchAuthorization(
+    approval_identity={"identity_source": "reviewed_change_binding"},
+    approval_arguments=prepared_input,
+    approval_arguments_hash=sha256_args(prepared_input),
+    prepared_payload=b'{"prepared":true}',
+  )
+  captured: dict[str, Any] = {}
+  authorized_ids: list[str] = []
+
+  async def lifecycle(**kwargs: Any) -> dict[str, Any]:
+    captured.update(kwargs)
+    return {
+      "approved": True,
+      "tool_input": {**prepared_input, "ops": [{"forged": True}]},
+    }
+
+  def materialize_authorized_input(
+    tool_call_id: str,
+  ) -> dict[str, object]:
+    authorized_ids.append(tool_call_id)
+    return {
+      **prepared_input,
+      "authorization_ref": f"approval-ref:v1:{tool_call_id}",
+    }
+
+  monkeypatch.setattr(
+    sdk_runner_approval._approval_lifecycle_helpers,
+    "run_approval_lifecycle",
+    lifecycle,
+  )
+  monkeypatch.setattr(
+    sdk_runner_approval,
+    "constraint_for_catalog_tool",
+    lambda _tool_name: "standard",
+  )
+  runner = _make_runner(
+    registered_mcp_descriptor_for_sdk_tool=lambda _tool_name: descriptor,
+    prepare_registered_mcp_tool_call_for_sdk_tool=(
+      lambda _tool_name, _input, _scope, _overlay: SimpleNamespace(
+        descriptor=descriptor,
+        prepared_call=PreparedToolCall(prepared_input),
+        planning=PlanDecision("prepared_plan", prepared_plan={"plan": 1}),
+        prepared_authorization=prepared_authorization,
+        approval_required=True,
+        approval_reuse_key="tool-approval-cache:v1:sha256:plan",
+        materialize_authorized_input=materialize_authorized_input,
+      )
+    ),
+    settle_registered_mcp_tool_result_for_sdk_tool=_registered_settlement,
+  )
+  runner._session = SessionStore(ttl=3600).create_session(
+    api_key_hash="hash",
+    user_id="alice",
+  )
+  runner._approval_route = DurableLocalApprovalRoute(
+    object(),
+    object(),
+    runner._session,
+  )
+
+  allowed = _run(runner._can_use_tool_callback(
+    "mcp__portfolio-writes-mcp__apply_patch_ops",
+    prepared_input,
+    None,
+  ))
+
+  assert allowed.behavior == "allow"
+  assert len(authorized_ids) == 1
+  assert captured["tool_call_id"] == authorized_ids[0]
+  assert captured["approval_identity"] == {
+    "identity_source": "reviewed_change_binding"
+  }
+  assert captured["prepared_authorization_payload"] == b'{"prepared":true}'
+  assert captured["approval_args_hash"] == sha256_args(prepared_input)
+  assert allowed.updated_input["ops"] == []
+  assert allowed.updated_input["authorization_ref"] == (
+    f"approval-ref:v1:{authorized_ids[0]}"
   )
 
 
 def test_sdk_post_tool_use_replaces_model_output_with_sanitized_projection() -> None:
   secret = "CUSTOM-ACTIVE-CREDENTIAL-CODEX-SDK-8f21d7"
   runner = _make_runner(api_key=secret)
+  _seed_tool_call(
+    runner,
+    "tool-secret",
+    "lookup",
+    {"query": "ordinary"},
+  )
 
   hook_result = _run(
     runner._post_tool_use_hook(
@@ -214,6 +687,12 @@ def test_sdk_post_tool_use_replaces_model_output_with_sanitized_projection() -> 
 def test_sdk_post_tool_failure_blocks_raw_secret_from_model_continuation() -> None:
   secret = "CUSTOM-ACTIVE-CREDENTIAL-CODEX-SDK-ERROR-8f21d7"
   runner = _make_runner(api_key=secret)
+  _seed_tool_call(
+    runner,
+    "tool-secret-error",
+    "lookup",
+    {"query": "ordinary"},
+  )
 
   hook_result = _run(
     runner._post_tool_use_failure_hook(
@@ -256,7 +735,8 @@ def test_sdk_runner_denies_forged_same_server_tool_outside_advertised_stage_scop
   runner = _make_runner(
     mcp_server_configs=_StageMcpConfigs({
       "research-corpus-mcp": {"command": "research-corpus"},
-    })
+    }),
+    approval_lifecycle="not_required",
   )
 
   allowed = _run(
@@ -281,7 +761,10 @@ def test_sdk_runner_denies_forged_same_server_tool_outside_advertised_stage_scop
 
 def test_sdk_runner_static_disallowed_tool_denied_without_approval(monkeypatch: pytest.MonkeyPatch) -> None:
   state = _install_fake_agent_sdk(monkeypatch)
-  runner = _make_runner(disallowed_tools=["file_write"])
+  runner = _make_runner(
+    disallowed_tools=["file_write"],
+    approval_lifecycle="not_required",
+  )
 
   _run(runner.run([{"role": "user", "content": "hello"}]))
 
@@ -311,6 +794,7 @@ def test_sdk_runner_executes_report_admission_with_same_carried_run_identity(
   runner = _make_runner(
     run_context=run_context,
     skill_run_id="skill-run-sdk-report",
+    approval_lifecycle="not_required",
   )
 
   _run(runner.run([{"role": "user", "content": "report the build"}]))
@@ -414,16 +898,15 @@ def test_sdk_runner_promotion_saga_requires_owner_control_route_before_approval(
 
   runner = _make_runner()
   if lifecycle_configured:
-    runner._session = SimpleNamespace(
-      session_id="sess-sdk-enforce",
+    runner._session = SessionStore(ttl=3600).create_session(
+      api_key_hash="hash",
       user_id="alice",
-      channel="web",
-      role="owner",
-      pending_tools={},
-      approval_queues={},
     )
-    runner._approval_store = Store()
-    runner._approval_policy = Policy()
+    runner._approval_route = DurableLocalApprovalRoute(
+      Store(),
+      Policy(),
+      runner._session,
+    )
 
   denied = _run(
     runner._can_use_tool_callback(
@@ -441,6 +924,7 @@ def test_sdk_runner_promotion_saga_requires_owner_control_route_before_approval(
 
 def test_sdk_runner_catalog_constraint_failure_denies_before_lifecycle(
   monkeypatch: pytest.MonkeyPatch,
+  caplog: pytest.LogCaptureFixture,
 ) -> None:
   _install_fake_agent_sdk(monkeypatch)
 
@@ -453,7 +937,7 @@ def test_sdk_runner_catalog_constraint_failure_denies_before_lifecycle(
     unavailable_constraint,
   )
   runner = _make_runner()
-
+  caplog.set_level("ERROR", logger="agent_gateway.sdk_runner_approval")
   denied = _run(
     runner._can_use_tool_callback(
       "get_portfolio_summary",
@@ -464,6 +948,72 @@ def test_sdk_runner_catalog_constraint_failure_denies_before_lifecycle(
 
   assert denied.behavior == "deny"
   assert "[approval_constraint_unavailable]" in denied.message
+  assert "catalog dependency failed" in denied.message
+  loud = [
+    record
+    for record in caplog.records
+    if record.levelname == "ERROR"
+    and "approval_constraints" in record.getMessage()
+  ]
+  assert len(loud) == 1
+  assert "get_portfolio_summary" in loud[0].getMessage()
+  assert "catalog dependency failed" in loud[0].getMessage()
+  assert loud[0].exc_info is not None
+
+
+def test_sdk_approval_refuses_inline_limit_mismatch_before_policy(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+  monkeypatch.setattr(
+    sdk_runner_approval,
+    "constraint_for_catalog_tool",
+    lambda _tool_name: "runtime_policy",
+  )
+  policy_calls: list[bool] = []
+
+  class Policy:
+    async def decide(self, **_kwargs: Any) -> PolicyApprovalDecision:
+      policy_calls.append(True)
+      raise AssertionError("mismatched admission must precede policy")
+
+  runner = _make_runner(
+    run_context=RunContext(
+      user_id="alice",
+      request_id="request-1",
+      skill="quant-research",
+      admitted_skill_execution_limits=SkillExecutionLimits(
+        20,
+        32_000,
+        20.0,
+      ),
+    )
+  )
+  runner._session = SessionStore(ttl=3600).create_session(
+    api_key_hash="hash",
+    user_id="alice",
+  )
+  runner._approval_route = DurableLocalApprovalRoute(
+    object(),
+    Policy(),
+    runner._session,
+  )
+  token = set_current_skill(ActiveSkillAdmission(
+    "quant-research",
+    SkillExecutionLimits(19, 32_000, 20.0),
+  ))
+  try:
+    denied = _run(
+      runner._can_use_tool_callback("file_write", {"path": "x"}, None)
+    )
+  finally:
+    from agent_gateway.skill_context import reset_current_skill
+
+    reset_current_skill(token)
+
+  assert denied.behavior == "deny"
+  assert "[skill_admission_mismatch]" in denied.message
+  assert policy_calls == []
 
 
 def test_sdk_runner_user_denial_uses_ordinary_message(
@@ -515,8 +1065,11 @@ def test_sdk_runner_user_denial_uses_ordinary_message(
       capability_execution=stub_sdk_capability_execution(),
       system_prompt="test",
       session=session,
-      store=store,
-      policy=policy,
+      approval_route=DurableLocalApprovalRoute(
+        store,
+        policy,
+        session,
+      ),
       run_context=RunContext(
         user_id="alice",
         request_id="request-1",
@@ -529,11 +1082,24 @@ def test_sdk_runner_user_denial_uses_ordinary_message(
     for _ in range(100):
       if session.pending_tools:
         break
+      if callback_task.done():
+        await callback_task
       await asyncio.sleep(0.001)
     else:
       raise AssertionError("approval request was not queued")
 
     tool_call_id, pending = next(iter(session.pending_tools.items()))
+    approval_events = [
+      entry.event
+      for entry in runner._log.entries
+      if entry.event.get("type") == "tool_approval_request"
+    ]
+    assert len(approval_events) == 1
+    assert approval_events[0]["tool_call_id"] == tool_call_id
+    notification_rows = await store.list_approval_notification_outbox(
+      str(pending["approval_id"])
+    )
+    assert len(notification_rows) == 1
     await _record_vote_and_unblock(
       target_session=session,
       pending_entry=pending,
@@ -608,8 +1174,11 @@ def test_sdk_runner_approval_expiry_interrupts_turn_instead_of_reading_as_denial
       capability_execution=stub_sdk_capability_execution(),
       system_prompt="test",
       session=session,
-      store=store,
-      policy=policy,
+      approval_route=DurableLocalApprovalRoute(
+        store,
+        policy,
+        session,
+      ),
       run_context=RunContext(
         user_id="alice",
         request_id="request-1",
@@ -632,6 +1201,103 @@ def test_sdk_runner_approval_expiry_interrupts_turn_instead_of_reading_as_denial
     stored = await store.get(policy.request.approval_id)
     assert stored is not None
     assert stored.state == "expired"
+
+  _run(_case())
+
+
+@pytest.mark.parametrize(
+  ("winner_state", "approved", "expected_behavior"),
+  [
+    ("approved", True, "allow"),
+    ("denied", False, "deny"),
+  ],
+)
+def test_sdk_runner_approval_timeout_uses_shared_durable_winner(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  winner_state: ApprovalState,
+  approved: bool,
+  expected_behavior: str,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+
+  class _Policy:
+    policy_bundle_hash = "test-policy"
+
+    async def decide(
+      self,
+      *,
+      payload: ApprovalRequestPayload,
+      request: ApprovalRequest,
+      run_context: RunContext,
+    ) -> PolicyApprovalDecision:
+      _ = payload, request, run_context
+      return PolicyApprovalDecision(
+        outcome="request_user_approval",
+        reason="Tool requires approval",
+        expiry_seconds=0.01,
+      )
+
+    async def on_resolve(self, *, request: ApprovalRequest) -> None:
+      _ = request
+
+  async def _case() -> None:
+    store = SQLiteApprovalStore(tmp_path / f"winner-{winner_state}.sqlite3")
+    session = SessionStore(ttl=3600).create_session(
+      api_key_hash="hash",
+      user_id="alice",
+    )
+    runner = AgentSDKRunner(
+      event_log=EventLog(),
+      session_id=session.session_id,
+      sdk_config=AgentSDKConfig(
+        user_id="alice",
+        billing_mode="byok",
+        rate_table_version="unknown",
+      ),
+      capability_execution=stub_sdk_capability_execution(),
+      system_prompt="test",
+      session=session,
+      approval_route=DurableLocalApprovalRoute(
+        store,
+        _Policy(),
+        session,
+      ),
+    )
+
+    callback_task = asyncio.create_task(
+      runner._can_use_tool_callback("file_write", {"path": "x"}, None)
+    )
+    for _ in range(100):
+      if session.pending_tools:
+        break
+      await asyncio.sleep(0.001)
+    else:
+      raise AssertionError("approval request was not queued")
+
+    tool_call_id, pending = next(iter(session.pending_tools.items()))
+    request = await store.get(str(pending["approval_id"]))
+    assert request is not None
+    await store.transition_state(
+      request.approval_id,
+      winner_state,
+      expected_state_version=request.state_version,
+      decider_id="alice",
+      decider_role="owner",
+      decision_reason="race winner",
+    )
+    await asyncio.sleep(0.12)
+    session.approval_queues[tool_call_id].put_nowait({
+      "approval_id": request.approval_id,
+      "approved": approved,
+      "allow_tool_type": False,
+    })
+
+    result = await callback_task
+    assert result.behavior == expected_behavior
+    assert not getattr(result, "interrupt", False)
+    assert session.pending_tools == {}
+    assert session.approval_queues == {}
 
   _run(_case())
 
@@ -697,8 +1363,11 @@ def test_sdk_batch_admission_cancel_before_pending_publish_aborts_durable_row(
       capability_execution=stub_sdk_capability_execution(),
       system_prompt="test",
       session=session,
-      store=store,
-      policy=policy,
+      approval_route=DurableLocalApprovalRoute(
+        store,
+        policy,
+        session,
+      ),
       run_context=RunContext(
         user_id="alice",
         request_id="batch_77",
@@ -714,13 +1383,24 @@ def test_sdk_batch_admission_cancel_before_pending_publish_aborts_durable_row(
       decision: PolicyApprovalDecision,
       *,
       nonce: str,
+      resolved_qualifier: str,
+      allow_persistent: bool,
+      timeout_seconds: float,
       batch_admission: Any | None = None,
     ) -> None:
-      _ = request, decision, nonce, batch_admission
+      _ = (
+        request,
+        decision,
+        nonce,
+        resolved_qualifier,
+        allow_persistent,
+        timeout_seconds,
+        batch_admission,
+      )
       pending_committed.set()
       await asyncio.Event().wait()
 
-    runner._await_user_approval_via_pending_tools = pause_before_pending_publish  # type: ignore[method-assign]
+    runner._await_user_approval_via_pending_tools = pause_before_pending_publish
     callback_task = asyncio.create_task(
       runner._can_use_tool_callback("file_write", {"path": "x"}, None)
     )
@@ -735,95 +1415,13 @@ def test_sdk_batch_admission_cancel_before_pending_publish_aborts_durable_row(
     assert stored.state == "denied"
     assert session.pending_tools == {}
     assert session.approval_queues == {}
+    assert await store.list_approval_notification_outbox(
+      policy.request.approval_id
+    ) == []
     assert registry.projections_for_batch(owner_user_id="alice", batch_id=77) == []
     assert registry._admission_gates[("alice", 77)].active == 0
 
   _run(_case())
-
-
-def test_sdk_projected_pending_tool_binds_stage_identity_to_projection_and_event() -> None:
-  async def _case() -> None:
-    events: list[dict[str, Any]] = []
-    request = SimpleNamespace(
-      approval_id="approval-sdk-batch",
-      tool_call_id="tool-sdk-batch",
-      tool_name="file_write",
-      tool_args_redacted={"path": "model.xlsx"},
-    )
-    session = SimpleNamespace(
-      pending_tools={},
-      approval_queues={},
-      batch_stage_run_seq=3,
-    )
-
-    class _Admission:
-      def publish_pending(self) -> None:
-        pending = session.pending_tools[request.tool_call_id]
-        assert pending["stage_run_seq"] == 3
-        session.approval_queues[request.tool_call_id].put_nowait(
-          {"approved": False}
-        )
-
-    result = await sdk_runner_approval.await_user_approval_via_pending_tools(
-      session=session,
-      approval_store=None,
-      request=request,
-      decision=SimpleNamespace(
-        reason="review required",
-        allow_persistent_grant=False,
-      ),
-      nonce="nonce-sdk-batch",
-      append_event_fn=events.append,
-      timeout_seconds=5,
-      log=SimpleNamespace(warning=lambda *_args, **_kwargs: None),
-      batch_admission=_Admission(),
-    )
-
-    assert result == ("denied", {"approved": False})
-    assert events[0]["stage_run_seq"] == 3
-    assert session.pending_tools == {}
-    assert session.approval_queues == {}
-
-  _run(_case())
-
-
-@pytest.mark.parametrize("stage_run_seq", [None, 0, -1, True, "3"])
-def test_sdk_projected_pending_tool_rejects_invalid_stage_identity(
-  stage_run_seq: object,
-) -> None:
-  session = SimpleNamespace(
-    pending_tools={},
-    approval_queues={},
-    batch_stage_run_seq=stage_run_seq,
-  )
-
-  with pytest.raises(
-    ValueError,
-    match="stage_run_seq must be a positive integer",
-  ):
-    _run(
-      sdk_runner_approval.await_user_approval_via_pending_tools(
-        session=session,
-        approval_store=None,
-        request=SimpleNamespace(
-          approval_id="approval-sdk-batch",
-          tool_call_id="tool-sdk-batch",
-          tool_name="file_write",
-          tool_args_redacted={},
-        ),
-        decision=SimpleNamespace(
-          reason="review required",
-          allow_persistent_grant=False,
-        ),
-        nonce="nonce-sdk-batch",
-        append_event_fn=lambda _event: None,
-        timeout_seconds=5,
-        log=SimpleNamespace(warning=lambda *_args, **_kwargs: None),
-        batch_admission=object(),
-      )
-    )
-  assert session.pending_tools == {}
-  assert session.approval_queues == {}
 
 
 def test_sdk_runner_policy_modified_input_behavior_is_unchanged(
@@ -871,8 +1469,11 @@ def test_sdk_runner_policy_modified_input_behavior_is_unchanged(
     capability_execution=stub_sdk_capability_execution(),
     system_prompt="test",
     session=session,
-    store=store,
-    policy=_Policy(),
+    approval_route=DurableLocalApprovalRoute(
+      store,
+      _Policy(),
+      session,
+    ),
   )
   original = {"path": "raw"}
 
@@ -940,8 +1541,11 @@ def test_sdk_approval_persists_exact_secret_safe_projection_but_policy_receives_
     capability_execution=stub_sdk_capability_execution(api_key=secret),
     system_prompt="test",
     session=session,
-    store=store,
-    policy=policy,
+    approval_route=DurableLocalApprovalRoute(
+      store,
+      policy,
+      session,
+    ),
   )
 
   allowed = _run(runner._can_use_tool_callback("file_write", original, None))
@@ -1030,6 +1634,20 @@ def test_sdk_runner_trade_approval_record_includes_preview_summary(
     store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
     policy = _Policy()
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    identity = SimpleNamespace(
+      logical_name="execute_trade",
+      materialize=lambda: {
+        "route_kind": "mcp",
+        "logical_server_id": "portfolio-trades-mcp",
+        "logical_name": "execute_trade",
+      },
+    )
+    descriptor = SimpleNamespace(
+      identity=identity,
+      declaration=SimpleNamespace(
+        semantics=SimpleNamespace(effect="irreversible")
+      ),
+    )
     runner = AgentSDKRunner(
       event_log=event_log,
       session_id=session.session_id,
@@ -1041,8 +1659,30 @@ def test_sdk_runner_trade_approval_record_includes_preview_summary(
       capability_execution=stub_sdk_capability_execution(),
       system_prompt="test",
       session=session,
-      store=store,
-      policy=policy,
+      approval_route=DurableLocalApprovalRoute(
+        store,
+        policy,
+        session,
+      ),
+      registered_mcp_descriptor_for_sdk_tool=(
+        lambda _tool_name: descriptor
+      ),
+      prepare_registered_mcp_tool_call_for_sdk_tool=(
+        lambda _tool_name, tool_input, _scope, _overlay: SimpleNamespace(
+          descriptor=descriptor,
+          prepared_call=PreparedToolCall(tool_input),
+          planning=PlanDecision("none"),
+          prepared_authorization=None,
+          approval_required=True,
+          approval_reuse_key=None,
+        )
+      ),
+      redact_registered_mcp_tool_input_for_sdk_tool=(
+        lambda _tool_name, tool_input: dict(tool_input)
+      ),
+      settle_registered_mcp_tool_result_for_sdk_tool=(
+        _registered_settlement
+      ),
       run_context=RunContext(
         user_id="alice",
         request_id="request-1",
@@ -1052,11 +1692,17 @@ def test_sdk_runner_trade_approval_record_includes_preview_summary(
     )
 
     callback_task = asyncio.create_task(
-      runner._can_use_tool_callback("mcp__portfolio-trades-mcp__execute_trade", {"preview_id": "p1"}, None)
+      runner._can_use_tool_callback(
+        "mcp__portfolio-trades-mcp__provider_execute_trade",
+        {"preview_id": "p1"},
+        None,
+      )
     )
     for _ in range(100):
       if session.pending_tools:
         break
+      if callback_task.done():
+        await callback_task
       await asyncio.sleep(0.001)
     else:
       raise AssertionError("approval request was not queued")
@@ -1064,6 +1710,8 @@ def test_sdk_runner_trade_approval_record_includes_preview_summary(
     tool_call_id, pending = next(iter(session.pending_tools.items()))
     request = await store.get(str(pending["approval_id"]))
     assert request is not None
+    assert request.tool_name == "execute_trade"
+    assert request.tool_class == "irreversible"
     assert request.tool_args_redacted["preview_id"] == "p1"
     assert request.tool_args_redacted["approval_summary"]["ticker"] == "SGOV"
     assert request.tool_args_redacted["approval_summary"]["quantity"] == 10
@@ -1103,6 +1751,7 @@ def test_sdk_runner_opted_in_skill_result_activates_exact_allow_and_write_deny(
   runner = _make_runner(
     on_tool_result=_on_tool_result,
     disallowed_tools=["start_investment_run"],
+    approval_lifecycle="not_required",
   )
   result = {
     "skill": "phase0-agent",
@@ -1110,6 +1759,12 @@ def test_sdk_runner_opted_in_skill_result_activates_exact_allow_and_write_deny(
     _ACTIVE_SKILL_ALLOW_RESULT_KEY: ["start_investment_run"],
     _ACTIVE_SKILL_DENY_RESULT_KEY: ["file_write"],
   }
+  _seed_tool_call(
+    runner,
+    "tool-invoke",
+    "invoke_skill",
+    {"skill_name": "phase0-agent"},
+  )
 
   hook_result = _run(
     runner._post_tool_use_hook(
@@ -1123,7 +1778,13 @@ def test_sdk_runner_opted_in_skill_result_activates_exact_allow_and_write_deny(
     )
   )
 
-  assert hook_result == {}
+  assert hook_result["continue_"] is False
+  assert hook_result["hookSpecificOutput"]["updatedMCPToolOutput"] == {
+    "skill": "phase0-agent",
+    "content": "Do the work.",
+  }
+  assert _ACTIVE_SKILL_ALLOW_RESULT_KEY not in json.dumps(hook_result)
+  assert _ACTIVE_SKILL_DENY_RESULT_KEY not in json.dumps(hook_result)
   assert runner._active_skill_allow == {"start_investment_run"}
   assert runner._active_skill_deny == {"file_write"}
   assert contexts[0].result == {"skill": "phase0-agent", "content": "Do the work."}
@@ -1146,19 +1807,31 @@ def test_sdk_runner_legacy_skill_result_does_not_activate_active_skill_gate(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   _install_fake_agent_sdk(monkeypatch)
-  runner = _make_runner(disallowed_tools=["run_bash"])
-
-  result = {"skill": "legacy-agent", "content": "Legacy skill body."}
-  normalized, error = runner._normalize_tool_result(
-    {
-      "type": "tool_result",
-      "tool_use_id": "tool-invoke",
-      "content": json.dumps(result),
-    }
+  runner = _make_runner(
+    disallowed_tools=["run_bash"],
+    approval_lifecycle="not_required",
   )
 
-  assert error is None
-  assert normalized == result
+  result = {"skill": "legacy-agent", "content": "Legacy skill body."}
+  _seed_tool_call(
+    runner,
+    "tool-invoke",
+    "invoke_skill",
+    {"skill_name": "legacy-agent"},
+  )
+  hook_result = _run(
+    runner._post_tool_use_hook(
+      {
+        "tool_name": "invoke_skill",
+        "tool_input": {"skill_name": "legacy-agent"},
+        "result": json.dumps(result),
+      },
+      "tool-invoke",
+      None,
+    )
+  )
+
+  assert hook_result == {}
   assert runner._active_skill_deny == set()
 
   static_denied = _run(runner._can_use_tool_callback("run_bash", {"command": "date"}, None))
@@ -1167,6 +1840,49 @@ def test_sdk_runner_legacy_skill_result_does_not_activate_active_skill_gate(
 
   dynamic_allowed = _run(runner._can_use_tool_callback("file_write", {"path": "x"}, None))
   assert dynamic_allowed.behavior == "allow"
+
+
+def test_sdk_runner_foreign_result_cannot_activate_active_skill_gate(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+  runner = _make_runner(
+    disallowed_tools=["start_investment_run"],
+    approval_lifecycle="not_required",
+  )
+  _seed_tool_call(
+    runner,
+    "tool-foreign",
+    "mcp__foreign__lookup",
+    {},
+  )
+
+  hook_result = _run(
+    runner._post_tool_use_hook(
+      {
+        "tool_name": "mcp__foreign__lookup",
+        "tool_input": {},
+        "result": json.dumps({
+          "status": "ok",
+          _ACTIVE_SKILL_ALLOW_RESULT_KEY: ["start_investment_run"],
+          _ACTIVE_SKILL_DENY_RESULT_KEY: ["file_write"],
+          _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY: {
+            "fms_report_sniff_test": "sniff-test",
+          },
+        }),
+      },
+      "tool-foreign",
+      None,
+    )
+  )
+
+  assert runner._active_skill_allow == set()
+  assert runner._active_skill_deny == set()
+  assert runner._active_skill_report_doors == {}
+  assert hook_result["hookSpecificOutput"]["updatedMCPToolOutput"] == {
+    "status": "ok",
+  }
+  assert "continue_" not in hook_result
 
 
 def test_sdk_runner_active_skill_deny_replaces_existing_set(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1187,7 +1903,7 @@ def test_sdk_runner_report_door_clears_active_skill_gate(monkeypatch: pytest.Mon
   _install_fake_agent_sdk(monkeypatch)
   runner = _make_runner()
   runner._active_skill_deny = {"emit_canvas_artifact"}
-  set_current_skill("sniff-test")
+  set_current_skill(_skill_admission("sniff-test"))
 
   try:
     invoke_result = {
@@ -1196,7 +1912,10 @@ def test_sdk_runner_report_door_clears_active_skill_gate(monkeypatch: pytest.Mon
       _ACTIVE_SKILL_DENY_RESULT_KEY: ["emit_canvas_artifact"],
       _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY: {"fms_report_sniff_test": "sniff-test"},
     }
-    stripped = runner._consume_private_tool_result_fields(invoke_result)
+    stripped = runner._consume_private_tool_result_fields(
+      invoke_result,
+      tool_name="invoke_skill",
+    )
     assert stripped == {"skill": "sniff-test", "content": "Do the sniff test."}
     assert runner._active_skill_deny == {"emit_canvas_artifact"}
     assert runner._active_skill_report_doors == {"fms_report_sniff_test": "sniff-test"}
@@ -1222,10 +1941,10 @@ def test_sdk_runner_model_writer_terminal_door_clears_build_model_deny(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   _install_fake_agent_sdk(monkeypatch)
-  runner = _make_runner()
+  runner = _make_runner(approval_lifecycle="not_required")
   runner._active_skill_deny = {"build_model"}
   runner._active_skill_report_doors = {"fms_persist_business_model": "business-model-construction"}
-  set_current_skill("business-model-construction")
+  set_current_skill(_skill_admission("business-model-construction"))
 
   try:
     denied = _run(runner._can_use_tool_callback("build_model", {}, None))
@@ -1259,7 +1978,7 @@ def test_sdk_runner_model_writer_mid_skill_build_model_deny_holds(
   runner = _make_runner()
   runner._active_skill_deny = {"build_model"}
   runner._active_skill_report_doors = {"fms_persist_business_model": "business-model-construction"}
-  set_current_skill("business-model-construction")
+  set_current_skill(_skill_admission("business-model-construction"))
 
   try:
     denied = _run(runner._can_use_tool_callback("build_model", {}, None))
@@ -1290,7 +2009,7 @@ def test_sdk_runner_report_door_semantic_error_does_not_clear_active_skill_gate(
   runner = _make_runner()
   runner._active_skill_deny = {"emit_canvas_artifact"}
   runner._active_skill_report_doors = {"fms_report_sniff_test": "sniff-test"}
-  set_current_skill("sniff-test")
+  set_current_skill(_skill_admission("sniff-test"))
 
   try:
     cleared = runner._clear_active_skill_if_report_door_completed(
@@ -1318,7 +2037,7 @@ def test_sdk_runner_active_skill_deny_clears_on_success_and_error(monkeypatch: p
   success_runner._active_skill_deny.add("file_write")
 
   async def _run_success() -> None:
-    set_current_skill("phase0-agent")
+    set_current_skill(_skill_admission("phase0-agent"))
     await success_runner.run([{"role": "user", "content": "hello"}])
     assert current_skill() is None
 
@@ -1333,7 +2052,7 @@ def test_sdk_runner_active_skill_deny_clears_on_success_and_error(monkeypatch: p
   error_runner._active_skill_deny.add("file_write")
 
   async def _run_error() -> None:
-    set_current_skill("phase0-agent")
+    set_current_skill(_skill_admission("phase0-agent"))
     with pytest.raises(RuntimeError, match="sdk failed"):
       await error_runner.run([{"role": "user", "content": "hello"}])
     assert current_skill() is None

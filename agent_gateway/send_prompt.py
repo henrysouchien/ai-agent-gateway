@@ -3,18 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
-from .capability_binding import (
-  require_capability_execution_bind,
-  validate_reported_identity,
-)
-from .capability_execution import (
-  BoundCapabilityExecution,
-)
-from .commercial_usage import CommercialUsageProducer
-from .multi_user.billing import UsageEvent, normalize_identity
-from .thinking import EffortResolution
+if TYPE_CHECKING:
+  from .capability_execution import BoundCapabilityExecution
+  from .commercial_usage import CommercialUsageProducer
+  from .multi_user.billing import UsageEvent
+  from .thinking import EffortResolution
 
 
 log = logging.getLogger("agent_gateway.send_prompt")
@@ -30,6 +25,9 @@ def _call_usage_callback(
 def _prepare_bound_execution(
   capability_execution: BoundCapabilityExecution,
 ) -> tuple[dict[str, Any], int, EffortResolution]:
+  from .capability_binding import require_capability_execution_bind
+  from .capability_execution import BoundCapabilityExecution
+
   if not isinstance(capability_execution, BoundCapabilityExecution):
     raise TypeError("send_prompt requires a BoundCapabilityExecution")
   capability_execution.validate()
@@ -81,6 +79,9 @@ async def send_prompt(
   before this execution-only helper is called. The exact provider adapter and
   bound credential snapshot are validated before a provider client is created.
   """
+  from .capability_binding import validate_reported_identity
+  from .multi_user.billing import UsageEvent, UsageState, normalize_identity
+
   sid = str(session_id or "send-prompt")
   normalized_request_id = str(request_id or "").strip()
   normalized_rate_version = str(rate_table_version or "").strip()
@@ -124,7 +125,7 @@ async def send_prompt(
   provider_reported_model: str | None = None
   stop_reason = ""
 
-  async def _emit_usage(usage_state: str) -> None:
+  async def _emit_usage(usage_state: UsageState) -> None:
     if on_usage is None and commercial_usage_producer is None:
       return
     cost = provider.estimate_cost(
@@ -152,7 +153,7 @@ async def send_prompt(
       rate_table_version=resolved_rate_version,
       billing_mode=resolved_billing_mode,
       channel=resolved_channel,
-      capability_bind=capability_bind.receipt(),
+      capability_bind=capability_bind.to_json(),
       provider_reported_model=provider_reported_model,
     )
     if commercial_usage_producer is not None:

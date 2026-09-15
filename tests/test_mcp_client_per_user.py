@@ -4,18 +4,22 @@ import asyncio
 import hashlib
 import hmac
 import json
+from datetime import timedelta
 import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from typing import Mapping
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
+from mcp.types import CallToolResult as _ToolResult, ContentBlock, TextContent
 
 from agent_gateway.mcp_client import (
   McpClientManager,
+  _ConnectedServerState,
   _PerUserGatewaySubject,
   _PerUserMcpError,
   _PerUserServerState,
@@ -27,7 +31,7 @@ import agent_gateway.mcp_client as mcp_client_module
 
 
 def _definition(config=None):
-  return _ServerState("gsheets-mcp", SimpleNamespace(), [], [], {"tool"}, config=config or {
+  return _ServerState("gsheets-mcp", _UnusedClientSession(), [], [], {"tool"}, config=config or {
     "command": "/venv/python",
     "args": ["server.py"],
     "per_user": True,
@@ -36,7 +40,14 @@ def _definition(config=None):
 
 
 def _child(label):
-  return _ServerState(label, SimpleNamespace(), [object()], [], {"tool"}, config={"type": "stdio"})
+  return _ConnectedServerState(
+    label,
+    _UnusedClientSession(),
+    [object()],
+    [],
+    {"tool"},
+    config={"type": "stdio"},
+  )
 
 
 def _manager(operation="gsheets_read_range"):
@@ -63,15 +74,29 @@ def _subject(user_id: int = 7) -> _PerUserGatewaySubject:
   return _PerUserGatewaySubject.from_gateway_session(_gateway_session(user_id))
 
 
-async def _mint_ok(_user):
+async def _mint_ok(subject):
   return "tier-two", time.time() + 3600, "https://risk"
 
 
-def _tool_result(*, is_error=False, payload=None, structured_content=None):
-  content = None
+
+
+class _UnusedClientSession:
+  async def call_tool(
+    self,
+    name: str,
+    arguments: Mapping[str, object],
+    *,
+    read_timeout_seconds: timedelta,
+    meta: Mapping[str, object] | None = None,
+  ) -> _ToolResult:
+    raise AssertionError(f"unexpected physical MCP call: {name}")
+
+
+def _tool_result(*, is_error=False, payload=None, structured_content=None) -> _ToolResult:
+  content: list[ContentBlock] = []
   if payload is not None:
-    content = [SimpleNamespace(text=json.dumps(payload))]
-  return SimpleNamespace(
+    content = [TextContent(type="text", text=json.dumps(payload))]
+  return _ToolResult(
     isError=is_error,
     structuredContent=structured_content,
     content=content,
@@ -130,8 +155,8 @@ def test_startup_connects_definition_only_config_without_token(tmp_path):
     manager = McpClientManager(config_path=config_path)
     captured = []
 
-    async def connect(jobs):
-      captured.extend(jobs)
+    async def connect(connect_jobs):
+      captured.extend(connect_jobs)
       return []
 
     manager._connect_startup_servers = connect
@@ -256,6 +281,7 @@ def test_missing_identity_fails_closed_without_spawn():
   manager = _manager()
   result, error = asyncio.run(manager.call_tool("tool", {}))
   assert result is None
+  assert error is not None
   assert error["sub_code"] == "missing_user_identity"
   assert error["data"]["operation"] == "gsheets_read_range"
   assert error["data"]["error"]["outcome"]["state"] == "not_started"
@@ -273,17 +299,19 @@ def test_session_owner_mismatch_fails_closed_without_broker_mint():
     )
   )
   assert result is None
+  assert error is not None
   assert error["sub_code"] == "missing_user_identity"
   assert manager._per_user_servers == {}
 
 
-def test_dispatcher_passes_authenticated_session_instead_of_identity_override():
+def test_dispatcher_passes_authenticated_session_to_per_user_mcp(monkeypatch):
   async def scenario():
     manager = _manager()
-    manager._mcp_tool_names = {"tool"}
+    manager._tool_to_server = {"gsheets_read_range": "gsheets-mcp"}
+    manager._prefixed_to_original = {}
+    manager._mcp_tool_names = {"gsheets_read_range"}
     session = _gateway_session()
-    # This asserts identity plumbing on the owner path; `tool` is a synthetic
-    # name with no policy class, which invite authority denies by default.
+    # This asserts identity plumbing on the owner path.
     session.role = "owner"
     captured = {}
 
@@ -291,18 +319,17 @@ def test_dispatcher_passes_authenticated_session_instead_of_identity_override():
       captured.update(name=name, tool_input=tool_input, kwargs=kwargs)
       return {"ok": True}, None
 
-    manager.call_tool = call_tool
+    monkeypatch.setattr(manager, "call_tool", call_tool)
     dispatcher = ToolDispatcher(
       mcp_client=manager,
       session=session,
       risk_user_id=7,
-      mcp_identity_overrides={"gsheets-mcp": 999},
     )
     result, error = await dispatcher.dispatch(
       "call-1",
-      "tool",
+      "gsheets_read_range",
       {},
-      advertised_tool_names=frozenset({"tool"}),
+      advertised_tool_names=frozenset({"gsheets_read_range"}),
     )
     assert error is None
     assert result == {"ok": True}
@@ -312,7 +339,7 @@ def test_dispatcher_passes_authenticated_session_instead_of_identity_override():
   asyncio.run(scenario())
 
 
-def test_same_user_single_flight_and_different_users_isolate():
+def test_same_user_single_flight_and_different_users_isolate(monkeypatch):
   async def scenario():
     manager = _manager()
     spawned = []
@@ -324,8 +351,8 @@ def test_same_user_single_flight_and_different_users_isolate():
       await gate.wait()
       return _PerUserServerState(_child(user.user_id), time.time() + 3600, time.time())
 
-    manager._mint_gsheets_broker_session = _mint_ok
-    manager._spawn_per_user_server = spawn
+    monkeypatch.setattr(manager, "_mint_gsheets_broker_session", _mint_ok)
+    monkeypatch.setattr(manager, "_spawn_per_user_server", spawn)
     same = [
       asyncio.create_task(manager._get_per_user_server("gsheets-mcp", _subject()))
       for _ in range(2)
@@ -354,8 +381,8 @@ def test_spawn_env_contains_token_but_not_tier_one_key(monkeypatch):
       captured.update(config["env"])
       return _child("spawned")
 
-    manager._mint_gsheets_broker_session = mint
-    manager._connect_stdio_with_retries = connect
+    monkeypatch.setattr(manager, "_mint_gsheets_broker_session", mint)
+    monkeypatch.setattr(manager, "_connect_stdio_with_retries", connect)
     await manager._spawn_per_user_server("gsheets-mcp", _subject())
     assert captured["GSHEETS_BROKER_SESSION_TOKEN"] == "tier-two"
     assert captured["GSHEETS_BROKER_URL"] == "https://risk"
@@ -364,18 +391,19 @@ def test_spawn_env_contains_token_but_not_tier_one_key(monkeypatch):
   asyncio.run(scenario())
 
 
-def test_mint_failures_are_terminal_and_do_not_spawn():
+def test_mint_failures_are_terminal_and_do_not_spawn(monkeypatch):
   async def scenario(code):
     manager = _manager()
 
     async def fail(_user):
       raise _PerUserMcpError(code)
 
-    manager._mint_gsheets_broker_session = fail
+    monkeypatch.setattr(manager, "_mint_gsheets_broker_session", fail)
     result, error = await manager.call_tool(
       "tool", {}, gateway_session=_gateway_session()
     )
     assert result is None
+    assert error is not None
     assert error["sub_code"] == code
     assert error["data"]["error"]["outcome"]["state"] == "not_started"
     assert error["data"]["error"]["outcome"]["mutation_may_have_occurred"] is False
@@ -385,16 +413,16 @@ def test_mint_failures_are_terminal_and_do_not_spawn():
   asyncio.run(scenario("broker_rate_limited"))
 
 
-def test_near_expiry_replaces_and_drains_old():
+def test_near_expiry_replaces_and_drains_old(monkeypatch):
   async def scenario():
     manager = _manager()
     old = _PerUserServerState(_child("old"), time.time() + 1, time.time(), active_calls=1)
     manager._per_user_servers[("gsheets-mcp", "7")] = old
     replacement = _PerUserServerState(_child("new"), time.time() + 3600, time.time())
-    manager._mint_gsheets_broker_session = _mint_ok
-    manager._spawn_per_user_server = lambda *_, **__: asyncio.sleep(0, result=replacement)
+    monkeypatch.setattr(manager, "_mint_gsheets_broker_session", _mint_ok)
+    monkeypatch.setattr(manager, "_spawn_per_user_server", lambda *_, **__: asyncio.sleep(0, result=replacement))
     closed = []
-    manager._close_contexts = lambda contexts: asyncio.sleep(0, result=closed.append(contexts))
+    monkeypatch.setattr(manager, "_close_contexts", lambda contexts: asyncio.sleep(0, result=closed.append(contexts)))
     current = await manager._get_per_user_server("gsheets-mcp", _subject())
     assert current is replacement
     assert old.draining is True
@@ -415,7 +443,7 @@ def test_idle_reap_and_dead_instance_respawn(monkeypatch):
     dead.server.exit_contexts = []
     manager._per_user_servers[("gsheets-mcp", "1")] = stale
     manager._per_user_servers[("gsheets-mcp", "2")] = dead
-    manager._close_contexts = lambda _contexts: asyncio.sleep(0)
+    monkeypatch.setattr(manager, "_close_contexts", lambda _contexts: asyncio.sleep(0))
     spawned = []
 
     async def spawn(_server, user, broker_session=None):
@@ -423,8 +451,8 @@ def test_idle_reap_and_dead_instance_respawn(monkeypatch):
       spawned.append(user.user_id)
       return _PerUserServerState(_child(user.user_id), time.time() + 3600, time.time())
 
-    manager._mint_gsheets_broker_session = _mint_ok
-    manager._spawn_per_user_server = spawn
+    monkeypatch.setattr(manager, "_mint_gsheets_broker_session", _mint_ok)
+    monkeypatch.setattr(manager, "_spawn_per_user_server", spawn)
     await manager._get_per_user_server("gsheets-mcp", _subject(2))
     assert "2" in spawned
     assert ("gsheets-mcp", "1") not in manager._per_user_servers
@@ -436,7 +464,7 @@ def test_concurrent_burst_respects_atomic_per_server_cap(monkeypatch):
   async def scenario():
     manager = _manager()
     monkeypatch.setattr(mcp_client_module, "PER_USER_INSTANCE_CAP", 2)
-    manager._mint_gsheets_broker_session = _mint_ok
+    monkeypatch.setattr(manager, "_mint_gsheets_broker_session", _mint_ok)
     gate = asyncio.Event()
     connect_started = 0
     max_accounted = 0
@@ -450,7 +478,7 @@ def test_concurrent_burst_respects_atomic_per_server_cap(monkeypatch):
       await gate.wait()
       return _child(f"child-{connect_started}")
 
-    manager._connect_stdio_with_retries = connect
+    monkeypatch.setattr(manager, "_connect_stdio_with_retries", connect)
     tasks = [
       asyncio.create_task(manager._get_per_user_server("gsheets-mcp", _subject(user)))
       for user in range(1, 4)
@@ -475,7 +503,7 @@ def test_force_respawn_reserves_slot_before_concurrent_new_user(monkeypatch):
   async def scenario():
     manager = _manager()
     monkeypatch.setattr(mcp_client_module, "PER_USER_INSTANCE_CAP", 1)
-    manager._mint_gsheets_broker_session = _mint_ok
+    monkeypatch.setattr(manager, "_mint_gsheets_broker_session", _mint_ok)
     old = _PerUserServerState(_child("old"), time.time() + 3600, time.time())
     manager._per_user_servers[("gsheets-mcp", "1")] = old
     spawn_started = asyncio.Event()
@@ -497,8 +525,8 @@ def test_force_respawn_reserves_slot_before_concurrent_new_user(monkeypatch):
       )
 
     drained = []
-    manager._spawn_per_user_server = spawn
-    manager._schedule_drain = drained.append
+    monkeypatch.setattr(manager, "_spawn_per_user_server", spawn)
+    monkeypatch.setattr(manager, "_schedule_drain", drained.append)
     manager._ensure_per_user_reaper = lambda: None
     replacement_task = asyncio.create_task(
       manager._get_per_user_server("gsheets-mcp", _subject(1), force=True)
@@ -535,12 +563,12 @@ def test_failed_mint_at_capacity_evicts_nobody(monkeypatch):
     healthy = _PerUserServerState(_child("healthy"), time.time() + 3600, time.time())
     manager._per_user_servers[("gsheets-mcp", "1")] = healthy
     drains = []
-    manager._schedule_drain = drains.append
+    monkeypatch.setattr(manager, "_schedule_drain", drains.append)
 
     async def fail(_user):
       raise _PerUserMcpError("sheets_not_connected")
 
-    manager._mint_gsheets_broker_session = fail
+    monkeypatch.setattr(manager, "_mint_gsheets_broker_session", fail)
     try:
       await manager._get_per_user_server("gsheets-mcp", _subject(2))
     except _PerUserMcpError as exc:
@@ -558,7 +586,7 @@ def test_spawn_failure_releases_reservation(monkeypatch):
   async def scenario():
     manager = _manager()
     monkeypatch.setattr(mcp_client_module, "PER_USER_INSTANCE_CAP", 1)
-    manager._mint_gsheets_broker_session = _mint_ok
+    monkeypatch.setattr(manager, "_mint_gsheets_broker_session", _mint_ok)
     attempts = 0
 
     async def connect(_name, _config):
@@ -568,7 +596,7 @@ def test_spawn_failure_releases_reservation(monkeypatch):
         raise RuntimeError("spawn failed")
       return _child("healthy")
 
-    manager._connect_stdio_with_retries = connect
+    monkeypatch.setattr(manager, "_connect_stdio_with_retries", connect)
     try:
       await manager._get_per_user_server("gsheets-mcp", _subject(1))
     except RuntimeError as exc:
@@ -587,7 +615,7 @@ def test_replacement_spawn_failure_restores_old_and_releases_reservation(monkeyp
   async def scenario():
     manager = _manager()
     monkeypatch.setattr(mcp_client_module, "PER_USER_INSTANCE_CAP", 1)
-    manager._mint_gsheets_broker_session = _mint_ok
+    monkeypatch.setattr(manager, "_mint_gsheets_broker_session", _mint_ok)
     old = _PerUserServerState(_child("old"), time.time() + 3600, time.time())
     manager._per_user_servers[("gsheets-mcp", "1")] = old
     attempts = 0
@@ -603,8 +631,8 @@ def test_replacement_spawn_failure_restores_old_and_releases_reservation(monkeyp
       )
 
     drained = []
-    manager._spawn_per_user_server = spawn
-    manager._schedule_drain = drained.append
+    monkeypatch.setattr(manager, "_spawn_per_user_server", spawn)
+    monkeypatch.setattr(manager, "_schedule_drain", drained.append)
     manager._ensure_per_user_reaper = lambda: None
     try:
       await manager._get_per_user_server("gsheets-mcp", _subject(1), force=True)
@@ -627,10 +655,10 @@ def test_replacement_spawn_failure_restores_old_and_releases_reservation(monkeyp
   asyncio.run(scenario())
 
 
-def test_expired_broker_child_is_discarded_when_replacement_spawn_fails():
+def test_expired_broker_child_is_discarded_when_replacement_spawn_fails(monkeypatch):
   async def scenario():
     manager = _manager()
-    manager._mint_gsheets_broker_session = _mint_ok
+    monkeypatch.setattr(manager, "_mint_gsheets_broker_session", _mint_ok)
     old = _PerUserServerState(_child("expired"), time.time() + 3600, time.time())
     manager._per_user_servers[("gsheets-mcp", "1")] = old
     drained = []
@@ -638,8 +666,8 @@ def test_expired_broker_child_is_discarded_when_replacement_spawn_fails():
     async def fail_spawn(*_args, **_kwargs):
       raise RuntimeError("replacement failed")
 
-    manager._spawn_per_user_server = fail_spawn
-    manager._schedule_drain = drained.append
+    monkeypatch.setattr(manager, "_spawn_per_user_server", fail_spawn)
+    monkeypatch.setattr(manager, "_schedule_drain", drained.append)
     manager._ensure_per_user_reaper = lambda: None
 
     try:
@@ -661,7 +689,7 @@ def test_expired_broker_child_is_discarded_when_replacement_spawn_fails():
   asyncio.run(scenario())
 
 
-def test_expired_broker_child_is_discarded_when_replacement_mint_fails():
+def test_expired_broker_child_is_discarded_when_replacement_mint_fails(monkeypatch):
   async def scenario():
     manager = _manager()
     old = _PerUserServerState(_child("expired"), time.time() + 3600, time.time())
@@ -671,8 +699,8 @@ def test_expired_broker_child_is_discarded_when_replacement_mint_fails():
     async def fail_mint(_user):
       raise _PerUserMcpError("sheets_unavailable", "broker unavailable")
 
-    manager._mint_gsheets_broker_session = fail_mint
-    manager._schedule_drain = drained.append
+    monkeypatch.setattr(manager, "_mint_gsheets_broker_session", fail_mint)
+    monkeypatch.setattr(manager, "_schedule_drain", drained.append)
 
     try:
       await manager._get_per_user_server(
@@ -707,10 +735,10 @@ def test_eviction_uses_lru_idle_instance_from_same_server(monkeypatch):
       ("gsheets-mcp", "2"): newer,
       ("other-mcp", "1"): other,
     })
-    manager._mint_gsheets_broker_session = _mint_ok
-    manager._connect_stdio_with_retries = lambda *_: asyncio.sleep(0, result=_child("added"))
+    monkeypatch.setattr(manager, "_mint_gsheets_broker_session", _mint_ok)
+    monkeypatch.setattr(manager, "_connect_stdio_with_retries", lambda *_: asyncio.sleep(0, result=_child("added")))
     drained = []
-    manager._schedule_drain = drained.append
+    monkeypatch.setattr(manager, "_schedule_drain", drained.append)
 
     await manager._get_per_user_server("gsheets-mcp", _subject(3))
     assert ("gsheets-mcp", "1") not in manager._per_user_servers
@@ -726,14 +754,14 @@ def test_periodic_reaper_drains_idle_instance_and_retires_lock(monkeypatch):
     manager = _manager()
     monkeypatch.setattr(mcp_client_module, "PER_USER_IDLE_REAP_SECONDS", 0.02)
     monkeypatch.setattr(mcp_client_module, "PER_USER_REAPER_INTERVAL_SECONDS", 0.005)
-    manager._mint_gsheets_broker_session = _mint_ok
-    manager._connect_stdio_with_retries = lambda *_: asyncio.sleep(0, result=_child("idle"))
+    monkeypatch.setattr(manager, "_mint_gsheets_broker_session", _mint_ok)
+    monkeypatch.setattr(manager, "_connect_stdio_with_retries", lambda *_: asyncio.sleep(0, result=_child("idle")))
     closed = asyncio.Event()
 
     async def close(_contexts):
       closed.set()
 
-    manager._close_contexts = close
+    monkeypatch.setattr(manager, "_close_contexts", close)
     state = await manager._get_per_user_server("gsheets-mcp", _subject())
     state.last_used_at = time.time() - 1
     await asyncio.wait_for(closed.wait(), timeout=1)
@@ -746,7 +774,7 @@ def test_periodic_reaper_drains_idle_instance_and_retires_lock(monkeypatch):
   asyncio.run(scenario())
 
 
-def test_transport_exception_cleanup_uses_normalized_user_id():
+def test_transport_exception_cleanup_uses_normalized_user_id(monkeypatch):
   async def scenario():
     manager = _manager()
     state = _PerUserServerState(_child("first"), time.time() + 3600, time.time())
@@ -761,13 +789,14 @@ def test_transport_exception_cleanup_uses_normalized_user_id():
     async def fail(**_kwargs):
       raise EOFError("transport failed with sensitive upstream detail")
 
-    manager._get_per_user_server = resolve
-    manager._call_tool_once = fail
-    manager._close_contexts = lambda *_: asyncio.sleep(0)
+    monkeypatch.setattr(manager, "_get_per_user_server", resolve)
+    monkeypatch.setattr(manager, "_call_tool_once", fail)
+    monkeypatch.setattr(manager, "_close_contexts", lambda *_: asyncio.sleep(0))
     result, error = await manager.call_tool(
       "tool", {}, gateway_session=_gateway_session()
     )
     assert result is None
+    assert error is not None
     assert error["sub_code"] == "sheets_transport_error"
     assert error["message"] == "The Google Sheets connection was lost before a read result was received."
     assert "sensitive" not in json.dumps(error)
@@ -778,12 +807,12 @@ def test_transport_exception_cleanup_uses_normalized_user_id():
   asyncio.run(scenario())
 
 
-def test_transport_failure_during_failed_replacement_does_not_restore_old():
+def test_transport_failure_during_failed_replacement_does_not_restore_old(monkeypatch):
   async def scenario():
     manager = _manager("gsheets_write_range")
     old = _PerUserServerState(_child("old"), time.time() + 3600, time.time())
     manager._per_user_servers[("gsheets-mcp", "7")] = old
-    manager._mint_gsheets_broker_session = _mint_ok
+    monkeypatch.setattr(manager, "_mint_gsheets_broker_session", _mint_ok)
     manager._ensure_per_user_reaper = lambda: None
     call_started = asyncio.Event()
     fail_call = asyncio.Event()
@@ -817,9 +846,9 @@ def test_transport_failure_during_failed_replacement_does_not_restore_old():
       close_started.set()
       await close_gate.wait()
 
-    manager._call_tool_once = invoke
-    manager._spawn_per_user_server = spawn
-    manager._close_contexts = close
+    monkeypatch.setattr(manager, "_call_tool_once", invoke)
+    monkeypatch.setattr(manager, "_spawn_per_user_server", spawn)
+    monkeypatch.setattr(manager, "_close_contexts", close)
     call_task = asyncio.create_task(
       manager.call_tool("tool", {}, gateway_session=_gateway_session())
     )
@@ -833,6 +862,7 @@ def test_transport_failure_during_failed_replacement_does_not_restore_old():
     fail_call.set()
     result, error = await call_task
     assert result is None
+    assert error is not None
     assert error["sub_code"] == "mutation_outcome_uncertain"
     assert error["data"]["error"]["outcome"] == {
       "state": "uncertain",
@@ -867,13 +897,13 @@ def test_transport_failure_during_failed_replacement_does_not_restore_old():
   asyncio.run(scenario())
 
 
-def test_stale_transport_failure_preserves_inserted_replacement():
+def test_stale_transport_failure_preserves_inserted_replacement(monkeypatch):
   async def scenario():
     manager = _manager("gsheets_write_range")
     old = _PerUserServerState(_child("old"), time.time() + 3600, time.time())
     replacement = _PerUserServerState(_child("replacement"), time.time() + 3600, time.time())
     manager._per_user_servers[("gsheets-mcp", "7")] = old
-    manager._mint_gsheets_broker_session = _mint_ok
+    monkeypatch.setattr(manager, "_mint_gsheets_broker_session", _mint_ok)
     manager._ensure_per_user_reaper = lambda: None
     call_started = asyncio.Event()
     fail_call = asyncio.Event()
@@ -888,9 +918,9 @@ def test_stale_transport_failure_preserves_inserted_replacement():
       nonlocal close_calls
       close_calls += 1
 
-    manager._call_tool_once = invoke
-    manager._spawn_per_user_server = lambda *_, **__: asyncio.sleep(0, result=replacement)
-    manager._close_contexts = close
+    monkeypatch.setattr(manager, "_call_tool_once", invoke)
+    monkeypatch.setattr(manager, "_spawn_per_user_server", lambda *_, **__: asyncio.sleep(0, result=replacement))
+    monkeypatch.setattr(manager, "_close_contexts", close)
     call_task = asyncio.create_task(
       manager.call_tool("tool", {}, gateway_session=_gateway_session())
     )
@@ -905,6 +935,7 @@ def test_stale_transport_failure_preserves_inserted_replacement():
     fail_call.set()
     result, error = await call_task
     assert result is None
+    assert error is not None
     assert error["sub_code"] == "mutation_outcome_uncertain"
     assert manager._per_user_servers[("gsheets-mcp", "7")] is replacement
     await asyncio.gather(*manager._drain_tasks)
@@ -913,7 +944,7 @@ def test_stale_transport_failure_preserves_inserted_replacement():
   asyncio.run(scenario())
 
 
-def test_schedule_drain_is_idempotent():
+def test_schedule_drain_is_idempotent(monkeypatch):
   async def scenario():
     manager = _manager()
     state = _PerUserServerState(_child("old"), time.time() + 3600, time.time())
@@ -923,7 +954,7 @@ def test_schedule_drain_is_idempotent():
       nonlocal close_calls
       close_calls += 1
 
-    manager._close_contexts = close
+    monkeypatch.setattr(manager, "_close_contexts", close)
     manager._schedule_drain(state)
     manager._schedule_drain(state)
     assert state.draining is True
@@ -934,10 +965,10 @@ def test_schedule_drain_is_idempotent():
   asyncio.run(scenario())
 
 
-def test_broker_session_expired_live_shape_respawns_and_retries_once():
+def test_broker_session_expired_live_shape_respawns_and_retries_once(monkeypatch):
   async def scenario():
     manager = _manager()
-    manager._close_contexts = lambda *_: asyncio.sleep(0)
+    monkeypatch.setattr(manager, "_close_contexts", lambda *_: asyncio.sleep(0))
     first = _PerUserServerState(_child("first"), time.time() + 3600, time.time())
     second = _PerUserServerState(_child("second"), time.time() + 3600, time.time())
     calls = []
@@ -958,8 +989,8 @@ def test_broker_session_expired_live_shape_respawns_and_retries_once():
         "values": [[1, 2]],
       })
 
-    manager._get_per_user_server = resolve
-    manager._call_tool_once = invoke
+    monkeypatch.setattr(manager, "_get_per_user_server", resolve)
+    monkeypatch.setattr(manager, "_call_tool_once", invoke)
     result, error = await manager.call_tool(
       "tool", {}, gateway_session=_gateway_session()
     )
@@ -976,10 +1007,113 @@ def test_broker_session_expired_live_shape_respawns_and_retries_once():
   asyncio.run(scenario())
 
 
-def test_broker_session_expired_second_failure_is_typed_after_one_respawn():
+def test_broker_session_expired_no_uncertain_replay_refreshes_future_only(monkeypatch):
   async def scenario():
     manager = _manager()
-    manager._close_contexts = lambda *_: asyncio.sleep(0)
+    monkeypatch.setattr(manager, "_close_contexts", lambda *_: asyncio.sleep(0))
+    first = _PerUserServerState(_child("first"), time.time() + 3600, time.time())
+    second = _PerUserServerState(_child("second"), time.time() + 3600, time.time())
+    resolves = []
+    sends = []
+
+    async def resolve(_server, user, force=False, discard_current_on_failure=False):
+      resolves.append((user.user_id, force, discard_current_on_failure))
+      return second if force else first
+
+    async def invoke(**kwargs):
+      sends.append(kwargs["server"].name)
+      return _sheets_error_result()
+
+    monkeypatch.setattr(manager, "_get_per_user_server", resolve)
+    monkeypatch.setattr(manager, "_call_tool_once", invoke)
+    result, error = await manager.call_tool(
+      "tool",
+      {},
+      gateway_session=_gateway_session(),
+      allow_uncertain_replay=False,
+    )
+
+    assert result is None
+    assert error is not None
+    assert error["sub_code"] == "broker_session_expired"
+    assert sends == ["first"]
+    assert resolves == [("7", False, False), ("7", True, True)]
+
+  asyncio.run(scenario())
+
+
+def test_future_dispatch_reuses_refreshed_per_user_sheets_session(monkeypatch):
+  async def scenario():
+    manager = _manager()
+    manager._tool_to_server = {"gsheets_read_range": "gsheets-mcp"}
+    manager._prefixed_to_original = {}
+    manager._mcp_tool_names = {"gsheets_read_range"}
+    monkeypatch.setattr(manager, "_close_contexts", lambda *_: asyncio.sleep(0))
+    first = _PerUserServerState(_child("first"), time.time() + 3600, time.time())
+    second = _PerUserServerState(_child("second"), time.time() + 3600, time.time())
+    current = first
+    sends = []
+
+    async def resolve(_server, _user, force=False, discard_current_on_failure=False):
+      nonlocal current
+      del discard_current_on_failure
+      if force:
+        current = second
+      return current
+
+    async def invoke(**kwargs):
+      sends.append(kwargs["server"].name)
+      if kwargs["server"].name == "first":
+        return _sheets_error_result()
+      return _tool_result(structured_content={
+        "status": "ok",
+        "operation": "gsheets_read_range",
+        "spreadsheet": "sheet-id",
+        "range": "Data!A1",
+        "values": [[1]],
+      })
+
+    monkeypatch.setattr(manager, "_get_per_user_server", resolve)
+    monkeypatch.setattr(manager, "_call_tool_once", invoke)
+    dispatcher = ToolDispatcher(
+      mcp_client=manager,
+      local_tool_handlers={},
+      role="owner",
+      session=_gateway_session(),
+      get_tool_definitions=lambda: [{"name": "gsheets_read_range"}],
+      allowed_mcp_tools_by_server={"gsheets-mcp": {"gsheets_read_range"}},
+    )
+
+    first_result, first_error = await dispatcher.dispatch(
+      "first-call",
+      "gsheets_read_range",
+      {},
+      advertised_tool_names=frozenset({"gsheets_read_range"}),
+      allow_uncertain_mcp_replay=False,
+    )
+    second_result, second_error = await dispatcher.dispatch(
+      "second-call",
+      "gsheets_read_range",
+      {},
+      advertised_tool_names=frozenset({"gsheets_read_range"}),
+      allow_uncertain_mcp_replay=False,
+    )
+
+    assert first_result is None
+    assert first_error is not None
+    assert first_error["sub_code"] == "broker_session_expired"
+    assert second_error is None
+    assert isinstance(second_result, dict)
+    assert second_result["status"] == "ok"
+    assert sends == ["first", "second"]
+
+  asyncio.run(scenario())
+
+
+def test_broker_session_expired_second_failure_is_typed_after_one_respawn(monkeypatch):
+  async def scenario():
+    manager = _manager()
+    monkeypatch.setattr(manager, "_close_contexts", lambda *_: asyncio.sleep(0))
     first = _PerUserServerState(_child("first"), time.time() + 3600, time.time())
     second = _PerUserServerState(_child("second"), time.time() + 3600, time.time())
     resolves = []
@@ -992,12 +1126,13 @@ def test_broker_session_expired_second_failure_is_typed_after_one_respawn():
       del kwargs
       return _sheets_error_result()
 
-    manager._get_per_user_server = resolve
-    manager._call_tool_once = invoke
+    monkeypatch.setattr(manager, "_get_per_user_server", resolve)
+    monkeypatch.setattr(manager, "_call_tool_once", invoke)
     result, error = await manager.call_tool(
       "tool", {}, gateway_session=_gateway_session()
     )
     assert result is None
+    assert error is not None
     assert error["code"] == "mcp_tool_error"
     assert error["sub_code"] == "broker_session_expired"
     assert error["data"]["error"]["retry"]["automatic"] is True
@@ -1007,7 +1142,7 @@ def test_broker_session_expired_second_failure_is_typed_after_one_respawn():
   asyncio.run(scenario())
 
 
-def test_broker_expiry_backstop_does_not_substring_match_arbitrary_text():
+def test_broker_expiry_backstop_does_not_substring_match_arbitrary_text(monkeypatch):
   async def scenario():
     manager = _manager()
     state = _PerUserServerState(_child("first"), time.time() + 3600, time.time())
@@ -1018,23 +1153,24 @@ def test_broker_expiry_backstop_does_not_substring_match_arbitrary_text():
       resolves.append(force)
       return state
 
-    manager._get_per_user_server = resolve
-    manager._call_tool_once = lambda **_: asyncio.sleep(0, result=SimpleNamespace(
+    monkeypatch.setattr(manager, "_get_per_user_server", resolve)
+    monkeypatch.setattr(manager, "_call_tool_once", lambda **_: asyncio.sleep(0, result=SimpleNamespace(
       isError=True,
       structuredContent=None,
       content=[SimpleNamespace(text="untyped broker_session_expired note")],
-    ))
+    )))
     result, error = await manager.call_tool(
       "tool", {}, gateway_session=_gateway_session()
     )
     assert result is None
+    assert error is not None
     assert error["code"] == "mcp_tool_error"
     assert resolves == [False]
 
   asyncio.run(scenario())
 
 
-def test_broker_session_expiry_never_replays_mutation_but_replaces_child():
+def test_broker_session_expiry_never_replays_mutation_but_replaces_child(monkeypatch):
   async def scenario():
     manager = _manager("gsheets_append_rows")
     first = _PerUserServerState(_child("first"), time.time() + 3600, time.time())
@@ -1054,13 +1190,14 @@ def test_broker_session_expiry_never_replays_mutation_but_replaces_child():
         retry_automatic=True,
       )
 
-    manager._get_per_user_server = resolve
-    manager._call_tool_once = invoke
+    monkeypatch.setattr(manager, "_get_per_user_server", resolve)
+    monkeypatch.setattr(manager, "_call_tool_once", invoke)
     result, error = await manager.call_tool(
       "tool", {"values": [[1]]}, gateway_session=_gateway_session()
     )
 
     assert result is None
+    assert error is not None
     assert error["sub_code"] == "broker_session_expired"
     assert dispatches == ["first"]
     assert resolves == [("7", False, False), ("7", True, True)]
@@ -1068,12 +1205,12 @@ def test_broker_session_expiry_never_replays_mutation_but_replaces_child():
   asyncio.run(scenario())
 
 
-def test_broker_session_expiry_read_requires_every_automatic_retry_marker():
+def test_broker_session_expiry_read_requires_every_automatic_retry_marker(monkeypatch):
   async def scenario():
-    for overrides in (
-      {"retry_safe": False},
-      {"retry_automatic": False},
-      {"outcome_state": "unchanged"},
+    for expired_result in (
+      _sheets_error_result(retry_safe=False),
+      _sheets_error_result(retry_automatic=False),
+      _sheets_error_result(outcome_state="unchanged"),
     ):
       manager = _manager("gsheets_read_range")
       first = _PerUserServerState(_child("first"), time.time() + 3600, time.time())
@@ -1088,15 +1225,16 @@ def test_broker_session_expiry_read_requires_every_automatic_retry_marker():
 
       async def invoke(**kwargs):
         dispatches.append(kwargs["server"].name)
-        return _sheets_error_result(**overrides)
+        return expired_result
 
-      manager._get_per_user_server = resolve
-      manager._call_tool_once = invoke
+      monkeypatch.setattr(manager, "_get_per_user_server", resolve)
+      monkeypatch.setattr(manager, "_call_tool_once", invoke)
       result, error = await manager.call_tool(
         "tool", {}, gateway_session=_gateway_session()
       )
 
       assert result is None
+      assert error is not None
       assert error["sub_code"] == "broker_session_expired"
       assert dispatches == ["first"]
       assert replacements == [True]
@@ -1104,7 +1242,7 @@ def test_broker_session_expiry_read_requires_every_automatic_retry_marker():
   asyncio.run(scenario())
 
 
-def test_structured_sheets_error_details_are_preserved_verbatim():
+def test_structured_sheets_error_details_are_preserved_verbatim(monkeypatch):
   async def scenario():
     manager = _manager("gsheets_copy_spreadsheet")
     state = _PerUserServerState(_child("first"), time.time() + 3600, time.time())
@@ -1119,8 +1257,8 @@ def test_structured_sheets_error_details_are_preserved_verbatim():
       del force, discard_current_on_failure
       return state
 
-    manager._get_per_user_server = resolve
-    manager._call_tool_once = lambda **_: asyncio.sleep(
+    monkeypatch.setattr(manager, "_get_per_user_server", resolve)
+    monkeypatch.setattr(manager, "_call_tool_once", lambda **_: asyncio.sleep(
       0,
       result=_sheets_error_result(
         operation="gsheets_copy_spreadsheet",
@@ -1131,13 +1269,14 @@ def test_structured_sheets_error_details_are_preserved_verbatim():
         retry_automatic=False,
         recovery=recovery,
       ),
-    )
+    ))
 
     result, error = await manager.call_tool(
       "tool", {}, gateway_session=_gateway_session()
     )
 
     assert result is None
+    assert error is not None
     assert error["sub_code"] == "copy_partial"
     assert error["data"]["operation"] == "gsheets_copy_spreadsheet"
     assert error["data"]["error"]["outcome"]["state"] == "partial"
@@ -1146,7 +1285,7 @@ def test_structured_sheets_error_details_are_preserved_verbatim():
   asyncio.run(scenario())
 
 
-def test_structured_sheets_error_requires_matching_operation():
+def test_structured_sheets_error_requires_matching_operation(monkeypatch):
   async def scenario():
     manager = _manager("gsheets_read_range")
     state = _PerUserServerState(_child("first"), time.time() + 3600, time.time())
@@ -1156,17 +1295,18 @@ def test_structured_sheets_error_requires_matching_operation():
       resolves.append((force, discard_current_on_failure))
       return state
 
-    manager._get_per_user_server = resolve
-    manager._call_tool_once = lambda **_: asyncio.sleep(
+    monkeypatch.setattr(manager, "_get_per_user_server", resolve)
+    monkeypatch.setattr(manager, "_call_tool_once", lambda **_: asyncio.sleep(
       0,
       result=_sheets_error_result(operation="gsheets_write_range"),
-    )
+    ))
 
     result, error = await manager.call_tool(
       "tool", {}, gateway_session=_gateway_session()
     )
 
     assert result is None
+    assert error is not None
     assert error["sub_code"] == "invalid_sheets_error_contract"
     assert error["data"]["operation"] == "gsheets_read_range"
     assert resolves == [(False, False)]
@@ -1174,25 +1314,29 @@ def test_structured_sheets_error_requires_matching_operation():
   asyncio.run(scenario())
 
 
-def test_structured_sheets_error_requires_complete_contract_shape():
+def test_structured_sheets_error_requires_complete_contract_shape(monkeypatch):
   async def scenario():
     manager = _manager("gsheets_read_range")
     state = _PerUserServerState(_child("first"), time.time() + 3600, time.time())
     malformed = _sheets_error_result()
-    del malformed.structuredContent["error"]["recovery"]
+    assert isinstance(malformed.structuredContent, dict)
+    malformed_error = malformed.structuredContent["error"]
+    assert isinstance(malformed_error, dict)
+    del malformed_error["recovery"]
 
     async def resolve(_server, _user, force=False, discard_current_on_failure=False):
       del force, discard_current_on_failure
       return state
 
-    manager._get_per_user_server = resolve
-    manager._call_tool_once = lambda **_: asyncio.sleep(0, result=malformed)
+    monkeypatch.setattr(manager, "_get_per_user_server", resolve)
+    monkeypatch.setattr(manager, "_call_tool_once", lambda **_: asyncio.sleep(0, result=malformed))
 
     result, error = await manager.call_tool(
       "tool", {}, gateway_session=_gateway_session()
     )
 
     assert result is None
+    assert error is not None
     assert error["sub_code"] == "invalid_sheets_error_contract"
     assert error["data"]["error"]["retry"]["automatic"] is False
 

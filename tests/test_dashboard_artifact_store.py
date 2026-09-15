@@ -159,6 +159,35 @@ def test_dashboard_artifact_store_lists_newest_first_with_filters(tmp_path: Path
   ]
 
 
+def test_dashboard_artifact_store_list_skips_corrupt_sidecar_visibly(
+  tmp_path: Path,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  workspace = tmp_path / "users" / "alice" / "workspace"
+  for artifact_id in ("good", "bad"):
+    write_dashboard_artifact(
+      workspace_dir=workspace,
+      artifact=_artifact(artifact_id, ticker="PCTY"),
+      payload_json=_payload(artifact_id),
+    )
+  (workspace / "artifacts" / "_dashboards" / "bad.json").write_text("{corrupt", encoding="utf-8")
+
+  with caplog.at_level(logging.WARNING, logger="agent_gateway.artifact_sidecar_index"):
+    listed = list_dashboard_artifacts(workspace)
+
+  assert [artifact.artifact_id for artifact in listed] == ["good"]
+  assert any(record.message == "artifact_sidecar_unreadable" for record in caplog.records)
+  row = get_artifact_sidecar_index_row(
+    workspace_dir=workspace,
+    artifact_kind="dashboard",
+    artifact_id="bad",
+    user_id="alice",
+  )
+  assert row is not None
+  assert row["stale_ts"] is not None
+  assert row["last_error"] == "corrupt_sidecar"
+
+
 def test_dashboard_artifact_store_rejects_unsafe_artifact_ids_before_writing(tmp_path: Path) -> None:
   artifact = _artifact("../escape", ticker="PCTY")
 

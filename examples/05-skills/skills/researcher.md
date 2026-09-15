@@ -1,6 +1,5 @@
 ---
 name: researcher
-model: claude-sonnet-4-6
 max_turns: 6
 timeout: 180
 ---

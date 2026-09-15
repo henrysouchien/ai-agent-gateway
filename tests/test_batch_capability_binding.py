@@ -425,7 +425,7 @@ def test_dispatch_threads_one_pre_materialized_execution_into_task(
         await release.wait()
         registry.status = "completed"
 
-      async def admit_in_process_runtime_authority(
+      async def open_captured_run_context(
         self,
         **kwargs: Any,
       ) -> object:
@@ -477,9 +477,15 @@ def test_dispatch_threads_one_pre_materialized_execution_into_task(
         "batch-capability-test-key-at-least-32-bytes"
       ),
       autonomous_storage_root=tmp_path,
+      gateway_skill_application=object(),
     )
     controller = _Controller()
     monkeypatch.setattr(batches, "_controller", lambda: controller)
+    monkeypatch.setattr(
+      batches,
+      "_captured_run_opener",
+      lambda: controller.open_captured_run_context,
+    )
     monkeypatch.setattr(
       batches,
       "_registry_for_user",
@@ -512,7 +518,7 @@ def test_dispatch_threads_one_pre_materialized_execution_into_task(
     assert execution.bind.registry_revision == resolver.registry.revision
     assert execution.bind.policy_revision == resolver.selection_policy.revision
     assert materialized_handles == [service_handle]
-    admission = await captured["captured_run_admission_factory"](
+    admission = await captured["captured_run_context_factory"](
       task_id="agent-1",
       session_driver_execution=execution,
     )

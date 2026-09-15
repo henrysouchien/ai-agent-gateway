@@ -4,8 +4,9 @@ import hashlib
 import json
 
 import pytest
-from pydantic import JsonValue, ValidationError
+from pydantic import BaseModel, JsonValue, ValidationError
 
+from agent_workflow_contracts import models
 from agent_workflow_contracts import (
   AdmittedDataRef,
   AdmittedPlanRef,
@@ -70,6 +71,52 @@ from agent_workflow_contracts import (
 
 HEX = "a" * 64
 DIGEST = f"sha256:{HEX}"
+
+
+def test_all_exports_every_module_model() -> None:
+  """`__all__` is a literal now (pyright reads nothing else); the removed
+  derivation — every module BaseModel subclass but WireModel, then the
+  hand-owned non-model exports — is the oracle."""
+
+  module_models = [
+    name
+    for name, value in vars(models).items()
+    if isinstance(value, type)
+    and issubclass(value, BaseModel)
+    and value.__module__ == models.__name__
+    and value is not models.WireModel
+  ]
+  assert models.__all__ == module_models + [
+    "DELIVERY_PREVIEW_MAX_BYTES",
+    "DELIVERY_PREVIEW_POLICY_VERSION",
+    "DeliveryEnvelope",
+    "PUBLISHED_OUTPUT_INLINE_MAX_BYTES",
+    "SELECTED_CONTENT_UTF8_CONTRACT",
+    "WORKFLOW_CONTENT_MAX_SEQUENCE",
+    "WORKFLOW_CONTENT_PAGE_MAX_BYTES",
+    "WorkflowContentError",
+    "WorkflowContentIntegrityError",
+    "WorkflowContentNotFoundError",
+    "WorkflowContentPageAuthorization",
+    "WorkflowContentView",
+    "WorkflowDeliverySpec",
+    "RequestedDataSelector",
+    "ContextView",
+    "ContextMaterialization",
+    "CapabilityBinding",
+    "DependencyAcceptancePolicy",
+    "NonExecutionReason",
+    "TaskExecutionDisposition",
+    "LogicalTaskRef",
+    "EvidenceRef",
+    "ParentResultMaterialization",
+    "canonical_json_bytes",
+    "sha256_digest",
+    "parse_delivery_envelope",
+    "parse_workflow_delivery_spec",
+    "terminal_task_result",
+    "verified_text",
+  ]
 
 
 def contract(name: str = "report", namespace: str = "test") -> ContractRef:
@@ -173,7 +220,7 @@ def test_models_are_frozen_extra_forbid_and_round_trip() -> None:
   with pytest.raises(ValidationError):
     TaskResult.model_validate({**original.model_dump(), "unknown": True})
   with pytest.raises(ValidationError):
-    original.task_result_id = "changed"  # type: ignore[misc]
+    original.task_result_id = "changed"
 
 
 def test_contract_and_capability_bind_are_full_secret_free_identities() -> None:
@@ -194,7 +241,7 @@ def test_contract_and_capability_bind_are_full_secret_free_identities() -> None:
     policy_revision="2026-08-13.1",
     selection_source="explicit_user",
   )
-  assert CapabilityBind.from_receipt(bind.receipt()) == bind
+  assert CapabilityBind.from_json(bind.to_json()) == bind
   serialized = bind.model_dump_json().lower()
   assert "api_key" not in serialized
   assert "auth_token" not in serialized
@@ -280,29 +327,29 @@ def test_agent_result_requirement_is_terminal_message_only() -> None:
   )
   assert ResultRequirement.model_validate(requirement.model_dump()) == requirement
   with pytest.raises(ValidationError):
-    ResultRequirement(
-      mode="hybrid",
-      projection=projection,
-      terminal_narrative="required",
-      outcome=OutcomeRequirement(required=True, source="domain_tool"),
-    )
+    ResultRequirement.model_validate({
+      "mode": "hybrid",
+      "projection": projection.model_dump(mode="json"),
+      "terminal_narrative": "required",
+      "outcome": {"required": True, "source": "domain_tool"},
+    })
   with pytest.raises(ValidationError):
-    ResultRequirement(
-      mode="narrative",
-      projection=projection,
-      terminal_narrative="required",
-      outcome=OutcomeRequirement(required=False, source="none"),
-    )
+    ResultRequirement.model_validate({
+      "mode": "narrative",
+      "projection": projection.model_dump(mode="json"),
+      "terminal_narrative": "required",
+      "outcome": {"required": False, "source": "none"},
+    })
   with pytest.raises(ValidationError):
-    ResultRequirement(
-      mode="strict_projection",
-      projection=ProjectionRequirement(
-        contract=contract("projection"),
-        required=False,
-      ),
-      terminal_narrative="forbidden",
-      outcome=OutcomeRequirement(required=False, source="none"),
-    )
+    ResultRequirement.model_validate({
+      "mode": "strict_projection",
+      "projection": {
+        "contract": contract("projection").model_dump(mode="json"),
+        "required": False,
+      },
+      "terminal_narrative": "forbidden",
+      "outcome": {"required": False, "source": "none"},
+    })
 
 
 def test_non_execution_disposition_requires_canonical_unavailable_inputs() -> None:
@@ -388,6 +435,11 @@ def test_exact_parent_materialization_has_no_clipping_semantics() -> None:
   assert "clipped" not in policy_schema
   with pytest.raises(ValidationError, match="byte count"):
     TerminalNarrativeInlineExact(source=handle, content="clipped")
+  with pytest.raises(ValidationError, match="successful completion"):
+    AgentCompletionEnvelope.model_validate({
+      **envelope.model_dump(mode="json"),
+      "parent_materialization": None,
+    })
 
 
 def test_attachment_spec_requires_summary_but_inline_does_not() -> None:
@@ -557,12 +609,12 @@ def test_delivery_spec_reader_keeps_absent_version_v1_exact_and_requires_v2_vers
   with pytest.raises(ValueError, match="unsupported schema_version"):
     parse_workflow_delivery_spec({**raw_v1, "schema_version": "1.0"})
   with pytest.raises(ValidationError, match="schema_version"):
-    WorkflowDeliverySpecV2(
-      presentation="attachment",
-      primary_selector="report",
-      preview_policy_version=DELIVERY_PREVIEW_POLICY_VERSION,
-      preview_max_bytes=DELIVERY_PREVIEW_MAX_BYTES,
-    )
+    WorkflowDeliverySpecV2.model_validate({
+      "presentation": "attachment",
+      "primary_selector": "report",
+      "preview_policy_version": DELIVERY_PREVIEW_POLICY_VERSION,
+      "preview_max_bytes": DELIVERY_PREVIEW_MAX_BYTES,
+    })
 
   v2 = parse_workflow_delivery_spec({
     "schema_version": "2.0",
@@ -577,13 +629,13 @@ def test_delivery_spec_reader_keeps_absent_version_v1_exact_and_requires_v2_vers
 
 def test_v2_delivery_preview_is_a_bounded_exact_utf8_interval() -> None:
   with pytest.raises(ValidationError, match="kind|source_start_byte"):
-    DeliveryPreview(
-      text="brief",
-      source_end_byte=5,
-      source_total_bytes=5,
-      complete=True,
-      omitted_bytes=0,
-    )
+    DeliveryPreview.model_validate({
+      "text": "brief",
+      "source_end_byte": 5,
+      "source_total_bytes": 5,
+      "complete": True,
+      "omitted_bytes": 0,
+    })
   with pytest.raises(ValidationError, match="byte range"):
     DeliveryPreview(
       kind="deterministic_text_preview",

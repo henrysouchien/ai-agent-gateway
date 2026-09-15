@@ -15,6 +15,9 @@ The gateway prefers Docker when a usable Docker image is available and falls bac
 ```bash
 pip install "ai-agent-gateway[anthropic]" uvicorn
 export ANTHROPIC_API_KEY="your-anthropic-api-key"
+export USER_DATA_DIR="$PWD/.agent-data"
+mkdir -p "$USER_DATA_DIR/gateway"
+chmod 700 "$USER_DATA_DIR" "$USER_DATA_DIR/gateway"
 ```
 
 Optional: override the Docker image the backend checks for.
@@ -34,7 +37,7 @@ uvicorn agent:app --reload --port 8000
 ```bash
 SESSION_TOKEN=$(curl -s http://127.0.0.1:8000/api/chat/init \
   -H 'Content-Type: application/json' \
-  -d '{"api_key":"demo-key"}' \
+  -d '{"api_key":"demo-key","user_id":"demo-user"}' \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_token"])')
 ```
 
@@ -43,6 +46,7 @@ curl -N http://127.0.0.1:8000/api/chat \
   -H "Authorization: Bearer $SESSION_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
+    "user_id": "demo-user",
     "messages": [
       {
         "role": "user",

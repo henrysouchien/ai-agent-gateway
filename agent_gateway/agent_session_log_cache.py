@@ -63,7 +63,9 @@ class ActiveFileOffsetCache:
     current_identity: ActiveFileIdentity | None,
     file_size: int,
   ) -> None:
-    if active_identity is None or current_identity != active_identity or current_identity[2] != file_size:
+    if active_identity is None or current_identity is None:
+      return
+    if current_identity != active_identity or current_identity[2] != file_size:
       return
     with self._lock:
       self._refresh_locked(active_identity)

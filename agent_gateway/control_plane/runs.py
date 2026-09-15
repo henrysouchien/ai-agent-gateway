@@ -3,36 +3,19 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request, Response
 
+from agent_gateway.approval_route import bind_session_approval_route
 from agent_gateway.approvals import ApprovalActionError, _record_vote_and_unblock
-from agent_gateway.autonomous_runner import AutonomousRegistry
+from agent_gateway.autonomous_runner import AutonomousRegistry, AutonomousTask
 from agent_gateway.control_run_lifecycle import is_control_run_active_state
 from agent_gateway.session import AuthManager
+from agent_gateway.named_refusal import NamedRefusal
+
 
 from .runs_helpers import (  # noqa: F401
-  ChatRunState,
-  AutonomousRunState,
-  _CONTROL_CHAT_TASK_PREFIX,
-  _AUTONOMOUS_RESUME_EVENT_TAIL,
-  _AUTONOMOUS_RESUME_EVENT_BLOCK_MAX_CHARS,
-  _AUTONOMOUS_RESUME_LOG_TAIL,
-  _AUTONOMOUS_RESUME_LOG_BLOCK_MAX_CHARS,
-  _AUTONOMOUS_RESUME_OPERATOR_MESSAGE_TAIL,
-  _AUTONOMOUS_RESUME_TOOL_RESULT_TAIL,
-  _AUTONOMOUS_RESUME_TOOL_RESULT_BLOCK_MAX_CHARS,
-  _AUTONOMOUS_RESUME_TOOL_RESULT_DICT_HEAD_ITEMS,
-  _AUTONOMOUS_RESUME_TOOL_RESULT_DICT_TAIL_ITEMS,
-  _AUTONOMOUS_RESUME_TOOL_RESULT_STRING_MAX_CHARS,
-  _AUTONOMOUS_RESUME_TOOL_RESULT_LIST_MAX_ITEMS,
-  _AUTONOMOUS_RESUME_TOOL_RESULT_VALUE_MAX_CHARS,
-  _AUTONOMOUS_RESUME_CONTEXT_MAX_CHARS,
-  _AUTONOMOUS_RESUME_OPERATOR_BLOCK_MAX_CHARS,
-  _AUTONOMOUS_RESUME_ORIGINAL_CONTEXT_BLOCK_MAX_CHARS,
-  VerdictSummaryResponse,
-  PendingApprovalResponse,
   ChatRunResponse,
   AutonomousRunResponse,
   DispatchScope,
@@ -51,34 +34,19 @@ from .runs_helpers import (  # noqa: F401
   AutonomousResumeRequest,
   RunMessageRequest,
   RunEnvelopeResponse,
-  _iso_from_unix,
   _require_bearer_session,
-  _state_from_session,
-  _ended_at_from_events,
-  _skill_run_ids,
-  _current_verdict,
-  _coerce_cost_usd,
-  _usage_cost_usd,
-  _events_cost_usd,
-  _verdict_summary_from_skill_result,
   _autonomous_state,
-  _pending_approval,
   _chat_run_from_session,
   _chat_session_has_run_activity,
-  _autonomous_events,
-  _autonomous_has_pending_approval,
-  _autonomous_pending_approval_events,
-  _autonomous_pending_entry_from_event,
   _deny_autonomous_pending_approvals_for_cancel,
   _autonomous_task_resumable,
-  _autonomous_task_messageable,
   _autonomous_run_from_task,
   _chat_session_for_user,
+  _message_delivery_target,
   _require_autonomous_registry,
   _autonomous_task_for_user,
   _record_owner_user_id,
   _render_log_line,
-  _session_has_cancel_event,
   _session_matches_owner,
   _session_owner_user_id,
   _normalize_channel,
@@ -87,39 +55,19 @@ from .runs_helpers import (  # noqa: F401
   _require_autonomous_channel,
 )
 from .runs_resume_helpers import (  # noqa: F401
-  _clip_resume_text,
-  _clip_resume_value_text,
-  _tail_text_lines,
-  _operator_message_tail,
-  _file_tail_lines,
-  _resume_json_key,
-  _resume_json_value,
-  _resume_json_text,
-  _completed_tool_result_tail,
-  _bounded_tool_summary,
-  _minimal_tool_summary,
-  _render_completed_tool_result_tail,
-  _render_json_newest_first_tail,
-  _resume_section,
-  _resume_joined_len,
   _build_autonomous_resume_context,
 )
-from .runs_chat_helpers import (  # noqa: F401
+from .runs_chat_helpers import (
   _require_control_session,
   _require_chat_session_for_run,
-  _transcript_dir_from_app_state,
   _run_state_event,
-  _event_for_run,
   _latest_user_message_content,
   _control_message_id,
   _has_parent_message_event,
-  _maybe_call_on_event,
   _publish_control_event,
   _cleanup_run_buffer,
-  _record_chat_parent_message_event,
   _cancel_control_chat_background_tasks,
   cleanup_control_chat_tasks,
-  _finalize_control_chat_task,
   _dispatch_control_chat_turn,
 )
 
@@ -128,8 +76,25 @@ def build_runs_router(
   auth: AuthManager,
   autonomous_registry: AutonomousRegistry | None = None,
   dispatch_scope_validator: Any | None = None,
+  control_profile_loader: Callable[[str], Any] | None = None,
 ) -> APIRouter:
   router = APIRouter(prefix="/runs")
+
+  def _require_autonomous_profile(profile_name: str) -> None:
+    if control_profile_loader is None:
+      return
+    try:
+      profile = control_profile_loader(profile_name)
+    except Exception as exc:
+      raise HTTPException(
+        status_code=422,
+        detail=f"Unknown autonomous profile: {profile_name}",
+      ) from exc
+    if not profile.supports_autonomous_execution:
+      raise HTTPException(
+        status_code=422,
+        detail=f"Profile {profile_name!r} is interactive-only",
+      )
 
   def _dispatch_scope_payload(scope: DispatchScope | None) -> dict[str, Any] | None:
     if scope is None:
@@ -246,8 +211,11 @@ def build_runs_router(
       chat_session.identity_status = getattr(authenticated, "identity_status", None)
       chat_session.channel = channel
       chat_session.is_public = channel == "public"
-      chat_session.approval_store = getattr(request.app.state, "gateway_approval_store", None)
-      chat_session.approval_policy = getattr(request.app.state, "gateway_approval_policy", None)
+      bind_session_approval_route(
+        chat_session,
+        getattr(request.app.state, "gateway_approval_store", None),
+        getattr(request.app.state, "gateway_approval_policy", None),
+      )
       chat_session.max_budget_usd = payload.max_budget_usd
       chat_session.initial_message = payload.message
       chat_session.stage_skill_route = (
@@ -288,6 +256,7 @@ def build_runs_router(
     channel = session_channel or requested_channel
     if not payload.profile or not payload.mode:
       raise HTTPException(status_code=422, detail="profile and mode are required")
+    _require_autonomous_profile(payload.profile)
 
     registry = _require_autonomous_registry(autonomous_registry)
     registry.set_user_event_bus(getattr(request.app.state, "user_event_bus", None))
@@ -298,8 +267,10 @@ def build_runs_router(
         mode=payload.mode,
         task=payload.task,
         skill=payload.skill,
+        pack=payload.pack,
         context=payload.context,
         ticker=payload.ticker,
+        research_file_id=payload.research_file_id,
         max_budget_usd=payload.max_budget_usd,
         channel=channel,
         user_id=authenticated.user_id,
@@ -313,10 +284,10 @@ def build_runs_router(
       )
     except ValueError as exc:
       raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except NamedRefusal as exc:
+      raise HTTPException(status_code=exc.http_status, detail=str(exc)) from exc
     except RuntimeError as exc:
-      detail = str(exc)
-      status_code = 429 if "concurrency limit" in detail.lower() else 409
-      raise HTTPException(status_code=status_code, detail=detail) from exc
+      raise HTTPException(status_code=500, detail=str(exc)) from exc
     record = _autonomous_task_for_user(registry, str(start_payload["task_id"]), owner_user_id)
     run = _autonomous_run_from_task(record)
     return AutonomousDispatchResponse(
@@ -336,45 +307,53 @@ def build_runs_router(
   ) -> RunEnvelopeResponse:
     authenticated = _require_bearer_session(request, auth)
     owner_user_id = _session_owner_user_id(authenticated)
-    target_session = auth.session_store.get_session(control_run_id)
-    if target_session is None:
-      if autonomous_registry is not None:
-        try:
-          record = _autonomous_task_for_user(autonomous_registry, control_run_id, owner_user_id)
-        except HTTPException as exc:
-          if exc.status_code != 404:
-            raise
-        else:
-          _require_control_session(authenticated)
-          if not isinstance(payload, AutonomousRunMessageRequest):
-            raise HTTPException(status_code=422, detail="Autonomous runs require message")
+    delivery_target = _message_delivery_target(
+      auth,
+      autonomous_registry,
+      control_run_id,
+      owner_user_id,
+    )
+    if isinstance(delivery_target, AutonomousTask):
+      _require_control_session(authenticated)
+      if not isinstance(payload, AutonomousRunMessageRequest):
+        raise HTTPException(status_code=422, detail="Autonomous runs require message")
+      if (
+        not is_control_run_active_state(
+          _autonomous_state(delivery_target.state)
+        )
+        and not _autonomous_task_resumable(delivery_target)
+      ):
+        raise HTTPException(
+          status_code=409,
+          detail="Run does not accept additional messages",
+        )
 
-          autonomous_registry.set_user_event_bus(getattr(request.app.state, "user_event_bus", None))
-          try:
-            delivery = await autonomous_registry.send_operator_message(
-              control_run_id,
-              user_id=owner_user_id,
-              channel=authenticated.channel,
-              message=payload.message,
-              message_id=payload.message_id,
-            )
-          except PermissionError as exc:
-            raise HTTPException(status_code=404, detail="Run not found") from exc
-          except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-          except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+      assert autonomous_registry is not None
+      autonomous_registry.set_user_event_bus(getattr(request.app.state, "user_event_bus", None))
+      try:
+        delivery = await autonomous_registry.send_operator_message(
+          control_run_id,
+          user_id=owner_user_id,
+          channel=authenticated.channel,
+          message=payload.message,
+          message_id=payload.message_id,
+        )
+      except PermissionError as exc:
+        raise HTTPException(status_code=404, detail="Run not found") from exc
+      except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+      except NamedRefusal as exc:
+        raise HTTPException(status_code=exc.http_status, detail=str(exc)) from exc
+      except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-          return RunEnvelopeResponse(
-            run=_autonomous_run_from_task(record),
-            message_id=str(delivery.get("message_id") or ""),
-            delivery_status=delivery.get("delivery_status"),  # type: ignore[arg-type]
-          )
-      raise HTTPException(status_code=404, detail="Run not found")
-    if target_session.kind != "chat":
-      raise HTTPException(status_code=409, detail="Run does not accept additional messages")
-    if not _chat_session_has_run_activity(target_session):
-      raise HTTPException(status_code=404, detail="Run not found")
+      return RunEnvelopeResponse(
+        run=_autonomous_run_from_task(delivery_target),
+        message_id=str(delivery.get("message_id") or ""),
+        delivery_status=delivery.get("delivery_status"),
+      )
+
+    target_session = delivery_target
     _require_chat_session_for_run(authenticated, target_session)
     if not isinstance(payload, ChatContinuationRequest):
       raise HTTPException(status_code=422, detail="Chat runs require messages")
@@ -382,12 +361,6 @@ def build_runs_router(
     context = dict(payload.context or {})
     if target_session.channel is not None:
       context["channel"] = target_session.channel
-    stage_skill_route = getattr(target_session, "stage_skill_route", None)
-    if isinstance(stage_skill_route, dict):
-      skill_name = str(stage_skill_route.get("skill_name") or "").strip()
-      if skill_name:
-        context["skill"] = skill_name
-        context["stage_skill_route"] = dict(stage_skill_route)
     dispatch_scope = getattr(target_session, "dispatch_scope", None)
     if isinstance(dispatch_scope, dict):
       context["dispatch_scope"] = dict(dispatch_scope)
@@ -447,6 +420,7 @@ def build_runs_router(
 
       resume_payload = payload or AutonomousResumeRequest()
       resume_context = _build_autonomous_resume_context(record, resume_payload)
+      _require_autonomous_profile(record.profile)
       try:
         start_payload = await registry.start(
           # Resume follows current authority in both promotion and revocation directions.
@@ -457,6 +431,7 @@ def build_runs_router(
           skill=record.skill,
           context=resume_context,
           ticker=record.ticker,
+          research_file_id=record.research_file_id,
           max_budget_usd=getattr(record, "max_budget_usd", None),
           channel=record.channel,
           user_id=getattr(record, "raw_user_id", None) or authenticated.user_id,
@@ -471,8 +446,10 @@ def build_runs_router(
         )
       except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+      except NamedRefusal as exc:
+        raise HTTPException(status_code=exc.http_status, detail=str(exc)) from exc
       except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
       resumed_record = _autonomous_task_for_user(registry, str(start_payload["task_id"]), owner_user_id)
       record.resumed_as.append(resumed_record.control_run_id)

@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any, Callable, Iterable, Mapping
 
 from agent_workflow_contracts import (
+  AdmittedToolRoute,
   AgentOperationSnapshot,
   ExecutionIdentity,
   OperationUnavailable,
@@ -20,6 +21,7 @@ from agent_workflow_contracts import (
   ToolGrantEntry,
   sha256_digest,
 )
+from agent_workflow_contracts.models import CatalogToolEffect
 
 from .capability_resolution import (
   OperationDeclaration,
@@ -30,9 +32,6 @@ from .policy_imports import (
   load_server_policy_module,
   resolve_server_policy_tool_class,
 )
-from .semantic_capability_routing import capability_for_tool
-from .semantic_capabilities import SemanticToolRoute
-from .tool_dispatch_declarations import canonical_dispatch_tool_name
 
 
 ADMITTED_TASK_METADATA_KEY = "admitted_task"
@@ -42,7 +41,10 @@ class OperationToolAdmissionError(ValueError):
   """The live runtime cannot bind an operation's semantic requirements."""
 
 
-ToolEffectResolver = Callable[[str, str | None, bool], str | None]
+ToolEffectResolver = Callable[
+  [str, str | None, bool],
+  CatalogToolEffect | None,
+]
 
 
 def _tool_grant(
@@ -61,7 +63,7 @@ def _tool_grant(
   )
 
 
-def _normalized_effect(raw: str | None) -> str | None:
+def _normalized_effect(raw: object) -> CatalogToolEffect | None:
   value = str(raw or "").strip().lower()
   if value in {"read", "pure_transform", "read_only", "support"}:
     return "read"
@@ -78,7 +80,7 @@ def _server_owned_effect(
   tool_id: str,
   server_id: str | None,
   is_local: bool,
-) -> str | None:
+) -> CatalogToolEffect | None:
   if is_local:
     policy = load_server_policy_module()
     get_local_effect = (
@@ -94,77 +96,6 @@ def _server_owned_effect(
       default="",
     )
   return _normalized_effect(raw)
-
-
-def _tool_route_facts(
-  *,
-  operation_tool_ids: frozenset[str],
-  definitions: Iterable[Mapping[str, Any]],
-  local_tool_handlers: Mapping[str, Any],
-  mcp_client: Any,
-  effect_resolver: ToolEffectResolver,
-) -> tuple[SemanticToolRoute, ...]:
-  is_mcp_tool = getattr(mcp_client, "is_mcp_tool", None)
-  get_server = getattr(mcp_client, "get_server_for_tool", None)
-  get_original = getattr(mcp_client, "get_original_tool_name", None)
-  routes: dict[str, SemanticToolRoute] = {}
-  for definition in definitions:
-    tool_id = str(definition.get("name") or "").strip()
-    if (
-      not tool_id
-      or tool_id not in operation_tool_ids
-    ):
-      continue
-    is_local = tool_id in local_tool_handlers
-    is_mcp = bool(callable(is_mcp_tool) and is_mcp_tool(tool_id))
-    if is_local == is_mcp:
-      # Ambiguous or unroutable definitions cannot become authority.
-      continue
-    server_id = (
-      str(get_server(tool_id) or "").strip()
-      if is_mcp and callable(get_server)
-      else None
-    )
-    if is_mcp and not server_id:
-      continue
-    policy_tool_id = (
-      str(get_original(tool_id) or tool_id).strip()
-      if is_mcp and callable(get_original)
-      else tool_id
-    )
-    effect = effect_resolver(policy_tool_id, server_id, is_local)
-    if effect is None:
-      continue
-    routes[tool_id] = SemanticToolRoute(
-      tool_id=tool_id,
-      effect=effect,
-      server_id=server_id,
-      capability=capability_for_tool(
-        canonical_name=canonical_dispatch_tool_name(policy_tool_id),
-        server_id=server_id,
-        effect=effect,
-      ),
-    )
-  return tuple(routes[name] for name in sorted(routes))
-
-
-def semantic_tool_routes(
-  tool_ids: Iterable[str],
-  *,
-  local_tool_handlers: Mapping[str, Any],
-  mcp_client: Any,
-  effect_resolver: ToolEffectResolver | None = None,
-) -> tuple[SemanticToolRoute, ...]:
-  """Prove exact private tool IDs against trusted live routing facts."""
-
-  names = frozenset(tool_ids)
-  return _tool_route_facts(
-    operation_tool_ids=names,
-    definitions=({"name": name} for name in sorted(names)),
-    local_tool_handlers=local_tool_handlers,
-    mcp_client=mcp_client,
-    effect_resolver=effect_resolver or _server_owned_effect,
-  )
 
 
 def admit_operation_tools(
@@ -244,39 +175,36 @@ def reissue_tool_grant(grant: ToolGrant, *, grant_id: str) -> ToolGrant:
   return _tool_grant(grant_id=grant_id, entries=validated.tools)
 
 
-def scopes_from_tool_grant(
+def dispatcher_scopes_from_admitted_routes(
   grant: ToolGrant,
-  *,
-  local_tool_handlers: Mapping[str, Any],
-  mcp_client: Any,
-) -> tuple[frozenset[str], dict[str, set[str]]]:
-  """Resolve dispatcher scopes from an already-admitted exact grant."""
+  routes: tuple[AdmittedToolRoute, ...],
+) -> tuple[frozenset[str], frozenset[str], dict[str, set[str]]]:
+  """Project dispatcher scopes from persisted authority without live reads."""
 
   grant = parse_tool_grant(grant)
-  is_mcp_tool = getattr(mcp_client, "is_mcp_tool", None)
-  get_server = getattr(mcp_client, "get_server_for_tool", None)
+  granted_tool_ids = tuple(entry.tool_id for entry in grant.tools)
+  route_tool_ids = tuple(route.tool_id for route in routes)
+  if route_tool_ids != granted_tool_ids:
+    raise OperationToolAdmissionError(
+      "admitted tool routes do not match the exact ordered ToolGrant"
+    )
+  local_tool_ids = frozenset(
+    route.tool_id for route in routes if route.origin == "local"
+  )
   mcp_scope: dict[str, set[str]] = {}
-  for entry in grant.tools:
-    if entry.tool_id in local_tool_handlers:
+  for route in routes:
+    if route.origin != "mcp":
       continue
-    if not callable(is_mcp_tool) or not is_mcp_tool(entry.tool_id):
-      raise OperationToolAdmissionError(
-        f"admitted tool {entry.tool_id!r} is no longer live"
-      )
-    server = str(get_server(entry.tool_id) or "").strip() if callable(get_server) else ""
-    if not server:
-      raise OperationToolAdmissionError(
-        f"admitted tool {entry.tool_id!r} has no live server route"
-      )
-    mcp_scope.setdefault(server, set()).add(entry.tool_id)
-  return frozenset(entry.tool_id for entry in grant.tools), mcp_scope
+    assert route.server_id is not None
+    mcp_scope.setdefault(route.server_id, set()).add(route.tool_id)
+  return frozenset(granted_tool_ids), local_tool_ids, mcp_scope
 
 
 __all__ = [
   "ADMITTED_TASK_METADATA_KEY",
   "OperationToolAdmissionError",
   "admit_operation_tools",
+  "dispatcher_scopes_from_admitted_routes",
   "parse_tool_grant",
   "reissue_tool_grant",
-  "scopes_from_tool_grant",
 ]

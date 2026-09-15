@@ -5,6 +5,7 @@ from typing import Annotated, Any, Literal, Union
 from fastapi import Body
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from agent_workflow_contracts.research_file_contract import is_research_file_id
 from agent_gateway.control_run_lifecycle import ControlRunState
 from agent_gateway.thinking import parse_effort
 
@@ -172,6 +173,14 @@ class AutonomousTerminalReceipt(BaseModel):
       )
     return self
 
+class AutonomousRunRecordPaths(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  task_manifest: str | None = None
+  log: str | None = None
+  events: str | None = None
+  tool_result_spill: str | None = None
+
 
 class DispatchScope(BaseModel):
   """Redacted, browser-safe structured scope for control-plane dispatches."""
@@ -255,6 +264,7 @@ class AutonomousRunResponse(BaseModel):
   exit_code: int | None = None
   error: str | None = None
   terminal_receipt: AutonomousTerminalReceipt | None = None
+  record_paths: AutonomousRunRecordPaths | None = None
   messageable: bool = False
   started_at: str
   ended_at: str | None
@@ -327,12 +337,14 @@ class AutonomousDispatchRequest(BaseModel):
 
   kind: Literal["autonomous"]
   profile: str | None = None
-  mode: Literal["once", "task", "skill"] | None = None
+  mode: Literal["once", "task", "skill", "pack"] | None = None
   skill: str | None = None
   task: str | None = None
+  pack: str | None = None
   ticker: str | None = None
   context: str | None = None
   channel: str | None = None
+  research_file_id: int | None = Field(default=None, ge=1)
   max_budget_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False)
   dispatch_scope: DispatchScope | None = None
 
@@ -345,28 +357,46 @@ class AutonomousDispatchRequest(BaseModel):
       raise ValueError("max_budget_usd must be a finite positive number")
     return value
 
+  @field_validator("research_file_id", mode="before")
+  @classmethod
+  def _reject_coerced_research_file_id(cls, value: Any) -> Any:
+    if value is None:
+      return None
+    if not is_research_file_id(value):
+      raise ValueError("research_file_id must be a positive integer")
+    return value
+
   @model_validator(mode="after")
   def _require_exclusive_mode_payload(self) -> "AutonomousDispatchRequest":
     if self.mode is None:
       return self
     skill = (self.skill or "").strip()
     task = (self.task or "").strip()
+    pack = (self.pack or "").strip()
     ticker = (self.ticker or "").strip()
     context = (self.context or "").strip()
     if self.mode == "once":
-      if skill or task or ticker or context:
-        raise ValueError("mode='once' does not accept skill, task, ticker, or context")
+      if skill or task or pack or ticker or context:
+        raise ValueError("mode='once' does not accept skill, task, pack, ticker, or context")
+      if self.research_file_id is not None:
+        raise ValueError("mode='once' does not accept research_file_id")
       return self
     if self.mode == "task":
       if not task:
         raise ValueError("mode='task' requires task")
-      if skill:
-        raise ValueError("mode='task' does not accept skill")
+      if skill or pack:
+        raise ValueError("mode='task' does not accept skill or pack")
+      return self
+    if self.mode == "pack":
+      if not pack:
+        raise ValueError("mode='pack' requires pack")
+      if skill or task or ticker or context:
+        raise ValueError("mode='pack' does not accept skill, task, ticker, or context")
       return self
     if not skill:
       raise ValueError("mode='skill' requires skill")
-    if task:
-      raise ValueError("mode='skill' does not accept task")
+    if task or pack:
+      raise ValueError("mode='skill' does not accept task or pack")
     return self
 
 
@@ -464,6 +494,7 @@ __all__ = [
   "AutonomousResumeRequest",
   "AutonomousResultReference",
   "AutonomousRunMessageRequest",
+  "AutonomousRunRecordPaths",
   "AutonomousRunResponse",
   "AutonomousRunState",
   "AutonomousTerminalReceipt",

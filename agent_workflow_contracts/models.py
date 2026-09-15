@@ -11,7 +11,7 @@ import hashlib
 import json
 import math
 import re
-from typing import Annotated, Any, Literal, Mapping, TypeAlias
+from typing import Annotated, Any, Literal, Mapping, Protocol, TypeAlias, cast
 
 from pydantic import (
   BaseModel,
@@ -196,12 +196,12 @@ class CapabilityBind(WireModel):
   def _canonical_bind_text(cls, value: str) -> str:
     return value.strip()
 
-  def receipt(self) -> dict[str, str]:
+  def to_json(self) -> dict[str, str]:
     return self.model_dump(mode="json")
 
   @classmethod
-  def from_receipt(cls, receipt: object) -> CapabilityBind:
-    return cls.model_validate(receipt)
+  def from_json(cls, value: object) -> CapabilityBind:
+    return cls.model_validate(value)
 
 
 class ContentHandle(WireModel):
@@ -438,10 +438,18 @@ CapabilityBinding: TypeAlias = Annotated[
 ]
 
 
+CatalogToolEffect: TypeAlias = Literal[
+  "read",
+  "propose",
+  "write",
+  "external_effect",
+]
+
+
 class ToolGrantEntry(WireModel):
   tool_id: OpaqueId
   route_id: OpaqueId
-  effect: Literal["read", "propose", "write", "external_effect"]
+  effect: CatalogToolEffect
 
 
 class ToolGrant(WireModel):
@@ -455,6 +463,22 @@ class ToolGrant(WireModel):
     ids = [tool.tool_id for tool in self.tools]
     if len(ids) != len(set(ids)):
       raise ValueError("tool grant cannot contain duplicate tool IDs")
+    return self
+
+
+class AdmittedToolRoute(WireModel):
+  """The exact physical route retained with one admitted tool grant."""
+
+  tool_id: OpaqueId
+  origin: Literal["local", "mcp"]
+  server_id: OpaqueId | None
+
+  @model_validator(mode="after")
+  def _server_matches_origin(self) -> AdmittedToolRoute:
+    if self.origin == "local" and self.server_id is not None:
+      raise ValueError("local admitted tool routes cannot name an MCP server")
+    if self.origin == "mcp" and self.server_id is None:
+      raise ValueError("MCP admitted tool routes require a server ID")
     return self
 
 
@@ -520,12 +544,41 @@ class CatalogToolEntry(WireModel):
   kind: Literal["catalog_tool"] = "catalog_tool"
   tool_id: OpaqueId
   canonical_name: OpaqueId
-  effect: Literal["read", "propose", "write", "external_effect"] | None = None
+  effect: CatalogToolEffect | None = None
+  origin: Literal["local", "mcp"] | None = Field(
+    default=None,
+    exclude_if=lambda value: value is None,
+  )
   server_id: OpaqueId | None = None
   capability: OpaqueId | None = None
   idempotent: bool | None = None
   success_signal: dict[str, JsonValue] | None = None
   source_identity: dict[str, JsonValue] | None = None
+
+  @model_validator(mode="after")
+  def _route_origin_matches_server(self) -> CatalogToolEntry:
+    if self.origin is None:
+      if self.server_id is not None:
+        raise ValueError("unrouted catalog entries cannot name an MCP server")
+    elif self.origin == "local":
+      if self.server_id is not None:
+        raise ValueError("local catalog routes cannot name an MCP server")
+    elif self.server_id is None:
+      raise ValueError("MCP catalog routes require a server ID")
+    return self
+
+
+class ResolvedCatalogRoute(Protocol):
+  """Static view of the physical-origin invariant on resolved routes."""
+
+  @property
+  def tool_id(self) -> str: ...
+
+  @property
+  def origin(self) -> Literal["local", "mcp"]: ...
+
+  @property
+  def server_id(self) -> str | None: ...
 
 
 class PlatformToolCatalog(WireModel):
@@ -580,6 +633,9 @@ class OperationUnavailable(WireModel):
     "policy_denial",
     "credential_unavailable",
     "version_digest_mismatch",
+    "mcp_server_denied",
+    "mcp_server_unavailable",
+    "mcp_tool_unavailable",
   ]
   detail: Annotated[str, StringConstraints(min_length=1, max_length=2_048)]
   unsatisfied: tuple[UnsatisfiedCapability, ...] = ()
@@ -610,7 +666,15 @@ class ResolvedAuthority(WireModel):
       raise ValueError("resolved routes must be sorted and unique")
     if set(route_ids) != {entry.tool_id for entry in self.grant.tools}:
       raise ValueError("resolved routes must be exactly the granted tools")
+    if any(route.origin is None for route in self.routes):
+      raise ValueError("resolved routes require an exact physical origin")
     return self
+
+  @property
+  def physical_routes(self) -> tuple[ResolvedCatalogRoute, ...]:
+    """Expose the exact-origin invariant already enforced at validation."""
+
+    return cast(tuple[ResolvedCatalogRoute, ...], self.routes)
 
 
 class EvidencePort(WireModel):
@@ -690,6 +754,27 @@ class AgentResumeMechanics(WireModel):
     return self
 
 
+class ProviderToolDefinition(WireModel):
+  """One exact provider-facing tool definition frozen for child execution."""
+
+  definition: dict[str, JsonValue]
+
+  @property
+  def name(self) -> str:
+    name = self.definition.get("name")
+    if type(name) is not str or not name or name != name.strip():
+      raise ValueError(
+        "provider tool definition requires a non-empty trimmed name"
+      )
+    return name
+
+  @model_validator(mode="after")
+  def _definition_has_stable_identity(self) -> ProviderToolDefinition:
+    self.name
+    canonical_json_bytes(self.definition)
+    return self
+
+
 class AgentExecutionSnapshot(WireModel):
   """Exact prompt and mechanics consumed by one admitted child attempt."""
 
@@ -723,6 +808,12 @@ class AgentExecutionSnapshot(WireModel):
     allow_inf_nan=False,
     exclude_if=lambda value: value is None,
   )
+  # Absent only on historical AdmittedTask schema 1.0 records. New schema 1.1
+  # tasks require the exact tuple and never reconstruct it from live catalogs.
+  provider_tool_definitions: tuple[ProviderToolDefinition, ...] | None = Field(
+    default=None,
+    exclude_if=lambda value: value is None,
+  )
   resume_mechanics: AgentResumeMechanics
   resume_instruction: NonEmptyText | None = None
 
@@ -750,6 +841,10 @@ class AgentExecutionSnapshot(WireModel):
       raise ValueError("system prompt must contain exact result instructions")
     if self.persisted_methodology_state is not None:
       _validate_safe_literal(self.persisted_methodology_state)
+    if self.provider_tool_definitions is not None:
+      names = tuple(item.name for item in self.provider_tool_definitions)
+      if len(names) != len(set(names)):
+        raise ValueError("provider tool definition names must be unique")
     return self
 
 
@@ -910,7 +1005,7 @@ TaskExecutionDisposition: TypeAlias = Annotated[
 
 
 class AdmittedTask(WireModel):
-  schema_version: Literal["1.0"] = "1.0"
+  schema_version: Literal["1.0", "1.1", "1.2"] = "1.1"
   admitted_task_id: OpaqueId
   logical_task: LogicalTaskRef
   attempt: AttemptRef
@@ -922,6 +1017,10 @@ class AdmittedTask(WireModel):
   inputs: tuple[AdmittedInputBinding, ...] = ()
   capability_bindings: tuple[CapabilityBinding, ...] = ()
   tool_grant: ToolGrant
+  tool_routes: tuple[AdmittedToolRoute, ...] | None = Field(
+    default=None,
+    exclude_if=lambda value: value is None,
+  )
   content_read_grants: tuple[ContentReadGrant, ...] = ()
   workspace_grant: WorkspaceGrant
   model_bind: CapabilityBind | None
@@ -950,6 +1049,27 @@ class AdmittedTask(WireModel):
       if is_resume != (self.execution_snapshot.resume_instruction is not None):
         raise ValueError(
           "resume attempts require one exact admitted resume instruction"
+        )
+      definitions = self.execution_snapshot.provider_tool_definitions
+      if self.schema_version in {"1.1", "1.2"} and definitions is None:
+        raise ValueError(
+          f"admitted task schema {self.schema_version} requires provider tool definitions"
+        )
+      if self.schema_version == "1.0" and definitions is not None:
+        raise ValueError(
+          "admitted task schema 1.0 cannot carry provider tool definitions"
+        )
+      definition_names = (
+        tuple(definition.name for definition in definitions)
+        if definitions is not None
+        else ()
+      )
+      granted_tool_ids = tuple(
+        entry.tool_id for entry in self.tool_grant.tools
+      )
+      if definitions is not None and definition_names != granted_tool_ids:
+        raise ValueError(
+          "provider tool definitions must match the exact ordered tool grant"
         )
     elif self.execution_snapshot is not None:
       raise ValueError("non-execution tasks cannot carry execution mechanics")
@@ -981,6 +1101,22 @@ class AdmittedTask(WireModel):
       raise ValueError("ordinary delegations cannot carry workflow plan identity")
     if self.operation.operation != self.logical_task.operation:
       raise ValueError("operation snapshot must match logical task")
+    if self.schema_version in {"1.0", "1.1"}:
+      if self.tool_routes is not None:
+        raise ValueError(
+          f"admitted task schema {self.schema_version} cannot carry tool routes"
+        )
+    elif self.tool_routes is None:
+      raise ValueError("admitted task schema 1.2 requires tool routes")
+    else:
+      granted_tool_ids = tuple(
+        entry.tool_id for entry in self.tool_grant.tools
+      )
+      route_tool_ids = tuple(route.tool_id for route in self.tool_routes)
+      if route_tool_ids != granted_tool_ids:
+        raise ValueError(
+          "admitted tool routes must match the exact ordered tool grant"
+        )
     if self.model_bind_digest != sha256_digest(self.model_bind):
       raise ValueError("model-bind digest must match admitted task provenance")
     binding_payload = [
@@ -1369,6 +1505,10 @@ ParentResultMaterialization: TypeAlias = Annotated[
 class SettlementProjection(WireModel):
   execution_status: Literal["succeeded", "failed", "interrupted", "cancelled", "skipped"]
   outcome_disposition: Literal["complete", "partial", "insufficient_evidence", "blocked", "not_assessed"] | None = None
+  terminal_reason: NonEmptyText | None = Field(
+    default=None,
+    exclude_if=lambda value: value is None,
+  )
 
 
 class ChildEvidenceProjection(WireModel):
@@ -1399,7 +1539,9 @@ class AgentCompletionEnvelope(WireModel):
   message_id: OpaqueId
   task_result_ref: TaskResultRef
   settlement_projection: SettlementProjection
-  parent_materialization: ParentResultMaterialization
+  # A stopped child may have no canonical content. Its settlement still
+  # reaches the parent; intermediate tool-use prose is not a terminal answer.
+  parent_materialization: ParentResultMaterialization | None
   # Absent means none: the field is omitted from dumps when empty so durable
   # completion events and digests recorded before child evidence existed
   # replay byte-identically.
@@ -1407,6 +1549,15 @@ class AgentCompletionEnvelope(WireModel):
     default=None,
     exclude_if=lambda value: value is None,
   )
+
+  @model_validator(mode="after")
+  def _successful_result_has_content(self) -> AgentCompletionEnvelope:
+    if (
+      self.settlement_projection.execution_status == "succeeded"
+      and self.parent_materialization is None
+    ):
+      raise ValueError("successful completion requires parent result content")
+    return self
 
 
 def _inline_content_bytes(value: JsonValue, handle: ContentHandle) -> bytes:
@@ -1877,8 +2028,10 @@ class DeliverySettlement(WireModel):
         or self.envelope.revision != self.revision
       ):
         raise ValueError("delivery envelope must match settlement revision")
-      if v1_pair and (
-        self.spec.summary_selector is not None
+      if (
+        isinstance(self.spec, WorkflowDeliverySpecV1)
+        and isinstance(self.envelope, DeliveryEnvelopeV1)
+        and self.spec.summary_selector is not None
         and self.envelope.summary is None
         and self.warning is None
       ):
@@ -1886,7 +2039,9 @@ class DeliverySettlement(WireModel):
           "delivery without its admitted authored summary requires an "
           "explicit delivery warning"
         )
-      if v2_pair:
+      if isinstance(self.spec, WorkflowDeliverySpecV2) and isinstance(
+        self.envelope, DeliveryEnvelopeV2
+      ):
         preview = self.envelope.primary.preview
         if preview.source_end_byte > self.spec.preview_max_bytes:
           raise ValueError("delivery preview exceeds its recorded byte bound")
@@ -2182,8 +2337,11 @@ class WorkflowResult(WireModel):
           None,
         )
         inline = publication.inline_view if publication is not None else None
-        if envelope.primary.preview.complete and inline is not None and (
-          _inline_content_bytes(inline.value, publication.content)
+        if (
+          envelope.primary.preview.complete
+          and publication is not None
+          and inline is not None
+          and _inline_content_bytes(inline.value, publication.content)
           != envelope.primary.preview.text.encode("utf-8")
         ):
           raise ValueError(
@@ -2193,13 +2351,113 @@ class WorkflowResult(WireModel):
 
 
 __all__ = [
-  name
-  for name, value in tuple(globals().items())
-  if isinstance(value, type)
-  and issubclass(value, BaseModel)
-  and value.__module__ == __name__
-  and value is not WireModel
-] + [
+  "ContractRef",
+  "AgentOperationRef",
+  "CapabilityBind",
+  "ContentHandle",
+  "ContentReadGrant",
+  "ContextViewPolicy",
+  "InvocationArgumentSelector",
+  "LiteralSelector",
+  "SelectedContentSelector",
+  "NodeValueSelector",
+  "PhaseOutputSelector",
+  "DurableArtifactSelector",
+  "RequestedDataRef",
+  "OwnerBinding",
+  "AdmittedDataRef",
+  "ContextSourceRef",
+  "InlineExactContextView",
+  "SemanticExcerptContextView",
+  "ContentReadContextView",
+  "AdmittedInputBinding",
+  "TypedInputCapabilityBinding",
+  "LiveToolCapabilityBinding",
+  "ToolGrantEntry",
+  "ToolGrant",
+  "AdmittedToolRoute",
+  "WorkspaceGrant",
+  "SemanticCapabilityRequirement",
+  "ExecutionIdentity",
+  "CatalogToolEntry",
+  "PlatformToolCatalog",
+  "UnsatisfiedCapability",
+  "OperationUnavailable",
+  "ResolvedAuthority",
+  "EvidencePort",
+  "AgentOperationSnapshot",
+  "AgentResumeMechanics",
+  "ProviderToolDefinition",
+  "AgentExecutionSnapshot",
+  "ProjectionRequirement",
+  "OutcomeRequirement",
+  "ResultRequirement",
+  "OutcomeRoute",
+  "OutcomePolicy",
+  "TaskSettlementAcceptancePolicy",
+  "ValidationVerdictAcceptancePolicy",
+  "OrdinaryDelegationTaskRef",
+  "WorkflowNodeTaskRef",
+  "AttemptRef",
+  "AdmittedWorkflowNodeIdentity",
+  "ExecuteTaskDisposition",
+  "SettleWithoutExecutionDisposition",
+  "AdmittedTask",
+  "ExecutionSettlement",
+  "CitationEvidenceRef",
+  "ContentEvidenceRef",
+  "ObservedSourceEvidenceRef",
+  "AnalyticalOutcome",
+  "EvidenceObservation",
+  "CanonicalProjection",
+  "NamedArtifact",
+  "TaskResultValues",
+  "TranscriptHandle",
+  "ActivityHandle",
+  "UsageObservation",
+  "TaskObservation",
+  "TaskResultProvenance",
+  "TaskResult",
+  "TaskResultRef",
+  "ParentResultPolicy",
+  "TerminalNarrativeInlineExact",
+  "ProjectionInline",
+  "AuthoredSummaryWithResultHandle",
+  "ResultHandle",
+  "SettlementProjection",
+  "ChildEvidenceProjection",
+  "AgentCompletionEnvelope",
+  "PublishedInlineView",
+  "PublishedOutput",
+  "PublishedOutputRef",
+  "WorkflowContentCursor",
+  "GrantContentPageAuthorization",
+  "PublishedOutputPageAuthorization",
+  "WorkflowContentPage",
+  "WorkflowDeliverySpecV1",
+  "WorkflowDeliverySpecV2",
+  "AuthoredDeliverySummary",
+  "DeliveryPrimary",
+  "DeliveryAdditionalOutput",
+  "DeliveryEnvelopeV1",
+  "DeliveryPreview",
+  "DeliveryPrimaryV2",
+  "DeliveryEnvelopeV2",
+  "DeliveryFailure",
+  "DeliveryWarning",
+  "DeliverySettlement",
+  "AdmittedPlanRef",
+  "TerminalPhaseRevision",
+  "ContinuationState",
+  "WorkflowViewPhase",
+  "WorkflowViewNodeState",
+  "WorkflowAuthorFailureView",
+  "WorkflowRecoveryHint",
+  "WorkflowAnomalyView",
+  "WorkflowContinuationAcceptedView",
+  "WorkflowOutputReadRecipe",
+  "WorkflowView",
+  "WorkflowResult",
   "DELIVERY_PREVIEW_MAX_BYTES",
   "DELIVERY_PREVIEW_POLICY_VERSION",
   "DeliveryEnvelope",

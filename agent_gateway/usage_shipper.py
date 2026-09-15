@@ -406,17 +406,28 @@ class CommercialUsageReconciliationIngestClient:
     for item in raw_results:
       if not isinstance(item, dict):
         raise CommercialUsageResponseError("commercial reconciliation result is invalid")
+      environment = item.get("environment")
+      source_product = item.get("source_product")
+      request_id = item.get("request_id")
+      session_id = item.get("session_id")
+      evidence_revision = item.get("evidence_revision")
+      report_sha256 = item.get("report_sha256")
       identity = (
-        item.get("environment"), item.get("source_product"), item.get("request_id"),
-        item.get("session_id"), item.get("evidence_revision"), item.get("report_sha256"),
+        environment, source_product, request_id,
+        session_id, evidence_revision, report_sha256,
       )
       status = item.get("status")
       reason = item.get("reason_code")
       if (
         item.get("schema_version") != 1
-        or any(not isinstance(value, str) for value in identity[:4])
-        or not isinstance(identity[4], int) or isinstance(identity[4], bool)
-        or not isinstance(identity[5], str) or not _SHA256.fullmatch(identity[5])
+        or not isinstance(environment, str)
+        or not isinstance(source_product, str)
+        or not isinstance(request_id, str)
+        or not isinstance(session_id, str)
+        or not isinstance(evidence_revision, int)
+        or isinstance(evidence_revision, bool)
+        or not isinstance(report_sha256, str)
+        or not _SHA256.fullmatch(report_sha256)
         or identity not in expected or identity in observed
         or status not in {"accepted", "duplicate", "conflict", "rejected_retryable"}
         or (reason is not None and (
@@ -430,9 +441,10 @@ class CommercialUsageReconciliationIngestClient:
         )
       observed.add(identity)
       results.append(ReconciliationAcceptance(
-        environment=identity[0], source_product=identity[1],
-        request_id=identity[2], session_id=identity[3], evidence_revision=identity[4],
-        report_sha256=identity[5], status=status, reason_code=reason,
+        environment=environment, source_product=source_product,
+        request_id=request_id, session_id=session_id,
+        evidence_revision=evidence_revision, report_sha256=report_sha256,
+        status=status, reason_code=reason,
       ))
     if observed != expected:
       raise CommercialUsageResponseError("commercial reconciliation response is incomplete")
@@ -544,7 +556,7 @@ class CommercialUsageShipper:
     for row in rows:
       result = by_id[row.event_id]
       reason = (result.reason_code or result.status)[:512]
-      if result.status in {"accepted", "duplicate"}:
+      if result.status == "accepted" or result.status == "duplicate":
         changed = self._outbox.mark_accepted(
           row.event_id,
           row.sending_lease_token or "",
@@ -562,7 +574,7 @@ class CommercialUsageShipper:
             "commercial_usage.ingest_lag_seconds",
             self._event_lag_seconds(row, current=current),
           )
-      elif result.status in {"conflict", "rejected_terminal"}:
+      elif result.status == "conflict" or result.status == "rejected_terminal":
         changed = self._outbox.mark_dead(
           row.event_id,
           row.sending_lease_token or "",
@@ -750,7 +762,7 @@ class CommercialUsageReconciliationShipper:
     for row in rows:
       result = by_digest[row.report_sha256]
       reason = (result.reason_code or result.status)[:512]
-      if result.status in {"accepted", "duplicate"}:
+      if result.status == "accepted" or result.status == "duplicate":
         changed = self._outbox.mark_reconciliation_accepted(
           row.report_id,
           row.sending_lease_token or "",

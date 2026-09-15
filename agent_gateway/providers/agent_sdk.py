@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -51,7 +52,14 @@ SDK_KNOWN_BUILTINS = {
 SDK_SAFE_BUILTINS = {"Read", "Glob", "Grep"}
 SDK_WEB_BUILTINS = {"WebSearch", "WebFetch"}
 SDK_GATED_BUILTINS = {"Write", "Edit", "Bash", "NotebookEdit", "BashOutput", "KillBash"}
-_UNSET = object()
+# Intentionally differs from api/agent/shared/tool_catalog.py:WEB_TOOL_CHANNELS,
+# which includes "discord". Whether Discord agent-SDK sessions receive hosted
+# WebSearch/WebFetch remains an open product decision; ruled 2026-08-31 to keep
+# today's behavior.
+SDK_WEB_TOOL_CHANNELS: frozenset[str] = frozenset({"web", "telegram", "cli", "tui"})
+
+class _Unset(Enum):
+  TOKEN = 0
 
 
 @dataclass
@@ -68,12 +76,6 @@ class AgentSDKConfig:
   request_id: str | None = None
 
 
-def _sdk_web_tool_channels() -> set[Optional[str]]:
-  try:
-    from api.tool_catalog import WEB_TOOL_CHANNELS
-  except Exception:
-    return {"web", "telegram", "cli", "tui"}
-  return set(WEB_TOOL_CHANNELS)
 
 
 def _resolve_channel_tier(
@@ -84,8 +86,10 @@ def _resolve_channel_tier(
   return channel_tiers.get(channel, default_tier)
 
 
-def _resolve_mcp_config_path(config_path: Path | str | None | object = _UNSET) -> Path | None:
-  if config_path is _UNSET:
+def _resolve_mcp_config_path(
+  config_path: Path | str | None | _Unset = _Unset.TOKEN,
+) -> Path | None:
+  if config_path is _Unset.TOKEN:
     env_path = os.getenv("MCP_CONFIG_PATH", "").strip()
     return Path(env_path).expanduser() if env_path else None
   if config_path is None:
@@ -137,7 +141,7 @@ def build_disallowed_tools(
 ) -> List[str]:
   tier = _resolve_channel_tier(channel, channel_tiers)
   allowed = set(SDK_SAFE_BUILTINS)
-  if channel in _sdk_web_tool_channels():
+  if channel in SDK_WEB_TOOL_CHANNELS:
     allowed |= SDK_WEB_BUILTINS
 
   blocked = set(SDK_KNOWN_BUILTINS) - allowed
@@ -167,7 +171,7 @@ def build_disallowed_tools(
 def load_mcp_config_for_sdk(
   channel: Optional[str],
   channel_tiers: Dict[Optional[str], Dict[str, set[str]]],
-  config_path: Path | str | None | object = _UNSET,
+  config_path: Path | str | None | _Unset = _Unset.TOKEN,
   *,
   session: Any | None = None,
 ) -> Dict[str, Dict[str, Any]]:

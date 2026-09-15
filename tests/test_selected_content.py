@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from typing import TypedDict
 
 import pytest
 from agent_gateway.selected_content import (
@@ -18,6 +19,13 @@ from agent_workflow_contracts import (
   OwnerBinding,
   SELECTED_CONTENT_UTF8_CONTRACT,
 )
+
+
+class _SelectedContentIdentity(TypedDict):
+  tenant_id: str
+  session_id: str
+  request_id: str
+  wire_position: int
 
 
 def _binding(name: str, text: str = "hello") -> SelectedContentBinding:
@@ -60,12 +68,12 @@ def _sized_binding(name: str, size: int) -> SelectedContentBinding:
 
 
 def test_name_is_deterministic_and_session_request_position_bound() -> None:
-  identity = dict(
-    tenant_id="tenant-1",
-    session_id="session-1",
-    request_id="request-1",
-    wire_position=0,
-  )
+  identity: _SelectedContentIdentity = {
+    "tenant_id": "tenant-1",
+    "session_id": "session-1",
+    "request_id": "request-1",
+    "wire_position": 0,
+  }
   first = derive_selected_content_name(**identity)
 
   assert first == derive_selected_content_name(**identity)

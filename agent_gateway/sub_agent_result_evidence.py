@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from collections import ChainMap
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 from .sub_agent_result_contract import (
   child_evidence_fits_externalization_bound,
@@ -14,6 +13,36 @@ from .tool_dispatch_classification import OUTCOME_OK
 _EVIDENCE_ADMISSION_WARNING = (
   "child evidence exceeded the canonical admission contract"
 )
+_K = TypeVar("_K")
+_V = TypeVar("_V")
+
+
+class _ReadOnlyChainMap(Mapping[_K, _V]):
+  """Overlay mappings without pretending their sources are mutable."""
+
+  def __init__(self, *maps: Mapping[_K, _V]) -> None:
+    self._maps = maps
+
+  def __getitem__(self, key: _K) -> _V:
+    for mapping in self._maps:
+      try:
+        return mapping[key]
+      except KeyError:
+        continue
+    raise KeyError(key)
+
+  def __iter__(self) -> Iterator[_K]:
+    seen: set[_K] = set()
+    for mapping in self._maps:
+      for key in mapping:
+        if key not in seen:
+          seen.add(key)
+          yield key
+
+  def __len__(self) -> int:
+    return len(set().union(*(mapping.keys() for mapping in self._maps)))
+
+
 
 
 class UsageEvidenceMergeError(ValueError):
@@ -407,7 +436,7 @@ def collect_sub_agent_result_evidence(
     return _rejected_evidence(warning_parts)
 
   fms_results = tuple(
-    ChainMap(
+    _ReadOnlyChainMap(
       {"tool_name": event.get("tool_name")},
       result,
     )

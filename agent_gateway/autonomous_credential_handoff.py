@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import dataclass
 from typing import Any, BinaryIO
 
 from .capability_binding import CredentialHandle
@@ -19,6 +20,7 @@ _HANDOFF_FIELDS = frozenset({
   "transport",
   "credential_handle",
   "auth_config",
+  "session_token",
 })
 _HANDLE_FIELDS = frozenset({
   "handle_id",
@@ -27,6 +29,14 @@ _HANDLE_FIELDS = frozenset({
   "tenant_id",
   "actor_id",
 })
+
+
+@dataclass(frozen=True, slots=True)
+class AutonomousLaunchSecrets:
+  """Non-persisted secrets delivered through the inherited launch pipe."""
+
+  credential: MaterializedCredential
+  session_token: str | None
 
 
 def _closed_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -65,18 +75,27 @@ def _handle_payload(handle: CredentialHandle) -> dict[str, str | None]:
 
 def encode_autonomous_credential_handoff(
   materialized: MaterializedCredential,
+  *,
+  session_token: str | None = None,
 ) -> bytes:
-  """Encode the launch's sole credential for an anonymous subprocess pipe."""
+  """Encode launch secrets for the anonymous subprocess pipe."""
 
   if not isinstance(materialized, MaterializedCredential):
     raise TypeError(
       "autonomous credential handoff requires MaterializedCredential"
     )
+  if session_token is not None and (
+    type(session_token) is not str
+    or not session_token
+    or session_token != session_token.strip()
+  ):
+    raise ValueError("autonomous session token must be canonical text")
   payload = {
-    "version": 1,
+    "version": 2,
     "transport": AUTONOMOUS_CREDENTIAL_HANDOFF_STDIN,
     "credential_handle": _handle_payload(materialized.handle),
     "auth_config": dict(materialized.auth_config),
+    "session_token": session_token,
   }
   try:
     encoded = json.dumps(
@@ -96,7 +115,7 @@ def encode_autonomous_credential_handoff(
   return encoded
 
 
-def read_autonomous_credential_handoff(
+def read_autonomous_launch_secrets(
   *,
   expected_handle_id: str,
   expected_provider: str,
@@ -104,8 +123,8 @@ def read_autonomous_credential_handoff(
   expected_tenant_id: str,
   expected_actor_id: str | None,
   stream: BinaryIO | None = None,
-) -> MaterializedCredential:
-  """Read and validate the sole credential from the inherited stdin pipe."""
+) -> AutonomousLaunchSecrets:
+  """Read and validate launch secrets from the inherited stdin pipe."""
 
   source = stream if stream is not None else sys.stdin.buffer
   try:
@@ -130,7 +149,7 @@ def read_autonomous_credential_handoff(
     expected=_HANDOFF_FIELDS,
     object_name="payload",
   )
-  if payload["version"] != 1:
+  if payload["version"] != 2:
     raise ValueError("autonomous credential handoff version is unsupported")
   if payload["transport"] != AUTONOMOUS_CREDENTIAL_HANDOFF_STDIN:
     raise ValueError("autonomous credential handoff transport is invalid")
@@ -181,16 +200,49 @@ def read_autonomous_credential_handoff(
     raise ValueError(
       "autonomous credential handoff provider does not match its handle"
     )
-  return MaterializedCredential(
-    handle=handle,
-    auth_config=auth_config,
+  session_token = payload["session_token"]
+  if session_token is not None and (
+    type(session_token) is not str
+    or not session_token
+    or session_token != session_token.strip()
+  ):
+    raise ValueError("autonomous session token is invalid")
+  return AutonomousLaunchSecrets(
+    credential=MaterializedCredential(
+      handle=handle,
+      auth_config=auth_config,
+    ),
+    session_token=session_token,
   )
+
+
+def read_autonomous_credential_handoff(
+  *,
+  expected_handle_id: str,
+  expected_provider: str,
+  expected_principal: str,
+  expected_tenant_id: str,
+  expected_actor_id: str | None,
+  stream: BinaryIO | None = None,
+) -> MaterializedCredential:
+  """Compatibility projection for callers that only consume the credential."""
+
+  return read_autonomous_launch_secrets(
+    expected_handle_id=expected_handle_id,
+    expected_provider=expected_provider,
+    expected_principal=expected_principal,
+    expected_tenant_id=expected_tenant_id,
+    expected_actor_id=expected_actor_id,
+    stream=stream,
+  ).credential
 
 
 __all__ = [
   "AUTONOMOUS_CREDENTIAL_HANDOFF_ENV",
   "AUTONOMOUS_CREDENTIAL_HANDOFF_MAX_BYTES",
   "AUTONOMOUS_CREDENTIAL_HANDOFF_STDIN",
+  "AutonomousLaunchSecrets",
   "encode_autonomous_credential_handoff",
+  "read_autonomous_launch_secrets",
   "read_autonomous_credential_handoff",
 ]

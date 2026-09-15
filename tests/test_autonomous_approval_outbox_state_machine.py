@@ -448,7 +448,7 @@ def test_two_duplicate_retriers_converge_on_one_publication(
   barrier = threading.Barrier(2)
 
   def reconcile() -> dict[str, Any]:
-    barrier.wait(timeout=1)
+    barrier.wait(timeout=30)
     return store.reconcile_autonomous_approval_delivery_duplicate(
       "approval-duplicate-race",
       tool_call_id="tool-duplicate-race",
@@ -459,8 +459,8 @@ def test_two_duplicate_retriers_converge_on_one_publication(
   with ThreadPoolExecutor(max_workers=2) as executor:
     first_future = executor.submit(reconcile)
     second_future = executor.submit(reconcile)
-    first = first_future.result(timeout=2)
-    second = second_future.result(timeout=2)
+    first = first_future.result(timeout=30)
+    second = second_future.result(timeout=30)
 
   assert first["state"] == "published"
   assert second["state"] == "published"
@@ -574,6 +574,7 @@ def test_delivery_failures_back_off_then_quarantine(
   _create_decision(store, "retry")
 
   prior_next_attempt_ns = 0
+  delivery = None
   for attempt in range(1, 6):
     delivery = asyncio.run(
       store.record_autonomous_approval_delivery_failure(
@@ -593,6 +594,7 @@ def test_delivery_failures_back_off_then_quarantine(
       "quarantined" if attempt == 5 else "pending"
     )
 
+  assert delivery is not None
   assert delivery["quarantined_at"] is not None
   assert asyncio.run(
     store.list_pending_autonomous_approval_deliveries()

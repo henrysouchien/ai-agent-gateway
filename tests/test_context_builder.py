@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -120,8 +121,13 @@ def test_context_builder_replays_historical_final_answer_draft_as_assistant_only
   ]
 
 
-def test_context_builder_tool_call_complete_backward_compat_with_final_blocks(tmp_path: Path) -> None:
+def test_context_builder_replays_annotated_tool_results_with_call(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "tool-result-compat.jsonl")
+  assistant = {
+    "type": "assistant_message",
+    "content_blocks": [{"type": "tool_use", "id": "tool-1", "name": "lookup", "input": {}}],
+  }
+  _run(log.append(assistant))
   _run(
     log.append(
       {
@@ -144,6 +150,7 @@ def test_context_builder_tool_call_complete_backward_compat_with_final_blocks(tm
   messages = _run(SessionContextBuilder(agent_session_log=log).build())
 
   assert messages == [
+    {"role": "assistant", "content": assistant["content_blocks"]},
     {
       "role": "user",
       "content": [
@@ -257,6 +264,71 @@ def test_context_builder_can_replay_full_session_without_temporal_cutoff(
   assert messages == [
     {"role": "user", "content": "First turn"},
     {"role": "user", "content": "Second turn"},
+  ]
+
+
+def test_context_builder_budgets_only_replayable_entries_across_attach_spans(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "cross-attach-replay.jsonl")
+  manifest = {
+    "type": "context_manifest",
+    "event_schema_version": "1",
+    "product_id": "cli_analyst",
+    "request_id": "request-old",
+    "role": "writer",
+    "runner_id": "runner-old",
+    "session_id": "session-cross-attach",
+    "turn": 1,
+    "surfaces": [
+      {
+        "aliases": [],
+        "capability_id": f"capability-{index}",
+        "external": False,
+        "name": f"inventory-{index}-" + ("x" * 256),
+        "previous_ids": [],
+        "source": "gateway",
+        "surface_id": f"surface-{index}",
+        "surface_type": "tool",
+        "transport": "mcp",
+      }
+      for index in range(400)
+    ],
+  }
+  assert len(json.dumps(manifest)) // 4 > 20_000
+
+  _run(log.append({"type": "attach", "role": "writer", "runner_id": "runner-old"}))
+  _run(log.append({"type": "user_message", "content": "Remember the codeword MARLINSPIKE."}))
+  _run(log.append(manifest))
+  _run(log.append({"type": "assistant_message", "content": "ACK"}))
+  _run(log.append({"type": "detach", "role": "writer", "runner_id": "runner-old"}))
+  _run(log.append({"type": "attach", "role": "writer", "runner_id": "runner-new"}))
+
+  messages = _run(SessionContextBuilder(agent_session_log=log, tail_window_seconds=None).build())
+
+  assert messages == [
+    {"role": "user", "content": "Remember the codeword MARLINSPIKE."},
+    {"role": "assistant", "content": "ACK"},
+  ]
+
+
+def test_context_builder_still_evicts_oldest_messages_when_conversation_exceeds_budget(
+  tmp_path: Path,
+) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "conversation-budget.jsonl")
+  _run(log.append({"type": "user_message", "content": "A" * 40}))
+  _run(log.append({"type": "assistant_message", "content": "B" * 40}))
+  _run(log.append({"type": "user_message", "content": "C" * 40}))
+
+  messages = _run(
+    SessionContextBuilder(
+      agent_session_log=log,
+      tail_window_seconds=None,
+      tail_token_budget=50,
+    ).build()
+  )
+
+  assert messages == [
+    {"role": "assistant", "content": "B" * 40},
+    {"role": "user", "content": "C" * 40},
   ]
 
 
@@ -414,3 +486,88 @@ def test_context_builder_suppresses_duplicate_interruption_tail_lines(tmp_path: 
   assert combined.count("## Previous run interrupted") == 1
   assert "[Session log] Previous run ended with interruption reason" not in combined
   assert "[Session log] Previous run interrupted tool" not in combined
+
+
+def test_context_builder_attaches_delayed_results_to_their_assistant_batch(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "delayed-batch.jsonl")
+  for tool_id in ("tool-a", "tool-b"):
+    _run(log.append({
+      "type": "assistant_message",
+      "content_blocks": [{"type": "tool_use", "id": tool_id, "name": "lookup", "input": {}}],
+    }))
+    _run(log.append({"type": "user_message", "content": f"Continue after {tool_id}"}))
+  for tool_id in ("tool-b", "tool-a"):
+    _run(log.append({
+      "type": "tool_call_interrupted",
+      "tool_call_id": tool_id,
+      "final_tool_result_blocks": [
+        {"type": "tool_result", "tool_use_id": tool_id, "content": "interrupted", "is_error": True},
+        {"type": "text", "text": f"Annotation for {tool_id}"},
+      ],
+    }))
+
+  messages = _run(SessionContextBuilder(agent_session_log=log).build())
+  for index, tool_id in ((0, "tool-a"), (3, "tool-b")):
+    assert messages[index]["content"][0]["id"] == tool_id
+    assert messages[index + 1] == {
+      "role": "user",
+      "content": [
+        {"type": "tool_result", "tool_use_id": tool_id, "content": "interrupted", "is_error": True},
+        {"type": "text", "text": f"Annotation for {tool_id}"},
+      ],
+    }
+    assert messages[index + 2]["content"] == f"Continue after {tool_id}"
+
+
+@pytest.mark.parametrize("followup", [False, True])
+def test_context_builder_budgets_tool_batch_atomically(tmp_path: Path, followup: bool) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "tool-batch-budget.jsonl")
+  _run(log.append({
+    "type": "assistant_message",
+    "content_blocks": [
+      {"type": "tool_use", "id": "tool-1", "name": "lookup", "input": {"text": "x" * 1000}},
+    ],
+  }))
+  _run(log.append({
+    "type": "tool_call_complete", "tool_call_id": "tool-1", "result": {"ok": True},
+  }))
+  if followup:
+    _run(log.append({"type": "user_message", "content": "Continue"}))
+
+  messages = _run(SessionContextBuilder(agent_session_log=log, tail_token_budget=100).build())
+  if followup:
+    assert messages == [{"role": "user", "content": "Continue"}]
+  else:
+    assert messages[0]["role"] == "assistant"
+    assert messages[0]["content"][0]["id"] == "tool-1"
+    assert messages[1]["content"][0]["tool_use_id"] == "tool-1"
+
+
+@pytest.mark.parametrize("boundary", ["time", "summary"])
+def test_context_builder_preserves_terminal_result_outside_replayed_call(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  boundary: str,
+) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "result-boundary.jsonl")
+  monkeypatch.setattr(agent_session_log_module.time, "time", lambda: 100.0)
+  call = _run(log.append({
+    "type": "assistant_message",
+    "content_blocks": [{"type": "tool_use", "id": "tool-1", "name": "lookup", "input": {}}],
+  }))
+  monkeypatch.setattr(agent_session_log_module.time, "time", lambda: 100.0 + 3 * 60 * 60)
+  if boundary == "summary":
+    _run(log.append({"type": "summary", "text": "Lookup requested", "covers": {"to_seq": call.seq}}))
+  _run(log.append({
+    "type": "tool_call_complete", "tool_call_id": "tool-1", "result": {"observed": "terminal evidence"},
+  }))
+
+  messages = _run(SessionContextBuilder(agent_session_log=log).build())
+  assert not any(
+    block.get("type") == "tool_result"
+    for message in messages if isinstance(message["content"], list)
+    for block in message["content"]
+  )
+  rendered = json.dumps(messages)
+  assert "tool-1" in rendered
+  assert "terminal evidence" in rendered

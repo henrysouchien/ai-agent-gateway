@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -112,7 +113,7 @@ class _StreamingRunner:
 
 
 def _make_app():
-  async def _build_chat_runtime(session, request, channel, auth_manager):
+  async def _build_chat_runtime(session, request, channel, auth_manager, *, storage_root: Path | None = None):
     _ = (session, channel, auth_manager)
     capability_bind = request.capability_bind
     assert capability_bind is not None

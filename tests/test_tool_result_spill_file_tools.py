@@ -19,8 +19,8 @@ if str(ROOT) not in sys.path:
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from api import local_tools  # noqa: E402
 from agent_gateway.tool_result_compaction import compact_model_tool_result_entry  # noqa: E402
+from agent_gateway.model_bound_wire import model_bound_wire_size  # noqa: E402
 import agent_gateway.tool_result_spill as spill_module  # noqa: E402
 from agent_gateway.tool_result_spill import (  # noqa: E402
   SPILL_ROOT_CONTROL_FILES,
@@ -28,7 +28,12 @@ from agent_gateway.tool_result_spill import (  # noqa: E402
   SpillCapabilities,
   SpillError,
   SpillLimitExceeded,
+  SpillReadAccessDenied,
+  SpillReadInvalidInput,
+  SpillReadUnavailable,
   SpillSink,
+  make_tool_result_read_handler,
+  read_spill_result,
   reconstruct_spill_manifest,
   write_spill_set,
 )
@@ -54,7 +59,11 @@ def _sink(
 ) -> SpillSink:
   return SpillSink(
     root_provider=lambda: str(root),
-    capabilities=capabilities or SpillCapabilities(file_read=True, file_grep=True),
+    capabilities=capabilities or SpillCapabilities(
+      file_read=True,
+      file_grep=True,
+      spill_read=True,
+    ),
     budget=budget or SpillBudget(),
     max_file_bytes=max_file_bytes,
   )
@@ -72,7 +81,7 @@ def _reader_json(result: dict[str, Any]) -> str:
   return json.dumps(result, default=str)
 
 
-def test_multiline_json_sidecar_round_trips_through_real_readers(
+def test_multiline_json_sidecar_round_trips_through_exact_sink_reader(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -84,8 +93,9 @@ def test_multiline_json_sidecar_round_trips_through_real_readers(
   markdown = "\n".join(lines)
   content = json.dumps({"status": "success", "nested": {"markdown": markdown}})
 
+  sink = _sink(root)
   publication = write_spill_set(
-    sink=_sink(root),
+    sink=sink,
     tool_name="thesis_read",
     tool_use_id="tool-1",
     content=content,
@@ -100,25 +110,25 @@ def test_multiline_json_sidecar_round_trips_through_real_readers(
   assert sidecar.read_text(encoding="utf-8") == markdown
   assert reconstruct_spill_manifest(manifest_path) == json.loads(content)
 
-  read_result, read_error = local_tools.file_read(
-    {"file_path": str(sidecar), "offset": len(lines) - 3, "limit": 3}
+  read_result = read_spill_result(
+    sink,
+    spill_ref=publication.spill_ref,
+    member_ref=sidecar_name,
+    offset=markdown.index("LATE_SENTINEL") - 100,
+    max_chars=400,
   )
-  assert read_error is None
-  assert read_result is not None
   assert "LATE_SENTINEL" in read_result["content"]
   assert len(_reader_json(read_result)) <= 60_000
 
-  grep_result, grep_error = local_tools.file_grep(
-    {
-      "pattern": "LATE_SENTINEL",
-      "path": str(sidecar),
-      "max_results": 1,
-      "context_lines": 1,
-    }
+  grep_result = read_spill_result(
+    sink,
+    spill_ref=publication.spill_ref,
+    member_ref=sidecar_name,
+    query="LATE_SENTINEL",
+    max_results=1,
+    context_chars=100,
   )
-  assert grep_error is None
-  assert grep_result is not None
-  assert grep_result["matches"][0]["line"].startswith("LATE_SENTINEL")
+  assert "LATE_SENTINEL" in grep_result["matches"][0]["content"]
   serialized_grep = _reader_json(grep_result)
   assert len(serialized_grep) <= 60_000
 
@@ -141,8 +151,9 @@ def test_single_line_megabyte_json_uses_bounded_chunks_and_round_trips(
   markdown = ("😀abc" * 270_000) + " LATE_MEGABYTE_SENTINEL"
   content = json.dumps({"markdown": markdown})
 
+  sink = _sink(root)
   publication = write_spill_set(
-    sink=_sink(root),
+    sink=sink,
     tool_name="thesis_read",
     tool_use_id="one-line",
     content=content,
@@ -160,25 +171,24 @@ def test_single_line_megabyte_json_uses_bounded_chunks_and_round_trips(
   line_budget = spill_module._reader_line_budget(chunk_path, model_max_chars=60_000)
   assert max(spill_module._reader_encoded_line_chars(line) for line in chunk_lines) <= line_budget
 
-  grep_result, grep_error = local_tools.file_grep(
-    {
-      "pattern": "LATE_MEGABYTE_SENTINEL",
-      "path": str(chunk_path),
-      "max_results": 1,
-      "context_lines": 1,
-    }
+  grep_result = read_spill_result(
+    sink,
+    spill_ref=publication.spill_ref,
+    member_ref=chunk_name,
+    query="LATE_MEGABYTE_SENTINEL",
+    max_results=1,
+    context_chars=100,
   )
-  assert grep_error is None
-  assert grep_result is not None
-  assert grep_result["count"] == 1
+  assert len(grep_result["matches"]) == 1
   assert len(_reader_json(grep_result)) <= 60_000
 
-  final_line = int(grep_result["matches"][0]["line_number"])
-  read_result, read_error = local_tools.file_read(
-    {"file_path": str(chunk_path), "offset": final_line, "limit": 1}
+  read_result = read_spill_result(
+    sink,
+    spill_ref=publication.spill_ref,
+    member_ref=chunk_name,
+    offset=grep_result["matches"][0]["start_offset"],
+    max_chars=500,
   )
-  assert read_error is None
-  assert read_result is not None
   assert "LATE_MEGABYTE_SENTINEL" in read_result["content"]
   assert len(_reader_json(read_result)) <= 60_000
 
@@ -241,25 +251,19 @@ def test_non_json_spills_preserve_exact_utf8_bytes_in_every_lane(
 
 
 @pytest.mark.parametrize(
-  ("capabilities", "present", "absent"),
+  "capabilities",
   [
-    (SpillCapabilities(code_execute=True), ("code_execute",), ("file_grep(pattern=",)),
-    (SpillCapabilities(file_read=True), ("file_read(file_path=",), ("file_grep(pattern=", "code_execute")),
-    (SpillCapabilities(file_grep=True), ("file_grep(pattern=",), ("file_read(file_path=", "code_execute")),
-    (
-      SpillCapabilities(file_read=True, file_grep=True),
-      ("file_read(file_path=", "file_grep(pattern="),
-      ("code_execute",),
-    ),
-    (SpillCapabilities(), ("no file/code reader",), ("file_read(file_path=", "file_grep(pattern=", "code_execute")),
+    SpillCapabilities(code_execute=True, spill_read=True),
+    SpillCapabilities(file_read=True, spill_read=True),
+    SpillCapabilities(file_grep=True, spill_read=True),
+    SpillCapabilities(file_read=True, file_grep=True, spill_read=True),
+    SpillCapabilities(),
   ],
 )
-def test_spill_hints_name_only_effective_reader_capabilities(
+def test_spill_ref_is_published_only_with_exact_reader_capability(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
   capabilities: SpillCapabilities,
-  present: tuple[str, ...],
-  absent: tuple[str, ...],
 ) -> None:
   monkeypatch.setenv("AGENT_GATEWAY_MAX_MODEL_TOOL_RESULT_CHARS", "60000")
   root = tmp_path / capabilities.lane
@@ -276,16 +280,28 @@ def test_spill_hints_name_only_effective_reader_capabilities(
   )
 
   live_payload = json.loads(live["content"])
-  hint = live_payload["spill_hint"]
-  for expected in present:
-    assert expected in hint
-  for unexpected in absent:
-    assert unexpected not in hint
-  assert "spill_file" not in json.loads(durable["content"])
-  if capabilities.file_read or capabilities.file_grep:
-    assert live_payload["spill_file"].endswith(".manifest.json")
-    assert set(live_payload["spill_summary"]) == {"member_count", "total_chars", "largest_members"}
+  assert "spill_file" not in live_payload
+  assert "spill_abspath" not in live_payload
+  assert "spill_hint" not in live_payload
+  assert "spill_ref" not in json.loads(durable["content"])
+  if capabilities.spill_read:
+    assert live_payload["spill_ref"].startswith("spill:v1:")
+    assert set(live_payload["spill_summary"]) == {
+      "payload_kind",
+      "member_count",
+      "total_chars",
+      "largest_members",
+    }
     assert len(live_payload["spill_summary"]["largest_members"]) <= 3
+    root_page = read_spill_result(
+      _sink(root, capabilities=capabilities),
+      spill_ref=live_payload["spill_ref"],
+      max_chars=200,
+    )
+    assert root_page["content"]
+  else:
+    assert "spill_ref" not in live_payload
+    assert "spill_summary" not in live_payload
 
 
 def test_shared_budget_is_atomic_under_concurrent_file_set_writers(tmp_path: Path) -> None:
@@ -527,13 +543,19 @@ def test_hard_link_unsupported_falls_back_to_plain_truncation_without_temp_or_po
   live, durable = compact_model_tool_result_entry(
     entry,
     tool_name="lookup",
-    spill_sink=_sink(tmp_path, capabilities=SpillCapabilities(code_execute=True)),
+    spill_sink=_sink(
+      tmp_path,
+      capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+    ),
     log_session_id="no-link",
     logger=logger,
   )
 
   assert live == durable
-  assert "spill_file" not in json.loads(live["content"])
+  live_payload = json.loads(live["content"])
+  assert "spill_file" not in live_payload
+  assert "spill_ref" not in live_payload
+  assert "spill_summary" not in live_payload
   assert list(tmp_path.iterdir()) == []
   assert logger.warnings
 
@@ -623,6 +645,215 @@ def test_disk_reconstruction_rejects_manifest_count_and_ref_metadata_tampering(t
   manifest_path.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
   with pytest.raises(SpillError, match="members missing"):
     reconstruct_spill_manifest(manifest_path)
+
+
+def test_exact_reader_denies_paths_control_files_symlinks_and_unlisted_members(
+  tmp_path: Path,
+) -> None:
+  sink = _sink(tmp_path)
+  publication = write_spill_set(
+    sink=sink,
+    tool_name="lookup",
+    tool_use_id="deny",
+    content=json.dumps({"markdown": "x" * 100_000}),
+    model_max_chars=60_000,
+  )
+  (tmp_path / "unlisted.txt").write_text("not admitted", encoding="utf-8")
+  (tmp_path / ".lease").write_text("control", encoding="utf-8")
+  (tmp_path / "linked.txt").symlink_to(tmp_path / "unlisted.txt")
+
+  with pytest.raises(SpillReadInvalidInput, match="malformed"):
+    read_spill_result(sink, spill_ref="/tmp/not-a-ref")
+  for member_ref in ("../unlisted.txt", ".lease", "linked.txt", "unlisted.txt"):
+    with pytest.raises(SpillReadAccessDenied):
+      read_spill_result(
+        sink,
+        spill_ref=publication.spill_ref,
+        member_ref=member_ref,
+      )
+
+  pointer_path = Path(publication.abspath)
+  pointer_path.unlink()
+  pointer_path.symlink_to(tmp_path / "unlisted.txt")
+  with pytest.raises(SpillReadAccessDenied):
+    read_spill_result(sink, spill_ref=publication.spill_ref)
+
+
+def test_exact_reader_fails_closed_on_missing_replaced_or_tampered_members(
+  tmp_path: Path,
+) -> None:
+  pointer_root = tmp_path / "pointer"
+  pointer_root.mkdir()
+  pointer_sink = _sink(
+    pointer_root,
+    capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+  )
+  pointer_publication = write_spill_set(
+    sink=pointer_sink,
+    tool_name="lookup",
+    tool_use_id="pointer",
+    content='{"value": "exact"}',
+    model_max_chars=60_000,
+  )
+  Path(pointer_publication.abspath).write_text(
+    '{"value": "replacement"}',
+    encoding="utf-8",
+  )
+  with pytest.raises(SpillReadUnavailable, match="integrity mismatch"):
+    read_spill_result(pointer_sink, spill_ref=pointer_publication.spill_ref)
+
+  member_root = tmp_path / "member"
+  member_root.mkdir()
+  member_sink = _sink(member_root)
+  member_publication = write_spill_set(
+    sink=member_sink,
+    tool_name="lookup",
+    tool_use_id="member",
+    content=json.dumps({"markdown": "x" * 100_000}),
+    model_max_chars=60_000,
+  )
+  manifest = json.loads(Path(member_publication.abspath).read_text(encoding="utf-8"))
+  member_ref = next(
+    member["filename"]
+    for member in manifest["members"]
+    if member["role"] in {"sidecar", "chunks"}
+  )
+  (member_root / member_ref).write_text("tampered", encoding="utf-8")
+  with pytest.raises(SpillReadUnavailable, match="integrity mismatch"):
+    read_spill_result(
+      member_sink,
+      spill_ref=member_publication.spill_ref,
+      member_ref=member_ref,
+    )
+
+  Path(member_publication.abspath).unlink()
+  with pytest.raises(SpillReadUnavailable, match="missing or expired"):
+    read_spill_result(member_sink, spill_ref=member_publication.spill_ref)
+
+
+@pytest.mark.asyncio
+async def test_exact_reader_handler_reports_expired_reference_without_fallback(
+  tmp_path: Path,
+) -> None:
+  sink = _sink(
+    tmp_path,
+    capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+  )
+  publication = write_spill_set(
+    sink=sink,
+    tool_name="lookup",
+    tool_use_id="expired",
+    content="expired content",
+    model_max_chars=60_000,
+  )
+  Path(publication.abspath).unlink()
+
+  result, error = await make_tool_result_read_handler(lambda: sink)({
+    "spill_ref": publication.spill_ref,
+  })
+
+  assert result is None
+  assert error == {
+    "code": "spill_unavailable",
+    "message": "spill is missing or expired",
+  }
+
+
+def test_exact_reader_enforces_page_and_search_response_budgets(
+  tmp_path: Path,
+) -> None:
+  sink = _sink(
+    tmp_path,
+    capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+  )
+  content = ("needle-" + "x" * 2_000) * 200
+  publication = write_spill_set(
+    sink=sink,
+    tool_name="lookup",
+    tool_use_id="budget",
+    content=content,
+    model_max_chars=60_000,
+  )
+
+  page = read_spill_result(
+    sink,
+    spill_ref=publication.spill_ref,
+    max_chars=40_000,
+  )
+  assert len(page["content"]) == 40_000
+  assert page["truncated"] is True
+  assert len(_reader_json(page)) < 48_000
+
+  search = read_spill_result(
+    sink,
+    spill_ref=publication.spill_ref,
+    query="needle",
+    max_results=20,
+    context_chars=500,
+  )
+  assert len(search["matches"]) == 20
+  assert search["truncated"] is True
+  assert len(_reader_json(search)) < 48_000
+  with pytest.raises(SpillReadInvalidInput, match=r"max_chars must be <= 40000"):
+    read_spill_result(
+      sink,
+      spill_ref=publication.spill_ref,
+      max_chars=40_001,
+    )
+  with pytest.raises(SpillReadInvalidInput, match="require query"):
+    read_spill_result(
+      sink,
+      spill_ref=publication.spill_ref,
+      max_results=2,
+    )
+  with pytest.raises(SpillReadInvalidInput, match="page reads"):
+    read_spill_result(
+      sink,
+      spill_ref=publication.spill_ref,
+      query="needle",
+      max_chars=100,
+    )
+
+
+@pytest.mark.parametrize("escaped", ["\x00", "\\", '"', "😀"])
+def test_exact_reader_bounds_serialized_page_and_search_results(
+  tmp_path: Path,
+  escaped: str,
+) -> None:
+  root = tmp_path / hashlib.sha256(escaped.encode("utf-8")).hexdigest()[:8]
+  root.mkdir()
+  sink = _sink(
+    root,
+    capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+  )
+  content = ((escaped * 600) + "needle") * 100
+  publication = write_spill_set(
+    sink=sink,
+    tool_name="lookup",
+    tool_use_id="escaped-budget",
+    content=content,
+    model_max_chars=60_000,
+  )
+
+  page = read_spill_result(
+    sink,
+    spill_ref=publication.spill_ref,
+    max_chars=40_000,
+  )
+  assert model_bound_wire_size(page) <= 48_000
+  assert page["truncated"] is True
+  assert page["next_offset"] == len(page["content"])
+
+  search = read_spill_result(
+    sink,
+    spill_ref=publication.spill_ref,
+    query="needle",
+    max_results=20,
+    context_chars=500,
+  )
+  assert model_bound_wire_size(search) <= 48_000
+  assert search["truncated"] is True
+  assert search["next_offset"] is not None
 
 
 def test_overlong_json_pointer_is_bounded_in_manifest_without_affecting_reconstruction(

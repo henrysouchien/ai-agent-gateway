@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import logging
 import sys
@@ -7,9 +8,10 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
@@ -38,6 +40,7 @@ from agent_gateway.model_registry import (  # noqa: E402
   ProductModelRegistry,
   ProductModelSelectionPolicy,
 )
+from agent_gateway.mcp_client import McpClientManager  # noqa: E402
 from agent_gateway import server as server_module  # noqa: E402
 from agent_gateway import server_artifact_helpers as artifact_helpers_module  # noqa: E402
 from agent_gateway import server_artifact_routes as artifact_routes_module  # noqa: E402
@@ -68,7 +71,7 @@ def test_server_parent_aliases_moved_helpers() -> None:
 
 def test_server_artifact_routes_use_parent_namespace_helpers(monkeypatch) -> None:
   calls: dict[str, Any] = {}
-  sentinel_request = object()
+  sentinel_request = Request({"type": "http"})
 
   def _auth_dependency(request):
     calls["request"] = request
@@ -107,7 +110,7 @@ def test_server_artifact_routes_use_parent_namespace_helpers(monkeypatch) -> Non
   }
 
 
-class _StubRunner:
+class _StubRunner(AgentRunner):
   def __init__(self, event_log, run_calls: list[dict[str, Any]]) -> None:
     self._event_log = event_log
     self._run_calls = run_calls
@@ -118,11 +121,13 @@ class _StubRunner:
 
   async def run(
     self,
-    *,
     messages: list[dict[str, Any]],
-    system_prompt: str | None = None,
+    system_prompt: str | list[tuple[str, bool]] | None = None,
     max_turns: int | None = None,
+    *,
+    resume_initial_messages=None,
   ) -> None:
+    _ = resume_initial_messages
     self._run_calls.append(
       {
         "messages": messages,
@@ -131,7 +136,7 @@ class _StubRunner:
       }
     )
     if self._credential_refresher is not None:
-      await self._credential_refresher(
+      refresh_result = self._credential_refresher(
         ProviderCredentialFailure(
           provider="anthropic",
           kind="rate_limit",
@@ -139,6 +144,8 @@ class _StubRunner:
           message="rate limit exceeded",
         )
       )
+      assert inspect.isawaitable(refresh_result)
+      await refresh_result
     self._event_log.append({"type": "stream_complete", "usage": {}})
 
 
@@ -260,14 +267,16 @@ def _make_app(
   captured_requests: list[Any] = []
   run_calls: list[dict[str, Any]] = []
 
-  async def _build_chat_runtime(session, request, channel, auth_manager):
+  async def _build_chat_runtime(session, request, channel, auth_manager, *, storage_root: Path | None = None):
     _ = channel, auth_manager
     captured_requests.append({"session": session, "request": request})
     capability_execution = request.capability_execution
     assert capability_execution is not None
     return ChatRuntime(
       system_prompt="test",
-      build_runner=lambda event_log, _sid: _StubRunner(event_log, run_calls),
+      build_runner=lambda event_log, _sid, _started_at: _StubRunner(
+        event_log, run_calls
+      ),
       capability_execution=capability_execution,
     )
 
@@ -313,15 +322,15 @@ def _init_session(
   response = client.post("/api/chat/init", json=payload)
   assert response.status_code == 200, response.text
   init = response.json()
-  session = client.app.state.auth.session_store.get_session(
-    init["session_id"]
-  )
+  app = client.app
+  assert isinstance(app, FastAPI)
+  session = app.state.auth.session_store.get_session(init["session_id"])
   assert session is not None
   session.model_entitled_capabilities = frozenset(CAPABILITY_IDS)
   session.model_entitled_keys = frozenset(
-    client.app.state.gateway_config.model_registry.models
+    app.state.gateway_config.model_registry.models
   )
-  init["session_token"] = client.app.state.auth.issue_token(session)
+  init["session_token"] = app.state.auth.issue_token(session)
   return init
 
 
@@ -386,15 +395,6 @@ def _auth_config_for(user_id: str) -> AuthConfig:
   )
 
 
-class _NoopMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
-    return False
-
-  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
-    return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
-
-  def get_tool_definitions(self) -> list[dict[str, Any]]:
-    return []
 
 
 class _ReplayProvider(ModelProvider):
@@ -459,7 +459,7 @@ def test_chat_stream_rebuilds_multi_turn_memory_from_session_log(tmp_path: Path)
   provider = _ReplayProvider(["AAPL market cap is about $4.4T.", "AAPL P/E is about 36x."])
   session_log = AgentSessionLog(path=tmp_path / "sessions" / "interactive.jsonl")
 
-  async def _build_chat_runtime(session, request, channel, auth_manager):
+  async def _build_chat_runtime(session, request, channel, auth_manager, *, storage_root: Path | None = None):
     _ = channel, auth_manager
     capability_execution = request.capability_execution
     assert capability_execution is not None
@@ -468,7 +468,7 @@ def test_chat_stream_rebuilds_multi_turn_memory_from_session_log(tmp_path: Path)
       return AgentRunner(
         event_log=event_log,
         dispatcher=ToolDispatcher(
-          mcp_client=_NoopMcpClient(),
+          mcp_client=McpClientManager(config_path=None),
           local_tool_handlers={},
           event_log=event_log,
           session_id=session_id,
@@ -543,6 +543,174 @@ def test_chat_stream_rebuilds_multi_turn_memory_from_session_log(tmp_path: Path)
   assert "What is its P/E?" in second_input
   assert "CLIENT FABRICATED USER" not in second_input
   assert "CLIENT FABRICATED ASSISTANT" not in second_input
+
+
+def test_chat_stream_rebuilds_memory_past_large_context_manifest(tmp_path: Path) -> None:
+  session_log = AgentSessionLog(
+    path=tmp_path / "sessions" / "interactive-large-manifest.jsonl"
+  )
+  # The observed interactive manifest contained roughly 300 prompt surfaces
+  # and serialized to about 174 KB. Keep this synthetic inventory similarly
+  # shaped and safely above the builder's 20,000-token replay budget.
+  context_manifest = {
+    "type": "context_manifest",
+    "product_id": "test-product",
+    "role": "writer",
+    "runner_id": "runner-first",
+    "session_id": "test-session",
+    "request_id": "request-first",
+    "turn": 1,
+    "surfaces": [
+      {
+        "surface_id": f"prompt.surface.{index}",
+        "capability_id": f"prompt.surface.{index}",
+        "surface_type": "prompt_section",
+        "transport": "prompt",
+        "source": {
+          "path": f"agent_gateway/prompts/surface_{index}.py",
+          "module": f"agent_gateway.prompts.surface_{index}",
+          "symbol": f"render_surface_{index}",
+          "source_kind": "python",
+          "dependencies": [f"prompt.dependency.{index}"],
+          "dependency_units": [
+            {
+              "dependency": f"prompt.dependency.{index}",
+              "text": "synthetic prompt inventory " + ("x" * 80),
+            }
+          ],
+        },
+        "aliases": [],
+        "previous_ids": [],
+        "external": False,
+      }
+      for index in range(300)
+    ],
+  }
+  assert len(json.dumps(context_manifest)) // 4 > 20_000
+
+  class _ManifestReplayProvider(_ReplayProvider):
+    def build_request_params(
+      self,
+      *,
+      model: str,
+      messages: list[dict[str, Any]],
+      system_prompt: str | list[tuple[str, bool]] | None,
+      tools: list[dict[str, Any]],
+      max_tokens: int,
+      **kwargs: Any,
+    ) -> dict[str, Any]:
+      params = super().build_request_params(
+        model=model,
+        messages=messages,
+        system_prompt=system_prompt,
+        tools=tools,
+        max_tokens=max_tokens,
+        **kwargs,
+      )
+      if len(self.captured_messages) == 1:
+        session_log.append_sync(context_manifest)
+      return params
+
+  first_user = "Remember that the portfolio label is NORTHSTAR."
+  first_assistant = "I will remember the portfolio label NORTHSTAR."
+  second_user = "What portfolio label did I give you?"
+  provider = _ManifestReplayProvider([first_assistant, "The label is NORTHSTAR."])
+  client_requests: list[list[dict[str, Any]]] = []
+
+  async def _build_chat_runtime(session, request, channel, auth_manager, *, storage_root: Path | None = None):
+    _ = channel, auth_manager
+    client_requests.append([message.model_dump() for message in request.messages])
+    capability_execution = request.capability_execution
+    assert capability_execution is not None
+
+    def _build_runner(event_log, session_id, _started_at=None):
+      return AgentRunner(
+        event_log=event_log,
+        dispatcher=ToolDispatcher(
+          mcp_client=McpClientManager(config_path=None),
+          local_tool_handlers={},
+          event_log=event_log,
+          session_id=session_id,
+        ),
+        session_id=session_id,
+        capability_execution=capability_execution,
+        get_tool_definitions=lambda: [],
+        user_id=session.user_id,
+        billing_mode="byok",
+        rate_table_version="unknown",
+        agent_session_log=session_log,
+        context_builder=SessionContextBuilder(
+          agent_session_log=session_log,
+          tail_window_seconds=None,
+        ),
+      )
+
+    return ChatRuntime(
+      system_prompt="system",
+      build_runner=_build_runner,
+      capability_execution=capability_execution,
+    )
+
+  def _resolve_replay_adapter(adapter: str) -> ModelProvider:
+    if adapter != "anthropic.messages":
+      raise ValueError(f"unexpected adapter: {adapter}")
+    return provider
+
+  app = create_gateway_app(
+    GatewayServerConfig(
+      **_strict_session_driver_config(
+        provider="anthropic",
+        model="stub-model",
+        effort="none",
+        tenant_id="test-product",
+        auth_config={
+          "provider": "anthropic",
+          "billing_mode": "byok",
+          "rate_table_version": "unknown",
+          "api_key": "k",
+        },
+      ),
+      default_provider=provider,
+      capability_adapter_resolver=_resolve_replay_adapter,
+      build_chat_runtime=_build_chat_runtime,
+    )
+  )
+  client = TestClient(app)
+  init = _init_session(client)
+
+  _consume_chat_stream(
+    client,
+    init["session_token"],
+    {"messages": [{"role": "user", "content": first_user}]},
+  )
+
+  first_span = [
+    json.loads(line)["event"]
+    for line in session_log.path.read_text(encoding="utf-8").splitlines()
+  ]
+  assert [event["type"] for event in first_span] == [
+    "attach",
+    "user_message",
+    "context_manifest",
+    "assistant_message",
+    "detach",
+  ]
+
+  _consume_chat_stream(
+    client,
+    init["session_token"],
+    {"messages": [{"role": "user", "content": second_user}]},
+  )
+
+  assert client_requests == [
+    [{"role": "user", "content": first_user}],
+    [{"role": "user", "content": second_user}],
+  ]
+  assert len(provider.captured_messages) == 2
+  second_model_input = json.dumps(provider.captured_messages[1], default=str)
+  assert first_user in second_model_input
+  assert first_assistant in second_model_input
+  assert second_user in second_model_input
 
 
 def _resolver_result_for(user_id: str, *, channel: str = "excel") -> ResolverResult:
@@ -984,7 +1152,7 @@ def test_chat_request_drain_trailing_constructs_deferred_event_log() -> None:
 
 
 def test_chat_late_dispatch_failure_logs_traceback(caplog) -> None:
-  async def _build_chat_runtime(*_args, **_kwargs):
+  async def _build_chat_runtime(*_args, storage_root: Path | None = None, **_kwargs):
     await asyncio.sleep(0.05)
     raise RuntimeError("late chat dispatch failure")
 
@@ -1109,6 +1277,13 @@ def test_gateway_server_config_accepts_on_session_created_hook() -> None:
   def _hook(_session, _api_key: str, _request) -> None:
     return None
 
+  async def _build_chat_runtime(
+    *_args: object,
+    storage_root: Path | None = None,
+    **_kwargs: object,
+  ) -> ChatRuntime:
+    raise AssertionError("runtime builder must not run during config construction")
+
   config = GatewayServerConfig(
     **_strict_session_driver_config(
       provider="anthropic",
@@ -1119,8 +1294,8 @@ def test_gateway_server_config_accepts_on_session_created_hook() -> None:
         "api_key": "service-test-key",
       },
     ),
-    build_chat_runtime=lambda *_args, **_kwargs: None,
     on_session_created=_hook,
+    build_chat_runtime=_build_chat_runtime,
   )
 
   assert config.on_session_created is _hook
@@ -1151,18 +1326,27 @@ def test_on_session_created_exception_expires_session_and_reraises() -> None:
 
 
 def test_auth_config_to_dict_is_called_before_create_session_boundary() -> None:
-  class _TrackedAuthConfig:
-    calls = 0
+  to_dict_calls: list[None] = []
+
+  class _TrackedAuthConfig(AuthConfig):
+    @property
+    def calls(self) -> int:
+      return len(to_dict_calls)
 
     def to_dict(self) -> dict[str, Any]:
-      self.calls += 1
-      return {
-        "provider": "anthropic",
-        "billing_mode": "byok",
-        "api_key": "tracked-key",
-      }
+      to_dict_calls.append(None)
+      return super().to_dict()
 
-  tracked = _TrackedAuthConfig()
+  tracked = _TrackedAuthConfig(
+    provider="anthropic",
+    billing_mode="byok",
+    max_tokens=None,
+    _raw={
+      "provider": "anthropic",
+      "billing_mode": "byok",
+      "api_key": "tracked-key",
+    },
+  )
 
   async def _resolver(_api_key: str, _init_request):
     return ResolverResult(

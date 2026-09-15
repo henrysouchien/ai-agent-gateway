@@ -26,7 +26,7 @@ def _bind_receipt() -> dict[str, str]:
     registry_revision="test-v1",
     policy_revision="test-v1",
     selection_source="explicit_user",
-  ).receipt()
+  ).to_json()
 
 
 def _summary(**changes) -> SessionUsageSummary:
@@ -277,6 +277,16 @@ def test_reconciliation_distinguishes_emergency_durability_from_lost_fact() -> N
   assert recovered.status == "match"
   assert recovered.emergency_spooled_event_count == 1
   assert recovered.durability_lost_event_count == 0
+
+
+def test_reconciliation_rejects_unknown_sink_durability() -> None:
+  tracker = CommercialUsageReconciliationTracker(
+    request_id="req_001", session_id="sess_001"
+  )
+  with pytest.raises(ValueError, match="durability is not admitted"):
+    tracker.record_batch([_base_payload()], durability=None)  # pyright: ignore[reportArgumentType]  # negative: missing durability rejection
+  with pytest.raises(ValueError, match="durability is not admitted"):
+    tracker.record_batch([_base_payload()], durability="durable")  # pyright: ignore[reportArgumentType]  # negative: durability alias rejection
 
 
 def test_parent_with_provider_units_remains_provider_call_and_cannot_double_children() -> None:

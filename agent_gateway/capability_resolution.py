@@ -33,13 +33,14 @@ and the gateway never statically imports ``agent.*``.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal, Protocol, TypeGuard
 
 from agent_workflow_contracts import (
   AdmittedInputBinding,
+  AdmittedToolRoute,
   CatalogToolEntry,
   ExecutionIdentity,
   OperationUnavailable,
@@ -48,8 +49,9 @@ from agent_workflow_contracts import (
   SemanticCapabilityRequirement,
   UnsatisfiedCapability,
 )
+from agent_workflow_contracts.models import CatalogToolEffect
 
-from .mcp_activation import LiveToolSurface
+from .policy_imports import load_server_policy_module
 from .semantic_capability_routing import capability_for_tool
 from .semantic_capabilities import (
   DEFAULT_SEMANTIC_CAPABILITY_REGISTRY,
@@ -70,7 +72,11 @@ class CapabilityResolutionInputError(ValueError):
 
 
 # ``(policy_tool_id, server_id, is_local) -> effect | None``
-ToolEffectResolver = Any
+ToolEffectResolver = Callable[
+  [str, str | None, bool],
+  CatalogToolEffect | None,
+]
+
 
 _WORKSPACE_EFFECT_CEILINGS: Mapping[str, frozenset[str]] = MappingProxyType({
   "read_only": frozenset({"read"}),
@@ -98,7 +104,7 @@ def _default_effect_resolver(
   tool_id: str,
   server_id: str | None,
   is_local: bool,
-) -> str | None:
+) -> CatalogToolEffect | None:
   """Delegate to the one server-owned effect table.
 
   Resolved through the module object so a test that pins
@@ -114,7 +120,8 @@ def _catalog_tool_entry(
   *,
   tool_id: str,
   canonical_name: str,
-  effect: str | None,
+  effect: CatalogToolEffect | None,
+  origin: Literal["local", "mcp"] | None,
   server_id: str | None,
   declaration: ToolDispatchDecl | None,
 ) -> CatalogToolEntry:
@@ -137,6 +144,7 @@ def _catalog_tool_entry(
     tool_id=tool_id,
     canonical_name=canonical_name,
     effect=effect,
+    origin=origin,
     server_id=server_id,
     capability=capability,
     idempotent=declaration.idempotent if declaration is not None else None,
@@ -169,25 +177,26 @@ def snapshot_platform_catalog(
 
   table = declarations if declarations is not None else tool_dispatch_declarations()
   if tool_ids is None:
-    entries = [
+    declarative_entries = [
       _catalog_tool_entry(
         tool_id=name,
         canonical_name=name,
         effect=row.effect,
+        origin=None,
         server_id=None,
         declaration=row,
       )
       for name, row in table.items()
     ]
     return PlatformToolCatalog(
-      tools=tuple(sorted(entries, key=lambda item: item.tool_id))
+      tools=tuple(sorted(declarative_entries, key=lambda item: item.tool_id))
     )
 
   handlers = local_tool_handlers if local_tool_handlers is not None else {}
   resolver = effect_resolver if effect_resolver is not None else _default_effect_resolver
   is_mcp_tool = getattr(mcp_client, "is_mcp_tool", None)
   get_server = getattr(mcp_client, "get_server_for_tool", None)
-  get_original = getattr(mcp_client, "get_original_tool_name", None)
+  get_policy_name = getattr(mcp_client, "get_policy_tool_name", None)
   entries: dict[str, CatalogToolEntry] = {}
   for raw in tool_ids:
     tool_id = str(raw or "").strip()
@@ -206,18 +215,30 @@ def snapshot_platform_catalog(
     )
     if is_mcp and server_id is None:
       continue
-    policy_tool_id = (
-      str(get_original(tool_id) or tool_id).strip()
-      if is_mcp and callable(get_original)
-      else tool_id
-    )
+    policy_tool_id = tool_id
+    if is_mcp:
+      if not callable(get_policy_name):
+        continue
+      resolved_policy_name = get_policy_name(tool_id)
+      if type(resolved_policy_name) is not str:
+        continue
+      policy_tool_id = resolved_policy_name.strip()
+      if not policy_tool_id or policy_tool_id != resolved_policy_name:
+        continue
     canonical = canonical_dispatch_tool_name(policy_tool_id)
+    matched_route = _exact_policy_route(
+      tool_id,
+      origin="local" if is_local else "mcp",
+      server=server_id,
+      original_tool_name=policy_tool_id,
+    )
     entries[tool_id] = _catalog_tool_entry(
       tool_id=tool_id,
       canonical_name=canonical,
       effect=resolver(policy_tool_id, server_id, is_local),
+      origin="local" if is_local else "mcp",
       server_id=server_id,
-      declaration=table.get(canonical),
+      declaration=(table.get(canonical) if matched_route is not None else None),
     )
   return PlatformToolCatalog(
     tools=tuple(entries[name] for name in sorted(entries))
@@ -259,11 +280,115 @@ def reset_platform_catalog_cache() -> None:
   _CACHED_DECLARATIVE_CATALOG = None
 
 
-def lookup_catalog_entry(tool_name: str) -> CatalogToolEntry | None:
-  """Return the catalog entry for ``tool_name``, or ``None`` when undescribed."""
+def _exact_policy_route(
+  tool_name: str,
+  *,
+  origin: str | None,
+  server: str | None,
+  original_tool_name: str | None,
+) -> tuple[Literal["local", "mcp"], str, str | None] | None:
+  """Return exact policy identity for one current live route.
 
+  ``origin`` is a fact from the dispatch boundary, not inferred from a missing
+  server.  The canonical product policy remains the sole owner of local/MCP
+  identity; an unavailable or incoherent policy therefore leaves the dispatch
+  undescribed and ineligible for retry.
+  """
+
+  if type(tool_name) is not str or not tool_name or tool_name != tool_name.strip():
+    return None
+  if type(origin) is not str:
+    return None
+  if origin != "local" and origin != "mcp":
+    return None
+  if type(original_tool_name) is not str:
+    return None
+  canonical_name = original_tool_name.strip()
+  if not canonical_name or canonical_name != original_tool_name:
+    return None
+
+  embedded_server: str | None = None
+  embedded_name: str | None = None
+  if tool_name.startswith("mcp__"):
+    parts = tool_name.split("__", 2)
+    if len(parts) != 3 or not parts[1] or not parts[2]:
+      return None
+    embedded_server = parts[1]
+    embedded_name = parts[2]
+
+  try:
+    policy = load_server_policy_module()
+    if policy is None:
+      return None
+    get_server = getattr(policy, "get_server_for_policy_tool", None)
+    get_local_effect = getattr(policy, "get_local_tool_effect", None)
+    if not callable(get_server) or not callable(get_local_effect):
+      return None
+    policy_server = get_server(canonical_name)
+    local_effect = get_local_effect(canonical_name)
+  except Exception:
+    return None
+
+  if origin == "local":
+    if server is not None or embedded_server is not None:
+      return None
+    if tool_name != canonical_name:
+      return None
+    if policy_server is not None or local_effect is None:
+      return None
+    exact_server = None
+  else:
+    if type(server) is not str or not server or server != server.strip():
+      return None
+    if embedded_server is not None and embedded_server != server:
+      return None
+    if embedded_name is not None and embedded_name != canonical_name:
+      return None
+    if type(policy_server) is not str or policy_server != server:
+      return None
+    if local_effect is not None:
+      return None
+    exact_server = server
+  return origin, canonical_name, exact_server
+
+
+def lookup_catalog_entry(
+  tool_name: str,
+  *,
+  origin: str | None,
+  server: str | None,
+  original_tool_name: str | None,
+) -> CatalogToolEntry | None:
+  """Attach a declaration only to its exact live, policy-owned route."""
+
+  route = _exact_policy_route(
+    tool_name,
+    origin=origin,
+    server=server,
+    original_tool_name=original_tool_name,
+  )
+  if route is None:
+    return None
+  exact_origin, canonical_name, exact_server = route
   _catalog, index = _declarative_catalog_index()
-  return index.get(canonical_dispatch_tool_name(tool_name))
+  declaration_entry = index.get(canonical_name)
+  if declaration_entry is None:
+    return None
+  return CatalogToolEntry(
+    tool_id=tool_name,
+    canonical_name=canonical_name,
+    effect=declaration_entry.effect,
+    origin=exact_origin,
+    server_id=exact_server,
+    capability=capability_for_tool(
+      canonical_name=canonical_name,
+      server_id=exact_server,
+      effect=declaration_entry.effect,
+    ),
+    idempotent=declaration_entry.idempotent,
+    success_signal=declaration_entry.success_signal,
+    source_identity=declaration_entry.source_identity,
+  )
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,14 +411,42 @@ class OperationDeclaration:
   inputs: tuple[AdmittedInputBinding, ...] = ()
 
 
-def admitted_catalog_routes(
+class AdmittedCatalogRoute(Protocol):
+  """Static view of a catalog route whose effect passed the authority ceiling."""
+
+  @property
+  def tool_id(self) -> str: ...
+
+  @property
+  def effect(self) -> CatalogToolEffect: ...
+
+  @property
+  def origin(self) -> Literal["local", "mcp"] | None: ...
+
+  @property
+  def server_id(self) -> str | None: ...
+
+  @property
+  def capability(self) -> str | None: ...
+
+
+def _has_admitted_effect(
+  entry: CatalogToolEntry,
+  *,
+  ceiling: Collection[str],
+) -> TypeGuard[AdmittedCatalogRoute]:
+  return entry.effect is not None and entry.effect in ceiling
+
+
+def _admitted_catalog_route_views(
   declaration: OperationDeclaration,
   *,
   catalog: PlatformToolCatalog,
   exclusions: Iterable[str] = (),
-) -> tuple[CatalogToolEntry, ...]:
-  """The exact catalog entries one declaration may draw authority from."""
-
+) -> tuple[
+  tuple[AdmittedCatalogRoute, ...],
+  tuple[CatalogToolEntry, ...],
+]:
   ceiling = _WORKSPACE_EFFECT_CEILINGS.get(declaration.workspace_scope)
   if ceiling is None:
     raise CapabilityResolutionInputError(
@@ -301,22 +454,44 @@ def admitted_catalog_routes(
     )
   excluded = frozenset(exclusions)
   mcp_ceiling = declaration.mcp_tool_ceiling
-  admitted: list[CatalogToolEntry] = []
+  admitted_routes: list[AdmittedCatalogRoute] = []
+  admitted_entries: list[CatalogToolEntry] = []
   for entry in catalog.tools:
+    catalog_entry = entry
     if entry.tool_id not in declaration.tool_ceiling:
       continue
     if entry.tool_id in excluded:
       continue
-    if entry.effect is None or entry.effect not in ceiling:
+    if not _has_admitted_effect(entry, ceiling=ceiling):
       continue
     if (
-      entry.server_id is not None
+      entry.origin == "mcp"
       and mcp_ceiling is not None
       and entry.tool_id not in mcp_ceiling
     ):
       continue
-    admitted.append(entry)
-  return tuple(sorted(admitted, key=lambda item: item.tool_id))
+    admitted_routes.append(entry)
+    admitted_entries.append(catalog_entry)
+  return (
+    tuple(sorted(admitted_routes, key=lambda item: item.tool_id)),
+    tuple(sorted(admitted_entries, key=lambda item: item.tool_id)),
+  )
+
+
+def admitted_catalog_routes(
+  declaration: OperationDeclaration,
+  *,
+  catalog: PlatformToolCatalog,
+  exclusions: Iterable[str] = (),
+) -> tuple[AdmittedCatalogRoute, ...]:
+  """The exact catalog routes one declaration may draw authority from."""
+
+  admitted, _admitted_entries = _admitted_catalog_route_views(
+    declaration,
+    catalog=catalog,
+    exclusions=exclusions,
+  )
+  return admitted
 
 
 def _unsatisfied_capabilities(
@@ -390,7 +565,7 @@ def resolve_operation_authority(
       "resolve_operation_authority requires a PlatformToolCatalog"
     )
   try:
-    admitted = admitted_catalog_routes(
+    admitted, admitted_entries = _admitted_catalog_route_views(
       declaration,
       catalog=catalog,
       exclusions=exclusions,
@@ -407,7 +582,7 @@ def resolve_operation_authority(
   routes = tuple(
     SemanticToolRoute(
       tool_id=entry.tool_id,
-      effect=str(entry.effect),
+      effect=entry.effect,
       server_id=entry.server_id,
       capability=entry.capability,
     )
@@ -442,7 +617,7 @@ def resolve_operation_authority(
     operation_name=declaration.operation_name,
     grant=compiled.tool_grant,
     bindings=compiled.capability_bindings,
-    routes=tuple(entry for entry in admitted if entry.tool_id in granted),
+    routes=tuple(entry for entry in admitted_entries if entry.tool_id in granted),
     identity=identity,
   )
 
@@ -453,30 +628,35 @@ def granted_tool_ids(authority: ResolvedAuthority) -> frozenset[str]:
   return frozenset(entry.tool_id for entry in authority.grant.tools)
 
 
+def admitted_tool_routes(
+  authority: ResolvedAuthority,
+) -> tuple[AdmittedToolRoute, ...]:
+  """Project exact physical routes in the tool grant's canonical order."""
+
+  routes_by_id = {route.tool_id: route for route in authority.physical_routes}
+  return tuple(
+    AdmittedToolRoute(
+      tool_id=entry.tool_id,
+      origin=routes_by_id[entry.tool_id].origin,
+      server_id=routes_by_id[entry.tool_id].server_id,
+    )
+    for entry in authority.grant.tools
+  )
+
+
 def derive_dispatcher_allowlist(
-  authority: ResolvedAuthority | LiveToolSurface,
+  authority: ResolvedAuthority,
 ) -> dict[str, frozenset[str]]:
-  """Project one settled decision into the dispatcher's per-server scope.
+  """Project one resolved operation authority into dispatcher MCP scope."""
 
-  Both paths that grant MCP tools end here.  The delegation path passes the
-  frozen :class:`ResolvedAuthority`; the interactive path passes the
-  :class:`~agent_gateway.mcp_activation.LiveToolSurface` derived from the
-  session's activation fold.  One function, so a tool the dispatcher admits is
-  a tool something actually granted — never a second, separately maintained
-  allowlist (T3-I12).
-  """
-
-  if isinstance(authority, LiveToolSurface):
-    return {
-      server_id: frozenset(tool_ids)
-      for server_id, tool_ids in sorted(
-        authority.allowed_mcp_tools_by_server.items()
-      )
-    }
   granted = granted_tool_ids(authority)
   scope: dict[str, set[str]] = {}
   for route in authority.routes:
-    if route.tool_id not in granted or route.server_id is None:
+    if (
+      route.tool_id not in granted
+      or route.origin != "mcp"
+      or route.server_id is None
+    ):
       continue
     scope.setdefault(route.server_id, set()).add(route.tool_id)
   return {
@@ -486,8 +666,10 @@ def derive_dispatcher_allowlist(
 
 
 __all__ = [
+  "AdmittedCatalogRoute",
   "CapabilityResolutionInputError",
   "OperationDeclaration",
+  "admitted_tool_routes",
   "admitted_catalog_routes",
   "canonical_dispatch_tool_name",
   "declarative_platform_catalog",

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
+from agent_gateway.approval_policy import ApprovalRequest
 
 from agent_gateway.batch_approval_projection import (
   BatchApprovalProjectionRegistry,
@@ -13,6 +15,95 @@ from agent_gateway.batch_approval_projection import (
   current_batch_approval_scope,
   require_batch_stage_run_seq,
 )
+
+
+def _approval_request(
+  *,
+  approval_id: str,
+  request_id: str,
+  session_id: str,
+) -> ApprovalRequest:
+  return ApprovalRequest(
+    approval_id=approval_id,
+    tool_call_id="tool-1",
+    parent_approval_id=None,
+    approval_chain_id=approval_id,
+    request_id=request_id,
+    session_id=session_id,
+    run_id=request_id,
+    user_id="1",
+    profile="chat",
+    channel="tui",
+    tool_name="place_order",
+    tool_class="state_write",
+    tool_args_redacted={"ticker": "MSFT"},
+    args_hash="args-1",
+    reason="needs approval",
+    blast_radius_summary="state_write:place_order",
+    state="pending_user",
+    requested_at=datetime(2026, 1, 1, tzinfo=UTC),
+  )
+
+
+class _BatchApprovalAdmissionStoreFake:
+  def __init__(self, request: ApprovalRequest) -> None:
+    self.request = request
+
+  async def abort_unpublished_approval(
+    self,
+    approval_id: str,
+    *,
+    expected_tool_call_id: str,
+    expected_user_id: str,
+    expected_request_id: str,
+    expected_run_id: str,
+    expected_session_id: str,
+    expected_channel: str | None,
+    decision_reason: str,
+  ) -> tuple[ApprovalRequest, bool, bool]:
+    _ = (
+      expected_tool_call_id,
+      expected_user_id,
+      expected_request_id,
+      expected_run_id,
+      expected_session_id,
+      expected_channel,
+      decision_reason,
+    )
+    assert approval_id == self.request.approval_id
+    return self.request, False, True
+
+  async def fence_persistent_grants_for_cancellation(
+    self,
+    approval_id: str,
+    *,
+    expected_tool_call_id: str,
+    expected_user_id: str,
+    expected_request_id: str,
+    expected_run_id: str,
+    expected_session_id: str,
+    expected_channel: str | None,
+  ) -> tuple[ApprovalRequest, bool]:
+    _ = (
+      expected_tool_call_id,
+      expected_user_id,
+      expected_request_id,
+      expected_run_id,
+      expected_session_id,
+      expected_channel,
+    )
+    assert approval_id == self.request.approval_id
+    return self.request, False
+
+  async def revoke_persistent_grants_for_approval(
+    self,
+    approval_id: str,
+    *,
+    revoked_at: datetime | None = None,
+  ) -> int:
+    _ = revoked_at
+    assert approval_id == self.request.approval_id
+    return 0
 
 
 def _session(user_id: str = "1", channel: str = "tui") -> SimpleNamespace:
@@ -318,11 +409,12 @@ def test_batch_freeze_drains_admitted_approval_before_snapshot() -> None:
   async def run_case() -> None:
     registry = BatchApprovalProjectionRegistry()
     session = _session()
-    store = SimpleNamespace(
-      abort_unpublished_approval=lambda *args, **kwargs: None,
-      fence_persistent_grants_for_cancellation=lambda *args, **kwargs: None,
-      revoke_persistent_grants_for_approval=lambda *args, **kwargs: None,
+    request = _approval_request(
+      approval_id="approval-admitted-before-freeze",
+      request_id="batch_12",
+      session_id=session.session_id,
     )
+    store = _BatchApprovalAdmissionStoreFake(request)
     scope = BatchApprovalScope(
       batch_id=12,
       owner_user_id="1",
@@ -342,15 +434,7 @@ def test_batch_freeze_drains_admitted_approval_before_snapshot() -> None:
     assert not freeze_task.done()
     _install_pending(session, "approval-admitted-before-freeze")
     admission.bind_request(
-      request=SimpleNamespace(
-        approval_id="approval-admitted-before-freeze",
-        tool_call_id="tool-1",
-        user_id="1",
-        request_id="batch_12",
-        run_id="batch_12",
-        session_id=session.session_id,
-        channel="tui",
-      ),
+      request=request,
       store=store,
     )
     admission.publish_pending()
@@ -367,11 +451,12 @@ def test_batch_drain_retains_projection_published_then_removed_from_carrier() ->
   async def run_case() -> None:
     registry = BatchApprovalProjectionRegistry()
     session = _session()
-    store = SimpleNamespace(
-      abort_unpublished_approval=lambda *args, **kwargs: None,
-      fence_persistent_grants_for_cancellation=lambda *args, **kwargs: None,
-      revoke_persistent_grants_for_approval=lambda *args, **kwargs: None,
+    request = _approval_request(
+      approval_id="approval-transient-after-fence",
+      request_id="batch_15",
+      session_id=session.session_id,
     )
+    store = _BatchApprovalAdmissionStoreFake(request)
     scope = BatchApprovalScope(
       batch_id=15,
       owner_user_id="1",
@@ -383,15 +468,7 @@ def test_batch_drain_retains_projection_published_then_removed_from_carrier() ->
     scope.register_session(session)
     admission = scope.acquire_admission(session)
     admission.bind_request(
-      request=SimpleNamespace(
-        approval_id="approval-transient-after-fence",
-        tool_call_id="tool-1",
-        user_id="1",
-        request_id="batch_15",
-        run_id="batch_15",
-        session_id=session.session_id,
-        channel="tui",
-      ),
+      request=request,
       store=store,
     )
 

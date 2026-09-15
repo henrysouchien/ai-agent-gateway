@@ -11,6 +11,7 @@ from ..agent_telemetry import make_prepare_env_with_agent_telemetry
 from ..runner import ToolResultContext
 from ..session import GatewaySession
 from ..tool_dispatcher import ApprovalKeyQualifier, LocalToolHandler
+from ..tool_policy_registry import PreparedToolCall, ToolInputPreparationError
 from ._background import BackgroundTask, OutputRingBuffer
 from ._backends import DockerBackend, ExecutionBackend, SubprocessBackend
 from ._config import CodeExecutionConfig
@@ -34,6 +35,7 @@ class CodeExecutionBundle:
   needs_approval: Callable[[str, Dict[str, Any] | None, str], bool]
   sanitize_hook: Callable[[ToolResultContext], None]
   ensure_work_dir: Callable[[], str]
+  prepare_call: Callable[[Dict[str, Any]], PreparedToolCall]
 
 
 def build_code_execution(
@@ -124,8 +126,15 @@ def build_code_execution(
     if not resolved_host:
       return None, {"code": "internal_error", "message": "Backend resolution failed"}
 
-    backend = _get_backend(resolved_host)
-    if not backend.available():
+    try:
+      backend = _get_backend(resolved_host)
+      backend_available = backend.available()
+    except Exception:
+      return None, {
+        "code": "backend_unavailable",
+        "message": f"Backend '{resolved_host}' unavailable",
+      }
+    if not backend_available:
       return None, {"code": "backend_unavailable", "message": f"Backend '{resolved_host}' unavailable"}
 
     work_dir = _ensure_code_execution_work_dir()
@@ -317,6 +326,58 @@ def build_code_execution(
     _, error = _timeout_ms_input(tool_input, cfg)
     return error is not None
 
+  def _prepare_call(raw_input: Dict[str, Any]) -> PreparedToolCall:
+    if not isinstance(raw_input, dict):
+      raise ToolInputPreparationError({
+        "code": "invalid_input",
+        "message": "code_execute input must be an object",
+      })
+    prepared = dict(raw_input)
+    host, error = _string_input(prepared, "host", default="auto")
+    if error is not None:
+      raise ToolInputPreparationError(error)
+    assert host is not None
+    valid_hosts = {"auto", *set(_get_registered_backend_names())}
+    if host not in valid_hosts:
+      raise ToolInputPreparationError({
+        "code": "invalid_input",
+        "message": f"Unknown host: '{host}'",
+      })
+    _, error = _boolean_input(prepared, "background", default=False)
+    if error is not None:
+      raise ToolInputPreparationError(error)
+    _, error = _string_input(
+      prepared,
+      "code",
+      required_message="code is required",
+      non_empty=True,
+    )
+    if error is not None:
+      raise ToolInputPreparationError(error)
+    _, error = _timeout_ms_input(prepared, cfg)
+    if error is not None:
+      raise ToolInputPreparationError(error)
+    try:
+      backend = _get_backend(host if host != "auto" else None)
+    except Exception as exc:
+      raise ToolInputPreparationError({
+        "code": "invalid_input",
+        "message": "Code execution backend could not be resolved",
+      }) from exc
+    try:
+      backend_available = host == "auto" or backend.available()
+    except Exception as exc:
+      raise ToolInputPreparationError({
+        "code": "backend_unavailable",
+        "message": "Code execution backend availability could not be determined",
+      }) from exc
+    if not backend_available:
+      raise ToolInputPreparationError({
+        "code": "backend_unavailable",
+        "message": f"Backend '{backend.name}' unavailable",
+      })
+    return PreparedToolCall(prepared, backend.name)
+
   def _needs_approval(
     tool_name: str,
     tool_input: Dict[str, Any] | None = None,
@@ -347,4 +408,5 @@ def build_code_execution(
     needs_approval=_needs_approval,
     sanitize_hook=strip_code_execute_base64_hook,
     ensure_work_dir=_ensure_code_execution_work_dir,
+    prepare_call=_prepare_call,
   )

@@ -17,8 +17,16 @@ from agent_gateway.model_registry import (
   INITIAL_MODEL_REGISTRY,
   INITIAL_MODEL_SELECTION_POLICY,
 )
+from agent_gateway.event_log import EventLog
 from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
-from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
+from agent_gateway.server import (
+  ChatRequest,
+  ChatRuntime,
+  GatewayServerConfig,
+  create_gateway_app,
+)
+from agent_gateway.session import AuthManager, GatewaySession
+from agent_gateway.server_models import SystemPrompt
 
 
 API_KEY = "artifacts-pr8-key"
@@ -56,6 +64,26 @@ class _FakeAutonomousRegistry:
     return None
 
 
+class _NoopBuildRunner:
+  async def run(
+    self,
+    *,
+    messages: list[dict[str, object]],
+    system_prompt: SystemPrompt | None = None,
+    max_turns: int | None = None,
+  ) -> None:
+    _ = messages, system_prompt, max_turns
+
+
+def _build_noop_runner(
+  event_log: EventLog,
+  session_id: str,
+  started_at: float,
+) -> _NoopBuildRunner:
+  _ = event_log, session_id, started_at
+  return _NoopBuildRunner()
+
+
 @pytest.fixture
 def artifact_pr8(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ArtifactPr8Fixture:
   data_dir = tmp_path / "data"
@@ -64,12 +92,21 @@ def artifact_pr8(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ArtifactPr8
   monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
   monkeypatch.setenv("AGENT_API_CLAIM_MAX_TTL_SECONDS", "600")
 
-  async def _build_chat_runtime(*, session, request, channel, auth_manager):
-    _ = session, channel, auth_manager
+  async def _build_chat_runtime(
+    session: GatewaySession,
+    request: ChatRequest,
+    channel: str | None,
+    auth_manager: AuthManager | None,
+    *,
+    storage_root: Path | None = None,
+  ) -> ChatRuntime:
+    _ = session, channel, auth_manager, storage_root
+    capability_execution = request.capability_execution
+    assert capability_execution is not None
     return ChatRuntime(
       system_prompt="test",
-      build_runner=lambda *_args: None,
-      capability_execution=request.capability_execution,
+      build_runner=_build_noop_runner,
+      capability_execution=capability_execution,
     )
 
   app = create_gateway_app(
@@ -755,6 +792,53 @@ def test_control_artifacts_boolean_research_file_id_fails_closed_when_unresolved
     "origin_ref": None,
     "classification_source": "unresolved_research_file",
   }
+
+
+def test_control_artifacts_unknown_classification_values_are_carried_not_demoted(
+  artifact_pr8: ArtifactPr8Fixture,
+) -> None:
+  artifact_id = "2026-05-20T130000.000-run-unknown-enum"
+  payload = _write_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    "PCTY",
+    "earnings-scenarios",
+    artifact_id,
+    mtime=1_800_000_002,
+    payload_updates={"origin_kind": "quarantine", "visibility": "pending_review"},
+  )
+
+  with TestClient(artifact_pr8.app) as client:
+    headers = _bearer_headers(client, USER_ID)
+    all_list = client.get(
+      "/api/control/artifacts?visibility=all&origin_kind=all",
+      headers=headers,
+    )
+    all_latest = client.get(
+      "/api/control/artifacts/PCTY/earnings-scenarios/latest?visibility=all&origin_kind=all",
+      headers=headers,
+    )
+    archived_latest = client.get(
+      "/api/control/artifacts/PCTY/earnings-scenarios/latest?visibility=archived&origin_kind=import",
+      headers=headers,
+    )
+
+  assert all_list.status_code == 200
+  assert [artifact["artifact_id"] for artifact in all_list.json()["artifacts"]] == [artifact_id]
+  assert all_latest.status_code == 200
+  assert all_latest.json() == {
+    **payload,
+    "research_file_id": None,
+    "control_run_id": None,
+    "has_research_file": False,
+    "origin_kind": "quarantine",
+    "visibility": "pending_review",
+    "origin_ref": None,
+    "classification_source": "sidecar",
+  }
+  # The invalid-sidecar demotion path is gone: an unknown self-produced enum
+  # value no longer masquerades as an archived import.
+  assert archived_latest.status_code == 404
 
 
 @pytest.mark.parametrize("auth_mode", ["bearer", "signed"])

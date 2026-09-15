@@ -8,19 +8,22 @@ included.  That is why a methodology could declare "I need evidence" and be
 admitted by a tool that cannot possibly supply it.
 
 This module is the one place that answers "which capability does this tool
-serve".  It is a **derivation**, not a second declaration table: the effect
-comes from the server-owned effect table (via the caller), and the domain
-comes from the route the platform already knows the tool by — its canonical
-name first, then its owning MCP server.  Both the live catalog snapshot and
-the skill-metadata codegen read this one function, so a skill's declared
-requirement and the route that satisfies it can never be derived from two
-different opinions.
+serve".  Static registration derives from an exact registered identity first,
+then its owning MCP server and intrinsic effect.  The existing bare-name
+helper remains a compatibility projection for current runtime readers only.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from types import MappingProxyType
+
+from agent_workflow_contracts.tool_registration import (
+  RegisteredToolIdentity,
+  ToolEffect,
+  ToolRegistrationContractError,
+  validate_registered_tool_identity,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -46,32 +49,56 @@ STATE_MUTATE = "state.mutate/v1"
 MARKET_DATA_HISTORY = "market-data.history/v1"
 
 
-#: Canonical tool name -> read capability.  Checked before the server map so a
-#: filings/transcripts route keeps its domain no matter which server hosts it.
-_READ_CAPABILITY_BY_TOOL: Mapping[str, str] = MappingProxyType({
-  "docs_fetch": WEB_READ,
-  "docs_search": WEB_READ,
-  "web_fetch": WEB_READ,
-  "web_search": WEB_READ,
-  "filings_list": FILINGS_READ,
-  "filings_read": FILINGS_READ,
-  "filings_search": FILINGS_READ,
-  "filings_source_excerpt": FILINGS_READ,
-  "get_earnings_transcript": TRANSCRIPTS_READ,
-  "transcripts_list": TRANSCRIPTS_READ,
-  "transcripts_read": TRANSCRIPTS_READ,
-  "transcripts_search": TRANSCRIPTS_READ,
-  "transcripts_source_excerpt": TRANSCRIPTS_READ,
-  "file_glob": CORPUS_READ,
-  "file_grep": CORPUS_READ,
-  "file_read": CORPUS_READ,
-  "memory_list": CORPUS_READ,
-  "memory_read": CORPUS_READ,
-  "memory_recall": CORPUS_READ,
-  "fms_compute_quantifying_risk": COMPUTATION_EXECUTE,
-  "invoke_skill": COMPUTATION_EXECUTE,
-  "load_tools": COMPUTATION_EXECUTE,
-  "valuation_ready_batch_read": COMPUTATION_EXECUTE,
+def _local(logical_name: str) -> RegisteredToolIdentity:
+  return RegisteredToolIdentity(
+    route_kind="local_handler",
+    logical_name=logical_name,
+  )
+
+
+def _mcp(logical_server_id: str, logical_name: str) -> RegisteredToolIdentity:
+  return RegisteredToolIdentity(
+    route_kind="mcp",
+    logical_server_id=logical_server_id,
+    logical_name=logical_name,
+  )
+
+
+#: Exact registered identity -> read capability.  Identity overrides precede
+#: the owning-server default and cannot leak to a same-bare-name route.
+_READ_CAPABILITY_BY_IDENTITY: Mapping[RegisteredToolIdentity, str] = (
+  MappingProxyType({
+    _local("docs_fetch"): WEB_READ,
+    _local("docs_search"): WEB_READ,
+    _local("web_fetch"): WEB_READ,
+    _local("web_search"): WEB_READ,
+    _mcp("research-corpus-mcp", "filings_list"): FILINGS_READ,
+    _mcp("research-corpus-mcp", "filings_read"): FILINGS_READ,
+    _mcp("research-corpus-mcp", "filings_search"): FILINGS_READ,
+    _mcp("research-corpus-mcp", "filings_source_excerpt"): FILINGS_READ,
+    _mcp("market-data-mcp", "get_earnings_transcript"): TRANSCRIPTS_READ,
+    _mcp("research-corpus-mcp", "transcripts_list"): TRANSCRIPTS_READ,
+    _mcp("research-corpus-mcp", "transcripts_read"): TRANSCRIPTS_READ,
+    _mcp("research-corpus-mcp", "transcripts_search"): TRANSCRIPTS_READ,
+    _mcp("research-corpus-mcp", "transcripts_source_excerpt"): TRANSCRIPTS_READ,
+    _local("file_glob"): CORPUS_READ,
+    _local("file_grep"): CORPUS_READ,
+    _local("file_read"): CORPUS_READ,
+    _local("memory_list"): CORPUS_READ,
+    _local("memory_read"): CORPUS_READ,
+    _local("memory_recall"): CORPUS_READ,
+    _local("fms_compute_quantifying_risk"): COMPUTATION_EXECUTE,
+    _local("invoke_skill"): COMPUTATION_EXECUTE,
+    _local("load_tools"): COMPUTATION_EXECUTE,
+    _local("valuation_ready_batch_read"): COMPUTATION_EXECUTE,
+  })
+)
+
+# Current runtime readers still pass a bare name.  This compatibility view is
+# projected one way from exact overrides and is not consulted by registration.
+_LEGACY_READ_CAPABILITY_BY_TOOL: Mapping[str, str] = MappingProxyType({
+  identity.logical_name: capability
+  for identity, capability in _READ_CAPABILITY_BY_IDENTITY.items()
 })
 
 #: MCP server -> read capability for every tool it owns that the tool map
@@ -96,6 +123,24 @@ _READ_CAPABILITY_BY_SERVER: Mapping[str, str] = MappingProxyType({
 _DEFAULT_READ_CAPABILITY = CORPUS_READ
 
 
+# Compatibility corrections that the old four-effect normalization could not
+# express.  These are immutable derivation inputs, not another tool catalog.
+SEMANTIC_CAPABILITY_CORRECTIONS_BY_EFFECT: Mapping[str, str] = MappingProxyType({
+  "irreversible": STATE_MUTATE,
+  "portfolio_config": STATE_MUTATE,
+})
+SEMANTIC_CAPABILITY_CORRECTIONS_BY_IDENTITY: Mapping[
+  RegisteredToolIdentity, str
+] = (
+  MappingProxyType({
+    _mcp("timesfm", "timesfm_forecast"): COMPUTATION_EXECUTE,
+  })
+)
+
+_READ_INTRINSIC_EFFECTS = frozenset({"read", "pure_transform", "support"})
+_PROPOSE_INTRINSIC_EFFECTS = frozenset({"preview", "artifact_write"})
+
+
 def capability_for_tool(
   *,
   canonical_name: str,
@@ -111,7 +156,7 @@ def capability_for_tool(
 
   name = str(canonical_name or "").strip()
   if effect == "read":
-    by_tool = _READ_CAPABILITY_BY_TOOL.get(name)
+    by_tool = _LEGACY_READ_CAPABILITY_BY_TOOL.get(name)
     if by_tool is not None:
       return by_tool
     if server_id is not None:
@@ -128,6 +173,48 @@ def capability_for_tool(
   return None
 
 
+def semantic_capability_for_registration(
+  identity: RegisteredToolIdentity,
+  effect: ToolEffect,
+) -> str:
+  """Derive the existing versioned capability for static intrinsic semantics.
+
+  The exact identity is authoritative.  Identity overrides cannot leak across
+  routes that share a bare name, and this function never calls the legacy
+  bare-name compatibility resolver.
+  """
+
+  canonical = validate_registered_tool_identity(identity)
+  if type(effect) is not str:
+    raise TypeError("effect must be an exact str")
+  by_effect = SEMANTIC_CAPABILITY_CORRECTIONS_BY_EFFECT.get(effect)
+  if by_effect is not None:
+    return by_effect
+  if effect in _READ_INTRINSIC_EFFECTS:
+    correction = SEMANTIC_CAPABILITY_CORRECTIONS_BY_IDENTITY.get(canonical)
+    if correction is not None:
+      return correction
+    by_identity = _READ_CAPABILITY_BY_IDENTITY.get(canonical)
+    if by_identity is not None:
+      return by_identity
+    if canonical.route_kind == "mcp":
+      assert canonical.logical_server_id is not None
+      return _READ_CAPABILITY_BY_SERVER.get(
+        canonical.logical_server_id,
+        _DEFAULT_READ_CAPABILITY,
+      )
+    return _DEFAULT_READ_CAPABILITY
+  if effect in _PROPOSE_INTRINSIC_EFFECTS:
+    return ARTIFACT_PROPOSE
+  if effect == "state_write":
+    return WORKSPACE_WRITE if canonical.route_kind != "mcp" else STATE_MUTATE
+  if effect == "external_write":
+    return STATE_MUTATE
+  raise ToolRegistrationContractError(
+    f"unsupported intrinsic tool effect: {effect}"
+    )
+
+
 __all__ = [
   "ARTIFACT_PROPOSE",
   "COMPUTATION_EXECUTE",
@@ -136,8 +223,11 @@ __all__ = [
   "MARKET_DATA_HISTORY",
   "MARKET_DATA_READ",
   "STATE_MUTATE",
+  "SEMANTIC_CAPABILITY_CORRECTIONS_BY_EFFECT",
+  "SEMANTIC_CAPABILITY_CORRECTIONS_BY_IDENTITY",
   "TRANSCRIPTS_READ",
   "WEB_READ",
   "WORKSPACE_WRITE",
   "capability_for_tool",
+  "semantic_capability_for_registration",
 ]

@@ -6,49 +6,75 @@ import subprocess
 import sys
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from agent_gateway.approval_policy import RunContext
+from agent_gateway.approval_route import DurableLocalApprovalRoute
+from agent_gateway.event_log import EventLog
 from agent_gateway.dispatcher_factory import (
   DispatcherConstructionError,
   GatewayDispatcherDeps,
   InvocationPrincipal,
   build_tool_dispatcher,
 )
+from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.session import GatewaySession
 from agent_gateway.tool_dispatcher import ToolDispatcher
+from agent_gateway.tool_dispatcher_helpers import (
+  ApprovalDecision,
+  ApprovalRequest,
+  InterceptContext,
+  InterceptDecision,
+  LocalToolHandler,
+  ToolResult,
+)
 
 ROOT = Path(__file__).resolve().parents[3]
 API_DIR = ROOT / "api"
 if str(API_DIR) not in sys.path:
   sys.path.insert(0, str(API_DIR))
 
-from agent.interactive.tool_dispatcher import ExcelToolDispatcher  # noqa: E402
-from excel_mcp.relay import ChannelType  # noqa: E402
+from agent.interactive.tool_dispatcher import (  # noqa: E402
+  AddinExecuteRequest,
+  ExcelToolDispatcher,
+)
+from excel_mcp.relay import (  # noqa: E402
+  Channel,
+  ChannelRegistry,
+  ChannelType,
+)
 
 
-class _McpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
-    return False
-
-  def get_server_for_tool(self, _name: str) -> str | None:
-    return None
-
-  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
-    return None, {"code": "unknown_tool", "message": name}
 
 
-class _ChannelRegistry:
-  def __init__(self, *, active_channels: list[Any] | None = None) -> None:
-    self._active_channels = list(active_channels or [])
+def _never_needs_approval(
+  _name: str,
+  _tool_input: object,
+  _qualifier: str,
+) -> bool:
+  return False
 
-  def get_active_channels(self) -> list[Any]:
-    return list(self._active_channels)
 
-  def get_channel_for_tool(self, _tool_name: str) -> None:
-    return None
+async def _local_handler(_tool_input: object) -> ToolResult:
+  return {"ok": True}, None
+
+
+async def _request_approval(
+  _request: ApprovalRequest,
+) -> ApprovalDecision | None:
+  return None
+
+
+async def _allow_interceptor(
+  _context: InterceptContext,
+) -> InterceptDecision:
+  return InterceptDecision(action="allow")
+
+
+async def _execute_addin(_request: AddinExecuteRequest) -> ToolResult:
+  return {"ok": True}, None
 
 
 def _session(
@@ -73,7 +99,7 @@ def _session(
 
 def _deps(
   *,
-  mcp_client: Any | None = None,
+  mcp_client: McpClientManager | None = None,
   approval_store: Any = None,
   approval_policy: Any = None,
   mcp_meta_inject_servers: frozenset[str] = frozenset({
@@ -81,7 +107,7 @@ def _deps(
   }),
 ) -> GatewayDispatcherDeps:
   return GatewayDispatcherDeps(
-    mcp_client=mcp_client or _McpClient(),
+    mcp_client=mcp_client or McpClientManager(config_path=None),
     approval_store=approval_store,
     approval_policy=approval_policy,
     mcp_meta_inject_servers=mcp_meta_inject_servers,
@@ -99,11 +125,11 @@ def _build(
     "event_log": None,
     "session_id": session.session_id,
     "request_approval": None,
-    "needs_approval": lambda *_args, **_kwargs: False,
+    "needs_approval": _never_needs_approval,
     "approved_tool_types": session.approved_tool_types,
     "local_tool_handlers": {},
-    "channel_registry": _ChannelRegistry(),
-    "execute_addin": lambda *_args, **_kwargs: None,
+    "channel_registry": ChannelRegistry(),
+    "execute_addin": _execute_addin,
     "channel_context": session.channel,
     "tool_packs": {},
   }
@@ -138,11 +164,15 @@ def _legacy_base_snapshot(dispatcher: ToolDispatcher) -> dict[str, Any]:
 
 
 def _wrapper_snapshot(dispatcher: ExcelToolDispatcher) -> dict[str, Any]:
-  return {
+  snapshot = {
     key: value
     for key, value in dispatcher.__dict__.items()
     if key not in {"_base", "_addin_lock"}
   }
+  for field_name in ("_redact_prepared_input", "_redact_raw_history_input"):
+    redactor = snapshot[field_name]
+    snapshot[field_name] = getattr(redactor, "__func__", redactor)
+  return snapshot
 
 
 def test_principal_derives_all_identity_from_session_without_loose_inputs() -> None:
@@ -303,6 +333,9 @@ def test_dependency_partition_and_per_runtime_wiring() -> None:
     "approval_store",
     "approval_policy",
     "mcp_meta_inject_servers",
+    "redaction_context_factory",
+    "tool_registration_catalog",
+    "tool_policy_implementations",
   }
   assert dependency_fields.isdisjoint({
     "interceptors",
@@ -311,7 +344,7 @@ def test_dependency_partition_and_per_runtime_wiring() -> None:
     "mcp_session_inject_servers",
   })
 
-  interceptor = object()
+  interceptor = _allow_interceptor
 
   def get_tool_definitions() -> list[dict[str, Any]]:
     return []
@@ -336,20 +369,13 @@ def test_dependency_partition_and_per_runtime_wiring() -> None:
 
 def test_chat_embedded_golden_attribute_snapshot_matches_easy_inline() -> None:
   session = _session()
-  mcp_client = _McpClient()
-  local_handlers = {"local": lambda _args: ({"ok": True}, None)}
-
-  def needs_approval(
-    _name: str,
-    _tool_input: dict[str, Any],
-    _qualifier: str,
-  ) -> bool:
-    return False
-
-  def request_approval(_request: Any) -> None:
-    return None
-
-  event_log = object()
+  mcp_client = McpClientManager(config_path=None)
+  local_handlers: dict[str, LocalToolHandler] = {
+    "local": _local_handler,
+  }
+  needs_approval = _never_needs_approval
+  request_approval = _request_approval
+  event_log = EventLog()
 
   def qualifier(_name: str, _args: dict[str, Any]) -> str:
     return "qualifier"
@@ -418,31 +444,27 @@ async def test_interactive_golden_attribute_snapshot_and_wrapper_parity(
   channel: str,
 ) -> None:
   session = _session(channel=channel)
-  mcp_client = _McpClient()
-  local_handlers = {"local": lambda _args: ({"ok": True}, None)}
-
-  def needs_approval(
-    _name: str,
-    _tool_input: dict[str, Any],
-    _qualifier: str,
-  ) -> bool:
-    return False
-
-  def request_approval(_request: Any) -> None:
-    return None
-
-  event_log = object()
+  mcp_client = McpClientManager(config_path=None)
+  local_handlers: dict[str, LocalToolHandler] = {
+    "local": _local_handler,
+  }
+  needs_approval = _never_needs_approval
+  request_approval = _request_approval
+  event_log = EventLog()
 
   def qualifier(_name: str, _args: dict[str, Any]) -> str:
     return "qualifier"
 
-  interceptors = [object()]
+  interceptors = [_allow_interceptor]
   meta_servers = frozenset({"portfolio-reads-mcp"})
-  identity_overrides = {"research-corpus-mcp": 7}
   cache_denied = frozenset({"never-cache"})
   store = object()
   policy = object()
-  run_context = object()
+  run_context = RunContext(
+    user_id=session.user_id,
+    request_id="request-1",
+    session_id=session.session_id,
+  )
 
   def get_tool_definitions() -> list[dict[str, Any]]:
     return [{"name": "local"}]
@@ -458,16 +480,13 @@ async def test_interactive_golden_attribute_snapshot_and_wrapper_parity(
     return None
 
   commercial_servers = frozenset({"portfolio-trades-mcp"})
-  channel_registry = _ChannelRegistry(
-    active_channels=[
-      SimpleNamespace(
-        channel_type=ChannelType.EXCEL,
-        tool_names={"excel_only_tool"},
-      )
-    ]
-  )
-  def execute_addin(_request: Any) -> None:
-    return None
+  channel_registry = ChannelRegistry()
+  await channel_registry.register(Channel(
+    channel_id="excel-1",
+    channel_type=ChannelType.EXCEL,
+    tool_names={"excel_only_tool"},
+  ))
+  execute_addin = _execute_addin
 
   tool_packs = {"market-data": {"tools": {"get_quote"}}}
 
@@ -486,12 +505,13 @@ async def test_interactive_golden_attribute_snapshot_and_wrapper_parity(
     channel=channel or session.channel,
     role=session.role,
     mcp_meta_inject_servers=meta_servers,
-    mcp_identity_overrides=identity_overrides,
     credentials_resolver_active=True,
     session_cache_denied_tools=cache_denied,
-    session=session,
-    store=store,
-    policy=policy,
+    approval_route=DurableLocalApprovalRoute(
+      store,
+      policy,
+      session,
+    ),
     run_context=run_context,
     get_tool_definitions=get_tool_definitions,
     allowed_mcp_tools_by_server=allowed_tools,
@@ -528,12 +548,13 @@ async def test_interactive_golden_attribute_snapshot_and_wrapper_parity(
     interceptors=interceptors,
     session_id=session.session_id,
     session_cache_denied_tools=cache_denied,
-    session=session,
-    store=store,
-    policy=policy,
+    approval_route=DurableLocalApprovalRoute(
+      store,
+      policy,
+      session,
+    ),
     run_context=run_context,
     get_tool_definitions=get_tool_definitions,
-    mcp_identity_overrides=identity_overrides,
     credentials_resolver_active=True,
     allowed_mcp_tools_by_server=allowed_tools,
     mcp_scope_context="profile",

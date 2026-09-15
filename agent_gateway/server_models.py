@@ -19,6 +19,7 @@ from typing import (
   Awaitable,
   Callable,
   Dict,
+  Iterable,
   List,
   Literal,
   Mapping,
@@ -43,6 +44,7 @@ from .auth import CredentialsResolver
 from .capability_binding import (
   CapabilityBind,
   CredentialHandle,
+  SESSION_DRIVER_CAPABILITY,
 )
 from .capability_execution import (
   BoundCapabilityExecution,
@@ -59,6 +61,8 @@ from .model_registry import (
 from .model_preferences import ModelPreferenceStore
 from .autonomous_capability_handoff import AutonomousCapabilityBindingResolver
 from .claim_signing_authority import GatewayClaimSigningAuthority
+from .control_skill_catalog import ControlSkillCatalog
+from .skill_limits import AutonomousSkillAdmissionPolicyResolver
 from .thinking import parse_effort
 from .commercial_work_start import (
   COMMERCIAL_CLAIM_HEADER,
@@ -86,21 +90,43 @@ if TYPE_CHECKING:
 
 SystemPrompt = str | List[Tuple[str, bool]]
 ExecutionLocationResolver = Callable[[str], Optional[str]]
-BuildChatRuntime = Callable[[GatewaySession, "ChatRequest", Optional[str], AuthManager], Awaitable["ChatRuntime"]]
+
+class BuildChatRuntime(Protocol):
+  async def __call__(
+    self,
+    session: GatewaySession,
+    request: "ChatRequest",
+    channel: str | None,
+    auth_manager: AuthManager | None,
+    /,
+    *,
+    storage_root: Path | None = None,
+  ) -> "ChatRuntime": ...
+
+
 SelectedContentAdmitter = Callable[
   [GatewaySession, "ChatRequest"],
   Awaitable[SelectedContentAdmission] | SelectedContentAdmission,
 ]
 RequestApproval = Callable[[ApprovalRequest], Awaitable[Optional[ApprovalDecision]]]
-BuildRunner = Callable[
-  [EventLog, str, float],
-  AgentRunner | AgentSDKRunner,
-]
+
+
+class BuildRunner(Protocol):
+  async def run(
+    self,
+    *,
+    messages: list[dict[str, object]],
+    system_prompt: SystemPrompt | None = None,
+    max_turns: int | None = None,
+  ) -> None: ...
+
+
 DispatchScopeValidator = Callable[
   [GatewaySession, dict[str, Any]],
   Awaitable[dict[str, Any] | None] | dict[str, Any] | None,
 ]
-SkillResumeAllowedResolver = Callable[[str], bool]
+ControlProfileNamesProvider = Callable[[], Iterable[str]]
+ControlProfileLoader = Callable[[str], Any]
 
 
 @dataclass(frozen=True)
@@ -574,8 +600,10 @@ class ChatRequest(BaseModel):
       if not model_key:
         raise ValueError("model_key must be non-empty when supplied")
       normalized["model_key"] = model_key
-    if "effort" in value and value.get("effort") is not None:
-      normalized["effort"] = parse_effort(value.get("effort")).value
+    if "effort" in value:
+      effort = value.get("effort")
+      if effort is not None:
+        normalized["effort"] = parse_effort(effort).value
     return normalized
 
   @model_validator(mode="after")
@@ -691,7 +719,7 @@ class ChatRequest(BaseModel):
       )
     capability_execution.validate()
     capability_bind = capability_execution.bind
-    if capability_bind.capability_id != "session.driver":
+    if capability_bind.capability_id != SESSION_DRIVER_CAPABILITY:
       raise ValueError("chat requests require a session.driver capability bind")
     self._capability_execution = capability_execution
     if capability_execution_resolver is not None:
@@ -783,6 +811,10 @@ class ToolApprovalRequest(BaseModel):
   allow_tool_type: bool = False
 
 
+def _empty_tool_definitions() -> List[Dict[str, Any]]:
+  return []
+
+
 @dataclass
 class ChatRuntime:
   """Per-request runtime wiring returned by `build_chat_runtime`.
@@ -790,7 +822,7 @@ class ChatRuntime:
   Attributes:
     system_prompt: Prompt string or cached prompt blocks for the request.
     build_runner: Factory that receives `(event_log, session_id, started_at)`
-      and returns an `AgentRunner` or `AgentSDKRunner`.
+      and returns a structural `BuildRunner` or `None`.
     get_tool_definitions: Callback returning the tool schemas visible to the
       model for this request.
     build_dispatcher: Reserved callback slot for custom dispatcher builders.
@@ -812,9 +844,11 @@ class ChatRuntime:
   """
 
   system_prompt: SystemPrompt
-  build_runner: BuildRunner
+  build_runner: Callable[[EventLog, str, float], BuildRunner]
   capability_execution: BoundCapabilityExecution
-  get_tool_definitions: Callable[[], List[Dict[str, Any]]] = field(default_factory=lambda: [])
+  get_tool_definitions: Callable[[], List[Dict[str, Any]]] = field(
+    default_factory=lambda: _empty_tool_definitions
+  )
   build_dispatcher: Callable[["RequestContext"], Any] | None = None
   excluded_tools: Optional[Set[str]] = None
   execution_location: Optional[ExecutionLocationResolver] = None
@@ -836,7 +870,7 @@ class ChatRuntime:
         "ChatRuntime.capability_execution must be BoundCapabilityExecution"
       )
     execution.validate()
-    if execution.bind.capability_id != "session.driver":
+    if execution.bind.capability_id != SESSION_DRIVER_CAPABILITY:
       raise ValueError(
         "ChatRuntime requires a session.driver capability execution"
       )
@@ -868,11 +902,11 @@ class ChatRuntime:
 
 
 def _build_runner_with_started_at(
-  build_runner: BuildRunner,
+  build_runner: Callable[[EventLog, str, float], BuildRunner],
   event_log: EventLog,
   session_id: str,
   started_at: float,
-) -> AgentRunner | AgentSDKRunner:
+) -> BuildRunner:
   return build_runner(event_log, session_id, started_at)
 
 
@@ -885,39 +919,13 @@ async def _call_build_chat_runtime(
   auth_manager: AuthManager | None,
   storage_root: Path | None = None,
 ) -> "ChatRuntime":
-  kwargs = {
-    "session": session,
-    "request": request,
-    "channel": channel,
-    "auth_manager": auth_manager,
-  }
-  if storage_root is not None:
-    kwargs["storage_root"] = storage_root
-  try:
-    signature = inspect.signature(build_chat_runtime)
-  except (TypeError, ValueError):
-    return await build_chat_runtime(session, request, channel, auth_manager)  # type: ignore[misc]
-
-  params = signature.parameters
-  accepts_kwargs = any(param.kind == param.VAR_KEYWORD for param in params.values())
-  legacy_names = ("session", "request", "channel", "auth_manager")
-  legacy_names_are_keyword_capable = all(
-    name in params
-    and params[name].kind in {params[name].POSITIONAL_OR_KEYWORD, params[name].KEYWORD_ONLY}
-    for name in legacy_names
+  return await build_chat_runtime(
+    session,
+    request,
+    channel,
+    auth_manager,
+    storage_root=storage_root,
   )
-  if accepts_kwargs:
-    return await build_chat_runtime(**kwargs)
-  if legacy_names_are_keyword_capable:
-    supported_kwargs = {
-      name: value
-      for name, value in kwargs.items()
-      if name in params
-      and params[name].kind
-      in {params[name].POSITIONAL_OR_KEYWORD, params[name].KEYWORD_ONLY}
-    }
-    return await build_chat_runtime(**supported_kwargs)
-  return await build_chat_runtime(session, request, channel, auth_manager)  # type: ignore[misc]
 
 
 @dataclass
@@ -985,9 +993,9 @@ class GatewayServerConfig:
       resolves and materializes the exact profile/skill-aware session-driver
       bind before an autonomous subprocess is launched. Resume requests carry
       the persisted bind as an exact requirement.
-    autonomous_skill_resume_allowed_resolver: Trusted synchronous callback
-      deriving the static resume source-policy fact for a new skill admission.
-      Resumed admissions inherit the persisted fact and do not invoke it.
+    autonomous_skill_admission_policy_resolver: Trusted synchronous callback
+      deriving the static resume fact and execution limits coherently for a
+      new skill admission. Resumed admissions inherit persisted facts.
     autonomous_api_dir: Optional application API directory containing the
       autonomous child entry point and authoritative `user_identity.py`.
       Applications installed separately from this package must set it
@@ -1015,6 +1023,14 @@ class GatewayServerConfig:
     control_skills_dir: Optional directory backing control-plane skill list/read
       endpoints. When omitted, the package uses `AGENT_GATEWAY_SKILLS_DIR` if
       set, otherwise an empty package-local directory.
+    control_skill_catalog: Optional injected control-plane catalog. It is
+      mutually exclusive with an explicitly supplied `control_skills_dir`.
+    control_profile_names_provider: Optional application-owned provider for
+      the profile names exposed by the control plane.
+    control_profile_loader: Optional application-owned canonical loader for
+      profiles exposed by the control plane.
+    skill_application: Optional opaque application-owned compiled skill view
+      passed only to application batch execution. Gateway does not inspect it.
     audit_hmac_secret_resolver: Callback returning the approval-audit HMAC
       secret bytes. Defaults to agent_gateway's environment-backed resolver.
     audit_hmac_key_id_resolver: Callback returning the approval-audit HMAC key
@@ -1059,6 +1075,9 @@ class GatewayServerConfig:
   resolver_timeout_seconds: float = 5.0
   mcp_client: Optional[McpClientManager] = None
   mcp_meta_inject_servers: frozenset[str] | None = None
+  tool_registration_catalog: Any | None = None
+  tool_policy_implementations: Any | None = None
+  redaction_context_factory: Callable[[Any], object | None] | None = None
   sdk_config: AgentSDKConfig | None = None
   per_turn_timeout: int = 300
   compaction_trigger: int | None = None
@@ -1073,8 +1092,8 @@ class GatewayServerConfig:
   autonomous_capability_binding_resolver: (
     AutonomousCapabilityBindingResolver | None
   ) = None
-  autonomous_skill_resume_allowed_resolver: (
-    SkillResumeAllowedResolver | None
+  autonomous_skill_admission_policy_resolver: (
+    AutonomousSkillAdmissionPolicyResolver | None
   ) = None
   claim_signing_authority: GatewayClaimSigningAuthority | None = None
   channel_profile_allowlist: Mapping[str, frozenset[str]] | None = None
@@ -1091,6 +1110,10 @@ class GatewayServerConfig:
   transcript_retention_days: int = 7
   retention_sweeper: ScheduledRetentionSweeper | None = None
   control_skills_dir: Optional[Path] = None
+  control_skill_catalog: ControlSkillCatalog | None = None
+  control_profile_names_provider: ControlProfileNamesProvider | None = None
+  control_profile_loader: ControlProfileLoader | None = None
+  skill_application: object | None = None
   audit_hmac_secret_resolver: Callable[[], bytes] = get_audit_hmac_secret
   audit_hmac_key_id_resolver: Callable[[], str] = get_audit_hmac_key_id
   tool_input_redactor: Optional[Callable[..., dict[str, Any]]] = None

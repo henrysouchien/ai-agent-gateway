@@ -3,6 +3,7 @@ silently end the run — the runner nudges and continues (bounded), and request
 max_tokens is clamped to the model's max_output_tokens."""
 
 import asyncio
+import re
 import logging
 import sys
 from pathlib import Path
@@ -18,6 +19,7 @@ from agent_gateway import (  # noqa: E402
   AgentSessionLog,
   CostEstimate,
   EventLog,
+  McpClientManager,
   ModelInfo,
   ToolDispatcher,
 )
@@ -34,15 +36,9 @@ def _run(coro):
   return asyncio.run(coro)
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
-    return False
-
-  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
-    return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
-
-  def get_tool_definitions(self) -> list[dict[str, Any]]:
-    return []
+class _NullMcpClient(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
 
 
 class _StubProvider:
@@ -124,7 +120,7 @@ def test_max_tokens_turn_with_no_tool_use_continues_with_nudge() -> None:
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    runner._stream_turn = _fake_stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = _fake_stream_turn
     await runner.run(messages=[{"role": "user", "content": "Start"}], system_prompt="x")
 
     assert len(seen_messages) == 2, "run must continue past the truncated turn"
@@ -154,7 +150,7 @@ def test_max_tokens_continuation_is_bounded(caplog) -> None:
         content_blocks=[{"type": "text", "text": "truncated"}],
       )
 
-    runner._stream_turn = _fake_stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = _fake_stream_turn
     caplog.set_level(logging.WARNING, logger="agent_gateway.runner")
     await runner.run(messages=[{"role": "user", "content": "Start"}], system_prompt="x")
 
@@ -169,6 +165,7 @@ def test_max_tokens_continuation_is_bounded(caplog) -> None:
 
 def test_child_max_tokens_segments_are_unbounded_and_do_not_consume_max_turns(
   tmp_path: Path,
+  caplog,
 ) -> None:
   async def _case() -> None:
     durable_log = AgentSessionLog(tmp_path / "child.jsonl")
@@ -197,7 +194,7 @@ def test_child_max_tokens_segments_are_unbounded_and_do_not_consume_max_turns(
         content_blocks=[{"type": "text", "text": "terminal segment"}],
       )
 
-    runner._stream_turn = _fake_stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = _fake_stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "Start"}],
       system_prompt="x",
@@ -227,6 +224,10 @@ def test_child_max_tokens_segments_are_unbounded_and_do_not_consume_max_turns(
       entry.event.get("type") == "max_turns_reached"
       for entry in runner._log.entries
     )
+    # The warning names the persisted segment, not the next one.
+    assert re.findall(
+      r"logical response segment (\d+) hit max_tokens", caplog.text
+    ) == ["0", "1", "2", "3", "4"]
 
   _run(_case())
 
@@ -278,7 +279,7 @@ def test_parent_message_breaks_child_max_tokens_logical_response(
         content_blocks=[{"type": "text", "text": "X"}],
       )
 
-    runner._stream_turn = _fake_stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = _fake_stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "Start"}],
       system_prompt="x",
@@ -356,7 +357,7 @@ def test_max_tokens_turn_with_tool_uses_is_not_intercepted() -> None:
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    runner._stream_turn = _fake_stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = _fake_stream_turn
     await runner.run(messages=[{"role": "user", "content": "Start"}], system_prompt="x")
 
     # complete tool calls still execute (loop continues through tool dispatch)
@@ -381,7 +382,7 @@ def test_request_max_tokens_clamped_to_model_max_output() -> None:
         content_blocks=[{"type": "text", "text": "done"}],
       )
 
-    runner._stream_turn = _fake_stream_turn  # type: ignore[method-assign]
+    runner._stream_turn = _fake_stream_turn
     await runner.run(messages=[{"role": "user", "content": "Start"}], system_prompt="x")
 
     assert seen["max_tokens"] == 16_384

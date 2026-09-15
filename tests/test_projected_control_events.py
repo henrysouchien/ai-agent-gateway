@@ -4,9 +4,10 @@ import asyncio
 import json
 from contextlib import suppress
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal, Mapping
 
 import pytest
+from fastapi.routing import APIRoute
 from starlette.requests import Request
 
 from agent_gateway.control_plane import events as events_module
@@ -14,46 +15,58 @@ from agent_gateway.control_plane import batches as batches_module
 from agent_gateway.control_plane.events import build_events_router
 from agent_gateway.event_adapter import adapt_control_event, adapt_event
 from agent_gateway.event_log import UserEventBus
+from agent_gateway.session import AuthManager, GatewaySession, SessionStore
 
 
-class _FakeSession(SimpleNamespace):
-  pass
+class _FakeSession(GatewaySession):
+  purpose: str | None = None
 
 
-class _FakeSessionStore:
-  def __init__(self, sessions: dict[str, _FakeSession] | None = None) -> None:
+class _FakeSessionStore(SessionStore):
+  def __init__(
+    self,
+    sessions: Mapping[str, GatewaySession] | None = None,
+  ) -> None:
     self._sessions = dict(sessions or {})
 
-  def get_session(self, session_id: str) -> _FakeSession | None:
+  def get_session(self, session_id: str) -> GatewaySession | None:
     return self._sessions.get(session_id)
 
 
-class _FakeAuth:
-  def __init__(self, tokens: dict[str, _FakeSession], sessions: dict[str, _FakeSession] | None = None) -> None:
-    self._tokens = tokens
+class _FakeAuth(AuthManager):
+  def __init__(
+    self,
+    tokens: Mapping[str, GatewaySession],
+    sessions: Mapping[str, GatewaySession] | None = None,
+  ) -> None:
+    self._tokens = dict(tokens)
     self.session_store = _FakeSessionStore(sessions)
 
-  def verify_token(self, token: str) -> _FakeSession:
+  def verify_token(self, token: str) -> GatewaySession:
     return self._tokens[token]
 
 
 def _session(
   *,
-  kind: str = "control",
+  kind: Literal["chat", "control"] = "control",
   user_id: str = "alice",
   session_id: str = "control-1",
   channel: str = "tui",
   purpose: str | None = None,
   owner_user_id: str | None = None,
 ) -> _FakeSession:
-  return _FakeSession(
-    kind=kind,
-    user_id=user_id,
+  session = _FakeSession(
     session_id=session_id,
+    api_key_hash="test",
+    created_at=0,
+    expires_at=2**63 - 1,
+    user_id=user_id,
+    kind=kind,
     channel=channel,
-    purpose=purpose,
     owner_user_id=owner_user_id,
   )
+  session.purpose = purpose
+  return session
 
 
 def _request(app: Any, token: str) -> Request:
@@ -70,17 +83,17 @@ def _request(app: Any, token: str) -> Request:
 
 
 def _route(
-  auth: _FakeAuth,
-):
+  auth: AuthManager,
+) -> APIRoute:
   route_path = "/events"
-  router = build_events_router(  # type: ignore[arg-type]
+  router = build_events_router(
     auth=auth,
     route_path=route_path,
   )
   return next(
     route
     for route in router.routes
-    if getattr(route, "path", None) == route_path
+    if isinstance(route, APIRoute) and route.path == route_path
   )
 
 
@@ -147,9 +160,7 @@ async def _open_events(
 
 
 async def _close_response(response: Any) -> None:
-  close = getattr(response.body_iterator, "aclose", None)
-  if callable(close):
-    await close()
+  await response.body_iterator.aclose()
   if response.background is not None:
     await response.background()
 

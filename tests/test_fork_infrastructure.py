@@ -22,6 +22,7 @@ from agent_gateway.mcp_activation import McpActivationFold
 from agent_gateway.capability_binding import (
   CapabilityBind,
   CredentialHandle,
+  CredentialPrincipal,
 )
 from agent_gateway.capability_execution import BoundCapabilityExecution
 from agent_gateway.event_log import EventLog
@@ -47,6 +48,8 @@ from agent_gateway.runner_fork_agents import (
 )
 from agent_gateway.providers import ModelInfo, ModelProvider
 from agent_gateway.model_registry import ModelRegistryEntry, ProductModelRegistry
+from agent_gateway.mcp_client import McpClientManager
+from agent_gateway.tool_dispatcher import ToolDispatcher
 from agent_gateway.runner_sub_agents import (
   _authoritative_child_tool_getter,
 )
@@ -155,7 +158,7 @@ def _runner() -> SimpleNamespace:
 )
 def test_session_credential_identity_requires_provider_and_principal(
   provider: str,
-  principal: str,
+  principal: CredentialPrincipal,
   expected: tuple[str, str] | None,
 ) -> None:
   runner = _runner()
@@ -304,22 +307,26 @@ def test_fork_tail_shares_placeholder_prefix_and_requests_normal_message() -> No
   assert "JSON" not in instruction
 
 
-class _Dispatcher:
+class _Dispatcher(ToolDispatcher):
   def __init__(self, definitions: list[dict[str, Any]]) -> None:
+    super().__init__(McpClientManager())
     self.definitions = definitions
     self.calls: list[str] = []
+    self.replay_controls: list[bool] = []
 
   def get_tool_definitions(self) -> list[dict[str, Any]]:
     return copy.deepcopy(self.definitions)
 
   async def dispatch(
     self,
-    _tool_call_id: str,
+    tool_call_id: str,
     tool_name: str,
-    _tool_input: dict[str, Any],
+    tool_input: dict[str, Any],
     **_kwargs: Any,
   ):
+    _ = tool_call_id, tool_input
     self.calls.append(tool_name)
+    self.replay_controls.append(_kwargs.get("allow_uncertain_mcp_replay", True))
     return {"ok": True}, None
 
 
@@ -380,6 +387,37 @@ def test_fork_dispatch_policy_denies_run_agent_structurally() -> None:
     },
   }
   assert dispatcher.calls == []
+
+
+def test_fork_dispatch_policy_validates_and_forwards_replay_control() -> None:
+  definitions = [{"name": "read_data"}]
+  receipt = parse_fork_scope_receipt(fork_scope_receipt_dict(
+    tool_decisions=(ForkToolDecision("read_data", "allow", "parent surface"),),
+    capability_bind=_bind().model_copy(update={"capability_id": "node.fork"}),
+    tenant_id="tenant-1",
+    billing_mode="byok",
+    resolved_budget_usd=5.0,
+    max_turns=20,
+    suffix_ceiling=20_000,
+  ))
+  base = _Dispatcher(definitions)
+  policy = ForkPolicyDispatcher(base, wire_tools=definitions, receipt=receipt)
+
+  assert asyncio.run(policy.dispatch(
+    "call",
+    "read_data",
+    {},
+    allow_uncertain_mcp_replay=False,
+  )) == ({"ok": True}, None)
+  assert base.replay_controls == [False]
+  with pytest.raises(TypeError, match="exact bool"):
+    asyncio.run(policy.dispatch(
+      "invalid",
+      "missing",
+      {},
+      allow_uncertain_mcp_replay=0,  # pyright: ignore[reportArgumentType]  # negative: exact-bool rejection
+    ))
+  assert base.calls == ["read_data"]
 
 
 def _message_markers(params: dict[str, Any]) -> list[tuple[int, int]]:
@@ -492,6 +530,8 @@ class _Provider(ModelProvider):
 
 
 class _SpawnRunner:
+  _fork_mode: bool
+  _fork_marker_position: tuple[int, int]
   children: list["_SpawnRunner"] = []
 
   def __init__(self, **kwargs: Any) -> None:

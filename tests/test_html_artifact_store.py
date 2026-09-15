@@ -22,7 +22,7 @@ from agent_gateway.html_artifact_store import (
   validate_html_artifact_content,
   write_html_artifact,
 )
-from schema.html_artifact import HtmlArtifact, StaticExports
+from schema.html_artifact import HtmlArtifact, HtmlArtifactPurpose, StaticExports
 
 
 def test_html_artifact_store_round_trips_sidecar_and_content(tmp_path: Path) -> None:
@@ -160,6 +160,35 @@ def test_html_artifact_store_lists_newest_first_with_filters(tmp_path: Path) -> 
   ]
 
 
+def test_html_artifact_store_list_skips_corrupt_sidecar_visibly(
+  tmp_path: Path,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  workspace = tmp_path / "users" / "alice" / "workspace"
+  for artifact_id in ("good", "bad"):
+    write_html_artifact(
+      workspace_dir=workspace,
+      artifact=_artifact(artifact_id, ticker="PCTY"),
+      html_content=f"<p>{artifact_id}</p>",
+    )
+  (workspace / "artifacts" / "_html" / "bad.json").write_text("{corrupt", encoding="utf-8")
+
+  with caplog.at_level(logging.WARNING, logger="agent_gateway.artifact_sidecar_index"):
+    listed = list_html_artifacts(workspace)
+
+  assert [artifact.artifact_id for artifact in listed] == ["good"]
+  assert any(record.message == "artifact_sidecar_unreadable" for record in caplog.records)
+  row = get_artifact_sidecar_index_row(
+    workspace_dir=workspace,
+    artifact_kind="html",
+    artifact_id="bad",
+    user_id="alice",
+  )
+  assert row is not None
+  assert row["stale_ts"] is not None
+  assert row["last_error"] == "corrupt_sidecar"
+
+
 def test_html_artifact_store_rejects_unsafe_artifact_ids_before_writing(tmp_path: Path) -> None:
   artifact = _artifact("../escape", ticker="PCTY")
 
@@ -198,7 +227,7 @@ def test_html_artifact_store_rejects_empty_or_non_string_html_before_writing(tmp
 
   for html in ("", " \n", None):
     try:
-      write_html_artifact(workspace_dir=tmp_path, artifact=artifact, html_content=html)
+      write_html_artifact(workspace_dir=tmp_path, artifact=artifact, html_content=html)  # pyright: ignore[reportArgumentType]  # negative: non-string HTML rejection
     except ValueError as exc:
       assert "non-empty string" in str(exc)
     else:
@@ -294,7 +323,7 @@ def _artifact(
   artifact_id: str,
   *,
   ticker: str | None,
-  purpose: str = "exploration",
+  purpose: HtmlArtifactPurpose = "exploration",
 ) -> HtmlArtifact:
   return HtmlArtifact(
     artifact_id=artifact_id,

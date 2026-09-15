@@ -1,9 +1,16 @@
 import asyncio
+from collections import deque
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import timedelta
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TextIO
 
 import pytest
+from anyio import ClosedResourceError
+from mcp.types import CallToolResult
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
@@ -12,19 +19,46 @@ if str(PKG_DIR) not in sys.path:
 
 import agent_gateway.mcp_client as mcp_client_module  # noqa: E402
 from agent_gateway.mcp_client import McpClientManager  # noqa: E402
+from agent_gateway.mcp_client_connections import (  # noqa: E402
+  McpListedTool,
+  McpListToolsResult,
+  McpToolCallResult,
+)
+from agent_gateway.tool_registration import RegisteredMcpToolCompilationError  # noqa: E402
+from agent_workflow_contracts.tool_registration import (  # noqa: E402
+  ToolRegistrationCatalog,
+)
+
+
+@dataclass(frozen=True)
+class _ListedTool:
+  name: str
+  description: str | None
+  inputSchema: Mapping[str, object] | None
+
+
+@dataclass(frozen=True)
+class _ListedToolsResult:
+  tools: Sequence[McpListedTool] | None
+  nextCursor: str | None
 
 
 class _ListedToolsSession:
   def __init__(self, names: list[str]) -> None:
     self.names = names
 
-  async def initialize(self):
+  async def initialize(self) -> object:
     return None
 
-  async def list_tools(self, cursor=None):
-    return SimpleNamespace(
+  async def list_tools(
+    self,
+    *,
+    cursor: str | None = None,
+  ) -> McpListToolsResult:
+    _ = cursor
+    return _ListedToolsResult(
       tools=[
-        SimpleNamespace(
+        _ListedTool(
           name=name,
           description=f"Tool {name}",
           inputSchema={"type": "object", "properties": {}},
@@ -33,6 +67,200 @@ class _ListedToolsSession:
       ],
       nextCursor=None,
     )
+
+  async def call_tool(
+    self,
+    name: str,
+    arguments: dict[str, object],
+    *,
+    read_timeout_seconds: timedelta,
+    meta: dict[str, object] | None = None,
+  ) -> McpToolCallResult:
+    _ = name, arguments, read_timeout_seconds, meta
+    raise AssertionError("tool calls are not used by list-tools tests")
+
+
+@pytest.fixture
+def reconnect_transport(monkeypatch):
+  pending = deque()
+  opened_contexts = []
+
+  class Session(_ListedToolsSession):
+    def __init__(self, names, generation):
+      super().__init__(names)
+      self.generation = generation
+      self.closed = False
+      self.before_call = None
+
+    async def __aenter__(self):
+      opened_contexts.append(self)
+      return self
+
+    async def __aexit__(self, *_args):
+      self.closed = True
+
+    async def call_tool(self, name, arguments, **kwargs):
+      if self.before_call is not None:
+        await self.before_call()
+      assert not self.closed
+      assert name in self.names
+      return CallToolResult(
+        content=[],
+        structuredContent={"tool": name, "generation": self.generation},
+      )
+
+  class StdioContext:
+    def __init__(self, errlog):
+      self.closed = False
+      self.errlog = errlog
+
+    async def __aenter__(self):
+      opened_contexts.append(self)
+      return object(), object()
+
+    async def __aexit__(self, *_args):
+      self.closed = True
+
+  def queue(names, *, generation=1):
+    session = Session(names, generation)
+    pending.append(session)
+    return session
+
+  monkeypatch.setattr(
+    mcp_client_module, "stdio_client",
+    lambda _params, errlog: StdioContext(errlog),
+  )
+  monkeypatch.setattr(
+    mcp_client_module, "ClientSession", lambda *_args: pending.popleft(),
+  )
+  monkeypatch.setattr(mcp_client_module, "_stdio_connect_retries", lambda: 0)
+  monkeypatch.setattr(mcp_client_module, "_stdio_connect_stabilize_delay", lambda: 0)
+  return queue, opened_contexts
+
+
+async def _reconnect_for_future(manager, name, tool):
+  return await manager._reconnect_stdio_server_for_future(
+    server_name=name,
+    server=manager._servers[name],
+    original_name=tool,
+    cause=EOFError("connection closed"),
+  )
+
+
+def test_reconnect_restores_tools_hidden_by_temporary_collision(reconnect_transport):
+  async def scenario():
+    queue, _opened_contexts = reconnect_transport
+    queue(["alpha"])
+    queue(["beta"])
+    manager = McpClientManager(config_path=None, inline_servers={
+      name: {"command": sys.executable} for name in ("first", "second")
+    })
+    await manager.startup()
+    try:
+      queue(["beta"], generation=2)
+      assert await _reconnect_for_future(manager, "first", "alpha")
+      result, error = await manager.call_tool("beta", {})
+      assert error is None
+      assert result == {"tool": "beta", "generation": 2}
+
+      queue(["alpha"], generation=3)
+      assert await _reconnect_for_future(manager, "first", "beta")
+      result, error = await manager.call_tool("beta", {})
+      assert error is None
+      assert result == {"tool": "beta", "generation": 1}
+      assert manager.get_server_for_tool("beta") == "second"
+    finally:
+      await manager.shutdown()
+
+  asyncio.run(scenario())
+
+
+def test_rejected_startup_closes_all_connected_transports(reconnect_transport):
+  async def scenario():
+    queue, opened_contexts = reconnect_transport
+    queue(["alpha"])
+    queue(["beta"])
+    manager = McpClientManager(
+      config_path=None,
+      inline_servers={
+        name: {"command": sys.executable} for name in ("first", "second")
+      },
+      tool_registration_catalog=ToolRegistrationCatalog(declarations=(), servers=()),
+    )
+    try:
+      with pytest.raises(RegisteredMcpToolCompilationError):
+        await manager.startup()
+      assert len(opened_contexts) == 4
+      assert all(context.closed for context in opened_contexts)
+      assert all(
+        context.errlog.closed
+        for context in opened_contexts
+        if hasattr(context, "errlog")
+      )
+    finally:
+      await manager.shutdown()
+
+  asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("allow_uncertain_replay", [False, True], ids=["future", "replay"])
+def test_delayed_reconnect_keeps_one_live_generation(
+  reconnect_transport, allow_uncertain_replay,
+):
+  async def scenario():
+    queue, opened_contexts = reconnect_transport
+    first = queue(["alpha"])
+    manager = McpClientManager(config_path=None, inline_servers={
+      "first": {"command": sys.executable},
+    })
+    await manager.startup()
+    failure_releases = [asyncio.Event(), asyncio.Event()]
+    calls_entered = [asyncio.Event(), asyncio.Event()]
+    call_count = 0
+
+    async def fail_when_released():
+      nonlocal call_count
+      index = call_count
+      call_count += 1
+      calls_entered[index].set()
+      await failure_releases[index].wait()
+      raise ClosedResourceError()
+
+    first.before_call = fail_when_released
+    calls = []
+    try:
+      for entered in calls_entered:
+        calls.append(asyncio.create_task(manager.call_tool(
+          "alpha", {}, allow_uncertain_replay=allow_uncertain_replay,
+        )))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+      second = queue(["alpha"], generation=2)
+      third = queue(["alpha"], generation=3)
+      failure_releases[0].set()
+      first_outcome = await asyncio.wait_for(calls[0], timeout=1)
+      failure_releases[1].set()
+      second_outcome = await asyncio.wait_for(calls[1], timeout=1)
+      if allow_uncertain_replay:
+        expected = ({"tool": "alpha", "generation": 2}, None)
+        assert first_outcome == expected
+        assert second_outcome == expected
+
+      result, error = await manager.call_tool("alpha", {})
+      assert error is None
+      assert result == {"tool": "alpha", "generation": 2}
+      assert manager._servers["first"].session is second
+      assert first.closed and not second.closed
+      if not allow_uncertain_replay:
+        assert third.closed
+      assert len([context for context in opened_contexts if not context.closed]) == 2
+    finally:
+      for release in failure_releases:
+        release.set()
+      await asyncio.gather(*calls, return_exceptions=True)
+      await manager.shutdown()
+    assert all(context.closed for context in opened_contexts)
+
+  asyncio.run(scenario())
 
 
 def test_session_allowed_tools_filter_definitions_and_dispatch_surface() -> None:
@@ -45,8 +273,7 @@ def test_session_allowed_tools_filter_definitions_and_dispatch_surface() -> None
     allowed_tools=("get_investment_artifact",),
   ))
 
-  manager._servers[state.name] = state
-  manager._apply_collision_filtering()
+  asyncio.run(manager._publish_server_states([state]))
 
   assert [tool["name"] for tool in state.tool_definitions] == [
     "get_investment_artifact"
@@ -70,6 +297,35 @@ def test_session_allowed_tools_reject_missing_remote_definition() -> None:
     ))
 
 
+def test_catalog_republication_preserves_other_server_prefix() -> None:
+  manager = McpClientManager(config_path=None)
+
+  async def initialize(name, tools, prefix=""):
+    return await manager._initialize_session_state(
+      name=name,
+      session=_ListedToolsSession(tools),
+      exit_contexts=[],
+      tool_prefix=prefix,
+    )
+
+  async def scenario():
+    first = await initialize("first", ["lookup"], "first_")
+    second = await initialize("second", ["previous_read"])
+    await manager._publish_server_states([first, second])
+    replacement = await initialize("second", ["replacement_read"])
+    await manager._publish_server_states([replacement])
+
+    assert {tool["name"] for tool in manager.get_tool_definitions()} == {
+      "first_lookup", "replacement_read",
+    }
+    assert manager.get_server_for_tool("first_lookup") == "first"
+    assert manager.get_original_tool_name("first_lookup") == "lookup"
+    assert manager.get_server_for_tool("previous_read") is None
+    assert manager.get_server_for_tool("replacement_read") == "second"
+
+  asyncio.run(scenario())
+
+
 def test_invalid_allowed_tools_leaves_optional_server_unadvertised() -> None:
   manager = McpClientManager(
     config_path=None,
@@ -91,6 +347,9 @@ def test_invalid_allowed_tools_leaves_optional_server_unadvertised() -> None:
 
 def test_connect_stdio_wrapper_uses_parent_module_runtime(monkeypatch) -> None:
   captured: dict[str, object] = {}
+  list_tool_cursors: list[str | None] = []
+  captured["list_tool_cursors"] = list_tool_cursors
+  errlogs: list[TextIO | None] = []
 
   class _FakeServerParameters:
     def __init__(self, **kwargs):
@@ -117,15 +376,19 @@ def test_connect_stdio_wrapper_uses_parent_module_runtime(monkeypatch) -> None:
       captured["session_exited"] = True
       return None
 
-    async def initialize(self):
+    async def initialize(self) -> object:
       captured["initialized"] = True
       return None
 
-    async def list_tools(self, cursor=None):
-      captured.setdefault("list_tool_cursors", []).append(cursor)
-      return SimpleNamespace(
+    async def list_tools(
+      self,
+      *,
+      cursor: str | None = None,
+    ) -> McpListToolsResult:
+      list_tool_cursors.append(cursor)
+      return _ListedToolsResult(
         tools=[
-          SimpleNamespace(
+          _ListedTool(
             name="patched_tool",
             description="Patched tool",
             inputSchema={"type": "object", "properties": {"x": {"type": "string"}}},
@@ -134,9 +397,21 @@ def test_connect_stdio_wrapper_uses_parent_module_runtime(monkeypatch) -> None:
         nextCursor=None,
       )
 
+    async def call_tool(
+      self,
+      name: str,
+      arguments: dict[str, object],
+      *,
+      read_timeout_seconds: timedelta,
+      meta: dict[str, object] | None = None,
+    ) -> McpToolCallResult:
+      _ = name, arguments, read_timeout_seconds, meta
+      raise AssertionError("tool calls are not used by stdio connection tests")
+
   def _fake_stdio_client(server_params, errlog=None):
     captured["stdio_client_params"] = server_params
     captured["errlog"] = errlog
+    errlogs.append(errlog)
     return _FakeStdioContext()
 
   monkeypatch.setattr(mcp_client_module, "StdioServerParameters", _FakeServerParameters)
@@ -167,7 +442,9 @@ def test_connect_stdio_wrapper_uses_parent_module_runtime(monkeypatch) -> None:
   assert captured["initialized"] is True
   assert captured["list_tool_cursors"] == [None, None]
   assert captured["errlog"] is not None
-  assert captured["errlog"].closed is False
+  stdio_errlog = errlogs[0]
+  assert stdio_errlog is not None
+  assert stdio_errlog.closed is False
   assert state.name == "demo"
   assert state.config == {"command": "fake-server", "args": ["--serve"], "env": {"raw": "env"}}
   assert state.tool_names == {"patched_tool"}
@@ -175,11 +452,12 @@ def test_connect_stdio_wrapper_uses_parent_module_runtime(monkeypatch) -> None:
   asyncio.run(manager._close_contexts(state.exit_contexts))
   assert captured["session_exited"] is True
   assert captured["stdio_exited"] is True
-  assert captured["errlog"].closed is True
+  assert stdio_errlog.closed is True
 
 
 def test_build_http_auth_wrapper_uses_parent_module_path_factory(monkeypatch) -> None:
   captured: dict[str, object] = {}
+  oauth_kwargs: dict[str, object] = {}
 
   class _FakePath:
     def __init__(self, value):
@@ -206,6 +484,7 @@ def test_build_http_auth_wrapper_uses_parent_module_path_factory(monkeypatch) ->
   class _FakeOAuth:
     def __init__(self, **kwargs):
       captured["oauth_kwargs"] = kwargs
+      oauth_kwargs.update(kwargs)
 
   monkeypatch.delenv("AGENT_GATEWAY_MCP_OAUTH_CACHE_DIR", raising=False)
   monkeypatch.setattr(mcp_client_module, "Path", _FakePath)
@@ -223,4 +502,4 @@ def test_build_http_auth_wrapper_uses_parent_module_path_factory(monkeypatch) ->
   assert isinstance(auth, _FakeOAuth)
   assert captured["expanded_path"] == "/patched-home/.cache/agent-gateway/mcp-oauth/finance-cli.json"
   assert captured["storage_path"] == "/patched-home/.cache/agent-gateway/mcp-oauth/finance-cli.json"
-  assert captured["oauth_kwargs"]["token_storage"].__class__ is _FakeStorage
+  assert oauth_kwargs["token_storage"].__class__ is _FakeStorage

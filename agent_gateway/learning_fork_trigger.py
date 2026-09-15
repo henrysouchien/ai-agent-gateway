@@ -145,20 +145,38 @@ def evaluate_learning_fork_trigger(
   )
 
 
+def _cohort_factors(
+  runner: Any,
+  session: Any,
+) -> tuple[dict[str, bool], bool, str | None]:
+  execution = getattr(runner, "_capability_execution", None)
+  bind = getattr(execution, "bind", None)
+  run_context = getattr(getattr(runner, "_dispatcher", None), "run_context", None)
+  role_owner = getattr(session, "role", None) == "owner"
+  billing_not_byok = getattr(runner, "_billing_mode", None) != "byok"
+  credential_principal_service = (
+    getattr(bind, "credential_principal", None) == "service"
+  )
+  run_mode_interactive = getattr(bind, "run_mode", None) == "interactive"
+  profile: str | None = getattr(run_context, "profile", None)
+  profile_analyst = profile == "analyst"
+  not_fork_mode = not bool(getattr(runner, "_fork_mode", False))
+  factors = {
+    "role_owner": role_owner,
+    "billing_not_byok": billing_not_byok,
+    "credential_principal_service": credential_principal_service,
+    "run_mode_interactive": run_mode_interactive,
+    "profile_analyst": profile_analyst,
+    "not_fork_mode": not_fork_mode,
+  }
+  return factors, run_context is not None, profile
+
+
 def owner_operated_interactive_analyst(runner: Any, session: Any) -> bool:
   """Default-on cohort; non-owner and BYOK sessions are excluded."""
 
-  execution = getattr(runner, "_capability_execution", None)
-  bind = getattr(execution, "bind", None)
-  run_context = getattr(getattr(runner, "_dispatcher", None), "_run_context", None)
-  return bool(
-    getattr(session, "role", None) == "owner"
-    and getattr(runner, "_billing_mode", None) != "byok"
-    and getattr(bind, "credential_principal", None) == "service"
-    and getattr(bind, "run_mode", None) == "interactive"
-    and getattr(run_context, "profile", None) == "analyst"
-    and not bool(getattr(runner, "_fork_mode", False))
-  )
+  factors, _, _ = _cohort_factors(runner, session)
+  return all(factors.values())
 
 
 def _gateway_session(runner: Any) -> Any | None:
@@ -352,10 +370,13 @@ def submit_learning_fork_after_turn(
   if session is None:
     return None
   try:
-    eligible = owner_operated_interactive_analyst(runner, session)
+    factors, run_context_present, profile = _cohort_factors(runner, session)
+    eligible = all(factors.values())
     enabled = learn_fork_enabled(
       owner_operated_interactive=eligible,
     )
+    memory_threshold = learn_memory_nudge_turns()
+    skill_threshold = learn_skill_nudge_iters()
     decision = evaluate_learning_fork_trigger(
       memory_turns=int(getattr(session, "learn_memory_nudge_turns", 0)),
       skill_iters=int(getattr(session, "learn_skill_nudge_iters", 0)),
@@ -367,11 +388,36 @@ def submit_learning_fork_after_turn(
       aborted=aborted,
       cancelled=cancelled,
       enabled=enabled,
-      memory_threshold=learn_memory_nudge_turns(),
-      skill_threshold=learn_skill_nudge_iters(),
+      memory_threshold=memory_threshold,
+      skill_threshold=skill_threshold,
     )
     session.learn_memory_nudge_turns = decision.memory_turns
     session.learn_skill_nudge_iters = decision.skill_iters
+    log.info(
+      "learning fork decision",
+      extra={
+        "data": {
+          "event": "learning_fork_decision",
+          "role_owner": factors["role_owner"],
+          "billing_not_byok": factors["billing_not_byok"],
+          "credential_principal_service": factors["credential_principal_service"],
+          "run_mode_interactive": factors["run_mode_interactive"],
+          "run_context_present": run_context_present,
+          "profile": profile,
+          "profile_analyst": factors["profile_analyst"],
+          "not_fork_mode": factors["not_fork_mode"],
+          "eligible": eligible,
+          "enabled": enabled,
+          "memory_counter": decision.memory_turns,
+          "memory_nudge_threshold": memory_threshold,
+          "skill_counter": decision.skill_iters,
+          "skill_nudge_threshold": skill_threshold,
+          "handoff_present": handoff is not None,
+          "should_submit": decision.should_submit,
+          "reason": decision.reason,
+        }
+      },
+    )
     if not decision.should_submit or handoff is None:
       return None
 

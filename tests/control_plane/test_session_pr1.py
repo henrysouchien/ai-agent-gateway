@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,9 +15,19 @@ from agent_gateway.model_registry import (
   INITIAL_MODEL_SELECTION_POLICY,
 )
 from agent_gateway.control_plane.middleware import CONTROL_PLANE_VERSION_HEADER
+from agent_gateway.event_log import EventLog
+from agent_gateway.runner import AgentRunner
 from agent_gateway.control_plane import session as control_session_module
 from agent_gateway.control_plane.session import CONTROL_SESSION_TTL_SECONDS
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
+
+
+def _unused_runner(
+  _event_log: EventLog,
+  _session_id: str,
+  _started_at: float,
+) -> AgentRunner:
+  raise AssertionError("control session tests never run a chat turn")
 
 
 def _gateway_user_keys(*, key: str, slug: str, email: str, risk_user_id: int, channel: str) -> str:
@@ -117,10 +128,10 @@ def test_control_session_lifecycle_create_use_expire_recreate(
 
 
 def test_control_session_stores_identity_derived_numeric_risk_user_id_without_resolver() -> None:
-  async def _build_chat_runtime(_session, _request, _channel, _auth_manager):
+  async def _build_chat_runtime(_session, _request, _channel, _auth_manager, *, storage_root: Path | None = None):
     return ChatRuntime(
       system_prompt="test",
-      build_runner=lambda *_args: None,
+      build_runner=_unused_runner,
       capability_execution=_request.capability_execution,
     )
 
@@ -167,10 +178,10 @@ def test_control_session_stores_identity_mapped_email_without_resolver(monkeypat
     ),
   )
 
-  async def _build_chat_runtime(_session, _request, _channel, _auth_manager):
+  async def _build_chat_runtime(_session, _request, _channel, _auth_manager, *, storage_root: Path | None = None):
     return ChatRuntime(
       system_prompt="test",
-      build_runner=lambda *_args: None,
+      build_runner=_unused_runner,
       capability_execution=_request.capability_execution,
     )
 

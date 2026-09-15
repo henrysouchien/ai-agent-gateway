@@ -125,6 +125,7 @@ def test_disabled_trigger_stays_none() -> None:
 def test_large_window_scales_trigger_up() -> None:
   # 160k legacy trigger on a 1M-window model -> 80% of 1M, not 160k.
   trig = effective_compaction_trigger(160_000, _model(1_000_000))
+  assert trig is not None
   assert trig == int(1_000_000 * COMPACTION_TRIGGER_PCT / 100)
   assert trig > 160_000
 

@@ -19,8 +19,9 @@ if str(PKG_DIR) not in sys.path:
 # entry.py validates PRODUCT_ID at import time. Keep collection hermetic in CI.
 os.environ.setdefault("PRODUCT_ID", "hank-test")
 
-from agent_gateway import AgentRunner, EventLog, ToolDispatcher
+from agent_gateway import AgentRunner, EventLog, McpClientManager, ToolDispatcher
 from api.agent.autonomous import entry as autonomous_entry
+from agent_gateway.tool_dispatcher_helpers import ToolResult
 from tests.capability_execution_test_support import (
   stub_capability_execution_resolver,
   stub_runner_capability_execution,
@@ -34,19 +35,45 @@ from tests.deterministic_fixture_support import (
 )
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
+class _NullMcpClient(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
+
+  def is_mcp_tool(self, name: str) -> bool:
+    _ = name
     return False
 
-  def get_server_for_tool(self, _name: str) -> str | None:
+  def get_server_for_tool(self, name: str) -> str | None:
+    _ = name
     return None
 
-  async def call_tool(self, name: str, _tool_input: dict[str, Any], **_kwargs: Any):
-    return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
+  async def call_tool(
+    self,
+    name: str,
+    tool_input: object,
+    meta: object | None = None,
+    abort_event: asyncio.Event | None = None,
+    gateway_session: object | None = None,
+    allow_uncertain_replay: bool = True,
+    trusted_dispatch_scope: object | None = None,
+  ) -> ToolResult:
+    _ = (
+      tool_input,
+      meta,
+      abort_event,
+      gateway_session,
+      allow_uncertain_replay,
+      trusted_dispatch_scope,
+    )
+    return None, {
+      "code": "unknown_tool",
+      "message": f"Unknown tool: {name}",
+    }
 
 
 def _construct_runner_from_runtime_config(config: Any, *, session_id: str) -> AgentRunner:
   event_log = EventLog()
+  execution_policy = config.execution_policy
   dispatcher = ToolDispatcher(
     mcp_client=_NullMcpClient(),
     local_tool_handlers={},
@@ -63,16 +90,16 @@ def _construct_runner_from_runtime_config(config: Any, *, session_id: str) -> Ag
         "auth_mode": "none",
         "api_key": "",
         "auth_token": "",
-        "max_tokens": config.max_tokens,
+        "max_tokens": execution_policy.max_tokens,
       },
       model=FIXTURE_MODEL_ID,
       effort="none",
     ),
     get_tool_definitions=lambda: [],
-    client_timeout=config.client_timeout,
-    max_tokens_override=config.max_tokens,
-    per_turn_timeout=config.per_turn_timeout,
-    max_budget_usd=config.max_budget_usd,
+    client_timeout=execution_policy.client_timeout,
+    max_tokens_override=execution_policy.max_tokens,
+    per_turn_timeout=execution_policy.per_turn_timeout,
+    max_budget_usd=execution_policy.max_budget_usd,
     max_concurrent_sub_agents=config.max_concurrent_sub_agents,
     user_id="alice",
     billing_mode="byok",
@@ -102,7 +129,8 @@ def test_fixture_profile_budget_validates_through_runner_config(monkeypatch) -> 
     profile,
     session_driver_execution=execution,
   )
-  assert run_config.max_budget_usd == profile.max_budget_usd > 0
+  assert run_config.execution_policy is profile.execution_policy
+  assert run_config.execution_policy.max_budget_usd > 0
 
   _construct_runner_from_runtime_config(run_config, session_id="fixture-profile-run")
 
@@ -142,8 +170,8 @@ def test_fixture_profile_timeout_defaults_to_live_qa_window(monkeypatch) -> None
     profile,
     session_driver_execution=execution,
   )
-  assert profile.timeout_seconds == 300
-  assert run_config.timeout_seconds == 300
+  assert profile.execution_policy.timeout_seconds == 300
+  assert run_config.execution_policy.timeout_seconds == 300
 
 
 def test_fixture_profile_timeout_can_be_overridden_for_fast_tests(monkeypatch) -> None:
@@ -160,5 +188,5 @@ def test_fixture_profile_timeout_can_be_overridden_for_fast_tests(monkeypatch) -
     profile,
     session_driver_execution=execution,
   )
-  assert profile.timeout_seconds == 42
-  assert run_config.timeout_seconds == 42
+  assert profile.execution_policy.timeout_seconds == 42
+  assert run_config.execution_policy.timeout_seconds == 42

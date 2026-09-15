@@ -4,7 +4,7 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Literal, TypeAlias
 
-from .capability_binding import CapabilityBind, RunMode
+from .capability_binding import CapabilityBind, RunMode, SESSION_DRIVER_CAPABILITY
 from .capability_execution import MaterializedCredential
 
 
@@ -85,7 +85,7 @@ class AutonomousCapabilityBindingRequest:
     if self.required_bind is not None:
       if not isinstance(self.required_bind, CapabilityBind):
         raise TypeError("required_bind must be CapabilityBind")
-      if self.required_bind.capability_id != "session.driver":
+      if self.required_bind.capability_id != SESSION_DRIVER_CAPABILITY:
         raise ValueError("resume binding requests require a session.driver bind")
       if self.required_bind.run_mode != self.run_mode:
         raise ValueError("persisted bind run_mode does not match the resume request")
@@ -104,7 +104,7 @@ class AutonomousCapabilityBinding:
   def __post_init__(self) -> None:
     if not isinstance(self.bind, CapabilityBind):
       raise TypeError("autonomous capability binding bind must be CapabilityBind")
-    if self.bind.capability_id != "session.driver":
+    if self.bind.capability_id != SESSION_DRIVER_CAPABILITY:
       raise ValueError("autonomous capability binding requires a session.driver bind")
     if self.bind.run_mode not in {"autonomous", "cron"}:
       raise ValueError(

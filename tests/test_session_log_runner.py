@@ -2,12 +2,14 @@ import asyncio
 import hashlib
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from agent_workflow_contracts import (  # noqa: E402
+from agent_workflow_contracts import (
   AgentOperationRef,
   AttemptRef,
   ContentHandle,
@@ -20,6 +22,8 @@ from agent_workflow_contracts import (  # noqa: E402
   sha256_digest,
 )
 
+
+
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
@@ -28,6 +32,7 @@ if str(PKG_DIR) not in sys.path:
 from agent_gateway import (  # noqa: E402
   AgentRunner,
   AgentSessionLog,
+  McpClientManager,
   EventLog,
   GatewaySession,
   ModelInfo,
@@ -75,7 +80,12 @@ def _subagent_result_identity(
   *,
   delegation_id: str,
   physical_task_id: str,
-) -> dict[str, object]:
+) -> tuple[
+  OrdinaryDelegationTaskRef,
+  AttemptRef,
+  ResultRequirement,
+  TaskResultProvenance,
+]:
   operation = AgentOperationRef(
     namespace="agent-operation",
     name="test-child",
@@ -91,15 +101,15 @@ def _subagent_result_identity(
     attempt_id=f"attempt:{physical_task_id}:1",
     physical_task_id=physical_task_id,
   )
-  return {
-    "logical_task": logical_task,
-    "attempt": attempt,
-    "result_requirement": ResultRequirement(
+  return (
+    logical_task,
+    attempt,
+    ResultRequirement(
       mode="narrative",
       terminal_narrative="required",
       outcome=OutcomeRequirement(required=False, source="none"),
     ),
-    "result_provenance": TaskResultProvenance(
+    TaskResultProvenance(
       admitted_task_digest=sha256_digest({
         "logical_task": logical_task.model_dump(mode="json"),
         "attempt": attempt.model_dump(mode="json"),
@@ -110,7 +120,7 @@ def _subagent_result_identity(
       }),
       tool_grant_digest=sha256_digest({"tools": ["lookup"]}),
     ),
-  }
+  )
 
 
 def _runner_execution(
@@ -139,15 +149,9 @@ def _child_execution(
   )
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
-    return False
+class _NullMcpClient(McpClientManager):
+  """No-server MCP manager used by dispatcher-focused tests."""
 
-  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
-    return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
-
-  def get_tool_definitions(self) -> list[dict[str, Any]]:
-    return []
 
 
 class _ScriptedProvider(ModelProvider):
@@ -218,16 +222,40 @@ def _make_dispatcher(
   event_log: EventLog | None = None,
   local_tool_handlers: dict[str, Any] | None = None,
 ) -> ToolDispatcher:
+  handlers = dict(local_tool_handlers or {})
+  tool_definitions = [
+    {
+      "name": name,
+      "description": f"Synthetic {name} test tool",
+      "input_schema": {
+        "type": "object",
+        "additionalProperties": True,
+      },
+    }
+    for name in handlers
+  ]
   return ToolDispatcher(
     mcp_client=_NullMcpClient(),
-    local_tool_handlers=local_tool_handlers or {},
+    local_tool_handlers=handlers,
     event_log=event_log or EventLog(),
     session_id="sess-parent",
     # Owner authority: since S1 fail-closed roles a role-less dispatcher is
     # invite and denies the synthetic local tools these logging tests execute.
     role="owner",
-    get_tool_definitions=None,
+    get_tool_definitions=lambda: list(tool_definitions),
   )
+
+
+def _make_runner(**kwargs: Any) -> AgentRunner:
+  dispatcher = kwargs.get("dispatcher")
+  tool_definition_getter = getattr(
+    dispatcher,
+    "get_tool_definitions",
+    None,
+  )
+  if callable(tool_definition_getter):
+    kwargs.setdefault("get_tool_definitions", tool_definition_getter)
+  return AgentRunner(**kwargs)
 
 
 def _tool_turn(
@@ -356,7 +384,7 @@ def test_runner_emits_durable_envelope_in_order(tmp_path: Path) -> None:
     _text_turn("done"),
   ])
   event_log = EventLog()
-  runner = AgentRunner(
+  runner = _make_runner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"lookup": _lookup_tool}),
     session_id="sess-parent",
@@ -389,6 +417,324 @@ def test_runner_emits_durable_envelope_in_order(tmp_path: Path) -> None:
   assert entries[6].event["reason"] == "completed"
 
 
+def test_detach_keeps_other_session_responsive(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def _case() -> None:
+    logs = [
+      AgentSessionLog(path=tmp_path / f"session-{index}.jsonl")
+      for index in range(2)
+    ]
+    events = [EventLog(), EventLog()]
+    runners = [
+      _make_runner(
+        event_log=events[index],
+        dispatcher=_make_dispatcher(event_log=events[index]),
+        session_id=f"session-{index}",
+        capability_execution=_runner_execution(
+          _ScriptedProvider([_text_turn(f"answer-{index}")])
+        ),
+        agent_session_log=logs[index],
+        user_id=f"user-{index}",
+        billing_mode="byok",
+        rate_table_version="unknown",
+      )
+      for index in range(2)
+    ]
+    loop = asyncio.get_running_loop()
+    scan_started = asyncio.Event()
+    release_scan = threading.Event()
+    scan_started_at: list[float] = []
+    read_entries = logs[0]._iter_current_entries_strict_sync
+
+    def _slow_terminal_scan():
+      if runners[0]._terminal_closure_event is not None and not scan_started_at:
+        scan_started_at.append(time.monotonic())
+        loop.call_soon_threadsafe(scan_started.set)
+        # A bounded disk-read delay reproduces a large retained-journal scan
+        # without making every test write and parse a 98 MB journal.
+        release_scan.wait(timeout=2.0)
+      yield from read_entries()
+
+    monkeypatch.setattr(
+      logs[0], "_iter_current_entries_strict_sync", _slow_terminal_scan
+    )
+    first = asyncio.create_task(
+      runners[0].run(messages=[{"role": "user", "content": "First"}])
+    )
+    try:
+      await asyncio.wait_for(scan_started.wait(), timeout=5.0)
+      loop_stall = time.monotonic() - scan_started_at[0]
+      await asyncio.wait_for(
+        runners[1].run(messages=[{"role": "user", "content": "Second"}]),
+        timeout=5.0,
+      )
+      assert any(
+        entry.event.get("text") == "answer-1"
+        for entry in events[1].entries
+      )
+      assert loop_stall < 0.5, f"Other session stalled for {loop_stall:.3f}s"
+    finally:
+      release_scan.set()
+      await first
+    for durable_log in logs:
+      entries, _ = await durable_log.query(order="asc")
+      assert entries[-1].event["type"] == "detach"
+
+  _run(_case())
+
+
+def test_cancellation_during_recovery_settles_without_starting_provider(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def _case() -> None:
+    durable_log = AgentSessionLog(path=tmp_path / "cancelled-recovery.jsonl")
+    await durable_log.append({
+      "type": "attach",
+      "gateway_session_id": "cancelled-recovery",
+      "runner_id": "old-writer",
+      "started_at": 100.0,
+      "client_kind": "cron",
+      "role": "writer",
+    })
+    provider = _ScriptedProvider([_text_turn("Must not execute")])
+    event_log = EventLog()
+    runner = _make_runner(
+      event_log=event_log,
+      dispatcher=_make_dispatcher(event_log=event_log),
+      session_id="cancelled-recovery",
+      capability_execution=_runner_execution(provider),
+      agent_session_log=durable_log,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    loop = asyncio.get_running_loop()
+    scan_started = asyncio.Event()
+    release_scan = threading.Event()
+    query = durable_log.query_current_strict_sync
+
+    def _paused_recovery_scan(**kwargs: Any):
+      if not release_scan.is_set():
+        loop.call_soon_threadsafe(scan_started.set)
+        release_scan.wait(timeout=2.0)
+      return query(**kwargs)
+
+    monkeypatch.setattr(
+      durable_log, "query_current_strict_sync", _paused_recovery_scan
+    )
+    task = asyncio.create_task(
+      runner.run(messages=[{"role": "user", "content": "Do expensive work"}])
+    )
+    try:
+      await asyncio.wait_for(scan_started.wait(), timeout=5.0)
+      # Match the public stream's disconnect-then-cancel ordering.
+      await runner.on_disconnect()
+      for _ in range(2):
+        task.cancel()
+        await asyncio.sleep(0)
+      assert not task.done()
+      assert runner._write_lease_file is not None
+    finally:
+      release_scan.set()
+      try:
+        await task
+      except asyncio.CancelledError:
+        pass
+    entries, _ = await durable_log.query(order="asc")
+    detach_reasons = [
+      entry.event["reason"] for entry in entries
+      if entry.event["type"] == "detach"
+    ]
+    assert (provider._turn_index, task.cancelled(), detach_reasons) == (
+      0, True, []
+    )
+    assert [entry.event["type"] for entry in entries] == [
+      "attach", "interrupted"
+    ]
+    assert entries[-1].event["runner_id"] == "old-writer"
+    assert entries[-1].event["reason"] == "recovered_on_attach"
+    assert runner._write_lease_file is None
+
+  _run(_case())
+
+
+def test_detach_commits_after_cancellation_during_terminal_scan(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def _case() -> None:
+    durable_log = AgentSessionLog(path=tmp_path / "cancelled-detach.jsonl")
+    event_log = EventLog()
+    runner = _make_runner(
+      event_log=event_log,
+      dispatcher=_make_dispatcher(event_log=event_log),
+      session_id="cancelled-detach",
+      capability_execution=_runner_execution(
+        _ScriptedProvider([_text_turn("Completed answer")])
+      ),
+      agent_session_log=durable_log,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    loop = asyncio.get_running_loop()
+    scan_started = asyncio.Event()
+    release_scan = threading.Event()
+    read_entries = durable_log._iter_current_entries_strict_sync
+
+    def _paused_terminal_scan():
+      if runner._terminal_closure_event is not None and not release_scan.is_set():
+        loop.call_soon_threadsafe(scan_started.set)
+        release_scan.wait(timeout=2.0)
+      yield from read_entries()
+
+    monkeypatch.setattr(
+      durable_log, "_iter_current_entries_strict_sync", _paused_terminal_scan
+    )
+    existing_tasks = asyncio.all_tasks()
+    task = asyncio.create_task(
+      runner.run(messages=[{"role": "user", "content": "Finish"}])
+    )
+    try:
+      await asyncio.wait_for(scan_started.wait(), timeout=5.0)
+      for _ in range(2):
+        # Portal shutdown cancels every task, including separately shielded
+        # child tasks, not just the runner waiting for terminal settlement.
+        for pending in asyncio.all_tasks() - existing_tasks:
+          pending.cancel()
+        await asyncio.sleep(0)
+      assert runner._write_lease_file is not None
+      assert not task.done()
+    finally:
+      release_scan.set()
+      try:
+        await task
+      except asyncio.CancelledError:
+        pass
+    entries, _ = await durable_log.query(order="asc")
+    assert entries[-1].event["type"] == "detach"
+    assert entries[-1].event["reason"] == "completed"
+    assert task.cancelled()
+    assert runner._write_lease_file is None
+
+  _run(_case())
+
+
+def test_post_sse_cancellation_keeps_durable_detach(tmp_path: Path) -> None:
+  async def case() -> None:
+    durable_log = AgentSessionLog(tmp_path / "post-sse-cancellation.jsonl")
+    event_log = EventLog()
+    runner = _make_runner(
+      event_log=event_log, dispatcher=_make_dispatcher(event_log=event_log),
+      session_id="post-sse-cancellation",
+      capability_execution=_runner_execution(_ScriptedProvider([_text_turn("done")])),
+      agent_session_log=durable_log, user_id="alice",
+      billing_mode="byok", rate_table_version="unknown",
+    )
+    task = asyncio.create_task(runner.run(messages=[{"role": "user", "content": "finish"}]))
+
+    def cancel_after_terminal(event: dict[str, Any], _session_id: str) -> None:
+      if event["type"] == "stream_complete":
+        task.cancel("SSE disconnect")
+        task.cancel("server shutdown")
+
+    event_log._on_event = cancel_after_terminal
+    with pytest.raises(asyncio.CancelledError):
+      await task
+    entries, _ = await durable_log.query(order="asc")
+    assert entries[-1].event["type"] == "detach"
+    assert entries[-1].event["reason"] == "completed"
+    assert event_log.has_terminal
+    assert runner._write_lease_file is None
+
+  _run(case())
+
+
+def test_named_skill_repeated_cancellation_drains_interruption_and_detach(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  from agent_gateway.skill_lifecycle import (
+    TopLevelSkillAdmission,
+    TopLevelSkillCompletionPlan,
+    TopLevelSkillLifecycleMetadata,
+    TopLevelSkillResultPolicy,
+  )
+  from agent_gateway.runner_session_events import build_skill_result_failure_event
+  from agent_gateway.skill_completion_wal import TopLevelSkillCompletionEffectPlan
+
+  async def case() -> None:
+    durable_log = AgentSessionLog(tmp_path / "named-cancellation.jsonl")
+    lifecycle = TopLevelSkillLifecycleMetadata(
+      skill_run_id="cancelled-skill", skill="fundamental-research",
+      scope="ticker", ticker="PCTY", portfolio_id=None,
+    )
+    event_log = EventLog()
+    dispatcher = _make_dispatcher(event_log=event_log)
+    runner = AgentRunner(
+      event_log=event_log, dispatcher=dispatcher, session_id="named-cancellation",
+      capability_execution=_runner_execution(_ScriptedProvider([_text_turn("unused")])),
+      agent_session_log=durable_log,
+      get_tool_definitions=dispatcher.get_tool_definitions,
+      top_level_skill_admission=TopLevelSkillAdmission.acquire(durable_log.path),
+      top_level_skill_lifecycle=lifecycle,
+      top_level_skill_result_policy=TopLevelSkillResultPolicy(
+        prepare_provider=lambda prompt: prompt,
+        prepare_completion=lambda _log, terminal: TopLevelSkillCompletionPlan(
+          result_event=build_skill_result_failure_event(lifecycle, error="cancelled"),
+          terminal_event=terminal,
+          effect=TopLevelSkillCompletionEffectPlan.noop(),
+        ),
+      ),
+      workspace_dir=tmp_path, user_id="alice", billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    streaming = asyncio.Event()
+
+    async def stream_turn(**_kwargs: Any):
+      streaming.set()
+      await asyncio.Future()
+
+    runner._stream_turn = stream_turn
+    loop = asyncio.get_running_loop()
+    scan_started = asyncio.Event()
+    release_scan = threading.Event()
+    emit_interrupted = runner._emit_interrupted_event_sync
+
+    def paused_interruption_scan(*args: Any, **kwargs: Any):
+      loop.call_soon_threadsafe(scan_started.set)
+      release_scan.wait(timeout=5.0)
+      return emit_interrupted(*args, **kwargs)
+
+    monkeypatch.setattr(
+      runner, "_emit_interrupted_event_sync", paused_interruption_scan,
+    )
+    task = asyncio.create_task(runner.run(messages=[{"role": "user", "content": "run"}]))
+    try:
+      await asyncio.wait_for(streaming.wait(), timeout=5.0)
+      task.cancel("provider cancellation")
+      await asyncio.wait_for(scan_started.wait(), timeout=5.0)
+      for _ in range(3):
+        task.cancel("repeated cancellation")
+        await asyncio.sleep(0)
+      assert not task.done()
+      assert runner._write_lease_file is not None
+    finally:
+      release_scan.set()
+      with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await runner.wait_for_top_level_skill_settlement() is True
+    entries, _ = await durable_log.query(order="asc")
+    assert [e.event["type"] for e in entries][-2:] == ["interrupted", "detach"]
+    assert entries[-1].event["reason"] == "cancelled"
+    assert runner._write_lease_file is None
+
+  _run(case())
+
+
 def test_runner_commits_selected_content_on_user_fact_before_provider_setup(
   tmp_path: Path,
 ) -> None:
@@ -419,7 +765,7 @@ def test_runner_commits_selected_content_on_user_fact_before_provider_setup(
 
   provider = _CommitCheckingProvider([_text_turn("done")])
   event_log = EventLog()
-  runner = AgentRunner(
+  runner = _make_runner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log),
     session_id="sess-parent",
@@ -455,7 +801,7 @@ def test_runner_suppresses_text_from_tool_only_turns(
     _text_turn("done"),
   ])
   event_log = EventLog()
-  runner = AgentRunner(
+  runner = _make_runner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"lookup": _lookup_tool}),
     session_id="sess-parent",
@@ -501,7 +847,7 @@ def test_semantic_tool_error_is_visible_in_trace_and_timing(tmp_path: Path) -> N
     _tool_turn(tool_input={"query": "X"}),
     _text_turn("handled"),
   ])
-  runner = AgentRunner(
+  runner = _make_runner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"lookup": _semantic_error_tool}),
     session_id="sess-parent",
@@ -545,7 +891,7 @@ def test_semantic_tool_error_without_detail_warns_model_context(tmp_path: Path) 
     _tool_turn(tool_name="get_skill_artifact", tool_input={"ticker": "ADI"}),
     _text_turn("handled"),
   ])
-  runner = AgentRunner(
+  runner = _make_runner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"get_skill_artifact": _empty_status_error_tool}),
     session_id="sess-parent",
@@ -590,7 +936,7 @@ def test_native_runner_semantic_error_includes_validation_details(tmp_path: Path
     _tool_turn(tool_name="thesis_append_decisions_log", tool_input={"research_file_id": 1, "entry": {}}),
     _text_turn("handled"),
   ])
-  runner = AgentRunner(
+  runner = _make_runner(
     event_log=event_log,
     dispatcher=_make_dispatcher(
       event_log=event_log,
@@ -627,7 +973,7 @@ def test_operator_pause_before_turn_emits_clean_interruption(tmp_path: Path) -> 
   pause_event = asyncio.Event()
   pause_event.set()
   provider = _ScriptedProvider([])
-  runner = AgentRunner(
+  runner = _make_runner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log),
     session_id="sess-parent",
@@ -674,7 +1020,7 @@ def test_operator_pause_after_turn_stops_before_tool_dispatch(tmp_path: Path) ->
     [_tool_turn()],
     after_turn=lambda _turn_index: pause_event.set(),
   )
-  runner = AgentRunner(
+  runner = _make_runner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"lookup": _unexpected_tool}),
     session_id="sess-parent",
@@ -690,13 +1036,128 @@ def test_operator_pause_after_turn_stops_before_tool_dispatch(tmp_path: Path) ->
 
   assert tool_calls == []
   entries, _ = _run(log.query(order="asc"))
-  event_types = [entry.event["type"] for entry in entries]
-  assert event_types == ["attach", "user_message", "assistant_message", "interrupted", "detach"]
-  assert entries[3].event["reason"] == "operator_pause"
-  assert entries[3].event["safe_boundary"] == "after_turn_before_tools"
-  assert entries[4].event["reason"] == "operator_pause"
-  assert "tool_call_start" not in event_types
-  assert "tool_call_interrupted" not in event_types
+  interruptions = [entry.event for entry in entries if entry.event["type"] == "interrupted"]
+  assert interruptions[0]["reason"] == "operator_pause"
+  assert interruptions[0]["safe_boundary"] == "after_turn_before_tools"
+  assert not any(entry.event["type"] == "tool_call_start" for entry in entries)
+
+
+@pytest.mark.parametrize("ending", ["completed", "operator_pause", "cancelled", "dispatch_error"])
+def test_followup_replays_complete_tool_batch_before_user_text(
+  tmp_path: Path,
+  ending: str,
+) -> None:
+  from agent_gateway.providers.anthropic import AnthropicProvider
+
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "followup.jsonl")
+    pause_event = asyncio.Event()
+
+    async def _lookup(tool_input: dict[str, Any], **kwargs: Any):
+      if ending == "cancelled":
+        raise asyncio.CancelledError()
+      return {"observed": tool_input["query"]}, None
+
+    opening = _ScriptedProvider(
+      [
+        [
+          *_tool_turn(tool_id="tool-a", tool_input={"query": "first"})[:-1],
+          *_tool_turn(tool_id="tool-b", tool_input={"query": "second"})[1:],
+        ],
+        _text_turn("Opening answer"),
+      ],
+      after_turn=(
+        (lambda _: pause_event.set())
+        if ending == "operator_pause" else None
+      ),
+    )
+    runner = _make_runner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(local_tool_handlers={"lookup": _lookup}),
+      session_id="sess-parent",
+      capability_execution=_runner_execution(opening),
+      agent_session_log=log,
+      operator_pause_event=pause_event,
+      on_tool_result=lambda _: [{"type": "text", "text": "Source annotation"}],
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    if ending == "dispatch_error":
+      async def _fail_dispatch(*args: Any, **kwargs: Any):
+        raise RuntimeError("dispatch unavailable")
+      runner._execute_single_tool = _fail_dispatch
+    if ending in {"cancelled", "dispatch_error"}:
+      expected = asyncio.CancelledError if ending == "cancelled" else RuntimeError
+      with pytest.raises(expected):
+        await runner.run(messages=[{"role": "user", "content": "Look up both"}])
+    else:
+      await runner.run(messages=[{"role": "user", "content": "Look up both"}])
+
+    entries, _ = await log.query(order="asc")
+    terminal_blocks = [
+      block
+      for entry in entries
+      for block in entry.event.get("final_tool_result_blocks", [])
+      if block.get("type") == "tool_result"
+    ]
+    assert {block["tool_use_id"] for block in terminal_blocks} == {"tool-a", "tool-b"}
+    if ending != "completed":
+      assert all(block.get("is_error") for block in terminal_blocks)
+
+    requests: list[dict[str, Any]] = []
+    anthropic = AnthropicProvider()
+
+    class _FollowupProvider(_ScriptedProvider):
+      def normalize_messages(self, messages, model_info):
+        for index, message in enumerate(messages):
+          content = message["content"]
+          if message["role"] != "assistant" or not isinstance(content, list):
+            continue
+          tool_ids = {block["id"] for block in content if block.get("type") == "tool_use"}
+          if not tool_ids:
+            continue
+          next_message = messages[index + 1]
+          assert next_message["role"] == "user"
+          result_ids = set()
+          for block in next_message["content"]:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+              break
+            result_ids.add(block["tool_use_id"])
+          assert result_ids == tool_ids
+        return anthropic.normalize_messages(messages, model_info)
+
+      def build_request_params(self, **kwargs):
+        params = anthropic.build_request_params(**kwargs)
+        requests.append(params)
+        return params
+
+    followup = _FollowupProvider([_text_turn("Follow-up answer")])
+    followup_runner = _make_runner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(),
+      session_id="sess-parent",
+      capability_execution=_runner_execution(followup),
+      agent_session_log=log,
+      context_builder=SessionContextBuilder(agent_session_log=log, tail_window_seconds=None),
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    await followup_runner.run(messages=[{"role": "user", "content": "Follow up"}])
+    assert len(requests) == 1
+    results = [
+      block for message in requests[0]["messages"]
+      if isinstance(message["content"], list)
+      for block in message["content"] if block.get("type") == "tool_result"
+    ]
+    assert {block["tool_use_id"] for block in results} == {"tool-a", "tool-b"}
+    if ending == "completed":
+      assert [json.loads(block["content"])["observed"] for block in results] == ["first", "second"]
+    else:
+      assert all(block.get("is_error") for block in results)
+
+  _run(_case())
 
 
 def test_provider_client_creation_failure_terminalizes_without_raising(
@@ -717,7 +1178,7 @@ def test_provider_client_creation_failure_terminalizes_without_raising(
   )
   provider = _StartupFailureProvider([])
   event_log = EventLog()
-  runner = AgentRunner(
+  runner = _make_runner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log),
     session_id="sess-parent",
@@ -738,16 +1199,12 @@ def test_provider_client_creation_failure_terminalizes_without_raising(
   assert returned is None
   entries, _ = _run(log.query(order="asc"))
   events = [entry.event for entry in entries]
-  assert [event["type"] for event in events] == [
-    "attach",
-    "user_message",
-    "error",
-    "detach",
-  ]
-  assert events[2]["error"] == (
-    "Provider startup failed: could not create client for provider=stub."
-  )
-  assert events[3]["reason"] == "error"
+  assert events[0]["type"] == "attach"
+  assert events[1]["type"] == "user_message"
+  failure = next(event for event in events if event["type"] == "error")
+  assert "Provider startup failed" in failure["error"]
+  assert events[-1]["type"] == "detach"
+  assert events[-1]["reason"] == "error"
   assert "sensitive client construction detail" not in json.dumps(events)
 
 
@@ -764,7 +1221,7 @@ def test_sub_agent_cancelled_run_emits_sub_agent_interrupted_reason(tmp_path: Pa
 
   log = AgentSessionLog(path=tmp_path / "sessions" / "sub-agent-cancelled.jsonl")
   provider = _BlockingProvider([])
-  runner = AgentRunner(
+  runner = _make_runner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sub-worker:parent",
@@ -825,7 +1282,7 @@ def test_runner_without_context_builder_does_not_inject_prior_durable_history(tm
       )
 
   provider = _CapturingProvider([_text_turn("done")])
-  runner = AgentRunner(
+  runner = _make_runner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-parent",
@@ -876,7 +1333,7 @@ def test_runner_with_context_builder_ignores_fabricated_client_history(tmp_path:
       )
 
   provider = _CapturingProvider([_text_turn("done")])
-  runner = AgentRunner(
+  runner = _make_runner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-parent",
@@ -916,7 +1373,7 @@ def test_stream_retry_and_terminal_error_are_durable(
   provider = _RetryableFailingProvider()
   log = AgentSessionLog(path=tmp_path / "sessions" / "stream-retry.jsonl")
   event_log = EventLog()
-  runner = AgentRunner(
+  runner = _make_runner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log),
     session_id="sess-parent",
@@ -953,7 +1410,7 @@ def test_tool_call_complete_logs_final_model_facing_result_blocks(tmp_path: Path
     _text_turn("done"),
   ])
   event_log = EventLog()
-  runner = AgentRunner(
+  runner = _make_runner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"warn_lookup": _warning_tool}),
     session_id="sess-parent",
@@ -984,7 +1441,7 @@ def test_tool_call_complete_pre_and_final_results_differ_when_annotated(tmp_path
     _text_turn("done"),
   ])
   event_log = EventLog()
-  runner = AgentRunner(
+  runner = _make_runner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"warn_lookup": _warning_tool}),
     session_id="sess-parent",
@@ -1015,7 +1472,7 @@ def test_tool_completion_retains_interceptor_warning_provenance(
     _text_turn("done"),
   ])
   event_log = EventLog()
-  runner = AgentRunner(
+  runner = _make_runner(
     event_log=event_log,
     dispatcher=_make_dispatcher(
       event_log=event_log,
@@ -1057,7 +1514,7 @@ def test_large_tool_result_is_compacted_only_for_model_context(tmp_path: Path, m
     _text_turn("done"),
   ])
   event_log = EventLog()
-  runner = AgentRunner(
+  runner = _make_runner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"large_lookup": _large_result_tool}),
     session_id="sess-parent",
@@ -1099,7 +1556,7 @@ def test_rebuild_task_registry_ignores_tool_call_complete_final_blocks(tmp_path:
         "started_at": 1.0,
         "capability_bind": _child_execution(
           _ScriptedProvider([])
-        ).bind.receipt(),
+        ).bind.to_json(),
       }
     )
   )
@@ -1118,7 +1575,7 @@ def test_rebuild_task_registry_ignores_tool_call_complete_final_blocks(tmp_path:
     )
   )
   provider = _ScriptedProvider([_text_turn("unused")])
-  runner = AgentRunner(
+  runner = _make_runner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(local_tool_handlers={}),
     session_id="sess-parent",
@@ -1141,7 +1598,7 @@ def test_task_durability_events_use_type_and_query_round_trips(tmp_path: Path) -
   log = AgentSessionLog(path=tmp_path / "sessions" / "task-events.jsonl")
   capability_bind = _child_execution(
     _ScriptedProvider([])
-  ).bind.receipt()
+  ).bind.to_json()
   correlation = {
     "task_id": "bg_0",
     "owner_runner_id": "runner_old",
@@ -1165,7 +1622,17 @@ def test_task_durability_events_use_type_and_query_round_trips(tmp_path: Path) -
       assert entry.event[key] == value
 
 
-def test_runner_stale_recovery_synthesizes_orphan_tool_and_prior_writer_interrupt(tmp_path: Path) -> None:
+@pytest.mark.parametrize("recovery_delay", [0, 3 * 60 * 60])
+def test_runner_stale_recovery_synthesizes_orphan_tool_and_prior_writer_interrupt(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  recovery_delay: int,
+) -> None:
+  from agent_gateway.providers.codex import CodexProvider
+  from agent_gateway.providers.openai import OpenAIProvider
+
+  now = gateway_runner.time.time()
+  monkeypatch.setattr(gateway_runner.time, "time", lambda: now - recovery_delay)
   log = AgentSessionLog(path=tmp_path / "sessions" / "recovery.jsonl")
   _run(
     log.append(
@@ -1179,6 +1646,15 @@ def test_runner_stale_recovery_synthesizes_orphan_tool_and_prior_writer_interrup
       }
     )
   )
+  _run(log.append({
+    "type": "assistant_message",
+    "content_blocks": [
+      {"type": "tool_use", "id": tool_id, "name": "file_read", "input": {}}
+      for tool_id in ("tool-orphan", "tool-not-started")
+    ],
+    "runner_id": "runner_old",
+    "role": "writer",
+  }))
   _run(
     log.append(
       {
@@ -1193,13 +1669,31 @@ def test_runner_stale_recovery_synthesizes_orphan_tool_and_prior_writer_interrup
     )
   )
 
-  provider = _ScriptedProvider([_text_turn("recovered")])
-  runner = AgentRunner(
+  monkeypatch.setattr(gateway_runner.time, "time", lambda: now)
+  replayed: list[dict[str, Any]] = []
+
+  class _RecoveryProvider(_ScriptedProvider):
+    def build_request_params(self, **kwargs):
+      replayed.extend(kwargs["messages"])
+      unmatched = {}
+      for adapter in (OpenAIProvider(), CodexProvider()):
+        params = adapter.build_request_params(**{**kwargs, "model": "gpt-5.4"})
+        calls = {item["call_id"] for item in params["input"] if item.get("type") == "function_call"}
+        unmatched[adapter.name] = {
+          item["call_id"] for item in params["input"]
+          if item.get("type") == "function_call_output" and item["call_id"] not in calls
+        }
+      assert not any(unmatched.values()), unmatched
+      return {}
+
+  provider = _RecoveryProvider([_text_turn("recovered")])
+  runner = _make_runner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(local_tool_handlers={}),
     session_id="sess-parent",
     capability_execution=_runner_execution(provider),
     agent_session_log=log,
+    context_builder=SessionContextBuilder(agent_session_log=log),
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -1208,31 +1702,35 @@ def test_runner_stale_recovery_synthesizes_orphan_tool_and_prior_writer_interrup
   _run(runner.run(messages=[{"role": "user", "content": "Continue"}], max_turns=1))
 
   entries, _ = _run(log.query(order="asc"))
-  event_types = [entry.event["type"] for entry in entries]
-  assert event_types[:6] == [
-    "attach",
-    "tool_call_start",
-    "tool_call_interrupted",
-    "interrupted",
-    "attach",
-    "user_message",
-  ]
-
-  orphan = entries[2].event
-  recovery = entries[3].event
-  new_attach = entries[4].event
-  assert orphan["tool_call_id"] == "tool-orphan"
-  assert orphan["tool_risk"] == "read_only"
+  interruptions = [entry.event for entry in entries if entry.event["type"] == "tool_call_interrupted"]
+  assert {event["tool_call_id"] for event in interruptions} == {"tool-orphan", "tool-not-started"}
+  assert all(event["tool_risk"] == "read_only" for event in interruptions)
+  orphan = next(event for event in interruptions if event["tool_call_id"] == "tool-orphan")
+  assert orphan["original_started_at"] == 101.0
+  recovery = next(entry.event for entry in entries if entry.event["type"] == "interrupted")
+  new_attach = next(
+    entry.event for entry in entries
+    if entry.event["type"] == "attach" and entry.event["runner_id"] != "runner_old"
+  )
   assert recovery["reason"] == "recovered_on_attach"
   assert recovery["runner_id"] == "runner_old"
   assert recovery["recovered_by_runner_id"] == new_attach["runner_id"]
   assert new_attach["runner_id"] != "runner_old"
+  messages = _run(SessionContextBuilder(agent_session_log=log, tail_window_seconds=None).build())
+  assistant_index = next(index for index, message in enumerate(messages) if message["role"] == "assistant")
+  results = messages[assistant_index + 1]["content"]
+  assert {block["tool_use_id"] for block in results} == {"tool-orphan", "tool-not-started"}
+  assert all(block["is_error"] for block in results)
+  assert "tool-orphan" in json.dumps(replayed)
+  assert "tool-not-started" in json.dumps(replayed)
+  if recovery_delay:
+    assert not any(message["role"] == "assistant" for message in replayed)
 
 
 def test_second_writer_lease_acquisition_raises(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "lease.jsonl")
   provider_one = _ScriptedProvider([_text_turn("one")])
-  runner_one = AgentRunner(
+  runner_one = _make_runner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-one",
@@ -1243,7 +1741,7 @@ def test_second_writer_lease_acquisition_raises(tmp_path: Path) -> None:
     rate_table_version="unknown",
   )
   provider_two = _ScriptedProvider([_text_turn("two")])
-  runner_two = AgentRunner(
+  runner_two = _make_runner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-two",
@@ -1279,7 +1777,7 @@ def test_register_background_task_emits_task_registered_with_correlation(
 
     monkeypatch.setattr(gateway_runner, "_derive_sub_agent_id", _fake_derive)
     provider = _ScriptedProvider([_text_turn("unused")])
-    runner = AgentRunner(
+    runner = _make_runner(
       event_log=EventLog(),
       dispatcher=_make_dispatcher(),
       session_id="sess-parent",
@@ -1296,7 +1794,7 @@ def test_register_background_task_emits_task_registered_with_correlation(
 
     capability_bind_receipt = _child_execution(
       runner._provider,
-    ).bind.receipt()
+    ).bind.to_json()
     result, error = await runner._register_background_task(
       tool_input={"task": "Collect"},
       handler=_handler,
@@ -1308,6 +1806,7 @@ def test_register_background_task_emits_task_registered_with_correlation(
     assert result is not None
     task = runner._task_registry.get(result["task_id"])
     assert task is not None
+    assert task.asyncio_task is not None
     await asyncio.wait_for(task.asyncio_task, timeout=1.0)
 
     registered, _ = await log.query(event_types={"task_registered"}, order="asc")
@@ -1341,7 +1840,7 @@ def _a_m8_runner(
   max_concurrent_sub_agents: int | None = None,
 ) -> AgentRunner:
   provider = _ScriptedProvider([_text_turn("unused")])
-  runner = AgentRunner(
+  runner = _make_runner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-parent",
@@ -1357,7 +1856,7 @@ def _a_m8_runner(
 
 
 def _a_m8_bind_receipt(runner: AgentRunner) -> dict[str, str]:
-  return _child_execution(runner._provider).bind.receipt()
+  return _child_execution(runner._provider).bind.to_json()
 
 
 async def _durable_task_events(
@@ -1400,7 +1899,7 @@ def test_concurrent_registration_admits_exactly_the_ceiling(
       await asyncio.sleep(0)
       return await original_lookup(task_id)
 
-    runner._lookup_task_in_log = _slow_lookup  # type: ignore[method-assign]
+    runner._lookup_task_in_log = _slow_lookup
 
     async def _handler(_tool_input: dict[str, Any], **_kwargs: Any):
       await release.wait()
@@ -1438,8 +1937,10 @@ def test_concurrent_registration_admits_exactly_the_ceiling(
 
     release.set()
     for result in admitted:
+      assert result is not None
       entry = runner._task_registry.get(result["task_id"])
       assert entry is not None
+      assert entry.asyncio_task is not None
       await asyncio.wait_for(entry.asyncio_task, timeout=1.0)
 
   _run(_case())
@@ -1466,7 +1967,7 @@ def test_post_append_failure_appends_a_compensating_terminal(
         raise RuntimeError("post-append transition failure")
       return original_transition(task_id, new_state, **kwargs)
 
-    runner._task_registry.transition = _transition  # type: ignore[method-assign]
+    runner._task_registry.transition = _transition
 
     async def _handler(_tool_input: dict[str, Any], **_kwargs: Any):
       raise AssertionError("worker must never run")
@@ -1567,7 +2068,7 @@ def test_post_append_cancellation_shields_the_compensating_terminal(
         raise asyncio.CancelledError()
       return original_transition(task_id, new_state, **kwargs)
 
-    runner._task_registry.transition = _transition  # type: ignore[method-assign]
+    runner._task_registry.transition = _transition
 
     async def _handler(_tool_input: dict[str, Any], **_kwargs: Any):
       raise AssertionError("worker must never run")
@@ -1604,7 +2105,7 @@ def test_pre_append_failure_still_discards_the_reservation(
     async def _refuse_append(event: dict[str, Any]):
       raise RuntimeError("durable registration unavailable")
 
-    runner._append_durable_event = _refuse_append  # type: ignore[method-assign]
+    runner._append_durable_event = _refuse_append
 
     async def _handler(_tool_input: dict[str, Any], **_kwargs: Any):
       raise AssertionError("worker must never run")
@@ -1642,7 +2143,7 @@ class _AsyncioProxy:
 def test_task_completed_is_durable_before_terminal_transition() -> None:
   async def _case() -> None:
     provider = _ScriptedProvider([_text_turn("unused")])
-    runner = AgentRunner(
+    runner = _make_runner(
       event_log=EventLog(),
       dispatcher=_make_dispatcher(),
       session_id="sess-parent",
@@ -1652,7 +2153,7 @@ def test_task_completed_is_durable_before_terminal_transition() -> None:
       rate_table_version="unknown",
     )
     entry = runner._task_registry.register("background_agent")
-    capability_bind = _child_execution(provider).bind.receipt()
+    capability_bind = _child_execution(provider).bind.to_json()
     entry.capability_bind_receipt = capability_bind
     entry.metadata.update(
       {
@@ -1678,8 +2179,8 @@ def test_task_completed_is_durable_before_terminal_transition() -> None:
         ordering.append(f"transition_{new_state.value}")
       return original_transition(task_id, new_state, **kwargs)
 
-    runner._append_durable_event = _append  # type: ignore[method-assign]
-    runner._task_registry.transition = _transition  # type: ignore[method-assign]
+    runner._append_durable_event = _append
+    runner._task_registry.transition = _transition
 
     async def _handler(_tool_input: dict[str, Any], **_kwargs: Any):
       return _child_report(), None
@@ -1695,7 +2196,7 @@ def test_rebuild_hot_set_lazy_lookup_and_seq_restore(tmp_path: Path) -> None:
   async def _case() -> None:
     log = AgentSessionLog(path=tmp_path / "sessions" / "rebuild.jsonl")
     provider = _ScriptedProvider([_text_turn("unused")])
-    capability_bind = _child_execution(provider).bind.receipt()
+    capability_bind = _child_execution(provider).bind.to_json()
     for index in range(4):
       await log.append(
         {
@@ -1746,7 +2247,7 @@ def test_rebuild_hot_set_lazy_lookup_and_seq_restore(tmp_path: Path) -> None:
       }
     )
     registry = TaskRegistry(max_retained=2)
-    runner = AgentRunner(
+    runner = _make_runner(
       event_log=EventLog(),
       dispatcher=_make_dispatcher(),
       session_id="sess-parent",
@@ -1760,10 +2261,12 @@ def test_rebuild_hot_set_lazy_lookup_and_seq_restore(tmp_path: Path) -> None:
 
     all_result, all_error = await runner.get_background_result({"task_id": "*"})
     assert all_error is None
+    assert all_result is not None
     assert [task["task_id"] for task in all_result["tasks"]] == ["bg_2", "bg_3"]
 
     lazy_result, lazy_error = await runner.get_background_result({"task_id": "bg_1"})
     assert lazy_error is None
+    assert lazy_result is not None
     assert lazy_result["status"] == "completed"
     assert lazy_result["report"]["summary"] == "done"
 
@@ -1781,14 +2284,14 @@ def test_rebuild_renders_interrupted_and_completed_crash_cases(tmp_path: Path) -
       "owner_role": "writer",
       "parent_turn_id": "turn-1",
       "task_type": "background",
-      "capability_bind": _child_execution(provider).bind.receipt(),
+      "capability_bind": _child_execution(provider).bind.to_json(),
     }
     await log.append({"type": "task_registered", **base, "task_id": "bg_0", "sub_agent_id": "sub0:sess-parent", "call_index": 0, "agent_name": "running", "started_at": 100.0})
     await log.append({"type": "task_registered", **base, "task_id": "bg_1", "sub_agent_id": "sub1:sess-parent", "call_index": 1, "agent_name": "done", "started_at": 110.0})
     await log.append({"type": "task_completed", **base, "task_id": "bg_1", "sub_agent_id": "sub1:sess-parent", "call_index": 1, "final_state": "completed", "completed_at": 120.0, "result": _child_report(), "error": None})
     await log.append({"type": "task_registered", **base, "task_id": "bg_2", "sub_agent_id": "sub2:sess-parent", "call_index": 2, "agent_name": "killed", "started_at": 130.0})
 
-    runner = AgentRunner(
+    runner = _make_runner(
       event_log=EventLog(),
       dispatcher=_make_dispatcher(),
       session_id="sess-parent",
@@ -1804,6 +2307,7 @@ def test_rebuild_renders_interrupted_and_completed_crash_cases(tmp_path: Path) -
     killed_as_interrupted, killed_error = await runner.get_background_result({"task_id": "bg_2"})
 
     assert interrupted_error is None
+    assert interrupted is not None
     assert interrupted["status"] == "interrupted"
     assert interrupted["completed"] is True
     assert interrupted["agent"] == "running"
@@ -1811,9 +2315,11 @@ def test_rebuild_renders_interrupted_and_completed_crash_cases(tmp_path: Path) -
     assert interrupted["sub_agent_id"] == "sub0:sess-parent"
     assert interrupted["parent_turn_id"] == "turn-1"
     assert completed_error is None
+    assert completed is not None
     assert completed["status"] == "completed"
     assert completed["report"]["summary"] == "done"
     assert killed_error is None
+    assert killed_as_interrupted is not None
     assert killed_as_interrupted["status"] == "interrupted"
 
   _run(_case())
@@ -1825,7 +2331,7 @@ def test_sub_agent_events_are_written_to_parent_log(tmp_path: Path) -> None:
     _tool_turn(tool_id="tool-sub", tool_input={"query": "MSFT"}),
     _text_turn("sub done"),
   ])
-  parent_runner = AgentRunner(
+  parent_runner = _make_runner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(local_tool_handlers={"lookup": _lookup_tool}),
     session_id="sess-parent",
@@ -1844,14 +2350,20 @@ def test_sub_agent_events_are_written_to_parent_log(tmp_path: Path) -> None:
     user_id="alice",
     auth_config={"api_key": "k"},
   )
+  logical_task, attempt, result_requirement, result_provenance = (
+    _subagent_result_identity(
+      delegation_id="test-sub-agent-events",
+      physical_task_id="sub0:sess-parent",
+    )
+  )
   result, error = _run(
     parent_runner.spawn_sub_agent(
       "Collect background context",
       capability_execution=_child_execution(parent_runner._provider),
-      **_subagent_result_identity(
-        delegation_id="test-sub-agent-events",
-        physical_task_id="sub0:sess-parent",
-      ),
+      logical_task=logical_task,
+      attempt=attempt,
+      result_requirement=result_requirement,
+      result_provenance=result_provenance,
       skill_name="test-child",
       dispatcher=_make_dispatcher(
         local_tool_handlers={"lookup": _lookup_tool},
@@ -1889,7 +2401,7 @@ def test_spawn_sub_agent_uses_shared_sub_agent_id_helper(tmp_path: Path, monkeyp
 
   monkeypatch.setattr(gateway_runner, "_derive_sub_agent_id", _fake_derive)
   provider = _ScriptedProvider([_text_turn("sub done")])
-  parent_runner = AgentRunner(
+  parent_runner = _make_runner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-parent",
@@ -1900,14 +2412,20 @@ def test_spawn_sub_agent_uses_shared_sub_agent_id_helper(tmp_path: Path, monkeyp
     billing_mode="byok",
     rate_table_version="unknown",
   )
+  logical_task, attempt, result_requirement, result_provenance = (
+    _subagent_result_identity(
+      delegation_id="test-shared-sub-agent-id",
+      physical_task_id="sub3:derived-parent",
+    )
+  )
   result, error = _run(
     parent_runner.spawn_sub_agent(
       "Collect background context",
       capability_execution=_child_execution(parent_runner._provider),
-      **_subagent_result_identity(
-        delegation_id="test-shared-sub-agent-id",
-        physical_task_id="sub3:derived-parent",
-      ),
+      logical_task=logical_task,
+      attempt=attempt,
+      result_requirement=result_requirement,
+      result_provenance=result_provenance,
       skill_name="test-child",
       dispatcher=_make_dispatcher(),
       sub_session=None,

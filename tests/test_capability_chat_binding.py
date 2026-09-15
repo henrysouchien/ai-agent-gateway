@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
+from agent_gateway import AgentRunner
 
 from agent_gateway.capability_binding import (
   CapabilityResolutionError,
@@ -143,7 +145,7 @@ def _configure_builder(builder: Any) -> None:
 
 
 def test_prepare_keeps_auth_config_credential_only_and_binds_registry_identity() -> None:
-  async def builder(*_args: Any, **_kwargs: Any) -> Any:
+  async def builder(*_args: Any, storage_root: Path | None = None, **_kwargs: Any) -> Any:
     raise AssertionError("preparation must not construct a runtime")
 
   _configure_builder(builder)
@@ -168,7 +170,7 @@ def test_prepare_keeps_auth_config_credential_only_and_binds_registry_identity()
 
 
 def test_prepare_accepts_explicit_stable_key_with_service_authority() -> None:
-  async def builder(*_args: Any, **_kwargs: Any) -> Any:
+  async def builder(*_args: Any, storage_root: Path | None = None, **_kwargs: Any) -> Any:
     raise AssertionError
 
   _configure_builder(builder)
@@ -195,7 +197,7 @@ def test_prepare_accepts_explicit_stable_key_with_service_authority() -> None:
 
 
 def test_prepare_rejects_provider_qualified_selector() -> None:
-  async def builder(*_args: Any, **_kwargs: Any) -> Any:
+  async def builder(*_args: Any, storage_root: Path | None = None, **_kwargs: Any) -> Any:
     raise AssertionError
 
   _configure_builder(builder)
@@ -209,7 +211,7 @@ def test_prepare_rejects_provider_qualified_selector() -> None:
 
 
 def test_prepare_with_stale_catalog_revision_and_ineligible_key_names_stale() -> None:
-  async def builder(*_args: Any, **_kwargs: Any) -> Any:
+  async def builder(*_args: Any, storage_root: Path | None = None, **_kwargs: Any) -> Any:
     raise AssertionError
 
   _configure_builder(builder)
@@ -226,13 +228,13 @@ def test_prepare_with_stale_catalog_revision_and_ineligible_key_names_stale() ->
   assert refused.value.code == "capability_catalog_stale"
   assert refused.value.catalog_revision == INITIAL_MODEL_REGISTRY.revision
   assert refused.value.eligible_model_keys
-  receipt = refused.value.receipt()
+  receipt = refused.value.to_error()
   assert receipt["catalog_revision"] == INITIAL_MODEL_REGISTRY.revision
   assert "user-secret" not in str(receipt)
 
 
 def test_prepare_with_stale_catalog_revision_and_eligible_key_still_binds() -> None:
-  async def builder(*_args: Any, **_kwargs: Any) -> Any:
+  async def builder(*_args: Any, storage_root: Path | None = None, **_kwargs: Any) -> Any:
     raise AssertionError
 
   _configure_builder(builder)
@@ -261,7 +263,7 @@ def test_effort_without_model_key_is_not_a_complete_intent() -> None:
 
 
 def test_context_authority_shaped_values_cannot_change_bind() -> None:
-  async def builder(*_args: Any, **_kwargs: Any) -> Any:
+  async def builder(*_args: Any, storage_root: Path | None = None, **_kwargs: Any) -> Any:
     raise AssertionError
 
   _configure_builder(builder)
@@ -293,8 +295,39 @@ def test_context_authority_shaped_values_cannot_change_bind() -> None:
   )
 
 
+def test_prepare_projects_the_persisted_stage_route_without_changing_profile() -> None:
+  async def builder(*_args: Any, storage_root: Path | None = None, **_kwargs: Any) -> Any:
+    raise AssertionError
+
+  _configure_builder(builder)
+  session = _session()
+  session.stage_skill_route = {
+    "route_kind": "stage",
+    "skill_name": "business-model-construction",
+  }
+  prepared = prepare_session_driver_turn(
+    session,
+    _inputs(context={
+      "profile": "community",
+      "skill": "caller-supplied-skill",
+      "stage_skill_route": {
+        "route_kind": "stage",
+        "skill_name": "caller-supplied-skill",
+      },
+    }),
+    build_chat_runtime=builder,
+  )
+
+  assert prepared.request.context["profile"] == "community"
+  assert prepared.request.context["skill"] == "business-model-construction"
+  assert prepared.request.context["stage_skill_route"] == {
+    "route_kind": "stage",
+    "skill_name": "business-model-construction",
+  }
+
+
 def test_prepare_never_falls_back_to_service_material_for_missing_user_secret() -> None:
-  async def builder(*_args: Any, **_kwargs: Any) -> Any:
+  async def builder(*_args: Any, storage_root: Path | None = None, **_kwargs: Any) -> Any:
     raise AssertionError
 
   _configure_builder(builder)
@@ -314,7 +347,7 @@ def test_prepare_never_falls_back_to_service_material_for_missing_user_secret() 
 
 
 def test_prepared_request_can_be_bound_only_once() -> None:
-  async def builder(*_args: Any, **_kwargs: Any) -> Any:
+  async def builder(*_args: Any, storage_root: Path | None = None, **_kwargs: Any) -> Any:
     raise AssertionError
 
   _configure_builder(builder)
@@ -323,18 +356,30 @@ def test_prepared_request_can_be_bound_only_once() -> None:
     _inputs(),
     build_chat_runtime=builder,
   )
+  capability_execution = prepared.request.capability_execution
+  assert capability_execution is not None
   with pytest.raises(ValueError, match="already bound"):
     prepared.request._bind_session_driver(
-      capability_execution=prepared.request.capability_execution,
+      capability_execution=capability_execution,
     )
 
 
-class _CompleteRunner:
+class _CompleteRunner(AgentRunner):
   def __init__(self, event_log: EventLog, execution: Any) -> None:
     self._event_log = event_log
-    self.capability_execution = execution
+    self._capability_execution = execution
+    self._selected_content_bindings = ()
+    self._selected_content_bindings_bound = False
 
-  async def run(self, **_: Any) -> None:
+  async def run(
+    self,
+    messages,
+    system_prompt=None,
+    max_turns=None,
+    *,
+    resume_initial_messages=None,
+  ) -> None:
+    _ = messages, system_prompt, max_turns, resume_initial_messages
     self._event_log.append({
       "type": "stream_complete",
       "terminal_disposition": "completed",
@@ -346,7 +391,14 @@ class _CompleteRunner:
 async def test_dispatch_emits_exact_complete_bind_before_runtime_work() -> None:
   seen_requests: list[Any] = []
 
-  async def builder(session: Any, request: Any, channel: Any, auth_manager: Any):
+  async def builder(
+    session: Any,
+    request: Any,
+    channel: Any,
+    auth_manager: Any,
+    *,
+    storage_root: Path | None = None,
+  ):
     _ = session, channel, auth_manager
     seen_requests.append(request)
     return ChatRuntime(
@@ -382,11 +434,13 @@ async def test_dispatch_emits_exact_complete_bind_before_runtime_work() -> None:
   )
 
   assert result.state == "completed"
-  assert seen_requests[0].capability_bind is prepared.request.capability_bind
+  capability_bind = prepared.request.capability_bind
+  assert capability_bind is not None
+  assert seen_requests[0].capability_bind is capability_bind
   bound_events = [event for event in events if event.get("type") == "capability_bound"]
   assert len(bound_events) == 1
   assert bound_events[0] == {
     "type": "capability_bound",
-    **prepared.request.capability_bind.receipt(),
+    **capability_bind.to_json(),
   }
   assert "secret" not in str(bound_events[0])

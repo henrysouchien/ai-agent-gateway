@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -21,6 +22,8 @@ from .runs_helpers import (
   _session_matches_owner,
   _session_owner_user_id,
 )
+
+log = logging.getLogger("agent_gateway.control_plane.readable_resources")
 
 _RESOURCE_ID_RE = re.compile(r"^[^/\\\s]+$")
 _CONTENT_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -312,7 +315,13 @@ def _find_visible_resources(
         continue
       try:
         payload, sort_ts = _resource_payload_from_event(event, source=source, include_content=include_content)
-      except _ReadableResourceInvalid:
+      except _ReadableResourceInvalid as exc:
+        log.warning(
+          "skipping invalid readable resource event (resource_id=%s, control_run_id=%s): %s",
+          event.get("resource_id"),
+          source.control_run_id,
+          exc,
+        )
         continue
       resource_id = payload["resource_id"]
       if resource_id in seen:

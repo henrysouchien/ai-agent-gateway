@@ -51,22 +51,6 @@ def limits() -> dict[str, int]:
   return dict(value)
 
 
-def externals_map() -> dict[str, str]:
-  value = manifest().get("externals")
-  if not isinstance(value, dict) or set(value) != {
-    "react", "recharts", "@hank/canvas-kit"
-  } or not all(isinstance(item, str) for item in value.values()):
-    raise ValueError("Canvas Kit externals map is invalid")
-  return dict(value)
-
-
-def bundle_format() -> dict[str, Any]:
-  value = manifest().get("bundle_format")
-  if not isinstance(value, dict):
-    raise ValueError("Canvas Kit bundle format is invalid")
-  return dict(value)
-
-
 def pinned_versions() -> dict[str, str]:
   value = manifest().get("pinned_versions")
   if not isinstance(value, dict) or not all(

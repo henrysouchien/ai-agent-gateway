@@ -43,7 +43,7 @@ class _NeverRunRunner:
     raise AssertionError("runner should not be called by health checks")
 
 
-async def _build_chat_runtime(_session, request, _channel, _auth_manager):
+async def _build_chat_runtime(_session, request, _channel, _auth_manager, *, storage_root: Path | None = None):
   return ChatRuntime(
     system_prompt="test",
     build_runner=lambda _event_log, _sid, _started_at: _NeverRunRunner(),
@@ -60,6 +60,20 @@ def test_package_exports_contract_metadata() -> None:
   assert CONTRACT_CONTROL_CHAT_CONTINUATION_V1 in agent_gateway.CONTRACTS
   assert CONTRACT_CONTROL_RUN_V1 in agent_gateway.CONTRACTS
   assert agent_gateway.package_health()["contracts"] == sorted(agent_gateway.CONTRACTS)
+
+
+def test_source_package_version_wins_over_ambient_distribution(monkeypatch) -> None:
+  declared = tomllib.loads(
+    (PKG_DIR / "pyproject.toml").read_text(encoding="utf-8")
+  )["project"]["version"]
+
+  def unexpected_metadata_lookup(_name: str) -> str:
+    raise AssertionError("source package version must not come from installed metadata")
+
+  monkeypatch.setattr(package_info.metadata, "version", unexpected_metadata_lookup)
+
+  assert package_info._package_version() == declared
+  assert package_info.__version__ == declared
 
 
 def test_package_metadata_does_not_require_excel_relay_capability() -> None:

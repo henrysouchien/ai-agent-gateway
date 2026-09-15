@@ -3,18 +3,21 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import asdict, is_dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 
 from fastapi.encoders import jsonable_encoder
 
 from .approval_policy import (
+  ApprovalPolicy,
+  ApprovalRequest,
   ApprovalVote,
   PersistentGrant,
   approval_is_executable,
+  approval_reuse_scope_authorized,
   new_approval_id,
   utc_now,
 )
-from .approval_store import PersistentGrantCancellationFenced
+from .approval_store import ApprovalRequestStore, PersistentGrantCancellationFenced
 from .policy_controls import effective_allow_tool_type
 from .session import GatewaySession
 
@@ -22,6 +25,15 @@ from .session import GatewaySession
 log = logging.getLogger("agent_gateway.approvals")
 
 TERMINAL_APPROVAL_STATES = frozenset({"auto_approved", "auto_denied", "approved", "denied", "expired"})
+
+class _RecordVoteWithAutonomousDelivery(Protocol):
+  async def __call__(
+    self,
+    approval_id: str,
+    vote: ApprovalVote,
+    *,
+    delivery: Mapping[str, Any],
+  ) -> ApprovalRequest: ...
 
 
 class ApprovalActionError(Exception):
@@ -31,7 +43,7 @@ class ApprovalActionError(Exception):
     self.payload = payload
 
 
-def _approval_request_to_dict(request_record: Any) -> dict[str, Any]:
+def _approval_request_to_dict(request_record: ApprovalRequest) -> dict[str, Any]:
   if is_dataclass(request_record):
     encoded = jsonable_encoder(asdict(request_record))
     if isinstance(encoded, dict):
@@ -53,9 +65,9 @@ def _resolve_store_and_policy(
   *,
   target_session: GatewaySession,
   app_state: Any,
-  authoritative_store: Any | None = None,
-  authoritative_policy: Any | None = None,
-) -> tuple[Any | None, Any | None]:
+  authoritative_store: ApprovalRequestStore | None = None,
+  authoritative_policy: ApprovalPolicy | None = None,
+) -> tuple[ApprovalRequestStore | None, ApprovalPolicy | None]:
   if authoritative_store is not None or authoritative_policy is not None:
     return authoritative_store, authoritative_policy
   store = getattr(target_session, "approval_store", None) or getattr(app_state, "gateway_approval_store", None)
@@ -98,17 +110,17 @@ def _cancellation_requested(pending_entry: dict[str, Any]) -> bool:
   return pending_entry.get("_approval_cancel_requested") is True
 
 
-async def _revoke_persistent_grants_for_cancel(store: Any, approval_id: str) -> None:
+async def _revoke_persistent_grants_for_cancel(store: ApprovalRequestStore, approval_id: str) -> None:
   revoke = getattr(store, "revoke_persistent_grants_for_approval", None)
   if not callable(revoke):
     raise RuntimeError("approval store cannot revoke cancellation-raced grants")
   try:
-    await revoke(approval_id)
+    await store.revoke_persistent_grants_for_approval(approval_id)
   except asyncio.CancelledError:
     # Store audit hooks run after the SQLite commit. Retry once so both a
     # pre-commit cancellation and a post-commit audit cancellation converge on
     # the same durable no-active-grant state.
-    await revoke(approval_id)
+    await store.revoke_persistent_grants_for_approval(approval_id)
 
 
 def _replace_queue_with_cancellation(approval_queue: Any, payload: dict[str, Any]) -> None:
@@ -294,6 +306,7 @@ async def _record_vote_and_unblock_locked(
     (
       allow_tool_type
       and request_record.approval_constraint == "standard"
+      and approval_reuse_scope_authorized(request_record)
     ),
   )
   pending_entry["tool_class"] = request_record.tool_class
@@ -326,6 +339,7 @@ async def _record_vote_and_unblock_locked(
     if autonomous_delivery is None:
       request_record = await store.record_vote(str(approval_id), vote)
     else:
+      record_with_delivery: _RecordVoteWithAutonomousDelivery | None
       record_with_delivery = getattr(
         store,
         "record_vote_with_autonomous_delivery",
@@ -377,6 +391,7 @@ async def _record_vote_and_unblock_locked(
   if (
     request_record.state == "approved"
     and request_record.approval_constraint == "standard"
+    and approval_reuse_scope_authorized(request_record)
     and effective_allow
     and request_record.persistent_grant_scope
   ):
@@ -434,104 +449,6 @@ async def _record_vote_and_unblock_locked(
   return {"approval": _approval_request_to_dict(request_record)}
 
 
-async def _force_deny_pending_and_unblock(
-  *,
-  target_session: GatewaySession,
-  pending_entry: dict[str, Any],
-  tool_call_id: str,
-  nonce: str,
-  decider_id: str,
-  decider_role: str | None,
-  reason: str,
-  app_state: Any,
-) -> dict[str, Any]:
-  """Close approval state when its owning runtime is being terminated.
-
-  Runtime teardown is not a quorum vote. It atomically denies a pending durable
-  request, then releases the in-memory waiter so no approval can be orphaned.
-  """
-  approval_queue = _validate_pending_entry(
-    pending_entry=pending_entry,
-    tool_call_id=tool_call_id,
-    nonce=nonce,
-    target_session=target_session,
-  )
-  approval_id = pending_entry.get("approval_id")
-  if not approval_id:
-    pending_entry["status"] = "approval_received"
-    await approval_queue.put({"approved": False, "allow_tool_type": False})
-    return {"status": "ok"}
-
-  store, policy = _resolve_store_and_policy(
-    target_session=target_session,
-    app_state=app_state,
-  )
-  if store is None or policy is None:
-    raise ApprovalActionError(
-      503,
-      {"error": "Approval subsystem unavailable", "approval_id": str(approval_id)},
-    )
-  force_deny = getattr(store, "force_deny_pending", None)
-  if not callable(force_deny):
-    raise ApprovalActionError(
-      503,
-      {"error": "Approval store does not support runtime teardown", "approval_id": str(approval_id)},
-    )
-  try:
-    request_record, transitioned = await force_deny(
-      str(approval_id),
-      decider_id=decider_id,
-      decider_role=decider_role,
-      decision_reason=reason,
-    )
-  except KeyError as exc:
-    raise ApprovalActionError(
-      404,
-      {"error": "Approval request not found", "approval_id": str(approval_id)},
-    ) from exc
-  except RuntimeError as exc:
-    raise ApprovalActionError(
-      409,
-      {
-        "error": "Approval request cannot be terminated",
-        "approval_id": str(approval_id),
-      },
-    ) from exc
-
-  if request_record.state == "expired":
-    raise ApprovalActionError(
-      410,
-      {"error": "Approval request expired", "approval_id": str(approval_id)},
-    )
-  if request_record.state not in {"denied", "auto_denied"}:
-    raise ApprovalActionError(
-      409,
-      {
-        "error": "Approval request resolved before runtime teardown",
-        "approval_id": str(approval_id),
-        "state": request_record.state,
-      },
-    )
-  if transitioned:
-    try:
-      await policy.on_resolve(request=request_record)
-    except Exception:
-      log.warning(
-        "Approval teardown policy callback failed for %s",
-        approval_id,
-        exc_info=True,
-      )
-  pending_entry["status"] = "approval_received"
-  await approval_queue.put(
-    {
-      "approved": False,
-      "allow_tool_type": False,
-      "approval_id": str(approval_id),
-    }
-  )
-  return {"approval": _approval_request_to_dict(request_record)}
-
-
 async def _cancel_pending_approval_and_unblock(
   *,
   target_session: GatewaySession,
@@ -542,8 +459,8 @@ async def _cancel_pending_approval_and_unblock(
   decider_role: str | None,
   reason: str,
   app_state: Any,
-  authoritative_store: Any,
-  authoritative_policy: Any,
+  authoritative_store: ApprovalRequestStore,
+  authoritative_policy: ApprovalPolicy,
   expected_owner_user_id: str,
   expected_request_id: str,
   expected_run_id: str,
@@ -580,7 +497,7 @@ async def _cancel_pending_approval_and_unblock(
       },
     )
   try:
-    _, fence_identity_matches = await fence_grants(
+    _, fence_identity_matches = await store.fence_persistent_grants_for_cancellation(
       approval_id,
       expected_tool_call_id=tool_call_id,
       expected_user_id=expected_owner_user_id,
@@ -650,7 +567,7 @@ async def _cancel_pending_approval_and_unblock(
         },
       )
     try:
-      request_record, transitioned, identity_matches = await terminalize(
+      request_record, transitioned, identity_matches = await store.terminalize_pending_for_cancellation(
         approval_id,
         expected_tool_call_id=tool_call_id,
         expected_user_id=expected_owner_user_id,
@@ -759,7 +676,6 @@ async def _cancel_pending_approval_and_unblock(
 __all__ = [
   "ApprovalActionError",
   "_approval_request_to_dict",
-  "_force_deny_pending_and_unblock",
   "_cancel_pending_approval_and_unblock",
   "_release_cancelled_approval",
   "_record_vote_and_unblock",

@@ -10,11 +10,16 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AgentRunner  # noqa: E402
-from agent_gateway.providers import ModelInfo, ThinkingLevel  # noqa: E402
+from agent_gateway import AgentRunner, ToolDispatcher  # noqa: E402
+from agent_gateway.mcp_client import McpClientManager  # noqa: E402
+from agent_gateway.providers import ModelInfo, ModelProvider, ThinkingLevel  # noqa: E402
+from agent_gateway.providers.base import StreamEvent  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.runner_stream_turn import RunnerStreamTurnMixin  # noqa: E402
 from agent_gateway.thinking import EffortResolution  # noqa: E402
+from tests.capability_execution_test_support import (  # noqa: E402
+  stub_runner_capability_execution,
+)
 
 
 def test_runner_stream_turn_methods_are_inherited_from_mixin() -> None:
@@ -82,10 +87,28 @@ def test_runner_stream_turn_reexports_streaming_helpers() -> None:
   assert gateway_runner.STREAM_THINKING_STALL_TIMEOUT > gateway_runner.STREAM_STALL_TIMEOUT
 
 
-def test_stream_turn_cancellation_preserves_primary_when_internal_close_fails(
-  monkeypatch,
-) -> None:
-  class _Provider:
+def test_tool_history_preserves_a_semantic_copy_without_changing_execution_input() -> None:
+  raw_input = {
+    "credential": "raw-secret",
+    "payload": {"value": 7},
+  }
+  raw_block = {
+    "type": "tool_use",
+    "id": "call-1",
+    "name": "registered_write",
+    "input": raw_input,
+    "provider_extension": {"signature": "signed"},
+  }
+
+  class _Provider(ModelProvider):
+    name = "stub"
+
+    def has_active_credential(self, config):
+      return bool(config.get("api_key"))
+    def get_model_info(self, model):
+      return ModelInfo(id=model, provider=self.name, supports_thinking=True)
+
+
     def resolve_effort(self, **kwargs):
       requested = kwargs["requested"]
       return EffortResolution(
@@ -95,7 +118,122 @@ def test_stream_turn_cancellation_preserves_primary_when_internal_close_fails(
         payload_fragments={},
       )
 
-    def normalize_messages(self, messages, _model_info):
+    def normalize_messages(self, messages, model_info):
+      _ = model_info
+      return messages
+
+    def build_request_params(self, **_kwargs):
+      return {}
+
+    async def stream(self, client, params):
+      _ = client, params
+      yield StreamEvent(
+        type="tool_use_end",
+        tool_id="call-1",
+        tool_name="registered_write",
+        tool_input=raw_input,
+        raw_block=raw_block,
+      )
+
+  class _Dispatcher(ToolDispatcher):
+    def __init__(self) -> None:
+      super().__init__(McpClientManager(config_path=None))
+
+    def redact_raw_tool_input_for_history(self, tool_name, tool_input):
+      _ = self, tool_name, tool_input
+      raise AssertionError(
+        "stream normalization must not redact model semantic history"
+      )
+
+    def prepare_tool_call(self, *_args, **_kwargs):
+      raise AssertionError("assistant history must not prepare executable input")
+
+  provider = _Provider()
+  runner = object.__new__(AgentRunner)
+  runner._provider = provider
+  runner._dispatcher = _Dispatcher()
+  runner._capability_execution = stub_runner_capability_execution(
+    provider=provider,
+    model="model",
+    effort="none",
+  )
+  runner._stream_stall_timeout = 60.0
+  runner._compaction_trigger = None
+  runner._compaction_instructions = None
+  runner._per_turn_timeout = None
+  runner._disconnected = False
+  runner._billing_mode = "byok"
+  runner._sid = "history-redaction"
+  runner._append = lambda _event: None  # type: ignore[method-assign]
+
+  returned = asyncio.run(runner._stream_turn(
+    client=object(),
+    config={
+      "model": "model",
+      "effort": "none",
+      "auth_mode": "api_key",
+    },
+    model_info=ModelInfo(id="model", provider="stub"),
+    system_prompt=None,
+    current_messages=[],
+    base_kwargs={"tools": []},
+    max_tokens=128,
+    turn_count=1,
+    turn_t0=0.0,
+    turn_t0_mono=0.0,
+    system_chars=0,
+    tools_chars=0,
+    usage_totals={
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cache_creation_tokens": 0,
+      "cache_read_tokens": 0,
+    },
+  ))
+
+  assert returned is not None
+  assert isinstance(returned, tuple)
+  _, result = returned
+  assert result.tool_uses == [("call-1", "registered_write", raw_input)]
+  assert result.tool_uses[0][2] is not raw_input
+  assert result.content_blocks == [{
+    "type": "tool_use",
+    "id": "call-1",
+    "name": "registered_write",
+    "input": {
+      "credential": "raw-secret",
+      "payload": {"value": 7},
+    },
+    "provider_extension": {"signature": "signed"},
+  }]
+  assert result.content_blocks[0] is not raw_block
+  assert raw_block["input"] is raw_input
+  assert raw_input["credential"] == "raw-secret"
+
+
+def test_stream_turn_cancellation_preserves_primary_when_internal_close_fails(
+  monkeypatch,
+) -> None:
+  class _Provider(ModelProvider):
+    name = "stub"
+
+    def has_active_credential(self, config):
+      return bool(config.get("api_key"))
+    def get_model_info(self, model):
+      return ModelInfo(id=model, provider=self.name, supports_thinking=True)
+
+
+    def resolve_effort(self, **kwargs):
+      requested = kwargs["requested"]
+      return EffortResolution(
+        requested=requested,
+        effective=requested,
+        thinking_enabled_effective=False,
+        payload_fragments={},
+      )
+
+    def normalize_messages(self, messages, model_info):
+      _ = model_info
       return messages
 
     def build_request_params(self, **_kwargs):
@@ -120,14 +258,13 @@ def test_stream_turn_cancellation_preserves_primary_when_internal_close_fails(
   )
   monkeypatch.setattr(gateway_runner, "asyncio", fake_asyncio)
 
+  provider = _Provider()
   runner = object.__new__(AgentRunner)
-  runner._provider = _Provider()
-  runner._capability_execution = SimpleNamespace(
-    bind=SimpleNamespace(
-      effort="none",
-      provider="stub",
-      model="model",
-    )
+  runner._provider = provider
+  runner._capability_execution = stub_runner_capability_execution(
+    provider=provider,
+    model="model",
+    effort="none",
   )
   runner._stream_stall_timeout = 60.0
   runner._compaction_trigger = None
@@ -142,7 +279,7 @@ def test_stream_turn_cancellation_preserves_primary_when_internal_close_fails(
   async def _force_close(*_args, **_kwargs):
     raise RuntimeError("provider close exploded")
 
-  runner.force_close = _force_close  # type: ignore[method-assign]
+  runner.force_close = _force_close
 
   with pytest.raises(asyncio.CancelledError) as exc_info:
     asyncio.run(

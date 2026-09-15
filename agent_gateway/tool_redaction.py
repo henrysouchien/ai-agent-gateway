@@ -1,21 +1,53 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import hmac
 import json
 import os
 import re
+import sys
 from typing import Any
 
 from .secret_boundary import sanitize_boundary_value, sanitization_failure_tool_input
+
+log = logging.getLogger("agent_gateway.tool_redaction")
 
 
 HMAC_KEY_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
+_ABSENT_HOST_REDACTION_MODULES = frozenset({
+  "agent",
+  "agent.shared",
+  "agent.shared.tool_redaction",
+})
+
+
+def resolve_redaction_provider() -> Any:
+  """Resolve the audit redaction provider once, at import time.
+
+  Prefers the host `agent.shared.tool_redaction` module and selects this
+  gateway-local implementation only when the host package is cleanly absent.
+  Any other import failure raises, so a broken host redaction install stops
+  the process at startup instead of silently degrading per approval call.
+  """
+  try:
+    from agent.shared import tool_redaction as host_redaction
+  except ModuleNotFoundError as exc:
+    if exc.name not in _ABSENT_HOST_REDACTION_MODULES:
+      raise
+    return sys.modules[__name__]
+  return host_redaction
+
+
 def get_audit_hmac_secret() -> bytes:
   secret = os.getenv("GATEWAY_AUDIT_HMAC_SECRET", "").strip()
   if not secret:
+    log.warning(
+      "GATEWAY_AUDIT_HMAC_SECRET is not set; audit args-hash HMAC is keyed "
+      "on the public dev-secret constant | failure=true"
+    )
     secret = "dev-secret"
   return secret.encode("utf-8")
 

@@ -45,6 +45,7 @@ def build_autonomous_cmd(
   deliver: bool = True,
   context: str | None = None,
   ticker: str | None = None,
+  research_file_id: int | None = None,
   max_budget_usd: float | None = None,
   normalize_autonomous_profile_func: Callable[[str], str] = normalize_autonomous_profile,
 ) -> list[str]:
@@ -66,6 +67,8 @@ def build_autonomous_cmd(
   if normalized_mode == "once":
     if task or skill or pack or context or ticker:
       raise ValueError("mode='once' does not accept task, skill, pack, context, or ticker")
+    if research_file_id is not None:
+      raise ValueError("research_file_id requires mode='skill' or mode='task'")
     return cmd
 
   if normalized_mode == "task":
@@ -74,6 +77,8 @@ def build_autonomous_cmd(
     if skill or pack or context or ticker:
       raise ValueError("mode='task' only accepts the task parameter")
     cmd.extend(["--task", task.strip()])
+    if research_file_id is not None:
+      cmd.extend(["--research-file-id", str(research_file_id)])
     return cmd
 
   if normalized_mode == "pack":
@@ -81,6 +86,8 @@ def build_autonomous_cmd(
       raise ValueError("pack is required when mode='pack'")
     if task or skill or context or ticker:
       raise ValueError("mode='pack' only accepts the pack parameter")
+    if research_file_id is not None:
+      raise ValueError("research_file_id requires mode='skill' or mode='task'")
     cmd.extend(["--pack", pack.strip()])
     return cmd
 
@@ -91,6 +98,8 @@ def build_autonomous_cmd(
   cmd.extend(["--skill", skill.strip()])
   if not deliver:
     cmd.append("--no-deliver")
+  if research_file_id is not None:
+    cmd.extend(["--research-file-id", str(research_file_id)])
   if normalized_max_budget_usd is not None:
     cmd.extend(["--max-budget-usd", str(normalized_max_budget_usd)])
   if ticker and ticker.strip():

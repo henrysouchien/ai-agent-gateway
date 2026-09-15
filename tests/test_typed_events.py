@@ -22,6 +22,7 @@ from agent_gateway.events import (
   RecapApproval,
   RecapArtifact,
   RecapFailure,
+  RecapFailureType,
   RecapVerdict,
   SessionRecapEvent,
   SkillResultCapturedEvent,
@@ -610,7 +611,7 @@ def test_session_recap_event_round_trip_with_nested_types() -> None:
 
 
 def test_session_recap_event_supports_all_failure_types() -> None:
-  failure_types = [
+  failure_types: list[RecapFailureType] = [
     "terminal_error",
     "artifact_failed",
     "artifact_unavailable",

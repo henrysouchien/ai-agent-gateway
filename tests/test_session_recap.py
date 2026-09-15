@@ -35,6 +35,7 @@ from agent_gateway.runner import AgentRunner
 from agent_gateway.secret_boundary import SecretBoundary
 from agent_gateway.sdk_runner import AgentSDKRunner
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
+from agent_gateway.server_models import SystemPrompt
 from agent_gateway.session import SessionStream
 from agent_gateway.session_recap import compute_recap, emit_recap_then_terminal
 
@@ -123,6 +124,35 @@ def test_compute_recap_buckets_renderer_visible_events() -> None:
     "budget_exceeded",
     "max_turns_reached",
   ]
+
+
+def test_compute_recap_consumes_the_canonical_tool_error_fold() -> None:
+  event_log = EventLog(session_id="session-fold")
+  event_log.append({
+    "type": "tool_call_complete",
+    "tool_call_id": "tool-success",
+    "tool_name": "lookup",
+    "is_error": False,
+    "error": {"code": "diagnostic_only"},
+    "semantic_error": {"code": "diagnostic_only"},
+  })
+  event_log.append({
+    "type": "tool_call_complete",
+    "tool_call_id": "tool-failure",
+    "tool_name": "lookup",
+    "is_error": True,
+    "result": {"status": "success"},
+  })
+
+  recap = compute_recap(
+    event_log,
+    session_id="session-fold",
+    started_at=1.0,
+    trigger="turn_end",
+  )
+
+  assert recap.tool_calls_summary.successes == 1
+  assert recap.tool_calls_summary.errors == 1
 
 
 def test_emit_recap_then_terminal_orders_recap_before_stream_complete() -> None:
@@ -240,47 +270,6 @@ def test_agent_runner_append_skips_recap_when_disabled() -> None:
   assert [entry.event["type"] for entry in event_log.entries] == ["stream_complete"]
 
 
-def test_agent_runner_error_event_calls_terminal_aware_hook() -> None:
-  class _FakeAgentSessionLog:
-    def __init__(self) -> None:
-      self.events: list[dict[str, Any]] = []
-
-    async def append(self, event: dict[str, Any]):
-      self.events.append(dict(event))
-      return type("Entry", (), {"seq": len(self.events)})()
-
-  event_log = EventLog(session_id="session-1")
-  agent_session_log = _FakeAgentSessionLog()
-  runner = AgentRunner.__new__(AgentRunner)
-  runner._log = event_log
-  runner._full_session_id = "session-1"
-  runner._session_started_at = 1.0
-  runner._emit_session_recap = False
-  runner._agent_session_log = agent_session_log
-  runner._runner_id = "runner-1"
-  runner._role = "writer"
-  runner._sub_agent_id = None
-  runner._last_durable_seq = 0
-  runner._top_level_skill_lifecycle = None
-  captured: dict[str, Any] = {}
-
-  async def _hook(active_event_log: EventLog, terminal_event: dict[str, Any]) -> None:
-    captured["entries_before_terminal"] = [entry.event["type"] for entry in active_event_log.entries]
-    captured["terminal_event"] = dict(terminal_event)
-    event = {"type": "skill_result_captured", "outcome": "error"}
-    active_event_log.append(event)
-    await AgentRunner._append_durable_event(runner, event)
-
-  runner._on_before_stream_complete = _hook
-
-  asyncio.run(AgentRunner._emit_error_event(runner, "failed"))
-
-  assert captured["entries_before_terminal"] == []
-  assert captured["terminal_event"] == {"type": "error", "error": "failed"}
-  assert [entry.event["type"] for entry in event_log.entries] == ["skill_result_captured", "error"]
-  assert [event["type"] for event in agent_session_log.events] == ["skill_result_captured", "error"]
-  assert agent_session_log.events[0]["runner_id"] == "runner-1"
-  assert agent_session_log.events[1]["runner_id"] == "runner-1"
 
 
 def test_sdk_runner_append_wraps_terminal_events_with_recap() -> None:
@@ -301,12 +290,39 @@ def _run(coro):
   return asyncio.run(coro)
 
 
+class _NoopBuildRunner:
+  async def run(
+    self,
+    *,
+    messages: list[dict[str, object]],
+    system_prompt: SystemPrompt | None = None,
+    max_turns: int | None = None,
+  ) -> None:
+    _ = messages, system_prompt, max_turns
+
+
+def _build_noop_runner(
+  event_log: EventLog,
+  session_id: str,
+  started_at: float,
+) -> _NoopBuildRunner:
+  _ = event_log, session_id, started_at
+  return _NoopBuildRunner()
+
+
 def _make_recap_app(transcript_dir: Path | None = None):
-  async def _build_chat_runtime(session, request, channel, auth_manager):
-    _ = session, channel, auth_manager
+  async def _build_chat_runtime(
+    session,
+    request,
+    channel,
+    auth_manager,
+    *,
+    storage_root: Path | None = None,
+  ):
+    _ = session, channel, auth_manager, storage_root
     return ChatRuntime(
       system_prompt="test",
-      build_runner=lambda _event_log, _session_id, _started_at: None,
+      build_runner=_build_noop_runner,
       capability_execution=request.capability_execution,
     )
 
@@ -418,7 +434,7 @@ def _usage_summary(session_id: str, *, request_id: str = "req-1") -> SessionUsag
     provider=bind.provider,
     usage_event_count=1,
     usage_event_ids=(f"usage:{session_id}:{request_id}",),
-    capability_bind=bind.receipt(),
+    capability_bind=bind.to_json(),
     provider_reported_model="claude-opus-5-20260801",
     started_at=1.0,
     ended_at=2.0,

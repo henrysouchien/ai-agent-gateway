@@ -9,7 +9,6 @@ from typing import Any, Callable
 import pytest
 
 from agent_gateway.control_plane import batches as batches_module
-from agent_gateway.control_plane import skills as skills_module
 from agent_gateway.control_plane import valuation_ready_tools as valuation_ready_tools_module
 
 
@@ -20,18 +19,7 @@ BROAD_API_FALLBACK_RE = re.compile(r"except ModuleNotFoundError:\s*\n\s+from api
 @pytest.mark.parametrize(
   ("call_factory", "primary_name", "fallback_name"),
   [
-    (lambda: skills_module._loader_api, "agent.skills", "api.agent.skills"),
-    (
-      lambda: valuation_ready_tools_module._valuation_ready_defaults,
-      "agent.skills.diligence_tracks",
-      "api.agent.skills.diligence_tracks",
-    ),
     (lambda: batches_module._controller, "agent.batch", "api.agent.batch"),
-    (
-      lambda: batches_module._batch_workflow_catalog,
-      "agent.skills.diligence_tracks",
-      "api.agent.skills.diligence_tracks",
-    ),
     (lambda: batches_module._active_batch_error_type, "agent.batch.registry", "api.agent.batch.registry"),
   ],
 )
@@ -109,3 +97,12 @@ def test_control_plane_api_fallbacks_check_missing_module_name() -> None:
   ]
 
   assert offenders == []
+
+
+def test_control_skill_and_workflow_views_do_not_import_app_skill_modules() -> None:
+  sources = (
+    Path(valuation_ready_tools_module.__file__).read_text(encoding="utf-8"),
+    Path(batches_module.__file__).read_text(encoding="utf-8"),
+  )
+
+  assert all("agent.skills" not in source for source in sources)

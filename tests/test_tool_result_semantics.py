@@ -1,5 +1,4 @@
-import agent_gateway.runner as gateway_runner
-from agent_gateway.tool_result_semantics import classify_semantic_tool_error, is_semantic_tool_error
+from agent_gateway.tool_result_semantics import classify_semantic_tool_error
 
 
 def test_classifies_status_error_payload() -> None:
@@ -17,7 +16,6 @@ def test_classifies_status_error_payload() -> None:
     "status": "error",
     "sub_code": "not_found",
   }
-  assert is_semantic_tool_error(payload) is True
 
 
 def test_does_not_classify_status_not_found_payload() -> None:
@@ -28,7 +26,6 @@ def test_does_not_classify_status_not_found_payload() -> None:
   }
 
   assert classify_semantic_tool_error(payload) is None
-  assert is_semantic_tool_error(payload) is False
 
 
 def test_classifies_status_error_payload_without_detail() -> None:
@@ -170,29 +167,6 @@ def test_warning_only_payload_is_not_semantic_error() -> None:
   assert classify_semantic_tool_error(["status", "error"]) is None
 
 
-def test_runner_soft_error_wrapper_delegates_to_semantic_helper() -> None:
-  error_payload = {"status": "error", "error": "failed"}
-  ok_payload = {"status": "success", "warning": "partial data"}
-
-  assert gateway_runner._is_soft_error is is_semantic_tool_error
-  assert gateway_runner.AgentRunner._is_soft_error(error_payload) is True
-  assert gateway_runner.AgentRunner._is_soft_error(ok_payload) is False
-
-
-def test_runner_soft_error_wrapper_calls_module_alias(monkeypatch) -> None:
-  payload = {"status": "success"}
-  calls = []
-
-  def sentinel(result):
-    calls.append(result)
-    return True
-
-  monkeypatch.setattr(gateway_runner, "_is_soft_error", sentinel)
-
-  assert gateway_runner.AgentRunner._is_soft_error(payload) is True
-  assert calls == [payload]
-
-
 def test_status_error_surfaces_repair_fix_and_example() -> None:
   payload = {
     "status": "error",
@@ -275,3 +249,76 @@ def test_status_error_with_fix_in_message_still_surfaces_example() -> None:
   message = semantic_error["message"]
   assert message.count("fix=") == 1
   assert 'example={"targets_by_method":{"dcf":{"target":122.0}}}' in message
+
+
+def test_status_error_surfaces_fms_validation_details_with_repair_hints() -> None:
+  payload = {
+    "status": "error",
+    "error": {
+      "type": "INVALID_JUDGMENT",
+      "message": "patch ops failed schema validation",
+      "recoverable": True,
+      "data": {
+        "got": [
+          {
+            "type": "value_error",
+            "loc": [],
+            "msg": (
+              "Value error, op_ids must be unique within batch; "
+              "duplicates: ['op_add_risk_x']"
+            ),
+          },
+        ],
+        "fix": "f",
+        "example": {"a": 1},
+      },
+    },
+  }
+
+  semantic_error = classify_semantic_tool_error(payload)
+
+  assert semantic_error is not None
+  message = semantic_error["message"]
+  assert "details=Value error, op_ids must be unique within batch" in message
+  assert "duplicates: ['op_add_risk_x']" in message
+  assert "fix=f" in message
+  assert 'example={"a":1}' in message
+
+
+def test_status_error_does_not_surface_string_data_got() -> None:
+  payload = {
+    "status": "error",
+    "error": {
+      "message": "filing lookup failed",
+      "data": {"got": "0000320193-25-000079"},
+    },
+  }
+
+  semantic_error = classify_semantic_tool_error(payload)
+
+  assert semantic_error is not None
+  assert semantic_error["message"] == "filing lookup failed"
+
+
+def test_status_error_elides_more_than_five_data_got_details() -> None:
+  payload = {
+    "status": "error",
+    "error": {
+      "message": "patch ops failed schema validation",
+      "data": {
+        "got": [
+          {"loc": ["ops", index], "msg": f"invalid operation {index}"}
+          for index in range(6)
+        ],
+      },
+    },
+  }
+
+  semantic_error = classify_semantic_tool_error(payload)
+
+  assert semantic_error is not None
+  message = semantic_error["message"]
+  assert "details=ops.0: invalid operation 0" in message
+  assert "ops.4: invalid operation 4" in message
+  assert "ops.5: invalid operation 5" not in message
+  assert "..." in message

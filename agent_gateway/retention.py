@@ -535,14 +535,6 @@ class RetentionSweeper:
     return tuple(reports)
 
 
-def sweep_retention(
-  catalog: RetentionCatalog,
-  mode: SweepMode,
-  **kwargs: Any,
-) -> tuple[RetentionSweepReport, ...]:
-  return RetentionSweeper(catalog).sweep(mode, **kwargs)
-
-
 __all__ = [
   "FileAgeAdapter",
   "KeepForeverAdapter",
@@ -558,5 +550,4 @@ __all__ = [
   "resolve_contained_path",
   "resolve_safe_root",
   "sweep_lock",
-  "sweep_retention",
 ]

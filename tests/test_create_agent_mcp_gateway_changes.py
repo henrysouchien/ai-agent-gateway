@@ -13,7 +13,8 @@ if str(PKG_DIR) not in sys.path:
 import agent_gateway.easy as easy_module
 import agent_gateway.sub_agent as sub_agent_module
 from agent_gateway import EventLog, McpClientManager, create_agent
-from agent_gateway.server import ChatTurnInputs
+from agent_workflow_contracts.tool_registration import McpInputPreparationRoute
+from agent_gateway.server import ChatMessage, ChatTurnInputs
 from agent_gateway.server_chat_helpers import prepare_session_driver_turn
 
 
@@ -36,7 +37,7 @@ def _build_runtime(app):
   prepared = prepare_session_driver_turn(
     session,
     ChatTurnInputs(
-      messages=[{"role": "user", "content": "hello"}],
+      messages=[ChatMessage(role="user", content="hello")],
       request_id=None,
       context={},
       metadata={},
@@ -76,11 +77,32 @@ def test_create_agent_forwards_new_mcp_options_to_manager_and_dispatcher() -> No
   assert mcp_client._timeout_overrides == {"browser": 90}
   assert mcp_client._default_tool_timeout == 45
   assert mcp_client._strip_input_fields == {"_session_id"}
+  assert mcp_client._input_preparation_routes == {}
 
   session, runtime = _build_runtime(app)
   runner = runtime.build_runner(EventLog(), session.session_id)
 
   assert runner._dispatcher._mcp_session_inject_servers == {"browser"}
+
+
+def test_create_agent_forwards_exact_input_preparation_routes() -> None:
+  route = McpInputPreparationRoute(
+    logical_server_id="market-data-mcp",
+    logical_name="fetch_financials",
+    mode="scalar",
+    keys=("symbol",),
+  )
+  app = create_agent(
+    "test",
+    api_key="test-anthropic-key",
+    mcp_servers={"browser": {"command": "python3", "args": ["run_server.py"]}},
+    mcp_input_preparation_routes=(route,),
+  )
+
+  mcp_client = app.state.gateway_config.mcp_client
+  assert mcp_client._input_preparation_routes == {
+    ("market-data-mcp", "fetch_financials"): route,
+  }
 
 
 def test_create_agent_forwards_mcp_session_inject_servers_to_run_agent(

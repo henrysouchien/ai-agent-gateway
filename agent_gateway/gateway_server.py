@@ -85,17 +85,26 @@ def run_gateway_server(
     claim_signing_key_fd
   )
   install_gateway_claim_signing_authority(authority)
-  config_kwargs: dict[str, object] = {
-    "host": host,
-    "port": port,
-    "workers": 1,
-    "timeout_keep_alive": timeout_keep_alive,
-    "timeout_graceful_shutdown": timeout_graceful_shutdown,
-  }
-  if ssl_keyfile is not None:
-    config_kwargs["ssl_keyfile"] = ssl_keyfile
-    config_kwargs["ssl_certfile"] = ssl_certfile
-  config = uvicorn.Config(app, **config_kwargs)
+  if ssl_keyfile is None:
+    config = uvicorn.Config(
+      app,
+      host=host,
+      port=port,
+      workers=1,
+      timeout_keep_alive=timeout_keep_alive,
+      timeout_graceful_shutdown=timeout_graceful_shutdown,
+    )
+  else:
+    config = uvicorn.Config(
+      app,
+      host=host,
+      port=port,
+      workers=1,
+      timeout_keep_alive=timeout_keep_alive,
+      timeout_graceful_shutdown=timeout_graceful_shutdown,
+      ssl_keyfile=ssl_keyfile,
+      ssl_certfile=ssl_certfile,
+    )
   uvicorn.Server(config).run()
 
 

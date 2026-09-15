@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import inspect
-from typing import Any, Callable, Mapping, Set
+from typing import AbstractSet, Any, Callable, Mapping, Set
 
 from .tool_dispatcher_helpers import NeedsApprovalCallback
 
@@ -10,7 +10,7 @@ def mcp_scope_error(
   tool_name: str,
   server_name: str | None,
   *,
-  allowed_mcp_tools_by_server: Mapping[str, Set[str]] | None,
+  allowed_mcp_tools_by_server: Mapping[str, AbstractSet[str]] | None,
   scope_context: str = "skill",
   describe_scope_block: Callable[[str | None, str], str | None] | None = None,
 ) -> dict[str, Any] | None:
@@ -64,16 +64,6 @@ def mcp_scope_error(
   }
 
 
-def callable_accepts_kw(callback: Any, keyword: str) -> bool:
-  if callback is None:
-    return False
-  try:
-    params = inspect.signature(callback).parameters
-  except (TypeError, ValueError):
-    return False
-  return keyword in params or any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values())
-
-
 def normalize_needs_approval(
   needs_approval: Callable[..., bool] | None,
 ) -> NeedsApprovalCallback:
@@ -83,13 +73,13 @@ def normalize_needs_approval(
   try:
     arg_count = len(inspect.signature(needs_approval).parameters)
   except (TypeError, ValueError):
-    return needs_approval  # type: ignore[return-value]
+    return needs_approval
 
   if arg_count == 1:
     return lambda name, _tool_input, _qualifier: needs_approval(name)
   if arg_count == 2:
     return lambda name, tool_input, _qualifier: needs_approval(name, tool_input)
-  return needs_approval  # type: ignore[return-value]
+  return needs_approval
 
 
 def qualified_key(tool_name: str, qualifier: str) -> str:

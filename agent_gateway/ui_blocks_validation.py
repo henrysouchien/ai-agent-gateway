@@ -266,15 +266,16 @@ def _stage_two(payload: dict[str, Any], bundle: dict[str, Any]) -> list[tuple[in
     schemas = bundle["primitive_blocks"] | bundle["sdk_blocks"]
     if name not in schemas or not isinstance(props, dict):
       continue
+    block_name: str = block["block"]
     issues = _schema_issues(props, schemas[name], bundle, "$.props")
-    if name.startswith("sdk:") and props.get("source") not in visible_sources:
+    if block_name.startswith("sdk:") and props.get("source") not in visible_sources:
       failures.append(_failure(2, index, FailureCode.UNKNOWN_SOURCE, f"unknown agent-visible source {props.get('source')!r}"))
       continue
     if issues:
       failures.append(_failure(2, index, FailureCode.PROPS_INVALID, "; ".join(sorted(issues))))
       continue
-    if name.startswith("sdk:"):
-      mapping_code = _field_mapping_code(name, props, bundle)
+    if block_name.startswith("sdk:"):
+      mapping_code = _field_mapping_code(block_name, props, bundle)
       if mapping_code is not None:
         failures.append(_failure(2, index, mapping_code, "SDK field mapping is not declared by the selected source"))
   return failures

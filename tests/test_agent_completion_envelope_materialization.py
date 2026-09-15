@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -22,6 +23,10 @@ from agent_gateway.agent_session_log import (
   IdempotentEventConflictError,
 )
 from agent_gateway.events import AgentCompletionEvent, event_from_dict, event_to_dict
+from agent_gateway.event_log import EventLog
+from agent_gateway.runner import AgentRunner
+from agent_gateway.final_narrative_artifact import publish_final_narrative
+from agent_gateway.sub_agent_result_contract import terminal_narrative_content_handle
 from agent_gateway.runner_background_tasks import (
   DEFAULT_PARENT_RESULT_MAX_INLINE_BYTES,
   ParentResultMaterializationError,
@@ -30,7 +35,15 @@ from agent_gateway.runner_background_tasks import (
   build_agent_completion_envelope,
   ordinary_parent_result_policy,
 )
-from agent_gateway.task_registry import TaskRegistry
+from agent_gateway.runner_background_lifecycle import (
+  RunnerBackgroundLifecycleMixin,
+)
+from agent_gateway.task_registry import (
+  TASK_NOTIFICATION_INLINE_PAYLOAD_MAX_BYTES,
+  TaskEntry,
+  TaskRegistry,
+  TaskState,
+)
 from agent_gateway.runner_run_loop import _agent_completion_contract_error
 from agent_workflow_contracts import (
   ActivityHandle,
@@ -58,6 +71,7 @@ from agent_workflow_contracts import (
   WorkflowNodeTaskRef,
   canonical_json_bytes,
 )
+from tests.capability_execution_test_support import stub_runner_capability_execution
 
 
 def _digest(value: str) -> str:
@@ -283,6 +297,291 @@ def test_projection_policy_preserves_exact_typed_value() -> None:
   assert envelope.parent_materialization.value == value
 
 
+def _projection_only_result() -> tuple[TaskResult, JsonValue]:
+  value: JsonValue = {
+    "tool_name": "fms_propose_demo",
+    "result": {"status": "staged", "proposal_id": "proposal-1"},
+  }
+  raw = canonical_json_bytes(value)
+  digest = hashlib.sha256(raw).hexdigest()
+  contract = _contract("terminal-tool-result")
+  projection = CanonicalProjection(
+    contract=contract,
+    content=ContentHandle(
+      content_id=f"sha256:{digest}",
+      content_sha256=digest,
+      content_bytes=len(raw),
+      content_chars=len(raw.decode("utf-8")),
+      contract=contract,
+      media_type="application/json",
+      encoding="utf-8",
+      retention="durable",
+    ),
+    inline_view=value,
+  )
+  payload = _task_result("placeholder").model_dump(mode="json")
+  payload["values"] = {
+    "terminal_narrative": None,
+    "projection": projection.model_dump(mode="json"),
+    "artifacts": [],
+  }
+  return TaskResult.model_validate(payload), value
+
+
+def test_projection_only_result_derives_inline_parent_delivery() -> None:
+  result, value = _projection_only_result()
+  policy = ordinary_parent_result_policy(result)
+
+  envelope = build_agent_completion_envelope(
+    result,
+    policy=policy,
+    terminal_narrative_reader=lambda _result: "must not be read",
+    read_grant_factory=_read_grant,
+  )
+
+  assert policy.preferred == "projection_inline"
+  assert envelope.parent_materialization.kind == "projection_inline"
+  assert envelope.parent_materialization.value == value
+
+
+@pytest.mark.asyncio
+async def test_background_completion_derives_policy_from_projection_result(
+  tmp_path: Path,
+) -> None:
+  class _Harness(RunnerBackgroundLifecycleMixin):
+    def __init__(self) -> None:
+      self._agent_session_log = AgentSessionLog(tmp_path / "session.jsonl")
+      self._workspace_dir = str(tmp_path)
+      self._runner_id = "parent-runner"
+
+    async def _append_durable_event(self, event: dict[str, object]) -> object:
+      return await self._agent_session_log.append(event)
+
+  result, value = _projection_only_result()
+  entry = TaskEntry(
+    task_id=result.attempt.physical_task_id,
+    task_type="background_agent",
+    task_result=result,
+    result=result.model_dump(mode="json"),
+  )
+  assert entry.parent_result_policy is None
+
+  await _Harness()._ensure_agent_completion_published(entry)
+
+  assert entry.completion_envelope is not None
+  materialization = entry.completion_envelope.parent_materialization
+  assert materialization.kind == "projection_inline"
+  assert materialization.value == value
+
+
+@pytest.mark.asyncio
+async def test_background_completion_publishes_projection_without_workspace(
+  tmp_path: Path,
+) -> None:
+  class _Harness(RunnerBackgroundLifecycleMixin):
+    def __init__(self) -> None:
+      self._agent_session_log = AgentSessionLog(tmp_path / "session.jsonl")
+      self._workspace_dir = None
+      self._runner_id = "parent-runner"
+
+    async def _append_durable_event(self, event: dict[str, object]) -> object:
+      return await self._agent_session_log.append(event)
+
+  result, value = _projection_only_result()
+  entry = TaskEntry(
+    task_id=result.attempt.physical_task_id,
+    task_type="background_agent",
+    task_result=result,
+    result=result.model_dump(mode="json"),
+  )
+
+  await _Harness()._ensure_agent_completion_published(entry)
+
+  assert entry.completion_envelope is not None
+  materialization = entry.completion_envelope.parent_materialization
+  assert materialization.kind == "projection_inline"
+  assert materialization.value == value
+
+
+@pytest.mark.asyncio
+async def test_background_terminal_settlement_without_content_survives_replay(
+  tmp_path: Path,
+) -> None:
+  class _Harness(RunnerBackgroundLifecycleMixin):
+    def __init__(self) -> None:
+      self._agent_session_log = AgentSessionLog(tmp_path / "session.jsonl")
+      self._workspace_dir = None
+      self._runner_id = "parent-runner"
+
+    async def _append_durable_event(self, event: dict[str, object]) -> object:
+      return await self._agent_session_log.append(event)
+
+  payload = _task_result("unpublished").model_dump(mode="json")
+  payload["execution"] = {
+    "status": "cancelled",
+    "terminal_reason": "cancelled: user stopped the child",
+  }
+  payload["values"] = {}
+  payload["outcome"] = None
+  result = TaskResult.model_validate(payload)
+  entry = TaskEntry(
+    task_id=result.attempt.physical_task_id,
+    task_type="background_agent",
+    task_result=result,
+    result=result.model_dump(mode="json"),
+  )
+  runner = _Harness()
+  await runner._ensure_agent_completion_published(entry)
+  envelope = entry.completion_envelope
+  assert envelope is not None
+  assert envelope.parent_materialization is None
+  assert envelope.settlement_projection.execution_status == "cancelled"
+  assert envelope.settlement_projection.terminal_reason == result.execution.terminal_reason
+
+  notification = agent_completion_notification(entry, envelope, timestamp=1.0)
+  assert notification.inline_payload()[1] is None
+  assert result.execution.terminal_reason in notification.format_xml()
+  assert notification.payload["parent_materialization"] is None
+  entry.completion_envelope = None
+  await _Harness()._ensure_agent_completion_published(entry)
+  assert entry.completion_envelope == envelope
+  events, _ = await runner._agent_session_log.query(event_types={"agent_completion"})
+  assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_pre_reason_failed_completion_replays_published_bytes(
+  tmp_path: Path,
+) -> None:
+  class _Harness(RunnerBackgroundLifecycleMixin):
+    def __init__(self) -> None:
+      self._agent_session_log = AgentSessionLog(tmp_path / "session.jsonl")
+      self._workspace_dir = tmp_path
+      self._runner_id = "parent-runner"
+
+    async def _append_durable_event(self, event: dict[str, object]) -> object:
+      return await self._agent_session_log.append(event)
+
+  text = "STATUS: BLOCKED"
+  payload = _task_result(text).model_dump(mode="json")
+  payload["execution"] = {
+    "status": "failed",
+    "terminal_reason": "required tool fms_report_build_model was not invoked",
+  }
+  payload["values"]["terminal_narrative"] = terminal_narrative_content_handle(
+    publish_final_narrative(
+      workspace_dir=tmp_path,
+      sub_agent_id="bg-1",
+      terminal_event_seq=1,
+      text=text,
+    )
+  ).model_dump(mode="json")
+  result = TaskResult.model_validate(payload)
+  envelope_payload = build_agent_completion_envelope(
+    result,
+    policy=ordinary_parent_result_policy(result),
+    terminal_narrative_reader=lambda _result: text,
+    read_grant_factory=_read_grant,
+  ).model_dump(mode="json")
+  # Historical durable publication predates terminal_reason in the projection.
+  del envelope_payload["settlement_projection"]["terminal_reason"]
+  envelope = AgentCompletionEnvelope.model_validate(envelope_payload)
+  event = event_to_dict(AgentCompletionEvent(
+    task_id=result.attempt.physical_task_id,
+    envelope=envelope,
+    ts=1.0,
+  ))
+  runner = _Harness()
+  published = await runner._agent_session_log.append(event)
+  entry = TaskEntry(
+    task_id=result.attempt.physical_task_id,
+    task_type="background_agent",
+    task_result=result,
+    result=result.model_dump(mode="json"),
+  )
+
+  await runner._ensure_agent_completion_published(entry)
+
+  assert canonical_json_bytes(entry.completion_envelope.model_dump(mode="json")) == (
+    canonical_json_bytes(envelope_payload)
+  )
+  stored, _ = await runner._agent_session_log.query(event_types={"agent_completion"})
+  assert [row.event for row in stored] == [published.event]
+  runner._workspace_dir = None
+  entry.completion_envelope = None
+  await runner._ensure_agent_completion_published(entry)
+  assert canonical_json_bytes(entry.completion_envelope.model_dump(mode="json")) == (
+    canonical_json_bytes(envelope_payload)
+  )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason_unit", ["x", '\u754c&"\n'])
+async def test_long_failure_reason_still_queues_completion(
+  tmp_path: Path,
+  reason_unit: str,
+) -> None:
+  async def unused_dispatch(*args: object, **kwargs: object) -> None:
+    raise AssertionError("settlement does not dispatch tools")
+
+  runner = AgentRunner(
+    event_log=EventLog(),
+    dispatcher=SimpleNamespace(dispatch=unused_dispatch),
+    session_id="parent-session",
+    user_id="test-user",
+    billing_mode="byok",
+    rate_table_version="test",
+    capability_execution=stub_runner_capability_execution(
+      provider=SimpleNamespace(name="anthropic"),
+      model="claude-sonnet-4-6",
+      effort="none",
+    ),
+    agent_session_log=AgentSessionLog(tmp_path / "session.jsonl"),
+  )
+  runner._runner_id = "parent-runner"
+  reason = ("remote failure: " + reason_unit * 40_000).strip()
+  payload = _task_result("unpublished").model_dump(mode="json")
+  payload["execution"] = {"status": "failed", "terminal_reason": reason}
+  payload["values"] = {}
+  payload["outcome"] = None
+  result = TaskResult.model_validate(payload)
+  entry = runner._task_registry.register(
+    "background_agent",
+    task_id=result.attempt.physical_task_id,
+  )
+  entry.task_result = result
+  runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
+
+  await runner._finalize_background_agent(
+    entry,
+    final_state=TaskState.FAILED,
+    result=result.model_dump(mode="json"),
+    error=None,
+  )
+
+  assert entry.state == TaskState.FAILED
+  notifications = runner._notification_queue.peek()
+  assert len(notifications) == 1
+  notification = notifications[0]
+  payload_json, omission_reason = notification.inline_payload()
+  assert omission_reason is None
+  assert len(html.escape(payload_json).encode("utf-8")) <= (
+    TASK_NOTIFICATION_INLINE_PAYLOAD_MAX_BYTES
+  )
+  projected_reason = notification.payload["settlement_projection"]["terminal_reason"]
+  assert projected_reason.endswith("...[truncated]")
+  assert reason.startswith(projected_reason.removesuffix("...[truncated]"))
+  assert entry.task_result.execution.terminal_reason == reason
+  assert notification.payload == entry.completion_envelope.model_dump(mode="json")
+  await runner._finalize_background_agent(
+    entry,
+    final_state=TaskState.FAILED,
+    result=result.model_dump(mode="json"),
+    error=None,
+  )
+  assert runner._notification_queue.pending_count == 1
+
+
 def test_completion_identity_is_stable_and_event_round_trips() -> None:
   text = "Exact result"
   result = _task_result(text)
@@ -443,6 +742,7 @@ def test_envelope_omits_child_evidence_when_the_child_observed_nothing() -> None
   assert envelope.child_evidence is None
   payload = envelope.model_dump(mode="json")
   assert "child_evidence" not in payload
+  assert "terminal_reason" not in payload["settlement_projection"]
   # A historical row that never carried the field still validates and still
   # dumps to exactly the bytes it was recorded with, so the durable event's
   # digest over it is unchanged.
@@ -624,29 +924,6 @@ def test_handle_delivery_notification_summary_fails_open_without_objective() -> 
   assert "Dispatched objective" not in notification.summary
 
 
-def test_inline_delivery_notification_summary_is_unchanged() -> None:
-  text = "Exact result"
-  result = _task_result(text)
-  envelope = build_agent_completion_envelope(
-    result,
-    policy=ordinary_parent_result_policy(result),
-    terminal_narrative_reader=lambda _result: text,
-    read_grant_factory=_read_grant,
-  )
-  assert envelope.parent_materialization.kind == "terminal_narrative_inline_exact"
-  notification = agent_completion_notification(
-    SimpleNamespace(
-      task_id="bg-1",
-      agent_name="explore",
-      notification_generation=1,
-      metadata={},
-    ),
-    envelope,
-    timestamp=123.5,
-  )
-  assert notification.summary == (
-    "Agent completed; consume the typed parent materialization."
-  )
 
 
 # --- CUR-E2E-08: recording that the parent read the delivered handle -------

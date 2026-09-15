@@ -17,6 +17,7 @@ from agent_gateway.auth import (
   CredentialsTimeoutError,
   MissingUserIdError,
 )
+from agent_gateway.approval_route import bind_session_approval_route
 from agent_gateway.session import AuthManager
 
 
@@ -133,14 +134,9 @@ def _user_identity_api() -> Any | None:
   try:
     return importlib.import_module("user_identity")
   except ModuleNotFoundError as exc:
-    if exc.name not in {"user_identity", "api"}:
+    if exc.name != "user_identity":
       raise
-    try:
-      return importlib.import_module("api.user_identity")
-    except ModuleNotFoundError as nested_exc:
-      if nested_exc.name not in {"user_identity", "api"}:
-        raise
-      return None
+    return None
 
 
 def _fallback_control_identity(
@@ -357,8 +353,7 @@ def build_session_router(
     )
     session.channel = resolved_channel
     session.is_public = False
-    session.approval_store = approval_store
-    session.approval_policy = approval_policy
+    bind_session_approval_route(session, approval_store, approval_policy)
 
     response.headers["Cache-Control"] = "private, no-store"
     return ControlSessionResponse(

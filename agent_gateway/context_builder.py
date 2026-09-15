@@ -28,6 +28,13 @@ class _InterruptedRunContext:
 
 
 @dataclass
+class _ReplayToolBatch:
+  messages: list[Message]
+  result_blocks: list[dict[str, Any]]
+  deferred_extras: list[dict[str, Any]]
+
+
+@dataclass
 class SessionContextBuilder:
   """Build replay context from a durable session log."""
 
@@ -100,7 +107,8 @@ class SessionContextBuilder:
       tail_entries = [
         entry for entry in tail_entries if entry.seq not in interrupted_context.covered_tail_seqs
       ]
-    tail_entries = self._truncate_to_token_budget(tail_entries, self.tail_token_budget)
+    tail_groups = self._entries_to_message_groups(tail_entries)
+    tail_messages = self._truncate_to_token_budget(tail_groups, self.tail_token_budget)
 
     messages: list[Message] = []
     if latest_summary is not None:
@@ -109,7 +117,7 @@ class SessionContextBuilder:
       messages.append(self._state_update_to_message(latest_state_update))
     if interrupted_context is not None:
       messages.append(self._interrupted_run_to_message(interrupted_context, latest_state_update))
-    messages.extend(self._entries_to_messages(tail_entries))
+    messages.extend(tail_messages)
     return messages
 
   async def _latest_interrupted_run_context(
@@ -174,7 +182,10 @@ class SessionContextBuilder:
       exclude_entry=current_projection.excludes,
     )
     covered_tail_seqs = {interruption.seq}
-    covered_tail_seqs.update(entry.seq for entry in tool_interruptions)
+    covered_tail_seqs.update(
+      entry.seq for entry in tool_interruptions
+      if not entry.event.get("final_tool_result_blocks")
+    )
     return _InterruptedRunContext(
       interruption=interruption,
       tool_interruptions=tool_interruptions,
@@ -182,22 +193,21 @@ class SessionContextBuilder:
       covered_tail_seqs=covered_tail_seqs,
     )
 
-  def _truncate_to_token_budget(self, entries: list[LogEntry], budget: int) -> list[LogEntry]:
+  def _truncate_to_token_budget(self, groups: list[list[Message]], budget: int) -> list[Message]:
     if budget <= 0:
       return []
 
-    selected: list[LogEntry] = []
+    selected: list[list[Message]] = []
     total_tokens = 0
-    for entry in reversed(entries):
-      entry_tokens = _estimate_tokens(entry.event)
-      if selected and total_tokens + entry_tokens > budget:
+    for group in reversed(groups):
+      group_tokens = sum(_estimate_tokens(message) for message in group)
+      if selected and total_tokens + group_tokens > budget:
         break
-      selected.append(entry)
-      total_tokens += entry_tokens
+      selected.append(group)
+      total_tokens += group_tokens
       if total_tokens >= budget:
         break
-    selected.reverse()
-    return selected
+    return [message for group in reversed(selected) for message in group]
 
   def _summary_to_message(self, entry: LogEntry) -> Message:
     text = str(entry.event.get("text") or "").strip()
@@ -405,19 +415,66 @@ class SessionContextBuilder:
   def _format_timestamp(self, timestamp: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp))
 
-  def _entries_to_messages(self, entries: list[LogEntry]) -> list[Message]:
-    messages: list[Message] = []
+  def _entries_to_message_groups(self, entries: list[LogEntry]) -> list[list[Message]]:
+    groups: list[list[Message]] = []
+    batches: list[_ReplayToolBatch] = []
+    pending_calls: dict[str, _ReplayToolBatch] = {}
+
     for entry in entries:
       event = entry.event
       event_type = str(event.get("type") or "")
       rendered = self._entry_to_message(event_type, event)
       if rendered is None:
         continue
-      if isinstance(rendered, list):
-        messages.extend(rendered)
-      else:
-        messages.append(rendered)
-    return messages
+      if (
+        event_type in {"tool_call_complete", "tool_call_interrupted"}
+        and isinstance(rendered, dict)
+        and isinstance(rendered["content"], list)
+      ):
+        event_batch = pending_calls.get(str(event.get("tool_call_id") or ""))
+        terminal_context: list[dict[str, Any]] = []
+        for block in rendered["content"]:
+          if block.get("type") != "tool_result":
+            extras = event_batch.deferred_extras if event_batch is not None else terminal_context
+            extras.append(block)
+            continue
+          tool_id = str(block.get("tool_use_id") or "")
+          batch = pending_calls.pop(tool_id, None)
+          if batch is not None:
+            batch.result_blocks.append(block)
+          else:
+            # A time/summary boundary can omit the call but retain its settlement.
+            terminal_context.append({
+              "type": "text",
+              "text": (
+                f"[Session log] Terminal result for `{tool_id}` (call outside replayed context): "
+                + json.dumps(block, default=str)
+              ),
+            })
+        if terminal_context:
+          groups.append([{"role": "user", "content": terminal_context}])
+        continue
+      for message in rendered if isinstance(rendered, list) else [rendered]:
+        group = [message]
+        groups.append(group)
+        content = message["content"]
+        if message["role"] == "assistant" and isinstance(content, list):
+          tool_ids = [str(block["id"]) for block in content if block.get("type") == "tool_use"]
+          if tool_ids:
+            batch = _ReplayToolBatch(group, [], [])
+            batches.append(batch)
+            for tool_id in tool_ids:
+              pending_calls[tool_id] = batch
+
+    for batch in batches:
+      if batch.result_blocks:
+        # Recovery may settle later in the log; replay and budget the owning
+        # assistant and all its results together, before any later user text.
+        batch.messages.append({
+          "role": "user",
+          "content": [*batch.result_blocks, *batch.deferred_extras],
+        })
+    return groups
 
   def _entry_to_message(self, event_type: str, event: dict[str, Any]) -> Message | list[Message] | None:
     event = sanitize_tool_event(event, sink="context_replay")
@@ -456,10 +513,7 @@ class SessionContextBuilder:
         messages.append(draft_message)
       return messages or None
 
-    if event_type == "tool_call_complete":
-      tool_call_id = str(event.get("tool_call_id") or "")
-      if not tool_call_id:
-        return None
+    if event_type in {"tool_call_complete", "tool_call_interrupted"}:
       final_blocks = event.get("final_tool_result_blocks")
       if isinstance(final_blocks, list):
         blocks = [
@@ -469,6 +523,11 @@ class SessionContextBuilder:
         ]
         if blocks:
           return {"role": "user", "content": blocks}
+
+    if event_type == "tool_call_complete":
+      tool_call_id = str(event.get("tool_call_id") or "")
+      if not tool_call_id:
+        return None
       error = event.get("error")
       if error is not None:
         content = json.dumps({"error": error}, default=str)

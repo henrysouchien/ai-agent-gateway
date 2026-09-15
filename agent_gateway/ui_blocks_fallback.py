@@ -54,8 +54,10 @@ def _template(template: Any, values: Mapping[str, Any]) -> str:
 
 
 def _table(props: Mapping[str, Any], projection: Mapping[str, Any], escape_chars: str) -> str:
-  columns = props.get("columns") if isinstance(props.get("columns"), list) else []
-  data = props.get("data") if isinstance(props.get("data"), list) else []
+  columns_value = props.get("columns")
+  columns = columns_value if isinstance(columns_value, list) else []
+  data_value = props.get("data")
+  data = data_value if isinstance(data_value, list) else []
   valid_columns = [column for column in columns if isinstance(column, Mapping)]
   if not valid_columns:
     return ""
@@ -82,7 +84,8 @@ def _project(block: Mapping[str, Any], table: Mapping[str, Any], manifest: Mappi
       "scope_summary": _scope_summary(block.get("scope"), escape_chars),
     })
   name = block.get("block")
-  props = block.get("props") if isinstance(block.get("props"), Mapping) else {}
+  props_value = block.get("props")
+  props = props_value if isinstance(props_value, Mapping) else {}
 
   def esc(key: str, default: Any = "") -> str:
     return _escape(props.get(key, default), escape_chars)
@@ -112,7 +115,8 @@ def _project(block: Mapping[str, Any], table: Mapping[str, Any], manifest: Mappi
     projection = table.get("data-table", {})
     return _table(props, projection if isinstance(projection, Mapping) else {}, escape_chars)
   if name == "sparkline-chart":
-    data = props.get("data") if isinstance(props.get("data"), list) else []
+    data_value = props.get("data")
+    data = data_value if isinstance(data_value, list) else []
     low = min(data) if data else "n/a"
     high = max(data) if data else "n/a"
     return _template(table.get(name, "{label|Series}: {count} points, {min}–{max}"), {
@@ -123,7 +127,20 @@ def _project(block: Mapping[str, Any], table: Mapping[str, Any], manifest: Mappi
     return _template(table.get("sdk:*", "_[live {block_short_name}: source {source}]_"), {
       "block_short_name": _escape(name[4:], escape_chars), "source": esc("source"),
     })
-  return ""
+  # Total projection derived from the owner table: a block name the manifest's
+  # fallback_projections table names must always project, and a name the table
+  # does not know renders a loud generic projection naming the block type — a
+  # block the system emitted is never silently dropped from the fallback.
+  template = table.get(name) if isinstance(name, str) else None
+  if isinstance(template, str):
+    return _template(template, {
+      key: _escape(value, escape_chars)
+      for key, value in props.items()
+      if isinstance(key, str) and value is not None
+    })
+  return _template("_[unrenderable block: {block_name}]_", {
+    "block_name": _escape(name, escape_chars) or "unknown",
+  })
 
 
 def text_fallback(payload_resolved: Mapping[str, Any], projection_table: Mapping[str, Any]) -> str:

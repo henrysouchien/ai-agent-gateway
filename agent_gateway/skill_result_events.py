@@ -15,13 +15,6 @@ from .sub_agent_skill_state import classify_child_outcome
 
 
 FMS_DOOR_PREFIX = "fms_"
-_FAILURE_FMS_STATUSES = frozenset({
-  "error",
-  "failed",
-  "failure",
-  "invalid",
-  "rejected",
-})
 
 
 def build_skill_result_captured_event(
@@ -59,13 +52,19 @@ def build_skill_result_captured_event(
   ):
     fms_results, artifact_events = canonical_evidence
   primary_fms = _primary_fms(fms_results)
-  classification = classify_child_outcome(result, error)
-  raw_status = primary_fms.get("status") if isinstance(primary_fms, dict) else None
-  normalized_fms_status = str(raw_status or "").strip().lower()
-  has_error = (
-    not classification.succeeded
-    or normalized_fms_status in _FAILURE_FMS_STATUSES
+  door_names = {
+    str(item.get("tool_name"))
+    for item in fms_results
+    if isinstance(item, dict) and item.get("tool_name")
+  }
+  classification = classify_child_outcome(
+    result,
+    error,
+    declared_terminal_doors=door_names,
+    door_results=fms_results,
   )
+  raw_status = primary_fms.get("status") if isinstance(primary_fms, dict) else None
+  has_error = not classification.succeeded
   outcome = "error" if has_error else "success"
   event = {
     "type": "skill_result_captured",
@@ -90,7 +89,7 @@ def build_skill_result_captured_event(
     "error": _result_error(
       classification.error,
       fms_results,
-      fallback_status=(normalized_fms_status if has_error else None),
+      fallback_status=(str(raw_status).strip().lower() if has_error and raw_status else None),
     ),
     "warnings": _warnings(result, fms_results),
     "approval_outcome": None,

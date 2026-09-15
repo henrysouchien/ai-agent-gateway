@@ -1,23 +1,22 @@
 from __future__ import annotations
 
 import importlib
-from typing import Any
+from collections.abc import Iterable
+from typing import Any, Protocol, runtime_checkable
 
 from .policy_imports import load_server_policy_module
 
 
-_POLICY_CATALOG_MODULE_NAMES = (
-  "agent.shared.server_policy_catalog",
-  "api.agent.shared.server_policy_catalog",
-)
+@runtime_checkable
+class _ClassToolsGetter(Protocol):
+  def __call__(self, tool_class: str) -> Iterable[object]: ...
+
+
+_POLICY_CATALOG_MODULE_NAME = "agent.shared.server_policy_catalog"
 _POLICY_CATALOG_IMPORT_ROOTS = frozenset({
   "agent",
   "agent.shared",
   "agent.shared.server_policy_catalog",
-  "api",
-  "api.agent",
-  "api.agent.shared",
-  "api.agent.shared.server_policy_catalog",
 })
 _FALLBACK_TRADE_OPENING_TOOLS = frozenset({
   "execute_trade",
@@ -53,24 +52,23 @@ HOSTED_UNAVAILABLE_NORMALIZER_TOOLS = frozenset({
 
 
 def _load_portfolio_irreversible_tools() -> frozenset[str]:
-  for module_name in _POLICY_CATALOG_MODULE_NAMES:
-    try:
-      module = importlib.import_module(module_name)
-    except ModuleNotFoundError as exc:
-      if exc.name not in _POLICY_CATALOG_IMPORT_ROOTS:
-        raise
-      continue
-    raw_tools = getattr(module, "PORTFOLIO_IRREVERSIBLE_TOOLS", ())
-    try:
-      tools = frozenset(
-        str(tool_name).strip()
-        for tool_name in raw_tools
-        if str(tool_name or "").strip()
-      )
-    except TypeError:
-      continue
-    if tools:
-      return tools
+  try:
+    module = importlib.import_module(_POLICY_CATALOG_MODULE_NAME)
+  except ModuleNotFoundError as exc:
+    if exc.name not in _POLICY_CATALOG_IMPORT_ROOTS:
+      raise
+    return _FALLBACK_TRADE_OPENING_TOOLS | _NON_OPENING_IRREVERSIBLE_TOOLS
+  raw_tools = getattr(module, "PORTFOLIO_IRREVERSIBLE_TOOLS", ())
+  try:
+    tools = frozenset(
+      str(tool_name).strip()
+      for tool_name in raw_tools
+      if str(tool_name or "").strip()
+    )
+  except TypeError:
+    return _FALLBACK_TRADE_OPENING_TOOLS | _NON_OPENING_IRREVERSIBLE_TOOLS
+  if tools:
+    return tools
   return _FALLBACK_TRADE_OPENING_TOOLS | _NON_OPENING_IRREVERSIBLE_TOOLS
 
 
@@ -99,7 +97,7 @@ def normalizer_excluded_tools() -> frozenset[str]:
   excluded = set(TRADE_OPENING_TOOLS)
   policy_module: Any | None = load_server_policy_module()
   get_class_tools = getattr(policy_module, "get_class_tools", None)
-  if callable(get_class_tools):
+  if isinstance(get_class_tools, _ClassToolsGetter):
     for tool_class in _WRITE_TOOL_CLASSES:
       raw_tools = get_class_tools(tool_class)
       try:

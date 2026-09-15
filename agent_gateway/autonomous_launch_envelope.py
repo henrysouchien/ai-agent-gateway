@@ -9,9 +9,15 @@ import secrets
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, overload
 
-from .capability_binding import CapabilityBind, CredentialHandle
+from agent_workflow_contracts.research_file_contract import is_research_file_id
+
+from .capability_binding import (
+  CapabilityBind,
+  CredentialHandle,
+  SESSION_DRIVER_CAPABILITY,
+)
 from .agent_session_log_layout import (
   AutonomousSessionLogAuthority,
   SESSION_LOG_LAYOUT_V2,
@@ -19,6 +25,11 @@ from .agent_session_log_layout import (
 )
 from .role_validation import require_exact_role
 from .session import GatewaySession
+from .skill_limits import (
+  SkillExecutionLimits,
+  skill_execution_limits_from_mapping,
+  skill_execution_limits_to_mapping,
+)
 
 
 AUTONOMOUS_CAPABILITY_ENVELOPE_ENV = (
@@ -26,9 +37,9 @@ AUTONOMOUS_CAPABILITY_ENVELOPE_ENV = (
 )
 AUTONOMOUS_TASK_ID_ENV = "AGENT_AUTONOMOUS_TASK_ID"
 AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE = (
-  "agent-gateway.autonomous-capability/v5"
+  "agent-gateway.autonomous-capability/v6"
 )
-AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION = 5
+AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION = 6
 AUTONOMOUS_CAPABILITY_ENVELOPE_TTL_SECONDS = 60
 AUTONOMOUS_CAPABILITY_ENVELOPE_MAX_TTL_SECONDS = 300
 AUTONOMOUS_CAPABILITY_ENVELOPE_CLOCK_SKEW_SECONDS = 5
@@ -63,9 +74,11 @@ _WORKLOAD_FIELDS = frozenset({
   "pack",
   "context",
   "ticker",
+  "research_file_id",
   "dev_mode",
   "max_budget_usd",
   "deliver",
+  "admitted_skill_execution_limits",
   "session_log_authority",
 })
 _CONTROL_AUTHORITY_FIELDS = frozenset({
@@ -76,12 +89,6 @@ _CONTROL_AUTHORITY_FIELDS = frozenset({
   "operator_inbox_path",
   "operator_inbox_device",
   "operator_inbox_inode",
-  "approval_decisions_path",
-  "approval_decisions_device",
-  "approval_decisions_inode",
-  "approval_store_path",
-  "approval_store_device",
-  "approval_store_inode",
 })
 _SESSION_AUTHORITY_FIELDS = frozenset({
   "ordinary_authority",
@@ -171,6 +178,26 @@ def _exact_positive_int(
   return value
 
 
+@overload
+def _canonical_workload_text(
+  value: object,
+  *,
+  field_name: str,
+  optional: Literal[False] = False,
+  free_text: bool = False,
+) -> str: ...
+
+
+@overload
+def _canonical_workload_text(
+  value: object,
+  *,
+  field_name: str,
+  optional: Literal[True],
+  free_text: bool = False,
+) -> str | None: ...
+
+
 def _canonical_workload_text(
   value: object,
   *,
@@ -222,6 +249,17 @@ def _workload_budget(value: object) -> float | None:
       "must be null or a finite positive number"
     )
   return budget
+
+
+def _workload_research_file_id(value: object) -> int | None:
+  if value is None:
+    return None
+  if not is_research_file_id(value):
+    raise ValueError(
+      "autonomous launch workload research_file_id "
+      "must be null or a positive integer"
+    )
+  return int(value)
 
 
 def _canonical_control_path(
@@ -392,12 +430,16 @@ class AutonomousLaunchWorkload:
   pack: str | None
   context: str | None
   ticker: str | None
+  research_file_id: int | None
   dev_mode: bool
   max_budget_usd: float | None
   deliver: bool
-  # This is not an executable CLI argument, so the entrypoint's workload
-  # comparison intentionally ignores it.  It is nevertheless mandatory in
-  # every signed v5 receipt and is verified independently before bootstrap.
+  # These are not executable CLI arguments, so the entrypoint's workload
+  # comparison intentionally ignores them. They remain mandatory in every
+  # signed v6 receipt and are verified independently before bootstrap.
+  admitted_skill_execution_limits: SkillExecutionLimits | None = field(
+    compare=False
+  )
   session_log_authority: AutonomousSessionLogAuthority | None = field(
     default=None,
     compare=False,
@@ -435,6 +477,15 @@ class AutonomousLaunchWorkload:
       raise TypeError(
         "autonomous launch workload session_log_authority must be exact"
       )
+    if self.mode == "skill":
+      if type(self.admitted_skill_execution_limits) is not SkillExecutionLimits:
+        raise TypeError(
+          "skill autonomous launch workload requires exact admitted limits"
+        )
+    elif self.admitted_skill_execution_limits is not None:
+      raise ValueError(
+        "non-skill autonomous launch workload cannot carry admitted limits"
+      )
 
     task = _canonical_workload_text(
       self.task,
@@ -464,6 +515,7 @@ class AutonomousLaunchWorkload:
       optional=True,
     )
     budget = _workload_budget(self.max_budget_usd)
+    research_file_id = _workload_research_file_id(self.research_file_id)
 
     if self.mode == "run_once":
       invalid = (
@@ -472,6 +524,7 @@ class AutonomousLaunchWorkload:
         or pack is not None
         or context is not None
         or ticker is not None
+        or research_file_id is not None
         or self.dev_mode
         or budget is not None
         or not self.deliver
@@ -494,6 +547,7 @@ class AutonomousLaunchWorkload:
         or pack is None
         or context is not None
         or ticker is not None
+        or research_file_id is not None
         or self.dev_mode
         or budget is not None
         or not self.deliver
@@ -515,6 +569,7 @@ class AutonomousLaunchWorkload:
     object.__setattr__(self, "pack", pack)
     object.__setattr__(self, "context", context)
     object.__setattr__(self, "ticker", ticker)
+    object.__setattr__(self, "research_file_id", research_file_id)
     object.__setattr__(self, "max_budget_usd", budget)
 
   @classmethod
@@ -535,9 +590,23 @@ class AutonomousLaunchWorkload:
       raise ValueError(
         "autonomous launch workload session_log_authority is invalid"
       ) from exc
+    admitted_limits_payload = payload["admitted_skill_execution_limits"]
+    try:
+      admitted_limits = (
+        skill_execution_limits_from_mapping(
+          admitted_limits_payload
+        )
+        if admitted_limits_payload is not None
+        else None
+      )
+    except (TypeError, ValueError) as exc:
+      raise ValueError(
+        "autonomous launch workload admitted limits are invalid"
+      ) from exc
     return cls(
       **{
         **payload,
+        "admitted_skill_execution_limits": admitted_limits,
         "session_log_authority": session_log_authority,
       }
     )
@@ -551,9 +620,17 @@ class AutonomousLaunchWorkload:
       "pack": self.pack,
       "context": self.context,
       "ticker": self.ticker,
+      "research_file_id": self.research_file_id,
       "dev_mode": self.dev_mode,
       "max_budget_usd": self.max_budget_usd,
       "deliver": self.deliver,
+      "admitted_skill_execution_limits": (
+        skill_execution_limits_to_mapping(
+          self.admitted_skill_execution_limits
+        )
+        if self.admitted_skill_execution_limits is not None
+        else None
+      ),
       "session_log_authority": (
         self.session_log_authority.receipt()
         if type(self.session_log_authority)
@@ -561,6 +638,81 @@ class AutonomousLaunchWorkload:
         else None
       ),
     }
+
+
+@dataclass(frozen=True, slots=True)
+class _AutonomousControlFileIdentity:
+  """Required path and inode identity for one file control endpoint."""
+
+  path: str
+  device: int
+  inode: int
+
+
+@dataclass(frozen=True, slots=True)
+class AutonomousFileControlAuthority:
+  """Required file endpoints projected from a file control authority."""
+
+  control_mode: Literal["file"] = field(default="file", init=False)
+  admission_ledger_path: str
+  admission_ledger_device: int
+  admission_ledger_inode: int
+  operator_inbox_path: str
+  operator_inbox_device: int
+  operator_inbox_inode: int
+
+
+@overload
+def _normalize_control_file_identity(
+  *,
+  path: str | None,
+  device: object,
+  inode: object,
+  field_name: str,
+  required: Literal[True],
+) -> _AutonomousControlFileIdentity: ...
+
+
+@overload
+def _normalize_control_file_identity(
+  *,
+  path: str | None,
+  device: object,
+  inode: object,
+  field_name: str,
+  required: Literal[False],
+) -> _AutonomousControlFileIdentity | None: ...
+
+
+def _normalize_control_file_identity(
+  *,
+  path: str | None,
+  device: object,
+  inode: object,
+  field_name: str,
+  required: bool,
+) -> _AutonomousControlFileIdentity | None:
+  if path is None:
+    if device is not None or inode is not None or required:
+      raise ValueError(
+        "autonomous control authority "
+        f"{field_name} path/device/inode must be all present "
+        "or all null"
+      )
+    return None
+  if (
+    isinstance(device, bool)
+    or not isinstance(device, int)
+    or device < 0
+    or isinstance(inode, bool)
+    or not isinstance(inode, int)
+    or inode <= 0
+  ):
+    raise ValueError(
+      "autonomous control authority "
+      f"{field_name} file identity is invalid"
+    )
+  return _AutonomousControlFileIdentity(path, device, inode)
 
 
 @dataclass(frozen=True, slots=True)
@@ -574,12 +726,6 @@ class AutonomousControlAuthority:
   operator_inbox_path: str | None
   operator_inbox_device: int | None
   operator_inbox_inode: int | None
-  approval_decisions_path: str | None
-  approval_decisions_device: int | None
-  approval_decisions_inode: int | None
-  approval_store_path: str | None
-  approval_store_device: int | None
-  approval_store_inode: int | None
 
   def __post_init__(self) -> None:
     if (
@@ -599,88 +745,42 @@ class AutonomousControlAuthority:
       field_name="operator_inbox_path",
       optional=True,
     )
-    approval_path = _canonical_control_path(
-      self.approval_decisions_path,
-      field_name="approval_decisions_path",
-      optional=True,
-    )
-    store_path = _canonical_control_path(
-      self.approval_store_path,
-      field_name="approval_store_path",
-      optional=True,
-    )
-
-    def normalize_file_identity(
-      *,
-      path: str | None,
-      device: object,
-      inode: object,
-      field_name: str,
-      required: bool,
-    ) -> tuple[int | None, int | None]:
-      if path is None:
-        if device is not None or inode is not None or required:
-          raise ValueError(
-            "autonomous control authority "
-            f"{field_name} path/device/inode must be all present "
-            "or all null"
-          )
-        return None, None
-      if (
-        isinstance(device, bool)
-        or not isinstance(device, int)
-        or device < 0
-        or isinstance(inode, bool)
-        or not isinstance(inode, int)
-        or inode <= 0
-      ):
-        raise ValueError(
-          "autonomous control authority "
-          f"{field_name} file identity is invalid"
-        )
-      return device, inode
-
     file_mode = self.control_mode == "file"
-    ledger_device, ledger_inode = normalize_file_identity(
-      path=ledger_path,
-      device=self.admission_ledger_device,
-      inode=self.admission_ledger_inode,
-      field_name="admission_ledger",
-      required=file_mode,
-    )
-    operator_device, operator_inode = normalize_file_identity(
-      path=operator_path,
-      device=self.operator_inbox_device,
-      inode=self.operator_inbox_inode,
-      field_name="operator_inbox",
-      required=file_mode,
-    )
-    approval_device, approval_inode = normalize_file_identity(
-      path=approval_path,
-      device=self.approval_decisions_device,
-      inode=self.approval_decisions_inode,
-      field_name="approval_decisions",
-      required=False,
-    )
-    store_device, store_inode = normalize_file_identity(
-      path=store_path,
-      device=self.approval_store_device,
-      inode=self.approval_store_inode,
-      field_name="approval_store",
-      required=False,
-    )
-    if (approval_path is None) != (store_path is None):
-      raise ValueError(
-        "autonomous control authority approval decision and "
-        "store endpoints must be both present or both null"
+    if file_mode:
+      ledger_identity = _normalize_control_file_identity(
+        path=ledger_path,
+        device=self.admission_ledger_device,
+        inode=self.admission_ledger_inode,
+        field_name="admission_ledger",
+        required=True,
+      )
+      operator_identity = _normalize_control_file_identity(
+        path=operator_path,
+        device=self.operator_inbox_device,
+        inode=self.operator_inbox_inode,
+        field_name="operator_inbox",
+        required=True,
+      )
+    else:
+      ledger_identity = _normalize_control_file_identity(
+        path=ledger_path,
+        device=self.admission_ledger_device,
+        inode=self.admission_ledger_inode,
+        field_name="admission_ledger",
+        required=False,
+      )
+      operator_identity = _normalize_control_file_identity(
+        path=operator_path,
+        device=self.operator_inbox_device,
+        inode=self.operator_inbox_inode,
+        field_name="operator_inbox",
+        required=False,
       )
     if not file_mode and any(
       value is not None
       for value in (
         ledger_path,
         operator_path,
-        approval_path,
-        store_path,
       )
     ):
       raise ValueError(
@@ -691,8 +791,6 @@ class AutonomousControlAuthority:
       for path in (
         ledger_path,
         operator_path,
-        approval_path,
-        store_path,
       )
       if path is not None
     ]
@@ -708,12 +806,20 @@ class AutonomousControlAuthority:
     object.__setattr__(
       self,
       "admission_ledger_device",
-      ledger_device,
+      (
+        ledger_identity.device
+        if ledger_identity is not None
+        else None
+      ),
     )
     object.__setattr__(
       self,
       "admission_ledger_inode",
-      ledger_inode,
+      (
+        ledger_identity.inode
+        if ledger_identity is not None
+        else None
+      ),
     )
     object.__setattr__(
       self,
@@ -723,42 +829,46 @@ class AutonomousControlAuthority:
     object.__setattr__(
       self,
       "operator_inbox_device",
-      operator_device,
+      (
+        operator_identity.device
+        if operator_identity is not None
+        else None
+      ),
     )
     object.__setattr__(
       self,
       "operator_inbox_inode",
-      operator_inode,
+      (
+        operator_identity.inode
+        if operator_identity is not None
+        else None
+      ),
     )
-    object.__setattr__(
-      self,
-      "approval_decisions_path",
-      approval_path,
+
+  def file_authority(self) -> AutonomousFileControlAuthority:
+    """Return the required file-mode projection for file consumers."""
+
+    ledger = _normalize_control_file_identity(
+      path=self.admission_ledger_path,
+      device=self.admission_ledger_device,
+      inode=self.admission_ledger_inode,
+      field_name="admission_ledger",
+      required=True,
     )
-    object.__setattr__(
-      self,
-      "approval_decisions_device",
-      approval_device,
+    operator = _normalize_control_file_identity(
+      path=self.operator_inbox_path,
+      device=self.operator_inbox_device,
+      inode=self.operator_inbox_inode,
+      field_name="operator_inbox",
+      required=True,
     )
-    object.__setattr__(
-      self,
-      "approval_decisions_inode",
-      approval_inode,
-    )
-    object.__setattr__(
-      self,
-      "approval_store_path",
-      store_path,
-    )
-    object.__setattr__(
-      self,
-      "approval_store_device",
-      store_device,
-    )
-    object.__setattr__(
-      self,
-      "approval_store_inode",
-      store_inode,
+    return AutonomousFileControlAuthority(
+      admission_ledger_path=ledger.path,
+      admission_ledger_device=ledger.device,
+      admission_ledger_inode=ledger.inode,
+      operator_inbox_path=operator.path,
+      operator_inbox_device=operator.device,
+      operator_inbox_inode=operator.inode,
     )
 
   @classmethod
@@ -782,12 +892,6 @@ class AutonomousControlAuthority:
       "operator_inbox_path": self.operator_inbox_path,
       "operator_inbox_device": self.operator_inbox_device,
       "operator_inbox_inode": self.operator_inbox_inode,
-      "approval_decisions_path": self.approval_decisions_path,
-      "approval_decisions_device": self.approval_decisions_device,
-      "approval_decisions_inode": self.approval_decisions_inode,
-      "approval_store_path": self.approval_store_path,
-      "approval_store_device": self.approval_store_device,
-      "approval_store_inode": self.approval_store_inode,
     }
 
 
@@ -804,7 +908,7 @@ class OrdinaryAutonomousSessionAuthority:
   user_email: str | None
   risk_user_id: int
   role: str
-  kind: str
+  kind: Literal["chat"]
   channel: str
   purpose: str
   raw_user_id: str | None
@@ -1055,13 +1159,15 @@ class AutonomousSessionAuthority:
       )
     session = GatewaySession(
       session_id=authority.session_id,
-      api_key_hash="",
+      api_key_hash=hashlib.sha256(
+        f"autonomous-session:{authority.session_id}".encode("utf-8")
+      ).hexdigest()[:16],
       created_at=authority.created_at,
       expires_at=authority.expires_at,
       user_id=authority.user_id,
       user_email=authority.user_email,
       risk_user_id=authority.risk_user_id,
-      role=authority.role,
+      role=require_exact_role(authority.role),
       kind=authority.kind,
       auth_config={"provider": authority.auth_provider},
       tenant_id=authority.tenant_id,
@@ -1117,7 +1223,7 @@ class AutonomousLaunchEnvelope:
       "iat_ns": self.iat_ns,
       "exp_ns": self.exp_ns,
       "nonce": self.nonce,
-      "capability_bind": self.bind.receipt(),
+      "capability_bind": self.bind.to_json(),
       "workload": self.workload.receipt(),
       "control_authority": self.control_authority.receipt(),
       "session_authority": self.session_authority.receipt(),
@@ -1174,7 +1280,7 @@ def _autonomous_bind(bind: object) -> CapabilityBind:
     raise TypeError(
       "autonomous capability envelope bind must be CapabilityBind"
     )
-  if bind.capability_id != "session.driver":
+  if bind.capability_id != SESSION_DRIVER_CAPABILITY:
     raise ValueError(
       "autonomous capability envelope requires a session.driver bind"
     )
@@ -1183,12 +1289,6 @@ def _autonomous_bind(bind: object) -> CapabilityBind:
       "autonomous capability envelope bind must use autonomous or cron run mode"
     )
   return bind
-
-
-def _bind_sha256(bind: CapabilityBind) -> str:
-  return hashlib.sha256(
-    _canonical_json(bind.receipt()).encode("utf-8")
-  ).hexdigest()
 
 
 def _closed_object(
@@ -1436,7 +1536,7 @@ def sign_autonomous_launch_envelope(
     "iat_ns": issued_at_ns,
     "exp_ns": expires_at_ns,
     "nonce": resolved_nonce,
-    "capability_bind": bind.receipt(),
+    "capability_bind": bind.to_json(),
     "workload": workload.receipt(),
     "control_authority": control_authority.receipt(),
     "session_authority": session_authority.receipt(),
@@ -1629,7 +1729,7 @@ def _decode_autonomous_launch_envelope(
       "must be 32 lowercase hex characters"
     )
   try:
-    bind = CapabilityBind.from_receipt(raw["capability_bind"])
+    bind = CapabilityBind.from_json(raw["capability_bind"])
   except (TypeError, ValueError) as exc:
     raise ValueError(
       f"autonomous capability envelope bind is invalid: {exc}"
@@ -1747,6 +1847,7 @@ __all__ = [
   "AUTONOMOUS_RUNTIME_SESSION_PURPOSE",
   "AUTONOMOUS_TASK_ID_ENV",
   "AutonomousControlAuthority",
+  "AutonomousFileControlAuthority",
   "AutonomousDispatchScope",
   "AutonomousLaunchEnvelope",
   "AutonomousLaunchWorkload",

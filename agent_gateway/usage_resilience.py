@@ -9,7 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Generic, Literal, Protocol, TypeVar
 from uuid import uuid4
 
 from .usage_outbox import CommercialUsageOutbox
@@ -25,6 +25,18 @@ class CommercialUsageCircuitOpen(RuntimeError):
 
 class CommercialUsageSpoolError(RuntimeError):
   """Emergency spool framing, persistence, or replay failed."""
+
+
+class CommercialUsageOutboxSink(Protocol):
+  def enqueue_batch(self, payloads: list[dict[str, Any]]) -> None: ...
+
+  def health(self) -> dict[str, Any]: ...
+
+
+CommercialUsageOutboxT = TypeVar(
+  "CommercialUsageOutboxT",
+  bound=CommercialUsageOutboxSink,
+)
 
 
 @dataclass(frozen=True)
@@ -286,7 +298,12 @@ class CommercialUsageEmergencySpool:
       os.chmod(self.path, 0o600)
       _ = file_id
 
-  def replay_into(self, outbox: CommercialUsageOutbox, *, limit: int | None = None) -> int:
+  def replay_into(
+    self,
+    outbox: CommercialUsageOutboxSink,
+    *,
+    limit: int | None = None,
+  ) -> int:
     if limit is not None and limit <= 0:
       raise ValueError("emergency spool replay limit must be positive")
     replayed = 0
@@ -431,13 +448,13 @@ def hmac_compare(left: str, right: str) -> bool:
   return hmac.compare_digest(left, right)
 
 
-class ResilientCommercialUsageSink:
+class ResilientCommercialUsageSink(Generic[CommercialUsageOutboxT]):
   """Primary outbox + emergency spool without retrying paid provider work."""
 
   def __init__(
     self,
     *,
-    outbox: CommercialUsageOutbox,
+    outbox: CommercialUsageOutboxT,
     spool: CommercialUsageEmergencySpool,
     circuit_breaker: CommercialUsageCircuitBreaker,
     max_backlog: int,
@@ -481,7 +498,7 @@ class ResilientCommercialUsageSink:
     return "lost"
 
   def producer(
-    self,
+    self: "ResilientCommercialUsageSink[CommercialUsageOutbox]",
     *,
     claim: Any = None,
     lineage: Any = None,
@@ -511,7 +528,10 @@ class ResilientCommercialUsageSink:
       on_reconciliation=persist_and_observe,
     )
 
-  def record_reconciliation(self, report: Any) -> None:
+  def record_reconciliation(
+    self: "ResilientCommercialUsageSink[CommercialUsageOutbox]",
+    report: Any,
+  ) -> None:
     """Persist parity evidence without turning paid work into a client retry."""
     try:
       self._outbox.record_reconciliation_report(report)
@@ -648,7 +668,7 @@ class CommercialUsageDurability:
   outbox: CommercialUsageOutbox
   spool: CommercialUsageEmergencySpool
   circuit_breaker: CommercialUsageCircuitBreaker
-  sink: ResilientCommercialUsageSink
+  sink: ResilientCommercialUsageSink[CommercialUsageOutbox]
 
   @classmethod
   def create(

@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import asyncio
 from pathlib import Path
+from shlex import quote
+import tempfile
 
 import pytest
 
@@ -75,7 +77,7 @@ def test_contract_negative_fixtures_hit_exact_first_failure(tmp_path: Path, fixt
   preflight = _preflight_or_skip() if stage in {"typecheck", "bundle_size_cap"} else object()
   source = (packaged_contract_directory() / "fixtures" / fixture).read_text()
   result = emit_canvas_artifact(
-    workspace_dir=tmp_path, preflight=preflight, title="Fixture", purpose="exploration",
+    workspace_dir=tmp_path, preflight=preflight, title="Fixture", purpose="exploration",  # pyright: ignore[reportArgumentType]  # negative: size-cap short-circuit sentinel
     summary="Fixture", tsx_source=source, copy_as_markdown="fallback",
     source_skill="fixture", skill_run_id="fixture-run",
   )
@@ -100,10 +102,17 @@ def test_valid_fixture_writes_sidecar_and_emits_event(tmp_path: Path) -> None:
 
 
 def test_subprocess_cancellation_cleans_emission_tempdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+  blocker = tmp_path / "node-blocker"
+  os.mkfifo(blocker)
+  blocker_fd = os.open(blocker, os.O_RDWR | os.O_NONBLOCK)
   fake_node = tmp_path / "slow-node"
-  fake_node.write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
+  fake_node.write_text(
+    f"#!/bin/sh\nread stop < {quote(str(blocker))}\n",
+    encoding="utf-8",
+  )
   fake_node.chmod(0o755)
   monkeypatch.setenv("TMPDIR", str(tmp_path))
+  monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
   preflight = CanvasBuildPreflight(
     build_dir=tmp_path, node=fake_node, tsc=fake_node, esbuild=fake_node,
     toolchain_version="test",
@@ -115,11 +124,18 @@ def test_subprocess_cancellation_cleans_emission_tempdir(tmp_path: Path, monkeyp
       preflight,
     ))
     for _ in range(100):
-      if list(tmp_path.glob("hank-canvas-build-*")): break
+      if list(tmp_path.glob("hank-canvas-build-*")):
+        break
       await asyncio.sleep(0.01)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-      await task
+    try:
+      assert list(tmp_path.glob("hank-canvas-build-*"))
+      task.cancel()
+      with pytest.raises(asyncio.CancelledError):
+        await task
+    finally:
+      task.cancel()
+      os.write(blocker_fd, b"stop\n")
+      os.close(blocker_fd)
 
   asyncio.run(scenario())
   assert list(tmp_path.glob("hank-canvas-build-*")) == []

@@ -1,47 +1,27 @@
 from __future__ import annotations
 
-import asyncio
+import logging
 from dataclasses import replace
-from datetime import timedelta
-import time
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
-from . import approval_settings
 from .approval_constraints import constraint_for_catalog_tool
-from .approval_policy import (
-  ApprovalDecision as PolicyApprovalDecision,
-  ApprovalRequest as PolicyApprovalRequest,
-  RunContext,
-  apply_decision_to_request,
-  build_approval_request,
-  call_policy_safely,
-  sha256_args,
-  utc_now,
-)
-from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich_trade_approval_args
-from .batch_approval_projection import (
-  abort_unpublished_batch_approval_admission,
-  acquire_batch_approval_admission,
-  require_batch_stage_run_seq,
-)
+from .approval_policy import RunContext
+from .approval_enrichment import enrich_trade_approval_args
+from .approval_route import DurableLocalApprovalRoute
+from .mcp_client import registered_mcp_dispatch_scope
 from .policy_imports import resolve_effective_role, resolve_server_policy_tool_class
-from .secret_boundary import (
-  sanitize_approval_decision_projection,
-  sanitize_boundary_value,
-  sanitization_failure_tool_input,
+from .sdk_runner_helpers import (
+  catalogless_policy_owner_mismatch,
+  catalogless_tool_name,
+  server_for_tool,
 )
+from .skill_limits import ActiveSkillAdmission
+from . import tool_dispatcher_approval_lifecycle as _approval_lifecycle_helpers
+from .tool_redaction import resolve_redaction_provider
 
+_redaction = resolve_redaction_provider()
 
-def approval_queue_timeout_seconds(
-  expiry_seconds: float | int | None,
-  *,
-  approval_wait_seconds_fn: Callable[[], float] = approval_settings.approval_wait_seconds,
-) -> float:
-  return min(float(expiry_seconds or 600), approval_wait_seconds_fn())
-
-
-def approval_lifecycle_configured(*, store: Any | None, policy: Any | None, session: Any | None) -> bool:
-  return store is not None and policy is not None and session is not None
+log = logging.getLogger("agent_gateway.sdk_runner_approval")
 
 
 def resolve_run_context(
@@ -77,131 +57,65 @@ def resolve_run_context(
   )
 
 
-def resolve_tool_class(
+def resolve_catalogless_approval_identity(
   tool_name: str,
   *,
-  policy_tool_name_fn: Callable[[str], str],
-  server_for_tool_fn: Callable[[str], str | None],
   resolve_server_policy_tool_class_fn: Callable[..., str] = resolve_server_policy_tool_class,
-) -> str:
-  policy_tool = policy_tool_name_fn(tool_name)
-  return resolve_server_policy_tool_class_fn(
-    tool_name,
-    policy_tool_name=policy_tool,
-    runtime_server=server_for_tool_fn(tool_name),
+) -> tuple[str, str]:
+  """Return the legacy lifecycle identity for an explicit catalog-free route."""
+
+  policy_tool = catalogless_tool_name(tool_name)
+  return (
+    policy_tool,
+    resolve_server_policy_tool_class_fn(
+      tool_name,
+      policy_tool_name=policy_tool,
+      runtime_server=server_for_tool(tool_name),
+    ),
   )
+
+
+def is_catalogless_approval_route(runner: Any, tool_name: str) -> bool:
+  """Select the construction-owned SDK-local and builtin approval route."""
+
+  return (
+    runner._registered_mcp_descriptor_for_sdk_tool is None
+    or not tool_name.startswith("mcp__")
+    or tool_name in runner._catalogless_mcp_tool_ids
+  )
+
+
+def registered_policy_owner_mismatch(
+  runner: Any,
+  tool_name: str,
+) -> tuple[str, str, str] | None:
+  """Retain catalog-free ownership checks only for its explicit routes."""
+
+  if is_catalogless_approval_route(runner, tool_name):
+    return catalogless_policy_owner_mismatch(tool_name)
+  return None
 
 
 def redact_for_approval_request(
   tool_name: str,
   tool_input: dict[str, Any],
-  *,
-  sha256_args_fn: Callable[[Any], str] = sha256_args,
 ) -> tuple[dict[str, Any], str]:
-  try:
-    from agent.shared.tool_redaction import get_audit_hmac_secret, get_audit_hmac_key_id, hmac_value, redact_tool_input
-
-    secret = get_audit_hmac_secret()
-    key_id = get_audit_hmac_key_id()
-    return (
-      redact_tool_input(tool_name, tool_input, deployment_secret=secret, key_id=key_id),
-      hmac_value(tool_input, deployment_secret=secret, key_id=key_id),
-    )
-  except Exception:
-    return {}, sha256_args_fn(tool_input)
+  secret = _redaction.get_audit_hmac_secret()
+  key_id = _redaction.get_audit_hmac_key_id()
+  return (
+    _redaction.redact_tool_input(tool_name, tool_input, deployment_secret=secret, key_id=key_id),
+    _redaction.hmac_value(tool_input, deployment_secret=secret, key_id=key_id),
+  )
 
 
-async def await_user_approval_via_pending_tools(
-  *,
-  session: Any | None,
-  approval_store: Any | None,
-  request: PolicyApprovalRequest,
-  decision: PolicyApprovalDecision,
-  nonce: str,
-  append_event_fn: Callable[[dict[str, Any]], None],
-  timeout_seconds: float,
-  log: Any,
-  time_fn: Callable[[], float] = time.time,
-  queue_factory: Callable[..., Any] = asyncio.Queue,
-  wait_for_fn: Callable[..., Any] = asyncio.wait_for,
-  batch_admission: Any | None = None,
-) -> tuple[str, dict[str, Any] | None]:
-  # Discriminated outcome: ("approved" | "denied" | "expired", vote payload).
-  # Callers MUST read the discriminant first: an expiry is not a denial.
-  if session is None:
-    return "denied", None
-  approval_queue: asyncio.Queue = queue_factory(maxsize=1)
-  pending_entry = {
-    "approval_id": request.approval_id,
-    "nonce": nonce,
-    "requested_at": int(time_fn()),
-    "status": "approval_pending",
-    "tool_name": request.tool_name,
-    "resolved_qualifier": "",
-  }
-  if batch_admission is not None:
-    pending_entry["stage_run_seq"] = require_batch_stage_run_seq(session)
-  session.pending_tools[request.tool_call_id] = pending_entry
-  session.approval_queues[request.tool_call_id] = approval_queue
-  if batch_admission is not None:
-    try:
-      batch_admission.publish_pending()
-    except BaseException:
-      session.pending_tools.pop(request.tool_call_id, None)
-      session.approval_queues.pop(request.tool_call_id, None)
-      raise
-  approval_event = {
-    "type": "tool_approval_request",
-    "tool_call_id": request.tool_call_id,
-    "approval_id": request.approval_id,
-    "nonce": nonce,
-    "tool_name": request.tool_name,
-    "tool_input": request.tool_args_redacted,
-    "resolved_qualifier": "",
-    "reason": decision.reason,
-    "allow_persistent_approval": decision.allow_persistent_grant,
-    "ts": time_fn(),
-  }
-  if batch_admission is not None:
-    approval_event["stage_run_seq"] = pending_entry["stage_run_seq"]
-  append_event_fn(approval_event)
-  session_log = getattr(session, "agent_session_log", None)
-  if session_log is not None:
-    try:
-      await session_log.append(approval_event)
-    except Exception:
-      log.warning(
-        "Failed to persist approval request event for %s | failure=true",
-        request.tool_call_id,
-      )
-  try:
-    approval = await wait_for_fn(
-      approval_queue.get(),
-      timeout=max(0.1, timeout_seconds),
-    )
-  except asyncio.TimeoutError:
-    if approval_store is not None:
-      try:
-        latest = await approval_store.get(request.approval_id)
-        if latest is not None and latest.state == "pending_user":
-          await approval_store.transition_state(
-            latest.approval_id,
-            "expired",
-            expected_state_version=latest.state_version,
-            decision_reason="Timed out waiting for user approval",
-          )
-      except Exception:
-        log.warning(
-          "Failed to expire timed-out approval request %s | failure=true",
-          request.approval_id,
-        )
-    return "expired", None
-  else:
-    approved = bool(approval.get("approved")) if isinstance(approval, dict) else False
-    return ("approved" if approved else "denied"), approval
-  finally:
-    session.pending_tools.pop(request.tool_call_id, None)
-    session.approval_queues.pop(request.tool_call_id, None)
+def approval_args_hash(tool_input: dict[str, Any]) -> str:
+  secret = _redaction.get_audit_hmac_secret()
+  key_id = _redaction.get_audit_hmac_key_id()
+  return _redaction.hmac_value(
+    tool_input,
+    deployment_secret=secret,
+    key_id=key_id,
+  )
 
 
 async def can_use_tool_callback(
@@ -210,54 +124,9 @@ async def can_use_tool_callback(
   input_data: dict[str, Any],
   _context: Any,
   *,
-  policy_owner_mismatch_fn: Callable[[str], tuple[str, str, str] | None],
-  policy_tool_name_fn: Callable[[str], str],
-  current_skill_fn: Callable[[], str | None],
-  replace_fn: Callable[..., Any],
+  current_skill_admission_fn: Callable[[], ActiveSkillAdmission | None],
   enrich_trade_approval_args_fn: Callable[..., dict[str, Any]] = enrich_trade_approval_args,
-  build_approval_request_fn: Callable[..., PolicyApprovalRequest] = build_approval_request,
-  call_policy_safely_fn: Callable[..., Any] = call_policy_safely,
-  apply_decision_to_request_fn: Callable[..., PolicyApprovalRequest] = apply_decision_to_request,
-  effective_trade_approval_expiry_seconds_fn: Callable[..., float | int | None] = effective_trade_approval_expiry_seconds,
-  approval_wait_seconds_fn: Callable[[], float] = approval_settings.approval_wait_seconds,
-  utc_now_fn: Callable[[], Any] = utc_now,
   uuid_hex_fn: Callable[[], str],
-  os_urandom_fn: Callable[[int], bytes],
-) -> Any:
-  arguments = dict(locals())
-  batch_admission = acquire_batch_approval_admission(runner._session)
-  arguments["batch_admission"] = batch_admission
-  try:
-    return await _can_use_tool_callback_impl(**arguments)
-  except BaseException:
-    if batch_admission is not None and not batch_admission.published:
-      await abort_unpublished_batch_approval_admission(batch_admission)
-    raise
-  finally:
-    if batch_admission is not None:
-      batch_admission.release()
-
-
-async def _can_use_tool_callback_impl(
-  runner: Any,
-  tool_name: str,
-  input_data: dict[str, Any],
-  _context: Any,
-  *,
-  policy_owner_mismatch_fn: Callable[[str], tuple[str, str, str] | None],
-  policy_tool_name_fn: Callable[[str], str],
-  current_skill_fn: Callable[[], str | None],
-  replace_fn: Callable[..., Any],
-  enrich_trade_approval_args_fn: Callable[..., dict[str, Any]] = enrich_trade_approval_args,
-  build_approval_request_fn: Callable[..., PolicyApprovalRequest] = build_approval_request,
-  call_policy_safely_fn: Callable[..., Any] = call_policy_safely,
-  apply_decision_to_request_fn: Callable[..., PolicyApprovalRequest] = apply_decision_to_request,
-  effective_trade_approval_expiry_seconds_fn: Callable[..., float | int | None] = effective_trade_approval_expiry_seconds,
-  approval_wait_seconds_fn: Callable[[], float] = approval_settings.approval_wait_seconds,
-  utc_now_fn: Callable[[], Any] = utc_now,
-  uuid_hex_fn: Callable[[], str],
-  os_urandom_fn: Callable[[int], bytes],
-  batch_admission: Any | None = None,
 ) -> Any:
   import claude_agent_sdk
 
@@ -265,7 +134,7 @@ async def _can_use_tool_callback_impl(
   deny_cls = getattr(claude_agent_sdk, "PermissionResultDeny")
   if tool_name in runner._effective_disallowed_tools():
     return deny_cls(message=f"Tool '{tool_name}' is not available in this context")
-  mismatch = policy_owner_mismatch_fn(tool_name)
+  mismatch = runner._sdk_policy_owner_mismatch(tool_name)
   if mismatch is not None:
     runtime_server, policy_tool, policy_server = mismatch
     return deny_cls(
@@ -274,14 +143,52 @@ async def _can_use_tool_callback_impl(
         f"'{runtime_server}'; policy owner for '{policy_tool}' is '{policy_server}'"
       )
     )
-  policy_tool = policy_tool_name_fn(tool_name)
+  registered_call = None
+  if is_catalogless_approval_route(runner, tool_name):
+    policy_tool, tool_class = runner._resolve_sdk_approval_identity(tool_name)
+    prepared_input = input_data
+  else:
+    preparer = cast(
+      Callable[..., Any],
+      runner._prepare_registered_mcp_tool_call_for_sdk_tool,
+    )
+    trusted_scope = registered_mcp_dispatch_scope(
+      user_id=runner._resolve_run_context().user_id,
+      dispatch_scope=getattr(runner._session, "dispatch_scope", None),
+    )
+    registered_call = preparer(
+      tool_name,
+      input_data,
+      trusted_scope,
+      runner._registered_approval_overlay,
+    )
+    descriptor = registered_call.descriptor
+    policy_tool = descriptor.identity.logical_name
+    tool_class = descriptor.declaration.semantics.effect
+    prepared_input = registered_call.prepared_call.materialize_input()
+    if not registered_call.approval_required:
+      return allow_cls(updated_input=prepared_input)
+  prepared_authorization = (
+    registered_call.prepared_authorization
+    if registered_call is not None
+    else None
+  )
   try:
     approval_constraint = constraint_for_catalog_tool(policy_tool)
-  except Exception:
+  except Exception as exc:
+    log.error(
+      "Approval constraint classification failed for tool %r (policy tool %r); "
+      "owner: agent_gateway.approval_constraints over the trusted FMS action "
+      "catalog (fms.action_catalog): %s",
+      tool_name,
+      policy_tool,
+      exc,
+      exc_info=True,
+    )
     return deny_cls(
       message=(
         "[approval_constraint_unavailable] Trusted approval classification "
-        "is unavailable"
+        f"is unavailable for tool '{policy_tool}': {exc}"
       )
     )
   if approval_constraint == "fresh_human_owner":
@@ -291,88 +198,93 @@ async def _can_use_tool_callback_impl(
         "authenticated owner control-plane route"
       )
     )
-  if not runner._approval_lifecycle_configured():
-    return allow_cls()
-  store = runner._approval_store
-  policy = runner._approval_policy
-  assert store is not None and policy is not None
-  run_context = runner._resolve_run_context()
-  active_skill = current_skill_fn()
-  if active_skill and run_context.skill is None:
-    run_context = replace_fn(run_context, skill=active_skill)
-  redacted, args_hash = runner._redact_for_approval_request(tool_name, input_data)
+  route = runner._approval_route
+  if not isinstance(route, DurableLocalApprovalRoute):
+    if getattr(runner, "_approval_lifecycle", "required") == "not_required":
+      return allow_cls(updated_input=prepared_input)
+    return deny_cls(
+      message=(
+        "[approval_route_absent] This run has no admitted approval route "
+        f"for '{tool_name}'"
+      )
+    )
+  approval_input = (
+    prepared_authorization.materialize_approval_arguments()
+    if prepared_authorization is not None
+    else prepared_input
+  )
+  redacted, default_args_hash = runner._redact_for_approval_request(
+    tool_name,
+    approval_input,
+  )
+  args_hash = (
+    prepared_authorization.approval_arguments_hash
+    if prepared_authorization is not None
+    else default_args_hash
+  )
   redacted = enrich_trade_approval_args_fn(policy_tool, redacted, event_log=runner._log)
-  redacted = sanitize_boundary_value(
-    redacted,
-    sink="approval_request",
-    boundary=getattr(runner, "_secret_boundary", None),
+  approval_reuse_key = (
+    registered_call.approval_reuse_key
+    if registered_call is not None
+    else None
   )
-  if not isinstance(redacted, dict):
-    redacted = sanitization_failure_tool_input()
-  request = build_approval_request_fn(
-    tool_call_id=f"sdk-{uuid_hex_fn()}",
-    tool_name=policy_tool,
-    tool_class=runner._resolve_tool_class(tool_name),
-    tool_args_redacted=redacted,
-    args_hash=args_hash,
-    run_context=run_context,
-    approval_constraint=approval_constraint,
-  )
-  if batch_admission is not None:
-    batch_admission.bind_request(request=request, store=store)
-  await store.create(request)
-  raw_args = dict(input_data)
+  tool_call_id = f"sdk-{uuid_hex_fn()}"
   try:
-    decision = await call_policy_safely_fn(policy, request, raw_args, run_context)
-  finally:
-    raw_args.clear()
-    del raw_args
-  expiry_seconds = effective_trade_approval_expiry_seconds_fn(
-    policy_tool,
-    request.tool_args_redacted,
-    requested_expiry_seconds=decision.expiry_seconds,
-    max_wait_seconds=approval_wait_seconds_fn(),
-    now=utc_now_fn(),
-  )
-  if expiry_seconds != decision.expiry_seconds:
-    decision = replace_fn(decision, expiry_seconds=expiry_seconds)
-  decision, raw_modified_tool_args = sanitize_approval_decision_projection(
-    decision,
-    sink="approval_decision",
-    boundary=getattr(runner, "_secret_boundary", None),
-  )
-  request = apply_decision_to_request_fn(request, decision)
-  await store.update_request(request)
-
-  if decision.outcome == "auto_approve":
-    request = await store.transition_state(request.approval_id, "auto_approved", expected_state_version=request.state_version)
-    await policy.on_resolve(request=request)
-    if raw_modified_tool_args is not None:
-      return allow_cls(updated_input=raw_modified_tool_args)
-    return allow_cls()
-  if decision.outcome == "auto_deny":
-    request = await store.transition_state(request.approval_id, "auto_denied", expected_state_version=request.state_version)
-    await policy.on_resolve(request=request)
-    return deny_cls(message=decision.reason)
-  request = await store.transition_state(
-    request.approval_id,
-    "pending_user",
-    expires_at=utc_now_fn() + timedelta(seconds=decision.expiry_seconds or 600),
-    expected_state_version=request.state_version,
-  )
-  outcome, _approval = await runner._await_user_approval_via_pending_tools(
-    request,
-    decision,
-    nonce=os_urandom_fn(8).hex(),
-    batch_admission=batch_admission,
-  )
-  if outcome == "approved":
-    if raw_modified_tool_args is not None:
-      return allow_cls(updated_input=raw_modified_tool_args)
-    return allow_cls()
-  if outcome == "expired":
-    # An expiry is not a user vote. Interrupt the turn so the model cannot
-    # continue as if the user had answered.
+    lifecycle = await _approval_lifecycle_helpers.run_approval_lifecycle(
+      route=route,
+      session=runner._session,
+      tool_call_id=tool_call_id,
+      tool_name=policy_tool,
+      tool_input=prepared_input,
+      qualifier="",
+      reason="",
+      allow_persistent=(
+        True
+        if registered_call is None
+        else approval_reuse_key is not None
+      ),
+      approval_constraint=approval_constraint,
+      approval_reuse_mode=(
+        "legacy"
+        if registered_call is None
+        else "exact"
+        if approval_reuse_key is not None
+        else "disabled"
+      ),
+      approval_reuse_key=approval_reuse_key,
+      approval_identity=(
+        prepared_authorization.approval_identity
+        if prepared_authorization is not None
+        else None
+      ),
+      prepared_authorization_payload=(
+        prepared_authorization.prepared_payload
+        if prepared_authorization is not None
+        else None
+      ),
+      approval_args_redacted=redacted,
+      approval_args_hash=args_hash,
+      resolve_run_context_fn=runner._resolve_run_context,
+      current_skill_admission_fn=current_skill_admission_fn,
+      redact_for_approval_request_fn=runner._redact_for_approval_request,
+      resolve_tool_class_fn=lambda _policy_tool: tool_class,
+      effective_trade_approval_decision_fn=runner._effective_trade_approval_decision,
+      await_user_approval_via_pending_tools_fn=runner._await_user_approval_via_pending_tools,
+      approval_queue_timeout_seconds_fn=runner._approval_queue_timeout_seconds,
+      secret_boundary=getattr(runner, "_secret_boundary", None),
+    )
+  except _approval_lifecycle_helpers.ApprovalSkillAdmissionMismatch:
+    return deny_cls(
+      message="[skill_admission_mismatch] Trusted skill admission is unavailable"
+    )
+  if lifecycle["approved"]:
+    lifecycle_input = lifecycle["tool_input"]
+    if registered_call is None or prepared_authorization is None:
+      return allow_cls(updated_input=lifecycle_input)
+    return allow_cls(
+      updated_input=registered_call.materialize_authorized_input(tool_call_id)
+    )
+  if lifecycle.get("timeout"):
     return deny_cls(
       message=(
         "[approval_timeout] approval expired; a fresh tool call and "
@@ -380,15 +292,18 @@ async def _can_use_tool_callback_impl(
       ),
       interrupt=True,
     )
+  request = lifecycle["request"]
+  if request.state == "auto_denied":
+    return deny_cls(message=str(request.reason or ""))
   return deny_cls(message="user denied")
 
 
 __all__ = [
-  "approval_lifecycle_configured",
-  "approval_queue_timeout_seconds",
-  "await_user_approval_via_pending_tools",
+  "approval_args_hash",
   "can_use_tool_callback",
   "redact_for_approval_request",
+  "is_catalogless_approval_route",
+  "registered_policy_owner_mismatch",
+  "resolve_catalogless_approval_identity",
   "resolve_run_context",
-  "resolve_tool_class",
 ]

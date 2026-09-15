@@ -22,6 +22,7 @@ from agent_workflow_contracts import (
   OwnerBinding,
   RequestedDataRef,
   SemanticCapabilityRequirement,
+  TypedInputCapabilityBinding,
 )
 
 
@@ -92,7 +93,9 @@ def test_typed_compatibility_requires_full_registered_contract_identity() -> Non
     inputs=(_input(accepted),),
     registry=registry,
   )
-  assert compiled.capability_bindings[0].input_contract == accepted
+  binding = compiled.capability_bindings[0]
+  assert isinstance(binding, TypedInputCapabilityBinding)
+  assert binding.input_contract == accepted
 
   with pytest.raises(
     SemanticCapabilityCompilationError,

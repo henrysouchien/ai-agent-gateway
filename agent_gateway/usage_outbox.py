@@ -510,7 +510,7 @@ class CommercialUsageOutbox:
     self._synchronous = synchronous
     self._reconciliation_shipping_enabled = bool(reconciliation_shipping_enabled)
     contracts_path = Path(__file__).parent / "contracts"
-    self._reconciliation_validators = {
+    self._reconciliation_validators: dict[object, Draft202012Validator] = {
       version: Draft202012Validator(json.loads(
         (
           contracts_path
@@ -986,7 +986,7 @@ class CommercialUsageOutbox:
       enabled=enabled,
       claim=claim,
       lineage=lineage,
-      sink=self.enqueue_batch,
+      sink=None,
     )
 
   def lease_batch(
@@ -1342,9 +1342,9 @@ class CommercialUsageOutbox:
     if payload.get("source_usage_schema_version") == 3:
       try:
         for line in lines:
-          bind = CapabilityBind.from_receipt(line.get("capability_bind"))
+          bind = CapabilityBind.from_json(line.get("capability_bind"))
           if (
-            line.get("capability_bind") != bind.receipt()
+            line.get("capability_bind") != bind.to_json()
             or line.get("provider") != bind.provider
             or line.get("model") != bind.upstream_model
             or line.get("capability_id") != bind.capability_id

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -16,6 +16,17 @@ class UnknownModelError(ValueError):
 
 
 @dataclass(frozen=True)
+class ContextRateTier:
+  """Per-million-token prices for a whole request at or above its prompt threshold."""
+
+  min_input_tokens: int
+  input_cost_per_mtok: float
+  output_cost_per_mtok: float
+  cache_read_cost_per_mtok: float
+  cache_write_cost_per_mtok: float
+
+
+@dataclass(frozen=True)
 class ModelRates:
   display_name: str
   input_cost_per_mtok: float
@@ -24,6 +35,7 @@ class ModelRates:
   cache_write_cost_per_mtok: float
   max_tokens: int | None
   context_window: int | None
+  tiers: tuple[ContextRateTier, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -32,6 +44,7 @@ class RateTable:
   source: str
   providers: dict[str, dict[str, ModelRates]]
   _path: Path = field(repr=False, compare=False)
+  _bundled: RateTable | None = field(default=None, repr=False, compare=False)
 
   def lookup(self, provider: str, model: str) -> ModelRates:
     provider_name = str(provider or "").strip().lower()
@@ -40,16 +53,19 @@ class RateTable:
     if model_id in provider_models:
       return provider_models[model_id]
 
+    candidates = (model_id, model_id.rsplit("/", 1)[-1])
+    match: ModelRates | None = None
+    match_length = -1
     for key, rates in provider_models.items():
-      if key in model_id:
-        return rates
-
-    candidates = [model_id]
-    if "/" in model_id:
-      candidates.append(model_id.rsplit("/", 1)[-1])
-    for key, rates in provider_models.items():
-      if any(candidate == key or candidate.startswith(f"{key}-") for candidate in candidates):
-        return rates
+      if len(key) > match_length and any(
+        candidate == key or candidate.startswith(f"{key}-") for candidate in candidates
+      ):
+        match = rates
+        match_length = len(key)
+    if match is not None:
+      return match
+    if self._bundled is not None:
+      return self._bundled.lookup(provider_name, model_id)
 
     raise UnknownModelError(
       f"Model '{model_id}' not in rate table v{self.version}. Update {self._path} or pass --rates-file with a newer version."
@@ -86,6 +102,33 @@ def _parse_required_str(value: Any, *, path: Path, label: str) -> str:
   if not isinstance(value, str) or not value.strip():
     raise ValueError(f"Rate table file {path} has invalid {label}: expected a non-empty string.")
   return value
+
+
+def _parse_tiers(path: Path, label: str, raw_tiers: Any) -> tuple[ContextRateTier, ...]:
+  if not isinstance(raw_tiers, list):
+    raise ValueError(f"Rate table file {path} has invalid {label}: expected an array.")
+  tiers = []
+  for index, raw_tier in enumerate(raw_tiers):
+    tier_label = f"{label}[{index}]"
+    raw = _expect_mapping(raw_tier, path=path, label=tier_label)
+    threshold = _parse_optional_int(
+      _expect_required_field(raw, "min_input_tokens", path=path, label=tier_label),
+      path=path, label=f"{tier_label}.min_input_tokens",
+    )
+    if threshold is None or threshold < 0:
+      raise ValueError(f"Rate table file {path} has invalid {tier_label}.min_input_tokens: expected a non-negative integer.")
+    prices = {
+      key: _parse_required_float(
+        _expect_required_field(raw, key, path=path, label=tier_label),
+        path=path, label=f"{tier_label}.{key}",
+      )
+      for key in (
+        "input_cost_per_mtok", "output_cost_per_mtok",
+        "cache_read_cost_per_mtok", "cache_write_cost_per_mtok",
+      )
+    }
+    tiers.append(ContextRateTier(min_input_tokens=threshold, **prices))
+  return tuple(sorted(tiers, key=lambda tier: tier.min_input_tokens, reverse=True))
 
 
 def _parse_model_rates(path: Path, provider: str, model: str, raw_model: Any) -> ModelRates:
@@ -132,6 +175,7 @@ def _parse_model_rates(path: Path, provider: str, model: str, raw_model: Any) ->
       path=path,
       label=f"providers.{provider}.models.{model}.context_window",
     ),
+    tiers=_parse_tiers(path, f"providers.{provider}.models.{model}.tiers", raw.get("tiers", [])),
   )
 
 
@@ -197,10 +241,29 @@ def load_rate_table(path: Path | None = None) -> RateTable:
   return RateTable(version=version, source=source, providers=providers, _path=selected_path)
 
 
+def load_provider_rate_table(provider: str, rate_table: RateTable | None = None) -> RateTable:
+  """Apply only this provider's override rows, retaining bundled prices for absent rows.
+
+  Explicit tables take precedence over the environment. Override lookup runs
+  first, so configured model-prefix prices also override exact bundled rows.
+  """
+  provider_name = str(provider).strip().lower()
+  bundled = load_rate_table(_DEFAULT_RATE_TABLE_PATH.with_name(f"{provider_name}.json"))
+  if rate_table is None:
+    configured_path = resolve_configured_rates_file()
+    if configured_path is not None:
+      rate_table = load_rate_table(configured_path)
+  if rate_table is None or not rate_table.providers.get(provider_name):
+    return bundled
+  return replace(rate_table, _bundled=bundled)
+
+
 __all__ = [
+  "ContextRateTier",
   "ModelRates",
   "RateTable",
   "UnknownModelError",
+  "load_provider_rate_table",
   "load_rate_table",
   "resolve_configured_rates_file",
 ]

@@ -25,6 +25,7 @@ anyio==4.13.0 \
     --hash=sha256:334b70e641fd2221c1505b3890c69882fe4a2df910cba14d97019b90b24439dc
     # via
     #   anthropic
+    #   claude-agent-sdk
     #   httpx
     #   mcp
     #   openai
@@ -313,6 +314,14 @@ charset-normalizer==3.4.7 \
     --hash=sha256:fbccdc05410c9ee21bbf16a35f4c1d16123dcdeb8a1d38f33654fa21d0234f79 \
     --hash=sha256:fea24543955a6a729c45a73fe90e08c743f0b3334bbf3201e6c4bc1b0c7fa464
     # via requests
+claude-agent-sdk==0.1.50 \
+    --hash=sha256:2e44caf3e5bce56e26a18158acf3e1c2c2784cf8fa15e425afe92816c987eb1a \
+    --hash=sha256:44e75b9d076bd6030742729f99eb38777b80f052b22338d0a028d8190fc59e52 \
+    --hash=sha256:493d8cc43f4166291606749cf47b03e822f03b7f371cc77af697564017ccf579 \
+    --hash=sha256:7363d431dc6efd83fa658a045e14fa4357440352b548002bfb9096d8f04d143c \
+    --hash=sha256:858b1822451209b2c3ad8df27458168d29ac19fd628680853f7707ea017fea73 \
+    --hash=sha256:e15157792857ecb55274a71f08981efcfda2e169bee7894cbdc245d05ac43203
+    # via -r requirements-dev.in
 click==8.3.2 \
     --hash=sha256:14162b8b3b3550a7d479eafa77dfd3c38d9dc8951f6f69c78913a8f9a7540fd5 \
     --hash=sha256:1924d2c27c5653561cd2cae4548d1406039cb79b858b747cfea24924bbc1616d
@@ -930,6 +939,7 @@ mcp==1.27.0 \
     --hash=sha256:d3dc35a7eec0d458c1da4976a48f982097ddaab87e278c5511d5a4a56e852b83
     # via
     #   -r requirements-dev.in
+    #   claude-agent-sdk
     #   fastmcp
 mdurl==0.1.2 \
     --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8 \

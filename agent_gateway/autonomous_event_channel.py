@@ -283,8 +283,7 @@ def _snapshot_json_value(
   container_id = id(value)
   if container_id in state.seen_containers:
     raise AutonomousEventChannelProtocolError(
-      "autonomous event channel JSON must not reuse container identities "
-      "(including circular references)"
+      "autonomous event channel JSON must not contain circular references"
     )
   state.seen_containers[container_id] = value
   if byte_limit < 2:
@@ -338,6 +337,8 @@ def _snapshot_json_value(
     raise AutonomousEventChannelProtocolError(
       "autonomous event channel JSON mutated during snapshot"
     ) from exc
+  finally:
+    del state.seen_containers[container_id]
 
 
 def _canonical_json_snapshot(

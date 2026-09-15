@@ -5,11 +5,9 @@ import logging
 import re
 import secrets
 import time
+from collections.abc import Sequence
 from typing import Any, Callable, FrozenSet
 
-from agent_workflow_contracts.research_file_contract import (
-  extract_research_file_id as _extract_research_file_id_from_task,
-)
 from agent_workflow_contracts.ticker_contract import (
   is_entity_ticker,
   normalize_contract_ticker,
@@ -19,7 +17,29 @@ from .session import GatewaySession
 from .artifact_paths import canonicalize_ticker
 from .operation_catalog import AgentOperationCatalog
 from .skills import SkillLoader, SkillProfile, operation_tool_ids
-from .task_registry import ParentMessage
+
+def _render_agent_param_description(
+  entries: Sequence[tuple[Any, str]],
+) -> str:
+  base = (
+    "Full immutable AgentOperationRef. Omit to select the registered generic "
+    "explore operation. Bare methodology/skill names are not accepted."
+  )
+  if not entries:
+    return base
+  lines = [base, "", "Available operations:"]
+  for operation, description in entries:
+    lines.append(
+      f"- {operation.namespace}/{operation.name}@{operation.version} "
+      f"({operation.digest}): {description}"
+    )
+  return "\n".join(lines)
+
+
+def _catalog_operation_entries(
+  operation_source: SkillLoader | AgentOperationCatalog,
+) -> list[tuple[Any, str]]:
+  return list(operation_source.list_callable_operations_with_descriptions())
 
 log = logging.getLogger("agent_gateway.sub_agent")
 
@@ -39,14 +59,6 @@ _ARTIFACT_EMIT_TOOLS = frozenset({"emit_canvas_artifact", "emit_dashboard_artifa
 ExcludedToolsResolver = Callable[[], FrozenSet[str]]
 NeedsApprovalResolver = Callable[[FrozenSet[str]], Callable[..., bool] | None]
 MutationModeExclusionsApplier = Callable[..., set[str]]
-_SKILL_SYSTEM_PROMPT_TEMPLATE = (
-  "{skill_prompt}\n\n"
-  "Today's date: {date}\n\n"
-  "You are a focused sub-agent working on behalf of another agent. Complete the assigned task "
-  "thoroughly and return a clear, concise response for the parent agent. If any tool fails or "
-  "returns suspicious data, note that explicitly instead of silently proceeding. You cannot "
-  "spawn further sub-agents."
-)
 _DEFAULT_SYSTEM_PROMPT_TEMPLATE = (
   "You are a focused sub-agent working on behalf of another agent. Complete the assigned task "
   "thoroughly and return a clear, concise response for the parent agent. If any tool fails or "
@@ -136,23 +148,6 @@ def _artifact_storage_user_id(parent_session: GatewaySession | None, fallback_us
   return fallback_user_id
 
 
-def _render_agent_param_description(entries: list[tuple[Any, str]]) -> str:
-  base = (
-    "Full immutable AgentOperationRef. Omit to select the registered generic "
-    "explore operation. Bare methodology/skill names are not accepted."
-  )
-  if not entries:
-    return base
-  lines = [base, "", "Available operations:"]
-  lines.extend(
-    (
-      f"- {operation.namespace}/{operation.name}@{operation.version} "
-      f"({operation.digest}): {description}"
-    )
-    for operation, description in entries
-  )
-  return "\n".join(lines)
-
 
 def _extract_ticker_from_task(task: str) -> str | None:
   candidates: list[str] = []
@@ -220,62 +215,6 @@ def _optional_research_file_id(value: object | None, *, default: int | None = No
   if default is not None and parsed != default:
     raise ValueError("research_file_id does not match the active context")
   return parsed
-
-
-def _message_content_text(content: Any) -> str:
-  if isinstance(content, str):
-    return content
-  if not isinstance(content, list):
-    return ""
-
-  parts: list[str] = []
-  for block in content:
-    if isinstance(block, str):
-      parts.append(block)
-      continue
-    if not isinstance(block, dict):
-      continue
-    for key in ("text", "content"):
-      value = block.get(key)
-      if isinstance(value, str):
-        parts.append(value)
-        break
-  return "\n".join(parts)
-
-
-def _extract_research_file_id_from_resume_messages(
-  reconstructed_messages: list[dict[str, Any]],
-  parent_messages: list[ParentMessage],
-  additional_context: str | None,
-) -> int | None:
-  for message in reconstructed_messages:
-    if message.get("role") != "user":
-      continue
-    research_file_id = _extract_research_file_id_from_task(_message_content_text(message.get("content")))
-    if research_file_id is not None:
-      return research_file_id
-    break
-  for message in parent_messages:
-    research_file_id = _extract_research_file_id_from_task(message.text)
-    if research_file_id is not None:
-      return research_file_id
-  return _extract_research_file_id_from_task(additional_context or "")
-
-
-def _artifact_ticker(profile: SkillProfile, context_ticker: str) -> str | None:
-  return canonicalize_ticker(context_ticker) if profile.scope == "ticker" and context_ticker else None
-
-
-def _artifact_scope(profile: SkillProfile, context_ticker: str) -> str:
-  return "ticker" if _artifact_ticker(profile, context_ticker) else "portfolio"
-
-
-def _dashboard_artifact_ticker(profile: SkillProfile, context_ticker: str) -> str | None:
-  return canonicalize_ticker(context_ticker) if profile.scope == "ticker" and context_ticker else None
-
-
-def _dashboard_artifact_scope(profile: SkillProfile, context_ticker: str) -> str:
-  return "ticker" if _dashboard_artifact_ticker(profile, context_ticker) else "portfolio"
 
 
 def _artifact_ticker_for_scope(
@@ -368,42 +307,34 @@ def _install_emit_canvas_artifact_handler(
   artifact_storage_user_id = _artifact_storage_user_id(parent_session, fallback_user_id)
 
   async def _handle_emit_canvas_artifact(tool_input: dict[str, Any], **_: Any):
-    try:
-      from memory import get_workspace_dir
-      from schema.thesis_shared_slice import SourceRecord
-      from .canvas_artifact_pipeline import emit_canvas_artifact_async
+    from memory import get_workspace_dir
+    from .canvas_artifact_pipeline import emit_canvas_artifact_async
 
-      raw_sources = tool_input.get("sources") or []
-      if not isinstance(raw_sources, list):
-        raise ValueError("sources must be a list")
-      research_file_id = _optional_research_file_id(
-        tool_input.get("research_file_id"), default=context_research_file_id,
-      )
-      def _emit_canvas_event(event: dict[str, Any]) -> None:
-        emit_parent_event(event)
+    research_file_id = _optional_research_file_id(
+      tool_input.get("research_file_id"), default=context_research_file_id,
+    )
+    def _emit_canvas_event(event: dict[str, Any]) -> None:
+      emit_parent_event(event)
 
-      result = await emit_canvas_artifact_async(
-        workspace_dir=get_workspace_dir(artifact_storage_user_id), preflight=preflight,
-        title=str(tool_input["title"]), purpose=str(tool_input["purpose"]),
-        summary=str(tool_input["summary"]), tsx_source=str(tool_input["tsx_source"]),
-        copy_as_markdown=str(tool_input["copy_as_markdown"]),
-        copy_as_prompt=tool_input.get("copy_as_prompt"),
-        copy_as_json=tool_input.get("copy_as_json"),
-        sources=[SourceRecord.model_validate(value) for value in raw_sources],
-        source_skill=resolved_skill_name, skill_run_id=skill_run_id,
-        ticker=_artifact_ticker_for_scope(
-          resolved_scope,
-          _current_context_ticker(context_ticker),
-        ),
-        session_id=str(getattr(parent_session, "session_id", "") or "").strip() or None,
-        research_file_id=research_file_id,
-        control_run_id=str(getattr(parent_session, "session_id", "") or "").strip() or None,
-        user_id=artifact_storage_user_id or "", emit_event=_emit_canvas_event,
-      )
-      return result, None
-    except Exception as exc:
-      log.warning("emit_canvas_artifact failed: %s", exc)
-      return None, {"code": "internal_error", "message": str(exc)}
+    result = await emit_canvas_artifact_async(
+      workspace_dir=get_workspace_dir(artifact_storage_user_id), preflight=preflight,
+      title=str(tool_input["title"]), purpose=str(tool_input["purpose"]),
+      summary=str(tool_input["summary"]), tsx_source=str(tool_input["tsx_source"]),
+      copy_as_markdown=str(tool_input["copy_as_markdown"]),
+      copy_as_prompt=tool_input.get("copy_as_prompt"),
+      copy_as_json=tool_input.get("copy_as_json"),
+      sources=tool_input.get("sources"),
+      source_skill=resolved_skill_name, skill_run_id=skill_run_id,
+      ticker=_artifact_ticker_for_scope(
+        resolved_scope,
+        _current_context_ticker(context_ticker),
+      ),
+      session_id=str(getattr(parent_session, "session_id", "") or "").strip() or None,
+      research_file_id=research_file_id,
+      control_run_id=str(getattr(parent_session, "session_id", "") or "").strip() or None,
+      user_id=artifact_storage_user_id or "", emit_event=_emit_canvas_event,
+    )
+    return result, None
 
   sub_local["emit_canvas_artifact"] = _handle_emit_canvas_artifact
   return True
@@ -534,11 +465,11 @@ def make_run_agent_tool_def(
 ) -> dict[str, Any]:
   """Build the public tool schema for `run_agent`.
 
-  When an operation source is provided, the operation description includes the
-  currently available immutable operation identities.
+  When an operation source is provided, each listed operation includes its
+  full immutable reference and parent-facing dispatch description.
   """
   operations = (
-    operation_source.list_callable_operations_with_descriptions()
+    _catalog_operation_entries(operation_source)
     if operation_source is not None
     else []
   )

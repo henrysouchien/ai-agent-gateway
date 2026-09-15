@@ -46,8 +46,10 @@ def map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Strea
     detail = str(event.get("message") or event.get("code") or json.dumps(event, separators=(",", ":")))
     raise RuntimeError(f"xAI error: {detail}")
   if event_type == "response.failed":
-    response = event.get("response") if isinstance(event.get("response"), dict) else {}
-    error = response.get("error") if isinstance(response.get("error"), dict) else {}
+    response_value = event.get("response")
+    response = response_value if isinstance(response_value, dict) else {}
+    error_value = response.get("error")
+    error = error_value if isinstance(error_value, dict) else {}
     detail = str(error.get("message") or "xAI response failed")
     raise RuntimeError(f"xAI response failed: {detail}")
   had_active_tool = state.current_block_type == "tool_use"
@@ -56,12 +58,14 @@ def map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Strea
   # separate argument delta events. Preserve the normal start/delta/end
   # gateway lifecycle in that case.
   if event_type == "response.output_item.added":
-    item = event.get("item") if isinstance(event.get("item"), dict) else {}
+    item_value = event.get("item")
+    item = item_value if isinstance(item_value, dict) else {}
     arguments = str(item.get("arguments") or "")
     if item.get("type") == "function_call" and arguments:
       mapped.append(StreamEvent(type="tool_use_delta", tool_input_json=arguments))
   elif event_type == "response.output_item.done" and not had_active_tool:
-    item = event.get("item") if isinstance(event.get("item"), dict) else {}
+    item_value = event.get("item")
+    item = item_value if isinstance(item_value, dict) else {}
     if item.get("type") == "function_call":
       call_id = str(item.get("call_id") or "")
       item_id = str(item.get("id") or "")

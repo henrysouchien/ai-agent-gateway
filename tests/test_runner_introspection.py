@@ -29,7 +29,7 @@ def test_runner_preserves_introspection_helper_aliases() -> None:
 
 def test_derive_sub_agent_id_accepts_session_objects_and_plain_ids() -> None:
   assert derive_sub_agent_id(SimpleNamespace(session_id="parent-session"), 3) == "sub3:parent-session"
-  assert derive_sub_agent_id("raw-parent", "4") == "sub4:raw-parent"
+  assert derive_sub_agent_id("raw-parent", 4) == "sub4:raw-parent"
   assert derive_sub_agent_id(SimpleNamespace(session_id=""), 0) == "sub0:"
 
 

@@ -9,7 +9,7 @@ import hashlib
 import json
 import re
 import time
-from typing import Callable, Mapping
+from typing import Callable, Literal, Mapping
 from uuid import UUID
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -33,6 +33,13 @@ WORK_AUTHORIZATION_REQUIRED_FIELDS = frozenset({
   "funding_route_id", "provider", "billing_mode", "reservation_id",
   "operation", "capability_id", "request_id", "session_id", "iat", "exp",
 })
+
+
+def _load_ed25519_public_key(pem: bytes) -> Ed25519PublicKey:
+  key = load_pem_public_key(pem)
+  if not isinstance(key, Ed25519PublicKey):
+    raise ValueError("work authorization verification keys must be Ed25519")
+  return key
 
 
 class WorkAuthorizationError(ValueError):
@@ -62,9 +69,7 @@ class WorkAuthorizationTrustSnapshot:
     for key_id, pem in self.public_keys_by_id.items():
       if not _CODE.fullmatch(key_id):
         raise ValueError("work authorization verification key id is invalid")
-      key = load_pem_public_key(pem)
-      if not isinstance(key, Ed25519PublicKey):
-        raise ValueError("work authorization verification keys must be Ed25519")
+      _load_ed25519_public_key(pem)
       retired_at = self.retired_at_by_key_id[key_id]
       if retired_at is not None and (type(retired_at) is not int or retired_at <= 0):
         raise ValueError("work authorization retirement cutoff is invalid")
@@ -108,7 +113,7 @@ class VerifiedWorkAuthorization:
   primary_inference_observability: str
   funding_route_id: UUID
   provider: str
-  billing_mode: str
+  billing_mode: Literal["byok", "metered"]
   reservation_id: UUID | None
   operation: str
   capability_id: str | None
@@ -126,7 +131,7 @@ class WorkAuthorizationVerifier:
     clock: Callable[[], int] | None = None,
   ) -> None:
     self._keys = {
-      key_id: load_pem_public_key(pem)
+      key_id: _load_ed25519_public_key(pem)
       for key_id, pem in trust.public_keys_by_id.items()
     }
     self._environment = trust.environment

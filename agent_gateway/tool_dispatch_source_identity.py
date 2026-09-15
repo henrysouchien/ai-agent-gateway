@@ -48,6 +48,10 @@ CANONICAL_TRANSCRIPT_DOCUMENT_ID_RE = re.compile(
 )
 CANONICAL_DOC_DOCUMENT_ID_RE = re.compile(r"^doc:[0-9a-f]{32}$")
 CANONICAL_WEB_DOCUMENT_ID_RE = re.compile(r"^web:([0-9a-fA-F]{64})$")
+HANDLE_ELIGIBLE_SANDBOX_COMPUTATION_FUNCTIONS = frozenset(
+  {"load_statements", "render_sourced_table"}
+)
+SANDBOX_COMPUTATION_DOCUMENT_ID_PREFIX = "sandbox:"
 
 _CANONICAL_EDGAR_DOCUMENT_ACCESSION_RE = re.compile(
   r"^edgar:(\d{10}-\d{2}-\d{6})(?:/[A-Za-z0-9._-]+\.[A-Za-z0-9]+)?$"
@@ -66,6 +70,52 @@ def _required_str(value: Any) -> str | None:
     return None
   text = str(value).strip()
   return text or None
+
+
+def sandbox_computation_document_id(function: str, output_sha256: str) -> str:
+  """Mint the stable document id for one sandbox computation result."""
+
+  return (
+    f"{SANDBOX_COMPUTATION_DOCUMENT_ID_PREFIX}{function}:"
+    f"sha={output_sha256[:12]}"
+  )
+
+
+def sandbox_computation_source_rows(
+  result: Any,
+) -> tuple[tuple[str, dict[str, Any]], ...]:
+  """Return eligible computation document ids with normalized sidecars."""
+
+  if not isinstance(result, dict):
+    return ()
+  if result.get("return_code") != 0 or result.get("timed_out"):
+    return ()
+  computations = result.get("computations")
+  if not isinstance(computations, list) or not computations:
+    return ()
+
+  rows: list[tuple[str, dict[str, Any]]] = []
+  for entry in computations:
+    if not isinstance(entry, dict):
+      continue
+    function = _required_str(entry.get("function"))
+    if function not in HANDLE_ELIGIBLE_SANDBOX_COMPUTATION_FUNCTIONS:
+      continue
+    output_hash = _required_str(entry.get("output_sha256"))
+    tool_version = _required_str(entry.get("tool_version"))
+    if not output_hash or not tool_version:
+      continue
+    normalized_entry = dict(entry)
+    normalized_entry.update({
+      "function": function,
+      "output_sha256": output_hash,
+      "tool_version": tool_version,
+    })
+    rows.append((
+      sandbox_computation_document_id(function, output_hash),
+      normalized_entry,
+    ))
+  return tuple(rows)
 
 
 def _optional_str(value: Any) -> str | None:
@@ -710,6 +760,16 @@ def _read_metric_citations(result: Mapping[str, Any]) -> list[dict[str, Any]]:
   return identities
 
 
+def _read_sandbox_computations(
+  result: Mapping[str, Any],
+  _descriptor: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+  return [
+    {"document_id": document_id, "source_kind": "computation"}
+    for document_id, _entry in sandbox_computation_source_rows(result)
+  ]
+
+
 _READERS = {
   "web_fetch": lambda result, descriptor: _read_web_fetch(result),
   "search_hits": _read_search_hits,
@@ -722,6 +782,7 @@ _READERS = {
     lambda result, descriptor: _read_parser_filing_sections(result)
   ),
   "metric_citations": lambda result, descriptor: _read_metric_citations(result),
+  "sandbox_computations": _read_sandbox_computations,
 }
 
 
@@ -754,10 +815,14 @@ def read_source_identities(
 
 
 __all__ = [
+  "HANDLE_ELIGIBLE_SANDBOX_COMPUTATION_FUNCTIONS",
+  "SANDBOX_COMPUTATION_DOCUMENT_ID_PREFIX",
   "UnknownSourceIdentityDescriptor",
   "canonicalize_filing_document_id",
   "canonicalize_transcript_document_id",
   "canonicalize_web_document_id",
   "normalize_citation_document_id",
   "read_source_identities",
+  "sandbox_computation_document_id",
+  "sandbox_computation_source_rows",
 ]

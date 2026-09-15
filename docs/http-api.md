@@ -10,7 +10,10 @@ By default the API is mounted under `/api`. If you set `GatewayServerConfig.pref
 - `POST /chat/tool-result` returns JSON
 - `POST /chat/tool-approval` returns JSON
 - `POST /chat/cancel` returns JSON
+- `POST /chat/recap` returns JSON
 - `GET /chat/subscribe` returns an SSE stream for an active turn
+- `GET /workflow-outputs/{workflow_run_id}/{output_id}` returns canonical output bytes
+- artifact, UI-block, letter, and control-plane reads return JSON or file content
 - `GET /health` returns JSON
 - `POST /chat` returns an SSE stream
 
@@ -25,6 +28,8 @@ Stream schema version is selected once at `POST /chat/init` and echoed on every 
 4. Your client sends that token as `Authorization: Bearer <session_token>` on chat and tool loop requests.
 
 If `valid_api_keys` is empty, any non-empty API key is accepted.
+Without a credentials resolver, session init must also supply a stable
+top-level `user_id`; a configured resolver owns that identity instead.
 
 ## Endpoints
 
@@ -154,8 +159,10 @@ Notes:
 - Stream envelopes have the shape `{seq, session_id, schema_version, event}`. For schema v1, the server projects each event through the v1 adapter, strips fields added after the v1 freeze, and skips event types not in the v1 wire contract while preserving cursor sequence gaps.
 - The server resolves only eligible stable keys from its exact model registry and
   selection policy. Raw upstream model names are rejected.
-- Recommended `context.channel` values: `web`, `cli`, `telegram`, `bot`. The field is free-form; gateways may route or scope behavior on the channel value, and analytics commonly use it. Planned reference dev clients (the in-flight `@ai-agent-gateway/tui` and `ai-agent-gateway-cli` packages) will send `"cli"` as the canonical dev-surface value.
-- `create_agent()` resolves the runtime for you. `create_gateway_app()` calls your `build_chat_runtime(session, request, channel, auth_manager)`.
+- Recommended `context.channel` values: `web`, `cli`, `telegram`, `bot`. The
+  field is free-form; gateways may route or scope behavior on it. Reference
+  TUI and CLI clients use `"cli"`.
+- `create_agent()` resolves the runtime for you. `create_gateway_app()` calls your `build_chat_runtime(session, request, channel, auth_manager, storage_root=...)`; a builder must accept the keyword-only `storage_root` (default `None`).
 
 Example:
 
@@ -171,6 +178,36 @@ curl -N http://127.0.0.1:8000/api/chat \
     "user_id": "alice"
   }'
 ```
+
+### GET /api/chat/subscribe
+
+Resume or add a subscriber to the bearer-token session's active SSE turn.
+Optional query parameters are `session_id` (must match the token), `after_seq`
+(non-negative cursor, default `0`), and `client_label`. The negotiated schema
+version comes from session init and cannot be changed here. A session with no
+active turn returns `404`.
+
+```bash
+curl -N "http://127.0.0.1:8000/api/chat/subscribe?after_seq=17" \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+```
+
+### POST /api/chat/recap
+
+Return a typed `session_recap` for the bearer-token session. `scope` is
+`active_turn` (default) or `session_cumulative`.
+
+```json
+{"session_id":"sess_1234abcd5678","scope":"active_turn"}
+```
+
+### GET /api/workflow-outputs/{workflow_run_id}/{output_id}
+
+Return the exact canonical bytes for a durable workflow-output attachment in
+the bearer-token session. Use `?download=true` for attachment disposition.
+The response includes `ETag`, `X-Content-SHA256`, and `X-Workflow-Output-Id`;
+missing, unavailable, and integrity-failed output paths return structured
+`404`, `503`, and `409` responses respectively.
 
 ### PUT /api/model-preferences/{capability_id}
 
@@ -346,11 +383,18 @@ curl -s http://127.0.0.1:8000/api/health
 
 ### Artifact endpoints
 
-Added in 0.15.0. Four read-only GET endpoints serve artifact JSON sidecars and `.docx` letter binaries from per-user workspace storage (`data/users/<user>/workspace/artifacts/` and `.../letters/`). The artifact files are written server-side by structured report doors or artifact-producing tools; these endpoints are read-only.
+Read-only GET endpoints serve artifact JSON sidecars, UI-block payloads, and
+letter binaries from per-user workspace storage. Artifact files are written
+server-side by structured report doors or artifact-producing tools.
 
-**Auth: signed end-user claim, not session JWT.** Each request must carry seven `X-Agent-Claim-*` headers (`Audience`, `Issued-At`, `Expiry`, `User-Id`, `User-Email`, `Nonce`, `Signature`). The signature is HMAC-SHA256 over `audience\nissued_at\nexpiry\nuser_id\nuser_email\nnonce` using a key the gateway operator pre-shares with the artifact client. This is the same signed-claim scheme Theme A introduced for `POST /api/chat/init`; the verifier is shared.
+**Auth.** Requests may use the gateway session bearer token. Clients without a
+session may instead send all seven signed `X-Agent-Claim-*` headers
+(`Audience`, `Issued-At`, `Expiry`, `User-Id`, `User-Email`, `Nonce`,
+`Signature`); the configured claim-signing authority verifies their HMAC and
+expiry.
 
-**Path safety.** All four endpoints reject:
+**Path safety.** Artifact and letter endpoints reject:
+
 - `..`-traversal (raw and URL-encoded)
 - Symlink escape outside the user's workspace
 - Cross-user access (404, not 403, to avoid info-leak)
@@ -421,9 +465,27 @@ Status codes:
 
 Response headers: `Cache-Control: private, max-age=0` + weak `ETag` (same scheme as JSON endpoints).
 
+#### GET /api/ui-blocks/{ui_blocks_id}
+
+Return the stored UI-block JSON payload for an authenticated user. It uses the
+same bearer-or-signed-claim authentication and path-safety boundary as the
+artifact reads.
+
+### Control plane
+
+`create_gateway_app()` also mounts the authenticated `/api/control` surface.
+It owns control sessions, profiles, skills, schedules, runs and continuations,
+batches, approvals, event streams, readable resources, artifacts, and health.
+Dashboard, canvas, and HTML artifact routers are mounted under `/api` as well.
+Use the generated OpenAPI document for exact control-plane request and response
+models; those routes are intended for operator clients rather than the basic
+chat flow.
+
 ## SSE Event Types
 
-Each SSE message is a JSON object under a `data:` line.
+Each SSE message is a JSON object under a `data:` line with the envelope
+`{"seq": ..., "session_id": ..., "schema_version": 1, "event": {...}}`.
+The schemas below describe the inner `event` object.
 
 ### Core Events
 
@@ -567,10 +629,17 @@ Schema:
     "output_tokens": 45,
     "cache_creation_input_tokens": 0,
     "cache_read_input_tokens": 0,
-    "estimated_cost": 0.0012
+    "estimated_cost": 0.0012,
+    "est_system_tokens": 5344,
+    "est_tools_tokens": 12980
   }
 }
 ```
+
+`est_system_tokens` and `est_tools_tokens` come from the server's
+`TokenEstimateSnapshot`. They are character-derived `chars/4` proxies for the
+turn's system-prompt and tool-definition sections, respectively, not provider
+token counts.
 
 `terminal_disposition` is `"completed"` or `"interrupted"`. Interrupted
 closures also carry a machine-readable `reason`, such as `"operator_pause"`,
@@ -940,7 +1009,7 @@ Additional fields:
 | --- | --- | --- |
 | `final_state` | string | Final task state. Current runner emission uses `completed`, `failed`, or `killed`. |
 | `completed_at` | number | Unix timestamp when the completion event was appended |
-| `result` | `ChildReturn v1` object or null | Canonical background child result. `kind: report` is authoritative; `kind: unstructured` carries a typed terminal failure reason. |
+| `result` | object or null | Terminal result retained by the task contract. Consumers should use its typed fields and referenced content rather than parse free-form relay text. |
 | `error` | object or null | Background task error payload |
 
 #### `parent_message_sent`
@@ -980,9 +1049,17 @@ Additional fields:
 | `sent_at` | number | Unix timestamp when the parent message was sent |
 | `message` | string | Message text delivered to the sub-agent |
 
-### Skill Framework Events
+### Typed Domain Events
 
-Added in 0.15.0. Six typed events emitted when the host wires up the skill-framework profile contract — running an embedder that does not set `skill_run_id` + `profile` on sub-agent calls will never see these. Five carry a `skill_run_id` for run correlation; `artifact_unavailable` is renderer-side only and has no run. The Python dataclasses live in `agent_gateway.events` (see api-reference.md).
+The canonical frozen dataclasses and complete 14-type union live in
+`agent_gateway.events` (see [API reference](./api-reference.md)). Seven types
+are run-scoped: `skill_run_started`, `skill_result_captured`, `artifact_ready`,
+`ui_blocks_ready`, `artifact_updated`, `aggregate_ready`, and
+`artifact_failed`. The remaining types are `agent_completion`,
+`workflow_output_attached`, `typed_recommendations_extracted`,
+`artifact_unavailable`, `tool_approval_request`, `tool_approval_decided`, and
+`session_recap`. The representative payloads below cover the core skill and
+artifact lifecycle; use the dataclasses for exact fields of every type.
 
 #### `skill_run_started`
 
@@ -994,6 +1071,8 @@ Emitted once at the start of a skill-framework sub-agent run.
   "skill_run_id": "run_8a3f",
   "skill": "fundamental-research",
   "ticker": "AAPL",
+  "scope": "ticker",
+  "portfolio_id": null,
   "ts": 1770000000.0
 }
 ```
@@ -1008,6 +1087,8 @@ Emitted when the runtime captures a structured skill result envelope.
   "skill_run_id": "run_8a3f",
   "skill": "fundamental-research",
   "ticker": "AAPL",
+  "scope": "ticker",
+  "portfolio_id": null,
   "exit_code": 0,
   "outcome": "success",
   "status": "noop",
@@ -1031,6 +1112,8 @@ Emitted when the runtime captures a structured skill result envelope.
 ```
 
 `compaction_count` is the non-negative number of context-compaction events observed during the skill run; legacy captures that omit it decode as zero. `verdict_echo` is optional; when present it is the UI/control-plane verdict summary source. It is produced by structured tools and FMS envelopes, not by parsing final markdown.
+The event may also carry `approval_outcome`, `approval_id`, and
+`approval_tool_name`.
 
 #### `artifact_ready`
 
@@ -1047,6 +1130,8 @@ Emitted when a structured report door or artifact-producing tool writes a JSON s
   "binary_artifact_path": "data/users/alice/workspace/letters/AAPL/20260520T173401.docx",
   "contract_name": "fundamental_research_v1",
   "data_source": "live",
+  "scope": "ticker",
+  "portfolio_id": null,
   "ts": 1770000010.0
 }
 ```
@@ -1088,7 +1173,7 @@ Emitted when a structured report door or artifact-producing tool fails to produc
 }
 ```
 
-`error_code` is one of `"validation" | "missing_contract" | "schema_drift" | "tool_write_failed" | "other"`.
+`error_code` is one of `"validation" | "missing_contract" | "schema_drift" | "tool_write_failed" | "other"`; `tool_call_id` may also be present.
 
 #### `artifact_unavailable`
 

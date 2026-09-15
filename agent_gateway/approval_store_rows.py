@@ -133,6 +133,8 @@ def request_to_row(request: ApprovalRequest) -> dict[str, Any]:
     "authorization_mode": request.authorization_mode,
     "grant_reference": request.grant_reference,
     "cache_reference": request.cache_reference,
+    "approval_reuse_mode": request.approval_reuse_mode,
+    "approval_reuse_key": request.approval_reuse_key,
   }
 
 
@@ -164,7 +166,7 @@ def row_to_request(row: sqlite3.Row) -> ApprovalRequest:
     expires_at=dt_from_text(row["expires_at"]),
     decider_id=row["decider_id"],
     decider_role=row["decider_role"],
-    decision=row["decision"],  # type: ignore[arg-type]
+    decision=row["decision"],
     decision_reason=row["decision_reason"],
     args_predicate=json_loads(row["args_predicate"]),
     policy_id=str(row["policy_id"]),
@@ -211,6 +213,17 @@ def row_to_request(row: sqlite3.Row) -> ApprovalRequest:
     cache_reference=(
       row["cache_reference"] if "cache_reference" in columns else None
     ),
+    approval_reuse_mode=(
+      row["approval_reuse_mode"]
+      if "approval_reuse_mode" in columns
+      and row["approval_reuse_mode"] is not None
+      else "legacy"
+    ),
+    approval_reuse_key=(
+      row["approval_reuse_key"]
+      if "approval_reuse_key" in columns
+      else None
+    ),
   )
 
 
@@ -240,7 +253,7 @@ def row_to_delegation_grant(row: sqlite3.Row) -> DelegationGrant:
     bound_excel_session_id=str(row["bound_excel_session_id"]),
     bound_relay_request_id=str(row["bound_relay_request_id"]),
     bound_workbook=row["bound_workbook"],
-    tool_class_ceiling=frozenset(json_loads(row["tool_class_ceiling"]) or []),  # type: ignore[arg-type]
+    tool_class_ceiling=frozenset(json_loads(row["tool_class_ceiling"]) or []),
     args_predicate=json_loads(row["args_predicate"]),
     window_seconds=int(row["window_seconds"]),
     exclude_external_write_bypass=bool(row["exclude_external_write_bypass"]),

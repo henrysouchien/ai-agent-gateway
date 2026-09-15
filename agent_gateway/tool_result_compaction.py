@@ -5,14 +5,7 @@ import os
 import uuid
 from typing import Any, Callable, Dict
 
-from .tool_result_spill import (
-  SPILL_LANE_CODE_EXECUTE,
-  SPILL_LANE_FILE_TOOLS,
-  SpillPublication,
-  SpillSink,
-  normalize_spill_sink,
-  write_spill_set,
-)
+from .tool_result_spill import SpillPublication, SpillSink, normalize_spill_sink, write_spill_set
 from .tool_result_semantics import status_error_has_detail
 
 MODEL_TOOL_RESULT_MAX_CHARS = 60_000
@@ -83,6 +76,15 @@ def _project_value(
 
   if isinstance(value, str):
     if len(value) <= max_string_chars:
+      return value
+    # Owner-minted context refs are shape, not bulk: whole or (envelope
+    # fallback) absent, never shortened. schema is a Hank checkout extra,
+    # not an ai-agent-gateway dependency — import only here.
+    try:
+      from schema.context_ref_wire import is_context_ref_wire_value
+    except ImportError:
+      is_context_ref_wire_value = None
+    if is_context_ref_wire_value is not None and is_context_ref_wire_value(value):
       return value
     return f"{value[:max_string_chars]}{_ELIDED_CHARS_MARKER}{len(value) - max_string_chars}>"
   if isinstance(value, (int, float, bool)) or value is None:
@@ -219,7 +221,8 @@ def _business_model_terminal_success_projection(
   if status is None or status.lower() in _ERROR_STATUSES:
     return None
 
-  readback = result.get("readback") if isinstance(result.get("readback"), dict) else {}
+  readback_value = result.get("readback")
+  readback = readback_value if isinstance(readback_value, dict) else {}
   verdict_candidates = (
     result.get("verdict"),
     result.get("verdict_echo"),
@@ -238,14 +241,16 @@ def _business_model_terminal_success_projection(
   if verdict is None:
     return None
 
+  typed_outputs_value = readback.get("typed_outputs")
   typed_outputs = (
-    readback.get("typed_outputs")
-    if isinstance(readback.get("typed_outputs"), dict)
+    typed_outputs_value
+    if isinstance(typed_outputs_value, dict)
     else {}
   )
+  stage_receipt_value = typed_outputs.get("business_model_stage_receipt")
   stage_receipt = (
-    typed_outputs.get("business_model_stage_receipt")
-    if isinstance(typed_outputs.get("business_model_stage_receipt"), dict)
+    stage_receipt_value
+    if isinstance(stage_receipt_value, dict)
     else {}
   )
   data_gaps = next(
@@ -330,7 +335,7 @@ def make_error_result(
   sub_code: str = "",
   data: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-  error_dict = {"code": code, "message": message}
+  error_dict: dict[str, Any] = {"code": code, "message": message}
   if sub_code:
     error_dict["sub_code"] = sub_code
   if data is not None:
@@ -382,9 +387,7 @@ def truncate_model_tool_result_content(
   *,
   tool_name: str,
   max_chars: int,
-  spill_filename: str | None = None,
-  spill_abspath: str | None = None,
-  spill_hint: str | None = None,
+  spill_ref: str | None = None,
   spill_summary: dict[str, Any] | None = None,
 ) -> tuple[str, bool]:
   if max_chars <= 0 or len(content) <= max_chars:
@@ -406,13 +409,11 @@ def truncate_model_tool_result_content(
       f"in place with {_ELIDED_ITEMS_KEY}, {_ELIDED_KEYS_KEY}, {_ELIDED_DEPTH_KEY}, or "
       f"'{_ELIDED_CHARS_MARKER}'. Unmarked values are complete and may be reported as-is. "
       "Narrow the tool query (filters, pagination, fewer fields) if you need the elided "
-      "detail. If a spill file is listed below, read it for the full result."
+      "detail. If a spill_ref is listed below, use tool_result_read for the full result."
     ),
   }
-  if spill_filename is not None:
-    payload["spill_file"] = spill_filename
-    payload["spill_abspath"] = spill_abspath
-    payload["spill_hint"] = spill_hint or _legacy_spill_hint(spill_filename)
+  if spill_ref is not None:
+    payload["spill_ref"] = spill_ref
     if spill_summary:
       payload["spill_summary"] = spill_summary
 
@@ -430,59 +431,20 @@ def truncate_model_tool_result_content(
     "original_chars": len(content),
     "message": "Tool result omitted from model context because it exceeded the configured payload limit.",
   }
-  if spill_filename is not None:
-    fallback_payload["spill_file"] = spill_filename
-    fallback_payload["spill_abspath"] = spill_abspath
-    fallback_payload["spill_hint"] = spill_hint or (
-      "The FULL, untruncated result was written to this file in your code_execute working directory."
-    )
+  if spill_ref is not None:
+    fallback_payload["spill_ref"] = spill_ref
     if spill_summary:
       fallback_payload["spill_summary"] = spill_summary
   return json.dumps(fallback_payload, default=str), True
 
 
-def _legacy_spill_hint(spill_filename: str) -> str:
-  return (
-    "The FULL, untruncated result was written to this file in your code_execute "
-    "working directory. Read it there instead of relying on this preview - e.g. "
-    f"in code_execute: `import pandas as pd; df = pd.read_json('{spill_filename}')` "
-    f"(or `json.load(open('{spill_filename}'))`). In run_bash/file_read, use the "
-    "absolute path (spill_abspath) instead of the bare name."
-  )
-
-
 def _publication_summary(publication: SpillPublication) -> dict[str, Any]:
   return {
+    "payload_kind": publication.payload_kind,
     "member_count": publication.member_count,
     "total_chars": publication.total_chars,
     "largest_members": list(publication.largest_members),
   }
-
-
-def _spill_hint(publication: SpillPublication, sink: SpillSink) -> str:
-  if publication.lane == SPILL_LANE_CODE_EXECUTE:
-    return _legacy_spill_hint(publication.filename)
-  if publication.lane == SPILL_LANE_FILE_TOOLS:
-    operations: list[str] = []
-    if sink.capabilities.file_read:
-      operations.append(
-        "page with `file_read(file_path=spill_abspath, offset=0, limit=3)` "
-        "(`limit=1` for `.chunks.txt` members)"
-      )
-    if sink.capabilities.file_grep:
-      operations.append(
-        "search an exact member with `file_grep(pattern=..., path=..., max_results=1, context_lines=1)`"
-      )
-    action = "; ".join(operations)
-    return (
-      "The full result is committed as the spill set described by this manifest. "
-      f"Use the manifest's bounded member list to {action}. Do not read a whole large file in one call; "
-      "that result will be truncated again."
-    )
-  return (
-    "The full result was retained as a run-scoped audit spill, but this run has no file/code reader. "
-    "Narrow or paginate the original tool call; an operator can inspect the audit artifact if needed."
-  )
 
 
 def compact_model_tool_result_entry(
@@ -562,12 +524,14 @@ def compact_model_tool_result_entry(
         content,
         tool_name=tool_name,
         max_chars=max_chars,
-        spill_filename=publication.filename,
-        spill_abspath=publication.abspath,
-        spill_hint=_spill_hint(publication, configured_sink),
+        spill_ref=(
+          publication.spill_ref
+          if configured_sink.capabilities.spill_read
+          else None
+        ),
         spill_summary=(
           _publication_summary(publication)
-          if publication.lane == SPILL_LANE_FILE_TOOLS
+          if configured_sink.capabilities.spill_read
           else None
         ),
       )

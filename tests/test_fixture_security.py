@@ -12,7 +12,7 @@ for path in (ROOT, PKG_DIR, API_DIR):
   if str(path) not in sys.path:
     sys.path.insert(0, str(path))
 
-from agent.profiles import load_profile
+from agent.profiles import load_profile, load_profile_composition
 from agent_gateway._provider_utils import _resolve_provider
 from agent_gateway.auth import AuthConfig
 from agent_gateway.providers import installed_adapter_providers
@@ -44,9 +44,10 @@ def test_product_provider_and_credentials_never_register_fixture(monkeypatch, ap
   assert "fixture.responses" not in installed_adapter_providers()
 
 
-def test_product_profile_registry_does_not_contain_fixture() -> None:
+@pytest.mark.parametrize("loader", [load_profile, load_profile_composition])
+def test_product_profile_loaders_do_not_resolve_fixture(loader) -> None:
   with pytest.raises(ModuleNotFoundError, match=r"agent\.profiles\._fixture"):
-    load_profile("_fixture")
+    loader("_fixture")
 
 
 def test_test_harness_can_inject_fixture_provider_and_profile_explicitly() -> None:
@@ -66,7 +67,7 @@ def test_test_harness_can_inject_fixture_provider_and_profile_explicitly() -> No
 
 
 def test_preserved_fixture_skill_records_remain_available_to_test_harnesses() -> None:
-  skills_root = ROOT / "api" / "memory" / "workspace" / "notes" / "skills"
+  skills_root = ROOT / "tests" / "fixtures" / "skills"
   names = {
     "fixture-sleep",
     "fixture-canvas-artifact",

@@ -4,6 +4,8 @@ import json
 from typing import Any
 
 _REPAIR_HINT_EXAMPLE_LIMIT = 600
+_DATA_GOT_DETAILS_ENTRY_LIMIT = 5
+_DATA_GOT_DETAILS_CHAR_LIMIT = 500
 
 
 def classify_semantic_tool_error(result: Any) -> dict[str, Any] | None:
@@ -40,10 +42,6 @@ def classify_semantic_tool_error(result: Any) -> dict[str, Any] | None:
     return payload
 
   return None
-
-
-def is_semantic_tool_error(result: Any) -> bool:
-  return classify_semantic_tool_error(result) is not None
 
 
 def _semantic_error_message(result: dict[str, Any], fallback: str) -> str:
@@ -162,12 +160,37 @@ def _format_validation_error(error: Any) -> str:
   return f"{location}: {message}" if location else message
 
 
+def _data_got_details_summary(result: dict[str, Any]) -> str:
+  data = result.get("data")
+  if not isinstance(data, dict):
+    return ""
+  raw_details = data.get("got")
+  if not isinstance(raw_details, list) or not raw_details:
+    return ""
+
+  formatted = [
+    text
+    for detail in raw_details[:_DATA_GOT_DETAILS_ENTRY_LIMIT]
+    if (text := _format_validation_error(detail))
+  ]
+  if not formatted:
+    return ""
+
+  summary = "details=" + "; ".join(formatted)
+  remaining = len(raw_details) - _DATA_GOT_DETAILS_ENTRY_LIMIT
+  if remaining > 0:
+    summary += f"; ... (+{remaining} more)"
+  if len(summary) > _DATA_GOT_DETAILS_CHAR_LIMIT:
+    summary = summary[: _DATA_GOT_DETAILS_CHAR_LIMIT - 3].rstrip() + "..."
+  return summary
+
+
 def _validation_errors_summary(result: dict[str, Any]) -> str:
   raw_errors = result.get("validation_errors")
   if not isinstance(raw_errors, list) or not raw_errors:
     raw_errors = result.get("errors")
   if not isinstance(raw_errors, list) or not raw_errors:
-    return ""
+    return _data_got_details_summary(result)
 
   limit = 4
   formatted = [

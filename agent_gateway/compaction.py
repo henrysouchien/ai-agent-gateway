@@ -12,11 +12,7 @@ from .capability_execution import BoundCapabilityExecution
 from .child_result_trust import UNTRUSTED_CHILD_RESULTS_POLICY
 from .product_config import gateway_product_id
 from .provider_summarize import DEFAULT_SUMMARY_SYSTEM_PROMPT, _provider_summarize
-from .secret_boundary import (
-  sanitize_boundary_value,
-  sanitize_tool_event,
-  sanitization_failure_tool_input,
-)
+from .secret_boundary import sanitize_tool_event
 
 
 LOGGER = logging.getLogger("agent_gateway.compaction")
@@ -43,17 +39,6 @@ _SUMMARY_BULK_KEYS = {
   "tables",
   "text",
 }
-
-
-def _redact_tool_input_for_summary(tool_name: str, tool_input: Any) -> Any:
-  if not isinstance(tool_input, dict):
-    return sanitize_boundary_value(tool_input, sink="compaction_prompt")
-  try:
-    from agent.shared.tool_redaction import get_audit_hmac_secret, redact_tool_input
-
-    return redact_tool_input(tool_name, tool_input, deployment_secret=get_audit_hmac_secret())
-  except Exception:
-    return sanitization_failure_tool_input()
 
 
 @dataclass(frozen=True)
@@ -134,7 +119,7 @@ def _flatten_content_blocks(content_blocks: Any) -> str:
       continue
     if block_type in {"tool_use", "server_tool_use"}:
       name = str(block.get("name") or "tool")
-      tool_input = _stringify(_compact_for_summary(_redact_tool_input_for_summary(name, block.get("input"))))
+      tool_input = _stringify(_compact_for_summary(block.get("input")))
       parts.append(f"[tool_use] {name} input={tool_input}")
       continue
     if block_type == "compaction":
@@ -172,7 +157,7 @@ def _format_entry_for_summary(entry: LogEntry) -> str | None:
   if event_type == "tool_call_start":
     tool_name = str(event.get("tool_name") or "tool")
     tool_call_id = str(event.get("tool_call_id") or "")
-    tool_input = _stringify(_compact_for_summary(_redact_tool_input_for_summary(tool_name, event.get("tool_input"))))
+    tool_input = _stringify(_compact_for_summary(event.get("tool_input")))
     return f"{prefix} tool={tool_name} tool_call_id={tool_call_id} input={tool_input}"
 
   if event_type == "tool_call_complete":

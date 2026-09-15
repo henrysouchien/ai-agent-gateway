@@ -20,14 +20,17 @@ for path in (PKG_DIR, API_DIR):
 
 from agent.shared.dashboard_artifact_tool import install_named_skill_emit_dashboard_artifact_handler
 from agent_gateway import AgentRunner, EventLog, ToolDispatcher
+from agent_gateway.mcp_client import McpClientManager
+from agent_gateway.tool_dispatcher_helpers import ToolResult
 from schema.dashboard_payload import DashboardPayload
-from tests.capability_execution_test_support import (  # noqa: E402
+from tests.capability_execution_test_support import (
   stub_runner_capability_execution,
 )
 from tests.deterministic_fixture_support import (
   FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME,
   FIXTURE_MODEL_ID,
   FixtureProvider,
+  compile_fixture_skills,
 )
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -37,17 +40,39 @@ if str(TESTS_DIR) not in sys.path:
 from test_artifact_api import ArtifactApiFixture, USER_ID, _signed_headers, artifact_api  # noqa: F401
 
 
-class _NullMcpClient:
-  def is_mcp_tool(self, _name: str) -> bool:
+class _NullMcpClient(McpClientManager):
+  def __init__(self) -> None:
+    super().__init__(config_path=None)
+
+  def is_mcp_tool(self, name: str) -> bool:
+    _ = name
     return False
 
-  def get_server_for_tool(self, _name: str) -> str | None:
+  def get_server_for_tool(self, name: str) -> str | None:
+    _ = name
     return None
 
   def get_tool_definitions(self) -> list[dict[str, Any]]:
     return []
 
-  async def call_tool(self, name: str, _tool_input: dict[str, Any], **_kwargs: Any):
+  async def call_tool(
+    self,
+    name: str,
+    tool_input: object,
+    meta: object | None = None,
+    abort_event: asyncio.Event | None = None,
+    gateway_session: object | None = None,
+    allow_uncertain_replay: bool = True,
+    trusted_dispatch_scope: object | None = None,
+  ) -> ToolResult:
+    _ = (
+      tool_input,
+      meta,
+      abort_event,
+      gateway_session,
+      allow_uncertain_replay,
+      trusted_dispatch_scope,
+    )
     return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
 
 
@@ -61,19 +86,20 @@ def test_fixture_provider_run_emits_dashboard_artifact_and_endpoints_serve(
   normalized_payload = DashboardPayload.model_validate(fixture_payload).model_dump(mode="json")
   workspace = _workspace(artifact_api)
   event_log = EventLog()
+  def emit_event(event: dict[str, Any]) -> None:
+    event_log.append(event)
   local_handlers: dict[str, Any] = {}
   installed = install_named_skill_emit_dashboard_artifact_handler(
     local_handlers=local_handlers,
-    skill_profile=SimpleNamespace(
-      name=FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME,
-      mutation_mode="read_only",
-    ),
+    skill_definition=compile_fixture_skills().definitions[
+      FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME
+    ],
     skill_run_id="fixture-dashboard-run",
     context_ticker="PCTY",
     skill_scope="ticker",
     workspace_dir=workspace,
     excluded_tools=frozenset(),
-    emit_event=event_log.append,
+    emit_event=emit_event,
   )
   assert installed is True
 
@@ -165,18 +191,19 @@ def test_emit_dashboard_artifact_failing_payload_returns_error_without_write_or_
   workspace = _workspace(artifact_api)
   event_log = EventLog()
   local_handlers: dict[str, Any] = {}
+  def emit_event(event: dict[str, Any]) -> None:
+    event_log.append(event)
   install_named_skill_emit_dashboard_artifact_handler(
     local_handlers=local_handlers,
-    skill_profile=SimpleNamespace(
-      name=FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME,
-      mutation_mode="read_only",
-    ),
+    skill_definition=compile_fixture_skills().definitions[
+      FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME
+    ],
     skill_run_id="fixture-dashboard-run",
     context_ticker="PCTY",
     skill_scope="ticker",
     workspace_dir=workspace,
     excluded_tools=frozenset(),
-    emit_event=event_log.append,
+    emit_event=emit_event,
   )
 
   result, error = asyncio.run(
