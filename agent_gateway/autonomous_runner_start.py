@@ -281,7 +281,6 @@ def _pinned_autonomous_child_pythonpath(
       "LOCAL_GATEWAY_RUNTIME_VERSION_ROOT must be absolute"
     )
   ai_root = version_root / "ai-excel-addin"
-  risk_root = version_root / "risk_module"
   return os.pathsep.join(str(path) for path in (
     ai_root,
     ai_root / "api",
@@ -291,8 +290,7 @@ def _pinned_autonomous_child_pythonpath(
     ai_root / "packages" / "sheets-finance-mcp",
     ai_root / "packages" / "value-semantics-core",
     ai_root / "packages" / "industry-slice-core",
-    risk_root / "brokerage-connect",
-    risk_root,
+    ai_root / "risk-dists",
   ))
 
 
@@ -331,10 +329,19 @@ def _positive_autonomous_child_env(
     for name in allowed_names
     if type((value := environ.get(name))) is str
   }
-  if not projected.get("PYTHONPATH"):
-    pinned_pythonpath = _pinned_autonomous_child_pythonpath(environ)
-    if pinned_pythonpath is not None:
-      projected["PYTHONPATH"] = pinned_pythonpath
+  pinned_pythonpath = _pinned_autonomous_child_pythonpath(environ)
+  if pinned_pythonpath is not None:
+    # Selected-generation imports take precedence over inherited child packages.
+    paths = pinned_pythonpath.split(os.pathsep)
+    inherited_pythonpath = projected.get("PYTHONPATH")
+    if inherited_pythonpath:
+      seen_paths = {os.path.realpath(path) for path in paths}
+      for path in inherited_pythonpath.split(os.pathsep):
+        real_path = os.path.realpath(path)
+        if real_path not in seen_paths:
+          paths.append(path)
+          seen_paths.add(real_path)
+    projected["PYTHONPATH"] = os.pathsep.join(paths)
   if (
     deliver
     and normalized_profile

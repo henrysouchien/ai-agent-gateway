@@ -742,18 +742,28 @@ def test_non_anthropic_child_rates_override_reaches_provider_construction(
   assert "child-projected" in provider._rate_table.version
 
 
-def test_pinned_autonomous_child_inherits_exact_runtime_import_roots() -> None:
+@pytest.mark.parametrize(
+  "inherit_risk_dists",
+  [False, True],
+  ids=["without-pythonpath", "with-risk-dists"],
+)
+def test_pinned_autonomous_child_inherits_exact_runtime_import_roots(
+  inherit_risk_dists: bool,
+) -> None:
   version_root = Path("/opt/hank/runtime/versions/ai-a_risk-b")
+  ai_root = version_root / "ai-excel-addin"
+  risk_dists = str(ai_root / "risk-dists")
+  source = {"LOCAL_GATEWAY_RUNTIME_VERSION_ROOT": str(version_root)}
+  if inherit_risk_dists:
+    source["PYTHONPATH"] = risk_dists
 
   projected = _positive_autonomous_child_env(
-    {"LOCAL_GATEWAY_RUNTIME_VERSION_ROOT": str(version_root)},
+    source,
     provider="openai",
     profile="research_producer",
     deliver=False,
   )
 
-  ai_root = version_root / "ai-excel-addin"
-  risk_root = version_root / "risk_module"
   assert projected["PYTHONPATH"].split(os.pathsep) == [
     str(ai_root),
     str(ai_root / "api"),
@@ -763,23 +773,69 @@ def test_pinned_autonomous_child_inherits_exact_runtime_import_roots() -> None:
     str(ai_root / "packages" / "sheets-finance-mcp"),
     str(ai_root / "packages" / "value-semantics-core"),
     str(ai_root / "packages" / "industry-slice-core"),
-    str(risk_root / "brokerage-connect"),
-    str(risk_root),
+    risk_dists,
   ]
 
 
-def test_pinned_autonomous_child_preserves_explicit_pythonpath() -> None:
+def test_pinned_autonomous_child_deduplicates_inherited_realpaths(
+  tmp_path: Path,
+) -> None:
+  version_root = tmp_path / "generation"
+  ai_root = version_root / "ai-excel-addin"
+  gateway_root = ai_root / "packages" / "agent-gateway"
+  gateway_root.mkdir(parents=True)
+  gateway_alias = tmp_path / "gateway-alias"
+  gateway_alias.symlink_to(gateway_root, target_is_directory=True)
+  risk_dists = ai_root / "risk-dists"
+  risk_dists.mkdir()
+  risk_alias = tmp_path / "risk-alias"
+  risk_alias.symlink_to(risk_dists, target_is_directory=True)
+  inherited_pythonpath = os.pathsep.join([
+    str(gateway_alias),
+    str(risk_dists),
+    str(gateway_root),
+    str(risk_alias),
+  ])
+
   projected = _positive_autonomous_child_env(
     {
-      "LOCAL_GATEWAY_RUNTIME_VERSION_ROOT": "/opt/hank/runtime/version",
-      "PYTHONPATH": "/explicit/runtime/path",
+      "LOCAL_GATEWAY_RUNTIME_VERSION_ROOT": str(version_root),
+      "PYTHONPATH": inherited_pythonpath,
     },
     provider="openai",
     profile="research_producer",
     deliver=False,
   )
 
-  assert projected["PYTHONPATH"] == "/explicit/runtime/path"
+  paths = projected["PYTHONPATH"].split(os.pathsep)
+  assert paths[0] == str(ai_root)
+  assert paths[2] == str(gateway_root)
+  assert paths[-1] == str(risk_dists)
+  assert not any(
+    path.endswith(("/risk_module", "/brokerage-connect")) for path in paths
+  )
+  assert sum(
+    os.path.realpath(path) == os.path.realpath(gateway_root) for path in paths
+  ) == 1
+  assert sum(
+    os.path.realpath(path) == os.path.realpath(risk_dists) for path in paths
+  ) == 1
+
+
+def test_unpinned_autonomous_child_preserves_inherited_pythonpath() -> None:
+  inherited_pythonpath = os.pathsep.join([
+    "/explicit/runtime/path",
+    "",
+    "/explicit/runtime/../runtime/path",
+  ])
+  projected = _positive_autonomous_child_env(
+    {"PYTHONPATH": inherited_pythonpath},
+    provider="openai",
+    profile="research_producer",
+    deliver=False,
+  )
+
+  assert projected["PYTHONPATH"] == inherited_pythonpath
 
 
 def test_parent_closes_user_credential_pipe_and_cleans_launch_on_broken_pipe(

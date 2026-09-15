@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.18.1 (2026-09-15)
+
+### Fixed
+
+- Autonomous children spawned from a pinned local runtime generation
+  (`LOCAL_GATEWAY_RUNTIME_VERSION_ROOT`) keep the generation's import roots ahead of
+  any inherited `PYTHONPATH`, and those roots now name the generation's installed
+  Risk distributions directory (`ai-excel-addin/risk-dists`) instead of the Risk
+  source tree. Production deployments without a pinned generation are unchanged.
+
 ## 0.18.0 (2026-09-15)
 
 This is a pre-1.0 breaking-minor release. It describes the complete public
