@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -27,7 +27,7 @@ from agent_gateway.runner import _MAX_TOKENS_CONTINUATIONS, _MAX_TOKENS_NUDGE, S
 from agent_gateway.final_narrative_artifact import read_final_narrative  # noqa: E402
 from agent_gateway.sub_agent_narrative_result import final_child_visible_text  # noqa: E402
 from agent_gateway.task_registry import ParentMessage  # noqa: E402
-from tests.capability_execution_test_support import (  # noqa: E402
+from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_runner_capability_execution,
 )
 

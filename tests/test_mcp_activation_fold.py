@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-GATEWAY_DIR = ROOT / "packages" / "agent-gateway"
+GATEWAY_DIR = Path(__file__).resolve().parents[1]
 if str(GATEWAY_DIR) not in sys.path:
   sys.path.insert(0, str(GATEWAY_DIR))
 

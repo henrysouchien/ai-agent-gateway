@@ -9,6 +9,15 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass, replace
+from contextlib import ExitStack
+from tempfile import TemporaryDirectory
+
+from agent_gateway.autonomous_launch_envelope import (
+  AutonomousControlAuthority,
+  AutonomousSessionAuthority,
+  sign_autonomous_launch_envelope,
+)
 
 import pytest
 
@@ -22,12 +31,14 @@ from agent_gateway.autonomous_claim_broker import (
 from agent_gateway.claim_signing_authority import (
   GatewayClaimSigningAuthority,
 )
+from agent_gateway.launch_nonce_store import prepare_launch_nonce_store
 from agent_gateway.server_artifact_helpers import (
   _verify_agent_claim_headers,
 )
-from tests.autonomous_exact_test_support import (
-  ExactAutonomousTestRuntime,
-  build_exact_autonomous_test_runtime,
+from gateway_test_support.autonomous_launch_test_support import (
+  _bind,
+  _ordinary_session_authority,
+  _workload,
 )
 
 
@@ -44,6 +55,74 @@ _CLAIM_ENV_TO_FIELD = {
 }
 
 
+@dataclass
+class _BrokerRuntime:
+  claim_broker: AutonomousClaimBroker
+  claim_signer: AutonomousClaimSigner
+  envelope_json: str
+  resources: ExitStack
+
+  def close(self) -> None:
+    self.resources.close()
+
+
+def _broker_runtime(
+  *,
+  broker_max_requests: int = broker_module.AUTONOMOUS_CLAIM_BROKER_MAX_REQUESTS,
+  broker_max_ttl_seconds: int = 600,
+) -> _BrokerRuntime:
+  now_ns = time.time_ns()
+  now_seconds = now_ns // 1_000_000_000
+  authority = _ordinary_session_authority()
+  session_authority = AutonomousSessionAuthority.ordinary(
+    replace(
+      authority.ordinary_authority,
+      created_at=now_seconds - 1,
+      expires_at=now_seconds + 600,
+    ),
+  )
+  with ExitStack() as resources:
+    root = Path(resources.enter_context(TemporaryDirectory(prefix="claim-broker-test-"))).resolve()
+    inbox = root / "operator-messages.jsonl"
+    inbox.touch()
+    inbox_stat = inbox.stat()
+    ledger = prepare_launch_nonce_store(root / "admissions.sqlite3")
+    control = AutonomousControlAuthority(
+      control_mode="file",
+      admission_ledger_path=ledger.path,
+      admission_ledger_device=ledger.device,
+      admission_ledger_inode=ledger.inode,
+      operator_inbox_path=str(inbox),
+      operator_inbox_device=inbox_stat.st_dev,
+      operator_inbox_inode=inbox_stat.st_ino,
+    )
+    envelope_json = sign_autonomous_launch_envelope(
+      _SECRET,
+      task_id="bg_7",
+      control_run_id="run-7",
+      owner_user_id="42",
+      channel_id="ab" * 32,
+      bind=_bind(),
+      workload=_workload(),
+      control_authority=control,
+      session_authority=session_authority,
+      now_ns=now_ns,
+    )
+    broker = AutonomousClaimBroker(
+      GatewayClaimSigningAuthority(_SECRET),
+      envelope_json,
+      max_requests=broker_max_requests,
+      max_ttl_seconds=broker_max_ttl_seconds,
+    )
+    resources.callback(broker.close)
+    signer = AutonomousClaimSigner(
+      broker.take_child_fd(),
+      envelope_json=envelope_json,
+    )
+    resources.callback(signer.close)
+    return _BrokerRuntime(broker, signer, envelope_json, resources.pop_all())
+
+
 def _claim_headers(claim: dict[str, str]) -> dict[str, str]:
   return {
     field: claim[env_name]
@@ -52,7 +131,7 @@ def _claim_headers(claim: dict[str, str]) -> dict[str, str]:
 
 
 def test_broker_signer_is_fixed_to_admitted_identity() -> None:
-  runtime = build_exact_autonomous_test_runtime()
+  runtime = _broker_runtime()
   try:
     signer = runtime.claim_signer
     assert signer.user_id == "42"
@@ -73,7 +152,7 @@ def test_broker_signer_is_fixed_to_admitted_identity() -> None:
 
 
 def test_broker_enforces_ttl_and_closes_after_rejection() -> None:
-  runtime = build_exact_autonomous_test_runtime(
+  runtime = _broker_runtime(
     broker_max_ttl_seconds=30,
   )
   try:
@@ -86,7 +165,7 @@ def test_broker_enforces_ttl_and_closes_after_rejection() -> None:
 
 
 def test_broker_enforces_request_count_and_closes() -> None:
-  runtime = build_exact_autonomous_test_runtime(
+  runtime = _broker_runtime(
     broker_max_requests=1,
   )
   try:
@@ -100,7 +179,7 @@ def test_broker_enforces_request_count_and_closes() -> None:
 
 
 def test_broker_rejects_any_envelope_other_than_exact_launch() -> None:
-  runtime = build_exact_autonomous_test_runtime()
+  runtime = _broker_runtime()
   second_broker = AutonomousClaimBroker(
     GatewayClaimSigningAuthority(_SECRET),
     runtime.envelope_json,
@@ -127,7 +206,7 @@ def test_broker_rejects_any_envelope_other_than_exact_launch() -> None:
 
 
 def test_broker_admission_waits_for_slow_child_boot() -> None:
-  runtime = build_exact_autonomous_test_runtime()
+  runtime = _broker_runtime()
   broker = AutonomousClaimBroker(
     GatewayClaimSigningAuthority(_SECRET),
     runtime.envelope_json,
@@ -148,7 +227,7 @@ def test_broker_admission_waits_for_slow_child_boot() -> None:
 
 
 def test_broker_parent_closure_fails_child_signing() -> None:
-  runtime = build_exact_autonomous_test_runtime()
+  runtime = _broker_runtime()
   try:
     runtime.claim_broker.close()
     with pytest.raises(AutonomousClaimBrokerError):
@@ -158,7 +237,7 @@ def test_broker_parent_closure_fails_child_signing() -> None:
 
 
 def test_broker_rejects_unbounded_request_configuration() -> None:
-  runtime = build_exact_autonomous_test_runtime()
+  runtime = _broker_runtime()
   try:
     with pytest.raises(ValueError, match="max_requests"):
       AutonomousClaimBroker(
@@ -176,7 +255,7 @@ def test_broker_rejects_unbounded_request_configuration() -> None:
 def _broker_with_controlled_clock(
   monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[
-  ExactAutonomousTestRuntime,
+  _BrokerRuntime,
   dict[str, float],
   AutonomousClaimBroker,
   AutonomousClaimSigner,
@@ -195,7 +274,7 @@ def _broker_with_controlled_clock(
     "monotonic",
     lambda: clock["monotonic"],
   )
-  runtime = build_exact_autonomous_test_runtime()
+  runtime = _broker_runtime()
   return (
     runtime,
     clock,
@@ -248,7 +327,7 @@ def test_broker_monotonic_deadline_survives_frozen_wall_clock(
 def test_broker_partial_admission_frame_times_out_and_closes(
   fragment: bytes,
 ) -> None:
-  runtime = build_exact_autonomous_test_runtime()
+  runtime = _broker_runtime()
   broker = AutonomousClaimBroker(
     GatewayClaimSigningAuthority(_SECRET),
     runtime.envelope_json,
@@ -343,7 +422,7 @@ def test_frame_send_times_out_when_peer_does_not_read() -> None:
 def test_take_child_fd_closes_detached_fd_when_hardening_fails(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  runtime = build_exact_autonomous_test_runtime()
+  runtime = _broker_runtime()
   broker = AutonomousClaimBroker(
     GatewayClaimSigningAuthority(_SECRET),
     runtime.envelope_json,
@@ -374,7 +453,7 @@ def test_take_child_fd_closes_detached_fd_when_hardening_fails(
 def test_broker_constructor_closes_both_sockets_on_setup_failure(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  runtime = build_exact_autonomous_test_runtime()
+  runtime = _broker_runtime()
 
   class SetupSocket:
     def __init__(self, *, fail: bool) -> None:
@@ -413,7 +492,7 @@ def test_broker_constructor_closes_both_sockets_on_setup_failure(
 def test_broker_constructor_closes_all_sockets_when_thread_start_fails(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  runtime = build_exact_autonomous_test_runtime()
+  runtime = _broker_runtime()
   original_socketpair = socket.socketpair
   created_sockets: list[socket.socket] = []
 
@@ -489,7 +568,7 @@ def test_signer_constructor_closes_owned_fd_on_socket_setup_failure(
   reason="Linux /proc regression",
 )
 def test_exec_child_never_receives_global_key_in_proc_environ() -> None:
-  runtime = build_exact_autonomous_test_runtime()
+  runtime = _broker_runtime()
   broker = AutonomousClaimBroker(
     GatewayClaimSigningAuthority(_SECRET),
     runtime.envelope_json,
@@ -501,12 +580,8 @@ def test_exec_child_never_receives_global_key_in_proc_environ() -> None:
   child_env["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE"] = (
     runtime.envelope_json
   )
-  repo_root = Path(__file__).resolve().parents[3]
-  child_env["PYTHONPATH"] = os.pathsep.join((
-    str(repo_root / "packages" / "agent-gateway"),
-    str(repo_root / "api"),
-    str(repo_root),
-  ))
+  package_root = Path(__file__).resolve().parents[1]
+  child_env["PYTHONPATH"] = str(package_root)
   source = r"""
 import json
 import os
@@ -528,7 +603,7 @@ signer.close()
   try:
     completed = subprocess.run(
       [sys.executable, "-c", source],
-      cwd=repo_root,
+      cwd=package_root,
       env=child_env,
       pass_fds=(child_fd,),
       check=True,

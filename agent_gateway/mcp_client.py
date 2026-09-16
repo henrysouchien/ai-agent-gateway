@@ -360,6 +360,7 @@ class _ServerState:
   exported_tool_names: frozenset[str] | None = None
   tool_metadata: Mapping[str, Mapping[str, Any] | None] = field(default_factory=dict)
   stdio_eof: asyncio.Event | None = None
+  stdio_receive_done: asyncio.Event | None = None
   stdio_watch_task: asyncio.Task[Any] | None = None
   reconnect_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
   published_tool_definitions: List[Dict[str, Any]] = field(init=False)
@@ -555,6 +556,10 @@ class McpClientManager:
 
   `inline_servers` is the easiest way to ship self-contained examples because it
   avoids any dependency on a separate config file.
+
+  `provider_symbol_resolver` is an optional application-owned port. Without it,
+  input-preparation routes leave symbols unchanged; the package never imports
+  a product resolver or reads a product symbol cache.
   """
 
   def __init__(
@@ -2863,6 +2868,14 @@ class McpClientManager:
           return current
         config = server.config
         assert config is not None
+        if (
+          server.stdio_eof is not None
+          and server.stdio_eof.is_set()
+          and server.stdio_receive_done is not None
+        ):
+          # EOF wakes this owner before ClientSession has delivered connection
+          # errors. Closing its task group now would strand the pending calls.
+          await server.stdio_receive_done.wait()
         await self._close_server(server)
       replacement = await self._connect_stdio_with_retries(server_name, config)
       try:

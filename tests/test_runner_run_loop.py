@@ -12,7 +12,7 @@ from typing import Any, Literal
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -56,7 +56,7 @@ from agent_gateway.runner_state import (  # noqa: E402
   ToolUseLoopResult,
 )
 from agent_gateway.tool_policy_registry import PreparedToolCall  # noqa: E402
-from tests.capability_execution_test_support import (  # noqa: E402
+from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_bound_capability_execution,
 )
 from agent_workflow_contracts import (  # noqa: E402
@@ -989,7 +989,8 @@ def test_mid_turn_capture_unavailable_reaches_model_and_siblings_continue() -> N
       return {"status": "sibling_completed"}, None
 
     runner = _make_credential_runner(
-      local_tool_handlers={"run_agent": run_agent}
+      local_tool_handlers={"run_agent": run_agent},
+      role="owner",
     )
     runner_ref[0] = runner
     _seed_fork_request_snapshot(runner)
@@ -1638,7 +1639,8 @@ def test_completed_workflow_output_attaches_to_final_summary_and_replays(
       return result, None
 
     runner = _make_credential_runner(
-      local_tool_handlers={"workflow_run": workflow_run}
+      local_tool_handlers={"workflow_run": workflow_run},
+      role="owner",
     )
     durable_log = AgentSessionLog(tmp_path / "workflow-attachment.jsonl")
     runner._agent_session_log = durable_log
@@ -1899,7 +1901,8 @@ def test_accepted_continuation_invalidates_stale_pending_attachment(
       return result_responses.pop(0), None
 
     runner = _make_credential_runner(
-      local_tool_handlers={"workflow_run": workflow_run}
+      local_tool_handlers={"workflow_run": workflow_run},
+      role="owner",
     )
     durable_log = AgentSessionLog(tmp_path / "continuation-attachment.jsonl")
     runner._agent_session_log = durable_log

@@ -7,13 +7,13 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog
 from agent_gateway.multi_user.billing import SessionUsageSummary, UsageEvent
-from tests.sdk_capability_execution_test_support import stub_sdk_capability_execution
+from gateway_test_support.sdk_capability_execution_test_support import stub_sdk_capability_execution
 
 
 def _run(coro):

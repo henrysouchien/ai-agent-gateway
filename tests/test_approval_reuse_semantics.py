@@ -7,9 +7,8 @@ from typing import Any
 
 import pytest
 
-from agent.shared.tool_policy_implementations import (
-  product_redaction_context_factory,
-)
+from gateway_test_support.host_policy import owner_session_host_policy
+
 
 from agent_gateway.session import SessionStore
 from agent_gateway.mcp_client import McpClientManager
@@ -448,6 +447,7 @@ def _implementation(kind: str, callback: Any) -> ToolPolicyImplementation:
   )
 
 
+@pytest.mark.usefixtures("owner_session_host_policy")
 def test_dynamic_ask_disables_registered_exact_reuse() -> None:
   declaration = ToolRegistrationDeclaration(
     RegisteredToolIdentity(
@@ -504,7 +504,7 @@ def test_dynamic_ask_disables_registered_exact_reuse() -> None:
     tool_registration_catalog=ToolRegistrationCatalog((declaration,), ()),
     tool_policy_implementations=registry,
     approval_predicate_context_factory=lambda _declaration, _prepared: None,
-    redaction_context_factory=product_redaction_context_factory,
+    redaction_context_factory=lambda _declaration: None,
   )
   captured: dict[str, Any] = {}
 

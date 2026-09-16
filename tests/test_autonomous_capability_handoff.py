@@ -43,11 +43,11 @@ from agent_gateway.claim_signing_authority import (
   GatewayClaimSigningAuthority,
 )
 
-from .control_plane.identity_helpers import fake_identity_resolver, fake_mcp_user_key_lookup
+from gateway_test_support.control_plane_identity import fake_identity_resolver, fake_mcp_user_key_lookup
 
 
 _SECRET = "autonomous-handoff-test-secret-at-least-32-bytes"
-_API_DIR = Path(__file__).resolve().parents[3] / "api"
+_API_DIR = Path(__file__).resolve().parents[1]
 _FAKE_PROCESS_PIDS = count(110_000)
 _FAKE_PROCESSES: dict[int, "_FakeProcess"] = {}
 

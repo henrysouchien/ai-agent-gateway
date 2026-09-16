@@ -11,7 +11,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -30,7 +30,7 @@ from agent_gateway.model_registry import (
 from agent_gateway.model_preferences import ModelPreferenceStore
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 from agent_gateway.session import bind_session_credentials
-from user_identity import resolve_canonical_user_identity
+from gateway_test_support.control_plane_identity import fake_identity_resolver
 
 
 _SELECTABLE_CAPABILITIES = frozenset({
@@ -67,6 +67,7 @@ def _resolver_result(channel: str = "cli") -> ResolverResult:
 def _make_app(
   credentials_resolver,
   *,
+  identity_resolver=fake_identity_resolver,
   on_session_created=None,
   model_preference_store: ModelPreferenceStore | None = None,
   model_registry=None,
@@ -90,7 +91,7 @@ def _make_app(
 
   return create_gateway_app(
     GatewayServerConfig(
-      identity_resolver=resolve_canonical_user_identity,
+      identity_resolver=identity_resolver,
       tenant_id="test-product",
       model_registry=model_registry or INITIAL_MODEL_REGISTRY,
       model_selection_policy=model_selection_policy or INITIAL_MODEL_SELECTION_POLICY,
@@ -765,35 +766,6 @@ def test_chat_init_session_stores_identity_derived_numeric_risk_user_id() -> Non
   assert claims["risk_user_id"] == 101
 
 
-def test_chat_init_session_stores_identity_mapped_email(monkeypatch) -> None:
-  monkeypatch.setenv(
-    "GATEWAY_USER_KEYS",
-    '[{"key":"mapped-key","channel":"mcp","slug":"henry","email":"henry@example.com","risk_user_id":1,"role":"owner"}]',
-  )
-  app = _make_app(None)
-
-  with TestClient(app) as client:
-    response = client.post("/api/chat/init", json={"api_key": "legacy-key", "user_id": "henry"})
-
-  assert response.status_code == 200
-  session = app.state.auth.session_store.get_session(response.json()["session_id"])
-  assert session is not None
-  assert session.owner_user_id == "1"
-  assert session.user_email == "henry@example.com"
-  assert session.user_aliases == ("1", "henry", "henry@example.com")
-  _verified_session, claims = app.state.auth.verify_token_with_payload(response.json()["session_token"])
-  assert claims["user_email"] == "henry@example.com"
-
-
-def test_chat_init_identity_config_error_returns_http_error(monkeypatch) -> None:
-  monkeypatch.setenv("GATEWAY_USER_KEYS", "{not-json")
-  app = _make_app(None)
-
-  with TestClient(app) as client:
-    response = client.post("/api/chat/init", json={"api_key": "legacy-key", "user_id": "alice"})
-
-  assert response.status_code == 400
-  assert response.json()["error"] == "credential_resolver_invalid"
 
 
 def test_httpexception_from_resolver_passes_through_status() -> None:

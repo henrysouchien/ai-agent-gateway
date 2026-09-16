@@ -10,18 +10,16 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
   sys.path.insert(0, str(ROOT))
-API_DIR = ROOT / "api"
-if str(API_DIR) not in sys.path:
-  sys.path.insert(0, str(API_DIR))
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+
+
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import AgentSessionLog, generate_and_append_summary
 import agent_gateway.compaction as compaction
 from agent_gateway.providers import AnthropicProvider
-from agent.profiles.analyst_context_builder import AnalystContextBuilder
-from tests.capability_execution_test_support import (
+from gateway_test_support.capability_execution_test_support import (
   stub_bound_capability_execution,
 )
 
@@ -39,16 +37,7 @@ def _execution():
   )
 
 
-def test_analyst_context_builder_keeps_tail_policy() -> None:
-  assert is_dataclass(AnalystContextBuilder)
-  assert [field.name for field in fields(AnalystContextBuilder)] == [
-    "agent_session_log",
-    "tail_window_seconds",
-    "tail_token_budget",
-  ]
-  assert AnalystContextBuilder.tail_window_seconds == 14400
-  assert AnalystContextBuilder.tail_token_budget == 20_000
-  assert AnalystContextBuilder.__module__ == "agent.profiles.analyst_context_builder"
+
 
 
 def test_generate_and_append_summary_round_trips_cumulative_summary(tmp_path: Path) -> None:

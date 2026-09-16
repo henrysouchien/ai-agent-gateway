@@ -5,6 +5,10 @@ from collections.abc import Mapping
 from types import SimpleNamespace
 from uuid import uuid4
 
+import pytest
+
+from gateway_test_support.host_policy import owner_session_host_policy
+
 from agent_gateway import ApprovalDecision, ToolDispatcher
 from agent_gateway.mcp_client import McpClientManager
 
@@ -62,6 +66,12 @@ def _commercial():
   )
 
 
+@pytest.fixture
+def irreversible_tool_policy(owner_session_host_policy):
+  owner_session_host_policy.get_tool_class = lambda _server, _name: "irreversible"
+
+
+@pytest.mark.usefixtures("irreversible_tool_policy")
 def test_irreversible_rechecks_after_approval_and_injects_token_free_lineage() -> None:
   sequence = []
   mcp = _Mcp(sequence)
@@ -118,6 +128,7 @@ def test_irreversible_rechecks_after_approval_and_injects_token_free_lineage() -
   }
 
 
+@pytest.mark.usefixtures("irreversible_tool_policy")
 def test_irreversible_live_recheck_failure_never_calls_mcp() -> None:
   mcp = _Mcp()
 
@@ -150,6 +161,7 @@ def test_irreversible_live_recheck_failure_never_calls_mcp() -> None:
   assert mcp.calls == []
 
 
+@pytest.mark.usefixtures("irreversible_tool_policy")
 def test_commercial_dispatch_denies_untrusted_mcp_without_metadata_leak() -> None:
   mcp = _Mcp()
   dispatcher = ToolDispatcher(
@@ -176,6 +188,7 @@ def test_commercial_dispatch_denies_untrusted_mcp_without_metadata_leak() -> Non
   assert mcp.calls == []
 
 
+@pytest.mark.usefixtures("irreversible_tool_policy")
 def test_missing_irreversible_recheck_fails_closed() -> None:
   mcp = _Mcp()
   dispatcher = ToolDispatcher(
@@ -201,6 +214,7 @@ def test_missing_irreversible_recheck_fails_closed() -> None:
   assert mcp.calls == []
 
 
+@pytest.mark.usefixtures("irreversible_tool_policy")
 def test_noncommercial_dispatch_remains_metadata_free() -> None:
   mcp = _Mcp()
   dispatcher = ToolDispatcher(

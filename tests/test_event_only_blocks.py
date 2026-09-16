@@ -20,10 +20,11 @@ from agent_gateway.mcp_client_connections import McpToolCallResult
 from agent_gateway.tool_dispatcher_helpers import ToolResult
 from agent_gateway.providers import StreamEvent
 from agent_gateway.transcript import _tool_result_blocks_from_event
-from tests.capability_execution_test_support import (
+from gateway_test_support.capability_execution_test_support import (
   stub_bound_capability_execution,
 )
-from tests.sdk_capability_execution_test_support import stub_sdk_capability_execution
+from gateway_test_support.sdk_capability_execution_test_support import stub_sdk_capability_execution
+from gateway_test_support.host_policy import owner_session_host_policy
 
 
 class _NullMcpClient(McpClientManager):
@@ -270,7 +271,7 @@ def test_event_only_blocks_stay_in_sse_but_not_normal_tool_next_turn() -> None:
   assert all(block.get("type") != "source_envelope" for block in model_content)
 
 
-def test_runner_context_uses_trusted_router_provider_not_payload_claim() -> None:
+def test_runner_context_uses_trusted_router_provider_not_payload_claim(owner_session_host_policy) -> None:
   event_log = EventLog()
   mcp_client = _trusted_market_data_manager()
   contexts: list[ToolResultContext] = []
@@ -290,6 +291,7 @@ def test_runner_context_uses_trusted_router_provider_not_payload_claim() -> None
       local_tool_handlers={},
       event_log=event_log,
       session_id="sess-provider-identity",
+      role="owner",
     ),
     session_id="sess-provider-identity",
     capability_execution=_execution(provider),

@@ -54,7 +54,7 @@ from agent_gateway.runner_sub_agents import (
   _authoritative_child_tool_getter,
 )
 from agent_gateway.task_registry import TaskEntry
-from tests.admitted_authority_test_support import (
+from gateway_test_support.admitted_authority_test_support import (
   SOURCE_TOOL_ID,
   provenance_of,
   sealed_admitted_task,

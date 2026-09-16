@@ -7,14 +7,14 @@ from dataclasses import replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 for path in (ROOT, PKG_DIR):
   if str(path) not in sys.path:
     sys.path.insert(0, str(path))
 
 from agent_gateway.capability_binding import ModelSelectionIntent
 from agent_gateway.capability_execution import derive_batch_capability_execution
-from tests.capability_execution_test_support import (
+from gateway_test_support.capability_execution_test_support import (
   stub_capability_execution_resolver,
 )
 

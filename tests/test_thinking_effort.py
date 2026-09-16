@@ -185,10 +185,7 @@ def test_chat_request_validates_and_canonicalizes_effort() -> None:
     )
 
 
-def test_profile_config_does_not_duplicate_effort_authority() -> None:
-  from api.agent.profiles import ProfileConfig
 
-  assert "effort" not in {field.name for field in fields(ProfileConfig)}
 
 
 def test_skill_effort_conflict_and_positional_boundary(tmp_path: Path) -> None:
@@ -198,19 +195,6 @@ def test_skill_effort_conflict_and_positional_boundary(tmp_path: Path) -> None:
     parse_skill_file(path)
 
 
-def test_provider_env_effort_does_not_enter_credential_config(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  from api.credentials import get_anthropic_config
-
-  monkeypatch.setenv("ANTHROPIC_EFFORT", "medium")
-  monkeypatch.setenv("ANTHROPIC_THINKING", "false")
-  config = get_anthropic_config()
-  assert "effort" not in config
-  assert "thinking" not in config
 
 
-def test_anthropic_sdk_floor_is_locked() -> None:
-  root = Path(__file__).resolve().parents[3]
-  assert 'anthropic = ["anthropic>=0.93.0"]' in (root / "packages/agent-gateway/pyproject.toml").read_text()
-  assert "anthropic>=0.93.0" in (root / "packages/agent-gateway/requirements-dev.in").read_text()
+

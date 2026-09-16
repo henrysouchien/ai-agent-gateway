@@ -6,8 +6,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
+from gateway_test_support.host_policy import owner_session_host_policy
+
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -34,10 +38,10 @@ from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.model_registry import INITIAL_MODEL_REGISTRY
 from agent_gateway.providers import AnthropicProvider, StreamEvent
 from agent_gateway.sub_agent import _DEFAULT_EXCLUDED_TOOLS
-from tests.capability_execution_test_support import (
+from gateway_test_support.capability_execution_test_support import (
   stub_runner_capability_execution,
 )
-from tests.tool_catalog_test_support import OWNER_GATEWAY_SESSION
+from gateway_test_support.tool_catalog_test_support import OWNER_GATEWAY_SESSION
 
 
 def _run(coro):
@@ -106,6 +110,7 @@ class _StubRunner:
       {"name": "file_glob"},
       {"name": "file_read"},
       {"name": "memory_read"},
+      {"name": "web_search"},
     ]
 
 
@@ -173,6 +178,13 @@ def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
 
 def _raw_worker_excluded_tools(**worker_excluded_tools):
   return worker_excluded_tools
+
+
+@pytest.fixture
+def worker_tool_policy(owner_session_host_policy):
+  owner_session_host_policy.get_local_tool_effect = lambda name: (
+    "read" if name in {"file_glob", "file_read", "memory_read", "web_search"} else None
+  )
 
 
 def test_coordinator_config_defaults() -> None:
@@ -277,6 +289,7 @@ def test_coordinator_disabled_does_not_inject_preamble() -> None:
   assert provider.system_prompts == [f"Base prompt\n\n{reminder}"]
 
 
+@pytest.mark.usefixtures("worker_tool_policy")
 def test_make_run_agent_handler_merges_worker_excluded_tools() -> None:
   runner = _StubRunner()
   resolver = _CapabilityResolver()
@@ -289,6 +302,7 @@ def test_make_run_agent_handler_merges_worker_excluded_tools() -> None:
       "file_read": _dummy_tool,
       "memory_read": _dummy_tool,
       "file_glob": _dummy_tool,
+      "web_search": _dummy_tool,
     },
     excluded_tools={"memory_read"},
     coordinator_config=CoordinatorConfig(
@@ -307,7 +321,7 @@ def test_make_run_agent_handler_merges_worker_excluded_tools() -> None:
     "memory_read",
   } <= runner.calls[0]["excluded_tools"]
   worker_tools = runner.calls[0]["dispatcher"]._local
-  assert set(worker_tools) == {"file_read"}
+  assert set(worker_tools) == {"file_read", "web_search"}
   assert worker_tools["file_read"] is _dummy_tool
   assert "report_door" not in runner.calls[0]
 
@@ -334,14 +348,16 @@ def test_coordinator_max_workers_overrides_max_background_tasks() -> None:
   assert runner._task_registry._max_inflight == 5
 
 
+@pytest.mark.usefixtures("worker_tool_policy")
 def test_make_run_agent_handler_uses_authenticated_worker_bind() -> None:
   runner = _StubRunner()
   resolver = _CapabilityResolver()
   handler = make_run_agent_handler(
     [runner],
+    parent_session=OWNER_GATEWAY_SESSION,
     skill_loader=None,
     mcp_client=_NullMcpClient(),
-    local_tool_handlers={"file_read": _dummy_tool},
+    local_tool_handlers={"file_read": _dummy_tool, "web_search": _dummy_tool},
     coordinator_config=CoordinatorConfig(enabled=True),
     capability_execution_resolver=resolver,
   )

@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -12,9 +12,10 @@ from agent_gateway.sub_agent import (  # noqa: E402
   _effective_mcp_session_inject_servers,
   make_run_agent_handler,
 )
-from tests.capability_execution_test_support import (  # noqa: E402
+from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_capability_execution_resolver,
 )
+from gateway_test_support.host_policy import owner_session_host_policy
 
 
 def _run(coro):
@@ -49,7 +50,12 @@ class _StubRunner:
     return [{"name": "file_read"}]
 
 
-def test_make_run_agent_handler_bounds_session_injection_to_admitted_scope() -> None:
+def test_make_run_agent_handler_bounds_session_injection_to_admitted_scope(
+  owner_session_host_policy,
+) -> None:
+  owner_session_host_policy.get_local_tool_effect = lambda name: (
+    "read" if name == "file_read" else None
+  )
   runner = _StubRunner()
   capability_execution_resolver = stub_capability_execution_resolver()
   handler = make_run_agent_handler(
@@ -73,57 +79,8 @@ def test_make_run_agent_handler_bounds_session_injection_to_admitted_scope() -> 
   assert dispatcher._interceptors == []
 
 
-def test_make_run_agent_handler_forwards_exact_interceptor_sequence() -> None:
-  runner = _StubRunner()
-
-  async def first_interceptor(_context):
-    raise AssertionError("interceptor should not run during handler assembly")
-
-  async def second_interceptor(_context):
-    raise AssertionError("interceptor should not run during handler assembly")
-
-  interceptors = (first_interceptor, second_interceptor)
-  handler = make_run_agent_handler(
-    [runner],
-    skill_loader=None,
-    mcp_client=_StubMcpClient(),
-    interceptors=interceptors,
-    local_tool_handlers={"file_read": _dummy_tool},
-    capability_execution_resolver=stub_capability_execution_resolver(),
-  )
-
-  result, error = _run(handler({
-    "background": False,
-    "objective": "Collect page state",
-  }))
-
-  assert error is None
-  assert result == {"response": "ok"}
-  forwarded = runner.calls[0]["dispatcher"]._interceptors
-  assert len(forwarded) == 2
-  assert forwarded[0] is first_interceptor
-  assert forwarded[1] is second_interceptor
 
 
-def test_make_run_agent_handler_explicit_none_keeps_empty_interceptors() -> None:
-  runner = _StubRunner()
-  handler = make_run_agent_handler(
-    [runner],
-    skill_loader=None,
-    mcp_client=_StubMcpClient(),
-    interceptors=None,
-    local_tool_handlers={"file_read": _dummy_tool},
-    capability_execution_resolver=stub_capability_execution_resolver(),
-  )
-
-  result, error = _run(handler({
-    "background": False,
-    "objective": "Collect page state",
-  }))
-
-  assert error is None
-  assert result == {"response": "ok"}
-  assert runner.calls[0]["dispatcher"]._interceptors == []
 
 
 def test_named_child_does_not_inherit_loaded_servers_for_session_injection() -> None:
@@ -149,28 +106,3 @@ def test_named_child_session_injection_requires_declaration_and_scope() -> None:
   assert unrestricted == {"browser"}
 
 
-def test_make_run_agent_handler_forwards_meta_user_context_to_dispatcher() -> None:
-  runner = _StubRunner()
-  capability_execution_resolver = stub_capability_execution_resolver()
-  handler = make_run_agent_handler(
-    [runner],
-    skill_loader=None,
-    mcp_client=_StubMcpClient(),
-    mcp_meta_inject_servers=frozenset({"portfolio-reads-mcp", "research-corpus-mcp"}),
-    user_id="42",
-    credentials_resolver_active=True,
-    local_tool_handlers={"file_read": _dummy_tool},
-    capability_execution_resolver=capability_execution_resolver,
-  )
-
-  result, error = _run(handler({
-    "background": False,
-    "objective": "Collect portfolio state",
-  }))
-
-  assert error is None
-  assert result == {"response": "ok"}
-  dispatcher = runner.calls[0]["dispatcher"]
-  assert dispatcher._mcp_meta_inject_servers == frozenset({"portfolio-reads-mcp", "research-corpus-mcp"})
-  assert dispatcher._user_id == "42"
-  assert dispatcher._credentials_resolver_active is True

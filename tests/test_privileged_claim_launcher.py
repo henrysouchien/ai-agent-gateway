@@ -37,16 +37,6 @@ def test_production_target_does_not_expose_product_catalog_as_generic_directory(
   assert "AGENT_GATEWAY_SKILLS_DIR" not in _TARGET_ENV
 
 
-def test_production_target_keeps_foundation_session_log_layout_v2() -> None:
-  repo_root = Path(__file__).resolve().parents[3]
-  assert "AGENT_SESSION_LOG_LAYOUT" not in _TARGET_ENV
-  assert _SESSION_LOG_LAYOUT_PATH == Path(
-    "/etc/agent_gateway/session-log-layout"
-  )
-  assert (
-    repo_root / "deploy" / "agent-session-log-layout.production"
-  ).read_bytes() == b"v2\n"
-  assert _TARGET_ENV["AGENT_SESSION_LOG_ARCHIVE_PRODUCT_IDS"] == "hank-dev"
 
 
 def test_launcher_reads_only_canonical_private_source(
@@ -235,7 +225,6 @@ def test_real_dropped_child_cannot_read_named_or_parent_authority(
   layout_path.chmod(0o600)
   assert secret_path.stat().st_uid == 0
   assert stat.S_IMODE(secret_path.stat().st_mode) == 0o600
-  repo_root = Path(__file__).resolve().parents[3]
   probe_source = r"""
 import ctypes
 import json
@@ -312,10 +301,7 @@ launch_with_claim_signing_fd(
 """
   env = dict(os.environ)
   env["AGENT_API_USER_CLAIM_HMAC_KEY"] = "must-be-scrubbed"
-  env["PYTHONPATH"] = os.pathsep.join((
-    str(repo_root / "packages" / "agent-gateway"),
-    str(repo_root),
-  ))
+  env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
   completed = subprocess.run(
     [
       sys.executable,

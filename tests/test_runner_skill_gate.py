@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -17,7 +17,7 @@ from agent_gateway.runner_skill_gate import (  # noqa: E402
   normalize_skill_deny,
   normalize_skill_report_doors,
 )
-from tests.capability_execution_test_support import (  # noqa: E402
+from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_runner_capability_execution,
 )
 

@@ -12,7 +12,7 @@ from agent_gateway.tool_dispatch_classification import (
   settle_catalogless_tool_result,
 )
 from agent_gateway.tool_policy_registry import PreparedToolCall
-from tests.capability_execution_test_support import (
+from gateway_test_support.capability_execution_test_support import (
   stub_runner_capability_execution,
 )
 

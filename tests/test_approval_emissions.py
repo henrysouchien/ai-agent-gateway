@@ -6,9 +6,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
+from gateway_test_support.host_policy import owner_session_host_policy
+
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -268,6 +272,7 @@ def test_approval_timeout_emits_decided_event() -> None:
   asyncio.run(_run())
 
 
+@pytest.mark.usefixtures("owner_session_host_policy")
 def test_lifecycle_approval_request_times_out_without_user_response(monkeypatch, tmp_path: Path) -> None:
   async def _run() -> None:
     from agent_gateway import approval_settings
@@ -347,6 +352,7 @@ def test_lifecycle_approval_request_times_out_without_user_response(monkeypatch,
   asyncio.run(_run())
 
 
+@pytest.mark.usefixtures("owner_session_host_policy")
 def test_lifecycle_user_denial_emits_ordinary_provenance_and_error(tmp_path: Path) -> None:
   async def _run() -> None:
     class _Policy:
@@ -509,6 +515,7 @@ def test_interactive_irreversible_approval_coerces_allow_tool_type_false(tmp_pat
   asyncio.run(_run())
 
 
+@pytest.mark.usefixtures("owner_session_host_policy")
 def test_delegated_lifecycle_auto_approval_emits_delegated_source(tmp_path: Path) -> None:
   async def _run() -> None:
     event_log = EventLog()
@@ -557,6 +564,7 @@ def test_delegated_lifecycle_auto_approval_emits_delegated_source(tmp_path: Path
   asyncio.run(_run())
 
 
+@pytest.mark.usefixtures("owner_session_host_policy")
 def test_delegated_lifecycle_external_write_escalates_without_auto_approval(monkeypatch, tmp_path: Path) -> None:
   async def _run() -> None:
     from agent_gateway import approval_settings

@@ -14,7 +14,7 @@ from typing import Any, NoReturn
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -29,7 +29,7 @@ from agent_gateway.providers import OpenAIProvider, ThinkingLevel
 from agent_gateway.providers.openai import OpenAIConfigurationError
 from agent_gateway.providers.openai_responses_helpers import _ResponsesStreamState, map_event
 from agent_gateway.tool_policy_registry import PreparedToolCall
-from tests.capability_execution_test_support import (
+from gateway_test_support.capability_execution_test_support import (
   stub_runner_capability_execution,
 )
 

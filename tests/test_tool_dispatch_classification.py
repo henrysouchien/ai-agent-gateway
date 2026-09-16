@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-GATEWAY_DIR = ROOT / "packages" / "agent-gateway"
+GATEWAY_DIR = Path(__file__).resolve().parents[1]
 if str(GATEWAY_DIR) not in sys.path:
   sys.path.insert(0, str(GATEWAY_DIR))
 
@@ -38,6 +38,16 @@ from agent_gateway.tool_dispatch_source_identity import (  # noqa: E402
 )
 from agent_workflow_contracts import CatalogToolEntry  # noqa: E402
 from agent_workflow_contracts.models import CatalogToolEffect  # noqa: E402
+from gateway_test_support.host_policy import owner_session_host_policy
+
+
+@pytest.fixture(autouse=True)
+def filing_route_policy(owner_session_host_policy):
+  owner_session_host_policy.get_server_for_policy_tool = lambda name: (
+    "research-corpus-mcp" if name == "filings_search" else None
+  )
+  owner_session_host_policy.get_local_tool_effect = lambda _name: None
+  owner_session_host_policy.get_tool_class = lambda _server, _name: "read"
 
 
 def _entry(
@@ -523,45 +533,6 @@ def test_sandbox_computation_source_reader_preserves_order_and_current_gates() -
   )
 
 
-def test_fred_declaration_population_marks_only_data_reads_as_vendor_sources() -> None:
-  from api.agent.shared.server_policies import MCP_SERVER_POLICIES
-
-  table = build_tool_dispatch_declarations(
-    effect_resolver=lambda name: "read" if name.startswith("fred_") else None
-  )
-  fred_names = {
-    "fred_get_multiple",
-    "fred_get_series",
-    "fred_list_series",
-    "fred_search",
-  }
-
-  assert {name for name in table if name.startswith("fred_")} == fred_names
-  assert MCP_SERVER_POLICIES["fred-mcp"].read_tools == fred_names
-  for name in fred_names:
-    row = table[name]
-    assert row.effect == "read"
-    assert row.idempotent is True
-    assert row.success_signal is None
-    assert row.source_identity is None
-
-  entry = resolve_dispatch_entry(
-    "fred_search",
-    origin="mcp",
-    server="fred-mcp",
-    original_tool_name="fred_search",
-  )
-  assert entry.catalog_entry is not None
-  assert entry.catalog_entry.capability == "market-data.read/v1"
-  assert classify_tool_outcome(
-    entry,
-    {"status": "error", "error": {"code": "not_found"}},
-    None,
-  ) == "error_semantic"
-  assert retry_decision(entry, "error_transport", 1) == "retry"
-  assert retry_decision(entry, "error_timeout", 1) == "retry"
-  assert retry_decision(entry, "error_rate_limited", 1) == "retry"
-  assert retry_decision(entry, "error_transport", 3) == "settle"
 
 
 def test_broker_session_expired_is_outer_retryable_only_for_declared_reads() -> None:

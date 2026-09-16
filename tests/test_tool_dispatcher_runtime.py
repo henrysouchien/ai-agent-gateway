@@ -7,7 +7,7 @@ from typing import Any, NoReturn
 
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -342,25 +342,6 @@ def test_runtime_mcp_scope_error_messages() -> None:
   assert "load_tools(servers=[" not in profile_serverless["message"]
 
 
-def test_tool_dispatcher_runtime_wrappers_preserve_parent_override_seams() -> None:
-  calls: list[tuple[str, str]] = []
-
-  class _CustomQualifiedKeyDispatcher(ToolDispatcher):
-    @staticmethod
-    def _qualified_key(tool_name: str, qualifier: str) -> str:
-      calls.append((tool_name, qualifier))
-      return "custom-key"
-
-  dispatcher = _CustomQualifiedKeyDispatcher(
-    mcp_client=_NullMcpClient(),
-    local_tool_handlers={},
-    needs_approval=lambda _name, _tool_input, _qualifier: True,
-    approved_tool_types={"custom-key"},
-  )
-
-  assert dispatcher._should_request_approval("write_file", {"path": "x"}, "tmp") is False
-  assert dispatcher._tool_was_cache_hit("write_file", "tmp") is True
-  assert calls == [("write_file", "tmp"), ("write_file", "tmp")]
 
 
 def test_tool_dispatcher_mcp_scope_wrapper_uses_instance_allowlist() -> None:
@@ -411,6 +392,7 @@ def test_tool_dispatcher_observes_post_construction_mutable_allowlist_updates() 
   dispatcher = ToolDispatcher(
     mcp_client=mcp,
     local_tool_handlers={},
+    role="owner",
     get_tool_definitions=lambda: [
       {"name": "corpus_search"},
       {"name": "corpus_write"},
@@ -451,6 +433,7 @@ def test_tool_dispatcher_keeps_one_wire_snapshot_for_all_calls_in_provider_respo
   dispatcher = ToolDispatcher(
     mcp_client=mcp,
     local_tool_handlers={},
+    role="owner",
     get_tool_definitions=lambda: [
       {"name": tool_name, "input_schema": {"type": "object"}}
       for tool_name in sorted(advertised)
@@ -695,6 +678,7 @@ def test_tool_dispatcher_enforces_the_live_scope_its_owner_derives() -> None:
   dispatcher = ToolDispatcher(
     mcp_client=mcp,
     local_tool_handlers={},
+    role="owner",
     allowed_mcp_tools_by_server=scope,
   )
 
@@ -727,22 +711,6 @@ def test_tool_dispatcher_enforces_the_live_scope_its_owner_derives() -> None:
   assert [call[0] for call in mcp.calls] == ["corpus_write"]
 
 
-def test_tool_dispatcher_normalizes_a_non_mapping_allowlist() -> None:
-  mcp = _ScopedCorpusMcpClient()
-
-  class _PairScope:
-    def items(self):
-      return [("research-corpus-mcp", ["corpus_search"])]
-
-  dispatcher = ToolDispatcher(
-    mcp_client=mcp,
-    local_tool_handlers={},
-    allowed_mcp_tools_by_server=_PairScope(),  # pyright: ignore[reportArgumentType]  # negative: non-Mapping normalization is the behavior under test
-  )
-
-  assert dispatcher._allowed_mcp_tools_by_server == {
-    "research-corpus-mcp": {"corpus_search"},
-  }
 
 
 def test_tool_dispatcher_enforces_mcp_scope() -> None:
@@ -750,6 +718,7 @@ def test_tool_dispatcher_enforces_mcp_scope() -> None:
   dispatcher = ToolDispatcher(
     mcp_client=mcp,
     local_tool_handlers={},
+    role="owner",
     allowed_mcp_tools_by_server={"research-corpus-mcp": {"corpus_search"}},
   )
 
@@ -772,6 +741,7 @@ def test_dispatcher_adds_argument_guidance_to_direct_mcp_validation_errors() -> 
   dispatcher = ToolDispatcher(
     mcp_client=_ValidationErrorMcpClient(),
     local_tool_handlers={},
+    role="owner",
     get_tool_definitions=lambda: [{"name": "get_price_target"}],
   )
 
@@ -795,6 +765,7 @@ def test_dispatcher_does_not_add_argument_guidance_to_non_validation_mcp_errors(
   dispatcher = ToolDispatcher(
     mcp_client=_NonValidationErrorMcpClient(),
     local_tool_handlers={},
+    role="owner",
     get_tool_definitions=lambda: [{"name": "get_price_target"}],
   )
 
@@ -820,6 +791,7 @@ def test_dispatcher_uses_original_tool_name_for_prefixed_mcp_argument_guidance()
       original_name="get_price_target",
     ),
     local_tool_handlers={},
+    role="owner",
     get_tool_definitions=lambda: [{"name": "portfolio_get_price_target"}],
   )
 

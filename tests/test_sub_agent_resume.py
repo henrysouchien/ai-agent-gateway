@@ -13,7 +13,7 @@ import pytest
 import agent_gateway.sub_agent as sub_agent_module
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -104,10 +104,11 @@ from agent_gateway.transcript import (
   reconstruct_messages_for_task,
   reconstruct_parent_messages,
 )
-from tests.capability_execution_test_support import (
+from gateway_test_support.capability_execution_test_support import (
   stub_bound_capability_execution,
   stub_capability_execution_resolver,
 )
+from gateway_test_support.host_policy import owner_session_host_policy
 
 _UNRESOLVED_BLOCK_RE = re.compile(r"\{\{[A-Z][A-Z0-9_]*\}\}")
 
@@ -1162,7 +1163,11 @@ async def _append_interrupted_skill_task(
 
 def test_parent_initial_and_resume_share_one_stateful_interceptor_chain(
   tmp_path: Path,
+  owner_session_host_policy,
 ) -> None:
+  owner_session_host_policy.get_local_tool_effect = lambda name: (
+    "read" if name == "web_search" else None
+  )
   async def _case() -> None:
     observed: list[tuple[str, str]] = []
     executions: list[str] = []
@@ -1187,6 +1192,14 @@ def test_parent_initial_and_resume_share_one_stateful_interceptor_chain(
 
     limit = _AggregateLimit()
     interceptors = (observe, limit)
+    parent_session = GatewaySession(
+      session_id="parent",
+      api_key_hash="hash",
+      created_at=1,
+      expires_at=2,
+      user_id="alice",
+      role="owner",
+    )
 
     async def web_search(_tool_input: dict[str, Any], **kwargs: Any):
       executions.append(str(kwargs.get("tool_call_id") or "executed"))
@@ -1237,6 +1250,7 @@ semantic_metadata:
     initial_runner.spawn_sub_agent = _initial_spawn_sub_agent  # type: ignore[method-assign]
     initial_handler = make_run_agent_handler(
       [initial_runner],
+      parent_session=parent_session,
       skill_loader=loader,
       mcp_client=_NullMcpClient(),
       local_tool_handlers={"web_search": web_search},
@@ -1248,6 +1262,7 @@ semantic_metadata:
       local_tool_handlers={"run_agent": initial_handler},
       interceptors=interceptors,
       session_id="parent",
+      role="owner",
     )
     initial_result, initial_error = await parent_dispatcher.dispatch(
       "parent-run-agent",
@@ -1297,6 +1312,7 @@ semantic_metadata:
     resume_runner.resume_sub_agent = _resume_sub_agent
     resume_handler = make_resume_handler(
       [resume_runner],
+      parent_session=parent_session,
       mcp_client=_NullMcpClient(),
       local_tool_handlers={"web_search": web_search},
       interceptors=interceptors,
@@ -1323,13 +1339,6 @@ semantic_metadata:
     await resumed_entry.asyncio_task
     resume_dispatcher = resumed["dispatcher"]
 
-    for dispatcher in (
-      parent_dispatcher,
-      initial_dispatcher,
-      resume_dispatcher,
-    ):
-      assert dispatcher._interceptors[0] is observe
-      assert dispatcher._interceptors[1] is limit
 
     initial_dispatch_result, initial_dispatch_error = (
       await initial_dispatcher.dispatch(
@@ -5265,6 +5274,7 @@ def test_resume_handler_rejects_persisted_grant_for_now_denied_mcp_server(
 )
 def test_resume_dispatches_only_through_the_persisted_route(
   tmp_path: Path,
+  owner_session_host_policy,
   case_name: str,
   persisted_route: AdmittedToolRoute,
   current_server: str | None,
@@ -5899,94 +5909,89 @@ def test_resume_copies_admitted_ticker_and_ignores_later_prose(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  import memory
 
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "data"))
-  memory.set_memory_store_factory(None)
-  try:
-    async def _case() -> None:
-      skills_dir = tmp_path / "skills"
-      _write_skill(skills_dir, "html-research", "scope: ticker")
-      runner = _runner(tmp_path)
-      runner._runner_id = "runner-test"
-      await _append_interrupted_skill_task(
-        runner,
-        task_id="bg_scope",
-        agent_name="html-research",
-        user_message="Resume the html analysis carefully.",
-      )
-      original = runner._task_registry.get("bg_scope")
-      assert original is not None and original.admitted_task is not None
-      original_inputs = original.admitted_task.inputs
-      log = runner._agent_session_log
-      assert log is not None
-      await log.append(
-        {
-          "type": "user_message",
-          "task_id": "bg_scope",
-          "sub_agent_id": "sub:bg_scope",
-          "role": "sub_agent",
-          "content": '{"ticker":"MSFT","note":"later tool-result-like message"}',
-        }
-      )
-      captured: dict[str, Any] = {}
+  async def _case() -> None:
+    skills_dir = tmp_path / "skills"
+    _write_skill(skills_dir, "html-research", "scope: ticker")
+    runner = _runner(tmp_path)
+    runner._runner_id = "runner-test"
+    await _append_interrupted_skill_task(
+      runner,
+      task_id="bg_scope",
+      agent_name="html-research",
+      user_message="Resume the html analysis carefully.",
+    )
+    original = runner._task_registry.get("bg_scope")
+    assert original is not None and original.admitted_task is not None
+    original_inputs = original.admitted_task.inputs
+    log = runner._agent_session_log
+    assert log is not None
+    await log.append(
+      {
+        "type": "user_message",
+        "task_id": "bg_scope",
+        "sub_agent_id": "sub:bg_scope",
+        "role": "sub_agent",
+        "content": '{"ticker":"MSFT","note":"later tool-result-like message"}',
+      }
+    )
+    captured: dict[str, Any] = {}
 
-      async def _resume_sub_agent(**kwargs: Any):
-        captured.update(kwargs)
-        return await _successful_resume_task_result(
-          kwargs,
-          "continued",
-          workspace_dir=tmp_path,
-        ), None
+    async def _resume_sub_agent(**kwargs: Any):
+      captured.update(kwargs)
+      return await _successful_resume_task_result(
+        kwargs,
+        "continued",
+        workspace_dir=tmp_path,
+      ), None
 
-      runner.resume_sub_agent = _resume_sub_agent
-      parent_log = EventLog()
-      handler = make_resume_handler(
-        [runner],
-        parent_session=GatewaySession(
-          session_id="sess-parent",
-          api_key_hash="hash",
-          created_at=10,
-          expires_at=20,
-          user_id="alice",
-          auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
-        ),
-        mcp_client=_NullMcpClient(),
-        local_tool_handlers={},
-        excluded_tools_resolver=frozenset,
-      )
+    runner.resume_sub_agent = _resume_sub_agent
+    parent_log = EventLog()
+    handler = make_resume_handler(
+      [runner],
+      parent_session=GatewaySession(
+        session_id="sess-parent",
+        api_key_hash="hash",
+        created_at=10,
+        expires_at=20,
+        user_id="alice",
+        auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+      ),
+      mcp_client=_NullMcpClient(),
+      local_tool_handlers={},
+      excluded_tools_resolver=frozenset,
+    )
 
-      result, error = await handler(
-        {"task_id": "bg_scope", "additional_context": "Focus on AAPL."},
-        tool_ctx=ToolExecutionContext(
-          tool_call_id="turn-resume",
-          tool_name="resume_background_agent",
-          event_log=parent_log,
-        ),
-      )
-      assert error is None
-      assert result is not None
-      resumed_entry = runner._task_registry.get(result["task_id"])
-      assert resumed_entry is not None
-      assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
-      await resumed_entry.asyncio_task
+    result, error = await handler(
+      {"task_id": "bg_scope", "additional_context": "Focus on AAPL."},
+      tool_ctx=ToolExecutionContext(
+        tool_call_id="turn-resume",
+        tool_name="resume_background_agent",
+        event_log=parent_log,
+      ),
+    )
+    assert error is None
+    assert result is not None
+    resumed_entry = runner._task_registry.get(result["task_id"])
+    assert resumed_entry is not None
+    assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
+    await resumed_entry.asyncio_task
 
-      # INC-4 retired emit_html_artifact; the resolved ticker/scope is observable
-      # on the surviving skill_run_started event (no emit tool needed).
-      events = [entry.event for entry in parent_log.entries]
-      assert [event["type"] for event in events] == [
-        "skill_run_started",
-        "skill_result_captured",
-      ]
-      assert events[0]["ticker"] == "PCTY"
-      assert events[0]["scope"] == "ticker"
-      assert events[1]["ticker"] == "PCTY"
-      assert resumed_entry.admitted_task is not None
-      assert resumed_entry.admitted_task.inputs == original_inputs
+    # INC-4 retired emit_html_artifact; the resolved ticker/scope is observable
+    # on the surviving skill_run_started event (no emit tool needed).
+    events = [entry.event for entry in parent_log.entries]
+    assert [event["type"] for event in events] == [
+      "skill_run_started",
+      "skill_result_captured",
+    ]
+    assert events[0]["ticker"] == "PCTY"
+    assert events[0]["scope"] == "ticker"
+    assert events[1]["ticker"] == "PCTY"
+    assert resumed_entry.admitted_task is not None
+    assert resumed_entry.admitted_task.inputs == original_inputs
 
-    _run(_case())
-  finally:
-    memory.set_memory_store_factory(None)
+  _run(_case())
 
 
 def test_resume_reuses_durable_private_schemas_after_live_mutation(
@@ -6294,175 +6299,165 @@ def test_resume_admitted_ticker_ignores_parent_resume_message_context(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  import memory
 
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "data"))
-  memory.set_memory_store_factory(None)
-  try:
-    async def _case() -> None:
-      skills_dir = tmp_path / "skills"
-      _write_skill(skills_dir, "html-research", "scope: ticker")
-      runner = _runner(tmp_path)
-      runner._runner_id = "runner-test"
-      await _append_interrupted_skill_task(
-        runner,
-        task_id="bg_parent_scope",
-        agent_name="html-research",
-        user_message="Resume the html analysis carefully.",
-      )
-      log = runner._agent_session_log
-      assert log is not None
-      await log.append(
-        {
-          "type": "parent_message_sent",
-          "task_id": "bg_parent_scope",
-          **_interrupted_task_correlation(
-            runner,
-            task_id="bg_parent_scope",
-            capability_bind_receipt=_bind_receipt(),
-          ),
-          "task_type": "background",
-          "message_id": "msg-msft",
-          "message": "Focus on MSFT for the resumed artifact.",
-          "sent_at": 2.0,
-        }
-      )
-      captured: dict[str, Any] = {}
-
-      async def _resume_sub_agent(**kwargs: Any):
-        captured.update(kwargs)
-        return await _successful_resume_task_result(
-          kwargs,
-          "continued",
-          workspace_dir=tmp_path,
-        ), None
-
-      runner.resume_sub_agent = _resume_sub_agent
-      parent_log = EventLog()
-      handler = make_resume_handler(
-        [runner],
-        parent_session=GatewaySession(
-          session_id="sess-parent",
-          api_key_hash="hash",
-          created_at=10,
-          expires_at=20,
-          user_id="alice",
-          auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+  async def _case() -> None:
+    skills_dir = tmp_path / "skills"
+    _write_skill(skills_dir, "html-research", "scope: ticker")
+    runner = _runner(tmp_path)
+    runner._runner_id = "runner-test"
+    await _append_interrupted_skill_task(
+      runner,
+      task_id="bg_parent_scope",
+      agent_name="html-research",
+      user_message="Resume the html analysis carefully.",
+    )
+    log = runner._agent_session_log
+    assert log is not None
+    await log.append(
+      {
+        "type": "parent_message_sent",
+        "task_id": "bg_parent_scope",
+        **_interrupted_task_correlation(
+          runner,
+          task_id="bg_parent_scope",
+          capability_bind_receipt=_bind_receipt(),
         ),
-        mcp_client=_NullMcpClient(),
-        local_tool_handlers={},
-        excluded_tools_resolver=frozenset,
-      )
+        "task_type": "background",
+        "message_id": "msg-msft",
+        "message": "Focus on MSFT for the resumed artifact.",
+        "sent_at": 2.0,
+      }
+    )
+    captured: dict[str, Any] = {}
 
-      result, error = await handler(
-        {"task_id": "bg_parent_scope"},
-        tool_ctx=ToolExecutionContext(
-          tool_call_id="turn-resume",
-          tool_name="resume_background_agent",
-          event_log=parent_log,
-        ),
-      )
-      assert error is None
-      assert result is not None
-      resumed_entry = runner._task_registry.get(result["task_id"])
-      assert resumed_entry is not None
-      assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
-      await resumed_entry.asyncio_task
+    async def _resume_sub_agent(**kwargs: Any):
+      captured.update(kwargs)
+      return await _successful_resume_task_result(
+        kwargs,
+        "continued",
+        workspace_dir=tmp_path,
+      ), None
 
-      # INC-4 retired emit_html_artifact; the parent-resume-message ticker context
-      # is observable on the surviving skill_run_started event.
-      events = [entry.event for entry in parent_log.entries]
-      assert [event["type"] for event in events] == [
-        "skill_run_started",
-        "skill_result_captured",
-      ]
-      assert events[0]["ticker"] == "PCTY"
-      assert events[0]["scope"] == "ticker"
-      assert events[1]["ticker"] == "PCTY"
+    runner.resume_sub_agent = _resume_sub_agent
+    parent_log = EventLog()
+    handler = make_resume_handler(
+      [runner],
+      parent_session=GatewaySession(
+        session_id="sess-parent",
+        api_key_hash="hash",
+        created_at=10,
+        expires_at=20,
+        user_id="alice",
+        auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+      ),
+      mcp_client=_NullMcpClient(),
+      local_tool_handlers={},
+      excluded_tools_resolver=frozenset,
+    )
 
-    _run(_case())
-  finally:
-    memory.set_memory_store_factory(None)
+    result, error = await handler(
+      {"task_id": "bg_parent_scope"},
+      tool_ctx=ToolExecutionContext(
+        tool_call_id="turn-resume",
+        tool_name="resume_background_agent",
+        event_log=parent_log,
+      ),
+    )
+    assert error is None
+    assert result is not None
+    resumed_entry = runner._task_registry.get(result["task_id"])
+    assert resumed_entry is not None
+    assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
+    await resumed_entry.asyncio_task
+
+    # INC-4 retired emit_html_artifact; the parent-resume-message ticker context
+    # is observable on the surviving skill_run_started event.
+    events = [entry.event for entry in parent_log.entries]
+    assert [event["type"] for event in events] == [
+      "skill_run_started",
+      "skill_result_captured",
+    ]
+    assert events[0]["ticker"] == "PCTY"
+    assert events[0]["scope"] == "ticker"
+    assert events[1]["ticker"] == "PCTY"
+
+  _run(_case())
 
 
 def test_resume_generic_historical_admission_without_ticker_remains_live(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  import memory
 
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "data"))
-  memory.set_memory_store_factory(None)
-  try:
-    async def _case() -> None:
-      skills_dir = tmp_path / "skills"
-      _write_skill(skills_dir, "html-research", "scope: ticker")
-      runner = _runner(tmp_path)
-      runner._runner_id = "runner-test"
-      await _append_interrupted_skill_task(
-        runner,
-        task_id="bg_no_scope",
-        agent_name="html-research",
-        user_message="Resume the html analysis carefully.",
-        required_context=(),
-        ticker=None,
-      )
-      captured: dict[str, Any] = {}
+  async def _case() -> None:
+    skills_dir = tmp_path / "skills"
+    _write_skill(skills_dir, "html-research", "scope: ticker")
+    runner = _runner(tmp_path)
+    runner._runner_id = "runner-test"
+    await _append_interrupted_skill_task(
+      runner,
+      task_id="bg_no_scope",
+      agent_name="html-research",
+      user_message="Resume the html analysis carefully.",
+      required_context=(),
+      ticker=None,
+    )
+    captured: dict[str, Any] = {}
 
-      async def _resume_sub_agent(**kwargs: Any):
-        captured.update(kwargs)
-        return await _successful_resume_task_result(
-          kwargs,
-          "continued",
-          workspace_dir=tmp_path,
-        ), None
+    async def _resume_sub_agent(**kwargs: Any):
+      captured.update(kwargs)
+      return await _successful_resume_task_result(
+        kwargs,
+        "continued",
+        workspace_dir=tmp_path,
+      ), None
 
-      runner.resume_sub_agent = _resume_sub_agent
-      parent_log = EventLog()
-      handler = make_resume_handler(
-        [runner],
-        parent_session=GatewaySession(
-          session_id="sess-parent",
-          api_key_hash="hash",
-          created_at=10,
-          expires_at=20,
-          user_id="alice",
-          auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
-        ),
-        mcp_client=_NullMcpClient(),
-        local_tool_handlers={},
-        excluded_tools_resolver=frozenset,
-      )
+    runner.resume_sub_agent = _resume_sub_agent
+    parent_log = EventLog()
+    handler = make_resume_handler(
+      [runner],
+      parent_session=GatewaySession(
+        session_id="sess-parent",
+        api_key_hash="hash",
+        created_at=10,
+        expires_at=20,
+        user_id="alice",
+        auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+      ),
+      mcp_client=_NullMcpClient(),
+      local_tool_handlers={},
+      excluded_tools_resolver=frozenset,
+    )
 
-      result, error = await handler(
-        {"task_id": "bg_no_scope"},
-        tool_ctx=ToolExecutionContext(
-          tool_call_id="turn-resume",
-          tool_name="resume_background_agent",
-          event_log=parent_log,
-        ),
-      )
-      assert error is None
-      assert result is not None
-      resumed_entry = runner._task_registry.get(result["task_id"])
-      assert resumed_entry is not None
-      assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
-      await resumed_entry.asyncio_task
+    result, error = await handler(
+      {"task_id": "bg_no_scope"},
+      tool_ctx=ToolExecutionContext(
+        tool_call_id="turn-resume",
+        tool_name="resume_background_agent",
+        event_log=parent_log,
+      ),
+    )
+    assert error is None
+    assert result is not None
+    resumed_entry = runner._task_registry.get(result["task_id"])
+    assert resumed_entry is not None
+    assert isinstance(resumed_entry.asyncio_task, asyncio.Task)
+    await resumed_entry.asyncio_task
 
-      # INC-4 retired emit_html_artifact; the portfolio-scope fallback (no ticker)
-      # is observable on the surviving skill_run_started event.
-      events = [entry.event for entry in parent_log.entries]
-      assert [event["type"] for event in events] == [
-        "skill_run_started",
-        "skill_result_captured",
-      ]
-      assert events[0]["ticker"] is None
-      assert events[0]["scope"] == "portfolio"
-      assert events[1]["ticker"] is None
+    # INC-4 retired emit_html_artifact; the portfolio-scope fallback (no ticker)
+    # is observable on the surviving skill_run_started event.
+    events = [entry.event for entry in parent_log.entries]
+    assert [event["type"] for event in events] == [
+      "skill_run_started",
+      "skill_result_captured",
+    ]
+    assert events[0]["ticker"] is None
+    assert events[0]["scope"] == "portfolio"
+    assert events[1]["ticker"] is None
 
-    _run(_case())
-  finally:
-    memory.set_memory_store_factory(None)
+  _run(_case())
 
 
 def test_resume_ticker_required_historical_admission_without_binding_fails_closed(

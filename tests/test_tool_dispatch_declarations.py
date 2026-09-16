@@ -13,9 +13,6 @@ from agent_gateway.tool_dispatch_declarations import (
   tool_dispatch_semantics_overrides,
 )
 from agent_workflow_contracts.tool_registration import RegisteredToolIdentity
-from api.agent.shared.tool_policy_implementations import (
-  build_product_tool_policy_implementation_registry,
-)
 
 
 def _local(name: str) -> RegisteredToolIdentity:
@@ -190,16 +187,6 @@ def test_dispatch_semantics_revalidate_forged_exact_class_identities(
     tool_dispatch_semantics_for(identity)
 
 
-def test_every_final_dispatch_policy_ref_exists_and_accepts_its_parameters() -> None:
-  registry = build_product_tool_policy_implementation_registry()
-  semantics = (
-    DEFAULT_TOOL_DISPATCH_SEMANTICS,
-    *tool_dispatch_semantics_overrides().values(),
-  )
-
-  for value in semantics:
-    registry.validate_reference(value.outcome_policy)
-    registry.validate_reference(value.source_identity_policy)
 
 
 _SUCCESS_SOURCE_DESCRIPTORS = {

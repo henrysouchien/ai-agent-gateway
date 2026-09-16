@@ -17,7 +17,7 @@ from agent_gateway.autonomous_control_files import (
 )
 from agent_gateway.autonomous_launch_envelope import AutonomousControlAuthority
 from agent_gateway.autonomous_runner_state import AutonomousTask
-from tests.capability_execution_test_support import (
+from gateway_test_support.capability_execution_test_support import (
   stub_capability_execution_resolver,
 )
 

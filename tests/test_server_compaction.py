@@ -38,7 +38,7 @@ from agent_gateway.server_compaction import (
 )
 import agent_gateway.runner_run_loop as runner_run_loop
 import agent_gateway.server_compaction as server_compaction
-from tests.capability_execution_test_support import (
+from gateway_test_support.capability_execution_test_support import (
   stub_bound_capability_execution,
 )
 

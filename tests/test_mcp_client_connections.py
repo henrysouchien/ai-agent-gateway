@@ -16,7 +16,7 @@ from anyio import ClosedResourceError
 from mcp.types import CallToolResult
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -240,6 +240,7 @@ def test_eof_and_delayed_tool_failures_keep_one_live_generation(
       second = queue(["alpha"], generation=2)
       queue(["alpha"], generation=3)
       manager._servers["first"].stdio_eof.set()
+      manager._servers["first"].stdio_receive_done.set()
       failure_releases[0].set()
       first_outcome = await asyncio.wait_for(calls[0], timeout=1)
       failure_releases[1].set()
@@ -265,6 +266,140 @@ def test_eof_and_delayed_tool_failures_keep_one_live_generation(
   asyncio.run(scenario())
 
 
+def test_pending_retry_awaits_passive_eof_reconnect(reconnect_transport, monkeypatch):
+  async def scenario():
+    queue, opened_contexts = reconnect_transport
+    queue(["alpha"])
+    manager = McpClientManager(config_path=None, inline_servers={
+      "first": {"command": sys.executable},
+    })
+    await manager.startup()
+    server = manager._servers["first"]
+    connect_started = asyncio.Event()
+    connect_release = asyncio.Event()
+    retry_started = asyncio.Event()
+    connect = manager._connect_stdio_with_retries
+
+    async def delayed_connect(name, config):
+      connect_started.set()
+      await connect_release.wait()
+      return await connect(name, config)
+
+    async def retry():
+      retry_started.set()
+      return await manager._retry_stdio_tool_call_after_reconnect(
+        server_name="first", server=server, original_name="alpha",
+        tool_input={}, meta=None, abort_event=None, timeout_seconds=1,
+        cause=EOFError("connection closed"),
+      )
+
+    monkeypatch.setattr(manager, "_connect_stdio_with_retries", delayed_connect)
+    pending = None
+    try:
+      queue(["alpha"], generation=2)
+      server.stdio_eof.set()
+      server.stdio_receive_done.set()
+      await asyncio.wait_for(connect_started.wait(), timeout=1)
+      pending = asyncio.create_task(retry())
+      await asyncio.wait_for(retry_started.wait(), timeout=1)
+      connect_release.set()
+      result = await asyncio.wait_for(pending, timeout=1)
+      assert result.structuredContent == {"tool": "alpha", "generation": 2}
+      assert await manager.call_tool("alpha", {}) == (
+        {"tool": "alpha", "generation": 2}, None,
+      )
+      assert len(opened_contexts) == 4
+    finally:
+      connect_release.set()
+      if pending is not None:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+      await manager.shutdown()
+    assert all(context.closed for context in opened_contexts)
+
+  asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("allow_uncertain_replay", [False, True], ids=["future", "replay"])
+def test_pending_stdio_calls_survive_passive_eof_reconnect(
+  tmp_path, allow_uncertain_replay,
+):
+  server_script = tmp_path / "mcp_server.py"
+  server_script.write_text("""
+import asyncio
+import json
+import os
+from pathlib import Path
+from fastmcp import FastMCP
+
+generation = Path("generation").read_text()
+with Path("starts").open("a") as stream:
+    stream.write(json.dumps({"pid": os.getpid(), "generation": generation}) + "\\n")
+mcp = FastMCP("pending-read")
+
+@mcp.tool()
+async def read_generation() -> dict:
+    with Path("calls").open("a") as stream:
+        stream.write(generation + "\\n")
+    if generation == "first":
+        await asyncio.Event().wait()
+    return {"generation": generation}
+
+mcp.run()
+""")
+  generation_file = tmp_path / "generation"
+  generation_file.write_text("first")
+  calls_file = tmp_path / "calls"
+  starts_file = tmp_path / "starts"
+
+  async def scenario():
+    manager = McpClientManager(
+      config_path=None,
+      default_tool_timeout=2,
+      inline_servers={
+        "generation": {
+          "command": sys.executable, "args": [str(server_script)], "cwd": str(tmp_path),
+        },
+      },
+    )
+    await manager.startup()
+    calls = []
+    try:
+      for _ in range(2):
+        calls.append(asyncio.create_task(manager.call_tool(
+          "read_generation", {}, allow_uncertain_replay=allow_uncertain_replay,
+        )))
+      async with asyncio.timeout(10):
+        while not calls_file.exists() or len(calls_file.read_text().splitlines()) < 2:
+          await asyncio.sleep(0.01)
+      first = json.loads(starts_file.read_text().splitlines()[0])
+      generation_file.write_text("second")
+      os.kill(first["pid"], signal.SIGTERM)
+      outcomes = await asyncio.wait_for(asyncio.gather(*calls), timeout=10)
+      if allow_uncertain_replay:
+        assert outcomes == [({"generation": "second"}, None)] * 2
+      else:
+        for result, error in outcomes:
+          assert result is None
+          assert error["sub_code"] == "connection_error"
+      assert await manager.call_tool("read_generation", {}) == (
+        {"generation": "second"}, None,
+      )
+      assert [json.loads(line)["generation"] for line in starts_file.read_text().splitlines()] == [
+        "first", "second",
+      ]
+      assert calls_file.read_text().splitlines() == (
+        ["first", "first"] + ["second"] * (3 if allow_uncertain_replay else 1)
+      )
+    finally:
+      for call in calls:
+        call.cancel()
+      await asyncio.gather(*calls, return_exceptions=True)
+      await manager.shutdown()
+
+  asyncio.run(scenario())
+
+
 def test_idle_stdio_child_reconnects_after_generation_swap_and_rollback(tmp_path):
   server_script = tmp_path / "mcp_server.py"
   generation_file = tmp_path / "generation"
@@ -274,7 +409,7 @@ def test_idle_stdio_child_reconnects_after_generation_swap_and_rollback(tmp_path
 import json
 import os
 from pathlib import Path
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 generation = Path("generation").read_text()
 identity = {"pid": os.getpid(), "generation": generation, "cwd": os.getcwd()}
@@ -419,6 +554,59 @@ def test_invalid_allowed_tools_leaves_optional_server_unadvertised() -> None:
   assert manager.get_startup_diagnostics()["idea-workbench-mcp"]["category"] == (
     "invalid_config"
   )
+
+
+def test_failed_stdio_child_reports_bounded_stderr_tail(monkeypatch, caplog) -> None:
+  monkeypatch.setattr(mcp_client_module, "_stdio_connect_retries", lambda: 0)
+  script = (
+    "import sys\n"
+    "for index in range(30): print(f'startup-line-{index:02}', file=sys.stderr)\n"
+    "raise RuntimeError('child dependency failed')\n"
+  )
+
+  async def scenario():
+    manager = McpClientManager(config_path=None)
+    try:
+      assert await manager._connect_or_warn(
+        "broken-child", {"command": sys.executable, "args": ["-c", script]},
+      ) is None
+    finally:
+      await manager.shutdown()
+
+  asyncio.run(scenario())
+  diagnostics = [
+    record.getMessage() for record in caplog.records
+    if "broken-child" in record.getMessage() and "stderr" in record.getMessage()
+  ]
+  assert len(diagnostics) == 1
+  stderr = diagnostics[0].split("\n", 1)[1]
+  assert len(stderr.splitlines()) == 20
+  assert "startup-line-00" not in stderr
+  assert "startup-line-29" in stderr
+  assert stderr.endswith("RuntimeError: child dependency failed")
+
+
+def test_failed_stdio_child_with_long_stderr_line_does_not_block(monkeypatch, caplog) -> None:
+  monkeypatch.setattr(mcp_client_module, "_stdio_connect_retries", lambda: 0)
+  script = "import sys; sys.stderr.write('x' * 1_000_000 + 'fatal startup error\\n')"
+
+  async def scenario():
+    manager = McpClientManager(config_path=None)
+    try:
+      assert await asyncio.wait_for(manager._connect_or_warn(
+        "noisy-child", {"command": sys.executable, "args": ["-c", script]},
+      ), timeout=15) is None
+    finally:
+      await manager.shutdown()
+
+  asyncio.run(scenario())
+  diagnostic = next(
+    record.getMessage() for record in caplog.records
+    if "noisy-child" in record.getMessage() and "stderr" in record.getMessage()
+  )
+  stderr = diagnostic.split("\n", 1)[1]
+  assert len(stderr) <= 8192
+  assert stderr.endswith("fatal startup error")
 
 
 def test_connect_stdio_wrapper_uses_parent_module_runtime(monkeypatch) -> None:

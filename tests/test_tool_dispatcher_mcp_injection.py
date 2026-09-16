@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -52,6 +52,7 @@ def test_dispatch_injects_session_id_only_for_configured_mcp_servers() -> None:
   dispatcher = ToolDispatcher(
     mcp_client=mcp_client,
     local_tool_handlers={},
+    role="owner",
     session_id="sess_browser_123",
     mcp_session_inject_servers={"browser"},
   )
@@ -88,6 +89,7 @@ def test_dispatch_rejects_mcp_tool_outside_scoped_allowlist() -> None:
   dispatcher = ToolDispatcher(
     mcp_client=mcp_client,
     local_tool_handlers={},
+    role="owner",
     allowed_mcp_tools_by_server={"browser": {"browser_snapshot"}},
   )
 

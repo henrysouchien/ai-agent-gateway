@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import os
+import threading
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -17,13 +18,18 @@ class _StdioReadStream:
   def __init__(self, stream: Any) -> None:
     self._stream = stream
     self.eof = asyncio.Event()
+    self.receive_done = asyncio.Event()
 
   async def __aenter__(self) -> _StdioReadStream:
     await self._stream.__aenter__()
     return self
 
   async def __aexit__(self, *args: Any) -> None:
-    await self._stream.__aexit__(*args)
+    try:
+      await self._stream.__aexit__(*args)
+    finally:
+      # ClientSession exits this context after notifying all pending requests.
+      self.receive_done.set()
 
   def __aiter__(self) -> _StdioReadStream:
     return self
@@ -134,12 +140,36 @@ class McpConnectionRuntime:
   logger: Any
 
 
-class _SyncCloseContext:
-  def __init__(self, close: Callable[[], Any]) -> None:
-    self._close = close
+class _StdioStderr:
+  """Drain child stderr without blocking it or retaining an unbounded log."""
+
+  def __init__(self, name: str, logger: Any) -> None:
+    read_fd, write_fd = os.pipe()
+    self.errlog = os.fdopen(write_fd, "w", encoding="utf-8")
+    self._reader = os.fdopen(read_fd, "rb", buffering=0)
+    self._tail = bytearray()
+    self._name = name
+    self._logger = logger
+    self.failed = True
+    self._thread = threading.Thread(target=self._drain, daemon=True)
+    self._thread.start()
+
+  def _drain(self) -> None:
+    with self._reader:
+      while chunk := self._reader.read(4096):
+        self._tail.extend(chunk)
+        del self._tail[:-8192]
 
   async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-    self._close()
+    self.errlog.close()
+    await asyncio.to_thread(self._thread.join)
+    if self.failed and self._tail:
+      tail = "\n".join(self._tail.decode("utf-8", errors="replace").splitlines()[-20:])
+      self._logger.warning(
+        "MCP stdio server %s failed to connect; stderr (last 20 lines, up to 8192 bytes):\n%s",
+        self._name,
+        tail,
+      )
 
 
 async def connect_startup_servers(
@@ -271,9 +301,9 @@ async def connect_stdio(
       cwd=cwd,
     )
 
-    devnull = open(os.devnull, "w")
-    exit_contexts.append(_SyncCloseContext(devnull.close))
-    stdio_cm = runtime.stdio_client_factory(server_params, errlog=devnull)
+    stderr = _StdioStderr(name, runtime.logger)
+    exit_contexts.append(stderr)
+    stdio_cm = runtime.stdio_client_factory(server_params, errlog=stderr.errlog)
     read_stream, write_stream = await stdio_cm.__aenter__()
     exit_contexts.append(stdio_cm)
     read_stream = _StdioReadStream(read_stream)
@@ -292,6 +322,8 @@ async def connect_stdio(
     await manager._verify_stdio_session_stable(session)
     state.config = dict(config)
     state.stdio_eof = read_stream.eof
+    state.stdio_receive_done = read_stream.receive_done
+    stderr.failed = False
     success = True
     return state
   finally:

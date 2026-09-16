@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, TypedDict
 import pytest
 
 from .control_plane.manifest_helpers import write_v6_manifest
-from .control_plane.identity_helpers import fake_identity_resolver, fake_mcp_user_key_lookup
+from gateway_test_support.control_plane_identity import fake_identity_resolver, fake_mcp_user_key_lookup
 
 if TYPE_CHECKING:
   from agent_gateway.capability_binding import RunMode
@@ -33,7 +33,7 @@ HMAC_KEY = "test-hmac-key-at-least-32-bytes-long"
 USER_ID = "1"
 USER_EMAIL = "hc@henrychien.com"
 TENANT_ID = "autonomous-runner-tests"
-API_DIR = Path(__file__).resolve().parents[3] / "api"
+API_DIR = Path(__file__).resolve().parents[1]
 CLAIM_ENV_KEYS = {
   "AGENT_API_CLAIM_AUDIENCE",
   "AGENT_API_CLAIM_ISSUED_AT",

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.18.4 (2026-09-15)
+
+### Fixed
+
+- Bound MCP dependencies to supported SDK majors (`mcp<2`, `fastmcp<4`);
+  newer majors remove the session APIs used by the gateway transport.
+- Made package tests independent of the embedding product checkout: product
+  integration scenarios live with the product, and generic fixtures and pytest
+  configuration are package-owned.
+
 ## 0.18.2 (2026-09-15)
 
 ### Fixed

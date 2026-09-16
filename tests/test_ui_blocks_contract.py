@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from agent_gateway import ui_blocks_contract
-from scripts.ui_blocks_fixture_loader import load_ui_blocks_fixtures
+from gateway_test_support.ui_blocks_fixtures import load_ui_blocks_fixtures
 
 
 def test_packaged_contract_accessors_are_valid() -> None:

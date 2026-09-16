@@ -2,9 +2,6 @@ from __future__ import annotations
 
 import json
 from importlib import resources
-from pathlib import Path
-import subprocess
-import sys
 from typing import get_args
 
 import pytest
@@ -23,50 +20,11 @@ from agent_gateway.control_run_lifecycle_contract import (
 from agent_gateway.control_plane.runs_models import AutonomousRunState, ChatRunState
 
 
-ROOT = Path(__file__).resolve().parents[4]
 CONTRACT_RESOURCE = resources.files("agent_gateway").joinpath(
   "contracts/control-run-v1/control_run_lifecycle.json"
 )
 
 
-def test_checked_in_control_run_lifecycle_contract_has_no_generation_drift() -> None:
-  result = subprocess.run(
-    [
-      sys.executable,
-      str(ROOT / "scripts" / "generate_control_run_lifecycle_contract.py"),
-      "--check",
-    ],
-    cwd=ROOT,
-    text=True,
-    capture_output=True,
-    check=False,
-  )
-
-  assert result.returncode == 0, result.stderr
-
-
-def test_control_run_lifecycle_contract_check_fails_on_local_drift(
-  tmp_path: Path,
-) -> None:
-  stale_output = tmp_path / "control_run_lifecycle.json"
-  stale_output.write_text("{}\n", encoding="utf-8")
-
-  result = subprocess.run(
-    [
-      sys.executable,
-      str(ROOT / "scripts" / "generate_control_run_lifecycle_contract.py"),
-      "--check",
-      "--output",
-      str(stale_output),
-    ],
-    cwd=ROOT,
-    text=True,
-    capture_output=True,
-    check=False,
-  )
-
-  assert result.returncode == 1
-  assert "stale control-run lifecycle contract" in result.stderr
 
 
 def test_packaged_control_run_lifecycle_contract_matches_python_owner() -> None:

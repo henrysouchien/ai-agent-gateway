@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -27,7 +27,7 @@ from agent_gateway.auth import (
 from agent_gateway.fork_request_handoff import ForkRequestHandoff
 from agent_gateway.providers import AnthropicProvider
 from agent_gateway.session import GatewaySession
-from tests.capability_execution_test_support import stub_runner_capability_execution
+from gateway_test_support.capability_execution_test_support import stub_runner_capability_execution
 
 
 def test_auth_config_round_trips_and_preserves_all_fields() -> None:

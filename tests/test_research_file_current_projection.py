@@ -50,6 +50,11 @@ _GENERATION_1 = "11111111-1111-4111-8111-111111111111"
 _GENERATION_2 = "22222222-2222-4222-8222-222222222222"
 
 
+@pytest.fixture(autouse=True)
+def _projection_tenant(monkeypatch):
+  monkeypatch.setenv("PRODUCT_ID", "tenant-a")
+
+
 def _run(coro):
   return asyncio.run(coro)
 

@@ -12,12 +12,11 @@ from typing import Any, Callable, Literal
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
-API_DIR = ROOT / "api"
-if str(API_DIR) not in sys.path:
-  sys.path.insert(0, str(API_DIR))
+
+
 
 from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog, SessionStore  # noqa: E402
 from agent_gateway import sdk_runner_approval  # noqa: E402
@@ -48,7 +47,7 @@ from agent_gateway.sdk_runner_stream import ToolCallInfo  # noqa: E402
 from agent_gateway.mcp_client import RegisteredMcpRawPatchAuthorization  # noqa: E402
 from agent_gateway.tool_dispatch_classification import ToolResultSettlement  # noqa: E402
 from agent_gateway.tool_policy_registry import PlanDecision, PreparedToolCall  # noqa: E402
-from tests.sdk_capability_execution_test_support import stub_sdk_capability_execution  # noqa: E402
+from gateway_test_support.sdk_capability_execution_test_support import stub_sdk_capability_execution  # noqa: E402
 
 
 def _skill_admission(name: str) -> ActiveSkillAdmission:
@@ -811,12 +810,17 @@ def test_sdk_runner_report_admission_fails_closed_without_carrier(
 
 def test_sdk_runner_stale_prefixed_mcp_tool_denied_without_approval(monkeypatch: pytest.MonkeyPatch) -> None:
   _install_fake_agent_sdk(monkeypatch)
-  from agent.shared import server_policies
+  from agent_gateway import policy_imports
 
   monkeypatch.setattr(
-    server_policies,
-    "get_server_for_policy_tool",
-    lambda tool_name: "portfolio-trades-mcp" if tool_name == "execute_trade" else None,
+    policy_imports,
+    "_server_policy",
+    SimpleNamespace(
+      get_forbidden_tools_for_session=lambda _session: frozenset(),
+      get_server_for_policy_tool=lambda name: (
+        "portfolio-trades-mcp" if name == "execute_trade" else None
+      ),
+    ),
   )
   runner = _make_runner()
 

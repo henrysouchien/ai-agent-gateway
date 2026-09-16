@@ -8,12 +8,11 @@ from agent_workflow_contracts import ResolvedAuthority
 
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
-API_DIR = ROOT / "api"
+PKG_DIR = Path(__file__).resolve().parents[1]
+
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
-if str(API_DIR) not in sys.path:
-  sys.path.insert(0, str(API_DIR))
+
 
 from agent_gateway.skills import (
   AGENT_DESCRIPTION_MAX_CHARS,
@@ -29,25 +28,6 @@ from agent_gateway.skills import (
   validate_operation_tool_coherence,
 )
 
-SKILLS_DIR = ROOT / "api" / "memory" / "workspace" / "notes" / "skills"
-COMPACT_ROLLOUT_SKILLS = [
-  "fundamental-research",
-  "business-quality-assessment",
-  "competitive-position",
-  "critical-factors",
-  "forecast-assumptions",
-  "earnings-scenarios",
-  "dcf-relative-valuation",
-  "identifying-risk",
-  "quantifying-risk",
-  "managing-risk",
-  "thesis-articulation",
-  "thesis-review",
-  "valuation-inputs",
-  "financial-red-flags",
-  "scenario-multiple-pricing",
-  "expected-value-decision",
-]
 
 
 def _write_skill(tmp_path: Path, frontmatter: str | None, *, body: str = "# Skill\n\nPrompt") -> Path:
@@ -849,43 +829,12 @@ def test_scalar_mcp_tool_names_shape_rejected(tmp_path: Path) -> None:
     parse_skill_file(skill_path)
 
 
-def test_error_extraction_is_registered_as_product_observation_skill() -> None:
-  loader = SkillLoader(SKILLS_DIR)
-
-  assert (SKILLS_DIR / "error-extraction.md").is_file()
-  assert "error-extraction" in loader.list_skills()
-  assert loader.exists("error-extraction") is True
-  assert loader.load("error-extraction").name == "error-extraction"
 
 
-def _compact_rollout_model_writer_skills() -> list[str]:
-  loader = SkillLoader(SKILLS_DIR)
-  return [
-    skill_name
-    for skill_name in COMPACT_ROLLOUT_SKILLS
-    if loader.load(skill_name).mutation_mode == "model_writer"
-  ]
 
 
-@pytest.mark.parametrize("skill_name", _compact_rollout_model_writer_skills())
-def test_model_writer_rollout_skills_are_not_resumable(skill_name: str) -> None:
-  profile = SkillLoader(SKILLS_DIR).load(skill_name)
-
-  assert profile.mutation_mode == "model_writer"
-  assert profile.resumable is False
 
 
-@pytest.mark.parametrize(
-  ("skill_name", "expected_timeout"),
-  [
-    ("fundamental-research", 1800.0),
-    ("valuation-inputs", 1200.0),
-  ],
-)
-def test_compact_rollout_skill_timeout_frontmatter(skill_name: str, expected_timeout: float) -> None:
-  profile = SkillLoader(SKILLS_DIR).load(skill_name)
-
-  assert profile.timeout == expected_timeout
 
 
 # --- PN-E2E-01: typed operation tool-coherence -------------------------------
@@ -923,76 +872,12 @@ class _StaticMcpClient:
     return name if name in self._server_by_tool else None
 
 
-def test_evidence_synthesis_compiles_its_declared_evidence_port() -> None:
-  # A tool-less integrator states, in the catalog, where upstream results
-  # enter and how many at minimum.  The digest covers the port; snapshots
-  # without ports keep their pre-port byte shape.
-  profile = SkillLoader(SKILLS_DIR).load("evidence-synthesis")
-  operation = compile_agent_operation(profile, execution_class="node.implement")
-
-  assert [port.model_dump() for port in operation.evidence_ports] == [
-    {"name": "evidence", "min_selections": 1, "max_selections": 6},
-  ]
-  assert operation.required_context == ()
-  assert "evidence_ports" in operation.model_dump(mode="json")
-
-  explore = compile_agent_operation(
-    SkillLoader(SKILLS_DIR).load("explore"),
-    execution_class="node.explore",
-  )
-  assert explore.evidence_ports == ()
-  assert "evidence_ports" not in explore.model_dump(mode="json")
 
 
-def test_evidence_port_cannot_reuse_a_required_context_key() -> None:
-  profile = SkillLoader(SKILLS_DIR).load("evidence-synthesis")
-  assert profile.metadata is not None
-  profile.metadata["evidence_ports"] = [{"name": "ticker"}]
-  profile.metadata["required_context"] = ["ticker"]
-  with pytest.raises(ValueError, match="cannot reuse required_context"):
-    compile_agent_operation(profile, execution_class="node.implement")
 
 
-def test_peer_comparison_analysis_declares_evidence_capability_and_ceiling() -> None:
-  profile = SkillLoader(SKILLS_DIR).load("peer-comparison-analysis")
-
-  assert operation_tool_ids(profile) == _PEER_COMPARISON_DECLARED_TOOLS
-
-  operation = compile_agent_operation(profile, execution_class="node.explore")
-
-  # B-8: the 8-tool data ceiling now names the two evidence universes it can
-  # actually reach, instead of the single coarse row any read tool satisfied.
-  assert [item.name for item in operation.required_capabilities] == [
-    "filings.read/v1",
-    "market-data.read/v1",
-  ]
-  assert all(
-    "live_tool" in item.binding_modes for item in operation.required_capabilities
-  )
 
 
-def test_peer_comparison_analysis_compiles_non_empty_tool_grant() -> None:
-  from agent_gateway.sub_agent_scope_receipt import admit_operation_tools
-
-  profile = SkillLoader(SKILLS_DIR).load("peer-comparison-analysis")
-  operation = compile_agent_operation(profile, execution_class="node.explore")
-  declared = operation_tool_ids(profile)
-
-  authority = admit_operation_tools(
-    operation,
-    grant_id="grant:test-peer-comparison",
-    operation_tool_ids=declared,
-    definitions=[{"name": name} for name in sorted(declared)],
-    local_tool_handlers={},
-    mcp_client=_StaticMcpClient(_PEER_COMPARISON_TOOLS_BY_SERVER),
-    effect_resolver=lambda tool_id, server_id, is_local: "read",
-  )
-  assert isinstance(authority, ResolvedAuthority)
-
-  assert authority.grant.tools
-  assert {
-    entry.tool_id for entry in authority.grant.tools
-  } == _PEER_COMPARISON_DECLARED_TOOLS
 
 
 def test_operation_tool_coherence_rejects_requirements_without_ceiling(
@@ -1028,39 +913,8 @@ def test_operation_tool_coherence_rejects_requirements_without_ceiling(
     compile_agent_operation(profile, execution_class="node.explore")
 
 
-def test_operation_tool_coherence_accepts_tool_free_and_tool_backed_profiles(
-  tmp_path: Path,
-) -> None:
-  tool_free = parse_skill_file(
-    _write_skill(
-      tmp_path,
-      """
-      name: tool-free-skill
-      agent_callable: true
-      agent_description: Genuinely tool-free advisory profile.
-      mutation_mode: read_only
-      semantic_metadata:
-        tool_refs: []
-      """,
-    )
-  )
-  validate_operation_tool_coherence(tool_free)
-  assert compile_agent_operation(
-    tool_free,
-    execution_class="node.explore",
-  ).required_capabilities == ()
-
-  backed = SkillLoader(SKILLS_DIR).load("filing-extractor")
-  validate_operation_tool_coherence(backed)
 
 
-def test_operation_tool_coherence_holds_for_all_callable_catalog_skills() -> None:
-  loader = SkillLoader(SKILLS_DIR)
-  for name in loader.list_skills():
-    profile = loader.load(name)
-    if not profile.agent_callable:
-      continue
-    validate_operation_tool_coherence(profile)
 
 
 def test_shim_named_profile_without_declarations_needs_nothing(

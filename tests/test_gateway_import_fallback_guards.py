@@ -62,7 +62,7 @@ def test_control_profiles_require_names_and_loader_together() -> None:
 def test_gateway_package_module_not_found_fallbacks_are_guarded() -> None:
   offenders = [
     file_path.relative_to(ROOT).as_posix()
-    for file_path in (ROOT / "packages" / "agent-gateway" / "agent_gateway").rglob("*.py")
+    for file_path in (Path(__file__).resolve().parents[1] / "agent_gateway").rglob("*.py")
     if BROAD_MODULE_NOT_FOUND_RE.search(file_path.read_text(encoding="utf-8"))
   ]
 

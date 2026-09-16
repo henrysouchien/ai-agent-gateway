@@ -4,14 +4,14 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import AgentRunner, EventLog, McpClientManager, ModelInfo, ModelProvider, ToolDispatcher  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.runner import STREAM_STALL_TIMEOUT, STREAM_THINKING_STALL_TIMEOUT  # noqa: E402
-from tests.capability_execution_test_support import (  # noqa: E402
+from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_bound_capability_execution,
 )
 

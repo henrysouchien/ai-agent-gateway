@@ -25,9 +25,11 @@ from agent_workflow_contracts import (
 
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
+
+from gateway_test_support.host_policy import owner_session_host_policy  # noqa: E402
 
 from agent_gateway import (  # noqa: E402
   AgentRunner,
@@ -49,7 +51,7 @@ import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.runner_run_loop import (  # noqa: E402
   _background_success_snapshot,
 )
-from tests.capability_execution_test_support import (  # noqa: E402
+from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_runner_capability_execution,
 )
 
@@ -1627,9 +1629,11 @@ def test_runner_stale_recovery_synthesizes_orphan_tool_and_prior_writer_interrup
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
   recovery_delay: int,
+  owner_session_host_policy,
 ) -> None:
   from agent_gateway.providers.codex import CodexProvider
   from agent_gateway.providers.openai import OpenAIProvider
+  owner_session_host_policy.get_tool_risk_value = {"file_read": "read_only"}.__getitem__
 
   now = gateway_runner.time.time()
   monkeypatch.setattr(gateway_runner.time, "time", lambda: now - recovery_delay)

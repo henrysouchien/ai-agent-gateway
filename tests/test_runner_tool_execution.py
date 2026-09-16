@@ -8,9 +8,10 @@ from types import SimpleNamespace
 from typing import Any, Never
 
 import pytest
+from gateway_test_support.host_policy import owner_session_host_policy
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -47,7 +48,7 @@ from agent_gateway.tool_dispatch_classification import (  # noqa: E402
   ToolResultSettlement,
   settle_catalogless_tool_result,
 )
-from tests.capability_execution_test_support import (  # noqa: E402
+from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_runner_capability_execution,
 )
 
@@ -1239,78 +1240,8 @@ def test_execute_single_tool_stops_after_expired_approval() -> None:
   assert runner._stop_after_tool_results_tool_name == "file_write"
 
 
-def test_execute_single_tool_returns_typed_blocker_for_excluded_fms_commit_tool() -> None:
-  runner = AgentRunner(
-    event_log=EventLog(session_id="test"),
-    dispatcher=_ExplodingDispatcher(),  # type: ignore[arg-type]
-    session_id="test-fms-commit-excluded",
-    capability_execution=_capability_execution(),
-    excluded_tools={"fms_persist_business_model"},
-    user_id="alice",
-    billing_mode="byok",
-    rate_table_version="unknown",
-  )
-
-  live_entry, tool_name, extra_blocks = _run(
-    runner._execute_single_tool(
-      "tool-1",
-      "fms_persist_business_model",
-      {"judgment": {"ticker": "PCTY"}},
-      {"tools": []},
-    )
-  )
-
-  assert tool_name == "fms_persist_business_model"
-  assert extra_blocks == []
-  payload = json.loads(live_entry["content"])
-  error = payload["error"]
-  assert error["code"] == "tool_excluded"
-  assert error["sub_code"] == "requires_interactive_approval"
-  assert "BUILD_BLOCKED" in error["message"]
-  assert error["data"]["recommended_verdict"] == "BUILD_BLOCKED"
-  assert error["data"]["pending_action"] == {
-    "code": "persist_business_model",
-    "stage": "bm",
-    "message": "Run fms_persist_business_model interactively with operator approval, then retry the workflow.",
-    "severity": "blocking",
-    "target": "fms_persist_business_model",
-    "source": "runner_tool_exclusion",
-    "metadata": {
-      "blocked_tool": "fms_persist_business_model",
-      "requires_interactive_approval": True,
-      "tool_class": "state_write",
-      "resolution": (
-        "Run this commit tool in an interactive model-writer/thesis-writer "
-        "session with operator approval, then retry the blocked workflow."
-      ),
-    },
-  }
-
-  complete_events = [entry.event for entry in runner._log.entries if entry.event.get("type") == "tool_call_complete"]
-  assert complete_events
-  assert complete_events[0]["error"]["data"] == error["data"]
 
 
-def test_execute_single_tool_returns_typed_blocker_for_excluded_thesis_writer_tool() -> None:
-  runner = AgentRunner(
-    event_log=EventLog(session_id="test"),
-    dispatcher=_ExplodingDispatcher(),  # type: ignore[arg-type]
-    session_id="test-fms-thesis-excluded",
-    capability_execution=_capability_execution(),
-    excluded_tools={"fms_report_thesis_consultation"},
-    user_id="alice",
-    billing_mode="byok",
-    rate_table_version="unknown",
-  )
-
-  live_entry, _tool_name, _extra_blocks = _run(
-    runner._execute_single_tool("tool-1", "fms_report_thesis_consultation", {}, {"tools": []})
-  )
-
-  error = json.loads(live_entry["content"])["error"]
-  assert error["sub_code"] == "requires_interactive_approval"
-  assert error["data"]["pending_action"]["code"] == "report_thesis_consultation"
-  assert error["data"]["pending_action"]["stage"] == "diligence"
 
 
 def test_execute_single_tool_keeps_apply_proposal_exclusions_generic() -> None:
@@ -1836,10 +1767,18 @@ def _start_event_count(runner: AgentRunner) -> int:
 
 
 @pytest.fixture
-def declared_read_effects(monkeypatch: pytest.MonkeyPatch):
-  """Pin the derived `effect` column so retry eligibility is deterministic."""
+def declared_read_effects(monkeypatch: pytest.MonkeyPatch, owner_session_host_policy):
+  """Supply the live test routes and read effects used by retry scenarios."""
 
   from agent_gateway import tool_dispatch_declarations as declarations
+
+  owner_session_host_policy.get_server_for_policy_tool = lambda name: (
+    "fred-mcp"
+    if name == "fred_search"
+    else _RecordedMcpRoutes.get_server_for_tool(name)
+  )
+  owner_session_host_policy.get_local_tool_effect = lambda _name: None
+  owner_session_host_policy.get_tool_class = lambda _server, _name: "read"
 
   monkeypatch.setattr(
     declarations,
@@ -1851,6 +1790,7 @@ def declared_read_effects(monkeypatch: pytest.MonkeyPatch):
   yield
 
 
+@pytest.mark.usefixtures("declared_read_effects")
 def test_dispatch_record_is_emitted_on_the_ok_exit_path() -> None:
   runner = _dispatch_runner(
     _RecordedDispatcher(
@@ -1888,6 +1828,7 @@ def test_dispatch_record_is_emitted_on_the_ok_exit_path() -> None:
   ]
 
 
+@pytest.mark.usefixtures("declared_read_effects")
 def test_dispatch_record_is_emitted_on_the_semantic_error_exit_path() -> None:
   runner = _dispatch_runner(
     _RecordedDispatcher([({"status": "error", "error": {"code": "no_rows"}}, None)])
@@ -2192,6 +2133,7 @@ def test_retries_stop_at_two_and_emit_retries_exhausted(
   assert _start_event_count(runner) == 1
 
 
+@pytest.mark.usefixtures("declared_read_effects")
 @pytest.mark.parametrize(
   ("failures", "expected_attempts", "expected_outcome"),
   [

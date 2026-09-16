@@ -98,7 +98,7 @@ def _create_request(*, request_id: str = "request-1") -> Any:
 class _Registry(AutonomousRegistry):
   def __init__(self, on_start: Callable[[], None] | None = None) -> None:
     super().__init__(
-      api_dir=Path(__file__).resolve().parents[4] / "api",
+      api_dir=Path(__file__).parent,
       log_dir=Path(__file__).with_name("_unused_autonomous_logs"),
     )
     self.on_start = on_start

@@ -10,7 +10,7 @@ from mcp.types import CallToolResult
 
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -19,6 +19,7 @@ from agent_gateway.mcp_client_connections import McpToolCallResult  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
 from agent_gateway.tool_dispatcher import ToolDispatcher  # noqa: E402
 import agent_gateway.mcp_client as mcp_client_module  # noqa: E402
+from gateway_test_support.host_policy import owner_session_host_policy
 
 
 SERVER = "research-corpus-mcp"
@@ -63,6 +64,7 @@ def _session(user_id: int, email: str) -> GatewaySession:
     user_email=email,
     risk_user_id=user_id,
     owner_user_id=str(user_id),
+    role="owner",
   )
 
 
@@ -287,7 +289,7 @@ def test_user_processes_isolate_and_credential_change_replaces_cached_child() ->
   assert all("GATEWAY_USER_KEYS" not in env for env in captured_envs)
 
 
-def test_dispatcher_preserves_meta_and_authenticated_session_for_user_server(monkeypatch) -> None:
+def test_dispatcher_preserves_meta_and_authenticated_session_for_user_server(monkeypatch, owner_session_host_policy) -> None:
   async def scenario() -> None:
     manager = _manager(lambda *_args: {})
     gateway_session = _session(7, "user@example.com")

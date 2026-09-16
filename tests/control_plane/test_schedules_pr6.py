@@ -31,10 +31,9 @@ from agent_gateway.server import (
 )
 from agent_gateway.skill_limits import SkillExecutionLimits
 from agent_gateway.session import AuthManager, GatewaySession
-from agent.shared import server_policies
 
 from .manifest_helpers import write_v6_manifest
-from .identity_helpers import fake_identity_resolver, fake_mcp_user_key_lookup
+from gateway_test_support.control_plane_identity import fake_identity_resolver, fake_mcp_user_key_lookup
 
 
 API_KEY = "schedules-pr6-key"
@@ -70,7 +69,6 @@ def _make_app(
   return create_gateway_app(
     GatewayServerConfig(
       jwt_secret="schedules-pr6-test-secret-0123456789",
-      server_policy=server_policies,
       valid_api_keys={API_KEY},
       tenant_id="test-product",
       model_registry=INITIAL_MODEL_REGISTRY,

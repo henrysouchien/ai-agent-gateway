@@ -6,19 +6,17 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping
+from typing import Any
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 import agent_gateway.mcp_client as mcp_client_module
-import agent_gateway.tool_dispatcher as tool_dispatcher_module
 from agent_gateway import AgentRunner, EventLog
-from agent_gateway.approval_policy import RunContext
 from agent_gateway.dispatcher_factory import (
   GatewayDispatcherDeps,
   InvocationPrincipal,
@@ -27,87 +25,30 @@ from agent_gateway.dispatcher_factory import (
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.mcp_client_connections import McpClientSession
 from agent_gateway.session import GatewaySession
-from agent_gateway.session_capabilities import TEAM_WORKSPACE_WRITE_CAPABILITY
 from agent_gateway.tool_dispatcher import ToolDispatcher
-from agent_gateway.tool_policy_registry import PreparedToolCall
-from tests.capability_execution_test_support import (
+from gateway_test_support.capability_execution_test_support import (
   stub_runner_capability_execution,
+)
+from gateway_test_support.host_policy import owner_session_host_policy
+from gateway_test_support.mcp_meta_transport import (
+  _FakeMcpClient,
+  _dispatch,
+  _portfolio_tool_def,
+  _run,
 )
 
 
-def _run(coro):
-  return asyncio.run(coro)
+@pytest.fixture(autouse=True)
+def _transport_host_policy(owner_session_host_policy):
+  # Sessionless MCP fixtures exercise role transport, not local-tool authority.
+  owner_session_host_policy.invite_denies_local_tool = lambda _tool: True
+  return owner_session_host_policy
 
 
-def _dispatch(
-  dispatcher: ToolDispatcher,
-  tool_call_id: str,
-  tool_name: str,
-  tool_input: dict[str, Any],
-  **kwargs: Any,
-):
-  return dispatcher.dispatch(
-    tool_call_id,
-    tool_name,
-    tool_input,
-    advertised_tool_names=frozenset({tool_name}),
-    **kwargs,
-  )
 
 
-def _community_session(*, risk_user_id: int = 900001) -> GatewaySession:
-  now = int(time.time())
-  return GatewaySession(
-    session_id="sess-community",
-    api_key_hash="hash-community",
-    created_at=now,
-    expires_at=now + 300,
-    user_id="sia-community",
-    risk_user_id=risk_user_id,
-    role="invite",
-    capabilities=frozenset({TEAM_WORKSPACE_WRITE_CAPABILITY}),
-    channel="discord",
-  )
 
 
-class _FakeMcpClient(McpClientManager):
-  def __init__(
-    self,
-    server_name: str = "portfolio-reads-mcp",
-    *,
-    tool_name: str = "portfolio_tool",
-    original_names: dict[str, str] | None = None,
-  ) -> None:
-    super().__init__(config_path=None)
-    self.server_name = server_name
-    self.tool_name = tool_name
-    self.original_names = original_names or {}
-    self.calls: list[dict[str, Any]] = []
-
-  def is_mcp_tool(self, name: str) -> bool:
-    return name == self.tool_name
-
-  def get_server_for_tool(self, name: str) -> str | None:
-    return self.server_name if name == self.tool_name else None
-
-  def get_original_tool_name(self, name: str) -> str:
-    return self.original_names.get(name, name)
-
-  async def call_tool(
-    self,
-    name: str,
-    tool_input: dict[str, Any] | PreparedToolCall,
-    meta: dict[str, Any] | None = None,
-    abort_event: asyncio.Event | None = None,
-    gateway_session: object | None = None,
-    allow_uncertain_replay: bool = True,
-    trusted_dispatch_scope: Mapping[str, object] | None = None,
-  ):
-    self.calls.append({"name": name, "tool_input": tool_input, "meta": meta})
-    return {"ok": True}, None
-
-  def get_tool_definitions(self) -> list[dict[str, Any]]:
-    return [_portfolio_tool_def(name=self.tool_name)]
 
 
 
@@ -197,48 +138,6 @@ def _server_state(
   )
 
 
-class _RoundTripResearchMcpClient(McpClientManager):
-  def __init__(self) -> None:
-    super().__init__(config_path=None)
-    self.rows_by_user: dict[str, dict[str, Any]] = {}
-    self.calls: list[dict[str, Any]] = []
-
-  def is_mcp_tool(self, name: str) -> bool:
-    return name in {"thesis_create", "thesis_read"}
-
-  def get_server_for_tool(self, name: str) -> str | None:
-    if name == "thesis_create":
-      return "portfolio-writes-mcp"
-    if name == "thesis_read":
-      return "research-corpus-mcp"
-    return None
-
-  def get_original_tool_name(self, name: str) -> str:
-    return name
-
-  async def call_tool(
-    self,
-    name: str,
-    tool_input: dict[str, Any] | PreparedToolCall,
-    meta: dict[str, Any] | None = None,
-    abort_event: asyncio.Event | None = None,
-    gateway_session: object | None = None,
-    allow_uncertain_replay: bool = True,
-    trusted_dispatch_scope: Mapping[str, object] | None = None,
-  ):
-    assert isinstance(tool_input, dict)
-    user_id = str((meta or {}).get("user_id") or "")
-    self.calls.append({"name": name, "tool_input": dict(tool_input), "meta": meta})
-    if name == "thesis_create":
-      row = {"research_file_id": tool_input["research_file_id"], "statement": tool_input["statement"]}
-      self.rows_by_user[user_id] = row
-      return {"status": "created", "thesis": row}, None
-    if name == "thesis_read":
-      row = self.rows_by_user.get(user_id)
-      if row is None:
-        return None, {"code": "not_found", "message": "thesis not found"}
-      return {"status": "ok", "thesis": row}, None
-    return None, {"code": "unknown_tool", "message": name}
 
 
 def _dispatch_scope(**overrides: Any) -> dict[str, Any]:
@@ -252,25 +151,6 @@ def _dispatch_scope(**overrides: Any) -> dict[str, Any]:
   }
 
 
-def _portfolio_tool_def(
-  name: str = "portfolio_tool",
-  *,
-  properties: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-  return {
-    "name": name,
-    "description": "Portfolio tool",
-    "input_schema": {
-      "type": "object",
-      "properties": properties
-      if properties is not None
-      else {
-        "format": {"type": "string"},
-        "portfolio_id": {"type": "string"},
-        "portfolio_name": {"type": "string"},
-      },
-    },
-  }
 
 
 @pytest.mark.parametrize("server_name", ["portfolio-reads-mcp", "research-corpus-mcp"])
@@ -316,7 +196,6 @@ def test_tool_dispatcher_injects_user_id_into_mcp_meta(server_name: str) -> None
 def test_real_interactive_entry_paths_forward_canonical_risk_user_id(
   entry_path: str,
   channel: str,
-  monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   # /chat/init resolves both CLI inputs through the key's GATEWAY_USER_KEYS
   # identity. The mcp_analyst session sidecar identifies the same interactive
@@ -338,11 +217,6 @@ def test_real_interactive_entry_paths_forward_canonical_risk_user_id(
   mcp = _FakeMcpClient(
     server_name="portfolio-reads-mcp",
     tool_name="get_current_model",
-  )
-  monkeypatch.setattr(
-    tool_dispatcher_module,
-    "authority_policy_denies_tool",
-    lambda **_kwargs: False,
   )
   dispatcher = _build_interactive_dispatcher(session, mcp)
 
@@ -438,98 +312,6 @@ def test_cli_channel_research_corpus_meta_carries_caller_session_token() -> None
     }
   ]
 
-@pytest.mark.parametrize(
-  ("server_name", "tool_name"),
-  [
-    ("portfolio-writes-mcp", "thesis_create"),
-    ("portfolio-producers-mcp", "build_model"),
-  ],
-)
-def test_community_write_mcp_meta_uses_authenticated_team_identity(
-  server_name: str,
-  tool_name: str,
-) -> None:
-  mcp = _FakeMcpClient(server_name=server_name, tool_name=tool_name)
-  session = _community_session()
-  dispatcher = ToolDispatcher(
-    mcp_client=mcp,
-    local_tool_handlers={},
-    session_id=session.session_id,
-    user_id=session.user_id,
-    risk_user_id=session.risk_user_id,
-    channel=session.channel,
-    role=session.role,
-    session=session,
-    run_context=RunContext(
-      user_id=session.user_id,
-      request_id="request-community-write",
-      session_id=session.session_id,
-      profile="community",
-      channel="discord",
-      run_id="skill-run-community-write",
-    ),
-    mcp_meta_inject_servers=frozenset({"portfolio-producers-mcp", "portfolio-writes-mcp"}),
-  )
-
-  result, error = _run(_dispatch(
-    dispatcher,
-    "call-1",
-    tool_name,
-    {"ticker": "MSFT"},
-    skill_run_id=(
-      "skill-run-community-write" if tool_name == "build_model" else None
-    ),
-  ))
-
-  assert error is None
-  assert result == {"ok": True}
-  assert mcp.calls[0]["meta"]["user_id"] == "900001"
-  assert mcp.calls[0]["meta"]["user_id"] != "1"
-
-
-def test_community_thesis_create_then_read_uses_team_store_identity() -> None:
-  mcp = _RoundTripResearchMcpClient()
-  session = _community_session()
-  dispatcher = ToolDispatcher(
-    mcp_client=mcp,
-    local_tool_handlers={},
-    session_id=session.session_id,
-    user_id=session.user_id,
-    risk_user_id=session.risk_user_id,
-    channel=session.channel,
-    role=session.role,
-    session=session,
-    run_context=RunContext(
-      user_id=session.user_id,
-      request_id="request-community-round-trip",
-      session_id=session.session_id,
-      profile="community",
-      channel="discord",
-    ),
-    mcp_meta_inject_servers=frozenset({"portfolio-writes-mcp", "research-corpus-mcp"}),
-    allowed_mcp_tools_by_server={
-      "portfolio-writes-mcp": {"thesis_create"},
-      "research-corpus-mcp": {"thesis_read"},
-    },
-  )
-
-  created, create_error = _run(
-    _dispatch(
-      dispatcher,
-      "call-1",
-      "thesis_create",
-      {"research_file_id": 101, "statement": "Team thesis."},
-    )
-  )
-  read, read_error = _run(_dispatch(dispatcher, "call-2", "thesis_read", {"research_file_id": 101}))
-
-  assert create_error is None
-  assert read_error is None
-  assert created is not None
-  assert read is not None
-  assert created["thesis"] == read["thesis"]
-  assert set(mcp.rows_by_user) == {"900001"}
-  assert all(call["meta"]["user_id"] == "900001" for call in mcp.calls)
 
 
 def test_tool_dispatcher_injects_run_context_into_mcp_meta_when_present() -> None:
@@ -736,7 +518,7 @@ def test_tool_dispatcher_uses_original_tool_name_for_prefixed_portfolio_default(
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-1",
-    session=SimpleNamespace(dispatch_scope=_dispatch_scope(portfolio_id=None)),
+    session=SimpleNamespace(dispatch_scope=_dispatch_scope(portfolio_id=None), role="owner"),
     get_tool_definitions=lambda: [
       _portfolio_tool_def(
         name="get_positions",

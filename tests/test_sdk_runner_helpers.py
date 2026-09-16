@@ -9,12 +9,11 @@ from typing import Any, Callable
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
-API_DIR = ROOT / "api"
-if str(API_DIR) not in sys.path:
-  sys.path.insert(0, str(API_DIR))
+
+
 
 from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog  # noqa: E402
 import agent_gateway.sdk_runner as sdk_runner  # noqa: E402
@@ -24,9 +23,7 @@ from agent_gateway import policy_imports  # noqa: E402
 from agent_gateway import sdk_runner_helpers  # noqa: E402
 from agent_gateway.sdk_runner_stream import ToolCallInfo  # noqa: E402
 from agent_gateway.tool_dispatch_classification import ToolResultSettlement  # noqa: E402
-from agent.shared import hooks  # noqa: E402
-from logs import cost_tracker  # noqa: E402
-from tests.sdk_capability_execution_test_support import stub_sdk_capability_execution  # noqa: E402
+from gateway_test_support.sdk_capability_execution_test_support import stub_sdk_capability_execution  # noqa: E402
 
 
 def _identity_registered_redaction(_tool_name, tool_input):
@@ -277,57 +274,6 @@ def test_sdk_context_surface_failure_log_is_value_free(caplog) -> None:
   assert "exception_type=RuntimeError" in caplog.text
 
 
-def test_sdk_runner_stream_forwards_live_tool_timing_identity(
-  tmp_path: Path,
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  db_path = tmp_path / "cost.db"
-  monkeypatch.setattr(cost_tracker, "_DB_PATH", db_path)
-  monkeypatch.setattr(sdk_runner, "time", SimpleNamespace(time=lambda: 12.5))
-  runner = AgentSDKRunner(
-    event_log=EventLog(),
-    session_id="sess-sdk-timing",
-    sdk_config=AgentSDKConfig(
-      user_id="alice",
-      billing_mode="byok",
-      rate_table_version="unknown",
-      request_id="req-sdk-timing",
-    ),
-    capability_execution=stub_sdk_capability_execution(),
-    system_prompt="test",
-    on_tool_timing=hooks.tool_timing_hook,
-  )
-  runner._pending_tool_calls["tool-sdk-1"] = ToolCallInfo(
-    tool_call_id="tool-sdk-1",
-    tool_name="mcp__portfolio-reads-mcp__documents_search",
-    tool_input={},
-    started_at=10.0,
-    redacted_tool_input={},
-  )
-
-  runner._complete_tool_call(
-    "tool-sdk-1",
-    executed_tool_input={},
-    result={"status": "ok"},
-  )
-
-  with sqlite3.connect(str(db_path)) as conn:
-    row = conn.execute(
-      """
-      SELECT capability_id, transport, request_id, tool_call_id, server, tool
-      FROM tool_timing
-      WHERE session_id = 'sess-sdk-timing'
-      """
-    ).fetchone()
-
-  assert tuple(row) == (
-    None,
-    "mcp",
-    "req-sdk-timing",
-    "tool-sdk-1",
-    "portfolio-reads-mcp",
-    "mcp__portfolio-reads-mcp__documents_search",
-  )
 
 
 def test_sdk_runner_helpers_preserve_core_payload_behavior() -> None:
@@ -343,18 +289,23 @@ def test_sdk_runner_helpers_preserve_core_payload_behavior() -> None:
 
 
 def test_sdk_runner_helpers_detect_catalogless_policy_owner_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
-  from agent.shared import server_policies
-
   monkeypatch.setattr(
-    server_policies,
-    "get_server_for_policy_tool",
-    lambda tool_name: "portfolio-trades-mcp" if tool_name == "execute_trade" else None,
+    policy_imports,
+    "_server_policy",
+    SimpleNamespace(
+      get_forbidden_tools_for_session=lambda _session: frozenset(),
+      get_server_for_policy_tool=lambda name: (
+        "portfolio-trades-mcp" if name == "execute_trade" else None
+      ),
+    ),
   )
 
   assert sdk_runner_helpers.catalogless_policy_owner_mismatch(
     "mcp__portfolio-reads-mcp__execute_trade"
   ) == ("portfolio-reads-mcp", "execute_trade", "portfolio-trades-mcp")
   assert sdk_runner_helpers.catalogless_policy_owner_mismatch("mcp__portfolio-trades-mcp__execute_trade") is None
+
+
 
 
 def test_sdk_runner_helpers_catalogless_owner_is_unset_without_bound_policy() -> None:

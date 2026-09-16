@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 from typing import Mapping
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 from mcp.types import CallToolResult as _ToolResult, ContentBlock, TextContent
@@ -28,6 +28,7 @@ from agent_gateway.mcp_client import (
 from agent_gateway.session import GatewaySession
 from agent_gateway.tool_dispatcher import ToolDispatcher
 import agent_gateway.mcp_client as mcp_client_module
+from gateway_test_support.host_policy import owner_session_host_policy
 
 
 def _definition(config=None):
@@ -67,6 +68,7 @@ def _gateway_session(user_id: int = 7, *, owner_user_id: str | None = None) -> G
     user_id=str(user_id),
     risk_user_id=user_id,
     owner_user_id=owner_user_id or str(user_id),
+    role="owner",
   )
 
 
@@ -304,7 +306,7 @@ def test_session_owner_mismatch_fails_closed_without_broker_mint():
   assert manager._per_user_servers == {}
 
 
-def test_dispatcher_passes_authenticated_session_to_per_user_mcp(monkeypatch):
+def test_dispatcher_passes_authenticated_session_to_per_user_mcp(monkeypatch, owner_session_host_policy):
   async def scenario():
     manager = _manager()
     manager._tool_to_server = {"gsheets_read_range": "gsheets-mcp"}
@@ -1042,7 +1044,7 @@ def test_broker_session_expired_no_uncertain_replay_refreshes_future_only(monkey
   asyncio.run(scenario())
 
 
-def test_future_dispatch_reuses_refreshed_per_user_sheets_session(monkeypatch):
+def test_future_dispatch_reuses_refreshed_per_user_sheets_session(monkeypatch, owner_session_host_policy):
   async def scenario():
     manager = _manager()
     manager._tool_to_server = {"gsheets_read_range": "gsheets-mcp"}

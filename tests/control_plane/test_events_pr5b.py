@@ -1,24 +1,21 @@
 from __future__ import annotations
 
 import asyncio
-from functools import cache
 from itertools import count
 import json
 import logging
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 from fastapi import FastAPI
-from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
-from starlette.requests import Request
-from agent.shared import server_policies
-from .identity_helpers import fake_identity_resolver, fake_mcp_user_key_lookup
+from gateway_test_support.control_plane_identity import fake_identity_resolver, fake_mcp_user_key_lookup
+from gateway_test_support.streaming_transport import _patch_asgi_transport_streaming
 
-from agent_gateway.control_skill_catalog import ControlSkillCatalog
 from agent_gateway.autonomous_capability_handoff import AutonomousCapabilityBinding
 from agent_gateway.autonomous_event_channel import (
   adopt_inherited_autonomous_event_channel,
@@ -48,25 +45,9 @@ from agent_gateway.server import (
   MaterializedCredential,
   create_gateway_app,
 )
-from agent.skills.composition import compile_skill_application
-from agent.shared.tool_registration import (
-  build_product_tool_registration_composition,
-)
+from agent_gateway.skill_limits import AutonomousSkillAdmissionPolicy, SkillExecutionLimits
 
 
-ROOT = Path(__file__).resolve().parents[4]
-
-
-@cache
-def _skill_application():
-  tool_registration = build_product_tool_registration_composition()
-  return compile_skill_application(
-    skills_root=ROOT / "api" / "memory" / "workspace" / "notes" / "skills",
-    source_prefix=PurePosixPath(
-      "api/memory/workspace/notes/skills"
-    ),
-    tool_registration_catalog=tool_registration.catalog,
-  )
 
 
 API_KEY = "events-pr5b-key"
@@ -258,12 +239,8 @@ def _make_app(monkeypatch, tmp_path: Path, events: list[dict[str, Any]]):
       _FAKE_PROCESSES[process_group_id], "returncode", -signal_number
     ),
   )
-  skill_application = _skill_application()
-  control_catalog = skill_application.control_catalog
-  assert isinstance(control_catalog, ControlSkillCatalog)
   return create_gateway_app(
     GatewayServerConfig(
-      server_policy=server_policies,
       identity_resolver=fake_identity_resolver,
       mcp_user_key_lookup=fake_mcp_user_key_lookup,
       jwt_secret="events-pr5b-test-secret-0123456789",
@@ -275,11 +252,13 @@ def _make_app(monkeypatch, tmp_path: Path, events: list[dict[str, Any]]):
       service_provider_handles={"anthropic": _SERVICE_HANDLE},
       service_auth_config_resolver=_materialize_service_credential,
       build_chat_runtime=_build_chat_runtime,
-      control_skill_catalog=control_catalog,
-      autonomous_skill_admission_policy_resolver=(
-        skill_application.resolve_autonomous_skill_admission_policy
+      autonomous_api_dir=tmp_path,
+      autonomous_skill_admission_policy_resolver=lambda _skill: (
+        AutonomousSkillAdmissionPolicy(
+          False,
+          SkillExecutionLimits(None, None, None),
+        )
       ),
-      skill_application=skill_application,
       autonomous_capability_binding_resolver=_autonomous_capability_binding,
       claim_signing_authority=GatewayClaimSigningAuthority(HMAC_KEY),
     )
@@ -389,42 +368,12 @@ def test_control_event_serialization_failure_logs_traceback(
     control = _control_session(client, "alice")
     app.state.user_event_bus = _SerializationFailureBus()
 
-    async def case() -> dict[str, Any]:
-      route = next(
-        route
-        for route in app.routes
-        if isinstance(route, APIRoute)
-        and route.path == "/api/control/events"
-      )
-      request = Request(
-        {
-          "type": "http",
-          "method": "GET",
-          "path": "/api/control/events",
-          "headers": [(
-            b"authorization",
-            f"Bearer {control['session_token']}".encode("utf-8"),
-          )],
-          "query_string": b"",
-          "app": app,
-        }
-      )
-      response = await route.endpoint(
-        request,
-        control_run_id=None,
-        run_id=None,
-        schema_version=None,
-        after_seq=0,
-      )
-      try:
-        chunk = await response.body_iterator.__anext__()
-        return _decode_sse_chunk(chunk)
-      finally:
-        await _shielded_aclose(response.body_iterator)
-        if response.background is not None:
-          await response.background()
-
-    event = asyncio.run(case())
+    response = client.get(
+      "/api/control/events",
+      headers=_headers(control),
+    )
+    assert response.status_code == 200
+    event = _decode_sse_chunk(response.content)
 
   assert event == {
     "type": "stream_error",
@@ -481,33 +430,23 @@ def test_control_events_cancelled_aclose_does_not_leave_pending_close_task() -> 
 
 
 async def _collect_control_events(app, token: str, *, control_run_id: str, count: int) -> list[dict[str, Any]]:
-  route = next(
-    route
-    for route in app.routes
-    if isinstance(route, APIRoute)
-    and route.path == "/api/control/events"
-  )
-  request = Request(
-    {
-      "type": "http",
-      "method": "GET",
-      "path": "/api/control/events",
-      "headers": [(b"authorization", f"Bearer {token}".encode("utf-8"))],
-      "query_string": f"control_run_id={control_run_id}".encode("utf-8"),
-      "app": app,
-    }
-  )
-  response = await route.endpoint(request, control_run_id=control_run_id, run_id=None)
   events: list[dict[str, Any]] = []
-  try:
-    iterator = response.body_iterator
-    for _ in range(count):
-      chunk = await asyncio.wait_for(iterator.__anext__(), timeout=0.5)
-      events.append(_decode_sse_chunk(chunk))
-  finally:
-    await _shielded_aclose(response.body_iterator)
-    if response.background is not None:
-      await response.background()
+  async with httpx.AsyncClient(
+    transport=httpx.ASGITransport(app=app),
+    base_url="http://testserver",
+  ) as client:
+    async with client.stream(
+      "GET",
+      "/api/control/events",
+      headers={"Authorization": f"Bearer {token}"},
+      params={"control_run_id": control_run_id},
+    ) as response:
+      assert response.status_code == 200
+      lines = response.aiter_lines()
+      while len(events) < count:
+        line = await asyncio.wait_for(lines.__anext__(), timeout=0.5)
+        if line.startswith("data: "):
+          events.append(json.loads(line.removeprefix("data: ")))
   return events
 
 

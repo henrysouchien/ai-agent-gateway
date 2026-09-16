@@ -31,7 +31,7 @@ from agent_gateway.server_chat_transcripts import (
   _read_session_transcript_events,
 )
 from agent_gateway.session import GatewaySession, SessionStream
-from tests.capability_execution_test_support import stub_bound_capability_execution
+from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
 
 
 class _BoundOpenAIProvider(OpenAIProvider):

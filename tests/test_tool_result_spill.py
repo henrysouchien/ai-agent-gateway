@@ -12,7 +12,7 @@ from typing import Any, Callable
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -40,10 +40,11 @@ from agent_gateway.tool_result_spill import (  # noqa: E402
 import agent_gateway.tool_result_compaction as tool_result_compaction  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 import agent_gateway.runner_tool_execution as runner_tool_execution  # noqa: E402
-from tests.capability_execution_test_support import (  # noqa: E402
+from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_capability_execution_resolver,
   stub_runner_capability_execution,
 )
+from gateway_test_support.host_policy import owner_session_host_policy
 
 
 CAP = 4_000
@@ -941,7 +942,13 @@ def test_runner_spills_large_tool_result_and_exact_reader_is_retry_safe(tmp_path
   _run(_run_test())
 
 
-def test_run_agent_sub_runner_spills_into_parent_work_dir(tmp_path: Path) -> None:
+def test_run_agent_sub_runner_spills_into_parent_work_dir(
+  tmp_path: Path,
+  owner_session_host_policy,
+) -> None:
+  owner_session_host_policy.get_local_tool_effect = lambda name: (
+    "read" if name == "file_read" else None
+  )
   async def _run_test() -> None:
     payload = "x" * PAYLOAD_SIZE
 
@@ -1056,73 +1063,4 @@ def test_run_agent_sub_runner_spills_into_parent_work_dir(tmp_path: Path) -> Non
   _run(_run_test())
 
 
-def test_interactive_model_provider_runner_threads_spill_provider(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  monkeypatch.setenv("MCP_CONFIG_PATH", str(ROOT / "deploy" / "mcp.production.json"))
-  import api.agent.interactive.runtime as runtime
 
-  captured: dict[str, Any] = {}
-
-  class _FakeRunner:
-    def __init__(self, **kwargs: Any) -> None:
-      captured.update(kwargs)
-
-  class _FakeProvider(ModelProvider):
-    name = "stub"
-
-    def has_active_credential(self, config: dict[str, Any]) -> bool:
-      return bool(config.get("api_key"))
-
-    def get_model_info(self, model: str) -> ModelInfo:
-      return ModelInfo(id=model, provider="stub")
-
-  monkeypatch.setattr(runtime, "AgentRunner", _FakeRunner)
-  def spill_provider() -> str:
-    return "/tmp/spill"
-  runner_ref: list[Any] = [None]
-  session = SimpleNamespace(
-    result_queue=None,
-    approval_store=None,
-    approval_policy=None,
-    user_id="alice",
-    session_id="sess-runtime",
-    mcp_activation_fold=McpActivationFold(),
-    channel="web",
-    role="owner",
-  )
-  capability_execution = stub_runner_capability_execution(
-    provider=_FakeProvider(),
-    auth_config={"api_key": "k"},
-    model="stub-model",
-    effort="none",
-  )
-  request = ChatRequest(
-    messages=[],
-    user_id="alice",
-    request_id="req-runtime",
-    context={},
-  )
-  request._bind_session_driver(capability_execution=capability_execution)
-
-  runner = runtime._build_model_provider_runner(
-    EventLog(),
-    "sess-runtime",
-    10.0,
-    request=request,
-    session=session,
-    runner_ref=runner_ref,
-    capability_execution=capability_execution,
-    mcp_client_manager=_NullMcpClient(),
-    excluded_tools=set(),
-    parent_per_turn_timeout=30,
-    build_dispatcher=lambda _ctx: object(),
-    get_tool_definitions=lambda: [],
-    channel="web",
-    on_tool_result=lambda _ctx: None,
-    code_execution_spill_dir_provider=spill_provider,
-  )
-
-  assert captured["code_execution_spill_dir_provider"] is spill_provider
-  assert captured["capability_execution"] is capability_execution
-  assert runner_ref[0] is runner

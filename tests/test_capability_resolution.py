@@ -9,6 +9,8 @@ and the visible Left.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from agent_gateway.capability_resolution import (
@@ -16,11 +18,9 @@ from agent_gateway.capability_resolution import (
   OperationDeclaration,
   admitted_tool_routes,
   admitted_catalog_routes,
-  declarative_platform_catalog,
   derive_dispatcher_allowlist,
   granted_tool_ids,
   lookup_catalog_entry,
-  reset_platform_catalog_cache,
   resolve_operation_authority,
   snapshot_platform_catalog,
 )
@@ -37,7 +37,6 @@ from agent_gateway.sub_agent_scope_receipt import (
 from agent_gateway.skills import compile_agent_operation, generic_explore_profile
 from agent_gateway.tool_dispatch_declarations import (
   build_tool_dispatch_declarations,
-  tool_dispatch_declarations,
 )
 from agent_workflow_contracts import (
   CatalogToolEntry,
@@ -57,6 +56,8 @@ _MCP_ROUTES = {
   "filings_search": "research-corpus-mcp",
   "transcripts_search": "research-corpus-mcp",
   "compare_peers": "market-data-mcp",
+  "fetch_financials": "market-data-mcp",
+  "corpus_inventory": "research-corpus-mcp",
 }
 
 
@@ -143,11 +144,30 @@ def _routed_catalog(
   )
 
 
+@pytest.fixture
+def declared_route_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+  from agent_gateway import capability_resolution
+
+  policy = SimpleNamespace(
+    get_server_for_policy_tool=_MCP_ROUTES.get,
+    get_local_tool_effect=lambda name: (
+      _effect(name, None, True) if name not in _MCP_ROUTES else None
+    ),
+  )
+  monkeypatch.setattr(
+    capability_resolution,
+    "load_server_policy_module",
+    lambda: policy,
+  )
+
+
 # --- the snapshot ----------------------------------------------------------
 
 
 def test_declarative_snapshot_is_seeded_from_the_dispatch_declaration_table() -> None:
-  table = tool_dispatch_declarations()
+  table = build_tool_dispatch_declarations(
+    effect_resolver=lambda name: _effect(name, None, False),
+  )
   catalog = snapshot_platform_catalog(declarations=table)
 
   assert {entry.tool_id for entry in catalog.tools} == set(table)
@@ -198,6 +218,7 @@ def test_declarative_snapshot_normalizes_descriptors_into_exact_json() -> None:
   }
 
 
+@pytest.mark.usefixtures("declared_route_policy")
 def test_dispatch_lookup_requires_exact_live_route_and_policy_owner() -> None:
   entry = lookup_catalog_entry(
     "mcp__research-corpus-mcp__filings_search",
@@ -239,6 +260,7 @@ def test_dispatch_lookup_requires_exact_live_route_and_policy_owner() -> None:
   ) is None
 
 
+@pytest.mark.usefixtures("declared_route_policy")
 def test_dispatch_lookup_refuses_unroutable_local_and_policy_unavailability(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -278,6 +300,7 @@ def test_dispatch_lookup_refuses_unroutable_local_and_policy_unavailability(
   ) is None
 
 
+@pytest.mark.usefixtures("declared_route_policy")
 def test_routed_snapshot_keeps_route_effect_but_withholds_wrong_owner_declaration() -> None:
   catalog = snapshot_platform_catalog(
     tool_ids=("filings_search",),
@@ -295,6 +318,7 @@ def test_routed_snapshot_keeps_route_effect_but_withholds_wrong_owner_declaratio
   assert entry.source_identity is None
 
 
+@pytest.mark.usefixtures("declared_route_policy")
 def test_routed_snapshot_uses_injected_declaration_table_after_owner_match() -> None:
   custom = {
     "corpus_inventory": ToolDispatchDecl(
@@ -334,29 +358,9 @@ def test_routed_snapshot_uses_injected_declaration_table_after_owner_match() -> 
   assert empty.source_identity is None
 
 
-def test_declarative_catalog_cache_follows_the_declaration_table_identity(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  reset_platform_catalog_cache()
-  baseline = declarative_platform_catalog()
-  assert declarative_platform_catalog() is baseline
-
-  from agent_gateway import tool_dispatch_declarations as declarations
-
-  monkeypatch.setattr(
-    declarations,
-    "_CACHED_DECLARATIONS",
-    declarations.build_tool_dispatch_declarations(
-      effect_resolver=lambda _tool_name: "propose"
-    ),
-  )
-  swapped = declarative_platform_catalog()
-
-  assert swapped is not baseline
-  assert all(entry.effect == "propose" for entry in swapped.tools)
-  reset_platform_catalog_cache()
 
 
+@pytest.mark.usefixtures("declared_route_policy")
 def test_routed_snapshot_describes_local_and_mcp_routes_exactly() -> None:
   catalog = _routed_catalog()
   by_id = {entry.tool_id: entry for entry in catalog.tools}

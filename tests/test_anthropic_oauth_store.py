@@ -16,7 +16,6 @@ from agent_gateway.providers.anthropic_oauth import (
   resolve_anthropic_auth_store_path,
   resolve_anthropic_oauth_token,
 )
-from api.credentials import get_anthropic_config
 
 
 def test_anthropic_store_is_separate_private_and_one_year(tmp_path: Path) -> None:
@@ -42,20 +41,6 @@ def test_existing_env_token_precedes_gateway_store(tmp_path: Path) -> None:
   assert record is None
 
 
-def test_get_anthropic_config_uses_store_only_when_env_token_absent(
-  monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-  path = tmp_path / "oauth.json"
-  import_claude_setup_token("sk-ant-oat01-stored", path=path)
-  monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(path))
-  monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
-  monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
-  monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
-  monkeypatch.setenv("ANTHROPIC_AUTH_MODE", "oauth")
-  assert get_anthropic_config()["auth_token"] == "sk-ant-oat01-stored"
-
-  monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-oat01-current")
-  assert get_anthropic_config()["auth_token"] == "sk-ant-oat01-current"
 
 
 def test_anthropic_cli_import_does_not_modify_claude_login(

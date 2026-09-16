@@ -87,9 +87,10 @@ from agent_gateway.tool_definition import (
   LiveToolRouteKind,
   OriginatedToolDefinition,
 )
-from tests.capability_execution_test_support import (
+from gateway_test_support.capability_execution_test_support import (
   stub_capability_execution_resolver,
 )
+from gateway_test_support.host_policy import owner_session_host_policy
 
 
 async def _tool(_tool_input: dict[str, Any], **_kwargs: Any):
@@ -590,6 +591,35 @@ class _PrefixedMcpClient(_McpClient):
       logical_name="thesis_read",
       exposed_name="private_thesis_read",
     ),)
+
+
+@pytest.fixture(autouse=True)
+def delegation_tool_policy(owner_session_host_policy):
+  """Describe this module's fake local handlers and live MCP surfaces."""
+  local_effects = {
+    "web_search": "read",
+    "file_read": "read",
+    "write_record": "state_write",
+  }
+  corpus = _PrefixedMcpClient()
+  corpus.activate()
+  server_effects = {}
+  server_by_tool = {}
+  for client, effect in (
+    (corpus, "read"),
+    (_InvestmentMcpClient(), "state_write"),
+  ):
+    for definition in client.get_tool_definitions():
+      name = definition["name"]
+      policy_name = client.get_policy_tool_name(name)
+      server = client.get_server_for_tool(name)
+      server_by_tool[policy_name] = server
+      server_effects[server, policy_name] = effect
+  owner_session_host_policy.get_local_tool_effect = local_effects.get
+  owner_session_host_policy.get_server_for_policy_tool = server_by_tool.get
+  owner_session_host_policy.get_tool_class = (
+    lambda server, name: server_effects.get((server, name))
+  )
 
 
 def test_run_agent_tool_schema_is_operation_first(tmp_path: Path) -> None:
@@ -2288,9 +2318,6 @@ def test_unnamed_delegation_does_not_infer_a_skill_budget(tmp_path: Path) -> Non
   assert error is None
   assert result is not None
   assert runner.spawn_calls[0]["max_budget_usd"] is None
-  assert "agent.shared.mutation_enforcement" not in inspect.getsource(
-    make_run_agent_handler
-  )
 
 
 @pytest.mark.parametrize("objective", [None, "", 0])

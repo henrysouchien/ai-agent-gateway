@@ -33,12 +33,12 @@ from agent_workflow_contracts import (
   TaskResult,
   TaskResultProvenance,
 )
-from tests.admitted_authority_test_support import (
+from gateway_test_support.admitted_authority_test_support import (
   SOURCE_TOOL_ID,
   provenance_of,
   sealed_admitted_task,
 )
-from tests.capability_execution_test_support import (
+from gateway_test_support.capability_execution_test_support import (
   stub_bound_capability_execution,
 )
 

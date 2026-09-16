@@ -12,7 +12,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 TESTS_DIR = Path(__file__).resolve().parent
 for path in (PKG_DIR, TESTS_DIR):
   if str(path) not in sys.path:
@@ -2661,11 +2661,4 @@ def test_completion_effect_rejects_cas_conflict_without_overwrite(
   }
 
 
-def test_direct_artifact_handlers_do_not_produce_lifecycle_start() -> None:
-  for relative_path in (
-    "api/agent/shared/canvas_artifact_tool.py",
-    "api/agent/shared/dashboard_artifact_tool.py",
-  ):
-    source = (ROOT / relative_path).read_text(encoding="utf-8")
-    assert "SkillRunStartedEvent" not in source
-    assert '"type": "skill_run_started"' not in source
+

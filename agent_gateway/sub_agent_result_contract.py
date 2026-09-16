@@ -202,9 +202,7 @@ def build_task_result(
   own verdict.  ``runtime_outcome`` is the separate *mechanical* door
   (D-B3-4): this function cannot see its caller, so the restriction is
   structural — a distinct keyword, accepted only for a ``mechanically_derived``
-  assessment, mutually exclusive with ``outcome``, and pinned to a single
-  non-test caller by
-  ``packages/agent-gateway/tests/test_runtime_outcome_import_restriction.py``.
+  assessment, and mutually exclusive with ``outcome``.
   """
 
   if runtime_outcome is not None:

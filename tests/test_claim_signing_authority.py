@@ -176,28 +176,7 @@ def test_same_layout_class_swap_cannot_reach_sealed_signing_operation() -> None:
     )
 
 
-def test_gateway_signing_consumer_has_no_virtual_dispatch() -> None:
-  assert "sign_claim" not in GatewayUserClaimSigner.__dict__
-  runtime_path = (
-    Path(__file__).resolve().parents[3]
-    / "api/agent/autonomous/runtime_execution.py"
-  )
-  tree = ast.parse(runtime_path.read_text(encoding="utf-8"))
-  calls = [
-    node.func
-    for node in ast.walk(tree)
-    if isinstance(node, ast.Call)
-  ]
 
-  assert all(
-    (
-      isinstance(call.value, ast.Name)
-      and call.value.id == "AutonomousClaimSigner"
-    )
-    for call in calls
-    if isinstance(call, ast.Attribute)
-    and call.attr == "sign_claim"
-  )
 
 
 @pytest.mark.parametrize(

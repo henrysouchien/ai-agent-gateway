@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from gateway_test_support.host_policy import owner_session_host_policy
 
 from agent_gateway.approval_route import DurableLocalApprovalRoute
 from agent_gateway.approval_store import SQLiteApprovalStore
@@ -369,6 +370,7 @@ def test_registered_dispatcher_requires_redaction_owner_at_construction() -> Non
 
 def test_registered_durable_approval_receives_exact_policy_redaction(
   tmp_path: Path,
+  owner_session_host_policy,
 ) -> None:
   captured: dict[str, object] = {}
 
@@ -533,6 +535,7 @@ def test_registered_native_mcp_history_redaction_delegates_raw_input() -> None:
 
 def test_registered_native_mcp_durable_approval_uses_manager_redaction(
   tmp_path: Path,
+  owner_session_host_policy,
 ) -> None:
   declaration = _declaration(
     ToolApprovalPolicy("always"),
@@ -630,6 +633,7 @@ def test_registered_native_mcp_durable_approval_uses_manager_redaction(
 
   dispatcher = _CapturingDispatcher(
     mcp_client=_RegisteredMcp(),
+    role="owner",
     needs_approval=lambda *_args: False,
     tool_registration_catalog=ToolRegistrationCatalog(
       (declaration,),

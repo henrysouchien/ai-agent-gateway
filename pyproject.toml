@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-agent-gateway"
-version = "0.18.3"
+version = "0.18.4"
 description = "Generic AI agent gateway with MCP tool support and streaming"
 readme = "README.md"
 license = "MIT"
@@ -15,8 +15,8 @@ dependencies = [
   "jsonschema>=4.26.0",
   "PyJWT>=2.14.0",
   "PyYAML",
-  "mcp>=1.30.0",
-  "fastmcp>=3.2.4",
+  "mcp>=1.30.0,<2",
+  "fastmcp>=3.2.4,<4",
   "httpx>=0.28.1",
   "pydantic",
   "uvicorn>=0.42.0",
@@ -63,3 +63,6 @@ agent_gateway = [
   "contracts/usage-reconciliation-v2/*.json",
   "contracts/usage-reconciliation-v3/*.json",
 ]
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"

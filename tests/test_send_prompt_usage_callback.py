@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -27,7 +27,7 @@ from agent_gateway.providers import (
   StreamEvent,
   ThinkingLevel,
 )
-from tests.capability_execution_test_support import stub_bound_capability_execution
+from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
 from agent_gateway.send_prompt import _call_usage_callback
 
 send_prompt_module = importlib.import_module("agent_gateway.send_prompt")

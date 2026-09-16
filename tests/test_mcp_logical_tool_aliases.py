@@ -703,25 +703,6 @@ def test_namespaced_provider_route_does_not_depend_on_live_catalog_startup() -> 
   assert manager.get_provider_id_for_tool("fetch_financials") is None
 
 
-def test_committed_catalog_diff_pins_the_additive_alias_set() -> None:
-  repo_root = Path(__file__).resolve().parents[3]
-  evidence = json.loads(
-    (repo_root / "docs/qa/provider-port-phase6-tool-catalog-diff.json").read_text()
-  )
-
-  assert evidence["phase"] == "6-retirement"
-  assert evidence["logical_server"] == "market-data-mcp"
-  assert evidence["logical_server_keys_after"] == 1
-  assert evidence["branded_rows_removed"] == len(ALIASES)
-  assert evidence["logical_market_data_rows_after"] == 21
-  assert set(ALIASES) <= set(evidence["neutral_tools"])
-  assert not {
-    original_name
-    for original_name, _tool_input in ALIASES.values()
-  } & set(evidence["neutral_tools"])
-  assert evidence["input_schema_changes"] == 0
-  assert evidence["effect_class_changes"] == 0
-  assert evidence["channel_tier_changes"] == 0
 
 
 def test_logical_server_request_starts_only_the_physical_transport(

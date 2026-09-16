@@ -16,8 +16,7 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from agent.shared import server_policies
-from .identity_helpers import fake_identity_resolver, fake_mcp_user_key_lookup
+from gateway_test_support.control_plane_identity import fake_identity_resolver, fake_mcp_user_key_lookup
 from agent_gateway import AgentRunner
 from agent_gateway.autonomous_capability_handoff import AutonomousCapabilityBinding
 from agent_gateway.autonomous_event_channel import (
@@ -272,7 +271,6 @@ def _make_app(tmp_path, policy: _NoopPolicy | None = None):
 
   app = create_gateway_app(
     GatewayServerConfig(
-      server_policy=server_policies,
       identity_resolver=fake_identity_resolver,
       mcp_user_key_lookup=fake_mcp_user_key_lookup,
       jwt_secret="approvals-pr7-test-secret-0123456789",

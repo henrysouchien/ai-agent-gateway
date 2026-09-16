@@ -16,7 +16,6 @@ from agent_gateway.providers.xai_oauth import (
   save_xai_token_record,
 )
 from agent_gateway.model_registry import INITIAL_MODEL_REGISTRY
-from api.credentials import get_xai_config
 
 
 def test_xai_is_first_class_provider_not_openai_subclass() -> None:
@@ -148,25 +147,6 @@ def test_explicit_oauth_token_does_not_adopt_process_or_default_store_refresh(
   asyncio.run(provider.close_client(client))
 
 
-def test_xai_config_has_no_selection_defaults_and_registry_owns_models(monkeypatch) -> None:
-  for name in ("XAI_MODEL", "XAI_EFFORT", "XAI_THINKING", "ALLOWED_MODELS_XAI"):
-    monkeypatch.delenv(name, raising=False)
-  config = get_xai_config()
-  assert config["base_url"] == "https://api.x.ai/v1"
-  assert {
-    "model",
-    "model_key",
-    "effort",
-    "thinking",
-    "thinking_enabled_requested",
-  }.isdisjoint(config)
-  xai_models = {
-    entry.upstream_model: entry.label
-    for entry in INITIAL_MODEL_REGISTRY.models.values()
-    if entry.provider == "xai"
-    and entry.capabilities.get("session.driver") == "user_selectable"
-  }
-  assert xai_models == {"grok-4.5": "Grok 4.5", "grok-4.6": "Grok 4.6"}
 
 
 def test_xai_effort_and_thinking_env_are_not_auth_authority(monkeypatch) -> None:

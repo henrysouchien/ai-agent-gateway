@@ -31,7 +31,7 @@ from agent_gateway.model_registry import (
   INITIAL_MODEL_SELECTION_POLICY,
 )
 
-from .control_plane.identity_helpers import fake_identity_resolver, fake_mcp_user_key_lookup
+from gateway_test_support.control_plane_identity import fake_identity_resolver, fake_mcp_user_key_lookup
 
 
 _HMAC_KEY = "autonomous-runner-event-channel-test-key"
@@ -50,7 +50,7 @@ def _session_log_root_for_spawn(
     str(session_log_base),
   )
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-_REPO_API_DIR = Path(__file__).resolve().parents[3] / "api"
+_REPO_API_DIR = Path(__file__).resolve().parents[1]
 _CHILD_IMPORT_PREFIX = (
   "import sys;"
   f"sys.path.insert(0, {str(_PACKAGE_ROOT)!r});"
@@ -171,74 +171,8 @@ channel.complete(
 """
 
 
-_SESSION_RECAP_CHILD = """
-import json,os
-from agent_gateway.autonomous_event_channel import (
-  AUTONOMOUS_EVENT_CHANNEL_FD_ENV,
-  adopt_inherited_autonomous_event_channel,
-)
-from agent_gateway.session_recap import emit_recap_then_terminal
-envelope=json.loads(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE"])
-event_fd=int(os.environ[AUTONOMOUS_EVENT_CHANNEL_FD_ENV])
-from agent.autonomous.child_event_delivery import AutonomousChannelEventOwner
-channel=adopt_inherited_autonomous_event_channel(
-  event_fd,
-  channel_id=envelope["channel_id"],
-)
-channel.start(timeout_seconds=20)
-owner=AutonomousChannelEventOwner(channel)
-event_log=owner.event_log(session_id="captured-recap-run")
-event_log.append({"type":"turn_complete","turn":1,"usage":{}})
-emit_recap_then_terminal(
-  event_log,
-  {
-    "type":"stream_complete",
-    "terminal_disposition":"completed",
-    "usage":{},
-  },
-  session_id="captured-recap-run",
-  started_at=1.0,
-)
-owner.complete(0)
-"""
 
 
-_BUDGET_LIMITED_CHILD = """
-import json,os,sys
-from agent_gateway.autonomous_event_channel import (
-  AUTONOMOUS_EVENT_CHANNEL_FD_ENV,
-  adopt_inherited_autonomous_event_channel,
-)
-from agent_gateway.session_recap import emit_recap_then_terminal
-envelope=json.loads(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE"])
-event_fd=int(os.environ[AUTONOMOUS_EVENT_CHANNEL_FD_ENV])
-from agent.autonomous.child_event_delivery import AutonomousChannelEventOwner
-channel=adopt_inherited_autonomous_event_channel(
-  event_fd,
-  channel_id=envelope["channel_id"],
-)
-channel.start(timeout_seconds=20)
-owner=AutonomousChannelEventOwner(channel)
-event_log=owner.event_log(session_id="captured-budget-run")
-event_log.append({
-  "type":"budget_exceeded",
-  "total_cost":5.5,
-  "budget":5.0,
-})
-emit_recap_then_terminal(
-  event_log,
-  {
-    "type":"stream_complete",
-    "terminal_disposition":"interrupted",
-    "reason":"budget_exceeded",
-    "usage":{},
-  },
-  session_id="captured-budget-run",
-  started_at=1.0,
-)
-owner.complete(2)
-raise SystemExit(2)
-"""
 
 
 def test_autonomous_start_uses_private_event_lifeline_and_lease_fds(
@@ -354,78 +288,8 @@ def test_autonomous_start_uses_private_event_lifeline_and_lease_fds(
   asyncio.run(case())
 
 
-def test_captured_run_recap_emits_end_and_settles_completed(
-  tmp_path: Path,
-) -> None:
-  async def case() -> None:
-    registry = _registry(tmp_path, child_source=_SESSION_RECAP_CHILD)
-
-    payload = await _start(registry)
-    status = await registry.wait(payload["task_id"], timeout_sec=20)
-    record = registry._tasks[payload["task_id"]]
-
-    assert status["state"] == "completed"
-    assert status.get("error") is None
-    assert record.event_channel_stream is not None
-    assert record.event_channel_acknowledgement is not None
-    assert [
-      event["type"]
-      for event in record.event_channel_projected_events
-    ] == ["turn_complete", "session_recap", "stream_complete"]
-    recap = record.event_channel_projected_events[1]
-    assert recap["seq_range"] == [1, 1]
-    manifest = json.loads(
-      (tmp_path / f"{payload['task_id']}.task.json").read_text(
-        encoding="utf-8"
-      )
-    )
-    assert manifest["state"] == "completed"
-    assert manifest.get("error") is None
-
-  asyncio.run(case())
 
 
-def test_budget_stop_emits_end_and_settles_budget_limited(
-  tmp_path: Path,
-) -> None:
-  async def case() -> None:
-    registry = _registry(
-      tmp_path,
-      child_source=_BUDGET_LIMITED_CHILD,
-    )
-
-    payload = await _start(registry)
-    status = await registry.wait(payload["task_id"], timeout_sec=20)
-    record = registry._tasks[payload["task_id"]]
-
-    assert status["state"] == "budget_limited"
-    assert status.get("error") is None
-    assert record.exit_code == 2
-    assert record.event_channel_stream is not None
-    assert record.event_channel_acknowledgement is not None
-    assert [
-      event["type"]
-      for event in record.event_channel_projected_events
-    ] == ["budget_exceeded", "session_recap", "stream_complete"]
-    assert record.event_channel_projected_events[-1] == {
-      "type": "stream_complete",
-      "terminal_disposition": "interrupted",
-      "reason": "budget_exceeded",
-      "usage": {},
-      "terminal_reason": None,
-      "run_id": payload["task_id"],
-      "control_run_id": payload["task_id"],
-    }
-    manifest = json.loads(
-      (tmp_path / f"{payload['task_id']}.task.json").read_text(
-        encoding="utf-8"
-      )
-    )
-    assert manifest["state"] == "budget_limited"
-    assert manifest["exit_code"] == 2
-    assert manifest.get("error") is None
-
-  asyncio.run(case())
 
 
 def test_owner_sigkill_reaps_target_grandchild_before_releasing_lease(

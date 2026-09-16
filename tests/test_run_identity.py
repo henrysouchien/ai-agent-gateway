@@ -18,7 +18,7 @@ from agent_gateway.run_identity import (
   model_run_identity_for_tool,
 )
 from agent_gateway.tool_dispatcher import ToolDispatcher
-from tests.capability_execution_test_support import stub_bound_capability_execution
+from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
 
 
 def _run(coro: Any) -> Any:
@@ -338,6 +338,7 @@ def test_custom_dispatcher_fails_closed_on_missing_or_conflicting_identity(
   dispatcher = ToolDispatcher(
     mcp_client=mcp,  # type: ignore[arg-type]
     local_tool_handlers={},
+    role="owner",
     run_context=RunContext(
       user_id="alice",
       request_id="request-1",
@@ -371,6 +372,7 @@ def test_custom_dispatcher_normalizes_prefixed_model_tool_before_identity_check(
   dispatcher = ToolDispatcher(
     mcp_client=mcp,  # type: ignore[arg-type]
     local_tool_handlers={},
+    role="owner",
     run_context=RunContext(
       user_id="alice",
       request_id="request-1",
@@ -401,6 +403,7 @@ def test_custom_dispatcher_routes_prefixed_model_tool_identity_metadata() -> Non
   dispatcher = ToolDispatcher(
     mcp_client=mcp,  # type: ignore[arg-type]
     local_tool_handlers={},
+    role="owner",
     run_context=RunContext(
       user_id="alice",
       request_id="request-1",
@@ -441,6 +444,7 @@ def test_custom_report_context_matches_runtime_run_identity() -> None:
   dispatcher = ToolDispatcher(
     mcp_client=_McpClient("unused"),  # type: ignore[arg-type]
     local_tool_handlers={"fms_report_build_model": report_handler},
+    role="owner",
     run_context=RunContext(
       user_id="alice",
       request_id="request-1",

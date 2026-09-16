@@ -9,7 +9,7 @@ from agent_gateway.ui_blocks_validation import (
   build_payload_submitted,
   validate_payload,
 )
-from scripts.ui_blocks_fixture_loader import load_ui_blocks_fixtures
+from gateway_test_support.ui_blocks_fixtures import load_ui_blocks_fixtures
 
 
 def _payload(*blocks: dict, **text: object) -> dict:

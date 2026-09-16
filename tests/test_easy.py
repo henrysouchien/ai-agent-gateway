@@ -9,10 +9,12 @@ from uuid import UUID
 from types import SimpleNamespace
 
 import pytest
+
+from gateway_test_support.host_policy import owner_session_host_policy
 from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
   sys.path.insert(0, str(ROOT))
 if str(PKG_DIR) not in sys.path:
@@ -1278,7 +1280,10 @@ def test_create_agent_skills_dir_respects_custom_run_agent_handler_override(tmp_
   assert runtime.get_tool_definitions() == []
 
 
-def test_create_agent_skills_dir_dispatches_bound_child_execution(tmp_path: Path) -> None:
+def test_create_agent_skills_dir_dispatches_bound_child_execution(
+  tmp_path: Path,
+  owner_session_host_policy,
+) -> None:
   skills_dir = tmp_path / "skills"
   _write_skill(
     skills_dir,
@@ -1333,11 +1338,10 @@ Research deeply.
       },
     ],
   )
-  configure_server_policy(SimpleNamespace(
-    get_local_tool_effect=lambda name: (
-      "read" if name in {"file_read", "web_search"} else None
-    ),
-  ))
+  owner_session_host_policy.get_local_tool_effect = lambda name: (
+    "read" if name in {"file_read", "web_search"} else None
+  )
+  configure_server_policy(owner_session_host_policy)
 
   session, runtime = _build_runtime(
     app,

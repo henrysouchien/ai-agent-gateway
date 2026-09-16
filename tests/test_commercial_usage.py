@@ -28,7 +28,7 @@ from agent_gateway.usage_resilience import (
 from agent_gateway.work_authorization_consumption import (
   WorkAuthorizationConsumptionRecord,
 )
-from tests.capability_execution_test_support import stub_bound_capability_execution
+from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
 
 
 send_prompt_module = importlib.import_module("agent_gateway.send_prompt")

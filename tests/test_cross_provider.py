@@ -10,7 +10,7 @@ from unittest.mock import patch
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -34,11 +34,11 @@ from agent_gateway.capability_execution import (
 )
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.providers import StreamEvent
-from tests.capability_execution_test_support import (
+from gateway_test_support.capability_execution_test_support import (
   stub_bound_capability_execution,
   stub_capability_execution_resolver,
 )
-from tests.tool_catalog_test_support import OWNER_GATEWAY_SESSION
+from gateway_test_support.tool_catalog_test_support import OWNER_GATEWAY_SESSION
 
 
 def _run(coro):

@@ -17,9 +17,8 @@ from agent_gateway.runner import AgentRunner
 from agent_gateway.control_plane import session as control_session_module
 from agent_gateway.control_plane.session import CONTROL_SESSION_TTL_SECONDS
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
-from agent.shared import server_policies
 
-from .identity_helpers import fake_identity_resolver
+from gateway_test_support.control_plane_identity import fake_identity_resolver
 
 
 def _unused_runner(
@@ -116,7 +115,6 @@ def test_control_session_stores_numeric_identity_without_credentials_resolver() 
     GatewayServerConfig(
       jwt_secret="control-plane-test-secret-0123456789",
       valid_api_keys={"legacy-key"},
-      server_policy=server_policies,
       tenant_id="test-product",
       model_registry=INITIAL_MODEL_REGISTRY,
       model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
@@ -164,7 +162,6 @@ def test_control_session_stores_email_from_supplied_identity_resolver() -> None:
     GatewayServerConfig(
       jwt_secret="control-plane-test-secret-0123456789",
       valid_api_keys={"legacy-key"},
-      server_policy=server_policies,
       tenant_id="test-product",
       model_registry=INITIAL_MODEL_REGISTRY,
       model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,

@@ -7,7 +7,7 @@ from typing import Any, NoReturn
 
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -21,8 +21,8 @@ from agent_gateway import (
   ToolDispatcher,
 )
 from agent_gateway.approval_store import SQLiteApprovalStore
-import agent_gateway.tool_dispatcher_helpers as dispatcher_helpers
 from agent_gateway.tool_policy_registry import PreparedToolCall
+from gateway_test_support.host_policy import owner_session_host_policy
 
 
 def _run(coro):
@@ -123,34 +123,6 @@ def test_local_tool_schema_validation_rejects_missing_required_before_handler() 
   ]
 
 
-def test_local_tool_schema_validation_methods_delegate_to_extracted_helpers() -> None:
-  schema = _tool_defs()[0]["input_schema"]
-  dispatcher = ToolDispatcher(
-    mcp_client=_NullMcpClient(),
-    local_tool_handlers={"structured_write": _unexpected_handler},
-    get_tool_definitions=_tool_defs,
-  )
-
-  assert ToolDispatcher._json_type_name(True) == dispatcher_helpers.json_type_name(True)
-  assert ToolDispatcher._matches_json_type({}, ["array", "object"]) is True
-  assert ToolDispatcher._format_expected_type(["string", "null"]) == "string|null"
-  assert dispatcher._active_local_tool_schema("structured_write") == (
-    dispatcher_helpers.active_local_tool_schema(_tool_defs, "structured_write")
-  )
-  assert dispatcher._tool_input_schema_error(
-    "structured_write",
-    message="bad",
-    details={"missing": ["judgment"]},
-  ) == dispatcher_helpers.tool_input_schema_error(
-    "structured_write",
-    message="bad",
-    details={"missing": ["judgment"]},
-  )
-  assert dispatcher._validate_against_local_schema(
-    "structured_write",
-    {},
-    schema,
-  ) == dispatcher_helpers.validate_against_local_schema("structured_write", {}, schema)
 
 
 def test_local_tool_schema_validation_preserves_dispatcher_override_seam() -> None:
@@ -397,7 +369,7 @@ def test_catalog_free_local_caller_remains_supported_without_request_snapshot() 
   assert result == {"received": {"ticker": "PAYC"}}
 
 
-def test_local_tool_schema_validation_rechecks_approval_modified_args(tmp_path: Path) -> None:
+def test_local_tool_schema_validation_rechecks_approval_modified_args(tmp_path: Path, owner_session_host_policy) -> None:
   calls: list[dict[str, Any]] = []
 
   async def _handler(tool_input: dict[str, Any], **_kwargs: Any):

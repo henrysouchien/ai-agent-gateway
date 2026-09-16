@@ -13,7 +13,7 @@ import pytest
 from mcp.types import CallToolResult as _ToolResult, TextContent
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -634,7 +634,7 @@ def test_parent_apply_collision_filtering_uses_parent_logger(monkeypatch) -> Non
     ),
   }
 
-  manager._apply_collision_filtering()
+  manager._apply_collision_filtering(policy_server_for_tool=lambda _name: None)
 
   assert manager.get_tool_definitions() == [
     {"name": "remote_tool", "description": "kept", "input_schema": {}},
@@ -745,7 +745,7 @@ def test_gsheets_exported_tools_reach_catalog_without_closed_world_gate() -> Non
     ),
   }
 
-  manager._apply_collision_filtering()
+  manager._apply_collision_filtering(policy_server_for_tool=lambda _name: "gsheets-mcp")
 
   assert [tool["name"] for tool in manager.get_tool_definitions()] == [
     "gsheets_read_range",
@@ -1287,19 +1287,34 @@ def test_call_tool_requires_exact_bool_for_uncertain_replay(value) -> None:
     _run(manager.call_tool("missing", {}, allow_uncertain_replay=value))
 
 
-def test_provider_symbol_translation_without_resolver_preserves_original() -> None:
-  manager = McpClientManager(config_path=None)
-  _inject_provider_routes(
-    manager,
-    ("market-data-mcp", "fetch_financials", "scalar", ("symbol",)),
+def test_provider_symbol_translation_without_resolver_dispatches_original() -> None:
+  manager = McpClientManager(
+    config_path=None,
+    input_preparation_routes=(McpInputPreparationRoute(
+      logical_server_id="edgar-parser-mcp",
+      logical_name="get_filings",
+      mode="scalar",
+      keys=("ticker",),
+    ),),
   )
-  payload = {"symbol": "BRKB"}
 
-  assert manager._translate_provider_symbol(
-    "market-data-mcp",
-    "fetch_financials",
-    payload,
-  ) is payload
+  class _Session:
+    async def call_tool(self, name, arguments, **kwargs):
+      # This server accepts its caller's symbol dialect, not SEC-native symbols.
+      assert name == "get_filings"
+      assert arguments == {"ticker": "BRKB"}
+      return _ToolResult(
+        content=[], structuredContent={"filings": [{"accession": "0001"}]},
+      )
+
+  manager._tool_to_server = {"get_filings": "edgar-parser-mcp"}
+  manager._servers = {
+    "edgar-parser-mcp": _connected_state("edgar-parser-mcp", _Session()),
+  }
+
+  assert _run(manager.call_tool("get_filings", {"ticker": "BRKB"})) == (
+    {"filings": [{"accession": "0001"}]}, None,
+  )
 
 
 def test_provider_symbol_translation_resolver_error_returns_original() -> None:

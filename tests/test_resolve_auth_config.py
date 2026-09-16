@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
   sys.path.insert(0, str(ROOT))
 if str(PKG_DIR) not in sys.path:

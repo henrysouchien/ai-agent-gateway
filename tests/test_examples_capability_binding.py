@@ -15,8 +15,8 @@ from agent_gateway.server_models import ChatMessage
 
 ROOT = Path(__file__).resolve().parents[3]
 EXAMPLE_PATHS = (
-  ROOT / "packages" / "agent-gateway" / "examples" / "06-tool-approval" / "agent.py",
-  ROOT / "packages" / "agent-gateway" / "examples" / "07-full-production" / "agent.py",
+  Path(__file__).resolve().parents[1] / "examples" / "06-tool-approval" / "agent.py",
+  Path(__file__).resolve().parents[1] / "examples" / "07-full-production" / "agent.py",
 )
 
 

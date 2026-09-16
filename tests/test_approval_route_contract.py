@@ -23,7 +23,7 @@ from typing import Any, Literal
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
+PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
@@ -46,10 +46,6 @@ from agent_gateway.tool_dispatcher import LocalToolHandler
 from agent_gateway.tool_dispatcher_helpers import ToolResult
 from agent_gateway.session import GatewaySession
 from agent_gateway.single_user_policy import SingleUserApprovalPolicy
-from agent.shared.trusted_plans import (
-  render_trusted_tool_plan_review,
-  validate_trusted_tool_plan,
-)
 
 
 class _NullMcp(McpClientManager):
@@ -164,95 +160,6 @@ def test_no_approval_route_is_the_only_sessionless_variant() -> None:
 # --- S12 -------------------------------------------------------------------
 
 
-def _planned_handler(events: list[str]) -> LocalToolHandler:
-  """A real PLANNING_IDENTITY handler over a real ARTIFACT_ONLY ChangeSet."""
-
-  from fms.core.change_set import (
-    ArtifactOnlyPlan,
-    ArtifactPayload,
-    BaseRevision,
-    CanonicalPayload,
-    ChangeSet,
-    CommitStrategy,
-    DomainResultRef,
-    EffectCriticality,
-    EffectKind,
-    EffectSpec,
-    InlinePayload,
-    IntentRef,
-    ProducerRef,
-    ReviewKind,
-    ReviewRequirement,
-    TargetRef,
-    TargetScope,
-  )
-
-  def canonical(value: object) -> CanonicalPayload:
-    return CanonicalPayload.from_value(value)
-
-  def inline(value: object) -> InlinePayload:
-    return InlinePayload("v1", "application/json", canonical(value).content)
-
-  artifact_path = "artifacts/TEST/planned.json"
-  change_set = ChangeSet(
-    "v1",
-    "",
-    "",
-    ProducerRef("test", "research_producer", "alice", "run-1"),
-    TargetRef("TEST", 7, "workspace/TEST", TargetScope.WORKSPACE),
-    (BaseRevision("workbook", "models/TEST.xlsx", "a" * 64),),
-    IntentRef("planned_write", canonical({"x": 1})),
-    DomainResultRef("test", "v1", inline({"ok": True})),
-    (
-      EffectSpec(
-        "artifact",
-        EffectKind.ARTIFACT_REFUSAL_ONLY,
-        EffectCriticality.REQUIRED,
-        (),
-        ArtifactPayload(
-          artifact_path,
-          canonical({"status": "planned"}),
-          inline({"status": "planned"}),
-        ),
-      ),
-    ),
-    (),
-    ReviewRequirement(ReviewKind.NONE, None),
-    CommitStrategy.ARTIFACT_ONLY,
-    ArtifactOnlyPlan(artifact_path),
-  )
-  prepared = SimpleNamespace(change_set=change_set)
-
-  class _PlannedHandler:
-    PLANNING_IDENTITY = "change_set"
-
-    async def __call__(
-      self,
-      _tool_input: dict[str, Any],
-      **_kwargs: Any,
-    ) -> Any:
-      raise AssertionError("planned tools must not execute through the legacy handler")
-
-    async def plan_change(
-      self,
-      _tool_input: dict[str, Any],
-      *,
-      call_index: int,
-      tool_ctx: Any,
-    ) -> tuple[Any, Any]:
-      _ = call_index, tool_ctx
-      events.append("plan")
-      return change_set, prepared
-
-    async def execute_prepared_change(
-      self,
-      *_args: Any,
-      **_kwargs: Any,
-    ) -> Any:
-      events.append("execute")
-      return {"ok": True}, None
-
-  return _PlannedHandler()
 
 
 def test_live_route_is_the_only_session_carrier(tmp_path: Path) -> None:
@@ -293,39 +200,6 @@ def test_live_route_is_the_only_session_carrier(tmp_path: Path) -> None:
   assert dispatcher._approval_policy is policy
 
 
-def test_dispatcher_without_a_route_has_no_ledger_and_refuses_at_the_door(
-  tmp_path: Path,
-) -> None:
-  events: list[str] = []
-  _store(tmp_path)
-  dispatcher = ToolDispatcher(
-    role="owner",
-    mcp_client=_NullMcp(),
-    local_tool_handlers={"planned": _planned_handler(events)},
-    plan_validator=validate_trusted_tool_plan,
-    plan_review_renderer=render_trusted_tool_plan_review,
-    needs_approval=lambda *_a: True,
-    request_approval=None,
-  )
-
-  assert isinstance(dispatcher._approval_route, NoApprovalRoute)
-  assert dispatcher._session is None
-  assert dispatcher._approval_store is None
-  assert dispatcher._approval_policy is None
-
-  result, error = asyncio.run(
-    dispatcher.dispatch("call-1", "planned", {"x": 1}, call_index=3)
-  )
-
-  assert result is None
-  assert error is not None
-  assert error["code"] == "approval_route_absent"
-  assert events == ["plan"]
-  # No row exists anywhere: the door refused before any ledger write.
-  import sqlite3
-
-  with sqlite3.connect(tmp_path / "approvals.sqlite3") as conn:
-    assert conn.execute("SELECT COUNT(*) FROM approval_requests").fetchone()[0] == 0
 
 
 # --- S13 -------------------------------------------------------------------

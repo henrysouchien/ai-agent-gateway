@@ -106,6 +106,10 @@ From the package root, run:
 pytest tests
 ```
 
+The suite and its `gateway_test_support/` fixtures are package-local; no embedding
+application checkout or product configuration is required. Product integration
+scenarios belong in the embedding application's tests, not this package suite.
+
 Use the focused test for the boundary you change. Runnable examples live under
 [`examples/`](examples/); the production-style assembly example is
 [`examples/07-full-production/`](examples/07-full-production/), and the
