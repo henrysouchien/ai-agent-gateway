@@ -1,6 +1,5 @@
 # ruff: noqa: E402
 
-from datetime import timedelta
 import sys
 from pathlib import Path
 from typing import Never
@@ -19,7 +18,7 @@ class _UnusedMcpSession:
     name: str,
     arguments: dict[str, object],
     *,
-    read_timeout_seconds: timedelta,
+    read_timeout_seconds: float,
     meta: dict[str, object] | None = None,
   ) -> Never:
     _ = name, arguments, read_timeout_seconds, meta

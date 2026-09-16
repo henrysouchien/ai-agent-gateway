@@ -8,6 +8,9 @@ import shutil
 from pathlib import Path
 from typing import Any, Callable, Final, Literal, Mapping, Sequence
 
+from mcp import MCPError
+from mcp.types import CONNECTION_CLOSED, REQUEST_TIMEOUT
+
 
 class _McpConfigPathUnset(Enum):
   TOKEN = "unset"
@@ -230,28 +233,32 @@ def iter_exception_tree(exc: BaseException):
 
 def is_retryable_stdio_connect_error(exc: BaseException) -> bool:
   for candidate in iter_exception_tree(exc):
-    type_name = type(candidate).__name__
-    message = str(candidate).lower()
-    if type_name == "McpError":
-      if any(marker in message for marker in MCP_STDIO_RETRYABLE_MESSAGE_MARKERS):
+    if isinstance(candidate, MCPError):
+      if candidate.code == CONNECTION_CLOSED:
         return True
       continue
-    if type_name in MCP_STDIO_RETRYABLE_EXCEPTION_NAMES:
+    if type(candidate).__name__ in MCP_STDIO_RETRYABLE_EXCEPTION_NAMES:
       return True
     if isinstance(candidate, OSError) and any(
-      marker in message for marker in MCP_STDIO_RETRYABLE_MESSAGE_MARKERS
+      marker in str(candidate).lower() for marker in MCP_STDIO_RETRYABLE_MESSAGE_MARKERS
     ):
       return True
   return False
 
 
 def is_retryable_stdio_startup_error(exc: BaseException) -> bool:
-  """Startup-connect retryability: transient transport errors (same as the tool-call gate) PLUS
-  transient connect timeouts. Timeouts are startup-only — a tool-call timeout must NOT trigger a
-  reconnect/re-run (duplicate side effects)."""
+  """Include timeouts for startup/future calls, never for in-flight replay.
+
+  A timed-out tool may already have applied side effects; the reconnect-and-replay
+  path must keep using ``is_retryable_stdio_connect_error`` instead.
+  """
   if is_retryable_stdio_connect_error(exc):
     return True
-  return any(isinstance(candidate, TimeoutError) for candidate in iter_exception_tree(exc))
+  return any(
+    isinstance(candidate, TimeoutError)
+    or (isinstance(candidate, MCPError) and candidate.code == REQUEST_TIMEOUT)
+    for candidate in iter_exception_tree(exc)
+  )
 
 
 def resolve_missing_stdio_executable(

@@ -1,7 +1,6 @@
 # ruff: noqa: E402
 
 import asyncio
-from datetime import timedelta
 import sys
 import time
 from pathlib import Path
@@ -9,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from mcp.types import CallToolResult
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = Path(__file__).resolve().parents[1]
@@ -84,19 +84,6 @@ def _build_interactive_dispatcher(
   assert isinstance(wrapped, _FakeExcelDispatcher)
   return wrapped._base
 
-class _FakeToolCallResult:
-  def __init__(
-    self,
-    *,
-    isError: bool,
-    structuredContent: object | None,
-    content: object,
-  ) -> None:
-    self.isError = isError
-    self.structuredContent = structuredContent
-    self.content = content
-
-
 class _FakeSession:
   def __init__(self) -> None:
     self.calls: list[dict[str, Any]] = []
@@ -106,7 +93,7 @@ class _FakeSession:
     name: str,
     arguments: dict[str, object],
     *,
-    read_timeout_seconds: timedelta,
+    read_timeout_seconds: float,
     meta: dict[str, object] | None = None,
   ):
     self.calls.append(
@@ -117,10 +104,10 @@ class _FakeSession:
         "meta": meta,
       }
     )
-    return _FakeToolCallResult(
-      isError=False,
-      structuredContent={"ok": True},
-      content=None,
+    return CallToolResult(
+      is_error=False,
+      structured_content={"ok": True},
+      content=[],
     )
 
 
@@ -663,12 +650,12 @@ def test_mcp_client_call_tool_uses_per_tool_timeout_before_server_timeout() -> N
   result, error = _run(manager.call_tool("build_model", {"research_file_id": 1}))
   assert error is None
   assert result == {"ok": True}
-  assert session.calls[-1]["read_timeout_seconds"].total_seconds() == 300
+  assert session.calls[-1]["read_timeout_seconds"] == 300
 
   result, error = _run(manager.call_tool("portfolio_summary", {}))
   assert error is None
   assert result == {"ok": True}
-  assert session.calls[-1]["read_timeout_seconds"].total_seconds() == 120
+  assert session.calls[-1]["read_timeout_seconds"] == 120
 
 
 def test_mcp_client_call_tool_enforces_hard_timeout_when_sdk_cancel_is_slow(monkeypatch) -> None:
@@ -688,7 +675,7 @@ def test_mcp_client_call_tool_enforces_hard_timeout_when_sdk_cancel_is_slow(monk
       name: str,
       arguments: dict[str, object],
       *,
-      read_timeout_seconds: timedelta,
+      read_timeout_seconds: float,
       meta: dict[str, object] | None = None,
     ):
       self.calls.append(
@@ -704,10 +691,10 @@ def test_mcp_client_call_tool_enforces_hard_timeout_when_sdk_cancel_is_slow(monk
       except asyncio.CancelledError:
         self.cancelled = True
         await asyncio.sleep(2)
-      return _FakeToolCallResult(
-        isError=False,
-        structuredContent={"late": True},
-        content=None,
+      return CallToolResult(
+        is_error=False,
+        structured_content={"late": True},
+        content=[],
       )
 
   session = _SlowCancellationSession()
@@ -726,7 +713,7 @@ def test_mcp_client_call_tool_enforces_hard_timeout_when_sdk_cancel_is_slow(monk
   assert error["sub_code"] == "timeout"
   assert "MCP tool slow_tool timed out after 0.01s" in error["message"]
   assert session.cancelled is True
-  assert session.calls[0]["read_timeout_seconds"].total_seconds() == 0.01
+  assert session.calls[0]["read_timeout_seconds"] == 0.01
 
 
 def test_mcp_client_call_tool_cancels_sdk_task_when_caller_is_cancelled() -> None:
@@ -742,7 +729,7 @@ def test_mcp_client_call_tool_cancels_sdk_task_when_caller_is_cancelled() -> Non
       name: str,
       arguments: dict[str, object],
       *,
-      read_timeout_seconds: timedelta,
+      read_timeout_seconds: float,
       meta: dict[str, object] | None = None,
     ):
       _ = name, arguments, read_timeout_seconds, meta
@@ -752,10 +739,10 @@ def test_mcp_client_call_tool_cancels_sdk_task_when_caller_is_cancelled() -> Non
       except asyncio.CancelledError:
         self.cancelled = True
         raise
-      return _FakeToolCallResult(
-        isError=False,
-        structuredContent={"late": True},
-        content=None,
+      return CallToolResult(
+        is_error=False,
+        structured_content={"late": True},
+        content=[],
       )
 
   async def _run_cancel() -> _CancellableSession:
@@ -799,7 +786,7 @@ def test_mcp_client_call_tool_preserves_caller_cancellation_racing_timeout_clean
         name: str,
         arguments: dict[str, object],
         *,
-        read_timeout_seconds: timedelta,
+        read_timeout_seconds: float,
         meta: dict[str, object] | None = None,
       ):
         _ = name, arguments, read_timeout_seconds, meta
@@ -809,10 +796,10 @@ def test_mcp_client_call_tool_preserves_caller_cancellation_racing_timeout_clean
           self.cancelled = True
           caller_task.cancel()
           raise
-        return _FakeToolCallResult(
-          isError=False,
-          structuredContent={"late": True},
-          content=None,
+        return CallToolResult(
+          is_error=False,
+          structured_content={"late": True},
+          content=[],
         )
 
     session = _CallerCancellingSession()

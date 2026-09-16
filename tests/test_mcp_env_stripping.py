@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from mcp.types import ListToolsResult, PaginatedRequestParams
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = Path(__file__).resolve().parents[1]
@@ -184,7 +185,6 @@ def test_server_env_passthrough_uses_parent_value_without_literal(
     ),
     encoding="utf-8",
   )
-  monkeypatch.setattr(mcp_client_module, "MCP_IMPORT_ERROR", None)
   monkeypatch.setattr(mcp_client_module.os, "environ", {env_name: "parent-secret"})
 
   manager = McpClientManager(
@@ -249,7 +249,6 @@ def test_server_env_passthrough_handles_config_when_parent_absent(
     ),
     encoding="utf-8",
   )
-  monkeypatch.setattr(mcp_client_module, "MCP_IMPORT_ERROR", None)
   monkeypatch.setattr(mcp_client_module.os, "environ", {})
 
   manager = McpClientManager(
@@ -287,7 +286,6 @@ def test_server_env_passthrough_preserves_literal_when_parent_value_is_empty(
     ),
     encoding="utf-8",
   )
-  monkeypatch.setattr(mcp_client_module, "MCP_IMPORT_ERROR", None)
   monkeypatch.setattr(mcp_client_module.os, "environ", {"FMP_API_KEY": ""})
 
   manager = McpClientManager(
@@ -352,7 +350,6 @@ def test_build_mcp_env_expands_refs_once_without_recursion(monkeypatch) -> None:
 
 
 def test_connect_passes_filtered_env_to_stdio_server_parameters(monkeypatch) -> None:
-  monkeypatch.setattr(mcp_client_module, "MCP_IMPORT_ERROR", None)
   monkeypatch.setattr(
     mcp_client_module.os,
     "environ",
@@ -378,10 +375,6 @@ def test_connect_passes_filtered_env_to_stdio_server_parameters(monkeypatch) -> 
     async def __aexit__(self, exc_type, exc, tb):
       return None
 
-  class _FakeListedTools:
-    tools = []
-    nextCursor = None
-
   class _FakeClientSession:
     def __init__(self, read_stream, write_stream):
       self.read_stream = read_stream
@@ -396,8 +389,8 @@ def test_connect_passes_filtered_env_to_stdio_server_parameters(monkeypatch) -> 
     async def initialize(self):
       return None
 
-    async def list_tools(self, cursor=None):
-      return _FakeListedTools()
+    async def list_tools(self, *, params: PaginatedRequestParams | None = None) -> ListToolsResult:
+      return ListToolsResult(tools=[])
 
   def _fake_stdio_client(server_params, errlog=None):
     captured["server_params"] = server_params

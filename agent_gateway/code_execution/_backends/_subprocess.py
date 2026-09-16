@@ -4,6 +4,7 @@ import asyncio
 import os
 import shutil
 import signal
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -64,7 +65,7 @@ class SubprocessBackend(ExecutionBackend):
     return False
 
   def available(self) -> bool:
-    return shutil.which("python3") is not None
+    return bool(sys.executable)
 
   async def execute(
     self,
@@ -126,7 +127,7 @@ class SubprocessBackend(ExecutionBackend):
     )
     before_mtimes = None if task_id else _snapshot_image_mtimes(work_dir_path)
     process = await asyncio.create_subprocess_exec(
-      "python3",
+      sys.executable,
       "-u",
       str(script_path),
       stdout=asyncio.subprocess.PIPE,

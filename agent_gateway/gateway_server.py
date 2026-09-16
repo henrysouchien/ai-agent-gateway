@@ -1,7 +1,15 @@
+# Privileged TCP launcher: privileged_claim_launcher hands off a claim-signing
+# fd; this boundary delegates to uvicorn.Config/Server.run with exactly one worker.
+# Uvicorn 0.53 app-load/bind/lifespan failures exit 3 and are logged here;
+# systemd Restart=always still restarts them.
+# Owners: packages/agent-gateway/README.md;
+# docs/reference/local-gateway-immutable-runtime.md.
+
 from __future__ import annotations
 
 import argparse
 import ctypes
+import logging
 import resource
 import sys
 from typing import Sequence
@@ -105,7 +113,38 @@ def run_gateway_server(
       ssl_keyfile=ssl_keyfile,
       ssl_certfile=ssl_certfile,
     )
-  uvicorn.Server(config).run()
+  server = uvicorn.Server(config)
+  try:
+    server.run()
+    if not server.started:
+      raise SystemExit(3)
+  except (SystemExit, Exception) as exc:
+    exit_code = 1
+    if isinstance(exc, SystemExit):
+      exit_code = exc.code if isinstance(exc.code, int) else int(exc.code is not None)
+    if not exit_code:
+      if server.started:
+        raise
+      exit_code = 3
+    if server.started:
+      failure_class = "runtime"
+    elif not config.loaded:
+      failure_class = "app_load"
+    elif (
+      server.lifespan.startup_failed
+      or (server.lifespan.error_occurred and config.lifespan == "on")
+    ):
+      failure_class = "lifespan"
+    else:
+      failure_class = "bind"
+    logging.getLogger(__name__).error(
+      "event=gateway_launch_failed failure_class=%s exit_code=%s",
+      failure_class,
+      exit_code,
+    )
+    if isinstance(exc, SystemExit) and not exc.code:
+      raise SystemExit(exit_code) from exc
+    raise
 
 
 def main(argv: Sequence[str] | None = None) -> int:

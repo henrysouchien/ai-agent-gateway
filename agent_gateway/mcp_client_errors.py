@@ -3,6 +3,18 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Callable
 
+from mcp import MCPError
+from mcp.types import (
+  CONNECTION_CLOSED,
+  INVALID_PARAMS,
+  INVALID_REQUEST,
+  METHOD_NOT_FOUND,
+  PARSE_ERROR,
+  REQUEST_TIMEOUT,
+)
+
+from .mcp_client_config import iter_exception_tree
+
 
 class McpExecutableMissingError(RuntimeError):
   """The configured stdio executable decisively cannot exist at spawn time.
@@ -16,6 +28,16 @@ class McpExecutableMissingError(RuntimeError):
 
 
 def classify_exception(exc: Exception, msg: str) -> str:
+  if isinstance(exc, MCPError):
+    if exc.code == REQUEST_TIMEOUT:
+      return "timeout"
+    if exc.code == CONNECTION_CLOSED:
+      return "connection_error"
+    if exc.code == METHOD_NOT_FOUND:
+      return "not_found"
+    if exc.code in (PARSE_ERROR, INVALID_REQUEST, INVALID_PARAMS):
+      return "parse_error"
+    return "unknown"
   lower = msg.lower()
   if isinstance(exc, asyncio.TimeoutError) or "timeout" in lower or "timed out" in lower:
     return "timeout"
@@ -25,6 +47,7 @@ def classify_exception(exc: Exception, msg: str) -> str:
 
 
 def classify_mcp_error(message: str) -> str:
+  # Tool-result text has no JSON-RPC code; protocol exceptions use classify_exception.
   lower = message.lower()
   if "not found" in lower or "no filing" in lower or "no data" in lower:
     return "not_found"
@@ -51,7 +74,11 @@ def startup_failure_from_exception(
       "message": message,
       "error_type": error_type,
     }
-  if isinstance(exc, asyncio.TimeoutError):
+  if any(
+    isinstance(candidate, asyncio.TimeoutError)
+    or (isinstance(candidate, MCPError) and candidate.code == REQUEST_TIMEOUT)
+    for candidate in iter_exception_tree(exc)
+  ):
     return {
       "category": "transient_timeout",
       "retryable": True,

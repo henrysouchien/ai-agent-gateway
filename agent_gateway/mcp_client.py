@@ -1,3 +1,10 @@
+"""Gateway-side MCP client for stdio and streamable HTTP.
+
+Owns per-user sessions and catalog publication; mcp_client_config owns reconnect
+classification. Reconnecting must never authorize unsafe tool-call replay.
+See packages/agent-gateway/docs/architecture.md.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -12,11 +19,16 @@ import random
 import time
 import uuid
 from dataclasses import dataclass, field, replace
-from datetime import timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import AbstractSet, Any, Callable, cast, Dict, List, Mapping, Sequence, Set, Tuple, TypedDict, TYPE_CHECKING
+from typing import AbstractSet, Any, Callable, cast, Dict, List, Mapping, Sequence, Set, Tuple, TypedDict
 
+import httpx
+import httpx2
+from fastmcp.client.auth.oauth import OAuth as FastMCPOAuth
+from mcp.client.session import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.client.streamable_http import streamable_http_client
 from typing_extensions import TypeIs
 
 from agent_workflow_contracts.tool_registration import (
@@ -61,45 +73,6 @@ from .tool_policy_registry import (
   ToolPolicyResultError,
 )
 
-try:
-  from mcp.client.session import ClientSession
-  from mcp.client.stdio import StdioServerParameters, stdio_client
-  MCP_IMPORT_ERROR: Exception | None = None
-except Exception as exc:
-  ClientSession = Any
-  StdioServerParameters = Any
-  MCP_IMPORT_ERROR = exc
-
-  def stdio_client(*args: Any, **kwargs: Any) -> Any:
-    _ = args, kwargs
-    raise RuntimeError(f"MCP client runtime unavailable: {MCP_IMPORT_ERROR}")
-
-try:
-  from mcp.client.streamable_http import streamable_http_client
-  STREAMABLE_HTTP_IMPORT_ERROR: Exception | None = None
-except Exception as exc:
-  streamable_http_client = None
-  STREAMABLE_HTTP_IMPORT_ERROR = exc
-
-try:
-  import httpx as _httpx
-  HTTPX_IMPORT_ERROR: Exception | None = None
-except Exception as exc:
-  _httpx = None
-  HTTPX_IMPORT_ERROR = exc
-if TYPE_CHECKING:
-  import httpx
-else:
-  httpx = _httpx
-
-try:
-  from fastmcp.client.auth.oauth import OAuth as FastMCPOAuth
-  FASTMCP_OAUTH_IMPORT_ERROR: Exception | None = None
-except Exception as exc:
-  FastMCPOAuth = None
-  FASTMCP_OAUTH_IMPORT_ERROR = exc
-
-
 log = logging.getLogger("agent_gateway.mcp_client")
 _UNSET: _config_helpers.McpConfigPathUnset = _config_helpers.UNSET
 _STREAMABLE_HTTP_TYPES = _config_helpers.STREAMABLE_HTTP_TYPES
@@ -133,7 +106,7 @@ PER_USER_DRAIN_TIMEOUT_SECONDS = 60.0
 
 
 class _McpCallKwargs(TypedDict, total=False):
-  read_timeout_seconds: timedelta
+  read_timeout_seconds: float
   meta: dict[str, object]
 
 
@@ -191,10 +164,6 @@ def _startup_concurrency_limit() -> int:
   return _config_helpers.startup_concurrency_limit(environ=os.environ, logger=log)
 
 
-def _iter_exception_tree(exc: BaseException):
-  yield from _config_helpers.iter_exception_tree(exc)
-
-
 def _is_retryable_stdio_connect_error(exc: BaseException) -> bool:
   return _config_helpers.is_retryable_stdio_connect_error(exc)
 
@@ -229,18 +198,15 @@ def _classify_mcp_error(message: str) -> str:
 
 
 def _is_sheets_transport_failure(exc: BaseException) -> bool:
-  return any(
-    isinstance(candidate, (asyncio.TimeoutError, TimeoutError))
-    for candidate in _iter_exception_tree(exc)
-  ) or _is_retryable_stdio_connect_error(exc)
+  return _is_retryable_stdio_startup_error(exc)
 
 
 def _sheets_structured_error(
-  result: Any,
+  result: _connection_helpers.McpToolCallResult,
   *,
   expected_operation: str,
 ) -> dict[str, Any] | None:
-  payload = getattr(result, "structuredContent", None)
+  payload = result.structured_content
   if not isinstance(payload, dict) or payload.get("status") != "error":
     return None
   operation = payload.get("operation")
@@ -849,7 +815,6 @@ class McpClientManager:
       await _startup_helpers.startup_manager(
         self,
         allowed_servers,
-        mcp_import_error=MCP_IMPORT_ERROR,
         supported_server_types=set(_SUPPORTED_SERVER_TYPES),
         logger=log,
       )
@@ -873,14 +838,11 @@ class McpClientManager:
       stdio_server_parameters_factory=StdioServerParameters,
       stdio_client_factory=stdio_client,
       client_session_factory=ClientSession,
-      httpx_module=httpx,
+      httpx_module=httpx2,
       streamable_http_client_factory=streamable_http_client,
       json_file_key_value_factory=_JsonFileKeyValue,
       fastmcp_oauth_factory=FastMCPOAuth,
       path_factory=Path,
-      httpx_import_error=HTTPX_IMPORT_ERROR,
-      streamable_http_import_error=STREAMABLE_HTTP_IMPORT_ERROR,
-      fastmcp_oauth_import_error=FASTMCP_OAUTH_IMPORT_ERROR,
       environ=os.environ,
       logger=log,
     )
@@ -2633,7 +2595,7 @@ class McpClientManager:
     if is_sheets and sheets_error is not None:
       return None, _sheets_gateway_error(sheets_error)
 
-    if result.isError:
+    if result.is_error:
       if is_sheets:
         payload = _gateway_sheets_error_payload(
           original_name,
@@ -2656,14 +2618,14 @@ class McpClientManager:
 
     if is_sheets:
       if (
-        isinstance(result.structuredContent, dict)
-        and result.structuredContent.get("status") == "ok"
-        and result.structuredContent.get("operation") == original_name
+        isinstance(result.structured_content, dict)
+        and result.structured_content.get("status") == "ok"
+        and result.structured_content.get("operation") == original_name
       ):
-        return result.structuredContent, None
+        return result.structured_content, None
       error_contract = bool(
-        isinstance(result.structuredContent, dict)
-        and result.structuredContent.get("status") == "error"
+        isinstance(result.structured_content, dict)
+        and result.structured_content.get("status") == "error"
       )
       payload = _gateway_sheets_error_payload(
         original_name,
@@ -2682,8 +2644,8 @@ class McpClientManager:
       )
       return None, _sheets_gateway_error(payload)
 
-    if result.structuredContent is not None:
-      return result.structuredContent, None
+    if result.structured_content is not None:
+      return result.structured_content, None
 
     text_payload = self._extract_text(result.content)
     if text_payload:
@@ -2708,7 +2670,7 @@ class McpClientManager:
       raise asyncio.CancelledError()
     session = server.session
     call_kwargs: _McpCallKwargs = {
-      "read_timeout_seconds": timedelta(seconds=timeout_seconds),
+      "read_timeout_seconds": timeout_seconds,
     }
     if meta is not None:
       call_kwargs["meta"] = meta
@@ -3117,9 +3079,9 @@ class McpClientManager:
   def _extract_text(content: Any) -> str:
     return _runtime_helpers.extract_text(content)
 
-  def _result_message(self, result: Any) -> str:
-    message = self._extract_text(getattr(result, "content", None))
-    structured_content = getattr(result, "structuredContent", None)
+  def _result_message(self, result: _connection_helpers.McpToolCallResult) -> str:
+    message = self._extract_text(result.content)
+    structured_content = result.structured_content
     if not message and structured_content is not None:
       message = json.dumps(structured_content, default=str)
     return message

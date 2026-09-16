@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from mcp import MCPError
+from mcp.types import CONNECTION_CLOSED, INTERNAL_ERROR, REQUEST_TIMEOUT
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = Path(__file__).resolve().parents[1]
@@ -126,6 +128,22 @@ def test_config_helper_invalid_numeric_logs_warning() -> None:
     logger=_Logger(),
   ) == 4
   assert warnings == [("Ignoring invalid %s=%r; using %d", "MCP_STARTUP_CONCURRENCY", "invalid", 4)]
+
+
+@pytest.mark.parametrize(
+  ("exc", "retry_connect", "retry_startup"),
+  [
+    (MCPError(CONNECTION_CLOSED, "peer disappeared"), True, True),
+    (MCPError(REQUEST_TIMEOUT, "response deadline elapsed"), False, True),
+    (MCPError(INTERNAL_ERROR, "connection closed"), False, False),
+  ],
+)
+def test_stdio_reconnect_classification_uses_mcp_codes(
+  exc, retry_connect, retry_startup,
+) -> None:
+  grouped = ExceptionGroup("stdio failed", [exc])
+  assert mcp_client_config.is_retryable_stdio_connect_error(grouped) is retry_connect
+  assert mcp_client_config.is_retryable_stdio_startup_error(grouped) is retry_startup
 
 
 def test_startup_concurrency_defaults_to_bounded_fanout() -> None:

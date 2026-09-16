@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import FrozenInstanceError
-from datetime import timedelta
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
+from mcp.types import CallToolResult
 
 import agent_gateway.mcp_client as mcp_client_module
 from agent_gateway.mcp_client import McpClientManager
@@ -42,7 +41,7 @@ class _UnusedMcpSession:
     name: str,
     arguments: dict[str, object],
     *,
-    read_timeout_seconds: timedelta,
+    read_timeout_seconds: float,
     meta: dict[str, object] | None = None,
   ) -> McpToolCallResult:
     _ = name, arguments, read_timeout_seconds, meta
@@ -215,14 +214,14 @@ def test_logical_alias_behavior_matches_branded_original(
       "original_name": kwargs["original_name"],
       "tool_input": kwargs["tool_input"],
     })
-    return SimpleNamespace(
-      isError=False,
-      structuredContent={
+    return CallToolResult(
+      is_error=False,
+      structured_content={
         "status": "ok",
         "tool": kwargs["original_name"],
         "input": kwargs["tool_input"],
       },
-      content=None,
+      content=[],
     )
 
   monkeypatch.setattr(manager, "_call_tool_once", fake_call_tool_once)
@@ -595,10 +594,10 @@ def test_retirement_dispatch_preserves_physical_session_and_provider_identity(
 
   async def fake_call_tool_once(**kwargs):
     calls.append((kwargs["server"], kwargs["original_name"], kwargs["tool_input"]))
-    return SimpleNamespace(
-      isError=False,
-      structuredContent={"tool": kwargs["original_name"]},
-      content=None,
+    return CallToolResult(
+      is_error=False,
+      structured_content={"tool": kwargs["original_name"]},
+      content=[],
     )
 
   monkeypatch.setattr(manager, "_call_tool_once", fake_call_tool_once)

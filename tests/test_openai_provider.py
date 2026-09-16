@@ -5,12 +5,12 @@ import builtins
 import json
 import stat
 import sys
-import types
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NoReturn
 
+import httpx2
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -47,6 +47,12 @@ class _EventStream:
       return next(self._iterator)
     except StopIteration as exc:
       raise StopAsyncIteration from exc
+
+  async def __aenter__(self):
+    return self
+
+  async def __aexit__(self, *_exc):
+    return None
 
 
 class _Responses:
@@ -134,26 +140,36 @@ def _clear_openai_env(monkeypatch: pytest.MonkeyPatch):
   monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
 
-def _install_fake_openai(monkeypatch: pytest.MonkeyPatch):
-  class FakeAsyncOpenAI:
-    def __init__(self, **kwargs: Any):
-      self.kwargs = kwargs
-      self.responses = SimpleNamespace(create=lambda **_kwargs: None)
+async def _capture_openai_request(config: dict[str, Any], *, timeout: float | None = None):
+  requests = []
 
-  class FakeOpenAIModule(types.ModuleType):
-    AsyncOpenAI: type[FakeAsyncOpenAI]
+  def handle_request(request: httpx2.Request) -> httpx2.Response:
+    requests.append(request)
+    return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=(
+      'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
+      'data: [DONE]\n\n'
+    ))
 
-  module = FakeOpenAIModule("openai")
-  module.AsyncOpenAI = FakeAsyncOpenAI
-  monkeypatch.setitem(sys.modules, "openai", module)
-  return FakeAsyncOpenAI
+  provider = OpenAIProvider()
+  client = provider.create_client(config, timeout=timeout)
+  try:
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(handle_request)) as http_client:
+      async with client.with_options(http_client=http_client) as local_client:
+        params = provider.build_request_params(
+          model="gpt-5.6", messages=[{"role": "user", "content": "hello"}],
+          system_prompt=None, tools=[], max_tokens=32, thinking_level=ThinkingLevel.NONE,
+        )
+        async for _event in provider.stream(local_client, params):
+          pass
+  finally:
+    await provider.close_client(client)
+  return requests[0]
 
 
 def test_provider_does_not_fall_back_to_process_api_key(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   monkeypatch.setenv("OPENAI_API_KEY", "process-service-secret")
-  _install_fake_openai(monkeypatch)
   provider = OpenAIProvider()
 
   assert provider.has_active_credential({"auth_mode": "api", "api_key": ""}) is False
@@ -167,18 +183,22 @@ def test_client_ignores_ambient_route_organization_and_project(
   monkeypatch.setenv("OPENAI_BASE_URL", "https://ambient.invalid/v1")
   monkeypatch.setenv("OPENAI_ORG_ID", "ambient-org")
   monkeypatch.setenv("OPENAI_PROJECT_ID", "ambient-project")
-  fake = _install_fake_openai(monkeypatch)
+  monkeypatch.setenv("OPENAI_API_KEY", "ambient-api-key")
+  monkeypatch.setenv("OPENAI_AUTH_TOKEN", "ambient-oauth-token")
 
-  client = OpenAIProvider().create_client({
+  request = asyncio.run(_capture_openai_request({
     "auth_mode": "api",
     "api_key": "bound-api-key",
-  })
+    "auth_token": "unselected-oauth-token",
+  }, timeout=37.0))
 
-  assert isinstance(client, fake)
-  assert client.kwargs["api_key"] == "bound-api-key"
-  assert client.kwargs["base_url"] == "https://api.openai.com/v1"
-  assert client.kwargs["organization"] == ""
-  assert client.kwargs["project"] == ""
+  assert str(request.url) == "https://api.openai.com/v1/responses"
+  assert request.headers.get_list("authorization") == ["Bearer bound-api-key"]
+  assert not request.headers.get("openai-organization")
+  assert not request.headers.get("openai-project")
+  assert request.extensions["timeout"] == {
+    "connect": 5.0, "read": 37.0, "write": 37.0, "pool": 37.0,
+  }
 
 
 def test_client_passes_bound_route_organization_and_project(
@@ -187,30 +207,33 @@ def test_client_passes_bound_route_organization_and_project(
   monkeypatch.setenv("OPENAI_BASE_URL", "https://ambient.invalid/v1")
   monkeypatch.setenv("OPENAI_ORG_ID", "ambient-org")
   monkeypatch.setenv("OPENAI_PROJECT_ID", "ambient-project")
-  fake = _install_fake_openai(monkeypatch)
+  monkeypatch.setenv("OPENAI_API_KEY", "ambient-api-key")
+  monkeypatch.setenv("OPENAI_AUTH_TOKEN", "ambient-oauth-token")
 
-  client = OpenAIProvider().create_client({
+  request = asyncio.run(_capture_openai_request({
     "auth_mode": "oauth",
+    "api_key": "unselected-api-key",
     "auth_token": "bound-oauth-token",
     "baseURL": "https://api.openai.com",
     "organization": "bound-org",
     "project": "bound-project",
-  })
+  }))
 
-  assert isinstance(client, fake)
-  assert client.kwargs["api_key"] == "bound-oauth-token"
-  assert client.kwargs["base_url"] == "https://api.openai.com/v1"
-  assert client.kwargs["organization"] == "bound-org"
-  assert client.kwargs["project"] == "bound-project"
+  assert str(request.url) == "https://api.openai.com/v1/responses"
+  assert request.headers.get_list("authorization") == ["Bearer bound-oauth-token"]
+  assert request.headers["openai-organization"] == "bound-org"
+  assert request.headers["openai-project"] == "bound-project"
 
 
-@pytest.mark.parametrize("key", ["base_url", "baseURL", "api_base_url", "api_base"])
-@pytest.mark.parametrize("url", ["https://api.openai.com", "https://api.openai.com/v1", "https://API.OPENAI.COM/v1/"])
-def test_official_base_url_aliases_canonicalize(monkeypatch: pytest.MonkeyPatch, key: str, url: str) -> None:
-  fake = _install_fake_openai(monkeypatch)
-  client = OpenAIProvider().create_client({"api_key": "sk-test", key: url})
-  assert isinstance(client, fake)
-  assert client.kwargs["base_url"] == "https://api.openai.com/v1"
+@pytest.mark.parametrize(("key", "url"), [
+  ("base_url", "https://api.openai.com"),
+  ("baseURL", "https://api.openai.com/v1"),
+  ("api_base_url", "https://API.OPENAI.COM/v1/"),
+  ("api_base", "https://api.openai.com/v1"),
+])
+def test_official_base_url_aliases_canonicalize(key: str, url: str) -> None:
+  request = asyncio.run(_capture_openai_request({"api_key": "sk-test", key: url}))
+  assert str(request.url) == "https://api.openai.com/v1/responses"
 
 
 @pytest.mark.parametrize("url", [
@@ -221,21 +244,80 @@ def test_official_base_url_aliases_canonicalize(monkeypatch: pytest.MonkeyPatch,
   "https://api.openai.com/v1/responses",
   "https://api.chutes.ai/v1",
 ])
-def test_non_official_or_unsafe_base_urls_fail(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
-  _install_fake_openai(monkeypatch)
+def test_non_official_or_unsafe_base_urls_fail(url: str) -> None:
   with pytest.raises(OpenAIConfigurationError, match="Responses-only|base_url"):
     OpenAIProvider().create_client({"api_key": "sk-test", "base_url": url})
 
 
-def test_nonempty_compat_fails(monkeypatch: pytest.MonkeyPatch) -> None:
-  _install_fake_openai(monkeypatch)
+def test_nonempty_compat_fails() -> None:
   with pytest.raises(OpenAIConfigurationError, match="compatibility overrides"):
     OpenAIProvider().create_client({"api_key": "sk-test", "compat": {"streaming": True}})
 
 
-def test_supported_sdk_contract_is_present() -> None:
-  from openai import AsyncOpenAI
-  assert hasattr(AsyncOpenAI, "responses")
+def test_raw_httpx2_transport_error_is_retryable() -> None:
+  error = httpx2.ReadError(
+    "connection closed during stream",
+    request=httpx2.Request("POST", "https://api.openai.com/v1/responses"),
+  )
+  assert OpenAIProvider().is_retryable_error(error) is True
+
+
+@pytest.mark.parametrize(
+  ("transport_error", "sdk_error"),
+  [(httpx2.ReadError, "APIConnectionError"), (httpx2.ReadTimeout, "APITimeoutError")],
+)
+def test_partial_stream_failure_is_retryable_and_closes_response(transport_error, sdk_error) -> None:
+  import openai
+
+  class InterruptedStream(httpx2.AsyncByteStream):
+    async def __aiter__(self):
+      yield b'data: {"type":"response.output_item.added","item":{"type":"message","id":"msg_1","content":[]}}\n\n'
+      yield b'data: {"type":"response.output_text.delta","delta":"partial"}\n\n'
+      raise transport_error("stream interrupted")
+
+  response = httpx2.Response(
+    200, headers={"content-type": "text/event-stream"}, stream=InterruptedStream(),
+  )
+  provider = OpenAIProvider()
+
+  async def case():
+    async with provider.create_client({"api_key": "test-key"}) as client:
+      async with httpx2.AsyncClient(transport=httpx2.MockTransport(lambda _request: response)) as http_client:
+        async with client.with_options(http_client=http_client, max_retries=0) as local:
+          stream = provider.stream(local, {"model": "gpt-5.6", "input": "hello", "stream": True})
+          assert (await anext(stream)).text == "partial"
+          with pytest.raises(getattr(openai, sdk_error)) as caught:
+            await anext(stream)
+          assert isinstance(caught.value.__cause__, transport_error)
+          assert provider.is_retryable_error(caught.value) is True
+          assert response.is_closed
+
+  asyncio.run(case())
+
+
+def test_closing_provider_stream_releases_response_before_client() -> None:
+  class UnfinishedStream(httpx2.AsyncByteStream):
+    async def __aiter__(self):
+      yield b'data: {"type":"response.output_item.added","item":{"type":"message","id":"msg_1","content":[]}}\n\n'
+      yield b'data: {"type":"response.output_text.delta","delta":"partial"}\n\n'
+      await asyncio.Event().wait()
+
+  response = httpx2.Response(
+    200, headers={"content-type": "text/event-stream"}, stream=UnfinishedStream(),
+  )
+  provider = OpenAIProvider()
+
+  async def case():
+    async with provider.create_client({"api_key": "test-key"}) as client:
+      async with httpx2.AsyncClient(transport=httpx2.MockTransport(lambda _request: response)) as http_client:
+        async with client.with_options(http_client=http_client) as local:
+          stream = provider.stream(local, {"model": "gpt-5.6", "input": "hello", "stream": True})
+          assert (await anext(stream)).text == "partial"
+          await stream.aclose()
+          assert response.is_closed
+          assert not local.is_closed()
+
+  asyncio.run(case())
 
 
 def test_request_contract_reasoning_tools_and_local_history() -> None:

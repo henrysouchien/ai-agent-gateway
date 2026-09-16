@@ -4,11 +4,9 @@ import asyncio
 import hashlib
 import hmac
 import json
-from datetime import timedelta
 import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 from typing import Mapping
 ROOT = Path(__file__).resolve().parents[3]
@@ -88,7 +86,7 @@ class _UnusedClientSession:
     name: str,
     arguments: Mapping[str, object],
     *,
-    read_timeout_seconds: timedelta,
+    read_timeout_seconds: float,
     meta: Mapping[str, object] | None = None,
   ) -> _ToolResult:
     raise AssertionError(f"unexpected physical MCP call: {name}")
@@ -99,8 +97,8 @@ def _tool_result(*, is_error=False, payload=None, structured_content=None) -> _T
   if payload is not None:
     content = [TextContent(type="text", text=json.dumps(payload))]
   return _ToolResult(
-    isError=is_error,
-    structuredContent=structured_content,
+    is_error=is_error,
+    structured_content=structured_content,
     content=content,
   )
 
@@ -1156,10 +1154,10 @@ def test_broker_expiry_backstop_does_not_substring_match_arbitrary_text(monkeypa
       return state
 
     monkeypatch.setattr(manager, "_get_per_user_server", resolve)
-    monkeypatch.setattr(manager, "_call_tool_once", lambda **_: asyncio.sleep(0, result=SimpleNamespace(
-      isError=True,
-      structuredContent=None,
-      content=[SimpleNamespace(text="untyped broker_session_expired note")],
+    monkeypatch.setattr(manager, "_call_tool_once", lambda **_: asyncio.sleep(0, result=_ToolResult(
+      is_error=True,
+      structured_content=None,
+      content=[TextContent(type="text", text="untyped broker_session_expired note")],
     )))
     result, error = await manager.call_tool(
       "tool", {}, gateway_session=_gateway_session()
@@ -1321,8 +1319,8 @@ def test_structured_sheets_error_requires_complete_contract_shape(monkeypatch):
     manager = _manager("gsheets_read_range")
     state = _PerUserServerState(_child("first"), time.time() + 3600, time.time())
     malformed = _sheets_error_result()
-    assert isinstance(malformed.structuredContent, dict)
-    malformed_error = malformed.structuredContent["error"]
+    assert isinstance(malformed.structured_content, dict)
+    malformed_error = malformed.structured_content["error"]
     assert isinstance(malformed_error, dict)
     del malformed_error["recovery"]
 

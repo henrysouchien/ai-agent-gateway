@@ -224,7 +224,24 @@ They all converge at the same dispatch layer.
 
 ### MCP Tools
 
-`McpClientManager` starts stdio MCP servers, lists their tool definitions, and routes tool calls back to the correct server.
+`McpClientManager` connects stdio and streamable-HTTP MCP servers, lists their
+tool definitions, and routes tool calls back to the correct server.
+`mcp_client_connections` owns transport setup, OAuth configuration, and catalog
+enumeration; `mcp_client_config` owns reconnect eligibility.
+
+MCP 2, FastMCP 4, and `httpx2` are required dependencies; OAuth is an optional
+per-server authentication choice, not an optional SDK installation. The client
+uses `ClientSession.initialize()` for its handshake, snake_case SDK attributes
+(without changing wire JSON names), float-second timeouts, and
+`PaginatedRequestParams` for catalog pagination and the stdio stability probe.
+Streamable HTTP yields read and write streams; its transport and OAuth clients
+use `httpx2`, while ordinary tool HTTP remains on `httpx`.
+
+Reconnect eligibility uses typed `MCPError` codes. Request timeout `-32001`
+permits startup retry or reconnection for future calls, never in-flight replay.
+Connection-closed errors can replay only when the call's existing replay policy
+allows it; registered mutating calls and uncertain Sheets mutations are not
+replayed.
 
 Good fit when:
 

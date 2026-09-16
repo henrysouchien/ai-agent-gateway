@@ -2014,6 +2014,8 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       "mcp_servers": dict(self._mcp_server_configs),
       "allowed_tools": list(self._allowed_tools),
       "continue_conversation": False,
+      # Gateway policy owns execution; never load user/project/local hooks.
+      "setting_sources": [],
       "max_turns": max_turns if max_turns is not None else self._max_turns,
       "max_budget_usd": self._sdk_config.max_budget_usd,
       "disallowed_tools": sorted(self._effective_disallowed_tools()),

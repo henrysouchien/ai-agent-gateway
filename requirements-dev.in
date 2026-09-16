@@ -1,20 +1,22 @@
 # Human-edited dependency intent file for agent-gateway dev/publish environment.
-# Run `make gateway-deps-lock` to regenerate requirements-dev.txt with pinned versions + hashes.
+# Run `make gateway-deps-update PKG=<name>` (space-separated list for coupled targets) to move one
+# dependency; `make gateway-deps-lock` only recompiles without upgrading.
 #
 # Core deps (must match pyproject.toml [project.dependencies])
 fastapi
 PyJWT>=2.14.0
 PyYAML
-mcp>=1.30.0
-fastmcp>=3.2.4
+mcp>=2,<3  # raw client API: typed pagination, float timeouts, httpx2 transport
+fastmcp>=4,<5  # paired with MCP 2
 httpx>=0.28.1
+httpx2>=2.5,<3
 pydantic
 
 # Optional deps we use locally (must match pyproject.toml [project.optional-dependencies])
-anthropic>=0.93.0
-openai>=2.31.0
+anthropic>=1.6,<2  # SDK transport uses httpx2
+openai>=3.14,<4  # SDK transport uses httpx2
 # Supported version is enforced by agent_gateway/providers/agent_sdk.py.
-claude-agent-sdk==0.1.50
+claude-agent-sdk==0.2.153
 
 # Build-system deps (used with --no-isolation to keep builds inside the hashed env)
 setuptools>=83.0.0

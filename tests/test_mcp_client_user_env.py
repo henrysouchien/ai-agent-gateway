@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import timedelta
 import sys
 from pathlib import Path
 from typing import Mapping
@@ -33,7 +32,7 @@ class _UnusedClientSession:
     name: str,
     arguments: Mapping[str, object],
     *,
-    read_timeout_seconds: timedelta,
+    read_timeout_seconds: float,
     meta: Mapping[str, object] | None = None,
   ) -> McpToolCallResult:
     raise AssertionError(f"unexpected physical MCP call: {name}")
@@ -99,7 +98,6 @@ def test_definition_process_strips_declared_user_authority(tmp_path, monkeypatch
     }),
     encoding="utf-8",
   )
-  monkeypatch.setattr(mcp_client_module, "MCP_IMPORT_ERROR", None)
   monkeypatch.setattr(
     mcp_client_module.os,
     "environ",
@@ -147,7 +145,7 @@ def test_authenticated_user_projection_completes_read_with_trusted_meta() -> Non
         name: str,
         arguments: Mapping[str, object],
         *,
-        read_timeout_seconds: timedelta,
+        read_timeout_seconds: float,
         meta: Mapping[str, object] | None = None,
       ) -> CallToolResult:
         captured["call"] = (
@@ -156,8 +154,8 @@ def test_authenticated_user_projection_completes_read_with_trusted_meta() -> Non
           {"read_timeout_seconds": read_timeout_seconds, "meta": meta},
         )
         return CallToolResult(
-          isError=False,
-          structuredContent={"items": []},
+          is_error=False,
+          structured_content={"items": []},
           content=[],
         )
 

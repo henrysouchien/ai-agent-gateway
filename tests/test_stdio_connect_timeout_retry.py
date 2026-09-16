@@ -47,9 +47,6 @@ def _runtime(
     json_file_key_value_factory=lambda _path: None,
     fastmcp_oauth_factory=None,
     path_factory=None,
-    httpx_import_error=None,
-    streamable_http_import_error=None,
-    fastmcp_oauth_import_error=None,
     environ={},
     logger=SimpleNamespace(warning=lambda *_args, **_kwargs: None),
   )

@@ -1,10 +1,11 @@
 import asyncio
 import json
 import logging
-from datetime import timedelta
 import time
 
-from mcp.types import CallToolResult
+from anyio import ClosedResourceError
+from mcp import MCPError
+from mcp.types import CONNECTION_CLOSED, CallToolResult
 import agent_gateway.mcp_client as mcp_client_module
 from agent_gateway.mcp_client import McpClientManager
 
@@ -120,16 +121,6 @@ def test_startup_records_invalid_and_unsupported_configs(tmp_path):
   }
 
 
-class McpError(Exception):
-  pass
-
-
-class _FakeExceptionGroup(Exception):
-  def __init__(self, *exceptions: Exception):
-    super().__init__("unhandled errors in a TaskGroup")
-    self.exceptions = exceptions
-
-
 def test_stdio_connect_retries_transient_connection_closed_group(monkeypatch, caplog):
   monkeypatch.setenv("MCP_STDIO_CONNECT_RETRIES", "2")
   monkeypatch.setenv("MCP_STDIO_CONNECT_BACKOFF_S", "0")
@@ -140,7 +131,10 @@ def test_stdio_connect_retries_transient_connection_closed_group(monkeypatch, ca
   async def _flaky_connect_stdio(name, config):
     attempts.append(1)
     if len(attempts) < 3:
-      raise _FakeExceptionGroup(McpError("Connection closed"))
+      raise ExceptionGroup(
+        "unhandled errors in a TaskGroup",
+        [MCPError(code=CONNECTION_CLOSED, message="Connection closed")],
+      )
     return connected_state
 
   monkeypatch.setattr(manager, "_connect_stdio", _flaky_connect_stdio)
@@ -162,7 +156,10 @@ def test_stdio_connect_exhausts_bounded_retries(monkeypatch, caplog):
 
   async def _always_closed(name, config):
     attempts.append(1)
-    raise _FakeExceptionGroup(McpError("Connection closed"))
+    raise ExceptionGroup(
+      "unhandled errors in a TaskGroup",
+      [MCPError(code=CONNECTION_CLOSED, message="Connection closed")],
+    )
 
   manager._connect_stdio = _always_closed
   caplog.set_level(logging.WARNING, logger="agent_gateway.mcp_client")
@@ -268,11 +265,6 @@ def test_stdio_missing_direct_argv_executable_is_not_retried(monkeypatch, caplog
   assert "/nonexistent/hank-test/fmp-mcp" in diagnostic["message"]
 
 
-class ClosedResourceError(Exception):
-  pass
-
-
-
 
 def test_stdio_tool_call_reconnects_once_on_closed_transport(monkeypatch, caplog):
   manager = McpClientManager(config_path=None)
@@ -283,7 +275,7 @@ def test_stdio_tool_call_reconnects_once_on_closed_transport(monkeypatch, caplog
       name: str,
       arguments: dict[str, object],
       *,
-      read_timeout_seconds: timedelta,
+      read_timeout_seconds: float,
       meta: dict[str, object] | None = None,
     ) -> CallToolResult:
       raise ClosedResourceError()
@@ -294,13 +286,13 @@ def test_stdio_tool_call_reconnects_once_on_closed_transport(monkeypatch, caplog
       name: str,
       arguments: dict[str, object],
       *,
-      read_timeout_seconds: timedelta,
+      read_timeout_seconds: float,
       meta: dict[str, object] | None = None,
     ) -> CallToolResult:
       return CallToolResult(
-        isError=False,
+        is_error=False,
         content=[],
-        structuredContent={"ok": True},
+        structured_content={"ok": True},
       )
 
   class _CloseContext:

@@ -1,5 +1,4 @@
 import asyncio
-from datetime import timedelta
 import hashlib
 import json
 import sys
@@ -8,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any, Never
 
 import pytest
+from mcp.types import CallToolResult
 from gateway_test_support.host_policy import owner_session_host_policy
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -59,7 +59,7 @@ class _UnusedMcpSession:
     name: str,
     arguments: dict[str, object],
     *,
-    read_timeout_seconds: timedelta,
+    read_timeout_seconds: float,
     meta: dict[str, object] | None = None,
   ) -> Never:
     _ = name, arguments, read_timeout_seconds, meta
@@ -2173,9 +2173,9 @@ def test_fred_runner_owns_every_physical_attempt_with_real_dispatcher_manager(
     physical_sends += 1
     if physical_sends <= failures:
       raise EOFError("connection closed")
-    return SimpleNamespace(
-      isError=False,
-      structuredContent={"status": "success", "seriess": []},
+    return CallToolResult(
+      is_error=False,
+      structured_content={"status": "success", "seriess": []},
       content=[],
     )
 

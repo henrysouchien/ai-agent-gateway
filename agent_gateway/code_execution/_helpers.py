@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import errno
 import os
-import site
 import stat as stat_module
 import tempfile
 from pathlib import Path
@@ -248,18 +247,6 @@ def _prepare_code_execute_env(config: CodeExecutionConfig) -> Dict[str, str]:
   work_dir = str(env.get("AGENT_CODE_EXECUTE_WORK_DIR") or "").strip()
   if work_dir:
     isolated_home = Path(work_dir) / ".code_execute_home"
-    user_site = site.getusersitepackages()
-    user_site_paths = [user_site] if isinstance(user_site, str) else list(user_site)
-    python_paths = [value for value in env.get("PYTHONPATH", "").split(os.pathsep) if value]
-    seen_python_paths = {os.path.realpath(value) for value in python_paths}
-    for value in user_site_paths:
-      resolved = os.path.realpath(value)
-      if not Path(resolved).is_dir() or resolved in seen_python_paths:
-        continue
-      python_paths.append(resolved)
-      seen_python_paths.add(resolved)
-    if python_paths:
-      env["PYTHONPATH"] = os.pathsep.join(python_paths)
   else:
     isolated_home = shared_cache_root / "home"
   if str(isolated_home) != "/workspace/.code_execute_home":

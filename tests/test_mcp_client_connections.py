@@ -1,19 +1,15 @@
 import asyncio
 from collections import deque
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from datetime import timedelta
 import json
 import os
 import signal
 import sys
 from pathlib import Path
-from types import SimpleNamespace
-from typing import TextIO
 
 import pytest
 from anyio import ClosedResourceError
-from mcp.types import CallToolResult
+from mcp import MCPError
+from mcp.types import CONNECTION_CLOSED, CallToolResult, ListToolsResult, PaginatedRequestParams, Tool
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = Path(__file__).resolve().parents[1]
@@ -22,28 +18,10 @@ if str(PKG_DIR) not in sys.path:
 
 import agent_gateway.mcp_client as mcp_client_module  # noqa: E402
 from agent_gateway.mcp_client import McpClientManager  # noqa: E402
-from agent_gateway.mcp_client_connections import (  # noqa: E402
-  McpListedTool,
-  McpListToolsResult,
-  McpToolCallResult,
-)
 from agent_gateway.tool_registration import RegisteredMcpToolCompilationError  # noqa: E402
 from agent_workflow_contracts.tool_registration import (  # noqa: E402
   ToolRegistrationCatalog,
 )
-
-
-@dataclass(frozen=True)
-class _ListedTool:
-  name: str
-  description: str | None
-  inputSchema: Mapping[str, object] | None
-
-
-@dataclass(frozen=True)
-class _ListedToolsResult:
-  tools: Sequence[McpListedTool] | None
-  nextCursor: str | None
 
 
 class _ListedToolsSession:
@@ -56,19 +34,19 @@ class _ListedToolsSession:
   async def list_tools(
     self,
     *,
-    cursor: str | None = None,
-  ) -> McpListToolsResult:
-    _ = cursor
-    return _ListedToolsResult(
+    params: PaginatedRequestParams | None = None,
+  ) -> ListToolsResult:
+    assert params is None or params.cursor is None
+    return ListToolsResult(
       tools=[
-        _ListedTool(
+        Tool(
           name=name,
           description=f"Tool {name}",
-          inputSchema={"type": "object", "properties": {}},
+          input_schema={"type": "object", "properties": {}},
         )
         for name in self.names
       ],
-      nextCursor=None,
+      next_cursor=None,
     )
 
   async def call_tool(
@@ -76,9 +54,9 @@ class _ListedToolsSession:
     name: str,
     arguments: dict[str, object],
     *,
-    read_timeout_seconds: timedelta,
+    read_timeout_seconds: float,
     meta: dict[str, object] | None = None,
-  ) -> McpToolCallResult:
+  ) -> CallToolResult:
     _ = name, arguments, read_timeout_seconds, meta
     raise AssertionError("tool calls are not used by list-tools tests")
 
@@ -109,7 +87,7 @@ def reconnect_transport(monkeypatch):
       assert name in self.names
       return CallToolResult(
         content=[],
-        structuredContent={"tool": name, "generation": self.generation},
+        structured_content={"tool": name, "generation": self.generation},
       )
 
   class StdioContext:
@@ -304,7 +282,7 @@ def test_pending_retry_awaits_passive_eof_reconnect(reconnect_transport, monkeyp
       await asyncio.wait_for(retry_started.wait(), timeout=1)
       connect_release.set()
       result = await asyncio.wait_for(pending, timeout=1)
-      assert result.structuredContent == {"tool": "alpha", "generation": 2}
+      assert result.structured_content == {"tool": "alpha", "generation": 2}
       assert await manager.call_tool("alpha", {}) == (
         {"tool": "alpha", "generation": 2}, None,
       )
@@ -609,161 +587,30 @@ def test_failed_stdio_child_with_long_stderr_line_does_not_block(monkeypatch, ca
   assert stderr.endswith("fatal startup error")
 
 
-def test_connect_stdio_wrapper_uses_parent_module_runtime(monkeypatch) -> None:
-  captured: dict[str, object] = {}
-  list_tool_cursors: list[str | None] = []
-  captured["list_tool_cursors"] = list_tool_cursors
-  errlogs: list[TextIO | None] = []
+def test_stdio_stability_probe_rejects_closed_transport(reconnect_transport):
+  async def scenario():
+    queue, opened_contexts = reconnect_transport
+    session = queue(["alpha"])
+    calls = 0
 
-  class _FakeServerParameters:
-    def __init__(self, **kwargs):
-      captured["server_params"] = kwargs
+    async def list_tools(*, params: PaginatedRequestParams | None = None):
+      nonlocal calls
+      calls += 1
+      if calls > 1:
+        raise MCPError(code=CONNECTION_CLOSED, message="Connection closed")
+      return ListToolsResult(tools=[Tool(name="alpha", input_schema={"type": "object"})])
 
-  class _FakeStdioContext:
-    async def __aenter__(self):
-      captured["stdio_entered"] = True
-      return object(), object()
+    session.list_tools = list_tools
+    manager = McpClientManager(config_path=None, inline_servers={
+      "unstable": {"command": sys.executable},
+    })
+    try:
+      await manager.startup()
+      assert manager.get_server_for_tool("alpha") is None
+      assert manager.get_startup_diagnostics()["unstable"]["category"] == "transient_transport"
+      assert calls == 2
+      assert all(context.closed for context in opened_contexts)
+    finally:
+      await manager.shutdown()
 
-    async def __aexit__(self, exc_type, exc, tb):
-      captured["stdio_exited"] = True
-      return None
-
-  class _FakeClientSession:
-    def __init__(self, read_stream, write_stream):
-      captured["session_streams"] = (read_stream, write_stream)
-
-    async def __aenter__(self):
-      captured["session_entered"] = True
-      return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-      captured["session_exited"] = True
-      return None
-
-    async def initialize(self) -> object:
-      captured["initialized"] = True
-      return None
-
-    async def list_tools(
-      self,
-      *,
-      cursor: str | None = None,
-    ) -> McpListToolsResult:
-      list_tool_cursors.append(cursor)
-      return _ListedToolsResult(
-        tools=[
-          _ListedTool(
-            name="patched_tool",
-            description="Patched tool",
-            inputSchema={"type": "object", "properties": {"x": {"type": "string"}}},
-          )
-        ],
-        nextCursor=None,
-      )
-
-    async def call_tool(
-      self,
-      name: str,
-      arguments: dict[str, object],
-      *,
-      read_timeout_seconds: timedelta,
-      meta: dict[str, object] | None = None,
-    ) -> McpToolCallResult:
-      _ = name, arguments, read_timeout_seconds, meta
-      raise AssertionError("tool calls are not used by stdio connection tests")
-
-  def _fake_stdio_client(server_params, errlog=None):
-    captured["stdio_client_params"] = server_params
-    captured["errlog"] = errlog
-    errlogs.append(errlog)
-    return _FakeStdioContext()
-
-  monkeypatch.setattr(mcp_client_module, "StdioServerParameters", _FakeServerParameters)
-  monkeypatch.setattr(mcp_client_module, "stdio_client", _fake_stdio_client)
-  monkeypatch.setattr(mcp_client_module, "ClientSession", _FakeClientSession)
-  monkeypatch.setattr(mcp_client_module, "_build_mcp_env", lambda env: {"PATCHED": str(env["raw"])})
-  monkeypatch.setattr(mcp_client_module, "_stdio_connect_stabilize_delay", lambda: 0)
-  monkeypatch.setattr(
-    mcp_client_module, "_preflight_stdio_executable", lambda _command, _args, _env: None
-  )
-
-  manager = McpClientManager(config_path=None)
-  state = asyncio.run(
-    manager._connect_stdio(
-      "demo",
-      {"command": "fake-server", "args": ["--serve"], "env": {"raw": "env"}},
-    )
-  )
-
-  assert captured["server_params"] == {
-    "command": "fake-server",
-    "args": ["--serve"],
-    "env": {"PATCHED": "env"},
-    "cwd": None,
-  }
-  assert captured["stdio_entered"] is True
-  assert captured["session_entered"] is True
-  assert captured["initialized"] is True
-  assert captured["list_tool_cursors"] == [None, None]
-  assert captured["errlog"] is not None
-  stdio_errlog = errlogs[0]
-  assert stdio_errlog is not None
-  assert stdio_errlog.closed is False
-  assert state.name == "demo"
-  assert state.config == {"command": "fake-server", "args": ["--serve"], "env": {"raw": "env"}}
-  assert state.tool_names == {"patched_tool"}
-
-  asyncio.run(manager._close_contexts(state.exit_contexts))
-  assert captured["session_exited"] is True
-  assert captured["stdio_exited"] is True
-  assert stdio_errlog.closed is True
-
-
-def test_build_http_auth_wrapper_uses_parent_module_path_factory(monkeypatch) -> None:
-  captured: dict[str, object] = {}
-  oauth_kwargs: dict[str, object] = {}
-
-  class _FakePath:
-    def __init__(self, value):
-      self.value = str(value)
-
-    @classmethod
-    def home(cls):
-      return cls("/patched-home")
-
-    def __truediv__(self, child):
-      return _FakePath(f"{self.value}/{child}")
-
-    def expanduser(self):
-      captured["expanded_path"] = self.value
-      return self
-
-    def __str__(self):
-      return self.value
-
-  class _FakeStorage:
-    def __init__(self, path):
-      captured["storage_path"] = str(path)
-
-  class _FakeOAuth:
-    def __init__(self, **kwargs):
-      captured["oauth_kwargs"] = kwargs
-      oauth_kwargs.update(kwargs)
-
-  monkeypatch.delenv("AGENT_GATEWAY_MCP_OAUTH_CACHE_DIR", raising=False)
-  monkeypatch.setattr(mcp_client_module, "Path", _FakePath)
-  monkeypatch.setattr(mcp_client_module, "_JsonFileKeyValue", _FakeStorage)
-  monkeypatch.setattr(mcp_client_module, "FastMCPOAuth", _FakeOAuth)
-  monkeypatch.setattr(mcp_client_module, "FASTMCP_OAUTH_IMPORT_ERROR", None)
-
-  manager = McpClientManager(config_path=None)
-  auth = manager._build_http_auth(
-    "finance-cli",
-    "https://cashnerd.ai/mcp",
-    {"oauth": True},
-  )
-
-  assert isinstance(auth, _FakeOAuth)
-  assert captured["expanded_path"] == "/patched-home/.cache/agent-gateway/mcp-oauth/finance-cli.json"
-  assert captured["storage_path"] == "/patched-home/.cache/agent-gateway/mcp-oauth/finance-cli.json"
-  assert oauth_kwargs["token_storage"].__class__ is _FakeStorage
+  asyncio.run(scenario())

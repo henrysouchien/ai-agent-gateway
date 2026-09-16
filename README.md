@@ -26,6 +26,7 @@ building runtimes and use one product policy per gateway process.
 | --- | --- | --- |
 | [`agent_gateway/easy.py`](agent_gateway/easy.py) | `create_agent()` | A small server from a prompt, tools, skills, and provider configuration |
 | [`agent_gateway/server.py`](agent_gateway/server.py) | `create_gateway_app()` | Product-owned runtime factories, auth, policy, and lifecycle integration |
+| [`agent_gateway/gateway_server.py`](agent_gateway/gateway_server.py) | `run_gateway_server()` / `main()` | Privileged single-worker TCP launcher, claim-signing fd adoption, and startup-failure logging |
 | [`agent_gateway/autonomous.py`](agent_gateway/autonomous.py) | `run_autonomous()` / `run_autonomous_sync()` | A prebound headless one-shot with no HTTP server |
 | [`agent_gateway/heartbeat.py`](agent_gateway/heartbeat.py) | `HeartbeatLoop` | Repeated prebound autonomous work with quiet windows and backoff |
 | [`agent_gateway/cli.py`](agent_gateway/cli.py) | `main()` (`agent init` / `agent run`) | Scaffold and run a package project |
@@ -99,6 +100,16 @@ Headless calls use the same runner, tools, skills, and provider abstractions,
 but return `RunOutput` instead of exposing an HTTP/SSE session.
 
 ## Develop and verify
+
+From the package directory, update a gateway dependency with:
+
+```bash
+pip-compile --generate-hashes --no-emit-options --allow-unsafe --upgrade-package <name>==<ver> --output-file requirements-dev.txt requirements-dev.in
+```
+
+For coupled targets, use multiple space-separated `--upgrade-package <name>==<ver>`
+flags. In the monorepo checkout, the shortcut is
+`make gateway-deps-update PKG='<name>==<ver>'` (`PKG` accepts a space-separated list).
 
 From the package root, run:
 

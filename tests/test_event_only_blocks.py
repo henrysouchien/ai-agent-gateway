@@ -1,8 +1,8 @@
 import asyncio
-from datetime import timedelta
 import json
-from types import SimpleNamespace
 from typing import Any
+
+from mcp.types import CallToolResult
 
 from agent_gateway import (
   AgentRunner,
@@ -72,7 +72,7 @@ class _UnusedMcpSession:
     name: str,
     arguments: dict[str, object],
     *,
-    read_timeout_seconds: timedelta,
+    read_timeout_seconds: float,
     meta: dict[str, object] | None = None,
   ) -> McpToolCallResult:
     _ = name, arguments, read_timeout_seconds, meta
@@ -206,11 +206,11 @@ def _trusted_market_data_manager() -> McpClientManager:
     policy_server_for_tool=lambda name: "market-data-mcp" if name == "fetch_financials" else "fmp-mcp"
   )
 
-  async def call_tool_once(**_kwargs: Any) -> SimpleNamespace:
-    return SimpleNamespace(
-      isError=False,
-      structuredContent={"status": "success", "provider_id": "edgar"},
-      content=None,
+  async def call_tool_once(**_kwargs: Any) -> CallToolResult:
+    return CallToolResult(
+      is_error=False,
+      structured_content={"status": "success", "provider_id": "edgar"},
+      content=[],
     )
 
   manager._call_tool_once = call_tool_once  # type: ignore[method-assign]

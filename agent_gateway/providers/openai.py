@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 import re
 from dataclasses import replace
@@ -24,7 +23,7 @@ from .openai_responses_helpers import (
   _MODEL_INFO_BY_TAG,
   _ResponsesStreamState,
   _convert_messages,
-  _convert_tools,
+  convert_openai_response_tools,
   _is_tool_result_message,
   _model_matches_tag,
   _normalize_tool_call_id,
@@ -144,11 +143,8 @@ class OpenAIProvider(ModelProvider):
     if not credential:
       raise RuntimeError(f"No OpenAI {mode} credential configured")
 
-    try:
-      import httpx
-      from openai import AsyncOpenAI
-    except ImportError as exc:
-      raise RuntimeError("openai>=2.31.0 is required to use OpenAIProvider") from exc
+    import httpx2
+    from openai import AsyncOpenAI
 
     client_kwargs: Dict[str, Any] = {
       "base_url": normalized["base_url"],
@@ -156,24 +152,15 @@ class OpenAIProvider(ModelProvider):
       "project": normalized["project"],
     }
     if timeout is not None:
-      client_kwargs["timeout"] = httpx.Timeout(timeout=timeout, connect=5.0)
+      client_kwargs["timeout"] = httpx2.Timeout(timeout=timeout, connect=5.0)
     client_kwargs["api_key"] = credential
-    client = AsyncOpenAI(**client_kwargs)
-    responses = getattr(client, "responses", None)
-    if responses is None or not callable(getattr(responses, "create", None)):
-      raise RuntimeError("openai>=2.31.0 with AsyncOpenAI.responses.create is required")
-    return client
+    return AsyncOpenAI(**client_kwargs)
 
   async def close_client(self, client: Any, timeout: float = 2.0) -> None:
     if client is None:
       return
-    closer = getattr(client, "aclose", None) or getattr(client, "close", None)
-    if closer is None:
-      return
     try:
-      result = closer()
-      if asyncio.iscoroutine(result):
-        await asyncio.wait_for(result, timeout=timeout)
+      await asyncio.wait_for(client.close(), timeout=timeout)
     except Exception:
       pass
 
@@ -362,7 +349,7 @@ class OpenAIProvider(ModelProvider):
       "max_output_tokens": max_tokens,
     }
     if tools:
-      params["tools"] = _convert_tools(tools)
+      params["tools"] = convert_openai_response_tools(tools)
       params["tool_choice"] = "auto"
       params["parallel_tool_calls"] = True
     resolution = kwargs.get("effort_resolution")
@@ -378,45 +365,28 @@ class OpenAIProvider(ModelProvider):
     return params
 
   async def stream(self, client: Any, params: dict[str, Any]) -> AsyncIterator[StreamEvent]:
-    responses = getattr(client, "responses", None)
-    create = getattr(responses, "create", None)
-    if not callable(create):
-      raise RuntimeError("OpenAI client does not expose responses.create; openai>=2.31.0 is required")
-    stream_result = create(**params)
-    if not inspect.isawaitable(stream_result):
-      raise TypeError(
-        f"object {type(stream_result).__name__} can't be used in 'await' expression"
-      )
-    stream = await stream_result
     state = _ResponsesStreamState()
-    async for event in stream:
-      for mapped in map_event(event, state):
-        yield mapped
-      if state.terminal_error is not None:
-        terminal_error = state.terminal_error
-        state.terminal_error = None
-        raise terminal_error
+    async with await client.responses.create(**params) as stream:
+      async for event in stream:
+        for mapped in map_event(event, state):
+          yield mapped
+        if state.terminal_error is not None:
+          terminal_error = state.terminal_error
+          state.terminal_error = None
+          raise terminal_error
 
   def is_retryable_error(self, exc: Exception) -> bool:
-    try:
-      import httpx
-    except ImportError:
-      httpx = None
-    try:
-      from openai import APIConnectionError, APIStatusError, RateLimitError
-    except ImportError:
-      APIConnectionError = APIStatusError = RateLimitError = None
+    import httpx2
+    from openai import APIConnectionError, APIStatusError, RateLimitError
     status_code = getattr(exc, "status_code", None)
     response = getattr(exc, "response", None)
     if status_code is None and response is not None:
       status_code = getattr(response, "status_code", None)
-    if APIConnectionError is not None and isinstance(exc, APIConnectionError):
+    if isinstance(exc, (APIConnectionError, RateLimitError)):
       return True
-    if RateLimitError is not None and isinstance(exc, RateLimitError):
-      return True
-    if APIStatusError is not None and isinstance(exc, APIStatusError):
+    if isinstance(exc, APIStatusError):
       return bool(status_code == 429 or isinstance(status_code, int) and 500 <= status_code < 600)
-    if httpx is not None and isinstance(exc, (httpx.TransportError, httpx.StreamError)):
+    if isinstance(exc, (httpx2.TransportError, httpx2.StreamError)):
       return True
     return bool(status_code == 429 or isinstance(status_code, int) and 500 <= status_code < 600)
 

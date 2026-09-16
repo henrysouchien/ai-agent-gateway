@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-from datetime import timedelta
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,7 +49,7 @@ class _UnusedClientSession:
     name: str,
     arguments: Mapping[str, object],
     *,
-    read_timeout_seconds: timedelta,
+    read_timeout_seconds: float,
     meta: Mapping[str, object] | None = None,
   ) -> _ToolResult:
     raise AssertionError(f"unexpected physical MCP call: {name}")
@@ -975,7 +974,7 @@ def test_provider_symbol_translation_uses_original_name_for_prefixed_tool(monkey
       name: str,
       arguments: Mapping[str, object],
       *,
-      read_timeout_seconds: timedelta,
+      read_timeout_seconds: float,
       meta: Mapping[str, object] | None = None,
     ) -> _ToolResult:
       self.calls.append(
@@ -986,7 +985,7 @@ def test_provider_symbol_translation_uses_original_name_for_prefixed_tool(monkey
           "meta": meta,
         }
       )
-      return _ToolResult(isError=False, structuredContent={"ok": True}, content=[])
+      return _ToolResult(is_error=False, structured_content={"ok": True}, content=[])
 
   session = _Session()
   manager._tool_to_server = {"safe_get_filings": "edgar-parser-mcp"}
@@ -1166,7 +1165,7 @@ def test_provider_symbol_translation_copy_not_mutate_and_retry_reuses_effective_
 
   async def fake_retry_stdio_tool_call_after_reconnect(**kwargs):
     seen_inputs.append(kwargs["tool_input"])
-    return _ToolResult(isError=False, structuredContent={"ok": True}, content=[])
+    return _ToolResult(is_error=False, structured_content={"ok": True}, content=[])
 
   manager._call_tool_once = fake_call_tool_once
   manager._retry_stdio_tool_call_after_reconnect = fake_retry_stdio_tool_call_after_reconnect
@@ -1201,7 +1200,7 @@ def test_call_tool_disables_uncertain_replay_but_reconnects_for_future() -> None
     physical_calls.append(kwargs["original_name"])
     if kwargs["server"].session is original_session:
       raise EOFError("connection closed")
-    return _ToolResult(isError=False, structuredContent={"status": "success"}, content=[])
+    return _ToolResult(is_error=False, structured_content={"status": "success"}, content=[])
 
   async def connect(name, config):
     return _ConnectedServerState(
@@ -1253,8 +1252,8 @@ def test_call_tool_default_preserves_one_stdio_replay() -> None:
     if physical_calls == 1:
       raise EOFError("connection closed")
     return _ToolResult(
-      isError=False,
-      structuredContent={"status": "success"},
+      is_error=False,
+      structured_content={"status": "success"},
       content=[],
     )
 
@@ -1304,7 +1303,7 @@ def test_provider_symbol_translation_without_resolver_dispatches_original() -> N
       assert name == "get_filings"
       assert arguments == {"ticker": "BRKB"}
       return _ToolResult(
-        content=[], structuredContent={"filings": [{"accession": "0001"}]},
+        content=[], structured_content={"filings": [{"accession": "0001"}]},
       )
 
   manager._tool_to_server = {"get_filings": "edgar-parser-mcp"}
@@ -1438,8 +1437,8 @@ def test_generic_stdio_sheets_mutation_timeout_reconnects_without_replay() -> No
 
 def test_sheets_requires_direct_structured_result_but_other_servers_keep_json_fallback() -> None:
   text_result = _ToolResult(
-    isError=False,
-    structuredContent=None,
+    is_error=False,
+    structured_content=None,
     content=[TextContent(type="text", text='{"status":"ok","value":1}')],
   )
 

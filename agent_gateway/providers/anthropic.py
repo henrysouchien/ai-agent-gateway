@@ -458,8 +458,8 @@ class AnthropicProvider(ModelProvider):
 
   def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
     try:
-      from anthropic import AsyncAnthropic, Omit
-      import httpx
+      from anthropic import AsyncAnthropic
+      import httpx2
     except ImportError as exc:
       raise RuntimeError("anthropic dependency is required to use AnthropicProvider") from exc
 
@@ -469,33 +469,41 @@ class AnthropicProvider(ModelProvider):
     if not credential:
       raise RuntimeError(f"No Anthropic {mode} credential configured")
 
+    auth_header = "Authorization" if mode == "oauth" else "X-Api-Key"
+    auth_value = f"Bearer {credential}" if mode == "oauth" else credential
+
+    class BoundAsyncAnthropic(AsyncAnthropic):
+      async def _prepare_request(self, request: httpx2.Request) -> None:
+        # This SDK hook runs after options are logged and all header layers merge.
+        # Bind on the HTTP request so ambient headers lose without logging secrets.
+        request.headers.pop("x-api-key", None)
+        request.headers.pop("authorization", None)
+        request.headers[auth_header] = auth_value
+
     client_kwargs: Dict[str, Any] = {
       "base_url": _bound_anthropic_base_url(config),
     }
     if timeout is not None:
-      client_kwargs["timeout"] = httpx.Timeout(timeout=timeout, connect=5.0)
+      client_kwargs["timeout"] = httpx2.Timeout(timeout=timeout, connect=5.0)
 
     if mode == "oauth":
       oauth_headers = {
-        "X-Api-Key": Omit(),
         "anthropic-beta": ",".join([*_OAUTH_BETA_SLUGS, *_COMMON_BETA_SLUGS]),
         "user-agent": "claude-cli/2026.3.14",
         "x-app": "cli",
       }
 
-      return AsyncAnthropic(
+      return BoundAsyncAnthropic(
         api_key="",
         auth_token=credential,
         default_headers=oauth_headers,
         **client_kwargs,
       )
 
-    api_headers: Dict[str, Any] = {
-      "Authorization": Omit(),
-    }
+    api_headers: Dict[str, Any] = {}
     if _COMMON_BETA_SLUGS:
       api_headers["anthropic-beta"] = ",".join(_COMMON_BETA_SLUGS)
-    return AsyncAnthropic(
+    return BoundAsyncAnthropic(
       api_key=credential,
       auth_token="",
       default_headers=api_headers,
@@ -1145,7 +1153,7 @@ class AnthropicProvider(ModelProvider):
 
   def is_retryable_error(self, exc: Exception) -> bool:
     try:
-      import httpx
+      import httpx2
       from anthropic import APIConnectionError, APIStatusError
     except ImportError:
       return False
@@ -1159,6 +1167,6 @@ class AnthropicProvider(ModelProvider):
       return status_code in {200, 429} or (isinstance(status_code, int) and 500 <= status_code < 600)
     if isinstance(exc, APIConnectionError):
       return True
-    if isinstance(exc, (httpx.TransportError, httpx.StreamError)):
+    if isinstance(exc, (httpx2.TransportError, httpx2.StreamError)):
       return True
     return False

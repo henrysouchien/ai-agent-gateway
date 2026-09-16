@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.19.0 (2026-09-16)
+
+### Changed
+
+- Require FastMCP 4 and MCP 2. Catalog pagination, request metadata,
+  structured results, timeout/cancellation, and streamable-HTTP OAuth now use
+  the MCP 2 SDK and httpx2 transport directly.
+- Classify MCP transport failures by typed SDK error codes without replaying
+  uncertain tool mutations.
+- Provider extras support Anthropic 1.6, OpenAI 3.14, and Claude Agent SDK
+  0.2.153; unrelated HTTP integrations continue to use httpx.
+
 ## 0.18.4 (2026-09-15)
 
 ### Fixed

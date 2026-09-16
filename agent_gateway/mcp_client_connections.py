@@ -5,11 +5,11 @@ import copy
 import os
 import threading
 from dataclasses import dataclass
-from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 
 from anyio import EndOfStream
+from mcp.types import PaginatedRequestParams
 
 
 class _StdioReadStream:
@@ -28,7 +28,8 @@ class _StdioReadStream:
     try:
       await self._stream.__aexit__(*args)
     finally:
-      # ClientSession exits this context after notifying all pending requests.
+      # The SDK dispatcher synchronously wakes pending requests after this exits,
+      # before the reconnect task waiting on receive_done can resume.
       self.receive_done.set()
 
   def __aiter__(self) -> _StdioReadStream:
@@ -54,13 +55,13 @@ class _StdioReadStream:
 
 class McpToolCallResult(Protocol):
   @property
-  def isError(self) -> bool: ...
+  def is_error(self) -> bool: ...
 
   @property
   def content(self) -> object: ...
 
   @property
-  def structuredContent(self) -> object | None: ...
+  def structured_content(self) -> object | None: ...
 
 
 class McpListedTool(Protocol):
@@ -71,7 +72,10 @@ class McpListedTool(Protocol):
   def description(self) -> str | None: ...
 
   @property
-  def inputSchema(self) -> Mapping[str, object] | None: ...
+  def input_schema(self) -> Mapping[str, object] | None: ...
+
+  @property
+  def meta(self) -> Mapping[str, object] | None: ...
 
 
 class McpListToolsResult(Protocol):
@@ -79,7 +83,7 @@ class McpListToolsResult(Protocol):
   def tools(self) -> Sequence[McpListedTool] | None: ...
 
   @property
-  def nextCursor(self) -> str | None: ...
+  def next_cursor(self) -> str | None: ...
 
 
 class McpClientSession(Protocol):
@@ -88,7 +92,7 @@ class McpClientSession(Protocol):
     name: str,
     arguments: dict[str, object],
     *,
-    read_timeout_seconds: timedelta,
+    read_timeout_seconds: float,
     meta: dict[str, object] | None = None,
   ) -> McpToolCallResult: ...
 
@@ -103,7 +107,7 @@ class McpConnectionSession(McpClientSession, Protocol):
   async def list_tools(
     self,
     *,
-    cursor: str | None = None,
+    params: PaginatedRequestParams | None = None,
   ) -> McpListToolsResult: ...
 
 
@@ -133,9 +137,6 @@ class McpConnectionRuntime:
   json_file_key_value_factory: Callable[[Path], Any]
   fastmcp_oauth_factory: Any
   path_factory: Any
-  httpx_import_error: Exception | None
-  streamable_http_import_error: Exception | None
-  fastmcp_oauth_import_error: Exception | None
   environ: MutableMapping[str, str]
   logger: Any
 
@@ -337,11 +338,6 @@ async def connect_streamable_http(
   config: dict[str, Any],
   runtime: McpConnectionRuntime,
 ) -> Any:
-  if runtime.httpx_import_error is not None:
-    raise RuntimeError(f"HTTP MCP transport unavailable: {runtime.httpx_import_error}")
-  if runtime.streamable_http_import_error is not None or runtime.streamable_http_client_factory is None:
-    raise RuntimeError(f"HTTP MCP transport unavailable: {runtime.streamable_http_import_error}")
-
   exit_contexts: list[Any] = []
   success = False
   try:
@@ -370,7 +366,7 @@ async def connect_streamable_http(
       http_client=http_client,
       terminate_on_close=terminate_on_close,
     )
-    read_stream, write_stream, _get_session_id = await stream_cm.__aenter__()
+    read_stream, write_stream = await stream_cm.__aenter__()
     exit_contexts.append(stream_cm)
 
     session = runtime.client_session_factory(read_stream, write_stream)
@@ -400,8 +396,6 @@ def build_http_auth(
   oauth_raw = config.get("oauth")
   if not oauth_raw:
     return None
-  if runtime.fastmcp_oauth_import_error is not None or runtime.fastmcp_oauth_factory is None:
-    raise RuntimeError(f"OAuth MCP transport unavailable: {runtime.fastmcp_oauth_import_error}")
   if oauth_raw is True:
     oauth_config: dict[str, Any] = {}
   elif isinstance(oauth_raw, dict):
@@ -445,21 +439,21 @@ async def initialize_session_state(
 ) -> Any:
   await asyncio.wait_for(session.initialize(), timeout=manager._startup_timeout)
 
-  tools: list[Any] = []
+  tools: list[McpListedTool] = []
   cursor: str | None = None
   while True:
     listed = await asyncio.wait_for(
-      session.list_tools(cursor=cursor),
+      session.list_tools(params=PaginatedRequestParams(cursor=cursor)),
       timeout=manager._startup_timeout,
     )
     tools.extend(listed.tools or [])
-    if listed.nextCursor is None:
+    if listed.next_cursor is None:
       break
-    cursor = listed.nextCursor
+    cursor = listed.next_cursor
 
   # Carry audience metadata with the candidate until its catalog is accepted.
   # It must never enter Anthropic/OpenAI tool definitions.
-  tool_metadata = {str(tool.name): getattr(tool, "meta", None) for tool in tools}
+  tool_metadata = {str(tool.name): tool.meta for tool in tools}
 
   advertised_names = {str(tool.name) for tool in tools}
   if allowed_tools is not None:
@@ -474,7 +468,7 @@ async def initialize_session_state(
 
   tool_definitions: list[dict[str, Any]] = []
   for tool in tools:
-    input_schema = tool.inputSchema or {"type": "object", "properties": {}}
+    input_schema = tool.input_schema or {"type": "object", "properties": {}}
     tool_definitions.append(
       {
         "name": tool.name,
@@ -504,7 +498,7 @@ async def verify_stdio_session_stable(
   if delay > 0:
     await asyncio.sleep(delay)
   await asyncio.wait_for(
-    session.list_tools(cursor=None),
+    session.list_tools(params=PaginatedRequestParams()),
     timeout=manager._startup_timeout,
   )
 

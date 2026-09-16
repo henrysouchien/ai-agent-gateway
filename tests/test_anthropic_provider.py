@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
-import httpx
+import httpx2
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -307,83 +307,214 @@ def test_build_request_params_never_marks_trailing_thinking_block() -> None:
   assert "cache_control" not in params["messages"][0]["content"][1]
 
 
-def _make_anthropic_api_status_error(status_code: int, message: str):
+def _make_anthropic_api_status_error(
+  status_code: int,
+  message: str,
+  *,
+  body: dict[str, object] | None = None,
+):
   anthropic = pytest.importorskip("anthropic")
-  request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
-  response = httpx.Response(status_code, request=request)
+  if body is None:
+    body = {"error": {"message": message}}
+  request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+  response = httpx2.Response(
+    status_code,
+    request=request,
+    headers={"request-id": "req_123"},
+    json=body,
+  )
   return anthropic.APIStatusError(
     message,
     response=response,
-    body={"error": {"message": message}},
+    body=body,
   )
 
 
+def test_create_client_accepts_configured_timeout_with_real_sdk() -> None:
+  anthropic = pytest.importorskip("anthropic")
+  provider = AnthropicProvider()
+  client = provider.create_client(
+    {"auth_mode": "api", "api_key": "bound-api-key"},
+    timeout=37.0,
+  )
+  try:
+    assert isinstance(client, anthropic.AsyncAnthropic)
+    assert client.timeout.connect == 5.0
+    assert client.timeout.read == 37.0
+    assert client.timeout.write == 37.0
+    assert client.timeout.pool == 37.0
+  finally:
+    asyncio.run(provider.close_client(client))
+
+
+def test_raw_httpx2_transport_error_is_retryable() -> None:
+  error = httpx2.ReadError(
+    "connection closed during stream",
+    request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages"),
+  )
+
+  assert AnthropicProvider().is_retryable_error(error) is True
+
+
+@pytest.mark.parametrize(
+  "custom_headers",
+  [
+    None,
+    "X-Api-Key: ambient-header-key",
+    "Authorization: Bearer ambient",
+    (
+      "X-Api-Key: ambient-header-key\nx-api-key: ambient-lowercase-key\n"
+      "Authorization: Bearer ambient\nauthorization: Bearer ambient-lowercase"
+    ),
+  ],
+  ids=["credential-env", "api-key-header", "oauth-header", "mixed-case-headers"],
+)
 def test_create_client_isolates_bound_credentials_and_routes_concurrently(
   monkeypatch: pytest.MonkeyPatch,
+  custom_headers: str | None,
 ) -> None:
-  anthropic = pytest.importorskip("anthropic")
+  pytest.importorskip("anthropic")
   barrier = threading.Barrier(2)
   ambient = {
     "ANTHROPIC_API_KEY": "ambient-api-key",
     "ANTHROPIC_AUTH_TOKEN": "ambient-oauth-token",
     "ANTHROPIC_BASE_URL": "https://ambient.invalid/v1",
   }
+  if custom_headers is not None:
+    ambient["ANTHROPIC_CUSTOM_HEADERS"] = custom_headers
+  else:
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
   for key, value in ambient.items():
     monkeypatch.setenv(key, value)
-
-  class _RecordingAsyncAnthropic:
-    def __init__(self, **kwargs):
-      self.kwargs = kwargs
-      self.environment = {
-        key: os.environ.get(key)
-        for key in ambient
-      }
-      barrier.wait(timeout=5.0)
-
-  monkeypatch.setattr(anthropic, "AsyncAnthropic", _RecordingAsyncAnthropic)
   provider = AnthropicProvider()
+
+  def capture_bound_request(config: dict[str, str]) -> httpx2.Request:
+    requests = []
+
+    def handle_request(request: httpx2.Request) -> httpx2.Response:
+      requests.append(request)
+      assert {key: os.environ.get(key) for key in ambient} == ambient
+      return httpx2.Response(200, json={
+        "id": "msg_123",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [{"type": "text", "text": "hello"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+      })
+
+    async def send_request() -> None:
+      barrier.wait(timeout=5.0)
+      client = provider.create_client(config)
+      try:
+        async with httpx2.AsyncClient(
+          transport=httpx2.MockTransport(handle_request),
+        ) as http_client:
+          async with client.with_options(http_client=http_client) as local_client:
+            await local_client.messages.create(
+              model="claude-sonnet-4-6",
+              max_tokens=16,
+              messages=[{"role": "user", "content": "hello"}],
+            )
+      finally:
+        await provider.close_client(client)
+
+    asyncio.run(send_request())
+    return requests[0]
 
   with ThreadPoolExecutor(max_workers=2) as executor:
     api_future = executor.submit(
-      provider.create_client,
-      {
-        "auth_mode": "api",
-        "api_key": "bound-api-key",
-      },
+      capture_bound_request,
+      {"auth_mode": "api", "api_key": "bound-api-key"},
     )
     oauth_future = executor.submit(
-      provider.create_client,
+      capture_bound_request,
       {
         "auth_mode": "oauth",
         "auth_token": "bound-oauth-token",
-        "baseURL": "https://bound.anthropic.example/v1",
+        "baseURL": "https://bound.anthropic.example",
       },
     )
-    api_client = api_future.result(timeout=5.0)
-    oauth_client = oauth_future.result(timeout=5.0)
+    api_request = api_future.result(timeout=5.0)
+    oauth_request = oauth_future.result(timeout=5.0)
 
-  assert {
-    key: os.environ.get(key)
-    for key in ambient
-  } == ambient
-  assert api_client.environment == ambient
-  assert oauth_client.environment == ambient
+  assert {key: os.environ.get(key) for key in ambient} == ambient
+  assert api_request.url == httpx2.URL("https://api.anthropic.com/v1/messages")
+  assert api_request.headers.get_list("x-api-key") == ["bound-api-key"]
+  assert "authorization" not in api_request.headers
+  assert oauth_request.url == httpx2.URL("https://bound.anthropic.example/v1/messages")
+  assert oauth_request.headers.get_list("authorization") == ["Bearer bound-oauth-token"]
+  assert "x-api-key" not in oauth_request.headers
 
-  assert api_client.kwargs["api_key"] == "bound-api-key"
-  assert api_client.kwargs["auth_token"] == ""
-  assert api_client.kwargs["base_url"] == "https://api.anthropic.com"
-  assert isinstance(
-    api_client.kwargs["default_headers"]["Authorization"],
-    anthropic.Omit,
+
+@pytest.mark.parametrize(
+  ("config", "header", "expected", "omitted_header"),
+  [
+    (
+      {"auth_mode": "api", "api_key": "bound-api-key-debug-secret"},
+      "x-api-key",
+      "bound-api-key-debug-secret",
+      "authorization",
+    ),
+    (
+      {"auth_mode": "oauth", "auth_token": "bound-oauth-debug-secret"},
+      "authorization",
+      "Bearer bound-oauth-debug-secret",
+      "x-api-key",
+    ),
+  ],
+  ids=["api-key", "oauth"],
+)
+def test_create_client_keeps_bound_credential_out_of_sdk_debug_logs(
+  monkeypatch: pytest.MonkeyPatch,
+  caplog: pytest.LogCaptureFixture,
+  config: dict[str, str],
+  header: str,
+  expected: str,
+  omitted_header: str,
+) -> None:
+  monkeypatch.setenv("ANTHROPIC_LOG", "debug")
+  pytest.importorskip("anthropic")
+  caplog.set_level(logging.DEBUG, logger="anthropic")
+  monkeypatch.setenv(
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "X-Api-Key: ambient-header-key\nx-api-key: ambient-lowercase-key\n"
+    "Authorization: Bearer ambient\nauthorization: Bearer ambient-lowercase",
   )
+  provider = AnthropicProvider()
 
-  assert oauth_client.kwargs["api_key"] == ""
-  assert oauth_client.kwargs["auth_token"] == "bound-oauth-token"
-  assert oauth_client.kwargs["base_url"] == "https://bound.anthropic.example/v1"
-  assert isinstance(
-    oauth_client.kwargs["default_headers"]["X-Api-Key"],
-    anthropic.Omit,
-  )
+  def handle_request(request: httpx2.Request) -> httpx2.Response:
+    assert request.headers.get_list(header) == [expected]
+    assert omitted_header not in request.headers
+    return httpx2.Response(200, json={
+      "id": "msg_123",
+      "type": "message",
+      "role": "assistant",
+      "model": "claude-sonnet-4-6",
+      "content": [{"type": "text", "text": "hello"}],
+      "stop_reason": "end_turn",
+      "stop_sequence": None,
+      "usage": {"input_tokens": 1, "output_tokens": 1},
+    })
+
+  async def send_request() -> None:
+    async with provider.create_client(config) as client:
+      async with httpx2.AsyncClient(
+        transport=httpx2.MockTransport(handle_request),
+      ) as http_client:
+        async with client.with_options(http_client=http_client) as local_client:
+          await local_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hello"}],
+          )
+
+  asyncio.run(send_request())
+  assert any("Request options:" in record.getMessage() for record in caplog.records)
+  credential = config.get("api_key") or config["auth_token"]
+  assert all(credential not in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.parametrize(
@@ -987,26 +1118,6 @@ def test_normalize_messages_removes_replayed_tool_result_tool_name() -> None:
   }
 
 
-class _FakeErrorResponse:
-  status_code = 400
-  headers = {"request-id": "req_123"}
-
-  def __init__(self, body: dict[str, object]):
-    self._body = body
-
-  def json(self) -> dict[str, object]:
-    return self._body
-
-
-class _FakeAnthropicError(Exception):
-  status_code = 400
-
-  def __init__(self, body: dict[str, object]):
-    super().__init__("fake anthropic status error")
-    self.body = body
-    self.response = _FakeErrorResponse(body)
-
-
 class _FailingStreamContext:
   def __init__(self, exc: Exception):
     self._exc = exc
@@ -1206,8 +1317,10 @@ def test_stream_routes_strict_tools_through_structured_outputs_beta(
 def test_anthropic_rejection_detail_redacts_sensitive_body_fallback() -> None:
   raw_key = "sk-ant-api03-DETAILKEY123"
   detail = _format_anthropic_rejection_detail(
-    _FakeAnthropicError(
-      {
+    _make_anthropic_api_status_error(
+      400,
+      "invalid request",
+      body={
         "error": {"type": "invalid_request_error"},
         "api_key": raw_key,
         "authorization": "Bearer secret-token",
@@ -1226,8 +1339,10 @@ def test_anthropic_rejection_detail_redacts_sensitive_body_fallback() -> None:
 def test_stream_wraps_anthropic_rejection_with_sanitized_context(caplog) -> None:
   provider = AnthropicProvider()
   raw_key = "sk-ant-api03-STREAMDETAILKEY123"
-  error = _FakeAnthropicError(
-    {
+  error = _make_anthropic_api_status_error(
+    400,
+    "invalid request",
+    body={
       "error": {
         "type": "invalid_request_error",
         "message": f"context_management cannot be combined with this thinking mode {raw_key}",

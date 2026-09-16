@@ -1,7 +1,12 @@
 import asyncio
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+
+import httpx2
+import pytest
+from mcp.shared.auth import OAuthToken
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = Path(__file__).resolve().parents[1]
@@ -9,75 +14,11 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 import agent_gateway.mcp_client as mcp_client_module
-from agent_gateway.mcp_client import McpClientManager, _JsonFileKeyValue
+from agent_gateway.mcp_client import McpClientManager
 
 
 def _run(coro):
   return asyncio.run(coro)
-
-
-class _FakeTimeout:
-  def __init__(self, timeout, *, read):
-    self.timeout = timeout
-    self.read = read
-
-
-class _FakeAsyncClient:
-  def __init__(self, **kwargs):
-    self.kwargs = kwargs
-    self.entered = False
-    self.exited = False
-
-  async def __aenter__(self):
-    self.entered = True
-    return self
-
-  async def __aexit__(self, exc_type, exc, tb):
-    self.exited = True
-    return None
-
-
-class _FakeStreamContext:
-  def __init__(self, captured: dict[str, object]):
-    self.captured = captured
-    self.exited = False
-
-  async def __aenter__(self):
-    self.captured["stream_entered"] = True
-    return object(), object(), lambda: "mcp-session-1"
-
-  async def __aexit__(self, exc_type, exc, tb):
-    self.exited = True
-    self.captured["stream_exited"] = True
-    return None
-
-
-class _FakeClientSession:
-  def __init__(self, read_stream, write_stream):
-    self.read_stream = read_stream
-    self.write_stream = write_stream
-
-  async def __aenter__(self):
-    return self
-
-  async def __aexit__(self, exc_type, exc, tb):
-    return None
-
-  async def initialize(self):
-    return None
-
-  async def list_tools(self, cursor=None):
-    assert cursor is None
-    return SimpleNamespace(
-      tools=[
-        SimpleNamespace(
-          name="remote_tool",
-          description="Remote tool",
-          inputSchema={"type": "object", "properties": {"ticker": {"type": "string"}}},
-        )
-      ],
-      nextCursor=None,
-    )
 
 
 def test_startup_allows_streamable_http_server_type(tmp_path) -> None:
@@ -106,34 +47,72 @@ def test_startup_allows_streamable_http_server_type(tmp_path) -> None:
   assert calls == ["finance-cli"]
 
 
-def test_connect_streamable_http_uses_url_headers_and_lists_tools(monkeypatch) -> None:
-  captured: dict[str, object] = {}
-  http_clients: list[_FakeAsyncClient] = []
+@pytest.mark.parametrize("terminate_on_close", [False, True])
+def test_connect_streamable_http_lists_catalog_pages_and_closes_session(
+  monkeypatch, terminate_on_close,
+) -> None:
+  requests: list[httpx2.Request] = []
+  cursors: list[str | None] = []
+  http_clients: list[httpx2.AsyncClient] = []
 
-  class _FakeHttpx:
-    Timeout = _FakeTimeout
+  async def respond(request: httpx2.Request) -> httpx2.Response:
+    requests.append(request)
+    assert request.headers["Authorization"] == "Bearer secret-token"
+    if request.method == "GET":
+      return httpx2.Response(405)
+    if request.method == "DELETE":
+      return httpx2.Response(200)
+    payload = json.loads(request.content)
+    if payload["method"] == "notifications/initialized":
+      return httpx2.Response(202)
+    if payload["method"] == "initialize":
+      result = {
+        "protocolVersion": "2025-11-25",
+        "capabilities": {"tools": {}},
+        "serverInfo": {"name": "paged-finance", "version": "1"},
+      }
+    else:
+      assert payload["method"] == "tools/list"
+      cursor = payload.get("params", {}).get("cursor")
+      cursors.append(cursor)
+      if cursor is None:
+        result = {
+          "tools": [{
+            "name": "remote_tool",
+            "description": "Remote tool",
+            "inputSchema": {"type": "object", "properties": {"ticker": {"type": "string"}}},
+            "_meta": {"audience": ["assistant"]},
+          }],
+          "nextCursor": "page-2",
+        }
+      else:
+        assert cursor == "page-2"
+        result = {
+          "tools": [{
+            "name": "second_tool",
+            "inputSchema": {"type": "object", "properties": {}},
+          }],
+        }
+    return httpx2.Response(
+      200,
+      headers={"Mcp-Session-Id": "mcp-session-1"},
+      json={"jsonrpc": "2.0", "id": payload["id"], "result": result},
+    )
 
-    @staticmethod
-    def AsyncClient(**kwargs):
-      client = _FakeAsyncClient(**kwargs)
-      http_clients.append(client)
-      return client
+  def http_client(**kwargs):
+    client = httpx2.AsyncClient(transport=httpx2.MockTransport(respond), **kwargs)
+    http_clients.append(client)
+    return client
 
-  def _fake_streamable_http_client(url, *, http_client, terminate_on_close=True):
-    captured["url"] = url
-    captured["http_client"] = http_client
-    captured["terminate_on_close"] = terminate_on_close
-    return _FakeStreamContext(captured)
-
-  monkeypatch.setattr(mcp_client_module, "HTTPX_IMPORT_ERROR", None)
-  monkeypatch.setattr(mcp_client_module, "httpx", _FakeHttpx)
-  monkeypatch.setattr(mcp_client_module, "streamable_http_client", _fake_streamable_http_client)
-  monkeypatch.setattr(mcp_client_module, "ClientSession", _FakeClientSession)
+  monkeypatch.setattr(
+    mcp_client_module, "httpx2",
+    SimpleNamespace(AsyncClient=http_client, Timeout=httpx2.Timeout),
+  )
   monkeypatch.setenv("CASHNERD_MCP_TOKEN", "secret-token")
 
-  manager = McpClientManager(config_path=None, startup_timeout=1)
-  state = _run(
-    manager._connect(
+  async def scenario():
+    manager = McpClientManager(config_path=None, startup_timeout=1)
+    state = await manager._connect(
       "finance-cli",
       {
         "type": "streamable-http",
@@ -141,53 +120,54 @@ def test_connect_streamable_http_uses_url_headers_and_lists_tools(monkeypatch) -
         "headers": {"Authorization": "Bearer ${CASHNERD_MCP_TOKEN}"},
         "timeout": 7,
         "sse_read_timeout": 45,
-        "terminate_on_close": False,
+        "terminate_on_close": terminate_on_close,
       },
     )
-  )
+    try:
+      assert state.tool_names == {"remote_tool", "second_tool"}
+      assert state.tool_definitions[0]["input_schema"]["properties"]["ticker"]["type"] == "string"
+      assert state.tool_metadata["remote_tool"] == {"audience": ["assistant"]}
+      assert all("_meta" not in tool and "meta" not in tool for tool in state.tool_definitions)
+      assert cursors == [None, "page-2"]
+    finally:
+      await manager._close_contexts(state.exit_contexts)
+    assert http_clients[0].is_closed
+    assert sum(request.method == "DELETE" for request in requests) == int(terminate_on_close)
 
-  assert captured["url"] == "https://cashnerd.ai/mcp"
-  assert captured["terminate_on_close"] is False
-  assert http_clients[0].entered is True
-  assert http_clients[0].kwargs["headers"] == {"Authorization": "Bearer secret-token"}
-  assert http_clients[0].kwargs["timeout"].timeout == 7
-  assert http_clients[0].kwargs["timeout"].read == 45
-  assert state.tool_names == {"remote_tool"}
-  assert state.tool_definitions[0]["input_schema"]["properties"]["ticker"]["type"] == "string"
-
-  _run(manager._close_contexts(state.exit_contexts))
-  assert http_clients[0].exited is True
-  assert captured["stream_exited"] is True
+  _run(scenario())
 
 
-def test_oauth_auth_uses_persistent_json_storage(monkeypatch, tmp_path) -> None:
-  captured: dict[str, object] = {}
-
-  class _FakeOAuth:
-    def __init__(self, **kwargs):
-      captured.update(kwargs)
-
-  monkeypatch.setattr(mcp_client_module, "FASTMCP_OAUTH_IMPORT_ERROR", None)
-  monkeypatch.setattr(mcp_client_module, "FastMCPOAuth", _FakeOAuth)
-
+def test_oauth_auth_reuses_persistent_tokens_with_httpx2(tmp_path) -> None:
   cache_path = tmp_path / "oauth.json"
+  config = {
+    "oauth": {
+      "cache_path": str(cache_path),
+      "scopes": ["openid", "email"],
+      "callback_port": 8765,
+      "client_name": "advisor",
+    }
+  }
   manager = McpClientManager(config_path=None)
-  auth = manager._build_http_auth(
-    "finance-cli",
-    "https://cashnerd.ai/mcp",
-    {
-      "oauth": {
-        "cache_path": str(cache_path),
-        "scopes": ["openid", "email"],
-        "callback_port": 8765,
-        "client_name": "advisor",
-      }
-    },
-  )
 
-  assert isinstance(auth, _FakeOAuth)
-  assert captured["mcp_url"] == "https://cashnerd.ai/mcp"
-  assert captured["scopes"] == ["openid", "email"]
-  assert captured["callback_port"] == 8765
-  assert captured["client_name"] == "advisor"
-  assert isinstance(captured["token_storage"], _JsonFileKeyValue)
+  async def scenario():
+    original = manager._build_http_auth("finance-cli", "https://cashnerd.ai/mcp", config)
+    await original.context.storage.set_tokens(
+      OAuthToken(access_token="persisted-token", token_type="Bearer"),
+    )
+    restored = manager._build_http_auth("finance-cli", "https://cashnerd.ai/mcp", config)
+    different_endpoint = manager._build_http_auth(
+      "finance-cli", "https://cashnerd.ai/other-mcp", config,
+    )
+    assert await different_endpoint.context.storage.get_tokens() is None
+
+    async def respond(request: httpx2.Request) -> httpx2.Response:
+      assert request.headers["Authorization"] == "Bearer persisted-token"
+      return httpx2.Response(200, json={"authenticated": True})
+
+    async with httpx2.AsyncClient(
+      auth=restored, transport=httpx2.MockTransport(respond),
+    ) as client:
+      response = await client.get("https://cashnerd.ai/mcp")
+    assert response.json() == {"authenticated": True}
+
+  _run(scenario())

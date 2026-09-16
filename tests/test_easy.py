@@ -20,7 +20,6 @@ if str(ROOT) not in sys.path:
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-import agent_gateway.mcp_client as mcp_client_module
 import agent_gateway.sub_agent as sub_agent_module
 from agent_gateway import EventLog, McpClientManager, ToolResultContext, create_agent
 from agent_gateway.tool_result_spill import SpillSink, TOOL_RESULT_READ_TOOL_DEF
@@ -1435,7 +1434,6 @@ def test_create_agent_mcp_config_path_expands_and_merges_inline_servers(
     seen[name] = dict(config)
     return None
 
-  monkeypatch.setattr(mcp_client_module, "MCP_IMPORT_ERROR", None)
   monkeypatch.setattr(McpClientManager, "_connect_or_warn", _fake_connect_or_warn)
 
   _run(mcp_client.startup())

@@ -65,6 +65,12 @@ class _EventStream:
     except StopIteration as exc:
       raise StopAsyncIteration from exc
 
+  async def __aenter__(self):
+    return self
+
+  async def __aexit__(self, *_exc):
+    return None
+
 
 class _Responses:
   def __init__(self, batches: list[list[dict[str, Any]]]) -> None:

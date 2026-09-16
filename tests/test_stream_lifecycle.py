@@ -582,17 +582,15 @@ def test_close_client_handles_real_anthropic_contract() -> None:
 
 def test_close_client_handles_real_openai_contract() -> None:
   async def case() -> None:
-    openai = pytest.importorskip("openai")
+    import openai
     provider = OpenAIProvider()
     client = openai.AsyncOpenAI(api_key="test-key")
 
-    assert hasattr(client, "close")
-    assert not hasattr(client, "aclose")
-    assert getattr(client, "_client").is_closed is False
+    assert client.is_closed() is False
 
     await provider.close_client(client)
 
-    assert getattr(client, "_client").is_closed is True
+    assert client.is_closed() is True
 
   _run(case())
 

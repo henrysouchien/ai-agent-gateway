@@ -190,11 +190,6 @@ def convert_openai_response_tools(
   ]
 
 
-def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-  """Backward-compatible private seam used by existing provider callers."""
-  return convert_openai_response_tools(tools)
-
-
 def _parse_signature(signature: Any, marker: str) -> dict[str, Any] | None:
   try:
     payload = json.loads(str(signature or ""))
@@ -604,7 +599,7 @@ __all__ = [
   "_MODEL_INFO_BY_TAG",
   "_ResponsesStreamState",
   "_convert_messages",
-  "_convert_tools",
+  "convert_openai_response_tools",
   "_field",
   "_is_tool_result_message",
   "_model_matches_tag",

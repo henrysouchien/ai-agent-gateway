@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import resource
+from types import SimpleNamespace
 
 import pytest
 
@@ -31,6 +32,7 @@ def test_run_gateway_server_uses_ordinary_tcp_server(
   class _Server:
     def __init__(self, config: _Config) -> None:
       seen["server_config"] = config
+      self.started = True
 
     def run(self) -> None:
       seen["ran"] = True
@@ -77,6 +79,7 @@ def test_run_gateway_server_supports_tls_serving_shape(
   class _Server:
     def __init__(self, config: _Config) -> None:
       seen["server_config"] = config
+      self.started = True
 
     def run(self) -> None:
       seen["ran"] = True
@@ -111,6 +114,46 @@ def test_run_gateway_server_supports_tls_serving_shape(
   }
   assert seen["ran"] is True
   assert len(installed) == 1
+
+
+@pytest.mark.parametrize("run_exits", [False, True])
+def test_run_gateway_server_reports_bind_failure(
+  monkeypatch: pytest.MonkeyPatch,
+  caplog: pytest.LogCaptureFixture,
+  run_exits: bool,
+) -> None:
+  def fail_bind(server: gateway_server.uvicorn.Server) -> None:
+    server.config.loaded = True
+    server.lifespan = SimpleNamespace(
+      startup_failed=False,
+      error_occurred=False,
+      should_exit=False,
+    )
+    if run_exits:
+      raise SystemExit(3)
+
+  monkeypatch.setattr(gateway_server.uvicorn.Server, "run", fail_bind)
+  monkeypatch.setattr(
+    gateway_server,
+    "install_gateway_claim_signing_authority",
+    lambda authority: None,
+  )
+
+  with pytest.raises(SystemExit) as failure:
+    gateway_server.main([
+      "--claim-signing-key-fd",
+      str(_claim_signing_key_fd()),
+    ])
+
+  assert failure.value.code == 3
+  failures = [
+    record for record in caplog.records
+    if "event=gateway_launch_failed" in record.getMessage()
+  ]
+  assert len(failures) == 1
+  assert "failure_class=bind" in failures[0].getMessage()
+  assert "exit_code=3" in failures[0].getMessage()
+
 
 
 @pytest.mark.parametrize(

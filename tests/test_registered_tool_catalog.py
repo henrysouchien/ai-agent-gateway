@@ -5,12 +5,11 @@ import asyncio
 import inspect
 import json
 from dataclasses import FrozenInstanceError
-from datetime import timedelta
 from pathlib import Path
 from types import MappingProxyType
-from types import SimpleNamespace
 
 import pytest
+from mcp.types import CallToolResult
 
 from agent_gateway.approval_policy import sha256_args
 from agent_gateway.mcp_client import (
@@ -262,7 +261,7 @@ class _CatalogMcpSession(McpClientSession):
     name: str,
     arguments: dict[str, object],
     *,
-    read_timeout_seconds: timedelta,
+    read_timeout_seconds: float,
     meta: dict[str, object] | None = None,
   ) -> McpToolCallResult:
     raise AssertionError("catalog topology must not execute its transport session")
@@ -636,11 +635,11 @@ def test_manager_allows_registered_idempotent_read_replay() -> None:
   async def fail_once(**_kwargs: object) -> object:
     raise EOFError("connection closed")
 
-  async def replay(**_kwargs: object) -> object:
+  async def replay(**_kwargs: object) -> CallToolResult:
     replay_attempts.append("replay")
-    return SimpleNamespace(
-      isError=False,
-      structuredContent={"status": "ok"},
+    return CallToolResult(
+      is_error=False,
+      structured_content={"status": "ok"},
       content=[],
     )
 

@@ -69,7 +69,6 @@ async def startup_manager(
   manager: Any,
   allowed_servers: set[str] | None = None,
   *,
-  mcp_import_error: Exception | None,
   supported_server_types: set[str],
   logger: Any,
 ) -> None:
@@ -105,19 +104,6 @@ async def startup_manager(
   if transport_allowed_servers is not None:
     configured_transports &= transport_allowed_servers
   manager._configured_transport_server_names = configured_transports
-
-  if mcp_import_error is not None:
-    logger.warning("MCP runtime unavailable; skipping startup: %s", mcp_import_error)
-    for server_name in sorted(requested_servers or set()):
-      manager._set_startup_diagnostic(
-        server_name,
-        category="runtime_unavailable",
-        message=f"MCP runtime unavailable: {mcp_import_error}",
-        retryable=False,
-        error_type=type(mcp_import_error).__name__,
-      )
-    manager._started = True
-    return
 
   if not mcp_servers:
     missing_config_targets = transport_allowed_servers if requested_servers is not None else set()

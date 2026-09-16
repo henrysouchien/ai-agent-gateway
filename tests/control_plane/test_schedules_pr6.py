@@ -180,7 +180,7 @@ def fake_schedule_backends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
       return None
     return {"status": "ok", "source": "jobs-mcp", **schedule}
 
-  def schedule_list(source: str | None = None) -> dict[str, Any]:
+  async def schedule_list(source: str | None = None) -> dict[str, Any]:
     if source not in (None, "launchd", "jobs-mcp"):
       return {"status": "error", "message": "source must be 'launchd', 'jobs-mcp', or None"}
     items: list[dict[str, Any]] = []
@@ -196,7 +196,7 @@ def fake_schedule_backends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         )
     return {"status": "ok", "schedules": items}
 
-  def schedule_show(name: str, source: str | None = None) -> dict[str, Any]:
+  async def schedule_show(name: str, source: str | None = None) -> dict[str, Any]:
     calls["schedule_show"].append({"name": name, "source": source})
     if source in (None, "launchd"):
       launchd = _launchd_show(name)
@@ -244,7 +244,7 @@ def fake_schedule_backends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     }
     return {"status": "ok", "label": f"{LAUNCHD_PREFIX}{name}"}
 
-  def schedule_enable(name: str) -> dict[str, Any]:
+  async def schedule_enable(name: str) -> dict[str, Any]:
     calls["launchd_enable"].append(name)
     clean = _strip_launchd_name(name)
     if clean not in launchd_store:
@@ -252,7 +252,7 @@ def fake_schedule_backends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     launchd_store[clean]["enabled"] = True
     return {"status": "ok"}
 
-  def schedule_disable(name: str) -> dict[str, Any]:
+  async def schedule_disable(name: str) -> dict[str, Any]:
     calls["launchd_disable"].append(name)
     clean = _strip_launchd_name(name)
     if clean not in launchd_store:
@@ -260,7 +260,7 @@ def fake_schedule_backends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     launchd_store[clean]["enabled"] = False
     return {"status": "ok"}
 
-  def schedule_delete(name: str, confirm: bool = False) -> dict[str, Any]:
+  async def schedule_delete(name: str, confirm: bool = False) -> dict[str, Any]:
     calls["launchd_delete"].append({"name": name, "confirm": confirm})
     clean = _strip_launchd_name(name)
     if not confirm:
@@ -270,7 +270,7 @@ def fake_schedule_backends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     del launchd_store[clean]
     return {"status": "ok", "message": "Schedule deleted"}
 
-  def schedule_logs(name: str, lines: int = 50) -> dict[str, Any]:
+  async def schedule_logs(name: str, lines: int = 50) -> dict[str, Any]:
     calls["launchd_logs"].append({"name": name, "lines": lines})
     clean = _strip_launchd_name(name)
     if clean in launchd_store:
@@ -279,7 +279,7 @@ def fake_schedule_backends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
       return {"status": "error", "message": "Log reading not supported for jobs-mcp schedules. Check jobs-mcp directly."}
     return {"status": "error", "code": "not_found", "message": f"Schedule not found: {name}"}
 
-  def create_job_schedule(
+  async def create_job_schedule(
     name: str,
     job_type: str,
     frequency: str,
@@ -319,7 +319,7 @@ def fake_schedule_backends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     }
     return {"status": "success", "schedule_id": schedule_id}
 
-  def update_job_schedule(schedule_id: str, *, enabled: bool | None = None, **_kwargs: Any) -> dict[str, Any]:
+  async def update_job_schedule(schedule_id: str, *, enabled: bool | None = None, **_kwargs: Any) -> dict[str, Any]:
     calls["jobs_update"].append({"schedule_id": schedule_id, "enabled": enabled})
     schedule = next((item for item in jobs_store.values() if item["schedule_id"] == schedule_id), None)
     if schedule is None:
@@ -328,7 +328,7 @@ def fake_schedule_backends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
       schedule["enabled"] = enabled
     return {"status": "success", "schedule": dict(schedule)}
 
-  def delete_job_schedule(schedule_id: str, *, dry_run: bool = False) -> dict[str, Any]:
+  async def delete_job_schedule(schedule_id: str, *, dry_run: bool = False) -> dict[str, Any]:
     calls["jobs_delete"].append({"schedule_id": schedule_id, "dry_run": dry_run})
     for name, schedule in list(jobs_store.items()):
       if schedule["schedule_id"] == schedule_id:
@@ -347,7 +347,6 @@ def fake_schedule_backends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     schedule_logs=schedule_logs,
   )
   jobs_fake = types.SimpleNamespace(
-    VALID_FREQUENCIES={"daily", "weekly", "monthly", "quarterly"},
     create_schedule=create_job_schedule,
     update_schedule=update_job_schedule,
     delete_schedule=delete_job_schedule,
@@ -366,10 +365,11 @@ def fake_schedule_backends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
   }
 
 
-def test_jobs_schedule_list_passes_backend_frequency_through() -> None:
+@pytest.mark.asyncio
+async def test_jobs_schedule_list_passes_backend_frequency_through() -> None:
   detail_calls: list[tuple[str, str | None]] = []
-  scheduler = types.SimpleNamespace(
-    schedule_list=lambda **_kwargs: {
+  async def list_schedules(**_kwargs):
+    return {
       "status": "ok",
       "schedules": [
         {
@@ -390,7 +390,10 @@ def test_jobs_schedule_list_passes_backend_frequency_through() -> None:
           "schedule_description": "Incomplete",
         },
       ],
-    },
+    }
+
+  scheduler = types.SimpleNamespace(
+    schedule_list=list_schedules,
     schedule_show=lambda name, source=None: detail_calls.append((name, source)),
   )
   backend = schedules_module.OperatorScheduleBackend(
@@ -398,7 +401,7 @@ def test_jobs_schedule_list_passes_backend_frequency_through() -> None:
     jobs=types.SimpleNamespace(),
   )
 
-  schedules = schedules_module._list_schedules("jobs-mcp", backend=backend)
+  schedules = await schedules_module._list_schedules("jobs-mcp", backend=backend)
 
   assert [schedule.name for schedule in schedules] == ["novel", "incomplete"]
   first, second = schedules
@@ -1799,7 +1802,7 @@ def test_agent_run_schedule_runner_rejects_interactive_profile_before_spawn(
   assert registry.starts == []
 
 
-def test_jobs_mcp_create_contract_rejects_wrong_day_types_and_frequency(fake_schedule_backends) -> None:
+def test_jobs_mcp_create_contract_rejects_wrong_day_types_and_extra_fields(fake_schedule_backends) -> None:
   app = _make_app(fake_schedule_backends["backend"])
   with TestClient(app) as client:
     session = _control_session(client, "alice", role="owner")
@@ -1817,17 +1820,6 @@ def test_jobs_mcp_create_contract_rejects_wrong_day_types_and_frequency(fake_sch
         "day_of_week": "0",
       },
     )
-    bad_frequency = client.post(
-      "/api/control/schedules",
-      headers=headers,
-      json={
-        "source": "jobs-mcp",
-        "name": "bad-frequency",
-        "job_type": "oi_analysis",
-        "frequency": "hourly",
-        "time_of_day": "08:15",
-      },
-    )
     create_enabled = client.post(
       "/api/control/schedules",
       headers=headers,
@@ -1842,6 +1834,26 @@ def test_jobs_mcp_create_contract_rejects_wrong_day_types_and_frequency(fake_sch
     )
 
     assert string_day.status_code == 422
-    assert bad_frequency.status_code == 422
     assert create_enabled.status_code == 422
     assert fake_schedule_backends["calls"]["jobs_create"] == []
+
+
+def test_jobs_service_unavailable_is_not_an_empty_list_or_missing_schedule(fake_schedule_backends) -> None:
+  async def unavailable(*args, **kwargs):
+    return {"status": "error", "code": "service_unavailable", "error": "jobs-mcp unavailable"}
+
+  backend = fake_schedule_backends["backend"]
+  backend.scheduler.schedule_list = unavailable
+  backend.scheduler.schedule_show = unavailable
+  backend.jobs.create_schedule = unavailable
+  app = _make_app(backend)
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client, "alice", role="owner"))
+    listing = client.get("/api/control/schedules?source=jobs-mcp", headers=headers)
+    detail = client.get("/api/control/schedules/absent", headers=headers)
+    created = client.post("/api/control/schedules", headers=headers, json={
+      "source": "jobs-mcp", "name": "probe", "job_type": "oi_analysis",
+      "frequency": "daily", "time_of_day": "08:15",
+    })
+    assert listing.status_code == detail.status_code == created.status_code == 503
+    assert listing.json()["detail"] == "jobs-mcp unavailable"
