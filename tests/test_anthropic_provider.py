@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -27,6 +28,7 @@ from agent_gateway import AnthropicProvider, ModelInfo, ThinkingLevel
 import agent_gateway.providers.anthropic as anthropic_provider_module
 import agent_gateway.providers.anthropic_helpers as anthropic_helpers
 from agent_gateway.providers.anthropic import _format_anthropic_rejection_detail
+from agent_gateway.providers.anthropic_oauth import AnthropicCredentialPool
 from agent_gateway.providers import StreamEvent
 
 
@@ -1525,6 +1527,60 @@ def test_stream_status_200_api_error_remains_retryable() -> None:
 
   assert exc_info.value is error
   assert provider.is_retryable_error(error) is True
+
+
+@pytest.mark.parametrize(
+  "error_body",
+  [
+    pytest.param(
+      {
+        "type": "error",
+        "error": {
+          "type": "permission_error",
+          "message": "OAuth authentication is currently not allowed for this organization.",
+          "details": {"error_code": "oauth_not_allowed_for_organization"},
+        },
+      },
+      id="observed-body",
+    ),
+    pytest.param(
+      {"type": "error", "error": {"type": "permission_error", "message": "oauth_not_allowed_for_organization"}},
+      id="error-code-only",
+    ),
+  ],
+)
+def test_org_refusing_oauth_parks_that_member_and_rotates_to_the_next(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  error_body: dict[str, object],
+) -> None:
+  """A 403 org OAuth refusal is per credential: pool siblings in other orgs answer."""
+  refused, serving = "sk-ant-oat01-refused-org", "sk-ant-oat01-serving"
+  pool = AnthropicCredentialPool()
+  monkeypatch.setattr(anthropic_provider_module, "ANTHROPIC_CREDENTIAL_POOL", pool)
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", refused)
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([refused, serving]))
+  monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+  monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "absent-oauth.json"))
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  provider = AnthropicProvider()
+  client = _FakeClient(_make_anthropic_api_status_error(403, f"Error code: 403 - {error_body}", body=error_body))
+  params = {
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "hello"}],
+    "_provider_auth_mode": "oauth",
+  }
+  with pytest.raises(RuntimeError) as exc_info:
+    asyncio.run(_drain_stream(provider, client, params))
+
+  failure = provider.classify_credential_failure(exc_info.value)
+
+  assert failure is not None and failure.kind == "auth"
+  assert provider.next_credential({"auth_mode": "oauth", "auth_token": refused}, failure) == {
+    "auth_token": serving,
+  }
+  assert pool.blocked_until(refused) > 0
 
 
 def test_stream_separates_provider_ping_from_silent_progress_metadata() -> None:

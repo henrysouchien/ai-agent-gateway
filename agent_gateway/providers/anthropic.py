@@ -827,7 +827,14 @@ class AnthropicProvider(ModelProvider):
             if is_same_model:
               next_content.append(dict(block))
             elif thinking_text.strip():
-              next_content.append({"type": "text", "text": thinking_text})
+              # The signature is bound to the model that produced it, so a
+              # different model gets the reasoning narrative as handoff
+              # context, marked as such rather than as its own prior words.
+              prior_model = str(message.get("model", "")) or "a previous model"
+              next_content.append({
+                "type": "text",
+                "text": f"[Reasoning summary from {prior_model}]\n{thinking_text}",
+              })
             continue
 
           if block_type in {"tool_use", "server_tool_use"}:

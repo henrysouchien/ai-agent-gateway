@@ -58,6 +58,44 @@ def _prepare_bound_execution(
   return config, max_tokens, effort_resolution
 
 
+def _rotated_execution(
+  capability_execution: BoundCapabilityExecution,
+  exc: Exception,
+) -> BoundCapabilityExecution | None:
+  """The same bind on the provider's next pool credential, or None.
+
+  The provider decides which failures a sibling credential can answer and
+  parks the rejected one (`classify_credential_failure` / `next_credential`,
+  the policy the runner uses); only credential material changes, so the bind,
+  model, and effort stay what the caller resolved. Each rotation parks the
+  credential it leaves, so the pool bounds the attempts.
+  """
+  from .capability_execution import BoundCapabilityExecution
+  from .runner_auth import merge_refreshed_auth_config
+
+  provider = capability_execution.provider
+  failure = provider.classify_credential_failure(exc)
+  if failure is None:
+    return None
+  rotated = provider.next_credential(capability_execution.auth_config, failure)
+  if rotated is None:
+    return None
+  log.info(
+    "send_prompt credential rotated after provider %s failure (status=%s); retrying",
+    failure.kind,
+    failure.status_code,
+  )
+  return BoundCapabilityExecution(
+    bind=capability_execution.bind,
+    registry=capability_execution.registry,
+    adapter=capability_execution.adapter,
+    auth_config=merge_refreshed_auth_config(
+      dict(capability_execution.auth_config),
+      rotated,
+    ),
+  )
+
+
 async def send_prompt(
   prompt: str,
   *,
@@ -107,13 +145,11 @@ async def send_prompt(
     commercial_guard = getattr(commercial_usage_producer, "assert_work_allowed", None)
     if callable(commercial_guard):
       commercial_guard(resolved_billing_mode)
-  config, max_tokens, effort_resolution = _prepare_bound_execution(
-    capability_execution
-  )
-  capability_bind = capability_execution.bind
-  provider = capability_execution.provider
+  execution = capability_execution
+  config, max_tokens, effort_resolution = _prepare_bound_execution(execution)
+  capability_bind = execution.bind
+  provider = execution.provider
   model = capability_bind.upstream_model
-  thinking_level = effort_resolution.requested
   client: Any = None
   text_parts: list[str] = []
   input_tokens = 0
@@ -162,57 +198,73 @@ async def send_prompt(
       _call_usage_callback(on_usage, usage_event)
 
   try:
-    client = provider.create_client(config=config, timeout=client_timeout)
-    params = provider.build_request_params(
-      model=model,
-      messages=[{"role": "user", "content": prompt}],
-      system_prompt=system_prompt,
-      tools=[],
-      max_tokens=max_tokens,
-      thinking_level=thinking_level,
-      effort_resolution=effort_resolution,
-      auth_mode=config.get("auth_mode"),
-    )
+    while True:
+      client = provider.create_client(config=config, timeout=client_timeout)
+      params = provider.build_request_params(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        system_prompt=system_prompt,
+        tools=[],
+        max_tokens=max_tokens,
+        thinking_level=effort_resolution.requested,
+        effort_resolution=effort_resolution,
+        auth_mode=config.get("auth_mode"),
+      )
 
-    try:
-      async for event in provider.stream(client, params):
-        if event.type == "text_delta":
-          text = str(event.text or "")
-          if text:
-            text_parts.append(text)
-          continue
+      try:
+        async for event in provider.stream(client, params):
+          if event.type == "text_delta":
+            text = str(event.text or "")
+            if text:
+              text_parts.append(text)
+            continue
 
-        if event.type == "message_start":
-          input_tokens += int(event.input_tokens or 0)
-          cache_read_tokens += int(event.cache_read_tokens or 0)
-          cache_creation_tokens += int(event.cache_creation_tokens or 0)
-          if event.provider_reported_model is not None:
-            provider_reported_model = validate_reported_identity(
-              capability_bind,
-              event.provider_reported_model,
-              registry=capability_execution.registry,
-            )
-          if event.provider_unit_deltas:
-            provider_unit_deltas.update(event.provider_unit_deltas)
-          continue
+          if event.type == "message_start":
+            input_tokens += int(event.input_tokens or 0)
+            cache_read_tokens += int(event.cache_read_tokens or 0)
+            cache_creation_tokens += int(event.cache_creation_tokens or 0)
+            if event.provider_reported_model is not None:
+              provider_reported_model = validate_reported_identity(
+                capability_bind,
+                event.provider_reported_model,
+                registry=execution.registry,
+              )
+            if event.provider_unit_deltas:
+              provider_unit_deltas.update(event.provider_unit_deltas)
+            continue
 
-        if event.type == "usage_update":
-          output_tokens += int(event.output_tokens or 0)
-          reasoning_tokens += int(event.reasoning_tokens or 0)
-          if event.provider_unit_deltas:
-            provider_unit_deltas.update(event.provider_unit_deltas)
-          continue
+          if event.type == "usage_update":
+            output_tokens += int(event.output_tokens or 0)
+            reasoning_tokens += int(event.reasoning_tokens or 0)
+            if event.provider_unit_deltas:
+              provider_unit_deltas.update(event.provider_unit_deltas)
+            continue
 
-        if event.type == "message_end":
-          stop_reason = str(event.stop_reason or "")
-    except asyncio.CancelledError:
-      if input_tokens or output_tokens or cache_read_tokens or cache_creation_tokens:
-        await _emit_usage("canceled")
-      raise
-    except Exception:
-      if input_tokens or output_tokens or cache_read_tokens or cache_creation_tokens:
-        await _emit_usage("failed_billable")
-      raise
+          if event.type == "message_end":
+            stop_reason = str(event.stop_reason or "")
+      except asyncio.CancelledError:
+        if input_tokens or output_tokens or cache_read_tokens or cache_creation_tokens:
+          await _emit_usage("canceled")
+        raise
+      except Exception as exc:
+        if input_tokens or output_tokens or cache_read_tokens or cache_creation_tokens:
+          await _emit_usage("failed_billable")
+        rotated_execution = _rotated_execution(execution, exc)
+        if rotated_execution is None:
+          raise
+        await provider.close_client(client)
+        client = None
+        execution = rotated_execution
+        provider = execution.provider
+        config, max_tokens, effort_resolution = _prepare_bound_execution(execution)
+        text_parts.clear()
+        input_tokens = output_tokens = reasoning_tokens = 0
+        cache_read_tokens = cache_creation_tokens = 0
+        provider_unit_deltas.clear()
+        provider_reported_model = None
+        stop_reason = ""
+        continue
+      break
 
     await _emit_usage("succeeded")
 

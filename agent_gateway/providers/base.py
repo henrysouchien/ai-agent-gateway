@@ -32,6 +32,9 @@ _AUTH_PATTERNS = (
   re.compile(r"\bauth(?:entication|orization)?(?:\s+failed|\s+error)?\b", re.IGNORECASE),
   re.compile(r"\binvalid api key\b", re.IGNORECASE),
   re.compile(r"\bexpired (?:token|credential|key)\b", re.IGNORECASE),
+  # A 403 whose organization refuses OAuth is a property of this credential's
+  # account, not of the request: a sibling in another organization answers it.
+  re.compile(r"\boauth_not_allowed_for_organization\b", re.IGNORECASE),
 )
 _RATE_LIMIT_PATTERNS = (
   re.compile(r"\brate(?:\s+limit(?:ed|ing)?|\s+limited)\b", re.IGNORECASE),

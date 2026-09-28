@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.20.1 (2026-09-28)
+
+### Fixed
+
+- `send_prompt` / `send_prompt_sync` rotate credentials the way a runner turn
+  does. A failure the provider classifies as a credential failure that a
+  sibling can answer (`classify_credential_failure` → `next_credential`: 429
+  and auth-class rejections) parks the bound credential and retries the same
+  bind on the next pool member, once per member; with no unblocked sibling the
+  last provider rejection is raised unchanged. Previously one refused or
+  rate-limited pool member failed every out-of-gateway prompt.
+- A 403 carrying `oauth_not_allowed_for_organization` classifies as `auth`
+  (rotatable) from its error code. Previously it rotated only because the
+  provider's prose message contained the word "authentication"; a body that
+  carried the code alone fell through to the 403 `billing` branch and was
+  never rotated.
+
 ## 0.20.0 (2026-09-28)
 
 ### Fixed
