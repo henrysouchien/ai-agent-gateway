@@ -118,58 +118,65 @@ _EXPECTED_EXECUTION_IDENTITIES = {
   "anthropic.claude-fable-5-1": ("anthropic", "claude-fable-5-1", "anthropic.messages", "messages.adaptive", "anthropic.public", "active", "high"),
   "anthropic.claude-fable-5": ("anthropic", "claude-fable-5", "anthropic.messages", "messages.adaptive", "anthropic.public", "active", "high"),
   "anthropic.claude-haiku-4-5": ("anthropic", "claude-haiku-4-5", "anthropic.messages", "messages.standard", "anthropic.public", "active", "none"),
-  "anthropic.claude-mythos-5": ("anthropic", "claude-mythos-5", "anthropic.messages", "messages.adaptive", "anthropic.public", "active", "high"),
+  "anthropic.claude-opus-5-5": ("anthropic", "claude-opus-5-5", "anthropic.messages", "messages.adaptive", "anthropic.public", "active", "high"),
   "anthropic.claude-opus-5": ("anthropic", "claude-opus-5", "anthropic.messages", "messages.adaptive", "anthropic.public", "active", "high"),
   "anthropic.claude-sonnet-5": ("anthropic", "claude-sonnet-5", "anthropic.messages", "messages.adaptive", "anthropic.public", "active", "high"),
   "openai.gpt-6-astra": ("openai", "gpt-6-astra", "openai.responses", "responses.reasoning", "openai.public", "active", "medium"),
+  "openai.gpt-6-sol": ("openai", "gpt-6-sol", "openai.responses", "responses.reasoning", "openai.public", "active", "medium"),
   "openai.gpt-5-6": ("openai", "gpt-5.6", "openai.responses", "responses.reasoning", "openai.public", "active", "medium"),
   "codex.gpt-6-astra": ("codex", "gpt-6-astra", "codex.responses", "codex.reasoning", "codex.chatgpt", "active", "medium"),
+  "codex.gpt-6-sol": ("codex", "gpt-6-sol", "codex.responses", "codex.reasoning", "codex.chatgpt", "active", "medium"),
   "codex.gpt-5-6-luna": ("codex", "gpt-5.6-luna", "codex.responses", "codex.reasoning", "codex.chatgpt", "active", "medium"),
   "codex.gpt-5-6-sol": ("codex", "gpt-5.6-sol", "codex.responses", "codex.reasoning", "codex.chatgpt", "active", "medium"),
   "codex.gpt-5-6-terra": ("codex", "gpt-5.6-terra", "codex.responses", "codex.reasoning", "codex.chatgpt", "active", "medium"),
   "xai.grok-4-6": ("xai", "grok-4.6", "xai.responses", "responses.reasoning", "xai.public", "active", "high"),
   "xai.grok-4-5": ("xai", "grok-4.5", "xai.responses", "responses.reasoning", "xai.public", "active", "high"),
-  "anthropic.claude-sonnet-4-6-sdk": ("anthropic", "claude-sonnet-4-6", "anthropic.sdk.messages", "messages.standard", "anthropic.byok", "hidden", "none"),
-  "anthropic.claude-haiku-4-5-20251001-sdk": ("anthropic", "claude-haiku-4-5-20251001", "anthropic.sdk.messages", "messages.standard", "anthropic.byok", "hidden", "none"),
-  "anthropic.claude-haiku-4-5-20251001-gateway": ("anthropic", "claude-haiku-4-5-20251001", "anthropic.messages", "messages.standard", "anthropic.public", "hidden", "none"),
-  "anthropic.claude-opus-4-8-oauth": ("anthropic", "claude-opus-4-8", "anthropic.sdk.messages", "messages.oauth", "anthropic.oauth", "hidden", "none"),
-  "anthropic.claude-sonnet-4-20250514-sdk": ("anthropic", "claude-sonnet-4-20250514", "anthropic.sdk.messages", "messages.standard", "anthropic.service", "hidden", "none"),
+  "anthropic.claude-sonnet-5-sdk": ("anthropic", "claude-sonnet-5", "anthropic.sdk.messages", "messages.adaptive", "anthropic.byok", "hidden", "none"),
+  "anthropic.claude-haiku-4-5-sdk": ("anthropic", "claude-haiku-4-5", "anthropic.sdk.messages", "messages.adaptive", "anthropic.byok", "hidden", "none"),
+  "anthropic.claude-opus-5-5-oauth": ("anthropic", "claude-opus-5-5", "anthropic.sdk.messages", "messages.oauth", "anthropic.oauth", "hidden", "none"),
+  "anthropic.claude-sonnet-4-6-sdk": ("anthropic", "claude-sonnet-4-6", "anthropic.sdk.messages", "messages.standard", "anthropic.byok", "deprecated", "none"),
+  "anthropic.claude-haiku-4-5-20251001-sdk": ("anthropic", "claude-haiku-4-5-20251001", "anthropic.sdk.messages", "messages.standard", "anthropic.byok", "deprecated", "none"),
+  "anthropic.claude-haiku-4-5-20251001-gateway": ("anthropic", "claude-haiku-4-5-20251001", "anthropic.messages", "messages.standard", "anthropic.public", "deprecated", "none"),
+  "anthropic.claude-opus-4-8-oauth": ("anthropic", "claude-opus-4-8", "anthropic.sdk.messages", "messages.oauth", "anthropic.oauth", "deprecated", "none"),
+  "anthropic.claude-sonnet-4-20250514-sdk": ("anthropic", "claude-sonnet-4-20250514", "anthropic.sdk.messages", "messages.standard", "anthropic.service", "retired", "none"),
   "openai.gpt-5-4-mini-sdk": ("openai", "gpt-5.4-mini", "openai.sdk.chat_completions", "chat_completions.standard", "openai.service", "hidden", "none"),
 }
 
 _EXPECTED_DEFAULTS = {
-  "session.driver": ("model", "anthropic.claude-opus-5", "high"),
+  "session.driver": ("model", "anthropic.claude-opus-5-5", "high"),
   "plan.author": ("inherit_parent", None, None),
-  "node.explore": ("model", "anthropic.claude-opus-5", "high"),
-  "node.implement": ("model", "anthropic.claude-opus-5", "high"),
-  "node.mutate": ("model", "anthropic.claude-opus-5", "high"),
+  "node.explore": ("model", "anthropic.claude-opus-5-5", "high"),
+  "node.implement": ("model", "anthropic.claude-opus-5-5", "high"),
+  "node.mutate": ("model", "anthropic.claude-opus-5-5", "high"),
   "node.fork": ("inherit_parent", None, None),
-  "node.verify": ("model", "anthropic.claude-opus-5", "high"),
-  "node.choose": ("model", "anthropic.claude-opus-5", "high"),
+  "node.verify": ("model", "anthropic.claude-opus-5-5", "high"),
+  "node.choose": ("model", "anthropic.claude-opus-5-5", "high"),
   "citation.review": ("model", "anthropic.claude-haiku-4-5", "none"),
-  "risk.completion": ("model", "anthropic.claude-sonnet-4-6-sdk", "none"),
-  "risk.interpretation": ("model", "anthropic.claude-sonnet-4-6-sdk", "none"),
+  "risk.completion": ("model", "anthropic.claude-sonnet-5-sdk", "none"),
+  "risk.interpretation": ("model", "anthropic.claude-sonnet-5-sdk", "none"),
   "risk.peer_generation": ("model", "openai.gpt-5-4-mini-sdk", "none"),
-  "risk.asset_classification": ("model", "anthropic.claude-haiku-4-5-20251001-sdk", "none"),
-  "risk.overview_editorial": ("model", "anthropic.claude-haiku-4-5-20251001-sdk", "none"),
-  "risk.document_ingest": ("model", "anthropic.claude-opus-4-8-oauth", "none"),
-  "investment.research_agent": ("model", "anthropic.claude-sonnet-4-6-sdk", "none"),
-  "investment.quant_worker": ("model", "openai.gpt-5-6", "high"),
-  "investment.newsletter": ("model", "anthropic.claude-haiku-4-5-20251001-gateway", "none"),
-  "investment.earnings_transcript": ("model", "anthropic.claude-haiku-4-5-20251001-gateway", "none"),
-  "investment.biotech_review": ("model", "anthropic.claude-sonnet-4-20250514-sdk", "none"),
+  "risk.asset_classification": ("model", "anthropic.claude-haiku-4-5-sdk", "none"),
+  "risk.overview_editorial": ("model", "anthropic.claude-haiku-4-5-sdk", "none"),
+  "risk.document_ingest": ("model", "anthropic.claude-opus-5-5-oauth", "none"),
+  "investment.research_agent": ("model", "anthropic.claude-sonnet-5", "none"),
+  "investment.quant_worker": ("model", "openai.gpt-6-sol", "high"),
+  "investment.newsletter": ("model", "anthropic.claude-haiku-4-5", "none"),
+  "investment.earnings_transcript": ("model", "anthropic.claude-haiku-4-5", "none"),
+  "investment.biotech_review": ("model", "anthropic.claude-sonnet-5", "none"),
 }
 
 _DRIVER_KEYS = frozenset({
   "anthropic.claude-fable-5-1",
   "anthropic.claude-fable-5",
   "anthropic.claude-haiku-4-5",
-  "anthropic.claude-mythos-5",
+  "anthropic.claude-opus-5-5",
   "anthropic.claude-opus-5",
   "anthropic.claude-sonnet-5",
   "openai.gpt-6-astra",
+  "openai.gpt-6-sol",
   "openai.gpt-5-6",
   "codex.gpt-6-astra",
+  "codex.gpt-6-sol",
   "codex.gpt-5-6-luna",
   "codex.gpt-5-6-sol",
   "codex.gpt-5-6-terra",
@@ -179,7 +186,7 @@ _DRIVER_KEYS = frozenset({
 
 
 def test_packaged_registry_artifact_matches_frozen_inventory() -> None:
-  assert INITIAL_MODEL_REGISTRY.revision == "2026-08-18.1"
+  assert INITIAL_MODEL_REGISTRY.revision == "2026-09-28.1"
   observed = {
     key: (
       entry.provider,
@@ -206,8 +213,11 @@ def test_packaged_registry_artifact_matches_frozen_inventory() -> None:
   assert INITIAL_MODEL_REGISTRY.require(
     "openai.gpt-5-6"
   ).reported_identities == frozenset({"gpt-5.6", "gpt-5.6-sol"})
-  oauth = INITIAL_MODEL_REGISTRY.require("anthropic.claude-opus-4-8-oauth")
+  oauth = INITIAL_MODEL_REGISTRY.require("anthropic.claude-opus-5-5-oauth")
   assert oauth.features == frozenset({"vision"})
+  assert INITIAL_MODEL_REGISTRY.require(
+    "anthropic.claude-opus-5-5"
+  ).supported_efforts == frozenset({"low", "medium", "high", "xhigh", "max"})
   assert INITIAL_MODEL_REGISTRY.require("xai.grok-4-5").supported_efforts == (
     frozenset({"low", "medium", "high", "xhigh"})
   )
@@ -217,7 +227,7 @@ def test_packaged_registry_artifact_matches_frozen_inventory() -> None:
 
 
 def test_packaged_selection_artifact_matches_frozen_policy() -> None:
-  assert INITIAL_MODEL_SELECTION_POLICY.revision == "2026-08-18.1"
+  assert INITIAL_MODEL_SELECTION_POLICY.revision == "2026-09-28.1"
   assert set(INITIAL_MODEL_SELECTION_POLICY.capabilities) == CAPABILITY_IDS
   observed = {
     capability_id: (
@@ -243,7 +253,7 @@ def test_packaged_selection_artifact_matches_frozen_policy() -> None:
     "anthropic.claude-fable-5-1",
     "anthropic.claude-fable-5",
     "anthropic.claude-haiku-4-5",
-    "anthropic.claude-mythos-5",
+    "anthropic.claude-opus-5-5",
     "anthropic.claude-opus-5",
     "anthropic.claude-sonnet-5",
   })
@@ -253,7 +263,7 @@ def test_packaged_selection_artifact_matches_frozen_policy() -> None:
   node_keys = frozenset({
     "anthropic.claude-fable-5-1",
     "anthropic.claude-fable-5",
-    "anthropic.claude-mythos-5",
+    "anthropic.claude-opus-5-5",
     "anthropic.claude-opus-5",
     "anthropic.claude-sonnet-5",
   })
@@ -402,12 +412,12 @@ def test_all_lifecycle_states_are_authorable_for_internal_models(
   target = next(
     entry
     for entry in document["models"]
-    if entry["key"] == "anthropic.claude-sonnet-4-20250514-sdk"
+    if entry["key"] == "anthropic.claude-sonnet-5-sdk"
   )
   target["lifecycle"] = lifecycle
   registry = load_model_registry(_write_artifact(tmp_path / "registry.yaml", document))
 
-  assert registry.require("anthropic.claude-sonnet-4-20250514-sdk").lifecycle == (
+  assert registry.require("anthropic.claude-sonnet-5-sdk").lifecycle == (
     lifecycle
   )
 
@@ -433,7 +443,7 @@ def test_policy_admission_rejects_retired_model_for_new_selection(
   target = next(
     entry
     for entry in document["models"]
-    if entry["key"] == "anthropic.claude-sonnet-4-20250514-sdk"
+    if entry["key"] == "anthropic.claude-sonnet-5-sdk"
   )
   target["lifecycle"] = lifecycle
   registry = load_model_registry(_write_artifact(tmp_path / "registry.yaml", document))
@@ -448,7 +458,7 @@ def test_unknown_lifecycle_value_is_rejected(tmp_path: Path) -> None:
   target = next(
     entry
     for entry in document["models"]
-    if entry["key"] == "anthropic.claude-sonnet-4-20250514-sdk"
+    if entry["key"] == "anthropic.claude-sonnet-5-sdk"
   )
   target["lifecycle"] = "sunset"
 

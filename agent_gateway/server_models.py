@@ -195,6 +195,9 @@ _ARTIFACT_INDEX_RECENT_LIMIT = 5
 _DEFAULT_CHAT_PROFILE = "analyst"
 _CHAT_PROFILE_ALIASES = {"hank": "analyst", "hank-community": "community"}
 _ACTIVE_TURN_GRACE_SECONDS = 60.0
+#: How long a follow-up message waits for the previous turn's post-terminal
+#: teardown before the session is reported as not released.
+_ACTIVE_TURN_SETTLE_WAIT_SECONDS = 30.0
 _STREAM_SUBSCRIBER_QUEUE_MAX = 256
 _STREAM_SUBSCRIBER_KEEPALIVE_SECONDS = 15.0
 _SIDECAR_SLUG_RE = re.compile(r"[^a-z0-9-]+")
@@ -970,7 +973,6 @@ class GatewayServerConfig:
     mcp_meta_inject_servers: Optional immutable set of MCP servers that receive
       server-derived invocation identity metadata.
     sdk_config: Optional `AgentSDKConfig` when using `AgentSDKRunner`.
-    per_turn_timeout: Default per-turn timeout in seconds.
     compaction_trigger: Default compaction threshold.
     compaction_instructions: Default compaction instructions.
     model_registry: Required stable execution-identity authority.
@@ -1018,7 +1020,9 @@ class GatewayServerConfig:
     on_shutdown: Optional shutdown callback.
     transcript_dir: Optional directory where request and event transcripts are
       written as JSONL files.
-    transcript_retention_days: Number of days to retain chat transcript files.
+    transcript_retention_days: Age horizon in days for the chat transcript
+      sweep. Defaults to 0, which deletes nothing; a positive value unlinks
+      transcripts and their `.meta.json` sidecars older than that many days.
     retention_sweeper: Optional synchronous retention sweeper injected by an
       application owner. Package consumers default to no sweep.
     control_skills_dir: Optional directory backing control-plane skill list/read
@@ -1088,7 +1092,6 @@ class GatewayServerConfig:
   server_policy: Any | None = None
   redaction_context_factory: Callable[[Any], object | None] | None = None
   sdk_config: AgentSDKConfig | None = None
-  per_turn_timeout: int = 300
   compaction_trigger: int | None = None
   compaction_instructions: str | None = None
   model_registry: ProductModelRegistry | None = None
@@ -1116,7 +1119,7 @@ class GatewayServerConfig:
   on_startup: Optional[Callable[..., Any]] = None
   on_shutdown: Optional[Callable[..., Any]] = None
   transcript_dir: Optional[Path] = None
-  transcript_retention_days: int = 7
+  transcript_retention_days: int = 0
   retention_sweeper: ScheduledRetentionSweeper | None = None
   control_skills_dir: Optional[Path] = None
   control_skill_catalog: ControlSkillCatalog | None = None

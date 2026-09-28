@@ -4,7 +4,7 @@ import asyncio
 import logging
 import re
 from dataclasses import replace
-from typing import Any, AsyncIterator, Dict
+from typing import Any, AsyncGenerator, Dict
 from urllib.parse import urlparse
 
 from ..model_registry import AdapterRouteSupport
@@ -144,12 +144,23 @@ class OpenAIProvider(ModelProvider):
       raise RuntimeError(f"No OpenAI {mode} credential configured")
 
     import httpx2
-    from openai import AsyncOpenAI
+    from openai import AsyncOpenAI, Omit
 
     client_kwargs: Dict[str, Any] = {
       "base_url": normalized["base_url"],
       "organization": normalized["organization"],
       "project": normalized["project"],
+      # openai>=3.14 parses `OPENAI_CUSTOM_HEADERS` from the process
+      # environment into the client's default headers, which are applied after
+      # the credential, organization and project passed here.  Restating the
+      # bound principal as explicit headers keeps that ambient input from
+      # redirecting a request to another account, organization or project;
+      # an unbound organization or project stays absent rather than inheritable.
+      "default_headers": {
+        "Authorization": f"Bearer {credential}",
+        "OpenAI-Organization": normalized["organization"] or Omit(),
+        "OpenAI-Project": normalized["project"] or Omit(),
+      },
     }
     if timeout is not None:
       client_kwargs["timeout"] = httpx2.Timeout(timeout=timeout, connect=5.0)
@@ -364,7 +375,7 @@ class OpenAIProvider(ModelProvider):
         params["reasoning"]["summary"] = "auto"
     return params
 
-  async def stream(self, client: Any, params: dict[str, Any]) -> AsyncIterator[StreamEvent]:
+  async def stream(self, client: Any, params: dict[str, Any]) -> AsyncGenerator[StreamEvent, None]:
     state = _ResponsesStreamState()
     async with await client.responses.create(**params) as stream:
       async for event in stream:

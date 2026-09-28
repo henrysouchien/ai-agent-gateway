@@ -571,12 +571,12 @@ class AutonomousTask:
     ):
       raise ValueError("autonomous task terminal_reason is invalid")
     if self.terminal_reason is not None and (
-      self.state not in {"completed", "finished"}
+      self.state != "interrupted"
       or self.exit_code != 0
       or self.error is not None
     ):
       raise ValueError(
-        "autonomous task terminal_reason requires successful completion"
+        "autonomous task terminal_reason requires a clean interrupted settlement"
       )
 
   @property
@@ -1454,14 +1454,16 @@ class AutonomousRegistryStateMixin:
         continue
       disposition = event.get("terminal_disposition")
       if disposition == "completed":
-        return "completed", None, terminal_reason
-      if disposition == "interrupted":
         if terminal_reason is not None:
           return (
             "failed",
-            "Interrupted terminal cannot carry autonomous terminal_reason",
+            "Successful terminal cannot carry autonomous terminal_reason",
             None,
           )
+        return "completed", None, None
+      if disposition == "interrupted":
+        if terminal_reason is not None:
+          return "interrupted", None, terminal_reason
         if event.get("reason") == "budget_exceeded":
           return "budget_limited", None, None
         return "interrupted", None, None
@@ -1472,6 +1474,42 @@ class AutonomousRegistryStateMixin:
       )
     return None, "Process exited without a terminal stream event", None
 
+  @staticmethod
+  def _terminal_settlement(
+    outcome: str | None,
+    *,
+    exit_code: int | None,
+    terminal_error: str | None,
+    terminal_reason: str | None,
+    existing_error: str | None = None,
+  ) -> tuple[str, str | None, str | None] | None:
+    """Map one terminal-event outcome to ``(state, error, terminal_reason)``.
+
+    The single owner of that table: the live reaper and both rehydration arms
+    read it here. ``None`` means the events settle nothing and the caller's own
+    fallback (manifest state, or an abandoned run) decides.
+    """
+    if outcome == "budget_limited":
+      return "budget_limited", None, None
+    if outcome == "interrupted":
+      return "interrupted", None, terminal_reason
+    if outcome == "completed":
+      if exit_code == 0:
+        return "completed", None, None
+      return (
+        "failed",
+        existing_error
+        or (
+          "completed stream without a committed process exit"
+          if exit_code is None
+          else f"Process exited with code {exit_code}"
+        ),
+        None,
+      )
+    if outcome == "failed":
+      return "failed", terminal_error, None
+    return None
+
   def _apply_terminal_event_state(self, record: AutonomousTask) -> bool:
     if record.state not in {"completed", "finished", "failed"}:
       return False
@@ -1480,25 +1518,22 @@ class AutonomousRegistryStateMixin:
     outcome, terminal_error, terminal_reason = self._terminal_event_outcome(
       record.event_channel_projected_events
     )
-    if outcome == "budget_limited":
-      record.state = "budget_limited"
-      record.error = None
-      record.terminal_reason = None
-    elif outcome == "interrupted":
-      record.state = "interrupted"
-      record.error = None
-      record.terminal_reason = None
-    elif outcome == "completed" and record.exit_code == 0:
-      record.state = "completed"
-      record.error = None
-      record.terminal_reason = terminal_reason
-    else:
+    settlement = self._terminal_settlement(
+      outcome,
+      exit_code=record.exit_code,
+      terminal_error=terminal_error,
+      terminal_reason=terminal_reason,
+      existing_error=record.error,
+    )
+    if settlement is None:
       record.state = "failed"
       record.terminal_reason = None
-      if outcome == "failed" and terminal_error is not None:
-        record.error = terminal_error
-      elif record.error is None:
-        record.error = terminal_error or f"Process exited with code {record.exit_code}"
+      if record.error is None:
+        record.error = (
+          terminal_error or f"Process exited with code {record.exit_code}"
+        )
+    else:
+      record.state, record.error, record.terminal_reason = settlement
     return prior != (record.state, record.error, record.terminal_reason)
 
   def _coerce_manifest_str(self, manifest: dict[str, Any], field_name: str) -> str | None:
@@ -1707,58 +1742,28 @@ class AutonomousRegistryStateMixin:
         error = None
         terminal_reason = None
     elif raw_manifest_state in {"completed", "failed"}:
-      if terminal_outcome == "budget_limited":
-        raw_state = "budget_limited"
-        error = None
-        terminal_reason = None
-      elif terminal_outcome == "interrupted":
-        raw_state = "interrupted"
-        error = None
-        terminal_reason = None
-      elif terminal_outcome == "completed":
-        if exit_code == 0:
-          raw_state = "completed"
-          error = None
-          terminal_reason = event_terminal_reason
-        else:
-          raw_state = "failed"
-          error = f"Process exited with code {exit_code}"
-          terminal_reason = None
-      elif terminal_outcome == "failed":
-        raw_state = "failed"
-        error = terminal_error
-        terminal_reason = None
+      settlement = self._terminal_settlement(
+        terminal_outcome,
+        exit_code=exit_code,
+        terminal_error=terminal_error,
+        terminal_reason=event_terminal_reason,
+      )
+      if settlement is not None:
+        raw_state, error, terminal_reason = settlement
       elif has_budget_exceeded:
         raw_state = "budget_limited"
         error = None
         terminal_reason = None
     elif is_active_or_unknown:
       completed_at = self._last_event_timestamp(events) or rehydrate_time
-      if terminal_outcome == "budget_limited":
-        raw_state = "budget_limited"
-        error = None
-        terminal_reason = None
-      elif terminal_outcome == "interrupted":
-        raw_state = "interrupted"
-        error = None
-        terminal_reason = None
-      elif terminal_outcome == "completed":
-        if exit_code == 0:
-          raw_state = "completed"
-          error = None
-          terminal_reason = event_terminal_reason
-        else:
-          raw_state = "failed"
-          error = (
-            "completed stream without a committed process exit"
-            if exit_code is None
-            else f"Process exited with code {exit_code}"
-          )
-          terminal_reason = None
-      elif terminal_outcome == "failed":
-        raw_state = "failed"
-        error = terminal_error
-        terminal_reason = None
+      settlement = self._terminal_settlement(
+        terminal_outcome,
+        exit_code=exit_code,
+        terminal_error=terminal_error,
+        terminal_reason=event_terminal_reason,
+      )
+      if settlement is not None:
+        raw_state, error, terminal_reason = settlement
       else:
         raw_state = "interrupted"
         was_interrupted = True

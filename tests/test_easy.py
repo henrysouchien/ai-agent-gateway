@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway_test_support.host_policy import owner_session_host_policy
+from gateway_test_support.model_defaults import SESSION_DRIVER, capability_default
 from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -31,9 +32,6 @@ from agent_gateway.commercial_work_authorization import VerifiedWorkAuthorizatio
 from agent_gateway.commercial_work_start import CommercialWorkStartContext
 from agent_gateway.commercial_authority_cache import CommercialAuthorityStateCache
 from agent_gateway.commercial_authority_subscriber import CommercialAuthoritySubscriber
-from agent_gateway.model_registry import (
-  INITIAL_MODEL_REGISTRY,
-)
 from agent_gateway.providers import AnthropicProvider, CodexProvider, OpenAIProvider, XAIProvider
 from agent_gateway.skills import SkillStateStore
 from agent_gateway.server import ChatRequest, ChatTurnInputs
@@ -43,10 +41,8 @@ from agent_gateway.work_authorization_consumption import (
   WorkAuthorizationConsumptionRecord,
 )
 
-DEFAULT_MODEL_KEY = "anthropic.claude-opus-5"
-DEFAULT_ANTHROPIC_MODEL = INITIAL_MODEL_REGISTRY.require(
-  DEFAULT_MODEL_KEY
-).upstream_model
+DEFAULT_MODEL_KEY = SESSION_DRIVER.model_key
+DEFAULT_UPSTREAM_MODEL = SESSION_DRIVER.upstream_model
 
 
 class _EmptyOperationCatalog:
@@ -546,7 +542,7 @@ def test_create_agent_exposes_default_routes_and_open_defaults() -> None:
   assert "model" not in auth_config
   assert "effort" not in auth_config
   assert config.cors_origins == ["*"]
-  assert _capability_models(app) == {DEFAULT_ANTHROPIC_MODEL}
+  assert _capability_models(app) == {DEFAULT_UPSTREAM_MODEL}
   assert config.tenant_id == "agent-gateway.easy"
   assert config.allow_service_credentials_for_interactive is True
   assert config.model_selection_policy is not None
@@ -596,7 +592,7 @@ def test_create_agent_with_credentials_resolver_skips_env_bootstrap(monkeypatch:
           "provider": "anthropic",
           "billing_mode": "byok",
           "api_key": "resolver-key",
-          "model": DEFAULT_ANTHROPIC_MODEL,
+          "model": DEFAULT_UPSTREAM_MODEL,
           "max_tokens": 16000,
         }
       ),
@@ -1309,7 +1305,7 @@ Research deeply.
 
   app = create_agent(
     "test",
-    model_key="anthropic.claude-opus-5",
+    model_key="anthropic.claude-opus-5-5",
     api_key="test-key",
     skills_dir=skills_dir,
     session_log_base_dir=tmp_path / "session-logs",
@@ -1370,7 +1366,7 @@ Research deeply.
   assert result == {"response": "ok"}
   assert captured["task"] == "Collect"
   execution = captured["capability_execution"]
-  assert execution.bind.upstream_model == "claude-opus-5"  # type: ignore[union-attr]
+  assert execution.bind.upstream_model == capability_default("node.explore").upstream_model  # type: ignore[union-attr]
 
 
 def test_create_agent_rejects_request_model_outside_driver_policy(

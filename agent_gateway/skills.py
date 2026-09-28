@@ -483,7 +483,6 @@ class SkillProfile:
   version: str | None = None
   model: str | None = None
   max_turns: int | None = None
-  timeout: float | None = None
   tool_packs: list[str] | None = None
   persist_state: bool = False
   scope: str | None = None
@@ -795,7 +794,6 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
   raw_model = frontmatter.pop("model", None)
   raw_provider = frontmatter.pop("provider", None)
   raw_max_turns = frontmatter.pop("max_turns", None)
-  raw_timeout = frontmatter.pop("timeout", None)
   raw_tool_packs = frontmatter.pop("tool_packs", None)
   raw_persist_state = frontmatter.pop("persist_state", None)
   raw_scope = frontmatter.pop("scope", None)
@@ -955,7 +953,6 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
     version=_clean_string(raw_version),
     model=_clean_string(raw_model),
     max_turns=_coerce_optional_int(raw_max_turns, field_name="max_turns", path=path),
-    timeout=_coerce_optional_float(raw_timeout, field_name="timeout", path=path),
     tool_packs=_coerce_optional_string_list(raw_tool_packs, field_name="tool_packs", path=path),
     persist_state=_coerce_optional_bool(raw_persist_state, field_name="persist_state", path=path),
     scope=_coerce_optional_scope(raw_scope, field_name="scope", path=path),

@@ -1356,7 +1356,7 @@ def test_web_agent_run_schedule_rejects_task_mode_dispatch(fake_schedule_backend
     assert fake_schedule_backends["calls"]["jobs_create"] == []
 
 
-def test_operator_raw_schedule_routes_are_not_shadowed_by_owned_agent_schedule(fake_schedule_backends) -> None:
+def test_owned_schedule_takes_precedence_over_operator_name_collision(fake_schedule_backends) -> None:
   fake_schedule_backends["launchd"]["daily-close"] = {
     "command": ["/usr/bin/python3", "task.py"],
     "working_directory": "/tmp",
@@ -1381,27 +1381,25 @@ def test_operator_raw_schedule_routes_are_not_shadowed_by_owned_agent_schedule(f
 
     detail = client.get("/api/control/schedules/daily-close", headers=headers)
     assert detail.status_code == 200, detail.text
-    assert detail.json()["source"] == "launchd"
+    assert detail.json()["schedule_id"] == safe_schedule_id
 
     disabled = client.put("/api/control/schedules/daily-close/enabled", headers=headers, json={"enabled": False})
     assert disabled.status_code == 200, disabled.text
-    assert disabled.json()["schedule"]["source"] == "launchd"
-    assert fake_schedule_backends["calls"]["launchd_disable"] == ["daily-close"]
+    assert disabled.json()["schedule"]["source"] == "agent-gateway"
 
     safe_detail = client.get(f"/api/control/schedules/{safe_schedule_id}", headers=headers)
     assert safe_detail.status_code == 200, safe_detail.text
     assert safe_detail.json()["source"] == "agent-gateway"
-    assert safe_detail.json()["enabled"] is True
+    assert safe_detail.json()["enabled"] is False
 
     deleted = client.delete("/api/control/schedules/daily-close?confirm=true", headers=headers)
     assert deleted.status_code == 200, deleted.text
-    assert deleted.json() == {"deleted": True, "name": "daily-close", "source": "launchd"}
-    assert fake_schedule_backends["calls"]["launchd_delete"] == [{"name": "daily-close", "confirm": True}]
+    assert deleted.json() == {"deleted": True, "name": "daily-close", "source": "agent-gateway"}
 
     fallback_detail = client.get("/api/control/schedules/daily-close", headers=headers)
     assert fallback_detail.status_code == 200, fallback_detail.text
-    assert fallback_detail.json()["source"] == "agent-gateway"
-    assert fallback_detail.json()["schedule_id"] == safe_schedule_id
+    assert fallback_detail.json()["source"] == "launchd"
+    assert fallback_detail.json()["enabled"] is True
 
 
 def test_agent_run_schedule_read_rows_project_without_raw_backend_fields() -> None:
@@ -1857,3 +1855,34 @@ def test_jobs_service_unavailable_is_not_an_empty_list_or_missing_schedule(fake_
     })
     assert listing.status_code == detail.status_code == created.status_code == 503
     assert listing.json()["detail"] == "jobs-mcp unavailable"
+
+
+def test_owner_agent_schedule_crud_survives_jobs_outage(fake_schedule_backends) -> None:
+  async def unavailable(*args, **kwargs):
+    return {"status": "error", "code": "service_unavailable", "error": "jobs-mcp unavailable"}
+
+  backend = fake_schedule_backends["backend"]
+  backend.scheduler.schedule_show = unavailable
+  app = _make_app(backend)
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client, "alice", role="owner"))
+    created = client.post(
+      "/api/control/schedules", headers=headers, json=_agent_run_schedule_payload(),
+    )
+    assert created.status_code == 201, created.text
+    schedule = created.json()["schedule"]
+    detail = client.get(f"/api/control/schedules/{schedule['schedule_id']}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["source"] == "agent-gateway"
+    disabled = client.put(
+      f"/api/control/schedules/{schedule['name']}/enabled",
+      headers=headers, json={"enabled": False},
+    )
+    assert disabled.status_code == 200, disabled.text
+    assert disabled.json()["schedule"]["enabled"] is False
+    deleted = client.delete(
+      f"/api/control/schedules/{schedule['schedule_id']}?confirm=true", headers=headers,
+    )
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["deleted"] is True
+    assert schedules_module.schedule_store_for("alice").get_for_owner("alice", schedule["schedule_id"]) is None

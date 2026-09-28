@@ -2,6 +2,9 @@
 
 Owns per-user sessions and catalog publication; mcp_client_config owns reconnect
 classification. Reconnecting must never authorize unsafe tool-call replay.
+Every connection's transport contexts are entered and exited by one host task
+that mcp_client_connections owns, never by a caller's: exiting them from
+anywhere else cancels the task that entered them.
 See packages/agent-gateway/docs/architecture.md.
 """
 
@@ -21,7 +24,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import AbstractSet, Any, Callable, cast, Dict, List, Mapping, Sequence, Set, Tuple, TypedDict
+from typing import AbstractSet, Any, Callable, cast, Coroutine, Dict, List, Mapping, Sequence, Set, Tuple, TypedDict
 
 import httpx
 import httpx2
@@ -102,7 +105,7 @@ PER_USER_EXPIRY_MARGIN_SECONDS = 5 * 60
 PER_USER_IDLE_REAP_SECONDS = 30 * 60
 PER_USER_REAPER_INTERVAL_SECONDS = 60.0
 PER_USER_INSTANCE_CAP = 32
-PER_USER_DRAIN_TIMEOUT_SECONDS = 60.0
+PER_USER_DRAIN_POLL_SECONDS = 0.05
 
 
 class _McpCallKwargs(TypedDict, total=False):
@@ -195,6 +198,21 @@ def _classify_exception(exc: Exception, msg: str) -> str:
 
 def _classify_mcp_error(message: str) -> str:
   return _error_helpers.classify_mcp_error(message)
+
+
+def _tool_error_from_exception(exc: Exception) -> dict[str, str]:
+  """Project a failed MCP call's exception; the message always names its class.
+
+  Transport exceptions such as anyio's ClosedResourceError stringify empty, so
+  ``str(exc)`` alone leaves the caller no why-not.
+  """
+  detail = str(exc)
+  return {
+    "code": "tool_error",
+    "sub_code": _classify_exception(exc, detail),
+    "message": ": ".join(filter(None, (type(exc).__name__, detail))),
+  }
+
 
 
 def _is_sheets_transport_failure(exc: BaseException) -> bool:
@@ -346,6 +364,66 @@ class _ConnectedServerState(_ServerState):
   session: _connection_helpers.McpClientSession
 
 
+def _consume_future_exception(future: "asyncio.Future[Any]") -> None:
+  """Mark a spawn result retrieved so an abandoned spawn logs no stray warning."""
+  if not future.cancelled():
+    future.exception()
+
+
+class _PerUserChildHost:
+  """One task owns a per-user child's lifecycle, from its startup to its close.
+
+  The transport contexts themselves are entered and exited by the connection
+  layer's own host task (`mcp_client_connections._TransportHost`). This host
+  carries what is per-user: the caller's hand-off (`ready`), the retirement
+  request, and a task that outlives an abandoned startup, which holds the
+  child's instance-cap slot until the child is let go.
+  """
+
+  def __init__(self, server_name: str, user_id: str) -> None:
+    self.server_name = server_name
+    self.user_id = user_id
+    self.task: asyncio.Task[None] | None = None
+    self.ready: asyncio.Future[_ConnectedServerState] = (
+      asyncio.get_running_loop().create_future()
+    )
+    self.ready.add_done_callback(_consume_future_exception)
+    self.close_requested = asyncio.Event()
+    self.closed = asyncio.Event()
+
+  def start(self, coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+    task = asyncio.ensure_future(coro)
+    task.add_done_callback(self._settle)
+    self.task = task
+    return task
+
+  def _settle(self, _task: asyncio.Task[None]) -> None:
+    """However the host task ends, everyone waiting on this child ends with it."""
+    if not self.ready.done():
+      self.ready.cancel()
+    self.closed.set()
+
+  def request_close(self) -> None:
+    """Ask for this child to be retired.
+
+    Never a cancellation of the host task, and never a deadline over it:
+    cancelling a host mid-teardown interrupts the very cleanup that reaps the
+    child, and one cancelled before its coroutine runs leaves its waiters
+    unsettled. A startup still in flight runs to its own end and the close is
+    waiting for it there. The connection layer's startup timeouts are per
+    request, so they do not bound a server that pages its tool catalog without
+    end; that loop carries its own page ceiling in
+    `mcp_client_connections.initialize_session_state`, which is where the bound
+    belongs — not here, where a deadline would surround the startup's own
+    teardown.
+    """
+    self.close_requested.set()
+
+  async def close(self) -> None:
+    self.request_close()
+    await self.closed.wait()
+
+
 @dataclass
 class _PerUserServerState:
   server: _ServerState
@@ -354,6 +432,7 @@ class _PerUserServerState:
   active_calls: int = 0
   draining: bool = False
   binding_fingerprint: bytes | None = None
+  host: _PerUserChildHost | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -569,6 +648,7 @@ class McpClientManager:
     self._per_user_spawn_locks: Dict[tuple[str, str], asyncio.Lock] = {}
     self._per_user_spawn_reservations: Dict[str, int] = {}
     self._per_user_reaper_task: asyncio.Task[Any] | None = None
+    self._per_user_hosts: Set[_PerUserChildHost] = set()
     self._drain_tasks: Set[asyncio.Task[Any]] = set()
     self._tool_definitions: List[Dict[str, Any]] = []
     self._tool_to_server: Dict[str, str] = {}
@@ -1936,25 +2016,104 @@ class McpClientManager:
     config["env"] = env
     # The tier-1 credential is read only by this gateway process and is never
     # copied into the child config/environment.
-    state = await self._connect_stdio_with_retries(f"{server_name}[user]", config)
+    host = _PerUserChildHost(server_name, subject.user_id)
+    task = host.start(self._host_per_user_child(host, config))
+    self._per_user_hosts.add(host)
+    task.add_done_callback(lambda _task: self._per_user_hosts.discard(host))
+    try:
+      state = await asyncio.shield(host.ready)
+    except BaseException:
+      # The child belongs to its host from the moment the host task starts,
+      # so an abandoned spawn is closed by the host and not by this caller.
+      host.request_close()
+      self._hold_spawn_slot_until_closed(host)
+      raise
     return _PerUserServerState(
       state,
       expires_at,
       time.time(),
       binding_fingerprint=binding_fingerprint,
+      host=host,
     )
 
-  async def _close_per_user_when_drained(self, state: _PerUserServerState) -> None:
-    deadline = time.monotonic() + PER_USER_DRAIN_TIMEOUT_SECONDS
-    while state.active_calls and time.monotonic() < deadline:
-      await asyncio.sleep(0.05)
-    await self._close_contexts(state.server.exit_contexts)
+  def _hold_spawn_slot_until_closed(self, host: _PerUserChildHost) -> None:
+    """Keep an abandoned child's instance-cap slot until its host lets it go.
 
-  def _schedule_drain(self, state: _PerUserServerState) -> None:
+    The caller that asked for the child releases its own reservation as it
+    unwinds, but the child outlives it by however long its startup takes to
+    notice. A slot that is free while the process is still running is a slot
+    the cap can hand out twice.
+    """
+    task = host.task
+    assert task is not None
+    if task.done():
+      # The startup failed rather than being abandoned; there is no child.
+      return
+    server_name = host.server_name
+    self._per_user_spawn_reservations[server_name] = (
+      self._per_user_spawn_reservations.get(server_name, 0) + 1
+    )
+
+    def _release(_task: "asyncio.Task[None]") -> None:
+      remaining = self._per_user_spawn_reservations.get(server_name, 0) - 1
+      if remaining > 0:
+        self._per_user_spawn_reservations[server_name] = remaining
+      else:
+        self._per_user_spawn_reservations.pop(server_name, None)
+
+    task.add_done_callback(_release)
+
+  async def _host_per_user_child(
+    self,
+    host: _PerUserChildHost,
+    config: Dict[str, Any],
+  ) -> None:
+    try:
+      state = await self._connect_stdio_with_retries(f"{host.server_name}[user]", config)
+    except BaseException as exc:
+      if not host.ready.done():
+        host.ready.set_exception(exc)
+      return
+    if host.close_requested.is_set() or host.ready.done():
+      # Retired, or abandoned, before it was ever published. A child whose
+      # close has been asked for is never handed to a caller.
+      host.close_requested.set()
+      if not host.ready.done():
+        host.ready.cancel()
+    else:
+      host.ready.set_result(state)
+    try:
+      await host.close_requested.wait()
+    finally:
+      await self._close_contexts(state.exit_contexts)
+
+  async def _close_per_user_when_drained(
+    self,
+    state: _PerUserServerState,
+    reason: str,
+  ) -> None:
+    # The state is already out of `_per_user_servers`, so no further caller can
+    # obtain it and `active_calls` falls to zero on its own. There is no deadline:
+    # a tool call carries its own timeout, and closing under one strands it.
+    started = time.monotonic()
+    while state.active_calls:
+      await asyncio.sleep(PER_USER_DRAIN_POLL_SECONDS)
+    host = state.host
+    assert host is not None
+    log.info(
+      "per-user MCP child %s closed | user=%s site=%s drained_in=%.2fs",
+      host.server_name,
+      host.user_id,
+      reason,
+      time.monotonic() - started,
+    )
+    await host.close()
+
+  def _schedule_drain(self, state: _PerUserServerState, reason: str) -> None:
     if state.draining:
       return
     state.draining = True
-    task = asyncio.create_task(self._close_per_user_when_drained(state))
+    task = asyncio.create_task(self._close_per_user_when_drained(state, reason))
     self._drain_tasks.add(task)
     task.add_done_callback(self._drain_tasks.discard)
 
@@ -1973,7 +2132,7 @@ class McpClientManager:
     for key, state in list(self._per_user_servers.items()):
       if state.active_calls == 0 and now - state.last_used_at > PER_USER_IDLE_REAP_SECONDS:
         if self._per_user_servers.pop(key, None) is state:
-          self._schedule_drain(state)
+          self._schedule_drain(state, "idle_reap")
           self._retire_per_user_spawn_lock(key)
 
   async def _run_per_user_reaper(self) -> None:
@@ -1998,7 +2157,6 @@ class McpClientManager:
     try:
       async with lock:
         now = time.time()
-        self._reap_idle_per_user_servers(now)
         definition = self._servers.get(server_name)
         if definition is None or not definition.config:
           raise _PerUserMcpError(
@@ -2012,16 +2170,21 @@ class McpClientManager:
         )
         binding_fingerprint = projected_env[1] if projected_env is not None else None
         current = self._per_user_servers.get(key)
-        if (
-          current is not None
-          and not current.draining
-          and bool(current.server.exit_contexts)
-          and not force
-          and current.expires_at - now > PER_USER_EXPIRY_MARGIN_SECONDS
-          and current.binding_fingerprint == binding_fingerprint
-        ):
-          current.last_used_at = now
-          return current
+        replacement_reason = "first_spawn"
+        if current is not None:
+          if current.draining:
+            replacement_reason = "already_draining"
+          elif not current.server.exit_contexts:
+            replacement_reason = "dead_transport"
+          elif force:
+            replacement_reason = "forced_refresh"
+          elif current.expires_at - now <= PER_USER_EXPIRY_MARGIN_SECONDS:
+            replacement_reason = "near_expiry"
+          elif current.binding_fingerprint != binding_fingerprint:
+            replacement_reason = "binding_changed"
+          else:
+            current.last_used_at = now
+            return current
 
         # Mint before changing capacity accounting or evicting a healthy child.
         # A forced broker-expiry replacement is the exception: the current
@@ -2034,7 +2197,7 @@ class McpClientManager:
             if force and discard_current_on_failure:
               expired = self._per_user_servers.pop(key, None)
               if expired is not None:
-                self._schedule_drain(expired)
+                self._schedule_drain(expired, "broker_mint_failed")
             raise
         current = self._per_user_servers.get(key)
         old_state = None
@@ -2068,7 +2231,7 @@ class McpClientManager:
               )
             _, evict_key, evicted = min(idle)
             self._per_user_servers.pop(evict_key, None)
-            self._schedule_drain(evicted)
+            self._schedule_drain(evicted, "instance_cap_eviction")
             self._retire_per_user_spawn_lock(evict_key)
         self._per_user_spawn_reservations[server_name] = (
           self._per_user_spawn_reservations.get(server_name, 0) + 1
@@ -2091,7 +2254,7 @@ class McpClientManager:
           ):
             self._per_user_servers[key] = old_state
           elif old_state is not None:
-            self._schedule_drain(old_state)
+            self._schedule_drain(old_state, "replacement_spawn_failed")
           raise
         else:
           self._per_user_servers[key] = replacement
@@ -2103,7 +2266,7 @@ class McpClientManager:
             self._per_user_spawn_reservations.pop(server_name, None)
         self._ensure_per_user_reaper()
         if old_state is not None and old_state is not replacement:
-          self._schedule_drain(old_state)
+          self._schedule_drain(old_state, replacement_reason)
         return replacement
     finally:
       self._retire_per_user_spawn_lock(key)
@@ -2398,7 +2561,7 @@ class McpClientManager:
         if self._per_user_servers.get(key) is per_user_state:
           self._per_user_servers.pop(key, None)
           self._retire_per_user_spawn_lock(key)
-        self._schedule_drain(per_user_state)
+        self._schedule_drain(per_user_state, "dispatch_transport_failure")
         if is_sheets:
           transport_failure = _is_sheets_transport_failure(exc)
           payload = _gateway_sheets_error_payload(
@@ -2429,12 +2592,7 @@ class McpClientManager:
             ),
           )
           return None, _sheets_gateway_error(payload)
-        msg = str(exc)
-        return None, {
-          "code": "tool_error",
-          "sub_code": _classify_exception(exc, msg),
-          "message": msg,
-        }
+        return None, _tool_error_from_exception(exc)
       if is_sheets:
         transport_failure = _is_sheets_transport_failure(exc)
         if transport_failure:
@@ -2479,12 +2637,7 @@ class McpClientManager:
           original_name=original_name,
           cause=exc,
         )
-        msg = str(exc)
-        return None, {
-          "code": "tool_error",
-          "sub_code": _classify_exception(exc, msg),
-          "message": msg,
-        }
+        return None, _tool_error_from_exception(exc)
       try:
         retry_result = await self._retry_stdio_tool_call_after_reconnect(
           server_name=transport_server_name,
@@ -2497,21 +2650,11 @@ class McpClientManager:
           cause=exc,
         )
       except Exception as retry_exc:
-        msg = str(retry_exc)
-        return None, {
-          "code": "tool_error",
-          "sub_code": _classify_exception(retry_exc, msg),
-          "message": msg,
-        }
+        return None, _tool_error_from_exception(retry_exc)
       if retry_result is not None:
         result = retry_result
       else:
-        msg = str(exc)
-        return None, {
-          "code": "tool_error",
-          "sub_code": _classify_exception(exc, msg),
-          "message": msg,
-        }
+        return None, _tool_error_from_exception(exc)
     except asyncio.CancelledError:
       raise
     finally:
@@ -2559,7 +2702,7 @@ class McpClientManager:
           if self._per_user_servers.get(key) is replacement:
             self._per_user_servers.pop(key, None)
             self._retire_per_user_spawn_lock(key)
-          self._schedule_drain(replacement)
+          self._schedule_drain(replacement, "sheets_replay_transport_failure")
           payload = _gateway_sheets_error_payload(
             original_name,
             code="sheets_transport_error",
@@ -2590,7 +2733,7 @@ class McpClientManager:
           if self._per_user_servers.get(key) is replacement:
             self._per_user_servers.pop(key, None)
             self._retire_per_user_spawn_lock(key)
-          self._schedule_drain(replacement)
+          self._schedule_drain(replacement, "broker_session_expired")
 
     if is_sheets and sheets_error is not None:
       return None, _sheets_gateway_error(sheets_error)
@@ -2882,13 +3025,21 @@ class McpClientManager:
       for server in reversed(list(self._servers.values())):
         await self._close_server(server)
 
-      for state in list(self._per_user_servers.values()):
-        await self._close_contexts(state.server.exit_contexts)
+      for task in list(self._drain_tasks):
+        task.cancel()
       if self._drain_tasks:
         await asyncio.gather(*list(self._drain_tasks), return_exceptions=True)
+      for host in list(self._per_user_hosts):
+        log.info(
+          "per-user MCP child %s closed | user=%s site=manager_shutdown",
+          host.server_name,
+          host.user_id,
+        )
+        await host.close()
 
       self._servers.clear()
       self._per_user_servers.clear()
+      self._per_user_hosts.clear()
       self._per_user_spawn_locks.clear()
       self._per_user_spawn_reservations.clear()
       self._tool_definitions = []

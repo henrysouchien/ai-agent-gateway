@@ -11,7 +11,6 @@ from typing import (
   List,
 )
 
-from .auth import ProviderCredentialFailure
 from .capability_execution import BoundCapabilityExecution
 from .multi_user.billing import (
   BillingMode,
@@ -20,10 +19,7 @@ from .multi_user.billing import (
   UsageState,
   UsageTotals as _UsageTotals,
 )
-from .runner_auth import (
-  call_credential_refresher as _call_credential_refresher,
-  merge_refreshed_auth_config as _merge_refreshed_auth_config,
-)
+from .runner_auth import merge_refreshed_auth_config as _merge_refreshed_auth_config
 from .secret_boundary import SecretBoundary
 from .runner_callbacks import (
   call_before_stream_complete_hook as _call_before_stream_complete_hook,
@@ -65,15 +61,6 @@ class RunnerHooksLifecycleMixin:
     _on_before_stream_complete: (
       Callable[..., Awaitable[None] | None] | None
     )
-    _on_credential_failure: (
-      Callable[
-        [ProviderCredentialFailure],
-        Awaitable[Dict[str, Any] | None]
-        | Dict[str, Any]
-        | None,
-      ]
-      | None
-    )
     _on_late_usage_event: (
       Callable[[UsageEvent], Awaitable[None] | None] | None
     )
@@ -84,7 +71,7 @@ class RunnerHooksLifecycleMixin:
     _on_tool_result: (
       Callable[
         [ToolResultContext],
-        Awaitable[List[Dict[str, Any]] | None],
+        Awaitable[List[Dict[str, Any]] | None] | List[Dict[str, Any]] | None,
       ]
       | None
     )
@@ -156,15 +143,6 @@ class RunnerHooksLifecycleMixin:
       self._on_metric,
       name=name,
       value=value,
-      log_session_id=self._sid,
-      logger=log,
-    )
-
-  async def _call_credential_refresher(self, failure: ProviderCredentialFailure) -> Dict[str, Any] | None:
-    return await _runner_attr(self, "_call_credential_refresher", _call_credential_refresher)(
-      self._on_credential_failure,
-      failure,
-      emit_metric=self._call_metric,
       log_session_id=self._sid,
       logger=log,
     )

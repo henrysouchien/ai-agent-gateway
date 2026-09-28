@@ -70,17 +70,17 @@ Response body:
       "catalog_revision": "registry-r7",
       "policy_revision": "policy-r4",
       "selected": {
-        "model_key": "anthropic.claude-opus-5",
-        "label": "Opus 5",
+        "model_key": "anthropic.claude-opus-5-5",
+        "label": "Opus 5.5",
         "effort": "high",
         "reason": "platform_default"
       },
       "notices": [],
       "choices": [
         {
-          "model_key": "anthropic.claude-opus-5",
-          "label": "Opus 5",
-          "supported_efforts": ["none", "low", "medium", "high"],
+          "model_key": "anthropic.claude-opus-5-5",
+          "label": "Opus 5.5",
+          "supported_efforts": ["none", "low", "medium", "high", "xhigh", "max"],
           "default_effort": "high",
           "lifecycle": "active"
         }
@@ -97,7 +97,7 @@ Schema:
 | `user_id` | string | Resolved end-user identity. When the request body `user_id` is set, this echoes it. When a credentials resolver derives identity from the API key, this is the resolver's resolved value. Clients should thread this value onto subsequent `POST /api/chat` calls so the gateway can enforce strict-mode identity checks. Added in 0.15.0. |
 | `session_token` | string | JWT bearer token for later requests |
 | `session_id` | string | Server-generated session id |
-| `expires_at` | integer | Unix timestamp |
+| `expires_at` | integer | Unix timestamp. The session's TTL; a turn still in progress keeps the session live past it (see Session Lifecycle) |
 | `schema_version` | integer | Negotiated wire schema version for this session. Every `/chat` and `/chat/subscribe` SSE envelope echoes this value. |
 | `capability_choices` | object | Required authenticated, session-executable choices keyed by capability id. Each entry includes exact registry/policy revisions, the selected stable key or `null`, notices, and eligible stable-key choices. Clients must not synthesize catalogs, aliases, or defaults. |
 
@@ -156,6 +156,7 @@ Schema:
 Notes:
 
 - One active stream is allowed per session. A second concurrent `POST /api/chat` returns HTTP `409`.
+- A turn starts only while the session's TTL has not elapsed. A `POST /api/chat` on a session past `expires_at` returns HTTP `401` `Session expired`, including one whose token was accepted while the previous turn was still running and that finds the turn over by the time it would start (see Session Lifecycle).
 - Stream envelopes have the shape `{seq, session_id, schema_version, event}`. For schema v1, the server projects each event through the v1 adapter, strips fields added after the v1 freeze, and skips event types not in the v1 wire contract while preserving cursor sequence gaps.
 - The server resolves only eligible stable keys from its exact model registry and
   selection policy. Raw upstream model names are rejected.
@@ -216,7 +217,7 @@ policy permits saved preferences. The bearer token must name a chat session.
 
 ```json
 {
-  "model_key": "anthropic.claude-opus-5",
+  "model_key": "anthropic.claude-opus-5-5",
   "effort": "high",
   "catalog_revision": "registry-r7"
 }
@@ -227,7 +228,7 @@ The response is the stored receipt:
 ```json
 {
   "capability": "session.driver",
-  "model_key": "anthropic.claude-opus-5",
+  "model_key": "anthropic.claude-opus-5-5",
   "effort": "high"
 }
 ```
@@ -786,16 +787,32 @@ Schema:
 
 #### `heartbeat`
 
-Keep-alive event emitted every 15 seconds while the stream is open.
+Liveness event appended every 60 seconds while a model turn streams. It reports
+how long the turn has run and how recently it made progress, so a client can show
+that a long turn is still working. Clients may render it (for example
+`working · 3m12s · last progress 4s ago`) and must not treat it as content or as
+a terminal event.
+
+Fields:
+
+- `elapsed_s`: integer seconds since the turn started
+- `last_progress_s`: integer seconds since the last progress event
+- `events`: integer count of progress events so far
 
 Schema:
 
 ```json
 {
   "type": "heartbeat",
+  "elapsed_s": 192,
+  "last_progress_s": 4,
+  "events": 37,
   "timestamp": 1770000000
 }
 ```
+
+Transport keepalive is separate: an idle stream receives the SSE comment
+`:keepalive` every 15 seconds. It is not a data event and carries no payload.
 
 #### `interrupted`
 
@@ -1203,7 +1220,11 @@ Typical flow:
 5. Call `POST /api/chat/tool-approval`
 6. Continue consuming SSE events until `stream_complete` or `error`
 
-The same session can be reused for multiple turns until `expires_at`.
+The same session can be reused for multiple turns until `expires_at`. The TTL bounds
+the session between turns, not a turn in progress: a turn accepted before
+`expires_at` keeps its session, and the token its tool calls authenticate with,
+live until the turn publishes its terminal event (`stream_complete` or `error`).
+After that the TTL applies, so an expired session cannot start another turn.
 
 ## Tool Approval Flow
 
@@ -1223,6 +1244,6 @@ When the configured policy permits it, the same approval can also mint a durable
 - Treat `stream_complete`, `error`, and `stream_error` as terminal events.
 - On `stream_complete`, use `terminal_disposition` to distinguish success from interruption; both close the transport.
 - Do not treat lifecycle and background-task events such as `turn_complete`, `interrupted`, `task_registered`, or `task_completed` as terminal.
-- Ignore `heartbeat` for rendering; it exists to keep the connection warm.
+- `heartbeat` is liveness, not content: render it as a progress indicator or ignore it, but never append it to the assistant message.
 - Do not assume every stream has `thinking_delta`, `tool_output_chunk`, or `tool_approval_request`.
 - Preserve `tool_call_id` and `nonce` exactly when you answer approval requests.

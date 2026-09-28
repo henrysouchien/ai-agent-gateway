@@ -48,6 +48,7 @@ from agent_gateway.runner_background_tasks import (  # noqa: E402
   _BACKGROUND_RESULT_ACK_RESULT_KEY,
 )
 from agent_gateway.runner_run_loop import (  # noqa: E402
+  MAX_TURNS_SYNTHESIS_REMINDER,
   _background_success_snapshot,
   RunnerRunLoopMixin,
 )
@@ -1216,7 +1217,6 @@ def test_runner_run_loop_method_is_inherited_from_mixin() -> None:
 def test_runner_still_reexports_run_loop_constants() -> None:
   assert gateway_runner._MAX_NOTIFICATIONS_PER_TURN == 5
   assert gateway_runner._MAX_TOKENS_CONTINUATIONS == 3
-  assert "tool-first response" in gateway_runner._MAX_TOKENS_NUDGE
 
 
 def test_native_context_surface_failure_log_is_value_free(caplog) -> None:
@@ -3217,7 +3217,9 @@ def test_unread_handle_reminder_suppressed_after_content_read() -> None:
     entry = runner._task_registry.register("background_agent")
     runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
     envelope, _text = _unread_handle_fixture()
-    content_id = envelope.parent_materialization.source.content_id
+    materialization = envelope.parent_materialization
+    assert materialization is not None
+    content_id = materialization.source.content_id
 
     stream_calls = 0
     seen_messages: list[str] = []
@@ -5957,7 +5959,9 @@ def test_failed_terminal_settlement_returns_learning_receipt_to_pending(
 
     async def before_terminal(_log: Any, event: dict[str, Any]) -> None:
       if event["type"] == "stream_complete":
-        runner._terminal_success_staged_events.append({
+        staged_events = runner._terminal_success_staged_events
+        assert staged_events is not None
+        staged_events.append({
           "type": "terminal_receipt", "receipt_id": "receipt-1", "outcome": "success",
         })
 
@@ -6045,6 +6049,7 @@ def test_failed_success_append_retains_staging_until_error_closure_commits(
 
     async def before_terminal(_log: Any, _event: dict[str, Any]) -> None:
       nonlocal staged
+      assert runner._terminal_success_staged_events is not None
       staged = runner._terminal_success_staged_events
       staged.append({"type": "terminal_receipt", "receipt_id": "kept", "outcome": "success"})
 
@@ -6676,5 +6681,112 @@ def test_the_exhaustion_synthesis_credit_is_still_capped_at_one() -> None:
       entry.event.get("type") == "max_turns_reached"
       for entry in runner._log.entries
     )
+
+  asyncio.run(case())
+
+
+def test_the_exhaustion_synthesis_turn_is_asked_for_the_answer_and_counted_as_run() -> None:
+  # m1-eval-research-build-journey-errors, 2026-09-23: the PCTY work-up parent
+  # spent its ceiling synthesis turn launching more work (it was never told the
+  # budget was spent), so the stop replaced the work-up with the canned line,
+  # and max_turns_reached reported 42/40 by counting the aborted iteration.
+  async def case() -> None:
+    runner = _make_credential_runner()
+    system_prompts: list[str] = []
+
+    async def stream_turn(**kwargs: Any):
+      system_prompts.append(str(kwargs.get("system_prompt")))
+      return object(), StreamTurnResult(
+        full_text="",
+        stop_reason="pause_turn",
+        content_blocks=[{"type": "text", "text": "still working"}],
+      )
+
+    runner._stream_turn = stream_turn
+    await runner.run(
+      messages=[{"role": "user", "content": "work"}],
+      max_turns=1,
+    )
+
+    assert len(system_prompts) == 2
+    assert MAX_TURNS_SYNTHESIS_REMINDER not in system_prompts[0]
+    assert MAX_TURNS_SYNTHESIS_REMINDER in system_prompts[1]
+    reached = [
+      entry.event
+      for entry in runner._log.entries
+      if entry.event.get("type") == "max_turns_reached"
+    ]
+    assert [(event["turn_count"], event["max_turns"]) for event in reached] == [
+      (len(system_prompts), 1)
+    ]
+
+  asyncio.run(case())
+
+def test_repeated_excluded_tool_still_ends_the_turn_with_an_answer() -> None:
+  # R8-05, 2026-09-17: a macro turn with ~40 tool results called an excluded
+  # tool twice and the analyst received nothing — the run loop mapped the
+  # excluded-tool guard to terminal_outcome_unproven, so the resolution the
+  # tool error carries ("finish with the durable evidence already produced")
+  # could never be followed. An excluded call is a tool-level error.
+  async def case() -> None:
+    runner = _make_credential_runner()
+    runner._excluded_tools = {"memory_store"}
+    runner._get_tool_definitions = lambda: [
+      {
+        "name": "memory_store",
+        "description": "Store a finding",
+        "input_schema": {"type": "object"},
+      }
+    ]
+    prompts: list[Any] = []
+
+    async def stream_turn(**kwargs: Any):
+      prompts.append(kwargs["system_prompt"])
+      if len(prompts) == 1:
+        calls = [
+          ("call-1", "memory_store", {"entity": "BXMT"}),
+          ("call-2", "memory_store", {"entity": "STWD"}),
+        ]
+        return object(), StreamTurnResult(
+          stop_reason="tool_use",
+          content_blocks=[
+            {
+              "type": "tool_use",
+              "id": call_id,
+              "name": name,
+              "input": dict(payload),
+            }
+            for call_id, name, payload in calls
+          ],
+          tool_uses=list(calls),
+          advertised_tool_names=frozenset({"memory_store"}),
+        )
+      return object(), StreamTurnResult(
+        full_text="Macro read: curve steepened; book is rate-sensitive.",
+        stop_reason="end_turn",
+        content_blocks=[
+          {
+            "type": "text",
+            "text": "Macro read: curve steepened; book is rate-sensitive.",
+          }
+        ],
+        advertised_tool_names=frozenset({"memory_store"}),
+      )
+
+    runner._stream_turn = stream_turn
+    await runner.run(
+      messages=[{"role": "user", "content": "macro setup for my book?"}],
+      max_turns=None,
+    )
+
+    assert len(prompts) == 2
+    assert "memory_store" in str(prompts[1])
+    assert "final turn" in str(prompts[1])
+    events = [entry.event for entry in runner._log.entries]
+    assert not any(event.get("type") == "error" for event in events)
+    completion = next(
+      event for event in events if event.get("type") == "stream_complete"
+    )
+    assert completion["terminal_disposition"] == "completed"
 
   asyncio.run(case())

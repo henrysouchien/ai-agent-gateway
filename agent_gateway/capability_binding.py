@@ -49,6 +49,7 @@ CapabilityResolutionCode: TypeAlias = Literal[
   "capability_model_deprecated",
   "capability_model_disabled",
   "capability_model_revoked",
+  "capability_model_retired",
   "capability_effort_invalid",
   "capability_effort_unsupported",
   "capability_entitlement_required",
@@ -384,6 +385,16 @@ def _validate_entry_for_policy(
   policy: CapabilitySelectionPolicy,
   user_selected: bool = False,
 ) -> None:
+  # Retirement is a provider fact, not policy: an admitted policy can never
+  # allow a retired key, so checking allowance first would always mask it.
+  if entry.lifecycle == "retired":
+    _refuse(
+      "capability_model_retired",
+      f"{entry.key} is retired: the provider no longer serves "
+      f"{entry.upstream_model}; it is permanently unavailable",
+      capability_id=capability_id,
+      entry=entry,
+    )
   if entry.key not in policy.allowed_model_keys:
     _refuse(
       "capability_model_not_allowed",
@@ -758,6 +769,7 @@ _STALE_CATALOG_REFUSAL_CODES: frozenset[str] = frozenset({
   "capability_model_deprecated",
   "capability_model_disabled",
   "capability_model_revoked",
+  "capability_model_retired",
   "capability_effort_unsupported",
   "capability_entitlement_required",
   "credential_unavailable",
@@ -1067,6 +1079,14 @@ def reauthorize_capability_bind(
     _refuse(
       "capability_model_revoked",
       f"durable binding model {entry.key} is revoked",
+      capability_id=bind.capability_id,
+      entry=entry,
+    )
+  if entry.lifecycle == "retired":
+    _refuse(
+      "capability_model_retired",
+      f"durable binding model {entry.key} is retired: the provider no longer "
+      f"serves {entry.upstream_model}",
       capability_id=bind.capability_id,
       entry=entry,
     )

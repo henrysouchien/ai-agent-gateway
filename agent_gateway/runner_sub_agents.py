@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import (
   TYPE_CHECKING,
   Any,
@@ -34,6 +35,8 @@ from .runner_budget import (
   ChildCostAccumulator,
   ObservationOnlyCostAccumulator,
 )
+from .runner_stream_turn import STREAM_GUARD_POLL_INTERVAL
+from .runner_streaming import STREAM_THINKING_STALL_TIMEOUT
 from .runner_state import user_turn_message as _user_turn_message
 from .sub_agent_result_evidence import SubAgentResultEvidence
 from .sub_agent_narrative_result import (
@@ -59,6 +62,62 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("agent_gateway.runner")
 _MISSING_SUB_AGENT_ID = object()
+# A child that emits nothing for this long with no tool in flight is wedged
+# (ACUI-1: an await outside both stream and tool). Derived from the stream
+# guard so the child's own stall guard always fires first on stream silence.
+SUB_AGENT_ACTIVITY_GAP = 2 * STREAM_THINKING_STALL_TIMEOUT
+
+
+class _ChildActivity:
+  """Parent-side liveness of one child run: its last event and open tools."""
+
+  __slots__ = ("last_at", "tools_in_flight")
+
+  def __init__(self) -> None:
+    self.last_at = time.monotonic()
+    self.tools_in_flight: set[str] = set()
+
+  def observe(self, event: Mapping[str, Any]) -> None:
+    self.last_at = time.monotonic()
+    event_type = event.get("type")
+    tool_call_id = str(event.get("tool_call_id") or "")
+    if event_type == "tool_call_start":
+      self.tools_in_flight.add(tool_call_id)
+    elif event_type in {"tool_call_complete", "tool_call_interrupted"}:
+      self.tools_in_flight.discard(tool_call_id)
+
+
+async def _await_child_under_activity_guard(
+  child_run: Awaitable[Any],
+  activity: _ChildActivity,
+) -> float | None:
+  """Await one child run; cancel it once it is silent with no tool in flight.
+
+  Returns the silence in seconds when the guard cancelled the child, else
+  None. A child exception or cancellation propagates unchanged, and a parent
+  cancellation is delivered into the child before it propagates.
+  """
+
+  child = asyncio.ensure_future(child_run)
+  try:
+    while True:
+      done, _pending = await asyncio.wait(
+        {child},
+        timeout=STREAM_GUARD_POLL_INTERVAL,
+      )
+      if done:
+        child.result()
+        return None
+      silence = time.monotonic() - activity.last_at
+      if not activity.tools_in_flight and silence > SUB_AGENT_ACTIVITY_GAP:
+        child.cancel()
+        await asyncio.wait({child})
+        return silence
+  except asyncio.CancelledError:
+    if not child.done():
+      child.cancel()
+      await asyncio.wait({child})
+    raise
 
 
 def _child_cost_accumulator(
@@ -107,6 +166,7 @@ def _build_child_event_log(
   parent_log: EventLog,
   event_log_cls: Callable[..., EventLog],
   sub_session_id: str,
+  activity: _ChildActivity,
   progress_cb: Callable[[Dict[str, Any], str], None] | None,
   on_sub_event: Callable[[Dict[str, Any], str], None] | None,
 ) -> EventLog:
@@ -129,6 +189,7 @@ def _build_child_event_log(
     event: Dict[str, Any],
     session_id: str,
   ) -> None:
+    activity.observe(event)
     event_copy = dict(event)
     event_copy["sub_agent_id"] = session_id
     if progress_cb is not None:
@@ -227,13 +288,12 @@ class RunnerSubAgentMixin:
     _on_tool_result: (
       Callable[
         [ToolResultContext],
-        Awaitable[List[Dict[str, Any]] | None],
+        Awaitable[List[Dict[str, Any]] | None] | List[Dict[str, Any]] | None,
       ]
       | None
     )
     _on_tool_timing: Callable[..., None] | None
     _on_usage: Callable[[UsageEvent], Awaitable[None] | None] | None
-    _per_turn_timeout: float | None
     _rate_table_version: str
     _request_id: str
     _skill_run_id: str | None
@@ -260,9 +320,7 @@ class RunnerSubAgentMixin:
     sub_session: Any | None = None,
     excluded_tools: Set[str] | None = None,
     max_turns: int | None,
-    timeout: float | None,
     client_timeout: float = 90,
-    per_turn_timeout: float | None = None,
     max_tokens: int = 64000,
     call_index: int = 0,
     parent_turn_id: str | None = None,
@@ -337,10 +395,12 @@ class RunnerSubAgentMixin:
     progress_cb = progress_tracker_factory(task_entry) if task_entry else None
 
     event_log_cls = _runner_attr(self, "EventLog", EventLog)
+    activity = _ChildActivity()
     sub_log = _build_child_event_log(
       parent_log=self._log,
       event_log_cls=event_log_cls,
       sub_session_id=sub_session_id,
+      activity=activity,
       progress_cb=progress_cb,
       on_sub_event=on_sub_event,
     )
@@ -358,7 +418,6 @@ class RunnerSubAgentMixin:
       capability_execution=capability_execution,
       client_timeout=client_timeout,
       max_tokens_override=max_tokens,
-      per_turn_timeout=per_turn_timeout if per_turn_timeout is not None else self._per_turn_timeout,
       stream_stall_timeout=self._stream_stall_timeout,
       mcp_client=self._mcp_client,
       mcp_activation_fold=self._mcp_activation_fold,
@@ -405,7 +464,7 @@ class RunnerSubAgentMixin:
         )
       ),
     )
-    timed_out = False
+    stalled = False
     runtime_exception_detail: str | None = None
     cancelled_error: asyncio.CancelledError | None = None
     cancellation_signal: str | None = None
@@ -416,17 +475,13 @@ class RunnerSubAgentMixin:
       system_prompt=system_prompt,
       max_turns=max_turns,
     )
-    asyncio_module = _runner_attr(self, "asyncio", asyncio)
-    timeout_error = getattr(asyncio_module, "TimeoutError", asyncio.TimeoutError)
     try:
-      if timeout is not None and timeout > 0:
-        await asyncio_module.wait_for(coro, timeout=timeout)
-      else:
-        await coro
-    except timeout_error as exc:
-      timed_out = True
-      cleanup_warnings.extend(cleanup_failure_notes(exc))
-      sub_log.append({"type": "error", "error": f"Sub-agent timed out after {timeout}s"})
+      silence = await _await_child_under_activity_guard(coro, activity)
+      if silence is not None:
+        stalled = True
+        detail = f"Sub-agent stalled: no activity for {silence:.0f}s"
+        _runner_attr(self, "log", log).warning("[%s] %s", sub_session_id, detail)
+        sub_log.append({"type": "error", "error": detail, "error_sub_code": "stalled"})
     except asyncio.CancelledError as exc:
       cancelled_error = exc
       cleanup_warnings.extend(cleanup_failure_notes(exc))
@@ -458,7 +513,7 @@ class RunnerSubAgentMixin:
       ) = await _close_sub_runner(
         sub_runner,
         sub_log,
-        timed_out=timed_out,
+        stalled=stalled,
         cancelled_error=cancelled_error,
         cancellation_signal=cancellation_signal,
         runtime_exception_detail=runtime_exception_detail,
@@ -499,8 +554,7 @@ class RunnerSubAgentMixin:
       requirement=result_requirement,
       provenance=result_provenance,
       final_narrative=final_narrative,
-      timed_out=timed_out,
-      timeout=timeout,
+      stalled=stalled,
       runtime_error_detail=runtime_exception_detail,
       external_terminal_signals=(
         [cancellation_signal]
@@ -535,9 +589,7 @@ class RunnerSubAgentMixin:
     sub_session: Any | None = None,
     excluded_tools: Set[str] | None = None,
     max_turns: int | None,
-    timeout: float | None,
     client_timeout: float = 90,
-    per_turn_timeout: float | None = None,
     max_tokens: int = 64000,
     call_index: int = 0,
     parent_turn_id: str | None = None,
@@ -598,8 +650,7 @@ class RunnerSubAgentMixin:
         requirement=result_requirement,
         provenance=result_provenance,
         final_narrative=None,
-        timed_out=False,
-        timeout=timeout,
+        stalled=False,
         prior_evidence=prior_evidence,
         admitted_task=resolved_admitted_task,
         prior_terminal_tool_result=prior_terminal_tool_result,
@@ -624,10 +675,12 @@ class RunnerSubAgentMixin:
     progress_cb = progress_tracker_factory(task_entry) if task_entry else None
 
     event_log_cls = _runner_attr(self, "EventLog", EventLog)
+    activity = _ChildActivity()
     sub_log = _build_child_event_log(
       parent_log=self._log,
       event_log_cls=event_log_cls,
       sub_session_id=sub_session_id,
+      activity=activity,
       progress_cb=progress_cb,
       on_sub_event=on_sub_event,
     )
@@ -645,7 +698,6 @@ class RunnerSubAgentMixin:
       capability_execution=capability_execution,
       client_timeout=client_timeout,
       max_tokens_override=max_tokens,
-      per_turn_timeout=per_turn_timeout if per_turn_timeout is not None else self._per_turn_timeout,
       stream_stall_timeout=self._stream_stall_timeout,
       mcp_client=self._mcp_client,
       mcp_activation_fold=self._mcp_activation_fold,
@@ -695,7 +747,7 @@ class RunnerSubAgentMixin:
     if bind_research_file_activity_lease_func is not None:
       bind_research_file_activity_lease_func(sub_runner)
     sub_runner._resume_parent_messages_for_ack = tuple(parent_messages)
-    timed_out = False
+    stalled = False
     runtime_exception_detail: str | None = None
     cancelled_error: asyncio.CancelledError | None = None
     cancellation_signal: str | None = None
@@ -707,17 +759,13 @@ class RunnerSubAgentMixin:
       max_turns=max_turns,
       resume_initial_messages=reconstructed_messages,
     )
-    asyncio_module = _runner_attr(self, "asyncio", asyncio)
-    timeout_error = getattr(asyncio_module, "TimeoutError", asyncio.TimeoutError)
     try:
-      if timeout is not None and timeout > 0:
-        await asyncio_module.wait_for(coro, timeout=timeout)
-      else:
-        await coro
-    except timeout_error as exc:
-      timed_out = True
-      cleanup_warnings.extend(cleanup_failure_notes(exc))
-      sub_log.append({"type": "error", "error": f"Sub-agent timed out after {timeout}s"})
+      silence = await _await_child_under_activity_guard(coro, activity)
+      if silence is not None:
+        stalled = True
+        detail = f"Sub-agent stalled: no activity for {silence:.0f}s"
+        _runner_attr(self, "log", log).warning("[%s] %s", sub_session_id, detail)
+        sub_log.append({"type": "error", "error": detail, "error_sub_code": "stalled"})
     except asyncio.CancelledError as exc:
       cancelled_error = exc
       cleanup_warnings.extend(cleanup_failure_notes(exc))
@@ -749,7 +797,7 @@ class RunnerSubAgentMixin:
       ) = await _close_sub_runner(
         sub_runner,
         sub_log,
-        timed_out=timed_out,
+        stalled=stalled,
         cancelled_error=cancelled_error,
         cancellation_signal=cancellation_signal,
         runtime_exception_detail=runtime_exception_detail,
@@ -790,8 +838,7 @@ class RunnerSubAgentMixin:
       requirement=result_requirement,
       provenance=result_provenance,
       final_narrative=final_narrative,
-      timed_out=timed_out,
-      timeout=timeout,
+      stalled=stalled,
       runtime_error_detail=runtime_exception_detail,
       external_terminal_signals=(
         [cancellation_signal]
@@ -830,7 +877,7 @@ async def _close_sub_runner(
   sub_runner: Any,
   sub_log: Any,
   *,
-  timed_out: bool,
+  stalled: bool,
   cancelled_error: asyncio.CancelledError | None,
   cancellation_signal: str | None,
   runtime_exception_detail: str | None,
@@ -855,7 +902,7 @@ async def _close_sub_runner(
       "error": detail,
       "message": detail,
     })
-    if cancelled_error is None and not timed_out:
+    if cancelled_error is None and not stalled:
       cancelled_error = exc
       cancellation_signal = _termination_signal(task_entry)
   except Exception as exc:
@@ -871,7 +918,7 @@ async def _close_sub_runner(
     })
     if (
       cancelled_error is None
-      and not timed_out
+      and not stalled
       and runtime_exception_detail is None
     ):
       runtime_exception_detail = detail

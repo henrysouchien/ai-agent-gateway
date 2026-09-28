@@ -60,5 +60,13 @@ class ExecutionBackend:
   async def cleanup(self, work_dir: str, *, task_id: str | None = None) -> None:
     raise NotImplementedError
 
+  def unavailable_reason(self) -> Optional[str]:
+    """Why this backend cannot run code right now, or None when it can.
+
+    The one availability probe: `available()` derives from it, so a backend
+    that `host=auto` skips always has a cause to log and to report.
+    """
+    return None
+
   def available(self) -> bool:
-    return True
+    return self.unavailable_reason() is None

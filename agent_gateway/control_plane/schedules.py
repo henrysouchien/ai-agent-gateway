@@ -1430,17 +1430,6 @@ async def _show_schedule(
   )
 
 
-async def _show_schedule_or_none(
-  name: str, *, backend: OperatorScheduleBackend | None, source: ScheduleSource | None = None,
-) -> OperatorScheduleResponse | None:
-  try:
-    return await _show_schedule(name, backend=backend, source=source)
-  except HTTPException as exc:
-    if exc.status_code == status.HTTP_404_NOT_FOUND:
-      return None
-    raise
-
-
 async def _show_jobs_schedule(
   name: str, *, backend: OperatorScheduleBackend | None,
 ) -> JobsMcpScheduleResponse:
@@ -1600,24 +1589,13 @@ def build_schedules_router(
   async def get_schedule(request: Request, name: str) -> ScheduleResponse:
     session = _require_bearer_session(request, auth)
     owner_user_id = _schedule_owner_user_id(session)
-    if not _can_access_operator_schedules(session):
-      owned_schedule = store_for(owner_user_id).get_for_owner(owner_user_id, name)
-      if owned_schedule is not None:
-        return _project_schedule_for_web(owned_schedule)
-      raise _operator_schedule_not_found(name)
-    if _is_web_session(session):
-      owned_schedule = store_for(owner_user_id).get_for_owner(owner_user_id, name)
-      if owned_schedule is not None:
-        return _project_schedule_for_web(owned_schedule)
-      schedule = await _show_schedule(name, backend=backend)
-      return _project_schedule_for_web(schedule)
-    raw_schedule = await _show_schedule_or_none(name, backend=backend)
-    if raw_schedule is not None:
-      return raw_schedule
     owned_schedule = store_for(owner_user_id).get_for_owner(owner_user_id, name)
     if owned_schedule is not None:
       return _project_schedule_for_web(owned_schedule)
-    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Schedule not found: {name}")
+    if not _can_access_operator_schedules(session):
+      raise _operator_schedule_not_found(name)
+    schedule = await _show_schedule(name, backend=backend)
+    return _project_schedule_for_web(schedule) if _is_web_session(session) else schedule
 
   @router.get(
     "/{name}/logs",
@@ -1761,10 +1739,8 @@ def build_schedules_router(
     session = _require_bearer_session(request, auth)
     owner_user_id = _schedule_owner_user_id(session)
     agent_store = store_for(owner_user_id)
-    if not _can_access_operator_schedules(session):
-      owned_schedule = agent_store.get_for_owner(owner_user_id, name)
-      if owned_schedule is None:
-        raise _operator_schedule_not_found(name)
+    owned_schedule = agent_store.get_for_owner(owner_user_id, name)
+    if owned_schedule is not None:
       updated = agent_store.set_enabled(
         owner_user_id,
         name,
@@ -1773,31 +1749,11 @@ def build_schedules_router(
         live_role=require_exact_role(getattr(session, "role", None)),
       )
       return ScheduleEnvelopeResponse(schedule=_project_schedule_for_web(updated))
+    if not _can_access_operator_schedules(session):
+      raise _operator_schedule_not_found(name)
     if _is_web_session(session):
-      owned_schedule = agent_store.get_for_owner(owner_user_id, name)
-      if owned_schedule is not None:
-        updated = agent_store.set_enabled(
-          owner_user_id,
-          name,
-          enabled=payload.enabled,
-          updated_by=owner_user_id,
-          live_role=require_exact_role(getattr(session, "role", None)),
-        )
-        return ScheduleEnvelopeResponse(schedule=_project_schedule_for_web(updated))
       raise _raw_web_schedule_write_forbidden()
-    schedule = await _show_schedule_or_none(name, backend=backend)
-    if schedule is None:
-      owned_schedule = agent_store.get_for_owner(owner_user_id, name)
-      if owned_schedule is not None:
-        updated = agent_store.set_enabled(
-          owner_user_id,
-          name,
-          enabled=payload.enabled,
-          updated_by=owner_user_id,
-          live_role=require_exact_role(getattr(session, "role", None)),
-        )
-        return ScheduleEnvelopeResponse(schedule=_project_schedule_for_web(updated))
-      raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Schedule not found: {name}")
+    schedule = await _show_schedule(name, backend=backend)
     if isinstance(schedule, LaunchdScheduleResponse):
       result = (
         await _require_operator_backend(backend).scheduler.schedule_enable(name)
@@ -1828,10 +1784,8 @@ def build_schedules_router(
     session = _require_bearer_session(request, auth)
     owner_user_id = _schedule_owner_user_id(session)
     agent_store = store_for(owner_user_id)
-    if not _can_access_operator_schedules(session):
-      owned_schedule = agent_store.get_for_owner(owner_user_id, name)
-      if owned_schedule is None:
-        raise _operator_schedule_not_found(name)
+    owned_schedule = agent_store.get_for_owner(owner_user_id, name)
+    if owned_schedule is not None:
       if not _is_web_session(session) and not confirm:
         raise HTTPException(status_code=400, detail="confirm=true is required to delete a schedule")
       deleted = agent_store.delete(owner_user_id, name)
@@ -1840,30 +1794,14 @@ def build_schedules_router(
         name=str(deleted.get("name") or name),
         source=_AGENT_RUN_SCHEDULE_BACKEND,
       )
+    if not _can_access_operator_schedules(session):
+      raise _operator_schedule_not_found(name)
     if _is_web_session(session):
-      owned_schedule = agent_store.get_for_owner(owner_user_id, name)
-      if owned_schedule is not None:
-        deleted = agent_store.delete(owner_user_id, name)
-        return ScheduleDeleteResponse(
-          deleted=True,
-          name=str(deleted.get("name") or name),
-          source=_AGENT_RUN_SCHEDULE_BACKEND,
-        )
       raise _raw_web_schedule_write_forbidden()
     if not confirm:
       raise HTTPException(status_code=400, detail="confirm=true is required to delete a schedule")
 
-    schedule = await _show_schedule_or_none(name, backend=backend)
-    if schedule is None:
-      owned_schedule = agent_store.get_for_owner(owner_user_id, name)
-      if owned_schedule is not None:
-        deleted = agent_store.delete(owner_user_id, name)
-        return ScheduleDeleteResponse(
-          deleted=True,
-          name=str(deleted.get("name") or name),
-          source=_AGENT_RUN_SCHEDULE_BACKEND,
-        )
-      raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Schedule not found: {name}")
+    schedule = await _show_schedule(name, backend=backend)
     if isinstance(schedule, LaunchdScheduleResponse):
       result = await _require_operator_backend(backend).scheduler.schedule_delete(name, confirm=True)
       _require_backend_success(result, action="schedule_delete", not_found_status=status.HTTP_404_NOT_FOUND)

@@ -1266,7 +1266,18 @@ def test_stream_turn_log_summary_handles_empty_text_and_missing_first_token() ->
   assert summary.text_preview == ""
 
 
-def test_select_run_max_tokens_uses_config_and_override() -> None:
+def test_select_run_max_tokens_without_override_requests_model_ceiling() -> None:
+  selection = select_run_max_tokens(
+    {"max_tokens": 16000},
+    max_tokens_override=None,
+    model_info=SimpleNamespace(max_output_tokens=128_000),
+  )
+
+  assert selection.value == 128_000
+  assert selection.clamped is False
+
+
+def test_select_run_max_tokens_uses_override_and_config_without_ceiling() -> None:
   model_info = SimpleNamespace(max_output_tokens=0)
 
   assert select_run_max_tokens(
@@ -1286,10 +1297,10 @@ def test_select_run_max_tokens_uses_config_and_override() -> None:
   assert selection.clamped is False
 
 
-def test_select_run_max_tokens_clamps_to_model_max_output() -> None:
+def test_select_run_max_tokens_clamps_override_to_model_max_output() -> None:
   selection = select_run_max_tokens(
-    {"max_tokens": 64000},
-    max_tokens_override=None,
+    {"max_tokens": 16000},
+    max_tokens_override=64000,
     model_info=SimpleNamespace(max_output_tokens=16384),
   )
 
@@ -1297,3 +1308,14 @@ def test_select_run_max_tokens_clamps_to_model_max_output() -> None:
   assert selection.requested == 64000
   assert selection.model_max_output == 16384
   assert selection.clamped is True
+
+
+def test_select_run_max_tokens_keeps_override_below_model_ceiling() -> None:
+  selection = select_run_max_tokens(
+    {"max_tokens": 16000},
+    max_tokens_override=24000,
+    model_info=SimpleNamespace(max_output_tokens=128_000),
+  )
+
+  assert selection.value == 24000
+  assert selection.clamped is False

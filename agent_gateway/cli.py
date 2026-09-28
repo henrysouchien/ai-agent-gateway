@@ -15,6 +15,7 @@ import getpass
 import os
 import subprocess
 import sys
+import time
 import webbrowser
 
 import httpx
@@ -98,18 +99,47 @@ def build_parser() -> argparse.ArgumentParser:
 
   auth_parser = subparsers.add_parser("auth", help="Manage provider authentication.")
   auth_sub = auth_parser.add_subparsers(dest="auth_command", required=True)
+  _USER_SCOPE_HELP = (
+    "risk_user_id whose credential pool this account belongs to; omit for the "
+    "deployment's org pool."
+  )
   auth_login = auth_sub.add_parser("login", help="Sign in to a provider.")
   auth_login.add_argument("provider", choices=["anthropic", "codex", "openai", "xai"])
   auth_login.add_argument("--no-browser", action="store_true", help="Do not open the verification URL.")
   auth_login.add_argument("--store", default=None, help="Override the OAuth token-store path.")
+  auth_login.add_argument("--user", default=None, help=_USER_SCOPE_HELP)
   auth_login.add_argument("--profile", default=None, help="CAAM profile name for a new Codex enrollment.")
   auth_login.add_argument("--email", default=None, help="Expected ChatGPT email for a new Codex enrollment.")
+  auth_enroll = auth_sub.add_parser(
+    "enroll",
+    help="Enroll an existing provider credential in a credential pool.",
+  )
+  auth_enroll.add_argument("provider", choices=["anthropic"])
+  auth_enroll.add_argument(
+    "--setup-token",
+    action="store_true",
+    required=True,
+    help="Read a `claude setup-token` value from stdin (never echoed, never an argument).",
+  )
+  auth_enroll.add_argument("--store", default=None, help="Override the OAuth token-store path.")
+  auth_enroll.add_argument("--user", default=None, help=_USER_SCOPE_HELP)
   auth_status = auth_sub.add_parser("status", help="Show provider authentication status.")
   auth_status.add_argument("provider", choices=["anthropic", "codex", "openai", "xai"])
   auth_status.add_argument("--store", default=None, help="Override the OAuth token-store path.")
+  auth_status.add_argument("--user", default=None, help=_USER_SCOPE_HELP)
   auth_logout = auth_sub.add_parser("logout", help="Remove persisted provider authentication.")
   auth_logout.add_argument("provider", choices=["anthropic", "xai"])
   auth_logout.add_argument("--store", default=None, help="Override the OAuth token-store path.")
+  auth_logout.add_argument("--user", default=None, help=_USER_SCOPE_HELP)
+  auth_list = auth_sub.add_parser("list", help="List enrolled provider accounts.")
+  auth_list.add_argument("provider", choices=["anthropic"])
+  auth_list.add_argument("--store", default=None, help="Override the OAuth token-store path.")
+  auth_list.add_argument("--user", default=None, help=_USER_SCOPE_HELP)
+  auth_remove = auth_sub.add_parser("remove", help="Remove one enrolled provider account.")
+  auth_remove.add_argument("provider", choices=["anthropic"])
+  auth_remove.add_argument("identity", help="Account identity reported by `auth list`.")
+  auth_remove.add_argument("--store", default=None, help="Override the OAuth token-store path.")
+  auth_remove.add_argument("--user", default=None, help=_USER_SCOPE_HELP)
 
   list_parser = subparsers.add_parser("list", help="Show the resolved project config.")
   list_parser.add_argument(
@@ -174,6 +204,12 @@ def main(
         return _auth_status(args, stdout=stdout_stream)
       if args.auth_command == "logout":
         return _auth_logout(args, stdout=stdout_stream)
+      if args.auth_command == "list":
+        return _auth_list(args, stdout=stdout_stream)
+      if args.auth_command == "enroll":
+        return _auth_enroll(args, stdout=stdout_stream)
+      if args.auth_command == "remove":
+        return _auth_remove(args, stdout=stdout_stream)
 
     if args.command == "list":
       return _list_project(args, stdout=stdout_stream)
@@ -297,6 +333,22 @@ def _xai_auth_config(args: argparse.Namespace) -> dict[str, str]:
   return {"auth_store_path": store} if store else {}
 
 
+def _anthropic_store_path(args: argparse.Namespace) -> Path:
+  """The store these `auth` commands read and write: one user's, or the org's.
+
+  `--user <risk_user_id>` names the pool that serves that user's turns and the
+  autonomous runs launched from them; without it the command operates on the
+  deployment's org pool, which every user's pool ends with.
+  """
+
+  from .providers.anthropic_oauth import resolve_anthropic_auth_store_path
+
+  return resolve_anthropic_auth_store_path(
+    _xai_auth_config(args),
+    user_scope=getattr(args, "user", None),
+  )
+
+
 def _auth_login(args: argparse.Namespace, *, stdout: TextIO) -> int:
   if args.provider == "anthropic":
     return _auth_login_anthropic(args, stdout=stdout)
@@ -334,31 +386,74 @@ def _auth_login(args: argparse.Namespace, *, stdout: TextIO) -> int:
 
 
 def _auth_login_anthropic(args: argparse.Namespace, *, stdout: TextIO) -> int:
+  """Enroll one Claude account in this gateway's own credential pool.
+
+  This is the product's own OAuth client: the grant it mints here (access plus
+  a refresh token it owns) is the only Anthropic grant the gateway ever
+  refreshes. Run it once per account; each run adds a sibling and leaves the
+  ones already enrolled alone.
+  """
+
   from .providers.anthropic_oauth import (
-    import_claude_setup_token,
-    resolve_anthropic_auth_store_path,
+    AnthropicOAuthError,
+    complete_anthropic_login,
+    mask_anthropic_token,
+    start_anthropic_login,
   )
 
-  token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
-  if not token:
-    stdout.write(
-      "Launching `claude setup-token`. This creates a separate one-year inference token "
-      "and does not replace Claude Code's saved login.\n"
-    )
-    stdout.flush()
-    try:
-      result = subprocess.run(["claude", "setup-token"], check=False)
-    except OSError as exc:
-      raise AgentProjectError("Unable to launch `claude setup-token`; install Claude Code first") from exc
-    if result.returncode != 0:
-      raise AgentProjectError(f"`claude setup-token` failed with exit code {result.returncode}")
-    token = getpass.getpass("Paste the setup token printed by Claude Code: ").strip()
-  path = resolve_anthropic_auth_store_path(_xai_auth_config(args))
+  path = _anthropic_store_path(args)
+  request = start_anthropic_login()
+  stdout.write("\nAnthropic OAuth login — one Claude account per run\n")
+  stdout.write(f"Open: {request.authorize_url}\n")
+  stdout.write(
+    "Sign in as the account you want to enroll, approve access, then copy the\n"
+    "value the callback page shows (it looks like `<code>#<state>`).\n"
+  )
+  stdout.flush()
+  if not args.no_browser:
+    webbrowser.open(request.authorize_url)
+  pasted = getpass.getpass("Paste the callback URL or code#state: ").strip()
   try:
-    import_claude_setup_token(token, path=path)
-  except (OSError, RuntimeError, ValueError) as exc:
+    record = complete_anthropic_login(request, pasted, store_path=path)
+  except (AnthropicOAuthError, OSError) as exc:
     raise AgentProjectError(str(exc)) from exc
-  stdout.write(f"Anthropic OAuth token stored for new gateway sessions: {path}\n")
+  stdout.write(
+    f"Enrolled {record.identity} ({mask_anthropic_token(record.access_token)}) in the "
+    f"gateway credential pool: {path}\n"
+  )
+  stdout.write("Existing Claude Code and gateway sessions were not modified.\n")
+  return 0
+
+
+def _auth_enroll(args: argparse.Namespace, *, stdout: TextIO) -> int:
+  """Enroll a `claude setup-token` credential in a credential pool.
+
+  The token is read from stdin — never an argument, never echoed — because an
+  account created with `claude setup-token` has no refresh grant for this
+  product's OAuth client to mint and is therefore the one credential form the
+  login flow cannot produce. It joins the pool as an ordinary sibling: sent
+  as-is, parked by its account key when a limiter rejects it.
+  """
+
+  from .providers.anthropic_oauth import (
+    AnthropicOAuthError,
+    enroll_anthropic_setup_token,
+    mask_anthropic_token,
+  )
+
+  path = _anthropic_store_path(args)
+  if sys.stdin.isatty():
+    token = getpass.getpass("Paste the Anthropic setup token: ")
+  else:
+    token = sys.stdin.read()
+  try:
+    record = enroll_anthropic_setup_token(token, store_path=path)
+  except (AnthropicOAuthError, OSError) as exc:
+    raise AgentProjectError(str(exc)) from exc
+  stdout.write(
+    f"Enrolled {record.identity} ({mask_anthropic_token(record.access_token)}) in the "
+    f"credential pool: {path}\n"
+  )
   stdout.write("Existing Claude Code and gateway sessions were not modified.\n")
   return 0
 
@@ -455,28 +550,68 @@ def _auth_status(args: argparse.Namespace, *, stdout: TextIO) -> int:
 
 def _auth_status_anthropic(args: argparse.Namespace, *, stdout: TextIO) -> int:
   from .providers.anthropic_oauth import (
-    anthropic_token_is_expiring,
     anthropic_token_store_is_private,
-    load_anthropic_oauth_record,
-    resolve_anthropic_auth_store_path,
+    load_anthropic_oauth_store,
   )
 
-  path = resolve_anthropic_auth_store_path(_xai_auth_config(args))
-  record = load_anthropic_oauth_record(path)
-  if not record:
-    stdout.write(f"Anthropic OAuth: no gateway token store ({path})\n")
+  path = _anthropic_store_path(args)
+  records = load_anthropic_oauth_store(path)
+  if not records:
+    stdout.write(f"Anthropic OAuth: no enrolled accounts ({path})\n")
     return 1
-  state = "renew soon" if anthropic_token_is_expiring(record) else "active"
   permissions = "0600" if anthropic_token_store_is_private(path) else "insecure permissions"
-  stdout.write(f"Anthropic OAuth: {state}; store={path}; permissions={permissions}\n")
+  # Local-only: this reads the store and its expiries and never contacts
+  # Anthropic, so a grant the server has revoked still looks enrolled here.
+  stdout.write(
+    f"Anthropic OAuth: {len(records)} enrolled account(s); store={path}; "
+    f"permissions={permissions}; not server-validated\n"
+  )
+  return 0
+
+
+def _auth_list(args: argparse.Namespace, *, stdout: TextIO) -> int:
+  from .providers.anthropic_oauth import (
+    load_anthropic_oauth_store,
+    mask_anthropic_token,
+  )
+
+  path = _anthropic_store_path(args)
+  records = load_anthropic_oauth_store(path)
+  if not records:
+    stdout.write(f"Anthropic OAuth: no enrolled accounts ({path})\n")
+    return 1
+  now = time.time()
+  for record in records:
+    remaining = record.expires_at - now
+    if not record.refresh_token:
+      expiry = "no refresh token (enroll again to make it refreshable)"
+    elif remaining <= 0:
+      expiry = "access token expired; refreshes before next use"
+    else:
+      expiry = f"access token valid for {remaining / 60:.0f} min"
+    line = f"{record.identity}  {mask_anthropic_token(record.access_token)}  {expiry}"
+    if record.last_error:
+      line += f"  last error: {record.last_error}"
+    stdout.write(f"{line}\n")
+  return 0
+
+
+def _auth_remove(args: argparse.Namespace, *, stdout: TextIO) -> int:
+  from .providers.anthropic_oauth import remove_anthropic_oauth_record
+
+  path = _anthropic_store_path(args)
+  identity = str(args.identity or "").strip()
+  if not remove_anthropic_oauth_record(path, identity):
+    stdout.write(f"Anthropic OAuth: no enrolled account {identity!r} in {path}\n")
+    return 1
+  stdout.write(f"Removed Anthropic OAuth account {identity} from {path}\n")
+  stdout.write("Claude Code's saved login was not modified.\n")
   return 0
 
 
 def _auth_logout(args: argparse.Namespace, *, stdout: TextIO) -> int:
   if args.provider == "anthropic":
-    from .providers.anthropic_oauth import resolve_anthropic_auth_store_path
-
-    path = resolve_anthropic_auth_store_path(_xai_auth_config(args))
+    path = _anthropic_store_path(args)
     provider_label = "Anthropic"
   else:
     from .providers.xai_oauth import (

@@ -1,9 +1,11 @@
 import asyncio
 from collections import deque
+from collections.abc import Awaitable, Callable
 import json
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 import agent_gateway.mcp_client as mcp_client_module  # noqa: E402
+import agent_gateway.mcp_client_connections as mcp_client_connections  # noqa: E402
 from agent_gateway.mcp_client import McpClientManager  # noqa: E402
 from agent_gateway.tool_registration import RegisteredMcpToolCompilationError  # noqa: E402
 from agent_workflow_contracts.tool_registration import (  # noqa: E402
@@ -71,7 +74,7 @@ def reconnect_transport(monkeypatch):
       super().__init__(names)
       self.generation = generation
       self.closed = False
-      self.before_call = None
+      self.before_call: Callable[[], Awaitable[None]] | None = None
 
     async def __aenter__(self):
       opened_contexts.append(self)
@@ -214,15 +217,18 @@ def test_eof_and_delayed_tool_failures_keep_one_live_generation(
         calls.append(asyncio.create_task(manager.call_tool(
           "alpha", {}, allow_uncertain_replay=allow_uncertain_replay,
         )))
-        await asyncio.wait_for(entered.wait(), timeout=1)
+        await entered.wait()
       second = queue(["alpha"], generation=2)
       queue(["alpha"], generation=3)
-      manager._servers["first"].stdio_eof.set()
-      manager._servers["first"].stdio_receive_done.set()
+      first_server = manager._servers["first"]
+      assert first_server.stdio_eof is not None
+      assert first_server.stdio_receive_done is not None
+      first_server.stdio_eof.set()
+      first_server.stdio_receive_done.set()
       failure_releases[0].set()
-      first_outcome = await asyncio.wait_for(calls[0], timeout=1)
+      first_outcome = await calls[0]
       failure_releases[1].set()
-      second_outcome = await asyncio.wait_for(calls[1], timeout=1)
+      second_outcome = await calls[1]
       if allow_uncertain_replay:
         expected = ({"tool": "alpha", "generation": 2}, None)
         assert first_outcome == expected
@@ -275,13 +281,16 @@ def test_pending_retry_awaits_passive_eof_reconnect(reconnect_transport, monkeyp
     pending = None
     try:
       queue(["alpha"], generation=2)
+      assert server.stdio_eof is not None
+      assert server.stdio_receive_done is not None
       server.stdio_eof.set()
       server.stdio_receive_done.set()
-      await asyncio.wait_for(connect_started.wait(), timeout=1)
+      await connect_started.wait()
       pending = asyncio.create_task(retry())
-      await asyncio.wait_for(retry_started.wait(), timeout=1)
+      await retry_started.wait()
       connect_release.set()
-      result = await asyncio.wait_for(pending, timeout=1)
+      result = await pending
+      assert result is not None
       assert result.structured_content == {"tool": "alpha", "generation": 2}
       assert await manager.call_tool("alpha", {}) == (
         {"tool": "alpha", "generation": 2}, None,
@@ -452,6 +461,74 @@ mcp.run()
   asyncio.run(scenario())
 
 
+def test_eof_reconnect_never_cancels_the_task_that_opened_the_generation(tmp_path):
+  """A generation's transport scopes belong to no caller.
+
+  The caller below reconnects the server on the tool-call path, so before the
+  connection layer hosted its own transports that caller entered the new
+  generation's anyio task groups. When the child then died mid-call, the EOF
+  watcher's close cancelled those groups' scopes, and anyio delivered the
+  cancellation to the task that entered them: the caller, whose call should
+  only have seen the server's transport error.
+  """
+  server_script = tmp_path / "mcp_server.py"
+  server_script.write_text("""
+import asyncio
+import os
+from pathlib import Path
+from fastmcp import FastMCP
+
+mcp = FastMCP("held")
+
+@mcp.tool()
+async def hold() -> dict:
+    with Path("calls").open("a") as stream:
+        stream.write(str(os.getpid()) + "\\n")
+    await asyncio.Event().wait()
+    return {}
+
+mcp.run(show_banner=False)
+""")
+  calls_file = tmp_path / "calls"
+
+  async def scenario():
+    manager = McpClientManager(
+      config_path=None,
+      default_tool_timeout=30,
+      inline_servers={
+        "held": {"command": sys.executable, "args": [str(server_script)], "cwd": str(tmp_path)},
+      },
+    )
+    await manager.startup()
+    opened = manager._servers["held"]
+
+    async def stage():
+      assert await _reconnect_for_future(manager, "held", "hold")
+      assert manager._servers["held"] is not opened
+      outcome = await manager.call_tool("hold", {}, allow_uncertain_replay=False)
+      # anyio keeps redelivering a scope's cancellation to its host task, so
+      # the caller must also survive its next await.
+      await asyncio.sleep(0.2)
+      return outcome
+
+    task = asyncio.create_task(stage())
+    try:
+      async with asyncio.timeout(15):
+        while not calls_file.exists() or not calls_file.read_text().strip():
+          await asyncio.sleep(0.01)
+      os.kill(int(calls_file.read_text().split()[0]), signal.SIGTERM)
+      result, error = await asyncio.wait_for(asyncio.shield(task), timeout=15)
+      assert result is None
+      assert error is not None
+      assert error["sub_code"] == "connection_error"
+    finally:
+      task.cancel()
+      await asyncio.gather(task, return_exceptions=True)
+      await manager.shutdown()
+
+  asyncio.run(scenario())
+
+
 def test_session_allowed_tools_filter_definitions_and_dispatch_surface() -> None:
   manager = McpClientManager(config_path=None)
   state = asyncio.run(manager._initialize_session_state(
@@ -484,6 +561,76 @@ def test_session_allowed_tools_reject_missing_remote_definition() -> None:
       tool_prefix="",
       allowed_tools=("get_investment_artifact", "start_quant_research"),
     ))
+
+
+class _PagingSession:
+  """List tools one page at a time; `pages=None` never stops offering a cursor."""
+
+  def __init__(self, pages: int | None) -> None:
+    self.pages = pages
+    self.cursors: list[str | None] = []
+
+  async def initialize(self) -> object:
+    return None
+
+  async def list_tools(
+    self,
+    *,
+    params: PaginatedRequestParams | None = None,
+  ) -> ListToolsResult:
+    cursor = None if params is None else params.cursor
+    self.cursors.append(cursor)
+    page = len(self.cursors)
+    last = self.pages is not None and page >= self.pages
+    return ListToolsResult(
+      tools=[
+        Tool(
+          name=f"tool_{page}",
+          description=f"Tool from page {page}",
+          input_schema={"type": "object", "properties": {}},
+        )
+      ],
+      next_cursor=None if last else f"page-{page}",
+    )
+
+  async def call_tool(self, name, arguments, **kwargs) -> CallToolResult:
+    raise AssertionError("pagination tests never dispatch a tool")
+
+
+def test_list_tools_pagination_collects_every_page_under_the_ceiling() -> None:
+  manager = McpClientManager(config_path=None)
+  session = _PagingSession(pages=3)
+
+  state = asyncio.run(manager._initialize_session_state(
+    name="idea-workbench-mcp",
+    session=session,
+    exit_contexts=[],
+    tool_prefix="",
+  ))
+
+  assert session.cursors == [None, "page-1", "page-2"]
+  assert [tool["name"] for tool in state.tool_definitions] == [
+    "tool_1", "tool_2", "tool_3",
+  ]
+
+
+def test_list_tools_pagination_ends_at_the_page_ceiling() -> None:
+  manager = McpClientManager(config_path=None)
+  session = _PagingSession(pages=None)
+
+  with pytest.raises(ValueError, match="did not finish paginating list_tools") as raised:
+    asyncio.run(manager._initialize_session_state(
+      name="idea-workbench-mcp",
+      session=session,
+      exit_contexts=[],
+      tool_prefix="",
+    ))
+
+  assert len(session.cursors) == mcp_client_connections._LIST_TOOLS_PAGE_CEILING
+  # The endless pager reaches the analyst by the carrier the layer already has.
+  diagnostic = mcp_client_module._startup_failure_from_exception(raised.value)
+  assert diagnostic["category"] == "startup_error"
+  assert diagnostic["retryable"] is False
 
 
 def test_catalog_republication_preserves_other_server_prefix() -> None:
@@ -585,6 +732,42 @@ def test_failed_stdio_child_with_long_stderr_line_does_not_block(monkeypatch, ca
   stderr = diagnostic.split("\n", 1)[1]
   assert len(stderr) <= 8192
   assert stderr.endswith("fatal startup error")
+
+
+def test_failed_stdio_child_with_surviving_descendant_shuts_down_bounded(monkeypatch, caplog) -> None:
+  monkeypatch.setattr(mcp_client_module, "_stdio_connect_retries", lambda: 0)
+  # The child leaves a descendant holding the inherited stderr pipe well past
+  # every cleanup deadline, so the drain never sees EOF.
+  script = (
+    "import os, subprocess, sys\n"
+    "devnull = os.open(os.devnull, os.O_RDWR)\n"
+    "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],"
+    " stdin=devnull, stdout=devnull)\n"
+    "print('child fatal: dependency missing', file=sys.stderr, flush=True)\n"
+    "raise SystemExit(3)\n"
+  )
+
+  async def scenario():
+    manager = McpClientManager(config_path=None)
+    try:
+      assert await manager._connect_or_warn(
+        "orphan-child", {"command": sys.executable, "args": ["-c", script]},
+      ) is None
+    finally:
+      await manager.shutdown()
+
+  started = time.monotonic()
+  # asyncio.run also joins the default executor, so a cleanup that abandoned an
+  # uncancellable thread join there shows up in this elapsed time.
+  asyncio.run(scenario())
+  elapsed = time.monotonic() - started
+
+  assert elapsed < 4.0, f"connection cleanup outlived its timeout: {elapsed:.2f}s"
+  diagnostic = next(
+    record.getMessage() for record in caplog.records
+    if "orphan-child" in record.getMessage() and "stderr" in record.getMessage()
+  )
+  assert diagnostic.endswith("child fatal: dependency missing")
 
 
 def test_stdio_stability_probe_rejects_closed_transport(reconnect_transport):

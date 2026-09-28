@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +20,10 @@ COMPACTION_TRIGGER_PCT = 80
 _REQUEST_TOKEN_FRAMING_BASE = 1024
 _REQUEST_TOKEN_FRAMING_PER_MESSAGE = 64
 _REQUEST_TOKEN_FRAMING_PER_TOOL = 128
+# Provider-reported input divided by the chars/4 proxy measured 1.6096 across
+# 11 paired samples of this repository's request surfaces, i.e. about 2.49
+# UTF-8 bytes of serialized request per billed input token.
+_REQUEST_BYTES_PER_TOKEN = 4 / 1.6096
 
 
 def estimate_tokens(text: str) -> int:
@@ -61,24 +66,28 @@ class TokenBreakdownSnapshot:
   pct_messages: int
 
 
-def conservative_request_input_token_bound(
+def request_input_token_estimate(
   snapshot: TokenEstimateSnapshot,
 ) -> int:
-  """Bound request input tokens without relying on English char averages.
+  """Estimate the input tokens the provider will count for this request.
 
-  Modern provider tokenizers have byte fallback, so UTF-8 bytes are a safe
-  upper bound for caller-controlled text and serialized JSON. Fixed and
+  Cost admission prices the request the provider is about to bill, so this is
+  a calibrated estimate rather than a bound in either direction: a worst case
+  kills runs that still have budget, and a floor lets a run overspend its cap.
+  UTF-8 bytes are the basis because tokenizer byte fallback makes characters
+  unreliable for non-Latin text; the divisor is this repository's own paired
+  measurement of provider-reported input against the chars/4 proxy. Fixed and
   per-record allowances cover provider message/tool framing that is not part
   of the serialized values.
   """
 
   for field_name in ("system_text", "messages_text", "tools_text"):
     if not isinstance(getattr(snapshot, field_name, None), str):
-      raise TypeError("request token bound requires serialized request text")
+      raise TypeError("request token estimate requires serialized request text")
   for field_name in ("message_count", "tool_count"):
     value = getattr(snapshot, field_name, None)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-      raise TypeError("request token bound requires bounded record counts")
+      raise TypeError("request token estimate requires bounded record counts")
   content_bytes = sum(
     len(value.encode("utf-8"))
     for value in (
@@ -88,22 +97,22 @@ def conservative_request_input_token_bound(
     )
   )
   return (
-    content_bytes
+    math.ceil(content_bytes / _REQUEST_BYTES_PER_TOKEN)
     + _REQUEST_TOKEN_FRAMING_BASE
     + snapshot.message_count * _REQUEST_TOKEN_FRAMING_PER_MESSAGE
     + snapshot.tool_count * _REQUEST_TOKEN_FRAMING_PER_TOOL
   )
 
 
-def conservative_request_input_token_bound_for_request(
+def request_input_token_estimate_for_request(
   *,
   system_text: str,
   messages: list[dict[str, Any]],
   tools: list[dict[str, Any]],
 ) -> int:
-  """Build the conservative bound from the exact final request surfaces."""
+  """Build the calibrated estimate from the exact final request surfaces."""
 
-  return conservative_request_input_token_bound(
+  return request_input_token_estimate(
     token_estimate_snapshot(
       system_text=system_text,
       messages=messages,

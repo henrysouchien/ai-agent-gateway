@@ -16,10 +16,12 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from agent_gateway.autonomous_event_channel import snapshot_autonomous_event  # noqa: E402
 from agent_gateway.mcp_activation import McpActivationFold  # noqa: E402
 from agent_gateway.mcp_client import McpClientManager  # noqa: E402
 from agent_gateway.server import ChatRequest  # noqa: E402
-from agent_gateway import AgentRunner, AgentSessionLog, EventLog, ModelInfo, ModelProvider, SessionStore, ToolDispatcher  # noqa: E402
+from agent_gateway.skill_result_events import extract_fms_results  # noqa: E402
+from agent_gateway import AgentRunner, AgentSessionLog, EventLog, ModelInfo, ModelProvider, SessionStore, ToolDispatcher, ToolResultContext  # noqa: E402
 from agent_gateway.code_execution import CodeExecutionConfig, DockerBackend, build_code_execution  # noqa: E402
 from agent_gateway.providers import StreamEvent  # noqa: E402
 from agent_gateway.sub_agent import make_run_agent_handler  # noqa: E402
@@ -28,6 +30,7 @@ from agent_gateway.tool_result_compaction import (  # noqa: E402
   compact_model_tool_result_entry,
   is_error_tool_result_entry,
   make_error_result,
+  project_tool_call_complete_for_stream,
   truncate_model_tool_result_content,
   write_tool_result_spill,
 )
@@ -938,6 +941,342 @@ def test_runner_spills_large_tool_result_and_exact_reader_is_retry_safe(tmp_path
       assert error is None
       assert result is not None
       assert result["stdout"] == f"{PAYLOAD_SIZE}\n"
+
+  _run(_run_test())
+
+
+def test_streamed_tool_call_complete_fits_the_autonomous_event_channel(tmp_path: Path) -> None:
+  # Local run bg_353 (2026-09-17): a 2.49 MB child `get_financials` result rode
+  # `tool_call_complete.result` onto the autonomous event channel, tripped its
+  # per-event bound, and killed a run that had already produced its deliverable.
+  async def _run_test() -> None:
+    payload = "x" * (2 * 1024 * 1024)
+
+    async def _big_data(_tool_input: dict[str, Any], **kwargs: Any):
+      _ = kwargs
+      return {"status": "success", "payload": payload}, None
+
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(
+      session,
+      config=CodeExecutionConfig(work_dir_root=str(tmp_path)),
+    )
+    spill_sink = SpillSink(
+      root_provider=bundle.ensure_work_dir,
+      capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+    )
+    local_handlers = dict(bundle.handlers)
+    local_handlers["big_data"] = _big_data
+    event_log = EventLog()
+    provider = _RecordingProvider([
+      _tool_use_turn("tool-1", "big_data"),
+      _text_turn("done"),
+    ])
+    runner = AgentRunner(
+      event_log=event_log,
+      dispatcher=_dispatcher(event_log, local_handlers, approval_key_qualifier=bundle.approval_qualifier),
+      session_id="sess-spill",
+      capability_execution=stub_runner_capability_execution(
+        provider=provider,
+        auth_config={"api_key": "k"},
+        model="stub-model",
+        effort="none",
+      ),
+      get_tool_definitions=lambda: [_tool_def("big_data"), *bundle.tool_definitions],
+      user_id="alice",
+      request_id="req-spill",
+      billing_mode="byok",
+      rate_table_version="unknown",
+      code_execution_spill_dir_provider=spill_sink,
+    )
+    durable_events: list[dict[str, Any]] = []
+    append_durable_event = runner._append_durable_event
+
+    async def _capture_durable_event(event: dict[str, Any]) -> Any:
+      durable_events.append(event)
+      return await append_durable_event(event)
+
+    runner._append_durable_event = _capture_durable_event
+
+    await runner.run(messages=[{"role": "user", "content": "load"}], system_prompt="x", max_turns=2)
+
+    streamed_event = next(
+      entry.event for entry in event_log.entries if entry.event.get("type") == "tool_call_complete"
+    )
+    # The bounded transport must accept the streamed projection unchanged.
+    snapshot_autonomous_event(streamed_event)
+    streamed_result = streamed_event["result"]
+    assert streamed_result["spill_ref"].startswith("spill:v1:")
+    assert payload not in json.dumps(streamed_event, default=str)
+
+    durable_event = next(
+      event for event in durable_events if event.get("type") == "tool_call_complete"
+    )
+    assert durable_event["result"] == {"status": "success", "payload": payload}
+
+  _run(_run_test())
+
+
+def test_streamed_tool_call_complete_keeps_the_fms_door_envelope(tmp_path: Path) -> None:
+  # A successful `fms_persist_business_model` result is swapped for its
+  # model-facing receipt at any size. The live event log is what skill capture,
+  # sub-agent result delivery and the `fms_*` door extractors read, so a result
+  # the channel frame can carry must still stream as the whole envelope.
+  envelope = {
+    "status": "success",
+    "subcommand": "persist_business_model",
+    "mutation_mode": "commit",
+    "proposal_id": "prop-1",
+    "artifact_ref": "fms://business-model/1",
+    "verdict": {"verdict": "accepted", "confidence": "high", "revision": "r3"},
+    "verdict_echo": {"verdict": "accepted"},
+    "readback": {"typed_outputs": {"business_model_stage_receipt": {"status": "ok"}}},
+  }
+
+  async def _run_test() -> None:
+    async def _persist(_tool_input: dict[str, Any], **kwargs: Any):
+      _ = kwargs
+      return dict(envelope), None
+
+    event_log = EventLog()
+    provider = _RecordingProvider([
+      _tool_use_turn("tool-1", "fms_persist_business_model"),
+      _text_turn("done"),
+    ])
+    runner = AgentRunner(
+      event_log=event_log,
+      dispatcher=_dispatcher(event_log, {"fms_persist_business_model": _persist}),
+      session_id="sess-spill",
+      capability_execution=stub_runner_capability_execution(
+        provider=provider,
+        auth_config={"api_key": "k"},
+        model="stub-model",
+        effort="none",
+      ),
+      get_tool_definitions=lambda: [_tool_def("fms_persist_business_model")],
+      user_id="alice",
+      request_id="req-spill",
+      billing_mode="byok",
+      rate_table_version="unknown",
+      code_execution_spill_dir_provider=SpillSink(
+        root_provider=lambda: str(tmp_path),
+        capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+      ),
+    )
+
+    await runner.run(messages=[{"role": "user", "content": "persist"}], system_prompt="x", max_turns=2)
+
+    captured = extract_fms_results(event_log.entries)
+    assert [result["subcommand"] for result in captured] == ["persist_business_model"]
+    assert captured[0]["mutation_mode"] == "commit"
+    assert captured[0]["verdict_echo"] == {"verdict": "accepted"}
+
+    streamed_event = next(
+      entry.event for entry in event_log.entries if entry.event.get("type") == "tool_call_complete"
+    )
+    # The model still sees only the receipt: persisted bulk stays out of context.
+    model_block = json.loads(streamed_event["final_tool_result_blocks"][0]["content"])
+    assert model_block["stage_receipt_status"] == "ok"
+    assert "readback" not in model_block
+
+  _run(_run_test())
+
+
+def test_streamed_door_result_over_the_frame_keeps_its_staged_envelope(tmp_path: Path) -> None:
+  # McpStdio :8211 (2026-09-23): a 2.67 M-char staged `fms_propose_competitive_position`
+  # result streamed as the model's compacted copy, whose envelope sat under
+  # `content_projection`; the door extractors skipped it and the pipeline gated
+  # competitive-position on the refusal the model had already repaired.
+  staged_proposal = {"changes": [{"path": f"drivers.{index}", "value": "z" * 4096} for index in range(640)]}
+  envelope = {
+    "status": "staged",
+    "subcommand": "propose_competitive_position",
+    "mutation_mode": "preview",
+    "gate_code": "PROCEED",
+    "artifact_ref": "artifacts/PCTY/competitive-position/proposal.json",
+    "staged_proposal": staged_proposal,
+  }
+
+  async def _run_test() -> None:
+    async def _propose(_tool_input: dict[str, Any], **kwargs: Any):
+      _ = kwargs
+      return json.loads(json.dumps(envelope)), None
+
+    event_log = EventLog()
+    provider = _RecordingProvider([
+      _tool_use_turn("tool-1", "fms_propose_competitive_position"),
+      _text_turn("done"),
+    ])
+    runner = AgentRunner(
+      event_log=event_log,
+      dispatcher=_dispatcher(event_log, {"fms_propose_competitive_position": _propose}),
+      session_id="sess-spill",
+      capability_execution=stub_runner_capability_execution(
+        provider=provider,
+        auth_config={"api_key": "k"},
+        model="stub-model",
+        effort="none",
+      ),
+      get_tool_definitions=lambda: [_tool_def("fms_propose_competitive_position")],
+      user_id="alice",
+      request_id="req-spill",
+      billing_mode="byok",
+      rate_table_version="unknown",
+      code_execution_spill_dir_provider=SpillSink(
+        root_provider=lambda: str(tmp_path),
+        capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+      ),
+    )
+
+    await runner.run(messages=[{"role": "user", "content": "propose"}], system_prompt="x", max_turns=2)
+
+    streamed_event = next(
+      entry.event for entry in event_log.entries if entry.event.get("type") == "tool_call_complete"
+    )
+    assert len(json.dumps(envelope)) > 2 * 1024 * 1024
+    # The bounded transport must accept the streamed projection unchanged.
+    snapshot_autonomous_event(streamed_event)
+    # The truncation is typed on the result the readers see.
+    assert streamed_event["result"]["_runner_truncated"] is True
+    assert streamed_event["result"]["spill_ref"].startswith("spill:v1:")
+
+    captured = extract_fms_results(event_log.entries)
+    assert [
+      (result["status"], result["subcommand"], result["mutation_mode"], result["gate_code"])
+      for result in captured
+    ] == [("staged", "propose_competitive_position", "preview", "PROCEED")]
+    assert captured[0]["artifact_ref"] == envelope["artifact_ref"]
+
+  _run(_run_test())
+
+
+def test_streamed_projection_of_a_wide_nested_result_fits_the_frame() -> None:
+  # Every full-depth rung keeps 16 keys per level, so five levels of 20-key
+  # dicts still project to ~11.7 M chars, and 400 wide top-level strings of
+  # four-byte characters outgrow a rung sized in characters; the stream must
+  # end on a rung the frame carries, with the envelope's top level intact.
+  def _nested(depth: int) -> Any:
+    return 1 if depth == 0 else {f"k{index}": _nested(depth - 1) for index in range(20)}
+
+  result = {"status": "staged", "subcommand": "propose_x", "mutation_mode": "preview", "tree": _nested(5)}
+  result.update({f"f{index}": "\N{GRINNING FACE}" * 3000 for index in range(400)})
+  content = json.dumps(result)
+  result_entry = {"type": "tool_result", "tool_use_id": "tool-1", "content": content}
+  live_content, _ = truncate_model_tool_result_content(content, tool_name="fms_propose_x", max_chars=60_000)
+  event = {"type": "tool_call_complete", "tool_name": "fms_propose_x", "result": result}
+
+  streamed = project_tool_call_complete_for_stream(
+    event,
+    result_entry=result_entry,
+    live_entry=dict(result_entry, content=live_content),
+  )
+
+  snapshot_autonomous_event(streamed)
+  assert extract_fms_results([streamed])[0]["status"] == "staged"
+
+
+def test_streamed_code_execute_event_projects_when_its_images_outgrow_the_frame(
+  tmp_path: Path,
+) -> None:
+  # `strip_code_execute_base64_hook` rewrites the model-facing content only:
+  # every `data_base64` becomes an `[image: …]` placeholder there while
+  # `event["result"]` keeps the base64. A default-settings `code_execute` result
+  # — 100 KB of stdout plus 5 plots of 500 KB — is therefore ~100 K model chars
+  # and ~2.5 MB on the wire, so a size decision taken on the model content
+  # streams an event the 2 MiB channel bound refuses.
+  stdout = "y" * 100_000
+  images = [
+    {
+      "filename": f"plot-{index}.png",
+      "media_type": "image/png",
+      "data_base64": "A" * (500 * 1024),
+    }
+    for index in range(5)
+  ]
+
+  async def _run_test() -> None:
+    async def _code_execute(_tool_input: dict[str, Any], **kwargs: Any):
+      _ = kwargs
+      return {
+        "status": "success",
+        "stdout": stdout,
+        "stderr": "",
+        "images": [dict(image) for image in images],
+      }, None
+
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(
+      session,
+      config=CodeExecutionConfig(work_dir_root=str(tmp_path)),
+    )
+    local_handlers = dict(bundle.handlers)
+    local_handlers["code_execute"] = _code_execute
+
+    # Production reaches the bundle's synchronous sanitize hook through the
+    # runner's awaited `on_tool_result` seam (`easy.py` `_combined_on_tool_result`).
+    async def _sanitize_tool_result(ctx: ToolResultContext) -> None:
+      bundle.sanitize_hook(ctx)
+
+    event_log = EventLog()
+    provider = _RecordingProvider([
+      _tool_use_turn("tool-1", "code_execute", {"code": "print(1)"}),
+      _text_turn("done"),
+    ])
+    runner = AgentRunner(
+      event_log=event_log,
+      dispatcher=_dispatcher(
+        event_log,
+        local_handlers,
+        approval_key_qualifier=bundle.approval_qualifier,
+      ),
+      session_id="sess-spill",
+      capability_execution=stub_runner_capability_execution(
+        provider=provider,
+        auth_config={"api_key": "k"},
+        model="stub-model",
+        effort="none",
+      ),
+      get_tool_definitions=lambda: list(bundle.tool_definitions),
+      on_tool_result=_sanitize_tool_result,
+      user_id="alice",
+      request_id="req-spill",
+      billing_mode="byok",
+      rate_table_version="unknown",
+      code_execution_spill_dir_provider=SpillSink(
+        root_provider=bundle.ensure_work_dir,
+        capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+      ),
+    )
+
+    durable_events: list[dict[str, Any]] = []
+    append_durable_event = runner._append_durable_event
+
+    async def _capture_durable_event(event: dict[str, Any]) -> Any:
+      durable_events.append(event)
+      return await append_durable_event(event)
+
+    runner._append_durable_event = _capture_durable_event
+
+    await runner.run(messages=[{"role": "user", "content": "plot"}], system_prompt="x", max_turns=2)
+
+    streamed_event = next(
+      entry.event for entry in event_log.entries if entry.event.get("type") == "tool_call_complete"
+    )
+    # The hook stripped the images from the model block, so that block alone
+    # never reveals how large the event is.
+    assert "A" * 1024 not in streamed_event["final_tool_result_blocks"][0]["content"]
+    # The bounded transport must accept the streamed projection unchanged.
+    snapshot_autonomous_event(streamed_event)
+    assert streamed_event["result"]["spill_ref"].startswith("spill:v1:")
+    # The images stream elided, each cut marked in place, never as their base64.
+    for image in streamed_event["result"]["images"]:
+      assert "...<elided chars=" in image["data_base64"]
+      assert image["filename"].startswith("plot-")
+
+    durable_event = next(
+      event for event in durable_events if event.get("type") == "tool_call_complete"
+    )
+    assert durable_event["result"]["images"][0]["data_base64"] == "A" * (500 * 1024)
 
   _run(_run_test())
 

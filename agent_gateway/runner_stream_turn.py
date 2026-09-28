@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("agent_gateway.runner")
 STREAM_GUARD_POLL_INTERVAL = 2.0
+STREAM_PROGRESS_LOG_INTERVAL = 60.0
 STREAM_RETRY_MAX = 3
 STREAM_RETRY_DELAY = 2.0
 STREAM_RETRY_BACKOFF = 2.0
@@ -88,7 +89,6 @@ class RunnerStreamTurnMixin:
     )
     _last_request_system_blocks: tuple[tuple[str, bool], ...]
     _last_request_wire_tools: list[dict[str, Any]]
-    _per_turn_timeout: float | None
     _provider: ModelProvider
     _sid: str
     _stream_stall_timeout: float | None
@@ -107,11 +107,6 @@ class RunnerStreamTurnMixin:
       model: str,
       usage_totals: _UsageTotals,
     ) -> UsageEvent: ...
-
-    async def _call_credential_refresher(
-      self,
-      failure: ProviderCredentialFailure,
-    ) -> Dict[str, Any] | None: ...
 
     def _call_metric(self, name: str, value: int = 1) -> None: ...
 
@@ -232,6 +227,7 @@ class RunnerStreamTurnMixin:
     stream_retry_backoff = _runner_attr(self, "STREAM_RETRY_BACKOFF", STREAM_RETRY_BACKOFF)
     stream_guard_poll_interval = _runner_attr(self, "STREAM_GUARD_POLL_INTERVAL", STREAM_GUARD_POLL_INTERVAL)
     last_progress_at = time_module.monotonic()
+    progress_events = 0
     guard_reason: tuple[str, str] | None = None
     requested_effort = parse_effort(
       config.get("effort"),
@@ -358,7 +354,7 @@ class RunnerStreamTurnMixin:
     )
 
     async def _consume_stream(params: Dict[str, Any], result: StreamTurnResult) -> None:
-      nonlocal last_progress_at
+      nonlocal last_progress_at, progress_events
       first_turn = turn_count == 1
       logger.debug("[%s] Turn %d stream open", self._sid, turn_count)
 
@@ -366,6 +362,7 @@ class RunnerStreamTurnMixin:
         event_type = event.type
         if event_type != "heartbeat":
           last_progress_at = time_module.monotonic()
+          progress_events += 1
 
         if event_type == "message_start":
           bind = self._capability_execution.bind
@@ -518,6 +515,7 @@ class RunnerStreamTurnMixin:
 
     async def _stream_guard(task: asyncio.Task, turn_start_mono: float) -> None:
       nonlocal guard_reason
+      next_progress_log_at = turn_start_mono + STREAM_PROGRESS_LOG_INTERVAL
       while not task.done():
         await asyncio_module.sleep(stream_guard_poll_interval)
         if task.done():
@@ -529,11 +527,26 @@ class RunnerStreamTurnMixin:
           logger.error("[%s] Turn %d watchdog (%s): %s", self._sid, turn_count, guard_reason[0], guard_reason[1])
           task.cancel()
           return
-        if self._per_turn_timeout is not None and (now - turn_start_mono) > self._per_turn_timeout:
-          guard_reason = ("timeout", f"turn timeout after {now - turn_start_mono:.0f}s")
-          logger.error("[%s] Turn %d watchdog (%s): %s", self._sid, turn_count, guard_reason[0], guard_reason[1])
-          task.cancel()
-          return
+        if now >= next_progress_log_at:
+          logger.info(
+            "[%s] Turn %d streaming: elapsed=%.0fs last_progress=%.0fs ago events=%d",
+            self._sid,
+            turn_count,
+            now - turn_start_mono,
+            stall,
+            progress_events,
+          )
+          # Liveness signal: a parent's activity guard stamps a child from it
+          # while the child streams output (a large tool input appends nothing
+          # else). Clients drop it. Not in the session log; the chat transcript
+          # and autonomous events files record it like every streamed event.
+          self._append({
+            "type": "heartbeat",
+            "elapsed_s": int(now - turn_start_mono),
+            "last_progress_s": int(stall),
+            "events": progress_events,
+          })
+          next_progress_log_at = now + STREAM_PROGRESS_LOG_INTERVAL
 
     stream_error: Exception | None = None
 
@@ -545,8 +558,6 @@ class RunnerStreamTurnMixin:
       if stream_error is not None:
         raise stream_error
       raise asyncio_module.CancelledError()
-
-    credential_refresh_attempted = False
 
     for attempt in range(1 + stream_retry_max):
       if attempt > 0:
@@ -567,6 +578,7 @@ class RunnerStreamTurnMixin:
         await asyncio_module.sleep(delay)
 
       last_progress_at = time_module.monotonic()
+      progress_events = 0
       commercial_producer = getattr(self, "_commercial_usage_producer", None)
       commercial_guard = getattr(commercial_producer, "assert_work_allowed", None)
       if callable(commercial_guard):
@@ -693,15 +705,17 @@ class RunnerStreamTurnMixin:
           credential_failure = self._provider.classify_credential_failure(exc)
         except Exception as classify_exc:
           logger.warning("[%s] credential failure classification failed (non-fatal): %s", self._sid, classify_exc)
-        if credential_failure is not None and not credential_refresh_attempted:
-          credential_refresh_attempted = True
-          refreshed_config = await self._call_credential_refresher(credential_failure)
-          if refreshed_config is not None:
-            self._apply_refreshed_auth_config(config, refreshed_config)
+        if credential_failure is not None:
+          # The provider owns which credentials are interchangeable; the bound
+          # model is untouched, so a spent credential costs one attempt of this
+          # turn instead of the run.
+          rotated_config = self._provider.next_credential(config, credential_failure)
+          if rotated_config is not None:
+            self._apply_refreshed_auth_config(config, rotated_config)
             usage_totals.clear()
             usage_totals.update(usage_before_attempt)
-            stream_error = RuntimeError(f"credential refreshed after {credential_failure.kind}")
-            self._call_metric("gateway.credential_refresh_success", 1)
+            stream_error = RuntimeError(f"credential rotated after {credential_failure.kind}")
+            self._call_metric("gateway.credential_rotated", 1)
             self._append(
               {
                 "type": "credential_refreshed",
@@ -712,7 +726,7 @@ class RunnerStreamTurnMixin:
             )
             await self._emit_stream_retry_event(
               attempt=attempt,
-              error=f"credential refreshed after provider {credential_failure.kind} failure",
+              error=f"credential rotated after provider {credential_failure.kind} failure",
             )
             if partial_usage_state.has_tokens:
               await self._call_on_usage(

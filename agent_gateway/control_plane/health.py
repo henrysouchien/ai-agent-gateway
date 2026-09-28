@@ -40,6 +40,9 @@ def _control_route_entries(request: Request, route_prefix: str) -> list[str]:
   for route, path in iter_api_routes(request.app.routes):
     if path != control_prefix and not path.startswith(f"{control_prefix}/"):
       continue
+    # FastAPI always populates an APIRoute's method set; the Optional comes from
+    # starlette's base Route, where a mounted route may carry none.
+    assert route.methods is not None
     methods = sorted(method for method in route.methods if method not in {"HEAD", "OPTIONS"})
     entries.extend(f"{method} {path}" for method in methods)
   return sorted(entries)

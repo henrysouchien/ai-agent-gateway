@@ -1,5 +1,4 @@
 import asyncio
-import inspect
 import json
 import logging
 import sys
@@ -28,7 +27,7 @@ from agent_gateway import (  # noqa: E402
   StreamEvent,
   ToolDispatcher,
 )
-from agent_gateway.auth import AuthConfig, NoCredentialError, ProviderCredentialFailure, ResolverResult  # noqa: E402
+from agent_gateway.auth import AuthConfig, NoCredentialError, ResolverResult  # noqa: E402
 from agent_gateway.capability_binding import (  # noqa: E402
   CredentialHandle,
 )
@@ -60,10 +59,6 @@ class _StubRunner(AgentRunner):
   def __init__(self, event_log, run_calls: list[dict[str, Any]]) -> None:
     self._event_log = event_log
     self._run_calls = run_calls
-    self._credential_refresher = None
-
-  def set_credential_refresher(self, callback) -> None:
-    self._credential_refresher = callback
 
   async def run(
     self,
@@ -81,17 +76,6 @@ class _StubRunner(AgentRunner):
         "max_turns": max_turns,
       }
     )
-    if self._credential_refresher is not None:
-      refresh_result = self._credential_refresher(
-        ProviderCredentialFailure(
-          provider="anthropic",
-          kind="rate_limit",
-          status_code=429,
-          message="rate limit exceeded",
-        )
-      )
-      assert inspect.isawaitable(refresh_result)
-      await refresh_result
     self._event_log.append({"type": "stream_complete", "usage": {}})
 
 

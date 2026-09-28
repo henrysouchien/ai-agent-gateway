@@ -56,6 +56,7 @@ from .transcript import (
 if TYPE_CHECKING:
   from .context_builder import Message
   from .runner import AgentRunner
+  from .runner_tool_execution import AgentRunnerDispatcher
 
 
 log = logging.getLogger("agent_gateway.runner")
@@ -545,12 +546,14 @@ async def spawn_fork_agent(
   attempt: AttemptRef,
   result_requirement: ResultRequirement,
   result_provenance: TaskResultProvenance,
-  dispatcher: Any,
+  dispatcher: AgentRunnerDispatcher,
+  local_handler_scopes: (
+    Mapping[str, Callable[[LocalToolHandler], LocalToolHandler]] | None
+  ) = None,
   scope_receipt: Mapping[str, Any],
   max_turns: int,
   max_budget_usd: float,
   suffix_ceiling: int,
-  timeout: float | None = None,
   client_timeout: float = 90,
   call_index: int = 0,
   parent_turn_id: str | None = None,
@@ -608,11 +611,11 @@ async def spawn_fork_agent(
   sub_log = _fork_event_log(parent, sub_session_id=sub_session_id)
   if event_log_observer is not None:
     event_log_observer(sub_log)
-  child_dispatcher = copy.copy(dispatcher)
-  if hasattr(child_dispatcher, "_event_log"):
-    child_dispatcher._event_log = sub_log
-  if hasattr(child_dispatcher, "_session_id"):
-    child_dispatcher._session_id = sub_session_id
+  child_dispatcher = dispatcher.fork_child(
+    event_log=sub_log,
+    session_id=sub_session_id,
+    local_handler_scopes=local_handler_scopes,
+  )
   policy_dispatcher = ForkPolicyDispatcher(
     child_dispatcher,
     wire_tools=handoff.wire_tools,
@@ -636,7 +639,6 @@ async def spawn_fork_agent(
     capability_execution=capability_execution,
     client_timeout=client_timeout,
     max_tokens_override=handoff.max_tokens,
-    per_turn_timeout=parent._per_turn_timeout,
     stream_stall_timeout=parent._stream_stall_timeout,
     mcp_client=parent._mcp_client,
     mcp_activation_fold=parent._mcp_activation_fold,
@@ -691,7 +693,6 @@ async def spawn_fork_agent(
   child_messages, child_marker_position = _build_fork_context(handoff, directive)
   sub_runner._fork_marker_position = child_marker_position
 
-  timed_out = False
   runtime_error_detail: str | None = None
   cancelled_error: asyncio.CancelledError | None = None
   cancellation_signal: str | None = None
@@ -703,17 +704,7 @@ async def spawn_fork_agent(
     resume_initial_messages=child_messages,
   )
   try:
-    if timeout is not None and timeout > 0:
-      await asyncio.wait_for(run_coro, timeout=timeout)
-    else:
-      await run_coro
-  except asyncio.TimeoutError as exc:
-    timed_out = True
-    cleanup_warnings.extend(cleanup_failure_notes(exc))
-    sub_log.append({
-      "type": "error",
-      "error": f"Forked sub-agent timed out after {timeout}s",
-    })
+    await run_coro
   except asyncio.CancelledError as exc:
     cancelled_error = exc
     cancellation_signal = (
@@ -736,7 +727,7 @@ async def spawn_fork_agent(
     ) = await _close_sub_runner(
       sub_runner,
       sub_log,
-      timed_out=timed_out,
+      stalled=False,
       cancelled_error=cancelled_error,
       cancellation_signal=cancellation_signal,
       runtime_exception_detail=runtime_error_detail,
@@ -765,8 +756,7 @@ async def spawn_fork_agent(
     requirement=result_requirement,
     provenance=result_provenance,
     final_narrative=narrative_text.final_narrative,
-    timed_out=timed_out,
-    timeout=timeout,
+    stalled=False,
     runtime_error_detail=runtime_error_detail,
     external_terminal_signals=signals,
     # B-3: the authority frozen at admission, never the ambient catalog.
@@ -889,20 +879,6 @@ async def spawn_learning_fork(
     outcome=OutcomeRequirement(required=False, source="none"),
   )
   event_log_box: list[EventLog] = []
-  try:
-    dispatcher = parent._dispatcher.with_scoped_local_handler(
-      "memory_write",
-      lambda stock: work_item.config.scope_memory_write(
-        stock,
-        fork_id=fork_id,
-        user_id=work_item.user_id,
-      ),
-    )
-  except KeyError:
-    raise RuntimeError(
-      "learning fork requires the stock memory_write handler"
-    ) from None
-
   budget = float(learn_fork_budget_usd())
   suffix_ceiling = fork_suffix_max_tokens()
   scope_receipt = fork_scope_receipt_dict(
@@ -933,7 +909,14 @@ async def spawn_learning_fork(
     attempt=attempt,
     result_requirement=result_requirement,
     result_provenance=result_provenance,
-    dispatcher=dispatcher,
+    dispatcher=parent._dispatcher,
+    local_handler_scopes={
+      "memory_write": lambda stock: work_item.config.scope_memory_write(
+        stock,
+        fork_id=fork_id,
+        user_id=work_item.user_id,
+      ),
+    },
     scope_receipt=scope_receipt,
     max_turns=LEARNING_FORK_MAX_TURNS,
     max_budget_usd=budget,

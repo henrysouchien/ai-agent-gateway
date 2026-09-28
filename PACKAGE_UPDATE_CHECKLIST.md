@@ -45,6 +45,26 @@ Reference this checklist when adding features, fixing bugs, or changing the publ
 - **`docs/comparison.md`** — only update if a feature changes our competitive positioning
 - **`CONTRIBUTING.md`** — only update if dev workflow changes
 
+## Registry or selection change
+
+Consumers read `agent_gateway/model_authority/product-model-registry.yaml` and
+`product-model-selection.yaml` from the installed wheel. A change that bumps
+either file's `revision` is a release, and no consumer sees it until each step
+below has run:
+
+- [ ] **Liveness** — from the ai-excel-addin root,
+  `.venv/bin/python3 scripts/model_registry_liveness.py --provider anthropic`
+  reports 0 unserved before publishing (it reads `ANTHROPIC_API_KEY` or
+  `ANTHROPIC_AUTH_TOKEN`)
+- [ ] **Republish** — bump the version and run the Publish steps below
+- [ ] **Relock each consumer** — risk_module: move the `requirements.txt` range
+  to the new version, `make requirements-lock`, and deploy, which installs
+  `--require-hashes -r requirements.lock`; investment_tools: move the
+  `pyproject.toml` range, `uv lock`, and install through its path
+  (`uv export --locked` in ai-excel-addin `scripts/deploy_investment_tools.sh`)
+- [ ] **Redeploy** — every consumer and gateway runtime; a relocked lock on
+  `main` is landed, not deployed
+
 ## Publish
 
 - [ ] **Commit** the feature + doc updates together

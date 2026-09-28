@@ -1,7 +1,10 @@
-# Privileged TCP launcher: privileged_claim_launcher hands off a claim-signing
-# fd; this boundary delegates to uvicorn.Config/Server.run with exactly one worker.
-# Uvicorn 0.53 app-load/bind/lifespan failures exit 3 and are logged here;
-# systemd Restart=always still restarts them.
+# TCP launch boundary for both supported launches: on the privileged host
+# privileged_claim_launcher hands off a claim-signing fd, and the local
+# immutable child (scripts/local_gateway_python_child.py, target
+# research-gateway-uvicorn) calls run_gateway_server directly. This boundary
+# delegates to uvicorn.Config/Server.run with exactly one worker. Uvicorn 0.53
+# app-load/bind/lifespan failures exit 3 and are logged here; systemd
+# Restart=always still restarts them.
 # Owners: packages/agent-gateway/README.md;
 # docs/reference/local-gateway-immutable-runtime.md.
 
@@ -54,7 +57,7 @@ def harden_claim_signing_process_boundary() -> None:
 
 def run_gateway_server(
   *,
-  claim_signing_key_fd: int,
+  claim_signing_key_fd: int | None,
   workers: int = 1,
   timeout_keep_alive: int = 120,
   timeout_graceful_shutdown: int = 30,
@@ -88,11 +91,16 @@ def run_gateway_server(
     raise ValueError(
       "ssl_keyfile and ssl_certfile must be provided together"
     )
-  harden_claim_signing_process_boundary()
-  authority = GatewayClaimSigningAuthority.from_one_shot_fd(
-    claim_signing_key_fd
-  )
-  install_gateway_claim_signing_authority(authority)
+  # A missing fd is the degraded local boot the launcher already reports
+  # ("claim-signing authority unavailable ..."): the gateway serves, and
+  # autonomous dispatch stays refused for want of installed authority. The
+  # privileged path's --claim-signing-key-fd is required, so it never lands here.
+  if claim_signing_key_fd is not None:
+    harden_claim_signing_process_boundary()
+    authority = GatewayClaimSigningAuthority.from_one_shot_fd(
+      claim_signing_key_fd
+    )
+    install_gateway_claim_signing_authority(authority)
   if ssl_keyfile is None:
     config = uvicorn.Config(
       app,

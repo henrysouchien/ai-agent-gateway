@@ -262,15 +262,21 @@ def test_nested_metadata_catalog_is_not_visibility_authority(
   )
 
 
-def test_hidden_skill_skips_loader_and_detail_matches_absent(
+def test_hidden_skill_skips_the_listing_loader_but_still_resolves(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+  """Withholding a skill from the listing must not withhold its record.
+
+  The control plane resolves the skill it is about to launch; a hidden
+  skill that read as absent was dispatched without its launch verdict.
+  """
   root = tmp_path / "skills"
   _write_skill(
     root,
     "hidden-skill",
-    frontmatter="catalog: 'off'\nmax_turns: not-an-int",
+    frontmatter="catalog: 'off'\nagent_callable: true",
+    body="Hidden body.",
   )
 
   class RefusingLoader:
@@ -283,27 +289,27 @@ def test_hidden_skill_skips_loader_and_detail_matches_absent(
   )
   catalog = DirectoryControlSkillCatalog(root)
   assert catalog.list_skills() == ()
-  with pytest.raises(ControlSkillUnavailableError) as hidden:
-    catalog.resolve_skill("hidden-skill")
   with pytest.raises(ControlSkillUnavailableError) as absent:
     catalog.resolve_skill("absent-skill")
-  assert hidden.value.code == absent.value.code == "unknown"
-  assert str(hidden.value) == str(absent.value)
-  for error in (hidden.value, absent.value):
-    assert error.__cause__ is None
-    assert error.__context__ is None
+  assert absent.value.code == "unknown"
+  assert absent.value.__cause__ is None
+  assert absent.value.__context__ is None
+
+  monkeypatch.undo()
+  hidden = DirectoryControlSkillCatalog(root).resolve_skill("hidden-skill")
+  assert hidden.catalog is False
+  assert hidden.can_launch is True
+  assert hidden.body == "Hidden body."
 
 
-@pytest.mark.parametrize("operation", ["list", "detail"])
 @pytest.mark.parametrize(
   "newline",
   [b"\r\n", b"\r"],
   ids=("crlf", "bare-cr"),
 )
-def test_hidden_source_stops_at_binary_frontmatter_delimiter(
+def test_listing_stops_at_a_hidden_skill_binary_frontmatter_delimiter(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
-  operation: str,
   newline: bytes,
 ) -> None:
   root = tmp_path / "skills"
@@ -362,14 +368,7 @@ def test_hidden_source_stops_at_binary_frontmatter_delimiter(
   monkeypatch.setattr(Path, "open", guarded_open)
   catalog = DirectoryControlSkillCatalog(root)
 
-  if operation == "list":
-    assert catalog.list_skills() == ()
-  else:
-    with pytest.raises(ControlSkillUnavailableError) as error:
-      catalog.resolve_skill("hidden-binary")
-    assert error.value.code == "unknown"
-    assert error.value.__cause__ is None
-    assert error.value.__context__ is None
+  assert catalog.list_skills() == ()
   assert body_reads == []
   assert binary_opens == [(("rb",), {"buffering": 0})]
   expected_prefix = header[:-1] if newline == b"\r\n" else header
@@ -458,15 +457,14 @@ def test_one_source_snapshot_stabilizes_true_to_false_mutation(
     assert tuple(summary.name for summary in catalog.list_skills()) == (
       "changing-skill",
     )
+    assert loads == ["changing-skill"]
     assert catalog.list_skills() == ()
   else:
     assert catalog.resolve_skill("changing-skill").body == "Snapshot body."
-    with pytest.raises(ControlSkillUnavailableError) as error:
-      catalog.resolve_skill("changing-skill")
-    assert error.value.code == "unknown"
-    assert error.value.__cause__ is None
-    assert error.value.__context__ is None
-  assert loads == ["changing-skill"]
+    assert loads == ["changing-skill"]
+    mutated = catalog.resolve_skill("changing-skill")
+    assert mutated.catalog is False
+    assert mutated.body == "Changed"
 
 
 @pytest.mark.parametrize(

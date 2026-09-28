@@ -8,9 +8,15 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import httpx2
 import pytest
+
+if TYPE_CHECKING:
+  # `anthropic` is an optional extra (`pyproject.toml:27`), so the runtime
+  # reaches it through `pytest.importorskip` below; this is types only.
+  from anthropic import RateLimitError
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = Path(__file__).resolve().parents[1]
@@ -347,6 +353,62 @@ def test_create_client_accepts_configured_timeout_with_real_sdk() -> None:
     asyncio.run(provider.close_client(client))
 
 
+def test_create_client_surfaces_429_instead_of_sleeping_its_retry_after(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """A provider-reported reset is raised to the caller, not slept inside the request.
+
+  The gateway owns retry policy (runner_stream_turn's bounded loop plus
+  `next_credential`); with the SDK's own retry enabled it obeys this
+  `retry-after` verbatim, so `RateLimitError` never reaches the sanitizer and
+  the turn dies on the stream watchdog instead of reporting the limit.
+  """
+  anthropic = pytest.importorskip("anthropic")
+  provider = AnthropicProvider()
+  requests: list[httpx2.Request] = []
+  slept: list[float] = []
+
+  async def record_sleep(seconds: float) -> None:
+    slept.append(seconds)
+
+  monkeypatch.setattr(anthropic._base_client.anyio, "sleep", record_sleep)
+
+  def handle_request(request: httpx2.Request) -> httpx2.Response:
+    requests.append(request)
+    return httpx2.Response(
+      429,
+      headers={"retry-after": "73443"},
+      json={
+        "type": "error",
+        "error": {"type": "rate_limit_error", "message": "usage limit reached"},
+      },
+    )
+
+  async def send_request() -> "RateLimitError":
+    client = provider.create_client({"auth_mode": "api", "api_key": "bound-api-key"})
+    try:
+      async with httpx2.AsyncClient(
+        transport=httpx2.MockTransport(handle_request),
+      ) as http_client:
+        async with client.with_options(http_client=http_client) as local_client:
+          with pytest.raises(anthropic.RateLimitError) as caught:
+            await local_client.messages.create(
+              model="claude-sonnet-4-6",
+              max_tokens=16,
+              messages=[{"role": "user", "content": "hello"}],
+            )
+      return caught.value
+    finally:
+      await provider.close_client(client)
+
+  error = asyncio.run(send_request())
+
+  assert len(requests) == 1
+  assert slept == []
+  assert error.response.headers["retry-after"] == "73443"
+  assert provider.is_retryable_error(error) is True
+
+
 def test_raw_httpx2_transport_error_is_retryable() -> None:
   error = httpx2.ReadError(
     "connection closed during stream",
@@ -447,6 +509,72 @@ def test_create_client_isolates_bound_credentials_and_routes_concurrently(
   assert oauth_request.url == httpx2.URL("https://bound.anthropic.example/v1/messages")
   assert oauth_request.headers.get_list("authorization") == ["Bearer bound-oauth-token"]
   assert "x-api-key" not in oauth_request.headers
+
+
+@pytest.mark.parametrize(
+  ("config", "custom_headers", "header", "expected", "omitted_header"),
+  [
+    (
+      {"auth_mode": "oauth", "auth_token": "bound-oauth-token"},
+      "Authorization:",
+      "authorization",
+      "Bearer bound-oauth-token",
+      "x-api-key",
+    ),
+    (
+      {"auth_mode": "api", "api_key": "bound-api-key"},
+      "Authorization:\nX-Api-Key:",
+      "x-api-key",
+      "bound-api-key",
+      "authorization",
+    ),
+  ],
+  ids=["oauth", "api-key"],
+)
+def test_create_client_ignores_empty_ambient_auth_headers(
+  monkeypatch: pytest.MonkeyPatch,
+  config: dict[str, str],
+  custom_headers: str,
+  header: str,
+  expected: str,
+  omitted_header: str,
+) -> None:
+  pytest.importorskip("anthropic")
+  monkeypatch.setenv(
+    "ANTHROPIC_CUSTOM_HEADERS",
+    f"{custom_headers}\nX-Ambient-Trace: preserved",
+  )
+  provider = AnthropicProvider()
+
+  def handle_request(request: httpx2.Request) -> httpx2.Response:
+    assert request.headers.get_list(header) == [expected]
+    assert omitted_header not in request.headers
+    assert request.headers["x-ambient-trace"] == "preserved"
+    return httpx2.Response(200, json={
+      "id": "msg_123",
+      "type": "message",
+      "role": "assistant",
+      "model": "claude-sonnet-4-6",
+      "content": [{"type": "text", "text": "hello"}],
+      "stop_reason": "end_turn",
+      "stop_sequence": None,
+      "usage": {"input_tokens": 1, "output_tokens": 1},
+    })
+
+  async def send_request() -> None:
+    async with provider.create_client(config) as client:
+      async with httpx2.AsyncClient(
+        transport=httpx2.MockTransport(handle_request),
+      ) as http_client:
+        async with client.with_options(http_client=http_client) as local_client:
+          result = await local_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hello"}],
+          )
+          assert result.content[0].text == "hello"
+
+  asyncio.run(send_request())
 
 
 @pytest.mark.parametrize(
@@ -741,8 +869,8 @@ def test_opus5_model_info_uses_bundled_rates_and_adaptive_thinking() -> None:
   ("requested", "expected_thinking", "expected_output_config"),
   [
     (ThinkingLevel.NONE, {"type": "disabled"}, None),
-    (ThinkingLevel.XHIGH, {"type": "adaptive"}, {"effort": "xhigh"}),
-    (ThinkingLevel.MAX, {"type": "adaptive"}, {"effort": "max"}),
+    (ThinkingLevel.XHIGH, {"type": "adaptive", "display": "summarized"}, {"effort": "xhigh"}),
+    (ThinkingLevel.MAX, {"type": "adaptive", "display": "summarized"}, {"effort": "max"}),
   ],
 )
 def test_opus5_resolved_effort_emits_complete_payload_pair(
@@ -792,11 +920,11 @@ def test_haiku_45_model_info_preserves_no_thinking_with_real_rates() -> None:
 @pytest.mark.parametrize(
   ("model", "expected"),
   [
-    ("claude-fable-5", {"type": "adaptive"}),
-    ("claude-opus-4-8", {"type": "adaptive"}),
-    ("claude-opus-4-7", {"type": "adaptive"}),
-    ("claude-sonnet-4-6", {"type": "adaptive"}),
-    ("claude-opus-4-6", {"type": "adaptive"}),
+    ("claude-fable-5", {"type": "adaptive", "display": "summarized"}),
+    ("claude-opus-4-8", {"type": "adaptive", "display": "summarized"}),
+    ("claude-opus-4-7", {"type": "adaptive", "display": "summarized"}),
+    ("claude-sonnet-4-6", {"type": "adaptive", "display": "summarized"}),
+    ("claude-opus-4-6", {"type": "adaptive", "display": "summarized"}),
     ("claude-sonnet-4-5", {"type": "enabled", "budget_tokens": 10000}),
     ("claude-opus-4-5", {"type": "enabled", "budget_tokens": 10000}),
     ("claude-sonnet-4", {"type": "enabled", "budget_tokens": 10000}),
@@ -885,14 +1013,13 @@ def test_registry_admitted_claude_model_without_row_derives_from_registry(
   assert compat["thinking_default_when_omitted"] == "on"
   # No "none" effort admitted => thinking cannot be explicitly disabled.
   assert compat["thinking_disable"] == "unsupported"
-  assert AnthropicProvider.thinking_param("claude-nova-6", 4096) == {"type": "adaptive"}
+  assert AnthropicProvider.thinking_param("claude-nova-6", 4096) == {"type": "adaptive", "display": "summarized"}
 
 
 @pytest.mark.parametrize(
   ("model", "expected_disable", "expected_omitted"),
   [
     ("claude-fable-5", "unsupported", "on"),
-    ("claude-mythos-5", "unsupported", "on"),
     ("claude-opus-5", "disabled", "on"),
     ("claude-sonnet-5", "disabled", "on"),
   ],
@@ -978,7 +1105,7 @@ def test_fable_request_params_do_not_send_sampling_knobs() -> None:
     thinking_level=ThinkingLevel.HIGH,
   )
 
-  assert params["thinking"] == {"type": "adaptive"}
+  assert params["thinking"] == {"type": "adaptive", "display": "summarized"}
   for key in ("temperature", "top_p", "top_k"):
     assert key not in params
 
@@ -1356,7 +1483,7 @@ def test_stream_wraps_anthropic_rejection_with_sanitized_context(caplog) -> None
     "max_tokens": 4096,
     "messages": [{"role": "user", "content": "hello"}],
     "tools": [{"name": "lookup"}],
-    "thinking": {"type": "adaptive"},
+    "thinking": {"type": "adaptive", "display": "summarized"},
     "context_management": {"edits": []},
     "_provider_auth_mode": "oauth",
   }
@@ -1425,6 +1552,25 @@ def test_stream_separates_provider_ping_from_silent_progress_metadata() -> None:
     "compaction",
     "message_end",
   ]
+
+
+def test_stream_summarized_thinking_streams_deltas_and_stores_summary_beside_signature() -> None:
+  provider = AnthropicProvider()
+  client = _FakeStreamingClient(
+    [
+      SimpleNamespace(type="content_block_start", content_block=SimpleNamespace(type="thinking")),
+      SimpleNamespace(type="content_block_delta", delta=SimpleNamespace(type="thinking_delta", thinking="Weigh ")),
+      SimpleNamespace(type="content_block_delta", delta=SimpleNamespace(type="thinking_delta", thinking="the guidance.")),
+      SimpleNamespace(type="content_block_delta", delta=SimpleNamespace(type="signature_delta", signature="sig")),
+      SimpleNamespace(type="content_block_stop"),
+    ]
+  )
+
+  events = asyncio.run(_collect_stream_events(provider, client, {"model": "claude-opus-5", "messages": []}))
+
+  assert [event.thinking_text for event in events if event.type == "thinking_delta"] == ["Weigh ", "the guidance."]
+  thinking_end = next(event for event in events if event.type == "thinking_end")
+  assert thinking_end.raw_block == {"type": "thinking", "thinking": "Weigh the guidance.", "signature": "sig"}
 
 
 def test_stream_sums_compaction_usage_iterations() -> None:
@@ -1719,16 +1865,17 @@ def test_declared_adapter_support_matches_messages_implementation() -> None:
   # Admits the packaged public-Messages entries (adaptive and standard).
   for key in (
     "anthropic.claude-opus-5",
+    "anthropic.claude-sonnet-5",
     "anthropic.claude-haiku-4-5",
-    "anthropic.claude-haiku-4-5-20251001-gateway",
   ):
     assert declaration.supports(INITIAL_MODEL_REGISTRY.require(key)), key
 
   # The Risk-local SDK adapter's execution identities are a different
   # implementation in a different serving process — never claimed here.
   for key in (
-    "anthropic.claude-sonnet-4-6-sdk",
-    "anthropic.claude-opus-4-8-oauth",
+    "anthropic.claude-sonnet-5-sdk",
+    "anthropic.claude-haiku-4-5-sdk",
+    "anthropic.claude-opus-5-5-oauth",
     "anthropic.claude-sonnet-4-20250514-sdk",
   ):
     assert not declaration.supports(INITIAL_MODEL_REGISTRY.require(key)), key

@@ -131,7 +131,6 @@ def _delegation_grant(
     tool_class_ceiling=ceiling,
     args_predicate=None,
     window_seconds=600,
-    exclude_external_write_bypass=True,
     created_at=now,
     expires_at=None,
   )

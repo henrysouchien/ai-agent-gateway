@@ -102,7 +102,7 @@ def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
       "warning_codes": [],
       "registry_scope": "session",
     },
-    {"type": "heartbeat", "timestamp": 1},
+    {"type": "heartbeat", "timestamp": 1, "elapsed_s": 61, "last_progress_s": 55, "events": 2},
     {
       "type": "interrupted",
       "reason": "recovered_on_attach",
@@ -306,6 +306,26 @@ def test_v1_adapter_preserves_artifact_ready_origin() -> None:
 
   assert adapted["origin"] == "readback"
   assert "future_only" not in adapted
+
+
+def test_v1_adapter_keeps_stream_guard_heartbeat_payload() -> None:
+  adapted = V1Adapter().transform(
+    {
+      "type": "heartbeat",
+      "elapsed_s": 61,
+      "last_progress_s": 55,
+      "events": 2,
+      "future_only": "strip-me",
+    }
+  )
+
+  assert adapted == {
+    "type": "heartbeat",
+    "elapsed_s": 61,
+    "last_progress_s": 55,
+    "events": 2,
+  }
+
 
 
 def test_v1_adapter_strips_unknown_fields_for_known_type() -> None:

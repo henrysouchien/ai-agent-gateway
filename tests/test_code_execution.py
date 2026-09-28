@@ -14,6 +14,7 @@ from agent_gateway.code_execution import CodeExecutionConfig, build_code_executi
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.event_log import EventLog
 from agent_gateway.runner import ToolResultContext
+from agent_gateway.secret_boundary import SecretBoundary
 from agent_gateway.tool_dispatcher_helpers import ToolResult
 
 
@@ -120,6 +121,52 @@ def test_code_execute_basic_execution_and_work_dir_persistence() -> None:
     assert second_result["truncated"] is False
     assert session.code_execution_work_dir is not None
     assert list(Path(session.code_execution_work_dir).glob("_code_execute_*.py")) == []
+
+  asyncio.run(_run_test())
+
+
+def test_code_execute_output_is_redacted_by_the_run_boundary() -> None:
+  # The sandbox prints whatever the model told it to print. A run's active
+  # credential that the model found on disk or in a variable must not reach the
+  # result the session persists, nor the streamed chunk that precedes it.
+  async def _run_test() -> None:
+    canary = "CUSTOM-ACTIVE-CREDENTIAL-CODE-EXECUTE"
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
+    event_log = EventLog()
+    dispatcher = ToolDispatcher(
+      mcp_client=_FakeMcp(),
+      local_tool_handlers=bundle.handlers,
+      role="owner",
+      needs_approval=lambda _name, _tool_input, _qualifier: False,
+      event_log=event_log,
+      approval_key_qualifier=bundle.approval_qualifier,
+    )
+    dispatcher.bind_secret_boundary(SecretBoundary((canary,)))
+
+    result, error = await dispatcher.dispatch(
+      "code_execute_call",
+      "code_execute",
+      {
+        "code": (
+          "import sys\n"
+          f"print('leaked {canary}')\n"
+          f"print('sk-ant-api03-CODEEXEC-CANARY-DO-NOT-USE-7c11', file=sys.stderr)\n"
+        )
+      },
+    )
+
+    assert error is None
+    assert result is not None
+    assert canary not in result["stdout"]
+    assert "leaked" in result["stdout"]
+    assert "sk-ant-api03-CODEEXEC-CANARY-DO-NOT-USE-7c11" not in result["stderr"]
+    chunks = [
+      entry.event for entry in event_log.entries
+      if entry.event.get("type") == "tool_output_chunk"
+    ]
+    assert chunks
+    assert all(canary not in str(chunk.get("text") or "") for chunk in chunks)
 
   asyncio.run(_run_test())
 
@@ -721,7 +768,7 @@ def test_per_bundle_backend_isolation_keeps_distinct_docker_images(monkeypatch) 
       "truncated": False,
     }
 
-  monkeypatch.setattr("agent_gateway.code_execution._backends._docker.DockerBackend.available", lambda self: True)
+  monkeypatch.setattr("agent_gateway.code_execution._backends._docker.DockerBackend.unavailable_reason", lambda self: None)
   monkeypatch.setattr("agent_gateway.code_execution._backends._docker.DockerBackend.execute", _fake_execute)
 
   async def _run_test() -> None:
@@ -755,5 +802,63 @@ def test_per_bundle_backend_isolation_keeps_distinct_docker_images(monkeypatch) 
     assert result_two is not None
     assert result_one["stdout"] == "image-one:latest\n"
     assert result_two["stdout"] == "image-two:latest\n"
+
+  asyncio.run(_run_test())
+
+
+def test_auto_host_with_missing_docker_image_reports_subprocess_and_why(tmp_path, monkeypatch, caplog) -> None:
+  # A real `docker` CLI whose image is absent: `image inspect` exits 1 with the
+  # daemon's own message. The walk must still reach subprocess, and both the
+  # result and the gateway log must say so and why.
+  fake_docker = tmp_path / "docker"
+  fake_docker.write_text(
+    "#!/bin/sh\n"
+    "echo \"Error response from daemon: No such image: $3\" >&2\n"
+    "exit 1\n"
+  )
+  fake_docker.chmod(0o755)
+  monkeypatch.setenv("PATH", f"{tmp_path}:/usr/bin:/bin")
+
+  async def _run_test() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(
+      session,
+      config=CodeExecutionConfig(docker_image="hank-missing-image:latest"),
+    )
+    try:
+      with caplog.at_level("WARNING", logger="agent_gateway.code_execution._handlers"):
+        result, error = await _dispatch_bundle_tool(
+          session,
+          bundle,
+          "code_execute",
+          {"code": "print('ran')"},
+        )
+      assert error is None
+      assert result is not None
+      assert result["stdout"] == "ran\n"
+      assert result["backend"] == "subprocess"
+      assert result["sandboxed"] is False
+      assert result["skipped_backends"] == [{
+        "backend": "docker",
+        "sandboxed": True,
+        "reason": (
+          "docker image inspect hank-missing-image:latest exited 1: "
+          "Error response from daemon: No such image: hank-missing-image:latest"
+        ),
+      }]
+      assert "selected subprocess (sandboxed=False)" in caplog.text
+      assert "No such image: hank-missing-image:latest" in caplog.text
+
+      named, error = await _dispatch_bundle_tool(
+        session,
+        bundle,
+        "code_execute",
+        {"code": "print('ran')", "host": "subprocess"},
+      )
+      assert error is None
+      assert named is not None
+      assert (named["backend"], named["sandboxed"], named["skipped_backends"]) == ("subprocess", False, [])
+    finally:
+      await cleanup_code_execution(session)
 
   asyncio.run(_run_test())

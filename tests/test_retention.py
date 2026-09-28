@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import multiprocessing
 import os
@@ -31,6 +32,8 @@ from agent_gateway.retention import (
   sweep_lock,
 )
 from agent_gateway.server import _cleanup_old_transcripts
+from agent_gateway.server_chat_helpers import _cleanup_sessions_loop
+from agent_gateway.server_models import GatewayServerConfig
 
 
 def _touch(path: Path, *, mtime: float) -> None:
@@ -96,6 +99,45 @@ def test_transcript_retention_noops_without_directory_or_positive_horizon(tmp_pa
   assert transcript.exists()
 
 
+def test_configured_transcript_dir_sweeps_nothing_at_the_library_default(tmp_path: Path) -> None:
+  now = 1_000_000.0
+  transcript = tmp_path / "old-session.jsonl"
+  meta = tmp_path / "old-session.meta.json"
+  _touch(transcript, mtime=now - (8 * 86400))
+  _touch(meta, mtime=now - (8 * 86400))
+
+  config = GatewayServerConfig(transcript_dir=tmp_path)
+
+  assert config.transcript_retention_days == 0
+  assert (
+    _cleanup_old_transcripts(
+      config.transcript_dir, config.transcript_retention_days, now=now
+    )
+    == 0
+  )
+  assert transcript.exists()
+  assert meta.exists()
+
+  swept = GatewayServerConfig(transcript_dir=tmp_path, transcript_retention_days=7)
+
+  assert (
+    _cleanup_old_transcripts(
+      swept.transcript_dir, swept.transcript_retention_days, now=now
+    )
+    == 2
+  )
+  assert not transcript.exists()
+  assert not meta.exists()
+
+
+def test_cleanup_sessions_loop_carries_the_same_off_default() -> None:
+  parameter = inspect.signature(_cleanup_sessions_loop).parameters[
+    "transcript_retention_days"
+  ]
+
+  assert parameter.default == GatewayServerConfig().transcript_retention_days == 0
+
+
 class _FailingAdapter:
   def sweep(self, context):
     raise RuntimeError("isolated failure")
@@ -112,13 +154,16 @@ def test_policy_inversion_and_explicit_keep_forever(caplog: pytest.LogCaptureFix
   assert "legal ruling pending" in caplog.text
 
 
-def test_triage_floor_registration_is_scoped() -> None:
-  short = RetentionPolicy("age", "platform", "short", max_age_days=2)
-  with pytest.raises(ValueError, match="72 hours"):
-    RetentionCatalogEntry("session", short, KeepForeverAdapter("session"), (Path("/tmp/session"),), triage_input=True)
+def test_registration_accepts_keep_forever_for_an_error_triage_input() -> None:
+  """No floor on deletion can reject a policy that deletes nothing."""
+
+  forever = RetentionPolicy.keep_forever("a scheduled lane's own run log", "henry")
+  entry = RetentionCatalogEntry(
+    "session", forever, KeepForeverAdapter("session"), (Path("/tmp/session"),)
+  )
+  assert entry.policy.is_keep_forever
+  short = RetentionPolicy("age", "platform", "scratch", max_age_days=2)
   RetentionCatalogEntry("unrelated", short, KeepForeverAdapter("unrelated"), (Path("/tmp/unrelated"),))
-  long = RetentionPolicy("age", "platform", "triage", max_age_days=30)
-  RetentionCatalogEntry("session", long, KeepForeverAdapter("session"), (Path("/tmp/session"),), triage_input=True)
 
 
 def test_safety_refuses_symlink_escape_and_broad_roots(tmp_path: Path) -> None:

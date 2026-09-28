@@ -195,7 +195,14 @@ def test_broker_rejects_any_envelope_other_than_exact_launch() -> None:
     allow_nan=False,
   )
   try:
-    with pytest.raises(AutonomousClaimBrokerError):
+    with pytest.raises(
+      AutonomousClaimBrokerError,
+      match=(
+        "rejected the request: broker_rejected_request: "
+        "AutonomousClaimBrokerError: autonomous claim broker admission "
+        "binding is invalid"
+      ),
+    ):
       AutonomousClaimSigner(
         child_fd,
         envelope_json=changed,
@@ -203,6 +210,63 @@ def test_broker_rejects_any_envelope_other_than_exact_launch() -> None:
   finally:
     second_broker.close()
     runtime.close()
+
+
+def _admission_rejection_frame(envelope_json: str) -> dict[str, object]:
+  broker = AutonomousClaimBroker(
+    GatewayClaimSigningAuthority(_SECRET),
+    envelope_json,
+  )
+  child_socket = socket.socket(fileno=broker.take_child_fd())
+  try:
+    broker_module._send_frame(
+      child_socket,
+      {
+        "envelope": envelope_json,
+        "op": "admit",
+        "version": broker_module.AUTONOMOUS_CLAIM_BROKER_PROTOCOL_VERSION,
+      },
+      deadline=time.monotonic() + 1.0,
+    )
+    return broker_module._recv_frame(
+      child_socket,
+      deadline=time.monotonic() + 1.0,
+    )
+  finally:
+    child_socket.close()
+    broker.close()
+
+
+def test_broker_rejection_keeps_store_refusal_distinct_from_policy() -> None:
+  runtime = _broker_runtime()
+  try:
+    # The runtime's own signer already consumed this launch's nonce.
+    frame = _admission_rejection_frame(runtime.envelope_json)
+  finally:
+    runtime.close()
+
+  assert frame["ok"] is False
+  assert frame["error"] == "launch_nonce_replay"
+  assert str(frame["reason"]).startswith("LaunchNonceReplay")
+
+
+def test_broker_rejection_reason_is_bounded(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  runtime = _broker_runtime()
+
+  def unavailable(*_args: object, **_kwargs: object) -> None:
+    raise broker_module.LaunchNonceStoreError("x" * 10_000)
+
+  monkeypatch.setattr(broker_module, "consume_launch_nonce", unavailable)
+  try:
+    frame = _admission_rejection_frame(runtime.envelope_json)
+  finally:
+    runtime.close()
+
+  assert frame["error"] == "launch_nonce_store"
+  assert frame["reason"] == ("LaunchNonceStoreError: " + "x" * 10_000)[:500]
+
 
 
 def test_broker_admission_waits_for_slow_child_boot() -> None:

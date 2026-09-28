@@ -59,7 +59,12 @@ def _snapshot_text_sequence(value: object, *, field_name: str) -> tuple[str, ...
 
 @dataclass(frozen=True, slots=True)
 class ControlSkillSummary:
-  """Exact immutable metadata exposed by the control skill list wire."""
+  """Exact immutable metadata exposed by the control skill wire.
+
+  ``catalog`` reports whether a skill is advertised in the listing.  It is a
+  reported fact, not a precondition of this record: a skill withheld from the
+  listing still has a launch verdict, and the control plane reads it here.
+  """
 
   name: str
   label: str
@@ -115,8 +120,6 @@ class ControlSkillSummary:
     ):
       if type(getattr(self, field_name)) is not bool:
         raise TypeError(f"{field_name} must be an exact bool")
-    if self.catalog is not True:
-      raise ValueError("catalog must be exactly True")
     if self.max_turns is not None and type(self.max_turns) is not int:
       raise TypeError("max_turns must be None or an exact int")
     if self.max_budget_usd is not None:
@@ -162,6 +165,15 @@ class ControlSkillDetail(ControlSkillSummary):
 
 @runtime_checkable
 class ControlSkillCatalog(Protocol):
+  """The control plane's read side over one adapter's skill definitions.
+
+  ``list_skills`` is the advertised subset — what an operator browses.
+  ``resolve_skill`` answers for every skill the adapter defines, advertised
+  or not, because dispatch admission asks it before a run id is charged;
+  a catalog that hid a launchable skill from the question would charge the
+  run and let the child fail anonymously.
+  """
+
   def list_skills(self) -> tuple[ControlSkillSummary, ...]: ...
 
   def resolve_skill(self, selector: object) -> ControlSkillDetail: ...

@@ -1209,6 +1209,47 @@ def test_admit_discounts_an_already_reserved_pending_successor() -> None:
   assert registry.admission_count == 1
 
 
+def test_admit_discounts_a_reserved_successor_that_already_started() -> None:
+  """A reservation holds its slot across the PENDING -> RUNNING transition.
+
+  A concurrent resume registration whose pre-decision durable lookup outlives
+  that transition reaches ``admit`` with the successor already RUNNING. It is
+  replaying the claim, not asking for a second slot, so the ceiling must hand
+  the entry back instead of refusing capacity.
+  """
+
+  registry = TaskRegistry(max_inflight=1)
+  reserved = registry.claim_resume_successor(
+    "background_agent",
+    task_id="bg_root_r1",
+    original_task_id="bg_root",
+  )[0]
+  registry.transition(reserved.task_id, TaskState.RUNNING)
+
+  entry, rejection = _admit(
+    registry,
+    task_id="bg_root_r1",
+    original_task_id="bg_root",
+  )
+  assert rejection is None
+  assert entry is not None
+  assert entry is reserved
+  assert entry.state == TaskState.RUNNING
+  assert registry.admission_count == 1
+
+
+def test_admit_returns_a_running_reservation_for_its_own_task_id() -> None:
+  registry = TaskRegistry(max_inflight=1)
+  reserved = registry.register("background_agent", task_id="bg_override")
+  registry.transition(reserved.task_id, TaskState.RUNNING)
+
+  entry, rejection = _admit(registry, task_id="bg_override")
+
+  assert rejection is None
+  assert entry is reserved
+  assert registry.admission_count == 1
+
+
 def test_admit_refuses_when_notification_retrieval_retention_is_full() -> None:
   registry = TaskRegistry(max_inflight=1, max_retained=1)
   omitted = registry.register("background_agent")

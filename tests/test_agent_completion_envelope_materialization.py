@@ -45,12 +45,15 @@ from agent_gateway.task_registry import (
   TaskState,
 )
 from agent_gateway.runner_run_loop import _agent_completion_contract_error
+from agent_gateway.mcp_client import McpClientManager
+from agent_gateway.tool_dispatcher import ToolDispatcher, ToolResult
 from agent_workflow_contracts import (
   ActivityHandle,
   AgentCompletionEnvelope,
   AgentOperationRef,
   AnalyticalOutcome,
   AttemptRef,
+  AuthoredSummaryWithResultHandle,
   CanonicalProjection,
   ChildEvidenceProjection,
   ContentHandle,
@@ -62,10 +65,12 @@ from agent_workflow_contracts import (
   ObservedSourceEvidenceRef,
   OrdinaryDelegationTaskRef,
   ParentResultPolicy,
+  ProjectionInline,
   TaskObservation,
   TaskResult,
   TaskResultProvenance,
   TaskResultValues,
+  TerminalNarrativeInlineExact,
   TranscriptHandle,
   UsageObservation,
   WorkflowNodeTaskRef,
@@ -193,9 +198,11 @@ def test_direct_narrative_defaults_to_exact_terminal_message() -> None:
     max_inline_bytes=DEFAULT_PARENT_RESULT_MAX_INLINE_BYTES,
     on_overflow="result_handle",
   )
-  assert envelope.parent_materialization.kind == "terminal_narrative_inline_exact"
-  assert envelope.parent_materialization.content == text
-  assert envelope.parent_materialization.complete is True
+  materialization = envelope.parent_materialization
+  assert isinstance(materialization, TerminalNarrativeInlineExact)
+  assert materialization.kind == "terminal_narrative_inline_exact"
+  assert materialization.content == text
+  assert materialization.complete is True
   assert envelope.task_result_ref.task_result_id == result.task_result_id
 
 
@@ -221,8 +228,10 @@ def test_oversized_narrative_delivers_handle_without_reading_or_preview() -> Non
   )
 
   assert reader_called is False
-  assert envelope.parent_materialization.kind == "result_handle"
-  assert envelope.parent_materialization.source.content_chars == len(text)
+  materialization = envelope.parent_materialization
+  assert materialization is not None
+  assert materialization.kind == "result_handle"
+  assert materialization.source.content_chars == len(text)
   wire = envelope.model_dump(mode="json")
   assert "x" * 101 not in str(wire)
   assert "text_truncated" not in str(wire)
@@ -242,8 +251,10 @@ def test_overflow_uses_only_explicit_operation_authored_summary() -> None:
     read_grant_factory=_read_grant,
     authored_summary="Authored synthesis.",
   )
-  assert envelope.parent_materialization.kind == "authored_summary_with_result_handle"
-  assert envelope.parent_materialization.summary == "Authored synthesis."
+  materialization = envelope.parent_materialization
+  assert isinstance(materialization, AuthoredSummaryWithResultHandle)
+  assert materialization.kind == "authored_summary_with_result_handle"
+  assert materialization.summary == "Authored synthesis."
 
   with pytest.raises(
     ParentResultMaterializationError,
@@ -293,8 +304,10 @@ def test_projection_policy_preserves_exact_typed_value() -> None:
     read_grant_factory=_read_grant,
   )
 
-  assert envelope.parent_materialization.kind == "projection_inline"
-  assert envelope.parent_materialization.value == value
+  materialization = envelope.parent_materialization
+  assert isinstance(materialization, ProjectionInline)
+  assert materialization.kind == "projection_inline"
+  assert materialization.value == value
 
 
 def _projection_only_result() -> tuple[TaskResult, JsonValue]:
@@ -340,8 +353,10 @@ def test_projection_only_result_derives_inline_parent_delivery() -> None:
   )
 
   assert policy.preferred == "projection_inline"
-  assert envelope.parent_materialization.kind == "projection_inline"
-  assert envelope.parent_materialization.value == value
+  materialization = envelope.parent_materialization
+  assert isinstance(materialization, ProjectionInline)
+  assert materialization.kind == "projection_inline"
+  assert materialization.value == value
 
 
 @pytest.mark.asyncio
@@ -370,6 +385,7 @@ async def test_background_completion_derives_policy_from_projection_result(
 
   assert entry.completion_envelope is not None
   materialization = entry.completion_envelope.parent_materialization
+  assert isinstance(materialization, ProjectionInline)
   assert materialization.kind == "projection_inline"
   assert materialization.value == value
 
@@ -399,6 +415,7 @@ async def test_background_completion_publishes_projection_without_workspace(
 
   assert entry.completion_envelope is not None
   materialization = entry.completion_envelope.parent_materialization
+  assert isinstance(materialization, ProjectionInline)
   assert materialization.kind == "projection_inline"
   assert materialization.value == value
 
@@ -436,11 +453,13 @@ async def test_background_terminal_settlement_without_content_survives_replay(
   assert envelope is not None
   assert envelope.parent_materialization is None
   assert envelope.settlement_projection.execution_status == "cancelled"
-  assert envelope.settlement_projection.terminal_reason == result.execution.terminal_reason
+  terminal_reason = result.execution.terminal_reason
+  assert terminal_reason is not None
+  assert envelope.settlement_projection.terminal_reason == terminal_reason
 
   notification = agent_completion_notification(entry, envelope, timestamp=1.0)
   assert notification.inline_payload()[1] is None
-  assert result.execution.terminal_reason in notification.format_xml()
+  assert terminal_reason in notification.format_xml()
   assert notification.payload["parent_materialization"] is None
   entry.completion_envelope = None
   await _Harness()._ensure_agent_completion_published(entry)
@@ -456,7 +475,7 @@ async def test_pre_reason_failed_completion_replays_published_bytes(
   class _Harness(RunnerBackgroundLifecycleMixin):
     def __init__(self) -> None:
       self._agent_session_log = AgentSessionLog(tmp_path / "session.jsonl")
-      self._workspace_dir = tmp_path
+      self._workspace_dir = str(tmp_path)
       self._runner_id = "parent-runner"
 
     async def _append_durable_event(self, event: dict[str, object]) -> object:
@@ -502,6 +521,7 @@ async def test_pre_reason_failed_completion_replays_published_bytes(
 
   await runner._ensure_agent_completion_published(entry)
 
+  assert entry.completion_envelope is not None
   assert canonical_json_bytes(entry.completion_envelope.model_dump(mode="json")) == (
     canonical_json_bytes(envelope_payload)
   )
@@ -510,6 +530,7 @@ async def test_pre_reason_failed_completion_replays_published_bytes(
   runner._workspace_dir = None
   entry.completion_envelope = None
   await runner._ensure_agent_completion_published(entry)
+  assert entry.completion_envelope is not None
   assert canonical_json_bytes(entry.completion_envelope.model_dump(mode="json")) == (
     canonical_json_bytes(envelope_payload)
   )
@@ -521,12 +542,18 @@ async def test_long_failure_reason_still_queues_completion(
   tmp_path: Path,
   reason_unit: str,
 ) -> None:
-  async def unused_dispatch(*args: object, **kwargs: object) -> None:
-    raise AssertionError("settlement does not dispatch tools")
+  class _NoDispatchDispatcher(ToolDispatcher):
+    async def dispatch(self, *args: object, **kwargs: object) -> ToolResult:
+      raise AssertionError("settlement does not dispatch tools")
 
   runner = AgentRunner(
     event_log=EventLog(),
-    dispatcher=SimpleNamespace(dispatch=unused_dispatch),
+    dispatcher=_NoDispatchDispatcher(
+      mcp_client=McpClientManager(config_path=None),
+      local_tool_handlers={},
+      event_log=EventLog(),
+      session_id="parent-session",
+    ),
     session_id="parent-session",
     user_id="test-user",
     billing_mode="byok",
@@ -565,6 +592,7 @@ async def test_long_failure_reason_still_queues_completion(
   notification = notifications[0]
   payload_json, omission_reason = notification.inline_payload()
   assert omission_reason is None
+  assert payload_json is not None
   assert len(html.escape(payload_json).encode("utf-8")) <= (
     TASK_NOTIFICATION_INLINE_PAYLOAD_MAX_BYTES
   )
@@ -572,6 +600,7 @@ async def test_long_failure_reason_still_queues_completion(
   assert projected_reason.endswith("...[truncated]")
   assert reason.startswith(projected_reason.removesuffix("...[truncated]"))
   assert entry.task_result.execution.terminal_reason == reason
+  assert entry.completion_envelope is not None
   assert notification.payload == entry.completion_envelope.model_dump(mode="json")
   await runner._finalize_background_agent(
     entry,
@@ -864,7 +893,9 @@ def test_handle_delivery_notification_summary_carries_dispatch_objective() -> No
   to its own tracking; the unread result was later called "outstanding".
   """
   envelope = _handle_shaped_envelope("x" * 4_000)
-  assert envelope.parent_materialization.kind == "result_handle"
+  materialization = envelope.parent_materialization
+  assert materialization is not None
+  assert materialization.kind == "result_handle"
 
   notification = agent_completion_notification(
     SimpleNamespace(
@@ -933,7 +964,9 @@ def test_mark_result_content_read_requires_matching_delivered_handle() -> None:
   registry = TaskRegistry()
   entry = registry.register("background_agent")
   envelope = _handle_shaped_envelope("x" * 4_000)
-  content_id = envelope.parent_materialization.source.content_id
+  materialization = envelope.parent_materialization
+  assert materialization is not None
+  content_id = materialization.source.content_id
 
   # No envelope yet: refused.
   assert registry.mark_result_content_read(
@@ -971,7 +1004,9 @@ def test_mark_result_content_read_refuses_inline_materialization() -> None:
     terminal_narrative_reader=lambda _result: text,
     read_grant_factory=_read_grant,
   )
-  content_id = entry.completion_envelope.parent_materialization.source.content_id
+  materialization = entry.completion_envelope.parent_materialization
+  assert materialization is not None
+  content_id = materialization.source.content_id
   assert registry.mark_result_content_read(
     entry.task_id, content_id=content_id
   ) is False

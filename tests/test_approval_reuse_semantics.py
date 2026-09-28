@@ -25,6 +25,7 @@ from agent_gateway.approval_policy import (
   utc_now,
 )
 from agent_gateway.approval_store import SQLiteApprovalStore
+from agent_gateway.approval_preferences import ApprovalPreferenceStore
 from agent_gateway.approvals import _record_vote_and_unblock_locked
 from agent_gateway.single_user_policy import (
   DelegationApprovalPolicy,
@@ -76,6 +77,18 @@ def _request(
     approval_reuse_key=key,
   )
 
+def _prompting_policy(
+  *,
+  store: Any,
+  tmp_path: Any,
+) -> SingleUserApprovalPolicy:
+  """A policy for a user who opted out of auto-approval, so grants are reachable."""
+
+  preference_store = ApprovalPreferenceStore(tmp_path / "approval-preferences.sqlite3")
+  preference_store.put(user_id="alice", preference="request_user_approval")
+  return SingleUserApprovalPolicy(store=store, preference_store=preference_store)
+
+
 
 @pytest.mark.parametrize(
   ("mode", "key"),
@@ -108,7 +121,7 @@ def test_exact_reuse_round_trips_and_is_immutable(tmp_path: Any) -> None:
 
 def test_exact_lookup_cannot_use_a_legacy_scope_collision(tmp_path: Any) -> None:
   store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
-  policy = SingleUserApprovalPolicy(store=store)
+  policy = _prompting_policy(store=store, tmp_path=tmp_path)
   legacy_source = replace(
     _request(),
     approval_id="legacy-source",
@@ -384,7 +397,7 @@ def test_disabled_reuse_skips_lookup_and_disallows_persistence() -> None:
     run_context=RunContext(user_id="alice", request_id="request-1"),
   ))
 
-  assert decision.outcome == "request_user_approval"
+  assert decision.outcome == "auto_approve"
   assert decision.allow_persistent_grant is False
   assert decision.persistent_grant_scope_hint is None
   assert approval_reuse_scope_authorized(
@@ -429,7 +442,9 @@ def test_registered_reuse_never_uses_delegation_auto_approval() -> None:
     run_context=run_context,
   ))
 
-  assert decision.outcome == "request_user_approval"
+  # The delegation credit is unavailable to a registered exact-reuse call, so
+  # the standing preference the owner holds is what settles it.
+  assert decision.outcome == "auto_approve"
   assert decision.policy_id == "single-user"
 
 

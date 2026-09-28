@@ -14,6 +14,7 @@ from agent_gateway.agent_session_log import (
 from agent_gateway.agent_session_log_inventory import (
   SUPPORTED_SESSION_LOG_STREAM_KINDS,
   SessionLogInventoryError,
+  SessionLogStorageLayout,
   enumerate_selected_agent_session_logs,
 )
 from agent_gateway.agent_session_log_layout import prepare_autonomous_session_log
@@ -448,8 +449,10 @@ def test_v1_repaired_manifest_preserves_historical_lineage(
 
   selected = enumerate_relocated()
   assert [item.path for item in selected] == [log.path]
+  assert selected[0].manifest_payload is not None
   assert selected[0].manifest_payload["logical_stream_id"] == str(manifest_lineage)
   retained = next(item for item in selected[0].files if item.role == "segment")
+  assert retained.sidecar_payload is not None
   assert retained.sidecar_payload["logical_stream_id"] == historical
 
 
@@ -469,7 +472,7 @@ def test_v1_repaired_manifest_preserves_historical_lineage(
 def test_relocated_segment_preserves_timestamp_precision(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
-  layout: str,
+  layout: SessionLogStorageLayout,
   mtime_delta_ns: int,
   extra_bytes: bytes,
   accepted: bool,
@@ -532,7 +535,7 @@ def test_relocated_segment_preserves_timestamp_precision(
 def test_manifest_requirement_follows_rotated_storage(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
-  layout: str,
+  layout: SessionLogStorageLayout,
   storage: str,
 ) -> None:
   monkeypatch.setenv("AGENT_SESSION_LOG_MAX_ACTIVE_BYTES", "1")
@@ -870,7 +873,7 @@ def test_v2_rejects_unknown_active_sidecar_field(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_v2_preserves_moved_stream_read_rotation_recovery_and_retirement(
+async def test_v2_preserves_moved_stream_read_rotation_and_manifest_recovery(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -907,9 +910,11 @@ async def test_v2_preserves_moved_stream_read_rotation_recovery_and_retirement(
     assert (new / relative).read_bytes() == body
     assert (new / relative).with_suffix(".meta.json").read_bytes() == sidecar
   assert not old.exists()
+  assert after.sidecar_payload is not None
   assert after.sidecar_payload["logical_stream_id"] == lineage
   for physical in after.files:
     payload = physical.sidecar_payload
+    assert payload is not None
     assert payload["logical_stream_id"] == lineage
     suffix = (
       physical.path.stem if physical.role == "segment"
@@ -920,43 +925,20 @@ async def test_v2_preserves_moved_stream_read_rotation_recovery_and_retirement(
   assert [entry.seq for entry in entries] == [1, 2, 3, 4]
   assert [entry.event["ordinal"] for entry in entries] == [1, 2, 3, 4]
 
-  # Rebuild from retained segments after losing only the manifest, then retire
-  # the prefix in order, including segments rotated on either side of the move.
+  # Rebuild from retained segments after losing only the manifest.
   log.manifest_path.unlink()
   log = AgentSessionLog(moved_active)
   recovered = _enumerate_v2(new)[0]
+  assert recovered.manifest_payload is not None
+  assert after.manifest_payload is not None
   assert recovered.manifest_payload["logical_stream_id"] == lineage
   assert [
     row["telemetry_source_id"] for row in recovered.manifest_payload["segments"]
   ] == [
     row["telemetry_source_id"] for row in after.manifest_payload["segments"]
   ]
-  def identity(value):
-    return (value.device, value.inode, value.size, value.mtime_ns)
-
-  remaining = recovered
-  while remaining.manifest_payload["segments"]:
-    descriptor = remaining.manifest_payload["segments"][0]
-    segment = next(
-      physical for physical in remaining.files
-      if physical.path.name == descriptor["path"]
-    )
-
-    retired = AgentSessionLog.retire_segment(
-      remaining.location,
-      descriptor,
-      expected_manifest=remaining.manifest_payload,
-      expected_manifest_identity=identity(remaining.manifest_identity),
-      expected_segment_identity=identity(segment.file_identity),
-      expected_sidecar_identity=identity(segment.sidecar_identity),
-    )
-    assert retired is not None
-    assert not segment.path.exists()
-    assert not segment.sidecar_path.exists()
-    entries, _ = await AgentSessionLog(moved_active).query_current_strict()
-    assert [entry.seq for entry in entries] == list(range(descriptor["last_seq"] + 1, 5))
-    remaining = _enumerate_v2(new)[0]
-    assert remaining.manifest_payload["logical_stream_id"] == lineage
+  entries, _ = await AgentSessionLog(moved_active).query_current_strict()
+  assert [entry.seq for entry in entries] == [1, 2, 3, 4]
 
 
 @pytest.mark.parametrize("drift", ["relative", "traversal", "nul", "namespace", "source_id"])

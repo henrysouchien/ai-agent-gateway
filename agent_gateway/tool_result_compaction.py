@@ -5,6 +5,7 @@ import os
 import uuid
 from typing import Any, Callable, Dict
 
+from .autonomous_event_channel import autonomous_event_fits_frame
 from .tool_result_spill import SpillPublication, SpillSink, normalize_spill_sink, write_spill_set
 from .tool_result_semantics import status_error_has_detail
 from .policy_imports import load_server_policy_module
@@ -59,6 +60,16 @@ _PROJECTION_LADDER = (
   (0, 40, 16),
 )
 
+# The live-stream projection walks the model ladder at full depth, then ends on
+# a rung that keeps the top level only: a result's width and nesting can outrun
+# every full-depth rung, and the top level is where an envelope's fields live.
+# 400 entries of at most 200 characters is under 330 KB even at four UTF-8
+# bytes a character, leaving the frame to the keys and the rest of the event.
+_STREAM_PROJECTION_LADDER = (
+  *((rung, _PROJECTION_MAX_DEPTH) for rung in _PROJECTION_LADDER),
+  ((0, 200, 400), 1),
+)
+
 
 def _project_value(
   value: Any,
@@ -67,6 +78,7 @@ def _project_value(
   max_string_chars: int,
   max_entries: int,
   depth: int,
+  max_depth: int = _PROJECTION_MAX_DEPTH,
 ) -> Any:
   """Return ``value`` reshaped to the given elision settings, marking every cut.
 
@@ -87,7 +99,7 @@ def _project_value(
   if isinstance(value, (int, float, bool)) or value is None:
     return value
   if isinstance(value, dict):
-    if depth >= _PROJECTION_MAX_DEPTH:
+    if depth >= max_depth:
       return {_ELIDED_DEPTH_KEY: "dict", _ELIDED_KEYS_KEY: len(value)}
     projected: Dict[str, Any] = {}
     for key, item in list(value.items())[:max_entries]:
@@ -97,12 +109,13 @@ def _project_value(
         max_string_chars=max_string_chars,
         max_entries=max_entries,
         depth=depth + 1,
+        max_depth=max_depth,
       )
     if len(value) > max_entries:
       projected[_ELIDED_KEYS_KEY] = len(value) - max_entries
     return projected
   if isinstance(value, list):
-    if depth >= _PROJECTION_MAX_DEPTH:
+    if depth >= max_depth:
       return [{_ELIDED_DEPTH_KEY: "list", _ELIDED_ITEMS_KEY: len(value)}]
     items = [
       _project_value(
@@ -111,6 +124,7 @@ def _project_value(
         max_string_chars=max_string_chars,
         max_entries=max_entries,
         depth=depth + 1,
+        max_depth=max_depth,
       )
       for item in value[:max_items]
     ]
@@ -123,6 +137,7 @@ def _project_value(
     max_string_chars=max_string_chars,
     max_entries=max_entries,
     depth=depth,
+    max_depth=max_depth,
   )
 
 
@@ -201,7 +216,9 @@ def _business_model_terminal_success_projection(
 ) -> str | None:
   """Return the bounded model-facing receipt for an accepted BM terminal call.
 
-  The runner's tool-complete event retains the original result separately.  This
+  The runner's tool-complete event retains the original result separately —
+  always in the durable record, and in the streamed copy too whenever the
+  channel frame can carry it (``project_tool_call_complete_for_stream``).  This
   projection therefore removes materialized BusinessModel/readback payloads only
   from the provider conversation, where they add no value after persistence.
   """
@@ -561,3 +578,76 @@ def compact_model_tool_result_entry(
     },
   )
   return live_entry, durable_entry
+
+
+def project_tool_call_complete_for_stream(
+  event: Dict[str, Any],
+  *,
+  result_entry: Dict[str, Any],
+  live_entry: Dict[str, Any],
+) -> Dict[str, Any]:
+  """Return the live-stream projection of one ``tool_call_complete`` event.
+
+  ``event["result"]`` is the raw tool payload, and the durable event keeps it:
+  context rebuilds and resume read the durable record.  A live stream can be a
+  bounded transport — the autonomous event channel refuses any event line over
+  2 MiB — so an event too large for that frame is streamed with its result
+  elided, never as the bulk payload the spill set already holds.
+
+  The size question is put to the channel, on this event: the model-facing
+  content is a different object, rewritten by the ``on_tool_result`` hooks
+  (``code_execute`` images become ``[image: …]`` placeholders there while
+  ``event["result"]`` keeps the base64), and it shares the frame with the tool
+  input, the durable result blocks and the dispatch metadata.
+
+  The live event is also the in-memory log that skill capture, sub-agent
+  result delivery and the ``fms_*`` door extractors read, and those readers
+  contract for the result's own envelope.  An event the frame can carry is
+  therefore streamed whole regardless of what the model was shown, and one it
+  cannot carry keeps the result's own shape with only bulk elided, every cut
+  marked in place, typed by ``_runner_truncated``, ``original_chars`` and,
+  when the result was spilled, the model copy's ``spill_ref``/``spill_summary``.
+  The model ladder is tried first at full depth; when no rung fits, the last
+  rung keeps only the top level — at most 400 entries, strings cut at 200
+  characters, nested values reduced to depth markers — so the result's values
+  stay under 330 KB whatever its width or depth.  Keys and product-minted
+  locators pass whole, and the channel still refuses at send an event whose
+  input or blocks alone outgrow the frame.  A non-object result, which has no
+  envelope to keep, streams under ``content_projection``.
+
+  Returns ``event`` itself when the streamed and durable copies are the same
+  object.
+  """
+
+  if live_entry is result_entry:
+    return event
+  if autonomous_event_fits_frame(event):
+    return event
+  # Compaction only ever returns a distinct entry for a string content, and it
+  # writes a JSON object there: the compacted preview or a semantic receipt.
+  model_copy = json.loads(live_entry["content"])
+  truncation: Dict[str, Any] = {
+    "_runner_truncated": True,
+    "original_chars": len(result_entry["content"]),
+  }
+  for key in ("spill_ref", "spill_summary"):
+    if key in model_copy:
+      truncation[key] = model_copy[key]
+  projected = dict(event)
+  for (max_items, max_string_chars, max_entries), max_depth in _STREAM_PROJECTION_LADDER:
+    value = _project_value(
+      event.get("result"),
+      max_items=max_items,
+      max_string_chars=max_string_chars,
+      max_entries=max_entries,
+      depth=0,
+      max_depth=max_depth,
+    )
+    projected["result"] = (
+      {**value, **truncation}
+      if isinstance(value, dict)
+      else {**truncation, "content_projection": value}
+    )
+    if autonomous_event_fits_frame(projected):
+      break
+  return projected

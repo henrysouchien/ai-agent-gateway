@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 import threading
@@ -9,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ..agent_telemetry import make_prepare_env_with_agent_telemetry
 from ..runner import ToolResultContext
+from ..secret_boundary import SecretBoundary
 from ..session import GatewaySession
 from ..tool_dispatcher import ApprovalKeyQualifier, LocalToolHandler
 from ..tool_policy_registry import PreparedToolCall, ToolInputPreparationError
@@ -19,6 +21,8 @@ from ._helpers import _boolean_input, _prepare_code_execute_env, _string_input, 
 from ._hooks import strip_code_execute_base64_hook
 from ._provenance import AGENT_CODE_EXECUTE_WORK_DIR_ENV, collect_computation_sidecars, delete_computation_sidecar_dir
 from ._tool_defs import make_code_execute_status_tool_def, make_code_execute_tool_def
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -44,9 +48,11 @@ def build_code_execution(
 ) -> CodeExecutionBundle:
   """Create built-in code execution tools for a session.
 
-  The bundle prefers Docker when available and falls back to subprocess
-  execution when registered. The session stores the persistent work directory and
-  any background tasks created by `code_execute(background=true)`.
+  `host=auto` prefers Docker and falls back to subprocess execution when
+  registered; a fallback is logged with the skipped backend's reason, and every
+  result names the backend that ran (`backend`, `sandboxed`, `skipped_backends`).
+  The session stores the persistent work directory and any background tasks
+  created by `code_execute(background=true)`.
   """
   cfg = config or CodeExecutionConfig()
 
@@ -56,17 +62,47 @@ def build_code_execution(
   if cfg.register_docker:
     backends["docker"] = DockerBackend(image=cfg.docker_image or None, config=cfg)
 
+  # `host=auto` takes the first backend in this order that can run. Each walk
+  # records what it skipped and why, keyed by the backend it settled on, so the
+  # call that then runs there reports the degradation it was selected under
+  # (the handler receives only the resolved backend name).
+  auto_skipped: Dict[str, List[Dict[str, Any]]] = {}
+
   def _get_backend(name: Optional[str] = None) -> ExecutionBackend:
     if name:
       backend = backends.get(name)
       if backend is not None:
         return backend
       raise ValueError(f"Unknown backend: '{name}'. Available: {sorted(backends)}")
+    skipped: List[Dict[str, Any]] = []
     for preferred in ("docker", "subprocess"):
       backend = backends.get(preferred)
-      if backend is not None and backend.available():
+      if backend is None:
+        continue
+      reason = backend.unavailable_reason()
+      if reason is None:
+        if skipped:
+          log.warning(
+            "code_execute host=auto selected %s (sandboxed=%s); skipped %s",
+            backend.name,
+            backend.sandboxed,
+            "; ".join(f"{entry['backend']} (sandboxed={entry['sandboxed']}): {entry['reason']}" for entry in skipped),
+          )
+        auto_skipped[backend.name] = skipped
         return backend
-    raise RuntimeError("No execution backend available")
+      skipped.append({"backend": backend.name, "sandboxed": backend.sandboxed, "reason": reason})
+    raise RuntimeError(
+      "No execution backend available: "
+      + "; ".join(f"{entry['backend']}: {entry['reason']}" for entry in skipped)
+    )
+
+  def _backend_identity(host: str, backend: ExecutionBackend) -> Dict[str, Any]:
+    """What a code_execute result says about where it ran."""
+    return {
+      "backend": backend.name,
+      "sandboxed": backend.sandboxed,
+      "skipped_backends": list(auto_skipped.get(backend.name, ())) if host == "auto" else [],
+    }
 
   def _get_registered_backend_names() -> list[str]:
     return list(backends.keys())
@@ -95,6 +131,33 @@ def build_code_execution(
     if backend.name == "docker":
       return "/workspace"
     return work_dir
+
+  def _output_redactor(tool_ctx: Any | None) -> Callable[[str], str]:
+    # The dispatcher binds this one-string projection on the tool context
+    # (`ToolExecutionContext.redact_text`); nothing else may answer to the name.
+    redact: Callable[[str], str] | None = getattr(tool_ctx, "redact_text", None)
+    if callable(redact):
+      return redact
+    return SecretBoundary().redact_text
+
+  def _redact_execution_output(
+    result: Any,
+    redact: Callable[[str], str],
+  ) -> Any:
+    """Redact the child's own bytes before they leave this handler.
+
+    A sandbox prints whatever the model told it to print, including a file or
+    an environment this process never handed it, so the producer is where that
+    text stops being raw.
+    """
+
+    if not isinstance(result, dict):
+      return result
+    for field in ("stdout", "stderr", "stdout_tail", "stderr_tail"):
+      value = result.get(field)
+      if isinstance(value, str):
+        result[field] = redact(value)
+    return result
 
   def _prepare_config_for_call(
     *,
@@ -193,9 +256,11 @@ def build_code_execution(
         "status": "running",
         "task_id": task_id,
         "message": "Use code_execute_status(task_id=...) to check progress.",
+        **_backend_identity(host, backend),
       }, None
 
     chunk_seq = [0]
+    redact = _output_redactor(tool_ctx)
 
     def _on_chunk(stream_name: str, text: str) -> None:
       if tool_ctx is None:
@@ -207,7 +272,7 @@ def build_code_execution(
           "tool_call_id": tool_ctx.tool_call_id,
           "tool_name": "code_execute",
           "stream": stream_name,
-          "text": text,
+          "text": redact(text),
           "seq": chunk_seq[0],
         }
       )
@@ -219,15 +284,18 @@ def build_code_execution(
       backend=backend,
       config=per_call_config,
     )
+    if result is not None:
+      result.update(_backend_identity(host, backend))
     if result is not None and tool_ctx is not None:
       collect_computation_sidecars(
         result,
         work_dir=work_dir,
         tool_call_id=getattr(tool_ctx, "tool_call_id", None),
       )
-    return result, error
+    return _redact_execution_output(result, redact), error
 
-  async def _handle_code_execute_status(tool_input: Dict[str, Any], **_: Any):
+  async def _handle_code_execute_status(tool_input: Dict[str, Any], **kwargs: Any):
+    redact = _output_redactor(kwargs.get("tool_ctx"))
     task_id, error = _string_input(
       tool_input,
       "task_id",
@@ -266,7 +334,7 @@ def build_code_execution(
             work_dir=task.handle.work_dir,
             tool_call_id=task.tool_call_id,
           )
-        return result, None
+        return _redact_execution_output(result, redact), None
       await task.safe_cancel(backend)
       if task._terminated:
         session.background_tasks.pop(task_id, None)
@@ -283,16 +351,19 @@ def build_code_execution(
           work_dir=task.handle.work_dir,
           tool_call_id=task.tool_call_id,
         )
-      return result, None
+      return _redact_execution_output(result, redact), None
 
     stdout_tail = task.stdout_buf.tail(20) or str(poll_result.get("stdout_tail") or "")
     stderr_tail = task.stderr_buf.tail(5) or str(poll_result.get("stderr_tail") or "")
-    return {
-      "status": "running",
-      "task_id": task_id,
-      "stdout_tail": stdout_tail,
-      "stderr_tail": stderr_tail,
-    }, None
+    return _redact_execution_output(
+      {
+        "status": "running",
+        "task_id": task_id,
+        "stdout_tail": stdout_tail,
+        "stderr_tail": stderr_tail,
+      },
+      redact,
+    ), None
 
   def _approval_qualifier(tool_name: str, tool_input: Dict[str, Any]) -> str:
     if tool_name != "code_execute":

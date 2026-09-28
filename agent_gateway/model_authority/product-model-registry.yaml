@@ -7,10 +7,11 @@
 # a missing or invalid artifact. The environment variable names which artifact
 # file to load — it is never model or default authority itself.
 #
-# Content is frozen per docs/reference/model-selection-authority-product-
-# decisions-2026-08-13.md section 6. Unknown fields are rejected by the loader.
+# Content is versioned by `revision`; a change ships by republishing the
+# ai-agent-gateway package and relocking its consumers. Unknown fields are
+# rejected by the loader.
 schema: "product-model-registry/v1"
-revision: "2026-08-18.1"
+revision: "2026-09-28.1"
 models:
   - key: "anthropic.claude-fable-5-1"
     label: "Fable 5.1"
@@ -71,15 +72,17 @@ models:
       plan.author: "internal"
       node.fork: "internal"
       citation.review: "internal"
+      investment.newsletter: "internal"
+      investment.earnings_transcript: "internal"
     supported_efforts: ["none"]
     default_effort: "none"
     features: ["tools", "streaming"]
     reported_identities: ["claude-haiku-4-5", "claude-haiku-4-5-20251001"]
 
-  - key: "anthropic.claude-mythos-5"
-    label: "Mythos 5"
+  - key: "anthropic.claude-opus-5-5"
+    label: "Opus 5.5"
     provider: "anthropic"
-    upstream_model: "claude-mythos-5"
+    upstream_model: "claude-opus-5-5"
     adapter: "anthropic.messages"
     protocol_profile: "messages.adaptive"
     route: "anthropic.public"
@@ -97,7 +100,7 @@ models:
     supported_efforts: ["low", "medium", "high", "xhigh", "max"]
     default_effort: "high"
     features: ["tools", "streaming"]
-    reported_identities: ["claude-mythos-5"]
+    reported_identities: ["claude-opus-5-5"]
 
   - key: "anthropic.claude-opus-5"
     label: "Opus 5"
@@ -140,6 +143,8 @@ models:
       node.verify: "internal"
       node.choose: "internal"
       citation.review: "internal"
+      investment.research_agent: "internal"
+      investment.biotech_review: "internal"
     supported_efforts: ["none", "low", "medium", "high", "xhigh", "max"]
     default_effort: "high"
     features: ["tools", "streaming"]
@@ -162,6 +167,24 @@ models:
     default_effort: "medium"
     features: ["tools", "streaming", "vision"]
     reported_identities: ["gpt-6-astra"]
+
+  - key: "openai.gpt-6-sol"
+    label: "GPT-6 Sol"
+    provider: "openai"
+    upstream_model: "gpt-6-sol"
+    adapter: "openai.responses"
+    protocol_profile: "responses.reasoning"
+    route: "openai.public"
+    lifecycle: "active"
+    capabilities:
+      session.driver: "user_selectable"
+      plan.author: "internal"
+      node.fork: "internal"
+      investment.quant_worker: "internal"
+    supported_efforts: ["low", "medium", "high", "xhigh", "max"]
+    default_effort: "medium"
+    features: ["tools", "streaming", "vision"]
+    reported_identities: ["gpt-6-sol"]
 
   - key: "openai.gpt-5-6"
     label: "GPT-5.6"
@@ -197,6 +220,23 @@ models:
     default_effort: "medium"
     features: ["tools", "streaming", "vision"]
     reported_identities: ["gpt-6-astra"]
+
+  - key: "codex.gpt-6-sol"
+    label: "GPT-6 Sol"
+    provider: "codex"
+    upstream_model: "gpt-6-sol"
+    adapter: "codex.responses"
+    protocol_profile: "codex.reasoning"
+    route: "codex.chatgpt"
+    lifecycle: "active"
+    capabilities:
+      session.driver: "user_selectable"
+      plan.author: "internal"
+      node.fork: "internal"
+    supported_efforts: ["low", "medium", "high", "xhigh", "max"]
+    default_effort: "medium"
+    features: ["tools", "streaming", "vision"]
+    reported_identities: ["gpt-6-sol"]
 
   - key: "codex.gpt-5-6-luna"
     label: "GPT-5.6 Luna"
@@ -283,6 +323,53 @@ models:
     features: ["tools", "streaming", "vision"]
     reported_identities: ["grok-4.5"]
 
+  - key: "anthropic.claude-sonnet-5-sdk"
+    label: "Claude Sonnet 5 (SDK)"
+    provider: "anthropic"
+    upstream_model: "claude-sonnet-5"
+    adapter: "anthropic.sdk.messages"
+    protocol_profile: "messages.adaptive"
+    route: "anthropic.byok"
+    lifecycle: "hidden"
+    capabilities:
+      risk.completion: "internal"
+      risk.interpretation: "internal"
+    supported_efforts: ["none", "low", "medium", "high", "xhigh", "max"]
+    default_effort: "none"
+    features: ["tools", "streaming"]
+    reported_identities: ["claude-sonnet-5"]
+
+  - key: "anthropic.claude-haiku-4-5-sdk"
+    label: "Claude Haiku 4.5 (SDK)"
+    provider: "anthropic"
+    upstream_model: "claude-haiku-4-5"
+    adapter: "anthropic.sdk.messages"
+    protocol_profile: "messages.adaptive"
+    route: "anthropic.byok"
+    lifecycle: "hidden"
+    capabilities:
+      risk.asset_classification: "internal"
+      risk.overview_editorial: "internal"
+    supported_efforts: ["none"]
+    default_effort: "none"
+    features: ["tools", "streaming"]
+    reported_identities: ["claude-haiku-4-5", "claude-haiku-4-5-20251001"]
+
+  - key: "anthropic.claude-opus-5-5-oauth"
+    label: "Claude Opus 5.5 (OAuth)"
+    provider: "anthropic"
+    upstream_model: "claude-opus-5-5"
+    adapter: "anthropic.sdk.messages"
+    protocol_profile: "messages.oauth"
+    route: "anthropic.oauth"
+    lifecycle: "hidden"
+    capabilities:
+      risk.document_ingest: "internal"
+    supported_efforts: ["none"]
+    default_effort: "none"
+    features: ["vision"]
+    reported_identities: ["claude-opus-5-5"]
+
   - key: "anthropic.claude-sonnet-4-6-sdk"
     label: "Claude Sonnet 4.6 (SDK)"
     provider: "anthropic"
@@ -290,7 +377,7 @@ models:
     adapter: "anthropic.sdk.messages"
     protocol_profile: "messages.standard"
     route: "anthropic.byok"
-    lifecycle: "hidden"
+    lifecycle: "deprecated"
     capabilities:
       risk.completion: "internal"
       risk.interpretation: "internal"
@@ -307,7 +394,7 @@ models:
     adapter: "anthropic.sdk.messages"
     protocol_profile: "messages.standard"
     route: "anthropic.byok"
-    lifecycle: "hidden"
+    lifecycle: "deprecated"
     capabilities:
       risk.asset_classification: "internal"
       risk.overview_editorial: "internal"
@@ -323,7 +410,7 @@ models:
     adapter: "anthropic.messages"
     protocol_profile: "messages.standard"
     route: "anthropic.public"
-    lifecycle: "hidden"
+    lifecycle: "deprecated"
     capabilities:
       investment.newsletter: "internal"
       investment.earnings_transcript: "internal"
@@ -339,7 +426,7 @@ models:
     adapter: "anthropic.sdk.messages"
     protocol_profile: "messages.oauth"
     route: "anthropic.oauth"
-    lifecycle: "hidden"
+    lifecycle: "deprecated"
     capabilities:
       risk.document_ingest: "internal"
     supported_efforts: ["none"]
@@ -354,7 +441,7 @@ models:
     adapter: "anthropic.sdk.messages"
     protocol_profile: "messages.standard"
     route: "anthropic.service"
-    lifecycle: "hidden"
+    lifecycle: "retired"
     capabilities:
       investment.biotech_review: "internal"
     supported_efforts: ["none"]

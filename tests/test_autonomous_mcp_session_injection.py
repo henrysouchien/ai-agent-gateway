@@ -94,11 +94,10 @@ async def _fake_run_session(
   event_log: EventLog,
   *,
   max_turns: int,
-  timeout_seconds: float,
   initial_message: str,
   system_prompt: str | list[tuple[str, bool]],
 ) -> autonomous.RunOutput:
-  _ = runner, event_log, max_turns, timeout_seconds, initial_message, system_prompt
+  _ = runner, event_log, max_turns, initial_message, system_prompt
   return autonomous.RunOutput(
     response="Completed.",
     tools_used=[],

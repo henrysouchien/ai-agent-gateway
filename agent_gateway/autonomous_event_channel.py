@@ -30,6 +30,15 @@ AUTONOMOUS_EVENT_CHANNEL_DIGEST_DOMAIN = (
 )
 
 _FRAME_HEADER = struct.Struct(">I")
+# Fixed cost of one EVENT frame around its canonical event: the length header,
+# the sibling keys written by `_encode_event_wire_frame`, the hex channel id,
+# and the widest `seq` the channel's event-count bound allows.
+_EVENT_FRAME_ENVELOPE_BYTES = (
+  _FRAME_HEADER.size
+  + len(b'{"channel_id":"","event":,"kind":"EVENT","seq":,"version":1}')
+  + 64
+  + len(str(AUTONOMOUS_EVENT_CHANNEL_MAX_EVENTS))
+)
 _CHANNEL_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_JSON_NESTING = 128
@@ -527,6 +536,17 @@ def _snapshot_event(event: dict[str, Any]) -> _EventSnapshot:
     raise AutonomousEventChannelBoundsError(
       "autonomous event channel event line exceeds the 2 MiB bound"
     ) from exc
+  # A snapshot is the pre-flight an owner runs before it touches the socket,
+  # and a bounds failure inside `send_event` aborts the endpoint. So the EVENT
+  # framing budget is checked here too: every event this function returns can
+  # actually be framed and sent.
+  if (
+    len(snapshot.encoded)
+    > AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES - _EVENT_FRAME_ENVELOPE_BYTES
+  ):
+    raise AutonomousEventChannelBoundsError(
+      "autonomous event channel frame exceeds the 2 MiB bound"
+    )
   if type(snapshot.value) is not dict:
     raise AutonomousEventChannelProtocolError(
       "autonomous event channel events must be JSON objects"
@@ -549,6 +569,27 @@ def snapshot_autonomous_event(
     event_type=snapshot.event_type,
     event_line_bytes=snapshot.line_bytes,
   )
+
+
+def autonomous_event_fits_frame(event: dict[str, Any]) -> bool:
+  """Return whether ``event`` fits one event frame on this channel.
+
+  The channel owns its own size verdict, measured on the event a producer
+  would actually send.  A producer deciding whether to degrade an event
+  before streaming it asks here instead of estimating the payload it can
+  afford; only the size question is answered.  An event the channel would
+  refuse for shape — non-exact JSON values, a circular reference, a missing
+  ``type`` — is not a size failure and is reported as fitting, so that
+  refusal still surfaces where the event is sent.
+  """
+
+  try:
+    _snapshot_event(event)
+  except AutonomousEventChannelBoundsError:
+    return False
+  except AutonomousEventChannelProtocolError:
+    return True
+  return True
 
 
 def _encode_wire_frame(value: dict[str, Any]) -> _WireFrame:
@@ -1648,6 +1689,7 @@ __all__ = [
   "AutonomousEventSnapshot",
   "ReceivedAutonomousEventStream",
   "adopt_inherited_autonomous_event_channel",
+  "autonomous_event_fits_frame",
   "create_autonomous_event_channel",
   "snapshot_autonomous_event",
 ]

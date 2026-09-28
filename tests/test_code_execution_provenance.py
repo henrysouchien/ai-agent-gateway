@@ -185,7 +185,7 @@ def test_docker_env_args_forward_work_dir_and_agent_telemetry_vars() -> None:
   )
 
   rendered_pairs = list(zip(args[0::2], args[1::2]))
-  assert ("-e", "PYTHONPATH=/pkg") in rendered_pairs
+  assert not any(value.startswith("PYTHONPATH=") for _flag, value in rendered_pairs)
   assert ("-e", f"{AGENT_CODE_EXECUTE_WORK_DIR_ENV}=/workspace") in rendered_pairs
   assert ("-e", f"{AGENT_TELEMETRY_RUN_ID_ENV}=run-1") in rendered_pairs
   assert ("-e", f"{AGENT_TELEMETRY_REQUEST_ID_ENV}=req-1") in rendered_pairs
@@ -209,7 +209,7 @@ def test_docker_handler_sets_container_work_dir_env(monkeypatch) -> None:
       "truncated": False,
     }
 
-  monkeypatch.setattr("agent_gateway.code_execution._backends._docker.DockerBackend.available", lambda self: True)
+  monkeypatch.setattr("agent_gateway.code_execution._backends._docker.DockerBackend.unavailable_reason", lambda self: None)
   monkeypatch.setattr("agent_gateway.code_execution._backends._docker.DockerBackend.execute", _fake_execute)
 
   async def _run_test() -> None:

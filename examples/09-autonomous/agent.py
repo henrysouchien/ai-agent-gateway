@@ -45,7 +45,7 @@ if __name__ == "__main__":
 
   # Standalone fixture only: production callers should obtain this immutable
   # bind and credential snapshot from their server-owned capability resolver.
-  entry = INITIAL_MODEL_REGISTRY.require("anthropic.claude-opus-5")
+  entry = INITIAL_MODEL_REGISTRY.require("anthropic.claude-opus-5-5")
   credential_handle = CredentialHandle(
     handle_id="example-09-anthropic-service",
     provider=entry.provider,

@@ -112,9 +112,12 @@ def resolve_auth_config(
     resolved_key = resolved_key or os.environ.get("ANTHROPIC_API_KEY", "").strip()
     resolved_token = resolved_token or os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
     if not resolved_token:
-      from .providers.anthropic_oauth import resolve_anthropic_oauth_token
+      from .providers.anthropic_oauth import (
+        resolve_anthropic_credentials,
+        select_anthropic_credential,
+      )
 
-      resolved_token, _store_path, _record = resolve_anthropic_oauth_token()
+      resolved_token = select_anthropic_credential(resolve_anthropic_credentials())
 
   # Resolve auth_mode with precedence chain
   explicit_mode = str(result.get("auth_mode", "")).strip().lower()

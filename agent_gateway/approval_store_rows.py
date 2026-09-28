@@ -256,7 +256,6 @@ def row_to_delegation_grant(row: sqlite3.Row) -> DelegationGrant:
     tool_class_ceiling=frozenset(json_loads(row["tool_class_ceiling"]) or []),
     args_predicate=json_loads(row["args_predicate"]),
     window_seconds=int(row["window_seconds"]),
-    exclude_external_write_bypass=bool(row["exclude_external_write_bypass"]),
     created_at=dt_from_text(row["created_at"]) or utc_now(),
     expires_at=dt_from_text(row["expires_at"]),
     revoked_at=dt_from_text(row["revoked_at"]),

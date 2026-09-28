@@ -206,7 +206,6 @@ def test_spawn_sub_agent_requires_bound_execution_instead_of_parent_fallback() -
       "Collect",
       dispatcher=_make_dispatcher(),
       max_turns=1,
-      timeout=5.0,
     )
 
 

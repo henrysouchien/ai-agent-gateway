@@ -577,6 +577,7 @@ def test_child_environment_is_profile_scoped_and_secret_minimal() -> None:
     "FMP_API_KEY": "research-secret",
     "SEC_BUDGET_SITE": "prod",
     "SEC_USER_AGENT": "host-agent contact@example.com",
+    "SEC_EXPECTED_MACHINE_IDENTITY": "host.example.test",
     "RESEARCH_PRODUCER_AGENT_MAX_TOKENS": "24000",
     "IBKR_FLEX_TOKEN": "brokerage-secret",
     "TELEGRAM_BOT_TOKEN": "telegram-secret",
@@ -625,6 +626,7 @@ def test_child_environment_is_profile_scoped_and_secret_minimal() -> None:
   assert analyst["FMP_API_KEY"] == "research-secret"
   assert analyst["SEC_BUDGET_SITE"] == "prod"
   assert analyst["SEC_USER_AGENT"] == "host-agent contact@example.com"
+  assert analyst["SEC_EXPECTED_MACHINE_IDENTITY"] == "host.example.test"
   # Session-log root must reach the child or it falls back to a path inside
   # the immutable promoted snapshot and dies on mkdir (bg_76/bg_77 2026-07-31).
   assert analyst["AGENT_SESSION_LOG_BASE_DIR"] == "/writable/live/api/sessions"
@@ -655,6 +657,7 @@ def test_child_environment_is_profile_scoped_and_secret_minimal() -> None:
   assert research_producer["FMP_API_KEY"] == "research-secret"
   assert research_producer["SEC_BUDGET_SITE"] == "prod"
   assert research_producer["SEC_USER_AGENT"] == "host-agent contact@example.com"
+  assert research_producer["SEC_EXPECTED_MACHINE_IDENTITY"] == "host.example.test"
   assert research_producer["RESEARCH_PRODUCER_AGENT_MAX_TOKENS"] == "24000"
   assert "IBKR_FLEX_TOKEN" not in research_producer
   assert forbidden.isdisjoint(research_producer)
@@ -668,6 +671,7 @@ def test_child_environment_is_profile_scoped_and_secret_minimal() -> None:
   assert advisor["FMP_API_KEY"] == "research-secret"
   assert advisor["SEC_BUDGET_SITE"] == "prod"
   assert advisor["SEC_USER_AGENT"] == "host-agent contact@example.com"
+  assert advisor["SEC_EXPECTED_MACHINE_IDENTITY"] == "host.example.test"
   assert advisor["AGENT_GATEWAY_RATES_FILE"] == "/opt/hank/rates.json"
   assert advisor["AGENT_SESSION_LOG_BASE_DIR"] == "/writable/live/api/sessions"
   assert advisor["IBKR_FLEX_TOKEN"] == "brokerage-secret"
@@ -686,6 +690,7 @@ def test_child_environment_is_profile_scoped_and_secret_minimal() -> None:
   assert "FMP_API_KEY" not in custom_provider
   assert "SEC_BUDGET_SITE" not in custom_provider
   assert "SEC_USER_AGENT" not in custom_provider
+  assert "SEC_EXPECTED_MACHINE_IDENTITY" not in custom_provider
   assert custom_provider["AGENT_GATEWAY_RATES_FILE"] == "/opt/hank/rates.json"
   assert "IBKR_FLEX_TOKEN" not in custom_provider
   assert "OPENAI_SESSION_EPOCH" not in custom_provider

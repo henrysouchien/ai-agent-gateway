@@ -28,9 +28,15 @@ from agent_workflow_contracts import AnalyticalOutcome, ToolGrant
 # evidence-poor.  The capability vocabulary marks them with the read verb.
 _SOURCE_CAPABILITY_SUFFIX = ".read/v1"
 
-_RATIONALE_TURNS_EXHAUSTED = (
-  "the child reached its turn ceiling before completing the objective"
-)
+_RATIONALE_CEILING_REACHED = {
+  "turns_exhausted": (
+    "the child reached its turn ceiling before completing the objective"
+  ),
+  "budget_exhausted": (
+    "the child reached its declared budget ceiling before completing the "
+    "objective"
+  ),
+}
 _RATIONALE_MISSING_INPUTS = (
   "required upstream inputs were unavailable at admission"
 )
@@ -77,7 +83,7 @@ def derive_mechanical_outcome(
   failures: Mapping[str, tuple[int, int]],
   sources: Sequence[Mapping[str, object]] = (),
   narrative_present: bool,
-  turns_exhausted: bool,
+  ceiling_reached: str | None,
   missing_inputs: tuple[str, ...] = (),
 ) -> AnalyticalOutcome | None:
   """Derive the mechanical ``AnalyticalOutcome``, or ``None`` if unassessed.
@@ -89,7 +95,7 @@ def derive_mechanical_outcome(
     pinned reading of an absent ``task_entry`` at the settlement sites.
   * narrative absent → ``None``.  Settlement already failed; there is nothing
     to qualify.
-  * ``turns_exhausted`` → ``partial``.
+  * a declared ceiling reached (``ceiling_reached``) → ``partial``.
   * missing inputs → ``partial``; nothing left to work with → ``blocked``.
   * all granted source-capability retrievals failed → ``insufficient_evidence``.
   * some failed → ``partial``.
@@ -104,12 +110,15 @@ def derive_mechanical_outcome(
   if grant is None or not narrative_present:
     return None
 
-  if turns_exhausted:
+  if ceiling_reached is not None:
+    rationale = _RATIONALE_CEILING_REACHED.get(ceiling_reached)
+    if rationale is None:
+      raise ValueError("mechanical outcome received an unknown ceiling")
     return AnalyticalOutcome(
       disposition="partial",
       assessment_source="mechanically_derived",
-      assessment_rationale=_RATIONALE_TURNS_EXHAUSTED,
-      unmet_requirements=("turns_exhausted",),
+      assessment_rationale=rationale,
+      unmet_requirements=(ceiling_reached,),
     )
 
   source_tool_ids = source_capability_tool_ids(grant=grant, bindings=bindings)

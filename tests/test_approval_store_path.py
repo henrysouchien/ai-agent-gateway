@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import pytest
 from fastapi import FastAPI
@@ -110,28 +109,10 @@ def test_gateway_approval_subsystem_uses_configured_campaign_db(
 ) -> None:
   user_data_dir = tmp_path / "campaign" / "data"
   expected = user_data_dir / "gateway" / "approvals.sqlite3"
+  # The state root is created by the deployment, not by the subsystem.
+  expected.parent.mkdir(parents=True, mode=0o700)
   monkeypatch.setenv("USER_DATA_DIR", str(user_data_dir))
   monkeypatch.setenv("GATEWAY_APPROVAL_DB_PATH", str(expected))
-  captured: dict[str, Any] = {}
-
-  class FakeStore:
-    def __init__(self, *, path: Path, **_kwargs: Any) -> None:
-      captured["path"] = path
-
-  monkeypatch.setattr(server_chat_helpers, "SQLiteApprovalStore", FakeStore)
-  monkeypatch.setattr(server_chat_helpers, "resolve_audit_writer", lambda: object())
-  monkeypatch.setattr(server_chat_helpers, "ApprovalAuditEmitter", lambda **_kwargs: object())
-  monkeypatch.setattr(
-    server_chat_helpers,
-    "build_env_approval_notification_destination_resolver",
-    lambda: None,
-  )
-  monkeypatch.setattr(
-    server_chat_helpers,
-    "build_env_telegram_approval_notification_sender",
-    lambda: None,
-  )
-  monkeypatch.setattr(server_chat_helpers, "resolve_policy", lambda *, store: ("policy", store))
   app = FastAPI()
   config = GatewayServerConfig(
     audit_hmac_secret_resolver=lambda: b"secret",
@@ -141,5 +122,9 @@ def test_gateway_approval_subsystem_uses_configured_campaign_db(
 
   server_chat_helpers._init_approval_subsystem(app, config)
 
-  assert captured["path"] == expected
-  assert app.state.gateway_approval_policy[0] == "policy"
+  assert app.state.gateway_approval_store.path == expected
+  # The standing approval preference is approval state: one file beside the
+  # ledger, handed to the one policy every channel shares.
+  assert app.state.gateway_approval_preference_store.path == (
+    user_data_dir / "gateway" / "approval-preferences.sqlite3"
+  )

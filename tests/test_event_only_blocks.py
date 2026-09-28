@@ -213,7 +213,7 @@ def _trusted_market_data_manager() -> McpClientManager:
       content=[],
     )
 
-  manager._call_tool_once = call_tool_once  # type: ignore[method-assign]
+  manager._call_tool_once = call_tool_once
   manager._translate_provider_symbol = lambda _server, _name, payload: payload  # type: ignore[method-assign]
   return manager
 

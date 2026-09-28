@@ -260,7 +260,6 @@ def create_agent(
   session_cache_denied_tools: frozenset[str] | None = None,
   max_turns: int | None = None,
   max_budget_usd: float | None = None,
-  per_turn_timeout: int = 300,
   valid_api_keys: set[str] | None = None,
   jwt_secret: str | None = None,
   session_ttl: int = 3600,
@@ -358,7 +357,6 @@ def create_agent(
     code_execution_config: Optional `CodeExecutionConfig` override.
     max_turns: Optional hard stop for the conversation loop.
     max_budget_usd: Optional estimated-cost budget across the session.
-    per_turn_timeout: Maximum seconds allowed for a single model turn.
     valid_api_keys: API keys accepted by `/chat/init`. If empty, any non-empty
       key is accepted.
     jwt_secret: JWT signing secret for session tokens. A random secret is
@@ -829,7 +827,6 @@ def create_agent(
         mcp_client=mcp_client,
         purpose=session.purpose,
         get_tool_definitions=_get_tool_defs,
-        per_turn_timeout=per_turn_timeout,
         on_tool_result=_combined_on_tool_result,
         on_usage=_combined_on_usage if usage_ledger is not None or on_usage is not None else None,
         on_session_summary=_combined_on_session_summary,
@@ -949,7 +946,6 @@ def create_agent(
       resolver_timeout_seconds=resolver_timeout_seconds,
       commercial_work_start_gate=commercial_work_start_gate,
       mcp_client=mcp_client,
-      per_turn_timeout=per_turn_timeout,
       on_startup=_combined_startup,
       on_shutdown=_combined_shutdown,
       prefix=prefix,

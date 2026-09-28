@@ -48,7 +48,7 @@ def _derive(**overrides):
     "failures": {},
     "sources": (),
     "narrative_present": True,
-    "turns_exhausted": False,
+    "ceiling_reached": None,
     "missing_inputs": (),
   }
   kwargs.update(overrides)
@@ -66,8 +66,8 @@ def test_absent_narrative_derives_no_outcome() -> None:
   assert _derive(narrative_present=False) is None
 
 
-def test_turns_exhausted_derives_partial_with_the_display_carrier() -> None:
-  outcome = _derive(turns_exhausted=True)
+def test_declared_ceiling_derives_partial_with_the_display_carrier() -> None:
+  outcome = _derive(ceiling_reached="turns_exhausted")
 
   assert outcome is not None
   assert outcome.disposition == "partial"
@@ -78,11 +78,15 @@ def test_turns_exhausted_derives_partial_with_the_display_carrier() -> None:
   assert outcome.unmet_requirements == ("turns_exhausted",)
 
 
-def test_turns_exhausted_precedes_a_clean_retrieval_record() -> None:
-  outcome = _derive(turns_exhausted=True, failures={"web_search": (3, 0)})
+def test_declared_ceiling_precedes_a_clean_retrieval_record() -> None:
+  outcome = _derive(
+    ceiling_reached="budget_exhausted",
+    failures={"web_search": (3, 0)},
+  )
 
   assert outcome is not None
   assert outcome.disposition == "partial"
+  assert outcome.unmet_requirements == ("budget_exhausted",)
 
 
 def test_all_source_capability_retrievals_failed_derives_insufficient() -> None:
@@ -185,7 +189,7 @@ def test_derivation_signature_names_only_admitted_authority_inputs() -> None:
     "failures",
     "sources",
     "narrative_present",
-    "turns_exhausted",
+    "ceiling_reached",
     "missing_inputs",
   }
 

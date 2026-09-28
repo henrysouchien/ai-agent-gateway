@@ -611,22 +611,36 @@ class ToolDispatcher:
     """Product review projection inherited with its plan validator."""
     return self._plan_review_renderer
 
-  def with_scoped_local_handler(
+  def fork_child(
     self,
-    tool_name: str,
-    scope: Callable[[LocalToolHandler], LocalToolHandler],
+    *,
+    event_log: EventLog,
+    session_id: str,
+    local_handler_scopes: Mapping[
+      str, Callable[[LocalToolHandler], LocalToolHandler]
+    ] | None = None,
   ) -> "ToolDispatcher":
-    """Return a shallow clone whose local ``tool_name`` handler is ``scope(stock)``.
+    """Return the dispatcher a fork child runs on.
 
-    A fork narrows what its parent already dispatches locally; it never adds a
-    route the parent lacks, so a missing stock handler raises ``KeyError``.
+    The clone records its boundary events in ``event_log`` under
+    ``session_id``; the parent's log and session are untouched. Each
+    ``local_handler_scopes`` entry replaces that stock local handler with
+    ``scope(stock)``. A fork narrows what its parent already dispatches
+    locally; it never adds a route the parent lacks, so a missing stock
+    handler raises ``KeyError``.
     """
 
-    stock = self._local.get(tool_name)
-    if not callable(stock):
-      raise KeyError(tool_name)
+    local = dict(self._local)
+    for tool_name, scope in (local_handler_scopes or {}).items():
+      stock = local.get(tool_name)
+      if not callable(stock):
+        raise KeyError(tool_name)
+      local[tool_name] = scope(stock)
     clone = copy.copy(self)
-    clone._local = {**self._local, tool_name: scope(stock)}
+    clone._local = local
+    clone._event_log = event_log
+    clone._session_id = session_id
+    clone._boundary_event_log = _BoundaryEventLogProjection(clone)
     return clone
 
   def _append_event(self, event: dict[str, Any]) -> Any | None:
@@ -1042,6 +1056,7 @@ class ToolDispatcher:
       run_id=run_context.run_id,
       user_id=run_context.user_id,
       ui_blocks_run=run_context.ui_blocks_run,
+      redact_text=self._secret_boundary.redact_text,
     )
 
   async def dispatch(
@@ -1434,6 +1449,30 @@ class ToolDispatcher:
   ) -> tuple[bool, str | None, bool]:
     """Return (approval required, safe cache key, cache hit)."""
 
+    required, cache_key, cache_hit, _profile_tightened = (
+      self.registered_approval_decision(
+        declaration,
+        prepared_call,
+        trusted_plan,
+      )
+    )
+    return required, cache_key, cache_hit
+
+  def registered_approval_decision(
+    self,
+    declaration: ToolRegistrationDeclaration,
+    prepared_call: PreparedToolCall,
+    trusted_plan: TrustedToolPlan | None = None,
+  ) -> tuple[bool, str | None, bool, bool]:
+    """Return (approval required, safe cache key, cache hit, profile tightened).
+
+    The last value is the running profile's own overlay decision, kept apart
+    from the door's registration: the profile can add a requirement the
+    registration did not carry, so whoever settles approval under the run's
+    owner authority has to see it. Profile policy tightens a door; it never
+    waives one.
+    """
+
     registry = self._tool_policy_implementations
     context_factory = self._approval_predicate_context_factory
     if registry is None:
@@ -1491,12 +1530,12 @@ class ToolDispatcher:
 
     approval_required = intrinsic_required or overlay_required
     if not approval_required:
-      return False, None, False
+      return False, None, False, overlay_required
     if (
       policy.cache_key is None
       or overlay_required
     ):
-      return True, None, False
+      return True, None, False, overlay_required
 
     try:
       prepared_plan = (
@@ -1524,7 +1563,7 @@ class ToolDispatcher:
       ) from exc
 
     cache_hit = cache_key in self._approved_tool_types
-    return not cache_hit, cache_key, cache_hit
+    return not cache_hit, cache_key, cache_hit, overlay_required
 
   def registered_addin_declaration(
     self,
@@ -1952,7 +1991,16 @@ class ToolDispatcher:
         assert registered_prepared_call is not None
         trusted_scope = registered_mcp_dispatch_scope(
           user_id=self._resolve_run_context().user_id,
-          dispatch_scope=self._portfolio_dispatch_scope(),
+          dispatch_scope={
+            **(self._portfolio_dispatch_scope() or {}),
+            # Planning binds the run the executor will receive in MCP meta;
+            # the apply route refuses a plan whose run differs.
+            **self._mcp_meta_run_context(
+              lifecycle_tool_name,
+              skill_run_id=skill_run_id,
+              workspace_dir=workspace_dir,
+            ),
+          },
         )
         registered_mcp_call = (
           self._mcp.classify_registered_mcp_prepared_tool_call(
@@ -1962,6 +2010,8 @@ class ToolDispatcher:
             self._registered_approval_overlay,
           )
         )
+      except PlannedWritePlanningRejected as exc:
+        return exc.tool_result()
       except Exception as exc:
         log.error(
           "Registered MCP planning failed for %s | exception_type=%s",
@@ -1977,6 +2027,7 @@ class ToolDispatcher:
 
     registered_approval_cache_key: str | None = None
     registered_approval_cache_hit = False
+    profile_tightened_approval = False
     if registered_approval_declaration is not None:
       assert registered_prepared_call is not None
       try:
@@ -1996,7 +2047,8 @@ class ToolDispatcher:
             static_needs_approval,
             registered_approval_cache_key,
             registered_approval_cache_hit,
-          ) = self.registered_approval_requirement(
+            profile_tightened_approval,
+          ) = self.registered_approval_decision(
             registered_approval_declaration,
             registered_prepared_call,
             trusted_plan,
@@ -2393,6 +2445,7 @@ class ToolDispatcher:
             automatic_approval_reason=automatic_approval_reason,
             automatic_denial_reason=automatic_denial_reason,
             deny_user_prompt=deny_user_prompt,
+            profile_tightened_approval=profile_tightened_approval,
           )
         )
       except Exception as exc:
@@ -2723,6 +2776,7 @@ class ToolDispatcher:
             approval_reuse_key=approval_reuse_key,
             approval_args_redacted=approval_args_redacted,
             approval_args_hash=approval_args_hash,
+            profile_tightened_approval=profile_tightened_approval,
           )
           approval_request_record = lifecycle.get("request")
           if lifecycle.get("timeout"):
@@ -2976,14 +3030,13 @@ class ToolDispatcher:
         caller_session_token = getattr(self._session, "session_token", None)
         if caller_session_token is not None:
           meta["session_token"] = caller_session_token
-        routed_skill_run_id = mcp_metadata_skill_run_id(
-          lifecycle_tool_name,
-          skill_run_id,
+        meta.update(
+          self._mcp_meta_run_context(
+            lifecycle_tool_name,
+            skill_run_id=skill_run_id,
+            workspace_dir=workspace_dir,
+          )
         )
-        if routed_skill_run_id is not None:
-          meta["skill_run_id"] = routed_skill_run_id
-        if workspace_dir is not None:
-          meta["workspace_dir"] = workspace_dir
         if batch_id is not None:
           meta["batch_id"] = str(batch_id)
         if (
@@ -3411,6 +3464,7 @@ class ToolDispatcher:
     automatic_approval_reason: str | None = None,
     automatic_denial_reason: str | None = None,
     deny_user_prompt: bool = False,
+    profile_tightened_approval: bool = False,
   ) -> dict[str, Any]:
     return await _approval_lifecycle_helpers.run_approval_lifecycle(
       route=self._approval_route,
@@ -3435,6 +3489,7 @@ class ToolDispatcher:
       automatic_approval_reason=automatic_approval_reason,
       automatic_denial_reason=automatic_denial_reason,
       deny_user_prompt=deny_user_prompt,
+      profile_tightened_approval=profile_tightened_approval,
       resolve_run_context_fn=self._resolve_run_context,
       current_skill_admission_fn=current_skill_admission,
       redact_for_approval_request_fn=self._redact_for_approval_request,
@@ -3671,6 +3726,26 @@ class ToolDispatcher:
     if _scope_text(scope.get("portfolio_name")) is None:
       return None
     return scope
+
+  @staticmethod
+  def _mcp_meta_run_context(
+    lifecycle_tool_name: str,
+    *,
+    skill_run_id: str | None,
+    workspace_dir: str | None,
+  ) -> dict[str, str]:
+    """The run identity a registered MCP call carries in its meta."""
+
+    context: dict[str, str] = {}
+    routed_skill_run_id = mcp_metadata_skill_run_id(
+      lifecycle_tool_name,
+      skill_run_id,
+    )
+    if routed_skill_run_id is not None:
+      context["skill_run_id"] = routed_skill_run_id
+    if workspace_dir is not None:
+      context["workspace_dir"] = workspace_dir
+    return context
 
   def _portfolio_scope_fields_for_tool(self, tool_name: str, server: str) -> set[str]:
     try:

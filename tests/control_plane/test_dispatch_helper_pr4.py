@@ -35,7 +35,7 @@ from agent_gateway.server import (
   MaterializedCredential,
   _dispatch_chat_turn,
 )
-from agent_gateway.session import AuthManager, GatewaySession, SessionStore
+from agent_gateway.session import AuthManager, GatewaySession, SessionStore, SessionStream
 
 
 _SERVICE_HANDLE = CredentialHandle(
@@ -264,7 +264,7 @@ async def _dispatch_with_runner(runner_type: type[Any]):
       metadata=None,
       model_key=None,
     ),
-    event_log=event_log,
+    turn=SessionStream(event_log=event_log, runner_task=None),
     on_event=_on_event,
     build_chat_runtime=_build_chat_runtime,
     transcript_dir=None,
@@ -306,7 +306,7 @@ def test_dispatch_chat_turn_runs_synchronously_and_fans_out_events() -> None:
         metadata={"document_context": {"source_id": "MSFT_10Q"}},
         model_key=None,
       ),
-      event_log=event_log,
+      turn=SessionStream(event_log=event_log, runner_task=None),
       on_event=_on_event,
       build_chat_runtime=_build_chat_runtime,
       transcript_dir=None,
@@ -366,7 +366,7 @@ def test_dispatch_chat_turn_clears_stream_active_after_runner_failure() -> None:
         metadata=None,
         model_key=None,
       ),
-      event_log=event_log,
+      turn=SessionStream(event_log=event_log, runner_task=None),
       on_event=_on_event,
       build_chat_runtime=_build_chat_runtime,
       transcript_dir=None,
@@ -478,7 +478,7 @@ def test_dispatch_chat_turn_rejects_concurrent_turn() -> None:
           metadata=None,
           model_key=None,
         ),
-        event_log=EventLog(),
+        turn=SessionStream(event_log=EventLog(), runner_task=None),
         on_event=lambda _event: None,  # type: ignore[arg-type]
         build_chat_runtime=_build_chat_runtime,
         transcript_dir=None,
@@ -542,7 +542,7 @@ def test_dispatch_prestart_selected_content_failure_releases_research_file_lock(
           metadata=None,
           model_key=None,
         ),
-        event_log=event_log,
+        turn=SessionStream(event_log=event_log, runner_task=None),
         on_event=lambda _event: None,  # type: ignore[arg-type]
         build_chat_runtime=_build_chat_runtime,
         transcript_dir=None,
@@ -617,7 +617,7 @@ def test_dispatch_prestart_activity_handoff_failure_releases_both_leases(
           metadata=None,
           model_key=None,
         ),
-        event_log=event_log,
+        turn=SessionStream(event_log=event_log, runner_task=None),
         on_event=lambda _event: None,  # type: ignore[arg-type]
         build_chat_runtime=_build_chat_runtime,
         transcript_dir=None,

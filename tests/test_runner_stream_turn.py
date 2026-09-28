@@ -160,7 +160,6 @@ def test_tool_history_preserves_a_semantic_copy_without_changing_execution_input
   runner._stream_stall_timeout = 60.0
   runner._compaction_trigger = None
   runner._compaction_instructions = None
-  runner._per_turn_timeout = None
   runner._disconnected = False
   runner._billing_mode = "byok"
   runner._sid = "history-redaction"
@@ -269,7 +268,6 @@ def test_stream_turn_cancellation_preserves_primary_when_internal_close_fails(
   runner._stream_stall_timeout = 60.0
   runner._compaction_trigger = None
   runner._compaction_instructions = None
-  runner._per_turn_timeout = None
   runner._disconnected = False
   runner._billing_mode = "byok"
   runner._sid = "stream-cleanup"
@@ -320,3 +318,126 @@ def test_stream_turn_cancellation_preserves_primary_when_internal_close_fails(
     "error": "Child cleanup failed: RuntimeError: provider close exploded",
     "message": "Child cleanup failed: RuntimeError: provider close exploded",
   }]
+
+
+def test_stream_guard_appends_heartbeat_while_tool_input_streams(
+  monkeypatch,
+) -> None:
+  import time
+
+  import agent_gateway.runner_stream_turn as stream_turn_module
+
+  monkeypatch.setattr(stream_turn_module, "STREAM_PROGRESS_LOG_INTERVAL", 0.02)
+  monkeypatch.setattr(gateway_runner, "STREAM_GUARD_POLL_INTERVAL", 0.02)
+  # A stall would fail the turn outright instead of retrying behind a delay.
+  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 0)
+
+  tool_input = {"body": "x" * 20}
+  tool_block = {"type": "tool_use", "id": "call-1", "name": "write_memo"}
+
+  class _Provider(ModelProvider):
+    name = "stub"
+
+    def has_active_credential(self, config):
+      return bool(config.get("api_key"))
+
+    def get_model_info(self, model):
+      return ModelInfo(id=model, provider=self.name, supports_thinking=True)
+
+    def resolve_effort(self, **kwargs):
+      requested = kwargs["requested"]
+      return EffortResolution(
+        requested=requested,
+        effective=requested,
+        thinking_enabled_effective=False,
+        payload_fragments={},
+      )
+
+    def normalize_messages(self, messages, model_info):
+      _ = model_info
+      return messages
+
+    def build_request_params(self, **_kwargs):
+      return {}
+
+    async def stream(self, client, params):
+      _ = client, params
+      yield StreamEvent(
+        type="tool_use_start",
+        tool_id="call-1",
+        tool_name="write_memo",
+        raw_block=dict(tool_block),
+      )
+      # A large tool input streams as input_json deltas only: nothing the
+      # runner appends until tool_use_end, for longer than the stall timeout.
+      deadline = time.monotonic() + 0.25
+      while time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+        yield StreamEvent(type="tool_use_delta", tool_input_json="x")
+      yield StreamEvent(
+        type="tool_use_end",
+        tool_id="call-1",
+        tool_name="write_memo",
+        tool_input=tool_input,
+        raw_block={**tool_block, "input": tool_input},
+      )
+      yield StreamEvent(type="message_end", stop_reason="tool_use")
+
+  provider = _Provider()
+  runner = object.__new__(AgentRunner)
+  runner._provider = provider
+  runner._capability_execution = stub_runner_capability_execution(
+    provider=provider,
+    model="model",
+    effort="none",
+  )
+  # Shorter than the stream: a guard that did not count deltas would fire.
+  runner._stream_stall_timeout = 0.15
+  runner._compaction_trigger = None
+  runner._compaction_instructions = None
+  runner._disconnected = False
+  runner._billing_mode = "byok"
+  runner._sid = "tool-input-heartbeat"
+  events: list[dict[str, object]] = []
+  runner._append = events.append  # type: ignore[method-assign]
+
+  returned = asyncio.run(runner._stream_turn(
+    client=object(),
+    config={
+      "model": "model",
+      "effort": "none",
+      "auth_mode": "api_key",
+    },
+    model_info=ModelInfo(id="model", provider="stub"),
+    system_prompt=None,
+    current_messages=[],
+    base_kwargs={"tools": []},
+    max_tokens=128,
+    turn_count=1,
+    turn_t0=time.time(),
+    turn_t0_mono=time.monotonic(),
+    system_chars=0,
+    tools_chars=0,
+    usage_totals={
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cache_creation_tokens": 0,
+      "cache_read_tokens": 0,
+    },
+  ))
+
+  heartbeats = [event for event in events if event["type"] == "heartbeat"]
+  assert heartbeats
+  for heartbeat in heartbeats:
+    assert set(heartbeat) == {"type", "elapsed_s", "last_progress_s", "events"}
+    assert all(
+      type(heartbeat[key]) is int
+      for key in ("elapsed_s", "last_progress_s", "events")
+    )
+  assert any(heartbeat["events"] > 1 for heartbeat in heartbeats if isinstance(heartbeat["events"], int))
+  assert [event for event in events if event["type"] != "heartbeat"] == []
+
+  assert isinstance(returned, tuple)
+  _, result = returned
+  assert result.stop_reason == "tool_use"
+  assert result.tool_uses == [("call-1", "write_memo", tool_input)]

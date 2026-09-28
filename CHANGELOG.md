@@ -1,5 +1,138 @@
 # Changelog
 
+## 0.20.0 (2026-09-28)
+
+### Fixed
+
+- A chat turn that runs past its session's TTL keeps its tools. Token
+  verification, session cleanup and turn admission read the TTL through one
+  predicate, `session_ttl_elapsed`, which keeps a session live while it holds
+  a turn that has not published its terminal event. Previously every tool call
+  that authenticated with the session's token was refused `Session expired`
+  once the turn crossed `expires_at`, and the cleanup loop cancelled the turn.
+  The TTL still applies after the turn ends: a turn attaches only while the
+  TTL has not elapsed, so an expired session cannot start a new turn, even
+  with a token accepted while the previous turn was still answering.
+- A fork child records its dispatcher boundary events (interceptor,
+  input-validation and approval audit events) in its own event log under its
+  own session id. Previously the child's dispatcher was a shallow copy whose
+  boundary-event projection still wrote to the parent's log, and on a
+  wrapping dispatcher the copy never rebound the log or session at all.
+- A `run_agent` child's first message carries its admitted binding: the
+  parent's objective under `Ticker: <T>` and `RESEARCH_FILE_ID=<n>`, the values
+  its run context holds. Previously the child got the objective alone, so a
+  child whose context tool takes `research_file_id` as an argument could admit
+  the file and still report it missing.
+- `anthropic.claude-opus-5-5` no longer advertises effort `none`: Opus 5.5
+  rejects `thinking: {"type": "disabled"}`. `claude-opus-5-5` has its own
+  model-info row (thinking cannot be disabled, omitted-effort default
+  `medium`) and rate row ($4 / $20 per MTok, cache read $0.20, 5-minute cache
+  write $5); it previously resolved by prefix to the Opus 5 rows. The
+  `claude-sonnet-5` model-info row carries the published $2 / $10 standard
+  price (cache read $0.20, write $2.50) instead of the cancelled $3 / $15
+  increase, matching its rate row. Anthropic rate table version `2026-09-28`,
+  source now names the pricing page.
+
+### Added
+
+- Model registry lifecycle `retired`: the provider no longer serves the
+  entry's `upstream_model`. A selection policy that names a retired key as a
+  default or allowed model fails admission. Resolution refuses a retired key
+  with the new `CAPABILITY_RESOLUTION_CODES` member `capability_model_retired`
+  (checked before policy allowance, for user-driven and internal selection
+  alike), and reauthorizing a durable binding on a retired key refuses with
+  the same code; the entry stays in the registry so the binding names why it
+  cannot run. A saved preference on a retired key is reported `model_hidden`
+  and the capability default applies.
+- `scripts/model_registry_liveness.py` (repository development check, not
+  shipped in the wheel and not a runtime gate) lists registry entries whose
+  Anthropic `upstream_model` the Models API no longer serves; exit 1 when any
+  are found. Providers without a liveness adapter are reported skipped.
+
+### Changed
+
+- Adaptive thinking is requested with `display: "summarized"` on every
+  adaptive Anthropic model. Thinking text streams as `thinking_delta`, is
+  stored in the assistant message's thinking block beside its signature, and
+  keeps the stream stall guard fed through long thinking phases (the silent
+  phase reached 337 s on opus-5 at effort high). Budget-mode thinking is
+  unchanged. Resumed sessions carry the logged `provider` onto replayed
+  assistant messages, so same-provider same-model thinking blocks replay with
+  their signatures; messages from logs that never recorded `provider` still
+  convert thinking to text.
+- `agent_workflow_contracts.research_file_contract.context_text_with_run_binding(
+  context_text, *, ticker, research_file_id)` is the one composer of the binding
+  header a model reads; embedding applications render run and skill contexts
+  through it.
+- `GatewayServerConfig.transcript_retention_days` now defaults to `0`, which
+  deletes nothing. An application that configures `transcript_dir` and says
+  nothing about retention previously swept transcripts and their `.meta.json`
+  sidecars at seven days. The sweeper is unchanged and a positive value still
+  enforces that horizon.
+- BREAKING: `ToolDispatcher.with_scoped_local_handler(tool_name, scope)` is
+  replaced by `ToolDispatcher.fork_child(*, event_log, session_id,
+  local_handler_scopes=None)`, which binds the child's event log, session id
+  and scoped local handlers in one clone; `AgentRunnerDispatcher` declares it,
+  and `spawn_fork_agent` takes the parent dispatcher plus
+  `local_handler_scopes` and calls it.
+- BREAKING: `per_turn_timeout` is removed from `AgentRunner`, `create_agent`,
+  `run_autonomous`, `GatewayServerConfig`, `AgentProjectConfig`, the sub-agent
+  and fork spawners and the `PARENT_PER_TURN_TIMEOUT` child-env allow-list. No
+  model turn is cancelled for how long it has run; a turn ends on its own stop
+  reason, the stream-gap stall watchdog, `max_turns` / `max_budget_usd`, a
+  tool's own I/O timeout or the operator's cancel. While a turn streams the
+  runner logs `Turn N streaming: elapsed=…s last_progress=…s ago events=…`
+  every 60 s. `load_agent_project_config` now logs and ignores keys it does
+  not read instead of raising `Unsupported agent config keys`, so an
+  `agent.yaml` the scaffold wrote with `per_turn_timeout: 300` still loads.
+- BREAKING: no wall clock bounds a `run_agent` child. Removed:
+  `DEFAULT_SUB_AGENT_TIMEOUT_SECONDS`, the 2100 s `run_agent` dispatch cap
+  (`run_agent` is now exempt from `tool_call_timeout`), the `timeout` argument
+  of `spawn_sub_agent` / `resume_sub_agent` / `spawn_fork_agent`,
+  `default_timeout` on `make_run_agent_handler` / `make_resume_handler`,
+  `SkillProfile.timeout` (skill frontmatter `timeout:` is no longer read),
+  `OperationRuntimePolicy.timeout_seconds`, `timeout_seconds` on `run_session` /
+  `run_autonomous`, and the `SUB_AGENT_TIMEOUT`, `SUB_AGENT_SKILL_TIMEOUT` and
+  `*_AGENT_TIMEOUT_SECONDS` child-env allow-list names. A wedged child ends by
+  a parent-side activity guard instead: with no child event for
+  `SUB_AGENT_ACTIVITY_GAP` (2 × `STREAM_THINKING_STALL_TIMEOUT`, 600 s) and no
+  child tool call in flight, the child is cancelled and settles `interrupted`
+  with `terminal_reason` `stalled: …` (`task_result_from_execution` takes
+  `stalled` in place of `timed_out` / `timeout`). The stream guard's 60 s
+  progress line also appends a `heartbeat` event (`elapsed_s`,
+  `last_progress_s`, `events`) so a child composing a long tool input stays
+  live to its parent.
+- The chat SSE projection keeps the `heartbeat` liveness fields (`elapsed_s`,
+  `last_progress_s`, `events`), so a client can show `working · 3m12s · last
+  progress 4s ago` during a turn that streams no text; the TUI working row
+  renders it. Provider pings still never reach the wire.
+- Model registry and selection policy revision `2026-09-28.1` move every
+  workload lane off superseded Anthropic ids:
+  - `investment.biotech_review`: `anthropic.claude-sonnet-4-20250514-sdk` →
+    `anthropic.claude-sonnet-5` at effort `none` (thinking disabled).
+  - `investment.research_agent`: `anthropic.claude-sonnet-4-6-sdk` →
+    `anthropic.claude-sonnet-5` at effort `none`.
+  - `investment.newsletter`, `investment.earnings_transcript`:
+    `anthropic.claude-haiku-4-5-20251001-gateway` →
+    `anthropic.claude-haiku-4-5` (undated `claude-haiku-4-5`).
+  - `risk.completion`, `risk.interpretation`: `anthropic.claude-sonnet-4-6-sdk`
+    → new `anthropic.claude-sonnet-5-sdk` (`anthropic.sdk.messages`,
+    `messages.adaptive`, `anthropic.byok`) at effort `none`.
+  - `risk.asset_classification`, `risk.overview_editorial`:
+    `anthropic.claude-haiku-4-5-20251001-sdk` → new
+    `anthropic.claude-haiku-4-5-sdk` (`anthropic.sdk.messages`,
+    `messages.adaptive`, `anthropic.byok`) at effort `none`.
+  - `risk.document_ingest`: `anthropic.claude-opus-4-8-oauth` → new
+    `anthropic.claude-opus-5-5-oauth` (`anthropic.sdk.messages`,
+    `messages.oauth`, `anthropic.oauth`) at effort `none`: no thinking field
+    is sent, so Opus 5.5 runs its default adaptive thinking.
+  - Lifecycle: `anthropic.claude-sonnet-4-20250514-sdk` is `retired`;
+    `anthropic.claude-sonnet-4-6-sdk`,
+    `anthropic.claude-haiku-4-5-20251001-sdk`,
+    `anthropic.claude-haiku-4-5-20251001-gateway` and
+    `anthropic.claude-opus-4-8-oauth` are `deprecated`. No policy allows any
+    of them.
+
 ## 0.19.0 (2026-09-16)
 
 ### Changed

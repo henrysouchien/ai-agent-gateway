@@ -1235,7 +1235,6 @@ class SQLiteApprovalStore:
           tool_class_ceiling TEXT NOT NULL,
           args_predicate TEXT,
           window_seconds INTEGER NOT NULL,
-          exclude_external_write_bypass INTEGER NOT NULL DEFAULT 1,
           created_at TEXT NOT NULL,
           expires_at TEXT,
           revoked_at TEXT,
@@ -3500,9 +3499,9 @@ class SQLiteApprovalStore:
             delegation_id, delegator_user_id, delegator_run_id, delegator_session_id,
             delegator_profile, delegator_channel, bound_excel_session_id,
             bound_relay_request_id, bound_workbook, tool_class_ceiling,
-            args_predicate, window_seconds, exclude_external_write_bypass,
+            args_predicate, window_seconds,
             created_at, expires_at, revoked_at, consumed_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           """,
           (
             grant.delegation_id,
@@ -3517,7 +3516,6 @@ class SQLiteApprovalStore:
             _json_dumps(sorted(grant.tool_class_ceiling)),
             _json_dumps(grant.args_predicate) if grant.args_predicate is not None else None,
             grant.window_seconds,
-            1 if grant.exclude_external_write_bypass else 0,
             _dt_to_text(grant.created_at),
             _dt_to_text(grant.expires_at),
             _dt_to_text(grant.revoked_at),

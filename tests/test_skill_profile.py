@@ -654,7 +654,7 @@ def test_dataclass_construction_defaults() -> None:
 
 
 def test_positional_construction_compat() -> None:
-  profile = SkillProfile("name", "prompt", None, None, None, None, None, False, None, False, {"custom": 1})
+  profile = SkillProfile("name", "prompt", None, None, None, None, False, None, False, {"custom": 1})
 
   assert [field.name for field in fields(SkillProfile)][-2:] == [
     "max_structured_reads",

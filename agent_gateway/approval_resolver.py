@@ -8,17 +8,26 @@ from .approval_policy import ApprovalPolicy
 from .single_user_policy import DelegationApprovalPolicy, SingleUserApprovalPolicy
 
 
-def resolve_policy(*, store: Any | None = None) -> ApprovalPolicy:
+def resolve_policy(
+  *,
+  store: Any | None = None,
+  preference_store: Any | None = None,
+) -> ApprovalPolicy:
   class_path = os.getenv("GATEWAY_APPROVAL_POLICY_CLASS", "").strip()
   if not class_path:
-    return DelegationApprovalPolicy(base=SingleUserApprovalPolicy(store=store))
+    return DelegationApprovalPolicy(
+      base=SingleUserApprovalPolicy(
+        store=store,
+        preference_store=preference_store,
+      )
+    )
   module_name, sep, attr = class_path.rpartition(".")
   if not sep or not module_name or not attr:
     raise RuntimeError("GATEWAY_APPROVAL_POLICY_CLASS must be a dotted class path")
   module = importlib.import_module(module_name)
   cls = getattr(module, attr)
   try:
-    base = cls(store=store)
+    base = cls(store=store, preference_store=preference_store)
   except TypeError:
     base = cls()
   return DelegationApprovalPolicy(base=base)

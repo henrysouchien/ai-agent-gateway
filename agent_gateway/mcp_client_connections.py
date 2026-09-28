@@ -4,6 +4,7 @@ import asyncio
 import copy
 import os
 import threading
+from concurrent import futures
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
@@ -141,10 +142,35 @@ class McpConnectionRuntime:
   logger: Any
 
 
+# Our write end is closed before the drain is awaited, so a drain still running
+# after this grace period means a surviving child descendant holds the stderr
+# pipe open and no EOF is coming. The wait has to expire well inside the
+# caller's context-close timeout (_MCP_CLOSE_TIMEOUT_SECONDS) so shutdown stays
+# bounded and the stderr tail still gets logged.
+_STDERR_DRAIN_GRACE_SECONDS = 1.0
+
+# How many `list_tools` pages one server's catalog may take before the walk in
+# initialize_session_state gives up. A mechanical I/O ceiling on a client loop,
+# never a wall-clock deadline on the work behind it. A client cannot know the
+# page size a server picks, so the ceiling is set where it cannot reject a real
+# catalog: all 14 servers this product configures return their whole catalog in
+# one page, the largest 67 tools (portfolio-reads-mcp, measured live
+# 2026-09-22), and 256 pages admits four times that even from a server perverse
+# enough to page one tool at a time. It exists to end a server that pages
+# without end, not to size a catalog.
+_LIST_TOOLS_PAGE_CEILING = 256
+
+
 class _StdioStderr:
   """Drain child stderr without blocking it or retaining an unbounded log."""
 
-  def __init__(self, name: str, logger: Any) -> None:
+  def __init__(
+    self,
+    name: str,
+    logger: Any,
+    *,
+    drain_grace_seconds: float = _STDERR_DRAIN_GRACE_SECONDS,
+  ) -> None:
     read_fd, write_fd = os.pipe()
     self.errlog = os.fdopen(write_fd, "w", encoding="utf-8")
     self._reader = os.fdopen(read_fd, "rb", buffering=0)
@@ -152,20 +178,40 @@ class _StdioStderr:
     self._name = name
     self._logger = logger
     self.failed = True
+    self._drain_grace_seconds = drain_grace_seconds
+    # Signalled by the reader thread instead of joining it: a join is neither
+    # cancellable nor interruptible, and an abandoned one parks a shared
+    # executor worker that the event loop waits for at shutdown.
+    self._drained: futures.Future[None] = futures.Future()
+    self._drained.set_running_or_notify_cancel()
     self._thread = threading.Thread(target=self._drain, daemon=True)
     self._thread.start()
 
   def _drain(self) -> None:
-    with self._reader:
-      while chunk := self._reader.read(4096):
-        self._tail.extend(chunk)
-        del self._tail[:-8192]
+    try:
+      with self._reader:
+        while chunk := self._reader.read(4096):
+          self._tail.extend(chunk)
+          del self._tail[:-8192]
+    finally:
+      self._drained.set_result(None)
 
   async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
     self.errlog.close()
-    await asyncio.to_thread(self._thread.join)
+    try:
+      await asyncio.wait_for(
+        asyncio.wrap_future(self._drained),
+        timeout=self._drain_grace_seconds,
+      )
+    except asyncio.TimeoutError:
+      self._logger.debug(
+        "MCP stdio server %s stderr drain still open after %.1fs; "
+        "a child descendant holds the pipe, reporting the tail read so far",
+        self._name,
+        self._drain_grace_seconds,
+      )
     if self.failed and self._tail:
-      tail = "\n".join(self._tail.decode("utf-8", errors="replace").splitlines()[-20:])
+      tail = "\n".join(bytes(self._tail).decode("utf-8", errors="replace").splitlines()[-20:])
       self._logger.warning(
         "MCP stdio server %s failed to connect; stderr (last 20 lines, up to 8192 bytes):\n%s",
         self._name,
@@ -273,15 +319,88 @@ async def connect_stdio_with_retries(
   raise RuntimeError("unreachable stdio connect retry state")
 
 
+class _TransportHost:
+  """One task enters a connection's transport contexts and the same task exits them.
+
+  The SDK's `stdio_client`, `streamable_http_client` and `ClientSession` each
+  enter an anyio task group. anyio delivers a group's cancellation to the task
+  that entered it, and only that task can exit it. A connection opened in a
+  caller's task would hand that caller, for the connection's whole life, a
+  cancellation aimed at whatever it is doing when an EOF reconnect, a
+  replacement or shutdown later closes the connection from another task —
+  a pipeline stage or a parent turn, cancelled by a reconnect it never asked
+  for. This host's task opens the contexts, waits to be closed, and exits them
+  itself; a connection's `exit_contexts` holds only the host.
+  """
+
+  def __init__(self, close_contexts: Callable[[list[Any]], Any]) -> None:
+    self._close_contexts = close_contexts
+    self._close_requested = asyncio.Event()
+    self._task: asyncio.Task[None] | None = None
+
+  async def open(self, opener: Callable[[list[Any]], Any]) -> Any:
+    """Run `opener(exit_contexts)` in the host task and return its result.
+
+    A caller that stops waiting only asks for the close: an open still in
+    flight runs to its own end in the host task, which then exits whatever it
+    entered.
+    """
+    opened: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    opened.add_done_callback(_retrieve_exception)
+    task = asyncio.create_task(self._run(opener, opened))
+    # The loop holds tasks weakly; an abandoned open still has to finish and
+    # exit what it entered.
+    _HOST_TASKS.add(task)
+    task.add_done_callback(_HOST_TASKS.discard)
+    self._task = task
+    try:
+      return await asyncio.shield(opened)
+    except BaseException:
+      self._close_requested.set()
+      raise
+
+  async def _run(self, opener: Callable[[list[Any]], Any], opened: asyncio.Future[Any]) -> None:
+    exit_contexts: list[Any] = []
+    try:
+      opened.set_result(await opener(exit_contexts))
+    except BaseException as exc:
+      await self._close_contexts(exit_contexts)
+      if isinstance(exc, asyncio.CancelledError):
+        opened.cancel()
+      else:
+        opened.set_exception(exc)
+      return
+    try:
+      await self._close_requested.wait()
+    finally:
+      await self._close_contexts(exit_contexts)
+
+  async def __aexit__(self, *_exc_info: Any) -> None:
+    self._close_requested.set()
+    assert self._task is not None
+    # Waiting, never awaiting the task itself: a caller's close deadline must
+    # not cancel the host out of its own teardown.
+    await asyncio.wait({self._task})
+
+
+def _retrieve_exception(future: asyncio.Future[Any]) -> None:
+  """Mark an open's failure retrieved when its caller already stopped waiting."""
+  if not future.cancelled():
+    future.exception()
+
+
+_HOST_TASKS: set[asyncio.Task[None]] = set()
+
+
 async def connect_stdio(
   manager: Any,
   name: str,
   config: dict[str, Any],
   runtime: McpConnectionRuntime,
 ) -> Any:
-  exit_contexts: list[Any] = []
-  success = False
-  try:
+  host = _TransportHost(runtime.close_contexts)
+
+  async def open_stdio(exit_contexts: list[Any]) -> Any:
     command = str(config.get("command", "")).strip()
     if not command:
       raise ValueError("missing command")
@@ -316,7 +435,7 @@ async def connect_stdio(
     state = await manager._initialize_session_state(
       name=name,
       session=session,
-      exit_contexts=exit_contexts,
+      exit_contexts=[host],
       tool_prefix=tool_prefix,
       allowed_tools=runtime.parse_allowed_tools(config.get("allowed_tools")),
     )
@@ -325,11 +444,9 @@ async def connect_stdio(
     state.stdio_eof = read_stream.eof
     state.stdio_receive_done = read_stream.receive_done
     stderr.failed = False
-    success = True
     return state
-  finally:
-    if not success:
-      await runtime.close_contexts(exit_contexts)
+
+  return await host.open(open_stdio)
 
 
 async def connect_streamable_http(
@@ -338,9 +455,9 @@ async def connect_streamable_http(
   config: dict[str, Any],
   runtime: McpConnectionRuntime,
 ) -> Any:
-  exit_contexts: list[Any] = []
-  success = False
-  try:
+  host = _TransportHost(runtime.close_contexts)
+
+  async def open_streamable_http(exit_contexts: list[Any]) -> Any:
     url = str(config.get("url") or "").strip()
     if not url:
       raise ValueError("missing url")
@@ -373,18 +490,15 @@ async def connect_streamable_http(
     await session.__aenter__()
     exit_contexts.append(session)
 
-    state = await manager._initialize_session_state(
+    return await manager._initialize_session_state(
       name=name,
       session=session,
-      exit_contexts=exit_contexts,
+      exit_contexts=[host],
       tool_prefix=tool_prefix,
       allowed_tools=runtime.parse_allowed_tools(config.get("allowed_tools")),
     )
-    success = True
-    return state
-  finally:
-    if not success:
-      await runtime.close_contexts(exit_contexts)
+
+  return await host.open(open_streamable_http)
 
 
 def build_http_auth(
@@ -441,7 +555,11 @@ async def initialize_session_state(
 
   tools: list[McpListedTool] = []
   cursor: str | None = None
-  while True:
+  # Bounded by construction: the `wait_for` below bounds one request, never the
+  # walk, so a server that answers every page with a fresh cursor used to be
+  # enumerated forever here — withholding every other server's catalog and
+  # holding the manager lock against shutdown for good.
+  for _page in range(_LIST_TOOLS_PAGE_CEILING):
     listed = await asyncio.wait_for(
       session.list_tools(params=PaginatedRequestParams(cursor=cursor)),
       timeout=manager._startup_timeout,
@@ -450,6 +568,14 @@ async def initialize_session_state(
     if listed.next_cursor is None:
       break
     cursor = listed.next_cursor
+  else:
+    # Reached only when the ceiling ran out with a cursor still pending: a
+    # protocol fault of the same class as the allowed_tools violation below,
+    # and it reaches the analyst by the same carrier.
+    raise ValueError(
+      "MCP server did not finish paginating list_tools within "
+      f"{_LIST_TOOLS_PAGE_CEILING} pages"
+    )
 
   # Carry audience metadata with the candidate until its catalog is accepted.
   # It must never enter Anthropic/OpenAI tool definitions.

@@ -52,7 +52,6 @@ def _grant(**overrides: Any) -> DelegationGrant:
     "tool_class_ceiling": frozenset({"state_write"}),
     "args_predicate": None,
     "window_seconds": 600,
-    "exclude_external_write_bypass": True,
     "created_at": utc_now(),
     "expires_at": None,
     "revoked_at": None,
@@ -142,7 +141,7 @@ def test_no_delegation_passthrough_matches_base_for_state_write() -> None:
     actual = await policy.decide(payload=payload, request=request, run_context=run_context)
 
     assert actual == expected
-    assert actual.outcome == "request_user_approval"
+    assert actual.outcome == "auto_approve"
 
   _run(_case())
 
@@ -196,7 +195,7 @@ def test_delegation_never_auto_approves_nonstandard_constraint(
   _run(_case())
 
 
-def test_delegated_state_write_not_in_ceiling_requests_user_approval() -> None:
+def test_delegated_state_write_outside_the_ceiling_follows_the_owner() -> None:
   async def _case() -> None:
     delegation = _grant(tool_class_ceiling=frozenset({"read"}))
     run_context = _run_context(delegation=delegation)
@@ -204,13 +203,14 @@ def test_delegated_state_write_not_in_ceiling_requests_user_approval() -> None:
 
     decision = await _policy().decide(payload=payload, request=request, run_context=run_context)
 
-    assert decision.outcome == "request_user_approval"
-    assert decision.policy_id == "delegation"
+    # The grant only adds; a class outside its ceiling is the owner's call.
+    assert decision.outcome == "auto_approve"
+    assert decision.policy_id == "single-user"
 
   _run(_case())
 
 
-def test_delegated_external_write_ignores_matching_persistent_grant(tmp_path: Path) -> None:
+def test_delegated_money_boundary_ignores_a_matching_persistent_grant(tmp_path: Path) -> None:
   async def _case() -> None:
     store = _store(tmp_path)
     base = SingleUserApprovalPolicy(store=store)
@@ -219,14 +219,14 @@ def test_delegated_external_write_ignores_matching_persistent_grant(tmp_path: Pa
       store,
       approval_id="prior-approval",
       tool_name="execute_trade",
-      scope_hint="external_write:execute_trade:AAPL",
+      scope_hint="irreversible:execute_trade:AAPL",
     )
     await store.create_persistent_grant(
       PersistentGrant(
         grant_id="persistent-grant-1",
         user_id="alice",
         tool_name="execute_trade",
-        scope_hint="external_write:execute_trade:AAPL",
+        scope_hint="irreversible:execute_trade:AAPL",
         args_predicate=None,
         granted_at=utc_now(),
         expires_at=utc_now() + timedelta(days=1),
@@ -236,22 +236,12 @@ def test_delegated_external_write_ignores_matching_persistent_grant(tmp_path: Pa
       )
     )
 
-    non_delegated_context = _run_context()
-    request, payload = _request_and_payload(
-      run_context=non_delegated_context,
-      tool_class="external_write",
-      tool_name="execute_trade",
-      tool_args={"ticker": "AAPL"},
-    )
-    base_decision = await base.decide(payload=payload, request=request, run_context=non_delegated_context)
-    assert base_decision.outcome == "auto_approve"
-
     delegated_context = _run_context(
-      delegation=_grant(tool_class_ceiling=frozenset({"external_write"})),
+      delegation=_grant(tool_class_ceiling=frozenset({"irreversible"})),
     )
     delegated_request, delegated_payload = _request_and_payload(
       run_context=delegated_context,
-      tool_class="external_write",
+      tool_class="irreversible",
       tool_name="execute_trade",
       tool_args={"ticker": "AAPL"},
     )
@@ -262,12 +252,12 @@ def test_delegated_external_write_ignores_matching_persistent_grant(tmp_path: Pa
     )
 
     assert delegated_decision.outcome == "request_user_approval"
-    assert delegated_decision.policy_id == "delegation"
+    assert delegated_decision.allow_persistent_grant is False
 
   _run(_case())
 
 
-def test_resolve_policy_wraps_default_and_blocks_delegated_external_write_persistent_grant(
+def test_resolve_policy_wraps_default_and_keeps_the_money_boundary_human(
   tmp_path: Path,
   monkeypatch: Any,
 ) -> None:
@@ -280,14 +270,14 @@ def test_resolve_policy_wraps_default_and_blocks_delegated_external_write_persis
       store,
       approval_id="prior-approval",
       tool_name="execute_trade",
-      scope_hint="external_write:execute_trade:AAPL",
+      scope_hint="irreversible:execute_trade:AAPL",
     )
     await store.create_persistent_grant(
       PersistentGrant(
         grant_id="persistent-grant-1",
         user_id="alice",
         tool_name="execute_trade",
-        scope_hint="external_write:execute_trade:AAPL",
+        scope_hint="irreversible:execute_trade:AAPL",
         args_predicate=None,
         granted_at=utc_now(),
         expires_at=utc_now() + timedelta(days=1),
@@ -298,11 +288,11 @@ def test_resolve_policy_wraps_default_and_blocks_delegated_external_write_persis
     )
 
     delegated_context = _run_context(
-      delegation=_grant(tool_class_ceiling=frozenset({"external_write"})),
+      delegation=_grant(tool_class_ceiling=frozenset({"irreversible"})),
     )
     request, payload = _request_and_payload(
       run_context=delegated_context,
-      tool_class="external_write",
+      tool_class="irreversible",
       tool_name="execute_trade",
       tool_args={"ticker": "AAPL"},
     )
@@ -310,14 +300,14 @@ def test_resolve_policy_wraps_default_and_blocks_delegated_external_write_persis
     decision = await policy.decide(payload=payload, request=request, run_context=delegated_context)
 
     assert decision.outcome == "request_user_approval"
-    assert decision.policy_id == "delegation"
 
   _run(_case())
 
 
-def test_delegated_portfolio_config_and_irreversible_request_user_approval() -> None:
+def test_delegated_money_boundary_asks_and_portfolio_config_does_not() -> None:
   async def _case() -> None:
     policy = _policy()
+    outcomes: dict[str, str] = {}
     for tool_class in ("portfolio_config", "irreversible"):
       run_context = _run_context(
         delegation=_grant(tool_class_ceiling=frozenset({tool_class})),
@@ -329,14 +319,18 @@ def test_delegated_portfolio_config_and_irreversible_request_user_approval() -> 
       )
 
       decision = await policy.decide(payload=payload, request=request, run_context=run_context)
+      outcomes[tool_class] = decision.outcome
 
-      assert decision.outcome == "request_user_approval"
-      assert decision.policy_id == "delegation"
+    # A grant naming the money boundary cannot buy it: only a live order asks.
+    assert outcomes == {
+      "portfolio_config": "auto_approve",
+      "irreversible": "request_user_approval",
+    }
 
   _run(_case())
 
 
-def test_delegated_args_predicate_must_match() -> None:
+def test_delegated_args_predicate_decides_only_the_grant_credit() -> None:
   async def _case() -> None:
     policy = _policy()
     delegation = _grant(
@@ -362,13 +356,16 @@ def test_delegated_args_predicate_must_match() -> None:
     )
     match = await policy.decide(payload=match_payload, request=match_request, run_context=match_context)
 
-    assert mismatch.outcome == "request_user_approval"
     assert match.outcome == "auto_approve"
+    assert match.policy_id == "delegation"
+    # A predicate mismatch withdraws the grant's credit, not the owner's answer.
+    assert mismatch.outcome == "auto_approve"
+    assert mismatch.policy_id == "single-user"
 
   _run(_case())
 
 
-def test_delegated_expired_window_requests_user_approval() -> None:
+def test_delegated_expired_window_falls_through_to_the_owner() -> None:
   async def _case() -> None:
     delegation = _grant(
       created_at=utc_now() - timedelta(days=1),
@@ -380,8 +377,10 @@ def test_delegated_expired_window_requests_user_approval() -> None:
 
     decision = await _policy().decide(payload=payload, request=request, run_context=run_context)
 
-    assert decision.outcome == "request_user_approval"
-    assert decision.policy_id == "delegation"
+    # An expired grant credits nothing, and escalates nothing: the standing
+    # preference the owner holds decides the call.
+    assert decision.outcome == "auto_approve"
+    assert decision.policy_id == "single-user"
 
   _run(_case())
 

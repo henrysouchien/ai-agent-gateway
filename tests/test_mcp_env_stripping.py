@@ -28,6 +28,7 @@ def test_build_mcp_env_keeps_allowlist_only_for_empty_server_env(monkeypatch) ->
       "HOME": "/tmp/home",
       "LANG": "en_US.UTF-8",
       "PYTHONPATH": "/workspace/lib",
+      "VIRTUAL_ENV": "/workspace/host-venv",
       "PYTHONNOUSERSITE": "1",
       "OPENAI_API_KEY": "openai-secret",
       "ANTHROPIC_API_KEY": "anthropic-secret",
@@ -43,6 +44,7 @@ def test_build_mcp_env_keeps_allowlist_only_for_empty_server_env(monkeypatch) ->
       "GOOGLE_API_KEY": "google-secret",
       "SEC_BUDGET_SITE": "prod",
       "SEC_USER_AGENT": "host-agent contact@example.com",
+      "SEC_EXPECTED_MACHINE_IDENTITY": "host.example.test",
       "AWS_SECRET_ACCESS_KEY": "aws-secret",
       "UNRELATED_VAR": "drop-me",
     },
@@ -69,6 +71,7 @@ def test_build_mcp_env_keeps_allowlist_only_for_empty_server_env(monkeypatch) ->
   assert "INVESTMENT_CAPABILITY_CLAIM_ED25519_PUBLIC_KEY" not in env
   assert "SEC_BUDGET_SITE" not in env
   assert "SEC_USER_AGENT" not in env
+  assert "SEC_EXPECTED_MACHINE_IDENTITY" not in env
   assert (
     "INVESTMENT_CAPABILITY_CLAIM_ED25519_PRIVATE_KEY"
     not in mcp_client_module._DEFAULT_ENV_ALLOWLIST
@@ -79,6 +82,9 @@ def test_build_mcp_env_keeps_allowlist_only_for_empty_server_env(monkeypatch) ->
   )
   assert "SEC_BUDGET_SITE" not in mcp_client_module._DEFAULT_ENV_ALLOWLIST
   assert "SEC_USER_AGENT" not in mcp_client_module._DEFAULT_ENV_ALLOWLIST
+  assert (
+    "SEC_EXPECTED_MACHINE_IDENTITY" not in mcp_client_module._DEFAULT_ENV_ALLOWLIST
+  )
 
 
 def test_build_mcp_env_expands_explicit_investment_claim_public_key_only(
@@ -162,6 +168,7 @@ def test_build_mcp_env_expands_risk_module_dotenv_pointer(monkeypatch) -> None:
     "FMP_API_KEY",
     "SEC_BUDGET_SITE",
     "SEC_USER_AGENT",
+    "SEC_EXPECTED_MACHINE_IDENTITY",
     "GMAIL_TOKEN_PATH",
     "GMAIL_CREDENTIALS_PATH",
     "INVESTMENT_TOOLS_DISABLE_RESEARCH_IDEAS",
@@ -222,6 +229,7 @@ def test_server_env_passthrough_uses_parent_value_without_literal(
     "FMP_API_KEY",
     "SEC_BUDGET_SITE",
     "SEC_USER_AGENT",
+    "SEC_EXPECTED_MACHINE_IDENTITY",
     "GMAIL_TOKEN_PATH",
     "GMAIL_CREDENTIALS_PATH",
     "INVESTMENT_TOOLS_DISABLE_RESEARCH_IDEAS",

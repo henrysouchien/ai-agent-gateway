@@ -129,7 +129,7 @@ V1_FIELD_PROJECTION: dict[str, frozenset[str]] = {
     "judge_path",
     "duration_ms",
   ),
-  "heartbeat": _fields("timestamp"),
+  "heartbeat": _fields("timestamp", "elapsed_s", "last_progress_s", "events"),
   "interrupted": _fields(
     "reason",
     "runner_id",

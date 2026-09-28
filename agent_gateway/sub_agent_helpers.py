@@ -43,11 +43,6 @@ _DEFAULT_EXCLUDED_TOOLS = frozenset({
   "send_message",
 })
 
-# Finite by default: with timeout=None a wedged sub-agent parks the parent's
-# run_agent tool call on an unbounded await, which holds the chat turn lock
-# forever (stuck "Running" card, dead Esc, 409 on every new message — ACUI-1).
-# Skill profiles with an explicit `timeout` still override this.
-DEFAULT_SUB_AGENT_TIMEOUT_SECONDS = 1800.0
 _ARTIFACT_EMIT_TOOLS = frozenset({"emit_canvas_artifact", "emit_dashboard_artifact"})
 ExcludedToolsResolver = Callable[[], FrozenSet[str]]
 NeedsApprovalResolver = Callable[[FrozenSet[str]], Callable[..., bool] | None]

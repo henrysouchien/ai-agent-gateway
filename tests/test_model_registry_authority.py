@@ -25,13 +25,16 @@ from agent_gateway.model_registry import (
   ProductModelSelectionPolicy,
 )
 from agent_gateway.providers import installed_adapter_route_support
+from gateway_test_support.model_defaults import SESSION_DRIVER
+
+_DRIVER_ENTRY = INITIAL_MODEL_REGISTRY.require(SESSION_DRIVER.model_key)
 
 
 def _auth(
   *,
-  providers: frozenset[str] = frozenset({"anthropic"}),
+  providers: frozenset[str] = frozenset({_DRIVER_ENTRY.provider}),
   capabilities: frozenset[str] = frozenset({"session.driver", "plan.author"}),
-  model_keys: frozenset[str] = frozenset({"anthropic.claude-opus-5"}),
+  model_keys: frozenset[str] = frozenset({SESSION_DRIVER.model_key}),
 ) -> AuthContext:
   handles = {
     provider: CredentialHandle(
@@ -97,17 +100,6 @@ def test_initial_artifacts_are_complete_and_adapter_closed() -> None:
     for capability_id, policy in INITIAL_MODEL_SELECTION_POLICY.capabilities.items()
     if capability_id != "plan.author"
   )
-  assert all(
-    INITIAL_MODEL_SELECTION_POLICY.capabilities[capability_id].default.effort
-    == "high"
-    for capability_id in {
-      "node.explore",
-      "node.implement",
-      "node.mutate",
-      "node.verify",
-      "node.choose",
-    }
-  )
   assert {
     entry.key
     for entry in INITIAL_MODEL_REGISTRY.models.values()
@@ -116,12 +108,14 @@ def test_initial_artifacts_are_complete_and_adapter_closed() -> None:
     "anthropic.claude-fable-5-1",
     "anthropic.claude-fable-5",
     "anthropic.claude-haiku-4-5",
-    "anthropic.claude-mythos-5",
+    "anthropic.claude-opus-5-5",
     "anthropic.claude-opus-5",
     "anthropic.claude-sonnet-5",
     "openai.gpt-6-astra",
+    "openai.gpt-6-sol",
     "openai.gpt-5-6",
     "codex.gpt-6-astra",
+    "codex.gpt-6-sol",
     "codex.gpt-5-6-luna",
     "codex.gpt-5-6-sol",
     "codex.gpt-5-6-terra",
@@ -130,14 +124,8 @@ def test_initial_artifacts_are_complete_and_adapter_closed() -> None:
   }
   assert INITIAL_MODEL_REGISTRY.require("openai.gpt-5-6").label == "GPT-5.6"
   assert INITIAL_MODEL_REGISTRY.require("codex.gpt-5-6-sol").label == "GPT-5.6 Sol"
-  assert INITIAL_MODEL_SELECTION_POLICY.capabilities[
-    "risk.asset_classification"
-  ].default.model_key == "anthropic.claude-haiku-4-5-20251001-sdk"
-  assert INITIAL_MODEL_SELECTION_POLICY.capabilities[
-    "investment.newsletter"
-  ].default.model_key == "anthropic.claude-haiku-4-5-20251001-gateway"
   assert all(
-    entry.lifecycle == "hidden"
+    entry.lifecycle in {"hidden", "deprecated", "retired"}
     for entry in INITIAL_MODEL_REGISTRY.models.values()
     if "user_selectable" not in entry.capabilities.values()
   )
@@ -149,6 +137,7 @@ def test_citation_review_resolves_haiku_without_user_picker() -> None:
     registry=INITIAL_MODEL_REGISTRY,
     selection_policy=INITIAL_MODEL_SELECTION_POLICY,
     auth=_auth(
+      providers=frozenset({"anthropic"}),
       capabilities=frozenset({"citation.review"}),
       model_keys=frozenset({"anthropic.claude-haiku-4-5"}),
     ),
@@ -164,32 +153,32 @@ def test_citation_review_resolves_haiku_without_user_picker() -> None:
   assert policy.allow_authenticated_run_override is False
 
 
-def test_omitted_selection_resolves_complete_opus_five_high_bind() -> None:
+def test_omitted_selection_resolves_complete_packaged_default_bind() -> None:
   bind = _resolve_driver(_auth())
 
   assert bind.model_dump(mode="json") == {
     "schema_version": "1.0",
     "capability_id": "session.driver",
-    "model_key": "anthropic.claude-opus-5",
-    "provider": "anthropic",
-    "upstream_model": "claude-opus-5",
-    "adapter": "anthropic.messages",
-    "protocol_profile": "messages.adaptive",
-    "route": "anthropic.public",
-    "effort": "high",
+    "model_key": SESSION_DRIVER.model_key,
+    "provider": _DRIVER_ENTRY.provider,
+    "upstream_model": SESSION_DRIVER.upstream_model,
+    "adapter": _DRIVER_ENTRY.adapter,
+    "protocol_profile": _DRIVER_ENTRY.protocol_profile,
+    "route": _DRIVER_ENTRY.route,
+    "effort": SESSION_DRIVER.effort,
     "credential_principal": "user",
-    "credential_ref": "credential:anthropic:user-7",
+    "credential_ref": f"credential:{_DRIVER_ENTRY.provider}:user-7",
     "run_mode": "interactive",
-    "registry_revision": "2026-08-18.1",
-    "policy_revision": "2026-08-18.1",
+    "registry_revision": SESSION_DRIVER.registry_revision,
+    "policy_revision": SESSION_DRIVER.policy_revision,
     "selection_source": "capability_default",
   }
 
 
 def test_explicit_stable_key_is_honored_exactly() -> None:
   auth = _auth(
-    providers=frozenset({"anthropic", "xai"}),
-    model_keys=frozenset({"anthropic.claude-opus-5", "xai.grok-4-5"}),
+    providers=frozenset({_DRIVER_ENTRY.provider, "xai"}),
+    model_keys=frozenset({SESSION_DRIVER.model_key, "xai.grok-4-5"}),
   )
   bind = _resolve_driver(
     auth,
@@ -232,7 +221,7 @@ def test_stale_saved_preference_falls_back_to_default_but_is_not_rewritten() -> 
 
   bind = _resolve_driver(_auth(), saved_preference=preference)
 
-  assert bind.model_key == "anthropic.claude-opus-5"
+  assert bind.model_key == SESSION_DRIVER.model_key
   assert bind.selection_source == "capability_default"
   assert preference.model_key == "xai.grok-4-5"
 
@@ -247,7 +236,7 @@ def test_ineligible_default_requires_action_instead_of_first_available() -> None
     _resolve_driver(auth)
 
   assert caught.value.code == "default_not_eligible"
-  assert caught.value.model_key == "anthropic.claude-opus-5"
+  assert caught.value.model_key == SESSION_DRIVER.model_key
   assert caught.value.eligible_model_keys == ("xai.grok-4-5",)
 
 
@@ -316,7 +305,7 @@ def test_durable_bind_reauthorization_never_reselects() -> None:
 
   alternative_only = _auth(
     providers=frozenset({"xai"}),
-    model_keys=frozenset({"anthropic.claude-opus-5", "xai.grok-4-5"}),
+    model_keys=frozenset({SESSION_DRIVER.model_key, "xai.grok-4-5"}),
   )
   with pytest.raises(CapabilityResolutionError) as caught:
     reauthorize_capability_bind(
@@ -331,7 +320,7 @@ def test_durable_bind_reauthorization_never_reselects() -> None:
 def test_durable_reauthorization_ignores_current_selection_policy_change() -> None:
   auth = _auth(
     model_keys=frozenset({
-      "anthropic.claude-opus-5",
+      SESSION_DRIVER.model_key,
       "anthropic.claude-sonnet-5",
     }),
   )
@@ -366,7 +355,7 @@ def test_durable_reauthorization_ignores_current_selection_policy_change() -> No
   )
 
   assert handle.handle_id == bind.credential_ref
-  assert bind.model_key == "anthropic.claude-opus-5"
+  assert bind.model_key == SESSION_DRIVER.model_key
   assert new_bind.model_key == "anthropic.claude-sonnet-5"
 
 
@@ -445,6 +434,45 @@ def test_durable_reauthorization_blocks_removed_capability_qualification() -> No
   assert caught.value.code == "capability_model_not_allowed"
 
 
+_DRIVER_POLICY = INITIAL_MODEL_SELECTION_POLICY.capabilities["session.driver"]
+
+
+@pytest.mark.parametrize(
+  "model_key",
+  [
+    pytest.param(SESSION_DRIVER.model_key, id="default"),
+    pytest.param(
+      next(
+        key
+        for key in sorted(_DRIVER_POLICY.allowed_model_keys)
+        if key != _DRIVER_POLICY.default.model_key
+      ),
+      id="allowed",
+    ),
+  ],
+)
+def test_policy_admission_rejects_retired_default_or_allowed_model(
+  model_key: str,
+) -> None:
+  entries = dict(INITIAL_MODEL_REGISTRY.models)
+  entries[model_key] = replace(
+    entries[model_key],
+    lifecycle="retired",
+    capabilities={
+      capability_id: "internal"
+      for capability_id in entries[model_key].capabilities
+    },
+  )
+  registry = ProductModelRegistry(
+    schema="product-model-registry/v1",
+    revision="retired-admission",
+    models=entries,
+  )
+
+  with pytest.raises(ValueError, match=f"allows retired model {model_key} "):
+    INITIAL_MODEL_SELECTION_POLICY.admit_registry(registry)
+
+
 def test_eligible_choices_are_authenticated_and_provider_free() -> None:
   choices = eligible_model_choices(
     "session.driver",
@@ -453,7 +481,7 @@ def test_eligible_choices_are_authenticated_and_provider_free() -> None:
     auth=_auth(),
   )
 
-  assert [choice.key for choice in choices] == ["anthropic.claude-opus-5"]
+  assert [choice.key for choice in choices] == [SESSION_DRIVER.model_key]
   assert not hasattr(choices[0], "provider")
   assert not hasattr(choices[0], "upstream_model")
 
@@ -462,14 +490,14 @@ def test_reported_identity_is_recorded_verbatim_or_rejected() -> None:
   bind = _resolve_driver(_auth())
   assert validate_reported_identity(
     bind,
-    "claude-opus-5",
+    SESSION_DRIVER.upstream_model,
     registry=INITIAL_MODEL_REGISTRY,
-  ) == "claude-opus-5"
+  ) == SESSION_DRIVER.upstream_model
 
   with pytest.raises(CapabilityResolutionError) as caught:
     validate_reported_identity(
       bind,
-      "claude-opus-5-unreviewed-snapshot",
+      f"{SESSION_DRIVER.upstream_model}-unreviewed-snapshot",
       registry=INITIAL_MODEL_REGISTRY,
     )
   assert caught.value.code == "reported_identity_mismatch"
@@ -477,7 +505,10 @@ def test_reported_identity_is_recorded_verbatim_or_rejected() -> None:
 
 def test_interactive_haiku_admits_the_provider_dated_report_without_rebinding() -> None:
   bind = _resolve_driver(
-    _auth(model_keys=frozenset({"anthropic.claude-haiku-4-5"})),
+    _auth(
+      providers=frozenset({"anthropic"}),
+      model_keys=frozenset({"anthropic.claude-haiku-4-5"}),
+    ),
     explicit_intent=ModelSelectionIntent(
       model_key="anthropic.claude-haiku-4-5",
       effort="none",

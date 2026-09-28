@@ -11,6 +11,7 @@ from agent_gateway.event_log import EventLog
 from agent_gateway.server import ChatTurnInputs
 from agent_gateway.server_chat_helpers import prepare_session_driver_turn
 from agent_gateway.server_models import ChatMessage
+from gateway_test_support.model_defaults import SESSION_DRIVER
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -41,7 +42,7 @@ def test_custom_gateway_examples_consume_exact_session_driver_bind(
   assert init_response.json()["user_id"] == "demo-user"
 
   policy = config.model_selection_policy.capabilities["session.driver"]
-  assert policy.default.model_key == "anthropic.claude-opus-5"
+  assert policy.default.model_key == SESSION_DRIVER.model_key
   assert policy.default.effort == module["DEFAULT_EFFORT"]
   entry = config.model_registry.require(policy.default.model_key)
   assert entry.provider == "anthropic"
@@ -77,12 +78,12 @@ def test_custom_gateway_examples_consume_exact_session_driver_bind(
   assert bind.to_json() == {
     "schema_version": "1.0",
     "capability_id": "session.driver",
-    "model_key": "anthropic.claude-opus-5",
-    "provider": "anthropic",
+    "model_key": SESSION_DRIVER.model_key,
+    "provider": entry.provider,
     "upstream_model": module["DEFAULT_MODEL"],
-    "adapter": "anthropic.messages",
-    "protocol_profile": "messages.adaptive",
-    "route": "anthropic.public",
+    "adapter": entry.adapter,
+    "protocol_profile": entry.protocol_profile,
+    "route": entry.route,
     "effort": module["DEFAULT_EFFORT"],
     "credential_principal": "service",
     "credential_ref": module["SERVICE_CREDENTIAL_HANDLE"].handle_id,

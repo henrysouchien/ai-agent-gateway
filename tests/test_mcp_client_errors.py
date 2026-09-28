@@ -191,3 +191,45 @@ def test_sdk_timeout_does_not_replay_dispatched_mutation(
       await manager.shutdown()
 
   asyncio.run(scenario())
+
+
+def test_tool_error_names_an_exception_whose_string_is_empty(monkeypatch) -> None:
+  import anyio
+
+  async def scenario():
+    class Session:
+      async def call_tool(self, name, arguments, *, read_timeout_seconds, meta=None):
+        raise anyio.ClosedResourceError()
+
+    def state():
+      return _ConnectedServerState(
+        name="edgar-parser-mcp",
+        session=Session(),
+        exit_contexts=[],
+        tool_definitions=[{"name": "get_filing_sections", "description": "", "input_schema": {}}],
+        tool_names={"get_filing_sections"},
+        config={"type": "stdio", "command": "edgar-parser-mcp"},
+      )
+
+    async def connect(name, config):
+      return state()
+
+    manager = McpClientManager(config_path=None)
+    manager._servers = {"edgar-parser-mcp": state()}
+    manager._tool_to_server = {"get_filing_sections": "edgar-parser-mcp"}
+    monkeypatch.setattr(manager, "_connect_stdio_with_retries", connect)
+    try:
+      assert str(anyio.ClosedResourceError()) == ""
+      result, error = await manager.call_tool(
+        "get_filing_sections", {"ticker": "PCTY"}, allow_uncertain_replay=False,
+      )
+    finally:
+      await manager.shutdown()
+    assert result is None
+    assert error == {
+      "code": "tool_error",
+      "sub_code": "unknown",
+      "message": "ClosedResourceError",
+    }
+
+  asyncio.run(scenario())

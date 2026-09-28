@@ -606,6 +606,11 @@ class ToolExecutionContext:
   approval_chain_id: str | None = None
   durable_business_model_payload: bytes | None = field(default=None, repr=False)
   trusted_plan: TrustedToolPlan | None = field(default=None, repr=False)
+  # Local tools that return unfiltered process or filesystem text redact it
+  # here, at the producer that knows where the bytes came from. The dispatcher
+  # binds the run's own secret boundary; a handler never sees the boundary
+  # itself, only this one-string projection.
+  redact_text: Callable[[str], str] | None = field(default=None, repr=False)
 
   def emit(self, event: Dict[str, Any]) -> None:
     """Append a custom event to the active event log."""

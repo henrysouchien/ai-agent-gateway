@@ -10,7 +10,7 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AgentSessionLog, SessionContextBuilder
+from agent_gateway import AgentSessionLog, AnthropicProvider, SessionContextBuilder
 import agent_gateway.agent_session_log as agent_session_log_module
 import agent_gateway.context_builder as context_builder_module
 
@@ -571,3 +571,35 @@ def test_context_builder_preserves_terminal_result_outside_replayed_call(
   rendered = json.dumps(messages)
   assert "tool-1" in rendered
   assert "terminal evidence" in rendered
+
+
+@pytest.mark.parametrize("provider_recorded", [True, False])
+def test_context_builder_resume_replays_same_model_thinking_with_signature(
+  tmp_path: Path,
+  provider_recorded: bool,
+) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "thinking-resume.jsonl")
+  thinking = {"type": "thinking", "thinking": "Weigh the guidance.", "signature": "sig-1"}
+  event = {
+    "type": "assistant_message",
+    "content_blocks": [thinking, {"type": "text", "text": "Guidance is light."}],
+    "stop_reason": "end_turn",
+    "model": "claude-opus-5",
+  }
+  if provider_recorded:
+    event["provider"] = "anthropic"
+  _run(log.append(event))
+
+  messages = _run(SessionContextBuilder(agent_session_log=log).build())
+  provider = AnthropicProvider()
+  normalized = provider.normalize_messages(messages, provider.get_model_info("claude-opus-5"))
+
+  # Logs written before the event recorded `provider` keep converting thinking
+  # to text, because the signature cannot be proven to belong to this model.
+  replayed_thinking = thinking if provider_recorded else {"type": "text", "text": "Weigh the guidance."}
+  assert normalized == [
+    {
+      "role": "assistant",
+      "content": [replayed_thinking, {"type": "text", "text": "Guidance is light."}],
+    },
+  ]

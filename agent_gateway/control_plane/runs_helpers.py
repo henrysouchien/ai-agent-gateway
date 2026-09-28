@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import time
 from collections.abc import Awaitable, Callable
@@ -71,6 +72,8 @@ from .runs_models import (
   ToolResultSummaryResponse,
   VerdictSummaryResponse,
 )
+
+log = logging.getLogger(__name__)
 
 __all__ = [
   "AutonomousDispatchRequest",
@@ -1031,7 +1034,13 @@ def _run_channel_matches(run_channel: str | None, authenticated_channel: str | N
 
 
 def _require_run_channel(run_channel: str | None, authenticated_channel: str | None) -> None:
+  """Answer a cross-channel lookup exactly like a miss; tell only the operator which it was."""
   if not _run_channel_matches(run_channel, authenticated_channel):
+    log.warning(
+      "control run lookup refused: run exists on channel %r, caller authenticated on channel %r; answered 404",
+      run_channel,
+      authenticated_channel,
+    )
     raise HTTPException(status_code=404, detail="Run not found")
 
 

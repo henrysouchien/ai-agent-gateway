@@ -494,6 +494,10 @@ class SessionContextBuilder:
         message["model"] = event["model"]
       if event.get("stop_reason"):
         message["stop_reason"] = event["stop_reason"]
+      # build_assistant_message_event records `provider`; logs written before
+      # it did lack the field, and those messages keep converting thinking.
+      if event.get("provider"):
+        message["provider"] = event["provider"]
       return message
 
     if event_type == "runtime_guard" and event.get("guard") == "final_answer":

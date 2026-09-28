@@ -13,7 +13,8 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.session import AuthManager, JWT_ALGORITHM, SessionStore
+from agent_gateway.event_log import EventLog
+from agent_gateway.session import AuthManager, JWT_ALGORITHM, SessionStore, SessionStream
 from agent_gateway.session_capabilities import TEAM_WORKSPACE_WRITE_CAPABILITY
 
 _JWT_SECRET = "jwt-secret-with-at-least-32-bytes"
@@ -322,5 +323,80 @@ def test_expiry_blocker_exception_retains_session_and_token_stays_rejected(
     assert exc_info.value.detail == "Session expired"
     assert session.session_id in store.sessions
     assert store.get_session(session.session_id) is None
+
+  asyncio.run(scenario())
+
+
+def _start_turn(session) -> tuple[SessionStream, asyncio.Task[bool], asyncio.Event]:
+  """Attach a running turn to ``session`` the way chat dispatch does."""
+
+  release = asyncio.Event()
+  runner = asyncio.get_running_loop().create_task(release.wait())
+  turn = SessionStream(
+    event_log=EventLog(session_id=session.session_id),
+    runner_task=runner,
+  )
+  session.active_turn = turn
+  return turn, runner, release
+
+
+def test_turn_in_progress_keeps_its_session_token_live_past_the_ttl(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def scenario() -> None:
+    now = [1_000]
+    monkeypatch.setattr("agent_gateway.session.time.time", lambda: now[0])
+    store = SessionStore(ttl=120)
+    auth = AuthManager(secret=_JWT_SECRET, valid_keys={"gateway-key"}, session_store=store)
+    session = store.create_session(api_key_hash="hash", user_id="alice")
+    token = auth.issue_token(session)
+    turn, runner, release = _start_turn(session)
+
+    # The turn's tool calls authenticate with the session's token after the TTL.
+    now[0] = session.expires_at + 1
+    assert auth.verify_token(token) is session
+    assert store.visible_sessions_snapshot() == (session,)
+    await store.cleanup_expired_async()
+    assert store.get_session(session.session_id) is session
+    assert turn.is_running
+
+    # Once the turn publishes its terminal event the TTL applies again: the
+    # expired session cannot start another turn.
+    turn.event_log.append({"type": "stream_complete"})
+    with pytest.raises(HTTPException) as exc_info:
+      auth.verify_token(token)
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "Session expired"
+    assert store.visible_sessions_snapshot() == ()
+    release.set()
+    await runner
+
+  asyncio.run(scenario())
+
+
+def test_session_ttl_expiry_waits_for_the_turn_it_is_running(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def scenario() -> None:
+    now = [1_000]
+    monkeypatch.setattr("agent_gateway.session.time.time", lambda: now[0])
+    store = SessionStore(ttl=120)
+    expired: list[str] = []
+    store.add_on_expiry(lambda item: expired.append(item.session_id))
+    running = store.create_session(api_key_hash="hash", user_id="alice")
+    idle = store.create_session(api_key_hash="hash", user_id="bob")
+    turn, runner, release = _start_turn(running)
+
+    now[0] = running.expires_at
+    await store.cleanup_expired_async()
+    assert expired == [idle.session_id]
+    assert store.get_session(running.session_id) is running
+
+    turn.event_log.append({"type": "stream_complete"})
+    release.set()
+    await runner
+    await store.cleanup_expired_async()
+    assert expired == [idle.session_id, running.session_id]
+    assert store.get_session(running.session_id) is None
 
   asyncio.run(scenario())

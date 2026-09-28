@@ -1,6 +1,6 @@
 """Canonical research-file identity contract.
 
-Two facts live here, and nowhere else.
+Three facts live here, and nowhere else.
 
 `is_research_file_id` is the one expression of what a research file id IS — a
 non-boolean integer in `1 .. MAX_RESEARCH_FILE_ID` — the rule this repository
@@ -11,6 +11,12 @@ published as code, so six boundaries hand-wrote it and disagreed three ways.
 run which research file it is bound to. It is write-only toward the model: the
 binding itself is a typed scalar decided once at dispatch, and free text is not
 a channel for it, so nothing in this tree parses that token back out.
+
+`context_text_with_run_binding` is the one composer of the binding header a
+model reads — `Ticker: <T>` then `RESEARCH_FILE_ID=<n>` above the context. An
+autonomous run's context, a skill invocation and a `run_agent` child's first
+message all render through it, so the header has one shape wherever a run
+starts.
 
 Sibling of `ticker_contract`; stdlib-only, importable from both `api/` and
 `agent_gateway/`.
@@ -50,8 +56,32 @@ def format_research_file_id_token(research_file_id: int) -> str:
   return f"RESEARCH_FILE_ID={int(research_file_id)}"
 
 
+def context_text_with_run_binding(
+  context_text: str,
+  *,
+  ticker: str | None,
+  research_file_id: int | None,
+) -> str:
+  """Render a run's already-decided binding once, in the text the model reads.
+
+  ``Ticker: <ticker>`` first, then ``RESEARCH_FILE_ID=<id>``, then
+  ``context_text``. Write-only toward the model: one producer, zero machine
+  readers. An absent half renders nothing, and an unbound run's context is
+  returned unchanged.
+  """
+  lines: list[str] = []
+  if ticker:
+    lines.append(f"Ticker: {ticker}")
+  if research_file_id is not None:
+    lines.append(format_research_file_id_token(research_file_id))
+  if not lines:
+    return context_text
+  return "\n".join((*lines, context_text)) if context_text else "\n".join(lines)
+
+
 __all__ = [
   "MAX_RESEARCH_FILE_ID",
+  "context_text_with_run_binding",
   "format_research_file_id_token",
   "is_research_file_id",
 ]

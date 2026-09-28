@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from .capability_execution import BoundCapabilityExecution
+from .providers.anthropic_oauth import ANTHROPIC_USER_SCOPE_FIELD
 from .ui_blocks_metrics import record as record_package_counter
 
 
@@ -30,10 +31,16 @@ _NON_SECRET_AUTH_CONFIG_FIELDS = frozenset({
   "provider",
   "rate_table_version",
   "token_expires_at",
+  # The user identity whose credential pool this material came from, named by
+  # the credential owner itself (providers/anthropic_oauth.py) rather than
+  # re-spelled here.
+  ANTHROPIC_USER_SCOPE_FIELD,
 })
 _MIN_SUBSTRING_SECRET_LENGTH = 8
+# Depth is a stack bound, not a coverage budget: nothing walked here is larger
+# than what the model itself wrote, so an over-deep subtree is dropped where it
+# is found instead of voiding the value around it.
 _MAX_DEPTH = 32
-_MAX_NODES = 100_000
 _LOG = logging.getLogger("agent_gateway.secret_boundary")
 
 # These patterns intentionally recognize credential material, not suspicious key
@@ -48,10 +55,6 @@ _HIGH_CONFIDENCE_PATTERNS = (
     re.DOTALL,
   ),
 )
-
-
-class _SanitizationLimitExceeded(Exception):
-  """Stop the whole traversal when its shared resource budget is exhausted."""
 
 
 class SecretBoundary:
@@ -120,26 +123,17 @@ class SecretBoundary:
 
   def sanitize(self, value: Any, *, sink: str) -> Any:
     del sink  # Sink is explicit at call sites and reserved for value-free metrics.
-    remaining = [_MAX_NODES]
-    try:
-      return self._sanitize(value, depth=0, remaining=remaining, active=set())
-    except _SanitizationLimitExceeded as exc:
-      _observe_sanitization_failure(reason=str(exc))
-      return SANITIZATION_FAILED
+    return self._sanitize(value, depth=0, active=set())
 
   def _sanitize(
     self,
     value: Any,
     *,
     depth: int,
-    remaining: list[int],
     active: set[int],
   ) -> Any:
-    remaining[0] -= 1
-    if remaining[0] < 0:
-      raise _SanitizationLimitExceeded("node_limit")
     if depth > _MAX_DEPTH:
-      raise _SanitizationLimitExceeded("depth_limit")
+      return UNSUPPORTED_VALUE
     if value is None or isinstance(value, (bool, int, float)):
       return value
     if isinstance(value, str):
@@ -169,7 +163,6 @@ class SecretBoundary:
           sanitized[key] = self._sanitize(
             raw_value,
             depth=depth + 1,
-            remaining=remaining,
             active=active,
           )
         return sanitized
@@ -182,7 +175,6 @@ class SecretBoundary:
           self._sanitize(
             item,
             depth=depth + 1,
-            remaining=remaining,
             active=active,
           )
           for item in value
@@ -190,6 +182,20 @@ class SecretBoundary:
       finally:
         active.remove(container_id)
     return UNSUPPORTED_VALUE
+
+  def redact_text(self, value: str) -> str:
+    """Redact registered material from one string, without walking a payload.
+
+    This is the primitive a producer of unfiltered process or filesystem text
+    uses on its own output (`run_bash` stdout, `file_read` content,
+    `code_execute` streams): those bytes are the one place a credential this
+    process never handed out can still appear, because the model chose to read
+    a file or dump an environment.
+    """
+
+    if type(value) is not str:
+      raise TypeError("secret redaction requires exact text")
+    return self._sanitize_string(value)
 
   def _sanitize_string(self, value: str) -> str:
     sanitized = value
@@ -375,7 +381,17 @@ def sanitize_tool_event(
   sink: str,
   boundary: SecretBoundary | None = None,
 ) -> dict[str, Any]:
-  """Sanitize only typed tool-derived fields, leaving ordinary prose alone."""
+  """Project the text this process persists, never a tool's returned payload.
+
+  A settled `result` (and its serialized copy in `final_tool_result_blocks`) is
+  no longer walked. Nothing the gateway hands a tool comes back through one:
+  provider credentials never enter a tool call, an MCP child's environment, or
+  a local child's environment, and the one place unfiltered bytes do appear —
+  a file the model read, a child's stdout — is redacted by the tool that
+  produced it. What stays below is bounded text this process, a server, or the
+  model authored: tool input, the settled error and dispatch record, guard and
+  error prose, resource content, typed assistant blocks.
+  """
 
   projected = dict(event)
   event_type = str(projected.get("type") or "")
@@ -388,17 +404,10 @@ def sanitize_tool_event(
   }:
     fields = ("tool_input", "display")
   elif event_type == "tool_call_complete":
-    # `dispatch` carries source URLs and document ids extracted from the tool
-    # payload, so it is sanitized like any other tool-derived field. Unknown
-    # keys pass through unsanitized, which makes this tuple a silent-failure
-    # surface — additions here are deliberate (D-B1-3).
-    fields = (
-      "result",
-      "error",
-      "semantic_error",
-      "final_tool_result_blocks",
-      "dispatch",
-    )
+    # A server authors `error`/`semantic_error`, and `dispatch` carries source
+    # URLs this process lifted out of the payload — a token in a query string
+    # is the shape here. Both are bounded records, not the payload itself.
+    fields = ("error", "semantic_error", "dispatch")
   elif event_type == "tool_output_chunk":
     fields = ("text", "content")
   elif event_type in {"error", "run_error", "stream_retry"}:
@@ -414,11 +423,6 @@ def sanitize_tool_event(
 
   for field in fields:
     if field in projected:
-      if field == "final_tool_result_blocks" and isinstance(projected[field], list):
-        projected[field] = _sanitize_typed_blocks(
-          projected[field], sink=sink, boundary=boundary, sanitize_untyped=True,
-        )
-        continue
       projected[field] = sanitize_boundary_value(
         projected[field],
         sink=sink,
@@ -450,17 +454,15 @@ def _sanitize_typed_blocks(
   *,
   sink: str,
   boundary: SecretBoundary | None,
-  sanitize_untyped: bool = False,
 ) -> list[Any]:
   projected: list[Any] = []
   for block in blocks:
     block_type = str(block.get("type") or "") if isinstance(block, Mapping) else ""
-    if block_type not in {"tool_use", "server_tool_use", "tool_result"}:
-      projected.append(
-        sanitize_boundary_value(block, sink=sink, boundary=boundary)
-        if sanitize_untyped
-        else dict(block) if isinstance(block, Mapping) else block
-      )
+    # `tool_result` blocks carry a tool's returned payload, which is projected
+    # by whoever produced it, not here. What this walks is the model's own
+    # authorship: the input it wrote for a tool call.
+    if block_type not in {"tool_use", "server_tool_use"}:
+      projected.append(dict(block) if isinstance(block, Mapping) else block)
       continue
 
     safe_block = sanitize_boundary_value(block, sink=sink, boundary=boundary)

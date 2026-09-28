@@ -64,8 +64,8 @@ class SubprocessBackend(ExecutionBackend):
   def sandboxed(self) -> bool:
     return False
 
-  def available(self) -> bool:
-    return bool(sys.executable)
+  def unavailable_reason(self) -> Optional[str]:
+    return None if sys.executable else "no Python interpreter (sys.executable is empty)"
 
   async def execute(
     self,

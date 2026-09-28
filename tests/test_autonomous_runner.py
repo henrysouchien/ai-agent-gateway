@@ -3594,6 +3594,12 @@ def test_autonomous_terminal_replace_failure_commits_fenced_failure_before_publi
 
     status = await registry.wait(payload["task_id"], timeout_sec=1)
     record = registry._tasks[payload["task_id"]]
+    # wait() returns as soon as the record leaves its active states, which the
+    # fence does before the reaper publishes the terminal run state and drops
+    # the replay buffer. Those are the reaper's own tail, so join it rather
+    # than sampling the bus at whatever point wait() happened to return.
+    assert record.reaper_task is not None
+    await record.reaper_task
     manifest = _read_manifest(tmp_path)
 
     assert failed_terminal_replace is True
@@ -3682,6 +3688,11 @@ def test_autonomous_terminal_fsync_failure_commits_fenced_failure_before_publish
     process.returncode = 0
 
     status = await registry.wait(payload["task_id"], timeout_sec=1)
+    # The terminal publish and buffer cleanup are the reaper's tail, which
+    # runs after the fence leaves the record's active states and therefore
+    # after wait() may already have returned.
+    assert record.reaper_task is not None
+    await record.reaper_task
     manifest = _read_manifest(tmp_path)
 
     assert fail_once is False
@@ -3742,6 +3753,10 @@ def test_autonomous_double_terminal_manifest_failure_removes_stale_manifest_with
     process.returncode = 0
 
     status = await registry.wait(payload["task_id"], timeout_sec=1)
+    # Join the reaper: the "no terminal publish" claim is only meaningful once
+    # the reaper that would have published has finished.
+    assert record.reaper_task is not None
+    await record.reaper_task
 
     assert process.returncode == 0
     assert status["state"] == "failed"
@@ -4138,7 +4153,8 @@ def test_writer_lease_terminal_reason_persists_and_rehydrates(
     record = registry._tasks[payload["task_id"]]
     terminal_event = {
       "type": "stream_complete",
-      "terminal_disposition": "completed",
+      "terminal_disposition": "interrupted",
+      "reason": "writer_lease_already_held",
       "terminal_reason": "writer_lease_already_held",
     }
     projected = await registry._record_and_publish_event(
@@ -4152,7 +4168,7 @@ def test_writer_lease_terminal_reason_persists_and_rehydrates(
 
     await registry.wait(payload["task_id"], timeout_sec=1)
 
-    assert record.state == "completed"
+    assert record.state == "interrupted"
     assert record.exit_code == 0
     assert record.error is None
     assert record.terminal_reason == "writer_lease_already_held"

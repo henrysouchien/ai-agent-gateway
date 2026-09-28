@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import re
-from typing import Any, AsyncIterator, Literal
+import time
+from typing import Any, AsyncIterator, Literal, Mapping
 
 from ..auth import ProviderCredentialFailure
 from ..model_registry import (
@@ -35,6 +37,14 @@ _RATE_LIMIT_PATTERNS = (
   re.compile(r"\brate(?:\s+limit(?:ed|ing)?|\s+limited)\b", re.IGNORECASE),
   re.compile(r"\btoo many requests\b", re.IGNORECASE),
 )
+# Anthropic's unified subscription limiter reports one status and one reset per
+# window; the status names whether that window is still serving requests.
+_LIMIT_WINDOW_PROJECTIONS = (
+  ("rate_limit_5h_status", "rate_limit_5h_reset"),
+  ("rate_limit_7d_status", "rate_limit_7d_reset"),
+)
+# 2001-09-09T01:46:40Z: above it a projected number is an instant, below it a delay.
+_EPOCH_SECONDS_FLOOR = 1_000_000_000.0
 _CONTEXT_LENGTH_PATTERNS = (
   re.compile(r"\bcontext[_\s-]*length[_\s-]*(?:exceeded|error)\b", re.IGNORECASE),
   re.compile(r"\bcontext\s+window\b", re.IGNORECASE),
@@ -178,6 +188,58 @@ def _error_code_from_exception(exc: Exception) -> str | None:
   return None
 
 
+def _projected_epoch_seconds(value: Any, *, now: float) -> float | None:
+  """Read one projected reset field as epoch seconds.
+
+  Providers project two shapes: a delay in seconds (`retry-after`) and an
+  absolute reset instant (`anthropic-ratelimit-unified-*-reset`, RFC 3339 or
+  epoch seconds). Both are the limiter's own words; this only converts them.
+  """
+
+  if isinstance(value, bool) or value is None:
+    return None
+  text = str(value).strip()
+  if not text:
+    return None
+  try:
+    numeric = float(text)
+  except ValueError:
+    try:
+      parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+      return None
+    if parsed.tzinfo is None:
+      parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+  # A value small enough to predate this decade is a delay, not an instant.
+  return numeric if numeric > _EPOCH_SECONDS_FLOOR else now + numeric
+
+
+def _credential_reset_at(exc: Exception, *, now: float | None = None) -> float | None:
+  """When the limiter said this credential becomes usable again.
+
+  Reads the rate-limit projection the provider layer already attached to the
+  exception (`api/credentials.py` `_anthropic_rate_limit_projection`); it never
+  re-reads response headers. A limit window is only counted while its own
+  status says it is not serving requests, so a burst 429 does not park a
+  credential until an unrelated weekly window rolls over.
+  """
+
+  moment = time.time() if now is None else now
+  candidates: list[float] = []
+  retry_after = _projected_epoch_seconds(getattr(exc, "retry_after", None), now=moment)
+  if retry_after is not None:
+    candidates.append(retry_after)
+  for status_field, reset_field in _LIMIT_WINDOW_PROJECTIONS:
+    status = str(getattr(exc, status_field, "") or "").strip().lower()
+    if not status or status.startswith("allow"):
+      continue
+    window_reset = _projected_epoch_seconds(getattr(exc, reset_field, None), now=moment)
+    if window_reset is not None:
+      candidates.append(window_reset)
+  return max(candidates) if candidates else None
+
+
 def _classify_provider_credential_failure(
   *,
   provider: str,
@@ -200,6 +262,7 @@ def _classify_provider_credential_failure(
       status_code=status_code,
       error_code=error_code,
       message=message,
+      reset_at=_credential_reset_at(exc),
     )
 
   if status_code in {401} or any(pattern.search(searchable) for pattern in _AUTH_PATTERNS):
@@ -209,6 +272,7 @@ def _classify_provider_credential_failure(
       status_code=status_code,
       error_code=error_code,
       message=message,
+      reset_at=_credential_reset_at(exc),
     )
 
   if status_code == 403:
@@ -218,6 +282,7 @@ def _classify_provider_credential_failure(
       status_code=status_code,
       error_code=error_code,
       message=message,
+      reset_at=_credential_reset_at(exc),
     )
 
   if status_code == 429 or any(pattern.search(searchable) for pattern in _RATE_LIMIT_PATTERNS):
@@ -227,6 +292,7 @@ def _classify_provider_credential_failure(
       status_code=status_code,
       error_code=error_code,
       message=message,
+      reset_at=_credential_reset_at(exc),
     )
 
   return None
@@ -406,6 +472,22 @@ class ModelProvider:
 
   def classify_credential_failure(self, exc: Exception) -> ProviderCredentialFailure | None:
     return _classify_provider_credential_failure(provider=self.name, exc=exc)
+
+  def next_credential(
+    self,
+    config: Mapping[str, Any],
+    failure: ProviderCredentialFailure,
+  ) -> dict[str, Any] | None:
+    """Credential material replacing the one this failure made unusable.
+
+    A provider that keeps several interchangeable same-mode credentials
+    returns the next usable one so the bound model keeps serving the run.
+    ``None`` means this provider has nothing to swap in and the caller's
+    existing retry stands.
+    """
+
+    del config, failure
+    return None
 
   def estimate_cost(
     self,

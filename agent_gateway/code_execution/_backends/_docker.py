@@ -65,21 +65,24 @@ class DockerBackend(ExecutionBackend):
   def sandboxed(self) -> bool:
     return True
 
-  def available(self) -> bool:
+  def unavailable_reason(self) -> Optional[str]:
     docker_bin = shutil.which("docker")
     if docker_bin is None:
-      return False
+      return "docker is not on PATH"
     try:
       subprocess.run(
         [docker_bin, "image", "inspect", self._image],
         check=True,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         timeout=3,
       )
-    except Exception:
-      return False
-    return True
+    except subprocess.CalledProcessError as exc:
+      detail = (exc.stderr or b"").decode("utf-8", errors="replace").strip()[:500]
+      return f"docker image inspect {self._image} exited {exc.returncode}: {detail or 'no stderr'}"
+    except Exception as exc:
+      return f"docker image inspect {self._image} failed: {type(exc).__name__}: {exc}"
+    return None
 
   async def execute(
     self,
@@ -322,7 +325,6 @@ class DockerBackend(ExecutionBackend):
       return []
     args: list[str] = []
     forwarded_keys = (
-      "PYTHONPATH",
       AGENT_CODE_EXECUTE_WORK_DIR_ENV,
       *(env_name for env_name, _header_name in AGENT_TELEMETRY_ENV_TO_HEADER),
     )

@@ -25,7 +25,8 @@ from agent_gateway.server_chat_helpers import (
   prepare_session_driver_turn,
 )
 from agent_gateway.server_models import ChatMessage, ChatRequest
-from agent_gateway.session import SessionStore
+from agent_gateway.session import SessionStore, SessionStream
+from gateway_test_support.model_defaults import SESSION_DRIVER
 
 
 class _ExactProvider(ModelProvider):
@@ -157,8 +158,8 @@ def test_prepare_keeps_auth_config_credential_only_and_binds_registry_identity()
 
   bind = prepared.request.capability_bind
   assert bind is not None
-  assert bind.model_key == "anthropic.claude-opus-5"
-  assert bind.upstream_model == "claude-opus-5"
+  assert bind.model_key == SESSION_DRIVER.model_key
+  assert bind.upstream_model == SESSION_DRIVER.upstream_model
   assert bind.credential_principal == "user"
   assert prepared.request.bound_auth_config == {
     "provider": "anthropic",
@@ -288,8 +289,8 @@ def test_context_authority_shaped_values_cannot_change_bind() -> None:
     bind.run_mode,
   ) == (
     "session.driver",
-    "anthropic.claude-opus-5",
-    "anthropic",
+    SESSION_DRIVER.model_key,
+    INITIAL_MODEL_REGISTRY.require(SESSION_DRIVER.model_key).provider,
     "user",
     "interactive",
   )
@@ -426,7 +427,7 @@ async def test_dispatch_emits_exact_complete_bind_before_runtime_work() -> None:
   result = await _dispatch_chat_turn(
     session,
     inputs,
-    event_log=EventLog(session_id=session.session_id),
+    turn=SessionStream(event_log=EventLog(session_id=session.session_id), runner_task=None),
     on_event=_capture,
     build_chat_runtime=builder,
     transcript_dir=None,

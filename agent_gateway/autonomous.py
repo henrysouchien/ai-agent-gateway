@@ -462,7 +462,6 @@ async def run_session(
   event_log: EventLog,
   *,
   max_turns: int,
-  timeout_seconds: float | None,
   initial_message: str,
   system_prompt: str | list[tuple[str, bool]] | None,
 ) -> RunOutput:
@@ -477,9 +476,6 @@ async def run_session(
   )
   run_task: asyncio.Task[None] | None = None
   try:
-    # timeout_seconds is retained for callers; it must not cancel LLM work.
-    # Bounds are progress-based; liveness is the event-gap stall watchdog.
-    _ = timeout_seconds
     if enrolled_top_level_skill:
       run_task = asyncio.create_task(coro)
       await _wait_for_enrolled_run_and_settlement(
@@ -713,13 +709,7 @@ async def run_autonomous(
   excluded_tools: set[str] | None = None,
   interceptors: Sequence[ToolInterceptor] | None = None,
   max_turns: int = 80,
-  timeout_seconds: float | None = None,
   max_budget_usd: float | None = None,
-  # None by default: thinking-turn duration is unpredictable, so a wall-clock
-  # per-turn cap races the runner's event-gap stall guard (which retries) and
-  # terminally kills slow-first-token turns (ACUI-25). Liveness = stall guard;
-  # runaway bounds = max_turns / max_budget_usd.
-  per_turn_timeout: float | None = None,
   client_timeout: float = 90.0,
   max_concurrent_sub_agents: int | None = DEFAULT_MAX_BACKGROUND_TASKS,
   compaction_instructions: str | None = None,
@@ -750,8 +740,8 @@ async def run_autonomous(
   and delivery (Telegram, webhook, or callback) on completion.
   Inline or file-backed MCP configuration requires a launcher-owned
   `trusted_mcp_allowed_servers`; skill metadata is not an admission policy.
-  The default execution control is turn-based; `timeout_seconds` is not
-  enforced. Set `max_budget_usd` for production cost control.
+  The default execution control is turn-based; no wall clock bounds the run.
+  Set `max_budget_usd` for production cost control.
   Standalone top-level skill callers must bind both `top_level_skill_name` and
   a unique `skill_run_id`; these values are trusted runtime context, not model input.
   """
@@ -1190,7 +1180,6 @@ async def run_autonomous(
       allow_stub_response=False,
       client_timeout=client_timeout,
       max_tokens_override=max_tokens,
-      per_turn_timeout=per_turn_timeout,
       mcp_client=mcp_client,
       mcp_activation_fold=session.mcp_activation_fold,
       excluded_tools=excluded_tools,
@@ -1217,7 +1206,6 @@ async def run_autonomous(
       runner,
       event_log,
       max_turns=max_turns,
-      timeout_seconds=timeout_seconds,
       initial_message=initial_message,
       system_prompt=system_prompt,
     )

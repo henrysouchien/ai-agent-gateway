@@ -28,6 +28,10 @@ from agent_gateway.model_registry import (
 )
 from agent_gateway.providers import installed_adapter_route_support
 from agent_workflow_contracts import CapabilityBind
+from gateway_test_support.model_defaults import QUANT_WORKER, SESSION_DRIVER
+
+_DRIVER_ENTRY = INITIAL_MODEL_REGISTRY.require(SESSION_DRIVER.model_key)
+_QUANT_PROVIDER = INITIAL_MODEL_REGISTRY.require(QUANT_WORKER.model_key).provider
 
 
 def _user_handle(provider: str) -> CredentialHandle:
@@ -121,14 +125,16 @@ def test_initial_registry_has_frontier_user_selectable_session_models() -> None:
     "anthropic.claude-fable-5-1",
     "anthropic.claude-fable-5",
     "anthropic.claude-haiku-4-5",
-    "anthropic.claude-mythos-5",
+    "anthropic.claude-opus-5-5",
     "anthropic.claude-opus-5",
     "anthropic.claude-sonnet-5",
     "codex.gpt-6-astra",
+    "codex.gpt-6-sol",
     "codex.gpt-5-6-luna",
     "codex.gpt-5-6-sol",
     "codex.gpt-5-6-terra",
     "openai.gpt-6-astra",
+    "openai.gpt-6-sol",
     "openai.gpt-5-6",
     "xai.grok-4-6",
     "xai.grok-4-5",
@@ -139,23 +145,23 @@ def test_initial_registry_has_frontier_user_selectable_session_models() -> None:
 def test_default_session_binding_freezes_complete_execution_identity() -> None:
   bind = _resolve("session.driver")
 
-  assert bind == CapabilityBind(
-    schema_version="1.0",
-    capability_id="session.driver",
-    model_key="anthropic.claude-opus-5",
-    provider="anthropic",
-    upstream_model="claude-opus-5",
-    adapter="anthropic.messages",
-    protocol_profile="messages.adaptive",
-    route="anthropic.public",
-    effort="high",
-    credential_principal="user",
-    credential_ref="user:tenant:alice:anthropic",
-    run_mode="interactive",
-    registry_revision=INITIAL_MODEL_REGISTRY.revision,
-    policy_revision=INITIAL_MODEL_SELECTION_POLICY.revision,
-    selection_source="capability_default",
-  )
+  assert bind == CapabilityBind.from_json({
+    "schema_version": "1.0",
+    "capability_id": "session.driver",
+    "model_key": SESSION_DRIVER.model_key,
+    "provider": _DRIVER_ENTRY.provider,
+    "upstream_model": SESSION_DRIVER.upstream_model,
+    "adapter": _DRIVER_ENTRY.adapter,
+    "protocol_profile": _DRIVER_ENTRY.protocol_profile,
+    "route": _DRIVER_ENTRY.route,
+    "effort": SESSION_DRIVER.effort,
+    "credential_principal": "user",
+    "credential_ref": f"user:tenant:alice:{_DRIVER_ENTRY.provider}",
+    "run_mode": "interactive",
+    "registry_revision": SESSION_DRIVER.registry_revision,
+    "policy_revision": SESSION_DRIVER.policy_revision,
+    "selection_source": "capability_default",
+  })
   assert CapabilityBind.from_json(bind.to_json()) == bind
 
 
@@ -221,8 +227,8 @@ def test_provider_or_upstream_selectors_are_not_model_keys(selector: str) -> Non
       "anthropic.claude-fable-5",
       "anthropic.claude-fable-5-1",
       "anthropic.claude-haiku-4-5",
-      "anthropic.claude-mythos-5",
       "anthropic.claude-opus-5",
+      "anthropic.claude-opus-5-5",
       "anthropic.claude-sonnet-5",
     ],
   }
@@ -268,7 +274,7 @@ def test_default_does_not_fall_through_to_another_eligible_model() -> None:
     )
 
   assert refused.value.code == "default_not_eligible"
-  assert refused.value.model_key == "anthropic.claude-opus-5"
+  assert refused.value.model_key == SESSION_DRIVER.model_key
   assert refused.value.eligible_model_keys == ("anthropic.claude-sonnet-5",)
 
 
@@ -282,7 +288,7 @@ def test_ineligible_saved_preference_is_not_execution_intent() -> None:
     ),
   )
 
-  assert bind.model_key == "anthropic.claude-opus-5"
+  assert bind.model_key == SESSION_DRIVER.model_key
   assert bind.selection_source == "capability_default"
 
 
@@ -312,6 +318,7 @@ def _registry_with_lifecycle(model_key: str, lifecycle: str) -> ProductModelRegi
     ("revoked", "model_revoked"),
     ("hidden", "model_hidden"),
     ("disabled", "model_disabled"),
+    ("retired", "model_hidden"),
   ],
 )
 def test_stale_saved_preference_yields_default_not_refusal(
@@ -333,7 +340,7 @@ def test_stale_saved_preference_yields_default_not_refusal(
     saved_preference=saved,
   )
 
-  assert bind.model_key == "anthropic.claude-opus-5"
+  assert bind.model_key == SESSION_DRIVER.model_key
   assert bind.selection_source == "capability_default"
   assert saved_preference_ineligibility(
     saved,
@@ -342,6 +349,57 @@ def test_stale_saved_preference_yields_default_not_refusal(
     policy=INITIAL_MODEL_SELECTION_POLICY.capabilities["session.driver"],
     auth=_auth(),
   ) == reason
+
+
+def test_explicit_selection_of_retired_model_is_refused_as_retired() -> None:
+  registry = _registry_with_lifecycle("anthropic.claude-sonnet-5", "retired")
+
+  with pytest.raises(CapabilityResolutionError) as refused:
+    resolve_capability_model(
+      "session.driver",
+      registry=registry,
+      selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+      auth=_auth(),
+      explicit_intent=ModelSelectionIntent(
+        model_key="anthropic.claude-sonnet-5",
+        effort="high",
+        source="explicit_user",
+      ),
+    )
+
+  assert refused.value.code == "capability_model_retired"
+  assert refused.value.model_key == "anthropic.claude-sonnet-5"
+
+
+def test_internal_default_on_retired_model_is_refused_as_retired() -> None:
+  default_key = INITIAL_MODEL_SELECTION_POLICY.capabilities[
+    "risk.overview_editorial"
+  ].default.model_key
+  assert default_key is not None
+  registry = _registry_with_lifecycle(default_key, "retired")
+
+  with pytest.raises(CapabilityResolutionError) as refused:
+    resolve_capability_model(
+      "risk.overview_editorial",
+      registry=registry,
+      selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+      auth=_auth(),
+    )
+
+  assert refused.value.code == "capability_model_retired"
+  assert refused.value.model_key == default_key
+
+
+def test_durable_binding_on_retired_model_refuses_execution() -> None:
+  auth = _auth()
+  bind = _resolve("session.driver", auth=auth)
+  registry = _registry_with_lifecycle(bind.model_key, "retired")
+
+  with pytest.raises(CapabilityResolutionError) as refused:
+    reauthorize_capability_bind(bind, registry=registry, auth=auth)
+
+  assert refused.value.code == "capability_model_retired"
+  assert refused.value.model_key == bind.model_key
 
 
 def test_saved_preference_with_unsupported_effort_yields_default() -> None:
@@ -353,7 +411,7 @@ def test_saved_preference_with_unsupported_effort_yields_default() -> None:
 
   bind = _resolve("session.driver", saved_preference=saved)
 
-  assert bind.model_key == "anthropic.claude-opus-5"
+  assert bind.model_key == SESSION_DRIVER.model_key
   assert bind.selection_source == "capability_default"
   assert saved_preference_ineligibility(
     saved,
@@ -732,10 +790,10 @@ def test_authenticated_plan_author_override_precedes_parent_inheritance() -> Non
   assert bind.selection_source == "explicit_user"
 
 
-def test_internal_workload_uses_frozen_dated_model_key() -> None:
+def test_internal_workload_uses_policy_default_model_key() -> None:
   bind = _resolve("risk.overview_editorial")
-  assert bind.model_key == "anthropic.claude-haiku-4-5-20251001-sdk"
-  assert bind.upstream_model == "claude-haiku-4-5-20251001"
+  assert bind.model_key == "anthropic.claude-haiku-4-5-sdk"
+  assert bind.upstream_model == "claude-haiku-4-5"
   assert bind.adapter == "anthropic.sdk.messages"
   assert bind.selection_source == "internal_policy"
 
@@ -745,13 +803,13 @@ def test_investment_quant_uses_service_authority_in_batch() -> None:
     "investment.quant_worker",
     auth=_auth(
       run_mode="batch",
-      providers=("openai",),
+      providers=(_QUANT_PROVIDER,),
       service=True,
     ),
   )
-  assert bind.model_key == "openai.gpt-5-6"
+  assert bind.model_key == QUANT_WORKER.model_key
   assert bind.credential_principal == "service"
-  assert bind.credential_ref == "service:tenant:openai"
+  assert bind.credential_ref == f"service:tenant:{_QUANT_PROVIDER}"
   assert bind.run_mode == "batch"
 
 
@@ -797,9 +855,9 @@ def test_reported_identity_must_be_explicitly_admitted() -> None:
   bind = _resolve("session.driver")
   assert validate_reported_identity(
     bind,
-    "claude-opus-5",
+    SESSION_DRIVER.upstream_model,
     registry=INITIAL_MODEL_REGISTRY,
-  ) == "claude-opus-5"
+  ) == SESSION_DRIVER.upstream_model
 
   with pytest.raises(CapabilityResolutionError) as refused:
     validate_reported_identity(
@@ -824,15 +882,15 @@ def test_auth_context_rejects_cross_actor_user_handle() -> None:
 
 
 def test_interactive_service_handle_requires_explicit_server_policy() -> None:
-  handle = _service_handle("anthropic")
+  handle = _service_handle(_DRIVER_ENTRY.provider)
   auth = AuthContext(
     run_mode="interactive",
     actor_id="alice",
     tenant_id="tenant",
     user_provider_handles={},
-    service_provider_handles={"anthropic": handle},
+    service_provider_handles={_DRIVER_ENTRY.provider: handle},
     entitled_capabilities=frozenset({"session.driver"}),
-    entitled_model_keys=frozenset({"anthropic.claude-opus-5"}),
+    entitled_model_keys=frozenset({SESSION_DRIVER.model_key}),
   )
   with pytest.raises(CapabilityResolutionError) as refused:
     _resolve("session.driver", auth=auth)
@@ -843,9 +901,9 @@ def test_interactive_service_handle_requires_explicit_server_policy() -> None:
     actor_id="alice",
     tenant_id="tenant",
     user_provider_handles={},
-    service_provider_handles={"anthropic": handle},
+    service_provider_handles={_DRIVER_ENTRY.provider: handle},
     entitled_capabilities=frozenset({"session.driver"}),
-    entitled_model_keys=frozenset({"anthropic.claude-opus-5"}),
+    entitled_model_keys=frozenset({SESSION_DRIVER.model_key}),
     allow_service_for_interactive=True,
   )
   assert _resolve("session.driver", auth=admitted).credential_principal == "service"
@@ -884,7 +942,7 @@ def test_externally_executed_capability_draws_typed_refusal_on_resolve() -> None
     run_mode="batch",
     service=True,
     capabilities=frozenset({"risk.completion"}),
-    model_keys=frozenset({"anthropic.claude-sonnet-4-6-sdk"}),
+    model_keys=frozenset({"anthropic.claude-sonnet-5-sdk"}),
   )
   resolver = _gateway_process_resolver(auth)
 
@@ -903,7 +961,7 @@ def test_externally_executed_bind_refuses_gateway_materialization() -> None:
     run_mode="batch",
     service=True,
     capabilities=frozenset({"risk.completion"}),
-    model_keys=frozenset({"anthropic.claude-sonnet-4-6-sdk"}),
+    model_keys=frozenset({"anthropic.claude-sonnet-5-sdk"}),
   )
   bind = _resolve("risk.completion", auth=auth)
   assert bind.adapter == "anthropic.sdk.messages"
@@ -946,7 +1004,7 @@ def test_gateway_executed_capability_is_not_blocked_by_the_designation() -> None
   execution = resolver.resolve("session.driver")
 
   assert execution.bind.capability_id == "session.driver"
-  assert execution.bind.model_key == "anthropic.claude-opus-5"
+  assert execution.bind.model_key == SESSION_DRIVER.model_key
 
 
 def test_unknown_executable_capability_designation_is_rejected() -> None:

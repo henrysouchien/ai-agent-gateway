@@ -30,6 +30,12 @@ building runtimes and use one product policy per gateway process.
 | [`agent_gateway/autonomous.py`](agent_gateway/autonomous.py) | `run_autonomous()` / `run_autonomous_sync()` | A prebound headless one-shot with no HTTP server |
 | [`agent_gateway/heartbeat.py`](agent_gateway/heartbeat.py) | `HeartbeatLoop` | Repeated prebound autonomous work with quiet windows and backoff |
 | [`agent_gateway/cli.py`](agent_gateway/cli.py) | `main()` (`agent init` / `agent run`) | Scaffold and run a package project |
+| [`agent_gateway/gateway_address.py`](agent_gateway/gateway_address.py) | `gateway_base_url()` | The origin of the gateway a process talks to: the one reader of `GATEWAY_BASE_URL` and the one place its default is spelled |
+
+`run_gateway_server()` is the serving entry on both local supported launches, not
+only the privileged host one: the immutable runtime's serving child calls it
+directly, so claim-signing adoption, `uvicorn.Config`/`Server` construction and
+the launch-failure journal have one owner.
 
 The package does not infer a new model or credential inside autonomous
 execution. The application resolves and passes the exact bound capability,
@@ -73,9 +79,12 @@ another eligible stable `model_key`.
 For OpenAI, install `ai-agent-gateway[openai]` and set `OPENAI_API_KEY`.
 Managed provider login flows are available through `agent auth login
 anthropic`, `agent auth login codex`, and `agent auth login xai`. Use `agent
-auth status <provider>` for all built-ins. Gateway token-store logout applies
-to Anthropic and XAI; Codex credentials are managed by the Codex CLI, and
-OpenAI uses `OPENAI_API_KEY`.
+auth status <provider>` for all built-ins. `agent auth login anthropic` is this
+gateway's own Claude OAuth login: run it once per Claude account to enroll
+interchangeable siblings, then `agent auth list anthropic` (masked) and `agent
+auth remove anthropic <identity>` manage them. Gateway token-store logout
+applies to Anthropic and XAI; Codex credentials are managed by the Codex CLI,
+and OpenAI uses `OPENAI_API_KEY`.
 
 The complete session-token, chat request, and SSE walkthrough is in the
 [quickstart](docs/quickstart.md).
@@ -101,10 +110,12 @@ but return `RunOutput` instead of exposing an HTTP/SSE session.
 
 ## Develop and verify
 
-From the package directory, update a gateway dependency with:
+From the repository root, update a gateway dependency with the constrained
+target (the dev lock is compiled `--constraint api/requirements.txt` so the two
+locks cannot disagree; `docs/reference/python-environments-and-packaging.md`):
 
 ```bash
-pip-compile --generate-hashes --no-emit-options --allow-unsafe --upgrade-package <name>==<ver> --output-file requirements-dev.txt requirements-dev.in
+make gateway-deps-update PKG=<name>   # then: make gateway-deps-install
 ```
 
 For coupled targets, use multiple space-separated `--upgrade-package <name>==<ver>`

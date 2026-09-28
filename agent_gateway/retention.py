@@ -10,9 +10,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import fcntl
-import json
 import logging
-import math
 import os
 import stat
 from dataclasses import dataclass, field, replace
@@ -173,7 +171,6 @@ class RetentionCatalogEntry:
   policy: RetentionPolicy
   adapter: RetentionAdapter
   roots: tuple[Path, ...]
-  triage_input: bool = False
   invariants: tuple[str, ...] = ()
   deferred: bool = False
 
@@ -182,10 +179,6 @@ class RetentionCatalogEntry:
       raise ValueError("catalog key is required")
     if not self.roots:
       raise ValueError(f"catalog entry {self.key!r} has no authorized roots")
-    if self.triage_input:
-      days = self.policy.max_age_days
-      if days is None or days * 24 < 72:
-        raise ValueError(f"triage input {self.key!r} must retain at least 72 hours")
     if self.policy.is_keep_forever:
       log.info(
         "retention keep_forever registered: key=%s owner=%s reason=%s",
@@ -393,77 +386,6 @@ class FileAgeAdapter:
       skipped_count=skipped,
       errors=tuple(errors),
     )
-
-
-class UiBlocksEnvelopeAgeAdapter:
-  """Age multi-user UI-block envelopes by their chat timestamp."""
-
-  def __init__(self, key: str, users_root: Path, *, repo_root: Path | None = None) -> None:
-    self.key = key
-    self.root = Path(users_root)
-    self.repo_root = repo_root
-
-  def sweep(self, context: RetentionSweepContext) -> RetentionSweepReport:
-    root = resolve_safe_root(self.root, repo_root=self.repo_root)
-    if not root.exists():
-      return RetentionSweepReport(key=self.key, mode=context.mode)
-    if root.is_symlink() or not root.is_dir():
-      raise RetentionSafetyError(f"ui-blocks root is not a regular directory: {root}")
-    cutoff = context.cutoff_ts()
-    count = size = deleted = deleted_bytes = skipped = 0
-    errors: list[str] = []
-    for candidate in root.glob("*/workspace/artifacts/_ui_blocks/*.json"):
-      try:
-        resolved = resolve_contained_path(candidate, root, repo_root=self.repo_root)
-        info = candidate.lstat()
-        if not stat.S_ISREG(info.st_mode):
-          continue
-        envelope_ts = _ui_blocks_envelope_ts(candidate, fallback=info.st_mtime)
-        if envelope_ts >= cutoff:
-          continue
-        count += 1
-        size += info.st_size
-        if context.enforce:
-          resolved.unlink()
-          deleted += 1
-          deleted_bytes += info.st_size
-      except RetentionSafetyError as exc:
-        skipped += 1
-        errors.append(str(exc))
-      except FileNotFoundError:
-        continue
-      except OSError as exc:
-        errors.append(f"{candidate}: {exc}")
-    if deleted:
-      try:
-        from .artifact_sidecar_index import reconcile_ui_blocks_index
-
-        reconcile_ui_blocks_index(root)
-      except Exception as exc:
-        errors.append(f"ui blocks index reconciliation failed: {exc}")
-    return RetentionSweepReport(
-      key=self.key,
-      mode=context.mode,
-      would_delete_count=count,
-      would_delete_bytes=size,
-      deleted_count=deleted,
-      deleted_bytes=deleted_bytes,
-      skipped_count=skipped,
-      errors=tuple(errors),
-    )
-
-
-def _ui_blocks_envelope_ts(path: Path, *, fallback: float) -> float:
-  try:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or isinstance(payload.get("ts"), bool):
-      raise ValueError("invalid envelope timestamp")
-    value = float(payload["ts"])
-    if not math.isfinite(value):
-      raise ValueError("invalid envelope timestamp")
-    return value
-  except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-    return fallback
 
 
 class RetentionSweeper:

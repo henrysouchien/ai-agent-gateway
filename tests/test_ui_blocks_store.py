@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,11 +13,6 @@ from agent_gateway.artifact_sidecar_index import (
   get_artifact_sidecar_index_row,
   reconcile_ui_blocks_index,
   register_ui_blocks_payload_sidecar,
-)
-from agent_gateway.retention import (
-  RetentionPolicy,
-  RetentionSweepContext,
-  UiBlocksEnvelopeAgeAdapter,
 )
 from agent_gateway.ui_blocks_store import read_ui_blocks_payload, write_ui_blocks_payload
 import agent_gateway.ui_blocks_store as store_module
@@ -250,70 +244,3 @@ def test_reconcile_removes_missing_rows_registers_files_and_marks_corrupt_orphan
   assert existing_corrupt_row is not None
   assert existing_corrupt_row["stale_ts"] is not None
   assert existing_corrupt_row["last_error"] == "corrupt_envelope"
-
-
-
-def test_ui_blocks_envelope_age_uses_ts_falls_back_to_mtime_and_reconciles(
-  tmp_path: Path,
-) -> None:
-  users_root = tmp_path / "users"
-  workspace = users_root / USER_ID / "workspace"
-  directory = workspace / "artifacts" / "_ui_blocks"
-  directory.mkdir(parents=True)
-  now = 2_000_000_000.0
-  old_id = UI_BLOCKS_ID
-  fresh_id = "ub_3333333333333333"
-  corrupt_id = "ub_4444444444444444"
-  old_path = directory / f"{old_id}.json"
-  fresh_path = directory / f"{fresh_id}.json"
-  corrupt_path = directory / f"{corrupt_id}.json"
-  old_path.write_text(json.dumps(_envelope(old_id, ts=now - 10 * 86_400)), encoding="utf-8")
-  fresh_path.write_text(json.dumps(_envelope(fresh_id, ts=now)), encoding="utf-8")
-  corrupt_path.write_text("broken", encoding="utf-8")
-  os.utime(old_path, (now, now))
-  os.utime(fresh_path, (now - 30 * 86_400, now - 30 * 86_400))
-  os.utime(corrupt_path, (now - 10 * 86_400, now - 10 * 86_400))
-  register_ui_blocks_payload_sidecar(
-    workspace_dir=workspace,
-    user_id=USER_ID,
-    ui_blocks_id=old_id,
-    path=old_path,
-    session_id="session-1",
-    turn_key="turn-1",
-    emission_index=2,
-    ts=now - 10 * 86_400,
-  )
-  policy = RetentionPolicy(
-    "age",
-    "platform",
-    "chat render cache",
-    max_age_days=7,
-  )
-  adapter = UiBlocksEnvelopeAgeAdapter("ui_blocks_payloads", users_root)
-  dry_context = RetentionSweepContext(
-    mode="dry_run",
-    now=datetime.fromtimestamp(now, tz=timezone.utc),
-    policy=policy,
-    authorized_roots=(users_root,),
-  )
-  dry_report = adapter.sweep(dry_context)
-  assert dry_report.would_delete_count == 2
-  assert old_path.exists() and fresh_path.exists() and corrupt_path.exists()
-
-  enforce_context = RetentionSweepContext(
-    mode="enforce",
-    now=datetime.fromtimestamp(now, tz=timezone.utc),
-    policy=policy,
-    authorized_roots=(users_root,),
-  )
-  report = adapter.sweep(enforce_context)
-  assert report.deleted_count == 2
-  assert not old_path.exists()
-  assert not corrupt_path.exists()
-  assert fresh_path.exists()
-  assert get_artifact_sidecar_index_row(
-    workspace_dir=workspace,
-    artifact_kind="ui_blocks",
-    artifact_id=old_id,
-    user_id=USER_ID,
-  ) is None

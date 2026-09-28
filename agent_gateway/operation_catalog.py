@@ -44,7 +44,7 @@ Effort = Literal[
   "max",
 ]
 
-_SEMANTIC_SCOPES = frozenset({"global", "ticker", "portfolio", "industry"})
+SEMANTIC_SCOPES = frozenset({"global", "ticker", "portfolio", "industry"})
 _STATE_CLASSES = frozenset({
   "producer",
   "advisor-with-decision-log",
@@ -179,7 +179,6 @@ class OperationRuntimePolicy:
   model: str | None = None
   provider: str | None = None
   max_turns: int | None = None
-  timeout_seconds: float | None = None
   max_tokens: int | None = None
   max_budget_usd: float | None = None
   effort: Effort | None = None
@@ -191,7 +190,7 @@ class OperationRuntimePolicy:
     _require_enum(
       self.semantic_scope,
       field_name="semantic_scope",
-      allowed=_SEMANTIC_SCOPES,
+      allowed=SEMANTIC_SCOPES,
     )
     _require_enum(
       self.state_class,
@@ -246,10 +245,6 @@ class OperationRuntimePolicy:
     _require_optional_positive_int(
       self.max_structured_reads,
       field_name="max_structured_reads",
-    )
-    _require_optional_positive_number(
-      self.timeout_seconds,
-      field_name="timeout_seconds",
     )
     _require_optional_positive_number(
       self.max_budget_usd,
@@ -442,6 +437,7 @@ __all__ = [
   "OperationRuntimePolicy",
   "ResolvedOperationRuntime",
   "RunMode",
+  "SEMANTIC_SCOPES",
   "SemanticScope",
   "StateClass",
 ]

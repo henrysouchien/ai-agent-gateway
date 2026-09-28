@@ -180,7 +180,7 @@ def test_terminal_receipt_carries_typed_writer_lease_reason(
 ) -> None:
   record = _run_record(
     tmp_path,
-    state="completed",
+    state="interrupted",
     completed_at=1784980800,
     exit_code=0,
     error=None,
@@ -189,11 +189,12 @@ def test_terminal_receipt_carries_typed_writer_lease_reason(
 
   receipt = _autonomous_terminal_receipt(
     record,
-    state="completed",
+    state="interrupted",
     events=[],
   )
 
   assert receipt is not None
+  assert receipt.disposition == "interrupted"
   assert receipt.terminal_reason == "writer_lease_already_held"
 
 

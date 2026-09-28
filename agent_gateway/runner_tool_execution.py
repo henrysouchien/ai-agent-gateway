@@ -43,6 +43,7 @@ from .tool_dispatch_classification import (
   retry_backoff_seconds,
   retry_decision,
 )
+from .tool_result_compaction import project_tool_call_complete_for_stream
 from .workflow_evidence_provenance import (
   WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY as _WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY,
 )
@@ -56,18 +57,18 @@ from .workflow_output_attachment import (
 
 if TYPE_CHECKING:
   from .approval_policy import RunContext
+  from .event_log import EventLog
   from .mcp_client import McpClientManager
 
 
 
 log = logging.getLogger("agent_gateway.runner")
-_RUN_AGENT_DISPATCH_TIMEOUT_SECONDS = 2100.0
 _ACTIVE_SKILL_ALLOW_RESULT_KEY = "_active_skill_allow"
 _ACTIVE_SKILL_DENY_RESULT_KEY = "_active_skill_deny"
 _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY = "_active_skill_report_doors"
 _READABLE_RESOURCE_SNAPSHOT_RESULT_KEY = "_readable_resource_snapshot"
 _READABLE_RESOURCE_MAX_CONTENT_BYTES = 2_000_000
-_REPEATED_TOOL_EXCLUDED_STOP_AFTER_COUNT = 2
+_REPEATED_TOOL_EXCLUDED_FINAL_ANSWER_COUNT = 2
 
 
 
@@ -99,10 +100,14 @@ class AgentRunnerDispatcher(Protocol):
   @property
   def run_context(self) -> RunContext | None: ...
 
-  def with_scoped_local_handler(
+  def fork_child(
     self,
-    tool_name: str,
-    scope: Callable[[LocalToolHandler], LocalToolHandler],
+    *,
+    event_log: EventLog,
+    session_id: str,
+    local_handler_scopes: Mapping[
+      str, Callable[[LocalToolHandler], LocalToolHandler]
+    ] | None = None,
   ) -> AgentRunnerDispatcher: ...
 
   async def dispatch(
@@ -264,6 +269,17 @@ def _record_tool_excluded_attempt(runner: Any, tool_name: str) -> int:
   return count
 
 
+def final_answer_turn_reminder(tool_name: str) -> str:
+  """The model-visible instruction that spends the guarded last turn."""
+
+  return (
+    f"'{tool_name}' is excluded in this context and will not become "
+    "available; the run has stopped expanding. This is your final turn: "
+    "answer now from the evidence already produced, or state the blocked "
+    "or partial verdict. Do not call tools."
+  )
+
+
 def _augment_repeated_tool_excluded_error(
   error: Dict[str, Any],
   *,
@@ -281,7 +297,7 @@ def _augment_repeated_tool_excluded_error(
     "blocked_tool": tool_name,
     "exclusion_count": exclusion_count,
     "repeated_tool_excluded": True,
-    "stop_after_tool_results": True,
+    "final_answer_turn": True,
     "resolution": resolution,
   })
   augmented["data"] = data
@@ -810,14 +826,17 @@ class RunnerToolExecutionMixin:
           "message": f"Tool '{tool_name}' is not available in this context",
         }
         exclusion_count = _record_tool_excluded_attempt(self, tool_name)
-        if exclusion_count >= _REPEATED_TOOL_EXCLUDED_STOP_AFTER_COUNT:
+        if exclusion_count >= _REPEATED_TOOL_EXCLUDED_FINAL_ANSWER_COUNT:
           error = _augment_repeated_tool_excluded_error(
             error,
             tool_name=tool_name,
             exclusion_count=exclusion_count,
           )
-          setattr(self, "_stop_after_tool_results_reason", "repeated_tool_excluded")
-          setattr(self, "_stop_after_tool_results_tool_name", tool_name)
+          # Not a stop-after-tool-results settlement: an excluded tool call
+          # is a tool-level error, and the turn still owes the analyst the
+          # answer its evidence already supports. The run loop spends one
+          # guarded final turn on that answer.
+          setattr(self, "_final_answer_turn_tool_name", tool_name)
       else:
         dispatch_kwargs: Dict[str, Any] = {"call_index": call_index}
         if getattr(self, "_dispatcher_accepts_advertised_tool_names", False):
@@ -869,17 +888,11 @@ class RunnerToolExecutionMixin:
         )
         effective_tool_timeout = self._tool_call_timeout
         if tool_name == "run_agent":
-          # Sub-agents legitimately outrun the generic tool cap, but skipping the
-          # cap entirely let a wedged run_agent hold the chat turn open forever
-          # (ACUI-1). The inner spawn timeout (DEFAULT_SUB_AGENT_TIMEOUT_SECONDS)
-          # is the primary bound and returns a clean tool error; this widened cap
-          # is the backstop if that inner await never resolves. It applies even
-          # when the generic tool_call_timeout is disabled (None) so inline
-          # run_agent is never unbounded.
-          effective_tool_timeout = max(
-            effective_tool_timeout or 0.0,
-            _runner_attr(self, "_RUN_AGENT_DISPATCH_TIMEOUT_SECONDS", _RUN_AGENT_DISPATCH_TIMEOUT_SECONDS),
-          )
+          # A sub-agent is agent-driven work, not a tool: no wall clock applies
+          # (operator ruling, 2026-09-28). Its liveness is the parent-side
+          # activity guard in runner_sub_agents, which ends a wedged child
+          # (ACUI-1) by the absence of child events, never by elapsed time.
+          effective_tool_timeout = None
         # B-2: one bounded, jittered retry loop owns transient dispatch
         # failure. Both arms are inside it, because the skip_timeout
         # population (MCP server timeouts) is exactly where 429 and transport
@@ -1072,17 +1085,8 @@ class RunnerToolExecutionMixin:
       if semantic_error is None and _is_accepted_ui_blocks_result(tool_name, result, error):
         setattr(self, "_stop_after_tool_results_reason", "accepted_ui_blocks")
         setattr(self, "_stop_after_tool_results_tool_name", tool_name)
-      log_result = sanitize_boundary_value(
-        result,
-        sink="tool_log",
-        boundary=getattr(self, "_secret_boundary", None),
-      )
-      log_error = sanitize_boundary_value(
-        error if error is not None else semantic_error,
-        sink="tool_log",
-        boundary=getattr(self, "_secret_boundary", None),
-      )
-      result_json = json_module.dumps(log_result, default=str) if result is not None else ""
+      log_error = error if error is not None else semantic_error
+      result_json = json_module.dumps(result, default=str) if result is not None else ""
       result_bytes = len(result_json)
       result_preview = result_json[:150] if result_json else "null"
       if error or semantic_error:
@@ -1130,13 +1134,19 @@ class RunnerToolExecutionMixin:
       error = {"code": "cancelled", "message": "Task was cancelled"}
       outcome_inputs_changed = True
     except Exception as exc:
-      safe_exc = sanitize_boundary_value(
-        str(exc),
-        sink="tool_log",
-        boundary=getattr(self, "_secret_boundary", None),
+      # Dispatch runs on the privileged plane, so an exception raised there can
+      # quote credential material this process does own. The hook still sees
+      # the raw exception; every copy that leaves here is projected once, at
+      # this one source, instead of by walking the result around it.
+      safe_exc = str(
+        sanitize_boundary_value(
+          str(exc),
+          sink="tool_log",
+          boundary=getattr(self, "_secret_boundary", None),
+        )
       )
       logger.error("[%s] Tool %s unhandled error: %s", self._sid, tool_name, safe_exc)
-      error = {"code": "internal_error", "message": str(exc)}
+      error = {"code": "internal_error", "message": safe_exc}
       outcome_inputs_changed = True
     finally:
       duration_ms = int((time_module.time() - tool_t0) * 1000)
@@ -1275,39 +1285,37 @@ class RunnerToolExecutionMixin:
         ),
       )
     )
-    result_entry = sanitize_boundary_value(
-      result_entry,
-      sink="model_tool_result",
-      boundary=getattr(self, "_secret_boundary", None),
-    )
-    if not isinstance(result_entry, dict):
-      result_entry = {
-        "type": "tool_result",
-        "tool_use_id": tool_id,
-        "content": "<secret-sanitization-failed>",
-        "is_error": True,
-      }
-    sanitized_extra_blocks = sanitize_boundary_value(
-      extra_blocks,
-      sink="model_tool_result",
-      boundary=getattr(self, "_secret_boundary", None),
-    )
     extra_blocks = (
-      [dict(block) for block in sanitized_extra_blocks if isinstance(block, dict)]
-      if isinstance(sanitized_extra_blocks, list)
+      [dict(block) for block in extra_blocks if isinstance(block, dict)]
+      if isinstance(extra_blocks, list)
       else []
     )
     live_entry, durable_entry = self._compact_model_tool_result_entry(result_entry, tool_name=tool_name)
     final_tool_result_blocks = [dict(durable_entry)]
     final_tool_result_blocks.extend(dict(block) for block in extra_blocks)
     tool_complete_event["final_tool_result_blocks"] = final_tool_result_blocks
+    streamed_projection = project_tool_call_complete_for_stream(
+      tool_complete_event,
+      result_entry=result_entry,
+      live_entry=live_entry,
+    )
+    streamed_is_projected = streamed_projection is not tool_complete_event
     tool_complete_event = sanitize_tool_event(
       tool_complete_event,
       sink="tool_complete",
       boundary=getattr(self, "_secret_boundary", None),
     )
+    streamed_tool_complete_event = (
+      sanitize_tool_event(
+        streamed_projection,
+        sink="tool_complete",
+        boundary=getattr(self, "_secret_boundary", None),
+      )
+      if streamed_is_projected
+      else tool_complete_event
+    )
     await self._append_durable_event(tool_complete_event)
-    self._append(tool_complete_event)
+    self._append(streamed_tool_complete_event)
     if superseded_continuation_run_id is not None:
       # The continuation is durably accepted (tool_call_complete appended
       # above), so any staged prior-revision attachment for this run is stale

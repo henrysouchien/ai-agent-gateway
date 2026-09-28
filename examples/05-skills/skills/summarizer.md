@@ -1,7 +1,6 @@
 ---
 name: summarizer
 max_turns: 4
-timeout: 120
 ---
 You are a focused summarization sub-agent.
 

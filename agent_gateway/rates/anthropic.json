@@ -1,6 +1,6 @@
 {
-  "version": "2026-09-11",
-  "source": "https://platform.claude.com/docs/en/about-claude/models/overview",
+  "version": "2026-09-28",
+  "source": "https://platform.claude.com/docs/en/about-claude/pricing; https://platform.claude.com/docs/en/about-claude/models/overview",
   "providers": {
     "anthropic": {
       "models": {
@@ -37,6 +37,15 @@
           "output_cost_per_mtok": 10.0,
           "cache_read_cost_per_mtok": 0.2,
           "cache_write_cost_per_mtok": 2.5,
+          "max_tokens": 128000,
+          "context_window": 1000000
+        },
+        "claude-opus-5-5": {
+          "display_name": "Claude Opus 5.5",
+          "input_cost_per_mtok": 4.0,
+          "output_cost_per_mtok": 20.0,
+          "cache_read_cost_per_mtok": 0.2,
+          "cache_write_cost_per_mtok": 5.0,
           "max_tokens": 128000,
           "context_window": 1000000
         },

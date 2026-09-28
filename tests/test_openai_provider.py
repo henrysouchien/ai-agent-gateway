@@ -138,6 +138,7 @@ def _shipped_openai_execution(provider: OpenAIProvider):
 @pytest.fixture(autouse=True)
 def _clear_openai_env(monkeypatch: pytest.MonkeyPatch):
   monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+  monkeypatch.delenv("OPENAI_CUSTOM_HEADERS", raising=False)
 
 
 async def _capture_openai_request(config: dict[str, Any], *, timeout: float | None = None):
@@ -223,6 +224,42 @@ def test_client_passes_bound_route_organization_and_project(
   assert request.headers.get_list("authorization") == ["Bearer bound-oauth-token"]
   assert request.headers["openai-organization"] == "bound-org"
   assert request.headers["openai-project"] == "bound-project"
+
+
+@pytest.mark.parametrize(("config", "expected"), [
+  (
+    {
+      "auth_mode": "api",
+      "api_key": "bound-api-key",
+      "organization": "bound-org",
+      "project": "bound-project",
+    },
+    ("Bearer bound-api-key", "bound-org", "bound-project"),
+  ),
+  (
+    {"auth_mode": "oauth", "auth_token": "bound-oauth-token"},
+    ("Bearer bound-oauth-token", None, None),
+  ),
+])
+def test_ambient_custom_headers_cannot_rebind_principal(
+  monkeypatch: pytest.MonkeyPatch,
+  config: dict[str, Any],
+  expected: tuple[str, str | None, str | None],
+) -> None:
+  monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "\n".join([
+    "Authorization: Bearer ambient-token",
+    "OpenAI-Organization: ambient-org",
+    "OpenAI-Project: ambient-project",
+    "X-Ambient-Trace: keep-me",
+  ]))
+
+  request = asyncio.run(_capture_openai_request(config))
+
+  authorization, organization, project = expected
+  assert request.headers.get_list("authorization") == [authorization]
+  assert request.headers.get("openai-organization") == organization
+  assert request.headers.get("openai-project") == project
+  assert request.headers["x-ambient-trace"] == "keep-me"
 
 
 @pytest.mark.parametrize(("key", "url"), [

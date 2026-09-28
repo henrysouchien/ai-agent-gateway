@@ -47,12 +47,16 @@ _NARRATIVE_QUERY_PAGE_SIZE = 64
 _TERMINAL_REASON_PRECEDENCE = (
   "cancelled",
   "killed",
-  "timeout",
+  "stalled",
   "budget_exhausted",
   "turns_exhausted",
   "retries_exhausted",
   "runtime_error",
 )
+
+#: The ceilings an agent operation declares for itself. Reaching one is a
+#: bounded stop, not a failure: the run did the work its cap paid for.
+_DECLARED_CEILING_SIGNALS = frozenset({"turns_exhausted", "budget_exhausted"})
 
 
 @runtime_checkable
@@ -339,7 +343,7 @@ def _execution_settlement(
   terminal_reason = f"{reason}: {detail}" if detail else reason
   if reason == "cancelled":
     status = "cancelled"
-  elif reason in {"killed", "timeout", "resume_abandoned"}:
+  elif reason in {"killed", "stalled", "resume_abandoned"}:
     status = "interrupted"
   else:
     status = "failed"
@@ -357,8 +361,7 @@ def task_result_from_execution(
   requirement: ResultRequirement,
   provenance: TaskResultProvenance,
   final_narrative: FinalNarrativeArtifactReference | None,
-  timed_out: bool,
-  timeout: float | None,
+  stalled: bool,
   outcome: AnalyticalOutcome | None = None,
   budget_exceeded_reason: str | None = None,
   runtime_error_detail: str | None = None,
@@ -405,7 +408,7 @@ def task_result_from_execution(
   allowed_signals = {
     "turns_exhausted",
     "retries_exhausted",
-    "timeout",
+    "stalled",
     "cancelled",
     "killed",
     "resume_abandoned",
@@ -448,6 +451,7 @@ def task_result_from_execution(
     if runtime_error_detail is not None
     else None
   )
+  parent_budget_stop = False
   for event in event_list:
     event_type = event.get("type")
     if terminal_tool_result is not None:
@@ -456,23 +460,23 @@ def task_result_from_execution(
       signals.append("turns_exhausted")
     elif event_type == "budget_exceeded":
       signals.append("budget_exhausted")
+      if str(event.get("reason") or "") == "parent_budget":
+        parent_budget_stop = True
     elif event_type in {"run_error", "error"}:
       signals.append("runtime_error")
       if error_detail is None:
         raw = str(event.get("error") or event.get("message") or "").strip()
         error_detail = raw or None
-  if timed_out and terminal_tool_result is None:
-    signals.append("timeout")
+  if stalled and terminal_tool_result is None:
+    signals.append("stalled")
     if error_detail is None:
-      error_detail = (
-        f"sub-agent timed out after {timeout}s"
-        if timeout is not None
-        else "sub-agent timed out"
-      )
+      error_detail = "Sub-agent stalled"
   if runtime_error_detail is not None and terminal_tool_result is None:
     signals.append("runtime_error")
   if budget_exceeded_reason is not None and terminal_tool_result is None:
     signals.append("budget_exhausted")
+    if str(budget_exceeded_reason) == "parent_budget":
+      parent_budget_stop = True
 
   if evidence.admission_rejected:
     signals.append("runtime_error")
@@ -513,15 +517,25 @@ def task_result_from_execution(
     error_detail = "agent execution cannot forbid its terminal assistant message"
 
   settled_signals = tuple(dict.fromkeys(signals))
-  # The honest partial (design §4.5): a child that hit its turn ceiling and
-  # still published a durable terminal narrative did real work. Exhaustion is
-  # the SOLE signal here — cancelled/killed/timeout/budget/runtime failures
-  # co-occurring keep the old failed settlement, and ``ExecutionSettlement``
-  # forbids a ``terminal_reason`` on ``succeeded``, so the exhaustion fact
-  # rides the outcome's ``unmet_requirements`` instead of the settlement.
-  turns_exhausted_only = set(settled_signals) == {"turns_exhausted"}
+  # The honest partial (design §4.5): a child that hit a ceiling its own
+  # operation declared — turns or budget — and still published a durable
+  # terminal narrative did real work. The declared ceiling must be the SOLE
+  # signal: cancelled/killed/stalled/runtime failures co-occurring keep the
+  # old failed settlement, and ``ExecutionSettlement`` forbids a
+  # ``terminal_reason`` on ``succeeded``, so the ceiling fact rides the
+  # outcome's ``unmet_requirements`` instead of the settlement. A stop the
+  # PARENT's budget caused is not a ceiling this operation declared: the child
+  # never reached its own cap, so it settles failed and consumers keying on
+  # status (the workflow scheduler) do not read it as a success.
+  ceiling_reached = (
+    next(iter(settled_signals))
+    if len(settled_signals) == 1
+    and settled_signals[0] in _DECLARED_CEILING_SIGNALS
+    and not parent_budget_stop
+    else None
+  )
   honest_partial = (
-    turns_exhausted_only
+    ceiling_reached is not None
     and final_narrative is not None
     and requirement.mode == "narrative"
   )
@@ -588,7 +602,7 @@ def task_result_from_execution(
       failures=fold_dispatch_failures(event_list),
       sources=evidence.observed_sources,
       narrative_present=final_narrative is not None,
-      turns_exhausted=honest_partial,
+      ceiling_reached=ceiling_reached if honest_partial else None,
       missing_inputs=(),
     )
   return build_task_result(

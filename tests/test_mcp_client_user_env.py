@@ -253,7 +253,7 @@ def test_user_processes_isolate_and_credential_change_replaces_cached_child() ->
       )
 
     manager._connect_stdio_with_retries = connect
-    manager._schedule_drain = lambda state: drained.append(state)
+    manager._schedule_drain = lambda state, reason: drained.append((state, reason))
     subject_seven = mcp_client_module._PerUserGatewaySubject.from_gateway_session(
       _session(7, "seven@example.com")
     )
@@ -270,7 +270,7 @@ def test_user_processes_isolate_and_credential_change_replaces_cached_child() ->
     assert same is first
     assert other is not first
     assert replacement is not first
-    assert len(drained) == 1
+    assert drained == [(first, "binding_changed")]
 
   asyncio.run(scenario())
 

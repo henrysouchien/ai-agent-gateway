@@ -179,7 +179,8 @@ def test_skill_result_event_treats_recoverable_fms_error_as_failure() -> None:
 
   assert event["exit_code"] == 1
   assert event["outcome"] == "error"
-  assert event["status"] == "error"
+  assert event["status"] == "blocked"
+  assert event["fms_results"][0]["status"] == "error"
   assert event["error"] == "active research file is required"
 
 

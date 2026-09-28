@@ -25,7 +25,7 @@ from .capability_binding import (
   SESSION_DRIVER_CAPABILITY,
 )
 from .events import DEFAULT_SCHEMA_VERSION
-from .event_log import EventLog
+from .event_log import EventLog, log_has_terminal
 from .mcp_activation import McpActivationFold
 from .session_event_history import SessionEventHistory
 from .session_capabilities import normalize_session_capabilities
@@ -164,10 +164,25 @@ class SessionStream:
   subscribers: Dict[str, StreamSubscriber] = field(default_factory=dict)
   transcript_written_seqs: set[int] = field(default_factory=set)
   cleanup_handle: asyncio.TimerHandle | None = None
+  #: Set once this turn has released everything the next turn needs: the
+  #: teardown that follows the terminal event is not the turn, and the next
+  #: message waits for it instead of being refused as "already running".
+  settled: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+  #: Set once this turn holds ``session.active_turn``. The request that
+  #: dispatched the turn owns this object from the start and waits on this
+  #: event, so it never has to guess which turn the session slot holds while
+  #: the previous turn is still tearing down.
+  attached: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
   @property
   def is_running(self) -> bool:
     return self.runner_task is not None and not self.runner_task.done()
+
+  @property
+  def in_progress(self) -> bool:
+    """Whether the turn is still running and has not published its terminal event."""
+
+    return self.is_running and not log_has_terminal(self.event_log)
 
 
 @dataclass
@@ -310,6 +325,29 @@ class GatewaySession:
   _expiring: bool = False
 
 
+def session_ttl_elapsed(
+  session: GatewaySession | None,
+  *,
+  expires_at: int,
+  now: int,
+) -> bool:
+  """Whether a session's TTL has run out at ``now``.
+
+  The TTL bounds a session between turns, never a turn in progress. A turn's
+  own tool calls authenticate with the session's token, so while the session
+  holds a turn that has not published its terminal event the session stays
+  live and the turn keeps its tools. A new turn is admitted only while this is
+  false at the moment it attaches (``_dispatch_chat_turn_body``), so an
+  expired session cannot start a turn even when its token was accepted while
+  the previous turn was still answering.
+  """
+
+  if now < expires_at:
+    return False
+  turn = session.active_turn if session is not None else None
+  return turn is None or not turn.in_progress
+
+
 def bind_session_capability_selections(
   session: GatewaySession,
   *,
@@ -398,7 +436,11 @@ def attach_session_credential_handle(
 
 
 class SessionStore:
-  """In-memory session registry with TTL-based cleanup."""
+  """In-memory session registry with TTL-based cleanup.
+
+  Cleanup, the visible snapshot and token verification read a session's
+  lifetime through one predicate, ``ttl_elapsed``.
+  """
 
   def __init__(self, ttl: int = 3600) -> None:
     self.ttl = ttl
@@ -564,6 +606,15 @@ class SessionStore:
       return None
     return session
 
+  def ttl_elapsed(self, session_id: str, *, expires_at: int, now: int) -> bool:
+    """``session_ttl_elapsed`` for the session registered as ``session_id``."""
+
+    return session_ttl_elapsed(
+      self.sessions.get(session_id),
+      expires_at=expires_at,
+      now=now,
+    )
+
   def visible_sessions_snapshot(self) -> tuple[GatewaySession, ...]:
     """Return sessions still usable at one captured wall-clock instant."""
 
@@ -571,7 +622,12 @@ class SessionStore:
     return tuple(
       session
       for session in tuple(self.sessions.values())
-      if not session._expired and session.expires_at > now
+      if not session._expired
+      and not self.ttl_elapsed(
+        session.session_id,
+        expires_at=session.expires_at,
+        now=now,
+      )
     )
 
   def expire_session(self, session_id: str) -> None:
@@ -602,8 +658,7 @@ class SessionStore:
       session._expiry_task = task
 
   def cleanup_expired(self) -> None:
-    now = int(time.time())
-    expired_ids = [session_id for session_id, session in self.sessions.items() if session.expires_at <= now]
+    expired_ids = self._ttl_elapsed_ids(int(time.time()))
     for session_id in expired_ids:
       self.expire_session(session_id)
 
@@ -623,10 +678,16 @@ class SessionStore:
       await asyncio.shield(task)
 
   async def cleanup_expired_async(self) -> None:
-    now = int(time.time())
-    expired_ids = [session_id for session_id, session in self.sessions.items() if session.expires_at <= now]
+    expired_ids = self._ttl_elapsed_ids(int(time.time()))
     for session_id in expired_ids:
       await self.expire_session_async(session_id)
+
+  def _ttl_elapsed_ids(self, now: int) -> list[str]:
+    return [
+      session_id
+      for session_id, session in tuple(self.sessions.items())
+      if self.ttl_elapsed(session_id, expires_at=session.expires_at, now=now)
+    ]
 
   async def _expire_session_async(self, session: GatewaySession) -> None:
     handle = session._expiry_retry_handle
@@ -796,8 +857,11 @@ class AuthManager:
     ):
       raise HTTPException(status_code=401, detail="Invalid session payload")
 
-    now = int(time.time())
-    if now >= int(expires_at):
+    if self.session_store.ttl_elapsed(
+      str(session_id),
+      expires_at=int(expires_at),
+      now=int(time.time()),
+    ):
       self.session_store.expire_session(session_id)
       raise HTTPException(status_code=401, detail="Session expired")
 
@@ -902,4 +966,5 @@ __all__ = [
   "SessionStore",
   "bind_session_capability_selections",
   "session_owner_user_id",
+  "session_ttl_elapsed",
 ]

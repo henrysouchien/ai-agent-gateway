@@ -85,9 +85,9 @@ before session scoping, MCP construction/startup, or provider-client creation.
 The executor snapshots the bound mapping before its first await and passes
 `allow_stub_response=False`.
 
-`timeout_seconds` is retained for caller compatibility but does not cancel LLM
-work. Liveness is enforced by the event-gap stall watchdog; bound long-running
-work with `max_turns` and `max_budget_usd`.
+No wall clock bounds the run or its `run_agent` children. Liveness is the
+event-gap stall watchdog plus the parent-side child activity guard; bound
+long-running work with `max_turns` and `max_budget_usd`.
 
 Returns a `RunOutput`; see the complete field list below.
 
@@ -105,7 +105,7 @@ Result of an autonomous run. Fields:
 - `usage: dict` — token usage from the provider
 - `error: str | None` — error message if the run failed
 - `timed_out: bool` — timeout marker retained in the result contract; the
-  current autonomous entry point does not enforce `timeout_seconds`
+  autonomous entry point applies no wall clock, so it stays False
 - `budget_exceeded: bool` — True if estimated cost exceeded `max_budget_usd`
 - `max_turns_reached: bool` — True if the model loop hit `max_turns`
 - `operator_paused: bool` — True when an operator intentionally paused the run
@@ -349,7 +349,10 @@ Key fields:
 - `dispatch_scope_validator`: optional dispatch-time validator/canonicalizer for redacted structured portfolio scope
 - `cors_origins`, `prefix`: HTTP surface
 - `on_event`, `on_startup`, `on_shutdown`: app lifecycle hooks
-- `transcript_dir`: JSONL transcript output
+- `transcript_dir`, `transcript_retention_days`: JSONL transcript output and
+  the age horizon that sweeps it. The horizon defaults to `0`, which deletes
+  nothing; a positive value unlinks transcripts and their `.meta.json`
+  sidecars older than that many days
 - `server_policy`: explicitly bound product policy callbacks; one policy per
   gateway process, installed before runtime construction (no checkout discovery)
 - `identity_resolver`, `mcp_user_key_lookup`: application identity and per-user
@@ -509,8 +512,9 @@ Inject built-in code execution tools into a runtime.
 
 Behavior:
 
-- prefers Docker when available
-- falls back to subprocess when enabled
+- `host=auto` prefers Docker when available
+- falls back to subprocess when enabled; the fallback is logged at `WARNING` with the skipped backend's reason
+- every `code_execute` result names where it ran: `backend`, `sandboxed`, and `skipped_backends` (`[{backend, sandboxed, reason}]`, empty unless `host=auto` skipped one)
 - stores background tasks and work directories on the session
 
 ### `cleanup_code_execution(session)`
@@ -519,10 +523,11 @@ Cancel background tasks and remove the session work directory. Call this on sess
 
 ### `DockerBackend` and `SubprocessBackend`
 
-Concrete execution backends.
+Concrete execution backends of `ExecutionBackend`.
 
 - `DockerBackend` is treated as sandboxed
 - `SubprocessBackend` is treated as unsandboxed
+- `unavailable_reason()` returns why a backend cannot run now, or `None`; `available()` derives from it, so a custom backend overrides `unavailable_reason()` only
 
 ### `OutputRingBuffer` and `BackgroundTask`
 
@@ -552,7 +557,6 @@ Common fields:
 - `system_prompt`
 - `model`
 - `max_turns`
-- `timeout`
 - `metadata`
 
 ### `SkillStateStore`

@@ -944,6 +944,7 @@ class TaskLifecycleListener(Protocol):
 
 
 _TERMINAL_STATES = {TaskState.COMPLETED, TaskState.FAILED, TaskState.KILLED, TaskState.INTERRUPTED}
+_ADMISSION_SLOT_STATES = frozenset({TaskState.PENDING, TaskState.RUNNING})
 
 
 class NotificationQueue:
@@ -1295,11 +1296,23 @@ class TaskRegistry:
     Returns ``(entry, None)`` when the slot is taken, or
     ``(None, rejection)`` when it is refused. A rejection means no slot was
     reserved and therefore no durable ``task_registered`` may be appended.
+    A caller naming a ``task_id`` this registry already holds gets that
+    entry back in whatever state it reached — it is reusing the slot it
+    already owns, so the ceiling never charges it again and the caller
+    re-reads the live state to decide between replay and start.
     """
 
     admission_count = self.admission_count
     reserved = self._tasks.get(task_id) if task_id else None
-    if reserved is not None and reserved.state == TaskState.PENDING:
+    if reserved is not None and reserved.state in _ADMISSION_SLOT_STATES:
+      # This caller reuses the entry that already holds the slot for this
+      # exact task_id — a deterministic resume successor, or a caller
+      # replaying its own override id — so the ceiling must not charge it
+      # twice. The state matters only because ``admission_count`` counts
+      # PENDING and RUNNING alone: a reservation that already started
+      # running is no more a new admission than a pending one, and a caller
+      # whose pre-decision awaits outlived that transition would otherwise
+      # be refused capacity it is not asking for.
       admission_count -= 1
     limit_error = reject_over_capacity(admission_count, self._max_inflight)
     if limit_error is not None:
@@ -1330,7 +1343,7 @@ class TaskRegistry:
           "message": str(exc),
         }
       return entry, None
-    if reserved is not None and reserved.state == TaskState.PENDING:
+    if reserved is not None:
       return reserved, None
     return (
       self.register(
@@ -1885,7 +1898,7 @@ class TaskRegistry:
     return sum(
       1
       for entry in self._tasks.values()
-      if entry.state in {TaskState.PENDING, TaskState.RUNNING}
+      if entry.state in _ADMISSION_SLOT_STATES
     )
 
   @property

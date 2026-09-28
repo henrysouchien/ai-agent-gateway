@@ -212,8 +212,7 @@ async def test_narrative_execution_returns_canonical_task_result(tmp_path) -> No
     requirement=_narrative_requirement(),
     provenance=provenance,
     final_narrative=visible.final_narrative,
-    timed_out=False,
-    timeout=None,
+    stalled=False,
   )
 
   assert result.execution.status == "succeeded"
@@ -235,8 +234,7 @@ def test_failed_execution_never_publishes_partial_canonical_values() -> None:
     requirement=_narrative_requirement(),
     provenance=provenance,
     final_narrative=None,
-    timed_out=False,
-    timeout=None,
+    stalled=False,
   )
 
   assert result.execution.status == "failed"
@@ -296,8 +294,7 @@ async def test_child_source_observations_populate_task_result_evidence(
     requirement=_narrative_requirement(),
     provenance=provenance,
     final_narrative=visible.final_narrative,
-    timed_out=False,
-    timeout=None,
+    stalled=False,
   )
 
   assert result.execution.status == "succeeded"
@@ -353,8 +350,7 @@ async def test_no_citation_context_child_yields_no_fabricated_citations(
     requirement=_narrative_requirement(),
     provenance=provenance,
     final_narrative=visible.final_narrative,
-    timed_out=False,
-    timeout=None,
+    stalled=False,
   )
 
   observed = result.evidence.observed_sources
@@ -482,8 +478,7 @@ async def test_turns_exhausted_with_narrative_settles_succeeded_and_partial(
     requirement=_narrative_requirement(),
     provenance=provenance,
     final_narrative=await _narrative(tmp_path),
-    timed_out=False,
-    timeout=None,
+    stalled=False,
     admitted_task=_admitted_task(),
   )
 
@@ -498,6 +493,65 @@ async def test_turns_exhausted_with_narrative_settles_succeeded_and_partial(
   assert result.values.terminal_narrative is not None
 
 
+@pytest.mark.asyncio
+async def test_budget_ceiling_with_narrative_settles_succeeded_and_partial(
+  tmp_path,
+) -> None:
+  # A budget ceiling is a cap the operation declared for itself, exactly like
+  # the turn ceiling: a child that reached it and still published a durable
+  # terminal narrative did real work the parent can consume.
+  logical, attempt, provenance = _task_identity()
+
+  result = task_result_from_execution(
+    ({"type": "budget_exceeded", "total_cost": 2.0, "budget": 2.0},),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=await _narrative(tmp_path),
+    stalled=False,
+    admitted_task=_admitted_task(),
+  )
+
+  assert result.execution.status == "succeeded"
+  assert result.execution.terminal_reason is None
+  assert result.outcome is not None
+  assert result.outcome.disposition == "partial"
+  assert result.outcome.unmet_requirements == ("budget_exhausted",)
+  assert result.values.terminal_narrative is not None
+
+
+@pytest.mark.asyncio
+async def test_parent_budget_stop_is_not_the_child_s_declared_ceiling(
+  tmp_path,
+) -> None:
+  # The parent's cap stopping a child is not a ceiling the child's operation
+  # declared: settling it succeeded/partial told status-keyed consumers (the
+  # workflow scheduler) that a node the parent killed had succeeded.
+  logical, attempt, provenance = _task_identity()
+
+  result = task_result_from_execution(
+    (
+      {
+        "type": "budget_exceeded",
+        "total_cost": 0.4,
+        "budget": 0.5,
+        "reason": "parent_budget",
+      },
+    ),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=await _narrative(tmp_path),
+    stalled=False,
+    admitted_task=_admitted_task(),
+  )
+
+  assert result.execution.status == "failed"
+  assert result.execution.terminal_reason == "budget_exhausted"
+
+
 def test_turns_exhausted_without_narrative_still_fails() -> None:
   logical, attempt, provenance = _task_identity()
 
@@ -508,8 +562,7 @@ def test_turns_exhausted_without_narrative_still_fails() -> None:
     requirement=_narrative_requirement(),
     provenance=provenance,
     final_narrative=None,
-    timed_out=False,
-    timeout=None,
+    stalled=False,
     admitted_task=_admitted_task(),
   )
 
@@ -534,14 +587,13 @@ async def test_turns_exhausted_beside_another_signal_keeps_failing(
     requirement=_narrative_requirement(),
     provenance=provenance,
     final_narrative=await _narrative(tmp_path),
-    timed_out=True,
-    timeout=30.0,
+    stalled=True,
     admitted_task=_admitted_task(),
   )
 
   assert result.execution.status == "interrupted"
   assert result.execution.terminal_reason is not None
-  assert result.execution.terminal_reason.startswith("timeout:")
+  assert result.execution.terminal_reason.startswith("stalled:")
   assert result.outcome is None
   assert result.values.terminal_narrative is None
 
@@ -566,8 +618,7 @@ async def test_clean_execution_derives_a_complete_mechanical_outcome(
     requirement=_narrative_requirement(),
     provenance=provenance,
     final_narrative=await _narrative(tmp_path, "Complete answer."),
-    timed_out=False,
-    timeout=None,
+    stalled=False,
     admitted_task=_admitted_task(),
   )
 
@@ -597,8 +648,7 @@ async def test_failed_source_retrievals_derive_insufficient_evidence(
     requirement=_narrative_requirement(),
     provenance=provenance,
     final_narrative=await _narrative(tmp_path, "I could not read the filings."),
-    timed_out=False,
-    timeout=None,
+    stalled=False,
     admitted_task=_admitted_task(),
   )
 
@@ -621,8 +671,7 @@ async def test_settlement_without_an_admitted_task_derives_no_outcome(
     requirement=_narrative_requirement(),
     provenance=provenance,
     final_narrative=await _narrative(tmp_path, "Unadmitted answer."),
-    timed_out=False,
-    timeout=None,
+    stalled=False,
   )
 
   assert result.execution.status == "succeeded"
@@ -673,8 +722,7 @@ async def test_terminal_tool_success_projects_exact_result_without_narrative(
     requirement=_narrative_requirement(),
     provenance=provenance,
     final_narrative=None,
-    timed_out=False,
-    timeout=None,
+    stalled=False,
     admitted_task=_admitted_task(tool_ids=(tool_name,)),
   )
 
@@ -713,8 +761,7 @@ async def test_named_operation_without_terminal_door_does_not_succeed(
     requirement=_narrative_requirement(),
     provenance=provenance,
     final_narrative=await _narrative(tmp_path, "STATUS: BLOCKED"),
-    timed_out=False,
-    timeout=None,
+    stalled=False,
     admitted_task=_admitted_task(tool_ids=(
       "prepare_model_build",
       "list_research_files",
@@ -753,8 +800,7 @@ async def test_named_operation_terminal_stop_is_not_succeeded(
     requirement=_narrative_requirement(),
     provenance=provenance,
     final_narrative=await _narrative(tmp_path, "STOP: missing research file"),
-    timed_out=False,
-    timeout=None,
+    stalled=False,
     admitted_task=_admitted_task(tool_ids=(
       "fms_persist_postcompile_valuation",
     )),
@@ -788,8 +834,7 @@ async def test_ordinary_child_without_declared_door_stays_succeeded(
     requirement=_narrative_requirement(),
     provenance=provenance,
     final_narrative=await _narrative(tmp_path, "Ordinary child answer."),
-    timed_out=False,
-    timeout=None,
+    stalled=False,
     admitted_task=_admitted_task(),
   )
 

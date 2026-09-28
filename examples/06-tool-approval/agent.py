@@ -28,7 +28,7 @@ BASE_DIR = Path(__file__).parent
 NOTES_DIR = BASE_DIR / "approved_notes"
 NOTES_DIR.mkdir(exist_ok=True)
 DEFAULT_MODEL = INITIAL_MODEL_REGISTRY.require(
-  "anthropic.claude-opus-5"
+  "anthropic.claude-opus-5-5"
 ).upstream_model
 DEFAULT_EFFORT = "high"
 TENANT_ID = "example-06-tool-approval"
@@ -141,7 +141,7 @@ def admit_demo_session(session, _api_key, _request) -> None:
   session.role = "owner"
   session.channel = "web"
   session.model_entitled_capabilities = frozenset({"session.driver"})
-  session.model_entitled_keys = frozenset({"anthropic.claude-opus-5"})
+  session.model_entitled_keys = frozenset({"anthropic.claude-opus-5-5"})
 
 
 def materialize_service_credential(

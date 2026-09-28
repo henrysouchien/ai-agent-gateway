@@ -8,7 +8,7 @@ from typing import Any
 try:
   import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10 wheel installs use metadata
-  tomllib = None  # type: ignore[assignment]
+  tomllib = None
 
 from .control_run_lifecycle import CONTROL_RUN_CONTRACT_VERSION
 

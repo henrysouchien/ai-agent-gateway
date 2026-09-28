@@ -3,33 +3,61 @@ from __future__ import annotations
 import hashlib
 import inspect
 from datetime import timedelta
-from typing import Any
+from typing import Any, Protocol
 
 from .approval_policy import (
+  DEFAULT_APPROVAL_PREFERENCE,
+  MONEY_BOUNDARY_TOOL_CLASSES,
+  STANDING_APPROVED_TOOL_CLASSES,
   ApprovalDecision,
   ApprovalPolicy,
+  ApprovalPreference,
   ApprovalRequest,
   ApprovalRequestPayload,
   RunContext,
   ToolClass,
+  preference_settles_class,
   utc_now,
 )
 from .policy_imports import resolve_effective_role
 
 
+class StandingApprovalPreferenceReader(Protocol):
+  def get(self, *, user_id: str) -> Any: ...
+
+
 class SingleUserApprovalPolicy:
-  """Default policy preserving the existing single-user approval behavior."""
+  """The one owner of which classes need a human, for every channel.
+
+  Approval is required where the class is the money boundary (a live order).
+  Every other class follows the user's standing approval preference, whose
+  product default is ``auto_approve_all_but_trades`` — so no agent-driven
+  surface draws an approval card for a read, a write or a config change.
+  """
 
   policy_id = "single-user"
-  policy_version = "1"
+  policy_version = "2"
 
-  def __init__(self, *, store: Any | None = None) -> None:
+  def __init__(
+    self,
+    *,
+    store: Any | None = None,
+    preference_store: StandingApprovalPreferenceReader | None = None,
+  ) -> None:
     self._store = store
+    self._preference_store = preference_store
     try:
       source = inspect.getsource(type(self))
     except Exception:
       source = type(self).__name__
     self.policy_bundle_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+  def standing_preference(self, *, user_id: str) -> ApprovalPreference:
+    """Read this user's standing answer; unset means the product default."""
+
+    if self._preference_store is None:
+      return DEFAULT_APPROVAL_PREFERENCE
+    return self._preference_store.get(user_id=user_id).preference
 
   async def decide(
     self,
@@ -51,11 +79,28 @@ class SingleUserApprovalPolicy:
         "Exact promotion requires a fresh decision by its frozen owner",
         allow_persistent_grant=False,
       )
-    # Portfolio configuration and irreversible tools require a fresh user decision.
-    if request.tool_class in {"portfolio_config", "irreversible"}:
+    # The money boundary: placing or cancelling a live order is the one class
+    # whose decision belongs to a human, on every channel.
+    if request.tool_class in MONEY_BOUNDARY_TOOL_CLASSES:
       return self._request_user(
         f"{request.tool_class} tool requires explicit user approval",
         allow_persistent_grant=False,
+      )
+
+    # Every other class follows the user's standing answer, decided here and
+    # nowhere else. Its default settles the call with no prompt and no client
+    # round-trip; the durable request still records the decision.
+    preference = self.standing_preference(user_id=request.user_id)
+    if preference_settles_class(
+      preference=preference,
+      tool_class=request.tool_class,
+    ):
+      return ApprovalDecision(
+        outcome="auto_approve",
+        reason=f"Standing approval preference: {preference}",
+        allow_persistent_grant=False,
+        policy_id=self.policy_id,
+        policy_version=self.policy_version,
       )
 
     if request.approval_reuse_mode == "disabled":
@@ -141,8 +186,14 @@ class SingleUserApprovalPolicy:
         break
     return f"{request.tool_class}:{request.tool_name}:{qualifier}" if qualifier else f"{request.tool_class}:{request.tool_name}"
 
+
 class DelegationApprovalPolicy:
-  """Approval policy wrapper for server-authoritative delegated Excel turns."""
+  """One minted grant, on top of the owner's rule, for delegated Excel turns.
+
+  The grant can only add an auto-approval for the exact call an operator
+  delegated; which classes need a human is the base policy's to decide, so
+  there is no second class list here and no arm that escalates past it.
+  """
 
   policy_id = "delegation"
 
@@ -186,14 +237,9 @@ class DelegationApprovalPolicy:
     if grant is None:
       return await self._base.decide(payload=payload, request=request, run_context=run_context)
 
-    if request.tool_class in {"portfolio_config", "irreversible"}:
-      return self._request_user(f"{request.tool_class} tool requires explicit user approval")
-
-    if request.tool_class == "external_write":
-      return self._request_user("external_write tool requires explicit user approval under delegation")
-
     if (
-      request.tool_class in grant.tool_class_ceiling
+      request.tool_class in STANDING_APPROVED_TOOL_CLASSES
+      and request.tool_class in grant.tool_class_ceiling
       and utc_now() <= grant.created_at + timedelta(seconds=grant.window_seconds)
       and self._predicate_matches(payload=payload, predicate=grant.args_predicate)
     ):
@@ -204,7 +250,11 @@ class DelegationApprovalPolicy:
         policy_version=self.policy_version,
       )
 
-    return self._request_user("Tool requires user approval under delegation")
+    return await self._base.decide(
+      payload=payload,
+      request=request,
+      run_context=run_context,
+    )
 
   async def on_resolve(self, *, request: ApprovalRequest) -> None:
     await self._base.on_resolve(request=request)
@@ -214,16 +264,6 @@ class DelegationApprovalPolicy:
 
   def role_authorized_for_class(self, *, decider_role: str | None, tool_class: ToolClass) -> bool:
     return self._base.role_authorized_for_class(decider_role=decider_role, tool_class=tool_class)
-
-  def _request_user(self, reason: str) -> ApprovalDecision:
-    return ApprovalDecision(
-      outcome="request_user_approval",
-      reason=reason,
-      expiry_seconds=600,
-      allow_persistent_grant=False,
-      policy_id=self.policy_id,
-      policy_version=self.policy_version,
-    )
 
   @staticmethod
   def _predicate_matches(*, payload: ApprovalRequestPayload, predicate: dict[str, Any] | None) -> bool:

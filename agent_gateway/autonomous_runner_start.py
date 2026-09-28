@@ -11,6 +11,10 @@ import signal
 import time
 from typing import Any, Mapping, TYPE_CHECKING
 
+from .autonomous_child_server_dotenv import (
+  AUTONOMOUS_CHILD_SERVER_DOTENV_ENV,
+  server_dotenv_payload,
+)
 from .autonomous_capability_handoff import (
   AutonomousCapabilityBindingRequest,
   resolve_autonomous_capability_binding,
@@ -65,7 +69,10 @@ from .agent_session_log_layout import (
   prepare_autonomous_session_log,
   resolve_agent_session_log_layout,
 )
-from .claim_signing_authority import GatewayClaimSigningAuthority
+from .claim_signing_authority import (
+  GatewayClaimSigningAuthority,
+  LEGACY_CLAIM_HMAC_KEY_ENV,
+)
 from .autonomous_runner_commands import (
   normalize_autonomous_profile,
   normalize_max_budget_usd,
@@ -73,8 +80,10 @@ from .autonomous_runner_commands import (
 from .artifact_paths import canonicalize_ticker
 from .capability_binding import CredentialHandle
 from .events import DEFAULT_SCHEMA_VERSION
+from .gateway_address import GATEWAY_BASE_URL_ENV
 from .role_validation import require_exact_role
 from .named_refusal import NamedRefusal
+from .providers.anthropic_oauth import ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES
 
 from .autonomous_runner_state import (
   AutonomousTask,
@@ -145,8 +154,7 @@ _AUTONOMOUS_CHILD_BASE_ENV_NAMES = frozenset({
   "LOCAL_GATEWAY_RUNTIME_ROOT",
   "LOCAL_GATEWAY_RUNTIME_MANIFEST",
   "LOCAL_GATEWAY_RUNTIME_VERSION_ROOT",
-  "GATEWAY_URL",
-  "GATEWAY_BASE_URL",
+  GATEWAY_BASE_URL_ENV,
   "GATEWAY_SSL_VERIFY",
   "AGENT_API_CLAIM_TTL_SECONDS",
   "AGENT_API_CLAIM_MAX_TTL_SECONDS",
@@ -156,9 +164,6 @@ _AUTONOMOUS_CHILD_BASE_ENV_NAMES = frozenset({
   "AGENT_SESSION_LOG_MAX_ACTIVE_BYTES",
   "AGENT_SDK_CWD",
   "SUB_AGENT_MAX_CONCURRENCY",
-  "SUB_AGENT_SKILL_TIMEOUT",
-  "SUB_AGENT_TIMEOUT",
-  "PARENT_PER_TURN_TIMEOUT",
   "MEMORY_ENABLED",
   "MEMORY_KEYWORD_WEIGHT",
   "MEMORY_VECTOR_WEIGHT",
@@ -176,13 +181,29 @@ _AUTONOMOUS_CHILD_BASE_ENV_NAMES = frozenset({
   "MODEL_ENGINE_OVERRIDES_DIR",
 })
 _AUTONOMOUS_CHILD_PROVIDER_ENV_NAMES = {
-  "anthropic": frozenset(),
+  # A child binds a capability, not a token: the credential the parent selected
+  # rides the handoff, and the pool that credential belongs to is configuration
+  # the child's own rotation owner resolves. Anthropic subscription limits are
+  # per credential, so a child that saw only its bound token died on the first
+  # 429 of whichever account was bound while a chat turn in the same gateway
+  # process rotated and completed
+  # (docs/qa/autonomous-child-credential-pool-of-one-2026-09-17.md). The names
+  # come from the resolver that owns what the pool is made of, never from a
+  # list kept here.
+  "anthropic": ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES,
   "openai": frozenset({
     "OPENAI_SESSION_EPOCH",
   }),
   "codex": frozenset(),
   "xai": frozenset(),
 }
+# Which provider's slice a child receives is the gateway's decision, so no
+# sibling file speaks for any of them -- the session epoch fences a child's
+# provider history, and a credential pool stays this gateway's own projection,
+# whether or not this child runs on that provider.
+_AUTONOMOUS_CHILD_ANY_PROVIDER_ENV_NAMES = frozenset().union(
+  *_AUTONOMOUS_CHILD_PROVIDER_ENV_NAMES.values()
+)
 _AUTONOMOUS_CHILD_RESEARCH_TOOL_ENV_NAMES = frozenset({
   "FMP_API_KEY",
   "FMP_CACHE_DIR",
@@ -191,6 +212,7 @@ _AUTONOMOUS_CHILD_RESEARCH_TOOL_ENV_NAMES = frozenset({
   "EDGAR_API_KEY",
   "SEC_BUDGET_SITE",
   "SEC_USER_AGENT",
+  "SEC_EXPECTED_MACHINE_IDENTITY",
   "DATABENTO_API_KEY",
   "ALERTS_GATEWAY_API_KEY",
 })
@@ -221,7 +243,6 @@ _AUTONOMOUS_CHILD_PROFILE_ENV_NAMES = {
     f"{prefix}_AGENT_MAX_TOKENS",
     f"{prefix}_AGENT_MAX_TURNS",
     f"{prefix}_AGENT_STREAM_STALL_TIMEOUT",
-    f"{prefix}_AGENT_TIMEOUT_SECONDS",
   })
   for profile, prefix in (
     ("analyst", "ANALYST"),
@@ -243,7 +264,7 @@ _RETIRED_AUTONOMOUS_CHILD_ENV_NAMES = (
   "AGENT_AUTONOMOUS_OPERATOR_INBOX_PATH",
   "AGENT_AUTONOMOUS_APPROVAL_DECISIONS_PATH",
   "AGENT_AUTONOMOUS_APPROVALS_DB_PATH",
-  "AGENT_API_USER_CLAIM_HMAC_KEY",
+  LEGACY_CLAIM_HMAC_KEY_ENV,
   "AGENT_API_CLAIM_AUDIENCE",
   "AGENT_API_CLAIM_ISSUED_AT",
   "AGENT_API_CLAIM_EXPIRY",
@@ -262,6 +283,19 @@ _RETIRED_AUTONOMOUS_CHILD_ENV_NAMES = (
   "ADVISOR_DEV_MODE",
   "RESEARCH_PRODUCER_DEV_MODE",
 )
+# The launcher computes this one for the child itself -- the MCP user-key table
+# narrowed to the child's own identity -- so neither the projection above nor a
+# sibling application's dotenv may supply it.
+_AUTONOMOUS_CHILD_NARROWED_GATEWAY_USER_KEYS_ENV = "GATEWAY_USER_KEYS"
+_AUTONOMOUS_CHILD_LAUNCHER_OWNED_ENV_NAMES = frozenset({
+  _AUTONOMOUS_CHILD_NARROWED_GATEWAY_USER_KEYS_ENV,
+})
+# Authority is never hand-listed here: the sibling delivery recognizes it from
+# its owners -- the gateway's own environment (every name this application is
+# configured with, claim and assertion signing keys included) and the shape of
+# the name itself (credential and identity material). A gateway secret added
+# tomorrow is withheld without editing this module; see
+# `autonomous_child_server_dotenv.server_dotenv_payload`.
 
 
 def _pinned_autonomous_child_pythonpath(
@@ -308,7 +342,10 @@ def _positive_autonomous_child_env(
     raise TypeError(
       "autonomous child environment deliver flag must be exact bool"
     )
-  allowed_names = (
+  # The runtime vocabulary is what the launcher computes for the child: no file
+  # speaks for it. Tool configuration is ordinary configuration whose value the
+  # declaring application owns when this gateway carries none of it.
+  runtime_contract_names = (
     _AUTONOMOUS_CHILD_BASE_ENV_NAMES
     | _AUTONOMOUS_CHILD_PROVIDER_ENV_NAMES.get(
       normalized_provider,
@@ -318,6 +355,9 @@ def _positive_autonomous_child_env(
       normalized_profile,
       frozenset(),
     )
+  )
+  allowed_names = (
+    runtime_contract_names
     | _AUTONOMOUS_CHILD_PROFILE_TOOL_ENV_NAMES.get(
       normalized_profile,
       frozenset(),
@@ -355,6 +395,28 @@ def _positive_autonomous_child_env(
       )
       if type(value) is str and value:
         projected[destination] = value
+  # A contained child cannot read a sibling application's dotenv, so the
+  # uncontained parent reads each declared sibling server's own file and
+  # delivers the values the child's MCP renderer puts back on that server's
+  # env block -- the whole file that server would have loaded for itself,
+  # minus what this contract governs: the child's runtime vocabulary, the
+  # names stripped at launch, the ones the launcher computes for the child
+  # itself, and whatever the delivery itself recognizes as this gateway's
+  # configuration or as authority material. A tool setting is withheld by its
+  # value, not by its name: `IBKR_ENABLED` reaches the Risk servers from the
+  # file that declares it precisely when this gateway carries none.
+  server_dotenv = server_dotenv_payload(
+    projected,
+    gateway_environ=environ,
+    withheld=(
+      runtime_contract_names
+      | frozenset(_RETIRED_AUTONOMOUS_CHILD_ENV_NAMES)
+      | _AUTONOMOUS_CHILD_LAUNCHER_OWNED_ENV_NAMES
+      | _AUTONOMOUS_CHILD_ANY_PROVIDER_ENV_NAMES
+    ),
+  )
+  if server_dotenv is not None:
+    projected[AUTONOMOUS_CHILD_SERVER_DOTENV_ENV] = server_dotenv
   return projected
 
 
@@ -1771,7 +1833,7 @@ class AutonomousRegistryStartMixin:
         capability_binding.materialized_credential,
         session_token=session_token,
       )
-      env["GATEWAY_USER_KEYS"] = _narrowed_mcp_gateway_user_keys(
+      env[_AUTONOMOUS_CHILD_NARROWED_GATEWAY_USER_KEYS_ENV] = _narrowed_mcp_gateway_user_keys(
         mcp_user_key_lookup=self._mcp_user_key_lookup,
         user_id=child_session.user_id,
         user_email=child_session.user_email,

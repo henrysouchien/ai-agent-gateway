@@ -30,7 +30,8 @@ def test_production_target_bounds_uvicorn_graceful_shutdown() -> None:
 
 
 def test_production_target_publishes_bound_gateway_endpoint() -> None:
-  assert _TARGET_ENV["GATEWAY_URL"] == "http://127.0.0.1:8001"
+  assert _TARGET_ENV["GATEWAY_BASE_URL"] == "http://127.0.0.1:8001"
+  assert "GATEWAY_URL" not in _TARGET_ENV
 
 
 def test_production_target_does_not_expose_product_catalog_as_generic_directory() -> None:

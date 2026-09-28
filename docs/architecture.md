@@ -237,6 +237,54 @@ uses `ClientSession.initialize()` for its handshake, snake_case SDK attributes
 Streamable HTTP yields read and write streams; its transport and OAuth clients
 use `httpx2`, while ordinary tool HTTP remains on `httpx`.
 
+`mcp_client_connections` opens every connection in a transport host task of its
+own. This covers shared and per-user connections, over stdio or streamable HTTP.
+The host task enters the SDK's transport and `ClientSession` contexts, hands the
+connected state to the caller, and later exits those contexts itself. The
+connection's `exit_contexts` holds only the host, so closing it is a request the
+host carries out. Entering the contexts in a caller's task would arm the
+connection with a cancellation aimed at that caller. Each of those contexts
+cancels its anyio scope on exit, and anyio delivers that cancellation to the
+task that entered the scope. An EOF reconnect, a replacement or a shutdown closes
+the connection from some other task, so the close would cancel whatever
+pipeline stage or turn opened that generation. Exiting a scope outside the task
+that entered it also leaves the scope entered for good.
+
+A server marked `per_user` in its config entry serves definitions only; calls
+route to a child keyed by `(server, user)` that `McpClientManager` spawns on
+first dispatch. Each such child also gets a per-user host task that owns its
+lifecycle: it hands the connected state to the caller, keeps the child until it
+is retired, and then closes it.
+
+A child is retired by the periodic idle reaper, by a replacement (forced
+refresh, near broker expiry, changed credential binding, dead transport), by
+instance-cap eviction, or by a transport failure on a dispatch. Retirement
+removes the child from the per-user map first, so no further caller can obtain
+it, and then waits for its in-flight calls to finish before the host closes it —
+with no deadline, since every tool call already carries its own timeout. Manager
+shutdown does not drain: it drops the pending drains and closes every live host
+at once. Each close logs the server, the user and the site that closed it. A
+close is only ever a request, never a cancellation of the host and never a
+deadline over it: cancelling a host mid-teardown interrupts the cleanup that
+reaps the child, and one cancelled before its coroutine runs leaves its waiters
+unsettled. A startup still in flight runs to its own end and the close is
+waiting for it there. The connection layer owns every startup timeout and
+applies them per request, so the catalog walk carries its own bound instead: a
+server answering every `list_tools` page with another cursor is enumerated for
+at most `_LIST_TOOLS_PAGE_CEILING` pages (256) in
+`mcp_client_connections.initialize_session_state`, and the walk then raises. On
+manager startup that raise becomes a non-retryable `startup_error` diagnostic
+against that one server, and the other servers' catalogs publish without it; for
+a per-user child it settles the waiting caller's `ready` with the failure rather
+than leaving a host that never arrives. That loop
+is where the bound belongs — it hangs a shared server's startup the same way as
+a per-user child's — and a deadline over the per-user host is not, because such
+a deadline surrounds the startup's own teardown and cancels the SDK
+mid-termination. The ceiling is a mechanical I/O bound on a client loop, never a
+wall-clock deadline on the work: the per-request `wait_for` is unchanged. An
+abandoned child holds its instance-cap slot until its host has let it go, and a
+child whose close has been asked for is never handed to a caller.
+
 Reconnect eligibility uses typed `MCPError` codes. Request timeout `-32001`
 permits startup retry or reconnection for future calls, never in-flight replay.
 Connection-closed errors can replay only when the call's existing replay policy
@@ -316,7 +364,7 @@ Sessions are first-class runtime state.
 - whether a stream is already active (`stream_active` / `active_turn`)
 - session kind (`chat` vs `control`)
 
-`AuthManager` issues and verifies JWT session tokens. `SessionStore` owns TTL, cleanup, and expiry hooks.
+`AuthManager` issues and verifies JWT session tokens. `SessionStore` owns TTL, cleanup, and expiry hooks. Token verification, cleanup, the visible-session snapshot and turn admission all read the TTL through one predicate, `session_ttl_elapsed` (`SessionStore.ttl_elapsed` by session id): a session holding a turn that has not published its terminal event is live past its `expires_at`, because that turn's own tool calls authenticate with the session's token. A new turn is admitted only if the TTL has not elapsed at the moment it attaches, so an expired session cannot start one, even with a token accepted while the previous turn was still answering.
 
 This matters because approvals, code execution state, and loaded MCP servers are all session-scoped, not global.
 

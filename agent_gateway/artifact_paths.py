@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 from collections.abc import Mapping
+from contextlib import closing
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -49,6 +52,10 @@ _TICKER_RE = re.compile(r"^[A-Z]{1,6}$")
 _EXTENDED_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.]{0,14}$")
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
+ISSUE_INBOX_DB_ENV = "AGENT_ISSUE_INBOX_DB_PATH"
+_ISSUE_INBOX_STORE_DIRECTORY = ("gateway", "issue-inbox")
+_ISSUE_INBOX_DB_FILENAME = "issue-inbox.sqlite3"
+_ISSUE_INBOX_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
 
 log = logging.getLogger(__name__)
 
@@ -211,6 +218,167 @@ def user_data_dir(
   return state_root / "hank" / "data"
 
 
+def resolve_issue_inbox_db_path(
+  environ: Mapping[str, str] | None = None,
+) -> tuple[Path | None, dict[str, str] | None]:
+  """Locate the durable `log_issue` inbox inside the gateway state root.
+
+  The store keeps a directory of its own. SQLite creates the rollback
+  journal beside the database, so whoever writes the inbox needs write
+  access to its directory — and the contained autonomous child opens this
+  store in-process through the `log_issue` handler. The `gateway/` root it
+  sits under also holds the parent-only approval ledger, which the child is
+  never admitted to, so the child's containment grants this directory
+  rather than that root.
+  """
+  env = os.environ if environ is None else environ
+  explicit = str(env.get(ISSUE_INBOX_DB_ENV, "")).strip()
+  if explicit:
+    target = Path(explicit).expanduser()
+    source = ISSUE_INBOX_DB_ENV
+  else:
+    user_data = str(env.get("USER_DATA_DIR", "")).strip()
+    if not user_data:
+      return None, {
+        "code": "issue_sink_unavailable",
+        "message": (
+          f"Set {ISSUE_INBOX_DB_ENV} or USER_DATA_DIR to a persistent path "
+          "outside the immutable runtime."
+        ),
+      }
+    target = Path(user_data).expanduser().joinpath(
+      *_ISSUE_INBOX_STORE_DIRECTORY,
+      _ISSUE_INBOX_DB_FILENAME,
+    )
+    source = "USER_DATA_DIR"
+  if not target.is_absolute():
+    return None, {
+      "code": "issue_sink_invalid",
+      "message": f"{source} must resolve to an absolute issue-inbox path: {target}",
+    }
+  runtime_value = str(env.get("LOCAL_GATEWAY_RUNTIME_VERSION_ROOT", "")).strip()
+  if runtime_value:
+    runtime_root = Path(runtime_value).expanduser()
+    if runtime_root.is_absolute() and target.resolve().is_relative_to(runtime_root.resolve()):
+      return None, {
+        "code": "issue_sink_invalid",
+        "message": f"Issue inbox must be outside the immutable runtime: {target}",
+      }
+  parent = target.parent
+  try:
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+  except OSError as exc:
+    return None, {
+      "code": "issue_sink_unavailable",
+      "message": f"Issue-inbox directory is unusable: {parent}: {exc}",
+    }
+  if not os.access(parent, os.W_OK):
+    return None, {
+      "code": "issue_sink_unavailable",
+      "message": f"Issue-inbox parent directory is not writable: {parent}",
+    }
+  if source == "USER_DATA_DIR":
+    _adopt_legacy_issue_inbox_store(target)
+  return target, None
+
+
+def _adopt_legacy_issue_inbox_store(target: Path) -> None:
+  """Fold a pre-directory inbox file into the store, exactly once.
+
+  The derived default was `<state>/gateway/issue-inbox.sqlite3` before the
+  store took a directory of its own, and rows left there are undelivered
+  intake that nothing reads any more. When the new path is still empty,
+  adoption is a rename inside the same gateway state root: it keeps the
+  inode, so an open handle and the rollback journal beside it stay valid,
+  and it cannot half-copy. When a run already created the new store, the
+  legacy rows are folded into it by issue id instead — the id is the payload
+  digest, so an id already present is the same observation and its live
+  status/attempt counters win. Either way the legacy path is left behind
+  under a different name, so adoption runs once and cannot double-publish:
+  each row's delivery marker travels with the row.
+  """
+  legacy = target.parent.parent / target.name
+  if not legacy.is_file():
+    return
+  if not target.exists():
+    _rename_legacy_issue_inbox_store(legacy, target)
+    return
+  _merge_legacy_issue_inbox_store(legacy, target)
+
+
+def _rename_legacy_issue_inbox_store(legacy: Path, target: Path) -> None:
+  adopted = [legacy.name]
+  try:
+    os.replace(legacy, target)
+    for suffix in _ISSUE_INBOX_SIDECAR_SUFFIXES:
+      sidecar = legacy.with_name(legacy.name + suffix)
+      if sidecar.exists():
+        os.replace(sidecar, target.with_name(target.name + suffix))
+        adopted.append(sidecar.name)
+  except OSError as exc:
+    log.warning("Issue-inbox legacy store %s could not be adopted: %s", legacy, exc)
+    return
+  log.info(
+    "Issue-inbox adopted legacy store from %s into %s: %s",
+    legacy.parent,
+    target.parent,
+    ", ".join(adopted),
+  )
+
+
+def _merge_legacy_issue_inbox_store(legacy: Path, target: Path) -> None:
+  try:
+    imported = _import_issue_inbox_rows(legacy, target)
+  except (OSError, sqlite3.Error) as exc:
+    log.warning("Issue-inbox legacy store %s could not be imported: %s", legacy, exc)
+    return
+  stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+  retired = legacy.with_name(f"{legacy.name}.adopted-{stamp}")
+  try:
+    for suffix in _ISSUE_INBOX_SIDECAR_SUFFIXES:
+      sidecar = legacy.with_name(legacy.name + suffix)
+      if sidecar.exists():
+        os.replace(sidecar, retired.with_name(retired.name + suffix))
+    os.replace(legacy, retired)
+  except OSError as exc:
+    # The rows are in the new store; without the rename the next resolve
+    # re-imports them, which the id-keyed insert makes a no-op.
+    log.warning("Issue-inbox legacy store %s could not be retired: %s", legacy, exc)
+    return
+  log.info(
+    "Issue-inbox imported %d legacy row(s) from %s into %s; legacy store kept as %s",
+    imported,
+    legacy,
+    target,
+    retired.name,
+  )
+
+
+def _import_issue_inbox_rows(legacy: Path, target: Path) -> int:
+  with closing(sqlite3.connect(target, timeout=5.0)) as connection:
+    connection.execute("PRAGMA busy_timeout = 5000")
+    columns = [row[1] for row in connection.execute("PRAGMA table_info(issue_inbox)")]
+    if not columns:
+      return 0
+    connection.execute("ATTACH DATABASE ? AS legacy", (str(legacy),))
+    try:
+      legacy_columns = {
+        row[1] for row in connection.execute("PRAGMA legacy.table_info(issue_inbox)")
+      }
+      carried = [name for name in columns if name in legacy_columns]
+      if "issue_id" not in carried:
+        return 0
+      projection = ", ".join(f'"{name}"' for name in carried)
+      with connection:
+        cursor = connection.execute(
+          f"INSERT OR IGNORE INTO main.issue_inbox ({projection}) "
+          f"SELECT {projection} FROM legacy.issue_inbox"
+        )
+      return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+    finally:
+      connection.execute("DETACH DATABASE legacy")
+
+
 def _safe_json_children(directory: Path, workspace_root: Path) -> list[Path]:
   artifacts: list[Path] = []
   for path in sorted(directory.glob("*.json"), key=lambda child: child.name):
@@ -347,9 +515,11 @@ __all__ = [
   "artifact_json_paths_for_request",
   "artifact_json_path_for_request",
   "canonicalize_ticker",
+  "ISSUE_INBOX_DB_ENV",
   "letter_docx_path_for_request",
   "normalize_ticker_for_artifact_request",
   "reject_unsafe_path",
+  "resolve_issue_inbox_db_path",
   "ticker_artifact_paths_for_request",
   "user_data_dir",
   "user_workspace_root",

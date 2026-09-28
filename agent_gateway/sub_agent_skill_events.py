@@ -151,33 +151,38 @@ class SkillRunEventEmitter:
             )
         else:
           appended_entry = event_log.append(deepcopy(event))
-          if (
-            appended_entry is None
-            or not _exact_value_match(
+          if appended_entry is not None:
+            # Exactness only has teeth over an entry the stream really
+            # took. `EventLog.append` returns None once the stream stops
+            # accepting events (closed, or its prepare hook already
+            # failed): that marker is durable either way, and the live
+            # stream is a rendering surface, not the authority for it.
+            # Raising there turns a terminal stream into a finalizer
+            # error that discards the run's completed work.
+            if not _exact_value_match(
               event,
               getattr(appended_entry, "event", None),
-            )
-          ):
-            raise RuntimeError(
-              "Live named-skill lifecycle projection was not exact"
-            )
-          matches = [
-            entry.event
-            for entry in getattr(event_log, "entries", ())
+            ):
+              raise RuntimeError(
+                "Live named-skill lifecycle projection was not exact"
+              )
+            matches = [
+              entry.event
+              for entry in getattr(event_log, "entries", ())
+              if (
+                isinstance(getattr(entry, "event", None), dict)
+                and entry.event.get("type") == event["type"]
+                and entry.event.get("skill_run_id")
+                == self._lifecycle.skill_run_id
+              )
+            ]
             if (
-              isinstance(getattr(entry, "event", None), dict)
-              and entry.event.get("type") == event["type"]
-              and entry.event.get("skill_run_id")
-              == self._lifecycle.skill_run_id
-            )
-          ]
-          if (
-            len(matches) != 1
-            or not _exact_value_match(event, matches[0])
-          ):
-            raise RuntimeError(
-              "Live named-skill lifecycle projection was not exact"
-            )
+              len(matches) != 1
+              or not _exact_value_match(event, matches[0])
+            ):
+              raise RuntimeError(
+                "Live named-skill lifecycle projection was not exact"
+              )
       else:
         event_log.append(deepcopy(event))
     emit = getattr(self._tool_ctx, "emit", None)
@@ -268,11 +273,21 @@ class SkillRunEventEmitter:
     result: Any | None,
     error: dict[str, Any] | None,
   ) -> dict[str, Any]:
+    started_ts = (
+      self._started_event.get("ts")
+      if isinstance(self._started_event, dict)
+      else None
+    )
     return build_skill_result_captured_event(
       **self._lifecycle.identity_fields(),
       entries=self._event_log_entries(),
       result=result,
       error=error,
+      duration_s=(
+        max(0.0, round(self._time_fn() - float(started_ts), 3))
+        if isinstance(started_ts, (int, float))
+        else None
+      ),
     )
 
   def project_result_captured(self, event: dict[str, Any]) -> bool:

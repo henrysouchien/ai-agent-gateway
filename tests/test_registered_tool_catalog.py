@@ -644,7 +644,7 @@ def test_manager_allows_registered_idempotent_read_replay() -> None:
     )
 
   manager._call_tool_once = fail_once  # type: ignore[method-assign]
-  manager._retry_stdio_tool_call_after_reconnect = replay  # type: ignore[method-assign]
+  manager._retry_stdio_tool_call_after_reconnect = replay
   manager._translate_provider_symbol = (
     lambda *_args, **_kwargs: (_ for _ in ()).throw(
       AssertionError("registered calls must already be prepared")

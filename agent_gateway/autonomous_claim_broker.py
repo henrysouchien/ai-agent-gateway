@@ -35,6 +35,8 @@ AUTONOMOUS_CLAIM_BROKER_MAX_REQUESTS = 256
 AUTONOMOUS_CLAIM_BROKER_MAX_TTL_SECONDS = 600
 AUTONOMOUS_CLAIM_BROKER_IO_TIMEOUT_SECONDS = 5.0
 AUTONOMOUS_CLAIM_BROKER_MAX_IO_TIMEOUT_SECONDS = 60.0
+# A rejection frame crosses the socket, so the reason it carries is bounded.
+_REJECTION_REASON_MAX_CHARS = 500
 
 _CLAIM_FIELDS = frozenset({
   "AGENT_API_CLAIM_AUDIENCE",
@@ -52,6 +54,20 @@ _SIGNATURE_RE = re.compile(r"^[0-9a-f]{64}$")
 
 class AutonomousClaimBrokerError(RuntimeError):
   """The private autonomous signing channel failed closed."""
+
+
+def _rejection_reason(exc: BaseException) -> str:
+  reason = ": ".join(filter(None, (type(exc).__name__, str(exc))))
+  return reason[:_REJECTION_REASON_MAX_CHARS]
+
+
+def _raise_if_rejected(response: Mapping[str, Any]) -> None:
+  """Surface a broker rejection frame's code and reason to the child."""
+  if response.get("ok") is False:
+    raise AutonomousClaimBrokerError(
+      "autonomous claim broker rejected the request: "
+      f"{response.get('error')}: {response.get('reason')}"
+    )
 
 
 def _closed_object(
@@ -450,13 +466,14 @@ class AutonomousClaimBroker:
     ):
       self._thread.join()
 
-  def _reject(self, code: str) -> None:
+  def _reject(self, code: str, reason: str) -> None:
     try:
       _send_frame(
         self._server_socket,
         {
           "error": code,
           "ok": False,
+          "reason": reason,
           "version": AUTONOMOUS_CLAIM_BROKER_PROTOCOL_VERSION,
         },
         deadline=_io_deadline(self._io_timeout_seconds),
@@ -587,11 +604,18 @@ class AutonomousClaimBroker:
           deadline=_io_deadline(self._io_timeout_seconds),
         )
         request_count += 1
-      self._reject("request_limit_exhausted")
-    except (AutonomousClaimBrokerError, LaunchNonceStoreError):
-      self._reject("broker_rejected_request")
-    except (OSError, ValueError):
-      self._reject("broker_failure")
+      self._reject(
+        "request_limit_exhausted",
+        f"autonomous claim broker served its {self._max_requests} requests",
+      )
+    except AutonomousClaimBrokerError as exc:
+      self._reject("broker_rejected_request", _rejection_reason(exc))
+    except LaunchNonceStoreError as exc:
+      # The store mints its own refusal code; a store outage stays distinct
+      # from a broker-policy rejection.
+      self._reject(exc.code, _rejection_reason(exc))
+    except (OSError, ValueError) as exc:
+      self._reject("broker_failure", _rejection_reason(exc))
     finally:
       self.close()
 
@@ -668,6 +692,7 @@ class AutonomousClaimSigner:
         broker_socket,
         deadline=deadline,
       )
+      _raise_if_rejected(response)
       _exact_fields(
         response,
         frozenset({
@@ -799,6 +824,11 @@ class AutonomousClaimSigner:
         raise AutonomousClaimBrokerError(
           "autonomous claim broker signing failed"
         ) from exc
+    try:
+      _raise_if_rejected(response)
+    except AutonomousClaimBrokerError:
+      self.close()
+      raise
     try:
       _exact_fields(
         response,

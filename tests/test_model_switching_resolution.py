@@ -19,6 +19,7 @@ from agent_gateway.model_registry import (
 )
 from agent_gateway.providers import ModelInfo, ModelProvider
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
+from gateway_test_support.model_defaults import SESSION_DRIVER
 
 
 class _ExactProvider(ModelProvider):
@@ -199,8 +200,8 @@ def test_server_omission_uses_registry_default_complete_binding() -> None:
     response = _run(client, token, {})
 
   assert response.status_code == 200
-  assert calls[0]["model_key"] == "anthropic.claude-opus-5"
-  assert calls[0]["upstream_model"] == "claude-opus-5"
+  assert calls[0]["model_key"] == SESSION_DRIVER.model_key
+  assert calls[0]["upstream_model"] == SESSION_DRIVER.upstream_model
   assert calls[0]["selection_source"] == "capability_default"
 
 

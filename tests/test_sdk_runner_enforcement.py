@@ -646,12 +646,13 @@ def test_sdk_registered_plan_hands_one_durable_payload_to_same_authorized_ref(
   )
 
 
-def test_sdk_post_tool_use_replaces_model_output_with_sanitized_projection() -> None:
-  secret = "CUSTOM-ACTIVE-CREDENTIAL-CODEX-SDK-8f21d7"
-  runner = _make_runner(api_key=secret)
+def test_sdk_post_tool_use_does_not_reproject_a_settled_result() -> None:
+  # The result belongs to the tool that produced it; the hook only rewrites the
+  # model's copy for the gateway's own signals, never to re-scan a payload.
+  runner = _make_runner(api_key="CUSTOM-ACTIVE-CREDENTIAL-CODEX-SDK-8f21d7")
   _seed_tool_call(
     runner,
-    "tool-secret",
+    "tool-plain",
     "lookup",
     {"query": "ordinary"},
   )
@@ -661,16 +662,14 @@ def test_sdk_post_tool_use_replaces_model_output_with_sanitized_projection() -> 
       {
         "tool_name": "lookup",
         "tool_input": {"query": "ordinary"},
-        "result": json.dumps({"status": "ok", "credential": secret}),
+        "result": json.dumps({"status": "ok", "answer": 42}),
       },
-      "tool-secret",
+      "tool-plain",
       None,
     )
   )
 
-  serialized = json.dumps(hook_result)
-  assert secret not in serialized
-  assert "<redacted-secret>" in serialized
+  assert hook_result == {}
 
 
 def test_sdk_post_tool_failure_blocks_raw_secret_from_model_continuation() -> None:

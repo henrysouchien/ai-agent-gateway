@@ -15,6 +15,11 @@ from agent_gateway.approvals import (
   _record_vote_and_unblock,
 )
 from agent_gateway.approval_store import SQLiteApprovalStore
+from agent_gateway.approval_preferences import (
+  ApprovalPreferenceStore,
+  StandingApprovalPreference,
+  admit_approval_preference,
+)
 from agent_gateway.autonomous_runner import AutonomousRegistry, AutonomousTask
 from agent_gateway.batch_approval_projection import (
   ApprovalProjection,
@@ -46,6 +51,10 @@ class ControlApprovalDecisionRequest(BaseModel):
   reason: str | None = None
 
 
+class ControlApprovalPreferenceRequest(BaseModel):
+  preference: str
+
+
 def _require_bearer_session(request: Request, auth: AuthManager) -> GatewaySession:
   token = AuthManager.get_bearer_token(request.headers.get("Authorization"))
   return auth.verify_token(token)
@@ -58,6 +67,22 @@ def _require_control_session(session: GatewaySession) -> None:
 
 def _json_error(status_code: int, message: str) -> JSONResponse:
   return JSONResponse({"error": message}, status_code=status_code)
+
+
+def _require_preference_store(request: Request) -> ApprovalPreferenceStore:
+  store = getattr(request.app.state, "gateway_approval_preference_store", None)
+  if store is None:
+    raise HTTPException(status_code=503, detail="Approval subsystem unavailable")
+  return store
+
+
+def _preference_payload(preference: StandingApprovalPreference) -> dict[str, Any]:
+  return {
+    "user_id": preference.user_id,
+    "preference": preference.preference,
+    "updated_at": preference.updated_at,
+    "source": preference.source,
+  }
 
 
 def _target_chat_session_for_user(
@@ -453,6 +478,42 @@ def build_approvals_router(
     if store is None and not approvals:
       return _json_error(503, "Approval subsystem unavailable")
     return JSONResponse({"approvals": approvals})
+
+  @router.get("/approvals/preference")
+  async def get_approval_preference(request: Request) -> JSONResponse:
+    authenticated = _require_bearer_session(request, auth)
+    _require_control_session(authenticated)
+    store = _require_preference_store(request)
+    return JSONResponse(
+      {
+        "preference": _preference_payload(
+          store.get(user_id=_session_owner_user_id(authenticated))
+        )
+      }
+    )
+
+  @router.put("/approvals/preference")
+  async def set_approval_preference(
+    request: Request,
+    payload: ControlApprovalPreferenceRequest,
+  ) -> JSONResponse:
+    authenticated = _require_bearer_session(request, auth)
+    _require_control_session(authenticated)
+    store = _require_preference_store(request)
+    try:
+      preference = admit_approval_preference(payload.preference)
+    except ValueError as exc:
+      return _json_error(400, str(exc))
+    return JSONResponse(
+      {
+        "preference": _preference_payload(
+          store.put(
+            user_id=_session_owner_user_id(authenticated),
+            preference=preference,
+          )
+        )
+      }
+    )
 
   @router.post("/runs/{run_id}/approvals/{approval_id}/notifications/retry")
   async def retry_approval_notification(request: Request, run_id: str, approval_id: str) -> JSONResponse:

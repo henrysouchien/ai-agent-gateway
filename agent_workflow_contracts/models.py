@@ -786,11 +786,9 @@ class AgentExecutionSnapshot(WireModel):
   persisted_methodology_state: JsonValue | None
   result_instructions: NonEmptyText
   max_turns: int | None = Field(default=None, ge=1, le=100)
-  timeout_seconds: float | None = Field(
-    default=None,
-    gt=0,
-    allow_inf_nan=False,
-  )
+  # No reader since 2026-09-28 (the child wall clock was removed); kept only
+  # because admitted tasks are persisted under a forbid-extras contract.
+  timeout_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
   client_timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
   max_tokens: int = Field(ge=1, le=256_000)
   cost_observation_threshold_usd: float | None = Field(

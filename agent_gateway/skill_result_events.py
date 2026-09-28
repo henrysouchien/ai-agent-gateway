@@ -28,7 +28,6 @@ def build_skill_result_captured_event(
   result: Any | None,
   error: dict[str, Any] | None,
   output_memory_file: str | None = None,
-  cost_usd: float | None = None,
   duration_s: float | None = None,
   canonical_result_evidence_authoritative: bool = False,
 ) -> dict[str, Any]:
@@ -63,7 +62,11 @@ def build_skill_result_captured_event(
     declared_terminal_doors=door_names,
     door_results=fms_results,
   )
-  raw_status = primary_fms.get("status") if isinstance(primary_fms, dict) else None
+  primary_door_status = (
+    str(primary_fms.get("status")).strip().lower()
+    if isinstance(primary_fms, dict) and primary_fms.get("status") is not None
+    else None
+  )
   has_error = not classification.succeeded
   outcome = "error" if has_error else "success"
   event = {
@@ -71,11 +74,13 @@ def build_skill_result_captured_event(
     **lifecycle.identity_fields(),
     "exit_code": 1 if has_error else 0,
     "outcome": outcome,
-    "status": (
-      str(raw_status)
-      if raw_status is not None
-      else classification.outcome
-    ),
+    # The child's status is the child's own disposition, from the same owner
+    # as exit_code (``classify_child_outcome``, which already fails the run
+    # when its declared terminal door failed). Reading it off the last FMS
+    # envelope instead paired a failure status with exit code 0 whenever a
+    # non-terminal door reported one, which the lifecycle contract rejects.
+    # Door statuses stay visible inside ``fms_results``.
+    "status": classification.outcome,
     "gate_code": _gate_code(primary_fms),
     "artifact_refs": _artifact_refs(fms_results, artifact_events),
     "proposal_ids": _proposal_ids(fms_results),
@@ -83,13 +88,13 @@ def build_skill_result_captured_event(
     "fms_results": fms_results,
     "artifact_events": artifact_events,
     "output_memory_file": output_memory_file,
-    "cost_usd": cost_usd,
+    "cost_usd": _canonical_task_result_cost_usd(result),
     "duration_s": duration_s,
     "compaction_count": _compaction_count(entry_list),
     "error": _result_error(
       classification.error,
       fms_results,
-      fallback_status=(str(raw_status).strip().lower() if has_error and raw_status else None),
+      fallback_status=primary_door_status if has_error else None,
     ),
     "warnings": _warnings(result, fms_results),
     "approval_outcome": None,
@@ -97,6 +102,23 @@ def build_skill_result_captured_event(
     "approval_tool_name": None,
   }
   return lifecycle.normalize_result_event(event)
+
+
+def _canonical_task_result_cost_usd(result: Any | None) -> float | None:
+  """Read the run's spend off the canonical result that reports it.
+
+  No caller ever passed a cost here, so every ``skill_result_captured`` said
+  ``cost_usd: null`` — including the ones a parent had to judge a terminated
+  child by (R2, 2026-09-17). The child settlement already carries exact
+  provider-reported spend in ``observation.usage``; read it there instead of
+  waiting for a caller to hand it over.
+  """
+
+  try:
+    task_result = TaskResult.model_validate(result)
+  except ValidationError:
+    return None
+  return task_result.observation.usage.cost_usd
 
 
 def _canonical_task_result_evidence(

@@ -106,7 +106,24 @@ def _read_universal_binary_line(handle: Any) -> bytes:
       return bytes(line)
 
 
-def _read_pinned_skill_source(path: Path) -> str | None:
+class _SkillWithheldFromListing(Exception):
+  """The listing read stopped at a skill the directory does not advertise."""
+
+
+def _read_pinned_skill_source(
+  path: Path,
+  *,
+  advertised_only: bool,
+) -> str:
+  """Read one pinned skill source.
+
+  ``advertised_only`` is the listing's read: a skill the directory withholds
+  from the catalog stops at its frontmatter and its body is never bulk-read.
+  Resolution reads every skill, advertised or not — the control plane asks
+  this adapter whether a named skill may be launched, and a skill it refused
+  to read would be dispatched unjudged.
+  """
+
   before = path.lstat()
   if not stat.S_ISREG(before.st_mode):
     raise ValueError("skill source must be a regular file")
@@ -130,8 +147,8 @@ def _read_pinned_skill_source(path: Path) -> str | None:
         if _is_frontmatter_delimiter(line):
           break
       frontmatter_source = _decode_skill_source(b"".join(captured))
-      if not _is_catalog_visible(frontmatter_source):
-        return None
+      if advertised_only and not _is_catalog_visible(frontmatter_source):
+        raise _SkillWithheldFromListing
     captured.append(handle.read())
     return _decode_skill_source(b"".join(captured))
 
@@ -258,6 +275,7 @@ def _project_summary(
   profile: SkillProfile,
   *,
   metadata: Mapping[str, Any],
+  advertised: bool,
   path: Path,
 ) -> ControlSkillSummary:
   name = profile.name
@@ -305,7 +323,7 @@ def _project_summary(
     max_budget_usd=profile.max_budget_usd,
     persist_state=profile.persist_state,
     typed_contract=_clean_text(metadata.get("typed_contract")),
-    catalog=True,
+    catalog=advertised,
     profiles=_text_list(
       semantic.get("allowed_profiles"),
       field_name="semantic allowed_profiles",
@@ -399,8 +417,12 @@ class DirectoryControlSkillCatalog:
         contained_path = _contained_skill_path(self._root, path)
         if contained_path is None or not contained_path.is_file():
           continue
-        source = _read_pinned_skill_source(contained_path)
-        if source is None:
+        try:
+          source = _read_pinned_skill_source(
+            contained_path,
+            advertised_only=True,
+          )
+        except _SkillWithheldFromListing:
           continue
         profile = SkillLoader(self._root).load_source(
           source,
@@ -410,6 +432,7 @@ class DirectoryControlSkillCatalog:
         projected.append(_project_summary(
           profile,
           metadata=metadata,
+          advertised=True,
           path=path,
         ))
       except Exception as exc:
@@ -447,12 +470,10 @@ class DirectoryControlSkillCatalog:
         selector=selector,
       ) from exc
     try:
-      source = _read_pinned_skill_source(contained_path)
-      if source is None:
-        raise ControlSkillUnavailableError(
-          code="unknown",
-          selector=selector,
-        ) from None
+      source = _read_pinned_skill_source(
+        contained_path,
+        advertised_only=False,
+      )
       profile = SkillLoader(self._root).load_source(
         source,
         path=contained_path,
@@ -461,6 +482,7 @@ class DirectoryControlSkillCatalog:
       summary = _project_summary(
         profile,
         metadata=metadata,
+        advertised=_is_catalog_visible(source),
         path=path,
       )
       body = resolve_blocks(profile.system_prompt, self._root / "_blocks")

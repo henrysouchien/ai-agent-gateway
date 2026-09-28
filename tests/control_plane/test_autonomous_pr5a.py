@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import httpx
+import httpx2
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -151,6 +152,70 @@ Run the resumable test skill.
 """,
     encoding="utf-8",
   )
+
+
+def test_dispatch_refuses_a_skill_the_catalog_cannot_launch(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  """The launch question is answered before a run id is charged.
+
+  A skill whose catalog entry says it cannot be launched (here: the
+  dev-mode-authority class) was accepted, given a run id, launched, and
+  reported back as the anonymous `autonomous_process_failed`; the reason
+  reached only the child log.
+  """
+  processes, _envs = _install_fake_spawn(monkeypatch)
+  skills_dir = tmp_path / "skills"
+  _write_resumable_skill(skills_dir)
+  (skills_dir / "dev-only-skill.md").write_text(
+    (skills_dir / "resumable-skill.md")
+    .read_text(encoding="utf-8")
+    .replace("resumable-skill", "dev-only-skill")
+    .replace("catalog: false", "catalog: true")
+    .replace(
+      "description: Resumable test skill",
+      "description: Dev-only test skill\n"
+      "blocked_reason: Skill 'dev-only-skill' requires trusted autonomous "
+      "dev-mode authority and cannot be launched by the control plane.",
+    ),
+    encoding="utf-8",
+  )
+  app = _make_app(monkeypatch, tmp_path, control_skills_dir=skills_dir)
+
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client, "alice"))
+    refused = client.post(
+      "/api/control/runs",
+      headers=headers,
+      json={
+        "kind": "autonomous",
+        "profile": "analyst",
+        "mode": "skill",
+        "skill": "dev-only-skill",
+      },
+    )
+    launched = client.post(
+      "/api/control/runs",
+      headers=headers,
+      json={
+        "kind": "autonomous",
+        "profile": "analyst",
+        "mode": "skill",
+        "skill": "resumable-skill",
+      },
+    )
+
+  assert refused.status_code == 422, refused.text
+  assert refused.json()["detail"] == (
+    "Skill 'dev-only-skill' requires trusted autonomous dev-mode authority "
+    "and cannot be launched by the control plane."
+  )
+  assert launched.status_code == 200, launched.text
+  assert [task.skill for task in app.state.subprocess_registry._tasks.values()] == [
+    "resumable-skill"
+  ]
+  assert len(processes) == 1
 
 
 
@@ -1470,7 +1535,7 @@ def test_autonomous_state_maps_budget_aliases_to_budget_limited() -> None:
 def _interrupted_terminal_detail(
   monkeypatch,
   tmp_path,
-) -> httpx.Response:
+) -> httpx2.Response:
   skills_dir = tmp_path / "skills"
   _write_resumable_skill(skills_dir)
   _write_rehydrate_manifest(

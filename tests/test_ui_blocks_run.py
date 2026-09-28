@@ -31,7 +31,7 @@ from agent_gateway.server_models import (
   ChatTurnInputs,
   UiBlocksContractPin,
 )
-from agent_gateway.session import AuthManager, GatewaySession
+from agent_gateway.session import AuthManager, GatewaySession, SessionStream
 from agent_gateway.tool_dispatcher import ToolDispatcher
 from agent_gateway.ui_blocks_run import UiBlocksRunContext, UiBlocksRunRegistry
 
@@ -551,7 +551,7 @@ def test_pin_and_run_object_survive_full_gateway_dispatch_chain(tmp_path) -> Non
     await _dispatch_chat_turn(
       _session(),
       inputs,
-      event_log=EventLog(),
+      turn=SessionStream(event_log=EventLog(), runner_task=None),
       on_event=_no_event,
       build_chat_runtime=build_chat_runtime,
       transcript_dir=tmp_path,
@@ -618,7 +618,7 @@ def test_unpinned_dispatch_has_none_capability_and_turn_keys_are_per_dispatch(tm
           metadata={},
           model_key=None,
         ),
-        event_log=EventLog(),
+        turn=SessionStream(event_log=EventLog(), runner_task=None),
         on_event=_no_event,
         build_chat_runtime=build_chat_runtime,
         transcript_dir=tmp_path,
@@ -704,7 +704,7 @@ def test_turn_key_and_registry_survive_stream_retry_event(tmp_path) -> None:
         metadata={},
         model_key=None,
       ),
-      event_log=EventLog(),
+      turn=SessionStream(event_log=EventLog(), runner_task=None),
       on_event=_no_event,
       build_chat_runtime=build_chat_runtime,
       transcript_dir=tmp_path,

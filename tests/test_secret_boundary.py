@@ -18,6 +18,7 @@ from agent_gateway.providers.base import ModelInfo  # noqa: E402
 from agent_gateway.secret_boundary import (  # noqa: E402
   REDACTED_SECRET,
   SANITIZATION_FAILED,
+  UNSUPPORTED_VALUE,
   SecretBoundary,
   sanitize_boundary_value,
   sanitize_tool_event,
@@ -123,27 +124,40 @@ def test_high_confidence_material_is_removed_without_scanning_prose_or_key_names
   assert sanitized["secret_value"] == REDACTED_SECRET
 
 
-def test_typed_event_policy_leaves_ordinary_chat_prose_and_sanitizes_tool_blocks() -> None:
+def test_typed_event_policy_projects_authored_text_and_leaves_results_alone() -> None:
   canary = "sk-ant-api03-CODEX-WAVE0-CANARY-DO-NOT-USE-8f21d7"
   ordinary = {
     "type": "user_message",
     "content": "Discuss paths and api_key examples without treating prose as authority.",
   }
-  tool_message = {
+  authored = {
+    "type": "assistant_message",
+    "content_blocks": [
+      {
+        "type": "tool_use",
+        "id": "tool-1",
+        "name": "run_bash",
+        "input": {"command": f"curl -H 'x-key: {canary}' https://example.test"},
+      }
+    ],
+  }
+  returned = {
     "type": "user_message",
     "content": [
       {
         "type": "tool_result",
         "tool_use_id": "tool-1",
-        "content": json.dumps({"credential": canary}),
+        "content": json.dumps({"stdout": "ok"}),
       }
     ],
   }
 
   assert sanitize_tool_event(ordinary, sink="replay") == ordinary
-  serialized = json.dumps(sanitize_tool_event(tool_message, sink="replay"))
-  assert canary not in serialized
-  assert REDACTED_SECRET in serialized
+  projected = sanitize_tool_event(authored, sink="replay")
+  assert canary not in json.dumps(projected)
+  assert REDACTED_SECRET in json.dumps(projected)
+  # A returned payload is projected by the tool that produced it, not again here.
+  assert sanitize_tool_event(returned, sink="replay") == returned
 
 
 def test_sanitizer_failure_returns_fixed_tombstone(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -158,10 +172,11 @@ def test_sanitizer_failure_returns_fixed_tombstone(monkeypatch: pytest.MonkeyPat
   ) == SANITIZATION_FAILED
 
 
-def test_oversized_financial_lineage_stops_after_one_failed_projection(
+def test_settled_tool_result_crosses_the_boundary_unprojected(
   caplog: pytest.LogCaptureFixture,
 ) -> None:
-  # fetch_financials emitted 42,606 value records in the buyer live cohort.
+  # fetch_financials emitted 42,606 value records in the buyer live cohort, and
+  # walking them blanked the whole result. Nothing walks a settled result now.
   value = {
     "result_key": "income",
     "row_index": 0,
@@ -178,109 +193,62 @@ def test_oversized_financial_lineage_stops_after_one_failed_projection(
       "lineage_descriptor": {"values": [dict(value) for _ in range(42_606)]},
       "hint": "Financial data is available by reference.",
     },
+    "error": None,
+    "dispatch": {"outcome": "ok", "sources": []},
   }
 
   projected = sanitize_tool_event(event, sink="tool_complete")
 
-  failures = [
+  assert projected == event
+  assert projected["result"] is event["result"]
+  assert not [
     record for record in caplog.records
     if record.name == "agent_gateway.secret_boundary"
   ]
-  assert len(failures) == 1
-  assert failures[0].data["reason"] == "node_limit"
-  assert projected["result"] == SANITIZATION_FAILED
-  assert projected["tool_name"] == "fetch_financials"
-  caplog.clear()
-  assert sanitize_tool_event(projected, sink="session_log") == projected
-  assert not caplog.records
-  assert event["result"]["lineage_descriptor"]["values"][-1] == value
 
 
-@pytest.mark.parametrize("limit", ["depth", "nodes"])
-def test_resource_limited_arguments_preserve_completed_results(limit: str) -> None:
-  value: object = "ordinary"
-  if limit == "depth":
-    for _ in range(33):
-      value = {"nested": value}
-  else:
-    value = ["ordinary"] * 100_000
+def test_over_deep_model_input_drops_only_the_unreadable_subtree() -> None:
+  deep: object = "ordinary"
+  for _ in range(33):
+    deep = {"nested": deep}
   assistant = sanitize_tool_event(
     {
       "type": "assistant_message",
       "content_blocks": [
-        {"type": "tool_use", "id": "tool-lookup", "name": "lookup", "input": {"value": value}},
-        {"type": "tool_use", "id": "tool-other", "name": "lookup", "input": {}},
+        {
+          "type": "tool_use",
+          "id": "tool-lookup",
+          "name": "lookup",
+          "input": {"value": deep, "flag": "keep", "rows": ["ordinary"] * 100_000},
+        },
       ],
     },
     sink="model_history",
   )
-  results = [
-    {"type": "tool_result", "tool_use_id": "tool-lookup", "content": '{"answer": 42}'},
-    {"type": "tool_result", "tool_use_id": "tool-other", "content": '{"answer": 7}'},
-  ]
 
-  normalized = AnthropicProvider().normalize_messages(
-    [
-      {"role": "assistant", "content": assistant["content_blocks"]},
-      {"role": "user", "content": results},
-    ],
-    ModelInfo(id="test-model", provider="anthropic"),
-  )
-
-  assert normalized[-1]["content"] == results
+  projected_input = assistant["content_blocks"][0]["input"]
   assert assistant["content_blocks"][0]["name"] == "lookup"
-  assert assistant["content_blocks"][0]["input"] == {"_boundary_error": SANITIZATION_FAILED}
+  assert projected_input["flag"] == "keep"
+  # Breadth is not a budget any more; only unreadable depth is dropped, and the
+  # call keeps the shape the model wrote around it.
+  assert projected_input["rows"] == ["ordinary"] * 100_000
+  assert UNSUPPORTED_VALUE in json.dumps(projected_input["value"])
 
 
-def test_depth_limit_tombstones_a_typed_block_with_one_failure(
-  caplog: pytest.LogCaptureFixture,
-) -> None:
-  value = {"content": "ordinary"}
-  for _ in range(33):
-    value = {"nested": value}
-  event = {
-    "type": "user_message",
-    "content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": value}],
-  }
-  boundary = SecretBoundary()
-
-  projected = sanitize_tool_event(event, sink="model", boundary=boundary)
-
-  assert projected["content"][0]["tool_use_id"] == "tool-1"
-  assert projected["content"][0]["content"] == SANITIZATION_FAILED
-  assert projected["content"][0]["is_error"] is True
-
-  failures = [
-    record for record in caplog.records
-    if record.name == "agent_gateway.secret_boundary"
-  ]
-  assert len(failures) == 1
-  assert failures[0].data["reason"] == "depth_limit"
-  assert boundary.sanitize({"content": "ordinary"}, sink="model") == {
-    "content": "ordinary",
-  }
-
-
-def test_resource_limited_durable_result_keeps_replay_identity() -> None:
+def test_replayed_tool_result_blocks_keep_their_call_identity() -> None:
   from agent_gateway.transcript import _tool_result_blocks_from_event
 
-  secret = "CUSTOM-ACTIVE-CREDENTIAL-RESULT-8f21d7"
-  value: object = secret
-  for _ in range(33):
-    value = {"nested": value}
   event = {
     "type": "tool_call_complete",
     "tool_call_id": "tool-lookup",
     "tool_name": "lookup",
     "result": {"answer": 42},
     "final_tool_result_blocks": [
-      {"type": "tool_result", "tool_use_id": "tool-lookup", "tool_name": secret, "content": value},
-      {"type": "text", "text": secret},
+      {"type": "tool_result", "tool_use_id": "tool-lookup", "content": '{"answer": 42}'},
+      {"type": "text", "text": "cited [S1]"},
     ],
   }
-  projected = sanitize_tool_event(
-    event, sink="durable_event", boundary=SecretBoundary((secret,)),
-  )
+  projected = sanitize_tool_event(event, sink="durable_event", boundary=SecretBoundary())
   replay = _tool_result_blocks_from_event(projected)
   normalized = AnthropicProvider().normalize_messages(
     [
@@ -294,18 +262,12 @@ def test_resource_limited_durable_result_keeps_replay_identity() -> None:
 
   assert projected["tool_call_id"] == "tool-lookup"
   assert normalized[-1]["content"] == [
-    {
-      "type": "tool_result",
-      "tool_use_id": "tool-lookup",
-      "content": SANITIZATION_FAILED,
-      "is_error": True,
-    },
-    {"type": "text", "text": REDACTED_SECRET},
+    {"type": "tool_result", "tool_use_id": "tool-lookup", "content": '{"answer": 42}'},
+    {"type": "text", "text": "cited [S1]"},
   ]
-  assert secret not in json.dumps(projected)
 
 
-def test_typed_tool_block_failure_is_structurally_valid(
+def test_typed_tool_call_failure_is_structurally_valid(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   secret = "CUSTOM-ACTIVE-CREDENTIAL-TYPED-FAILURE-8f21d7"
@@ -326,26 +288,17 @@ def test_typed_tool_block_failure_is_structurally_valid(
           "name": secret,
           "input": {"credential": secret},
         },
-        {
-          "type": "tool_result",
-          "tool_use_id": secret,
-          "content": secret,
-        },
       ],
     },
     sink="model_history",
     boundary=boundary,
   )
 
-  call, result = projected["content_blocks"]
+  (call,) = projected["content_blocks"]
   assert call["type"] == "tool_use"
   assert isinstance(call["id"], str) and call["id"]
   assert isinstance(call["name"], str) and call["name"]
   assert isinstance(call["input"], dict)
-  assert result["type"] == "tool_result"
-  assert result["tool_use_id"] == call["id"]
-  assert result["content"] == SANITIZATION_FAILED
-  assert result["is_error"] is True
   assert secret not in json.dumps(projected)
 
 

@@ -217,7 +217,7 @@ If you use an `npx`-based MCP server, install Node.js first and verify the comma
 
 ### Code execution does not use Docker
 
-That is expected when Docker is unavailable or the configured image is missing. The gateway prefers Docker and falls back to subprocess execution if subprocess support is enabled.
+That is expected when Docker is unavailable or the configured image is missing. The gateway prefers Docker and falls back to subprocess execution if subprocess support is enabled. The result says which ran and why (`backend`, `sandboxed`, `skipped_backends[].reason`), and the gateway log carries a `WARNING` naming the skipped backend and its reason, e.g. `No such image`.
 
 ### Session init fails with 401
 

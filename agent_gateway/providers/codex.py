@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import replace
-from typing import Any, AsyncIterator
+from typing import Any, AsyncGenerator
 from weakref import WeakKeyDictionary
 
 import httpx
@@ -393,7 +393,7 @@ class CodexProvider(ModelProvider):
 
     return truncate_to_last_compaction(result, compaction_as_text=True)
 
-  async def stream(self, client: Any, params: dict[str, Any]) -> AsyncIterator[StreamEvent]:
+  async def stream(self, client: Any, params: dict[str, Any]) -> AsyncGenerator[StreamEvent, None]:
     if not isinstance(client, httpx.AsyncClient):
       raise RuntimeError("CodexProvider requires an httpx.AsyncClient")
 

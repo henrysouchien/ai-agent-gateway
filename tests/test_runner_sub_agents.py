@@ -1,4 +1,5 @@
 import asyncio
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -14,6 +15,7 @@ from agent_gateway.capability_execution import BoundCapabilityExecution
 from agent_gateway.event_log import EventLog
 from agent_gateway.session import GatewaySession
 from agent_gateway.providers import ModelInfo, ModelProvider
+from agent_gateway.providers.base import StreamEvent
 from agent_gateway.runner_budget import (
   ChildCostAccumulator,
   ObservationOnlyCostAccumulator,
@@ -21,6 +23,8 @@ from agent_gateway.runner_budget import (
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.multi_user.billing import _UsageAggregator
 import agent_gateway.runner as gateway_runner
+import agent_gateway.runner_sub_agents as runner_sub_agents
+import agent_gateway.runner_stream_turn as runner_stream_turn
 from agent_gateway.runner_sub_agents import RunnerSubAgentMixin
 from agent_gateway.sub_agent_result_evidence import SubAgentResultEvidence
 from agent_gateway.task_registry import TaskEntry
@@ -278,14 +282,13 @@ class _SessionLog(AgentSessionLog):
     })], None
 
 
-def _parent(tmp_path: Path, *, session_log: _SessionLog | None) -> AgentRunner:
+def _parent(tmp_path: Path, *, session_log: _SessionLog | AgentSessionLog | None) -> AgentRunner:
   runner = object.__new__(AgentRunner)
   runner._sub_agent_config = None
   runner._provider = _ParentProvider()
   runner._auth_config = {"api_key": "parent"}
   runner._full_session_id = "parent-session"
   runner._log = EventLog()
-  runner._per_turn_timeout = 11.0
   runner._stream_stall_timeout = 12.0
   runner._mcp_client = None
   runner._mcp_activation_fold = McpActivationFold()
@@ -335,7 +338,6 @@ def _spawn(parent: AgentRunner, **overrides: Any):
     "result_provenance": _PROVENANCE,
     "dispatcher": _Dispatcher(),
     "max_turns": 4,
-    "timeout": None,
   }
   kwargs.update(overrides)
   return asyncio.run(parent.spawn_sub_agent("research this", **kwargs))
@@ -354,7 +356,6 @@ def _resume(parent: AgentRunner, **overrides: Any):
     "result_provenance": _PROVENANCE,
     "dispatcher": _Dispatcher(),
     "max_turns": 4,
-    "timeout": None,
   }
   kwargs.update(overrides)
   return asyncio.run(parent.resume_sub_agent(**kwargs))
@@ -543,6 +544,189 @@ def test_spawn_sub_agent_uses_exact_child_skill_run_identity(
   assert error is None
   assert isinstance(result, TaskResult)
   assert _ChildRunner.instances[0].kwargs["skill_run_id"] == "child-skill-run"
+
+
+class _WedgedChildRunner(_ChildRunner):
+  """A child whose inner await never resolves and that emits nothing."""
+
+  cancelled = False
+
+  async def run(self, **kwargs: object) -> None:
+    self.run_kwargs = kwargs
+    try:
+      await asyncio.Event().wait()
+    except asyncio.CancelledError:
+      self.cancelled = True
+      raise
+
+
+class _HeartbeatOnlyChildRunner(_ChildRunner):
+  """A live child whose only events, past the gap, are stream heartbeats."""
+
+  cancelled = False
+
+  async def run(self, **kwargs: object) -> None:
+    try:
+      for _ in range(10):
+        await asyncio.sleep(0.02)
+        self.kwargs["event_log"].append({
+          "type": "heartbeat",
+          "elapsed_s": 0,
+          "last_progress_s": 0,
+          "events": 1,
+        })
+    except asyncio.CancelledError:
+      self.cancelled = True
+      raise
+    await super().run(**kwargs)
+
+
+class _ToolInFlightChildRunner(_ChildRunner):
+  """A child silent past the gap while one of its tool calls is running."""
+
+  cancelled = False
+
+  async def run(self, **kwargs: object) -> None:
+    event_log = self.kwargs["event_log"]
+    event_log.append({
+      "type": "tool_call_start",
+      "tool_call_id": "call-1",
+      "tool_name": "web_search",
+      "tool_input": {"query": "filings"},
+    })
+    try:
+      await asyncio.sleep(0.2)
+    except asyncio.CancelledError:
+      self.cancelled = True
+      raise
+    event_log.append({
+      "type": "tool_call_complete",
+      "tool_call_id": "call-1",
+      "tool_name": "web_search",
+      "result": {"results": []},
+    })
+    await super().run(**kwargs)
+
+
+@pytest.fixture
+def _short_activity_gap(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(runner_sub_agents, "SUB_AGENT_ACTIVITY_GAP", 0.05)
+  monkeypatch.setattr(runner_sub_agents, "STREAM_GUARD_POLL_INTERVAL", 0.01)
+
+
+@pytest.mark.usefixtures("_short_activity_gap")
+def test_wedged_child_is_cancelled_by_the_activity_guard(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  _ChildRunner.instances.clear()
+  parent = _parent(tmp_path, session_log=_SessionLog("never reached"))
+  monkeypatch.setattr(gateway_runner, "AgentRunner", _WedgedChildRunner)
+  monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)
+
+  result, error = _spawn(parent)
+
+  child = _ChildRunner.instances[-1]
+  assert isinstance(child, _WedgedChildRunner)
+  assert child.cancelled is True
+  assert child.closed is True
+  assert error is None
+  assert result is not None
+  assert result.execution.status == "interrupted"
+  assert result.execution.terminal_reason is not None
+  assert result.execution.terminal_reason.startswith(
+    "stalled: Sub-agent stalled: no activity for"
+  )
+  errors = [
+    entry.event
+    for entry in child.kwargs["event_log"].entries
+    if entry.event.get("type") == "error"
+  ]
+  assert [event["error_sub_code"] for event in errors] == ["stalled"]
+
+
+@pytest.mark.usefixtures("_short_activity_gap")
+@pytest.mark.parametrize(
+  "child_cls",
+  [_HeartbeatOnlyChildRunner, _ToolInFlightChildRunner],
+  ids=["heartbeats-only", "tool-in-flight"],
+)
+def test_live_child_outlasts_the_activity_gap(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  child_cls: type[_ChildRunner],
+) -> None:
+  _ChildRunner.instances.clear()
+  parent = _parent(tmp_path, session_log=_SessionLog("Done."))
+  monkeypatch.setattr(gateway_runner, "AgentRunner", child_cls)
+  monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)
+
+  result, error = _spawn(parent)
+
+  child = _ChildRunner.instances[-1]
+  assert getattr(child, "cancelled") is False
+  assert error is None
+  assert isinstance(result, TaskResult)
+  assert result.execution.status == "succeeded"
+
+
+class _ToolInputStreamingProvider(_Provider):
+  """A child provider composing a large tool input: deltas only, past the gap."""
+
+  def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> object:
+    return object()
+
+  async def close_client(self, client: Any, timeout: float = 2.0) -> None:
+    return None
+
+  def build_request_params(self, **_kwargs: Any) -> dict[str, Any]:
+    return {}
+
+  async def stream(self, client: Any, params: dict[str, Any]):
+    deadline = time.monotonic() + 0.3
+    while time.monotonic() < deadline:
+      await asyncio.sleep(0.01)
+      yield StreamEvent(type="tool_use_delta", tool_input_json="x")
+    yield StreamEvent(type="text_delta", text="Done.")
+    yield StreamEvent(type="text_end", raw_block={"type": "text", "text": "Done."})
+    yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+
+def test_real_child_streaming_tool_input_outlasts_the_activity_gap(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  monkeypatch.setattr(runner_sub_agents, "SUB_AGENT_ACTIVITY_GAP", 0.1)
+  monkeypatch.setattr(runner_sub_agents, "STREAM_GUARD_POLL_INTERVAL", 0.01)
+  monkeypatch.setattr(runner_stream_turn, "STREAM_PROGRESS_LOG_INTERVAL", 0.02)
+  monkeypatch.setattr(gateway_runner, "STREAM_GUARD_POLL_INTERVAL", 0.02)
+  parent = _parent(tmp_path, session_log=AgentSessionLog(tmp_path / "session.jsonl"))
+  execution = stub_bound_capability_execution(
+    provider=_ToolInputStreamingProvider(),
+    model="child-model",
+    effort="medium",
+    capability_id="node.explore",
+    credential_principal="user",
+    auth_config={"api_key": "child-secret"},
+  )
+  observed: list[object] = []
+
+  result, error = _spawn(
+    parent,
+    capability_execution=execution,
+    on_sub_event=lambda event, _sid: observed.append(event.get("type")),
+  )
+
+  assert error is None
+  assert isinstance(result, TaskResult)
+  assert result.execution.status == "succeeded"
+  # The stream's only runner-visible output before its text is the guard's
+  # heartbeat, and that is what kept the parent from calling the child wedged.
+  first_text = observed.index("text_delta")
+  assert observed[:first_text]
+  assert set(observed[:first_text]) == {"heartbeat"}
+  assert "error" not in observed
+
 
 
 @pytest.mark.parametrize("method", ["spawn", "resume"])

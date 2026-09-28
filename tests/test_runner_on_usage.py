@@ -401,7 +401,7 @@ def test_terminal_watchdog_emits_accumulated_failed_billable_usage(
     session_id="sess-watchdog",
     capability_execution=_runner_execution(provider),
     user_id="alice", request_id="req-watchdog", billing_mode="metered",
-    rate_table_version="v1", channel="web", per_turn_timeout=0.01,
+    rate_table_version="v1", channel="web", stream_stall_timeout=0.01,
     commercial_usage_producer=Producer(),
   )
 
@@ -1484,7 +1484,9 @@ def test_standalone_stream_error_closes_client_after_settlement(
     ))
     try:
       await asyncio.wait_for(settlement_started.wait(), timeout=5.0)
-      pool = client._transport._pool
+      transport = client._transport
+      assert isinstance(transport, httpx.AsyncHTTPTransport)
+      pool = transport._pool
       assert (client.is_closed, len(pool.connections), runner._active_client is client) == (
         False, 1, True,
       )
@@ -1625,7 +1627,6 @@ def test_spawn_sub_agent_emits_usage_with_parent_turn_id(tmp_path: Path) -> None
       dispatcher=_make_dispatcher(),
       sub_session=sub_session,
       max_turns=1,
-      timeout=5.0,
       parent_turn_id="tool-run-agent-1",
     )
   )
@@ -1951,14 +1952,12 @@ def test_sub_runner_with_parent_aggregator_does_not_emit_own_summary() -> None:
   assert parent_summary.billing_mode == "byok"
 
 
-@pytest.mark.parametrize("timeout", [0, None, -1])
 def test_spawn_sub_agent_no_wall_clock(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
-  timeout: float | None,
 ) -> None:
   async def _unexpected_wait_for(*_args: Any, **_kwargs: Any) -> None:
-    raise AssertionError("asyncio.wait_for should not wrap non-positive timeouts")
+    raise AssertionError("asyncio.wait_for must not wrap a sub-agent run")
 
   monkeypatch.setattr(gateway_runner.asyncio, "wait_for", _unexpected_wait_for)
   parent_provider = _UsageProvider()
@@ -1981,7 +1980,6 @@ def test_spawn_sub_agent_no_wall_clock(
       skill_name="test-child",
       dispatcher=_make_dispatcher(),
       max_turns=1,
-      timeout=timeout,
     )
   )
 

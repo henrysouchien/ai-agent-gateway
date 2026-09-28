@@ -47,10 +47,11 @@ from agent_gateway.runner_background_tasks import (
 )
 from agent_gateway.final_narrative_artifact import publish_final_narrative
 from agent_gateway.operation_catalog import (
+  MutationMode,
   OperationRuntimePolicy,
   ResolvedOperationRuntime,
 )
-from agent_gateway.operation_snapshot import build_agent_operation_snapshot
+from agent_gateway.operation_snapshot import WorkspaceScope, build_agent_operation_snapshot
 from agent_gateway.tool_dispatcher_helpers import ToolExecutionContext
 from agent_gateway.session import GatewaySession
 from agent_gateway.skills import SkillLoader, operation_tool_ids
@@ -335,6 +336,7 @@ def _handler(
   approved_tool_types: set[str] | None = None,
   trusted_research_file_id: int | None = None,
   mcp_client: Any | None = None,
+  declared_local_tool_definitions: Any | None = None,
 ):
   handlers = {"web_search": _tool}
   handlers.update(background_handlers or {})
@@ -366,6 +368,7 @@ def _handler(
     mcp_meta_inject_servers=mcp_meta_inject_servers,
     fms_rebinder=fms_rebinder,
     trusted_research_file_id=trusted_research_file_id,
+    declared_local_tool_definitions=declared_local_tool_definitions,
   )
 
 
@@ -467,6 +470,8 @@ def _catalog_runtime(
   session_inject_servers: frozenset[str] = frozenset(),
   extra_excluded_tools: frozenset[str] = frozenset(),
   max_budget_usd: float | None = 4.5,
+  workspace_scope: WorkspaceScope = "read_only",
+  mutation_mode: MutationMode = "read_only",
 ) -> ResolvedOperationRuntime:
   snapshot = build_agent_operation_snapshot(
     name=name,
@@ -476,6 +481,7 @@ def _catalog_runtime(
     description="Review canonical evidence.",
     execution_class="node.explore",
     required_capabilities=required_capabilities,
+    workspace_scope=workspace_scope,
     resumable=True,
   )
   mcp_tools = mcp_tools_by_server or {}
@@ -488,7 +494,7 @@ def _catalog_runtime(
       resumable=True,
       resume_mcp_session_reset_ok=True,
       state_dir=None,
-      mutation_mode="read_only",
+      mutation_mode=mutation_mode,
       run_mode="full",
       exact_tool_ids=exact_tool_ids,
       mcp_tools_by_server=mcp_tools,
@@ -497,7 +503,6 @@ def _catalog_runtime(
       timeout_overrides={},
       extra_excluded_tools=extra_excluded_tools,
       max_turns=7,
-      timeout_seconds=45,
       max_tokens=2_222,
       max_budget_usd=max_budget_usd,
     ),
@@ -598,6 +603,7 @@ def delegation_tool_policy(owner_session_host_policy):
   """Describe this module's fake local handlers and live MCP surfaces."""
   local_effects = {
     "web_search": "read",
+    "propose_record": "preview",
     "file_read": "read",
     "write_record": "state_write",
   }
@@ -709,6 +715,71 @@ def test_catalog_dispatch_grant_filters_child_surface_not_ceiling() -> None:
   assert "write_record" not in admitted
 
 
+def test_declared_local_propose_route_is_admitted_when_parent_has_not_loaded_it() -> None:
+  """A loadable local propose tool missing from the parent payload is still granted.
+
+  Parent-prompt deferral withholds the schema until load_tools. The operation
+  declared the tool and the parent can route it, so admission must not treat
+  the missing advertisement as a missing route.
+  """
+  propose = "propose_record"
+
+  class _DeferredParent(_Runner):
+    def _get_tool_definitions(self) -> list[dict[str, Any]]:
+      return [{
+        "name": "web_search",
+        "description": "Read-only evidence search.",
+        "input_schema": {"type": "object"},
+      }]
+
+  runtime = _catalog_runtime(
+    name="position-initiation-predecision",
+    exact_tool_ids=frozenset({"web_search", propose}),
+    workspace_scope="workspace_write",
+    mutation_mode="preview",
+    required_capabilities=(
+      SemanticCapabilityRequirement(
+        name="artifact.propose/v1",
+        required=True,
+        binding_modes=("live_tool",),
+      ),
+    ),
+  )
+  runner = _DeferredParent()
+  result, error = asyncio.run(_handler(
+    runner,
+    loader=None,
+    operation_catalog=_Catalog(runtime),
+    background_handlers={propose: _tool},
+    declared_local_tool_definitions=lambda names: (
+      [{
+        "name": propose,
+        "description": "Propose a position-initiation predecision.",
+        "input_schema": {"type": "object"},
+      }]
+      if propose in names
+      else []
+    ),
+  )({
+    "operation": runtime.snapshot.operation.model_dump(mode="json"),
+    "objective": "Work the pre-decision checks.",
+    "background": False,
+  }))
+
+  assert error is None, error
+  assert result is not None
+  spawn = runner.spawn_calls[0]
+  admitted = frozenset(
+    entry.tool_id for entry in spawn["admitted_task"].tool_grant.tools
+  )
+  assert propose in admitted
+  assert {
+    definition["name"]
+    for definition in spawn["dispatcher"].get_tool_definitions()
+  } >= {propose}
+
+
+
 def test_run_agent_handler_rejects_catalog_and_loader_together(
   tmp_path: Path,
 ) -> None:
@@ -776,7 +847,6 @@ def test_injected_catalog_admission_consumes_snapshot_and_policy_directly() -> N
   assert len(runner.spawn_calls) == 1
   spawn = runner.spawn_calls[0]
   assert spawn["max_turns"] == 7
-  assert spawn["timeout"] == 45
   assert spawn["max_tokens"] == 2_222
   assert spawn["max_budget_usd"] == 4.5
   assert TaskResult.model_validate(result).logical_task.operation == (
@@ -1457,6 +1527,67 @@ def test_non_investment_research_context_keeps_existing_asserted_id_dispatch(
   assert runner.spawn_calls[0]["dispatcher"]._run_context.research_file_id == 42
 
 
+# Run AD's `bg_2` (`control dispatch --profile research_producer --mode task
+# --research-file-id 1`): the parent's recorded `run_agent` calls. Each child
+# admitted file 1, but its first message was the objective alone, so the
+# postcompile-valuation and earnings-scenarios children stopped reporting
+# `research_file_id` missing.
+@pytest.mark.parametrize(
+  ("operation_name", "required_context", "objective"),
+  [
+    (
+      "postcompile-valuation",
+      ("ticker", "research_file_id"),
+      "Persist the postcompile valuation for the current PCTY model through "
+      "your context-bound terminal door, passing the typed context_ref your "
+      "context tool returns.",
+    ),
+    (
+      "earnings-scenarios",
+      ("ticker", "research_file_id"),
+      "Build and persist the PCTY ScenarioSet through fms_persist_scenario_set.",
+    ),
+    (
+      "build-model",
+      ("ticker",),
+      "Build the PCTY model from the current research file state and persist "
+      "it through your terminal door.",
+    ),
+  ],
+)
+def test_named_child_first_message_carries_the_run_binding(
+  tmp_path: Path,
+  operation_name: str,
+  required_context: tuple[str, ...],
+  objective: str,
+) -> None:
+  loader = _write_operation(
+    tmp_path,
+    required_context=required_context,
+    operation_name=operation_name,
+  )
+  runner = _Runner()
+
+  result, error = asyncio.run(_handler(
+    runner,
+    loader=loader,
+    trusted_research_file_id=1,
+  )({
+    "operation": _operation(loader),
+    "objective": objective,
+    "research_file_id": 1,
+    "ticker": "PCTY",
+    "background": False,
+  }))
+
+  assert error is None
+  assert result is not None
+  spawn = runner.spawn_calls[0]
+  assert spawn["task"] == f"Ticker: PCTY\nRESEARCH_FILE_ID=1\n{objective}"
+  assert spawn["dispatcher"]._run_context.research_file_id == 1
+  assert spawn["admitted_task"].objective == objective
+
+
 @pytest.mark.parametrize(
   "required_context",
   [("research_file_id",), ()],
@@ -1725,9 +1856,11 @@ def test_foreground_delegation_returns_readable_completion_handle(
 
   assert error is None
   envelope = AgentCompletionEnvelope.model_validate(result)
-  assert envelope.parent_materialization.kind == "result_handle"
-  source = envelope.parent_materialization.source
-  grant = envelope.parent_materialization.read_grant
+  materialization = envelope.parent_materialization
+  assert materialization is not None
+  assert materialization.kind == "result_handle"
+  source = materialization.source
+  grant = materialization.read_grant
   page, read_error = asyncio.run(
     make_get_agent_result_content_handler([runner])({
       "content_id": source.content_id,
@@ -1763,10 +1896,11 @@ def test_foreground_delegation_publishes_budget_exhaustion_without_narrative(
       self._runner_id = "parent-runner"
       self._role = "writer"
       self._workspace_dir = tmp_path
-      self._agent_session_log = AgentSessionLog(tmp_path / "session.jsonl")
+      self.session_log = AgentSessionLog(tmp_path / "session.jsonl")
+      self._agent_session_log = self.session_log
 
     async def _append_durable_event(self, event: dict[str, Any]) -> object:
-      return await self._agent_session_log.append(event)
+      return await self.session_log.append(event)
 
     async def spawn_sub_agent(self, task: str, **kwargs: Any):
       # Buyer 3.3: the child stopped after tool use, before any end_turn.
@@ -1785,8 +1919,7 @@ def test_foreground_delegation_publishes_budget_exhaustion_without_narrative(
         requirement=kwargs["result_requirement"],
         provenance=kwargs["result_provenance"],
         final_narrative=None,
-        timed_out=False,
-        timeout=None,
+        stalled=False,
       )
       return result, None
 
@@ -1804,8 +1937,9 @@ def test_foreground_delegation_publishes_budget_exhaustion_without_narrative(
   assert envelope.settlement_projection.execution_status == "failed"
   assert envelope.settlement_projection.terminal_reason == "budget_exhausted"
   assert envelope.parent_materialization is None
+  assert envelope.child_evidence is not None
   assert envelope.child_evidence.evidence_tools == ("fetch_financials",)
-  events, _ = asyncio.run(runner._agent_session_log.query(
+  events, _ = asyncio.run(runner.session_log.query(
     event_types={"task_completed", "agent_completion"},
     order="asc",
   ))
@@ -1860,8 +1994,7 @@ def test_foreground_interrupt_publication_failure_names_terminal_reason(
         requirement=kwargs["result_requirement"],
         provenance=kwargs["result_provenance"],
         final_narrative=None,
-        timed_out=False,
-        timeout=None,
+        stalled=False,
         external_terminal_signals=external_signals,
       )
       return result, None
@@ -1875,6 +2008,7 @@ def test_foreground_interrupt_publication_failure_names_terminal_reason(
   }))
 
   assert result is None
+  assert error is not None
   assert error == {
     "code": "agent_completion_materialization_failed",
     "message": (
@@ -1989,8 +2123,10 @@ def test_foreground_delegation_materializes_projection_only_result(
 
   assert error is None
   envelope = AgentCompletionEnvelope.model_validate(result)
-  assert envelope.parent_materialization.kind == "projection_inline"
-  assert envelope.parent_materialization.value == projection_value
+  materialization = envelope.parent_materialization
+  assert materialization is not None
+  assert materialization.kind == "projection_inline"
+  assert materialization.value == projection_value
 
 
 def test_registered_operation_requires_full_ref_and_emits_lifecycle(
@@ -2054,7 +2190,10 @@ def test_registered_operation_captures_recoverable_fms_error_without_internal_er
   assert captured["type"] == "skill_result_captured"
   assert captured["exit_code"] == 1
   assert captured["outcome"] == "error"
-  assert captured["status"] == "error"
+  # The child's status is its own disposition; the door's status stays on the
+  # door's row.
+  assert captured["status"] == "blocked"
+  assert captured["fms_results"][0]["status"] == "error"
   assert captured["error"] == "active research file is required"
 
 
@@ -2460,6 +2599,56 @@ def test_skill_lifecycle_result_projects_after_child_stream_closes() -> None:
   ]
   assert [entry.event["type"] for entry in child_log.entries] == [
     "stream_complete",
+  ]
+
+
+def test_skill_lifecycle_result_settles_after_parent_stream_closes() -> None:
+  durable: list[dict[str, Any]] = []
+  parent_log = EventLog()
+
+  async def append(event: dict[str, Any]) -> object:
+    durable.append(dict(event))
+    return object()
+
+  async def confirm(event: dict[str, Any]) -> dict[str, Any] | None:
+    return dict(event) if event in durable else None
+
+  emitter = SkillRunEventEmitter(
+    skill_run_id="skill-run-closed-parent",
+    profile=SimpleNamespace(name="valuation-policy-precompile"),
+    semantic_scope="ticker",
+    context_ticker="PCTY",
+    portfolio_id=None,
+    event_log_getter=lambda: parent_log,
+    tool_ctx=ToolExecutionContext(
+      tool_call_id="tool-1",
+      tool_name="run_agent",
+      event_log=parent_log,
+    ),
+    durable_appender=append,
+    durable_confirmer=confirm,
+    time_fn=lambda: 1.0,
+  )
+
+  assert asyncio.run(emitter.emit_started()) is True
+  # The parent run reached its own terminal event before the background
+  # child's result was settled: the live stream no longer takes events.
+  parent_log.append({"type": "error", "error": "run_failed"})
+
+  assert asyncio.run(
+    emitter.emit_result_captured(
+      {"status": "completed", "result": "done"},
+      None,
+    )
+  ) is True
+
+  assert [event["type"] for event in durable] == [
+    "skill_run_started",
+    "skill_result_captured",
+  ]
+  assert [entry.event["type"] for entry in parent_log.entries] == [
+    "skill_run_started",
+    "error",
   ]
 
 

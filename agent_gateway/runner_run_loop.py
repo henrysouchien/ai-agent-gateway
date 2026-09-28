@@ -36,10 +36,10 @@ from .runner_limits import (
   CONTEXT_WARNING_PCT,
   ContextPressureReminderDecision,
   TokenEstimateSnapshot,
-  conservative_request_input_token_bound_for_request as _conservative_request_input_token_bound_for_request,
   context_pressure_reminder_decision as _context_pressure_reminder_decision,
   effective_compaction_trigger as _effective_compaction_trigger,
   model_context_window as _model_context_window,
+  request_input_token_estimate_for_request as _request_input_token_estimate_for_request,
   system_prompt_estimate_text as _system_prompt_estimate_text,
   token_estimate_snapshot as _token_estimate_snapshot,
 )
@@ -61,11 +61,13 @@ from .runner_run_loop_defaults import (
   MAX_TOKENS_NUDGE as _MAX_TOKENS_NUDGE,
 )
 from .runner_session_lifecycle import _runner_attr
+from .runner_tool_execution import final_answer_turn_reminder
 from .secret_boundary import (
   sanitize_tool_event,
   sanitization_failure_tool_input,
 )
 from .skill_completion_wal import TopLevelSkillCompletionEffectPlan
+from .skill_context import reset_current_skill, set_current_skill
 from .runner_session_events import (
   build_budget_exceeded_event as _build_budget_exceeded_event,
   build_budget_exceeded_text_event as _build_budget_exceeded_text_event,
@@ -226,6 +228,7 @@ class _AdmitProviderRequestBudget(Protocol):
     provider: ModelProvider,
     model: str,
     estimated_input_tokens: int,
+    cached_input_tokens: int,
     requested_max_output_tokens: int,
   ) -> ProviderRequestBudgetAdmission: ...
 
@@ -234,7 +237,7 @@ class _BuildContextPressureReminder(Protocol):
   def __call__(self, *, pct: int) -> str: ...
 
 
-class _ConservativeRequestInputTokenBoundForRequest(Protocol):
+class _RequestInputTokenEstimateForRequest(Protocol):
   def __call__(
     self,
     *,
@@ -483,6 +486,15 @@ def _unread_settled_handle_entries(runner: Any) -> list[Any]:
 #: to the reminded set, so an over-cap fan-out gets its remaining tasks named
 #: at the next stop boundary instead of being silently marked reminded.
 _UNREAD_HANDLE_NUDGE_MAX_TASKS = 10
+
+#: The one turn the loop grants after `max_turns` exists to settle the run with
+#: what it has; unless the model is told so, it spends that turn launching
+#: more work and the stop discards the reply (m1-eval-research-build-journey-errors).
+MAX_TURNS_SYNTHESIS_REMINDER = (
+  "The turn budget for this request is spent. This is your final turn: do not "
+  "start new work or call tools. Write your answer now from the evidence "
+  "already produced, and say plainly what is incomplete."
+)
 
 
 def _unread_result_handle_nudge(entries: list[Any]) -> str:
@@ -2042,7 +2054,7 @@ class RunnerRunLoopMixin:
     base_kwargs: Dict[str, Any],
     build_context_pressure_reminder: _BuildContextPressureReminder,
     build_runtime_guard_event: _BuildRuntimeGuardEvent,
-    conservative_request_input_token_bound_for_request: _ConservativeRequestInputTokenBoundForRequest,
+    cached_prefix_tokens: int,
     context_limit: int,
     context_pressure_reminder_decision: _ContextPressureReminderDecision,
     current_messages: list[dict[str, Any]],
@@ -2052,11 +2064,12 @@ class RunnerRunLoopMixin:
     delivery_request_nudge_recorded: bool,
     emit_budget_exceeded_stop: Callable[[Any], Awaitable[None]],
     emit_terminal_failure: Callable[[str, str], Awaitable[None]],
-    fork_suffix_reminder_text: str | None,
+    wrap_up_reminder_text: str | None,
     logger: logging.Logger,
     max_tokens: int,
     max_turns: int | None,
     pending_notifications_at_render: int,
+    request_input_token_estimate_for_request: _RequestInputTokenEstimateForRequest,
     system_prompt: Optional[Union[str, List[Tuple[str, bool]]]],
     system_prompt_estimate_text: Callable[[Any], str],
     token_estimate_snapshot: _TokenEstimateSnapshot,
@@ -2092,7 +2105,7 @@ class RunnerRunLoopMixin:
         getattr(self, "_fork_suffix_max_tokens")
       ):
         self._fork_suffix_ceiling_triggered = True
-        fork_suffix_reminder_text = (
+        wrap_up_reminder_text = (
           FORK_SUFFIX_WRAP_UP_REMINDER
         )
         max_turns = (
@@ -2100,6 +2113,19 @@ class RunnerRunLoopMixin:
           if max_turns is None
           else min(max_turns, turn_count)
         )
+    final_answer_tool = getattr(self, "_final_answer_turn_tool_name", None)
+    if final_answer_tool is not None:
+      # The excluded-tool guard bounds expansion, not the answer: the run
+      # gets exactly this one turn to finish with what it already has.
+      self._final_answer_turn_tool_name = None
+      wrap_up_reminder_text = final_answer_turn_reminder(
+        str(final_answer_tool)
+      )
+      max_turns = (
+        turn_count
+        if max_turns is None
+        else min(max_turns, turn_count)
+      )
     if (
       active_delivery_obligation is not None
       and active_delivery_obligation[2]
@@ -2119,7 +2145,7 @@ class RunnerRunLoopMixin:
       part
       for part in (
         turn_reminder.text,
-        fork_suffix_reminder_text,
+        wrap_up_reminder_text,
       )
       if part
     )
@@ -2166,7 +2192,7 @@ class RunnerRunLoopMixin:
         [
           context_pressure_reminder,
           turn_reminder.text,
-          fork_suffix_reminder_text,
+          wrap_up_reminder_text,
         ],
       )
     )
@@ -2183,7 +2209,7 @@ class RunnerRunLoopMixin:
         provider=self._provider,
         model=upstream_model,
         estimated_input_tokens=(
-          conservative_request_input_token_bound_for_request(
+          request_input_token_estimate_for_request(
             system_text=system_prompt_estimate_text(
               turn_system_prompt
             ),
@@ -2191,6 +2217,7 @@ class RunnerRunLoopMixin:
             tools=base_kwargs.get("tools") or [],
           )
         ),
+        cached_input_tokens=cached_prefix_tokens,
         requested_max_output_tokens=max_tokens,
       )
     except ProviderRequestBudgetError:
@@ -2236,7 +2263,7 @@ class RunnerRunLoopMixin:
     )
     return (
       max_turns,
-      fork_suffix_reminder_text,
+      wrap_up_reminder_text,
       delivery_request_nudge_message,
       turn_system_prompt,
       request_max_tokens,
@@ -2698,11 +2725,9 @@ class RunnerRunLoopMixin:
           f"tool:{stop_after_tool_results_reason}"
         )
       else:
-        terminal_failure = (
-          str(stop_after_tool_results_reason),
-          "terminal_outcome_unproven: stop-after-tool-results ended "
-          "without an accepted terminal result "
-          f"({stop_after_tool_results_reason}).",
+        raise RuntimeError(
+          "stop-after-tool-results reason is not a settlement: "
+          f"{stop_after_tool_results_reason!r}"
         )
       return finish("break")
 
@@ -2812,7 +2837,33 @@ class RunnerRunLoopMixin:
     *,
     resume_initial_messages: List[Dict[str, Any]] | None = None,
   ) -> None:
-    """Execute the full chat loop and stream events into `EventLog`."""
+    """Execute the full chat loop and stream events into `EventLog`.
+
+    Every run starts with no ambient skill admission and restores its
+    caller's on exit. The ambient admission belongs to the run whose
+    `invoke_skill` set it; a child run awaited in its parent's task, or in a
+    task that copied the parent's contextvars, carries its own admission on
+    its dispatcher's `RunContext` instead.
+    """
+    admission_token = set_current_skill(None)
+    try:
+      await self._run_chat_loop(
+        messages,
+        system_prompt,
+        max_turns,
+        resume_initial_messages=resume_initial_messages,
+      )
+    finally:
+      reset_current_skill(admission_token)
+
+  async def _run_chat_loop(
+    self,
+    messages: List[Dict[str, Any]],
+    system_prompt: Optional[Union[str, List[Tuple[str, bool]]]] = None,
+    max_turns: Optional[int] = None,
+    *,
+    resume_initial_messages: List[Dict[str, Any]] | None = None,
+  ) -> None:
     _require_fresh_runner(self._summary_emitted)
     self._stream_started_at = None
     self._first_text_at = None
@@ -2857,10 +2908,10 @@ class RunnerRunLoopMixin:
       "_context_pressure_reminder_decision",
       _context_pressure_reminder_decision,
     )
-    conservative_request_input_token_bound_for_request = _runner_attr(
+    request_input_token_estimate_for_request = _runner_attr(
       self,
-      "_conservative_request_input_token_bound_for_request",
-      _conservative_request_input_token_bound_for_request,
+      "_request_input_token_estimate_for_request",
+      _request_input_token_estimate_for_request,
     )
     build_token_estimate_log_data = _runner_attr(
       self, "_build_token_estimate_log_data", _build_token_estimate_log_data
@@ -3172,6 +3223,11 @@ class RunnerRunLoopMixin:
       model_visible_synthesis_credits_granted = 0
       current_messages = list(messages)
       last_real_stream_input_tokens: int | None = None
+      # What the provider itself reported serving from, or writing into, its
+      # prompt cache on this run's last request: the prefix the next request
+      # will be billed at the cache-read rate. Zero until a response says
+      # otherwise, so a cold run prices its whole prompt uncached.
+      cached_prefix_tokens = 0
 
       def reset_logical_response_lineage() -> None:
         nonlocal logical_response_id
@@ -3341,6 +3397,10 @@ class RunnerRunLoopMixin:
               terminal_success_reason = "background_delivery_settled"
               break
             if delivery_epoch_from_max:
+              # This iteration stops before any provider call; its increment
+              # counted a turn that never ran.
+              if not continuing_provider_segment:
+                turn_count -= 1
               logger.warning(
                 "[%s] Max turns (%d) reached, stopping",
                 self._sid,
@@ -3435,7 +3495,16 @@ class RunnerRunLoopMixin:
         request_scoped_nudge_message: dict[str, Any] | None = None
         delivery_request_nudge_message: dict[str, Any] | None = None
         delivery_request_nudge_recorded = False
-        fork_suffix_reminder_text: str | None = None
+        # A turn past `max_turns` is the settlement turn; one that must
+        # retrieve an omitted background result carries its own nudge.
+        wrap_up_reminder_text: str | None = (
+          MAX_TURNS_SYNTHESIS_REMINDER
+          if delivery_epoch_from_max
+          and active_delivery_obligation is not None
+          and active_delivery_obligation[2]
+          not in {"exact_retrieval", "ack_recovery"}
+          else None
+        )
 
         def remove_current_message(target: dict[str, Any] | None) -> None:
           if target is None:
@@ -3571,9 +3640,7 @@ class RunnerRunLoopMixin:
             base_kwargs=base_kwargs,
             build_context_pressure_reminder=build_context_pressure_reminder,
             build_runtime_guard_event=build_runtime_guard_event,
-            conservative_request_input_token_bound_for_request=(
-              conservative_request_input_token_bound_for_request
-            ),
+            cached_prefix_tokens=cached_prefix_tokens,
             context_limit=context_limit,
             context_pressure_reminder_decision=(
               context_pressure_reminder_decision
@@ -3589,12 +3656,15 @@ class RunnerRunLoopMixin:
             ),
             emit_budget_exceeded_stop=emit_budget_exceeded_stop,
             emit_terminal_failure=emit_terminal_failure,
-            fork_suffix_reminder_text=fork_suffix_reminder_text,
+            wrap_up_reminder_text=wrap_up_reminder_text,
             logger=logger,
             max_tokens=max_tokens,
             max_turns=max_turns,
             pending_notifications_at_render=(
               pending_notifications_at_render
+            ),
+            request_input_token_estimate_for_request=(
+              request_input_token_estimate_for_request
             ),
             system_prompt=system_prompt,
             system_prompt_estimate_text=system_prompt_estimate_text,
@@ -3608,7 +3678,7 @@ class RunnerRunLoopMixin:
             return
           (
             max_turns,
-            fork_suffix_reminder_text,
+            wrap_up_reminder_text,
             delivery_request_nudge_message,
             turn_system_prompt,
             request_max_tokens,
@@ -3723,8 +3793,13 @@ class RunnerRunLoopMixin:
           + int(stream_usage.get("cache_read_input_tokens", 0) or 0)
           + int(stream_usage.get("cache_creation_input_tokens", 0) or 0)
         )
+        reported_cached_prefix = (
+          int(stream_usage.get("cache_read_input_tokens", 0) or 0)
+          + int(stream_usage.get("cache_creation_input_tokens", 0) or 0)
+        )
         if real_stream_input > 0:
           last_real_stream_input_tokens = real_stream_input
+          cached_prefix_tokens = reported_cached_prefix
         if stream_usage_state.has_tokens:
           stream_usage_event = self._build_usage_event(
             model=upstream_model, usage_totals=stream_usage,

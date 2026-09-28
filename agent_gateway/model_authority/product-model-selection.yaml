@@ -7,24 +7,27 @@
 # startup on a missing or invalid artifact. The environment variable names
 # which artifact file to load — it is never model or default authority itself.
 #
-# Content is frozen per docs/reference/model-selection-authority-product-
-# decisions-2026-08-13.md section 6. Unknown fields are rejected by the loader.
+# Content is versioned by `revision`; a change ships by republishing the
+# ai-agent-gateway package and relocking its consumers. Unknown fields are
+# rejected by the loader.
 schema: "product-model-selection/v1"
-revision: "2026-08-18.1"
+revision: "2026-09-28.1"
 capabilities:
   session.driver:
-    default: {kind: "model", model_key: "anthropic.claude-opus-5", effort: "high"}
+    default: {kind: "model", model_key: "anthropic.claude-opus-5-5", effort: "high"}
     by_channel: {}
     allowed_model_keys:
       - "anthropic.claude-fable-5-1"
       - "anthropic.claude-fable-5"
       - "anthropic.claude-haiku-4-5"
-      - "anthropic.claude-mythos-5"
+      - "anthropic.claude-opus-5-5"
       - "anthropic.claude-opus-5"
       - "anthropic.claude-sonnet-5"
       - "openai.gpt-6-astra"
+      - "openai.gpt-6-sol"
       - "openai.gpt-5-6"
       - "codex.gpt-6-astra"
+      - "codex.gpt-6-sol"
       - "codex.gpt-5-6-luna"
       - "codex.gpt-5-6-sol"
       - "codex.gpt-5-6-terra"
@@ -40,12 +43,14 @@ capabilities:
       - "anthropic.claude-fable-5-1"
       - "anthropic.claude-fable-5"
       - "anthropic.claude-haiku-4-5"
-      - "anthropic.claude-mythos-5"
+      - "anthropic.claude-opus-5-5"
       - "anthropic.claude-opus-5"
       - "anthropic.claude-sonnet-5"
       - "openai.gpt-6-astra"
+      - "openai.gpt-6-sol"
       - "openai.gpt-5-6"
       - "codex.gpt-6-astra"
+      - "codex.gpt-6-sol"
       - "codex.gpt-5-6-luna"
       - "codex.gpt-5-6-sol"
       - "codex.gpt-5-6-terra"
@@ -54,32 +59,32 @@ capabilities:
     allow_authenticated_run_override: true
 
   node.explore:
-    default: {kind: "model", model_key: "anthropic.claude-opus-5", effort: "high"}
+    default: {kind: "model", model_key: "anthropic.claude-opus-5-5", effort: "high"}
     by_channel: {}
     allowed_model_keys:
       - "anthropic.claude-fable-5-1"
       - "anthropic.claude-fable-5"
-      - "anthropic.claude-mythos-5"
+      - "anthropic.claude-opus-5-5"
       - "anthropic.claude-opus-5"
       - "anthropic.claude-sonnet-5"
 
   node.implement:
-    default: {kind: "model", model_key: "anthropic.claude-opus-5", effort: "high"}
+    default: {kind: "model", model_key: "anthropic.claude-opus-5-5", effort: "high"}
     by_channel: {}
     allowed_model_keys:
       - "anthropic.claude-fable-5-1"
       - "anthropic.claude-fable-5"
-      - "anthropic.claude-mythos-5"
+      - "anthropic.claude-opus-5-5"
       - "anthropic.claude-opus-5"
       - "anthropic.claude-sonnet-5"
 
   node.mutate:
-    default: {kind: "model", model_key: "anthropic.claude-opus-5", effort: "high"}
+    default: {kind: "model", model_key: "anthropic.claude-opus-5-5", effort: "high"}
     by_channel: {}
     allowed_model_keys:
       - "anthropic.claude-fable-5-1"
       - "anthropic.claude-fable-5"
-      - "anthropic.claude-mythos-5"
+      - "anthropic.claude-opus-5-5"
       - "anthropic.claude-opus-5"
       - "anthropic.claude-sonnet-5"
 
@@ -90,12 +95,14 @@ capabilities:
       - "anthropic.claude-fable-5-1"
       - "anthropic.claude-fable-5"
       - "anthropic.claude-haiku-4-5"
-      - "anthropic.claude-mythos-5"
+      - "anthropic.claude-opus-5-5"
       - "anthropic.claude-opus-5"
       - "anthropic.claude-sonnet-5"
       - "openai.gpt-6-astra"
+      - "openai.gpt-6-sol"
       - "openai.gpt-5-6"
       - "codex.gpt-6-astra"
+      - "codex.gpt-6-sol"
       - "codex.gpt-5-6-luna"
       - "codex.gpt-5-6-sol"
       - "codex.gpt-5-6-terra"
@@ -103,22 +110,22 @@ capabilities:
       - "xai.grok-4-5"
 
   node.verify:
-    default: {kind: "model", model_key: "anthropic.claude-opus-5", effort: "high"}
+    default: {kind: "model", model_key: "anthropic.claude-opus-5-5", effort: "high"}
     by_channel: {}
     allowed_model_keys:
       - "anthropic.claude-fable-5-1"
       - "anthropic.claude-fable-5"
-      - "anthropic.claude-mythos-5"
+      - "anthropic.claude-opus-5-5"
       - "anthropic.claude-opus-5"
       - "anthropic.claude-sonnet-5"
 
   node.choose:
-    default: {kind: "model", model_key: "anthropic.claude-opus-5", effort: "high"}
+    default: {kind: "model", model_key: "anthropic.claude-opus-5-5", effort: "high"}
     by_channel: {}
     allowed_model_keys:
       - "anthropic.claude-fable-5-1"
       - "anthropic.claude-fable-5"
-      - "anthropic.claude-mythos-5"
+      - "anthropic.claude-opus-5-5"
       - "anthropic.claude-opus-5"
       - "anthropic.claude-sonnet-5"
 
@@ -129,19 +136,19 @@ capabilities:
       - "anthropic.claude-fable-5-1"
       - "anthropic.claude-fable-5"
       - "anthropic.claude-haiku-4-5"
-      - "anthropic.claude-mythos-5"
+      - "anthropic.claude-opus-5-5"
       - "anthropic.claude-opus-5"
       - "anthropic.claude-sonnet-5"
 
   risk.completion:
-    default: {kind: "model", model_key: "anthropic.claude-sonnet-4-6-sdk", effort: "none"}
+    default: {kind: "model", model_key: "anthropic.claude-sonnet-5-sdk", effort: "none"}
     by_channel: {}
-    allowed_model_keys: ["anthropic.claude-sonnet-4-6-sdk"]
+    allowed_model_keys: ["anthropic.claude-sonnet-5-sdk"]
 
   risk.interpretation:
-    default: {kind: "model", model_key: "anthropic.claude-sonnet-4-6-sdk", effort: "none"}
+    default: {kind: "model", model_key: "anthropic.claude-sonnet-5-sdk", effort: "none"}
     by_channel: {}
-    allowed_model_keys: ["anthropic.claude-sonnet-4-6-sdk"]
+    allowed_model_keys: ["anthropic.claude-sonnet-5-sdk"]
 
   risk.peer_generation:
     default: {kind: "model", model_key: "openai.gpt-5-4-mini-sdk", effort: "none"}
@@ -149,41 +156,41 @@ capabilities:
     allowed_model_keys: ["openai.gpt-5-4-mini-sdk"]
 
   risk.asset_classification:
-    default: {kind: "model", model_key: "anthropic.claude-haiku-4-5-20251001-sdk", effort: "none"}
+    default: {kind: "model", model_key: "anthropic.claude-haiku-4-5-sdk", effort: "none"}
     by_channel: {}
-    allowed_model_keys: ["anthropic.claude-haiku-4-5-20251001-sdk"]
+    allowed_model_keys: ["anthropic.claude-haiku-4-5-sdk"]
 
   risk.overview_editorial:
-    default: {kind: "model", model_key: "anthropic.claude-haiku-4-5-20251001-sdk", effort: "none"}
+    default: {kind: "model", model_key: "anthropic.claude-haiku-4-5-sdk", effort: "none"}
     by_channel: {}
-    allowed_model_keys: ["anthropic.claude-haiku-4-5-20251001-sdk"]
+    allowed_model_keys: ["anthropic.claude-haiku-4-5-sdk"]
 
   risk.document_ingest:
-    default: {kind: "model", model_key: "anthropic.claude-opus-4-8-oauth", effort: "none"}
+    default: {kind: "model", model_key: "anthropic.claude-opus-5-5-oauth", effort: "none"}
     by_channel: {}
-    allowed_model_keys: ["anthropic.claude-opus-4-8-oauth"]
+    allowed_model_keys: ["anthropic.claude-opus-5-5-oauth"]
 
   investment.research_agent:
-    default: {kind: "model", model_key: "anthropic.claude-sonnet-4-6-sdk", effort: "none"}
+    default: {kind: "model", model_key: "anthropic.claude-sonnet-5", effort: "none"}
     by_channel: {}
-    allowed_model_keys: ["anthropic.claude-sonnet-4-6-sdk"]
+    allowed_model_keys: ["anthropic.claude-sonnet-5"]
 
   investment.quant_worker:
-    default: {kind: "model", model_key: "openai.gpt-5-6", effort: "high"}
+    default: {kind: "model", model_key: "openai.gpt-6-sol", effort: "high"}
     by_channel: {}
-    allowed_model_keys: ["openai.gpt-6-astra", "openai.gpt-5-6"]
+    allowed_model_keys: ["openai.gpt-6-astra", "openai.gpt-6-sol", "openai.gpt-5-6"]
 
   investment.newsletter:
-    default: {kind: "model", model_key: "anthropic.claude-haiku-4-5-20251001-gateway", effort: "none"}
+    default: {kind: "model", model_key: "anthropic.claude-haiku-4-5", effort: "none"}
     by_channel: {}
-    allowed_model_keys: ["anthropic.claude-haiku-4-5-20251001-gateway"]
+    allowed_model_keys: ["anthropic.claude-haiku-4-5"]
 
   investment.earnings_transcript:
-    default: {kind: "model", model_key: "anthropic.claude-haiku-4-5-20251001-gateway", effort: "none"}
+    default: {kind: "model", model_key: "anthropic.claude-haiku-4-5", effort: "none"}
     by_channel: {}
-    allowed_model_keys: ["anthropic.claude-haiku-4-5-20251001-gateway"]
+    allowed_model_keys: ["anthropic.claude-haiku-4-5"]
 
   investment.biotech_review:
-    default: {kind: "model", model_key: "anthropic.claude-sonnet-4-20250514-sdk", effort: "none"}
+    default: {kind: "model", model_key: "anthropic.claude-sonnet-5", effort: "none"}
     by_channel: {}
-    allowed_model_keys: ["anthropic.claude-sonnet-4-20250514-sdk"]
+    allowed_model_keys: ["anthropic.claude-sonnet-5"]

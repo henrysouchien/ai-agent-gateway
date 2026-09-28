@@ -59,7 +59,10 @@ def test_load_rate_table_none_loads_bundled_default() -> None:
   table = load_rate_table(None)
 
   assert table.version
-  assert table.source == "https://platform.claude.com/docs/en/about-claude/models/overview"
+  assert table.source == (
+    "https://platform.claude.com/docs/en/about-claude/pricing; "
+    "https://platform.claude.com/docs/en/about-claude/models/overview"
+  )
   assert table.providers["anthropic"]
 
 
@@ -179,6 +182,30 @@ def test_lookup_opus5_returns_bundled_model_rates() -> None:
   assert rates.cache_write_cost_per_mtok == 6.25
   assert rates.max_tokens == 128_000
   assert rates.context_window == 1_000_000
+
+
+def test_lookup_opus55_returns_its_own_rates_not_the_opus5_prefix_row() -> None:
+  table = load_rate_table(None)
+
+  rates = table.lookup("anthropic", "claude-opus-5-5")
+
+  assert rates.display_name == "Claude Opus 5.5"
+  assert rates.input_cost_per_mtok == 4.0
+  assert rates.output_cost_per_mtok == 20.0
+  assert rates.cache_read_cost_per_mtok == 0.2
+  assert rates.cache_write_cost_per_mtok == 5.0
+
+
+def test_lookup_sonnet5_returns_published_standard_rates() -> None:
+  table = load_rate_table(None)
+
+  rates = table.lookup("anthropic", "claude-sonnet-5")
+
+  assert rates.input_cost_per_mtok == 2.0
+  assert rates.output_cost_per_mtok == 10.0
+  assert rates.cache_read_cost_per_mtok == 0.2
+  assert rates.cache_write_cost_per_mtok == 2.5
+
 
 
 def test_lookup_tag_match_returns_shorter_tag_entry(tmp_path: Path) -> None:
@@ -327,9 +354,12 @@ def test_anthropic_override_preserves_other_provider_budget(
   provider = provider_type(rate_table=load_rate_table(path)) if injected else provider_type()
 
   assert provider.estimate_cost("gpt-5.6", 100_000, 1_000).total == pytest.approx(0.53)
+  # A cold request is priced at that provider's own input rate, so $0.04 of
+  # budget cannot fund 100k uncached input tokens.
   admission = admit_provider_request_budget(
-    CostAccumulator(0.50), provider=provider, model="gpt-5.6",
-    estimated_input_tokens=100_000, requested_max_output_tokens=1_000,
+    CostAccumulator(0.04), provider=provider, model="gpt-5.6",
+    estimated_input_tokens=100_000, cached_input_tokens=0,
+    requested_max_output_tokens=1_000,
   )
   assert admission.denied_state is not None
 
@@ -345,9 +375,9 @@ def test_anthropic_override_preserves_other_provider_budget(
 def test_published_long_context_prices(provider_type, model, input_tokens, expected) -> None:
   assert provider_type().estimate_cost(model, input_tokens, 1_000).total == pytest.approx(expected)
   admission = admit_provider_request_budget(
-    CostAccumulator(0.60 if provider_type is XAIProvider else 4.0),
+    CostAccumulator(0.20 if provider_type is XAIProvider else 0.55),
     provider=provider_type(), model=model, estimated_input_tokens=input_tokens,
-    requested_max_output_tokens=1_000,
+    cached_input_tokens=0, requested_max_output_tokens=1_000,
   )
   assert admission.denied_state is not None
 

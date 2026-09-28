@@ -11,6 +11,7 @@ from typing import Any, Callable, Mapping, Protocol, TYPE_CHECKING
 
 from . import approval_settings
 from .approval_policy import (
+  MONEY_BOUNDARY_TOOL_CLASSES,
   ApprovalConstraint,
   ApprovalReuseMode,
   ApprovalState,
@@ -289,6 +290,7 @@ async def _run_delegated_approval_lifecycle(
   tool_input: dict[str, Any],
   qualifier: str,
   reason: str | None,
+  profile_tightened_approval: bool,
   await_user_approval_via_pending_tools_fn: Any,
   utc_now_fn: Any,
   os_urandom_fn: Any,
@@ -299,7 +301,38 @@ async def _run_delegated_approval_lifecycle(
   This run owns no ledger and no policy, so nothing durable is written and no
   policy is evaluated: the request is projected onto the event frame the parent
   drains, and the wait is bounded by the same durable expiry the operator sees.
+
+  A delegated run is unattended by construction — no human sits at its decision
+  channel — so every class outside the money boundary is settled here under the
+  run owner's own authority, the same rule the interactive policy applies
+  (`MONEY_BOUNDARY_TOOL_CLASSES`, `agent_gateway.approval_policy`). A live order
+  still asks, and so does a door the running profile tightened, which the run's
+  owner authority may not waive.
   """
+
+  if (
+    request.tool_class not in MONEY_BOUNDARY_TOOL_CLASSES
+    and request.approval_constraint == "standard"
+    and not profile_tightened_approval
+  ):
+    decided_at = utc_now_fn()
+    request = replace(
+      request,
+      state="auto_approved",
+      decision="auto_approved",
+      authorization_mode="OWNER_CONTROL_PLANE",
+      expires_at=None,
+      decided_at=decided_at,
+      decider_id=run_context.user_id,
+      decider_role=run_context.decider_role,
+      reason=reason or "",
+    )
+    return {
+      "approved": True,
+      "allow_tool_type": False,
+      "request": request,
+      "tool_input": tool_input,
+    }
 
   expires_at = request.requested_at + timedelta(
     seconds=_DELEGATED_APPROVAL_EXPIRY_SECONDS
@@ -382,6 +415,7 @@ async def run_approval_lifecycle(
   automatic_approval_reason: str | None = None,
   automatic_denial_reason: str | None = None,
   deny_user_prompt: bool = False,
+  profile_tightened_approval: bool = False,
   resolve_run_context_fn: Any,
   current_skill_admission_fn: Any,
   redact_for_approval_request_fn: Any,
@@ -437,6 +471,7 @@ async def _run_approval_lifecycle_impl(
   automatic_approval_reason: str | None = None,
   automatic_denial_reason: str | None = None,
   deny_user_prompt: bool = False,
+  profile_tightened_approval: bool = False,
   resolve_run_context_fn: Any,
   current_skill_admission_fn: Any,
   redact_for_approval_request_fn: Any,
@@ -576,6 +611,7 @@ async def _run_approval_lifecycle_impl(
       tool_input=tool_input,
       qualifier=qualifier,
       reason=safe_reason,
+      profile_tightened_approval=profile_tightened_approval,
       await_user_approval_via_pending_tools_fn=(
         await_user_approval_via_pending_tools_fn
       ),

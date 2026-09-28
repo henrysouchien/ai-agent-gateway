@@ -45,6 +45,9 @@ from agent_workflow_contracts import (
   sha256_digest,
   terminal_task_result,
 )
+from agent_workflow_contracts.research_file_contract import (
+  context_text_with_run_binding,
+)
 from agent_workflow_contracts.ticker_contract import (
   TICKER_INPUT_CONTRACT,
   require_canonical_contract_ticker,
@@ -133,7 +136,6 @@ from .sub_agent_scope_receipt import (
   reissue_tool_grant,
 )
 from .sub_agent_helpers import (
-  DEFAULT_SUB_AGENT_TIMEOUT_SECONDS as DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
   ExcludedToolsResolver as ExcludedToolsResolver,
   MutationModeExclusionsApplier as MutationModeExclusionsApplier,
   NeedsApprovalResolver as NeedsApprovalResolver,
@@ -1330,10 +1332,12 @@ def make_run_agent_handler(
   credentials_resolver_active: bool = False,
   local_tool_handlers: dict[str, Any] | None = None,
   artifact_tools_installer: Callable[..., list[dict[str, Any]]] | None = None,
+  declared_local_tool_definitions: (
+    Callable[[frozenset[str]], Sequence[Mapping[str, Any]]] | None
+  ) = None,
   fms_rebinder: Callable[[dict[str, Any], int], None] | None = None,
   excluded_tools: set[str] | None = None,
   default_max_turns: int = 15,
-  default_timeout: float | None = DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
   default_max_tokens: int = 64000,
   default_cost_observation_threshold_usd: float | None = (
     DEFAULT_COST_OBSERVATION_THRESHOLD_USD
@@ -1477,7 +1481,6 @@ def make_run_agent_handler(
       operation_persist_state = runtime_policy.persist_state
       operation_version = operation.operation.version
       configured_max_turns = runtime_policy.max_turns
-      configured_timeout = runtime_policy.timeout_seconds
       configured_max_tokens = runtime_policy.max_tokens
       configured_max_budget_usd = runtime_policy.max_budget_usd
     elif skill_loader is not None:
@@ -1499,7 +1502,6 @@ def make_run_agent_handler(
       operation_persist_state = profile.persist_state
       operation_version = profile.version
       configured_max_turns = profile.max_turns
-      configured_timeout = profile.timeout
       configured_max_tokens = profile.max_tokens
       configured_max_budget_usd = (
         profile.max_budget_usd if named_operation else None
@@ -1530,7 +1532,6 @@ def make_run_agent_handler(
       operation_persist_state = profile.persist_state
       operation_version = profile.version
       configured_max_turns = profile.max_turns
-      configured_timeout = profile.timeout
       configured_max_tokens = profile.max_tokens
       configured_max_budget_usd = None
     registered_runtime = runtime_policy is not None or named_operation
@@ -1779,11 +1780,6 @@ def make_run_agent_handler(
       if configured_max_turns is not None
       else default_max_turns
     )
-    effective_timeout = (
-      configured_timeout
-      if configured_timeout is not None
-      else default_timeout
-    )
     effective_max_tokens = (
       configured_max_tokens
       if configured_max_tokens is not None
@@ -1925,6 +1921,29 @@ def make_run_agent_handler(
         exact_tool_ids=operation_private_mcp_tool_ids,
         tool_definition_projector=tool_definition_projector,
       ))
+    if declared_local_tool_definitions is not None:
+      already = {
+        str(definition.get("name") or "")
+        for definition in extra_tool_definitions
+      }
+      requested = frozenset(
+        tool_id
+        for tool_id in operation_dispatch_tool_ids
+        if tool_id in sub_local and tool_id not in already
+      )
+      if requested:
+        seen = set(already)
+        for definition in declared_local_tool_definitions(requested):
+          if not isinstance(definition, dict):
+            raise TypeError(
+              "declared local tool definitions must be objects"
+            )
+          name = str(definition.get("name") or "")
+          if name not in requested or name in seen:
+            continue
+          seen.add(name)
+          extra_tool_definitions.append(definition)
+
 
     candidate_definitions_getter = _child_tool_definitions_getter(
       runner=runner,
@@ -1999,7 +2018,6 @@ def make_run_agent_handler(
       persisted_methodology_state=previous_state,
       methodology_state_instructions=methodology_state_instructions,
       max_turns=effective_max_turns,
-      timeout_seconds=effective_timeout,
       client_timeout_seconds=90,
       max_tokens=effective_max_tokens,
       cost_observation_threshold_usd=cost_observation_threshold_usd,
@@ -2025,6 +2043,16 @@ def make_run_agent_handler(
     )
     admitted_task_ref[0] = admitted_task
     context_ticker = _admitted_context_ticker()
+    child_research_file_id = _admitted_context_research_file_id()
+    # The child reads its binding the way a stage does: its first message is
+    # the parent's objective under the one binding header, so a door that takes
+    # research_file_id as a model argument is callable without the child
+    # rediscovering the file.
+    child_message = context_text_with_run_binding(
+      task,
+      ticker=context_ticker,
+      research_file_id=child_research_file_id,
+    )
     result_provenance = TaskResultProvenance(
       admitted_task_digest=admitted_task.admitted_task_digest,
       model_bind_digest=admitted_task.model_bind_digest,
@@ -2117,7 +2145,7 @@ def make_run_agent_handler(
           max_tokens=execution_snapshot.max_tokens,
           max_budget_usd=execution_snapshot.max_budget_usd,
         ),
-        research_file_id=_admitted_context_research_file_id(),
+        research_file_id=child_research_file_id,
         user_id=effective_parent_user_id,
         session_id=getattr(runner, "_full_session_id", ""),
         approval_policy=getattr(parent_session, "approval_policy", None),
@@ -2164,7 +2192,7 @@ def make_run_agent_handler(
       except DurableSkillEventPersistenceError:
         return None, _durable_skill_event_persistence_error()
       return await runner.spawn_sub_agent(
-        task,
+        child_message,
         capability_execution=execution,
         skill_name=agent_name,
         logical_task=admitted_task.logical_task,
@@ -2176,7 +2204,6 @@ def make_run_agent_handler(
         sub_session=sub_session,
         excluded_tools=child_excluded,
         max_turns=execution_snapshot.max_turns,
-        timeout=execution_snapshot.timeout_seconds,
         client_timeout=execution_snapshot.client_timeout_seconds,
         max_tokens=execution_snapshot.max_tokens,
         cost_observation_threshold_usd=(
@@ -2345,7 +2372,6 @@ def make_resume_handler(
   excluded_tools_resolver: ExcludedToolsResolver | None = None,
   denied_mcp_servers: AbstractSet[str] = frozenset(),
   default_max_turns: int = 15,
-  default_timeout: float | None = DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
   default_max_tokens: int = 64000,
   capability_execution_resolver: CapabilityExecutionResolver,
   coordinator_config: CoordinatorConfig | None = None,
@@ -3074,7 +3100,6 @@ def make_resume_handler(
         sub_session=sub_session,
         excluded_tools=child_excluded,
         max_turns=successor_execution_snapshot.max_turns,
-        timeout=successor_execution_snapshot.timeout_seconds,
         client_timeout=successor_execution_snapshot.client_timeout_seconds,
         max_tokens=successor_execution_snapshot.max_tokens,
         skill_run_id=skill_run_id,

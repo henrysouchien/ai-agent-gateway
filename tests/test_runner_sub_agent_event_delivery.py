@@ -10,6 +10,7 @@ from agent_gateway.event_log import EventLog
 from agent_gateway.runner_sub_agents import (
   RunnerSubAgentMixin,
   _build_child_event_log,
+  _ChildActivity,
 )
 
 
@@ -30,6 +31,7 @@ def test_child_log_inherits_parent_prepare_and_forces_sub_agent_identity() -> No
     parent_log=parent_log,
     event_log_cls=EventLog,
     sub_session_id="sub0:session-1",
+    activity=_ChildActivity(),
     progress_cb=None,
     on_sub_event=None,
   )
@@ -57,6 +59,7 @@ def test_child_log_propagates_strict_prepare_failure_without_callbacks() -> None
     parent_log=EventLog(prepare_event=_reject),
     event_log_cls=EventLog,
     sub_session_id="sub1:session-1",
+    activity=_ChildActivity(),
     progress_cb=lambda event, _session_id: progress_events.append(event),
     on_sub_event=lambda event, _session_id: observed_events.append(event),
   )
@@ -95,6 +98,7 @@ def test_foreground_child_approval_is_replayable_from_parent_log_once() -> None:
     parent_log=parent_log,
     event_log_cls=EventLog,
     sub_session_id="sub0:parent-session",
+    activity=_ChildActivity(),
     progress_cb=None,
     on_sub_event=lambda event, _session_id: captured_events.append(event),
   )
@@ -141,6 +145,7 @@ def test_non_approval_child_events_remain_isolated_from_parent_log() -> None:
     parent_log=parent_log,
     event_log_cls=EventLog,
     sub_session_id="sub0:parent-session",
+    activity=_ChildActivity(),
     progress_cb=None,
     on_sub_event=None,
   )

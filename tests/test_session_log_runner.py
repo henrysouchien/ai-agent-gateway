@@ -2374,7 +2374,6 @@ def test_sub_agent_events_are_written_to_parent_log(tmp_path: Path) -> None:
       ),
       sub_session=sub_session,
       max_turns=5,
-      timeout=5.0,
     )
   )
 
@@ -2434,7 +2433,6 @@ def test_spawn_sub_agent_uses_shared_sub_agent_id_helper(tmp_path: Path, monkeyp
       dispatcher=_make_dispatcher(),
       sub_session=None,
       max_turns=5,
-      timeout=5.0,
       call_index=3,
     )
   )

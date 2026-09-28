@@ -32,7 +32,7 @@ LOGS_DIR.mkdir(exist_ok=True)
 REPORTS_DIR.mkdir(exist_ok=True)
 TRANSCRIPTS_DIR.mkdir(exist_ok=True)
 DEFAULT_MODEL = INITIAL_MODEL_REGISTRY.require(
-  "anthropic.claude-opus-5"
+  "anthropic.claude-opus-5-5"
 ).upstream_model
 DEFAULT_EFFORT = "high"
 TENANT_ID = "example-07-full-production"
@@ -200,7 +200,7 @@ def admit_demo_session(session, _api_key, _request) -> None:
   session.role = "owner"
   session.channel = "web"
   session.model_entitled_capabilities = frozenset({"session.driver"})
-  session.model_entitled_keys = frozenset({"anthropic.claude-opus-5"})
+  session.model_entitled_keys = frozenset({"anthropic.claude-opus-5-5"})
 
 
 def materialize_service_credential(
@@ -257,7 +257,6 @@ async def build_chat_runtime(
       get_tool_definitions=get_tool_definitions,
       on_usage=on_usage,
       on_tool_timing=on_tool_timing,
-      per_turn_timeout=90,
       max_budget_usd=0.50,
       user_id=session.user_id,
       request_id=request.request_id,

@@ -85,7 +85,9 @@ def test_all_modules_import_without_checkout_trees(tmp_path: Path) -> None:
         continue
       target = dependency_dir / top
       if not target.exists():
-        source = Path(distribution.locate_file(top))
+        # `locate_file` is typed as the `SimplePath` protocol; every installed
+        # distribution here resolves it to a real filesystem path.
+        source = Path(str(distribution.locate_file(top)))
         if source.exists():
           target.symlink_to(source, target_is_directory=source.is_dir())
     for value in distribution.requires or ():

@@ -10,7 +10,7 @@ import traceback
 import uuid
 from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime
-from typing import Any, Literal, Mapping, NoReturn, Protocol
+from typing import Any, Literal, Mapping, NoReturn, Protocol, get_args
 
 from .ui_blocks_run import UiBlocksRunContext, current_ui_blocks_run
 from .skill_limits import SkillExecutionLimits
@@ -26,6 +26,41 @@ ToolClass = Literal[
   "portfolio_config",
   "irreversible",
 ]
+
+# The money boundary. Placing or cancelling a live order moves real money at a
+# broker, and `irreversible` is the registration-derived class those doors
+# compile to (`api/agent/shared/server_policy_catalog.py`
+# PORTFOLIO_IRREVERSIBLE_TOOLS on `portfolio-trades-mcp`). It is the one class
+# whose decision belongs to a human, on every channel.
+MONEY_BOUNDARY_TOOL_CLASSES: frozenset[ToolClass] = frozenset({"irreversible"})
+# Every other class follows the user's standing approval preference. Derived by
+# complement so a newly added ToolClass is admitted by the preference rather
+# than silently acquiring a human door nobody declared.
+STANDING_APPROVED_TOOL_CLASSES: frozenset[ToolClass] = frozenset(
+  get_args(ToolClass)
+) - MONEY_BOUNDARY_TOOL_CLASSES
+
+# The user's standing answer for every class outside the money boundary.
+# `auto_approve_all_but_trades` is the product default: an agent-driven surface
+# never draws an approval card for a read, a write, or a config change. A user
+# who wants to be asked again sets `request_user_approval`.
+ApprovalPreference = Literal["auto_approve_all_but_trades", "request_user_approval"]
+DEFAULT_APPROVAL_PREFERENCE: ApprovalPreference = "auto_approve_all_but_trades"
+APPROVAL_PREFERENCES: frozenset[str] = frozenset(get_args(ApprovalPreference))
+
+
+def preference_settles_class(
+  *,
+  preference: ApprovalPreference,
+  tool_class: str,
+) -> bool:
+  """Return whether the standing preference decides this class without a human."""
+
+  return (
+    preference == "auto_approve_all_but_trades"
+    and tool_class not in MONEY_BOUNDARY_TOOL_CLASSES
+  )
+
 
 ApprovalIdentitySource = Literal["change_set", "reviewed_change_binding"]
 ApprovalReuseMode = Literal["legacy", "disabled", "exact"]
@@ -443,7 +478,6 @@ class DelegationGrant:
   tool_class_ceiling: frozenset[ToolClass]
   args_predicate: dict[str, Any] | None
   window_seconds: int
-  exclude_external_write_bypass: bool = True
   created_at: datetime
   expires_at: datetime | None = None
   revoked_at: datetime | None = None

@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import replace
-from typing import Any, AsyncIterator, Dict, Literal
+from typing import Any, AsyncGenerator, Dict, Literal, Mapping
 
+from ..auth import ProviderCredentialFailure
 from ..rate_limit import get_global_token_bucket
 from ..rates import RateTable, UnknownModelError, load_provider_rate_table
 from .base import ModelInfo, ModelProvider, StreamEvent, ThinkingLevel, truncate_to_last_compaction
@@ -40,10 +42,21 @@ from .anthropic_helpers import (
   _to_plain_dict as _to_plain_dict,
   _truncate_error_detail as _truncate_error_detail,
 )
+from .anthropic_oauth import (
+  ANTHROPIC_CREDENTIAL_POOL,
+  UNDECLARED_LIMIT_BLOCK_SECONDS,
+  ensure_fresh_anthropic_credential,
+  resolve_anthropic_credentials,
+  rotate_anthropic_credential,
+)
 
 
 log = logging.getLogger("agent_gateway.providers.anthropic")
 _DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+# Failures a sibling credential can actually answer: a spent subscription window
+# and a credential this account can no longer authenticate. Billing and request
+# rejections say the same thing on every sibling, so they are not rotated.
+_ROTATABLE_CREDENTIAL_FAILURES = frozenset({"auth", "rate_limit"})
 _MESSAGE_CACHE_CONTROL = {"type": "ephemeral"}
 _MESSAGE_CACHEABLE_BLOCK_TYPES = frozenset({
   "bash_code_execution_tool_result",
@@ -456,6 +469,57 @@ class AnthropicProvider(ModelProvider):
       return bool(str(config.get("auth_token") or "").strip())
     return bool(str(config.get("api_key") or "").strip())
 
+  def next_credential(
+    self,
+    config: Mapping[str, Any],
+    failure: ProviderCredentialFailure,
+  ) -> dict[str, Any] | None:
+    """The next unblocked sibling credential for the same bound model.
+
+    Subscription limits are per credential, not per model: a 5h/7d rejection
+    says this Claude account is spent, not that the run needs a different
+    model. So the pool parks the rejected credential until the reset the
+    limiter itself reported and hands back a sibling; the caller rebuilds its
+    client from the same `model_key`. With no sibling left the run keeps the
+    existing rate-limit retry.
+    """
+
+    if str(config.get("auth_mode", "api")).strip().lower() != "oauth":
+      return None
+    if failure.kind not in _ROTATABLE_CREDENTIAL_FAILURES:
+      return None
+    current = str(config.get("auth_token") or "").strip()
+    if not current:
+      return None
+    sources = resolve_anthropic_credentials(config)
+    if failure.reset_at is None:
+      log.info(
+        "Anthropic %s failure (status=%s) reported no reset window; parking this "
+        "credential for %.0fs and rotating",
+        failure.kind,
+        failure.status_code,
+        UNDECLARED_LIMIT_BLOCK_SECONDS,
+      )
+    blocked_until = (
+      failure.reset_at
+      if failure.reset_at is not None
+      else time.time() + UNDECLARED_LIMIT_BLOCK_SECONDS
+    )
+    replacement = rotate_anthropic_credential(
+      sources,
+      current=current,
+      until=blocked_until,
+      pool=ANTHROPIC_CREDENTIAL_POOL,
+    )
+    if not replacement:
+      log.warning(
+        "Anthropic %s failure with no unblocked sibling credential in a pool of %d",
+        failure.kind,
+        len(sources.credentials),
+      )
+      return None
+    return {"auth_token": replacement}
+
   def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
     try:
       from anthropic import AsyncAnthropic
@@ -468,11 +532,26 @@ class AnthropicProvider(ModelProvider):
     credential = str(config.get(credential_field) or "").strip()
     if not credential:
       raise RuntimeError(f"No Anthropic {mode} credential configured")
+    if mode == "oauth":
+      # The bound token may have been selected hours ago (a long session, a
+      # captured run). An account enrolled through this product's own login
+      # refreshes here, at the one boundary where the credential becomes a
+      # client; an environment token has no refresh grant and is untouched.
+      credential = ensure_fresh_anthropic_credential(credential, config=config)
 
     auth_header = "Authorization" if mode == "oauth" else "X-Api-Key"
     auth_value = f"Bearer {credential}" if mode == "oauth" else credential
 
     class BoundAsyncAnthropic(AsyncAnthropic):
+      def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        # The SDK imports ambient headers during construction, including copies.
+        # Drop auth overrides before default_headers and pre-request validation.
+        self._custom_headers = {
+          name: value for name, value in self._custom_headers.items()
+          if name.lower() not in {"x-api-key", "authorization"}
+        }
+
       async def _prepare_request(self, request: httpx2.Request) -> None:
         # This SDK hook runs after options are logged and all header layers merge.
         # Bind on the HTTP request so ambient headers lose without logging secrets.
@@ -482,6 +561,16 @@ class AnthropicProvider(ModelProvider):
 
     client_kwargs: Dict[str, Any] = {
       "base_url": _bound_anthropic_base_url(config),
+      # The gateway owns provider retry policy: runner_stream_turn's bounded
+      # STREAM_RETRY_MAX loop plus this provider's next_credential rotation.
+      # The SDK's own retry (anthropic 1.6.0 DEFAULT_MAX_RETRIES=2) is a second
+      # writer: _calculate_retry_timeout obeys the 429's retry-after verbatim
+      # (capped only at 4_294_967 s) and sleeps it inside the request, so a
+      # reset reported in hours never surfaces as RateLimitError and the turn
+      # dies on the watchdog instead of reporting the limit. Zero retries here
+      # hands 429/5xx straight to is_retryable_error, the sanitizer, and the
+      # credential pool.
+      "max_retries": 0,
     }
     if timeout is not None:
       client_kwargs["timeout"] = httpx2.Timeout(timeout=timeout, connect=5.0)
@@ -705,7 +794,8 @@ class AnthropicProvider(ModelProvider):
         omitted_on,
         {},
       )
-    fragments: dict[str, Any] = {"thinking": {"type": "adaptive"}}
+    thinking = _thinking_param(model_info, max_tokens)
+    fragments: dict[str, Any] = {"thinking": thinking} if thinking is not None else {}
     if compat.get("supports_output_config_effort") and effective != ThinkingLevel.NONE:
       fragments["output_config"] = {"effort": effective.value}
     return EffortResolution(requested, effective, effective != ThinkingLevel.NONE, fragments)
@@ -891,7 +981,7 @@ class AnthropicProvider(ModelProvider):
       compaction_as_text=not model_info.supports_native_compaction,
     )
 
-  async def stream(self, client: Any, params: dict[str, Any]) -> AsyncIterator[StreamEvent]:
+  async def stream(self, client: Any, params: dict[str, Any]) -> AsyncGenerator[StreamEvent, None]:
     bucket = get_global_token_bucket()
     if bucket is not None:
       await bucket.acquire(estimated_tokens=int(params.get("max_tokens") or 0))

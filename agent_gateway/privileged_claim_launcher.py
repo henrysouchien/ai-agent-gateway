@@ -37,10 +37,6 @@ _TARGET_ENV = {
     "/var/www/agent_gateway/venv/bin:"
     "/usr/local/bin:/usr/bin:/bin"
   ),
-  "PYTHONPATH": (
-    "/var/www/agent_gateway:"
-    "/var/www/agent_gateway/api"
-  ),
   "CANVAS_BUILD_DIR": "/opt/hank/canvas-build",
   "CANVAS_NODE_BINARY": "/opt/hank/node-v24.16.0/bin/node",
   "BROKERAGE_CONNECT_REQUIRED": "true",
@@ -56,7 +52,7 @@ _TARGET_ENV = {
     "/mnt/hank-data/agent_gateway/data/commercial"
   ),
   "GATEWAY_LOG_DIR": "/mnt/hank-data/agent_gateway/logs",
-  "GATEWAY_URL": "http://127.0.0.1:8001",
+  "GATEWAY_BASE_URL": "http://127.0.0.1:8001",
   "MCP_CONFIG_PATH": (
     "/var/www/agent_gateway/deploy/mcp.production.json"
   ),

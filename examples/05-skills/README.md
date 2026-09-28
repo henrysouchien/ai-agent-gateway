@@ -52,5 +52,5 @@ curl -N http://127.0.0.1:8000/api/chat \
 
 - Skills are plain markdown files with optional YAML frontmatter.
 - `run_agent` spawns focused sub-agents with their own turn budgets.
-- Named skill profiles set timeout and max-turn limits. Provider and model
+- Named skill profiles set max-turn limits. Provider and model
   selection remain owned by the capability resolver.

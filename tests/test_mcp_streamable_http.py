@@ -151,6 +151,7 @@ def test_oauth_auth_reuses_persistent_tokens_with_httpx2(tmp_path) -> None:
 
   async def scenario():
     original = manager._build_http_auth("finance-cli", "https://cashnerd.ai/mcp", config)
+    assert original is not None
     await original.context.storage.set_tokens(
       OAuthToken(access_token="persisted-token", token_type="Bearer"),
     )
@@ -158,6 +159,7 @@ def test_oauth_auth_reuses_persistent_tokens_with_httpx2(tmp_path) -> None:
     different_endpoint = manager._build_http_auth(
       "finance-cli", "https://cashnerd.ai/other-mcp", config,
     )
+    assert different_endpoint is not None
     assert await different_endpoint.context.storage.get_tokens() is None
 
     async def respond(request: httpx2.Request) -> httpx2.Response:

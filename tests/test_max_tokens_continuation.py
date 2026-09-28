@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
@@ -16,6 +18,8 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import (  # noqa: E402
   AgentRunner,
+  AgentSDKConfig,
+  AgentSDKRunner,
   AgentSessionLog,
   CostEstimate,
   EventLog,
@@ -29,6 +33,9 @@ from agent_gateway.sub_agent_narrative_result import final_child_visible_text  #
 from agent_gateway.task_registry import ParentMessage  # noqa: E402
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_runner_capability_execution,
+)
+from gateway_test_support.sdk_capability_execution_test_support import (  # noqa: E402
+  stub_sdk_capability_execution,
 )
 
 
@@ -72,6 +79,7 @@ def _make_runner(
   session_id: str = "sess-max-tokens",
   agent_session_log: AgentSessionLog | None = None,
   message_inbox: asyncio.Queue[ParentMessage] | None = None,
+  max_tokens_override: int | None = None,
 ) -> AgentRunner:
   event_log = EventLog()
   return AgentRunner(
@@ -90,6 +98,7 @@ def _make_runner(
       auth_config=auth_config,
     ),
     get_tool_definitions=lambda: [],
+    max_tokens_override=max_tokens_override,
     agent_session_log=agent_session_log,
     message_inbox=message_inbox,
     user_id="alice",
@@ -126,9 +135,11 @@ def test_max_tokens_turn_with_no_tool_use_continues_with_nudge() -> None:
     assert len(seen_messages) == 2, "run must continue past the truncated turn"
     follow_up = seen_messages[1]
     assert follow_up[-1] == {"role": "user", "content": _MAX_TOKENS_NUDGE}
-    assert "tool-first response" in _MAX_TOKENS_NUDGE
-    assert "smallest valid JSON payload" in _MAX_TOKENS_NUDGE
-    assert "Do not spend another turn on hidden analysis" in _MAX_TOKENS_NUDGE
+    # The continuation asks for the complete call; it never narrows the judgment.
+    nudge = _MAX_TOKENS_NUDGE.lower()
+    assert "complete" in nudge
+    for narrowing in ("smallest", "omit", "trim", "shorten", "minimal"):
+      assert narrowing not in nudge
     # the truncated partial tool_use must NOT be replayed to the model
     replayed_assistant = follow_up[-2]
     assert replayed_assistant["role"] == "assistant"
@@ -366,25 +377,62 @@ def test_max_tokens_turn_with_tool_uses_is_not_intercepted() -> None:
   _run(_case())
 
 
-def test_request_max_tokens_clamped_to_model_max_output() -> None:
-  async def _case() -> None:
-    runner = _make_runner(
-      _StubProvider(max_output_tokens=16_384),
-      auth_config={"api_key": "k", "max_tokens": 64_000},
+async def _requested_max_tokens(runner: AgentRunner) -> int:
+  seen: dict[str, Any] = {}
+
+  async def _fake_stream_turn(**kwargs: Any):
+    seen["max_tokens"] = kwargs["max_tokens"]
+    return object(), StreamTurnResult(
+      full_text="done",
+      stop_reason="end_turn",
+      content_blocks=[{"type": "text", "text": "done"}],
     )
-    seen: dict[str, Any] = {}
 
-    async def _fake_stream_turn(**kwargs: Any):
-      seen["max_tokens"] = kwargs["max_tokens"]
-      return object(), StreamTurnResult(
-        full_text="done",
-        stop_reason="end_turn",
-        content_blocks=[{"type": "text", "text": "done"}],
-      )
+  runner._stream_turn = _fake_stream_turn
+  await runner.run(messages=[{"role": "user", "content": "Start"}], system_prompt="x")
+  return seen["max_tokens"]
 
-    runner._stream_turn = _fake_stream_turn
-    await runner.run(messages=[{"role": "user", "content": "Start"}], system_prompt="x")
 
-    assert seen["max_tokens"] == 16_384
+def test_request_max_tokens_without_override_is_model_ceiling() -> None:
+  runner = _make_runner(
+    _StubProvider(max_output_tokens=128_000),
+    auth_config={"api_key": "k", "max_tokens": 16_000},
+  )
 
-  _run(_case())
+  assert _run(_requested_max_tokens(runner)) == 128_000
+
+
+def test_request_max_tokens_override_clamped_to_model_max_output() -> None:
+  runner = _make_runner(
+    _StubProvider(max_output_tokens=16_384),
+    max_tokens_override=64_000,
+  )
+
+  assert _run(_requested_max_tokens(runner)) == 16_384
+
+
+@pytest.mark.parametrize(
+  ("max_tokens_override", "expected"),
+  [(None, "64000"), (20_000, "20000"), (128_000, "64000")],
+)
+def test_sdk_run_output_limit_resolves_like_the_run_loop(
+  max_tokens_override: int | None,
+  expected: str,
+) -> None:
+  # The SDK child merges this env over the gateway's own, so it is always set:
+  # an unset override requests the model ceiling (64,000 for the stub model),
+  # never whatever CLAUDE_CODE_MAX_OUTPUT_TOKENS the gateway process holds.
+  runner = AgentSDKRunner(
+    event_log=EventLog(),
+    session_id="sess-sdk-max-tokens",
+    sdk_config=AgentSDKConfig(
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    ),
+    capability_execution=stub_sdk_capability_execution(),
+    system_prompt="x",
+    max_tokens_override=max_tokens_override,
+  )
+
+  assert runner._credential_env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == expected

@@ -115,6 +115,16 @@ class ObservationOnlyCostAccumulator(CostAccumulator):
 
 @dataclass(frozen=True)
 class BudgetExceededState:
+  """One budget stop, as rendered to the analyst: ``total_cost >= budget``.
+
+  After a response, ``total_cost`` is the spend the provider reported. Before
+  transport, the run has not spent the money yet and the stop is caused by
+  the cost it cannot avoid, so ``total_cost`` is the observed spend plus the
+  cheapest form of the request that cannot be funded. Either way the rendered
+  inequality states something true; reporting the cap itself claimed a spend
+  that never happened.
+  """
+
   total_cost: float
   budget: float
   reason: Any
@@ -232,27 +242,35 @@ def _project_provider_request_cost(
   *,
   model: str,
   estimated_input_tokens: int,
+  cached_input_tokens: int,
   max_output_tokens: int,
 ) -> float:
+  """Price one request the way the provider is about to bill it.
+
+  Three rates, each on the tokens it actually applies to: the prefix the
+  provider has already cached for this run at the cache-read rate, the
+  newly appended tail at the uncached input rate, and ``max_output_tokens``
+  at the output rate. Neither distortion is safe here. Pricing the whole
+  prompt at the uncached/cache-write worst case on top of a byte-derived
+  token bound that overstates tokens ~4x killed runs with most of their
+  declared budget unspent (docs/queue/run-agent-child-budget-exhausted-at-start.md);
+  pricing it all as a cache read admitted cold requests at several times the
+  remaining budget (.git/codex-commit-audits/9dbe499838fa377b2b10fab8a45f7fc1478e698f.md
+  P1). ``cached_input_tokens`` is what the provider itself reported reading
+  from or writing to the cache on this run's previous request, so a cold run
+  prices every input token uncached.
+  """
+
+  cached = min(max(0, cached_input_tokens), estimated_input_tokens)
   try:
-    uncached_estimate = provider.estimate_cost(
+    estimate = provider.estimate_cost(
       model,
-      estimated_input_tokens,
+      estimated_input_tokens - cached,
       max_output_tokens,
-      cache_read_tokens=0,
+      cache_read_tokens=cached,
       cache_creation_tokens=0,
     )
-    cache_write_estimate = provider.estimate_cost(
-      model,
-      0,
-      max_output_tokens,
-      cache_read_tokens=0,
-      cache_creation_tokens=estimated_input_tokens,
-    )
-    total = max(
-      float(uncached_estimate.total),
-      float(cache_write_estimate.total),
-    )
+    total = float(estimate.total)
   except Exception as exc:
     raise ProviderRequestBudgetError(
       "provider request cost could not be bounded"
@@ -270,18 +288,24 @@ def admit_provider_request_budget(
   provider: Any,
   model: str,
   estimated_input_tokens: int,
+  cached_input_tokens: int,
   requested_max_output_tokens: int,
 ) -> ProviderRequestBudgetAdmission:
-  """Cap one request to the remaining hard budget before provider transport.
+  """Cap one request's output to the remaining hard budget before transport.
 
-  Input tokens are conservatively priced as uncached. Output tokens are
-  bounded by the request's provider-enforced ``max_tokens`` value.
+  Input is priced at the rates it will be billed at (see
+  ``_project_provider_request_cost``). Output tokens are bounded by the
+  request's provider-enforced ``max_tokens`` value, which is the part of the
+  request the run can still trade down.
   """
 
   if (
     isinstance(estimated_input_tokens, bool)
     or not isinstance(estimated_input_tokens, int)
     or estimated_input_tokens < 0
+    or isinstance(cached_input_tokens, bool)
+    or not isinstance(cached_input_tokens, int)
+    or cached_input_tokens < 0
     or isinstance(requested_max_output_tokens, bool)
     or not isinstance(requested_max_output_tokens, int)
     or requested_max_output_tokens <= 0
@@ -302,30 +326,30 @@ def admit_provider_request_budget(
       denied_state=None,
     )
   remaining_usd, effective_budget, reason = remaining
-  minimum_cost = _project_provider_request_cost(
-    provider,
-    model=model,
-    estimated_input_tokens=estimated_input_tokens,
-    max_output_tokens=1,
-  )
+
+  def project(max_output_tokens: int) -> float:
+    return _project_provider_request_cost(
+      provider,
+      model=model,
+      estimated_input_tokens=estimated_input_tokens,
+      cached_input_tokens=cached_input_tokens,
+      max_output_tokens=max_output_tokens,
+    )
+
+  minimum_cost = project(1)
   if minimum_cost > remaining_usd:
     return ProviderRequestBudgetAdmission(
       max_output_tokens=None,
       projected_max_cost=minimum_cost,
       remaining_budget=remaining_usd,
       denied_state=BudgetExceededState(
-        total_cost=effective_budget,
+        total_cost=effective_budget - remaining_usd + minimum_cost,
         budget=effective_budget,
         reason=reason,
         reason_suffix=budget_reason_suffix(reason),
       ),
     )
-  full_cost = _project_provider_request_cost(
-    provider,
-    model=model,
-    estimated_input_tokens=estimated_input_tokens,
-    max_output_tokens=requested_max_output_tokens,
-  )
+  full_cost = project(requested_max_output_tokens)
   if full_cost <= remaining_usd:
     return ProviderRequestBudgetAdmission(
       max_output_tokens=requested_max_output_tokens,
@@ -337,25 +361,13 @@ def admit_provider_request_budget(
   high = requested_max_output_tokens
   while low < high:
     candidate = (low + high + 1) // 2
-    candidate_cost = _project_provider_request_cost(
-      provider,
-      model=model,
-      estimated_input_tokens=estimated_input_tokens,
-      max_output_tokens=candidate,
-    )
-    if candidate_cost <= remaining_usd:
+    if project(candidate) <= remaining_usd:
       low = candidate
     else:
       high = candidate - 1
-  projected = _project_provider_request_cost(
-    provider,
-    model=model,
-    estimated_input_tokens=estimated_input_tokens,
-    max_output_tokens=low,
-  )
   return ProviderRequestBudgetAdmission(
     max_output_tokens=low,
-    projected_max_cost=projected,
+    projected_max_cost=project(low),
     remaining_budget=remaining_usd,
     denied_state=None,
   )

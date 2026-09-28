@@ -71,8 +71,21 @@ def select_run_max_tokens(
   max_tokens_override: int | None,
   model_info: Any,
 ) -> MaxTokensSelection:
-  requested = int(max_tokens_override if max_tokens_override is not None else config["max_tokens"])
+  """Owner of a run's per-turn output request.
+
+  A declared override (operator env, skill declaration, sub-agent or fork
+  handoff) is requested as given and clamped down to the model's output
+  ceiling. With no override the run requests that ceiling itself; the
+  credential-bound `config["max_tokens"]` is read only when the provider
+  reports no ceiling.
+  """
   model_max_output = int(getattr(model_info, "max_output_tokens", 0) or 0)
+  if max_tokens_override is not None:
+    requested = int(max_tokens_override)
+  elif model_max_output > 0:
+    requested = model_max_output
+  else:
+    requested = int(config["max_tokens"])
   if model_max_output > 0 and requested > model_max_output:
     return MaxTokensSelection(
       value=model_max_output,

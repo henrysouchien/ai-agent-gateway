@@ -104,6 +104,17 @@ from agent_gateway.transcript import (
   reconstruct_messages_for_task,
   reconstruct_parent_messages,
 )
+from agent_gateway.capability_execution import CapabilityExecutionResolver
+from agent_gateway.skill_context import (
+  current_skill_admission,
+  reset_current_skill_admission,
+  set_current_skill_admission,
+)
+from agent_gateway.skill_limits import (
+  ActiveSkillAdmission,
+  SkillExecutionLimits,
+  reconcile_skill_admission,
+)
 from gateway_test_support.capability_execution_test_support import (
   stub_bound_capability_execution,
   stub_capability_execution_resolver,
@@ -1018,7 +1029,6 @@ async def _append_interrupted_skill_task(
     operation=operation,
     result_instructions=render_result_instructions(result_requirement),
     max_turns=15,
-    timeout_seconds=None,
     client_timeout_seconds=90,
     max_tokens=64_000,
     cost_observation_threshold_usd=5.0,
@@ -1380,6 +1390,200 @@ semantic_metadata:
     await asyncio.gather(initial_entry.asyncio_task, return_exceptions=True)
 
   _run(_case())
+
+
+@pytest.mark.parametrize("background", [True, False], ids=["background", "foreground"])
+def test_run_agent_child_reconciles_its_own_skill_not_the_parents(
+  tmp_path: Path,
+  owner_session_host_policy,
+  background: bool,
+) -> None:
+  """r3-01: a parent's inline `invoke_skill` admission must not reach its child.
+
+  The child starts through `run_agent`'s real start path: in background, a
+  worker task created with `asyncio.create_task` (which copies the parent's
+  contextvars); in foreground, awaited in the parent's own task. At its first
+  dispatch the child reconciles its own RunContext skill against the ambient
+  admission exactly as the exact-write approval lifecycle does, and the
+  parent's inline admission is intact afterwards.
+  """
+  owner_session_host_policy.get_local_tool_effect = lambda name: (
+    "read" if name == "web_search" else None
+  )
+
+  class _ScriptedChildProvider(ModelProvider):
+    name = "anthropic"
+
+    def __init__(self) -> None:
+      self.calls = 0
+
+    def has_active_credential(self, config: dict[str, Any]) -> bool:
+      _ = config
+      return True
+
+    def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
+      _ = config, timeout
+      return object()
+
+    async def close_client(self, client: Any, timeout: float = 2.0) -> None:
+      _ = client, timeout
+
+    def get_model_info(self, model: str) -> ModelInfo:
+      return ModelInfo(id=model, provider=self.name)
+
+    def normalize_messages(self, messages: list[dict[str, Any]], model_info: ModelInfo) -> list[dict[str, Any]]:
+      _ = model_info
+      return messages
+
+    def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
+      _ = kwargs
+      return {}
+
+    async def stream(self, client: Any, params: dict[str, Any]):
+      _ = client, params
+      self.calls += 1
+      if self.calls == 1:
+        yield StreamEvent(
+          type="tool_use_end",
+          tool_id="child-first-dispatch",
+          tool_name="web_search",
+          tool_input={},
+        )
+        yield StreamEvent(type="message_end", stop_reason="tool_use")
+        return
+      yield StreamEvent(type="text_delta", text="done")
+      yield StreamEvent(type="text_end", raw_block={"type": "text", "text": "done"})
+      yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+  child_dispatchers: list[ToolDispatcher] = []
+  reconciled: list[ActiveSkillAdmission | str | None] = []
+
+  async def web_search(_tool_input: dict[str, Any], **_kwargs: Any):
+    run_context = child_dispatchers[-1]._resolve_run_context()
+    try:
+      reconciled.append(reconcile_skill_admission(
+        skill_name=run_context.skill,
+        execution_limits=run_context.admitted_skill_execution_limits,
+        active_admission=current_skill_admission(),
+      ))
+    except ValueError as exc:
+      reconciled.append(str(exc))
+    return {"ok": True}, None
+
+  async def _case() -> tuple[ActiveSkillAdmission, ActiveSkillAdmission | None]:
+    skills_dir = tmp_path / "skills"
+    _write_skill(
+      skills_dir,
+      "child-skill-b",
+      """
+allowed_tools:
+  - web_search
+mcp_tools: {}
+semantic_metadata:
+  required_context: []
+  tool_refs:
+    - kind: local
+      tool_id: web_search
+  capability_requirements:
+    - name: web.read/v1
+      required: true
+      binding_modes: [live_tool]
+""",
+      body="Read the admitted evidence and report.",
+    )
+    loader = SkillLoader(skills_dir)
+    operation = next(
+      item.snapshot.operation.model_dump(mode="json")
+      for item in loader.list_callable_operations()
+      if item.snapshot.operation.name == "child-skill-b"
+    )
+    provider = _ScriptedChildProvider()
+    base = stub_capability_execution_resolver()
+    resolver = CapabilityExecutionResolver(
+      registry=base.registry,
+      selection_policy=base.selection_policy,
+      auth_context=base.auth_context,
+      credential_materializer=base.credential_materializer,
+      adapter_resolver=lambda _adapter: provider,
+    )
+    runner = _runner(tmp_path)
+    runner._get_tool_definitions = lambda: [{
+      "name": "web_search",
+      "description": "Read-only evidence search.",
+      "input_schema": {"type": "object"},
+    }]
+    spawn_sub_agent = runner.spawn_sub_agent
+
+    async def _recording_spawn_sub_agent(task: str, **kwargs: Any):
+      child_dispatchers.append(kwargs["dispatcher"])
+      return await spawn_sub_agent(task, **kwargs)
+
+    runner.spawn_sub_agent = _recording_spawn_sub_agent
+    handler = make_run_agent_handler(
+      [runner],
+      parent_session=GatewaySession(
+        session_id="parent",
+        api_key_hash="hash",
+        created_at=1,
+        expires_at=2,
+        user_id="alice",
+        role="owner",
+      ),
+      skill_loader=loader,
+      mcp_client=_NullMcpClient(),
+      local_tool_handlers={"web_search": web_search},
+      capability_execution_resolver=resolver,
+    )
+    parent_dispatcher = ToolDispatcher(
+      mcp_client=_NullMcpClient(),
+      local_tool_handlers={"run_agent": handler},
+      session_id="parent",
+      role="owner",
+    )
+    parent_admission = ActiveSkillAdmission(
+      skill_name="parent-skill-a",
+      execution_limits=SkillExecutionLimits(
+        max_turns=None,
+        max_tokens=None,
+        max_budget_usd=None,
+      ),
+    )
+    token = set_current_skill_admission(parent_admission)
+    try:
+      result, error = await parent_dispatcher.dispatch(
+        "parent-run-agent",
+        "run_agent",
+        {
+          "operation": operation,
+          "objective": "Read the admitted evidence.",
+          "background": background,
+        },
+      )
+      assert error is None
+      assert result is not None
+      if background:
+        entry = runner._task_registry.get(result["task_id"])
+        assert entry is not None
+        assert isinstance(entry.asyncio_task, asyncio.Task)
+        await asyncio.wait_for(entry.asyncio_task, timeout=10)
+      return parent_admission, current_skill_admission()
+    finally:
+      reset_current_skill_admission(token)
+
+  parent_admission, parent_after = _run(_case())
+
+  assert len(child_dispatchers) == 1
+  child_run_context = child_dispatchers[0]._resolve_run_context()
+  assert child_run_context.skill == "child-skill-b"
+  child_limits = child_run_context.admitted_skill_execution_limits
+  assert child_limits is not None
+  assert reconciled == [
+    ActiveSkillAdmission(
+      skill_name="child-skill-b",
+      execution_limits=child_limits,
+    )
+  ]
+  assert parent_after is parent_admission
 
 
 def test_resume_handler_explicit_none_keeps_empty_interceptors(
@@ -5809,7 +6013,6 @@ def test_resume_handler_uses_exact_admitted_prompt_after_skill_source_changes(
     )
     assert captured["system_prompt"] == successor_snapshot.system_prompt
     assert captured["max_turns"] == successor_snapshot.max_turns
-    assert captured["timeout"] == successor_snapshot.timeout_seconds
     assert captured["client_timeout"] == (
       successor_snapshot.client_timeout_seconds
     )

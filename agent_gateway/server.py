@@ -80,7 +80,7 @@ from .session import (
   AuthManager,
   GatewaySession,
   SessionStore,
-  StreamSubscriber,
+  SessionStream,
   bind_session_credentials,
   session_owner_user_id,
 )
@@ -153,6 +153,7 @@ from .server_chat_helpers import (  # noqa: F401
   _capability_execution_resolver_for_session,
   prepare_session_driver_turn,
   _dispatch_chat_turn,
+  _await_dispatched_turn,
   _init_approval_subsystem,
 )
 
@@ -1490,12 +1491,13 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
           pass
 
     event_log = EventLog(session_id=sid, defer_terminal_close=bool(body.drain_trailing))
+    active_turn = SessionStream(event_log=event_log, runner_task=None)
     try:
       dispatch_task = asyncio.create_task(
         _dispatch_chat_turn(
           session,
           inputs,
-          event_log=event_log,
+          turn=active_turn,
           on_event=_on_chat_event,
           build_chat_runtime=app.state.gateway_build_chat_runtime,
           transcript_dir=transcript_dir,
@@ -1508,19 +1510,12 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       if session._commercial_dispatch_owner is commercial_dispatch_owner:
         session._commercial_dispatch_owner = None
       raise
-    await asyncio.sleep(0)
-    if dispatch_task.done():
-      exc = dispatch_task.exception()
-      if exc is not None:
-        raise exc
-    active_turn = session.active_turn
-    subscriber: StreamSubscriber | None = None
-    if active_turn is not None and active_turn.event_log is event_log:
-      subscriber = _register_stream_subscriber(
-        active_turn,
-        after_seq=0,
-        client_label="post",
-      )
+    await _await_dispatched_turn(active_turn, dispatch_task)
+    subscriber = _register_stream_subscriber(
+      active_turn,
+      after_seq=0,
+      client_label="post",
+    )
 
     async def finalize_dispatch_task() -> None:
       try:
@@ -1547,15 +1542,11 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       async with cleanup_lock:
         if cleanup_complete:
           return
-        active_turn = session.active_turn
-        if active_turn is not None and active_turn.event_log is event_log and subscriber is not None:
-          await _cleanup_stream_subscriber(active_turn, subscriber.subscriber_id)
+        await _cleanup_stream_subscriber(active_turn, subscriber.subscriber_id)
         cleanup_complete = True
 
     async def event_generator():
       try:
-        if active_turn is None or subscriber is None:
-          return
         async for chunk in _stream_subscriber_sse(
           session=session,
           active_turn=active_turn,

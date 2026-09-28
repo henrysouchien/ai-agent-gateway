@@ -15,7 +15,6 @@ from typing import AbstractSet, Any, Awaitable, Callable, Dict, List, Optional, 
 from agent_workflow_contracts import ResultRequirement
 
 from .agent_session_log import AgentSessionLog
-from .auth import ProviderCredentialFailure
 from .capability_execution import BoundCapabilityExecution
 from .context_builder import SessionContextBuilder
 from .context_capture import ContextCapture
@@ -40,9 +39,9 @@ from .runner_introspection import (
 )
 from .runner_limits import (
   CONTEXT_PRESSURE_REMINDER_PCT as CONTEXT_PRESSURE_REMINDER_PCT,
-  conservative_request_input_token_bound_for_request as _conservative_request_input_token_bound_for_request,  # noqa: F401 - compatibility alias
   effective_compaction_trigger as _effective_compaction_trigger,  # noqa: F401 - compatibility alias
   model_context_window as _model_context_window,  # noqa: F401 - compatibility alias
+  request_input_token_estimate_for_request as _request_input_token_estimate_for_request,  # noqa: F401 - compatibility alias
   token_estimate_snapshot as _token_estimate_snapshot,  # noqa: F401 - compatibility alias
 )
 from .runner_run_loop_defaults import (
@@ -177,19 +176,10 @@ kill_background_tasks_for_asyncio_tasks = _kill_background_tasks_for_asyncio_tas
 log = logging.getLogger("agent_gateway.runner")
 STREAM_GUARD_POLL_INTERVAL = 2.0
 # Liveness is guarded by event-gap stall detection (retryable), NOT wall clock:
-# thinking-turn duration is unpredictable, so per_turn_timeout should be None on
-# thinking surfaces. If a caller does set it, it must comfortably EXCEED the
-# stall allowance above or the terminal per-turn abort preempts the retryable
-# stall guard on a slow first token (both timers start near turn start;
-# per-turn always leads). See ACUI-25.
+# thinking-turn duration is unpredictable. See ACUI-25.
 STREAM_RETRY_MAX = 3
 STREAM_RETRY_DELAY = 2.0
 STREAM_RETRY_BACKOFF = 2.0
-# Backstop cap for inline run_agent dispatch (ACUI-1). Must comfortably exceed
-# sub_agent.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS (1800s) so the inner spawn
-# timeout fires first and returns a clean tool error; this only triggers if
-# that inner await itself never resolves.
-_RUN_AGENT_DISPATCH_TIMEOUT_SECONDS = 2100.0
 _ACTIVE_SKILL_ALLOW_RESULT_KEY = "_active_skill_allow"
 _ACTIVE_SKILL_DENY_RESULT_KEY = "_active_skill_deny"
 _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY = "_active_skill_report_doors"
@@ -200,7 +190,10 @@ _REPORT_DOOR_CLEAR_SUCCESS_STATUSES = frozenset({"noop", "staged"})
 
 
 
-OnToolResult = Callable[[ToolResultContext], Awaitable[List[Dict[str, Any]] | None]]
+OnToolResult = Callable[
+  [ToolResultContext],
+  Awaitable[List[Dict[str, Any]] | None] | List[Dict[str, Any]] | None,
+]
 OnUsage = Callable[[UsageEvent], Awaitable[None] | None]
 OnSessionSummary = Callable[[SessionUsageSummary], Awaitable[None] | None]
 OnBeforeStreamComplete = Callable[..., Awaitable[None] | None]
@@ -209,7 +202,6 @@ OnMaxTurns = Callable[[List[Dict[str, Any]], int], Awaitable[str | None]]
 BackgroundTaskHandler = Callable[..., Awaitable[Tuple[Optional[Any], Optional[Dict[str, Any]]]]]
 BackgroundTaskCallback = Callable[[BackgroundTask | TaskEntry], Awaitable[None] | None]
 OnMetric = Callable[[str, int], None]
-OnCredentialRefresh = Callable[[ProviderCredentialFailure], Awaitable[Dict[str, Any] | None] | Dict[str, Any] | None]
 ShutdownSignalProvider = Callable[[], Dict[str, Any] | None]
 
 
@@ -281,7 +273,6 @@ class AgentRunner(
     allow_stub_response: bool = False,
     client_timeout: float | None = None,
     max_tokens_override: int | None = None,
-    per_turn_timeout: float | None = None,
     stream_stall_timeout: float | None = None,
     mcp_client: McpClientManager | None = None,
     mcp_activation_fold: McpActivationFold | None = None,
@@ -302,7 +293,6 @@ class AgentRunner(
     channel: str | None = None,
     usage_ledger_dlq_path: Path | str | None = None,
     on_metric: OnMetric | None = None,
-    on_credential_failure: OnCredentialRefresh | None = None,
     sub_agent_config: SubAgentConfig | None = None,
     compaction_trigger: int | None = None,
     compaction_instructions: str | None = None,
@@ -528,7 +518,6 @@ class AgentRunner(
     self._effort_resolution: EffortResolution | None = None
     self._client_timeout = client_timeout
     self._max_tokens_override = max_tokens_override
-    self._per_turn_timeout = per_turn_timeout
     self._stream_stall_timeout = stream_stall_timeout
     self._mcp_client = mcp_client
     # Pass-through only: the runner neither reads nor writes this fold. It
@@ -583,7 +572,6 @@ class AgentRunner(
       Path(usage_ledger_dlq_path).expanduser() if usage_ledger_dlq_path is not None else DEFAULT_USAGE_DLQ_PATH
     )
     self._on_metric = on_metric
-    self._on_credential_failure = on_credential_failure
     self._sub_agent_config = sub_agent_config
     self._compaction_trigger = compaction_trigger
     self._compaction_instructions = compaction_instructions
@@ -1033,9 +1021,6 @@ class AgentRunner(
 
   def _operator_pause_requested(self) -> bool:
     return bool(self._operator_pause_event is not None and self._operator_pause_event.is_set())
-
-  def set_credential_refresher(self, callback: OnCredentialRefresh | None) -> None:
-    self._on_credential_failure = callback
 
   @staticmethod
   def _annotate_result(result: Any, tool_name: str = "") -> Any:

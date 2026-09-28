@@ -116,7 +116,6 @@ class _FakeAutonomousProcess:
   async def wait(self) -> int:
     while self.returncode is None:
       await asyncio.sleep(0.01)
-    self._close_inherited_fds()
     return self.returncode
 
   def retain_inherited_fds(self, inherited_fds: tuple[int, ...]) -> None:

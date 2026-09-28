@@ -15,6 +15,7 @@ export const CAPABILITY_RESOLUTION_CODES = [
   "capability_model_deprecated",
   "capability_model_disabled",
   "capability_model_not_allowed",
+  "capability_model_retired",
   "capability_model_revoked",
   "capability_model_unavailable",
   "capability_policy_missing",

@@ -41,6 +41,7 @@ from .runner import (
   _detect_user_id_param,
 )
 from .runner_introspection import detect_keyword_param as _detect_keyword_param
+from .runner_state import select_run_max_tokens
 from .run_identity import (
   MODEL_RUN_IDENTITY_LOCAL_TOOLS,
   RunIdentityCarrier,
@@ -653,16 +654,23 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     self._credential_env = _agent_sdk_credential_env(
       capability_execution
     )
-    if max_tokens_override is not None:
-      if (
-        isinstance(max_tokens_override, bool)
-        or not isinstance(max_tokens_override, int)
-        or max_tokens_override <= 0
-      ):
-        raise ValueError("SDK max_tokens_override must be a positive integer")
-      self._credential_env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(
-        max_tokens_override
-      )
+    if max_tokens_override is not None and (
+      isinstance(max_tokens_override, bool)
+      or not isinstance(max_tokens_override, int)
+      or max_tokens_override <= 0
+    ):
+      raise ValueError("SDK max_tokens_override must be a positive integer")
+    # Always set: ClaudeAgentOptions.env merges with the parent environment, so
+    # an unset value would inherit the gateway's CLAUDE_CODE_MAX_OUTPUT_TOKENS.
+    self._credential_env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(
+      select_run_max_tokens(
+        dict(capability_execution.auth_config),
+        max_tokens_override=max_tokens_override,
+        model_info=capability_execution.provider.get_model_info(
+          capability_bind.upstream_model
+        ),
+      ).value
+    )
     self._max_tokens_override = max_tokens_override
     self._system_prompt = system_prompt
     self._disallowed_tools = list(disallowed_tools or sdk_config.disallowed_tools)
@@ -1485,28 +1493,24 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       error=None,
       completion_event=completion_event,
     )
-    safe_result = sanitize_boundary_value(
-      result,
-      sink="sdk_model_tool_result",
-      boundary=self._secret_boundary,
-    )
-    safe_additional_context = (
-      sanitize_boundary_value(
-        additional_context,
-        sink="sdk_model_tool_result",
-        boundary=self._secret_boundary,
+    additional_context = (
+      str(
+        sanitize_boundary_value(
+          additional_context,
+          sink="sdk_model_tool_result",
+          boundary=self._secret_boundary,
+        )
       )
       if additional_context
-      else None
+      else additional_context
     )
     if tool_surface_changed:
       self._sdk_rebuild_transcript.append(
         f"TOOL {tool_name} RESULT: "
-        + json.dumps(safe_result, sort_keys=True, default=str)
+        + json.dumps(result, sort_keys=True, default=str)
       )
     if (
-      safe_result == result
-      and not safe_additional_context
+      not additional_context
       and not had_private_load_signal
       and not had_private_skill_signal
       and not tool_surface_changed
@@ -1516,14 +1520,12 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     hook_output: dict[str, Any] = {
       "hookEventName": "PostToolUse",
     }
-    if (
-      safe_result != result
-      or had_private_load_signal
-      or had_private_skill_signal
-    ):
-      hook_output["updatedMCPToolOutput"] = safe_result
-    if safe_additional_context:
-      hook_output["additionalContext"] = safe_additional_context
+    # The only rewrite left is the gateway's own: a private load or skill
+    # signal replaces the payload. A tool's result is not reprojected here.
+    if had_private_load_signal or had_private_skill_signal:
+      hook_output["updatedMCPToolOutput"] = result
+    if additional_context:
+      hook_output["additionalContext"] = additional_context
     if (
       tool_surface_changed
       or (had_private_load_signal and rebuild_error is None)
@@ -1570,29 +1572,34 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       error=error,
       completion_event=completion_event,
     )
+    # The failure message is authored by the tool's server and the hook's
+    # additional context is authored here: both are bounded text, the same
+    # class the durable event projects. The result payload is not reprojected.
     safe_error = sanitize_boundary_value(
       error,
       sink="sdk_model_tool_error",
       boundary=self._secret_boundary,
     )
-    safe_additional_context = (
-      sanitize_boundary_value(
-        additional_context,
-        sink="sdk_model_tool_error",
-        boundary=self._secret_boundary,
+    additional_context = (
+      str(
+        sanitize_boundary_value(
+          additional_context,
+          sink="sdk_model_tool_error",
+          boundary=self._secret_boundary,
+        )
       )
       if additional_context
-      else None
+      else additional_context
     )
-    if not safe_additional_context and safe_error == error:
+    if not additional_context and safe_error == error:
       return {}
     response: dict[str, Any] = {
       "hookSpecificOutput": {
         "hookEventName": "PostToolUseFailure",
       }
     }
-    if safe_additional_context:
-      response["hookSpecificOutput"]["additionalContext"] = safe_additional_context
+    if additional_context:
+      response["hookSpecificOutput"]["additionalContext"] = additional_context
     if safe_error != error:
       response["decision"] = "block"
       response["reason"] = str(safe_error)

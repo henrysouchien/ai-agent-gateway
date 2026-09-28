@@ -71,6 +71,7 @@ def create_control_plane_router(
   ))
   router.include_router(build_runs_router(
     auth=auth,
+    skill_catalog=control_skill_catalog,
     autonomous_registry=autonomous_registry,
     dispatch_scope_validator=dispatch_scope_validator,
     control_profile_loader=control_profile_loader,

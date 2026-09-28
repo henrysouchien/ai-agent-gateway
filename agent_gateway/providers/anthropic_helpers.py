@@ -95,6 +95,25 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
     ),
   ),
   (
+    ("claude-opus-5-5",),
+    ModelInfo(
+      id="claude-opus-5-5",
+      provider="anthropic",
+      context_window=1_000_000,
+      max_output_tokens=128_000,
+      supports_thinking=True,
+      supports_native_compaction=True,
+      thinking_mode="adaptive",
+      input_cost_per_mtok=4.00,
+      output_cost_per_mtok=20.00,
+      cache_read_cost_per_mtok=0.20,
+      cache_write_cost_per_mtok=5.00,
+      # Thinking is always on: `thinking: {"type": "disabled"}` is a 400, and the
+      # API's omitted-effort default is medium (Opus 5.5 migration guide).
+      compat=_adaptive_compat(disable="unsupported", omitted="on", default_effort="medium", values=_EFFORT_5),
+    ),
+  ),
+  (
     ("claude-opus-5",),
     ModelInfo(
       id="claude-opus-5",
@@ -160,10 +179,10 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       supports_thinking=True,
       supports_native_compaction=True,
       thinking_mode="adaptive",
-      input_cost_per_mtok=3.00,
-      output_cost_per_mtok=15.00,
-      cache_read_cost_per_mtok=0.30,
-      cache_write_cost_per_mtok=3.75,
+      input_cost_per_mtok=2.00,
+      output_cost_per_mtok=10.00,
+      cache_read_cost_per_mtok=0.20,
+      cache_write_cost_per_mtok=2.50,
       compat=_adaptive_compat(disable="disabled", omitted="on", default_effort="high", values=_EFFORT_5),
     ),
   ),
@@ -338,7 +357,11 @@ def _model_info_from_registry_entry(
 
 def _thinking_param(model_info: ModelInfo, max_tokens: int) -> dict[str, Any] | None:
   if model_info.thinking_mode == "adaptive":
-    return {"type": "adaptive"}
+    # `display: "summarized"` streams thinking text as `thinking_delta`: the
+    # stored block keeps the summary beside its signature, and the deltas feed
+    # the stream stall guard through long thinking phases that otherwise emit
+    # nothing (337 s observed on opus-5 effort high without it).
+    return {"type": "adaptive", "display": "summarized"}
 
   if model_info.thinking_mode == "budget":
     budget_tokens = min(10000, max_tokens - 1024)

@@ -129,9 +129,8 @@ class _Dispatcher:
     return {"status": "ok", "echo": dict(tool_input)}, None
 
 
-class _SecretResultDispatcher(_Dispatcher):
-  def __init__(self, secret: str) -> None:
-    self.secret = secret
+class _InputRecordingDispatcher(_Dispatcher):
+  def __init__(self) -> None:
     self.inputs: list[dict[str, Any]] = []
 
   async def dispatch(
@@ -146,7 +145,7 @@ class _SecretResultDispatcher(_Dispatcher):
   ):
     _ = tool_id, tool_name, call_index
     self.inputs.append(dict(tool_input))
-    return {"status": "ok", "credential": self.secret}, None
+    return {"status": "ok"}, None
 
 
 class _TaskResultDispatcher(_Dispatcher):
@@ -419,7 +418,7 @@ def _runner(dispatcher: _Dispatcher | None = None) -> AgentRunner:
   )
 
 
-def test_tool_secret_is_absent_from_model_event_durable_and_replay_boundaries(
+def test_model_authored_tool_input_secret_is_absent_from_every_persisted_boundary(
   tmp_path: Path,
 ) -> None:
   secret = "CUSTOM-ACTIVE-CREDENTIAL-CODEX-WAVE0-8f21d7"
@@ -430,7 +429,7 @@ def test_tool_secret_is_absent_from_model_event_durable_and_replay_boundaries(
     effort="none",
     auth_config={"api_key": secret},
   )
-  dispatcher = _SecretResultDispatcher(secret)
+  dispatcher = _InputRecordingDispatcher()
   runner = AgentRunner(
     event_log=EventLog(session_id="secret-boundary"),
     dispatcher=dispatcher,  # type: ignore[arg-type]
@@ -455,14 +454,15 @@ def test_tool_secret_is_absent_from_model_event_durable_and_replay_boundaries(
   replay = _run(SessionContextBuilder(agent_session_log=session_log).build())
 
   assert dispatcher.inputs == [{"query": "ordinary", "credential": secret}]
+  events = [entry.event for entry in runner._log.entries]
   assert secret not in json.dumps(live_entry)
-  assert secret not in json.dumps([entry.event for entry in runner._log.entries])
+  assert secret not in json.dumps(events)
   assert secret not in json.dumps([entry.event for entry in durable])
   assert secret not in json.dumps(replay)
-  assert "<redacted-secret>" in json.dumps(live_entry)
+  assert "<redacted-secret>" in json.dumps(events)
 
 
-def test_unhandled_tool_exception_is_raw_for_hook_but_sanitized_at_all_boundaries(
+def test_unhandled_tool_exception_is_projected_once_at_its_source(
   tmp_path: Path,
 ) -> None:
   secret = "CUSTOM-ACTIVE-CREDENTIAL-TOOL-EXCEPTION-8f21d7"
@@ -517,7 +517,8 @@ def test_unhandled_tool_exception_is_raw_for_hook_but_sanitized_at_all_boundarie
   durable, _ = _run(session_log.query(order="asc"))
   replay = _run(SessionContextBuilder(agent_session_log=session_log).build())
 
-  assert secret in json.dumps(hook_errors)
+  assert secret not in json.dumps(hook_errors)
+  assert "<redacted-secret>" in json.dumps(hook_errors)
   assert extra_blocks == [
     {"type": "text", "text": "ordinary hook note", "api_key_set": True}
   ]
@@ -1029,7 +1030,7 @@ def test_execute_single_tool_keeps_ui_blocks_validation_failure_recoverable() ->
   )
 
   assert "validation_failed" in json.loads(live_entry["content"])
-  assert not hasattr(runner, "_stop_after_tool_results_reason")
+  assert getattr(runner, "_final_answer_turn_tool_name", None) is None
 
 
 def test_foreground_run_agent_emits_canonical_task_result_json() -> None:
@@ -1183,7 +1184,7 @@ def test_execute_single_tool_exposes_top_level_tool_usage_hint_in_model_error_da
   assert complete_events[-1]["final_tool_result_blocks"][0]["content"] == live_entry["content"]
 
 
-def test_execute_single_tool_stops_after_repeated_generic_excluded_tool() -> None:
+def test_repeated_generic_excluded_tool_claims_a_final_answer_turn() -> None:
   runner = AgentRunner(
     event_log=EventLog(session_id="test"),
     dispatcher=_ExplodingDispatcher(),  # type: ignore[arg-type]
@@ -1213,9 +1214,11 @@ def test_execute_single_tool_stops_after_repeated_generic_excluded_tool() -> Non
   assert error["sub_code"] == "repeated_tool_excluded"
   assert error["data"]["blocked_tool"] == "apply_patch_ops"
   assert error["data"]["exclusion_count"] == 2
-  assert error["data"]["stop_after_tool_results"] is True
-  assert runner._stop_after_tool_results_reason == "repeated_tool_excluded"
-  assert runner._stop_after_tool_results_tool_name == "apply_patch_ops"
+  assert error["data"]["final_answer_turn"] is True
+  # The excluded-tool guard never settles the turn: an excluded call is a
+  # tool-level error, so the model still gets the turn its evidence earned.
+  assert getattr(runner, "_stop_after_tool_results_reason", None) is None
+  assert runner._final_answer_turn_tool_name == "apply_patch_ops"
 
 
 def test_execute_single_tool_stops_after_expired_approval() -> None:

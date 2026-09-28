@@ -12,14 +12,7 @@ from fastapi import FastAPI, HTTPException
 
 
 from .agent_session_log import _atomic_write_sidecar
-from .approval_audit import ApprovalAuditEmitter
-from .approval_notifications import (
-  build_env_approval_notification_destination_resolver,
-  build_env_telegram_approval_notification_sender,
-)
-from .approval_resolver import resolve_policy
-from .approval_store import SQLiteApprovalStore, resolve_approval_db_path
-from .audit_resolver import resolve_audit_writer
+from .approval_subsystem import build_approval_subsystem
 from .capability_binding import (
   CAPABILITY_IDS,
   AuthContext,
@@ -51,6 +44,7 @@ from .session import (
   SessionStream,
   StreamSubscriber,
   bind_session_capability_selections,
+  session_ttl_elapsed,
 )
 from .session_recap import emit_recap_then_terminal
 from .selected_content import SelectedContentAdmission
@@ -83,6 +77,7 @@ from .server_models import (
   RequestApproval,
   SessionExecutionPolicy,
   _ACTIVE_TURN_GRACE_SECONDS,
+  _ACTIVE_TURN_SETTLE_WAIT_SECONDS,
   _STREAM_SUBSCRIBER_DONE,
   _STREAM_SUBSCRIBER_KEEPALIVE_SECONDS,
   _STREAM_SUBSCRIBER_QUEUE_MAX,
@@ -206,7 +201,7 @@ async def _cleanup_sessions_loop(
   session_store: SessionStore,
   *,
   transcript_dir: Optional[Path] = None,
-  transcript_retention_days: int = 7,
+  transcript_retention_days: int = 0,
 ) -> None:
   while True:
     await asyncio.sleep(300)
@@ -252,6 +247,60 @@ def _clear_active_turn(session: GatewaySession, active_turn: SessionStream) -> N
 
 def _active_turn_is_running(active_turn: SessionStream | None) -> bool:
   return active_turn is not None and active_turn.is_running
+
+
+async def _await_settling_active_turn(session: GatewaySession) -> bool:
+  """Wait out a turn that has already published its terminal event.
+
+  Once the analyst has seen the terminal event the turn is over as far as
+  the conversation is concerned; what remains — fanout stop, event-log
+  close, lease release, ``stream_active`` reset — is teardown the next turn
+  must merely follow, not be refused by. Heavy tool-laden turns took long
+  enough over that window that the follow-up an analyst typed right after
+  ``done`` was answered with "a turn is already running" and thrown away
+  (R1-08, 2026-09-17).
+
+  Returns whether the previous turn settled inside the window.
+  """
+
+  active_turn = session.active_turn
+  if active_turn is None or not log_has_terminal(active_turn.event_log):
+    return True
+  if active_turn.settled.is_set():
+    return True
+  try:
+    await asyncio.wait_for(
+      active_turn.settled.wait(),
+      timeout=_ACTIVE_TURN_SETTLE_WAIT_SECONDS,
+    )
+  except asyncio.TimeoutError:
+    return False
+  return True
+
+
+async def _await_dispatched_turn(turn: SessionStream, dispatch_task: asyncio.Task[Any]) -> None:
+  """Wait until the dispatched turn holds the session, or its dispatch failed.
+
+  A reader is bound to the turn it dispatched, never to whatever
+  ``session.active_turn`` holds a tick later: the previous turn keeps that slot
+  through its own teardown — a deferred citation-validation drain holds it for
+  up to twelve seconds after the analyst has already seen ``stream_complete`` —
+  and a reader that samples the slot early found no turn of its own, streamed
+  nothing and wrote nothing to the session log while the run it had started
+  executed and was billed (four dark turns, 2026-09-18 chain acceptance).
+
+  A dispatch that ends before attaching ended in a refusal, and that refusal is
+  the caller's to raise as its status code.
+  """
+
+  attached = asyncio.ensure_future(turn.attached.wait())
+  try:
+    await asyncio.wait({attached, dispatch_task}, return_when=asyncio.FIRST_COMPLETED)
+  finally:
+    attached.cancel()
+  if turn.attached.is_set():
+    return
+  await dispatch_task
 
 
 def _schedule_active_turn_clear(session: GatewaySession, active_turn: SessionStream) -> None:
@@ -1054,7 +1103,7 @@ async def _dispatch_chat_turn(
   session: GatewaySession,
   inputs: ChatTurnInputs,
   *,
-  event_log: EventLog,
+  turn: SessionStream,
   on_event: Callable[[dict[str, Any]], Awaitable[None]],
   build_chat_runtime: BuildChatRuntime,
   transcript_dir: Path | None,
@@ -1062,12 +1111,18 @@ async def _dispatch_chat_turn(
   prepared_turn: PreparedChatTurn | None = None,
   required_event_delivery: bool = False,
 ) -> ChatTurnResult:
-  """Run one chat turn outside the ASGI response lifecycle."""
+  """Run one chat turn outside the ASGI response lifecycle.
+
+  The caller owns ``turn`` — the stream object this turn's events flow
+  through — from before the dispatch, so a reader binds to the turn it
+  dispatched instead of to whatever ``session.active_turn`` happens to hold.
+  """
+  event_log = turn.event_log
   try:
     return await _dispatch_chat_turn_body(
       session,
       inputs,
-      event_log=event_log,
+      turn=turn,
       on_event=on_event,
       build_chat_runtime=build_chat_runtime,
       transcript_dir=transcript_dir,
@@ -1089,7 +1144,7 @@ async def _dispatch_chat_turn_body(
   session: GatewaySession,
   inputs: ChatTurnInputs,
   *,
-  event_log: EventLog,
+  turn: SessionStream,
   on_event: Callable[[dict[str, Any]], Awaitable[None]],
   build_chat_runtime: BuildChatRuntime,
   transcript_dir: Path | None,
@@ -1097,6 +1152,7 @@ async def _dispatch_chat_turn_body(
   prepared_turn: PreparedChatTurn | None = None,
   required_event_delivery: bool = False,
 ) -> ChatTurnResult:
+  event_log = turn.event_log
   if (
     inputs.commercial_dispatch_owner is not None
     and session._commercial_dispatch_owner is not inputs.commercial_dispatch_owner
@@ -1104,12 +1160,25 @@ async def _dispatch_chat_turn_body(
     raise HTTPException(status_code=409, detail="Commercial dispatch ownership was lost")
   if session.kind != "chat":
     raise HTTPException(status_code=400, detail="control sessions cannot dispatch chat turns")
+  if not await _await_settling_active_turn(session):
+    raise HTTPException(
+      status_code=409,
+      detail=(
+        "The previous turn published its terminal event but has not "
+        f"released the session within {_ACTIVE_TURN_SETTLE_WAIT_SECONDS:g}s"
+      ),
+    )
   if _active_turn_is_running(session.active_turn):
     raise HTTPException(status_code=409, detail="A turn is already running; subscribe via /chat/subscribe")
   if session.active_turn is not None:
     _clear_active_turn(session, session.active_turn)
   if session.stream_active:
     raise HTTPException(status_code=409, detail="A turn is already running; subscribe via /chat/subscribe")
+  # The request was authenticated while the previous turn could still hold
+  # the session live past its TTL; admission reads the TTL again here, with no
+  # await before the attach below, so an expired session cannot start a turn.
+  if session_ttl_elapsed(session, expires_at=session.expires_at, now=int(time.time())):
+    raise HTTPException(status_code=401, detail="Session expired")
 
   prepared = prepared_turn or prepare_session_driver_turn(
     session,
@@ -1143,11 +1212,10 @@ async def _dispatch_chat_turn_body(
     session._commercial_dispatch_owner = None
   session.stream_active = True
   sid = session.session_id
-  active_turn = SessionStream(
-    event_log=event_log,
-    runner_task=asyncio.current_task(),
-  )
+  active_turn = turn
+  active_turn.runner_task = asyncio.current_task()
   session.active_turn = active_turn
+  active_turn.attached.set()
 
   previous_on_event = getattr(event_log, "_on_event", None)
   previous_session_id = getattr(event_log, "_session_id", "")
@@ -1308,13 +1376,6 @@ async def _dispatch_chat_turn_body(
         raise RuntimeError(
           "chat runner did not preserve the exact session.driver execution"
         )
-      clear_credential_refresher = getattr(
-        runner,
-        "set_credential_refresher",
-        None,
-      )
-      if callable(clear_credential_refresher):
-        clear_credential_refresher(None)
     finally:
       reset_ui_blocks_run(ui_blocks_token)
     setattr(event_log, "_gateway_execution_location", runtime.execution_location)
@@ -1458,6 +1519,7 @@ async def _dispatch_chat_turn_body(
     session.stream_active = False
     if session.active_turn is active_turn:
       _schedule_active_turn_clear(session, active_turn)
+    active_turn.settled.set()
 
   if required_event_delivery and fanout_failure.done():
     raise RuntimeError(
@@ -1474,21 +1536,13 @@ async def _dispatch_chat_turn_body(
 
 
 def _init_approval_subsystem(app: FastAPI, config: GatewayServerConfig) -> None:
-  audit_writer = resolve_audit_writer()
-  audit_emitter = ApprovalAuditEmitter(
-    writer=audit_writer,
-    deployment_secret=config.audit_hmac_secret_resolver(),
-    key_id=config.audit_hmac_key_id_resolver(),
+  subsystem = build_approval_subsystem(
+    audit_hmac_secret=config.audit_hmac_secret_resolver(),
+    audit_hmac_key_id=config.audit_hmac_key_id_resolver(),
     tool_input_redactor=config.tool_input_redactor,
   )
-  store = SQLiteApprovalStore(
-    path=resolve_approval_db_path(),
-    audit_emitter=audit_emitter,
-    notification_destination_resolver=build_env_approval_notification_destination_resolver(),
-    notification_sender=build_env_telegram_approval_notification_sender(),
-  )
-  policy = resolve_policy(store=store)
-  app.state.gateway_approval_audit_writer = audit_writer
-  app.state.gateway_approval_audit_emitter = audit_emitter
-  app.state.gateway_approval_store = store
-  app.state.gateway_approval_policy = policy
+  app.state.gateway_approval_audit_writer = subsystem.audit_writer
+  app.state.gateway_approval_audit_emitter = subsystem.audit_emitter
+  app.state.gateway_approval_store = subsystem.store
+  app.state.gateway_approval_preference_store = subsystem.preference_store
+  app.state.gateway_approval_policy = subsystem.policy

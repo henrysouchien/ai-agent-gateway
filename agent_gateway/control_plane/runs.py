@@ -11,6 +11,10 @@ from agent_gateway.approval_route import bind_session_approval_route
 from agent_gateway.approvals import ApprovalActionError, _record_vote_and_unblock
 from agent_gateway.autonomous_runner import AutonomousRegistry, AutonomousTask
 from agent_gateway.control_run_lifecycle import is_control_run_active_state
+from agent_gateway.control_skill_catalog import (
+  ControlSkillCatalog,
+  ControlSkillUnavailableError,
+)
 from agent_gateway.session import AuthManager
 from agent_gateway.named_refusal import NamedRefusal
 
@@ -74,10 +78,13 @@ from .runs_chat_helpers import (
 def build_runs_router(
   *,
   auth: AuthManager,
+  skill_catalog: ControlSkillCatalog,
   autonomous_registry: AutonomousRegistry | None = None,
   dispatch_scope_validator: Any | None = None,
   control_profile_loader: Callable[[str], Any] | None = None,
 ) -> APIRouter:
+  if not isinstance(skill_catalog, ControlSkillCatalog):
+    raise TypeError("skill_catalog must implement ControlSkillCatalog")
   router = APIRouter(prefix="/runs")
 
   def _require_autonomous_profile(profile_name: str) -> None:
@@ -95,6 +102,33 @@ def build_runs_router(
         status_code=422,
         detail=f"Profile {profile_name!r} is interactive-only",
       )
+
+  def _require_dispatchable_skill(skill_name: str) -> None:
+    """Answer the launch question before a run id is charged.
+
+    The catalog owns launchability: ``can_launch`` is its verdict for an
+    ordinary control dispatch, and ``blocked_reason`` is the definition's own
+    sentence. ``catalog: false`` withholds a skill from the advertised
+    listing and never from this question, so every skill this catalog
+    defines is judged here before the run is charged.
+
+    Whether a name exists at all is not this catalog's authority — the
+    runner resolves the skill it launches — so an unresolvable selector
+    carries no verdict and is dispatched unchanged.
+    """
+
+    try:
+      skill = skill_catalog.resolve_skill(skill_name)
+    except ControlSkillUnavailableError:
+      return
+    if skill.can_launch:
+      return
+    raise NamedRefusal(
+      "skill_autonomous_run_not_allowed",
+      skill.blocked_reason
+      or f"Skill '{skill.name}' cannot be launched by the control plane.",
+      transport="invalid",
+    )
 
   def _dispatch_scope_payload(scope: DispatchScope | None) -> dict[str, Any] | None:
     if scope is None:
@@ -261,6 +295,8 @@ def build_runs_router(
     registry = _require_autonomous_registry(autonomous_registry)
     registry.set_user_event_bus(getattr(request.app.state, "user_event_bus", None))
     try:
+      if payload.skill:
+        _require_dispatchable_skill(payload.skill)
       start_payload = await registry.start(
         role=authenticated.role,
         profile=payload.profile,

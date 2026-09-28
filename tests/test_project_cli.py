@@ -13,7 +13,6 @@ import yaml
 
 from agent_gateway import cli as agent_cli
 from agent_gateway import project
-from agent_gateway.project import AgentProjectError
 from agent_gateway.providers import xai_oauth
 
 
@@ -74,7 +73,6 @@ def test_create_agent_from_yaml_forwards_resolved_config(
         "max_tokens": 2048,
         "max_turns": 8,
         "max_budget_usd": 1.5,
-        "per_turn_timeout": 120,
       },
       sort_keys=False,
     ),
@@ -105,7 +103,6 @@ def test_create_agent_from_yaml_forwards_resolved_config(
       "code_execution": True,
       "max_turns": 8,
       "max_budget_usd": 1.5,
-      "per_turn_timeout": 120,
       "prefix": "/v2",
     }
   ]
@@ -341,12 +338,17 @@ def test_anthropic_logout_still_unlinks_store(tmp_path: Path) -> None:
   assert not store.exists()
 
 
-def test_project_config_rejects_unknown_keys(tmp_path: Path) -> None:
+def test_project_config_ignores_unknown_keys_with_warning(
+  tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
   config_path = tmp_path / "agent.yaml"
-  config_path.write_text("name: demo\nsurprise: true\n", encoding="utf-8")
+  config_path.write_text("name: demo\nretired_key: 300\n", encoding="utf-8")
 
-  with pytest.raises(AgentProjectError, match="Unsupported agent config keys: surprise"):
-    project.load_agent_project_config(config_path)
+  with caplog.at_level("WARNING", logger="agent_gateway.project"):
+    config = project.load_agent_project_config(config_path)
+
+  assert config.name == "demo"
+  assert "retired_key" in caplog.text
 
 
 def test_launch_project_examples_have_loadable_configs() -> None:

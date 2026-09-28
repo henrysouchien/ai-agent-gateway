@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 from gateway_test_support.control_plane_identity import fake_identity_resolver, fake_mcp_user_key_lookup
@@ -36,7 +37,7 @@ from agent_gateway.server import (
   MaterializedCredential,
   create_gateway_app,
 )
-from agent_gateway.session import AuthManager, GatewaySession
+from agent_gateway.session import AuthManager, GatewaySession, SessionStream
 
 
 API_KEY = "runs-test-key"
@@ -1433,6 +1434,28 @@ def test_get_run_returns_chat_run_shape_and_404s_unknown_or_cross_user() -> None
     assert cross_user.status_code == 404
 
 
+def test_get_run_cross_channel_404_matches_a_miss_but_logs_the_mismatch(caplog) -> None:
+  caplog.set_level(logging.WARNING, logger="agent_gateway.control_plane.runs_helpers")
+  app = _make_app()
+  with TestClient(app) as client:
+    alice_control = _control_session(client, "alice")
+    excel_chat = _chat_session(client, "alice")
+    session = app.state.auth.session_store.get_session(excel_chat["session_id"])
+    assert session is not None
+    session.channel = "excel"
+    session.initial_message = "first"
+
+    caplog.clear()
+    unknown = client.get("/api/control/runs/not-a-run", headers=_headers(alice_control))
+    assert "control run lookup refused" not in caplog.text
+
+    cross_channel = client.get(f"/api/control/runs/{excel_chat['session_id']}", headers=_headers(alice_control))
+
+  assert (cross_channel.status_code, cross_channel.json()) == (unknown.status_code, unknown.json())
+  assert cross_channel.json() == {"detail": "Run not found"}
+  assert "run exists on channel 'excel', caller authenticated on channel 'tui'" in caplog.text
+
+
 def test_chat_run_cost_accumulates_completed_turns_and_live_partial() -> None:
   app = _make_app()
   with TestClient(app) as client:
@@ -1746,10 +1769,14 @@ def test_listing_elapsed_running_chat_is_read_only_until_explicit_cancel() -> No
     assert session.stream_active is True
     assert any(key.startswith("control_chat_turn:") for key in session.control_chat_tasks)
 
+    # A session past its TTL stays live while its turn is in progress, so the
+    # running chat is still listed; listing it neither expires nor cancels it.
     session.expires_at = 0
     listed = client.get("/api/control/runs?kind=chat", headers=_headers(control))
     assert listed.status_code == 200, listed.text
-    assert [run["run_id"] for run in listed.json()["runs"]] == []
+    assert [(run["run_id"], run["state"]) for run in listed.json()["runs"]] == [
+      (chat_session_id, "running"),
+    ]
 
     assert session._expired is False
     assert chat_session_id in app.state.auth.session_store.sessions
@@ -1767,3 +1794,73 @@ def test_listing_elapsed_running_chat_is_read_only_until_explicit_cancel() -> No
     assert _wait_until(lambda: session.stream_active is False)
     assert _wait_until(lambda: not any(key.startswith("control_chat_turn:") for key in session.control_chat_tasks))
     assert app.state.auth.session_store.get_session(chat_session_id) is None
+
+
+def test_expired_session_cannot_start_a_turn_when_its_running_turn_ends_mid_request(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  # A running turn keeps its session's token valid past the TTL, so a
+  # follow-up can authenticate while that turn is still answering. If the turn
+  # then ends before the follow-up attaches, the follow-up must not start a
+  # turn on the expired session (audit of 87cd86770).
+  import httpx
+
+  async def scenario() -> None:
+    contexts: list[dict[str, Any]] = []
+    app = _make_app(contexts)
+    auth = app.state.auth
+    now = [1_000]
+    monkeypatch.setattr("agent_gateway.session.time.time", lambda: now[0])
+    monkeypatch.setattr("agent_gateway.server_chat_helpers.time.time", lambda: now[0])
+    session = auth.session_store.create_session(
+      api_key_hash="hash",
+      user_id="alice",
+      ttl_seconds=120,
+      tenant_id=_TEST_TENANT_ID,
+      allow_service_for_interactive=True,
+      model_entitled_capabilities=CAPABILITY_IDS,
+      model_entitled_keys=frozenset(INITIAL_MODEL_REGISTRY.models),
+    )
+    session.channel = "tui"
+    token = auth.issue_token(session)
+    release = asyncio.Event()
+    turn = SessionStream(event_log=EventLog(session_id=session.session_id), runner_task=None)
+
+    async def running_turn() -> None:
+      await release.wait()
+      turn.event_log.append({"type": "stream_complete"})
+      session.stream_active = False
+      turn.settled.set()
+
+    turn.runner_task = asyncio.create_task(running_turn())
+    session.active_turn = turn
+    session.stream_active = True
+    now[0] = session.expires_at + 1
+
+    verify = auth.verify_token_with_payload
+
+    def authenticate_then_end_the_running_turn(presented: str):
+      verified = verify(presented)
+      release.set()
+      return verified
+
+    monkeypatch.setattr(auth, "verify_token_with_payload", authenticate_then_end_the_running_turn)
+    async with httpx.AsyncClient(
+      transport=httpx.ASGITransport(app=app),
+      base_url="http://test",
+    ) as client:
+      response = await client.post(
+        "/api/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+          "messages": [{"role": "user", "content": "a new turn after the TTL"}],
+          "context": {"channel": "tui"},
+        },
+      )
+    await turn.runner_task
+
+    assert response.status_code == 401, response.text
+    assert response.json()["detail"] == "Session expired"
+    assert contexts == []
+
+  asyncio.run(scenario())

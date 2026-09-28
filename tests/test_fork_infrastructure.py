@@ -574,7 +574,6 @@ def _fork_parent(tmp_path, cls: type = _SpawnRunner) -> Any:
   parent._log = EventLog()
   parent._full_session_id = "parent-session"
   parent._cost_accumulator = None
-  parent._per_turn_timeout = None
   parent._stream_stall_timeout = 60.0
   parent._mcp_client = None
   parent._mcp_activation_fold = McpActivationFold()

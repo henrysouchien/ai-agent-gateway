@@ -15,6 +15,7 @@ from agent_gateway.event_log import EventLog
 from agent_gateway.runner_introspection import exception_traceback_already_logged
 from agent_gateway.session import (
   GatewaySession,
+  SessionStream,
   session_owner_user_id,
 )
 
@@ -346,12 +347,12 @@ async def _dispatch_control_chat_turn(
       )
       pending_seen.set()
 
-  event_log = EventLog(session_id=control_run_id)
+  turn = SessionStream(event_log=EventLog(session_id=control_run_id), runner_task=None)
   dispatch_task = asyncio.create_task(
     _dispatch_chat_turn(
       session,
       inputs,
-      event_log=event_log,
+      turn=turn,
       on_event=_on_event,
       build_chat_runtime=app_state.gateway_build_chat_runtime,
       transcript_dir=_transcript_dir_from_app_state(app_state),

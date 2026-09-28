@@ -8,13 +8,14 @@ import threading
 import time
 import types
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import httpx
 import pytest
 
 import agent_gateway.runner as gateway_runner
 import agent_gateway.server as gateway_server
+import agent_gateway.server_chat_helpers as chat_helpers
 from agent_gateway.event_log import EventLog
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.providers import AnthropicProvider, OpenAIProvider
@@ -363,6 +364,7 @@ class _CredentialFailureProvider(ModelProvider):
   def __init__(self) -> None:
     self.stream_calls = 0
     self.created_api_keys: list[str] = []
+    self.rotated_failures: list[Any] = []
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
     return bool(config.get("api_key"))
@@ -391,6 +393,15 @@ class _CredentialFailureProvider(ModelProvider):
   ) -> dict[str, Any]:
     _ = model, messages, system_prompt, tools, max_tokens, kwargs
     return {}
+
+  def next_credential(
+    self,
+    config: Mapping[str, Any],
+    failure: Any,
+  ) -> dict[str, Any] | None:
+    _ = config
+    self.rotated_failures.append(failure)
+    return {"api_key": "new-key", "provider": "anthropic", "billing_mode": "byok"}
 
   async def stream(self, client: Any, params: dict[str, Any]):
     _ = client, params
@@ -1538,7 +1549,7 @@ def test_subscribe_uses_sse_comment_keepalive_without_event_log_heartbeat(make_t
   _run(case())
 
 
-def test_credential_refresh_retries_stream_with_new_auth_config(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_credential_rotation_retries_stream_with_new_auth_config(monkeypatch: pytest.MonkeyPatch) -> None:
   async def case() -> None:
     monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.0)
     provider = _CredentialFailureProvider()
@@ -1560,13 +1571,6 @@ def test_credential_refresh_retries_stream_with_new_auth_config(monkeypatch: pyt
       billing_mode="byok",
       rate_table_version="unknown",
     )
-    refresh_failures = []
-
-    async def _refresh(failure):
-      refresh_failures.append(failure)
-      return {"api_key": "new-key", "provider": "anthropic", "billing_mode": "byok"}
-
-    runner.set_credential_refresher(_refresh)
 
     await runner.run(
       messages=[{"role": "user", "content": "hello"}],
@@ -1575,7 +1579,7 @@ def test_credential_refresh_retries_stream_with_new_auth_config(monkeypatch: pyt
     )
 
     events = [entry.event for entry in event_log.entries]
-    assert refresh_failures and refresh_failures[0].kind == "rate_limit"
+    assert provider.rotated_failures and provider.rotated_failures[0].kind == "rate_limit"
     assert provider.created_api_keys == ["old-key", "new-key"]
     assert any(event.get("type") == "credential_refreshed" for event in events)
     assert "".join(event.get("text", "") for event in events if event.get("type") == "text_delta") == "rotated"
@@ -1868,5 +1872,147 @@ def test_tool_call_in_flight_disconnect_preserves_running_turn(make_test_app) ->
       assert dispatcher.cancelled_calls == 1
       assert session.stream_active is False
       assert session.active_turn is None
+
+  _run(case())
+
+
+def _settling_session(*, terminal: bool) -> tuple[Any, SessionStream]:
+  event_log = EventLog(session_id="sess-settling")
+  event_log.append({"type": "text_delta", "text": "answer"})
+  if terminal:
+    event_log.append({"type": "stream_complete", "usage": {}})
+  active_turn = SessionStream(event_log=event_log, runner_task=None)
+  session = types.SimpleNamespace(active_turn=active_turn)
+  return session, active_turn
+
+
+def test_follow_up_waits_for_a_terminated_turn_to_release_the_session() -> None:
+  # R1-08, 2026-09-17: the analyst's third question was refused with "a turn
+  # is already running" and lost, because the heavy turn's teardown was still
+  # running after its terminal event had already reached the client.
+  async def case() -> None:
+    session, active_turn = _settling_session(terminal=True)
+    waiter = asyncio.ensure_future(
+      chat_helpers._await_settling_active_turn(session)
+    )
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    active_turn.settled.set()
+
+    assert await asyncio.wait_for(waiter, timeout=1.0) is True
+
+  _run(case())
+
+
+def test_follow_up_does_not_wait_for_a_turn_that_is_still_answering() -> None:
+  # No terminal event yet: the turn is genuinely running and admission still
+  # refuses it rather than queueing behind it.
+  async def case() -> None:
+    session, _active_turn = _settling_session(terminal=False)
+
+    assert await asyncio.wait_for(
+      chat_helpers._await_settling_active_turn(session),
+      timeout=1.0,
+    ) is True
+
+  _run(case())
+
+
+def test_follow_up_reports_a_turn_that_never_releases_the_session(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def case() -> None:
+    monkeypatch.setattr(
+      chat_helpers,
+      "_ACTIVE_TURN_SETTLE_WAIT_SECONDS",
+      0.05,
+    )
+    session, _active_turn = _settling_session(terminal=True)
+
+    assert await chat_helpers._await_settling_active_turn(session) is False
+
+  _run(case())
+
+
+class _HoldingAfterTerminalRunner(AgentRunner):
+  """Keeps the session past its own terminal event, like a deferred drain."""
+
+  holds: list[asyncio.Event] = []
+
+  async def run(
+    self,
+    messages: list[dict[str, Any]],
+    system_prompt: str | list[tuple[str, bool]] | None = None,
+    max_turns: int | None = None,
+    *,
+    resume_initial_messages=None,
+  ) -> None:
+    await super().run(
+      messages=messages,
+      system_prompt=system_prompt,
+      max_turns=max_turns,
+      resume_initial_messages=resume_initial_messages,
+    )
+    if type(self).holds:
+      await type(self).holds.pop(0).wait()
+
+
+def test_next_turn_streams_while_the_previous_turn_is_still_settling(
+  make_test_app,
+  tmp_path: Path,
+) -> None:
+  # CF-1, 2026-09-18: after a turn whose citation validation was still
+  # draining, the next turn on that session streamed zero events and wrote
+  # zero events to its session log while the run executed and was billed.
+  async def case() -> None:
+    drain = asyncio.Event()
+    _HoldingAfterTerminalRunner.holds = [drain]
+    app = make_test_app(
+      provider=_CompletingProvider(text="answer"),
+      runner_class=_HoldingAfterTerminalRunner,
+      transcript_dir=tmp_path,
+    )
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      headers = {"Authorization": f"Bearer {session_info['session_token']}"}
+
+      async with client.stream("POST", "/api/chat", headers=headers, json=_chat_payload()) as first:
+        assert first.status_code == 200
+        first_events = await _collect_sse_events(first)
+      assert any(event.get("type") == "stream_complete" for event in first_events)
+
+      session = app.state.auth.session_store.get_session(session_info["session_id"])
+      assert session.active_turn is not None
+      assert not session.active_turn.settled.is_set()
+
+      second_status: list[int] = []
+      second_events: list[dict[str, Any]] = []
+
+      async def second_turn() -> None:
+        async with client.stream("POST", "/api/chat", headers=headers, json=_chat_payload()) as second:
+          second_status.append(second.status_code)
+          second_events.extend(await _collect_sse_events(second))
+
+      follow_up = asyncio.ensure_future(second_turn())
+      await asyncio.sleep(0.1)
+      assert not follow_up.done(), "the follow-up answered before the previous turn released the session"
+
+      drain.set()
+      await asyncio.wait_for(follow_up, timeout=5.0)
+
+      assert second_status == [200]
+      second_types = [event.get("type") for event in second_events]
+      assert "text_delta" in second_types
+      assert "stream_complete" in second_types
+
+      transcript_path = tmp_path / f"{session_info['session_id']}.jsonl"
+      transcript = [json.loads(line) for line in transcript_path.read_text(encoding="utf-8").splitlines()]
+      transcript_types = [entry.get("type") for entry in transcript]
+      assert transcript_types.count("chat_request") == 2
+      assert transcript_types.count("stream_complete") == 2
+
+      await _expire_session_and_shutdown_bus(app, session_info["session_id"])
 
   _run(case())

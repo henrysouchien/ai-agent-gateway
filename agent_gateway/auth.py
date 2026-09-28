@@ -122,6 +122,10 @@ class ProviderCredentialFailure:
   error_code: str | None = None
   message: str = ""
   retryable_with_new_credentials: bool = True
+  # Epoch seconds at which the limiter said this credential becomes usable
+  # again, when it said so at all. Derived from the provider projection of the
+  # response's own reset/retry-after fields, never from a local policy.
+  reset_at: float | None = None
 
 
 @dataclass(frozen=True)

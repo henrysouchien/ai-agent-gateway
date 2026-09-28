@@ -458,36 +458,6 @@ def test_collect_run_output_first_terminal_error_wins() -> None:
   assert output.usage == {}
 
 
-def test_run_session_positive_timeout_does_not_kill_llm_work() -> None:
-  event_log = EventLog()
-
-  class _SlowRunner:
-    async def run(self, **kwargs: Any) -> None:
-      _ = kwargs
-      await asyncio.sleep(0.05)
-      event_log.append({"type": "text_delta", "text": "completed"})
-      event_log.append({
-        "type": "stream_complete",
-        "terminal_disposition": "completed",
-        "usage": {},
-      })
-
-  output = _run(
-    autonomous.run_session(
-      _SlowRunner(),  # type: ignore[arg-type]
-      event_log,
-      max_turns=3,
-      timeout_seconds=0.01,
-      initial_message="hello",
-      system_prompt="You are helpful.",
-    )
-  )
-
-  assert output.timed_out is False
-  assert output.response == "completed"
-  assert output.error is None
-
-
 def test_enrolled_run_session_waits_for_explicit_settlement_handshake() -> None:
   async def _case() -> None:
     event_log = EventLog()
@@ -518,7 +488,6 @@ def test_enrolled_run_session_waits_for_explicit_settlement_handshake() -> None:
         runner,  # type: ignore[arg-type]
         event_log,
         max_turns=3,
-        timeout_seconds=0.01,
         initial_message="hello",
         system_prompt=None,
       )
@@ -577,7 +546,6 @@ def test_caller_cancellation_after_completion_fence_does_not_cancel_run(
         runner,  # type: ignore[arg-type]
         event_log,
         max_turns=3,
-        timeout_seconds=None,
         initial_message="hello",
         system_prompt=None,
       )
@@ -596,11 +564,7 @@ def test_caller_cancellation_after_completion_fence_does_not_cancel_run(
   _run(_case())
 
 
-@pytest.mark.parametrize("timeout_seconds", [0, None, -1, 0.01])
-def test_run_session_no_wall_clock(
-  monkeypatch: pytest.MonkeyPatch,
-  timeout_seconds: float | None,
-) -> None:
+def test_run_session_no_wall_clock(monkeypatch: pytest.MonkeyPatch) -> None:
   event_log = EventLog()
 
   class _Runner:
@@ -623,7 +587,6 @@ def test_run_session_no_wall_clock(
       _Runner(),  # type: ignore[arg-type]
       event_log,
       max_turns=3,
-      timeout_seconds=timeout_seconds,
       initial_message="hello",
       system_prompt="You are helpful.",
     )
@@ -652,7 +615,6 @@ def test_run_session_writer_lease_collision_is_info_skip(
         _LeaseHeldRunner(),  # type: ignore[arg-type]
         event_log,
         max_turns=3,
-        timeout_seconds=None,
         initial_message="hello",
         system_prompt="You are helpful.",
       )
@@ -680,11 +642,10 @@ def test_run_autonomous_uses_exact_prebound_model(monkeypatch: pytest.MonkeyPatc
     event_log,
     *,
     max_turns: int,
-    timeout_seconds: float | None,
     initial_message: str,
     system_prompt: str | list[tuple[str, bool]],
   ) -> autonomous.RunOutput:
-    _ = event_log, max_turns, timeout_seconds, initial_message, system_prompt
+    _ = event_log, max_turns, initial_message, system_prompt
     captured["model"] = (
       runner._capability_execution.bind.upstream_model
     )
@@ -1443,7 +1404,6 @@ def test_run_autonomous_simple(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     event_log: EventLog,
     *,
     max_turns: int,
-    timeout_seconds: float,
     initial_message: str,
     system_prompt: str | list[tuple[str, bool]],
   ) -> autonomous.RunOutput:
@@ -1451,7 +1411,6 @@ def test_run_autonomous_simple(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     captured["run_session_event_log"] = event_log
     captured["run_session_kwargs"] = {
       "max_turns": max_turns,
-      "timeout_seconds": timeout_seconds,
       "initial_message": initial_message,
       "system_prompt": system_prompt,
     }
@@ -1489,7 +1448,6 @@ def test_run_autonomous_simple(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
       tool_handlers={"local_tool": _noop_local_tool},
       tool_definitions=[{"name": "local_tool", "description": "Local tool", "input_schema": {"type": "object"}}],
       max_turns=7,
-      timeout_seconds=12,
       state_dir=state_dir,
       delivery=autonomous.DeliveryConfig(
         on_complete=_on_complete,
@@ -1569,14 +1527,12 @@ def test_run_autonomous_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     event_log: EventLog,
     *,
     max_turns: int,
-    timeout_seconds: float | None,
     initial_message: str,
     system_prompt: str | list[tuple[str, bool]],
   ) -> autonomous.RunOutput:
     _ = runner, event_log, initial_message, system_prompt
     captured["run_session_kwargs"] = {
       "max_turns": max_turns,
-      "timeout_seconds": timeout_seconds,
     }
     return autonomous.RunOutput(
       response="Completed.",
@@ -1602,8 +1558,6 @@ def test_run_autonomous_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
   )
 
   assert captured["run_session_kwargs"]["max_turns"] == 80
-  assert captured["run_session_kwargs"]["timeout_seconds"] is None
-  assert captured["runner_kwargs"]["per_turn_timeout"] is None
 
 
 def test_run_autonomous_forwards_outputs_dir(
@@ -1625,11 +1579,10 @@ def test_run_autonomous_forwards_outputs_dir(
     event_log: EventLog,
     *,
     max_turns: int,
-    timeout_seconds: float,
     initial_message: str,
     system_prompt: str | list[tuple[str, bool]],
   ) -> autonomous.RunOutput:
-    _ = runner, event_log, max_turns, timeout_seconds, initial_message, system_prompt
+    _ = runner, event_log, max_turns, initial_message, system_prompt
     return autonomous.RunOutput(
       response="Completed.",
       tools_used=[],
@@ -1865,11 +1818,10 @@ def test_run_autonomous_skills_dir_registers_send_message_tool_and_builtin_name(
     event_log: EventLog,
     *,
     max_turns: int,
-    timeout_seconds: float,
     initial_message: str,
     system_prompt: str | list[tuple[str, bool]],
   ) -> autonomous.RunOutput:
-    _ = event_log, max_turns, timeout_seconds, initial_message, system_prompt
+    _ = event_log, max_turns, initial_message, system_prompt
     captured["local_handlers"] = set(runner._dispatcher._local)
     captured["tool_defs"] = {tool["name"] for tool in runner._get_tool_definitions()}
     captured["builtin_tool_names"] = set(runner._mcp_client._builtin_tool_names)

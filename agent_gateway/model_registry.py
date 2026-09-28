@@ -24,7 +24,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Final, Literal, Mapping, TypeAlias
+from typing import Final, Literal, Mapping, TypeAlias, get_args
 
 import yaml
 
@@ -32,12 +32,16 @@ from .thinking import ThinkingLevel
 
 
 CapabilityExposure: TypeAlias = Literal["user_selectable", "internal"]
+# ``retired``: the provider no longer serves ``upstream_model``.  The entry
+# stays so a durable binding on it resolves to a named refusal, not an
+# unknown key; it can never start or continue work.
 ModelLifecycle: TypeAlias = Literal[
   "active",
   "hidden",
   "deprecated",
   "disabled",
   "revoked",
+  "retired",
 ]
 SelectionSource: TypeAlias = Literal[
   "explicit_user",
@@ -131,7 +135,14 @@ EXTERNALLY_EXECUTED_CAPABILITY_IDS = (
 )
 
 _EXPOSURES = frozenset({"user_selectable", "internal"})
-_LIFECYCLES = frozenset({"active", "hidden", "deprecated", "disabled", "revoked"})
+_LIFECYCLES = frozenset(get_args(ModelLifecycle))
+# Lifecycles a selection policy may not name as a default or allowed key.
+_NO_NEW_SELECTION_LIFECYCLES = frozenset({
+  "deprecated",
+  "disabled",
+  "revoked",
+  "retired",
+})
 _FEATURES = frozenset({"tools", "vision", "streaming", "structured_output"})
 
 
@@ -189,9 +200,7 @@ class ModelRegistryEntry:
         raise ValueError(f"{key} has unknown capability: {capability_id}")
       if exposure not in _EXPOSURES:
         raise ValueError(f"{key} has unknown exposure: {exposure}")
-    if lifecycle in {"hidden", "deprecated", "disabled", "revoked"} and (
-      "user_selectable" in capabilities.values()
-    ):
+    if lifecycle != "active" and "user_selectable" in capabilities.values():
       raise ValueError(f"{lifecycle} model {key} cannot be user-selectable")
 
     supported_efforts = frozenset(
@@ -441,7 +450,7 @@ class ProductModelSelectionPolicy:
     for capability_id, policy in self.capabilities.items():
       for key in policy.allowed_model_keys:
         entry = registry.require(key)
-        if entry.lifecycle in {"deprecated", "disabled", "revoked"}:
+        if entry.lifecycle in _NO_NEW_SELECTION_LIFECYCLES:
           raise ValueError(
             f"{capability_id} allows {entry.lifecycle} model {key} for new selection"
           )
@@ -449,7 +458,7 @@ class ProductModelSelectionPolicy:
           raise ValueError(f"{key} is not qualified for {capability_id}")
       if policy.default.kind == "model":
         entry = registry.require(policy.default.model_key or "")
-        if entry.lifecycle in {"deprecated", "disabled", "revoked"}:
+        if entry.lifecycle in _NO_NEW_SELECTION_LIFECYCLES:
           raise ValueError(
             f"{capability_id} default uses {entry.lifecycle} model {entry.key}"
           )

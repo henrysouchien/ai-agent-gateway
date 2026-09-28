@@ -77,6 +77,7 @@ def _admitted_research_file_registration(
   research_file_id: int,
   materialization: str = "inline_exact",
   selector: str = "literal",
+  drop_admitted_source_content: bool = False,
 ) -> dict[str, object]:
   """One real admitted registration for a research file, as the log holds it.
 
@@ -109,7 +110,6 @@ def _admitted_research_file_registration(
       result_instructions=render_result_instructions(requirement),
       admission_date="2026-09-12",
       max_turns=10,
-      timeout_seconds=600,
       client_timeout_seconds=90,
       max_tokens=64_000,
       cost_observation_threshold_usd=50,
@@ -177,10 +177,14 @@ def _admitted_research_file_registration(
     ).model_dump(mode="json")]
     payload["content_read_grants"] = [read_grant.model_dump(mode="json")]
   admitted = AdmittedTask.model_validate(seal_admitted_task_payload(payload))
+  admitted_payload = admitted.model_dump(mode="json")
+  if drop_admitted_source_content:
+    # Without its admitted content handle the committed identity is unresolvable.
+    del admitted_payload["inputs"][0]["source"]["content"]
   return {
     "type": "task_registered",
     "task_id": task_id,
-    "metadata": {"admitted_task": admitted.model_dump(mode="json")},
+    "metadata": {"admitted_task": admitted_payload},
   }
 
 
@@ -482,9 +486,8 @@ def test_unresolvable_registration_identity_fails_retry_closed(
     task_id="bg-unresolvable",
     research_file_id=41,
     materialization="content_read",
+    drop_admitted_source_content=True,
   )
-  # Without its admitted content handle the committed identity is unresolvable.
-  del event["metadata"]["admitted_task"]["inputs"][0]["source"]["content"]
   _run(log.append(event))
 
   with pytest.raises(

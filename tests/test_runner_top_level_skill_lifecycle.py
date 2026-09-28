@@ -25,6 +25,7 @@ from agent_gateway.providers import StreamEvent  # noqa: E402
 from agent_gateway.runner_session_events import (  # noqa: E402
   build_skill_run_started_event,
 )
+from agent_gateway.operation_catalog import SemanticScope  # noqa: E402
 from agent_gateway.skill_lifecycle import (  # noqa: E402
   TopLevelServerTerminalCause,
   TopLevelSkillAdmission,
@@ -312,7 +313,7 @@ def _runner(
   ],
 )
 def test_canonical_lifecycle_identity_keeps_semantic_scope_separate(
-  semantic_scope: str,
+  semantic_scope: SemanticScope,
   ticker: str | None,
   portfolio_id: str | None,
   expected: dict[str, Any],
@@ -1875,7 +1876,9 @@ def test_named_skill_closure_keeps_one_pair_across_storage_recovery(
       return append_sync(event)
 
     async def before_terminal(_log: Any, _terminal: dict[str, Any]) -> None:
-      runner._terminal_success_staged_events.append({
+      staged = runner._terminal_success_staged_events
+      assert staged is not None
+      staged.append({
         "type": "terminal_receipt", "receipt_id": "required", "outcome": "success",
       })
 
@@ -2203,7 +2206,13 @@ def test_result_policy_payload_types_are_strict(
     lifecycle.normalize_result_event(event)
 
 
-def test_result_policy_allows_recoverable_fms_retry_before_success() -> None:
+def test_result_policy_retains_failed_door_rows_beside_a_clean_run() -> None:
+  """A door's failure is the door's fact: the row survives, the run stands.
+
+  Both the recoverable retry and the unrecoverable refusal are kept verbatim
+  in ``fms_results``; the pipeline fails the stage on the door's own status.
+  """
+
   lifecycle = _metadata()
   event = _result_event(
     lifecycle,
@@ -2221,6 +2230,14 @@ def test_result_policy_allows_recoverable_fms_retry_before_success() -> None:
     },
     {
       "tool_name": "fms_report_idea_to_thesis",
+      "status": "error",
+      "error": {
+        "recoverable": False,
+        "message": "write refused",
+      },
+    },
+    {
+      "tool_name": "fms_report_idea_to_thesis",
       "status": "applied",
       "artifact_ref": "artifacts/PCTY/idea-to-thesis/result.json",
     },
@@ -2231,25 +2248,6 @@ def test_result_policy_allows_recoverable_fms_retry_before_success() -> None:
   assert normalized["outcome"] == "success"
   assert normalized["exit_code"] == 0
   assert normalized["fms_results"] == event["fms_results"]
-
-
-def test_result_policy_rejects_unrecoverable_fms_failure_on_success() -> None:
-  lifecycle = _metadata()
-  event = _result_event(
-    lifecycle,
-    {"type": "stream_complete"},
-  )
-  event["fms_results"] = [{
-    "tool_name": "fms_report_idea_to_thesis",
-    "status": "error",
-    "error": {
-      "recoverable": False,
-      "message": "write refused",
-    },
-  }]
-
-  with pytest.raises(RuntimeError, match="unrecoverable FMS failure"):
-    lifecycle.normalize_result_event(event)
 
 
 def test_result_policy_rejects_unexpected_fields() -> None:

@@ -181,9 +181,6 @@ class _NoopRunner(AgentRunner):
   def set_purpose(self, purpose) -> None:
     _ = purpose
 
-  def set_credential_refresher(self, callback) -> None:
-    _ = callback
-
   async def on_disconnect(self) -> None:
     return None
 
@@ -253,7 +250,7 @@ def _make_app(monkeypatch, tmp_path: Path, events: list[dict[str, Any]]):
       service_auth_config_resolver=_materialize_service_credential,
       build_chat_runtime=_build_chat_runtime,
       autonomous_api_dir=tmp_path,
-      autonomous_skill_admission_policy_resolver=lambda _skill: (
+      autonomous_skill_admission_policy_resolver=lambda skill_name: (
         AutonomousSkillAdmissionPolicy(
           False,
           SkillExecutionLimits(None, None, None),

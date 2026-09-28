@@ -31,6 +31,7 @@ from agent_gateway.model_preferences import ModelPreferenceStore
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 from agent_gateway.session import bind_session_credentials
 from gateway_test_support.control_plane_identity import fake_identity_resolver
+from gateway_test_support.model_defaults import SESSION_DRIVER
 
 
 _SELECTABLE_CAPABILITIES = frozenset({
@@ -349,7 +350,7 @@ def test_init_with_stale_saved_preference_binds_default_and_names_reason(
   assert response.status_code == 200, response.text
   driver = response.json()["capability_choices"]["session.driver"]
   assert driver["selected"] is not None
-  assert driver["selected"]["model_key"] == "anthropic.claude-opus-5"
+  assert driver["selected"]["model_key"] == SESSION_DRIVER.model_key
   assert driver["selected"]["reason"] == "capability_default"
   notices = {notice["code"]: notice for notice in driver["notices"]}
   notice = notices["saved_preference_not_applied"]
@@ -392,7 +393,7 @@ def test_init_with_unsupported_effort_preference_binds_default(
   assert response.status_code == 200, response.text
   driver = response.json()["capability_choices"]["session.driver"]
   assert driver["selected"] is not None
-  assert driver["selected"]["model_key"] == "anthropic.claude-opus-5"
+  assert driver["selected"]["model_key"] == SESSION_DRIVER.model_key
   notices = {notice["code"]: notice for notice in driver["notices"]}
   notice = notices["saved_preference_not_applied"]
   assert notice["model_key"] == "anthropic.claude-haiku-4-5"
@@ -521,17 +522,17 @@ def test_chat_init_returns_only_session_executable_stable_key_choices() -> None:
   assert driver["catalog_revision"] == INITIAL_MODEL_REGISTRY.revision
   assert driver["policy_revision"] == INITIAL_MODEL_SELECTION_POLICY.revision
   assert driver["selected"] == {
-    "model_key": "anthropic.claude-opus-5",
-    "label": "Opus 5",
-    "effort": "high",
+    "model_key": SESSION_DRIVER.model_key,
+    "label": INITIAL_MODEL_REGISTRY.require(SESSION_DRIVER.model_key).label,
+    "effort": SESSION_DRIVER.effort,
     "reason": "capability_default",
   }
   assert {choice["model_key"] for choice in driver["choices"]} == {
     "anthropic.claude-fable-5",
     "anthropic.claude-fable-5-1",
     "anthropic.claude-haiku-4-5",
-    "anthropic.claude-mythos-5",
     "anthropic.claude-opus-5",
+    "anthropic.claude-opus-5-5",
     "anthropic.claude-sonnet-5",
   }
   author = choices["plan.author"]

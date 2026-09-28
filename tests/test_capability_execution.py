@@ -24,6 +24,9 @@ from agent_gateway.model_registry import (
   INITIAL_MODEL_SELECTION_POLICY,
 )
 from agent_gateway.providers import ModelInfo, ModelProvider
+from gateway_test_support.model_defaults import SESSION_DRIVER
+
+_DRIVER_ENTRY = INITIAL_MODEL_REGISTRY.require(SESSION_DRIVER.model_key)
 
 
 class _ExactProvider(ModelProvider):
@@ -119,10 +122,10 @@ def _resolver(
 def test_resolver_materializes_one_complete_immutable_execution() -> None:
   execution = _resolver().resolve("session.driver")
 
-  assert execution.bind.model_key == "anthropic.claude-opus-5"
-  assert execution.bind.adapter == "anthropic.messages"
+  assert execution.bind.model_key == SESSION_DRIVER.model_key
+  assert execution.bind.adapter == _DRIVER_ENTRY.adapter
   assert execution.registry is INITIAL_MODEL_REGISTRY
-  assert execution.adapter.name == "anthropic"
+  assert execution.adapter.name == _DRIVER_ENTRY.provider
   assert execution.auth_config == {
     "api_key": "test-secret",
     "auth_mode": "api",
@@ -194,7 +197,7 @@ def test_adapter_resolver_failure_is_typed_before_runtime_dispatch() -> None:
   with pytest.raises(CapabilityResolutionError) as refused:
     resolver.resolve("session.driver")
   assert refused.value.code == "provider_unavailable"
-  assert refused.value.model_key == "anthropic.claude-opus-5"
+  assert refused.value.model_key == SESSION_DRIVER.model_key
 
 
 def test_bound_execution_rejects_provider_family_mismatch() -> None:
@@ -344,7 +347,7 @@ def test_exact_parent_binding_is_passed_to_plan_author_resolution() -> None:
 
 def test_standard_protocol_profile_cannot_gain_reasoning_effort() -> None:
   resolver = _resolver()
-  execution = resolver.resolve("risk.completion")
+  execution = resolver.resolve("citation.review")
   assert execution.bind.protocol_profile == "messages.standard"
   assert execution.bind.effort == "none"
   assert not set(execution.auth_config) & {

@@ -283,7 +283,7 @@ def test_deferred_dispatch_happy_path_closes_after_trailing_event(tmp_path) -> N
     result = await _dispatch_chat_turn(
       _session(),
       _inputs(),
-      event_log=event_log,
+      turn=SessionStream(event_log=event_log, runner_task=None),
       on_event=_no_event,
       build_chat_runtime=_runtime_builder(
         lambda log, _sid: _AppendingRunner(log, events)
@@ -311,7 +311,7 @@ def test_deferred_dispatch_cancelled_mid_drain_keeps_first_terminal() -> None:
       _dispatch_chat_turn(
         _session(),
         _inputs(),
-        event_log=event_log,
+        turn=SessionStream(event_log=event_log, runner_task=None),
         on_event=_no_event,
         build_chat_runtime=_runtime_builder(
           lambda log, _sid: _DrainingRunner(log, terminal_emitted)
@@ -343,7 +343,7 @@ def test_deferred_dispatch_runner_exception_emits_exactly_one_terminal() -> None
     await _dispatch_chat_turn(
       _session(),
       _inputs(),
-      event_log=event_log,
+      turn=SessionStream(event_log=event_log, runner_task=None),
       on_event=_no_event,
       build_chat_runtime=_runtime_builder(lambda _log, _sid: _FailingRunner()),
       transcript_dir=None,
@@ -400,7 +400,7 @@ def test_dispatch_pre_lifecycle_rejections_preserve_scoped_close(
         await _dispatch_chat_turn(
           session,
           _inputs(profile="analyst"),
-          event_log=event_log,
+          turn=SessionStream(event_log=event_log, runner_task=None),
           on_event=_no_event,
           build_chat_runtime=build_runtime,
           transcript_dir=None,

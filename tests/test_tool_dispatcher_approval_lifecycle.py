@@ -38,6 +38,10 @@ from agent_gateway.approval_policy import (
 from agent_gateway.approval_route import (
   DurableLocalApprovalRoute,
   NoApprovalRoute,
+  ParentDelegatedApprovalRoute,
+)
+from agent_gateway.autonomous_approval_channel import (
+  AutonomousApprovalChannelChild,
 )
 from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.session import GatewaySession
@@ -919,5 +923,136 @@ def test_native_approval_refuses_inline_limit_mismatch_before_policy(
     )
 
   assert calls == []
+
+
+@pytest.mark.parametrize(
+  ("tool_class", "expected_state", "expected_mode"),
+  [
+    ("state_write", "auto_approved", "OWNER_CONTROL_PLANE"),
+    ("irreversible", "pending_user", "HUMAN"),
+  ],
+)
+def test_delegated_run_settles_everything_but_the_money_boundary(
+  tool_class: str,
+  expected_state: str,
+  expected_mode: str,
+) -> None:
+  """An unattended run settles its own writes; a live order still asks.
+
+  The delegated route is an autonomous child's only route and no operator is
+  guaranteed to sit at it, so every class outside the money boundary is settled
+  under the run owner's authority instead of parked until the durable expiry
+  fails the whole run. Placing an order is the one class that still waits.
+  """
+
+  session = _gateway_session()
+  prompts: list[str] = []
+
+  async def record_prompt(*_args: Any, **_kwargs: Any) -> None:
+    prompts.append("prompted")
+    return None
+
+  result = asyncio.run(
+    lifecycle_helpers.run_approval_lifecycle(
+      route=ParentDelegatedApprovalRoute(
+        object.__new__(AutonomousApprovalChannelChild),
+        session,
+      ),
+      session=session,
+      tool_call_id="call-idea-triage",
+      tool_name="idea_triage_decide",
+      tool_input={"decisions": [{"id": 1, "verdict": "dismiss"}]},
+      qualifier="",
+      reason="triage verdict",
+      allow_persistent=False,
+      resolve_run_context_fn=lambda: RunContext(
+        user_id="owner-1",
+        request_id="control-run-1",
+        profile="analyst",
+        channel="cli",
+        decider_role="owner",
+      ),
+      current_skill_admission_fn=lambda: None,
+      redact_for_approval_request_fn=lambda *_args: ({}, "args-hash"),
+      resolve_tool_class_fn=lambda _tool_name: tool_class,
+      effective_trade_approval_decision_fn=(
+        lambda _name, _args, decision: decision
+      ),
+      await_user_approval_via_pending_tools_fn=record_prompt,
+      approval_queue_timeout_seconds_fn=lambda _expiry: 1.0,
+    )
+  )
+
+  request = result["request"]
+  assert request.state == expected_state
+  assert request.authorization_mode == expected_mode
+  if expected_state == "auto_approved":
+    assert result["approved"] is True
+    assert result.get("timeout") is None
+    assert request.decider_id == "owner-1"
+    assert request.decider_role == "owner"
+    assert prompts == []
+  else:
+    assert result["approved"] is False
+    assert result["timeout"] is True
+    assert prompts == ["prompted"]
+
+
+def test_delegated_run_keeps_a_profile_tightened_door_human() -> None:
+  """A profile that tightened a run_owner door is not waived by the settle.
+
+  The profile's approval overlay can only add a requirement, so a door its
+  `approval_required_tools` names asks the operator even though the door's own
+  registration would let the run's owner authority settle it unattended.
+  """
+
+  session = _gateway_session()
+  prompts: list[str] = []
+
+  async def record_prompt(*_args: Any, **_kwargs: Any) -> None:
+    prompts.append("prompted")
+    return None
+
+  result = asyncio.run(
+    lifecycle_helpers.run_approval_lifecycle(
+      route=ParentDelegatedApprovalRoute(
+        object.__new__(AutonomousApprovalChannelChild),
+        session,
+      ),
+      session=session,
+      tool_call_id="call-memory-write",
+      tool_name="memory_write",
+      tool_input={"content": "thesis note"},
+      qualifier="",
+      reason="persist research note",
+      allow_persistent=False,
+      profile_tightened_approval=True,
+      resolve_run_context_fn=lambda: RunContext(
+        user_id="owner-1",
+        request_id="control-run-2",
+        profile="analyst",
+        channel="cli",
+        decider_role="owner",
+      ),
+      current_skill_admission_fn=lambda: None,
+      redact_for_approval_request_fn=lambda *_args: ({}, "args-hash"),
+      resolve_tool_class_fn=lambda _tool_name: "state_write",
+      effective_trade_approval_decision_fn=(
+        lambda _name, _args, decision: decision
+      ),
+      await_user_approval_via_pending_tools_fn=record_prompt,
+      approval_queue_timeout_seconds_fn=lambda _expiry: 1.0,
+    )
+  )
+
+  request = result["request"]
+  assert request.state == "pending_user"
+  assert request.authorization_mode == "HUMAN"
+  assert request.decision is None
+  assert request.decider_id is None
+  assert result["approved"] is False
+  assert result["timeout"] is True
+  assert prompts == ["prompted"]
+
 
 

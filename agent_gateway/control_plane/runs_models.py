@@ -166,10 +166,10 @@ class AutonomousTerminalReceipt(BaseModel):
       )
     if (
       self.terminal_reason is not None
-      and self.disposition != "completed"
+      and self.disposition != "interrupted"
     ):
       raise ValueError(
-        "terminal receipt reason requires completed disposition"
+        "terminal receipt reason requires an interrupted disposition"
       )
     return self
 

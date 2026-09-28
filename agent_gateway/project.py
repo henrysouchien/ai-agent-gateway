@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ DEFAULT_AGENT_CONFIG = "agent.yaml"
 PROJECT_CONFIG_ENV = "AGENT_GATEWAY_PROJECT_CONFIG"
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant. Answer clearly and use short paragraphs."
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+logger = logging.getLogger(__name__)
 _TOP_LEVEL_KEYS = {
   "name",
   "system_prompt",
@@ -31,7 +33,6 @@ _TOP_LEVEL_KEYS = {
   "max_tokens",
   "max_turns",
   "max_budget_usd",
-  "per_turn_timeout",
 }
 
 
@@ -61,7 +62,6 @@ class AgentProjectConfig:
   max_tokens: int
   max_turns: int | None
   max_budget_usd: float | None
-  per_turn_timeout: int
 
 
 def validate_project_name(name: str) -> str:
@@ -94,7 +94,6 @@ def default_agent_config_payload(
     "max_tokens": 16000,
     "max_turns": None,
     "max_budget_usd": None,
-    "per_turn_timeout": 300,
   }
   if model_key is not None:
     payload["model_key"] = model_key
@@ -202,7 +201,7 @@ def load_agent_project_config(config_path: str | Path = DEFAULT_AGENT_CONFIG) ->
   payload = load_agent_project_payload(path)
   unknown = sorted(set(payload) - _TOP_LEVEL_KEYS)
   if unknown:
-    raise AgentProjectError(f"Unsupported agent config keys: {', '.join(unknown)}")
+    logger.warning("Ignoring unsupported agent config keys in %s: %s", path, ", ".join(unknown))
 
   base_dir = path.parent
   name = validate_project_name(_string(payload.get("name"), "agent"))
@@ -224,7 +223,6 @@ def load_agent_project_config(config_path: str | Path = DEFAULT_AGENT_CONFIG) ->
     max_tokens=_int(payload.get("max_tokens"), 16000, key="max_tokens"),
     max_turns=_optional_int(payload.get("max_turns"), key="max_turns"),
     max_budget_usd=_optional_float(payload.get("max_budget_usd"), key="max_budget_usd"),
-    per_turn_timeout=_int(payload.get("per_turn_timeout"), 300, key="per_turn_timeout"),
   )
 
 
@@ -246,7 +244,6 @@ def create_agent_from_yaml(config_path: str | Path = DEFAULT_AGENT_CONFIG) -> Fa
     code_execution=config.code_execution,
     max_turns=config.max_turns,
     max_budget_usd=config.max_budget_usd,
-    per_turn_timeout=config.per_turn_timeout,
     prefix=config.api_prefix,
   )
 

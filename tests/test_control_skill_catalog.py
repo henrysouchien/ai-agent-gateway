@@ -242,11 +242,6 @@ def test_control_summary_requires_exact_booleans(
     _summary(**{field_name: value})
 
 
-def test_control_summary_requires_visible_catalog_entry() -> None:
-  with pytest.raises(ValueError, match="catalog must be exactly True"):
-    _summary(catalog=False)
-
-
 @pytest.mark.parametrize("value", [True, False, 1.5, "2"])
 def test_control_summary_rejects_non_exact_max_turns(value: object) -> None:
   with pytest.raises(TypeError, match="max_turns"):

@@ -169,6 +169,12 @@ if TYPE_CHECKING:
     event_to_dict,
   )
   from .event_log import EventLog, LogEntry as EventLogEntry
+  from .gateway_address import (
+    DEFAULT_GATEWAY_BASE_URL,
+    GATEWAY_BASE_URL_ENV,
+    configured_gateway_base_url,
+    gateway_base_url,
+  )
   from .heartbeat import HeartbeatConfig, HeartbeatLoop, TickResult, strip_heartbeat_ok
   from .providers import (
     AgentSDKConfig,
@@ -434,6 +440,10 @@ _EXPORTS = {
   "event_to_dict": ("agent_gateway.events", "event_to_dict"),
   "EventLog": ("agent_gateway.event_log", "EventLog"),
   "EventLogEntry": ("agent_gateway.event_log", "LogEntry"),
+  "DEFAULT_GATEWAY_BASE_URL": ("agent_gateway.gateway_address", "DEFAULT_GATEWAY_BASE_URL"),
+  "GATEWAY_BASE_URL_ENV": ("agent_gateway.gateway_address", "GATEWAY_BASE_URL_ENV"),
+  "configured_gateway_base_url": ("agent_gateway.gateway_address", "configured_gateway_base_url"),
+  "gateway_base_url": ("agent_gateway.gateway_address", "gateway_base_url"),
   "HeartbeatConfig": ("agent_gateway.heartbeat", "HeartbeatConfig"),
   "HeartbeatLoop": ("agent_gateway.heartbeat", "HeartbeatLoop"),
   "TickResult": ("agent_gateway.heartbeat", "TickResult"),
@@ -678,6 +688,10 @@ __all__ = [
   "DockerBackend",
   "EventLog",
   "EventLogEntry",
+  "DEFAULT_GATEWAY_BASE_URL",
+  "GATEWAY_BASE_URL_ENV",
+  "configured_gateway_base_url",
+  "gateway_base_url",
   "EffortResolution",
   "GatewaySession",
   "GatewayDispatcherDeps",

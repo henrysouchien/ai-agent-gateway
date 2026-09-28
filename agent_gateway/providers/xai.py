@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import replace
-from typing import Any, AsyncIterator
+from typing import Any, AsyncGenerator
 from weakref import WeakKeyDictionary
 
 import httpx
@@ -359,7 +359,7 @@ class XAIProvider(ModelProvider):
       params["_endpoint_url"] = resolve_responses_url(str(kwargs["base_url"]))
     return params
 
-  async def stream(self, client: Any, params: dict[str, Any]) -> AsyncIterator[StreamEvent]:
+  async def stream(self, client: Any, params: dict[str, Any]) -> AsyncGenerator[StreamEvent, None]:
     if not isinstance(client, httpx.AsyncClient):
       raise RuntimeError("XAIProvider requires an httpx.AsyncClient")
     state = self._client_state.get(client)

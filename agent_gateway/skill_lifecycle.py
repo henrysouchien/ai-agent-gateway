@@ -20,6 +20,7 @@ from .descriptor_paths import (
   DirectoryIdentity,
   open_directory_chain,
 )
+from .operation_catalog import SEMANTIC_SCOPES
 from .skill_completion_wal import (
   TopLevelSkillCompletionEffectPlan,
   canonical_json_bytes,
@@ -29,7 +30,6 @@ from .named_refusal import NamedRefusal
 
 
 SkillLifecycleScope = Literal["ticker", "portfolio"]
-SemanticSkillScope = Literal["ticker", "portfolio", "industry"]
 TopLevelServerTerminalCause = Literal[
   "caller_cancellation",
   "shutdown",
@@ -683,12 +683,22 @@ def resolve_skill_lifecycle_artifact_identity(
   context_ticker: str | None,
   portfolio_id: str | None,
 ) -> SkillLifecycleArtifactIdentity:
-  """Map semantic skill scope to the one canonical artifact identity."""
+  """Map semantic skill scope to the one canonical artifact identity.
 
-  if semantic_scope not in (None, "ticker", "portfolio", "industry"):
+  Every scope the compiled catalog can carry is admitted here — the set
+  belongs to ``operation_catalog``, which projects the application's
+  compiled skills, and the catalog default is ``global``.  Only a
+  ``ticker`` scope with a concrete ticker keys artifacts by ticker; every
+  other scope carries the single portfolio-keyed identity.
+  """
+
+  if semantic_scope is not None and (
+    type(semantic_scope) is not str
+    or semantic_scope not in SEMANTIC_SCOPES
+  ):
     raise ValueError(
-      "semantic_scope must be exactly None, 'ticker', 'portfolio', "
-      "or 'industry'"
+      "semantic_scope must be None or one of: "
+      + ", ".join(sorted(SEMANTIC_SCOPES))
     )
   _require_optional_exact_string(
     context_ticker,
@@ -1027,21 +1037,16 @@ class TopLevelSkillLifecycleMetadata:
         "skill_result_captured error outcome requires nonzero exit_code "
         "and a non-empty error"
       )
-    unrecoverable_failed_fms_statuses = [
-      str(item.get("status") or "").strip().lower()
-      for item in event["fms_results"]
-      if str(item.get("status") or "").strip().lower()
-      in _FAILURE_RESULT_STATUSES
-      and not (
-        isinstance(item.get("error"), Mapping)
-        and item["error"].get("recoverable") is True
-      )
-    ]
-    if unrecoverable_failed_fms_statuses and exit_code == 0:
-      raise RuntimeError(
-        "skill_result_captured unrecoverable FMS failure requires "
-        "nonzero exit_code"
-      )
+    # A door row's status belongs to that door's operation; the run's exit
+    # code belongs to the run. This contract used to reject its own
+    # producer's honest result whenever any unrecoverable door row sat
+    # beside exit code 0 — a relation no producer can honor (the run may
+    # have recovered by another route, which is why the recoverable case was
+    # already exempted). Its only observed effect was to replace the run's
+    # result with a policy crash and STOP-gate every dependent stage (live
+    # incident 2026-09-17, pipeline c80aa974d623). The door rows stay in
+    # ``fms_results``, where the pipeline reads them and fails the stage on
+    # the door's own status.
     verdict_echo = event["verdict_echo"]
     if verdict_echo is not None and type(verdict_echo) is not dict:
       raise RuntimeError(
@@ -1316,7 +1321,6 @@ async def drain_owned_lifecycle_task(
 
 
 __all__ = [
-  "SemanticSkillScope",
   "SKILL_RESULT_CORE_FIELDS",
   "SkillLifecycleArtifactIdentity",
   "SkillLifecycleScope",

@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import inspect
-from collections.abc import Callable
 from typing import Any, Dict
 
-MetricEmitter = Callable[[str, int], None]
 _SELECTION_AUTH_CONFIG_FIELDS = frozenset({
   "effort",
   "execution_transport",
@@ -59,31 +56,3 @@ def merge_refreshed_auth_config(
   merged["auth_token"] = str(merged.get("auth_token", ""))
   return merged
 
-
-async def call_credential_refresher(
-  callback: Callable[[Any], Any] | None,
-  failure: Any,
-  *,
-  emit_metric: MetricEmitter,
-  log_session_id: str,
-  logger: Any,
-) -> Dict[str, Any] | None:
-  if callback is None or not bool(getattr(failure, "retryable_with_new_credentials", False)):
-    return None
-  try:
-    refreshed = callback(failure)
-    if inspect.isawaitable(refreshed):
-      refreshed = await refreshed
-  except Exception as exc:
-    logger.warning(
-      "[%s] credential refresh failed after provider %s failure (non-fatal): %s",
-      log_session_id,
-      getattr(failure, "kind", ""),
-      exc,
-    )
-    emit_metric("gateway.credential_refresh_failed", 1)
-    return None
-  if not isinstance(refreshed, dict) or not refreshed:
-    emit_metric("gateway.credential_refresh_unavailable", 1)
-    return None
-  return dict(refreshed)
