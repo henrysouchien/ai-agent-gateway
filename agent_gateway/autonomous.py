@@ -42,7 +42,7 @@ from .autonomous_output import (
   run_output_exit_code as _run_output_exit_code,
   run_output_outcome as _run_output_outcome,
 )
-from .capability_binding import SESSION_DRIVER_CAPABILITY
+from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
 from .capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,

@@ -338,17 +338,47 @@ def test_anthropic_logout_still_unlinks_store(tmp_path: Path) -> None:
   assert not store.exists()
 
 
-def test_project_config_ignores_unknown_keys_with_warning(
-  tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_project_config_rejects_unknown_key_naming_it(tmp_path: Path) -> None:
   config_path = tmp_path / "agent.yaml"
-  config_path.write_text("name: demo\nretired_key: 300\n", encoding="utf-8")
+  config_path.write_text("name: demo\nmax_buget_usd: 0.01\n", encoding="utf-8")
+
+  with pytest.raises(project.AgentProjectError, match="max_buget_usd"):
+    project.load_agent_project_config(config_path)
+
+
+@pytest.mark.parametrize(
+  "retired_line",
+  ["per_turn_timeout: 300", "provider: anthropic", "model: claude-sonnet-4"],
+)
+def test_project_config_loads_retired_key_with_warning(
+  tmp_path: Path, caplog: pytest.LogCaptureFixture, retired_line: str
+) -> None:
+  retired_key = retired_line.split(":", 1)[0]
+  config_path = tmp_path / "agent.yaml"
+  config_path.write_text(f"name: demo\n{retired_line}\n", encoding="utf-8")
 
   with caplog.at_level("WARNING", logger="agent_gateway.project"):
     config = project.load_agent_project_config(config_path)
 
   assert config.name == "demo"
-  assert "retired_key" in caplog.text
+  assert config.model_key is None
+  assert retired_key in caplog.text
+
+
+def test_project_config_scaffold_round_trips_through_loader(tmp_path: Path) -> None:
+  config_path = tmp_path / "agent.yaml"
+  payload = project.default_agent_config_payload(
+    name="demo", model_key="openai.gpt-5-6", effort="high"
+  )
+  project.save_agent_project_payload(payload, config_path)
+
+  config = project.load_agent_project_config(config_path)
+
+  path_keys = {"skills_dir", "skill_state_file", "outputs_dir"}
+  for key in path_keys:
+    assert getattr(config, key) == tmp_path / payload[key], key
+  for key in set(payload) - path_keys:
+    assert getattr(config, key) == payload[key], key
 
 
 def test_launch_project_examples_have_loadable_configs() -> None:

@@ -53,11 +53,8 @@ from .commercial_work_start import (
   COMMERCIAL_WORK_AUTHORIZATION_HEADER,
   CommercialWorkStartError,
 )
-from .capability_binding import (
-  CapabilityResolutionError,
-  eligible_model_choices,
-)
-from .model_registry import GATEWAY_EXECUTED_CAPABILITY_IDS
+from model_authority.binding import CapabilityResolutionError, eligible_model_choices
+from model_authority.capabilities import GATEWAY_EXECUTED_CAPABILITY_IDS
 from .event_log import EventLog, UserEventBus
 from .approval_route import bind_session_approval_route
 from .dispatcher_factory import GatewayDispatcherDeps

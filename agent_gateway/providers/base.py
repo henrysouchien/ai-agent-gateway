@@ -2,18 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import logging
 import re
 import time
 from typing import Any, AsyncIterator, Literal, Mapping
 
 from ..auth import ProviderCredentialFailure
-from ..model_registry import (
-  INITIAL_MODEL_REGISTRY,
-  AdapterRouteSupport,
-  ModelRegistryEntry,
-)
-from ..rates import ContextRateTier
-from ..thinking import EffortResolution, ThinkingLevel
+from model_authority.current import INITIAL_MODEL_REGISTRY, RATE_TABLES
+from model_authority.registry import AdapterRouteSupport, ModelRegistryEntry
+from model_authority.rates import ContextRateTier, RateTable, UnknownModelError, provider_rate_table
+from model_authority.schema import FamilyCompat
+from model_authority.thinking import EffortResolution, ThinkingLevel
+
+log = logging.getLogger(__name__)
 
 
 _STATUS_CODE_RE = re.compile(r"\b(400|401|403|404|429|5\d\d)\b")
@@ -63,7 +64,11 @@ ThinkingMode = Literal["adaptive", "budget", "none"]
 
 @dataclass
 class ModelInfo:
-  """Static or semi-static metadata about a model identifier."""
+  """Request facts for one model id, built from its model-authority entry.
+
+  Limits and ``compat`` come from the entry's family compat block, efforts
+  from its ``supported_efforts``, prices from the authority's rate table.
+  """
 
   id: str
   provider: str
@@ -78,7 +83,9 @@ class ModelInfo:
   cache_read_cost_per_mtok: float = 0.0
   cache_write_cost_per_mtok: float = 0.0
   thinking_mode: ThinkingMode | None = None
-  compat: dict[str, Any] | None = None
+  compat: FamilyCompat | None = None
+  # The entry's supported efforts in canonical ``ThinkingLevel`` order.
+  effort_values: tuple[str, ...] = ()
   rate_tiers: tuple[ContextRateTier, ...] = ()
 
   def __post_init__(self) -> None:
@@ -88,20 +95,18 @@ class ModelInfo:
       self.supports_thinking = True
 
 
-def registry_entry_for_model(provider: str, model_id: str) -> ModelRegistryEntry | None:
-  """Locate the product-model-registry entry admitting one provider model id.
+def registry_entry_for_model(support: AdapterRouteSupport, model_id: str) -> ModelRegistryEntry | None:
+  """The model-authority entry one adapter executes for a provider model id.
 
-  The deployment-selected registry artifact is the single owner of which
-  models exist and of their effort/feature facts; provider capability tables
-  only refine wire metadata (windows, costs, probed protocol quirks) for the
-  models they know.  An exact ``upstream_model`` match wins over a
-  ``reported_identities`` alias; iteration is key-ordered for determinism.
+  Only entries the adapter's own route-support declaration covers qualify, so
+  an upstream id the authority also lists for another process's adapter never
+  shapes this adapter's requests.  An exact ``upstream_model`` match wins over
+  a ``reported_identities`` alias; iteration is key-ordered for determinism.
   """
-  family = str(provider or "").strip().lower()
   alias_match: ModelRegistryEntry | None = None
   for key in sorted(INITIAL_MODEL_REGISTRY.models):
     entry = INITIAL_MODEL_REGISTRY.models[key]
-    if entry.provider != family:
+    if not support.supports(entry):
       continue
     if entry.upstream_model == model_id:
       return entry
@@ -110,11 +115,66 @@ def registry_entry_for_model(provider: str, model_id: str) -> ModelRegistryEntry
   return alias_match
 
 
+def admitted_entry(support: AdapterRouteSupport, model: str) -> tuple[str, ModelRegistryEntry]:
+  """The stripped model id and its entry; a model id with no entry is not callable."""
+  model_id = str(model or "").strip()
+  if not model_id:
+    raise ValueError("Model is required")
+  entry = registry_entry_for_model(support, model_id)
+  if entry is None:
+    raise ValueError(
+      f"the model authority admits no {support.adapter} entry for model {model_id!r}"
+    )
+  return model_id, entry
+
+
 def registry_effort_values(entry: ModelRegistryEntry) -> tuple[str, ...]:
   """The entry's supported efforts in canonical ``ThinkingLevel`` order."""
   return tuple(
     level.value for level in ThinkingLevel if level.value in entry.supported_efforts
   )
+
+
+def authority_rate_table(provider: str, override: RateTable | None = None) -> RateTable:
+  """This provider's authority rate table, with an explicit override's rows first."""
+  return provider_rate_table(provider, RATE_TABLES, override)
+
+
+def model_info_from_entry(
+  model_id: str,
+  entry: ModelRegistryEntry,
+  rate_table: RateTable,
+  *,
+  supports_thinking: bool,
+  thinking_mode: ThinkingMode | None = None,
+  supports_native_compaction: bool = False,
+) -> ModelInfo:
+  """Build ``ModelInfo`` from the entry, its compat limits and the rate table's prices."""
+  compat = entry.compat
+  info = ModelInfo(
+    id=model_id,
+    provider=entry.provider,
+    context_window=compat.context_window,
+    max_output_tokens=compat.max_output_tokens,
+    supports_thinking=supports_thinking,
+    supports_vision="vision" in entry.features,
+    supports_tool_use="tools" in entry.features,
+    supports_native_compaction=supports_native_compaction,
+    thinking_mode=thinking_mode,
+    compat=compat,
+    effort_values=registry_effort_values(entry),
+  )
+  try:
+    rates = rate_table.lookup(entry.provider, model_id)
+  except UnknownModelError:
+    log.warning("%s model %r has no rate row; using zero-cost estimates", entry.provider, model_id)
+    return info
+  info.input_cost_per_mtok = rates.input_cost_per_mtok
+  info.output_cost_per_mtok = rates.output_cost_per_mtok
+  info.cache_read_cost_per_mtok = rates.cache_read_cost_per_mtok
+  info.cache_write_cost_per_mtok = rates.cache_write_cost_per_mtok
+  info.rate_tiers = rates.tiers
+  return info
 
 
 @dataclass
@@ -130,6 +190,7 @@ class StreamEvent:
   thinking_text: str = ""
   signature: str = ""
   stop_reason: str = ""
+  stop_details: dict[str, Any] | None = None
   input_tokens: int = 0
   output_tokens: int = 0
   reasoning_tokens: int = 0

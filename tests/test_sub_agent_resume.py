@@ -27,9 +27,7 @@ from agent_gateway import (
   ToolDispatcher,
   ToolExecutionContext,
 )
-from agent_gateway.capability_binding import (
-  CapabilityBind,
-)
+from model_authority.bind import CapabilityBind
 from agent_gateway.execution_snapshot import (
   build_agent_execution_snapshot,
   render_result_instructions,
@@ -138,7 +136,7 @@ def _bind_receipt(
     "provider": provider,
     "upstream_model": model,
     "adapter": f"test.{provider}",
-    "protocol_profile": "test.reasoning",
+    "protocol_profile": "responses.reasoning",
     "route": "test.in_process",
     "effort": effort,
     "credential_principal": "user",

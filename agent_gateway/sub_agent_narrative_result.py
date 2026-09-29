@@ -58,6 +58,11 @@ _TERMINAL_REASON_PRECEDENCE = (
 #: bounded stop, not a failure: the run did the work its cap paid for.
 _DECLARED_CEILING_SIGNALS = frozenset({"turns_exhausted", "budget_exhausted"})
 
+#: Assistant stop reasons that close a logical response whose text is the
+#: child's delivered narrative. ``refusal`` is the provider declining to
+#: continue: what the model delivered before the stop is still its output.
+_TERMINAL_NARRATIVE_STOP_REASONS = frozenset({"end_turn", "refusal"})
+
 
 @runtime_checkable
 class _NarrativeQuery(Protocol):
@@ -233,9 +238,9 @@ async def _materialize_lineaged_response(
         raise RuntimeError(
           "assistant logical response crosses a tool or terminal boundary"
         )
-    elif event.get("stop_reason") != "end_turn":
+    elif event.get("stop_reason") not in _TERMINAL_NARRATIVE_STOP_REASONS:
       raise RuntimeError(
-        "assistant logical response does not end at an end_turn segment"
+        "assistant logical response does not end at a terminal segment"
       )
   return "".join(
     _visible_text_from_content_blocks(event.get("content_blocks"))
@@ -280,8 +285,12 @@ async def final_child_visible_text(
   event = getattr(entry, "event", None)
   # The newest assistant event for this exact attempt is authoritative. If it
   # is not terminal, partial-output handling must run; searching backward for
-  # an older end_turn would publish a stale answer as this attempt's result.
-  if not isinstance(event, dict) or event.get("stop_reason") != "end_turn":
+  # an older terminal segment would publish a stale answer as this attempt's
+  # result.
+  if (
+    not isinstance(event, dict)
+    or event.get("stop_reason") not in _TERMINAL_NARRATIVE_STOP_REASONS
+  ):
     return FinalChildVisibleText(
       text="",
       final_narrative=None,
@@ -452,6 +461,7 @@ def task_result_from_execution(
     else None
   )
   parent_budget_stop = False
+  refusal_category: str | None = None
   for event in event_list:
     event_type = event.get("type")
     if terminal_tool_result is not None:
@@ -467,6 +477,14 @@ def task_result_from_execution(
       if error_detail is None:
         raw = str(event.get("error") or event.get("message") or "").strip()
         error_detail = raw or None
+    elif event_type == "refusal":
+      # The provider ended the child's turn with ``stop_reason=refusal``. The
+      # delivered text is still the child's narrative; the signal says why it
+      # stopped.
+      signals.append("refusal")
+      category = event.get("category")
+      if isinstance(category, str) and category.strip():
+        refusal_category = category.strip()
   if stalled and terminal_tool_result is None:
     signals.append("stalled")
     if error_detail is None:
@@ -539,15 +557,27 @@ def task_result_from_execution(
     and final_narrative is not None
     and requirement.mode == "narrative"
   )
+  refused = settled_signals == ("refusal",)
   if honest_partial:
     execution = ExecutionSettlement(status="succeeded")
+  elif refused:
+    # A refusal is the child's own disposition, not a runtime failure: it
+    # settles interrupted with the provider's category and keeps the text the
+    # model delivered before the stop.
+    execution = ExecutionSettlement(
+      status="interrupted",
+      terminal_reason=(
+        f"refusal: {refusal_category}" if refusal_category else "refusal"
+      ),
+    )
   else:
     execution = _execution_settlement(
       settled_signals,
       error_detail=error_detail,
     )
   if execution.status != "succeeded":
-    final_narrative = None
+    if not refused:
+      final_narrative = None
     projection = None
     runtime_projection = None
     acquired_outcome = None

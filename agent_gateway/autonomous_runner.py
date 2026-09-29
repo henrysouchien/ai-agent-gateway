@@ -38,7 +38,7 @@ from .autonomous_control_contract import (
 )
 from .autonomous_launch_envelope import AutonomousControlAuthority
 from .claim_signing_authority import GatewayClaimSigningAuthority
-from .capability_binding import CredentialHandle
+from model_authority.binding import CredentialHandle
 from .session import GatewaySession
 from .autonomous_event_channel import (
   AutonomousEventRecord,

@@ -33,23 +33,18 @@ from agent_gateway.batch_approval_projection import (
   approval_record_matches_projection,
   bind_batch_approval_scope,
 )
-from ..capability_binding import (
-  AuthContext,
-  CapabilityBind,
-  CredentialHandle,
-  SESSION_DRIVER_CAPABILITY,
-)
+from model_authority.bind import CapabilityBind
+from model_authority.binding import AuthContext, CredentialHandle
+from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
 from agent_gateway.capability_execution import (
   BoundCapabilityExecution,
   CapabilityAdapterResolver,
   CapabilityExecutionResolver,
   MaterializedCredential,
 )
-from agent_gateway.model_registry import (
-  GATEWAY_EXECUTED_CAPABILITY_IDS,
-  ProductModelRegistry,
-  ProductModelSelectionPolicy,
-)
+from model_authority.capabilities import GATEWAY_EXECUTED_CAPABILITY_IDS
+from model_authority.registry import ProductModelRegistry
+from model_authority.selection import ProductModelSelectionPolicy
 from agent_gateway.claim_signing_authority import (
   GatewayClaimSigningAuthority,
 )

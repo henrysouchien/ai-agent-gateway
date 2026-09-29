@@ -13,11 +13,9 @@ from typing import Any, Literal, Mapping, overload
 
 from agent_workflow_contracts.research_file_contract import is_research_file_id
 
-from .capability_binding import (
-  CapabilityBind,
-  CredentialHandle,
-  SESSION_DRIVER_CAPABILITY,
-)
+from model_authority.bind import CapabilityBind
+from model_authority.binding import CredentialHandle
+from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
 from .agent_session_log_layout import (
   AutonomousSessionLogAuthority,
   SESSION_LOG_LAYOUT_V2,

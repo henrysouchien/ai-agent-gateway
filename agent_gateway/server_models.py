@@ -41,29 +41,23 @@ from pydantic import (
 from pydantic_core import PydanticCustomError
 
 from .auth import CredentialsResolver
-from .capability_binding import (
-  CapabilityBind,
-  CredentialHandle,
-  SESSION_DRIVER_CAPABILITY,
-)
+from model_authority.bind import CapabilityBind
+from model_authority.binding import CredentialHandle
+from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
 from .capability_execution import (
   BoundCapabilityExecution,
   CapabilityAdapterResolver,
   CapabilityExecutionResolver,
   MaterializedCredential,
 )
-from .model_registry import (
-  ModelLifecycle,
-  ProductModelRegistry,
-  ProductModelSelectionPolicy,
-  SelectionSource,
-)
+from model_authority.registry import ModelLifecycle, ProductModelRegistry, SelectionSource
+from model_authority.selection import ProductModelSelectionPolicy
 from .model_preferences import ModelPreferenceStore
 from .autonomous_capability_handoff import AutonomousCapabilityBindingResolver
 from .claim_signing_authority import GatewayClaimSigningAuthority
 from .control_skill_catalog import ControlSkillCatalog
 from .skill_limits import AutonomousSkillAdmissionPolicyResolver
-from .thinking import parse_effort
+from model_authority.thinking import parse_effort
 from .commercial_work_start import (
   COMMERCIAL_CLAIM_HEADER,
   COMMERCIAL_WORK_AUTHORIZATION_HEADER,

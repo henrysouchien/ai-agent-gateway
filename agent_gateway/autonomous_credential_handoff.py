@@ -5,7 +5,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, BinaryIO
 
-from .capability_binding import CredentialHandle
+from model_authority.binding import CredentialHandle
 from .capability_execution import MaterializedCredential
 
 

@@ -9,7 +9,7 @@ import time
 from typing import TYPE_CHECKING, Any, Dict, Mapping
 
 from . import sdk_runner_helpers as _sdk_runner_helpers
-from .capability_binding import validate_reported_identity
+from model_authority.binding import validate_reported_identity
 from .event_adapter import TERMINAL_DISPOSITIONS, TerminalDisposition
 from .runner_session_events import (
   build_tool_call_complete_event as _build_tool_call_complete_event,

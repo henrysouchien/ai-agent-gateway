@@ -9,14 +9,21 @@ import pytest
 from agent_gateway import (
   AgentRunner,
   AgentSessionLog,
-  EffortResolution,
   EventLog,
   ModelInfo,
   ModelProvider,
   ToolDispatcher,
 )
-from agent_gateway.providers import AnthropicProvider, CodexProvider, OpenAIProvider, StreamEvent, ThinkingLevel, XAIProvider
-from agent_gateway.capability_binding import CapabilityEffort
+from model_authority.thinking import EffortResolution
+from agent_gateway.providers import (
+  AnthropicProvider,
+  CodexProvider,
+  OpenAIProvider,
+  StreamEvent,
+  XAIProvider,
+)
+from model_authority.thinking import ThinkingLevel
+from model_authority.binding import CapabilityEffort
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.providers.base import truncate_to_last_compaction
 from agent_gateway.server_compaction import (
@@ -451,9 +458,9 @@ def test_server_compaction_apply_truncate_roundtrip() -> None:
 
 def test_server_compaction_codex_normalize_text() -> None:
   provider = CodexProvider()
-  model_info = provider.get_model_info("gpt-5.5")
+  model_info = provider.get_model_info("gpt-5.6-sol")
   normalized: list[dict[str, Any]] = provider.normalize_messages(
-    [{"role": "user", "content": "old"}, *apply_compaction_anchor([], LONG_SUMMARY, provider="codex", model="gpt-5.5")],
+    [{"role": "user", "content": "old"}, *apply_compaction_anchor([], LONG_SUMMARY, provider="codex", model="gpt-5.6-sol")],
     model_info,
   )
 
@@ -547,11 +554,11 @@ def test_server_compaction_gain_guard() -> None:
 
 def test_server_compaction_orphan_passthrough_characterization() -> None:
   messages = [
-    *apply_compaction_anchor([], LONG_SUMMARY, provider="codex", model="gpt-5.5"),
+    *apply_compaction_anchor([], LONG_SUMMARY, provider="codex", model="gpt-5.6-sol"),
     {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "missing-tool", "content": "orphan"}]},
   ]
 
-  codex_normalized = CodexProvider().normalize_messages(messages, CodexProvider().get_model_info("gpt-5.5"))
+  codex_normalized = CodexProvider().normalize_messages(messages, CodexProvider().get_model_info("gpt-5.6-sol"))
   openai_normalized = OpenAIProvider().normalize_messages(messages, OpenAIProvider().get_model_info("gpt-5.6"))
 
   assert codex_normalized[-1]["content"][0]["tool_use_id"] == "missing-tool"
@@ -562,7 +569,7 @@ def test_server_compaction_anchor_replay_anthropic() -> None:
   provider = AnthropicProvider()
   normalized = provider.normalize_messages(
     [{"role": "user", "content": "old"}, *apply_compaction_anchor([], LONG_SUMMARY, provider="codex", model="model")],
-    provider.get_model_info("claude-sonnet-4-6"),
+    provider.get_model_info("claude-sonnet-5"),
   )
 
   assert normalized[0]["content"][0] == {"type": "compaction", "content": LONG_SUMMARY}
@@ -738,8 +745,8 @@ def test_server_compaction_summary_strips_analysis(monkeypatch: pytest.MonkeyPat
 
 
 def test_server_compaction_continuation_request_shape() -> None:
-  messages = apply_compaction_anchor([], LONG_SUMMARY, provider="codex", model="gpt-5.5")
-  normalized = CodexProvider().normalize_messages(messages, CodexProvider().get_model_info("gpt-5.5"))
+  messages = apply_compaction_anchor([], LONG_SUMMARY, provider="codex", model="gpt-5.6-sol")
+  normalized = CodexProvider().normalize_messages(messages, CodexProvider().get_model_info("gpt-5.6-sol"))
 
   assert messages[0]["role"] == "assistant"
   assert messages[0]["content"][0]["type"] == "compaction"
@@ -797,7 +804,7 @@ def test_runner_supported_anthropic_model_uses_native_compaction() -> None:
     messages=[{"role": "user", "content": LONG_INPUT}],
     max_turns=1,
     effort="none",
-    model="claude-sonnet-4-6",
+    model="claude-sonnet-5",
   )
 
   assert provider.summary_requests == 0

@@ -16,7 +16,7 @@ if str(PKG_DIR) not in sys.path:
 import agent_gateway.runner_usage as runner_usage  # noqa: E402
 from agent_gateway.commercial_usage import CommercialUsageProducer  # noqa: E402
 from agent_gateway.multi_user.billing import SessionUsageSummary  # noqa: E402
-from agent_workflow_contracts import CapabilityBind  # noqa: E402
+from model_authority.bind import CapabilityBind
 
 
 class _Aggregator:

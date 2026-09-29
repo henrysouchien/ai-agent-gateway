@@ -4,7 +4,9 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Literal, TypeAlias
 
-from .capability_binding import CapabilityBind, RunMode, SESSION_DRIVER_CAPABILITY
+from model_authority.bind import CapabilityBind
+from model_authority.binding import RunMode
+from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
 from .capability_execution import MaterializedCredential
 
 

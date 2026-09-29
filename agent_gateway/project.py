@@ -34,6 +34,8 @@ _TOP_LEVEL_KEYS = {
   "max_turns",
   "max_budget_usd",
 }
+# Keys an earlier `agent init` scaffold wrote and the schema later retired: its own history, not an allowlist.
+_RETIRED_KEYS = frozenset({"per_turn_timeout", "provider", "model"})
 
 
 class AgentProjectError(ValueError):
@@ -199,9 +201,12 @@ def save_agent_project_payload(
 def load_agent_project_config(config_path: str | Path = DEFAULT_AGENT_CONFIG) -> AgentProjectConfig:
   path = Path(config_path).expanduser()
   payload = load_agent_project_payload(path)
-  unknown = sorted(set(payload) - _TOP_LEVEL_KEYS)
+  unknown = sorted(set(payload) - _TOP_LEVEL_KEYS - _RETIRED_KEYS)
   if unknown:
-    logger.warning("Ignoring unsupported agent config keys in %s: %s", path, ", ".join(unknown))
+    raise AgentProjectError(f"Unsupported agent config keys in {path}: {', '.join(unknown)}")
+  retired = sorted(set(payload) & _RETIRED_KEYS)
+  if retired:
+    logger.warning("Ignoring retired agent config keys in %s: %s", path, ", ".join(retired))
 
   base_dir = path.parent
   name = validate_project_name(_string(payload.get("name"), "agent"))

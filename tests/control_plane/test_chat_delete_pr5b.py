@@ -14,15 +14,10 @@ from agent_gateway.approval_audit import ApprovalAuditEmitter
 from agent_gateway.approval_policy import ApprovalRequest, ApprovalRequestPayload, RunContext, utc_now
 from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.audit_writer import JSONLAuditWriter
-from agent_gateway.capability_binding import (
-  CredentialHandle,
-)
+from model_authority.binding import CredentialHandle
 from agent_gateway.capability_execution import BoundCapabilityExecution
-from agent_gateway.model_registry import (
-  CAPABILITY_IDS,
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
-)
+from model_authority.capabilities import CAPABILITY_IDS
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.event_log import EventLog
 from agent_gateway.runner import AgentRunner
 from agent_gateway.server import (

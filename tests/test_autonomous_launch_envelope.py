@@ -32,12 +32,8 @@ from agent_gateway.autonomous_launch_envelope import (
   sign_autonomous_launch_envelope,
   verify_autonomous_launch_envelope,
 )
-from agent_gateway.capability_binding import (
-  CapabilityBind,
-  CredentialHandle,
-  CredentialPrincipal,
-  RunMode,
-)
+from model_authority.bind import CapabilityBind
+from model_authority.binding import CredentialHandle, CredentialPrincipal, RunMode
 from agent_gateway.session import GatewaySession
 from agent_gateway.skill_limits import SkillExecutionLimits
 from agent_gateway.agent_session_log_layout import (

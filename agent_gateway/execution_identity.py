@@ -41,7 +41,7 @@ def execution_identity_from_session(
 
   Single tier by construction: the session's credential binding is the only
   source consulted.  ``credential_handle_id`` is populated only from a bound
-  :class:`~agent_gateway.capability_binding.CredentialHandle` that matches
+  :class:`~model_authority.binding.CredentialHandle` that matches
   ``bind`` exactly (handle id, provider, principal) — a handle that does not
   match the capability bind is not a weaker identity, it is a different one,
   and the resolution fails rather than degrading.

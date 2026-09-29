@@ -9,7 +9,6 @@ import pytest
 from agent_workflow_contracts import (
   AdmittedInputBinding,
   AdmittedTask,
-  CapabilityBind,
   ContentReadContextView,
   ContentReadGrant,
   ContextViewPolicy,
@@ -17,6 +16,7 @@ from agent_workflow_contracts import (
   ToolGrant,
   sha256_digest,
 )
+from model_authority.bind import CapabilityBind
 from agent_gateway.agent_session_log import (
   AgentSessionLog,
   AgentSessionRef,

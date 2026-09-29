@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from model_authority.bind import CapabilityBind
 from pydantic import TypeAdapter
 
 from .models import (
@@ -14,7 +15,6 @@ from .models import (
   AgentCompletionEnvelope,
   AgentOperationRef,
   CanonicalProjection,
-  CapabilityBind,
   ContentHandle,
   ContractRef,
   DeliveryEnvelope,

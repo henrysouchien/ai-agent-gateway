@@ -2,19 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import replace
 from typing import Any, AsyncGenerator
 from weakref import WeakKeyDictionary
 
 import httpx
 
-from ..model_registry import AdapterRouteSupport
-from ..rates import RateTable, UnknownModelError, load_provider_rate_table
-from ..thinking import EffortResolution, ThinkingLevel
+from model_authority.registry import AdapterRouteSupport
+from model_authority.rates import RateTable
+from model_authority.thinking import EffortResolution, ThinkingLevel
 from .base import (
   ModelInfo, ModelProvider, StreamEvent, _is_context_length_exception,
-  registry_effort_values, registry_entry_for_model,
+  authority_rate_table,
 )
+from .openai_responses_helpers import reasoning_effort_fragment, responses_compat, responses_model_info
 from .codex import CodexProvider
 from .xai_helpers import (
   DEFAULT_INSTRUCTIONS,
@@ -130,7 +130,7 @@ class XAIProvider(ModelProvider):
     )
 
   def __init__(self, *, rate_table: RateTable | None = None) -> None:
-    self._rate_table = load_provider_rate_table(self.name, rate_table)
+    self._rate_table = authority_rate_table(self.name, rate_table)
     self._client_state: WeakKeyDictionary[httpx.AsyncClient, dict[str, Any]] = WeakKeyDictionary()
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
@@ -194,87 +194,7 @@ class XAIProvider(ModelProvider):
       pass
 
   def get_model_info(self, model: str) -> ModelInfo:
-    model_id = str(model or "").strip()
-    if not model_id:
-      raise ValueError("Model is required")
-    # Context windows per docs.x.ai models pages (audited 2026-07-21):
-    # grok-4.3 and grok-4.20 variants 1M; grok-4.5 500k; grok-build-0.1 256k.
-    # grok-latest is not a documented alias — conservatively assume it resolves
-    # to grok-4.5 (500k) so compaction fires before any real wall.
-    # xAI publishes NO max-output cap; 128k is an internal assumption.
-    context_window = 1_000_000
-    supports_thinking = True
-    compat: dict[str, bool | str | tuple[str, ...]]
-    if model_id == "grok-4.3" or model_id.startswith("grok-4.3-"):
-      compat = {
-        "supportsReasoningEffort": True,
-        "reasoningEffortValues": ("none", "low", "medium", "high"),
-        "reasoningEffortDefault": "medium",
-      }
-    elif model_id == "grok-latest":
-      context_window = 500_000
-      compat = {
-        "supportsReasoningEffort": True,
-        "reasoningEffortValues": ("none", "low", "medium", "high"),
-        "reasoningEffortDefault": "medium",
-      }
-    elif model_id == "grok-4.5" or model_id.startswith("grok-4.5-"):
-      context_window = 500_000
-      compat = {
-        "supportsReasoningEffort": True,
-        "reasoningEffortValues": ("low", "medium", "high"),
-        "reasoningEffortDefault": "medium",
-      }
-    elif model_id in {
-      "grok-build-0.1",
-      "grok-4.20-beta-latest-reasoning",
-      "grok-4.20-beta-latest-non-reasoning",
-    }:
-      context_window = 256_000 if model_id == "grok-build-0.1" else 1_000_000
-      supports_thinking = model_id.endswith("-reasoning")
-      compat = {"supportsReasoningEffort": False}
-    else:
-      # Allowlist enforcement happens above the provider. Unknown explicitly
-      # allowlisted Grok models use the spec's conservative reasoning dial.
-      compat = {
-        "supportsReasoningEffort": True,
-        "reasoningEffortValues": ("low", "medium", "high"),
-        "reasoningEffortDefault": "medium",
-      }
-    entry = registry_entry_for_model(self.name, model_id)
-    if entry is not None:
-      efforts = registry_effort_values(entry)
-      supports_thinking = any(value != "none" for value in efforts)
-      compat = {
-        "supportsReasoningEffort": supports_thinking,
-        "reasoningEffortValues": efforts,
-        "reasoningEffortDefault": entry.default_effort,
-      }
-    model_info = ModelInfo(
-      id=model_id,
-      provider=self.name,
-      context_window=context_window,
-      max_output_tokens=128_000,
-      supports_thinking=supports_thinking,
-      supports_vision="vision" in entry.features if entry is not None else False,
-      supports_tool_use="tools" in entry.features if entry is not None else True,
-      compat=compat,
-    )
-    try:
-      rates = self._rate_table.lookup(self.name, model_id)
-    except UnknownModelError:
-      log.warning("xAI model %r has no rate row; using zero-cost estimates", model_id)
-      return model_info
-    return replace(
-      model_info,
-      context_window=rates.context_window or model_info.context_window,
-      max_output_tokens=rates.max_tokens or model_info.max_output_tokens,
-      input_cost_per_mtok=rates.input_cost_per_mtok,
-      output_cost_per_mtok=rates.output_cost_per_mtok,
-      cache_read_cost_per_mtok=rates.cache_read_cost_per_mtok,
-      cache_write_cost_per_mtok=rates.cache_write_cost_per_mtok,
-      rate_tiers=rates.tiers,
-    )
+    return responses_model_info(self.adapter_route_support(), model, self._rate_table)
 
   def resolve_effort(
     self,
@@ -286,15 +206,15 @@ class XAIProvider(ModelProvider):
     **request_context: Any,
   ) -> EffortResolution:
     del max_tokens, request_context
-    compat = dict(model_info.compat or {})
-    if not compat.get("supportsReasoningEffort"):
+    compat = responses_compat(model_info)
+    if not compat.reasoning_control.values:
       if requested != ThinkingLevel.NONE:
         raise ValueError(
           f"xai model {model!r} does not support reasoning effort "
           f"{requested.value!r}; unsupported effort is refused, never repaired"
         )
       return EffortResolution(requested, ThinkingLevel.NONE, False, {})
-    supported = tuple(ThinkingLevel(str(value)) for value in compat.get("reasoningEffortValues", ()))
+    supported = tuple(ThinkingLevel(value) for value in compat.reasoning_control.values)
     if requested not in supported:
       raise ValueError(
         f"xai model {model!r} does not support reasoning effort "
@@ -306,7 +226,7 @@ class XAIProvider(ModelProvider):
       requested=requested,
       effective=requested,
       thinking_enabled_effective=requested != ThinkingLevel.NONE,
-      payload_fragments={"reasoning": {"effort": requested.value}},
+      payload_fragments=reasoning_effort_fragment(compat, requested.value),
     )
 
   def normalize_messages(self, messages: list[dict[str, Any]], model_info: ModelInfo) -> list[dict[str, Any]]:
@@ -352,6 +272,8 @@ class XAIProvider(ModelProvider):
     reasoning = effort_resolution.payload_fragments.get("reasoning")
     if isinstance(reasoning, dict):
       params["reasoning"] = dict(reasoning)
+      if effort_resolution.effective != ThinkingLevel.NONE and responses_compat(model_info).reasoning_summary:
+        params["reasoning"]["summary"] = "auto"
     headers = kwargs.get("headers")
     if isinstance(headers, dict) and headers:
       params["_headers"] = dict(headers)

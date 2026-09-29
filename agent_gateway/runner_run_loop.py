@@ -76,6 +76,7 @@ from .runner_session_events import (
   build_context_warning_log_data as _build_context_warning_log_data,
   build_max_turns_reached_event as _build_max_turns_reached_event,
   build_max_turns_text_event as _build_max_turns_text_event,
+  build_refusal_event as _build_refusal_event,
   build_runtime_guard_event as _build_runtime_guard_event,
   build_stream_complete_event as _build_stream_complete_event,
   build_token_estimate_log_data as _build_token_estimate_log_data,
@@ -1128,6 +1129,7 @@ class RunnerRunLoopMixin:
       *,
       content_blocks: List[Dict[str, Any]],
       stop_reason: str | None,
+      stop_details: Dict[str, Any] | None = None,
       model: str,
       usage: Dict[str, Any],
       parent_messages: list[ParentMessage] | None = None,
@@ -2327,6 +2329,10 @@ class RunnerRunLoopMixin:
     # Returns the ordinal the assistant message was persisted with, so the
     # max_tokens warning below names the same segment as the durable record.
     logical_response_segment_ordinal = await persist_assistant_message_once()
+    if turn.stop_reason == "refusal":
+      # The provider declined to continue. The delivered text stays the turn's
+      # output; the client is told why, and nothing is reset or retried.
+      self._append(_build_refusal_event(turn.stop_details))
     if exceeded_state is not None:
       await emit_budget_exceeded_stop(exceeded_state)
       return finish("break")
@@ -2396,8 +2402,12 @@ class RunnerRunLoopMixin:
       return finish("continue")
     if terminal_failure is not None:
       return finish("break")
+    # A refusal is a completed model turn like `end_turn`: background work
+    # still running or awaiting delivery holds it open the same way, so it
+    # never reaches the terminal gate with work unsettled.
     delivery_follow_up_allowed = turn.stop_reason in {
       "end_turn",
+      "refusal",
       "tool_use",
     }
     # Ack follows delivery: this response consumed the reminder that
@@ -2410,7 +2420,7 @@ class RunnerRunLoopMixin:
       self._ack_delivered_notifications(delivered_notifications)
       delivered_notifications = []
     if (
-      turn.stop_reason == "end_turn"
+      turn.stop_reason in {"end_turn", "refusal"}
       and self._background_notifications_enabled
       and self._notification_queue.pending_count == 0
       and (
@@ -2585,8 +2595,8 @@ class RunnerRunLoopMixin:
           type(exc).__name__,
         )
       return finish("continue")
-    if turn.stop_reason == "end_turn":
-      terminal_success_reason = "end_turn"
+    if turn.stop_reason in {"end_turn", "refusal"}:
+      terminal_success_reason = turn.stop_reason
     else:
       terminal_failure = (
         "terminal_outcome_unproven",
@@ -3550,6 +3560,7 @@ class RunnerRunLoopMixin:
             failed_est_at=None if force else getattr(self, "_portable_compaction_failed_est_at", None),
             tools=base_kwargs.get("tools") or [],
             force=force,
+            on_event=self._append,
           )
           if compact_result.summarize_usage is not None:
             _merge_usage_totals(usage_totals, compact_result.summarize_usage)
@@ -3832,6 +3843,7 @@ class RunnerRunLoopMixin:
           entry = await self._append_assistant_message_event(
             content_blocks=durable_assistant_content_blocks,
             stop_reason=turn.stop_reason,
+            stop_details=turn.stop_details,
             model=upstream_model,
             usage=turn_usage_payload,
             parent_messages=list(pending_parent_message_acks.values()),
@@ -3862,7 +3874,7 @@ class RunnerRunLoopMixin:
             )
             pending_parent_message_acks.clear()
           if (
-            turn.stop_reason == "end_turn"
+            turn.stop_reason in {"end_turn", "refusal"}
             or bool(turn.tool_uses)
           ):
             pending_model_visible_tool_result_ids.difference_update(

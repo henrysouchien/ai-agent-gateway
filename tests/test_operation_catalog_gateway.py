@@ -8,7 +8,6 @@ import pytest
 from agent_workflow_contracts import (
   AdmittedTask,
   AgentExecutionSnapshot,
-  CapabilityBind,
   ExecuteTaskDisposition,
   OrdinaryDelegationTaskRef,
   ToolGrant,
@@ -16,6 +15,7 @@ from agent_workflow_contracts import (
   canonical_json_bytes,
   sha256_digest,
 )
+from model_authority.bind import CapabilityBind
 from agent_gateway.skills import SkillLoader
 from agent_gateway.execution_snapshot import (
   build_agent_execution_snapshot,

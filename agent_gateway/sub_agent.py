@@ -57,10 +57,8 @@ from .autonomous_output import extract_state_update
 from .approval_policy import RunContext
 from .approval_route import session_approval_route
 from .agent_result_content import make_get_agent_result_content_handler
-from .capability_binding import (
-  CapabilityBind,
-  CapabilityResolutionError,
-)
+from model_authority.bind import CapabilityBind
+from model_authority.binding import CapabilityResolutionError
 from .capability_execution import CapabilityExecutionResolver
 from .commercial_work_start import (
   CommercialWorkStartError,

@@ -21,15 +21,13 @@ from agent_gateway.autonomous_runner import AutonomousRegistry
 from agent_gateway.autonomous_runner_state import (
   autonomous_owner_lease_is_released,
 )
-from agent_gateway.capability_binding import CapabilityBind, CredentialHandle
+from model_authority.bind import CapabilityBind
+from model_authority.binding import CredentialHandle
 from agent_gateway.capability_execution import MaterializedCredential
 from agent_gateway.claim_signing_authority import (
   GatewayClaimSigningAuthority,
 )
-from agent_gateway.model_registry import (
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
-)
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 
 from gateway_test_support.control_plane_identity import fake_identity_resolver, fake_mcp_user_key_lookup
 

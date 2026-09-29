@@ -12,11 +12,12 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import AgentRunner, ToolDispatcher  # noqa: E402
 from agent_gateway.mcp_client import McpClientManager  # noqa: E402
-from agent_gateway.providers import ModelInfo, ModelProvider, ThinkingLevel  # noqa: E402
+from agent_gateway.providers import ModelInfo, ModelProvider
+from model_authority.thinking import ThinkingLevel
 from agent_gateway.providers.base import StreamEvent  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.runner_stream_turn import RunnerStreamTurnMixin  # noqa: E402
-from agent_gateway.thinking import EffortResolution  # noqa: E402
+from model_authority.thinking import EffortResolution
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_runner_capability_execution,
 )
@@ -441,3 +442,204 @@ def test_stream_guard_appends_heartbeat_while_tool_input_streams(
   _, result = returned
   assert result.stop_reason == "tool_use"
   assert result.tool_uses == [("call-1", "write_memo", tool_input)]
+
+
+_REFUSAL_STOP_DETAILS = {
+  "type": "refusal",
+  "category": "reasoning_extraction",
+  "explanation": "The request asks the model to reproduce its internal reasoning.",
+}
+
+
+class _RefusingProvider(ModelProvider):
+  """Delivers some text per request, ending each turn with the next scripted stop.
+
+  A ``refusal`` stop carries the provider's ``stop_details``; any other stop
+  carries none.
+  """
+
+  name = "stub"
+
+  def __init__(self, stop_reasons: tuple[str, ...] = ("refusal",)) -> None:
+    self.requests = 0
+    self._stop_reasons = stop_reasons
+
+  def has_active_credential(self, config):
+    return True
+
+  def create_client(self, config, *, timeout=None):
+    _ = config, timeout
+    return object()
+
+  async def close_client(self, client, timeout=2.0):
+    _ = client, timeout
+
+  def get_model_info(self, model):
+    return ModelInfo(id=model, provider=self.name)
+
+  def build_request_params(self, **_kwargs):
+    self.requests += 1
+    return {}
+
+  async def stream(self, client, params):
+    _ = client, params
+    stop_reason = self._stop_reasons[self.requests - 1]
+    text = "Here is the first half" if stop_reason == "refusal" else "Final answer."
+    yield StreamEvent(type="message_start", input_tokens=10)
+    yield StreamEvent(type="text_delta", text=text)
+    yield StreamEvent(type="text_end", raw_block={"type": "text", "text": text})
+    yield StreamEvent(type="usage_update", output_tokens=5)
+    yield StreamEvent(
+      type="message_end",
+      stop_reason=stop_reason,
+      stop_details=dict(_REFUSAL_STOP_DETAILS) if stop_reason == "refusal" else None,
+    )
+
+
+def _refusal_runner(
+  provider: _RefusingProvider,
+  durable_events: list[dict[str, object]],
+) -> AgentRunner:
+  from agent_gateway.event_log import EventLog
+  from gateway_test_support.capability_execution_test_support import (
+    stub_bound_capability_execution,
+  )
+
+  event_log = EventLog()
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=ToolDispatcher(
+      mcp_client=McpClientManager(config_path=None),
+      local_tool_handlers={},
+      event_log=event_log,
+      session_id="sess-refusal",
+      get_tool_definitions=None,
+    ),
+    session_id="sess-refusal",
+    capability_execution=stub_bound_capability_execution(
+      provider=provider,
+      model="claude-opus-5",
+      effort="none",
+      auth_config={"api_key": "k"},
+    ),
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  async def _append_durable_event(event):
+    durable_events.append(dict(event))
+    return SimpleNamespace(seq=len(durable_events))
+
+  runner._append_durable_event = _append_durable_event
+  return runner
+
+
+def test_refusal_stop_completes_the_turn_with_a_refusal_notice() -> None:
+  from agent_gateway.runner_session_events import REFUSAL_GUIDANCE
+
+  provider = _RefusingProvider()
+  durable_events: list[dict[str, object]] = []
+  runner = _refusal_runner(provider, durable_events)
+
+  asyncio.run(runner.run(messages=[{"role": "user", "content": "Explain your reasoning first."}]))
+
+  # Nothing is retried or reset: one provider request.
+  assert provider.requests == 1
+  [assistant_message] = [
+    event for event in durable_events if event.get("type") == "assistant_message"
+  ]
+  assert assistant_message["stop_reason"] == "refusal"
+  assert assistant_message["content_blocks"] == [
+    {"type": "text", "text": "Here is the first half"}
+  ]
+  # The provider's reason is durable beside the stop, not only on the live notice.
+  assert assistant_message["stop_details"] == _REFUSAL_STOP_DETAILS
+  events = [entry.event for entry in runner._log.entries]
+  types = [event["type"] for event in events]
+  refusal = next(event for event in events if event["type"] == "refusal")
+  assert refusal == {
+    "type": "refusal",
+    "category": "reasoning_extraction",
+    "explanation": "The request asks the model to reproduce its internal reasoning.",
+    "guidance": REFUSAL_GUIDANCE,
+  }
+  assert types.index("text_delta") < types.index("refusal") < types.index("stream_complete")
+  [stream_complete] = [event for event in events if event["type"] == "stream_complete"]
+  assert stream_complete["terminal_disposition"] == "completed"
+  assert not {"error", "run_error", "interrupted"} & set(types)
+  assert not any(event.get("type") in {"error", "run_error"} for event in durable_events)
+
+
+def test_end_turn_assistant_message_carries_no_stop_details() -> None:
+  provider = _RefusingProvider(stop_reasons=("end_turn",))
+  durable_events: list[dict[str, object]] = []
+  runner = _refusal_runner(provider, durable_events)
+
+  asyncio.run(runner.run(messages=[{"role": "user", "content": "Answer plainly."}]))
+
+  [assistant_message] = [
+    event for event in durable_events if event.get("type") == "assistant_message"
+  ]
+  assert assistant_message["stop_reason"] == "end_turn"
+  assert "stop_details" not in assistant_message
+
+
+def test_refusal_with_running_background_child_waits_for_delivery_like_end_turn() -> None:
+  from agent_gateway.task_registry import TaskState
+
+  provider = _RefusingProvider(stop_reasons=("refusal", "end_turn"))
+  durable_events: list[dict[str, object]] = []
+  runner = _refusal_runner(provider, durable_events)
+
+  async def case() -> None:
+    entry = runner._task_registry.register("background_agent", agent_name="reviewer")
+    wait_started = asyncio.Event()
+
+    async def child() -> None:
+      await wait_started.wait()
+      runner._task_registry.transition(
+        entry.task_id,
+        TaskState.COMPLETED,
+        result={"kind": "report", "report": {"summary": "review complete"}},
+      )
+
+    child_task = asyncio.create_task(child())
+    entry.asyncio_task = child_task
+    runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
+    assert runner._task_registry.admission_count > 0
+
+    original_wait = runner._wait_for_background_notification
+    wait_calls = 0
+
+    async def tracked_wait() -> bool:
+      nonlocal wait_calls
+      wait_calls += 1
+      wait_started.set()
+      return await original_wait()
+
+    runner._wait_for_background_notification = tracked_wait
+    await runner.run(
+      messages=[{"role": "user", "content": "Explain your reasoning first."}],
+      max_turns=3,
+    )
+
+    # The refused turn held the run open for the child exactly as end_turn
+    # does, then delivered its notification on a follow-up turn.
+    assert wait_calls == 1
+    assert provider.requests == 2
+    assert entry.state is TaskState.COMPLETED
+    assert runner._notification_queue.pending_count == 0
+
+  asyncio.run(case())
+
+  events = [entry.event for entry in runner._log.entries]
+  types = [event["type"] for event in events]
+  assert types.count("refusal") == 1
+  [stream_complete] = [event for event in events if event["type"] == "stream_complete"]
+  assert stream_complete["terminal_disposition"] == "completed"
+  assert not {"error", "run_error", "interrupted"} & set(types)
+  assert not any(event.get("type") in {"error", "run_error"} for event in durable_events)
+  assert [
+    event["stop_reason"] for event in durable_events if event.get("type") == "assistant_message"
+  ] == ["refusal", "end_turn"]

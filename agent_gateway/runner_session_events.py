@@ -175,6 +175,7 @@ def build_assistant_message_event(
   *,
   content_blocks: List[Dict[str, Any]],
   stop_reason: str | None,
+  stop_details: Dict[str, Any] | None = None,
   model: str,
   provider: str | None,
   usage: Dict[str, Any],
@@ -194,6 +195,10 @@ def build_assistant_message_event(
     "provider": provider,
     "usage": dict(usage),
   }
+  # The provider's reason for the stop (a refusal's category/explanation),
+  # absent when the provider sent none.
+  if stop_details is not None:
+    event["stop_details"] = dict(stop_details)
   attachments = [
     attachment.to_dict()
     for attachment in (workflow_output_attachments or ())
@@ -359,6 +364,27 @@ def build_runtime_guard_event(*, guard: str, message: str) -> Dict[str, Any]:
     "type": "runtime_guard",
     "guard": guard,
     "message": message,
+  }
+
+
+REFUSAL_GUIDANCE = (
+  "Anthropic recommends starting a fresh conversation before continuing; "
+  "further turns in this context may be refused again."
+)
+
+
+def build_refusal_event(stop_details: Dict[str, Any] | None) -> Dict[str, Any]:
+  """The client-visible notice for a turn the provider ended with ``refusal``.
+
+  ``category`` and ``explanation`` are the provider's ``stop_details`` verbatim
+  (``None`` when absent); the delivered text stays the turn's output.
+  """
+  details = stop_details if isinstance(stop_details, dict) else {}
+  return {
+    "type": "refusal",
+    "category": details.get("category"),
+    "explanation": details.get("explanation"),
+    "guidance": REFUSAL_GUIDANCE,
   }
 
 

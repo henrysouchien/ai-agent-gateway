@@ -266,7 +266,7 @@ def _float_or_zero(value: Any) -> float:
   if isinstance(value, bool):
     return 0.0
   try:
-    return float(value)  # type: ignore[arg-type]
+    return float(value)
   except (TypeError, ValueError):
     return 0.0
 

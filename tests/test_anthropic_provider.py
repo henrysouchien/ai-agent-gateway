@@ -9,7 +9,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import httpx2
 import pytest
@@ -24,9 +24,9 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AnthropicProvider, ModelInfo, ThinkingLevel
+from agent_gateway import AnthropicProvider, ModelInfo
+from model_authority.thinking import ThinkingLevel
 import agent_gateway.providers.anthropic as anthropic_provider_module
-import agent_gateway.providers.anthropic_helpers as anthropic_helpers
 from agent_gateway.providers.anthropic import _format_anthropic_rejection_detail
 from agent_gateway.providers.anthropic_oauth import AnthropicCredentialPool
 from agent_gateway.providers import StreamEvent
@@ -63,7 +63,7 @@ def test_server_tool_usage_preserves_known_billable_units_and_rejects_unknown_po
 
 
 def _model_info() -> ModelInfo:
-  return AnthropicProvider().get_model_info("claude-sonnet-4-6")
+  return AnthropicProvider().get_model_info("claude-sonnet-5")
 
 
 def _cached_tool() -> dict[str, object]:
@@ -104,7 +104,7 @@ def _cache_marker_locations(params: dict[str, object]) -> list[tuple[str, int, i
 
 def test_build_request_params_places_fourth_marker_on_interactive_message_tail() -> None:
   params = AnthropicProvider().build_request_params(
-    model="claude-sonnet-4-6",
+    model="claude-sonnet-5",
     messages=[{
       "role": "user",
       "content": [
@@ -130,7 +130,7 @@ def test_build_request_params_places_fourth_marker_on_interactive_message_tail()
 
 def test_build_request_params_places_third_marker_for_sub_agent_shape() -> None:
   params = AnthropicProvider().build_request_params(
-    model="claude-sonnet-4-6",
+    model="claude-sonnet-5",
     messages=[{
       "role": "user",
       "content": [{"type": "text", "text": "review this"}],
@@ -149,7 +149,7 @@ def test_build_request_params_places_third_marker_for_sub_agent_shape() -> None:
 
 def test_build_request_params_never_adds_a_fifth_explicit_marker() -> None:
   params = AnthropicProvider().build_request_params(
-    model="claude-sonnet-4-6",
+    model="claude-sonnet-5",
     messages=[{
       "role": "user",
       "content": [{"type": "text", "text": "do not mark past the API limit"}],
@@ -189,7 +189,7 @@ def test_build_request_params_marks_cacheable_final_block(
   final_block: dict[str, object],
 ) -> None:
   params = AnthropicProvider().build_request_params(
-    model="claude-sonnet-4-6",
+    model="claude-sonnet-5",
     messages=[{"role": "user", "content": [final_block]}],
     system_prompt=None,
     tools=[],
@@ -204,7 +204,7 @@ def test_build_request_params_marks_cacheable_final_block(
 
 def test_build_request_params_normalizes_bare_string_final_content_for_marker() -> None:
   params = AnthropicProvider().build_request_params(
-    model="claude-sonnet-4-6",
+    model="claude-sonnet-5",
     messages=[{"role": "user", "content": "bare prompt"}],
     system_prompt=None,
     tools=[],
@@ -227,7 +227,7 @@ def test_build_request_params_skips_marker_without_cacheable_final_block(
   caplog.set_level(logging.DEBUG, logger="agent_gateway.providers.anthropic")
 
   params = AnthropicProvider().build_request_params(
-    model="claude-sonnet-4-6",
+    model="claude-sonnet-5",
     messages=[{
       "role": "user",
       "content": [{"type": "thinking", "thinking": "private"}],
@@ -279,7 +279,7 @@ def test_build_request_params_strips_stale_message_markers_before_placement() ->
   ]
 
   params = AnthropicProvider().build_request_params(
-    model="claude-sonnet-4-6",
+    model="claude-sonnet-5",
     messages=messages,
     system_prompt=None,
     tools=[],
@@ -294,7 +294,7 @@ def test_build_request_params_strips_stale_message_markers_before_placement() ->
 
 def test_build_request_params_never_marks_trailing_thinking_block() -> None:
   params = AnthropicProvider().build_request_params(
-    model="claude-sonnet-4-6",
+    model="claude-sonnet-5",
     messages=[{
       "role": "user",
       "content": [
@@ -395,7 +395,7 @@ def test_create_client_surfaces_429_instead_of_sleeping_its_retry_after(
         async with client.with_options(http_client=http_client) as local_client:
           with pytest.raises(anthropic.RateLimitError) as caught:
             await local_client.messages.create(
-              model="claude-sonnet-4-6",
+              model="claude-sonnet-5",
               max_tokens=16,
               messages=[{"role": "user", "content": "hello"}],
             )
@@ -462,7 +462,7 @@ def test_create_client_isolates_bound_credentials_and_routes_concurrently(
         "id": "msg_123",
         "type": "message",
         "role": "assistant",
-        "model": "claude-sonnet-4-6",
+        "model": "claude-sonnet-5",
         "content": [{"type": "text", "text": "hello"}],
         "stop_reason": "end_turn",
         "stop_sequence": None,
@@ -478,7 +478,7 @@ def test_create_client_isolates_bound_credentials_and_routes_concurrently(
         ) as http_client:
           async with client.with_options(http_client=http_client) as local_client:
             await local_client.messages.create(
-              model="claude-sonnet-4-6",
+              model="claude-sonnet-5",
               max_tokens=16,
               messages=[{"role": "user", "content": "hello"}],
             )
@@ -556,7 +556,7 @@ def test_create_client_ignores_empty_ambient_auth_headers(
       "id": "msg_123",
       "type": "message",
       "role": "assistant",
-      "model": "claude-sonnet-4-6",
+      "model": "claude-sonnet-5",
       "content": [{"type": "text", "text": "hello"}],
       "stop_reason": "end_turn",
       "stop_sequence": None,
@@ -570,7 +570,7 @@ def test_create_client_ignores_empty_ambient_auth_headers(
       ) as http_client:
         async with client.with_options(http_client=http_client) as local_client:
           result = await local_client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-sonnet-5",
             max_tokens=16,
             messages=[{"role": "user", "content": "hello"}],
           )
@@ -622,7 +622,7 @@ def test_create_client_keeps_bound_credential_out_of_sdk_debug_logs(
       "id": "msg_123",
       "type": "message",
       "role": "assistant",
-      "model": "claude-sonnet-4-6",
+      "model": "claude-sonnet-5",
       "content": [{"type": "text", "text": "hello"}],
       "stop_reason": "end_turn",
       "stop_sequence": None,
@@ -636,7 +636,7 @@ def test_create_client_keeps_bound_credential_out_of_sdk_debug_logs(
       ) as http_client:
         async with client.with_options(http_client=http_client) as local_client:
           await local_client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-sonnet-5",
             max_tokens=16,
             messages=[{"role": "user", "content": "hello"}],
           )
@@ -667,41 +667,6 @@ def test_provider_rejects_blank_bound_credential_despite_ambient_values(
     provider.create_client(config)
 
 
-def test_anthropic_provider_helper_exports_are_parent_aliases() -> None:
-  helper_names = (
-    "_COMMON_BETA_SLUGS",
-    "_COMPACTION_BETA_SLUG",
-    "_ERROR_REDACTION",
-    "_MAX_ERROR_DETAIL_LEN",
-    "_MAX_TOOL_ID_LEN",
-    "_MODEL_INFO_BY_TAG",
-    "_OAUTH_BETA_SLUGS",
-    "_OAUTH_IDENTITY",
-    "_SENSITIVE_ERROR_KEY_RE",
-    "_SENSITIVE_ERROR_VALUE_RES",
-    "_STRUCTURED_OUTPUTS_BETA_SLUG",
-    "_TOOL_ID_RE",
-    "_exception_body",
-    "_exception_status_code",
-    "_format_anthropic_rejection_detail",
-    "_has_tool_result_block",
-    "_model_info_for_model",
-    "_model_matches_tag",
-    "_normalize_tool_call_id",
-    "_redact_error_body",
-    "_response_header",
-    "_same_model_message",
-    "_stream_request_context",
-    "_synthetic_tool_result",
-    "_thinking_param",
-    "_to_plain_dict",
-    "_truncate_error_detail",
-  )
-
-  for name in helper_names:
-    assert getattr(anthropic_provider_module, name) is getattr(anthropic_helpers, name)
-
-
 def test_model_info_defaults_derive_thinking_mode_from_supports_thinking() -> None:
   default_info = ModelInfo(id="stub", provider="test")
   assert default_info.thinking_mode == "none"
@@ -716,22 +681,15 @@ def test_model_info_defaults_derive_thinking_mode_from_supports_thinking() -> No
   ("model", "expected"),
   [
     ("claude-fable-5", True),
-    ("claude-mythos-5", True),
-    ("claude-opus-4-8", True),
-    ("claude-opus-4-7", True),
+    ("claude-fable-5-1", True),
+    ("claude-opus-5-5", True),
+    ("claude-opus-5", True),
     ("claude-sonnet-5", True),
-    ("claude-sonnet-4-6", True),
-    ("claude-sonnet-4-6-20260615", True),
-    ("claude-opus-4-6", True),
-    ("claude-sonnet-4-5", False),
-    ("claude-opus-4-5", False),
     ("claude-haiku-4-5", False),
-    ("claude-3.7-sonnet-20250219", False),
-    ("claude-sonnet-4-60", False),
-    ("claude-sonnet-4-6x", False),
+    ("claude-haiku-4-5-20251001", False),
   ],
 )
-def test_native_compaction_capability_is_model_specific_and_fail_closed(
+def test_native_compaction_capability_is_model_specific(
   model: str,
   expected: bool,
 ) -> None:
@@ -743,10 +701,9 @@ def test_native_compaction_capability_is_model_specific_and_fail_closed(
 @pytest.mark.parametrize(
   ("model", "expects_native_compaction"),
   [
-    ("claude-sonnet-4-6", True),
+    ("claude-sonnet-5", True),
     ("claude-haiku-4-5", False),
-    ("claude-sonnet-4-60", False),
-    ("claude-sonnet-4-6x", False),
+    ("claude-haiku-4-5-20251001", False),
   ],
 )
 def test_compaction_request_is_emitted_only_for_supported_models(
@@ -821,37 +778,6 @@ def test_fable_revision_uses_its_exact_cached_token_price() -> None:
   assert provider.estimate_cost("claude-fable-5", 0, 0, cache_read_tokens=1_000_000).total == 1.0
 
 
-def test_anthropic_prefers_specific_model_metadata_over_family(monkeypatch) -> None:
-  from dataclasses import replace
-
-  family = AnthropicProvider().get_model_info("claude-fable-5")
-  specific = replace(family, id="claude-fable-5-1", supports_native_compaction=False)
-  monkeypatch.setattr(anthropic_helpers, "_MODEL_INFO_BY_TAG", [
-    (("claude-fable-5",), family),
-    (("claude-fable-5-1",), specific),
-  ])
-
-  provider = AnthropicProvider()
-  assert provider.get_model_info("claude-fable-5").supports_native_compaction is True
-  assert provider.get_model_info("claude-fable-5-1").supports_native_compaction is False
-  assert provider.get_model_info("claude-fable-5-1-20260911").supports_native_compaction is False
-
-
-def test_opus48_model_info_uses_bundled_rates_and_adaptive_thinking() -> None:
-  provider = AnthropicProvider()
-
-  info = provider.get_model_info("claude-opus-4-8")
-
-  assert info.context_window == 1_000_000
-  assert info.max_output_tokens == 128_000
-  assert info.input_cost_per_mtok == 5.0
-  assert info.output_cost_per_mtok == 25.0
-  assert info.cache_read_cost_per_mtok == 0.5
-  assert info.cache_write_cost_per_mtok == 6.25
-  assert info.supports_thinking is True
-  assert info.thinking_mode == "adaptive"
-
-
 def test_opus5_model_info_uses_bundled_rates_and_adaptive_thinking() -> None:
   provider = AnthropicProvider()
 
@@ -923,17 +849,12 @@ def test_haiku_45_model_info_preserves_no_thinking_with_real_rates() -> None:
   ("model", "expected"),
   [
     ("claude-fable-5", {"type": "adaptive", "display": "summarized"}),
-    ("claude-opus-4-8", {"type": "adaptive", "display": "summarized"}),
-    ("claude-opus-4-7", {"type": "adaptive", "display": "summarized"}),
-    ("claude-sonnet-4-6", {"type": "adaptive", "display": "summarized"}),
-    ("claude-opus-4-6", {"type": "adaptive", "display": "summarized"}),
-    ("claude-sonnet-4-5", {"type": "enabled", "budget_tokens": 10000}),
-    ("claude-opus-4-5", {"type": "enabled", "budget_tokens": 10000}),
-    ("claude-sonnet-4", {"type": "enabled", "budget_tokens": 10000}),
+    ("claude-fable-5-1", {"type": "adaptive", "display": "summarized"}),
+    ("claude-opus-5-5", {"type": "adaptive", "display": "summarized"}),
+    ("claude-opus-5", {"type": "adaptive", "display": "summarized"}),
+    ("claude-sonnet-5", {"type": "adaptive", "display": "summarized"}),
     ("claude-haiku-4-5", None),
     ("claude-haiku-4-5-20251001", None),
-    ("claude-3.7-sonnet-20250219", None),
-    ("claude-3-opus-20240229", None),
   ],
 )
 def test_thinking_param_matches_existing_model_capability_mapping(
@@ -943,118 +864,95 @@ def test_thinking_param_matches_existing_model_capability_mapping(
   assert AnthropicProvider.thinking_param(model, 12_000) == expected
 
 
-
-
-def test_registry_unadmitted_claude_model_is_rejected() -> None:
+@pytest.mark.parametrize(
+  "model",
+  [
+    "claude-zenith-9",
+    # Listed by the authority for Risk's anthropic.sdk.messages adapter only.
+    "claude-sonnet-4-6",
+    # A non-claude id routed here is decided by the authority, not degraded.
+    "gpt-5.2",
+  ],
+)
+def test_model_without_a_messages_authority_entry_is_refused(model: str) -> None:
   provider = AnthropicProvider()
 
-  with pytest.raises(ValueError, match="product model registry does not admit"):
-    provider.get_model_info("claude-zenith-9")
-  with pytest.raises(ValueError, match="product model registry does not admit"):
-    AnthropicProvider.thinking_param("claude-zenith-9", 4096)
+  with pytest.raises(ValueError, match="admits no anthropic.messages entry"):
+    provider.get_model_info(model)
+  with pytest.raises(ValueError, match="admits no anthropic.messages entry"):
+    AnthropicProvider.thinking_param(model, 4096)
 
 
-def test_thinking_param_defers_foreign_model_ids_to_registry_owner() -> None:
-  # No prefix pre-check: a non-claude id routed here is decided by the
-  # product model registry (raise), not silently degraded to no-thinking.
-  with pytest.raises(ValueError, match="product model registry does not admit"):
-    AnthropicProvider.thinking_param("gpt-5.2", 4096)
+def _registry_entry(effort_control: Literal["output_config", "budget", "none"]):
+  from gateway_test_support.model_defaults import compat_for_profile
+  from model_authority.registry import ModelRegistryEntry
+  from model_authority.schema import AnthropicThinking
 
-
-def _registry_entry(**overrides):
-  from agent_gateway.model_registry import ModelRegistryEntry
-
-  fields = {
-    "key": "anthropic.claude-nova-6",
-    "label": "Nova 6",
-    "provider": "anthropic",
-    "upstream_model": "claude-nova-6",
-    "adapter": "anthropic.messages",
-    "protocol_profile": "messages.adaptive",
-    "route": "anthropic.public",
-    "lifecycle": "active",
-    "capabilities": {"session.driver": "user_selectable"},
-    "supported_efforts": frozenset({"low", "medium", "high", "xhigh", "max"}),
-    "default_effort": "high",
-    "features": frozenset({"tools", "streaming"}),
-    "reported_identities": frozenset({"claude-nova-6"}),
-  }
-  fields.update(overrides)
-  return ModelRegistryEntry(**fields)
-
-
-def test_registry_admitted_claude_model_without_row_derives_from_registry(
-  monkeypatch,
-) -> None:
-  # Config-only model addition (plan §8): a registry-admitted model is served
-  # before the capability table gains a row, with thinking and effort facts
-  # derived from the registry owner — no generic substitution that would drop
-  # xhigh/max efforts or misreport disable semantics.
-  from agent_gateway.model_registry import ProductModelRegistry
-  import agent_gateway.providers.base as provider_base
-
-  entry = _registry_entry()
-  monkeypatch.setattr(
-    provider_base,
-    "INITIAL_MODEL_REGISTRY",
-    ProductModelRegistry(
-      schema="product-model-registry/v1",
-      revision="test",
-      models={entry.key: entry},
+  compat = compat_for_profile("messages.adaptive").model_copy(update={
+    "thinking": AnthropicThinking(
+      default_when_omitted="on",
+      can_disable=False,
+      effort_control=effort_control,
+      effort_when_omitted="high",
     ),
+    "max_output_tokens": 64_000,
+    "context_window": 500_000,
+  })
+  return ModelRegistryEntry(
+    key="anthropic.claude-nova-6",
+    label="Nova 6",
+    provider="anthropic",
+    upstream_model="claude-nova-6",
+    adapter="anthropic.messages",
+    protocol_profile="messages.adaptive",
+    route="anthropic.public",
+    lifecycle="active",
+    capabilities={"session.driver": "user_selectable"},
+    supported_efforts=frozenset({"low", "medium", "high", "xhigh", "max"}),
+    default_effort="high",
+    features=frozenset({"tools", "streaming"}),
+    reported_identities=frozenset({"claude-nova-6"}),
+    compat=compat,
   )
-  provider = AnthropicProvider()
-
-  info = provider.get_model_info("claude-nova-6")
-
-  assert info.supports_thinking is True
-  assert info.thinking_mode == "adaptive"
-  compat = info.compat or {}
-  assert compat["effort_values"] == ("low", "medium", "high", "xhigh", "max")
-  assert compat["thinking_default_effort"] == "high"
-  assert compat["thinking_default_when_omitted"] == "on"
-  # No "none" effort admitted => thinking cannot be explicitly disabled.
-  assert compat["thinking_disable"] == "unsupported"
-  assert AnthropicProvider.thinking_param("claude-nova-6", 4096) == {"type": "adaptive", "display": "summarized"}
 
 
 @pytest.mark.parametrize(
-  ("model", "expected_disable", "expected_omitted"),
+  ("effort_control", "thinking_mode", "expected_thinking"),
   [
-    ("claude-fable-5", "unsupported", "on"),
-    ("claude-opus-5", "disabled", "on"),
-    ("claude-sonnet-5", "disabled", "on"),
+    ("output_config", "adaptive", {"type": "adaptive", "display": "summarized"}),
+    ("budget", "budget", {"type": "enabled", "budget_tokens": 10000}),
+    ("none", "none", None),
   ],
 )
-def test_registry_derivation_reproduces_cataloged_adaptive_compat(
-  model: str,
-  expected_disable: str,
-  expected_omitted: str,
+def test_new_authority_entry_is_served_from_its_compat_alone(
+  monkeypatch,
+  effort_control: Literal["output_config", "budget", "none"],
+  thinking_mode: str,
+  expected_thinking: dict[str, object] | None,
 ) -> None:
-  # Oracle for the derivation rules: for every adaptive model that has BOTH a
-  # registry entry and a catalog row, deriving from the registry entry must
-  # reproduce the catalog row's thinking compat exactly.
-  from agent_gateway.model_registry import INITIAL_MODEL_REGISTRY
-  from agent_gateway.providers.anthropic_helpers import (
-    _model_info_from_registry_entry,
+  # Adding a model is an authority data change: an entry with no gateway code
+  # and no rate row is served, its limits and thinking shape read from compat.
+  from model_authority.registry import ProductModelRegistry
+  from model_authority.schema import SCHEMA
+  import agent_gateway.providers.base as provider_base
+
+  entry = _registry_entry(effort_control)
+  monkeypatch.setattr(
+    provider_base,
+    "INITIAL_MODEL_REGISTRY",
+    ProductModelRegistry(schema=SCHEMA, revision="test", models={entry.key: entry}),
   )
 
-  entry = next(
-    e for e in INITIAL_MODEL_REGISTRY.models.values()
-    if e.provider == "anthropic" and e.upstream_model == model
-  )
-  catalog = AnthropicProvider().get_model_info(model)
+  info = AnthropicProvider().get_model_info("claude-nova-6")
 
-  derived = _model_info_from_registry_entry(model, entry)
-  assert derived.compat is not None
-
-  assert derived.compat == catalog.compat
-  assert derived.compat["thinking_disable"] == expected_disable
-  assert derived.compat["thinking_default_when_omitted"] == expected_omitted
-  assert derived.thinking_mode == catalog.thinking_mode
+  assert info.thinking_mode == thinking_mode
+  assert (info.context_window, info.max_output_tokens) == (500_000, 64_000)
+  assert info.effort_values == ("low", "medium", "high", "xhigh", "max")
+  assert info.input_cost_per_mtok == info.output_cost_per_mtok == 0.0
+  assert AnthropicProvider.thinking_param("claude-nova-6", 12_000) == expected_thinking
 
 
-@pytest.mark.parametrize("model", ["claude-haiku-4-5", "claude-3.7-sonnet-20250219"])
+@pytest.mark.parametrize("model", ["claude-haiku-4-5", "claude-haiku-4-5-20251001"])
 def test_known_non_thinking_models_emit_no_thinking_param(model: str) -> None:
   provider = AnthropicProvider()
 
@@ -1146,7 +1044,7 @@ def test_strict_tool_schema_is_transformed_without_widening_gateway_contract() -
   }]
 
   params = provider.build_request_params(
-    model="claude-opus-4-8",
+    model="claude-opus-5",
     messages=[],
     system_prompt=None,
     tools=tools,
@@ -1179,7 +1077,7 @@ def test_non_strict_tools_skip_anthropic_schema_transformation() -> None:
   }]
 
   params = provider.build_request_params(
-    model="claude-opus-4-8",
+    model="claude-opus-5",
     messages=[],
     system_prompt=None,
     tools=tools,
@@ -1366,7 +1264,7 @@ def test_tool_use_mapper_emits_raw_input_without_redactor_dependency(
   events = asyncio.run(_collect_stream_events(
     AnthropicProvider(),
     client,
-    {"model": "claude-sonnet-4-6", "messages": []},
+    {"model": "claude-sonnet-5", "messages": []},
   ))
   tool_event = next(event for event in events if event.type == "tool_use_end")
 
@@ -1394,7 +1292,7 @@ def test_tool_use_mapper_emits_raw_input_without_redactor_dependency(
       ],
     ),
     (
-      "claude-opus-4-8",
+      "claude-opus-5",
       "oauth",
       160_000,
       [
@@ -1516,7 +1414,7 @@ def test_stream_status_200_api_error_remains_retryable() -> None:
   error = _make_anthropic_api_status_error(200, "stream failed")
   client = _FakeClient(error)
   params = {
-    "model": "claude-sonnet-4-6",
+    "model": "claude-sonnet-5",
     "max_tokens": 4096,
     "messages": [{"role": "user", "content": "hello"}],
     "tools": [],
@@ -1566,7 +1464,7 @@ def test_org_refusing_oauth_parks_that_member_and_rotates_to_the_next(
   provider = AnthropicProvider()
   client = _FakeClient(_make_anthropic_api_status_error(403, f"Error code: 403 - {error_body}", body=error_body))
   params = {
-    "model": "claude-sonnet-4-6",
+    "model": "claude-sonnet-5",
     "max_tokens": 1024,
     "messages": [{"role": "user", "content": "hello"}],
     "_provider_auth_mode": "oauth",
@@ -1597,7 +1495,7 @@ def test_stream_separates_provider_ping_from_silent_progress_metadata() -> None:
     ]
   )
 
-  types = asyncio.run(_collect_stream_types(provider, client, {"model": "claude-sonnet-4-6", "messages": []}))
+  types = asyncio.run(_collect_stream_types(provider, client, {"model": "claude-sonnet-5", "messages": []}))
 
   assert types == [
     "heartbeat",
@@ -1671,7 +1569,7 @@ def test_stream_sums_compaction_usage_iterations() -> None:
     ]
   )
 
-  events = asyncio.run(_collect_stream_events(provider, client, {"model": "claude-sonnet-4-6", "messages": []}))
+  events = asyncio.run(_collect_stream_events(provider, client, {"model": "claude-sonnet-5", "messages": []}))
 
   message_start = events[0]
   usage_update = events[1]
@@ -1684,6 +1582,56 @@ def test_stream_sums_compaction_usage_iterations() -> None:
   assert usage_update.output_tokens == 15
   assert usage_update.cache_creation_tokens == 3
   assert usage_update.cache_read_tokens == 4
+
+
+def test_stream_message_end_carries_refusal_stop_details() -> None:
+  from anthropic.types import RawMessageDeltaEvent
+
+  provider = AnthropicProvider()
+  client = _FakeStreamingClient(
+    [
+      RawMessageDeltaEvent.model_validate(
+        {
+          "type": "message_delta",
+          "delta": {
+            "stop_reason": "refusal",
+            "stop_sequence": None,
+            "stop_details": {
+              "type": "refusal",
+              "category": "reasoning_extraction",
+              "explanation": "The request asks for internal reasoning.",
+            },
+          },
+          "usage": {"output_tokens": 3},
+        }
+      ),
+    ]
+  )
+
+  events = asyncio.run(_collect_stream_events(provider, client, {"model": "claude-opus-5", "messages": []}))
+
+  message_end = events[-1]
+  assert message_end.type == "message_end"
+  assert message_end.stop_reason == "refusal"
+  assert message_end.stop_details == {
+    "type": "refusal",
+    "category": "reasoning_extraction",
+    "explanation": "The request asks for internal reasoning.",
+  }
+
+
+def test_stream_message_end_without_stop_details_carries_none() -> None:
+  provider = AnthropicProvider()
+  client = _FakeStreamingClient(
+    [SimpleNamespace(type="message_delta", delta=SimpleNamespace(stop_reason="end_turn"), usage=None)]
+  )
+
+  events = asyncio.run(_collect_stream_events(provider, client, {"model": "claude-opus-5", "messages": []}))
+
+  message_end = events[-1]
+  assert message_end.type == "message_end"
+  assert message_end.stop_reason == "end_turn"
+  assert message_end.stop_details is None
 
 
 def test_normalize_messages_drops_orphan_tool_result_message() -> None:
@@ -1906,7 +1854,7 @@ def test_truncate_helper_as_text_summary_ends_with_separator() -> None:
 
 
 def test_declared_adapter_support_matches_messages_implementation() -> None:
-  from agent_gateway.model_registry import INITIAL_MODEL_REGISTRY
+  from model_authority.current import INITIAL_MODEL_REGISTRY
 
   declaration = AnthropicProvider.adapter_route_support()
 

@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+from dataclasses import replace
 import sys
 from pathlib import Path
 from typing import Any
@@ -25,15 +26,14 @@ from agent_gateway import (
   make_run_agent_tool_def,
   parse_skill_file,
 )
-from agent_gateway.capability_binding import (
-  CapabilityResolutionError,
-)
+from model_authority.binding import CapabilityResolutionError
+from model_authority.current import INITIAL_MODEL_REGISTRY
 from agent_gateway.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
 )
 from agent_gateway.mcp_client import McpClientManager
-from agent_gateway.providers import StreamEvent
+from agent_gateway.providers import CodexProvider, OpenAIProvider, StreamEvent, XAIProvider
 from gateway_test_support.capability_execution_test_support import (
   stub_bound_capability_execution,
   stub_capability_execution_resolver,
@@ -368,3 +368,54 @@ def test_run_agent_tool_schema_omits_model_selection_authority() -> None:
   )
   assert schema["required"] == ["objective"]
   assert schema["additionalProperties"] is False
+
+
+@pytest.mark.parametrize(
+  ("provider_type", "model", "input_tokens", "expected"),
+  [
+    (XAIProvider, "grok-4.6", 199_999, 0.405998),
+    (XAIProvider, "grok-4.6", 200_000, 0.812),
+    (OpenAIProvider, "gpt-6-astra", 272_000, 2.77),
+    (OpenAIProvider, "gpt-6-astra", 272_001, 5.51502),
+  ],
+)
+def test_long_context_threshold_inclusivity(provider_type, model, input_tokens, expected) -> None:
+  assert provider_type().estimate_cost(model, input_tokens, 1_000).total == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+  ("provider_type", "model", "uncached", "cached", "written", "expected"),
+  [
+    (XAIProvider, "grok-4.6", 100_000, 100_000, 0, 0.512),
+    (OpenAIProvider, "gpt-6-astra", 172_000, 100_000, 0, 1.87),
+    (OpenAIProvider, "gpt-6-astra", 172_001, 100_000, 0, 3.71502),
+    (CodexProvider, "gpt-6-astra", 0, 0, 300_000, 7.575),
+  ],
+)
+def test_long_context_tier_counts_all_prompt_tokens(
+  provider_type, model, uncached, cached, written, expected,
+) -> None:
+  estimate = provider_type().estimate_cost(
+    model, uncached, 1_000, cache_read_tokens=cached, cache_creation_tokens=written,
+  )
+  assert estimate.total == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("provider_type", [CodexProvider, OpenAIProvider, XAIProvider])
+def test_unknown_rate_model_keeps_warn_and_zero(provider_type, monkeypatch, caplog) -> None:
+  import agent_gateway.providers.base as provider_base
+
+  support = provider_type.adapter_route_support()
+  template = next(entry for entry in INITIAL_MODEL_REGISTRY.models.values() if support.supports(entry))
+  model = "unpriced-future-model"
+  entry = replace(
+    template, key=f"{provider_type.name}.unpriced", upstream_model=model,
+    reported_identities=frozenset({model}),
+  )
+  monkeypatch.setattr(
+    provider_base, "INITIAL_MODEL_REGISTRY",
+    replace(INITIAL_MODEL_REGISTRY, models={entry.key: entry}),
+  )
+
+  assert provider_type().estimate_cost(model, 1000, 2000, cache_read_tokens=3000).total == 0
+  assert any(record.levelname == "WARNING" and model in record.getMessage() for record in caplog.records)

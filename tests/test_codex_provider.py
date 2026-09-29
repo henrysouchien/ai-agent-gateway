@@ -14,7 +14,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway.providers import CodexProvider
-from agent_gateway.providers.base import ThinkingLevel
+from model_authority.thinking import ThinkingLevel
 import agent_gateway.providers.codex_helpers as codex_helpers
 from agent_gateway.providers.codex import (
   _ResponsesStreamState,
@@ -86,16 +86,16 @@ def test_codex_has_active_credential_accepts_auth_token() -> None:
   assert provider.has_active_credential({"auth_mode": "oauth", "auth_token": "   "}) is False
 
 
-def test_codex_gpt55_uses_gpt5_family_metadata() -> None:
+def test_codex_gpt56_sol_model_info_reads_authority_limits_and_rates() -> None:
   provider = CodexProvider()
 
-  model_info = provider.get_model_info("gpt-5.5")
+  model_info = provider.get_model_info("gpt-5.6-sol")
 
-  assert model_info.id == "gpt-5.5"
+  assert model_info.id == "gpt-5.6-sol"
   assert model_info.provider == "codex"
-  assert model_info.context_window == 400_000
-  assert model_info.input_cost_per_mtok == 5.00
-  assert model_info.output_cost_per_mtok == 30.00
+  assert model_info.context_window == 272_000
+  assert model_info.input_cost_per_mtok == 4.00
+  assert model_info.output_cost_per_mtok == 20.00
   assert model_info.supports_thinking is True
   assert model_info.supports_vision is True
 
@@ -104,15 +104,13 @@ def test_codex_gpt55_uses_gpt5_family_metadata() -> None:
   ("model_id", "context_window"),
   [
     ("gpt-6-astra", 272_000),
+    ("gpt-6-sol", 200_000),
     ("gpt-5.6-terra", 272_000),
     ("gpt-5.6-sol", 272_000),
     ("gpt-5.6-luna", 272_000),
-    ("gpt-5.6", 400_000),
-    ("gpt-5.5", 400_000),
-    ("gpt-5.1", 400_000),
   ],
 )
-def test_codex_context_window_uses_provider_rate_data(model_id: str, context_window: int) -> None:
+def test_codex_context_window_comes_from_the_authority_entry(model_id: str, context_window: int) -> None:
   provider = CodexProvider()
 
   assert provider.get_model_info(model_id).context_window == context_window
@@ -128,10 +126,10 @@ def test_codex_terra_effective_compaction_trigger_is_reachable() -> None:
   assert trigger == 217_600
 
 
-def test_codex_gpt55_cost_estimation_is_non_zero() -> None:
+def test_codex_gpt56_sol_cost_estimation_is_non_zero() -> None:
   provider = CodexProvider()
 
-  estimate = provider.estimate_cost("gpt-5.5", 1_000, 500, cache_read_tokens=100)
+  estimate = provider.estimate_cost("gpt-5.6-sol", 1_000, 500, cache_read_tokens=100)
 
   assert estimate.total > 0
   assert estimate.input_cost > 0
@@ -139,25 +137,26 @@ def test_codex_gpt55_cost_estimation_is_non_zero() -> None:
   assert estimate.cache_read_cost > 0
 
 
-def test_registry_unadmitted_model_is_rejected() -> None:
-  # The substring fallback ("gpt-5" in id => guessed 272k thinking metadata,
-  # anything else => bare non-thinking ModelInfo) is gone: identities the
-  # registry owner does not admit are refused loudly.
-  provider = CodexProvider()
+@pytest.mark.parametrize(
+  "model",
+  [
+    "gpt-5.9-experimental",
+    "gpt-6-nova",
+    # Listed by the authority for the openai.responses adapter only.
+    "gpt-5.6",
+  ],
+)
+def test_model_without_a_codex_authority_entry_is_refused(model: str) -> None:
+  with pytest.raises(ValueError, match="admits no codex.responses entry"):
+    CodexProvider().get_model_info(model)
 
-  with pytest.raises(ValueError, match="product model registry does not admit"):
-    provider.get_model_info("gpt-5.9-experimental")
-  with pytest.raises(ValueError, match="product model registry does not admit"):
-    provider.get_model_info("gpt-6-nova")
 
-
-def test_registry_admitted_model_without_capability_row_derives_from_registry(
-  monkeypatch,
-) -> None:
-  # Config-only model addition: a model the registry artifact admits is served
-  # before codex_model_info gains a row, with effort facts derived from the
-  # registry owner instead of a name-substring guess.
-  from agent_gateway.model_registry import ModelRegistryEntry, ProductModelRegistry
+def test_new_authority_entry_is_served_from_its_compat_alone(monkeypatch) -> None:
+  # Adding a model is an authority data change: an entry with no gateway code
+  # and no rate row is served, its limits and reasoning vocabulary read from compat.
+  from gateway_test_support.model_defaults import compat_for_profile
+  from model_authority.registry import ModelRegistryEntry, ProductModelRegistry
+  from model_authority.schema import SCHEMA
   import agent_gateway.providers.base as provider_base
 
   entry = ModelRegistryEntry(
@@ -174,35 +173,39 @@ def test_registry_admitted_model_without_capability_row_derives_from_registry(
     default_effort="medium",
     features=frozenset({"tools", "streaming"}),
     reported_identities=frozenset({"gpt-5.7-sol"}),
+    compat=compat_for_profile("codex.reasoning"),
   )
   monkeypatch.setattr(
     provider_base,
     "INITIAL_MODEL_REGISTRY",
-    ProductModelRegistry(
-      schema="product-model-registry/v1",
-      revision="test",
-      models={entry.key: entry},
-    ),
+    ProductModelRegistry(schema=SCHEMA, revision="test", models={entry.key: entry}),
   )
+  provider = CodexProvider()
 
-  info = CodexProvider().get_model_info("gpt-5.7-sol")
+  info = provider.get_model_info("gpt-5.7-sol")
+  params = provider.build_request_params(
+    model="gpt-5.7-sol",
+    messages=[{"role": "user", "content": "hello"}],
+    system_prompt="system",
+    tools=[],
+    max_tokens=1024,
+    thinking_level=ThinkingLevel.XHIGH,
+  )
 
   assert info.provider == "codex"
   assert info.supports_thinking is True
   assert info.supports_tool_use is True
-  compat = info.compat or {}
-  assert compat["supportsReasoningEffort"] is True
-  assert compat["reasoningEffortValues"] == (
-    "none", "low", "medium", "high", "xhigh", "max",
-  )
-  assert compat["reasoningEffortDefault"] == "medium"
+  assert info.context_window == 200_000
+  assert info.input_cost_per_mtok == info.output_cost_per_mtok == 0.0
+  # The compat declares no reasoning summary, so only the effort is sent.
+  assert params["reasoning"] == {"effort": "xhigh"}
 
 
 def test_build_request_params_supplies_default_instructions_when_system_prompt_missing() -> None:
   provider = CodexProvider()
 
   params = provider.build_request_params(
-    model="gpt-5.5",
+    model="gpt-5.6-sol",
     messages=[{"role": "user", "content": "hello"}],
     system_prompt=None,
     tools=[],
@@ -216,7 +219,7 @@ def test_build_request_params_omits_unsupported_temperature() -> None:
   provider = CodexProvider()
 
   params = provider.build_request_params(
-    model="gpt-5.5",
+    model="gpt-5.6-sol",
     messages=[{"role": "user", "content": "hello"}],
     system_prompt="system",
     tools=[],
@@ -230,25 +233,26 @@ def test_build_request_params_omits_unsupported_temperature() -> None:
 def test_build_request_params_preserves_reasoning_effort_clamps() -> None:
   provider = CodexProvider()
 
-  gpt55_params = provider.build_request_params(
-    model="gpt-5.5",
+  sol_params = provider.build_request_params(
+    model="gpt-5.6-sol",
     messages=[{"role": "user", "content": "hello"}],
     system_prompt="system",
     tools=[],
     max_tokens=1024,
     thinking_level=ThinkingLevel.MINIMAL,
   )
-  mini_params = provider.build_request_params(
-    model="gpt-5.1-codex-mini",
+  astra_params = provider.build_request_params(
+    model="gpt-6-astra",
     messages=[{"role": "user", "content": "hello"}],
     system_prompt="system",
     tools=[],
     max_tokens=1024,
-    thinking_level=ThinkingLevel.LOW,
+    thinking_level=ThinkingLevel.NONE,
   )
 
-  assert gpt55_params["reasoning"]["effort"] == "low"
-  assert mini_params["reasoning"]["effort"] == "medium"
+  assert sol_params["reasoning"]["effort"] == "low"
+  # gpt-6-astra cannot turn reasoning off: "none" clamps up to its lowest effort.
+  assert astra_params["reasoning"]["effort"] == "low"
 
 
 def test_resolve_codex_url_normalizes_backend_api_variants() -> None:
@@ -282,12 +286,12 @@ def test_convert_tools_uses_gateway_input_schema_and_null_strict() -> None:
 
 def test_convert_messages_translates_same_model_assistant_text_and_tool_history() -> None:
   provider = CodexProvider()
-  model_info = provider.get_model_info("gpt-5.1-codex-mini")
+  model_info = provider.get_model_info("gpt-5.6-luna")
   messages = [
     {
       "role": "assistant",
       "provider": "codex",
-      "model": "gpt-5.1-codex-mini",
+      "model": "gpt-5.6-luna",
       "content": [
         {
           "type": "thinking",
@@ -346,7 +350,7 @@ def test_convert_messages_translates_same_model_assistant_text_and_tool_history(
 
 def test_normalize_messages_normalizes_cross_model_tool_ids() -> None:
   provider = CodexProvider()
-  model_info = provider.get_model_info("gpt-5.4")
+  model_info = provider.get_model_info("gpt-5.6-sol")
   messages = [
     {
       "role": "assistant",
@@ -489,7 +493,7 @@ def test_parse_sse_and_map_event_translate_raw_responses_stream(
 
 def test_normalize_messages_converts_compaction_to_text_and_truncates() -> None:
   provider = CodexProvider()
-  model_info = provider.get_model_info("gpt-5.5")
+  model_info = provider.get_model_info("gpt-5.6-sol")
   messages = [
     {"role": "user", "content": "old history"},
     {

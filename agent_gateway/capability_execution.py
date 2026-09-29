@@ -7,24 +7,21 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
-from .capability_binding import (
+from model_authority.bind import CapabilityBind
+from model_authority.binding import (
   AuthContext,
-  CapabilityBind,
   CapabilityId,
   CapabilityResolutionError,
   CredentialHandle,
   ModelSelectionIntent,
-  SESSION_DRIVER_CAPABILITY,
   reauthorize_capability_bind,
   require_capability_execution_bind,
   resolve_capability_model,
 )
-from .model_registry import (
-  CAPABILITY_EXECUTION_PROCESS,
-  CAPABILITY_IDS,
-  ProductModelRegistry,
-  ProductModelSelectionPolicy,
-)
+from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
+from model_authority.capabilities import CAPABILITY_EXECUTION_PROCESS, CAPABILITY_IDS
+from model_authority.registry import ProductModelRegistry
+from model_authority.selection import ProductModelSelectionPolicy
 from .providers import ModelProvider
 
 

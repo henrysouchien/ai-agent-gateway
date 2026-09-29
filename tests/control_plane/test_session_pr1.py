@@ -7,10 +7,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from agent_gateway import session as session_module
-from agent_gateway.model_registry import (
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
-)
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.control_plane.middleware import CONTROL_PLANE_VERSION_HEADER
 from agent_gateway.event_log import EventLog
 from agent_gateway.runner import AgentRunner

@@ -60,7 +60,7 @@ def _native_execution(
   active_provider = provider or AnthropicProvider()
   return stub_bound_capability_execution(
     provider=active_provider,
-    model="claude-sonnet-4-6",
+    model="claude-sonnet-5",
     effort="none",
     auth_config={
       "api_key": api_key,
@@ -1671,7 +1671,7 @@ def test_runner_apply_refreshed_auth_config_updates_request_and_runner_config() 
   }
   assert request_config == {
     **expected,
-    "model": "claude-sonnet-4-6",
+    "model": "claude-sonnet-5",
     "effort": "none",
     "thinking_enabled_requested": False,
   }

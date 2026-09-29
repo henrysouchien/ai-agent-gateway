@@ -9,7 +9,7 @@ if TYPE_CHECKING:
   from .capability_execution import BoundCapabilityExecution
   from .commercial_usage import CommercialUsageProducer
   from .multi_user.billing import UsageEvent
-  from .thinking import EffortResolution
+  from model_authority.thinking import EffortResolution
 
 
 log = logging.getLogger("agent_gateway.send_prompt")
@@ -25,7 +25,7 @@ def _call_usage_callback(
 def _prepare_bound_execution(
   capability_execution: BoundCapabilityExecution,
 ) -> tuple[dict[str, Any], int, EffortResolution]:
-  from .capability_binding import require_capability_execution_bind
+  from model_authority.binding import require_capability_execution_bind
   from .capability_execution import BoundCapabilityExecution
 
   if not isinstance(capability_execution, BoundCapabilityExecution):
@@ -117,7 +117,7 @@ async def send_prompt(
   before this execution-only helper is called. The exact provider adapter and
   bound credential snapshot are validated before a provider client is created.
   """
-  from .capability_binding import validate_reported_identity
+  from model_authority.binding import validate_reported_identity
   from .multi_user.billing import UsageEvent, UsageState, normalize_identity
 
   sid = str(session_id or "send-prompt")

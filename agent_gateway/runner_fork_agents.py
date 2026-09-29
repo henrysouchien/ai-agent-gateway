@@ -23,7 +23,7 @@ from agent_workflow_contracts import (
 )
 
 from .capability_execution import BoundCapabilityExecution
-from .capability_binding import CapabilityBind
+from model_authority.bind import CapabilityBind
 from .event_log import EventLog
 from .fork_ledger import ForkLedger
 from .fork_request_handoff import ForkRequestHandoff
@@ -39,6 +39,8 @@ from .runner_introspection import derive_sub_agent_id
 from .runner_session_lifecycle import _runner_attr
 from .runner_state import ChildCostAccumulator
 from .runner_sub_agents import (
+  _ChildActivity,
+  _await_child_under_activity_guard,
   _close_sub_runner,
   _runtime_exception_detail,
 )
@@ -514,6 +516,7 @@ def _fork_event_log(
   parent: Any,
   *,
   sub_session_id: str,
+  activity: _ChildActivity,
 ) -> EventLog:
   parent_log = parent._log
   original_on_event = getattr(parent_log, "_on_event", None)
@@ -525,6 +528,7 @@ def _fork_event_log(
     return prepared
 
   def on_event(event: dict[str, Any], session_id: str) -> None:
+    activity.observe(event)
     if original_on_event is not None:
       original_on_event(event, session_id)
 
@@ -608,7 +612,12 @@ async def spawn_fork_agent(
     parent._full_session_id,
     call_index,
   )
-  sub_log = _fork_event_log(parent, sub_session_id=sub_session_id)
+  activity = _ChildActivity()
+  sub_log = _fork_event_log(
+    parent,
+    sub_session_id=sub_session_id,
+    activity=activity,
+  )
   if event_log_observer is not None:
     event_log_observer(sub_log)
   child_dispatcher = dispatcher.fork_child(
@@ -693,6 +702,7 @@ async def spawn_fork_agent(
   child_messages, child_marker_position = _build_fork_context(handoff, directive)
   sub_runner._fork_marker_position = child_marker_position
 
+  stalled = False
   runtime_error_detail: str | None = None
   cancelled_error: asyncio.CancelledError | None = None
   cancellation_signal: str | None = None
@@ -704,7 +714,16 @@ async def spawn_fork_agent(
     resume_initial_messages=child_messages,
   )
   try:
-    await run_coro
+    silence = await _await_child_under_activity_guard(run_coro, activity)
+    if silence is not None:
+      stalled = True
+      detail = f"Forked sub-agent stalled: no activity for {silence:.0f}s"
+      log.warning("[%s] %s", sub_session_id, detail)
+      sub_log.append({
+        "type": "error",
+        "error": detail,
+        "error_sub_code": "stalled",
+      })
   except asyncio.CancelledError as exc:
     cancelled_error = exc
     cancellation_signal = (
@@ -727,7 +746,7 @@ async def spawn_fork_agent(
     ) = await _close_sub_runner(
       sub_runner,
       sub_log,
-      stalled=False,
+      stalled=stalled,
       cancelled_error=cancelled_error,
       cancellation_signal=cancellation_signal,
       runtime_exception_detail=runtime_error_detail,
@@ -756,7 +775,7 @@ async def spawn_fork_agent(
     requirement=result_requirement,
     provenance=result_provenance,
     final_narrative=narrative_text.final_narrative,
-    stalled=False,
+    stalled=stalled,
     runtime_error_detail=runtime_error_detail,
     external_terminal_signals=signals,
     # B-3: the authority frozen at admission, never the ambient catalog.

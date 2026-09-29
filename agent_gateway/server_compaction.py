@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,7 +13,7 @@ from .child_result_trust import UNTRUSTED_CHILD_RESULTS_POLICY
 from .provider_summarize import provider_summarize
 from .providers.base import ModelProvider
 from .runner_limits import estimate_tokens
-from .thinking import ThinkingLevel, parse_effort
+from model_authority.thinking import ThinkingLevel, parse_effort
 
 
 LOGGER = logging.getLogger("agent_gateway.server_compaction")
@@ -409,6 +410,7 @@ async def summarize_messages(
   *,
   capability_execution: BoundCapabilityExecution,
   tools: list[dict[str, Any]] | None = None,
+  on_event: Callable[[dict[str, Any]], object] | None = None,
 ) -> tuple[str, dict[str, Any]]:
   if not isinstance(capability_execution, BoundCapabilityExecution):
     raise TypeError(
@@ -432,6 +434,7 @@ async def summarize_messages(
       tools=summarize_tools,
       max_tokens=SUMMARY_MAX_TOKENS,
       request_kwargs=request_kwargs,
+      on_event=on_event,
     )
     if result.saw_tool_use:
       raise SummaryResponseRejected("Summary generation returned tool_use", usage=result.usage)
@@ -446,6 +449,7 @@ async def summarize_messages(
       system_prompt=UNTRUSTED_CHILD_RESULTS_POLICY,
       tools=[],
       max_tokens=SUMMARY_MAX_TOKENS,
+      on_event=on_event,
     )
     if result.saw_tool_use:
       raise SummaryResponseRejected("Summary generation returned tool_use", usage=result.usage)
@@ -475,6 +479,7 @@ async def maybe_compact_current_messages(
   tail_token_budget: int = TAIL_TOKEN_BUDGET,
   tools: list[dict[str, Any]] | None = None,
   force: bool = False,
+  on_event: Callable[[dict[str, Any]], object] | None = None,
 ) -> CompactResult:
   if not isinstance(capability_execution, BoundCapabilityExecution):
     raise TypeError(
@@ -518,6 +523,7 @@ async def maybe_compact_current_messages(
     instructions,
     capability_execution=capability_execution,
     tools=tools,
+    on_event=on_event,
   )
   summary = summary.strip()
   summary_chars = len(summary)

@@ -76,7 +76,7 @@ def test_credential_material_is_omitted_from_runtime_object_repr() -> None:
   )
   execution = stub_runner_capability_execution(
     provider=AnthropicProvider(),
-    model="claude-sonnet-4-6",
+    model="claude-sonnet-5",
     effort="none",
     auth_config={"api_key": secret},
   )

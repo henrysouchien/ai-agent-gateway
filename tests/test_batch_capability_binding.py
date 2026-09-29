@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from agent_gateway.capability_binding import (
+from model_authority.binding import (
   AuthContext,
   CredentialHandle,
   ModelSelectionIntent,
@@ -20,10 +20,7 @@ from agent_gateway.claim_signing_authority import (
 )
 from agent_gateway.control_plane import batches
 from agent_gateway.providers import ModelInfo, ModelProvider
-from agent_gateway.model_registry import (
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
-)
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.session import GatewaySession
 
 

@@ -814,6 +814,41 @@ Schema:
 Transport keepalive is separate: an idle stream receives the SSE comment
 `:keepalive` every 15 seconds. It is not a data event and carries no payload.
 
+#### `refusal`
+
+Emitted when the provider ends a model turn with `stop_reason: "refusal"`. It
+arrives after the turn's last `text_delta` and before `stream_complete`. The text
+the model delivered before the stop stays the turn's output; the gateway does not
+retry, trim, or reset the conversation. The run then closes with
+`stream_complete.terminal_disposition = "completed"`; this event, not the
+disposition, is what marks the turn as refused. No `error` event is emitted for a
+refusal. The persisted `assistant_message` keeps its text blocks and
+`stop_reason: "refusal"`.
+
+Fields:
+
+- `category`: the provider's `stop_details.category` verbatim (for Anthropic:
+  `cyber`, `bio`, `frontier_llm`, `reasoning_extraction`, `general_harms`), or
+  `null` when the provider sent none
+- `explanation`: the provider's `stop_details.explanation` verbatim, or `null`
+- `guidance`: fixed text telling the user that Anthropic recommends starting a
+  fresh conversation before continuing
+
+Schema:
+
+```json
+{
+  "type": "refusal",
+  "category": "reasoning_extraction",
+  "explanation": "The request asks the model to reproduce its internal reasoning.",
+  "guidance": "Anthropic recommends starting a fresh conversation before continuing; further turns in this context may be refused again."
+}
+```
+
+A `run_agent` child whose turn is refused settles `interrupted` with
+`terminal_reason` `refusal: <category>` (`refusal` when no category was sent)
+and keeps the text it delivered as its terminal narrative.
+
 #### `interrupted`
 
 Lifecycle audit event emitted when a runner is interrupted or recovered. This
@@ -1245,5 +1280,6 @@ When the configured policy permits it, the same approval can also mint a durable
 - On `stream_complete`, use `terminal_disposition` to distinguish success from interruption; both close the transport.
 - Do not treat lifecycle and background-task events such as `turn_complete`, `interrupted`, `task_registered`, or `task_completed` as terminal.
 - `heartbeat` is liveness, not content: render it as a progress indicator or ignore it, but never append it to the assistant message.
+- `refusal` is a notice, not a failure and not a terminal: keep the text already delivered, show the category, explanation and guidance under it, and wait for `stream_complete`.
 - Do not assume every stream has `thinking_delta`, `tool_output_chunk`, or `tool_approval_request`.
 - Preserve `tool_call_id` and `nonce` exactly when you answer approval requests.

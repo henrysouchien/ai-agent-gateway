@@ -15,15 +15,10 @@ from fastapi.testclient import TestClient
 import pytest
 
 from agent_gateway import AgentRunner, EventLog
-from agent_gateway.capability_binding import (
-  CredentialHandle,
-)
+from model_authority.binding import CredentialHandle
 from agent_gateway.auth import AuthConfig, ResolverResult
-from agent_gateway.model_registry import (
-  CAPABILITY_IDS,
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
-)
+from model_authority.capabilities import CAPABILITY_IDS
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.commercial_claims import (
   CommercialClaimError,
   CommercialClaimVerifier,

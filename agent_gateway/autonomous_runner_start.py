@@ -78,7 +78,7 @@ from .autonomous_runner_commands import (
   normalize_max_budget_usd,
 )
 from .artifact_paths import canonicalize_ticker
-from .capability_binding import CredentialHandle
+from model_authority.binding import CredentialHandle
 from .events import DEFAULT_SCHEMA_VERSION
 from .gateway_address import GATEWAY_BASE_URL_ENV
 from .role_validation import require_exact_role
@@ -131,7 +131,7 @@ _AUTONOMOUS_CHILD_BASE_ENV_NAMES = frozenset({
   "ENVIRONMENT",
   "APP_ENV",
   "AGENT_GATEWAY_ENV",
-  "AGENT_GATEWAY_RATES_FILE",
+  "HANK_MODEL_AUTHORITY_DIR",
   "USER_DATA_DIR",
   "CORPUS_LOG_DIR",
   "CORPUS_STATE_DIR",
@@ -318,6 +318,7 @@ def _pinned_autonomous_child_pythonpath(
     ai_root,
     ai_root / "api",
     ai_root / "packages" / "agent-gateway",
+    ai_root / "packages" / "model-authority",
     ai_root / "packages" / "excel-mcp" / "python",
     ai_root / "packages" / "ibkr-relay-client" / "python",
     ai_root / "packages" / "sheets-finance-mcp",

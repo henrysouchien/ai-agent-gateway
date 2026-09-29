@@ -7,15 +7,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from gateway_test_support.control_plane_identity import fake_identity_resolver, fake_mcp_user_key_lookup
 
-from agent_gateway.capability_binding import (
-  CredentialHandle,
-)
+from model_authority.binding import CredentialHandle
 from agent_gateway.capability_execution import BoundCapabilityExecution
-from agent_gateway.model_registry import (
-  CAPABILITY_IDS,
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
-)
+from model_authority.capabilities import CAPABILITY_IDS
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.event_log import EventLog
 from agent_gateway.runner import AgentRunner
 from agent_gateway.server import (

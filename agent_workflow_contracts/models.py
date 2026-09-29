@@ -23,6 +23,8 @@ from pydantic import (
   model_validator,
 )
 
+from model_authority.bind import CapabilityBind
+
 
 class WireModel(BaseModel):
   model_config = ConfigDict(extra="forbid", frozen=True)
@@ -145,63 +147,6 @@ TERMINAL_NARRATIVE_CONTRACT = ContractRef(
 
 class AgentOperationRef(ContractRef):
   """Full immutable identity of an executable operation."""
-
-
-class CapabilityBind(WireModel):
-  """Complete, secret-free execution identity for one admitted capability."""
-
-  schema_version: Literal["1.0"]
-  capability_id: OpaqueId
-  model_key: OpaqueId
-  provider: OpaqueId
-  upstream_model: OpaqueId
-  adapter: OpaqueId
-  protocol_profile: OpaqueId
-  route: OpaqueId
-  effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
-  credential_principal: Literal["user", "service"]
-  credential_ref: OpaqueId
-  run_mode: Literal["interactive", "fleet", "batch", "autonomous", "cron"]
-  registry_revision: Version
-  policy_revision: Version
-  selection_source: Literal[
-    "explicit_user",
-    "saved_preference",
-    "channel_default",
-    "capability_default",
-    "internal_policy",
-    "parent_binding",
-  ]
-
-  @field_validator("provider")
-  @classmethod
-  def _provider_family(cls, value: str) -> str:
-    normalized = value.strip().lower()
-    if normalized == "agent-sdk":
-      raise ValueError("provider must name a credential provider family")
-    return normalized
-
-  @field_validator(
-    "capability_id",
-    "model_key",
-    "upstream_model",
-    "adapter",
-    "protocol_profile",
-    "route",
-    "credential_ref",
-    "registry_revision",
-    "policy_revision",
-  )
-  @classmethod
-  def _canonical_bind_text(cls, value: str) -> str:
-    return value.strip()
-
-  def to_json(self) -> dict[str, str]:
-    return self.model_dump(mode="json")
-
-  @classmethod
-  def from_json(cls, value: object) -> CapabilityBind:
-    return cls.model_validate(value)
 
 
 class ContentHandle(WireModel):
@@ -2351,7 +2296,6 @@ class WorkflowResult(WireModel):
 __all__ = [
   "ContractRef",
   "AgentOperationRef",
-  "CapabilityBind",
   "ContentHandle",
   "ContentReadGrant",
   "ContextViewPolicy",

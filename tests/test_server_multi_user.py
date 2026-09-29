@@ -28,15 +28,13 @@ from agent_gateway import (  # noqa: E402
   ToolDispatcher,
 )
 from agent_gateway.auth import AuthConfig, NoCredentialError, ResolverResult  # noqa: E402
-from agent_gateway.capability_binding import (  # noqa: E402
-  CredentialHandle,
-)
-from agent_gateway.model_registry import (  # noqa: E402
-  CAPABILITY_IDS,
+from model_authority.binding import CredentialHandle
+from model_authority.capabilities import CAPABILITY_IDS
+from model_authority.registry import ModelRegistryEntry, ProductModelRegistry
+from model_authority.schema import SCHEMA
+from model_authority.selection import (
   CapabilityDefault,
   CapabilitySelectionPolicy,
-  ModelRegistryEntry,
-  ProductModelRegistry,
   ProductModelSelectionPolicy,
 )
 from agent_gateway.mcp_client import McpClientManager  # noqa: E402
@@ -49,7 +47,7 @@ from agent_gateway.server import (  # noqa: E402
   create_gateway_app,
 )
 from agent_gateway.selected_content import SelectedContentAdmission  # noqa: E402
-
+from gateway_test_support.model_defaults import compat_for_profile  # noqa: E402
 
 
 
@@ -88,8 +86,11 @@ def _strict_session_driver_config(
   auth_config: dict[str, Any],
 ) -> dict[str, Any]:
   model_key = f"test.server.{provider}.{model}"
+  protocol_profile = (
+    "messages.adaptive" if provider == "anthropic" else "responses.reasoning"
+  )
   registry = ProductModelRegistry(
-    schema="product-model-registry/v1",
+    schema=SCHEMA,
     revision="server-multi-user-tests.1",
     models={
       model_key: ModelRegistryEntry(
@@ -101,9 +102,8 @@ def _strict_session_driver_config(
         # closure now rejects registry entries asserting profiles/routes the
         # installed implementation does not provide.
         adapter=f"{provider}.responses" if provider != "anthropic" else "anthropic.messages",
-        protocol_profile=(
-          "messages.adaptive" if provider == "anthropic" else "responses.reasoning"
-        ),
+        protocol_profile=protocol_profile,
+        compat=compat_for_profile(protocol_profile),
         route=(
           "anthropic.public" if provider == "anthropic" else f"{provider}.public"
         ),
@@ -124,7 +124,7 @@ def _strict_session_driver_config(
     },
   )
   policy = ProductModelSelectionPolicy(
-    schema="product-model-selection/v1",
+    schema=SCHEMA,
     revision="server-multi-user-tests.1",
     capabilities={
       capability_id: CapabilitySelectionPolicy(
@@ -214,7 +214,7 @@ def _make_app(
     GatewayServerConfig(
       **_strict_session_driver_config(
         provider="anthropic",
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         tenant_id="test-product",
         auth_config={
           "provider": "anthropic",
@@ -1090,7 +1090,7 @@ def test_chat_late_dispatch_failure_logs_traceback(caplog) -> None:
     GatewayServerConfig(
       **_strict_session_driver_config(
         provider="anthropic",
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         tenant_id="test-product",
         auth_config={
           "provider": "anthropic",
@@ -1217,7 +1217,7 @@ def test_gateway_server_config_accepts_on_session_created_hook() -> None:
   config = GatewayServerConfig(
     **_strict_session_driver_config(
       provider="anthropic",
-      model="claude-sonnet-4-6",
+      model="claude-sonnet-5",
       tenant_id="test-product",
       auth_config={
         "provider": "anthropic",

@@ -21,9 +21,11 @@ from agent_gateway import AgentRunner, EventLog, ToolDispatcher
 from agent_gateway.agent_session_log import AgentSessionLog
 from agent_gateway.capability_execution import BoundCapabilityExecution
 from agent_gateway.mcp_client import McpClientManager
-from agent_gateway.model_registry import ModelRegistryEntry, ProductModelRegistry
+from model_authority.registry import ModelRegistryEntry, ProductModelRegistry
+from model_authority.current import INITIAL_MODEL_REGISTRY
+from model_authority.schema import SCHEMA
 from agent_gateway.providers import OpenAIProvider
-from agent_workflow_contracts import CapabilityBind
+from model_authority.bind import CapabilityBind
 
 
 SECRET = "sk-ant-api03-CODEX-WAVE0-CANARY-DO-NOT-USE-8f21d7"
@@ -114,11 +116,11 @@ def _execution(provider: OpenAIProvider) -> BoundCapabilityExecution:
   bind = CapabilityBind(
     schema_version="1.0",
     capability_id="session.driver",
-    model_key="test.openai.gpt-5-6-terra",
+    model_key="test.openai.gpt-5-6",
     provider="openai",
-    upstream_model="gpt-5.6-terra",
+    upstream_model="gpt-5.6",
     adapter="test.openai",
-    protocol_profile="test.reasoning",
+    protocol_profile="responses.reasoning",
     route="test.in_process",
     effort="low",
     credential_principal="service",
@@ -135,6 +137,12 @@ def _execution(provider: OpenAIProvider) -> BoundCapabilityExecution:
     upstream_model=bind.upstream_model,
     adapter=bind.adapter,
     protocol_profile=bind.protocol_profile,
+    compat=next(
+      packaged.compat
+      for packaged in INITIAL_MODEL_REGISTRY.models.values()
+      if packaged.adapter == "openai.responses"
+      and packaged.upstream_model == bind.upstream_model
+    ),
     route=bind.route,
     lifecycle="active",
     capabilities={bind.capability_id: "internal"},
@@ -144,7 +152,7 @@ def _execution(provider: OpenAIProvider) -> BoundCapabilityExecution:
     reported_identities=frozenset({bind.upstream_model}),
   )
   registry = ProductModelRegistry(
-    schema="product-model-registry/v1",
+    schema=SCHEMA,
     revision=bind.registry_revision,
     models={entry.key: entry},
   )

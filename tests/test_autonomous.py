@@ -17,16 +17,12 @@ import agent_gateway  # noqa: E402
 import agent_gateway.autonomous as autonomous  # noqa: E402
 import agent_gateway.autonomous_output as autonomous_output  # noqa: E402
 from agent_gateway import EventLog  # noqa: E402
-from agent_gateway.capability_binding import (  # noqa: E402
-  CapabilityBind,
-  CapabilityEffort,
-  CredentialHandle,
-)
+from model_authority.bind import CapabilityBind
+from model_authority.binding import CapabilityEffort, CredentialHandle
 from agent_gateway.capability_execution import BoundCapabilityExecution  # noqa: E402
-from agent_gateway.model_registry import (  # noqa: E402
-  ModelRegistryEntry,
-  ProductModelRegistry,
-)
+from model_authority.registry import ModelRegistryEntry, ProductModelRegistry
+from model_authority.schema import SCHEMA
+from gateway_test_support.model_defaults import compat_for_profile  # noqa: E402
 from agent_gateway.mcp_client import _ServerState  # noqa: E402
 from agent_gateway.providers import ModelInfo, ModelProvider  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
@@ -119,7 +115,7 @@ def _autonomous_bind(
     provider=provider,
     upstream_model=model,
     adapter=f"test.{provider}",
-    protocol_profile="test.reasoning",
+    protocol_profile="responses.reasoning",
     route="test.in_process",
     effort=effort,
     credential_principal="service",
@@ -137,7 +133,7 @@ def _autonomous_bind(
 
 def _registry_for_bind(bind: CapabilityBind) -> ProductModelRegistry:
   return ProductModelRegistry(
-    schema="product-model-registry/v1",
+    schema=SCHEMA,
     revision=bind.registry_revision,
     models={
       bind.model_key: ModelRegistryEntry(
@@ -147,6 +143,7 @@ def _registry_for_bind(bind: CapabilityBind) -> ProductModelRegistry:
         upstream_model=bind.upstream_model,
         adapter=bind.adapter,
         protocol_profile=bind.protocol_profile,
+        compat=compat_for_profile(bind.protocol_profile),
         route=bind.route,
         lifecycle="active",
         capabilities={

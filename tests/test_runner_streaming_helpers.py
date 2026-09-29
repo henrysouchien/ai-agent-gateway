@@ -6,7 +6,8 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.providers import ModelInfo, ThinkingLevel  # noqa: E402
+from agent_gateway.providers import ModelInfo
+from model_authority.thinking import ThinkingLevel
 import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.runner_streaming import (  # noqa: E402
   STREAM_STALL_TIMEOUT,

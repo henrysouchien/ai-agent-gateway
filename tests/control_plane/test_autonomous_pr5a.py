@@ -21,13 +21,8 @@ from agent_gateway.autonomous_launch_envelope import (
   AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
   verify_autonomous_launch_envelope,
 )
-from agent_gateway.capability_binding import (
-  CapabilityBind,
-)
-from agent_gateway.model_registry import (
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
-)
+from model_authority.bind import CapabilityBind
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.control_plane import runs as runs_module
 from agent_gateway.control_plane import runs_chat_helpers as chat_helpers_module
 from agent_gateway.control_plane import runs_helpers as helpers_module

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable
 
-from .providers import ModelInfo, ThinkingLevel
-from .thinking import EffortResolution
+from .providers import ModelInfo
+from model_authority.thinking import EffortResolution, ThinkingLevel
 
 STREAM_STALL_TIMEOUT = 60  # max seconds between stream progress events before watchdog cancels
 STREAM_THINKING_STALL_TIMEOUT = 300  # extended-thinking turns can be quiet before first visible output

@@ -4,7 +4,7 @@ from pathlib import Path
 
 from agent_gateway.autonomous_launch_envelope import AutonomousControlAuthority
 from agent_gateway.autonomous_runner import AutonomousTask
-from agent_gateway.capability_binding import CapabilityBind
+from model_authority.bind import CapabilityBind
 from agent_gateway.skill_limits import SkillExecutionLimits
 from agent_gateway.control_plane.runs_helpers import (
   _autonomous_result_refs,

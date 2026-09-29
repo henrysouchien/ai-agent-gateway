@@ -12,7 +12,7 @@ from typing import Any, Awaitable, Callable, Protocol
 from uuid import NAMESPACE_URL, uuid5
 
 from jsonschema import Draft202012Validator
-from agent_workflow_contracts import CapabilityBind
+from model_authority.bind import CapabilityBind
 
 from .commercial_claims import VerifiedCommercialClaim
 from .commercial_contract import (

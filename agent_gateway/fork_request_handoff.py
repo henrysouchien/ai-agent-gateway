@@ -5,7 +5,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
-from .capability_binding import CapabilityBind, SESSION_DRIVER_CAPABILITY
+from model_authority.bind import CapabilityBind
+from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
 from .execution_identity import resolved_execution_identity
 
 

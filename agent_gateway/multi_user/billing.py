@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol, TypeAlias
 
-from agent_workflow_contracts import CapabilityBind
+from model_authority.bind import CapabilityBind
 
 BillingMode: TypeAlias = Literal["byok", "metered"]
 UsageState: TypeAlias = Literal[

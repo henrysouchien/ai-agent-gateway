@@ -1765,6 +1765,7 @@ class RunnerSessionLifecycleMixin:
     *,
     content_blocks: List[Dict[str, Any]],
     stop_reason: str | None,
+    stop_details: Dict[str, Any] | None = None,
     model: str,
     usage: Dict[str, Any],
     parent_messages: list[ParentMessage] | None = None,
@@ -1793,6 +1794,7 @@ class RunnerSessionLifecycleMixin:
     )(
       content_blocks=content_blocks,
       stop_reason=stop_reason,
+      stop_details=stop_details,
       model=model,
       provider=getattr(self._provider, "name", None),
       usage=usage,

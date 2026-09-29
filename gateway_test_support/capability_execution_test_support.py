@@ -3,33 +3,26 @@ from __future__ import annotations
 import re
 from typing import Any, AsyncIterator, Iterable, cast
 
-from agent_gateway import (
-  CAPABILITY_IDS,
-  AuthContext,
-  CapabilityBind,
+from model_authority.bind import CapabilityBind
+from model_authority.binding import AuthContext, CredentialPrincipal, CredentialHandle, RunMode
+from model_authority.capabilities import CAPABILITY_IDS
+from model_authority.registry import ModelRegistryEntry, ProductModelRegistry
+from model_authority.selection import (
   CapabilityDefault,
   CapabilitySelectionPolicy,
-  CredentialPrincipal,
-  CredentialHandle,
-  ModelRegistryEntry,
-  ProductModelRegistry,
   ProductModelSelectionPolicy,
-  RunMode,
 )
-from agent_gateway.capability_binding import CapabilityEffort
+from model_authority.binding import CapabilityEffort
 from agent_gateway.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
   MaterializedCredential,
 )
-from agent_gateway.providers import (
-  CostEstimate,
-  ModelInfo,
-  ModelProvider,
-  StreamEvent,
-  ThinkingLevel,
-)
-from agent_gateway.thinking import EffortResolution
+from agent_gateway.providers import CostEstimate, ModelInfo, ModelProvider, StreamEvent
+from model_authority.thinking import ThinkingLevel
+from model_authority.schema import SCHEMA
+from model_authority.thinking import EffortResolution
+from gateway_test_support.model_defaults import compat_for_profile
 
 
 _DEFAULT_MODELS = (
@@ -253,7 +246,7 @@ def stub_capability_execution_resolver(
       protocol_profile=(
         default_protocol_profile
         if is_default and default_protocol_profile
-        else "test.reasoning"
+        else "responses.reasoning"
       ),
       route=(default_route if is_default and default_route else "test.in_process"),
       lifecycle="active",
@@ -269,19 +262,24 @@ def stub_capability_execution_resolver(
       default_effort="none",
       features=frozenset({"tools", "streaming"}),
       reported_identities=frozenset({model}),
+      compat=compat_for_profile(
+        default_protocol_profile
+        if is_default and default_protocol_profile
+        else "responses.reasoning"
+      ),
     )
   entries = {
     _key(provider, model): _entry(provider, model)
     for provider, model in identities
   }
   registry = ProductModelRegistry(
-    schema="product-model-registry/v1",
+    schema=SCHEMA,
     revision="test-capability-execution.1",
     models=entries,
   )
   default_key = _key(*default_identity)
   policy = ProductModelSelectionPolicy(
-    schema="product-model-selection/v1",
+    schema=SCHEMA,
     revision="test-capability-execution.1",
     capabilities={
       capability_id: CapabilitySelectionPolicy(
@@ -422,7 +420,7 @@ def stub_bound_capability_execution(
       if str(getattr(provider, "name", "")).strip().lower() == "agent-sdk"
       else f"test.{provider_name}"
     ),
-    protocol_profile="test.reasoning",
+    protocol_profile="responses.reasoning",
     route="test.in_process",
     effort=effort,
     credential_principal=credential_principal,
@@ -450,9 +448,10 @@ def stub_bound_capability_execution(
     default_effort=effort,
     features=frozenset({"tools", "streaming"}),
     reported_identities=frozenset({normalized_model}),
+    compat=compat_for_profile(bind.protocol_profile),
   )
   registry = ProductModelRegistry(
-    schema="product-model-registry/v1",
+    schema=SCHEMA,
     revision="test-capability-execution.1",
     models={entry.key: entry},
   )

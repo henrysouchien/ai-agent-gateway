@@ -30,6 +30,7 @@ def test_build_mcp_env_keeps_allowlist_only_for_empty_server_env(monkeypatch) ->
       "PYTHONPATH": "/workspace/lib",
       "VIRTUAL_ENV": "/workspace/host-venv",
       "PYTHONNOUSERSITE": "1",
+      "HANK_MODEL_AUTHORITY_DIR": "/etc/hank/model-authority",
       "OPENAI_API_KEY": "openai-secret",
       "ANTHROPIC_API_KEY": "anthropic-secret",
       "XAI_API_KEY": "xai-secret",
@@ -57,6 +58,7 @@ def test_build_mcp_env_keeps_allowlist_only_for_empty_server_env(monkeypatch) ->
     "HOME": "/tmp/home",
     "LANG": "en_US.UTF-8",
     "PYTHONNOUSERSITE": "1",
+    "HANK_MODEL_AUTHORITY_DIR": "/etc/hank/model-authority",
   }
   assert "ANTHROPIC_API_KEY" not in env
   assert "OPENAI_API_KEY" not in env

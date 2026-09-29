@@ -128,7 +128,7 @@ def _subagent_result_identity(
 def _runner_execution(
   provider: ModelProvider,
   *,
-  model: str = "claude-sonnet-4-6",
+  model: str = "claude-sonnet-5",
   capability_id: str = "session.driver",
 ) -> BoundCapabilityExecution:
   return stub_runner_capability_execution(
@@ -142,7 +142,7 @@ def _runner_execution(
 def _child_execution(
   provider: ModelProvider,
   *,
-  model: str = "claude-sonnet-4-6",
+  model: str = "claude-sonnet-5",
 ) -> BoundCapabilityExecution:
   return _runner_execution(
     provider,
@@ -1681,7 +1681,7 @@ def test_runner_stale_recovery_synthesizes_orphan_tool_and_prior_writer_interrup
       replayed.extend(kwargs["messages"])
       unmatched = {}
       for adapter in (OpenAIProvider(), CodexProvider()):
-        params = adapter.build_request_params(**{**kwargs, "model": "gpt-5.4"})
+        params = adapter.build_request_params(**{**kwargs, "model": "gpt-6-sol"})
         calls = {item["call_id"] for item in params["input"] if item.get("type") == "function_call"}
         unmatched[adapter.name] = {
           item["call_id"] for item in params["input"]

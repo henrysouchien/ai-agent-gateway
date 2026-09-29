@@ -19,14 +19,12 @@ from dataclasses import replace
 from agent_gateway import AgentRunner, McpClientManager, ToolDispatcher
 
 from agent_gateway.auth import AuthConfig, ResolverResult
-from agent_gateway.capability_binding import ModelSelectionIntent
-from agent_gateway.model_registry import (
-  CAPABILITY_IDS,
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
-  ProductModelRegistry,
-  ProductModelSelectionPolicy,
-)
+from model_authority.binding import ModelSelectionIntent
+from model_authority.capabilities import CAPABILITY_IDS
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
+from model_authority.registry import ProductModelRegistry
+from model_authority.schema import SCHEMA
+from model_authority.selection import ProductModelSelectionPolicy
 from agent_gateway.model_preferences import ModelPreferenceStore
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 from agent_gateway.session import bind_session_credentials
@@ -285,7 +283,7 @@ def _stale_preference_deployment(
     },
   )
   registry = ProductModelRegistry(
-    schema="product-model-registry/v1",
+    schema=SCHEMA,
     revision=f"post-{lifecycle}",
     models=entries,
   )
@@ -301,7 +299,7 @@ def _stale_preference_deployment(
     for capability_id, policy in INITIAL_MODEL_SELECTION_POLICY.capabilities.items()
   }
   selection_policy = ProductModelSelectionPolicy(
-    schema="product-model-selection/v1",
+    schema=SCHEMA,
     revision=f"post-{lifecycle}",
     capabilities=capabilities,
   )

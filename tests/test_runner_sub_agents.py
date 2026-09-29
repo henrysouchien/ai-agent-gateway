@@ -728,6 +728,73 @@ def test_real_child_streaming_tool_input_outlasts_the_activity_gap(
   assert "error" not in observed
 
 
+class _RefusingChildProvider(_Provider):
+  """A child provider that delivers text, then stops with ``refusal``."""
+
+  def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> object:
+    return object()
+
+  async def close_client(self, client: Any, timeout: float = 2.0) -> None:
+    return None
+
+  def build_request_params(self, **_kwargs: Any) -> dict[str, Any]:
+    return {}
+
+  async def stream(self, client: Any, params: dict[str, Any]):
+    yield StreamEvent(type="text_delta", text="Partial findings.")
+    yield StreamEvent(type="text_end", raw_block={"type": "text", "text": "Partial findings."})
+    yield StreamEvent(
+      type="message_end",
+      stop_reason="refusal",
+      stop_details={
+        "type": "refusal",
+        "category": "reasoning_extraction",
+        "explanation": "The request asks for internal reasoning.",
+      },
+    )
+
+
+def test_refused_child_settles_with_refusal_signal_and_keeps_its_narrative(
+  tmp_path: Path,
+) -> None:
+  from agent_gateway.sub_agent_narrative_result import (
+    read_task_result_terminal_narrative,
+  )
+  from agent_gateway.sub_agent_skill_state import classify_child_outcome
+
+  parent = _parent(tmp_path, session_log=AgentSessionLog(tmp_path / "session.jsonl"))
+  execution = stub_bound_capability_execution(
+    provider=_RefusingChildProvider(),
+    model="child-model",
+    effort="medium",
+    capability_id="node.explore",
+    credential_principal="user",
+    auth_config={"api_key": "child-secret"},
+  )
+  observed: list[dict[str, Any]] = []
+
+  result, error = _spawn(
+    parent,
+    capability_execution=execution,
+    on_sub_event=lambda event, _sid: observed.append(dict(event)),
+  )
+
+  assert error is None
+  assert isinstance(result, TaskResult)
+  assert result.execution.status == "interrupted"
+  assert result.execution.terminal_reason == "refusal: reasoning_extraction"
+  assert read_task_result_terminal_narrative(
+    result,
+    workspace_dir=str(tmp_path),
+  ) == "Partial findings."
+  classification = classify_child_outcome(result.model_dump(mode="json"), None)
+  assert classification.succeeded is False
+  assert classification.error is not None
+  assert classification.error["code"] == "refusal: reasoning_extraction"
+  types = [event.get("type") for event in observed]
+  assert "refusal" in types
+  assert not {"error", "run_error"} & set(types)
+
 
 @pytest.mark.parametrize("method", ["spawn", "resume"])
 def test_named_child_budget_wraps_observation_accumulator(

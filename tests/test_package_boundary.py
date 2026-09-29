@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import importlib.util
 from importlib import metadata
 import os
 import subprocess
@@ -15,10 +16,7 @@ from packaging.utils import canonicalize_name
 
 from agent_gateway.approval_audit import ApprovalAuditEmitter, build_audit_entry
 from agent_gateway.approval_policy import ApprovalRequest, utc_now
-from agent_gateway.model_registry import (
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
-)
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.event_log import EventLog
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 from agent_gateway.server_models import BuildChatRuntime, SystemPrompt
@@ -89,6 +87,18 @@ def test_all_modules_import_without_checkout_trees(tmp_path: Path) -> None:
         # distribution here resolves it to a real filesystem path.
         source = Path(str(distribution.locate_file(top)))
         if source.exists():
+          target.symlink_to(source, target_is_directory=source.is_dir())
+    # An editable install (the in-repo authority) ships an import finder, not
+    # its packages; `-S` never runs that finder, so expose its top-level
+    # packages from where the finder resolves them.
+    if '"editable": true' in (distribution.read_text("direct_url.json") or ""):
+      for top in (distribution.read_text("top_level.txt") or "").split():
+        spec = importlib.util.find_spec(top)
+        assert spec is not None and spec.origin is not None, top
+        origin = Path(spec.origin)
+        source = origin.parent if spec.submodule_search_locations else origin
+        target = dependency_dir / source.name
+        if not target.exists():
           target.symlink_to(source, target_is_directory=source.is_dir())
     for value in distribution.requires or ():
       dependency = Requirement(value)

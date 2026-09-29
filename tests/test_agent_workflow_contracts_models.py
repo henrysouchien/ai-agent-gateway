@@ -15,7 +15,6 @@ from agent_workflow_contracts import (
   AnalyticalOutcome,
   AttemptRef,
   AuthoredDeliverySummary,
-  CapabilityBind,
   CanonicalProjection,
   ContentEvidenceRef,
   ContentHandle,
@@ -67,6 +66,7 @@ from agent_workflow_contracts import (
   parse_delivery_envelope,
   parse_workflow_delivery_spec,
 )
+from model_authority.bind import CapabilityBind
 
 
 HEX = "a" * 64

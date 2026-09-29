@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import replace
 from typing import Any, AsyncGenerator
 from weakref import WeakKeyDictionary
 
@@ -12,23 +11,20 @@ from .base import (
   ModelInfo,
   ModelProvider,
   StreamEvent,
-  ThinkingLevel,
   _is_context_length_exception,
-  registry_effort_values,
-  registry_entry_for_model,
+  authority_rate_table,
   truncate_to_last_compaction,
 )
-from ..model_registry import AdapterRouteSupport
-from ..rates import RateTable, UnknownModelError, load_provider_rate_table
-from ..thinking import EffortResolution, clamp_effort
+from model_authority.registry import AdapterRouteSupport
+from model_authority.rates import RateTable
+from model_authority.thinking import EffortResolution, ThinkingLevel, clamp_effort
+from .openai_responses_helpers import reasoning_effort_fragment, responses_compat, responses_model_info
 from .codex_helpers import (
   DEFAULT_INSTRUCTIONS as DEFAULT_INSTRUCTIONS,
   _RETRYABLE_STATUSES as _RETRYABLE_STATUSES,
   _RETRYABLE_RE as _RETRYABLE_RE,
-  _MODEL_INFO_BY_TAG as _MODEL_INFO_BY_TAG,
   _ResponsesStreamState as _ResponsesStreamState,
   _config_base_url as _config_base_url,
-  _model_matches_tag as _model_matches_tag,
   _credential_token as _credential_token,
   _sanitize_surrogates as _sanitize_surrogates,
   _system_prompt_text as _system_prompt_text,
@@ -65,7 +61,7 @@ class CodexProvider(ModelProvider):
     )
 
   def __init__(self, *, rate_table: RateTable | None = None) -> None:
-    self._rate_table = load_provider_rate_table(self.name, rate_table)
+    self._rate_table = authority_rate_table(self.name, rate_table)
     self._client_state: WeakKeyDictionary[httpx.AsyncClient, dict[str, Any]] = WeakKeyDictionary()
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
@@ -102,49 +98,7 @@ class CodexProvider(ModelProvider):
       pass
 
   def get_model_info(self, model: str) -> ModelInfo:
-    model_id = str(model or "").strip()
-    if not model_id:
-      raise ValueError("Model is required")
-    for tags, info in sorted(_MODEL_INFO_BY_TAG, key=lambda row: max(map(len, row[0])), reverse=True):
-      if any(_model_matches_tag(model_id, tag) for tag in tags):
-        model_info = replace(info, id=model_id)
-        break
-    else:
-      entry = registry_entry_for_model(self.name, model_id)
-      if entry is None:
-        raise ValueError(
-          f"the product model registry does not admit codex model {model_id!r}"
-        )
-      efforts = registry_effort_values(entry)
-      reasoning = tuple(value for value in efforts if value != "none")
-      model_info = ModelInfo(
-        id=model_id,
-        provider=self.name,
-        supports_thinking=bool(reasoning),
-        supports_vision="vision" in entry.features,
-        supports_tool_use="tools" in entry.features,
-        compat={
-          "supportsReasoningEffort": bool(reasoning),
-          "reasoningEffortValues": efforts if reasoning else (),
-          "reasoningEffortDefault": entry.default_effort,
-          "omitEqualsNone": False,
-        },
-      )
-    try:
-      rates = self._rate_table.lookup(self.name, model_id)
-    except UnknownModelError:
-      log.warning("Codex model %r has no rate row; using zero-cost estimates", model_id)
-      return model_info
-    return replace(
-      model_info,
-      context_window=rates.context_window or model_info.context_window,
-      max_output_tokens=rates.max_tokens or model_info.max_output_tokens,
-      input_cost_per_mtok=rates.input_cost_per_mtok,
-      output_cost_per_mtok=rates.output_cost_per_mtok,
-      cache_read_cost_per_mtok=rates.cache_read_cost_per_mtok,
-      cache_write_cost_per_mtok=rates.cache_write_cost_per_mtok,
-      rate_tiers=rates.tiers,
-    )
+    return responses_model_info(self.adapter_route_support(), model, self._rate_table)
 
   def build_request_params(
     self,
@@ -200,10 +154,12 @@ class CodexProvider(ModelProvider):
       )
     reasoning_fragment = effort_resolution.payload_fragments.get("reasoning")
     if isinstance(reasoning_fragment, dict):
-      params["reasoning"] = {
-        "summary": str(kwargs.get("reasoning_summary") or "auto"),
-        **reasoning_fragment,
-      }
+      params["reasoning"] = dict(reasoning_fragment)
+      if responses_compat(model_info).reasoning_summary:
+        params["reasoning"] = {
+          "summary": str(kwargs.get("reasoning_summary") or "auto"),
+          **reasoning_fragment,
+        }
 
     return params
 
@@ -217,18 +173,17 @@ class CodexProvider(ModelProvider):
     **request_context: Any,
   ) -> EffortResolution:
     del model, max_tokens, request_context
-    if not model_info.supports_thinking:
+    compat = responses_compat(model_info)
+    if not model_info.supports_thinking or not compat.reasoning_control.values:
       return EffortResolution(requested, ThinkingLevel.NONE, False, {})
-    compat = dict(model_info.compat or {})
-    raw_values = tuple(compat.get("reasoningEffortValues") or ("low", "medium", "high"))
-    supported = tuple(ThinkingLevel(str(value)) for value in raw_values)
+    supported = tuple(ThinkingLevel(value) for value in compat.reasoning_control.values)
     normalized = ThinkingLevel.LOW if requested == ThinkingLevel.MINIMAL and ThinkingLevel.MINIMAL not in supported else requested
     effective = clamp_effort(normalized, supported)
     return EffortResolution(
       requested,
       effective,
       effective != ThinkingLevel.NONE,
-      {"reasoning": {"effort": effective.value}},
+      reasoning_effort_fragment(compat, effective.value),
     )
 
   def normalize_messages(self, messages: list[dict[str, Any]], model_info: ModelInfo) -> list[dict[str, Any]]:

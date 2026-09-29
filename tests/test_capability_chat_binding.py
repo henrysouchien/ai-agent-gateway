@@ -7,17 +7,11 @@ import pytest
 from pydantic import ValidationError
 from agent_gateway import AgentRunner
 
-from agent_gateway.capability_binding import (
-  CapabilityResolutionError,
-  CredentialHandle,
-)
+from model_authority.binding import CapabilityResolutionError, CredentialHandle
 from agent_gateway.capability_execution import MaterializedCredential
 from agent_gateway.event_log import EventLog
-from agent_gateway.model_registry import (
-  CAPABILITY_IDS,
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
-)
+from model_authority.capabilities import CAPABILITY_IDS
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.providers import ModelInfo, ModelProvider
 from agent_gateway.server import ChatRuntime, ChatTurnInputs
 from agent_gateway.server_chat_helpers import (

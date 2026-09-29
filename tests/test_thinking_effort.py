@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import pytest
-from dataclasses import fields
+from dataclasses import replace
 from pathlib import Path
 
-from agent_gateway import EffortResolution, ThinkingLevel, resolve_auth_config
+from agent_gateway import resolve_auth_config
+from model_authority.thinking import ThinkingLevel
+from model_authority.thinking import EffortResolution
 from agent_gateway.providers.anthropic import AnthropicProvider
 from agent_gateway.providers.codex import CodexProvider
 from agent_gateway.providers.openai import OpenAIProvider
@@ -14,32 +16,7 @@ from agent_gateway.runner_state import normalized_run_config
 from agent_gateway.runner_streaming import effective_stream_stall_timeout
 from agent_gateway.server import ChatRequest
 from agent_gateway.skills import parse_skill_file
-from agent_gateway.thinking import parse_effort, resolve_effort_pair
-
-
-@pytest.mark.parametrize("raw", ["none", "MINIMAL", " low ", "medium", "high", "xhigh", "max"])
-def test_parse_effort_accepts_all_canonical_levels(raw: str) -> None:
-  assert parse_effort(raw) is ThinkingLevel(raw.strip().lower())
-
-
-@pytest.mark.parametrize(
-  ("effort", "thinking", "expected"),
-  [
-    (None, True, ThinkingLevel.HIGH),
-    (None, False, ThinkingLevel.NONE),
-    ("high", True, ThinkingLevel.HIGH),
-    ("none", False, ThinkingLevel.NONE),
-    ("medium", None, ThinkingLevel.MEDIUM),
-  ],
-)
-def test_dual_key_agreement_matrix(effort, thinking, expected) -> None:
-  assert resolve_effort_pair(effort=effort, thinking=thinking) is expected
-
-
-@pytest.mark.parametrize(("effort", "thinking"), [("medium", True), ("medium", False), ("none", True)])
-def test_dual_key_conflicts_raise(effort, thinking) -> None:
-  with pytest.raises(ValueError, match="conflicting"):
-    resolve_effort_pair(effort=effort, thinking=thinking)
+from model_authority.schema import AnthropicMessagesCompat
 
 
 def test_auth_config_cannot_select_effort_or_thinking() -> None:
@@ -94,32 +71,45 @@ def test_sonnet5_none_always_emits_disabled_below_gate() -> None:
 def test_below_gate_uses_omitted_default_capability() -> None:
   provider = AnthropicProvider()
   sonnet = provider.get_model_info("claude-sonnet-5")
-  opus = provider.get_model_info("claude-opus-4-8")
-  sonnet_resolution = provider.resolve_effort(
-    requested=ThinkingLevel.HIGH, model=sonnet.id, model_info=sonnet, max_tokens=1024
-  )
-  opus_resolution = provider.resolve_effort(
-    requested=ThinkingLevel.HIGH, model=opus.id, model_info=opus, max_tokens=1024
-  )
-  assert (sonnet_resolution.effective, sonnet_resolution.thinking_enabled_effective) == (ThinkingLevel.HIGH, True)
-  assert (opus_resolution.effective, opus_resolution.thinking_enabled_effective) == (ThinkingLevel.NONE, False)
+  opus55 = provider.get_model_info("claude-opus-5-5")
+  # The same model with thinking off when omitted, as the authority can declare it.
+  assert isinstance(sonnet.compat, AnthropicMessagesCompat)
+  off_by_default = replace(sonnet, compat=sonnet.compat.model_copy(update={
+    "thinking": sonnet.compat.thinking.model_copy(update={
+      "default_when_omitted": "off", "effort_when_omitted": "none",
+    }),
+  }))
+
+  def below_gate(info):
+    resolution = provider.resolve_effort(
+      requested=ThinkingLevel.HIGH, model=info.id, model_info=info, max_tokens=1024
+    )
+    return (resolution.effective, resolution.thinking_enabled_effective, dict(resolution.payload_fragments))
+
+  assert below_gate(sonnet) == (ThinkingLevel.HIGH, True, {})
+  assert below_gate(opus55) == (ThinkingLevel.MEDIUM, True, {})
+  assert below_gate(off_by_default) == (ThinkingLevel.NONE, False, {})
 
 
-def test_fable_none_is_effectively_on_and_opus46_xhigh_clamps() -> None:
+def test_fable_none_is_effectively_on_and_xhigh_clamps_to_supported_efforts() -> None:
   provider = AnthropicProvider()
   fable = provider.get_model_info("claude-fable-5")
-  opus46 = provider.get_model_info("claude-opus-4-6")
+  opus = provider.get_model_info("claude-opus-5")
+  # An entry whose supported efforts stop at high, as the authority can declare it.
+  high_ceiling = replace(opus, effort_values=("none", "low", "medium", "high"))
   assert provider.resolve_effort(
     requested=ThinkingLevel.NONE, model=fable.id, model_info=fable, max_tokens=4096
   ).effective is ThinkingLevel.HIGH
-  assert provider.resolve_effort(
-    requested=ThinkingLevel.XHIGH, model=opus46.id, model_info=opus46, max_tokens=4096
-  ).effective is ThinkingLevel.HIGH
+  clamped = provider.resolve_effort(
+    requested=ThinkingLevel.XHIGH, model=high_ceiling.id, model_info=high_ceiling, max_tokens=4096
+  )
+  assert clamped.effective is ThinkingLevel.HIGH
+  assert clamped.payload_fragments["output_config"] == {"effort": "high"}
 
 
 def test_openai_runtime_compat_cannot_disable_responses_effort() -> None:
   provider = OpenAIProvider()
-  info = provider.get_model_info("gpt-5.6-terra")
+  info = provider.get_model_info("gpt-5.6")
   resolved = provider.resolve_effort(
     requested=ThinkingLevel.MAX,
     model=info.id,
@@ -143,14 +133,22 @@ def test_openai_runtime_compat_cannot_disable_responses_effort() -> None:
 
 
 def test_gpt56_specific_rows_and_max_payload_are_distinct() -> None:
-  provider = OpenAIProvider()
-  infos = [provider.get_model_info(model) for model in ("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")]
-  assert [info.id for info in infos] == ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+  openai = OpenAIProvider()
+  codex = CodexProvider()
+  cases = [
+    (openai, "gpt-5.6"),
+    (openai, "gpt-5.6-sol"),
+    (codex, "gpt-5.6-sol"),
+    (codex, "gpt-5.6-terra"),
+    (codex, "gpt-5.6-luna"),
+  ]
+  infos = [(provider, provider.get_model_info(model)) for provider, model in cases]
+  assert [info.id for _provider, info in infos] == [model for _provider, model in cases]
   assert all(
     provider.resolve_effort(
       requested=ThinkingLevel.MAX, model=info.id, model_info=info, max_tokens=4096
     ).payload_fragments == {"reasoning": {"effort": "max"}}
-    for info in infos
+    for provider, info in infos
   )
 
 
@@ -185,16 +183,8 @@ def test_chat_request_validates_and_canonicalizes_effort() -> None:
     )
 
 
-
-
-
 def test_skill_effort_conflict_and_positional_boundary(tmp_path: Path) -> None:
   path = tmp_path / "skill.md"
   path.write_text("---\nname: effort-skill\neffort: medium\nthinking: true\n---\nBody\n")
   with pytest.raises(ValueError, match="conflicting"):
     parse_skill_file(path)
-
-
-
-
-

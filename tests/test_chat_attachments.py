@@ -6,10 +6,7 @@ from pathlib import Path
 
 import pytest
 from agent_gateway import server_models
-from agent_gateway.model_registry import (
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
-)
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.server import GatewayServerConfig, create_gateway_app
 from agent_gateway.server_models import ChatRequest
 from fastapi.testclient import TestClient

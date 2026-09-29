@@ -23,7 +23,7 @@ from .approval_route import (
   route_policy,
   route_store,
 )
-from .capability_binding import SESSION_DRIVER_CAPABILITY
+from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
 from .capability_execution import BoundCapabilityExecution
 from .event_log import EventLog
 from .context_capture import ContextCapture, build_context_manifest_event, canonical_manifest_digest

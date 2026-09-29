@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from .capability_binding import validate_reported_identity
+from model_authority.binding import validate_reported_identity
 from .capability_execution import BoundCapabilityExecution
-from .thinking import parse_effort
+from model_authority.thinking import parse_effort
+from .runner_stream_turn import STREAM_PROGRESS_LOG_INTERVAL
 
 
 DEFAULT_SUMMARY_SYSTEM_PROMPT = "You write cumulative narrative summaries of autonomous analyst sessions."
@@ -83,6 +86,7 @@ async def provider_summarize(
   max_tokens: int,
   timeout: float = 60.0,
   request_kwargs: dict[str, Any] | None = None,
+  on_event: Callable[[dict[str, Any]], object] | None = None,
 ) -> ProviderSummarizeResult:
   if not isinstance(capability_execution, BoundCapabilityExecution):
     raise TypeError(
@@ -159,8 +163,28 @@ async def provider_summarize(
       "capability_bind": bind.to_json(),
     })
     saw_tool_use = False
+    stream_started_at = time.monotonic()
+    next_heartbeat_at = stream_started_at + STREAM_PROGRESS_LOG_INTERVAL
+    stream_events = 0
     async for event in provider.stream(client, params):
       event_type = getattr(event, "type", "")
+      now = time.monotonic()
+      # A provider heartbeat (an SSE keepalive ping) is not progress, as in
+      # the turn stream's _consume_stream: a summary that only pings stays
+      # silent to the parent's guard.
+      if event_type != "heartbeat":
+        stream_events += 1
+        if on_event is not None and now >= next_heartbeat_at:
+          # Liveness signal, same shape as the turn stream's: a parent's
+          # activity guard stamps a child from it while the child streams a
+          # summary, which appends nothing else until it ends.
+          on_event({
+            "type": "heartbeat",
+            "elapsed_s": int(now - stream_started_at),
+            "last_progress_s": 0,
+            "events": stream_events,
+          })
+          next_heartbeat_at = now + STREAM_PROGRESS_LOG_INTERVAL
       reported_model = getattr(event, "provider_reported_model", None)
       if event_type == "message_start" and reported_model is not None:
         usage["provider_reported_model"] = validate_reported_identity(

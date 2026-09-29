@@ -15,8 +15,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_gateway.auth import AuthConfig, ResolverResult
-from agent_gateway.model_registry import CAPABILITY_IDS, INITIAL_MODEL_REGISTRY
-from agent_gateway.rates import load_rate_table, UnknownModelError
+from model_authority.capabilities import CAPABILITY_IDS
+from model_authority.current import INITIAL_MODEL_REGISTRY, RATE_TABLES
+from model_authority.rates import UnknownModelError
 
 
 def divider(title: str) -> None:
@@ -28,7 +29,7 @@ def divider(title: str) -> None:
 def test_rate_table() -> None:
   divider("TEST: Rate table loads and Opus pricing is correct")
 
-  table = load_rate_table()
+  table = RATE_TABLES["anthropic"]
   print(f"  Version: {table.version}")
   print(f"  Source:  {table.source}")
 

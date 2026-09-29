@@ -30,13 +30,14 @@ def auth_config_model_free() -> dict[str, Any]:
 @pytest.fixture
 def make_test_app():
   from agent_gateway.event_log import EventLog
-  from agent_gateway import (
-    CAPABILITY_IDS,
+  from model_authority.binding import CredentialHandle
+  from model_authority.capabilities import CAPABILITY_IDS
+  from model_authority.registry import ModelRegistryEntry, ProductModelRegistry
+  from model_authority.schema import SCHEMA
+  from gateway_test_support.model_defaults import compat_for_profile
+  from model_authority.selection import (
     CapabilityDefault,
     CapabilitySelectionPolicy,
-    CredentialHandle,
-    ModelRegistryEntry,
-    ProductModelRegistry,
     ProductModelSelectionPolicy,
   )
   from agent_gateway.auth import AuthConfig, ResolverResult
@@ -106,7 +107,7 @@ def make_test_app():
       and adapter_provider_name.strip().lower() != provider_name
     ):
       provider.name = provider_name
-    bound_model = "claude-sonnet-4-6"
+    bound_model = "claude-sonnet-5"
     bound_effort = (
       "high"
       if execution_transport == "agent-sdk"
@@ -149,9 +150,9 @@ def make_test_app():
       upstream_model=bound_model,
       adapter=adapter_id,
       protocol_profile=(
-        "agent_sdk.session"
+        "messages.adaptive"
         if execution_transport == "agent-sdk"
-        else "test.native"
+        else "responses.reasoning"
       ),
       route="test.in_process",
       lifecycle="active",
@@ -167,14 +168,17 @@ def make_test_app():
       default_effort=bound_effort,
       features=frozenset({"tools", "streaming"}),
       reported_identities=frozenset({bound_model}),
+      compat=compat_for_profile(
+        "messages.adaptive" if execution_transport == "agent-sdk" else "responses.reasoning"
+      ),
     )
     model_registry = ProductModelRegistry(
-      schema="product-model-registry/v1",
+      schema=SCHEMA,
       revision="gateway-tests.1",
       models={model_key: registry_entry},
     )
     model_selection_policy = ProductModelSelectionPolicy(
-      schema="product-model-selection/v1",
+      schema=SCHEMA,
       revision="gateway-tests.1",
       capabilities={
         capability_id: CapabilitySelectionPolicy(

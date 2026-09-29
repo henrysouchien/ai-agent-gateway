@@ -14,13 +14,8 @@ from fastapi.testclient import TestClient
 
 from agent_gateway.autonomous_runner import AutonomousRegistry
 from agent_gateway.autonomous_runner_state import AutonomousTask
-from agent_gateway.capability_binding import (
-  CapabilityBind,
-)
-from agent_gateway.model_registry import (
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
-)
+from model_authority.bind import CapabilityBind
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.autonomous_launch_envelope import AutonomousControlAuthority
 from agent_gateway.control_plane import schedules as schedules_module
 from agent_gateway.server import (

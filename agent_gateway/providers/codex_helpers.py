@@ -10,12 +10,6 @@ from typing import Any
 import httpx
 
 from .base import ModelInfo, StreamEvent
-from .codex_model_info import (
-  _MODEL_INFO_BY_TAG as _MODEL_INFO_BY_TAG,
-  _clamp_reasoning_effort as _clamp_reasoning_effort,
-  _map_reasoning_effort as _map_reasoning_effort,
-  _model_matches_tag as _model_matches_tag,
-)
 
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
 JWT_CLAIM_PATH = "https://api.openai.com/auth"

@@ -11,7 +11,7 @@ import sys
 
 from jsonschema import Draft202012Validator
 
-from agent_gateway.capability_binding import CAPABILITY_RESOLUTION_CODES
+from model_authority.binding import CAPABILITY_RESOLUTION_CODES
 from agent_workflow_contracts import parse_delivery_envelope
 
 

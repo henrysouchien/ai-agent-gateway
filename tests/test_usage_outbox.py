@@ -7,7 +7,7 @@ import sqlite3
 import stat
 
 import pytest
-from agent_workflow_contracts import CapabilityBind
+from model_authority.bind import CapabilityBind
 
 from agent_gateway import usage_outbox as usage_outbox_module
 from agent_gateway.commercial_contract import canonical_usage_payload_sha256

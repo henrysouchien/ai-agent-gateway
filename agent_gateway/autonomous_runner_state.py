@@ -30,7 +30,8 @@ from .autonomous_approval_channel import (
 )
 from .autonomous_launch_envelope import AutonomousControlAuthority
 from .autonomous_claim_broker import AutonomousClaimBroker
-from .capability_binding import CapabilityBind, SESSION_DRIVER_CAPABILITY
+from model_authority.bind import CapabilityBind
+from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
 from .role_validation import require_exact_role
 from .skill_limits import (
   AutonomousSkillAdmissionPolicy,

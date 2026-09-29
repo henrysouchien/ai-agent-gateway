@@ -26,7 +26,7 @@ from agent_gateway import EventLog, McpClientManager, ToolResultContext, create_
 from agent_gateway.tool_result_spill import SpillSink, TOOL_RESULT_READ_TOOL_DEF
 from agent_gateway.auth import AuthConfig, ResolverResult
 from agent_gateway._provider_utils import _resolve_provider
-from agent_gateway.capability_binding import CapabilityResolutionError
+from model_authority.binding import CapabilityResolutionError
 from agent_gateway.commercial_claims import VerifiedCommercialClaim
 from agent_gateway.commercial_work_authorization import VerifiedWorkAuthorization
 from agent_gateway.commercial_work_start import CommercialWorkStartContext
@@ -661,7 +661,7 @@ def test_easy_policy_carries_base_revision_not_caller_choice() -> None:
   import re as _re
 
   from agent_gateway.easy import _easy_model_selection_policy
-  from agent_gateway.model_registry import INITIAL_MODEL_SELECTION_POLICY
+  from model_authority.current import INITIAL_MODEL_SELECTION_POLICY
 
   entry, policy = _easy_model_selection_policy(
     model_key="anthropic.claude-haiku-4-5",

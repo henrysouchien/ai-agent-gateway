@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.21.0 (2026-09-29)
+
+### Changed
+
+- BREAKING: the model authority — registry, selection policy, capability
+  resolver, rate tables, effort vocabulary and `CapabilityBind` — moved to the
+  new distribution `hank-model-authority` (import `model_authority`), a new
+  dependency (`hank-model-authority>=1.0,<2`). `agent_gateway.model_registry`,
+  `agent_gateway.capability_binding`, `agent_gateway.rates`,
+  `agent_gateway.thinking` and the package-root re-exports of their names are
+  removed with no aliases; import from `model_authority.current`,
+  `.registry`, `.selection`, `.binding`, `.bind`, `.capabilities`, `.rates` and
+  `.thinking`. `agent_workflow_contracts.CapabilityBind` is removed: use
+  `model_authority.bind.CapabilityBind`; the wire schema
+  (`capability-bind.schema.json`) is unchanged. The package no longer ships
+  `model_authority/*.yaml` or `rates/*.json`.
+- BREAKING: adapters derive `ModelInfo` from the model's registry entry, its
+  `compat:` block and the rate tables. The model-ID tag tables in the
+  Anthropic, OpenAI Responses, Codex and xAI providers are gone, including
+  `providers/codex_model_info.py`; a model ID with no registry entry is not
+  callable.
+- BREAKING: `HANK_MODEL_AUTHORITY_DIR` — a directory holding
+  `model-authority.yaml` and `rates/*.json` — replaces
+  `AGENT_GATEWAY_MODEL_REGISTRY_FILE`, `AGENT_GATEWAY_MODEL_SELECTION_FILE` and
+  `AGENT_GATEWAY_RATES_FILE`, which are no longer read. Unset, the copy
+  packaged in `hank-model-authority` loads. The autonomous runner projects
+  `HANK_MODEL_AUTHORITY_DIR` into its child environment where it projected
+  the rates-file variable. A registry or selection revision now ships as a
+  deploy of that directory, not as a gateway release.
+- A model turn the provider ends with `stop_reason=refusal` completes as a
+  refusal instead of a failure. The runner keeps the delivered text as the
+  turn's output, persists the `assistant_message` with `stop_reason: refusal`,
+  appends a client-visible `refusal` event carrying the provider's
+  `stop_details.category` and `explanation` verbatim plus guidance to start a
+  fresh conversation, and closes with `stream_complete` `completed`. A refused
+  `run_agent` child settles `interrupted` with `terminal_reason`
+  `refusal: <category>` and keeps its narrative. Previously a refusal fell
+  through to `terminal_outcome_unproven`: an `error` event, a `run_error`
+  settlement, and a child `runtime_error` with its text discarded.
+- BREAKING: `agent.yaml` loading refuses unknown top-level keys again:
+  `load_agent_project_config` raises `AgentProjectError` naming each one, so a
+  typo such as `max_buget_usd` fails at load instead of running with no budget
+  cap. Keys an earlier `agent init` scaffold wrote and the schema later retired
+  (`per_turn_timeout`, `provider`, `model`) still load, with a warning naming
+  each retired key; their values are ignored. Reverses the 0.20.0 log-and-ignore
+  rule for keys the product never wrote.
+- Fork children (`spawn_fork_agent`) run under the same parent-side activity
+  guard as spawned and resumed sub-agents: a fork silent past
+  `SUB_AGENT_ACTIVITY_GAP` with no tool in flight is cancelled and settles
+  `interrupted` with `terminal_reason` `stalled: …`, instead of hanging and
+  holding its fork-registry session and concurrency slots.
+- A child streaming a portable-compaction summary emits `heartbeat` events
+  through its event path while the summary streams, so the parent activity
+  guard no longer settles a healthy child `stalled` mid-compaction; a summary
+  that sends nothing is still settled `stalled`.
+
 ## 0.20.1 (2026-09-28)
 
 ### Fixed

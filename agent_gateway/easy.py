@@ -26,10 +26,8 @@ from fastapi import FastAPI
 from ._provider_utils import _resolve_provider
 from .agent_session_log import AgentSessionLog, slugify
 from .auth import CredentialsResolver
-from .capability_binding import (
-  CredentialHandle,
-  SESSION_DRIVER_CAPABILITY,
-)
+from model_authority.binding import CredentialHandle
+from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
 from .capability_execution import MaterializedCredential
 from .code_execution import CodeExecutionConfig, build_code_execution
 from .commercial_work_start import CommercialWorkStartGate
@@ -41,15 +39,11 @@ from .dispatcher_factory import (
 from .mcp_client import McpClientManager
 from .operation_catalog import AgentOperationCatalog
 from .multi_user.billing import DEFAULT_USAGE_DLQ_PATH, SessionUsageSummary, UsageEvent, UsageLedger
-from .model_registry import (
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
-  CapabilityDefault,
-  ModelRegistryEntry,
-  ProductModelSelectionPolicy,
-)
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
+from model_authority.registry import ModelRegistryEntry
+from model_authority.selection import CapabilityDefault, ProductModelSelectionPolicy
 from .providers import AnthropicProvider, ModelProvider
-from .rates import load_rate_table
+from model_authority.rates import load_rate_table
 from .runner import AgentRunner, ToolResultContext
 from .runtime_spill import build_spill_sink
 from .tool_result_spill import (
@@ -67,7 +61,7 @@ from .session import AuthManager, GatewaySession, session_owner_user_id
 from .skills import SkillLoader, SkillStateStore
 from .task_registry import CoordinatorConfig
 from .tool_dispatcher import LocalToolHandler
-from .thinking import resolve_effort_pair
+from model_authority.thinking import resolve_effort_pair
 
 log = logging.getLogger("agent_gateway.easy")
 
@@ -209,7 +203,7 @@ def _easy_model_selection_policy(
   # below and surfaces in every binding as model_key/effort with
   # selection_source="capability_default".
   policy = ProductModelSelectionPolicy(
-    schema="product-model-selection/v1",
+    schema=INITIAL_MODEL_SELECTION_POLICY.schema,
     revision=INITIAL_MODEL_SELECTION_POLICY.revision,
     capabilities={
       **INITIAL_MODEL_SELECTION_POLICY.capabilities,
@@ -501,7 +495,9 @@ def create_agent(
     isinstance(resolved_provider, str)
     and resolved_provider.strip().lower() == "anthropic"
   ):
-    provider_instance = AnthropicProvider(rate_table=load_rate_table(rates_file))
+    provider_instance = AnthropicProvider(
+      rate_table=load_rate_table(rates_file) if rates_file is not None else None,
+    )
   if _provider_name != capability_entry.provider:
     raise ValueError("resolved provider does not match the selected model key")
   capability_entry, model_selection_policy = _easy_model_selection_policy(

@@ -11,11 +11,12 @@ from agent_gateway import AgentRunner
 from agent_gateway.autonomous_capability_handoff import AutonomousCapabilityBinding
 from agent_gateway.autonomous_event_channel import adopt_inherited_autonomous_event_channel
 from agent_gateway.autonomous_launch_envelope import AUTONOMOUS_CAPABILITY_ENVELOPE_ENV
-from agent_gateway.capability_binding import CapabilityBind, CredentialHandle
+from model_authority.bind import CapabilityBind
+from model_authority.binding import CredentialHandle
 from agent_gateway.capability_execution import MaterializedCredential
 from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
 from agent_gateway.event_log import EventLog
-from agent_gateway.model_registry import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 from agent_gateway.skill_limits import AutonomousSkillAdmissionPolicy, SkillExecutionLimits
 

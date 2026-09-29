@@ -7,11 +7,8 @@ from typing import Any
 
 from agent_gateway.launch_nonce_store import prepare_launch_nonce_store
 from agent_gateway.autonomous_launch_envelope import AutonomousControlAuthority
-from agent_gateway.capability_binding import CapabilityBind
-from agent_gateway.model_registry import (
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
-)
+from model_authority.bind import CapabilityBind
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 
 
 TASK_MANIFEST_VERSION = 8

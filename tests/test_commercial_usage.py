@@ -6,7 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from agent_workflow_contracts import CapabilityBind
+from model_authority.bind import CapabilityBind
 
 from agent_gateway.commercial_claims import VerifiedCommercialClaim
 from agent_gateway.commercial_work_authorization import VerifiedWorkAuthorization

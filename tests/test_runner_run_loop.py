@@ -29,10 +29,7 @@ from agent_gateway import (  # noqa: E402
   ToolResultContext,
   ToolDispatcher,
 )
-from agent_gateway.capability_binding import (  # noqa: E402
-  CapabilityResolutionError,
-  CredentialHandle,
-)
+from model_authority.binding import CapabilityResolutionError, CredentialHandle
 from agent_gateway.fork_request_handoff import ForkRequestHandoff  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
 from agent_gateway.mcp_client import McpClientManager  # noqa: E402

@@ -10,7 +10,7 @@ from typing import Any, Protocol
 
 from fastapi import HTTPException, Request
 
-from agent_gateway.capability_binding import CapabilityResolutionError
+from model_authority.binding import CapabilityResolutionError
 from agent_gateway.event_log import EventLog
 from agent_gateway.runner_introspection import exception_traceback_already_logged
 from agent_gateway.session import (

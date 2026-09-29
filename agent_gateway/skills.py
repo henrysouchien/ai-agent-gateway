@@ -48,7 +48,7 @@ from .sub_agent_capability import (
   resolve_sub_agent_capability,
 )
 from .sub_agent_scope_receipt import _server_owned_effect
-from .thinking import resolve_effort_pair
+from model_authority.thinking import resolve_effort_pair
 
 log = logging.getLogger("agent_gateway.skills")
 _FRONTMATTER_DELIMITER = "---"

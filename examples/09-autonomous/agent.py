@@ -3,14 +3,13 @@ from pathlib import Path
 
 from agent_gateway import (
   BoundCapabilityExecution,
-  CapabilityBind,
-  CredentialHandle,
   DeliveryConfig,
   GatewaySession,
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
   run_autonomous_sync,
 )
+from model_authority.bind import CapabilityBind
+from model_authority.binding import CredentialHandle
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.providers import AnthropicProvider
 
 

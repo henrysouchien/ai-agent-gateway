@@ -106,7 +106,7 @@ def pool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AnthropicCredential
 def _run(provider: _PoolProvider) -> str:
   execution = stub_bound_capability_execution(
     provider=provider,
-    model="claude-sonnet-4-6",
+    model="claude-sonnet-5",
     effort="none",
     auth_config={"auth_mode": "oauth", "auth_token": _REFUSED, "max_tokens": 1024},
   )

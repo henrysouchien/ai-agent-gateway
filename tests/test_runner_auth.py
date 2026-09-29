@@ -32,7 +32,7 @@ from agent_gateway.autonomous_credential_handoff import (  # noqa: E402
 from agent_gateway.autonomous_runner_start import (  # noqa: E402
   _positive_autonomous_child_env,
 )
-from agent_gateway.capability_binding import CredentialHandle  # noqa: E402
+from model_authority.binding import CredentialHandle
 from agent_gateway.capability_execution import MaterializedCredential  # noqa: E402
 from agent_gateway.providers import StreamEvent  # noqa: E402
 from agent_gateway.providers.anthropic import AnthropicProvider  # noqa: E402

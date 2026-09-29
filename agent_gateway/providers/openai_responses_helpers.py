@@ -5,8 +5,11 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from model_authority.rates import RateTable
+from model_authority.registry import AdapterRouteSupport
+from model_authority.schema import OpenAIResponsesCompat
 from ..openai_history_fence import REASONING_SIGNATURE_MARKER, TEXT_SIGNATURE_MARKER
-from .base import ModelInfo, StreamEvent
+from .base import ModelInfo, StreamEvent, admitted_entry, model_info_from_entry
 
 
 _TOOL_ID_RE = re.compile(r"[^a-zA-Z0-9_-]+")
@@ -15,71 +18,35 @@ _SURROGATE_RE = re.compile(r"[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udb
 _RESPONSE_STATUSES = frozenset({"completed", "incomplete", "failed", "cancelled", "queued", "in_progress"})
 
 
-def _responses_compat(
-  *,
-  effort_values: tuple[str, ...] = (),
-  effort_default: str = "none",
-  summary: bool = False,
-  function_tools: bool = True,
-) -> dict[str, Any]:
-  return {
-    "supportsResponsesFunctionTools": function_tools,
-    "supportsResponsesReasoningSummary": summary,
-    "supportsReasoningEffort": bool(effort_values),
-    "reasoningEffortValues": effort_values,
-    "reasoningEffortDefault": effort_default,
-  }
+def responses_compat(model_info: ModelInfo) -> OpenAIResponsesCompat:
+  compat = model_info.compat
+  if not isinstance(compat, OpenAIResponsesCompat):
+    raise TypeError(f"model {model_info.id!r} carries no openai.responses compat")
+  return compat
 
 
-_GPT56_VALUES = ("none", "low", "medium", "high", "xhigh", "max")
-_GPT55_VALUES = ("none", "low", "medium", "high", "xhigh")
+def responses_model_info(support: AdapterRouteSupport, model: str, rate_table: RateTable) -> ModelInfo:
+  """``ModelInfo`` for an ``openai.responses``-family entry this adapter executes."""
+  model_id, entry = admitted_entry(support, model)
+  compat = entry.compat
+  if not isinstance(compat, OpenAIResponsesCompat):
+    raise TypeError(f"{entry.key}.compat is not the openai.responses key set")
+  return model_info_from_entry(
+    model_id,
+    entry,
+    rate_table,
+    supports_thinking=any(value != "none" for value in compat.reasoning_control.values),
+  )
 
-_MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
-  *[
-    (
-      (model_id,),
-      ModelInfo(
-        id=model_id,
-        provider="openai",
-        context_window=1_050_000,
-        max_output_tokens=128_000,
-        supports_thinking=True,
-        supports_vision=True,
-        compat=_responses_compat(effort_values=_GPT56_VALUES, effort_default="medium", summary=True),
-      ),
-    )
-    for model_id in (
-      "gpt-5.6-sol",
-      "gpt-5.6-terra",
-      "gpt-5.6-luna",
-      "gpt-5.6",
-    )
-  ],
-  (
-    ("gpt-5.5",),
-    ModelInfo(
-      id="gpt-5.5",
-      provider="openai",
-      context_window=1_050_000,
-      max_output_tokens=128_000,
-      supports_thinking=True,
-      supports_vision=True,
-      compat=_responses_compat(effort_values=_GPT55_VALUES, effort_default="medium", summary=True),
-    ),
-  ),
-  (
-    ("gpt-5.4",),
-    ModelInfo(
-      id="gpt-5.4",
-      provider="openai",
-      context_window=1_050_000,
-      max_output_tokens=128_000,
-      supports_thinking=True,
-      supports_vision=True,
-      compat=_responses_compat(effort_values=_GPT55_VALUES, effort_default="none", summary=True),
-    ),
-  ),
-]
+
+def reasoning_effort_fragment(compat: OpenAIResponsesCompat, effort: str) -> dict[str, Any]:
+  """The request fragment carrying ``effort`` at ``reasoning_control.param``."""
+  *parents, leaf = compat.reasoning_control.param.split(".")
+  fragment: dict[str, Any] = {leaf: effort}
+  for key in reversed(parents):
+    fragment = {key: fragment}
+  return fragment
+
 
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
@@ -110,11 +77,6 @@ def _json_dumps(value: Any) -> str:
 
 def _sanitize_text(value: Any) -> str:
   return _SURROGATE_RE.sub("", str(value or ""))
-
-
-def _model_matches_tag(model_id: str, tag: str) -> bool:
-  candidates = (model_id, model_id.rsplit("/", 1)[-1])
-  return any(candidate == tag or candidate.startswith(f"{tag}-") for candidate in candidates)
 
 
 def _normalize_id(value: Any, *, fallback: str = "call") -> str:
@@ -596,19 +558,19 @@ def map_event(event_value: Any, state: _ResponsesStreamState) -> list[StreamEven
 
 
 __all__ = [
-  "_MODEL_INFO_BY_TAG",
   "_ResponsesStreamState",
   "_convert_messages",
   "convert_openai_response_tools",
   "_field",
   "_is_tool_result_message",
-  "_model_matches_tag",
   "_normalize_tool_call_id",
-  "_responses_compat",
   "_same_model_message",
   "_stringify_tool_result_content",
   "_synthetic_tool_result",
   "_system_prompt_text",
   "_to_plain_dict",
   "map_event",
+  "reasoning_effort_fragment",
+  "responses_compat",
+  "responses_model_info",
 ]

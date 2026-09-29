@@ -45,25 +45,42 @@ Reference this checklist when adding features, fixing bugs, or changing the publ
 - **`docs/comparison.md`** — only update if a feature changes our competitive positioning
 - **`CONTRIBUTING.md`** — only update if dev workflow changes
 
-## Registry or selection change
+## Model authority change
 
-Consumers read `agent_gateway/model_authority/product-model-registry.yaml` and
-`product-model-selection.yaml` from the installed wheel. A change that bumps
-either file's `revision` is a release, and no consumer sees it until each step
-below has run:
+`ai-agent-gateway` carries no model authority. The registry, selection policy,
+rate tables, loader and resolver are `hank-model-authority` (import
+`model_authority`, source `packages/model-authority/`); the data is one
+directory, `model-authority.yaml` plus `rates/*.json`, tracked at
+`packages/model-authority/model_authority/authority/`. A process loads the
+directory `HANK_MODEL_AUTHORITY_DIR` names, or the packaged copy when it is
+unset. A registry or selection change is never a gateway release.
 
-- [ ] **Liveness** — from the ai-excel-addin root,
+**A data change** (an entry, a default, an allowlist, a `compat:` value of a
+key the family already admits, a price) bumps `revision` and ships as a host
+deploy of that directory:
+
+- [ ] **Declare the lowest schema minor** that covers the fields the artifact
+  uses; the loader refuses a minor newer than its own
+- [ ] **Liveness** — from the ai-excel-addin root, with
+  `HANK_MODEL_AUTHORITY_DIR` set to the candidate directory,
   `.venv/bin/python3 scripts/model_registry_liveness.py --provider anthropic`
-  reports 0 unserved before publishing (it reads `ANTHROPIC_API_KEY` or
-  `ANTHROPIC_AUTH_TOKEN`)
-- [ ] **Republish** — bump the version and run the Publish steps below
-- [ ] **Relock each consumer** — risk_module: move the `requirements.txt` range
-  to the new version, `make requirements-lock`, and deploy, which installs
-  `--require-hashes -r requirements.lock`; investment_tools: move the
-  `pyproject.toml` range, `uv lock`, and install through its path
-  (`uv export --locked` in ai-excel-addin `scripts/deploy_investment_tools.sh`)
-- [ ] **Redeploy** — every consumer and gateway runtime; a relocked lock on
-  `main` is landed, not deployed
+  reports 0 unserved (it reads `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`)
+- [ ] **Check** — every host venv that loads the authority admits the
+  candidate: `<venv>/bin/python3 -m model_authority check <dir>`
+- [ ] **Deploy** — put the directory where the units' `HANK_MODEL_AUTHORITY_DIR`
+  points and restart the units that load it (`scripts/deploy_model_authority.sh`
+  is the host deploy for this step and is not in the tree yet; a unit with the
+  variable unset runs the packaged copy of its installed `hank-model-authority`)
+- [ ] **Observe** — each service's health reports the new `model_authority`
+  revision and sha256; the gateway's is `/api/health/ready`
+
+**A schema change** (a new `compat:` key, lifecycle literal or selection field
+is a minor; a removal or redefinition is a major) or a capability change is a
+`hank-model-authority` release (`scripts/publish_model_authority.sh`):
+
+- [ ] **Loaders first, then data using the new minor** — release the loader,
+  relock and redeploy every consumer onto it, confirm each health surface's
+  `admits` range covers the minor, and only then deploy data that declares it
 
 ## Publish
 

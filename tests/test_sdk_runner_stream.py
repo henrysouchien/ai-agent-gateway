@@ -14,13 +14,9 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import (  # noqa: E402
-  AgentSDKConfig,
-  AgentSDKRunner,
-  CapabilityResolutionError,
-  EventLog,
-  ProductModelRegistry,
-)
+from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog
+from model_authority.binding import CapabilityResolutionError
+from model_authority.registry import ProductModelRegistry
 import agent_gateway.sdk_runner as sdk_runner  # noqa: E402
 from agent_gateway.sdk_runner_stream import ToolCallInfo, _SDKRunnerStreamMixin  # noqa: E402
 from agent_gateway.tool_dispatch_classification import ToolResultSettlement  # noqa: E402

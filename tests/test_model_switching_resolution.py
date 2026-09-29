@@ -7,16 +7,13 @@ from fastapi.testclient import TestClient
 
 from agent_gateway import AgentRunner, EventLog, McpClientManager, ToolDispatcher
 from agent_gateway.auth import AuthConfig, ResolverResult
-from agent_gateway.capability_binding import CredentialHandle
+from model_authority.binding import CredentialHandle
 from agent_gateway.capability_execution import (
   BoundCapabilityExecution,
   MaterializedCredential,
 )
-from agent_gateway.model_registry import (
-  CAPABILITY_IDS,
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
-)
+from model_authority.capabilities import CAPABILITY_IDS
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.providers import ModelInfo, ModelProvider
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 from gateway_test_support.model_defaults import SESSION_DRIVER

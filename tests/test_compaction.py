@@ -31,7 +31,7 @@ def _run(coro):
 def _execution():
   return stub_bound_capability_execution(
     provider=AnthropicProvider(),
-    model="claude-sonnet-4-6",
+    model="claude-sonnet-5",
     effort="none",
     auth_config={"api_key": "test", "max_tokens": 512},
   )

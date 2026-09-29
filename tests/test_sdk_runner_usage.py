@@ -62,7 +62,7 @@ def test_sdk_runner_usage_event_threads_identity() -> None:
   assert event.rate_table_version == "v1"
   assert event.billing_mode == "metered"
   assert event.request_id == "req-sdk"
-  assert event.model == "claude-sonnet-4-6"
+  assert event.model == execution.bind.upstream_model
   assert event.provider == "anthropic"
   assert event.capability_bind == execution.bind.to_json()
   assert event.provider_reported_model == execution.bind.upstream_model
@@ -89,6 +89,8 @@ def test_sdk_stream_emits_one_commercial_delta_per_provider_call() -> None:
     async def emit(self, event, *, usage_state="succeeded"):
       emitted.append((event, usage_state))
 
+  # Each provider call is priced from the anthropic.messages authority entry.
+  execution = stub_sdk_capability_execution(model="claude-sonnet-5")
   runner = AgentSDKRunner(
     event_log=EventLog(),
     session_id="sess-sdk",
@@ -97,17 +99,14 @@ def test_sdk_stream_emits_one_commercial_delta_per_provider_call() -> None:
       channel="web", rate_table_version="v1", billing_mode="metered",
       request_id="req-sdk",
     ),
-    capability_execution=stub_sdk_capability_execution(),
+    capability_execution=execution,
     system_prompt="test",
     commercial_usage_producer=Producer(),
   )
-  for model, input_tokens, cached, output_tokens in (
-    ("claude-sonnet-4-6", 10, 2, 4),
-    ("claude-sonnet-4-6", 20, 5, 8),
-  ):
+  for input_tokens, cached, output_tokens in ((10, 2, 4), (20, 5, 8)):
     runner._handle_stream_event({
       "type": "message_start",
-      "message": {"model": model, "usage": {
+      "message": {"model": "claude-sonnet-5", "usage": {
         "input_tokens": input_tokens, "cache_read_input_tokens": cached,
         "server_tool_use": {"web_search_requests": 1, "web_fetch_requests": 1},
       }},
@@ -127,9 +126,9 @@ def test_sdk_stream_emits_one_commercial_delta_per_provider_call() -> None:
   assert {
     event.capability_bind["upstream_model"] for event, _ in emitted
     if event.capability_bind is not None
-  } == {"claude-sonnet-4-6"}
+  } == {"claude-sonnet-5"}
   assert {event.provider_reported_model for event, _ in emitted} == {
-    "claude-sonnet-4-6"
+    "claude-sonnet-5"
   }
   assert [event.provider_unit_deltas for event, _ in emitted] == [
     {"web_fetch": 1, "web_search": 1},
@@ -193,6 +192,7 @@ def test_sdk_reconciliation_failure_does_not_block_summary_callback() -> None:
 
 def test_sdk_runner_explicit_identity_summary() -> None:
   summaries: list[SessionUsageSummary] = []
+  execution = stub_sdk_capability_execution()
   runner = AgentSDKRunner(
     event_log=EventLog(),
     session_id="sess-sdk",
@@ -201,7 +201,7 @@ def test_sdk_runner_explicit_identity_summary() -> None:
       rate_table_version="v1",
       billing_mode="byok",
     ),
-    capability_execution=stub_sdk_capability_execution(),
+    capability_execution=execution,
     system_prompt="test",
     on_session_summary=summaries.append,
   )
@@ -220,7 +220,7 @@ def test_sdk_runner_explicit_identity_summary() -> None:
   assert summaries[0].request_id
   assert summaries[0].input_tokens == 3
   assert summaries[0].turns == 1
-  assert summaries[0].model == "claude-sonnet-4-6"
+  assert summaries[0].model == execution.bind.upstream_model
   assert summaries[0].provider == "anthropic"
   assert summaries[0].rate_table_version == "v1"
   assert summaries[0].billing_mode == "byok"

@@ -19,13 +19,15 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import AgentRunner, EventLog, ToolDispatcher
-from agent_gateway.capability_binding import CapabilityResolutionError
+from model_authority.binding import CapabilityResolutionError
 from agent_gateway.agent_session_log import AgentSessionLog
 from agent_gateway.openai_history_fence import REASONING_SIGNATURE_MARKER, TEXT_SIGNATURE_MARKER
-from agent_gateway.model_registry import INITIAL_MODEL_REGISTRY, ProductModelRegistry
+from model_authority.current import INITIAL_MODEL_REGISTRY
+from model_authority.registry import ProductModelRegistry
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.provider_summarize import provider_summarize
-from agent_gateway.providers import OpenAIProvider, ThinkingLevel
+from agent_gateway.providers import OpenAIProvider
+from model_authority.thinking import ThinkingLevel
 from agent_gateway.providers.openai import OpenAIConfigurationError
 from agent_gateway.providers.openai_responses_helpers import _ResponsesStreamState, map_event
 from agent_gateway.tool_policy_registry import PreparedToolCall
@@ -360,13 +362,13 @@ def test_closing_provider_stream_releases_response_before_client() -> None:
 def test_request_contract_reasoning_tools_and_local_history() -> None:
   provider = OpenAIProvider()
   params = provider.build_request_params(
-    model="gpt-5.6-terra",
+    model="gpt-6-astra",
     messages=[
       {"role": "user", "content": [{"type": "text", "text": "look up x"}]},
       {
         "role": "assistant",
         "provider": "openai",
-        "model": "gpt-5.6-terra",
+        "model": "gpt-6-astra",
         "content": [{"type": "tool_use", "id": "call_1|fc_1", "name": "lookup", "input": {"q": "x"}}],
       },
       {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1|fc_1", "content": "ok"}]},
@@ -401,7 +403,7 @@ def test_reasoning_matrix_none_and_effort_are_nested() -> None:
   )
   assert none_params["reasoning"] == {"effort": "none"}
   high_params = provider.build_request_params(
-    model="gpt-5.4", messages=[], system_prompt=None, tools=[], max_tokens=100,
+    model="gpt-6-sol", messages=[], system_prompt=None, tools=[], max_tokens=100,
     thinking_level=ThinkingLevel.HIGH,
   )
   # Responses nests reasoning; a top-level reasoning_effort is what gpt-5.6 rejects
@@ -436,8 +438,9 @@ def test_non_reasoning_model_omits_reasoning(monkeypatch) -> None:
 
 def test_text_only_model_rejects_required_tools(monkeypatch) -> None:
   provider = OpenAIProvider()
-  compat = dict(provider.get_model_info("gpt-5.6").compat or {})
-  compat["supportsResponsesFunctionTools"] = False
+  base_compat = provider.get_model_info("gpt-5.6").compat
+  assert base_compat is not None
+  compat = base_compat.model_copy(update={"function_tools": False})
   _synthetic_model(monkeypatch, provider, supports_tool_use=False, compat=compat)
   params = provider.build_request_params(
     model="synthetic-textonly", messages=[{"role": "user", "content": "hello"}],
@@ -451,19 +454,25 @@ def test_text_only_model_rejects_required_tools(monkeypatch) -> None:
     )
 
 
-def test_registry_unadmitted_model_is_rejected() -> None:
-  with pytest.raises(ValueError, match="product model registry does not admit"):
-    OpenAIProvider().get_model_info("gpt-5.2")
+@pytest.mark.parametrize(
+  "model",
+  [
+    "gpt-5.2",
+    # Listed by the authority for the codex.responses adapter only.
+    "gpt-5.6-terra",
+  ],
+)
+def test_model_without_an_openai_authority_entry_is_refused(model: str) -> None:
+  with pytest.raises(ValueError, match="admits no openai.responses entry"):
+    OpenAIProvider().get_model_info(model)
 
 
-def test_registry_admitted_model_without_capability_row_derives_from_registry(
-  monkeypatch,
-) -> None:
-  # Config-only model addition (plan §8): a model the registry artifact admits
-  # is served before this adapter's capability table gains a row, with effort
-  # and feature facts derived from the registry owner instead of a guessed or
-  # rejected identity.
-  from agent_gateway.model_registry import ModelRegistryEntry, ProductModelRegistry
+def test_new_authority_entry_is_served_from_its_compat_alone(monkeypatch) -> None:
+  # Adding a model is an authority data change: an entry with no gateway code
+  # and no rate row is served, its limits, tools and reasoning read from compat.
+  from gateway_test_support.model_defaults import compat_for_profile
+  from model_authority.registry import ModelRegistryEntry
+  from model_authority.schema import SCHEMA
   import agent_gateway.providers.base as provider_base
 
   entry = ModelRegistryEntry(
@@ -480,26 +489,29 @@ def test_registry_admitted_model_without_capability_row_derives_from_registry(
     default_effort="medium",
     features=frozenset({"tools", "streaming"}),
     reported_identities=frozenset({"gpt-6"}),
+    compat=compat_for_profile("responses.reasoning"),
   )
   monkeypatch.setattr(
     provider_base,
     "INITIAL_MODEL_REGISTRY",
-    ProductModelRegistry(
-      schema="product-model-registry/v1",
-      revision="test",
-      models={entry.key: entry},
-    ),
+    ProductModelRegistry(schema=SCHEMA, revision="test", models={entry.key: entry}),
   )
+  provider = OpenAIProvider()
 
-  info = OpenAIProvider().get_model_info("gpt-6")
+  info = provider.get_model_info("gpt-6")
+  params = provider.build_request_params(
+    model="gpt-6", messages=[], system_prompt=None,
+    tools=[{"name": "x", "input_schema": {"type": "object"}}], max_tokens=100,
+    thinking_level=ThinkingLevel.XHIGH,
+  )
 
   assert info.supports_thinking is True
   assert info.supports_tool_use is True
-  compat = info.compat or {}
-  assert compat["supportsReasoningEffort"] is True
-  assert compat["reasoningEffortValues"] == ("none", "low", "medium", "high", "xhigh")
-  assert compat["reasoningEffortDefault"] == "medium"
-  assert compat["supportsResponsesFunctionTools"] is True
+  assert info.context_window == 200_000
+  assert info.input_cost_per_mtok == info.output_cost_per_mtok == 0.0
+  assert params["tools"][0]["name"] == "x"
+  # The compat declares no reasoning summary, so only the effort is sent.
+  assert params["reasoning"] == {"effort": "xhigh"}
 
 
 def test_legacy_and_native_history_conversion() -> None:
@@ -846,7 +858,7 @@ def test_runner_executes_responses_tool_loop_and_replays_function_output() -> No
     session_id="responses-tool-loop",
     capability_execution=stub_runner_capability_execution(
       provider=provider,
-      model="gpt-5.6-terra",
+      model="gpt-6-astra",
       effort="low",
       auth_config={"api_key": "sk-test", "max_tokens": 512},
     ),
@@ -1036,7 +1048,7 @@ def test_standalone_runner_keeps_raw_execution_separate_from_safe_history(
     session_id="standalone-redaction",
     capability_execution=stub_runner_capability_execution(
       provider=Provider(),
-      model="gpt-5.6-terra",
+      model="gpt-6-astra",
       effort="low",
       auth_config={"api_key": "sk-test", "max_tokens": 512},
     ),
@@ -1255,7 +1267,7 @@ def test_real_openai_summary_rejects_unadmitted_nearby_identity(
 
 
 def test_declared_adapter_support_matches_responses_only_implementation() -> None:
-  from agent_gateway.model_registry import INITIAL_MODEL_REGISTRY
+  from model_authority.current import INITIAL_MODEL_REGISTRY
 
   declaration = OpenAIProvider.adapter_route_support()
 

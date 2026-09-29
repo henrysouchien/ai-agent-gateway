@@ -8,7 +8,7 @@ import threading
 from typing import Any, Literal
 from uuid import UUID
 
-from agent_workflow_contracts import CapabilityBind
+from model_authority.bind import CapabilityBind
 
 from .multi_user.billing import SessionUsageSummary
 

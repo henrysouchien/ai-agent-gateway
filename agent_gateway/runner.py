@@ -155,7 +155,7 @@ from .task_registry import (
   TaskRegistry,
   TaskState,
 )
-from .thinking import EffortResolution
+from model_authority.thinking import EffortResolution
 from .tool_display import resolve_display  # noqa: F401 - compatibility alias
 from .tool_result_compaction import (
   MODEL_TOOL_RESULT_MAX_CHARS_ENV as MODEL_TOOL_RESULT_MAX_CHARS_ENV,

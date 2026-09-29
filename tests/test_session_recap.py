@@ -15,12 +15,9 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.model_registry import (
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
-)
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.easy import create_agent
-from agent_gateway.capability_binding import CapabilityBind
+from model_authority.bind import CapabilityBind
 from agent_gateway.event_log import EventLog
 from agent_gateway.events import (
   RecapFailure,

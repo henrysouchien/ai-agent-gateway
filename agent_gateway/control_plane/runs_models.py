@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from agent_workflow_contracts.research_file_contract import is_research_file_id
 from agent_gateway.control_run_lifecycle import ControlRunState
-from agent_gateway.thinking import parse_effort
+from model_authority.thinking import parse_effort
 
 ChatRunState = ControlRunState
 AutonomousRunState = ControlRunState

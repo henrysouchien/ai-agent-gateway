@@ -9,8 +9,8 @@ import sqlite3
 from threading import RLock
 import time
 
-from .capability_binding import ModelSelectionIntent
-from .model_registry import CAPABILITY_IDS
+from model_authority.binding import ModelSelectionIntent
+from model_authority.capabilities import CAPABILITY_IDS
 
 
 class ModelPreferenceStore:

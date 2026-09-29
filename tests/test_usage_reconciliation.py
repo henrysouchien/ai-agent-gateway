@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
-from agent_workflow_contracts import CapabilityBind
+from model_authority.bind import CapabilityBind
 
 from agent_gateway.multi_user.billing import SessionUsageSummary
 from agent_gateway.usage_reconciliation import CommercialUsageReconciliationTracker

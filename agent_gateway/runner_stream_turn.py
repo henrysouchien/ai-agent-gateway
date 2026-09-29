@@ -8,10 +8,10 @@ import time
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
 
 from .auth import ProviderCredentialFailure
-from .capability_binding import validate_reported_identity
-from .providers import ModelInfo, ThinkingLevel
+from model_authority.binding import validate_reported_identity
+from .providers import ModelInfo
 from .providers.anthropic_helpers import _format_anthropic_rejection_detail
-from .thinking import EffortResolution, parse_effort
+from model_authority.thinking import EffortResolution, ThinkingLevel, parse_effort
 from .runner_introspection import format_exc as _format_exc
 from .runner_limits import (
   effective_compaction_trigger as _effective_compaction_trigger,
@@ -510,6 +510,7 @@ class RunnerStreamTurnMixin:
 
         if event_type == "message_end":
           result.stop_reason = event.stop_reason or None
+          result.stop_details = event.stop_details
 
       logger.debug("[%s] Turn %d stream end", self._sid, turn_count)
 

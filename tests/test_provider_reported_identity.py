@@ -21,8 +21,8 @@ from agent_gateway.multi_user.billing import (  # noqa: E402
   _UsageAggregator,
 )
 from agent_gateway.events import _session_usage_summary  # noqa: E402
-from agent_gateway.capability_binding import CapabilityResolutionError  # noqa: E402
-from agent_gateway.model_registry import ProductModelRegistry  # noqa: E402
+from model_authority.binding import CapabilityResolutionError
+from model_authority.registry import ProductModelRegistry
 from agent_gateway.providers.anthropic import AnthropicProvider  # noqa: E402
 from agent_gateway.providers.codex_helpers import (  # noqa: E402
   _ResponsesStreamState as CodexStreamState,
@@ -45,7 +45,7 @@ from agent_gateway.providers import (  # noqa: E402
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_bound_capability_execution,
 )
-from agent_workflow_contracts import CapabilityBind  # noqa: E402
+from model_authority.bind import CapabilityBind
 
 
 class _StaticStream:

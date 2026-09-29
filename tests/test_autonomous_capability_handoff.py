@@ -10,7 +10,6 @@ from pathlib import Path
 
 import pytest
 
-from agent_gateway import OpenAIProvider
 import agent_gateway.autonomous_credential_handoff as credential_handoff
 from agent_gateway.autonomous_capability_handoff import (
   AutonomousCapabilityBinding,
@@ -32,7 +31,8 @@ from agent_gateway.autonomous_runner import AutonomousRegistry
 from agent_gateway.autonomous_runner_start import (
   _positive_autonomous_child_env,
 )
-from agent_gateway.capability_binding import CapabilityBind, CredentialHandle
+from model_authority.bind import CapabilityBind
+from model_authority.binding import CredentialHandle
 from agent_gateway.capability_execution import MaterializedCredential
 from agent_gateway.skill_limits import (
   AutonomousSkillAdmissionPolicy,
@@ -582,7 +582,7 @@ def test_child_environment_is_profile_scoped_and_secret_minimal() -> None:
     "IBKR_FLEX_TOKEN": "brokerage-secret",
     "TELEGRAM_BOT_TOKEN": "telegram-secret",
     "TELEGRAM_CHAT_ID": "telegram-chat",
-    "AGENT_GATEWAY_RATES_FILE": "/opt/hank/rates.json",
+    "HANK_MODEL_AUTHORITY_DIR": "/opt/hank/model-authority",
     "AGENT_SESSION_LOG_BASE_DIR": "/writable/live/api/sessions",
     "CORPUS_LOG_DIR": "/writable/live/corpus-logs",
     "CORPUS_STATE_DIR": "/writable/live/corpus",
@@ -622,7 +622,7 @@ def test_child_environment_is_profile_scoped_and_secret_minimal() -> None:
     deliver=False,
   )
   assert "OPENAI_MODEL" not in analyst
-  assert analyst["AGENT_GATEWAY_RATES_FILE"] == "/opt/hank/rates.json"
+  assert analyst["HANK_MODEL_AUTHORITY_DIR"] == "/opt/hank/model-authority"
   assert analyst["FMP_API_KEY"] == "research-secret"
   assert analyst["SEC_BUDGET_SITE"] == "prod"
   assert analyst["SEC_USER_AGENT"] == "host-agent contact@example.com"
@@ -672,7 +672,7 @@ def test_child_environment_is_profile_scoped_and_secret_minimal() -> None:
   assert advisor["SEC_BUDGET_SITE"] == "prod"
   assert advisor["SEC_USER_AGENT"] == "host-agent contact@example.com"
   assert advisor["SEC_EXPECTED_MACHINE_IDENTITY"] == "host.example.test"
-  assert advisor["AGENT_GATEWAY_RATES_FILE"] == "/opt/hank/rates.json"
+  assert advisor["HANK_MODEL_AUTHORITY_DIR"] == "/opt/hank/model-authority"
   assert advisor["AGENT_SESSION_LOG_BASE_DIR"] == "/writable/live/api/sessions"
   assert advisor["IBKR_FLEX_TOKEN"] == "brokerage-secret"
   assert advisor["ADVISOR_TELEGRAM_BOT_TOKEN"] == "telegram-secret"
@@ -691,53 +691,11 @@ def test_child_environment_is_profile_scoped_and_secret_minimal() -> None:
   assert "SEC_BUDGET_SITE" not in custom_provider
   assert "SEC_USER_AGENT" not in custom_provider
   assert "SEC_EXPECTED_MACHINE_IDENTITY" not in custom_provider
-  assert custom_provider["AGENT_GATEWAY_RATES_FILE"] == "/opt/hank/rates.json"
+  assert custom_provider["HANK_MODEL_AUTHORITY_DIR"] == "/opt/hank/model-authority"
   assert "IBKR_FLEX_TOKEN" not in custom_provider
   assert "OPENAI_SESSION_EPOCH" not in custom_provider
   assert not any("TELEGRAM" in name for name in custom_provider)
   assert forbidden.isdisjoint(custom_provider)
-
-
-def test_non_anthropic_child_rates_override_reaches_provider_construction(
-  monkeypatch: pytest.MonkeyPatch,
-  tmp_path: Path,
-) -> None:
-  rates_path = tmp_path / "rates.json"
-  rates_path.write_text(json.dumps({
-    "version": "child-projected",
-    "source": "https://example.test/rates",
-    "providers": {
-      "openai": {
-        "models": {
-          "gpt-6-astra": {
-            "display_name": "GPT-6 Astra",
-            "input_cost_per_mtok": 2.0,
-            "output_cost_per_mtok": 3.0,
-            "cache_read_cost_per_mtok": 4.0,
-            "cache_write_cost_per_mtok": 5.0,
-          },
-        },
-      },
-    },
-  }), encoding="utf-8")
-  projected = _positive_autonomous_child_env(
-    {"AGENT_GATEWAY_RATES_FILE": str(rates_path)},
-    provider="openai",
-    profile="analyst",
-    deliver=False,
-  )
-  monkeypatch.setenv(
-    "AGENT_GATEWAY_RATES_FILE",
-    projected["AGENT_GATEWAY_RATES_FILE"],
-  )
-
-  provider = OpenAIProvider()
-  estimate = provider.estimate_cost(
-    "gpt-6-astra", 1000, 2000, cache_read_tokens=3000, cache_creation_tokens=4000,
-  )
-
-  assert estimate.total == pytest.approx(0.04)
-  assert "child-projected" in provider._rate_table.version
 
 
 @pytest.mark.parametrize(
@@ -766,6 +724,7 @@ def test_pinned_autonomous_child_inherits_exact_runtime_import_roots(
     str(ai_root),
     str(ai_root / "api"),
     str(ai_root / "packages" / "agent-gateway"),
+    str(ai_root / "packages" / "model-authority"),
     str(ai_root / "packages" / "excel-mcp" / "python"),
     str(ai_root / "packages" / "ibkr-relay-client" / "python"),
     str(ai_root / "packages" / "sheets-finance-mcp"),

@@ -25,17 +25,14 @@ from agent_gateway import (
   ToolDispatcher,
   make_run_agent_handler,
 )
-from agent_gateway.capability_binding import (
-  CapabilityBind,
-  CapabilityId,
-  ModelSelectionIntent,
-)
+from model_authority.bind import CapabilityBind
+from model_authority.binding import CapabilityId, ModelSelectionIntent
 from agent_gateway.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
 )
 from agent_gateway.mcp_client import McpClientManager
-from agent_gateway.model_registry import INITIAL_MODEL_REGISTRY
+from model_authority.current import INITIAL_MODEL_REGISTRY
 from agent_gateway.providers import AnthropicProvider, StreamEvent
 from agent_gateway.sub_agent import _DEFAULT_EXCLUDED_TOOLS
 from gateway_test_support.capability_execution_test_support import (

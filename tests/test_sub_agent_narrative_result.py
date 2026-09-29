@@ -11,7 +11,6 @@ from agent_workflow_contracts import (
   AgentResumeMechanics,
   AttemptRef,
   LiveToolCapabilityBinding,
-  CapabilityBind,
   ContractRef,
   OrdinaryDelegationTaskRef,
   OutcomeRequirement,
@@ -22,6 +21,7 @@ from agent_workflow_contracts import (
   ProviderToolDefinition,
   sha256_digest,
 )
+from model_authority.bind import CapabilityBind
 
 from agent_gateway.final_narrative_artifact import read_final_narrative
 from agent_gateway.sub_agent import _ordinary_admitted_task_factory
@@ -434,7 +434,7 @@ def _admitted_task(*, tool_ids: tuple[str, ...] = ("filings_search",)):
       provider="anthropic",
       upstream_model="test-model",
       adapter="native",
-      protocol_profile="messages",
+      protocol_profile="messages.standard",
       route="test",
       effort="none",
       credential_principal="user",
@@ -595,6 +595,70 @@ async def test_turns_exhausted_beside_another_signal_keeps_failing(
   assert result.execution.terminal_reason is not None
   assert result.execution.terminal_reason.startswith("stalled:")
   assert result.outcome is None
+  assert result.values.terminal_narrative is None
+
+
+_REFUSAL_EVENT = {
+  "type": "refusal",
+  "category": "reasoning_extraction",
+  "explanation": "The request asks for internal reasoning.",
+  "guidance": "Anthropic recommends starting a fresh conversation before continuing.",
+}
+
+
+@pytest.mark.asyncio
+async def test_refused_child_settles_interrupted_and_keeps_delivered_narrative(
+  tmp_path,
+) -> None:
+  # A provider refusal is its own disposition: the text the model delivered
+  # before the stop is the child's narrative, never a runtime_error.
+  logical, attempt, provenance = _task_identity()
+  refused = _assistant_entry("Delivered before the stop.", seq=11, ordinal=0, terminal=True)
+  refused.event["stop_reason"] = "refusal"
+  visible = await final_child_visible_text(
+    _NarrativeLog([refused]),
+    sub_session_id="child-1",
+    workspace_dir=str(tmp_path),
+  )
+  assert visible.text == "Delivered before the stop."
+
+  result = task_result_from_execution(
+    (dict(_REFUSAL_EVENT),),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=visible.final_narrative,
+    stalled=False,
+    admitted_task=_admitted_task(),
+  )
+
+  assert result.execution.status == "interrupted"
+  assert result.execution.terminal_reason == "refusal: reasoning_extraction"
+  assert result.values.terminal_narrative is not None
+  assert read_task_result_terminal_narrative(
+    result,
+    workspace_dir=str(tmp_path),
+  ) == "Delivered before the stop."
+
+
+@pytest.mark.asyncio
+async def test_refusal_beside_a_runtime_error_keeps_failing(tmp_path) -> None:
+  logical, attempt, provenance = _task_identity()
+
+  result = task_result_from_execution(
+    (dict(_REFUSAL_EVENT), {"type": "error", "error": "channel closed"}),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=await _narrative(tmp_path),
+    stalled=False,
+    admitted_task=_admitted_task(),
+  )
+
+  assert result.execution.status == "failed"
+  assert result.execution.terminal_reason == "runtime_error: channel closed"
   assert result.values.terminal_narrative is None
 
 

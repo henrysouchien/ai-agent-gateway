@@ -1741,7 +1741,7 @@ class SQLiteApprovalStore:
           decided_at=decided_at,
           decider_id=decider_id if decider_id is not None else current.decider_id,
           decider_role=decider_role if decider_role is not None else current.decider_role,
-          decision=terminal_decision,  # type: ignore[arg-type]
+          decision=terminal_decision,
           decision_reason=decision_reason if decision_reason is not None else current.decision_reason,
         )
         conn.execute(

@@ -2,12 +2,16 @@
 /* eslint-disable */
 
 /**
- * Canonical capability-id vocabulary, generated from the gateway's
- * CAPABILITY_IDS owner set (agent_gateway/model_registry.py).
+ * Canonical capability-id vocabulary, generated from the model
+ * authority's CAPABILITY_IDS owner set (model_authority/capabilities.py).
  * Clients must consume this artifact instead of hand copying the ids.
  */
 export const CAPABILITY_IDS = [
   "citation.review",
+  "edgar.earnings_8k",
+  "edgar.earnings_8k_fallback",
+  "edgar.general_completion",
+  "edgar.langextract",
   "investment.biotech_review",
   "investment.earnings_transcript",
   "investment.newsletter",
@@ -33,7 +37,7 @@ export type CapabilityId = (typeof CAPABILITY_IDS)[number];
 
 /**
  * Single spelling of the chat-driver capability id
- * (agent_gateway/model_registry.py SESSION_DRIVER_CAPABILITY).
+ * (model_authority/capabilities.py SESSION_DRIVER_CAPABILITY).
  */
 export const SESSION_DRIVER_CAPABILITY =
   "session.driver" as const satisfies CapabilityId;

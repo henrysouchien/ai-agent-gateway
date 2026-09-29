@@ -16,14 +16,13 @@ from fastapi import HTTPException
 from agent_workflow_contracts import WorkflowContentPage
 
 from .approval_route import NO_APPROVAL_ROUTE, ApprovalRoute
-from .capability_binding import (
-  CAPABILITY_IDS,
+from model_authority.binding import (
   CapabilityId,
   CredentialHandle,
   CredentialPrincipal,
   ModelSelectionIntent,
-  SESSION_DRIVER_CAPABILITY,
 )
+from model_authority.capabilities import CAPABILITY_IDS, SESSION_DRIVER_CAPABILITY
 from .events import DEFAULT_SCHEMA_VERSION
 from .event_log import EventLog, log_has_terminal
 from .mcp_activation import McpActivationFold

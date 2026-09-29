@@ -4,22 +4,29 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import replace
 from typing import Any, AsyncGenerator, Dict, Literal, Mapping
 
 from ..auth import ProviderCredentialFailure
 from ..rate_limit import get_global_token_bucket
-from ..rates import RateTable, UnknownModelError, load_provider_rate_table
-from .base import ModelInfo, ModelProvider, StreamEvent, ThinkingLevel, truncate_to_last_compaction
-from ..model_registry import AdapterRouteSupport
-from ..thinking import EffortResolution, clamp_effort
+from model_authority.rates import RateTable
+from model_authority.registry import AdapterRouteSupport
+from model_authority.schema import AnthropicMessagesCompat
+from model_authority.thinking import EffortResolution, ThinkingLevel, clamp_effort
+from .base import (
+  ModelInfo,
+  ModelProvider,
+  StreamEvent,
+  admitted_entry,
+  authority_rate_table,
+  model_info_from_entry,
+  truncate_to_last_compaction,
+)
 from .anthropic_helpers import (
   _COMMON_BETA_SLUGS as _COMMON_BETA_SLUGS,
   _COMPACTION_BETA_SLUG as _COMPACTION_BETA_SLUG,
   _ERROR_REDACTION as _ERROR_REDACTION,
   _MAX_ERROR_DETAIL_LEN as _MAX_ERROR_DETAIL_LEN,
   _MAX_TOOL_ID_LEN as _MAX_TOOL_ID_LEN,
-  _MODEL_INFO_BY_TAG as _MODEL_INFO_BY_TAG,
   _OAUTH_BETA_SLUGS as _OAUTH_BETA_SLUGS,
   _OAUTH_IDENTITY as _OAUTH_IDENTITY,
   _SENSITIVE_ERROR_KEY_RE as _SENSITIVE_ERROR_KEY_RE,
@@ -30,8 +37,6 @@ from .anthropic_helpers import (
   _exception_status_code as _exception_status_code,
   _format_anthropic_rejection_detail as _format_anthropic_rejection_detail,
   _has_tool_result_block as _has_tool_result_block,
-  _model_info_for_model as _model_info_for_model,
-  _model_matches_tag as _model_matches_tag,
   _normalize_tool_call_id as _normalize_tool_call_id,
   _redact_error_body as _redact_error_body,
   _response_header as _response_header,
@@ -431,6 +436,38 @@ def _prepare_anthropic_tools(
   return prepare_anthropic_tools(tools)
 
 
+# `thinking.effort_control` names how a request carries effort; the request's
+# thinking parameter follows from it (see `_thinking_param`).
+_THINKING_MODE_BY_EFFORT_CONTROL: dict[str, Literal["adaptive", "budget", "none"]] = {
+  "output_config": "adaptive",
+  "budget": "budget",
+  "none": "none",
+}
+
+
+def _messages_compat(model_info: ModelInfo) -> AnthropicMessagesCompat:
+  compat = model_info.compat
+  if not isinstance(compat, AnthropicMessagesCompat):
+    raise TypeError(f"Anthropic model {model_info.id!r} carries no anthropic.messages compat")
+  return compat
+
+
+def _messages_model_info(model: str, rate_table: RateTable) -> ModelInfo:
+  model_id, entry = admitted_entry(AnthropicProvider.adapter_route_support(), model)
+  compat = entry.compat
+  if not isinstance(compat, AnthropicMessagesCompat):
+    raise TypeError(f"{entry.key}.compat is not the anthropic.messages key set")
+  thinking_mode = _THINKING_MODE_BY_EFFORT_CONTROL[compat.thinking.effort_control]
+  return model_info_from_entry(
+    model_id,
+    entry,
+    rate_table,
+    supports_thinking=thinking_mode != "none",
+    thinking_mode=thinking_mode,
+    supports_native_compaction=compat.native_compaction,
+  )
+
+
 class AnthropicProvider(ModelProvider):
   """`ModelProvider` implementation for Anthropic's Messages API.
 
@@ -455,14 +492,16 @@ class AnthropicProvider(ModelProvider):
     )
 
   def __init__(self, *, rate_table: RateTable | None = None):
-    self._rate_table = load_provider_rate_table(self.name, rate_table)
+    self._rate_table = authority_rate_table(self.name, rate_table)
 
   @staticmethod
   def thinking_param(model: str, max_tokens: int) -> dict[str, Any] | None:
-    # No prefix pre-check: the product model registry (via
-    # _model_info_for_model) is the single owner of which model ids are
-    # admitted, and it raises for anything it does not know.
-    return _thinking_param(_model_info_for_model(str(model or "").strip()), max_tokens)
+    # The model authority is the single owner of which model ids are
+    # admitted; _messages_model_info raises for anything it does not know.
+    return _thinking_param(
+      _messages_model_info(model, authority_rate_table(AnthropicProvider.name)),
+      max_tokens,
+    )
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
     if str(config.get("auth_mode", "api")).strip().lower() == "oauth":
@@ -613,26 +652,7 @@ class AnthropicProvider(ModelProvider):
       pass
 
   def get_model_info(self, model: str) -> ModelInfo:
-    model_id = str(model or "").strip()
-    if not model_id:
-      raise ValueError("Model is required")
-    if not model_id.startswith("claude"):
-      raise ValueError(f"AnthropicProvider does not recognize model: {model_id}")
-    model_info = _model_info_for_model(model_id)
-    try:
-      rates = self._rate_table.lookup(self.name, model_id)
-    except UnknownModelError:
-      return model_info
-    return replace(
-      model_info,
-      context_window=rates.context_window or 200_000,
-      max_output_tokens=rates.max_tokens or 16_384,
-      input_cost_per_mtok=rates.input_cost_per_mtok,
-      output_cost_per_mtok=rates.output_cost_per_mtok,
-      cache_read_cost_per_mtok=rates.cache_read_cost_per_mtok,
-      cache_write_cost_per_mtok=rates.cache_write_cost_per_mtok,
-      rate_tiers=rates.tiers,
-    )
+    return _messages_model_info(model, self._rate_table)
 
   def build_request_params(
     self,
@@ -761,28 +781,29 @@ class AnthropicProvider(ModelProvider):
     if not model_info.supports_thinking or model_info.thinking_mode == "none":
       return EffortResolution(requested, ThinkingLevel.NONE, False, {})
 
-    compat = dict(model_info.compat or {})
     if model_info.thinking_mode == "budget":
       if requested == ThinkingLevel.NONE:
         return EffortResolution(requested, ThinkingLevel.NONE, False, {})
-      thinking = _thinking_param(model_info, max_tokens)
+      budget = _thinking_param(model_info, max_tokens)
       return EffortResolution(
         requested,
-        ThinkingLevel.HIGH if thinking is not None else ThinkingLevel.NONE,
-        thinking is not None,
-        {"thinking": thinking} if thinking is not None else {},
+        ThinkingLevel.HIGH if budget is not None else ThinkingLevel.NONE,
+        budget is not None,
+        {"thinking": budget} if budget is not None else {},
       )
 
-    disable = str(compat.get("thinking_disable", "omit"))
-    default_effort = ThinkingLevel(str(compat.get("thinking_default_effort", "none")))
-    omitted_on = str(compat.get("thinking_default_when_omitted", "off")) == "on"
-    supported = tuple(ThinkingLevel(str(value)) for value in compat.get("effort_values", ()))
+    thinking = _messages_compat(model_info).thinking
+    default_effort = ThinkingLevel(thinking.effort_when_omitted)
+    omitted_on = thinking.default_when_omitted == "on"
+    supported = tuple(
+      ThinkingLevel(value) for value in model_info.effort_values if value != ThinkingLevel.NONE.value
+    )
 
     if requested == ThinkingLevel.NONE:
-      if disable == "disabled":
-        return EffortResolution(requested, ThinkingLevel.NONE, False, {"thinking": {"type": "disabled"}})
-      if disable == "unsupported":
+      if not thinking.can_disable:
         return EffortResolution(requested, default_effort, True, {})
+      if omitted_on:
+        return EffortResolution(requested, ThinkingLevel.NONE, False, {"thinking": {"type": "disabled"}})
       return EffortResolution(requested, ThinkingLevel.NONE, False, {})
 
     normalized = ThinkingLevel.LOW if requested == ThinkingLevel.MINIMAL else requested
@@ -794,9 +815,9 @@ class AnthropicProvider(ModelProvider):
         omitted_on,
         {},
       )
-    thinking = _thinking_param(model_info, max_tokens)
-    fragments: dict[str, Any] = {"thinking": thinking} if thinking is not None else {}
-    if compat.get("supports_output_config_effort") and effective != ThinkingLevel.NONE:
+    thinking_fragment = _thinking_param(model_info, max_tokens)
+    fragments: dict[str, Any] = {"thinking": thinking_fragment} if thinking_fragment is not None else {}
+    if thinking.effort_control == "output_config" and effective != ThinkingLevel.NONE:
       fragments["output_config"] = {"effort": effective.value}
     return EffortResolution(requested, effective, effective != ThinkingLevel.NONE, fragments)
 
@@ -1006,6 +1027,7 @@ class AnthropicProvider(ModelProvider):
     )
     betas: list[str] = []
     stop_reason = ""
+    stop_details: dict[str, Any] | None = None
     current_block_type: str | None = None
     current_tool_id: str | None = None
     current_tool_name: str | None = None
@@ -1194,6 +1216,8 @@ class AnthropicProvider(ModelProvider):
           if event_type == "message_delta":
             delta = getattr(event, "delta", None)
             stop_reason = str(getattr(delta, "stop_reason", "") or "")
+            raw_stop_details = _to_plain_dict(getattr(delta, "stop_details", None))
+            stop_details = raw_stop_details if isinstance(raw_stop_details, dict) else None
             usage = getattr(event, "usage", None)
             if usage is not None:
               usage_totals = _anthropic_usage_totals(usage)
@@ -1246,7 +1270,7 @@ class AnthropicProvider(ModelProvider):
       log.warning("Anthropic request rejected during stream: %s; %s", detail, context)
       raise RuntimeError(f"Anthropic request rejected (stage=stream): {detail}; {context}") from None
 
-    yield StreamEvent(type="message_end", stop_reason=stop_reason)
+    yield StreamEvent(type="message_end", stop_reason=stop_reason, stop_details=stop_details)
 
   def is_retryable_error(self, exc: Exception) -> bool:
     try:

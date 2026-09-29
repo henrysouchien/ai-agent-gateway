@@ -2,8 +2,8 @@
 /* eslint-disable */
 
 /**
- * Canonical typed selection-refusal code set, generated from the gateway's
- * CapabilityResolutionCode Literal (agent_gateway/capability_binding.py).
+ * Canonical typed selection-refusal code set, generated from the model
+ * authority's CapabilityResolutionCode Literal (model_authority/binding.py).
  * Clients must consume this artifact instead of hand copying the codes.
  */
 export const CAPABILITY_RESOLUTION_CODES = [

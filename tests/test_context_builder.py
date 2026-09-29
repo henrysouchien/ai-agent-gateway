@@ -594,13 +594,9 @@ def test_context_builder_resume_replays_same_model_thinking_with_signature(
   provider = AnthropicProvider()
   normalized = provider.normalize_messages(messages, provider.get_model_info("claude-opus-5"))
 
-  # Logs written before the event recorded `provider` keep converting thinking
-  # to text, because the signature cannot be proven to belong to this model.
-  replayed_thinking = (
-    thinking
-    if provider_recorded
-    else {"type": "text", "text": "[Reasoning summary from claude-opus-5]\nWeigh the guidance."}
-  )
+  # A log written before the event recorded `provider` carries the model id
+  # alone; that id never named another provider, so the signed block replays.
+  replayed_thinking = thinking
   assert normalized == [
     {
       "role": "assistant",

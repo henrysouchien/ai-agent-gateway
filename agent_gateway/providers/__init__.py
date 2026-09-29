@@ -1,14 +1,12 @@
 from types import MappingProxyType
 from typing import Mapping
 
-from ..model_registry import (
-  AdapterRouteSupport,
-  GATEWAY_EXECUTED_CAPABILITY_IDS,
-  INITIAL_MODEL_REGISTRY,
-)
+from model_authority.capabilities import GATEWAY_EXECUTED_CAPABILITY_IDS
+from model_authority.current import INITIAL_MODEL_REGISTRY
+from model_authority.registry import AdapterRouteSupport
 from .agent_sdk import AgentSDKConfig
 from .anthropic import AnthropicProvider
-from .base import CostEstimate, ModelInfo, ModelProvider, StreamEvent, ThinkingLevel, truncate_to_last_compaction
+from .base import CostEstimate, ModelInfo, ModelProvider, StreamEvent, truncate_to_last_compaction
 from .codex import CodexProvider
 from .openai import OpenAIProvider
 from .xai import XAIProvider
@@ -74,7 +72,6 @@ __all__ = [
   "OpenAIProvider",
   "XAIProvider",
   "StreamEvent",
-  "ThinkingLevel",
   "installed_adapter_providers",
   "installed_adapter_route_support",
   "truncate_to_last_compaction",

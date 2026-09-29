@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from agent_gateway.capability_binding import (
+from model_authority.binding import (
   AuthContext,
   CapabilityResolutionError,
   CredentialHandle,
@@ -18,11 +18,8 @@ from agent_gateway.capability_execution import (
   MaterializedCredential,
   derive_batch_capability_execution,
 )
-from agent_gateway.model_registry import (
-  CAPABILITY_IDS,
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
-)
+from model_authority.capabilities import CAPABILITY_IDS
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.providers import ModelInfo, ModelProvider
 from gateway_test_support.model_defaults import SESSION_DRIVER
 

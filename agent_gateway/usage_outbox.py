@@ -17,7 +17,7 @@ from typing import Any, Iterable, Literal
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from jsonschema import Draft202012Validator
-from agent_workflow_contracts import CapabilityBind
+from model_authority.bind import CapabilityBind
 
 from .commercial_contract import canonical_usage_payload_sha256
 

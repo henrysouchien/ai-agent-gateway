@@ -13,25 +13,22 @@ from fastapi import FastAPI, HTTPException
 
 from .agent_session_log import _atomic_write_sidecar
 from .approval_subsystem import build_approval_subsystem
-from .capability_binding import (
-  CAPABILITY_IDS,
+from model_authority.binding import (
   AuthContext,
   CapabilityId,
   CapabilityResolutionError,
   CredentialHandle,
   ModelSelectionIntent,
-  SESSION_DRIVER_CAPABILITY,
   eligible_model_choices,
   resolve_capability_model,
   saved_preference_ineligibility,
 )
+from model_authority.capabilities import CAPABILITY_IDS, SESSION_DRIVER_CAPABILITY
 from .capability_execution import CapabilityExecutionResolver
 from .control_run_lifecycle import coerce_control_run_state
-from .model_registry import (
-  GATEWAY_EXECUTED_CAPABILITY_IDS,
-  ProductModelRegistry,
-  ProductModelSelectionPolicy,
-)
+from model_authority.capabilities import GATEWAY_EXECUTED_CAPABILITY_IDS
+from model_authority.registry import ProductModelRegistry
+from model_authority.selection import ProductModelSelectionPolicy
 from .event_adapter import adapt_event
 from .event_log import EventLog, log_has_terminal
 from .events import DEFAULT_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS

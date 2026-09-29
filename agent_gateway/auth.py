@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Literal, Mapping
 
-from .capability_binding import CredentialPrincipal
-from .model_registry import CAPABILITY_IDS
+from model_authority.binding import CredentialPrincipal
+from model_authority.capabilities import CAPABILITY_IDS
 from .session_capabilities import normalize_session_capabilities
 
 

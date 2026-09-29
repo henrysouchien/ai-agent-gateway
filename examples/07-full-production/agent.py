@@ -10,17 +10,15 @@ from agent_gateway import (
   ApprovalDecision,
   AuthManager,
   ChatRuntime,
-  CredentialHandle,
   GatewayServerConfig,
   GatewaySession,
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
   McpClientManager,
   ToolDispatcher,
   UsageEvent,
   create_gateway_app,
-  load_rate_table,
 )
+from model_authority.binding import CredentialHandle
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY, RATE_TABLES
 from agent_gateway.server import ChatRequest, MaterializedCredential
 
 
@@ -185,8 +183,8 @@ def on_tool_timing(
   )
 
 
-rate_table = load_rate_table()
-provider = AnthropicProvider(rate_table=rate_table)
+provider = AnthropicProvider()
+rate_table = RATE_TABLES["anthropic"]
 mcp_client = McpClientManager(config_path=None)
 AUTH_CONFIG = build_auth_config(rate_table_version=rate_table.version)
 TOOL_DEFINITIONS = report_tool_definitions()

@@ -8,14 +8,14 @@ import pytest
 
 from agent_gateway import AuthConfig, OpenAIProvider, XAIProvider
 from agent_gateway._provider_utils import _resolve_provider, resolve_auth_config
-from agent_gateway.providers.base import ThinkingLevel
+from model_authority.thinking import ThinkingLevel
 from agent_gateway.providers.xai_helpers import _ResponsesStreamState, map_event, resolve_responses_url
 from agent_gateway.providers.xai_oauth import (
   DEFAULT_XAI_OAUTH_CLIENT_ID,
   DEFAULT_XAI_OAUTH_SCOPE,
   save_xai_token_record,
 )
-from agent_gateway.model_registry import INITIAL_MODEL_REGISTRY
+from model_authority.current import INITIAL_MODEL_REGISTRY
 
 
 def test_xai_is_first_class_provider_not_openai_subclass() -> None:
@@ -169,9 +169,8 @@ def test_xai_effort_and_thinking_env_are_not_auth_authority(monkeypatch) -> None
     ("grok-4.5", ThinkingLevel.MEDIUM, ThinkingLevel.MEDIUM, True, {"reasoning": {"effort": "medium"}}),
     ("grok-4.5", ThinkingLevel.HIGH, ThinkingLevel.HIGH, True, {"reasoning": {"effort": "high"}}),
     ("grok-4.5", ThinkingLevel.XHIGH, ThinkingLevel.XHIGH, True, {"reasoning": {"effort": "xhigh"}}),
+    ("grok-4.6", ThinkingLevel.LOW, ThinkingLevel.LOW, True, {"reasoning": {"effort": "low"}}),
     ("grok-4.6", ThinkingLevel.XHIGH, ThinkingLevel.XHIGH, True, {"reasoning": {"effort": "xhigh"}}),
-    ("grok-4.3", ThinkingLevel.NONE, ThinkingLevel.NONE, False, {"reasoning": {"effort": "none"}}),
-    ("grok-4.3-fast", ThinkingLevel.HIGH, ThinkingLevel.HIGH, True, {"reasoning": {"effort": "high"}}),
   ],
 )
 def test_effort_resolution_preserves_supported_effort_exactly(
@@ -197,9 +196,8 @@ def test_effort_resolution_preserves_supported_effort_exactly(
     ("grok-4.5", ThinkingLevel.NONE),
     ("grok-4.5", ThinkingLevel.MINIMAL),
     ("grok-4.5", ThinkingLevel.MAX),
-    ("grok-4.3-fast", ThinkingLevel.MAX),
-    ("grok-build-0.1", ThinkingLevel.HIGH),
-    ("grok-4.20-beta-latest-non-reasoning", ThinkingLevel.HIGH),
+    ("grok-4.6", ThinkingLevel.NONE),
+    ("grok-4.6", ThinkingLevel.MAX),
   ],
 )
 def test_unsupported_effort_is_refused_never_clamped(model, requested) -> None:
@@ -384,17 +382,11 @@ def test_error_event_identifies_xai() -> None:
 @pytest.mark.parametrize(
   ("model_id", "expected_window", "expected_trigger"),
   [
-    # docs.x.ai values (audited 2026-07-21); grok-latest is an undocumented
-    # alias pinned conservatively to grok-4.5's 500k.
     ("grok-4.5", 500_000, 400_000),
-    ("grok-4.5-latest", 500_000, 400_000),
-    ("grok-latest", 500_000, 400_000),
-    ("grok-build-0.1", 256_000, 204_800),
-    ("grok-4.3", 1_000_000, 800_000),
-    ("grok-4.20-beta-latest-reasoning", 1_000_000, 800_000),
+    ("grok-4.6", 500_000, 400_000),
   ],
 )
-def test_xai_windows_match_official_docs(model_id: str, expected_window: int, expected_trigger: int) -> None:
+def test_xai_windows_come_from_the_authority_entry(model_id: str, expected_window: int, expected_trigger: int) -> None:
   from agent_gateway.runner_limits import effective_compaction_trigger
 
   provider = XAIProvider()
@@ -402,6 +394,13 @@ def test_xai_windows_match_official_docs(model_id: str, expected_window: int, ex
 
   assert info.context_window == expected_window
   assert effective_compaction_trigger(160_000, info) == expected_trigger
+
+
+# Aliases and retired ids the authority does not list for xai.responses.
+@pytest.mark.parametrize("model", ["grok-latest", "grok-4.5-latest", "grok-4.3", "gpt-5.6"])
+def test_model_without_an_xai_authority_entry_is_refused(model: str) -> None:
+  with pytest.raises(ValueError, match="admits no xai.responses entry"):
+    XAIProvider().get_model_info(model)
 
 
 def test_xai_reasoning_summary_streams_what_it_persists() -> None:

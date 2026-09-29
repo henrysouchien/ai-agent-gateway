@@ -37,15 +37,10 @@ from agent_gateway.approval_policy import (
 )
 from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.audit_writer import JSONLAuditWriter
-from agent_gateway.capability_binding import (
-  CapabilityBind,
-  CredentialHandle,
-)
-from agent_gateway.model_registry import (
-  CAPABILITY_IDS,
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
-)
+from model_authority.bind import CapabilityBind
+from model_authority.binding import CredentialHandle
+from model_authority.capabilities import CAPABILITY_IDS
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.capability_execution import MaterializedCredential
 from agent_gateway.control_plane import approvals as approvals_module
 from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority

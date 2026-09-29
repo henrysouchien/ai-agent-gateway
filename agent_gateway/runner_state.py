@@ -13,7 +13,7 @@ from .runner_budget import (
   budget_exceeded_state as budget_exceeded_state,
   budget_reason_suffix as budget_reason_suffix,
 )
-from .thinking import parse_effort
+from model_authority.thinking import parse_effort
 
 
 def normalized_run_config(
@@ -806,6 +806,7 @@ class StreamTurnResult:
   full_text: str = ""
   tool_uses: List[Tuple[str, str, Dict[str, Any]]] = field(default_factory=list)
   stop_reason: str | None = None
+  stop_details: Dict[str, Any] | None = None
   first_token_t: float | None = None
   content_blocks: List[Dict[str, Any]] = field(default_factory=list)
   advertised_tool_names: frozenset[str] | None = None

@@ -20,7 +20,6 @@ from agent_workflow_contracts import (
   AgentOperationSnapshot,
   AgentResumeMechanics,
   AttemptRef,
-  CapabilityBind,
   ContractRef,
   ExecuteTaskDisposition,
   LiveToolCapabilityBinding,
@@ -34,6 +33,7 @@ from agent_workflow_contracts import (
   WorkspaceGrant,
   sha256_digest,
 )
+from model_authority.bind import CapabilityBind
 
 from agent_gateway.sub_agent import seal_admitted_task_payload
 
@@ -100,7 +100,7 @@ def sealed_admitted_task(
     capability_id="node.explore",
     model_key="anthropic.test-sonnet",
     provider="anthropic",
-    upstream_model="claude-sonnet-4-6",
+    upstream_model="claude-sonnet-5",
     adapter="anthropic.messages",
     protocol_profile="messages.adaptive",
     route="anthropic.public",

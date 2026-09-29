@@ -25,7 +25,7 @@ from .control_plane.manifest_helpers import write_v6_manifest
 from gateway_test_support.control_plane_identity import fake_identity_resolver, fake_mcp_user_key_lookup
 
 if TYPE_CHECKING:
-  from agent_gateway.capability_binding import RunMode
+  from model_authority.binding import RunMode
   from agent_gateway.autonomous_runner import AutonomousRegistry
   from agent_gateway.skill_limits import AutonomousSkillAdmissionPolicyResolver
 
@@ -46,11 +46,8 @@ CLAIM_ENV_KEYS = {
 
 
 def _test_capability_bind(run_mode: RunMode):
-  from agent_gateway.capability_binding import CapabilityBind
-  from agent_gateway.model_registry import (
-    INITIAL_MODEL_REGISTRY,
-    INITIAL_MODEL_SELECTION_POLICY,
-  )
+  from model_authority.bind import CapabilityBind
+  from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 
   entry = INITIAL_MODEL_REGISTRY.require("anthropic.claude-opus-5")
   handle = _test_service_credential_handle()
@@ -75,7 +72,7 @@ def _test_capability_bind(run_mode: RunMode):
 
 
 def _test_service_credential_handle():
-  from agent_gateway.capability_binding import CredentialHandle
+  from model_authority.binding import CredentialHandle
 
   return CredentialHandle(
     handle_id="service:autonomous-runner-tests:anthropic",
@@ -687,7 +684,7 @@ def _run_real_owned_sentinel_output_canary(
   from agent_gateway.autonomous_runner_start import (
     _OWNED_PROCESS_SENTINEL_SOURCE,
   )
-  from agent_gateway.capability_binding import CredentialHandle
+  from model_authority.binding import CredentialHandle
   from agent_gateway.capability_execution import MaterializedCredential
 
   secret = "CUSTOM-ACTIVE-CREDENTIAL-autonomous-output-8f21d7"

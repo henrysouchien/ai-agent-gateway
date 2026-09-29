@@ -5,7 +5,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Sequence
 
-from agent_workflow_contracts import CapabilityBind
+from model_authority.bind import CapabilityBind
 
 FORK_SCOPE_RECEIPT_VERSION = "2"
 SIDE_QUEST_FORK_KIND = "side_quest"

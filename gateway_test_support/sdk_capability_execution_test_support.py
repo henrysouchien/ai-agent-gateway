@@ -12,7 +12,7 @@ def stub_sdk_capability_execution(
   *,
   capability_id: str = "session.driver",
   provider: str = "anthropic",
-  model: str = "claude-sonnet-4-6",
+  model: str = "claude-sonnet-5",
   effort: str = "none",
   auth_mode: str = "api",
   api_key: str = "test-secret",
@@ -25,7 +25,7 @@ def stub_sdk_capability_execution(
     default_model=model,
     default_effort=effort,
     default_adapter="anthropic.agent_sdk",
-    default_protocol_profile="agent_sdk.session",
+    default_protocol_profile="messages.adaptive",
   )
   execution = resolver.resolve(capability_id)
   return replace(

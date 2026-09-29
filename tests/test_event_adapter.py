@@ -9,10 +9,11 @@ from agent_gateway.event_adapter import (
   V1Adapter,
   adapt_event,
 )
+from agent_gateway.runner_session_events import REFUSAL_GUIDANCE, build_refusal_event
 
 
 def test_v1_wire_projection_covers_every_v1_type() -> None:
-  assert len(V1_WIRE_EVENT_TYPES) == 42
+  assert len(V1_WIRE_EVENT_TYPES) == 43
   assert V1_WIRE_EVENT_TYPES
   assert set(V1_FIELD_PROJECTION) == set(V1_WIRE_EVENT_TYPES)
   assert all("type" in fields for fields in V1_FIELD_PROJECTION.values())
@@ -326,6 +327,28 @@ def test_v1_adapter_keeps_stream_guard_heartbeat_payload() -> None:
     "events": 2,
   }
 
+
+def test_v1_adapter_projects_refusal_notice_from_provider_stop_details() -> None:
+  event = build_refusal_event(
+    {
+      "type": "refusal",
+      "category": "reasoning_extraction",
+      "explanation": "The request asks for internal reasoning.",
+    }
+  )
+
+  assert V1Adapter().transform({**event, "future_only": "strip-me"}) == {
+    "type": "refusal",
+    "category": "reasoning_extraction",
+    "explanation": "The request asks for internal reasoning.",
+    "guidance": REFUSAL_GUIDANCE,
+  }
+  assert V1Adapter().transform(build_refusal_event(None)) == {
+    "type": "refusal",
+    "category": None,
+    "explanation": None,
+    "guidance": REFUSAL_GUIDANCE,
+  }
 
 
 def test_v1_adapter_strips_unknown_fields_for_known_type() -> None:

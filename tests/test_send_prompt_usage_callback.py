@@ -14,19 +14,12 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.capability_binding import (
-  CapabilityBind,
-  CapabilityResolutionError,
-)
+from model_authority.bind import CapabilityBind
+from model_authority.binding import CapabilityResolutionError
 from agent_gateway.capability_execution import BoundCapabilityExecution
 from agent_gateway.multi_user.billing import UsageEvent
-from agent_gateway.providers import (
-  CostEstimate,
-  ModelInfo,
-  ModelProvider,
-  StreamEvent,
-  ThinkingLevel,
-)
+from agent_gateway.providers import CostEstimate, ModelInfo, ModelProvider, StreamEvent
+from model_authority.thinking import ThinkingLevel
 from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
 from agent_gateway.send_prompt import _call_usage_callback
 

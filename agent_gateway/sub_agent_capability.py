@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from types import MappingProxyType
 
-from .capability_binding import CapabilityId
+from model_authority.binding import CapabilityId
 
 
 DELEGATION_ROLE_CAPABILITIES = MappingProxyType({

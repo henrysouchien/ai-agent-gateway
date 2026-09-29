@@ -3,35 +3,32 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from dataclasses import replace
 from typing import Any, AsyncGenerator, Dict
 from urllib.parse import urlparse
 
-from ..model_registry import AdapterRouteSupport
-from ..rates import RateTable, UnknownModelError, load_provider_rate_table
-from ..thinking import EffortResolution, clamp_effort
+from model_authority.registry import AdapterRouteSupport
+from model_authority.rates import RateTable
+from model_authority.thinking import EffortResolution, ThinkingLevel, clamp_effort
 from .base import (
   ModelInfo,
   ModelProvider,
   StreamEvent,
-  ThinkingLevel,
-  registry_effort_values,
-  registry_entry_for_model,
+  authority_rate_table,
   truncate_to_last_compaction,
 )
 from .openai_responses_helpers import (
-  _MODEL_INFO_BY_TAG,
   _ResponsesStreamState,
   _convert_messages,
   convert_openai_response_tools,
   _is_tool_result_message,
-  _model_matches_tag,
   _normalize_tool_call_id,
-  _responses_compat,
   _same_model_message,
   _synthetic_tool_result,
   _system_prompt_text,
   map_event,
+  reasoning_effort_fragment,
+  responses_compat,
+  responses_model_info,
 )
 
 log = logging.getLogger(__name__)
@@ -127,7 +124,7 @@ class OpenAIProvider(ModelProvider):
     )
 
   def __init__(self, *, rate_table: RateTable | None = None) -> None:
-    self._rate_table = load_provider_rate_table(self.name, rate_table)
+    self._rate_table = authority_rate_table(self.name, rate_table)
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
     if str(config.get("auth_mode", "api")).strip().lower() == "oauth":
@@ -176,50 +173,7 @@ class OpenAIProvider(ModelProvider):
       pass
 
   def get_model_info(self, model: str) -> ModelInfo:
-    model_id = str(model or "").strip()
-    if not model_id:
-      raise ValueError("Model is required")
-    for tags, info in sorted(_MODEL_INFO_BY_TAG, key=lambda row: max(map(len, row[0])), reverse=True):
-      if any(_model_matches_tag(model_id, tag) for tag in tags):
-        model_info = replace(info, id=model_id)
-        break
-    else:
-      entry = registry_entry_for_model(self.name, model_id)
-      if entry is None:
-        raise ValueError(
-          f"the product model registry does not admit OpenAI model {model_id!r}"
-        )
-      efforts = registry_effort_values(entry)
-      reasoning = tuple(value for value in efforts if value != "none")
-      supports_tools = "tools" in entry.features
-      model_info = ModelInfo(
-        id=model_id,
-        provider=self.name,
-        supports_thinking=bool(reasoning),
-        supports_vision="vision" in entry.features,
-        supports_tool_use=supports_tools,
-        compat=_responses_compat(
-          effort_values=efforts if reasoning else (),
-          effort_default=entry.default_effort,
-          summary=bool(reasoning),
-          function_tools=supports_tools,
-        ),
-      )
-    try:
-      rates = self._rate_table.lookup(self.name, model_id)
-    except UnknownModelError:
-      log.warning("OpenAI model %r has no rate row; using zero-cost estimates", model_id)
-      return model_info
-    return replace(
-      model_info,
-      context_window=rates.context_window or model_info.context_window,
-      max_output_tokens=rates.max_tokens or model_info.max_output_tokens,
-      input_cost_per_mtok=rates.input_cost_per_mtok,
-      output_cost_per_mtok=rates.output_cost_per_mtok,
-      cache_read_cost_per_mtok=rates.cache_read_cost_per_mtok,
-      cache_write_cost_per_mtok=rates.cache_write_cost_per_mtok,
-      rate_tiers=rates.tiers,
-    )
+    return responses_model_info(self.adapter_route_support(), model, self._rate_table)
 
   def resolve_effort(
     self,
@@ -231,10 +185,10 @@ class OpenAIProvider(ModelProvider):
     **request_context: Any,
   ) -> EffortResolution:
     del model, max_tokens, request_context
-    compat = dict(model_info.compat or {})
-    if not model_info.supports_thinking or not compat.get("supportsReasoningEffort"):
+    compat = responses_compat(model_info)
+    if not model_info.supports_thinking or not compat.reasoning_control.values:
       return EffortResolution(requested, ThinkingLevel.NONE, False, {})
-    supported = tuple(ThinkingLevel(str(value)) for value in compat.get("reasoningEffortValues") or ())
+    supported = tuple(ThinkingLevel(value) for value in compat.reasoning_control.values)
     normalized = requested
     if requested == ThinkingLevel.MINIMAL and ThinkingLevel.MINIMAL not in supported:
       normalized = ThinkingLevel.LOW
@@ -243,7 +197,7 @@ class OpenAIProvider(ModelProvider):
       requested=requested,
       effective=effective,
       thinking_enabled_effective=effective != ThinkingLevel.NONE,
-      payload_fragments={"reasoning": {"effort": effective.value}},
+      payload_fragments=reasoning_effort_fragment(compat, effective.value),
     )
 
   def normalize_messages(self, messages: list[dict[str, Any]], model_info: ModelInfo) -> list[dict[str, Any]]:
@@ -346,8 +300,8 @@ class OpenAIProvider(ModelProvider):
     **kwargs: Any,
   ) -> dict[str, Any]:
     model_info = self.get_model_info(model)
-    compat = dict(model_info.compat or {})
-    if tools and not compat.get("supportsResponsesFunctionTools"):
+    compat = responses_compat(model_info)
+    if tools and not compat.function_tools:
       raise ValueError(f"OpenAI model {model!r} does not support Responses function tools")
     normalized_messages = self.normalize_messages(messages, model_info)
     params: dict[str, Any] = {
@@ -371,7 +325,7 @@ class OpenAIProvider(ModelProvider):
     reasoning = resolution.payload_fragments.get("reasoning")
     if isinstance(reasoning, dict):
       params["reasoning"] = dict(reasoning)
-      if resolution.effective != ThinkingLevel.NONE and compat.get("supportsResponsesReasoningSummary"):
+      if resolution.effective != ThinkingLevel.NONE and compat.reasoning_summary:
         params["reasoning"]["summary"] = "auto"
     return params
 

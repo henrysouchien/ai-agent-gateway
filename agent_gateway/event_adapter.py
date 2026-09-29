@@ -35,6 +35,7 @@ V1_WIRE_EVENT_TYPES: frozenset[str] = frozenset(
     "max_turns_reached",
     "budget_exceeded",
     "runtime_guard",
+    "refusal",
     "operator_pause",
     "citation_validation",
     "heartbeat",
@@ -113,6 +114,7 @@ V1_FIELD_PROJECTION: dict[str, frozenset[str]] = {
   "max_turns_reached": _fields("turn_count", "max_turns"),
   "budget_exceeded": _fields("total_cost", "budget"),
   "runtime_guard": _fields("guard", "message"),
+  "refusal": _fields("category", "explanation", "guidance"),
   "operator_pause": _fields("reason", "safe_boundary"),
   "citation_validation": _fields(
     "schema_version",

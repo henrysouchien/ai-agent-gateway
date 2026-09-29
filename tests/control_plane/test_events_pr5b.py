@@ -23,15 +23,10 @@ from agent_gateway.autonomous_event_channel import (
 from agent_gateway.autonomous_launch_envelope import (
   AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
 )
-from agent_gateway.capability_binding import (
-  CapabilityBind,
-  CredentialHandle,
-)
-from agent_gateway.model_registry import (
-  CAPABILITY_IDS,
-  INITIAL_MODEL_REGISTRY,
-  INITIAL_MODEL_SELECTION_POLICY,
-)
+from model_authority.bind import CapabilityBind
+from model_authority.binding import CredentialHandle
+from model_authority.capabilities import CAPABILITY_IDS
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
 from agent_gateway.control_plane import events as events_module
 from agent_gateway.control_plane.events import (

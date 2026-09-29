@@ -18,12 +18,10 @@ from agent_workflow_contracts import (
   sha256_digest,
 )
 
+from agent_gateway import runner_sub_agents
 from agent_gateway.mcp_activation import McpActivationFold
-from agent_gateway.capability_binding import (
-  CapabilityBind,
-  CredentialHandle,
-  CredentialPrincipal,
-)
+from model_authority.bind import CapabilityBind
+from model_authority.binding import CredentialHandle, CredentialPrincipal
 from agent_gateway.capability_execution import BoundCapabilityExecution
 from agent_gateway.event_log import EventLog
 from agent_gateway.execution_identity import resolved_execution_identity
@@ -47,7 +45,9 @@ from agent_gateway.runner_fork_agents import (
   spawn_fork_agent,
 )
 from agent_gateway.providers import ModelInfo, ModelProvider
-from agent_gateway.model_registry import ModelRegistryEntry, ProductModelRegistry
+from model_authority.registry import ModelRegistryEntry, ProductModelRegistry
+from model_authority.schema import SCHEMA
+from gateway_test_support.model_defaults import compat_for_profile
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.tool_dispatcher import ToolDispatcher
 from agent_gateway.runner_sub_agents import (
@@ -67,7 +67,7 @@ def _bind() -> CapabilityBind:
     capability_id="session.driver",
     model_key="anthropic.test-sonnet",
     provider="anthropic",
-    upstream_model="claude-sonnet-4-6",
+    upstream_model="claude-sonnet-5",
     adapter="anthropic.messages",
     protocol_profile="messages.adaptive",
     route="anthropic.public",
@@ -83,7 +83,7 @@ def _bind() -> CapabilityBind:
 
 def _registry_for_bind(bind: CapabilityBind) -> ProductModelRegistry:
   return ProductModelRegistry(
-    schema="product-model-registry/v1",
+    schema=SCHEMA,
     revision=bind.registry_revision,
     models={
       bind.model_key: ModelRegistryEntry(
@@ -93,6 +93,7 @@ def _registry_for_bind(bind: CapabilityBind) -> ProductModelRegistry:
         upstream_model=bind.upstream_model,
         adapter=bind.adapter,
         protocol_profile=bind.protocol_profile,
+        compat=compat_for_profile(bind.protocol_profile),
         route=bind.route,
         lifecycle="active",
         capabilities={
@@ -446,7 +447,7 @@ def test_fork_marker_stays_pinned_across_multi_turn_requests() -> None:
     },
   ]
   first = provider.build_request_params(
-    model="claude-sonnet-4-6",
+    model="claude-sonnet-5",
     messages=messages,
     system_prompt=[("static", True), ("dynamic", True)],
     tools=[],
@@ -465,7 +466,7 @@ def test_fork_marker_stays_pinned_across_multi_turn_requests() -> None:
     },
   ])
   second = provider.build_request_params(
-    model="claude-sonnet-4-6",
+    model="claude-sonnet-5",
     messages=messages,
     system_prompt=[("static", True), ("dynamic", True)],
     tools=[],
@@ -484,14 +485,14 @@ def test_fork_marker_normalizes_bare_string_like_parent_request() -> None:
     {"role": "user", "content": "What is my portfolio risk?"},
   ]
   parent = provider.build_request_params(
-    model="claude-sonnet-4-6",
+    model="claude-sonnet-5",
     messages=parent_messages,
     system_prompt=[("static", True), ("dynamic", True)],
     tools=[],
     max_tokens=4096,
   )
   fork = provider.build_request_params(
-    model="claude-sonnet-4-6",
+    model="claude-sonnet-5",
     messages=[
       *parent_messages,
       {
@@ -611,7 +612,7 @@ def test_spawn_fork_reuses_resume_seed_and_fresh_tagged_log(
     capability_id="node.fork",
     model_key="anthropic.test-sonnet",
     provider="anthropic",
-    upstream_model="claude-sonnet-4-6",
+    upstream_model="claude-sonnet-5",
     adapter="anthropic.messages",
     protocol_profile="messages.adaptive",
     route="anthropic.public",
@@ -748,7 +749,7 @@ def test_fork_settlement_derives_the_outcome_from_admitted_authority(
     capability_id="node.fork",
     model_key="anthropic.test-sonnet",
     provider="anthropic",
-    upstream_model="claude-sonnet-4-6",
+    upstream_model="claude-sonnet-5",
     adapter="anthropic.messages",
     protocol_profile="messages.adaptive",
     route="anthropic.public",
@@ -851,6 +852,174 @@ def test_fork_settlement_derives_the_outcome_from_admitted_authority(
   # ``web_search``; its only retrieval failed.
   assert result.outcome.disposition == "insufficient_evidence"
   assert result.outcome.unmet_requirements == (SOURCE_TOOL_ID,)
+
+
+class _WedgedForkRunner(_SpawnRunner):
+  """A fork whose inner await never resolves and that emits nothing."""
+
+  cancelled = False
+
+  async def run(self, **_kwargs: Any) -> None:
+    try:
+      await asyncio.Event().wait()
+    except asyncio.CancelledError:
+      self.cancelled = True
+      raise
+
+
+class _HeartbeatForkRunner(_SpawnRunner):
+  """A live fork whose only events, past the gap, are stream heartbeats."""
+
+  cancelled = False
+
+  async def run(self, **kwargs: Any) -> None:
+    try:
+      for _ in range(10):
+        await asyncio.sleep(0.02)
+        self._log.append({
+          "type": "heartbeat",
+          "elapsed_s": 0,
+          "last_progress_s": 0,
+          "events": 1,
+        })
+    except asyncio.CancelledError:
+      self.cancelled = True
+      raise
+    await super().run(**kwargs)
+
+
+def _spawn_minimal_fork(tmp_path, cls: type[_SpawnRunner]) -> TaskResult:
+  _SpawnRunner.children.clear()
+  parent = _fork_parent(tmp_path, cls=cls)
+  execution_bind = CapabilityBind(
+    schema_version="1.0",
+    capability_id="node.fork",
+    model_key="anthropic.test-sonnet",
+    provider="anthropic",
+    upstream_model="claude-sonnet-5",
+    adapter="anthropic.messages",
+    protocol_profile="messages.adaptive",
+    route="anthropic.public",
+    effort="high",
+    credential_principal="user",
+    credential_ref="credential-1",
+    run_mode="interactive",
+    registry_revision="registry-1",
+    policy_revision="policy-1",
+    selection_source="parent_binding",
+  )
+  execution = BoundCapabilityExecution(
+    bind=execution_bind,
+    registry=_registry_for_bind(execution_bind),
+    adapter=_Provider(),
+    auth_config={"api_key": "secret", "provider": "anthropic"},
+  )
+  handoff = build_mid_turn_handoff(
+    _runner(),
+    [
+      {"role": "user", "content": [{"type": "text", "text": "parent"}]},
+      _assistant("fork-1"),
+    ],
+  )
+  parent._capability_execution = SimpleNamespace(bind=handoff.capability_bind)
+  receipt = fork_scope_receipt_dict(
+    tool_decisions=(
+      ForkToolDecision("read_data", "allow", "parent surface"),
+      ForkToolDecision("run_agent", "deny", "orchestration surface"),
+    ),
+    capability_bind=execution.bind,
+    tenant_id=handoff.tenant_id,
+    billing_mode=handoff.billing_mode,
+    resolved_budget_usd=5.0,
+    max_turns=20,
+    suffix_ceiling=20_000,
+  )
+  operation = AgentOperationRef(
+    namespace="agent-operation",
+    name="test-fork",
+    version="1.0",
+    digest=sha256_digest({"operation": "test-fork"}),
+  )
+  digest = sha256_digest({"task": "test-fork"})
+  result, error = asyncio.run(asyncio.wait_for(
+    spawn_fork_agent(
+      parent,
+      "finish the side quest",
+      handoff=handoff,
+      capability_execution=execution,
+      logical_task=OrdinaryDelegationTaskRef(
+        delegation_id="test-fork-1",
+        operation=operation,
+      ),
+      attempt=AttemptRef(
+        attempt_number=1,
+        attempt_id="attempt:test-fork:1",
+        physical_task_id="sub0:parent-session",
+      ),
+      result_requirement=ResultRequirement(
+        mode="narrative",
+        terminal_narrative="required",
+        outcome=OutcomeRequirement(required=False, source="none"),
+      ),
+      result_provenance=TaskResultProvenance(
+        admitted_task_digest=digest,
+        model_bind_digest=digest,
+        capability_binding_digest=digest,
+        tool_grant_digest=digest,
+      ),
+      dispatcher=_Dispatcher(handoff.wire_tools),
+      scope_receipt=receipt,
+      max_turns=20,
+      max_budget_usd=5.0,
+      suffix_ceiling=20_000,
+    ),
+    # Far past the patched gap: a fork the guard does not reach fails here
+    # instead of hanging the suite.
+    timeout=2.0,
+  ))
+  assert error is None
+  assert isinstance(result, TaskResult)
+  return result
+
+
+@pytest.fixture
+def _short_activity_gap(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(runner_sub_agents, "SUB_AGENT_ACTIVITY_GAP", 0.05)
+  monkeypatch.setattr(runner_sub_agents, "STREAM_GUARD_POLL_INTERVAL", 0.01)
+
+
+@pytest.mark.usefixtures("_short_activity_gap")
+def test_wedged_fork_is_settled_stalled_by_the_activity_guard(
+  tmp_path,
+) -> None:
+  # ACUI-1 for forks: an await outside stream and tool, no event, no clock.
+  # The parent's activity guard, not elapsed time, is what ends it.
+  result = _spawn_minimal_fork(tmp_path, _WedgedForkRunner)
+
+  child = _SpawnRunner.children[-1]
+  assert isinstance(child, _WedgedForkRunner)
+  assert child.cancelled is True
+  assert result.execution.status == "interrupted"
+  assert result.execution.terminal_reason is not None
+  assert result.execution.terminal_reason.startswith(
+    "stalled: Forked sub-agent stalled: no activity for"
+  )
+  errors = [
+    entry.event
+    for entry in child._log.entries
+    if entry.event.get("type") == "error"
+  ]
+  assert [event.get("error_sub_code") for event in errors] == ["stalled"]
+
+
+@pytest.mark.usefixtures("_short_activity_gap")
+def test_live_fork_outlasts_the_activity_gap(tmp_path) -> None:
+  result = _spawn_minimal_fork(tmp_path, _HeartbeatForkRunner)
+
+  child = _SpawnRunner.children[-1]
+  assert isinstance(child, _HeartbeatForkRunner)
+  assert child.cancelled is False
+  assert result.execution.status == "succeeded"
 
 
 def test_dynamic_fork_bind_inherits_exact_parent_selection() -> None:

@@ -22,9 +22,13 @@ UNSET: Final[McpConfigPathUnset] = _McpConfigPathUnset.TOKEN
 ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 STREAMABLE_HTTP_TYPES = {"streamable-http", "streamable_http", "http", "streamable"}
 SUPPORTED_SERVER_TYPES = {"stdio"} | STREAMABLE_HTTP_TYPES
+# HANK_MODEL_AUTHORITY_DIR: a stdio child that imports the model authority
+# (Risk and Investment servers through agent_gateway.providers) must load the
+# directory its parent loaded, not its own packaged copy.
 DEFAULT_ENV_ALLOWLIST = {
   "PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "USER",
   "PYTHONNOUSERSITE", "PYTHONDONTWRITEBYTECODE", "NODE_PATH",
+  "HANK_MODEL_AUTHORITY_DIR",
 }
 MCP_STDIO_CONNECT_RETRIES_ENV = "MCP_STDIO_CONNECT_RETRIES"
 MCP_STDIO_CONNECT_BACKOFF_ENV = "MCP_STDIO_CONNECT_BACKOFF_S"
