@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.21.1 (2026-09-29)
+
+### Changed
+
+- Requires `hank-model-authority>=1.2,<2` (schema `model-authority/2.1`).
+- The Anthropic adapter turns thinking off with the entry's
+  `compat.thinking.off_value`: at effort `none`, a non-null off value yields
+  `{"thinking": {"type": <off_value>}}` alone (no `display`, no
+  `output_config`) — `disabled` for Sonnet 5, `between_tools` for an entry
+  that names it (Claude Sonnet 5.5 refuses `disabled`) — and no thinking field
+  when the off value is null.
+- `compat.tool_choice_forcing` controls lone-tool forcing: `any` always forces,
+  `thinking_off_only` forces only when thinking is off, and `never` sends auto.
+  Multiple offered tools use auto.
+
 ## 0.21.0 (2026-09-29)
 
 ### Changed

@@ -68,9 +68,9 @@ deploy of that directory:
 - [ ] **Check** — every host venv that loads the authority admits the
   candidate: `<venv>/bin/python3 -m model_authority check <dir>`
 - [ ] **Deploy** — put the directory where the units' `HANK_MODEL_AUTHORITY_DIR`
-  points and restart the units that load it (`scripts/deploy_model_authority.sh`
-  is the host deploy for this step and is not in the tree yet; a unit with the
-  variable unset runs the packaged copy of its installed `hank-model-authority`)
+  points and restart the units that load it: `scripts/deploy_model_authority.sh`
+  (runbook `docs/runbooks/model-authority-deploy.md`); a unit with the
+  variable unset runs the packaged copy of its installed `hank-model-authority`
 - [ ] **Observe** — each service's health reports the new `model_authority`
   revision and sha256; the gateway's is `/api/health/ready`
 
@@ -99,6 +99,10 @@ is a minor; a removal or redefinition is a major) or a capability change is a
 - [ ] **Write truthful release notes** — categorize the complete public delta,
   call out breaking changes and executable migrations, and retain explicit
   validation qualifications and operational residuals
+- [ ] **Publish `hank-model-authority` first** when the gateway's
+  `hank-model-authority` range needs a version PyPI does not serve yet
+  (`scripts/publish_model_authority.sh --yes`): the gateway publisher pushes
+  the dist sync before its wheel smoke, which installs that dependency from PyPI
 - [ ] **Run the publisher** — `scripts/publish_agent_gateway.sh --yes`; the
   optional `--minor` or `--major` flag only selects the suggested next version
   when the source-owned version is already present on PyPI

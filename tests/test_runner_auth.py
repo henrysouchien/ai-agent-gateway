@@ -92,7 +92,12 @@ class _PooledAnthropicProvider(AnthropicProvider):
     _ = client, timeout
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name, max_output_tokens=4096)
+    from gateway_test_support.model_defaults import compat_for_profile
+
+    return ModelInfo(
+      id=model, provider=self.name, max_output_tokens=4096,
+      compat=compat_for_profile("messages.standard"),
+    )
 
   def build_request_params(
     self,

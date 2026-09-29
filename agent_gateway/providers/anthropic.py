@@ -740,6 +740,16 @@ class AnthropicProvider(ModelProvider):
         auth_mode=auth_mode,
       )
     params.update(effort_resolution.payload_fragments)
+    if prepared_tools:
+      forcing = _messages_compat(model_info).tool_choice_forcing
+      may_force = forcing == "any" or (
+        forcing == "thinking_off_only" and not effort_resolution.thinking_enabled_effective
+      )
+      params["tool_choice"] = (
+        {"type": "tool", "name": prepared_tools[0]["name"]}
+        if len(prepared_tools) == 1 and may_force
+        else {"type": "auto"}
+      )
 
     compaction_trigger = kwargs.get("compaction_trigger")
     if compaction_trigger is not None and model_info.supports_native_compaction:
@@ -778,12 +788,21 @@ class AnthropicProvider(ModelProvider):
     **request_context: Any,
   ) -> EffortResolution:
     del model, request_context
+    thinking = _messages_compat(model_info).thinking
+    default_effort = ThinkingLevel(thinking.effort_when_omitted)
+    omitted_on = thinking.default_when_omitted == "on"
+    if requested == ThinkingLevel.NONE:
+      if thinking.off_value is not None:
+        return EffortResolution(
+          requested, ThinkingLevel.NONE, False, {"thinking": {"type": thinking.off_value}},
+        )
+      return EffortResolution(
+        requested, default_effort if omitted_on else ThinkingLevel.NONE, omitted_on, {},
+      )
     if not model_info.supports_thinking or model_info.thinking_mode == "none":
       return EffortResolution(requested, ThinkingLevel.NONE, False, {})
 
     if model_info.thinking_mode == "budget":
-      if requested == ThinkingLevel.NONE:
-        return EffortResolution(requested, ThinkingLevel.NONE, False, {})
       budget = _thinking_param(model_info, max_tokens)
       return EffortResolution(
         requested,
@@ -792,19 +811,10 @@ class AnthropicProvider(ModelProvider):
         {"thinking": budget} if budget is not None else {},
       )
 
-    thinking = _messages_compat(model_info).thinking
-    default_effort = ThinkingLevel(thinking.effort_when_omitted)
-    omitted_on = thinking.default_when_omitted == "on"
     supported = tuple(
       ThinkingLevel(value) for value in model_info.effort_values if value != ThinkingLevel.NONE.value
     )
 
-    if requested == ThinkingLevel.NONE:
-      if not thinking.can_disable:
-        return EffortResolution(requested, default_effort, True, {})
-      if omitted_on:
-        return EffortResolution(requested, ThinkingLevel.NONE, False, {"thinking": {"type": "disabled"}})
-      return EffortResolution(requested, ThinkingLevel.NONE, False, {})
 
     normalized = ThinkingLevel.LOW if requested == ThinkingLevel.MINIMAL else requested
     effective = clamp_effort(normalized, supported) if supported else ThinkingLevel.NONE

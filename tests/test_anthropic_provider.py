@@ -832,6 +832,143 @@ def test_opus5_resolved_effort_emits_complete_payload_pair(
     assert params["output_config"] == expected_output_config
 
 
+def _sonnet_5_5_registry(monkeypatch) -> None:
+  # Claude Sonnet 5.5 as model-authority/2.1 data, from the 2026-09-29 live
+  # probes: thinking disabled is a 400 and between_tools is the lowest
+  # setting; forced tool_choice is a 400 under every thinking setting.
+  from model_authority.registry import ModelRegistryEntry, ProductModelRegistry
+  from model_authority.schema import SCHEMA, AnthropicMessagesCompat, AnthropicThinking
+  import agent_gateway.providers.base as provider_base
+
+  entry = ModelRegistryEntry(
+    key="anthropic.claude-sonnet-5-5",
+    label="Sonnet 5.5",
+    provider="anthropic",
+    upstream_model="claude-sonnet-5-5",
+    adapter="anthropic.messages",
+    protocol_profile="messages.adaptive",
+    route="anthropic.public",
+    lifecycle="active",
+    capabilities={"session.driver": "user_selectable"},
+    supported_efforts=frozenset({"none", "low", "medium", "high", "xhigh", "max"}),
+    default_effort="high",
+    features=frozenset({"tools", "streaming"}),
+    reported_identities=frozenset({"claude-sonnet-5-5"}),
+    compat=AnthropicMessagesCompat(
+      accepts_temperature=False,
+      thinking=AnthropicThinking(
+        default_when_omitted="on",
+        can_disable=False,
+        effort_control="output_config",
+        effort_when_omitted="high",
+        off_value="between_tools",
+      ),
+      forced_tool_choice_requires_thinking_off=True,
+      tool_choice_forcing="never",
+      native_compaction=True,
+      max_output_tokens=128_000,
+      context_window=1_000_000,
+    ),
+  )
+  monkeypatch.setattr(
+    provider_base,
+    "INITIAL_MODEL_REGISTRY",
+    ProductModelRegistry(schema=SCHEMA, revision="test", models={entry.key: entry}),
+  )
+
+
+@pytest.mark.parametrize(
+  ("model", "requested", "expected_thinking", "expected_output_config", "effective"),
+  [
+    # Sonnet 5 accepts thinking disabled (probe: 200).
+    ("claude-sonnet-5", ThinkingLevel.NONE, {"type": "disabled"}, None, ThinkingLevel.NONE),
+    # Opus 5.5 cannot be turned off: none runs its default (medium).
+    ("claude-opus-5-5", ThinkingLevel.NONE, None, None, ThinkingLevel.MEDIUM),
+    # Sonnet 5.5: between_tools alone (with display or effort xhigh/max: 400).
+    ("claude-sonnet-5-5", ThinkingLevel.NONE, {"type": "between_tools"}, None, ThinkingLevel.NONE),
+    (
+      "claude-sonnet-5-5",
+      ThinkingLevel.XHIGH,
+      {"type": "adaptive", "display": "summarized"},
+      {"effort": "xhigh"},
+      ThinkingLevel.XHIGH,
+    ),
+  ],
+)
+def test_effort_payload_follows_the_entry_off_value(
+  monkeypatch,
+  model: str,
+  requested: ThinkingLevel,
+  expected_thinking: dict[str, str] | None,
+  expected_output_config: dict[str, str] | None,
+  effective: ThinkingLevel,
+) -> None:
+  if model == "claude-sonnet-5-5":
+    _sonnet_5_5_registry(monkeypatch)
+  provider = AnthropicProvider()
+  info = provider.get_model_info(model)
+  resolution = provider.resolve_effort(requested=requested, model=model, model_info=info, max_tokens=4096)
+
+  params = provider.build_request_params(
+    model=model,
+    messages=[],
+    system_prompt=None,
+    tools=[{"name": "submit", "description": "d", "input_schema": {"type": "object"}}],
+    max_tokens=4096,
+    thinking_level=requested,
+    effort_resolution=resolution,
+  )
+
+  assert resolution.effective == effective
+  assert params.get("thinking") == expected_thinking
+  assert params.get("output_config") == expected_output_config
+  assert params["tool_choice"] == (
+    {"type": "tool", "name": "submit"} if model == "claude-sonnet-5" else {"type": "auto"}
+  )
+
+
+@pytest.mark.parametrize(
+  ("forcing", "requested", "tool_count", "expected"),
+  [
+    ("any", ThinkingLevel.HIGH, 1, {"type": "tool", "name": "submit"}),
+    ("thinking_off_only", ThinkingLevel.NONE, 1, {"type": "tool", "name": "submit"}),
+    ("thinking_off_only", ThinkingLevel.HIGH, 1, {"type": "auto"}),
+    ("never", ThinkingLevel.NONE, 1, {"type": "auto"}),
+    ("any", ThinkingLevel.NONE, 2, {"type": "auto"}),
+  ],
+)
+def test_tool_forcing_follows_compat_and_effective_thinking(
+  monkeypatch, forcing, requested, tool_count, expected,
+) -> None:
+  from dataclasses import replace
+  from model_authority.registry import ProductModelRegistry
+  from model_authority.schema import SCHEMA, AnthropicMessagesCompat
+  import agent_gateway.providers.base as provider_base
+
+  entry = _registry_entry("output_config")
+  data = entry.compat.model_dump()
+  data["thinking"].update(default_when_omitted="off", can_disable=True, off_value="disabled")
+  data.update(tool_choice_forcing=forcing, forced_tool_choice_requires_thinking_off=forcing != "any")
+  entry = replace(entry, compat=AnthropicMessagesCompat.model_validate(data))
+  monkeypatch.setattr(
+    provider_base, "INITIAL_MODEL_REGISTRY",
+    ProductModelRegistry(schema=SCHEMA, revision="test", models={entry.key: entry}),
+  )
+  tools = [
+    {"name": name, "description": "d", "input_schema": {"type": "object"}}
+    for name in ("submit", "other")[:tool_count]
+  ]
+  params = AnthropicProvider().build_request_params(
+    model=entry.upstream_model, messages=[], system_prompt=None, tools=tools,
+    max_tokens=4096, thinking_level=requested,
+  )
+  assert params["tool_choice"] == expected
+  if requested == ThinkingLevel.NONE:
+    # Explicit off applies even to a default-off entry.
+    assert params["thinking"] == {"type": "disabled"}
+    assert "output_config" not in params
+
+
 def test_haiku_45_model_info_preserves_no_thinking_with_real_rates() -> None:
   provider = AnthropicProvider()
 

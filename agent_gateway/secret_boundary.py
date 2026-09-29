@@ -19,7 +19,8 @@ UNSUPPORTED_VALUE = "<unsupported-boundary-value>"
 # secret material unless its key is a provably non-secret selection/config
 # field. A provider adding a new credential key is redacted by default instead
 # of silently escaping the boundary. These key names mirror the auth_config
-# reads in providers/*, capability_binding.py, runner_auth.py, and easy.py.
+# reads in providers/*, capability_execution.py, model_authority's binding.py,
+# runner_auth.py, and easy.py.
 _NON_SECRET_AUTH_CONFIG_FIELDS = frozenset({
   "auth_mode",
   "auth_store_path",
