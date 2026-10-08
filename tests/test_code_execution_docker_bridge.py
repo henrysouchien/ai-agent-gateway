@@ -37,7 +37,7 @@ from test_code_execution_bridge import (
   SEARCH_FILINGS,
   _CODE_CALLABLE,
   _CaptureMcp,
-  _FILING_HANDLE,
+  _FILING_HANDLES,
   _bind,
   _fd_closed,
   _filings_extractor,
@@ -234,7 +234,7 @@ def test_docker_nested_results_compose_and_preserve_ledger_sources(docker_runtim
       assert [entry["server"] for entry in nested] == ["edgar-parser-mcp", "fred-mcp"]
       assert all(entry["ok"] is True and entry["error_code"] is None for entry in nested)
       assert all(entry["result_bytes"] > 0 and entry["duration_ms"] >= 0 for entry in nested)
-      assert result["sources"] == [{**_FILING_HANDLE, "produced_by_tool": "get_filings"}]
+      assert result["sources"] == [{**handle, "produced_by_tool": "get_filings"} for handle in _FILING_HANDLES]
       assert "321.4" not in json.dumps(result)
       state = session.code_execution_kernels["docker"]
       container_id = state.container_id

@@ -18,7 +18,7 @@ from agent_gateway import SessionStore
 from agent_gateway.code_execution import CodeExecutionConfig, build_code_execution, cleanup_code_execution
 from agent_gateway.code_execution._frame_reader import FrameReader
 from agent_gateway.code_execution._backends._kernel import KernelBackend, KernelState
-from agent_gateway.code_execution._frame_codec import MAX_FRAME_BYTES
+from agent_gateway.code_execution._frame_codec import MAX_FRAME_BYTES, decode_frame
 from test_code_execution_bridge import FRED_SERIES, GET_FILINGS, _CODE_CALLABLE, _CaptureMcp, _bind, _filings_extractor, _policy
 
 
@@ -375,9 +375,9 @@ def test_kernel_token_tracks_slot_and_environment_lifetime(tmp_path: Path) -> No
       try:
         await asyncio.sleep(0)
         assert lookup_active_cell(cell.token) is None
-        denied = await cell.answer_frame(encode_frame({
+        denied = decode_frame(await cell.handle_frame(encode_frame({
           "type": "hello", "call_id": "before", "cell_token": cell.token,
-        }))
+        })))
         assert denied["error"]["code"] == "bad_cell_token"
         backend.runtime.lock.release()
         for _ in range(200):

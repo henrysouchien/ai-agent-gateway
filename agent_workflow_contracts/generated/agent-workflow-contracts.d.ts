@@ -25,6 +25,9 @@ export type AdmittedContextWire = {
   readonly "lineage": AdmittedLineage;
   readonly "placement": "in_process" | "local_stub" | "hosted_stub";
   readonly "research_binding": AdmittedResearchBinding;
+  readonly "selection_snapshot"?: ({
+  readonly [key: string]: JsonValue;
+}) | (null);
   readonly "tenant": (AdmittedTenant) | (null);
   readonly "tool_grant": ReadonlyArray<string>;
   readonly "withheld_tools"?: ReadonlyArray<string>;

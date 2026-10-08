@@ -396,7 +396,10 @@ def _spawn(parent: AgentRunner, **overrides: Any):
     "dispatcher": _Dispatcher(),
   }
   kwargs.update(overrides)
-  return asyncio.run(parent.spawn_sub_agent("research this", **kwargs))
+  child_runner_ref: list[Any] = []
+  return asyncio.run(parent.spawn_sub_agent(
+    "research this", bind_job_runner=child_runner_ref.append, **kwargs,
+  ))
 
 
 def _resume(parent: AgentRunner, **overrides: Any):
@@ -413,7 +416,10 @@ def _resume(parent: AgentRunner, **overrides: Any):
     "dispatcher": _Dispatcher(),
   }
   kwargs.update(overrides)
-  return asyncio.run(parent.resume_sub_agent(**kwargs))
+  child_runner_ref: list[Any] = []
+  return asyncio.run(parent.resume_sub_agent(
+    bind_job_runner=child_runner_ref.append, **kwargs,
+  ))
 
 
 def test_runner_sub_agent_methods_are_inherited_from_mixin() -> None:

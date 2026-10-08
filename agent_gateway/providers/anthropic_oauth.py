@@ -1205,32 +1205,6 @@ def rotate_anthropic_credential_source(
   return _usable_credential(siblings, pool=selected_pool, now=now)
 
 
-def select_anthropic_credential(
-  sources: AnthropicCredentialSources,
-  *,
-  pool: AnthropicCredentialPool | None = None,
-  now: float | None = None,
-) -> str:
-  """Token boundary retained while Risk and Investment migrate to source objects."""
-  selected = select_anthropic_credential_source(sources, pool=pool, now=now)
-  return selected.token if selected is not None else ""
-
-
-def rotate_anthropic_credential(
-  sources: AnthropicCredentialSources,
-  *,
-  current: str,
-  until: float,
-  pool: AnthropicCredentialPool | None = None,
-  now: float | None = None,
-) -> str:
-  """Token boundary retained while Risk migrates its rotation consumer."""
-  selected = rotate_anthropic_credential_source(
-    sources, current=current, until=until, pool=pool, now=now,
-  )
-  return selected.token if selected is not None else ""
-
-
 def ensure_fresh_anthropic_credential(
   token: str,
   *,
@@ -1490,9 +1464,7 @@ __all__ = [
   "remove_anthropic_oauth_record",
   "resolve_anthropic_auth_store_path",
   "resolve_anthropic_credentials",
-  "rotate_anthropic_credential",
   "rotate_anthropic_credential_source",
-  "select_anthropic_credential",
   "select_anthropic_credential_source",
   "setup_token_account_identity",
   "start_anthropic_login",

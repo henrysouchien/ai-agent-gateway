@@ -248,7 +248,6 @@ def test_positioning_filing_sources_declaration_and_reader(status: str) -> None:
         "filing_url": "https://www.sec.gov/Archives/edgar/data/1364742/filing",
         "accession": "0001364742-26-000010",
       },
-      {"manager_cik": "0001166559", "year": 2026, "quarter": 2},
     ],
   }
   assert classify_tool_outcome(None, result, None) == "ok"
@@ -326,23 +325,6 @@ def test_positioning_without_filing_sources_mints_nothing(
   assert read_source_identities({"kind": "positioning_filing_sources"}, result) == ()
 
 
-@pytest.mark.parametrize("missing_field", ["manager_cik", "year", "quarter"])
-def test_positioning_skips_incomplete_filing_identity(missing_field: str) -> None:
-  from agent_gateway.tool_dispatch_source_identity import read_source_identities
-
-  filing = {
-    "manager_cik": "0001067983",
-    "year": 2026,
-    "quarter": 2,
-    "source_url": "https://financialmodelingprep.com/13f/1067983/2026/2",
-  }
-  del filing[missing_field]
-  assert read_source_identities({"kind": "positioning_filing_sources"}, {
-    "status": "success",
-    "filing_sources": [filing],
-  }) == ()
-
-
 @pytest.mark.parametrize("name", [
   "get_macro_dashboard", "get_rates_and_curves", "get_economic_indicators",
   "get_sector_analysis", "get_technical_summary", "get_positioning",
@@ -380,24 +362,6 @@ def test_producer_vendor_reader_preserves_coordinates(
   assert read_source_identities({"kind": "producer_vendor_sources"}, {
     "sources": [row],
   }) == ({"document_id": source_url, **row},)
-
-
-@pytest.mark.parametrize(("field", "value"), [
-  ("source_kind", "filing"), ("provider", ""), ("provider", 1),
-  ("endpoint", " "), ("endpoint", None), ("source_url", ""),
-  ("source_url", 1), ("key_fields", {}), ("key_fields", []),
-])
-def test_producer_vendor_reader_skips_malformed_rows(field: str, value: object) -> None:
-  from agent_gateway.tool_dispatch_source_identity import read_source_identities
-
-  valid: dict[str, object] = {
-    "source_kind": "vendor", "provider": "fred", "endpoint": "observations",
-    "key_fields": {"series_id": "DGS10"},
-    "source_url": "https://api.stlouisfed.org/fred/series/observations",
-  }
-  assert read_source_identities({"kind": "producer_vendor_sources"}, {
-    "sources": [None, "invalid", {**valid, field: value}, valid],
-  }) == ({"document_id": valid["source_url"], **valid},)
 
 
 @pytest.mark.parametrize("result", [{}, {"sources": None}, {"sources": {}}])

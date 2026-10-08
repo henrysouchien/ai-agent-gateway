@@ -1596,7 +1596,7 @@ def make_run_agent_handler(
   tool_definition_projector: (
     Callable[[dict[str, Any]], dict[str, Any] | None] | None
   ) = None,
-):
+) -> JobScopedHandler:
   """Build the local handler used by the `run_agent` tool.
 
   The returned handler resolves a full operation identity (or the registered
@@ -1618,30 +1618,22 @@ def make_run_agent_handler(
   if trusted_research_file_id is not None:
     _require_research_file_id(trusted_research_file_id)
   skill_state_lock = asyncio.Lock()
-  parent_dispatch_scope = (
-    parent_session.dispatch_scope
-    if parent_session is not None
-    else None
-  )
-  parent_portfolio_id = (
-    parent_dispatch_scope.get("portfolio_id")
-    if parent_dispatch_scope is not None
-    else None
-  )
 
   async def _handle_run_agent(
-    tool_input: dict[str, Any], **kwargs: Any,
+    tool_input: dict[str, Any], *, scope: JobScope, **kwargs: Any,
   ) -> tuple[Any | None, dict[str, Any] | None]:
-    runner = runner_ref[0]
+    runner = scope.runner()
+    parent_session = scope.session
+    parent_dispatch_scope = (
+      parent_session.dispatch_scope if parent_session is not None else None
+    )
+    parent_portfolio_id = (
+      parent_dispatch_scope.get("portfolio_id")
+      if parent_dispatch_scope is not None else None
+    )
     if runner is None:
       return None, {"code": "internal_error", "message": "Sub-agent runner not initialized"}
-    # Runtime setup may finish approval routing after installing this handler.
-    # Capture the parent authority once at the spawn hop, not installation.
-    root = root_context(
-      parent_session,
-      withheld_tools=frozenset(excluded_tools or ()),
-      research_file_id=trusted_research_file_id,
-    )
+    root = scope.caller()
     # run_agent's arguments are model-authored external input (rule 1 of
     # docs/engineering/fail-closed-local-guards.md; rule 6's "malformed input
     # shape"): a malformed argument must not become a paid child. Each arm names
@@ -2315,6 +2307,8 @@ def make_run_agent_handler(
             ),
             route_tool_names=declared_mcp_route_tool_names,
             children=operation.children,
+            role=operation.role,
+            effort=operation.effort,
           ),
           capability_execution_resolver=capability_execution_resolver,
           session=parent_session,
@@ -2336,13 +2330,6 @@ def make_run_agent_handler(
         "next_call": None,
       }
     if isinstance(admission, Refusal):
-      if admission.reason == "handle_not_granted":
-        return None, {
-          "code": admission.reason,
-          "message": admission.detail,
-          "owner": admission.owner,
-          "next_call": None,
-        }
       # Data integrity: the child is bound to the turn's verified file, so a
       # different asserted id means writes to a file the child would not
       # touch; the next call carries the verified id.
@@ -2361,22 +2348,15 @@ def make_run_agent_handler(
             },
           },
         }
-      if admission.reason == "depth_exceeded":
-        return None, {
-          "code": admission.reason,
-          "message": admission.detail,
-          "owner": admission.owner,
-          "classification": admission.classification,
-          "next_call": admission.next_call,
-        }
-      return None, {
-        "code": "operation_unavailable",
-        "message": (
-          f"{admission.owner} refused ({admission.reason}): "
-          f"{admission.detail}"
-        ),
-        "next_call": None,
+      error = {
+        "code": admission.reason,
+        "message": admission.detail,
+        "owner": admission.owner,
+        "next_call": admission.next_call,
       }
+      if admission.classification is not None:
+        error["classification"] = admission.classification
+      return None, error
     admitted_context = admission.wire
     operation_authority = admission.tool_authority
     context_research_file_id = admitted_context.research_binding.research_file_id
@@ -2542,6 +2522,11 @@ def make_run_agent_handler(
           auth_config=dict(execution.auth_config),
           channel=getattr(parent_session, "channel", None),
           is_public=getattr(parent_session, "is_public", False),
+          tenant_id=(
+            admitted_context.tenant.tenant_id
+            if admitted_context.tenant is not None
+            else None
+          ),
         )
         capture_job_context(sub_session, context_for_child(
           admission, job_id=admitted_task.attempt.physical_task_id,
@@ -2556,9 +2541,12 @@ def make_run_agent_handler(
           if runner._spill_dir_provider is not None
           else None
         )
+        child_runner_ref: list[Any] = []
         rebind_job_handlers(child_local, JobScope(
           caller=lambda: current_parent_context(sub_session),
           spill_sink=lambda: child_spill_sink,
+          runner=lambda: child_runner_ref[0],
+          session=sub_session,
         ))
         code_execution = _install_child_code_execution(
           child_local,
@@ -2641,6 +2629,7 @@ def make_run_agent_handler(
           system_prompt=system_prompt,
           dispatcher=sub_dispatcher,
           sub_session=sub_session,
+          bind_job_runner=child_runner_ref.append,
           excluded_tools=child_excluded,
           max_tokens=execution_snapshot.max_tokens,
           cost_observation_threshold_usd=(
@@ -2804,7 +2793,24 @@ def make_run_agent_handler(
         }
     return result, error
 
-  return _handle_run_agent
+  def _build(scope: JobScope):
+    async def _scoped_run_agent(tool_input: dict[str, Any], **kwargs: Any):
+      return await _handle_run_agent(tool_input, scope=scope, **kwargs)
+    return _scoped_run_agent
+
+  return JobScopedHandler(
+    _build,
+    JobScope(
+      caller=lambda: root_context(
+        parent_session,
+        withheld_tools=frozenset(excluded_tools or ()),
+        research_file_id=trusted_research_file_id,
+      ),
+      spill_sink=lambda: None,
+      runner=lambda: runner_ref[0],
+      session=parent_session,
+    ),
+  )
 
 
 def make_resume_handler(
@@ -3471,6 +3477,11 @@ def make_resume_handler(
           auth_config=dict(execution.auth_config),
           channel=getattr(parent_session, "channel", None),
           is_public=getattr(parent_session, "is_public", False),
+          tenant_id=(
+            continuation.wire.tenant.tenant_id
+            if continuation.wire.tenant is not None
+            else None
+          ),
         )
         capture_job_context(sub_session, context_for_child(
           continuation,
@@ -3486,9 +3497,12 @@ def make_resume_handler(
           if runner._spill_dir_provider is not None
           else None
         )
+        child_runner_ref: list[Any] = []
         rebind_job_handlers(child_local, JobScope(
           caller=lambda: current_parent_context(sub_session),
           spill_sink=lambda: child_spill_sink,
+          runner=lambda: child_runner_ref[0],
+          session=sub_session,
         ))
         code_execution = _install_child_code_execution(
           child_local,
@@ -3571,6 +3585,7 @@ def make_resume_handler(
           system_prompt=system_prompt,
           dispatcher=sub_dispatcher,
           sub_session=sub_session,
+          bind_job_runner=child_runner_ref.append,
           excluded_tools=child_excluded,
           max_tokens=successor_execution_snapshot.max_tokens,
           skill_run_id=skill_run_id,

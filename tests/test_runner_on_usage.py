@@ -1663,10 +1663,12 @@ def test_spawn_sub_agent_emits_usage_with_parent_turn_id(tmp_path: Path) -> None
     user_id="alice",
     auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
   )
+  child_runner_ref: list[Any] = []
   result, error = _run(
     parent_runner.spawn_sub_agent(
       "Collect usage",
       capability_execution=_child_execution(_UsageProvider()),
+      bind_job_runner=child_runner_ref.append,
       **_subagent_identity("sub0:sess-parent"),
       skill_name="test-child",
       dispatcher=_make_dispatcher(),
@@ -2022,10 +2024,12 @@ def test_spawn_sub_agent_no_wall_clock(
     billing_mode="byok",
     rate_table_version="unknown",
   )
+  child_runner_ref: list[Any] = []
   result, error = _run(
     parent_runner.spawn_sub_agent(
       "Collect usage",
       capability_execution=_child_execution(_UsageProvider()),
+      bind_job_runner=child_runner_ref.append,
       **_subagent_identity("sub0:sess-parent"),
       skill_name="test-child",
       dispatcher=_make_dispatcher(),

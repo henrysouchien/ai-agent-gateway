@@ -759,6 +759,10 @@ class AdmittedContextWire(WireModel):
     default=(),
     exclude_if=lambda value: not value,
   )
+  selection_snapshot: dict[str, JsonValue] | None = Field(
+    default=None,
+    exclude_if=lambda value: value is None,
+  )
 
 
 class AgentExecutionSnapshot(WireModel):

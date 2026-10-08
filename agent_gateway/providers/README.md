@@ -49,12 +49,6 @@ with `account_identity`, `grant_hash`, `generation_id` and opaque
 together. OAuth refresh updates material within that generation; replacement
 of a static key/token or reconsent enrolls a new generation.
 
-The additive `ai-agent-gateway` 0.22.2 API retains the token-returning
-`select_anthropic_credential()` and `rotate_anthropic_credential()` exports for
-the existing Risk and Investment consumers. Their removal belongs to the
-breaking 0.23.0 cutover, after both consumers migrate and their dependency ranges
-are ready; this is bounded coexistence, not the canonical source-object API.
-
 The store keeps active credential records and generation retirement reasons.
 Retirement discards that generation's secrets; a narrow
 `retired_auth_token_grants` map retains only retired static auth-token grant hashes

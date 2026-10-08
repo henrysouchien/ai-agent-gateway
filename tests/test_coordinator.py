@@ -1,10 +1,11 @@
 # ruff: noqa: E402
 
 import asyncio
+from collections.abc import Mapping
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -27,6 +28,7 @@ from agent_gateway import (
 )
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CapabilityId, ModelSelectionIntent
+from model_authority.selection import TierDefaultInput
 from agent_gateway.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
@@ -94,6 +96,8 @@ class _PromptCaptureProvider(ModelProvider):
 
 
 class _StubRunner:
+  _spill_dir_provider = None
+
   def __init__(self) -> None:
     self._full_session_id = "session-coordinator"
     self.calls: list[dict[str, Any]] = []
@@ -125,7 +129,11 @@ class _CapabilityResolver(CapabilityExecutionResolver):
     explicit_intent: ModelSelectionIntent | None = None,
     saved_preference: ModelSelectionIntent | None = None,
     parent_bind: CapabilityBind | None = None,
+    role: str | None = None,
     effort: str | None = None,
+    role_map: Mapping[str, TierDefaultInput] | None = None,
+    role_map_source: Literal["saved_preference", "internal_policy"] | None = None,
+    requested_role_source: Literal["explicit_user", "internal_policy"] = "internal_policy",
   ) -> CapabilityBind:
     self.calls.append({
       "capability_id": capability_id,

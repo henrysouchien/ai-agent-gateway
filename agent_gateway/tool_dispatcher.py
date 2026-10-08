@@ -1034,6 +1034,14 @@ class ToolDispatcher:
       self.resolve_effective_tool_input(tool_name, dict(tool_input))
     )
 
+  async def prepare_tool_call_async(
+    self,
+    tool_name: str,
+    tool_input: Mapping[str, Any],
+  ) -> PreparedToolCall:
+    """Prepare through the async entry point shared by runners and bridges."""
+    return self.prepare_tool_call(tool_name, tool_input)
+
   def _registered_code_declaration(
     self,
     tool_name: str,

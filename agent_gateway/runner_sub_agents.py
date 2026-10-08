@@ -319,6 +319,7 @@ class RunnerSubAgentMixin:
     on_sub_event: Optional[Callable[[Dict[str, Any], str], None]] = None,
     skill_run_id: str | None = None,
     admitted_task: AdmittedTask | None = None,
+    bind_job_runner: Callable[[Any], None],
   ) -> Tuple[Optional[TaskResult], Optional[Dict[str, Any]]]:
     """Run a focused sub-agent task and return its canonical result.
 
@@ -446,6 +447,7 @@ class RunnerSubAgentMixin:
       sub_session=sub_session,
       task_entry=task_entry,
       spill_sink=child_spill_sink,
+      bind_job_runner=bind_job_runner,
     )
     dispatcher.bind_research_file_activity_owner(sub_runner.ensure_research_file_activity)
     stalled = False
@@ -577,6 +579,7 @@ class RunnerSubAgentMixin:
     skill_run_id: str | None = None,
     admitted_task: AdmittedTask | None = None,
     prior_terminal_tool_result: Mapping[str, Any] | None = None,
+    bind_job_runner: Callable[[Any], None],
     bind_research_file_activity_lease_func: (
       Callable[[Any], None] | None
     ) = None,
@@ -714,6 +717,7 @@ class RunnerSubAgentMixin:
       sub_session=sub_session,
       task_entry=task_entry,
       spill_sink=child_spill_sink,
+      bind_job_runner=bind_job_runner,
     )
     dispatcher.bind_research_file_activity_owner(sub_runner.ensure_research_file_activity)
     if bind_research_file_activity_lease_func is not None:
@@ -851,6 +855,7 @@ def _bind_child_registry(
   sub_session: Any | None,
   task_entry: TaskEntry | None,
   spill_sink: SpillSink | None,
+  bind_job_runner: Callable[[Any], None],
 ) -> None:
   """Name the child job its registry belongs to and link it into the tree.
 
@@ -870,6 +875,7 @@ def _bind_child_registry(
     parent=parent_registry,
     spill_sink=spill_sink,
   ))
+  bind_job_runner(sub_runner)
 
 
 def _termination_signal(task_entry: TaskEntry | None) -> str:

@@ -1612,8 +1612,11 @@ def test_org_refusing_oauth_parks_that_member_and_rotates_to_the_next(
   failure = provider.classify_credential_failure(exc_info.value)
 
   assert failure is not None and failure.kind == "auth"
+  serving_member = anthropic_provider_module.resolve_anthropic_credentials().by_token(serving)
+  assert serving_member is not None
   assert provider.next_credential({"auth_mode": "oauth", "auth_token": refused}, failure) == {
     "auth_token": serving,
+    "credential_source": serving_member.source_metadata(),
   }
   assert pool.blocked_until(refused) > 0
 

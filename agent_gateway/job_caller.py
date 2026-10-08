@@ -27,10 +27,14 @@ class JobScope:
   ``spill_sink`` returns that job's own spill sink (``None``: the runtime
   has none). It is part of the scope because spill membership is location:
   a reader's own root and the job roots below it are its outputs.
+  ``runner`` resolves the executing runner after child construction; ``session``
+  is that job's session, so nested spawns use its authority and concurrency slot.
   """
 
   caller: CallerContext
   spill_sink: Callable[[], Any | None]
+  runner: Callable[[], Any] = lambda: None
+  session: Any | None = None
 
 
 class JobScopedHandler:

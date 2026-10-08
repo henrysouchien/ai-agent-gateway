@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 from model_authority.bind import CapabilityBind
 from model_authority.binding import (
@@ -21,7 +21,7 @@ from model_authority.binding import (
 )
 from model_authority.capabilities import CAPABILITY_EXECUTION_PROCESS, CAPABILITY_IDS
 from model_authority.registry import ProductModelRegistry
-from model_authority.selection import ProductModelSelectionPolicy
+from model_authority.selection import ProductModelSelectionPolicy, TierDefaultInput
 from .providers import ModelProvider
 
 
@@ -192,10 +192,15 @@ class CapabilityExecutionResolver:
     saved_preference: ModelSelectionIntent | None = None,
     parent_bind: CapabilityBind | None = None,
     effort: str | None = None,
+    role: str | None = None,
+    role_map: Mapping[str, TierDefaultInput] | None = None,
+    role_map_source: Literal["saved_preference", "internal_policy"] | None = None,
+    requested_role_source: Literal["explicit_user", "internal_policy"] = "internal_policy",
   ) -> CapabilityBind:
     """Select and authorize an exact bind without credentials or adapter effects.
 
-    ``effort`` is the operation's in-row request (its declared role's effort).
+    ``role`` and ``effort`` are already-lowered spawn/operation requests;
+    the admission owner supplies the inherited effective ``role_map``.
     """
 
     self._require_executable_here(str(capability_id or "").strip())
@@ -210,6 +215,10 @@ class CapabilityExecutionResolver:
       trusted_channel=self.trusted_channel,
       parent_bind=parent_bind,
       requested_effort=effort,
+      requested_role=role,
+      role_map=role_map,
+      role_map_source=role_map_source,
+      requested_role_source=requested_role_source,
     )
 
   def resolve(
@@ -219,12 +228,22 @@ class CapabilityExecutionResolver:
     explicit_intent: ModelSelectionIntent | None = None,
     saved_preference: ModelSelectionIntent | None = None,
     parent_bind: CapabilityBind | None = None,
+    effort: str | None = None,
+    role: str | None = None,
+    role_map: Mapping[str, TierDefaultInput] | None = None,
+    role_map_source: Literal["saved_preference", "internal_policy"] | None = None,
+    requested_role_source: Literal["explicit_user", "internal_policy"] = "internal_policy",
   ) -> BoundCapabilityExecution:
     bind = self.select_bind(
       capability_id,
       explicit_intent=explicit_intent,
       saved_preference=saved_preference,
       parent_bind=parent_bind,
+      effort=effort,
+      role=role,
+      role_map=role_map,
+      role_map_source=role_map_source,
+      requested_role_source=requested_role_source,
     )
     return self._materialize(bind)
 

@@ -132,10 +132,14 @@ class AutonomousLaunchAdmissionRefused(Exception):
       self.reason = refusal.reason
       self.owner = refusal.owner
       self.code = refusal.reason
+      self.classification = refusal.classification
+      self.next_call = refusal.next_call
     else:
       self.reason = None
       self.owner = None
       self.code = "operation_unavailable"
+      self.classification = None
+      self.next_call = None
     self.http_status = (
       403
       if isinstance(refusal, Refusal) and refusal.reason in {
@@ -156,7 +160,12 @@ class AutonomousLaunchAdmissionRefused(Exception):
 
   def payload(self) -> dict[str, str]:
     if self.reason is not None and self.owner is not None:
-      return {"owner": self.owner, "reason": self.reason, "detail": self.detail}
+      payload = {"owner": self.owner, "reason": self.reason, "detail": self.detail}
+      if self.classification is not None:
+        payload["classification"] = self.classification
+      if self.next_call is not None:
+        payload["next_call"] = self.next_call
+      return payload
     return {"code": self.code, "detail": self.detail}
 
 

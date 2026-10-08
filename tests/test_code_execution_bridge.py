@@ -26,6 +26,7 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import SessionStore, ToolDispatcher
 from agent_gateway.code_execution import CodeExecutionConfig, build_code_execution, cleanup_code_execution
+from agent_gateway.code_execution._frame_codec import decode_frame
 from agent_gateway.event_log import EventLog
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.policy_imports import configure_server_policy, load_server_policy_module
@@ -59,17 +60,26 @@ _FILINGS_RESULT = {
   "status": "success",
   "ticker": "AAPL",
   "filings": [
-    {"accession_number": "0000320193-24-000123", "form": "10-K"},
-    {"accession_number": "0000320193-24-000081", "form": "10-Q"},
+    {
+      "document_id": "edgar:0000320193-24-000123", "accession": "0000320193-24-000123",
+      "accession_number": "0000320193-24-000123", "form": "10-K",
+    },
+    {
+      "document_id": "edgar:0000320193-24-000081", "accession": "0000320193-24-000081",
+      "accession_number": "0000320193-24-000081", "form": "10-Q",
+    },
   ],
 }
 _FRED_RESULT = {"series_id": "CPIAUCSL", "observations": [{"date": "2026-08-01", "value": "321.4"}]}
-_FILING_HANDLE = {"document_id": "doc-1", "source_kind": "filing", "accession": "0000320193-24-000123"}
+_FILING_HANDLES = [
+  {"document_id": row["document_id"], "source_kind": "filing", "accession": row["accession"]}
+  for row in _FILINGS_RESULT["filings"]
+]
 
 
 def _filings_extractor(operation: str, result: Any) -> list[dict[str, Any]]:
   if operation == GET_FILINGS and isinstance(result, dict) and result.get("filings"):
-    return [dict(_FILING_HANDLE)]
+    return [dict(handle) for handle in _FILING_HANDLES]
   return []
 
 
@@ -89,6 +99,7 @@ def _policy() -> Any:
       "search_filings": "edgar-parser-mcp",
     }.get(name),
     get_tool_class=lambda server, tool: _POLICY_CLASSES.get((server, tool)),
+    get_local_tool_effect=lambda _name: None,
   ))
   yield
   configure_server_policy(previous)
@@ -519,8 +530,8 @@ def test_sources_are_deduplicated_and_payloads_stay_out_of_the_result() -> None:
         (False, "not_found"),
         (True, None),
       ]
-      # Two identical reads mint one handle; the failed read mints none.
-      assert result["sources"] == [{**_FILING_HANDLE, "produced_by_tool": "get_filings"}]
+      # Repeated reads retain each filing once; the failed read adds none.
+      assert result["sources"] == [{**handle, "produced_by_tool": "get_filings"} for handle in _FILING_HANDLES]
       rendered = json.dumps({key: value for key, value in result.items() if key != "sources"})
       assert "0000320193-24-000123" not in rendered
       assert "321.4" not in json.dumps(result)
@@ -530,7 +541,7 @@ def test_sources_are_deduplicated_and_payloads_stay_out_of_the_result() -> None:
   asyncio.run(_run())
 
 
-def test_sources_are_empty_without_a_bound_extractor() -> None:
+def test_settled_sources_survive_without_a_bound_extractor() -> None:
   async def _run() -> None:
     session, _bundle, _mcp, dispatcher = _setup()
     try:
@@ -538,8 +549,11 @@ def test_sources_are_empty_without_a_bound_extractor() -> None:
       assert error is None, error
       assert result["return_code"] == 0, result["stderr"]
       assert len(result["nested_calls"]) == 4
-      assert result["sources"] == []
-      rendered = json.dumps(result)
+      assert result["sources"] == [
+        {"document_id": handle["document_id"], "source_kind": "filing", "produced_by_tool": "get_filings"}
+        for handle in _FILING_HANDLES
+      ]
+      rendered = json.dumps({key: value for key, value in result.items() if key != "sources"})
       assert "0000320193-24-000123" not in rendered
       assert "321.4" not in rendered
     finally:
@@ -560,7 +574,9 @@ def test_a_raising_extractor_leaves_the_cell_and_nested_call_intact() -> None:
       assert result["return_code"] == 0, result["stderr"]
       assert result["stdout"] == "10-K\n"
       assert [(entry["ok"], entry["error_code"]) for entry in result["nested_calls"]] == [(True, None)]
-      assert result["sources"] == []
+      assert [source["document_id"] for source in result["sources"]] == [
+        handle["document_id"] for handle in _FILING_HANDLES
+      ]
     finally:
       await cleanup_code_execution(session)
 
@@ -677,7 +693,7 @@ def test_background_cell_collected_through_a_later_request_bundle_keeps_its_brid
       result = await _collect_background(later_dispatcher, task_id)
       assert result["stdout"] == "10-K\n", result
       assert [(entry["nested_call_id"], entry["ok"]) for entry in result["nested_calls"]] == [(f"{OUTER_ID}.1", True)]
-      assert result["sources"] == [{**_FILING_HANDLE, "produced_by_tool": "get_filings"}]
+      assert result["sources"] == [{**handle, "produced_by_tool": "get_filings"} for handle in _FILING_HANDLES]
       assert task_id not in session.background_tasks
       [(cell, original_fds)] = opened
       assert all(_fd_closed(fd, original) for fd, original in original_fds.items())
@@ -783,11 +799,11 @@ def test_repeated_registration_revocation_and_new_cell_grant_narrowing() -> None
     cell = reader.open_cell("first", abort_event=None, active=True)
     try:
       async def request(channel: Any, operation: str, index: int) -> Any:
-        return await channel.answer_frame(encode_frame({
+        return decode_frame(await channel.handle_frame(encode_frame({
           "type": "tool_call", "call_id": f"repeat-{index}",
           "parent_call_id": channel.outer_call_id, "cell_token": channel.token,
           "operation": operation, "input": {"series_id": "CPIAUCSL"},
-        }))
+        })))
 
       assert (await request(cell, FRED_SERIES, 1))["ok"]
       assert (await request(cell, FRED_SERIES, 2))["ok"]
@@ -804,10 +820,10 @@ def test_repeated_registration_revocation_and_new_cell_grant_narrowing() -> None
       later = reader.open_cell("later", abort_event=None, active=True)
       try:
         assert (await request(later, FRED_SERIES, 4))["error"]["code"] == "not_granted"
-        catalog = await later.answer_frame(encode_frame({
+        catalog = decode_frame(await later.handle_frame(encode_frame({
           "type": "catalog", "request": "search", "query": "",
           "call_id": "catalog", "parent_call_id": "later", "cell_token": later.token,
-        }))
+        })))
         assert [row["name"] for row in catalog["result"]] == [GET_FILINGS]
         assert len(mcp.calls) == 2
       finally:
@@ -873,17 +889,18 @@ def test_complete_settled_edgar_and_input_dependent_vendor_identities(monkeypatc
       source_key=lambda handle: (handle["document_id"], handle["source_kind"]),
       extract_sources=lambda operation, _result: [{
         "document_id": "edgar:document-0", "source_kind": "filing",
+        "source_url": "https://www.sec.gov/Archives/document-0",
         "accession": "0000320193-24-000123",
       }] if operation == GET_FILINGS else [],
     )
     cell = bundle.frame_reader.open_cell("sources", abort_event=None, active=True)
     try:
       for index, operation in enumerate((GET_FILINGS, FRED_SERIES)):
-        reply = await cell.answer_frame(encode_frame({
+        reply = decode_frame(await cell.handle_frame(encode_frame({
           "type": "tool_call", "call_id": f"s{index}", "cell_token": cell.token,
           "parent_call_id": "sources", "operation": operation,
           "input": {"series_id": "requested-CPI" if operation == FRED_SERIES else "CPIAUCSL"},
-        }))
+        })))
         assert reply["ok"], reply
       sources = cell.summary()["sources"]
       assert len(sources) == 71
@@ -1014,10 +1031,10 @@ def test_registered_settlement_sources_match_direct_dispatch_and_are_json_serial
         )["sources"]
         expected.extend({**source, "produced_by_tool": operation} for source in direct)
       for index, (operation, tool_input) in enumerate([*calls, *calls]):
-        reply = await cell.answer_frame(encode_frame({
+        reply = decode_frame(await cell.handle_frame(encode_frame({
           "type": "tool_call", "call_id": str(index), "cell_token": cell.token,
           "parent_call_id": cell.outer_call_id, "operation": operation, "input": tool_input,
-        }))
+        })))
         assert reply["ok"], reply
       summary = cell.summary()
       assert summary["sources"] == expected
@@ -1041,7 +1058,7 @@ def test_reader_teardown_awaits_nested_dispatch_and_revokes_all_cells() -> None:
     reader = bundle.frame_reader
     cell = reader.open_cell("teardown", abort_event=None, active=True)
     original_fds = {fd: os.fstat(fd) for fd in cell.fds()}
-    task = asyncio.create_task(cell.answer_frame(encode_frame({
+    task = asyncio.create_task(cell.handle_frame(encode_frame({
       "type": "tool_call", "call_id": "wait", "cell_token": cell.token,
       "parent_call_id": "teardown", "operation": FRED_SERIES,
       "input": {"series_id": "CPIAUCSL"},
@@ -1084,11 +1101,11 @@ def test_actual_oversized_dispatch_reply_is_protocol_error_and_next_cell_works(m
     reader = bundle.frame_reader
     cell = reader.open_cell("large-reply", abort_event=None, active=True)
     try:
-      reply = await cell.answer_frame(encode_frame({
+      reply = decode_frame(await cell.handle_frame(encode_frame({
         "type": "tool_call", "call_id": "large", "cell_token": cell.token,
         "parent_call_id": cell.outer_call_id, "operation": FRED_SERIES,
         "input": {"series_id": "large"},
-      }))
+      })))
       assert reply["ok"] is False
       assert reply["error"]["code"] == "protocol_error"
       assert cell.budget.error is not None
@@ -1097,11 +1114,11 @@ def test_actual_oversized_dispatch_reply_is_protocol_error_and_next_cell_works(m
       cell.close()
       later = reader.open_cell("small-reply", abort_event=None, active=True)
       try:
-        reply = await later.answer_frame(encode_frame({
+        reply = decode_frame(await later.handle_frame(encode_frame({
           "type": "tool_call", "call_id": "small", "cell_token": later.token,
           "parent_call_id": later.outer_call_id, "operation": FRED_SERIES,
           "input": {"series_id": "CPIAUCSL"},
-        }))
+        })))
         assert reply["ok"] is True, reply
         assert reply["result"]["series_id"] == "CPIAUCSL"
       finally:
@@ -1129,11 +1146,11 @@ def test_producer_status_error_reaches_cell_and_ledger_records_failure(monkeypat
     monkeypatch.setattr(mcp, "call_tool", producer)
     cell = bundle.frame_reader.open_cell("status-error", abort_event=None, active=True)
     try:
-      reply = await cell.answer_frame(encode_frame({
+      reply = decode_frame(await cell.handle_frame(encode_frame({
         "type": "tool_call", "call_id": "dgs30", "cell_token": cell.token,
         "parent_call_id": cell.outer_call_id, "operation": FRED_SERIES,
         "input": {"series_id": "DGS30"},
-      }))
+      })))
       assert reply["ok"] is True
       assert reply["result"] == refusal
       entry = cell.summary()["nested_calls"][0]
@@ -1167,11 +1184,11 @@ def test_native_calls_share_bridge_authority_ordinals_and_sources() -> None:
       assert active.principal["user_id"] == session.user_id
       assert {route["name"] for route in active.installed_routes()} == {GET_FILINGS, FRED_SERIES}
       first = active.start_native(GET_FILINGS, {"cik": "AAPL"})
-      reply = await cell.answer_frame(encode_frame({
+      reply = decode_frame(await cell.handle_frame(encode_frame({
         "type": "tool_call", "call_id": "bridge", "cell_token": cell.token,
         "parent_call_id": cell.outer_call_id, "operation": FRED_SERIES,
         "input": {"series_id": "CPIAUCSL"},
-      }))
+      })))
       assert reply["ok"]
       active.settle_native(first, result=dict(_FILINGS_RESULT), error=None)
       final = active.start_native(FRED_SERIES, {"series_id": "missing"})
@@ -1180,7 +1197,7 @@ def test_native_calls_share_bridge_authority_ordinals_and_sources() -> None:
       assert [row["ordinal"] for row in summary["nested_calls"]] == [1, 2, 3]
       assert first["native"] and first["ok"]
       assert final["error_code"] == "not_found" and not final["ok"]
-      assert any(source.get("document_id") == "doc-1" for source in summary["sources"])
+      assert any(source.get("document_id") == _FILING_HANDLES[0]["document_id"] for source in summary["sources"])
       with pytest.raises(ToolInputPreparationError) as refusal:
         active.start_native(SEARCH_FILINGS, {})
       assert refusal.value.materialize_error()["code"] == "not_granted"
@@ -1262,7 +1279,7 @@ def test_native_settlement_retrieves_live_entry_without_repreparing_executed_inp
       summary = cell.summary()
       assert summary["nested_calls"][0]["ok"]
       assert summary["nested_calls"][0]["provenance"] == provenance
-      assert any(source.get("document_id") == "doc-1" for source in summary["sources"])
+      assert any(source.get("document_id") == _FILING_HANDLES[0]["document_id"] for source in summary["sources"])
     finally:
       await cleanup_code_execution(session)
 
@@ -1321,9 +1338,9 @@ def test_exited_cell_revokes_token_while_descendant_holds_output_pipes(tmp_path:
       assert not data["reader_task"].done()
       assert task.result is None
       assert lookup_active_cell(cell.token) is None
-      reply = await cell.answer_frame(encode_frame({
+      reply = decode_frame(await cell.handle_frame(encode_frame({
         "type": "hello", "call_id": "after-exit", "cell_token": cell.token,
-      }))
+      })))
       assert reply["error"]["code"] == "bad_cell_token"
     finally:
       if pid_path.exists():

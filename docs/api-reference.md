@@ -259,6 +259,16 @@ exact durable bind without choosing a replacement. Both paths validate policy,
 registry, principal eligibility, provider adapter, credential material, and
 effort before returning.
 
+`select_bind()` selects a secret-free `CapabilityBind` without materializing a
+credential or adapter. Both selection methods accept optional `role`, exact
+`effort`, `role_map: Mapping[str, TierDefaultInput]`, `role_map_source`
+(`saved_preference` or `internal_policy`), and `requested_role_source`
+(`explicit_user` or `internal_policy`, defaulting to `internal_policy`).
+An explicit map requires its source. Admission supplies the frozen effective
+map; this adapter does not derive it from a runtime session. `authorize_bind()`
+and `materialize_bind()` retain exact frozen-bind reauthorization without
+reselection.
+
 ### `BoundCapabilityExecution`
 
 Carries the exact `CapabilityBind`, admitting `ProductModelRegistry`,

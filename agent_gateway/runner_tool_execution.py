@@ -73,15 +73,6 @@ _READABLE_RESOURCE_MAX_CONTENT_BYTES = 2_000_000
 
 
 @runtime_checkable
-class _AsyncToolCallPreparer(Protocol):
-  async def __call__(
-    self,
-    tool_name: str,
-    tool_input: Dict[str, Any],
-  ) -> PreparedToolCall: ...
-
-
-@runtime_checkable
 class _EffectiveToolInputResolver(Protocol):
   def __call__(
     self,
@@ -129,6 +120,12 @@ class AgentRunnerDispatcher(Protocol):
   ) -> ToolResult: ...
 
   def prepare_tool_call(
+    self,
+    tool_name: str,
+    tool_input: Dict[str, Any],
+  ) -> PreparedToolCall: ...
+
+  async def prepare_tool_call_async(
     self,
     tool_name: str,
     tool_input: Dict[str, Any],
@@ -497,25 +494,11 @@ class RunnerToolExecutionMixin:
     prepared_call = PreparedToolCall(tool_input)
     preparation_failed = False
     preparation_error: Dict[str, Any] | None = None
-    prepare_tool_call_async = getattr(
-      self._dispatcher,
-      "prepare_tool_call_async",
-      None,
-    )
     prepare_tool_call = getattr(self._dispatcher, "prepare_tool_call", None)
     dispatch_prepared = getattr(self._dispatcher, "dispatch_prepared", None)
-    if (
-      (
-        isinstance(prepare_tool_call_async, _AsyncToolCallPreparer)
-        or callable(prepare_tool_call)
-      )
-      and callable(dispatch_prepared)
-    ):
+    if callable(prepare_tool_call) and callable(dispatch_prepared):
       try:
-        if isinstance(prepare_tool_call_async, _AsyncToolCallPreparer):
-          candidate = await prepare_tool_call_async(tool_name, tool_input)
-        else:
-          candidate = self._dispatcher.prepare_tool_call(tool_name, tool_input)
+        candidate = await self._dispatcher.prepare_tool_call_async(tool_name, tool_input)
         if type(candidate) is not PreparedToolCall:
           raise TypeError("prepare_tool_call must return exact PreparedToolCall")
         prepared_call = candidate

@@ -210,6 +210,7 @@ def _linked_registry_runner(
     _task_registry=TaskRegistry(),
     force_close=force_close,
   )
+  child_runner_ref: list[object] = []
   _bind_child_registry(
     child,
     parent_registry=parent,
@@ -221,6 +222,7 @@ def _linked_registry_runner(
     sub_session=None,
     task_entry=task_entry,
     spill_sink=None,
+    bind_job_runner=child_runner_ref.append,
   )
   return child
 
@@ -251,6 +253,7 @@ def _notification_registry_runner(
     billing_mode="byok",
     rate_table_version="unknown",
   )
+  child_runner_ref: list[object] = []
   _bind_child_registry(
     child,
     parent_registry=parent,
@@ -262,6 +265,7 @@ def _notification_registry_runner(
     sub_session=None,
     task_entry=task_entry,
     spill_sink=None,
+    bind_job_runner=child_runner_ref.append,
   )
   return child
 

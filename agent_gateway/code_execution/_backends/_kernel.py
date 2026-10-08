@@ -437,7 +437,7 @@ class KernelBackend(ExecutionBackend):
     stdin, stdout = process.stdin, process.stdout
     data = handle._backend_data
     budget = bridge.budget if bridge is not None else CellBudget()
-    requests: asyncio.Queue[bytes] = asyncio.Queue()
+    requests: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
     fault = asyncio.Event()
     protocol_error: str | None = None
     displays: list[Dict[str, Any]] = []
@@ -463,12 +463,11 @@ class KernelBackend(ExecutionBackend):
 
     async def dispatch_requests() -> None:
       while True:
-        line = await requests.get()
+        frame = await requests.get()
         try:
           if bridge is not None:
-            reply = await bridge.handle_frame(line, accounted=True)
+            reply = await bridge.handle_decoded_frame(frame)
           else:
-            frame = decode_frame(line)
             reply = encode_frame(_error_reply(frame.get("type"), frame.get("call_id"), "bridge_unavailable", "no bridge for this cell"), budget)
           stdin.write(reply)
           await stdin.drain()
@@ -489,7 +488,11 @@ class KernelBackend(ExecutionBackend):
             bridge.deactivate()
           raise _KernelLost("runner exited")
         try:
-          frame = decode_frame(line, budget if protocol_error is None else None)
+          frame = (
+            bridge.decode_frame(line)
+            if bridge is not None and protocol_error is None
+            else decode_frame(line, budget if protocol_error is None else None)
+          )
         except ProtocolError as exc:
           fail_protocol(str(exc))
           # A poisoned budget still needs the bounded terminal control frame;
@@ -501,7 +504,7 @@ class KernelBackend(ExecutionBackend):
         kind = frame.get("type")
         if kind in ("hello", "catalog", "tool_call"):
           if protocol_error is None:
-            requests.put_nowait(line)
+            requests.put_nowait(frame)
           continue
         if frame.get("id") != handle.handle_id:
           log.debug("code_execute dropped stale %s frame for %s", kind, frame.get("id"))

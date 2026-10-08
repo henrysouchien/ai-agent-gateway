@@ -15,6 +15,7 @@ from agent_workflow_contracts import (
   CatalogToolEntry,
   PlatformToolCatalog,
   SemanticCapabilityRequirement,
+  sha256_digest,
 )
 from agent_workflow_contracts.models import (
   AdmittedContextWire,
@@ -34,6 +35,7 @@ from agent_gateway.admission import (
   Refusal,
   SpawnRequest,
   admit,
+  capture_job_context,
   context_for_child,
   current_parent_context,
   root_context,
@@ -56,6 +58,11 @@ from gateway_test_support.capability_execution_test_support import (
   stub_capability_execution_resolver,
 )
 from gateway_test_support.host_policy import owner_session_host_policy
+
+@pytest.fixture(autouse=True)
+def _default_spawn_depth(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.delenv("HANK_MAX_SPAWN_DEPTH", raising=False)
+
 
 
 def _session() -> GatewaySession:
@@ -90,9 +97,13 @@ class _PlainResolver:
 
   def __init__(self) -> None:
     self.reads: list[str] = []
+    self.selections: list[tuple[str | None, str | None]] = []
 
-  def select_bind(self, capability_id: str, *, effort: str | None = None) -> Any:
+  def select_bind(
+    self, capability_id: str, *, role: str | None = None, effort: str | None = None,
+  ) -> Any:
     self.reads.append(capability_id)
+    self.selections.append((role, effort))
     return _BIND
 
 
@@ -104,6 +115,7 @@ def _owners(
   registered: frozenset[str] | None = None,
   env_contract: str | None = None,
   env_names: frozenset[str] = frozenset(),
+  children: tuple[str, ...] = (),
 ) -> AdmissionOwners:
   known = ceiling if registered is None else registered
   declaration = OperationDeclaration(
@@ -132,6 +144,7 @@ def _owners(
       execution_class="node.explore",
       route_ceiling=ceiling,
       operation_routes=operation_routes,
+      children=children,
     ),
     capability_execution_resolver=resolver,
     session=_session(),
@@ -456,19 +469,173 @@ def test_spawn_tool_leaves_a_grant_whose_children_are_empty() -> None:
   assert result.wire.tool_grant == ("send_message", "web_search")
 
 
-def test_deep_spawn_after_budget_overrun_retains_admitted_authority() -> None:
-  parent = _root(depth=7, remaining_usd=-1.25)
-  result = admit(
-    _request(),
-    parent,
-    owners=_owners(_PlainResolver()),
-  )
+@pytest.mark.parametrize("remaining_usd", [None, 0.0, -1.25])
+def test_spawn_after_zero_or_overrun_spend_retains_admitted_authority(
+  remaining_usd: float | None,
+) -> None:
+  parent = _root(depth=1, remaining_usd=remaining_usd)
+  result = admit(_request(), parent, owners=_owners(_PlainResolver()))
 
   assert isinstance(result, AdmittedContext)
-  assert result.wire.lineage.depth == 8
-  assert result.wire.budget_share == -1.25
+  assert result.wire.lineage.depth == 2
+  assert result.wire.budget_share == remaining_usd
   assert result.wire.tool_grant == ("file_read", "web_search")
   assert result.approval_route is parent.approval_route
+
+
+@pytest.mark.parametrize("maximum", [0, 1, 3])
+def test_configured_spawn_depth_omits_only_the_spawn_tool_at_the_boundary(
+  maximum: int,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setenv("HANK_MAX_SPAWN_DEPTH", str(maximum))
+  owners = _owners(
+    _PlainResolver(),
+    ceiling=frozenset({"file_read", "run_agent"}),
+    children=("explore",),
+  )
+  parent = _root()
+  for depth in range(1, maximum + 1):
+    result = admit(_request(), parent, owners=owners)
+    assert isinstance(result, AdmittedContext)
+    assert result.wire.lineage.depth == depth
+    assert ("run_agent" in result.wire.tool_grant) == (depth < maximum)
+    assert "file_read" in result.wire.tool_grant
+    assert tuple(entry.tool_id for entry in result.tool_authority.grant.tools) == (
+      result.wire.tool_grant
+    )
+    parent = context_for_child(result, job_id=f"job-{depth}")
+
+  refused = admit(_request(), parent, owners=owners)
+  assert isinstance(refused, Refusal)
+  assert refused.reason == "depth_exceeded"
+  assert refused.classification == "resource"
+  assert refused.next_call == (
+    "Return an ordinary final response with your partial work to your "
+    "parent; the parent can spawn the remaining work."
+  )
+
+
+@pytest.mark.parametrize("maximum", [-1, -7])
+@pytest.mark.parametrize("parent_depth", [0, 2, 7])
+def test_negative_spawn_depth_limit_disables_refusal_and_tool_omission(
+  maximum: int,
+  parent_depth: int,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setenv("HANK_MAX_SPAWN_DEPTH", str(maximum))
+  result = admit(
+    _request(),
+    _root(depth=parent_depth, remaining_usd=-1.25),
+    owners=_owners(
+      _PlainResolver(),
+      ceiling=frozenset({"file_read", "run_agent"}),
+      children=("explore",),
+    ),
+  )
+  assert isinstance(result, AdmittedContext)
+  assert result.wire.lineage.depth == parent_depth + 1
+  assert result.wire.budget_share == -1.25
+  assert result.wire.tool_grant == ("file_read", "run_agent")
+
+
+@pytest.mark.parametrize("parent_depth", [2, 7])
+@pytest.mark.parametrize("children", [(), ("explore",)])
+def test_direct_or_stale_spawn_at_or_past_default_depth_is_a_resource_refusal(
+  parent_depth: int,
+  children: tuple[str, ...],
+) -> None:
+  resolver = _PlainResolver()
+  result = admit(
+    _request(),
+    _root(depth=parent_depth, children=children, remaining_usd=0.0),
+    owners=_owners(resolver),
+  )
+  assert isinstance(result, Refusal)
+  assert result.reason == "depth_exceeded"
+  assert result.owner == "admission spawn containment"
+  assert result.classification == "resource"
+  assert result.next_call is not None
+  assert "ordinary final response" in result.next_call
+  assert "parent can spawn" in result.next_call
+  assert resolver.reads == []
+
+
+def test_spawn_boundary_preserves_other_grants_and_does_not_mutate_inputs(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  resolver = _PlainResolver()
+  ceiling = frozenset({
+    "file_read", "run_agent", "send_message", "private_read",
+    "outside_read", "web_search", "missing_read",
+  })
+  owners = _owners(
+    resolver,
+    ceiling=ceiling,
+    operation_routes=frozenset({"private_read"}),
+    registered=ceiling - {"missing_read"},
+    children=("explore",),
+  )
+  parent = _root(
+    depth=1,
+    tool_ids=frozenset({"file_read", "run_agent", "send_message", "web_search"}),
+    withheld=frozenset({"web_search"}),
+    handle_grants=frozenset({"h:1"}),
+  )
+  before = copy.deepcopy(parent)
+  request = _request(handles=("h:1",))
+  bounded = admit(request, parent, owners=owners)
+  monkeypatch.setenv("HANK_MAX_SPAWN_DEPTH", "-1")
+  unbounded = admit(request, parent, owners=owners)
+
+  assert isinstance(bounded, AdmittedContext)
+  assert isinstance(unbounded, AdmittedContext)
+  assert bounded.wire.tool_grant == ("file_read", "private_read", "send_message")
+  assert tuple(entry.tool_id for entry in bounded.tool_authority.grant.tools) == (
+    bounded.wire.tool_grant
+  )
+  assert unbounded.wire.tool_grant == (
+    "file_read", "private_read", "run_agent", "send_message",
+  )
+  assert bounded.wire.model_copy(update={
+    "tool_grant": unbounded.wire.tool_grant,
+  }) == unbounded.wire
+  assert bounded.wire.children == ("explore",)
+  assert bounded.wire.handle_grants == ("h:1",)
+  assert parent == before
+  assert owners.operation.route_ceiling is ceiling
+
+
+def test_spawn_adapter_preserves_depth_refusal_and_ordinary_final_recovery(
+  owner_session_host_policy: Any,
+) -> None:
+  owner_session_host_policy.get_local_tool_effect = lambda _name: "read"
+  runner = _BackgroundRunner()
+  session = _session()
+  capture_job_context(session, _root(
+    depth=2, job_id="worker", children=("explore",),
+    tool_ids=frozenset({"file_read", "web_search"}),
+  ))
+  handler = make_run_agent_handler(
+    [runner],
+    parent_session=session,
+    mcp_client=_McpClient(),
+    local_tool_handlers={"web_search": _tool, "file_read": _tool},
+    capability_execution_resolver=_resolver(),
+  )
+  result, error = asyncio.run(handler({"objective": "Collect", "background": True}))
+  assert result is None
+  assert error == {
+    "code": "depth_exceeded",
+    "message": "Spawn depth 2 has reached the configured maximum 2.",
+    "owner": "admission spawn containment",
+    "classification": "resource",
+    "next_call": (
+      "Return an ordinary final response with your partial work to your "
+      "parent; the parent can spawn the remaining work."
+    ),
+  }
+  assert runner.background_calls == []
 
 
 def test_child_session_cannot_regain_the_roots_spawn_authority() -> None:
@@ -492,6 +659,30 @@ def test_child_session_cannot_regain_the_roots_spawn_authority() -> None:
   assert result.reason == "grant_exceeds_parent"
   assert parent.job_id == "child-1"
   assert parent.depth == 1
+
+
+@pytest.mark.parametrize(
+  ("spawn", "operation", "selected"),
+  [
+    ((None, None), (None, None), (None, None)),
+    ((None, None), ("research", "medium"), ("research", "medium")),
+    (("drafting", "high"), ("research", "medium"), ("drafting", "high")),
+    (("drafting", None), ("research", "medium"), ("drafting", "medium")),
+  ],
+)
+def test_spawn_role_and_effort_win_over_the_operations_then_the_slot(
+  spawn: tuple[str | None, str | None],
+  operation: tuple[str | None, str | None],
+  selected: tuple[str | None, str | None],
+) -> None:
+  resolver = _PlainResolver()
+  owners = _owners(resolver)
+  owners = replace(
+    owners, operation=replace(owners.operation, role=operation[0], effort=operation[1]),
+  )
+  admit(_request(role=spawn[0], effort=spawn[1]), _root(), owners=owners)
+  assert resolver.reads == ["node.explore"]
+  assert resolver.selections == [selected]
 
 
 def test_remaining_budget_is_the_share() -> None:
@@ -692,6 +883,7 @@ def _continuation_task(
   *,
   legacy: bool = False,
   admitted_context: AdmittedContextWire | None = None,
+  depth: int | None = None,
 ) -> AdmittedTask:
   runner = _BackgroundRunner()
   wire, _ = _door_context(runner, {}, caplog)
@@ -704,7 +896,11 @@ def _continuation_task(
   else:
     payload["execution_snapshot"]["admitted_context"] = wire.model_copy(update={
       "budget_share": -4.5,
-      "lineage": wire.lineage.model_copy(update={"depth": 9}),
+      "lineage": (
+        wire.lineage.model_copy(update={"depth": depth})
+        if depth is not None
+        else wire.lineage
+      ),
     }).model_dump(mode="json")
   payload.pop("admitted_task_digest")
   seal_admitted_task_payload(payload)
@@ -715,6 +911,7 @@ def _continuation_task(
   ("cause", "placement", "environment"),
   [
     ("continuation", "in_process", ()),
+    ("revive", "in_process", ()),
     ("placement_lost", "local_stub", ("PATH",)),
   ],
 )
@@ -726,13 +923,13 @@ def test_continuation_relocates_without_rebinding_or_regranting(
   owner_session_host_policy: Any,
 ) -> None:
   owner_session_host_policy.get_local_tool_effect = lambda _name: "read"
-  task = _continuation_task(caplog)
+  task = _continuation_task(caplog, depth=9)
   assert task.execution_snapshot is not None
   original = task.execution_snapshot.admitted_context
   assert original is not None
   result = admit(
     ContinueRequest(task.attempt.physical_task_id, cause=cause),
-    _root(tool_ids=frozenset({"write_record"}), remaining_usd=100.0),
+    _root(depth=7, tool_ids=frozenset({"write_record"}), remaining_usd=0.0),
     owners=ContinuationOwners(
       task=task,
       research_binding=original.research_binding,
@@ -747,6 +944,9 @@ def test_continuation_relocates_without_rebinding_or_regranting(
   assert result.wire.env_projection == environment
   assert result.wire.budget_share == -4.5
   assert result.wire.lineage.depth == 9
+  assert result.wire.lineage == original.lineage
+  assert result.wire.tool_grant == original.tool_grant
+  assert result.tool_authority is task
   assert result.wire.capability_bind == task.model_bind
   authority = result.tool_authority
   assert authority.tool_routes is not None
@@ -755,6 +955,73 @@ def test_continuation_relocates_without_rebinding_or_regranting(
   )
   assert tool_ids == local_ids == frozenset({"file_read", "web_search"})
   assert mcp_scope == {}
+
+
+@pytest.mark.parametrize("cause", ["continuation", "revive", "placement_lost"])
+def test_continuation_keeps_frozen_spawn_grant_after_depth_limit_changes(
+  cause: Any,
+  caplog: pytest.LogCaptureFixture,
+  owner_session_host_policy: Any,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  owner_session_host_policy.get_local_tool_effect = lambda _name: "read"
+  admitted = admit(
+    _request(),
+    _root(research_binding=AdmittedResearchBinding(research_file_id=42)),
+    owners=_owners(
+      _PlainResolver(),
+      ceiling=frozenset({"file_read", "run_agent", "web_search"}),
+      children=("explore",),
+    ),
+  )
+  assert isinstance(admitted, AdmittedContext)
+  authority = admitted.tool_authority
+  payload = _continuation_task(caplog, depth=9).model_dump(mode="json")
+  # Freeze the semantic owner's grant, routes and definitions as one task.
+  payload["operation"]["children"] = list(admitted.wire.children)
+  payload["tool_grant"] = authority.grant.model_dump(mode="json")
+  payload["tool_grant_digest"] = authority.grant.digest
+  payload["capability_bindings"] = [
+    binding.model_dump(mode="json") for binding in authority.bindings
+  ]
+  payload["capability_binding_digest"] = sha256_digest(payload["capability_bindings"])
+  payload["tool_routes"] = [
+    {"tool_id": route.tool_id, "origin": route.origin, "server_id": route.server_id}
+    for route in authority.physical_routes
+  ]
+  snapshot = payload["execution_snapshot"]
+  snapshot["provider_tool_definitions"] = [
+    {"definition": {
+      "name": entry.tool_id,
+      "description": entry.tool_id,
+      "input_schema": {"type": "object"},
+    }}
+    for entry in authority.grant.tools
+  ]
+  snapshot["admitted_context"] = admitted.wire.model_copy(update={
+    "lineage": admitted.wire.lineage.model_copy(update={"depth": 9}),
+    "budget_share": -4.5,
+  }).model_dump(mode="json")
+  payload.pop("admitted_task_digest")
+  seal_admitted_task_payload(payload)
+  task = AdmittedTask.model_validate(payload)
+  before = task.model_dump(mode="json")
+  monkeypatch.setenv("HANK_MAX_SPAWN_DEPTH", "0")
+  result = admit(
+    ContinueRequest(task.attempt.physical_task_id, cause=cause),
+    _root(depth=7, tool_ids=frozenset(), remaining_usd=0.0),
+    owners=ContinuationOwners(
+      task=task,
+      research_binding=admitted.wire.research_binding,
+    ),
+  )
+  assert isinstance(result, AdmittedContext)
+  assert result.tool_authority is task
+  assert result.wire.tool_grant == ("file_read", "run_agent", "web_search")
+  assert result.wire.lineage.depth == 9
+  assert result.wire.lineage.parent_job_id == admitted.wire.lineage.parent_job_id
+  assert result.wire.budget_share == -4.5
+  assert task.model_dump(mode="json") == before
 
 
 @pytest.mark.parametrize("cause", ["continuation", "revive", "placement_lost"])
@@ -994,20 +1261,35 @@ def test_frozen_bind_is_authorized_without_reselection(
   assert result.wire.capability_bind is frozen
 
 
-def test_declared_child_can_spawn_without_gaining_undeclared_operations() -> None:
-  owners = _owners(_resolver(), ceiling=frozenset({"run_agent", "file_read"}))
-  owners = replace(
-    owners, operation=replace(owners.operation, children=("explore",)),
+def test_default_root_lead_worker_bound_keeps_declared_child_authority() -> None:
+  owners = _owners(
+    _resolver(),
+    ceiling=frozenset({"run_agent", "file_read"}),
+    children=("explore",),
   )
-  admitted = admit(_request(), _root(), owners=owners)
-  assert isinstance(admitted, AdmittedContext)
-  parent = context_for_child(admitted, job_id="lead")
+  root = _root()
+  assert root.depth == 0
+  lead = admit(_request(), root, owners=owners)
+  assert isinstance(lead, AdmittedContext)
+  assert lead.wire.lineage.depth == 1
+  assert lead.wire.tool_grant == ("file_read", "run_agent")
+  parent = context_for_child(lead, job_id="lead")
   worker = admit(_request(), parent, owners=owners)
   refused = admit(_request(operation="mutate"), parent, owners=owners)
   assert isinstance(worker, AdmittedContext)
-  assert "run_agent" in worker.wire.tool_grant
+  assert worker.wire.lineage.depth == 2
   assert worker.wire.lineage.parent_job_id == "lead"
+  assert worker.wire.tool_grant == ("file_read",)
+  assert tuple(entry.tool_id for entry in worker.tool_authority.grant.tools) == (
+    "file_read",
+  )
+  worker_context = context_for_child(worker, job_id="worker")
+  assert worker_context.tool_ids == frozenset({"file_read"})
+  assert worker.wire.children == ("explore",)
   assert isinstance(refused, Refusal) and refused.reason == "grant_exceeds_parent"
+  stale_spawn = admit(_request(), worker_context, owners=owners)
+  assert isinstance(stale_spawn, Refusal)
+  assert stale_spawn.reason == "depth_exceeded"
 
 
 def test_late_output_can_be_read_and_explicitly_passed_without_ambient_access() -> None:

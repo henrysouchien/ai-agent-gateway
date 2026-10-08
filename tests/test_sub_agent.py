@@ -16,6 +16,7 @@ from pydantic import JsonValue, ValidationError
 
 from agent_gateway import AgentRunner, ToolDispatcher
 from agent_gateway.admission import capture_job_context, current_parent_context
+from agent_gateway.job_caller import JobScope, rebind_job_handlers
 from agent_gateway.tool_result_spill import (
   SpillCapabilities,
   SpillSink,
@@ -411,6 +412,171 @@ def _handler(
     trusted_research_file_id=trusted_research_file_id,
     declared_local_tool_definitions=declared_local_tool_definitions,
   )
+
+
+def test_rebound_run_agent_uses_child_authority_and_runner(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  owner_session_host_policy: Any,
+) -> None:
+  monkeypatch.delenv("HANK_MAX_SPAWN_DEPTH", raising=False)
+  owner_session_host_policy.get_local_tool_effect = lambda _name: "read"
+
+  _write_operation(tmp_path)
+  profile_path = tmp_path / "filing-review.md"
+  profile_path.write_text(
+    profile_path.read_text(encoding="utf-8").replace(
+      "agent_callable: true", "agent_callable: true\nchildren: [filing-review]",
+    ),
+    encoding="utf-8",
+  )
+  loader = SkillLoader(tmp_path)
+  operation = _operation(loader)
+  async def exercise() -> None:
+    calls: list[dict[str, Any]] = []
+    refusals: list[dict[str, Any]] = []
+    root_sessions: list[GatewaySession] = []
+    handler: Any = None
+
+    class SlotRunner(_Runner):
+      def __init__(self, depth: int) -> None:
+        super().__init__()
+        self.depth = depth
+        self.slot = asyncio.Semaphore(1)
+
+      async def spawn_sub_agent(self, task: str, **kwargs: Any):
+        async with self.slot:
+          call = {"task": task, **kwargs}
+          calls.append(call)
+          child_session = kwargs["sub_session"]
+          child_runner = SlotRunner(self.depth + 1)
+          handlers = {"run_agent": handler}
+          rebind_job_handlers(handlers, JobScope(
+            caller=lambda: current_parent_context(child_session),
+            spill_sink=lambda: None,
+            runner=lambda: child_runner,
+            session=child_session,
+          ))
+          result, error = await handlers["run_agent"]({
+            "operation": operation,
+            "objective": "Collect nested evidence.",
+            "background": False,
+          })
+          if self.depth == 0:
+            assert error is None and result is not None
+            assert self.slot.locked()
+          else:
+            assert result is None and error is not None
+            refusals.append(error)
+          return _spawn_result(call), None
+
+    root_runner = SlotRunner(0)
+    handler = _handler(
+      root_runner, loader=loader, parent_sessions=root_sessions,
+    )
+    result, error = await asyncio.wait_for(handler({
+      "objective": "Collect evidence.",
+      "operation": operation,
+      "background": False,
+    }), timeout=5)
+    assert error is None and result is not None
+    assert len(calls) == 2
+    child, grandchild = [
+      call["admitted_task"].execution_snapshot.admitted_context
+      for call in calls
+    ]
+    assert child.lineage.depth == 1
+    assert grandchild.lineage.depth == 2
+    assert grandchild.lineage.parent_job_id == (
+      calls[0]["admitted_task"].attempt.physical_task_id
+    )
+    assert child.tool_grant == ("web_search",)
+    assert grandchild.tool_grant == child.tool_grant
+    assert len(refusals) == 1
+    assert refusals[0]["code"] == "depth_exceeded"
+
+  asyncio.run(exercise())
+
+
+def test_rebound_run_agent_admits_typed_ticker_with_child_session_tenant(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  owner_session_host_policy: Any,
+) -> None:
+  monkeypatch.delenv("HANK_MAX_SPAWN_DEPTH", raising=False)
+  owner_session_host_policy.get_local_tool_effect = lambda _name: "read"
+
+  _write_operation(tmp_path, required_context=("ticker",))
+  profile_path = tmp_path / "filing-review.md"
+  profile_path.write_text(
+    profile_path.read_text(encoding="utf-8").replace(
+      "agent_callable: true", "agent_callable: true\nchildren: [filing-review]",
+    ),
+    encoding="utf-8",
+  )
+  loader = SkillLoader(tmp_path)
+  operation = _operation(loader)
+
+  async def exercise() -> None:
+    calls: list[dict[str, Any]] = []
+    root_sessions: list[GatewaySession] = []
+    handler: Any = None
+
+    class SlotRunner(_Runner):
+      def __init__(self, depth: int) -> None:
+        super().__init__()
+        self.depth = depth
+        self.slot = asyncio.Semaphore(1)
+
+      async def spawn_sub_agent(self, task: str, **kwargs: Any):
+        async with self.slot:
+          call = {"task": task, **kwargs}
+          calls.append(call)
+          if self.depth == 0:
+            child_session = kwargs["sub_session"]
+            child_runner = SlotRunner(self.depth + 1)
+            handlers = {"run_agent": handler}
+            rebind_job_handlers(handlers, JobScope(
+              caller=lambda: current_parent_context(child_session),
+              spill_sink=lambda: None,
+              runner=lambda: child_runner,
+              session=child_session,
+            ))
+            result, error = await handlers["run_agent"]({
+              "operation": operation,
+              "objective": "Collect nested filing evidence.",
+              "ticker": "AAPL",
+              "background": False,
+            })
+            assert error is None and result is not None
+            assert self.slot.locked()
+          return _spawn_result(call), None
+
+    root_runner = SlotRunner(0)
+    handler = _handler(
+      root_runner, loader=loader, parent_sessions=root_sessions,
+    )
+    result, error = await asyncio.wait_for(handler({
+      "objective": "Lead the filing review.",
+      "operation": operation,
+      "ticker": "AAPL",
+      "background": False,
+    }), timeout=5)
+    assert error is None and result is not None
+    assert len(calls) == 2
+    lead, grandchild = [call["admitted_task"] for call in calls]
+    context = grandchild.execution_snapshot.admitted_context
+    assert context.lineage.depth == 2
+    assert context.lineage.parent_job_id == lead.attempt.physical_task_id
+    ticker_input = next(
+      binding for binding in grandchild.inputs if binding.name == "ticker"
+    )
+    assert ticker_input.context.content == "AAPL"
+    assert ticker_input.source.actual_contract == TICKER_INPUT_CONTRACT
+    assert ticker_input.source.owner.tenant_id == root_sessions[0].tenant_id
+    assert ticker_input.source.owner.tenant_id == "tenant-test"
+
+  asyncio.run(exercise())
 
 
 def _write_operation(

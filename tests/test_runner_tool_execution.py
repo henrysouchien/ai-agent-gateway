@@ -1671,6 +1671,13 @@ class _PreparedRecordedDispatcher(_RecordedDispatcher):
     self.prepare_calls += 1
     return PreparedToolCall({**tool_input, "prepared": tool_name})
 
+  async def prepare_tool_call_async(
+    self,
+    tool_name: str,
+    tool_input: dict[str, Any],
+  ) -> PreparedToolCall:
+    return self.prepare_tool_call(tool_name, tool_input)
+
   def redact_prepared_tool_input(
     self,
     tool_name: str,
@@ -1784,6 +1791,13 @@ class _FailingPreparationDispatcher(_Dispatcher):
     _tool_input: dict[str, Any],
   ) -> PreparedToolCall:
     raise RuntimeError("resolver unavailable")
+
+  async def prepare_tool_call_async(
+    self,
+    tool_name: str,
+    tool_input: dict[str, Any],
+  ) -> PreparedToolCall:
+    return self.prepare_tool_call(tool_name, tool_input)
 
   async def dispatch_prepared(self, *_args: Any, **_kwargs: Any):
     self.dispatch_calls += 1

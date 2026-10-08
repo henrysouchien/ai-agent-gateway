@@ -14,9 +14,9 @@ class CellBridge(Protocol):
 
   Subprocess hands `child_fds()` to the child with `child_env()` and runs
   `serve()` on its inherited pipes. Docker initializes its container runner
-  over stdin and routes the runner's bridge frames through `handle_frame()`.
-  The transport decodes data/request frames against `budget` once; the reader
-  charges bridge replies. Both close the registration when the cell ends.
+  over stdin and routes decoded bridge requests through `handle_decoded_frame()`.
+  The channel's `decode_frame()` charges inbound data/request frames once;
+  its answer path charges bridge replies. Both close registration at cell end.
   """
 
   budget: CellBudget
@@ -33,9 +33,11 @@ class CellBridge(Protocol):
 
   async def serve(self) -> None: ...
 
-  async def answer_frame(self, line: bytes, *, accounted: bool = False) -> Dict[str, Any]: ...
+  def decode_frame(self, line: bytes) -> Dict[str, Any]: ...
 
-  async def handle_frame(self, line: bytes, *, accounted: bool = False) -> bytes: ...
+  async def handle_frame(self, line: bytes) -> bytes: ...
+
+  async def handle_decoded_frame(self, frame: Dict[str, Any]) -> bytes: ...
 
   def close(self) -> None: ...
 

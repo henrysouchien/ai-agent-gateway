@@ -50,6 +50,10 @@ each entry's per-family `compat` block and the rate tables.
 and authorizes a secret-free bind through that owner, without materializing
 credentials or constructing an adapter. `resolve()` selects and materializes
 once; `materialize_bind()` executes an already selected bind without reselection.
+Both selection methods accept already-lowered `role`/exact `effort` and the
+admission owner's effective `role_map` with its source. They use the shared
+model-authority resolver; this adapter does not capture principal preferences
+or own a map registry.
 [`agent_gateway/providers/`](agent_gateway/providers/README.md) builds each request
 from the bound entry. Mechanism: `docs/reference/model-authority.md`.
 

@@ -2527,10 +2527,12 @@ def test_sub_agent_events_are_written_to_parent_log(tmp_path: Path) -> None:
       physical_task_id="sub0:sess-parent",
     )
   )
+  child_runner_ref: list[Any] = []
   result, error = _run(
     parent_runner.spawn_sub_agent(
       "Collect background context",
       capability_execution=_child_execution(parent_runner._provider),
+      bind_job_runner=child_runner_ref.append,
       logical_task=logical_task,
       attempt=attempt,
       result_requirement=result_requirement,
@@ -2587,10 +2589,12 @@ def test_spawn_sub_agent_uses_shared_sub_agent_id_helper(tmp_path: Path, monkeyp
       physical_task_id="sub3:derived-parent",
     )
   )
+  child_runner_ref: list[Any] = []
   result, error = _run(
     parent_runner.spawn_sub_agent(
       "Collect background context",
       capability_execution=_child_execution(parent_runner._provider),
+      bind_job_runner=child_runner_ref.append,
       logical_task=logical_task,
       attempt=attempt,
       result_requirement=result_requirement,
@@ -2769,9 +2773,11 @@ def test_session_context_builder_resumes_the_model_visible_state_of_every_turn(
           physical_task_id=f"sub{call_index}:sess-parent",
         )
       )
+      child_runner_ref: list[Any] = []
       result, error = await runner.spawn_sub_agent(
         objective,
         capability_execution=_child_execution(child_provider),
+        bind_job_runner=child_runner_ref.append,
         logical_task=logical_task,
         attempt=attempt,
         result_requirement=result_requirement,

@@ -9,13 +9,17 @@ context holds the exact tool and approval authorities its consumers execute;
 are log lines: one ``admitted`` line and one line per unknown name.
 
 ``budget_share`` records observed remaining spend, including overruns and an
-unknown value. Spend and lineage depth are not admission quotas; containment
-remains owned by ``runner_soft_budget``.
+unknown value; ``runner_soft_budget`` owns spend containment. Fresh spawns
+default to depth two (root 0 → lead 1 → worker 2); ``HANK_MAX_SPAWN_DEPTH``
+sets that resource bound and a negative value disables it. At the deepest
+tier the executable grant omits ``run_agent``; continuations retain their
+original grant and lineage without applying a fresh-spawn bound.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Generic, Literal, TypeVar, overload
@@ -50,6 +54,7 @@ RefusalReason = Literal[
   "invite_effect_not_allowed",
   "handle_not_granted",
   "binding_not_granted",
+  "depth_exceeded",
 ]
 Placement = Literal["in_process", "local_stub", "hosted_stub"]
 
@@ -59,6 +64,8 @@ class Refusal:
   reason: RefusalReason
   owner: str
   detail: str
+  classification: Literal["resource"] | None = None
+  next_call: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +78,7 @@ class SpawnRequest:
   handles: tuple[str, ...] = ()
   binding: AdmittedResearchBinding | None = None
   effort: str | None = None
+  role: str | None = None
   profile: str | None = None
 
 
@@ -215,6 +223,9 @@ class OperationRegistration:
   MCP routes and artifact doors): they may extend the parent's visible surface,
   but remain narrowed by its withheld set. ``route_tool_names`` maps a canonical
   route id to the tool name the role policy reads; an absent id is its own name.
+  ``role`` and ``effort`` are the operation's declared model role and exact
+  effort (``AgentOperationSnapshot``); a spawn's own value wins, and an absent
+  one leaves the authority's slot default in force.
   """
 
   name: str
@@ -223,6 +234,8 @@ class OperationRegistration:
   operation_routes: frozenset[str]
   route_tool_names: Mapping[str, str] = field(default_factory=dict)
   children: tuple[str, ...] = ()
+  role: str | None = None
+  effort: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,6 +402,23 @@ def _admit_spawn(
   admission adds no refusal around it.
   """
 
+  max_spawn_depth = int(os.getenv("HANK_MAX_SPAWN_DEPTH", "2"))
+  if max_spawn_depth >= 0 and parent.depth >= max_spawn_depth:
+    return Refusal(
+      reason="depth_exceeded",
+      owner="admission spawn containment",
+      detail=(
+        f"Spawn depth {parent.depth} has reached the configured maximum "
+        f"{max_spawn_depth}."
+      ),
+      classification="resource",
+      next_call=(
+        "Return an ordinary final response with your partial work to your "
+        "parent; the parent can spawn the remaining work."
+      ),
+    )
+  child_depth = parent.depth + 1
+
   registration = owners.operation
   if parent.children is not None and request.operation not in parent.children:
     return Refusal(
@@ -446,7 +476,9 @@ def _admit_spawn(
     owners.frozen_bind
     if owners.frozen_bind is not None
     else owners.capability_execution_resolver.select_bind(
-      registration.execution_class, effort=request.effort,
+      registration.execution_class,
+      role=request.role if request.role is not None else registration.role,
+      effort=request.effort if request.effort is not None else registration.effort,
     )
   )
 
@@ -478,7 +510,10 @@ def _admit_spawn(
       or policy_name in role_denied
     ):
       continue
-    if tool_id == RUN_AGENT_TOOL_NAME and not children:
+    if tool_id == RUN_AGENT_TOOL_NAME and (
+      not children
+      or (max_spawn_depth >= 0 and child_depth >= max_spawn_depth)
+    ):
       continue
     granted.append(tool_id)
 
@@ -499,7 +534,7 @@ def _admit_spawn(
     approval_route=_approval_route_name(approval_route),
     handle_grants=tuple(sorted(request.handles)),
     placement=owners.placement,
-    lineage=AdmittedLineage(parent_job_id=parent.job_id, depth=parent.depth + 1),
+    lineage=AdmittedLineage(parent_job_id=parent.job_id, depth=child_depth),
   )
   log.info(
     "admitted %s: %s",

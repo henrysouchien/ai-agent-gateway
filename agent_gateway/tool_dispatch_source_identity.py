@@ -18,11 +18,14 @@ the citation-minting path and is deliberately not duplicated here.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Iterator, Mapping
 import hashlib
 from itertools import chain
+import logging
 import re
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------
@@ -738,28 +741,33 @@ def _read_parser_filing_sections(result: Mapping[str, Any]) -> list[dict[str, An
   return identities
 
 
+def metric_citation_source_rows(
+  items: Iterable[Any],
+) -> Iterator[tuple[Mapping[str, Any], str | None, Mapping[str, Any], dict[str, Any]]]:
+  """Convert parser citations once; consumers add presentation to these identities."""
+  for match in items:
+    if not isinstance(match, Mapping):
+      continue
+    for citation_key, citation in _metric_citation_items(match):
+      source_kind = _optional_str(citation.get("source_kind")) or "xbrl_fact"
+      document_id = _metric_document_id(citation, source_kind=source_kind)
+      if document_id is None:
+        continue
+      identity = _identity(
+        document_id=document_id,
+        source_kind=source_kind,
+        source_url=_source_url_from_payload(citation),
+      )
+      if identity is not None:
+        yield match, citation_key, citation, identity
+
+
 def _read_metric_citations(result: Mapping[str, Any]) -> list[dict[str, Any]]:
   matches = chain.from_iterable(
     collection for name in ("matches", "series")
     if isinstance(collection := result.get(name), list)
   )
-  identities: list[dict[str, Any]] = []
-  for match in matches:
-    if not isinstance(match, Mapping):
-      continue
-    for _citation_key, citation in _metric_citation_items(match):
-      source_kind = _optional_str(citation.get("source_kind")) or "xbrl_fact"
-      document_id = _metric_document_id(citation, source_kind=source_kind)
-      if document_id is None:
-        continue
-      record = _identity(
-        document_id=document_id,
-        source_kind=source_kind,
-        source_url=_source_url_from_payload(citation),
-      )
-      if record is not None:
-        identities.append(record)
-  return identities
+  return [identity for _match, _key, _citation, identity in metric_citation_source_rows(matches)]
 
 
 def _read_positioning_filing_sources(
@@ -773,29 +781,35 @@ def _read_positioning_filing_sources(
   for filing in filing_sources:
     if not isinstance(filing, Mapping):
       continue
-    manager_cik = _required_str(filing.get("manager_cik"))
-    year = _required_str(filing.get("year"))
-    quarter = _required_str(filing.get("quarter"))
-    source_url = _required_str(filing.get("source_url"))
-    if not manager_cik or not year or not quarter or not source_url:
-      continue
-    document_id = f"fmp:13f:{manager_cik}:{year}:Q{quarter}"
-    key_fields: dict[str, Any] = {
-      "manager_cik": manager_cik,
-      "year": filing["year"],
-      "quarter": filing["quarter"],
+    coordinates = {
+      field: filing[field]
+      for field in ("manager_cik", "year", "quarter")
+      if field in filing
     }
+    missing = [
+      field for field in ("manager_cik", "year", "quarter", "source_url")
+      if not _required_str(filing.get(field))
+    ]
+    if missing:
+      log.warning("get_topdown_positioning source row missing fields: %s", ", ".join(missing))
+    document_id = (
+      f"fmp:13f:{coordinates['manager_cik']}:{coordinates['year']}:Q{coordinates['quarter']}"
+      if all(_required_str(coordinates.get(field)) for field in ("manager_cik", "year", "quarter"))
+      else None
+    )
+    key_fields = dict(coordinates)
     accession = _required_str(filing.get("accession"))
     if accession:
-      document_id += f":{accession}"
+      if document_id is not None:
+        document_id += f":{accession}"
       key_fields["accession"] = accession
     record = {
-      "document_id": document_id,
+      **({"document_id": document_id} if document_id is not None else {}),
       "source_kind": "vendor",
       "provider": "fmp",
       "endpoint": "get_topdown_positioning",
       "key_fields": key_fields,
-      "source_url": source_url,
+      **({"source_url": filing["source_url"]} if "source_url" in filing else {}),
     }
     identities.append(record)
   return identities
@@ -810,27 +824,26 @@ def _read_producer_vendor_sources(
     return []
   identities: list[dict[str, Any]] = []
   for source in sources:
-    if not isinstance(source, Mapping) or source.get("source_kind") != "vendor":
+    if not isinstance(source, Mapping):
       continue
-    provider = source.get("provider")
-    endpoint = source.get("endpoint")
-    source_url = source.get("source_url")
-    key_fields = source.get("key_fields")
-    if (
-      not isinstance(provider, str) or not provider.strip()
-      or not isinstance(endpoint, str) or not endpoint.strip()
-      or not isinstance(source_url, str) or not source_url.strip()
-      or not isinstance(key_fields, Mapping) or not key_fields
-    ):
-      continue
+    missing = [
+      field for field in ("source_kind", "provider", "endpoint", "source_url")
+      if not _required_str(source.get(field))
+    ]
+    if not source.get("key_fields"):
+      missing.append("key_fields")
+    if missing:
+      log.warning(
+        "producer_vendor_sources (%s) source row missing fields: %s",
+        source.get("endpoint"), ", ".join(missing),
+      )
     record: dict[str, Any] = {
-      "document_id": source_url,
-      "source_kind": "vendor",
-      "provider": provider,
-      "endpoint": endpoint,
-      "key_fields": dict(key_fields),
-      "source_url": source_url,
+      field: source[field]
+      for field in ("source_kind", "provider", "endpoint", "key_fields", "source_url")
+      if field in source
     }
+    if "source_url" in source:
+      record["document_id"] = source["source_url"]
     for field in ("section_label", "as_of", "as_of_basis"):
       if field in source:
         record[field] = source[field]
@@ -901,6 +914,7 @@ __all__ = [
   "canonicalize_filing_document_id",
   "canonicalize_transcript_document_id",
   "canonicalize_web_document_id",
+  "metric_citation_source_rows",
   "normalize_citation_document_id",
   "read_source_identities",
   "sandbox_computation_document_id",

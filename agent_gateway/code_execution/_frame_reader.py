@@ -50,7 +50,6 @@ import weakref
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from ..policy_imports import load_server_policy_helpers, resolve_server_policy_tool_class
-from ..runner_tool_execution import _AsyncToolCallPreparer
 from ..sdk_runner_helpers import server_for_tool
 from ..tool_dispatch_declarations import canonical_dispatch_tool_name
 
@@ -381,28 +380,25 @@ class CellChannel:
 
   # --- frame handling --------------------------------------------------------
 
-  async def handle_frame(self, line: bytes, *, accounted: bool = False) -> bytes:
-    """Return already-accounted wire bytes; transports must not charge twice."""
-    return (await self._answer_wire(line, accounted=accounted))[1]
+  def decode_frame(self, line: bytes) -> Dict[str, Any]:
+    """Decode and charge one inbound frame, including kernel control frames."""
+    return decode_frame(line, self.budget)
 
-  async def answer_frame(self, line: bytes, *, accounted: bool = False) -> Dict[str, Any]:
-    """Validate both directions, including direct (non-transport) callers.
+  async def handle_frame(self, line: bytes) -> bytes:
+    """Decode one raw request and return its budgeted wire reply."""
+    try:
+      frame = self.decode_frame(line)
+    except ProtocolError as exc:
+      return self._protocol_error_wire({}, exc)
+    return await self.handle_decoded_frame(frame)
 
-    `accounted` means the transport already decoded this inbound frame against
-    this same cell budget. It never bypasses the individual frame bound.
-    """
-    return (await self._answer_wire(line, accounted=accounted))[0]
-
-  async def _answer_wire(self, line: bytes, *, accounted: bool) -> tuple[Dict[str, Any], bytes]:
-    frame: Dict[str, Any] = {}
+  async def handle_decoded_frame(self, frame: Dict[str, Any]) -> bytes:
+    """Answer a request already decoded and charged by this channel."""
     reply: Dict[str, Any] = {}
     task = asyncio.current_task()
     if task is not None:
       self._inflight.add(task)
     try:
-      frame = decode_frame(line, None if accounted else self.budget)
-      if self.budget.error is not None:
-        raise ProtocolError(self.budget.error)
       reply = await self._answer_frame(frame)
       wire = encode_frame(reply, self.budget)
       nested_id = reply.get("nested_call_id")
@@ -412,27 +408,26 @@ class CellChannel:
             envelope = encode_frame({**reply, "result": None})
             entry["result_bytes"] = len(wire) - len(envelope) + 4
             break
-      return reply, wire
+      return wire
     except ProtocolError as exc:
-      if len(line) > MAX_FRAME_BYTES:
-        self.budget.fail(str(exc))
       nested_id = reply.get("nested_call_id")
       for entry in self.ledger:
         if entry["nested_call_id"] == nested_id:
           entry["ok"] = False
           entry["error_code"] = "protocol_error"
-      reply = _error_reply(frame.get("type"), frame.get("call_id"), "protocol_error", str(exc))
-      try:
-        wire = encode_frame(reply, self.budget)
-      except ProtocolError as bounds:
-        # Untrusted correlation/type fields may themselves fill the frame.
-        # A terminal protocol error has a fixed-size envelope.
-        reply = _error_reply(None, None, "protocol_error", str(bounds))
-        wire = encode_frame(reply)
-      return reply, wire
+      return self._protocol_error_wire(frame, exc)
     finally:
       if task is not None:
         self._inflight.discard(task)
+
+  def _protocol_error_wire(self, frame: Dict[str, Any], exc: ProtocolError) -> bytes:
+    reply = _error_reply(frame.get("type"), frame.get("call_id"), "protocol_error", str(exc))
+    try:
+      return encode_frame(reply, self.budget)
+    except ProtocolError as bounds:
+      # Untrusted correlation/type fields may themselves fill the frame.
+      # A terminal protocol error has a fixed-size envelope.
+      return encode_frame(_error_reply(None, None, "protocol_error", str(bounds)))
 
   async def _answer_frame(self, frame: Dict[str, Any]) -> Dict[str, Any]:
     frame_type = frame.get("type")
@@ -525,13 +520,7 @@ class CellChannel:
 
     started = time.monotonic()
     try:
-      # Select the same preparation owner as direct runner calls. Registered
-      # Excel routes resolve workbook identity asynchronously before dispatch.
-      prepare_async = getattr(dispatcher, "prepare_tool_call_async", None)
-      if isinstance(prepare_async, _AsyncToolCallPreparer):
-        prepared_call = await prepare_async(operation, tool_input)
-      else:
-        prepared_call = dispatcher.prepare_tool_call(operation, tool_input)
+      prepared_call = await dispatcher.prepare_tool_call_async(operation, tool_input)
       executed_call = prepared_call
 
       def capture_executed(call: Any) -> None:
@@ -588,21 +577,38 @@ class CellChannel:
     return reply
 
   def _record_sources(self, operation: str, nested_call_id: str, result: Any, settled_sources: Any) -> None:
-    # Settled producer identities are authoritative (including input-dependent
-    # vendor ids). The product extractor may additionally supply richer handles.
-    handles = list(settled_sources)
+    # Settlement owns identity; the extractor only enriches those rows with
+    # citation presentation. It cannot introduce another source.
+    identity_fields = ("document_id", "source_kind", "source_url", "provider", "endpoint", "key_fields")
+
+    def identity_key(source: Mapping[str, Any]) -> str:
+      return json.dumps(
+        _materialize_source_identity({field: source.get(field) for field in identity_fields}),
+        sort_keys=True, separators=(",", ":"),
+      )
+
+    identities = {
+      identity_key(source): _materialize_source_identity(source)
+      for source in settled_sources
+    }
+    presentations: List[tuple[str, Dict[str, Any]]] = []
     extract = self._extract_sources
     if extract is not None:
       try:
-        handles.extend(extract(operation, result) or ())
+        for partial in extract(operation, result) or ():
+          identity = identity_key(partial)
+          presentations.append((identity, {
+            field: value for field, value in partial.items() if field not in identity_fields
+          }))
       except Exception:
         log.exception("code_execute source extraction failed for %s", nested_call_id)
+    handles = [
+      {**identities[identity], **presentation}
+      for identity, presentation in presentations if identity in identities
+    ]
+    presented = {identity for identity, _presentation in presentations}
+    handles.extend(source for identity, source in identities.items() if identity not in presented)
     for handle in handles:
-      if not isinstance(handle, Mapping):
-        continue
-      # Registered settlement freezes nested values; project them exactly as
-      # direct dispatch records do before registry keying or inline transport.
-      handle = _materialize_source_identity(handle)
       try:
         key = (
           self._source_key(handle)
@@ -614,13 +620,9 @@ class CellChannel:
         continue
       # Provenance, not payload: the citation owner treats the handle as the
       # nested operation's partial, not `code_execute`'s.
-      existing = self._sources.get(key)
-      if existing is None:
-        self._sources[key] = {**handle, "produced_by_tool": canonical_dispatch_tool_name(operation)}
-      else:
-        # Preserve settled identity fields while retaining richer handle
-        # metadata (e.g. filing accession) for the same registry identity.
-        self._sources[key] = {**handle, **existing}
+      self._sources.setdefault(
+        key, {**handle, "produced_by_tool": canonical_dispatch_tool_name(operation)},
+      )
 
   def _catalog(self, frame: Dict[str, Any]) -> Dict[str, Any]:
     call_id = frame.get("call_id")

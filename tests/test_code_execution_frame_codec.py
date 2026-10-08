@@ -48,24 +48,22 @@ def test_exact_frame_boundary_and_poisoned_aggregate():
   assert codec.decode_frame(codec.encode_frame({"error": "protocol_error"})) == {"error": "protocol_error"}
 
 
-def test_direct_reader_bounds_and_accounted_transport_do_not_double_charge():
+def test_reader_bounds_and_fresh_cell_after_oversized_request():
   async def run():
     reader = FrameReader()
     cell = reader.open_cell("outer", abort_event=None, active=True)
     try:
       frame = {"type": "hello", "call_id": "h1", "cell_token": cell.token, "protocol": 1}
       wire = codec.encode_frame(frame)
-      codec.decode_frame(wire, cell.budget)
-      reply_wire = await cell.handle_frame(wire, accounted=True)
+      reply_wire = await cell.handle_frame(wire)
       assert codec.decode_frame(reply_wire)["ok"] is True
       assert cell.budget.used_bytes == len(wire) + len(reply_wire)
-      oversized = await cell.answer_frame(b"x" * (codec.MAX_FRAME_BYTES + 1), accounted=True)
+      oversized = codec.decode_frame(await cell.handle_frame(b"x" * (codec.MAX_FRAME_BYTES + 1)))
       assert oversized["error"]["code"] == "protocol_error"
-      # Even an accounted call cannot bypass the byte bound. A fresh cell has
-      # its own aggregate and token; the interpreter need not be destroyed.
+      # A fresh cell has its own aggregate and token; the interpreter survives.
       fresh = reader.open_cell("later", abort_event=None, active=True)
       try:
-        reply = await fresh.answer_frame(codec.encode_frame({"type": "hello", "cell_token": fresh.token}))
+        reply = codec.decode_frame(await fresh.handle_frame(codec.encode_frame({"type": "hello", "cell_token": fresh.token})))
         assert reply["ok"] is True
       finally:
         fresh.close()
