@@ -28,6 +28,7 @@ from agent_gateway.fork_request_handoff import ForkRequestHandoff
 from agent_gateway.providers import AnthropicProvider
 from agent_gateway.session import GatewaySession
 from gateway_test_support.capability_execution_test_support import stub_runner_capability_execution
+from model_authority.capabilities import CAPABILITY_IDS
 
 
 def test_auth_config_round_trips_and_preserves_all_fields() -> None:
@@ -147,6 +148,7 @@ def test_resolver_result_dataclass_and_credentials_resolver_async_contract() -> 
     "capabilities",
     "model_entitled_capabilities",
     "model_entitled_keys",
+    "unknown_model_entitled_capabilities",
   ]
   assert result.user_id == "alice"
   assert result.channel == "excel"
@@ -158,7 +160,32 @@ def test_resolver_result_dataclass_and_credentials_resolver_async_contract() -> 
   assert result.capabilities == frozenset()
   assert result.model_entitled_capabilities == frozenset()
   assert result.model_entitled_keys == frozenset()
+  assert result.unknown_model_entitled_capabilities == frozenset()
   assert result.auth_config is auth_config
+
+
+def test_resolver_result_names_unknown_model_entitlements() -> None:
+  auth_config = AuthConfig.from_dict(
+    {
+      "provider": "anthropic",
+      "billing_mode": "byok",
+      "api_key": "resolver-key",
+    }
+  )
+  known = sorted(CAPABILITY_IDS)[0]
+
+  result = ResolverResult(
+    user_id="alice",
+    channel="web",
+    auth_config=auth_config,
+    credential_principal="user",
+    model_entitled_capabilities=frozenset({known, "not.a.capability"}),
+  )
+
+  assert result.model_entitled_capabilities == frozenset({known})
+  assert result.unknown_model_entitled_capabilities == frozenset(
+    {"not.a.capability"}
+  )
 
 
 def test_resolver_result_requires_explicit_credential_principal() -> None:

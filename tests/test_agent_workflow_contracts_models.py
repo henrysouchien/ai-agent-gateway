@@ -317,38 +317,36 @@ def test_admitted_ref_binds_owner_contract_content_and_read_grant() -> None:
     )
 
 
-def test_agent_result_requirement_is_terminal_message_only() -> None:
-  projection = ProjectionRequirement(contract=contract("projection"))
+@pytest.mark.parametrize(
+  ("mode", "terminal_narrative"),
+  [
+    ("narrative", "required"),
+    ("hybrid", "optional"),
+    ("strict_projection", "forbidden"),
+  ],
+)
+def test_agent_result_requirement_preserves_result_metadata(
+  mode: str,
+  terminal_narrative: str,
+) -> None:
   requirement = ResultRequirement(
-    mode="narrative",
-    projection=None,
-    terminal_narrative="required",
+    mode=mode,
+    projection=ProjectionRequirement(contract=contract("projection")),
+    terminal_narrative=terminal_narrative,
     outcome=OutcomeRequirement(required=False, source="none"),
   )
-  assert ResultRequirement.model_validate(requirement.model_dump()) == requirement
-  with pytest.raises(ValidationError):
-    ResultRequirement.model_validate({
-      "mode": "hybrid",
-      "projection": projection.model_dump(mode="json"),
-      "terminal_narrative": "required",
-      "outcome": {"required": True, "source": "domain_tool"},
-    })
+  assert ResultRequirement.model_validate_json(
+    requirement.model_dump_json()
+  ) == requirement
+
+
+def test_agent_result_outcome_remains_runtime_owned() -> None:
   with pytest.raises(ValidationError):
     ResultRequirement.model_validate({
       "mode": "narrative",
-      "projection": projection.model_dump(mode="json"),
+      "projection": None,
       "terminal_narrative": "required",
-      "outcome": {"required": False, "source": "none"},
-    })
-  with pytest.raises(ValidationError):
-    ResultRequirement.model_validate({
-      "mode": "strict_projection",
-      "projection": {
-        "contract": contract("projection").model_dump(mode="json"),
-        "required": False,
-      },
-      "terminal_narrative": "forbidden",
-      "outcome": {"required": False, "source": "none"},
+      "outcome": {"required": True, "source": "domain_tool"},
     })
 
 

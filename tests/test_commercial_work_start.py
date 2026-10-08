@@ -26,6 +26,7 @@ from agent_gateway.commercial_claims import (
 )
 from agent_gateway.commercial_work_authorization import (
   VerifiedWorkAuthorization,
+  WorkAuthorizationError,
   WorkAuthorizationVerifier,
 )
 from agent_gateway.commercial_work_start import (
@@ -240,6 +241,7 @@ class _AuthorizationVerifier(WorkAuthorizationVerifier):
     self.order = order
     self.authorization = authorization
     self.calls: list[dict[str, object]] = []
+    self.error: Exception | None = None
 
   def verify_for_attach(
     self,
@@ -255,6 +257,8 @@ class _AuthorizationVerifier(WorkAuthorizationVerifier):
   ) -> VerifiedWorkAuthorization:
     self.order.append("verify_authorization")
     assert token in {WORK_TOKEN, WORK_TOKEN_2}
+    if self.error is not None:
+      raise self.error
     facts: dict[str, object] = {
       "execution_claim": execution_claim,
       "request_id": request_id,
@@ -340,20 +344,15 @@ def _request_facts():
   return session, request, headers
 
 
-def test_gate_is_default_off_and_rejects_false_authority_signals() -> None:
+def test_gate_is_default_off_and_ignores_commercial_headers() -> None:
   gate = CommercialWorkStartGate(enabled=False)
   session, request, headers = _request_facts()
   assert gate.verify_request(
     {}, session=session, request=request, channel="mcp"
   ) is None
-  with pytest.raises(
-    CommercialWorkStartError, match="disabled"
-  ) as raised:
-    gate.verify_request(
-      headers, session=session, request=request, channel="mcp"
-    )
-  assert raised.value.status_code == 403
-  assert raised.value.code == "commercial_work_start_disabled"
+  assert gate.verify_request(
+    headers, session=session, request=request, channel="mcp"
+  ) is None
 
 
 def test_enabled_gate_requires_complete_dependencies_and_both_headers() -> None:
@@ -467,18 +466,30 @@ def test_child_provider_must_match_verified_root_authority() -> None:
 
 def test_gate_maps_invalid_replay_conflict_and_storage_failure_to_no_start() -> None:
   order: list[str] = []
-  gate, claim_verifier, _, store = _gate(order)
+  gate, claim_verifier, authorization_verifier, store = _gate(order)
   session, request, headers = _request_facts()
-  claim_verifier.error = CommercialClaimError("expired")
+  claim_verifier.error = CommercialClaimError("unknown_key")
   with pytest.raises(CommercialWorkStartError) as invalid:
     gate.verify_request(
       headers, session=session, request=request, channel="mcp"
     )
   assert invalid.value.code == "commercial_work_authority_invalid"
   assert invalid.value.status_code == 403
+  assert "unknown_key" in str(invalid.value)
   assert store.attached == []
 
   claim_verifier.error = None
+  authorization_verifier.error = WorkAuthorizationError("key_retired")
+  with pytest.raises(CommercialWorkStartError) as retired:
+    gate.verify_request(
+      headers, session=session, request=request, channel="mcp"
+    )
+  assert retired.value.code == "commercial_work_authority_invalid"
+  assert retired.value.status_code == 403
+  assert "key_retired" in str(retired.value)
+  assert store.attached == []
+
+  authorization_verifier.error = None
   pending = gate.verify_request(
     headers, session=session, request=request, channel="mcp"
   )
@@ -527,11 +538,10 @@ class _CompleteRunner(AgentRunner):
     self,
     messages,
     system_prompt=None,
-    max_turns=None,
     *,
     resume_initial_messages=None,
   ) -> None:
-    _ = messages, system_prompt, max_turns, resume_initial_messages
+    _ = messages, system_prompt, resume_initial_messages
     self._order.append("provider_start")
     if self._delay:
       await asyncio.sleep(self._delay)
@@ -818,12 +828,23 @@ def _nested_string_values(value: object) -> list[str]:
   return []
 
 
-def test_unconfigured_server_rejects_commercial_headers() -> None:
+def test_unconfigured_server_ignores_commercial_headers() -> None:
   runtime_calls: list[str] = []
 
-  async def build_runtime(*_args, storage_root: Path | None = None, **_kwargs):
+  async def build_runtime(_session, request, _channel, _auth_manager, *, storage_root: Path | None = None):
+    _ = storage_root
     runtime_calls.append("runtime")
-    raise AssertionError("runtime must not be constructed")
+    assert request.commercial_work_start is None
+    return ChatRuntime(
+      system_prompt="test",
+      build_runner=lambda event_log, _sid, _started_at: _CompleteRunner(
+        event_log,
+        runtime_calls,
+        0,
+        request.capability_execution,
+      ),
+      capability_execution=request.capability_execution,
+    )
 
   app = create_gateway_app(
     _gateway_config(build_chat_runtime=build_runtime)
@@ -840,6 +861,5 @@ def test_unconfigured_server_rejects_commercial_headers() -> None:
         "messages": [{"role": "user", "content": "hello"}],
       },
     )
-  assert response.status_code == 403
-  assert response.json()["error"] == "commercial_work_start_disabled"
-  assert runtime_calls == []
+  assert response.status_code == 200, response.text
+  assert runtime_calls == ["runtime", "provider_start"]

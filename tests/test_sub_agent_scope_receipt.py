@@ -13,7 +13,6 @@ from agent_gateway.capability_resolution import (
   granted_tool_ids,
 )
 from agent_gateway.sub_agent_scope_receipt import (
-  OperationToolAdmissionError,
   admit_operation_tools,
   dispatcher_scopes_from_admitted_routes,
   parse_tool_grant,
@@ -260,7 +259,7 @@ def test_caller_exclusions_are_a_resolver_input_not_a_later_subtraction() -> Non
   assert derive_dispatcher_allowlist(authority) == {"web": frozenset({"web_search"})}
 
 
-def test_persisted_grant_digest_is_verified() -> None:
+def test_persisted_grant_parses_without_digest_reverification() -> None:
   authority = admit_operation_tools(
     _operation(),
     grant_id="grant:task-3",
@@ -274,8 +273,7 @@ def test_persisted_grant_digest_is_verified() -> None:
   payload = authority.grant.model_dump(mode="json")
   payload["digest"] = "sha256:" + "0" * 64
 
-  with pytest.raises(OperationToolAdmissionError, match="digest mismatch"):
-    parse_tool_grant(payload)
+  assert parse_tool_grant(payload).tools == authority.grant.tools
 
 
 def test_reissued_grant_keeps_persisted_route_scopes() -> None:
@@ -338,8 +336,10 @@ def test_persisted_routes_project_exact_local_and_mcp_dispatcher_scopes() -> Non
   assert local_tools == frozenset({"file_read"})
   assert mcp_scope == {"server-a": {"web_search"}}
 
-  with pytest.raises(OperationToolAdmissionError, match="exact ordered ToolGrant"):
-    dispatcher_scopes_from_admitted_routes(grant, tuple(reversed(routes)))
+  assert dispatcher_scopes_from_admitted_routes(
+    grant,
+    tuple(reversed(routes)),
+  ) == (all_tools, local_tools, mcp_scope)
 
 
 def test_admitted_route_origin_requires_its_exact_server_shape() -> None:

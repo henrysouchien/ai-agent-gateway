@@ -35,6 +35,7 @@ from agent_workflow_contracts import (  # noqa: E402
 from agent_gateway import AgentRunner, AgentSessionLog, EventLog, SessionContextBuilder, TaskState, ToolDispatcher  # noqa: E402
 from agent_gateway.mcp_client import McpClientManager, _ServerState  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
+from agent_gateway.approval_policy import RunContext  # noqa: E402
 import agent_gateway.runner_tool_execution as runner_tool_execution  # noqa: E402
 from agent_gateway.runner_background_tasks import (  # noqa: E402
   _BACKGROUND_RESULT_ACK_RESULT_KEY,
@@ -59,7 +60,7 @@ class _UnusedMcpSession:
     name: str,
     arguments: dict[str, object],
     *,
-    read_timeout_seconds: float,
+    read_timeout_seconds: float | None,
     meta: dict[str, object] | None = None,
   ) -> Never:
     _ = name, arguments, read_timeout_seconds, meta
@@ -248,6 +249,25 @@ class _HintedErrorDispatcher(_Dispatcher):
       "message": "ticker\n Unexpected keyword argument [type=unexpected_keyword_argument]",
       "tool_usage_hint": "Pass research_file_id; do not pass ticker.",
     }
+
+
+class _RefusalDispatcher(_Dispatcher):
+  def __init__(self, error: dict[str, Any]) -> None:
+    self._error = error
+
+  async def dispatch(
+    self,
+    tool_id: str,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    call_index: int = 0,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: Any | None = None,
+  ):
+    _ = tool_id, tool_name, tool_input, call_index
+    return None, dict(self._error)
+
 
 
 class _ApprovalTimeoutDispatcher(_Dispatcher):
@@ -1030,7 +1050,6 @@ def test_execute_single_tool_keeps_ui_blocks_validation_failure_recoverable() ->
   )
 
   assert "validation_failed" in json.loads(live_entry["content"])
-  assert getattr(runner, "_final_answer_turn_tool_name", None) is None
 
 
 def test_foreground_run_agent_emits_canonical_task_result_json() -> None:
@@ -1063,7 +1082,18 @@ def test_foreground_run_agent_emits_canonical_task_result_json() -> None:
   assert "TaskResult(" not in live_entry["content"]
 
 
-def test_execute_single_tool_keeps_generic_excluded_tools_bare() -> None:
+def _profile_excluded_error(tool_name: str) -> dict[str, Any]:
+  return {
+    "code": "tool_excluded",
+    "message": (
+      f"Tool '{tool_name}' is excluded by the profile's static excluded tools "
+      "and is not available in this run."
+    ),
+    "data": {"excluding_owner": "profile", "next_call": None},
+  }
+
+
+def test_execute_single_tool_names_the_excluding_owner_and_a_null_next_call() -> None:
   runner = AgentRunner(
     event_log=EventLog(session_id="test"),
     dispatcher=_ExplodingDispatcher(),  # type: ignore[arg-type]
@@ -1082,43 +1112,78 @@ def test_execute_single_tool_keeps_generic_excluded_tools_bare() -> None:
   assert tool_name == "run_agent"
   assert extra_blocks == []
   payload = json.loads(live_entry["content"])
-  assert payload["error"] == {
-    "code": "tool_excluded",
-    "message": "Tool 'run_agent' is not available in this context",
-  }
+  assert payload["error"] == _profile_excluded_error("run_agent")
 
 
-def test_execute_single_tool_returns_typed_blocker_for_output_file_gated_tool(monkeypatch: Any) -> None:
-  monkeypatch.setattr(
-    runner_tool_execution,
-    "_output_file_gated_tool_names",
-    lambda: frozenset({"analyze_stock"}),
-  )
+def test_execute_single_tool_names_the_skill_run_as_the_excluding_owner() -> None:
+  class _SkillRunDispatcher(_ExplodingDispatcher):
+    run_context = RunContext(
+      user_id="alice",
+      request_id="req-1",
+      profile="analyst",
+      skill="model-build",
+    )
+
   runner = AgentRunner(
     event_log=EventLog(session_id="test"),
-    dispatcher=_ExplodingDispatcher(),  # type: ignore[arg-type]
-    session_id="test-output-file-gated-excluded",
+    dispatcher=_SkillRunDispatcher(),  # type: ignore[arg-type]
+    session_id="test-skill-excluded",
     capability_execution=_capability_execution(),
-    excluded_tools={"analyze_stock"},
+    excluded_tools={"apply_patch_ops"},
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
   )
 
-  live_entry, tool_name, extra_blocks = _run(
-    runner._execute_single_tool("tool-1", "analyze_stock", {"ticker": "MSCI"}, {"tools": []})
+  live_entry, _tool_name, _extra_blocks = _run(
+    runner._execute_single_tool("tool-1", "apply_patch_ops", {"ops": []}, {"tools": []})
   )
 
-  assert tool_name == "analyze_stock"
-  assert extra_blocks == []
-  payload = json.loads(live_entry["content"])
-  error = payload["error"]
+  error = json.loads(live_entry["content"])["error"]
   assert error["code"] == "tool_excluded"
-  assert error["sub_code"] == "output_file_gated_tool_excluded"
-  assert "output='file'" in error["message"]
-  assert error["data"]["output_file_gated"] is True
-  assert error["data"]["suggested_tools"] == ["get_quote", "industry_peer_comparison"]
-  assert "quantifying-risk" in error["data"]["resolution"]
+  assert "skill's declared excludes" in error["message"]
+  assert error["data"] == {
+    "excluding_owner": "skill_or_operation_grant",
+    "profile": "analyst",
+    "skill": "model-build",
+    "next_call": None,
+  }
+
+
+def test_execute_single_tool_never_blames_the_skill_for_a_grant_omitted_tool() -> None:
+  # A delegated child as sub_agent.py builds it: the run context names the
+  # operation as `skill`, and `excluded_tools` already holds a local tool the
+  # operation grant left out, merged with whatever the skill excludes.
+  class _DelegatedChildDispatcher(_ExplodingDispatcher):
+    run_context = RunContext(
+      user_id="alice",
+      request_id="req-1",
+      run_id="skill-run-1",
+      profile="analyst",
+      skill="explore",
+    )
+
+  runner = AgentRunner(
+    event_log=EventLog(session_id="test"),
+    dispatcher=_DelegatedChildDispatcher(),  # type: ignore[arg-type]
+    session_id="test-grant-omitted",
+    capability_execution=_capability_execution(),
+    excluded_tools={"get_quote"},
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  live_entry, _tool_name, _extra_blocks = _run(
+    runner._execute_single_tool("tool-1", "get_quote", {"ticker": "AAPL"}, {"tools": []})
+  )
+
+  error = json.loads(live_entry["content"])["error"]
+  assert error["code"] == "tool_excluded"
+  assert error["data"]["excluding_owner"] == "skill_or_operation_grant"
+  assert "operation grant omits" in error["message"]
+  assert "cannot say which one" in error["message"]
+  assert error["data"]["next_call"] is None
 
 
 def test_execute_single_tool_preserves_dispatcher_error_data_for_model_result() -> None:
@@ -1149,6 +1214,7 @@ def test_execute_single_tool_preserves_dispatcher_error_data_for_model_result() 
       "tool": "load_tools",
       "args": {"pack": "market-data"},
     },
+    "next_call": None,
   }
 
   complete_events = [entry.event for entry in runner._log.entries if entry.event.get("type") == "tool_call_complete"]
@@ -1175,7 +1241,10 @@ def test_execute_single_tool_exposes_top_level_tool_usage_hint_in_model_error_da
   assert extra_blocks == []
   error = json.loads(live_entry["content"])["error"]
   assert error["code"] == "mcp_tool_error"
-  assert error["data"] == {"tool_usage_hint": "Pass research_file_id; do not pass ticker."}
+  assert error["data"] == {
+    "tool_usage_hint": "Pass research_file_id; do not pass ticker.",
+    "next_call": None,
+  }
 
   complete_events = [entry.event for entry in runner._log.entries if entry.event.get("type") == "tool_call_complete"]
   assert complete_events
@@ -1184,7 +1253,58 @@ def test_execute_single_tool_exposes_top_level_tool_usage_hint_in_model_error_da
   assert complete_events[-1]["final_tool_result_blocks"][0]["content"] == live_entry["content"]
 
 
-def test_repeated_generic_excluded_tool_claims_a_final_answer_turn() -> None:
+def _model_error_for_refusal(refusal: dict[str, Any]) -> dict[str, Any]:
+  runner = AgentRunner(
+    event_log=EventLog(session_id="test"),
+    dispatcher=_RefusalDispatcher(refusal),  # type: ignore[arg-type]
+    session_id="test-refusal-next-call",
+    capability_execution=_capability_execution(),
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+  live_entry, _tool_name, _extra_blocks = _run(
+    runner._execute_single_tool("tool-1", "run_agent", {"operation": "explore"}, {"tools": []})
+  )
+  assert live_entry["is_error"] is True
+  return json.loads(live_entry["content"])["error"]
+
+
+@pytest.mark.parametrize(
+  "next_call",
+  [
+    {"tool_name": "run_agent", "arguments": {"operation": "explore", "research_file_id": 42}},
+    None,
+  ],
+)
+def test_execute_single_tool_carries_a_refusals_top_level_next_call_to_the_model(
+  next_call: dict[str, Any] | None,
+) -> None:
+  error = _model_error_for_refusal({
+    "code": "context_research_file_id_mismatch",
+    "message": "research_file_id does not match the turn context (42)",
+    "next_call": next_call,
+  })
+
+  assert error["code"] == "context_research_file_id_mismatch"
+  assert error["data"] == {"next_call": next_call}
+
+
+def test_execute_single_tool_writes_an_explicit_null_next_call_when_the_refusal_names_none() -> None:
+  error = _model_error_for_refusal({
+    "code": "required_context_missing",
+    "message": "operation requires prior tool results in this turn for: context_ref",
+  })
+
+  assert error == {
+    "code": "required_context_missing",
+    "message": "operation requires prior tool results in this turn for: context_ref",
+    "data": {"next_call": None},
+  }
+
+
+
+def test_repeated_excluded_tool_returns_the_same_result_and_never_forces_a_final_turn() -> None:
   runner = AgentRunner(
     event_log=EventLog(session_id="test"),
     dispatcher=_ExplodingDispatcher(),  # type: ignore[arg-type]
@@ -1196,29 +1316,15 @@ def test_repeated_generic_excluded_tool_claims_a_final_answer_turn() -> None:
     rate_table_version="unknown",
   )
 
-  first_entry, _tool_name, _extra_blocks = _run(
-    runner._execute_single_tool("tool-1", "apply_patch_ops", {"ops": []}, {"tools": []})
-  )
-  assert json.loads(first_entry["content"])["error"] == {
-    "code": "tool_excluded",
-    "message": "Tool 'apply_patch_ops' is not available in this context",
-  }
-  assert not hasattr(runner, "_stop_after_tool_results_reason")
-
-  second_entry, _tool_name, _extra_blocks = _run(
-    runner._execute_single_tool("tool-2", "apply_patch_ops", {"ops": []}, {"tools": []})
-  )
-
-  error = json.loads(second_entry["content"])["error"]
-  assert error["code"] == "tool_excluded"
-  assert error["sub_code"] == "repeated_tool_excluded"
-  assert error["data"]["blocked_tool"] == "apply_patch_ops"
-  assert error["data"]["exclusion_count"] == 2
-  assert error["data"]["final_answer_turn"] is True
-  # The excluded-tool guard never settles the turn: an excluded call is a
-  # tool-level error, so the model still gets the turn its evidence earned.
+  for tool_id in ("tool-1", "tool-2"):
+    entry, _tool_name, _extra_blocks = _run(
+      runner._execute_single_tool(tool_id, "apply_patch_ops", {"ops": []}, {"tools": []})
+    )
+    assert json.loads(entry["content"])["error"] == _profile_excluded_error("apply_patch_ops")
+  # An excluded call is a tool-level error: it neither settles the turn nor
+  # forces a no-tools final turn, however often the model repeats it.
   assert getattr(runner, "_stop_after_tool_results_reason", None) is None
-  assert runner._final_answer_turn_tool_name == "apply_patch_ops"
+  assert not hasattr(runner, "_final_answer_turn_tool_name")
 
 
 def test_execute_single_tool_stops_after_expired_approval() -> None:
@@ -1263,10 +1369,9 @@ def test_execute_single_tool_keeps_apply_proposal_exclusions_generic() -> None:
     runner._execute_single_tool("tool-1", "apply_patch_proposal", {}, {"tools": []})
   )
 
-  assert json.loads(live_entry["content"])["error"] == {
-    "code": "tool_excluded",
-    "message": "Tool 'apply_patch_proposal' is not available in this context",
-  }
+  assert json.loads(live_entry["content"])["error"] == _profile_excluded_error(
+    "apply_patch_proposal"
+  )
 
 
 def _aggregate_workflow_result_payload() -> dict[str, Any]:
@@ -1714,26 +1819,6 @@ class _RecordedMcpRoutes:
     return tool_name if tool_name == "filings_search" else None
 
 
-class _HangingDispatcher(_Dispatcher):
-  def __init__(self) -> None:
-    self.calls = 0
-
-  async def dispatch(
-    self,
-    tool_id: str,
-    tool_name: str,
-    tool_input: dict[str, Any],
-    *,
-    call_index: int = 0,
-    allow_uncertain_mcp_replay: bool = True,
-    on_executed_prepared_call: Any | None = None,
-  ):
-    _ = tool_id, tool_name, tool_input, call_index
-    self.calls += 1
-    await asyncio.sleep(10)
-    raise AssertionError("unreachable")
-
-
 def _dispatch_runner(dispatcher: Any, **kwargs: Any) -> AgentRunner:
   if isinstance(dispatcher, _RecordedDispatcher):
     kwargs.setdefault("mcp_client", _RecordedMcpRoutes())
@@ -1892,17 +1977,6 @@ def test_dispatch_record_is_emitted_on_the_transport_exit_path() -> None:
   event = _complete_event(runner)
   assert event["error"]["code"] == "internal_error"
   assert event["dispatch"]["outcome"] == "error_transport"
-
-
-def test_dispatch_record_is_emitted_on_the_timeout_exit_path() -> None:
-  dispatcher = _HangingDispatcher()
-  runner = _dispatch_runner(dispatcher, tool_call_timeout=0.01)
-
-  _run(runner._execute_single_tool("tool-1", "file_read", {}, {"tools": []}))
-
-  event = _complete_event(runner)
-  assert event["error"]["code"] == "tool_timeout"
-  assert event["dispatch"]["outcome"] == "error_timeout"
 
 
 def test_dispatch_record_is_on_the_event_before_the_cancelled_arm_appends() -> None:

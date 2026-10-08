@@ -153,41 +153,30 @@ def admit_operation_tools(
 
 
 def parse_tool_grant(raw: object) -> ToolGrant:
-  """Validate one persisted canonical ToolGrant, including its digest."""
+  """Validate one persisted canonical ToolGrant."""
 
   try:
-    grant = ToolGrant.model_validate(raw)
+    return ToolGrant.model_validate(raw)
   except Exception as exc:
     raise OperationToolAdmissionError("invalid persisted ToolGrant") from exc
-  expected = sha256_digest({
-    "grant_id": grant.grant_id,
-    "tools": [entry.model_dump(mode="json") for entry in grant.tools],
-  })
-  if grant.digest != expected:
-    raise OperationToolAdmissionError("persisted ToolGrant digest mismatch")
-  return grant
 
 
 def reissue_tool_grant(grant: ToolGrant, *, grant_id: str) -> ToolGrant:
   """Issue the same exact authority under a new admitted attempt identity."""
 
-  validated = parse_tool_grant(grant)
-  return _tool_grant(grant_id=grant_id, entries=validated.tools)
+  return _tool_grant(grant_id=grant_id, entries=parse_tool_grant(grant).tools)
 
 
 def dispatcher_scopes_from_admitted_routes(
   grant: ToolGrant,
   routes: tuple[AdmittedToolRoute, ...],
 ) -> tuple[frozenset[str], frozenset[str], dict[str, set[str]]]:
-  """Project dispatcher scopes from persisted authority without live reads."""
+  """Project dispatcher scopes from persisted authority without live reads.
 
-  grant = parse_tool_grant(grant)
-  granted_tool_ids = tuple(entry.tool_id for entry in grant.tools)
-  route_tool_ids = tuple(route.tool_id for route in routes)
-  if route_tool_ids != granted_tool_ids:
-    raise OperationToolAdmissionError(
-      "admitted tool routes do not match the exact ordered ToolGrant"
-    )
+  The grant names the exact tools; the routes name where each runs.
+  """
+
+  granted_tool_ids = frozenset(entry.tool_id for entry in grant.tools)
   local_tool_ids = frozenset(
     route.tool_id for route in routes if route.origin == "local"
   )
@@ -197,7 +186,7 @@ def dispatcher_scopes_from_admitted_routes(
       continue
     assert route.server_id is not None
     mcp_scope.setdefault(route.server_id, set()).add(route.tool_id)
-  return frozenset(granted_tool_ids), local_tool_ids, mcp_scope
+  return granted_tool_ids, local_tool_ids, mcp_scope
 
 
 __all__ = [

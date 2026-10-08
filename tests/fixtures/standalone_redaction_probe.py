@@ -278,7 +278,7 @@ async def _run_scenario(
     agent_session_log=session_log,
     emit_session_recap=False,
   )
-  await runner.run([{"role": "user", "content": "load prices"}], max_turns=3)
+  await runner.run([{"role": "user", "content": "load prices"}])
   serialized_event_log = json.dumps([entry.event for entry in event_log.entries])
   serialized_history = json.dumps(responses.requests[1:])
   serialized_session = session_log.path.read_text()

@@ -13,7 +13,6 @@ import pytest
 from agent_gateway import launch_nonce_store as store_module
 from agent_gateway.launch_nonce_store import (
   LAUNCH_NONCE_STORE_SCHEMA_VERSION,
-  LaunchNonceStoreCapacityExceeded,
   LaunchNonceClockRollback,
   LaunchNonceReplay,
   LaunchNonceExpired,
@@ -22,6 +21,7 @@ from agent_gateway.launch_nonce_store import (
   LaunchNonceStoreUnavailable,
   LaunchNonceFacts,
   consume_launch_nonce,
+  launch_nonce_store_row_count,
   prepare_launch_nonce_store,
 )
 from agent_gateway.autonomous_launch_envelope import (
@@ -205,14 +205,14 @@ def test_identity_and_facts_contracts_are_closed_and_exact(
     replace(facts, channel_id="A" * 64)
   with pytest.raises(ValueError, match="integer"):
     replace(facts, issued_at_ns=True)
-  with pytest.raises(ValueError, match="TTL"):
-    replace(
-      facts,
-      expires_at_ns=(
-        facts.issued_at_ns
-        + 301_000_000_000
-      ),
-    )
+  long_lived = replace(
+    facts,
+    expires_at_ns=(
+      facts.issued_at_ns
+      + 301_000_000_000
+    ),
+  )
+  assert long_lived.expires_at_ns - long_lived.issued_at_ns == 301_000_000_000
   with pytest.raises(TypeError, match="verified launch envelope"):
     LaunchNonceFacts.from_verified_envelope(object())  # pyright: ignore[reportArgumentType]  # negative: unverified envelope rejection
 
@@ -577,7 +577,7 @@ def test_cleanup_is_bounded_and_occurs_in_the_admission_transaction(
   assert _row_count(path) == 4
 
 
-def test_capacity_failure_rolls_back_the_uncommitted_nonce(
+def test_row_count_is_measured_not_refused(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -592,27 +592,17 @@ def test_capacity_failure_rolls_back_the_uncommitted_nonce(
     1,
   )
   path = _path(tmp_path)
+  assert launch_nonce_store_row_count(path) is None
   identity = prepare_launch_nonce_store(path)
-  first = _facts(1)
-  second = _facts(2)
-  consume_launch_nonce(
-    identity,
-    first,
-    clock_ns=lambda: _ADMISSION_NS,
-  )
-
-  with pytest.raises(LaunchNonceStoreCapacityExceeded):
+  assert launch_nonce_store_row_count(path) == 0
+  for index in (1, 2):
     consume_launch_nonce(
       identity,
-      second,
+      _facts(index),
       clock_ns=lambda: _ADMISSION_NS,
     )
 
-  with sqlite3.connect(path) as connection:
-    nonces = connection.execute(
-      "SELECT nonce FROM ordinary_autonomous_launch_admissions"
-    ).fetchall()
-  assert nonces == [(first.nonce,)]
+  assert launch_nonce_store_row_count(path) == 2
 
 
 def test_schema_and_persisted_bound_mismatches_fail_closed(

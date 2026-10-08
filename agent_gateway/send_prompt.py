@@ -102,7 +102,6 @@ async def send_prompt(
   capability_execution: BoundCapabilityExecution,
   user_id: str,
   system_prompt: str | list[tuple[str, bool]] | None = None,
-  client_timeout: float = 180.0,
   session_id: str | None = None,
   request_id: str | None = None,
   rate_table_version: str | None = None,
@@ -119,6 +118,7 @@ async def send_prompt(
   """
   from model_authority.binding import validate_reported_identity
   from .multi_user.billing import UsageEvent, UsageState, normalize_identity
+  from .runner_streaming import _stream_with_stall_timeout
 
   sid = str(session_id or "send-prompt")
   normalized_request_id = str(request_id or "").strip()
@@ -199,7 +199,7 @@ async def send_prompt(
 
   try:
     while True:
-      client = provider.create_client(config=config, timeout=client_timeout)
+      client = provider.create_client(config=config)
       params = provider.build_request_params(
         model=model,
         messages=[{"role": "user", "content": prompt}],
@@ -212,7 +212,13 @@ async def send_prompt(
       )
 
       try:
-        async for event in provider.stream(client, params):
+        async for event in _stream_with_stall_timeout(
+          provider.stream(client, params),
+          config=config,
+          model_info=provider.get_model_info(model),
+          max_tokens=max_tokens,
+          effort_resolution=effort_resolution,
+        ):
           if event.type == "text_delta":
             text = str(event.text or "")
             if text:

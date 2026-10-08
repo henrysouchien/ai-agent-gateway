@@ -67,7 +67,13 @@ class ApprovalProjectionIdentity(Protocol):
   def owner_user_id(self) -> str: ...
 
   @property
-  def run_id(self) -> str: ...
+  def run_id(self) -> str:
+    """The batch's control run id, ``batch_<id>``: a durable row's ``request_id``.
+
+    A row's own ``run_id`` is the stage's skill run id (the model lifecycle
+    identity), so it never names the batch.
+    """
+    ...
 
   @property
   def session_id(self) -> str: ...
@@ -170,7 +176,7 @@ class BatchApprovalAdmission:
     if not all((
       str(getattr(request, "user_id", "") or "") == self.carrier.owner_user_id,
       str(getattr(request, "request_id", "") or "") == self.carrier.run_id,
-      str(getattr(request, "run_id", "") or "") == self.carrier.run_id,
+      _has_lifecycle_run_id(request),
       str(getattr(request, "session_id", "") or "") == expected_session_id,
       normalize_approval_channel(getattr(request, "channel", None))
       == self.carrier.channel,
@@ -211,7 +217,7 @@ class BatchApprovalAdmission:
           expected_tool_call_id=tool_call_id,
           expected_user_id=self.carrier.owner_user_id,
           expected_request_id=self.carrier.run_id,
-          expected_run_id=self.carrier.run_id,
+          expected_run_id=str(getattr(self.request, "run_id", "") or ""),
           expected_session_id=str(
             getattr(self.carrier.session, "session_id", "") or ""
           ),
@@ -243,7 +249,15 @@ class BatchApprovalAdmission:
 
 
 class BatchApprovalProjectionRegistry:
-  """Process-local routing references for durable batch approvals."""
+  """Process-local routing references for durable batch approvals.
+
+  A batch's live approval cards are partitioned by owner and channel — user
+  A's batch approvals are never projected to user B's session — and keyed by
+  stage run (`stage_run_seq`), so a session registers only under its own owner
+  and channel. Once a batch is fenced (cancelled or draining) no new card is
+  admitted, so a decision cannot land on a batch whose approvals are being
+  frozen (concurrency).
+  """
 
   def __init__(self) -> None:
     self._carriers: dict[tuple[str, int, int], _BatchApprovalCarrier] = {}
@@ -847,10 +861,16 @@ def approval_record_matches_projection(
     str(getattr(record, "tool_call_id", "") or "") == projection.tool_call_id,
     str(getattr(record, "user_id", "") or "") == projection.owner_user_id,
     str(getattr(record, "request_id", "") or "") == projection.run_id,
-    str(getattr(record, "run_id", "") or "") == projection.run_id,
+    _has_lifecycle_run_id(record),
     str(getattr(record, "session_id", "") or "") == projection.session_id,
     normalize_approval_channel(getattr(record, "channel", None)) == projection.channel,
   ))
+
+
+def _has_lifecycle_run_id(record: Any) -> bool:
+  """A batch row's ``run_id`` is its stage's lifecycle id; the batch is ``request_id``."""
+  run_id = getattr(record, "run_id", None)
+  return type(run_id) is str and bool(run_id) and run_id == run_id.strip()
 
 
 @dataclass(frozen=True)

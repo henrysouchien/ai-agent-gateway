@@ -47,11 +47,9 @@ def test_cost_observation_threshold_rejects_invalid_value(
   assert exc_info.value.source == "call"
 
 
-def test_cost_observation_threshold_receipt_does_not_claim_enforcement() -> None:
+def test_cost_observation_threshold_refusal_receipt_carries_typed_code() -> None:
   with pytest.raises(CostObservationThresholdError) as exc_info:
     resolve_cost_observation_threshold_usd(call_threshold_usd=0)
 
   receipt = exc_info.value.receipt()
   assert receipt["code"] == "invalid_cost_observation_threshold"
-  assert "budget" not in receipt["message"]
-  assert "cap" not in receipt["message"]

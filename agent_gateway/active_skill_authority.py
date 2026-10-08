@@ -3,12 +3,12 @@
 The compiled skill definition owns inline mutation-mode exceptions.  The
 ``invoke_skill`` handler projects those declarations onto the live runtime and
 passes the exact routes here.  This boundary only combines that resolved fact
-with the independent signed investment-capability grant policy.
+with the signed investment-capability grant the skill's own note declares.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -16,16 +16,15 @@ from .capability_resolution import CapabilityResolutionInputError
 from .investment_capability_claim import (
   INVESTMENT_CAPABILITY_CLAIM_SERVER,
   INVESTMENT_CAPABILITY_FACADE_TOOLS,
-  INVESTMENT_CAPABILITY_SKILL_GRANTS,
+  investment_capability_grants,
 )
 
 
 @dataclass(frozen=True, slots=True)
 class ActiveSkillToolAuthority:
-  """What one loaded skill may use, and what its mode ceiling withdraws."""
+  """What one loaded skill may use beyond the session's excluded-tool set."""
 
   granted: frozenset[str] = frozenset()
-  denied: frozenset[str] = frozenset()
 
 
 def _validated_live_tool_routes(
@@ -62,14 +61,14 @@ def _investment_capability_routes(
   *,
   declared_live_routes: Mapping[str, str],
 ) -> frozenset[str]:
-  """Project the signed-claim policy through exact declared live routes."""
+  """Project the skill note's declared grant through exact live routes."""
 
-  grant = INVESTMENT_CAPABILITY_SKILL_GRANTS.get(skill_name)
+  grant = investment_capability_grants().get(skill_name)
   if grant is None:
     return frozenset()
   return frozenset(
     tool_name
-    for tool_name in grant.allowed_tool_names
+    for tool_name in grant.tool_names
     if declared_live_routes.get(
       f"mcp__{INVESTMENT_CAPABILITY_CLAIM_SERVER}__{tool_name}"
     ) == tool_name
@@ -81,8 +80,6 @@ def resolve_active_skill_authority(
   *,
   declared_live_tool_routes: Mapping[str, str],
   inline_mode_exception_routes: Mapping[str, str] = MappingProxyType({}),
-  mode_denied_tools: Iterable[str] = (),
-  extra_denied_tools: Iterable[str] = (),
 ) -> ActiveSkillToolAuthority:
   """Combine declared inline exceptions with signed investment grants."""
 
@@ -108,11 +105,7 @@ def resolve_active_skill_authority(
       declared_live_routes=declared_routes,
     )
   )
-  resolved_grants = frozenset(granted)
-  denied = (frozenset(mode_denied_tools) - resolved_grants) | frozenset(
-    extra_denied_tools
-  )
-  return ActiveSkillToolAuthority(granted=resolved_grants, denied=denied)
+  return ActiveSkillToolAuthority(granted=frozenset(granted))
 
 
 __all__ = [

@@ -37,7 +37,6 @@ CANVAS_RUNTIME_SUPPORT_FILES = (
   "policy.mjs",
   "tsconfig.json",
 )
-_ALLOWED_IMPORTS = frozenset({"react", "recharts", "@hank/canvas-kit"})
 _FORBIDDEN_PATTERNS = (
   r"\bfetch\b", r"\bXMLHttpRequest\b", r"\bWebSocket\b", r"\bEventSource\b",
   r"\bimportScripts\b", r"\beval\b", r"\bFunction\b", r"\bdocument\s*\.\s*cookie\b",
@@ -145,8 +144,10 @@ def _validate_canvas_build_environment(
   package_dir = packaged_build_directory().resolve()
   _verify_runtime_support_files(build_dir=build_dir, package_dir=package_dir)
   node = Path(config.node_binary)
-  tsc = build_dir / "node_modules" / ".bin" / "tsc"
-  esbuild = build_dir / "node_modules" / ".bin" / "esbuild"
+  # The package paths are the tools themselves; npm's `.bin/` entries are symlinks to them, which an
+  # immutable local runtime tree does not carry (`--no-bin-links`), while /opt/hank/canvas-build has both.
+  tsc = build_dir / "node_modules" / "typescript" / "bin" / "tsc"
+  esbuild = build_dir / "node_modules" / "esbuild" / "bin" / "esbuild"
   for name, path in (("tsc", tsc), ("esbuild", esbuild)):
     if not path.is_file():
       raise RuntimeError(f"Canvas {name} is absent: {path}; run canvas_build/provision.sh")
@@ -266,12 +267,13 @@ def check_module_policy(source: str) -> None:
   """Reject imports and executable vocabulary before invoking the toolchain."""
 
   diagnostics: list[dict[str, Any]] = []
+  allowed_imports = canvas_kit_contract.manifest()["externals"]
   import_pattern = re.compile(r"\b(?:import|export)\s+(?:[^;]*?\s+from\s+)?[\"']([^\"']+)[\"']")
   for match in import_pattern.finditer(source):
-    if match.group(1) not in _ALLOWED_IMPORTS:
+    if match.group(1) not in allowed_imports:
       diagnostics.append(_diagnostic(
         "import_allowlist", f"Import {match.group(1)!r} is not allowed.",
-        "Import only react, recharts, or @hank/canvas-kit.", source=source, offset=match.start(),
+        f"Import only {', '.join(allowed_imports)}.", source=source, offset=match.start(),
       ))
   masked = _masked_source(source)
   for pattern in _FORBIDDEN_PATTERNS:
@@ -335,7 +337,7 @@ def _run_build_command(
       argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True,
       timeout=BUILD_TIMEOUT_SECONDS, check=False,
       # Darwin's posix_spawn bridge rejects these rlimits; production Linux
-      # applies both memory and file ceilings. Timeout/output caps apply everywhere.
+      # applies both memory and file ceilings. The timeout applies everywhere.
       preexec_fn=_limit_resources if os.name == "posix" and sys.platform != "darwin" else None,
     )
   except subprocess.TimeoutExpired as exc:
@@ -343,12 +345,6 @@ def _run_build_command(
       "toolchain_timeout", f"Canvas {stage} exceeded {BUILD_TIMEOUT_SECONDS:g}s.",
       "Reduce source complexity and retry; persistent timeouts require operator action.",
     )]) from exc
-  output = completed.stdout + completed.stderr
-  if len(output) > BUILD_OUTPUT_MAX_BYTES:
-    raise CanvasBuildFailure("build_environment", [_diagnostic(
-      "toolchain_output_limit", "Canvas toolchain output exceeded its safety limit.",
-      "Fix the first reported errors or reduce generated source complexity.",
-    )])
   return completed
 
 
@@ -373,11 +369,6 @@ async def _run_build_command_async(
       "toolchain_timeout", f"Canvas {stage} exceeded {BUILD_TIMEOUT_SECONDS:g}s.",
       "Reduce source complexity and retry; persistent timeouts require operator action.",
     )]) from exc
-  if len(stdout) + len(stderr) > BUILD_OUTPUT_MAX_BYTES:
-    raise CanvasBuildFailure("build_environment", [_diagnostic(
-      "toolchain_output_limit", "Canvas toolchain output exceeded its safety limit.",
-      "Fix the first reported errors or reduce generated source complexity.",
-    )])
   return process.returncode or 0, stdout, stderr
 
 
@@ -426,7 +417,7 @@ def build_canvas_bundle(source: str, preflight: CanvasBuildPreflight) -> bytes:
     config_path.write_text(json.dumps({"compilerOptions": options, "files": [str(input_path)]}))
     clean_env = sanitized_subprocess_env(node_binary=preflight.node)
     policy = _run_build_command(
-      [str(preflight.node), str(preflight.build_dir / "policy.mjs"), str(input_path)],
+      [str(preflight.node), str(preflight.build_dir / "policy.mjs"), str(input_path), str(contract_dir)],
       cwd=temp_dir, env=clean_env, stage="module policy",
     )
     if policy.returncode:
@@ -485,7 +476,7 @@ async def build_canvas_bundle_async(source: str, preflight: CanvasBuildPreflight
     config_path.write_text(json.dumps({"compilerOptions": options, "files": [str(input_path)]}))
     clean_env = sanitized_subprocess_env(node_binary=preflight.node)
     returncode, stdout, _stderr = await _run_build_command_async(
-      [str(preflight.node), str(preflight.build_dir / "policy.mjs"), str(input_path)],
+      [str(preflight.node), str(preflight.build_dir / "policy.mjs"), str(input_path), str(contract_dir)],
       cwd=temp_dir, env=clean_env, stage="module policy",
     )
     if returncode:

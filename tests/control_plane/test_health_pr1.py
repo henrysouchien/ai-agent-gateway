@@ -34,9 +34,10 @@ def test_control_version_header_is_control_prefix_only(
   assert CONTROL_PLANE_VERSION_HEADER not in root_health.headers
   assert root_health.json()["status"] == "ok"
   assert "package" in root_health.json()
+  assert "rows" in root_health.json()["autonomous_admission_ledger"]
 
 
-def test_approval_delivery_fatal_state_fails_health(
+def test_approval_delivery_fatal_state_is_reported_not_folded_into_health(
   client: TestClient,
   control_health_url: str,
 ) -> None:
@@ -51,8 +52,11 @@ def test_approval_delivery_fatal_state_fails_health(
 
   assert control_health.status_code == 200
   assert control_health.json()["status"] == "error"
-  assert root_health.status_code == 503
-  assert root_health.json()["status"] == "error"
+  assert root_health.status_code == 200
+  assert root_health.json()["status"] == "ok"
+  assert root_health.json()["approval_delivery"] == {
+    "fatal_error": "injected approval recovery failure",
+  }
 
 
 def test_approval_delivery_coordinator_follows_app_lifespan(

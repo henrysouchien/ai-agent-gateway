@@ -37,11 +37,16 @@ def strip_code_execute_base64_hook(ctx: ToolResultContext) -> None:
     if key in result:
       result.pop(key, None)
       updated = True
+  displays = result.get("displays")
+  if isinstance(displays, list):
+    for index, bundle in enumerate(displays):
+      if not isinstance(bundle, dict):
+        continue
+      for mime in tuple(bundle):
+        if mime.startswith("image/") and mime != "image/svg+xml":
+          bundle[mime] = f"[image: display_{index + 1}]"
+          updated = True
 
-  if ctx.tool_name != "code_execute":
-    if updated:
-      ctx.result_entry["content"] = json.dumps(result, default=str)
-    return
 
   images = result.get("images")
   if not isinstance(images, list):

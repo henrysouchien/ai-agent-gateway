@@ -175,7 +175,6 @@ async def build_chat_runtime(
       local_tool_handlers=LOCAL_HANDLERS,
       needs_approval=lambda tool_name, _tool_input, _qualifier: tool_name == "write_note",
       request_approval=make_request_approval(session, event_log),
-      approved_tool_types=session.approved_tool_types,
       event_log=event_log,
       session_id=session_id,
     )
@@ -202,7 +201,6 @@ async def build_chat_runtime(
     build_runner=build_runner,
     capability_execution=capability_execution,
     get_tool_definitions=get_tool_definitions,
-    max_turns=6,
   )
 
 

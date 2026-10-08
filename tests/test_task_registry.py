@@ -1,9 +1,12 @@
 # ruff: noqa: E402
 
 import asyncio
+import gc
 import sys
 import time
+import weakref
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,19 +15,62 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from agent_workflow_contracts import (
+  AdmittedTask,
+  AgentOperationRef,
+  AttemptRef,
+  ContentReadGrant,
+  ExecutionSettlement,
+  OrdinaryDelegationTaskRef,
+  OutcomeRequirement,
+  ResultRequirement,
+  canonical_json_bytes,
+  sha256_digest,
+  terminal_task_result,
+)
+from gateway_test_support.admitted_authority_test_support import (
+  provenance_of,
+  sealed_admitted_task,
+)
+from gateway_test_support.capability_execution_test_support import stub_runner_capability_execution
+from gateway_test_support.resumer_custody_test_support import (
+  canonical_read_custody_task,
+  custody_registration,
+)
+
+from agent_gateway import AgentRunner, ToolDispatcher
+from agent_gateway.agent_session_log import AgentSessionLog
+from agent_gateway.event_log import EventLog
+from agent_gateway.mcp_client import McpClientManager
+from agent_gateway.runner_sub_agents import _bind_child_registry, _close_sub_runner
 from agent_gateway.runner_background_lifecycle import RunnerBackgroundLifecycleMixin
 from agent_gateway.runner_background_tasks import (
   background_task_payload,
+  build_agent_completion_envelope,
+  ordinary_parent_result_policy,
+  task_completed_event_payload,
+  task_correlation_payload,
+)
+from agent_gateway.runner_session_events import build_agent_completion_event
+from agent_gateway.sub_agent import seal_admitted_task_payload
+from agent_gateway.sub_agent_result_contract import (
+  build_task_result,
+  canonical_projection,
+  report_contract_ref,
 )
 from agent_gateway.runner_state import BackgroundTask
 from agent_gateway.task_registry import (
   ParentMessage,
+  RegistryOwner,
   ResumeSuccessorConflictError,
   TaskDurableEventConflictError,
+  TASK_NOTIFICATION_INLINE_PAYLOAD_MAX_BYTES,
   TaskEntry,
   TaskRegistry,
   TaskState,
   _TERMINAL_STATES,
+  job_output_handles,
+  job_read_subtree,
   make_progress_tracker,
 )
 
@@ -42,8 +88,200 @@ def _bind_receipt(*, provider: str, model: str) -> dict[str, str]:
   }
 
 
+def _canonical_admitted_task(task_id: str = "bg_7") -> AdmittedTask:
+  task = sealed_admitted_task(
+    logical_task=OrdinaryDelegationTaskRef(
+      delegation_id=f"delegation:{task_id}",
+      operation=AgentOperationRef(
+        namespace="agent-operation",
+        name="research",
+        version="1",
+        digest=sha256_digest({"operation": "research"}),
+      ),
+    ),
+    attempt=AttemptRef(
+      attempt_number=1,
+      attempt_id=f"attempt:{task_id}",
+      physical_task_id=task_id,
+    ),
+    result_requirement=ResultRequirement(outcome=OutcomeRequirement()),
+  )
+  assert task.model_bind is not None
+  payload = task.model_dump(mode="json")
+  payload["schema_version"] = "1.2"
+  payload["operation"]["execution_class"] = task.model_bind.capability_id
+  payload["operation"]["resumable"] = True
+  payload["execution_snapshot"]["resume_mechanics"]["resumable"] = True
+  payload["execution_snapshot"]["resume_mechanics"]["max_chain_depth"] = 3
+  payload["execution_snapshot"]["provider_tool_definitions"] = [
+    {"definition": {
+      "name": "web_search",
+      "description": "Search public sources.",
+      "input_schema": {"type": "object"},
+    }},
+  ]
+  payload["tool_routes"] = [
+    {"tool_id": "web_search", "origin": "local", "server_id": None},
+  ]
+  payload["admitted_task_digest"] = sha256_digest({
+    key: value
+    for key, value in payload.items()
+    if key != "admitted_task_digest"
+  })
+  return AdmittedTask.model_validate(payload)
+
+
+async def _append_custody_completion(
+  durable_log: AgentSessionLog,
+  admitted: AdmittedTask,
+) -> str:
+  task_id = admitted.attempt.physical_task_id
+  projection = canonical_projection(
+    contract=report_contract_ref("explore-findings-v1"),
+    value={"task_id": task_id},
+  )
+  result = build_task_result(
+    logical_task=admitted.logical_task,
+    attempt=admitted.attempt,
+    requirement=admitted.result_requirement,
+    provenance=provenance_of(admitted),
+    execution=ExecutionSettlement(status="succeeded"),
+    outcome=None,
+    terminal_narrative=None,
+    projection=None,
+    runtime_projection=projection,
+  )
+
+  def _narrative(_result):
+    raise AssertionError("projection completion does not read a narrative")
+
+  envelope = build_agent_completion_envelope(
+    result,
+    policy=ordinary_parent_result_policy(result),
+    terminal_narrative_reader=_narrative,
+    read_grant_factory=lambda source: ContentReadGrant(
+      grant_id=f"grant:{task_id}",
+      content_id=source.content_id,
+      scope="direct_parent",
+      principal_id="runner-alias",
+    ),
+  )
+  entry = TaskEntry(
+    task_id=task_id,
+    task_type="background_agent",
+    state=TaskState.COMPLETED,
+    started_at=1.0,
+    completed_at=2.0,
+    result=result.model_dump(mode="json"),
+    admitted_task=admitted,
+    task_result=result,
+    completion_envelope=envelope,
+  )
+  await durable_log.append(task_completed_event_payload(
+    entry,
+    TaskState.COMPLETED,
+    correlation_payload=task_correlation_payload(entry, runner_id="runner-alias", role="owner"),
+    completed_at=2.0,
+  ))
+  await durable_log.append(build_agent_completion_event(
+    task_id=task_id,
+    envelope=envelope,
+    ts=2.0,
+  ))
+  return projection.content.content_id
+
+
 def _run(coro):
   return asyncio.run(coro)
+
+
+def _linked_registry_runner(
+  parent: TaskRegistry,
+  task_id: str,
+  *,
+  task_entry: TaskEntry | None = None,
+  close_error: type[BaseException] | None = None,
+) -> SimpleNamespace:
+  async def force_close(timeout: float = 2.0) -> None:
+    if close_error is not None:
+      raise close_error("close failed")
+
+  child = SimpleNamespace(
+    _task_registry=TaskRegistry(),
+    force_close=force_close,
+  )
+  _bind_child_registry(
+    child,
+    parent_registry=parent,
+    attempt=AttemptRef(
+      attempt_number=1,
+      attempt_id=f"attempt:{task_id}",
+      physical_task_id=task_id,
+    ),
+    sub_session=None,
+    task_entry=task_entry,
+    spill_sink=None,
+  )
+  return child
+
+
+def _notification_registry_runner(
+  parent: TaskRegistry,
+  task_id: str,
+  *,
+  task_entry: TaskEntry | None = None,
+) -> AgentRunner:
+  event_log = EventLog()
+  child = AgentRunner(
+    event_log=event_log,
+    dispatcher=ToolDispatcher(
+      mcp_client=McpClientManager(config_path=None),
+      local_tool_handlers={},
+      event_log=event_log,
+      session_id=task_id,
+    ),
+    session_id=task_id,
+    capability_execution=stub_runner_capability_execution(
+      provider=SimpleNamespace(name="stub"),
+      model="stub-model",
+      effort="none",
+      auth_config={"api_key": "test-only"},
+    ),
+    user_id="registry-test",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+  _bind_child_registry(
+    child,
+    parent_registry=parent,
+    attempt=AttemptRef(
+      attempt_number=1,
+      attempt_id=f"attempt:{task_id}",
+      physical_task_id=task_id,
+    ),
+    sub_session=None,
+    task_entry=task_entry,
+    spill_sink=None,
+  )
+  return child
+
+
+def _close_registry_runner(
+  child: SimpleNamespace | AgentRunner,
+  *,
+  task_entry: TaskEntry | None = None,
+  cancelled_error: asyncio.CancelledError | None = None,
+) -> None:
+  _run(_close_sub_runner(
+    child,
+    EventLog(),
+    stalled=False,
+    cancelled_error=cancelled_error,
+    cancellation_signal="cancelled" if cancelled_error is not None else None,
+    runtime_exception_detail=None,
+    task_entry=task_entry,
+    cleanup_warnings=[],
+  ))
 
 
 def _child_report(summary: str = "done") -> dict[str, object]:
@@ -140,6 +378,48 @@ class _BackgroundLifecycleHarness(RunnerBackgroundLifecycleMixin):
   async def _append_durable_event(self, event: dict[str, object]) -> None:
     self.append_invocations += 1
     self.durable_events.append(event)
+
+
+async def _kill_registry_owner(
+  parent: TaskRegistry,
+  owner_entry: TaskEntry,
+  child: AgentRunner,
+) -> None:
+  harness = _BackgroundLifecycleHarness()
+  harness._task_registry = parent
+  started = asyncio.Event()
+
+  async def _handler(
+    _tool_input: dict[str, object],
+    **_kwargs: object,
+  ) -> tuple[dict[str, object], None]:
+    started.set()
+    try:
+      await asyncio.Event().wait()
+    except asyncio.CancelledError as exc:
+      await _close_sub_runner(
+        child,
+        EventLog(),
+        stalled=False,
+        cancelled_error=exc,
+        cancellation_signal="killed",
+        runtime_exception_detail=None,
+        task_entry=owner_entry,
+        cleanup_warnings=[],
+      )
+      raise
+    raise AssertionError("owner handler must end by cancellation")
+
+  task = asyncio.create_task(harness._run_background_agent(owner_entry, _handler, {}, 0))
+  owner_entry.asyncio_task = task
+  await started.wait()
+  assert parent.kill(owner_entry.task_id)
+  await task
+
+  assert owner_entry.state == TaskState.KILLED
+  assert owner_entry.completion_persistence_state == "committed"
+  assert harness.durable_events[0]["task_id"] == owner_entry.task_id
+  assert harness.durable_events[0]["final_state"] == "killed"
 
 
 def test_task_registry_register_transition_get_and_list_tasks() -> None:
@@ -1104,15 +1384,6 @@ def test_registry_counts_running_and_admission_slots_separately() -> None:
   assert registry.admission_count == 2
 
 
-def _reject_over_capacity(
-  admission_count: int,
-  ceiling: int,
-) -> dict[str, str] | None:
-  if admission_count < ceiling:
-    return None
-  return {"code": "max_background_tasks"}
-
-
 def _reject_retrieval_backpressure(
   pending_omitted_results: int,
   retention_limit: int,
@@ -1127,22 +1398,15 @@ def _reject_retrieval_backpressure(
 def _admit(registry: TaskRegistry, **kwargs: object):
   return registry.admit(
     "background_agent",
-    reject_over_capacity=_reject_over_capacity,
     reject_retrieval_backpressure=_reject_retrieval_backpressure,
     **kwargs,  # type: ignore[arg-type]
   )
 
 
-def test_running_transition_over_ceiling_logs_invariant_violation_and_proceeds(
+def test_running_transition_past_the_in_flight_count_logs_no_violation(
   caplog: pytest.LogCaptureFixture,
 ) -> None:
-  """T3-I04 / D-A8-5: the RUNNING gate is a detector, never a refusal.
-
-  It used to ``raise RuntimeError("Task inflight limit reached")`` after the
-  durable ``task_registered`` append, stranding the entry PENDING with no
-  terminal (CUR-E2E-03). Capacity is owned by ``admit`` now, so reaching this
-  branch is a code defect: record it and proceed.
-  """
+  """The in-flight count is a measurement; the RUNNING transition never gates on it."""
 
   registry = TaskRegistry(max_inflight=1)
   first = registry.register("background_agent")
@@ -1154,40 +1418,26 @@ def test_running_transition_over_ceiling_logs_invariant_violation_and_proceeds(
 
   assert entry.state == TaskState.RUNNING
   assert registry.inflight_count == 2
-  violations = [
+  assert not [
     record
     for record in caplog.records
     if "task registry invariant violation" in record.getMessage()
   ]
-  assert len(violations) == 1
-  message = violations[0].getMessage()
-  assert second.task_id in message
-  assert "max_inflight=1" in message
-
-  registry.transition(first.task_id, TaskState.COMPLETED)
-  assert registry.inflight_count == 1
 
 
-def test_admit_refuses_capacity_instead_of_the_running_transition() -> None:
-  """The ceiling now lives at the single admission point (D-A8-1)."""
+def test_admit_never_refuses_for_the_in_flight_count() -> None:
+  """A child past the old ceiling is admitted; it waits on the semaphore to run."""
 
   registry = TaskRegistry(max_inflight=1)
   first, rejection = _admit(registry)
   assert rejection is None
   assert first is not None
 
-  refused, rejection = _admit(registry)
-  assert refused is None
-  assert rejection == {"code": "max_background_tasks"}
-  assert registry.admission_count == 1
-
-  registry.transition(first.task_id, TaskState.RUNNING)
-  registry.transition(first.task_id, TaskState.COMPLETED)
-
-  admitted, rejection = _admit(registry)
+  second, rejection = _admit(registry)
   assert rejection is None
-  assert admitted is not None
-  assert registry.admission_count == 1
+  assert second is not None
+  assert second.task_id != first.task_id
+  assert registry.admission_count == 2
 
 
 def test_admit_discounts_an_already_reserved_pending_successor() -> None:
@@ -1291,10 +1541,11 @@ def test_admit_is_atomic_under_concurrent_callers() -> None:
 
   Every caller yields to the event loop right before admitting, which is
   exactly what the old ``await self._lookup_task_in_log(...)`` between the
-  capacity check and ``register`` did.
+  verdict and ``register`` did. The one admission verdict left is retrieval
+  backpressure (retention limit ``max_retained + max_inflight`` = 3 here).
   """
 
-  registry = TaskRegistry(max_inflight=3)
+  registry = TaskRegistry(max_inflight=1, max_retained=2)
   admitted: list[str] = []
   refused: list[dict[str, str]] = []
 
@@ -1314,7 +1565,9 @@ def test_admit_is_atomic_under_concurrent_callers() -> None:
 
   assert len(admitted) == 3
   assert len(refused) == 7
-  assert {rejection["code"] for rejection in refused} == {"max_background_tasks"}
+  assert {rejection["code"] for rejection in refused} == {
+    "background_notification_retrieval_required"
+  }
   assert registry.admission_count == 3
 
 
@@ -1352,6 +1605,314 @@ def test_evict_completed_removes_old_terminal_entries() -> None:
   assert registry.get(old_entry.task_id) is None
   assert registry.get(recent_entry.task_id) is recent_entry
   assert registry.get(running_entry.task_id) is running_entry
+
+
+@pytest.mark.parametrize(
+  ("close_error", "cancelled_error"),
+  [
+    (None, None),
+    (RuntimeError, None),
+    (asyncio.CancelledError, None),
+    (None, asyncio.CancelledError),
+  ],
+)
+def test_completed_foreground_registry_is_released(
+  close_error: type[BaseException] | None,
+  cancelled_error: type[asyncio.CancelledError] | None,
+) -> None:
+  root = TaskRegistry(owner=RegistryOwner(job_id="root", tenant=lambda: None))
+  child = _linked_registry_runner(root, "foreground", close_error=close_error)
+  child_registry = weakref.ref(child._task_registry)
+
+  _close_registry_runner(
+    child,
+    cancelled_error=cancelled_error() if cancelled_error is not None else None,
+  )
+  del child
+  gc.collect()
+
+  assert child_registry() is None
+  assert [job.job_id for job in root.roster()] == ["root"]
+
+
+def test_completed_foreground_registry_keeps_live_background_descendant_on_roster() -> None:
+  root = TaskRegistry(owner=RegistryOwner(job_id="root", tenant=lambda: None))
+  child = _linked_registry_runner(root, "foreground")
+  child_registry = weakref.ref(child._task_registry)
+  entry = child._task_registry.register("background_agent", agent_name="writer")
+  child._task_registry.transition(entry.task_id, TaskState.RUNNING)
+
+  _close_registry_runner(child)
+  del child
+  gc.collect()
+
+  descendant = root.find_on_roster("writer")
+  assert descendant is not None
+  assert descendant.entry is entry
+  assert descendant.parent_job_id == "foreground"
+  assert child_registry() is descendant.registry
+  descendant.registry.transition(entry.task_id, TaskState.COMPLETED)
+  del descendant
+  gc.collect()
+
+  assert root.find_on_roster(entry.task_id) is None
+  assert child_registry() is None
+  assert [job.job_id for job in root.roster()] == ["root"]
+
+
+def test_retention_eviction_releases_killed_owner_with_unretrieved_result() -> None:
+  async def _case() -> None:
+    root = TaskRegistry(
+      max_retained=1,
+      owner=RegistryOwner(job_id="root", tenant=lambda: None),
+    )
+    owner_entry = root.register("background_agent", task_id="background-owner")
+    root.transition(owner_entry.task_id, TaskState.RUNNING)
+    owner = _notification_registry_runner(
+      root,
+      owner_entry.task_id,
+      task_entry=owner_entry,
+    )
+    inner = _BackgroundLifecycleHarness()
+    inner._task_registry = owner._task_registry
+    omitted = inner._task_registry.register("background_agent", task_id="omitted-leaf")
+    inner._task_registry.transition(omitted.task_id, TaskState.RUNNING)
+    report = _child_report("x" * (TASK_NOTIFICATION_INLINE_PAYLOAD_MAX_BYTES + 1))
+
+    async def _handler(
+      _tool_input: dict[str, object],
+      **_kwargs: object,
+    ) -> tuple[dict[str, object], None]:
+      return report, None
+
+    await inner._run_background_agent(omitted, _handler, {}, 0)
+    # Payload omission represents the omitted-delivery state family; both
+    # omission states have the same registry retention semantics.
+    assert omitted.notification_delivery_state == "payload_omitted"
+    generation = omitted.notification_generation
+    completion = inner.durable_events[0]
+
+    await _kill_registry_owner(root, owner_entry, owner)
+    assert root.get(owner_entry.task_id) is owner_entry
+    assert root.find_on_roster(omitted.task_id) is not None
+    root.register("background_agent", task_id="replacement")
+
+    assert root.get(owner_entry.task_id) is None
+    assert owner_entry.task_id not in root._child_registries
+    assert root.find_on_roster(omitted.task_id) is None
+    assert [job.job_id for job in root.roster()] == ["root", "replacement"]
+    assert omitted.notification_delivery_state == "payload_omitted"
+    assert omitted.notification_generation == generation
+    assert completion["result"] == omitted.result == report
+    assert completion["final_state"] == "completed"
+
+  _run(_case())
+
+
+@pytest.mark.parametrize("eviction", ["age", "retention"])
+def test_background_owner_eviction_preserves_live_nested_descendant(
+  eviction: str,
+) -> None:
+  root = TaskRegistry(
+    max_retained=1,
+    owner=RegistryOwner(job_id="root", tenant=lambda: None),
+  )
+  owner_entry = root.register("background_agent", task_id="background-owner")
+  root.transition(owner_entry.task_id, TaskState.RUNNING)
+  owner = _linked_registry_runner(root, owner_entry.task_id, task_entry=owner_entry)
+  owner_registry = weakref.ref(owner._task_registry)
+  foreground = _notification_registry_runner(owner._task_registry, "foreground")
+  foreground_registry = weakref.ref(foreground._task_registry)
+  leaf = foreground._task_registry.register(
+    "background_agent",
+    task_id="nested-leaf",
+    agent_name="leaf",
+  )
+  foreground._task_registry.transition(leaf.task_id, TaskState.RUNNING)
+  omitted = foreground._task_registry.register(
+    "background_agent",
+    task_id="omitted-leaf",
+  )
+  foreground._task_registry.transition(
+    omitted.task_id,
+    TaskState.COMPLETED,
+    result=_child_report("x" * (TASK_NOTIFICATION_INLINE_PAYLOAD_MAX_BYTES + 1)),
+  )
+  assert omitted.notification_delivery_state == "payload_omitted"
+  _close_registry_runner(foreground)
+  _close_registry_runner(owner, task_entry=owner_entry)
+  root.transition(owner_entry.task_id, TaskState.COMPLETED)
+  del owner, foreground
+
+  if eviction == "age":
+    assert root.evict_completed(max_age_seconds=0) == 1
+  else:
+    root.register("background_agent")
+
+  assert root.get(owner_entry.task_id) is None
+  assert root.find_on_roster(omitted.task_id) is not None
+  descendant = root.find_on_roster("leaf")
+  assert descendant is not None
+  assert descendant.entry is leaf
+  assert descendant.parent_job_id == "foreground"
+  descendant.registry.transition(leaf.task_id, TaskState.FAILED)
+  del descendant
+  gc.collect()
+
+  assert root.find_on_roster(leaf.task_id) is None
+  assert root.find_on_roster(omitted.task_id) is None
+  assert omitted.notification_delivery_state == "payload_omitted"
+  assert owner_registry() is None
+  assert foreground_registry() is None
+
+
+def test_evicted_owner_waits_for_real_detached_completion_before_unlinking() -> None:
+  async def _case() -> None:
+    append_started = asyncio.Event()
+    release_append = asyncio.Event()
+    reconciled = asyncio.Event()
+
+    class _DelayedAppendHarness(_BackgroundLifecycleHarness):
+      async def _append_durable_event(self, event: dict[str, object]) -> None:
+        if event["task_id"] == "detached-leaf":
+          append_started.set()
+          await release_append.wait()
+        await super()._append_durable_event(event)
+
+    root = TaskRegistry(
+      max_retained=1,
+      owner=RegistryOwner(job_id="root", tenant=lambda: None),
+    )
+    owner_entry = root.register("background_agent", task_id="background-owner")
+    root.transition(owner_entry.task_id, TaskState.RUNNING)
+    owner = _notification_registry_runner(
+      root,
+      owner_entry.task_id,
+      task_entry=owner_entry,
+    )
+    inner = _DelayedAppendHarness()
+    inner._task_registry = owner._task_registry
+    omitted = inner._task_registry.register("background_agent", task_id="omitted-leaf")
+    inner._task_registry.transition(omitted.task_id, TaskState.RUNNING)
+    report = _child_report("x" * (TASK_NOTIFICATION_INLINE_PAYLOAD_MAX_BYTES + 1))
+    await inner._finalize_background_agent(
+      omitted,
+      final_state=TaskState.COMPLETED,
+      result=report,
+      error=None,
+    )
+    assert omitted.notification_delivery_state == "payload_omitted"
+    generation = omitted.notification_generation
+
+    detached = inner._task_registry.register("background_agent", task_id="detached-leaf")
+    inner._task_registry.transition(detached.task_id, TaskState.RUNNING)
+    detached.completion_callback = lambda _entry: reconciled.set()
+    finalizer = asyncio.create_task(inner._finalize_background_agent(
+      detached,
+      final_state=TaskState.COMPLETED,
+      result=_child_report("settled after owner eviction"),
+      error=None,
+    ))
+    await append_started.wait()
+    finalizer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await finalizer
+    assert detached.state == TaskState.INTERRUPTED
+    assert detached.completion_finalizer_detached
+
+    await _kill_registry_owner(root, owner_entry, owner)
+    root.register("background_agent", task_id="replacement")
+    assert root.get(owner_entry.task_id) is None
+    descendant = root.find_on_roster(detached.task_id)
+    assert descendant is not None
+    assert descendant.entry is detached
+    assert descendant.parent_job_id == owner_entry.task_id
+    assert owner_entry.task_id in root._child_registries
+
+    release_append.set()
+    await asyncio.wait_for(reconciled.wait(), timeout=2.0)
+
+    assert detached.state == TaskState.COMPLETED
+    assert detached.completion_persistence_state == "committed"
+    assert not detached.completion_finalizer_detached
+    assert root.find_on_roster(detached.task_id) is None
+    assert root.find_on_roster(omitted.task_id) is None
+    assert owner_entry.task_id not in root._child_registries
+    assert [job.job_id for job in root.roster()] == ["root", "replacement"]
+    assert omitted.notification_delivery_state == "payload_omitted"
+    assert omitted.notification_generation == generation
+    assert inner.durable_events[0]["result"] == omitted.result == report
+    assert [event["final_state"] for event in inner.durable_events] == [
+      "completed",
+      "completed",
+    ]
+
+  _run(_case())
+
+
+def test_foreground_registry_keeps_detached_completion_until_reconciled() -> None:
+  root = TaskRegistry(owner=RegistryOwner(job_id="root", tenant=lambda: None))
+  child = _linked_registry_runner(root, "foreground")
+  entry = child._task_registry.register("background_agent")
+  child._task_registry.transition(entry.task_id, TaskState.RUNNING)
+  _close_registry_runner(child)
+  entry.completion_finalizer_detached = True
+  child._task_registry.transition(entry.task_id, TaskState.INTERRUPTED)
+
+  assert root.find_on_roster(entry.task_id) is not None
+  entry.completion_finalizer_detached = False
+  child._task_registry.finalize_interrupted(entry.task_id, TaskState.FAILED)
+
+  assert root.find_on_roster(entry.task_id) is None
+
+
+def test_foreground_registry_prunes_terminal_detached_completion_after_reconciliation() -> None:
+  root = TaskRegistry(owner=RegistryOwner(job_id="root", tenant=lambda: None))
+  child = _linked_registry_runner(root, "foreground")
+  child_registry = weakref.ref(child._task_registry)
+  entry = child._task_registry.register("background_agent")
+  child._task_registry.transition(entry.task_id, TaskState.RUNNING)
+  entry.completion_finalizer_detached = True
+  child._task_registry.transition(entry.task_id, TaskState.COMPLETED)
+  _close_registry_runner(child)
+  del child
+
+  descendant = root.find_on_roster(entry.task_id)
+  assert descendant is not None
+  entry.completion_finalizer_detached = False
+  descendant.registry.transition(entry.task_id, TaskState.COMPLETED)
+  del descendant
+  gc.collect()
+
+  assert root.find_on_roster(entry.task_id) is None
+  assert child_registry() is None
+
+
+def test_foreground_registry_keeps_omitted_notification_until_retrieved() -> None:
+  class _OmittedNotificationListener:
+    def on_transition(
+      self,
+      entry: TaskEntry,
+      old_state: TaskState,
+      new_state: TaskState,
+    ) -> None:
+      if new_state == TaskState.COMPLETED:
+        entry.notification_delivery_state = "payload_omitted"
+
+  root = TaskRegistry(owner=RegistryOwner(job_id="root", tenant=lambda: None))
+  child = _linked_registry_runner(root, "foreground")
+  child._task_registry.add_listener(_OmittedNotificationListener())
+  entry = child._task_registry.register("background_agent")
+  child._task_registry.transition(entry.task_id, TaskState.RUNNING)
+  _close_registry_runner(child)
+  child._task_registry.transition(entry.task_id, TaskState.COMPLETED)
+
+  assert root.find_on_roster(entry.task_id) is not None
+  assert child._task_registry.mark_notification_payload_retrieved(
+    entry.task_id,
+    notification_generation=entry.notification_generation,
+  )
+  assert root.find_on_roster(entry.task_id) is None
 
 
 def test_listener_fires_synchronously_on_transition() -> None:
@@ -1594,30 +2155,196 @@ def test_load_from_events_loudly_skips_unsupported_schema_version(
   assert registry.register("background_agent").task_id == "bg_8"
 
 
-def test_load_from_events_loudly_skips_v2_registration_without_bind(
-  caplog: pytest.LogCaptureFixture,
+@pytest.mark.parametrize("receipt", ["absent", "conflicting"])
+def test_load_from_events_recovers_canonical_authority_independent_of_receipt(
+  receipt: str,
 ) -> None:
-  registry = TaskRegistry()
-  event = {
+  admitted = _canonical_admitted_task()
+  assert admitted.model_bind is not None
+  correlation = {
+    "owner_runner_id": "runner-parent",
+    "owner_role": "writer",
+    "sub_agent_id": "sub7:session-parent",
+    "parent_turn_id": "turn-7",
+    "call_index": 7,
+    "task_type": "background_agent",
+  }
+  metadata = {
+    **correlation,
+    "admitted_task": admitted.model_dump(mode="json"),
+    "capability_bind": admitted.model_bind.to_json(),
+    "custom": "retained",
+  }
+  registration = {
     "type": "task_registered",
     "event_schema_version": 2,
     "task_id": "bg_7",
-    "task_type": "background",
-    "agent_name": "writer",
+    "agent_name": "research",
     "started_at": 100.0,
+    "metadata": metadata,
+    **correlation,
+    "_durable_seq": 1,
   }
-
-  with caplog.at_level("WARNING", logger="agent_gateway.task_registry"):
-    registry.load_from_events([event])
-
-  assert registry.get("bg_7") is None
-  skip_records = [
-    record
-    for record in caplog.records
-    if "Skipping durable task bg_7" in record.getMessage()
+  raw_receipt = None
+  if receipt == "conflicting":
+    raw_receipt = _bind_receipt(provider="openai", model="gpt-5.2")
+    registration["capability_bind"] = raw_receipt
+  messages = [
+    {
+      "type": "parent_message_sent",
+      "task_id": "bg_7",
+      **correlation,
+      "capability_bind": admitted.model_bind.to_json(),
+      "message_id": message_id,
+      "message": text,
+      "sent_at": timestamp,
+      "_durable_seq": seq,
+    }
+    for message_id, text, timestamp, seq in (
+      ("msg-first", "Read the filing", 110.0, 2),
+      ("msg-next", "Use the amendment", 120.0, 3),
+    )
   ]
-  assert len(skip_records) == 1
-  assert "capability_bind" in skip_records[0].getMessage()
+  registry = TaskRegistry()
+  listener = _RecordingListener()
+  registry.add_listener(listener)
+  registry.load_from_events([registration, *messages])
+
+  entry = registry.get("bg_7")
+  assert entry is not None
+  assert entry.state is TaskState.INTERRUPTED
+  assert entry.error is None
+  assert entry.reconstructed_from_log is True
+  assert entry.registration_persistence_state == "committed"
+  assert entry.completion_persistence_state == "not_started"
+  assert entry.admitted_task == admitted
+  assert entry.metadata["admitted_task"] == admitted.model_dump(mode="json")
+  assert entry.metadata["custom"] == "retained"
+  assert entry.capability_bind_receipt == (
+    raw_receipt if isinstance(raw_receipt, dict) else None
+  )
+  assert entry.metadata["capability_bind"] == (
+    admitted.model_bind.to_json() if receipt == "absent" else raw_receipt
+  )
+  assert list(entry.accepted_parent_messages.values()) == [
+    ParentMessage("msg-first", "Read the filing", 110.0, "bg_7", 2),
+    ParentMessage("msg-next", "Use the amendment", 120.0, "bg_7", 3),
+  ]
+  assert entry.delivered_messages == {"msg-first", "msg-next"}
+  assert listener.transitions == []
+  assert registry.register("background_agent").task_id == "bg_8"
+
+
+def test_load_from_events_retains_noncanonical_registration_without_receipt() -> None:
+  metadata = {"custom": {"observation": "raw"}, "owner_role": "writer"}
+  registry = TaskRegistry()
+  registry.load_from_events([{
+    "type": "task_registered",
+    "event_schema_version": 2,
+    "task_id": "bg_7",
+    "task_type": "plan_run",
+    "started_at": 100.0,
+    "original_task_id": "bg_3",
+    "metadata": metadata,
+  }])
+
+  entry = registry.get("bg_7")
+  assert entry is not None
+  assert entry.state is TaskState.INTERRUPTED
+  assert entry.admitted_task is None
+  assert entry.capability_bind_receipt is None
+  assert entry.metadata["custom"] == metadata["custom"]
+  assert entry.metadata["owner_role"] == "writer"
+  assert entry.original_task_id == "bg_3"
+  assert entry.started_at == 100.0
+  assert registry.register("background_agent").task_id == "bg_8"
+
+
+@pytest.mark.parametrize(
+  "tamper",
+  ["model_bind_digest", "admitted_task_digest", "logical_identity"],
+)
+def test_load_from_events_detects_canonical_corruption_without_receipt(
+  tamper: str,
+) -> None:
+  payload = _canonical_admitted_task().model_dump(mode="json")
+  if tamper == "logical_identity":
+    payload["logical_task"]["operation"]["name"] = "different-operation"
+  else:
+    payload[tamper] = f"sha256:{'f' * 64}"
+  registry = TaskRegistry()
+  registry.load_from_events([{
+    "type": "task_registered",
+    "event_schema_version": 2,
+    "task_id": "bg_7",
+    "task_type": "background_agent",
+    "started_at": 100.0,
+    "metadata": {"admitted_task": payload},
+  }])
+
+  entry = registry.get("bg_7")
+  assert entry is not None
+  assert entry.state is TaskState.FAILED
+  assert entry.admitted_task is None
+  assert entry.error is not None
+  assert entry.error["code"] == "invalid_admitted_task"
+  assert entry.metadata["admitted_task"] == payload
+
+
+@pytest.mark.parametrize("tamper", [None, "physical_identity", "authority_digest"])
+def test_load_from_events_preserves_canonical_result_identity_without_receipt(
+  tamper: str | None,
+) -> None:
+  admitted = _canonical_admitted_task()
+  task_result = terminal_task_result(
+    admitted,
+    status="interrupted",
+    reason="Gateway restarted.",
+  )
+  result = task_result.model_dump(mode="json")
+  if tamper == "physical_identity":
+    result["attempt"]["physical_task_id"] = "bg_8"
+  elif tamper == "authority_digest":
+    result["provenance"]["admitted_task_digest"] = f"sha256:{'f' * 64}"
+  registry = TaskRegistry()
+  registry.load_from_events([
+    {
+      "type": "task_registered",
+      "event_schema_version": 2,
+      "task_id": "bg_7",
+      "task_type": "background_agent",
+      "started_at": 100.0,
+      "metadata": {"admitted_task": admitted.model_dump(mode="json")},
+    },
+    {
+      "type": "task_completed",
+      "task_id": "bg_7",
+      "final_state": "interrupted",
+      "completed_at": 125.0,
+      "result": result,
+      "error": None,
+    },
+  ])
+
+  entry = registry.get("bg_7")
+  assert entry is not None
+  assert entry.admitted_task == admitted
+  assert entry.result == result
+  assert entry.completed_at == 125.0
+  assert entry.completion_persistence_state == "committed"
+  if tamper is None:
+    assert entry.state is TaskState.INTERRUPTED
+    assert entry.task_result == task_result
+    assert entry.error is None
+  else:
+    assert entry.state is TaskState.FAILED
+    assert entry.task_result is None
+    assert entry.error is not None
+    assert entry.error["code"] == (
+      "invalid_task_result"
+      if tamper == "physical_identity"
+      else "task_result_admission_mismatch"
+    )
 
 
 def test_load_from_events_skip_warns_once_per_task_and_reason(
@@ -1665,10 +2392,6 @@ def test_load_from_events_rejects_conflicting_duplicate_task_events(
     "task_type": "background",
     "agent_name": "writer",
     "started_at": 100.0,
-    "capability_bind": _bind_receipt(
-      provider="anthropic",
-      model="claude-sonnet-4-6",
-    ),
   }
   completion = {
     "type": "task_completed",
@@ -2002,3 +2725,154 @@ def test_make_progress_tracker_caps_recent_tools_at_ten() -> None:
   assert entry.progress.last_tool_name == "tool_11"
   assert len(entry.progress.recent_tools) == 10
   assert entry.progress.recent_tools == [f"tool_{index}" for index in range(2, 12)]
+
+
+def test_job_read_custody_follows_downward_and_forward_edges_only(tmp_path: Path) -> None:
+  async def _case() -> None:
+    durable_log = AgentSessionLog(tmp_path / "custody.jsonl")
+    a0 = canonical_read_custody_task("a0")
+    old_child = canonical_read_custody_task("a0-child", parent_job_id="a0")
+    old_sibling = canonical_read_custody_task("old-sibling")
+    actor_parent = canonical_read_custody_task("actor-parent", parent_job_id="actor-root")
+    actor = canonical_read_custody_task("nested-actor", parent_job_id="actor-parent")
+    a1 = canonical_read_custody_task("a1", predecessor=a0, resumer_job_id="nested-actor")
+    current_child = canonical_read_custody_task("a1-child", parent_job_id="a1")
+    later_actor = canonical_read_custody_task("later-actor", parent_job_id="later-root")
+    a2 = canonical_read_custody_task("a2", predecessor=a1, resumer_job_id="later-actor")
+    later_child = canonical_read_custody_task("a2-child", parent_job_id="a2")
+    unrelated = canonical_read_custody_task("unrelated", parent_job_id="unrelated-root")
+    unrelated_successor = canonical_read_custody_task("unrelated-successor",
+    predecessor=unrelated,
+    resumer_job_id="a1",)
+    tasks = (
+      a0, old_child, old_sibling, actor_parent, actor, a1, current_child,
+      later_actor, a2, later_child, unrelated, unrelated_successor,
+    )
+    outputs = {}
+    for task in tasks:
+      await durable_log.append(custody_registration(task))
+      outputs[task.attempt.physical_task_id] = await _append_custody_completion(durable_log, task)
+
+    resumed = {"a0", "a0-child", "a1", "a1-child", "a2", "a2-child"}
+    expected = {
+      "original-owner": {"original-owner", "old-sibling"} | resumed,
+      "nested-actor": {"nested-actor"} | resumed,
+      "later-actor": {"later-actor", "a1", "a1-child", "a2", "a2-child"},
+      # Physical ancestors retain their children, not their children's custody.
+      "actor-parent": {"actor-parent", "nested-actor"},
+      "actor-root": {"actor-root", "actor-parent", "nested-actor"},
+      "later-root": {"later-root", "later-actor"},
+      # A reached successor does not pass its own unrelated custody onward.
+      "a1": {"a1", "a1-child", "a2", "a2-child", "unrelated", "unrelated-successor"},
+      "session-alias": {"session-alias"},
+      "runner-alias": {"runner-alias"},
+      "unrelated-root": {"unrelated-root", "unrelated", "unrelated-successor"},
+    }
+    for reader, jobs in expected.items():
+      assert await job_read_subtree(durable_log, job_id=reader) == jobs
+      assert await job_output_handles(durable_log, job_id=reader) == frozenset(
+        outputs[job] for job in jobs if job in outputs
+      )
+    # Cold replay needs neither a retained registry nor a new custody event.
+    replay = AgentSessionLog(tmp_path / "custody.jsonl")
+    assert await job_read_subtree(replay, job_id="nested-actor") == expected["nested-actor"]
+    assert await job_read_subtree(replay, job_id="later-actor") == expected["later-actor"]
+
+  _run(_case())
+
+
+@pytest.mark.parametrize("tamper", ["digest", "physical_identity", "unsealed_metadata"])
+def test_job_read_custody_requires_the_canonical_successor(
+  tmp_path: Path,
+  tamper: str,
+) -> None:
+  async def _case() -> None:
+    durable_log = AgentSessionLog(tmp_path / "custody.jsonl")
+    original = canonical_read_custody_task("original")
+    successor = canonical_read_custody_task("successor", predecessor=original, resumer_job_id="actor")
+    await durable_log.append(custody_registration(original))
+    registration = custody_registration(successor)
+    if tamper == "digest":
+      registration["metadata"]["admitted_task"]["attempt"]["resumer_job_id"] = "other-actor"
+    elif tamper == "physical_identity":
+      registration["task_id"] = "physical-alias"
+    else:
+      registration["metadata"]["admitted_task"] = {
+        "attempt": successor.attempt.model_dump(mode="json"),
+        "execution_snapshot": {
+          "admitted_context": {"lineage": {"parent_job_id": "original-owner"}},
+        },
+      }
+    await durable_log.append(registration)
+    for reader in ("actor", "other-actor", "session-alias", "runner-alias"):
+      assert await job_read_subtree(durable_log, job_id=reader) == {reader}
+    assert await job_read_subtree(durable_log, job_id="original") == {"original"}
+
+  _run(_case())
+
+
+def test_job_read_custody_preserves_old_attempt_bytes_without_actor(tmp_path: Path) -> None:
+  async def _case() -> None:
+    durable_log = AgentSessionLog(tmp_path / "historical.jsonl")
+    original = canonical_read_custody_task("original")
+    successor = canonical_read_custody_task("successor", predecessor=original)
+    # Construct the pre-custody attempt wire, not a dump of the new optional field.
+    payload = successor.model_dump(mode="json", exclude={"admitted_task_digest"})
+    payload["attempt"] = {
+      "attempt_number": 2,
+      "attempt_id": "attempt:successor",
+      "physical_task_id": "successor",
+      "restart_of_attempt_id": None,
+      "resume_of_task_id": "original",
+    }
+    seal_admitted_task_payload(payload)
+    old_digest = payload["admitted_task_digest"]
+    old_wire = canonical_json_bytes(payload)
+    replayed = AdmittedTask.model_validate(payload)
+    assert replayed.admitted_task_digest == old_digest
+    assert canonical_json_bytes(replayed.model_dump(mode="json")) == old_wire
+    await durable_log.append(custody_registration(original))
+    await durable_log.append(custody_registration(replayed, parent_session_id="later-session"))
+    assert await job_read_subtree(durable_log, job_id="original") == {"original", "successor"}
+    assert await job_read_subtree(durable_log, job_id="successor") == {"successor"}
+    assert await job_read_subtree(durable_log, job_id="later-session") == {"later-session"}
+
+  _run(_case())
+
+
+def test_job_read_custody_stays_in_its_tenant_journal_after_completion_eviction(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    alice_log = AgentSessionLog(tmp_path / "alice" / "session.jsonl")
+    bob_log = AgentSessionLog(tmp_path / "bob" / "session.jsonl")
+    original = canonical_read_custody_task("alice-original")
+    successor = canonical_read_custody_task("alice-successor", predecessor=original, resumer_job_id="actor")
+    stranger = canonical_read_custody_task("bob-task", parent_job_id="bob-owner", tenant_storage_id="bob")
+    for task in (original, successor):
+      await alice_log.append(custody_registration(task))
+    await bob_log.append(custody_registration(stranger))
+    original_content = await _append_custody_completion(alice_log, original)
+    successor_content = await _append_custody_completion(alice_log, successor)
+    stranger_content = await _append_custody_completion(bob_log, stranger)
+
+    events, _ = await alice_log.query(event_types={"task_registered", "task_completed", "agent_completion"})
+    retained = TaskRegistry()
+    retained.load_from_events([item.event for item in events])
+    retained_successor = retained.get("alice-successor")
+    assert retained_successor is not None
+    assert retained_successor.state is TaskState.COMPLETED
+    assert retained_successor.admitted_task == successor
+    registry = TaskRegistry(max_retained=0)
+    registry.load_from_events([item.event for item in events])
+    assert registry.list_tasks() == []
+    replay = AgentSessionLog(tmp_path / "alice" / "session.jsonl")
+    assert await job_output_handles(replay, job_id="actor") == frozenset({
+      original_content, successor_content,
+    })
+    assert await job_read_subtree(bob_log, job_id="actor") == {"actor"}
+    assert await job_output_handles(bob_log, job_id="actor") == frozenset()
+    assert await job_output_handles(bob_log, job_id="bob-owner") == frozenset({stranger_content})
+    assert await job_read_subtree(replay, job_id="bob-owner") == {"bob-owner"}
+
+  _run(_case())

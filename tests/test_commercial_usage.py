@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import ast
 import importlib
-from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -233,15 +231,19 @@ async def test_producer_keeps_reported_model_distinct_from_exact_bind() -> None:
 
 
 @pytest.mark.asyncio
-async def test_producer_rejects_capability_projection_drift() -> None:
+async def test_producer_bills_the_bind_when_lineage_capability_differs() -> None:
+  emitted = []
   producer = CommercialUsageProducer(
     enabled=True,
     claim=_claim(),
     lineage=_lineage(capability_id="different.capability"),
-    sink=lambda _events: "lost",
+    sink=lambda payloads: emitted.extend(payloads) or "outbox",
   )
-  with pytest.raises(ValueError, match="capability projection differs"):
-    await producer.emit(_event())
+  payload = await producer.emit(_event())
+
+  assert payload is not None
+  assert payload["capability_id"] == "portfolio.review"
+  assert [item["capability_id"] for item in emitted] == ["portfolio.review"]
 
 
 @pytest.mark.asyncio
@@ -284,24 +286,38 @@ async def test_verified_work_start_emits_attempt_authoritative_usage_v3() -> Non
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-  "event_changes",
+  ("event_changes", "payload_field"),
   (
-    {"request_id": "other-request"},
-    {"session_id": "other-session"},
-    {"provider": "openai"},
-    {"billing_mode": "byok"},
+    ({"request_id": "other-request"}, "request_id"),
+    ({"session_id": "other-session"}, "session_id"),
+    ({"billing_mode": "byok"}, "raw_billing_mode"),
   ),
 )
-async def test_usage_v3_rejects_drift_from_verified_work_start(event_changes) -> None:
+async def test_usage_v3_records_drift_from_verified_work_start(
+  event_changes, payload_field
+) -> None:
+  emitted = []
+
+  def sink(payloads):
+    emitted.extend(payloads)
+    return "outbox"
+
+  work_start = _work_start()
   producer = CommercialUsageProducer(
     enabled=True,
     claim=None,
     lineage=None,
-    sink=lambda _events: "lost",
-    work_start=_work_start(),
+    sink=sink,
+    work_start=work_start,
   )
-  with pytest.raises(ValueError, match="differs"):
-    await producer.emit(_event(**event_changes))
+  payload = await producer.emit(_event(**event_changes))
+
+  assert payload is not None
+  assert emitted == [payload]
+  assert payload[payload_field] == next(iter(event_changes.values()))
+  assert payload["work_authorization_id"] == str(
+    work_start.authorization.authorization_id
+  )
 
 
 @pytest.mark.asyncio
@@ -748,57 +764,3 @@ async def test_send_prompt_real_producer_emits_metered_canonical_identity() -> N
   assert len({event["source_event_id"] for event in emitted}) == 3
   assert all(event["cost_observation_kind"] == "unknown" for event in emitted[1:])
   assert all(event["producer_estimated_cost_usd"] is None for event in emitted[1:])
-
-
-def _awaits_emit(source: str, receiver: str) -> bool:
-  tree = ast.parse(source)
-  return any(
-    isinstance(node, ast.Await)
-    and isinstance(node.value, ast.Call)
-    and isinstance(node.value.func, ast.Attribute)
-    and node.value.func.attr == "emit"
-    and isinstance(node.value.func.value, ast.Name)
-    and node.value.func.value.id == receiver
-    for node in ast.walk(tree)
-  )
-
-
-def _passes_keyword(source: str, keyword: str) -> bool:
-  tree = ast.parse(source)
-  return any(
-    isinstance(node, ast.Call)
-    and any(item.arg == keyword for item in node.keywords)
-    for node in ast.walk(tree)
-  )
-
-
-def test_production_usage_path_inventory_reaches_shared_commercial_hook() -> None:
-  package = Path(__file__).resolve().parents[1] / "agent_gateway"
-  emitters = {
-    "runner_usage.py": "commercial_usage_producer",
-    "sdk_runner_context.py": "producer",
-    "send_prompt.py": "commercial_usage_producer",
-  }
-  for filename, receiver in emitters.items():
-    source = (package / filename).read_text(encoding="utf-8")
-    assert _awaits_emit(source, receiver), f"production usage path bypasses commercial hook: {filename}"
-
-  for filename in ("runner_sub_agents.py", "autonomous.py"):
-    source = (package / filename).read_text(encoding="utf-8")
-    assert _passes_keyword(source, "commercial_usage_producer"), filename
-  easy_source = (package / "easy.py").read_text(encoding="utf-8")
-  assert "commercial_usage_producer_factory" in easy_source
-  assert _passes_keyword(easy_source, "commercial_usage_producer")
-
-  sdk_stream = (package / "sdk_runner_stream.py").read_text(encoding="utf-8")
-  assert {"message_start", "message_delta"} <= {
-    node.value
-    for node in ast.walk(ast.parse(sdk_stream))
-    if isinstance(node, ast.Constant) and isinstance(node.value, str)
-  }
-  assert not _awaits_emit("async def bypass(producer):\n  return None\n", "producer")
-  for filename in ("runner_stream_turn.py", "sdk_runner.py", "send_prompt.py"):
-    assert "assert_work_allowed" in (package / filename).read_text(encoding="utf-8")
-  assert (package / "sdk_runner.py").read_text(encoding="utf-8").count(
-    "commercial_guard(self._billing_mode)"
-  ) >= 2

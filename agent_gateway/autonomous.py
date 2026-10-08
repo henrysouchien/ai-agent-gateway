@@ -26,7 +26,7 @@ from agent_workflow_contracts.tool_registration import (
 )
 
 from ._io import _atomic_write_json, _read_json_object
-from .approval_route import NoApprovalRoute, session_approval_route
+from .approval_route import session_approval_route
 from .agent_session_log import AgentSessionLog, slugify
 from .autonomous_output import (
   RunOutput as RunOutput,
@@ -47,6 +47,7 @@ from .capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
 )
+from .code_execution import CodeExecutionBundle
 from .event_log import EventLog
 from .mcp_client import McpClientManager
 from .operation_catalog import AgentOperationCatalog
@@ -55,6 +56,7 @@ from .openai_history_fence import (
   OPENAI_SESSION_EPOCH_ENV,
   scope_provider_session_id,
 )
+from .admission import current_parent_context, root_context
 from .approval_policy import RunContext
 from .runner import AgentRunner, ToolResultContext, DEFAULT_MAX_BACKGROUND_TASKS
 from .runner_session_lifecycle import WriterLeaseAlreadyHeldError
@@ -74,7 +76,7 @@ from .sub_agent import (
   make_run_agent_tool_def,
 )
 from .agent_result_content import make_get_agent_result_content_tool_def
-from .task_registry import CoordinatorConfig
+from .task_registry import CoordinatorConfig, ParentMessage, RegistryOwner
 from .tool_dispatcher import LocalToolHandler, ToolDispatcher, ToolInterceptor
 from .tool_policy_registry import PreparedToolCall, ToolPolicyImplementationRegistry
 from .tool_registration import RegisteredMcpToolDescriptor
@@ -461,7 +463,6 @@ async def run_session(
   runner: AgentRunner,
   event_log: EventLog,
   *,
-  max_turns: int,
   initial_message: str,
   system_prompt: str | list[tuple[str, bool]] | None,
 ) -> RunOutput:
@@ -472,7 +473,6 @@ async def run_session(
   coro = runner.run(
     messages=[{"role": "user", "content": initial_message}],
     system_prompt=system_prompt,
-    max_turns=max_turns,
   )
   run_task: asyncio.Task[None] | None = None
   try:
@@ -671,7 +671,7 @@ async def run_autonomous(
   initial_message: str,
   *,
   capability_execution: BoundCapabilityExecution,
-  admitted_skill_execution_limits: SkillExecutionLimits | None,
+  admitted_skill_execution_limits: SkillExecutionLimits | None = None,
   session: GatewaySession,
   mcp_servers: dict[str, dict[str, Any]] | None = None,
   mcp_config_path: str | Path | None = None,
@@ -693,9 +693,9 @@ async def run_autonomous(
   ] | None = None,
   local_input_preparation_context_factory: Callable[..., object | None] | None = None,
   redaction_context_factory: Callable[..., object | None] | None = None,
-  approval_predicate_context_factory: Callable[..., object | None] | None = None,
-  registered_approval_overlay: Callable[..., bool] | None = None,
   tool_handlers: dict[str, LocalToolHandler] | None = None,
+  code_execution_factory: Callable[[GatewaySession], CodeExecutionBundle | None] | None = None,
+  code_execution_binder: Callable[[CodeExecutionBundle, ToolDispatcher], None] | None = None,
   tool_definitions: list[dict[str, Any]] | None = None,
   skill_local_tool_ceiling: frozenset[str] | None = None,
   skill_mcp_tool_ceiling: Mapping[str, frozenset[str]] | None = None,
@@ -708,9 +708,6 @@ async def run_autonomous(
   needs_approval: Callable[..., bool] | None = None,
   excluded_tools: set[str] | None = None,
   interceptors: Sequence[ToolInterceptor] | None = None,
-  max_turns: int = 80,
-  max_budget_usd: float | None = None,
-  client_timeout: float = 90.0,
   max_concurrent_sub_agents: int | None = DEFAULT_MAX_BACKGROUND_TASKS,
   compaction_instructions: str | None = None,
   state_dir: str | Path | None = None,
@@ -738,10 +735,16 @@ async def run_autonomous(
   Use for autonomous/cron jobs or as the building block for HeartbeatLoop.
   Supports MCP tools, local tool handlers, skills/sub-agents, state persistence,
   and delivery (Telegram, webhook, or callback) on completion.
+  Callers supplying session-bound code handlers also supply
+  `code_execution_factory` to construct a fresh bundle on each child session
+  and `code_execution_binder` to bind its dispatcher and exact tool grant;
+  interpreter state must not be shared with the parent.
   Inline or file-backed MCP configuration requires a launcher-owned
   `trusted_mcp_allowed_servers`; skill metadata is not an admission policy.
-  The default execution control is turn-based; no wall clock bounds the run.
-  Set `max_budget_usd` for production cost control.
+  No turn, cost, or wall-clock ceiling bounds the run; cost is measured through
+  `on_usage` / `on_session_summary`.
+  Supplied execution-limit observations are optional and pass through to the
+  session's RunContext unchanged, whether or not this is a named skill run.
   Standalone top-level skill callers must bind both `top_level_skill_name` and
   a unique `skill_run_id`; these values are trusted runtime context, not model input.
   """
@@ -801,10 +804,6 @@ async def run_autonomous(
     )
   resolved_auth_config = dict(capability_execution.auth_config)
   if top_level_skill_name is None:
-    if admitted_skill_execution_limits is not None:
-      raise ValueError(
-        "run_autonomous without a top-level skill cannot carry admitted limits"
-      )
     if skill_run_id is not None:
       raise ValueError(
         "run_autonomous skill_run_id requires top_level_skill_name"
@@ -841,10 +840,6 @@ async def run_autonomous(
       )
     trusted_skill_name = top_level_skill_name
     trusted_skill_run_id = skill_run_id
-    if type(admitted_skill_execution_limits) is not SkillExecutionLimits:
-      raise TypeError(
-        "run_autonomous top-level skill requires exact admitted limits"
-      )
   max_tokens = resolved_auth_config.get("max_tokens")
   if (
     isinstance(max_tokens, bool)
@@ -1071,27 +1066,24 @@ async def run_autonomous(
         interceptors=runtime_interceptors,
         mcp_session_inject_servers=mcp_session_inject_servers,
         local_tool_handlers=local_handlers,
+        code_execution_factory=code_execution_factory,
+        code_execution_binder=code_execution_binder,
         excluded_tools=skills_excluded_tools,
         outputs_dir=Path(outputs_dir) if outputs_dir is not None else None,
         capability_execution_resolver=(
           child_capability_execution_resolvers["run_agent"]
         ),
-        coordinator_config=coordinator,
         tool_registration_catalog=tool_registration_catalog,
         tool_policy_implementations=tool_policy_implementations,
-        input_preparation_context_factory=(
-          local_input_preparation_context_factory
-        ),
         redaction_context_factory=redaction_context_factory,
-        approval_predicate_context_factory=(
-          approval_predicate_context_factory
-        ),
-        registered_approval_overlay=registered_approval_overlay,
       )
       if "get_background_result" not in local_handlers:
         local_handlers["get_background_result"] = make_get_background_result_handler(runner_ref)
       if "send_message" not in local_handlers:
-        local_handlers["send_message"] = make_send_message_handler(runner_ref)
+        local_handlers["send_message"] = make_send_message_handler(
+          runner_ref,
+          caller=lambda: current_parent_context(session),
+        )
       if not any(definition.get("name") == "run_agent" for definition in extra_tool_defs):
         extra_tool_defs.append(make_run_agent_tool_def(operation_source))
       if not any(definition.get("name") == "get_background_result" for definition in extra_tool_defs):
@@ -1137,10 +1129,10 @@ async def run_autonomous(
 
     event_log = EventLog()
     approval_route = session_approval_route(session)
-    # A live route carries the session whose ledger records the decision; a
-    # dispatcher without one still needs its session for everything else.
-    routeless_session = (
-      session if isinstance(approval_route, NoApprovalRoute) else None
+    context = root_context(
+      session,
+      withheld_tools=frozenset(excluded_tools or ()),
+      research_file_id=None,
     )
     dispatcher = ToolDispatcher(
       mcp_client=mcp_client or _NullMcpClient(),
@@ -1156,7 +1148,7 @@ async def run_autonomous(
       risk_user_id=session.risk_user_id,
       channel=session.channel,
       role=session.role,
-      session=routeless_session,
+      session=session,
       approval_route=approval_route,
       run_context=run_context,
       get_tool_definitions=_get_tool_defs,
@@ -1167,18 +1159,14 @@ async def run_autonomous(
         local_input_preparation_context_factory
       ),
       redaction_context_factory=redaction_context_factory,
-      approval_predicate_context_factory=(
-        approval_predicate_context_factory
-      ),
-      registered_approval_overlay=registered_approval_overlay,
     )
+    root_inbox: asyncio.Queue[ParentMessage] = asyncio.Queue(maxsize=64)
     runner = AgentRunner(
       event_log=event_log,
       dispatcher=dispatcher,
       session_id=sid,
       capability_execution=capability_execution,
       allow_stub_response=False,
-      client_timeout=client_timeout,
       max_tokens_override=max_tokens,
       mcp_client=mcp_client,
       mcp_activation_fold=session.mcp_activation_fold,
@@ -1191,21 +1179,28 @@ async def run_autonomous(
       user_id=user_id,
       billing_mode=billing_mode,
       rate_table_version=rate_table_version,
-      max_budget_usd=max_budget_usd,
       max_concurrent_sub_agents=max_concurrent_sub_agents,
       skill_run_id=trusted_skill_run_id,
       compaction_instructions=compaction_instructions,
       coordinator=coordinator,
       agent_session_log=durable_session_log,
+      message_inbox=root_inbox,
       commercial_usage_producer=commercial_usage_producer,
     )
+    job_id = context.job_id
+    assert job_id is not None, "the executing job must have an admitted identity"
+    runner._task_registry.bind_owner(RegistryOwner(
+      job_id=job_id,
+      tenant=lambda: current_parent_context(session).tenant,
+      inbox=root_inbox,
+      spill_sink=getattr(session, "tool_result_spill_sink", None),
+    ))
     runner_ref[0] = runner
 
     previous_state = load_state(state_dir, state_file=state_file) if state_dir is not None else {}
     output = await run_session(
       runner,
       event_log,
-      max_turns=max_turns,
       initial_message=initial_message,
       system_prompt=system_prompt,
     )
@@ -1233,8 +1228,24 @@ async def run_autonomous(
 
     return output
   finally:
-    if mcp_client is not None:
-      await mcp_client.shutdown()
+    from .code_execution import cleanup_code_execution
+
+    async def _shutdown_owned_session() -> None:
+      try:
+        await cleanup_code_execution(session)
+      finally:
+        if mcp_client is not None:
+          await mcp_client.shutdown()
+
+    shutdown_task = asyncio.create_task(
+      _shutdown_owned_session(),
+      name=f"autonomous-session:{sid}:shutdown",
+    )
+    try:
+      await asyncio.shield(shutdown_task)
+    except asyncio.CancelledError:
+      await drain_owned_lifecycle_task(shutdown_task)
+      raise
 
 
 def run_autonomous_sync(

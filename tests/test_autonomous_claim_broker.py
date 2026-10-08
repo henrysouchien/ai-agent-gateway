@@ -142,7 +142,6 @@ def test_broker_signer_is_fixed_to_admitted_identity() -> None:
     verified = _verify_agent_claim_headers(
       _SECRET,
       _claim_headers(claim),
-      ttl_ceiling=600,
     )
     assert verified is not None
     assert verified["user_id"] == "42"

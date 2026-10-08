@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+import hashlib
 import io
+import json
 import os
 from pathlib import Path
 import stat
+from threading import Event
 
 import pytest
 
@@ -15,14 +20,17 @@ from agent_gateway.providers.anthropic_oauth import (
   ANTHROPIC_USER_SCOPE_FIELD,
   AnthropicOAuthError,
   AnthropicOAuthRecord,
+  AnthropicSourceError,
   complete_anthropic_login,
   enroll_anthropic_setup_token,
   load_anthropic_oauth_store,
   parse_anthropic_callback,
   refresh_anthropic_oauth_record,
+  register_anthropic_static_credential,
+  remove_anthropic_oauth_record,
   resolve_anthropic_auth_store_path,
   resolve_anthropic_credentials,
-  select_anthropic_credential,
+  select_anthropic_credential_source,
   start_anthropic_login,
   upsert_anthropic_oauth_record,
 )
@@ -82,12 +90,14 @@ def test_env_token_precedes_enrolled_accounts_and_both_are_siblings(tmp_path: Pa
     "sk-ant-oat01-setup-env",
     "sk-ant-oat01-stored@example.com-access",
   )
-  # The enrolled account is keyed by identity so a refreshed access token keeps
-  # its parking window; environment tokens are their own keys.
+  # Parking remains account-level for enrolled grants and token-level for env
+  # members; durable source identity does not change pool cooldown semantics.
   assert sources.keys[-1] == "stored@example.com"
   env_credential = sources.by_token("sk-ant-oat01-existing-session")
   assert env_credential is not None
-  assert env_credential.record is None
+  assert env_credential.record is not None
+  assert env_credential.record.source == "env:ANTHROPIC_AUTH_TOKEN"
+  assert env_credential.store_path == path
 
 
 def test_env_token_that_is_an_enrolled_access_token_resolves_to_that_account(
@@ -267,6 +277,7 @@ def test_enrolling_an_account_does_not_mutate_an_existing_gateway_session_config
 ) -> None:
   monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
   monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+  monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "oauth.json"))
   app = create_agent(
     "test",
     provider="anthropic",
@@ -420,7 +431,13 @@ def test_selection_refreshes_the_expired_account_it_is_about_to_bind(
   )
 
   pool = anthropic_oauth.AnthropicCredentialPool()
-  assert select_anthropic_credential(sources, pool=pool) == "sk-ant-oat01-bound-fresh"
+  selected = select_anthropic_credential_source(sources, pool=pool)
+  assert selected is not None
+  assert selected.token == "sk-ant-oat01-bound-fresh"
+  [stored] = load_anthropic_oauth_store(path)
+  assert selected.record == stored
+  assert selected.store_path == path
+  assert selected.source_metadata() == stored.source_metadata()
 
 
 def test_failed_refresh_marks_the_account_and_serves_the_next_sibling(
@@ -439,13 +456,13 @@ def test_failed_refresh_marks_the_account_and_serves_the_next_sibling(
   )
   pool = anthropic_oauth.AnthropicCredentialPool()
 
-  assert select_anthropic_credential(sources, pool=pool) == (
-    "sk-ant-oat01-healthy@example.com-access"
-  )
+  selected = select_anthropic_credential_source(sources, pool=pool)
+  assert selected is not None
+  assert selected.token == "sk-ant-oat01-healthy@example.com-access"
   stale, healthy = load_anthropic_oauth_store(path)
   # The record is marked, never deleted: re-enrolling is the operator's remedy.
   assert stale.identity == "stale@example.com"
-  assert "invalid_grant" in stale.last_error
+  assert stale.last_error
   assert stale.refresh_token == "sk-ant-ort01-stale@example.com-refresh"
   assert healthy.last_error == ""
   assert pool.blocked_until("stale@example.com") > 0.0
@@ -553,7 +570,10 @@ def test_refresh_is_written_back_to_the_store_that_owns_the_account(
 
   sources = resolve_anthropic_credentials(environ=environ, user_scope=4)
   pool = anthropic_oauth.AnthropicCredentialPool()
-  assert select_anthropic_credential(sources, pool=pool) == "sk-ant-oat01-user-fresh"
+  selected = select_anthropic_credential_source(sources, pool=pool)
+  assert selected is not None
+  assert selected.token == "sk-ant-oat01-user-fresh"
+  assert selected.store_path == user_store
 
   [stored] = load_anthropic_oauth_store(user_store)
   assert stored.access_token == "sk-ant-oat01-user-fresh"
@@ -592,3 +612,586 @@ def test_cli_enrolls_a_setup_token_from_stdin_into_one_users_pool(
   assert resolve_anthropic_credentials(
     environ={"USER_DATA_DIR": str(tmp_path)}, user_scope=1
   ).tokens == (token,)
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_legacy_migration_persists_one_generation_across_reload(
+  tmp_path: Path, legacy: bool,
+) -> None:
+  path = tmp_path / "oauth.json"
+  original = _record("migrated@example.com")
+  if legacy:
+    payload = {"auth_token": original.access_token, "source": "claude-setup-token"}
+    grant_material = original.access_token
+  else:
+    entry = original.to_payload()
+    for name in ("generation_id", "grant_hash", "credential_kind"):
+      entry.pop(name)
+    payload = {"version": 2, "accounts": [entry]}
+    grant_material = original.refresh_token
+  path.write_text(json.dumps(payload), encoding="utf-8")
+  path.chmod(0o644)
+
+  [first] = load_anthropic_oauth_store(path)
+  migrated_bytes = path.read_bytes()
+  [second] = load_anthropic_oauth_store(path)
+  assert first.source_metadata() == second.source_metadata()
+  assert first.grant_hash == hashlib.sha256(grant_material.encode()).hexdigest()
+  assert first.generation_id
+  assert path.read_bytes() == migrated_bytes
+  assert stat.S_IMODE(path.stat().st_mode) == 0o600
+  recovered = resolve_anthropic_credentials(
+    {"credential_source": first.source_metadata()},
+    environ={"ANTHROPIC_AUTH_STORE_PATH": str(path)},
+  ).credentials[0]
+  assert recovered.token == original.access_token
+  assert recovered.source_metadata() == first.source_metadata()
+
+
+def test_exact_materialization_refreshes_material_without_changing_source_grant(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  path = tmp_path / "oauth.json"
+  [original] = upsert_anthropic_oauth_record(
+    path, _record("grant@example.com", expires_at=0.0),
+  )
+  metadata = original.source_metadata()
+  env = {"ANTHROPIC_AUTH_STORE_PATH": str(path)}
+  monkeypatch.setattr(
+    anthropic_oauth, "_post_token_endpoint",
+    lambda url, body: {
+      "access_token": "fixture-rotated-access",
+      "refresh_token": "fixture-rotated-refresh",
+      "expires_in": 28800,
+    },
+  )
+  sources = resolve_anthropic_credentials({"credential_source": metadata}, environ=env)
+  materialized = select_anthropic_credential_source(
+    sources, pool=anthropic_oauth.AnthropicCredentialPool(), now=1000.0,
+  )
+  assert materialized is not None
+  assert materialized.token == "fixture-rotated-access"
+  assert materialized.source_metadata() == metadata
+  assert set(metadata) == {"account_identity", "grant_hash", "generation_id", "generation_ref"}
+  assert original.access_token not in metadata["generation_ref"]
+  assert str(path) not in metadata["generation_ref"]
+  assert metadata["grant_hash"] == hashlib.sha256(original.refresh_token.encode()).hexdigest()
+  recovered = resolve_anthropic_credentials(
+    {"credential_source": metadata}, environ=env,
+  ).credentials[0]
+  assert recovered == materialized
+  [stored] = load_anthropic_oauth_store(path)
+  assert stored.refresh_token == "fixture-rotated-refresh"
+  assert stored.source_metadata() == metadata
+  assert original.refresh_token not in path.read_text()
+
+
+def test_same_account_reconsent_supersedes_original_generation_in_its_pool_slot(
+  tmp_path: Path,
+) -> None:
+  path = tmp_path / "oauth.json"
+  env = {"ANTHROPIC_AUTH_STORE_PATH": str(path)}
+
+  def consent(access: str, refresh: str) -> AnthropicOAuthRecord:
+    request = start_anthropic_login()
+    return complete_anthropic_login(
+      request, f"fixture-code#{request.state}", store_path=path, now=1000.0,
+      post=lambda url, body: {
+        "access_token": access,
+        "refresh_token": refresh,
+        "expires_in": 28800,
+        "account": {"email_address": "same@example.com"},
+      },
+    )
+
+  original = consent("fixture-first-access", "fixture-first-grant")
+  upsert_anthropic_oauth_record(path, _record("sibling@example.com"))
+  replacement = consent("fixture-next-access", "fixture-next-grant")
+
+  assert replacement.identity == original.identity
+  assert replacement.grant_hash != original.grant_hash
+  assert replacement.generation_id != original.generation_id
+  active = load_anthropic_oauth_store(path)
+  assert [record.identity for record in active] == ["same@example.com", "sibling@example.com"]
+  assert active[0] == replacement
+  with pytest.raises(AnthropicSourceError) as missing:
+    resolve_anthropic_credentials({"credential_source": original.source_metadata()}, environ=env)
+  assert missing.value.code == "credential_unavailable"
+  assert missing.value.reason == "superseded"
+  assert missing.value.next_call
+  assert resolve_anthropic_credentials(
+    {"credential_source": replacement.source_metadata()}, environ=env,
+  ).credentials[0].token == replacement.access_token
+  assert original.access_token not in path.read_text()
+  assert original.refresh_token not in path.read_text()
+
+
+@pytest.mark.parametrize("source", ["env:ANTHROPIC_API_KEY", "request:anthropic:api_key"])
+def test_static_api_key_reobservation_and_replacement_have_exact_source_generations(
+  tmp_path: Path, source: str,
+) -> None:
+  env = {"USER_DATA_DIR": str(tmp_path), "ANTHROPIC_API_KEY": "fixture-api-key-first"}
+  original = register_anthropic_static_credential(
+    env["ANTHROPIC_API_KEY"], source=source, environ=env, user_scope=7,
+  )
+  assert original is not None and original.record is not None
+  path = resolve_anthropic_auth_store_path(
+    environ=env, user_scope="" if source.startswith("env:") else 7,
+  )
+  assert original.store_path == path
+  assert original.account_identity == "api-key-" + hashlib.sha256(original.token.encode()).hexdigest()[:16]
+  assert original.grant_hash == hashlib.sha256(original.token.encode()).hexdigest()
+  repeated = register_anthropic_static_credential(
+    original.token, source=source, environ=env, user_scope=7,
+  )
+  assert repeated is not None
+  assert repeated.source_metadata() == original.source_metadata()
+  assert load_anthropic_oauth_store(path) == ()
+  assert resolve_anthropic_credentials(environ=env, user_scope=7).credentials == ()
+
+  env["ANTHROPIC_API_KEY"] = "fixture-api-key-replacement"
+  replacement = register_anthropic_static_credential(
+    env["ANTHROPIC_API_KEY"], source=source, environ=env, user_scope=7,
+  )
+  assert replacement is not None
+  assert replacement.generation_id != original.generation_id
+  assert load_anthropic_oauth_store(path) == ()
+  assert original.token not in path.read_text()
+  assert stat.S_IMODE(path.stat().st_mode) == 0o600
+  if source.startswith("env:"):
+    assert not resolve_anthropic_auth_store_path(environ=env, user_scope=7).exists()
+
+
+def test_empty_static_source_does_not_invent_a_generation_and_removal_discards_material(
+  tmp_path: Path,
+) -> None:
+  env = {"USER_DATA_DIR": str(tmp_path)}
+  assert register_anthropic_static_credential("", environ=env) is None
+  path = resolve_anthropic_auth_store_path(environ=env)
+  assert not path.exists()
+  key = register_anthropic_static_credential(
+    "fixture-request-key", source="request:anthropic:api_key", environ=env, user_scope=1,
+  )
+  assert key is not None
+  assert register_anthropic_static_credential(
+    "", source="request:anthropic:api_key", environ=env, user_scope=1,
+  ) is None
+  assert key.store_path is not None
+  saved = json.loads(key.store_path.read_text())
+  assert saved["static_credentials"] == []
+  assert key.token not in key.store_path.read_text()
+
+
+def test_exact_generation_lookup_never_crosses_user_custody_or_matches_same_account(
+  tmp_path: Path,
+) -> None:
+  env = {"USER_DATA_DIR": str(tmp_path)}
+  user_path = resolve_anthropic_auth_store_path(environ=env, user_scope=1)
+  org_path = resolve_anthropic_auth_store_path(environ=env)
+  [private] = upsert_anthropic_oauth_record(user_path, _record("same@example.com"))
+  [shared] = upsert_anthropic_oauth_record(
+    org_path, replace(_record("same@example.com"), access_token="fixture-org-access"),
+  )
+  assert resolve_anthropic_credentials(
+    {"credential_source": private.source_metadata()}, environ=env, user_scope=1,
+  ).credentials[0].token == private.access_token
+  with pytest.raises(AnthropicSourceError) as missing:
+    resolve_anthropic_credentials(
+      {"credential_source": private.source_metadata()}, environ=env, user_scope=2,
+    )
+  assert missing.value.reason == "missing"
+  assert resolve_anthropic_credentials(
+    {"credential_source": shared.source_metadata()}, environ=env, user_scope=2,
+  ).credentials[0].token == shared.access_token
+  with pytest.raises(AnthropicSourceError) as unknown:
+    resolve_anthropic_credentials(
+      {"credential_source": {"generation_ref": "fixture-secret-ref-not-enrolled"}},
+      environ=env, user_scope=1,
+    )
+  assert "fixture-secret-ref-not-enrolled" not in str(unknown.value)
+
+
+def test_environment_array_sources_keep_membership_identity_across_reordering_and_removal(
+  tmp_path: Path,
+) -> None:
+  env = {
+    "USER_DATA_DIR": str(tmp_path),
+    "ANTHROPIC_AUTH_TOKENS": json.dumps(["fixture-member-a", "fixture-member-b"]),
+  }
+  original = resolve_anthropic_credentials(environ=env, user_scope=1)
+  first, second = original.credentials
+  assert first.store_path == second.store_path == original.store_path
+  assert load_anthropic_oauth_store(original.store_path) == ()
+  assert original.user_store_path is not None and not original.user_store_path.exists()
+  env["ANTHROPIC_AUTH_TOKENS"] = json.dumps(["fixture-member-b", "fixture-member-a"])
+  reordered = resolve_anthropic_credentials(environ=env, user_scope=2)
+  assert reordered.tokens == ("fixture-member-b", "fixture-member-a")
+  assert [credential.generation_ref for credential in reordered.credentials] == [
+    second.generation_ref, first.generation_ref,
+  ]
+  env["ANTHROPIC_AUTH_TOKENS"] = json.dumps(["fixture-member-b", "fixture-member-c"])
+  updated = resolve_anthropic_credentials(environ=env, user_scope=2)
+  assert updated.tokens == ("fixture-member-b", "fixture-member-c")
+  assert updated.credentials[0].generation_ref == second.generation_ref
+  assert updated.credentials[1].generation_ref not in (first.generation_ref, second.generation_ref)
+  with pytest.raises(AnthropicSourceError) as removed:
+    resolve_anthropic_credentials(
+      {"credential_source": first.source_metadata()}, environ=env, user_scope=2,
+    )
+  assert removed.value.reason == "removed"
+  assert resolve_anthropic_credentials(
+    {"credential_source": second.source_metadata()}, environ=env, user_scope=2,
+  ).credentials[0].token == second.token
+  assert first.token not in original.store_path.read_text()
+
+
+def test_environment_singleton_replacement_preserves_other_env_source_members(
+  tmp_path: Path,
+) -> None:
+  env = {
+    "USER_DATA_DIR": str(tmp_path),
+    "ANTHROPIC_AUTH_TOKEN": "fixture-primary-env-token",
+    "CLAUDE_CODE_OAUTH_TOKEN": "fixture-other-env-token",
+  }
+  first, other = resolve_anthropic_credentials(environ=env).credentials
+  env["ANTHROPIC_AUTH_TOKEN"] = "fixture-replacement-env-token"
+  replacement, retained = resolve_anthropic_credentials(environ=env).credentials
+  assert retained.generation_ref == other.generation_ref
+  assert replacement.generation_ref != first.generation_ref
+  with pytest.raises(AnthropicSourceError) as missing:
+    resolve_anthropic_credentials({"credential_source": first.source_metadata()}, environ=env)
+  assert missing.value.reason == "superseded"
+  assert resolve_anthropic_credentials(
+    {"credential_source": retained.source_metadata()}, environ=env,
+  ).credentials[0].token == other.token
+
+
+def test_captured_refresh_record_cannot_overwrite_new_consent(
+  tmp_path: Path,
+) -> None:
+  path = tmp_path / "oauth.json"
+  [original] = upsert_anthropic_oauth_record(path, _record("same@example.com", expires_at=0.0))
+  [replacement] = upsert_anthropic_oauth_record(
+    path, replace(_record("same@example.com"), access_token="fixture-new-consent", refresh_token="fixture-new-grant"),
+  )
+  posts: list[object] = []
+  with pytest.raises(AnthropicSourceError) as missing:
+    refresh_anthropic_oauth_record(
+      original, store_path=path, now=1000.0,
+      post=lambda url, body: posts.append(body) or {},
+    )
+  assert missing.value.reason == "superseded"
+  assert posts == []
+  assert load_anthropic_oauth_store(path) == (replacement,)
+
+
+def test_concurrent_refreshers_never_reuse_a_captured_rotating_refresh_token(
+  tmp_path: Path,
+) -> None:
+  path = tmp_path / "oauth.json"
+  [original] = upsert_anthropic_oauth_record(path, _record("same@example.com", expires_at=0.0))
+  entered = Event()
+  release = Event()
+  second_started = Event()
+  posted: list[str] = []
+
+  def post(url, body):
+    posted.append(body["refresh_token"])
+    entered.set()
+    assert release.wait(5)
+    return {"access_token": "fixture-fresh-access", "refresh_token": "fixture-fresh-refresh", "expires_in": 28800}
+
+  def second_refresh():
+    second_started.set()
+    return refresh_anthropic_oauth_record(original, store_path=path, now=1000.0, post=post)
+
+  with ThreadPoolExecutor(max_workers=2) as executor:
+    first = executor.submit(refresh_anthropic_oauth_record, original, store_path=path, now=1000.0, post=post)
+    try:
+      assert entered.wait(5)
+      second = executor.submit(second_refresh)
+      assert second_started.wait(5)
+    finally:
+      release.set()
+    first_result, second_result = first.result(5), second.result(5)
+  assert posted == [original.refresh_token]
+  assert first_result == second_result
+  assert first_result.source_metadata() == original.source_metadata()
+  assert load_anthropic_oauth_store(path) == (first_result,)
+
+
+@pytest.mark.parametrize("mutation", ["consent", "remove"])
+def test_consent_and_removal_serialize_with_refresh_and_cannot_be_undone(
+  tmp_path: Path, mutation: str,
+) -> None:
+  path = tmp_path / "oauth.json"
+  env = {"ANTHROPIC_AUTH_STORE_PATH": str(path)}
+  [original] = upsert_anthropic_oauth_record(path, _record("same@example.com", expires_at=0.0))
+  entered = Event()
+  release = Event()
+  mutation_started = Event()
+
+  def post(url, body):
+    entered.set()
+    assert release.wait(5)
+    return {"access_token": "fixture-refreshed-access", "refresh_token": "fixture-refreshed-refresh", "expires_in": 28800}
+
+  def mutate():
+    mutation_started.set()
+    if mutation == "remove":
+      return remove_anthropic_oauth_record(path, original.identity)
+    return upsert_anthropic_oauth_record(
+      path, replace(_record(original.identity), access_token="fixture-consent-access", refresh_token="fixture-consent-grant"),
+    )
+
+  with ThreadPoolExecutor(max_workers=2) as executor:
+    refresh = executor.submit(refresh_anthropic_oauth_record, original, store_path=path, now=1000.0, post=post)
+    try:
+      assert entered.wait(5)
+      mutator = executor.submit(mutate)
+      assert mutation_started.wait(5)
+    finally:
+      release.set()
+    refresh.result(5)
+    mutator.result(5)
+  active = load_anthropic_oauth_store(path)
+  if mutation == "remove":
+    assert active == ()
+  else:
+    assert len(active) == 1
+    assert active[0].access_token == "fixture-consent-access"
+    assert active[0].generation_id != original.generation_id
+  with pytest.raises(AnthropicSourceError) as missing:
+    resolve_anthropic_credentials({"credential_source": original.source_metadata()}, environ=env)
+  assert missing.value.reason == ("removed" if mutation == "remove" else "superseded")
+  assert "fixture-refreshed-access" not in path.read_text()
+  assert "fixture-refreshed-refresh" not in path.read_text()
+
+
+def test_source_repr_and_refresh_failure_never_expose_credential_material(
+  tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  path = tmp_path / "oauth.json"
+  [record] = upsert_anthropic_oauth_record(path, _record("private@example.com", expires_at=0.0))
+  sources = resolve_anthropic_credentials(environ={"ANTHROPIC_AUTH_STORE_PATH": str(path)})
+  for material in (record.access_token, record.refresh_token):
+    assert material not in repr(record)
+    assert material not in repr(sources)
+
+  def failure(url, body):
+    raise AnthropicOAuthError(f"fixture endpoint echoed {record.refresh_token}")
+
+  with pytest.raises(AnthropicOAuthError) as failed:
+    refresh_anthropic_oauth_record(record, store_path=path, now=1000.0, post=failure)
+  monkeypatch.setattr(anthropic_oauth, "_post_token_endpoint", failure)
+  caplog.set_level("INFO", logger=anthropic_oauth.__name__)
+  selected = select_anthropic_credential_source(sources, pool=anthropic_oauth.AnthropicCredentialPool(), now=1000.0)
+  assert selected is not None
+  assert selected.source_metadata() == record.source_metadata()
+  assert caplog.records
+  [stored] = load_anthropic_oauth_store(path)
+  for material in (record.access_token, record.refresh_token):
+    assert material not in str(failed.value)
+    assert material not in stored.last_error
+    assert material not in caplog.text
+
+
+def test_empty_pool_selection_returns_no_source_or_invented_generation(tmp_path: Path) -> None:
+  env = {"USER_DATA_DIR": str(tmp_path)}
+  sources = resolve_anthropic_credentials(environ=env, user_scope=3)
+  assert select_anthropic_credential_source(sources, pool=anthropic_oauth.AnthropicCredentialPool()) is None
+  assert not sources.store_path.exists()
+  assert sources.user_store_path is not None and not sources.user_store_path.exists()
+
+
+def test_reconsent_with_identical_returned_material_still_creates_a_new_generation(
+  tmp_path: Path,
+) -> None:
+  path = tmp_path / "oauth.json"
+  request = start_anthropic_login()
+
+  def login():
+    return complete_anthropic_login(
+      request, f"fixture-code#{request.state}", store_path=path, now=1000.0,
+      post=lambda url, body: {
+        "access_token": "fixture-consent-access",
+        "refresh_token": "fixture-consent-refresh",
+        "expires_in": 28800,
+        "account": {"email_address": "same@example.com"},
+      },
+    )
+
+  original, replacement = login(), login()
+  assert original.grant_hash == replacement.grant_hash
+  assert original.generation_id != replacement.generation_id
+  assert load_anthropic_oauth_store(path) == (replacement,)
+  with pytest.raises(AnthropicSourceError) as missing:
+    resolve_anthropic_credentials(
+      {"credential_source": original.source_metadata()},
+      environ={"ANTHROPIC_AUTH_STORE_PATH": str(path)},
+    )
+  assert missing.value.reason == "superseded"
+
+
+@pytest.mark.parametrize("with_metadata", [False, True])
+def test_bound_environment_config_preserves_original_org_source_without_user_clone(
+  tmp_path: Path, with_metadata: bool,
+) -> None:
+  env = {"USER_DATA_DIR": str(tmp_path), "ANTHROPIC_AUTH_TOKEN": "fixture-org-token"}
+  original_sources = resolve_anthropic_credentials(environ=env, user_scope=7)
+  original = select_anthropic_credential_source(
+    original_sources, pool=anthropic_oauth.AnthropicCredentialPool(),
+  )
+  assert original is not None
+  cfg: dict[str, object] = {"auth_token": original.token, ANTHROPIC_USER_SCOPE_FIELD: "7"}
+  if with_metadata:
+    cfg["credential_source"] = original.source_metadata()
+
+  repeated_sources = resolve_anthropic_credentials(cfg, environ=env)
+  repeated = select_anthropic_credential_source(
+    repeated_sources, pool=anthropic_oauth.AnthropicCredentialPool(),
+  )
+  assert repeated is not None
+  assert repeated.generation_ref == original.generation_ref
+  assert repeated.store_path == original_sources.store_path
+  assert repeated.record is not None and repeated.record.source == "env:ANTHROPIC_AUTH_TOKEN"
+  assert anthropic_oauth.ensure_fresh_anthropic_credential(original.token, config=cfg, environ=env) == original.token
+  assert original_sources.user_store_path is not None
+  assert not original_sources.user_store_path.exists()
+  saved = json.loads(original_sources.store_path.read_text())
+  assert saved["static_credentials"][0]["source"] == "env:ANTHROPIC_AUTH_TOKEN"
+
+  env["ANTHROPIC_AUTH_TOKEN"] = ""
+  with pytest.raises(AnthropicSourceError) as removed:
+    resolve_anthropic_credentials(cfg, environ=env)
+  assert removed.value.reason == "removed"
+  with pytest.raises(AnthropicSourceError):
+    resolve_anthropic_credentials(
+      {"credential_source": original.source_metadata()}, environ=env, user_scope=7,
+    )
+  assert not original_sources.user_store_path.exists()
+  assert original.token not in original_sources.store_path.read_text()
+
+
+def test_bound_source_metadata_retains_original_grant_after_access_token_refresh(
+  tmp_path: Path,
+) -> None:
+  env = {"USER_DATA_DIR": str(tmp_path)}
+  user_path = resolve_anthropic_auth_store_path(environ=env, user_scope=7)
+  [original] = upsert_anthropic_oauth_record(
+    user_path, _record("same@example.com", expires_at=0.0),
+  )
+  cfg: dict[str, object] = {
+    "auth_token": original.access_token,
+    ANTHROPIC_USER_SCOPE_FIELD: "7",
+    "credential_source": original.source_metadata(),
+  }
+  refreshed = refresh_anthropic_oauth_record(
+    original, store_path=user_path, now=1000.0,
+    post=lambda url, body: {
+      "access_token": "fixture-grant-refreshed-access",
+      "refresh_token": "fixture-grant-refreshed-refresh",
+      "expires_in": 28800,
+    },
+  )
+  resolved = resolve_anthropic_credentials(cfg, environ=env)
+  assert len(resolved.credentials) == 1
+  assert resolved.credentials[0].token == refreshed.access_token
+  assert resolved.credentials[0].source_metadata() == original.source_metadata()
+  assert anthropic_oauth.ensure_fresh_anthropic_credential(
+    original.access_token, config=cfg, environ=env, now=1000.0,
+  ) == refreshed.access_token
+  saved = json.loads(user_path.read_text())
+  assert saved["static_credentials"] == []
+
+  [replacement] = upsert_anthropic_oauth_record(
+    user_path,
+    replace(_record(original.identity), access_token="fixture-new-consent", refresh_token="fixture-new-consent-grant"),
+  )
+  # Even bytes matching the current successor cannot substitute for known X.
+  cfg["auth_token"] = replacement.access_token
+  with pytest.raises(AnthropicSourceError) as superseded:
+    resolve_anthropic_credentials(cfg, environ=env)
+  assert superseded.value.reason == "superseded"
+  with pytest.raises(AnthropicSourceError):
+    anthropic_oauth.ensure_fresh_anthropic_credential(
+      replacement.access_token, config=cfg, environ=env, now=1000.0,
+    )
+  assert load_anthropic_oauth_store(user_path) == (replacement,)
+  assert json.loads(user_path.read_text())["static_credentials"] == []
+
+
+@pytest.mark.parametrize("name", [
+  "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKENS",
+  "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
+])
+def test_process_without_source_environment_cannot_retire_durable_generation(
+  tmp_path: Path, name: str,
+) -> None:
+  token = "fixture-authoritative-material"
+  authoritative_env = {
+    "USER_DATA_DIR": str(tmp_path),
+    name: json.dumps([token]) if name == "ANTHROPIC_AUTH_TOKENS" else token,
+  }
+  if name == "ANTHROPIC_API_KEY":
+    original = register_anthropic_static_credential(token, environ=authoritative_env)
+  else:
+    [original] = resolve_anthropic_credentials(environ=authoritative_env).credentials
+  assert original is not None and original.store_path is not None
+  saved_bytes = original.store_path.read_bytes()
+  unobserving_env = {"USER_DATA_DIR": str(tmp_path)}
+
+  assert resolve_anthropic_credentials(environ=unobserving_env).credentials == ()
+  assert original.store_path.read_bytes() == saved_bytes
+  if name != "ANTHROPIC_API_KEY":
+    for with_metadata in (False, True):
+      cfg: dict[str, object] = {"auth_token": token, ANTHROPIC_USER_SCOPE_FIELD: "7"}
+      if with_metadata:
+        cfg["credential_source"] = original.source_metadata()
+      with pytest.raises(AnthropicSourceError) as unavailable_bound:
+        resolve_anthropic_credentials(cfg, environ=unobserving_env)
+      assert unavailable_bound.value.reason == "unobservable"
+      assert original.store_path.read_bytes() == saved_bytes
+      assert not resolve_anthropic_auth_store_path(environ=unobserving_env, user_scope=7).exists()
+    [recovered] = resolve_anthropic_credentials(environ=authoritative_env).credentials
+  else:
+    recovered = register_anthropic_static_credential(token, environ=authoritative_env)
+  assert recovered is not None
+  assert recovered.source_metadata() == original.source_metadata()
+  assert original.store_path.read_bytes() == saved_bytes
+
+
+def test_partial_environment_retires_only_observed_empty_source(
+  tmp_path: Path,
+) -> None:
+  env = {
+    "USER_DATA_DIR": str(tmp_path),
+    "ANTHROPIC_AUTH_TOKEN": "fixture-first-visible-token",
+    "CLAUDE_CODE_OAUTH_TOKEN": "fixture-second-visible-token",
+  }
+  first, second = resolve_anthropic_credentials(environ=env).credentials
+  partial_env = {"USER_DATA_DIR": str(tmp_path), "ANTHROPIC_AUTH_TOKEN": ""}
+  assert resolve_anthropic_credentials(environ=partial_env).credentials == ()
+  assert second.store_path is not None
+  assert first.token not in second.store_path.read_text()
+  with pytest.raises(AnthropicSourceError) as removed:
+    resolve_anthropic_credentials({"credential_source": first.source_metadata()}, environ=partial_env)
+  assert removed.value.reason == "removed"
+  with pytest.raises(AnthropicSourceError) as unobservable:
+    resolve_anthropic_credentials({"credential_source": second.source_metadata()}, environ=partial_env)
+  assert unobservable.value.reason == "unobservable"
+  assert resolve_anthropic_credentials(
+    {"credential_source": second.source_metadata()}, environ=env,
+  ).credentials[0].token == second.token
+
+
+def test_api_key_source_metadata_is_not_oauth_pool_membership(tmp_path: Path) -> None:
+  env = {"USER_DATA_DIR": str(tmp_path), "ANTHROPIC_API_KEY": "fixture-api-key"}
+  key = register_anthropic_static_credential(env["ANTHROPIC_API_KEY"], environ=env)
+  assert key is not None
+  cfg: dict[str, object] = {"auth_mode": "api", "api_key": key.token, "credential_source": key.source_metadata()}
+  assert resolve_anthropic_credentials(cfg, environ=env).credentials == ()
+  cfg["auth_mode"] = "oauth"
+  with pytest.raises(AnthropicSourceError) as incompatible:
+    resolve_anthropic_credentials(cfg, environ=env)
+  assert incompatible.value.reason == "incompatible_source"

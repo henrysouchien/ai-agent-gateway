@@ -3,7 +3,6 @@ name: report-writer
 agent_callable: true
 agent_description: Draft a short research report from a triaged source summary.
 persist_state: true
-max_turns: 4
 ---
 
 Write a concise research report from the source summary and user goal supplied by the parent agent.

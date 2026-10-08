@@ -66,11 +66,10 @@ class _CompleteRunner(AgentRunner):
     self,
     messages: list[dict[str, Any]],
     system_prompt: str | list[tuple[str, bool]] | None = None,
-    max_turns: int | None = None,
     *,
     resume_initial_messages: list[dict[str, Any]] | None = None,
   ) -> None:
-    _ = messages, system_prompt, max_turns, resume_initial_messages
+    _ = messages, system_prompt, resume_initial_messages
     self._calls.append(self.capability_execution.bind.to_json())
     self._log.append({"type": "stream_complete", "usage": {}})
 
@@ -209,13 +208,13 @@ def test_server_accepts_only_stable_key_selection() -> None:
     response = _run(
       client,
       token,
-      {"model_key": "openai.gpt-5-6", "effort": "xhigh"},
+      {"model_key": "openai.gpt-6-1-sol", "effort": "xhigh"},
     )
 
   assert response.status_code == 200
-  assert calls[0]["model_key"] == "openai.gpt-5-6"
+  assert calls[0]["model_key"] == "openai.gpt-6-1-sol"
   assert calls[0]["provider"] == "openai"
-  assert calls[0]["upstream_model"] == "gpt-5.6"
+  assert calls[0]["upstream_model"] == "gpt-6.1-sol"
   assert calls[0]["effort"] == "xhigh"
 
 
@@ -229,11 +228,11 @@ def test_server_rejects_unknown_stable_key_before_runtime_dispatch() -> None:
       json={
         "messages": [{"role": "user", "content": "hi"}],
         "user_id": "alice",
-        "model_key": "openai:gpt-5.6",
+        "model_key": "openai:gpt-6.1-sol",
       },
     )
 
   assert response.status_code == 400
   assert response.json()["error_code"] == "capability_model_unavailable"
-  assert response.json()["model_key"] == "openai:gpt-5.6"
+  assert response.json()["model_key"] == "openai:gpt-6.1-sol"
   assert calls == []

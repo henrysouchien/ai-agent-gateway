@@ -1,4 +1,10 @@
-"""Atomic single-call consumption for outward raw patch authorizations."""
+"""Atomic single-call consumption for outward raw patch authorizations.
+
+One authorization applies exactly one patch (concurrency and data integrity):
+a claim leases it to one executor and a consume is single-shot, and both refuse
+a different change identity or payload digest, so two workers or a retry
+cannot apply the patch twice or apply other bytes under the same authorization.
+"""
 
 from __future__ import annotations
 

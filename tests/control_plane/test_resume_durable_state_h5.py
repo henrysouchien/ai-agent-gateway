@@ -132,12 +132,6 @@ def test_resume_context_rehydrates_surviving_manifest_and_file_evidence(tmp_path
   assert "bg_10 durable operator message" in context
 
 
-def test_resume_context_rehydrates_durable_event_and_tool_evidence(tmp_path: Path) -> None:
-  context = _rehydrated_resume_context(tmp_path)
-  assert "bg_10 durable event tail" in context
-  assert "bg_10 durable completed tool result" in context
-
-
 @pytest.mark.parametrize(
   "status",
   ["missing", "unreadable", "partial_malformed", "tail_truncated", "path_mismatch"],

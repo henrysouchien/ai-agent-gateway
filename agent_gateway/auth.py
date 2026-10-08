@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Literal, Mapping
 
 from model_authority.binding import CredentialPrincipal
 from model_authority.capabilities import CAPABILITY_IDS
 from .session_capabilities import normalize_session_capabilities
+
+
+logger = logging.getLogger(__name__)
 
 
 _VALID_PROVIDERS = {"anthropic", "openai", "codex", "xai"}
@@ -41,16 +45,6 @@ class AuthConfig:
       raise ValueError(f"Unsupported billing_mode '{billing_mode}'. Expected 'byok' or 'metered'.")
 
     raw = dict(d)
-    forbidden_selection = sorted(
-      field_name
-      for field_name in ("model", "model_key", "effort", "thinking")
-      if field_name in raw
-    )
-    if forbidden_selection:
-      raise ValueError(
-        "AuthConfig credential material must not select execution identity: "
-        + ", ".join(forbidden_selection)
-      )
     max_tokens = raw.get("max_tokens")
     if max_tokens is not None:
       max_tokens = int(max_tokens)
@@ -79,6 +73,12 @@ class ResolverResult:
   capabilities: frozenset[str] = frozenset()
   model_entitled_capabilities: frozenset[str] = frozenset()
   model_entitled_keys: frozenset[str] = frozenset()
+  # Entitlements the resolver named that no registered capability matches.
+  # They grant nothing (the intersection below); this field is where a session
+  # reads which ones were dropped.
+  unknown_model_entitled_capabilities: frozenset[str] = field(
+    default=frozenset(), init=False
+  )
 
   def __post_init__(self) -> None:
     if self.credential_principal not in {"user", "service"}:
@@ -93,12 +93,15 @@ class ResolverResult:
       for value in self.model_entitled_capabilities
       if str(value or "").strip()
     )
-    unknown = self.model_entitled_capabilities - CAPABILITY_IDS
-    if unknown:
-      raise ValueError(
-        "unknown model-entitled capabilities: "
-        f"{', '.join(sorted(unknown))}"
+    self.unknown_model_entitled_capabilities = (
+      self.model_entitled_capabilities - CAPABILITY_IDS
+    )
+    if self.unknown_model_entitled_capabilities:
+      logger.warning(
+        "unknown model-entitled capabilities grant nothing: %s",
+        ", ".join(sorted(self.unknown_model_entitled_capabilities)),
       )
+    self.model_entitled_capabilities &= CAPABILITY_IDS
     self.model_entitled_keys = frozenset(
       str(value or "").strip()
       for value in self.model_entitled_keys

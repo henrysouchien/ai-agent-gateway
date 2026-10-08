@@ -278,9 +278,21 @@ def split_messages_for_compact(
   *,
   keep_rounds: int = KEEP_ROUNDS,
   tail_token_budget: int = TAIL_TOKEN_BUDGET,
+  preserve_tool_result_ids: frozenset[str] | set[str] = frozenset(),
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-  if keep_rounds <= 0:
-    return [dict(message) for message in messages], []
+  # Required delivery is a chronological suffix, not an optional round. Keep
+  # the whole calling batch, including companion results and later continuations.
+  required_start = len(messages)
+  for index, message in enumerate(messages):
+    if _tool_result_ids(message) & preserve_tool_result_ids:
+      required_start = min(required_start, index)
+      result_ids = _tool_result_ids(message)
+      for call_index in range(index - 1, -1, -1):
+        if _tool_use_ids(messages[call_index]) & result_ids:
+          required_start = min(required_start, call_index)
+          result_ids -= _tool_use_ids(messages[call_index])
+        if not result_ids:
+          break
 
   selected_units: list[tuple[int, list[dict[str, Any]]]] = []
   used_tokens = 0
@@ -316,14 +328,13 @@ def split_messages_for_compact(
     rounds += 1
     index = start - 1
 
-  if not selected_units:
-    return [dict(message) for message in messages], []
-
-  first_tail_index = min(start for start, _unit in selected_units)
-  tail: list[dict[str, Any]] = []
-  for _start, unit in sorted(selected_units, key=lambda item: item[0]):
-    tail.extend(unit)
-  return [dict(message) for message in messages[:first_tail_index]], tail
+  first_tail_index = min(
+    [required_start, *(start for start, _unit in selected_units)]
+  )
+  return (
+    [dict(message) for message in messages[:first_tail_index]],
+    [dict(message) for message in messages[first_tail_index:]],
+  )
 
 
 def apply_compaction_anchor(
@@ -342,7 +353,18 @@ def apply_compaction_anchor(
     "stop_reason": "compaction",
   }
   if tail:
-    return [anchor, *[dict(message) for message in tail]]
+    # An older anchor in a retained batch must not supersede this boundary.
+    retained = []
+    for message in tail:
+      message = dict(message)
+      if isinstance(message.get("content"), list):
+        message["content"] = [
+          block for block in message["content"]
+          if not isinstance(block, dict) or block.get("type") != "compaction"
+        ]
+      if message.get("content"):
+        retained.append(message)
+    return [anchor, *retained]
   return [anchor, {"role": "user", "content": CONTINUATION_NUDGE}]
 
 
@@ -477,6 +499,7 @@ async def maybe_compact_current_messages(
   failed_est_at: int | None = None,
   keep_rounds: int = KEEP_ROUNDS,
   tail_token_budget: int = TAIL_TOKEN_BUDGET,
+  preserve_tool_result_ids: frozenset[str] | set[str] = frozenset(),
   tools: list[dict[str, Any]] | None = None,
   force: bool = False,
   on_event: Callable[[dict[str, Any]], object] | None = None,
@@ -494,7 +517,19 @@ async def maybe_compact_current_messages(
     messages,
     keep_rounds=keep_rounds,
     tail_token_budget=tail_token_budget,
+    preserve_tool_result_ids=preserve_tool_result_ids,
   )
+  # Older logs grafted their anchor onto the following assistant batch.
+  # Its summary belongs to the replaced prefix, not to the verbatim tail.
+  for message in tail:
+    content = message.get("content")
+    if isinstance(content, list):
+      anchors = [
+        block for block in content
+        if isinstance(block, dict) and block.get("type") == "compaction"
+      ]
+      if anchors:
+        to_summarize.append({**message, "content": anchors})
   est_summarize_tokens = _estimate_messages(to_summarize)
   should_compact, reason = should_portable_compact(
     est_total_tokens=est_total_tokens,
@@ -546,7 +581,7 @@ async def maybe_compact_current_messages(
     model=model,
   )
   anchor_block = dict(compacted_messages[0]["content"][0])
-  est_after = max(0, est_total_tokens - est_summarize_tokens) + _estimate_messages(compacted_messages)
+  est_after = max(0, est_total_tokens - _estimate_messages(messages)) + _estimate_messages(compacted_messages)
   return CompactResult(
     applied=True,
     messages=compacted_messages,

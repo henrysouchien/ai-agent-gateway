@@ -1,11 +1,13 @@
 # ruff: noqa: E402
 
+import asyncio
 import base64
 import json
 import sys
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -489,6 +491,54 @@ def test_parse_sse_and_map_event_translate_raw_responses_stream(
 
   message_end = _only("message_end")
   assert message_end.stop_reason == "tool_use"
+  assert message_end.request_input_tokens == 10
+
+
+@pytest.mark.parametrize("terminal_type", ["response.done", "response.completed"])
+@pytest.mark.parametrize(
+  ("usage", "request_input_tokens", "billed_input", "cached"),
+  [
+    ({"input_tokens": 100, "input_tokens_details": {"cached_tokens": 25}}, 100, 75, 25),
+    ({"input_tokens": 100}, 100, 100, 0),
+    ({"input_tokens": 0}, 0, 0, 0),
+    ({}, None, 0, 0),
+    ({"input_tokens": None}, None, 0, 0),
+    ({"input_tokens_details": {"cached_tokens": 25}}, None, 0, 25),
+    (None, None, 0, 0),
+  ],
+)
+def test_stream_reports_absolute_request_input_separately_from_billing(
+  terminal_type: str,
+  usage: dict[str, Any] | None,
+  request_input_tokens: int | None,
+  billed_input: int,
+  cached: int,
+) -> None:
+  response: dict[str, Any] = {"status": "completed"}
+  if usage is not None:
+    response["usage"] = {**usage, "output_tokens": 7}
+  payload = "data: " + json.dumps({"type": terminal_type, "response": response}) + "\n\n"
+
+  def handle_request(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=payload)
+
+  async def collect():
+    provider = CodexProvider()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle_request)) as client:
+      provider._client_state[client] = {
+        "token": _fake_jwt("acct_test"),
+        "account_id": "acct_test",
+        "endpoint_url": "https://codex.example/responses",
+        "init_headers": {},
+      }
+      return [event async for event in provider.stream(client, {"model": "gpt-6-sol"})]
+
+  events = asyncio.run(collect())
+  assert [event.type for event in events] == ["message_start", "usage_update", "message_end"]
+  assert (events[0].input_tokens, events[0].cache_read_tokens) == (billed_input, cached)
+  assert events[1].output_tokens == (7 if usage is not None else 0)
+  assert events[2].request_input_tokens == request_input_tokens
+  assert events[2].stop_reason == "end_turn"
 
 
 def test_normalize_messages_converts_compaction_to_text_and_truncates() -> None:

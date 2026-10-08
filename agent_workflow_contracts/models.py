@@ -34,7 +34,6 @@ Name = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9._-]{0,127}$")]
 Version = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")]
 Digest = Annotated[str, StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$")]
 HexDigest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
-AGENT_OPERATION_INSTRUCTIONS_MAX_CHARS = 262_144
 OpaqueId = Annotated[
   str,
   StringConstraints(strip_whitespace=True, min_length=1, max_length=512),
@@ -44,7 +43,6 @@ NonEmptyText = Annotated[
   StringConstraints(
     strip_whitespace=True,
     min_length=1,
-    max_length=AGENT_OPERATION_INSTRUCTIONS_MAX_CHARS,
   ),
 ]
 
@@ -52,24 +50,19 @@ COMMON_CHILD_OPERATION_INSTRUCTIONS = (
   "You are a focused sub-agent working on behalf of another agent. Complete "
   "the admitted objective thoroughly. If evidence access fails or returns "
   "suspicious data, identify the limitation explicitly instead of silently "
-  "proceeding. You cannot delegate to another agent."
+  "proceeding."
 )
 
 
 def compose_operation_instructions(instructions: str) -> str:
-  """Append the common child contract within the exact wire-text bound."""
+  """Append the common child instructions without changing methodology text."""
 
   if type(instructions) is not str:
     raise TypeError("operation instructions must be a string")
   methodology = instructions.strip()
   if not methodology:
     raise ValueError("operation instructions must be non-empty")
-  composed = f"{methodology}\n\n{COMMON_CHILD_OPERATION_INSTRUCTIONS}"
-  if len(composed) > AGENT_OPERATION_INSTRUCTIONS_MAX_CHARS:
-    raise ValueError(
-      "composed operation instructions exceed the 262144-character wire bound"
-    )
-  return composed
+  return f"{methodology}\n\n{COMMON_CHILD_OPERATION_INSTRUCTIONS}"
 
 
 _RAW_PATH = re.compile(r"^(?:/|~/|\.{1,2}/|file://|[A-Za-z]:[\\/])")
@@ -649,6 +642,14 @@ class AgentOperationSnapshot(WireModel):
   description: Annotated[str, StringConstraints(min_length=1, max_length=2_048)]
   instructions: NonEmptyText
   execution_class: OpaqueId
+  role: str | None = Field(
+    default=None,
+    exclude_if=lambda value: value is None,
+  )
+  effort: str | None = Field(
+    default=None,
+    exclude_if=lambda value: value is None,
+  )
   required_capabilities: tuple[SemanticCapabilityRequirement, ...] = ()
   workspace_scope: Literal["read_only", "workspace_write", "model_write"]
   required_context: tuple[Name, ...] = Field(default=(), max_length=8)
@@ -660,17 +661,25 @@ class AgentOperationSnapshot(WireModel):
     max_length=4,
     exclude_if=lambda value: not value,
   )
+  # Empty declarations preserve pre-children snapshot dumps and semantic digests.
+  children: tuple[str, ...] = Field(
+    default=(),
+    exclude_if=lambda value: not value,
+  )
   resumable: bool = False
-  result_modes: tuple[Literal["narrative"], ...] = Field(min_length=1)
+  # False when a successful FMS door result does not end the child run (the
+  # operation persists several units, then reports). Omitted from dumps at its
+  # default so snapshots and digests recorded before the field replay
+  # byte-identically.
+  terminal_on_persist: bool = Field(
+    default=True,
+    exclude_if=lambda value: value is True,
+  )
+  result_modes: tuple[str, ...] = Field(min_length=1)
   projection_contracts: tuple[ContractRef, ...] = ()
 
   @model_validator(mode="after")
-  def _agent_result_is_a_terminal_message(self) -> AgentOperationSnapshot:
-    if self.result_modes != ("narrative",) or self.projection_contracts:
-      raise ValueError(
-        "agent operations return a normal terminal message; typed result "
-        "records are materialized by runtime code"
-      )
+  def _evidence_ports_are_unambiguous(self) -> AgentOperationSnapshot:
     port_names = tuple(port.name for port in self.evidence_ports)
     if tuple(sorted(set(port_names))) != port_names:
       raise ValueError("evidence_ports must be sorted and unique by name")
@@ -683,20 +692,11 @@ class AgentResumeMechanics(WireModel):
   """Exact admitted continuation mechanics for one logical child task."""
 
   resumable: bool
-  max_chain_depth: int = Field(ge=0, le=100)
+  max_chain_depth: int = Field(ge=0)
   transcript_strategy: Literal["durable_reconstruction"]
   prompt_strategy: Literal["reuse_exact"]
   tool_grant_strategy: Literal["reissue_exact"]
   control_message_strategy: Literal["admitted_exact"]
-
-  @model_validator(mode="after")
-  def _depth_matches_resumability(self) -> AgentResumeMechanics:
-    if self.resumable == (self.max_chain_depth == 0):
-      raise ValueError(
-        "resumable execution requires a positive chain depth and "
-        "non-resumable execution requires zero"
-      )
-    return self
 
 
 class ProviderToolDefinition(WireModel):
@@ -720,6 +720,47 @@ class ProviderToolDefinition(WireModel):
     return self
 
 
+class AdmittedTenant(WireModel):
+  """The tenant a job acts for; a child always holds its parent's."""
+
+  tenant_id: str | None = None
+  storage_id: str
+  role: Literal["owner", "invite"]
+
+
+class AdmittedResearchBinding(WireModel):
+  """The research file and ticker a job is bound to, or none."""
+
+  research_file_id: int | None = Field(default=None, gt=0)
+  ticker: OpaqueId | None = None
+
+
+class AdmittedLineage(WireModel):
+  parent_job_id: OpaqueId | None
+  depth: int = Field(ge=0)
+
+
+class AdmittedContextWire(WireModel):
+  """Everything `admit` derives for one spawned job (execution-boundary design §3.2)."""
+
+  tenant: AdmittedTenant | None
+  research_binding: AdmittedResearchBinding
+  capability_bind: CapabilityBind
+  children: tuple[Name, ...]
+  tool_grant: tuple[OpaqueId, ...]
+  budget_share: float | None = Field(allow_inf_nan=False)
+  env_projection: tuple[OpaqueId, ...]
+  approval_route: Literal["durable_local", "parent_delegated", "no_approval_route"]
+  handle_grants: tuple[OpaqueId, ...]
+  placement: Literal["in_process", "local_stub", "hosted_stub"]
+  lineage: AdmittedLineage
+  # Durable narrowing for descendants; empty historical wire bytes stay unchanged.
+  withheld_tools: tuple[str, ...] = Field(
+    default=(),
+    exclude_if=lambda value: not value,
+  )
+
+
 class AgentExecutionSnapshot(WireModel):
   """Exact prompt and mechanics consumed by one admitted child attempt."""
 
@@ -730,12 +771,22 @@ class AgentExecutionSnapshot(WireModel):
   ]
   persisted_methodology_state: JsonValue | None
   result_instructions: NonEmptyText
+  # No reader since the soft ladder (61babe3020a6; cap-numbers-have-one-owner):
+  # kept only because admitted tasks are persisted under a forbid-extras contract.
   max_turns: int | None = Field(default=None, ge=1, le=100)
   # No reader since 2026-09-28 (the child wall clock was removed); kept only
   # because admitted tasks are persisted under a forbid-extras contract.
   timeout_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
-  client_timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
-  max_tokens: int = Field(ge=1, le=256_000)
+  client_timeout_seconds: float | None = Field(
+    default=None,
+    exclude_if=lambda value: value is None,
+    allow_inf_nan=False,
+    description=(
+      "Recorded history from runs admitted before TC9; no runtime code "
+      "reads this value."
+    ),
+  )
+  max_tokens: int = Field(ge=1)
   cost_observation_threshold_usd: float | None = Field(
     default=None,
     gt=0,
@@ -745,10 +796,10 @@ class AgentExecutionSnapshot(WireModel):
       "authorizes, admits, interrupts, gates, or settles execution."
     ),
   )
+  # No reader since the soft ladder (61babe3020a6); persisted under forbid-extras,
+  # so the value is admitted as written: nothing spends or caps against it.
   max_budget_usd: float | None = Field(
     default=None,
-    gt=0,
-    allow_inf_nan=False,
     exclude_if=lambda value: value is None,
   )
   # Absent only on historical AdmittedTask schema 1.0 records. New schema 1.1
@@ -759,20 +810,12 @@ class AgentExecutionSnapshot(WireModel):
   )
   resume_mechanics: AgentResumeMechanics
   resume_instruction: NonEmptyText | None = None
-
-  @field_validator("max_budget_usd", mode="before")
-  @classmethod
-  def _validate_max_budget_usd(cls, value: Any) -> float | None:
-    if value is None:
-      return None
-    if (
-      isinstance(value, bool)
-      or not isinstance(value, int | float)
-      or not math.isfinite(float(value))
-      or float(value) <= 0
-    ):
-      raise ValueError("max_budget_usd must be a finite positive number")
-    return float(value)
+  # Absent on attempts admitted before `admit` existed; omitted from dumps
+  # then, so their persisted digests are unchanged.
+  admitted_context: AdmittedContextWire | None = Field(
+    default=None,
+    exclude_if=lambda value: value is None,
+  )
 
   @model_validator(mode="after")
   def _prompt_contains_admitted_dynamic_instructions(
@@ -802,23 +845,12 @@ class OutcomeRequirement(WireModel):
 
 
 class ResultRequirement(WireModel):
-  """Runtime policy for an agent's ordinary terminal assistant message.
+  """Code-owned result metadata, not a response schema for the model."""
 
-  This is code-owned admission metadata, not a response schema for the model.
-  Any later structured projection must be produced by a deterministic runtime
-  materializer or a separately invoked domain tool.
-  """
-
-  mode: Literal["narrative"] = "narrative"
-  projection: None = None
-  terminal_narrative: Literal["required"] = "required"
+  mode: str = "narrative"
+  projection: ProjectionRequirement | None = None
+  terminal_narrative: str = "required"
   outcome: OutcomeRequirement
-
-  @model_validator(mode="after")
-  def _mode_is_coherent(self) -> ResultRequirement:
-    if self.outcome != OutcomeRequirement():
-      raise ValueError("agent terminal messages cannot author typed outcomes")
-    return self
 
 
 class OutcomeRoute(WireModel):
@@ -886,6 +918,11 @@ class AttemptRef(WireModel):
   physical_task_id: OpaqueId
   restart_of_attempt_id: OpaqueId | None = None
   resume_of_task_id: OpaqueId | None = None
+  # Historical attempts retain their exact canonical bytes when no actor exists.
+  resumer_job_id: OpaqueId | None = Field(
+    default=None,
+    exclude_if=lambda value: value is None,
+  )
 
   @model_validator(mode="after")
   def _lineage(self) -> AttemptRef:
@@ -1491,6 +1528,15 @@ class AgentCompletionEnvelope(WireModel):
   child_evidence: ChildEvidenceProjection | None = Field(
     default=None,
     exclude_if=lambda value: value is None,
+  )
+  # The exact refs the child's terminal door minted (``read_back_refs`` of its
+  # door result), keyed as a consumer's ``required_context`` names them. They
+  # travel inline whatever the materialization: a result that overflows to a
+  # handle still names what its door persisted, so a later named child in the
+  # parent's turn binds them. Omitted when empty, like ``child_evidence``.
+  stage_refs: dict[str, JsonValue] = Field(
+    default_factory=dict,
+    exclude_if=lambda value: not value,
   )
 
   @model_validator(mode="after")
@@ -2330,6 +2376,10 @@ __all__ = [
   "AgentOperationSnapshot",
   "AgentResumeMechanics",
   "ProviderToolDefinition",
+  "AdmittedTenant",
+  "AdmittedResearchBinding",
+  "AdmittedLineage",
+  "AdmittedContextWire",
   "AgentExecutionSnapshot",
   "ProjectionRequirement",
   "OutcomeRequirement",

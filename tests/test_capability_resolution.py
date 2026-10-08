@@ -636,22 +636,6 @@ def test_optional_capability_without_a_route_still_resolves() -> None:
   assert authority.routes == ()
 
 
-def test_unknown_workspace_scope_is_a_visible_left_not_a_raise() -> None:
-  declaration = OperationDeclaration(
-    operation_name="explore",
-    grant_id="grant:scope",
-    workspace_scope="omnipotent",
-    required_capabilities=(),
-    tool_ceiling=frozenset({"web_search"}),
-  )
-
-  unavailable = resolve_operation_authority(declaration, catalog=_routed_catalog())
-
-  assert isinstance(unavailable, OperationUnavailable)
-  assert unavailable.code == "invalid_metadata"
-  assert "workspace scope" in unavailable.detail
-
-
 def test_resolver_rejects_inexact_inputs() -> None:
   with pytest.raises(CapabilityResolutionInputError):
     resolve_operation_authority(object(), catalog=_routed_catalog())  # type: ignore[arg-type]

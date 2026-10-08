@@ -197,12 +197,6 @@ def _state_from_session(session: GatewaySession, events: list[dict[str, Any]]) -
     if disposition == "completed":
       return "completed"
     if disposition == "interrupted":
-      # Mirrors the autonomous classification in
-      # AutonomousRunnerState._terminal_event_outcome. The `error`/`stream_error`
-      # branch above still wins, so a corrupted channel keeps reporting `failed`
-      # instead of the nicer budget label.
-      if event.get("reason") == "budget_exceeded":
-        return "budget_limited"
       return "interrupted"
     return "failed"
   return "starting"
@@ -621,7 +615,6 @@ def _chat_run_from_session(session: GatewaySession) -> ChatRunResponse:
     started_at=_iso_from_unix(session.created_at),
     ended_at=_ended_at_from_events(events) if state in _TERMINAL_RUN_STATES else None,
     cost_usd=_events_cost_usd(events),
-    max_budget_usd=getattr(session, "max_budget_usd", None),
     initial_message=session.initial_message,
     skill_run_ids=_skill_run_ids(events),
     current_verdict=_current_verdict(events),
@@ -884,7 +877,6 @@ def _autonomous_run_from_task(record: AutonomousTask) -> AutonomousRunResponse:
     started_at=_iso_from_unix(record.started_at),
     ended_at=_iso_from_unix(record.completed_at) if record.completed_at is not None else None,
     cost_usd=_events_cost_usd(events),
-    max_budget_usd=getattr(record, "max_budget_usd", None),
     skill_run_ids=_skill_run_ids(events),
     current_verdict=_current_verdict(events),
     staged_proposals=_staged_proposals(events),
@@ -1003,6 +995,9 @@ def _autonomous_task_for_user(
       (task for task in resolved_registry._tasks.values() if task.control_run_id == control_run_id),
       None,
     )
+  # Runs are partitioned by owner: a control session reads and steers only its
+  # owner's runs, and another user's run answers the same 404 as a missing one
+  # so its existence is not disclosed.
   if record is None or _record_owner_user_id(record) != user_id:
     raise HTTPException(status_code=404, detail="Run not found")
   return record

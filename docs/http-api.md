@@ -97,7 +97,7 @@ Schema:
 | `user_id` | string | Resolved end-user identity. When the request body `user_id` is set, this echoes it. When a credentials resolver derives identity from the API key, this is the resolver's resolved value. Clients should thread this value onto subsequent `POST /api/chat` calls so the gateway can enforce strict-mode identity checks. Added in 0.15.0. |
 | `session_token` | string | JWT bearer token for later requests |
 | `session_id` | string | Server-generated session id |
-| `expires_at` | integer | Unix timestamp. The session's TTL; a turn still in progress keeps the session live past it (see Session Lifecycle) |
+| `expires_at` | integer | Unix timestamp. The session's TTL; work still in progress (a turn, or a batch admitted on this token) keeps the token valid past it, but a new turn starts only before it (see Session Lifecycle) |
 | `schema_version` | integer | Negotiated wire schema version for this session. Every `/chat` and `/chat/subscribe` SSE envelope echoes this value. |
 | `capability_choices` | object | Required authenticated, session-executable choices keyed by capability id. Each entry includes exact registry/policy revisions, the selected stable key or `null`, notices, and eligible stable-key choices. Clients must not synthesize catalogs, aliases, or defaults. |
 
@@ -129,7 +129,7 @@ Request body:
     "channel": "web"
   },
   "user_id": "alice",
-  "model_key": "anthropic.claude-sonnet-5",
+  "model_key": "anthropic.claude-sonnet-5-5",
   "effort": "high",
   "catalog_revision": "registry-r7"
 }
@@ -156,7 +156,7 @@ Schema:
 Notes:
 
 - One active stream is allowed per session. A second concurrent `POST /api/chat` returns HTTP `409`.
-- A turn starts only while the session's TTL has not elapsed. A `POST /api/chat` on a session past `expires_at` returns HTTP `401` `Session expired`, including one whose token was accepted while the previous turn was still running and that finds the turn over by the time it would start (see Session Lifecycle).
+- A turn starts only while the session's TTL has not elapsed. A `POST /api/chat` on a session past `expires_at` returns HTTP `401` `Session expired`, including one whose token was accepted while the previous turn, or a batch it dispatched, was still running and that finds no turn in progress by the time it would start (see Session Lifecycle).
 - Stream envelopes have the shape `{seq, session_id, schema_version, event}`. For schema v1, the server projects each event through the v1 adapter, strips fields added after the v1 freeze, and skips event types not in the v1 wire contract while preserving cursor sequence gaps.
 - The server resolves only eligible stable keys from its exact model registry and
   selection policy. Raw upstream model names are rejected.
@@ -201,6 +201,35 @@ Return a typed `session_recap` for the bearer-token session. `scope` is
 ```json
 {"session_id":"sess_1234abcd5678","scope":"active_turn"}
 ```
+
+`tool_calls_summary.measurements` maps run-count names to integers. Each name
+holds the largest value seen, except `model_calls`, which is a total; none of
+them is a bound. A name appears only when its source was seen in the run.
+
+| Name | Source |
+| --- | --- |
+| interceptor counts (`calls_in_window`, `structured_reads`, `concurrent_sub_agents`, …) | `interceptor_measurement` events |
+| `decisions_sent`, `frame_bytes` | `approval_decision_sent` events: approval decisions sent to an autonomous child and their frame bytes |
+| `in_flight`, `day_invocations`, `day_charged_microusd`, `retained_bytes` | `learning_fork_launched` events |
+| `lease_fence_bytes` | `skill_run_started` events |
+| `model_calls` | count of `model_*` tool calls (MCP prefix ignored) |
+| `autonomous_in_flight_at_start`, `credential_handoff_bytes` | added by the autonomous parent to its child's recap from the run record |
+
+At terminal closure, the `session_recap` event's `usage` is the existing
+authoritative `SessionUsageSummary`, captured after child-drain handling and before
+the terminal event is emitted. It includes billed attempts and retries; recap
+construction does not recount provider events. Canonical settlement persists
+the first terminal recap and `detach` together under the existing session-log
+append mutex, rolling back both on append failure before deciding the error
+fallback. The recap precedes `detach`, which remains the final durable lifecycle
+event. Live terminal projection reuses the committed JSON payload, including
+list-valued usage event IDs.
+On the next turn, the context builder projects the record as a previous-turn
+recap, making its usage and tool measurements available to the agent.
+An ordinary exception escaping the runner, including a failed compaction summary,
+is converted to its canonical error terminal before that recap is persisted.
+The original exception still propagates; a later server error emission cannot
+replace the first terminal or its accounting.
 
 ### GET /api/workflow-outputs/{workflow_run_id}/{output_id}
 
@@ -344,7 +373,7 @@ Schema:
 | `tool_call_id` | string | yes | Matches the approval request event |
 | `nonce` | string | yes | Anti-replay nonce from the approval request |
 | `approved` | boolean | yes | `true` to execute, `false` to deny |
-| `allow_tool_type` | boolean | no | Persist approval for this tool type in the current session |
+| `allow_tool_type` | boolean | no | Request a persistent grant for this approval; honored only when the request's `allow_persistent_approval` is true and the session's approval policy mints grants |
 
 Success response:
 
@@ -516,6 +545,36 @@ Schema:
 }
 ```
 
+#### `tool_calls_planned`
+
+Emitted once per model turn that ends with tool use, immediately after that
+turn's `turn_complete` and before its first `tool_call_start`. It names every
+tool call the model planned, in model order, before any of them executes.
+
+Schema:
+
+```json
+{
+  "type": "tool_calls_planned",
+  "turn": 1,
+  "calls": [
+    {
+      "tool_call_id": "toolu_123",
+      "tool_name": "get_quote",
+      "tool_input": {"ticker": "NVDA"},
+      "display": {"label": "Get quote", "detail": "NVDA"}
+    }
+  ]
+}
+```
+
+Fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `turn` | integer | The `turn_complete` turn these calls belong to |
+| `calls` | array | One entry per planned call: `tool_call_id`, `tool_name`, `tool_input` (the redacted provider input, as persisted on the assistant message), and `display` (the label object `tool_call_start` carries, built the same way, or `null`) |
+
 #### `tool_call_start`
 
 Emitted before a tool runs.
@@ -574,6 +633,13 @@ Fields:
 | `server` | string or null | MCP server name when relevant |
 | `execution_location` | string, optional | Added when the runtime resolves location metadata |
 
+A model-visible tool error built by the gateway is the tool result content
+`{"error": {"code", "message", "sub_code"?, "data"}}`. `data` always carries
+`next_call`: the producer's suggested next action, or `null` when there is no
+next action. A `tool_excluded` error also names the excluding set in
+`data.excluding_owner` (`profile`, `skill_or_operation_grant` or `role`) and returns the same
+result, with `next_call: null`, on every repeat.
+
 #### `tool_call_interrupted`
 
 Emitted when a runtime knows that a started tool call will not produce a
@@ -614,10 +680,11 @@ Fields:
 
 #### `stream_complete`
 
-Terminal transport-closure event for the SSE stream. `terminal_disposition`
-distinguishes a successfully completed run from an intentional interruption.
-Clients must close the stream for either disposition, but must not persist or
-present an interrupted run as successful.
+Terminal run-settlement event. `terminal_disposition` distinguishes a successfully
+completed run from an intentional interruption. This is not necessarily transport
+EOF: citation validation can follow the terminal event. Continue reading through
+EOF to receive those settlements; do not persist or present an interrupted run as
+successful.
 
 Schema:
 
@@ -643,10 +710,10 @@ turn's system-prompt and tool-definition sections, respectively, not provider
 token counts.
 
 `terminal_disposition` is `"completed"` or `"interrupted"`. Interrupted
-closures also carry a machine-readable `reason`, such as `"operator_pause"`,
-`"budget_exceeded"`, or `"max_turns_reached"`.
+closures also carry a machine-readable `reason`, such as `"operator_pause"`
+or `"soft_budget_abort"`.
 
-Consumers must stop at the first terminal event. An unknown non-null
+The first terminal event fixes the run outcome; trailing events cannot replace it. An unknown non-null
 `terminal_disposition` is a protocol error and must fail closed; it must never
 be projected as successful completion. A missing disposition is interpreted
 as completed only when reading pre-cutover event history.
@@ -667,7 +734,10 @@ Schema:
     "cache_creation_input_tokens": 0,
     "cache_read_input_tokens": 0,
     "estimated_cost": 0.0012
-  }
+  },
+  "est_input_tokens": 14210,
+  "request_input_tokens": 15000,
+  "context_window": 200000
 }
 ```
 
@@ -676,7 +746,15 @@ Fields:
 | Field | Type | Notes |
 | --- | --- | --- |
 | `turn` | integer | One-based turn counter within the stream |
-| `usage` | object | Per-turn token delta emitted by the runner. Current runner emission includes `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, and `cache_read_input_tokens`. |
+| `usage` | object | Per-turn billing usage, additive across provider calls and server-side iterations, including compaction summary requests. Current runner emission includes `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, and `cache_read_input_tokens`; this aggregate is not a context measurement. |
+| `est_input_tokens` | integer | Character-derived estimate of the last submitted request's prompt |
+| `request_input_tokens` | integer or null | Provider-reported absolute prompt tokens of the final invocation, counting cached tokens once. For Anthropic, this is the last server-side iteration's input plus cache-read and cache-creation tokens, not the sum of iterations. Zero is a valid measurement; `null` means unavailable. |
+| `context_window` | integer | The model's context window |
+
+The TUI uses `request_input_tokens` as its sole actual context measurement.
+An unavailable measurement (including an absent field in older events) clears
+the displayed context rather than substituting aggregate `usage` or the
+character-derived estimate. A reported zero remains known zero.
 
 #### `error`
 
@@ -720,7 +798,7 @@ Fields:
 | `nonce` | string | Anti-replay nonce |
 | `tool_name` | string | Tool name |
 | `tool_input` | object | Proposed tool input |
-| `resolved_qualifier` | string | Tool-type qualifier used for session approval caching |
+| `resolved_qualifier` | string | Tool-type qualifier (for code execution, the backend) |
 | `reason` | string | Free-form context for why approval is needed. May be empty. Clients render this in the approval prompt UI when non-empty. |
 | `allow_persistent_approval` | boolean | Whether the gateway will accept `allow_tool_type=true` for this approval. When false, the client should not offer the "approve all of this tool type" option. |
 
@@ -811,8 +889,9 @@ Schema:
 }
 ```
 
-Transport keepalive is separate: an idle stream receives the SSE comment
-`:keepalive` every 15 seconds. It is not a data event and carries no payload.
+Transport keepalive is separate: after 15 seconds without a wire emission, the
+stream yields the SSE comment `:keepalive`. Filtered internal log entries do not
+reset that idle interval. The comment is not a data event and carries no payload.
 
 #### `refusal`
 
@@ -874,7 +953,7 @@ Fields:
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `reason` | string | Interruption reason such as `max_turns_reached`, `budget_exceeded`, `graceful_shutdown`, `sub_agent_cancelled`, or `recovered_on_attach` |
+| `reason` | string | Interruption reason such as `soft_budget_abort` (with `kind`, `observed`, `threshold`, `grace_turns`), `graceful_shutdown`, `sub_agent_cancelled`, or `recovered_on_attach` |
 | `runner_id` | string or null | Interrupted runner id |
 | `role` | string or null | Runner role, typically `writer` or `sub_agent` |
 | `last_completed_seq` | integer or null | Last durable sequence number considered safe by the runner |
@@ -921,34 +1000,35 @@ Schema:
 }
 ```
 
-#### `max_turns_reached`
+#### `soft_budget_steer` and `soft_budget_final`
 
-Nonterminal reason marker emitted when the runner stops because it exceeded
-`max_turns`. The stream then closes with an interrupted `stream_complete`.
+Informational markers from the one soft containment guard on delegated runs
+(`runner_soft_budget.py`; `docs/engineering/soft-budget-containment-reference.md`).
+Neither stops the run. `soft_budget_steer` says the run's provider requests
+(turns plus `max_tokens` continuation segments) reached the threshold from the
+bundled `SOFT_TURN_BUDGET` table, and a wrap-up notice naming the `observed`
+request count and the `threshold` rides the child's next turn;
+`soft_budget_final` says 1.5x the threshold was reached and the next turn
+is the forced final report. `kind` is always `"turns"`; `observed` is the
+request count. Only a run that still has not answered after the grace turns is
+aborted: an `interrupted` event with `reason: "soft_budget_abort"` carries
+`kind`, `observed`, `threshold` and `grace_turns`, and the stream then closes
+with an interrupted `stream_complete` whose `reason` is `soft_budget_abort`.
+A primary run emits none of these.
 
-Schema:
+For interactive children, the durable steer/final record also contains
+`notice`: the exact text injected into the subsequent provider request,
+alongside `kind`, `observed`, and `threshold`. These measurements remain
+readable after the in-memory run has ended.
+
+Schema (both):
 
 ```json
 {
-  "type": "max_turns_reached",
-  "turn_count": 6,
-  "max_turns": 5
-}
-```
-
-#### `budget_exceeded`
-
-Nonterminal reason marker emitted when the accumulated estimated cost crosses
-`max_budget_usd`. The stream then closes with an interrupted
-`stream_complete`.
-
-Schema:
-
-```json
-{
-  "type": "budget_exceeded",
-  "total_cost": 0.42,
-  "budget": 0.4
+  "type": "soft_budget_steer",
+  "kind": "turns",
+  "observed": 10,
+  "threshold": 10
 }
 ```
 
@@ -1253,13 +1333,17 @@ Typical flow:
 3. Receive SSE events
 4. If needed, handle `tool_approval_request`
 5. Call `POST /api/chat/tool-approval`
-6. Continue consuming SSE events until `stream_complete` or `error`
+6. Observe the run disposition at `stream_complete` or `error`; consume through EOF for trailing settlements.
 
 The same session can be reused for multiple turns until `expires_at`. The TTL bounds
-the session between turns, not a turn in progress: a turn accepted before
-`expires_at` keeps its session, and the token its tool calls authenticate with,
-live until the turn publishes its terminal event (`stream_complete` or `error`).
-After that the TTL applies, so an expired session cannot start another turn.
+the session between units of work, not one in progress: a turn accepted before
+`expires_at` keeps the token its tool calls authenticate with valid until the turn
+publishes its terminal event (`stream_complete` or `error`), and a batch admitted on
+the session's token keeps it valid until the batch finishes or is cancelled, even
+after the turn that dispatched it has ended. Admission of a new turn is the clock
+alone: a running turn is refused with 409 before admission is read, and once a turn
+has ended the TTL applies, so an expired session cannot start another turn even
+while a batch it dispatched still runs.
 
 ## Tool Approval Flow
 
@@ -1270,9 +1354,9 @@ When a tool needs approval:
 3. Your client calls `POST /api/chat/tool-approval`.
 4. The runner resumes and emits the rest of the tool lifecycle events.
 
-If `allow_tool_type=true`, the server stores that approval in `session.approved_tool_types` for the rest of the session. For code execution, the qualifier usually resolves to `docker` or `subprocess`, so approval can be scoped to a specific backend.
+There is no session approval cache: each approval decides one call. For code execution, the qualifier usually resolves to `docker` or `subprocess`, naming the backend the approval covers.
 
-When the configured policy permits it, the same approval can also mint a durable persistent grant. A later grant match still creates a new per-call approval/authorization record; clients must not treat the grant ID as executable authority or assume it reuses an earlier plan. Grant and per-call expiry, revocation-race, scope, and current predicate limitations are documented in [Persistent grants and per-call authorization](architecture.md#persistent-grants-and-per-call-authorization). The API does not currently let a client select a default grant TTL.
+The default `SingleUserApprovalPolicy` never mints a persistent grant: it asks only for a live order, and decides each one per call. When a custom policy permits it, the same approval can also mint a durable persistent grant. A later grant match still creates a new per-call approval/authorization record; clients must not treat the grant ID as executable authority or assume it reuses an earlier plan. Grant and per-call expiry, revocation-race, scope, and predicate facts are documented in [Persistent grants and per-call authorization](architecture.md#persistent-grants-and-per-call-authorization). The API does not currently let a client select a default grant TTL.
 
 ## Notes For Frontend Clients
 

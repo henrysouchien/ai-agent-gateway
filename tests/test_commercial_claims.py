@@ -159,8 +159,6 @@ def test_verifier_accepts_valid_offline_claim_and_overlapping_keys() -> None:
     ({"effective_scopes": ["trade-preview", "read"]}, {}, NOW + 1, "invalid_scopes"),
     ({"iat": NOW + 60, "exp": NOW + 300}, {}, NOW + 1, "claim_not_yet_valid"),
     ({}, {}, NOW + 300, "start_authority_expired"),
-    ({"exp": NOW + 301, "authorized_work_start_deadline": NOW + 301}, {}, NOW + 1,
-     "invalid_claim_lifetime"),
   ),
 )
 def test_verifier_fails_closed_on_skew_stale_and_unknown_lineage(
@@ -172,6 +170,18 @@ def test_verifier_fails_closed_on_skew_stale_and_unknown_lineage(
     verifier.verify_for_work_start(
       _token(private, _payload(**payload_changes)), now=now
     )
+
+
+def test_verifier_accepts_long_signed_claim_and_records_its_window() -> None:
+  private, public = _keypair()
+  verifier = CommercialClaimVerifier(_trust(public))
+  claim = verifier.verify_for_work_start(
+    _token(private, _payload(
+      exp=NOW + 1800, authorized_work_start_deadline=NOW + 1800,
+    )),
+    now=NOW + 1,
+  )
+  assert (claim.issued_at, claim.expires_at) == (NOW, NOW + 1800)
 
 
 def test_verifier_rejects_wrong_key_tamper_audience_and_missing_lineage() -> None:

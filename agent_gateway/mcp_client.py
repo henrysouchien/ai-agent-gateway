@@ -37,7 +37,6 @@ from typing_extensions import TypeIs
 from agent_workflow_contracts.tool_registration import (
   McpInputPreparationRoute,
   ToolRegistrationCatalog,
-  ToolRegistrationDeclaration,
   index_mcp_input_preparation_routes,
   validate_tool_registration_catalog,
 )
@@ -47,7 +46,6 @@ from . import mcp_client_connections as _connection_helpers
 from . import mcp_client_config as _config_helpers
 from . import mcp_client_errors as _error_helpers
 from . import mcp_client_oauth_storage as _oauth_storage
-from . import mcp_client_policy_owner as _policy_owner_helpers
 from . import mcp_client_runtime as _runtime_helpers
 from . import mcp_client_startup as _startup_helpers
 from .approval_policy import sha256_args
@@ -109,7 +107,7 @@ PER_USER_DRAIN_POLL_SECONDS = 0.05
 
 
 class _McpCallKwargs(TypedDict, total=False):
-  read_timeout_seconds: float
+  read_timeout_seconds: None
   meta: dict[str, object]
 
 
@@ -343,6 +341,7 @@ class _ServerState:
   config: Dict[str, Any] | None = None
   exported_tool_names: frozenset[str] | None = None
   tool_metadata: Mapping[str, Mapping[str, Any] | None] = field(default_factory=dict)
+  code_dispositions: Mapping[str, str | None] = field(default_factory=dict)
   stdio_eof: asyncio.Event | None = None
   stdio_receive_done: asyncio.Event | None = None
   stdio_watch_task: asyncio.Task[Any] | None = None
@@ -605,6 +604,11 @@ class McpClientManager:
   `provider_symbol_resolver` is an optional application-owned port. Without it,
   input-preparation routes leave symbols unchanged; the package never imports
   a product resolver or reads a product symbol cache.
+
+  `default_tool_timeout`, `timeout_overrides`, `tool_timeout_overrides` and a
+  registration's `*_timeout_seconds` are expected durations, not deadlines: a
+  call past its expectation logs a warning and keeps waiting. Only the caller's
+  `abort_event` cancels an MCP tool call.
   """
 
   def __init__(
@@ -837,12 +841,17 @@ class McpClientManager:
       payload["error_type"] = error_type
     self._startup_diagnostics[canonical_name] = payload
 
-  def _timeout_for_tool(self, server_name: str, exposed_name: str, original_name: str) -> float:
+  def _expected_seconds_for_tool(self, server_name: str, exposed_name: str, original_name: str) -> float:
+    """Resolve the registered expected duration of one MCP tool call.
+
+    A measurement, never a deadline: ``_call_tool_once`` logs when a call runs
+    past it and keeps waiting.
+    """
     if self._tool_registration_catalog is not None:
       descriptor = self.get_registered_mcp_tool_descriptor(exposed_name)
       if descriptor.server.transport_server_id != server_name:
         raise ValueError(
-          "registered MCP timeout server does not match the live transport"
+          "registered MCP expectation server does not match the live transport"
         )
       return descriptor.server.per_tool_timeout_seconds.get(
         descriptor.identity.logical_name,
@@ -1115,9 +1124,6 @@ class McpClientManager:
     sdk_tool_name: str,
     raw_input: Mapping[str, object],
     trusted_dispatch_scope: Mapping[str, object] | None,
-    registered_approval_overlay: (
-      Callable[[ToolRegistrationDeclaration, PreparedToolCall], bool] | None
-    ) = None,
   ) -> RegisteredMcpToolCall:
     """Prepare and classify one SDK call through its live registration."""
 
@@ -1133,7 +1139,6 @@ class McpClientManager:
       descriptor.exposed_name,
       prepared_call,
       trusted_dispatch_scope,
-      registered_approval_overlay,
     )
 
   def classify_registered_mcp_prepared_tool_call(
@@ -1141,9 +1146,6 @@ class McpClientManager:
     exposed_name: str,
     prepared_call: PreparedToolCall,
     trusted_dispatch_scope: object | None,
-    registered_approval_overlay: (
-      Callable[[ToolRegistrationDeclaration, PreparedToolCall], bool] | None
-    ) = None,
   ) -> RegisteredMcpToolCall:
     """Plan and classify one already-prepared exact registered MCP call."""
 
@@ -1191,38 +1193,20 @@ class McpClientManager:
       prepared_authorization = None
     policy = descriptor.declaration.semantics.approval
     if policy.mode == "never":
-      intrinsic_approval_required = False
+      approval_required = False
     elif policy.mode == "always":
-      intrinsic_approval_required = True
+      approval_required = True
     else:
       assert policy.predicate is not None
-      intrinsic_approval_required = registry.execute_approval_predicate(
+      approval_required = registry.execute_approval_predicate(
         policy.predicate,
         ApprovalPredicateCall(
           descriptor.identity,
           prepared_call.prepared_input,
         ),
       )
-    overlay_approval_required = False
-    if registered_approval_overlay is not None:
-      overlay_result = registered_approval_overlay(
-        descriptor.declaration,
-        prepared_call,
-      )
-      if type(overlay_result) is not bool:
-        raise TypeError(
-          "registered approval overlay must return an exact bool"
-        )
-      overlay_approval_required = overlay_result
-    approval_required = (
-      intrinsic_approval_required or overlay_approval_required
-    )
     approval_reuse_key = None
-    if (
-      approval_required
-      and not overlay_approval_required
-      and policy.cache_key is not None
-    ):
+    if approval_required and policy.cache_key is not None:
       approval_reuse_key = registry.execute_approval_cache_key(
         policy.cache_key,
         ApprovalCacheKeyCall(
@@ -1594,6 +1578,7 @@ class McpClientManager:
         transport_server_id=server_name,
         provider_original_name=provider_original_name,
         provider_id=self._provider_ids_by_server.get(server_name),
+        code_disposition=self._servers[server_name].code_dispositions.get(provider_original_name),
       ))
 
     for server_name, definitions in selected_logical_definitions:
@@ -1697,6 +1682,7 @@ class McpClientManager:
           transport_server_id=transport_server_id,
           provider_original_name=provider_original_name,
           provider_id=self._provider_ids_by_server.get(transport_server_id),
+          code_disposition=transport_state.code_dispositions.get(provider_original_name),
         ))
     return tuple(bindings)
 
@@ -2094,7 +2080,8 @@ class McpClientManager:
   ) -> None:
     # The state is already out of `_per_user_servers`, so no further caller can
     # obtain it and `active_calls` falls to zero on its own. There is no deadline:
-    # a tool call carries its own timeout, and closing under one strands it.
+    # a tool call ends at its result or its caller's abort, and closing under one
+    # strands it.
     started = time.monotonic()
     while state.active_calls:
       await asyncio.sleep(PER_USER_DRAIN_POLL_SECONDS)
@@ -2541,7 +2528,7 @@ class McpClientManager:
         )
         return None, _sheets_gateway_error(payload)
       server = per_user_state.server
-    timeout_seconds = self._timeout_for_tool(transport_server_name, name, original_name)
+    expected_seconds = self._expected_seconds_for_tool(transport_server_name, name, original_name)
     try:
       if per_user_state is not None:
         per_user_state.active_calls += 1
@@ -2552,7 +2539,7 @@ class McpClientManager:
         tool_input=effective_input,
         meta=meta,
         abort_event=abort_event,
-        timeout_seconds=timeout_seconds,
+        expected_seconds=expected_seconds,
       )
     except Exception as exc:
       if per_user_state is not None:
@@ -2646,7 +2633,7 @@ class McpClientManager:
           tool_input=effective_input,
           meta=meta,
           abort_event=abort_event,
-          timeout_seconds=timeout_seconds,
+          expected_seconds=expected_seconds,
           cause=exc,
         )
       except Exception as retry_exc:
@@ -2695,7 +2682,7 @@ class McpClientManager:
             tool_input=effective_input,
             meta=meta,
             abort_event=abort_event,
-            timeout_seconds=timeout_seconds,
+            expected_seconds=expected_seconds,
           )
         except Exception as exc:
           key = (server_name, per_user_subject.user_id)
@@ -2807,16 +2794,26 @@ class McpClientManager:
     tool_input: Dict[str, Any],
     meta: Dict[str, Any] | None,
     abort_event: asyncio.Event | None,
-    timeout_seconds: float,
+    expected_seconds: float,
   ) -> _connection_helpers.McpToolCallResult:
+    """Run one MCP tool call to its result; only the caller's abort ends it early.
+
+    No clock cancels the call (GP19/GA-N2): a deadline discarded a healthy
+    server's work and returned nothing resumable. ``expected_seconds`` is the
+    registered expectation, a measurement: past it, one warning is logged with
+    the elapsed time and the call keeps waiting. Liveness against a hung server
+    is the caller's ``abort_event``.
+    """
     if abort_event is not None and abort_event.is_set():
       raise asyncio.CancelledError()
     session = server.session
+    # None is the SDK's "no read timeout"; the session factory sets no default.
     call_kwargs: _McpCallKwargs = {
-      "read_timeout_seconds": timeout_seconds,
+      "read_timeout_seconds": None,
     }
     if meta is not None:
       call_kwargs["meta"] = meta
+    started = time.monotonic()
     call_task = asyncio.create_task(session.call_tool(
       original_name,
       tool_input,
@@ -2828,12 +2825,22 @@ class McpClientManager:
       if abort_event is not None:
         abort_task = asyncio.create_task(abort_event.wait())
         wait_tasks.add(abort_task)
-      timeout = max(0.0, float(timeout_seconds))
       done, _pending = await asyncio.wait(
         wait_tasks,
-        timeout=timeout,
+        timeout=max(0.0, float(expected_seconds)),
         return_when=asyncio.FIRST_COMPLETED,
       )
+      if not done:
+        log.warning(
+          "MCP tool %s exceeded its expected %gs (elapsed %.1fs); still waiting for its result",
+          original_name,
+          expected_seconds,
+          time.monotonic() - started,
+        )
+        done, _pending = await asyncio.wait(
+          wait_tasks,
+          return_when=asyncio.FIRST_COMPLETED,
+        )
       if abort_task in done and abort_event is not None and abort_event.is_set():
         await self._cancel_mcp_tool_call(
           call_task,
@@ -2841,16 +2848,7 @@ class McpClientManager:
           reason="abort",
         )
         raise asyncio.CancelledError()
-      if call_task in done:
-        return await call_task
-      await self._cancel_mcp_tool_call(
-        call_task,
-        tool_name=original_name,
-        reason="timeout",
-      )
-      raise asyncio.TimeoutError(
-        f"MCP tool {original_name} timed out after {timeout:g}s"
-      )
+      return await call_task
     except asyncio.CancelledError:
       await self._cancel_mcp_tool_call(
         call_task,
@@ -2890,7 +2888,7 @@ class McpClientManager:
     tool_input: Dict[str, Any],
     meta: Dict[str, Any] | None,
     abort_event: asyncio.Event | None,
-    timeout_seconds: float,
+    expected_seconds: float,
     cause: Exception,
   ) -> _connection_helpers.McpToolCallResult | None:
     config = server.config
@@ -2928,7 +2926,7 @@ class McpClientManager:
       tool_input=tool_input,
       meta=meta,
       abort_event=abort_event,
-      timeout_seconds=timeout_seconds,
+      expected_seconds=expected_seconds,
     )
 
   async def _reconnect_stdio_server_for_future(
@@ -3085,10 +3083,9 @@ class McpClientManager:
 
       policy_server_for_tool = sheets_fallback_policy_server
 
-    if policy_server_for_tool is not None:
-      self._prefilter_policy_owner_mismatches(
-        policy_server_for_tool=policy_server_for_tool,
-      )
+    # A tool whose runtime server is not its policy owner is not hidden here:
+    # registration of its route (`mcp_client_catalog.add_logical_tool_aliases`,
+    # `tool_registration`) decides what it may do.
 
     result = _catalog_helpers.apply_collision_filtering(
       servers=self._servers,
@@ -3100,10 +3097,6 @@ class McpClientManager:
     self._tool_to_server = result.tool_to_server
     self._prefixed_to_original = result.prefixed_to_original
     self._mcp_tool_names = result.mcp_tool_names
-    if policy_server_for_tool is not None:
-      self._apply_policy_owner_invariant(
-        policy_server_for_tool=policy_server_for_tool,
-      )
     alias_result = _catalog_helpers.add_logical_tool_aliases(
       tool_definitions=self._tool_definitions,
       tool_to_server=self._tool_to_server,
@@ -3141,89 +3134,6 @@ class McpClientManager:
       f"{state.tool_prefix}{tool_def['name']}" if state.tool_prefix else tool_def["name"]
       for tool_def in kept_tool_definitions
       if isinstance(tool_def.get("name"), str)
-    }
-
-
-  def _prefilter_policy_owner_mismatches(
-    self,
-    *,
-    policy_server_for_tool: Callable[[str], str | None],
-  ) -> None:
-    for server_name, state in self._servers.items():
-      kept_tool_definitions: list[dict[str, Any]] = []
-      mismatches: list[tuple[str, str]] = []
-      for tool_def in state.published_tool_definitions:
-        original_name = str(tool_def.get("name") or "").strip()
-        if not original_name:
-          kept_tool_definitions.append(tool_def)
-          continue
-        policy_server = policy_server_for_tool(original_name)
-        policy_runtime_server = self._transport_server_name(policy_server) if policy_server else None
-        if policy_server and policy_runtime_server != server_name:
-          mismatches.append((original_name, policy_server))
-          continue
-        kept_tool_definitions.append(tool_def)
-
-      if not mismatches:
-        continue
-
-      state.published_tool_definitions = kept_tool_definitions
-      state.tool_names = {
-        f"{state.tool_prefix}{tool_def['name']}" if state.tool_prefix else tool_def["name"]
-        for tool_def in kept_tool_definitions
-        if isinstance(tool_def.get("name"), str)
-      }
-      mismatch_summary = ", ".join(
-        f"{original_name}->{policy_server}"
-        for original_name, policy_server in mismatches
-      )
-      message = (
-        "MCP runtime owner does not match gateway policy owner; "
-        f"pre-filtering tools before catalog merge: {mismatch_summary}"
-      )
-      category = "policy_owner_mismatch"
-      error_type = "PolicyOwnerMismatch"
-      self._set_startup_diagnostic(
-        server_name,
-        category=category,
-        message=message,
-        retryable=False,
-        error_type=error_type,
-      )
-      log.error("%s on runtime server %s", message, server_name)
-
-  def _apply_policy_owner_invariant(
-    self,
-    *,
-    policy_server_for_tool: Callable[[str], str | None] | None = None,
-  ) -> None:
-    resolved_policy_server_for_tool = policy_server_for_tool
-    if resolved_policy_server_for_tool is None:
-      _get_forbidden_tools_for_session, get_server_for_policy_tool, _get_tool_class = load_server_policy_helpers()
-      if get_server_for_policy_tool is None:
-        log.warning("Skipping MCP policy-owner invariant: server policy module unavailable")
-        return
-      resolved_policy_server_for_tool = get_server_for_policy_tool
-
-    result = _policy_owner_helpers.apply_policy_owner_invariant(
-      servers=self._servers,
-      tool_definitions=self._tool_definitions,
-      tool_to_server=self._tool_to_server,
-      prefixed_to_original=self._prefixed_to_original,
-      mcp_tool_names=self._mcp_tool_names,
-      policy_server_for_tool=resolved_policy_server_for_tool,
-      transport_server_for_policy_server=self._transport_server_name,
-      set_startup_diagnostic=self._set_startup_diagnostic,
-      logger=log,
-    )
-    self._tool_definitions = result.tool_definitions
-    self._tool_to_server = result.tool_to_server
-    self._prefixed_to_original = result.prefixed_to_original
-    self._mcp_tool_names = result.mcp_tool_names
-    self._dispatch_to_original = {
-      exposed_name: original_name
-      for exposed_name, original_name in self._dispatch_to_original.items()
-      if exposed_name in self._tool_to_server
     }
 
   @staticmethod

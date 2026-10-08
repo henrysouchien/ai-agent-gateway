@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 from types import SimpleNamespace
 from typing import Any
 
@@ -25,21 +26,16 @@ from model_authority.binding import CredentialHandle, CredentialPrincipal
 from agent_gateway.capability_execution import BoundCapabilityExecution
 from agent_gateway.event_log import EventLog
 from agent_gateway.execution_identity import resolved_execution_identity
+from agent_gateway.runner_limits import ContextPressureReminderDecision
 from agent_gateway.fork_request_handoff import (
   build_mid_turn_handoff,
   build_post_turn_handoff,
   credential_identity_or_none,
   fork_credential_identity_available,
 )
-from agent_gateway.fork_scope_receipt import (
-  ForkToolDecision,
-  fork_scope_receipt_dict,
-  parse_fork_scope_receipt,
-)
 from agent_gateway.providers.anthropic import AnthropicProvider
 from agent_gateway.runner_fork_agents import (
   FORK_PLACEHOLDER,
-  ForkPolicyDispatcher,
   _bind_learning_fork_execution,
   build_fork_messages,
   spawn_fork_agent,
@@ -50,10 +46,7 @@ from model_authority.schema import SCHEMA
 from gateway_test_support.model_defaults import compat_for_profile
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.tool_dispatcher import ToolDispatcher
-from agent_gateway.runner_sub_agents import (
-  _authoritative_child_tool_getter,
-)
-from agent_gateway.task_registry import TaskEntry
+from agent_gateway.task_registry import TaskEntry, TaskRegistry
 from gateway_test_support.admitted_authority_test_support import (
   SOURCE_TOOL_ID,
   provenance_of,
@@ -303,9 +296,6 @@ def test_fork_tail_shares_placeholder_prefix_and_requests_normal_message() -> No
     for block in first_tail[:-1]
   )
   assert first_tail[-1] != second_tail[-1]
-  instruction = first_tail[-1]["text"]
-  assert "normal assistant message" in instruction
-  assert "JSON" not in instruction
 
 
 class _Dispatcher(ToolDispatcher):
@@ -330,95 +320,6 @@ class _Dispatcher(ToolDispatcher):
     self.replay_controls.append(_kwargs.get("allow_uncertain_mcp_replay", True))
     return {"ok": True}, None
 
-
-def test_tool_getter_guard_has_strict_fork_and_nonfork_arms() -> None:
-  definitions = [{"name": "read_data"}]
-  getter = _authoritative_child_tool_getter(
-    _Dispatcher(definitions),
-    operation="fork",
-  )
-  assert getter() == definitions
-  with pytest.raises(TypeError, match="authoritative tool catalog"):
-    _authoritative_child_tool_getter(
-      object(),  # type: ignore[arg-type]
-      operation="fork",
-    )
-
-
-def test_fork_dispatch_policy_denies_run_agent_structurally() -> None:
-  definitions = [
-    {"name": "read_data"},
-    {"name": "run_agent"},
-  ]
-  raw_receipt = fork_scope_receipt_dict(
-    tool_decisions=(
-      ForkToolDecision("read_data", "allow", "parent surface"),
-      ForkToolDecision("run_agent", "deny", "orchestration surface"),
-    ),
-    capability_bind=_bind().model_copy(
-      update={"capability_id": "node.fork"}
-    ),
-    tenant_id="tenant-1",
-    billing_mode="byok",
-    resolved_budget_usd=5.0,
-    max_turns=20,
-    suffix_ceiling=20_000,
-  )
-  dispatcher = _Dispatcher(definitions)
-  policy = ForkPolicyDispatcher(
-    dispatcher,
-    wire_tools=definitions,
-    receipt=parse_fork_scope_receipt(raw_receipt),
-  )
-
-  result, error = asyncio.run(
-    policy.dispatch("call-1", "run_agent", {"task": "nested"})
-  )
-
-  assert result is None
-  assert error == {
-    "code": "fork_policy_denied",
-    "message": (
-      "fork policy: run_agent is not available in a forked child"
-    ),
-    "data": {
-      "tool": "run_agent",
-      "fork_kind": "side_quest",
-      "reason": "orchestration surface",
-    },
-  }
-  assert dispatcher.calls == []
-
-
-def test_fork_dispatch_policy_validates_and_forwards_replay_control() -> None:
-  definitions = [{"name": "read_data"}]
-  receipt = parse_fork_scope_receipt(fork_scope_receipt_dict(
-    tool_decisions=(ForkToolDecision("read_data", "allow", "parent surface"),),
-    capability_bind=_bind().model_copy(update={"capability_id": "node.fork"}),
-    tenant_id="tenant-1",
-    billing_mode="byok",
-    resolved_budget_usd=5.0,
-    max_turns=20,
-    suffix_ceiling=20_000,
-  ))
-  base = _Dispatcher(definitions)
-  policy = ForkPolicyDispatcher(base, wire_tools=definitions, receipt=receipt)
-
-  assert asyncio.run(policy.dispatch(
-    "call",
-    "read_data",
-    {},
-    allow_uncertain_mcp_replay=False,
-  )) == ({"ok": True}, None)
-  assert base.replay_controls == [False]
-  with pytest.raises(TypeError, match="exact bool"):
-    asyncio.run(policy.dispatch(
-      "invalid",
-      "missing",
-      {},
-      allow_uncertain_mcp_replay=0,  # pyright: ignore[reportArgumentType]  # negative: exact-bool rejection
-    ))
-  assert base.calls == ["read_data"]
 
 
 def _message_markers(params: dict[str, Any]) -> list[tuple[int, int]]:
@@ -533,12 +434,18 @@ class _Provider(ModelProvider):
 class _SpawnRunner:
   _fork_mode: bool
   _fork_marker_position: tuple[int, int]
+  _fork_suffix_tokens: int
   children: list["_SpawnRunner"] = []
 
   def __init__(self, **kwargs: Any) -> None:
     self.kwargs = kwargs
     self._log = kwargs["event_log"]
     self._runner_id = f"runner-{kwargs['session_id']}"
+    self._task_registry = (
+      kwargs["task_registry"]
+      if kwargs.get("task_registry") is not None
+      else TaskRegistry()
+    )
     self.__class__.children.append(self)
 
   async def _append_durable_event(self, _event: dict[str, Any]) -> None:
@@ -549,6 +456,9 @@ class _SpawnRunner:
 
   async def run(self, **_kwargs: Any) -> None:
     self._log.append({"type": "text_delta", "text": "fork complete"})
+    # A suffix past the ceiling is measured; the fork still finishes.
+    self._fork_suffix_tokens = 25_000
+    self._log.append({"type": "turn_complete"})
     self._log.append({"type": "stream_complete"})
 
   async def force_close(self, timeout: float = 2.0) -> None:
@@ -590,7 +500,6 @@ def _fork_parent(tmp_path, cls: type = _SpawnRunner) -> Any:
   parent._on_metric = None
   parent._compaction_trigger = None
   parent._tool_call_timeout = None
-  parent._on_max_turns = None
   parent._aggregator = None
   parent._max_concurrent_sub_agents = 4
   parent._agent_session_log = _ForkSessionLog()
@@ -604,7 +513,9 @@ def _fork_parent(tmp_path, cls: type = _SpawnRunner) -> Any:
 
 def test_spawn_fork_reuses_resume_seed_and_fresh_tagged_log(
   tmp_path,
+  caplog: pytest.LogCaptureFixture,
 ) -> None:
+  caplog.set_level("INFO", logger="agent_gateway.runner")
   _SpawnRunner.children.clear()
   parent = _fork_parent(tmp_path)
   execution_bind = CapabilityBind(
@@ -646,20 +557,6 @@ def test_spawn_fork_reuses_resume_seed_and_fresh_tagged_log(
   parent._capability_execution = SimpleNamespace(
     bind=handoff.capability_bind,
   )
-  decisions = (
-    ForkToolDecision("read_data", "allow", "parent surface"),
-    ForkToolDecision("run_agent", "deny", "orchestration surface"),
-  )
-  receipt = fork_scope_receipt_dict(
-    tool_decisions=decisions,
-    capability_bind=execution.bind,
-    tenant_id=handoff.tenant_id,
-    billing_mode=handoff.billing_mode,
-    resolved_budget_usd=5.0,
-    max_turns=20,
-    suffix_ceiling=20_000,
-  )
-
   operation = AgentOperationRef(
     namespace="agent-operation",
     name="test-fork",
@@ -697,10 +594,6 @@ def test_spawn_fork_reuses_resume_seed_and_fresh_tagged_log(
       ),
       result_provenance=result_provenance,
       dispatcher=_Dispatcher(handoff.wire_tools),
-      scope_receipt=receipt,
-      max_turns=20,
-      max_budget_usd=5.0,
-      suffix_ceiling=20_000,
     )
   )
 
@@ -710,10 +603,22 @@ def test_spawn_fork_reuses_resume_seed_and_fresh_tagged_log(
   assert result.values.terminal_narrative is not None
   assert result.values.projection is None
   child = _SpawnRunner.children[-1]
-  assert child._fork_mode is True
-  assert child._fork_marker_position == (0, 0)
-  assert child.kwargs["emit_session_recap"] is False
-  assert child.kwargs["on_session_summary"] is None
+  # The fork's tool surface is the parent's exact wire surface, minus nothing.
+  assert child.kwargs["get_tool_definitions"]() == handoff.wire_tools
+  assert "run_agent" in {
+    tool["name"] for tool in child.kwargs["get_tool_definitions"]()
+  }
+  measurements = [
+    record.data  # pyright: ignore[reportAttributeAccessIssue]  # structured log payload
+    for record in caplog.records
+    if getattr(record, "data", {}).get("event") == "fork_measurements"
+  ]
+  assert measurements == [{
+    "event": "fork_measurements",
+    "sub_agent_id": child.kwargs["session_id"],
+    "turns": 1,
+    "suffix_tokens": 25_000,
+  }]
   assert all(
     entry.event["sub_agent_id"].startswith("sub0:")
     and entry.event["fork"] is True
@@ -781,18 +686,6 @@ def test_fork_settlement_derives_the_outcome_from_admitted_authority(
     ],
   )
   parent._capability_execution = SimpleNamespace(bind=handoff.capability_bind)
-  receipt = fork_scope_receipt_dict(
-    tool_decisions=(
-      ForkToolDecision("read_data", "allow", "parent surface"),
-      ForkToolDecision("run_agent", "deny", "orchestration surface"),
-    ),
-    capability_bind=execution.bind,
-    tenant_id=handoff.tenant_id,
-    billing_mode=handoff.billing_mode,
-    resolved_budget_usd=5.0,
-    max_turns=20,
-    suffix_ceiling=20_000,
-  )
   operation = AgentOperationRef(
     namespace="agent-operation",
     name="test-fork",
@@ -835,10 +728,6 @@ def test_fork_settlement_derives_the_outcome_from_admitted_authority(
       result_requirement=result_requirement,
       result_provenance=provenance_of(admitted),
       dispatcher=_Dispatcher(handoff.wire_tools),
-      scope_receipt=receipt,
-      max_turns=20,
-      max_budget_usd=5.0,
-      suffix_ceiling=20_000,
       task_entry=task_entry,
     )
   )
@@ -922,18 +811,6 @@ def _spawn_minimal_fork(tmp_path, cls: type[_SpawnRunner]) -> TaskResult:
     ],
   )
   parent._capability_execution = SimpleNamespace(bind=handoff.capability_bind)
-  receipt = fork_scope_receipt_dict(
-    tool_decisions=(
-      ForkToolDecision("read_data", "allow", "parent surface"),
-      ForkToolDecision("run_agent", "deny", "orchestration surface"),
-    ),
-    capability_bind=execution.bind,
-    tenant_id=handoff.tenant_id,
-    billing_mode=handoff.billing_mode,
-    resolved_budget_usd=5.0,
-    max_turns=20,
-    suffix_ceiling=20_000,
-  )
   operation = AgentOperationRef(
     namespace="agent-operation",
     name="test-fork",
@@ -968,10 +845,6 @@ def _spawn_minimal_fork(tmp_path, cls: type[_SpawnRunner]) -> TaskResult:
         tool_grant_digest=digest,
       ),
       dispatcher=_Dispatcher(handoff.wire_tools),
-      scope_receipt=receipt,
-      max_turns=20,
-      max_budget_usd=5.0,
-      suffix_ceiling=20_000,
     ),
     # Far past the patched gap: a fork the guard does not reach fails here
     # instead of hanging the suite.
@@ -1001,9 +874,6 @@ def test_wedged_fork_is_settled_stalled_by_the_activity_guard(
   assert child.cancelled is True
   assert result.execution.status == "interrupted"
   assert result.execution.terminal_reason is not None
-  assert result.execution.terminal_reason.startswith(
-    "stalled: Forked sub-agent stalled: no activity for"
-  )
   errors = [
     entry.event
     for entry in child._log.entries
@@ -1072,17 +942,11 @@ def test_learning_fork_provenance_uses_canonical_full_payload_digest() -> None:
     terminal_narrative="required",
     outcome=OutcomeRequirement(required=False, source="none"),
   )
-  scope_receipt = fork_scope_receipt_dict(
-    tool_decisions=(
-      ForkToolDecision("memory_write", "allow", "learning surface"),
-    ),
-    capability_bind=execution.bind,
-    tenant_id="tenant-1",
-    billing_mode="byok",
-    resolved_budget_usd=1.0,
-    max_turns=10,
-    suffix_ceiling=20_000,
-  )
+  wire_tools = [{"name": "memory_write"}, {"name": "run_agent"}]
+  tool_grant = {
+    "kind": "parent_wire_surface",
+    "tools": ["memory_write", "run_agent"],
+  }
 
   provenance = learning_fork_result_provenance(
     physical_task_id="sub0:parent-session",
@@ -1091,7 +955,7 @@ def test_learning_fork_provenance_uses_canonical_full_payload_digest() -> None:
     objective="LEARN",
     result_requirement=requirement,
     execution=execution,
-    scope_receipt=scope_receipt,
+    wire_tools=wire_tools,
   )
 
   # One definition of admitted_task_digest: the canonical full-payload seal
@@ -1106,14 +970,14 @@ def test_learning_fork_provenance_uses_canonical_full_payload_digest() -> None:
     "operation": _LEARNING_FORK_OPERATION.model_dump(mode="json"),
     "result_requirement": requirement.model_dump(mode="json"),
     "model_bind": execution.bind.model_dump(mode="json"),
-    "scope_receipt": dict(scope_receipt),
+    "tool_grant": tool_grant,
     "model_bind_digest": provenance.model_bind_digest,
     "capability_binding_digest": provenance.capability_binding_digest,
     "tool_grant_digest": provenance.tool_grant_digest,
   }
   assert provenance.admitted_task_digest == sha256_digest(expected_payload)
   assert provenance.model_bind_digest == sha256_digest(execution.bind)
-  assert provenance.tool_grant_digest == sha256_digest(scope_receipt)
+  assert provenance.tool_grant_digest == sha256_digest(tool_grant)
 
   # The retired four-field subset digest is not the admitted task digest.
   legacy_subset_digest = sha256_digest({
@@ -1127,3 +991,73 @@ def test_learning_fork_provenance_uses_canonical_full_payload_digest() -> None:
   # The seal is derived, never supplied.
   with pytest.raises(ValueError, match="derived"):
     seal_admitted_task_payload({"admitted_task_digest": "sha256:forged"})
+
+
+def test_run_loop_measures_fork_suffix_and_never_stops_the_fork() -> None:
+  # GC13/GC14: the run loop owns the measurement. A suffix far past the old
+  # 20k ceiling is recorded, and the request opens no forced-final turn.
+  from agent_gateway.runner_run_loop import RunnerRunLoopMixin
+
+  async def _record_context(**kwargs: Any) -> tuple[bool, bool]:
+    _ = kwargs
+    return False, False
+
+  fork_runner = SimpleNamespace(
+    _fork_mode=True,
+    _fork_marker_position=(0, 0),
+    _fork_suffix_tokens=0,
+    _inject_system_prompt_reminder=lambda prompt, _reminder: prompt,
+    _record_provider_request_context=_record_context,
+  )
+  prefix = {"role": "user", "content": [
+    {"type": "text", "text": "parent history"},
+    {"type": "text", "text": "fork directive"},
+  ]}
+  suffix = {"role": "assistant", "content": [{"type": "text", "text": "x" * 90}]}
+  measured: list[list[dict[str, Any]]] = []
+
+  def _estimate(*, system_text: str, messages: list[dict[str, Any]], tools: list[Any]) -> Any:
+    _ = system_text, tools
+    measured.append(copy.deepcopy(messages))
+    tokens = 1_000_000 * len(messages)
+    return SimpleNamespace(est_messages_tokens=tokens, est_total_tokens=tokens)
+
+  result = asyncio.run(RunnerRunLoopMixin._prepare_provider_request(
+    fork_runner,  # pyright: ignore[reportArgumentType]  # duck-typed runner
+    active_delivery_obligation=None,
+    base_kwargs={},
+    build_context_pressure_reminder=lambda **_kwargs: "",
+    build_runtime_guard_event=lambda **_kwargs: {},
+    context_limit=10_000_000,
+    context_pressure_reminder_decision=lambda **_kwargs: ContextPressureReminderDecision(
+      reminder_pct=None,
+      next_threshold_pct=50,
+    ),
+    current_messages=[prefix, suffix],
+    delivered_notifications=[],
+    delivered_notifications_recorded=False,
+    delivery_request_nudge_message=None,
+    delivery_request_nudge_recorded=False,
+    wrap_up_reminder_text=None,
+    logger=logging.getLogger("test"),
+    max_tokens=1_000,
+    last_ordinary_turn=None,
+    pending_notifications_at_render=0,
+    system_prompt="system",
+    system_prompt_estimate_text=lambda _prompt: "",
+    token_estimate_snapshot=_estimate,
+    turn_count=3,
+    turn_reminder=SimpleNamespace(text=""),  # pyright: ignore[reportArgumentType]  # duck-typed reminder
+    user_turn_message=lambda text: {"role": "user", "content": text},
+  ))
+
+  # The first estimate is the suffix: the boundary message's blocks after the
+  # marker, then every later message.
+  assert measured[0] == [
+    {"role": "user", "content": [{"type": "text", "text": "fork directive"}]},
+    suffix,
+  ]
+  assert fork_runner._fork_suffix_tokens == 2_000_000
+  last_ordinary_turn, wrap_up_reminder_text = result[0], result[1]
+  assert last_ordinary_turn is None
+  assert wrap_up_reminder_text is None

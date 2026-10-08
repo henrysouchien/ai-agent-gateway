@@ -32,7 +32,7 @@ class _UnusedClientSession:
     name: str,
     arguments: Mapping[str, object],
     *,
-    read_timeout_seconds: float,
+    read_timeout_seconds: float | None,
     meta: Mapping[str, object] | None = None,
   ) -> McpToolCallResult:
     raise AssertionError(f"unexpected physical MCP call: {name}")
@@ -145,7 +145,7 @@ def test_authenticated_user_projection_completes_read_with_trusted_meta() -> Non
         name: str,
         arguments: Mapping[str, object],
         *,
-        read_timeout_seconds: float,
+        read_timeout_seconds: float | None,
         meta: Mapping[str, object] | None = None,
       ) -> CallToolResult:
         captured["call"] = (

@@ -3,18 +3,16 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
-from typing import Any, Callable
+from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request, Response
 
+from agent_gateway.admission import root_context
+from agent_gateway.autonomous_capability_handoff import AutonomousLaunchAdmissionRefused
 from agent_gateway.approval_route import bind_session_approval_route
 from agent_gateway.approvals import ApprovalActionError, _record_vote_and_unblock
 from agent_gateway.autonomous_runner import AutonomousRegistry, AutonomousTask
 from agent_gateway.control_run_lifecycle import is_control_run_active_state
-from agent_gateway.control_skill_catalog import (
-  ControlSkillCatalog,
-  ControlSkillUnavailableError,
-)
 from agent_gateway.session import AuthManager
 from agent_gateway.named_refusal import NamedRefusal
 
@@ -78,57 +76,10 @@ from .runs_chat_helpers import (
 def build_runs_router(
   *,
   auth: AuthManager,
-  skill_catalog: ControlSkillCatalog,
   autonomous_registry: AutonomousRegistry | None = None,
   dispatch_scope_validator: Any | None = None,
-  control_profile_loader: Callable[[str], Any] | None = None,
 ) -> APIRouter:
-  if not isinstance(skill_catalog, ControlSkillCatalog):
-    raise TypeError("skill_catalog must implement ControlSkillCatalog")
   router = APIRouter(prefix="/runs")
-
-  def _require_autonomous_profile(profile_name: str) -> None:
-    if control_profile_loader is None:
-      return
-    try:
-      profile = control_profile_loader(profile_name)
-    except Exception as exc:
-      raise HTTPException(
-        status_code=422,
-        detail=f"Unknown autonomous profile: {profile_name}",
-      ) from exc
-    if not profile.supports_autonomous_execution:
-      raise HTTPException(
-        status_code=422,
-        detail=f"Profile {profile_name!r} is interactive-only",
-      )
-
-  def _require_dispatchable_skill(skill_name: str) -> None:
-    """Answer the launch question before a run id is charged.
-
-    The catalog owns launchability: ``can_launch`` is its verdict for an
-    ordinary control dispatch, and ``blocked_reason`` is the definition's own
-    sentence. ``catalog: false`` withholds a skill from the advertised
-    listing and never from this question, so every skill this catalog
-    defines is judged here before the run is charged.
-
-    Whether a name exists at all is not this catalog's authority — the
-    runner resolves the skill it launches — so an unresolvable selector
-    carries no verdict and is dispatched unchanged.
-    """
-
-    try:
-      skill = skill_catalog.resolve_skill(skill_name)
-    except ControlSkillUnavailableError:
-      return
-    if skill.can_launch:
-      return
-    raise NamedRefusal(
-      "skill_autonomous_run_not_allowed",
-      skill.blocked_reason
-      or f"Skill '{skill.name}' cannot be launched by the control plane.",
-      transport="invalid",
-    )
 
   def _dispatch_scope_payload(scope: DispatchScope | None) -> dict[str, Any] | None:
     if scope is None:
@@ -140,51 +91,20 @@ def build_runs_router(
     *,
     session: Any,
   ) -> dict[str, Any] | None:
+    """Dispatch the scope the product validator canonicalizes.
+
+    The validator owns its outcome: it returns a redacted scope (``None`` keeps
+    the requested one) or raises its own ``HTTPException``.
+    """
     payload = _dispatch_scope_payload(scope)
     if payload is None or dispatch_scope_validator is None:
       return payload
-    try:
-      validation_result = dispatch_scope_validator(session, dict(payload))
-      if inspect.isawaitable(validation_result):
-        validation_result = await validation_result
-    except HTTPException:
-      raise
-    except ValueError as exc:
-      raise HTTPException(
-        status_code=422,
-        detail={
-          "error": "dispatch_scope_validation_failed",
-          "message": str(exc) or "Selected dispatch scope is not valid.",
-        },
-      ) from exc
-    except Exception as exc:
-      raise HTTPException(
-        status_code=422,
-        detail={
-          "error": "dispatch_scope_validation_failed",
-          "message": "Selected dispatch scope could not be validated.",
-        },
-      ) from exc
+    validation_result = dispatch_scope_validator(session, dict(payload))
+    if inspect.isawaitable(validation_result):
+      validation_result = await validation_result
     if validation_result is None:
-      validation_result = payload
-    if not isinstance(validation_result, dict):
-      raise HTTPException(
-        status_code=422,
-        detail={
-          "error": "dispatch_scope_validation_failed",
-          "message": "Dispatch scope validator returned an invalid payload.",
-        },
-      )
-    try:
-      return DispatchScope.model_validate(validation_result).model_dump()
-    except ValueError as exc:
-      raise HTTPException(
-        status_code=422,
-        detail={
-          "error": "dispatch_scope_validation_failed",
-          "message": "Dispatch scope validator returned a non-redacted scope.",
-        },
-      ) from exc
+      return payload
+    return DispatchScope.model_validate(validation_result).model_dump()
 
   @router.post("", response_model=RunDispatchResponse)
   async def dispatch_run(
@@ -198,6 +118,8 @@ def build_runs_router(
       _require_control_session(authenticated)
       requested_channel = _normalize_channel(payload.channel)
       session_channel = _normalize_channel(authenticated.channel)
+      # Auth: the session's channel comes from the gateway key it was minted with
+      # (CP4, auth.py ChannelMismatchError), so it cannot dispatch a run into another channel.
       if session_channel is not None and requested_channel is not None and session_channel != requested_channel:
         raise HTTPException(status_code=401, detail="Channel mismatch")
       channel = session_channel or requested_channel
@@ -220,7 +142,7 @@ def build_runs_router(
       )
       if dispatch_scope is not None:
         context["dispatch_scope"] = dispatch_scope
-        context.setdefault("portfolio_name", dispatch_scope["portfolio_name"])
+        context["portfolio_name"] = dispatch_scope["portfolio_name"]
 
       chat_session = auth.session_store.create_session(
         api_key_hash=authenticated.api_key_hash,
@@ -250,7 +172,6 @@ def build_runs_router(
         getattr(request.app.state, "gateway_approval_store", None),
         getattr(request.app.state, "gateway_approval_policy", None),
       )
-      chat_session.max_budget_usd = payload.max_budget_usd
       chat_session.initial_message = payload.message
       chat_session.stage_skill_route = (
         dict(stage_skill_route) if stage_skill_route is not None else None
@@ -285,19 +206,25 @@ def build_runs_router(
     _require_control_session(authenticated)
     requested_channel = _normalize_channel(payload.channel)
     session_channel = _normalize_channel(authenticated.channel)
+    # Auth: the session's channel comes from the gateway key it was minted with
+    # (CP4, auth.py ChannelMismatchError), so it cannot dispatch a run into another channel.
     if session_channel is not None and requested_channel is not None and session_channel != requested_channel:
       raise HTTPException(status_code=401, detail="Channel mismatch")
     channel = session_channel or requested_channel
     if not payload.profile or not payload.mode:
       raise HTTPException(status_code=422, detail="profile and mode are required")
-    _require_autonomous_profile(payload.profile)
 
     registry = _require_autonomous_registry(autonomous_registry)
     registry.set_user_event_bus(getattr(request.app.state, "user_event_bus", None))
+    # The scope validator owns its outcome; only registry.start's errors map here.
+    dispatch_scope = await _validated_dispatch_scope_payload(payload.dispatch_scope, session=authenticated)
     try:
-      if payload.skill:
-        _require_dispatchable_skill(payload.skill)
       start_payload = await registry.start(
+        parent=root_context(
+          authenticated,
+          withheld_tools=frozenset(),
+          research_file_id=payload.research_file_id,
+        ),
         role=authenticated.role,
         profile=payload.profile,
         mode=payload.mode,
@@ -307,7 +234,6 @@ def build_runs_router(
         context=payload.context,
         ticker=payload.ticker,
         research_file_id=payload.research_file_id,
-        max_budget_usd=payload.max_budget_usd,
         channel=channel,
         user_id=authenticated.user_id,
         user_email=authenticated.user_email,
@@ -316,8 +242,10 @@ def build_runs_router(
         risk_user_id=authenticated.risk_user_id,
         user_aliases=list(getattr(authenticated, "user_aliases", ()) or (owner_user_id,)),
         identity_status=getattr(authenticated, "identity_status", None),
-        dispatch_scope=await _validated_dispatch_scope_payload(payload.dispatch_scope, session=authenticated),
+        dispatch_scope=dispatch_scope,
       )
+    except AutonomousLaunchAdmissionRefused as exc:
+      raise HTTPException(status_code=exc.http_status, detail=exc.payload()) from exc
     except ValueError as exc:
       raise HTTPException(status_code=422, detail=str(exc)) from exc
     except NamedRefusal as exc:
@@ -402,7 +330,7 @@ def build_runs_router(
       context["dispatch_scope"] = dict(dispatch_scope)
       portfolio_name = dispatch_scope.get("portfolio_name")
       if isinstance(portfolio_name, str) and portfolio_name.strip():
-        context.setdefault("portfolio_name", portfolio_name)
+        context["portfolio_name"] = portfolio_name
     latest_user_message = _latest_user_message_content(list(payload.messages))
     message_id = _control_message_id(payload.request_id) if latest_user_message is not None else None
     if message_id is not None and _has_parent_message_event(target_session, message_id):
@@ -456,7 +384,6 @@ def build_runs_router(
 
       resume_payload = payload or AutonomousResumeRequest()
       resume_context = _build_autonomous_resume_context(record, resume_payload)
-      _require_autonomous_profile(record.profile)
       try:
         start_payload = await registry.start(
           # Resume follows current authority in both promotion and revocation directions.
@@ -468,7 +395,6 @@ def build_runs_router(
           context=resume_context,
           ticker=record.ticker,
           research_file_id=record.research_file_id,
-          max_budget_usd=getattr(record, "max_budget_usd", None),
           channel=record.channel,
           user_id=getattr(record, "raw_user_id", None) or authenticated.user_id,
           user_email=authenticated.user_email,

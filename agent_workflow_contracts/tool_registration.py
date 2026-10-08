@@ -450,7 +450,12 @@ class ToolRegistrationDeclaration:
 
 @dataclass(frozen=True, slots=True)
 class RegisteredToolServerDescriptor:
-  """Stable server-level facts shared by its registered MCP tools."""
+  """Stable server-level facts shared by its registered MCP tools.
+
+  `default_timeout_seconds` and `per_tool_timeout_seconds` are expected call
+  durations, a measurement the MCP client logs against; no clock cancels a
+  call at them.
+  """
 
   logical_server_id: str
   transport_server_id: str

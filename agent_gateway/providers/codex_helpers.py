@@ -532,7 +532,8 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
       usage = {}
     input_details = usage.get("input_tokens_details") or {}
     cached_tokens = int(input_details.get("cached_tokens") or 0) if isinstance(input_details, dict) else 0
-    input_tokens = max(0, int(usage.get("input_tokens") or 0) - cached_tokens)
+    total_input = int(usage.get("input_tokens") or 0)
+    input_tokens = max(0, total_input - cached_tokens)
     output_tokens = int(usage.get("output_tokens") or 0)
     output_details = usage.get("output_tokens_details") or {}
     reasoning_tokens = (
@@ -559,6 +560,8 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
       StreamEvent(
         type="message_end",
         stop_reason=_map_stop_reason(normalized_response, saw_tool_use=state.saw_tool_use),
+        # Responses input_tokens already includes cached prompt tokens.
+        request_input_tokens=total_input if usage.get("input_tokens") is not None else None,
       )
     )
     return events

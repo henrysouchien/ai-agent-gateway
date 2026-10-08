@@ -17,6 +17,7 @@ class CodeExecutionConfig:
   docker_image: str = ""
   register_docker: bool = True
   register_subprocess: bool = True
+  register_kernel: bool = False
 
   # Preamble
   preamble_suffix: str = ""

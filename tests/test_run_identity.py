@@ -9,13 +9,11 @@ from agent_gateway import AgentRunner, CostEstimate, EventLog, ModelInfo, ModelP
 from agent_gateway.approval_policy import RunContext
 from agent_gateway.runner import StreamTurnResult
 from agent_gateway.run_identity import (
-  MODEL_RUN_IDENTITY_MCP_TOOLS,
   RUN_IDENTITY_MCP_ENV,
   RUN_IDENTITY_MCP_TOOLS_ENV,
   RunIdentityCarrier,
   RunIdentityCarrierError,
   inject_run_identity_into_mcp_server_configs,
-  model_run_identity_for_tool,
 )
 from agent_gateway.tool_dispatcher import ToolDispatcher
 from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
@@ -101,25 +99,6 @@ class _Provider(ModelProvider):
       cache_creation_tokens,
     )
     return CostEstimate()
-
-
-def test_run_identity_carrier_routes_model_chains_and_rejects_author() -> None:
-  carrier = RunIdentityCarrier("skill-run-1")
-
-  assert {
-    tool_name: model_run_identity_for_tool(tool_name, carrier)
-    for tool_name in MODEL_RUN_IDENTITY_MCP_TOOLS
-  } == {
-    "build_model": "skill-run-1",
-    "prepare_model_build": "skill-run-1",
-  }
-  assert model_run_identity_for_tool("fms_report_build_model", carrier) == "skill-run-1"
-  assert model_run_identity_for_tool("filings_search", carrier) is None
-  with pytest.raises(
-    RunIdentityCarrierError,
-    match="author_model_spec does not accept run identity",
-  ):
-    model_run_identity_for_tool("author_model_spec", carrier)
 
 
 @pytest.mark.parametrize(
@@ -278,7 +257,6 @@ def test_custom_runner_preserves_request_snapshot_and_run_identity() -> None:
     runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "build the model"}],
-      max_turns=2,
     )
 
     assert len(mcp.calls) == 1
@@ -287,7 +265,8 @@ def test_custom_runner_preserves_request_snapshot_and_run_identity() -> None:
   _run(case())
 
 
-def test_custom_dispatcher_keeps_author_chain_identity_free() -> None:
+def test_custom_dispatcher_gives_author_chain_legacy_attribution() -> None:
+  """``author_model_spec`` is an ordinary non-lifecycle tool: attribution only."""
   mcp = _McpClient("author_model_spec")
   dispatcher = ToolDispatcher(
     mcp_client=mcp,  # type: ignore[arg-type]
@@ -318,22 +297,23 @@ def test_custom_dispatcher_keeps_author_chain_identity_free() -> None:
 
   assert error is None
   assert result == {"ok": True}
-  assert "skill_run_id" not in mcp.calls[0]["meta"]
+  assert mcp.calls[0]["meta"]["skill_run_id"] == "skill-run-custom"
 
 
 @pytest.mark.parametrize(
-  ("skill_run_id", "context_run_id", "expected_code"),
+  ("skill_run_id", "context_run_id"),
   [
-    (None, "skill-run-custom", "run_identity_required"),
-    ("skill-run-custom", None, "run_identity_invalid"),
-    ("skill-run-custom", "other-run", "run_identity_mismatch"),
+    (None, "skill-run-custom"),
+    ("skill-run-custom", None),
+    ("skill-run-custom", "other-run"),
   ],
 )
-def test_custom_dispatcher_fails_closed_on_missing_or_conflicting_identity(
+def test_custom_dispatcher_forwards_lifecycle_call_to_the_identity_owner(
   skill_run_id: str | None,
   context_run_id: str | None,
-  expected_code: str,
 ) -> None:
+  """The carrier's consumers (Risk's MCP carrier, the build routes) refuse a
+  missing or malformed identity; the dispatcher keys nothing on the tool name."""
   mcp = _McpClient("build_model")
   dispatcher = ToolDispatcher(
     mcp_client=mcp,  # type: ignore[arg-type]
@@ -358,43 +338,10 @@ def test_custom_dispatcher_fails_closed_on_missing_or_conflicting_identity(
     )
   )
 
-  assert result is None
-  assert error is not None and error["code"] == expected_code
-  assert mcp.calls == []
-
-
-@pytest.mark.parametrize("original_tool_name", ["prepare_model_build", "build_model"])
-def test_custom_dispatcher_normalizes_prefixed_model_tool_before_identity_check(
-  original_tool_name: str,
-) -> None:
-  prefixed_name = f"mcp__portfolio-producers-mcp__{original_tool_name}"
-  mcp = _McpClient(prefixed_name, original_tool_name=original_tool_name)
-  dispatcher = ToolDispatcher(
-    mcp_client=mcp,  # type: ignore[arg-type]
-    local_tool_handlers={},
-    role="owner",
-    run_context=RunContext(
-      user_id="alice",
-      request_id="request-1",
-      session_id="session-1",
-      run_id="skill-run-prefixed",
-    ),
-    mcp_meta_inject_servers=frozenset({"portfolio-producers-mcp"}),
-  )
-
-  result, error = _run(
-    dispatcher.dispatch(
-      "call-prefixed",
-      prefixed_name,
-      {},
-      advertised_tool_names=frozenset({prefixed_name}),
-      skill_run_id=None,
-    )
-  )
-
-  assert result is None
-  assert error is not None and error["code"] == "run_identity_required"
-  assert mcp.calls == []
+  assert error is None
+  assert result == {"ok": True}
+  assert len(mcp.calls) == 1
+  assert mcp.calls[0]["meta"].get("skill_run_id") == skill_run_id
 
 
 def test_custom_dispatcher_routes_prefixed_model_tool_identity_metadata() -> None:

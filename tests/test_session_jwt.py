@@ -13,8 +13,15 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from agent_gateway.control_plane.batches import BatchTaskRegistry
 from agent_gateway.event_log import EventLog
-from agent_gateway.session import AuthManager, JWT_ALGORITHM, SessionStore, SessionStream
+from agent_gateway.session import (
+  AuthManager,
+  JWT_ALGORITHM,
+  SessionStore,
+  SessionStream,
+  session_admits_new_turn,
+)
 from agent_gateway.session_capabilities import TEAM_WORKSPACE_WRITE_CAPABILITY
 
 _JWT_SECRET = "jwt-secret-with-at-least-32-bytes"
@@ -66,6 +73,15 @@ def test_auth_manager_rejects_short_hs256_secret() -> None:
     assert "at least 32 bytes" in str(exc)
   else:
     raise AssertionError("AuthManager accepted a short JWT signing secret")
+
+
+def test_auth_manager_with_configured_keys_refuses_an_unknown_key() -> None:
+  auth = AuthManager(secret=_JWT_SECRET, valid_keys={"gateway-key"}, session_store=SessionStore(ttl=3600))
+
+  auth.validate_api_key("gateway-key")
+  with pytest.raises(HTTPException) as exc_info:
+    auth.validate_api_key("any")
+  assert exc_info.value.status_code == 401
 
 
 def test_session_store_ttl_override_and_kind_are_store_only() -> None:
@@ -355,6 +371,9 @@ def test_turn_in_progress_keeps_its_session_token_live_past_the_ttl(
     # The turn's tool calls authenticate with the session's token after the TTL.
     now[0] = session.expires_at + 1
     assert auth.verify_token(token) is session
+    # Admission is the clock alone: a running turn is refused earlier (409) by the
+    # chat helper, so in-progress work never widens admission past the TTL.
+    assert not session_admits_new_turn(session, expires_at=session.expires_at, now=now[0])
     assert store.visible_sessions_snapshot() == (session,)
     await store.cleanup_expired_async()
     assert store.get_session(session.session_id) is session
@@ -367,6 +386,7 @@ def test_turn_in_progress_keeps_its_session_token_live_past_the_ttl(
       auth.verify_token(token)
     assert exc_info.value.status_code == 401
     assert exc_info.value.detail == "Session expired"
+    assert not session_admits_new_turn(session, expires_at=session.expires_at, now=now[0])
     assert store.visible_sessions_snapshot() == ()
     release.set()
     await runner
@@ -398,5 +418,148 @@ def test_session_ttl_expiry_waits_for_the_turn_it_is_running(
     await store.cleanup_expired_async()
     assert expired == [idle.session_id, running.session_id]
     assert store.get_session(running.session_id) is None
+
+  asyncio.run(scenario())
+
+
+def _start_batch(
+  task_registry: BatchTaskRegistry,
+  session,
+  *,
+  batch_id: int,
+) -> asyncio.Event:
+  """Admit a running batch on ``session``'s token the way batch dispatch does."""
+
+  release = asyncio.Event()
+  task_registry.start(
+    owner_user_id=session.user_id,
+    batch_id=batch_id,
+    task=asyncio.get_running_loop().create_task(release.wait()),
+    registry=object(),
+    live_session=session,
+  )
+  return release
+
+
+async def _until_terminal(task_registry: BatchTaskRegistry, session, batch_id: int) -> None:
+  while task_registry.has_admitted_batch(
+    owner_user_id=session.user_id,
+    batch_id=batch_id,
+  ):
+    await asyncio.sleep(0)
+
+
+def _assert_expired(auth: AuthManager, token: str) -> None:
+  with pytest.raises(HTTPException) as exc_info:
+    auth.verify_token(token)
+  assert exc_info.value.status_code == 401
+  assert exc_info.value.detail == "Session expired"
+
+
+def test_admitted_batch_keeps_its_session_token_live_until_terminal(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def scenario() -> None:
+    now = [1_000]
+    monkeypatch.setattr("agent_gateway.session.time.time", lambda: now[0])
+    store = SessionStore(ttl=900)
+    auth = AuthManager(secret=_JWT_SECRET, valid_keys={"gateway-key"}, session_store=store)
+    task_registry = BatchTaskRegistry()
+    running = store.create_session(api_key_hash="hash", user_id="alice", kind="control")
+    idle = store.create_session(api_key_hash="hash", user_id="bob", kind="control")
+    running_token = auth.issue_token(running)
+    idle_token = auth.issue_token(idle)
+    release = _start_batch(task_registry, running, batch_id=1)
+
+    # Every stage authenticates with the dispatching token past 900 s; a
+    # session holding no turn and no batch expires at 900 s.
+    now[0] = running.expires_at + 1
+    assert auth.verify_token(running_token) is running
+    _assert_expired(auth, idle_token)
+    await store.cleanup_expired_async()
+    assert store.get_session(running.session_id) is running
+
+    release.set()
+    await _until_terminal(task_registry, running, 1)
+    assert running.admitted_batches == set()
+    _assert_expired(auth, running_token)
+
+  asyncio.run(scenario())
+
+
+def test_cancelled_batch_releases_its_session_token_to_the_ttl(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def scenario() -> None:
+    now = [1_000]
+    monkeypatch.setattr("agent_gateway.session.time.time", lambda: now[0])
+    store = SessionStore(ttl=900)
+    auth = AuthManager(secret=_JWT_SECRET, valid_keys={"gateway-key"}, session_store=store)
+    task_registry = BatchTaskRegistry()
+    session = store.create_session(api_key_hash="hash", user_id="alice", kind="control")
+    token = auth.issue_token(session)
+    unwinding = asyncio.Event()
+    finish_unwind = asyncio.Event()
+
+    async def batch() -> None:
+      try:
+        await asyncio.Event().wait()
+      except asyncio.CancelledError:
+        unwinding.set()
+        await finish_unwind.wait()
+        raise
+
+    task_registry.start(
+      owner_user_id="alice",
+      batch_id=1,
+      task=asyncio.get_running_loop().create_task(batch()),
+      registry=object(),
+      live_session=session,
+    )
+    await asyncio.sleep(0)
+
+    now[0] = session.expires_at + 1
+    assert auth.verify_token(token) is session
+
+    cancelling = asyncio.get_running_loop().create_task(
+      task_registry.cancel(owner_user_id="alice", batch_id=1)
+    )
+    await unwinding.wait()
+    # Cancel admission ends liveness; the batch's unwind does not hold it.
+    assert session.admitted_batches == set()
+    _assert_expired(auth, token)
+    finish_unwind.set()
+    assert await cancelling
+
+  asyncio.run(scenario())
+
+
+def test_batch_dispatched_by_a_turn_keeps_the_session_live_after_the_turn(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def scenario() -> None:
+    now = [1_000]
+    monkeypatch.setattr("agent_gateway.session.time.time", lambda: now[0])
+    store = SessionStore(ttl=900)
+    auth = AuthManager(secret=_JWT_SECRET, valid_keys={"gateway-key"}, session_store=store)
+    task_registry = BatchTaskRegistry()
+    session = store.create_session(api_key_hash="hash", user_id="alice")
+    token = auth.issue_token(session)
+    turn, runner, turn_release = _start_turn(session)
+    batch_release = _start_batch(task_registry, session, batch_id=1)
+
+    now[0] = session.expires_at + 1
+    # The turn ends; the batch it dispatched is still running on its token.
+    turn.event_log.append({"type": "stream_complete"})
+    turn_release.set()
+    await runner
+    assert auth.verify_token(token) is session
+    # The batch keeps the token valid for its stages; it does not admit a new
+    # turn on the expired session (audit of b520d1220).
+    assert not session_admits_new_turn(session, expires_at=session.expires_at, now=now[0])
+
+    batch_release.set()
+    await _until_terminal(task_registry, session, 1)
+    _assert_expired(auth, token)
 
   asyncio.run(scenario())

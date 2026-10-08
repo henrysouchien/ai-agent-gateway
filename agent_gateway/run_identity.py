@@ -8,15 +8,17 @@ from typing import Any, Mapping
 RUN_IDENTITY_MCP_ENV = "AGENT_SKILL_RUN_ID"
 RUN_IDENTITY_MCP_TOOLS_ENV = "AGENT_SKILL_RUN_ID_TOOLS"
 
-# These are the only MCP model-building chains allowed to consume the
-# server-owned run identity. The report door is gateway-local, so it receives
-# the same identity through ToolExecutionContext rather than subprocess env.
+# The value of RUN_IDENTITY_MCP_TOOLS_ENV. Risk's MCP carrier
+# (utils/gateway_context.py:resolve_skill_run_id_for_mcp_call) refuses a
+# lifecycle call whose name this list omits, or a list naming a tool outside
+# its own copy, so the wire value is this exact pair until Risk reads the list
+# without a mirror (risk queue gateway-run-identity-tool-sets-are-local-mirrors).
+# Nothing in the gateway keys a refusal on it.
 MODEL_RUN_IDENTITY_MCP_TOOLS = frozenset({
   "build_model",
   "prepare_model_build",
 })
 MODEL_RUN_IDENTITY_LOCAL_TOOLS = frozenset({"fms_report_build_model"})
-MODEL_RUN_IDENTITY_FORBIDDEN_TOOLS = frozenset({"author_model_spec"})
 RUN_IDENTITY_MAX_LENGTH = 128
 _RUN_IDENTITY_PATTERN = re.compile(
   rf"^[A-Za-z0-9][A-Za-z0-9._:-]{{0,{RUN_IDENTITY_MAX_LENGTH - 1}}}$"
@@ -69,51 +71,6 @@ class RunIdentityCarrier:
     }
 
 
-def model_run_identity_for_tool(
-  tool_name: str,
-  carrier: RunIdentityCarrier | None,
-) -> str | None:
-  """Resolve identity only for the run-bound model chains.
-
-  The judgment-author chain is an explicit negative route: attempting to
-  attach identity there is a construction error instead of a silent widening.
-  """
-
-  normalized_name = str(tool_name or "").strip()
-  if normalized_name in MODEL_RUN_IDENTITY_FORBIDDEN_TOOLS:
-    if carrier is not None:
-      raise RunIdentityCarrierError(
-        "run_identity_forbidden",
-        f"{normalized_name} does not accept run identity"
-      )
-    return None
-  if normalized_name in (
-    MODEL_RUN_IDENTITY_MCP_TOOLS | MODEL_RUN_IDENTITY_LOCAL_TOOLS
-  ):
-    return carrier.run_id if carrier is not None else None
-  return None
-
-
-def mcp_metadata_skill_run_id(
-  tool_name: str,
-  skill_run_id: str | None,
-) -> str | None:
-  """Route lifecycle authority or legacy attribution to MCP metadata.
-
-  Only prepare/build treat this field as authority. Other MCP tools retain the
-  historical attribution value; the author chain is explicitly identity-free.
-  """
-
-  normalized_name = str(tool_name or "").strip()
-  if normalized_name in MODEL_RUN_IDENTITY_FORBIDDEN_TOOLS:
-    return None
-  if normalized_name not in MODEL_RUN_IDENTITY_MCP_TOOLS:
-    normalized_attribution = str(skill_run_id or "").strip()
-    return normalized_attribution or None
-  carrier = RunIdentityCarrier.from_optional(skill_run_id)
-  return carrier.run_id if carrier is not None else None
-
-
 def inject_run_identity_into_mcp_server_configs(
   configs: Mapping[str, Any],
   *,
@@ -149,6 +106,8 @@ def inject_run_identity_into_mcp_server_configs(
       str(key): str(value)
       for key, value in dict(raw_env or {}).items()
     }
+    # The server-owned run id decides which run directory the MCP child
+    # writes; config that overrides it would let one run write as another.
     for key, expected in carrier_env.items():
       existing = env.get(key)
       if existing is not None and existing != expected:
@@ -163,7 +122,6 @@ def inject_run_identity_into_mcp_server_configs(
 
 
 __all__ = [
-  "MODEL_RUN_IDENTITY_FORBIDDEN_TOOLS",
   "MODEL_RUN_IDENTITY_LOCAL_TOOLS",
   "MODEL_RUN_IDENTITY_MCP_TOOLS",
   "RUN_IDENTITY_MCP_ENV",
@@ -172,7 +130,5 @@ __all__ = [
   "RunIdentityCarrier",
   "RunIdentityCarrierError",
   "inject_run_identity_into_mcp_server_configs",
-  "mcp_metadata_skill_run_id",
-  "model_run_identity_for_tool",
   "validate_run_identity",
 ]

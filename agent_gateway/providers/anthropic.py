@@ -52,7 +52,7 @@ from .anthropic_oauth import (
   UNDECLARED_LIMIT_BLOCK_SECONDS,
   ensure_fresh_anthropic_credential,
   resolve_anthropic_credentials,
-  rotate_anthropic_credential,
+  rotate_anthropic_credential_source,
 )
 
 
@@ -358,6 +358,16 @@ def _usage_iterations(usage: Any) -> list[Any]:
   return plain if isinstance(plain, list) else []
 
 
+def _anthropic_prompt_usage(usage: Any) -> dict[str, int]:
+  """Read only reported prompt components; absent input is not measured zero."""
+  components: dict[str, int] = {}
+  for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+    value = usage.get(key) if isinstance(usage, dict) else getattr(usage, key, None)
+    if value is not None:
+      components[key] = int(value)
+  return components
+
+
 def _anthropic_usage_totals(usage: Any) -> dict[str, Any]:
   iterations = _usage_iterations(usage)
   if not iterations:
@@ -544,20 +554,23 @@ class AnthropicProvider(ModelProvider):
       if failure.reset_at is not None
       else time.time() + UNDECLARED_LIMIT_BLOCK_SECONDS
     )
-    replacement = rotate_anthropic_credential(
+    selected = rotate_anthropic_credential_source(
       sources,
       current=current,
       until=blocked_until,
       pool=ANTHROPIC_CREDENTIAL_POOL,
     )
-    if not replacement:
+    if selected is None:
       log.warning(
         "Anthropic %s failure with no unblocked sibling credential in a pool of %d",
         failure.kind,
         len(sources.credentials),
       )
       return None
-    return {"auth_token": replacement}
+    return {
+      "auth_token": selected.token,
+      "credential_source": selected.source_metadata(),
+    }
 
   def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
     try:
@@ -1021,8 +1034,12 @@ class AnthropicProvider(ModelProvider):
 
   async def stream(self, client: Any, params: dict[str, Any]) -> AsyncGenerator[StreamEvent, None]:
     bucket = get_global_token_bucket()
+    provider_wait_ms = 0
     if bucket is not None:
-      await bucket.acquire(estimated_tokens=int(params.get("max_tokens") or 0))
+      waited_seconds = await bucket.acquire(
+        estimated_tokens=int(params.get("max_tokens") or 0),
+      )
+      provider_wait_ms = round(waited_seconds * 1000)
 
     stream_params = dict(params)
     auth_mode = str(stream_params.pop("_provider_auth_mode", "api")).strip().lower()
@@ -1059,6 +1076,8 @@ class AnthropicProvider(ModelProvider):
       "cache_read_input_tokens": 0,
     }
     reported_provider_unit_deltas: dict[str, int] = {}
+    request_prompt_usage: dict[str, int] = {}
+    request_has_iterations = False
 
     try:
       if use_compaction or use_structured_outputs:
@@ -1084,6 +1103,7 @@ class AnthropicProvider(ModelProvider):
           if event_type == "message_start":
             message = getattr(event, "message", None)
             usage = getattr(message, "usage", None) if message is not None else None
+            request_prompt_usage = _anthropic_prompt_usage(usage)
             reported_model = str(
               (getattr(message, "model", "") if message is not None else "")
               or ""
@@ -1105,6 +1125,7 @@ class AnthropicProvider(ModelProvider):
               # Anthropic reports separately billed server-tool units on the
               # final usage snapshot; avoid counting the same call twice.
               provider_units=0,
+              provider_wait_ms=provider_wait_ms,
             )
             continue
 
@@ -1230,6 +1251,16 @@ class AnthropicProvider(ModelProvider):
             stop_details = raw_stop_details if isinstance(raw_stop_details, dict) else None
             usage = getattr(event, "usage", None)
             if usage is not None:
+              iterations = _usage_iterations(usage)
+              if iterations:
+                # Each snapshot's last invocation owns context, even when its
+                # required input measurement is absent. Never retain the prefix.
+                request_prompt_usage = _anthropic_prompt_usage(iterations[-1])
+                request_has_iterations = True
+              elif not request_has_iterations:
+                # Scalar deltas refer to the same invocation; output-only
+                # deltas leave its prompt intact, including explicit zeroes.
+                request_prompt_usage.update(_anthropic_prompt_usage(usage))
               usage_totals = _anthropic_usage_totals(usage)
               current_totals = {
                 "input_tokens": max(
@@ -1280,7 +1311,14 @@ class AnthropicProvider(ModelProvider):
       log.warning("Anthropic request rejected during stream: %s; %s", detail, context)
       raise RuntimeError(f"Anthropic request rejected (stage=stream): {detail}; {context}") from None
 
-    yield StreamEvent(type="message_end", stop_reason=stop_reason, stop_details=stop_details)
+    yield StreamEvent(
+      type="message_end",
+      stop_reason=stop_reason,
+      stop_details=stop_details,
+      request_input_tokens=(
+        sum(request_prompt_usage.values()) if "input_tokens" in request_prompt_usage else None
+      ),
+    )
 
   def is_retryable_error(self, exc: Exception) -> bool:
     try:

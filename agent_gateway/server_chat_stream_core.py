@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from time import monotonic
 from typing import Any, AsyncIterator, Callable
 
 from .event_adapter import adapt_event
@@ -154,24 +155,28 @@ async def stream_subscriber_sse(
   wait_for_fn: Callable[..., Any],
   timeout_error: type[BaseException],
   event_for_wire_fn: Callable[[Any, EventLog], dict[str, Any]],
-  write_transcript_fn: Callable[..., None],
+  write_turn_transcript_entry_fn: Callable[..., None],
   adapt_event_fn: Callable[[dict[str, Any], int], dict[str, Any] | None] = adapt_event,
   stream_envelope_fn: Callable[..., dict[str, Any]] = stream_envelope,
   json_dumps_fn: Callable[[Any], str] = _json_dumps,
   default_schema_version: int = DEFAULT_SCHEMA_VERSION,
+  monotonic_fn: Callable[[], float] = monotonic,
 ) -> AsyncIterator[bytes]:
   event_log = active_turn.event_log
+  # Filtered log entries do not count as wire activity.
+  keepalive_deadline = monotonic_fn() + keepalive_seconds
   try:
     while True:
       try:
         item = await wait_for_fn(
           subscriber.queue.get(),
-          timeout=keepalive_seconds,
+          timeout=max(0.0, keepalive_deadline - monotonic_fn()),
         )
       except timeout_error:
         pump_task = subscriber.pump_task
         if pump_task is not None and pump_task.done() and subscriber.disconnect_reason:
           return
+        keepalive_deadline = monotonic_fn() + keepalive_seconds
         yield b":keepalive\n\n"
         continue
 
@@ -181,13 +186,13 @@ async def stream_subscriber_sse(
       entry = item
       subscriber.last_sent_seq = int(entry.seq)
       event = event_for_wire_fn(entry, event_log)
-      entry_seq = int(entry.seq)
-      if write_transcript and entry_seq not in active_turn.transcript_written_seqs:
-        active_turn.transcript_written_seqs.add(entry_seq)
-        write_transcript_fn(
+      if write_transcript:
+        write_turn_transcript_entry_fn(
+          active_turn,
+          int(entry.seq),
+          event,
           transcript_dir=transcript_dir,
           session_id=session.session_id,
-          entry=event,
           user_id=session.user_id,
           channel=channel,
         )
@@ -215,7 +220,9 @@ async def stream_subscriber_sse(
         event=adapted_event,
       )
       try:
-        yield f"data: {json_dumps_fn(envelope)}\n\n".encode("utf-8")
+        chunk = f"data: {json_dumps_fn(envelope)}\n\n".encode("utf-8")
+        keepalive_deadline = monotonic_fn() + keepalive_seconds
+        yield chunk
       except Exception as ser_exc:
         log.error(
           "SSE serialization failed for event type=%s: %s",

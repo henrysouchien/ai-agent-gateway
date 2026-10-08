@@ -6,7 +6,8 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Dict, List, Optional
+from itertools import islice
+from typing import AbstractSet, Any, Callable, Dict, List, Optional
 
 from ..agent_telemetry import make_prepare_env_with_agent_telemetry
 from ..runner import ToolResultContext
@@ -16,7 +17,9 @@ from ..tool_dispatcher import ApprovalKeyQualifier, LocalToolHandler
 from ..tool_policy_registry import PreparedToolCall, ToolInputPreparationError
 from ._background import BackgroundTask, OutputRingBuffer
 from ._backends import DockerBackend, ExecutionBackend, SubprocessBackend
+from ._backends._kernel import KernelBackend, KernelState
 from ._config import CodeExecutionConfig
+from ._frame_reader import CatalogMetadata, CodeCallable, FrameReader, SourceExtractor, SourceKey
 from ._helpers import _boolean_input, _prepare_code_execute_env, _string_input, _timeout_ms_input, code_execute
 from ._hooks import strip_code_execute_base64_hook
 from ._provenance import AGENT_CODE_EXECUTE_WORK_DIR_ENV, collect_computation_sidecars, delete_computation_sidecar_dir
@@ -29,17 +32,50 @@ log = logging.getLogger(__name__)
 class CodeExecutionBundle:
   """Bundle returned by `build_code_execution()`.
 
-  It contains the local handlers, tool schemas, approval helpers, and result
-  sanitization hook needed to plug code execution into a gateway runtime.
+  It contains local handlers, tool schemas, approval helpers, a result hook
+  and the session-owned `frame_reader` used by running cells. Request-scoped
+  bundles share execution state, not dispatcher/configuration authority.
   """
 
   handlers: Dict[str, LocalToolHandler]
   tool_definitions: List[Dict[str, Any]]
   approval_qualifier: ApprovalKeyQualifier
-  needs_approval: Callable[[str, Dict[str, Any] | None, str], bool]
   sanitize_hook: Callable[[ToolResultContext], None]
   ensure_work_dir: Callable[[], str]
   prepare_call: Callable[[Dict[str, Any]], PreparedToolCall]
+  frame_reader: FrameReader
+
+  def bind_dispatcher(
+    self,
+    dispatcher: Any,
+    *,
+    tool_definitions: Callable[[], List[Dict[str, Any]]],
+    extract_sources: SourceExtractor | None = None,
+    source_key: SourceKey | None = None,
+    code_callable: CodeCallable | None = None,
+    catalog_metadata: CatalogMetadata | None = None,
+  ) -> None:
+    """Bind the dispatcher (and its tool catalog) that nested cell calls go through.
+
+    Each request's builder binds its own dispatcher; the latest bind wins, and
+    a cell keeps the binding it opened under.
+    `tool_definitions` is the turn's grant and `code_callable(operation)` the
+    product registration's decision for that exact route; a nested call needs both.
+    `extract_sources(operation, result)` is the product's per-tool source-handle
+    extractor; its handles for successful nested calls become the outer
+    result's `sources`, alongside the canonical dispatch settlement's sources.
+    `source_key` is the citation registry's identity: equal keys are one source.
+    `catalog_metadata` projects the installed route's producer identities;
+    it neither resolves aliases nor grants an operation.
+    """
+    self.frame_reader.bind_dispatcher(
+      dispatcher,
+      tool_definitions=tool_definitions,
+      extract_sources=extract_sources,
+      source_key=source_key,
+      code_callable=code_callable,
+      catalog_metadata=catalog_metadata,
+    )
 
 
 def build_code_execution(
@@ -48,19 +84,29 @@ def build_code_execution(
 ) -> CodeExecutionBundle:
   """Create built-in code execution tools for a session.
 
-  `host=auto` prefers Docker and falls back to subprocess execution when
-  registered; a fallback is logged with the skipped backend's reason, and every
-  result names the backend that ran (`backend`, `sandboxed`, `skipped_backends`).
-  The session stores the persistent work directory and any background tasks
-  created by `code_execute(background=true)`.
+  `host=auto` prefers Docker, then a registered host kernel, then subprocess;
+  skipped backend reasons are logged and returned with the selected backend.
+  Reader, persistent interpreter states, work directory and background tasks
+  belong to the session. Each bundle carries the current request's config.
   """
   cfg = config or CodeExecutionConfig()
+
+  def _session_kernel(name: str) -> KernelState:
+    state = session.code_execution_kernels.get(name)
+    if state is None:
+      state = KernelState()
+      session.code_execution_kernels[name] = state
+    return state
 
   backends: Dict[str, ExecutionBackend] = {}
   if cfg.register_subprocess:
     backends["subprocess"] = SubprocessBackend(config=cfg)
+  if cfg.register_kernel:
+    backends["kernel"] = KernelBackend(config=cfg, state=_session_kernel("kernel"))
   if cfg.register_docker:
-    backends["docker"] = DockerBackend(image=cfg.docker_image or None, config=cfg)
+    backends["docker"] = DockerBackend(
+      image=cfg.docker_image or None, config=cfg, state=_session_kernel("docker"),
+    )
 
   # `host=auto` takes the first backend in this order that can run. Each walk
   # records what it skipped and why, keyed by the backend it settled on, so the
@@ -75,7 +121,7 @@ def build_code_execution(
         return backend
       raise ValueError(f"Unknown backend: '{name}'. Available: {sorted(backends)}")
     skipped: List[Dict[str, Any]] = []
-    for preferred in ("docker", "subprocess"):
+    for preferred in ("docker", "kernel", "subprocess"):
       backend = backends.get(preferred)
       if backend is None:
         continue
@@ -108,6 +154,13 @@ def build_code_execution(
     return list(backends.keys())
 
   work_dir_lock = threading.Lock()
+  if session.code_execution_frame_reader is None:
+    session.code_execution_frame_reader = FrameReader(principal={
+      "user_id": session.user_id,
+      "user_email": session.user_email,
+      "risk_user_id": session.risk_user_id,
+    })
+  frame_reader = session.code_execution_frame_reader
 
   def _ensure_code_execution_work_dir() -> str:
     if session.code_execution_work_dir:
@@ -146,18 +199,45 @@ def build_code_execution(
   ) -> Any:
     """Redact the child's own bytes before they leave this handler.
 
-    A sandbox prints whatever the model told it to print, including a file or
-    an environment this process never handed it, so the producer is where that
-    text stops being raw.
+    A child can print or display a credential read from disk, and errors,
+    sources and sidecars can carry those same bytes. Redact the whole
+    model-visible result, including mapping keys, at this producer boundary.
     """
-
-    if not isinstance(result, dict):
-      return result
-    for field in ("stdout", "stderr", "stdout_tail", "stderr_tail"):
-      value = result.get(field)
+    # Admitted sidecars can be deeper than Python's call stack. Project them
+    # post-order without recursion, preserving containers and mapping keys.
+    pending: list[tuple[Any, bool]] = [(result, False)]
+    values: list[Any] = []
+    while pending:
+      value, expanded = pending.pop()
       if isinstance(value, str):
-        result[field] = redact(value)
-    return result
+        values.append(redact(value))
+      elif isinstance(value, (list, tuple, dict)):
+        if not expanded:
+          pending.append((value, True))
+          if isinstance(value, dict):
+            for key, item in reversed(value.items()):
+              pending.append((item, False))
+              pending.append((key, False))
+          else:
+            pending.extend((item, False) for item in reversed(value))
+          continue
+        count = len(value) * 2 if isinstance(value, dict) else len(value)
+        start = len(values) - count
+        projected: Any
+        if isinstance(value, dict):
+          projected = {
+            values[index]: values[index + 1]
+            for index in range(start, len(values), 2)
+          }
+        elif isinstance(value, tuple):
+          projected = tuple(islice(values, start, None))
+        else:
+          projected = values[start:]
+        del values[start:]
+        values.append(projected)
+      else:
+        values.append(value)
+    return values[0]
 
   def _prepare_config_for_call(
     *,
@@ -188,6 +268,8 @@ def build_code_execution(
     resolved_host = getattr(tool_ctx, "resolved_qualifier", "") if tool_ctx is not None else ""
     if not resolved_host:
       return None, {"code": "internal_error", "message": "Backend resolution failed"}
+    # The outer call every nested `hank.call` of this cell is recorded under.
+    outer_call_id = str(getattr(tool_ctx, "tool_call_id", "") or "")
 
     try:
       backend = _get_backend(resolved_host)
@@ -235,14 +317,22 @@ def build_code_execution(
           return
         stdout_buf.append(stream_name, text)
 
-      handle = await backend.start(
-        code,
-        work_dir,
-        task_id=task_id,
-        timeout_ms=timeout_ms,
-        env=env,
-        on_output=_on_bg_output,
-      )
+      # A background cell outlives this turn; its own cancellation closes the
+      # registration while the session's interpreter remains available.
+      cell = frame_reader.open_cell(outer_call_id, abort_event=None, active=False)
+      try:
+        handle = await backend.start_bridged(
+          code,
+          work_dir,
+          bridge=cell,
+          task_id=task_id,
+          timeout_ms=timeout_ms,
+          env=env,
+          on_output=_on_bg_output,
+        )
+      except BaseException:
+        await cell.aclose()
+        raise
       session.background_tasks[task_id] = BackgroundTask(
         task_id=task_id,
         handle=handle,
@@ -251,6 +341,7 @@ def build_code_execution(
         stderr_buf=stderr_buf,
         started_at=time.time(),
         tool_call_id=getattr(tool_ctx, "tool_call_id", None),
+        bridge=cell,
       )
       return {
         "status": "running",
@@ -277,15 +368,25 @@ def build_code_execution(
         }
       )
 
-    result, error = await code_execute(
-      tool_input,
-      session_work_dir=work_dir,
-      on_output=_on_chunk,
-      backend=backend,
-      config=per_call_config,
+    cell = frame_reader.open_cell(
+      outer_call_id,
+      abort_event=getattr(tool_ctx, "abort_event", None),
+      active=False,
     )
+    try:
+      result, error = await code_execute(
+        tool_input,
+        session_work_dir=work_dir,
+        on_output=_on_chunk,
+        backend=backend,
+        config=per_call_config,
+        bridge=cell,
+      )
+    finally:
+      await cell.aclose()
     if result is not None:
       result.update(_backend_identity(host, backend))
+      result.update(cell.summary())
     if result is not None and tool_ctx is not None:
       collect_computation_sidecars(
         result,
@@ -377,26 +478,6 @@ def build_code_execution(
     except (RuntimeError, ValueError):
       return ""
 
-  def _code_execute_input_will_fail_validation(tool_input: Dict[str, Any] | None) -> bool:
-    if not isinstance(tool_input, dict):
-      return True
-    host, error = _string_input(tool_input, "host", default="auto")
-    if error is not None or host not in {"auto", *set(_get_registered_backend_names())}:
-      return True
-    _, error = _boolean_input(tool_input, "background", default=False)
-    if error is not None:
-      return True
-    _, error = _string_input(
-      tool_input,
-      "code",
-      required_message="code is required",
-      non_empty=True,
-    )
-    if error is not None:
-      return True
-    _, error = _timeout_ms_input(tool_input, cfg)
-    return error is not None
-
   def _prepare_call(raw_input: Dict[str, Any]) -> PreparedToolCall:
     if not isinstance(raw_input, dict):
       raise ToolInputPreparationError({
@@ -449,22 +530,10 @@ def build_code_execution(
       })
     return PreparedToolCall(prepared, backend.name)
 
-  def _needs_approval(
-    tool_name: str,
-    tool_input: Dict[str, Any] | None = None,
-    qualifier: str = "",
-  ) -> bool:
-    if tool_name != "code_execute":
-      return False
-    if _code_execute_input_will_fail_validation(tool_input):
-      return False
-    if qualifier:
-      try:
-        return not _get_backend(qualifier).sandboxed
-      except (RuntimeError, ValueError):
-        return True
-    return True
-
+  # No approval door on `code_execute` (it asked whenever the backend was
+  # unsandboxed): posture decides whether the subprocess backend is registered
+  # at all (`CodeExecutionConfig.register_subprocess`), so a registered
+  # backend runs without a card.
   available_hosts = ("auto",) + tuple(_get_registered_backend_names())
   return CodeExecutionBundle(
     handlers={
@@ -476,8 +545,43 @@ def build_code_execution(
       make_code_execute_status_tool_def(),
     ],
     approval_qualifier=_approval_qualifier,
-    needs_approval=_needs_approval,
     sanitize_hook=strip_code_execute_base64_hook,
     ensure_work_dir=_ensure_code_execution_work_dir,
     prepare_call=_prepare_call,
+    frame_reader=frame_reader,
   )
+
+
+_docker_availability_cache: Dict[Optional[str], tuple[Optional[str], float]] = {}
+_docker_availability_lock = threading.Lock()
+
+
+def docker_backend_unavailable_reason(
+  config: CodeExecutionConfig | None = None,
+  *,
+  ttl_s: float = 15.0,
+) -> Optional[str]:
+  """Why the Docker backend `config` names cannot run, or `None` when it can.
+
+  Read-only: builds the same `DockerBackend` `build_code_execution` registers
+  and returns its `unavailable_reason()` (`docker` on PATH plus a `docker image
+  inspect` with a 3 s timeout). The answer is memoised per image name for
+  `ttl_s` seconds so one turn does not pay the inspect twice.
+  """
+  cfg = config or CodeExecutionConfig()
+  image = cfg.docker_image or None
+  now = time.monotonic()
+  with _docker_availability_lock:
+    cached = _docker_availability_cache.get(image)
+    if cached is not None and cached[1] > now:
+      return cached[0]
+  reason = DockerBackend(image=image, config=cfg).unavailable_reason()
+  with _docker_availability_lock:
+    _docker_availability_cache[image] = (reason, time.monotonic() + ttl_s)
+  return reason
+
+
+def clear_docker_availability_cache() -> None:
+  """Forget every memoised Docker availability answer."""
+  with _docker_availability_lock:
+    _docker_availability_cache.clear()

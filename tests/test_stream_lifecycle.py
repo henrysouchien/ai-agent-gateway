@@ -196,7 +196,6 @@ class _ObservedAgentRunner(AgentRunner):
     self,
     messages: list[dict[str, Any]],
     system_prompt: str | list[tuple[str, bool]] | None = None,
-    max_turns: int | None = None,
     *,
     resume_initial_messages=None,
   ) -> None:
@@ -204,7 +203,6 @@ class _ObservedAgentRunner(AgentRunner):
       await super().run(
         messages=messages,
         system_prompt=system_prompt,
-        max_turns=max_turns,
         resume_initial_messages=resume_initial_messages,
       )
     except asyncio.CancelledError:
@@ -1226,7 +1224,7 @@ def test_normal_stream_completion_unchanged(make_test_app) -> None:
   _run(case())
 
 
-def test_retired_normalizer_purpose_is_rejected_before_runtime(
+def test_normalizer_purpose_is_admitted_on_chat(
   make_test_app,
 ) -> None:
   async def case() -> None:
@@ -1258,20 +1256,17 @@ def test_retired_normalizer_purpose_is_rejected_before_runtime(
       payload = _chat_payload()
       payload["context"]["purpose"] = "normalizer"
 
-      response = await client.post(
+      async with client.stream(
+        "POST",
         "/api/chat",
         headers={"Authorization": f"Bearer {session_info['session_token']}"},
         json=payload,
-      )
+      ) as response:
+        assert response.status_code == 200
+        events = await _collect_sse_events(response)
 
-    assert response.status_code == 400
-    assert response.json() == {
-      "error": "purpose_unavailable",
-      "message": "The normalizer chat purpose is unavailable.",
-    }
-    assert app.state.test_state.session is None
-    assert session.purpose is None
-    assert provider.tool_names == []
+    assert "stream_complete" in [event.get("type") for event in events]
+    assert session.purpose == "normalizer"
 
   _run(case())
 
@@ -1575,7 +1570,6 @@ def test_credential_rotation_retries_stream_with_new_auth_config(monkeypatch: py
     await runner.run(
       messages=[{"role": "user", "content": "hello"}],
       system_prompt="test",
-      max_turns=1,
     )
 
     events = [entry.event for entry in event_log.entries]
@@ -1944,14 +1938,12 @@ class _HoldingAfterTerminalRunner(AgentRunner):
     self,
     messages: list[dict[str, Any]],
     system_prompt: str | list[tuple[str, bool]] | None = None,
-    max_turns: int | None = None,
     *,
     resume_initial_messages=None,
   ) -> None:
     await super().run(
       messages=messages,
       system_prompt=system_prompt,
-      max_turns=max_turns,
       resume_initial_messages=resume_initial_messages,
     )
     if type(self).holds:
@@ -1978,14 +1970,27 @@ def test_next_turn_streams_while_the_previous_turn_is_still_settling(
       session_info = await _init_session(client)
       headers = {"Authorization": f"Bearer {session_info['session_token']}"}
 
-      async with client.stream("POST", "/api/chat", headers=headers, json=_chat_payload()) as first:
-        assert first.status_code == 200
-        first_events = await _collect_sse_events(first)
-      assert any(event.get("type") == "stream_complete" for event in first_events)
+      first_events: list[dict[str, Any]] = []
 
-      session = app.state.auth.session_store.get_session(session_info["session_id"])
-      assert session.active_turn is not None
+      async def first_turn() -> None:
+        async with client.stream("POST", "/api/chat", headers=headers, json=_chat_payload()) as first:
+          assert first.status_code == 200
+          first_events.extend(await _collect_sse_events(first))
+
+      # The chat log stays open past its terminal while the turn drains, so the
+      # first response ends only when the turn does; the ASGI transport buffers
+      # the whole body, so the terminal is observed on the session's log.
+      first_task = asyncio.ensure_future(first_turn())
+      session = None
+      for _ in range(500):
+        session = app.state.auth.session_store.get_session(session_info["session_id"])
+        if session.active_turn is not None and session.active_turn.event_log.has_terminal:
+          break
+        await asyncio.sleep(0.01)
+      assert session is not None and session.active_turn is not None
+      assert session.active_turn.event_log.has_terminal
       assert not session.active_turn.settled.is_set()
+      assert not first_task.done()
 
       second_status: list[int] = []
       second_events: list[dict[str, Any]] = []
@@ -2000,7 +2005,8 @@ def test_next_turn_streams_while_the_previous_turn_is_still_settling(
       assert not follow_up.done(), "the follow-up answered before the previous turn released the session"
 
       drain.set()
-      await asyncio.wait_for(follow_up, timeout=5.0)
+      await asyncio.wait_for(asyncio.gather(first_task, follow_up), timeout=5.0)
+      assert any(event.get("type") == "stream_complete" for event in first_events)
 
       assert second_status == [200]
       second_types = [event.get("type") for event in second_events]
@@ -2012,6 +2018,67 @@ def test_next_turn_streams_while_the_previous_turn_is_still_settling(
       transcript_types = [entry.get("type") for entry in transcript]
       assert transcript_types.count("chat_request") == 2
       assert transcript_types.count("stream_complete") == 2
+
+      await _expire_session_and_shutdown_bus(app, session_info["session_id"])
+
+  _run(case())
+
+
+class _TrailingRecordRunner(AgentRunner):
+  """Writes a citation record after its terminal, like a late validation."""
+
+  async def run(
+    self,
+    messages: list[dict[str, Any]],
+    system_prompt: str | list[tuple[str, bool]] | None = None,
+    *,
+    resume_initial_messages=None,
+  ) -> None:
+    await super().run(
+      messages=messages,
+      system_prompt=system_prompt,
+      resume_initial_messages=resume_initial_messages,
+    )
+    await asyncio.sleep(0.01)
+    self._log.append({
+      "type": "citation_validation",
+      "schema_version": 1,
+      "turn": 1,
+      "violations": [],
+      "violation_count": 0,
+    })
+
+
+def test_chat_record_after_terminal_reaches_stream_and_transcript(
+  make_test_app,
+  tmp_path: Path,
+) -> None:
+  async def case() -> None:
+    app = make_test_app(
+      provider=_CompletingProvider(text="answer"),
+      runner_class=_TrailingRecordRunner,
+      transcript_dir=tmp_path,
+    )
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      headers = {"Authorization": f"Bearer {session_info['session_token']}"}
+      async with client.stream("POST", "/api/chat", headers=headers, json=_chat_payload()) as response:
+        assert response.status_code == 200
+        events = await _collect_sse_events(response)
+
+      stream_types = [event.get("type") for event in events]
+      assert stream_types[-2:] == ["stream_complete", "citation_validation"]
+      session = app.state.auth.session_store.get_session(session_info["session_id"])
+      assert session.active_turn is not None
+      assert session.active_turn.event_log.closed is True
+
+      transcript_path = tmp_path / f"{session_info['session_id']}.jsonl"
+      transcript_types = [
+        json.loads(line).get("type")
+        for line in transcript_path.read_text(encoding="utf-8").splitlines()
+      ]
+      assert transcript_types[-2:] == ["stream_complete", "citation_validation"]
 
       await _expire_session_and_shutdown_bus(app, session_info["session_id"])
 

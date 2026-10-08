@@ -52,6 +52,25 @@ interruption/detach; attach recovery also includes calls not yet dispatched.
 An interrupted result reports missing completion, not that side effects were
 rolled back. `SessionContextBuilder` replays each batch as one user message
 with all tool results before supplemental text, matching the live tool loop.
+Replay is parent-only: entries whose envelope `role` is `sub_agent` are
+excluded. There is no tail budget or time window. After the tail is flattened,
+`truncate_to_last_compaction` starts at the last assistant message holding a
+`{type: "compaction"}` block.
+
+A session's durable log outlives its TTL and the process. Every attach records
+the log's owner (`user_id`, `channel`, `api_key_hash` of the writing session).
+`POST /api/chat/init` with `resume_session_id` mints a new session (new id,
+token and TTL, fresh credential bind) and asks the application's
+`session_resume_resolver` for the caller's own log for that id: it checks only
+the caller's filename and requires the log's first attach to name the resolved
+caller. A caller's idle session still holding that log is expired as the new
+one binds. A refusal is HTTP 409 `{"error": "session_resume_refused",
+"reason": ...}` — `not_found` (including a log owned by someone else),
+`ambiguous`, `no_ownership_record`, or `in_use` (the holding session is mid-turn)
+— and registers no session and touches no file. On success the response echoes
+`resumed_from_session_id`, the session carries `resume_log_path`, and the
+next turn appends to and replays that log. A log keeps its first session's id,
+so every later resume presents that id.
 
 ## Core Concepts
 
@@ -185,7 +204,7 @@ Use it when you need:
 - a `build_runner` callback
 - a tool-definition callback
 - the exact `session.driver` `BoundCapabilityExecution`
-- request-scoped limits such as `max_turns`
+- request-scoped hooks and settings such as `on_usage` and `compaction_trigger`
 
 ### `AgentRunner`
 
@@ -197,7 +216,10 @@ Use it when you need:
 - appends SSE-facing events
 - tracks usage and estimated cost
 - retries transient stream failures
-- stops on budgets or max-turn limits
+- runs the one soft-budget ladder (`runner_soft_budget`) on a delegated run:
+  steer at `SOFT_TURN_BUDGET`, forced final at 1.5×, and an abort only when the
+  child still has not answered after the grace turns; a primary run has no
+  ladder, and cost is a measurement, never a stop
 
 ## Tool Dispatch
 
@@ -261,7 +283,7 @@ refresh, near broker expiry, changed credential binding, dead transport), by
 instance-cap eviction, or by a transport failure on a dispatch. Retirement
 removes the child from the per-user map first, so no further caller can obtain
 it, and then waits for its in-flight calls to finish before the host closes it —
-with no deadline, since every tool call already carries its own timeout. Manager
+with no deadline: a tool call ends at its result or its caller's abort. Manager
 shutdown does not drain: it drops the pending drains and closes every live host
 at once. Each close logs the server, the user and the site that closed it. A
 close is only ever a request, never a cancellation of the host and never a
@@ -319,7 +341,7 @@ Flow:
 4. The client calls `/api/chat/tool-approval`
 5. The dispatcher resumes or returns a `user_denied` / `approval_timeout` error
 
-`allow_tool_type=true` stores a session-scoped approval key so later calls of the same tool type can skip the prompt.
+There is no session approval cache: each approval decides one call. `allow_tool_type=true` requests a persistent grant, which only an approval policy that permits grants mints.
 
 Important nuance:
 
@@ -328,22 +350,22 @@ Important nuance:
 
 ### Persistent grants and per-call authorization
 
-A persistent grant is eligibility to mint authorization for a new invocation; it is not itself executable authority. The default policy looks up an active grant by exact `user_id`, tool name, and derived scope hint. A finite `expires_at` and revocation close that lookup. When a grant matches, the gateway still creates a new durable approval request for the invocation and records `authorization_mode=PERSISTENT_GRANT` plus the source grant ID in `grant_reference`.
+A persistent grant is eligibility to mint authorization for a new invocation; it is not itself executable authority. The default `SingleUserApprovalPolicy` neither looks up nor mints grants: it asks a human only for the `irreversible` class (a live order), decides every such call fresh with `allow_persistent_grant=False`, and auto-approves every other class. The store keeps grant rows and their revocation path (`revoke_persistent_grant`) for existing rows and for a custom policy (`GATEWAY_APPROVAL_POLICY_CLASS`). A custom policy that matches a grant returns its ID as `grant_reference`; the gateway still creates a new durable approval request for the invocation and records `authorization_mode=PERSISTENT_GRANT` plus that ID in `grant_reference`.
 
 The per-call row binds the current actor, tool, redacted argument projection and argument hash, policy identity, and request context. For exact-planned tools, the row also binds the current plan/change identity; the trusted carrier separately proves that identity is linked to the prepared payload. The dispatcher revalidates the row against the carrier immediately before execution. For FMS ChangeSet writes, the effect interpreter rechecks the live base before the first effect. A grant therefore never authorizes reuse of a prior plan or bypasses the current validation owned by an exact executor.
 
-Current grant matching has two deliberate facts and one known limitation:
+A custom policy that reuses grants owns its matching; the store gives it these facts:
 
-- The default scope hint includes the tool class, tool name, and the first available `ticker`, `symbol`, `portfolio_id`, or `account_id`. The reminted approval and execution authorization carry the current tenant context, but the persistent-grant lookup key itself is not tenant-keyed.
-- `args_predicate` is persisted on a grant, but `SingleUserApprovalPolicy` does not currently evaluate it during persistent-grant lookup. It is stored metadata, not an active authorization boundary in the default policy. Tightening this would change which existing grants are accepted and requires a separately reviewed compatibility and policy decision.
-- Revocation is linearized by the active-grant lookup. A revocation committed before that query prevents the match. Once lookup has returned a grant, a later revocation prevents future matches but does not retract the per-call decision already in progress.
+- The scope hint is whatever the policy returns as `persistent_grant_scope_hint`; the reminted approval and execution authorization carry the current tenant context, but the grant lookup key (`user_id`, tool name, scope hint) is not tenant-keyed.
+- `args_predicate` is persisted on a grant but evaluated only by a policy that chooses to; it is stored metadata, not an authorization boundary the store enforces.
+- Revocation is linearized by the active-grant lookup (`find_persistent_grant`). A revocation committed before that query prevents the match. Once lookup has returned a grant, a later revocation prevents future matches but does not retract the per-call decision already in progress.
 
 Grant lifetime and invocation lifetime are separate:
 
 | Record | Current time semantics |
 | --- | --- |
-| Persistent grant | `expires_at=NULL` means indefinite until revoked. Ordinary grant creation currently writes `NULL`; a finite timestamp, when supplied, is enforced at lookup. |
-| Default human prompt | The policy requests 600 seconds. The lifecycle may reduce the effective window, notably to stay within a trade preview's lifetime, and stores the resulting expiry on the pending row. |
+| Persistent grant | `expires_at=NULL` means indefinite until revoked. Grant creation on approval writes `NULL`; a finite timestamp, when supplied, is enforced at lookup. |
+| Default human prompt | The policy requests 600 seconds for a live order. The lifecycle may reduce the effective window, notably to stay within a trade preview's lifetime, and stores the resulting expiry on the pending row. |
 | Prepared BusinessModel approval | A missing per-call expiry is replaced with a 15-minute expiry before the prepared row is stored. |
 | Generic grant-reminted approval | May retain `expires_at=NULL`. That means no approval-row time deadline; argument/identity, exact-plan, proposal TTL, and live-base checks still apply where those contracts exist. |
 
@@ -356,7 +378,6 @@ Sessions are first-class runtime state.
 `GatewaySession` (module `agent_gateway.session`) currently tracks:
 
 - `pending_tools`
-- `approved_tool_types`
 - `loaded_mcp_servers`
 - `approval_queues`
 - code execution work directory
@@ -364,7 +385,7 @@ Sessions are first-class runtime state.
 - whether a stream is already active (`stream_active` / `active_turn`)
 - session kind (`chat` vs `control`)
 
-`AuthManager` issues and verifies JWT session tokens. `SessionStore` owns TTL, cleanup, and expiry hooks. Token verification, cleanup, the visible-session snapshot and turn admission all read the TTL through one predicate, `session_ttl_elapsed` (`SessionStore.ttl_elapsed` by session id): a session holding a turn that has not published its terminal event is live past its `expires_at`, because that turn's own tool calls authenticate with the session's token. A new turn is admitted only if the TTL has not elapsed at the moment it attaches, so an expired session cannot start one, even with a token accepted while the previous turn was still answering.
+`AuthManager` issues and verifies JWT session tokens. `SessionStore` owns TTL, cleanup, and expiry hooks. Token validity is one predicate, `session_ttl_elapsed` (`SessionStore.ttl_elapsed` by session id), read by token verification, cleanup and the visible-session snapshot: a session holding a unit of work in progress — a turn that has not published its terminal event, or a batch admitted on its token that has neither finished nor been cancelled (`BatchTaskRegistry` records and clears it on `admitted_batches`) — is live past its `expires_at`, because that work's own tool calls authenticate with the session's token. Turn admission is a second predicate, `session_admits_new_turn`, read by `_dispatch_chat_turn_body` with no await before the attach: a new turn starts only before `expires_at` (a running turn is refused earlier with 409, so in-progress work never widens admission). An admitted batch keeps the token valid but does not extend admission, so an expired session cannot start a turn, even with a token accepted while the previous turn or a batch it dispatched was still running.
 
 This matters because approvals, code execution state, and loaded MCP servers are all session-scoped, not global.
 
@@ -399,7 +420,7 @@ A `ToolInterceptor` returns an `InterceptDecision` with:
 
 Warnings are attached to successful tool results. Denials stop the tool before it runs and emit `interceptor_decision` events.
 
-If an interceptor has `__intercept_critical__ = True` and throws, the dispatcher fails closed and blocks the tool.
+An interceptor that throws is logged and the tool proceeds; an interceptor that holds an invariant returns its own `deny`.
 
 ## Code Execution
 
@@ -413,7 +434,7 @@ It also returns:
 - local handlers
 - tool definitions
 - approval qualifier logic
-- approval predicate
+- the prepared-call hook and work-directory helper
 - a result-sanitization hook
 
 Backend selection:
@@ -452,11 +473,10 @@ When `skills_dir` is configured:
 Sub-agents are intentionally constrained:
 
 - they get their own runner and event log
-- they use one immutable capability bind; for a named operation, the registered
-  skill profile's finite budget is frozen into the immutable execution snapshot
-  and enforced again on durable resume
-- unnamed delegation keeps the legacy observation-only cost accumulator, and
-  `run_agent` has no model-authored hard-budget input
+- they use one immutable capability bind; a named operation declares no turn or
+  cost limit, and every child meets the one soft turn ladder
+- cost is recorded on the child's `CostAccumulator` as a measurement, and
+  `run_agent` has no model-authored budget input
 - they cannot recursively spawn more sub-agents because `run_agent` is excluded by default
 
 ### Background Sub-Agents

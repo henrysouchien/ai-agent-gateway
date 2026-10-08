@@ -19,6 +19,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, Body, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationInfo, field_validator, model_validator
 
+from agent_gateway.admission import ParentContext, root_context, root_context_from_identity
+from agent_gateway.approval_route import ControlPlaneApprovalRoute
+from agent_workflow_contracts.models import AdmittedResearchBinding, AdmittedTenant
+from agent_gateway.autonomous_capability_handoff import AutonomousLaunchAdmissionRefused
 from agent_gateway.artifact_paths import user_data_dir
 from agent_gateway.autonomous_runner import AutonomousRegistry
 from agent_gateway.session import AuthManager, GatewaySession
@@ -45,6 +49,10 @@ _SCHEDULE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _TIME_OF_DAY_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 _TICKER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-]{0,31}$")
 _AGENT_SCHEDULE_POLL_INTERVAL_ENV = "AGENT_GATEWAY_AGENT_RUN_SCHEDULE_POLL_SECONDS"
+# A claim is the in-flight lease one firer holds between claim_due_record and
+# record_fire_result: while it is younger than this window no other poll loop
+# may claim the same schedule (two firers would double-start one due run); once
+# older, the claim is treated as an abandoned crashed firer and taken over.
 _AGENT_SCHEDULE_CLAIM_STALE_AFTER_SECONDS = 15 * 60
 _WEB_SAFE_SCHEDULE_FIELDS = frozenset({
   "schedule_id",
@@ -62,6 +70,7 @@ _WEB_SAFE_SCHEDULE_FIELDS = frozenset({
   "last_run_id",
   "last_status",
   "last_error",
+  "last_fire_warning",
   "schedule_description",
   "description",
   "cadence_summary",
@@ -80,6 +89,7 @@ _WEB_SAFE_SCHEDULE_FIELDS = frozenset({
   "can_run_now",
   "cadence",
   "dispatch",
+  "dispatch_text_lengths",
 })
 
 
@@ -107,6 +117,8 @@ def _parse_utc_datetime(value: Any) -> datetime | None:
 
 
 def _user_data_dir(owner_user_id: object) -> Path:
+  # A user id is a path segment: user A's store must never resolve into user
+  # B's directory or outside the data root, so traversal segments are refused.
   normalized = str(owner_user_id or "").strip()
   if not normalized:
     raise ValueError("user_id is required for per-user store access")
@@ -255,8 +267,6 @@ class AgentRunScheduleDispatch(BaseModel):
       return value
     if not value.strip():
       raise ValueError(f"{info.field_name} must be omitted, null, or a non-empty string")
-    if len(value) > 128:
-      raise ValueError(f"{info.field_name} must be 128 characters or fewer")
     return value
 
   @field_validator("ticker")
@@ -275,8 +285,6 @@ class AgentRunScheduleDispatch(BaseModel):
       return value
     if not value.strip():
       raise ValueError("task must be omitted, null, or a non-empty string")
-    if len(value) > 2000:
-      raise ValueError("task must be 2000 characters or fewer")
     return value
 
   @field_validator("context")
@@ -286,8 +294,6 @@ class AgentRunScheduleDispatch(BaseModel):
       return value
     if not value.strip():
       raise ValueError("context must be omitted, null, or a non-empty string")
-    if len(value) > 8000:
-      raise ValueError("context must be 8000 characters or fewer")
     return value
 
   @model_validator(mode="after")
@@ -342,11 +348,11 @@ class CreateAgentRunScheduleRequest(BaseModel):
   @field_validator("timezone")
   @classmethod
   def _validate_timezone(cls, value: str) -> str:
-    if not value.strip() or len(value) > 64:
+    if not value.strip():
       raise ValueError("timezone must be a non-empty IANA timezone")
     try:
       ZoneInfo(value)
-    except ZoneInfoNotFoundError as exc:
+    except (ZoneInfoNotFoundError, OSError) as exc:
       raise ValueError("timezone must be a valid IANA timezone") from exc
     return value
 
@@ -455,18 +461,6 @@ class ScheduleDeleteResponse(BaseModel):
   source: ScheduleSource | AgentScheduleSource
 
 
-class CreateLaunchdScheduleRequest(BaseModel):
-  model_config = ConfigDict(extra="forbid")
-
-  source: Literal["launchd"]
-  name: str = Field(..., min_length=1)
-  command: list[str] = Field(..., min_length=1)
-  schedule: dict[str, Any] | list[dict[str, Any]]
-  working_directory: str = Field(..., min_length=1)
-  log_file: str | None = None
-  comment: str | None = None
-
-
 class CreateJobsMcpScheduleRequest(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
@@ -482,7 +476,7 @@ class CreateJobsMcpScheduleRequest(BaseModel):
 
 
 CreateScheduleRequest = Annotated[
-  Union[CreateLaunchdScheduleRequest, CreateJobsMcpScheduleRequest, CreateAgentRunScheduleRequest],
+  Union[CreateJobsMcpScheduleRequest, CreateAgentRunScheduleRequest],
   Body(),
 ]
 
@@ -590,6 +584,15 @@ def _request_body_hash(value: dict[str, Any]) -> str:
   return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _dispatch_text_lengths(dispatch: dict[str, Any]) -> dict[str, int]:
+  return {
+    field: len(value)
+    for field in ("profile", "skill", "task", "context")
+    if isinstance(value := dispatch.get(field), str)
+  }
+
+
+
 class ScheduleStoreUnreadableError(RuntimeError):
   def __init__(self, path: Path, cause: BaseException) -> None:
     self.path = path
@@ -646,13 +649,18 @@ class AgentRunScheduleStore:
         self.path.read_text(encoding="utf-8"),
         object_pairs_hook=_reject_duplicate_keys,
       )
+      # A payload this loader cannot read is corruption: the store is left
+      # untouched and this user's schedules are skipped rather than overwritten,
+      # because saving over it would destroy the user's schedules.
       if not isinstance(payload, dict):
         raise ValueError("payload must be a JSON object")
-      if "version" not in payload:
-        raise ValueError("version is required")
-      version = payload["version"]
+      version = payload.get("version")
       if type(version) is not int or version != 1:
-        raise ValueError("version must be the integer 1")
+        logger.warning(
+          "Schedule store %s has version %r; reading it as version 1",
+          self.path,
+          version,
+        )
       if "schedules" not in payload:
         raise ValueError("schedules is required")
       schedules = payload["schedules"]
@@ -735,6 +743,7 @@ class AgentRunScheduleStore:
     now = _utc_now()
     enabled = payload.enabled if payload.enabled is not None else True
     cadence_payload = payload.cadence.model_dump(mode="json", exclude_none=True)
+    dispatch_payload = payload.dispatch.model_dump(mode="json", exclude_none=True)
     record = {
       "schedule_id": f"sched_{secrets.token_hex(8)}",
       "id": None,
@@ -744,7 +753,8 @@ class AgentRunScheduleStore:
       "enabled": enabled,
       "timezone": payload.timezone,
       "cadence": cadence_payload,
-      "dispatch": payload.dispatch.model_dump(mode="json", exclude_none=True),
+      "dispatch": dispatch_payload,
+      "dispatch_text_lengths": _dispatch_text_lengths(dispatch_payload),
       "owner_user_id": owner_user_id,
       "dispatch_role": dispatch_role,
       "dispatch_revision": 1,
@@ -815,6 +825,7 @@ class AgentRunScheduleStore:
       record["cadence"] = payload.cadence.model_dump(mode="json", exclude_none=True)
     if payload.dispatch is not None:
       record["dispatch"] = payload.dispatch.model_dump(mode="json", exclude_none=True)
+      record["dispatch_text_lengths"] = _dispatch_text_lengths(record["dispatch"])
       revision = record.get("dispatch_revision")
       record["dispatch_revision"] = (
         revision + 1
@@ -823,18 +834,12 @@ class AgentRunScheduleStore:
       )
       record["dispatch_role"] = exact_live_role
       record["dispatch_authored_by"] = owner_user_id
-    if (
-      payload.enabled is True
-      and record.get("enabled") is False
-      and record.get("dispatch_role") != exact_live_role
-    ):
-      raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail={
-          "error": "schedule_dispatch_role_mismatch",
-          "message": "Re-submit the dispatch under the current role before enabling it.",
-        },
-      )
+    # The fire runs under the stored dispatch_role, so enabling records the
+    # enabling session's live role exactly as a dispatch PATCH does: arming a
+    # schedule never carries authority the enabling session does not hold.
+    if payload.enabled is True and record.get("enabled") is False:
+      record["dispatch_role"] = exact_live_role
+      record["dispatch_authored_by"] = owner_user_id
     if payload.enabled is not None:
       record["enabled"] = payload.enabled
     record["updated_by"] = updated_by
@@ -947,6 +952,7 @@ class AgentRunScheduleStore:
     run_id: str | None,
     status_text: str,
     error: str | None = None,
+    warning: str | None = None,
     fired_at: datetime | None = None,
     claim_id: str | None = None,
     advance_next_run: bool = True,
@@ -969,6 +975,10 @@ class AgentRunScheduleStore:
         record["last_error"] = error
       else:
         record.pop("last_error", None)
+      if warning:
+        record["last_fire_warning"] = warning
+      else:
+        record.pop("last_fire_warning", None)
       if advance_next_run:
         try:
           record["next_run_at"] = compute_agent_schedule_next_run_at(
@@ -996,7 +1006,6 @@ class AgentRunScheduleRunner:
     store_for: Callable[[object], AgentRunScheduleStore] = schedule_store_for,
     users_root: Path | None = None,
     autonomous_registry: AutonomousRegistry,
-    profile_loader: Callable[[str], Any] | None = None,
     user_event_bus_factory: Callable[[], Any | None] | None = None,
     poll_interval_seconds: float | None = None,
   ) -> None:
@@ -1004,7 +1013,6 @@ class AgentRunScheduleRunner:
     self.users_root = users_root or agent_run_schedule_users_root()
     self._stores_by_path: dict[Path, AgentRunScheduleStore] = {}
     self.autonomous_registry: AutonomousRegistry = autonomous_registry
-    self.profile_loader = profile_loader
     self.user_event_bus_factory = user_event_bus_factory
     self.poll_interval_seconds = (
       poll_interval_seconds
@@ -1013,16 +1021,6 @@ class AgentRunScheduleRunner:
     )
     self._task: asyncio.Task[Any] | None = None
     self._stopped = asyncio.Event()
-
-  def _require_autonomous_profile(self, profile_name: str) -> None:
-    if self.profile_loader is None:
-      return
-    try:
-      profile = self.profile_loader(profile_name)
-    except Exception as exc:
-      raise ValueError(f"Unknown autonomous profile: {profile_name}") from exc
-    if not profile.supports_autonomous_execution:
-      raise ValueError(f"Profile {profile_name!r} is interactive-only")
 
   def _configured_poll_interval_seconds(self) -> float:
     raw = os.getenv(_AGENT_SCHEDULE_POLL_INTERVAL_ENV, "").strip()
@@ -1083,7 +1081,7 @@ class AgentRunScheduleRunner:
         result = await self._fire_record(
           store,
           claimed,
-          role=claimed.get("dispatch_role"),
+          live_role=None,
           now=now,
           claim_id=claim_id,
         )
@@ -1120,6 +1118,7 @@ class AgentRunScheduleRunner:
     record: dict[str, Any],
     *,
     live_role: str,
+    parent: ParentContext | None = None,
     now: datetime | None = None,
   ) -> dict[str, Any] | None:
     exact_live_role = require_exact_role(live_role)
@@ -1127,7 +1126,8 @@ class AgentRunScheduleRunner:
     return await self._fire_record(
       store,
       record,
-      role=exact_live_role,
+      live_role=exact_live_role,
+      parent=parent,
       now=now,
       claim_id=None,
       advance_next_run=False,
@@ -1138,7 +1138,8 @@ class AgentRunScheduleRunner:
     store: AgentRunScheduleStore,
     record: dict[str, Any],
     *,
-    role: object,
+    live_role: Literal["owner", "invite"] | None,
+    parent: ParentContext | None = None,
     now: datetime | None = None,
     claim_id: str | None = None,
     advance_next_run: bool = True,
@@ -1147,28 +1148,43 @@ class AgentRunScheduleRunner:
     schedule_id = str(record.get("schedule_id") or "")
     if not schedule_id:
       return None
-    try:
-      dispatch_role = require_exact_role(role)
-    except ValueError:
-      # A stored schedule that predates the role plane carries no dispatch_role.
-      # Owner is the only role that can own a schedule store, so adopt it and
-      # run the work loudly rather than failing the fire and advancing
-      # next_run — that silently retires real queued work forever.
-      logger.warning(
-        "Schedule %s has no attested dispatch role (%r); dispatching as owner",
-        schedule_id,
-        role,
-      )
-      dispatch_role = "owner"
+    warning: str | None = None
+    user_id = str(record.get("raw_user_id") or record.get("owner_user_id") or "")
+    user_email = record.get("user_email") if isinstance(record.get("user_email"), str) else None
+    if live_role is not None:
+      dispatch_role = live_role
+    else:
+      # A schedule fires with no more authority than its author's live session
+      # role. dispatch_role is unattested JSON in the user store, so it is honoured
+      # only up to the role the session plane assigns this user now (the live
+      # GATEWAY_USER_KEYS entry spawn already reads); a stored role above that, or
+      # none, fires as invite and the gap is recorded.
+      stored_role = record.get("dispatch_role")
+      roster_role = registry.live_user_role(user_id, user_email)
+      if stored_role == "owner" and roster_role == "owner":
+        dispatch_role = "owner"
+      elif stored_role == "invite":
+        dispatch_role = "invite"
+      else:
+        warning = (
+          f"Stored dispatch_role 'owner' exceeds the owner's live role ({roster_role!r}); "
+          "fired as invite."
+          if stored_role == "owner"
+          else f"Stored schedule has no valid dispatch_role ({stored_role!r}); fired as invite. "
+          "Re-submit the dispatch to record its authoring role."
+        )
+        logger.warning("Schedule %s: %s", schedule_id, warning)
+        dispatch_role = "invite"
     dispatch = record.get("dispatch")
     if not isinstance(dispatch, dict):
-      result: dict[str, str | bool] = {"schedule_id": schedule_id, "status": "failed", "error": "Schedule dispatch is missing"}
+      result: dict[str, Any] = {"schedule_id": schedule_id, "status": "failed", "error": "Schedule dispatch is missing"}
       try:
         store.record_fire_result(
           schedule_id,
           run_id=None,
           status_text="failed",
           error="Schedule dispatch is missing",
+          warning=warning,
           fired_at=now,
           claim_id=claim_id,
           advance_next_run=advance_next_run,
@@ -1178,6 +1194,23 @@ class AgentRunScheduleRunner:
       return result
 
     try:
+      if parent is None:
+        parent = root_context_from_identity(
+          tenant=AdmittedTenant(
+            tenant_id=registry._tenant_id,
+            storage_id=str(record.get("owner_user_id") or ""),
+            role=dispatch_role,
+          ),
+          job_id=claim_id or schedule_id,
+          tool_ids=None,
+          withheld_tools=frozenset(),
+          research_binding=AdmittedResearchBinding(),
+          approval_route=ControlPlaneApprovalRoute(
+            registry._approval_store,
+            registry._approval_policy,
+          ),
+          remaining_usd=None,
+        )
       dispatch_scope = dispatch.get("dispatch_scope")
       if not isinstance(dispatch_scope, dict):
         dispatch_scope = (
@@ -1185,9 +1218,9 @@ class AgentRunScheduleRunner:
           if isinstance(record.get("dispatch_scope"), dict)
           else None
         )
-      self._require_autonomous_profile(str(dispatch.get("profile") or ""))
       registry.set_user_event_bus(self.user_event_bus_factory() if self.user_event_bus_factory else None)
       start_payload = await registry.start(
+        parent=parent,
         role=dispatch_role,
         profile=str(dispatch.get("profile") or ""),
         mode=str(dispatch.get("mode") or ""),
@@ -1212,8 +1245,8 @@ class AgentRunScheduleRunner:
           else None
         ),
         channel=str(record.get("channel") or "web"),
-        user_id=str(record.get("raw_user_id") or record.get("owner_user_id") or ""),
-        user_email=record.get("user_email") if isinstance(record.get("user_email"), str) else None,
+        user_id=user_id,
+        user_email=user_email,
         owner_user_id=str(record.get("owner_user_id") or ""),
         user_slug=record.get("user_slug") if isinstance(record.get("user_slug"), str) else None,
         risk_user_id=record.get("risk_user_id") if isinstance(record.get("risk_user_id"), int) else None,
@@ -1224,13 +1257,20 @@ class AgentRunScheduleRunner:
         schedule_name=str(record.get("name") or ""),
       )
     except Exception as exc:
-      result = {"schedule_id": schedule_id, "status": "failed", "error": str(exc)}
+      result = {
+        "schedule_id": schedule_id,
+        "status": "failed",
+        "error": exc.payload() if isinstance(exc, AutonomousLaunchAdmissionRefused) else str(exc),
+      }
+      if isinstance(exc, AutonomousLaunchAdmissionRefused):
+        result["error_status"] = exc.http_status
       try:
         store.record_fire_result(
           schedule_id,
           run_id=None,
           status_text="failed",
           error=str(exc),
+          warning=warning,
           fired_at=now,
           claim_id=claim_id,
           advance_next_run=advance_next_run,
@@ -1246,6 +1286,7 @@ class AgentRunScheduleRunner:
         schedule_id,
         run_id=run_id,
         status_text="started",
+        warning=warning,
         fired_at=now,
         claim_id=claim_id,
         advance_next_run=advance_next_run,
@@ -1270,49 +1311,6 @@ def _normalize_channel(channel: str | None) -> str | None:
 
 def _is_web_session(session: GatewaySession) -> bool:
   return _normalize_channel(getattr(session, "channel", None)) == "web"
-
-
-def _raw_web_schedule_write_forbidden() -> HTTPException:
-  return HTTPException(
-    status_code=status.HTTP_403_FORBIDDEN,
-    detail={
-      "error": "web_control_raw_schedule_forbidden",
-      "message": "Web Agent Control cannot use raw launchd or jobs-mcp schedule writes.",
-    },
-  )
-
-
-def _launchd_schedule_creation_forbidden() -> HTTPException:
-  return HTTPException(
-    status_code=status.HTTP_403_FORBIDDEN,
-    detail={
-      "error": "launchd_schedule_creation_forbidden",
-      "message": (
-        "The Agent Control API cannot create launchd schedules. "
-        "Install approved launchd jobs through deployment-managed templates."
-      ),
-    },
-  )
-
-
-def _web_dev_schedule_dispatch_forbidden() -> HTTPException:
-  return HTTPException(
-    status_code=status.HTTP_403_FORBIDDEN,
-    detail={
-      "error": "web_control_dev_dispatch_forbidden",
-      "message": "Web Agent Control schedules require skill mode.",
-    },
-  )
-
-
-def _require_agent_schedule_dispatch_allowed(
-  session: GatewaySession,
-  dispatch: AgentRunScheduleDispatch,
-) -> None:
-  if not _is_web_session(session):
-    return
-  if dispatch.mode != "skill":
-    raise _web_dev_schedule_dispatch_forbidden()
 
 
 def _error_message(result: dict[str, Any], fallback: str) -> str:
@@ -1497,12 +1495,15 @@ def build_schedules_router(
   )
 
   def _can_access_operator_schedules(session: GatewaySession) -> bool:
+    # Operator schedules are the deployment's host-wide launchd and jobs-mcp jobs,
+    # shared by every user rather than stored per user, so an invite principal
+    # must not see or change them; the 404 also hides that a name exists.
     return require_exact_role(getattr(session, "role", None)) == "owner"
 
   def _operator_schedule_not_found(name: str) -> HTTPException:
     return HTTPException(
       status_code=status.HTTP_404_NOT_FOUND,
-      detail=f"Schedule not found: {name}",
+      detail=f"Schedule not found: {name}. GET /control/schedules lists the schedules this session can manage.",
     )
 
   async def _validated_agent_schedule_dispatch(
@@ -1510,52 +1511,20 @@ def build_schedules_router(
     *,
     session: GatewaySession,
   ) -> AgentRunScheduleDispatch:
+    """Store the scope the product validator canonicalizes.
+
+    The validator owns its outcome: it returns a redacted scope (``None`` keeps
+    the requested one) or raises its own ``HTTPException``.
+    """
     scope = dispatch.dispatch_scope
     if scope is None or dispatch_scope_validator is None:
       return dispatch
-    payload = scope.model_dump()
-    try:
-      validation_result = dispatch_scope_validator(session, dict(payload))
-      if inspect.isawaitable(validation_result):
-        validation_result = await validation_result
-    except HTTPException:
-      raise
-    except ValueError as exc:
-      raise HTTPException(
-        status_code=422,
-        detail={
-          "error": "dispatch_scope_validation_failed",
-          "message": str(exc) or "Selected dispatch scope is not valid.",
-        },
-      ) from exc
-    except Exception as exc:
-      raise HTTPException(
-        status_code=422,
-        detail={
-          "error": "dispatch_scope_validation_failed",
-          "message": "Selected dispatch scope could not be validated.",
-        },
-      ) from exc
+    validation_result = dispatch_scope_validator(session, scope.model_dump())
+    if inspect.isawaitable(validation_result):
+      validation_result = await validation_result
     if validation_result is None:
-      validation_result = payload
-    if not isinstance(validation_result, dict):
-      raise HTTPException(
-        status_code=422,
-        detail={
-          "error": "dispatch_scope_validation_failed",
-          "message": "Dispatch scope validator returned an invalid payload.",
-        },
-      )
-    try:
-      validated_scope = DispatchScope.model_validate(validation_result)
-    except ValueError as exc:
-      raise HTTPException(
-        status_code=422,
-        detail={
-          "error": "dispatch_scope_validation_failed",
-          "message": "Dispatch scope validator returned a non-redacted scope.",
-        },
-      ) from exc
+      return dispatch
+    validated_scope = DispatchScope.model_validate(validation_result)
     return dispatch.model_copy(update={"dispatch_scope": validated_scope})
 
   @router.get(
@@ -1610,14 +1579,6 @@ def build_schedules_router(
     session = _require_bearer_session(request, auth)
     if not _can_access_operator_schedules(session):
       raise _operator_schedule_not_found(name)
-    if _is_web_session(session):
-      raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail={
-          "error": "web_control_schedule_logs_forbidden",
-          "message": "Web Agent Control cannot read raw scheduler logs.",
-        },
-      )
     result = await _require_operator_backend(backend).scheduler.schedule_logs(name, lines=lines)
     payload = _require_backend_success(result, action="schedule_logs", not_found_status=status.HTTP_404_NOT_FOUND)
     return ScheduleLogsResponse(name=name, log_lines=_as_string_list(payload.get("lines")))
@@ -1633,16 +1594,11 @@ def build_schedules_router(
     if isinstance(payload, CreateAgentRunScheduleRequest):
       dispatch = await _validated_agent_schedule_dispatch(payload.dispatch, session=session)
       payload = payload.model_copy(update={"dispatch": dispatch})
-      _require_agent_schedule_dispatch_allowed(session, payload.dispatch)
       created = store_for(_schedule_owner_user_id(session)).create(payload, session)
       return ScheduleEnvelopeResponse(schedule=_project_schedule_for_web(created))
 
     if not _can_access_operator_schedules(session):
       raise _operator_schedule_not_found(payload.name)
-    if _is_web_session(session):
-      raise _raw_web_schedule_write_forbidden()
-    if payload.source == "launchd":
-      raise _launchd_schedule_creation_forbidden()
 
     jobs = _require_operator_backend(backend).jobs
     result = await jobs.create_schedule(
@@ -1655,7 +1611,8 @@ def build_schedules_router(
       params=payload.params,
     )
     _require_backend_success(result, action="jobs-mcp create_schedule")
-    return ScheduleEnvelopeResponse(schedule=await _show_jobs_schedule(payload.name, backend=backend))
+    schedule = await _show_jobs_schedule(payload.name, backend=backend)
+    return ScheduleEnvelopeResponse(schedule=_project_schedule_for_web(schedule) if _is_web_session(session) else schedule)
 
   @router.patch(
     "/{name}",
@@ -1672,12 +1629,9 @@ def build_schedules_router(
     agent_store = store_for(owner_user_id)
     existing = agent_store.get_for_owner(owner_user_id, name)
     if existing is None:
-      if _is_web_session(session):
-        raise _raw_web_schedule_write_forbidden()
       raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
     if payload.dispatch is not None:
       dispatch = await _validated_agent_schedule_dispatch(payload.dispatch, session=session)
-      _require_agent_schedule_dispatch_allowed(session, dispatch)
       payload = payload.model_copy(update={"dispatch": dispatch})
     updated = agent_store.update(
       owner_user_id,
@@ -1698,22 +1652,24 @@ def build_schedules_router(
     owner_user_id = _schedule_owner_user_id(session)
     record = store_for(owner_user_id).get_for_owner(owner_user_id, name)
     if record is None:
-      if _is_web_session(session):
-        raise _raw_web_schedule_write_forbidden()
       raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
     if agent_schedule_runner is None:
       raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Agent schedule runner unavailable")
     result = await agent_schedule_runner.fire_record_now(
       record,
       live_role=require_exact_role(getattr(session, "role", None)),
+      parent=root_context(
+        session,
+        withheld_tools=frozenset(),
+        research_file_id=None,
+      ),
     )
     if result is None:
       raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Schedule run-now did not start")
     if result.get("status") != "started":
-      raise HTTPException(
-        status_code=status.HTTP_409_CONFLICT,
-        detail=str(result.get("error") or "Schedule run-now failed"),
-      )
+      error = result.get("error") or "Schedule run-now failed"
+      status_code = result.get("error_status", status.HTTP_409_CONFLICT)
+      raise HTTPException(status_code=status_code, detail=error)
     registry = agent_schedule_runner.autonomous_registry
     task = _autonomous_task_for_user(registry, str(result.get("run_id") or ""), owner_user_id)
     run = _autonomous_run_from_task(task)
@@ -1751,8 +1707,6 @@ def build_schedules_router(
       return ScheduleEnvelopeResponse(schedule=_project_schedule_for_web(updated))
     if not _can_access_operator_schedules(session):
       raise _operator_schedule_not_found(name)
-    if _is_web_session(session):
-      raise _raw_web_schedule_write_forbidden()
     schedule = await _show_schedule(name, backend=backend)
     if isinstance(schedule, LaunchdScheduleResponse):
       result = (
@@ -1761,7 +1715,8 @@ def build_schedules_router(
         else await _require_operator_backend(backend).scheduler.schedule_disable(name)
       )
       _require_backend_success(result, action="schedule_enable" if payload.enabled else "schedule_disable")
-      return ScheduleEnvelopeResponse(schedule=await _show_schedule(name, backend=backend, source="launchd"))
+      schedule = await _show_schedule(name, backend=backend, source="launchd")
+      return ScheduleEnvelopeResponse(schedule=_project_schedule_for_web(schedule) if _is_web_session(session) else schedule)
 
     result = await _require_operator_backend(backend).jobs.update_schedule(schedule.schedule_id, enabled=payload.enabled)
     _require_backend_success(
@@ -1769,25 +1724,22 @@ def build_schedules_router(
       action="jobs-mcp update_schedule",
       not_found_status=status.HTTP_404_NOT_FOUND,
     )
-    return ScheduleEnvelopeResponse(schedule=await _show_jobs_schedule(name, backend=backend))
+    jobs_schedule = await _show_jobs_schedule(name, backend=backend)
+    return ScheduleEnvelopeResponse(
+      schedule=_project_schedule_for_web(jobs_schedule) if _is_web_session(session) else jobs_schedule,
+    )
 
   @router.delete(
     "/{name}",
     response_model=ScheduleDeleteResponse,
     description=operator_global_description,
   )
-  async def delete_schedule(
-    request: Request,
-    name: str,
-    confirm: bool = Query(default=False),
-  ) -> ScheduleDeleteResponse:
+  async def delete_schedule(request: Request, name: str) -> ScheduleDeleteResponse:
     session = _require_bearer_session(request, auth)
     owner_user_id = _schedule_owner_user_id(session)
     agent_store = store_for(owner_user_id)
     owned_schedule = agent_store.get_for_owner(owner_user_id, name)
     if owned_schedule is not None:
-      if not _is_web_session(session) and not confirm:
-        raise HTTPException(status_code=400, detail="confirm=true is required to delete a schedule")
       deleted = agent_store.delete(owner_user_id, name)
       return ScheduleDeleteResponse(
         deleted=True,
@@ -1796,10 +1748,6 @@ def build_schedules_router(
       )
     if not _can_access_operator_schedules(session):
       raise _operator_schedule_not_found(name)
-    if _is_web_session(session):
-      raise _raw_web_schedule_write_forbidden()
-    if not confirm:
-      raise HTTPException(status_code=400, detail="confirm=true is required to delete a schedule")
 
     schedule = await _show_schedule(name, backend=backend)
     if isinstance(schedule, LaunchdScheduleResponse):
@@ -1821,7 +1769,6 @@ def build_schedules_router(
 __all__ = [
   "BrowserSafeScheduleResponse",
   "CreateJobsMcpScheduleRequest",
-  "CreateLaunchdScheduleRequest",
   "CreateScheduleRequest",
   "JobsMcpScheduleResponse",
   "LaunchdScheduleResponse",

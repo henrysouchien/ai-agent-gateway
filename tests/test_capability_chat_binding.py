@@ -171,7 +171,7 @@ def test_prepare_accepts_explicit_stable_key_with_service_authority() -> None:
   _configure_builder(builder)
   prepared = prepare_session_driver_turn(
     _session(),
-    _inputs(model_key="openai.gpt-5-6", effort="xhigh"),
+    _inputs(model_key="openai.gpt-6-1-sol", effort="xhigh"),
     build_chat_runtime=builder,
   )
   bind = prepared.request.capability_bind
@@ -183,9 +183,9 @@ def test_prepare_accepts_explicit_stable_key_with_service_authority() -> None:
     bind.effort,
     bind.credential_principal,
   ) == (
-    "openai.gpt-5-6",
+    "openai.gpt-6-1-sol",
     "openai",
-    "gpt-5.6",
+    "gpt-6.1-sol",
     "xhigh",
     "service",
   )
@@ -199,7 +199,7 @@ def test_prepare_rejects_provider_qualified_selector() -> None:
   with pytest.raises(CapabilityResolutionError) as refused:
     prepare_session_driver_turn(
       _session(),
-      _inputs(model_key="openai:gpt-5.6"),
+      _inputs(model_key="openai:gpt-6.1-sol"),
       build_chat_runtime=builder,
     )
   assert refused.value.code == "capability_model_unavailable"
@@ -236,7 +236,7 @@ def test_prepare_with_stale_catalog_revision_and_eligible_key_still_binds() -> N
   prepared = prepare_session_driver_turn(
     _session(),
     _inputs(
-      model_key="anthropic.claude-sonnet-5",
+      model_key="anthropic.claude-sonnet-5-5",
       effort="xhigh",
       catalog_revision="1999-01-01.0",
     ),
@@ -245,7 +245,7 @@ def test_prepare_with_stale_catalog_revision_and_eligible_key_still_binds() -> N
 
   bind = prepared.request.capability_bind
   assert bind is not None
-  assert bind.model_key == "anthropic.claude-sonnet-5"
+  assert bind.model_key == "anthropic.claude-sonnet-5-5"
   assert bind.effort == "xhigh"
 
 
@@ -265,7 +265,7 @@ def test_context_authority_shaped_values_cannot_change_bind() -> None:
   prepared = prepare_session_driver_turn(
     _session(),
     _inputs(context={
-      "model_key": "openai.gpt-5-6",
+      "model_key": "openai.gpt-6-1-sol",
       "provider": "openai",
       "capability_id": "plan.author",
       "credential_ref": "service:other",
@@ -370,11 +370,10 @@ class _CompleteRunner(AgentRunner):
     self,
     messages,
     system_prompt=None,
-    max_turns=None,
     *,
     resume_initial_messages=None,
   ) -> None:
-    _ = messages, system_prompt, max_turns, resume_initial_messages
+    _ = messages, system_prompt, resume_initial_messages
     self._event_log.append({
       "type": "stream_complete",
       "terminal_disposition": "completed",

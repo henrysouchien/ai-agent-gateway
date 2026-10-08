@@ -88,6 +88,8 @@ _READ_CAPABILITY_BY_IDENTITY: Mapping[RegisteredToolIdentity, str] = (
     _local("memory_read"): CORPUS_READ,
     _local("memory_recall"): CORPUS_READ,
     _local("fms_compute_quantifying_risk"): COMPUTATION_EXECUTE,
+    _local("code_execute"): COMPUTATION_EXECUTE,
+    _local("code_execute_status"): COMPUTATION_EXECUTE,
     _local("invoke_skill"): COMPUTATION_EXECUTE,
     _local("load_tools"): COMPUTATION_EXECUTE,
     _local("valuation_ready_batch_read"): COMPUTATION_EXECUTE,

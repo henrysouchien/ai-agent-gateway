@@ -100,6 +100,7 @@ class _Registry(AutonomousRegistry):
     super().__init__(
       api_dir=Path(__file__).parent,
       log_dir=Path(__file__).with_name("_unused_autonomous_logs"),
+      mcp_user_key_lookup=lambda _user_id, _email: {"role": "owner"},
     )
     self.on_start = on_start
     self.starts: list[dict[str, Any]] = []
@@ -231,10 +232,6 @@ INVALID_DOCUMENTS = [
   ("schedules_wrong_type", b'{"version":1,"schedules":{},"idempotency":{}}'),
   ("missing_idempotency", b'{"version":1,"schedules":[]}'),
   ("idempotency_wrong_type", b'{"version":1,"schedules":[],"idempotency":[]}'),
-  ("missing_version", b'{"schedules":[],"idempotency":{}}'),
-  ("version_non_int", b'{"version":"1","schedules":[],"idempotency":{}}'),
-  ("version_two", b'{"version":2,"schedules":[],"idempotency":{}}'),
-  ("version_bool", b'{"version":true,"schedules":[],"idempotency":{}}'),
   ("non_dict_schedule", b'{"version":1,"schedules":[7],"idempotency":{}}'),
   (
     "duplicate_top_level_schedules",
@@ -259,6 +256,35 @@ def test_complete_invalid_document_matrix_fails_closed(
     schedules_module.AgentRunScheduleStore(path)._load()
   assert isinstance(exc_info.value.cause, ValueError)
   assert exc_info.value.__cause__ is exc_info.value.cause
+  assert path.read_bytes() == raw
+
+
+UNKNOWN_VERSION_DOCUMENTS = [
+  ("missing_version", b'{"schedules":[],"idempotency":{}}'),
+  ("version_non_int", b'{"version":"1","schedules":[],"idempotency":{}}'),
+  ("version_two", b'{"version":2,"schedules":[],"idempotency":{}}'),
+  ("version_bool", b'{"version":true,"schedules":[],"idempotency":{}}'),
+]
+
+
+@pytest.mark.parametrize(
+  "_name,raw",
+  UNKNOWN_VERSION_DOCUMENTS,
+  ids=[item[0] for item in UNKNOWN_VERSION_DOCUMENTS],
+)
+def test_unknown_version_is_logged_and_read_as_v1(
+  tmp_path: Path,
+  caplog: pytest.LogCaptureFixture,
+  _name: str,
+  raw: bytes,
+) -> None:
+  path = tmp_path / "schedules.json"
+  path.write_bytes(raw)
+  with caplog.at_level(logging.WARNING, logger=schedules_module.__name__):
+    payload = schedules_module.AgentRunScheduleStore(path)._load()
+  assert payload["schedules"] == []
+  assert payload["idempotency"] == {}
+  assert "reading it as version 1" in caplog.text
   assert path.read_bytes() == raw
 
 
@@ -465,15 +491,14 @@ def test_run_now_uses_live_role_instead_of_persisted_dispatch_role(
   assert registry.starts[0]["role"] == "invite"
 
 
-def test_roleless_due_record_dispatches_as_owner_instead_of_retiring_the_work(
+def test_roleless_due_record_dispatches_as_invite_and_records_the_gap(
   tmp_path: Path,
 ) -> None:
-  """A schedule predating the role plane must still run.
+  """A stored schedule without a dispatch_role still runs, never as owner.
 
-  Operator ruling 2026-08-03: process attestation may not refuse product work.
-  The prior behavior failed the fire AND advanced next_run, silently retiring a
-  real recurring job forever. Owner is the only role that can own a schedule
-  store, so a roleless record dispatches as owner with a loud warning.
+  dispatch_role is unattested JSON in the user store, so a missing value takes
+  the session plane's unknown-principal role (invite) and the fire record names
+  the gap for the operator.
   """
 
   path = _per_user_store_path(tmp_path)
@@ -487,10 +512,11 @@ def test_roleless_due_record_dispatches_as_owner_instead_of_retiring_the_work(
   results = asyncio.run(runner.fire_due(now=NOW))
 
   assert [row["status"] for row in results] == ["started"]
-  assert len(registry.starts) == 1
+  assert [start["role"] for start in registry.starts] == ["invite"]
   stored = store.get_for_owner("alice", "sched_alice")
   assert stored is not None
-  assert stored.get("last_error") != "role_unattested"
+  assert stored["last_status"] == "started"
+  assert "no valid dispatch_role" in stored["last_fire_warning"]
 
 
 @pytest.mark.parametrize(

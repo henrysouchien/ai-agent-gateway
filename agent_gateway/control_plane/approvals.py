@@ -15,11 +15,6 @@ from agent_gateway.approvals import (
   _record_vote_and_unblock,
 )
 from agent_gateway.approval_store import SQLiteApprovalStore
-from agent_gateway.approval_preferences import (
-  ApprovalPreferenceStore,
-  StandingApprovalPreference,
-  admit_approval_preference,
-)
 from agent_gateway.autonomous_runner import AutonomousRegistry, AutonomousTask
 from agent_gateway.batch_approval_projection import (
   ApprovalProjection,
@@ -51,38 +46,21 @@ class ControlApprovalDecisionRequest(BaseModel):
   reason: str | None = None
 
 
-class ControlApprovalPreferenceRequest(BaseModel):
-  preference: str
-
-
 def _require_bearer_session(request: Request, auth: AuthManager) -> GatewaySession:
   token = AuthManager.get_bearer_token(request.headers.get("Authorization"))
   return auth.verify_token(token)
 
 
 def _require_control_session(session: GatewaySession) -> None:
+  # Approvals are an owner act (auth): only a control-plane session, minted by
+  # the owner's login, may list or decide them. A chat session's bearer is
+  # scoped to driving one run and must not authorize that run's own live order.
   if session.kind != "control":
     raise HTTPException(status_code=401, detail="Control session required")
 
 
 def _json_error(status_code: int, message: str) -> JSONResponse:
   return JSONResponse({"error": message}, status_code=status_code)
-
-
-def _require_preference_store(request: Request) -> ApprovalPreferenceStore:
-  store = getattr(request.app.state, "gateway_approval_preference_store", None)
-  if store is None:
-    raise HTTPException(status_code=503, detail="Approval subsystem unavailable")
-  return store
-
-
-def _preference_payload(preference: StandingApprovalPreference) -> dict[str, Any]:
-  return {
-    "user_id": preference.user_id,
-    "preference": preference.preference,
-    "updated_at": preference.updated_at,
-    "source": preference.source,
-  }
 
 
 def _target_chat_session_for_user(
@@ -413,9 +391,11 @@ async def _visible_pending_approval_for_run(
 
 
 def _approval_retry_state_error(request_record: Any, approval_id: str) -> JSONResponse | None:
+  # A notification retry re-draws the card. One decision per request
+  # (concurrency, the vote checks in `agent_gateway.approvals`): a card for a
+  # resolved or not-pending request would ask for a second decision on a call
+  # already decided, so only a `pending_user` row is re-notified.
   state = getattr(request_record, "state", None)
-  if state == "expired":
-    return _json_error(410, "Approval request expired")
   if state in TERMINAL_APPROVAL_STATES:
     return _json_error(409, "Approval request already resolved")
   if state != "pending_user":
@@ -478,42 +458,6 @@ def build_approvals_router(
     if store is None and not approvals:
       return _json_error(503, "Approval subsystem unavailable")
     return JSONResponse({"approvals": approvals})
-
-  @router.get("/approvals/preference")
-  async def get_approval_preference(request: Request) -> JSONResponse:
-    authenticated = _require_bearer_session(request, auth)
-    _require_control_session(authenticated)
-    store = _require_preference_store(request)
-    return JSONResponse(
-      {
-        "preference": _preference_payload(
-          store.get(user_id=_session_owner_user_id(authenticated))
-        )
-      }
-    )
-
-  @router.put("/approvals/preference")
-  async def set_approval_preference(
-    request: Request,
-    payload: ControlApprovalPreferenceRequest,
-  ) -> JSONResponse:
-    authenticated = _require_bearer_session(request, auth)
-    _require_control_session(authenticated)
-    store = _require_preference_store(request)
-    try:
-      preference = admit_approval_preference(payload.preference)
-    except ValueError as exc:
-      return _json_error(400, str(exc))
-    return JSONResponse(
-      {
-        "preference": _preference_payload(
-          store.put(
-            user_id=_session_owner_user_id(authenticated),
-            preference=preference,
-          )
-        )
-      }
-    )
 
   @router.post("/runs/{run_id}/approvals/{approval_id}/notifications/retry")
   async def retry_approval_notification(request: Request, run_id: str, approval_id: str) -> JSONResponse:
@@ -619,6 +563,9 @@ def build_approvals_router(
           return _json_error(404, "Run approval not found")
         tool_call_id = str(pending_event.get("tool_call_id") or "")
         nonce = str(pending_event.get("nonce") or "")
+        # The nonce is the card's replay guard and the tool call id routes the
+        # decision to the one waiting call (concurrency: one decision per
+        # request); a decision with neither cannot be bound to that call.
         if not tool_call_id or not nonce:
           return _json_error(409, "Approval request is missing routing metadata")
         if store is None:
@@ -771,8 +718,6 @@ def build_approvals_router(
       tool_call_id, pending_entry = delegated_pending
 
     if batch_request_record is not None:
-      if batch_request_record.state == "expired":
-        return _json_error(410, "Approval request expired")
       if batch_request_record.state in TERMINAL_APPROVAL_STATES:
         return _json_error(409, "Approval request already resolved")
       if batch_request_record.state != "pending_user":
@@ -802,11 +747,11 @@ def build_approvals_router(
             "tool_call_id": batch_projection.tool_call_id,
             "user_id": batch_projection.owner_user_id,
             "request_id": batch_projection.run_id,
-            "run_id": batch_projection.run_id,
+            "run_id": str(batch_request_record.run_id),
             "session_id": batch_projection.session_id,
             "channel": batch_projection.channel,
           }
-          if batch_projection is not None
+          if batch_projection is not None and batch_request_record is not None
           else None
         ),
       )

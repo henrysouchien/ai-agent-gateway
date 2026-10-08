@@ -396,6 +396,7 @@ def sanitize_tool_event(
 
   projected = dict(event)
   event_type = str(projected.get("type") or "")
+  tool_input_fields = ("tool_input", "display")
   fields: tuple[str, ...] = ()
   if event_type in {
     "tool_call_start",
@@ -403,7 +404,23 @@ def sanitize_tool_event(
     "tool_execute_request",
     "tool_approval_request",
   }:
-    fields = ("tool_input", "display")
+    fields = tool_input_fields
+  elif event_type == "tool_calls_planned" and isinstance(projected.get("calls"), list):
+    # Match the start event's projection: IDs and tool names are opaque handles,
+    # not authored prose. Redacting them would split one call into two UI cards.
+    safe_calls: list[Any] = []
+    for call in projected["calls"]:
+      if isinstance(call, Mapping):
+        safe_call = dict(call)
+        for field in tool_input_fields:
+          if field in safe_call:
+            safe_call[field] = sanitize_boundary_value(
+              safe_call[field], sink=sink, boundary=boundary,
+            )
+        safe_calls.append(safe_call)
+      else:
+        safe_calls.append(call)
+    projected["calls"] = safe_calls
   elif event_type == "tool_call_complete":
     # A server authors `error`/`semantic_error`, and `dispatch` carries source
     # URLs this process lifted out of the payload — a token in a query string

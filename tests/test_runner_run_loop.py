@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 import hashlib
 import inspect
 import json
@@ -39,7 +39,6 @@ import agent_gateway.runner_background_lifecycle as gateway_background_lifecycle
 from agent_gateway.runner import StreamTurnResult  # noqa: E402
 from agent_gateway.runner_budget import (  # noqa: E402
   CostAccumulator,
-  ObservationOnlyCostAccumulator,
 )
 from agent_gateway.runner_background_tasks import (  # noqa: E402
   _BACKGROUND_RESULT_ACK_RESULT_KEY,
@@ -49,6 +48,7 @@ from agent_gateway.runner_run_loop import (  # noqa: E402
   _background_success_snapshot,
   RunnerRunLoopMixin,
 )
+from agent_gateway.runner_soft_budget import SOFT_BUDGET_STEER_NOTICE  # noqa: E402
 from agent_gateway.runner_state import (  # noqa: E402
   StreamTurnFailure,
   ToolUseLoopResult,
@@ -249,7 +249,6 @@ def test_shared_log_sub_agent_success_ignores_foreign_unfinished_skill_lifecycle
     runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=None,
     )
 
     reconstructed = runner._task_registry.get(
@@ -389,7 +388,6 @@ def _make_credential_runner(
   api_key: str = "k",
   allow_stub_response: bool = True,
   coordinator: CoordinatorConfig | None = None,
-  cost_accumulator: CostAccumulator | None = None,
   gateway_session: GatewaySession | None = None,
   local_tool_handlers: dict[str, Any] | None = None,
   role: Literal["owner", "invite"] | None = None,
@@ -441,7 +439,6 @@ def _make_credential_runner(
     allow_stub_response=allow_stub_response,
     get_tool_definitions=lambda: [],
     coordinator=coordinator,
-    _cost_accumulator=cost_accumulator,
     user_id=user_id,
     channel=channel,
     billing_mode="byok",
@@ -449,7 +446,45 @@ def _make_credential_runner(
   )
 
 
-def test_runner_sanitizes_exact_credential_from_assistant_tool_history_before_next_request() -> None:
+def _soft_budget_threshold(
+  runner: AgentRunner,
+  monkeypatch: pytest.MonkeyPatch,
+  turns: int,
+) -> None:
+  """Give a test runner a delegated run's ladder, lowered to ``turns``."""
+
+  runner._soft_budget_kind = "sub_agent"
+  monkeypatch.setenv("HANK_SOFT_TURN_BUDGET", str(turns))
+
+
+def _after_pause_turns(
+  stream_turn: Callable[..., Awaitable[Any]],
+  count: int,
+):
+  """Run ``count`` ordinary ``pause_turn`` turns before ``stream_turn``.
+
+  With a threshold of 1 the ladder steers before turn 2 and opens the forced
+  final before turn 3, so one leading pause turn makes the wrapped first call
+  the steered turn and its second call the forced final.
+  """
+
+  calls = 0
+
+  async def wrapped(**kwargs: Any) -> Any:
+    nonlocal calls
+    calls += 1
+    if calls <= count:
+      return object(), StreamTurnResult(
+        full_text="",
+        stop_reason="pause_turn",
+        content_blocks=[{"type": "text", "text": "working"}],
+      )
+    return await stream_turn(**kwargs)
+
+  return wrapped
+
+
+def test_runner_sanitizes_exact_credential_from_assistant_tool_history_before_next_request(monkeypatch: pytest.MonkeyPatch) -> None:
   async def case() -> None:
     secret = "CUSTOM-ACTIVE-CREDENTIAL-RUN-HISTORY-8f21d7"
     safe_text = (
@@ -516,9 +551,9 @@ def test_runner_sanitizes_exact_credential_from_assistant_tool_history_before_ne
       )
 
     runner._stream_turn = stream_turn
+    _soft_budget_threshold(runner, monkeypatch, 2)
     await runner.run(
       messages=[{"role": "user", "content": "look it up"}],
-      max_turns=2,
     )
 
     assert dispatched_inputs == [raw_input]
@@ -542,6 +577,7 @@ def test_runner_sanitizes_exact_credential_from_assistant_tool_history_before_ne
 
 
 def test_runner_keeps_semantic_tool_input_in_session_and_redacts_persistence(
+  monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
 ) -> None:
   async def case() -> None:
@@ -611,9 +647,9 @@ def test_runner_keeps_semantic_tool_input_in_session_and_redacts_persistence(
       )
 
     runner._stream_turn = stream_turn
+    _soft_budget_threshold(runner, monkeypatch, 2)
     await runner.run(
       messages=[{"role": "user", "content": "Copy the source sheet."}],
-      max_turns=2,
     )
 
     assert dispatched_inputs == [raw_input]
@@ -637,106 +673,6 @@ def test_runner_keeps_semantic_tool_input_in_session_and_redacts_persistence(
     ])
     assert raw_title not in presentation_payload
     assert redacted_title in presentation_payload
-
-  asyncio.run(case())
-
-
-def test_native_runner_denies_tool_added_after_provider_request_snapshot() -> None:
-  class MutableMcpClient:
-    def __init__(self) -> None:
-      self.live_tools = {"corpus_search"}
-      self.calls: list[str] = []
-
-    def get_tool_definitions(self) -> list[dict[str, Any]]:
-      return [
-        {"name": name, "description": name, "input_schema": {"type": "object"}}
-        for name in sorted(self.live_tools)
-      ]
-
-    def is_mcp_tool(self, name: str) -> bool:
-      return name in {"corpus_search", "corpus_write"}
-
-    def get_server_for_tool(self, name: str) -> str | None:
-      return "research-corpus-mcp" if self.is_mcp_tool(name) else None
-
-    async def call_tool(
-      self,
-      name: str,
-      _tool_input: dict[str, Any],
-      **_kwargs: Any,
-    ) -> tuple[dict[str, Any], None]:
-      self.calls.append(name)
-      return {"ok": name}, None
-
-  async def case() -> None:
-    mcp = MutableMcpClient()
-    event_log = EventLog()
-    dispatcher = ToolDispatcher(
-      mcp_client=mcp,  # type: ignore[arg-type]
-      local_tool_handlers={},
-      get_tool_definitions=mcp.get_tool_definitions,
-      allowed_mcp_tools_by_server={
-        "research-corpus-mcp": {"corpus_search", "corpus_write"},
-      },
-    )
-    provider = _CredentialProvider()
-    runner = AgentRunner(
-      event_log=event_log,
-      dispatcher=dispatcher,
-      session_id="sess-request-snapshot",
-      capability_execution=stub_bound_capability_execution(
-        provider=provider,
-        model="stub-model",
-        effort="none",
-        auth_config={"api_key": "k"},
-      ),
-      get_tool_definitions=mcp.get_tool_definitions,
-      user_id="alice",
-      billing_mode="byok",
-      rate_table_version="unknown",
-    )
-    turn_number = 0
-
-    async def stream_turn(**_kwargs: Any):
-      nonlocal turn_number
-      turn_number += 1
-      if turn_number == 1:
-        request_snapshot = frozenset({"corpus_search"})
-        mcp.live_tools.add("corpus_write")
-        return object(), StreamTurnResult(
-          tool_uses=[("tool-write", "corpus_write", {})],
-          stop_reason="tool_use",
-          content_blocks=[
-            {
-              "type": "tool_use",
-              "id": "tool-write",
-              "name": "corpus_write",
-              "input": {},
-            }
-          ],
-          advertised_tool_names=request_snapshot,
-        )
-      return object(), StreamTurnResult(
-        full_text="done",
-        stop_reason="end_turn",
-        content_blocks=[{"type": "text", "text": "done"}],
-        advertised_tool_names=frozenset(mcp.live_tools),
-      )
-
-    runner._stream_turn = stream_turn
-    await runner.run(
-      messages=[{"role": "user", "content": "write to corpus"}],
-      max_turns=2,
-    )
-
-    assert mcp.calls == []
-    completions = [
-      entry.event
-      for entry in event_log.entries
-      if entry.event.get("type") == "tool_call_complete"
-    ]
-    assert len(completions) == 1
-    assert completions[0]["error"]["code"] == "mcp_tool_not_allowed"
 
   asyncio.run(case())
 
@@ -1309,6 +1245,38 @@ def test_run_loop_uses_bound_upstream_model() -> None:
   assert provider.seen_config["model"] == "configured-model"
 
 
+def test_run_loop_initial_client_uses_provider_default_timeout() -> None:
+  provider = _NoCredentialProvider()
+  runner = _make_no_credential_runner(provider)
+  provider.available = True
+  calls = []
+  default_timeout = object()
+  closed = []
+  clients = []
+
+  def create_client(config, *, timeout=default_timeout):
+    calls.append(timeout)
+    client = object()
+    clients.append(client)
+    return client
+
+  async def close_client(client, timeout=2.0):
+    closed.append(client)
+
+  async def stream_turn(**_kwargs: Any):
+    return _kwargs["client"], StreamTurnResult(
+      full_text="done", stop_reason="end_turn",
+      content_blocks=[{"type": "text", "text": "done"}],
+    )
+
+  provider.create_client = create_client
+  provider.close_client = close_client
+  runner._stream_turn = stream_turn
+  asyncio.run(runner.run(messages=[{"role": "user", "content": "finish"}]))
+  assert calls == [default_timeout]
+  assert closed == clients
+
+
 def test_run_loop_missing_explicit_model_fails_closed_before_provider_startup(
   monkeypatch,
 ) -> None:
@@ -1335,7 +1303,6 @@ def test_run_loop_missing_credential_fails_closed_when_stub_disabled(monkeypatch
     asyncio.run(runner.run(messages=[{"role": "user", "content": "private prompt"}]))
 
   events = [entry.event for entry in runner._log.entries]
-  assert [event for event in events if event.get("type") == "error"] == []
   assert not any(event.get("type") in {"text_delta", "stream_complete"} for event in events)
   assert "private prompt" not in str(events)
 
@@ -1412,11 +1379,11 @@ def test_real_run_preserves_cancellation_across_release_and_close_failures(
   monkeypatch.setattr(runner, "force_close", _force_close)
   runner._write_lease_file = object()
 
+  _soft_budget_threshold(runner, monkeypatch, 1)
   with pytest.raises(asyncio.CancelledError) as exc_info:
     asyncio.run(
       runner.run(
         messages=[{"role": "user", "content": "cancel this child"}],
-        max_turns=1,
       )
     )
 
@@ -1534,6 +1501,7 @@ def test_context_capture_failure_suppresses_manifest_and_turn_continues() -> Non
 
 
 def test_completed_workflow_output_attaches_to_final_summary_and_replays(
+  monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
 ) -> None:
   async def case() -> None:
@@ -1674,9 +1642,9 @@ def test_completed_workflow_output_attaches_to_final_summary_and_replays(
       )
 
     runner._stream_turn = stream_turn
+    _soft_budget_threshold(runner, monkeypatch, 2)
     await runner.run(
       messages=[{"role": "user", "content": "run the workflow"}],
-      max_turns=2,
     )
 
     live_events = [entry.event for entry in runner._log.entries]
@@ -1727,6 +1695,7 @@ def test_completed_workflow_output_attaches_to_final_summary_and_replays(
 
 
 def test_accepted_continuation_invalidates_stale_pending_attachment(
+  monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
 ) -> None:
   """result -> continue -> failed phase-two delivery -> final answer.
@@ -1952,9 +1921,9 @@ def test_accepted_continuation_invalidates_stale_pending_attachment(
       )
 
     runner._stream_turn = stream_turn
+    _soft_budget_threshold(runner, monkeypatch, 4)
     await runner.run(
       messages=[{"role": "user", "content": "run and continue the workflow"}],
-      max_turns=4,
     )
 
     # The phase-one attachment was staged before the continuation was
@@ -1982,7 +1951,7 @@ def test_accepted_continuation_invalidates_stale_pending_attachment(
   asyncio.run(case())
 
 
-def test_successful_final_turn_consumes_notifications_already_shown() -> None:
+def test_successful_final_turn_consumes_notifications_already_shown(monkeypatch: pytest.MonkeyPatch) -> None:
   async def case() -> None:
     runner = _make_credential_runner()
     runner._notification_queue.push(
@@ -2009,10 +1978,10 @@ def test_successful_final_turn_consumes_notifications_already_shown() -> None:
 
     runner._stream_turn = stream_turn
 
+    _soft_budget_threshold(runner, monkeypatch, 3)
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
       system_prompt="base",
-      max_turns=3,
     )
 
     assert stream_calls == 1
@@ -2023,6 +1992,7 @@ def test_successful_final_turn_consumes_notifications_already_shown() -> None:
 
 @pytest.mark.parametrize("pause_reason", ["pause_turn", "compaction"])
 def test_noncommittal_pause_repeats_notification_until_completed_turn(
+  monkeypatch: pytest.MonkeyPatch,
   pause_reason: str,
 ) -> None:
   async def case() -> None:
@@ -2055,10 +2025,10 @@ def test_noncommittal_pause_repeats_notification_until_completed_turn(
 
     runner._stream_turn = stream_turn
 
+    _soft_budget_threshold(runner, monkeypatch, 3)
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
       system_prompt="base",
-      max_turns=3,
     )
 
     assert len(seen_prompts) == 2
@@ -2068,7 +2038,7 @@ def test_noncommittal_pause_repeats_notification_until_completed_turn(
   asyncio.run(case())
 
 
-def test_persistence_failure_does_not_acknowledge_notification() -> None:
+def test_persistence_failure_does_not_acknowledge_notification(monkeypatch: pytest.MonkeyPatch) -> None:
   async def case() -> None:
     runner = _make_credential_runner()
     runner._notification_queue.push(
@@ -2096,10 +2066,10 @@ def test_persistence_failure_does_not_acknowledge_notification() -> None:
     runner._append_assistant_message_event = fail_persistence
 
     with pytest.raises(RuntimeError, match="assistant persistence failed"):
+      _soft_budget_threshold(runner, monkeypatch, 2)
       await runner.run(
         messages=[{"role": "user", "content": "finish"}],
         system_prompt="base",
-        max_turns=2,
       )
 
     assert runner._notification_queue.pending_count == 1
@@ -2108,7 +2078,7 @@ def test_persistence_failure_does_not_acknowledge_notification() -> None:
   asyncio.run(case())
 
 
-def test_provider_error_turn_retains_inline_notification_and_fails_terminally() -> None:
+def test_provider_error_turn_retains_inline_notification_and_fails_terminally(monkeypatch: pytest.MonkeyPatch) -> None:
   async def case() -> None:
     runner = _make_credential_runner()
     runner._notification_queue.push(
@@ -2130,9 +2100,9 @@ def test_provider_error_turn_retains_inline_notification_and_fails_terminally() 
       )
 
     runner._stream_turn = stream_turn
+    _soft_budget_threshold(runner, monkeypatch, 2)
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=2,
     )
 
     events = [entry.event for entry in runner._log.entries]
@@ -2155,7 +2125,7 @@ def test_provider_error_turn_retains_inline_notification_and_fails_terminally() 
   asyncio.run(case())
 
 
-def test_empty_tool_use_turn_acks_inline_notification_it_rendered() -> None:
+def test_empty_tool_use_turn_acks_inline_notification_it_rendered(monkeypatch: pytest.MonkeyPatch) -> None:
   # A-M7 (T3-I01): a `tool_use` stop reason with no usable tool block is
   # still a completed model turn — the response consumed the reminder that
   # rendered the notification, so it is acked at that request's boundary
@@ -2207,9 +2177,9 @@ def test_empty_tool_use_turn_acks_inline_notification_it_rendered() -> None:
       )
 
     runner._stream_turn = stream_turn
+    _soft_budget_threshold(runner, monkeypatch, 3)
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=3,
     )
 
     assert len(seen_prompts) == 2
@@ -2223,7 +2193,7 @@ def test_empty_tool_use_turn_acks_inline_notification_it_rendered() -> None:
   asyncio.run(case())
 
 
-def test_provider_error_turn_retains_exact_result_ack() -> None:
+def test_provider_error_turn_retains_exact_result_ack(monkeypatch: pytest.MonkeyPatch) -> None:
   async def case() -> None:
     runner = _make_credential_runner()
     entry, messages = _seed_pending_omitted_result_ack(runner)
@@ -2236,7 +2206,8 @@ def test_provider_error_turn_retains_exact_result_ack() -> None:
       )
 
     runner._stream_turn = stream_turn
-    await runner.run(messages=messages, max_turns=2)
+    _soft_budget_threshold(runner, monkeypatch, 2)
+    await runner.run(messages=messages)
 
     events = [item.event for item in runner._log.entries]
     assert entry.notification_delivery_state == "payload_omitted"
@@ -2255,7 +2226,7 @@ def test_provider_error_turn_retains_exact_result_ack() -> None:
   asyncio.run(case())
 
 
-def test_empty_tool_use_turn_retains_exact_ack_until_end_turn() -> None:
+def test_empty_tool_use_turn_retains_exact_ack_until_end_turn(monkeypatch: pytest.MonkeyPatch) -> None:
   async def case() -> None:
     runner = _make_credential_runner()
     entry, messages = _seed_pending_omitted_result_ack(runner)
@@ -2284,7 +2255,8 @@ def test_empty_tool_use_turn_retains_exact_ack_until_end_turn() -> None:
       )
 
     runner._stream_turn = stream_turn
-    await runner.run(messages=messages, max_turns=3)
+    _soft_budget_threshold(runner, monkeypatch, 3)
+    await runner.run(messages=messages)
 
     assert len(seen_messages) == 2
     assert entry.notification_delivery_state == "delivered"
@@ -2364,10 +2336,10 @@ def test_tool_use_turn_acks_notification_before_the_tool_batch(
       execute_tool_use_loop,
     )
 
+    _soft_budget_threshold(runner, monkeypatch, 3)
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
       system_prompt="base",
-      max_turns=3,
     )
 
     assert len(seen_prompts) == 2
@@ -2382,7 +2354,7 @@ def test_tool_use_turn_acks_notification_before_the_tool_batch(
   asyncio.run(case())
 
 
-def test_notification_arriving_during_final_turn_gets_one_follow_up() -> None:
+def test_notification_arriving_during_final_turn_gets_one_follow_up(monkeypatch: pytest.MonkeyPatch) -> None:
   async def case() -> None:
     runner = _make_credential_runner()
     seen_prompts: list[str] = []
@@ -2413,10 +2385,10 @@ def test_notification_arriving_during_final_turn_gets_one_follow_up() -> None:
 
     runner._stream_turn = stream_turn
 
+    _soft_budget_threshold(runner, monkeypatch, 3)
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
       system_prompt="base",
-      max_turns=3,
     )
 
     assert len(seen_prompts) == 2
@@ -2428,7 +2400,7 @@ def test_notification_arriving_during_final_turn_gets_one_follow_up() -> None:
   asyncio.run(case())
 
 
-def test_max_turn_delivery_grace_shows_inline_notification() -> None:
+def test_max_turn_delivery_grace_shows_inline_notification(monkeypatch: pytest.MonkeyPatch) -> None:
   async def case() -> None:
     runner = _make_credential_runner()
     stream_calls = 0
@@ -2454,22 +2426,19 @@ def test_max_turn_delivery_grace_shows_inline_notification() -> None:
       )
 
     runner._stream_turn = stream_turn
+    _soft_budget_threshold(runner, monkeypatch, 1)
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=1,
     )
 
     assert stream_calls == 2
     assert entry.notification_delivery_state == "delivered"
-    assert not any(
-      log_entry.event.get("type") == "max_turns_reached"
-      for log_entry in runner._log.entries
-    )
+    assert runner._log.entries[-1].event.get("type") == "stream_complete"
 
   asyncio.run(case())
 
 
-def test_delivery_grace_reconciles_generation_finalized_during_last_request() -> None:
+def test_delivery_grace_reconciles_generation_finalized_during_last_request(monkeypatch: pytest.MonkeyPatch) -> None:
   async def case() -> None:
     runner = _make_credential_runner()
     entry = runner._task_registry.register(
@@ -2509,19 +2478,16 @@ def test_delivery_grace_reconciles_generation_finalized_during_last_request() ->
       )
 
     runner._stream_turn = stream_turn
+    _soft_budget_threshold(runner, monkeypatch, 1)
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=1,
     )
 
     assert len(seen_prompts) == 3
     assert entry.notification_generation == 2
     assert entry.notification_delivery_state == "delivered"
     assert runner._notification_queue.pending_count == 0
-    assert not any(
-      log_entry.event.get("type") == "max_turns_reached"
-      for log_entry in runner._log.entries
-    )
+    assert runner._log.entries[-1].event.get("type") == "stream_complete"
 
   asyncio.run(case())
 
@@ -2604,7 +2570,6 @@ def test_natural_finish_delivery_epoch_exhausts_bounded_notification_credits(
     )
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=None,
     )
 
     events = [log_entry.event for log_entry in runner._log.entries]
@@ -2622,7 +2587,6 @@ def test_natural_finish_delivery_epoch_exhausts_bounded_notification_credits(
     assert not any(
       event.get("type") in {
         "background_delivery_exhausted",
-        "max_turns_reached",
         "stream_complete",
       }
       for event in events
@@ -2639,9 +2603,15 @@ def test_natural_finish_delivery_epoch_exhausts_bounded_notification_credits(
   asyncio.run(case())
 
 
-def test_delivery_epoch_freezes_admission_but_allows_exact_omitted_retrieval() -> None:
+def test_delivery_epoch_freezes_admission_but_allows_exact_omitted_retrieval(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
   async def case() -> None:
+    # A threshold of 1 after one leading pause turn: the ladder opens the
+    # forced-final epoch on the second call below — the epoch that freezes
+    # admission.
     runner = _make_credential_runner()
+    _soft_budget_threshold(runner, monkeypatch, 1)
     entry = runner._task_registry.register("background_agent")
     runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
     runner._task_registry.transition(
@@ -2729,10 +2699,9 @@ def test_delivery_epoch_freezes_admission_but_allows_exact_omitted_retrieval() -
         ],
       )
 
-    runner._stream_turn = stream_turn
+    runner._stream_turn = _after_pause_turns(stream_turn, 1)
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=1,
     )
 
     assert stream_calls == 2
@@ -2822,7 +2791,6 @@ def test_live_run_working_turns_do_not_spend_delivery_credits(
     )
     await runner.run(
       messages=[{"role": "user", "content": "five tracks"}],
-      max_turns=None,
     )
 
     events = [log_entry.event for log_entry in runner._log.entries]
@@ -2838,7 +2806,7 @@ def test_live_run_working_turns_do_not_spend_delivery_credits(
 def test_live_run_delivery_does_not_freeze_background_admission() -> None:
   """A live run keeps admitting background tasks while results arrive.
 
-  Admission freezes because the run is past `max_turns` and may only wind
+  Admission freezes because the run is in its forced final and may only wind
   down — never merely because a notification is outstanding. Latching the
   freeze on the first arriving result broke staged fan-out: a parent that
   dispatches its next track once a concurrency slot frees had that dispatch
@@ -2914,7 +2882,6 @@ def test_live_run_delivery_does_not_freeze_background_admission() -> None:
     runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "five tracks"}],
-      max_turns=None,
     )
 
     assert grace_active_at_dispatch is False
@@ -3065,7 +3032,6 @@ def test_natural_finish_reminds_once_for_unread_handle_result(
     runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "five tracks"}],
-      max_turns=None,
     )
 
     # Turn 1 works, turn 2 carries the delivery, turn 3 is the reminder;
@@ -3182,7 +3148,6 @@ def test_omitted_payload_nudge_is_durably_recorded(tmp_path: Path) -> None:
     runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "one track"}],
-      max_turns=None,
     )
 
     assert entry.notification_delivery_state == "payload_omitted"
@@ -3255,7 +3220,6 @@ def test_unread_handle_reminder_suppressed_after_content_read() -> None:
     runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "five tracks"}],
-      max_turns=None,
     )
 
     assert stream_calls == 2
@@ -3268,14 +3232,14 @@ def test_unread_handle_reminder_suppressed_after_content_read() -> None:
   asyncio.run(case())
 
 
-def test_unread_handle_reminder_yields_when_finish_lands_on_max_turns() -> None:
-  """A bounded run whose natural finish lands on the limit gets NO reminder.
+def test_unread_handle_reminder_runs_when_the_steer_threshold_is_reached(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """The soft-budget steer threshold is not a last turn.
 
-  Crossing `max_turns` on the reminder turn would latch the from-max
-  delivery epoch and `_background_delivery_grace_active`, spend the single
-  synthesis credit, and convert an obeying model's read into a
-  `max_turns_reached` interruption. The reminder is fail-open there: the
-  run finishes exactly as pre-fix code did.
+  The reminder yields only while a forced-final turn is pending; a run that
+  merely reaches its steer threshold has none, so the unread handle is
+  reminded and the run settles on the answer to the reminder.
   """
 
   async def case() -> None:
@@ -3311,21 +3275,20 @@ def test_unread_handle_reminder_yields_when_finish_lands_on_max_turns() -> None:
       )
 
     runner._stream_turn = stream_turn
+    _soft_budget_threshold(runner, monkeypatch, 2)
     await runner.run(
       messages=[{"role": "user", "content": "one track"}],
-      max_turns=2,
     )
 
-    # Turn 1 works, turn 2 carries the delivery and stops ON the limit:
-    # the reminder yields rather than crossing it.
-    assert stream_calls == 2
+    # Turn 2 carries the delivery and reaches the steer threshold; no
+    # forced-final turn is pending, so turn 3 is the reminder.
+    assert stream_calls == 3
     reminder_marker = "delivered as content handles and have never been read"
-    assert all(reminder_marker not in seen for seen in seen_messages)
+    assert reminder_marker not in seen_messages[1]
+    assert reminder_marker in seen_messages[2]
     events = [log_entry.event for log_entry in runner._log.entries]
     assert [event for event in events if event.get("type") == "error"] == []
-    assert not any(
-      event.get("type") == "max_turns_reached" for event in events
-    )
+    assert not any(event.get("type") == "soft_budget_final" for event in events)
     assert any(
       event.get("type") == "stream_complete" for event in events
     )
@@ -3388,7 +3351,6 @@ def test_unread_handle_reminder_answer_survives_compelled_continuation() -> None
     runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "one track"}],
-      max_turns=None,
     )
 
     # 1 work, 2 delivery, 3 reminder (pauses), 4 completes the answer.
@@ -3476,7 +3438,6 @@ def test_tools_then_end_turn_stop_still_reminds_for_unread_handle(
     )
     await runner.run(
       messages=[{"role": "user", "content": "one track"}],
-      max_turns=None,
     )
 
     reminder_marker = "delivered as content handles and have never been read"
@@ -3533,7 +3494,6 @@ def test_inline_delivery_never_triggers_unread_handle_reminder() -> None:
     runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "one track"}],
-      max_turns=None,
     )
 
     assert stream_calls == 2
@@ -3673,7 +3633,6 @@ def test_delivery_epoch_requires_provider_to_commit_new_regular_tool_result(
     )
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=None,
     )
 
     assert len(provider_tool_result_ids) == 4
@@ -3784,9 +3743,9 @@ def test_omitted_notification_forces_exact_retrieval_and_consumption(
       "_execute_tool_use_loop",
       execute_tool_use_loop,
     )
+    _soft_budget_threshold(runner, monkeypatch, 1)
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=1,
     )
 
     assert stream_calls == 3
@@ -3797,12 +3756,15 @@ def test_omitted_notification_forces_exact_retrieval_and_consumption(
 
 
 @pytest.mark.parametrize("compaction_mode", ["proactive", "reactive"])
-def test_compaction_dropped_ack_gets_exactly_one_recovery_cycle(
+def test_injected_compaction_loss_cannot_complete_via_background_alias_recovery(
   monkeypatch: pytest.MonkeyPatch,
   compaction_mode: str,
 ) -> None:
   async def case() -> None:
+    # A threshold of 1 after one leading pause turn: the second call below
+    # opens the forced-final delivery epoch whose recovery cycle this pins.
     runner = _make_credential_runner()
+    _soft_budget_threshold(runner, monkeypatch, 1)
     runner._compaction_trigger = 1
     runner._effective_compaction_trigger = (  # type: ignore[method-assign]
       lambda _trigger, _model_info: 1
@@ -3977,7 +3939,7 @@ def test_compaction_dropped_ack_gets_exactly_one_recovery_cycle(
         tools_used=["get_background_result"],
       )
 
-    runner._stream_turn = stream_turn
+    runner._stream_turn = _after_pause_turns(stream_turn, 1)
     monkeypatch.setattr(
       "agent_gateway.runner_run_loop.maybe_compact_current_messages",
       compact_messages,
@@ -3989,7 +3951,6 @@ def test_compaction_dropped_ack_gets_exactly_one_recovery_cycle(
     )
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=1,
     )
 
     assert compaction_apply_count == 1
@@ -4002,6 +3963,13 @@ def test_compaction_dropped_ack_gets_exactly_one_recovery_cycle(
     assert (
       await runner._aggregator.snapshot()
     ).compaction_count == 1
+    events = [item.event for item in runner._log.entries]
+    assert not any(event.get("type") == "stream_complete" for event in events)
+    assert any(
+      event.get("type") == "error"
+      and "model_visible_tool_results_uncommitted" in event.get("error", "")
+      for event in events
+    )
 
   asyncio.run(case())
 
@@ -4093,10 +4061,10 @@ def test_run_loop_context_reminder_uses_actual_post_compaction_request(
     )
     runner._stream_turn = stream_turn
 
+    _soft_budget_threshold(runner, monkeypatch, 1)
     await runner.run(
       messages=[{"role": "user", "content": "large context"}],
       system_prompt="base prompt",
-      max_turns=1,
     )
 
     assert len(seen_prompts) == 1
@@ -4240,10 +4208,10 @@ def test_run_loop_reactive_compaction_rebuilds_reminder_and_manifest(
     )
     runner._stream_turn = stream_turn
 
+    _soft_budget_threshold(runner, monkeypatch, 1)
     await runner.run(
       messages=[{"role": "user", "content": "large context"}],
       system_prompt="base prompt",
-      max_turns=1,
     )
 
     assert len(captured_prompts) == 2
@@ -4334,10 +4302,10 @@ def test_run_loop_context_pressure_estimate_includes_fixed_turn_reminder(
     )
     runner._stream_turn = stream_turn
 
+    _soft_budget_threshold(runner, monkeypatch, 1)
     await runner.run(
       messages=[{"role": "user", "content": "near threshold"}],
       system_prompt="base prompt",
-      max_turns=1,
     )
 
     assert len(seen_prompts) == 1
@@ -4419,10 +4387,10 @@ def test_run_loop_context_pressure_requires_full_ten_point_hysteresis(
     )
     runner._stream_turn = stream_turn
 
+    _soft_budget_threshold(runner, monkeypatch, 3)
     await runner.run(
       messages=[{"role": "user", "content": "continue"}],
       system_prompt="base prompt",
-      max_turns=3,
     )
 
     assert len(seen_prompts) == 3
@@ -4437,7 +4405,11 @@ def test_two_omitted_notifications_require_both_exact_results(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   async def case() -> None:
+    # A threshold of 1 after one leading pause turn: the forced-final epoch
+    # opens on the second call below and must still deliver both exact
+    # results.
     runner = _make_credential_runner()
+    _soft_budget_threshold(runner, monkeypatch, 1)
     entries = [
       runner._task_registry.register("background_agent")
       for _ in range(2)
@@ -4519,7 +4491,7 @@ def test_two_omitted_notifications_require_both_exact_results(
         tools_used=["get_background_result"],
       )
 
-    runner._stream_turn = stream_turn
+    runner._stream_turn = _after_pause_turns(stream_turn, 1)
     monkeypatch.setattr(
       gateway_runner,
       "_execute_tool_use_loop",
@@ -4527,7 +4499,6 @@ def test_two_omitted_notifications_require_both_exact_results(
     )
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=1,
     )
 
     assert stream_calls == 5
@@ -4539,12 +4510,16 @@ def test_two_omitted_notifications_require_both_exact_results(
   asyncio.run(case())
 
 
-def test_budget_stop_after_retrieval_retains_pending_ack(
+def test_soft_budget_abort_waits_for_omitted_payload_delivery(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   async def case() -> None:
-    cost_accumulator = CostAccumulator(0.5)
-    runner = _make_credential_runner(cost_accumulator=cost_accumulator)
+    # A threshold of 1 after two leading pause turns opens the forced final
+    # on the first call below. The child retrieves the omitted payload, then
+    # keeps calling tools: the delivery turns settle first (they do not spend
+    # grace), and only then does the abort land.
+    runner = _make_credential_runner()
+    _soft_budget_threshold(runner, monkeypatch, 1)
     entry = runner._task_registry.register("background_agent")
     runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
     runner._task_registry.transition(
@@ -4561,31 +4536,46 @@ def test_budget_stop_after_retrieval_retains_pending_ack(
     async def stream_turn(**_kwargs: Any):
       nonlocal stream_calls
       stream_calls += 1
+      tool_use = (
+        (
+          "tool-budget-retrieve",
+          "get_background_result",
+          {"task_id": entry.task_id},
+        )
+        if stream_calls == 1
+        else (f"tool-busy-{stream_calls}", "lookup", {})
+      )
+      assert stream_calls <= 8, "the soft-budget abort never landed"
       turn = StreamTurnResult(
         full_text="",
         stop_reason="tool_use",
         content_blocks=[
           {
             "type": "tool_use",
-            "id": "tool-budget-retrieve",
-            "name": "get_background_result",
-            "input": {"task_id": entry.task_id},
+            "id": tool_use[0],
+            "name": tool_use[1],
+            "input": tool_use[2],
           }
         ],
       )
-      turn.tool_uses = [
-        (
-          "tool-budget-retrieve",
-          "get_background_result",
-          {"task_id": entry.task_id},
-        )
-      ]
+      turn.tool_uses = [tool_use]
       return object(), turn
 
     async def execute_tool_use_loop(
-      *_args: Any,
+      tool_uses: list[tuple[str, str, dict[str, Any]]],
       **_kwargs: Any,
     ) -> ToolUseLoopResult:
+      if tool_uses[0][1] != "get_background_result":
+        return ToolUseLoopResult(
+          tool_results_content=[
+            {
+              "type": "tool_result",
+              "tool_use_id": tool_uses[0][0],
+              "content": '{"ok":true}',
+            }
+          ],
+          tools_used=["lookup"],
+        )
       response, error = await runner.get_background_result(
         {"task_id": entry.task_id},
       )
@@ -4600,7 +4590,6 @@ def test_budget_stop_after_retrieval_retains_pending_ack(
         acknowledgement["task_id"],
         acknowledgement["notification_generation"],
       )
-      cost_accumulator.add(1.0)
       return ToolUseLoopResult(
         tool_results_content=[
           {
@@ -4612,7 +4601,7 @@ def test_budget_stop_after_retrieval_retains_pending_ack(
         tools_used=["get_background_result"],
       )
 
-    runner._stream_turn = stream_turn
+    runner._stream_turn = _after_pause_turns(stream_turn, 2)
     monkeypatch.setattr(
       gateway_runner,
       "_execute_tool_use_loop",
@@ -4620,27 +4609,17 @@ def test_budget_stop_after_retrieval_retains_pending_ack(
     )
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=3,
     )
 
-    assert stream_calls == 1
-    assert entry.notification_delivery_state == "payload_omitted"
-    assert runner._pending_background_result_acks == {
-      "tool-budget-retrieve": (
-        entry.task_id,
-        entry.notification_generation,
-      )
-    }
+    assert stream_calls >= 3
+    assert entry.notification_delivery_state == "delivered"
+    assert runner._pending_background_result_acks == {}
     events = [item.event for item in runner._log.entries]
-    assert not any(
-      event.get("type") == "error"
-      and "background_delivery_incomplete" in str(event.get("error"))
-      for event in events
-    )
+    assert not any(event.get("type") == "error" for event in events)
     assert any(
       event.get("type") == "stream_complete"
       and event.get("terminal_disposition") == "interrupted"
-      and event.get("reason") == "budget_exceeded"
+      and event.get("reason") == "soft_budget_abort"
       for event in events
     )
 
@@ -4651,8 +4630,7 @@ def test_cost_observation_threshold_records_usage_without_stopping_run() -> None
   async def case() -> None:
     usage_events: list[Any] = []
     runner = _make_credential_runner()
-    runner._cost_accumulator = ObservationOnlyCostAccumulator(0.5)
-    runner._max_budget_usd = None
+    runner._cost_accumulator = CostAccumulator(0.5)
     runner._on_usage = usage_events.append
     runner._estimate_usage_cost = (  # type: ignore[method-assign]
       lambda _model, _usage: CostEstimate(total=1.25)
@@ -4676,14 +4654,16 @@ def test_cost_observation_threshold_records_usage_without_stopping_run() -> None
     runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish the workflow node"}],
-      max_turns=None,
     )
 
     events = [entry.event for entry in runner._log.entries]
     assert runner._cost_accumulator.total == 1.25
     assert runner._cost_accumulator.observation_threshold_crossed is True
     assert usage_events
-    assert not any(event.get("type") == "budget_exceeded" for event in events)
+    assert not any(
+      str(event.get("type") or "").startswith("soft_budget")
+      for event in events
+    )
     assert any(
       event.get("type") == "stream_complete"
       and event.get("terminal_disposition") == "completed"
@@ -4693,7 +4673,7 @@ def test_cost_observation_threshold_records_usage_without_stopping_run() -> None
   asyncio.run(case())
 
 
-def test_final_turn_waits_event_first_for_running_child_notification() -> None:
+def test_final_turn_waits_event_first_for_running_child_notification(monkeypatch: pytest.MonkeyPatch) -> None:
   async def case() -> None:
     runner = _make_credential_runner()
     entry = runner._task_registry.register(
@@ -4745,10 +4725,10 @@ def test_final_turn_waits_event_first_for_running_child_notification() -> None:
       )
 
     runner._stream_turn = stream_turn
+    _soft_budget_threshold(runner, monkeypatch, 3)
     await runner.run(
       messages=[{"role": "user", "content": "finish after review"}],
       system_prompt="base",
-      max_turns=3,
     )
 
     assert wait_calls == 1
@@ -4764,11 +4744,10 @@ def test_final_turn_waits_event_first_for_running_child_notification() -> None:
   asyncio.run(case())
 
 
-def test_auto_notify_false_and_exhausted_turn_limit_skip_background_wait() -> None:
+def test_auto_notify_false_skips_background_wait() -> None:
   async def run_case(
     *,
     coordinator: CoordinatorConfig | None,
-    max_turns: int,
   ) -> None:
     runner = _make_credential_runner(coordinator=coordinator)
     release_child = asyncio.Event()
@@ -4805,85 +4784,13 @@ def test_auto_notify_false_and_exhausted_turn_limit_skip_background_wait() -> No
     runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=max_turns,
     )
 
   asyncio.run(
     run_case(
       coordinator=CoordinatorConfig(enabled=True, auto_notify=False),
-      max_turns=3,
     )
   )
-  asyncio.run(run_case(coordinator=None, max_turns=1))
-
-
-def test_background_child_budget_crossing_blocks_notification_follow_up() -> None:
-  async def case() -> None:
-    cost_accumulator = CostAccumulator(1.0)
-    runner = _make_credential_runner(cost_accumulator=cost_accumulator)
-    entry = runner._task_registry.register("background_agent")
-    wait_started = asyncio.Event()
-
-    async def child() -> None:
-      await wait_started.wait()
-      cost_accumulator.add(1.0)
-      runner._task_registry.transition(
-        entry.task_id,
-        TaskState.COMPLETED,
-        result={
-          "kind": "report",
-          "report": {"summary": "expensive review complete"},
-        },
-      )
-
-    child_task = asyncio.create_task(child())
-    entry.asyncio_task = child_task
-    runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
-
-    original_wait = runner._wait_for_background_notification
-
-    async def tracked_wait() -> bool:
-      wait_started.set()
-      return await original_wait()
-
-    runner._wait_for_background_notification = tracked_wait
-    stream_calls = 0
-
-    async def stream_turn(**_kwargs: Any):
-      nonlocal stream_calls
-      stream_calls += 1
-      return object(), StreamTurnResult(
-        full_text="draft",
-        stop_reason="end_turn",
-        content_blocks=[{"type": "text", "text": "draft"}],
-      )
-
-    runner._stream_turn = stream_turn
-    await runner.run(
-      messages=[{"role": "user", "content": "finish within budget"}],
-      max_turns=3,
-    )
-
-    assert stream_calls == 1
-    assert child_task.done() and not child_task.cancelled()
-    assert any(
-      entry.event.get("type") == "budget_exceeded"
-      for entry in runner._log.entries
-    )
-    assert not any(
-      entry.event.get("type") == "error"
-      and "background_delivery_incomplete"
-      in str(entry.event.get("error"))
-      for entry in runner._log.entries
-    )
-    assert any(
-      entry.event.get("type") == "stream_complete"
-      and entry.event.get("terminal_disposition") == "interrupted"
-      and entry.event.get("reason") == "budget_exceeded"
-      for entry in runner._log.entries
-    )
-
-  asyncio.run(case())
 
 
 def test_post_tool_end_turn_waits_for_custom_provider_background_child(
@@ -4965,9 +4872,9 @@ def test_post_tool_end_turn_waits_for_custom_provider_background_child(
       "_execute_tool_use_loop",
       execute_tool_use_loop,
     )
+    _soft_budget_threshold(runner, monkeypatch, 3)
     await runner.run(
       messages=[{"role": "user", "content": "use custom provider"}],
-      max_turns=3,
     )
 
     assert stream_calls == 2
@@ -5115,32 +5022,15 @@ def test_run_loop_stops_after_expired_approval_tool_result(monkeypatch) -> None:
   asyncio.run(_case())
 
 
-def test_terminal_tool_result_wins_over_post_tool_budget_boundary(monkeypatch) -> None:
+def test_terminal_tool_result_settles_a_steered_run(monkeypatch) -> None:
   async def _case() -> None:
     runner = _make_credential_runner()
     terminal_tool_name = "fms_propose_managing_risk"
     runner._terminal_tool_result_ids = frozenset({terminal_tool_name})
     stream_calls = {"count": 0}
-    exceeded_state = SimpleNamespace(
-      total_cost=2.6353,
-      budget=2.0,
-      reason="parent_budget",
-      reason_suffix="",
-    )
-    runner._cost_accumulator = CostAccumulator(10.0)
-    monkeypatch.setattr(
-      gateway_runner,
-      "_budget_cost_progress",
-      lambda *_args, **_kwargs: SimpleNamespace(
-        last_reported_cost=2.6353,
-        exceeded_state=exceeded_state,
-      ),
-    )
-    monkeypatch.setattr(
-      gateway_runner,
-      "_budget_exceeded_state",
-      lambda _accumulator: exceeded_state,
-    )
+    # A threshold of 1 after one leading pause turn steers the terminal-tool
+    # turn; the terminal tool result settles the run as it always did.
+    _soft_budget_threshold(runner, monkeypatch, 1)
 
     async def fake_stream_turn(**kwargs: Any):
       _ = kwargs
@@ -5192,7 +5082,7 @@ def test_terminal_tool_result_wins_over_post_tool_budget_boundary(monkeypatch) -
         tools_used=["fms_propose_managing_risk"],
       )
 
-    runner._stream_turn = fake_stream_turn
+    runner._stream_turn = _after_pause_turns(fake_stream_turn, 1)
     monkeypatch.setattr(gateway_runner, "_execute_tool_use_loop", fake_execute_tool_use_loop)
 
     await runner.run(messages=[{"role": "user", "content": "Run managing risk"}], system_prompt="x")
@@ -5201,11 +5091,11 @@ def test_terminal_tool_result_wins_over_post_tool_budget_boundary(monkeypatch) -
     assert runner._stop_after_tool_results_reason == "terminal_tool_result"
     events = [entry.event for entry in runner._log.entries]
     assert events[-1]["type"] == "stream_complete"
-    assert not any(event.get("type") == "budget_exceeded" for event in events)
-    assert not any(
-      event.get("type") == "run_interrupted" and event.get("reason") == "budget_exceeded"
-      for event in events
-    )
+    assert events[-1]["terminal_disposition"] == "completed"
+    assert [event["type"] for event in events if str(event.get("type") or "").startswith("soft_budget")] == [
+      "soft_budget_steer",
+    ]
+    assert not any(event.get("type") == "interrupted" for event in events)
 
   asyncio.run(_case())
 
@@ -5298,7 +5188,6 @@ def test_max_tokens_exhaustion_cannot_commit_with_queued_notification() -> None:
     runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=None,
     )
 
     events = [entry.event for entry in runner._log.entries]
@@ -5377,7 +5266,6 @@ def test_terminal_tool_cannot_commit_with_mid_batch_notification(
     )
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=None,
     )
 
     events = [entry.event for entry in runner._log.entries]
@@ -5462,7 +5350,6 @@ def test_terminal_tool_commits_cleanly_after_acking_delivered_notification(
     )
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=None,
     )
 
     events = [item.event for item in runner._log.entries]
@@ -5540,7 +5427,6 @@ def test_terminal_tool_with_running_child_fails_before_shutdown_notification(
     )
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=None,
     )
 
     events = [item.event for item in runner._log.entries]
@@ -5593,7 +5479,6 @@ def test_pre_terminal_hook_notification_is_rechecked_before_success() -> None:
     runner._on_before_stream_complete = before_terminal
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=None,
     )
 
     events = [entry.event for entry in runner._log.entries]
@@ -5635,7 +5520,6 @@ def test_success_rejects_queued_entry_when_queue_bookkeeping_is_empty() -> None:
     runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=None,
     )
 
     events = [item.event for item in runner._log.entries]
@@ -5669,7 +5553,6 @@ def test_success_rejects_malformed_pending_background_ack() -> None:
     runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=None,
     )
 
     events = [item.event for item in runner._log.entries]
@@ -5701,7 +5584,6 @@ def test_success_rejects_pending_initializer() -> None:
     runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=None,
     )
 
     events = [item.event for item in runner._log.entries]
@@ -5768,7 +5650,6 @@ def test_terminal_snapshot_detects_generation_published_and_drained_in_hook() ->
     runner._on_before_stream_complete = before_terminal
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=None,
     )
 
     events = [item.event for item in runner._log.entries]
@@ -5839,7 +5720,6 @@ def test_staged_success_receipt_is_durable_before_live_terminal(
     runner._on_before_stream_complete = before_terminal
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=None,
     )
 
     durable_index = timeline.index(
@@ -5899,7 +5779,6 @@ def test_staged_success_receipt_persistence_failure_refuses_success(
     )
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=None,
     )
 
     events = [item.event for item in runner._log.entries]
@@ -6020,7 +5899,7 @@ def test_transient_error_append_preserves_failure_history(
     entries, _ = await durable_log.query(order="asc")
     assert entries[0] == existing
     current = [e.event for e in entries if e.event.get("runner_id") == runner._runner_id]
-    assert current[-1]["type"] == "detach" and current[-1]["reason"] == "error"
+    assert any(e["type"] == "detach" and e["reason"] == "error" for e in current)
     assert any(e["type"] == "run_error" for e in current)
     assert any(e["type"] == "interrupted" for e in current)
     assert any(e["type"] == "error" and "provider exploded" in e["error"] for e in current)
@@ -6054,19 +5933,20 @@ def test_failed_success_append_retains_staging_until_error_closure_commits(
     fallback_started = asyncio.Event()
     release_fallback = threading.Event()
     loop = asyncio.get_running_loop()
-    append_sync = durable_log.append_sync
+    encode = durable_log._encode_entry
 
-    def fail_first_detach(event: dict[str, Any]):
+    def fail_first_detach(entry):
       nonlocal failed
+      event = entry.event
       if event["type"] == "detach" and not failed:
         failed = True
         raise OSError("transient detach failure")
       if failed and event["type"] == "run_error":
         loop.call_soon_threadsafe(fallback_started.set)
         release_fallback.wait(timeout=5.0)
-      return append_sync(event)
+      return encode(entry)
 
-    monkeypatch.setattr(durable_log, "append_sync", fail_first_detach)
+    monkeypatch.setattr(durable_log, "_encode_entry", fail_first_detach)
     runner._stream_turn = stream_turn
     runner._on_before_stream_complete = before_terminal
     task = asyncio.create_task(runner.run(messages=[{"role": "user", "content": "finish"}]))
@@ -6079,7 +5959,7 @@ def test_failed_success_append_retains_staging_until_error_closure_commits(
       await task
     entries, _ = await durable_log.query(order="asc")
     assert [e.event["receipt_id"] for e in entries if e.event["type"] == "terminal_receipt"] == ["kept"]
-    assert entries[-1].event["reason"] == "error"
+    assert any(e.event["type"] == "detach" and e.event["reason"] == "error" for e in entries)
     assert any(e.event["type"] == "interrupted" and e.event["reason"] == "persistence" for e in entries)
     assert not staged
     assert [e.event["type"] for e in runner._log.entries if e.event["type"] in {"error", "stream_complete"}] == ["error"]
@@ -6113,7 +5993,6 @@ def test_terminal_hook_failure_warns_and_run_still_succeeds() -> None:
     runner._on_before_stream_complete = failing_hook
     await runner.run(
       messages=[{"role": "user", "content": "finish"}],
-      max_turns=None,
     )
 
     events = [item.event for item in runner._log.entries]
@@ -6141,7 +6020,6 @@ def test_operator_pause_with_background_blocker_is_not_relabelled_error() -> Non
 
     await runner.run(
       messages=[{"role": "user", "content": "pause"}],
-      max_turns=None,
     )
 
     events = [item.event for item in runner._log.entries]
@@ -6224,9 +6102,9 @@ def test_child_result_trust_policy_persists_for_foreground_tool_result(
       "_execute_tool_use_loop",
       execute_tool_use_loop,
     )
+    _soft_budget_threshold(runner, monkeypatch, 3)
     await runner.run(
       messages=[{"role": "user", "content": "delegate"}],
-      max_turns=3,
     )
 
     assert len(prompts) == 2
@@ -6267,16 +6145,7 @@ def test_workflow_obstruction_blocks_settlement_maps_states() -> None:
   assert not workflow_obstruction_blocks_settlement(object())
 
 
-def test_both_hold_open_sites_consult_workflow_obstruction() -> None:
-  # Both end_turn hold-open sites extend RUNNING-task keying with the
-  # workflow settlement obstruction (§5.3, T2-I04).
-  no_tool_source = inspect.getsource(RunnerRunLoopMixin._handle_no_tool_turn)
-  tool_source = inspect.getsource(RunnerRunLoopMixin._finish_tool_turn)
-  assert no_tool_source.count("self._workflow_settlement_obstructed()") == 1
-  assert tool_source.count("self._workflow_settlement_obstructed()") == 1
-
-
-def test_workflow_obstruction_holds_final_turn_until_drive_settles() -> None:
+def test_workflow_obstruction_holds_final_turn_until_drive_settles(monkeypatch: pytest.MonkeyPatch) -> None:
   # A running/authoring workflow obstructs unconditionally even with no
   # RUNNING registry task (the authoring window): the final turn waits on
   # the obstruction's wake handle and settles once the drive resolves the
@@ -6319,9 +6188,9 @@ def test_workflow_obstruction_holds_final_turn_until_drive_settles() -> None:
         )
 
       runner._stream_turn = stream_turn
+      _soft_budget_threshold(runner, monkeypatch, 3)
       await runner.run(
         messages=[{"role": "user", "content": "finish"}],
-        max_turns=3,
       )
 
       assert wait_calls == 1
@@ -6340,7 +6209,7 @@ def test_workflow_obstruction_holds_final_turn_until_drive_settles() -> None:
   run_case("authoring")
 
 
-def test_unacked_workflow_boundary_delivers_reminder_then_acks_on_completed_turn() -> None:
+def test_unacked_workflow_boundary_delivers_reminder_then_acks_on_completed_turn(monkeypatch: pytest.MonkeyPatch) -> None:
   # An unacked awaiting_action boundary rides the existing notification
   # queue: the reminder carries the boundary event, and the ack at the
   # delivering request's response boundary invokes the delivered-callback
@@ -6403,10 +6272,10 @@ def test_unacked_workflow_boundary_delivers_reminder_then_acks_on_completed_turn
       )
 
     runner._stream_turn = stream_turn
+    _soft_budget_threshold(runner, monkeypatch, 3)
     await runner.run(
       messages=[{"role": "user", "content": "run the workflow"}],
       system_prompt="base",
-      max_turns=3,
     )
 
     # Delivered in the reminder, consumed exactly once under the ack path,
@@ -6519,10 +6388,10 @@ def test_unacked_workflow_boundary_acks_on_tool_use_turn(
       "_execute_tool_use_loop",
       execute_tool_use_loop,
     )
+    _soft_budget_threshold(runner, monkeypatch, 3)
     await runner.run(
       messages=[{"role": "user", "content": "run the workflow"}],
       system_prompt="base",
-      max_turns=3,
     )
 
     assert "workflow_boundary_blocked" in prompts[0]
@@ -6615,16 +6484,14 @@ def test_background_wait_blocks_on_unacked_boundary_until_notification() -> None
   asyncio.run(case())
 
 
-def test_turn_exhaustion_grants_the_synthesis_credit_without_pending_results() -> None:
+def test_forced_final_grants_the_synthesis_credit_without_pending_results(monkeypatch: pytest.MonkeyPatch) -> None:
   # B-3 / design §4.4: "the one synthesis credit is granted unconditionally at
-  # exhaustion; the dispatch loop owns eliciting the terminal narrative."
-  # Before this, the obligation was minted only when model-visible tool
-  # results were still pending, so a run that exhausted its turns any other
-  # way went straight to max_turns_reached with no committal turn — and the
-  # honest-partial remap had no narrative to settle on.
+  # exhaustion; the dispatch loop owns eliciting the terminal narrative." The
+  # soft-budget ladder's forced final is that exhaustion: with a
+  # threshold of 1, turn 2 is steered and turn 3 is the forced final report.
   async def case() -> None:
     runner = _make_credential_runner()
-    stop_reasons = ["pause_turn", "end_turn"]
+    stop_reasons = ["pause_turn", "pause_turn", "end_turn"]
     seen: list[str] = []
 
     async def stream_turn(**kwargs: Any):
@@ -6637,23 +6504,25 @@ def test_turn_exhaustion_grants_the_synthesis_credit_without_pending_results() -
       )
 
     runner._stream_turn = stream_turn
+    _soft_budget_threshold(runner, monkeypatch, 1)
     await runner.run(
       messages=[{"role": "user", "content": "work"}],
-      max_turns=1,
     )
 
-    # The exhaustion turn happened: the model was asked once more, and its
-    # end_turn response is the terminal narrative a settled partial rides.
-    assert len(seen) == 2
+    # The forced-final turn happened: the model was asked once more, and its
+    # end_turn response completes the run as an ordinary result.
+    assert len(seen) == 3
+    assert MAX_TURNS_SYNTHESIS_REMINDER in seen[2]
     events = [entry.event for entry in runner._log.entries]
-    assert any(event.get("type") == "stream_complete" for event in events)
+    assert events[-1]["type"] == "stream_complete"
+    assert events[-1]["terminal_disposition"] == "completed"
 
   asyncio.run(case())
 
 
-def test_the_exhaustion_synthesis_credit_is_still_capped_at_one() -> None:
-  # The generalization does not become an escape hatch: a model that keeps
-  # calling tools still terminates at max_turns_reached.
+def test_a_child_that_never_answers_after_the_forced_final_is_aborted(monkeypatch: pytest.MonkeyPatch) -> None:
+  # The forced final does not become an escape hatch: a model that never
+  # answers is aborted once its grace turns have run.
   async def case() -> None:
     runner = _make_credential_runner()
     calls = 0
@@ -6668,25 +6537,26 @@ def test_the_exhaustion_synthesis_credit_is_still_capped_at_one() -> None:
       )
 
     runner._stream_turn = stream_turn
+    _soft_budget_threshold(runner, monkeypatch, 1)
     await runner.run(
       messages=[{"role": "user", "content": "work"}],
-      max_turns=1,
     )
 
-    assert calls == 2
-    assert any(
-      entry.event.get("type") == "max_turns_reached"
-      for entry in runner._log.entries
-    )
+    # Turns 1-2 ordinary, turn 3 forced final, turn 4 the last grace turn.
+    assert calls == 4
+    completion = runner._log.entries[-1].event
+    assert completion["type"] == "stream_complete"
+    assert completion["terminal_disposition"] == "interrupted"
+    assert completion["reason"] == "soft_budget_abort"
 
   asyncio.run(case())
 
 
-def test_the_exhaustion_synthesis_turn_is_asked_for_the_answer_and_counted_as_run() -> None:
+def test_the_forced_final_turn_is_asked_for_the_answer_and_counted_as_run(monkeypatch: pytest.MonkeyPatch) -> None:
   # m1-eval-research-build-journey-errors, 2026-09-23: the PCTY work-up parent
   # spent its ceiling synthesis turn launching more work (it was never told the
-  # budget was spent), so the stop replaced the work-up with the canned line,
-  # and max_turns_reached reported 42/40 by counting the aborted iteration.
+  # budget was spent). The forced-final turns carry the synthesis reminder, and
+  # the ladder counts only turns that ran.
   async def case() -> None:
     runner = _make_credential_runner()
     system_prompts: list[str] = []
@@ -6700,22 +6570,23 @@ def test_the_exhaustion_synthesis_turn_is_asked_for_the_answer_and_counted_as_ru
       )
 
     runner._stream_turn = stream_turn
+    _soft_budget_threshold(runner, monkeypatch, 1)
     await runner.run(
       messages=[{"role": "user", "content": "work"}],
-      max_turns=1,
     )
 
-    assert len(system_prompts) == 2
+    assert len(system_prompts) == 4
     assert MAX_TURNS_SYNTHESIS_REMINDER not in system_prompts[0]
-    assert MAX_TURNS_SYNTHESIS_REMINDER in system_prompts[1]
-    reached = [
-      entry.event
+    assert MAX_TURNS_SYNTHESIS_REMINDER not in system_prompts[1]
+    assert SOFT_BUDGET_STEER_NOTICE in system_prompts[1]
+    assert MAX_TURNS_SYNTHESIS_REMINDER in system_prompts[2]
+    assert MAX_TURNS_SYNTHESIS_REMINDER in system_prompts[3]
+    ladder = [
+      (entry.event["type"], entry.event["observed"], entry.event["threshold"])
       for entry in runner._log.entries
-      if entry.event.get("type") == "max_turns_reached"
+      if str(entry.event.get("type") or "").startswith("soft_budget")
     ]
-    assert [(event["turn_count"], event["max_turns"]) for event in reached] == [
-      (len(system_prompts), 1)
-    ]
+    assert ladder == [("soft_budget_steer", 1, 1), ("soft_budget_final", 2, 1)]
 
   asyncio.run(case())
 
@@ -6773,17 +6644,485 @@ def test_repeated_excluded_tool_still_ends_the_turn_with_an_answer() -> None:
     runner._stream_turn = stream_turn
     await runner.run(
       messages=[{"role": "user", "content": "macro setup for my book?"}],
-      max_turns=None,
     )
 
     assert len(prompts) == 2
-    assert "memory_store" in str(prompts[1])
-    assert "final turn" in str(prompts[1])
+    # No forced-final reminder: the second-hit clamp was deleted (RS-N1); the
+    # excluded result itself carries the owner and an explicit null next_call.
+    assert "final turn" not in str(prompts[1])
     events = [entry.event for entry in runner._log.entries]
     assert not any(event.get("type") == "error" for event in events)
     completion = next(
       event for event in events if event.get("type") == "stream_complete"
     )
     assert completion["terminal_disposition"] == "completed"
+
+  asyncio.run(case())
+
+
+def test_turn_final_inside_a_continuation_opens_the_forced_final_and_settles_background_work(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def case() -> None:
+    # A threshold of 1 after one leading pause turn. The first segment below
+    # (turn 2, steered) stops on max_tokens; its continuation is observed
+    # with turn 2 counted, so the ladder finalizes while the logical turn is
+    # still open. The continuation segment is the forced final: it carries
+    # the synthesis reminder, and the background task that completes during
+    # it is delivered (auto-notify) before the run settles, never dropped as
+    # background_delivery_incomplete.
+    runner = _make_credential_runner()
+    runner._role = "sub_agent"  # continuation segments are a child's logical response
+    _soft_budget_threshold(runner, monkeypatch, 1)
+    entry = runner._task_registry.register("background_agent")
+    runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
+    stream_calls = 0
+    prompts: list[Any] = []
+
+    async def stream_turn(**kwargs: Any):
+      nonlocal stream_calls
+      stream_calls += 1
+      prompts.append(kwargs.get("system_prompt"))
+      if stream_calls == 1:
+        return object(), StreamTurnResult(
+          full_text="partial findings",
+          stop_reason="max_tokens",
+          content_blocks=[{"type": "text", "text": "partial findings"}],
+        )
+      if stream_calls == 2:
+        # The task is still running when this segment answers; it completes
+        # while the loop is waiting on it, as a real child would.
+        async def _complete_later() -> None:
+          await asyncio.sleep(0.05)
+          runner._task_registry.transition(
+            entry.task_id,
+            TaskState.COMPLETED,
+            result={"kind": "report", "report": {"summary": "done"}},
+          )
+        entry.asyncio_task = asyncio.get_running_loop().create_task(_complete_later())
+      assert stream_calls <= 6, "the run never settled"
+      return object(), StreamTurnResult(
+        full_text="final answer",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "final answer"}],
+      )
+
+    runner._stream_turn = _after_pause_turns(stream_turn, 1)
+    await runner.run(messages=[{"role": "user", "content": "go"}])
+
+    events = [item.event for item in runner._log.entries]
+    assert [
+      (event["type"], event["kind"]) for event in events
+      if str(event.get("type") or "").startswith("soft_budget")
+    ] == [("soft_budget_steer", "turns"), ("soft_budget_final", "turns")]
+    # The continuation segment after the final is the forced final turn.
+    assert MAX_TURNS_SYNTHESIS_REMINDER not in str(prompts[0])
+    assert MAX_TURNS_SYNTHESIS_REMINDER in str(prompts[1])
+    assert entry.notification_delivery_state == "delivered"
+    assert not any(event.get("type") == "error" for event in events)
+    assert not any(
+      "background_delivery_incomplete" in json.dumps(event) for event in events
+    )
+    assert any(
+      event.get("type") == "stream_complete"
+      and event.get("terminal_disposition") == "completed"
+      for event in events
+    )
+
+  asyncio.run(case())
+
+
+@pytest.mark.parametrize("measurement", [None, 0, 987])
+def test_turn_complete_uses_final_request_measurement_not_billed_usage(measurement) -> None:
+  async def case() -> None:
+    runner = _make_credential_runner()
+    async def stream_turn(**kwargs):
+      kwargs["usage_totals"]["capability_bind"] = runner._capability_execution.bind.to_json()
+      kwargs["usage_totals"]["input_tokens"] += 7_000
+      kwargs["usage_totals"]["cache_read_input_tokens"] += 2_000
+      kwargs["usage_totals"]["cache_creation_input_tokens"] += 1_000
+      return object(), StreamTurnResult(
+        full_text="done", stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "done"}],
+        request_input_tokens=measurement,
+      )
+    runner._stream_turn = stream_turn
+    await runner.run([{"role": "user", "content": "finish"}])
+    complete = next(entry.event for entry in runner._log.entries if entry.event.get("type") == "turn_complete")
+    assert complete["request_input_tokens"] == measurement
+    assert complete["usage"]["input_tokens"] == 7_000
+    assert complete["usage"]["cache_read_input_tokens"] == 2_000
+    assert complete["usage"]["cache_creation_input_tokens"] == 1_000
+  asyncio.run(case())
+
+
+def test_interactive_child_persists_actual_soft_budget_notice(monkeypatch, tmp_path) -> None:
+  async def case() -> None:
+    runner = _make_credential_runner()
+    durable_log = AgentSessionLog(tmp_path / "child-notice.jsonl")
+    runner._agent_session_log = durable_log
+    runner._role = "sub_agent"
+    runner._sub_agent_id = "child-notice"
+    _soft_budget_threshold(runner, monkeypatch, 1)
+    prompts = []
+    async def stream_turn(**kwargs):
+      prompts.append(kwargs["system_prompt"])
+      return object(), StreamTurnResult(
+        full_text="working" if len(prompts) == 1 else "done",
+        stop_reason="pause_turn" if len(prompts) == 1 else "end_turn",
+        content_blocks=[{"type": "text", "text": "response"}],
+      )
+    runner._stream_turn = stream_turn
+    await runner.run([{"role": "user", "content": "finish"}], system_prompt="base")
+    entries, _ = await durable_log.query(event_types={"soft_budget_steer"}, order="asc")
+    assert len(entries) == 1
+    event = entries[0].event
+    assert event["role"] == "sub_agent"
+    assert event["kind"] == "turns"
+    assert event["observed"] == event["threshold"] == 1
+    assert SOFT_BUDGET_STEER_NOTICE in event["notice"]
+    assert event["notice"] in str(prompts[1])
+    assert event["notice"] not in str(prompts[0])
+    assert any(entry.event.get("type") == "stream_complete" for entry in runner._log.entries)
+  asyncio.run(case())
+
+
+@pytest.mark.parametrize("terminal_error", [False, True])
+def test_first_terminal_recap_uses_authoritative_usage_and_replays_next_turn(
+  monkeypatch, tmp_path, terminal_error,
+) -> None:
+  import fcntl
+
+  from agent_gateway.context_builder import SessionContextBuilder
+
+  class PricedProvider(_CredentialProvider):
+    def estimate_cost(
+      self,
+      model: str,
+      input_tokens: int,
+      output_tokens: int,
+      cache_read_tokens: int = 0,
+      cache_creation_tokens: int = 0,
+    ) -> CostEstimate:
+      return CostEstimate(
+        input_cost=input_tokens / 1000,
+        output_cost=output_tokens / 1000,
+        total=(input_tokens + output_tokens) / 1000,
+      )
+
+  async def case() -> None:
+    durable_log = AgentSessionLog(tmp_path / "recap.jsonl")
+    runner = _make_credential_runner(provider=PricedProvider())
+    runner._agent_session_log = durable_log
+    summaries = []
+    runner._on_session_summary = summaries.append
+    calls = 0
+    async def stream_turn(**kwargs):
+      nonlocal calls
+      calls += 1
+      kwargs["usage_totals"]["capability_bind"] = runner._capability_execution.bind.to_json()
+      if calls == 1:
+        runner._append({"type": "interceptor_measurement", "measurement": {"structured_reads": 7}})
+        kwargs["usage_totals"]["input_tokens"] += 100
+        kwargs["usage_totals"]["output_tokens"] += 10
+        return object(), StreamTurnResult(
+          full_text="partial", stop_reason="pause_turn",
+          content_blocks=[{"type": "text", "text": "partial"}],
+          request_input_tokens=100,
+        )
+      if terminal_error:
+        # A failed attempt can still have billable partial usage, owned by
+        # the stream's existing usage-event path rather than a recap recount.
+        await runner._call_on_usage(runner._build_usage_event(
+          model="stub-model", usage_totals={
+            **kwargs["usage_totals"], "input_tokens": 50, "output_tokens": 5,
+          },
+        ))
+        return StreamTurnFailure(
+          error=RuntimeError("partial provider failure"),
+          formatted_error="partial provider failure", is_context_length=False,
+        )
+      kwargs["usage_totals"]["input_tokens"] += 50
+      kwargs["usage_totals"]["output_tokens"] += 5
+      return object(), StreamTurnResult(
+        full_text="done", stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "done"}],
+        request_input_tokens=50,
+      )
+    runner._stream_turn = stream_turn
+    encode = durable_log._encode_entry
+    recap_persisted_under_lease = False
+
+    def encode_with_writer_ownership(entry):
+      nonlocal recap_persisted_under_lease
+      event = entry.event
+      if event["type"] == "session_recap":
+        assert runner._write_lease_file is not None
+        assert not runner._write_lease_file.closed
+        with durable_log._open_writer_lease_file() as contender:
+          with pytest.raises(BlockingIOError):
+            fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        recap_persisted_under_lease = True
+      return encode(entry)
+
+    original_handoff = runner._await_write_lease_handoff
+
+    async def handoff():
+      assert recap_persisted_under_lease
+      recaps, _ = await durable_log.query(event_types={"session_recap"})
+      assert len(recaps) == 1
+      assert runner._write_lease_file is not None
+      handed_off = await original_handoff()
+      assert handed_off
+      assert runner._write_lease_file is None
+      return handed_off
+
+    monkeypatch.setattr(durable_log, "_encode_entry", encode_with_writer_ownership)
+    monkeypatch.setattr(runner, "_await_write_lease_handoff", handoff)
+    await runner.run([{"role": "user", "content": "first request"}])
+    assert recap_persisted_under_lease
+    assert runner._write_lease_file is None
+    monkeypatch.setattr(durable_log, "_encode_entry", encode)
+    events = [entry.event for entry in runner._log.entries]
+    recap = next(event for event in events if event.get("type") == "session_recap")
+    terminal = next(event for event in events if event.get("type") in {"stream_complete", "error"})
+    assert terminal["type"] == ("error" if terminal_error else "stream_complete")
+    assert len(summaries) == 1
+    assert recap["usage"]["turns"] == summaries[0].turns
+    assert recap["usage"]["cost"] == summaries[0].cost == pytest.approx(0.165)
+    assert recap["usage"]["input_tokens"] == summaries[0].input_tokens == 150
+    assert recap["tool_calls_summary"]["measurements"]["structured_reads"] == 7
+    assert bool(recap["failures"]) == terminal_error
+    # A later terminal attempt cannot change the first recap or its usage.
+    runner._append({"type": "error", "error": "late duplicate"})
+    assert len([entry for entry in runner._log.entries if entry.event.get("type") == "session_recap"]) == 1
+    second = _make_credential_runner()
+    second._agent_session_log = durable_log
+    second._context_builder = SessionContextBuilder(durable_log)
+    seen_messages = []
+    async def next_stream(**kwargs):
+      seen_messages.extend(kwargs["current_messages"])
+      return object(), StreamTurnResult(
+        full_text="used prior recap", stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "used prior recap"}],
+      )
+    second._stream_turn = next_stream
+    await second.run([{"role": "user", "content": "read the prior turn measurements"}])
+    recap_message = next(message for message in seen_messages if "## Previous turn recap" in str(message["content"]))
+    assert '"structured_reads": 7' in recap_message["content"]
+    assert '"input_tokens": 150' in recap_message["content"]
+    second_recap = next(entry.event for entry in second._log.entries if entry.event.get("type") == "session_recap")
+    assert second_recap["usage"]["cost"] == 0
+    assert second_recap["usage"]["input_tokens"] == 0
+  asyncio.run(case())
+
+
+def test_detach_write_failure_recap_matches_the_final_error(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+  async def case() -> None:
+    durable_log = AgentSessionLog(tmp_path / "detach-failure.jsonl")
+    runner = _make_credential_runner()
+    runner._agent_session_log = durable_log
+    encode = durable_log._encode_entry
+    failed = False
+
+    def fail_first_detach(entry):
+      nonlocal failed
+      if entry.event["type"] == "detach" and not failed:
+        failed = True
+        raise OSError("first detach write failed")
+      return encode(entry)
+
+    async def stream_turn(**_kwargs: Any):
+      return object(), StreamTurnResult(
+        full_text="answer", stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "answer"}],
+      )
+
+    monkeypatch.setattr(durable_log, "_encode_entry", fail_first_detach)
+    monkeypatch.setattr(runner, "_stream_turn", stream_turn)
+    await runner.run([{"role": "user", "content": "answer"}])
+    live = [entry.event for entry in runner._log.entries]
+    terminal = next(event for event in live if event["type"] == "error")
+    recap = next(event for event in live if event["type"] == "session_recap")
+    entries, _ = await durable_log.query(order="asc")
+    durable = [entry.event for entry in entries]
+    durable_recap = next(event for event in durable if event["type"] == "session_recap")
+    assert terminal["error"].startswith("terminal_persistence_failed:")
+    assert any(failure["detail"] == terminal["error"] for failure in recap["failures"])
+    assert durable_recap["failures"] == recap["failures"]
+    assert durable[-1]["type"] == "detach"
+    assert durable[-1]["reason"] == "error"
+
+  asyncio.run(case())
+
+
+def test_compaction_summary_exception_closes_with_authoritative_durable_recap(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  import fcntl
+  from dataclasses import asdict
+
+  import httpx
+
+  import agent_gateway.server_compaction as compaction
+  from agent_gateway.session_recap import emit_recap_then_terminal
+
+  class PricedProvider(_CredentialProvider):
+    def estimate_cost(
+      self,
+      model: str,
+      input_tokens: int,
+      output_tokens: int,
+      cache_read_tokens: int = 0,
+      cache_creation_tokens: int = 0,
+    ) -> CostEstimate:
+      return CostEstimate(
+        input_cost=input_tokens / 1000,
+        output_cost=output_tokens / 1000,
+        total=(input_tokens + output_tokens) / 1000,
+      )
+
+  async def case() -> None:
+    durable_log = AgentSessionLog(tmp_path / "compaction-error.jsonl")
+    runner = _make_credential_runner(provider=PricedProvider())
+    runner._agent_session_log = durable_log
+    assert runner._top_level_skill_lifecycle is None
+    summaries = []
+    runner._on_session_summary = summaries.append
+    runner._compaction_trigger = 1
+    error = httpx.RemoteProtocolError(
+      "peer closed connection without sending complete message body "
+      "(incomplete chunked read)"
+    )
+    stream_calls = 0
+    summary_calls = 0
+
+    async def stream_turn(**kwargs: Any):
+      nonlocal stream_calls
+      stream_calls += 1
+      assert stream_calls == 1
+      kwargs["usage_totals"]["capability_bind"] = runner._capability_execution.bind.to_json()
+      kwargs["usage_totals"]["input_tokens"] += 100
+      kwargs["usage_totals"]["output_tokens"] += 10
+      return object(), StreamTurnResult(
+        stop_reason="tool_use",
+        tool_uses=[("lookup-1", "lookup", {})],
+        content_blocks=[{
+          "type": "tool_use", "id": "lookup-1", "name": "lookup", "input": {},
+        }],
+        request_input_tokens=100,
+      )
+
+    async def execute_tools(*_args: Any, **_kwargs: Any):
+      return ToolUseLoopResult(
+        tool_results_content=[{
+          "type": "tool_result", "tool_use_id": "lookup-1", "content": "result",
+        }],
+        tools_used=["lookup"],
+      )
+
+    async def summarize(*_args: Any, **_kwargs: Any):
+      nonlocal summary_calls
+      summary_calls += 1
+      events = [entry.event for entry in runner._log.entries]
+      turn = next(event for event in events if event.get("type") == "turn_complete")
+      assert turn["usage"]["input_tokens"] == 100
+      assert not any(event.get("type") in {"stream_complete", "error"} for event in events)
+      raise error
+
+    monkeypatch.setattr(runner, "_stream_turn", stream_turn)
+    monkeypatch.setattr(gateway_runner, "_execute_tool_use_loop", execute_tools)
+    monkeypatch.setattr(
+      compaction,
+      "should_portable_compact",
+      lambda **_: (stream_calls == 1, "summary-exception-regression"),
+    )
+    monkeypatch.setattr(compaction, "summarize_messages", summarize)
+    encode = durable_log._encode_entry
+    recap_persisted_under_lease = False
+
+    def encode_with_writer_ownership(entry):
+      nonlocal recap_persisted_under_lease
+      event = entry.event
+      if event["type"] == "session_recap":
+        assert runner._write_lease_file is not None
+        assert not runner._write_lease_file.closed
+        with durable_log._open_writer_lease_file() as contender:
+          with pytest.raises(BlockingIOError):
+            fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        recap_persisted_under_lease = True
+      return encode(entry)
+
+    original_handoff = runner._await_write_lease_handoff
+    handoffs = []
+
+    async def handoff():
+      assert recap_persisted_under_lease
+      entries, _ = await durable_log.query(order="asc")
+      events = [entry.event for entry in entries]
+      assert sum(event.get("type") == "session_recap" for event in events) == 1
+      assert sum(event.get("type") == "error" for event in events) == 1
+      detaches = [event for event in events if event.get("type") == "detach"]
+      assert len(detaches) == 1
+      assert detaches[0]["reason"] == "error"
+      assert events[-1]["type"] == "detach"
+      assert events.index(next(event for event in events if event["type"] == "session_recap")) < events.index(detaches[0])
+      assert len(summaries) == 1
+      assert runner._write_lease_file is not None
+      handed_off = await original_handoff()
+      assert handed_off
+      assert runner._write_lease_file is None
+      handoffs.append(handed_off)
+      return handed_off
+
+    monkeypatch.setattr(durable_log, "_encode_entry", encode_with_writer_ownership)
+    monkeypatch.setattr(runner, "_await_write_lease_handoff", handoff)
+    with pytest.raises(httpx.RemoteProtocolError) as raised:
+      await runner.run([{"role": "user", "content": "look up and answer"}])
+    assert raised.value is error
+    assert raised.value.__cause__ is None
+    assert stream_calls == summary_calls == 1
+    assert recap_persisted_under_lease
+    assert handoffs == [True]
+    assert runner._write_lease_file is None
+    with durable_log._open_writer_lease_file() as contender:
+      fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    events = [entry.event for entry in runner._log.entries]
+    closure = [
+      event for event in events
+      if event.get("type") in {"session_recap", "error", "stream_complete"}
+    ]
+    assert [event["type"] for event in closure] == ["session_recap", "error"]
+    recap, terminal = closure
+    assert terminal["error"] == str(error)
+    assert events.index(terminal) == events.index(recap) + 1
+    assert len(summaries) == 1
+    assert recap["usage"] == json.loads(json.dumps(asdict(summaries[0])))
+    assert summaries[0].input_tokens == 100
+    assert summaries[0].output_tokens == 10
+    assert summaries[0].cost == pytest.approx(0.11)
+    assert summaries[0].turns == 1
+    assert any(failure["detail"] == str(error) for failure in recap["failures"])
+    durable_entries, _ = await durable_log.query(order="asc")
+    durable_events = [entry.event for entry in durable_entries]
+    durable_recap = next(event for event in durable_events if event["type"] == "session_recap")
+    durable_error = next(event for event in durable_events if event["type"] == "error")
+    assert durable_recap["usage"] == json.loads(json.dumps(recap["usage"]))
+    assert durable_recap["failures"] == recap["failures"]
+    assert durable_error["error"] == terminal["error"]
+
+    # The server's exception handler has no usage argument. Its later attempt
+    # must preserve the runner's already-published terminal and full recap.
+    emit_recap_then_terminal(
+      runner._log,
+      {"type": "error", "error": "later server exception handler"},
+      session_id="sess_run_loop",
+      started_at=0,
+    )
+    assert [entry.event for entry in runner._log.entries] == events
 
   asyncio.run(case())

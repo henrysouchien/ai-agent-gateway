@@ -126,6 +126,35 @@ def _write_transcript(
     pass
 
 
+def _write_turn_transcript_entry(
+  active_turn: SessionStream,
+  seq: int,
+  event: Dict[str, Any],
+  *,
+  transcript_dir: Optional[Path],
+  session_id: str,
+  user_id: str | None,
+  channel: str | None,
+  write_transcript: Callable[..., None],
+) -> None:
+  """Append one turn-log entry to the session transcript, once per ``seq``.
+
+  The one writer for a turn's log entries: a live stream subscriber writes each
+  entry as it sends it, and the turn's close writes whatever no subscriber sent
+  — the tail a client that stopped reading at the terminal never saw.
+  """
+  if seq in active_turn.transcript_written_seqs:
+    return
+  active_turn.transcript_written_seqs.add(seq)
+  write_transcript(
+    transcript_dir,
+    session_id,
+    event,
+    user_id=user_id,
+    channel=channel,
+  )
+
+
 def _cleanup_old_transcripts(
   transcript_dir: Optional[Path],
   retention_days: int,

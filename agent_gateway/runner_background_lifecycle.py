@@ -8,6 +8,7 @@ import math
 import secrets
 import sys
 import time
+from pathlib import Path
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple, TypeGuard, Union
 
@@ -28,7 +29,6 @@ from .runner_background_tasks import (
   REQUIRED_SKILL_LIFECYCLE_METADATA_KEY,
   background_asyncio_tasks as _background_asyncio_tasks,
   background_elapsed_seconds as _background_elapsed_seconds,
-  background_task_limit_error as _background_task_limit_error,
   background_task_payload as _background_task_payload,
   background_task_reminder_text as _background_task_reminder_text,
   background_result_task as _background_result_task,
@@ -75,6 +75,7 @@ from .runner_run_loop_defaults import MAX_NOTIFICATIONS_PER_TURN as _MAX_NOTIFIC
 from .runner_session_events import build_agent_completion_event as _build_agent_completion_event
 from .runner_session_lifecycle import _exact_value_match, _runner_attr
 from .session import GatewaySession
+from .research_file_activity_lock import try_acquire_research_file_activity
 from .events import AgentCompletionEvent, TypedEvent, event_from_dict
 from .final_narrative_artifact import FinalNarrativeArtifactError
 from .skill_result_events import build_skill_result_captured_event
@@ -95,6 +96,34 @@ from .task_registry import (
   resolve_required_skill_result_marker,
   task_state_for_result,
 )
+
+
+class _RunResearchFileActivityLease:
+  """One run's exact-file leases, retained by its existing teardown owner."""
+
+  def __init__(self) -> None:
+    self._leases: dict[int | None, Any] = {}
+
+  def bind(self, lease: Any, research_file_id: int | None) -> None:
+    self._leases[research_file_id] = lease
+
+  def ensure(self, workspace_dir: Path, research_file_id: int) -> bool:
+    if research_file_id in self._leases:
+      return True
+    lease = try_acquire_research_file_activity(
+      workspace_dir,
+      research_file_id=research_file_id,
+      exclusive=False,
+    )
+    if lease is None:
+      return False
+    self._leases[research_file_id] = lease
+    return True
+
+  def release(self) -> None:
+    leases, self._leases = self._leases, {}
+    for lease in reversed(tuple(leases.values())):
+      lease.release()
 
 
 BackgroundTaskHandler = Callable[..., Awaitable[Tuple[Optional[Any], Optional[Dict[str, Any]]]]]
@@ -243,7 +272,6 @@ class RunnerBackgroundLifecycleMixin:
     _background_notifications_enabled: bool
     _gateway_session_id: str
     _max_concurrent_sub_agents: int | None
-    _max_resume_chain_depth: int
     _notification_queue: NotificationQueue
     _parent_turn_id: str | None
     _role: str
@@ -251,6 +279,8 @@ class RunnerBackgroundLifecycleMixin:
     _sid: str
     _task_registry: TaskRegistry
     _workspace_dir: str | None
+
+    def _append(self, event: Dict[str, Any]) -> Any | None: ...
 
     async def _append_durable_event(
       self,
@@ -2531,7 +2561,6 @@ class RunnerBackgroundLifecycleMixin:
     admitted_task: AdmittedTask | None = None,
     parent_result_policy: ParentResultPolicy | None = None,
     task_id_override: str | None = None,
-    terminal_replay: bool = False,
     validate_resume_source: bool = False,
     resume_source_entry: TaskEntry | None = None,
   ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -2614,21 +2643,14 @@ class RunnerBackgroundLifecycleMixin:
       source_error = _source_error()
       if source_error is not None:
         return None, source_error
-      resume_task_id, resume_error = await _runner_attr(self, "_resume_task_id_override", _resume_task_id_override)(
+      resume_task_id = await _runner_attr(self, "_resume_task_id_override", _resume_task_id_override)(
         original_task_id,
-        max_resume_chain_depth=(
-          sys.maxsize
-          if terminal_replay
-          else self._max_resume_chain_depth
-        ),
         resume_chain_depth=self._resume_chain_depth,
         resume_root=self._resume_root_task_id,
       )
       source_error = _source_error()
       if source_error is not None:
         return None, source_error
-      if resume_error is not None:
-        return None, resume_error
       if resolved_task_id is not None and resolved_task_id != resume_task_id:
         return None, {
           "code": "resume_successor_conflict",
@@ -2712,22 +2734,16 @@ class RunnerBackgroundLifecycleMixin:
         return None, source_error
 
     # ---- Atomic admission -------------------------------------------------
-    # One synchronous critical section folds the capacity ceiling, the
-    # notification-retrieval ceiling, and the reservation. A rejection here
-    # produces no durable ``task_registered`` at all (D-A8-3).
+    # One synchronous critical section folds the notification-retrieval
+    # ceiling and the reservation. A rejection here produces no durable
+    # ``task_registered`` at all (D-A8-3). The in-flight count is measured
+    # below, never refused: an admitted child waits on the sub-agent
+    # semaphore for an execution slot.
     entry, rejection = self._task_registry.admit(
       task_type,
       agent_name=agent_name,
       task_id=resolved_task_id,
       original_task_id=original_task_id,
-      reject_over_capacity=lambda admission_count, ceiling: _runner_attr(
-        self,
-        "_background_task_limit_error",
-        _background_task_limit_error,
-      )(
-        admission_count=admission_count,
-        max_background_tasks=ceiling,
-      ),
       reject_retrieval_backpressure=(
         lambda pending_omitted_results, retention_limit: {
           "code": "background_notification_retrieval_required",
@@ -2746,6 +2762,10 @@ class RunnerBackgroundLifecycleMixin:
       return None, rejection
     if entry is None:
       raise RuntimeError("task admission returned neither entry nor rejection")
+    self._append({
+      "type": "interceptor_measurement",
+      "measurement": {"concurrent_sub_agents": self._task_registry.admission_count},
+    })
 
     # ``admit`` may hand back a reservation another caller took while this
     # one was in its pre-decision awaits. Re-read the reservation's live
@@ -3273,13 +3293,26 @@ class RunnerBackgroundLifecycleMixin:
       )
 
   def bind_research_file_activity_lease(self, lease: Any) -> None:
-    """Transfer one parent-run shared lease to the background-task owner."""
+    """Transfer pre-bound activity to the run's exact-file lease owner."""
 
     if lease is None or not callable(getattr(lease, "release", None)):
       raise TypeError("research file activity lease is invalid")
     if getattr(self, "_research_file_activity_lease", None) is not None:
       raise RuntimeError("research file activity lease is already bound")
-    self._research_file_activity_lease = lease
+    activity = _RunResearchFileActivityLease()
+    activity.bind(lease, getattr(self, "_context_research_file_id", None))
+    self._research_file_activity_lease = activity
+
+  def ensure_research_file_activity(
+    self, workspace_dir: Path, research_file_id: int
+  ) -> bool:
+    """Fence lazy bindings until this run and its tracked children settle."""
+
+    activity = getattr(self, "_research_file_activity_lease", None)
+    if activity is None:
+      activity = _RunResearchFileActivityLease()
+      self._research_file_activity_lease = activity
+    return activity.ensure(workspace_dir, research_file_id)
 
   def release_research_file_activity_lease_if_owned(self) -> None:
     """Release an unstarted transfer, retaining it for any tracked children."""

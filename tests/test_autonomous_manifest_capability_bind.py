@@ -74,7 +74,6 @@ def _record(*, capability_bind: CapabilityBind) -> autonomous_runner_state.Auton
     ticker=None,
     channel="tui",
     dev_mode=False,
-    max_budget_usd=1.0,
     research_file_id=None,
     dispatch_scope=None,
     cmd=["python", "-m", "job"],

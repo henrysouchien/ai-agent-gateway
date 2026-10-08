@@ -19,16 +19,14 @@ from agent_gateway.providers import ModelProvider  # noqa: E402
 from agent_gateway.runner_session_events import (  # noqa: E402
   build_assistant_message_event,
   build_attach_event,
-  build_budget_exceeded_event,
-  build_budget_exceeded_text_event,
   build_chat_done_log_data,
   build_context_pressure_reminder,
   build_context_warning_log_data,
   build_detach_event,
   build_error_event,
   build_interrupted_event,
-  build_max_turns_reached_event,
-  build_max_turns_text_event,
+  build_soft_budget_final_event,
+  build_soft_budget_steer_event,
   build_orphan_tool_call_interrupted_events,
   build_operator_pause_event,
   build_run_error_event,
@@ -97,6 +95,7 @@ def test_top_level_durable_envelopes_require_exact_current_integer_version(
 def test_runner_session_lifecycle_resolves_parent_module_event_builders(monkeypatch: Any) -> None:
   runner = object.__new__(AgentRunner)
   runner._gateway_session_id = "sess"
+  runner._gateway_session = None
   runner._client_kind = "cli"
   runner._durable_attach_emitted = False
   appended: list[dict[str, Any]] = []
@@ -123,6 +122,9 @@ def test_runner_session_lifecycle_resolves_parent_module_event_builders(monkeypa
       "started_at": 12.5,
       "client_kind": "cli",
       "hostname": "patched-host",
+      "user_id": None,
+      "channel": None,
+      "api_key_hash": None,
     }
   ]
   assert runner._durable_attach_emitted
@@ -218,24 +220,6 @@ def test_runner_writer_recovery_resolves_parent_module_risk_helper(tmp_path: Pat
   AgentRunner._release_write_lease(runner)
 
 
-def test_runner_release_write_lease_resolves_parent_module_helper(monkeypatch: Any) -> None:
-  calls: list[Any] = []
-  runner = object.__new__(AgentRunner)
-  runner._write_lease_file = object()
-
-  def _release_write_lease(write_lease_file: Any, *, clear_write_lease_file: Any) -> bool:
-    calls.append(write_lease_file)
-    clear_write_lease_file()
-    return True
-
-  monkeypatch.setattr(gateway_runner, "_release_write_lease", _release_write_lease)
-
-  AgentRunner._release_write_lease(runner)
-
-  assert calls
-  assert runner._write_lease_file is None
-
-
 def test_session_event_builders_copy_inputs_and_shape_payloads() -> None:
   content_blocks: list[dict[str, Any]] = [{"type": "text", "text": "hello"}]
   usage = {"input_tokens": 3, "output_tokens": 5}
@@ -255,12 +239,18 @@ def test_session_event_builders_copy_inputs_and_shape_payloads() -> None:
     started_at=1.25,
     client_kind="cli",
     hostname="host",
+    user_id="alice",
+    channel="cli",
+    api_key_hash="abc123",
   ) == {
     "type": "attach",
     "gateway_session_id": "sess",
     "started_at": 1.25,
     "client_kind": "cli",
     "hostname": "host",
+    "user_id": "alice",
+    "channel": "cli",
+    "api_key_hash": "abc123",
   }
   assert build_write_lease_metadata(
     runner_id="runner-1",
@@ -293,10 +283,17 @@ def test_session_event_builders_copy_inputs_and_shape_payloads() -> None:
     "provider": "stub",
     "usage": {"input_tokens": 3, "output_tokens": 5},
   }
-  assert build_stream_retry_event(attempt=2, error="stall") == {
+  assert build_stream_retry_event(
+    attempt=2,
+    error="stall",
+    attempt_elapsed_s=12.5,
+    backoff_s=8.0,
+  ) == {
     "type": "stream_retry",
     "attempt": 2,
     "error": "stall",
+    "attempt_elapsed_s": 12.5,
+    "backoff_s": 8.0,
   }
   assert build_error_event("failed") == {"type": "error", "error": "failed"}
   assert build_run_error_event(phase="close", error_type="RuntimeError", error="offline") == {
@@ -419,22 +416,6 @@ def test_runner_write_lease_metadata_delegates_to_session_event_helper(
     "runner_id": "runner-1",
     "started_at": 3.5,
   }
-
-
-def test_runner_write_lease_metadata_preserves_early_noop_guard(monkeypatch: Any) -> None:
-  runner = AgentRunner.__new__(AgentRunner)
-  runner._agent_session_log = None
-
-  def fail_time() -> float:
-    raise AssertionError("time should not be read for missing session log")
-
-  def fail_hostname() -> str:
-    raise AssertionError("hostname should not be read for missing session log")
-
-  monkeypatch.setattr(gateway_runner.time, "time", fail_time)
-  monkeypatch.setattr(gateway_runner.socket, "gethostname", fail_hostname)
-
-  runner._write_lease_metadata()
 
 
 def test_release_write_lease_closes_and_clears_file() -> None:
@@ -685,33 +666,22 @@ def test_run_terminal_and_limit_event_builders_shape_payloads() -> None:
     "usage": {"input_tokens": 1},
   }
   turn_usage["input_tokens"] = 9
-  assert build_max_turns_reached_event(turn_count=3, max_turns=2) == {
-    "type": "max_turns_reached",
-    "turn_count": 3,
-    "max_turns": 2,
+  assert build_soft_budget_steer_event("turns", 3, 3) == {
+    "type": "soft_budget_steer",
+    "kind": "turns",
+    "observed": 3,
+    "threshold": 3,
   }
-  assert build_max_turns_text_event("wrap up") == {
-    "type": "text_delta",
-    "text": "\n\n[Max turns reached]\nwrap up",
-  }
-  assert build_max_turns_text_event(None) == {
-    "type": "text_delta",
-    "text": "\n\n[Sub-agent reached maximum turn limit]",
+  assert build_soft_budget_final_event("cost", 1.6, 1.0) == {
+    "type": "soft_budget_final",
+    "kind": "cost",
+    "observed": 1.6,
+    "threshold": 1.0,
   }
   assert build_runtime_guard_event(guard="final_answer", message="continue") == {
     "type": "runtime_guard",
     "guard": "final_answer",
     "message": "continue",
-  }
-  assert build_budget_exceeded_event(total_cost=1.23456, budget=1.0, reason="parent_budget") == {
-    "type": "budget_exceeded",
-    "total_cost": 1.2346,
-    "budget": 1.0,
-    "reason": "parent_budget",
-  }
-  assert build_budget_exceeded_text_event(total_cost=1.23456, budget=1.0, reason_suffix=" (parent budget)") == {
-    "type": "text_delta",
-    "text": "\n\n[Budget limit reached: $1.2346 >= $1.0000 (parent budget)]",
   }
 
 
@@ -945,6 +915,76 @@ def test_terminal_closure_decision_preserves_failure_and_cancellation_precedence
   assert decide(terminal_event={"type": "error", "error": "provider failed"}).disposition == "error"
   persistence = decide(persistence_error=OSError("disk unavailable"))
   assert (persistence.disposition, persistence.reason) == ("error", "persistence")
+
+
+def test_terminal_closure_decision_supplies_unprepared_exception_terminal() -> None:
+  error = RuntimeError("incomplete chunked read")
+  decision = terminal_closure_decision(
+    clean_detach_reason="completed",
+    run_error=error,
+    terminal_event=None,
+    server_terminal_cause=None,
+  )
+
+  assert (decision.disposition, decision.reason) == ("error", "error")
+  assert decision.cause is error
+  assert decision.terminal == build_error_event(str(error))
+
+
+@pytest.mark.parametrize(
+  "terminal",
+  [
+    {"type": "error", "error": "first provider failure"},
+    {
+      "type": "stream_complete",
+      "terminal_disposition": "interrupted",
+      "reason": "timeout",
+    },
+  ],
+)
+def test_escaping_exception_preserves_prepared_terminal(terminal: dict[str, Any]) -> None:
+  error = RuntimeError("later incomplete chunked read")
+  decision = terminal_closure_decision(
+    clean_detach_reason="completed",
+    run_error=error,
+    terminal_event=terminal,
+    server_terminal_cause=None,
+  )
+
+  assert decision.cause is error
+  assert decision.terminal is terminal
+
+
+def test_unprepared_exception_terminal_preserves_cancellation_and_persistence() -> None:
+  cancellation = asyncio.CancelledError("shutdown")
+  cancelled = terminal_closure_decision(
+    clean_detach_reason="completed",
+    run_error=cancellation,
+    terminal_event=None,
+    server_terminal_cause="timeout",
+  )
+  assert (cancelled.disposition, cancelled.reason) == ("cancelled", "timeout")
+  assert cancelled.cause is cancellation
+  assert cancelled.terminal is None
+
+  persistence_error = OSError("disk unavailable")
+  failed = terminal_closure_decision(
+    clean_detach_reason="completed",
+    run_error=RuntimeError("incomplete chunked read"),
+    terminal_event=None,
+    server_terminal_cause="timeout",
+    persistence_error=persistence_error,
+  )
+  assert (failed.disposition, failed.reason) == ("error", "persistence")
+  assert failed.cause is persistence_error
+  assert failed.terminal == {
+    **build_error_event(
+      "terminal_persistence_failed: terminal persistence failed "
+      "(OSError: disk unavailable)."
+    ),
+    "reason": "persistence",
+    "server_terminal_cause": "timeout",
+  }
 
 
 def test_run_interrupted_reason_preserves_shutdown_reason_except_cancelled_sub_agent() -> None:

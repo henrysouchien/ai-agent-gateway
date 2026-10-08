@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -27,17 +26,11 @@ from model_authority.bind import CapabilityBind
 from .event_log import EventLog
 from .fork_ledger import ForkLedger
 from .fork_request_handoff import ForkRequestHandoff
-from .fork_scope_receipt import (
-  ForkScopeReceipt,
-  ForkToolDecision,
-  fork_scope_receipt_dict,
-  parse_fork_scope_receipt,
-)
-from .fork_task_registry import ForkTaskRegistry, learn_fork_budget_usd
+from .fork_task_registry import ForkTaskRegistry
 from .runner_cleanup import cleanup_failure_notes
 from .runner_introspection import derive_sub_agent_id
 from .runner_session_lifecycle import _runner_attr
-from .runner_state import ChildCostAccumulator
+from .runner_budget import CostAccumulator
 from .runner_sub_agents import (
   _ChildActivity,
   _await_child_under_activity_guard,
@@ -63,27 +56,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("agent_gateway.runner")
 FORK_PLACEHOLDER = "Fork started — processing continues in the parent."
-FORK_SUFFIX_WRAP_UP_REMINDER = (
-  "Fork suffix limit reached. Stop expanding the investigation and finish "
-  "now with a complete normal final assistant message."
-)
-DEFAULT_FORK_SUFFIX_MAX_TOKENS = 20_000
-FORK_SCOPE_RECEIPT_EVENT_TYPE = "fork_scope_receipt"
 FORK_MARKER_EVENT_FIELD = "fork"
-FORK_ORCHESTRATION_TOOLS = frozenset({
-  "run_agent",
-  "get_background_result",
-  "resume_background_agent",
-  "send_message",
-})
-LEARNING_FORK_ALLOWED_TOOLS = frozenset({
-  "memory_recall",
-  "memory_list",
-  "memory_read",
-  "memory_write",
-  "list_skills",
-})
-LEARNING_FORK_MAX_TURNS = 10
 _LEARNING_FORK_OPERATION = AgentOperationRef(
   namespace="agent-operation",
   name="learning-fork",
@@ -129,20 +102,18 @@ class LearningForkWorkItem:
   session_id: str
   owner: str
   user_id: str
-  receipt_text: str | None = None
+  fork_events: Sequence[Any] = ()
 
   @property
   def _fork_retained_payload(self) -> ForkRequestHandoff:
     return self.handoff
 
   def on_admission_settled(self, fork_id: str) -> None:
-    if not self.receipt_text:
-      raise RuntimeError("learning fork has no receipt to publish")
     self.ledger.write_receipt(
       fork_id=fork_id,
       session_id=self.session_id,
       owner=self.owner,
-      receipt_text=self.receipt_text,
+      receipt_text=_learning_receipt_text(self.fork_events),
     )
 
 
@@ -161,72 +132,6 @@ def _bind_learning_fork_execution(
     adapter=parent_execution.adapter,
     auth_config=parent_execution.auth_config,
   )
-
-
-def _positive_env_int(name: str, default: int) -> int:
-  raw = os.getenv(name)
-  if raw is None:
-    return default
-  try:
-    value = int(raw)
-  except (TypeError, ValueError) as exc:
-    raise ValueError(f"{name} must be a positive integer") from exc
-  if value <= 0:
-    raise ValueError(f"{name} must be a positive integer")
-  return value
-
-
-def fork_suffix_max_tokens() -> int:
-  return _positive_env_int(
-    "HANK_FORK_SUFFIX_MAX_TOKENS",
-    DEFAULT_FORK_SUFFIX_MAX_TOKENS,
-  )
-
-
-def build_side_quest_tool_decisions(
-  wire_tools: Sequence[Mapping[str, Any]],
-  *,
-  is_classified: Callable[[str], bool],
-) -> tuple[ForkToolDecision, ...]:
-  decisions: list[ForkToolDecision] = []
-  seen: set[str] = set()
-  for definition in wire_tools:
-    name = str(definition.get("name") or "").strip()
-    if not name or name in seen:
-      raise ValueError("fork wire tools must have unique non-empty names")
-    seen.add(name)
-    if name in FORK_ORCHESTRATION_TOOLS:
-      decision = "deny"
-      reason = "orchestration surface"
-    elif not is_classified(name):
-      decision = "deny"
-      reason = "unclassified tool"
-    else:
-      decision = "allow"
-      reason = "parent surface"
-    decisions.append(ForkToolDecision(name, decision, reason))
-  return tuple(sorted(decisions, key=lambda item: item.tool))
-
-
-def build_learning_fork_tool_decisions(
-  wire_tools: Sequence[Mapping[str, Any]],
-) -> tuple[ForkToolDecision, ...]:
-  """Classify the exact wire surface against the closed five-tool allowlist."""
-
-  decisions: list[ForkToolDecision] = []
-  seen: set[str] = set()
-  for definition in wire_tools:
-    name = str(definition.get("name") or "").strip()
-    if not name or name in seen:
-      raise ValueError("fork wire tools must have unique non-empty names")
-    seen.add(name)
-    allowed = name in LEARNING_FORK_ALLOWED_TOOLS
-    decisions.append(ForkToolDecision(
-      name,
-      "allow" if allowed else "deny",
-      "learning fork closed allowlist" if allowed else "not in learning allowlist",
-    ))
-  return tuple(sorted(decisions, key=lambda item: item.tool))
 
 
 def cross_check_learning_memory_writes(
@@ -278,72 +183,6 @@ def cross_check_learning_memory_writes(
       caveats[-1] = caveat
   checked["caveats"] = caveats
   return checked
-
-
-class ForkPolicyDispatcher:
-  """Dispatch-layer fork policy while preserving the parent's wire catalog."""
-
-  def __init__(
-    self,
-    dispatcher: Any,
-    *,
-    wire_tools: Sequence[dict[str, Any]],
-    receipt: ForkScopeReceipt,
-  ) -> None:
-    self._dispatcher = dispatcher
-    self._wire_tools = copy.deepcopy(list(wire_tools))
-    self._decisions = {
-      decision.tool: decision
-      for decision in receipt.tool_decisions
-    }
-    if set(self._decisions) != {
-      str(definition.get("name") or "").strip()
-      for definition in self._wire_tools
-    }:
-      raise ValueError(
-        "fork dispatch policy must classify the exact wire tool set"
-      )
-
-  def __getattr__(self, name: str) -> Any:
-    return getattr(self._dispatcher, name)
-
-  def get_tool_definitions(self) -> list[dict[str, Any]]:
-    return copy.deepcopy(self._wire_tools)
-
-  async def dispatch(
-    self,
-    tool_call_id: str,
-    tool_name: str,
-    tool_input: dict[str, Any],
-    *,
-    allow_uncertain_mcp_replay: bool = True,
-    **kwargs: Any,
-  ) -> tuple[Any | None, dict[str, Any] | None]:
-    if type(allow_uncertain_mcp_replay) is not bool:
-      raise TypeError("allow_uncertain_mcp_replay must be an exact bool")
-    decision = self._decisions.get(str(tool_name or "").strip())
-    if decision is None or decision.decision != "allow":
-      normalized = str(tool_name or "").strip() or "<unknown>"
-      return None, {
-        "code": "fork_policy_denied",
-        "message": (
-          f"fork policy: {normalized} is not available in a forked child"
-        ),
-        "data": {
-          "tool": normalized,
-          "fork_kind": "side_quest",
-          "reason": (
-            decision.reason if decision is not None else "unclassified tool"
-          ),
-        },
-      }
-    return await self._dispatcher.dispatch(
-      tool_call_id,
-      tool_name,
-      tool_input,
-      allow_uncertain_mcp_replay=allow_uncertain_mcp_replay,
-      **kwargs,
-    )
 
 
 def _tool_use_ids(message: Mapping[str, Any]) -> list[str]:
@@ -440,8 +279,7 @@ def fork_boilerplate(
     raise ValueError("fork directive must be non-empty")
   return (
     "You are a side-quest fork of the parent conversation. Preserve the "
-    "inherited context, stay concise, and do not call run_agent or any "
-    "background/resume management tool. Finish with a normal assistant "
+    "inherited context and stay concise. Finish with a normal assistant "
     "message containing the complete result. The runtime owns result typing "
     "and persistence.\n\n"
     f"Fork directive:\n{normalized}"
@@ -554,11 +392,6 @@ async def spawn_fork_agent(
   local_handler_scopes: (
     Mapping[str, Callable[[LocalToolHandler], LocalToolHandler]] | None
   ) = None,
-  scope_receipt: Mapping[str, Any],
-  max_turns: int,
-  max_budget_usd: float,
-  suffix_ceiling: int,
-  client_timeout: float = 90,
   call_index: int = 0,
   parent_turn_id: str | None = None,
   task_entry: TaskEntry | None = None,
@@ -571,14 +404,10 @@ async def spawn_fork_agent(
   if not isinstance(capability_execution, BoundCapabilityExecution):
     raise TypeError("spawn_fork_agent requires BoundCapabilityExecution")
   capability_execution.validate()
-  if capability_execution.bind.capability_id != "node.fork":
-    raise ValueError("spawn_fork_agent requires a node.fork capability bind")
   if not isinstance(attempt, AttemptRef):
     raise TypeError("spawn_fork_agent requires an exact AttemptRef")
   if not isinstance(result_requirement, ResultRequirement):
     raise TypeError("spawn_fork_agent requires a ResultRequirement")
-  if result_requirement.mode != "narrative":
-    raise ValueError("fork agents return a normal terminal message")
   if not isinstance(result_provenance, TaskResultProvenance):
     raise TypeError("spawn_fork_agent requires exact admitted provenance")
   if task_entry is not None and task_entry.admitted_task is not None:
@@ -595,15 +424,6 @@ async def spawn_fork_agent(
       or admitted.tool_grant_digest != result_provenance.tool_grant_digest
     ):
       raise ValueError("spawn_fork_agent identity differs from admitted task")
-  receipt = parse_fork_scope_receipt(scope_receipt)
-  if (
-    handoff.capability_bind != parent._capability_execution.bind
-    or receipt.capability_bind != capability_execution.bind
-    or receipt.max_turns != max_turns
-    or receipt.suffix_ceiling != suffix_ceiling
-    or receipt.resolved_budget_usd != max_budget_usd
-  ):
-    raise ValueError("fork scope receipt does not match spawn configuration")
   sub_session_id = _runner_attr(
     parent,
     "_derive_sub_agent_id",
@@ -625,28 +445,17 @@ async def spawn_fork_agent(
     session_id=sub_session_id,
     local_handler_scopes=local_handler_scopes,
   )
-  policy_dispatcher = ForkPolicyDispatcher(
-    child_dispatcher,
-    wire_tools=handoff.wire_tools,
-    receipt=receipt,
-  )
-  child_get_tool_definitions = (
-    policy_dispatcher.get_tool_definitions
-  )
-  sub_log.append({
-    "type": FORK_SCOPE_RECEIPT_EVENT_TYPE,
-    "receipt": receipt.to_dict(),
-  })
-  child_accumulator = ChildCostAccumulator(
-    None if independent_accounting else parent._cost_accumulator,
-    max_budget_usd,
-  )
+  wire_tools = copy.deepcopy(list(handoff.wire_tools))
+
+  def child_get_tool_definitions() -> list[dict[str, Any]]:
+    return copy.deepcopy(wire_tools)
+
+  child_accumulator = CostAccumulator()
   sub_runner = type(parent)(
     event_log=sub_log,
-    dispatcher=policy_dispatcher,
+    dispatcher=child_dispatcher,
     session_id=sub_session_id,
     capability_execution=capability_execution,
-    client_timeout=client_timeout,
     max_tokens_override=handoff.max_tokens,
     stream_stall_timeout=parent._stream_stall_timeout,
     mcp_client=parent._mcp_client,
@@ -670,8 +479,6 @@ async def spawn_fork_agent(
     compaction_trigger=parent._compaction_trigger,
     compaction_instructions=None,
     tool_call_timeout=parent._tool_call_timeout,
-    on_max_turns=parent._on_max_turns,
-    max_budget_usd=max_budget_usd,
     _cost_accumulator=child_accumulator,
     _parent_aggregator=(
       None if independent_accounting else parent._aggregator
@@ -696,8 +503,8 @@ async def spawn_fork_agent(
     ),
   )
   sub_runner._fork_mode = True
-  sub_runner._fork_suffix_max_tokens = suffix_ceiling
-  sub_runner._fork_scope_receipt = receipt.to_dict()
+  sub_runner._soft_budget_kind = "fork"
+  sub_runner._fork_suffix_tokens = 0
   sub_runner._tenant_id = handoff.tenant_id
   child_messages, child_marker_position = _build_fork_context(handoff, directive)
   sub_runner._fork_marker_position = child_marker_position
@@ -710,7 +517,6 @@ async def spawn_fork_agent(
   run_coro = sub_runner.run(
     messages=child_messages[-1:],
     system_prompt=list(handoff.rendered_system_blocks),
-    max_turns=max_turns,
     resume_initial_messages=child_messages,
   )
   try:
@@ -753,6 +559,19 @@ async def spawn_fork_agent(
       task_entry=task_entry,
       cleanup_warnings=cleanup_warnings,
     )
+    # Measurements, never stops: the fork's log is closed by its terminal
+    # event, so they ride the structured run log beside chat_done.
+    log.info(
+      "fork measurements",
+      extra={
+        "data": {
+          "event": "fork_measurements",
+          "sub_agent_id": sub_session_id,
+          "turns": _count_events(sub_log.entries, "turn_complete"),
+          "suffix_tokens": sub_runner._fork_suffix_tokens,
+        }
+      },
+    )
     if child_cost_observer is not None:
       child_cost_observer(child_accumulator.total)
 
@@ -791,6 +610,15 @@ async def spawn_fork_agent(
   return result, None
 
 
+def _count_events(event_entries: Sequence[Any], event_type: str) -> int:
+  count = 0
+  for raw in event_entries:
+    event = raw.event if hasattr(raw, "event") else raw
+    if isinstance(event, Mapping) and event.get("type") == event_type:
+      count += 1
+  return count
+
+
 def _learning_receipt_text(event_entries: Sequence[Any]) -> str:
   """Summarize deterministic tool effects, never the model's prose shape."""
 
@@ -818,7 +646,7 @@ def learning_fork_result_provenance(
   objective: str,
   result_requirement: ResultRequirement,
   execution: BoundCapabilityExecution,
-  scope_receipt: Mapping[str, Any],
+  wire_tools: Sequence[Mapping[str, Any]],
 ) -> TaskResultProvenance:
   """Derive fork provenance from the canonical full-payload admission digest.
 
@@ -826,8 +654,9 @@ def learning_fork_result_provenance(
   :func:`agent_gateway.sub_agent.seal_admitted_task_payload` over the complete
   admission payload (component digests included). The learning fork's
   admission artifacts are its logical task, attempt, objective, operation ref,
-  result requirement, inherited model bind, and fork scope receipt; the digest
-  covers all of them rather than a bespoke field subset.
+  result requirement, inherited model bind, and its tool grant — the parent's
+  exact wire tool surface; the digest covers all of them rather than a bespoke
+  field subset.
   """
   from .sub_agent import seal_admitted_task_payload
 
@@ -836,7 +665,11 @@ def learning_fork_result_provenance(
     "kind": "dynamic_parent_bind",
     "bind": execution.bind.model_dump(mode="json"),
   })
-  tool_grant_digest = sha256_digest(scope_receipt)
+  tool_grant = {
+    "kind": "parent_wire_surface",
+    "tools": [str(definition.get("name") or "") for definition in wire_tools],
+  }
+  tool_grant_digest = sha256_digest(tool_grant)
   admission_payload = seal_admitted_task_payload({
     "schema_version": "1.0",
     "admitted_task_id": f"admitted:{physical_task_id}",
@@ -846,7 +679,7 @@ def learning_fork_result_provenance(
     "operation": _LEARNING_FORK_OPERATION.model_dump(mode="json"),
     "result_requirement": result_requirement.model_dump(mode="json"),
     "model_bind": execution.bind.model_dump(mode="json"),
-    "scope_receipt": dict(scope_receipt),
+    "tool_grant": tool_grant,
     "model_bind_digest": model_bind_digest,
     "capability_binding_digest": capability_binding_digest,
     "tool_grant_digest": tool_grant_digest,
@@ -898,17 +731,6 @@ async def spawn_learning_fork(
     outcome=OutcomeRequirement(required=False, source="none"),
   )
   event_log_box: list[EventLog] = []
-  budget = float(learn_fork_budget_usd())
-  suffix_ceiling = fork_suffix_max_tokens()
-  scope_receipt = fork_scope_receipt_dict(
-    tool_decisions=build_learning_fork_tool_decisions(handoff.wire_tools),
-    capability_bind=execution.bind,
-    tenant_id=handoff.tenant_id,
-    billing_mode=handoff.billing_mode,
-    resolved_budget_usd=budget,
-    max_turns=LEARNING_FORK_MAX_TURNS,
-    suffix_ceiling=suffix_ceiling,
-  )
   result_provenance = learning_fork_result_provenance(
     physical_task_id=physical_task_id,
     logical_task=logical_task,
@@ -916,7 +738,7 @@ async def spawn_learning_fork(
     objective=work_item.config.directive,
     result_requirement=result_requirement,
     execution=execution,
-    scope_receipt=scope_receipt,
+    wire_tools=handoff.wire_tools,
   )
   child_cost: list[float] = []
   result, error = await spawn_fork_agent(
@@ -936,10 +758,6 @@ async def spawn_learning_fork(
         user_id=work_item.user_id,
       ),
     },
-    scope_receipt=scope_receipt,
-    max_turns=LEARNING_FORK_MAX_TURNS,
-    max_budget_usd=budget,
-    suffix_ceiling=suffix_ceiling,
     call_index=call_index,
     parent_turn_id=str(getattr(parent, "_request_id", "") or ""),
     event_log_observer=event_log_box.append,
@@ -948,26 +766,16 @@ async def spawn_learning_fork(
   )
   if error is not None or result is None or result.execution.status != "succeeded":
     raise RuntimeError("learning fork did not complete successfully")
-  work_item.receipt_text = _learning_receipt_text(
-    event_log_box[0].entries if event_log_box else (),
-  )
+  work_item.fork_events = event_log_box[0].entries if event_log_box else ()
   return Decimal(str(child_cost[-1] if child_cost else 0))
 
 
 __all__ = [
-  "DEFAULT_FORK_SUFFIX_MAX_TOKENS",
   "FORK_PLACEHOLDER",
-  "FORK_SUFFIX_WRAP_UP_REMINDER",
-  "ForkPolicyDispatcher",
-  "LEARNING_FORK_ALLOWED_TOOLS",
-  "LEARNING_FORK_MAX_TURNS",
   "LearningForkConfig",
   "LearningForkWorkItem",
   "build_fork_messages",
-  "build_learning_fork_tool_decisions",
-  "build_side_quest_tool_decisions",
   "cross_check_learning_memory_writes",
-  "fork_suffix_max_tokens",
   "fork_suffix_messages",
   "learning_fork_result_provenance",
   "spawn_fork_agent",

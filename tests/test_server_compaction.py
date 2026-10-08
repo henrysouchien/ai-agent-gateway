@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -26,6 +27,7 @@ from model_authority.thinking import ThinkingLevel
 from model_authority.binding import CapabilityEffort
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.providers.base import truncate_to_last_compaction
+from agent_gateway.context_builder import SessionContextBuilder
 from agent_gateway.server_compaction import (
   CONTINUATION_NUDGE,
   KEEP_ROUNDS,
@@ -386,7 +388,6 @@ def _run_runner(
   messages: list[dict[str, Any]],
   event_log: EventLog | None = None,
   agent_session_log: AgentSessionLog | None = None,
-  max_turns: int | None = None,
   compaction_trigger: int = 20,
   effort: CapabilityEffort = "high",
   model: str = "model",
@@ -413,7 +414,7 @@ def _run_runner(
   with pytest.MonkeyPatch.context() as monkeypatch:
     monkeypatch.setattr(server_compaction, "MIN_COMPACT_GAIN_TOKENS", 500)
     monkeypatch.setattr(runner_run_loop, "MIN_COMPACT_GAIN_TOKENS", 500)
-    _run(runner.run(messages, max_turns=max_turns))
+    _run(runner.run(messages))
   return log
 
 
@@ -760,7 +761,6 @@ def test_runner_portable_compact_mid_loop() -> None:
   event_log = _run_runner(
     provider,
     messages=[{"role": "user", "content": LONG_INPUT}],
-    max_turns=3,
     effort="medium",
   )
 
@@ -784,7 +784,6 @@ def test_runner_haiku_uses_portable_compaction_without_native_payload() -> None:
   _run_runner(
     provider,
     messages=[{"role": "user", "content": LONG_INPUT}],
-    max_turns=1,
     effort="none",
     model="claude-haiku-4-5",
   )
@@ -802,7 +801,6 @@ def test_runner_supported_anthropic_model_uses_native_compaction() -> None:
   _run_runner(
     provider,
     messages=[{"role": "user", "content": LONG_INPUT}],
-    max_turns=1,
     effort="none",
     model="claude-sonnet-5",
   )
@@ -812,27 +810,29 @@ def test_runner_supported_anthropic_model_uses_native_compaction() -> None:
   assert main_request["context_management"]["edits"][0]["type"] == "compact_20260112"
 
 
-def test_server_compaction_one_message_merge(tmp_path) -> None:
+def test_server_compaction_summary_precedes_retained_responses(tmp_path) -> None:
   provider = _PortableRunnerProvider(main_turns=[_tool_turn(), _text_turn("complete")])
   durable_log = AgentSessionLog(path=tmp_path / "session.jsonl")
   _run_runner(
     provider,
     messages=[{"role": "user", "content": LONG_INPUT}],
     agent_session_log=durable_log,
-    max_turns=3,
   )
 
   assistant_entries, _ = _run(durable_log.query(event_types={"assistant_message"}, order="asc"))
-  compacted = [
-    entry.event for entry in assistant_entries
-    if entry.event.get("content_blocks", [{}])[0].get("type") == "compaction"
-  ]
-
-  assert len(compacted) == 1
-  content_blocks = compacted[0]["content_blocks"]
-  assert content_blocks[0] == {"type": "compaction", "content": ANCHOR_SUMMARY}
-  assert content_blocks[1]["type"] == "tool_use"
-  assert CONTINUATION_NUDGE not in str(compacted)
+  summaries, _ = _run(durable_log.query(event_types={"summary"}, order="asc"))
+  assert len(summaries) == 1
+  assert summaries[0].event["summary_kind"] == "portable_compaction"
+  assert summaries[0].event["text"] == ANCHOR_SUMMARY
+  assert summaries[0].event["covers"]["to_seq"] < assistant_entries[0].seq
+  assert not any(
+    block.get("type") == "compaction"
+    for entry in assistant_entries for block in entry.event["content_blocks"]
+  )
+  rebuilt = _run(SessionContextBuilder(durable_log).build())
+  assert rebuilt[0]["content"] == [{"type": "compaction", "content": ANCHOR_SUMMARY}]
+  assert any(block.get("type") == "tool_result" for message in rebuilt
+             if isinstance(message["content"], list) for block in message["content"])
 
 
 def test_server_compaction_anchor_persist_on_stream_failure(tmp_path) -> None:
@@ -842,25 +842,20 @@ def test_server_compaction_anchor_persist_on_stream_failure(tmp_path) -> None:
     provider,
     messages=[{"role": "user", "content": LONG_INPUT}],
     agent_session_log=durable_log,
-    max_turns=1,
   )
 
-  assistant_entries, _ = _run(durable_log.query(event_types={"assistant_message"}, order="asc"))
-  anchor_event = assistant_entries[-1].event
-  assert anchor_event["stop_reason"] == "compaction"
-  assert anchor_event["content_blocks"] == [{"type": "compaction", "content": ANCHOR_SUMMARY}]
+  summaries, _ = _run(durable_log.query(event_types={"summary"}, order="asc"))
+  anchor_event = summaries[-1].event
+  assert anchor_event["summary_kind"] == "portable_compaction"
+  assert anchor_event["text"] == ANCHOR_SUMMARY
   assert anchor_event["usage"]["input_tokens"] == 31
   assert anchor_event["usage"]["output_tokens"] == 7
 
   resume_provider = _PortableRunnerProvider(main_turns=[_tool_turn(), _text_turn("resumed")])
-  anchor_message = {
-    "role": "assistant",
-    "content": anchor_event["content_blocks"],
-    "provider": "codex",
-    "model": "model",
-    "stop_reason": "compaction",
-  }
-  _run_runner(resume_provider, messages=[anchor_message], max_turns=2)
+  rebuilt = _run(SessionContextBuilder(durable_log).build())
+  anchor_message = rebuilt[0]
+  assert anchor_message["content"] == [{"type": "compaction", "content": ANCHOR_SUMMARY}]
+  _run_runner(resume_provider, messages=[anchor_message])
   assert resume_provider.main_requests[0][-1] == {"role": "user", "content": CONTINUATION_NUDGE}
   assert CONTINUATION_NUDGE not in str(resume_provider.main_requests[1])
 
@@ -900,21 +895,16 @@ def test_server_compaction_durable_anchor(tmp_path) -> None:
     provider,
     messages=[{"role": "user", "content": LONG_INPUT}],
     agent_session_log=durable_log,
-    max_turns=1,
   )
 
-  assistant_entries, _ = _run(durable_log.query(event_types={"assistant_message"}, order="asc"))
-  content_blocks = assistant_entries[-1].event["content_blocks"]
-  rebuilt = [{
-    "role": "assistant",
-    "content": content_blocks,
-    "provider": "codex",
-    "model": "model",
-    "stop_reason": assistant_entries[-1].event["stop_reason"],
-  }]
-
-  assert content_blocks[0] == {"type": "compaction", "content": ANCHOR_SUMMARY}
-  assert truncate_to_last_compaction([{"role": "user", "content": "old"}, *rebuilt], compaction_as_text=True)[0]["role"] == "assistant"
+  rebuilt = _run(SessionContextBuilder(durable_log).build())
+  assert rebuilt[0]["content"] == [{"type": "compaction", "content": ANCHOR_SUMMARY}]
+  assert rebuilt[-1]["content"] == [{"type": "text", "text": "complete"}]
+  normalized = CodexProvider().normalize_messages(
+    rebuilt, CodexProvider().get_model_info("gpt-5.6-sol"),
+  )
+  assert "complete" in str(normalized)
+  assert ANCHOR_SUMMARY in str(normalized)
 
 
 def test_server_compaction_reactive_hedge() -> None:
@@ -924,7 +914,6 @@ def test_server_compaction_reactive_hedge() -> None:
   event_log = _run_runner(
     provider,
     messages=[{"role": "user", "content": LONG_INPUT}],
-    max_turns=1,
     compaction_trigger=10_000,
   )
 
@@ -939,7 +928,6 @@ def test_server_compaction_reactive_hedge() -> None:
   second_log = _run_runner(
     second_failure,
     messages=[{"role": "user", "content": LONG_INPUT}],
-    max_turns=1,
     compaction_trigger=10_000,
   )
   assert second_failure.summary_requests == 1
@@ -949,7 +937,6 @@ def test_server_compaction_reactive_hedge() -> None:
   unclassified_log = _run_runner(
     unclassified,
     messages=[{"role": "user", "content": LONG_INPUT}],
-    max_turns=1,
     compaction_trigger=10_000,
   )
   assert unclassified.summary_requests == 0
@@ -973,7 +960,7 @@ def test_server_compaction_matches_anthropic_block_shape() -> None:
 
 def test_server_compaction_summarize_usage_reported() -> None:
   provider = _PortableRunnerProvider(main_turns=[_text_turn("complete")])
-  event_log = _run_runner(provider, messages=[{"role": "user", "content": LONG_INPUT}], max_turns=1)
+  event_log = _run_runner(provider, messages=[{"role": "user", "content": LONG_INPUT}])
 
   turn_complete = next(entry.event for entry in event_log.entries if entry.event.get("type") == "turn_complete")
   usage = turn_complete["usage"]
@@ -982,6 +969,133 @@ def test_server_compaction_summarize_usage_reported() -> None:
   assert usage["cache_creation_input_tokens"] == 3
   assert usage["output_tokens"] == 7 + 3
   assert usage["reasoning_tokens_observed"] == 1
+
+
+def test_portable_compaction_merges_anthropic_capacity_wait_once(
+  monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+  import agent_gateway.providers.anthropic as adapter
+
+  summary_usage = {
+    "input_tokens": 31, "cache_read_input_tokens": 2,
+    "cache_creation_input_tokens": 3, "output_tokens": 7,
+  }
+  first_answer_usage = {
+    "input_tokens": 100, "cache_read_input_tokens": 200,
+    "cache_creation_input_tokens": 30, "output_tokens": 10,
+  }
+  final_answer_usage = {
+    "input_tokens": 20, "cache_read_input_tokens": 40,
+    "cache_creation_input_tokens": 5, "output_tokens": 7,
+  }
+
+  def sdk_events(text, initial_usage, final_usage):
+    return [
+      SimpleNamespace(type="message_start", message=SimpleNamespace(
+        usage=SimpleNamespace(**{**initial_usage, "output_tokens": 0}),
+      )),
+      SimpleNamespace(type="content_block_start", content_block=SimpleNamespace(type="text")),
+      SimpleNamespace(type="content_block_delta", delta=SimpleNamespace(type="text_delta", text=text)),
+      SimpleNamespace(type="content_block_stop"),
+      # Repeated absolute snapshots must not repeat billing or capacity wait.
+      *[
+        SimpleNamespace(
+          type="message_delta", delta=SimpleNamespace(stop_reason="end_turn"),
+          usage=final_usage,
+        )
+        for _ in range(2)
+      ],
+    ]
+
+  class SDKStream:
+    def __init__(self, events):
+      self.events = events
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, *_args):
+      return False
+
+    async def __aiter__(self):
+      for event in self.events:
+        yield event
+
+  scripts = iter([
+    SDKStream(sdk_events(LONG_SUMMARY, summary_usage, SimpleNamespace(**summary_usage))),
+    SDKStream(sdk_events("complete", first_answer_usage, SimpleNamespace(
+      **first_answer_usage,
+      iterations=[
+        SimpleNamespace(**first_answer_usage),
+        SimpleNamespace(**final_answer_usage),
+      ],
+    ))),
+  ])
+  requests = []
+
+  def stream(**kwargs):
+    requests.append(kwargs)
+    return next(scripts)
+
+  messages_api = SimpleNamespace(stream=stream)
+  client = SimpleNamespace(messages=messages_api, beta=SimpleNamespace(messages=messages_api))
+  waits = iter([1.234, 2.345])
+  reservations = []
+
+  async def acquire(*, estimated_tokens):
+    reservations.append(estimated_tokens)
+    return next(waits)
+
+  # Script external SDK/capacity responses and lower the context window to
+  # trigger compaction; keep request building, parsing and usage merging real.
+  monkeypatch.setattr(adapter, "get_global_token_bucket", lambda: SimpleNamespace(acquire=acquire))
+  provider = AnthropicProvider()
+  model_info = provider.get_model_info("claude-haiku-4-5")
+  monkeypatch.setattr(provider, "get_model_info", lambda _model: replace(model_info, context_window=20))
+  monkeypatch.setattr(provider, "create_client", lambda *_args, **_kwargs: client)
+  durable_log = AgentSessionLog(path=tmp_path / "session.jsonl")
+  event_log = _run_runner(
+    provider,
+    messages=[{"role": "user", "content": LONG_INPUT}],
+    agent_session_log=durable_log,
+    effort="none",
+    model="claude-haiku-4-5",
+  )
+
+  assert len(requests) == 2
+  assert reservations == [SUMMARY_MAX_TOKENS, model_info.max_output_tokens]
+  assert all("context_management" not in request for request in requests)
+  assert LONG_INPUT in str(requests[0]["messages"])
+  assert LONG_INPUT not in str(requests[1]["messages"])
+  assert ANCHOR_SUMMARY in str(requests[1]["messages"])
+  summaries, _ = _run(durable_log.query(event_types={"summary"}, order="asc"))
+  assert len(summaries) == 1
+  assert summaries[0].event["summary_kind"] == "portable_compaction"
+  assert summaries[0].event["text"] == ANCHOR_SUMMARY
+  compact_usage = summaries[0].event["usage"]
+  assert compact_usage["provider_wait_ms"] == 1234
+  for key, value in summary_usage.items():
+    assert compact_usage[key] == value
+
+  events = [entry.event for entry in event_log.entries]
+  assert not [event for event in events if event.get("type") == "error"]
+  assert next(event for event in events if event.get("type") == "stream_complete")["terminal_disposition"] == "completed"
+  turns = [event for event in events if event.get("type") == "turn_complete"]
+  assert len(turns) == 1
+  usage = turns[0]["usage"]
+  assert usage["provider_wait_ms"] == 1234 + 2345
+  assert usage["input_tokens"] == 31 + 100 + 20
+  assert usage["cache_read_input_tokens"] == 2 + 200 + 40
+  assert usage["cache_creation_input_tokens"] == 3 + 30 + 5
+  assert usage["output_tokens"] == 7 + 10 + 7
+  # Context is the final answering invocation, not its earlier iteration or
+  # the portable summary request whose billing shares this turn's payload.
+  assert turns[0]["request_input_tokens"] == 20 + 40 + 5
+  assert "request_input_tokens" not in usage
+  expected_cost = provider.estimate_cost(
+    "claude-haiku-4-5", 151, 24, cache_read_tokens=242, cache_creation_tokens=38,
+  )
+  assert usage["estimated_cost"] == round(expected_cost.total, 4)
 
 
 def test_server_compaction_render_fallback_prompt_omits_bulk_payloads() -> None:
@@ -993,3 +1107,212 @@ def test_server_compaction_render_fallback_prompt_omits_bulk_payloads() -> None:
 
   assert "<omitted list items=20>" in rendered
   assert "Conversation transcript to compact" in prompt
+
+
+@pytest.mark.parametrize("keep_rounds,budget", [(0, 0), (1, 1), (20, 100_000)])
+def test_pending_batch_is_required_chronological_tail(keep_rounds: int, budget: int) -> None:
+  batch = [
+    {"role": "assistant", "provider": "codex", "content": [
+      {"type": "thinking", "thinking": "retain metadata", "signature": "opaque"},
+      {"type": "tool_use", "id": "a", "name": "lookup", "input": {"x": 1}},
+      {"type": "tool_use", "id": "b", "name": "lookup", "input": {"x": 2}},
+    ]},
+    {"role": "user", "content": [
+      {"type": "tool_result", "tool_use_id": "a", "content": "UNDELIVERED_SENTINEL"},
+      {"type": "tool_result", "tool_use_id": "b", "content": "error detail", "is_error": True},
+      {"type": "text", "text": "companion context"},
+    ]},
+    {"role": "assistant", "content": [{"type": "text", "text": "paused"}], "stop_reason": "pause_turn"},
+    {"role": "user", "content": "continue"},
+  ]
+  messages = [{"role": "user", "content": "older"}, *batch]
+  pending = {"a"}
+  prefix, tail = split_messages_for_compact(
+    messages, keep_rounds=keep_rounds, tail_token_budget=budget,
+    preserve_tool_result_ids=pending,
+  )
+  assert prefix + tail == messages
+  assert tail[-len(batch):] == batch
+  assert pending == {"a"}
+  assert sum("UNDELIVERED_SENTINEL" in str(message) for message in tail) == 1
+  assert split_messages_for_compact(messages, keep_rounds=0) == (messages, [])
+
+
+def test_pending_tail_supersedes_old_anchor_and_counts_tail_once(monkeypatch) -> None:
+  monkeypatch.setattr(server_compaction, "MIN_COMPACT_GAIN_TOKENS", 1)
+  tail = [
+    {"role": "assistant", "content": [
+      {"type": "compaction", "content": "obsolete anchor"},
+      {"type": "tool_use", "id": "a", "name": "lookup", "input": {}},
+    ]},
+    {"role": "user", "content": [
+      {"type": "tool_result", "tool_use_id": "a", "content": "UNDELIVERED_SENTINEL"},
+    ]},
+  ]
+  messages = [{"role": "user", "content": LONG_INPUT}, *tail]
+  overhead = 73
+  provider = _SummaryProvider()
+  result = _run(maybe_compact_current_messages(
+    messages, None,
+    capability_execution=stub_bound_capability_execution(provider=provider, model="model", effort="high"),
+    trigger=1,
+    est_total_tokens=overhead + server_compaction._estimate_messages(messages),
+    preserve_tool_result_ids={"a"},
+  ))
+  assert result.applied
+  assert result.est_after == overhead + server_compaction._estimate_messages(result.messages)
+  assert "UNDELIVERED_SENTINEL" not in str(provider.requests)
+  assert "obsolete anchor" in str(provider.requests)
+  normalized = CodexProvider().normalize_messages(
+    result.messages, CodexProvider().get_model_info("gpt-5.6-sol"),
+  )
+  assert "obsolete anchor" not in str(normalized)
+  assert "UNDELIVERED_SENTINEL" in str(normalized)
+
+
+class _NormalizedPendingProvider(_ContextLengthProvider):
+  def normalize_messages(self, messages, model_info):
+    return CodexProvider().normalize_messages(messages, model_info)
+
+
+@pytest.mark.parametrize("continuation", ["end_turn", "refusal", "pause_turn", "max_tokens", "tool_use"])
+def test_pending_result_survives_real_compaction_and_provider_normalization(
+  monkeypatch, tmp_path, continuation,
+) -> None:
+  # Force the trigger only; splitting, summarizing, request normalization,
+  # tool execution, durable replay and terminal acknowledgement stay real.
+  monkeypatch.setattr(
+    server_compaction, "should_portable_compact",
+    lambda **kwargs: (kwargs["turn_count"] >= 2, "test_trigger"),
+  )
+  first = _tool_turn()
+  first[1] = replace(first[1], tool_input={"query": "UNDELIVERED_SENTINEL"}, raw_block={
+    "type": "tool_use", "id": "tool-1", "name": "lookup",
+    "input": {"query": "UNDELIVERED_SENTINEL"},
+  })
+  middle = _text_turn("consuming result")
+  middle[-1] = replace(middle[-1], stop_reason=continuation)
+  if continuation == "tool_use":
+    middle = _tool_turn()
+    middle[1] = replace(middle[1], tool_id="tool-2", raw_block={
+      "type": "tool_use", "id": "tool-2", "name": "lookup", "input": {"query": "AAPL"},
+    })
+  turns: list[list[StreamEvent] | Exception] = [first, middle]
+  if continuation in {"pause_turn", "max_tokens", "tool_use"}:
+    turns.append(_text_turn("finished"))
+  provider = _NormalizedPendingProvider(main_turns=turns)
+  durable_log = AgentSessionLog(path=tmp_path / "session.jsonl")
+  event_log = _run_runner(
+    provider, messages=[{"role": "user", "content": LONG_INPUT}],
+    agent_session_log=durable_log, model="gpt-5.6-sol",
+  )
+  events = [entry.event for entry in event_log.entries]
+  assert not [event for event in events if event.get("type") == "error"]
+  assert next(event for event in events if event.get("type") == "stream_complete")["terminal_disposition"] == "completed"
+  completed, _ = _run(durable_log.query(event_types={"tool_call_complete"}, order="asc"))
+  exact_result = next(
+    block for block in completed[0].event["final_tool_result_blocks"]
+    if block.get("type") == "tool_result"
+  )
+  relevant_requests = provider.main_requests[1:3] if continuation in {"pause_turn", "max_tokens"} else provider.main_requests[1:2]
+  for request in relevant_requests:
+    blocks = [block for message in request if isinstance(message.get("content"), list) for block in message["content"]]
+    assert sum(block.get("type") == "tool_use" and block.get("id") == exact_result["tool_use_id"] for block in blocks) == 1
+    assert [block for block in blocks if block.get("type") == "tool_result" and block.get("tool_use_id") == exact_result["tool_use_id"]] == [exact_result]
+  assert provider.summary_requests == len(turns) - 1
+  summary_requests = [request for request in provider.requests if request["kind"] == "summary"]
+  assert "UNDELIVERED_SENTINEL" not in str(summary_requests[0])
+  if continuation in {"pause_turn", "max_tokens"}:
+    assert "UNDELIVERED_SENTINEL" not in str(summary_requests)
+    rebuilt = _run(SessionContextBuilder(durable_log).build())
+    normalized = provider.normalize_messages(rebuilt, provider.get_model_info("gpt-5.6-sol"))
+    assert "UNDELIVERED_SENTINEL" in str(normalized)
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_reactive_compaction_preserves_pending_result_on_retry_and_error(
+  monkeypatch, tmp_path, failure,
+) -> None:
+  monkeypatch.setattr(
+    server_compaction, "should_portable_compact",
+    lambda **kwargs: (kwargs["force"], "forced_context_length"),
+  )
+  provider = _NormalizedPendingProvider(main_turns=[
+    _tool_turn(),
+    RuntimeError("context length exceeded"),
+    RuntimeError("context length exceeded again") if failure else _text_turn("done"),
+  ])
+  durable_log = AgentSessionLog(path=tmp_path / "session.jsonl")
+  event_log = _run_runner(
+    provider, messages=[{"role": "user", "content": LONG_INPUT}],
+    agent_session_log=durable_log, model="gpt-5.6-sol",
+  )
+  assert provider.summary_requests == 1
+  def results(messages):
+    return [block for message in messages if isinstance(message.get("content"), list)
+            for block in message["content"] if block.get("type") == "tool_result"]
+  assert results(provider.main_requests[1]) == results(provider.main_requests[2])
+  assert results(provider.main_requests[2])
+  rebuilt = _run(SessionContextBuilder(durable_log).build())
+  assert results(provider.normalize_messages(rebuilt, provider.get_model_info("gpt-5.6-sol"))) == results(provider.main_requests[2])
+  events = [entry.event for entry in event_log.entries]
+  if failure:
+    assert any(event.get("type") == "error" and "context length" in event.get("error", "") for event in events)
+    assert not any(event.get("type") == "stream_complete" for event in events)
+  else:
+    assert next(event for event in events if event.get("type") == "stream_complete")["terminal_disposition"] == "completed"
+    assert not any(event.get("type") == "error" for event in events)
+
+
+def test_child_portable_summary_cannot_replace_parent_context(tmp_path) -> None:
+  async def case():
+    durable_log = AgentSessionLog(tmp_path / "shared-log.jsonl")
+    parent = await durable_log.append({
+      "type": "user_message", "role": "writer", "content": "parent task",
+    })
+    await durable_log.append({
+      "type": "summary", "role": "sub_agent", "sub_agent_id": "child",
+      "summary_kind": "portable_compaction", "text": "child-only summary",
+      "covers": {"from_seq": 1, "to_seq": parent.seq},
+    })
+    assert await SessionContextBuilder(durable_log).build() == [
+      {"role": "user", "content": "parent task"},
+    ]
+  _run(case())
+
+
+@pytest.mark.parametrize("summary_text", ["short", LONG_SUMMARY])
+def test_unsummarizable_pending_work_is_never_acknowledged_or_discarded(
+  monkeypatch, summary_text,
+) -> None:
+  messages = [
+    {"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "lookup", "input": {}}]},
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "UNDELIVERED_SENTINEL"}]},
+  ]
+  provider = _SummaryProvider(summary_text=summary_text)
+  pending = {"a"}
+  result = _run(maybe_compact_current_messages(
+    messages, None,
+    capability_execution=stub_bound_capability_execution(provider=provider, model="model", effort="high"),
+    trigger=1, est_total_tokens=100_000, preserve_tool_result_ids=pending,
+  ))
+  assert not result.applied
+  assert result.reason == "insufficient_gain"
+  assert result.messages == messages
+  assert pending == {"a"}
+  assert provider.requests == []
+  monkeypatch.setattr(server_compaction, "MIN_COMPACT_GAIN_TOKENS", 1)
+  with_prefix = [{"role": "user", "content": LONG_INPUT}, *messages]
+  result = _run(maybe_compact_current_messages(
+    with_prefix, None,
+    capability_execution=stub_bound_capability_execution(provider=provider, model="model", effort="high"),
+    trigger=1, est_total_tokens=100_000, preserve_tool_result_ids=pending,
+  ))
+  if summary_text == "short":
+    assert not result.applied
+    assert result.reason == "summary_too_short"
+    assert result.messages == with_prefix
+  else:
+    assert result.applied
+    assert result.messages[1:] == messages
+  assert pending == {"a"}

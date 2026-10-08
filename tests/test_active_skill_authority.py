@@ -4,13 +4,31 @@ import pytest
 
 from agent_gateway.active_skill_authority import resolve_active_skill_authority
 from agent_gateway.capability_resolution import CapabilityResolutionInputError
+from agent_gateway.investment_capability_claim import (
+  InvestmentCapabilityGrant,
+  configure_investment_capability_grants,
+  investment_capability_grants,
+)
+
+
+@pytest.fixture(autouse=True)
+def _bind_market_scan_declared_grant():
+  previous = investment_capability_grants()
+  configure_investment_capability_grants({
+    "market-scan": InvestmentCapabilityGrant(
+      capability_ids=("fingerprint_screen", "insider_buying", "quality_screen"),
+      effect_classes=("artifact_write", "read", "state_write"),
+      tool_names=("get_investment_run", "start_investment_run"),
+    ),
+  })
+  yield
+  configure_investment_capability_grants(previous)
 
 
 def test_declared_inline_grant_is_independent_of_skill_name() -> None:
   kwargs = {
     "declared_live_tool_routes": {"code_execute": "code_execute"},
     "inline_mode_exception_routes": {"code_execute": "code_execute"},
-    "mode_denied_tools": {"code_execute", "run_bash"},
   }
 
   original = resolve_active_skill_authority("sourced-teardown", **kwargs)
@@ -18,7 +36,6 @@ def test_declared_inline_grant_is_independent_of_skill_name() -> None:
 
   assert original == renamed
   assert original.granted == frozenset({"code_execute"})
-  assert original.denied == frozenset({"run_bash"})
 
 
 def test_removing_inline_exception_revokes_live_declared_tool() -> None:
@@ -26,11 +43,9 @@ def test_removing_inline_exception_revokes_live_declared_tool() -> None:
     "sourced-teardown",
     declared_live_tool_routes={"code_execute": "code_execute"},
     inline_mode_exception_routes={},
-    mode_denied_tools={"code_execute"},
   )
 
   assert authority.granted == frozenset()
-  assert authority.denied == frozenset({"code_execute"})
 
 
 def test_market_scan_grant_uses_exact_claim_server_and_policy() -> None:

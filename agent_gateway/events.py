@@ -45,8 +45,7 @@ RecapFailureType: TypeAlias = Literal[
   "terminal_error",
   "artifact_failed",
   "artifact_unavailable",
-  "budget_exceeded",
-  "max_turns_reached",
+  "soft_budget_abort",
 ]
 DEFAULT_SCHEMA_VERSION = 1
 SUPPORTED_SCHEMA_VERSIONS: frozenset[int] = frozenset({DEFAULT_SCHEMA_VERSION})
@@ -314,6 +313,12 @@ class ToolCallsSummary:
   errors: int
   by_tool_name: dict[str, int]
   by_server: dict[str, int]
+  # Run counts by name. Peaks: the interceptor counts (``calls_in_window``,
+  # ``structured_reads``), the counts ``session_recap.RUN_MEASUREMENT_FIELDS``
+  # folds off other owners' events, and those an autonomous parent adds to its
+  # child's recap (``autonomous_in_flight_at_start``,
+  # ``credential_handoff_bytes``). A total: ``model_calls``.
+  measurements: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -640,6 +645,11 @@ def event_from_dict(payload: dict[str, Any]) -> TypedEvent:
           tool_calls_summary["by_server"],
           "session_recap.tool_calls_summary.by_server",
         ),
+        # Recaps written before interceptor measurements carry none.
+        measurements=_int_dict(
+          tool_calls_summary.get("measurements", {}),
+          "session_recap.tool_calls_summary.measurements",
+        ),
       ),
       failures=[
         _recap_failure(item)
@@ -831,8 +841,7 @@ def _recap_failure_type(value: Any) -> RecapFailureType:
     "terminal_error",
     "artifact_failed",
     "artifact_unavailable",
-    "budget_exceeded",
-    "max_turns_reached",
+    "soft_budget_abort",
   }:
     return str(value)  # type: ignore[return-value]
   raise ValueError(f"Unknown session recap failure type: {value!r}")

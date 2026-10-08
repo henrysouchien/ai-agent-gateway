@@ -60,9 +60,9 @@ def test_process_environment_is_the_default_source(
 
 
 def test_autonomous_child_inherits_the_canonical_name_alone() -> None:
-  from agent_gateway.autonomous_runner_start import (
-    _AUTONOMOUS_CHILD_BASE_ENV_NAMES,
+  from agent_gateway.child_environment import (
+    AUTONOMOUS_CHILD_RUNTIME_ENV_NAMES,
   )
 
-  assert GATEWAY_BASE_URL_ENV in _AUTONOMOUS_CHILD_BASE_ENV_NAMES
-  assert "GATEWAY_URL" not in _AUTONOMOUS_CHILD_BASE_ENV_NAMES
+  assert GATEWAY_BASE_URL_ENV in AUTONOMOUS_CHILD_RUNTIME_ENV_NAMES
+  assert "GATEWAY_URL" not in AUTONOMOUS_CHILD_RUNTIME_ENV_NAMES

@@ -12,7 +12,6 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import AgentSessionLog, AnthropicProvider, SessionContextBuilder
 import agent_gateway.agent_session_log as agent_session_log_module
-import agent_gateway.context_builder as context_builder_module
 
 
 def _run(coro):
@@ -30,7 +29,6 @@ def test_context_builder_loads_state_update_as_layer_1b_and_filters_tail(tmp_pat
           "data_flags": ["Earnings stale"],
           "active_servers": ["fmp-mcp", "macro-mcp"],
           "regime": "risk_off",
-          "budget_exceeded": True,
         },
         "runner_id": "runner_test",
         "generated_at": 1.0,
@@ -60,7 +58,6 @@ def test_context_builder_loads_state_update_as_layer_1b_and_filters_tail(tmp_pat
   assert "Data flags:\n- Earnings stale" in state_message["content"]
   assert "Active MCP servers: fmp-mcp, macro-mcp" in state_message["content"]
   assert "Regime: risk_off" in state_message["content"]
-  assert "previous run exceeded budget" in state_message["content"].lower()
   assert messages[1] == {"role": "user", "content": "Continue the analyst loop."}
 
 
@@ -230,105 +227,168 @@ def test_context_builder_loads_summary_before_state_update_and_uses_summary_boun
   assert "Older context 2" not in combined_render
 
 
-def test_context_builder_without_summary_uses_temporal_fallback(
+def test_context_builder_replays_entries_older_than_any_window(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  log = AgentSessionLog(path=tmp_path / "sessions" / "temporal-fallback.jsonl")
+  log = AgentSessionLog(path=tmp_path / "sessions" / "old-entries.jsonl")
   monkeypatch.setattr(agent_session_log_module.time, "time", lambda: 100.0)
-  _run(log.append({"type": "user_message", "content": "Old event"}))
-  monkeypatch.setattr(agent_session_log_module.time, "time", lambda: 199.0)
-  _run(log.append({"type": "user_message", "content": "Recent event"}))
+  _run(log.append({"type": "user_message", "content": "What is the risk score?"}))
+  _run(log.append({"type": "assistant_message", "content": "Overall risk score: 89.0"}))
+  monkeypatch.undo()
+  _run(log.append({"type": "user_message", "content": "What was the first number?"}))
 
-  builder = SessionContextBuilder(agent_session_log=log, tail_window_seconds=10)
-  monkeypatch.setattr(context_builder_module.time, "time", lambda: 205.0)
-  messages = _run(builder.build())
-
-  assert messages == [{"role": "user", "content": "Recent event"}]
-
-
-def test_context_builder_can_replay_full_session_without_temporal_cutoff(
-  tmp_path: Path,
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  log = AgentSessionLog(path=tmp_path / "sessions" / "full-replay.jsonl")
-  monkeypatch.setattr(agent_session_log_module.time, "time", lambda: 100.0)
-  _run(log.append({"type": "user_message", "content": "First turn"}))
-  monkeypatch.setattr(agent_session_log_module.time, "time", lambda: 199.0)
-  _run(log.append({"type": "user_message", "content": "Second turn"}))
-
-  builder = SessionContextBuilder(agent_session_log=log, tail_window_seconds=None)
-  monkeypatch.setattr(context_builder_module.time, "time", lambda: 10_000.0)
-  messages = _run(builder.build())
+  messages = _run(SessionContextBuilder(agent_session_log=log).build())
 
   assert messages == [
-    {"role": "user", "content": "First turn"},
-    {"role": "user", "content": "Second turn"},
+    {"role": "user", "content": "What is the risk score?"},
+    {"role": "assistant", "content": "Overall risk score: 89.0"},
+    {"role": "user", "content": "What was the first number?"},
   ]
 
 
-def test_context_builder_budgets_only_replayable_entries_across_attach_spans(tmp_path: Path) -> None:
-  log = AgentSessionLog(path=tmp_path / "sessions" / "cross-attach-replay.jsonl")
-  manifest = {
-    "type": "context_manifest",
-    "event_schema_version": "1",
-    "product_id": "cli_analyst",
-    "request_id": "request-old",
+def test_context_builder_replays_parent_rows_only(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "parent-only.jsonl")
+  child = {"role": "sub_agent", "sub_agent_id": "sub0:sess_parent"}
+  parent_call = {
+    "type": "assistant_message",
     "role": "writer",
-    "runner_id": "runner-old",
-    "session_id": "session-cross-attach",
-    "turn": 1,
-    "surfaces": [
-      {
-        "aliases": [],
-        "capability_id": f"capability-{index}",
-        "external": False,
-        "name": f"inventory-{index}-" + ("x" * 256),
-        "previous_ids": [],
-        "source": "gateway",
-        "surface_id": f"surface-{index}",
-        "surface_type": "tool",
-        "transport": "mcp",
-      }
-      for index in range(400)
+    "content_blocks": [
+      {"type": "text", "text": "Delegating the profile."},
+      {"type": "tool_use", "id": "run-1", "name": "run_agent", "input": {"task": "Profile ACME"}},
     ],
   }
-  assert len(json.dumps(manifest)) // 4 > 20_000
+  _run(log.append({"type": "user_message", "role": "writer", "content": "Profile ACME for me."}))
+  _run(log.append(parent_call))
+  _run(log.append({"type": "tool_call_start", "role": "writer", "tool_call_id": "run-1", "tool_name": "run_agent"}))
+  _run(log.append({"type": "attach", **child}))
+  _run(log.append({"type": "user_message", "content": "CHILD_TASK Profile ACME", **child}))
+  _run(log.append({
+    "type": "assistant_message",
+    "content_blocks": [{"type": "tool_use", "id": "child-tool", "name": "fetch_company_profile", "input": {}}],
+    **child,
+  }))
+  _run(log.append({"type": "tool_call_start", "tool_call_id": "child-tool", **child}))
+  _run(log.append({
+    "type": "tool_call_complete", "tool_call_id": "child-tool", "result": {"CHILD_RESULT": True}, **child,
+  }))
+  _run(log.append({
+    "type": "assistant_message",
+    "content_blocks": [
+      {"type": "compaction", "content": "CHILD_SUMMARY"},
+      {"type": "text", "text": "CHILD_DRAFT ACME makes widgets."},
+    ],
+    **child,
+  }))
+  _run(log.append({"type": "detach", "reason": "completed", **child}))
+  _run(log.append({
+    "type": "tool_call_complete",
+    "role": "writer",
+    "tool_call_id": "run-1",
+    "tool_name": "run_agent",
+    "result": {"report": "ACME makes widgets."},
+  }))
+  _run(log.append({"type": "assistant_message", "role": "writer", "content": "ACME makes widgets."}))
 
-  _run(log.append({"type": "attach", "role": "writer", "runner_id": "runner-old"}))
-  _run(log.append({"type": "user_message", "content": "Remember the codeword MARLINSPIKE."}))
-  _run(log.append(manifest))
-  _run(log.append({"type": "assistant_message", "content": "ACK"}))
-  _run(log.append({"type": "detach", "role": "writer", "runner_id": "runner-old"}))
-  _run(log.append({"type": "attach", "role": "writer", "runner_id": "runner-new"}))
-
-  messages = _run(SessionContextBuilder(agent_session_log=log, tail_window_seconds=None).build())
+  messages = _run(SessionContextBuilder(agent_session_log=log).build())
 
   assert messages == [
-    {"role": "user", "content": "Remember the codeword MARLINSPIKE."},
-    {"role": "assistant", "content": "ACK"},
+    {"role": "user", "content": "Profile ACME for me."},
+    {"role": "assistant", "content": parent_call["content_blocks"]},
+    {
+      "role": "user",
+      "content": [{
+        "type": "tool_result",
+        "tool_use_id": "run-1",
+        "content": json.dumps({"report": "ACME makes widgets."}),
+      }],
+    },
+    {"role": "assistant", "content": "ACME makes widgets."},
+  ]
+  assert "CHILD_" not in json.dumps(messages)
+
+
+def test_context_builder_resumes_from_last_compaction_block(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "compaction-boundary.jsonl")
+  _run(log.append({"type": "user_message", "content": "Old question"}))
+  _run(log.append({"type": "assistant_message", "content": "Old answer"}))
+  _run(log.append({"type": "user_message", "content": "Run the lookup"}))
+  _run(log.append({
+    "type": "assistant_message",
+    "content_blocks": [
+      {"type": "text", "text": "Pre-compaction text"},
+      {"type": "compaction", "content": "S"},
+      {"type": "tool_use", "id": "tool-2", "name": "lookup", "input": {}},
+    ],
+  }))
+  _run(log.append({"type": "tool_call_complete", "tool_call_id": "tool-2", "result": {"ok": True}}))
+  _run(log.append({"type": "user_message", "content": "Later question"}))
+  _run(log.append({"type": "assistant_message", "content": "Later answer"}))
+
+  messages = _run(SessionContextBuilder(agent_session_log=log).build())
+
+  assert messages == [
+    {
+      "role": "assistant",
+      "content": [
+        {"type": "compaction", "content": "S"},
+        {"type": "tool_use", "id": "tool-2", "name": "lookup", "input": {}},
+      ],
+    },
+    {
+      "role": "user",
+      "content": [{"type": "tool_result", "tool_use_id": "tool-2", "content": json.dumps({"ok": True})}],
+    },
+    {"role": "user", "content": "Later question"},
+    {"role": "assistant", "content": "Later answer"},
   ]
 
 
-def test_context_builder_still_evicts_oldest_messages_when_conversation_exceeds_budget(
-  tmp_path: Path,
-) -> None:
-  log = AgentSessionLog(path=tmp_path / "sessions" / "conversation-budget.jsonl")
-  _run(log.append({"type": "user_message", "content": "A" * 40}))
-  _run(log.append({"type": "assistant_message", "content": "B" * 40}))
-  _run(log.append({"type": "user_message", "content": "C" * 40}))
+def test_context_builder_uses_latest_of_multiple_compactions(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "multiple-compactions.jsonl")
+  _run(log.append({"type": "user_message", "content": "First turn"}))
+  _run(log.append({
+    "type": "assistant_message",
+    "content_blocks": [{"type": "compaction", "content": "S1"}, {"type": "text", "text": "After S1"}],
+  }))
+  _run(log.append({"type": "user_message", "content": "Second turn"}))
+  _run(log.append({
+    "type": "assistant_message",
+    "content_blocks": [{"type": "compaction", "content": "S2"}, {"type": "text", "text": "After S2"}],
+  }))
+  _run(log.append({"type": "user_message", "content": "Third turn"}))
 
-  messages = _run(
-    SessionContextBuilder(
-      agent_session_log=log,
-      tail_window_seconds=None,
-      tail_token_budget=50,
-    ).build()
-  )
+  messages = _run(SessionContextBuilder(agent_session_log=log).build())
 
   assert messages == [
-    {"role": "assistant", "content": "B" * 40},
-    {"role": "user", "content": "C" * 40},
+    {
+      "role": "assistant",
+      "content": [{"type": "compaction", "content": "S2"}, {"type": "text", "text": "After S2"}],
+    },
+    {"role": "user", "content": "Third turn"},
+  ]
+
+
+def test_context_builder_resumes_from_anchor_only_compaction_row(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "anchor-only-compaction.jsonl")
+  _run(log.append({"type": "user_message", "content": "Heavy turn"}))
+  _run(log.append({"type": "assistant_message", "content": "Pre-compaction answer"}))
+  _run(log.append({
+    "type": "assistant_message",
+    "content_blocks": [{"type": "compaction", "content": "Portable summary"}],
+    "stop_reason": "compaction",
+  }))
+  _run(log.append({"type": "user_message", "content": "Next turn"}))
+
+  messages = _run(SessionContextBuilder(agent_session_log=log).build())
+
+  assert messages == [
+    {
+      "role": "assistant",
+      "content": [{"type": "compaction", "content": "Portable summary"}],
+      "stop_reason": "compaction",
+    },
+    {"role": "user", "content": "Next turn"},
   ]
 
 
@@ -385,7 +445,7 @@ def test_context_builder_surfaces_previous_writer_interruption_with_sub_agent_wo
       {
         "type": "state_update",
         "payload": {
-          "budget_exceeded": True,
+          "error": "Autonomous run interrupted: soft_budget_abort",
           "data_flags": ["estimate revisions unavailable"],
           "alerts": ["resume macro review"],
         },
@@ -397,7 +457,7 @@ def test_context_builder_surfaces_previous_writer_interruption_with_sub_agent_wo
       {
         "type": "interrupted",
         "role": "writer",
-        "reason": "budget_exceeded",
+        "reason": "soft_budget_abort",
         "runner_id": "runner_old",
         "last_completed_seq": 4,
       }
@@ -419,11 +479,11 @@ def test_context_builder_surfaces_previous_writer_interruption_with_sub_agent_wo
   combined = "\n".join(str(message["content"]) for message in messages)
 
   assert "## Previous run interrupted" in combined
-  assert "Reason: budget_exceeded" in combined
+  assert "Reason: soft_budget_abort" in combined
   assert "Runner: runner_old" in combined
   assert "`screen_estimate_revisions` (`tool-parent`), risk read_only" in combined
   assert "macro-review (`sub0:sess-parent`): 3 event(s), 1 tool call(s)" in combined
-  assert "- budget_exceeded: true" in combined
+  assert "- error: Autonomous run interrupted: soft_budget_abort" in combined
   assert "- data flag: estimate revisions unavailable" in combined
   assert "- alert: resume macro review" in combined
 
@@ -436,7 +496,7 @@ def test_context_builder_does_not_surface_old_interruption_after_clean_writer_ru
       {
         "type": "interrupted",
         "role": "writer",
-        "reason": "budget_exceeded",
+        "reason": "soft_budget_abort",
         "runner_id": "runner_old",
       }
     )
@@ -519,45 +579,13 @@ def test_context_builder_attaches_delayed_results_to_their_assistant_batch(tmp_p
     assert messages[index + 2]["content"] == f"Continue after {tool_id}"
 
 
-@pytest.mark.parametrize("followup", [False, True])
-def test_context_builder_budgets_tool_batch_atomically(tmp_path: Path, followup: bool) -> None:
-  log = AgentSessionLog(path=tmp_path / "sessions" / "tool-batch-budget.jsonl")
-  _run(log.append({
-    "type": "assistant_message",
-    "content_blocks": [
-      {"type": "tool_use", "id": "tool-1", "name": "lookup", "input": {"text": "x" * 1000}},
-    ],
-  }))
-  _run(log.append({
-    "type": "tool_call_complete", "tool_call_id": "tool-1", "result": {"ok": True},
-  }))
-  if followup:
-    _run(log.append({"type": "user_message", "content": "Continue"}))
-
-  messages = _run(SessionContextBuilder(agent_session_log=log, tail_token_budget=100).build())
-  if followup:
-    assert messages == [{"role": "user", "content": "Continue"}]
-  else:
-    assert messages[0]["role"] == "assistant"
-    assert messages[0]["content"][0]["id"] == "tool-1"
-    assert messages[1]["content"][0]["tool_use_id"] == "tool-1"
-
-
-@pytest.mark.parametrize("boundary", ["time", "summary"])
-def test_context_builder_preserves_terminal_result_outside_replayed_call(
-  tmp_path: Path,
-  monkeypatch: pytest.MonkeyPatch,
-  boundary: str,
-) -> None:
+def test_context_builder_preserves_terminal_result_outside_replayed_call(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "result-boundary.jsonl")
-  monkeypatch.setattr(agent_session_log_module.time, "time", lambda: 100.0)
   call = _run(log.append({
     "type": "assistant_message",
     "content_blocks": [{"type": "tool_use", "id": "tool-1", "name": "lookup", "input": {}}],
   }))
-  monkeypatch.setattr(agent_session_log_module.time, "time", lambda: 100.0 + 3 * 60 * 60)
-  if boundary == "summary":
-    _run(log.append({"type": "summary", "text": "Lookup requested", "covers": {"to_seq": call.seq}}))
+  _run(log.append({"type": "summary", "text": "Lookup requested", "covers": {"to_seq": call.seq}}))
   _run(log.append({
     "type": "tool_call_complete", "tool_call_id": "tool-1", "result": {"observed": "terminal evidence"},
   }))
@@ -603,3 +631,117 @@ def test_context_builder_resume_replays_same_model_thinking_with_signature(
       "content": [replayed_thinking, {"type": "text", "text": "Guidance is light."}],
     },
   ]
+
+
+@pytest.mark.parametrize("stop_reason", ["pause_turn", "max_tokens", "error"])
+def test_portable_summary_replays_pending_pair_after_failed_or_partial_request(
+  tmp_path: Path, stop_reason: str,
+) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / f"portable-{stop_reason}.jsonl")
+  call = {"type": "tool_use", "id": "pending-1", "name": "lookup", "input": {"q": "NVDA"}}
+  result = {"type": "tool_result", "tool_use_id": "pending-1", "content": "UNDELIVERED_SENTINEL"}
+  _run(log.append({"type": "user_message", "content": "Covered question"}))
+  _run(log.append({"type": "assistant_message", "content_blocks": [call]}))
+  _run(log.append({
+    "type": "tool_call_complete", "tool_call_id": "pending-1",
+    "final_tool_result_blocks": [result],
+  }))
+  # An older relocated anchor must not truncate the protected call/result pair.
+  _run(log.append({
+    "type": "assistant_message",
+    "content_blocks": [
+      {"type": "compaction", "content": "SUPERSEDED_ANCHOR"},
+      {"type": "text", "text": "Retained continuation"},
+    ],
+  }))
+  _run(log.append({
+    "type": "summary", "summary_kind": "portable_compaction",
+    "covers": {"from_seq": 1, "to_seq": 1}, "text": "Current prefix summary",
+  }))
+  if stop_reason == "error":
+    _run(log.append({"type": "error", "error": "provider disconnected"}))
+  else:
+    _run(log.append({
+      "type": "assistant_message", "stop_reason": stop_reason,
+      "content_blocks": [{"type": "text", "text": "Partial answer"}],
+    }))
+
+  messages = _run(SessionContextBuilder(agent_session_log=log).build())
+  expected = [
+    ("assistant", [{"type": "compaction", "content": "Current prefix summary"}]),
+    ("assistant", [call]),
+    ("user", [result]),
+    ("assistant", [{"type": "text", "text": "Retained continuation"}]),
+  ]
+  if stop_reason != "error":
+    expected.append(("assistant", [{"type": "text", "text": "Partial answer"}]))
+  # Compare the complete model-visible sequence, not provider bookkeeping:
+  # the pair occurs exactly once, after the current anchor, with no stale anchor.
+  assert [(message["role"], message["content"]) for message in messages] == expected
+
+
+def test_newest_portable_summary_cutoff_replays_pending_pair_once(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "portable-newest.jsonl")
+  _run(log.append({"type": "user_message", "content": "Covered question"}))
+  _run(log.append({
+    "type": "summary", "summary_kind": "portable_compaction",
+    "covers": {"from_seq": 1, "to_seq": 1}, "text": "Old prefix",
+  }))
+  _run(log.append({"type": "user_message", "content": "Now covered too"}))
+  call = {"type": "tool_use", "id": "pending-2", "name": "lookup", "input": {}}
+  result = {"type": "tool_result", "tool_use_id": "pending-2", "content": "SECOND_SENTINEL"}
+  _run(log.append({"type": "assistant_message", "content_blocks": [call]}))
+  _run(log.append({
+    "type": "tool_call_complete", "tool_call_id": "pending-2",
+    "final_tool_result_blocks": [result],
+  }))
+  for text in ("New prefix", "Newest prefix"):
+    _run(log.append({
+      "type": "summary", "summary_kind": "portable_compaction",
+      "covers": {"from_seq": 1, "to_seq": 3}, "text": text,
+    }))
+
+  messages = _run(SessionContextBuilder(agent_session_log=log).build())
+  # Exact content and order exclude duplicate pairs and every superseded summary.
+  assert [(message["role"], message["content"]) for message in messages] == [
+    ("assistant", [{"type": "compaction", "content": "Newest prefix"}]),
+    ("assistant", [call]),
+    ("user", [result]),
+  ]
+
+
+def test_second_turn_context_exposes_completed_first_turn_recap_measurements(tmp_path: Path) -> None:
+  from agent_gateway.events import event_to_dict
+  from agent_gateway.session_recap import compute_recap_from_events
+
+  log = AgentSessionLog(path=tmp_path / "sessions" / "two-turn-recap.jsonl")
+  _run(log.append({"type": "user_message", "content": "First question"}))
+  _run(log.append({"type": "assistant_message", "content": "First answer"}))
+  recap = event_to_dict(compute_recap_from_events(
+    [{
+      "type": "learning_fork_launched", "in_flight": 2, "day_invocations": 7,
+      "day_charged_microusd": 125_000, "retained_bytes": 4096,
+    }],
+    session_id="recap-session",
+    started_at=1.0,
+    trigger="turn_end",
+  ))
+  _run(log.append(recap))
+  _run(log.append({"type": "stream_complete", "terminal_disposition": "completed"}))
+  _run(log.append({"type": "user_message", "content": "What happened last turn?"}))
+
+  messages = _run(SessionContextBuilder(agent_session_log=log).build())
+  recap_messages = [
+    message for message in messages
+    if isinstance(message["content"], str)
+    and message["content"].startswith("## Previous turn recap\n\n")
+  ]
+  assert len(recap_messages) == 1
+  assert recap_messages[0]["role"] == "user"
+  rendered = json.loads(recap_messages[0]["content"].split("\n\n", 1)[1])
+  measurements = rendered["tool_calls_summary"]["measurements"]
+  assert measurements == recap["tool_calls_summary"]["measurements"]
+  assert measurements
+  assert 125_000 in measurements.values()
+  assert messages.index(recap_messages[0]) < len(messages) - 1
+  assert messages[-1] == {"role": "user", "content": "What happened last turn?"}

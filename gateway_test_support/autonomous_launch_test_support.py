@@ -57,16 +57,11 @@ def _workload(
   context: str | None = None,
   ticker: str | None = None,
   dev_mode: bool = False,
-  max_budget_usd: float | None = None,
   deliver: bool = True,
   admitted_skill_execution_limits: SkillExecutionLimits | None = None,
 ) -> AutonomousLaunchWorkload:
   if mode == "skill" and admitted_skill_execution_limits is None:
-    admitted_skill_execution_limits = SkillExecutionLimits(
-      20,
-      32_000,
-      20.0,
-    )
+    admitted_skill_execution_limits = SkillExecutionLimits(32_000)
   return AutonomousLaunchWorkload(
     profile=profile,
     mode=mode,
@@ -77,7 +72,6 @@ def _workload(
     ticker=ticker,
     research_file_id=None,
     dev_mode=dev_mode,
-    max_budget_usd=max_budget_usd,
     deliver=deliver,
     admitted_skill_execution_limits=admitted_skill_execution_limits,
     session_log_authority=AutonomousSessionLogAuthority(

@@ -26,7 +26,7 @@ from agent_gateway.skill_context import (  # noqa: E402
 def _admission(name: str = "quant-research") -> ActiveSkillAdmission:
   return ActiveSkillAdmission(
     name,
-    SkillExecutionLimits(20, 32_000, 20.0),
+    SkillExecutionLimits(32_000),
   )
 
 

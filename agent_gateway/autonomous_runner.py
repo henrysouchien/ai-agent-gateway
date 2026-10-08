@@ -82,6 +82,7 @@ from .autonomous_runner_start import (
 from .autonomous_run_lock import AutonomousRunMutationLock
 from .skill_limits import AutonomousSkillAdmissionPolicyResolver
 from .ui_blocks_metrics import record as record_package_counter
+from .session_recap import fold_run_measurements
 
 _STATUS_TAIL_LINES = 40
 _POST_EXIT_SETTLE_SECONDS = 5.0
@@ -134,6 +135,37 @@ def _control_endpoint_identity(
       "autonomous control append endpoint does not match signed authority"
     )
   return path, expected_device, expected_inode
+
+
+async def _recap_with_parent_measurements(
+  record: AutonomousTask,
+  recap: dict[str, Any],
+) -> dict[str, Any]:
+  """The child's ``session_recap`` plus the counts only this parent holds.
+
+  The child folds its own log; the approval decisions this parent sent (with
+  their frame bytes), the in-flight count at start and the credential handoff
+  bytes live on the run record, so they join the recap's measurements here.
+  """
+
+  # Exact by ordering, not by the live channel counters (the channel is closed
+  # and dropped at reap): `send_approval_decision` publishes and records each
+  # decision under this lock, so a recap drained right after a publish waits
+  # for that decision's `approval_decision_sent` event before folding.
+  async with record.approval_decision_lock:
+    parent_measurements = fold_run_measurements(record.event_lines or [])
+  for name, value in (
+    ("autonomous_in_flight_at_start", record.autonomous_in_flight_at_start),
+    ("credential_handoff_bytes", record.credential_handoff_bytes),
+  ):
+    if value is not None:
+      parent_measurements[name] = value
+  summary = dict(recap["tool_calls_summary"])
+  measurements = dict(summary.get("measurements") or {})
+  for name, value in parent_measurements.items():
+    measurements[name] = max(value, int(measurements.get(name, 0)))
+  summary["measurements"] = measurements
+  return {**recap, "tool_calls_summary": summary}
 
 
 def _control_record_snapshot(
@@ -391,7 +423,6 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     deliver: bool = True,
     ticker: str | None = None,
     research_file_id: int | None = None,
-    max_budget_usd: float | None = None,
   ) -> list[str]:
     return _runner_commands.build_autonomous_cmd(
       python_executable=self._python,
@@ -404,7 +435,6 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
       context=context,
       ticker=ticker,
       research_file_id=research_file_id,
-      max_budget_usd=max_budget_usd,
       normalize_autonomous_profile_func=normalize_autonomous_profile,
     )
 
@@ -666,8 +696,6 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
       return "cancelled"
     if record.state == "interrupted":
       return "interrupted"
-    if record.state in {"budget_limited", "budget_exceeded"}:
-      return "budget_limited"
     if record.state == "blocked":
       return "blocked"
     if record.state in {"completed", "finished"}:
@@ -851,9 +879,14 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
                 record=record,
                 event=result.event,
               )
+          # The child's recap carries its own log's counts; the parent's join
+          # it before the run record keeps it.
+          event = result.event
+          if event.get("type") == "session_recap":
+            event = await _recap_with_parent_measurements(record, event)
           projected_event = await self._record_and_publish_event(
             record,
-            result.event,
+            event,
             strict=True,
           )
           if projected_event is None:
@@ -1805,24 +1838,27 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
       except asyncio.CancelledError:
         await publication_task
         raise
-
-    await self._record_and_publish_event(
-      record,
-      {
-        "type": "approval_decision_sent",
-        "task_id": record.task_id,
-        "run_id": record.control_run_id,
-        "control_run_id": record.control_run_id,
-        "approval_id": normalized_approval_id,
-        "tool_call_id": normalized_tool_call_id,
-        "approved": approved,
-        "allow_tool_type": False,
-        "decider": {
-          "user_id": user_id,
+      # Recorded before the lock is released: the recap fold waits on this
+      # lock, so it never sees a published decision without its event.
+      await self._record_and_publish_event(
+        record,
+        {
+          "type": "approval_decision_sent",
+          "task_id": record.task_id,
+          "run_id": record.control_run_id,
+          "control_run_id": record.control_run_id,
+          "approval_id": normalized_approval_id,
+          "tool_call_id": normalized_tool_call_id,
+          "approved": approved,
+          "allow_tool_type": False,
+          "decider": {
+            "user_id": user_id,
+          },
+          "sent_at": decided_at_ns / 1_000_000_000,
+          "decisions_sent": endpoint.decisions_sent,
+          "frame_bytes": endpoint.sent_frame_bytes(delivery_sequence),
         },
-        "sent_at": decided_at_ns / 1_000_000_000,
-      },
-    )
+      )
     return {
       "task_id": record.task_id,
       "run_id": record.control_run_id,

@@ -54,11 +54,16 @@ log = logging.getLogger(__name__)
 
 
 def _require_control_session(session: GatewaySession) -> None:
+  # A control session is minted by the owner's gateway-key login and spans every
+  # run, batch and readable resource the owner holds, while a chat bearer proves
+  # only its own session (auth).
   if session.kind != "control":
     raise HTTPException(status_code=401, detail="Control session required")
 
 
 def _require_chat_session_for_run(authenticated: GatewaySession, target: GatewaySession) -> None:
+  # A chat bearer acts only on its own run; a control session acts on runs of its
+  # owner in its own channel (auth).
   if authenticated.kind == "chat" and authenticated.session_id == target.session_id:
     return
   if authenticated.kind == "control" and _session_matches_owner(target, _session_owner_user_id(authenticated)):
@@ -305,6 +310,8 @@ async def _dispatch_control_chat_turn(
   )
   if record_parent_message:
     if session.stream_active or (session.active_turn is not None and session.active_turn.is_running):
+      # Concurrency: one session's transcript, runner and event log take one
+      # writer, so a second turn waits on the running one (server_chat_helpers CP43).
       raise HTTPException(status_code=409, detail="A turn is already running; subscribe via /chat/subscribe")
 
   try:
@@ -347,7 +354,7 @@ async def _dispatch_control_chat_turn(
       )
       pending_seen.set()
 
-  turn = SessionStream(event_log=EventLog(session_id=control_run_id), runner_task=None)
+  turn = SessionStream(event_log=EventLog(session_id=control_run_id, defer_terminal_close=True), runner_task=None)
   dispatch_task = asyncio.create_task(
     _dispatch_chat_turn(
       session,

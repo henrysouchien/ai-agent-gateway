@@ -11,73 +11,6 @@ from model_authority.thinking import parse_effort
 
 ChatRunState = ControlRunState
 AutonomousRunState = ControlRunState
-_CONTROL_CONTEXT_AUTHORITY_FIELDS = frozenset({
-  "account_id",
-  "account_ids",
-  "api_key",
-  "auth",
-  "authorization",
-  "channel",
-  "credential",
-  "credential_id",
-  "credential_ids",
-  "credentials",
-  "dev_mode",
-  "dispatch_scope",
-  "email",
-  "owner",
-  "owner_id",
-  "owner_user_id",
-  "portfolio",
-  "portfolio_id",
-  "portfolio_name",
-  "refresh_token",
-  "risk_user_id",
-  "route",
-  "route_id",
-  "token",
-  "user",
-  "user_email",
-  "user_id",
-})
-_CONTROL_CONTEXT_AUTHORITY_KEYS = frozenset(
-  "".join(character.lower() for character in field if character.isalnum())
-  for field in _CONTROL_CONTEXT_AUTHORITY_FIELDS
-)
-
-
-def _context_key_is_authority_field(key: Any) -> bool:
-  normalized = "".join(character.lower() for character in str(key) if character.isalnum())
-  return normalized in _CONTROL_CONTEXT_AUTHORITY_KEYS
-
-
-def _context_authority_paths(value: Any, *, path: str = "context") -> list[str]:
-  paths: list[str] = []
-  if isinstance(value, dict):
-    for key, nested_value in value.items():
-      key_text = str(key)
-      child_path = f"{path}.{key_text}"
-      if _context_key_is_authority_field(key_text):
-        paths.append(child_path)
-      paths.extend(_context_authority_paths(nested_value, path=child_path))
-    return paths
-  if isinstance(value, list):
-    for index, nested_value in enumerate(value):
-      paths.extend(_context_authority_paths(nested_value, path=f"{path}[{index}]"))
-  return paths
-
-
-def _reject_context_authority_fields(value: dict[str, Any]) -> dict[str, Any]:
-  paths = _context_authority_paths(value)
-  if paths:
-    preview = ", ".join(paths[:5])
-    if len(paths) > 5:
-      preview += f", ... (+{len(paths) - 5} more)"
-    raise ValueError(
-      "context must not include portfolio, account, owner, credential, token, "
-      f"route, channel, or dispatch-scope authority fields: {preview}"
-    )
-  return value
 
 
 class VerdictSummaryResponse(BaseModel):
@@ -144,7 +77,6 @@ class AutonomousTerminalReceipt(BaseModel):
   run_id: str = Field(..., min_length=1)
   disposition: Literal[
     "completed",
-    "budget_limited",
     "failed",
     "interrupted",
     "cancelled",
@@ -198,8 +130,6 @@ class DispatchScope(BaseModel):
   def _validate_portfolio_name(cls, value: str) -> str:
     if not value.strip():
       raise ValueError("portfolio_name must be a non-empty string")
-    if len(value) > 256:
-      raise ValueError("portfolio_name must be 256 characters or fewer")
     return value
 
   @field_validator("portfolio_id", "display_name")
@@ -209,8 +139,6 @@ class DispatchScope(BaseModel):
       return value
     if not value.strip():
       raise ValueError(f"{info.field_name} must be omitted, null, or a non-empty string")
-    if len(value) > 256:
-      raise ValueError(f"{info.field_name} must be 256 characters or fewer")
     return value
 
 
@@ -232,7 +160,6 @@ class ChatRunResponse(BaseModel):
   started_at: str
   ended_at: str | None
   cost_usd: float | None
-  max_budget_usd: float | None = None
   initial_message: str
   skill_run_ids: list[str]
   current_verdict: VerdictSummaryResponse | None
@@ -269,7 +196,6 @@ class AutonomousRunResponse(BaseModel):
   started_at: str
   ended_at: str | None
   cost_usd: float | None
-  max_budget_usd: float | None = None
   skill_run_ids: list[str]
   current_verdict: VerdictSummaryResponse | None
   staged_proposals: list[StagedProposalResponse] = Field(default_factory=list)
@@ -299,14 +225,8 @@ class ChatDispatchRequest(BaseModel):
   skill: str | None = None
   ticker: str | None = None
   deadline_sec: int | None = Field(default=None, ge=1)
-  max_budget_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False)
   context: dict[str, Any] = Field(default_factory=dict)
   dispatch_scope: DispatchScope | None = None
-
-  @field_validator("context")
-  @classmethod
-  def _reject_context_authority_fields(cls, value: dict[str, Any]) -> dict[str, Any]:
-    return _reject_context_authority_fields(value)
 
   @field_validator("effort", mode="before")
   @classmethod
@@ -322,15 +242,6 @@ class ChatDispatchRequest(BaseModel):
       raise ValueError("catalog_revision requires an explicit model_key")
     return self
 
-  @field_validator("max_budget_usd", mode="before")
-  @classmethod
-  def _reject_coerced_max_budget(cls, value: Any) -> Any:
-    if value is None:
-      return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-      raise ValueError("max_budget_usd must be a finite positive number")
-    return value
-
 
 class AutonomousDispatchRequest(BaseModel):
   model_config = ConfigDict(extra="forbid")
@@ -345,17 +256,7 @@ class AutonomousDispatchRequest(BaseModel):
   context: str | None = None
   channel: str | None = None
   research_file_id: int | None = Field(default=None, ge=1)
-  max_budget_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False)
   dispatch_scope: DispatchScope | None = None
-
-  @field_validator("max_budget_usd", mode="before")
-  @classmethod
-  def _reject_coerced_max_budget(cls, value: Any) -> Any:
-    if value is None:
-      return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-      raise ValueError("max_budget_usd must be a finite positive number")
-    return value
 
   @field_validator("research_file_id", mode="before")
   @classmethod
@@ -447,11 +348,6 @@ class ChatContinuationRequest(BaseModel):
   effort: str | None = None
   catalog_revision: str | None = None
   deadline_sec: int | None = Field(default=None, ge=1)
-
-  @field_validator("context")
-  @classmethod
-  def _reject_context_authority_fields(cls, value: dict[str, Any]) -> dict[str, Any]:
-    return _reject_context_authority_fields(value)
 
   @field_validator("effort", mode="before")
   @classmethod

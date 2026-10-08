@@ -352,8 +352,9 @@ def make_error_result(
   error_dict: dict[str, Any] = {"code": code, "message": message}
   if sub_code:
     error_dict["sub_code"] = sub_code
-  if data is not None:
-    error_dict["data"] = data
+  # ``next_call`` is the producer's next action, or an explicit ``None`` when
+  # it named none: every model-visible error answers "what next".
+  error_dict["data"] = {**(data or {}), "next_call": (data or {}).get("next_call")}
   return {
     "type": "tool_result",
     "tool_use_id": tool_use_id,
@@ -470,6 +471,7 @@ def compact_model_tool_result_entry(
   log_session_id: str,
   logger: Any,
   uuid_factory: Callable[[], Any] | None = None,
+  on_spill_publication: Callable[[SpillPublication], None] | None = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
   content = result_entry.get("content")
   if not isinstance(content, str):
@@ -534,6 +536,8 @@ def compact_model_tool_result_entry(
         model_max_chars=max_chars,
         uuid_factory=uuid_factory or uuid.uuid4,
       )
+      if on_spill_publication is not None:
+        on_spill_publication(publication)
       live_compacted_content, _ = truncate_model_tool_result_content(
         content,
         tool_name=tool_name,

@@ -84,7 +84,7 @@ def test_dispatch_injects_session_id_only_for_configured_mcp_servers() -> None:
   ]
 
 
-def test_dispatch_rejects_mcp_tool_outside_scoped_allowlist() -> None:
+def test_dispatch_runs_mcp_tool_outside_scoped_allowlist() -> None:
   mcp_client = _CaptureMcpClient()
   dispatcher = ToolDispatcher(
     mcp_client=mcp_client,
@@ -101,7 +101,7 @@ def test_dispatch_rejects_mcp_tool_outside_scoped_allowlist() -> None:
       advertised_tool_names=frozenset({"browser_snapshot", "filesystem_read"}),
     )
   )
-  denied_result, denied_error = _run(
+  outside_result, outside_error = _run(
     dispatcher.dispatch(
       "tool_2",
       "filesystem_read",
@@ -112,8 +112,9 @@ def test_dispatch_rejects_mcp_tool_outside_scoped_allowlist() -> None:
 
   assert allowed_error is None
   assert allowed_result == {"ok": True}
-  assert denied_result is None
-  assert denied_error is not None
-  assert denied_error["code"] == "mcp_tool_not_allowed"
-  assert "filesystem.filesystem_read" in denied_error["message"]
-  assert mcp_client.calls == [("browser_snapshot", {"url": "https://example.com"})]
+  assert outside_error is None
+  assert outside_result == {"ok": True}
+  assert mcp_client.calls == [
+    ("browser_snapshot", {"url": "https://example.com"}),
+    ("filesystem_read", {"path": "/tmp/example.txt"}),
+  ]

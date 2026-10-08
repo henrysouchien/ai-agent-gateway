@@ -4,7 +4,6 @@ import asyncio
 from copy import deepcopy
 from dataclasses import dataclass, field
 import fcntl
-import hashlib
 import inspect
 import json
 import math
@@ -93,15 +92,7 @@ SKILL_RESULT_CORE_FIELDS = frozenset({
   "approval_id",
   "approval_tool_name",
 })
-_FAILURE_RESULT_STATUSES = frozenset({
-  "error",
-  "failed",
-  "failure",
-  "invalid",
-  "rejected",
-})
 _LEASE_FENCE_SCHEMA_VERSION = 1
-_MAX_LEASE_FENCE_BYTES = 4 * 1024 * 1024
 
 
 class WriterLeaseAlreadyHeldError(NamedRefusal):
@@ -130,23 +121,20 @@ def _lease_fence_record(
   generation: int,
   owner_token: str,
 ) -> dict[str, Any]:
-  body = {
+  return {
     "schema_version": _LEASE_FENCE_SCHEMA_VERSION,
     "generation": generation,
     "owner_token": owner_token,
   }
-  checksum = (
-    "sha256:"
-    + hashlib.sha256(canonical_json_bytes(body)).hexdigest()
-  )
-  return {**body, "checksum": checksum}
 
 
 def _parse_lease_fence_records(raw: bytes) -> list[dict[str, Any]]:
   if not raw:
     return []
-  if len(raw) > _MAX_LEASE_FENCE_BYTES:
-    raise RuntimeError("Writer lease fence history exceeds 4 MiB")
+  # Under the exclusive flock a tail without a newline can only be a prior
+  # holder's interrupted append; appending the next generation after it would
+  # fuse both into one unreadable record and lose the fencing token the
+  # completion WAL compares, so the history is refused rather than extended.
   if not raw.endswith(b"\n"):
     raise RuntimeError("Writer lease fence history has a torn tail")
   records: list[dict[str, Any]] = []
@@ -160,20 +148,13 @@ def _parse_lease_fence_records(raw: bytes) -> list[dict[str, Any]]:
       ) from exc
     if (
       type(record) is not dict
-      or set(record)
-      != {
-        "schema_version",
-        "generation",
-        "owner_token",
-        "checksum",
-      }
+      or not {"schema_version", "generation", "owner_token"} <= record.keys()
       or type(record["schema_version"]) is not int
       or record["schema_version"] != _LEASE_FENCE_SCHEMA_VERSION
       or type(record["generation"]) is not int
       or record["generation"] != prior_generation + 1
       or type(record["owner_token"]) is not str
       or len(record["owner_token"]) != 64
-      or type(record["checksum"]) is not str
     ):
       raise RuntimeError(
         f"Writer lease fence record {index} is invalid"
@@ -184,19 +165,6 @@ def _parse_lease_fence_records(raw: bytes) -> list[dict[str, Any]]:
       raise RuntimeError(
         f"Writer lease fence record {index} owner token is invalid"
       ) from exc
-    body = {
-      "schema_version": record["schema_version"],
-      "generation": record["generation"],
-      "owner_token": record["owner_token"],
-    }
-    expected_checksum = (
-      "sha256:"
-      + hashlib.sha256(canonical_json_bytes(body)).hexdigest()
-    )
-    if record["checksum"] != expected_checksum:
-      raise RuntimeError(
-        f"Writer lease fence record {index} checksum mismatch"
-      )
     records.append(record)
     prior_generation = record["generation"]
   return records
@@ -214,6 +182,9 @@ class TopLevelSkillAdmission:
   _parent_identity: DirectoryIdentity = field(repr=False)
   lease_generation: int
   lease_owner_token: str = field(repr=False)
+  # Size of the fence history after this admission's append: a measurement
+  # reported on skill_run_started, never a bound on the next admission.
+  lease_fence_bytes: int
   _initial_log_identity: tuple[int, int] | None = field(
     repr=False,
     default=None,
@@ -341,6 +312,10 @@ class TopLevelSkillAdmission:
         raise RuntimeError(
           "Top-level skill admission lease identity changed"
         )
+      # The exclusive flock is the single-writer guarantee for this session
+      # log: two runners appending one JSONL would interleave sequence numbers
+      # and corrupt the append-only log, so a second writer is refused as
+      # writer_lease_already_held (callers record the run as skipped).
       try:
         fcntl.flock(
           lease_file.fileno(),
@@ -351,9 +326,7 @@ class TopLevelSkillAdmission:
           f"Writer lease already held for {canonical_log_path}"
         ) from exc
       lease_file.seek(0)
-      lease_history = lease_file.read(
-        _MAX_LEASE_FENCE_BYTES + 1
-      )
+      lease_history = lease_file.read()
       fence_records = _parse_lease_fence_records(lease_history)
       lease_generation = len(fence_records) + 1
       lease_owner_token = secrets.token_hex(32)
@@ -362,18 +335,12 @@ class TopLevelSkillAdmission:
         owner_token=lease_owner_token,
       )
       fence_line = canonical_json_bytes(fence_record) + b"\n"
-      if len(lease_history) + len(fence_line) > _MAX_LEASE_FENCE_BYTES:
-        raise RuntimeError(
-          "Writer lease fence history cannot accept another generation"
-      )
       lease_file.seek(0, os.SEEK_END)
       _write_all_fd(lease_file.fileno(), fence_line)
       lease_file.flush()
       os.fsync(lease_file.fileno())
       lease_file.seek(0)
-      persisted_records = _parse_lease_fence_records(
-        lease_file.read(_MAX_LEASE_FENCE_BYTES + 1)
-      )
+      persisted_records = _parse_lease_fence_records(lease_file.read())
       if (
         not persisted_records
         or persisted_records[-1] != fence_record
@@ -410,6 +377,7 @@ class TopLevelSkillAdmission:
         _parent_identity=parent_identity,
         lease_generation=lease_generation,
         lease_owner_token=lease_owner_token,
+        lease_fence_bytes=len(lease_history) + len(fence_line),
         _initial_log_identity=initial_log_identity,
       )
     except BaseException:
@@ -545,9 +513,7 @@ class TopLevelSkillAdmission:
       )
     self._validate_storage_identity()
     self._lease_file.seek(0)
-    records = _parse_lease_fence_records(
-      self._lease_file.read(_MAX_LEASE_FENCE_BYTES + 1)
-    )
+    records = _parse_lease_fence_records(self._lease_file.read())
     if not records:
       raise RuntimeError("Writer lease fence history is empty")
     latest = records[-1]
@@ -1011,42 +977,10 @@ class TopLevelSkillLifecycleMetadata:
         event[field_name],
         field_name=f"skill_result_captured.{field_name}",
       )
-    exit_code = event["exit_code"]
-    outcome = event["outcome"]
-    status = event["status"].strip().lower()
-    error = event["error"]
-    if outcome == "success":
-      if exit_code != 0:
-        raise RuntimeError(
-          "skill_result_captured success requires exit_code 0"
-        )
-      if error is not None:
-        raise RuntimeError(
-          "skill_result_captured success cannot carry an error"
-        )
-    if status in _FAILURE_RESULT_STATUSES and exit_code == 0:
-      raise RuntimeError(
-        "skill_result_captured failure status requires nonzero exit_code"
-      )
-    if outcome in {"error", "post_run_guard_failed"} and (
-      exit_code == 0
-      or not isinstance(error, str)
-      or not error.strip()
-    ):
-      raise RuntimeError(
-        "skill_result_captured error outcome requires nonzero exit_code "
-        "and a non-empty error"
-      )
-    # A door row's status belongs to that door's operation; the run's exit
-    # code belongs to the run. This contract used to reject its own
-    # producer's honest result whenever any unrecoverable door row sat
-    # beside exit code 0 — a relation no producer can honor (the run may
-    # have recovered by another route, which is why the recoverable case was
-    # already exempted). Its only observed effect was to replace the run's
-    # result with a policy crash and STOP-gate every dependent stage (live
-    # incident 2026-09-17, pipeline c80aa974d623). The door rows stay in
-    # ``fms_results``, where the pipeline reads them and fails the stage on
-    # the door's own status.
+    # The producer owns how outcome, status, exit_code, error and each door
+    # row in ``fms_results`` relate; this normalizer records them as produced
+    # and checks only their JSON types. Downstream stages read the run's
+    # exit_code and each door's own status.
     verdict_echo = event["verdict_echo"]
     if verdict_echo is not None and type(verdict_echo) is not dict:
       raise RuntimeError(

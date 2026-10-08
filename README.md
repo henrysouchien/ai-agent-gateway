@@ -28,6 +28,7 @@ building runtimes and use one product policy per gateway process.
 | [`agent_gateway/server.py`](agent_gateway/server.py) | `create_gateway_app()` | Product-owned runtime factories, auth, policy, and lifecycle integration |
 | [`agent_gateway/gateway_server.py`](agent_gateway/gateway_server.py) | `run_gateway_server()` / `main()` | Privileged single-worker TCP launcher, claim-signing fd adoption, and startup-failure logging |
 | [`agent_gateway/autonomous.py`](agent_gateway/autonomous.py) | `run_autonomous()` / `run_autonomous_sync()` | A prebound headless one-shot with no HTTP server |
+| [`agent_gateway/admission.py`](agent_gateway/admission.py) | `admit()` | Shared spawn, continuation, message and handle authority |
 | [`agent_gateway/heartbeat.py`](agent_gateway/heartbeat.py) | `HeartbeatLoop` | Repeated prebound autonomous work with quiet windows and backoff |
 | [`agent_gateway/cli.py`](agent_gateway/cli.py) | `main()` (`agent init` / `agent run`) | Scaffold and run a package project |
 | [`agent_gateway/gateway_address.py`](agent_gateway/gateway_address.py) | `gateway_base_url()` | The origin of the gateway a process talks to: the one reader of `GATEWAY_BASE_URL` and the one place its default is spelled |
@@ -40,6 +41,60 @@ the launch-failure journal have one owner.
 The package does not infer a new model or credential inside autonomous
 execution. The application resolves and passes the exact bound capability,
 session, billing mode, and skill limits before calling `run_autonomous()`.
+
+Model selection and model request facts come from `model_authority`
+(`hank-model-authority`; in the monorepo `packages/model-authority/`), which this
+package depends on and carries no copy of: the registry, the selection policy,
+each entry's per-family `compat` block and the rate tables.
+`CapabilityExecutionResolver.select_bind()` in `capability_execution.py` selects
+and authorizes a secret-free bind through that owner, without materializing
+credentials or constructing an adapter. `resolve()` selects and materializes
+once; `materialize_bind()` executes an already selected bind without reselection.
+[`agent_gateway/providers/`](agent_gateway/providers/README.md) builds each request
+from the bound entry. Mechanism: `docs/reference/model-authority.md`.
+
+`admit(SpawnRequest(...), parent, owners=AdmissionOwners(...))` returns the
+selected context and exact `ResolvedAuthority`, without materializing credentials.
+`admit(ContinueRequest(...), parent, owners=ContinuationOwners(...))` instead
+retains the original `AdmittedTask`: no model reselection, semantic recompile, or
+replacement tool grant. Its context preserves lineage and recorded spend;
+`placement_lost` refreshes only backend placement/environment facts. Both results
+carry the child's approval route from `child_approval_route()`: a child never
+holds `DurableLocalApprovalRoute`; an in-process child records into its parent's
+ledger through `InProcessDelegatedApprovalRoute`, a detached child adopts its
+inherited channel as `ParentDelegatedApprovalRoute`, and a sessionless root's
+children carry its `ControlPlaneApprovalRoute`. The existing task registry, transcript
+reconstruction, attempt creation and credential materialization remain outside
+this pure step. A valid older task without the context projection keeps its
+durable authority; missing durable routes/definitions retain the resume owner's
+existing handling.
+`AdmissionOwners.frozen_bind` retains a plan-frozen model bind without
+reselection; `materialize_bind()` is the single reauthorization owner. Fresh spawns select effort within the registered role; profile
+overlays remain deferred. Declared operation children determine nested spawning.
+Role narrowing reads the authenticated admitted tenant, not the presence or role
+of an optional runtime session. The product policy still reads real session/profile
+capability facts for its scoped exceptions; sessionless launch does not mint a
+synthetic session or gain those exceptions.
+Operation-private routes may extend the parent's visible surface, but cannot
+bypass its withheld routes. Admission matches withheld canonical route IDs and
+their registered policy names before freezing the executable grant.
+The admitted wire retains `withheld_tools` across descendants and durable
+continuation. Resume keeps its original executable grant while descendants
+retain recorded exclusions plus the current parent's known exclusions.
+`MessageRequest` and `HandleRequest` retain the caller's job context, using
+spawn-passed handles plus current own/descendant outputs supplied by the durable
+output owner. Message references are citations, never grants to the recipient.
+The authenticated turn edge calls `root_context()` after approval, verified
+research binding and withheld tools are ready; `current_parent_context()` reads
+that captured scope without minting authority. A child session installs
+`context_for_child(..., job_id=<physical task id>)` with `capture_job_context()`
+and cannot regain root scope.
+Sessionless control/schedule edges use `root_context_from_identity()` with their
+authenticated identity, live roster and approval owner.
+`TaskRegistry` recovery validates the canonical task and keeps its model bind as
+execution authority. Duplicate registration/message bind receipts are optional
+observations, not prerequisites or competing authority; canonical corruption and
+task/result/message identity checks still apply.
 
 ## Quick start
 

@@ -33,33 +33,12 @@ ToolClass = Literal[
 # PORTFOLIO_IRREVERSIBLE_TOOLS on `portfolio-trades-mcp`). It is the one class
 # whose decision belongs to a human, on every channel.
 MONEY_BOUNDARY_TOOL_CLASSES: frozenset[ToolClass] = frozenset({"irreversible"})
-# Every other class follows the user's standing approval preference. Derived by
-# complement so a newly added ToolClass is admitted by the preference rather
-# than silently acquiring a human door nobody declared.
+# Every other class is approved without a human. Derived by complement so a
+# newly added ToolClass is approved rather than silently acquiring a human door
+# nobody declared.
 STANDING_APPROVED_TOOL_CLASSES: frozenset[ToolClass] = frozenset(
   get_args(ToolClass)
 ) - MONEY_BOUNDARY_TOOL_CLASSES
-
-# The user's standing answer for every class outside the money boundary.
-# `auto_approve_all_but_trades` is the product default: an agent-driven surface
-# never draws an approval card for a read, a write, or a config change. A user
-# who wants to be asked again sets `request_user_approval`.
-ApprovalPreference = Literal["auto_approve_all_but_trades", "request_user_approval"]
-DEFAULT_APPROVAL_PREFERENCE: ApprovalPreference = "auto_approve_all_but_trades"
-APPROVAL_PREFERENCES: frozenset[str] = frozenset(get_args(ApprovalPreference))
-
-
-def preference_settles_class(
-  *,
-  preference: ApprovalPreference,
-  tool_class: str,
-) -> bool:
-  """Return whether the standing preference decides this class without a human."""
-
-  return (
-    preference == "auto_approve_all_but_trades"
-    and tool_class not in MONEY_BOUNDARY_TOOL_CLASSES
-  )
 
 
 ApprovalIdentitySource = Literal["change_set", "reviewed_change_binding"]
@@ -622,57 +601,10 @@ def constrain_approval_decision(
   request: ApprovalRequest,
   decision: ApprovalDecision,
 ) -> ApprovalDecision:
-  """Apply the durable constraint before policy output can affect lifecycle state."""
+  """Shape the policy decision's reuse fields to the request's reuse mode."""
 
-  if request.approval_constraint == "standard":
-    constrained = decision
-  elif request.approval_constraint == "legacy_unknown":
-    constrained = replace(
-      decision,
-      outcome="auto_deny",
-      reason=(
-        "Approval constraint is unknown; replan and obtain a fresh approval"
-      ),
-      allow_persistent_grant=False,
-      persistent_grant_scope_hint=None,
-      grant_reference=None,
-      modified_tool_args=None,
-    )
-  elif decision.outcome == "auto_deny":
-    constrained = replace(
-      decision,
-      allow_persistent_grant=False,
-      persistent_grant_scope_hint=None,
-      grant_reference=None,
-    )
-  else:
-    constrained = replace(
-      decision,
-      outcome="request_user_approval",
-      reason="Exact promotion requires a fresh decision by its frozen owner",
-      allow_persistent_grant=False,
-      persistent_grant_scope_hint=None,
-      grant_reference=None,
-      modified_tool_args=None,
-    )
-
+  constrained = decision
   scope = constrained.persistent_grant_scope_hint
-  grant_mismatch = (
-    constrained.grant_reference is not None
-    and (
-      request.approval_reuse_mode == "disabled"
-      or (
-        request.approval_reuse_mode == "exact"
-        and scope != request.approval_reuse_key
-      )
-    )
-  )
-  if grant_mismatch and constrained.outcome == "auto_approve":
-    constrained = replace(
-      constrained,
-      outcome="request_user_approval",
-      reason="Persistent approval grant did not match this registered call",
-    )
   if request.approval_reuse_mode == "disabled":
     return replace(
       constrained,
@@ -709,19 +641,23 @@ def constrain_approval_decision(
 
 
 def approval_is_executable(request: ApprovalRequest) -> bool:
-  """Return whether the durable request can authorize its exact mutation."""
+  """Return whether the durable request can authorize its exact mutation.
 
-  if request.approval_constraint == "standard":
-    return request.state in {"approved", "auto_approved"}
+  A `legacy_unknown` request never executes (money, integrity): a durable row
+  whose constraint is unknown authorizes nothing, whatever state it reached, so
+  a replayed or resumed approval cannot run it. A `fresh_human_owner` request
+  runs only on a human vote by its frozen owner (money): an approval by any
+  other decider, owner role or not, is recorded and does not execute.
+  """
+
   if request.approval_constraint == "legacy_unknown":
     return False
-  return (
-    request.state == "approved"
-    and request.decision == "approved"
-    and request.authorization_mode in {"HUMAN", "OWNER_CONTROL_PLANE"}
-    and request.decider_role == "owner"
-    and request.decider_id == request.required_owner_user_id
-  )
+  if request.approval_constraint == "fresh_human_owner":
+    return (
+      request.state == "approved"
+      and request.decider_id == request.required_owner_user_id
+    )
+  return request.state in {"approved", "auto_approved"}
 
 
 def approval_reuse_scope_authorized(request: ApprovalRequest) -> bool:

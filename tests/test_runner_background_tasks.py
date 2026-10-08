@@ -15,6 +15,7 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import (  # noqa: E402
   AgentRunner,
+  EventLog,
   ModelProvider,
   NotificationQueue,
   TaskEntry,
@@ -33,7 +34,6 @@ from agent_gateway.runner_background_tasks import (  # noqa: E402
   background_task_payload,
   background_task_ids,
   background_task_ids_for_asyncio_tasks,
-  background_task_limit_error,
   background_task_registration_metadata,
   background_task_reminder_text,
   background_result_task,
@@ -409,6 +409,7 @@ def test_runner_background_registration_resolves_parent_module_helpers(monkeypat
   runner._gateway_session_id = "sess"
   runner._parent_turn_id = "turn-1"
   runner._sid = "sess"
+  runner._log = EventLog()
 
   durable_events: list[dict[str, Any]] = []
 
@@ -462,6 +463,10 @@ def test_runner_background_registration_resolves_parent_module_helpers(monkeypat
   assert registered_types == ["plan_run"]
   assert workflow_metadata_seen == [workflow_task_metadata]
   assert transitions == [("bg_5", TaskState.RUNNING)]
+  assert [entry.event for entry in runner._log.entries] == [{
+    "type": "interceptor_measurement",
+    "measurement": {"concurrent_sub_agents": 1},
+  }]
 
 
 def test_runner_shutdown_background_tasks_resolves_parent_module_helpers(monkeypatch: Any) -> None:
@@ -915,20 +920,6 @@ def test_background_result_task_returns_legacy_not_found_error() -> None:
   assert log_lookups == ["missing"]
 
 
-def test_background_task_limit_error_preserves_legacy_message() -> None:
-  assert background_task_limit_error(admission_count=1, max_background_tasks=2) is None
-  assert background_task_limit_error(admission_count=2, max_background_tasks=2) == {
-    "code": "max_background_tasks",
-    "message": (
-      "Background task limit reached (2). "
-      "Wait for an existing background task to finish before launching another."
-    ),
-  }
-  over_limit = background_task_limit_error(admission_count=3, max_background_tasks=2)
-  assert over_limit is not None
-  assert over_limit["code"] == "max_background_tasks"
-
-
 def test_call_before_background_task_start_hook_handles_none_success_and_failure() -> None:
   class Logger:
     def __init__(self) -> None:
@@ -1105,20 +1096,19 @@ def test_resume_task_id_override_handles_absent_original_without_callbacks() -> 
   assert asyncio.run(
     resume_task_id_override(
       None,
-      max_resume_chain_depth=3,
       resume_chain_depth=depth,
       resume_root=root,
     )
-  ) == (None, None)
+  ) is None
   assert calls == []
 
 
-def test_resume_task_id_override_builds_next_id_or_depth_error() -> None:
+def test_resume_task_id_override_builds_next_id_at_any_depth() -> None:
   calls: list[str] = []
 
   async def depth(task_id: str) -> int:
     calls.append(f"depth:{task_id}")
-    return 2
+    return 7
 
   async def root(task_id: str) -> str:
     calls.append(f"root:{task_id}")
@@ -1126,31 +1116,12 @@ def test_resume_task_id_override_builds_next_id_or_depth_error() -> None:
 
   assert asyncio.run(
     resume_task_id_override(
-      "bg_root_r2",
-      max_resume_chain_depth=3,
+      "bg_root_r7",
       resume_chain_depth=depth,
       resume_root=root,
     )
-  ) == ("bg_root_r3", None)
-  assert calls == ["depth:bg_root_r2", "root:bg_root_r2"]
-
-  calls.clear()
-
-  assert asyncio.run(
-    resume_task_id_override(
-      "bg_root_r2",
-      max_resume_chain_depth=2,
-      resume_chain_depth=depth,
-      resume_root=root,
-    )
-  ) == (
-    None,
-    {
-      "code": "max_resume_chain_depth",
-      "message": "Resume chain depth limit reached (2) for bg_root_r2",
-    },
-  )
-  assert calls == ["depth:bg_root_r2"]
+  ) == "bg_root_r8"
+  assert calls == ["depth:bg_root_r7", "root:bg_root_r7"]
 
 
 def test_resume_root_task_id_from_registry_follows_parents_and_breaks_cycles() -> None:
@@ -1279,7 +1250,7 @@ def test_background_task_payload_formats_interrupted_and_killed_states() -> None
       "call_index": 2,
       "task_type": "sub_agent",
       "capability_bind": _bind_receipt(model="claude"),
-      "resumable": True,
+      "resume_chain_depth": 1,
     },
     original_task_id="bg_root",
   )
@@ -1309,7 +1280,8 @@ def test_background_task_payload_formats_interrupted_and_killed_states() -> None
   assert interrupted_payload["status"] == "interrupted"
   assert interrupted_payload["completed"] is True
   assert interrupted_payload["owner_runner_id"] == "runner-1"
-  assert interrupted_payload["resumable"] is True
+  assert "resumable" not in interrupted_payload
+  assert interrupted_payload["resume_chain_depth"] == 1
   assert interrupted_payload["resumed_as"] == ["bg_root_r1"]
   assert interrupted_payload["latest_resume_task_id"] == "bg_root_r1"
   assert interrupted_payload["message"] == "completion durability is uncertain"
@@ -1457,101 +1429,6 @@ def test_runner_resumed_task_ids_delegates_after_registry_rebuild() -> None:
 
   assert asyncio.run(runner._resumed_task_ids("bg_root")) == ["bg_r1", "bg_r2"]
   assert rebuilt == [True]
-
-
-def test_runner_register_background_task_returns_limit_error_before_hooks() -> None:
-  registry = TaskRegistry(max_inflight=2)
-  first = registry.register("background_agent")
-  second = registry.register("background_agent")
-  registry.transition(first.task_id, TaskState.RUNNING)
-  registry.transition(second.task_id, TaskState.RUNNING)
-
-  runner = object.__new__(AgentRunner)
-  runner._task_registry = registry
-  runner._max_background_tasks = 2
-  started: list[str] = []
-
-  async def handler(_tool_input: dict[str, Any], **_: Any) -> tuple[None, None]:
-    started.append("handler")
-    return None, None
-
-  result, error = asyncio.run(
-    runner._register_background_task(
-      capability_bind_receipt=_bind_receipt(),
-      tool_input={},
-      handler=handler,
-      on_before_start=lambda: started.append("hook"),
-    )
-  )
-
-  assert result is None
-  assert error == {
-    "code": "max_background_tasks",
-    "message": (
-      "Background task limit reached (2). "
-      "Wait for an existing background task to finish before launching another."
-    ),
-  }
-  assert started == []
-
-
-def test_runner_register_background_task_returns_resume_depth_error_before_registration() -> None:
-  class Registry(TaskRegistry):
-    def register(
-      self,
-      task_type: str,
-      agent_name: str | None = None,
-      *,
-      task_id: str | None = None,
-      original_task_id: str | None = None,
-      **metadata_kwargs: Any,
-    ) -> TaskEntry:
-      started.append("register")
-      return super().register(
-        task_type,
-        agent_name=agent_name,
-        task_id=task_id,
-        original_task_id=original_task_id,
-        **metadata_kwargs,
-      )
-
-  started: list[str] = []
-
-  async def depth(task_id: str) -> int:
-    started.append(f"depth:{task_id}")
-    return 2
-
-  async def root(task_id: str) -> str:
-    started.append(f"root:{task_id}")
-    return "bg_root"
-
-  async def handler(_tool_input: dict[str, Any], **_: Any) -> tuple[None, None]:
-    started.append("handler")
-    return None, None
-
-  runner = object.__new__(AgentRunner)
-  runner._task_registry = Registry(max_inflight=2)
-  runner._max_background_tasks = 2
-  runner._max_resume_chain_depth = 2
-  runner._resume_chain_depth = depth
-  runner._resume_root_task_id = root
-
-  result, error = asyncio.run(
-    runner._register_background_task(
-      capability_bind_receipt=_bind_receipt(),
-      tool_input={},
-      handler=handler,
-      on_before_start=lambda: started.append("hook"),
-      original_task_id="bg_root_r2",
-    )
-  )
-
-  assert result is None
-  assert error == {
-    "code": "max_resume_chain_depth",
-    "message": "Resume chain depth limit reached (2) for bg_root_r2",
-  }
-  assert started == ["depth:bg_root_r2"]
 
 
 def test_runner_resume_registry_helpers_delegate_to_background_helpers() -> None:
@@ -1910,7 +1787,7 @@ def test_background_registration_metadata_includes_optional_fields() -> None:
     cost_observation_threshold_usd=1.25,
     original_task_id="bg_root",
     tool_input={
-      "resumable": "yes",
+      "resume_chain_depth": 2,
     },
   )
 
@@ -1924,7 +1801,7 @@ def test_background_registration_metadata_includes_optional_fields() -> None:
     "capability_bind": bind_receipt,
     "cost_observation_threshold_usd": 1.25,
     "original_task_id": "bg_root",
-    "resumable": True,
+    "resume_chain_depth": 2,
   }
   correlation = task_correlation_payload(
     _task(metadata=metadata),
@@ -2058,7 +1935,7 @@ def test_prepare_background_task_registration_mutates_entry_and_returns_call_ind
       "provider": " anthropic ",
       "model": " claude ",
       "cost_observation_threshold_usd": "1.5",
-      "resumable": True,
+      "resume_chain_depth": 1,
     },
     capability_bind_receipt=_bind_receipt(),
     owner_runner_id="runner-1",
@@ -2084,7 +1961,7 @@ def test_prepare_background_task_registration_mutates_entry_and_returns_call_ind
     "capability_bind": _bind_receipt(),
     "cost_observation_threshold_usd": 1.5,
     "original_task_id": "bg_3",
-    "resumable": True,
+    "resume_chain_depth": 1,
     WORKFLOW_TASK_METADATA_KEY: _workflow_task_metadata().payload(),
   }
 
@@ -2105,7 +1982,6 @@ def test_register_background_task_rejects_untyped_workflow_metadata_before_regis
   runner = object.__new__(AgentRunner)
   runner._task_registry = Registry(max_inflight=2)
   runner._max_background_tasks = 2
-  runner._max_resume_chain_depth = 2
 
   async def handler(_tool_input: dict[str, Any], **_: Any) -> tuple[None, None]:
     pytest.fail("invalid workflow metadata must reject before dispatch")

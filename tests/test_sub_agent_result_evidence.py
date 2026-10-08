@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from agent_gateway.sub_agent_result_evidence import (
+  EVIDENCE_GAP_RATIONALE,
   SubAgentResultEvidence,
   collect_sub_agent_result_evidence,
   fold_dispatch_failures,
@@ -206,7 +207,7 @@ def test_collect_live_usage_arithmetic_overflow_fails_closed(
     durable=False,
   )
 
-  assert evidence.admission_rejected is True
+  assert evidence.gap == EVIDENCE_GAP_RATIONALE
   assert evidence.usage == {}
   assert evidence.fms_results == ()
 
@@ -226,7 +227,7 @@ def test_collect_durable_usage_arithmetic_overflow_fails_closed() -> None:
     durable=True,
   )
 
-  assert evidence.admission_rejected is True
+  assert evidence.gap == EVIDENCE_GAP_RATIONALE
   assert evidence.usage == {}
 
 
@@ -250,7 +251,7 @@ def test_merge_preflights_exact_canonical_usage_after_metadata_overwrite() -> No
 
   merged = merge_sub_agent_result_evidence(first, second)
 
-  assert merged.admission_rejected is False
+  assert merged.gap is None
   assert merged.usage["trace"] is current_trace
   assert merged.usage["marker"] == "current"
 
@@ -273,7 +274,7 @@ def test_merge_rejects_aggregate_evidence_that_only_overflows_together() -> None
 
   merged = merge_sub_agent_result_evidence(first, second)
 
-  assert merged.admission_rejected is True
+  assert merged.gap == EVIDENCE_GAP_RATIONALE
   assert merged.fms_results == ()
   assert merged.warning_parts[:2] == ("first", "second")
 
@@ -296,7 +297,7 @@ def test_merge_rejects_aggregate_evidence_over_byte_ceiling() -> None:
 
   merged = merge_sub_agent_result_evidence(first, second)
 
-  assert merged.admission_rejected is True
+  assert merged.gap == EVIDENCE_GAP_RATIONALE
   assert merged.fms_results == ()
 
 
@@ -322,7 +323,7 @@ def test_merge_rejects_integer_sum_that_crosses_digit_ceiling() -> None:
 
   merged = merge_sub_agent_result_evidence(first, second)
 
-  assert merged.admission_rejected is True
+  assert merged.gap == EVIDENCE_GAP_RATIONALE
   assert merged.usage == {}
 
 

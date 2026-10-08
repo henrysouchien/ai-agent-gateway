@@ -9,7 +9,10 @@ import json
 import logging
 import os
 import time
-from typing import AbstractSet, Any, Callable, cast, Dict, get_args, Mapping, Optional, Protocol, Sequence, Set, TYPE_CHECKING, TypeGuard
+from pathlib import Path
+from typing import AbstractSet, Any, Callable, cast, Dict, get_args, Mapping, Optional, Protocol, Sequence, TYPE_CHECKING, TypeGuard
+
+from pydantic import ValidationError
 
 from agent_workflow_contracts.tool_registration import (
   RegisteredToolIdentity,
@@ -28,14 +31,14 @@ from .approval_policy import (
   ApprovalRequest as PolicyApprovalRequest,
   RunContext,
   ToolClass,
-  approval_is_executable,
   utc_now,
 )
 from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich_trade_approval_args
 from .approval_route import (
   NO_APPROVAL_ROUTE,
   ApprovalRoute,
-  DurableLocalApprovalRoute,
+  route_ledger,
+  route_session,
   NoApprovalRoute,
   ParentDelegatedApprovalRoute,
   route_policy,
@@ -57,14 +60,6 @@ from .policy_imports import (
   authority_policy_denies_tool,
   resolve_effective_role,
   resolve_server_policy_tool_class,
-)
-from .run_identity import (
-  MODEL_RUN_IDENTITY_LOCAL_TOOLS,
-  MODEL_RUN_IDENTITY_MCP_TOOLS,
-  RunIdentityCarrier,
-  RunIdentityCarrierError,
-  mcp_metadata_skill_run_id,
-  validate_run_identity,
 )
 from .secret_boundary import (
   SANITIZATION_FAILED,
@@ -190,10 +185,6 @@ class _ToolDispatcherApprovalAuthority(
   """The route aggregate needed by dispatch and its lifecycle delegate."""
 
 
-class RegisteredApprovalPolicyError(RuntimeError):
-  """A registered approval policy could not produce a safe decision."""
-
-
 def resolve_registered_addin_declaration(
   catalog: ToolRegistrationCatalog | None,
   tool_name: str,
@@ -298,7 +289,6 @@ class ToolDispatcher:
     local_tool_handlers: Dict[str, LocalToolHandler] | None = None,
     needs_approval: Callable[..., bool] | None = None,
     request_approval: ApprovalCallback | None = None,
-    approved_tool_types: Set[str] | None = None,
     event_log: EventLog | None = None,
     approval_key_qualifier: ApprovalKeyQualifier | None = None,
     interceptors: Sequence[ToolInterceptor] | None = None,
@@ -313,7 +303,6 @@ class ToolDispatcher:
     channel: str | None = None,
     role: str | None = None,
     credentials_resolver_active: bool = False,
-    session_cache_denied_tools: frozenset[str] | None = None,
     session: Any | None = None,
     approval_route: ApprovalRoute = NO_APPROVAL_ROUTE,
     run_context: RunContext | None = None,
@@ -335,15 +324,6 @@ class ToolDispatcher:
     ) = None,
     redaction_context_factory: (
       Callable[[ToolRegistrationDeclaration], object | None] | None
-    ) = None,
-    approval_predicate_context_factory: (
-      Callable[
-        [ToolRegistrationDeclaration, PreparedToolCall],
-        object | None,
-      ] | None
-    ) = None,
-    registered_approval_overlay: (
-      Callable[[ToolRegistrationDeclaration, PreparedToolCall], bool] | None
     ) = None,
   ) -> None:
     self._mcp = mcp_client
@@ -417,30 +397,6 @@ class ToolDispatcher:
       raise ValueError(
         "registered tool catalog requires a redaction context factory"
       )
-    if (
-      approval_predicate_context_factory is not None
-      and not callable(approval_predicate_context_factory)
-    ):
-      raise TypeError("approval_predicate_context_factory must be callable")
-    if (
-      approval_predicate_context_factory is not None
-      and tool_policy_implementations is None
-    ):
-      raise ValueError(
-        "approval predicate context requires registered policy implementations"
-      )
-    if (
-      registered_approval_overlay is not None
-      and not callable(registered_approval_overlay)
-    ):
-      raise TypeError("registered_approval_overlay must be callable")
-    if (
-      registered_approval_overlay is not None
-      and approval_predicate_context_factory is None
-    ):
-      raise ValueError(
-        "registered approval overlay requires registered approval runtime"
-      )
     self._tool_policy_implementations = tool_policy_implementations
     self._input_preparation_context_factory = (
       input_preparation_context_factory
@@ -456,10 +412,6 @@ class ToolDispatcher:
       if self._tool_registration_catalog is None
       else self._redact_registered_raw_history_input
     )
-    self._approval_predicate_context_factory = (
-      approval_predicate_context_factory
-    )
-    self._registered_approval_overlay = registered_approval_overlay
     if (
       local_tool_class_resolver is not None
       and local_catalog_action_resolver is not None
@@ -484,7 +436,6 @@ class ToolDispatcher:
       self._local_catalog_actions = local_catalog_actions
     self._needs_approval = self._normalize_needs_approval(needs_approval)
     self._request_approval = request_approval
-    self._approved_tool_types = approved_tool_types if approved_tool_types is not None else set()
     self._event_log = event_log
     self._boundary_event_log = _BoundaryEventLogProjection(self)
     self._approval_key_qualifier = approval_key_qualifier
@@ -494,7 +445,6 @@ class ToolDispatcher:
     self._on_headless_ask = on_headless_ask
     self._mcp_session_inject_servers = mcp_session_inject_servers or set()
     self._mcp_meta_inject_servers = mcp_meta_inject_servers or frozenset()
-    supplied_session = session
     if identity is not None:
       # D-B6-1: one identity value, not five arguments assembled per call
       # site. Passing both would let the two disagree, so it is refused.
@@ -525,25 +475,13 @@ class ToolDispatcher:
     self._role = resolve_effective_role(role)
     self._credentials_resolver_active = credentials_resolver_active
     self._approval_route = approval_route
-    if not isinstance(self._approval_route, NoApprovalRoute):
-      # D-B6-1, applied to the other value that carries a session: a live
-      # approval route already names the GatewaySession whose ledger row,
-      # pending-tools entry and single-slot decision queue record the
-      # decision, so that session cannot also arrive separately.
-      if supplied_session is not None:
-        raise ValueError(
-          "approval route supersedes the separate session argument"
-        )
-      route_session = self._approval_route.session
-      if identity is not None and identity.session is not route_session:
-        raise ValueError(
-          "dispatch identity and approval route name different sessions"
-        )
-      session = route_session
-    self._session_cache_denied = session_cache_denied_tools or frozenset()
+    # Execution identity owns auth, source-pack state and tool calls. The
+    # approval route independently owns the ledger and decision queue, which
+    # can belong to the parent of this executing session.
     self._source_pack_session = session
     self._session = session
     self._run_context = run_context
+    self._research_file_activity_owner: Callable[[Path, int], bool] | None = None
     self._get_tool_definitions = get_tool_definitions
     self._mcp_scope_context = mcp_scope_context
     self._describe_mcp_scope_block = describe_mcp_scope_block
@@ -573,9 +511,9 @@ class ToolDispatcher:
   def _durable_business_model_store(self) -> ToolDispatcherApprovalStore:
     """Return the ledger admitted for the prepared BusinessModel path."""
 
-    route = self._approval_route
-    if isinstance(route, DurableLocalApprovalRoute):
-      return route.store
+    ledger = route_ledger(self._approval_route)
+    if ledger is not None:
+      return ledger.store
     raise TrustedToolPlanError(
       "prepared BusinessModel lifecycle requires durable local approval custody"
     )
@@ -594,6 +532,29 @@ class ToolDispatcher:
     if not isinstance(boundary, SecretBoundary):
       raise TypeError("dispatcher secret boundary must be SecretBoundary")
     self._secret_boundary = boundary
+
+  def bind_research_file_activity_owner(
+    self, ensure_activity: Callable[[Path, int], bool]
+  ) -> None:
+    """Project the constructed runner's one research activity operation."""
+
+    self._research_file_activity_owner = ensure_activity
+
+  def _ensure_research_file_activity(
+    self, workspace_dir: Path, research_file_id: int
+  ) -> bool:
+    # Interactive construction precedes the runner. The active turn supplies
+    # that same owner by the time a tool can execute; autonomous and delegated
+    # dispatchers bind their exact runner before starting it.
+    ensure_activity = self._research_file_activity_owner
+    if ensure_activity is None:
+      session = self._session
+      assert session is not None, "interactive activity requires its session"
+      active_turn = session.active_turn
+      assert active_turn is not None, "interactive activity requires its live turn"
+      assert active_turn.runtime_owner is not None, "live turn has no runner owner"
+      ensure_activity = active_turn.runtime_owner.ensure_research_file_activity
+    return ensure_activity(workspace_dir, research_file_id)
 
   @property
   def run_context(self) -> RunContext | None:
@@ -758,137 +719,6 @@ class ToolDispatcher:
       log=log,
     )
 
-  def _mcp_scope_error(self, tool_name: str, server_name: str | None) -> Dict[str, Any] | None:
-    return _runtime_helpers.mcp_scope_error(
-      tool_name,
-      server_name,
-      allowed_mcp_tools_by_server=self._allowed_mcp_tools_by_server,
-      scope_context=self._mcp_scope_context,
-      describe_scope_block=self._describe_mcp_scope_block,
-    )
-
-  def _wire_mcp_scope_error(
-    self,
-    tool_name: str,
-    server_name: str | None,
-    advertised_tool_names: AbstractSet[str] | None,
-  ) -> Dict[str, Any] | None:
-    """Materialize an MCP provider-request snapshot failure."""
-
-    if advertised_tool_names is None:
-      return {
-        "code": "mcp_tool_not_allowed",
-        "sub_code": "advertisement_unavailable",
-        "message": "The advertised MCP tool snapshot is unavailable; dispatch was denied.",
-      }
-    advertised_scope = (
-      {server_name: set(advertised_tool_names)}
-      if server_name
-      else {}
-    )
-    return _runtime_helpers.mcp_scope_error(
-      tool_name,
-      server_name,
-      allowed_mcp_tools_by_server=advertised_scope,
-      scope_context=self._mcp_scope_context,
-      describe_scope_block=self._describe_mcp_scope_block,
-    )
-
-  def _deferred_local_pack_for_unadvertised_tool(
-    self,
-    tool_name: str,
-    advertised_tool_names: AbstractSet[str],
-  ) -> str | None:
-    """Return the one catalog-owned pack this session can load for a local tool."""
-
-    if (
-      self._session is None
-      or self._role != "owner"
-      or tool_name not in self._local
-      or "load_tools" not in self._local
-      or "load_tools" not in advertised_tool_names
-    ):
-      return None
-    profile_name = (
-      str(getattr(self._run_context, "profile", "") or "") or None
-    )
-    if (
-      authority_policy_denies_tool(
-        session=self._session,
-        role=self._role,
-        tool_name=tool_name,
-        is_local=True,
-        profile_name=profile_name,
-      )
-      or authority_policy_denies_tool(
-        session=self._session,
-        role=self._role,
-        tool_name="load_tools",
-        is_local=True,
-        profile_name=profile_name,
-      )
-    ):
-      return None
-    loaded_local_tools = getattr(
-      self._session,
-      "loaded_local_tools",
-      None,
-    )
-    if loaded_local_tools is None or tool_name in loaded_local_tools:
-      return None
-
-    policy = load_server_policy_module()
-    resolve_pack = getattr(policy, "deferred_local_tool_pack", None)
-    return resolve_pack(tool_name, self._channel) if resolve_pack is not None else None
-
-  def _request_advertisement_error(
-    self,
-    tool_name: str,
-    advertised_tool_names: AbstractSet[str] | None,
-    *,
-    is_mcp: bool,
-    server_name: str | None,
-  ) -> Dict[str, Any] | None:
-    """Apply one provider-request tool-name snapshot to local and MCP routes."""
-
-    if advertised_tool_names is None:
-      return (
-        self._wire_mcp_scope_error(
-          tool_name,
-          server_name,
-          advertised_tool_names,
-        )
-        if is_mcp
-        else None
-      )
-    if tool_name in advertised_tool_names:
-      return None
-    if is_mcp:
-      return self._wire_mcp_scope_error(
-        tool_name,
-        server_name,
-        advertised_tool_names,
-      )
-    deferred_pack = self._deferred_local_pack_for_unadvertised_tool(
-      tool_name,
-      advertised_tool_names,
-    )
-    return {
-      "code": "tool_not_advertised",
-      "message": (
-        f"Tool '{tool_name}' was not advertised for this provider request"
-      ),
-      "details": {"tool_name": tool_name},
-      "fix": (
-        "Call only tools advertised for this provider request."
-        if deferred_pack is None
-        else (
-          f"This tool is in deferred tool pack '{deferred_pack}'; "
-          f'call load_tools(pack="{deferred_pack}") before retrying.'
-        )
-      ),
-    }
-
   @staticmethod
   def _catalog_action(tool_name: str) -> Any | None:
     """Read the embedding application's explicitly bound action catalog."""
@@ -984,6 +814,56 @@ class ToolDispatcher:
     tool_ctx.trusted_plan = trusted_plan
     return trusted_plan, executor
 
+  def _owner_failure_error(
+    self,
+    tool_name: str,
+    tool_input: Mapping[str, Any],
+    exc: Exception,
+    *,
+    code: str,
+  ) -> dict[str, Any]:
+    """The owner's own failure, carried to the agent rather than renamed.
+
+    A planner or local tool that raised instead of returning a coded refusal still
+    said what failed: its exception type and message (redacted at this boundary),
+    the owner's code, field, fix and ``next_call`` when the exception carries them.
+    A pydantic ``ValidationError`` is a stored model the owner constructed and its
+    own schema rejected: it names the model and the dotted field of its first
+    error. Absent the owner's own ``next_call``, the next call is this call again
+    with the named field repaired. ``code`` names the stage that failed.
+    """
+    raw_data = getattr(exc, "data", None)
+    data: Mapping[str, Any] = raw_data if isinstance(raw_data, Mapping) else {}
+    error_type = type(exc).__name__
+    reason = self._secret_boundary.redact_text(str(exc)).strip() or error_type
+    field = getattr(exc, "field", None) or data.get("field")
+    model: str | None = None
+    if isinstance(exc, ValidationError):
+      model = exc.title
+      first = exc.errors(include_input=False)[:1]
+      field = ".".join(str(part) for part in first[0]["loc"]) if first else None
+    owner_code = getattr(exc, "code", None)
+    fix = getattr(exc, "fix", None) or data.get("fix")
+    next_call = getattr(exc, "next_call", None) or data.get("next_call")
+    return {
+      "code": code,
+      "message": f"Tool '{tool_name}' raised {error_type}: {reason}",
+      # ``error.data`` is where the model reads a refusal's repair facts.
+      "data": {
+        "error_type": error_type,
+        "reason": reason,
+        "field": field if isinstance(field, str) and field else None,
+        **({"model": model} if model else {}),
+        **({"owner_code": owner_code} if isinstance(owner_code, str) else {}),
+        **({"fix": self._secret_boundary.redact_text(fix)} if isinstance(fix, str) else {}),
+        "next_call": (
+          dict(next_call)
+          if isinstance(next_call, Mapping)
+          else {"tool_name": tool_name, "arguments": copy.deepcopy(dict(tool_input))}
+        ),
+      },
+    }
+
   @staticmethod
   def _prepared_business_model_authorization(
     tool_name: str,
@@ -1055,8 +935,10 @@ class ToolDispatcher:
       request_id=run_context.request_id,
       run_id=run_context.run_id,
       user_id=run_context.user_id,
+      profile=run_context.profile,
       ui_blocks_run=run_context.ui_blocks_run,
       redact_text=self._secret_boundary.redact_text,
+      research_file_activity_owner=self._ensure_research_file_activity,
     )
 
   async def dispatch(
@@ -1435,10 +1317,8 @@ class ToolDispatcher:
     self,
     tool_name: str,
   ) -> ToolRegistrationDeclaration | None:
-    """Return the exact installed route declaration when approval is bound."""
+    """Return the exact installed route declaration that owns approval."""
 
-    if self._approval_predicate_context_factory is None:
-      return None
     return self.registered_tool_declaration(tool_name)
 
   def registered_approval_requirement(
@@ -1446,35 +1326,10 @@ class ToolDispatcher:
     declaration: ToolRegistrationDeclaration,
     prepared_call: PreparedToolCall,
     trusted_plan: TrustedToolPlan | None = None,
-  ) -> tuple[bool, str | None, bool]:
-    """Return (approval required, safe cache key, cache hit)."""
-
-    required, cache_key, cache_hit, _profile_tightened = (
-      self.registered_approval_decision(
-        declaration,
-        prepared_call,
-        trusted_plan,
-      )
-    )
-    return required, cache_key, cache_hit
-
-  def registered_approval_decision(
-    self,
-    declaration: ToolRegistrationDeclaration,
-    prepared_call: PreparedToolCall,
-    trusted_plan: TrustedToolPlan | None = None,
-  ) -> tuple[bool, str | None, bool, bool]:
-    """Return (approval required, safe cache key, cache hit, profile tightened).
-
-    The last value is the running profile's own overlay decision, kept apart
-    from the door's registration: the profile can add a requirement the
-    registration did not carry, so whoever settles approval under the run's
-    owner authority has to see it. Profile policy tightens a door; it never
-    waives one.
-    """
+  ) -> tuple[bool, str | None]:
+    """Return (approval required, approval reuse key) from the registration."""
 
     registry = self._tool_policy_implementations
-    context_factory = self._approval_predicate_context_factory
     if registry is None:
       raise RuntimeError("registered approval runtime is not configured")
     if type(prepared_call) is not PreparedToolCall:
@@ -1482,88 +1337,33 @@ class ToolDispatcher:
 
     policy = declaration.semantics.approval
     if policy.mode == "never":
-      intrinsic_required = False
-    elif policy.mode == "always":
-      intrinsic_required = True
+      return False, None
+    if policy.mode == "always":
+      approval_required = True
     else:
       assert policy.predicate is not None
-      if context_factory is None:
-        raise RuntimeError(
-          "registered approval predicate context is not configured"
-        )
-      try:
-        intrinsic_required = registry.execute_approval_predicate(
-          policy.predicate,
-          ApprovalPredicateCall(
-            declaration.identity,
-            prepared_call.prepared_input,
-            context_factory(declaration, prepared_call),
-          ),
-        )
-      except Exception as exc:
-        log.error(
-          "Registered approval predicate failed for %s | exception_type=%s",
-          declaration.identity.registration_key,
-          type(exc).__name__,
-        )
-        raise RegisteredApprovalPolicyError(
-          "registered approval predicate failed"
-        ) from exc
-
-    overlay_required = False
-    overlay = self._registered_approval_overlay
-    if overlay is not None:
-      try:
-        overlay_result = overlay(declaration, prepared_call)
-        if type(overlay_result) is not bool:
-          raise TypeError("registered approval overlay must return an exact bool")
-        overlay_required = overlay_result
-      except Exception as exc:
-        log.error(
-          "Registered approval overlay failed for %s | exception_type=%s",
-          declaration.identity.registration_key,
-          type(exc).__name__,
-        )
-        raise RegisteredApprovalPolicyError(
-          "registered approval overlay failed"
-        ) from exc
-
-    approval_required = intrinsic_required or overlay_required
-    if not approval_required:
-      return False, None, False, overlay_required
-    if (
-      policy.cache_key is None
-      or overlay_required
-    ):
-      return True, None, False, overlay_required
-
-    try:
-      prepared_plan = (
-        trusted_plan.approval_identity()
-        if trusted_plan is not None
-        else None
-      )
-      cache_key = registry.execute_approval_cache_key(
-        policy.cache_key,
-        ApprovalCacheKeyCall(
+      approval_required = registry.execute_approval_predicate(
+        policy.predicate,
+        ApprovalPredicateCall(
           declaration.identity,
           prepared_call.prepared_input,
-          prepared_call.exact_backend,
-          prepared_plan,
         ),
       )
-    except Exception as exc:
-      log.error(
-        "Registered approval cache key failed for %s | exception_type=%s",
-        declaration.identity.registration_key,
-        type(exc).__name__,
-      )
-      raise RegisteredApprovalPolicyError(
-        "registered approval cache key failed"
-      ) from exc
-
-    cache_hit = cache_key in self._approved_tool_types
-    return not cache_hit, cache_key, cache_hit, overlay_required
+    if not approval_required or policy.cache_key is None:
+      return approval_required, None
+    return True, registry.execute_approval_cache_key(
+      policy.cache_key,
+      ApprovalCacheKeyCall(
+        declaration.identity,
+        prepared_call.prepared_input,
+        prepared_call.exact_backend,
+        (
+          trusted_plan.approval_identity()
+          if trusted_plan is not None
+          else None
+        ),
+      ),
+    )
 
   def registered_addin_declaration(
     self,
@@ -1675,7 +1475,6 @@ class ToolDispatcher:
         tool_name,
         prepared_call.materialize_input(),
         call_index=call_index,
-        advertised_tool_names=advertised_tool_names,
         abort_event=abort_event,
         skill_run_id=skill_run_id,
         step_id=step_id,
@@ -1726,7 +1525,6 @@ class ToolDispatcher:
     tool_input: Dict[str, Any],
     *,
     call_index: int = 0,
-    advertised_tool_names: AbstractSet[str] | None = None,
     abort_event: asyncio.Event | None = None,
     skill_run_id: str | None = None,
     step_id: str | None = None,
@@ -1753,29 +1551,11 @@ class ToolDispatcher:
 
     Notes:
       - Local handlers receive `tool_ctx` and `call_index` keyword arguments.
-      - Approved tool types are cached in-session through `allow_tool_type`.
       - Interceptor warnings are attached to successful dict results under
         `_interceptor_warnings`.
     """
     self.ensure_gateway_local_tool_handler(tool_name)
     is_local_tool = tool_name in self._local
-    is_mcp_tool = (
-      not is_local_tool
-      and self._mcp.is_mcp_tool(tool_name)
-    )
-    mcp_server_name = (
-      self._mcp.get_server_for_tool(tool_name)
-      if is_mcp_tool
-      else None
-    )
-    advertisement_error = self._request_advertisement_error(
-      tool_name,
-      advertised_tool_names,
-      is_mcp=is_mcp_tool,
-      server_name=mcp_server_name,
-    )
-    if advertisement_error is not None:
-      return None, advertisement_error
     lifecycle_tool_name = tool_name
     get_original_tool_name = getattr(self._mcp, "get_original_tool_name", None)
     if callable(get_original_tool_name):
@@ -1791,6 +1571,11 @@ class ToolDispatcher:
       tool_name=tool_name,
       is_local=is_local_tool,
       profile_name=str(getattr(self._run_context, "profile", "") or "") or None,
+      mcp_server=(
+        self._mcp.get_server_for_tool(tool_name)
+        if not is_local_tool and self._mcp.is_mcp_tool(tool_name)
+        else None
+      ),
     ):
       return None, {
         "code": "role_policy_denied",
@@ -1799,27 +1584,6 @@ class ToolDispatcher:
 
     if abort_event is not None and abort_event.is_set():
       raise asyncio.CancelledError()
-
-    if lifecycle_tool_name in (
-      MODEL_RUN_IDENTITY_MCP_TOOLS | MODEL_RUN_IDENTITY_LOCAL_TOOLS
-    ):
-      try:
-        carrier = RunIdentityCarrier.from_optional(skill_run_id)
-        if carrier is None:
-          raise RunIdentityCarrierError(
-            "run_identity_required",
-            f"Tool '{lifecycle_tool_name}' requires a server-owned run identity.",
-          )
-        run_context_id = validate_run_identity(
-          self._resolve_run_context().run_id
-        )
-        if run_context_id != carrier.run_id:
-          raise RunIdentityCarrierError(
-            "run_identity_mismatch",
-            f"Tool '{lifecycle_tool_name}' received conflicting run identities.",
-          )
-      except RunIdentityCarrierError as exc:
-        return None, {"code": exc.code, "message": str(exc)}
 
     input_schema_error = self._validate_local_tool_input(tool_call_id, tool_name, tool_input)
     if input_schema_error is not None:
@@ -1832,22 +1596,6 @@ class ToolDispatcher:
     )
     if not ir.proceed:
       return None, ir.error
-    if (
-      registered_prepared_call is not None
-      and tool_input != registered_prepared_call.materialize_input()
-    ):
-      return None, {
-        "code": "tool_input_preparation_failed",
-        "message": (
-          f"Tool '{tool_name}' input changed after preparation; dispatch was denied."
-        ),
-      }
-
-    if is_mcp_tool:
-      scope_error = self._mcp_scope_error(tool_name, mcp_server_name)
-      if scope_error is not None:
-        return None, scope_error
-
     registered_code_declaration = self._registered_code_declaration(tool_name)
     registered_approval_declaration = (
       self._registered_approval_declaration(tool_name)
@@ -1909,7 +1657,7 @@ class ToolDispatcher:
       )
       if (
         tool_name == "fms_persist_business_model"
-        and isinstance(self._approval_route, DurableLocalApprovalRoute)
+        and route_ledger(self._approval_route) is not None
         and str(skill_run_id or "").strip()
       ):
         from .prepared_business_model_store import PreparedBusinessModelLifecycle
@@ -1921,7 +1669,7 @@ class ToolDispatcher:
             "code": "planned_write_authorization_unavailable",
             "message": "BusinessModel exact planning requires a trusted user scope.",
           }
-        durable = await self._approval_route.store.get_prepared_business_model_change(
+        durable = await self._durable_business_model_store().get_prepared_business_model_change(
           caller_kind="fms_persist",
           user_scope=user_scope,
           idempotency_locator=str(skill_run_id).strip(),
@@ -1977,10 +1725,9 @@ class ToolDispatcher:
           tool_name,
           type(exc).__name__,
         )
-        return None, {
-          "code": "planned_write_planning_failed",
-          "message": f"Tool '{tool_name}' could not produce a trusted exact-write plan.",
-        }
+        return None, self._owner_failure_error(
+          tool_name, tool_input, exc, code="planned_write_planning_failed"
+        )
     elif (
       registered_approval_declaration is not None
       and registered_approval_declaration.identity.route_kind == "mcp"
@@ -1996,7 +1743,6 @@ class ToolDispatcher:
             # Planning binds the run the executor will receive in MCP meta;
             # the apply route refuses a plan whose run differs.
             **self._mcp_meta_run_context(
-              lifecycle_tool_name,
               skill_run_id=skill_run_id,
               workspace_dir=workspace_dir,
             ),
@@ -2007,7 +1753,6 @@ class ToolDispatcher:
             tool_name,
             registered_prepared_call,
             trusted_scope,
-            self._registered_approval_overlay,
           )
         )
       except PlannedWritePlanningRejected as exc:
@@ -2018,50 +1763,26 @@ class ToolDispatcher:
           tool_name,
           type(exc).__name__,
         )
-        return None, {
-          "code": "planned_write_planning_failed",
-          "message": (
-            f"Tool '{tool_name}' could not produce its registered exact plan."
-          ),
-        }
+        return None, self._owner_failure_error(
+          tool_name, tool_input, exc, code="planned_write_planning_failed"
+        )
 
-    registered_approval_cache_key: str | None = None
-    registered_approval_cache_hit = False
-    profile_tightened_approval = False
+    registered_approval_reuse_key: str | None = None
     if registered_approval_declaration is not None:
       assert registered_prepared_call is not None
-      try:
-        if registered_mcp_call is not None:
-          static_needs_approval = registered_mcp_call.approval_required
-          registered_approval_cache_key = (
-            registered_mcp_call.approval_reuse_key
-          )
-          registered_approval_cache_hit = (
-            registered_approval_cache_key is not None
-            and registered_approval_cache_key in self._approved_tool_types
-          )
-          if registered_approval_cache_hit:
-            static_needs_approval = False
-        else:
-          (
-            static_needs_approval,
-            registered_approval_cache_key,
-            registered_approval_cache_hit,
-            profile_tightened_approval,
-          ) = self.registered_approval_decision(
+      if registered_mcp_call is not None:
+        static_needs_approval = registered_mcp_call.approval_required
+        registered_approval_reuse_key = registered_mcp_call.approval_reuse_key
+      else:
+        static_needs_approval, registered_approval_reuse_key = (
+          self.registered_approval_requirement(
             registered_approval_declaration,
             registered_prepared_call,
             trusted_plan,
           )
-      except RegisteredApprovalPolicyError:
-        return None, {
-          "code": "registered_approval_policy_failed",
-          "message": (
-            f"Tool '{tool_name}' approval policy could not be evaluated."
-          ),
-        }
+        )
     else:
-      static_needs_approval = self._should_request_approval(
+      static_needs_approval = self._needs_approval(
         tool_name,
         tool_input,
         qualifier,
@@ -2072,27 +1793,13 @@ class ToolDispatcher:
     if registered_approval_declaration is None:
       approval_reuse_mode = "legacy"
       approval_reuse_key = None
-    elif dynamic_ask or registered_approval_cache_key is None:
+    elif dynamic_ask or registered_approval_reuse_key is None:
       approval_reuse_mode = "disabled"
       approval_reuse_key = None
     else:
       approval_reuse_mode = "exact"
-      approval_reuse_key = registered_approval_cache_key
-    session_approval_cache_key = (
-      approval_reuse_key
-      if approval_reuse_mode == "exact"
-      else (
-        (
-          None
-          if tool_name in self._session_cache_denied
-          else self._qualified_key(tool_name, qualifier)
-        )
-        if approval_reuse_mode == "legacy"
-        else None
-      )
-    )
+      approval_reuse_key = registered_approval_reuse_key
     final_tool_input = tool_input
-    approval_modified_prepared_input = False
     approval_request_record: PolicyApprovalRequest | None = None
     registered_prepared_authorization = (
       registered_mcp_call.prepared_authorization
@@ -2103,24 +1810,6 @@ class ToolDispatcher:
       trusted_plan is not None
       or registered_prepared_authorization is not None
     )
-
-    if (
-      not exact_plan_active
-      and not static_needs_approval
-      and not dynamic_ask
-      and (
-        registered_approval_cache_hit
-        if registered_approval_declaration is not None
-        else self._tool_was_cache_hit(tool_name, qualifier)
-      )
-    ):
-      self._emit_approval_decided(
-        tool_call_id,
-        tool_name,
-        outcome="approved",
-        decision_source="session_cache_approved",
-        allow_tool_type_applied=False,
-      )
 
     if exact_plan_active:
       if isinstance(self._approval_route, NoApprovalRoute):
@@ -2149,26 +1838,17 @@ class ToolDispatcher:
 
       allow_persistent = not dynamic_ask
       approval_reason = ir.pending_ask.message if ir.pending_ask is not None else ""
-      cache_approved = (
-        not static_needs_approval
-        and not dynamic_ask
-        and (
-          registered_approval_cache_hit
-          if registered_approval_declaration is not None
-          else self._tool_was_cache_hit(tool_name, qualifier)
-        )
-      )
       automatic_approval_reason: str | None = None
       automatic_denial_reason: str | None = None
       deny_user_prompt = False
 
-      if self._should_avoid_permission_prompts and not cache_approved:
+      # A headless run draws no card, but it does not decide the door: a static
+      # door still goes to the route's decider (the route's approval policy on a
+      # durable route), and only a `request_user` outcome there becomes the
+      # headless denial (`deny_user_prompt`).
+      if self._should_avoid_permission_prompts:
         if static_needs_approval:
-          automatic_denial_reason = (
-            ir.pending_ask.message
-            if ir.pending_ask is not None
-            else f"Tool '{tool_name}' requires static approval in headless context"
-          )
+          deny_user_prompt = True
         elif dynamic_ask:
           hook_result = "deny"
           if self._on_headless_ask is not None and ir.pending_ask is not None:
@@ -2374,10 +2054,6 @@ class ToolDispatcher:
               PreparedBusinessModelLifecycle.AUTHORIZED,
               PreparedBusinessModelLifecycle.CONSUMED,
             }:
-              if not approval_is_executable(resume_approval_request):
-                raise TrustedToolPlanError(
-                  "durable FMS BusinessModel plan lost approved lineage"
-                )
               skip_approval_lifecycle = True
         approval_args_redacted: dict[str, Any] | None = None
         approval_args_hash: str | None = None
@@ -2441,18 +2117,17 @@ class ToolDispatcher:
             resume_approval_request=resume_approval_request,
             approval_args_redacted=approval_args_redacted,
             approval_args_hash=approval_args_hash,
-            session_cache_approved=cache_approved,
             automatic_approval_reason=automatic_approval_reason,
             automatic_denial_reason=automatic_denial_reason,
             deny_user_prompt=deny_user_prompt,
-            profile_tightened_approval=profile_tightened_approval,
           )
         )
       except Exception as exc:
         log.error(
-          "Durable exact-write authorization failed for %s | exception_type=%s",
+          "Durable exact-write authorization failed for %s | exception_type=%s | error=%s",
           tool_name,
           type(exc).__name__,
+          exc,
         )
         return None, {
           "code": "planned_write_authorization_persistence_failed",
@@ -2630,6 +2305,9 @@ class ToolDispatcher:
 
       final_tool_input = lifecycle.get("tool_input", tool_input)
       approval_modified_prepared_input = final_tool_input != tool_input
+      # A registered prepared call executes the bytes its registration prepared,
+      # so arguments an approval decision rewrote could never reach the tool:
+      # executing would run bytes other than the ones the approval row records.
       if (
         registered_prepared_call is not None
         and approval_modified_prepared_input
@@ -2644,11 +2322,6 @@ class ToolDispatcher:
         final_tool_input = registered_mcp_call.materialize_authorized_input(
           tool_call_id
         )
-      will_install = (
-        bool(lifecycle.get("allow_tool_type"))
-        and allow_persistent
-        and session_approval_cache_key is not None
-      )
       self._emit_approval_decided(
         tool_call_id,
         tool_name,
@@ -2661,14 +2334,19 @@ class ToolDispatcher:
             else "user_approved"
           )
         ),
-        allow_tool_type_applied=will_install,
+        allow_tool_type_applied=False,
       )
-      if will_install:
-        assert session_approval_cache_key is not None
-        self._approved_tool_types.add(session_approval_cache_key)
 
     elif static_needs_approval or dynamic_ask:
-      if self._should_avoid_permission_prompts:
+      # A static door on a live route is the route's to decide in every
+      # context; headless only forbids a durable route's card
+      # (`deny_user_prompt`). Without a route there is no decider but the
+      # card, so a headless run denies it.
+      route_decides_static_door = static_needs_approval and not isinstance(
+        self._approval_route,
+        NoApprovalRoute,
+      )
+      if self._should_avoid_permission_prompts and not route_decides_static_door:
         if static_needs_approval:
           reason_text = (
             ir.pending_ask.message
@@ -2776,7 +2454,7 @@ class ToolDispatcher:
             approval_reuse_key=approval_reuse_key,
             approval_args_redacted=approval_args_redacted,
             approval_args_hash=approval_args_hash,
-            profile_tightened_approval=profile_tightened_approval,
+            deny_user_prompt=self._should_avoid_permission_prompts,
           )
           approval_request_record = lifecycle.get("request")
           if lifecycle.get("timeout"):
@@ -2791,6 +2469,12 @@ class ToolDispatcher:
           if not lifecycle.get("approved"):
             decision_source = "user_denied"
             error_dict = {"code": "user_denied", "message": "User denied execution"}
+            if lifecycle.get("decision_source") == "headless_auto_deny":
+              decision_source = "headless_auto_deny"
+              error_dict = {
+                "code": "headless_auto_deny",
+                "message": f"Tool '{tool_name}' blocked in headless context.",
+              }
             self._emit_approval_decided(
               tool_call_id,
               tool_name,
@@ -2801,6 +2485,8 @@ class ToolDispatcher:
             return None, error_dict
           final_tool_input = lifecycle["tool_input"] if "tool_input" in lifecycle else tool_input
           approval_modified_prepared_input = final_tool_input != tool_input
+          # Same rule as the exact-plan branch: a registered prepared call cannot
+          # carry arguments the approval decision rewrote.
           if (
             registered_prepared_call is not None
             and approval_modified_prepared_input
@@ -2811,11 +2497,6 @@ class ToolDispatcher:
                 f"Tool '{tool_name}' input changed after preparation; dispatch was denied."
               ),
             }
-          will_install = (
-            bool(lifecycle.get("allow_tool_type"))
-            and allow_persistent
-            and session_approval_cache_key is not None
-          )
           self._emit_approval_decided(
             tool_call_id,
             tool_name,
@@ -2825,11 +2506,8 @@ class ToolDispatcher:
               if getattr(approval_request_record, "state", None) == "auto_approved"
               else "user_approved"
             ),
-            allow_tool_type_applied=will_install,
+            allow_tool_type_applied=False,
           )
-          if will_install:
-            assert session_approval_cache_key is not None
-            self._approved_tool_types.add(session_approval_cache_key)
         elif self._request_approval is None:
           return None, {
             "code": "approval_required",
@@ -2859,24 +2537,15 @@ class ToolDispatcher:
               allow_tool_type_applied=False,
             )
             return None, {"code": "approval_timeout", "message": "User did not respond within timeout"}
-          will_install = (
-            decision.approved
-            and decision.allow_tool_type
-            and allow_persistent
-            and session_approval_cache_key is not None
-          )
           self._emit_approval_decided(
             tool_call_id,
             tool_name,
             outcome="approved" if decision.approved else "denied",
             decision_source="user_approved" if decision.approved else "user_denied",
-            allow_tool_type_applied=will_install,
+            allow_tool_type_applied=False,
           )
           if not decision.approved:
             return None, {"code": "user_denied", "message": "User denied execution"}
-          if will_install:
-            assert session_approval_cache_key is not None
-            self._approved_tool_types.add(session_approval_cache_key)
 
     result: Optional[Any]
     error: Optional[Dict[str, Any]]
@@ -2895,17 +2564,6 @@ class ToolDispatcher:
             "code": "commercial_irreversible_authority_invalid",
             "message": "Fresh commercial authority is invalid or expired.",
           }
-    if (
-      registered_prepared_call is not None
-      and approval_modified_prepared_input
-    ):
-      return None, {
-        "code": "tool_input_preparation_failed",
-        "message": (
-          f"Tool '{tool_name}' input changed after preparation; dispatch was denied."
-        ),
-      }
-
     if local_handler is not None:
       input_schema_error = self._validate_local_tool_input(tool_call_id, tool_name, final_tool_input)
       if input_schema_error is not None:
@@ -2949,11 +2607,6 @@ class ToolDispatcher:
             "code": "planned_write_trusted_plan_lost",
             "message": f"Tool '{tool_name}' lost its trusted exact-write authorization.",
           }
-        if not approval_is_executable(approval_request_record):
-          return None, {
-            "code": "planned_write_authorization_state_invalid",
-            "message": f"Tool '{tool_name}' does not have an executable approval state.",
-          }
         exact_kwargs = {
           "authorized_identity": trusted_plan.identity,
           "approval_id": tool_ctx.approval_id,
@@ -2965,29 +2618,43 @@ class ToolDispatcher:
           for parameter in executor_parameters.values()
         ):
           exact_kwargs["approval_request"] = approval_request_record
-        exact_result = planned_executor(
-          trusted_plan.prepared,
-          **exact_kwargs,
-        )
-        if inspect.isawaitable(exact_result):
-          exact_result = await exact_result
-        if type(exact_result) is not tuple or len(exact_result) != 2:
-          raise TrustedToolPlanError(
-            "exact planned-write executor must return a ToolResult pair"
+        try:
+          exact_result = planned_executor(
+            trusted_plan.prepared,
+            **exact_kwargs,
           )
-        result, error = exact_result
+          if inspect.isawaitable(exact_result):
+            exact_result = await exact_result
+        except Exception as exc:
+          log.error(
+            "Exact-write execution failed for %s | exception_type=%s",
+            tool_name,
+            type(exc).__name__,
+          )
+          result, error = None, self._owner_failure_error(
+            tool_name, final_tool_input, exc, code="local_tool_failed"
+          )
+        else:
+          if type(exact_result) is not tuple or len(exact_result) != 2:
+            raise TrustedToolPlanError(
+              "exact planned-write executor must return a ToolResult pair"
+            )
+          result, error = exact_result
       else:
         if capture_readable_resource_snapshot:
           local_kwargs["capture_readable_resource_snapshot"] = True
-        result, error = await local_handler(final_tool_input, **local_kwargs)
+        try:
+          result, error = await local_handler(final_tool_input, **local_kwargs)
+        except Exception as exc:
+          log.error(
+            "Local tool failed for %s | exception_type=%s",
+            tool_name,
+            type(exc).__name__,
+          )
+          result, error = None, self._owner_failure_error(
+            tool_name, final_tool_input, exc, code="local_tool_failed"
+          )
     elif self._mcp.is_mcp_tool(tool_name):
-      if approval_modified_prepared_input:
-        return None, {
-          "code": "tool_input_preparation_failed",
-          "message": (
-            f"Tool '{tool_name}' input changed after preparation; dispatch was denied."
-          ),
-        }
       server = self._mcp.get_server_for_tool(tool_name)
       if (
         self._commercial_work_start is not None
@@ -3032,7 +2699,6 @@ class ToolDispatcher:
           meta["session_token"] = caller_session_token
         meta.update(
           self._mcp_meta_run_context(
-            lifecycle_tool_name,
             skill_run_id=skill_run_id,
             workspace_dir=workspace_dir,
           )
@@ -3292,14 +2958,10 @@ class ToolDispatcher:
     route_absent = isinstance(self._approval_route, NoApprovalRoute)
     if self._request_approval is None and route_absent:
       return False
-    try:
-      registered_declaration = self._registered_approval_declaration(tool_name)
-    except Exception:
-      return True
+    registered_declaration = self._registered_approval_declaration(tool_name)
     if registered_declaration is not None:
       registered_static_needs_approval = (
         registered_declaration.semantics.approval.mode != "never"
-        or self._registered_approval_overlay is not None
       )
       return self._requires_approval_with_qualifier(
         tool_name,
@@ -3332,37 +2994,29 @@ class ToolDispatcher:
     if type(prepared_call) is not PreparedToolCall:
       raise TypeError("prepared_call must be an exact PreparedToolCall")
     tool_input = prepared_call.materialize_input()
-    try:
-      registered_declaration = self._registered_approval_declaration(tool_name)
-      if registered_declaration is not None:
-        if (
-          registered_declaration.semantics.planning_policy.policy_id != "none"
-        ):
-          # Exact-write planning happens inside dispatch.  Timeout
-          # classification runs before that boundary and therefore cannot
-          # derive a plan-bound approval reuse key yet.  Such calls may enter
-          # the approval lifecycle, so classify them conservatively without
-          # executing the cache-key policy against an absent plan.
-          return True
-        registered_static_needs_approval = (
-          self.registered_approval_requirement(
-            registered_declaration,
-            prepared_call,
-          )[0]
-        )
-        return self._requires_approval_with_qualifier(
-          tool_name,
-          tool_input,
-          prepared_call.exact_backend or "",
-          registered_static_needs_approval=registered_static_needs_approval,
-        )
-    except Exception as exc:
-      log.error(
-        "Registered approval classification failed for %s | exception_type=%s",
-        tool_name,
-        type(exc).__name__,
+    registered_declaration = self._registered_approval_declaration(tool_name)
+    if registered_declaration is not None:
+      if (
+        registered_declaration.semantics.planning_policy.policy_id != "none"
+      ):
+        # Exact-write planning happens inside dispatch.  Timeout
+        # classification runs before that boundary and therefore cannot
+        # derive a plan-bound approval reuse key yet.  Such calls may enter
+        # the approval lifecycle, so classify them conservatively without
+        # executing the reuse-key policy against an absent plan.
+        return True
+      registered_static_needs_approval = (
+        self.registered_approval_requirement(
+          registered_declaration,
+          prepared_call,
+        )[0]
       )
-      return True
+      return self._requires_approval_with_qualifier(
+        tool_name,
+        tool_input,
+        prepared_call.exact_backend or "",
+        registered_static_needs_approval=registered_static_needs_approval,
+      )
     if self._registered_code_declaration(tool_name) is not None:
       qualifier = prepared_call.exact_backend
       if qualifier is None:
@@ -3392,7 +3046,7 @@ class ToolDispatcher:
       return True
     if (
       registered_static_needs_approval is None
-      and self._should_request_approval(tool_name, tool_input, qualifier)
+      and self._needs_approval(tool_name, tool_input, qualifier)
     ):
       return True
     if isinstance(self._approval_route, NoApprovalRoute):
@@ -3460,15 +3114,13 @@ class ToolDispatcher:
     resume_approval_request: PolicyApprovalRequest | None = None,
     approval_args_redacted: dict[str, Any] | None = None,
     approval_args_hash: str | None = None,
-    session_cache_approved: bool = False,
     automatic_approval_reason: str | None = None,
     automatic_denial_reason: str | None = None,
     deny_user_prompt: bool = False,
-    profile_tightened_approval: bool = False,
   ) -> dict[str, Any]:
     return await _approval_lifecycle_helpers.run_approval_lifecycle(
       route=self._approval_route,
-      session=self._session,
+      session=route_session(self._approval_route),
       tool_call_id=tool_call_id,
       tool_name=tool_name,
       tool_input=tool_input,
@@ -3485,11 +3137,9 @@ class ToolDispatcher:
       resume_approval_request=resume_approval_request,
       approval_args_redacted=approval_args_redacted,
       approval_args_hash=approval_args_hash,
-      session_cache_approved=session_cache_approved,
       automatic_approval_reason=automatic_approval_reason,
       automatic_denial_reason=automatic_denial_reason,
       deny_user_prompt=deny_user_prompt,
-      profile_tightened_approval=profile_tightened_approval,
       resolve_run_context_fn=self._resolve_run_context,
       current_skill_admission_fn=current_skill_admission,
       redact_for_approval_request_fn=self._redact_for_approval_request,
@@ -3510,7 +3160,6 @@ class ToolDispatcher:
     allow_persistent: bool,
     approval_reuse_mode: ApprovalReuseMode,
     approval_reuse_key: str | None,
-    session_cache_approved: bool = False,
   ) -> dict[str, Any]:
     """Run approval with the exact add-in declaration's registered effect."""
 
@@ -3524,7 +3173,7 @@ class ToolDispatcher:
 
     return await _approval_lifecycle_helpers.run_approval_lifecycle(
       route=self._approval_route,
-      session=self._session,
+      session=route_session(self._approval_route),
       tool_call_id=tool_call_id,
       tool_name=declaration.identity.logical_name,
       tool_input=tool_input,
@@ -3535,7 +3184,6 @@ class ToolDispatcher:
       approval_reuse_key=approval_reuse_key,
       approval_args_redacted=approval_args_redacted,
       approval_args_hash=approval_args_hash,
-      session_cache_approved=session_cache_approved,
       resolve_run_context_fn=self._resolve_run_context,
       current_skill_admission_fn=current_skill_admission,
       redact_for_approval_request_fn=self._redact_for_approval_request,
@@ -3561,7 +3209,7 @@ class ToolDispatcher:
     durable_request: dict[str, Any] | None = None,
   ) -> dict[str, Any] | None:
     return await _approval_lifecycle_helpers.await_user_approval_via_pending_tools(
-      session=self._session,
+      session=route_session(self._approval_route),
       approval_store=self._approval_store,
       append_event_fn=self._boundary_event_log.append,
       request=request,
@@ -3729,7 +3377,6 @@ class ToolDispatcher:
 
   @staticmethod
   def _mcp_meta_run_context(
-    lifecycle_tool_name: str,
     *,
     skill_run_id: str | None,
     workspace_dir: str | None,
@@ -3737,11 +3384,8 @@ class ToolDispatcher:
     """The run identity a registered MCP call carries in its meta."""
 
     context: dict[str, str] = {}
-    routed_skill_run_id = mcp_metadata_skill_run_id(
-      lifecycle_tool_name,
-      skill_run_id,
-    )
-    if routed_skill_run_id is not None:
+    routed_skill_run_id = str(skill_run_id or "").strip()
+    if routed_skill_run_id:
       context["skill_run_id"] = routed_skill_run_id
     if workspace_dir is not None:
       context["workspace_dir"] = workspace_dir
@@ -3874,35 +3518,6 @@ class ToolDispatcher:
     needs_approval: Callable[..., bool] | None,
   ) -> NeedsApprovalCallback:
     return _runtime_helpers.normalize_needs_approval(needs_approval)
-
-  @staticmethod
-  def _qualified_key(tool_name: str, qualifier: str) -> str:
-    return _runtime_helpers.qualified_key(tool_name, qualifier)
-
-  def _should_request_approval(
-    self,
-    tool_name: str,
-    tool_input: Dict[str, Any],
-    qualifier: str,
-  ) -> bool:
-    return _runtime_helpers.should_request_approval(
-      tool_name,
-      tool_input,
-      qualifier,
-      session_cache_denied=self._session_cache_denied,
-      approved_tool_types=self._approved_tool_types,
-      needs_approval=self._needs_approval,
-      qualified_key_fn=self._qualified_key,
-    )
-
-  def _tool_was_cache_hit(self, tool_name: str, qualifier: str) -> bool:
-    return _runtime_helpers.tool_was_cache_hit(
-      tool_name,
-      qualifier,
-      session_cache_denied=self._session_cache_denied,
-      approved_tool_types=self._approved_tool_types,
-      qualified_key_fn=self._qualified_key,
-    )
 
   def _emit_approval_decided(
     self,

@@ -1664,61 +1664,234 @@ def test_stream_summarized_thinking_streams_deltas_and_stores_summary_beside_sig
   assert thinking_end.raw_block == {"type": "thinking", "thinking": "Weigh the guidance.", "signature": "sig"}
 
 
-def test_stream_sums_compaction_usage_iterations() -> None:
+@pytest.mark.parametrize(
+  ("start_usage", "deltas", "expected"),
+  [
+    pytest.param(
+      {"input_tokens": 100, "cache_read_input_tokens": 200, "cache_creation_input_tokens": 30},
+      [{"output_tokens": 7}], 330, id="output-only",
+    ),
+    pytest.param(
+      {"input_tokens": 100, "cache_read_input_tokens": 200, "cache_creation_input_tokens": 30},
+      [None], 330, id="no-final-usage",
+    ),
+    pytest.param(
+      {"input_tokens": 100, "cache_read_input_tokens": 200, "cache_creation_input_tokens": 30},
+      [{"input_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}],
+      0, id="explicit-zero",
+    ),
+    pytest.param(
+      {"input_tokens": 100, "cache_read_input_tokens": 200, "cache_creation_input_tokens": 30},
+      [{"cache_creation_input_tokens": 0}, {"input_tokens": 20}],
+      220, id="partial-components",
+    ),
+    pytest.param(
+      {"input_tokens": 100, "cache_read_input_tokens": 200, "cache_creation_input_tokens": 30},
+      [{"input_tokens": 200, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 5}],
+      205, id="cache-category-shift",
+    ),
+    pytest.param({"input_tokens": 0}, [{"output_tokens": 7}], 0, id="zero-start"),
+    pytest.param({"input_tokens": 12}, [{"output_tokens": 7}], 12, id="optional-caches"),
+    pytest.param(None, [{"input_tokens": 12}], 12, id="late-prompt"),
+    pytest.param(None, [{"output_tokens": 7}], None, id="no-prompt"),
+    pytest.param(
+      {"cache_read_input_tokens": 200}, [{"output_tokens": 7}], None,
+      id="missing-required-input",
+    ),
+    pytest.param(None, [None], None, id="no-usage"),
+  ],
+)
+def test_stream_final_prompt_preserves_same_invocation_components(
+  start_usage: dict[str, int] | None,
+  deltas: list[dict[str, int] | None],
+  expected: int | None,
+) -> None:
   provider = AnthropicProvider()
-  client = _FakeStreamingClient(
-    [
-      SimpleNamespace(
-        type="message_start",
-        message=SimpleNamespace(
-          usage=SimpleNamespace(
-            input_tokens=100,
-            output_tokens=0,
-            cache_creation_input_tokens=1,
-            cache_read_input_tokens=2,
-          )
-        ),
+  client = _FakeStreamingClient([
+    SimpleNamespace(
+      type="message_start",
+      message=SimpleNamespace(
+        usage=SimpleNamespace(**start_usage) if start_usage is not None else None,
       ),
+    ),
+    *[
       SimpleNamespace(
         type="message_delta",
         delta=SimpleNamespace(stop_reason="end_turn"),
-        usage=SimpleNamespace(
-          input_tokens=100,
-          output_tokens=10,
-          cache_creation_input_tokens=1,
-          cache_read_input_tokens=2,
-          iterations=[
-            SimpleNamespace(
-              input_tokens=100,
-              output_tokens=10,
-              cache_creation_input_tokens=1,
-              cache_read_input_tokens=2,
-            ),
-            SimpleNamespace(
-              input_tokens=50,
-              output_tokens=5,
-              cache_creation_input_tokens=3,
-              cache_read_input_tokens=4,
-            ),
-          ],
-        ),
-      ),
-    ]
+        usage=SimpleNamespace(**usage) if usage is not None else None,
+      )
+      for usage in deltas
+    ],
+  ])
+
+  events = asyncio.run(_collect_stream_events(
+    provider, client, {"model": "claude-sonnet-5", "messages": []},
+  ))
+
+  assert events[-1].type == "message_end"
+  assert events[-1].request_input_tokens == expected
+  assert events[0].input_tokens == (start_usage or {}).get("input_tokens", 0)
+  assert events[0].cache_read_tokens == (start_usage or {}).get("cache_read_input_tokens", 0)
+  assert events[0].cache_creation_tokens == (start_usage or {}).get("cache_creation_input_tokens", 0)
+
+
+@pytest.mark.parametrize("native_compaction", [False, True])
+@pytest.mark.parametrize(
+  ("last_prompt", "expected", "billed_prompt"),
+  [
+    pytest.param(
+      {"input_tokens": 20, "cache_read_input_tokens": 40, "cache_creation_input_tokens": 5},
+      65, (120, 240, 35), id="compacted",
+    ),
+    pytest.param(
+      {"input_tokens": 200, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 5},
+      205, (300, 200, 35), id="cache-category-shift",
+    ),
+    pytest.param(
+      {"input_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+      0, (100, 200, 30), id="zero",
+    ),
+    pytest.param(
+      {"cache_read_input_tokens": 40, "cache_creation_input_tokens": 5},
+      None, (100, 240, 35), id="missing-required-input",
+    ),
+    pytest.param({"input_tokens": 20}, 20, (120, 200, 30), id="optional-caches"),
+  ],
+)
+def test_stream_final_iteration_prompt_is_independent_of_repeated_billing_and_wait(
+  monkeypatch: pytest.MonkeyPatch,
+  native_compaction: bool,
+  last_prompt: dict[str, int],
+  expected: int | None,
+  billed_prompt: tuple[int, int, int],
+) -> None:
+  acquired: list[int] = []
+
+  async def acquire(*, estimated_tokens: int) -> float:
+    acquired.append(estimated_tokens)
+    return 1.234
+
+  monkeypatch.setattr(
+    anthropic_provider_module, "get_global_token_bucket",
+    lambda: SimpleNamespace(acquire=acquire),
   )
+  first = {
+    "input_tokens": 100, "cache_read_input_tokens": 200, "cache_creation_input_tokens": 30,
+    "output_tokens": 10, "server_tool_use": {"web_search_requests": 1},
+  }
+  last = {
+    **last_prompt, "output_tokens": 7, "server_tool_use": {"web_fetch_requests": 2},
+  }
+  snapshot = SimpleNamespace(
+    # The top-level initial prompt must not override the final iteration.
+    **first, iterations=[SimpleNamespace(**first), SimpleNamespace(**last)],
+  )
+  client = _FakeStreamingClient([
+    SimpleNamespace(
+      type="message_start",
+      message=SimpleNamespace(usage=SimpleNamespace(**{**first, "output_tokens": 0})),
+    ),
+    *[
+      SimpleNamespace(
+        type="message_delta", delta=SimpleNamespace(stop_reason="end_turn"), usage=snapshot,
+      )
+      for _ in range(2)
+    ],
+  ])
+  params: dict[str, object] = {
+    "model": "claude-sonnet-5", "messages": [], "max_tokens": 4096,
+  }
+  if native_compaction:
+    params["context_management"] = {"edits": [{"type": "compact_20260112"}]}
 
-  events = asyncio.run(_collect_stream_events(provider, client, {"model": "claude-sonnet-5", "messages": []}))
+  events = asyncio.run(_collect_stream_events(AnthropicProvider(), client, params))
 
-  message_start = events[0]
-  usage_update = events[1]
-  assert message_start.type == "message_start"
-  assert message_start.input_tokens == 100
-  assert message_start.cache_creation_tokens == 1
-  assert message_start.cache_read_tokens == 2
-  assert usage_update.type == "usage_update"
-  assert usage_update.input_tokens == 50
-  assert usage_update.output_tokens == 15
-  assert usage_update.cache_creation_tokens == 3
-  assert usage_update.cache_read_tokens == 4
+  assert acquired == [4096]
+  assert events[0].provider_wait_ms == 1234
+  assert sum(event.provider_wait_ms for event in events) == 1234
+  assert events[-1].type == "message_end"
+  assert events[-1].request_input_tokens == expected
+  assert (
+    sum(event.input_tokens for event in events),
+    sum(event.cache_read_tokens for event in events),
+    sum(event.cache_creation_tokens for event in events),
+  ) == billed_prompt
+  assert sum(event.output_tokens for event in events) == 17
+  assert [event.provider_unit_deltas for event in events if event.type == "usage_update"] == [
+    {"web_search": 1, "web_fetch": 2}, {},
+  ]
+  assert (client.beta.messages.kwargs is not None) is native_compaction
+  assert (client.messages.kwargs is not None) is not native_compaction
+
+
+@pytest.mark.parametrize("iterations", [None, []])
+def test_stream_sdk_output_only_delta_keeps_initial_prompt(iterations: list[object] | None) -> None:
+  from anthropic.types import RawMessageDeltaEvent
+
+  client = _FakeStreamingClient([
+    SimpleNamespace(
+      type="message_start",
+      message=SimpleNamespace(usage=SimpleNamespace(
+        input_tokens=100, cache_read_input_tokens=200, cache_creation_input_tokens=30,
+      )),
+    ),
+    RawMessageDeltaEvent.model_validate({
+      "type": "message_delta",
+      "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+      "usage": {"output_tokens": 7, "iterations": iterations},
+    }),
+  ])
+
+  events = asyncio.run(_collect_stream_events(
+    AnthropicProvider(), client, {"model": "claude-sonnet-5", "messages": []},
+  ))
+
+  assert events[-1].request_input_tokens == 330
+  assert (
+    sum(event.input_tokens for event in events),
+    sum(event.cache_read_tokens for event in events),
+    sum(event.cache_creation_tokens for event in events),
+    sum(event.output_tokens for event in events),
+  ) == (100, 200, 30, 7)
+
+
+@pytest.mark.parametrize(
+  ("last_iteration", "expected"),
+  [
+    pytest.param({"input_tokens": 20, "cache_read_input_tokens": 40}, 60, id="known"),
+    pytest.param({"output_tokens": 7}, None, id="incomplete-latest-snapshot"),
+  ],
+)
+def test_stream_iteration_snapshots_replace_prompt_without_scalar_aggregate_leakage(
+  last_iteration: dict[str, int],
+  expected: int | None,
+) -> None:
+  initial = {"input_tokens": 100, "cache_read_input_tokens": 200}
+  client = _FakeStreamingClient([
+    SimpleNamespace(
+      type="message_start", message=SimpleNamespace(usage=SimpleNamespace(**initial)),
+    ),
+    *[
+      SimpleNamespace(
+        type="message_delta", delta=SimpleNamespace(stop_reason="end_turn"), usage=usage,
+      )
+      for usage in [
+        {"iterations": [initial, {"input_tokens": 50, "cache_read_input_tokens": 60}]},
+        {"iterations": [initial, last_iteration]},
+        {"output_tokens": 7},
+        # Without an iteration identity these scalar totals cannot restore the
+        # last invocation's missing input or overwrite its known smaller prompt.
+        {"input_tokens": 999, "cache_read_input_tokens": 999, "iterations": []},
+        None,
+      ]
+    ],
+  ])
+
+  events = asyncio.run(_collect_stream_events(
+    AnthropicProvider(), client, {"model": "claude-sonnet-5", "messages": []},
+  ))
+
+  assert events[-1].request_input_tokens == expected
 
 
 def test_stream_message_end_carries_refusal_stop_details() -> None:

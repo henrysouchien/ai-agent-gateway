@@ -86,8 +86,24 @@ The executor snapshots the bound mapping before its first await and passes
 `allow_stub_response=False`.
 
 No wall clock bounds the run or its `run_agent` children. Liveness is the
-event-gap stall watchdog plus the parent-side child activity guard; bound
-long-running work with `max_turns` and `max_budget_usd`.
+event-gap stall watchdog plus the parent-side child activity guard. The same
+no-progress bound (`runner_streaming.effective_stream_stall_timeout`; heartbeats
+are not progress) covers the direct provider streams of portable compaction
+(`provider_summarize`) and `send_prompt`, which raise `StreamStallError`; time a
+request spends queued for local Anthropic rate-limit capacity
+(`rate_limit.locally_queued`) is not a stall. The deadline is checked before
+consuming ready events, so continuously ready heartbeats cannot bypass it. A
+delegated run (a `run_agent` child or a learning fork) meets the soft-budget ladder
+(`agent_gateway/runner_soft_budget.py`): a wrap-up steer at the threshold, a
+forced final report at 1.5x, and an `interrupted` run with reason
+`soft_budget_abort` only if the child still has not finished two provider
+requests later. The ladder counts provider requests (turns plus `max_tokens`
+continuation segments). Its threshold has one source, the bundled
+`SOFT_TURN_BUDGET` table keyed by run kind (`default` 100, `fork` 10); nothing
+a skill, profile or caller declares feeds it. `HANK_SOFT_TURN_BUDGET` can only
+lower it, and `0` disables the ladder. A primary run has no ladder, and no run
+carries a cost ceiling: spend is measured (`stream_complete.usage`, usage
+events), never enforced.
 
 Returns a `RunOutput`; see the complete field list below.
 
@@ -106,8 +122,6 @@ Result of an autonomous run. Fields:
 - `error: str | None` — error message if the run failed
 - `timed_out: bool` — timeout marker retained in the result contract; the
   autonomous entry point applies no wall clock, so it stays False
-- `budget_exceeded: bool` — True if estimated cost exceeded `max_budget_usd`
-- `max_turns_reached: bool` — True if the model loop hit `max_turns`
 - `operator_paused: bool` — True when an operator intentionally paused the run
 - `max_tokens_reached: bool` — True when generation reached its token bound
 - `exit_reason: str | None` — more specific terminal reason, when one exists
@@ -126,9 +140,8 @@ Where results go after a run completes.
 ### `run_output_exit_code()` and `run_output_outcome()`
 
 Map a `RunOutput` to process exit codes: `0` for success or operator pause, `1`
-for errors and post-run guard failures, `2` for budget exhaustion, `3` for
-max turns, `4` for max tokens, and `124` for timeout. Semantic outcomes include
-`success`, `timeout`, `error`, `budget_exceeded`, `max_turns`, `max_tokens`,
+for errors and post-run guard failures, `4` for max tokens, and `124` for
+timeout. Semantic outcomes include `success`, `timeout`, `error`, `max_tokens`,
 `operator_pause`, or a more specific `exit_reason`. Exit codes are for process
 semantics; outcomes are for persisted state tracking.
 
@@ -286,12 +299,27 @@ and complete/truncated v2 goldens under
 
 Foreground results and background notifications use `AgentCompletionEnvelope`.
 `settlement_projection` carries the canonical execution status and, when the
-child did not succeed, its `terminal_reason`. If execution stopped before
-producing canonical content (for example, `budget_exhausted`), the envelope
-still publishes with `parent_materialization: null` and any child evidence.
+child did not succeed, its `terminal_reason`. A child the soft-budget ladder
+drove to its forced final report and that answered settles as an ordinary
+completed result carrying its usage. A child aborted by the ladder settles
+`failed` with `terminal_reason` `soft_budget_abort`; its envelope still
+publishes with `parent_materialization: null` and any child evidence.
 Intermediate tool-use prose is not promoted to a completed report. Successful
-results continue to carry exact inline content or a readable content handle;
-their serialized shape is unchanged.
+results continue to carry exact inline content or a readable content handle.
+
+`get_agent_result_content` reads the canonical `source.content_id` of inline
+narrative and projection materializations as well as overflow handles. Authority
+comes from the executing job's admitted outputs or explicitly passed handles,
+independent of the parent's presentation choice. Optional `read_grant_id` selects
+an existing grant-bearing materialization; it does not grant access or select a
+grantless inline materialization. Canonical task-result and byte integrity checks
+apply to every readable source.
+
+When the child settled on a terminal door's answer, `stage_refs` carries the
+refs that door minted (`read_back_refs` of its result: a persisted set's ref, a
+skill artifact's `{skill, artifact_id, content_sha256}`) in every arm, so a
+result that overflowed to a handle still names what its door persisted; the
+field is omitted when the door minted none.
 
 ### Autonomous capability handoff
 
@@ -376,7 +404,6 @@ Key fields:
 - `build_runner`
 - `capability_execution`
 - `get_tool_definitions`
-- `max_turns`
 - `execution_location`
 
 ### `RequestContext`
@@ -456,6 +483,18 @@ Routes tool calls to local handlers or MCP servers and applies:
 - approval rules
 - in-session approval caching
 
+Pass the actual executing session through `session`, or bundle it with its
+authenticated user and credential identity in `DispatchIdentity`. Local-handler
+context, role policy, per-user MCP authentication, and source-pack capture use
+that execution authority. A `DispatchIdentity` cannot also be supplied alongside
+separate execution-identity arguments.
+
+`approval_route` is independent: its ledger and policy authorize the money
+boundary, and its session owns pending approval cards and decision queues. An
+in-process child can therefore execute under its own session while
+`InProcessDelegatedApprovalRoute` records and waits for decisions on its parent's
+ledger and queue. The route never supplies or replaces execution identity.
+
 ### `ToolExecutionContext`
 
 Optional context object passed to local tool handlers. Use `emit()` to stream extra structured events such as `tool_output_chunk`.
@@ -468,7 +507,7 @@ Standard tool return shape: `(result, error)`.
 
 Types used by the approval loop.
 
-`ApprovalDecision.allow_tool_type` persists approval for that tool type within the session.
+`ApprovalDecision.allow_tool_type` requests a persistent grant; only an approval policy that permits grants mints one. Each approval otherwise decides one call.
 
 ### `InterceptContext`, `InterceptDecision`, `InterceptResult`, and `ToolInterceptor`
 
@@ -505,6 +544,24 @@ Contains:
 - tool definitions
 - approval helpers
 - result sanitization hook
+- session-owned host frame reader shared by request bundles
+
+`bundle.bind_dispatcher(...)` binds the turn's dispatcher, a `code_callable(operation)`
+predicate the embedding application derives from the exact installed route's producer
+policy and served disposition retained on its registered live binding (a same-named
+operation on another server is decided by that server and route). Served
+`artifact_composable`, `tool_only` and `internal_only` reviews exclude the route;
+`read_composable` and `pure_local` never widen the policy read-effect requirement.
+Absent, malformed or `unclassified` producer metadata keeps existing policy coverage;
+malformed metadata logs once at registration without rejecting the tool. Optional
+`catalog_metadata(operation)` supplies route identities, alongside the application's source extraction
+and identity callbacks. Cells compose those granted operations through the injected
+`hank.search(query)`, `hank.describe(operation)` and `hank.call(operation, **arguments)`;
+catalog rows carry the route metadata unchanged, and grant is rechecked per call.
+The host reader dispatches through the canonical dispatcher and settles producer
+source identities. Complete deduplicated `sources` stay inline; model-output
+spilling handles large envelopes. Nested payloads go to the cell, not directly
+to the model. A cell registration permits repeated frames until that cell ends.
 
 ### `build_code_execution(session, config=None)`
 
@@ -513,21 +570,51 @@ Inject built-in code execution tools into a runtime.
 Behavior:
 
 - `host=auto` prefers Docker when available
-- falls back to subprocess when enabled; the fallback is logged at `WARNING` with the skipped backend's reason
+- falls back to a registered host kernel, then subprocess; skipped-backend reasons are logged at `WARNING`
 - every `code_execute` result names where it ran: `backend`, `sandboxed`, and `skipped_backends` (`[{backend, sandboxed, reason}]`, empty unless `host=auto` skipped one)
-- stores background tasks and work directories on the session
+- stores reader, interpreter states, background tasks and work directory on the session
 
 ### `cleanup_code_execution(session)`
 
-Cancel background tasks and remove the session work directory. Call this on session expiry or app shutdown if you manage runtimes yourself.
+Cancel background tasks, await interpreter shutdown and nested dispatch closure,
+then remove the session work directory. Call this on final session expiry,
+task teardown or app shutdown if you manage runtimes yourself. Ordinary cell
+completion or interruption does not dispose a persistent interpreter.
 
-### `DockerBackend` and `SubprocessBackend`
+### `docker_backend_unavailable_reason(config=None, *, ttl_s=15.0)`
+
+Read-only availability probe for the Docker backend `config` names: returns that `DockerBackend`'s `unavailable_reason()` (`None` when it can run). The answer is memoised per image name for `ttl_s` seconds; `clear_docker_availability_cache()` forgets it. A runtime that must offer `code_execute` only under the sandboxed backend calls this before `build_code_execution()`.
+
+### `DockerBackend`, `KernelBackend` and `SubprocessBackend`
 
 Concrete execution backends of `ExecutionBackend`.
 
 - `DockerBackend` is treated as sandboxed
+- `KernelBackend` is an unsandboxed persistent host interpreter, registered explicitly
 - `SubprocessBackend` is treated as unsandboxed
 - `unavailable_reason()` returns why a backend cannot run now, or `None`; `available()` derives from it, so a custom backend overrides `unavailable_reason()` only
+
+Subprocess carries the bridge over inherited pipes. Docker and the host kernel
+run the same dependency-free `_kernel_runner.py` with the shared client and
+codec shipped as source. The container receives cell tokens over stdin, not a
+new environment allowlist or socket mount; its direct networking remains
+disabled and domain reads execute through the gateway dispatcher.
+
+Every placement uses the same 2 MiB wire-frame and 64 MiB executing-cell
+aggregate bounds. Oversize requests, replies and aggregate overflow report
+`protocol_error`, not truncated success or silent source loss. Exhausting one
+cell does not grant further dispatch or destroy the session interpreter.
+
+Docker/kernel cells retain Python locals and imports. Only explicit `display()`
+emits MIME bundles; results include bounded stdout/stderr, stdout tail and
+workdir-relative spill paths. Those logs remain until session cleanup.
+Cell interruption cancels nested work and preserves previously assigned locals;
+session teardown awaits interpreter/container disposal. Request bundles bind
+each new cell to the current dispatcher and granted surface, so persistent
+locals or cached discovery cannot retain a wider old grant.
+Subprocess timeout measures process exit independently of stream drainage:
+readers stay active through termination grace, then have a two-second drain
+bound so a descendant holding a writer cannot stall teardown.
 
 ### `OutputRingBuffer` and `BackgroundTask`
 
@@ -556,7 +643,6 @@ Common fields:
 - `name`
 - `system_prompt`
 - `model`
-- `max_turns`
 - `metadata`
 
 ### `SkillStateStore`
@@ -571,12 +657,10 @@ Parse a standalone skill markdown file into a `SkillProfile`.
 
 Factory for the local `run_agent` handler.
 
-For a named operation, the handler freezes the registered skill profile's
-finite `max_budget_usd` into `AgentExecutionSnapshot`. Initial execution and
-durable resume enforce that frozen value while continuing to forward cost to
-the telemetry-only observation accumulator. The public tool input cannot set
-or increase this hard budget; unnamed delegation retains observation-only cost
-tracking.
+The child carries no turn or cost number of its own: its soft-budget ladder
+threshold is the bundled table's, and its spend is recorded against the
+telemetry-only `cost_observation_threshold_usd`, which never admits,
+interrupts or gates anything.
 
 Key parameters:
 
@@ -592,6 +676,19 @@ Key parameters:
 
 The handler supports `background=true` in the tool input. When set, the sub-agent runs asynchronously and the tool returns immediately with a `task_id`. With automatic notifications enabled, the terminal result is delivered through a typed task notification; current-run tasks must not be polled.
 
+Optional `handles` is a list of canonical content-handle strings granting the
+child read access. Only handles already granted to the executing caller or
+published by that caller's job or its descendants in the durable session log
+may be passed. Spill membership comes from durable successful-publication
+observations binding the exact content reference to its producer job and tenant.
+The reader resolves the producer's spill root internally; model-facing handles
+do not expose private filesystem paths. Historical own/descendant rights and
+the canonical admitted-resumer custody event determine accessible producers.
+Duplicates are
+collapsed; unowned handles are refused by shared admission. A nested spawn
+retains its executing child's scope, not the root session's scope. Message
+citations do not grant reads.
+
 ### `make_resume_handler(...)`
 
 Factory for the local `resume_background_agent` handler. Its optional trusted
@@ -600,11 +697,20 @@ cloning or reordering its stateful elements. Production initial and resume
 wiring supplies the same finalized instances. A caller-supplied custom
 `run_agent` handler remains caller-owned and is not wrapped or replaced.
 
+Successful continuation records one additive custody event on the canonical
+successor `AttemptRef.resumer_job_id`: the actual admitted resumer job receives
+read custody over the resumed job and its descendants. This is not a union of
+the resumer's ancestors, a session/runner alias grant, or a rewrite of historical
+rights. Original execution lineage, executable grants and message-roster rights
+remain unchanged. Ordinary-result and spill output owners project that event;
+spill reads retain exact-reference, tenant and content-integrity checks.
+Workflow continuation's restore API remains incomplete; this contract does not
+claim that workflow continuation or all handle-family journeys are restored.
+
 ### `make_run_agent_tool_def(...)`
 
-Factory for the tool schema exposed to the model. Includes the `background`
-boolean property and deliberately excludes `max_budget_usd`; hard budget
-authority comes from the registered named profile and execution snapshot.
+Factory for the tool schema exposed to the model. Includes optional `handles`
+and the `background` boolean property; it carries no turn or cost ceiling.
 
 ### `make_get_background_result_handler(runner_ref)`
 

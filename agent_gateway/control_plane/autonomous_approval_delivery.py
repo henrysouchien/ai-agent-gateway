@@ -212,6 +212,11 @@ def require_matching_autonomous_delivery(
   nonce: str,
   approved: bool,
 ) -> None:
+  """Refuse an outbox row whose identity diverges from the durable request.
+
+  Delivering such a row would hand one request's or run's decision to another
+  run, so a mismatch is treated as corruption, never delivered.
+  """
   expected_delivery = {
     "approval_id": approval_id,
     "tool_call_id": tool_call_id,

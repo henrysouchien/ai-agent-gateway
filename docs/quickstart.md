@@ -90,7 +90,7 @@ from agent_gateway import create_agent
 app = create_agent(
   "You are a concise assistant. Answer clearly and use short paragraphs.",
   provider="openai",
-  model_key="openai.gpt-5-6",
+  model_key="openai.gpt-6-1-sol",
 )
 ```
 

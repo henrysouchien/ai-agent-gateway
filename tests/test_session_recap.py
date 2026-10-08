@@ -34,7 +34,11 @@ from agent_gateway.sdk_runner import AgentSDKRunner
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 from agent_gateway.server_models import SystemPrompt
 from agent_gateway.session import SessionStream
-from agent_gateway.session_recap import compute_recap, emit_recap_then_terminal
+from agent_gateway.session_recap import (
+  compute_recap,
+  emit_recap_then_terminal,
+  fold_run_measurements,
+)
 
 
 def test_compute_recap_buckets_renderer_visible_events() -> None:
@@ -96,8 +100,16 @@ def test_compute_recap_buckets_renderer_visible_events() -> None:
     }
   )
   event_log.append({"type": "artifact_failed", "error_detail": "artifact validation failed", "ts": 7.0})
-  event_log.append({"type": "budget_exceeded", "message": "budget hit", "ts": 8.0})
-  event_log.append({"type": "max_turns_reached", "turn_count": 5, "max_turns": 5, "ts": 9.0})
+  event_log.append({"type": "soft_budget_steer", "kind": "turns", "observed": 100, "threshold": 100, "ts": 8.0})
+  event_log.append({
+    "type": "interrupted",
+    "reason": "soft_budget_abort",
+    "kind": "turns",
+    "observed": 152,
+    "threshold": 100,
+    "grace_turns": 2,
+    "ts": 9.0,
+  })
 
   recap = compute_recap(
     event_log,
@@ -118,9 +130,9 @@ def test_compute_recap_buckets_renderer_visible_events() -> None:
   assert recap.tool_calls_summary.by_server == {"excel": 1}
   assert [failure.failure_type for failure in recap.failures] == [
     "artifact_failed",
-    "budget_exceeded",
-    "max_turns_reached",
+    "soft_budget_abort",
   ]
+  assert recap.failures[-1].detail == "kind=turns observed=152 threshold=100 grace_turns=2"
 
 
 def test_compute_recap_consumes_the_canonical_tool_error_fold() -> None:
@@ -152,6 +164,61 @@ def test_compute_recap_consumes_the_canonical_tool_error_fold() -> None:
   assert recap.tool_calls_summary.errors == 1
 
 
+def test_compute_recap_carries_the_run_counts_other_owners_report() -> None:
+  event_log = EventLog(session_id="session-counts")
+  event_log.append({
+    "type": "skill_run_started",
+    "skill_run_id": "run-1",
+    "skill": "dcf-relative-valuation",
+    "lease_fence_bytes": 812,
+  })
+  event_log.append({"type": "approval_decision_sent", "decisions_sent": 1, "frame_bytes": 410})
+  event_log.append({"type": "approval_decision_sent", "decisions_sent": 2, "frame_bytes": 388})
+  event_log.append({
+    "type": "learning_fork_launched",
+    "in_flight": 2,
+    "retained_bytes": 9000,
+    "day_invocations": 3,
+    "day_charged_microusd": 6_000_000,
+  })
+  for index, tool_name in enumerate(
+    ["mcp__model-engine__model_scenario", "model_sensitivity", "get_quote"]
+  ):
+    event_log.append({
+      "type": "tool_call_start",
+      "tool_call_id": f"call-{index}",
+      "tool_name": tool_name,
+    })
+
+  recap = compute_recap(
+    event_log,
+    session_id="session-counts",
+    started_at=1.0,
+    trigger="turn_end",
+  )
+
+  assert recap.tool_calls_summary.measurements == {
+    "lease_fence_bytes": 812,
+    "decisions_sent": 2,
+    "frame_bytes": 410,
+    "in_flight": 2,
+    "retained_bytes": 9000,
+    "day_invocations": 3,
+    "day_charged_microusd": 6_000_000,
+    "model_calls": 2,
+  }
+  assert event_from_dict(event_to_dict(recap)) == recap
+  assert fold_run_measurements([entry.event for entry in event_log.entries]) == {
+    "lease_fence_bytes": 812,
+    "decisions_sent": 2,
+    "frame_bytes": 410,
+    "in_flight": 2,
+    "retained_bytes": 9000,
+    "day_invocations": 3,
+    "day_charged_microusd": 6_000_000,
+  }
+
+
 def test_emit_recap_then_terminal_orders_recap_before_stream_complete() -> None:
   event_log = EventLog(session_id="session-1")
   event_log.append(
@@ -181,6 +248,31 @@ def test_emit_recap_then_terminal_orders_recap_before_stream_complete() -> None:
   assert recap.artifacts[0].artifact_id == "artifact-1"
   assert recap.seq_range == (1, 1)
   assert entries[1].event["seq_range"] == [1, 1]
+
+
+def test_zero_usage_recap_is_exact_json_for_the_event_channel() -> None:
+  from agent_gateway.autonomous_event_channel import _canonical_json_bytes
+
+  event_log = EventLog(session_id="session-1")
+  usage = SessionUsageSummary(
+    user_id="7", session_id="session-1", request_id="request",
+    input_tokens=0, output_tokens=0, cache_read_tokens=0,
+    cache_creation_tokens=0, cost=0.0, turns=0, channel="cli",
+    started_at=1.0, ended_at=2.0,
+  )
+
+  emit_recap_then_terminal(
+    event_log,
+    {"type": "stream_complete", "usage": {}},
+    session_id="session-1",
+    started_at=1.0,
+    usage=usage,
+  )
+
+  recap = event_log.entries[0].event
+  assert recap["type"] == "session_recap"
+  assert recap["usage"]["usage_event_ids"] == []
+  _canonical_json_bytes(recap, max_bytes=1_000_000)
 
 
 def test_emit_recap_then_terminal_captures_terminal_error_as_pending_failure() -> None:
@@ -220,8 +312,8 @@ def test_emit_recap_then_terminal_can_skip_recap_for_sub_agent_logs() -> None:
 def test_emit_recap_then_terminal_respects_explicit_pending_failure_seq() -> None:
   event_log = EventLog(session_id="session-1")
   failure = RecapFailure(
-    failure_type="budget_exceeded",
-    detail="budget hit",
+    failure_type="soft_budget_abort",
+    detail="kind=cost observed=1.5 threshold=1.0 grace_turns=2",
     emitted_at_seq=42,
     ts=5.0,
   )
@@ -293,9 +385,8 @@ class _NoopBuildRunner:
     *,
     messages: list[dict[str, object]],
     system_prompt: SystemPrompt | None = None,
-    max_turns: int | None = None,
   ) -> None:
-    _ = messages, system_prompt, max_turns
+    _ = messages, system_prompt
 
 
 def _build_noop_runner(
@@ -852,7 +943,7 @@ def test_create_agent_usage_summary_populates_cached_usage_without_observer() ->
     app = create_agent(
       "test",
       provider=_UsageProvider(),
-      model_key="anthropic.claude-opus-5",
+      model_key="anthropic.claude-opus-5-5",
       valid_api_keys={"gateway-key"},
       jwt_secret="session-recap-create-agent-secret-0123456789",
     )
@@ -865,7 +956,7 @@ def test_create_agent_usage_summary_populates_cached_usage_without_observer() ->
       assert session is not None
       session.model_entitled_capabilities = frozenset({"session.driver"})
       session.model_entitled_keys = frozenset({
-        "anthropic.claude-opus-5"
+        "anthropic.claude-opus-5-5"
       })
       session_info["session_token"] = app.state.auth.issue_token(session)
       async with client.stream(

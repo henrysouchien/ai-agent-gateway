@@ -29,10 +29,6 @@ def _normalized_alias(value: object) -> str:
   return re.sub(r"[\s_]+", "-", text)
 
 
-class DelegationRoleResolutionError(ValueError):
-  """Raised when caller-controlled role text has no declared capability."""
-
-
 def is_delegation_profile(
   *,
   validated_agent_name: str | None,
@@ -48,16 +44,13 @@ def is_delegation_profile(
 
 
 def resolve_delegation_role_capability(role: object) -> CapabilityId:
-  """Resolve an explicit delegation role or refuse it before child spawn."""
+  """Resolve a declared delegation role to its node capability.
 
-  alias = _normalized_alias(role)
-  capability = DELEGATION_ROLE_CAPABILITIES.get(alias)
-  if capability is None:
-    rendered = alias or "<blank>"
-    raise DelegationRoleResolutionError(
-      f"Unmapped delegation role: {rendered}"
-    )
-  return capability
+  A role the curated map does not name runs as ``node.implement``, the
+  capability every registered skill without a curated role gets.
+  """
+
+  return DELEGATION_ROLE_CAPABILITIES.get(_normalized_alias(role), "node.implement")
 
 
 def resolve_sub_agent_capability(
@@ -68,33 +61,24 @@ def resolve_sub_agent_capability(
 ) -> CapabilityId:
   """Map server-validated named-agent metadata to one node capability.
 
-  Mutating skill metadata takes precedence over purpose-like aliases on a
-  validated named agent. Curated role aliases use the strict role resolver.
-  Other *validated, registered skill names* and the permitted unnamed generic
-  worker use ``node.implement``. Untrusted role text must go through
-  :func:`resolve_delegation_role_capability`, which is fail-closed.
+  Mutating skill metadata takes precedence over a curated delegation role,
+  which takes precedence over a curated alias on the validated agent name.
+  Other *validated, registered skill names*, roles the curated map does not
+  name, and the permitted unnamed generic worker use ``node.implement``.
   """
-
-  declared_capability: CapabilityId | None = None
-  if delegation_role is not None:
-    declared_capability = resolve_delegation_role_capability(delegation_role)
 
   if _normalized_alias(mutation_mode) in _MUTATING_SKILL_MODES:
     return "node.mutate"
-
-  if declared_capability is not None:
-    return declared_capability
-
-  alias = _normalized_alias(validated_agent_name)
-  if alias in DELEGATION_ROLE_CAPABILITIES:
-    return resolve_delegation_role_capability(alias)
+  for alias in (delegation_role, validated_agent_name):
+    capability = DELEGATION_ROLE_CAPABILITIES.get(_normalized_alias(alias))
+    if capability is not None:
+      return capability
   return "node.implement"
 
 
 __all__ = [
   "DELEGATION_CAPABILITY_IDS",
   "DELEGATION_ROLE_CAPABILITIES",
-  "DelegationRoleResolutionError",
   "is_delegation_profile",
   "resolve_delegation_role_capability",
   "resolve_sub_agent_capability",

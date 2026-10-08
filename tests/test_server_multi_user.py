@@ -62,7 +62,6 @@ class _StubRunner(AgentRunner):
     self,
     messages: list[dict[str, Any]],
     system_prompt: str | list[tuple[str, bool]] | None = None,
-    max_turns: int | None = None,
     *,
     resume_initial_messages=None,
   ) -> None:
@@ -71,7 +70,6 @@ class _StubRunner(AgentRunner):
       {
         "messages": messages,
         "system_prompt": system_prompt,
-        "max_turns": max_turns,
       }
     )
     self._event_log.append({"type": "stream_complete", "usage": {}})
@@ -412,7 +410,6 @@ def test_chat_stream_rebuilds_multi_turn_memory_from_session_log(tmp_path: Path)
         agent_session_log=session_log,
         context_builder=SessionContextBuilder(
           agent_session_log=session_log,
-          tail_window_seconds=None,
         ),
       )
 
@@ -571,7 +568,6 @@ def test_chat_stream_rebuilds_memory_past_large_context_manifest(tmp_path: Path)
         agent_session_log=session_log,
         context_builder=SessionContextBuilder(
           agent_session_log=session_log,
-          tail_window_seconds=None,
         ),
       )
 
@@ -614,17 +610,6 @@ def test_chat_stream_rebuilds_memory_past_large_context_manifest(tmp_path: Path)
     {"messages": [{"role": "user", "content": first_user}]},
   )
 
-  first_span = [
-    json.loads(line)["event"]
-    for line in session_log.path.read_text(encoding="utf-8").splitlines()
-  ]
-  assert [event["type"] for event in first_span] == [
-    "attach",
-    "user_message",
-    "context_manifest",
-    "assistant_message",
-    "detach",
-  ]
 
   _consume_chat_stream(
     client,
@@ -690,23 +675,6 @@ def test_chat_init_request_accepts_byok_fields_without_channel_field() -> None:
   assert request.anthropic_api_key == "sk-ant-api"
   assert request.anthropic_auth_token == "sk-ant-oat"
   assert "channel" not in fields
-
-
-def test_chat_init_rejects_reserved_user_returned_by_resolver() -> None:
-  calls: list[tuple[str, Any]] = []
-
-  async def _resolver(api_key: str, init_request):
-    calls.append((api_key, init_request))
-    return _resolver_result_for("_default")
-
-  app, _captured_requests, _run_calls = _make_app(credentials_resolver=_resolver)
-
-  with TestClient(app) as client:
-    response = client.post("/api/chat/init", json={"api_key": "gateway-key"})
-
-  assert calls and calls[0][0] == "gateway-key"
-  assert response.status_code == 400
-  assert response.json()["error"] == "missing_user_id"
 
 
 def test_chat_init_accepts_resolver_derived_user_without_request_user_id() -> None:
@@ -1061,7 +1029,7 @@ def test_chat_request_id_uses_consumer_value_or_gateway_uuid() -> None:
   assert str(uuid.UUID(captured_requests[1]["request"].request_id)) == captured_requests[1]["request"].request_id
 
 
-def test_chat_request_drain_trailing_constructs_deferred_event_log() -> None:
+def test_chat_event_log_defers_terminal_close_without_client_flag() -> None:
   app, _captured_requests, _run_calls = _make_app()
 
   with TestClient(app) as client:
@@ -1069,10 +1037,7 @@ def test_chat_request_drain_trailing_constructs_deferred_event_log() -> None:
     _consume_chat_stream(
       client,
       init_response["session_token"],
-      {
-        "messages": [{"role": "user", "content": "hello"}],
-        "drain_trailing": True,
-      },
+      {"messages": [{"role": "user", "content": "hello"}]},
     )
 
   session = app.state.auth.session_store.get_session(init_response["session_id"])

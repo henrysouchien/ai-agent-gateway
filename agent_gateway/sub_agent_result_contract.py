@@ -47,7 +47,6 @@ from pydantic import (
   BaseModel,
   ConfigDict,
   Field,
-  field_validator,
   model_validator,
   StringConstraints,
 )
@@ -57,9 +56,6 @@ EXPLORE_FINDINGS_RETURN_CONTRACT = "explore-findings-v1"
 VERIFY_FINDING_RETURN_CONTRACT = "verify-finding-v1"
 ARTIFACT_BRIEF_RETURN_CONTRACT = "artifact-brief-v1"
 TERMINAL_TOOL_RESULT_RETURN_CONTRACT = "terminal-tool-result-v1"
-FUNDAMENTAL_RESEARCH_PROPOSAL_RETURN_CONTRACT = (
-  "fundamental-research-proposal-v1"
-)
 
 # These semantic caps replace the legacy assumption that compactness can be
 # recovered by truncating one serialized response after the child finishes.
@@ -220,37 +216,14 @@ def build_task_result(
     else None
   )
   successful = execution.status == "succeeded"
-  if (
-    successful
-    and requirement.terminal_narrative == "required"
-    and narrative_handle is None
-    and runtime_projection is None
-  ):
-    raise ValueError("result contract requires an exact terminal narrative")
-  if requirement.terminal_narrative == "forbidden" and narrative_handle is not None:
-    raise ValueError("result contract forbids a terminal narrative")
   if projection is not None and runtime_projection is not None:
     raise ValueError(
       "task result cannot carry both authored and runtime projections"
     )
   if runtime_projection is not None and not successful:
     raise ValueError("runtime projection requires successful execution")
-  if requirement.projection is None:
-    if projection is not None:
-      raise ValueError("result contract does not declare a projection")
-  else:
-    if successful and requirement.projection.required and projection is None:
-      raise ValueError("result contract requires a canonical projection")
-    if projection is not None and projection.contract != requirement.projection.contract:
-      raise ValueError("projection contract does not match result requirement")
-  if successful and requirement.outcome.required:
-    if outcome is None:
-      raise ValueError("result contract requires an analytical outcome")
-    if outcome.assessment_source != requirement.outcome.source:
-      raise ValueError("outcome assessment source does not match result requirement")
-  elif outcome is not None and requirement.outcome.source != "none":
-    if outcome.assessment_source != requirement.outcome.source:
-      raise ValueError("optional outcome source does not match result requirement")
+  if requirement.projection is None and projection is not None:
+    raise ValueError("result contract does not declare a projection")
   if requirement.outcome.source == "none" and outcome is not None:
     if not (
       outcome.disposition == "not_assessed"
@@ -477,67 +450,6 @@ class ArtifactBriefReport(ReportBase):
   artifact_title: FindingClaim
   key_points: list[FindingClaim] = Field(max_length=REPORT_FINDINGS_MAX_ITEMS)
   omissions: list[CaveatText] = Field(max_length=REPORT_CAVEATS_MAX_ITEMS)
-
-
-class FundamentalResearchProposalReport(ReportBase):
-  """Complete source-bearing judgment for the parent-owned FMS door.
-
-  The child is intentionally responsible only for research and proposal
-  construction.  The report door validates that the complete handoff object
-  is present; the mutation-capable parent remains responsible for invoking
-  ``fms_propose_fundamental_research`` and returning its durable receipt.
-  """
-
-  model_config = ConfigDict(extra="forbid")
-
-  judgment: dict[str, Any]
-
-  @field_validator("judgment")
-  @classmethod
-  def _validate_complete_judgment(
-    cls,
-    value: dict[str, Any],
-  ) -> dict[str, Any]:
-    required_fields = {
-      "ticker",
-      "verdict",
-      "confidence",
-      "research_date",
-      "step_synthesis",
-      "sources",
-      "data_gaps",
-      "step_coverage",
-      "recommended_next_action",
-    }
-    missing = sorted(required_fields - set(value))
-    if missing:
-      raise ValueError(
-        "fundamental-research judgment is missing required handoff fields: "
-        + ", ".join(missing)
-      )
-    ticker = value.get("ticker")
-    if not isinstance(ticker, str) or not ticker.strip():
-      raise ValueError("fundamental-research judgment ticker must be non-empty")
-    if not isinstance(value.get("step_synthesis"), dict):
-      raise ValueError(
-        "fundamental-research judgment step_synthesis must be an object"
-      )
-    if (
-      value.get("company_diligence") is not None
-      and not isinstance(value.get("company_diligence"), dict)
-    ):
-      raise ValueError(
-        "fundamental-research judgment company_diligence must be an object when present"
-      )
-    for field_name in ("sources", "data_gaps"):
-      items = value.get(field_name)
-      if not isinstance(items, list) or any(
-        not isinstance(item, dict) for item in items
-      ):
-        raise ValueError(
-          f"fundamental-research judgment {field_name} must be a list of objects"
-        )
-    return value
 
 
 def _evidence_fits_externalization_bound(
@@ -816,8 +728,6 @@ __all__ = [
   "ExploreFindingsReport",
   "Finding",
   "FinalNarrativeArtifactReference",
-  "FUNDAMENTAL_RESEARCH_PROPOSAL_RETURN_CONTRACT",
-  "FundamentalResearchProposalReport",
   "FmsArtifactReference",
   "PlanJournalReference",
   "REPORT_ARTIFACTS_MAX_ITEMS",

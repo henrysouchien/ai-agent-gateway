@@ -407,13 +407,6 @@ def test_abort_between_attempts_settles() -> None:
   assert retry_decision(_entry(), "error_transport", 1, aborted=True) == "settle"
 
 
-def test_wall_clock_exhaustion_settles() -> None:
-  assert (
-    retry_decision(_entry(), "error_transport", 1, wall_clock_exhausted=True)
-    == "settle"
-  )
-
-
 def test_backoff_is_jittered_and_bounded() -> None:
   policy = RetryPolicy(base_delay_seconds=1.0, max_delay_seconds=4.0)
 

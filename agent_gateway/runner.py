@@ -30,7 +30,6 @@ from .multi_user.billing import (
   normalize_identity,
 )
 from .product_config import gateway_product_id  # noqa: F401 - compatibility alias
-from .policy_controls import normalizer_excluded_tools
 from .runner_introspection import (
   derive_sub_agent_id as _derive_sub_agent_id,  # noqa: F401 - compatibility alias
   detect_keyword_param as _detect_keyword_param,
@@ -41,7 +40,6 @@ from .runner_limits import (
   CONTEXT_PRESSURE_REMINDER_PCT as CONTEXT_PRESSURE_REMINDER_PCT,
   effective_compaction_trigger as _effective_compaction_trigger,  # noqa: F401 - compatibility alias
   model_context_window as _model_context_window,  # noqa: F401 - compatibility alias
-  request_input_token_estimate_for_request as _request_input_token_estimate_for_request,  # noqa: F401 - compatibility alias
   token_estimate_snapshot as _token_estimate_snapshot,  # noqa: F401 - compatibility alias
 )
 from .runner_run_loop_defaults import (
@@ -110,19 +108,15 @@ from .runner_skill_gate import (
   default_tool_definitions as _default_tool_definitions,
   effective_excluded_tools as _effective_excluded_tools,
   filter_excluded_tool_definitions as _filter_excluded_tool_definitions,
-  is_report_door_clear_event as _is_report_door_clear_event,
-  normalize_skill_deny as _normalize_skill_deny,
-  normalize_skill_report_doors as _normalize_skill_report_doors,
+  normalize_skill_allow as _normalize_skill_allow,
 )
 from .runner_state import (
   BackgroundTask,
-  ChildCostAccumulator,  # noqa: F401 - compatibility alias
   CostAccumulator,
   StreamTurnResult,  # noqa: F401 - compatibility alias
   SubAgentConfig,
   ToolResultContext,
   budget_cost_progress as _budget_cost_progress,  # noqa: F401 - compatibility alias
-  budget_exceeded_state as _budget_exceeded_state,  # noqa: F401 - compatibility alias
   execute_tool_use_loop as _execute_tool_use_loop,  # noqa: F401 - compatibility alias
   normalized_run_config as _normalized_run_config,  # noqa: F401 - compatibility alias
   turn_reminder_state as _turn_reminder_state,  # noqa: F401 - compatibility alias
@@ -167,7 +161,7 @@ from .tool_result_compaction import (
   write_tool_result_spill,
 )
 from .tool_result_semantics import classify_semantic_tool_error  # noqa: F401 - compatibility alias
-from .tool_result_spill import SpillSink, normalize_spill_sink
+from .tool_result_spill import SpillPublication, SpillSink, normalize_spill_sink
 
 
 kill_background_tasks = _kill_background_tasks
@@ -181,11 +175,6 @@ STREAM_RETRY_MAX = 3
 STREAM_RETRY_DELAY = 2.0
 STREAM_RETRY_BACKOFF = 2.0
 _ACTIVE_SKILL_ALLOW_RESULT_KEY = "_active_skill_allow"
-_ACTIVE_SKILL_DENY_RESULT_KEY = "_active_skill_deny"
-_ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY = "_active_skill_report_doors"
-# Report doors are the only auto-clear doors in scope and normally return noop;
-# staged is included defensively for preview-mode doors that stage artifacts.
-_REPORT_DOOR_CLEAR_SUCCESS_STATUSES = frozenset({"noop", "staged"})
 
 
 
@@ -198,7 +187,6 @@ OnUsage = Callable[[UsageEvent], Awaitable[None] | None]
 OnSessionSummary = Callable[[SessionUsageSummary], Awaitable[None] | None]
 OnBeforeStreamComplete = Callable[..., Awaitable[None] | None]
 OnToolTiming = Callable[..., None]
-OnMaxTurns = Callable[[List[Dict[str, Any]], int], Awaitable[str | None]]
 BackgroundTaskHandler = Callable[..., Awaitable[Tuple[Optional[Any], Optional[Dict[str, Any]]]]]
 BackgroundTaskCallback = Callable[[BackgroundTask | TaskEntry], Awaitable[None] | None]
 OnMetric = Callable[[str, int], None]
@@ -231,20 +219,25 @@ class AgentRunner(
   - `get_tool_definitions` supplies the current tool schema visible to the
     model.
   - `on_tool_result`, `on_usage`, and `on_tool_timing` are observability hooks.
-  - `max_budget_usd` and `max_turns` stop the loop before it runs away.
+  - A delegated run (sub-agent or fork) meets the soft-budget ladder
+    (`runner_soft_budget`), keyed by `_soft_budget_kind`; a primary
+    (`writer`) run has none.
+  - Concurrent children queue on this runner's six slots by default. A child
+    runner inherits the slot count, not the semaphore: its own queue lets a
+    parent await grandchildren without holding a shared tree-wide permit.
   """
   _billing_mode: BillingMode
 
 
   @property
   def _max_background_tasks(self) -> int:
-    """The single background-capacity ceiling (D-A8-1 / T3-I04).
+    """The background in-flight count the registry sizes retention by.
 
-    The value lives on ``TaskRegistry._max_inflight``, the one place every
-    capacity decision reads: ``TaskRegistry.admit`` for admission and the
-    RUNNING invariant check. This runner-facing name is a *view* onto it, so
-    writing either one writes both and the two ceilings that used to drift
-    apart (admission vs. inflight) cannot desynchronize.
+    The value lives on ``TaskRegistry._max_inflight``, which no admission
+    refuses on: it is one operand of the notification-retrieval retention
+    limit (``max_retained + max_inflight``). Execution concurrency is the
+    sub-agent semaphore. This runner-facing name is a *view* onto it, so
+    writing either one writes both.
     """
 
     ceiling = getattr(
@@ -271,13 +264,11 @@ class AgentRunner(
     *,
     capability_execution: BoundCapabilityExecution,
     allow_stub_response: bool = False,
-    client_timeout: float | None = None,
     max_tokens_override: int | None = None,
     stream_stall_timeout: float | None = None,
     mcp_client: McpClientManager | None = None,
     mcp_activation_fold: McpActivationFold | None = None,
     excluded_tools: AbstractSet[str] | None = None,
-    purpose: str | None = None,
     get_tool_definitions: Callable[[], List[Dict[str, Any]]] | None = None,
     on_tool_result: OnToolResult | None = None,
     on_usage: OnUsage | None = None,
@@ -297,11 +288,10 @@ class AgentRunner(
     compaction_trigger: int | None = None,
     compaction_instructions: str | None = None,
     tool_call_timeout: float | None = 120.0,
-    on_max_turns: OnMaxTurns | None = None,
-    max_budget_usd: float | None = None,
     _cost_accumulator: CostAccumulator | None = None,
     _parent_aggregator: _UsageAggregator | None = None,
     max_concurrent_sub_agents: int | None = DEFAULT_MAX_BACKGROUND_TASKS,
+    soft_budget_kind: str | None = None,
     result_requirement: ResultRequirement | None = None,
     agent_session_log: AgentSessionLog | None = None,
     context_builder: SessionContextBuilder | None = None,
@@ -357,8 +347,6 @@ class AgentRunner(
         "AgentRunner requires a BoundCapabilityExecution"
       )
     capability_execution.validate()
-    if max_budget_usd is not None and max_budget_usd <= 0:
-      raise ValueError("max_budget_usd must be positive when provided")
     if max_concurrent_sub_agents is not None and max_concurrent_sub_agents <= 0:
       raise ValueError("max_concurrent_sub_agents must be positive when provided")
     if max_resume_chain_depth <= 0:
@@ -391,8 +379,6 @@ class AgentRunner(
       and not isinstance(result_requirement, ResultRequirement)
     ):
       raise TypeError("result_requirement must be a ResultRequirement")
-    if result_requirement is not None and result_requirement.mode != "narrative":
-      raise ValueError("agent execution accepts terminal-message results only")
     if (
       top_level_skill_lifecycle is not None
       and not isinstance(
@@ -516,7 +502,6 @@ class AgentRunner(
     self._auth_config = dict(capability_execution.auth_config)
     self._allow_stub_response = bool(allow_stub_response)
     self._effort_resolution: EffortResolution | None = None
-    self._client_timeout = client_timeout
     self._max_tokens_override = max_tokens_override
     self._stream_stall_timeout = stream_stall_timeout
     self._mcp_client = mcp_client
@@ -530,10 +515,7 @@ class AgentRunner(
       mcp_activation_fold if mcp_activation_fold is not None else McpActivationFold()
     )
     self._excluded_tools = set(excluded_tools or set())
-    self.set_purpose(purpose)
     self._active_skill_allow: set[str] = set()
-    self._active_skill_deny: set[str] = set()
-    self._active_skill_report_doors: dict[str, str] = {}
     self._get_tool_definitions = get_tool_definitions
     self._on_tool_result = on_tool_result
     self._on_usage = on_usage
@@ -582,13 +564,9 @@ class AgentRunner(
     self._portable_compaction_last_turn: int | None = None
     self._portable_compaction_floor_warned = False
     self._tool_call_timeout = tool_call_timeout
-    self._on_max_turns = on_max_turns
-    self._max_budget_usd = max_budget_usd if max_budget_usd is not None else (
-      _cost_accumulator.budget if _cost_accumulator is not None else None
+    self._cost_accumulator = (
+      _cost_accumulator if _cost_accumulator is not None else CostAccumulator()
     )
-    self._cost_accumulator = _cost_accumulator
-    if self._cost_accumulator is None and self._max_budget_usd is not None:
-      self._cost_accumulator = CostAccumulator(self._max_budget_usd)
     self._last_reported_cost = 0.0
     self._coordinator = coordinator
     self._max_resume_chain_depth = max_resume_chain_depth
@@ -632,12 +610,10 @@ class AgentRunner(
     self._operator_pause_event = operator_pause_event or asyncio.Event()
     self._shutdown_signal_provider = shutdown_signal_provider
     self._notification_queue = NotificationQueue()
-    # D-A8-1 / T3-I04: one ceiling, written unconditionally. The assignment
-    # goes through the ``_max_background_tasks`` property, which is a view
-    # onto ``TaskRegistry._max_inflight`` — the single value every capacity
-    # decision reads. Injected registries and the coordinator override take
-    # the same path, so admission and the RUNNING invariant cannot
-    # desynchronize.
+    # One value, written unconditionally. The assignment goes through the
+    # ``_max_background_tasks`` property, which is a view onto
+    # ``TaskRegistry._max_inflight`` (the retention-limit operand). Injected
+    # registries and the coordinator override take the same path.
     self._max_background_tasks = (
       self._coordinator.max_workers
       if (self._coordinator is not None and self._coordinator.enabled)
@@ -718,6 +694,15 @@ class AgentRunner(
     )
     self._role = "sub_agent" if _is_sub_agent_session_id(self._full_session_id) else "writer"
     self._sub_agent_id = self._full_session_id if self._role == "sub_agent" else None
+    # The run kind keying ``SOFT_TURN_BUDGET``. By default the session role:
+    # a ``sub_agent`` child meets the ladder, a ``writer`` (a watched primary
+    # chat) has none. A composition root names a kind explicitly when the
+    # role would lie: an autonomous ``bg_*`` run is a top-level session nobody
+    # watches, so ``runtime_session_objects`` passes ``"autonomous"``; a fork
+    # runner is re-keyed ``fork`` where it is made one (``runner_fork_agents``).
+    self._soft_budget_kind = (
+      soft_budget_kind if soft_budget_kind is not None else self._role
+    )
     self._client_kind = self._channel or ("cron" if self._agent_session_log is not None else "cli")
     self._runner_id: str | None = None
     self._write_lease_file: Any | None = None
@@ -1011,6 +996,8 @@ class AgentRunner(
         session_id=self._full_session_id,
         started_at=self._session_started_at,
         emit_recap=self._emit_session_recap,
+        usage=getattr(self, "_session_usage_summary", None),
+        recap_payload=getattr(self, "_terminal_recap_payload", None),
       )
     return self._log.append(event)
 
@@ -1041,6 +1028,7 @@ class AgentRunner(
     result_entry: Dict[str, Any],
     *,
     tool_name: str,
+    on_spill_publication: Callable[[SpillPublication], None] | None = None,
   ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     return _compact_model_tool_result_entry(
       result_entry,
@@ -1049,6 +1037,7 @@ class AgentRunner(
       log_session_id=self._sid,
       logger=log,
       uuid_factory=uuid.uuid4,
+      on_spill_publication=on_spill_publication,
     )
 
   @staticmethod
@@ -1074,21 +1063,8 @@ class AgentRunner(
   def _default_tool_definitions(self) -> List[Dict[str, Any]]:
     return _default_tool_definitions(self._get_tool_definitions, self._mcp_client)
 
-  def set_purpose(self, purpose: str | None) -> None:
-    self._purpose = (
-      purpose.strip().lower()
-      if isinstance(purpose, str) and purpose.strip()
-      else None
-    )
   def _effective_excluded_tools(self) -> set[str]:
-    excluded = _effective_excluded_tools(
-      self._excluded_tools,
-      self._active_skill_deny,
-      self._active_skill_allow,
-    )
-    if self._purpose == "normalizer":
-      excluded.update(normalizer_excluded_tools())
-    return excluded
+    return _effective_excluded_tools(self._excluded_tools, self._active_skill_allow)
 
   def _filter_excluded_tool_definitions(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return _filter_excluded_tool_definitions(tools, self._effective_excluded_tools())
@@ -1096,52 +1072,14 @@ class AgentRunner(
   def _rebuild_filtered_tool_definitions(self, base_kwargs: Dict[str, Any]) -> None:
     base_kwargs["tools"] = self._filter_excluded_tool_definitions(self._default_tool_definitions())
 
-  def _activate_skill_report_doors(self, value: Any) -> None:
-    normalized = _normalize_skill_report_doors(value)
-    if normalized is not None:
-      self._active_skill_report_doors = normalized
-
   def _activate_skill_allow(self, tool_names: Any, base_kwargs: Dict[str, Any]) -> None:
-    allowed = _normalize_skill_deny(tool_names)
+    allowed = _normalize_skill_allow(tool_names)
     if allowed is None:
       return
     if allowed == self._active_skill_allow:
       return
     self._active_skill_allow = allowed
     self._rebuild_filtered_tool_definitions(base_kwargs)
-
-  def _activate_skill_deny(self, tool_names: Any, base_kwargs: Dict[str, Any]) -> None:
-    denied = _normalize_skill_deny(tool_names)
-    if denied is None:
-      return
-    if denied == self._active_skill_deny:
-      return
-    self._active_skill_deny = denied
-    self._rebuild_filtered_tool_definitions(base_kwargs)
-
-  def _clear_active_skill_if_report_door_completed(self, event: Dict[str, Any], base_kwargs: Dict[str, Any]) -> bool:
-    tool_name = str(event.get("tool_name") or "").strip()
-    expected_skill = self._active_skill_report_doors.get(tool_name)
-    if not _is_report_door_clear_event(
-      event,
-      expected_skill=expected_skill,
-      success_statuses=_REPORT_DOOR_CLEAR_SUCCESS_STATUSES,
-    ):
-      return False
-    try:
-      from .skill_context import clear_current_skill, current_skill
-
-      active_skill = current_skill()
-      if active_skill != expected_skill:
-        return False
-      clear_current_skill()
-    except Exception:
-      return False
-    self._active_skill_allow.clear()
-    self._active_skill_deny.clear()
-    self._active_skill_report_doors.clear()
-    self._rebuild_filtered_tool_definitions(base_kwargs)
-    return True
 
   def _refresh_tools(self, base_kwargs: Dict[str, Any], _new_servers: List[str]) -> None:
     """Re-advertise after a load; the activation itself is already recorded.

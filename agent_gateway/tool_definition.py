@@ -165,6 +165,7 @@ class LiveToolRouteBinding:
   transport_server_id: str
   provider_original_name: str
   provider_id: str | None
+  code_disposition: str | None = None
 
   def __post_init__(self) -> None:
     definition = validate_originated_tool_definition(
@@ -243,6 +244,7 @@ def validate_live_tool_route_binding(
     transport_server_id=value.transport_server_id,
     provider_original_name=value.provider_original_name,
     provider_id=value.provider_id,
+    code_disposition=value.code_disposition,
   )
 
 

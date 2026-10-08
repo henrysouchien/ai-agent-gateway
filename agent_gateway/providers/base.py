@@ -198,9 +198,15 @@ class StreamEvent:
   provider_unit_deltas: dict[str, int] | None = None
   cache_read_tokens: int = 0
   cache_creation_tokens: int = 0
+  # Milliseconds the call waited on the operator's provider rate bucket
+  # before it was sent; reported on message_start.
+  provider_wait_ms: int = 0
   raw_block: Any = None
   caller: dict[str, Any] | None = None
   provider_reported_model: str | None = None
+  # On message_end: absolute final invocation prompt, including both cache
+  # categories, not summed billable iterations. Zero is known; None unavailable.
+  request_input_tokens: int | None = None
 
 
 @dataclass

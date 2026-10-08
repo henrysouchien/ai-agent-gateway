@@ -13,7 +13,6 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from .skill_limits import SkillExecutionLimits
-from .skill_context import current_skill
 
 INVESTMENT_CAPABILITY_CLAIM_PRIVATE_KEY_ENV: Final = (
   "INVESTMENT_CAPABILITY_CLAIM_ED25519_PRIVATE_KEY"
@@ -23,12 +22,14 @@ INVESTMENT_CAPABILITY_CLAIM_PUBLIC_KEY_ENV: Final = (
 )
 INVESTMENT_CAPABILITY_CLAIM_ISSUER: Final = "ai-excel-addin"
 INVESTMENT_CAPABILITY_CLAIM_AUDIENCE: Final = "investment-tools"
+# ``exp`` is the replay bound of a signed claim: a captured token stops
+# authorizing a user's investment tools 60 seconds after issuance, and
+# investment-tools rejects any claim whose exp - iat exceeds this.
 INVESTMENT_CAPABILITY_CLAIM_TTL_SECONDS: Final = 60
 INVESTMENT_CAPABILITY_CLAIM_KEY_BYTES: Final = 32
 INVESTMENT_SELECTED_CONTENT_CLAIM_PURPOSE: Final = "selected_content_read"
 _MAX_ID_CHARS = 256
 _MAX_CHANNEL_CHARS = 64
-_MAX_TOKEN_CHARS = 16_384
 _MAX_RESEARCH_FILE_ID = (1 << 63) - 1
 _POLICY_BUNDLE_HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
@@ -46,52 +47,42 @@ INVESTMENT_CAPABILITY_FACADE_TOOLS: Final = frozenset({
 INVESTMENT_CAPABILITY_CLAIM_SERVER: Final = "idea-workbench-mcp"
 
 
-class InvestmentCapabilitySkillGrant(NamedTuple):
-  allowed_capability_ids: tuple[str, ...]
-  allowed_tool_names: tuple[str, ...]
+class InvestmentCapabilityGrant(NamedTuple):
+  """One skill's investment grant, projected from its own skill note.
+
+  ``capability_ids`` and ``effect_classes`` are the note's
+  ``semantic_metadata.investment_grant``; ``tool_names`` are the tools its
+  ``tool_refs`` declare on ``INVESTMENT_CAPABILITY_CLAIM_SERVER``.
+  investment-tools owns both vocabularies and intersects every claim with the
+  routed tool's own maximum, so the gateway restates neither.
+  """
+
+  capability_ids: tuple[str, ...]
   effect_classes: tuple[str, ...]
-  max_wall_clock_seconds: int | None
+  tool_names: tuple[str, ...]
 
 
-# This mapping is gateway policy, never model input. A skill receives only the
-# narrow capability/effect set reviewed here, and the receiving server further
-# intersects it with each tool wrapper's route maximum.
-INVESTMENT_CAPABILITY_SKILL_GRANTS: Final[Mapping[str, InvestmentCapabilitySkillGrant]] = (
-  MappingProxyType({
-    "market-scan": InvestmentCapabilitySkillGrant(
-      allowed_capability_ids=(
-        "fingerprint_screen",
-        "insider_buying",
-        "quality_screen",
-      ),
-      allowed_tool_names=(
-        "cancel_investment_run",
-        "get_investment_artifact",
-        "get_investment_capability",
-        "get_investment_run",
-        "list_investment_artifacts",
-        "list_investment_capabilities",
-        "start_investment_run",
-      ),
-      effect_classes=("artifact_write", "read", "state_write"),
-      max_wall_clock_seconds=None,
-    ),
-    "quant-research": InvestmentCapabilitySkillGrant(
-      allowed_capability_ids=("quant_research",),
-      allowed_tool_names=(
-        "cancel_investment_run",
-        "get_investment_artifact",
-        "get_investment_capability",
-        "get_investment_run",
-        "list_investment_artifacts",
-        "list_investment_capabilities",
-        "start_quant_research",
-      ),
-      effect_classes=("read", "research_write", "state_write"),
-      max_wall_clock_seconds=5_400,
-    ),
-  })
-)
+_skill_grants: Mapping[str, InvestmentCapabilityGrant] = MappingProxyType({})
+
+
+def configure_investment_capability_grants(
+  grants: Mapping[str, InvestmentCapabilityGrant],
+) -> None:
+  """Bind the application's skill-name -> declared-grant projection.
+
+  Process-scoped like ``configure_server_policy``: the composition root that
+  compiles the skill catalog binds the grants its notes declare. Unbound, no
+  skill holds a grant.
+  """
+
+  global _skill_grants
+  _skill_grants = grants
+
+
+def investment_capability_grants() -> Mapping[str, InvestmentCapabilityGrant]:
+  """The bound skill-name -> declared-grant projection."""
+
+  return _skill_grants
 
 
 class InvestmentCapabilityClaimError(RuntimeError):
@@ -104,12 +95,12 @@ def investment_capability_claim_unavailable_error(
 ) -> dict[str, Any]:
   """Named refusal for a missing investment-capability grant.
 
-  The grant set and issuance route are derived from
-  ``INVESTMENT_CAPABILITY_SKILL_GRANTS``. Callers carry this payload; they
+  The grant set is the bound projection of the skill notes that declare
+  ``semantic_metadata.investment_grant``. Callers carry this payload; they
   do not restate the grants.
   """
 
-  grants = tuple(sorted(INVESTMENT_CAPABILITY_SKILL_GRANTS))
+  grants = tuple(sorted(_skill_grants))
   operations = tuple(f"agent-operation/{name}" for name in grants)
   grant_list = " or ".join(grants)
   operation_list = " or ".join(operations)
@@ -124,20 +115,6 @@ def investment_capability_claim_unavailable_error(
     "route": "run_agent",
     "operations": list(operations),
   }
-
-
-def investment_capability_server_load_error(
-  server_name: str,
-) -> dict[str, Any] | None:
-  """Refuse loading a claim-gated server the session cannot hold a grant for."""
-
-  if server_name != INVESTMENT_CAPABILITY_CLAIM_SERVER:
-    return None
-  if current_skill() in INVESTMENT_CAPABILITY_SKILL_GRANTS:
-    return None
-  return investment_capability_claim_unavailable_error(
-    subject=f"server '{server_name}'",
-  )
 
 
 
@@ -231,41 +208,22 @@ def investment_capability_signing_available() -> bool:
 
 
 def _approved_budget(
-  execution_limits: SkillExecutionLimits,
-  grant: InvestmentCapabilitySkillGrant,
+  execution_limits: SkillExecutionLimits | None,
 ) -> dict[str, int | float]:
-  if type(execution_limits) is not SkillExecutionLimits:
-    raise InvestmentCapabilityClaimError(
-      "investment capability skill policy is unavailable"
-    )
-  max_cost_usd = execution_limits.max_budget_usd
-  max_tokens = execution_limits.max_tokens
-  max_turns = execution_limits.max_turns
-  if (
-    max_cost_usd is None
-    or not 0 < max_cost_usd <= 10_000
-    or max_tokens is None
-    or not 1 <= max_tokens <= 100_000_000
-    or max_turns is None
-    or not 1 <= max_turns <= 10_000
-  ):
-    raise InvestmentCapabilityClaimError(
-      "investment capability skill policy has an invalid approved budget"
-    )
-  wall_clock = grant.max_wall_clock_seconds
-  if (
-    isinstance(wall_clock, bool)
-    or not isinstance(wall_clock, int)
-    or not 1 <= wall_clock <= 604_800
-  ):
-    raise InvestmentCapabilityClaimError(
-      "investment capability skill policy has an invalid approved budget"
-    )
+  """Sign the quant containment bound and admitted token limit, as present.
+
+  Cost and turns are not minted. investment-tools records those as
+  measurements; the issuer refuses none.
+  """
+
+  numbers: dict[str, int | float | None] = {
+    "max_wall_clock_seconds": 5_400,
+    "max_tokens": (
+      None if execution_limits is None else execution_limits.max_tokens
+    ),
+  }
   return {
-    "max_cost_usd": float(max_cost_usd),
-    "max_tokens": max_tokens,
-    "max_turns": max_turns,
-    "max_wall_clock_seconds": wall_clock,
+    field: value for field, value in numbers.items() if value is not None
   }
 
 
@@ -310,28 +268,17 @@ def issue_investment_capability_claim(
     raise InvestmentCapabilityClaimError(
       "investment capability claim requires policy_bundle_hash"
     )
-  if routed_tool not in INVESTMENT_CAPABILITY_FACADE_TOOLS:
-    raise InvestmentCapabilityClaimError(
-      "investment capability claim cannot bind an unsupported tool"
-    )
-  grant = INVESTMENT_CAPABILITY_SKILL_GRANTS.get(trusted_skill)
+  grant = _skill_grants.get(trusted_skill)
   if grant is None:
     raise InvestmentCapabilityClaimError(
       "investment capability claim cannot bind an unsupported skill"
     )
-  if routed_tool not in grant.allowed_tool_names:
+  if routed_tool not in grant.tool_names:
     raise InvestmentCapabilityClaimError(
       "investment capability claim cannot bind an unsupported tool"
     )
-  if "quant_research" in grant.allowed_capability_ids:
-    if type(admitted_skill_execution_limits) is not SkillExecutionLimits:
-      raise InvestmentCapabilityClaimError(
-        "investment capability skill policy is unavailable"
-      )
-    approved_budget = _approved_budget(
-      admitted_skill_execution_limits,
-      grant,
-    )
+  if "quant_research" in grant.capability_ids:
+    approved_budget = _approved_budget(admitted_skill_execution_limits)
   else:
     approved_budget = None
   if routed_tool == "start_quant_research":
@@ -361,7 +308,7 @@ def issue_investment_capability_claim(
     "typ": "JWT",
   }
   payload: dict[str, object] = {
-    "allowed_capability_ids": sorted(grant.allowed_capability_ids),
+    "allowed_capability_ids": sorted(grant.capability_ids),
     "aud": INVESTMENT_CAPABILITY_CLAIM_AUDIENCE,
     "channel": routed_channel,
     "effect_classes": sorted(grant.effect_classes),
@@ -388,12 +335,7 @@ def issue_investment_capability_claim(
     _b64url(_canonical_json(payload)).encode("ascii"),
   ))
   signature = private_key.sign(signing_input)
-  token = f"{signing_input.decode('ascii')}.{_b64url(signature)}"
-  if len(token) > _MAX_TOKEN_CHARS:
-    raise InvestmentCapabilityClaimError(
-      "investment capability claim exceeds its transport bound"
-    )
-  return token
+  return f"{signing_input.decode('ascii')}.{_b64url(signature)}"
 
 
 def issue_investment_selected_content_claim(
@@ -407,11 +349,7 @@ def issue_investment_selected_content_claim(
 
   subject = _required_text(user_id, "user_id")
   selected_artifact_id = _required_text(artifact_id, "artifact_id")
-  selected_view = _required_text(view, "view", maximum=32)
-  if selected_view not in {"summary", "excerpt"}:
-    raise InvestmentCapabilityClaimError(
-      "investment selected-content claim requires a supported view"
-    )
+  selected_view = _required_text(view, "view")
   issued_at = int(time.time()) if now is None else now
   if isinstance(issued_at, bool) or not isinstance(issued_at, int):
     raise InvestmentCapabilityClaimError(
@@ -441,12 +379,7 @@ def issue_investment_selected_content_claim(
     _b64url(_canonical_json(payload)).encode("ascii"),
   ))
   signature = private_key.sign(signing_input)
-  token = f"{signing_input.decode('ascii')}.{_b64url(signature)}"
-  if len(token) > _MAX_TOKEN_CHARS:
-    raise InvestmentCapabilityClaimError(
-      "investment selected-content claim exceeds its transport bound"
-    )
-  return token
+  return f"{signing_input.decode('ascii')}.{_b64url(signature)}"
 
 
 __all__ = [
@@ -459,12 +392,12 @@ __all__ = [
   "INVESTMENT_CAPABILITY_CLAIM_TTL_SECONDS",
   "INVESTMENT_SELECTED_CONTENT_CLAIM_PURPOSE",
   "INVESTMENT_CAPABILITY_FACADE_TOOLS",
-  "INVESTMENT_CAPABILITY_SKILL_GRANTS",
-  "InvestmentCapabilitySkillGrant",
+  "InvestmentCapabilityGrant",
   "InvestmentCapabilityClaimError",
+  "configure_investment_capability_grants",
+  "investment_capability_grants",
   "issue_investment_capability_claim",
   "issue_investment_selected_content_claim",
   "investment_capability_claim_unavailable_error",
-  "investment_capability_server_load_error",
   "investment_capability_signing_available",
 ]

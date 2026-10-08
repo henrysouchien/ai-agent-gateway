@@ -454,11 +454,10 @@ class _TerminalRunner(AgentRunner):
     self,
     messages: list[dict[str, Any]],
     system_prompt: str | list[tuple[str, bool]] | None = None,
-    max_turns: int | None = None,
     *,
     resume_initial_messages: list[dict[str, Any]] | None = None,
   ) -> None:
-    _ = messages, system_prompt, max_turns, resume_initial_messages
+    _ = messages, system_prompt, resume_initial_messages
     self._event_log.append({"type": "stream_complete", "usage": {}})
 
 
@@ -648,11 +647,10 @@ def test_turn_key_and_registry_survive_stream_retry_event(tmp_path) -> None:
         self,
         messages: list[dict[str, Any]],
         system_prompt: str | list[tuple[str, bool]] | None = None,
-        max_turns: int | None = None,
         *,
         resume_initial_messages: list[dict[str, Any]] | None = None,
       ) -> None:
-        _ = messages, system_prompt, max_turns, resume_initial_messages
+        _ = messages, system_prompt, resume_initial_messages
         captured["before_retry"] = self.ui_run
         self._event_log.append({
           "type": "stream_retry",

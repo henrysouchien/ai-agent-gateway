@@ -13,17 +13,22 @@ from agent_workflow_contracts import (
   AuthoredSummaryWithResultHandle,
   ContentHandle,
   ContentReadGrant,
+  ProjectionInline,
   ResultHandle,
   TaskResult,
   TaskResultRef,
+  TerminalNarrativeInlineExact,
   canonical_json_bytes,
 )
 
+from .admission import HandleOwners, HandleRequest, Refusal, admit
+from .job_caller import CallerContext, JobScope, JobScopedHandler
 from .final_narrative_artifact import (
   FinalNarrativeArtifactError,
   read_final_narrative_by_content_handle,
 )
 from .runner_background_tasks import WORKFLOW_TASK_METADATA_KEY
+from .task_registry import job_output_handles
 from .text_paging import json_bounded_text_prefix
 
 
@@ -47,8 +52,9 @@ def make_get_agent_result_content_tool_def() -> dict[str, Any]:
   return {
     "name": "get_agent_result_content",
     "description": (
-      "Read exact canonical result content through the content handle and "
-      "direct-parent read grant returned by run_agent. This supports terminal "
+      "Read exact canonical result content of an agent job by its content "
+      "handle: a result of a job you started (or its descendants), or a "
+      "handle passed to you when you were started. This supports terminal "
       "narrative text and canonical projection JSON. Continue with "
       "next_cursor.after_char until end=true."
     ),
@@ -64,7 +70,10 @@ def make_get_agent_result_content_tool_def() -> dict[str, Any]:
           "type": "string",
           "minLength": 1,
           "maxLength": 512,
-          "description": "Exact parent_materialization.read_grant.grant_id.",
+          "description": (
+            "Optional exact parent_materialization.read_grant.grant_id; "
+            "when given it selects that materialization."
+          ),
         },
         "after_char": {
           "type": "integer",
@@ -75,13 +84,31 @@ def make_get_agent_result_content_tool_def() -> dict[str, Any]:
           ),
         },
       },
-      "required": ["content_id", "read_grant_id"],
+      "required": ["content_id"],
       "additionalProperties": False,
     },
   }
 
 
-def make_get_agent_result_content_handler(runner_ref: list[Any]):
+def make_get_agent_result_content_handler(
+  runner_ref: list[Any],
+  *,
+  caller: CallerContext,
+) -> JobScopedHandler:
+  """Build the ordinary result reader for one executing job.
+
+  ``caller`` returns the reading job's admitted context; the read is
+  ``admit(HandleRequest)`` over that job's grants and the outputs of it and
+  its descendants, then the durable materialization is verified byte-exact.
+  """
+
+  return JobScopedHandler(
+    lambda scope: _result_content_handler(runner_ref, scope.caller),
+    JobScope(caller=caller, spill_sink=lambda: None),
+  )
+
+
+def _result_content_handler(runner_ref: list[Any], caller: CallerContext):
   async def _handle_get_agent_result_content(
     tool_input: dict[str, Any],
     **_kwargs: Any,
@@ -97,26 +124,34 @@ def make_get_agent_result_content_handler(runner_ref: list[Any]):
       return None, error
     assert parsed is not None
     content_id, read_grant_id, after_char = parsed
+    reader = caller()
     durable_log = getattr(runner, "_agent_session_log", None)
     workspace_dir = getattr(runner, "_workspace_dir", None)
-    gateway_session_id = str(
-      getattr(runner, "_gateway_session_id", "") or ""
-    )
-    principal_id = str(getattr(runner, "_runner_id", "") or "")
     if (
-      durable_log is None
+      reader is None
+      or reader.job_id is None
+      or durable_log is None
       or workspace_dir is None
-      or not gateway_session_id
-      or not principal_id
     ):
       return None, {
         "code": "result_content_unavailable",
         "message": "Durable agent result content storage is unavailable",
       }
-    authorized, authorization_error = await _authorized_result_content(
+    admitted = admit(
+      HandleRequest(handle=content_id, reader_job_id=reader.job_id),
+      reader,
+      owners=HandleOwners(
+        outputs=await job_output_handles(durable_log, job_id=reader.job_id),
+      ),
+    )
+    if isinstance(admitted, Refusal):
+      return None, {
+        "code": admitted.reason,
+        "message": admitted.detail,
+        "owner": admitted.owner,
+      }
+    authorized, authorization_error = await _durable_result_content(
       durable_log,
-      gateway_session_id=gateway_session_id,
-      principal_id=principal_id,
       content_id=content_id,
       read_grant_id=read_grant_id,
     )
@@ -158,7 +193,7 @@ def make_get_agent_result_content_handler(runner_ref: list[Any]):
 
 def _parse_request(
   tool_input: Any,
-) -> tuple[tuple[str, str, int] | None, dict[str, Any] | None]:
+) -> tuple[tuple[str, str | None, int] | None, dict[str, Any] | None]:
   if type(tool_input) is not dict:
     return None, {
       "code": "invalid_input",
@@ -182,14 +217,14 @@ def _parse_request(
       "message": "content_id must be an exact sha256 content identity",
     }
   read_grant_id = tool_input.get("read_grant_id")
-  if (
+  if read_grant_id is not None and (
     type(read_grant_id) is not str
     or not read_grant_id.strip()
     or len(read_grant_id) > 512
   ):
     return None, {
       "code": "invalid_input",
-      "message": "read_grant_id must be a non-empty direct-parent grant ID",
+      "message": "read_grant_id must be a non-empty grant ID when given",
     }
   after_char = tool_input.get("after_char", 0)
   if (
@@ -201,17 +236,24 @@ def _parse_request(
       "code": "invalid_input",
       "message": "after_char must be a non-negative integer",
     }
-  return (content_id, read_grant_id.strip(), after_char), None
+  return (
+    content_id,
+    read_grant_id.strip() if read_grant_id is not None else None,
+    after_char,
+  ), None
 
 
-async def _authorized_result_content(
+async def _durable_result_content(
   durable_log: Any,
   *,
-  gateway_session_id: str,
-  principal_id: str,
   content_id: str,
-  read_grant_id: str,
+  read_grant_id: str | None,
 ) -> tuple[_AuthorizedResultContent | None, dict[str, Any] | None]:
+  """Locate the one durable ordinary materialization of ``content_id``.
+
+  Authority is admission's (the caller admitted the ``HandleRequest``);
+  this resolves and verifies the producing completion only.
+  """
   candidates: list[_AuthorizedResultContent] = []
   completion_entries, _ = await durable_log.query(
     event_types={"agent_completion"},
@@ -237,10 +279,11 @@ async def _authorized_result_content(
     content, grant = handle_and_grant
     if (
       content.content_id != content_id
-      or grant.grant_id != read_grant_id
-      or grant.content_id != content_id
-      or grant.scope != "direct_parent"
-      or grant.principal_id != principal_id
+      or (grant is not None and grant.content_id != content_id)
+      or (
+        read_grant_id is not None
+        and (grant is None or grant.grant_id != read_grant_id)
+      )
     ):
       continue
     registration_entries, _ = await durable_log.query(
@@ -256,10 +299,7 @@ async def _authorized_result_content(
     if len(registrations) != 1:
       continue
     registration = registrations[0]
-    if (
-      registration.get("parent_session_id") != gateway_session_id
-      or _workflow_owned(registration, registration.get("metadata"))
-    ):
+    if _workflow_owned(registration, registration.get("metadata")):
       continue
     task_result = await _durable_task_result(
       durable_log,
@@ -281,18 +321,25 @@ async def _authorized_result_content(
   if not candidates:
     return None, {
       "code": "result_content_unavailable",
-      "message": (
-        "No authorized ordinary agent completion grants this content read"
-      ),
+      "message": "No ordinary agent completion materializes this content",
     }
+  # Two jobs may publish byte-identical content under one content_id; without
+  # a grant id naming one materialization, they agree when handle and value
+  # kind agree (the bytes are verified against the content_id on read).
   canonical = {
     json.dumps(
       {
         "handle": candidate.handle.model_dump(mode="json"),
-        "task_result_ref": TaskResultRef.from_result(
-          candidate.task_result
-        ).model_dump(mode="json"),
         "value_kind": candidate.value_kind,
+        **(
+          {
+            "task_result_ref": TaskResultRef.from_result(
+              candidate.task_result
+            ).model_dump(mode="json"),
+          }
+          if read_grant_id is not None
+          else {}
+        ),
       },
       sort_keys=True,
       separators=(",", ":"),
@@ -302,7 +349,7 @@ async def _authorized_result_content(
   if len(canonical) != 1:
     return None, {
       "code": "result_content_unavailable",
-      "message": "Conflicting durable content handles exist for this grant",
+      "message": "Conflicting durable content handles exist for this content",
     }
   return candidates[0], None
 
@@ -400,13 +447,15 @@ def _materialize_exact_content(
 
 def _completion_handle_and_grant(
   envelope: AgentCompletionEnvelope,
-) -> tuple[ContentHandle, ContentReadGrant] | None:
+) -> tuple[ContentHandle, ContentReadGrant | None] | None:
   materialization = envelope.parent_materialization
   if isinstance(
     materialization,
     (ResultHandle, AuthoredSummaryWithResultHandle),
   ):
     return materialization.source, materialization.read_grant
+  if isinstance(materialization, (TerminalNarrativeInlineExact, ProjectionInline)):
+    return materialization.source, None
   return None
 
 

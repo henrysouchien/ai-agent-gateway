@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx2
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -43,8 +44,8 @@ from agent_gateway.providers.anthropic_oauth import (  # noqa: E402
   AnthropicOAuthRecord,
   resolve_anthropic_auth_store_path,
   resolve_anthropic_credentials,
-  rotate_anthropic_credential,
-  select_anthropic_credential,
+  rotate_anthropic_credential_source,
+  select_anthropic_credential_source,
   upsert_anthropic_oauth_record,
 )
 from agent_gateway.runner_auth import merge_refreshed_auth_config  # noqa: E402
@@ -313,26 +314,28 @@ def test_usage_limited_credential_rotates_to_sibling_and_keeps_bound_model(
 
 
 def test_single_credential_pool_is_never_withheld_from_a_run(
-  monkeypatch: Any,
+  monkeypatch: Any, tmp_path: Path,
 ) -> None:
   reset_at = time.time() + 3600
   pool = AnthropicCredentialPool()
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", _TOKEN_A)
   monkeypatch.delenv("ANTHROPIC_AUTH_TOKENS", raising=False)
   monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
-  monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", "/nonexistent/anthropic/oauth.json")
+  monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "oauth.json"))
   sources = resolve_anthropic_credentials()
 
   assert sources.tokens == (_TOKEN_A,)
-  assert select_anthropic_credential(sources, pool=pool) == _TOKEN_A
+  selected = select_anthropic_credential_source(sources, pool=pool)
+  assert selected is not None and selected.token == _TOKEN_A
 
   # Nothing to swap in, and the only credential is still handed out: a pool of
   # one leaves the turn to the gateway's own bounded stream retry, which ends it
   # with the sanitized rate-limit error (see the pool-of-one turn test below).
-  assert rotate_anthropic_credential(
+  assert rotate_anthropic_credential_source(
     sources, current=_TOKEN_A, until=reset_at, pool=pool
-  ) == ""
-  assert select_anthropic_credential(sources, pool=pool) == _TOKEN_A
+  ) is None
+  selected = select_anthropic_credential_source(sources, pool=pool)
+  assert selected is not None and selected.token == _TOKEN_A
 
 
 def test_usage_limited_enrolled_account_rotates_to_the_next_enrolled_account(
@@ -376,7 +379,12 @@ def test_usage_limited_enrolled_account_rotates_to_the_next_enrolled_account(
     failure,
   )
 
-  assert rotated == {"auth_token": "sk-ant-oat01-sibling@example.com"}
+  sibling = resolve_anthropic_credentials().by_token("sk-ant-oat01-sibling@example.com")
+  assert sibling is not None
+  assert rotated == {
+    "auth_token": "sk-ant-oat01-sibling@example.com",
+    "credential_source": sibling.source_metadata(),
+  }
   assert pool.blocked_until("primary@example.com") == pytest.approx(reset_at, abs=2.0)
   assert pool.blocked_until("sibling@example.com") == 0.0
   # Every account limited: no sibling is handed back, so the run cannot circle.
@@ -515,11 +523,12 @@ def test_autonomous_child_rotates_on_the_pool_its_projection_carries(
 
   # The parent selects out of the pool it resolves, as it does for every run.
   parent_pool = AnthropicCredentialPool()
-  bound_token = select_anthropic_credential(
+  selected = select_anthropic_credential_source(
     resolve_anthropic_credentials(environ=gateway_environ),
     pool=parent_pool,
   )
-  assert bound_token == _TOKEN_A
+  assert selected is not None and selected.token == _TOKEN_A
+  bound_token = selected.token
 
   handle = CredentialHandle(
     handle_id="handle-autonomous-child",
@@ -642,13 +651,23 @@ def test_a_users_turn_rotates_inside_that_users_pool_and_never_onto_another(
     ANTHROPIC_USER_SCOPE_FIELD: "1",
   }
 
-  assert select_anthropic_credential(
+  selected = select_anthropic_credential_source(
     resolve_anthropic_credentials(environ=environ, user_scope=1), pool=pool
-  ) == primary
-  assert provider.next_credential(mine_bound, failure) == {"auth_token": sibling}
+  )
+  assert selected is not None and selected.token == primary
+  def source_of(token: str, user_scope: int) -> dict[str, str]:
+    credential = resolve_anthropic_credentials(
+      environ=environ, user_scope=user_scope,
+    ).by_token(token)
+    assert credential is not None
+    return credential.source_metadata()
+
+  assert provider.next_credential(mine_bound, failure) == {
+    "auth_token": sibling, "credential_source": source_of(sibling, 1),
+  }
   assert provider.next_credential(
     {**mine_bound, "auth_token": sibling}, failure
-  ) == {"auth_token": _TOKEN_A}
+  ) == {"auth_token": _TOKEN_A, "credential_source": source_of(_TOKEN_A, 1)}
   assert pool.blocked_until("henry-primary@example.com") == pytest.approx(reset_at, abs=2.0)
 
   # Another user's turn is served the org credential and nothing of user 1's,
@@ -663,7 +682,7 @@ def test_a_users_turn_rotates_inside_that_users_pool_and_never_onto_another(
       ANTHROPIC_USER_SCOPE_FIELD: "2",
     },
     failure,
-  ) == {"auth_token": _TOKEN_A}
+  ) == {"auth_token": _TOKEN_A, "credential_source": source_of(_TOKEN_A, 2)}
 
 
 def test_autonomous_child_of_a_user_scoped_run_inherits_that_users_pool(
@@ -696,11 +715,12 @@ def test_autonomous_child_of_a_user_scoped_run_inherits_that_users_pool(
   )
 
   parent_pool = AnthropicCredentialPool()
-  bound_token = select_anthropic_credential(
+  selected = select_anthropic_credential_source(
     resolve_anthropic_credentials(environ=gateway_environ, user_scope=3),
     pool=parent_pool,
   )
-  assert bound_token == primary
+  assert selected is not None and selected.token == primary
+  bound_token = selected.token
 
   handle = CredentialHandle(
     handle_id="handle-user-scoped-child",
@@ -765,3 +785,60 @@ def test_autonomous_child_of_a_user_scoped_run_inherits_that_users_pool(
   assert child_pool.blocked_until("child-primary@example.com") == pytest.approx(
     reset_at, abs=2.0
   )
+
+
+def test_rotated_credential_source_matches_prepared_provider_authentication(
+  monkeypatch: Any, tmp_path: Path,
+) -> None:
+  for name in ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES:
+    monkeypatch.delenv(name, raising=False)
+  monkeypatch.setenv("HOME", str(tmp_path))
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "state"))
+  store_path = tmp_path / "oauth.json"
+  monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(store_path))
+  token_a = _enroll(store_path, "rotation-primary@example.com")
+  token_b = _enroll(store_path, "rotation-sibling@example.com")
+
+  pool = AnthropicCredentialPool()
+  monkeypatch.setattr(anthropic_provider_module, "ANTHROPIC_CREDENTIAL_POOL", pool)
+  sources = resolve_anthropic_credentials()
+  selected = select_anthropic_credential_source(sources, pool=pool)
+  assert selected is not None and selected.token == token_a
+  replacement = next(source for source in sources.credentials if source.token == token_b)
+  config = {
+    "auth_mode": "oauth",
+    "auth_token": selected.token,
+    "credential_source": selected.source_metadata(),
+  }
+  provider = AnthropicProvider()
+  refreshed = provider.next_credential(
+    config,
+    ProviderCredentialFailure(
+      provider="anthropic",
+      kind="rate_limit",
+      status_code=429,
+      reset_at=time.time() + 3600,
+    ),
+  )
+  assert refreshed is not None
+  assert refreshed["auth_token"] == token_b
+  assert refreshed["credential_source"] == replacement.source_metadata()
+  assert refreshed["credential_source"] != selected.source_metadata()
+  merged = merge_refreshed_auth_config(config, refreshed)
+  assert merged["credential_source"] == replacement.source_metadata()
+
+  async def prepare_request() -> None:
+    client = provider.create_client(merged)
+    try:
+      request = httpx2.Request(
+        "POST",
+        "https://api.anthropic.com/v1/messages",
+        headers={"Authorization": f"Bearer {token_a}"},
+      )
+      await client._prepare_request(request)
+      assert request.headers["Authorization"] == f"Bearer {token_b}"
+      assert request.headers["Authorization"] != f"Bearer {token_a}"
+    finally:
+      await client.close()
+
+  _run(prepare_request())

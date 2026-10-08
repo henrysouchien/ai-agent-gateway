@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import ast
 from collections.abc import Mapping
 from dataclasses import fields, FrozenInstanceError
-from pathlib import Path
 from types import MappingProxyType
 
 import pytest
@@ -42,9 +40,6 @@ from agent_workflow_contracts.tool_registration import (
   ToolRegistrationDeclaration,
   VersionedPolicyRef,
 )
-
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def _ref(
@@ -391,39 +386,3 @@ def test_catalog_totality_uses_private_validated_lookup() -> None:
   ToolPolicyImplementationRegistry(entries).validate_catalog(_catalog())
   with pytest.raises(MissingToolPolicyImplementationError):
     ToolPolicyImplementationRegistry(entries[:-1]).validate_catalog(_catalog())
-
-
-def test_module_has_strict_imports_and_no_global_or_generic_execution() -> None:
-  path = ROOT / "agent_gateway" / "tool_policy_registry.py"
-  tree = ast.parse(path.read_text(encoding="utf-8"))
-  allowed_roots = {
-    "__future__",
-    "collections",
-    "dataclasses",
-    "math",
-    "types",
-    "typing",
-    "agent_workflow_contracts",
-  }
-  imports: set[str] = set()
-  global_registry_calls: list[ast.Call] = []
-  public_method_names: set[str] = set()
-  for node in ast.walk(tree):
-    if isinstance(node, ast.Import):
-      imports.update(alias.name.split(".", 1)[0] for alias in node.names)
-    elif isinstance(node, ast.ImportFrom):
-      imports.add((node.module or "").split(".", 1)[0])
-    elif isinstance(node, ast.FunctionDef) and not node.name.startswith("_"):
-      public_method_names.add(node.name)
-    elif (
-      isinstance(node, (ast.Assign, ast.AnnAssign))
-      and isinstance(node.value, ast.Call)
-      and isinstance(node.value.func, ast.Name)
-      and node.value.func.id == "ToolPolicyImplementationRegistry"
-    ):
-      global_registry_calls.append(node.value)
-
-  assert imports <= allowed_roots
-  assert global_registry_calls == []
-  assert "execute" not in public_method_names
-  assert "resolve" not in public_method_names

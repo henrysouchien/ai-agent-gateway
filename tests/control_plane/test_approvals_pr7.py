@@ -246,11 +246,10 @@ class _NoopRunner(AgentRunner):
     self,
     messages,
     system_prompt=None,
-    max_turns=None,
     *,
     resume_initial_messages=None,
   ) -> None:
-    _ = messages, system_prompt, max_turns, resume_initial_messages
+    _ = messages, system_prompt, resume_initial_messages
 
 
 
@@ -763,6 +762,38 @@ def test_control_approval_uses_canonical_owner_for_fresh_owner_vote(tmp_path) ->
     assert queue.get_nowait()["approved"] is True
 
 
+def test_fresh_owner_money_request_does_not_run_on_another_owner_vote(tmp_path) -> None:
+  app, store, _policy, _writer = _make_app(
+    tmp_path,
+    _NoopPolicy(owner_only_classes={"irreversible"}),
+  )
+  with TestClient(app) as client:
+    control = _control_session(client, "101")
+    chat = _chat_session(client, "101")
+    control_session = _session(app, control)
+    control_session.role = "owner"
+    control["session_token"] = app.state.auth.issue_token(control_session)
+    approval, queue = _install_pending_approval(
+      app=app,
+      store=store,
+      chat_payload=chat,
+      user_id="101",
+      tool_class="irreversible",
+      approval_constraint="fresh_human_owner",
+      required_owner_user_id="202",
+    )
+
+    response = client.post(
+      f"/api/control/runs/{chat['session_id']}/approvals/{approval.approval_id}",
+      headers=_headers(control),
+      json={"approved": True},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["approval"]["decider_id"] == "101"
+    assert queue.get_nowait()["approved"] is False
+
+
 def test_control_approval_endpoints_reject_chat_session_tokens(tmp_path) -> None:
   app, store, _policy, _writer = _make_app(tmp_path)
   with TestClient(app) as client:
@@ -1125,7 +1156,8 @@ def test_batch_approval_expiry_wins_over_late_vote(tmp_path) -> None:
       headers=_headers(alice),
       json={"approved": True},
     )
-    assert response.status_code == 410
+    assert response.status_code == 409
+    assert response.json()["error"] == "Approval request already resolved"
     expired_record = _run(store.get(approval.approval_id))
     assert expired_record is not None
     assert expired_record.state == "expired"
@@ -1925,8 +1957,8 @@ def test_terminal_and_expired_approval_states_are_rejected(tmp_path) -> None:
 
     assert terminal_retry.status_code == 409
     assert terminal_retry.json()["error"] == "Approval request already resolved"
-    assert expired_retry.status_code == 410
-    assert expired_retry.json()["error"] == "Approval request expired"
+    assert expired_retry.status_code == 409
+    assert expired_retry.json()["error"] == "Approval request already resolved"
 
 
 def test_chat_tool_approval_endpoint_uses_shared_helper(tmp_path) -> None:

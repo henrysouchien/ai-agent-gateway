@@ -1,10 +1,22 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable
+import asyncio
+import time
+from typing import Any, AsyncIterator, Dict, Iterable
 
-from .providers import ModelInfo
+from .providers import ModelInfo, StreamEvent
+from .rate_limit import local_queue_left_at, locally_queued
 from model_authority.thinking import EffortResolution, ThinkingLevel
 
+# The stream watchdog is the containment layer's hung-peer bound on a provider
+# stream (rule 8 of docs/engineering/fail-closed-local-guards.md), applied to
+# every run alike — no profile varies it. It fires only on *no progress* — every
+# non-heartbeat provider event resets the clock — never on a turn's duration,
+# so it cannot cut valid work. The turn runner retries a stalled stream up to
+# STREAM_RETRY_MAX; direct stream consumers raise StreamStallError instead.
+# The soft budget cannot end a hung request, because its ladder counts completed
+# requests. Each turn's elapsed and last-progress seconds ride the `heartbeat`
+# event, every retry rides `stream_retry`, and the terminal error names attempts.
 STREAM_STALL_TIMEOUT = 60  # max seconds between stream progress events before watchdog cancels
 STREAM_THINKING_STALL_TIMEOUT = 300  # extended-thinking turns can be quiet before first visible output
 
@@ -39,6 +51,79 @@ def effective_stream_stall_timeout(
   ):
     return float(stream_thinking_stall_timeout_default)
   return float(stream_stall_timeout_default)
+
+
+class StreamStallError(RuntimeError):
+  """A provider stream exceeded its no-progress containment deadline."""
+
+  def __init__(self, stall_seconds: float) -> None:
+    self.stall_seconds = stall_seconds
+    super().__init__(
+      f"Provider stream made no progress for {stall_seconds:g}s (stream stall)"
+    )
+
+
+async def _stream_with_stall_timeout(
+  stream: AsyncIterator[StreamEvent],
+  *,
+  config: Dict[str, Any],
+  model_info: ModelInfo,
+  max_tokens: int,
+  effort_resolution: EffortResolution | None = None,
+) -> AsyncIterator[StreamEvent]:
+  """Bound a blocked next event without imposing a total stream duration cap."""
+  stall_timeout = effective_stream_stall_timeout(
+    None,
+    config=config,
+    model_info=model_info,
+    max_tokens=max_tokens,
+    effort_resolution=effort_resolution,
+    stream_stall_timeout_default=STREAM_STALL_TIMEOUT,
+    stream_thinking_stall_timeout_default=STREAM_THINKING_STALL_TIMEOUT,
+  )
+  last_progress_at = time.monotonic()
+  next_event: asyncio.Future[StreamEvent] | None = None
+  try:
+    while True:
+      if next_event is None:
+        next_event = asyncio.ensure_future(stream.__anext__())
+      remaining = stall_timeout - (time.monotonic() - last_progress_at)
+      done = set()
+      if remaining > 0:
+        done, _ = await asyncio.wait({next_event}, timeout=remaining)
+      if not done:
+        # The deadline is checked here before any ready event is consumed, so
+        # back-to-back heartbeats (which are not progress) cannot outrun it.
+        if locally_queued(next_event):
+          # Queued for local rate-limit capacity: the request has not reached
+          # the peer yet, so the hung-peer clock does not run.
+          last_progress_at = time.monotonic()
+          continue
+        left_queue_at = local_queue_left_at(next_event)
+        if left_queue_at is not None and left_queue_at > last_progress_at:
+          # The queue ended after the last progress mark: the peer has been
+          # silent only since the request left the queue.
+          last_progress_at = left_queue_at
+          continue
+        next_event.cancel()
+        raise StreamStallError(time.monotonic() - last_progress_at)
+      try:
+        event = next_event.result()
+      except StopAsyncIteration:
+        return
+      finally:
+        next_event = None
+      if event.type != "heartbeat":
+        last_progress_at = time.monotonic()
+      yield event
+  finally:
+    if next_event is not None and not next_event.done():
+      # The generator cannot be closed while its __anext__ is still running.
+      next_event.cancel()
+      await asyncio.gather(next_event, return_exceptions=True)
+    close = getattr(stream, "aclose", None)
+    if close is not None:
+      await close()
 
 
 def observed_thinking_in_messages(
@@ -78,4 +163,4 @@ def classify_guard_outcome(
   guard_error = f"Stream watchdog: {guard_message}"
   if guard_kind == "stall" and attempt < max_attempts:
     return ("retry", guard_error, guard_kind)
-  return ("abort", guard_error, guard_kind)
+  return ("abort", f"{guard_error} (attempt {attempt + 1} of {max_attempts + 1})", guard_kind)

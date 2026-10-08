@@ -17,7 +17,7 @@ def owner_session_host_policy():
     authority_denies_tool=lambda session, _tool_name, **_kwargs: (
       getattr(session, "role", None) != "owner"
     ),
-    get_forbidden_tools_for_session=lambda _session: frozenset(),
+    get_forbidden_tools_for_session=lambda _session, *, role=None: frozenset(),
     get_server_for_policy_tool=lambda _tool_name: None,
     get_tool_class=None,
   )

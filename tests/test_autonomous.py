@@ -4,7 +4,7 @@ import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, AsyncIterator
 
 import pytest
 
@@ -17,14 +17,18 @@ import agent_gateway  # noqa: E402
 import agent_gateway.autonomous as autonomous  # noqa: E402
 import agent_gateway.autonomous_output as autonomous_output  # noqa: E402
 from agent_gateway import EventLog  # noqa: E402
+from agent_gateway.events import event_to_dict  # noqa: E402
+from agent_gateway.multi_user.billing import SessionUsageSummary  # noqa: E402
+from agent_gateway.session_recap import compute_recap, emit_recap_then_terminal  # noqa: E402
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CapabilityEffort, CredentialHandle
 from agent_gateway.capability_execution import BoundCapabilityExecution  # noqa: E402
 from model_authority.registry import ModelRegistryEntry, ProductModelRegistry
 from model_authority.schema import SCHEMA
 from gateway_test_support.model_defaults import compat_for_profile  # noqa: E402
+from gateway_test_support.host_policy import owner_session_host_policy  # noqa: E402, F401
 from agent_gateway.mcp_client import _ServerState  # noqa: E402
-from agent_gateway.providers import ModelInfo, ModelProvider  # noqa: E402
+from agent_gateway.providers import ModelInfo, ModelProvider, StreamEvent  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
 from agent_gateway.skill_limits import SkillExecutionLimits  # noqa: E402
 from agent_gateway.tool_policy_registry import (  # noqa: E402
@@ -94,10 +98,10 @@ class _StubProvider(ModelProvider):
   def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
     return dict(kwargs)
 
-  async def stream(self, client: Any, params: dict[str, Any]):
+  async def stream(self, client: Any, params: dict[str, Any]) -> AsyncIterator[StreamEvent]:
     _ = client, params
     if False:
-      yield
+      yield StreamEvent(type="message_start")
 
 
 def _autonomous_bind(
@@ -206,6 +210,114 @@ def _bound_execution(
   }
 
 
+@pytest.mark.parametrize("admitted_child", [False, True])
+def test_run_autonomous_first_handle_read_keeps_executing_job(
+  tmp_path: Path,
+  owner_session_host_policy,
+  admitted_child: bool,
+) -> None:
+  from dataclasses import replace
+  from agent_gateway.admission import (
+    capture_job_context,
+    current_parent_context,
+    root_context,
+  )
+  from agent_gateway.tool_result_spill import (
+    SpillCapabilities,
+    SpillSink,
+    TOOL_RESULT_READ_TOOL_DEF,
+    make_tool_result_read_handler,
+    write_spill_set,
+  )
+
+  sink = SpillSink(
+    lambda: str(tmp_path),
+    capabilities=SpillCapabilities(file_read=True, spill_read=True),
+  )
+  publication = write_spill_set(
+    sink=sink,
+    tool_name="file_read",
+    tool_use_id="first",
+    content="autonomous evidence",
+    model_max_chars=16000,
+  )
+  arguments = {
+    "spill_ref": publication.spill_ref,
+    "member_ref": "file_read_first.txt",
+  }
+  observed: list[tuple[Any, Any]] = []
+
+  class _FirstReadProvider(_StubProvider):
+    async def stream(self, client: Any, params: dict[str, Any]) -> AsyncIterator[StreamEvent]:
+      yield StreamEvent(type="message_start", input_tokens=10)
+      if not observed:
+        yield StreamEvent(
+          type="tool_use_end",
+          tool_id="read-first",
+          tool_name="tool_result_read",
+          tool_input=arguments,
+          raw_block={
+            "type": "tool_use",
+            "id": "read-first",
+            "name": "tool_result_read",
+            "input": arguments,
+          },
+        )
+        yield StreamEvent(type="message_end", stop_reason="tool_use")
+      else:
+        yield StreamEvent(type="text_delta", text="read complete")
+        yield StreamEvent(
+          type="text_end",
+          raw_block={"type": "text", "text": "read complete"},
+        )
+        yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+  bound = _bound_execution(provider=_FirstReadProvider())
+  session = bound["session"]
+  job_id = session.session_id
+  if admitted_child:
+    context = root_context(
+      session,
+      withheld_tools=frozenset(),
+      research_file_id=None,
+    )
+    job_id = "physical-child-job"
+    capture_job_context(session, replace(
+      context,
+      children=(),
+      tool_ids=frozenset({"tool_result_read"}),
+      job_id=job_id,
+      depth=1,
+    ))
+  handler = make_tool_result_read_handler(
+    lambda: sink,
+    caller=lambda: current_parent_context(session),
+    journal=lambda: None,
+  )
+
+  async def _read(tool_input, **kwargs):
+    result = await handler(tool_input, **kwargs)
+    observed.append(result)
+    return result
+
+  _run(autonomous.run_autonomous(
+    "test",
+    **bound,
+    initial_message="read own evidence",
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="test",
+    tool_handlers={"tool_result_read": _read},
+    tool_definitions=[TOOL_RESULT_READ_TOOL_DEF],
+  ))
+  result, error = observed[0]
+  assert error is None
+  assert result["content"] == "autonomous evidence"
+  assert current_parent_context(session).job_id == job_id
+  if admitted_child:
+    assert current_parent_context(session).children == ()
+
+
 def test_autonomous_output_exports_preserve_public_parent_surface() -> None:
   helper_names = (
     "RunOutput",
@@ -285,8 +397,8 @@ def test_collect_run_output() -> None:
   event_log.append({"type": "text_delta", "text": "Hello"})
   event_log.append({"type": "text_delta", "text": " world"})
   event_log.append({"type": "tool_call_start", "tool_name": "fresh_tool"})
-  event_log.append({"type": "budget_exceeded"})
-  event_log.append({"type": "max_turns_reached"})
+  event_log.append({"type": "soft_budget_steer", "kind": "turns", "observed": 100, "threshold": 100})
+  event_log.append({"type": "soft_budget_final", "kind": "turns", "observed": 150, "threshold": 100})
   event_log.append({
     "type": "stream_complete",
     "terminal_disposition": "completed",
@@ -300,8 +412,8 @@ def test_collect_run_output() -> None:
   assert output.usage == {"input_tokens": 10, "output_tokens": 20}
   assert output.error is None
   assert output.timed_out is False
-  assert output.budget_exceeded is True
-  assert output.max_turns_reached is True
+  assert autonomous.run_output_outcome(output) == "success"
+  assert autonomous.run_output_exit_code(output) == 0
   assert output.max_tokens_reached is False
 
 
@@ -347,8 +459,6 @@ def test_collect_run_output_detects_operator_pause() -> None:
 @pytest.mark.parametrize(
   ("reason", "expected"),
   [
-    ("budget_exceeded", "budget_exceeded"),
-    ("max_turns_reached", "max_turns_reached"),
     ("operator_pause", "operator_paused"),
   ],
 )
@@ -377,18 +487,19 @@ def test_collect_run_output_decodes_interrupted_terminal_disposition(
   assert autonomous.run_output_outcome(output) != "success"
 
 
-def test_collect_run_output_fails_closed_on_other_interruption_reason() -> None:
+@pytest.mark.parametrize("reason", ["cancelled", "soft_budget_abort"])
+def test_collect_run_output_fails_closed_on_other_interruption_reason(reason: str) -> None:
   event_log = EventLog()
   event_log.append({
     "type": "stream_complete",
     "terminal_disposition": "interrupted",
-    "reason": "cancelled",
+    "reason": reason,
     "usage": {},
   })
 
   output = autonomous.collect_run_output(event_log, timed_out=False)
 
-  assert output.error == "Autonomous run interrupted: cancelled"
+  assert output.error == f"Autonomous run interrupted: {reason}"
   assert autonomous.run_output_exit_code(output) == 1
   assert autonomous.run_output_outcome(output) == "error"
 
@@ -455,6 +566,161 @@ def test_collect_run_output_first_terminal_error_wins() -> None:
   assert output.usage == {}
 
 
+@pytest.mark.parametrize(
+  "terminal_order",
+  ["recap_before_terminal", "recap_after_terminal", "error", "missing"],
+)
+def test_collect_run_output_carries_recap_to_durable_state(
+  terminal_order: str,
+  tmp_path: Path,
+) -> None:
+  event_log = EventLog(defer_terminal_close=True)
+  event_log.append({"type": "text_delta", "text": "partial"})
+  event_log.append({
+    "type": "tool_call_start",
+    "tool_call_id": "preview",
+    "tool_name": "model_preview",
+  })
+  event_log.append({
+    "type": "tool_call_complete",
+    "tool_call_id": "preview",
+    "tool_name": "model_preview",
+    "is_error": True,
+  })
+  event_log.append({
+    "type": "interceptor_measurement",
+    "measurement": {"calls_in_window": 6, "structured_reads": 2},
+  })
+  summary = SessionUsageSummary(
+    user_id="7",
+    session_id="standalone",
+    request_id="request",
+    input_tokens=30,
+    output_tokens=40,
+    cache_read_tokens=0,
+    cache_creation_tokens=0,
+    cost=0.63,
+    turns=3,
+    channel="cli",
+    started_at=1.0,
+    ended_at=2.0,
+  )
+  terminal_usage = {"input_tokens": 10, "output_tokens": 20, "estimated_cost": 0.12}
+  terminal: dict[str, Any] = {
+    "type": "stream_complete",
+    "terminal_disposition": "completed",
+    "usage": terminal_usage,
+  }
+  if terminal_order == "recap_before_terminal":
+    emit_recap_then_terminal(
+      event_log, terminal, session_id="standalone", started_at=1.0, usage=summary,
+    )
+  else:
+    if terminal_order == "recap_after_terminal":
+      event_log.append(terminal)
+    elif terminal_order == "error":
+      event_log.append({"type": "error", "error": "provider failed"})
+    event_log.append(event_to_dict(compute_recap(
+      event_log,
+      session_id="standalone",
+      started_at=1.0,
+      trigger="turn_end",
+      usage=summary,
+    )))
+
+  if terminal_order != "missing":
+    event_log.append({"type": "text_delta", "text": "not part of the result"})
+    event_log.append({"type": "operator_pause"})
+    event_log.append({"type": "max_tokens_reached"})
+    event_log.append({
+      "type": "stream_complete",
+      "terminal_disposition": "completed",
+      "usage": {"input_tokens": 999},
+    })
+
+  output = autonomous.collect_run_output(event_log, timed_out=False)
+  assert output.response == "partial"
+  assert output.tools_used == ["model_preview"]
+  assert output.operator_paused is False
+  assert output.max_tokens_reached is False
+  expected_error = {
+    "error": "provider failed",
+    "missing": "missing_terminal_event",
+  }.get(terminal_order)
+  expected_usage = {} if expected_error else terminal_usage
+  assert output.error == expected_error
+  assert output.usage == expected_usage
+  assert output.session_recap is not None
+  assert output.session_recap["tool_calls_summary"] == {
+    "total_calls": 1,
+    "successes": 0,
+    "errors": 1,
+    "by_tool_name": {"model_preview": 1},
+    "by_server": {"local": 1},
+    "measurements": {"calls_in_window": 6, "structured_reads": 2, "model_calls": 1},
+  }
+  assert output.session_recap["usage"]["turns"] == 3
+  assert output.session_recap["usage"]["cost"] == 0.63
+
+  state = autonomous.build_state_payload(
+    previous_state={"session_recap": {"session_id": "previous"}},
+    model_state={"session_recap": {"session_id": "model-authored"}},
+    run_output=output,
+  )
+  assert state["session_recap"] == output.session_recap
+  autonomous.save_state(tmp_path, state)
+  retained = autonomous.load_state(tmp_path)
+  assert retained["session_recap"]["session_id"] == "standalone"
+  assert retained["session_recap"]["tool_calls_summary"] == output.session_recap["tool_calls_summary"]
+  assert retained["session_recap"]["usage"]["turns"] == 3
+  assert retained["session_recap"]["usage"]["cost"] == 0.63
+  assert retained["usage"] == expected_usage
+  assert retained["last_outcome"] == ("error" if expected_error else "success")
+
+
+def test_collect_run_output_keeps_latest_run_wide_recap_across_retry() -> None:
+  event_log = EventLog()
+  event_log.append({"type": "text_delta", "text": "stale"})
+  event_log.append({
+    "type": "tool_call_start", "tool_call_id": "old", "tool_name": "old_tool",
+  })
+  event_log.append({
+    "type": "tool_call_complete", "tool_call_id": "old", "is_error": True,
+  })
+  event_log.append(event_to_dict(compute_recap(
+    event_log, session_id="standalone", started_at=1.0, trigger="explicit",
+  )))
+  event_log.append({"type": "stream_retry"})
+  event_log.append({"type": "text_delta", "text": "fresh"})
+  event_log.append({
+    "type": "tool_call_start", "tool_call_id": "fresh", "tool_name": "fresh_tool",
+  })
+  event_log.append({
+    "type": "tool_call_complete", "tool_call_id": "fresh", "is_error": False,
+  })
+  emit_recap_then_terminal(
+    event_log,
+    {
+      "type": "stream_complete",
+      "terminal_disposition": "completed",
+      "usage": {"input_tokens": 10, "output_tokens": 20, "estimated_cost": 0.12},
+    },
+    session_id="standalone",
+    started_at=1.0,
+  )
+
+  output = autonomous.collect_run_output(event_log, timed_out=False)
+  assert output.response == "fresh"
+  assert output.tools_used == ["fresh_tool"]
+  assert output.usage == {"input_tokens": 10, "output_tokens": 20, "estimated_cost": 0.12}
+  assert output.session_recap is not None
+  assert output.session_recap["tool_calls_summary"]["total_calls"] == 2
+  assert output.session_recap["tool_calls_summary"]["successes"] == 1
+  assert output.session_recap["tool_calls_summary"]["errors"] == 1
+  assert output.session_recap["usage"] is None
+
+
+
 def test_enrolled_run_session_waits_for_explicit_settlement_handshake() -> None:
   async def _case() -> None:
     event_log = EventLog()
@@ -484,7 +750,6 @@ def test_enrolled_run_session_waits_for_explicit_settlement_handshake() -> None:
       autonomous.run_session(
         runner,  # type: ignore[arg-type]
         event_log,
-        max_turns=3,
         initial_message="hello",
         system_prompt=None,
       )
@@ -542,7 +807,6 @@ def test_caller_cancellation_after_completion_fence_does_not_cancel_run(
       autonomous.run_session(
         runner,  # type: ignore[arg-type]
         event_log,
-        max_turns=3,
         initial_message="hello",
         system_prompt=None,
       )
@@ -583,7 +847,6 @@ def test_run_session_no_wall_clock(monkeypatch: pytest.MonkeyPatch) -> None:
     autonomous.run_session(
       _Runner(),  # type: ignore[arg-type]
       event_log,
-      max_turns=3,
       initial_message="hello",
       system_prompt="You are helpful.",
     )
@@ -611,7 +874,6 @@ def test_run_session_writer_lease_collision_is_info_skip(
       autonomous.run_session(
         _LeaseHeldRunner(),  # type: ignore[arg-type]
         event_log,
-        max_turns=3,
         initial_message="hello",
         system_prompt="You are helpful.",
       )
@@ -638,11 +900,10 @@ def test_run_autonomous_uses_exact_prebound_model(monkeypatch: pytest.MonkeyPatc
     runner,
     event_log,
     *,
-    max_turns: int,
     initial_message: str,
     system_prompt: str | list[tuple[str, bool]],
   ) -> autonomous.RunOutput:
-    _ = event_log, max_turns, initial_message, system_prompt
+    _ = event_log, initial_message, system_prompt
     captured["model"] = (
       runner._capability_execution.bind.upstream_model
     )
@@ -683,7 +944,7 @@ def test_run_autonomous_binds_trusted_top_level_skill_identity(
   monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
   authority = _bound_execution()
   authority["admitted_skill_execution_limits"] = (
-    SkillExecutionLimits(None, None, None)
+    SkillExecutionLimits(None)
   )
   authority["session"].approval_policy = type(
     "TrustedPolicy",
@@ -768,7 +1029,7 @@ def test_run_autonomous_enforces_exact_top_level_skill_tool_ceiling(
   monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
   authority = _bound_execution()
   authority["admitted_skill_execution_limits"] = (
-    SkillExecutionLimits(None, None, None)
+    SkillExecutionLimits(None)
   )
   authority["session"].approval_policy = type(
     "TrustedPolicy",
@@ -1071,8 +1332,6 @@ def test_run_autonomous_sync_rejects_removed_raw_selection_fields() -> None:
   [
     (autonomous.RunOutput("ok", [], {}, None, False), 0),
     (autonomous.RunOutput("ok", [], {}, "boom", False), 1),
-    (autonomous.RunOutput("ok", [], {}, None, False, budget_exceeded=True), 2),
-    (autonomous.RunOutput("ok", [], {}, None, False, max_turns_reached=True), 3),
     (autonomous.RunOutput("ok", [], {}, None, False, max_tokens_reached=True), 4),
     (autonomous.RunOutput("ok", [], {}, None, False, operator_paused=True), 0),
     (autonomous.RunOutput("ok", [], {}, "guard failed", False, exit_reason="post_run_guard_failed"), 1),
@@ -1089,8 +1348,6 @@ def test_run_output_exit_code(output: autonomous.RunOutput, expected: int) -> No
     (autonomous.RunOutput("ok", [], {}, None, False), "success"),
     (autonomous.RunOutput("ok", [], {}, None, True), "timeout"),
     (autonomous.RunOutput("ok", [], {}, "boom", False), "error"),
-    (autonomous.RunOutput("ok", [], {}, None, False, budget_exceeded=True), "budget_exceeded"),
-    (autonomous.RunOutput("ok", [], {}, None, False, max_turns_reached=True), "max_turns"),
     (autonomous.RunOutput("ok", [], {}, None, False, max_tokens_reached=True), "max_tokens"),
     (autonomous.RunOutput("ok", [], {}, None, False, operator_paused=True), "operator_pause"),
     (
@@ -1161,8 +1418,17 @@ def test_build_state_payload() -> None:
   )
 
   payload = autonomous.build_state_payload(
-    previous_state={"existing": "value", "alerts": ["keep"], "next_session": [None, "next"]},
-    model_state={"alerts": ["fresh"], "new_key": 1},
+    previous_state={
+      "existing": "value",
+      "alerts": ["keep"],
+      "next_session": [None, "next"],
+      "session_recap": {"session_id": "previous"},
+    },
+    model_state={
+      "alerts": ["fresh"],
+      "new_key": 1,
+      "session_recap": {"session_id": "model-authored"},
+    },
     run_output=output,
     model_name="claude-opus-4-6",
     briefing_file="briefings/daily.md",
@@ -1178,6 +1444,7 @@ def test_build_state_payload() -> None:
   assert payload["active_servers"] == ["prices"]
   assert payload["tools_used"] == ["file_read", "web_fetch"]
   assert payload["usage"] == {"input_tokens": 5}
+  assert payload["session_recap"] is None
   assert payload["operator_paused"] is False
   assert payload["max_tokens_reached"] is False
   assert payload["last_outcome"] == "success"
@@ -1208,13 +1475,13 @@ def test_build_state_payload() -> None:
         usage={"input_tokens": 5},
         error=None,
         timed_out=False,
-        budget_exceeded=True,
+        max_tokens_reached=True,
       ),
-      "budget_exceeded",
+      "max_tokens",
       None,
     ),
   ],
-  ids=["terminal-error", "interrupted-budget"],
+  ids=["terminal-error", "interrupted-max-tokens"],
 )
 def test_build_state_payload_rejects_model_state_from_non_successful_run(
   output: autonomous.RunOutput,
@@ -1275,14 +1542,6 @@ def test_format_run_summary_operator_paused_status() -> None:
   message = autonomous.format_run_summary(output, label="Nightly analyst run")
 
   assert "Status: operator paused" in message
-
-
-def test_format_run_summary_max_tokens_status() -> None:
-  output = autonomous.RunOutput("Partial.", [], {}, None, False, max_tokens_reached=True)
-
-  message = autonomous.format_run_summary(output, label="Nightly analyst run")
-
-  assert "Status: max tokens reached" in message
 
 
 def test_deliver_telegram(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1372,396 +1631,6 @@ def test_deliver_callback() -> None:
   }
 
 
-def test_run_autonomous_simple(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-  captured: dict[str, Any] = {}
-  delivered: dict[str, Any] = {}
-  registration_catalog = ToolRegistrationCatalog((), ())
-  policy_implementations = ToolPolicyImplementationRegistry(())
-  def local_preparation(*_args):
-    return None
-
-  def approval_context(*_args):
-    return None
-
-  def approval_overlay(*_args):
-    return False
-
-  class _StubDispatcher:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-      captured["dispatcher_args"] = args
-      captured["dispatcher_kwargs"] = kwargs
-
-  class _StubRunner:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-      captured["runner_args"] = args
-      captured["runner_kwargs"] = kwargs
-
-  async def _fake_run_session(
-    runner: Any,
-    event_log: EventLog,
-    *,
-    max_turns: int,
-    initial_message: str,
-    system_prompt: str | list[tuple[str, bool]],
-  ) -> autonomous.RunOutput:
-    captured["run_session_runner"] = runner
-    captured["run_session_event_log"] = event_log
-    captured["run_session_kwargs"] = {
-      "max_turns": max_turns,
-      "initial_message": initial_message,
-      "system_prompt": system_prompt,
-    }
-    return autonomous.RunOutput(
-      response=(
-        "Completed.\n\n"
-        "## STATE_UPDATE_JSON\n"
-        "```json\n"
-        '{"alerts":["Watch earnings"],"next_session":["Review transcript"]}\n'
-        "```"
-      ),
-      tools_used=["file_read"],
-      usage={"input_tokens": 1, "output_tokens": 2},
-      error=None,
-      timed_out=False,
-    )
-
-  async def _on_complete(run_output: autonomous.RunOutput, state: dict[str, Any] | None) -> None:
-    delivered["response"] = run_output.response
-    delivered["state"] = dict(state or {})
-
-  state_dir = tmp_path / "state"
-  autonomous.save_state(state_dir, {"existing": "value"})
-  monkeypatch.setattr(autonomous, "ToolDispatcher", _StubDispatcher)
-  monkeypatch.setattr(autonomous, "AgentRunner", _StubRunner)
-  monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
-
-  provider = _StubProvider()
-  authority = _bound_execution(provider=provider)
-  result = _run(
-    autonomous.run_autonomous(
-      "You are helpful.",
-      "Run the task.",
-      **authority,
-      tool_handlers={"local_tool": _noop_local_tool},
-      tool_definitions=[{"name": "local_tool", "description": "Local tool", "input_schema": {"type": "object"}}],
-      max_turns=7,
-      state_dir=state_dir,
-      delivery=autonomous.DeliveryConfig(
-        on_complete=_on_complete,
-        briefing_file="notes/briefing.md",
-      ),
-      session_id="session-123",
-      mcp_meta_inject_servers=frozenset({"idea-workbench-mcp"}),
-      tool_registration_catalog=registration_catalog,
-      tool_policy_implementations=policy_implementations,
-      local_input_preparation_context_factory=local_preparation,
-      approval_predicate_context_factory=approval_context,
-      registered_approval_overlay=approval_overlay,
-      user_id="alice",
-      billing_mode="byok",
-      rate_table_version="unknown",
-    )
-  )
-
-  assert result.response.startswith("Completed.")
-  capability_execution = captured["runner_kwargs"]["capability_execution"]
-  assert capability_execution.provider is provider
-  assert capability_execution.bind.upstream_model == "stub-model"
-  assert capability_execution.bind.effort == "none"
-  assert captured["runner_kwargs"]["max_tokens_override"] == 16_000
-  assert captured["runner_kwargs"]["allow_stub_response"] is False
-  assert captured["runner_kwargs"]["session_id"] == "session-123"
-  assert captured["dispatcher_kwargs"]["session"] is authority["session"]
-  assert (
-    captured["dispatcher_kwargs"]["run_context"]
-    is authority["session"].run_context
-  )
-  assert captured["dispatcher_kwargs"]["role"] == authority["session"].role
-  assert captured["dispatcher_kwargs"]["interceptors"] == ()
-  assert captured["dispatcher_kwargs"]["tool_registration_catalog"] is (
-    registration_catalog
-  )
-  assert captured["dispatcher_kwargs"]["tool_policy_implementations"] is (
-    policy_implementations
-  )
-  assert captured["dispatcher_kwargs"]["input_preparation_context_factory"] is (
-    local_preparation
-  )
-  assert captured["dispatcher_kwargs"]["approval_predicate_context_factory"] is (
-    approval_context
-  )
-  assert captured["dispatcher_kwargs"]["registered_approval_overlay"] is (
-    approval_overlay
-  )
-  assert captured["dispatcher_kwargs"]["mcp_meta_inject_servers"] == frozenset(
-    {"idea-workbench-mcp"}
-  )
-  assert captured["run_session_kwargs"]["initial_message"] == "Run the task."
-  assert captured["run_session_kwargs"]["system_prompt"] == "You are helpful."
-
-  saved_state = autonomous.load_state(state_dir)
-  assert saved_state["existing"] == "value"
-  assert saved_state["alerts"] == ["Watch earnings"]
-  assert saved_state["next_session"] == ["Review transcript"]
-  assert saved_state["briefing_file"] == "notes/briefing.md"
-  assert delivered["state"]["existing"] == "value"
-
-
-def test_run_autonomous_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-  captured: dict[str, Any] = {}
-
-  class _StubDispatcher:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-      _ = args, kwargs
-
-  class _StubRunner:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-      _ = args
-      captured["runner_kwargs"] = kwargs
-
-  async def _fake_run_session(
-    runner: Any,
-    event_log: EventLog,
-    *,
-    max_turns: int,
-    initial_message: str,
-    system_prompt: str | list[tuple[str, bool]],
-  ) -> autonomous.RunOutput:
-    _ = runner, event_log, initial_message, system_prompt
-    captured["run_session_kwargs"] = {
-      "max_turns": max_turns,
-    }
-    return autonomous.RunOutput(
-      response="Completed.",
-      tools_used=[],
-      usage={},
-      error=None,
-      timed_out=False,
-    )
-
-  monkeypatch.setattr(autonomous, "ToolDispatcher", _StubDispatcher)
-  monkeypatch.setattr(autonomous, "AgentRunner", _StubRunner)
-  monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
-
-  _run(
-    autonomous.run_autonomous(
-      "You are helpful.",
-      "Run the task.",
-      **_bound_execution(),
-      user_id="alice",
-      billing_mode="byok",
-      rate_table_version="unknown",
-    )
-  )
-
-  assert captured["run_session_kwargs"]["max_turns"] == 80
-
-
-def test_run_autonomous_forwards_outputs_dir(
-  monkeypatch: pytest.MonkeyPatch,
-  tmp_path: Path,
-) -> None:
-  captured: dict[str, Any] = {}
-
-  class _StubDispatcher:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-      _ = args, kwargs
-
-  class _StubRunner:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-      _ = args, kwargs
-
-  async def _fake_run_session(
-    runner: Any,
-    event_log: EventLog,
-    *,
-    max_turns: int,
-    initial_message: str,
-    system_prompt: str | list[tuple[str, bool]],
-  ) -> autonomous.RunOutput:
-    _ = runner, event_log, max_turns, initial_message, system_prompt
-    return autonomous.RunOutput(
-      response="Completed.",
-      tools_used=[],
-      usage={},
-      error=None,
-      timed_out=False,
-    )
-
-  async def _fake_run_agent(_tool_input, **_kwargs):
-    return {"response": "ok"}, None
-
-  def _fake_make_run_agent_handler(*args, **kwargs):
-    _ = args
-    captured["kwargs"] = kwargs
-    return _fake_run_agent
-
-  skills_dir = tmp_path / "skills"
-  outputs_dir = tmp_path / "outputs"
-  skills_dir.mkdir(parents=True, exist_ok=True)
-
-  monkeypatch.setattr(autonomous, "ToolDispatcher", _StubDispatcher)
-  monkeypatch.setattr(autonomous, "AgentRunner", _StubRunner)
-  monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
-  monkeypatch.setattr(autonomous, "make_run_agent_handler", _fake_make_run_agent_handler)
-
-  authority = _bound_execution()
-  _run(
-    autonomous.run_autonomous(
-      "You are helpful.",
-      "Run the task.",
-      **authority,
-      skills_dir=skills_dir,
-      outputs_dir=outputs_dir,
-      **_raw_capability_execution_resolver(capability_execution_resolver=object()),
-      user_id="alice",
-      billing_mode="byok",
-      rate_table_version="unknown",
-    )
-  )
-
-  assert captured["kwargs"]["outputs_dir"] == outputs_dir
-  assert captured["kwargs"]["capability_execution_resolver"] is not None
-  assert captured["kwargs"]["parent_session"] is authority["session"]
-
-
-def test_run_autonomous_shares_one_interceptor_tuple_with_automatic_child(
-  monkeypatch: pytest.MonkeyPatch,
-  tmp_path: Path,
-) -> None:
-  captured: dict[str, Any] = {}
-
-  class _StubDispatcher:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-      _ = args
-      captured["parent_interceptors"] = kwargs["interceptors"]
-
-  class _StubRunner:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-      _ = args, kwargs
-
-  async def _fake_run_session(
-    runner: Any,
-    event_log: EventLog,
-    **_kwargs: Any,
-  ) -> autonomous.RunOutput:
-    _ = runner, event_log
-    return autonomous.RunOutput(
-      response="Completed.",
-      tools_used=[],
-      usage={},
-      error=None,
-      timed_out=False,
-    )
-
-  async def _fake_run_agent(_tool_input, **_kwargs):
-    return {"response": "ok"}, None
-
-  def _fake_make_run_agent_handler(*_args: Any, **kwargs: Any):
-    captured["child_interceptors"] = kwargs["interceptors"]
-    return _fake_run_agent
-
-  first = object()
-  second = object()
-  supplied = [first, second]
-  skills_dir = tmp_path / "skills"
-  skills_dir.mkdir()
-  monkeypatch.setattr(autonomous, "ToolDispatcher", _StubDispatcher)
-  monkeypatch.setattr(autonomous, "AgentRunner", _StubRunner)
-  monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
-  monkeypatch.setattr(
-    autonomous,
-    "make_run_agent_handler",
-    _fake_make_run_agent_handler,
-  )
-
-  _run(
-    autonomous.run_autonomous(
-      "You are helpful.",
-      "Run the task.",
-      **_bound_execution(),
-      skills_dir=skills_dir,
-      **_raw_interceptors(interceptors=supplied),
-      **_raw_capability_execution_resolver(capability_execution_resolver=object()),
-      user_id="alice",
-      billing_mode="byok",
-      rate_table_version="unknown",
-    )
-  )
-
-  runtime_interceptors = captured["parent_interceptors"]
-  assert type(runtime_interceptors) is tuple
-  assert captured["child_interceptors"] is runtime_interceptors
-  assert runtime_interceptors[0] is first
-  assert runtime_interceptors[1] is second
-
-
-def test_run_autonomous_keeps_custom_run_agent_handler_caller_owned(
-  monkeypatch: pytest.MonkeyPatch,
-  tmp_path: Path,
-) -> None:
-  captured: dict[str, Any] = {}
-
-  async def custom_run_agent(_tool_input, **_kwargs):
-    return {"response": "custom"}, None
-
-  class _StubDispatcher:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-      _ = args
-      captured["run_agent"] = kwargs["local_tool_handlers"]["run_agent"]
-      captured["interceptors"] = kwargs["interceptors"]
-
-  class _StubRunner:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-      _ = args, kwargs
-
-  async def _fake_run_session(
-    runner: Any,
-    event_log: EventLog,
-    **_kwargs: Any,
-  ) -> autonomous.RunOutput:
-    _ = runner, event_log
-    return autonomous.RunOutput(
-      response="Completed.",
-      tools_used=[],
-      usage={},
-      error=None,
-      timed_out=False,
-    )
-
-  def _unexpected_make_run_agent_handler(*_args: Any, **_kwargs: Any):
-    raise AssertionError("custom run_agent must not be replaced or wrapped")
-
-  interceptor = object()
-  skills_dir = tmp_path / "skills"
-  skills_dir.mkdir()
-  monkeypatch.setattr(autonomous, "ToolDispatcher", _StubDispatcher)
-  monkeypatch.setattr(autonomous, "AgentRunner", _StubRunner)
-  monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
-  monkeypatch.setattr(
-    autonomous,
-    "make_run_agent_handler",
-    _unexpected_make_run_agent_handler,
-  )
-
-  _run(
-    autonomous.run_autonomous(
-      "You are helpful.",
-      "Run the task.",
-      **_bound_execution(),
-      skills_dir=skills_dir,
-      tool_handlers={"run_agent": custom_run_agent},
-      **_raw_interceptors(interceptors=[interceptor]),
-      user_id="alice",
-      billing_mode="byok",
-      rate_table_version="unknown",
-    )
-  )
-
-  assert captured["run_agent"] is custom_run_agent
-  assert captured["interceptors"] == (interceptor,)
-
-
 def test_run_autonomous_skills_dir_registers_send_message_tool_and_builtin_name(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
@@ -1814,11 +1683,10 @@ def test_run_autonomous_skills_dir_registers_send_message_tool_and_builtin_name(
     runner: Any,
     event_log: EventLog,
     *,
-    max_turns: int,
     initial_message: str,
     system_prompt: str | list[tuple[str, bool]],
   ) -> autonomous.RunOutput:
-    _ = event_log, max_turns, initial_message, system_prompt
+    _ = event_log, initial_message, system_prompt
     captured["local_handlers"] = set(runner._dispatcher._local)
     captured["tool_defs"] = {tool["name"] for tool in runner._get_tool_definitions()}
     captured["builtin_tool_names"] = set(runner._mcp_client._builtin_tool_names)
@@ -1908,3 +1776,177 @@ def test_split_messages_empty() -> None:
 
 def test_split_messages_force_split_long_line() -> None:
   assert autonomous.split_messages("ABCDEFGHIJ", max_len=4) == ["ABCD", "EFGH", "IJ"]
+
+
+@pytest.mark.parametrize("use_factory", [False, True])
+def test_run_autonomous_delegated_code_handler_keeps_its_executable_route(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  use_factory: bool,
+  owner_session_host_policy: Any,
+) -> None:
+  import json
+
+  from agent_gateway import ToolDispatcher
+  from agent_gateway.code_execution import (
+    CodeExecutionBundle, CodeExecutionConfig, build_code_execution,
+    cleanup_code_execution,
+  )
+  from agent_gateway.skills import SkillLoader
+  from agent_gateway.task_registry import TaskRegistry
+  from gateway_test_support.capability_execution_test_support import stub_capability_execution_resolver
+  owner_session_host_policy.get_local_tool_effect = {
+    "code_execute": "read", "code_execute_status": "read", "parent_read": "read",
+  }.get
+
+  captured: dict[str, Any] = {}
+  skills_dir = tmp_path / "skills"
+  skills_dir.mkdir()
+  (skills_dir / "kernel-child.md").write_text(
+    "---\nname: kernel-child\nversion: '1.0'\nagent_callable: true\n"
+    "agent_description: Compute.\nmutation_mode: read_only\n"
+    "allowed_tools: [code_execute]\nmcp_tools: {}\n"
+    "semantic_metadata:\n  required_context: []\n"
+    "  tool_refs:\n    - kind: local\n      tool_id: code_execute\n"
+    "  capability_requirements:\n    - name: computation.execute/v1\n"
+    "      required: true\n      binding_modes: [live_tool]\n"
+    "---\nCompute and return the result.\n", encoding="utf-8",
+  )
+  loader = SkillLoader(skills_dir)
+  operation = next(
+    item.snapshot.operation.model_dump(mode="json")
+    for item in loader.list_callable_operations()
+    if item.snapshot.operation.name == "kernel-child"
+  )
+  resolver = stub_capability_execution_resolver(
+    default_provider="openai", default_model="gpt-5.6-sol",
+  )
+  authority = _bound_execution()
+  parent_bundle = build_code_execution(
+    authority["session"],
+    config=CodeExecutionConfig(register_docker=False, register_kernel=False),
+  )
+
+  async def caller_code_handler(_input: dict[str, Any], **_kwargs: Any):
+    return {"stdout": "caller-owned\n"}, None
+
+  parent_handlers = {
+    **(parent_bundle.handlers if use_factory else {"code_execute": caller_code_handler}),
+    "parent_read": caller_code_handler,
+  }
+  definitions = [
+    *parent_bundle.tool_definitions,
+    {"name": "parent_read", "description": "Parent-only read.",
+     "input_schema": {"type": "object"}},
+  ]
+
+  def bind_code_execution(bundle: CodeExecutionBundle, dispatcher: ToolDispatcher) -> None:
+    bundle.bind_dispatcher(
+      dispatcher, tool_definitions=dispatcher.get_tool_definitions,
+      code_callable=lambda name: name in parent_handlers,
+    )
+
+  def child_factory(session: GatewaySession):
+    captured["child_session"] = session
+    bundle = build_code_execution(session, config=CodeExecutionConfig(
+      register_docker=False, register_kernel=False,
+    ))
+    captured["child_bundle"] = bundle
+    return bundle
+
+  class ParentRunner:
+    def __init__(self, **kwargs: Any) -> None:
+      self._dispatcher = kwargs["dispatcher"]
+      self._get_tool_definitions = kwargs["get_tool_definitions"]
+      self._full_session_id = authority["session"].session_id
+      self._agent_session_log = object()
+      self._spill_dir_provider = None
+      self._log = kwargs["event_log"]
+      self._task_registry = TaskRegistry()
+      self.durable_events: list[dict[str, Any]] = []
+
+    async def _append_durable_event(self, event: dict[str, Any]):
+      self.durable_events.append(event)
+      return object()
+
+    async def _confirm_durable_skill_event(self, event: dict[str, Any]):
+      return event
+
+    async def spawn_sub_agent(self, task: str, **kwargs: Any):
+      dispatcher = kwargs["dispatcher"]
+      captured["child_definitions"] = dispatcher.get_tool_definitions()
+      captured["code_result"] = await dispatcher.dispatch(
+        "child-cell", "code_execute", {
+          "host": "subprocess",
+          "code": (
+            "import json\n"
+            "print(json.dumps({"
+            "'catalog': [row['name'] for row in hank.search('code_execute')], "
+            "'parent_reads': hank.search('parent_read')}))"
+          ),
+        },
+      )
+      # This fixture stops the provider loop after observing the actual route.
+      return None, {"code": "cancelled", "message": "Fixture stopped after child dispatch."}
+
+  async def run_parent(runner: Any, _log: EventLog, **_kwargs: Any):
+    if use_factory:
+      parent_dispatcher = ToolDispatcher(
+        mcp_client=autonomous._NullMcpClient(), local_tool_handlers=parent_handlers,
+        role="owner", approval_key_qualifier=parent_bundle.approval_qualifier,
+        get_tool_definitions=lambda: definitions,
+      )
+      bind_code_execution(parent_bundle, parent_dispatcher)
+      result, error = await parent_dispatcher.dispatch(
+        "parent-cell", "code_execute", {
+          "host": "subprocess",
+          "code": "print([row['name'] for row in hank.search('parent_read')])",
+        },
+      )
+      assert error is None
+      assert result is not None and result["return_code"] == 0, result
+      assert result["stdout"] == "['parent_read']\n"
+    _, error = await runner._dispatcher.dispatch("delegate", "run_agent", {
+      "operation": operation, "objective": "Compute.", "background": False,
+    })
+    assert error is not None and error["code"] == "cancelled"
+    return autonomous.RunOutput("Completed.", [], {}, None, False)
+
+  monkeypatch.setattr(autonomous, "AgentRunner", ParentRunner)
+  monkeypatch.setattr(autonomous, "run_session", run_parent)
+  async def run() -> None:
+    try:
+      await autonomous.run_autonomous(
+        "System", "Compute.", **authority,
+        skills_dir=skills_dir,
+        tool_handlers=parent_handlers,
+        tool_definitions=definitions,
+        code_execution_factory=child_factory if use_factory else None,
+        code_execution_binder=bind_code_execution if use_factory else None,
+        **_raw_capability_execution_resolver(capability_execution_resolver=resolver),
+        user_id="alice", billing_mode="byok", rate_table_version="unknown",
+      )
+    finally:
+      await cleanup_code_execution(authority["session"])
+
+  _run(run())
+  result, error = captured["code_result"]
+  assert error is None
+  if use_factory:
+    assert result["return_code"] == 0, result
+    assert json.loads(result["stdout"]) == {
+      "catalog": ["code_execute"], "parent_reads": [],
+    }
+  else:
+    assert result["stdout"] == "caller-owned\n"
+  assert {definition["name"] for definition in captured["child_definitions"]} == {
+    "code_execute",
+  }
+  if use_factory:
+    assert captured["child_session"] is not authority["session"]
+    assert (
+      captured["child_bundle"].handlers["code_execute"]
+      is not parent_bundle.handlers["code_execute"]
+    )
+    assert captured["child_bundle"].frame_reader is not parent_bundle.frame_reader
+    assert captured["child_session"].code_execution_work_dir is None

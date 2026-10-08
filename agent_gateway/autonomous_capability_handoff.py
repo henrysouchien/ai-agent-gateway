@@ -7,6 +7,8 @@ from typing import Awaitable, Callable, Literal, TypeAlias
 from model_authority.bind import CapabilityBind
 from model_authority.binding import RunMode
 from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
+from agent_workflow_contracts import OperationUnavailable, ResolvedAuthority
+from .admission import AdmittedContext, ParentContext, Refusal
 from .capability_execution import MaterializedCredential
 
 
@@ -22,7 +24,7 @@ def _required_text(value: object, *, field_name: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class AutonomousCapabilityBindingRequest:
-  """Trusted server request for one autonomous session-driver binding."""
+  """Trusted server request for one exact autonomous launch binding."""
 
   task_id: str
   control_run_id: str
@@ -36,6 +38,11 @@ class AutonomousCapabilityBindingRequest:
   source: AutonomousCapabilityBindingSource
   run_mode: RunMode
   required_bind: CapabilityBind | None = None
+  parent: ParentContext | None = None
+  task: str | None = None
+  ticker: str | None = None
+  research_file_id: int | None = None
+  env_names: frozenset[str] = frozenset()
 
   def __post_init__(self) -> None:
     object.__setattr__(self, "task_id", _required_text(self.task_id, field_name="task_id"))
@@ -74,23 +81,11 @@ class AutonomousCapabilityBindingRequest:
       raise ValueError(f"unsupported autonomous capability binding source: {self.source!r}")
     if self.run_mode not in {"autonomous", "cron"}:
       raise ValueError("autonomous capability binding run_mode must be 'autonomous' or 'cron'")
-    if self.source == "schedule" and self.run_mode != "cron":
-      raise ValueError("scheduled autonomous binding requests require run_mode='cron'")
-    if self.source == "start" and self.run_mode != "autonomous":
-      raise ValueError("fresh autonomous binding requests require run_mode='autonomous'")
-    if self.source == "resume" and self.run_mode not in {"autonomous", "cron"}:
-      raise ValueError("resume binding requests require autonomous or cron run mode")
     if self.source == "resume" and self.required_bind is None:
       raise ValueError("resume binding requests require an exact persisted bind")
-    if self.source != "resume" and self.required_bind is not None:
-      raise ValueError("only resume binding requests may carry an exact persisted bind")
     if self.required_bind is not None:
       if not isinstance(self.required_bind, CapabilityBind):
         raise TypeError("required_bind must be CapabilityBind")
-      if self.required_bind.capability_id != SESSION_DRIVER_CAPABILITY:
-        raise ValueError("resume binding requests require a session.driver bind")
-      if self.required_bind.run_mode != self.run_mode:
-        raise ValueError("persisted bind run_mode does not match the resume request")
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,12 +97,13 @@ class AutonomousCapabilityBinding:
     repr=False,
     compare=False,
   )
+  admitted: AdmittedContext[ResolvedAuthority] | None = None
 
   def __post_init__(self) -> None:
     if not isinstance(self.bind, CapabilityBind):
       raise TypeError("autonomous capability binding bind must be CapabilityBind")
-    if self.bind.capability_id != SESSION_DRIVER_CAPABILITY:
-      raise ValueError("autonomous capability binding requires a session.driver bind")
+    if self.admitted is not None and self.bind != self.admitted.wire.capability_bind:
+      raise ValueError("autonomous capability binding does not match admitted context")
     if self.bind.run_mode not in {"autonomous", "cron"}:
       raise ValueError(
         "autonomous capability binding requires autonomous or cron run mode"
@@ -126,6 +122,43 @@ class AutonomousCapabilityBinding:
       raise ValueError(
         "autonomous binding credential handle does not match its bind"
       )
+
+class AutonomousLaunchAdmissionRefused(Exception):
+  """Surface the admission owner's cause before launch side effects."""
+
+  def __init__(self, refusal: Refusal | OperationUnavailable) -> None:
+    self.detail = refusal.detail
+    if isinstance(refusal, Refusal):
+      self.reason = refusal.reason
+      self.owner = refusal.owner
+      self.code = refusal.reason
+    else:
+      self.reason = None
+      self.owner = None
+      self.code = "operation_unavailable"
+    self.http_status = (
+      403
+      if isinstance(refusal, Refusal) and refusal.reason in {
+        "tenant_mismatch", "grant_exceeds_parent", "binding_not_granted",
+        "handle_not_granted", "invite_effect_not_allowed",
+      }
+      else 422
+    )
+    super().__init__(self.detail)
+
+  @classmethod
+  def from_refusal(cls, refusal: Refusal) -> AutonomousLaunchAdmissionRefused:
+    return cls(refusal)
+
+  @classmethod
+  def from_unavailable(cls, unavailable: OperationUnavailable) -> AutonomousLaunchAdmissionRefused:
+    return cls(unavailable)
+
+  def payload(self) -> dict[str, str]:
+    if self.reason is not None and self.owner is not None:
+      return {"owner": self.owner, "reason": self.reason, "detail": self.detail}
+    return {"code": self.code, "detail": self.detail}
+
 
 
 AutonomousCapabilityBindingResolver: TypeAlias = Callable[
@@ -151,8 +184,6 @@ async def resolve_autonomous_capability_binding(
     raise TypeError(
       "autonomous capability binding resolver must return AutonomousCapabilityBinding"
     )
-  if resolved.bind.run_mode != request.run_mode:
-    raise ValueError("autonomous capability binding run_mode does not match the launch request")
   if (
     resolved.bind.credential_principal == "user"
     and resolved.materialized_credential.handle.actor_id
@@ -163,6 +194,11 @@ async def resolve_autonomous_capability_binding(
     )
   if request.required_bind is not None and resolved.bind != request.required_bind:
     raise ValueError("resume capability binding does not match the persisted exact bind")
+  if resolved.admitted is not None:
+    if resolved.bind != resolved.admitted.wire.capability_bind:
+      raise ValueError("autonomous capability binding does not match admitted context")
+  elif request.required_bind is None and resolved.bind.capability_id != SESSION_DRIVER_CAPABILITY:
+    raise ValueError("unadmitted autonomous capability binding requires a session.driver bind")
   return resolved
 
 
@@ -171,5 +207,6 @@ __all__ = [
   "AutonomousCapabilityBindingRequest",
   "AutonomousCapabilityBindingResolver",
   "AutonomousCapabilityBindingSource",
+  "AutonomousLaunchAdmissionRefused",
   "resolve_autonomous_capability_binding",
 ]

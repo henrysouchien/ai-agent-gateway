@@ -292,8 +292,14 @@ def test_deferred_dispatch_happy_path_closes_after_trailing_event(tmp_path) -> N
     assert all(entry.event.get("error") != "stream closed" for entry in event_log.entries)
     assert event_log.closed is True
     assert result.state == "completed"
+    # No subscriber was attached: the log's close writes the whole turn,
+    # including the entry after the terminal, to the transcript.
     transcript = (tmp_path / "sess-trailing.jsonl").read_text(encoding="utf-8").splitlines()
-    assert [json.loads(line)["type"] for line in transcript] == ["chat_request"]
+    assert [json.loads(line)["type"] for line in transcript] == [
+      "chat_request",
+      "stream_complete",
+      "citation_validation",
+    ]
 
   _run(case())
 
@@ -481,39 +487,11 @@ def test_chat_turn_state_uses_first_terminal_error_before_trailing_success() -> 
   assert _chat_turn_state_from_events(events) == "failed"
 
 
-def test_chat_turn_state_projects_budget_limited_for_budget_stop() -> None:
-  events = [
-    {"type": "text_delta", "text": "partial"},
-    {
-      "type": "budget_exceeded",
-      "total_cost": 0.42,
-      "budget": 0.4,
-      "reason": "sdk_max_budget_usd",
-    },
-    {
-      "type": "stream_complete",
-      "terminal_disposition": "interrupted",
-      "reason": "budget_exceeded",
-      "usage": {},
-    },
-  ]
-
-  state = _chat_turn_state_from_events(events)
-
-  assert state == "budget_limited"
-  classification = CONTROL_RUN_STATE_CLASSIFICATION[state]
-  assert classification["terminal"] is True
-  assert classification["resumable"] is False
-  # The wire vocabulary is unchanged: only the recorded run state is remapped.
-  assert [event["type"] for event in events] == [
-    "text_delta",
-    "budget_exceeded",
-    "stream_complete",
-  ]
-
-
-@pytest.mark.parametrize("reason", [None, "operator_pause", "client_disconnect"])
-def test_chat_turn_state_keeps_interrupted_without_budget_reason(
+@pytest.mark.parametrize(
+  "reason",
+  [None, "operator_pause", "client_disconnect", "soft_budget_abort"],
+)
+def test_chat_turn_state_projects_interrupted_terminal(
   reason: str | None,
 ) -> None:
   terminal: dict[str, Any] = {
@@ -528,29 +506,6 @@ def test_chat_turn_state_keeps_interrupted_without_budget_reason(
 
   assert state == "interrupted"
   assert CONTROL_RUN_STATE_CLASSIFICATION[state]["resumable"] is True
-
-
-def test_chat_turn_state_budget_stop_with_channel_error_stays_failed() -> None:
-  # A chat-path channel failure surfaces as an `error` terminal in the turn log
-  # (`_dispatch_chat_turn_body` emits it when required event delivery fails).
-  # Honest corruption outranks the nicer budget label.
-  events = [
-    {
-      "type": "budget_exceeded",
-      "total_cost": 0.42,
-      "budget": 0.4,
-      "reason": "sdk_max_budget_usd",
-    },
-    {"type": "error", "error": "required chat turn event delivery failed"},
-    {
-      "type": "stream_complete",
-      "terminal_disposition": "interrupted",
-      "reason": "budget_exceeded",
-      "usage": {},
-    },
-  ]
-
-  assert _chat_turn_state_from_events(events) == "failed"
 
 
 def test_chat_request_drain_trailing_compatibility() -> None:

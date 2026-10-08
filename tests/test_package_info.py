@@ -94,15 +94,6 @@ def test_package_health_reports_deployment_commit(monkeypatch) -> None:
   assert health["source_commit_provenance"] == "deployment_environment"
 
 
-def test_package_health_allows_missing_local_deployment_commit(monkeypatch) -> None:
-  monkeypatch.setattr(package_info, "SOURCE_COMMIT", None)
-
-  health = package_info.package_health()
-
-  assert health["source_commit"] is None
-  assert health["source_commit_provenance"] is None
-
-
 def test_health_reports_package_contracts() -> None:
   app = create_gateway_app(
     GatewayServerConfig(

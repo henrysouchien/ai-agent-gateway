@@ -19,9 +19,10 @@ derivations:
 ``derive_live_surface``
     The whole prompt-facing surface — active servers, deferred tool names,
     deferred tool ids, and the per-server allowlist — computed together from
-    ``(profile, channel tier, server catalog, fold, denied)``.  Because the
-    three projections come out of one function over one fact, they cannot
-    disagree: a tool is advertised exactly when it is allowed.
+    ``(profile, server catalog, fold, denied)``.  Because the three
+    projections come out of one function over one fact, they cannot
+    disagree: a tool is advertised exactly when it is allowed.  No channel
+    tier withholds a server; only a profile's registered tool ceiling does.
 
 ``LiveToolSurface``
     The immutable result. Interactive prompt, catalog, and dispatcher readers
@@ -326,162 +327,82 @@ def _catalog_tool_names(payload: Any) -> set[str]:
 def derive_live_surface(
   *,
   profile: Any | None,
-  channel_context: str | None,
-  channel_tiers: Mapping[str | None, Mapping[str, Any]],
   server_catalog: Mapping[str, Any],
   activation_fold: McpActivationFold | None,
   denied_mcp_servers: Iterable[str] | None = None,
-  stage_authority: Any | None = None,
 ) -> LiveToolSurface:
-  """Derive the live MCP surface from the activation fold.
+  """Derive the live MCP surface from the profile's registration and the fold.
 
-  ``profile=None`` means "no profile ceiling in force": every active server is
-  fully advertised and nothing is deferred, which is what a scope-less caller
-  used to get by passing ``deferred_mcp_tools=None``.
+  Every connected server the profile is not denied is active; no channel
+  tier decides which servers a session sees. The denied set is the
+  profile's own registration plus the operator-only audience
+  (``api/agent/shared/mcp_audience.py``), an authorization partition.
 
-  A ``stage_authority`` replaces the profile ceiling outright: the stage's
-  exact per-server map is the allowlist, and only the stage's own servers
-  contribute deferred names.
+  A server advertises its whole tool list unless the profile registers a
+  tool ceiling for it in ``core_mcp_tools`` (and does not mark it unscoped):
+  that registration is what a profile may reach on a shared server — the
+  community profile's invite users never see the owner's portfolio reads or
+  shared-corpus writes — and only the fold's grants widen it.
   """
 
-  if stage_authority is not None:
-    return _stage_authority_surface(
-      stage_authority=stage_authority,
-      channel_tiers=channel_tiers,
-      channel_context=channel_context,
-      server_catalog=server_catalog,
-      activation_fold=activation_fold,
-      denied_mcp_servers=denied_mcp_servers,
-      profile=profile,
-    )
-
-  tier = channel_tiers.get(channel_context, channel_tiers[None])
-  denied_servers = set(
-    denied_mcp_servers
-    if denied_mcp_servers is not None
-    else getattr(profile, "denied_mcp_servers", frozenset()) or frozenset()
-  )
+  denied_servers = _denied_servers(profile, denied_mcp_servers)
   fold = activation_fold if activation_fold is not None else McpActivationFold()
-  active_servers = (
-    set(tier.get("always", set())) | set(fold.activated_servers)
-  ) - denied_servers
   catalog = {
     str(server_name): payload
     for server_name, payload in server_catalog.items()
     if str(server_name) not in denied_servers
   }
-
-  unscoped_active_servers = {
+  unscoped_servers = {
     str(server_name)
     for server_name in getattr(profile, "unscoped_active_mcp_servers", frozenset()) or frozenset()
-    if isinstance(server_name, str)
   }
-  core_tools_by_server: dict[str, set[str]] = {
-    str(server_name): {
-      str(tool_name)
-      for tool_name in tool_names
-      if isinstance(tool_name, str)
-    }
+  registered_ceilings: dict[str, set[str]] = {
+    str(server_name): {str(tool_name) for tool_name in tool_names}
     for server_name, tool_names in (getattr(profile, "core_mcp_tools", {}) or {}).items()
+    if str(server_name) not in unscoped_servers
   }
 
   withheld_names: set[str] = set()
-  deferred_tool_pairs: set[tuple[str, str]] = set()
+  withheld_tool_pairs: set[tuple[str, str]] = set()
   allowed_mcp_tools_by_server: dict[str, frozenset[str]] = {}
-  active_ungated_tool_names: set[str] = set()
-  whole_servers = fold.whole_servers
-
-  for server_name in catalog:
-    server_tool_names = _catalog_tool_names(catalog.get(server_name, {}))
-    if server_name in active_servers:
-      if profile is None or server_name in unscoped_active_servers:
-        allowed_mcp_tools_by_server[server_name] = frozenset(server_tool_names)
-        active_ungated_tool_names.update(server_tool_names)
-        continue
-      granted = set(core_tools_by_server.get(server_name, set()))
-      if server_name in whole_servers:
-        granted |= server_tool_names
-      granted |= set(fold.granted_tools(server_name))
-      allowed = server_tool_names & granted
-      allowed_mcp_tools_by_server[server_name] = frozenset(allowed)
-      server_deferred_tools = server_tool_names - allowed
+  visible_names: set[str] = set(fold.granted_tool_names)
+  for server_name, payload in catalog.items():
+    server_tool_names = _catalog_tool_names(payload)
+    ceiling = registered_ceilings.get(server_name)
+    if ceiling is None or server_name in fold.whole_servers:
+      allowed = server_tool_names
     else:
-      server_deferred_tools = server_tool_names
+      allowed = server_tool_names & (ceiling | set(fold.granted_tools(server_name)))
+    allowed_mcp_tools_by_server[server_name] = frozenset(allowed)
+    visible_names |= allowed
+    for tool_name in server_tool_names - allowed:
+      withheld_names.add(tool_name)
+      withheld_tool_pairs.add((server_name, tool_name))
 
-    withheld_names |= server_deferred_tools
-    for tool_name in server_deferred_tools:
-      deferred_tool_pairs.add((server_name, tool_name))
-
-  # An explicitly granted or ungated tool name is visible everywhere it is
-  # advertised. Both subtractions preserve the pre-fold behaviour exactly: the
-  # deferred set was always a flat name set, and `load_tools` removed loaded
-  # names from it globally.
-  visible_names = active_ungated_tool_names | set(fold.granted_tool_names)
-  withheld_names -= visible_names
+  # The withheld set is a flat name set: a name allowed on any server is
+  # visible everywhere it is advertised.
   return LiveToolSurface(
-    active_servers=frozenset(active_servers),
+    active_servers=frozenset(
+      (set(catalog) | set(fold.activated_servers)) - denied_servers
+    ),
     server_catalog=catalog,
-    deferred_mcp_tools=frozenset(withheld_names),
+    deferred_mcp_tools=frozenset(withheld_names - visible_names),
     deferred_mcp_tool_ids=frozenset(
       f"mcp__{server_name}__{tool_name}"
-      for server_name, tool_name in deferred_tool_pairs
+      for server_name, tool_name in withheld_tool_pairs
     ),
     allowed_mcp_tools_by_server=allowed_mcp_tools_by_server,
   )
 
 
-def _stage_authority_surface(
-  *,
-  stage_authority: Any,
-  channel_tiers: Mapping[str | None, Mapping[str, Any]],
-  channel_context: str | None,
-  server_catalog: Mapping[str, Any],
-  activation_fold: McpActivationFold | None,
-  denied_mcp_servers: Iterable[str] | None,
+def _denied_servers(
   profile: Any | None,
-) -> LiveToolSurface:
-  """The stage route's exact scope, in the shape every reader already takes."""
-
-  tier = channel_tiers.get(channel_context, channel_tiers[None])
-  denied_servers = set(
+  denied_mcp_servers: Iterable[str] | None,
+) -> set[str]:
+  return set(
     denied_mcp_servers
     if denied_mcp_servers is not None
     else getattr(profile, "denied_mcp_servers", frozenset()) or frozenset()
-  )
-  fold = activation_fold if activation_fold is not None else McpActivationFold()
-  stage_servers = {
-    str(server_name)
-    for server_name in getattr(stage_authority, "mcp_server_names", ()) or ()
-  }
-  allowed_mcp_tools_by_server = {
-    str(server_name): frozenset(str(tool_name) for tool_name in tool_names)
-    for server_name, tool_names in (
-      getattr(stage_authority, "mcp_tools_by_server", {}) or {}
-    ).items()
-  }
-  catalog = {
-    str(server_name): payload
-    for server_name, payload in server_catalog.items()
-    if str(server_name) not in denied_servers
-  }
-  withheld_names: set[str] = set()
-  deferred_tool_ids: set[str] = set()
-  for server_name in stage_servers:
-    allowed = allowed_mcp_tools_by_server.get(server_name, frozenset())
-    for tool_name in sorted(_catalog_tool_names(catalog.get(server_name, {}))):
-      if tool_name in allowed:
-        continue
-      withheld_names |= {tool_name}
-      deferred_tool_ids |= {f"mcp__{server_name}__{tool_name}"}
-  active_servers = (
-    set(tier.get("always", set())) | set(fold.activated_servers) | stage_servers
-  ) - denied_servers
-  return LiveToolSurface(
-    active_servers=frozenset(active_servers),
-    server_catalog=catalog,
-    deferred_mcp_tools=frozenset(withheld_names),
-    deferred_mcp_tool_ids=frozenset(deferred_tool_ids),
-    allowed_mcp_tools_by_server=allowed_mcp_tools_by_server,
   )
 
 
@@ -570,11 +491,8 @@ class SessionToolSurface:
   __slots__ = (
     "_session",
     "_profile",
-    "_channel_context",
-    "_channel_tiers",
     "_mcp_client_manager",
     "_denied_mcp_servers",
-    "_stage_authority",
     "_defers_mcp_tools",
     "_fold",
   )
@@ -584,23 +502,17 @@ class SessionToolSurface:
     *,
     session: Any,
     profile: Any | None,
-    channel_context: str | None,
-    channel_tiers: Mapping[str | None, Mapping[str, Any]],
     mcp_client_manager: Any,
     denied_mcp_servers: Iterable[str] | None = None,
-    stage_authority: Any | None = None,
     defers_mcp_tools: bool = True,
     activation_fold: McpActivationFold | None = None,
   ) -> None:
     self._session = session
     self._profile = profile
-    self._channel_context = channel_context
-    self._channel_tiers = channel_tiers
     self._mcp_client_manager = mcp_client_manager
     self._denied_mcp_servers = (
       None if denied_mcp_servers is None else set(denied_mcp_servers)
     )
-    self._stage_authority = stage_authority
     self._defers_mcp_tools = bool(defers_mcp_tools)
     self._fold = activation_fold
 
@@ -660,12 +572,9 @@ class SessionToolSurface:
   def surface(self) -> LiveToolSurface:
     return derive_live_surface(
       profile=self._profile,
-      channel_context=self._channel_context,
-      channel_tiers=self._channel_tiers,
       server_catalog=self._server_catalog(),
       activation_fold=self.activation_fold,
       denied_mcp_servers=self._denied_mcp_servers,
-      stage_authority=self._stage_authority,
     )
 
   @property
@@ -702,11 +611,6 @@ class _EmptyMcpClientManager:
     return {}
 
 
-_DETACHED_CHANNEL_TIERS: Mapping[str | None, Mapping[str, Any]] = MappingProxyType({
-  None: MappingProxyType({"always": frozenset(), "defer": frozenset()}),
-})
-
-
 def detached_tool_surface(
   activated_servers: Iterable[str] = (),
   *,
@@ -728,8 +632,6 @@ def detached_tool_surface(
   return SessionToolSurface(
     session=None,
     profile=None,
-    channel_context=None,
-    channel_tiers=_DETACHED_CHANNEL_TIERS,
     mcp_client_manager=_EmptyMcpClientManager(),
     denied_mcp_servers=(),
     defers_mcp_tools=defers_mcp_tools,

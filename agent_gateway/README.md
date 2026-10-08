@@ -7,7 +7,7 @@ library API is documented in `../docs/`.
 |---|---|
 | `providers/` | model adapters — `anthropic`, `codex`, `openai`, `xai`, `agent_sdk`, plus `*_helpers` and the `anthropic_oauth` / `xai_oauth` token stores. An adapter builds `ModelInfo` from the model's registry entry, its `compat:` block and the rate tables; a model ID with no registry entry is not callable |
 | `control_plane/` | the generic `/control/*` FastAPI routers (session, profiles, skills, schedules, runs, batches, approvals, events, health); product backends are supplied explicitly |
-| `code_execution/_backends/` | the two `ExecutionBackend` implementations, `DockerBackend` and `SubprocessBackend` |
+| `code_execution/_backends/` | `ExecutionBackend` placements: session-owned `KernelBackend` and `DockerBackend` share the persistent runner/codec; `SubprocessBackend` is one-shot |
 | `canvas_build/` | pinned Node toolchain (`.node-version`, `provision.sh`, `build.mjs`, `policy.mjs`) that compiles agent-authored canvas TSX |
 | `contracts/canvas-kit-v1/` | the contract `canvas_build` compiles against: `canvas_kit_manifest.v1.json` (externals, pinned versions, size caps) + 7 conformance fixtures whose expected stage/code live in `fixtures/expectations.json`. The `@hank/canvas-kit` type surface is committed under `types/node_modules/` and shipped by the `contracts/canvas-kit-v1/**/*.d.ts` package-data glob in `pyproject.toml`. |
 | `contracts/` (others) | `claim-contract-v1`, `commercial-*`, `control-run-v1`, `ui-blocks-v1`, `usage-reconciliation-v{1,2,3}` JSON Schemas and fixtures |
@@ -16,6 +16,10 @@ library API is documented in `../docs/`.
 The model authority — registry, selection policy, resolver, rate tables, effort
 vocabulary and `CapabilityBind` — is not in this package. It is
 `hank-model-authority` (`../../model-authority/`, import `model_authority`).
+
+Event credential projection: `secret_boundary.py` redacts authored inputs and
+display text in both `tool_calls_planned` and call-start events, leaving opaque
+call IDs and tool names unchanged so consumers can correlate the same call.
 
 Library reference: `../docs/architecture.md`, `../docs/api-reference.md`, `../docs/http-api.md`
 Operator view: the control-plane modules above and the generated OpenAPI

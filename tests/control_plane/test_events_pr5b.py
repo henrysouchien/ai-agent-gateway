@@ -189,11 +189,10 @@ class _NoopRunner(AgentRunner):
     self,
     messages: list[dict[str, Any]],
     system_prompt: str | list[tuple[str, bool]] | None = None,
-    max_turns: int | None = None,
     *,
     resume_initial_messages=None,
   ) -> None:
-    _ = messages, system_prompt, max_turns, resume_initial_messages
+    _ = messages, system_prompt, resume_initial_messages
 
 
 def _make_app(monkeypatch, tmp_path: Path, events: list[dict[str, Any]]):
@@ -248,7 +247,7 @@ def _make_app(monkeypatch, tmp_path: Path, events: list[dict[str, Any]]):
       autonomous_skill_admission_policy_resolver=lambda skill_name: (
         AutonomousSkillAdmissionPolicy(
           False,
-          SkillExecutionLimits(None, None, None),
+          SkillExecutionLimits(None),
         )
       ),
       autonomous_capability_binding_resolver=_autonomous_capability_binding,

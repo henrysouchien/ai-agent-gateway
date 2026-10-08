@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import os
 import resource
+import sys
 from types import SimpleNamespace
 
 import pytest
 
 from agent_gateway import gateway_server
+from agent_gateway.startup_failures import GatewaySchemaIncompatibleError
 
 
 def _claim_signing_key_fd() -> int:
@@ -28,6 +30,9 @@ def test_run_gateway_server_uses_ordinary_tcp_server(
     def __init__(self, app: str, **kwargs: object) -> None:
       seen["app"] = app
       seen["config"] = dict(kwargs)
+
+    def load(self) -> None:
+      pass
 
   class _Server:
     def __init__(self, config: _Config) -> None:
@@ -75,6 +80,9 @@ def test_run_gateway_server_supports_tls_serving_shape(
     def __init__(self, app: str, **kwargs: object) -> None:
       seen["app"] = app
       seen["config"] = dict(kwargs)
+
+    def load(self) -> None:
+      pass
 
   class _Server:
     def __init__(self, config: _Config) -> None:
@@ -154,6 +162,92 @@ def test_run_gateway_server_reports_bind_failure(
   assert "failure_class=bind" in failures[0].getMessage()
   assert "exit_code=3" in failures[0].getMessage()
 
+
+@pytest.mark.parametrize(
+  ("startup_failure", "failure_class", "exit_code"),
+  [
+    (
+      GatewaySchemaIncompatibleError("store is behind"),
+      "schema",
+      4,
+    ),
+    (RuntimeError("transient startup failure"), "lifespan", 3),
+  ],
+)
+def test_run_gateway_server_classifies_schema_startup_failure(
+  monkeypatch: pytest.MonkeyPatch,
+  caplog: pytest.LogCaptureFixture,
+  startup_failure: Exception,
+  failure_class: str,
+  exit_code: int,
+) -> None:
+  from contextlib import asynccontextmanager
+  from types import ModuleType
+
+  from starlette.applications import Starlette
+
+  @asynccontextmanager
+  async def lifespan(_app: Starlette):
+    raise startup_failure
+    yield
+
+  module = ModuleType("_gateway_server_startup_failure_app")
+  setattr(module, "app", Starlette(lifespan=lifespan))
+  monkeypatch.setitem(sys.modules, module.__name__, module)
+
+  with pytest.raises(SystemExit) as failure:
+    gateway_server.run_gateway_server(
+      claim_signing_key_fd=None,
+      app=f"{module.__name__}:app",
+      port=0,
+    )
+
+  assert failure.value.code == exit_code
+  failures = [
+    record for record in caplog.records
+    if "event=gateway_launch_failed" in record.getMessage()
+  ]
+  assert len(failures) == 1
+  assert f"failure_class={failure_class}" in failures[0].getMessage()
+  assert f"exit_code={exit_code}" in failures[0].getMessage()
+
+
+def test_schema_failure_is_classified_when_gateway_server_runs_as_main(
+  monkeypatch: pytest.MonkeyPatch,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  # gateway.service runs `python3 -m agent_gateway.gateway_server`, so that module
+  # exists twice (as __main__ and by name); the app raises the class the named
+  # module sees, and the __main__ copy must still classify it as schema / 4.
+  import runpy
+  from contextlib import asynccontextmanager
+  from types import ModuleType
+
+  from starlette.applications import Starlette
+
+  @asynccontextmanager
+  async def lifespan(_app: Starlette):
+    raise GatewaySchemaIncompatibleError("store is behind")
+    yield
+
+  module = ModuleType("_gateway_server_startup_failure_app_main")
+  setattr(module, "app", Starlette(lifespan=lifespan))
+  monkeypatch.setitem(sys.modules, module.__name__, module)
+
+  second_copy = runpy.run_module("agent_gateway.gateway_server", run_name="_gateway_server_second_copy")
+  with pytest.raises(SystemExit) as failure:
+    second_copy["run_gateway_server"](
+      claim_signing_key_fd=None,
+      app=f"{module.__name__}:app",
+      port=0,
+    )
+
+  assert failure.value.code == 4
+  failures = [
+    record for record in caplog.records
+    if "event=gateway_launch_failed" in record.getMessage()
+  ]
+  assert failures and "failure_class=schema" in failures[-1].getMessage()
 
 
 @pytest.mark.parametrize(

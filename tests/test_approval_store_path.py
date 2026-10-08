@@ -123,8 +123,3 @@ def test_gateway_approval_subsystem_uses_configured_campaign_db(
   server_chat_helpers._init_approval_subsystem(app, config)
 
   assert app.state.gateway_approval_store.path == expected
-  # The standing approval preference is approval state: one file beside the
-  # ledger, handed to the one policy every channel shares.
-  assert app.state.gateway_approval_preference_store.path == (
-    user_data_dir / "gateway" / "approval-preferences.sqlite3"
-  )

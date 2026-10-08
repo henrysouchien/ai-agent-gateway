@@ -76,9 +76,11 @@ class CodexProvider(ModelProvider):
     base_url = _config_base_url(config)
     endpoint_url = _resolve_codex_url(base_url)
 
-    client_kwargs: dict[str, Any] = {}
-    effective_timeout = timeout if timeout is not None else 120.0
-    client_kwargs["timeout"] = httpx.Timeout(timeout=effective_timeout, connect=10.0)
+    # No read deadline of the provider's own: a quiet stream is bounded once, by
+    # the runner's stream watchdog (runner_streaming.py); connect stays bounded.
+    client_kwargs: dict[str, Any] = {
+      "timeout": httpx.Timeout(timeout=timeout, connect=10.0),
+    }
     client = httpx.AsyncClient(**client_kwargs)
     self._client_state[client] = {
       "token": token,

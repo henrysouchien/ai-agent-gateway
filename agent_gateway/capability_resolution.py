@@ -447,11 +447,7 @@ def _admitted_catalog_route_views(
   tuple[AdmittedCatalogRoute, ...],
   tuple[CatalogToolEntry, ...],
 ]:
-  ceiling = _WORKSPACE_EFFECT_CEILINGS.get(declaration.workspace_scope)
-  if ceiling is None:
-    raise CapabilityResolutionInputError(
-      f"unknown operation workspace scope: {declaration.workspace_scope}"
-    )
+  ceiling = _WORKSPACE_EFFECT_CEILINGS[declaration.workspace_scope]
   excluded = frozenset(exclusions)
   mcp_ceiling = declaration.mcp_tool_ceiling
   admitted_routes: list[AdmittedCatalogRoute] = []
@@ -564,18 +560,11 @@ def resolve_operation_authority(
     raise CapabilityResolutionInputError(
       "resolve_operation_authority requires a PlatformToolCatalog"
     )
-  try:
-    admitted, admitted_entries = _admitted_catalog_route_views(
-      declaration,
-      catalog=catalog,
-      exclusions=exclusions,
-    )
-  except CapabilityResolutionInputError as exc:
-    return OperationUnavailable(
-      operation_name=declaration.operation_name,
-      code="invalid_metadata",
-      detail=str(exc)[:2_048],
-    )
+  admitted, admitted_entries = _admitted_catalog_route_views(
+    declaration,
+    catalog=catalog,
+    exclusions=exclusions,
+  )
   declared = frozenset(
     requirement.name for requirement in declaration.required_capabilities
   )

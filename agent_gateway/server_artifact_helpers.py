@@ -19,7 +19,6 @@ from .server_models import (
   _AGENT_API_CLAIM_AUDIENCE,
   _AGENT_API_CLAIM_CLOCK_SKEW_SECONDS,
   _AGENT_API_CLAIM_HEADERS,
-  _AGENT_API_CLAIM_MAX_TTL_SECONDS_DEFAULT,
   _AGENT_API_CLAIM_NONCE_HEX_LENGTH,
 )
 
@@ -92,17 +91,6 @@ def _json_dumps(payload: Dict[str, Any]) -> str:
   return bytes(JSONResponse(content=sanitized).body).decode("utf-8")
 
 
-def _claim_ttl_ceiling_seconds() -> int:
-  raw = os.getenv("AGENT_API_CLAIM_MAX_TTL_SECONDS", "").strip()
-  if not raw:
-    return _AGENT_API_CLAIM_MAX_TTL_SECONDS_DEFAULT
-  try:
-    value = int(raw)
-  except ValueError:
-    return _AGENT_API_CLAIM_MAX_TTL_SECONDS_DEFAULT
-  return value if value > 0 else _AGENT_API_CLAIM_MAX_TTL_SECONDS_DEFAULT
-
-
 def _verify_signed_user_claim(request: Request) -> dict[str, Any]:
   claim_headers = _extract_agent_claim_headers(request.headers)
   if claim_headers is None:
@@ -119,10 +107,10 @@ def _verify_signed_user_claim(request: Request) -> dict[str, Any]:
       detail="Agent API signed claim verifier not configured",
     )
 
-  verified = authority.verify_user_claim(
-    claim_headers,
-    ttl_ceiling=_claim_ttl_ceiling_seconds(),
-  )
+  verified = authority.verify_user_claim(claim_headers)
+  # The signed claim is the only proof of which user's artifacts the caller
+  # may read: audience, signature and expiry-vs-now partition artifact reads
+  # by user.
   if verified is None:
     raise HTTPException(status_code=401, detail="Invalid signed user claim")
   return verified
@@ -159,7 +147,6 @@ def _verify_agent_claim_headers(
   hmac_key: str,
   claim_headers: Mapping[str, str],
   *,
-  ttl_ceiling: int,
   now: int | None = None,
 ) -> dict[str, Any] | None:
   if claim_headers.get("audience") != _AGENT_API_CLAIM_AUDIENCE:
@@ -174,8 +161,6 @@ def _verify_agent_claim_headers(
   if issued_at > current_time + _AGENT_API_CLAIM_CLOCK_SKEW_SECONDS:
     return None
   if current_time > expiry:
-    return None
-  if expiry - issued_at > ttl_ceiling:
     return None
 
   user_id = str(claim_headers.get("user_id") or "")
@@ -208,8 +193,6 @@ def _normalize_request_user_id(user_id: str | None) -> str | None:
   normalized = user_id.strip() if isinstance(user_id, str) else user_id
   if normalized == "":
     return None
-  if normalized == "_default":
-    raise MissingUserIdError("user_id '_default' is reserved; supply a stable end-user id.")
   return normalized
 
 

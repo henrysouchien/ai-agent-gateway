@@ -7,7 +7,7 @@ import types
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Literal
+from typing import Any, Callable
 
 import pytest
 
@@ -36,13 +36,10 @@ from agent_gateway.batch_approval_projection import (  # noqa: E402
   BatchApprovalScope,
 )
 from agent_gateway.providers.agent_sdk import SDK_PINNED_VERSION  # noqa: E402
-from agent_gateway.runner import (  # noqa: E402
-  _ACTIVE_SKILL_ALLOW_RESULT_KEY,
-  _ACTIVE_SKILL_DENY_RESULT_KEY,
-  _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY,
-)
+from agent_gateway.runner import _ACTIVE_SKILL_ALLOW_RESULT_KEY  # noqa: E402
 from agent_gateway.skill_context import clear_current_skill, current_skill, set_current_skill  # noqa: E402
 from agent_gateway.skill_limits import ActiveSkillAdmission, SkillExecutionLimits  # noqa: E402
+from agent_gateway.single_user_policy import SingleUserApprovalPolicy  # noqa: E402
 from agent_gateway.sdk_runner_stream import ToolCallInfo  # noqa: E402
 from agent_gateway.mcp_client import RegisteredMcpRawPatchAuthorization  # noqa: E402
 from agent_gateway.tool_dispatch_classification import ToolResultSettlement  # noqa: E402
@@ -53,7 +50,7 @@ from gateway_test_support.sdk_capability_execution_test_support import stub_sdk_
 def _skill_admission(name: str) -> ActiveSkillAdmission:
   return ActiveSkillAdmission(
     name,
-    SkillExecutionLimits(None, None, None),
+    SkillExecutionLimits(None),
   )
 
 
@@ -188,7 +185,6 @@ def _make_runner(
   mcp_server_configs: dict[str, Any] | None = None,
   registered_mcp_descriptor_for_sdk_tool: Callable[[str], Any] | None = None,
   prepare_registered_mcp_tool_call_for_sdk_tool: Callable[..., Any] | None = None,
-  registered_approval_overlay: Callable[..., bool] | None = None,
   redact_registered_mcp_tool_input_for_sdk_tool: Callable[..., Any] | None = None,
   settle_registered_mcp_tool_result_for_sdk_tool: Callable[..., Any] | None = None,
   on_tool_result: Any | None = None,
@@ -196,13 +192,33 @@ def _make_runner(
   skill_run_id: str | None = None,
   max_tokens_override: int | None = None,
   api_key: str = "test-secret",
-  approval_lifecycle: Literal["required", "not_required"] = "required",
+  approval_store_path: Path | None = None,
 ) -> AgentSDKRunner:
   if (
     registered_mcp_descriptor_for_sdk_tool is not None
     and redact_registered_mcp_tool_input_for_sdk_tool is None
   ):
     redact_registered_mcp_tool_input_for_sdk_tool = _identity_registered_redaction
+  session = None
+  approval_route = None
+  if approval_store_path is not None:
+    # Only a live order asks; every class these tests call is approved by the
+    # real policy through the durable-local ledger.
+    store = SQLiteApprovalStore(approval_store_path)
+    session = SessionStore(ttl=3600).create_session(
+      api_key_hash="hash",
+      user_id="alice",
+    )
+    approval_route = DurableLocalApprovalRoute(
+      store,
+      SingleUserApprovalPolicy(store=store),
+      session,
+    )
+  route_kwargs: dict[str, Any] = (
+    {}
+    if approval_route is None
+    else {"session": session, "approval_route": approval_route}
+  )
   return AgentSDKRunner(
     event_log=event_log or EventLog(),
     session_id="sess-sdk-enforce",
@@ -221,7 +237,6 @@ def _make_runner(
     prepare_registered_mcp_tool_call_for_sdk_tool=(
       prepare_registered_mcp_tool_call_for_sdk_tool
     ),
-    registered_approval_overlay=registered_approval_overlay,
     redact_registered_mcp_tool_input_for_sdk_tool=(
       redact_registered_mcp_tool_input_for_sdk_tool
     ),
@@ -232,7 +247,7 @@ def _make_runner(
     run_context=run_context,
     skill_run_id=skill_run_id,
     max_tokens_override=max_tokens_override,
-    approval_lifecycle=approval_lifecycle,
+    **route_kwargs,
   )
 
 
@@ -259,13 +274,13 @@ def _seed_tool_call(
   )
 
 
-def test_sdk_runner_unconfigured_lifecycle_denies_without_explicit_opt_in(
+def test_sdk_runner_without_a_decider_refuses_only_a_live_order(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  """S8: an SDK run that reached no local ledger denies; it never fails open.
+  """GA23: with no route, a non-money call is settled; a live order is refused.
 
-  `_make_runner()` supplies no route, so this is the un-configured path: the
-  runner holds `NoApprovalRoute`, no store, no policy and no session.
+  `_make_runner()` supplies no route, so the runner holds `NoApprovalRoute`,
+  no store, no policy and no session.
   """
 
   _install_fake_agent_sdk(monkeypatch)
@@ -275,20 +290,27 @@ def test_sdk_runner_unconfigured_lifecycle_denies_without_explicit_opt_in(
   assert runner._approval_store is None
   assert runner._approval_policy is None
 
-  denied = _run(runner._can_use_tool_callback("file_write", {"path": "x"}, None))
+  allowed = _run(runner._can_use_tool_callback("file_write", {"path": "x"}, None))
+  assert allowed.behavior == "allow"
+
+  monkeypatch.setattr(
+    runner,
+    "_resolve_sdk_approval_identity",
+    lambda _tool_name: ("execute_trade", "irreversible"),
+  )
+  denied = _run(runner._can_use_tool_callback("execute_trade", {"ticker": "MSFT"}, None))
 
   assert denied.behavior == "deny"
   assert "[approval_route_absent]" in denied.message
 
 
-def test_sdk_runner_denies_on_a_route_whose_ledger_it_does_not_own(
+def test_sdk_runner_parent_delegated_non_money_call_reaches_the_class_check(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  """S8, the other half: a live-but-not-local route is still not an allow.
+  """A catalogless non-money call on a parent-delegated route is settled.
 
-  The SDK runtime evaluates policy and writes the ledger in-process, so only a
-  durable-local route configures it. A parent-delegated route is a real route
-  this runtime cannot serve — the honest answer is a refusal, not an allow.
+  The delegated lifecycle applies the class check: everything outside the
+  money boundary runs under the run owner's authority with no card.
   """
 
   _install_fake_agent_sdk(monkeypatch)
@@ -303,23 +325,11 @@ def test_sdk_runner_denies_on_a_route_whose_ledger_it_does_not_own(
     session,
   )
 
-  denied = _run(runner._can_use_tool_callback("file_write", {"path": "x"}, None))
-
-  assert denied.behavior == "deny"
-  assert "[approval_route_absent]" in denied.message
-  assert runner._approval_store is None
-  assert runner._approval_policy is None
-
-
-def test_sdk_runner_explicit_not_required_lifecycle_allows_without_store(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  _install_fake_agent_sdk(monkeypatch)
-  runner = _make_runner(approval_lifecycle="not_required")
-
   allowed = _run(runner._can_use_tool_callback("file_write", {"path": "x"}, None))
 
   assert allowed.behavior == "allow"
+  assert runner._approval_store is None
+  assert runner._approval_policy is None
 
 
 def test_sdk_runner_requires_complete_registered_mcp_owners() -> None:
@@ -330,13 +340,9 @@ def test_sdk_runner_requires_complete_registered_mcp_owners() -> None:
     )
 
 
-def test_sdk_runner_requires_callable_registered_approval_overlay() -> None:
-  with pytest.raises(TypeError, match="registered_approval_overlay"):
-    _make_runner(registered_approval_overlay=object())  # type: ignore[arg-type]
-
-
 def test_sdk_runner_registered_mode_builtin_callback_stays_catalogless(
   monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
 ) -> None:
   _install_fake_agent_sdk(monkeypatch)
 
@@ -354,7 +360,7 @@ def test_sdk_runner_registered_mode_builtin_callback_stays_catalogless(
     registered_mcp_descriptor_for_sdk_tool=descriptor_for,
     prepare_registered_mcp_tool_call_for_sdk_tool=prepare_registered_call,
     settle_registered_mcp_tool_result_for_sdk_tool=_registered_settlement,
-    approval_lifecycle="not_required",
+    approval_store_path=tmp_path / "approvals.sqlite3",
   )
 
   allowed = _run(
@@ -366,6 +372,7 @@ def test_sdk_runner_registered_mode_builtin_callback_stays_catalogless(
 
 def test_sdk_runner_registered_mode_sdk_local_callback_stays_catalogless(
   monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
 ) -> None:
   _install_fake_agent_sdk(monkeypatch)
   local_tool_id = "mcp__gateway-tools__load_tools"
@@ -388,7 +395,7 @@ def test_sdk_runner_registered_mode_sdk_local_callback_stays_catalogless(
     registered_mcp_descriptor_for_sdk_tool=descriptor_for,
     prepare_registered_mcp_tool_call_for_sdk_tool=prepare_registered_call,
     settle_registered_mcp_tool_result_for_sdk_tool=_registered_settlement,
-    approval_lifecycle="not_required",
+    approval_store_path=tmp_path / "approvals.sqlite3",
   )
 
   allowed = _run(
@@ -420,7 +427,6 @@ def test_sdk_registered_read_returns_manager_prepared_input_without_approval(
     _tool_name: str,
     _input: Any,
     scope: object,
-    _overlay: object,
   ) -> Any:
     scopes.append(scope)
     return SimpleNamespace(
@@ -455,43 +461,6 @@ def test_sdk_registered_read_returns_manager_prepared_input_without_approval(
   }]
 
 
-def test_sdk_registered_not_required_lifecycle_returns_prepared_input(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  _install_fake_agent_sdk(monkeypatch)
-  descriptor = SimpleNamespace(
-    identity=SimpleNamespace(logical_name="manage_proxy_cache"),
-    declaration=SimpleNamespace(
-      semantics=SimpleNamespace(effect="portfolio_config")
-    ),
-  )
-  runner = _make_runner(
-    registered_mcp_descriptor_for_sdk_tool=lambda _tool_name: descriptor,
-    prepare_registered_mcp_tool_call_for_sdk_tool=(
-      lambda _tool_name, _input, _scope, _overlay: SimpleNamespace(
-        descriptor=descriptor,
-        prepared_call=PreparedToolCall({"action": "invalidate"}),
-        planning=PlanDecision("none"),
-        prepared_authorization=None,
-        approval_required=True,
-        approval_reuse_key=None,
-      )
-    ),
-    settle_registered_mcp_tool_result_for_sdk_tool=_registered_settlement,
-    approval_lifecycle="not_required",
-  )
-  runner._session = SimpleNamespace(dispatch_scope=None)
-
-  allowed = _run(runner._can_use_tool_callback(
-    "mcp__portfolio-config-mcp__manage_proxy_cache",
-    {"action": "invalidate", "ignored": True},
-    None,
-  ))
-
-  assert allowed.behavior == "allow"
-  assert allowed.updated_input == {"action": "invalidate"}
-
-
 def test_sdk_registered_write_uses_exact_reuse_and_prepared_identity(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -524,7 +493,7 @@ def test_sdk_registered_write_uses_exact_reuse_and_prepared_identity(
   runner = _make_runner(
     registered_mcp_descriptor_for_sdk_tool=lambda _tool_name: descriptor,
     prepare_registered_mcp_tool_call_for_sdk_tool=(
-      lambda _tool_name, _input, _scope, _overlay: SimpleNamespace(
+      lambda _tool_name, _input, _scope: SimpleNamespace(
         descriptor=descriptor,
         prepared_call=PreparedToolCall({"action": "invalidate"}),
         planning=PlanDecision("none"),
@@ -604,7 +573,7 @@ def test_sdk_registered_plan_hands_one_durable_payload_to_same_authorized_ref(
   runner = _make_runner(
     registered_mcp_descriptor_for_sdk_tool=lambda _tool_name: descriptor,
     prepare_registered_mcp_tool_call_for_sdk_tool=(
-      lambda _tool_name, _input, _scope, _overlay: SimpleNamespace(
+      lambda _tool_name, _input, _scope: SimpleNamespace(
         descriptor=descriptor,
         prepared_call=PreparedToolCall(prepared_input),
         planning=PlanDecision("prepared_plan", prepared_plan={"plan": 1}),
@@ -709,6 +678,7 @@ def test_sdk_runner_projects_max_tokens_override_to_pinned_sdk_environment() -> 
 
 def test_sdk_runner_denies_forged_same_server_tool_outside_advertised_stage_scope(
   monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
 ) -> None:
   _install_fake_agent_sdk(monkeypatch)
 
@@ -724,7 +694,7 @@ def test_sdk_runner_denies_forged_same_server_tool_outside_advertised_stage_scop
     mcp_server_configs=_StageMcpConfigs({
       "research-corpus-mcp": {"command": "research-corpus"},
     }),
-    approval_lifecycle="not_required",
+    approval_store_path=tmp_path / "approvals.sqlite3",
   )
 
   allowed = _run(
@@ -747,11 +717,14 @@ def test_sdk_runner_denies_forged_same_server_tool_outside_advertised_stage_scop
   assert "not available in this context" in denied.message
 
 
-def test_sdk_runner_static_disallowed_tool_denied_without_approval(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sdk_runner_static_disallowed_tool_denied_without_approval(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
   state = _install_fake_agent_sdk(monkeypatch)
   runner = _make_runner(
     disallowed_tools=["file_write"],
-    approval_lifecycle="not_required",
+    approval_store_path=tmp_path / "approvals.sqlite3",
   )
 
   _run(runner.run([{"role": "user", "content": "hello"}]))
@@ -771,6 +744,7 @@ def test_sdk_runner_static_disallowed_tool_denied_without_approval(monkeypatch: 
 
 def test_sdk_runner_executes_report_admission_with_same_carried_run_identity(
   monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
 ) -> None:
   state = _install_fake_agent_sdk(monkeypatch)
   run_context = RunContext(
@@ -782,7 +756,7 @@ def test_sdk_runner_executes_report_admission_with_same_carried_run_identity(
   runner = _make_runner(
     run_context=run_context,
     skill_run_id="skill-run-sdk-report",
-    approval_lifecycle="not_required",
+    approval_store_path=tmp_path / "approvals.sqlite3",
   )
 
   _run(runner.run([{"role": "user", "content": "report the build"}]))
@@ -806,87 +780,6 @@ def test_sdk_runner_report_admission_fails_closed_without_carrier(
   assert decision.behavior == "deny"
   assert "[run_identity_required]" in decision.message
 
-
-def test_sdk_runner_stale_prefixed_mcp_tool_denied_without_approval(monkeypatch: pytest.MonkeyPatch) -> None:
-  _install_fake_agent_sdk(monkeypatch)
-  from agent_gateway import policy_imports
-
-  monkeypatch.setattr(
-    policy_imports,
-    "_server_policy",
-    SimpleNamespace(
-      get_forbidden_tools_for_session=lambda _session: frozenset(),
-      get_server_for_policy_tool=lambda name: (
-        "portfolio-trades-mcp" if name == "execute_trade" else None
-      ),
-    ),
-  )
-  runner = _make_runner()
-
-  denied = _run(
-    runner._can_use_tool_callback(
-      "mcp__portfolio-reads-mcp__execute_trade",
-      {"preview_id": "p1"},
-      None,
-    )
-  )
-
-  assert denied.behavior == "deny"
-  assert "policy owner for 'execute_trade' is 'portfolio-trades-mcp'" in denied.message
-
-
-
-
-
-
-def test_sdk_approval_refuses_inline_limit_mismatch_before_policy(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  _install_fake_agent_sdk(monkeypatch)
-  policy_calls: list[bool] = []
-
-  class Policy:
-    async def decide(self, **_kwargs: Any) -> PolicyApprovalDecision:
-      policy_calls.append(True)
-      raise AssertionError("mismatched admission must precede policy")
-
-  runner = _make_runner(
-    run_context=RunContext(
-      user_id="alice",
-      request_id="request-1",
-      skill="quant-research",
-      admitted_skill_execution_limits=SkillExecutionLimits(
-        20,
-        32_000,
-        20.0,
-      ),
-    )
-  )
-  runner._session = SessionStore(ttl=3600).create_session(
-    api_key_hash="hash",
-    user_id="alice",
-  )
-  runner._approval_route = DurableLocalApprovalRoute(
-    object(),
-    Policy(),
-    runner._session,
-  )
-  token = set_current_skill(ActiveSkillAdmission(
-    "quant-research",
-    SkillExecutionLimits(19, 32_000, 20.0),
-  ))
-  try:
-    denied = _run(
-      runner._can_use_tool_callback("file_write", {"path": "x"}, None)
-    )
-  finally:
-    from agent_gateway.skill_context import reset_current_skill
-
-    reset_current_skill(token)
-
-  assert denied.behavior == "deny"
-  assert "[skill_admission_mismatch]" in denied.message
-  assert policy_calls == []
 
 
 def test_sdk_runner_user_denial_uses_ordinary_message(
@@ -1541,7 +1434,7 @@ def test_sdk_runner_trade_approval_record_includes_preview_summary(
         lambda _tool_name: descriptor
       ),
       prepare_registered_mcp_tool_call_for_sdk_tool=(
-        lambda _tool_name, tool_input, _scope, _overlay: SimpleNamespace(
+        lambda _tool_name, tool_input, _scope: SimpleNamespace(
           descriptor=descriptor,
           prepared_call=PreparedToolCall(tool_input),
           planning=PlanDecision("none"),
@@ -1611,8 +1504,9 @@ def test_sdk_runner_trade_approval_record_includes_preview_summary(
   _run(_case())
 
 
-def test_sdk_runner_opted_in_skill_result_activates_exact_allow_and_write_deny(
+def test_sdk_runner_opted_in_skill_result_activates_exact_allow(
   monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
 ) -> None:
   _install_fake_agent_sdk(monkeypatch)
   contexts = []
@@ -1624,13 +1518,12 @@ def test_sdk_runner_opted_in_skill_result_activates_exact_allow_and_write_deny(
   runner = _make_runner(
     on_tool_result=_on_tool_result,
     disallowed_tools=["start_investment_run"],
-    approval_lifecycle="not_required",
+    approval_store_path=tmp_path / "approvals.sqlite3",
   )
   result = {
     "skill": "phase0-agent",
     "content": "Do the work.",
     _ACTIVE_SKILL_ALLOW_RESULT_KEY: ["start_investment_run"],
-    _ACTIVE_SKILL_DENY_RESULT_KEY: ["file_write"],
   }
   _seed_tool_call(
     runner,
@@ -1657,32 +1550,26 @@ def test_sdk_runner_opted_in_skill_result_activates_exact_allow_and_write_deny(
     "content": "Do the work.",
   }
   assert _ACTIVE_SKILL_ALLOW_RESULT_KEY not in json.dumps(hook_result)
-  assert _ACTIVE_SKILL_DENY_RESULT_KEY not in json.dumps(hook_result)
   assert runner._active_skill_allow == {"start_investment_run"}
-  assert runner._active_skill_deny == {"file_write"}
   assert contexts[0].result == {"skill": "phase0-agent", "content": "Do the work."}
   assert _ACTIVE_SKILL_ALLOW_RESULT_KEY not in contexts[0].result
-  assert _ACTIVE_SKILL_DENY_RESULT_KEY not in contexts[0].result
 
   allowed = _run(runner._can_use_tool_callback("start_investment_run", {}, None))
   assert allowed.behavior == "allow"
 
-  denied = _run(runner._can_use_tool_callback("file_write", {"path": "x"}, None))
-  assert denied.behavior == "deny"
-  assert denied.message == "Tool 'file_write' is not available in this context"
-
-  runner._activate_skill_deny(["start_investment_run"])
-  denied_again = _run(runner._can_use_tool_callback("start_investment_run", {}, None))
-  assert denied_again.behavior == "deny"
+  # A skill no longer subtracts tools: an unlisted tool keeps the run's surface.
+  file_write = _run(runner._can_use_tool_callback("file_write", {"path": "x"}, None))
+  assert file_write.behavior == "allow"
 
 
 def test_sdk_runner_legacy_skill_result_does_not_activate_active_skill_gate(
   monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
 ) -> None:
   _install_fake_agent_sdk(monkeypatch)
   runner = _make_runner(
     disallowed_tools=["run_bash"],
-    approval_lifecycle="not_required",
+    approval_store_path=tmp_path / "approvals.sqlite3",
   )
 
   result = {"skill": "legacy-agent", "content": "Legacy skill body."}
@@ -1705,7 +1592,7 @@ def test_sdk_runner_legacy_skill_result_does_not_activate_active_skill_gate(
   )
 
   assert hook_result == {}
-  assert runner._active_skill_deny == set()
+  assert runner._active_skill_allow == set()
 
   static_denied = _run(runner._can_use_tool_callback("run_bash", {"command": "date"}, None))
   assert static_denied.behavior == "deny"
@@ -1721,7 +1608,6 @@ def test_sdk_runner_foreign_result_cannot_activate_active_skill_gate(
   _install_fake_agent_sdk(monkeypatch)
   runner = _make_runner(
     disallowed_tools=["start_investment_run"],
-    approval_lifecycle="not_required",
   )
   _seed_tool_call(
     runner,
@@ -1738,10 +1624,6 @@ def test_sdk_runner_foreign_result_cannot_activate_active_skill_gate(
         "result": json.dumps({
           "status": "ok",
           _ACTIVE_SKILL_ALLOW_RESULT_KEY: ["start_investment_run"],
-          _ACTIVE_SKILL_DENY_RESULT_KEY: ["file_write"],
-          _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY: {
-            "fms_report_sniff_test": "sniff-test",
-          },
         }),
       },
       "tool-foreign",
@@ -1750,164 +1632,16 @@ def test_sdk_runner_foreign_result_cannot_activate_active_skill_gate(
   )
 
   assert runner._active_skill_allow == set()
-  assert runner._active_skill_deny == set()
-  assert runner._active_skill_report_doors == {}
   assert hook_result["hookSpecificOutput"]["updatedMCPToolOutput"] == {
     "status": "ok",
   }
   assert "continue_" not in hook_result
 
 
-def test_sdk_runner_active_skill_deny_replaces_existing_set(monkeypatch: pytest.MonkeyPatch) -> None:
-  _install_fake_agent_sdk(monkeypatch)
-  runner = _make_runner()
-  runner._active_skill_deny = {"file_write", "run_bash"}
-
-  runner._activate_skill_deny(["file_write"])
-
-  assert runner._active_skill_deny == {"file_write"}
-
-  runner._activate_skill_deny([])
-
-  assert runner._active_skill_deny == set()
-
-
-def test_sdk_runner_report_door_clears_active_skill_gate(monkeypatch: pytest.MonkeyPatch) -> None:
-  _install_fake_agent_sdk(monkeypatch)
-  runner = _make_runner()
-  runner._active_skill_deny = {"emit_canvas_artifact"}
-  set_current_skill(_skill_admission("sniff-test"))
-
-  try:
-    invoke_result = {
-      "skill": "sniff-test",
-      "content": "Do the sniff test.",
-      _ACTIVE_SKILL_DENY_RESULT_KEY: ["emit_canvas_artifact"],
-      _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY: {"fms_report_sniff_test": "sniff-test"},
-    }
-    stripped = runner._consume_private_tool_result_fields(
-      invoke_result,
-      tool_name="invoke_skill",
-    )
-    assert stripped == {"skill": "sniff-test", "content": "Do the sniff test."}
-    assert runner._active_skill_deny == {"emit_canvas_artifact"}
-    assert runner._active_skill_report_doors == {"fms_report_sniff_test": "sniff-test"}
-
-    result = {
-      "status": "staged",
-      "subcommand": "report_sniff_test",
-      "mutation_mode": "preview",
-    }
-    runner._clear_active_skill_if_report_door_completed(
-      tool_name="fms_report_sniff_test",
-      result=result,
-      error=None,
-    )
-
-    assert runner._active_skill_deny == set()
-    assert current_skill() is None
-  finally:
-    clear_current_skill()
-
-
-def test_sdk_runner_model_writer_terminal_door_clears_build_model_deny(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  _install_fake_agent_sdk(monkeypatch)
-  runner = _make_runner(approval_lifecycle="not_required")
-  runner._active_skill_deny = {"build_model"}
-  runner._active_skill_report_doors = {"fms_persist_business_model": "business-model-construction"}
-  set_current_skill(_skill_admission("business-model-construction"))
-
-  try:
-    denied = _run(runner._can_use_tool_callback("build_model", {}, None))
-    assert denied.behavior == "deny"
-
-    cleared = runner._clear_active_skill_if_report_door_completed(
-      tool_name="fms_persist_business_model",
-      result={
-        "status": "staged",
-        "subcommand": "persist_business_model",
-        "mutation_mode": "model_writer",
-      },
-      error=None,
-    )
-
-    assert cleared is True
-    assert runner._active_skill_deny == set()
-    assert runner._active_skill_report_doors == {}
-    assert current_skill() is None
-
-    allowed = _run(runner._can_use_tool_callback("build_model", {}, None))
-    assert allowed.behavior == "allow"
-  finally:
-    clear_current_skill()
-
-
-def test_sdk_runner_model_writer_mid_skill_build_model_deny_holds(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  _install_fake_agent_sdk(monkeypatch)
-  runner = _make_runner()
-  runner._active_skill_deny = {"build_model"}
-  runner._active_skill_report_doors = {"fms_persist_business_model": "business-model-construction"}
-  set_current_skill(_skill_admission("business-model-construction"))
-
-  try:
-    denied = _run(runner._can_use_tool_callback("build_model", {}, None))
-    assert denied.behavior == "deny"
-
-    cleared = runner._clear_active_skill_if_report_door_completed(
-      tool_name="fms_report_build_model",
-      result={
-        "status": "staged",
-        "subcommand": "report_build_model",
-        "mutation_mode": "preview",
-      },
-      error=None,
-    )
-
-    assert cleared is False
-    assert runner._active_skill_deny == {"build_model"}
-    assert runner._active_skill_report_doors == {"fms_persist_business_model": "business-model-construction"}
-    assert current_skill() == "business-model-construction"
-  finally:
-    clear_current_skill()
-
-
-def test_sdk_runner_report_door_semantic_error_does_not_clear_active_skill_gate(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  _install_fake_agent_sdk(monkeypatch)
-  runner = _make_runner()
-  runner._active_skill_deny = {"emit_canvas_artifact"}
-  runner._active_skill_report_doors = {"fms_report_sniff_test": "sniff-test"}
-  set_current_skill(_skill_admission("sniff-test"))
-
-  try:
-    cleared = runner._clear_active_skill_if_report_door_completed(
-      tool_name="fms_report_sniff_test",
-      result={
-        "status": "error",
-        "subcommand": "report_sniff_test",
-        "mutation_mode": "preview",
-        "message": "judgment rejected",
-      },
-      error=None,
-    )
-
-    assert cleared is False
-    assert runner._active_skill_deny == {"emit_canvas_artifact"}
-    assert runner._active_skill_report_doors == {"fms_report_sniff_test": "sniff-test"}
-    assert current_skill() == "sniff-test"
-  finally:
-    clear_current_skill()
-
-
-def test_sdk_runner_active_skill_deny_clears_on_success_and_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sdk_runner_active_skill_allow_clears_on_success_and_error(monkeypatch: pytest.MonkeyPatch) -> None:
   _install_fake_agent_sdk(monkeypatch)
   success_runner = _make_runner()
-  success_runner._active_skill_deny.add("file_write")
+  success_runner._active_skill_allow.add("file_write")
 
   async def _run_success() -> None:
     set_current_skill(_skill_admission("phase0-agent"))
@@ -1915,14 +1649,14 @@ def test_sdk_runner_active_skill_deny_clears_on_success_and_error(monkeypatch: p
     assert current_skill() is None
 
   _run(_run_success())
-  assert success_runner._active_skill_deny == set()
+  assert success_runner._active_skill_allow == set()
 
   _install_fake_agent_sdk(
     monkeypatch,
     iterator_factory=lambda _prompt, _options: _AsyncMessages([RuntimeError("sdk failed")]),
   )
   error_runner = _make_runner()
-  error_runner._active_skill_deny.add("file_write")
+  error_runner._active_skill_allow.add("file_write")
 
   async def _run_error() -> None:
     set_current_skill(_skill_admission("phase0-agent"))
@@ -1931,4 +1665,4 @@ def test_sdk_runner_active_skill_deny_clears_on_success_and_error(monkeypatch: p
     assert current_skill() is None
 
   _run(_run_error())
-  assert error_runner._active_skill_deny == set()
+  assert error_runner._active_skill_allow == set()

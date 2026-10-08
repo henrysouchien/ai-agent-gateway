@@ -61,7 +61,7 @@ def _run_record(
     owner_lease_inode=manifest["owner_lease_inode"],
     started_at=1784980000,
     skill_resume_allowed=False,
-    admitted_skill_execution_limits=SkillExecutionLimits(None, None, None),
+    admitted_skill_execution_limits=SkillExecutionLimits(None),
     state=state,
     completed_at=completed_at,
     exit_code=exit_code,

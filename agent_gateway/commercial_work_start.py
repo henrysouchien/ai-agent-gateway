@@ -73,7 +73,12 @@ def require_commercial_child_provider(
   work_start: CommercialWorkStartContext | None,
   provider: str | None,
 ) -> None:
-  """Bind delegated provider work to the root authorization before dispatch."""
+  """Bind delegated provider work to the root authorization before dispatch.
+
+  Money: the child resolves its own provider bind, which the root
+  authorization's request-path provider check never sees, and a child on
+  another provider would spend under a funding route authorized for one.
+  """
   if work_start is None:
     return
   if not isinstance(work_start, CommercialWorkStartContext):
@@ -92,7 +97,9 @@ def require_commercial_child_provider(
   if resolved_provider != work_start.authorization.provider:
     raise CommercialWorkStartError(
       "commercial_child_provider_mismatch",
-      "Commercial child provider differs from authorized work.",
+      "Commercial child provider differs from authorized work: bind the "
+      f"child to {work_start.authorization.provider!r} or start it under a "
+      f"work authorization for {resolved_provider!r}.",
       status_code=403,
     )
 
@@ -139,17 +146,12 @@ class CommercialWorkStartGate:
     request: Any,
     channel: str | None,
   ) -> PendingCommercialWorkStart | None:
+    if not self.enabled:
+      # Headers carry no spend authority on their own: without a gate that
+      # verifies them the work runs on the session's own credentials.
+      return None
     claim_token = headers.get(COMMERCIAL_CLAIM_HEADER)
     authorization_token = headers.get(COMMERCIAL_WORK_AUTHORIZATION_HEADER)
-    has_commercial_header = claim_token is not None or authorization_token is not None
-    if not self.enabled:
-      if has_commercial_header:
-        raise CommercialWorkStartError(
-          "commercial_work_start_disabled",
-          "Commercial work-start authorization is disabled.",
-          status_code=403,
-        )
-      return None
     if not claim_token or not authorization_token:
       raise CommercialWorkStartError(
         "commercial_work_authority_required",
@@ -188,7 +190,7 @@ class CommercialWorkStartGate:
     except CommercialClaimError as exc:
       raise CommercialWorkStartError(
         "commercial_work_authority_invalid",
-        "Commercial work-start authority is invalid or expired.",
+        f"Commercial work-start claim was refused by its verifier: {exc.code}.",
         status_code=403,
       ) from exc
     owner_user_id = str(getattr(session, "owner_user_id", "") or "").strip()
@@ -216,7 +218,8 @@ class CommercialWorkStartGate:
     except WorkAuthorizationError as exc:
       raise CommercialWorkStartError(
         "commercial_work_authority_invalid",
-        "Commercial work-start authority is invalid or expired.",
+        "Commercial work-start authorization was refused by its verifier: "
+        f"{exc.code}.",
         status_code=403,
       ) from exc
     return PendingCommercialWorkStart(

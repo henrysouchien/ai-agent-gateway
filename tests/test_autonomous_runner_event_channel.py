@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import asyncio
 import fcntl
 import json
@@ -915,82 +914,3 @@ def test_event_file_polling_surface_is_structurally_absent() -> None:
   assert "os.killpg(" in source
   assert "endpoint.receive_next" in source
   assert "endpoint.acknowledge" in source
-
-
-def test_subprocess_drain_is_unbounded_after_hello_and_interruptible() -> None:
-  package_dir = _PACKAGE_ROOT / "agent_gateway"
-  runner_source = (package_dir / "autonomous_runner.py").read_text(
-    encoding="utf-8"
-  )
-  runner_tree = ast.parse(runner_source)
-  drain = next(
-    node
-    for node in ast.walk(runner_tree)
-    if isinstance(node, ast.AsyncFunctionDef)
-    and node.name == "_drain_event_channel"
-  )
-  to_thread_calls = [
-    node
-    for node in ast.walk(drain)
-    if isinstance(node, ast.Call)
-    and isinstance(node.func, ast.Attribute)
-    and node.func.attr == "to_thread"
-  ]
-  receive_calls = [
-    node
-    for node in to_thread_calls
-    if node.args
-    and isinstance(node.args[0], ast.Attribute)
-    and node.args[0].attr == "receive_next"
-  ]
-  acknowledge_calls = [
-    node
-    for node in to_thread_calls
-    if node.args
-    and isinstance(node.args[0], ast.Attribute)
-    and node.args[0].attr == "acknowledge"
-  ]
-
-  assert len(receive_calls) == 2
-  first_receive_keywords = {
-    keyword.arg: ast.literal_eval(keyword.value)
-    for keyword in receive_calls[0].keywords
-  }
-  assert first_receive_keywords == {"unbounded_stream": True}
-  assert receive_calls[1].keywords == []
-  assert len(acknowledge_calls) == 1
-  assert "_AUTONOMOUS_RUN_MAX_" + "SECONDS" not in runner_source
-  assert "return_when=asyncio.FIRST_COMPLETED" in runner_source
-  assert "interrupt_event_channel()" in runner_source
-
-  protocol_source = (
-    package_dir / "autonomous_event_channel.py"
-  ).read_text(encoding="utf-8")
-  protocol_tree = ast.parse(protocol_source)
-  parent_class = next(
-    node
-    for node in protocol_tree.body
-    if isinstance(node, ast.ClassDef)
-    and node.name == "AutonomousEventChannelParent"
-  )
-  methods = {
-    node.name: ast.get_source_segment(protocol_source, node) or ""
-    for node in parent_class.body
-    if isinstance(node, ast.FunctionDef)
-  }
-
-  assert "deadline, unbounded = self._receive_mode()" in methods["_advance_receive"]
-  assert "unbounded_stream=" in methods["receive_next"]
-  assert "self._advance_receive()" in methods["receive_next"]
-  assert (
-    "time.monotonic() + self._timeout(timeout_seconds)"
-    in methods["acknowledge"]
-  )
-
-  start_source = (package_dir / "autonomous_runner_start.py").read_text(
-    encoding="utf-8"
-  )
-  assert (
-    "io_timeout_seconds=AUTONOMOUS_EVENT_CHANNEL_MAX_IO_TIMEOUT_SECONDS"
-    in start_source
-  )

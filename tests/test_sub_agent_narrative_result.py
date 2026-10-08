@@ -14,6 +14,7 @@ from agent_workflow_contracts import (
   ContractRef,
   OrdinaryDelegationTaskRef,
   OutcomeRequirement,
+  ProjectionInline,
   ResultRequirement,
   TaskResultProvenance,
   ToolGrant,
@@ -24,6 +25,10 @@ from agent_workflow_contracts import (
 from model_authority.bind import CapabilityBind
 
 from agent_gateway.final_narrative_artifact import read_final_narrative
+from agent_gateway.runner_background_tasks import (
+  build_agent_completion_envelope,
+  ordinary_parent_result_policy,
+)
 from agent_gateway.sub_agent import _ordinary_admitted_task_factory
 from agent_gateway.sub_agent_narrative_result import (
   final_child_visible_text,
@@ -463,81 +468,66 @@ async def _narrative(tmp_path, text: str = "Partial but real answer."):
   return visible.final_narrative
 
 
+_STEER_EVENT = {"type": "soft_budget_steer", "kind": "turns", "observed": 3, "threshold": 3}
+_FINAL_EVENT = {"type": "soft_budget_final", "kind": "turns", "observed": 5, "threshold": 3}
+_STREAM_COMPLETE_EVENT = {
+  "type": "stream_complete",
+  "usage": {"input_tokens": 40, "output_tokens": 20},
+}
+
+
 @pytest.mark.asyncio
-async def test_turns_exhausted_with_narrative_settles_succeeded_and_partial(
+async def test_forced_final_answer_settles_as_an_ordinary_completed_result(
   tmp_path,
 ) -> None:
-  # B-3 (design §4.5): a child that hit its turn ceiling and still published a
-  # durable terminal narrative did real work. The discard branch is gone.
+  # The soft-budget ladder's steer and forced final are not settlement
+  # classes: a child that answered after them settles exactly like one that
+  # never met the ladder, and its usage rides the result.
   logical, attempt, provenance = _task_identity()
+  narrative = await _narrative(tmp_path)
 
-  result = task_result_from_execution(
-    ({"type": "max_turns_reached", "turn_count": 4, "max_turns": 3},),
-    logical_task=logical,
-    attempt=attempt,
-    requirement=_narrative_requirement(),
-    provenance=provenance,
-    final_narrative=await _narrative(tmp_path),
-    stalled=False,
-    admitted_task=_admitted_task(),
-  )
+  def settle(events):
+    return task_result_from_execution(
+      events,
+      logical_task=logical,
+      attempt=attempt,
+      requirement=_narrative_requirement(),
+      provenance=provenance,
+      final_narrative=narrative,
+      stalled=False,
+      admitted_task=_admitted_task(),
+    )
 
-  assert result.execution.status == "succeeded"
-  # ExecutionSettlement forbids a terminal_reason on succeeded: the exhaustion
-  # fact rides the outcome instead.
-  assert result.execution.terminal_reason is None
-  assert result.outcome is not None
-  assert result.outcome.disposition == "partial"
-  assert result.outcome.assessment_source == "mechanically_derived"
-  assert result.outcome.unmet_requirements == ("turns_exhausted",)
-  assert result.values.terminal_narrative is not None
+  laddered = settle((_STEER_EVENT, _FINAL_EVENT, _STREAM_COMPLETE_EVENT))
+  plain = settle((_STREAM_COMPLETE_EVENT,))
 
-
-@pytest.mark.asyncio
-async def test_budget_ceiling_with_narrative_settles_succeeded_and_partial(
-  tmp_path,
-) -> None:
-  # A budget ceiling is a cap the operation declared for itself, exactly like
-  # the turn ceiling: a child that reached it and still published a durable
-  # terminal narrative did real work the parent can consume.
-  logical, attempt, provenance = _task_identity()
-
-  result = task_result_from_execution(
-    ({"type": "budget_exceeded", "total_cost": 2.0, "budget": 2.0},),
-    logical_task=logical,
-    attempt=attempt,
-    requirement=_narrative_requirement(),
-    provenance=provenance,
-    final_narrative=await _narrative(tmp_path),
-    stalled=False,
-    admitted_task=_admitted_task(),
-  )
-
-  assert result.execution.status == "succeeded"
-  assert result.execution.terminal_reason is None
-  assert result.outcome is not None
-  assert result.outcome.disposition == "partial"
-  assert result.outcome.unmet_requirements == ("budget_exhausted",)
-  assert result.values.terminal_narrative is not None
+  assert laddered.execution.status == "succeeded"
+  assert laddered.execution.terminal_reason is None
+  assert laddered.values.terminal_narrative is not None
+  assert laddered.outcome == plain.outcome
+  assert laddered.observation.usage.input_tokens == 40
+  assert laddered.observation.usage.output_tokens == 20
 
 
 @pytest.mark.asyncio
-async def test_parent_budget_stop_is_not_the_child_s_declared_ceiling(
+async def test_soft_budget_abort_settles_failed_with_its_terminal_reason(
   tmp_path,
 ) -> None:
-  # The parent's cap stopping a child is not a ceiling the child's operation
-  # declared: settling it succeeded/partial told status-keyed consumers (the
-  # workflow scheduler) that a node the parent killed had succeeded.
   logical, attempt, provenance = _task_identity()
 
   result = task_result_from_execution(
     (
+      _STEER_EVENT,
+      _FINAL_EVENT,
       {
-        "type": "budget_exceeded",
-        "total_cost": 0.4,
-        "budget": 0.5,
-        "reason": "parent_budget",
+        "type": "interrupted",
+        "reason": "soft_budget_abort",
+        "kind": "turns",
+        "observed": 7,
+        "threshold": 3,
+        "grace_turns": 2,
       },
+      _STREAM_COMPLETE_EVENT,
     ),
     logical_task=logical,
     attempt=attempt,
@@ -549,39 +539,20 @@ async def test_parent_budget_stop_is_not_the_child_s_declared_ceiling(
   )
 
   assert result.execution.status == "failed"
-  assert result.execution.terminal_reason == "budget_exhausted"
-
-
-def test_turns_exhausted_without_narrative_still_fails() -> None:
-  logical, attempt, provenance = _task_identity()
-
-  result = task_result_from_execution(
-    ({"type": "max_turns_reached", "turn_count": 4, "max_turns": 3},),
-    logical_task=logical,
-    attempt=attempt,
-    requirement=_narrative_requirement(),
-    provenance=provenance,
-    final_narrative=None,
-    stalled=False,
-    admitted_task=_admitted_task(),
-  )
-
-  assert result.execution.status == "failed"
-  assert result.execution.terminal_reason == "turns_exhausted"
+  assert result.execution.terminal_reason == "soft_budget_abort"
   assert result.outcome is None
   assert result.values.terminal_narrative is None
+  assert result.observation.usage.input_tokens == 40
 
 
 @pytest.mark.asyncio
-async def test_turns_exhausted_beside_another_signal_keeps_failing(
+async def test_soft_budget_abort_beside_a_harder_signal_keeps_its_precedence(
   tmp_path,
 ) -> None:
-  # The remap fires only when exhaustion is the SOLE terminal signal; the
-  # precedence tuple already orders the harder failures ahead of it.
   logical, attempt, provenance = _task_identity()
 
   result = task_result_from_execution(
-    ({"type": "max_turns_reached", "turn_count": 4, "max_turns": 3},),
+    ({"type": "interrupted", "reason": "soft_budget_abort"},),
     logical_task=logical,
     attempt=attempt,
     requirement=_narrative_requirement(),
@@ -597,6 +568,34 @@ async def test_turns_exhausted_beside_another_signal_keeps_failing(
   assert result.outcome is None
   assert result.values.terminal_narrative is None
 
+
+@pytest.mark.asyncio
+async def test_unadmitted_evidence_is_a_recorded_gap_not_a_failed_child(
+  tmp_path,
+) -> None:
+  # GC58: usage evidence that cannot be merged is not kept, but the child's
+  # own answer still settles; the gap rides the mechanical outcome.
+  logical, attempt, provenance = _task_identity()
+
+  result = task_result_from_execution(
+    (
+      {"type": "turn_complete", "usage": {"counter": 10**4000}},
+      {"type": "turn_complete", "usage": {"counter": 1.0}},
+    ),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=await _narrative(tmp_path),
+    stalled=False,
+    admitted_task=_admitted_task(),
+  )
+
+  assert result.execution.status == "succeeded"
+  assert result.values.terminal_narrative is not None
+  assert result.outcome is not None
+  assert result.outcome.disposition == "partial"
+  assert result.outcome.unmet_requirements == ("child_evidence",)
 
 _REFUSAL_EVENT = {
   "type": "refusal",
@@ -779,7 +778,7 @@ async def test_terminal_tool_success_projects_exact_result_without_narrative(
         "error": None,
         "semantic_error": None,
       },
-      {"type": "budget_exceeded", "reason": "post_tool_budget"},
+      {"type": "interrupted", "reason": "soft_budget_abort"},
     ),
     logical_task=logical,
     attempt=attempt,
@@ -800,7 +799,7 @@ async def test_terminal_tool_success_projects_exact_result_without_narrative(
 
 
 @pytest.mark.asyncio
-async def test_named_operation_without_terminal_door_does_not_succeed(
+async def test_named_operation_without_terminal_door_settles_on_its_narrative(
   tmp_path,
 ) -> None:
   logical, attempt, provenance = _task_identity()
@@ -824,7 +823,7 @@ async def test_named_operation_without_terminal_door_does_not_succeed(
     attempt=attempt,
     requirement=_narrative_requirement(),
     provenance=provenance,
-    final_narrative=await _narrative(tmp_path, "STATUS: BLOCKED"),
+    final_narrative=await _narrative(tmp_path, "Prepared; the build is next."),
     stalled=False,
     admitted_task=_admitted_task(tool_ids=(
       "prepare_model_build",
@@ -833,48 +832,148 @@ async def test_named_operation_without_terminal_door_does_not_succeed(
     )),
   )
 
-  assert result.execution.status != "succeeded"
-  assert result.outcome is not None
-  assert result.outcome.disposition == "blocked"
-  assert result.outcome.assessment_source == "mechanically_derived"
+  assert result.execution.status == "succeeded"
+  assert result.execution.terminal_reason is None
   assert result.values.terminal_narrative is not None
+  assert result.values.projection is None
+  assert result.evidence.tools_used == (
+    "prepare_model_build",
+    "list_research_files",
+  )
+  assert result.outcome is not None
+  assert result.outcome.disposition != "blocked"
 
 
 @pytest.mark.asyncio
-async def test_named_operation_terminal_stop_is_not_succeeded(
+async def test_terminal_door_stop_is_the_child_result(tmp_path) -> None:
+  logical, attempt, provenance = _task_identity()
+  door = "fms_persist_postcompile_valuation"
+  door_result = {
+    "subcommand": "persist_postcompile_valuation",
+    "mutation_mode": "model_writer",
+    "status": "error",
+    "gate_code": "STOP",
+    "error": {
+      "type": "INVALID_JUDGMENT",
+      "message": "postcompile-valuation persistence requires the active research file",
+    },
+  }
+
+  result = task_result_from_execution(
+    (
+      {"type": "tool_call_start", "tool_name": door},
+      {"type": "tool_call_complete", "tool_name": door, "result": door_result},
+    ),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=await _narrative(tmp_path, "The persist door refused."),
+    stalled=False,
+    admitted_task=_admitted_task(tool_ids=(door,)),
+  )
+
+  assert result.execution.status == "succeeded"
+  assert result.values.projection is not None
+  assert result.values.projection.inline_view == {
+    "tool_name": door,
+    "result": door_result,
+  }
+  assert result.execution.terminal_reason is None
+  # The refusal is the row's outcome: a workflow consumer reading the
+  # settlement does not read a refused door as a completed stage.
+  assert result.outcome is not None
+  assert result.outcome.disposition == "blocked"
+  assert result.outcome.unmet_requirements == (door,)
+
+
+_CONTEXT_DOOR = "get_postcompile_valuation_context"
+_CONTEXT_REFUSAL = {
+  "status": "error",
+  "error_type": "postcompile_model_version_not_ready",
+  "error": "the model version has no accepted valuation policy",
+  "next_call": {
+    "tool_name": "get_valuation_policy_context",
+    "arguments": {"research_file_id": 1},
+  },
+}
+
+
+def _context_read_event(result: dict[str, object]) -> dict[str, object]:
+  return {
+    "type": "tool_call_complete",
+    "tool_name": _CONTEXT_DOOR,
+    "result": result,
+    "dispatch": {"outcome": "ok"},
+  }
+
+
+@pytest.mark.asyncio
+async def test_context_door_refusal_reaches_the_parent_verbatim(tmp_path) -> None:
+  logical, attempt, provenance = _task_identity()
+
+  result = task_result_from_execution(
+    (
+      {"type": "tool_call_start", "tool_name": _CONTEXT_DOOR},
+      _context_read_event(_CONTEXT_REFUSAL),
+    ),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=await _narrative(tmp_path, "The context door refused."),
+    stalled=False,
+    admitted_task=_admitted_task(tool_ids=(
+      _CONTEXT_DOOR,
+      "fms_persist_postcompile_valuation",
+    )),
+  )
+
+  assert result.execution.status == "succeeded"
+  assert result.execution.terminal_reason is None
+  assert result.outcome is not None
+  assert result.outcome.disposition == "blocked"
+  assert result.outcome.unmet_requirements == (_CONTEXT_DOOR,)
+  envelope = build_agent_completion_envelope(
+    result,
+    policy=ordinary_parent_result_policy(result),
+    terminal_narrative_reader=lambda _result: pytest.fail("narrative read"),
+    read_grant_factory=lambda _source: pytest.fail("handle minted"),
+  )
+  materialization = envelope.parent_materialization
+  assert isinstance(materialization, ProjectionInline)
+  assert materialization.value == {
+    "tool_name": _CONTEXT_DOOR,
+    "result": _CONTEXT_REFUSAL,
+  }
+  assert envelope.settlement_projection.execution_status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_context_refusal_superseded_by_an_accepted_read_keeps_the_narrative(
   tmp_path,
 ) -> None:
   logical, attempt, provenance = _task_identity()
 
   result = task_result_from_execution(
     (
-      {"type": "tool_call_start", "tool_name": "fms_persist_postcompile_valuation"},
-      _fms_complete(
-        "fms_persist_postcompile_valuation",
-        status="error",
-        gate_code="STOP",
-        error={
-          "type": "INVALID_JUDGMENT",
-          "message": "postcompile-valuation persistence requires the active research file",
-        },
-      ),
+      _context_read_event(_CONTEXT_REFUSAL),
+      _context_read_event({"context_ref": "pcvcx1:exact"}),
     ),
     logical_task=logical,
     attempt=attempt,
     requirement=_narrative_requirement(),
     provenance=provenance,
-    final_narrative=await _narrative(tmp_path, "STOP: missing research file"),
+    final_narrative=await _narrative(tmp_path, "Read the context."),
     stalled=False,
     admitted_task=_admitted_task(tool_ids=(
+      _CONTEXT_DOOR,
       "fms_persist_postcompile_valuation",
     )),
   )
 
-  assert result.execution.status != "succeeded"
-  assert result.outcome is not None
-  assert result.outcome.disposition == "blocked"
-  assert result.outcome.assessment_source == "mechanically_derived"
-  assert "STOP" in (result.outcome.assessment_rationale or "")
+  assert result.execution.status == "succeeded"
+  assert result.values.projection is None
   assert result.values.terminal_narrative is not None
 
 

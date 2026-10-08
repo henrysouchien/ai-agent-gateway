@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .agent_session_log import AgentSessionLog, LogEntry
+from .providers.base import truncate_to_last_compaction
 from .research_file_current_projection import (
   ResearchFileCurrentProjection,
   load_research_file_current_projection,
@@ -13,10 +14,6 @@ from .research_file_current_projection import (
 from .secret_boundary import sanitize_tool_event
 
 Message = dict[str, Any]
-
-
-def _estimate_tokens(value: Any) -> int:
-  return max(1, len(json.dumps(value, default=str)) // 4)
 
 
 @dataclass
@@ -36,11 +33,14 @@ class _ReplayToolBatch:
 
 @dataclass
 class SessionContextBuilder:
-  """Build replay context from a durable session log."""
+  """Build replay context from a durable session log.
+
+  The replay is the parent writer's model-visible state: every current entry
+  after the projection cutoff or durable summary, minus child (`sub_agent`)
+  rows, cut at the last compaction block exactly as the provider request is.
+  """
 
   agent_session_log: AgentSessionLog
-  tail_window_seconds: int | None = 7200
-  tail_token_budget: int = 20_000
 
   async def build(self) -> list[Message]:
     snapshot_max_seq = await self.agent_session_log.latest_seq_current_strict()
@@ -50,7 +50,10 @@ class SessionContextBuilder:
     )
     current_query = {
       "before_seq": snapshot_max_seq,
-      "exclude_entry": current_projection.excludes,
+      "exclude_entry": lambda entry: (
+        current_projection.excludes(entry)
+        or entry.event.get("role") == "sub_agent"
+      ),
     }
     summaries, _ = await self.agent_session_log.query_current_strict(
       event_types={"summary"},
@@ -72,43 +75,46 @@ class SessionContextBuilder:
       snapshot_max_seq=snapshot_max_seq,
     )
 
+    tail_after_seq = current_projection.cutoff_seq + 1
     if latest_summary is not None:
       covers = latest_summary.event.get("covers") or {}
       covers_to_seq = int(covers.get("to_seq", 0) or 0)
-      tail_entries, _ = await self.agent_session_log.query_current_strict(
-        after_seq=max(
-          covers_to_seq + 1,
-          current_projection.cutoff_seq + 1,
-        ),
-        order="asc",
-        **current_query,
-      )
-    elif self.tail_window_seconds is None:
-      tail_entries, _ = await self.agent_session_log.query_current_strict(
-        after_seq=current_projection.cutoff_seq + 1,
-        order="asc",
-        **current_query,
-      )
-    else:
-      since_ts = time.time() - self.tail_window_seconds
-      tail_entries, _ = await self.agent_session_log.query_current_strict(
-        after_seq=current_projection.cutoff_seq + 1,
-        after_ts=since_ts,
-        order="asc",
-        **current_query,
-      )
+      tail_after_seq = max(covers_to_seq + 1, tail_after_seq)
+    tail_entries, _ = await self.agent_session_log.query_current_strict(
+      after_seq=tail_after_seq,
+      order="asc",
+      **current_query,
+    )
 
+    # A child shares the log file but is its own session: its outcome reached
+    # the parent through the parent's own tool result or reply, never its rows.
     tail_entries = [
       entry
       for entry in tail_entries
       if entry.event.get("type") not in {"summary", "state_update"}
+      and entry.event.get("role") != "sub_agent"
     ]
     if interrupted_context is not None:
       tail_entries = [
         entry for entry in tail_entries if entry.seq not in interrupted_context.covered_tail_seqs
       ]
+    if latest_summary is not None and latest_summary.event.get("summary_kind") == "portable_compaction":
+      # These blocks predate the prefix-only summary. A retained calling
+      # batch may contain an old anchor, but it no longer defines a cutoff.
+      tail_entries = [
+        replace(entry, event={
+          **entry.event,
+          "content_blocks": [
+            block for block in entry.event["content_blocks"]
+            if not isinstance(block, dict) or block.get("type") != "compaction"
+          ],
+        })
+        if entry.seq < latest_summary.seq and isinstance(entry.event.get("content_blocks"), list)
+        else entry
+        for entry in tail_entries
+      ]
     tail_groups = self._entries_to_message_groups(tail_entries)
-    tail_messages = self._truncate_to_token_budget(tail_groups, self.tail_token_budget)
+    tail_messages = [message for group in tail_groups for message in group]
 
     messages: list[Message] = []
     if latest_summary is not None:
@@ -118,7 +124,7 @@ class SessionContextBuilder:
     if interrupted_context is not None:
       messages.append(self._interrupted_run_to_message(interrupted_context, latest_state_update))
     messages.extend(tail_messages)
-    return messages
+    return truncate_to_last_compaction(messages, compaction_as_text=False)
 
   async def _latest_interrupted_run_context(
     self,
@@ -193,26 +199,18 @@ class SessionContextBuilder:
       covered_tail_seqs=covered_tail_seqs,
     )
 
-  def _truncate_to_token_budget(self, groups: list[list[Message]], budget: int) -> list[Message]:
-    if budget <= 0:
-      return []
-
-    selected: list[list[Message]] = []
-    total_tokens = 0
-    for group in reversed(groups):
-      group_tokens = sum(_estimate_tokens(message) for message in group)
-      if selected and total_tokens + group_tokens > budget:
-        break
-      selected.append(group)
-      total_tokens += group_tokens
-      if total_tokens >= budget:
-        break
-    return [message for group in reversed(selected) for message in group]
-
   def _summary_to_message(self, entry: LogEntry) -> Message:
     text = str(entry.event.get("text") or "").strip()
     if not text:
       text = "(summary unavailable)"
+    if entry.event.get("summary_kind") == "portable_compaction":
+      return {
+        "role": "assistant",
+        "content": [{"type": "compaction", "content": text}],
+        "provider": entry.event.get("source_provider"),
+        "model": entry.event.get("source_model"),
+        "stop_reason": "compaction",
+      }
     return {
       "role": "user",
       "content": f"## Prior session summary\n\n{text}",
@@ -310,9 +308,6 @@ class SessionContextBuilder:
     if isinstance(next_session, list) and next_session:
       sections.append("Next session:\n" + "\n".join(f"- {item}" for item in next_session if str(item).strip()))
 
-    if payload.get("budget_exceeded"):
-      sections.append("Note: previous run exceeded budget; review interrupted events for details.")
-
     error = payload.get("error")
     if isinstance(error, str) and error.strip():
       sections.append(f"Previous run error: {error.strip()}")
@@ -393,8 +388,6 @@ class SessionContextBuilder:
       return []
 
     lines: list[str] = []
-    if payload.get("budget_exceeded"):
-      lines.append("- budget_exceeded: true")
     error = payload.get("error")
     if isinstance(error, str) and error.strip():
       lines.append(f"- error: {error.strip()}")
@@ -443,7 +436,7 @@ class SessionContextBuilder:
           if batch is not None:
             batch.result_blocks.append(block)
           else:
-            # A time/summary boundary can omit the call but retain its settlement.
+            # A summary or projection boundary can omit the call but retain its settlement.
             terminal_context.append({
               "type": "text",
               "text": (
@@ -468,8 +461,8 @@ class SessionContextBuilder:
 
     for batch in batches:
       if batch.result_blocks:
-        # Recovery may settle later in the log; replay and budget the owning
-        # assistant and all its results together, before any later user text.
+        # Recovery may settle later in the log; replay the owning assistant
+        # and all its results together, before any later user text.
         batch.messages.append({
           "role": "user",
           "content": [*batch.result_blocks, *batch.deferred_extras],
@@ -482,6 +475,11 @@ class SessionContextBuilder:
       return {
         "role": "user",
         "content": event.get("content", ""),
+      }
+    if event_type == "session_recap":
+      return {
+        "role": "user",
+        "content": "## Previous turn recap\n\n" + json.dumps(event, default=str),
       }
 
     if event_type == "assistant_message":

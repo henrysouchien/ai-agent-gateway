@@ -15,6 +15,7 @@ from agent_gateway.sub_agent import (  # noqa: E402
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_capability_execution_resolver,
 )
+from gateway_test_support.child_task_result import succeeded_child_task_result
 from gateway_test_support.host_policy import owner_session_host_policy
 
 
@@ -44,7 +45,7 @@ class _StubRunner:
 
   async def spawn_sub_agent(self, task: str, **kwargs: Any):
     self.calls.append({"task": task, **kwargs})
-    return {"response": "ok"}, None
+    return succeeded_child_task_result(kwargs), None
 
   def _get_tool_definitions(self) -> list[dict[str, str]]:
     return [{"name": "file_read"}]
@@ -73,7 +74,7 @@ def test_make_run_agent_handler_bounds_session_injection_to_admitted_scope(
   }))
 
   assert error is None
-  assert result == {"response": "ok"}
+  assert result == succeeded_child_task_result(runner.calls[0])
   dispatcher = runner.calls[0]["dispatcher"]
   assert dispatcher._mcp_session_inject_servers == set()
   assert dispatcher._interceptors == []

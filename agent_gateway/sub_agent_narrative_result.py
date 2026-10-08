@@ -37,9 +37,11 @@ from .sub_agent_result_evidence import (
 )
 from .sub_agent_skill_state import (
   accepted_declared_terminal_tool_result_value,
-  classify_declared_door_outcome,
+  declared_context_doors_from_grant,
   declared_terminal_doors_from_grant,
+  latest_declared_door_refusal,
   latest_successful_declared_terminal_tool_result,
+  terminal_result_doors,
 )
 
 
@@ -48,15 +50,10 @@ _TERMINAL_REASON_PRECEDENCE = (
   "cancelled",
   "killed",
   "stalled",
-  "budget_exhausted",
-  "turns_exhausted",
+  "soft_budget_abort",
   "retries_exhausted",
   "runtime_error",
 )
-
-#: The ceilings an agent operation declares for itself. Reaching one is a
-#: bounded stop, not a failure: the run did the work its cap paid for.
-_DECLARED_CEILING_SIGNALS = frozenset({"turns_exhausted", "budget_exhausted"})
 
 #: Assistant stop reasons that close a logical response whose text is the
 #: child's delivered narrative. ``refusal`` is the provider declining to
@@ -372,7 +369,6 @@ def task_result_from_execution(
   final_narrative: FinalNarrativeArtifactReference | None,
   stalled: bool,
   outcome: AnalyticalOutcome | None = None,
-  budget_exceeded_reason: str | None = None,
   runtime_error_detail: str | None = None,
   external_terminal_signals: Sequence[str] = (),
   prior_evidence: SubAgentResultEvidence | None = None,
@@ -415,21 +411,20 @@ def task_result_from_execution(
     collect_sub_agent_result_evidence(entry_list, durable=False),
   )
   allowed_signals = {
-    "turns_exhausted",
     "retries_exhausted",
     "stalled",
     "cancelled",
     "killed",
     "resume_abandoned",
-    "budget_exhausted",
     "runtime_error",
   }
   grant = admitted_task.tool_grant if admitted_task is not None else None
   declared_doors = declared_terminal_doors_from_grant(grant)
+  result_doors = terminal_result_doors(admitted_task)
   validated_prior_terminal_tool_result = (
     accepted_declared_terminal_tool_result_value(
       prior_terminal_tool_result,
-      declared_terminal_doors=declared_doors,
+      declared_terminal_doors=result_doors,
     )
     if prior_terminal_tool_result is not None
     else None
@@ -441,10 +436,10 @@ def task_result_from_execution(
     raise ValueError(
       "prior terminal tool result does not match admitted authority"
     )
-  terminal_tool_result = None if evidence.admission_rejected else (
+  terminal_tool_result = (
     latest_successful_declared_terminal_tool_result(
       event_list,
-      declared_terminal_doors=declared_doors,
+      declared_terminal_doors=result_doors,
     )
     or validated_prior_terminal_tool_result
   )
@@ -460,18 +455,19 @@ def task_result_from_execution(
     if runtime_error_detail is not None
     else None
   )
-  parent_budget_stop = False
   refusal_category: str | None = None
   for event in event_list:
     event_type = event.get("type")
     if terminal_tool_result is not None:
       continue
-    if event_type == "max_turns_reached":
-      signals.append("turns_exhausted")
-    elif event_type == "budget_exceeded":
-      signals.append("budget_exhausted")
-      if str(event.get("reason") or "") == "parent_budget":
-        parent_budget_stop = True
+    if (
+      event_type == "interrupted"
+      and event.get("reason") == "soft_budget_abort"
+    ):
+      # The soft-budget ladder's last resort: the child ignored the steer and
+      # the forced final. A run that answered after them never reaches here
+      # and settles as an ordinary result.
+      signals.append("soft_budget_abort")
     elif event_type in {"run_error", "error"}:
       signals.append("runtime_error")
       if error_detail is None:
@@ -491,34 +487,34 @@ def task_result_from_execution(
       error_detail = "Sub-agent stalled"
   if runtime_error_detail is not None and terminal_tool_result is None:
     signals.append("runtime_error")
-  if budget_exceeded_reason is not None and terminal_tool_result is None:
-    signals.append("budget_exhausted")
-    if str(budget_exceeded_reason) == "parent_budget":
-      parent_budget_stop = True
-
-  if evidence.admission_rejected:
-    signals.append("runtime_error")
-    error_detail = "child evidence failed canonical admission"
 
   projection = None
+  # The child settles on what its doors returned: an accepted terminal result,
+  # else its last declared door's refusal verbatim (the door's own error and
+  # ``next_call``), else its narrative. A refusal is also the child's
+  # outcome (``blocked``, below): the row records what the door answered, so
+  # a consumer reading the settlement — the workflow scheduler's dependency
+  # acceptance — does not read a refused door as a completed stage.
+  door_refusal = (
+    latest_declared_door_refusal(
+      declared_doors | declared_context_doors_from_grant(grant),
+      event_list,
+    )
+    if terminal_tool_result is None
+    else None
+  )
+  door_answer = terminal_tool_result if terminal_tool_result is not None else door_refusal
   runtime_projection = (
     canonical_projection(
       contract=report_contract_ref(
         TERMINAL_TOOL_RESULT_RETURN_CONTRACT
       ),
-      value=dict(terminal_tool_result),
+      value=dict(door_answer),
     )
-    if terminal_tool_result is not None
+    if door_answer is not None
     else None
   )
   acquired_outcome = outcome
-  if not signals and requirement.mode != "narrative":
-    signals.append("runtime_error")
-    error_detail = (
-      "agent execution accepts terminal-message results only; structured "
-      "records require a deterministic runtime materializer"
-    )
-
   if (
     not signals
     and requirement.terminal_narrative == "required"
@@ -527,40 +523,10 @@ def task_result_from_execution(
   ):
     signals.append("runtime_error")
     error_detail = "durable terminal assistant narrative was not available"
-  if (
-    not signals
-    and requirement.terminal_narrative == "forbidden"
-  ):
-    signals.append("runtime_error")
-    error_detail = "agent execution cannot forbid its terminal assistant message"
 
   settled_signals = tuple(dict.fromkeys(signals))
-  # The honest partial (design §4.5): a child that hit a ceiling its own
-  # operation declared — turns or budget — and still published a durable
-  # terminal narrative did real work. The declared ceiling must be the SOLE
-  # signal: cancelled/killed/stalled/runtime failures co-occurring keep the
-  # old failed settlement, and ``ExecutionSettlement`` forbids a
-  # ``terminal_reason`` on ``succeeded``, so the ceiling fact rides the
-  # outcome's ``unmet_requirements`` instead of the settlement. A stop the
-  # PARENT's budget caused is not a ceiling this operation declared: the child
-  # never reached its own cap, so it settles failed and consumers keying on
-  # status (the workflow scheduler) do not read it as a success.
-  ceiling_reached = (
-    next(iter(settled_signals))
-    if len(settled_signals) == 1
-    and settled_signals[0] in _DECLARED_CEILING_SIGNALS
-    and not parent_budget_stop
-    else None
-  )
-  honest_partial = (
-    ceiling_reached is not None
-    and final_narrative is not None
-    and requirement.mode == "narrative"
-  )
   refused = settled_signals == ("refusal",)
-  if honest_partial:
-    execution = ExecutionSettlement(status="succeeded")
-  elif refused:
+  if refused:
     # A refusal is the child's own disposition, not a runtime failure: it
     # settles interrupted with the provider's category and keeps the text the
     # model delivered before the stop.
@@ -583,57 +549,31 @@ def task_result_from_execution(
     acquired_outcome = None
   elif runtime_projection is not None:
     final_narrative = None
-  door_classification = None
-  if execution.status == "succeeded" and declared_doors:
-    door_classification = classify_declared_door_outcome(
-      declared_terminal_doors=declared_doors,
-      tools_used=evidence.tools_used,
-      door_results=evidence.fms_results,
-    )
-    if not door_classification.succeeded:
-      reason = (
-        door_classification.error["code"]
-        if door_classification.error is not None
-        else "terminal_door_not_invoked"
-      )
-      detail = (
-        door_classification.error["message"]
-        if door_classification.error is not None
-        else "declared terminal door was not invoked"
-      )
-      execution = ExecutionSettlement(
-        status="failed",
-        terminal_reason=f"{reason}: {detail}",
-      )
-      acquired_outcome = None
   runtime_outcome = None
-  if (
-    door_classification is not None
-    and not door_classification.succeeded
-    and door_classification.error is not None
-  ):
-    rationale = str(door_classification.error["message"])
-    if door_classification.semantic == "stop" and "STOP" not in rationale:
-      rationale = f"STOP: {rationale}"
-    runtime_outcome = AnalyticalOutcome(
-      disposition="blocked",
-      assessment_source="mechanically_derived",
-      assessment_rationale=rationale,
-      unmet_requirements=tuple(sorted(declared_doors)),
-    )
-  elif execution.status == "succeeded" and acquired_outcome is None:
-    runtime_outcome = derive_mechanical_outcome(
-      grant=grant,
-      bindings=(
-        admitted_task.capability_bindings
-        if admitted_task is not None
-        else ()
-      ),
-      failures=fold_dispatch_failures(event_list),
-      sources=evidence.observed_sources,
-      narrative_present=final_narrative is not None,
-      ceiling_reached=ceiling_reached if honest_partial else None,
-      missing_inputs=(),
+  if execution.status == "succeeded" and acquired_outcome is None:
+    runtime_outcome = (
+      AnalyticalOutcome(
+        disposition="blocked",
+        assessment_source="mechanically_derived",
+        assessment_rationale=(
+          f"{door_refusal['tool_name']} refused; its answer is this result"
+        ),
+        unmet_requirements=(str(door_refusal["tool_name"]),),
+      )
+      if door_refusal is not None
+      else derive_mechanical_outcome(
+        grant=grant,
+        bindings=(
+          admitted_task.capability_bindings
+          if admitted_task is not None
+          else ()
+        ),
+        failures=fold_dispatch_failures(event_list),
+        sources=evidence.observed_sources,
+        narrative_present=final_narrative is not None,
+        missing_inputs=(),
+        evidence_gap=evidence.gap,
+      )
     )
   return build_task_result(
     logical_task=logical_task,

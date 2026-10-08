@@ -57,7 +57,7 @@ class _ListedToolsSession:
     name: str,
     arguments: dict[str, object],
     *,
-    read_timeout_seconds: float,
+    read_timeout_seconds: float | None,
     meta: dict[str, object] | None = None,
   ) -> CallToolResult:
     _ = name, arguments, read_timeout_seconds, meta
@@ -273,7 +273,7 @@ def test_pending_retry_awaits_passive_eof_reconnect(reconnect_transport, monkeyp
       retry_started.set()
       return await manager._retry_stdio_tool_call_after_reconnect(
         server_name="first", server=server, original_name="alpha",
-        tool_input={}, meta=None, abort_event=None, timeout_seconds=1,
+        tool_input={}, meta=None, abort_event=None, expected_seconds=1,
         cause=EOFError("connection closed"),
       )
 

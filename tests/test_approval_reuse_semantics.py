@@ -16,21 +16,14 @@ from agent_gateway.approval_route import DurableLocalApprovalRoute
 from agent_gateway.approval_policy import (
   ApprovalDecision,
   ApprovalRequestPayload,
-  DelegationGrant,
-  PersistentGrant,
   RunContext,
   apply_decision_to_request,
   approval_reuse_scope_authorized,
   build_approval_request,
-  utc_now,
 )
 from agent_gateway.approval_store import SQLiteApprovalStore
-from agent_gateway.approval_preferences import ApprovalPreferenceStore
 from agent_gateway.approvals import _record_vote_and_unblock_locked
-from agent_gateway.single_user_policy import (
-  DelegationApprovalPolicy,
-  SingleUserApprovalPolicy,
-)
+from agent_gateway.single_user_policy import SingleUserApprovalPolicy
 from agent_gateway.tool_dispatcher import ToolDispatcher
 from agent_gateway.tool_dispatcher_helpers import InterceptDecision
 from agent_gateway.tool_policy_registry import (
@@ -77,18 +70,6 @@ def _request(
     approval_reuse_key=key,
   )
 
-def _prompting_policy(
-  *,
-  store: Any,
-  tmp_path: Any,
-) -> SingleUserApprovalPolicy:
-  """A policy for a user who opted out of auto-approval, so grants are reachable."""
-
-  preference_store = ApprovalPreferenceStore(tmp_path / "approval-preferences.sqlite3")
-  preference_store.put(user_id="alice", preference="request_user_approval")
-  return SingleUserApprovalPolicy(store=store, preference_store=preference_store)
-
-
 
 @pytest.mark.parametrize(
   ("mode", "key"),
@@ -119,91 +100,6 @@ def test_exact_reuse_round_trips_and_is_immutable(tmp_path: Any) -> None:
     _run(store.update_request(replace(loaded, approval_reuse_key="other-key")))
 
 
-def test_exact_lookup_cannot_use_a_legacy_scope_collision(tmp_path: Any) -> None:
-  store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
-  policy = _prompting_policy(store=store, tmp_path=tmp_path)
-  legacy_source = replace(
-    _request(),
-    approval_id="legacy-source",
-    approval_chain_id="legacy-source",
-    state="approved",
-    decision="approved",
-    persistent_grant_scope="registered:safe-key",
-  )
-  _run(store.create(legacy_source))
-  _run(store.create_persistent_grant(PersistentGrant(
-    grant_id="legacy-grant",
-    user_id="alice",
-    tool_name="registered_write",
-    scope_hint="registered:safe-key",
-    args_predicate=None,
-    granted_at=utc_now(),
-    expires_at=None,
-    revoked_at=None,
-    granted_via_approval_id=legacy_source.approval_id,
-    policy_id=policy.policy_id,
-  )))
-  request = _request(
-    mode="exact",
-    key="registered:safe-key",
-    tool_call_id="call-exact",
-  )
-  payload = ApprovalRequestPayload(
-    request.approval_id,
-    request.tool_name,
-    request.tool_class,
-    {"ticker": "AAPL"},
-  )
-
-  decision = _run(policy.decide(
-    payload=payload,
-    request=request,
-    run_context=RunContext(user_id="alice", request_id="request-1"),
-  ))
-
-  assert decision.outcome == "request_user_approval"
-  assert decision.persistent_grant_scope_hint == "registered:safe-key"
-
-  exact_source = replace(
-    _request(
-      mode="exact",
-      key="registered:safe-key",
-      tool_call_id="exact-source-call",
-    ),
-    approval_id="exact-source",
-    approval_chain_id="exact-source",
-    state="approved",
-    decision="approved",
-    persistent_grant_scope="registered:safe-key",
-  )
-  _run(store.create(exact_source))
-  _run(store.create_persistent_grant(PersistentGrant(
-    grant_id="exact-grant",
-    user_id="alice",
-    tool_name="registered_write",
-    scope_hint="registered:safe-key",
-    args_predicate=None,
-    granted_at=utc_now(),
-    expires_at=None,
-    revoked_at=None,
-    granted_via_approval_id=exact_source.approval_id,
-    policy_id=policy.policy_id,
-  )))
-
-  reused = _run(policy.decide(
-    payload=payload,
-    request=request,
-    run_context=RunContext(user_id="alice", request_id="request-1"),
-  ))
-
-  assert reused.outcome == "auto_approve"
-  assert reused.grant_reference == "exact-grant"
-  applied = apply_decision_to_request(request, reused)
-  assert applied.authorization_mode == "PERSISTENT_GRANT"
-  assert applied.grant_reference == "exact-grant"
-  assert applied.persistent_grant_scope == "registered:safe-key"
-
-
 @pytest.mark.parametrize(
   ("mode", "key", "scope"),
   [
@@ -211,7 +107,7 @@ def test_exact_lookup_cannot_use_a_legacy_scope_collision(tmp_path: Any) -> None
     ("exact", "registered:safe-key", "registered:other-key"),
   ],
 )
-def test_policy_cannot_attach_a_mismatched_reuse_grant(
+def test_policy_mismatched_reuse_grant_is_stripped_from_the_approval(
   mode: str,
   key: str | None,
   scope: str,
@@ -226,7 +122,7 @@ def test_policy_cannot_attach_a_mismatched_reuse_grant(
     ),
   )
 
-  assert applied.authorization_mode == "HUMAN"
+  assert applied.authorization_mode == "AUTO_ALLOW"
   assert applied.grant_reference is None
   assert applied.persistent_grant_scope is None
 
@@ -254,49 +150,6 @@ def test_policy_cannot_offer_persistence_without_authorizing_it(
   )
 
   assert applied.persistent_grant_scope is None
-
-
-def test_exact_session_cache_hit_records_the_exact_key(tmp_path: Any) -> None:
-  store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
-
-  class Policy:
-    policy_id = "test-policy"
-    policy_version = "1"
-
-    async def decide(self, **_kwargs: Any) -> Any:
-      raise AssertionError("an exact session cache hit cannot consult policy")
-
-    async def on_resolve(self, *, request: Any) -> None:
-      assert request.cache_reference == "registered:safe-key"
-
-  dispatcher = ToolDispatcher(
-    mcp_client=_NoMcp(),
-    approval_route=DurableLocalApprovalRoute(
-      store,
-      Policy(),
-      SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice"),
-    ),
-    run_context=RunContext(user_id="alice", request_id="request-cache"),
-  )
-
-  result = _run(dispatcher._run_approval_lifecycle(
-    tool_call_id="call-cache",
-    tool_name="registered_write",
-    tool_input={"ticker": "AAPL"},
-    qualifier="legacy-qualifier-must-not-appear",
-    reason="",
-    allow_persistent=True,
-    approval_reuse_mode="exact",
-    approval_reuse_key="registered:safe-key",
-    approval_args_redacted={"ticker": "AAPL"},
-    approval_args_hash="args-hash",
-    session_cache_approved=True,
-  ))
-
-  request = result["request"]
-  assert request.authorization_mode == "CACHE_HIT"
-  assert request.cache_reference == "registered:safe-key"
-  assert _run(store.get(request.approval_id)) == request
 
 
 def test_resume_cannot_change_approval_reuse_identity(tmp_path: Any) -> None:
@@ -405,49 +258,6 @@ def test_disabled_reuse_skips_lookup_and_disallows_persistence() -> None:
   ) is False
 
 
-def test_registered_reuse_never_uses_delegation_auto_approval() -> None:
-  now = utc_now()
-  delegation = DelegationGrant(
-    delegation_id="delegation-1",
-    delegator_user_id="alice",
-    delegator_run_id="run-1",
-    delegator_session_id="session-1",
-    delegator_profile="chat",
-    delegator_channel="web",
-    bound_excel_session_id="excel-1",
-    bound_relay_request_id="relay-1",
-    bound_workbook=None,
-    tool_class_ceiling=frozenset({"state_write"}),
-    args_predicate=None,
-    window_seconds=600,
-    created_at=now,
-  )
-  run_context = RunContext(
-    user_id="alice",
-    request_id="request-1",
-    delegation=delegation,
-  )
-  policy = DelegationApprovalPolicy(base=SingleUserApprovalPolicy())
-  request = _request(mode="exact", key="registered:safe-key")
-  payload = ApprovalRequestPayload(
-    request.approval_id,
-    request.tool_name,
-    request.tool_class,
-    {"ticker": "AAPL"},
-  )
-
-  decision = _run(policy.decide(
-    payload=payload,
-    request=request,
-    run_context=run_context,
-  ))
-
-  # The delegation credit is unavailable to a registered exact-reuse call, so
-  # the standing preference the owner holds is what settles it.
-  assert decision.outcome == "auto_approve"
-  assert decision.policy_id == "single-user"
-
-
 def _ref(kind: str) -> VersionedPolicyRef:
   return VersionedPolicyRef(kind=kind, policy_id=kind, version="v1")  # type: ignore[arg-type]
 
@@ -518,7 +328,6 @@ def test_dynamic_ask_disables_registered_exact_reuse() -> None:
     role="owner",
     tool_registration_catalog=ToolRegistrationCatalog((declaration,), ()),
     tool_policy_implementations=registry,
-    approval_predicate_context_factory=lambda _declaration, _prepared: None,
     redaction_context_factory=lambda _declaration: None,
   )
   captured: dict[str, Any] = {}

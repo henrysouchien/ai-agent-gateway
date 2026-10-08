@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import threading
 import weakref
@@ -156,7 +158,6 @@ class GatewayClaimSigningAuthority:
     self,
     claim_headers: Mapping[str, str],
     *,
-    ttl_ceiling: int,
     now: int | None = None,
   ) -> dict[str, Any] | None:
     """Verify a claim without making the root secret caller-observable."""
@@ -168,9 +169,19 @@ class GatewayClaimSigningAuthority:
     return _verify_agent_claim_headers(
       self.__secret,
       claim_headers,
-      ttl_ceiling=ttl_ceiling,
       now=now,
     )
+
+  def verify_native_risk_request(self, body: bytes, signature: str) -> bool:
+    """Authenticate the producer callback without exposing holder key material."""
+    try:
+      supplied = bytes.fromhex(signature)
+    except ValueError:
+      return False
+    mac = hmac.new(self.__secret.encode("utf-8"), digestmod=hashlib.sha256)
+    mac.update(b"hank/native-risk-cell/v1\0")
+    mac.update(body)
+    return hmac.compare_digest(mac.digest(), supplied)
 
 
 class _GatewayUserClaimBinding(NamedTuple):
@@ -179,34 +190,14 @@ class _GatewayUserClaimBinding(NamedTuple):
   user_id: str
 
 
-_gateway_user_claim_bindings: dict[
-  int,
-  tuple[weakref.ReferenceType[GatewayUserClaimSigner], _GatewayUserClaimBinding],
-] = {}
+# Entries leave with their signer. WeakKeyDictionary drops them without taking
+# the lock below, so a collection that runs inside the locked section cannot
+# wait on a lock its own thread holds.
+_gateway_user_claim_bindings: weakref.WeakKeyDictionary[
+  GatewayUserClaimSigner,
+  _GatewayUserClaimBinding,
+] = weakref.WeakKeyDictionary()
 _gateway_user_claim_bindings_lock = threading.Lock()
-
-
-def _discard_gateway_user_claim_binding(
-  signer_identity: int,
-  signer_reference: weakref.ReferenceType[GatewayUserClaimSigner],
-) -> None:
-  with _gateway_user_claim_bindings_lock:
-    current = _gateway_user_claim_bindings.get(signer_identity)
-    if current is not None and current[0] is signer_reference:
-      _gateway_user_claim_bindings.pop(signer_identity, None)
-
-
-def _gateway_user_claim_reference(
-  signer: GatewayUserClaimSigner,
-  signer_identity: int,
-) -> weakref.ReferenceType[GatewayUserClaimSigner]:
-  return weakref.ref(
-    signer,
-    lambda reference: _discard_gateway_user_claim_binding(
-      signer_identity,
-      reference,
-    ),
-  )
 
 
 def _gateway_user_claim_binding(
@@ -215,10 +206,9 @@ def _gateway_user_claim_binding(
   if type(signer) is not GatewayUserClaimSigner:
     raise TypeError("gateway user claim signer type changed")
   with _gateway_user_claim_bindings_lock:
-    current = _gateway_user_claim_bindings.get(id(signer))
-    if current is None or current[0]() is not signer:
-      raise RuntimeError("gateway user claim signer is not bound")
-    binding = current[1]
+    binding = _gateway_user_claim_bindings.get(signer)
+  if binding is None:
+    raise RuntimeError("gateway user claim signer is not bound")
   if type(binding) is not _GatewayUserClaimBinding:
     raise RuntimeError("gateway user claim signer is not bound")
   return binding
@@ -257,25 +247,12 @@ class GatewayUserClaimSigner:
       user_email=user_email,
       user_id=user_id,
     )
-    signer_identity = id(self)
-    signer_reference = _gateway_user_claim_reference(
-      self,
-      signer_identity,
-    )
     with _gateway_user_claim_bindings_lock:
-      current = _gateway_user_claim_bindings.get(signer_identity)
-      if current is not None and current[0]() is self:
+      if _gateway_user_claim_bindings.get(self) is not None:
         raise RuntimeError(
           "gateway user claim signer is already bound"
         )
-      if current is not None and current[0]() is not None:
-        raise RuntimeError(
-          "gateway user claim signer identity collision"
-        )
-      _gateway_user_claim_bindings[signer_identity] = (
-        signer_reference,
-        binding,
-      )
+      _gateway_user_claim_bindings[self] = binding
 
   def __init_subclass__(cls, **kwargs: Any) -> None:
     raise TypeError("gateway user claim signer cannot be subclassed")

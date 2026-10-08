@@ -25,10 +25,8 @@ from .runs_helpers import (
 
 log = logging.getLogger("agent_gateway.control_plane.readable_resources")
 
-_RESOURCE_ID_RE = re.compile(r"^[^/\\\s]+$")
 _CONTENT_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _READABLE_RESOURCE_EVENT_TYPE = "readable_resource_ready"
-_READABLE_RESOURCE_MAX_CONTENT_BYTES = 2_000_000
 
 
 class ReadableResourceResponse(BaseModel):
@@ -82,22 +80,6 @@ def _string_or_none(value: Any) -> str | None:
   return cleaned or None
 
 
-def _validate_resource_id(resource_id: str) -> str:
-  cleaned = resource_id.strip()
-  if not _resource_id_is_safe(cleaned):
-    raise HTTPException(status_code=400, detail="Unsafe readable resource id")
-  return cleaned
-
-
-def _resource_id_is_safe(resource_id: str) -> bool:
-  return bool(
-    resource_id
-    and len(resource_id) <= 512
-    and resource_id not in {".", ".."}
-    and _RESOURCE_ID_RE.fullmatch(resource_id) is not None
-  )
-
-
 def _non_negative_int(value: Any) -> int | None:
   if isinstance(value, bool):
     return None
@@ -128,27 +110,11 @@ def _resource_owner_id(event: dict[str, Any]) -> str | None:
   return None
 
 
-def _event_claims_match_source(event: dict[str, Any], source: _ReadableResourceSource) -> bool:
-  expected = {
-    "control_run_id": source.control_run_id,
-    "run_id": source.run_id,
-    "session_id": source.session_id,
-    "task_id": source.task_id,
-  }
-  for key, expected_value in expected.items():
-    claimed = _string_or_none(event.get(key))
-    if claimed is not None and claimed != expected_value:
-      return False
-  return True
-
-
 def _content_payload(event: dict[str, Any]) -> tuple[str, int, str]:
   content = event.get("content")
   if not isinstance(content, str) or not content.strip():
     raise _ReadableResourceInvalid("readable resource snapshot content is missing")
   content_bytes = content.encode("utf-8")
-  if len(content_bytes) > _READABLE_RESOURCE_MAX_CONTENT_BYTES:
-    raise _ReadableResourceInvalid("readable resource snapshot content exceeds 2 MB")
 
   declared_bytes = _non_negative_int(event.get("content_bytes"))
   if declared_bytes is None:
@@ -160,6 +126,7 @@ def _content_payload(event: dict[str, Any]) -> tuple[str, int, str]:
   if content_sha256 is None or _CONTENT_SHA256_RE.fullmatch(content_sha256) is None:
     raise _ReadableResourceInvalid("readable resource content_sha256 is invalid")
   normalized_sha = content_sha256.lower()
+  # Served bytes that no longer hash to the digest recorded when the run produced them are corrupted content.
   if hashlib.sha256(content_bytes).hexdigest() != normalized_sha:
     raise _ReadableResourceInvalid("readable resource content sha256 mismatch")
   return content, declared_bytes, normalized_sha
@@ -175,23 +142,18 @@ def _resource_payload_from_event(
     raise _ReadableResourceInvalid("not a readable resource event")
   if _string_or_none(event.get("content_class")) != "human_readable":
     raise _ReadableResourceInvalid("readable resource is not human readable")
-  if _string_or_none(event.get("content_type")) not in {"text/markdown", "text/plain"}:
-    raise _ReadableResourceInvalid("readable resource content_type is not allowed")
 
   resource_id = _required_string(event, "resource_id")
   if resource_id is None:
     raise _ReadableResourceInvalid("readable resource id is missing")
-  if not _resource_id_is_safe(resource_id):
-    raise _ReadableResourceInvalid("readable resource id is unsafe")
   owner_id = _resource_owner_id(event)
   if owner_id is None:
     raise _ReadableResourceInvalid("readable resource owner provenance is missing")
-  if not _event_claims_match_source(event, source):
-    raise _ReadableResourceInvalid("readable resource owner provenance conflicts with source run")
   skill_run_id = _required_string(event, "skill_run_id")
   contract_name = _required_string(event, "contract_name")
   snapshot_id = _required_string(event, "content_snapshot_id")
-  if skill_run_id is None or contract_name is None or snapshot_id is None:
+  content_type = _required_string(event, "content_type")
+  if skill_run_id is None or contract_name is None or snapshot_id is None or content_type is None:
     raise _ReadableResourceInvalid("readable resource provenance is incomplete")
   content, content_bytes, content_sha256 = _content_payload(event)
   truncated = event.get("truncated")
@@ -210,7 +172,7 @@ def _resource_payload_from_event(
     "task_id": source.task_id,
     "skill_run_id": skill_run_id,
     "contract_name": contract_name,
-    "content_type": str(event["content_type"]),
+    "content_type": content_type,
     "content_class": "human_readable",
     "content_snapshot_id": snapshot_id,
     "content_sha256": content_sha256,
@@ -378,7 +340,7 @@ def build_readable_resources_router(
     request: Request,
     resource_id: str,
   ) -> ReadableResourceDetailResponse:
-    normalized_resource_id = _validate_resource_id(resource_id)
+    normalized_resource_id = resource_id.strip()
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
     for _sort_ts, resource in _find_visible_resources(

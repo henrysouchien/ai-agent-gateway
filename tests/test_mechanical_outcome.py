@@ -48,7 +48,6 @@ def _derive(**overrides):
     "failures": {},
     "sources": (),
     "narrative_present": True,
-    "ceiling_reached": None,
     "missing_inputs": (),
   }
   kwargs.update(overrides)
@@ -64,29 +63,6 @@ def test_absent_admitted_authority_derives_no_outcome() -> None:
 def test_absent_narrative_derives_no_outcome() -> None:
   # Settlement already failed; there is nothing to qualify.
   assert _derive(narrative_present=False) is None
-
-
-def test_declared_ceiling_derives_partial_with_the_display_carrier() -> None:
-  outcome = _derive(ceiling_reached="turns_exhausted")
-
-  assert outcome is not None
-  assert outcome.disposition == "partial"
-  assert outcome.assessment_source == "mechanically_derived"
-  assert outcome.assessment_rationale
-  # ``ExecutionSettlement`` forbids a terminal_reason on ``succeeded``, so the
-  # exhaustion fact must ride the outcome.
-  assert outcome.unmet_requirements == ("turns_exhausted",)
-
-
-def test_declared_ceiling_precedes_a_clean_retrieval_record() -> None:
-  outcome = _derive(
-    ceiling_reached="budget_exhausted",
-    failures={"web_search": (3, 0)},
-  )
-
-  assert outcome is not None
-  assert outcome.disposition == "partial"
-  assert outcome.unmet_requirements == ("budget_exhausted",)
 
 
 def test_all_source_capability_retrievals_failed_derives_insufficient() -> None:
@@ -163,6 +139,30 @@ def test_missing_inputs_derive_partial_and_total_absence_derives_blocked() -> No
   assert blocked.unmet_requirements == ("upstream_report",)
 
 
+def test_child_evidence_gap_derives_partial_with_its_rationale() -> None:
+  # GC58: evidence past its canonical bound is not kept, but the result
+  # stands; the gap is recorded on the published outcome.
+  outcome = _derive(
+    failures={"web_search": (2, 0)},
+    evidence_gap="child evidence was not recorded",
+  )
+
+  assert outcome is not None
+  assert outcome.disposition == "partial"
+  assert outcome.assessment_source == "mechanically_derived"
+  assert outcome.assessment_rationale == "child evidence was not recorded"
+  assert outcome.unmet_requirements == ("child_evidence",)
+
+  # A child that settled on a terminal tool result has no narrative; the gap
+  # still rides its outcome (audit DEFECT on 2c9979b651).
+  tool_settled = _derive(
+    narrative_present=False,
+    evidence_gap="child evidence was not recorded",
+  )
+  assert tool_settled is not None
+  assert tool_settled.unmet_requirements == ("child_evidence",)
+
+
 def test_source_capability_membership_is_the_grant_intersected_bindings() -> None:
   grant = _grant("web_search", "file_read")
   bindings = (
@@ -189,8 +189,8 @@ def test_derivation_signature_names_only_admitted_authority_inputs() -> None:
     "failures",
     "sources",
     "narrative_present",
-    "ceiling_reached",
     "missing_inputs",
+    "evidence_gap",
   }
 
 

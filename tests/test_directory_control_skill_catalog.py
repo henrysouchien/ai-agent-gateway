@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 from collections.abc import Iterator
 from dataclasses import fields
 import json
@@ -26,48 +25,6 @@ from agent_gateway.skills import SkillLoader
 
 
 ROOT = Path(__file__).resolve().parents[1]
-
-_ABSOLUTE_IMPORTS = {
-  "__future__": frozenset({"annotations"}),
-  "collections.abc": frozenset({"Mapping"}),
-  "dataclasses": frozenset({"dataclass"}),
-  "pathlib": frozenset({"Path"}),
-  "typing": frozenset({"Any"}),
-}
-_DIRECT_IMPORTS = frozenset({"logging", "os", "stat", "yaml"})
-_RELATIVE_IMPORTS = {
-  "control_skill_catalog": frozenset({
-    "ControlSkillDetail",
-    "ControlSkillSummary",
-    "ControlSkillUnavailableError",
-    "is_control_skill_name",
-  }),
-  "skills": frozenset({"SkillLoader", "SkillProfile", "resolve_blocks"}),
-}
-
-
-def _assert_directory_import_boundary(source: str) -> None:
-  tree = ast.parse(source)
-  for node in ast.walk(tree):
-    if isinstance(node, ast.Import):
-      assert len(node.names) == 1
-      alias = node.names[0]
-      assert alias.asname is None
-      assert alias.name in _DIRECT_IMPORTS
-      continue
-    if not isinstance(node, ast.ImportFrom):
-      continue
-    allowed = (
-      _ABSOLUTE_IMPORTS.get(node.module or "")
-      if node.level == 0
-      else _RELATIVE_IMPORTS.get(node.module or "")
-      if node.level == 1
-      else None
-    )
-    assert allowed is not None
-    for alias in node.names:
-      assert alias.asname is None
-      assert alias.name in allowed
 
 
 def _write_skill(
@@ -95,13 +52,11 @@ scope: portfolio
 agent_callable: true
 agent_description: Agent-facing detail.
 resumable: true
-max_turns: -4
 persist_state: true
 metadata:
   label:
   display_label: Must Not Win
   typed_contract: platform:external-result@7
-  max_budget_usd: -3.5
   required_context: [portfolio, ticker, ticker, '  ']
   requires_portfolio_context: 'yes'
   modes: ''
@@ -127,7 +82,7 @@ semantic_metadata:
 """
 
 
-def test_directory_catalog_projects_complete_27_field_external_table(
+def test_directory_catalog_projects_complete_25_field_external_table(
   tmp_path: Path,
 ) -> None:
   root = tmp_path / "external-skills"
@@ -148,7 +103,7 @@ def test_directory_catalog_projects_complete_27_field_external_table(
   assert len(listing) == 1
   summary = listing[0]
   assert type(summary) is ControlSkillSummary
-  assert len(fields(summary)) == 27
+  assert len(fields(summary)) == 25
   assert summary.name == "rich-alias"
   assert summary.label == "Rich Alias"
   assert summary.description == "Rich description."
@@ -159,9 +114,6 @@ def test_directory_catalog_projects_complete_27_field_external_table(
   assert summary.required_context == ("portfolio", "ticker")
   assert summary.agent_callable is True
   assert summary.resumable is True
-  assert summary.max_turns == -4
-  assert summary.max_budget_usd == -3.5
-  assert type(summary.max_budget_usd) is float
   assert summary.persist_state is True
   assert summary.typed_contract == "platform:external-result@7"
   assert summary.catalog is True
@@ -664,7 +616,7 @@ def test_list_does_not_resolve_blocks_but_detail_does(tmp_path: Path) -> None:
   "frontmatter",
   [
     "catalog: maybe",
-    "max_turns: not-an-int",
+    "max_tokens: not-an-int",
     "semantic_metadata: not-a-mapping",
     "semantic_metadata:\n  output_contracts: [not-a-mapping]",
     "metadata:\n  required_context: bad: mapping",
@@ -801,43 +753,6 @@ def test_list_skips_non_files_non_markdown_and_invalid_stems(tmp_path: Path) -> 
     summary.name
     for summary in DirectoryControlSkillCatalog(root).list_skills()
   ) == ("valid-skill",)
-
-
-def test_directory_adapter_import_boundary_and_no_reexport() -> None:
-  source_path = ROOT / "agent_gateway" / "directory_control_skill_catalog.py"
-  source = source_path.read_text(encoding="utf-8")
-  _assert_directory_import_boundary(source)
-  tree = ast.parse(source)
-  forbidden = {
-    "CompiledSkillControlCatalog",
-    "CompiledSkillDefinitionCatalog",
-    "SkillMetadataV2",
-    "get_skills_root",
-  }
-  assert not forbidden.intersection(
-    node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
-  )
-  package_init = (ROOT / "agent_gateway" / "__init__.py").read_text(
-    encoding="utf-8"
-  )
-  assert "directory_control_skill_catalog" not in package_init
-
-
-@pytest.mark.parametrize(
-  "statement",
-  [
-    "import pathlib",
-    "import yaml as parser",
-    "from .skills import SkillLoader as Loader",
-    "from .reader import SkillLoader",
-    "from agent.skills.catalog import SkillDefinition",
-  ],
-)
-def test_directory_import_guard_rejects_foreign_or_aliased_imports(
-  statement: str,
-) -> None:
-  with pytest.raises(AssertionError):
-    _assert_directory_import_boundary(statement)
 
 
 def test_directory_adapter_imports_without_application_modules() -> None:

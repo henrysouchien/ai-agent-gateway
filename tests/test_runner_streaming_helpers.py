@@ -96,12 +96,12 @@ def test_classify_guard_outcome_distinguishes_retry_abort_and_non_guard() -> Non
   )
   assert classify_guard_outcome(("stall", "quiet"), attempt=3, max_attempts=3) == (
     "abort",
-    "Stream watchdog: quiet",
+    "Stream watchdog: quiet (attempt 4 of 4)",
     "stall",
   )
   assert classify_guard_outcome(("timeout", "slow"), attempt=1, max_attempts=3) == (
     "abort",
-    "Stream watchdog: slow",
+    "Stream watchdog: slow (attempt 2 of 4)",
     "timeout",
   )
   assert gateway_runner.AgentRunner._classify_guard_outcome(("stall", "quiet"), 1, 2) == (

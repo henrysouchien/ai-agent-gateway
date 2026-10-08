@@ -753,6 +753,55 @@ class AgentSessionLog:
 
     return self._append_sync(dict(event))
 
+  def append_terminal_pair_sync(
+    self, recap: dict[str, Any], detach: dict[str, Any],
+  ) -> tuple[LogEntry, LogEntry]:
+    """Publish recap before detach, or roll back both on an append failure.
+
+    The writer's existing append mutex owns the rollback and serializes
+    strict readers. Completed settlement never leaves an exception-partial
+    pair. This adds no crash-recovery format.
+    """
+    events = [sanitize_tool_event(event, sink="session_log") for event in (recap, detach)]
+    for event in events:
+      event["event_schema_version"] = EVENT_SCHEMA_VERSION
+    with self._open_append_mutex_file() as mutex_file:
+      fcntl.flock(mutex_file.fileno(), fcntl.LOCK_EX)
+      try:
+        self._repair_manifest_locked()
+        self._rotate_active_if_needed_locked()
+        opened = self._open_active_file(writable=True)
+        assert opened is not None
+        handle, _info, _created = opened
+        with handle:
+          handle.seek(0, os.SEEK_END)
+          offset = handle.tell()
+          previous_seq = self._latest_seq_for_append(handle)
+          timestamp = time.time()
+          entries = (
+            LogEntry(seq=previous_seq + 1, timestamp=timestamp, event=events[0]),
+            LogEntry(seq=previous_seq + 2, timestamp=timestamp, event=events[1]),
+          )
+          first = self._encode_entry(entries[0])
+          second = self._encode_entry(entries[1])
+          try:
+            handle.write(first + second)
+            handle.flush()
+            os.fsync(handle.fileno())
+            self._update_manifest_latest_seq_locked(entries[1].seq)
+          except BaseException:
+            handle.seek(offset)
+            handle.truncate()
+            handle.flush()
+            os.fsync(handle.fileno())
+            self._update_manifest_latest_seq_locked(previous_seq)
+            raise
+      finally:
+        fcntl.flock(mutex_file.fileno(), fcntl.LOCK_UN)
+    self._update_cache(seq=entries[0].seq, offset=offset)
+    self._update_cache(seq=entries[1].seq, offset=offset + len(first))
+    return entries
+
   @property
   def pending_append_futures(
     self,

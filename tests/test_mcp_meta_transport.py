@@ -2,7 +2,6 @@
 
 import asyncio
 import sys
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -74,7 +73,6 @@ def _build_interactive_dispatcher(
     session_id=session.session_id,
     request_approval=None,
     needs_approval=lambda *_args: False,
-    approved_tool_types=set(),
     local_tool_handlers={},
     get_tool_definitions=mcp.get_tool_definitions,
     session=session,
@@ -93,7 +91,7 @@ class _FakeSession:
     name: str,
     arguments: dict[str, object],
     *,
-    read_timeout_seconds: float,
+    read_timeout_seconds: float | None,
     meta: dict[str, object] | None = None,
   ):
     self.calls.append(
@@ -628,7 +626,7 @@ def test_mcp_client_call_tool_forwards_meta_to_underlying_session() -> None:
   assert session.calls[0]["meta"] == {"session_id": "sess-1", "user_id": "42", "channel": "excel", "role": "invite"}
 
 
-def test_mcp_client_call_tool_uses_per_tool_timeout_before_server_timeout() -> None:
+def test_mcp_client_call_tool_sends_no_transport_deadline_and_resolves_expectations() -> None:
   manager = McpClientManager(
     config_path=None,
     timeout_overrides={"portfolio-reads-mcp": 120},
@@ -650,24 +648,23 @@ def test_mcp_client_call_tool_uses_per_tool_timeout_before_server_timeout() -> N
   result, error = _run(manager.call_tool("build_model", {"research_file_id": 1}))
   assert error is None
   assert result == {"ok": True}
-  assert session.calls[-1]["read_timeout_seconds"] == 300
+  assert session.calls[-1]["read_timeout_seconds"] is None
+  assert manager._expected_seconds_for_tool(
+    "portfolio-reads-mcp", "build_model", "build_model"
+  ) == 300
+  assert manager._expected_seconds_for_tool(
+    "portfolio-reads-mcp", "portfolio_summary", "portfolio_summary"
+  ) == 120
 
-  result, error = _run(manager.call_tool("portfolio_summary", {}))
-  assert error is None
-  assert result == {"ok": True}
-  assert session.calls[-1]["read_timeout_seconds"] == 120
 
-
-def test_mcp_client_call_tool_enforces_hard_timeout_when_sdk_cancel_is_slow(monkeypatch) -> None:
-  monkeypatch.setattr(mcp_client_module, "_MCP_TOOL_CANCEL_GRACE_SECONDS", 0.01)
+def test_mcp_client_call_past_its_expectation_returns_its_result_and_logs(caplog) -> None:
   manager = McpClientManager(
     config_path=None,
     tool_timeout_overrides={"portfolio-reads-mcp.slow_tool": 0.01},
   )
 
-  class _SlowCancellationSession:
+  class _SlowSession:
     def __init__(self) -> None:
-      self.calls: list[dict[str, Any]] = []
       self.cancelled = False
 
     async def call_tool(
@@ -675,45 +672,41 @@ def test_mcp_client_call_tool_enforces_hard_timeout_when_sdk_cancel_is_slow(monk
       name: str,
       arguments: dict[str, object],
       *,
-      read_timeout_seconds: float,
+      read_timeout_seconds: float | None,
       meta: dict[str, object] | None = None,
     ):
-      self.calls.append(
-        {
-          "name": name,
-          "tool_input": arguments,
-          "read_timeout_seconds": read_timeout_seconds,
-          "meta": meta,
-        }
-      )
+      _ = name, arguments, read_timeout_seconds, meta
       try:
-        await asyncio.sleep(60)
+        await asyncio.sleep(0.2)
       except asyncio.CancelledError:
         self.cancelled = True
-        await asyncio.sleep(2)
+        raise
       return CallToolResult(
         is_error=False,
         structured_content={"late": True},
         content=[],
       )
 
-  session = _SlowCancellationSession()
+  session = _SlowSession()
   manager._tool_to_server = {"slow_tool": "portfolio-reads-mcp"}
   manager._prefixed_to_original = {"slow_tool": "slow_tool"}
   manager._servers = {
     "portfolio-reads-mcp": _server_state(session),
   }
 
-  started = time.monotonic()
-  result, error = _run(manager.call_tool("slow_tool", {"ticker": "MSFT"}))
+  with caplog.at_level("WARNING", logger="agent_gateway.mcp_client"):
+    result, error = _run(manager.call_tool("slow_tool", {"ticker": "MSFT"}))
 
-  assert time.monotonic() - started < 0.5
-  assert result is None
-  assert error is not None
-  assert error["sub_code"] == "timeout"
-  assert "MCP tool slow_tool timed out after 0.01s" in error["message"]
-  assert session.cancelled is True
-  assert session.calls[0]["read_timeout_seconds"] == 0.01
+  assert error is None
+  assert result == {"late": True}
+  assert session.cancelled is False
+  warnings = [
+    record.getMessage()
+    for record in caplog.records
+    if record.name == "agent_gateway.mcp_client" and "exceeded its expected" in record.getMessage()
+  ]
+  assert len(warnings) == 1
+  assert "MCP tool slow_tool exceeded its expected 0.01s" in warnings[0]
 
 
 def test_mcp_client_call_tool_cancels_sdk_task_when_caller_is_cancelled() -> None:
@@ -729,7 +722,7 @@ def test_mcp_client_call_tool_cancels_sdk_task_when_caller_is_cancelled() -> Non
       name: str,
       arguments: dict[str, object],
       *,
-      read_timeout_seconds: float,
+      read_timeout_seconds: float | None,
       meta: dict[str, object] | None = None,
     ):
       _ = name, arguments, read_timeout_seconds, meta
@@ -766,16 +759,14 @@ def test_mcp_client_call_tool_cancels_sdk_task_when_caller_is_cancelled() -> Non
   assert session.cancelled is True
 
 
-def test_mcp_client_call_tool_preserves_caller_cancellation_racing_timeout_cleanup(monkeypatch) -> None:
+def test_mcp_client_call_tool_preserves_caller_cancellation_racing_abort_cleanup(monkeypatch) -> None:
   monkeypatch.setattr(mcp_client_module, "_MCP_TOOL_CANCEL_GRACE_SECONDS", 1.0)
-  manager = McpClientManager(
-    config_path=None,
-    tool_timeout_overrides={"portfolio-reads-mcp.slow_tool": 0.01},
-  )
+  manager = McpClientManager(config_path=None)
 
   async def _run_race() -> bool:
     caller_task = asyncio.current_task()
     assert caller_task is not None
+    abort_event = asyncio.Event()
 
     class _CallerCancellingSession:
       def __init__(self) -> None:
@@ -786,10 +777,11 @@ def test_mcp_client_call_tool_preserves_caller_cancellation_racing_timeout_clean
         name: str,
         arguments: dict[str, object],
         *,
-        read_timeout_seconds: float,
+        read_timeout_seconds: float | None,
         meta: dict[str, object] | None = None,
       ):
         _ = name, arguments, read_timeout_seconds, meta
+        asyncio.get_running_loop().call_soon(abort_event.set)
         try:
           await asyncio.sleep(60)
         except asyncio.CancelledError:
@@ -810,7 +802,7 @@ def test_mcp_client_call_tool_preserves_caller_cancellation_racing_timeout_clean
     }
 
     try:
-      await manager.call_tool("slow_tool", {"ticker": "MSFT"})
+      await manager.call_tool("slow_tool", {"ticker": "MSFT"}, abort_event=abort_event)
     except asyncio.CancelledError:
       return session.cancelled
     return False

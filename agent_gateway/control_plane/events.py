@@ -50,7 +50,7 @@ def _parse_projected_schema_version(raw: str | None) -> int | None:
     return None
   normalized = str(raw).strip().lower()
   if normalized not in _PROJECTED_SCHEMA_VERSION_ALIASES:
-    raise HTTPException(status_code=400, detail="schema_version must be v1")
+    log.info("control events requested schema_version=%r; projecting v1", raw)
   return DEFAULT_SCHEMA_VERSION
 
 
@@ -508,22 +508,26 @@ def build_events_router(
     projected_schema_version = _parse_projected_schema_version(schema_version)
     scoped_run_id = control_run_id or run_id
     if authenticated.kind == "chat":
+      # A chat bearer is minted for exactly one run: a chat token for run A cannot read run B's events.
       if scoped_run_id is not None and scoped_run_id != authenticated.session_id:
-        raise HTTPException(status_code=401, detail="Chat session token cannot subscribe to another run")
+        raise HTTPException(
+          status_code=401,
+          detail=(
+            "Chat session token cannot subscribe to another run; omit run_id to follow this "
+            "chat run, or subscribe with a control session token."
+          ),
+        )
       scoped_run_id = authenticated.session_id
-    elif authenticated.kind == "control":
-      if (
-        scoped_run_id is not None
-        and not _run_visible_to_session(
+    elif (
+      scoped_run_id is not None
+      and not _run_visible_to_session(
         auth=auth,
         app_state=request.app.state,
         authenticated=authenticated,
         run_id=scoped_run_id,
-        )
-      ):
-        raise HTTPException(status_code=404, detail="Run not found")
-    else:
-      raise HTTPException(status_code=401, detail="Chat or control session required")
+      )
+    ):
+      raise HTTPException(status_code=404, detail="Run not found")
 
     normalized_after_seq = (
       _normalize_after_seq(after_seq)

@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import math
 import re
 import secrets
 import time
@@ -12,6 +11,8 @@ from pathlib import Path
 from typing import Any, Literal, Mapping, overload
 
 from agent_workflow_contracts.research_file_contract import is_research_file_id
+from agent_workflow_contracts import ResolvedAuthority
+from agent_workflow_contracts.models import AdmittedContextWire
 
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CredentialHandle
@@ -35,13 +36,11 @@ AUTONOMOUS_CAPABILITY_ENVELOPE_ENV = (
 )
 AUTONOMOUS_TASK_ID_ENV = "AGENT_AUTONOMOUS_TASK_ID"
 AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE = (
-  "agent-gateway.autonomous-capability/v6"
+  "agent-gateway.autonomous-capability/v7"
 )
-AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION = 6
+AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION = 7
 AUTONOMOUS_CAPABILITY_ENVELOPE_TTL_SECONDS = 60
-AUTONOMOUS_CAPABILITY_ENVELOPE_MAX_TTL_SECONDS = 300
 AUTONOMOUS_CAPABILITY_ENVELOPE_CLOCK_SKEW_SECONDS = 5
-AUTONOMOUS_CAPABILITY_ENVELOPE_MAX_BYTES = 256 * 1024
 AUTONOMOUS_CAPABILITY_ENVELOPE_HMAC_MIN_BYTES = 32
 AUTONOMOUS_RUNTIME_SESSION_PURPOSE = "autonomous_runtime"
 
@@ -59,6 +58,8 @@ _ENVELOPE_FIELDS = frozenset({
   "exp_ns",
   "nonce",
   "capability_bind",
+  "admitted_context",
+  "tool_authority",
   "workload",
   "control_authority",
   "session_authority",
@@ -74,7 +75,6 @@ _WORKLOAD_FIELDS = frozenset({
   "ticker",
   "research_file_id",
   "dev_mode",
-  "max_budget_usd",
   "deliver",
   "admitted_skill_execution_limits",
   "session_log_authority",
@@ -129,13 +129,15 @@ def _closed_mapping(
   *,
   field_name: str,
   fields: frozenset[str],
+  optional_fields: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
   if not isinstance(value, Mapping):
     raise ValueError(
       f"autonomous capability envelope {field_name} must be an object"
     )
   payload = dict(value)
-  if set(payload) != fields:
+  present_fields = set(payload)
+  if present_fields - fields or fields - present_fields - optional_fields:
     raise ValueError(
       f"autonomous capability envelope {field_name} violates its closed contract"
     )
@@ -215,8 +217,7 @@ def _canonical_workload_text(
     raise ValueError(
       f"autonomous launch workload {field_name} must be canonical"
     )
-  max_bytes = 64 * 1024 if free_text else 512
-  if len(value.encode("utf-8")) > max_bytes or "\x00" in value:
+  if "\x00" in value:
     raise ValueError(
       f"autonomous launch workload {field_name} is invalid"
     )
@@ -228,25 +229,6 @@ def _canonical_workload_text(
       f"autonomous launch workload {field_name} is invalid"
     )
   return value
-
-
-def _workload_budget(value: object) -> float | None:
-  if value is None:
-    return None
-  if (
-    type(value) is not float
-  ):
-    raise ValueError(
-      "autonomous launch workload max_budget_usd "
-      "must be null or a finite positive number"
-    )
-  budget = float(value)
-  if not math.isfinite(budget) or budget <= 0:
-    raise ValueError(
-      "autonomous launch workload max_budget_usd "
-      "must be null or a finite positive number"
-    )
-  return budget
 
 
 def _workload_research_file_id(value: object) -> int | None:
@@ -364,10 +346,6 @@ class AutonomousDispatchScope:
       self.portfolio_name,
       field_name="dispatch_scope.portfolio_name",
     )
-    if len(portfolio_name) > 256:
-      raise ValueError(
-        "autonomous dispatch scope portfolio_name exceeds 256 characters"
-      )
     portfolio_id = _optional_text(
       self.portfolio_id,
       field_name="dispatch_scope.portfolio_id",
@@ -376,14 +354,6 @@ class AutonomousDispatchScope:
       self.display_name,
       field_name="dispatch_scope.display_name",
     )
-    if portfolio_id is not None and len(portfolio_id) > 256:
-      raise ValueError(
-        "autonomous dispatch scope portfolio_id exceeds 256 characters"
-      )
-    if display_name is not None and len(display_name) > 256:
-      raise ValueError(
-        "autonomous dispatch scope display_name exceeds 256 characters"
-      )
     object.__setattr__(self, "portfolio_name", portfolio_name)
     object.__setattr__(self, "portfolio_id", portfolio_id)
     object.__setattr__(self, "display_name", display_name)
@@ -430,13 +400,13 @@ class AutonomousLaunchWorkload:
   ticker: str | None
   research_file_id: int | None
   dev_mode: bool
-  max_budget_usd: float | None
   deliver: bool
-  # These are not executable CLI arguments, so the entrypoint's workload
-  # comparison intentionally ignores them. They remain mandatory in every
-  # signed v6 receipt and are verified independently before bootstrap.
+  # Neither value is an executable CLI argument, so workload comparison ignores
+  # them. Limits are optional observations; session-log authority is verified
+  # independently before bootstrap.
   admitted_skill_execution_limits: SkillExecutionLimits | None = field(
-    compare=False
+    default=None,
+    compare=False,
   )
   session_log_authority: AutonomousSessionLogAuthority | None = field(
     default=None,
@@ -475,15 +445,6 @@ class AutonomousLaunchWorkload:
       raise TypeError(
         "autonomous launch workload session_log_authority must be exact"
       )
-    if self.mode == "skill":
-      if type(self.admitted_skill_execution_limits) is not SkillExecutionLimits:
-        raise TypeError(
-          "skill autonomous launch workload requires exact admitted limits"
-        )
-    elif self.admitted_skill_execution_limits is not None:
-      raise ValueError(
-        "non-skill autonomous launch workload cannot carry admitted limits"
-      )
 
     task = _canonical_workload_text(
       self.task,
@@ -512,7 +473,6 @@ class AutonomousLaunchWorkload:
       field_name="ticker",
       optional=True,
     )
-    budget = _workload_budget(self.max_budget_usd)
     research_file_id = _workload_research_file_id(self.research_file_id)
 
     if self.mode == "run_once":
@@ -524,8 +484,6 @@ class AutonomousLaunchWorkload:
         or ticker is not None
         or research_file_id is not None
         or self.dev_mode
-        or budget is not None
-        or not self.deliver
       )
     elif self.mode == "task":
       invalid = (
@@ -535,8 +493,6 @@ class AutonomousLaunchWorkload:
         or context is not None
         or ticker is not None
         or self.dev_mode
-        or budget is not None
-        or not self.deliver
       )
     elif self.mode == "pack":
       invalid = (
@@ -547,8 +503,6 @@ class AutonomousLaunchWorkload:
         or ticker is not None
         or research_file_id is not None
         or self.dev_mode
-        or budget is not None
-        or not self.deliver
       )
     else:
       invalid = (
@@ -568,7 +522,6 @@ class AutonomousLaunchWorkload:
     object.__setattr__(self, "context", context)
     object.__setattr__(self, "ticker", ticker)
     object.__setattr__(self, "research_file_id", research_file_id)
-    object.__setattr__(self, "max_budget_usd", budget)
 
   @classmethod
   def from_receipt(
@@ -579,6 +532,7 @@ class AutonomousLaunchWorkload:
       value,
       field_name="workload",
       fields=_WORKLOAD_FIELDS,
+      optional_fields=frozenset({"admitted_skill_execution_limits"}),
     )
     try:
       session_log_authority = AutonomousSessionLogAuthority.from_receipt(
@@ -588,7 +542,7 @@ class AutonomousLaunchWorkload:
       raise ValueError(
         "autonomous launch workload session_log_authority is invalid"
       ) from exc
-    admitted_limits_payload = payload["admitted_skill_execution_limits"]
+    admitted_limits_payload = payload.get("admitted_skill_execution_limits")
     try:
       admitted_limits = (
         skill_execution_limits_from_mapping(
@@ -620,7 +574,6 @@ class AutonomousLaunchWorkload:
       "ticker": self.ticker,
       "research_file_id": self.research_file_id,
       "dev_mode": self.dev_mode,
-      "max_budget_usd": self.max_budget_usd,
       "deliver": self.deliver,
       "admitted_skill_execution_limits": (
         skill_execution_limits_to_mapping(
@@ -1209,6 +1162,7 @@ class AutonomousLaunchEnvelope:
   control_authority: AutonomousControlAuthority
   session_authority: AutonomousSessionAuthority
   signature: str
+  admitted: tuple[AdmittedContextWire, ResolvedAuthority] | None = None
 
   def payload(self) -> dict[str, Any]:
     return {
@@ -1222,6 +1176,12 @@ class AutonomousLaunchEnvelope:
       "exp_ns": self.exp_ns,
       "nonce": self.nonce,
       "capability_bind": self.bind.to_json(),
+      "admitted_context": (
+        self.admitted[0].model_dump(mode="json") if self.admitted is not None else None
+      ),
+      "tool_authority": (
+        self.admitted[1].model_dump(mode="json") if self.admitted is not None else None
+      ),
       "workload": self.workload.receipt(),
       "control_authority": self.control_authority.receipt(),
       "session_authority": self.session_authority.receipt(),
@@ -1278,15 +1238,52 @@ def _autonomous_bind(bind: object) -> CapabilityBind:
     raise TypeError(
       "autonomous capability envelope bind must be CapabilityBind"
     )
-  if bind.capability_id != SESSION_DRIVER_CAPABILITY:
-    raise ValueError(
-      "autonomous capability envelope requires a session.driver bind"
-    )
   if bind.run_mode not in {"autonomous", "cron"}:
     raise ValueError(
       "autonomous capability envelope bind must use autonomous or cron run mode"
     )
   return bind
+
+
+def _reject_admitted_nul(value: Any) -> None:
+  if isinstance(value, str):
+    if "\x00" in value:
+      raise ValueError("autonomous envelope admitted authority contains NUL")
+  elif isinstance(value, Mapping):
+    for name, child in value.items():
+      _reject_admitted_nul(name)
+      _reject_admitted_nul(child)
+  elif isinstance(value, (list, tuple)):
+    for child in value:
+      _reject_admitted_nul(child)
+
+
+def _admitted_launch_authority(
+  context: object,
+  authority: object,
+  *,
+  bind: CapabilityBind,
+) -> tuple[AdmittedContextWire, ResolvedAuthority] | None:
+  if context is None and authority is None:
+    if bind.capability_id != SESSION_DRIVER_CAPABILITY:
+      raise ValueError("unadmitted autonomous envelope requires a session.driver bind")
+    return None
+  if context is None or authority is None:
+    raise ValueError("admitted_context and tool_authority must both be null or present")
+  try:
+    wire = AdmittedContextWire.model_validate(context)
+    resolved = ResolvedAuthority.model_validate(authority)
+  except (TypeError, ValueError) as exc:
+    raise ValueError("autonomous envelope admitted authority is invalid") from exc
+  for original, model in ((context, wire), (authority, resolved)):
+    payload = model.model_dump(mode="json")
+    canonical = _canonical_json(payload)
+    _reject_admitted_nul(payload)
+    if isinstance(original, Mapping) and _canonical_json(original) != canonical:
+      raise ValueError("autonomous envelope admitted authority must be canonical")
+  if bind != wire.capability_bind:
+    raise ValueError("autonomous envelope bind does not match admitted context")
+  return wire, resolved
 
 
 def _closed_object(
@@ -1438,6 +1435,8 @@ def sign_autonomous_launch_envelope(
   workload: AutonomousLaunchWorkload,
   control_authority: AutonomousControlAuthority,
   session_authority: AutonomousSessionAuthority,
+  admitted_context: AdmittedContextWire | None = None,
+  tool_authority: ResolvedAuthority | None = None,
   ttl_seconds: int = AUTONOMOUS_CAPABILITY_ENVELOPE_TTL_SECONDS,
   now_ns: int | None = None,
   nonce: str | None = None,
@@ -1445,6 +1444,7 @@ def sign_autonomous_launch_envelope(
   """Return the sole canonical signed launch-envelope contract."""
 
   bind = _autonomous_bind(bind)
+  admitted = _admitted_launch_authority(admitted_context, tool_authority, bind=bind)
   if type(workload) is not AutonomousLaunchWorkload:
     raise TypeError(
       "autonomous capability envelope workload "
@@ -1463,12 +1463,12 @@ def sign_autonomous_launch_envelope(
     raise TypeError(
       "autonomous capability envelope ttl_seconds must be an integer"
     )
-  if not 1 <= ttl_seconds <= (
-    AUTONOMOUS_CAPABILITY_ENVELOPE_MAX_TTL_SECONDS
-  ):
+  # The TTL is a measurement the envelope carries (iat_ns/exp_ns), not a ceiling:
+  # a launch is bounded by expiry against now and by its single-use nonce
+  # (launch_nonce_store), and a window must still close after it opens.
+  if ttl_seconds < 1:
     raise ValueError(
-      "autonomous capability envelope ttl_seconds must be between 1 and "
-      f"{AUTONOMOUS_CAPABILITY_ENVELOPE_MAX_TTL_SECONDS}"
+      "autonomous capability envelope ttl_seconds must be positive"
     )
   issued_at_ns = _timestamp_ns(
     time.time_ns() if now_ns is None else now_ns,
@@ -1535,6 +1535,12 @@ def sign_autonomous_launch_envelope(
     "exp_ns": expires_at_ns,
     "nonce": resolved_nonce,
     "capability_bind": bind.to_json(),
+    "admitted_context": (
+      admitted[0].model_dump(mode="json") if admitted is not None else None
+    ),
+    "tool_authority": (
+      admitted[1].model_dump(mode="json") if admitted is not None else None
+    ),
     "workload": workload.receipt(),
     "control_authority": control_authority.receipt(),
     "session_authority": session_authority.receipt(),
@@ -1543,13 +1549,6 @@ def sign_autonomous_launch_envelope(
     **unsigned_payload,
     "signature": _signature(secret, unsigned_payload),
   })
-  if (
-    len(envelope_json.encode("utf-8"))
-    > AUTONOMOUS_CAPABILITY_ENVELOPE_MAX_BYTES
-  ):
-    raise ValueError(
-      "autonomous capability envelope exceeds its byte bound"
-    )
   return envelope_json
 
 
@@ -1559,9 +1558,6 @@ def _decode_autonomous_launch_envelope(
   *,
   authenticate_signature: bool,
   now_ns: int | None = None,
-  max_ttl_seconds: int = (
-    AUTONOMOUS_CAPABILITY_ENVELOPE_MAX_TTL_SECONDS
-  ),
   clock_skew_seconds: int = (
     AUTONOMOUS_CAPABILITY_ENVELOPE_CLOCK_SKEW_SECONDS
   ),
@@ -1572,13 +1568,6 @@ def _decode_autonomous_launch_envelope(
     raise ValueError(
       "autonomous capability envelope "
       "must be a non-empty JSON string"
-    )
-  if (
-    len(envelope_json.encode("utf-8"))
-    > AUTONOMOUS_CAPABILITY_ENVELOPE_MAX_BYTES
-  ):
-    raise ValueError(
-      "autonomous capability envelope exceeds its byte bound"
     )
   try:
     raw = json.loads(
@@ -1675,15 +1664,6 @@ def _decode_autonomous_launch_envelope(
   issued_at_ns = _timestamp_ns(raw["iat_ns"], field_name="iat_ns")
   expires_at_ns = _timestamp_ns(raw["exp_ns"], field_name="exp_ns")
   if (
-    isinstance(max_ttl_seconds, bool)
-    or not isinstance(max_ttl_seconds, int)
-    or max_ttl_seconds < 1
-  ):
-    raise ValueError(
-      "autonomous capability envelope "
-      "max_ttl_seconds must be positive"
-    )
-  if (
     isinstance(clock_skew_seconds, bool)
     or not isinstance(clock_skew_seconds, int)
     or clock_skew_seconds < 0
@@ -1695,13 +1675,6 @@ def _decode_autonomous_launch_envelope(
   if expires_at_ns <= issued_at_ns:
     raise ValueError(
       "autonomous capability envelope expiry must follow issuance"
-    )
-  if (
-    expires_at_ns - issued_at_ns
-    > max_ttl_seconds * 1_000_000_000
-  ):
-    raise ValueError(
-      "autonomous capability envelope TTL exceeds the allowed maximum"
     )
   current_time_ns = _timestamp_ns(
     time.time_ns() if now_ns is None else now_ns,
@@ -1733,6 +1706,9 @@ def _decode_autonomous_launch_envelope(
       f"autonomous capability envelope bind is invalid: {exc}"
     ) from exc
   bind = _autonomous_bind(bind)
+  admitted = _admitted_launch_authority(
+    raw["admitted_context"], raw["tool_authority"], bind=bind,
+  )
   try:
     workload = AutonomousLaunchWorkload.from_receipt(
       raw["workload"]
@@ -1791,6 +1767,7 @@ def _decode_autonomous_launch_envelope(
     control_authority=control_authority,
     session_authority=session_authority,
     signature=signature,
+    admitted=admitted,
   )
 
 
@@ -1799,9 +1776,6 @@ def verify_autonomous_launch_envelope(
   envelope_json: str,
   *,
   now_ns: int | None = None,
-  max_ttl_seconds: int = (
-    AUTONOMOUS_CAPABILITY_ENVELOPE_MAX_TTL_SECONDS
-  ),
   clock_skew_seconds: int = (
     AUTONOMOUS_CAPABILITY_ENVELOPE_CLOCK_SKEW_SECONDS
   ),
@@ -1813,7 +1787,6 @@ def verify_autonomous_launch_envelope(
     envelope_json,
     authenticate_signature=True,
     now_ns=now_ns,
-    max_ttl_seconds=max_ttl_seconds,
     clock_skew_seconds=clock_skew_seconds,
   )
 
@@ -1837,8 +1810,6 @@ __all__ = [
   "AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE",
   "AUTONOMOUS_CAPABILITY_ENVELOPE_CLOCK_SKEW_SECONDS",
   "AUTONOMOUS_CAPABILITY_ENVELOPE_ENV",
-  "AUTONOMOUS_CAPABILITY_ENVELOPE_MAX_TTL_SECONDS",
-  "AUTONOMOUS_CAPABILITY_ENVELOPE_MAX_BYTES",
   "AUTONOMOUS_CAPABILITY_ENVELOPE_HMAC_MIN_BYTES",
   "AUTONOMOUS_CAPABILITY_ENVELOPE_TTL_SECONDS",
   "AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION",

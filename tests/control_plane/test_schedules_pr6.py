@@ -12,6 +12,9 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from agent_gateway.approval_route import ControlPlaneApprovalRoute
+from agent_gateway.approval_store import SQLiteApprovalStore
+from agent_gateway.single_user_policy import SingleUserApprovalPolicy
 from agent_gateway.autonomous_runner import AutonomousRegistry
 from agent_gateway.autonomous_runner_state import AutonomousTask
 from model_authority.bind import CapabilityBind
@@ -407,39 +410,6 @@ async def test_jobs_schedule_list_passes_backend_frequency_through() -> None:
   assert detail_calls == []
 
 
-def test_launchd_schedule_create_is_rejected_before_backend_call(
-  fake_schedule_backends,
-) -> None:
-  app = _make_app(fake_schedule_backends["backend"])
-  with TestClient(app) as client:
-    session = _control_session(client, "alice", role="owner")
-    headers = _headers(session)
-
-    create = client.post(
-      "/api/control/schedules",
-      headers=headers,
-      json={
-        "source": "launchd",
-        "name": "daily-close",
-        "command": ["/usr/bin/python3", "task.py"],
-        "schedule": {"hour": 9, "minute": 30},
-        "working_directory": "/tmp",
-        "log_file": "/tmp/daily-close.log",
-        "comment": "market close prep",
-      },
-    )
-
-    assert create.status_code == 403, create.text
-    assert create.json()["detail"] == {
-      "error": "launchd_schedule_creation_forbidden",
-      "message": (
-        "The Agent Control API cannot create launchd schedules. "
-        "Install approved launchd jobs through deployment-managed templates."
-      ),
-    }
-    assert fake_schedule_backends["calls"]["launchd_create"] == []
-
-
 def test_existing_launchd_schedule_list_show_logs_toggle_delete(fake_schedule_backends) -> None:
   fake_schedule_backends["launchd"]["daily-close"] = {
     "command": ["/usr/bin/python3", "task.py"],
@@ -474,11 +444,7 @@ def test_existing_launchd_schedule_list_show_logs_toggle_delete(fake_schedule_ba
     assert disabled.json()["schedule"]["enabled"] is False
     assert fake_schedule_backends["calls"]["launchd_disable"] == ["daily-close"]
 
-    missing_confirm = client.delete("/api/control/schedules/daily-close", headers=headers)
-    assert missing_confirm.status_code == 400
-    assert "confirm=true" in missing_confirm.json()["detail"]
-
-    deleted = client.delete("/api/control/schedules/daily-close?confirm=true", headers=headers)
+    deleted = client.delete("/api/control/schedules/daily-close", headers=headers)
     assert deleted.status_code == 200, deleted.text
     assert deleted.json() == {"deleted": True, "name": "daily-close", "source": "launchd"}
     assert fake_schedule_backends["calls"]["launchd_delete"] == [{"name": "daily-close", "confirm": True}]
@@ -556,10 +522,7 @@ def test_jobs_mcp_schedule_create_list_show_toggle_delete(fake_schedule_backends
       {"schedule_id": "sched_weekly-oi", "enabled": False}
     ]
 
-    missing_confirm = client.delete("/api/control/schedules/weekly-oi", headers=headers)
-    assert missing_confirm.status_code == 400
-
-    deleted = client.delete("/api/control/schedules/weekly-oi?confirm=true", headers=headers)
+    deleted = client.delete("/api/control/schedules/weekly-oi", headers=headers)
     assert deleted.status_code == 200, deleted.text
     assert deleted.json() == {"deleted": True, "name": "weekly-oi", "source": "jobs-mcp"}
     assert fake_schedule_backends["calls"]["jobs_delete"] == [
@@ -618,17 +581,6 @@ def test_operator_schedule_surfaces_are_owner_only(fake_schedule_backends) -> No
         "/api/control/schedules",
         headers=invite_headers,
         json={
-          "source": "launchd",
-          "name": "invite-launchd",
-          "command": ["/bin/echo", "no"],
-          "schedule": {"hour": 9},
-          "working_directory": "/tmp",
-        },
-      ),
-      client.post(
-        "/api/control/schedules",
-        headers=invite_headers,
-        json={
           "source": "jobs-mcp",
           "name": "invite-job",
           "job_type": "oi_analysis",
@@ -647,11 +599,11 @@ def test_operator_schedule_surfaces_are_owner_only(fake_schedule_backends) -> No
         json={"enabled": False},
       ),
       client.delete(
-        "/api/control/schedules/daily-close?confirm=true",
+        "/api/control/schedules/daily-close",
         headers=invite_headers,
       ),
       client.delete(
-        "/api/control/schedules/weekly-oi?confirm=true",
+        "/api/control/schedules/weekly-oi",
         headers=invite_headers,
       ),
     )
@@ -741,27 +693,24 @@ def test_web_schedule_reads_are_projected_and_raw_fields_redacted(fake_schedule_
     assert "command" not in detail.json()
     assert "working_directory" not in detail.json()
     assert "recent_log_lines" not in detail.json()
-    assert logs.status_code == 403
-    assert logs.json()["detail"]["error"] == "web_control_schedule_logs_forbidden"
+    assert logs.status_code == 200, logs.text
+    assert logs.json() == {"name": "daily-close", "log_lines": ["secret log"]}
 
 
-def test_web_raw_schedule_writes_are_rejected_before_backends(fake_schedule_backends) -> None:
+def test_web_owner_operator_schedule_writes_reach_backends(fake_schedule_backends) -> None:
+  fake_schedule_backends["launchd"]["daily-close"] = {
+    "command": ["/bin/echo", "launchd"],
+    "working_directory": "/tmp",
+    "schedule_description": "Daily at 9:30 AM",
+    "enabled": True,
+    "last_exit_status": 0,
+    "recent_log_lines": [],
+  }
   app = _make_app(fake_schedule_backends["backend"])
   with TestClient(app) as client:
     session = _control_session(client, "alice", channel="web", role="owner")
     headers = _headers(session)
 
-    create_launchd = client.post(
-      "/api/control/schedules",
-      headers=headers,
-      json={
-        "source": "launchd",
-        "name": "daily-close",
-        "command": ["/usr/bin/python3", "task.py"],
-        "schedule": {"hour": 9, "minute": 30},
-        "working_directory": "/tmp",
-      },
-    )
     create_jobs = client.post(
       "/api/control/schedules",
       headers=headers,
@@ -772,18 +721,23 @@ def test_web_raw_schedule_writes_are_rejected_before_backends(fake_schedule_back
         "frequency": "weekly",
         "time_of_day": "08:15",
         "day_of_week": 0,
+        "params": {"symbols": ["AAPL"]},
       },
     )
     toggle = client.put("/api/control/schedules/daily-close/enabled", headers=headers, json={"enabled": False})
-    delete = client.delete("/api/control/schedules/daily-close?confirm=true", headers=headers)
+    delete = client.delete("/api/control/schedules/daily-close", headers=headers)
 
-    for response in (create_launchd, create_jobs, toggle, delete):
-      assert response.status_code == 403, response.text
-      assert response.json()["detail"]["error"] == "web_control_raw_schedule_forbidden"
-    assert fake_schedule_backends["calls"]["launchd_create"] == []
-    assert fake_schedule_backends["calls"]["launchd_disable"] == []
-    assert fake_schedule_backends["calls"]["launchd_delete"] == []
-    assert fake_schedule_backends["calls"]["jobs_create"] == []
+    assert create_jobs.status_code == 201, create_jobs.text
+    assert create_jobs.json()["schedule"]["kind"] == "operator_schedule"
+    assert "params" not in create_jobs.json()["schedule"]
+    assert toggle.status_code == 200, toggle.text
+    assert toggle.json()["schedule"]["enabled"] is False
+    assert "command" not in toggle.json()["schedule"]
+    assert delete.status_code == 200, delete.text
+    assert delete.json() == {"deleted": True, "name": "daily-close", "source": "launchd"}
+    assert [call["name"] for call in fake_schedule_backends["calls"]["jobs_create"]] == ["weekly-oi"]
+    assert fake_schedule_backends["calls"]["launchd_disable"] == ["daily-close"]
+    assert fake_schedule_backends["calls"]["launchd_delete"] == [{"name": "daily-close", "confirm": True}]
 
 
 def _agent_run_schedule_payload(**overrides: Any) -> dict[str, Any]:
@@ -840,6 +794,11 @@ def test_schedule_create_stamps_exact_dispatch_role(
   record = store.create(request, session)
 
   assert record["dispatch_role"] == role
+  assert record["dispatch_text_lengths"] == {
+    "profile": len("analyst"),
+    "skill": len("earnings-review"),
+    "context": len("Review new earnings/news and report material changes."),
+  }
   assert record["dispatch_revision"] == 1
   assert record["dispatch_authored_by"] == "alice"
 
@@ -870,7 +829,7 @@ def test_schedule_create_rejects_mixed_case_role(tmp_path: Path) -> None:
     store.create(request, session)
 
 
-def test_schedule_dispatch_authority_tracks_dispatch_revision_and_enable_gate(
+def test_schedule_dispatch_authority_tracks_dispatch_revision_and_enabling_role(
   fake_schedule_backends,
 ) -> None:
   app = _make_app(fake_schedule_backends["backend"])
@@ -926,7 +885,14 @@ def test_schedule_dispatch_authority_tracks_dispatch_revision_and_enable_gate(
       headers=headers,
       json={"kind": "agent_run_schedule", "enabled": True},
     )
-    assert owner_enable_invite_dispatch.status_code == 403
+    assert owner_enable_invite_dispatch.status_code == 200, owner_enable_invite_dispatch.text
+    stored = app.state.agent_run_schedule_store_for("alice").get_for_owner("alice", schedule_id)
+    assert stored is not None
+    assert (stored["enabled"], stored["dispatch_role"], stored["dispatch_revision"]) == (
+      True,
+      "owner",
+      1,
+    )
 
     dispatch_response = client.patch(
       f"/api/control/schedules/{schedule_id}",
@@ -943,12 +909,6 @@ def test_schedule_dispatch_authority_tracks_dispatch_revision_and_enable_gate(
       },
     )
     assert dispatch_response.status_code == 200, dispatch_response.text
-    owner_enabled = client.put(
-      f"/api/control/schedules/{schedule_id}/enabled",
-      headers=headers,
-      json={"enabled": True},
-    )
-    assert owner_enabled.status_code == 200, owner_enabled.text
     disabled = client.put(
       f"/api/control/schedules/{schedule_id}/enabled",
       headers=headers,
@@ -963,43 +923,19 @@ def test_schedule_dispatch_authority_tracks_dispatch_revision_and_enable_gate(
     headers = {
       "Authorization": f"Bearer {app.state.auth.issue_token(live_session)}"
     }
-    patch_enable = client.patch(
-      f"/api/control/schedules/{schedule_id}",
-      headers=headers,
-      json={"kind": "agent_run_schedule", "enabled": True},
-    )
     put_enable = client.put(
       f"/api/control/schedules/{schedule_id}/enabled",
       headers=headers,
       json={"enabled": True},
     )
-    assert patch_enable.status_code == 403
-    assert put_enable.status_code == 403
-
-    recapture = client.patch(
-      f"/api/control/schedules/{schedule_id}",
-      headers=headers,
-      json={
-        "kind": "agent_run_schedule",
-        "dispatch": {
-          "kind": "autonomous",
-          "profile": "analyst",
-          "mode": "skill",
-          "skill": "earnings-review",
-          "context": "Invite-authored revision",
-        },
-      },
-    )
-    assert recapture.status_code == 200, recapture.text
-    enabled = client.put(
-      f"/api/control/schedules/{schedule_id}/enabled",
-      headers=headers,
-      json={"enabled": True},
-    )
-    assert enabled.status_code == 200, enabled.text
+    assert put_enable.status_code == 200, put_enable.text
     stored = app.state.agent_run_schedule_store_for("alice").get_for_owner("alice", schedule_id)
     assert stored is not None
-    assert (stored["dispatch_role"], stored["dispatch_revision"]) == ("invite", 3)
+    assert (stored["enabled"], stored["dispatch_role"], stored["dispatch_revision"]) == (
+      True,
+      "invite",
+      2,
+    )
 
 
 def test_web_agent_run_schedule_crud_is_safe_and_owner_scoped(fake_schedule_backends) -> None:
@@ -1173,7 +1109,7 @@ def test_web_agent_run_schedule_crud_is_safe_and_owner_scoped(fake_schedule_back
           started_at=1_700_000_000.0,
           skill_resume_allowed=False,
           admitted_skill_execution_limits=(
-            SkillExecutionLimits(None, None, None)
+            SkillExecutionLimits(None)
             if kwargs["mode"] == "skill"
             else None
           ),
@@ -1201,6 +1137,7 @@ def test_web_agent_run_schedule_crud_is_safe_and_owner_scoped(fake_schedule_back
     assert run_now_payload["run"]["schedule_name"] == "weekday-nvda-earnings-watch"
     assert fake_registry.user_event_bus is not None
     assert fake_registry.starts[0] == {
+      "parent": app.state.auth.session_store.get_session(alice["session_id"]).admitted_job_context,
       "role": "invite",
       "profile": "analyst",
       "mode": "skill",
@@ -1235,6 +1172,56 @@ def test_web_agent_run_schedule_crud_is_safe_and_owner_scoped(fake_schedule_back
     }
     assert fake_schedule_backends["calls"]["launchd_create"] == []
     assert fake_schedule_backends["calls"]["jobs_create"] == []
+
+
+def test_schedule_run_now_forwards_authenticated_parent(
+  fake_schedule_backends,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  app = _make_app(fake_schedule_backends["backend"])
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice", channel="web")
+    headers = _headers(alice)
+    session = app.state.auth.session_store.get_session(alice["session_id"])
+    assert session is not None
+    created = client.post(
+      "/api/control/schedules",
+      headers=headers,
+      json=_agent_run_schedule_payload(),
+    )
+    assert created.status_code == 201, created.text
+    schedule_id = created.json()["schedule"]["schedule_id"]
+    starts: list[dict[str, Any]] = []
+
+    async def capture_start(**kwargs: Any) -> dict[str, Any]:
+      starts.append(kwargs)
+      raise ValueError("launch captured before process creation")
+
+    registry = AutonomousRegistry(
+      api_dir=fake_schedule_backends["tmp_path"] / "parent-registry-api",
+      log_dir=fake_schedule_backends["tmp_path"] / "parent-registry-logs",
+    )
+    monkeypatch.setattr(registry, "start", capture_start)
+    app.state.agent_run_schedule_runner.autonomous_registry = registry
+    response = client.post(
+      f"/api/control/schedules/{schedule_id}/run-now",
+      headers=headers,
+      json={},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == "launch captured before process creation"
+    assert len(starts) == 1
+    parent = starts[0]["parent"]
+    assert parent is session.admitted_job_context
+    assert parent.tenant is not None
+    assert parent.tenant.tenant_id == session.tenant_id
+    assert parent.tenant.storage_id == session.owner_user_id
+    assert parent.tenant.role == session.role
+    assert parent.job_id == session.session_id
+    assert parent.research_binding.research_file_id is None
+    assert parent.research_binding.ticker is None
+    assert parent.withheld == frozenset()
+
 
 
 def test_web_agent_run_schedule_create_validates_dispatch_scope(fake_schedule_backends) -> None:
@@ -1291,42 +1278,9 @@ def test_web_agent_run_schedule_create_validates_dispatch_scope(fake_schedule_ba
     assert create.json()["schedule"]["dispatch"]["dispatch_scope"] == canonical_scope
 
 
-def test_web_agent_run_schedule_create_rejects_unknown_dispatch_scope(fake_schedule_backends) -> None:
-  def validator(_session: Any, _scope: dict[str, Any]) -> None:
-    raise ValueError("portfolio not visible")
-
-  app = _make_app(fake_schedule_backends["backend"], dispatch_scope_validator=validator)
-  with TestClient(app) as client:
-    alice = _control_session(client, "alice", channel="web")
-    response = client.post(
-      "/api/control/schedules",
-      headers=_headers(alice),
-      json=_agent_run_schedule_payload(
-        name="unknown-portfolio-risk",
-        request_id="unknown-portfolio-risk-1",
-        dispatch={
-          "kind": "autonomous",
-          "profile": "analyst",
-          "mode": "skill",
-          "skill": "portfolio_risk",
-          "context": "Review daily risk.",
-          "dispatch_scope": {
-            "kind": "portfolio",
-            "source": "user_selected",
-            "portfolio_name": "unknown_book",
-          },
-        },
-      ),
-    )
-
-    assert response.status_code == 422
-    assert response.json()["detail"] == {
-      "error": "dispatch_scope_validation_failed",
-      "message": "portfolio not visible",
-    }
-
-
-def test_web_agent_run_schedule_rejects_task_mode_dispatch(fake_schedule_backends) -> None:
+def test_web_agent_run_schedule_accepts_task_mode_and_records_text_lengths(fake_schedule_backends) -> None:
+  task = "Review the portfolio. " * 200
+  context = "Prior notes. " * 1000
   app = _make_app(fake_schedule_backends["backend"])
   with TestClient(app) as client:
     session = _control_session(client, "alice", channel="web")
@@ -1340,15 +1294,20 @@ def test_web_agent_run_schedule_rejects_task_mode_dispatch(fake_schedule_backend
           "kind": "autonomous",
           "profile": "analyst",
           "mode": "task",
-          "task": "Review the portfolio.",
+          "task": task,
+          "context": context,
         },
       ),
     )
 
-    assert response.status_code == 403, response.text
-    assert response.json()["detail"]["error"] == "web_control_dev_dispatch_forbidden"
-    assert fake_schedule_backends["calls"]["launchd_create"] == []
-    assert fake_schedule_backends["calls"]["jobs_create"] == []
+    assert response.status_code == 201, response.text
+    schedule = response.json()["schedule"]
+    assert schedule["dispatch"]["mode"] == "task"
+    assert schedule["dispatch_text_lengths"] == {
+      "profile": len("analyst"),
+      "task": len(task),
+      "context": len(context),
+    }
 
 
 def test_owned_schedule_takes_precedence_over_operator_name_collision(fake_schedule_backends) -> None:
@@ -1387,7 +1346,7 @@ def test_owned_schedule_takes_precedence_over_operator_name_collision(fake_sched
     assert safe_detail.json()["source"] == "agent-gateway"
     assert safe_detail.json()["enabled"] is False
 
-    deleted = client.delete("/api/control/schedules/daily-close?confirm=true", headers=headers)
+    deleted = client.delete("/api/control/schedules/daily-close", headers=headers)
     assert deleted.status_code == 200, deleted.text
     assert deleted.json() == {"deleted": True, "name": "daily-close", "source": "agent-gateway"}
 
@@ -1516,6 +1475,9 @@ def test_per_user_schedule_files_are_isolated_and_one_tick_fires_both_owners(
       super().__init__(
         api_dir=fake_schedule_backends["tmp_path"] / "tick-registry-api",
         log_dir=fake_schedule_backends["tmp_path"] / "tick-registry-logs",
+        tenant_id="test-product",
+        approval_store=SQLiteApprovalStore(fake_schedule_backends["tmp_path"] / "tick-approvals.sqlite3"),
+        approval_policy=SingleUserApprovalPolicy(),
       )
       self.starts: list[dict[str, Any]] = []
 
@@ -1584,6 +1546,68 @@ def test_per_user_schedule_files_are_isolated_and_one_tick_fires_both_owners(
   assert {start["user_id"] for start in registry.starts} == {"alice", "bob"}
 
 
+def test_native_schedule_due_fire_forwards_control_plane_parent(
+  fake_schedule_backends,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  app = _make_app(fake_schedule_backends["backend"])
+  root = fake_schedule_backends["tmp_path"]
+  approval_store = SQLiteApprovalStore(root / "due-parent-approvals.sqlite3")
+  approval_policy = SingleUserApprovalPolicy()
+  registry = AutonomousRegistry(
+    api_dir=root / "due-parent-api",
+    log_dir=root / "due-parent-logs",
+    tenant_id="test-product",
+    approval_store=approval_store,
+    approval_policy=approval_policy,
+  )
+  starts: list[dict[str, Any]] = []
+
+  async def capture_start(**kwargs: Any) -> dict[str, Any]:
+    starts.append(kwargs)
+    return {"run_id": "bg_due_parent", "task_id": "bg_due_parent"}
+
+  monkeypatch.setattr(registry, "start", capture_start)
+  app.state.agent_run_schedule_runner.autonomous_registry = registry
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice", channel="web")
+    created = client.post(
+      "/api/control/schedules",
+      headers=_headers(alice),
+      json=_agent_run_schedule_payload(),
+    )
+    assert created.status_code == 201, created.text
+    schedule_id = created.json()["schedule"]["schedule_id"]
+    path = root / "users" / "alice" / "agent-run-schedules.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["schedules"][0]["next_run_at"] = "2026-01-01T00:00:00Z"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    results = asyncio.run(
+      app.state.agent_run_schedule_runner.fire_due(
+        now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+      )
+    )
+  assert results == [{
+    "schedule_id": schedule_id,
+    "status": "started",
+    "run_id": "bg_due_parent",
+  }]
+  assert len(starts) == 1
+  parent = starts[0]["parent"]
+  assert parent.tenant is not None
+  assert parent.tenant.tenant_id == "test-product"
+  assert parent.tenant.storage_id == "alice"
+  assert parent.tenant.role == "invite"
+  assert parent.job_id.startswith("claim_")
+  assert parent.tool_ids is None
+  assert parent.withheld == frozenset()
+  assert parent.research_binding.research_file_id is None
+  assert parent.research_binding.ticker is None
+  assert isinstance(parent.approval_route, ControlPlaneApprovalRoute)
+  assert parent.approval_route.store is approval_store
+  assert parent.approval_route.policy is approval_policy
+
+
 def test_retired_global_schedule_file_is_never_read(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
@@ -1615,7 +1639,16 @@ def test_retired_global_schedule_file_is_never_read(
   assert runner._existing_stores() == []
 
 
-def test_agent_run_schedule_runner_starts_due_autonomous_run_with_owner_identity(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+  ("roster_role", "fired_role"),
+  [("owner", "owner"), ("invite", "invite"), (None, "invite")],
+)
+def test_agent_run_schedule_runner_starts_due_autonomous_run_with_owner_identity(
+  tmp_path: Path,
+  roster_role: str | None,
+  fired_role: str,
+) -> None:
+  """A stored dispatch_role fires with no more authority than the owner's live role."""
   store_path = tmp_path / "users" / "alice-owner" / "agent-run-schedules.json"
   store_path.parent.mkdir(parents=True)
   dispatch_scope = {
@@ -1663,6 +1696,14 @@ def test_agent_run_schedule_runner_starts_due_autonomous_run_with_owner_identity
       super().__init__(
         api_dir=tmp_path / "owner-registry-api",
         log_dir=tmp_path / "owner-registry-logs",
+        tenant_id="test-product",
+        approval_store=SQLiteApprovalStore(tmp_path / "owner-approvals.sqlite3"),
+        approval_policy=SingleUserApprovalPolicy(),
+        mcp_user_key_lookup=lambda user_id, user_email: (
+          {"channel": "mcp", "role": roster_role}
+          if (user_id, user_email) == ("alice", "alice@example.com")
+          else None
+        ),
       )
       self.user_event_bus = None
       self.starts: list[dict[str, Any]] = []
@@ -1690,7 +1731,8 @@ def test_agent_run_schedule_runner_starts_due_autonomous_run_with_owner_identity
   assert registry.user_event_bus == "bus"
   assert registry.starts == [
     {
-      "role": "owner",
+      "parent": registry.starts[0]["parent"],
+      "role": fired_role,
       "profile": "analyst",
       "mode": "task",
       "task": "Review the portfolio.",
@@ -1714,11 +1756,15 @@ def test_agent_run_schedule_runner_starts_due_autonomous_run_with_owner_identity
   assert stored is not None
   assert stored["last_run_id"] == "bg_1"
   assert stored["last_status"] == "started"
+  if fired_role == "owner":
+    assert "last_fire_warning" not in stored
+  else:
+    assert "exceeds the owner's live role" in stored["last_fire_warning"]
   assert stored["next_run_at"] > "2026-01-01T00:00:00Z"
 
 
 @pytest.mark.parametrize("entry", ["run_now", "fire_due"])
-def test_agent_run_schedule_runner_rejects_interactive_profile_before_spawn(
+def test_agent_run_schedule_runner_leaves_the_profile_class_to_the_runner(
   tmp_path: Path,
   entry: str,
 ) -> None:
@@ -1757,6 +1803,9 @@ def test_agent_run_schedule_runner_rejects_interactive_profile_before_spawn(
       super().__init__(
         api_dir=tmp_path / "interactive-registry-api",
         log_dir=tmp_path / "interactive-registry-logs",
+        tenant_id="test-product",
+        approval_store=SQLiteApprovalStore(tmp_path / "interactive-approvals.sqlite3"),
+        approval_policy=SingleUserApprovalPolicy(),
       )
       self.starts: list[dict[str, Any]] = []
       self.bus_calls = 0
@@ -1767,7 +1816,7 @@ def test_agent_run_schedule_runner_rejects_interactive_profile_before_spawn(
 
     async def start(self, **kwargs: Any) -> dict[str, Any]:
       self.starts.append(kwargs)
-      return {"run_id": "unexpected", "task_id": "unexpected"}
+      return {"run_id": "bg_community", "task_id": "bg_community"}
 
   store = schedules_module.AgentRunScheduleStore(store_path)
   registry = FakeRegistry()
@@ -1775,9 +1824,6 @@ def test_agent_run_schedule_runner_rejects_interactive_profile_before_spawn(
     store_for=lambda _owner_user_id: store,
     users_root=tmp_path / "users",
     autonomous_registry=registry,
-    profile_loader=lambda _name: types.SimpleNamespace(
-      supports_autonomous_execution=False,
-    ),
     poll_interval_seconds=0,
   )
 
@@ -1789,10 +1835,10 @@ def test_agent_run_schedule_runner_rejects_interactive_profile_before_spawn(
     result = asyncio.run(runner.fire_due(now=now))[0]
 
   assert result is not None
-  assert result["status"] == "failed"
-  assert "interactive-only" in result["error"]
-  assert registry.bus_calls == 0
-  assert registry.starts == []
+  assert result["status"] == "started"
+  assert result["run_id"] == "bg_community"
+  assert registry.bus_calls == 1
+  assert [start["profile"] for start in registry.starts] == ["community"]
 
 
 def test_jobs_mcp_create_contract_rejects_wrong_day_types_and_extra_fields(fake_schedule_backends) -> None:
@@ -1876,7 +1922,7 @@ def test_owner_agent_schedule_crud_survives_jobs_outage(fake_schedule_backends) 
     assert disabled.status_code == 200, disabled.text
     assert disabled.json()["schedule"]["enabled"] is False
     deleted = client.delete(
-      f"/api/control/schedules/{schedule['schedule_id']}?confirm=true", headers=headers,
+      f"/api/control/schedules/{schedule['schedule_id']}", headers=headers,
     )
     assert deleted.status_code == 200, deleted.text
     assert deleted.json()["deleted"] is True

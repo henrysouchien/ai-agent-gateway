@@ -7,8 +7,6 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = Path(__file__).resolve().parents[1]
@@ -27,7 +25,7 @@ from agent_gateway.approval_policy import (
 )
 from agent_gateway.approval_resolver import resolve_policy
 from agent_gateway.approval_store import SQLiteApprovalStore
-from agent_gateway.single_user_policy import DelegationApprovalPolicy, SingleUserApprovalPolicy
+from agent_gateway.single_user_policy import SingleUserApprovalPolicy
 
 
 def _run(awaitable: Any) -> Any:
@@ -98,10 +96,6 @@ def _request_and_payload(
   return request, payload
 
 
-def _policy(*, store: SQLiteApprovalStore | None = None) -> DelegationApprovalPolicy:
-  return DelegationApprovalPolicy(base=SingleUserApprovalPolicy(store=store))
-
-
 async def _create_approved_grant_source(
   store: SQLiteApprovalStore,
   *,
@@ -130,91 +124,10 @@ async def _create_approved_grant_source(
   await store.create(source)
 
 
-def test_no_delegation_passthrough_matches_base_for_state_write() -> None:
-  async def _case() -> None:
-    base = SingleUserApprovalPolicy()
-    policy = DelegationApprovalPolicy(base=base)
-    run_context = _run_context()
-    request, payload = _request_and_payload(run_context=run_context)
-
-    expected = await base.decide(payload=payload, request=request, run_context=run_context)
-    actual = await policy.decide(payload=payload, request=request, run_context=run_context)
-
-    assert actual == expected
-    assert actual.outcome == "auto_approve"
-
-  _run(_case())
-
-
-def test_delegated_state_write_in_ceiling_auto_approves_within_window() -> None:
-  async def _case() -> None:
-    delegation = _grant(tool_class_ceiling=frozenset({"state_write"}))
-    run_context = _run_context(delegation=delegation)
-    request, payload = _request_and_payload(run_context=run_context)
-
-    decision = await _policy().decide(payload=payload, request=request, run_context=run_context)
-
-    assert decision.outcome == "auto_approve"
-    assert decision.reason == "delegation grant matched"
-    assert decision.policy_id == "delegation"
-
-  _run(_case())
-
-
-@pytest.mark.parametrize(
-  ("approval_constraint", "required_owner_user_id", "expected_outcome"),
-  [
-    ("fresh_human_owner", "alice", "request_user_approval"),
-    ("legacy_unknown", None, "auto_deny"),
-  ],
-)
-def test_delegation_never_auto_approves_nonstandard_constraint(
-  approval_constraint: str,
-  required_owner_user_id: str | None,
-  expected_outcome: str,
-) -> None:
-  async def _case() -> None:
-    delegation = _grant(tool_class_ceiling=frozenset({"state_write"}))
-    run_context = _run_context(delegation=delegation)
-    request, payload = _request_and_payload(run_context=run_context)
-    request = replace(
-      request,
-      approval_constraint=approval_constraint,
-      required_owner_user_id=required_owner_user_id,
-    )
-
-    decision = await _policy().decide(
-      payload=payload,
-      request=request,
-      run_context=run_context,
-    )
-
-    assert decision.outcome == expected_outcome
-    assert decision.allow_persistent_grant is False
-
-  _run(_case())
-
-
-def test_delegated_state_write_outside_the_ceiling_follows_the_owner() -> None:
-  async def _case() -> None:
-    delegation = _grant(tool_class_ceiling=frozenset({"read"}))
-    run_context = _run_context(delegation=delegation)
-    request, payload = _request_and_payload(run_context=run_context)
-
-    decision = await _policy().decide(payload=payload, request=request, run_context=run_context)
-
-    # The grant only adds; a class outside its ceiling is the owner's call.
-    assert decision.outcome == "auto_approve"
-    assert decision.policy_id == "single-user"
-
-  _run(_case())
-
-
 def test_delegated_money_boundary_ignores_a_matching_persistent_grant(tmp_path: Path) -> None:
   async def _case() -> None:
     store = _store(tmp_path)
-    base = SingleUserApprovalPolicy(store=store)
-    policy = DelegationApprovalPolicy(base=base)
+    policy = SingleUserApprovalPolicy(store=store)
     await _create_approved_grant_source(
       store,
       approval_id="prior-approval",
@@ -265,7 +178,7 @@ def test_resolve_policy_wraps_default_and_keeps_the_money_boundary_human(
     monkeypatch.delenv("GATEWAY_APPROVAL_POLICY_CLASS", raising=False)
     store = _store(tmp_path)
     policy = resolve_policy(store=store)
-    assert isinstance(policy, DelegationApprovalPolicy)
+    assert isinstance(policy, SingleUserApprovalPolicy)
     await _create_approved_grant_source(
       store,
       approval_id="prior-approval",
@@ -306,7 +219,7 @@ def test_resolve_policy_wraps_default_and_keeps_the_money_boundary_human(
 
 def test_delegated_money_boundary_asks_and_portfolio_config_does_not() -> None:
   async def _case() -> None:
-    policy = _policy()
+    policy = SingleUserApprovalPolicy()
     outcomes: dict[str, str] = {}
     for tool_class in ("portfolio_config", "irreversible"):
       run_context = _run_context(
@@ -326,61 +239,6 @@ def test_delegated_money_boundary_asks_and_portfolio_config_does_not() -> None:
       "portfolio_config": "auto_approve",
       "irreversible": "request_user_approval",
     }
-
-  _run(_case())
-
-
-def test_delegated_args_predicate_decides_only_the_grant_credit() -> None:
-  async def _case() -> None:
-    policy = _policy()
-    delegation = _grant(
-      tool_class_ceiling=frozenset({"state_write"}),
-      args_predicate={"ticker": "MSFT"},
-    )
-
-    mismatch_context = _run_context(delegation=delegation)
-    mismatch_request, mismatch_payload = _request_and_payload(
-      run_context=mismatch_context,
-      tool_args={"ticker": "AAPL"},
-    )
-    mismatch = await policy.decide(
-      payload=mismatch_payload,
-      request=mismatch_request,
-      run_context=mismatch_context,
-    )
-
-    match_context = _run_context(delegation=delegation)
-    match_request, match_payload = _request_and_payload(
-      run_context=match_context,
-      tool_args={"ticker": "MSFT"},
-    )
-    match = await policy.decide(payload=match_payload, request=match_request, run_context=match_context)
-
-    assert match.outcome == "auto_approve"
-    assert match.policy_id == "delegation"
-    # A predicate mismatch withdraws the grant's credit, not the owner's answer.
-    assert mismatch.outcome == "auto_approve"
-    assert mismatch.policy_id == "single-user"
-
-  _run(_case())
-
-
-def test_delegated_expired_window_falls_through_to_the_owner() -> None:
-  async def _case() -> None:
-    delegation = _grant(
-      created_at=utc_now() - timedelta(days=1),
-      window_seconds=1,
-      tool_class_ceiling=frozenset({"state_write"}),
-    )
-    run_context = _run_context(delegation=delegation)
-    request, payload = _request_and_payload(run_context=run_context)
-
-    decision = await _policy().decide(payload=payload, request=request, run_context=run_context)
-
-    # An expired grant credits nothing, and escalates nothing: the standing
-    # preference the owner holds decides the call.
-    assert decision.outcome == "auto_approve"
-    assert decision.policy_id == "single-user"
 
   _run(_case())
 

@@ -14,6 +14,22 @@ export type ActivityHandle = {
   readonly "owner_id": string;
 };
 
+/** Everything `admit` derives for one spawned job (execution-boundary design §3.2). */
+export type AdmittedContextWire = {
+  readonly "approval_route": "durable_local" | "parent_delegated" | "no_approval_route";
+  readonly "budget_share": (number) | (null);
+  readonly "capability_bind": CapabilityBind;
+  readonly "children": ReadonlyArray<string>;
+  readonly "env_projection": ReadonlyArray<string>;
+  readonly "handle_grants": ReadonlyArray<string>;
+  readonly "lineage": AdmittedLineage;
+  readonly "placement": "in_process" | "local_stub" | "hosted_stub";
+  readonly "research_binding": AdmittedResearchBinding;
+  readonly "tenant": (AdmittedTenant) | (null);
+  readonly "tool_grant": ReadonlyArray<string>;
+  readonly "withheld_tools"?: ReadonlyArray<string>;
+};
+
 export type AdmittedDataRef = {
   readonly "actual_contract": ContractRef;
   readonly "content": ContentHandle;
@@ -31,12 +47,30 @@ export type AdmittedInputBinding = {
   readonly "source": AdmittedDataRef;
 };
 
+export type AdmittedLineage = {
+  readonly "depth": number;
+  readonly "parent_job_id": (string) | (null);
+};
+
 export type AdmittedPlanRef = {
   readonly "digest": string;
   readonly "phase_number": number;
   readonly "plan_id": string;
   readonly "revision": number;
   readonly "workflow_run_id": string;
+};
+
+/** The research file and ticker a job is bound to, or none. */
+export type AdmittedResearchBinding = {
+  readonly "research_file_id"?: (number) | (null);
+  readonly "ticker"?: (string) | (null);
+};
+
+/** The tenant a job acts for; a child always holds its parent's. */
+export type AdmittedTenant = {
+  readonly "role": "owner" | "invite";
+  readonly "storage_id": string;
+  readonly "tenant_id"?: (string) | (null);
 };
 
 /** The exact physical route retained with one admitted tool grant. */
@@ -58,7 +92,8 @@ export type AdmittedWorkflowNodeIdentity = {
 /** Exact prompt and mechanics consumed by one admitted child attempt. */
 export type AgentExecutionSnapshot = {
   readonly "admission_date": string;
-  readonly "client_timeout_seconds": number;
+  readonly "admitted_context"?: (AdmittedContextWire) | (null);
+  readonly "client_timeout_seconds"?: (number) | (null);
   readonly "cost_observation_threshold_usd"?: (number) | (null);
   readonly "max_budget_usd"?: (number) | (null);
   readonly "max_tokens": number;
@@ -81,7 +116,9 @@ export type AgentOperationRef = {
 };
 
 export type AgentOperationSnapshot = {
+  readonly "children"?: ReadonlyArray<string>;
   readonly "description": string;
+  readonly "effort"?: (string) | (null);
   readonly "evidence_ports"?: ReadonlyArray<EvidencePort>;
   readonly "execution_class": string;
   readonly "instructions": string;
@@ -91,8 +128,10 @@ export type AgentOperationSnapshot = {
   readonly "prompt": ContractRef;
   readonly "required_capabilities"?: ReadonlyArray<SemanticCapabilityRequirement>;
   readonly "required_context"?: ReadonlyArray<string>;
-  readonly "result_modes": ReadonlyArray<"narrative">;
+  readonly "result_modes": ReadonlyArray<string>;
   readonly "resumable"?: boolean;
+  readonly "role"?: (string) | (null);
+  readonly "terminal_on_persist"?: boolean;
   readonly "workspace_scope": "read_only" | "workspace_write" | "model_write";
 };
 
@@ -120,6 +159,7 @@ export type AttemptRef = {
   readonly "physical_task_id": string;
   readonly "restart_of_attempt_id"?: (string) | (null);
   readonly "resume_of_task_id"?: (string) | (null);
+  readonly "resumer_job_id"?: (string) | (null);
 };
 
 export type AuthoredDeliverySummary = {
@@ -428,6 +468,11 @@ export type ProjectionInline = {
   readonly "value": JsonValue;
 };
 
+export type ProjectionRequirement = {
+  readonly "contract": ContractRef;
+  readonly "required"?: boolean;
+};
+
 /** One exact provider-facing tool definition frozen for child execution. */
 export type ProviderToolDefinition = {
   readonly "definition": {
@@ -469,16 +514,12 @@ export type ResultHandle = {
   readonly "source": ContentHandle;
 };
 
-/** Runtime policy for an agent's ordinary terminal assistant message.
-
-This is code-owned admission metadata, not a response schema for the model.
-Any later structured projection must be produced by a deterministic runtime
-materializer or a separately invoked domain tool. */
+/** Code-owned result metadata, not a response schema for the model. */
 export type ResultRequirement = {
-  readonly "mode"?: "narrative";
+  readonly "mode"?: string;
   readonly "outcome": OutcomeRequirement;
-  readonly "projection"?: null;
-  readonly "terminal_narrative"?: "required";
+  readonly "projection"?: (ProjectionRequirement) | (null);
+  readonly "terminal_narrative"?: string;
 };
 
 export type SelectedContentSelector = {
@@ -768,6 +809,9 @@ export type AgentCompletionEnvelope = {
   readonly "parent_materialization": ((TerminalNarrativeInlineExact) | (ProjectionInline) | (AuthoredSummaryWithResultHandle) | (ResultHandle)) | (null);
   readonly "schema_version"?: "1.0";
   readonly "settlement_projection": SettlementProjection;
+  readonly "stage_refs"?: {
+  readonly [key: string]: JsonValue;
+};
   readonly "task_result_ref": TaskResultRef;
 };
 

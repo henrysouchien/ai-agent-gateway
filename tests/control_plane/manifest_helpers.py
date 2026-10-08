@@ -76,11 +76,7 @@ def write_v6_manifest(
     "pack": None,
     "deliver": True,
     "skill_resume_allowed": False,
-    "admitted_skill_execution_limits": {
-      "max_turns": None,
-      "max_tokens": None,
-      "max_budget_usd": None,
-    },
+    "admitted_skill_execution_limits": {"max_tokens": None},
     "context": "Original work packet",
     "ticker": "MSFT",
     "channel": "tui",
@@ -106,11 +102,7 @@ def write_v6_manifest(
   manifest.update(overrides)
   if "admitted_skill_execution_limits" not in overrides:
     manifest["admitted_skill_execution_limits"] = (
-      {
-        "max_turns": None,
-        "max_tokens": None,
-        "max_budget_usd": None,
-      }
+      {"max_tokens": None}
       if manifest.get("mode") == "skill"
       else None
     )

@@ -14,6 +14,7 @@ from agent_workflow_contracts import (
   ResultRequirement,
   ToolGrant,
 )
+from agent_workflow_contracts.models import AdmittedContextWire
 
 
 def provider_tool_definitions_for_grant(
@@ -46,20 +47,10 @@ def provider_tool_definitions_for_grant(
 
 
 def render_result_instructions(requirement: ResultRequirement) -> str:
-  """Render the only model-facing result contract: a normal final message.
-
-  Wire models are runtime-owned.  A child may call typed tools while working,
-  but it never serializes the runtime's result envelope or submits a typed
-  sidecar as its answer.
-  """
+  """Render the ordinary child guidance for a substantive final message."""
 
   if not isinstance(requirement, ResultRequirement):
     raise TypeError("requirement must be a ResultRequirement")
-  if requirement.mode != "narrative":
-    raise ValueError(
-      "agent execution supports terminal-message results only; structured "
-      "records must be materialized by deterministic runtime code"
-    )
   return "\n".join((
     "## Child Result",
     "",
@@ -76,14 +67,12 @@ def build_agent_execution_snapshot(
   persisted_methodology_state: Any | None = None,
   methodology_state_instructions: str | None = None,
   context_instructions: str | None = None,
-  max_turns: int | None,
-  client_timeout_seconds: float,
   max_tokens: int,
   cost_observation_threshold_usd: float | None,
   provider_tool_definitions: tuple[ProviderToolDefinition, ...],
   max_resume_chain_depth: int,
   resume_instruction: str | None = None,
-  max_budget_usd: float | None = None,
+  admitted_context: AdmittedContextWire | None = None,
 ) -> AgentExecutionSnapshot:
   """Freeze every model-visible prompt byte and execution mechanic at admission."""
 
@@ -125,21 +114,19 @@ def build_agent_execution_snapshot(
     admission_date=exact_date,
     persisted_methodology_state=persisted_methodology_state,
     result_instructions=exact_result_instructions,
-    max_turns=max_turns,
-    client_timeout_seconds=client_timeout_seconds,
     max_tokens=max_tokens,
     cost_observation_threshold_usd=cost_observation_threshold_usd,
-    max_budget_usd=max_budget_usd,
     provider_tool_definitions=provider_tool_definitions,
     resume_mechanics=AgentResumeMechanics(
       resumable=operation.resumable,
-      max_chain_depth=(max_resume_chain_depth if operation.resumable else 0),
+      max_chain_depth=max_resume_chain_depth,
       transcript_strategy="durable_reconstruction",
       prompt_strategy="reuse_exact",
       tool_grant_strategy="reissue_exact",
       control_message_strategy="admitted_exact",
     ),
     resume_instruction=exact_resume_instruction,
+    admitted_context=admitted_context,
   )
 
 
@@ -155,8 +142,6 @@ def resume_agent_execution_snapshot(
   exact_instruction = resume_instruction.strip()
   if not exact_instruction:
     raise ValueError("resume instruction must be non-empty")
-  if not snapshot.resume_mechanics.resumable:
-    raise ValueError("execution snapshot is not resumable")
   return snapshot.model_copy(update={"resume_instruction": exact_instruction})
 
 

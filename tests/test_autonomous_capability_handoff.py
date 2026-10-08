@@ -9,11 +9,20 @@ from itertools import count
 from pathlib import Path
 
 import pytest
+from dataclasses import replace
+from agent_workflow_contracts import OperationUnavailable, ResolvedAuthority
+from agent_workflow_contracts.models import (
+  AdmittedContextWire, AdmittedLineage, AdmittedResearchBinding, AdmittedTenant, ToolGrant,
+)
+from agent_gateway.admission import AdmittedContext, Refusal, context_for_child
+from agent_gateway.approval_route import NoApprovalRoute
+from agent_gateway.child_environment import AUTONOMOUS_CHILD_ENVIRONMENT, filter_child_environment
 
 import agent_gateway.autonomous_credential_handoff as credential_handoff
 from agent_gateway.autonomous_capability_handoff import (
   AutonomousCapabilityBinding,
   AutonomousCapabilityBindingRequest,
+  AutonomousLaunchAdmissionRefused,
   resolve_autonomous_capability_binding,
 )
 from agent_gateway.autonomous_credential_handoff import (
@@ -207,7 +216,7 @@ def _registry(
     autonomous_skill_admission_policy_resolver=lambda skill_name: (
       AutonomousSkillAdmissionPolicy(
         False,
-        SkillExecutionLimits(None, None, None),
+        SkillExecutionLimits(None),
       )
     ),
     claim_signing_authority=GatewayClaimSigningAuthority(_SECRET),
@@ -556,7 +565,7 @@ def test_child_closes_inherited_user_credential_pipe(
   assert inherited_stdin.closed is True
 
 
-def test_child_environment_is_profile_scoped_and_secret_minimal() -> None:
+def test_child_environment_is_uniform_across_profiles_and_secret_minimal() -> None:
   source = {
     "PATH": "/usr/bin",
     "OPENAI_MODEL": "gpt-test",
@@ -645,7 +654,7 @@ def test_child_environment_is_profile_scoped_and_secret_minimal() -> None:
   # fails closed at the history fence (OpenAISessionEpochError).
   assert analyst["OPENAI_SESSION_EPOCH"] == "responses-v1"
   assert "ANTHROPIC_MODEL" not in analyst
-  assert "IBKR_FLEX_TOKEN" not in analyst
+  assert analyst["IBKR_FLEX_TOKEN"] == "brokerage-secret"
   assert forbidden.isdisjoint(analyst)
 
   research_producer = _positive_autonomous_child_env(
@@ -659,7 +668,7 @@ def test_child_environment_is_profile_scoped_and_secret_minimal() -> None:
   assert research_producer["SEC_USER_AGENT"] == "host-agent contact@example.com"
   assert research_producer["SEC_EXPECTED_MACHINE_IDENTITY"] == "host.example.test"
   assert research_producer["RESEARCH_PRODUCER_AGENT_MAX_TOKENS"] == "24000"
-  assert "IBKR_FLEX_TOKEN" not in research_producer
+  assert research_producer["IBKR_FLEX_TOKEN"] == "brokerage-secret"
   assert forbidden.isdisjoint(research_producer)
 
   advisor = _positive_autonomous_child_env(
@@ -687,15 +696,36 @@ def test_child_environment_is_profile_scoped_and_secret_minimal() -> None:
     profile="custom",
     deliver=True,
   )
-  assert "FMP_API_KEY" not in custom_provider
-  assert "SEC_BUDGET_SITE" not in custom_provider
-  assert "SEC_USER_AGENT" not in custom_provider
-  assert "SEC_EXPECTED_MACHINE_IDENTITY" not in custom_provider
+  # Tool configuration is one projection for every autonomous child: a
+  # profile the gateway has never heard of receives exactly what analyst does.
+  assert custom_provider["FMP_API_KEY"] == "research-secret"
+  assert custom_provider["SEC_BUDGET_SITE"] == "prod"
+  assert custom_provider["SEC_USER_AGENT"] == "host-agent contact@example.com"
+  assert custom_provider["SEC_EXPECTED_MACHINE_IDENTITY"] == "host.example.test"
   assert custom_provider["HANK_MODEL_AUTHORITY_DIR"] == "/opt/hank/model-authority"
-  assert "IBKR_FLEX_TOKEN" not in custom_provider
+  assert custom_provider["IBKR_FLEX_TOKEN"] == "brokerage-secret"
   assert "OPENAI_SESSION_EPOCH" not in custom_provider
   assert not any("TELEGRAM" in name for name in custom_provider)
   assert forbidden.isdisjoint(custom_provider)
+  tool_names = {
+    "FMP_API_KEY",
+    "SEC_BUDGET_SITE",
+    "SEC_USER_AGENT",
+    "SEC_EXPECTED_MACHINE_IDENTITY",
+    "IBKR_FLEX_TOKEN",
+  }
+  assert {
+    profile: {name: env[name] for name in tool_names}
+    for profile, env in (
+      ("analyst", analyst),
+      ("research_producer", research_producer),
+      ("advisor", advisor),
+      ("custom", custom_provider),
+    )
+  } == {
+    profile: {name: source[name] for name in tool_names}
+    for profile in ("analyst", "research_producer", "advisor", "custom")
+  }
 
 
 @pytest.mark.parametrize(
@@ -1394,3 +1424,178 @@ def test_resolver_helper_rejects_missing_and_mismatched_results() -> None:
     asyncio.run(resolve_autonomous_capability_binding(None, request))
   with pytest.raises(TypeError, match="must return AutonomousCapabilityBinding"):
     asyncio.run(resolve_autonomous_capability_binding(invalid_resolver, request))
+
+
+def _admitted(bind: CapabilityBind) -> AdmittedContext[ResolvedAuthority]:
+  return AdmittedContext(
+    wire=AdmittedContextWire(
+      tenant=AdmittedTenant(tenant_id="test-product", storage_id="42", role="owner"),
+      research_binding=AdmittedResearchBinding(research_file_id=7, ticker="MSFT"),
+      capability_bind=bind,
+      children=(),
+      tool_grant=(),
+      budget_share=None,
+      env_projection=("PATH",),
+      approval_route="no_approval_route",
+      handle_grants=(),
+      placement="local_stub",
+      lineage=AdmittedLineage(parent_job_id="parent-7", depth=1),
+    ),
+    tool_authority=ResolvedAuthority(
+      operation_name="risk.scan",
+      grant=ToolGrant(grant_id="grant-7", tools=(), digest="sha256:" + "0" * 64),
+    ),
+    approval_route=NoApprovalRoute(),
+  )
+
+
+def test_admitted_node_binding_signs_projects_persists_and_resumes(monkeypatch, tmp_path) -> None:
+  bind = _bind(run_mode="autonomous").model_copy(update={"capability_id": "node.explore"})
+  admitted = _admitted(bind)
+  parent = context_for_child(admitted, job_id="parent-7")
+  requests = []
+  environments = []
+
+  def resolver(request):
+    requests.append(request)
+    binding = _service_binding(request.required_bind or bind)
+    return replace(binding, admitted=admitted) if request.source != "resume" else binding
+
+  async def fake_exec(*args, **kwargs):
+    environments.append(dict(kwargs["env"]))
+    return _FakeProcess()
+
+  monkeypatch.setenv("FMP_API_KEY", "not-in-admitted-projection")
+  monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+  registry = _registry(tmp_path, resolver)
+
+  async def run():
+    first = await registry.start(
+      role="owner", profile="analyst", mode="skill", skill="risk.scan",
+      context="Investigate risk", ticker="MSFT", research_file_id=7,
+      user_id="42", user_email="owner@example.com", parent=parent,
+    )
+    await registry.wait(first["task_id"], timeout_sec=1)
+    restored = _registry(tmp_path, resolver)
+    record = restored._tasks[first["task_id"]]
+    assert record.admitted_context == admitted.wire
+    assert record.tool_authority == admitted.tool_authority
+    resumed = await _start(restored, resumed_from=first["run_id"])
+    return first, resumed, restored
+
+  first, resumed, restored = asyncio.run(run())
+  assert requests[0].parent is parent
+  assert requests[0].task == "Investigate risk"
+  assert requests[0].ticker == "MSFT"
+  assert requests[0].research_file_id == 7
+  assert requests[0].env_names == frozenset(filter_child_environment(
+    os.environ, purpose=AUTONOMOUS_CHILD_ENVIRONMENT,
+  ))
+  assert requests[1].parent is None
+  assert requests[1].required_bind == bind
+  for environment in environments:
+    envelope = verify_autonomous_launch_envelope(_SECRET, environment[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV])
+    assert envelope.admitted == (admitted.wire, admitted.tool_authority)
+    assert envelope.bind == bind
+    assert "FMP_API_KEY" not in environment
+    assert environment["PYTHONUNBUFFERED"] == "1"
+    assert environment["AGENT_SESSION_LOG_BASE_DIR"]
+  record = restored._tasks[resumed["task_id"]]
+  assert record.capability_bind == bind
+  assert record.admitted_context == admitted.wire
+  assert record.tool_authority == admitted.tool_authority
+  assert record.autonomous_in_flight_at_start is not None
+  assert record.credential_handoff_bytes is not None
+  assert record.credential_handoff_bytes > 0
+
+
+def test_binding_rejects_bind_differing_from_admitted_context() -> None:
+  bind = _bind(run_mode="autonomous")
+  with pytest.raises(ValueError, match="does not match admitted context"):
+    replace(_service_binding(bind), admitted=_admitted(bind.model_copy(update={"capability_id": "node.verify"})))
+
+
+def test_binding_resolver_rejects_different_required_node_bind() -> None:
+  bind = _bind(run_mode="autonomous").model_copy(update={"capability_id": "node.explore"})
+  request = AutonomousCapabilityBindingRequest(
+    task_id="bg_1", control_run_id="run-1", owner_user_id="42", raw_user_id="42",
+    user_email=None, profile="analyst", mode="skill", skill="risk.scan",
+    channel=None, source="resume", run_mode="autonomous", required_bind=bind,
+  )
+  changed = bind.model_copy(update={"effort": "high"})
+  with pytest.raises(ValueError, match="persisted exact bind"):
+    asyncio.run(resolve_autonomous_capability_binding(lambda request: _service_binding(changed), request))
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_admission_refusal_preserves_owner_before_launch_side_effects(monkeypatch, tmp_path, unavailable) -> None:
+  refusal = (
+    AutonomousLaunchAdmissionRefused.from_unavailable(OperationUnavailable(
+      operation_name="risk.scan", code="missing_route", detail="Missing risk route",
+    ))
+    if unavailable else AutonomousLaunchAdmissionRefused.from_refusal(Refusal(
+      reason="grant_exceeds_parent", owner="admission.tool_grant", detail="Outside parent",
+    ))
+  )
+
+  def resolver(request):
+    raise refusal
+
+  async def fake_exec(*args, **kwargs):
+    pytest.fail("admission refusal must precede spawn")
+
+  monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+  run_dir = tmp_path / "runs"
+  registry = _registry(run_dir, resolver)
+  with pytest.raises(AutonomousLaunchAdmissionRefused) as raised:
+    asyncio.run(_start(registry))
+  assert raised.value is refusal
+  assert not registry._tasks
+  assert registry._reserved_slots == 0
+  assert not list(run_dir.glob("bg_*"))
+  if unavailable:
+    assert refusal.http_status == 422
+    assert refusal.payload() == {"code": "operation_unavailable", "detail": "Missing risk route"}
+  else:
+    assert refusal.http_status == 403
+    assert refusal.payload() == {"owner": "admission.tool_grant", "reason": "grant_exceeds_parent", "detail": "Outside parent"}
+
+
+@pytest.mark.parametrize("mutation", ["context_only", "authority_only", "bind_mismatch"])
+def test_rehydrate_rejects_incomplete_or_mismatched_admitted_authority(monkeypatch, tmp_path, mutation) -> None:
+  bind = _bind(run_mode="autonomous").model_copy(update={"capability_id": "node.explore"})
+  admitted = _admitted(bind)
+
+  def resolver(request):
+    return replace(_service_binding(bind), admitted=admitted)
+
+  async def fake_exec(*args, **kwargs):
+    return _FakeProcess()
+
+  monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+  registry = _registry(tmp_path, resolver)
+  first = asyncio.run(_start(registry))
+  path = tmp_path / f"{first['task_id']}.task.json"
+  manifest = json.loads(path.read_text(encoding="utf-8"))
+  if mutation == "context_only":
+    manifest["tool_authority"] = None
+  elif mutation == "authority_only":
+    manifest["admitted_context"] = None
+  else:
+    manifest["admitted_context"]["capability_bind"]["effort"] = "high"
+  path.write_text(json.dumps(manifest), encoding="utf-8")
+  assert first["task_id"] not in _registry(tmp_path)._tasks
+
+
+@pytest.mark.parametrize(
+  ("reason", "status"),
+  [
+    ("tenant_mismatch", 403), ("grant_exceeds_parent", 403),
+    ("binding_not_granted", 403), ("handle_not_granted", 403),
+    ("invite_effect_not_allowed", 403), ("session_unauthenticated", 422),
+  ],
+)
+def test_launch_admission_refusal_owns_http_projection(reason, status) -> None:
+  exception = AutonomousLaunchAdmissionRefused.from_refusal(Refusal(reason, "owner", "detail"))
+  assert exception.http_status == status
+  assert exception.payload() == {"reason": reason, "owner": "owner", "detail": "detail"}

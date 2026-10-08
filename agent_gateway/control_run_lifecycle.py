@@ -14,7 +14,6 @@ ControlRunState = Literal[
   "running",
   "approval_pending",
   "completed",
-  "budget_limited",
   "failed",
   "interrupted",
   "cancelled",
@@ -41,7 +40,6 @@ CONTROL_RUN_STATE_CLASSIFICATION: MappingProxyType[str, ControlRunStateClassific
       "cancellable": True,
     },
     "completed": {"active": False, "terminal": True, "resumable": False, "cancellable": False},
-    "budget_limited": {"active": False, "terminal": True, "resumable": False, "cancellable": False},
     "failed": {"active": False, "terminal": True, "resumable": True, "cancellable": False},
     "interrupted": {"active": False, "terminal": True, "resumable": True, "cancellable": False},
     "cancelled": {"active": False, "terminal": True, "resumable": True, "cancellable": False},
@@ -52,11 +50,12 @@ _INTERNAL_AUTONOMOUS_STATE_ALIASES: MappingProxyType[str, ControlRunState] = Map
   {
     "finished": "completed",
     "killed": "cancelled",
-    "budget_exceeded": "budget_limited",
     "blocked": "failed",
     "remediating": "running",
   }
 )
+# Records written before 61babe3020a6 name the retired budget stop; it reads as the interrupt it was.
+_RETIRED_BUDGET_STOP_STATES = frozenset({"budget_exceeded", "budget_limited"})
 _AUTONOMOUS_RUN_RESUMABLE_INTERNAL_STATES = frozenset({"failed", "interrupted", "killed", "cancelled"})
 _AUTONOMOUS_RUN_MESSAGEABLE_INTERNAL_STATES = frozenset({"running", "waiting", "approval_pending"})
 
@@ -85,10 +84,17 @@ CONTROL_TERMINAL_RUN_STATES = _states_where("terminal")
 CONTROL_CHAT_MESSAGEABLE_RUN_STATES = CONTROL_ACTIVE_RUN_STATES | frozenset({"completed"})
 
 
+def read_persisted_autonomous_state(raw_state: str) -> str:
+  """Project a persisted autonomous record's raw state; the retired budget stop reads as interrupted."""
+  return "interrupted" if raw_state in _RETIRED_BUDGET_STOP_STATES else raw_state
+
+
 def coerce_control_run_state(value: object) -> ControlRunState | None:
   normalized = _normalized_state_text(value)
   if normalized is None:
     return None
+  if normalized in _RETIRED_BUDGET_STOP_STATES:
+    return "interrupted"
   alias = _INTERNAL_AUTONOMOUS_STATE_ALIASES.get(normalized)
   if alias is not None:
     return alias

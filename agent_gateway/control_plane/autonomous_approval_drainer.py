@@ -14,6 +14,7 @@ from agent_gateway.autonomous_runner import (
 from .autonomous_approval_delivery import (
   autonomous_run_accepts_approval_decisions,
   deliver_autonomous_approval_outbox,
+  require_matching_autonomous_delivery,
 )
 
 
@@ -162,6 +163,7 @@ class AutonomousApprovalDeliveryCoordinator:
 
   @property
   def fatal_error(self) -> str | None:
+    """The latest drain error once drains have kept failing; None after a success."""
     return self._fatal_error
 
   def start(self) -> None:
@@ -180,7 +182,7 @@ class AutonomousApprovalDeliveryCoordinator:
     self.wake()
 
   def wake(self) -> bool:
-    if self._closing or self._fatal_error is not None:
+    if self._closing:
       return False
     self._wake_generation += 1
     self._wake_event.set()
@@ -230,10 +232,12 @@ class AutonomousApprovalDeliveryCoordinator:
       else:
         self._drain_failure_count = 0
         self._drain_first_failure_at = None
+        if self._fatal_error is not None:
+          log.info("Autonomous approval delivery drain recovered")
+          self._fatal_error = None
       if (
         observed_generation != self._wake_generation
         and not self._closing
-        and self._fatal_error is None
       ):
         self._wake_event.set()
 
@@ -243,28 +247,27 @@ class AutonomousApprovalDeliveryCoordinator:
     if self._drain_first_failure_at is None:
       self._drain_first_failure_at = now
     self._drain_failure_count += 1
-    exhausted = (
+    sustained = (
       self._drain_failure_count
       >= AUTONOMOUS_APPROVAL_FALLBACK_RETRY_MAX_ATTEMPTS
       or now - self._drain_first_failure_at
       >= AUTONOMOUS_APPROVAL_FALLBACK_RETRY_WINDOW_SECONDS
     )
-    if exhausted:
+    if sustained:
+      # Reported, never latched: the durable outbox still holds every row, so
+      # the drainer keeps retrying with backoff and health clears on success.
+      first_report = self._fatal_error is None
       self._fatal_error = (
-        "autonomous approval recovery failed closed after "
+        "autonomous approval recovery failing after "
         f"{self._drain_failure_count} attempts: "
         f"{type(failure).__name__}: {failure}"
       )
-      retry_handle = self._retry_handle
-      self._retry_handle = None
-      if retry_handle is not None:
-        retry_handle.cancel()
-      log.critical(self._fatal_error)
-      return
+      if first_report:
+        log.critical(self._fatal_error)
     self._arm_retry(
       min(
         self._fallback_retry_base_seconds
-        * (2 ** (self._drain_failure_count - 1)),
+        * (2 ** min(self._drain_failure_count - 1, 16)),
         16.0,
       )
     )
@@ -504,19 +507,6 @@ class AutonomousApprovalDeliveryCoordinator:
       raise PermanentAutonomousApprovalDeliveryError(
         "autonomous approval owner task is unavailable"
       )
-    expected_run_identity = {
-      "task_id": record.task_id,
-      "control_run_id": record.control_run_id,
-      "session_id": record.session_id,
-      "channel_id": record.channel_id,
-    }
-    if any(
-      delivery.get(field_name) != expected
-      for field_name, expected in expected_run_identity.items()
-    ):
-      raise PermanentAutonomousApprovalDeliveryError(
-        "autonomous approval pending row changed run authority"
-      )
     if not autonomous_run_accepts_approval_decisions(record):
       raise PermanentAutonomousApprovalDeliveryError(
         "autonomous approval owner task is not active"
@@ -547,6 +537,21 @@ class AutonomousApprovalDeliveryCoordinator:
       raise PermanentAutonomousApprovalDeliveryError(
         "autonomous approval pending row has no durable request"
       )
+    # A row is delivered only to the run it was created for; that match is
+    # require_matching_autonomous_delivery's, and a mismatch is corruption, so the
+    # row is quarantined rather than retried.
+    try:
+      require_matching_autonomous_delivery(
+        record,
+        delivery,
+        request_record,
+        approval_id=approval_id,
+        tool_call_id=tool_call_id,
+        nonce=nonce,
+        approved=approved,
+      )
+    except (RuntimeError, ValueError) as exc:
+      raise PermanentAutonomousApprovalDeliveryError(str(exc)) from exc
     await deliver_autonomous_approval_outbox(
       registry=self._registry,
       store=self._store,

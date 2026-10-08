@@ -120,10 +120,10 @@ SDK_KNOWN_BUILTINS = {
 SDK_SAFE_BUILTINS = {"Read", "Glob", "Grep"}
 SDK_WEB_BUILTINS = {"WebSearch", "WebFetch"}
 SDK_GATED_BUILTINS = {"Write", "Edit", "Bash", "NotebookEdit", "BashOutput", "KillBash"}
-# Intentionally differs from api/agent/shared/tool_catalog.py:WEB_TOOL_CHANNELS,
-# which includes "discord". Whether Discord agent-SDK sessions receive hosted
-# WebSearch/WebFetch remains an open product decision; ruled 2026-08-31 to keep
-# today's behavior.
+# Channels whose agent-SDK sessions get hosted WebSearch/WebFetch; the SDK
+# system prompt (api/agent/shared/prompts/sdk.py) reads this set. Discord is
+# excluded: whether Discord agent-SDK sessions receive them remains an open
+# product decision, ruled 2026-08-31 to keep today's behavior.
 SDK_WEB_TOOL_CHANNELS: frozenset[str] = frozenset({"web", "telegram", "cli", "tui"})
 
 class _Unset(Enum):
@@ -134,7 +134,6 @@ class _Unset(Enum):
 class AgentSDKConfig:
   """Non-routing configuration for the optional Anthropic agent SDK runner."""
 
-  max_budget_usd: float | None = None
   cwd: str | Path | None = None
   disallowed_tools: list[str] = field(default_factory=list)
   user_id: str | None = None

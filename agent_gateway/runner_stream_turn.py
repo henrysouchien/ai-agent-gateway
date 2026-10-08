@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Uni
 from .auth import ProviderCredentialFailure
 from model_authority.binding import validate_reported_identity
 from .providers import ModelInfo
+from .rate_limit import local_queue_left_at, locally_queued
 from .providers.anthropic_helpers import _format_anthropic_rejection_detail
 from model_authority.thinking import EffortResolution, ThinkingLevel, parse_effort
 from .runner_introspection import format_exc as _format_exc
@@ -79,7 +80,6 @@ class RunnerStreamTurnMixin:
   if TYPE_CHECKING:
     _billing_mode: Literal["byok", "metered"]
     _capability_execution: BoundCapabilityExecution
-    _client_timeout: float | None
     _compaction_instructions: str | None
     _compaction_trigger: int | None
     _disconnected: bool
@@ -130,6 +130,8 @@ class RunnerStreamTurnMixin:
       *,
       attempt: int,
       error: str,
+      attempt_elapsed_s: float,
+      backoff_s: float | None,
     ) -> None: ...
 
     def _set_client(self, client: Any) -> None: ...
@@ -382,6 +384,7 @@ class RunnerStreamTurnMixin:
             cache_read_tokens=event.cache_read_tokens,
             provider_units=event.provider_units,
             provider_unit_deltas=event.provider_unit_deltas,
+            provider_wait_ms=event.provider_wait_ms,
           )
           if first_turn:
             uncached_input_tokens = int(
@@ -511,18 +514,28 @@ class RunnerStreamTurnMixin:
         if event_type == "message_end":
           result.stop_reason = event.stop_reason or None
           result.stop_details = event.stop_details
+          result.request_input_tokens = event.request_input_tokens
 
       logger.debug("[%s] Turn %d stream end", self._sid, turn_count)
 
     async def _stream_guard(task: asyncio.Task, turn_start_mono: float) -> None:
-      nonlocal guard_reason
+      nonlocal guard_reason, last_progress_at
       next_progress_log_at = turn_start_mono + STREAM_PROGRESS_LOG_INTERVAL
       while not task.done():
         await asyncio_module.sleep(stream_guard_poll_interval)
         if task.done():
           return
         now = time_module.monotonic()
-        stall = now - last_progress_at
+        if locally_queued(task):
+          # Local capacity waiting is not silence from the provider peer.
+          # Keep emitting liveness without fabricating peer progress.
+          stall = 0.0
+        else:
+          left_queue_at = local_queue_left_at(task)
+          if left_queue_at is not None and left_queue_at > last_progress_at:
+            # A queue wait can start and finish entirely between guard polls.
+            last_progress_at = left_queue_at
+          stall = now - last_progress_at
         if stall > _effective_stall_timeout:
           guard_reason = ("stall", f"no stream progress for {stall:.0f}s")
           logger.error("[%s] Turn %d watchdog (%s): %s", self._sid, turn_count, guard_reason[0], guard_reason[1])
@@ -560,11 +573,22 @@ class RunnerStreamTurnMixin:
         raise stream_error
       raise asyncio_module.CancelledError()
 
+    def _retry_delay(next_attempt: int) -> float:
+      return stream_retry_delay * (stream_retry_backoff ** (next_attempt - 1))
+
+    async def _emit_stream_retry(attempt: int, attempt_start_mono: float, error: str) -> None:
+      await self._emit_stream_retry_event(
+        attempt=attempt,
+        error=error,
+        attempt_elapsed_s=time_module.monotonic() - attempt_start_mono,
+        backoff_s=_retry_delay(attempt + 1) if attempt < stream_retry_max else None,
+      )
+
     for attempt in range(1 + stream_retry_max):
       if attempt > 0:
         _raise_if_disconnected()
         await self._close_client(client, timeout=2.0)
-        client = self._provider.create_client(config, timeout=self._client_timeout)
+        client = self._provider.create_client(config)
         self._set_client(client)
         logger.warning(
           "[%s] Stream retry %d/%d on turn %d after %s",
@@ -575,10 +599,10 @@ class RunnerStreamTurnMixin:
           _runner_attr(self, "_format_exc", _format_exc)(stream_error) if stream_error is not None else "unknown error",
         )
         _raise_if_disconnected()
-        delay = stream_retry_delay * (stream_retry_backoff ** (attempt - 1))
+        delay = _retry_delay(attempt)
         await asyncio_module.sleep(delay)
 
-      last_progress_at = time_module.monotonic()
+      last_progress_at = attempt_start_mono = time_module.monotonic()
       progress_events = 0
       commercial_producer = getattr(self, "_commercial_usage_producer", None)
       commercial_guard = getattr(commercial_producer, "assert_work_allowed", None)
@@ -683,7 +707,7 @@ class RunnerStreamTurnMixin:
               1 + stream_retry_max,
               guard_message,
             )
-            await self._emit_stream_retry_event(attempt=attempt, error=guard_error)
+            await _emit_stream_retry(attempt, attempt_start_mono, guard_error)
             continue
           logger.error(
             "[%s] Stream watchdog on turn %d after %.1fs (%s): %s | %s",
@@ -725,9 +749,10 @@ class RunnerStreamTurnMixin:
                 "status_code": credential_failure.status_code,
               }
             )
-            await self._emit_stream_retry_event(
-              attempt=attempt,
-              error=f"credential rotated after provider {credential_failure.kind} failure",
+            await _emit_stream_retry(
+              attempt,
+              attempt_start_mono,
+              f"credential rotated after provider {credential_failure.kind} failure",
             )
             if partial_usage_state.has_tokens:
               await self._call_on_usage(
@@ -788,7 +813,7 @@ class RunnerStreamTurnMixin:
               usage_state="canceled" if self._disconnected else "failed_billable",
             )
           _raise_if_disconnected(exc)
-          await self._emit_stream_retry_event(attempt=attempt, error=event_error)
+          await _emit_stream_retry(attempt, attempt_start_mono, event_error)
           continue
         if partial_usage_state.has_tokens:
           await self._call_on_usage(
@@ -824,7 +849,7 @@ class RunnerStreamTurnMixin:
               1 + stream_retry_max,
               guard_message,
             )
-            await self._emit_stream_retry_event(attempt=attempt, error=guard_error)
+            await _emit_stream_retry(attempt, attempt_start_mono, guard_error)
             continue
           if partial_usage_state.has_tokens:
             await self._call_on_usage(

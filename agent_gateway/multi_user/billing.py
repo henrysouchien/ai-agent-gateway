@@ -33,9 +33,11 @@ DEFAULT_USAGE_DLQ_PATH = Path("~/.gateway/usage_dlq.jsonl").expanduser()
 class UsageEvent:
   """Secret-free usage observation with admitted and reported identity split.
 
-  ``capability_bind`` is the authoritative admitted identity receipt.  The
-  compatibility ``model`` and ``provider`` projections must exactly match it
-  and are never replaced with ``provider_reported_model``.
+  ``capability_bind`` is the authoritative admitted identity receipt and the
+  billed identity.  A compatibility ``model`` or ``provider`` projection that
+  differs from it is billed as the bind says, and the projected value is kept
+  in ``projection_divergence``; neither is replaced with
+  ``provider_reported_model``.
   """
 
   user_id: str
@@ -63,13 +65,18 @@ class UsageEvent:
   is_batch: bool = False
   product_id: str | None = None
   event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+  projection_divergence: dict[str, str] | None = None
 
   def __post_init__(self) -> None:
     bind = CapabilityBind.from_json(self.capability_bind)
+    divergence = dict(self.projection_divergence or {})
     if self.model != bind.upstream_model:
-      raise ValueError("usage model projection differs from capability bind")
+      divergence["model"] = self.model
     if self.provider != bind.provider:
-      raise ValueError("usage provider projection differs from capability bind")
+      divergence["provider"] = self.provider
+    object.__setattr__(self, "model", bind.upstream_model)
+    object.__setattr__(self, "provider", bind.provider)
+    object.__setattr__(self, "projection_divergence", divergence or None)
     object.__setattr__(self, "capability_bind", bind.to_json())
     if self.provider_reported_model is not None:
       if not isinstance(self.provider_reported_model, str):
@@ -118,6 +125,7 @@ class SessionUsageSummary:
   provider_reported_model: str | None = None
   stream_started_at: float | None = None
   first_text_at: float | None = None
+  projection_divergence: dict[str, str] | None = None
 
   @property
   def wall_time_s(self) -> float:
@@ -137,11 +145,14 @@ class SessionUsageSummary:
         raise ValueError(
           "usage summaries with a capability bind require provider observations"
         )
+      # The bind is the billed identity; a differing projection is kept, not billed.
       bind = CapabilityBind.from_json(self.capability_bind)
+      divergence = dict(self.projection_divergence or {})
       if self.model is not None and self.model != bind.upstream_model:
-        raise ValueError("usage summary model projection differs from capability bind")
+        divergence["model"] = self.model
       if self.provider is not None and self.provider != bind.provider:
-        raise ValueError("usage summary provider projection differs from capability bind")
+        divergence["provider"] = self.provider
+      object.__setattr__(self, "projection_divergence", divergence or None)
       object.__setattr__(self, "capability_bind", bind.to_json())
       object.__setattr__(self, "model", bind.upstream_model)
       object.__setattr__(self, "provider", bind.provider)
@@ -186,8 +197,6 @@ def normalize_identity(
   normalized_user_id = str(user_id or "").strip()
   if not normalized_user_id:
     raise ValueError("user_id is required for usage identity")
-  if normalized_user_id == "_default":
-    raise ValueError("user_id '_default' is reserved for usage identity")
 
   normalized_rate_table_version = str(rate_table_version or "").strip()
   if not normalized_rate_table_version:

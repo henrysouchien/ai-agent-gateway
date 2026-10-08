@@ -82,8 +82,12 @@ def require_inherited_role(parent_session: Any | None) -> Literal["owner", "invi
   return "owner" if normalized == "owner" else "invite"
 
 
-def role_denied_tools_for_session(session: Any | None) -> frozenset[str]:
-  """Return enumerable role denials; execution still fails closed if unavailable."""
+def role_denied_tools_for_session(
+  session: Any | None,
+  *,
+  role: str | None = None,
+) -> frozenset[str]:
+  """Project role denials using admitted role and real session capability facts."""
   policy_module = load_server_policy_module()
   if policy_module is None:
     return frozenset()
@@ -94,7 +98,11 @@ def role_denied_tools_for_session(session: Any | None) -> frozenset[str]:
   )
   if forbidden_for_session is None:
     return frozenset()
-  return frozenset(forbidden_for_session(session))
+  return frozenset(
+    forbidden_for_session(session)
+    if role is None
+    else forbidden_for_session(session, role=role)
+  )
 
 
 def role_policy_denies_tool(
@@ -133,8 +141,9 @@ def authority_policy_denies_tool(
   tool_name: str,
   is_local: bool,
   profile_name: str | None = None,
+  mcp_server: str | None = None,
 ) -> bool:
-  """Evaluate authenticated role and scoped session capabilities together."""
+  """Evaluate authenticated role, scoped session capabilities and profile scope."""
   if session is None:
     # A sessionless runtime has no scoped capability to evaluate.  Its exact
     # inherited role is therefore owned by the package-level role policy;
@@ -156,6 +165,7 @@ def authority_policy_denies_tool(
     tool_name,
     is_local=is_local,
     profile_name=profile_name,
+    mcp_server=mcp_server,
   ))
 
 
@@ -164,8 +174,9 @@ def resolve_server_policy_tool_class(
   *,
   policy_tool_name: str | None = None,
   runtime_server: str | None = None,
-  default: str = "state_write",
+  default: str = "",
 ) -> str:
+  """Return the registered tool class; an unregistered tool stays unclassified."""
   _get_forbidden_tools_for_session, get_server_for_policy_tool, get_tool_class = load_server_policy_helpers(
     require_tool_class=True
   )

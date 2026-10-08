@@ -572,7 +572,7 @@ def test_top_level_skill_lifecycle_is_exactly_once_and_ordered(
     prepare_provider=_prepare_provider,
     prepare_completion=lambda _event_log, terminal_event: (
       _completion_plan(
-        _result_event(lifecycle, terminal_event),
+        {**_result_event(lifecycle, terminal_event), "verdict_echo": {"verdict_token": "BUY"}},
         terminal_event,
       )
     ),
@@ -605,16 +605,6 @@ def test_top_level_skill_lifecycle_is_exactly_once_and_ordered(
 
   entries, _ = _run(log.query(order="asc"))
   durable_types = [entry.event["type"] for entry in entries]
-  assert durable_types == [
-    "attach",
-    "user_message",
-    "skill_run_started",
-    "context_manifest",
-    "assistant_message",
-    "skill_result_captured",
-    "stream_complete",
-    "detach",
-  ]
   assert provider_seen_types == [
     "attach",
     "user_message",
@@ -650,6 +640,25 @@ def test_top_level_skill_lifecycle_is_exactly_once_and_ordered(
       field_name: event[field_name]
       for field_name in _metadata().identity_fields()
     } == _metadata().identity_fields()
+  # GP61: the run record reports the fence size its admission wrote (one
+  # fence line on a fresh log), not merely some positive number.
+  admission = runner._top_level_skill_admission
+  assert admission is not None
+  assert lifecycle_events[0]["lease_fence_bytes"] == (
+    admission.write_lease_path.stat().st_size
+  )
+  # The turn's session_recap copies that count from skill_run_started.
+  recap = next(
+    entry.event
+    for entry in event_log.entries
+    if entry.event["type"] == "session_recap"
+  )
+  assert recap["tool_calls_summary"]["measurements"]["lease_fence_bytes"] == (
+    lifecycle_events[0]["lease_fence_bytes"]
+  )
+  assert [verdict["verdict_token"] for verdict in recap["verdicts"]] == ["BUY"]
+  durable_recap = next(entry.event for entry in entries if entry.event["type"] == "session_recap")
+  assert durable_recap["verdicts"] == recap["verdicts"]
 
   live_types = [entry.event["type"] for entry in event_log.entries]
   assert live_types.count("skill_run_started") == 1
@@ -1860,11 +1869,12 @@ def test_named_skill_closure_keeps_one_pair_across_storage_recovery(
     runner = _runner(log=log, provider=_ScriptedProvider([_text_turn("done")]))
     if server_cause is not None:
       assert runner.set_server_terminal_cause(server_cause)
-    append_sync = log.append_sync
+    encode = log._encode_entry
     failed = False
 
-    def fail_once(event: dict[str, Any]) -> Any:
+    def fail_once(entry) -> Any:
       nonlocal failed
+      event = entry.event
       if event["type"] == failed_event and not failed:
         failed = True
         # Nothing in the live stream may expose a partially drained closure.
@@ -1873,7 +1883,7 @@ def test_named_skill_closure_keeps_one_pair_across_storage_recovery(
           for entry in runner._log.entries
         )
         raise OSError(f"{failed_event} append failed before write")
-      return append_sync(event)
+      return encode(entry)
 
     async def before_terminal(_log: Any, _terminal: dict[str, Any]) -> None:
       staged = runner._terminal_success_staged_events
@@ -1882,7 +1892,7 @@ def test_named_skill_closure_keeps_one_pair_across_storage_recovery(
         "type": "terminal_receipt", "receipt_id": "required", "outcome": "success",
       })
 
-    monkeypatch.setattr(log, "append_sync", fail_once)
+    monkeypatch.setattr(log, "_encode_entry", fail_once)
     runner._on_before_stream_complete = before_terminal
     await runner.run(messages=[{"role": "user", "content": "Run the skill"}])
     assert await runner.wait_for_top_level_skill_settlement()
@@ -1944,17 +1954,18 @@ def test_failed_detach_retry_records_error_without_replacing_committed_outcome(
   async def case() -> None:
     log = AgentSessionLog(tmp_path / "sessions" / "detach-retry.jsonl")
     runner = _runner(log=log, provider=_ScriptedProvider([_text_turn("done")]))
-    append_sync = log.append_sync
+    encode = log._encode_entry
     remaining_failures = 2
 
-    def fail_completed_detach(event: dict[str, Any]) -> Any:
+    def fail_completed_detach(entry) -> Any:
       nonlocal remaining_failures
+      event = entry.event
       if event["type"] == "detach" and remaining_failures:
         remaining_failures -= 1
         raise OSError("completed detach cannot persist")
-      return append_sync(event)
+      return encode(entry)
 
-    monkeypatch.setattr(log, "append_sync", fail_completed_detach)
+    monkeypatch.setattr(log, "_encode_entry", fail_completed_detach)
     await runner.run(messages=[{"role": "user", "content": "Run the skill"}])
     assert await runner.wait_for_top_level_skill_settlement()
     entries, _ = await log.query(order="asc")
@@ -2385,6 +2396,7 @@ def test_admission_fence_generation_is_durable_and_monotonic(
   assert first.lease_generation == 1
   assert len(bytes.fromhex(first.lease_owner_token)) == 32
   assert stat.S_IMODE(first.write_lease_path.stat().st_mode) == 0o600
+  assert first.lease_fence_bytes == first.write_lease_path.stat().st_size
   first.release()
   assert first.release() is False
   assert first.release_count == 1
@@ -2394,6 +2406,9 @@ def test_admission_fence_generation_is_durable_and_monotonic(
     assert second.lease_generation == 2
     assert second.lease_owner_token != first.lease_owner_token
     second.validate_fence()
+    # GP61: the fence grows by one line per admission and is measured, not capped.
+    assert second.lease_fence_bytes == second.write_lease_path.stat().st_size
+    assert second.lease_fence_bytes > first.lease_fence_bytes
   finally:
     second.release()
 

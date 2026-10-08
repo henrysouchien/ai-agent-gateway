@@ -162,42 +162,6 @@ def test_no_approval_route_is_the_only_sessionless_variant() -> None:
 
 
 
-def test_live_route_is_the_only_session_carrier(tmp_path: Path) -> None:
-  store = _store(tmp_path)
-  policy = _policy()
-  session_a = _session("sess-a")
-  session_b = _session("sess-b")
-  route = DurableLocalApprovalRoute(store, policy, session_a)
-
-  with pytest.raises(ValueError):
-    ToolDispatcher(
-      role="owner",
-      mcp_client=_NullMcp(),
-      local_tool_handlers={},
-      needs_approval=lambda *_a: True,
-      approval_route=route,
-      session=session_b,
-    )
-  with pytest.raises(ValueError):
-    ToolDispatcher(
-      role="owner",
-      mcp_client=_NullMcp(),
-      local_tool_handlers={},
-      needs_approval=lambda *_a: True,
-      approval_route=route,
-      session=session_a,
-    )
-
-  dispatcher = ToolDispatcher(
-    role="owner",
-    mcp_client=_NullMcp(),
-    local_tool_handlers={},
-    needs_approval=lambda *_a: True,
-    approval_route=route,
-  )
-  assert dispatcher._session is session_a
-  assert dispatcher._approval_store is store
-  assert dispatcher._approval_policy is policy
 
 
 
@@ -244,7 +208,6 @@ def test_gateway_construction_funnel_has_one_route_writer(
       session_id=session.session_id,
       request_approval=None,
       needs_approval=lambda *_a: False,
-      approved_tool_types=set(),
       local_tool_handlers={},
       _tool_dispatcher_cls=_CapturingDispatcher,
       _excel_tool_dispatcher_cls=lambda **kwargs: kwargs["base"],

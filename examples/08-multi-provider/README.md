@@ -3,7 +3,7 @@
 This example serves the same gateway shape through `provider="openai"` on `create_agent()`.
 
 It shows the first-party, Responses-only OpenAI setup:
-`create_agent(..., provider="openai", model_key="openai.gpt-5-6")`.
+`create_agent(..., provider="openai", model_key="openai.gpt-6-1-sol")`.
 
 ## Install
 

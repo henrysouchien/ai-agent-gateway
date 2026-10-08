@@ -35,6 +35,8 @@ from agent_workflow_contracts import (
   TaskResult,
   TaskResultProvenance,
   TaskResultValues,
+  ToolGrant,
+  ToolGrantEntry,
   TranscriptHandle,
   UsageObservation,
   canonical_json_bytes,
@@ -203,6 +205,7 @@ def test_classify_child_outcome_uses_execution_settlement_failure() -> None:
     "code": "timeout",
     "message": "Sub-agent ended with timeout",
     "child_outcome": "interrupted",
+    "next_call": None,
   }
 
 
@@ -226,9 +229,9 @@ def test_classify_child_outcome_rejects_success_claim_from_error() -> None:
 
 
 
-def test_named_operation_without_terminal_door_is_not_succeeded() -> None:
+def test_lifecycle_without_a_door_result_keeps_the_child_disposition() -> None:
   result = _task_result(
-    "STATUS: BLOCKED — prepare failed",
+    "Prepared; the build is next.",
     tools_used=("prepare_model_build", "list_research_files"),
     operation_name="build-model",
   )
@@ -238,13 +241,12 @@ def test_named_operation_without_terminal_door_is_not_succeeded() -> None:
     declared_terminal_doors=frozenset({"fms_report_build_model", "build_model"}),
   )
 
-  assert classification.succeeded is False
-  assert classification.outcome == "blocked"
-  assert classification.semantic == "none"
-  assert classification.execution_status != "succeeded"
+  assert classification.succeeded is True
+  assert classification.outcome == "complete"
+  assert classification.error is None
 
 
-def test_named_operation_terminal_stop_is_not_succeeded() -> None:
+def test_lifecycle_records_the_terminal_door_refusal_as_its_error() -> None:
   result = _task_result(
     "persist returned STOP",
     tools_used=("fms_persist_postcompile_valuation",),
@@ -260,13 +262,106 @@ def test_named_operation_terminal_stop_is_not_succeeded() -> None:
       "gate_code": "STOP",
       "subcommand": "persist_postcompile_valuation",
       "mutation_mode": "model_writer",
+      "error": {"type": "INVALID_JUDGMENT", "message": "no active research file"},
     },),
   )
 
   assert classification.succeeded is False
-  assert classification.semantic == "stop"
-  assert classification.execution_status != "succeeded"
   assert classification.outcome == "blocked"
+  assert classification.error == {
+    "code": "STOP",
+    "message": "no active research file",
+    "child_outcome": "blocked",
+  }
+
+
+_POSTCOMPILE_DOOR = "fms_persist_postcompile_valuation"
+_POSTCOMPILE_CONTEXT = "get_postcompile_valuation_context"
+
+
+def _context_read(*, sub_code: str | None) -> dict[str, Any]:
+  event: dict[str, Any] = {
+    "type": "tool_call_complete",
+    "tool_name": _POSTCOMPILE_CONTEXT,
+    "result": {"context_ref": "pcvcx1:exact"},
+    "semantic_error": None,
+  }
+  if sub_code is not None:
+    event["result"] = {"status": "error", "error_type": sub_code}
+    event["semantic_error"] = {
+      "code": "tool_status_error",
+      "message": "exact compiled valuation authority could not be resolved",
+      "sub_code": sub_code,
+    }
+  return event
+
+
+def test_context_doors_are_the_granted_context_reads() -> None:
+  tool_ids = ("docs_fetch", _POSTCOMPILE_DOOR, _POSTCOMPILE_CONTEXT)
+  grant = ToolGrant(
+    grant_id="grant-1",
+    tools=tuple(
+      ToolGrantEntry(
+        tool_id=tool_id,
+        route_id="route-1",
+        effect="write" if tool_id.startswith("fms_") else "read",
+      )
+      for tool_id in tool_ids
+    ),
+    digest=sha256_digest({"grant": list(tool_ids)}),
+  )
+
+  assert skill_state.declared_context_doors_from_grant(grant) == {
+    _POSTCOMPILE_CONTEXT,
+  }
+
+
+def test_context_door_refusal_is_returned_verbatim_with_its_next_call() -> None:
+  refusal = _context_read(sub_code="postcompile_model_version_not_ready")
+  refusal["result"]["next_call"] = {
+    "tool_name": "get_valuation_policy_context",
+    "arguments": {"research_file_id": 1},
+  }
+
+  assert skill_state.latest_declared_door_refusal(
+    {_POSTCOMPILE_DOOR, _POSTCOMPILE_CONTEXT},
+    (refusal,),
+  ) == {
+    "tool_name": _POSTCOMPILE_CONTEXT,
+    "result": refusal["result"],
+  }
+
+
+@pytest.mark.parametrize(
+  "tool_events",
+  [
+    pytest.param((), id="no-door-called"),
+    pytest.param(
+      (
+        _context_read(sub_code="postcompile_model_version_not_ready"),
+        _context_read(sub_code=None),
+      ),
+      id="refusal-superseded-by-accepted-read",
+    ),
+    pytest.param(
+      ({
+        "type": "tool_call_complete",
+        "tool_name": _POSTCOMPILE_CONTEXT,
+        "result": None,
+        "semantic_error": None,
+        "error": {"code": "tool_timeout", "sub_code": "timeout"},
+      },),
+      id="transport-failure-is-not-a-door-answer",
+    ),
+  ],
+)
+def test_no_door_refusal_leaves_the_child_on_its_narrative(
+  tool_events: tuple[dict[str, Any], ...],
+) -> None:
+  assert skill_state.latest_declared_door_refusal(
+    {_POSTCOMPILE_DOOR, _POSTCOMPILE_CONTEXT},
+    tool_events,
+  ) is None
 
 
 def test_ordinary_child_without_declared_door_keeps_clean_exit() -> None:
@@ -275,7 +370,6 @@ def test_ordinary_child_without_declared_door_keeps_clean_exit() -> None:
 
   assert classification.succeeded is True
   assert classification.outcome == "complete"
-  assert classification.semantic is None
   assert classification.execution_status == "succeeded"
 
 

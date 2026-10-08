@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
-import math
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
+log = logging.getLogger(__name__)
 
-_LIMIT_FIELDS = frozenset({"max_turns", "max_tokens", "max_budget_usd"})
+
+_LIMIT_FIELDS = frozenset({"max_tokens"})
+# Records persisted before the declared turn/cost ceilings were retired carry
+# these two extra keys; their values are dropped on read.
+_LEGACY_LIMIT_FIELDS = frozenset({"max_turns", "max_tokens", "max_budget_usd"})
 _ACTIVE_FIELDS = frozenset({"skill_name", "execution_limits"})
 _AUTONOMOUS_POLICY_FIELDS = frozenset({
   "skill_resume_allowed",
@@ -16,12 +21,7 @@ _AUTONOMOUS_POLICY_FIELDS = frozenset({
 })
 
 
-def _closed_mapping(
-  value: object,
-  *,
-  field_name: str,
-  fields: frozenset[str],
-) -> dict[str, object]:
+def _readable_mapping(value: object, *, field_name: str) -> dict[str, object]:
   if not isinstance(value, Mapping):
     raise TypeError(f"{field_name} must be a mapping")
   try:
@@ -35,6 +35,16 @@ def _closed_mapping(
     if key in payload:
       raise ValueError(f"{field_name} contains duplicate keys")
     payload[key] = item
+  return payload
+
+
+def _closed_mapping(
+  value: object,
+  *,
+  field_name: str,
+  fields: frozenset[str],
+) -> dict[str, object]:
+  payload = _readable_mapping(value, field_name=field_name)
   if frozenset(payload) != fields:
     raise ValueError(f"{field_name} has invalid fields")
   return payload
@@ -50,20 +60,6 @@ def _optional_positive_int(value: object, *, field_name: str) -> int | None:
   return value
 
 
-def _optional_positive_float(value: object, *, field_name: str) -> float | None:
-  if value is None:
-    return None
-  if type(value) is not int and type(value) is not float:
-    raise TypeError(f"{field_name} must be an exact number or None")
-  try:
-    normalized = float(value)
-  except OverflowError as exc:
-    raise ValueError(f"{field_name} must be finite and positive") from exc
-  if not math.isfinite(normalized) or normalized <= 0:
-    raise ValueError(f"{field_name} must be finite and positive")
-  return normalized
-
-
 def _canonical_skill_name(value: object, *, field_name: str) -> str:
   if type(value) is not str:
     raise TypeError(f"{field_name} must be an exact string")
@@ -74,28 +70,13 @@ def _canonical_skill_name(value: object, *, field_name: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class SkillExecutionLimits:
-  max_turns: int | None
   max_tokens: int | None
-  max_budget_usd: float | None
 
   def __post_init__(self) -> None:
     object.__setattr__(
       self,
-      "max_turns",
-      _optional_positive_int(self.max_turns, field_name="max_turns"),
-    )
-    object.__setattr__(
-      self,
       "max_tokens",
       _optional_positive_int(self.max_tokens, field_name="max_tokens"),
-    )
-    object.__setattr__(
-      self,
-      "max_budget_usd",
-      _optional_positive_float(
-        self.max_budget_usd,
-        field_name="max_budget_usd",
-      ),
     )
 
 
@@ -137,7 +118,7 @@ def reconcile_skill_admission(
   execution_limits: SkillExecutionLimits | None,
   active_admission: ActiveSkillAdmission | None,
 ) -> ActiveSkillAdmission | None:
-  """Reconcile named and inline facts without allowing either to override."""
+  """Return the session's active admission, else the run's named admission."""
 
   if active_admission is not None and type(active_admission) is not ActiveSkillAdmission:
     raise TypeError("active_admission must be exact ActiveSkillAdmission or None")
@@ -156,46 +137,34 @@ def reconcile_skill_admission(
   if active_admission is None:
     return named
   if active_admission != named:
-    raise ValueError("named and active skill admission facts do not match")
+    log.warning(
+      "Skill admission mismatch | named=%s active=%s",
+      named.skill_name,
+      active_admission.skill_name,
+    )
   return active_admission
 
 
 def skill_execution_limits_to_mapping(
   value: SkillExecutionLimits,
-) -> dict[str, int | float | None]:
+) -> dict[str, int | None]:
   if type(value) is not SkillExecutionLimits:
     raise TypeError("value must be exact SkillExecutionLimits")
-  return {
-    "max_turns": value.max_turns,
-    "max_tokens": value.max_tokens,
-    "max_budget_usd": value.max_budget_usd,
-  }
+  return {"max_tokens": value.max_tokens}
 
 
 def skill_execution_limits_from_mapping(
   value: object,
 ) -> SkillExecutionLimits:
-  payload = _closed_mapping(
-    value,
-    field_name="admitted skill execution limits",
-    fields=_LIMIT_FIELDS,
-  )
-  max_turns = _optional_positive_int(
-    payload["max_turns"],
-    field_name="max_turns",
-  )
-  max_tokens = _optional_positive_int(
-    payload["max_tokens"],
-    field_name="max_tokens",
-  )
-  max_budget_usd = _optional_positive_float(
-    payload["max_budget_usd"],
-    field_name="max_budget_usd",
-  )
+  field_name = "admitted skill execution limits"
+  payload = _readable_mapping(value, field_name=field_name)
+  if frozenset(payload) not in (_LIMIT_FIELDS, _LEGACY_LIMIT_FIELDS):
+    raise ValueError(f"{field_name} has invalid fields")
   return SkillExecutionLimits(
-    max_turns=max_turns,
-    max_tokens=max_tokens,
-    max_budget_usd=max_budget_usd,
+    max_tokens=_optional_positive_int(
+      payload["max_tokens"],
+      field_name="max_tokens",
+    ),
   )
 
 

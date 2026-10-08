@@ -498,7 +498,6 @@ def retry_decision(
   *,
   needs_approval: bool = False,
   aborted: bool = False,
-  wall_clock_exhausted: bool = False,
 ) -> str:
   """Return ``"retry"`` or ``"settle"`` for one completed attempt.
 
@@ -508,7 +507,7 @@ def retry_decision(
 
   if outcome not in RETRYABLE_OUTCOMES:
     return "settle"
-  if aborted or wall_clock_exhausted:
+  if aborted:
     return "settle"
   if needs_approval and not policy.allow_when_approval_required:
     return "settle"

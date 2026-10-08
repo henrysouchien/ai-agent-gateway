@@ -5,7 +5,6 @@ import errno
 import fcntl
 import json
 import logging
-import math
 import os
 import re
 import secrets
@@ -19,6 +18,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, SupportsIndex, TYPE_CHECKING, TypedDict
 
+from agent_workflow_contracts import ResolvedAuthority
+from agent_workflow_contracts.models import AdmittedContextWire
 from .autonomous_event_channel import (
   AutonomousEventAcknowledgement,
   AutonomousEventChannelParent,
@@ -32,6 +33,7 @@ from .autonomous_launch_envelope import AutonomousControlAuthority
 from .autonomous_claim_broker import AutonomousClaimBroker
 from model_authority.bind import CapabilityBind
 from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
+from .control_run_lifecycle import read_persisted_autonomous_state
 from .role_validation import require_exact_role
 from .skill_limits import (
   AutonomousSkillAdmissionPolicy,
@@ -100,16 +102,6 @@ AUTONOMOUS_RUN_STATE_CLASSIFICATION: MappingProxyType[
     "terminal": True,
   },
   "interrupted": {
-    "active_process": False,
-    "rehydrated_active": False,
-    "terminal": True,
-  },
-  "budget_limited": {
-    "active_process": False,
-    "rehydrated_active": False,
-    "terminal": True,
-  },
-  "budget_exceeded": {
     "active_process": False,
     "rehydrated_active": False,
     "terminal": True,
@@ -374,8 +366,9 @@ class AutonomousTask:
   events_inode: int | None = None
   events_evidence_status: str = "missing"
   manifest_version: int = _TASK_MANIFEST_VERSION
-  max_budget_usd: float | None = None
   research_file_id: int | None = None
+  autonomous_in_flight_at_start: int | None = None
+  credential_handoff_bytes: int | None = None
   state: str = "running"
   exit_code: int | None = None
   error: str | None = None
@@ -418,6 +411,8 @@ class AutonomousTask:
   schedule_name: str | None = None
   tool_result_spill_dir: Path | None = None
   capability_bind: CapabilityBind | None = None
+  admitted_context: AdmittedContextWire | None = None
+  tool_authority: ResolvedAuthority | None = None
   claim_broker: AutonomousClaimBroker | None = None
   launch_nonce: str | None = None
   approval_channel: AutonomousApprovalChannelParent | None = None
@@ -505,15 +500,6 @@ class AutonomousTask:
       raise ValueError("autonomous task skill_resume_allowed must be an exact bool")
     if self.mode != "skill" and self.skill_resume_allowed:
       raise ValueError("non-skill autonomous task cannot enable skill resume")
-    if self.mode == "skill":
-      if type(self.admitted_skill_execution_limits) is not SkillExecutionLimits:
-        raise ValueError(
-          "skill autonomous task requires exact admitted execution limits"
-        )
-    elif self.admitted_skill_execution_limits is not None:
-      raise ValueError(
-        "non-skill autonomous task cannot carry admitted execution limits"
-      )
     if self.pack is not None and (
       not isinstance(self.pack, str)
       or not self.pack
@@ -529,13 +515,10 @@ class AutonomousTask:
         or self.context is not None
         or self.ticker is not None
         or self.dev_mode
-        or self.max_budget_usd is not None
       ):
         raise ValueError("autonomous pack task has incompatible launch fields")
     elif self.pack is not None:
       raise ValueError("autonomous task pack is only valid for mode='pack'")
-    if not self.deliver and self.mode != "skill":
-      raise ValueError("autonomous task deliver=False is only valid for mode='skill'")
     if self.owner_user_id is None:
       self.owner_user_id = self.user_id
     self.role = require_exact_role(self.role)
@@ -548,8 +531,15 @@ class AutonomousTask:
         self.user_slug,
         self.user_email,
       )
+    if (self.admitted_context is None) != (self.tool_authority is None):
+      raise ValueError("autonomous task admitted context and tool authority must both be present or absent")
+    if self.admitted_context is not None:
+      if not isinstance(self.admitted_context, AdmittedContextWire) or not isinstance(self.tool_authority, ResolvedAuthority):
+        raise TypeError("autonomous task requires typed admitted authority")
+      if self.capability_bind != self.admitted_context.capability_bind:
+        raise ValueError("autonomous task bind does not match admitted context")
     if self.capability_bind is not None:
-      if self.capability_bind.capability_id != SESSION_DRIVER_CAPABILITY:
+      if self.admitted_context is None and self.capability_bind.capability_id != SESSION_DRIVER_CAPABILITY:
         raise ValueError("autonomous task requires a session.driver capability bind")
       if self.capability_bind.run_mode not in {"autonomous", "cron"}:
         raise ValueError("autonomous task bind must use autonomous or cron run mode")
@@ -599,13 +589,6 @@ def _positive_int(value: Any) -> int | None:
   return None
 
 
-def _positive_finite_float(value: Any) -> float | None:
-  if isinstance(value, bool) or not isinstance(value, (int, float)):
-    return None
-  normalized = float(value)
-  return normalized if math.isfinite(normalized) and normalized > 0 else None
-
-
 def _normalize_identity_str(value: Any) -> str | None:
   if isinstance(value, bool):
     return None
@@ -640,7 +623,7 @@ def _normalize_dispatch_scope(value: Any) -> dict[str, Any] | None:
   if value.get("source") not in {"active_default", "user_selected"}:
     return None
   portfolio_name = value.get("portfolio_name")
-  if not isinstance(portfolio_name, str) or not portfolio_name.strip() or len(portfolio_name) > 256:
+  if not isinstance(portfolio_name, str) or not portfolio_name.strip():
     return None
   normalized: dict[str, Any] = {
     "kind": "portfolio",
@@ -653,7 +636,7 @@ def _normalize_dispatch_scope(value: Any) -> dict[str, Any] | None:
     raw = value.get(key)
     if raw is None:
       continue
-    if not isinstance(raw, str) or not raw.strip() or len(raw) > 256:
+    if not isinstance(raw, str) or not raw.strip():
       return None
     normalized[key] = raw
   return normalized
@@ -1056,8 +1039,9 @@ class AutonomousRegistryStateMixin:
       "ticker": record.ticker,
       "channel": record.channel,
       "dev_mode": record.dev_mode,
-      "max_budget_usd": record.max_budget_usd,
       "research_file_id": record.research_file_id,
+      "autonomous_in_flight_at_start": record.autonomous_in_flight_at_start,
+      "credential_handoff_bytes": record.credential_handoff_bytes,
       "dispatch_scope": _normalize_dispatch_scope(record.dispatch_scope),
       "containment_expectation": {
         "platform": sys.platform,
@@ -1105,6 +1089,14 @@ class AutonomousRegistryStateMixin:
       record.capability_bind.to_json()
       if record.capability_bind is not None
       else None
+    )
+    payload["admitted_context"] = (
+      record.admitted_context.model_dump(mode="json")
+      if record.admitted_context is not None else None
+    )
+    payload["tool_authority"] = (
+      record.tool_authority.model_dump(mode="json")
+      if record.tool_authority is not None else None
     )
     return payload
 
@@ -1463,11 +1455,7 @@ class AutonomousRegistryStateMixin:
           )
         return "completed", None, None
       if disposition == "interrupted":
-        if terminal_reason is not None:
-          return "interrupted", None, terminal_reason
-        if event.get("reason") == "budget_exceeded":
-          return "budget_limited", None, None
-        return "interrupted", None, None
+        return "interrupted", None, terminal_reason
       return (
         "failed",
         f"Invalid stream_complete terminal_disposition: {disposition!r}",
@@ -1490,8 +1478,6 @@ class AutonomousRegistryStateMixin:
     read it here. ``None`` means the events settle nothing and the caller's own
     fallback (manifest state, or an abandoned run) decides.
     """
-    if outcome == "budget_limited":
-      return "budget_limited", None, None
     if outcome == "interrupted":
       return "interrupted", None, terminal_reason
     if outcome == "completed":
@@ -1672,7 +1658,6 @@ class AutonomousRegistryStateMixin:
       or not isinstance(deliver, bool)
       or (mode == "pack" and raw_pack is None)
       or (mode != "pack" and raw_pack is not None)
-      or (not deliver and mode != "skill")
       or (
         mode == "pack"
         and (
@@ -1683,7 +1668,6 @@ class AutonomousRegistryStateMixin:
               "skill",
               "context",
               "ticker",
-              "max_budget_usd",
             )
           )
           or manifest.get("dev_mode") is not False
@@ -1693,7 +1677,9 @@ class AutonomousRegistryStateMixin:
       self._warn_once(manifest_path, "Skipping autonomous manifest with invalid pack/deliver contract: %s")
       return None
 
-    raw_manifest_state = self._coerce_manifest_str(manifest, "state") or "running"
+    raw_manifest_state = read_persisted_autonomous_state(
+      self._coerce_manifest_str(manifest, "state") or "running"
+    )
     raw_exit_code = manifest.get("exit_code")
     exit_code = (
       int(raw_exit_code)
@@ -1720,28 +1706,15 @@ class AutonomousRegistryStateMixin:
     terminal_outcome, terminal_error, event_terminal_reason = (
       self._terminal_event_outcome(events)
     )
-    has_budget_exceeded = any(
-      is_root_run_event(event) and event.get("type") == "budget_exceeded"
-      for event in events
-    )
-    preserved_states = {
-      "killed",
-      "blocked",
-      "budget_limited",
-      "budget_exceeded",
-      "interrupted",
-    }
+    preserved_states = {"killed", "blocked", "interrupted"}
     is_active_or_unknown = (
       raw_manifest_state in rehydrated_active_states
       or raw_manifest_state not in terminal_states
     )
-    if raw_manifest_state == "failed" and error is not None:
+    if (
+      raw_manifest_state == "failed" and error is not None
+    ) or raw_manifest_state in preserved_states:
       pass
-    elif raw_manifest_state in preserved_states:
-      if raw_manifest_state in {"budget_limited", "budget_exceeded"}:
-        raw_state = "budget_limited"
-        error = None
-        terminal_reason = None
     elif raw_manifest_state in {"completed", "failed"}:
       settlement = self._terminal_settlement(
         terminal_outcome,
@@ -1751,10 +1724,6 @@ class AutonomousRegistryStateMixin:
       )
       if settlement is not None:
         raw_state, error, terminal_reason = settlement
-      elif has_budget_exceeded:
-        raw_state = "budget_limited"
-        error = None
-        terminal_reason = None
     elif is_active_or_unknown:
       completed_at = self._last_event_timestamp(events) or rehydrate_time
       settlement = self._terminal_settlement(
@@ -1794,8 +1763,19 @@ class AutonomousRegistryStateMixin:
         exc_info=True,
       )
       return None
-    if capability_bind.capability_id != SESSION_DRIVER_CAPABILITY:
-      self._warn_once(manifest_path, "Skipping autonomous manifest with non-session capability bind: %s")
+    raw_admitted_context = manifest.get("admitted_context")
+    raw_tool_authority = manifest.get("tool_authority")
+    try:
+      admitted_context = (
+        AdmittedContextWire.model_validate(raw_admitted_context)
+        if raw_admitted_context is not None else None
+      )
+      tool_authority = (
+        ResolvedAuthority.model_validate(raw_tool_authority)
+        if raw_tool_authority is not None else None
+      )
+    except (TypeError, ValueError):
+      self._warn_once(manifest_path, "Skipping autonomous manifest with invalid admitted authority: %s")
       return None
     if capability_bind.run_mode not in {"autonomous", "cron"}:
       self._warn_once(manifest_path, "Skipping autonomous manifest with non-autonomous capability bind: %s")
@@ -1829,7 +1809,7 @@ class AutonomousRegistryStateMixin:
       # This validation-only value is replaced before exposure or persistence
       # after all task/owner invariants have passed.
       admitted_skill_execution_limits = (
-        SkillExecutionLimits(None, None, None)
+        SkillExecutionLimits(None)
         if mode == "skill"
         else None
       )
@@ -1902,11 +1882,14 @@ class AutonomousRegistryStateMixin:
       if isinstance(started_at, (int, float))
       else rehydrate_time
     )
-    record_max_budget_usd = _positive_finite_float(
-      manifest.get("max_budget_usd")
-    )
     record_research_file_id = _positive_int(
       manifest.get("research_file_id")
+    )
+    record_autonomous_in_flight_at_start = _positive_int(
+      manifest.get("autonomous_in_flight_at_start")
+    )
+    record_credential_handoff_bytes = _positive_int(
+      manifest.get("credential_handoff_bytes")
     )
     record_terminal_manifest_committed = (
       not was_interrupted
@@ -1977,8 +1960,9 @@ class AutonomousRegistryStateMixin:
         skill_resume_allowed=skill_resume_allowed,
         admitted_skill_execution_limits=admitted_skill_execution_limits,
         manifest_version=manifest_version,
-        max_budget_usd=record_max_budget_usd,
         research_file_id=record_research_file_id,
+        autonomous_in_flight_at_start=record_autonomous_in_flight_at_start,
+        credential_handoff_bytes=record_credential_handoff_bytes,
         state=raw_state,
         exit_code=exit_code,
         error=error,
@@ -2001,6 +1985,8 @@ class AutonomousRegistryStateMixin:
         schedule_id=record_schedule_id,
         schedule_name=record_schedule_name,
         capability_bind=capability_bind,
+        admitted_context=admitted_context,
+        tool_authority=tool_authority,
         tool_result_spill_dir=record_tool_result_spill_dir,
       )
     except (TypeError, ValueError):

@@ -1,13 +1,14 @@
 import asyncio
 import json
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import pytest
 
@@ -22,7 +23,7 @@ from agent_gateway.mcp_client import McpClientManager  # noqa: E402
 from agent_gateway.server import ChatRequest  # noqa: E402
 from agent_gateway.skill_result_events import extract_fms_results  # noqa: E402
 from agent_gateway import AgentRunner, AgentSessionLog, EventLog, ModelInfo, ModelProvider, SessionStore, ToolDispatcher, ToolResultContext  # noqa: E402
-from agent_gateway.code_execution import CodeExecutionConfig, DockerBackend, build_code_execution  # noqa: E402
+from agent_gateway.code_execution import CodeExecutionConfig, DockerBackend, build_code_execution, cleanup_code_execution  # noqa: E402
 from agent_gateway.providers import StreamEvent  # noqa: E402
 from agent_gateway.sub_agent import make_run_agent_handler  # noqa: E402
 from agent_gateway.tool_result_compaction import (  # noqa: E402
@@ -40,6 +41,11 @@ from agent_gateway.tool_result_spill import (  # noqa: E402
   make_tool_result_read_handler,
   read_spill_result,
 )
+from gateway_test_support.resumer_custody_test_support import (  # noqa: E402
+  canonical_read_custody_task,
+  custody_registration,
+)
+from gateway_test_support.spill_custody_test_support import publish_custody_spill  # noqa: E402
 import agent_gateway.tool_result_compaction as tool_result_compaction  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 import agent_gateway.runner_tool_execution as runner_tool_execution  # noqa: E402
@@ -48,6 +54,24 @@ from gateway_test_support.capability_execution_test_support import (  # noqa: E4
   stub_runner_capability_execution,
 )
 from gateway_test_support.host_policy import owner_session_host_policy
+from agent_gateway.admission import ParentContext, current_parent_context  # noqa: E402
+from agent_gateway.approval_route import NoApprovalRoute  # noqa: E402
+from agent_workflow_contracts.models import AdmittedResearchBinding, AdmittedTenant  # noqa: E402
+
+
+def _root_job() -> ParentContext:
+  return ParentContext(
+    tenant=AdmittedTenant(tenant_id=None, storage_id="alice", role="owner"),
+    research_binding=AdmittedResearchBinding(),
+    children=None,
+    tool_ids=None,
+    withheld=frozenset(),
+    handle_grants=frozenset(),
+    remaining_usd=None,
+    job_id="root",
+    depth=0,
+    approval_route=NoApprovalRoute(),
+  )
 
 
 CAP = 4_000
@@ -452,25 +476,38 @@ def test_make_error_result_includes_optional_sub_code() -> None:
     "code": "invalid_input",
     "message": "bad payload",
     "sub_code": "too_large",
+    "data": {"next_call": None},
   }
 
 
-def test_make_error_result_includes_optional_data() -> None:
+def test_make_error_result_includes_optional_data_and_an_explicit_next_call() -> None:
   result = make_error_result(
     "tool-1",
     "tool_excluded",
-    "requires approval",
-    sub_code="requires_interactive_approval",
-    data={"recommended_verdict": "BUILD_BLOCKED"},
+    "excluded by profile",
+    sub_code="profile_static_exclude",
+    data={"excluding_owner": "profile"},
   )
 
   payload = json.loads(result["content"])
   assert payload["error"] == {
     "code": "tool_excluded",
-    "message": "requires approval",
-    "sub_code": "requires_interactive_approval",
-    "data": {"recommended_verdict": "BUILD_BLOCKED"},
+    "message": "excluded by profile",
+    "sub_code": "profile_static_exclude",
+    "data": {"excluding_owner": "profile", "next_call": None},
   }
+
+
+def test_make_error_result_keeps_the_producers_next_call() -> None:
+  next_call = {"tool_name": "load_tools", "arguments": {"pack": "market-data"}}
+  result = make_error_result(
+    "tool-1",
+    "tool_unavailable",
+    "load the pack first",
+    data={"next_call": next_call},
+  )
+
+  assert json.loads(result["content"])["error"]["data"] == {"next_call": next_call}
 
 
 def test_is_error_tool_result_entry_treats_only_truthy_payload_error_as_error() -> None:
@@ -841,18 +878,30 @@ def test_code_execution_ensure_work_dir_is_idempotent_and_concurrency_safe(
   assert Path(results[0]).exists()
 
 
-def test_runner_spills_large_tool_result_and_exact_reader_is_retry_safe(tmp_path: Path) -> None:
-  async def _run_test() -> None:
+@pytest.fixture
+def _shared_code_execution_root() -> Iterator[Path]:
+  # macOS's OS temp directory is not reliably shared with Docker.
+  state_root = Path.home() / ".local" / "state" / "hank"
+  state_root.mkdir(parents=True, exist_ok=True)
+  with tempfile.TemporaryDirectory(prefix="tool-result-spill-test-", dir=state_root) as root:
+    yield Path(root)
+
+
+def test_runner_spills_large_tool_result_and_exact_reader_is_retry_safe(
+  _shared_code_execution_root: Path,
+) -> None:
+  session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+
+  async def _run_journey() -> None:
     payload = "x" * PAYLOAD_SIZE
 
     async def _big_data(_tool_input: dict[str, Any], **kwargs: Any):
       _ = kwargs
       return {"status": "success", "payload": payload}, None
 
-    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     bundle = build_code_execution(
       session,
-      config=CodeExecutionConfig(work_dir_root=str(tmp_path)),
+      config=CodeExecutionConfig(work_dir_root=str(_shared_code_execution_root)),
     )
     spill_sink = SpillSink(
       root_provider=bundle.ensure_work_dir,
@@ -861,7 +910,9 @@ def test_runner_spills_large_tool_result_and_exact_reader_is_retry_safe(tmp_path
     local_handlers = dict(bundle.handlers)
     local_handlers["big_data"] = _big_data
     local_handlers["tool_result_read"] = make_tool_result_read_handler(
-      lambda: spill_sink
+      lambda: spill_sink,
+      caller=_root_job,
+      journal=lambda: None,
     )
     event_log = EventLog()
     provider = _RecordingProvider([
@@ -890,13 +941,14 @@ def test_runner_spills_large_tool_result_and_exact_reader_is_retry_safe(tmp_path
       code_execution_spill_dir_provider=spill_sink,
     )
 
-    await runner.run(messages=[{"role": "user", "content": "load"}], system_prompt="x", max_turns=2)
+    await runner.run(messages=[{"role": "user", "content": "load"}], system_prompt="x")
 
-    expected_content = json.dumps({"status": "success", "payload": payload}, default=str)
+    expected_payload = {"status": "success", "payload": payload}
     work_dir = Path(session.code_execution_work_dir or "")
     spill_files = [path for path in work_dir.iterdir() if path.name.startswith("big_data_tool-1")]
     assert len(spill_files) == 1
-    assert json.loads(spill_files[0].read_text(encoding="utf-8")) == json.loads(expected_content)
+    spill_bytes = spill_files[0].read_bytes()
+    assert json.loads(spill_bytes) == expected_payload
 
     live_blocks = _model_bound_tool_result_blocks(provider)
     live_payload = json.loads(live_blocks[0]["content"])
@@ -913,10 +965,13 @@ def test_runner_spills_large_tool_result_and_exact_reader_is_retry_safe(tmp_path
     assert "spill_ref" not in durable_payload
     assert "spill_summary" not in durable_payload
 
-    first_read = read_spill_result(spill_sink, spill_ref=spill_ref)
-    second_read = read_spill_result(spill_sink, spill_ref=spill_ref)
+    first_read, first_error = await local_handlers["tool_result_read"]({"spill_ref": spill_ref})
+    second_read, second_error = await local_handlers["tool_result_read"]({"spill_ref": spill_ref})
+    assert first_error is None
+    assert second_error is None
+    assert first_read is not None
     assert first_read == second_read
-    assert json.loads(first_read["content"]) == json.loads(expected_content)
+    assert first_read["content"].encode("utf-8") == spill_bytes
 
     code = (
       "import json\n"
@@ -930,6 +985,7 @@ def test_runner_spills_large_tool_result_and_exact_reader_is_retry_safe(tmp_path
     )
     assert error is None
     assert result is not None
+    assert result["return_code"] == 0, result
     assert result["stdout"] == f"{PAYLOAD_SIZE}\n"
 
     if DockerBackend().available():
@@ -940,7 +996,14 @@ def test_runner_spills_large_tool_result_and_exact_reader_is_retry_safe(tmp_path
       )
       assert error is None
       assert result is not None
+      assert result["return_code"] == 0, result
       assert result["stdout"] == f"{PAYLOAD_SIZE}\n"
+
+  async def _run_test() -> None:
+    try:
+      await _run_journey()
+    finally:
+      await cleanup_code_execution(session)
 
   _run(_run_test())
 
@@ -998,7 +1061,7 @@ def test_streamed_tool_call_complete_fits_the_autonomous_event_channel(tmp_path:
 
     runner._append_durable_event = _capture_durable_event
 
-    await runner.run(messages=[{"role": "user", "content": "load"}], system_prompt="x", max_turns=2)
+    await runner.run(messages=[{"role": "user", "content": "load"}], system_prompt="x")
 
     streamed_event = next(
       entry.event for entry in event_log.entries if entry.event.get("type") == "tool_call_complete"
@@ -1064,7 +1127,7 @@ def test_streamed_tool_call_complete_keeps_the_fms_door_envelope(tmp_path: Path)
       ),
     )
 
-    await runner.run(messages=[{"role": "user", "content": "persist"}], system_prompt="x", max_turns=2)
+    await runner.run(messages=[{"role": "user", "content": "persist"}], system_prompt="x")
 
     captured = extract_fms_results(event_log.entries)
     assert [result["subcommand"] for result in captured] == ["persist_business_model"]
@@ -1128,7 +1191,7 @@ def test_streamed_door_result_over_the_frame_keeps_its_staged_envelope(tmp_path:
       ),
     )
 
-    await runner.run(messages=[{"role": "user", "content": "propose"}], system_prompt="x", max_turns=2)
+    await runner.run(messages=[{"role": "user", "content": "propose"}], system_prompt="x")
 
     streamed_event = next(
       entry.event for entry in event_log.entries if entry.event.get("type") == "tool_call_complete"
@@ -1257,7 +1320,7 @@ def test_streamed_code_execute_event_projects_when_its_images_outgrow_the_frame(
 
     runner._append_durable_event = _capture_durable_event
 
-    await runner.run(messages=[{"role": "user", "content": "plot"}], system_prompt="x", max_turns=2)
+    await runner.run(messages=[{"role": "user", "content": "plot"}], system_prompt="x")
 
     streamed_event = next(
       entry.event for entry in event_log.entries if entry.event.get("type") == "tool_call_complete"
@@ -1281,7 +1344,7 @@ def test_streamed_code_execute_event_projects_when_its_images_outgrow_the_frame(
   _run(_run_test())
 
 
-def test_run_agent_sub_runner_spills_into_parent_work_dir(
+def test_run_agent_sub_runner_spills_into_own_job_root(
   tmp_path: Path,
   owner_session_host_policy,
 ) -> None:
@@ -1333,7 +1396,9 @@ def test_run_agent_sub_runner_spills_into_parent_work_dir(
     local_handlers = dict(bundle.handlers)
     local_handlers["file_read"] = _big_data
     local_handlers["tool_result_read"] = make_tool_result_read_handler(
-      lambda: spill_sink
+      lambda: spill_sink,
+      caller=lambda: current_parent_context(session),
+      journal=lambda: runner_ref[0]._agent_session_log,
     )
     runner_ref: list[Any] = [None]
     local_handlers["run_agent"] = make_run_agent_handler(
@@ -1374,17 +1439,24 @@ def test_run_agent_sub_runner_spills_into_parent_work_dir(
     )
     runner_ref[0] = runner
 
-    await runner.run(messages=[{"role": "user", "content": "delegate"}], system_prompt="x", max_turns=2)
+    await runner.run(messages=[{"role": "user", "content": "delegate"}], system_prompt="x")
 
     assert provider.last_spill_ref is not None
-    recovered = read_spill_result(
-      spill_sink,
-      spill_ref=provider.last_spill_ref,
-    )
-    assert json.loads(recovered["content"]) == {
-      "status": "success",
-      "payload": payload,
-    }
+    expected_payload = {"status": "success", "payload": payload}
+    work_dir = Path(bundle.ensure_work_dir())
+    filename = provider.last_spill_ref.split(":", 3)[2]
+    assert not (work_dir / filename).exists()
+    spill_files = list(work_dir.glob(f"jobs/*/{filename}"))
+    assert len(spill_files) == 1
+    spill_bytes = spill_files[0].read_bytes()
+    assert json.loads(spill_bytes) == expected_payload
+
+    recovered, error = await local_handlers["tool_result_read"]({
+      "spill_ref": provider.last_spill_ref,
+    })
+    assert error is None
+    assert recovered is not None
+    assert recovered["content"].encode("utf-8") == spill_bytes
     run_agent_event = next(
       entry.event
       for entry in event_log.entries
@@ -1402,4 +1474,133 @@ def test_run_agent_sub_runner_spills_into_parent_work_dir(
   _run(_run_test())
 
 
+@pytest.mark.parametrize("payload_chars", [PAYLOAD_SIZE, 2 * 1024 * 1024])
+def test_spill_publication_custody_is_durable_only_and_uses_physical_owner(
+  tmp_path: Path,
+  payload_chars: int,
+) -> None:
+  async def _case() -> None:
+    root = tmp_path / "spills"
+    root.mkdir()
+    sink = SpillSink(
+      lambda: str(root),
+      capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+    )
+    journal = AgentSessionLog(tmp_path / "session.jsonl")
+    context = replace(_root_job(), job_id="physical-producer")
+    payload = {"status": "success", "payload": "x" * payload_chars}
+    spill_ref, durable, live, provider = await publish_custody_spill(
+      sink, context, journal, tool_use_id="physical-call", payload=payload,
+    )
+    assert durable["spill_publication"] == {
+      "spill_ref": spill_ref,
+      "producer_job_id": "physical-producer",
+      "producer_root": str(root.resolve()),
+    }
+    assert durable["spill_publication"]["producer_job_id"] != durable["runner_id"]
+    assert durable["result"] == payload
+    assert "spill_publication" not in live
+    assert str(root.resolve()) not in json.dumps(live)
+    model_messages = [params["messages"] for params in provider.params_history]
+    assert "spill_publication" not in json.dumps(model_messages)
+    assert str(root.resolve()) not in json.dumps(model_messages)
+    snapshot_autonomous_event(live)
+    model_payloads = _tool_result_payloads(provider.params_history[-1]["messages"])
+    assert any(payload.get("spill_ref") == spill_ref for payload in model_payloads)
+    durable_content = json.loads(durable["final_tool_result_blocks"][0]["content"])
+    for pointer_key in ("spill_ref", "spill_summary", "spill_file", "spill_abspath", "spill_hint"):
+      assert pointer_key not in durable_content
+    # Reopening consumes the committed journal fact, not a retained event object.
+    replay, _ = await AgentSessionLog(tmp_path / "session.jsonl").query(
+      event_types={"tool_call_complete"},
+    )
+    assert replay[0].event["spill_publication"] == durable["spill_publication"]
 
+  _run(_case())
+
+
+@pytest.mark.parametrize(
+  "reader_job_id",
+  ["rightful-producer", "rightful-parent", "rightful-resumer"],
+)
+def test_cold_spill_read_admits_custody_when_refs_collide(
+  tmp_path: Path,
+  reader_job_id: str,
+) -> None:
+  async def _case() -> None:
+    journal_path = tmp_path / "session.jsonl"
+    journal = AgentSessionLog(journal_path)
+    rightful_task = canonical_read_custody_task(
+      "rightful-producer", parent_job_id="rightful-parent",
+    )
+    successor = canonical_read_custody_task(
+      "rightful-successor",
+      predecessor=rightful_task,
+      resumer_job_id="rightful-resumer",
+    )
+    unrelated_task = canonical_read_custody_task(
+      "unrelated-producer", parent_job_id="unrelated-parent",
+    )
+    for task in (unrelated_task, rightful_task, successor):
+      await journal.append(custody_registration(task))
+    unrelated_root = tmp_path / "unrelated"
+    rightful_root = tmp_path / "rightful"
+    unrelated_root.mkdir()
+    rightful_root.mkdir()
+    unrelated_sink, rightful_sink = (
+      SpillSink(
+        lambda root=root: str(root),
+        capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+      )
+      for root in (unrelated_root, rightful_root)
+    )
+    payload = {"status": "success", "payload": "α😀\n" + "x" * PAYLOAD_SIZE}
+    # Both real runners publish successfully using identical tool-call IDs
+    # and content, but distinct physical producer jobs and storage roots.
+    unrelated_ref, _, _, _ = await publish_custody_spill(
+      unrelated_sink, replace(_root_job(), job_id="unrelated-producer"), journal,
+      tool_use_id="colliding-call", payload=payload,
+    )
+    spill_ref, _, _, _ = await publish_custody_spill(
+      rightful_sink, replace(_root_job(), job_id="rightful-producer"), journal,
+      tool_use_id="colliding-call", payload=payload,
+    )
+    assert unrelated_ref == spill_ref
+    publications, _ = await journal.query(event_types={"tool_call_complete"})
+    assert [
+      item.event["spill_publication"]["producer_job_id"] for item in publications
+    ] == ["unrelated-producer", "rightful-producer"]
+    member_ref = spill_ref.split(":", 3)[2]
+    expected_bytes = (rightful_root / member_ref).read_bytes()
+    assert (unrelated_root / member_ref).read_bytes() == expected_bytes
+    # Cold reads retain no writer or sink and reopen only the durable journal.
+    del unrelated_sink, rightful_sink, journal
+    replay = AgentSessionLog(journal_path)
+    reader = replace(_root_job(), job_id=reader_job_id)
+    assert reader.handle_grants == frozenset()
+    result, error = await make_tool_result_read_handler(
+      lambda: None, caller=lambda: reader, journal=lambda: replay,
+    )({"spill_ref": spill_ref, "max_chars": 40_000})
+    assert error is None and result is not None
+    assert result["content"].encode("utf-8") == expected_bytes
+    assert result["next_offset"] is None
+    assert result["truncated"] is False
+    for denied_job_id in ("ungranted-reader", "session-alias", "runner-alias"):
+      denied_reader = replace(_root_job(), job_id=denied_job_id)
+      result, error = await make_tool_result_read_handler(
+        lambda: None, caller=lambda: denied_reader, journal=lambda: replay,
+      )({"spill_ref": spill_ref})
+      assert result is None and error is not None
+      assert error["code"] == "handle_not_granted"
+    # An explicitly passed handle still reads a same-tenant publication
+    # without becoming an output of the receiving job.
+    granted_reader = replace(
+      _root_job(), job_id="granted-reader", handle_grants=frozenset({spill_ref}),
+    )
+    result, error = await make_tool_result_read_handler(
+      lambda: None, caller=lambda: granted_reader, journal=lambda: replay,
+    )({"spill_ref": spill_ref, "max_chars": 40_000})
+    assert error is None and result is not None
+    assert result["content"].encode("utf-8") == expected_bytes
+
+  _run(_case())

@@ -390,7 +390,12 @@ def _terminal_events(response: dict[str, Any], state: _ResponsesStreamState) -> 
     stop_reason = "error"
   else:
     stop_reason = "end_turn"
-  events.append(StreamEvent(type="message_end", stop_reason=stop_reason))
+  events.append(StreamEvent(
+    type="message_end",
+    stop_reason=stop_reason,
+    # Responses input_tokens already includes cached prompt tokens.
+    request_input_tokens=total_input if usage.get("input_tokens") is not None else None,
+  ))
   return events
 
 

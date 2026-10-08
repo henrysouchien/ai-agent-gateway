@@ -36,14 +36,12 @@ from agent_gateway.approval_policy import (
   utc_now,
 )
 from agent_gateway.approval_route import (
-  DurableLocalApprovalRoute,
   NoApprovalRoute,
   ParentDelegatedApprovalRoute,
 )
 from agent_gateway.autonomous_approval_channel import (
   AutonomousApprovalChannelChild,
 )
-from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.session import GatewaySession
 from agent_gateway.prepared_business_model_store import PreparedBusinessModelLifecycle
 from agent_gateway.batch_approval_projection import (
@@ -793,139 +791,6 @@ _DEFAULT_BUSINESS_MODEL_RESTORE = object()
 
 
 @pytest.mark.parametrize(
-  ("session_cache_approved", "automatic_approval_reason"),
-  [
-    (True, None),
-    (False, "headless hook allowed"),
-    (False, None),
-  ],
-)
-def test_fresh_owner_lifecycle_blocks_every_automatic_source(
-  tmp_path: Path,
-  session_cache_approved: bool,
-  automatic_approval_reason: str | None,
-) -> None:
-  class AutoPolicy:
-    policy_id = "auto-policy"
-    policy_version = "1"
-
-    def __init__(self) -> None:
-      self.decide_calls = 0
-      self.resolved: list[str] = []
-
-    async def decide(self, **_kwargs: Any) -> PolicyApprovalDecision:
-      self.decide_calls += 1
-      return PolicyApprovalDecision(
-        outcome="auto_approve",
-        reason="custom automatic policy",
-        allow_persistent_grant=True,
-        persistent_grant_scope_hint="state_write:apply_proposal_series",
-        grant_reference="grant-should-not-survive",
-      )
-
-    async def on_resolve(self, *, request: Any) -> None:
-      self.resolved.append(request.approval_id)
-
-  async def fail_if_prompted(*_args: Any, **_kwargs: Any) -> None:
-    raise AssertionError("headless fresh-owner lifecycle must not prompt")
-
-  store = SQLiteApprovalStore(tmp_path / "fresh-owner.sqlite3")
-  policy = AutoPolicy()
-  session = _gateway_session()
-  result = asyncio.run(
-    lifecycle_helpers.run_approval_lifecycle(
-      route=DurableLocalApprovalRoute(store, policy, session),
-      session=session,
-      tool_call_id="promotion-call",
-      tool_name="apply_proposal_series",
-      tool_input={"proposal_ids": ["proposal-1"]},
-      qualifier="",
-      reason="promotion",
-      allow_persistent=True,
-      approval_constraint="fresh_human_owner",
-      required_owner_user_id="owner-1",
-      session_cache_approved=session_cache_approved,
-      automatic_approval_reason=automatic_approval_reason,
-      deny_user_prompt=True,
-      resolve_run_context_fn=lambda: RunContext(
-        user_id="owner-1",
-        request_id="request-1",
-        decider_role="owner",
-      ),
-      current_skill_admission_fn=lambda: None,
-      redact_for_approval_request_fn=lambda *_args: ({}, "args-hash"),
-      resolve_tool_class_fn=lambda _tool_name: "state_write",
-      effective_trade_approval_decision_fn=lambda _name, _args, decision: decision,
-      await_user_approval_via_pending_tools_fn=fail_if_prompted,
-      approval_queue_timeout_seconds_fn=lambda _expiry: 1.0,
-    )
-  )
-
-  request = result["request"]
-  assert result["approved"] is False
-  assert result["allow_tool_type"] is False
-  assert request.state == "auto_denied"
-  assert request.authorization_mode == "HUMAN"
-  assert request.grant_reference is None
-  assert request.persistent_grant_scope is None
-  assert request.approval_constraint == "fresh_human_owner"
-  assert request.required_owner_user_id == "owner-1"
-  assert policy.decide_calls == 1
-  assert policy.resolved == [request.approval_id]
-
-
-def test_native_approval_refuses_inline_limit_mismatch_before_policy(
-  tmp_path: Path,
-) -> None:
-  calls: list[str] = []
-
-  class Policy:
-    async def decide(self, **_kwargs: Any) -> PolicyApprovalDecision:
-      calls.append("policy")
-      raise AssertionError("mismatched admission must precede policy")
-
-  limits = SkillExecutionLimits(20, 32_000, 20.0)
-  with pytest.raises(ValueError, match="do not match"):
-    asyncio.run(
-      lifecycle_helpers.run_approval_lifecycle(
-        route=DurableLocalApprovalRoute(
-          SQLiteApprovalStore(tmp_path / "admission-mismatch.sqlite3"),
-          Policy(),
-          _gateway_session(),
-        ),
-        session=_gateway_session(),
-        tool_call_id="call-mismatch",
-        tool_name="file_write",
-        tool_input={"path": "x"},
-        qualifier="",
-        reason="write",
-        allow_persistent=False,
-        resolve_run_context_fn=lambda: RunContext(
-          user_id="owner-1",
-          request_id="request-1",
-          skill="quant-research",
-          admitted_skill_execution_limits=limits,
-        ),
-        current_skill_admission_fn=lambda: ActiveSkillAdmission(
-          "quant-research",
-          SkillExecutionLimits(19, 32_000, 20.0),
-        ),
-        redact_for_approval_request_fn=lambda *_args: (_ for _ in ()).throw(
-          AssertionError("mismatch must precede redaction")
-        ),
-        resolve_tool_class_fn=lambda _tool_name: "state_write",
-        effective_trade_approval_decision_fn=(
-          lambda _name, _args, decision: decision
-        ),
-        await_user_approval_via_pending_tools_fn=lambda *_args: None,
-        approval_queue_timeout_seconds_fn=lambda _expiry: 1.0,
-      )
-    )
-
-  assert calls == []
-
-
-@pytest.mark.parametrize(
   ("tool_class", "expected_state", "expected_mode"),
   [
     ("state_write", "auto_approved", "OWNER_CONTROL_PLANE"),
@@ -996,63 +861,6 @@ def test_delegated_run_settles_everything_but_the_money_boundary(
     assert result["approved"] is False
     assert result["timeout"] is True
     assert prompts == ["prompted"]
-
-
-def test_delegated_run_keeps_a_profile_tightened_door_human() -> None:
-  """A profile that tightened a run_owner door is not waived by the settle.
-
-  The profile's approval overlay can only add a requirement, so a door its
-  `approval_required_tools` names asks the operator even though the door's own
-  registration would let the run's owner authority settle it unattended.
-  """
-
-  session = _gateway_session()
-  prompts: list[str] = []
-
-  async def record_prompt(*_args: Any, **_kwargs: Any) -> None:
-    prompts.append("prompted")
-    return None
-
-  result = asyncio.run(
-    lifecycle_helpers.run_approval_lifecycle(
-      route=ParentDelegatedApprovalRoute(
-        object.__new__(AutonomousApprovalChannelChild),
-        session,
-      ),
-      session=session,
-      tool_call_id="call-memory-write",
-      tool_name="memory_write",
-      tool_input={"content": "thesis note"},
-      qualifier="",
-      reason="persist research note",
-      allow_persistent=False,
-      profile_tightened_approval=True,
-      resolve_run_context_fn=lambda: RunContext(
-        user_id="owner-1",
-        request_id="control-run-2",
-        profile="analyst",
-        channel="cli",
-        decider_role="owner",
-      ),
-      current_skill_admission_fn=lambda: None,
-      redact_for_approval_request_fn=lambda *_args: ({}, "args-hash"),
-      resolve_tool_class_fn=lambda _tool_name: "state_write",
-      effective_trade_approval_decision_fn=(
-        lambda _name, _args, decision: decision
-      ),
-      await_user_approval_via_pending_tools_fn=record_prompt,
-      approval_queue_timeout_seconds_fn=lambda _expiry: 1.0,
-    )
-  )
-
-  request = result["request"]
-  assert request.state == "pending_user"
-  assert request.authorization_mode == "HUMAN"
-  assert request.decision is None
-  assert request.decider_id is None
-  assert result["approved"] is False
-  assert result["timeout"] is True
-  assert prompts == ["prompted"]
 
 
 

@@ -24,10 +24,8 @@ from agent_gateway.autonomous_launch_envelope import (
 from model_authority.bind import CapabilityBind
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.control_plane import runs as runs_module
-from agent_gateway.control_plane import runs_chat_helpers as chat_helpers_module
 from agent_gateway.control_plane import runs_helpers as helpers_module
 from agent_gateway.control_plane import runs_models as models_module
-from agent_gateway.control_plane import runs_resume_helpers as resume_helpers_module
 from agent_gateway.control_plane.runs_helpers import (
   _AUTONOMOUS_RESUME_CONTEXT_MAX_CHARS,
   _AUTONOMOUS_RESUME_TOOL_RESULT_BLOCK_MAX_CHARS,
@@ -55,28 +53,12 @@ from gateway_test_support.control_plane_autonomous import (
 )
 
 
-
-
-def test_control_plane_runs_parent_aliases_moved_helpers() -> None:
-  assert runs_module.ChatRunResponse is helpers_module.ChatRunResponse
-  assert helpers_module.ChatRunResponse is models_module.ChatRunResponse
-  assert runs_module.AutonomousRunResponse is helpers_module.AutonomousRunResponse
-  assert helpers_module.AutonomousRunResponse is models_module.AutonomousRunResponse
-  assert helpers_module.ChatDispatchRequest is models_module.ChatDispatchRequest
-  assert helpers_module.RunEnvelopeResponse is models_module.RunEnvelopeResponse
-  assert runs_module._autonomous_state is helpers_module._autonomous_state
-  assert runs_module._build_autonomous_resume_context is resume_helpers_module._build_autonomous_resume_context
-  assert runs_module.cleanup_control_chat_tasks is chat_helpers_module.cleanup_control_chat_tasks
-  assert runs_module._dispatch_control_chat_turn is chat_helpers_module._dispatch_control_chat_turn
-
-
 def test_control_plane_run_status_vocab_normalizes_internal_states() -> None:
   assert helpers_module._autonomous_state("blocked") == "failed"
-  assert helpers_module._autonomous_state("budget_limited") == "budget_limited"
+  assert helpers_module._autonomous_state("budget_limited") == "interrupted"
   assert helpers_module._autonomous_state("remediating") == "running"
   assert helpers_module._TERMINAL_RUN_STATES == {
     "completed",
-    "budget_limited",
     "failed",
     "interrupted",
     "cancelled",
@@ -149,16 +131,14 @@ Run the resumable test skill.
   )
 
 
-def test_dispatch_refuses_a_skill_the_catalog_cannot_launch(
+def test_dispatch_leaves_skill_launchability_to_the_runner(
   monkeypatch,
   tmp_path,
 ) -> None:
-  """The launch question is answered before a run id is charged.
+  """A skill the catalog marks unlaunchable is dispatched like any other.
 
-  A skill whose catalog entry says it cannot be launched (here: the
-  dev-mode-authority class) was accepted, given a run id, launched, and
-  reported back as the anonymous `autonomous_process_failed`; the reason
-  reached only the child log.
+  Launchability is not a 422 at dispatch. ``autonomous_run_allowed`` is a
+  warning the launcher records (AS37), not a refusal here.
   """
   processes, _envs = _install_fake_spawn(monkeypatch)
   skills_dir = tmp_path / "skills"
@@ -180,7 +160,7 @@ def test_dispatch_refuses_a_skill_the_catalog_cannot_launch(
 
   with TestClient(app) as client:
     headers = _headers(_control_session(client, "alice"))
-    refused = client.post(
+    blocked = client.post(
       "/api/control/runs",
       headers=headers,
       json={
@@ -201,16 +181,13 @@ def test_dispatch_refuses_a_skill_the_catalog_cannot_launch(
       },
     )
 
-  assert refused.status_code == 422, refused.text
-  assert refused.json()["detail"] == (
-    "Skill 'dev-only-skill' requires trusted autonomous dev-mode authority "
-    "and cannot be launched by the control plane."
-  )
+  assert blocked.status_code == 200, blocked.text
   assert launched.status_code == 200, launched.text
-  assert [task.skill for task in app.state.subprocess_registry._tasks.values()] == [
-    "resumable-skill"
+  assert sorted(task.skill for task in app.state.subprocess_registry._tasks.values()) == [
+    "dev-only-skill",
+    "resumable-skill",
   ]
-  assert len(processes) == 1
+  assert len(processes) == 2
 
 
 
@@ -258,7 +235,7 @@ def test_injected_control_and_admission_avoid_directory_fallback(
   def resolver(_skill: str) -> AutonomousSkillAdmissionPolicy:
     return AutonomousSkillAdmissionPolicy(
       False,
-      SkillExecutionLimits(None, None, None),
+      SkillExecutionLimits(None),
     )
 
   app = _make_app(
@@ -554,7 +531,6 @@ def test_autonomous_control_endpoints_spawn_read_logs_cancel_and_enforce_user_sc
         "context": "Review AAPL earnings",
         "ticker": "AAPL",
         "channel": "tui",
-        "max_budget_usd": 5.0,
       },
     )
     assert start.status_code == 200, start.text
@@ -650,7 +626,6 @@ def test_live_two_user_run_matrix_is_disjoint_and_cross_user_actions_are_404(
       schedule_id=None,
       schedule_name=None,
       capability_bind=None,
-      max_budget_usd=kwargs.get("max_budget_usd"),
       log_path=log_path,
       events_path=None,
       tool_result_spill_dir=None,
@@ -887,7 +862,6 @@ def test_autonomous_runs_are_scoped_by_canonical_owner_alias(monkeypatch, tmp_pa
         "context": "Review AAPL earnings",
         "ticker": "AAPL",
         "channel": "tui",
-        "max_budget_usd": 5.0,
       },
     )
     assert start.status_code == 200, start.text
@@ -900,8 +874,7 @@ def test_autonomous_runs_are_scoped_by_canonical_owner_alias(monkeypatch, tmp_pa
     assert start_run["user_email"] == "henry@example.com"
     assert start_run["user_aliases"] == ["1", "henry", "henry@example.com"]
     assert start_run["identity_status"] == "gateway_user_key_mapping"
-    assert start_run["max_budget_usd"] == 5.0
-    assert start.json()["cmd"][start.json()["cmd"].index("--max-budget-usd") + 1] == "5.0"
+    assert "max_budget_usd" not in start_run
     envelope = verify_autonomous_launch_envelope(
       HMAC_KEY,
       envs[0][AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
@@ -930,7 +903,7 @@ def test_autonomous_runs_are_scoped_by_canonical_owner_alias(monkeypatch, tmp_pa
     assert manifest["raw_user_id"] == "henry"
     assert manifest["user_slug"] == "henry"
     assert manifest["user_aliases"] == ["1", "henry", "henry@example.com"]
-    assert manifest["max_budget_usd"] == 5.0
+    assert "max_budget_usd" not in manifest
 
     detail = client.get("/api/control/runs/bg_0", headers=_headers(henry_web))
     assert detail.status_code == 200
@@ -943,14 +916,12 @@ def test_autonomous_runs_are_scoped_by_canonical_owner_alias(monkeypatch, tmp_pa
     assert detail_run["user_email"] == "henry@example.com"
     assert detail_run["user_aliases"] == ["1", "henry", "henry@example.com"]
     assert detail_run["identity_status"] == "gateway_user_key_mapping"
-    assert detail_run["max_budget_usd"] == 5.0
     listed = client.get("/api/control/runs?kind=autonomous", headers=_headers(henry_web))
     assert listed.status_code == 200
     listed_run = listed.json()["runs"][0]
     assert listed_run["owner_user_id"] == "1"
     assert listed_run["raw_user_id"] == "henry"
     assert listed_run["identity_status"] == "gateway_user_key_mapping"
-    assert listed_run["max_budget_usd"] == 5.0
     assert client.get("/api/control/runs/bg_0", headers=_headers(alice)).status_code == 404
 
 
@@ -1262,10 +1233,10 @@ def _rehydrated_readable_resource_responses(monkeypatch, tmp_path):
         content_class="dev_only",
       ),
       _readable_resource_event(
-        resource_id="rr:spoofed",
+        resource_id="rr:mislabeled",
         control_run_id="other-run",
-        skill_run_id="skill-spoofed",
-        content="## Spoofed\n",
+        skill_run_id="skill-mislabeled",
+        content="## Mislabeled\n",
       ),
     ],
   )
@@ -1278,12 +1249,12 @@ def _rehydrated_readable_resource_responses(monkeypatch, tmp_path):
     listed = client.get("/api/control/readable-resources?limit=24", headers=_headers(alice))
     filtered = client.get("/api/control/readable-resources?run_id=run-readable", headers=_headers(alice))
     detail = client.get("/api/control/readable-resources/rr:daily-note", headers=_headers(alice))
-    spoofed = client.get("/api/control/readable-resources/rr:spoofed", headers=_headers(alice))
+    mislabeled = client.get("/api/control/readable-resources/rr:mislabeled", headers=_headers(alice))
     bob_detail = client.get("/api/control/readable-resources/rr:daily-note", headers=_headers(bob))
     run_detail = client.get("/api/control/runs/run-readable", headers=_headers(alice))
     bob_run_detail = client.get("/api/control/runs/run-readable", headers=_headers(bob))
 
-  return listed, filtered, detail, spoofed, bob_detail, run_detail, bob_run_detail
+  return listed, filtered, detail, mislabeled, bob_detail, run_detail, bob_run_detail
 
 
 def test_readable_resources_rehydrated_run_remains_owner_scoped(monkeypatch, tmp_path) -> None:
@@ -1297,26 +1268,35 @@ def test_readable_resources_rehydrated_run_remains_owner_scoped(monkeypatch, tmp
 
 def test_readable_resources_list_detail_visible_rehydrated_snapshots(monkeypatch, tmp_path) -> None:
   content = "## Daily note\n\nCaptured markdown.\n"
-  listed, filtered, detail, spoofed, bob_detail, _run_detail, _bob_run_detail = (
+  listed, filtered, detail, mislabeled, bob_detail, _run_detail, _bob_run_detail = (
     _rehydrated_readable_resource_responses(monkeypatch, tmp_path)
   )
   assert listed.status_code == 200, listed.text
   payload = listed.json()
   assert payload["next_cursor"] is None
-  assert len(payload["readable_resources"]) == 1
-  listed_resource = payload["readable_resources"][0]
-  assert listed_resource["resource_id"] == "rr:daily-note"
+  listed_by_id = {
+    resource["resource_id"]: resource
+    for resource in payload["readable_resources"]
+  }
+  assert set(listed_by_id) == {"rr:daily-note", "rr:mislabeled"}
+  listed_resource = listed_by_id["rr:daily-note"]
   assert listed_resource["control_run_id"] == "run-readable"
   assert listed_resource["skill_run_id"] == "skill-readable"
   assert listed_resource["content_class"] == "human_readable"
   assert "content" not in listed_resource
   assert filtered.status_code == 200
-  assert filtered.json()["readable_resources"] == [listed_resource]
+  assert {
+    resource["resource_id"]
+    for resource in filtered.json()["readable_resources"]
+  } == {"rr:daily-note", "rr:mislabeled"}
   assert detail.status_code == 200, detail.text
   detail_payload = detail.json()
   assert detail_payload["content"] == content
   assert detail_payload["content_sha256"] == hashlib.sha256(content.encode("utf-8")).hexdigest()
-  assert spoofed.status_code == 404
+  # A snapshot read from this owner's run is served under that run's ids,
+  # whatever run id the event itself carries.
+  assert mislabeled.status_code == 200, mislabeled.text
+  assert mislabeled.json()["control_run_id"] == "run-readable"
   assert bob_detail.status_code == 404
 
 
@@ -1374,54 +1354,63 @@ def test_run_cost_prefers_terminal_stream_complete_total(monkeypatch, tmp_path) 
   assert detail.json()["cost_usd"] == 0.08
 
 
-def _budget_exceeded_detail(monkeypatch, tmp_path):
+def _soft_budget_abort_detail(monkeypatch, tmp_path):
   _write_rehydrate_manifest(
     tmp_path,
     "bg_8",
-    control_run_id="run-budget",
+    control_run_id="run-soft-abort",
     user_id="alice",
     state="completed",
-    exit_code=0,
+    exit_code=1,
     error=None,
     completed_at=210.0,
   )
   _write_rehydrate_events(
     tmp_path,
     "bg_8",
-    [{"type": "budget_exceeded", "run_id": "run-budget", "control_run_id": "run-budget", "total_cost": 1.25, "budget": 1.0, "ts": 209}],
+    [
+      {
+        "type": "interrupted",
+        "reason": "soft_budget_abort",
+        "kind": "turns",
+        "observed": 152,
+        "threshold": 100,
+        "grace_turns": 2,
+        "run_id": "run-soft-abort",
+        "control_run_id": "run-soft-abort",
+        "ts": 208,
+      },
+      {
+        "type": "stream_complete",
+        "terminal_disposition": "interrupted",
+        "reason": "soft_budget_abort",
+        "run_id": "run-soft-abort",
+        "control_run_id": "run-soft-abort",
+        "ts": 209,
+      },
+    ],
   )
   app = _make_app(monkeypatch, tmp_path)
 
   with TestClient(app) as client:
     alice = _control_session(client, "alice", email="alice@example.com")
-    detail = client.get("/api/control/runs/run-budget", headers=_headers(alice))
+    detail = client.get("/api/control/runs/run-soft-abort", headers=_headers(alice))
 
   return detail
 
 
-def test_rehydrated_budget_event_run_is_visible(monkeypatch, tmp_path) -> None:
-  detail = _budget_exceeded_detail(monkeypatch, tmp_path)
+def test_soft_budget_abort_projects_interrupted_run_state(monkeypatch, tmp_path) -> None:
+  detail = _soft_budget_abort_detail(monkeypatch, tmp_path)
   assert detail.status_code == 200, detail.text
-  assert detail.json()["ended_at"] is not None
-
-
-def test_autonomous_budget_exceeded_event_maps_to_budget_limited_run_state(
-  monkeypatch,
-  tmp_path,
-) -> None:
-  detail = _budget_exceeded_detail(monkeypatch, tmp_path)
   payload = detail.json()
-  assert payload["state"] == "budget_limited"
-  assert payload["resumable"] is False
-  assert payload["terminal_receipt"]["disposition"] == "budget_limited"
-  assert payload["terminal_receipt"]["error"] is None
+  assert payload["state"] == "interrupted"
+  assert payload["ended_at"] is not None
+  assert payload["terminal_receipt"]["disposition"] == "interrupted"
 
 
 @pytest.mark.parametrize(
   ("internal_state", "projected_state"),
   [
-    ("budget_limited", "budget_limited"),
-    ("budget_exceeded", "budget_limited"),
     ("blocked", "failed"),
   ],
 )
@@ -1518,13 +1507,6 @@ def test_autonomous_state_passes_interrupted_through() -> None:
   from agent_gateway.control_plane.runs import _autonomous_state
 
   assert _autonomous_state("interrupted") == "interrupted"
-
-
-def test_autonomous_state_maps_budget_aliases_to_budget_limited() -> None:
-  from agent_gateway.control_plane.runs import _autonomous_state
-
-  assert _autonomous_state("budget_limited") == "budget_limited"
-  assert _autonomous_state("budget_exceeded") == "budget_limited"
 
 
 def _interrupted_terminal_detail(
@@ -1776,7 +1758,6 @@ def test_autonomous_resume_starts_linked_run_for_resumable_interrupted_skill(mon
         "context": "Original work packet",
         "ticker": "MSFT",
         "channel": "tui",
-        "max_budget_usd": 5.0,
       },
     )
     assert start.status_code == 200, start.text
@@ -1807,12 +1788,9 @@ def test_autonomous_resume_starts_linked_run_for_resumable_interrupted_skill(mon
     assert payload["run"]["run_id"] == "bg_1"
     assert payload["run"]["resumed_from"] == "bg_0"
     assert payload["run"]["state"] == "running"
-    assert payload["run"]["max_budget_usd"] == 5.0
-    assert payload["cmd"][payload["cmd"].index("--max-budget-usd") + 1] == "5.0"
 
     assert original.resumed_as == ["bg_1"]
     resumed_record = app.state.subprocess_registry._tasks["bg_1"]
-    assert resumed_record.max_budget_usd == 5.0
     assert resumed_record.context is not None
     assert "Original work packet" in resumed_record.context
     assert "resume from the latest safe point" in resumed_record.context
@@ -2387,10 +2365,10 @@ def test_autonomous_resume_rejects_model_writer_skill_even_when_metadata_resumab
   processes, _envs = _install_fake_spawn(monkeypatch)
   skills_dir = tmp_path / "skills"
   skills_dir.mkdir()
-  (skills_dir / "forecast-assumptions.md").write_text(
+  (skills_dir / "model-update.md").write_text(
     """---
-name: forecast-assumptions
-description: Forecast assumptions writer
+name: model-update
+description: Model update writer
 agent_callable: true
 resumable: true
 mutation_mode: model_writer
@@ -2401,7 +2379,7 @@ semantic_metadata:
   contract_name: skill-metadata
   schema_version: '2'
   catalog_version: skill-catalog/2
-  skill_id: forecast-assumptions
+  skill_id: model-update
   tool_refs: []
   allowed_effects: [state_write]
   approval_constraints: [runtime_policy]
@@ -2415,7 +2393,7 @@ semantic_metadata:
     opt_in: not_required
   allowed_profiles: [analyst]
 ---
-Update forecast assumptions.
+Update the model.
 """,
     encoding="utf-8",
   )
@@ -2430,7 +2408,7 @@ Update forecast assumptions.
         "kind": "autonomous",
         "profile": "analyst",
         "mode": "skill",
-        "skill": "forecast-assumptions",
+        "skill": "model-update",
         "context": "Original work packet",
         "ticker": "MSFT",
       },
@@ -2587,55 +2565,14 @@ def test_autonomous_dispatch_validation_error_returns_422_and_releases_slot(monk
     assert invalid.status_code == 422
     assert invalid.json()["detail"] == "mode='task' only accepts the task parameter"
 
-    invalid_budget = client.post(
-      "/api/control/runs",
-      headers=_headers(alice),
-      json={
-        "kind": "autonomous",
-        "profile": "analyst",
-        "mode": "task",
-        "task": "summarize",
-        "max_budget_usd": 5.0,
-      },
-    )
-    assert invalid_budget.status_code == 422
-    assert invalid_budget.json()["detail"] == "max_budget_usd requires mode='skill'"
-
-    non_positive_budget = client.post(
-      "/api/control/runs",
-      headers=_headers(alice),
-      json={
-        "kind": "autonomous",
-        "profile": "analyst",
-        "mode": "skill",
-        "skill": "earnings-review",
-        "max_budget_usd": 0,
-      },
-    )
-    assert non_positive_budget.status_code == 422
-
-    for coerced_budget in (True, "5"):
-      rejected_coercion = client.post(
-        "/api/control/runs",
-        headers=_headers(alice),
-        json={
-          "kind": "autonomous",
-          "profile": "analyst",
-          "mode": "skill",
-          "skill": "earnings-review",
-          "max_budget_usd": coerced_budget,
-        },
-      )
-      assert rejected_coercion.status_code == 422
-
     valid = client.post(
       "/api/control/runs",
       headers=_headers(alice),
       json={"kind": "autonomous", "profile": "analyst", "mode": "task", "task": "summarize"},
     )
     assert valid.status_code == 200, valid.text
-    assert valid.json()["run_id"] == "bg_2"
-    record = app.state.subprocess_registry._tasks["bg_2"]
+    assert valid.json()["run_id"] == "bg_1"
+    record = app.state.subprocess_registry._tasks["bg_1"]
     assert record.dev_mode is False
     assert record.cmd == [
       sys.executable,
@@ -2764,10 +2701,11 @@ def test_control_profiles_lists_backend_available_profiles(monkeypatch, tmp_path
     assert profile_names == {"analyst", "advisor", "research_producer"}
 
 
-def test_autonomous_dispatch_rejects_interactive_profile_before_spawn(
+def test_autonomous_dispatch_leaves_the_profile_class_to_the_runner(
   monkeypatch,
   tmp_path,
 ) -> None:
+  """The runner's ``require_autonomous_profile`` owns the interactive-only refusal."""
   processes, _envs = _install_fake_spawn(monkeypatch)
   profiles = {
     "community": SimpleNamespace(
@@ -2795,9 +2733,8 @@ def test_autonomous_dispatch_rejects_interactive_profile_before_spawn(
       },
     )
 
-  assert response.status_code == 422
-  assert "interactive-only" in response.text
-  assert processes == []
+  assert response.status_code == 200, response.text
+  assert len(processes) == 1
 
 
 def test_autonomous_run_response_preserves_waiting_and_queued_states(monkeypatch, tmp_path) -> None:
@@ -2877,7 +2814,7 @@ def test_autonomous_waiting_run_accepts_operator_message(monkeypatch, tmp_path) 
     assert "continue with read-only scope" in record.operator_inbox_path.read_text(encoding="utf-8")
 
 
-def test_autonomous_dispatch_concurrency_limit_returns_429(monkeypatch, tmp_path) -> None:
+def test_autonomous_dispatch_records_in_flight_count_without_refusing(monkeypatch, tmp_path) -> None:
   _install_fake_spawn(monkeypatch)
   monkeypatch.setenv("AGENT_GATEWAY_AUTONOMOUS_MAX_RUNNING", "1")
   app = _make_app(monkeypatch, tmp_path)
@@ -2897,11 +2834,16 @@ def test_autonomous_dispatch_concurrency_limit_returns_429(monkeypatch, tmp_path
       headers=_headers(alice),
       json={"kind": "autonomous", "profile": "analyst", "mode": "task", "task": "summarize again"},
     )
-    assert second.status_code == 429
-    assert second.json()["detail"] == "Autonomous concurrency limit reached (1)"
+    assert second.status_code == 200, second.text
+    registry = app.state.subprocess_registry
+    assert registry._tasks["bg_0"].autonomous_in_flight_at_start == 1
+    assert registry._tasks["bg_1"].autonomous_in_flight_at_start == 2
+    assert registry._manifest_payload(registry._tasks["bg_1"])[
+      "autonomous_in_flight_at_start"
+    ] == 2
 
 
-def test_autonomous_resume_of_slot_exhausted_run_returns_429(monkeypatch, tmp_path) -> None:
+def test_autonomous_resume_while_origin_holds_a_slot_is_not_refused(monkeypatch, tmp_path) -> None:
   processes, _envs = _install_fake_spawn(monkeypatch)
   monkeypatch.setenv("AGENT_GATEWAY_AUTONOMOUS_MAX_RUNNING", "1")
   skills_dir = tmp_path / "skills"
@@ -2932,8 +2874,8 @@ def test_autonomous_resume_of_slot_exhausted_run_returns_429(monkeypatch, tmp_pa
       json={},
     )
 
-  assert resumed.status_code == 429
-  assert resumed.json()["detail"] == "Autonomous concurrency limit reached (1)"
+  assert resumed.status_code == 200, resumed.text
+  assert resumed.json()["resumed_from"] == "bg_0"
 
 
 def test_autonomous_run_reads_logs_and_cancel_are_channel_scoped(monkeypatch, tmp_path) -> None:
@@ -3113,7 +3055,6 @@ def test_autonomous_dispatch_once_mode_accepts_the_mcp_serializer_explicit_nulls
         "context": None,
         "ticker": None,
         "channel": None,
-        "max_budget_usd": None,
       },
     )
 

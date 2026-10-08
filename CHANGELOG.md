@@ -1,5 +1,195 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Mailbox sends and ordinary-result, workflow-output and spill reads admit the
+  executing job's scope. Child handlers are rebound at spawn and resume; linked
+  per-runner registries address parents and siblings without a second registry.
+  `run_agent.handles` explicitly delegates readable handles, while
+  `send_message.handle_refs` remains citation-only. Child spills live under their
+  own job roots and retain pointer/manifest byte-integrity verification.
+  Supported package entries capture authenticated root authority before the
+  first handle read and expose their root through the existing drained mailbox.
+  Autonomous admitted jobs retain their physical job identity. Completed
+  foreground registries release their tree links after live descendants and
+  completion reconciliation settle. Terminal workflow author failures remain
+  readable without an adopted phase or fabricated output publications.
+  Catalog-backed `run_agent` admission forwards the operation owner's declared
+  effort to the existing provider-bind selection.
+  Canonical ordinary content reads include inline narrative and projection
+  sources, not only overflow handles; presentation does not create a second
+  access rule. Explicit read-grant selectors and exact-byte verification remain.
+  Closed background-owner registries release obsolete roster links after their
+  parent task is evicted, without rewriting omitted notifications or losing
+  durable results; live descendants and detached finalizers retain their links
+  until actual settlement.
+
+- BREAKING: run hard caps are gone (`61babe3020a6`..`c308d64d5cdd`). `AgentRunner`
+  and `AgentRunner.run()` lose `max_budget_usd`, `max_turns`, `on_max_turns`;
+  `AgentSDKConfig`, `ChatRuntime` and `SubAgentConfig` lose the same fields.
+  Primary runs no longer carry any ceiling; a delegated run meets one soft
+  ladder (`runner_soft_budget.SoftBudgetLadder`) that steers at its threshold,
+  forces a final report at 1.5×, and aborts only after grace. The events are
+  `soft_budget_steer` / `soft_budget_final`; the terminal is
+  `interrupted` with `reason: "soft_budget_abort"`. `max_turns_reached` and
+  `budget_exceeded` events and the `turns_exhausted` / `budget_exhausted`
+  settlement classes are deleted. Cost stays measured on
+  `stream_complete.usage.estimated_cost`. Model: `docs/engineering/soft-budget-containment-reference.md`.
+- BREAKING: a background child is never refused for the in-flight count.
+  `TaskRegistry.admit` loses `reject_over_capacity`, and
+  `runner_background_tasks.background_task_limit_error` (code
+  `max_background_tasks`) is deleted. Every admitted child registers, and
+  execution waits on the sub-agent semaphore (`max_concurrent_sub_agents`).
+  `TaskRegistry(max_inflight=)` now only sizes the notification-retrieval
+  retention limit.
+- BREAKING: `AUTONOMOUS_CAPABILITY_ENVELOPE_MAX_BYTES` is deleted, and the signed
+  launch envelope no longer refuses sign or decode by size. The
+  `AUTONOMOUS_CAPABILITY_ENVELOPE_MAX_TTL_SECONDS` constant is deleted (it had no
+  reader). The 256-character dispatch-scope caps (`AutonomousDispatchScope`, the
+  manifest scope normalizer, the lifecycle `portfolio_id`) are gone.
+- Autonomous capability binding no longer checks `run_mode` equality between the
+  persisted bind and the resume/launch request. The exact persisted-bind equality
+  and the credential actor match are unchanged.
+- `spawn_fork_agent` no longer checks that the bind is `node.fork` or that the result
+  mode is narrative. The canvas build no longer refuses a finished compile whose
+  output exceeds 128 KiB; the timeout and the Linux rlimits are the bounds.
+  `BROKERAGE_CONNECT_REQUIRED` is gone from the child environment passthrough.
+
+- BREAKING: an MCP tool call no longer has a deadline (GP19/GA-N2). The
+  per-tool and per-server seconds (`default_tool_timeout`, `timeout_overrides`,
+  `tool_timeout_overrides`, a registration's `*_timeout_seconds`) are expected
+  durations: past one, `agent_gateway.mcp_client` logs one warning with the tool,
+  expected and elapsed seconds, and the call keeps waiting for its result. The
+  SDK gets `read_timeout_seconds=None` (`McpClientSession.call_tool` now takes
+  `float | None`); only the caller's `abort_event` cancels a call. The same
+  holds for local tools: `AgentRunner(tool_call_timeout=)` is the expected
+  duration of a local tool call (logged on `agent_gateway.runner` when exceeded),
+  never a `tool_timeout` cancellation; transient-failure retries are bounded by
+  the attempt count alone (`retry_decision` loses `wall_clock_exhausted`).
+- The per-profile provider client timeout and stream-stall override are
+  deleted (`gateway-policy-denials-derive-from-registration`, TC9/TC37): no
+  profile sets `client_timeout` or `stream_stall_timeout`, xAI and Codex no
+  longer default a 120s read deadline, and the stream watchdog
+  (`runner_streaming.py`) is the one hung-stream bound, applied to every run
+  alike. Its terminal error names the attempts.
+- `investment_capability_server_load_error` is deleted (GP22 sibling): loading
+  `idea-workbench-mcp` is not grant-gated; the claim-gated facade tools are
+  authorized per call by claim issuance. The issuer no longer keeps a second
+  hand list of facade tools beside the skill note's declared grant.
+
+- BREAKING: investment-capability grants come from each skill's own note
+  (`gateway-policy-denials-derive-from-registration`, GP21–GP23).
+  `INVESTMENT_CAPABILITY_SKILL_GRANTS` and `InvestmentCapabilitySkillGrant`
+  are removed; the application binds the skill-name → `InvestmentCapabilityGrant`
+  projection of its notes' `semantic_metadata.investment_grant` with
+  `configure_investment_capability_grants` (unbound, no skill holds a grant).
+  The claim issuer and inline `invoke_skill` facade grant read that binding.
+  Quant claims carry `max_wall_clock_seconds` and `max_tokens` only;
+  `QUANT_RESEARCH_APPROVED_BUDGET_CEILINGS` is removed and no turn or cost
+  number is minted. Package `0.22.1` requires `hank-model-authority>=1.3,<2`
+  so a published-dependency install has `require_registered_capability_bind`.
+- The Anthropic provider rate bucket's wait is measured, not silent:
+  `AnthropicTokenBucket.acquire` returns the seconds waited and the call's
+  turn usage carries `provider_wait_ms` when a wait happened (GP14).
+- BREAKING: control-plane refusals stand only with a written reason
+  (`control-plane-refusals-justified-or-deleted`). Schedules: a stored record
+  with no `dispatch_role` fires as `invite` (never `owner`) and records
+  `last_fire_warning`; `DELETE /control/schedules/:name` takes no `confirm`;
+  web sessions may create task-mode schedules and read operator schedule logs
+  (`web_control_raw_schedule_forbidden`, `web_control_schedule_logs_forbidden`
+  removed); the launchd create shape `CreateLaunchdScheduleRequest` is removed;
+  dispatch text length refusals are gone and `dispatch_text_lengths` is on the
+  record. The dispatch-scope validator owns its outcome: it returns a redacted
+  scope or raises its own `HTTPException`, and any other failure surfaces as a
+  crash (`dispatch_scope_validation_failed` removed). Valuation-ready batches warn
+  `corpus_not_ready` instead of refusing, and `missing_corpus_requirements`,
+  `CORPUS_GATED_PIPELINE_TEMPLATES` and the valuation-ready skill guard are
+  removed. Readable resources carry any `content_type` and any size; an
+  unknown event `schema_version` projects as v1. Commercial claim and
+  work-authorization lifetimes are not capped at 300 s; commercial headers on
+  a gateway with no or a disabled commercial gate are ignored, not 403, with no
+  log line (`commercial_work_start_disabled` removed); unknown model-entitled
+  capabilities grant nothing instead of raising; `AuthConfig` no longer
+  refuses selection fields; usage/work-start drift no longer fails the turn.
+  `/chat` admits the normalizer purpose; saved model preferences are not
+  refused by capability class; `_default` is an ordinary user id.
+- BREAKING: child, fork and autonomous runs carry no name-based exclusions or
+  scope receipts (`child-run-receipts-and-exclusions-deleted`). A `run_agent`
+  child's surface is its grant with nothing subtracted by name: the default
+  `run_agent` / `get_agent_result_content` / `get_background_result` /
+  `send_message` exclusion, the skill `extra_excluded_tools` subtraction on the
+  profile path and the "cannot spawn further sub-agents" prompt sentence are
+  gone. A fork runs on its parent's wire surface: `FORK_ORCHESTRATION_TOOLS`,
+  `LEARNING_FORK_ALLOWED_TOOLS`, `ForkPolicyDispatcher` (`fork_policy_denied`),
+  `build_side_quest_tool_decisions`, `build_learning_fork_tool_decisions` and
+  the `fork_scope_receipt` module and event are removed.
+- BREAKING: fork caps are measurements. `learn_fork_enabled` and
+  `HANK_LEARN_FORK_ENABLED`, `HANK_LEARN_FORK_GLOBAL_CONCURRENCY`,
+  `HANK_LEARN_FORK_DAILY_INVOCATION_QUOTA`, `HANK_LEARN_FORK_DAILY_BUDGET_USD`
+  and `HANK_FORK_HANDOFF_MAX_BYTES` (with their `DEFAULT_*` constants and
+  readers) are removed; `ForkAdmissionQuotaExceeded` and
+  `ForkAdmissionBudgetExceeded` are removed and `ForkLedger.reserve_admission`
+  returns an `AdmissionReservation` carrying the day's invocation count and
+  charged microusd. `learning_fork_launched` telemetry carries `in_flight`,
+  `day_invocations`, `day_charged_microusd` and the handoff's retained bytes.
+  The fork suffix ceiling is removed: `FORK_SUFFIX_WRAP_UP_REMINDER`, the
+  forced-final clamp, `HANK_FORK_SUFFIX_MAX_TOKENS`,
+  `DEFAULT_FORK_SUFFIX_MAX_TOKENS`, `fork_suffix_max_tokens()` and the
+  `spawn_fork_agent(suffix_ceiling=)` parameter are gone, and the
+  `fork_measurements` record carries `suffix_tokens`.
+- BREAKING: autonomous launch refuses less. The `autonomous_concurrency_limit`
+  429 is gone (the in-flight count is recorded as
+  `autonomous_in_flight_at_start` on the task and its manifest);
+  `AUTONOMOUS_CREDENTIAL_HANDOFF_MAX_BYTES` and its refusals are removed
+  (`credential_handoff_bytes` is recorded on the manifest); a resumed run no
+  longer has to repeat its origin's mode and skill, and a capability binding no
+  longer couples its source to the run mode. The child environment projection
+  is one list in `child_environment.py` (`AUTONOMOUS_CHILD_ENVIRONMENT`),
+  applied to every autonomous child alike instead of varying by profile.
+  `deliver=False` (`--no-deliver`) is accepted for every mode and suppresses
+  once/pack Telegram delivery.
+- `spawn_sub_agent` / `resume_sub_agent` no longer require a `node.*`
+  capability bind; an unmapped delegation role resolves from registration
+  instead of raising (`DelegationRoleResolutionError` is removed); a persisted
+  `ToolGrant` is no longer re-verified against its digest or route order.
+  The coordinator's `worker_excluded_tools` no longer subtracts from a child.
+  `resume` no longer abandons a non-resumable or model-writer operation
+  (`not_resumable`, `model_writer_resume_unsupported`) or a chain past its
+  depth (`max_resume_chain_depth`); the successor's `tool_input` records
+  `resume_chain_depth`, and `resume_task_id_override` returns the successor id
+  alone. Child evidence past its canonical bound no longer fails the child
+  (`admission_rejected` is removed): the result settles on its own terms and
+  its mechanical outcome is `partial` with `child_evidence` unmet.
+- `code_execute` accepts any `timeout_ms` at or above its floor and reports
+  the requested `timeout_ms` on its result; the container kill is the bound.
+  The canvas import allowlist is read from the canvas-kit manifest's
+  `externals` instead of three hand-written copies.
+- Agent results carry the reason and the count in turn
+  (`agent-results-carry-the-reason-and-the-count-in-turn`).
+  `make_error_result` always writes `error.data.next_call`: the producer's
+  value, or an explicit `null` when it names no next action. A
+  `tool_excluded` result carries `data.excluding_owner` (`profile`, `skill_or_operation_grant`
+  or `role`) and `next_call: null` on every hit; a repeated excluded call no
+  longer forces a final turn. The FMS-commit and output-file run exclusions
+  are removed (money stays at the approval policy, hosted file output at its
+  interceptor). The soft-budget steer notice names the run's `observed`
+  provider requests and its `threshold` (`soft_budget_steer_notice`).
+  `session_recap.tool_calls_summary.measurements` folds the approval
+  decisions sent (`decisions_sent`, `frame_bytes`), the learning fork's
+  `in_flight`, `day_invocations`, `day_charged_microusd` and
+  `retained_bytes`, the skill run's `lease_fence_bytes`, and a `model_calls`
+  total of `model_*` tool calls (`RUN_MEASUREMENT_FIELDS`,
+  `fold_run_measurements`); an autonomous child's recap also carries
+  `autonomous_in_flight_at_start` and `credential_handoff_bytes`.
+  `ResolverResult.unknown_model_entitled_capabilities` names the
+  model-entitled capabilities the resolver supplied that match no registered
+  capability. A commercial work-start 403 (`commercial_work_authority_invalid`)
+  names the verifier's refusal code in its message. A sub-agent
+  `invalid_context` result names the failing input in `details.field` and
+  `details.reason`, with `next_call: null`.
+
 ## 0.21.1 (2026-09-29)
 
 ### Changed

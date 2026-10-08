@@ -11,16 +11,11 @@ import threading
 import time
 from typing import Any, Iterator, Mapping
 
-from .autonomous_control_contract import (
-  AUTONOMOUS_APPROVAL_DECISION_LIMIT,
-)
-
 
 AUTONOMOUS_APPROVAL_CHANNEL_FD_ENV = (
   "AGENT_AUTONOMOUS_APPROVAL_CHANNEL_FD"
 )
 AUTONOMOUS_APPROVAL_CHANNEL_VERSION = 1
-AUTONOMOUS_APPROVAL_CHANNEL_MAX_FRAME_BYTES = 16 * 1024
 AUTONOMOUS_APPROVAL_CHANNEL_DEFAULT_SEND_TIMEOUT_SECONDS = 5.0
 AUTONOMOUS_APPROVAL_CHANNEL_DEFAULT_RECEIVE_TIMEOUT_SECONDS = (
   24 * 60 * 60.0
@@ -294,9 +289,9 @@ def _canonical_body(value: Mapping[str, Any]) -> bytes:
     raise AutonomousApprovalChannelProtocolError(
       "autonomous approval frame is not canonical JSON"
     ) from exc
-  if not body or len(body) > AUTONOMOUS_APPROVAL_CHANNEL_MAX_FRAME_BYTES:
+  if not body:
     raise AutonomousApprovalChannelProtocolError(
-      "autonomous approval frame exceeds its byte bound"
+      "autonomous approval frame is empty"
     )
   return body
 
@@ -630,11 +625,9 @@ class AutonomousApprovalChannelParent(_OwnedApprovalEndpoint):
       elif (
         prior_sequence is not None
         or decision.delivery_sequence <= self._last_sequence
-        or len(self._sent_by_sequence)
-        >= AUTONOMOUS_APPROVAL_DECISION_LIMIT
       ):
         raise AutonomousApprovalChannelProtocolError(
-          "autonomous approval delivery is stale, conflicting, or over quota"
+          "autonomous approval delivery is stale or conflicting"
         )
       resolved_timeout = (
         self._timeout_seconds
@@ -653,6 +646,17 @@ class AutonomousApprovalChannelParent(_OwnedApprovalEndpoint):
         ] = decision.delivery_sequence
         self._last_sequence = decision.delivery_sequence
       return decision
+
+  @property
+  def decisions_sent(self) -> int:
+    """Distinct decisions this endpoint delivered; reported on the run record."""
+
+    return len(self._sent_by_sequence)
+
+  def sent_frame_bytes(self, delivery_sequence: int) -> int:
+    """Body size of the decision delivered at `delivery_sequence`."""
+
+    return len(self._sent_by_sequence[delivery_sequence])
 
   def require_sent(
     self,
@@ -742,10 +746,7 @@ class AutonomousApprovalChannelChild(_OwnedApprovalEndpoint):
         field_name="frame header",
       )
       (body_length,) = _FRAME_HEADER.unpack(header)
-      if (
-        body_length < 1
-        or body_length > AUTONOMOUS_APPROVAL_CHANNEL_MAX_FRAME_BYTES
-      ):
+      if body_length < 1:
         raise AutonomousApprovalChannelProtocolError(
           "autonomous approval frame length is invalid"
         )
@@ -778,11 +779,9 @@ class AutonomousApprovalChannelChild(_OwnedApprovalEndpoint):
       if (
         prior_sequence is not None
         or decision.delivery_sequence <= self._last_sequence
-        or len(self._received_by_sequence)
-        >= AUTONOMOUS_APPROVAL_DECISION_LIMIT
       ):
         raise AutonomousApprovalChannelProtocolError(
-          "autonomous approval delivery is stale, conflicting, or over quota"
+          "autonomous approval delivery is stale or conflicting"
         )
       self._received_by_sequence[decision.delivery_sequence] = (
         body,
@@ -925,7 +924,6 @@ __all__ = [
   "AUTONOMOUS_APPROVAL_CHANNEL_DEFAULT_RECEIVE_TIMEOUT_SECONDS",
   "AUTONOMOUS_APPROVAL_CHANNEL_DEFAULT_SEND_TIMEOUT_SECONDS",
   "AUTONOMOUS_APPROVAL_CHANNEL_FD_ENV",
-  "AUTONOMOUS_APPROVAL_CHANNEL_MAX_FRAME_BYTES",
   "AUTONOMOUS_APPROVAL_CHANNEL_MAX_TIMEOUT_SECONDS",
   "AUTONOMOUS_APPROVAL_CHANNEL_VERSION",
   "AutonomousApprovalChannelAuthority",

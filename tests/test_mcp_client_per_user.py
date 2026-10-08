@@ -135,7 +135,7 @@ class _UnusedClientSession:
     name: str,
     arguments: Mapping[str, object],
     *,
-    read_timeout_seconds: float,
+    read_timeout_seconds: float | None,
     meta: Mapping[str, object] | None = None,
   ) -> _ToolResult:
     raise AssertionError(f"unexpected physical MCP call: {name}")

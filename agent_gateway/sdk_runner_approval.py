@@ -4,9 +4,9 @@ import logging
 from dataclasses import replace
 from typing import Any, Callable, cast
 
-from .approval_policy import RunContext
+from .approval_policy import MONEY_BOUNDARY_TOOL_CLASSES, RunContext
 from .approval_enrichment import enrich_trade_approval_args
-from .approval_route import DurableLocalApprovalRoute
+from .approval_route import NoApprovalRoute, route_ledger
 from .mcp_client import registered_mcp_dispatch_scope
 from .policy_imports import resolve_effective_role, resolve_server_policy_tool_class
 from .sdk_runner_helpers import (
@@ -131,15 +131,6 @@ async def can_use_tool_callback(
   deny_cls = getattr(claude_agent_sdk, "PermissionResultDeny")
   if tool_name in runner._effective_disallowed_tools():
     return deny_cls(message=f"Tool '{tool_name}' is not available in this context")
-  mismatch = runner._sdk_policy_owner_mismatch(tool_name)
-  if mismatch is not None:
-    runtime_server, policy_tool, policy_server = mismatch
-    return deny_cls(
-      message=(
-        f"Tool '{tool_name}' is not available from MCP server "
-        f"'{runtime_server}'; policy owner for '{policy_tool}' is '{policy_server}'"
-      )
-    )
   registered_call = None
   if is_catalogless_approval_route(runner, tool_name):
     policy_tool, tool_class = runner._resolve_sdk_approval_identity(tool_name)
@@ -157,7 +148,6 @@ async def can_use_tool_callback(
       tool_name,
       input_data,
       trusted_scope,
-      runner._registered_approval_overlay,
     )
     descriptor = registered_call.descriptor
     policy_tool = descriptor.identity.logical_name
@@ -172,13 +162,27 @@ async def can_use_tool_callback(
   )
   approval_constraint = "standard"
   route = runner._approval_route
-  if not isinstance(route, DurableLocalApprovalRoute):
-    if getattr(runner, "_approval_lifecycle", "required") == "not_required":
+  if isinstance(route, NoApprovalRoute):
+    # A run with no decider settles every class outside the money boundary
+    # itself; a live order nobody can decide must not spend the owner's money
+    # (`NoApprovalRoute`), so it alone is refused here.
+    if tool_class in MONEY_BOUNDARY_TOOL_CLASSES:
+      return deny_cls(
+        message=(
+          "[approval_route_absent] This run has no admitted approval route "
+          f"for '{tool_name}'"
+        )
+      )
+    if prepared_authorization is None:
       return allow_cls(updated_input=prepared_input)
+  if prepared_authorization is not None and route_ledger(route) is None:
+    # The authorized input references a prepared row only a durable-local
+    # ledger writes; without one there is nothing behind the reference.
     return deny_cls(
       message=(
-        "[approval_route_absent] This run has no admitted approval route "
-        f"for '{tool_name}'"
+        "[planned_write_prepared_custody_unsupported] "
+        f"'{tool_name}' needs durable prepared-payload custody, which this "
+        "run's approval route does not carry"
       )
     )
   approval_input = (
@@ -202,54 +206,49 @@ async def can_use_tool_callback(
     else None
   )
   tool_call_id = f"sdk-{uuid_hex_fn()}"
-  try:
-    lifecycle = await _approval_lifecycle_helpers.run_approval_lifecycle(
-      route=route,
-      session=runner._session,
-      tool_call_id=tool_call_id,
-      tool_name=policy_tool,
-      tool_input=prepared_input,
-      qualifier="",
-      reason="",
-      allow_persistent=(
-        True
-        if registered_call is None
-        else approval_reuse_key is not None
-      ),
-      approval_constraint=approval_constraint,
-      approval_reuse_mode=(
-        "legacy"
-        if registered_call is None
-        else "exact"
-        if approval_reuse_key is not None
-        else "disabled"
-      ),
-      approval_reuse_key=approval_reuse_key,
-      approval_identity=(
-        prepared_authorization.approval_identity
-        if prepared_authorization is not None
-        else None
-      ),
-      prepared_authorization_payload=(
-        prepared_authorization.prepared_payload
-        if prepared_authorization is not None
-        else None
-      ),
-      approval_args_redacted=redacted,
-      approval_args_hash=args_hash,
-      resolve_run_context_fn=runner._resolve_run_context,
-      current_skill_admission_fn=current_skill_admission_fn,
-      redact_for_approval_request_fn=runner._redact_for_approval_request,
-      resolve_tool_class_fn=lambda _policy_tool: tool_class,
-      effective_trade_approval_decision_fn=runner._effective_trade_approval_decision,
-      await_user_approval_via_pending_tools_fn=runner._await_user_approval_via_pending_tools,
-      approval_queue_timeout_seconds_fn=runner._approval_queue_timeout_seconds,
-      secret_boundary=getattr(runner, "_secret_boundary", None),
-    )
-  except _approval_lifecycle_helpers.ApprovalSkillAdmissionMismatch:
-    return deny_cls(
-      message="[skill_admission_mismatch] Trusted skill admission is unavailable"
-    )
+  lifecycle = await _approval_lifecycle_helpers.run_approval_lifecycle(
+    route=route,
+    session=runner._session,
+    tool_call_id=tool_call_id,
+    tool_name=policy_tool,
+    tool_input=prepared_input,
+    qualifier="",
+    reason="",
+    allow_persistent=(
+      True
+      if registered_call is None
+      else approval_reuse_key is not None
+    ),
+    approval_constraint=approval_constraint,
+    approval_reuse_mode=(
+      "legacy"
+      if registered_call is None
+      else "exact"
+      if approval_reuse_key is not None
+      else "disabled"
+    ),
+    approval_reuse_key=approval_reuse_key,
+    approval_identity=(
+      prepared_authorization.approval_identity
+      if prepared_authorization is not None
+      else None
+    ),
+    prepared_authorization_payload=(
+      prepared_authorization.prepared_payload
+      if prepared_authorization is not None
+      else None
+    ),
+    approval_args_redacted=redacted,
+    approval_args_hash=args_hash,
+    resolve_run_context_fn=runner._resolve_run_context,
+    current_skill_admission_fn=current_skill_admission_fn,
+    redact_for_approval_request_fn=runner._redact_for_approval_request,
+    resolve_tool_class_fn=lambda _policy_tool: tool_class,
+    effective_trade_approval_decision_fn=runner._effective_trade_approval_decision,
+    await_user_approval_via_pending_tools_fn=runner._await_user_approval_via_pending_tools,
+    approval_queue_timeout_seconds_fn=runner._approval_queue_timeout_seconds,
+    secret_boundary=getattr(runner, "_secret_boundary", None),
+  )
   if lifecycle["approved"]:
     lifecycle_input = lifecycle["tool_input"]
     if registered_call is None or prepared_authorization is None:

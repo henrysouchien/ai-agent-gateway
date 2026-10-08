@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Literal, TypedDict
 
 import pytest
+from agent_workflow_contracts import ResolvedAuthority
+from agent_workflow_contracts.models import (
+  AdmittedContextWire, AdmittedLineage, AdmittedResearchBinding, AdmittedTenant, ToolGrant,
+)
 
 import agent_gateway.autonomous_launch_envelope as envelope_module
 from agent_gateway.autonomous_launch_envelope import (
@@ -59,7 +63,6 @@ class _WorkloadOverrides(TypedDict, total=False):
   context: str | None
   ticker: str | None
   dev_mode: bool
-  max_budget_usd: float | None
   deliver: bool
   admitted_skill_execution_limits: SkillExecutionLimits | None
 
@@ -112,6 +115,8 @@ def _signed(
   session_authority: AutonomousSessionAuthority | _DefaultOverride = (
     _DEFAULT_OVERRIDE
   ),
+  admitted_context: AdmittedContextWire | None = None,
+  tool_authority: ResolvedAuthority | None = None,
   ttl_seconds: int = 60,
   now_ns: int | None = _NOW_NS,
   nonce: str | None = _NONCE,
@@ -140,6 +145,8 @@ def _signed(
     workload=resolved_workload,
     control_authority=resolved_control_authority,
     session_authority=resolved_session_authority,
+    admitted_context=admitted_context,
+    tool_authority=tool_authority,
     ttl_seconds=ttl_seconds,
     now_ns=now_ns,
     nonce=nonce,
@@ -180,7 +187,7 @@ def _resign(payload: dict[str, object]) -> str:
   )
 
 
-def test_v6_round_trip_constructs_exact_gateway_session() -> None:
+def test_v7_round_trip_constructs_exact_gateway_session() -> None:
   dispatch_scope = AutonomousDispatchScope(
     kind="portfolio",
     source="user_selected",
@@ -204,7 +211,7 @@ def test_v6_round_trip_constructs_exact_gateway_session() -> None:
 
   envelope = _verify(raw)
   assert envelope.audience == AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE
-  assert envelope.version == AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION == 6
+  assert envelope.version == AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION == 7
   assert envelope.task_id == "bg_7"
   assert envelope.control_run_id == "run-7"
   assert envelope.owner_user_id == "42"
@@ -213,6 +220,8 @@ def test_v6_round_trip_constructs_exact_gateway_session() -> None:
   assert envelope.workload == _workload()
   assert envelope.control_authority == _control_authority()
   assert envelope.session_authority == authority
+  assert envelope.admitted is None
+  assert parsed["admitted_context"] is parsed["tool_authority"] is None
 
   session = envelope.session_authority.to_gateway_session()
   assert type(session) is GatewaySession
@@ -223,43 +232,35 @@ def test_v6_round_trip_constructs_exact_gateway_session() -> None:
   assert session.dispatch_scope == dispatch_scope.receipt()
 
 
-def test_v6_skill_limits_are_signed_required_and_compare_false() -> None:
+def test_skill_limit_observations_are_signed_but_not_cli_arguments() -> None:
   first = _workload(
     mode="skill",
     skill="quant-research",
-    admitted_skill_execution_limits=SkillExecutionLimits(
-      20,
-      32_000,
-      20.0,
-    ),
+    admitted_skill_execution_limits=SkillExecutionLimits(32_000),
   )
   second = _workload(
     mode="skill",
     skill="quant-research",
-    admitted_skill_execution_limits=SkillExecutionLimits(
-      1,
-      2,
-      3.0,
-    ),
+    admitted_skill_execution_limits=SkillExecutionLimits(2),
   )
 
   assert first == second
   assert first.receipt()["admitted_skill_execution_limits"] == {
-    "max_turns": 20,
     "max_tokens": 32_000,
-    "max_budget_usd": 20.0,
   }
-  parsed = AutonomousLaunchWorkload.from_receipt(first.receipt())
+  parsed = _verify(_signed(workload=first)).workload
   assert type(parsed.admitted_skill_execution_limits) is SkillExecutionLimits
-  assert parsed.admitted_skill_execution_limits == (
-    SkillExecutionLimits(20, 32_000, 20.0)
-  )
+  assert parsed.admitted_skill_execution_limits == SkillExecutionLimits(32_000)
+
+  payload = json.loads(_signed(workload=first))
+  payload["workload"]["admitted_skill_execution_limits"] = {"max_tokens": 2}
+  with pytest.raises(ValueError, match="signature is invalid"):
+    _verify(json.dumps(payload, sort_keys=True, separators=(",", ":")))
 
 
 @pytest.mark.parametrize(
   "value",
   [
-    None,
     {},
     {"max_turns": 20, "max_tokens": 32_000},
     {
@@ -268,10 +269,11 @@ def test_v6_skill_limits_are_signed_required_and_compare_false() -> None:
       "max_budget_usd": 20.0,
       "extra": None,
     },
-    {"max_turns": True, "max_tokens": 32_000, "max_budget_usd": 20.0},
+    {"max_tokens": True},
+    {"max_tokens": 0},
   ],
 )
-def test_v6_skill_workload_rejects_malformed_signed_limits(value: object) -> None:
+def test_v7_skill_workload_rejects_malformed_signed_limits(value: object) -> None:
   payload = json.loads(_signed(
     workload=_workload(mode="skill", skill="quant-research")
   ))
@@ -281,16 +283,60 @@ def test_v6_skill_workload_rejects_malformed_signed_limits(value: object) -> Non
     _verify(_resign(payload))
 
 
-def test_v6_non_skill_workload_rejects_signed_limits_object() -> None:
-  payload = json.loads(_signed())
-  payload["workload"]["admitted_skill_execution_limits"] = {
-    "max_turns": None,
-    "max_tokens": None,
-    "max_budget_usd": None,
-  }
+@pytest.mark.parametrize("observation", ["absent", "null"])
+def test_signed_skill_workload_without_limit_observation(
+  observation: str,
+) -> None:
+  workload = AutonomousLaunchWorkload(
+    profile="analyst",
+    mode="skill",
+    task=None,
+    skill="quant-research",
+    pack=None,
+    context=None,
+    ticker=None,
+    research_file_id=None,
+    dev_mode=False,
+    deliver=True,
+    session_log_authority=_workload().session_log_authority,
+  )
+  raw = _signed(workload=workload)
+  if observation == "absent":
+    payload = json.loads(raw)
+    payload["workload"].pop("admitted_skill_execution_limits")
+    raw = _resign(payload)
 
-  with pytest.raises(ValueError, match="workload is invalid"):
-    _verify(_resign(payload))
+  verified = _verify(raw)
+  assert verified.workload.skill == "quant-research"
+  assert verified.workload.admitted_skill_execution_limits is None
+  assert verified.workload.receipt()["admitted_skill_execution_limits"] is None
+
+
+@pytest.mark.parametrize(
+  "kwargs",
+  [
+    {"mode": "run_once"},
+    {"mode": "task", "task": "Investigate the variance"},
+    {"mode": "pack", "pack": "daily-risk-pack"},
+  ],
+)
+def test_signed_non_skill_workload_carries_limit_observation(
+  kwargs: _WorkloadOverrides,
+) -> None:
+  overrides: _WorkloadOverrides = {
+    **kwargs,
+    "admitted_skill_execution_limits": SkillExecutionLimits(32_000),
+  }
+  workload = _workload(**overrides)
+  verified = _verify(_signed(workload=workload))
+
+  assert verified.workload.mode == workload.mode
+  assert verified.workload.admitted_skill_execution_limits == SkillExecutionLimits(
+    32_000
+  )
+  assert verified.payload()["workload"]["admitted_skill_execution_limits"] == {
+    "max_tokens": 32_000,
+  }
 
 
 def test_envelope_rejects_tampering_and_wrong_signature() -> None:
@@ -336,7 +382,7 @@ def test_envelope_rejects_hmac_secrets_shorter_than_32_bytes() -> None:
     )
 
 
-def test_v6_sign_rejects_workload_without_session_log_authority() -> None:
+def test_v7_sign_rejects_workload_without_session_log_authority() -> None:
   workload = AutonomousLaunchWorkload(
     profile="analyst",
     mode="run_once",
@@ -347,7 +393,6 @@ def test_v6_sign_rejects_workload_without_session_log_authority() -> None:
     ticker=None,
     research_file_id=None,
     dev_mode=False,
-    max_budget_usd=None,
     deliver=True,
     admitted_skill_execution_limits=None,
   )
@@ -367,7 +412,7 @@ def test_v6_sign_rejects_workload_without_session_log_authority() -> None:
     )
 
 
-def test_v6_verify_rejects_missing_session_log_authority() -> None:
+def test_v7_verify_rejects_missing_session_log_authority() -> None:
   payload = json.loads(_signed())
   payload["workload"].pop("session_log_authority")
   with pytest.raises(ValueError, match="workload is invalid"):
@@ -424,7 +469,6 @@ def test_envelope_rejects_closed_contract_changes(
       context="Quarterly review\nUse filed results.",
       ticker="MSFT",
       dev_mode=True,
-      max_budget_usd=12.5,
       deliver=False,
     ),
   ],
@@ -445,17 +489,8 @@ def test_envelope_round_trips_every_closed_workload_mode(
     {"mode": "run_once", "skill": "earnings-review"},
     {"mode": "task", "task": "review", "dev_mode": True},
     {"mode": "task", "task": None},
-    {"mode": "pack", "pack": "daily", "deliver": False},
     {"mode": "skill", "skill": None},
     {"mode": "skill", "skill": "review", "task": "other"},
-    {"mode": "skill", "skill": "review", "max_budget_usd": True},
-    {"mode": "skill", "skill": "review", "max_budget_usd": 12},
-    {"mode": "skill", "skill": "review", "max_budget_usd": 0},
-    {
-      "mode": "skill",
-      "skill": "review",
-      "max_budget_usd": float("inf"),
-    },
   ],
 )
 def test_workload_rejects_incompatible_or_noncanonical_fields(
@@ -465,16 +500,74 @@ def test_workload_rejects_incompatible_or_noncanonical_fields(
     _workload(**kwargs)
 
 
-def test_workload_free_text_limit_is_measured_in_utf8_bytes() -> None:
-  with pytest.raises(
-    ValueError,
-    match="autonomous launch workload context is invalid",
-  ):
-    _workload(
-      mode="skill",
-      skill="review",
-      context="\U0001f642" * (64 * 1024),
-    )
+@pytest.mark.parametrize(
+  "kwargs",
+  [
+    {"mode": "task", "task": "\U0001f642" * (64 * 1024)},
+    {
+      "mode": "skill",
+      "skill": "review",
+      "context": "\U0001f642" * (64 * 1024),
+    },
+    {"mode": "skill", "skill": "s" * 513},
+    {"mode": "skill", "skill": "review", "ticker": "t" * 513},
+    {"mode": "pack", "pack": "p" * 513},
+  ],
+)
+def test_signed_workload_preserves_text_above_former_byte_ceilings(
+  kwargs: _WorkloadOverrides,
+) -> None:
+  workload = _workload(**kwargs)
+  verified = _verify(_signed(workload=workload))
+
+  assert verified.workload == workload
+  assert verified.payload()["workload"] == workload.receipt()
+
+
+def test_workload_accepts_profile_above_former_byte_ceiling() -> None:
+  profile = "p" * 513
+  workload = _workload(profile=profile)
+  assert workload.profile == profile
+
+
+@pytest.mark.parametrize(
+  "kwargs",
+  [
+    {"profile": "ana\x00lyst"},
+    {"mode": "task", "task": "review\x00task"},
+    {"mode": "skill", "skill": "re\x00view"},
+    {"mode": "skill", "skill": "review", "context": "file\x00context"},
+    {"mode": "skill", "skill": "review", "ticker": "MS\x00FT"},
+    {"mode": "pack", "pack": "risk\x00pack"},
+  ],
+)
+def test_workload_rejects_nul_before_process_arguments(
+  kwargs: _WorkloadOverrides,
+) -> None:
+  with pytest.raises(ValueError, match="autonomous launch workload"):
+    _workload(**kwargs)
+
+
+@pytest.mark.parametrize(
+  ("kwargs", "field_name"),
+  [
+    ({"mode": "run_once"}, "profile"),
+    ({"mode": "task", "task": "review"}, "task"),
+    ({"mode": "skill", "skill": "review"}, "skill"),
+    ({"mode": "skill", "skill": "review"}, "context"),
+    ({"mode": "skill", "skill": "review"}, "ticker"),
+    ({"mode": "pack", "pack": "risk-pack"}, "pack"),
+  ],
+)
+def test_signed_workload_rejects_nul_before_process_arguments(
+  kwargs: _WorkloadOverrides,
+  field_name: str,
+) -> None:
+  payload = json.loads(_signed(workload=_workload(**kwargs)))
+  payload["workload"][field_name] = "invalid\x00argument"
+
+  with pytest.raises(ValueError, match="workload is invalid"):
+    _verify(_resign(payload))
 
 
 @pytest.mark.parametrize("mutation", ["missing", "extra"])
@@ -653,9 +746,17 @@ def test_envelope_rejects_expired_or_future_tokens(
     _verify(_signed(), now_ns=verify_now_ns)
 
 
-def test_envelope_rejects_excessive_ttl_bad_nonce_and_bad_channel() -> None:
-  with pytest.raises(ValueError, match="ttl_seconds must be between"):
-    _signed(ttl_seconds=301)
+def test_envelope_carries_a_long_ttl_and_expiry_bounds_it() -> None:
+  envelope = _signed(ttl_seconds=600)
+
+  _verify(envelope, now_ns=_NOW_NS + 590_000_000_000)
+  with pytest.raises(ValueError, match="expired"):
+    _verify(envelope, now_ns=_NOW_NS + 606_000_000_000)
+  with pytest.raises(ValueError, match="ttl_seconds must be positive"):
+    _signed(ttl_seconds=0)
+
+
+def test_envelope_rejects_bad_nonce_and_bad_channel() -> None:
   with pytest.raises(ValueError, match="nonce must be 32 lowercase hex"):
     _signed(nonce="not-a-valid-nonce")
   with pytest.raises(ValueError, match="channel_id must be 64 lowercase"):
@@ -726,3 +827,78 @@ def test_superseded_contracts_and_in_memory_replay_path_are_deleted() -> None:
   assert "used_nonces" not in source
   assert "MutableSet" not in source
   assert "legacy" not in source.lower()
+
+
+def _admitted_authority(bind: CapabilityBind) -> tuple[AdmittedContextWire, ResolvedAuthority]:
+  return (
+    AdmittedContextWire(
+      tenant=AdmittedTenant(tenant_id="test-product", storage_id="42", role="owner"),
+      research_binding=AdmittedResearchBinding(research_file_id=7, ticker="MSFT"),
+      capability_bind=bind,
+      children=(),
+      tool_grant=(),
+      budget_share=None,
+      env_projection=("PATH",),
+      approval_route="parent_delegated",
+      handle_grants=(),
+      placement="local_stub",
+      lineage=AdmittedLineage(parent_job_id="parent-7", depth=1),
+    ),
+    ResolvedAuthority(
+      operation_name="risk.scan",
+      grant=ToolGrant(grant_id="grant-7", tools=(), digest="sha256:" + "0" * 64),
+    ),
+  )
+
+
+def test_v7_round_trip_carries_exact_admitted_authority() -> None:
+  bind = _bind().model_copy(update={"capability_id": "node.explore"})
+  context, authority = _admitted_authority(bind)
+  raw = _signed(bind=bind, admitted_context=context, tool_authority=authority)
+  verified = _verify(raw)
+  broker = envelope_module._decode_broker_verified_autonomous_launch_envelope(raw, now_ns=_NOW_NS)
+  assert verified.admitted == broker.admitted == (context, authority)
+  assert verified.bind == context.capability_bind
+  assert verified.payload() == json.loads(raw)
+
+
+@pytest.mark.parametrize("field", ["admitted_context", "tool_authority"])
+def test_envelope_signature_binds_admitted_authority(field: str) -> None:
+  context, authority = _admitted_authority(_bind())
+  payload = json.loads(_signed(admitted_context=context, tool_authority=authority))
+  payload[field] = None
+  with pytest.raises(ValueError, match="signature is invalid"):
+    _verify(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+
+def test_envelope_rejects_mismatched_admitted_bind() -> None:
+  context, authority = _admitted_authority(_bind())
+  changed = context.model_copy(update={"capability_bind": _bind().model_copy(update={"credential_ref": "service:different-handle"})})
+  with pytest.raises(ValueError, match="bind does not match admitted context"):
+    _signed(admitted_context=changed, tool_authority=authority)
+  payload = json.loads(_signed(admitted_context=context, tool_authority=authority))
+  payload["admitted_context"] = changed.model_dump(mode="json")
+  with pytest.raises(ValueError, match="bind does not match admitted context"):
+    _verify(_resign(payload))
+
+
+@pytest.mark.parametrize("field", ["admitted_context", "tool_authority"])
+@pytest.mark.parametrize("mutation", ["null", "unknown", "nul", "noncanonical"])
+def test_envelope_admitted_authority_keeps_closed_canonical_contract(field: str, mutation: str) -> None:
+  context, authority = _admitted_authority(_bind())
+  payload = json.loads(_signed(admitted_context=context, tool_authority=authority))
+  if mutation == "null":
+    payload[field] = None
+  elif mutation == "unknown":
+    payload[field]["unknown"] = "untrusted"
+  elif mutation == "nul":
+    if field == "tool_authority":
+      payload[field]["operation_name"] = "risk\x00scan"
+    else:
+      payload[field]["tenant"]["storage_id"] = "42\x00"
+  elif field == "tool_authority":
+    payload[field]["grant"]["grant_id"] = " grant-7 "
+  else:
+    payload[field]["research_binding"]["ticker"] = " MSFT "
+  with pytest.raises(ValueError):
+    _verify(_resign(payload))

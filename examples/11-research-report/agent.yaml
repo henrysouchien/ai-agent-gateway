@@ -18,5 +18,3 @@ mcp_servers:
       - .
 code_execution: false
 max_tokens: 16000
-max_turns: null
-max_budget_usd: null

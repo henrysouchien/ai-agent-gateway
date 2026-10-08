@@ -26,8 +26,6 @@ def _output(
   *,
   error: str | None = None,
   timed_out: bool = False,
-  budget_exceeded: bool = False,
-  max_turns_reached: bool = False,
 ) -> RunOutput:
   return RunOutput(
     response=response,
@@ -35,8 +33,6 @@ def _output(
     usage={},
     error=error,
     timed_out=timed_out,
-    budget_exceeded=budget_exceeded,
-    max_turns_reached=max_turns_reached,
   )
 
 
@@ -425,44 +421,6 @@ def test_tick_error_from_exception() -> None:
     assert tick_results[0].output is None
     assert tick_results[0].error == "RuntimeError: boom"
     assert loop.state["consecutive_errors"] == 1
-
-  _run(case())
-
-
-def test_tick_budget_exceeded_is_alert() -> None:
-  async def case() -> None:
-    alert_calls: list[RunOutput] = []
-    error_calls: list[RunOutput | Exception] = []
-    tick_results: list[TickResult] = []
-
-    async def run_fn() -> RunOutput:
-      return _output("HEARTBEAT_OK\n", budget_exceeded=True)
-
-    async def on_alert(output: RunOutput, _state: dict[str, Any]) -> None:
-      alert_calls.append(output)
-
-    async def on_error(error: RunOutput | Exception, _state: dict[str, Any]) -> None:
-      error_calls.append(error)
-
-    async def on_tick(result: TickResult, _state: dict[str, Any]) -> None:
-      tick_results.append(result)
-
-    loop = HeartbeatLoop(
-      run_fn,
-      HeartbeatConfig(max_ticks=1),
-      on_alert=on_alert,
-      on_error=on_error,
-      on_tick=on_tick,
-    )
-    await loop.start()
-
-    assert len(alert_calls) == 1
-    assert error_calls == []
-    assert len(tick_results) == 1
-    assert tick_results[0].alert is True
-    assert tick_results[0].stripped_response.strip() == ""
-    assert loop.state["last_outcome"] == "budget_exceeded"
-    assert loop.state["consecutive_errors"] == 0
 
   _run(case())
 

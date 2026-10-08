@@ -78,6 +78,12 @@ def usage_delta(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]
     value = after.get(key)
     if value is not None:
       delta[key] = value
+  wait_ms = (
+    int(after.get("provider_wait_ms", 0) or 0)
+    - int(before.get("provider_wait_ms", 0) or 0)
+  )
+  if wait_ms > 0:
+    delta["provider_wait_ms"] = wait_ms
   return delta
 
 
@@ -105,6 +111,7 @@ def apply_message_start_usage(
   cache_read_tokens: int,
   provider_units: int = 0,
   provider_unit_deltas: dict[str, int] | None = None,
+  provider_wait_ms: int = 0,
 ) -> Dict[str, Any]:
   usage_totals["input_tokens"] += input_tokens
   usage_totals["cache_creation_input_tokens"] += cache_creation_tokens
@@ -113,6 +120,12 @@ def apply_message_start_usage(
   accumulated_units = usage_totals.setdefault("provider_unit_deltas", {})
   for operation, count in (provider_unit_deltas or {}).items():
     accumulated_units[operation] = int(accumulated_units.get(operation, 0) or 0) + int(count)
+  # A measurement, not a token: the provider rate bucket's wait before this
+  # call (rate_limit.py). It rides turn usage only when a wait happened.
+  if provider_wait_ms:
+    usage_totals["provider_wait_ms"] = (
+      int(usage_totals.get("provider_wait_ms", 0) or 0) + provider_wait_ms
+    )
   return usage_totals
 
 

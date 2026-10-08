@@ -66,11 +66,10 @@ class _EchoRunner(AgentRunner):
     self,
     messages: list[dict[str, Any]],
     system_prompt: str | list[tuple[str, bool]] | None = None,
-    max_turns: int | None = None,
     *,
     resume_initial_messages: list[dict[str, Any]] | None = None,
   ) -> None:
-    _ = system_prompt, max_turns, resume_initial_messages
+    _ = system_prompt, resume_initial_messages
     self._captured["messages"] = messages
     last_user = next((message["content"] for message in reversed(messages) if message.get("role") == "user"), "")
     self._event_log.append({"type": "text_delta", "text": f"echo:{last_user}"})

@@ -13,13 +13,11 @@ from agent_gateway.runner_session_events import REFUSAL_GUIDANCE, build_refusal_
 
 
 def test_v1_wire_projection_covers_every_v1_type() -> None:
-  assert len(V1_WIRE_EVENT_TYPES) == 43
+  assert len(V1_WIRE_EVENT_TYPES) == 44
   assert V1_WIRE_EVENT_TYPES
   assert set(V1_FIELD_PROJECTION) == set(V1_WIRE_EVENT_TYPES)
   assert all("type" in fields for fields in V1_FIELD_PROJECTION.values())
-  assert "budget_exceeded" in V1_WIRE_EVENT_TYPES
-  assert "budget_limited" not in V1_WIRE_EVENT_TYPES
-  assert "budget_limited" not in V1_FIELD_PROJECTION
+  assert {"soft_budget_steer", "soft_budget_final"} <= V1_WIRE_EVENT_TYPES
   assert "blocked" not in V1_WIRE_EVENT_TYPES
   assert "blocked" not in V1_FIELD_PROJECTION
   assert "remediating" not in V1_WIRE_EVENT_TYPES
@@ -89,9 +87,21 @@ def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
     {"type": "stream_retry", "attempt": 1, "error": "retry"},
     {"type": "credential_refreshed", "provider": "anthropic", "kind": "auth", "status_code": 401},
     {"type": "compaction", "chars": 123},
-    {"type": "turn_complete", "turn": 1, "usage": {"input_tokens": 1}},
-    {"type": "max_turns_reached", "turn_count": 5, "max_turns": 5},
-    {"type": "budget_exceeded", "total_cost": 1.2, "budget": 1.0},
+    {
+      "type": "turn_complete",
+      "turn": 1,
+      "usage": {"input_tokens": 1},
+      "est_input_tokens": 900,
+      "request_input_tokens": 1000,
+      "context_window": 200_000,
+    },
+    {
+      "type": "tool_calls_planned",
+      "turn": 1,
+      "calls": [{"tool_call_id": "toolu_1", "tool_name": "get_quote", "tool_input": {}, "display": None}],
+    },
+    {"type": "soft_budget_steer", "kind": "turns", "observed": 100, "threshold": 100},
+    {"type": "soft_budget_final", "kind": "cost", "observed": 1.5, "threshold": 1.0},
     {"type": "runtime_guard", "guard": "final_answer", "message": "continue"},
     {"type": "operator_pause", "reason": "operator_pause", "safe_boundary": "before_turn"},
     {
@@ -113,6 +123,17 @@ def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
       "recovered_by_runner_id": "runner-2",
       "recovered_at": 1010.0,
       "safe_boundary": "before_turn",
+    },
+    {
+      "type": "interrupted",
+      "reason": "soft_budget_abort",
+      "runner_id": "runner-1",
+      "role": "writer",
+      "last_completed_seq": 43,
+      "kind": "turns",
+      "observed": 152,
+      "threshold": 100,
+      "grace_turns": 2,
     },
     {
       "type": "stream_complete",
@@ -309,6 +330,24 @@ def test_v1_adapter_preserves_artifact_ready_origin() -> None:
   assert "future_only" not in adapted
 
 
+def test_adapt_event_keeps_tool_calls_planned_turn_and_calls() -> None:
+  calls = [
+    {
+      "tool_call_id": "toolu_1",
+      "tool_name": "get_quote",
+      "tool_input": {"ticker": "NVDA"},
+      "display": {"label": "Get quote", "detail": "NVDA"},
+    },
+    {"tool_call_id": "toolu_2", "tool_name": "get_news", "tool_input": {}, "display": None},
+  ]
+  adapted = adapt_event(
+    {"type": "tool_calls_planned", "turn": 1, "calls": calls, "future_only": "strip-me"},
+    1,
+  )
+
+  assert adapted == {"type": "tool_calls_planned", "turn": 1, "calls": calls}
+
+
 def test_v1_adapter_keeps_stream_guard_heartbeat_payload() -> None:
   adapted = V1Adapter().transform(
     {
@@ -375,8 +414,7 @@ def test_v1_adapter_strips_unknown_fields_for_known_type() -> None:
 @pytest.mark.parametrize(
   ("raw_state", "projected_state"),
   [
-    ("budget_limited", "budget_limited"),
-    ("budget_exceeded", "budget_limited"),
+    ("budget_limited", "interrupted"),
     ("blocked", "failed"),
     ("remediating", "running"),
     ("killed", "cancelled"),

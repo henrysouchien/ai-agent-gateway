@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+from types import MappingProxyType
 from pathlib import Path
 from typing import Any, Dict
 
@@ -11,12 +12,9 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import SessionStore, ToolDispatcher
 from agent_gateway.agent_telemetry import (
-  AGENT_TELEMETRY_REQUEST_ID_ENV,
-  AGENT_TELEMETRY_RUN_ID_ENV,
   AGENT_TELEMETRY_TOOL_CALL_ID_ENV,
 )
 from agent_gateway.code_execution import CodeExecutionConfig, build_code_execution, cleanup_code_execution
-from agent_gateway.code_execution._backends._docker import DockerBackend
 from agent_gateway.code_execution._provenance import (
   AGENT_CODE_EXECUTE_WORK_DIR_ENV,
   collect_computation_sidecars,
@@ -24,6 +22,7 @@ from agent_gateway.code_execution._provenance import (
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.event_log import EventLog
 from agent_gateway.runner import ToolResultContext
+from agent_gateway.tool_dispatch_source_identity import sandbox_computation_source_rows
 
 
 def _run(coro):
@@ -66,6 +65,89 @@ def _entry(function: str, output_hash: str) -> dict[str, Any]:
     "params": {"symbol": "MSCI"},
     "summary": {"accessions": ["0001408198-26-000001"]},
   }
+
+
+def test_native_provenance_collects_without_sidecars_and_reaches_source_rows(tmp_path: Path) -> None:
+  for work_dir in (None, tmp_path / "absent"):
+    provenance = _entry("load_statements", "a" * 64)
+    del provenance["schema_version"]
+    result: dict[str, Any] = {
+      "return_code": 0,
+      "nested_calls": [{
+        "nested_call_id": "cell.1",
+        "provenance": MappingProxyType(provenance),
+      }],
+    }
+
+    collect_computation_sidecars(result, work_dir=work_dir, tool_call_id="cell")
+
+    expected = {**provenance, "nested_call_id": "cell.1"}
+    assert result["computations"] == [expected]
+    assert "nested_call_id" not in provenance
+    assert "computations_dropped" not in result
+    rows = sandbox_computation_source_rows(result)
+    assert len(rows) == 1
+    assert rows[0][0] == "sandbox:load_statements:sha=aaaaaaaaaaaa"
+    assert rows[0][1] == expected
+
+
+def test_native_provenance_is_unbounded_and_preserves_ledger_attribution() -> None:
+  nested_calls = [
+    {
+      "nested_call_id": f"cell.{index}",
+      "provenance": _entry("load_statements", f"{index:064x}"),
+    }
+    for index in range(20)
+  ]
+  result: dict[str, Any] = {"nested_calls": nested_calls}
+
+  collect_computation_sidecars(result, work_dir=None, tool_call_id="cell")
+
+  assert result["computations"] == [
+    {**call["provenance"], "nested_call_id": call["nested_call_id"]}
+    for call in nested_calls
+  ]
+  assert "computations_dropped" not in result
+
+
+def test_invalid_native_provenance_is_ignored() -> None:
+  invalid_entries: list[Any] = [None, "not-a-mapping"]
+  for field in ("function", "tool_version", "output_sha256"):
+    missing = _entry("load_statements", "a" * 64)
+    del missing[field]
+    invalid_entries.append(missing)
+    invalid_entries.append({**_entry("load_statements", "a" * 64), field: " "})
+    invalid_entries.append({**_entry("load_statements", "a" * 64), field: 123})
+  result: dict[str, Any] = {
+    "nested_calls": [
+      {"nested_call_id": f"cell.{index}", "provenance": entry}
+      for index, entry in enumerate(invalid_entries)
+    ],
+  }
+
+  collect_computation_sidecars(result, work_dir=None, tool_call_id="cell")
+
+  assert "computations" not in result
+  assert "computations_dropped" not in result
+
+
+def test_native_provenance_deduplicates_sidecars_without_consuming_legacy_limit(tmp_path: Path) -> None:
+  sidecar_dir = tmp_path / ".agent_provenance" / "cell"
+  sidecar_dir.mkdir(parents=True)
+  native = _entry("load_statements", "a" * 64)
+  legacy = [_entry("load_statements", f"{index:064x}") for index in range(17)]
+  for index, entry in enumerate(legacy):
+    (sidecar_dir / f"{index:04d}.json").write_text(json.dumps(entry), encoding="utf-8")
+  (sidecar_dir / "9999-duplicate.json").write_text(json.dumps(native), encoding="utf-8")
+  result: dict[str, Any] = {
+    "nested_calls": [{"nested_call_id": "cell.1", "provenance": native}],
+  }
+
+  collect_computation_sidecars(result, work_dir=tmp_path, tool_call_id="cell")
+
+  assert result["computations"] == [{**native, "nested_call_id": "cell.1"}, *legacy[:16]]
+  assert result["computations_dropped"] == 1
+  assert not sidecar_dir.exists()
 
 
 def _write_sidecars_code(entries: list[tuple[str, dict[str, Any]]], *, sleep_s: float = 0.0) -> str:
@@ -168,68 +250,6 @@ def test_code_execute_sets_work_dir_env_for_foreground_and_background_subprocess
       "work_dir": session.code_execution_work_dir,
       "tool_call_id": "code_execute_call",
     }
-
-  _run(_run_test())
-
-
-def test_docker_env_args_forward_work_dir_and_agent_telemetry_vars() -> None:
-  backend = DockerBackend()
-  args = backend._env_args(
-    {
-      "PYTHONPATH": "/pkg",
-      AGENT_CODE_EXECUTE_WORK_DIR_ENV: "/workspace",
-      AGENT_TELEMETRY_RUN_ID_ENV: "run-1",
-      AGENT_TELEMETRY_REQUEST_ID_ENV: "req-1",
-      AGENT_TELEMETRY_TOOL_CALL_ID_ENV: "tool-1",
-    }
-  )
-
-  rendered_pairs = list(zip(args[0::2], args[1::2]))
-  assert not any(value.startswith("PYTHONPATH=") for _flag, value in rendered_pairs)
-  assert ("-e", f"{AGENT_CODE_EXECUTE_WORK_DIR_ENV}=/workspace") in rendered_pairs
-  assert ("-e", f"{AGENT_TELEMETRY_RUN_ID_ENV}=run-1") in rendered_pairs
-  assert ("-e", f"{AGENT_TELEMETRY_REQUEST_ID_ENV}=req-1") in rendered_pairs
-  assert ("-e", f"{AGENT_TELEMETRY_TOOL_CALL_ID_ENV}=tool-1") in rendered_pairs
-
-
-def test_docker_handler_sets_container_work_dir_env(monkeypatch) -> None:
-  seen: dict[str, Any] = {}
-
-  async def _fake_execute(self, code, work_dir, **kwargs):
-    seen["code"] = code
-    seen["work_dir"] = work_dir
-    seen["env"] = dict(kwargs["env"])
-    return {
-      "stdout": "ok\n",
-      "stderr": "",
-      "return_code": 0,
-      "images": [],
-      "timed_out": False,
-      "duration_ms": 1,
-      "truncated": False,
-    }
-
-  monkeypatch.setattr("agent_gateway.code_execution._backends._docker.DockerBackend.unavailable_reason", lambda self: None)
-  monkeypatch.setattr("agent_gateway.code_execution._backends._docker.DockerBackend.execute", _fake_execute)
-
-  async def _run_test() -> None:
-    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-    bundle = build_code_execution(
-      session,
-      config=CodeExecutionConfig(register_subprocess=False, register_docker=True),
-    )
-
-    result, error = await _dispatch_bundle_tool(
-      session,
-      bundle,
-      "code_execute",
-      {"code": "print(1)", "host": "docker"},
-    )
-
-    assert error is None
-    assert result is not None
-    assert seen["env"][AGENT_CODE_EXECUTE_WORK_DIR_ENV] == "/workspace"
-    assert seen["env"][AGENT_TELEMETRY_TOOL_CALL_ID_ENV] == "code_execute_call"
 
   _run(_run_test())
 

@@ -26,15 +26,24 @@ async def tool_result_response(
   if not pending:
     return JSONResponse({"error": "Unknown tool_call_id"}, status_code=404)
 
+  # One result per tool call (concurrency): the waiting turn reads exactly one
+  # result for this call, so a second submission has no reader.
   if pending.get("status") == "received":
     return JSONResponse({"error": "Result already submitted"}, status_code=409)
 
+  # Concurrency: only a call the turn is waiting on as a client tool takes a
+  # result; an entry in any other state (an approval awaiting its vote) has no
+  # result reader.
   if pending.get("status") != "pending":
     return JSONResponse({"error": "Invalid pending tool state for result submission"}, status_code=409)
 
+  # The nonce binds the result to the issued call (replay): a result carrying
+  # another call's nonce was not produced for this one.
   if pending.get("nonce") != payload.nonce:
     return JSONResponse({"error": "Nonce mismatch"}, status_code=409)
 
+  # The pending call was already released at its deadline, so a late result has
+  # no waiting turn to deliver to.
   current_time = time.time if time_time is None else time_time
   if int(current_time()) > int(pending.get("expires_at", 0)):
     session.pending_tools.pop(payload.tool_call_id, None)

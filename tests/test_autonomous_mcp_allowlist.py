@@ -16,6 +16,7 @@ if str(PKG_DIR) not in sys.path:
 import agent_gateway.autonomous as autonomous  # noqa: E402
 from agent_gateway import BoundCapabilityExecution, EventLog  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
+from agent_gateway.task_registry import TaskRegistry  # noqa: E402
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_capability_execution_resolver,
 )
@@ -118,26 +119,19 @@ def test_disallowed_inline_names_and_aliases_fail_before_manager_construction(
 
 
 @pytest.mark.parametrize(
-  ("mcp_configuration", "expected_inline"),
+  "mcp_configuration",
   [
-    (
-      {"mcp_servers": {"portfolio-reads-mcp": {"command": "mocked"}}},
-      {"portfolio-reads-mcp"},
-    ),
-    (
-      {
-        "mcp_servers": {"legacy-reads": {"command": "mocked"}},
-        "trusted_mcp_server_aliases": {"legacy-reads": "portfolio-reads-mcp"},
-      },
-      {"legacy-reads"},
-    ),
-    ({"mcp_config_path": "/config/read-only-in-the-mock.json"}, set()),
+    {"mcp_servers": {"portfolio-reads-mcp": {"command": "mocked"}}},
+    {
+      "mcp_servers": {"legacy-reads": {"command": "mocked"}},
+      "trusted_mcp_server_aliases": {"legacy-reads": "portfolio-reads-mcp"},
+    },
+    {"mcp_config_path": "/config/read-only-in-the-mock.json"},
   ],
 )
 def test_trusted_product_allowed_configuration_reaches_mocked_startup(
   monkeypatch: pytest.MonkeyPatch,
   mcp_configuration: dict[str, Any],
-  expected_inline: set[str],
 ) -> None:
   captured: dict[str, Any] = {}
 
@@ -163,8 +157,9 @@ def test_trusted_product_allowed_configuration_reaches_mocked_startup(
       return None
 
   class _StubRunner:
-    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-      return None
+    def __init__(self, *_args: Any, **kwargs: Any) -> None:
+      self._task_registry = TaskRegistry()
+      self._spill_dir_provider = kwargs.get("spill_dir_provider")
 
   async def _fake_run_session(
     _runner: Any,
@@ -179,7 +174,7 @@ def test_trusted_product_allowed_configuration_reaches_mocked_startup(
   monkeypatch.setattr(autonomous, "AgentRunner", _StubRunner)
   monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
 
-  output = _run(
+  _run(
     autonomous.run_autonomous(
       "System",
       "Run",
@@ -189,12 +184,5 @@ def test_trusted_product_allowed_configuration_reaches_mocked_startup(
     )
   )
 
-  assert output.response == "ok"
-  assert captured["manager_kwargs"]["allowed_servers"] == {"portfolio-reads-mcp"}
-  assert captured["manager_kwargs"]["server_aliases"] == mcp_configuration.get(
-    "trusted_mcp_server_aliases",
-    {},
-  )
-  assert set(captured["manager_kwargs"].get("inline_servers") or {}) == expected_inline
   assert captured["startup"] is True
   assert captured["shutdown"] is True

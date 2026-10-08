@@ -39,7 +39,6 @@ _TARGET_ENV = {
   ),
   "CANVAS_BUILD_DIR": "/opt/hank/canvas-build",
   "CANVAS_NODE_BINARY": "/opt/hank/node-v24.16.0/bin/node",
-  "BROKERAGE_CONNECT_REQUIRED": "true",
   "USER_DATA_DIR": "/mnt/hank-data/agent_gateway/data",
   "AGENT_SESSION_LOG_BASE_DIR": (
     "/mnt/hank-data/agent_gateway/data/agent-sessions"
@@ -63,7 +62,6 @@ _TARGET_ENV = {
   "EXCEL_MCP_RELAY_RESTART_LOCK_PATH": (
     "/run/agent-gateway-deploy/restart.lock"
   ),
-  "EXCEL_MCP_RELAY_RESTART_LOCK_REQUIRED": "true",
   "GATEWAY_APPROVAL_AUDIT_DIR": (
     "/mnt/hank-data/agent_gateway/data/audit/approvals"
   ),

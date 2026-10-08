@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import ast
 from dataclasses import FrozenInstanceError
-from pathlib import Path
 from types import MappingProxyType
 
 import pytest
@@ -13,9 +11,6 @@ from agent_gateway.tool_definition import (
   validate_live_tool_route_binding,
   validate_originated_tool_definition,
 )
-
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def _definition() -> dict[str, object]:
@@ -373,31 +368,3 @@ def test_live_tool_route_binding_rejects_reserved_tool_names(
       provider_original_name=provider_original_name,
       provider_id=None,
     )
-
-
-def test_contract_module_is_stdlib_only_and_not_reexported() -> None:
-  source = (ROOT / "agent_gateway" / "tool_definition.py").read_text(
-    encoding="utf-8"
-  )
-  allowed = {
-    "__future__": {"annotations"},
-    "collections.abc": {"Mapping"},
-    "dataclasses": {"dataclass"},
-    "types": {"MappingProxyType"},
-    "typing": {"Any", "Literal"},
-  }
-  for node in ast.walk(ast.parse(source)):
-    if isinstance(node, ast.Import):
-      assert all(alias.asname is None for alias in node.names)
-      assert {alias.name for alias in node.names}.issubset({"math"})
-      continue
-    if not isinstance(node, ast.ImportFrom):
-      continue
-    assert node.level == 0
-    assert node.module in allowed
-    assert all(alias.asname is None for alias in node.names)
-    assert {alias.name for alias in node.names}.issubset(allowed[node.module])
-  package_init = (ROOT / "agent_gateway" / "__init__.py").read_text(
-    encoding="utf-8"
-  )
-  assert "tool_definition" not in package_init

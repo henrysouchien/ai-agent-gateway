@@ -10,7 +10,7 @@ from agent_workflow_contracts.ticker_contract import (
 )
 
 from .operation_catalog import AgentOperationCatalog
-from .skills import SkillLoader, SkillProfile, operation_tool_ids
+from .skills import SkillLoader
 
 def _render_agent_param_description(
   entries: Sequence[tuple[Any, str]],
@@ -36,33 +36,31 @@ def _catalog_operation_entries(
   return list(operation_source.list_callable_operations_with_descriptions())
 
 
-_DEFAULT_EXCLUDED_TOOLS = frozenset({
-  "run_agent",
-  "get_agent_result_content",
-  "get_background_result",
-  "send_message",
-})
-
 _ARTIFACT_EMIT_TOOLS = frozenset({"emit_canvas_artifact", "emit_dashboard_artifact"})
+# The one spawn door's tool name: admission withholds it from a job whose
+# admitted `children` is empty.
+RUN_AGENT_TOOL_NAME = "run_agent"
 ExcludedToolsResolver = Callable[[], FrozenSet[str]]
 NeedsApprovalResolver = Callable[[FrozenSet[str]], Callable[..., bool] | None]
 MutationModeExclusionsApplier = Callable[..., set[str]]
 _DEFAULT_SYSTEM_PROMPT_TEMPLATE = (
   "You are a focused sub-agent working on behalf of another agent. Complete the assigned task "
   "thoroughly and return a clear, concise response for the parent agent. If any tool fails or "
-  "returns suspicious data, note that explicitly instead of silently proceeding. You cannot "
-  "spawn further sub-agents.\n\n"
+  "returns suspicious data, note that explicitly instead of silently proceeding.\n\n"
   "Today's date: {date}"
 )
 _RUN_AGENT_DESCRIPTION = (
   "Spawn a focused child from a registered executable operation. Pass the "
   "complete operation identity advertised below, or omit it to select the "
   "registered generic explore operation. The server admits model, semantic "
-  "capabilities, and an exact tool grant; operation prose does not grant tools."
+  "capabilities, and an exact tool grant; operation prose does not grant tools. "
+  "Declared required_context refs are server-set from prior tool results in "
+  "this turn, not copied into objective. Missing refs return "
+  "required_context_missing without spawning a child; no latest lookup."
 )
 _RESUME_AGENT_DESCRIPTION = (
-  "Resume an interrupted background sub-agent. Only resumable skills can be resumed; "
-  "read the `resumable` and lineage fields from its automatic interrupted notification "
+  "Resume an interrupted background sub-agent from its durable transcript; "
+  "read the lineage fields from its automatic interrupted notification "
   "(use get_background_result only for a historical or explicitly omitted notification). "
   "The exact original complete capability bind and credential authority are "
   "reused; selection overrides are not accepted. Returns new task_id."
@@ -197,43 +195,6 @@ def _optional_research_file_id(value: object | None, *, default: int | None = No
   return parsed
 
 
-def _skill_extra_excluded_tool_names(skill_profile: SkillProfile | None) -> set[str]:
-  raw_tools = getattr(skill_profile, "extra_excluded_tools", None)
-  if raw_tools is None:
-    return set()
-  if isinstance(raw_tools, str) or not isinstance(raw_tools, (list, tuple, set, frozenset)):
-    raise ValueError(
-      f"Skill '{getattr(skill_profile, 'name', '<unknown>')}' extra_excluded_tools must be a list of tool names"
-    )
-  tool_names: set[str] = set()
-  for raw_tool in raw_tools:
-    if not isinstance(raw_tool, str):
-      raise ValueError(
-        f"Skill '{getattr(skill_profile, 'name', '<unknown>')}' extra_excluded_tools entries must be strings"
-      )
-    tool_name = raw_tool.strip()
-    if tool_name:
-      tool_names.add(tool_name)
-  return tool_names
-
-
-def _skill_artifact_excluded_tools(
-  effective_excluded: set[str] | FrozenSet[str],
-  *,
-  skill_profile: SkillProfile | None = None,
-) -> set[str]:
-  excluded = set(effective_excluded)
-  skill_excluded = _skill_extra_excluded_tool_names(skill_profile)
-  declared_artifact_routes = (
-    operation_tool_ids(skill_profile) & _ARTIFACT_EMIT_TOOLS
-    if skill_profile is not None
-    else frozenset()
-  )
-  excluded.difference_update(declared_artifact_routes - skill_excluded)
-  return excluded
-
-
-
 def make_run_agent_tool_def(
   operation_source: SkillLoader | AgentOperationCatalog | None = None,
 ) -> dict[str, Any]:
@@ -249,7 +210,7 @@ def make_run_agent_tool_def(
   )
 
   return {
-    "name": "run_agent",
+    "name": RUN_AGENT_TOOL_NAME,
     "description": _RUN_AGENT_DESCRIPTION,
     "input_schema": {
       "type": "object",
@@ -273,6 +234,14 @@ def make_run_agent_tool_def(
         "objective": {
           "type": "string",
           "description": "The objective for the admitted child task.",
+        },
+        "handles": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": (
+            "Optional explicit read grants for the child. Pass handles already "
+            "available to you or produced by your own job or its descendants."
+          ),
         },
         "ticker": {
           "type": "string",
@@ -413,6 +382,11 @@ def make_send_message_tool_def() -> dict[str, Any]:
           "minLength": 1,
           "maxLength": 12000,
           "description": "Message content to deliver to the agent.",
+        },
+        "handle_refs": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Handle citations accompanying the message; never grants read access to the recipient.",
         },
       },
       "required": ["to", "message"],

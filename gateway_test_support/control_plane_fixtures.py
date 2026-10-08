@@ -55,7 +55,6 @@ class _ControlTestRunner(AgentRunner):
     self,
     messages: list[dict[str, Any]],
     system_prompt: str | list[tuple[str, bool]] | None = None,
-    max_turns: int | None = None,
     *,
     resume_initial_messages: list[dict[str, Any]] | None = None,
     **_kwargs: Any,

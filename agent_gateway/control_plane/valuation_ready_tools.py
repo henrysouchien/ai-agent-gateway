@@ -6,7 +6,6 @@ from typing import Any, Awaitable, Callable
 
 from fastapi import HTTPException
 
-from agent_gateway.skill_context import current_skill
 from agent_gateway.artifact_paths import canonicalize_ticker
 from agent_gateway.tool_dispatcher_helpers import LocalToolHandler, ToolExecutionContext
 
@@ -40,12 +39,12 @@ VALUATION_READY_BATCH_DISPATCH_TOOL_DEF: dict[str, Any] = {
       },
       "required_filings": {
         "type": "array",
-        "description": "Exact SEC filing fiscal periods required before spend (YYYY-Q1..Q4 or YYYY-FY).",
+        "description": "Exact SEC filing fiscal periods checked before spend (YYYY-Q1..Q4 or YYYY-FY); periods not yet ready return as warnings.",
         "items": {"type": "string", "pattern": "^[0-9]{4}-(?:Q[1-4]|FY)$"},
       },
       "required_transcripts": {
         "type": "array",
-        "description": "Exact earnings transcript fiscal periods required before spend (YYYY-Q1..Q4 or YYYY-FY).",
+        "description": "Exact earnings transcript fiscal periods checked before spend (YYYY-Q1..Q4 or YYYY-FY); periods not yet ready return as warnings.",
         "items": {"type": "string", "pattern": "^[0-9]{4}-(?:Q[1-4]|FY)$"},
       },
     },
@@ -96,27 +95,6 @@ def make_valuation_ready_skill_tool_bundle(*, app_state: Any, session: Any) -> d
       "valuation_ready_batch_read": _make_read_handler(app_state=app_state, session=session),
     },
   }
-
-
-def _unsupported_runtime_error() -> dict[str, Any]:
-  return {
-    "code": "unsupported_runtime",
-    "message": (
-      "valuation-ready batch initiation is available only inside the gateway-hosted "
-      "interactive valuation-ready skill runtime."
-    ),
-    "details": {
-      "verdict": "INSUFFICIENT_DATA",
-      "reason": "unsupported_runtime",
-      "supported_runtime": "gateway_interactive",
-    },
-  }
-
-
-def _guard_active_skill() -> dict[str, Any] | None:
-  if current_skill() == VALUATION_READY_SKILL:
-    return None
-  return _unsupported_runtime_error()
 
 
 def _normalize_ticker(value: Any) -> str | None:
@@ -213,9 +191,6 @@ def _make_dispatch_handler(*, app_state: Any, session: Any) -> LocalToolHandler:
     tool_ctx: ToolExecutionContext,
     **_: object,
   ) -> tuple[Any | None, dict[str, Any] | None]:
-    unsupported = _guard_active_skill()
-    if unsupported is not None:
-      return None, unsupported
     try:
       spec, error = _dispatch_spec(
         tool_input or {},
@@ -294,9 +269,6 @@ def _make_dispatch_handler(*, app_state: Any, session: Any) -> LocalToolHandler:
 
 def _make_read_handler(*, app_state: Any, session: Any) -> ToolHandler:
   async def _handle(tool_input: dict[str, Any], **_: Any) -> tuple[Any | None, dict[str, Any] | None]:
-    unsupported = _guard_active_skill()
-    if unsupported is not None:
-      return None, unsupported
     try:
       batch_id = int(tool_input["batch_id"])
     except (KeyError, TypeError, ValueError):

@@ -31,11 +31,9 @@ _TOP_LEVEL_KEYS = {
   "mcp_servers",
   "code_execution",
   "max_tokens",
-  "max_turns",
-  "max_budget_usd",
 }
 # Keys an earlier `agent init` scaffold wrote and the schema later retired: its own history, not an allowlist.
-_RETIRED_KEYS = frozenset({"per_turn_timeout", "provider", "model"})
+_RETIRED_KEYS = frozenset({"per_turn_timeout", "provider", "model", "max_turns", "max_budget_usd"})
 
 
 class AgentProjectError(ValueError):
@@ -62,8 +60,6 @@ class AgentProjectConfig:
   mcp_servers: dict[str, dict[str, Any]]
   code_execution: bool
   max_tokens: int
-  max_turns: int | None
-  max_budget_usd: float | None
 
 
 def validate_project_name(name: str) -> str:
@@ -94,8 +90,6 @@ def default_agent_config_payload(
     "mcp_servers": {},
     "code_execution": False,
     "max_tokens": 16000,
-    "max_turns": None,
-    "max_budget_usd": None,
   }
   if model_key is not None:
     payload["model_key"] = model_key
@@ -226,8 +220,6 @@ def load_agent_project_config(config_path: str | Path = DEFAULT_AGENT_CONFIG) ->
     mcp_servers=mcp_servers,
     code_execution=_bool(payload.get("code_execution"), False),
     max_tokens=_int(payload.get("max_tokens"), 16000, key="max_tokens"),
-    max_turns=_optional_int(payload.get("max_turns"), key="max_turns"),
-    max_budget_usd=_optional_float(payload.get("max_budget_usd"), key="max_budget_usd"),
   )
 
 
@@ -247,8 +239,6 @@ def create_agent_from_yaml(config_path: str | Path = DEFAULT_AGENT_CONFIG) -> Fa
     skill_state_file=config.skill_state_file,
     outputs_dir=config.outputs_dir,
     code_execution=config.code_execution,
-    max_turns=config.max_turns,
-    max_budget_usd=config.max_budget_usd,
     prefix=config.api_prefix,
   )
 
@@ -289,20 +279,6 @@ def _int(value: Any, default: int, *, key: str) -> int:
   if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
     raise AgentProjectError(f"{key} must be a positive integer")
   return value
-
-
-def _optional_int(value: Any, *, key: str) -> int | None:
-  if value is None:
-    return None
-  return _int(value, 1, key=key)
-
-
-def _optional_float(value: Any, *, key: str) -> float | None:
-  if value is None:
-    return None
-  if not isinstance(value, int | float) or isinstance(value, bool) or value <= 0:
-    raise AgentProjectError(f"{key} must be a positive number")
-  return float(value)
 
 
 def _optional_path(base_dir: Path, value: Any) -> Path | None:

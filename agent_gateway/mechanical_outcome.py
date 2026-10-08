@@ -28,15 +28,6 @@ from agent_workflow_contracts import AnalyticalOutcome, ToolGrant
 # evidence-poor.  The capability vocabulary marks them with the read verb.
 _SOURCE_CAPABILITY_SUFFIX = ".read/v1"
 
-_RATIONALE_CEILING_REACHED = {
-  "turns_exhausted": (
-    "the child reached its turn ceiling before completing the objective"
-  ),
-  "budget_exhausted": (
-    "the child reached its declared budget ceiling before completing the "
-    "objective"
-  ),
-}
 _RATIONALE_MISSING_INPUTS = (
   "required upstream inputs were unavailable at admission"
 )
@@ -83,8 +74,8 @@ def derive_mechanical_outcome(
   failures: Mapping[str, tuple[int, int]],
   sources: Sequence[Mapping[str, object]] = (),
   narrative_present: bool,
-  ceiling_reached: str | None,
   missing_inputs: tuple[str, ...] = (),
+  evidence_gap: str | None = None,
 ) -> AnalyticalOutcome | None:
   """Derive the mechanical ``AnalyticalOutcome``, or ``None`` if unassessed.
 
@@ -93,9 +84,11 @@ def derive_mechanical_outcome(
   * no admitted authority (``grant is None``) → ``None``.  There was no
     admission to assess against, so no assessment occurred.  This is the
     pinned reading of an absent ``task_entry`` at the settlement sites.
+  * child evidence past its canonical bound (``evidence_gap``) → ``partial``
+    with that rationale, whether the child settled on its narrative or on a
+    terminal tool result: the result stands, its evidence is not recorded.
   * narrative absent → ``None``.  Settlement already failed; there is nothing
     to qualify.
-  * a declared ceiling reached (``ceiling_reached``) → ``partial``.
   * missing inputs → ``partial``; nothing left to work with → ``blocked``.
   * all granted source-capability retrievals failed → ``insufficient_evidence``.
   * some failed → ``partial``.
@@ -107,19 +100,19 @@ def derive_mechanical_outcome(
   ``unmet_requirements`` on ``complete``.
   """
 
-  if grant is None or not narrative_present:
+  if grant is None:
     return None
 
-  if ceiling_reached is not None:
-    rationale = _RATIONALE_CEILING_REACHED.get(ceiling_reached)
-    if rationale is None:
-      raise ValueError("mechanical outcome received an unknown ceiling")
+  if evidence_gap is not None:
     return AnalyticalOutcome(
       disposition="partial",
       assessment_source="mechanically_derived",
-      assessment_rationale=rationale,
-      unmet_requirements=(ceiling_reached,),
+      assessment_rationale=evidence_gap,
+      unmet_requirements=("child_evidence",),
     )
+
+  if not narrative_present:
+    return None
 
   source_tool_ids = source_capability_tool_ids(grant=grant, bindings=bindings)
   attempted = 0

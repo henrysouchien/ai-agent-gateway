@@ -24,7 +24,7 @@ from .skills import SkillLoader, SkillProfile, resolve_blocks
 log = logging.getLogger("agent_gateway.directory_control_skill_catalog")
 
 _FRONTMATTER_DELIMITER = "---"
-_PORTFOLIO_CONTEXT_NAMES = frozenset({
+PORTFOLIO_CONTEXT_NAMES = frozenset({
   "portfolio",
   "portfolio_context",
   "portfolio_name",
@@ -292,7 +292,7 @@ def _project_summary(
   )
   if (
     requires_portfolio_context
-    and not _PORTFOLIO_CONTEXT_NAMES.intersection(required_context)
+    and not PORTFOLIO_CONTEXT_NAMES.intersection(required_context)
   ):
     raise ValueError(
       "portfolio context requirement must be present in required_context"
@@ -319,8 +319,6 @@ def _project_summary(
     required_context=required_context,
     agent_callable=profile.agent_callable,
     resumable=profile.resumable,
-    max_turns=profile.max_turns,
-    max_budget_usd=profile.max_budget_usd,
     persist_state=profile.persist_state,
     typed_contract=_clean_text(metadata.get("typed_contract")),
     catalog=advertised,
@@ -367,8 +365,6 @@ def _project_detail(
     required_context=summary.required_context,
     agent_callable=summary.agent_callable,
     resumable=summary.resumable,
-    max_turns=summary.max_turns,
-    max_budget_usd=summary.max_budget_usd,
     persist_state=summary.persist_state,
     typed_contract=summary.typed_contract,
     catalog=summary.catalog,

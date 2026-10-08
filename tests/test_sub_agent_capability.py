@@ -13,7 +13,6 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway.sub_agent_capability import (  # noqa: E402
   DELEGATION_ROLE_CAPABILITIES,
-  DelegationRoleResolutionError,
   is_delegation_profile,
   resolve_delegation_role_capability,
   resolve_sub_agent_capability,
@@ -83,12 +82,8 @@ def test_explicit_delegation_role_map_is_exhaustive_and_normalized(
 
 
 @pytest.mark.parametrize("role", ["", "  ", "arbitrary-role", "node.implement"])
-def test_explicit_unmapped_delegation_role_is_refused(role: str) -> None:
-  with pytest.raises(
-    DelegationRoleResolutionError,
-    match="Unmapped delegation role",
-  ):
-    resolve_delegation_role_capability(role)
+def test_explicit_unmapped_delegation_role_runs_as_implement(role: str) -> None:
+  assert resolve_delegation_role_capability(role) == "node.implement"
 
 
 @pytest.mark.parametrize(
@@ -118,13 +113,17 @@ def test_trusted_declared_role_controls_registered_skill_capability() -> None:
   ) == "node.verify"
 
 
-def test_trusted_declared_unknown_role_is_refused() -> None:
-  with pytest.raises(DelegationRoleResolutionError):
-    resolve_sub_agent_capability(
-      validated_agent_name="custom-curated-profile",
-      mutation_mode=None,
-      delegation_role="unknown-role",
-    )
+def test_trusted_declared_unknown_role_derives_from_registration() -> None:
+  assert resolve_sub_agent_capability(
+    validated_agent_name="custom-curated-profile",
+    mutation_mode=None,
+    delegation_role="unknown-role",
+  ) == "node.implement"
+  assert resolve_sub_agent_capability(
+    validated_agent_name="verify-finding",
+    mutation_mode=None,
+    delegation_role="unknown-role",
+  ) == "node.verify"
 
 
 def test_mutation_metadata_precedes_declared_delegation_role() -> None:
@@ -135,10 +134,9 @@ def test_mutation_metadata_precedes_declared_delegation_role() -> None:
   ) == "node.mutate"
 
 
-def test_mutation_metadata_does_not_hide_unmapped_delegation_role() -> None:
-  with pytest.raises(DelegationRoleResolutionError):
-    resolve_sub_agent_capability(
-      validated_agent_name="custom-curated-profile",
-      mutation_mode="apply",
-      delegation_role="unknown-role",
-    )
+def test_mutation_metadata_precedes_unmapped_delegation_role() -> None:
+  assert resolve_sub_agent_capability(
+    validated_agent_name="custom-curated-profile",
+    mutation_mode="apply",
+    delegation_role="unknown-role",
+  ) == "node.mutate"

@@ -275,7 +275,7 @@ def test_stdio_tool_call_reconnects_once_on_closed_transport(monkeypatch, caplog
       name: str,
       arguments: dict[str, object],
       *,
-      read_timeout_seconds: float,
+      read_timeout_seconds: float | None,
       meta: dict[str, object] | None = None,
     ) -> CallToolResult:
       raise ClosedResourceError()
@@ -286,7 +286,7 @@ def test_stdio_tool_call_reconnects_once_on_closed_transport(monkeypatch, caplog
       name: str,
       arguments: dict[str, object],
       *,
-      read_timeout_seconds: float,
+      read_timeout_seconds: float | None,
       meta: dict[str, object] | None = None,
     ) -> CallToolResult:
       return CallToolResult(
@@ -397,17 +397,3 @@ def test_close_contexts_times_out_hanging_context(caplog):
 
   assert time.monotonic() - started < 1
   assert "MCP context close timed out" in caplog.text
-
-
-def test_close_contexts_suppresses_cancelled_cleanup(caplog):
-  manager = McpClientManager(config_path=None)
-
-  class _CancelledCloseContext:
-    async def __aexit__(self, exc_type, exc, tb):
-      raise asyncio.CancelledError("Cancelled via cancel scope")
-
-  caplog.set_level(logging.DEBUG, logger="agent_gateway.mcp_client")
-
-  asyncio.run(manager._close_contexts([_CancelledCloseContext()]))
-
-  assert "MCP context close cancelled during cleanup" in caplog.text

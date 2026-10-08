@@ -7,7 +7,6 @@ import hashlib
 import inspect
 import json
 import logging
-import math
 import re
 import secrets
 import unicodedata
@@ -113,7 +112,6 @@ class BuildRunner(Protocol):
     *,
     messages: list[dict[str, object]],
     system_prompt: SystemPrompt | None = None,
-    max_turns: int | None = None,
   ) -> None: ...
 
 
@@ -130,24 +128,13 @@ class SessionExecutionPolicy:
   """Trusted per-turn runner limits; model selection belongs to product policy."""
 
   max_tokens: int | None = None
-  max_turns: int | None = None
-  max_budget_usd: float | None = None
 
   def __post_init__(self) -> None:
-    for field_name in ("max_tokens", "max_turns"):
-      value = getattr(self, field_name)
-      if value is not None and (
-        isinstance(value, bool) or not isinstance(value, int) or value <= 0
-      ):
-        raise ValueError(f"{field_name} must be a positive integer")
-    budget = self.max_budget_usd
-    if budget is not None and (
-      isinstance(budget, bool)
-      or not isinstance(budget, int | float)
-      or not math.isfinite(float(budget))
-      or float(budget) <= 0
+    value = self.max_tokens
+    if value is not None and (
+      isinstance(value, bool) or not isinstance(value, int) or value <= 0
     ):
-      raise ValueError("max_budget_usd must be a finite positive number")
+      raise ValueError("max_tokens must be a positive integer")
 
 
 SessionExecutionPolicyResolver = Callable[
@@ -179,7 +166,6 @@ _AGENT_API_CLAIM_HEADERS = {
   "nonce": "X-Agent-Claim-Nonce",
   "signature": "X-Agent-Claim-Signature",
 }
-_AGENT_API_CLAIM_MAX_TTL_SECONDS_DEFAULT = 600
 _ARTIFACT_DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 _ARTIFACT_ORIGIN_VALUES = frozenset({"product", "harness", "import"})
 _ARTIFACT_ORIGIN_FILTER_VALUES = frozenset({"all", *_ARTIFACT_ORIGIN_VALUES})
@@ -192,6 +178,10 @@ _ACTIVE_TURN_GRACE_SECONDS = 60.0
 #: How long a follow-up message waits for the previous turn's post-terminal
 #: teardown before the session is reported as not released.
 _ACTIVE_TURN_SETTLE_WAIT_SECONDS = 30.0
+#: Per-subscriber SSE queue bound (resource): a slow subscriber cannot grow
+#: gateway memory without bound. On overflow only that subscriber's stream ends;
+#: the turn is not stopped (it writes the event log, not the queue), and
+#: /chat/subscribe with after_seq resumes from the log.
 _STREAM_SUBSCRIBER_QUEUE_MAX = 256
 _STREAM_SUBSCRIBER_KEEPALIVE_SECONDS = 15.0
 _SIDECAR_SLUG_RE = re.compile(r"[^a-z0-9-]+")
@@ -241,6 +231,8 @@ def _looks_like_commercial_jwt(value: str) -> bool:
 
 
 def _assert_no_commercial_bearer_material(value: Any) -> None:
+  """Credential containment: commercial bearer tokens are header-only, so they
+  never land in the persisted request body, transcript or logs."""
   stack = [value]
   seen: set[int] = set()
   while stack:
@@ -257,7 +249,8 @@ def _assert_no_commercial_bearer_material(value: Any) -> None:
         ):
           raise PydanticCustomError(
             "commercial_bearer_material_forbidden",
-            "commercial bearer material is accepted only in dedicated headers",
+            "commercial bearer material is accepted only in the "
+            "X-Hank-Commercial-Claim and X-Hank-Work-Authorization headers",
           )
         stack.append(item)
     elif isinstance(current, (list, tuple)):
@@ -269,8 +262,37 @@ def _assert_no_commercial_bearer_material(value: Any) -> None:
     elif isinstance(current, str) and _looks_like_commercial_jwt(current):
       raise PydanticCustomError(
         "commercial_bearer_material_forbidden",
-        "commercial bearer material is accepted only in dedicated headers",
+        "commercial bearer material is accepted only in the "
+        "X-Hank-Commercial-Claim and X-Hank-Work-Authorization headers",
       )
+
+
+SessionResumeRefusalReason = Literal[
+  "not_found",
+  "ambiguous",
+  "no_ownership_record",
+  "in_use",
+]
+
+
+class SessionResumeResolver(Protocol):
+  """Find the caller's own interactive log for an init-time resume.
+
+  Receives the caller as `chat_init` resolved it and the presented session
+  id. Returns the log path when exactly one of the caller's logs carries an
+  attach record naming this `user_id`, `channel` and `api_key_hash`, else the
+  refusal reason. It opens no file outside the caller's own filename and
+  creates or modifies none.
+  """
+
+  def __call__(
+    self,
+    *,
+    resume_session_id: str,
+    user_id: str,
+    channel: str | None,
+    api_key_hash: str,
+  ) -> Path | SessionResumeRefusalReason: ...
 
 
 class ChatInitRequest(BaseModel):
@@ -291,6 +313,7 @@ class ChatInitRequest(BaseModel):
   capability_selections: Dict[str, "CapabilitySelection"] = Field(
     default_factory=dict
   )
+  resume_session_id: str | None = None
 
 
 class CapabilitySelection(BaseModel):
@@ -402,6 +425,7 @@ class ChatInitResponse(BaseModel):
   expires_at: int
   schema_version: int
   capability_choices: Dict[str, CapabilityChoiceResponse]
+  resumed_from_session_id: str | None = None
 
 
 class ChatMessage(BaseModel):
@@ -549,9 +573,10 @@ class InvestmentArtifactSelection(BaseModel):
 class ChatRequest(BaseModel):
   """Request body for `POST /chat`.
 
-  `messages` is the full message list for the current turn. `context` is
-  intentionally free-form; `context["channel"]` is the most common field used
-  to shape runtime behavior per frontend.
+  `messages` is the new user turn; when a durable session log is attached the
+  runner rebuilds prior turns from it and reads only the last user message.
+  `context` is intentionally free-form; `context["channel"]` is the most common
+  field used to shape runtime behavior per frontend.
   """
 
   model_config = ConfigDict(extra="forbid")
@@ -837,7 +862,6 @@ class ChatRuntime:
     disconnect_handler: Optional request-scoped disconnect hook invoked when the
       client connection is closed mid-stream.
     post_runner_init: Optional callback invoked after runner construction.
-    max_turns: Optional cap on loop iterations for this request.
     compaction_trigger: Optional token threshold for provider-side compaction.
     compaction_instructions: Optional provider-specific compaction instructions.
   """
@@ -856,7 +880,6 @@ class ChatRuntime:
   on_tool_timing: Optional[Callable[..., Any]] = None
   disconnect_handler: Optional[Callable[[], Awaitable[None] | None]] = None
   post_runner_init: Optional[Callable[[Any], None]] = None
-  max_turns: Optional[int] = None
   compaction_trigger: int | None = None
   compaction_instructions: str | None = None
   purpose: str | None = None
@@ -960,7 +983,8 @@ class GatewayServerConfig:
     credentials_resolver: Optional init-time resolver for per-user credentials.
     dispatch_scope_validator: Optional dispatch-time validator for structured
       portfolio scopes. The callback may canonicalize the redacted scope or
-      raise an HTTPException/ValueError to stop run creation.
+      raise an HTTPException to stop run creation; any other failure is logged
+      and the requested scope is dispatched.
     commercial_work_start_gate: Optional default-off gate that verifies header
       authority and persists one-time consumption before runtime construction.
     mcp_client: Optional shared `McpClientManager`.
@@ -1010,6 +1034,9 @@ class GatewayServerConfig:
     on_tool_timing: Optional app-level tool timing hook.
     on_session_created: Optional app-level hook invoked after session creation
       and before the init response is issued.
+    session_resume_resolver: Application lookup for `resume_session_id` at
+      init: returns the caller's own existing interactive log or a refusal
+      reason. Without it every resume is refused as `not_found`.
     on_startup: Optional startup callback.
     on_shutdown: Optional shutdown callback.
     transcript_dir: Optional directory where request and event transcripts are
@@ -1110,6 +1137,7 @@ class GatewayServerConfig:
   on_usage: Optional[Callable[..., Any]] = None
   on_tool_timing: Optional[Callable[..., Any]] = None
   on_session_created: Optional[Callable[[GatewaySession, str, ChatInitRequest], None]] = None
+  session_resume_resolver: SessionResumeResolver | None = None
   on_startup: Optional[Callable[..., Any]] = None
   on_shutdown: Optional[Callable[..., Any]] = None
   transcript_dir: Optional[Path] = None

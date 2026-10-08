@@ -174,7 +174,7 @@ def test_max_tokens_continuation_is_bounded(caplog) -> None:
   _run(_case())
 
 
-def test_child_max_tokens_segments_are_unbounded_and_do_not_consume_max_turns(
+def test_child_max_tokens_segments_are_one_logical_response(
   tmp_path: Path,
   caplog,
 ) -> None:
@@ -209,7 +209,6 @@ def test_child_max_tokens_segments_are_unbounded_and_do_not_consume_max_turns(
     await runner.run(
       messages=[{"role": "user", "content": "Start"}],
       system_prompt="x",
-      max_turns=1,
     )
 
     assert calls == 6
@@ -231,8 +230,9 @@ def test_child_max_tokens_segments_are_unbounded_and_do_not_consume_max_turns(
       entry.event.get("continued_from_assistant_message_seq")
       for entry in entries
     ] == [None, *[entry.seq for entry in entries[:-1]]]
+    # Six requests sit far below the bundled threshold: no ladder stage.
     assert not any(
-      entry.event.get("type") == "max_turns_reached"
+      str(entry.event.get("type") or "").startswith("soft_budget")
       for entry in runner._log.entries
     )
     # The warning names the persisted segment, not the next one.
@@ -242,6 +242,60 @@ def test_child_max_tokens_segments_are_unbounded_and_do_not_consume_max_turns(
 
   _run(_case())
 
+
+def test_child_max_tokens_segments_advance_the_soft_budget(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setenv("HANK_SOFT_TURN_BUDGET", "3")
+
+  async def _case() -> None:
+    runner = _make_runner(
+      _StubProvider(),
+      session_id="sub_parent:2",
+      agent_session_log=AgentSessionLog(tmp_path / "child.jsonl"),
+    )
+    calls = 0
+
+    async def _fake_stream_turn(**_kwargs: Any):
+      nonlocal calls
+      calls += 1
+      # Each segment is a provider request that completes no turn.
+      if calls <= 5:
+        return object(), StreamTurnResult(
+          full_text="repeated provider segment",
+          stop_reason="max_tokens",
+          content_blocks=[{"type": "text", "text": "repeated provider segment"}],
+        )
+      return object(), StreamTurnResult(
+        full_text="terminal segment",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "terminal segment"}],
+      )
+
+    runner._stream_turn = _fake_stream_turn
+    await runner.run(
+      messages=[{"role": "user", "content": "Start"}],
+      system_prompt="x",
+    )
+
+    assert calls == 6
+    # Three requests completed before segment 4 and five before segment 6:
+    # the ladder steers and finalizes inside the continuation chain instead
+    # of waiting for a turn that a max_tokens chain never completes.
+    assert [
+      (entry.event["type"], entry.event["kind"], entry.event["observed"])
+      for entry in runner._log.entries
+      if str(entry.event.get("type") or "").startswith("soft_budget")
+    ] == [
+      ("soft_budget_steer", "turns", 3),
+      ("soft_budget_final", "turns", 5),
+    ]
+    assert not any(
+      entry.event.get("type") == "interrupted" for entry in runner._log.entries
+    )
+
+  _run(_case())
 
 def test_parent_message_breaks_child_max_tokens_logical_response(
   tmp_path: Path,
@@ -294,7 +348,6 @@ def test_parent_message_breaks_child_max_tokens_logical_response(
     await runner.run(
       messages=[{"role": "user", "content": "Start"}],
       system_prompt="x",
-      max_turns=2,
     )
 
     assert len(seen_messages) == 2
@@ -436,3 +489,52 @@ def test_sdk_run_output_limit_resolves_like_the_run_loop(
   )
 
   assert runner._credential_env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == expected
+
+
+def test_child_max_tokens_chain_that_never_answers_meets_the_abort(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setenv("HANK_SOFT_TURN_BUDGET", "3")
+
+  async def _case() -> None:
+    runner = _make_runner(
+      _StubProvider(),
+      session_id="sub_parent:3",
+      agent_session_log=AgentSessionLog(tmp_path / "child.jsonl"),
+    )
+    calls = 0
+
+    async def _fake_stream_turn(**_kwargs: Any):
+      nonlocal calls
+      calls += 1
+      assert calls <= 12, "an endless max_tokens chain never met the abort"
+      # The provider never completes the turn.
+      return object(), StreamTurnResult(
+        full_text="more",
+        stop_reason="max_tokens",
+        content_blocks=[{"type": "text", "text": "more"}],
+      )
+
+    runner._stream_turn = _fake_stream_turn
+    await runner.run(
+      messages=[{"role": "user", "content": "Start"}],
+      system_prompt="x",
+    )
+
+    events = [entry.event for entry in runner._log.entries]
+    # Final fires before segment 6 (five requests); segments 6 and 7 spend
+    # the grace, and the abort lands before the eighth request.
+    assert calls == 7
+    assert [
+      (event["type"], event["kind"]) for event in events
+      if str(event.get("type") or "").startswith("soft_budget")
+    ] == [("soft_budget_steer", "turns"), ("soft_budget_final", "turns")]
+    assert any(
+      event.get("type") == "stream_complete"
+      and event.get("terminal_disposition") == "interrupted"
+      and event.get("reason") == "soft_budget_abort"
+      for event in events
+    )
+
+  _run(_case())

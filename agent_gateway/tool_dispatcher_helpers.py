@@ -4,12 +4,15 @@ import asyncio
 import logging
 from collections.abc import Sequence as AbcSequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Literal, Mapping, Optional, Protocol, Sequence, Tuple, TYPE_CHECKING
 
 from . import approval_settings
 
 if TYPE_CHECKING:
   from .ui_blocks_run import UiBlocksRunContext
+
+_log = logging.getLogger("agent_gateway.dispatcher")
 
 class EventLogWriter(Protocol):
   """Append-only event surface required by dispatcher helper contracts."""
@@ -258,11 +261,18 @@ def tool_input_schema_error(
   message: str,
   details: Dict[str, Any],
 ) -> Dict[str, Any]:
+  # No call is named: repeating this tool with an empty or echoed input repeats
+  # the refusal, and the refused input is raw agent payload logged before any
+  # redaction runs. The message and details name the fields to add, remove or retype.
   return {
     "code": "invalid_tool_input_schema",
     "message": f"Tool '{tool_name}' input does not match its active input_schema: {message}",
     "details": {"tool_name": tool_name, **details},
-    "fix": "Call the tool with a JSON object matching its active input_schema, including required fields.",
+    "fix": (
+      f"Call '{tool_name}' again with the fields this message names added, "
+      "removed or retyped to match its input_schema."
+    ),
+    "next_call": None,
   }
 
 
@@ -445,11 +455,16 @@ class InterceptDecision:
     executing; in headless contexts, resolves to deny unless an
     `on_headless_ask` hook overrides
   - deny: block and return an error to the model
+
+  `measurement` names counts the interceptor keeps (``{name: value}``); it
+  never changes the action.  Each is logged as one ``interceptor_measurement``
+  event, and ``session_recap`` folds the largest value per name.
   """
 
   action: str  # "allow", "deny", "warn", "ask"
   message: str = ""
   code: str = "interceptor"
+  measurement: Mapping[str, int] | None = None
 
   def __post_init__(self) -> None:
     if self.action not in {"allow", "deny", "warn", "ask"}:
@@ -500,35 +515,25 @@ async def run_interceptors(
     try:
       decision = await interceptor(ctx)
     except Exception as exc:
-      is_critical = getattr(interceptor, "__intercept_critical__", False)
-      if is_critical:
-        log.error(
-          "Critical interceptor failed; denying | exception_type=%s",
-          type(exc).__name__,
-        )
-        if event_log is not None:
-          event_log.append(
-            {
-              "type": "interceptor_decision",
-              "tool_call_id": tool_call_id,
-              "tool_name": tool_name,
-              "action": "deny",
-              "code": "interceptor_error",
-              "message": "Critical safety interceptor failed",
-            }
-          )
-        return InterceptResult(
-          proceed=False,
-          error={
-            "code": "interceptor_error",
-            "message": f"Safety check failed due to an internal error. Tool '{tool_name}' was blocked.",
-          },
-        )
+      # A crashed interceptor is logged and the call proceeds: an interceptor
+      # that holds an invariant returns its own deny, and the live-order money
+      # boundary is decided by the approval policy
+      # (`SingleUserApprovalPolicy.decide`), not by this chain.
       log.warning(
-        "Interceptor error (non-fatal) | exception_type=%s",
+        "Interceptor error; proceeding | exception_type=%s",
         type(exc).__name__,
       )
       continue
+
+    if decision.measurement and event_log is not None:
+      event_log.append(
+        {
+          "type": "interceptor_measurement",
+          "tool_call_id": tool_call_id,
+          "tool_name": tool_name,
+          "measurement": dict(decision.measurement),
+        }
+      )
 
     if decision.action == "deny":
       if event_log is not None:
@@ -601,6 +606,8 @@ class ToolExecutionContext:
   request_id: str | None = None
   run_id: str | None = None
   user_id: str | None = None
+  # The calling run's profile; a child run inherits it as its own (sub_agent).
+  profile: str | None = None
   ui_blocks_run: "UiBlocksRunContext | None" = field(default=None, repr=False)
   approval_id: str | None = None
   approval_chain_id: str | None = None
@@ -611,11 +618,39 @@ class ToolExecutionContext:
   # binds the run's own secret boundary; a handler never sees the boundary
   # itself, only this one-string projection.
   redact_text: Callable[[str], str] | None = field(default=None, repr=False)
+  # The exact run's activity owner; handlers fence lazy file identities here.
+  research_file_activity_owner: Callable[[Path, int], bool] | None = field(
+    default=None, repr=False
+  )
+
+  def ensure_research_file_activity(
+    self, workspace_dir: Path, research_file_id: int
+  ) -> bool:
+    """Fence one research identity through this context's constructed run."""
+
+    owner = self.research_file_activity_owner
+    assert owner is not None, "research tool context has no run activity owner"
+    return owner(workspace_dir, research_file_id)
 
   def emit(self, event: Dict[str, Any]) -> None:
-    """Append a custom event to the active event log."""
-    if self.event_log is not None:
+    """Append a custom event to the active event log.
+
+    A tool's emitted event is secondary to its result: the delivery channel owns
+    its own failure. ``EventLog.append`` re-raises whatever its ``prepare_event``
+    or ``on_event`` callbacks raise (event_log.py:93-97, :111-116), so the type is
+    unbounded; the log has already closed itself when its policy says so. The
+    failure is logged here and never rewrites the tool's result.
+    """
+    if self.event_log is None:
+      return
+    try:
       self.event_log.append(event)
+    except Exception as exc:
+      _log.error(
+        "Tool event delivery failed for %s | exception_type=%s",
+        self.tool_name,
+        type(exc).__name__,
+      )
 
   @property
   def aborted(self) -> bool:

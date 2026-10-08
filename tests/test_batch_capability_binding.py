@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from fastapi import HTTPException
 
 from model_authority.binding import (
   AuthContext,
@@ -21,7 +22,15 @@ from agent_gateway.claim_signing_authority import (
 from agent_gateway.control_plane import batches
 from agent_gateway.providers import ModelInfo, ModelProvider
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
-from agent_gateway.session import GatewaySession
+from agent_gateway.session import AuthManager, GatewaySession, SessionStore
+from agent_gateway.admission import AdmittedContext, root_context
+from agent_gateway.approval_route import child_approval_route
+from agent_workflow_contracts import ResolvedAuthority
+from agent_workflow_contracts.models import (
+  AdmittedContextWire,
+  AdmittedLineage,
+  ToolGrant,
+)
 
 
 class _Provider(ModelProvider):
@@ -257,6 +266,84 @@ def test_batch_parent_rebinds_authenticated_alias_to_canonical_owner() -> None:
   assert session.owner_user_id == "1"
 
 
+def test_batch_parent_rebind_carries_authenticated_session_token() -> None:
+  handle = CredentialHandle(
+    handle_id="service:batch-alias:anthropic",
+    provider="anthropic",
+    principal="service",
+    tenant_id="tenant-a",
+    actor_id=None,
+  )
+  now = int(time.time())
+  session = GatewaySession(
+    session_id="sess-batch-alias-token",
+    api_key_hash="hash",
+    created_at=now,
+    expires_at=now + 60,
+    user_id="henry",
+    owner_user_id="1",
+    risk_user_id=1,
+    kind="chat",
+    auth_config={
+      "provider": "anthropic",
+      "api_key": "user-secret",
+    },
+    session_token="caller-issued-jwt",
+    tenant_id="tenant-a",
+    session_credential_handle=handle,
+    channel="mcp",
+  )
+  _resolver, execution = batches._batch_capability_execution_context(
+    app_state=SimpleNamespace(gateway_config=_config()),
+    user_id="1",
+    authenticated_session=session,
+  )
+
+  parent = batches._batch_parent_session(
+    user_id="1",
+    user_email=None,
+    role=session.role,
+    tenant_id="tenant-a",
+    channel=session.channel,
+    authenticated_session=session,
+    session_driver_execution=execution,
+  )
+
+  assert parent is not session
+  assert parent.user_id == "1"
+  assert parent.session_token == "caller-issued-jwt"
+
+
+def test_sessionless_batch_parent_carries_no_session_token() -> None:
+  service_handle = CredentialHandle(
+    handle_id="service:batch:anthropic",
+    provider="anthropic",
+    principal="service",
+    tenant_id="tenant-a",
+    actor_id=None,
+  )
+  _resolver, execution = batches._batch_capability_execution_context(
+    app_state=SimpleNamespace(
+      gateway_config=_config(service_handle=service_handle)
+    ),
+    user_id="alice",
+    authenticated_session=None,
+  )
+
+  parent = batches._batch_parent_session(
+    user_id="alice",
+    user_email=None,
+    role="owner",
+    tenant_id="tenant-a",
+    channel=None,
+    authenticated_session=None,
+    session_driver_execution=execution,
+  )
+
+  assert parent.user_id == "alice"
+  assert parent.session_token is None
+
+
 def test_batch_parent_preserves_exact_authenticated_owner_session() -> None:
   handle = CredentialHandle(
     handle_id="user:alice:anthropic",
@@ -341,7 +428,7 @@ def test_authenticated_cross_provider_batch_preserves_session_selection() -> Non
       run_scoped_user_providers=frozenset({"openai"}),
     ),
     explicit_intent=ModelSelectionIntent(
-      model_key="openai.gpt-5-6",
+      model_key="openai.gpt-6-1-sol",
       effort="medium",
       source="explicit_user",
     ),
@@ -375,10 +462,84 @@ def test_authenticated_cross_provider_batch_preserves_session_selection() -> Non
     "openai"
   })
   assert execution.bind.provider == "openai"
-  assert execution.bind.model_key == "openai.gpt-5-6"
-  assert execution.bind.upstream_model == "gpt-5.6"
+  assert execution.bind.model_key == "openai.gpt-6-1-sol"
+  assert execution.bind.upstream_model == "gpt-6.1-sol"
   assert execution.bind.credential_principal == "user"
   assert execution.auth_config["api_key"] == "user-secret"
+
+
+class _DispatchRegistry:
+  def __init__(self) -> None:
+    self.status = "running"
+
+  def close(self) -> None:
+    return None
+
+  def lookup_batch_dispatch(self, **_kwargs: Any) -> None:
+    return None
+
+  def list_active_batches(self, _user_id: str) -> list[dict[str, Any]]:
+    return []
+
+  def get_batch_digest(self, _batch_id: int) -> dict[str, Any]:
+    return {
+      "batch_id": 17,
+      "user_id": "alice",
+      "status": self.status,
+      "cost_usd": 0.0,
+    }
+
+
+class _DispatchEventBus:
+  async def publish_terminal_if_absent(
+    self,
+    _user_id: str,
+    _control_run_id: str,
+    _event: dict[str, Any],
+  ) -> bool:
+    return True
+
+
+def _dispatch_app_state(
+  *,
+  tmp_path: Path,
+  registry: _DispatchRegistry,
+  controller: Any,
+  task_registry: batches.BatchTaskRegistry,
+  gateway_config: SimpleNamespace,
+) -> SimpleNamespace:
+  return SimpleNamespace(
+    batch_backend=batches.BatchBackend(
+      registry_for_user=lambda _user_id: registry,
+      controller=controller,
+      open_captured_run_context=controller.open_captured_run_context,
+      stage_admitter=lambda *_args: pytest.fail(
+        "capture-only dispatch controller must not admit stages"
+      ),
+      terminal_event_payload=lambda batch_id, digest: {
+        "type": "run_state_changed",
+        "run_id": f"batch_{batch_id}",
+        "control_run_id": f"batch_{batch_id}",
+        "batch_id": batch_id,
+        "user_id": digest["user_id"],
+        "state": digest["status"],
+      },
+      active_batch_error=RuntimeError,
+      dispatch_replay=batches.BatchDispatchReplayError,
+      dispatch_rejected=batches.BatchDispatchRejectedError,
+      dispatch_rejection_record=SimpleNamespace,
+    ),
+    gateway_config=gateway_config,
+    batch_task_registry=task_registry,
+    gateway_approval_store=None,
+    gateway_approval_policy=None,
+    user_event_bus=_DispatchEventBus(),
+    gateway_claim_signing_authority=GatewayClaimSigningAuthority(
+      "batch-capability-test-key-at-least-32-bytes"
+    ),
+    autonomous_storage_root=tmp_path,
+    gateway_skill_application=object(),
+  )
 
 
 def test_dispatch_threads_one_pre_materialized_execution_into_task(
@@ -397,6 +558,14 @@ def test_dispatch_threads_one_pre_materialized_execution_into_task(
     started = asyncio.Event()
     release = asyncio.Event()
     captured: dict[str, Any] = {}
+    build_parent_session = batches._batch_parent_session
+
+    def capture_parent_session(**kwargs: Any) -> GatewaySession:
+      session = build_parent_session(**kwargs)
+      captured["parent_session"] = session
+      return session
+
+    monkeypatch.setattr(batches, "_batch_parent_session", capture_parent_session)
 
     class _Controller:
       def acquire_batch_run(self, _payload: dict[str, Any], **_kwargs: Any):
@@ -416,74 +585,22 @@ def test_dispatch_threads_one_pre_materialized_execution_into_task(
       async def open_captured_run_context(
         self,
         **kwargs: Any,
-      ) -> object:
+      ) -> dict[str, Any]:
         captured["admission_kwargs"] = kwargs
-        return object()
+        return kwargs
 
-    class _Registry:
-      def __init__(self) -> None:
-        self.status = "running"
-
-      def close(self) -> None:
-        return None
-
-      def lookup_batch_dispatch(self, **_kwargs: Any) -> None:
-        return None
-
-      def list_active_batches(self, _user_id: str) -> list[dict[str, Any]]:
-        return []
-
-      def get_batch_digest(self, _batch_id: int) -> dict[str, Any]:
-        return {
-          "batch_id": 17,
-          "user_id": "alice",
-          "status": self.status,
-          "cost_usd": 0.0,
-        }
-
-    class _EventBus:
-      async def publish_terminal_if_absent(
-        self,
-        _user_id: str,
-        _control_run_id: str,
-        _event: dict[str, Any],
-      ) -> bool:
-        return True
-
-    registry = _Registry()
+    registry = _DispatchRegistry()
     controller = _Controller()
     task_registry = batches.BatchTaskRegistry()
-    app_state = SimpleNamespace(
-      batch_backend=batches.BatchBackend(
-        registry_for_user=lambda _user_id: registry,
-        controller=controller,
-        open_captured_run_context=controller.open_captured_run_context,
-        terminal_event_payload=lambda batch_id, digest: {
-          "type": "run_state_changed",
-          "run_id": f"batch_{batch_id}",
-          "control_run_id": f"batch_{batch_id}",
-          "batch_id": batch_id,
-          "user_id": digest["user_id"],
-          "state": digest["status"],
-        },
-        active_batch_error=RuntimeError,
-        dispatch_replay=batches.BatchDispatchReplayError,
-        dispatch_rejected=batches.BatchDispatchRejectedError,
-        dispatch_rejection_record=SimpleNamespace,
-      ),
+    app_state = _dispatch_app_state(
+      tmp_path=tmp_path,
+      registry=registry,
+      controller=controller,
+      task_registry=task_registry,
       gateway_config=_config(
         service_handle=service_handle,
         materialized_handles=materialized_handles,
       ),
-      batch_task_registry=task_registry,
-      gateway_approval_store=None,
-      gateway_approval_policy=None,
-      user_event_bus=_EventBus(),
-      gateway_claim_signing_authority=GatewayClaimSigningAuthority(
-        "batch-capability-test-key-at-least-32-bytes"
-      ),
-      autonomous_storage_root=tmp_path,
-      gateway_skill_application=object(),
     )
     monkeypatch.setattr(
       batches,
@@ -512,11 +629,40 @@ def test_dispatch_threads_one_pre_materialized_execution_into_task(
     assert execution.bind.registry_revision == resolver.registry.revision
     assert execution.bind.policy_revision == resolver.selection_policy.revision
     assert materialized_handles == [service_handle]
-    admission = await captured["captured_run_context_factory"](
+    parent = root_context(
+      captured["parent_session"],
+      withheld_tools=frozenset(),
+      research_file_id=None,
+    )
+    assert parent.tenant is not None
+    admitted = AdmittedContext(
+      wire=AdmittedContextWire(
+        tenant=parent.tenant,
+        research_binding=parent.research_binding,
+        capability_bind=execution.bind,
+        children=(),
+        tool_grant=(),
+        budget_share=None,
+        env_projection=(),
+        approval_route="no_approval_route",
+        handle_grants=(),
+        placement="in_process",
+        lineage=AdmittedLineage(
+          parent_job_id=parent.job_id,
+          depth=parent.depth + 1,
+        ),
+      ),
+      tool_authority=ResolvedAuthority(
+        operation_name="test-stage",
+        grant=ToolGrant(grant_id="test-stage-grant", digest="sha256:" + "0" * 64),
+      ),
+      approval_route=child_approval_route(parent.approval_route),
+    )
+    await captured["captured_run_context_factory"](
       task_id="agent-1",
       session_driver_execution=execution,
+      admitted=admitted,
     )
-    assert type(admission) is object
     admission_kwargs = captured["admission_kwargs"]
     service_session = admission_kwargs["parent_session"]
     assert type(service_session) is GatewaySession
@@ -538,6 +684,99 @@ def test_dispatch_threads_one_pre_materialized_execution_into_task(
     release.set()
     await task
     await asyncio.sleep(0)
+
+  asyncio.run(_run())
+
+
+def test_authenticated_dispatch_keeps_its_session_token_live_until_terminal(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  async def _run() -> None:
+    now = [1_000]
+    monkeypatch.setattr("agent_gateway.session.time.time", lambda: now[0])
+    started = asyncio.Event()
+    release = asyncio.Event()
+    registry = _DispatchRegistry()
+
+    class _Controller:
+      def acquire_batch_run(self, _payload: dict[str, Any], **_kwargs: Any):
+        return 17, "alice", None
+
+      async def run_acquired_batch(
+        self,
+        _batch_id: int,
+        _payload: dict[str, Any],
+        **_kwargs: Any,
+      ) -> None:
+        started.set()
+        await release.wait()
+        registry.status = "completed"
+
+      async def open_captured_run_context(self, **_kwargs: Any) -> object:
+        return object()
+
+    store = SessionStore(ttl=900)
+    auth = AuthManager(
+      secret="batch-liveness-test-secret-at-least-32-bytes",
+      valid_keys={"gateway-key"},
+      session_store=store,
+    )
+    session = store.create_session(
+      api_key_hash="hash",
+      user_id="alice",
+      kind="control",
+      auth_config={"provider": "anthropic", "api_key": "user-secret"},
+      tenant_id="tenant-a",
+      session_credential_handle=CredentialHandle(
+        handle_id="user:alice:anthropic",
+        provider="anthropic",
+        principal="user",
+        tenant_id="tenant-a",
+        actor_id="alice",
+      ),
+    )
+    token = auth.issue_token(session)
+    task_registry = batches.BatchTaskRegistry()
+    controller = _Controller()
+    app_state = _dispatch_app_state(
+      tmp_path=tmp_path,
+      registry=registry,
+      controller=controller,
+      task_registry=task_registry,
+      gateway_config=_config(),
+    )
+    monkeypatch.setattr(
+      batches,
+      "require_corpus_readiness",
+      lambda payload, **_kwargs: asyncio.sleep(
+        0,
+        result=(payload, None),
+      ),
+    )
+
+    await batches.dispatch_batch_in_process(
+      {"source": "quality_screen", "universe": ["MSFT"]},
+      app_state=app_state,
+      user_id="alice",
+      dispatch_key="batch-liveness-test",
+      authenticated_session=session,
+    )
+    await started.wait()
+    assert session.admitted_batches == {("alice", 17)}
+
+    # The batch's stages carry this token past the session's TTL.
+    now[0] = session.expires_at + 1
+    assert auth.verify_token(token) is session
+
+    release.set()
+    while task_registry.has_admitted_batch(owner_user_id="alice", batch_id=17):
+      await asyncio.sleep(0)
+    assert session.admitted_batches == set()
+    with pytest.raises(HTTPException) as exc_info:
+      auth.verify_token(token)
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "Session expired"
 
   asyncio.run(_run())
 

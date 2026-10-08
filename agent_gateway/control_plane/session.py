@@ -54,8 +54,6 @@ def _normalize_user_id(user_id: str | None) -> str | None:
   normalized = user_id.strip() if isinstance(user_id, str) else user_id
   if normalized == "":
     return None
-  if normalized == "_default":
-    raise MissingUserIdError("user_id '_default' is reserved; supply a stable end-user id.")
   return normalized
 
 

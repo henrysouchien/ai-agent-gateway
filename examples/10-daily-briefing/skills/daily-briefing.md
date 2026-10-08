@@ -3,7 +3,6 @@ name: daily-briefing
 agent_callable: true
 agent_description: Turn provided source notes into a concise daily briefing with actions and risks.
 persist_state: true
-max_turns: 4
 ---
 
 Create a compact daily briefing from the material provided by the parent agent.

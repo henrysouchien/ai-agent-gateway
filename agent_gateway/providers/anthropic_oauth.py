@@ -7,7 +7,7 @@ import hashlib
 import json
 import logging
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import secrets
 import stat
@@ -38,7 +38,7 @@ ANTHROPIC_OAUTH_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 # anthropic_helpers._OAUTH_BETA_SLUGS); the profile endpoint wants it too.
 ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20"
 ANTHROPIC_OAUTH_SOURCE = "anthropic-oauth-login"
-ANTHROPIC_OAUTH_STORE_VERSION = 2
+ANTHROPIC_OAUTH_STORE_VERSION = 3
 
 # Sibling setup tokens, one per Claude subscription account, as a JSON array of
 # strings. Same encoding as the other multi-valued credential env in this
@@ -85,6 +85,16 @@ ProfileGetter = Callable[[str, str], JSONMapping]
 class AnthropicOAuthError(RuntimeError):
   """A login, refresh, or store operation this product owns did not complete."""
 
+
+class AnthropicSourceError(AnthropicOAuthError):
+  """The exact credential generation is not currently authorized at its owner."""
+
+  code = "credential_unavailable"
+  next_call = "python3 -m agent_gateway.cli auth login anthropic"
+
+  def __init__(self, reason: str) -> None:
+    self.reason = reason
+    super().__init__(f"Anthropic source generation is {reason}; run `{self.next_call}`")
 
 def _anthropic_store_base(env: Mapping[str, str]) -> Path:
   """The root every Anthropic token store of this deployment lives under."""
@@ -143,23 +153,41 @@ def resolve_anthropic_auth_store_path(
 
 @dataclass(frozen=True)
 class AnthropicOAuthRecord:
-  """One enrolled Claude account: its own tokens, its own expiry, its own errors.
+  """Current material for one immutable source grant generation.
 
-  `identity` is the account the grant belongs to (email address, else account
-  id). It is the record's key: it survives refresh, so parking an account for a
-  usage window is not undone by that account's access token rotating.
+  `identity` remains the account-level parking key across OAuth refreshes.
+  Generation metadata is assigned by the store, not by a reader or consumer.
   """
 
   identity: str
-  access_token: str
-  refresh_token: str = ""
+  access_token: str = field(repr=False)
+  refresh_token: str = field(default="", repr=False)
   expires_at: float = 0.0
   created_at: float = 0.0
   updated_at: float = 0.0
   scope: str = ANTHROPIC_OAUTH_SCOPE
   source: str = ANTHROPIC_OAUTH_SOURCE
-  last_error: str = ""
+  last_error: str = field(default="", repr=False)
   last_error_at: float = 0.0
+  grant_hash: str = ""
+  generation_id: str = ""
+  credential_kind: str = "auth_token"
+
+  @property
+  def generation_ref(self) -> str:
+    return f"anthropic-generation-{self.generation_id}" if self.generation_id else ""
+
+  @property
+  def account_identity(self) -> str:
+    return self.identity
+
+  def source_metadata(self) -> dict[str, str]:
+    return {
+      "account_identity": self.identity,
+      "grant_hash": self.grant_hash,
+      "generation_id": self.generation_id,
+      "generation_ref": self.generation_ref,
+    }
 
   def needs_refresh(self, *, now: float | None = None) -> bool:
     if not self.refresh_token:
@@ -179,6 +207,9 @@ class AnthropicOAuthRecord:
       "source": self.source,
       "last_error": self.last_error,
       "last_error_at": self.last_error_at,
+      "grant_hash": self.grant_hash,
+      "generation_id": self.generation_id,
+      "credential_kind": self.credential_kind,
     }
 
   @classmethod
@@ -205,6 +236,9 @@ class AnthropicOAuthRecord:
       source=str(payload.get("source") or ANTHROPIC_OAUTH_SOURCE).strip(),
       last_error=str(payload.get("last_error") or "").strip(),
       last_error_at=_float_or_zero(payload.get("last_error_at")),
+      grant_hash=str(payload.get("grant_hash") or "").strip(),
+      generation_id=str(payload.get("generation_id") or "").strip(),
+      credential_kind=str(payload.get("credential_kind") or "auth_token").strip(),
     )
 
 
@@ -212,17 +246,36 @@ class AnthropicOAuthRecord:
 class AnthropicCredential:
   """A pool member: what to send, what to park, and who can refresh it.
 
-  `key` is what the process-wide block state is keyed by — an enrolled
-  account's identity, or the token itself for a credential supplied through the
-  environment, which has no identity and no refresh token. `store_path` is the
-  store the record was read from, so a refresh is written back to the store
-  that owns the account rather than to whichever store the pool started at.
+  `key` preserves the existing account/environment parking policy. `record`
+  carries the same generation that supplied `token`, including after refresh.
+  `store_path` locates its owner and is never encoded into a source reference.
   """
 
-  key: str
-  token: str
+  key: str = field(repr=False)
+  token: str = field(repr=False)
   record: AnthropicOAuthRecord | None = None
-  store_path: Path | None = None
+  store_path: Path | None = field(default=None, repr=False)
+
+  @property
+  def account_identity(self) -> str:
+    return self.record.account_identity if self.record is not None else ""
+
+  @property
+  def grant_hash(self) -> str:
+    return self.record.grant_hash if self.record is not None else ""
+
+  @property
+  def generation_id(self) -> str:
+    return self.record.generation_id if self.record is not None else ""
+
+  @property
+  def generation_ref(self) -> str:
+    return self.record.generation_ref if self.record is not None else ""
+
+  def source_metadata(self) -> dict[str, str]:
+    if self.record is None:
+      raise AnthropicSourceError("unregistered")
+    return self.record.source_metadata()
 
 
 @dataclass(frozen=True)
@@ -261,6 +314,12 @@ class AnthropicCredentialSources:
         return credential
     return None
 
+  def by_generation_ref(self, generation_ref: str) -> AnthropicCredential | None:
+    for credential in self.credentials:
+      if credential.generation_ref == generation_ref:
+        return credential
+    return None
+
 
 def _float_or_zero(value: Any) -> float:
   if isinstance(value, bool):
@@ -290,6 +349,7 @@ def _store_lock(path: Path) -> Iterator[None]:
   lock_path = path.with_name(f".{path.name}.lock")
   fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
   try:
+    os.fchmod(fd, 0o600)
     fcntl.flock(fd, fcntl.LOCK_EX)
     yield
   finally:
@@ -299,61 +359,106 @@ def _store_lock(path: Path) -> Iterator[None]:
       os.close(fd)
 
 
-def load_anthropic_oauth_store(path: Path) -> tuple[AnthropicOAuthRecord, ...]:
-  """Every enrolled account, in enrollment order.
+@dataclass
+class _AnthropicStore:
+  accounts: list[AnthropicOAuthRecord] = field(default_factory=list)
+  static_credentials: list[AnthropicOAuthRecord] = field(default_factory=list)
+  retired_auth_token_grants: dict[str, str] = field(default_factory=dict)
+  retirements: dict[str, str] = field(default_factory=dict)
 
-  A store written before this product had its own login holds a single
-  setup-token record; it is read as one account with no refresh token, so an
-  existing deployment keeps serving from it and nothing has to be re-imported.
-  """
 
-  try:
-    raw = path.read_text(encoding="utf-8")
-  except FileNotFoundError:
-    return ()
-  except OSError as exc:
-    raise AnthropicOAuthError(f"Unable to read Anthropic OAuth token store: {path}") from exc
-  try:
-    parsed = json.loads(raw)
-  except json.JSONDecodeError as exc:
-    raise AnthropicOAuthError(f"Invalid Anthropic OAuth token store JSON: {path}") from exc
-  if not isinstance(parsed, dict):
-    raise AnthropicOAuthError(f"Invalid Anthropic OAuth token store payload: {path}")
+def _grant_hash(record: AnthropicOAuthRecord) -> str:
+  # Only enrollment/migration hashes material. Rotating OAuth tokens never
+  # recompute the grant identity established by the original refresh grant.
+  material = record.refresh_token or record.access_token
+  return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
-  accounts = parsed.get("accounts")
-  if isinstance(accounts, list):
-    records = [AnthropicOAuthRecord.from_payload(entry) for entry in accounts if isinstance(entry, dict)]
-    return tuple(record for record in records if record is not None)
 
-  legacy_token = str(parsed.get("auth_token") or "").strip()
-  if not legacy_token:
-    return ()
-  return (
-    AnthropicOAuthRecord(
-      identity="legacy-setup-token",
-      access_token=legacy_token,
-      expires_at=_float_or_zero(parsed.get("expires_at")),
-      created_at=_float_or_zero(parsed.get("created_at")),
-      scope="",
-      source=str(parsed.get("source") or "claude-setup-token").strip(),
-    ),
+def _new_generation(record: AnthropicOAuthRecord) -> AnthropicOAuthRecord:
+  return replace(
+    record,
+    grant_hash=_grant_hash(record),
+    generation_id=secrets.token_hex(32),
   )
 
 
-def save_anthropic_oauth_store(path: Path, records: Sequence[AnthropicOAuthRecord]) -> None:
-  """Replace the store atomically at mode 0600, preserving enrollment order."""
+def _retire_generation(store: _AnthropicStore, record: AnthropicOAuthRecord, reason: str) -> None:
+  if record.credential_kind == "auth_token" and record in store.static_credentials:
+    store.retired_auth_token_grants[record.grant_hash] = record.generation_id
+  store.retirements[record.generation_id] = reason
 
+
+def _load_store_unlocked(path: Path, *, migrate: bool = True) -> _AnthropicStore:
+  try:
+    parsed = json.loads(path.read_text(encoding="utf-8"))
+  except FileNotFoundError:
+    return _AnthropicStore()
+  except OSError as exc:
+    raise AnthropicOAuthError("Unable to read Anthropic credential store") from exc
+  except json.JSONDecodeError:
+    raise AnthropicOAuthError("Invalid Anthropic credential store JSON") from None
+  if not isinstance(parsed, dict):
+    raise AnthropicOAuthError("Invalid Anthropic credential store payload")
+
+  store = _AnthropicStore()
+  retired_grants = parsed.get("retired_auth_token_grants")
+  if isinstance(retired_grants, dict):
+    store.retired_auth_token_grants = dict(retired_grants)
+  retirements = parsed.get("retirements")
+  if isinstance(retirements, dict):
+    store.retirements = dict(retirements)
+  for name, records in (("accounts", store.accounts), ("static_credentials", store.static_credentials)):
+    entries = parsed.get(name)
+    if isinstance(entries, list):
+      for entry in entries:
+        record = AnthropicOAuthRecord.from_payload(entry) if isinstance(entry, dict) else None
+        if record is not None:
+          records.append(record)
+  if not isinstance(parsed.get("accounts"), list):
+    legacy_token = str(parsed.get("auth_token") or "").strip()
+    if legacy_token:
+      store.accounts.append(AnthropicOAuthRecord(
+        identity="legacy-setup-token",
+        access_token=legacy_token,
+        expires_at=_float_or_zero(parsed.get("expires_at")),
+        created_at=_float_or_zero(parsed.get("created_at")),
+        scope="",
+        source=str(parsed.get("source") or "claude-setup-token").strip(),
+      ))
+  migrated = False
+  if migrate:
+    for records in (store.accounts, store.static_credentials):
+      for index, record in enumerate(records):
+        if not record.generation_id or not record.grant_hash:
+          records[index] = _new_generation(record)
+          migrated = True
+    if migrated:
+      _write_store_unlocked(path, store)
+  return store
+
+
+def load_anthropic_oauth_store(path: Path) -> tuple[AnthropicOAuthRecord, ...]:
+  """Active pool accounts in enrollment order; migrate legacy/v2 once under lock."""
+
+  with _store_lock(path):
+    return tuple(_load_store_unlocked(path).accounts)
+
+
+def _write_store_unlocked(path: Path, store: _AnthropicStore) -> None:
   payload = {
     "version": ANTHROPIC_OAUTH_STORE_VERSION,
-    "accounts": [record.to_payload() for record in records],
+    "accounts": [record.to_payload() for record in store.accounts],
+    "static_credentials": [record.to_payload() for record in store.static_credentials],
+    "retired_auth_token_grants": store.retired_auth_token_grants,
+    "retirements": store.retirements,
   }
   path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
   try:
     path.parent.chmod(0o700)
   except OSError:
     pass
-  temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-  fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+  temp_path = path.with_name(f".{path.name}.{secrets.token_hex(12)}.tmp")
+  fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
   try:
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
       json.dump(payload, handle, indent=2, sort_keys=True)
@@ -363,6 +468,11 @@ def save_anthropic_oauth_store(path: Path, records: Sequence[AnthropicOAuthRecor
     os.chmod(temp_path, 0o600)
     os.replace(temp_path, path)
     os.chmod(path, 0o600)
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+      os.fsync(directory_fd)
+    finally:
+      os.close(directory_fd)
   finally:
     try:
       temp_path.unlink()
@@ -370,39 +480,66 @@ def save_anthropic_oauth_store(path: Path, records: Sequence[AnthropicOAuthRecor
       pass
 
 
+def _enroll_record(
+  store: _AnthropicStore,
+  record: AnthropicOAuthRecord,
+) -> AnthropicOAuthRecord:
+  if not record.identity or not record.access_token:
+    raise AnthropicOAuthError("Anthropic credential requires an identity and material")
+  records = store.static_credentials if record.credential_kind == "api_key" else store.accounts
+  for index, current in enumerate(records):
+    if current.identity == record.identity:
+      if not record.refresh_token and current.grant_hash == _grant_hash(record):
+        return current
+      enrolled = _new_generation(record)
+      _retire_generation(store, current, "superseded")
+      records[index] = enrolled
+      return enrolled
+  enrolled = _new_generation(record)
+  records.append(enrolled)
+  return enrolled
+
+
+def _current_generation(store: _AnthropicStore, generation_id: str) -> AnthropicOAuthRecord:
+  for record in (*store.accounts, *store.static_credentials):
+    if record.generation_id == generation_id:
+      return record
+  raise AnthropicSourceError(store.retirements.get(generation_id, "missing"))
+
+
 def upsert_anthropic_oauth_record(
   path: Path,
   record: AnthropicOAuthRecord,
 ) -> tuple[AnthropicOAuthRecord, ...]:
-  """Write one account, keyed by identity, without disturbing its siblings.
+  """Enroll a grant, superseding same-account consent in its original pool slot.
 
-  The read happens under the same lock as the write: a refresh landing while
-  another account is being enrolled must not drop either one.
+  This is not a refresh update. Refresh owns its exact generation separately.
+  Reobserving the same non-refreshing setup token retains its generation.
   """
 
-  if not record.identity or not record.access_token:
-    raise AnthropicOAuthError("Anthropic OAuth record requires an identity and an access token")
   with _store_lock(path):
-    existing = list(load_anthropic_oauth_store(path))
-    for index, current in enumerate(existing):
-      if current.identity == record.identity:
-        existing[index] = record
-        break
-    else:
-      existing.append(record)
-    save_anthropic_oauth_store(path, existing)
-    return tuple(existing)
+    store = _load_store_unlocked(path)
+    _enroll_record(store, record)
+    _write_store_unlocked(path, store)
+    return tuple(store.accounts)
 
 
 def remove_anthropic_oauth_record(path: Path, identity: str) -> bool:
+  """Retire the account's current material, retaining secret-free source history."""
+
   normalized = str(identity or "").strip()
   with _store_lock(path):
-    existing = list(load_anthropic_oauth_store(path))
-    remaining = [record for record in existing if record.identity != normalized]
-    if len(remaining) == len(existing):
-      return False
-    save_anthropic_oauth_store(path, remaining)
-    return True
+    store = _load_store_unlocked(path)
+    removed = False
+    for records in (store.accounts, store.static_credentials):
+      for record in tuple(records):
+        if record.identity == normalized:
+          _retire_generation(store, record, "removed")
+          records.remove(record)
+          removed = True
+    if removed:
+      _write_store_unlocked(path, store)
+    return removed
 
 
 def _pool_tokens(raw: str) -> tuple[str, ...]:
@@ -466,6 +603,134 @@ ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES = frozenset(
 )
 
 
+def _register_static_unlocked(
+  store: _AnthropicStore,
+  material: str,
+  *,
+  credential_kind: str,
+  source: str,
+) -> AnthropicOAuthRecord | None:
+  current = next((
+    record for record in store.static_credentials
+    if record.credential_kind == credential_kind and record.source == source
+  ), None)
+  if not material:
+    if current is not None:
+      _retire_generation(store, current, "removed")
+      store.static_credentials.remove(current)
+    return None
+  digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+  if current is not None and current.grant_hash == digest:
+    return current
+  # Opaque credentials have no remote account identity. This source-local
+  # display identity follows setup_token_account_identity; the FULL hash and
+  # random generation id, not this truncated label, identify the source grant.
+  identity = f"api-key-{digest[:16]}" if credential_kind == "api_key" else setup_token_account_identity(material)
+  moment = time.time()
+  enrolled = _new_generation(AnthropicOAuthRecord(
+    identity=identity,
+    access_token=material,
+    created_at=moment,
+    updated_at=moment,
+    scope="" if credential_kind == "api_key" else "user:inference",
+    source=source,
+    credential_kind=credential_kind,
+  ))
+  if current is not None:
+    index = store.static_credentials.index(current)
+    _retire_generation(store, current, "superseded")
+    store.static_credentials[index] = enrolled
+  else:
+    store.static_credentials.append(enrolled)
+  return enrolled
+
+
+def register_anthropic_static_credential(
+  material: str,
+  *,
+  credential_kind: str = "api_key",
+  source: str = "env:ANTHROPIC_API_KEY",
+  config: Mapping[str, Any] | None = None,
+  environ: Mapping[str, str] | None = None,
+  user_scope: Any = None,
+) -> AnthropicCredential | None:
+  """Register the effective opaque key/token in this existing source store.
+
+  Source slots identify custody, not remote accounts: environment slots belong
+  to the org; request slots belong to the authenticated user's store. Same
+  source/material retains its generation, replacement retires it, and empty
+  material removes it. API keys never enter the OAuth pool projection.
+  """
+
+  path = resolve_anthropic_auth_store_path(
+    config, environ=environ, user_scope="" if source.startswith("env:") else user_scope,
+  )
+  normalized = str(material or "").strip()
+  with _store_lock(path):
+    store = _load_store_unlocked(path)
+    before = tuple(record.generation_id for record in store.static_credentials)
+    record = _register_static_unlocked(
+      store, normalized, credential_kind=credential_kind, source=source,
+    )
+    if before != tuple(current.generation_id for current in store.static_credentials):
+      _write_store_unlocked(path, store)
+    if record is None:
+      return None
+    return AnthropicCredential(
+      key=record.identity, token=record.access_token, record=record, store_path=path,
+    )
+
+
+def _environment_source_material(source: str, env: Mapping[str, str]) -> tuple[str, ...] | None:
+  """Visible source material, or None when this process cannot observe the source."""
+
+  name = source.removeprefix("env:").split(":", 1)[0]
+  if name not in env:
+    return None
+  if name == "ANTHROPIC_API_KEY":
+    return _single_token(env[name])
+  for env_name, read_form in _ENV_POOL_FORMS:
+    if name == env_name:
+      return read_form(env[name])
+  return ()
+
+
+def _sync_environment_tokens(
+  path: Path,
+  env: Mapping[str, str],
+  enrolled_tokens: Mapping[str, tuple[Path, AnthropicOAuthRecord]],
+) -> dict[tuple[str, str], AnthropicOAuthRecord]:
+  """Reconcile observed org-env members; an absent name has no retirement authority."""
+
+  selected: dict[tuple[str, str], AnthropicOAuthRecord] = {}
+  with _store_lock(path):
+    store = _load_store_unlocked(path)
+    before = tuple(record.generation_id for record in store.static_credentials)
+    desired: set[str] = set()
+    for name, read_form in _ENV_POOL_FORMS:
+      for token in read_form(env.get(name, "")):
+        if token in enrolled_tokens:
+          continue
+        source = f"env:{name}"
+        if name == ANTHROPIC_AUTH_TOKENS_ENV:
+          source += f":{hashlib.sha256(token.encode('utf-8')).hexdigest()}"
+        desired.add(source)
+        record = _register_static_unlocked(
+          store, token, credential_kind="auth_token", source=source,
+        )
+        if record is not None:
+          selected[(name, token)] = record
+    pool_sources = tuple(f"env:{name}" for name, _read in _ENV_POOL_FORMS if name in env)
+    for record in tuple(store.static_credentials):
+      if any(record.source == prefix or record.source.startswith(prefix + ":") for prefix in pool_sources):
+        if record.source not in desired:
+          _retire_generation(store, record, "removed")
+          store.static_credentials.remove(record)
+    if before != tuple(record.generation_id for record in store.static_credentials):
+      _write_store_unlocked(path, store)
+  return selected
+
+
 def resolve_anthropic_credentials(
   config: Mapping[str, Any] | None = None,
   *,
@@ -503,6 +768,10 @@ def resolve_anthropic_credentials(
     for path, records in reversed(stores)
     for record in records
   }
+  env_records = _sync_environment_tokens(
+    org_path, env,
+    {record.access_token: (org_path, record) for record in stores[-1][1]},
+  )
 
   credentials: list[AnthropicCredential] = []
   seen_keys: set[str] = set()
@@ -513,10 +782,44 @@ def resolve_anthropic_credentials(
     seen_keys.add(credential.key)
     credentials.append(credential)
 
-  def _append_token(token: str) -> None:
+  def _append_token(token: str, *, name: str = "") -> None:
     stored = by_access_token.get(token)
     if stored is None:
-      _append(AnthropicCredential(key=token, token=token))
+      if name:
+        record = env_records[(name, token)]
+        credential = AnthropicCredential(
+          key=token, token=record.access_token, record=record, store_path=org_path,
+        )
+      else:
+        # Re-entry of an already owned static source preserves its provenance.
+        # Full static hashes also identify retired material without retaining
+        # old secrets; that is not consent to resurrect it as a request source.
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        for path in store_paths:
+          with _store_lock(path):
+            store = _load_store_unlocked(path)
+            current = next((
+              record for record in store.static_credentials
+              if record.credential_kind == "auth_token" and record.access_token == token
+            ), None)
+            retired_id = store.retired_auth_token_grants.get(digest, "")
+            known_ref = current.generation_ref if current is not None else (
+              f"anthropic-generation-{retired_id}" if retired_id else ""
+            )
+          if known_ref:
+            credential = _resolve_generation(
+              known_ref, environ=env, user_scope=scope, store_paths=store_paths,
+            )
+            _append(credential)
+            return
+        credential = register_anthropic_static_credential(
+          token, credential_kind="auth_token", source="request:anthropic:auth_token",
+          config=cfg, environ=env, user_scope=scope,
+        )
+        if credential is None:
+          return
+        credential = replace(credential, key=token)
+      _append(credential)
       return
     path, record = stored
     _append(AnthropicCredential(
@@ -536,13 +839,23 @@ def resolve_anthropic_credentials(
       ))
 
   bound = str(cfg.get("auth_token") or "").strip()
-  if bound:
+  bound_source = cfg.get("credential_source") if cfg.get("auth_mode") != "api" else None
+  if isinstance(bound_source, Mapping):
+    credential = _resolve_generation(
+      str(bound_source.get("generation_ref") or ""),
+      environ=env, user_scope=scope, store_paths=store_paths,
+    )
+    if credential.record is not None and credential.record.credential_kind != "auth_token":
+      # OAuth bearer pool membership never admits API billing credentials.
+      raise AnthropicSourceError("incompatible_source")
+    _append(credential)
+  elif bound:
     _append_token(bound)
   for path, records in stores[:-1]:
     _append_records(path, records)
   for name, read_form in _ENV_POOL_FORMS:
     for token in read_form(env.get(name, "")):
-      _append_token(token)
+      _append_token(token, name=name)
   _append_records(*stores[-1])
 
   return AnthropicCredentialSources(
@@ -551,6 +864,43 @@ def resolve_anthropic_credentials(
     user_scope=scope,
     user_store_path=user_path,
   )
+
+
+def _resolve_generation(
+  generation_ref: str,
+  *,
+  environ: Mapping[str, str] | None,
+  user_scope: Any,
+  store_paths: Sequence[Path] | None = None,
+) -> AnthropicCredential:
+  scope = anthropic_user_scope(user_scope)
+  org_path = resolve_anthropic_auth_store_path(environ=environ, user_scope="")
+  paths = store_paths if store_paths is not None else (
+    (resolve_anthropic_auth_store_path(environ=environ, user_scope=scope), org_path)
+    if scope else (org_path,)
+  )
+  generation_id = generation_ref.removeprefix("anthropic-generation-")
+  for path in paths:
+    with _store_lock(path):
+      store = _load_store_unlocked(path, migrate=False)
+      try:
+        record = _current_generation(store, generation_id)
+      except AnthropicSourceError as exc:
+        if exc.reason != "missing":
+          raise
+        continue
+      if record.source.startswith("env:"):
+        env = os.environ if environ is None else environ
+        available = _environment_source_material(record.source, env)
+        if available is None:
+          raise AnthropicSourceError("unobservable")
+        if record.access_token not in available:
+          raise AnthropicSourceError("superseded" if available else "removed")
+      key = record.identity if record in store.accounts else record.access_token
+      return AnthropicCredential(
+        key=key, token=record.access_token, record=record, store_path=path,
+      )
+  raise AnthropicSourceError("missing")
 
 
 class AnthropicCredentialPool:
@@ -602,12 +952,11 @@ def _post_token_endpoint(url: str, body: JSONMapping) -> JSONMapping:
       headers={"Content-Type": "application/json", "Accept": "application/json"},
       timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, connect=HTTP_CONNECT_TIMEOUT_SECONDS),
     )
-  except httpx.HTTPError as exc:
-    raise AnthropicOAuthError(f"Anthropic OAuth token request failed: {exc}") from exc
+  except httpx.HTTPError:
+    raise AnthropicOAuthError("Anthropic OAuth token request failed") from None
   if response.status_code >= 400:
-    detail = str(response.text or "").strip()[:200]
     raise AnthropicOAuthError(
-      f"Anthropic OAuth token request failed ({response.status_code}): {detail}"
+      f"Anthropic OAuth token request failed ({response.status_code})"
     )
   try:
     payload = response.json()
@@ -631,12 +980,11 @@ def _get_profile_endpoint(url: str, access_token: str) -> JSONMapping:
       },
       timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, connect=HTTP_CONNECT_TIMEOUT_SECONDS),
     )
-  except httpx.HTTPError as exc:
-    raise AnthropicOAuthError(f"Anthropic OAuth profile request failed: {exc}") from exc
+  except httpx.HTTPError:
+    raise AnthropicOAuthError("Anthropic OAuth profile request failed") from None
   if response.status_code >= 400:
-    detail = str(response.text or "").strip()[:200]
     raise AnthropicOAuthError(
-      f"Anthropic OAuth profile request failed ({response.status_code}): {detail}"
+      f"Anthropic OAuth profile request failed ({response.status_code})"
     )
   try:
     payload = response.json()
@@ -683,21 +1031,32 @@ def refresh_anthropic_oauth_record(
   now: float | None = None,
   post: TokenPoster | None = None,
 ) -> AnthropicOAuthRecord:
-  """Exchange this account's refresh token, persisting the rotated one.
+  """Refresh the exact current grant under its owner's cross-process lock.
 
-  Anthropic rotates the refresh token on use, so the new one is written before
-  this function returns: an interrupted caller must not leave the store holding
-  a grant the server has already retired. A failed refresh is recorded on the
-  account and re-raised; the record is never deleted, because the operator's
-  remedy is one `auth login anthropic` for that account, not a vanished row.
+  Reloading before the exchange prevents reuse of a rotating refresh token.
+  Consent/removal and the entire refresh exchange+save share the same lock.
+  Captured material from a retired generation can never overwrite its successor.
   """
 
-  if not record.refresh_token:
-    raise AnthropicOAuthError(
-      f"Anthropic account {record.identity} has no refresh token; run "
-      "`python3 -m agent_gateway.cli auth login anthropic` for it"
-    )
   moment = time.time() if now is None else now
+  with _store_lock(store_path):
+    store = _load_store_unlocked(store_path)
+    current = _current_generation(store, record.generation_id)
+    if current.access_token != record.access_token or current.refresh_token != record.refresh_token:
+      return current
+    return _refresh_record_unlocked(store_path, store, current, moment=moment, post=post)
+
+
+def _refresh_record_unlocked(
+  path: Path,
+  store: _AnthropicStore,
+  record: AnthropicOAuthRecord,
+  *,
+  moment: float,
+  post: TokenPoster | None = None,
+) -> AnthropicOAuthRecord:
+  if not record.needs_refresh(now=moment):
+    return record
   poster = post or _post_token_endpoint
   try:
     payload = poster(
@@ -709,15 +1068,14 @@ def refresh_anthropic_oauth_record(
       },
     )
     access_token, refresh_token, expires_in, scope = _token_payload_fields(payload)
-  except AnthropicOAuthError as exc:
-    failed = replace(record, last_error=str(exc)[:300], last_error_at=moment)
-    upsert_anthropic_oauth_record(store_path, failed)
-    raise
+  except AnthropicOAuthError:
+    failed = replace(record, last_error="Anthropic OAuth refresh failed", last_error_at=moment)
+    store.accounts[store.accounts.index(record)] = failed
+    _write_store_unlocked(path, store)
+    raise AnthropicOAuthError("Anthropic OAuth refresh failed") from None
   refreshed = replace(
     record,
     access_token=access_token,
-    # An OAuth server that omits refresh_token leaves the presented one valid;
-    # Anthropic sends a new one, and that is the one that must land on disk.
     refresh_token=refresh_token or record.refresh_token,
     expires_at=moment + expires_in if expires_in else moment,
     updated_at=moment,
@@ -725,7 +1083,8 @@ def refresh_anthropic_oauth_record(
     last_error="",
     last_error_at=0.0,
   )
-  upsert_anthropic_oauth_record(store_path, refreshed)
+  store.accounts[store.accounts.index(record)] = refreshed
+  _write_store_unlocked(path, store)
   LOGGER.info(
     "Refreshed Anthropic OAuth access token for %s (expires in %.0fs)",
     refreshed.identity,
@@ -734,48 +1093,56 @@ def refresh_anthropic_oauth_record(
   return refreshed
 
 
-def _usable_token(
-  sources: AnthropicCredentialSources,
+def _current_credential(
+  credential: AnthropicCredential,
+  *,
+  refresh: bool,
+  now: float | None = None,
+  post: TokenPoster | None = None,
+) -> AnthropicCredential:
+  if credential.record is None or credential.store_path is None:
+    raise AnthropicSourceError("unregistered")
+  path = credential.store_path
+  with _store_lock(path):
+    store = _load_store_unlocked(path)
+    record = _current_generation(store, credential.generation_id)
+    if refresh:
+      record = _refresh_record_unlocked(
+        path, store, record, moment=time.time() if now is None else now, post=post,
+      )
+    return replace(credential, token=record.access_token, record=record)
+
+
+def _usable_credential(
   candidates: Sequence[AnthropicCredential],
   *,
   pool: AnthropicCredentialPool,
   now: float | None = None,
-) -> str:
-  """The first candidate that is neither parked nor stale, refreshing as needed."""
+) -> AnthropicCredential | None:
+  """The first unparked source, with material and metadata from the same generation."""
 
   moment = time.time() if now is None else now
   for credential in candidates:
     if pool.blocked_until(credential.key) > moment:
       continue
-    record = credential.record
-    store_path = credential.store_path
-    if record is None or store_path is None or not record.needs_refresh(now=moment):
-      return credential.token
     try:
-      refreshed = refresh_anthropic_oauth_record(
-        record,
-        store_path=store_path,
-        now=moment,
-      )
+      return _current_credential(credential, refresh=True, now=moment)
     except AnthropicOAuthError as exc:
-      # Same mechanism as a usage limit: park this account and let the next
-      # sibling serve. The next attempt retries the refresh.
+      # Keep the existing account-level refresh-failure parking policy.
       pool.block(credential.key, until=moment + REFRESH_FAILURE_BLOCK_SECONDS)
       LOGGER.warning(
         "Anthropic OAuth refresh failed for %s; parking it for %.0fs: %s",
-        credential.key,
+        credential.account_identity,
         REFRESH_FAILURE_BLOCK_SECONDS,
         exc,
       )
-      continue
-    return refreshed.access_token
-  return ""
+  return None
 
 
 def _log_pool_summary(sources: AnthropicCredentialSources) -> None:
   summary = ", ".join(
-    f"{credential.key if credential.record is not None else 'env'}"
-    f"={mask_anthropic_token(credential.token)}"
+    f"{credential.account_identity}"
+    f" generation={credential.generation_id}"
     for credential in sources.credentials
   )
   if _LOGGED_POOL_SUMMARIES.get(sources.user_scope) == summary:
@@ -791,12 +1158,12 @@ def _log_pool_summary(sources: AnthropicCredentialSources) -> None:
   )
 
 
-def select_anthropic_credential(
+def select_anthropic_credential_source(
   sources: AnthropicCredentialSources,
   *,
   pool: AnthropicCredentialPool | None = None,
   now: float | None = None,
-) -> str:
+) -> AnthropicCredential | None:
   """Bind a credential: the first usable one, else the first at all.
 
   A pool of one is never withheld from a run — an expired or unrefreshable
@@ -806,19 +1173,20 @@ def select_anthropic_credential(
 
   selected_pool = ANTHROPIC_CREDENTIAL_POOL if pool is None else pool
   _log_pool_summary(sources)
-  return _usable_token(sources, sources.credentials, pool=selected_pool, now=now) or (
-    sources.credentials[0].token if sources.credentials else ""
-  )
+  selected = _usable_credential(sources.credentials, pool=selected_pool, now=now)
+  if selected is not None:
+    return selected
+  return _current_credential(sources.credentials[0], refresh=False) if sources.credentials else None
 
 
-def rotate_anthropic_credential(
+def rotate_anthropic_credential_source(
   sources: AnthropicCredentialSources,
   *,
   current: str,
   until: float,
   pool: AnthropicCredentialPool | None = None,
   now: float | None = None,
-) -> str:
+) -> AnthropicCredential | None:
   """Park the current credential until `until` and hand back the next sibling.
 
   Unlike binding there is no fallback here: handing back a credential a limiter
@@ -834,7 +1202,33 @@ def rotate_anthropic_credential(
   siblings = [
     credential for credential in sources.credentials if credential.key != current_key
   ]
-  return _usable_token(sources, siblings, pool=selected_pool, now=now)
+  return _usable_credential(siblings, pool=selected_pool, now=now)
+
+
+def select_anthropic_credential(
+  sources: AnthropicCredentialSources,
+  *,
+  pool: AnthropicCredentialPool | None = None,
+  now: float | None = None,
+) -> str:
+  """Token boundary retained while Risk and Investment migrate to source objects."""
+  selected = select_anthropic_credential_source(sources, pool=pool, now=now)
+  return selected.token if selected is not None else ""
+
+
+def rotate_anthropic_credential(
+  sources: AnthropicCredentialSources,
+  *,
+  current: str,
+  until: float,
+  pool: AnthropicCredentialPool | None = None,
+  now: float | None = None,
+) -> str:
+  """Token boundary retained while Risk migrates its rotation consumer."""
+  selected = rotate_anthropic_credential_source(
+    sources, current=current, until=until, pool=pool, now=now,
+  )
+  return selected.token if selected is not None else ""
 
 
 def ensure_fresh_anthropic_credential(
@@ -846,34 +1240,42 @@ def ensure_fresh_anthropic_credential(
 ) -> str:
   """The access token to send for `token`, refreshed first when it is stale.
 
-  A credential supplied through the environment has no refresh token and is
-  returned untouched, with no store read beyond the one the resolver already
-  does. An enrolled account whose access token expired refreshes here, at the
-  boundary where the credential is about to be bound to a client.
+  A non-refreshing setup/environment source is sent as-is. Supplied source
+  metadata resolves its exact original generation even if `token` predates
+  a refresh; it never falls back to the pool's current access-token match.
+  Owned OAuth grants refresh at this credential-to-client boundary.
   """
 
   normalized = str(token or "").strip()
-  if not normalized:
+  bound_source = (config or {}).get("credential_source")
+  if not normalized and not isinstance(bound_source, Mapping):
     return ""
   sources = resolve_anthropic_credentials(config, environ=environ)
-  credential = sources.by_token(normalized)
+  if isinstance(bound_source, Mapping):
+    credential = sources.by_generation_ref(str(bound_source.get("generation_ref") or ""))
+    if credential is None:
+      raise AnthropicSourceError("missing")
+  else:
+    credential = sources.by_token(normalized)
   if credential is None or credential.record is None or credential.store_path is None:
     return normalized
   record = credential.record
   if not record.needs_refresh(now=now):
-    return normalized
+    return credential.token
   try:
     return refresh_anthropic_oauth_record(
       record,
       store_path=credential.store_path,
       now=now,
     ).access_token
+  except AnthropicSourceError:
+    raise
   except AnthropicOAuthError as exc:
     # The bound credential is still handed to the request: the provider's 401
     # is what rotates the run to a sibling, and withholding it here would end
     # the turn with no request made at all.
     LOGGER.warning("Anthropic OAuth refresh failed for %s: %s", record.identity, exc)
-    return normalized
+    return credential.token
 
 
 @dataclass(frozen=True)
@@ -992,8 +1394,8 @@ def complete_anthropic_login(
     scope=scope,
     source=ANTHROPIC_OAUTH_SOURCE,
   )
-  upsert_anthropic_oauth_record(store_path, record)
-  return record
+  enrolled = upsert_anthropic_oauth_record(store_path, record)
+  return next(current for current in enrolled if current.identity == identity)
 
 
 def setup_token_account_identity(token: str) -> str:
@@ -1038,8 +1440,8 @@ def enroll_anthropic_setup_token(
     scope="user:inference",
     source="claude-setup-token",
   )
-  upsert_anthropic_oauth_record(store_path, record)
-  return record
+  enrolled = upsert_anthropic_oauth_record(store_path, record)
+  return next(current for current in enrolled if current.identity == record.identity)
 
 
 
@@ -1070,6 +1472,7 @@ __all__ = [
   "AnthropicLoginRequest",
   "AnthropicOAuthError",
   "AnthropicOAuthRecord",
+  "AnthropicSourceError",
   "REFRESH_FAILURE_BLOCK_SECONDS",
   "REFRESH_MARGIN_SECONDS",
   "UNDECLARED_LIMIT_BLOCK_SECONDS",
@@ -1083,12 +1486,14 @@ __all__ = [
   "mask_anthropic_token",
   "parse_anthropic_callback",
   "refresh_anthropic_oauth_record",
+  "register_anthropic_static_credential",
   "remove_anthropic_oauth_record",
   "resolve_anthropic_auth_store_path",
   "resolve_anthropic_credentials",
   "rotate_anthropic_credential",
-  "save_anthropic_oauth_store",
+  "rotate_anthropic_credential_source",
   "select_anthropic_credential",
+  "select_anthropic_credential_source",
   "setup_token_account_identity",
   "start_anthropic_login",
   "upsert_anthropic_oauth_record",

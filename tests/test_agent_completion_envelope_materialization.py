@@ -26,7 +26,12 @@ from agent_gateway.events import AgentCompletionEvent, event_from_dict, event_to
 from agent_gateway.event_log import EventLog
 from agent_gateway.runner import AgentRunner
 from agent_gateway.final_narrative_artifact import publish_final_narrative
-from agent_gateway.sub_agent_result_contract import terminal_narrative_content_handle
+from agent_gateway.sub_agent_result_contract import (
+  TERMINAL_TOOL_RESULT_RETURN_CONTRACT,
+  canonical_projection,
+  report_contract_ref,
+  terminal_narrative_content_handle,
+)
 from agent_gateway.runner_background_tasks import (
   DEFAULT_PARENT_RESULT_MAX_INLINE_BYTES,
   ParentResultMaterializationError,
@@ -769,8 +774,10 @@ def test_envelope_omits_child_evidence_when_the_child_observed_nothing() -> None
   )
 
   assert envelope.child_evidence is None
+  assert envelope.stage_refs == {}
   payload = envelope.model_dump(mode="json")
   assert "child_evidence" not in payload
+  assert "stage_refs" not in payload
   assert "terminal_reason" not in payload["settlement_projection"]
   # A historical row that never carried the field still validates and still
   # dumps to exactly the bytes it was recorded with, so the durable event's
@@ -820,6 +827,71 @@ def test_envelope_carries_the_child_evidence_projection_when_the_child_read() ->
 def test_child_evidence_projection_must_record_an_observation() -> None:
   with pytest.raises(ValidationError, match="must record an observation"):
     ChildEvidenceProjection()
+
+
+def _terminal_door_result(door_result: dict[str, JsonValue]) -> TaskResult:
+  payload = _task_result("placeholder").model_dump(mode="json")
+  payload["values"] = {
+    "terminal_narrative": None,
+    "projection": canonical_projection(
+      contract=report_contract_ref(TERMINAL_TOOL_RESULT_RETURN_CONTRACT),
+      value={"tool_name": "fms_propose_critical_factors", "result": door_result},
+    ).model_dump(mode="json"),
+    "artifacts": [],
+  }
+  return TaskResult.model_validate(payload)
+
+
+_CF_REF = {"skill": "critical-factors", "artifact_id": "cf-1", "content_sha256": "c" * 64}
+
+
+@pytest.mark.parametrize(
+  ("preview_bytes", "kind"),
+  [(0, "projection_inline"), (DEFAULT_PARENT_RESULT_MAX_INLINE_BYTES, "result_handle")],
+)
+def test_envelope_carries_the_terminal_doors_refs_in_every_arm(
+  preview_bytes: int,
+  kind: str,
+) -> None:
+  # The critical-factors door answers ~365 KB; its child overflowed to a handle
+  # 4 of 4, and the parent's next named child found no critical_factors_ref.
+  result = _terminal_door_result({
+    "status": "staged",
+    "readback": {**_CF_REF, "contract_name": "CriticalFactors", "ticker": "PCTY"},
+    "preview": "x" * preview_bytes,
+  })
+
+  envelope = build_agent_completion_envelope(
+    result,
+    policy=ordinary_parent_result_policy(result),
+    terminal_narrative_reader=lambda _result: "must not be read",
+    read_grant_factory=_read_grant,
+  )
+
+  assert envelope.parent_materialization is not None
+  assert envelope.parent_materialization.kind == kind
+  payload = envelope.model_dump(mode="json")
+  assert payload["stage_refs"] == {"critical_factors_ref": _CF_REF}
+  assert AgentCompletionEnvelope.model_validate(payload) == envelope
+
+
+def test_envelope_names_no_refs_a_door_did_not_mint() -> None:
+  refused = _terminal_door_result({"status": "error", "gate_code": "STOP", "readback": None})
+  report_value = {"summary": "Canonical child summary.", "result": {"readback": _CF_REF}}
+  report = _task_result("placeholder", projection=canonical_projection(
+    contract=_contract("research-projection"), value=report_value,
+  ))
+
+  for result in (refused, report):
+    envelope = build_agent_completion_envelope(
+      result,
+      policy=ParentResultPolicy(
+        preferred="projection_inline", max_inline_bytes=1_000, on_overflow="fail",
+      ),
+      terminal_narrative_reader=lambda _result: "unused",
+      read_grant_factory=_read_grant,
+    )
+    assert "stage_refs" not in envelope.model_dump(mode="json")
 
 
 def test_run_loop_rejects_a_clipped_normalized_completion_envelope() -> None:

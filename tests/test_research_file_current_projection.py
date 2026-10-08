@@ -13,6 +13,8 @@ from agent_workflow_contracts import (
   ContentReadGrant,
   ContextViewPolicy,
   InvocationArgumentSelector,
+  OutcomeRequirement,
+  ResultRequirement,
   ToolGrant,
   sha256_digest,
 )
@@ -38,7 +40,6 @@ from agent_gateway.research_file_current_projection import (
 )
 from agent_gateway.skills import SkillLoader
 from agent_gateway.sub_agent import (
-  _canonical_result_requirement,
   _ordinary_admitted_task_factory,
   _research_file_id_admitted_input,
   seal_admitted_task_payload,
@@ -93,7 +94,7 @@ def _admitted_research_file_registration(
     tools=(),
     digest=sha256_digest({"grant_id": "grant:research-file", "tools": []}),
   )
-  requirement = _canonical_result_requirement(operation=operation)
+  requirement = ResultRequirement(outcome=OutcomeRequirement())
   parent_session = SimpleNamespace(
     tenant_id="tenant-a",
     session_id="session-a",
@@ -109,8 +110,6 @@ def _admitted_research_file_registration(
       operation=operation,
       result_instructions=render_result_instructions(requirement),
       admission_date="2026-09-12",
-      max_turns=10,
-      client_timeout_seconds=90,
       max_tokens=64_000,
       cost_observation_threshold_usd=50,
       provider_tool_definitions=(),
@@ -275,7 +274,6 @@ def test_context_builder_replays_only_future_events_after_cutoff(
 
   messages = _run(SessionContextBuilder(
     agent_session_log=log,
-    tail_window_seconds=None,
   ).build())
 
   assert messages == [{"role": "user", "content": "future prompt"}]
@@ -442,7 +440,6 @@ def test_same_generation_retry_invalidates_registration_by_admitted_content(
   assert not _run(task_registration_is_current(log, "bg-research-file"))
   messages = _run(SessionContextBuilder(
     agent_session_log=log,
-    tail_window_seconds=None,
   ).build())
   assert messages == []
 

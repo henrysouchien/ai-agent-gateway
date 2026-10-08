@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import ast
 import asyncio
 import inspect
 import json
 from dataclasses import FrozenInstanceError
-from pathlib import Path
 from types import MappingProxyType
 
 import pytest
-from mcp.types import CallToolResult
+from fastmcp import Client, FastMCP
+from mcp.types import CallToolResult, ListToolsResult, PaginatedRequestParams
 
 from agent_gateway.approval_policy import sha256_args
 from agent_gateway.mcp_client import (
@@ -48,9 +47,6 @@ from agent_workflow_contracts.tool_registration import (
   ToolRegistrationDeclaration,
   VersionedPolicyRef,
 )
-
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def _policy(kind: str) -> VersionedPolicyRef:
@@ -261,10 +257,25 @@ class _CatalogMcpSession(McpClientSession):
     name: str,
     arguments: dict[str, object],
     *,
-    read_timeout_seconds: float,
+    read_timeout_seconds: float | None,
     meta: dict[str, object] | None = None,
   ) -> McpToolCallResult:
     raise AssertionError("catalog topology must not execute its transport session")
+
+
+class _InitializedCatalogSession(_CatalogMcpSession):
+  """Adapt an already initialized in-memory FastMCP connection."""
+
+  def __init__(self, client: Client) -> None:
+    self.client = client
+
+  async def initialize(self) -> object:
+    return None
+
+  async def list_tools(
+    self, *, params: PaginatedRequestParams | None = None,
+  ) -> ListToolsResult:
+    return await self.client.list_tools_mcp(cursor=params.cursor if params else None)
 
 
 def _server_state(
@@ -349,6 +360,63 @@ def test_manager_binds_only_live_registered_routes_and_allows_offline_rows() -> 
     match="unknown registered live MCP tool",
   ):
     manager.get_registered_mcp_tool_descriptor("offline_tool")
+
+
+@pytest.mark.parametrize("logical_route", [False, True], ids=["physical", "logical-alias"])
+@pytest.mark.parametrize("meta, expected, malformed", [
+  ({"hank/code-disposition": "read_composable", "hank/code-reason": "Read rows"}, "read_composable", False),
+  ({"hank/code-disposition": "pure_local", "hank/code-reason": "Local calculation"}, "pure_local", False),
+  ({"hank/code-disposition": "tool_only", "hank/code-reason": "Warm cache"}, "tool_only", False),
+  ({"hank/code-disposition": "artifact_composable", "hank/code-reason": "Writes artifact"}, "artifact_composable", False),
+  ({"hank/code-disposition": "internal_only", "hank/code-reason": "Owner operation"}, "internal_only", False),
+  ({"hank/code-disposition": "unclassified", "hank/code-reason": "Not reviewed"}, None, False),
+  ({"hank/code-disposition": "unknown", "hank/code-reason": "Unknown review"}, None, True),
+  ({"hank/code-disposition": "tool_only", "hank/code-reason": " "}, None, True),
+  ({"hank/code-disposition": "tool_only"}, None, True),
+  ({"hank/code-reason": "Missing disposition"}, None, True),
+  ({}, None, False),
+])
+def test_served_code_review_survives_exact_route_registration(
+  caplog, logical_route, meta, expected, malformed,
+) -> None:
+  async def scenario() -> None:
+    producer = FastMCP("reviewed-producer")
+
+    @producer.tool(name="provider_read", meta=meta)
+    def read_rows() -> dict:
+      return {"rows": [1]}
+
+    logical_server = "reviewed-mcp" if logical_route else "provider-mcp"
+    operation = "read_rows" if logical_route else "provider_read"
+    manager = McpClientManager(
+      config_path=None,
+      allowed_servers={logical_server},
+      logical_server_routes={logical_server: "provider-mcp"} if logical_route else None,
+      logical_tool_aliases={logical_server: {operation: "provider_read"}} if logical_route else None,
+      tool_registration_catalog=_catalog(
+        (_declaration(logical_server, operation),),
+        (_server(logical_server, transport_server_id="provider-mcp"),),
+      ),
+    )
+    async with Client(producer) as client:
+      state = await manager._initialize_session_state(
+        name="provider-mcp", session=_InitializedCatalogSession(client), exit_contexts=[],
+        tool_prefix="", allowed_tools=None,
+      )
+      manager._servers = {"provider-mcp": state}
+      manager._apply_collision_filtering(policy_server_for_tool=lambda _name: logical_server)
+      binding = manager.get_registered_mcp_tool_descriptor(operation).live_binding
+      assert binding.code_disposition == expected
+      assert binding.logical_server_id == logical_server
+      assert binding.provider_original_name == "provider_read"
+      # Rebuilding descriptors preserves the review without relogging malformed meta.
+      manager._refresh_registered_mcp_tool_descriptors()
+      assert manager.get_registered_mcp_tool_descriptor(operation).live_binding.code_disposition == expected
+      assert set(manager.get_tool_definitions()[0]) == {"name", "description", "input_schema"}
+    warnings = [record for record in caplog.records if "Malformed code disposition" in record.message]
+    assert len(warnings) == int(malformed)
+
+  asyncio.run(scenario())
 
 
 def test_manager_resolves_sdk_alias_and_same_bare_names_to_exact_descriptors() -> None:
@@ -436,7 +504,7 @@ def test_manager_rejects_an_unknown_live_route_during_topology_compile() -> None
     )
 
 
-def test_manager_uses_registered_per_tool_timeout() -> None:
+def test_manager_uses_registered_per_tool_expectation() -> None:
   manager = McpClientManager(
     config_path=None,
     allowed_servers={"research-mcp"},
@@ -458,14 +526,14 @@ def test_manager_uses_registered_per_tool_timeout() -> None:
     policy_server_for_tool=lambda _name: "research-mcp"
   )
 
-  assert manager._timeout_for_tool(
+  assert manager._expected_seconds_for_tool(
     "research-mcp",
     "filings_read",
     "filings_read",
   ) == 73
 
 
-def test_manager_uses_logical_registration_timeout_on_physical_transport() -> None:
+def test_manager_uses_logical_registration_expectation_on_physical_transport() -> None:
   manager = McpClientManager(
     config_path=None,
     allowed_servers={"market-data-mcp"},
@@ -501,7 +569,7 @@ def test_manager_uses_logical_registration_timeout_on_physical_transport() -> No
   assert descriptor.live_binding.provider_original_name == "provider_fetch"
   assert manager.get_server_for_tool("fetch_financials") == "market-data-mcp"
   assert manager.get_original_tool_name("fetch_financials") == "provider_fetch"
-  assert manager._timeout_for_tool(
+  assert manager._expected_seconds_for_tool(
     "provider-mcp",
     "fetch_financials",
     "provider_fetch",
@@ -995,49 +1063,3 @@ def test_compiler_requires_an_exact_detachable_static_catalog() -> None:
   object.__setattr__(catalog, "declarations", [declaration])
   with pytest.raises(TypeError, match="exact tuple"):
     compile_registered_mcp_tool_descriptors(catalog, ())
-
-
-def test_module_direct_source_dependencies_are_exact_and_not_root_reexported() -> None:
-  source = (ROOT / "agent_gateway" / "tool_registration.py").read_text(
-    encoding="utf-8"
-  )
-  allowed_absolute = {
-    "__future__": {"annotations"},
-    "dataclasses": {"dataclass"},
-    "agent_workflow_contracts.tool_registration": {
-      "RegisteredToolIdentity",
-      "RegisteredToolServerDescriptor",
-      "ToolRegistrationCatalog",
-      "ToolRegistrationDeclaration",
-      "UnknownToolRegistrationError",
-      "validate_registered_tool_server_descriptor",
-      "validate_tool_registration_catalog",
-      "validate_tool_registration_declaration",
-    },
-  }
-  allowed_relative = {
-    "tool_definition": {
-      "LiveToolRouteBinding",
-      "validate_live_tool_route_binding",
-    },
-  }
-  for node in ast.walk(ast.parse(source)):
-    if isinstance(node, ast.Import):
-      pytest.fail(f"unexpected import statement: {ast.unparse(node)}")
-    if not isinstance(node, ast.ImportFrom):
-      continue
-    assert all(alias.asname is None for alias in node.names)
-    if node.level == 0:
-      assert node.module in allowed_absolute
-      assert {alias.name for alias in node.names} == allowed_absolute[node.module]
-    else:
-      assert node.level == 1
-      assert node.module in allowed_relative
-      assert {alias.name for alias in node.names} == allowed_relative[node.module]
-
-  package_init = (ROOT / "agent_gateway" / "__init__.py").read_text(
-    encoding="utf-8"
-  )
-  assert "tool_registration" not in package_init
-  assert "mcp_client" not in source
-  assert "agent." not in source

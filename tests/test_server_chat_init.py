@@ -185,7 +185,7 @@ def test_put_preference_with_stale_revision_and_ineligible_key_names_stale_catal
       # No openai credential is eligible in this session; under a stale
       # observed revision the typed answer is the stale-catalog refresh, not
       # a bare unavailable-key error.
-      "model_key": "openai.gpt-5-6",
+      "model_key": "openai.gpt-6-1-sol",
       "catalog_revision": "1999-01-01.0",
     },
   )
@@ -194,7 +194,7 @@ def test_put_preference_with_stale_revision_and_ineligible_key_names_stale_catal
   payload = response.json()
   assert payload["error_code"] == "capability_catalog_stale"
   assert payload["catalog_revision"] == INITIAL_MODEL_REGISTRY.revision
-  assert "anthropic.claude-opus-5" in payload["eligible_model_keys"]
+  assert "anthropic.claude-sonnet-5-5" in payload["eligible_model_keys"]
   assert store.get(
     tenant_id="test-product",
     actor_id="101",
@@ -208,7 +208,7 @@ def test_put_preference_with_stale_revision_and_still_eligible_key_is_accepted(
   response, store = _put_preference(
     tmp_path,
     {
-      "model_key": "anthropic.claude-sonnet-5",
+      "model_key": "anthropic.claude-sonnet-5-5",
       "effort": "high",
       "catalog_revision": "1999-01-01.0",
     },
@@ -217,7 +217,7 @@ def test_put_preference_with_stale_revision_and_still_eligible_key_is_accepted(
   assert response.status_code == 200, response.text
   assert response.json() == {
     "capability": "session.driver",
-    "model_key": "anthropic.claude-sonnet-5",
+    "model_key": "anthropic.claude-sonnet-5-5",
     "effort": "high",
   }
   stored = store.get(
@@ -226,7 +226,7 @@ def test_put_preference_with_stale_revision_and_still_eligible_key_is_accepted(
     capability_id="session.driver",
   )
   assert stored is not None
-  assert stored.model_key == "anthropic.claude-sonnet-5"
+  assert stored.model_key == "anthropic.claude-sonnet-5-5"
 
 
 def test_put_preference_with_current_revision_keeps_specific_refusal(
@@ -235,7 +235,7 @@ def test_put_preference_with_current_revision_keeps_specific_refusal(
   response, _store = _put_preference(
     tmp_path,
     {
-      "model_key": "openai.gpt-5-6",
+      "model_key": "openai.gpt-6-1-sol",
       "catalog_revision": INITIAL_MODEL_REGISTRY.revision,
     },
   )
@@ -250,11 +250,11 @@ def test_put_preference_with_stale_revision_and_unsupported_effort_names_stale_c
   response, store = _put_preference(
     tmp_path,
     {
-      # haiku supports only "none"; under a stale observed revision the
+      # opus-5-5 does not support "none"; under a stale observed revision the
       # supported-effort set may have changed, so the answer is the typed
       # stale-catalog refresh.
-      "model_key": "anthropic.claude-haiku-4-5",
-      "effort": "high",
+      "model_key": "anthropic.claude-opus-5-5",
+      "effort": "none",
       "catalog_revision": "1999-01-01.0",
     },
   )
@@ -271,15 +271,15 @@ def test_put_preference_with_stale_revision_and_unsupported_effort_names_stale_c
 def _stale_preference_deployment(
   lifecycle: str,
 ) -> tuple[ProductModelRegistry, ProductModelSelectionPolicy]:
-  """A later deployment where xai.grok-4-5 left the active lifecycle."""
+  """A later deployment where xai.grok-4-7 left the active lifecycle."""
 
   entries = dict(INITIAL_MODEL_REGISTRY.models)
-  entries["xai.grok-4-5"] = replace(
-    entries["xai.grok-4-5"],
+  entries["xai.grok-4-7"] = replace(
+    entries["xai.grok-4-7"],
     lifecycle=lifecycle,
     capabilities={
       capability_id: "internal"
-      for capability_id in entries["xai.grok-4-5"].capabilities
+      for capability_id in entries["xai.grok-4-7"].capabilities
     },
   )
   registry = ProductModelRegistry(
@@ -291,9 +291,9 @@ def _stale_preference_deployment(
     capability_id: (
       replace(
         policy,
-        allowed_model_keys=policy.allowed_model_keys - {"xai.grok-4-5"},
+        allowed_model_keys=policy.allowed_model_keys - {"xai.grok-4-7"},
       )
-      if "xai.grok-4-5" in policy.allowed_model_keys
+      if "xai.grok-4-7" in policy.allowed_model_keys
       else policy
     )
     for capability_id, policy in INITIAL_MODEL_SELECTION_POLICY.capabilities.items()
@@ -328,7 +328,7 @@ def test_init_with_stale_saved_preference_binds_default_and_names_reason(
     tenant_id="test-product",
     actor_id="101",
     capability_id="session.driver",
-    model_key="xai.grok-4-5",
+    model_key="xai.grok-4-7",
     effort="medium",
   )
   registry, selection_policy = _stale_preference_deployment(lifecycle)
@@ -352,10 +352,10 @@ def test_init_with_stale_saved_preference_binds_default_and_names_reason(
   assert driver["selected"]["reason"] == "capability_default"
   notices = {notice["code"]: notice for notice in driver["notices"]}
   notice = notices["saved_preference_not_applied"]
-  assert notice["model_key"] == "xai.grok-4-5"
+  assert notice["model_key"] == "xai.grok-4-7"
   assert notice["reason"] == reason
   assert "it remains saved until replaced or cleared" in notice["message"]
-  assert "xai.grok-4-5" not in {
+  assert "xai.grok-4-7" not in {
     choice["model_key"] for choice in driver["choices"]
   }
   # The stored preference row is retained, never repaired or deleted.
@@ -377,8 +377,8 @@ def test_init_with_unsupported_effort_preference_binds_default(
     tenant_id="test-product",
     actor_id="101",
     capability_id="session.driver",
-    model_key="anthropic.claude-haiku-4-5",
-    effort="high",
+    model_key="anthropic.claude-fable-5-1",
+    effort="none",
   )
   app = _make_app(_resolver, model_preference_store=store)
 
@@ -394,7 +394,7 @@ def test_init_with_unsupported_effort_preference_binds_default(
   assert driver["selected"]["model_key"] == SESSION_DRIVER.model_key
   notices = {notice["code"]: notice for notice in driver["notices"]}
   notice = notices["saved_preference_not_applied"]
-  assert notice["model_key"] == "anthropic.claude-haiku-4-5"
+  assert notice["model_key"] == "anthropic.claude-fable-5-1"
   assert notice["reason"] == "effort_unsupported"
   assert store.get(
     tenant_id="test-product",
@@ -525,14 +525,16 @@ def test_chat_init_returns_only_session_executable_stable_key_choices() -> None:
     "effort": SESSION_DRIVER.effort,
     "reason": "capability_default",
   }
-  assert {choice["model_key"] for choice in driver["choices"]} == {
-    "anthropic.claude-fable-5",
-    "anthropic.claude-fable-5-1",
-    "anthropic.claude-haiku-4-5",
-    "anthropic.claude-opus-5",
-    "anthropic.claude-opus-5-5",
-    "anthropic.claude-sonnet-5",
+  # Only session.driver keys this anthropic-only session can execute.
+  driver_allowed = INITIAL_MODEL_SELECTION_POLICY.capabilities[
+    "session.driver"
+  ].allowed_model_keys
+  anthropic_keys = {
+    key for key in driver_allowed
+    if INITIAL_MODEL_REGISTRY.require(key).provider == "anthropic"
   }
+  assert anthropic_keys and anthropic_keys != driver_allowed
+  assert {choice["model_key"] for choice in driver["choices"]} == anthropic_keys
   author = choices["plan.author"]
   assert author["selected"] is None
   assert [notice["code"] for notice in author["notices"]] == [
@@ -554,7 +556,7 @@ def test_chat_init_normalizes_and_freezes_capability_selections() -> None:
         "api_key": "cli-key",
         "capability_selections": {
           "plan.author": {
-            "model_key": "anthropic.claude-sonnet-5",
+            "model_key": "anthropic.claude-sonnet-5-5",
             "effort": " HIGH ",
           },
         },
@@ -566,15 +568,15 @@ def test_chat_init_normalizes_and_freezes_capability_selections() -> None:
   assert session is not None
   assert session.capability_run_overrides == {
     "plan.author": ModelSelectionIntent(
-      model_key="anthropic.claude-sonnet-5",
+      model_key="anthropic.claude-sonnet-5-5",
       effort="high",
       source="explicit_user",
     ),
   }
   with pytest.raises(TypeError):
     session.capability_run_overrides["node.verify"] = ModelSelectionIntent(
-      model_key="anthropic.claude-opus-5",
-      effort="none",
+      model_key="anthropic.claude-opus-5-5",
+      effort="high",
       source="explicit_user",
     )
 
@@ -603,7 +605,7 @@ def test_chat_init_rejects_unknown_or_unselectable_capability(
       json={
         "api_key": "cli-key",
         "capability_selections": {
-          capability_id: {"model_key": "anthropic.claude-opus-5"},
+          capability_id: {"model_key": "anthropic.claude-opus-5-5"},
         },
       },
     )
@@ -651,7 +653,7 @@ def test_chat_init_rejects_unsupported_effort_before_issuing_token() -> None:
         "api_key": "cli-key",
         "capability_selections": {
           "plan.author": {
-            "model_key": "anthropic.claude-fable-5",
+            "model_key": "anthropic.claude-fable-5-1",
             "effort": "none",
           },
         },
@@ -669,7 +671,7 @@ def test_chat_init_rejects_unsupported_effort_before_issuing_token() -> None:
   [
     {},
     {"model_key": 123},
-    {"model_key": "anthropic.claude-opus-5", "unexpected": "value"},
+    {"model_key": "anthropic.claude-opus-5-5", "unexpected": "value"},
   ],
 )
 def test_chat_init_rejects_malformed_capability_selection(
@@ -708,7 +710,7 @@ def test_chat_init_rejects_selection_without_eligible_credential() -> None:
         "api_key": "cli-key",
         "capability_selections": {
           "plan.author": {
-            "model_key": "openai.gpt-5-6",
+            "model_key": "openai.gpt-6-1-sol",
             "effort": "low",
           },
         },

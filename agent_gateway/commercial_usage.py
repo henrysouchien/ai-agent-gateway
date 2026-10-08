@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import inspect
 import json
+import logging
 import re
 from typing import Any, Awaitable, Callable, Protocol
 from uuid import NAMESPACE_URL, uuid5
@@ -32,6 +33,7 @@ from .usage_reconciliation import (
   UsageDurability,
 )
 
+logger = logging.getLogger(__name__)
 
 _CODE = re.compile(r"^[a-z][a-z0-9._:-]{0,127}$")
 CommercialUsageSink = Callable[
@@ -211,13 +213,19 @@ class CommercialUsageProducer:
       raise ValueError("commercial usage provider is required")
     if event.capability_bind is None:
       raise ValueError("commercial Usage V3 requires capability bind JSON")
+    # The bind is the billed identity. UsageEvent already bills a differing
+    # model/provider projection as the bind and keeps it in projection_divergence;
+    # a work-start lineage naming another capability is logged, and the event is
+    # published under the bind (the closed Usage V3 contract has no divergence field).
     bind = CapabilityBind.from_json(event.capability_bind)
-    if event.provider != bind.provider:
-      raise ValueError("commercial usage provider projection differs from capability bind")
-    if event.model != bind.upstream_model:
-      raise ValueError("commercial usage model projection differs from capability bind")
     if lineage.capability_id != bind.capability_id:
-      raise ValueError("commercial usage capability projection differs from capability bind")
+      logger.warning(
+        "commercial usage %s: lineage capability %s differs from capability bind %s; "
+        "billed as the bind",
+        event.event_id,
+        lineage.capability_id,
+        bind.capability_id,
+      )
     if event.channel is None or not _CODE.fullmatch(event.channel):
       raise ValueError("commercial usage channel is required")
     if event.reasoning_tokens_observed is not None and (
@@ -225,26 +233,20 @@ class CommercialUsageProducer:
       or event.reasoning_tokens_observed > event.output_tokens
     ):
       raise ValueError("reasoning tokens must be an informational output subset")
+    # Money: Hank-funded usage without a budget reservation is unbillable spend.
     if event.billing_mode == "metered" and lineage.reservation_id is None:
-      raise ValueError("Hank-funded commercial usage requires reservation lineage")
+      raise ValueError(
+        "Hank-funded commercial usage requires reservation lineage: start the "
+        "work under a metered work authorization whose reservation_id names "
+        "the risk_module budget reservation (minted by its budget reserve "
+        "when it issues that authorization)"
+      )
     if event.input_tokens < 0 or event.cache_read_tokens < 0 or event.cache_creation_tokens < 0:
       raise ValueError("commercial usage token counts cannot be negative")
     if event.provider_unit_deltas and Decimal(str(event.separately_billed_tool_cost_usd)) != 0:
       raise ValueError("typed provider units require allocated, not aggregate, tool cost")
     if event.provider_unit_deltas and event.provider_units is not None:
       raise ValueError("aggregate provider units cannot coexist with typed unit deltas")
-    if self._work_start is not None:
-      authorization = self._work_start.authorization
-      if (
-        event.request_id != authorization.request_id
-        or event.session_id != authorization.session_id
-        or event.provider != authorization.provider
-        or event.billing_mode != authorization.billing_mode
-        or bind.capability_id != authorization.capability_id
-      ):
-        raise ValueError(
-          "commercial usage event differs from verified work-start facts"
-        )
     occurred_at = datetime.fromtimestamp(event.timestamp, timezone.utc).isoformat().replace(
       "+00:00", "Z"
     )

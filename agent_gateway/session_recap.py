@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import replace
+from collections.abc import Iterable
 from typing import Any, Protocol
 
 from .event_log import LogEntry, log_has_terminal
@@ -22,6 +24,26 @@ from .multi_user.billing import SessionUsageSummary
 
 
 log = logging.getLogger("agent_gateway.session_recap")
+
+#: Counts other owners report on events this recap folds, by event type. Each
+#: replaced a refusal; the recap keeps the largest value per name in
+#: ``tool_calls_summary.measurements`` beside the interceptor counts. None is a
+#: bound.
+RUN_MEASUREMENT_FIELDS: dict[str, tuple[str, ...]] = {
+  # autonomous_runner.send_approval_decision
+  "approval_decision_sent": ("decisions_sent", "frame_bytes"),
+  # fork_task_registry.ForkTaskRegistry.submit
+  "learning_fork_launched": (
+    "in_flight",
+    "day_invocations",
+    "day_charged_microusd",
+    "retained_bytes",
+  ),
+  # runner_session_lifecycle._emit_top_level_skill_started (skill_lifecycle admission)
+  "skill_run_started": ("lease_fence_bytes",),
+}
+#: Calls to the model engine's ``model_*`` tools, counted from the tool calls.
+MODEL_CALLS_MEASUREMENT = "model_calls"
 
 
 class _SessionRecapSource(Protocol):
@@ -108,6 +130,7 @@ def _compute_recap_entries(
   for entry in entries:
     event = entry.event
     event_type = str(event.get("type") or "")
+    tool_calls_summary.record_run_measurements(event_type, event)
     if event_type == "artifact_ready":
       artifacts.append(
         RecapArtifact(
@@ -153,6 +176,8 @@ def _compute_recap_entries(
       tool_calls_summary.record_start(event)
     elif event_type == "tool_call_complete":
       tool_calls_summary.record_complete(event)
+    elif event_type == "interceptor_measurement":
+      tool_calls_summary.record_measurement(event)
     elif event_type == "error":
       failures.append(
         RecapFailure(
@@ -180,20 +205,11 @@ def _compute_recap_entries(
           ts=_event_ts(event, entry.timestamp),
         )
       )
-    elif event_type == "budget_exceeded":
+    elif event_type == "interrupted" and event.get("reason") == "soft_budget_abort":
       failures.append(
         RecapFailure(
-          failure_type="budget_exceeded",
-          detail=_failure_detail(event),
-          emitted_at_seq=entry.seq,
-          ts=_event_ts(event, entry.timestamp),
-        )
-      )
-    elif event_type == "max_turns_reached":
-      failures.append(
-        RecapFailure(
-          failure_type="max_turns_reached",
-          detail=_failure_detail(event),
+          failure_type="soft_budget_abort",
+          detail=_soft_budget_abort_detail(event),
           emitted_at_seq=entry.seq,
           ts=_event_ts(event, entry.timestamp),
         )
@@ -229,6 +245,7 @@ def emit_recap_then_terminal(
   emit_recap: bool = True,
   pending_failure: RecapFailure | None = None,
   usage: SessionUsageSummary | None = None,
+  recap_payload: dict[str, Any] | None = None,
 ) -> None:
   if log_has_terminal(event_log):
     return
@@ -238,37 +255,52 @@ def emit_recap_then_terminal(
     event_log.append(terminal_payload)
     return
 
-  terminal_expected_seq = event_log.next_seq + 1
-  resolved_failure = pending_failure or _terminal_failure(terminal_payload, terminal_expected_seq)
-  if resolved_failure is not None and resolved_failure.emitted_at_seq <= 0:
-    resolved_failure = replace(resolved_failure, emitted_at_seq=terminal_expected_seq)
-
   try:
-    recap = compute_recap(
-      event_log,
-      session_id=session_id,
-      started_at=started_at,
-      trigger="turn_end",
-      pending_failure=resolved_failure,
-      usage=usage,
-    )
-    event_log.append(_recap_payload(recap))
+    event_log.append(recap_payload if recap_payload is not None else terminal_recap_payload(
+      event_log, terminal_payload, session_id=session_id, started_at=started_at,
+      pending_failure=pending_failure, usage=usage,
+    ))
   except Exception:
     log.warning("session_recap compute failed; continuing to terminal", exc_info=True)
 
   event_log.append(terminal_payload)
 
 
+def terminal_recap_payload(
+  event_log: _SessionRecapSource,
+  terminal_event: dict[str, Any],
+  *,
+  session_id: str,
+  started_at: float,
+  pending_failure: RecapFailure | None = None,
+  usage: SessionUsageSummary | None = None,
+  pending_events: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+  entries = event_log.entries
+  next_seq = event_log.next_seq
+  for event in pending_events or ():
+    entries.append(LogEntry(seq=next_seq, timestamp=time.time(), event=event))
+    next_seq += 1
+  terminal_expected_seq = next_seq + 1
+  failure = pending_failure or _terminal_failure(terminal_event, terminal_expected_seq)
+  if failure is not None and failure.emitted_at_seq <= 0:
+    failure = replace(failure, emitted_at_seq=terminal_expected_seq)
+  return _recap_payload(_compute_recap_entries(
+    entries, empty_next_seq=next_seq, session_id=session_id,
+    started_at=started_at, trigger="turn_end",
+    pending_failure=failure, usage=usage,
+  ))
+
+
 def _recap_payload(recap: SessionRecapEvent) -> dict[str, Any]:
   from .events import event_to_dict
 
-  payload = event_to_dict(recap)
-  # ``SessionRecapEvent`` keeps its domain-level range as a tuple, while the
-  # autonomous event channel intentionally accepts only exact JSON values.
-  # Project the range to its wire representation before EventLog delivery so
-  # an optional recap can never prevent the final terminal EVENT + END.
-  payload["seq_range"] = list(recap.seq_range)
-  return payload
+  # ``SessionRecapEvent`` keeps domain tuples (``seq_range`` and the usage
+  # summary's ``usage_event_ids``), while the autonomous event channel accepts
+  # only exact JSON values. Project the whole recap to its wire representation
+  # before EventLog delivery so an optional recap can never prevent the final
+  # terminal EVENT + END.
+  return json.loads(json.dumps(event_to_dict(recap)))
 
 
 def _terminal_failure(event: dict[str, Any], emitted_at_seq: int) -> RecapFailure | None:
@@ -289,6 +321,7 @@ class _ToolCallAccumulator:
     self.errors = 0
     self.by_tool_name: dict[str, int] = {}
     self.by_server: dict[str, int] = {}
+    self.measurements: dict[str, int] = {}
     self._seen_starts: set[str] = set()
 
   def record_start(self, event: dict[str, Any]) -> None:
@@ -308,6 +341,17 @@ class _ToolCallAccumulator:
     else:
       self.successes += 1
 
+  def record_measurement(self, event: dict[str, Any]) -> None:
+    # Producer: tool_dispatcher_helpers.run_interceptors; largest value per name.
+    for name, value in event["measurement"].items():
+      self.measurements[name] = max(int(value), self.measurements.get(name, 0))
+
+  def record_run_measurements(self, event_type: str, event: dict[str, Any]) -> None:
+    for name in RUN_MEASUREMENT_FIELDS.get(event_type, ()):
+      value = event.get(name)
+      if value is not None:
+        self.measurements[name] = max(int(value), self.measurements.get(name, 0))
+
   def to_summary(self) -> ToolCallsSummary:
     return ToolCallsSummary(
       total_calls=self.total_calls,
@@ -315,6 +359,7 @@ class _ToolCallAccumulator:
       errors=self.errors,
       by_tool_name=dict(self.by_tool_name),
       by_server=dict(self.by_server),
+      measurements=dict(self.measurements),
     )
 
   def _increment_buckets(self, event: dict[str, Any]) -> None:
@@ -322,6 +367,10 @@ class _ToolCallAccumulator:
     server = _server_name(event)
     self.by_tool_name[tool_name] = self.by_tool_name.get(tool_name, 0) + 1
     self.by_server[server] = self.by_server.get(server, 0) + 1
+    if _bare_tool_name(tool_name).startswith("model_"):
+      self.measurements[MODEL_CALLS_MEASUREMENT] = (
+        self.measurements.get(MODEL_CALLS_MEASUREMENT, 0) + 1
+      )
 
 
 def _server_name(event: dict[str, Any]) -> str:
@@ -334,6 +383,22 @@ def _server_name(event: dict[str, Any]) -> str:
     if len(parts) >= 3 and parts[1]:
       return parts[1]
   return "local"
+
+
+def _bare_tool_name(tool_name: str) -> str:
+  if tool_name.startswith("mcp__"):
+    return tool_name.split("__", 2)[-1]
+  return tool_name
+
+
+def fold_run_measurements(events: Iterable[dict[str, Any]]) -> dict[str, int]:
+  """The ``RUN_MEASUREMENT_FIELDS`` peaks over ``events``: the fold the recap
+  runs, for an owner that adds counts from a log the recap did not see."""
+
+  accumulator = _ToolCallAccumulator()
+  for event in events:
+    accumulator.record_run_measurements(str(event.get("type") or ""), event)
+  return accumulator.measurements
 
 
 def _event_ts(event: dict[str, Any], fallback: float) -> float:
@@ -429,9 +494,18 @@ def _failure_detail(event: dict[str, Any]) -> str:
   return str(event.get("type") or "failure")
 
 
+def _soft_budget_abort_detail(event: dict[str, Any]) -> str:
+  return " ".join(
+    f"{key}={event.get(key)}" for key in ("kind", "observed", "threshold", "grace_turns")
+  )
+
+
 __all__ = [
+  "MODEL_CALLS_MEASUREMENT",
+  "RUN_MEASUREMENT_FIELDS",
   "SessionRecapEventLog",
   "compute_recap",
   "compute_recap_from_events",
   "emit_recap_then_terminal",
+  "fold_run_measurements",
 ]

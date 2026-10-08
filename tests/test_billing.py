@@ -364,8 +364,7 @@ def test_usage_event_rejects_unversioned_old_dlq_payload() -> None:
 def test_normalize_identity_requires_explicit_billing_identity() -> None:
   with pytest.raises(ValueError, match="user_id"):
     normalize_identity(None, "v1", "byok", "  ")
-  with pytest.raises(ValueError, match="reserved"):
-    normalize_identity("_default", "v1", "byok", "  ")
+  assert normalize_identity("_default", "v1", "byok", "  ")[0] == "_default"
   with pytest.raises(ValueError, match="rate_table_version"):
     normalize_identity("alice", None, "byok", "  ")
   with pytest.raises(ValueError, match="billing_mode"):
@@ -473,6 +472,51 @@ def test_usage_summary_identity_requires_a_provider_observation_and_receipt() ->
       **fields,
       provider_reported_model="claude-sonnet-4-6-20260801",
     )
+
+
+def test_usage_event_bills_the_bind_and_keeps_a_differing_projection(tmp_path: Path) -> None:
+  event = UsageEvent(
+    **{
+      **_event().__dict__,
+      "model": "claude-opus-4-6",
+      "provider": "codex",
+      "capability_bind": _bind_receipt(provider="anthropic", model="claude-sonnet-4-6"),
+      "projection_divergence": None,
+    }
+  )
+
+  assert (event.model, event.provider) == ("claude-sonnet-4-6", "anthropic")
+  assert event.projection_divergence == {"model": "claude-opus-4-6", "provider": "codex"}
+
+  spool_path = tmp_path / "usage_dlq.jsonl"
+  write_dlq(event, spool_path)
+  ledger = SqliteUsageLedger(tmp_path / "usage.db")
+  assert _run(replay_dlq(ledger, spool_path))["replayed"] == 1
+  total = _run(ledger.get_total("alice", model="claude-sonnet-4-6"))
+  assert total.event_count == 1
+
+
+def test_usage_summary_bills_the_bind_and_keeps_a_differing_projection() -> None:
+  summary = SessionUsageSummary(
+    user_id="alice",
+    session_id="sess",
+    request_id="req",
+    input_tokens=1,
+    output_tokens=1,
+    cache_read_tokens=0,
+    cache_creation_tokens=0,
+    cost=0.0,
+    turns=1,
+    channel="web",
+    started_at=1.0,
+    ended_at=2.0,
+    usage_event_count=1,
+    model="claude-opus-4-6",
+    capability_bind=_bind_receipt(provider="anthropic", model="claude-sonnet-4-6"),
+  )
+
+  assert (summary.model, summary.provider) == ("claude-sonnet-4-6", "anthropic")
+  assert summary.projection_divergence == {"model": "claude-opus-4-6"}
 
 
 def test_usage_aggregator_concurrent_record_calls() -> None:

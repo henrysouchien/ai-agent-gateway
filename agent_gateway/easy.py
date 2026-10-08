@@ -44,6 +44,7 @@ from model_authority.registry import ModelRegistryEntry
 from model_authority.selection import CapabilityDefault, ProductModelSelectionPolicy
 from .providers import AnthropicProvider, ModelProvider
 from model_authority.rates import load_rate_table
+from .admission import current_parent_context, root_context
 from .runner import AgentRunner, ToolResultContext
 from .runtime_spill import build_spill_sink
 from .tool_result_spill import (
@@ -59,7 +60,7 @@ from .server import (
 )
 from .session import AuthManager, GatewaySession, session_owner_user_id
 from .skills import SkillLoader, SkillStateStore
-from .task_registry import CoordinatorConfig
+from .task_registry import CoordinatorConfig, ParentMessage, RegistryOwner
 from .tool_dispatcher import LocalToolHandler
 from model_authority.thinking import resolve_effort_pair
 
@@ -251,9 +252,6 @@ def create_agent(
   code_execution: bool = False,
   code_execution_config: CodeExecutionConfig | None = None,
   needs_approval: Callable[..., bool] | None = None,
-  session_cache_denied_tools: frozenset[str] | None = None,
-  max_turns: int | None = None,
-  max_budget_usd: float | None = None,
   valid_api_keys: set[str] | None = None,
   jwt_secret: str | None = None,
   session_ttl: int = 3600,
@@ -349,8 +347,6 @@ def create_agent(
     code_execution: Enable built-in `code_execute` and `code_execute_status`.
       Docker is preferred; subprocess is the fallback when registered.
     code_execution_config: Optional `CodeExecutionConfig` override.
-    max_turns: Optional hard stop for the conversation loop.
-    max_budget_usd: Optional estimated-cost budget across the session.
     valid_api_keys: API keys accepted by `/chat/init`. If empty, any non-empty
       key is accepted.
     jwt_secret: JWT signing secret for session tokens. A random secret is
@@ -389,7 +385,7 @@ def create_agent(
     app = create_agent(
       "You are a concise assistant.",
       provider="openai",
-      model_key="openai.gpt-5-6",
+      model_key="openai.gpt-6-1-sol",
     )
     ```
 
@@ -640,10 +636,12 @@ def create_agent(
         commercial_usage_producer = await commercial_usage_producer
     local_handlers = dict(tool_handlers or {})
     extra_tool_defs = list(tool_definitions or [])
-    local_handlers["tool_result_read"] = make_tool_result_read_handler(
-      lambda: getattr(session, "tool_result_spill_sink", None)
-    )
     runner_ref: list[Any] = [None]
+    local_handlers["tool_result_read"] = make_tool_result_read_handler(
+      lambda: getattr(session, "tool_result_spill_sink", None),
+      caller=lambda: current_parent_context(session),
+      journal=lambda: runner_ref[0]._agent_session_log,
+    )
     user_needs_approval = needs_approval
 
     ce_bundle = None
@@ -676,13 +674,20 @@ def create_agent(
         skill_state_store=skill_state_store,
         outputs_dir=Path(outputs_dir) if outputs_dir is not None else None,
         capability_execution_resolver=capability_execution_resolver,
-        coordinator_config=coordinator,
         approval_key_qualifier=ce_bundle.approval_qualifier if ce_bundle else None,
+        code_execution_factory=(
+          (lambda child_session: build_code_execution(child_session, config=code_execution_config))
+          if code_execution
+          else None
+        ),
       )
       if "get_background_result" not in local_handlers:
         local_handlers["get_background_result"] = make_get_background_result_handler(runner_ref)
       if "send_message" not in local_handlers:
-        local_handlers["send_message"] = make_send_message_handler(runner_ref)
+        local_handlers["send_message"] = make_send_message_handler(
+          runner_ref,
+          caller=lambda: current_parent_context(session),
+        )
       if not any(definition.get("name") == "run_agent" for definition in extra_tool_defs):
         extra_tool_defs.append(make_run_agent_tool_def(operation_source))
       if not any(definition.get("name") == "get_background_result" for definition in extra_tool_defs):
@@ -711,8 +716,6 @@ def create_agent(
       tool_input: dict[str, Any] | None = None,
       qualifier: str = "",
     ) -> bool:
-      if ce_bundle is not None and name == "code_execute":
-        return ce_bundle.needs_approval(name, tool_input, qualifier)
       if user_needs_approval is not None:
         return bool(user_needs_approval(name, tool_input, qualifier))
       return False
@@ -787,11 +790,9 @@ def create_agent(
         local_tool_handlers=local_handlers,
         needs_approval=_needs_approval,
         request_approval=_make_request_approval(session, event_log),
-        approved_tool_types=session.approved_tool_types,
         event_log=event_log,
         session_id=session_id,
         mcp_session_inject_servers=mcp_session_inject_servers,
-        session_cache_denied_tools=session_cache_denied_tools,
         get_tool_definitions=_get_tool_defs,
         commercial_work_start=request.commercial_work_start,
         commercial_irreversible_recheck=(
@@ -812,6 +813,12 @@ def create_agent(
         },
       )
       session.tool_result_spill_sink = configured_spill_sink
+      context = root_context(
+        session,
+        withheld_tools=frozenset(),
+        research_file_id=None,
+      )
+      root_inbox: asyncio.Queue[ParentMessage] = asyncio.Queue(maxsize=64)
       runner = AgentRunner(
         event_log=event_log,
         dispatcher=dispatcher,
@@ -821,7 +828,6 @@ def create_agent(
         capability_execution=capability_execution,
         allow_stub_response=False,
         mcp_client=mcp_client,
-        purpose=session.purpose,
         get_tool_definitions=_get_tool_defs,
         on_tool_result=_combined_on_tool_result,
         on_usage=_combined_on_usage if usage_ledger is not None or on_usage is not None else None,
@@ -833,12 +839,20 @@ def create_agent(
         rate_table_version=resolved_rate_table_version,
         channel=channel,
         usage_ledger_dlq_path=resolved_usage_dlq_path,
-        max_budget_usd=max_budget_usd,
         coordinator=coordinator,
         agent_session_log=agent_session_log,
         code_execution_spill_dir_provider=configured_spill_sink,
+        message_inbox=root_inbox,
         commercial_usage_producer=commercial_usage_producer,
       )
+      job_id = context.job_id
+      assert job_id is not None, "the executing job must have an admitted identity"
+      runner._task_registry.bind_owner(RegistryOwner(
+        job_id=job_id,
+        tenant=lambda: current_parent_context(session).tenant,
+        inbox=root_inbox,
+        spill_sink=configured_spill_sink,
+      ))
       runner_ref[0] = runner
       return runner
 
@@ -847,7 +861,6 @@ def create_agent(
       build_runner=_build_runner,
       capability_execution=capability_execution,
       get_tool_definitions=_get_tool_defs,
-      max_turns=max_turns,
     )
 
   async def _combined_startup() -> None:

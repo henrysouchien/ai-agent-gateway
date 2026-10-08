@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -18,8 +19,13 @@ from agent_gateway.capability_execution import (
   MaterializedCredential,
   derive_batch_capability_execution,
 )
+from agent_gateway.runner_fork_agents import _bind_learning_fork_execution
+from agent_gateway.runner_hooks_lifecycle import RunnerHooksLifecycleMixin
+from agent_gateway.send_prompt import _prepare_bound_execution
+from model_authority.bind import CapabilityBind
 from model_authority.capabilities import CAPABILITY_IDS
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
+from model_authority.registry import ProductModelRegistry
 from agent_gateway.providers import ModelInfo, ModelProvider
 from gateway_test_support.model_defaults import SESSION_DRIVER
 
@@ -116,6 +122,36 @@ def _resolver(
   )
 
 
+def test_selection_defers_credential_and_adapter_effects_until_materialization() -> None:
+  base = _resolver()
+  effects: list[str] = []
+
+  def _credential(handle: CredentialHandle) -> MaterializedCredential:
+    effects.append("credential")
+    return base.credential_materializer(handle)
+
+  def _adapter(name: str) -> ModelProvider:
+    effects.append("adapter")
+    return base.adapter_resolver(name)
+
+  resolver = replace(
+    base,
+    credential_materializer=_credential,
+    adapter_resolver=_adapter,
+  )
+  selected = resolver.select_bind("session.driver")
+  assert selected.model_key == SESSION_DRIVER.model_key
+  assert effects == []
+
+  execution = resolver.materialize_bind(selected)
+  assert execution.bind == selected
+  assert effects == ["credential", "adapter"]
+
+  effects.clear()
+  assert resolver.resolve("session.driver").bind == selected
+  assert effects == ["credential", "adapter"]
+
+
 def test_resolver_materializes_one_complete_immutable_execution() -> None:
   execution = _resolver().resolve("session.driver")
 
@@ -210,19 +246,6 @@ def test_bound_execution_rejects_provider_family_mismatch() -> None:
   assert refused.value.code == "provider_unavailable"
 
 
-def test_bound_execution_rejects_bind_identity_not_admitted_by_registry() -> None:
-  execution = _resolver().resolve("session.driver")
-  bind = execution.bind.model_copy(update={"upstream_model": "claude-sonnet-5"})
-
-  with pytest.raises(ValueError, match="execution identity does not match"):
-    BoundCapabilityExecution(
-      bind=bind,
-      registry=execution.registry,
-      adapter=execution.adapter,
-      auth_config=execution.auth_config,
-    )
-
-
 @pytest.mark.parametrize(
   ("field", "value"),
   [
@@ -275,7 +298,7 @@ def test_materialize_durable_bind_reauthorizes_without_reselection() -> None:
   initial = resolver.resolve(
     "session.driver",
     explicit_intent=ModelSelectionIntent(
-      model_key="anthropic.claude-sonnet-5",
+      model_key="anthropic.claude-sonnet-5-5",
       effort="xhigh",
       source="explicit_user",
     ),
@@ -283,7 +306,7 @@ def test_materialize_durable_bind_reauthorizes_without_reselection() -> None:
 
   resumed = resolver.materialize_bind(initial.bind)
   assert resumed.bind is initial.bind
-  assert resumed.bind.model_key == "anthropic.claude-sonnet-5"
+  assert resumed.bind.model_key == "anthropic.claude-sonnet-5-5"
   assert resumed.bind.effort == "xhigh"
 
 
@@ -300,7 +323,7 @@ def test_materialize_bind_refuses_changed_run_mode() -> None:
 
 def test_authenticated_run_override_is_policy_scoped() -> None:
   override = ModelSelectionIntent(
-    model_key="anthropic.claude-fable-5",
+    model_key="anthropic.claude-fable-5-1",
     effort="high",
     source="explicit_user",
   )
@@ -330,7 +353,7 @@ def test_exact_parent_binding_is_passed_to_plan_author_resolution() -> None:
   parent = resolver.resolve(
     "session.driver",
     explicit_intent=ModelSelectionIntent(
-      model_key="anthropic.claude-sonnet-5",
+      model_key="anthropic.claude-sonnet-5-5",
       effort="high",
       source="explicit_user",
     ),
@@ -343,9 +366,9 @@ def test_exact_parent_binding_is_passed_to_plan_author_resolution() -> None:
 
 
 def test_standard_protocol_profile_cannot_gain_reasoning_effort() -> None:
-  resolver = _resolver()
-  execution = resolver.resolve("citation.review")
-  assert execution.bind.protocol_profile == "messages.standard"
+  resolver = _resolver(auth=_auth(providers=("openai",)))
+  execution = resolver.resolve("risk.peer_generation")
+  assert execution.bind.protocol_profile == "chat_completions.standard"
   assert execution.bind.effort == "none"
   assert not set(execution.auth_config) & {
     "model",
@@ -365,6 +388,68 @@ def test_standard_protocol_profile_cannot_gain_reasoning_effort() -> None:
       auth_config=execution.auth_config,
     )
   assert refused.value.code == "capability_effort_unsupported"
+
+
+def _driver_execution_unqualified_for_fork() -> BoundCapabilityExecution:
+  """A session.driver execution whose model its registry does not qualify for node.fork."""
+
+  driver = _resolver().resolve("session.driver")
+  models = dict(INITIAL_MODEL_REGISTRY.models)
+  entry = models[driver.bind.model_key]
+  models[entry.key] = replace(
+    entry,
+    capabilities={
+      capability_id: exposure
+      for capability_id, exposure in entry.capabilities.items()
+      if capability_id != "node.fork"
+    },
+  )
+  return BoundCapabilityExecution(
+    bind=driver.bind,
+    registry=ProductModelRegistry(
+      schema=INITIAL_MODEL_REGISTRY.schema,
+      revision=INITIAL_MODEL_REGISTRY.revision,
+      models=models,
+    ),
+    adapter=driver.adapter,
+    auth_config=driver.auth_config,
+  )
+
+
+def _rebound_to_unqualified_fork() -> BoundCapabilityExecution:
+  execution = _driver_execution_unqualified_for_fork()
+  object.__setattr__(
+    execution,
+    "bind",
+    CapabilityBind.model_validate({
+      **execution.bind.to_json(),
+      "capability_id": "node.fork",
+      "selection_source": "parent_binding",
+    }),
+  )
+  return execution
+
+
+def test_learning_fork_rebind_to_unqualified_model_is_refused() -> None:
+  with pytest.raises(CapabilityResolutionError) as refused:
+    _bind_learning_fork_execution(_driver_execution_unqualified_for_fork())
+  assert refused.value.code == "capability_model_not_allowed"
+  assert refused.value.capability_id == "node.fork"
+
+
+def test_credential_refresh_of_unqualified_rebind_is_refused() -> None:
+  runner = RunnerHooksLifecycleMixin()
+  runner._capability_execution = _rebound_to_unqualified_fork()
+
+  with pytest.raises(CapabilityResolutionError) as refused:
+    runner._apply_refreshed_auth_config({}, {"api_key": "rotated"})
+  assert refused.value.code == "capability_model_not_allowed"
+
+
+def test_send_prompt_refuses_unqualified_rebind() -> None:
+  with pytest.raises(CapabilityResolutionError) as refused:
+    _prepare_bound_execution(_rebound_to_unqualified_fork())
+  assert refused.value.code == "capability_model_not_allowed"
 
 
 def test_batch_derivation_preserves_exact_bind_and_scopes_user_handle() -> None:

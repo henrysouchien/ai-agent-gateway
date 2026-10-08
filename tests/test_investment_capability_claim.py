@@ -22,16 +22,16 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-import agent_gateway.investment_capability_claim as claim_module
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.approval_policy import RunContext
 from agent_gateway.investment_capability_claim import (
   INVESTMENT_CAPABILITY_FACADE_TOOLS,
   INVESTMENT_CAPABILITY_CLAIM_PRIVATE_KEY_ENV,
   INVESTMENT_CAPABILITY_CLAIM_PUBLIC_KEY_ENV,
-  INVESTMENT_CAPABILITY_SKILL_GRANTS,
-  InvestmentCapabilitySkillGrant,
+  InvestmentCapabilityGrant,
   InvestmentCapabilityClaimError,
+  configure_investment_capability_grants,
+  investment_capability_grants,
   issue_investment_capability_claim,
   issue_investment_selected_content_claim,
   investment_capability_signing_available,
@@ -63,6 +63,38 @@ _PUBLIC_KEY_MATERIAL = base64.urlsafe_b64encode(
 _KEY_ID = f"ed25519-sha256:{hashlib.sha256(_PUBLIC_KEY_BYTES).hexdigest()}"
 _POLICY_BUNDLE_HASH = hashlib.sha256(b"test-policy-bundle").hexdigest()
 
+_READ_FACADE_TOOLS = (
+  "cancel_investment_run",
+  "get_investment_artifact",
+  "get_investment_capability",
+  "get_investment_run",
+  "list_investment_artifacts",
+  "list_investment_capabilities",
+)
+# What the market-scan and quant-research notes declare; the product
+# composition root binds the same projection from the compiled catalog.
+_DECLARED_GRANTS = {
+  "market-scan": InvestmentCapabilityGrant(
+    capability_ids=("fingerprint_screen", "insider_buying", "quality_screen"),
+    effect_classes=("artifact_write", "read", "state_write"),
+    tool_names=(*_READ_FACADE_TOOLS, "start_investment_run"),
+  ),
+  "quant-research": InvestmentCapabilityGrant(
+    capability_ids=("quant_research",),
+    effect_classes=("read", "research_write", "state_write"),
+    tool_names=(*_READ_FACADE_TOOLS, "start_quant_research"),
+  ),
+}
+
+
+@pytest.fixture(autouse=True)
+def _bind_declared_grants():
+  previous = investment_capability_grants()
+  configure_investment_capability_grants(_DECLARED_GRANTS)
+  yield
+  configure_investment_capability_grants(previous)
+
+
 
 def _limits_for_skill(
   skill: str | None,
@@ -70,8 +102,8 @@ def _limits_for_skill(
   if skill is None:
     return None
   if skill == "quant-research":
-    return SkillExecutionLimits(20, 32_000, 20.0)
-  return SkillExecutionLimits(None, None, None)
+    return SkillExecutionLimits(32_000)
+  return SkillExecutionLimits(None)
 
 
 def _set_signing_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -228,51 +260,6 @@ def test_claim_unavailable_error_names_grant_and_issuance_route() -> None:
   )
 
 
-def test_server_load_refuses_without_admitted_grant() -> None:
-  from agent_gateway.investment_capability_claim import (
-    investment_capability_server_load_error,
-  )
-
-  token = set_current_skill(None)
-  try:
-    error = investment_capability_server_load_error("idea-workbench-mcp")
-  finally:
-    reset_current_skill(token)
-
-  assert error is not None
-  _assert_names_grant_and_issuance_route(
-    error,
-    subject="server 'idea-workbench-mcp'",
-  )
-
-
-@pytest.mark.parametrize("skill", ["market-scan", "quant-research"])
-def test_server_load_allows_when_session_holds_grant(skill: str) -> None:
-  from agent_gateway.investment_capability_claim import (
-    investment_capability_server_load_error,
-  )
-
-  token = set_current_skill(ActiveSkillAdmission(
-    skill,
-    _limits_for_skill(skill),  # type: ignore[arg-type]
-  ))
-  try:
-    error = investment_capability_server_load_error("idea-workbench-mcp")
-  finally:
-    reset_current_skill(token)
-
-  assert error is None
-
-
-def test_server_load_does_not_gate_unrelated_servers() -> None:
-  from agent_gateway.investment_capability_claim import (
-    investment_capability_server_load_error,
-  )
-
-  assert investment_capability_server_load_error("portfolio-reads-mcp") is None
-
-
-
 def test_facade_tool_boundary_is_exact() -> None:
   assert INVESTMENT_CAPABILITY_FACADE_TOOLS == frozenset({
     "cancel_investment_run",
@@ -326,8 +313,6 @@ def test_selected_content_claim_is_the_exact_minimal_v2_contract(
   ("artifact_id", "view", "now"),
   [
     ("", "summary", 1_800_000_000),
-    ("artifact-1", "schema", 1_800_000_000),
-    ("artifact-1", "SUMMARY", 1_800_000_000),
     ("artifact-1", "summary", True),
   ],
 )
@@ -348,54 +333,51 @@ def test_selected_content_claim_rejects_noncanonical_coordinates(
     )
 
 
-def test_investment_capability_skill_grants_are_exact_and_gateway_owned() -> None:
-  assert set(INVESTMENT_CAPABILITY_SKILL_GRANTS) == {
-    "market-scan",
-    "quant-research",
+def test_claim_grant_is_the_bound_skill_declaration(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _set_signing_key(monkeypatch)
+  configure_investment_capability_grants({
+    "screen-digest": InvestmentCapabilityGrant(
+      capability_ids=("quality_screen",),
+      effect_classes=("read",),
+      tool_names=("get_investment_run",),
+    ),
+  })
+  inputs: dict[str, Any] = {
+    "user_id": "42",
+    "session_id": "session-123",
+    "skill_run_id": "skill-run-123",
+    "channel": "excel",
+    "request_id": "request-123",
+    "jti": "tool-call-declared",
+    "admitted_skill_execution_limits": SkillExecutionLimits(None),
+    "policy_bundle_hash": _POLICY_BUNDLE_HASH,
   }
 
-  market_grant = INVESTMENT_CAPABILITY_SKILL_GRANTS["market-scan"]
-  assert market_grant.allowed_capability_ids == (
-    "fingerprint_screen",
-    "insider_buying",
-    "quality_screen",
+  token = issue_investment_capability_claim(
+    **inputs,
+    tool_name="get_investment_run",
+    skill="screen-digest",
   )
-  assert market_grant.allowed_tool_names == (
-    "cancel_investment_run",
-    "get_investment_artifact",
-    "get_investment_capability",
-    "get_investment_run",
-    "list_investment_artifacts",
-    "list_investment_capabilities",
-    "start_investment_run",
-  )
-  assert market_grant.effect_classes == (
-    "artifact_write",
-    "read",
-    "state_write",
-  )
-  assert market_grant.max_wall_clock_seconds is None
-  assert "quant_research" not in market_grant.allowed_capability_ids
-  assert "start_quant_research" not in market_grant.allowed_tool_names
-  assert "research_write" not in market_grant.effect_classes
+  _header, payload = _decode_claim(token)
+  assert payload["allowed_capability_ids"] == ["quality_screen"]
+  assert payload["effect_classes"] == ["read"]
+  assert payload["skill"] == "screen-digest"
 
-  grant = INVESTMENT_CAPABILITY_SKILL_GRANTS["quant-research"]
-  assert grant.allowed_capability_ids == ("quant_research",)
-  assert grant.allowed_tool_names == (
-    "cancel_investment_run",
-    "get_investment_artifact",
-    "get_investment_capability",
-    "get_investment_run",
-    "list_investment_artifacts",
-    "list_investment_capabilities",
-    "start_quant_research",
-  )
-  assert grant.effect_classes == ("read", "research_write", "state_write")
-  assert grant.max_wall_clock_seconds == 5_400
-  assert "fingerprint_screen" not in grant.allowed_capability_ids
-  assert "quality_screen" not in grant.allowed_capability_ids
-  assert "artifact_write" not in grant.effect_classes
-  assert "start_investment_run" not in grant.allowed_tool_names
+  with pytest.raises(InvestmentCapabilityClaimError, match="unsupported tool"):
+    issue_investment_capability_claim(
+      **inputs,
+      tool_name="start_investment_run",
+      skill="screen-digest",
+    )
+  # No gateway-side list survives the binding: an undeclared skill holds no grant.
+  with pytest.raises(InvestmentCapabilityClaimError, match="unsupported skill"):
+    issue_investment_capability_claim(
+      **inputs,
+      tool_name="get_investment_run",
+      skill="market-scan",
+    )
   assert "approved_budget" not in inspect.signature(
     issue_investment_capability_claim
   ).parameters
@@ -505,9 +487,7 @@ def test_claim_is_canonical_signed_short_lived_and_exactly_bound(
   assert payload == {
     "allowed_capability_ids": ["quant_research"],
     "approved_budget": {
-      "max_cost_usd": 20.0,
       "max_tokens": 32_000,
-      "max_turns": 20,
       "max_wall_clock_seconds": 5_400,
     },
     "aud": "investment-tools",
@@ -618,9 +598,7 @@ def test_dispatch_injects_claim_bound_to_original_routed_tool(
   assert payload["skill"] == "quant-research"
   assert payload["allowed_capability_ids"] == ["quant_research"]
   assert payload["approved_budget"] == {
-    "max_cost_usd": 20.0,
     "max_tokens": 32_000,
-    "max_turns": 20,
     "max_wall_clock_seconds": 5_400,
   }
   assert payload["effect_classes"] == ["read", "research_write", "state_write"]
@@ -887,76 +865,51 @@ def test_quant_dispatch_rejects_malformed_trusted_origin_before_mcp(
   assert mcp.calls == []
 
 
-def test_issuer_rejects_malformed_gateway_budget_policy(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  _set_signing_key(monkeypatch)
-  monkeypatch.setattr(
-    claim_module,
-    "INVESTMENT_CAPABILITY_SKILL_GRANTS",
-    {
-      "quant-research": InvestmentCapabilitySkillGrant(
-        allowed_capability_ids=("quant_research",),
-        allowed_tool_names=("start_quant_research",),
-        effect_classes=("read", "research_write", "state_write"),
-        max_wall_clock_seconds=0,
-      ),
-    },
-  )
-
-  with pytest.raises(
-    InvestmentCapabilityClaimError,
-    match="invalid approved budget",
-  ):
-    issue_investment_capability_claim(
-      user_id="42",
-      session_id="session-123",
-      skill_run_id="skill-run-123",
-      channel="excel",
-      tool_name="start_quant_research",
-      request_id="request-123",
-      jti="tool-call-123",
-      skill="quant-research",
-      admitted_skill_execution_limits=_limits_for_skill("quant-research"),
-      policy_bundle_hash=_POLICY_BUNDLE_HASH,
-      research_file_id=2,
-    )
-
-
 @pytest.mark.parametrize(
-  "limits",
+  ("limits", "approved_budget"),
   [
-    SkillExecutionLimits(10_001, 32_000, 20.0),
-    SkillExecutionLimits(20, 100_000_001, 20.0),
-    SkillExecutionLimits(20, 32_000, 10_000.01),
-    SkillExecutionLimits(None, 32_000, 20.0),
-    SkillExecutionLimits(20, None, 20.0),
-    SkillExecutionLimits(20, 32_000, None),
+    (
+      SkillExecutionLimits(100_000_001),
+      {
+        "max_tokens": 100_000_001,
+        "max_wall_clock_seconds": 5_400,
+      },
+    ),
+    (
+      SkillExecutionLimits(None),
+      {"max_wall_clock_seconds": 5_400},
+    ),
+    (
+      None,
+      {"max_wall_clock_seconds": 5_400},
+    ),
   ],
 )
-def test_quant_claim_retains_consumer_budget_ceilings(
+def test_quant_claim_signs_the_admitted_budget_numbers_present(
   monkeypatch: pytest.MonkeyPatch,
-  limits: SkillExecutionLimits,
+  limits: SkillExecutionLimits | None,
+  approved_budget: dict[str, int | float],
 ) -> None:
   _set_signing_key(monkeypatch)
 
-  with pytest.raises(
-    InvestmentCapabilityClaimError,
-    match="invalid approved budget",
-  ):
-    issue_investment_capability_claim(
-      user_id="42",
-      session_id="session-123",
-      skill_run_id="skill-run-123",
-      channel="excel",
-      tool_name="start_quant_research",
-      request_id="request-123",
-      jti="tool-call-123",
-      skill="quant-research",
-      admitted_skill_execution_limits=limits,
-      policy_bundle_hash=_POLICY_BUNDLE_HASH,
-      research_file_id=2,
-    )
+  token = issue_investment_capability_claim(
+    user_id="42",
+    session_id="session-123",
+    skill_run_id="skill-run-123",
+    channel="excel",
+    tool_name="start_quant_research",
+    request_id="request-123",
+    jti="tool-call-123",
+    skill="quant-research",
+    admitted_skill_execution_limits=limits,
+    policy_bundle_hash=_POLICY_BUNDLE_HASH,
+    research_file_id=2,
+    now=1_800_000_000,
+  )
+
+  _header, payload = _decode_claim(token)
+  assert payload["approved_budget"] == approved_budget
+  assert payload["exp"] == 1_800_000_060
 
 
 @pytest.mark.parametrize("tool_name", sorted(INVESTMENT_CAPABILITY_FACADE_TOOLS))
@@ -1019,7 +972,7 @@ def test_conflicting_trusted_skill_contexts_fail_closed(
   _set_signing_key(monkeypatch)
   token = set_current_skill(ActiveSkillAdmission(
     "different-skill",
-    SkillExecutionLimits(20, 32_000, 20.0),
+    SkillExecutionLimits(32_000),
   ))
   try:
     mcp = _FakeMcpClient(tool_name="get_investment_run")

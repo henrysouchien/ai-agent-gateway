@@ -13,9 +13,7 @@ from agent_gateway.runner_skill_gate import (  # noqa: E402
   default_tool_definitions,
   effective_excluded_tools,
   filter_excluded_tool_definitions,
-  is_report_door_clear_event,
-  normalize_skill_deny,
-  normalize_skill_report_doors,
+  normalize_skill_allow,
 )
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_runner_capability_execution,
@@ -91,22 +89,13 @@ def test_skill_gate_filter_helpers_normalize_inputs() -> None:
   tools = [{"name": "read"}, {"name": "write"}, {"name": "always_hidden"}]
 
   assert effective_excluded_tools({"always_hidden"}, set()) == {"always_hidden"}
-  assert effective_excluded_tools({"always_hidden"}, {"write"}) == {"always_hidden", "write"}
-  assert effective_excluded_tools({"always_hidden"}, set(), {"always_hidden"}) == set()
-  assert effective_excluded_tools(
-    {"always_hidden"},
-    {"always_hidden"},
-    {"always_hidden"},
-  ) == {"always_hidden"}
+  assert effective_excluded_tools({"always_hidden"}, {"always_hidden"}) == set()
   assert filter_excluded_tool_definitions(tools, {"write"}) == [{"name": "read"}, {"name": "always_hidden"}]
   assert filter_excluded_tool_definitions(tools, set()) == tools
-  assert normalize_skill_report_doors({" report ": " skill ", "": "skip", "empty": " "}) == {"report": "skill"}
-  assert normalize_skill_report_doors(None) is None
-  assert normalize_skill_report_doors(["not", "a", "dict"]) == {}
-  assert normalize_skill_deny(" write ") == {"write"}
-  assert normalize_skill_deny([" read ", "", None, "write"]) == {"read", "write"}
-  assert normalize_skill_deny({"write", " read "}) == {"read", "write"}
-  assert normalize_skill_deny({"bad": "mapping"}) is None
+  assert normalize_skill_allow(" write ") == {"write"}
+  assert normalize_skill_allow([" read ", "", None, "write"]) == {"read", "write"}
+  assert normalize_skill_allow({"write", " read "}) == {"read", "write"}
+  assert normalize_skill_allow({"bad": "mapping"}) is None
 
 
 def test_default_tool_definitions_prefers_callback_and_copies_result_list() -> None:
@@ -130,58 +119,11 @@ def test_default_tool_definitions_falls_back_to_mcp_client_and_empty_list() -> N
   assert _make_runner_with_mcp_tools(mcp_tools)._default_tool_definitions() is mcp_tools
 
 
-def test_report_door_clear_event_helper_matches_success_contract() -> None:
-  success_event = {
-    "type": "tool_call_complete",
-    "tool_name": "fms_report",
-    "error": None,
-    "result": {"status": "STAGED", "subcommand": "report", "mutation_mode": "preview"},
-  }
-
-  assert is_report_door_clear_event(success_event, expected_skill="skill", success_statuses={"staged"})
-  assert not is_report_door_clear_event(success_event, expected_skill=None, success_statuses={"staged"})
-  assert not is_report_door_clear_event(
-    {**success_event, "error": {"code": "bad"}},
-    expected_skill="skill",
-    success_statuses={"staged"},
-  )
-  assert not is_report_door_clear_event(
-    {**success_event, "result": {"status": "error", "subcommand": "report", "mutation_mode": "preview"}},
-    expected_skill="skill",
-    success_statuses={"staged"},
-  )
-  assert not is_report_door_clear_event(
-    {**success_event, "result": {"status": "staged", "subcommand": "report", "mutation_mode": "apply"}},
-    expected_skill="skill",
-    success_statuses={"staged"},
-  )
-
-  model_writer_event = {
-    "type": "tool_call_complete",
-    "tool_name": "fms_persist_business_model",
-    "error": None,
-    "result": {"status": "staged", "subcommand": "persist_business_model", "mutation_mode": "model_writer"},
-  }
-  assert is_report_door_clear_event(model_writer_event, expected_skill="skill", success_statuses={"staged"})
-  assert not is_report_door_clear_event(
-    {**model_writer_event, "tool_name": "fms_persist_dcf_relative_valuation"},
-    expected_skill="skill",
-    success_statuses={"staged"},
-  )
-
-
 def test_runner_skill_gate_delegates_filter_and_activate() -> None:
   runner = _make_runner(["read", "write", "always_hidden"])
   base_kwargs: dict[str, Any] = {}
 
   assert runner._default_tool_definitions() == [{"name": "read"}, {"name": "write"}, {"name": "always_hidden"}]
-
-  runner._activate_skill_report_doors({" report ": " skill "})
-  assert runner._active_skill_report_doors == {"report": "skill"}
-  runner._activate_skill_report_doors(None)
-  assert runner._active_skill_report_doors == {"report": "skill"}
-  runner._activate_skill_report_doors("reset")
-  assert runner._active_skill_report_doors == {}
 
   assert runner._effective_excluded_tools() == {"always_hidden"}
   assert runner._filter_excluded_tool_definitions([{"name": "read"}, {"name": "always_hidden"}]) == [{"name": "read"}]
@@ -195,15 +137,6 @@ def test_runner_skill_gate_delegates_filter_and_activate() -> None:
     {"name": "always_hidden"},
   ]
 
-  runner._activate_skill_deny([" write ", ""], base_kwargs)
-
-  assert runner._active_skill_deny == {"write"}
-  assert base_kwargs["tools"] == [{"name": "read"}, {"name": "always_hidden"}]
-
-  runner._activate_skill_deny(["always_hidden"], base_kwargs)
-  assert runner._effective_excluded_tools() == {"always_hidden"}
-  assert base_kwargs["tools"] == [{"name": "read"}, {"name": "write"}]
-
   unchanged_tools = base_kwargs["tools"]
-  runner._activate_skill_deny({"bad": "mapping"}, base_kwargs)
+  runner._activate_skill_allow({"bad": "mapping"}, base_kwargs)
   assert base_kwargs["tools"] is unchanged_tools

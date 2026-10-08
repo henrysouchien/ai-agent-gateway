@@ -140,7 +140,7 @@ def test_sdk_timeout_does_not_replay_dispatched_mutation(
         name: str,
         arguments: dict[str, object],
         *,
-        read_timeout_seconds: float,
+        read_timeout_seconds: float | None,
         meta: dict[str, object] | None = None,
       ) -> CallToolResult:
         mutations.append((self.generation, arguments["value"]))

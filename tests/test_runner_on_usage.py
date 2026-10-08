@@ -590,6 +590,41 @@ def test_apply_message_start_usage_mutates_existing_totals() -> None:
   }
 
 
+def test_provider_wait_is_measured_on_turn_usage_not_refused() -> None:
+  from agent_gateway.rate_limit import AnthropicTokenBucket
+
+  bucket = AnthropicTokenBucket(rpm=600)
+  bucket._rpm_tokens = 0.0
+  waited = asyncio.run(bucket.acquire())
+  assert 0.05 <= waited < 1.0
+
+  before = empty_usage_totals()
+  after = apply_message_start_usage(
+    empty_usage_totals(),
+    input_tokens=10,
+    cache_read_tokens=0,
+    cache_creation_tokens=0,
+    provider_wait_ms=round(waited * 1000),
+  )
+  assert usage_delta(before, after)["provider_wait_ms"] == round(waited * 1000)
+  assert "provider_wait_ms" not in usage_delta(after, after)
+
+  # Portable compaction's provider call waits on the same bucket; its usage
+  # carries the wait and the merge folds it into turn usage.
+  from agent_gateway.provider_summarize import _add_usage_from_event
+  from agent_gateway.runner_run_loop import _merge_usage_totals
+
+  summarize_usage: dict[str, Any] = {}
+  _add_usage_from_event(
+    summarize_usage,
+    StreamEvent(type="message_start", provider_wait_ms=250),
+  )
+  totals = empty_usage_totals()
+  _merge_usage_totals(totals, summarize_usage)
+  assert totals["provider_wait_ms"] == 250
+
+
+
 def test_apply_usage_update_mutates_output_tokens_only() -> None:
   usage = {
     "input_tokens": 20,
@@ -1134,8 +1169,8 @@ def test_on_usage_fires_once_per_turn_with_usage_event_fields() -> None:
   assert event.provider == "stub"
 
 
-@pytest.mark.parametrize("budget", [None, 4.0])
-def test_session_cost_sums_request_tiers_instead_of_repricing_total_tokens(budget) -> None:
+@pytest.mark.parametrize("with_accumulator", [False, True])
+def test_session_cost_sums_request_tiers_instead_of_repricing_total_tokens(with_accumulator) -> None:
   priced_provider = OpenAIProvider()
 
   class _TieredUsageProvider(_UsageProvider):
@@ -1158,7 +1193,7 @@ def test_session_cost_sums_request_tiers_instead_of_repricing_total_tokens(budge
   usage_events: list[UsageEvent] = []
   event_log = EventLog()
   provider = _TieredUsageProvider()
-  accumulator = CostAccumulator(budget) if budget is not None else None
+  accumulator = CostAccumulator() if with_accumulator else None
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log),
@@ -1205,14 +1240,18 @@ def test_portable_compaction_cost_keeps_request_tiers_separate(tmp_path: Path) -
       yield StreamEvent(type="text_delta", text=text)
       yield StreamEvent(type="text_end", raw_block={"type": "text", "text": text})
       yield StreamEvent(type="usage_update", output_tokens=1_000)
-      yield StreamEvent(type="message_end", stop_reason="end_turn")
+      yield StreamEvent(
+        type="message_end",
+        stop_reason="end_turn",
+        request_input_tokens=260_000 if is_compaction else 15_000,
+      )
 
   usage_events: list[UsageEvent] = []
   summaries: list[SessionUsageSummary] = []
   event_log = EventLog()
   durable_log = AgentSessionLog(path=tmp_path / "compaction-pricing.jsonl")
   provider = _CompactionUsageProvider()
-  accumulator = CostAccumulator(4.0)
+  accumulator = CostAccumulator()
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log),
@@ -1236,7 +1275,7 @@ def test_portable_compaction_cost_keeps_request_tiers_separate(tmp_path: Path) -
   assert (completion["usage"]["estimated_cost"], completion["terminal_disposition"]) == (
     pytest.approx(2.85), "completed",
   )
-  assert not any(event.get("type") == "budget_exceeded" for event in events)
+  assert not any(event.get("type") == "interrupted" for event in events)
   assert accumulator.total == pytest.approx(2.85)
   assert [event.cost_usd for event in usage_events] == pytest.approx([2.65, 0.20])
   assert [(event.input_tokens, event.output_tokens) for event in usage_events] == [
@@ -1250,9 +1289,15 @@ def test_portable_compaction_cost_keeps_request_tiers_separate(tmp_path: Path) -
     assert usage["input_tokens"] == 275_000
     assert usage["output_tokens"] == 2_000
     assert usage["estimated_cost"] == pytest.approx(2.85)
+  # GP12: turn_complete measures the request actually submitted — the
+  # compacted one, below the 24k trigger the uncompacted history exceeded —
+  # and the model's window; nothing stops the run at either. The provider's
+  # own prompt count for that request rides beside the summed usage.
+  assert 0 < turn_complete["est_input_tokens"] < 24_000
+  assert turn_complete["request_input_tokens"] == 15_000
+  assert turn_complete["context_window"] == 30_000
   assistant_messages, _ = _run(durable_log.query(event_types={"assistant_message"}, order="asc"))
   assert assistant_messages[0].event["usage"]["estimated_cost"] == pytest.approx(2.85)
-  assert assistant_messages[0].event["content_blocks"][0]["type"] == "compaction"
 
 
 def test_runner_preserves_cumulative_typed_provider_unit_deltas(
@@ -1626,7 +1671,6 @@ def test_spawn_sub_agent_emits_usage_with_parent_turn_id(tmp_path: Path) -> None
       skill_name="test-child",
       dispatcher=_make_dispatcher(),
       sub_session=sub_session,
-      max_turns=1,
       parent_turn_id="tool-run-agent-1",
     )
   )
@@ -1781,7 +1825,6 @@ def test_native_compaction_block_counts_once_in_session_summary(
         "content": "trigger native compaction",
       }],
       system_prompt="base prompt",
-      max_turns=2,
     )
   )
 
@@ -1876,11 +1919,18 @@ def test_runner_session_summary_reports_failed_drain_and_in_flight_tasks() -> No
     )
     runner._task_registry = task_registry
 
+    # The never-finishing task is the drain failure under test; the run must
+    # not wait on it for a notification (a run has no turn limit that would
+    # end it early, so the wait is stubbed).
+    async def _no_notification() -> bool:
+      return False
+
+    runner._wait_for_background_notification = _no_notification
+
     try:
       with pytest.raises(RuntimeError, match="drain failed"):
         await runner.run(
           messages=[{"role": "user", "content": "hello"}],
-          max_turns=1,
         )
 
       assert len(summaries) == 1
@@ -1979,7 +2029,6 @@ def test_spawn_sub_agent_no_wall_clock(
       **_subagent_identity("sub0:sess-parent"),
       skill_name="test-child",
       dispatcher=_make_dispatcher(),
-      max_turns=1,
     )
   )
 

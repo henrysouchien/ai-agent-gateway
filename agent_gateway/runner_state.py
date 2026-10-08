@@ -5,13 +5,8 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Mapping, Sequence, Set, Tuple
 
 from .runner_budget import (
-  ChildCostAccumulator as ChildCostAccumulator,
   CostAccumulator as CostAccumulator,
-  ProviderRequestBudgetError as ProviderRequestBudgetError,
-  admit_provider_request_budget as admit_provider_request_budget,
   budget_cost_progress as budget_cost_progress,
-  budget_exceeded_state as budget_exceeded_state,
-  budget_reason_suffix as budget_reason_suffix,
 )
 from model_authority.thinking import parse_effort
 
@@ -797,7 +792,6 @@ class SubAgentConfig:
 
   excluded_tools: Set[str]
   system_prompt: str | None = None
-  max_turns: int = 15
   model: str | None = None
 
 
@@ -810,6 +804,8 @@ class StreamTurnResult:
   first_token_t: float | None = None
   content_blocks: List[Dict[str, Any]] = field(default_factory=list)
   advertised_tool_names: frozenset[str] | None = None
+  # Final invocation's absolute prompt, independent of additive billed usage.
+  request_input_tokens: int | None = None
 
 
 @dataclass(frozen=True)

@@ -12,13 +12,12 @@ def _build(**overrides):
   return build_autonomous_cmd(**overrides)
 
 
-def test_skill_command_carries_budget_and_delivery_suppression() -> None:
+def test_skill_command_carries_delivery_suppression() -> None:
   assert _build(
     mode="skill",
     skill="thesis-review",
     ticker="foo",
     context="context",
-    max_budget_usd=12,
     deliver=False,
   ) == [
     "/usr/bin/python3",
@@ -26,11 +25,9 @@ def test_skill_command_carries_budget_and_delivery_suppression() -> None:
     "agent.autonomous",
     "--profile",
     "research_producer",
+    "--no-deliver",
     "--skill",
     "thesis-review",
-    "--no-deliver",
-    "--max-budget-usd",
-    "12.0",
     "--ticker",
     "FOO",
     "--context",
@@ -51,8 +48,26 @@ def test_pack_command_is_closed_to_exact_pack_name() -> None:
 
   with pytest.raises(ValueError, match="only accepts the pack"):
     _build(mode="pack", pack="morning-pack", ticker="FOO")
-  with pytest.raises(ValueError, match="deliver=False requires"):
-    _build(mode="pack", pack="morning-pack", deliver=False)
+
+
+@pytest.mark.parametrize(
+  ("overrides", "tail"),
+  [
+    ({"mode": "once"}, []),
+    ({"mode": "task", "task": "work"}, ["--task", "work"]),
+    ({"mode": "pack", "pack": "morning-pack"}, ["--pack", "morning-pack"]),
+  ],
+)
+def test_every_mode_carries_delivery_suppression(overrides, tail) -> None:
+  assert _build(deliver=False, **overrides) == [
+    "/usr/bin/python3",
+    "-m",
+    "agent.autonomous",
+    "--profile",
+    "research_producer",
+    "--no-deliver",
+    *tail,
+  ]
 
 
 @pytest.mark.parametrize(

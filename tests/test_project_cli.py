@@ -71,8 +71,6 @@ def test_create_agent_from_yaml_forwards_resolved_config(
         "mcp_servers": {"fs": {"command": "npx", "args": ["-y", "server", "."]}},
         "code_execution": True,
         "max_tokens": 2048,
-        "max_turns": 8,
-        "max_budget_usd": 1.5,
       },
       sort_keys=False,
     ),
@@ -101,8 +99,6 @@ def test_create_agent_from_yaml_forwards_resolved_config(
       "skill_state_file": tmp_path / "skill_state.json",
       "outputs_dir": tmp_path / "artifacts",
       "code_execution": True,
-      "max_turns": 8,
-      "max_budget_usd": 1.5,
       "prefix": "/v2",
     }
   ]
@@ -348,7 +344,13 @@ def test_project_config_rejects_unknown_key_naming_it(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
   "retired_line",
-  ["per_turn_timeout: 300", "provider: anthropic", "model: claude-sonnet-4"],
+  [
+    "per_turn_timeout: 300",
+    "provider: anthropic",
+    "model: claude-sonnet-4",
+    "max_turns: 8",
+    "max_budget_usd: 1.5",
+  ],
 )
 def test_project_config_loads_retired_key_with_warning(
   tmp_path: Path, caplog: pytest.LogCaptureFixture, retired_line: str

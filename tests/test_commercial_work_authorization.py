@@ -218,7 +218,6 @@ def test_verifier_enforces_key_retirement_iat_and_token_window() -> None:
   ("payload_changes", "expected"),
   (
     ({"kid": "other-key"}, "key_id_mismatch"),
-    ({"workflow_attempt_number": 2}, "invalid_attempt_shape"),
     ({"reservation_id": None}, "invalid_authority_shape"),
     ({"primary_inference_observability": "hank_byok_observed"},
      "invalid_authority_shape"),
@@ -234,6 +233,30 @@ def test_verifier_rejects_signed_but_invalid_authority_shape(
       _verifier(public),
       _token(private, _payload(**payload_changes)),
     )
+
+
+def test_verifier_records_attempt_lineage_without_judging_its_shape() -> None:
+  private, public = _keypair()
+  verified = _verify(
+    _verifier(public),
+    _token(private, _payload(workflow_attempt_number=2)),
+  )
+  assert verified.workflow_attempt_kind == "initial"
+  assert verified.workflow_attempt_number == 2
+  assert verified.retry_of_workflow_run_id is None
+
+
+def test_verifier_accepts_long_signed_authorization_and_records_its_window() -> None:
+  private, public = _keypair()
+  verified = _verify(
+    _verifier(public),
+    _token(private, _payload(exp=NOW + 600)),
+    execution_claim=_claim(
+      authorized_work_start_deadline=NOW + 900, expires_at=NOW + 900,
+    ),
+  )
+  assert (verified.issued_at, verified.expires_at) == (NOW, NOW + 600)
+
 
 
 def test_verifier_rejects_tamper_unknown_key_and_unsafe_headers() -> None:

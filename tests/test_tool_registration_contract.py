@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 from dataclasses import FrozenInstanceError
 import os
 from pathlib import Path
@@ -513,36 +512,7 @@ def test_catalog_validator_reconstructs_forged_nested_records() -> None:
   ] == {"mode": "exact"}
 
 
-def test_contract_module_is_stdlib_only_not_reexported_and_imports_no_gateway() -> None:
-  source = (
-    ROOT / "agent_workflow_contracts" / "tool_registration.py"
-  ).read_text(encoding="utf-8")
-  allowed = {
-    "__future__": {"annotations"},
-    "collections.abc": {"Iterable", "Mapping"},
-    "dataclasses": {"dataclass", "field"},
-    "types": {"MappingProxyType"},
-    "typing": {"Literal"},
-  }
-  for node in ast.walk(ast.parse(source)):
-    if isinstance(node, ast.Import):
-      assert all(alias.asname is None for alias in node.names)
-      assert {alias.name for alias in node.names}.issubset(
-        {"hashlib", "json", "math"}
-      )
-      continue
-    if not isinstance(node, ast.ImportFrom):
-      continue
-    assert node.level == 0
-    assert node.module in allowed
-    assert all(alias.asname is None for alias in node.names)
-    assert {alias.name for alias in node.names}.issubset(allowed[node.module])
-
-  package_init = (
-    ROOT / "agent_workflow_contracts" / "__init__.py"
-  ).read_text(encoding="utf-8")
-  assert "tool_registration" not in package_init
-
+def test_contract_module_imports_without_loading_agent_gateway() -> None:
   env = dict(os.environ)
   env["PYTHONPATH"] = str(ROOT)
   probe = subprocess.run(

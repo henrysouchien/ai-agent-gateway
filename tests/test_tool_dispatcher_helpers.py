@@ -57,6 +57,25 @@ def test_tool_execution_context_emits_and_tracks_abort() -> None:
   assert ctx.aborted is True
   asyncio.run(asyncio.wait_for(ctx.wait_aborted(), timeout=0.1))
 
+def test_tool_execution_context_emit_owns_its_delivery_failure() -> None:
+  """A tool's secondary event never fails the tool: the channel logs and the log
+  closes itself under its own ``raise`` policy (HUBS run 2 catch-all ratchet)."""
+
+  def failing_subscriber(_event: object, _session_id: str) -> None:
+    raise TimeoutError("secondary event delivery timed out")
+
+  event_log = EventLog(on_event=failing_subscriber, on_event_error="raise")
+  ctx = dispatcher_module.ToolExecutionContext(
+    tool_call_id="tool-1",
+    tool_name="demo",
+    event_log=event_log,
+  )
+
+  ctx.emit({"type": "artifact_ready", "artifact_id": "a-1"})
+
+  assert event_log.closed is True
+
+
 
 def test_intercept_decision_rejects_unknown_action() -> None:
   with pytest.raises(ValueError, match="Invalid interceptor action"):
@@ -94,3 +113,42 @@ def test_run_interceptors_helper_returns_first_pending_ask_and_warnings() -> Non
     code="ask_policy",
   )
   assert [entry.event["action"] for entry in event_log.entries] == ["warn", "ask"]
+
+
+_POSTCOMPILE_SCHEMA = {
+  "type": "object",
+  "properties": {
+    "context_ref": {"type": "string"},
+    "judgment": {"type": "object"},
+    "credential_note": {"type": "string"},
+  },
+  "required": ["context_ref", "judgment"],
+  "additionalProperties": False,
+}
+
+
+@pytest.mark.parametrize(
+  ("tool_input", "fragment"),
+  [
+    ({}, "missing required field(s): context_ref, judgment"),
+    ({"context_ref": "ctx-1", "credential_note": "sk-secret"}, "missing required field(s): judgment"),
+    (["not", "an", "object"], "expected object, got array"),
+  ],
+)
+def test_schema_refusal_names_the_fields_and_no_call_without_echoing_input(
+  tool_input,
+  fragment,
+) -> None:
+  error = dispatcher_helpers.validate_against_local_schema(
+    "fms_persist_postcompile_valuation",
+    tool_input,
+    _POSTCOMPILE_SCHEMA,
+  )
+
+  assert error is not None
+  assert error["code"] == "invalid_tool_input_schema"
+  assert "'fms_persist_postcompile_valuation'" in error["message"]
+  assert fragment in error["message"]
+  # Re-sending this tool with an empty or echoed input repeats the refusal.
+  assert error["next_call"] is None
+  assert "sk-secret" not in repr(error)

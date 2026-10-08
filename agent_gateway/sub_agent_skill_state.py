@@ -6,7 +6,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from agent_workflow_contracts import TaskResult, ToolGrant
+from agent_workflow_contracts import AdmittedTask, TaskResult, ToolGrant
 from pydantic import ValidationError
 
 _FAILURE_OUTCOME_BY_STATUS = {
@@ -25,6 +25,12 @@ _FAILURE_FMS_STATUSES = frozenset({
 })
 _FMS_DOOR_PREFIX = "fms_"
 _FMS_NON_TERMINAL_PREFIXES = ("fms_compute_",)
+# A context-bound named operation opens its exact handoff through one granted
+# read named ``get_<artifact>_context``; the locator it returns is what the
+# terminal door consumes. Same derivation as the ``fms_`` door prefix: read
+# off the admitted grant, never enumerated per skill.
+_CONTEXT_DOOR_PREFIX = "get_"
+_CONTEXT_DOOR_SUFFIX = "_context"
 _TERMINAL_SUCCESS_STATUSES = frozenset({
   "applied",
   "noop",
@@ -45,7 +51,6 @@ class ChildOutcomeClassification:
   outcome: str
   succeeded: bool
   error: dict[str, Any] | None
-  semantic: str | None = None
   execution_status: str = "failed"
 
 
@@ -61,10 +66,77 @@ def declared_terminal_doors_from_grant(grant: ToolGrant | None) -> frozenset[str
   )
 
 
+def terminal_result_doors(admitted_task: AdmittedTask | None) -> frozenset[str]:
+  """Return the declared doors whose accepted result is the child's result.
+
+  An accepted result from one of these doors ends the run and is what the
+  parent reads. An operation that persists several units and then reports
+  declares ``terminal_on_persist: false``: none of its doors ends the run, its
+  narrative is its result, and a refused door still settles it (the refusal
+  reads the grant's doors, not these).
+  """
+
+  if admitted_task is None or not admitted_task.operation.terminal_on_persist:
+    return frozenset()
+  return declared_terminal_doors_from_grant(admitted_task.tool_grant)
+
+
 def _is_declared_terminal_door(tool_id: str) -> bool:
   if not tool_id.startswith(_FMS_DOOR_PREFIX):
     return False
   return not tool_id.startswith(_FMS_NON_TERMINAL_PREFIXES)
+
+
+def declared_context_doors_from_grant(grant: ToolGrant | None) -> frozenset[str]:
+  """Return the context doors the child's admitted grant declares."""
+
+  if grant is None:
+    return frozenset()
+  return frozenset(
+    entry.tool_id
+    for entry in grant.tools
+    if entry.effect == "read"
+    and entry.tool_id.startswith(_CONTEXT_DOOR_PREFIX)
+    and entry.tool_id.endswith(_CONTEXT_DOOR_SUFFIX)
+  )
+
+
+def _door_refused(result: Any) -> bool:
+  if not isinstance(result, Mapping):
+    return False
+  return (
+    str(result.get("gate_code") or "").strip() == "STOP"
+    or str(result.get("status") or "").strip().lower() in _FAILURE_FMS_STATUSES
+  )
+
+
+def latest_declared_door_refusal(
+  declared_doors: Iterable[str],
+  tool_events: Iterable[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+  """Return the child's last declared-door answer, verbatim, when it refused.
+
+  The doors are the grant's terminal and context doors. When the last of them
+  the child called answered ``STOP`` or an error status, that answer — with
+  its own ``next_call`` — is what the child settles on and the parent reads.
+  A later accepted call supersedes an earlier refusal, and a transport
+  failure carries no door answer.
+  """
+
+  doors = frozenset(declared_doors)
+  last: Mapping[str, Any] | None = None
+  for event in tool_events:
+    if (
+      event.get("type") == "tool_call_complete"
+      and event.get("tool_name") in doors
+    ):
+      last = event
+  if last is None or not _door_refused(last.get("result")):
+    return None
+  return {
+    "tool_name": str(last["tool_name"]),
+    "result": dict(last["result"]),
+  }
 
 
 def _failure_classification(
@@ -73,7 +145,6 @@ def _failure_classification(
   message: str,
   outcome: str = "error",
   execution_status: str = "failed",
-  semantic: str | None = None,
 ) -> ChildOutcomeClassification:
   return ChildOutcomeClassification(
     outcome=outcome,
@@ -82,90 +153,48 @@ def _failure_classification(
       "code": reason,
       "message": message,
       "child_outcome": outcome,
+      "next_call": None,
     },
-    semantic=semantic,
     execution_status=execution_status,
   )
 
 
-def _named_door_classification(
+def _door_result_classification(
   *,
-  declared_terminal_doors: frozenset[str],
-  tools_used: Sequence[str],
   door_results: Sequence[Mapping[str, Any]],
-  process_classification: ChildOutcomeClassification,
+  process_outcome: str,
 ) -> ChildOutcomeClassification:
-  invoked = declared_terminal_doors.intersection(tools_used)
-  matching_results = [
-    result
-    for result in door_results
-    if result.get("tool_name") in declared_terminal_doors
-  ]
-  if not invoked and not matching_results:
-    doors = ", ".join(sorted(declared_terminal_doors))
-    return _failure_classification(
-      reason="terminal_door_not_invoked",
-      message=(
-        "Named agent-operation ended without invoking its declared "
-        f"terminal door ({doors})"
-      ),
-      outcome="blocked",
-      semantic="none",
-    )
-  terminal = matching_results[-1] if matching_results else None
-  if terminal is not None:
-    raw_status = str(terminal.get("status") or "").strip().lower()
+  """Record the child's last FMS door answer on its skill lifecycle event.
+
+  The lifecycle event mirrors what the door returned; the door's own error is
+  the event's error. The ``run_agent`` settlement does not read this: it
+  settles on the door answer itself (``latest_declared_door_refusal``).
+  """
+
+  terminal = door_results[-1] if door_results else None
+  if terminal is not None and _door_refused(terminal):
     gate_code = str(terminal.get("gate_code") or "").strip()
-    if gate_code == "STOP" or raw_status in _FAILURE_FMS_STATUSES:
-      reason = "terminal_door_stop" if gate_code == "STOP" else "terminal_door_error"
-      message = (
-        f"Named agent-operation terminal door returned {gate_code or raw_status}"
-      )
-      error = terminal.get("error")
-      if isinstance(error, Mapping):
-        detail = error.get("message") or error.get("type")
-        if detail:
-          message = str(detail)
-      return _failure_classification(
-        reason=reason,
-        message=message,
-        outcome="blocked",
-        semantic="stop" if gate_code == "STOP" else "none",
-      )
+    raw_status = str(terminal.get("status") or "").strip().lower()
+    message = f"{terminal.get('tool_name')} returned {gate_code or raw_status}"
+    error = terminal.get("error")
+    if isinstance(error, Mapping):
+      detail = error.get("message") or error.get("type")
+      if detail:
+        message = str(detail)
+    return ChildOutcomeClassification(
+      outcome="blocked",
+      succeeded=False,
+      error={
+        "code": gate_code or raw_status,
+        "message": message,
+        "child_outcome": "blocked",
+      },
+    )
   return ChildOutcomeClassification(
-    outcome=process_classification.outcome,
+    outcome=process_outcome,
     succeeded=True,
     error=None,
-    semantic="terminal_door",
     execution_status="succeeded",
-  )
-
-
-def classify_declared_door_outcome(
-  *,
-  declared_terminal_doors: Iterable[str],
-  tools_used: Sequence[str],
-  door_results: Sequence[Mapping[str, Any]] = (),
-  process_outcome: str = "not_assessed",
-) -> ChildOutcomeClassification:
-  declared = frozenset(declared_terminal_doors)
-  if not declared:
-    return ChildOutcomeClassification(
-      outcome=process_outcome,
-      succeeded=True,
-      error=None,
-      execution_status="succeeded",
-    )
-  return _named_door_classification(
-    declared_terminal_doors=declared,
-    tools_used=tools_used,
-    door_results=door_results,
-    process_classification=ChildOutcomeClassification(
-      outcome=process_outcome,
-      succeeded=True,
-      error=None,
-      execution_status="succeeded",
-    ),
   )
 
 
@@ -328,13 +357,7 @@ def classify_child_outcome(
       execution_status="failed",
     )
 
-  try:
-    task_result = TaskResult.model_validate(result)
-  except ValidationError as exc:
-    return _failure_classification(
-      reason="invalid_child_result",
-      message=f"Sub-agent returned an invalid result: {exc.errors()[0]['msg']}",
-    )
+  task_result = TaskResult.model_validate(result)
 
   execution = task_result.execution
   if execution.status != "succeeded":
@@ -346,21 +369,18 @@ def classify_child_outcome(
       execution_status=execution.status,
     )
 
-  process_classification = ChildOutcomeClassification(
-    outcome=(
+  declared = frozenset(declared_terminal_doors or ())
+  return _door_result_classification(
+    door_results=tuple(
+      door_result
+      for door_result in door_results or ()
+      if door_result.get("tool_name") in declared
+    ),
+    process_outcome=(
       task_result.outcome.disposition
       if task_result.outcome is not None
       else "not_assessed"
     ),
-    succeeded=True,
-    error=None,
-    execution_status="succeeded",
-  )
-  return classify_declared_door_outcome(
-    declared_terminal_doors=declared_terminal_doors or (),
-    tools_used=task_result.evidence.tools_used,
-    door_results=tuple(door_results or ()),
-    process_outcome=process_classification.outcome,
   )
 
 
@@ -486,8 +506,9 @@ async def persist_skill_state(
 __all__ = [
   "ChildOutcomeClassification",
   "classify_child_outcome",
-  "classify_declared_door_outcome",
+  "latest_declared_door_refusal",
   "accepted_declared_terminal_tool_result_value",
+  "declared_context_doors_from_grant",
   "declared_terminal_doors_from_grant",
   "declared_terminal_tool_result_disposition",
   "latest_successful_declared_terminal_tool_result",
@@ -495,4 +516,5 @@ __all__ = [
   "result_response_text",
   "skill_state_prompt",
   "terminal_fms_result_disposition",
+  "terminal_result_doors",
 ]

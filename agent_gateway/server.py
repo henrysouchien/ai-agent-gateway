@@ -48,11 +48,7 @@ from .skill_limits import (
 from .control_plane import create_control_plane_router
 from .control_plane.middleware import add_control_plane_version_header_middleware
 from .control_plane.session import _resolve_control_identity
-from .commercial_work_start import (
-  COMMERCIAL_CLAIM_HEADER,
-  COMMERCIAL_WORK_AUTHORIZATION_HEADER,
-  CommercialWorkStartError,
-)
+from .commercial_work_start import CommercialWorkStartError
 from model_authority.binding import CapabilityResolutionError, eligible_model_choices
 from model_authority.capabilities import GATEWAY_EXECUTED_CAPABILITY_IDS
 from .event_log import EventLog, UserEventBus
@@ -82,6 +78,10 @@ from .session import (
   session_owner_user_id,
 )
 from .ui_blocks_metrics import snapshot as ui_blocks_metrics_snapshot
+from .launch_nonce_store import (
+  launch_nonce_store_path,
+  launch_nonce_store_row_count,
+)
 
 from . import server_chat_helpers as _server_chat_helpers  # noqa: F401 - dynamic streaming deps alias
 from . import server_chat_control_routes as _server_chat_control_routes
@@ -115,6 +115,7 @@ from .server_models import (  # noqa: F401
   RequestContext,
   GatewayServerConfig,
   MaterializedCredential,
+  SessionResumeRefusalReason,
 )
 from .server_artifact_helpers import (  # noqa: F401
   _normalize_prefix,
@@ -167,11 +168,7 @@ def _generic_skill_admission_policy_resolver(
         bool(profile.resumable)
         and profile.mutation_mode != "model_writer"
       ),
-      execution_limits=SkillExecutionLimits(
-        max_turns=profile.max_turns,
-        max_tokens=profile.max_tokens,
-        max_budget_usd=profile.max_budget_usd,
-      ),
+      execution_limits=SkillExecutionLimits(max_tokens=profile.max_tokens),
     )
 
   return resolve
@@ -890,7 +887,6 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     store_for=app.state.agent_run_schedule_store_for,
     users_root=agent_run_schedule_users_root(),
     autonomous_registry=app.state.subprocess_registry,
-    profile_loader=config.control_profile_loader,
     user_event_bus_factory=lambda: getattr(app.state, "user_event_bus", None),
   )
 
@@ -1050,8 +1046,45 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       status, error_payload = _resolver_contract_payload(str(exc), user_id=resolved_user_id)
       return JSONResponse(error_payload, status_code=status)
 
+    api_key_hash = AuthManager.hash_api_key(payload.api_key)
+    resume_log_path: Path | None = None
+    if payload.resume_session_id is not None:
+      # Resolve, check and bind with no await in between: two inits presenting
+      # one log cannot both pass the live-session check.
+      resume_resolver = config.session_resume_resolver
+      resume_outcome: Path | SessionResumeRefusalReason = (
+        resume_resolver(
+          resume_session_id=payload.resume_session_id,
+          user_id=resolved_user_id,
+          channel=resolved_channel,
+          api_key_hash=api_key_hash,
+        )
+        if resume_resolver is not None
+        else "not_found"
+      )
+      if isinstance(resume_outcome, Path):
+        prior_session = auth.session_store.live_session_bound_to_log(
+          resume_outcome
+        )
+        if prior_session is not None:
+          # The resolver proved this log is the caller's (same user and api
+          # key), so the session holding it is the caller's own: a turn still
+          # answering keeps it; an idle one is retired as the new one binds,
+          # so two live sessions never hold one log.
+          prior_turn = prior_session.active_turn
+          if prior_turn is not None and prior_turn.in_progress:
+            resume_outcome = "in_use"
+          else:
+            auth.session_store.expire_session(prior_session.session_id)
+      if not isinstance(resume_outcome, Path):
+        return JSONResponse(
+          {"error": "session_resume_refused", "reason": resume_outcome},
+          status_code=409,
+        )
+      resume_log_path = resume_outcome
+
     session = auth.session_store.create_session(
-      api_key_hash=AuthManager.hash_api_key(payload.api_key),
+      api_key_hash=api_key_hash,
       user_id=resolved_user_id,
       user_email=identity.user_email,
       risk_user_id=identity.risk_user_id,
@@ -1071,6 +1104,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       allow_service_for_interactive=resolved_allow_service_for_interactive,
     )
     session.channel = resolved_channel
+    session.resume_log_path = resume_log_path
     session.is_public = resolved_channel == "public"
     bind_session_approval_route(
       session,
@@ -1111,7 +1145,15 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       auth.session_store.expire_session(session.session_id)
       raise
     token = auth.issue_token(session)
-    log.info("Session created: %s", session.session_id)
+    log.info(
+      "Session created: %s%s",
+      session.session_id,
+      (
+        f" (resumed from {payload.resume_session_id})"
+        if resume_log_path is not None
+        else ""
+      ),
+    )
     response.headers["Cache-Control"] = "private, no-store"
     return ChatInitResponse(
       user_id=resolved_user_id,
@@ -1123,16 +1165,14 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         session=session,
         build_chat_runtime=app.state.gateway_build_chat_runtime,
       ),
+      resumed_from_session_id=(
+        payload.resume_session_id if resume_log_path is not None else None
+      ),
     )
 
   def _model_preference_session(request: Request) -> GatewaySession:
     token = AuthManager.get_bearer_token(request.headers.get("Authorization"))
     session, _claims = auth.verify_token_with_payload(token)
-    if session.kind != "chat":
-      raise HTTPException(
-        status_code=400,
-        detail="model preferences require a chat session",
-      )
     return session
 
   @router.put(
@@ -1150,10 +1190,10 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       raise HTTPException(status_code=503, detail="model preference store is unavailable")
     normalized_capability = str(capability_id or "").strip()
     policy = model_selection_policy.capabilities.get(normalized_capability)
-    if policy is None or not policy.allow_saved_preference:
+    if policy is None:
       raise HTTPException(
         status_code=422,
-        detail=f"saved preference is not allowed for {normalized_capability!r}",
+        detail=f"no model-selection policy exists for {normalized_capability!r}",
       )
     resolver = _capability_execution_resolver_for_session(
       session=session,
@@ -1247,12 +1287,6 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     if store is None:
       raise HTTPException(status_code=503, detail="model preference store is unavailable")
     normalized_capability = str(capability_id or "").strip()
-    policy = model_selection_policy.capabilities.get(normalized_capability)
-    if policy is None or not policy.allow_saved_preference:
-      raise HTTPException(
-        status_code=422,
-        detail=f"saved preference is not allowed for {normalized_capability!r}",
-      )
     resolver = _capability_execution_resolver_for_session(
       session=session,
       build_chat_runtime=app.state.gateway_build_chat_runtime,
@@ -1324,9 +1358,21 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         },
         status_code=400,
       )
+    # A control bearer is the owner's control-plane credential and owns no chat
+    # transcript or runner; a chat run is started by POST /control/runs
+    # kind=chat, which mints the chat session. This is the only path on which a
+    # control session can reach turn dispatch (the control-run paths dispatch
+    # chat-kind sessions only), checked before any commercial authorization is
+    # consumed.
     if session.kind != "chat":
       return JSONResponse(
-        {"error": "invalid_session_kind", "message": "control sessions cannot dispatch chat turns"},
+        {
+          "error": "invalid_session_kind",
+          "message": (
+            "control sessions own no chat transcript; start a chat run with "
+            "POST /control/runs kind=chat, which mints the chat session"
+          ),
+        },
         status_code=400,
       )
     raw_channel = (body.context or {}).get("channel")
@@ -1353,6 +1399,9 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       investment_artifact_selection=body.investment_artifact_selection,
     )
     commercial_gate = config.commercial_work_start_gate
+    # A session admits one active turn (its transcript and runner state take
+    # one writer); under commercial gating this is checked before consume so a
+    # one-time work authorization is never spent on a turn that cannot attach.
     if (
       commercial_gate is not None
       and commercial_gate.enabled
@@ -1370,38 +1419,16 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         status_code=409,
       )
     raw_purpose = (body.context or {}).get("purpose")
-    normalized_purpose = (
+    session.purpose = (
       raw_purpose.strip().lower()
       if isinstance(raw_purpose, str) and raw_purpose.strip()
       else None
     )
-    if normalized_purpose == "normalizer":
-      return JSONResponse(
-        {
-          "error": "purpose_unavailable",
-          "message": "The normalizer chat purpose is unavailable.",
-        },
-        status_code=400,
-      )
-    session.purpose = normalized_purpose
     try:
       pending_work_start = None
-      if commercial_gate is None:
-        if (
-          request.headers.get(COMMERCIAL_CLAIM_HEADER) is not None
-          or request.headers.get(COMMERCIAL_WORK_AUTHORIZATION_HEADER) is not None
-        ):
-          return JSONResponse(
-            {
-              "error": "commercial_work_start_disabled",
-              "message": "Commercial work-start authorization is disabled.",
-            },
-            status_code=403,
-          )
-      else:
-        if commercial_gate.enabled:
-          commercial_dispatch_owner = object()
-          session._commercial_dispatch_owner = commercial_dispatch_owner
+      if commercial_gate is not None and commercial_gate.enabled:
+        commercial_dispatch_owner = object()
+        session._commercial_dispatch_owner = commercial_dispatch_owner
       prepared_turn = prepare_session_driver_turn(
         session,
         inputs,
@@ -1487,7 +1514,10 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         except Exception:
           pass
 
-    event_log = EventLog(session_id=sid, defer_terminal_close=bool(body.drain_trailing))
+    # A chat turn keeps its log open past the terminal until the turn ends, so
+    # the answer turn's citation_validation record still lands after the client
+    # is released (RunnerWithCitationValidation); the dispatch closes the log.
+    event_log = EventLog(session_id=sid, defer_terminal_close=True)
     active_turn = SessionStream(event_log=event_log, runner_task=None)
     try:
       dispatch_task = asyncio.create_task(
@@ -1646,21 +1676,27 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         additional_contracts.add(CONTRACT_INVESTMENT_SELECTED_CONTENT_V1)
     return JSONResponse(
       {
-        "status": (
-          "error"
-          if approval_delivery_fatal_error is not None
-          else "ok"
-        ),
+        "status": "ok",
         "package": package_health(
           additional_contracts=frozenset(additional_contracts)
         ),
         "counters": ui_blocks_metrics_snapshot(),
+        # Informational: the launch-nonce ledger's admission row count is a
+        # measurement and never changes ``status`` or the HTTP code.
+        "autonomous_admission_ledger": {
+          "rows": launch_nonce_store_row_count(
+            launch_nonce_store_path(
+              app.state.subprocess_registry._log_dir.resolve()
+            )
+          ),
+        },
+        # Informational: a failing approval-delivery coordinator is product
+        # state reported for its readers; it never changes ``status`` or the
+        # HTTP code, which assert only that this process is serving.
+        "approval_delivery": {
+          "fatal_error": approval_delivery_fatal_error,
+        },
       },
-      status_code=(
-        503
-        if approval_delivery_fatal_error is not None
-        else 200
-      ),
     )
 
   app.include_router(router)

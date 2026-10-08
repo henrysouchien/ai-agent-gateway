@@ -10,7 +10,6 @@ from agent_gateway.artifact_paths import canonicalize_ticker
 
 CORPUS_READINESS_TOOL = "check_corpus_readiness"
 CORPUS_REQUIREMENTS_FIELD = "corpus_requirements"
-CORPUS_GATED_PIPELINE_TEMPLATES = frozenset({"valuation-ready"})
 
 _PERIOD_RE = re.compile(r"^[0-9]{4}-(?:Q[1-4]|FY)$")
 _REQUIREMENT_KEYS = frozenset({
@@ -51,7 +50,11 @@ async def require_corpus_readiness(
   *,
   app_state: Any,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-  """Fail closed on declared corpus gaps before batch admission or spend."""
+  """Observe declared corpus requirements without gating batch admission.
+
+  Missing content and unavailable checks are warnings; only malformed external
+  requirement declarations raise. An unavailable check is not a ready corpus.
+  """
 
   normalized_payload, requirements = _normalize_requirements(payload)
   if not requirements:
@@ -59,22 +62,45 @@ async def require_corpus_readiness(
 
   gateway_config = getattr(app_state, "gateway_config", None)
   mcp_client = getattr(gateway_config, "mcp_client", None)
+  unavailable_message = None
   if mcp_client is None or not callable(getattr(mcp_client, "call_tool", None)):
-    raise _unavailable_error("The corpus readiness service is not configured.")
+    unavailable_message = "The corpus readiness service is not configured."
 
-  get_server_for_tool = getattr(mcp_client, "get_server_for_tool", None)
-  if callable(get_server_for_tool) and get_server_for_tool(CORPUS_READINESS_TOOL) is None:
-    raise _unavailable_error("The corpus readiness tool is not connected.")
-
-  checks = await asyncio.gather(
-    *(
-      _check_one_requirement(mcp_client, requirement)
+  if unavailable_message is not None:
+    checks = [
+      _unavailable_check(requirement, unavailable_message)
       for requirement in requirements
+    ]
+  else:
+    checks = await asyncio.gather(
+      *(
+        _check_one_requirement(mcp_client, requirement)
+        for requirement in requirements
+      )
     )
-  )
+  warnings = []
+  for requirement, check in zip(requirements, checks):
+    if check["ready"] is True:
+      continue
+    unavailable = check["ready"] is None
+    warnings.append({
+      "code": "corpus_readiness_unavailable" if unavailable else "corpus_not_ready",
+      "severity": "warning",
+      "ticker": requirement["ticker"],
+      "message": (
+        check["message"] if unavailable
+        else f"Required corpus content is not ready for {requirement['ticker']}."
+      ),
+    })
+  status = "ready"
+  if any(check["ready"] is None for check in checks):
+    status = "unavailable"
+  elif warnings:
+    status = "not_ready"
   return normalized_payload, {
-    "status": "ready",
+    "status": status,
     "checks": checks,
+    "warnings": warnings,
   }
 
 
@@ -89,55 +115,49 @@ async def _check_one_requirement(
     "required_transcripts": list(requirement["required_transcripts"]),
   }
   try:
+    get_server_for_tool = getattr(mcp_client, "get_server_for_tool", None)
+    if callable(get_server_for_tool) and get_server_for_tool(CORPUS_READINESS_TOOL) is None:
+      return _unavailable_check(
+        requirement,
+        "The corpus readiness tool is not connected.",
+      )
     result, error = await mcp_client.call_tool(CORPUS_READINESS_TOOL, tool_input)
   except asyncio.CancelledError:
     raise
   except Exception as exc:
     log.exception("Corpus readiness call failed for %s", ticker, exc_info=exc)
-    raise _unavailable_error(
+    return _unavailable_check(
+      requirement,
       "The corpus readiness service could not complete the check.",
-      ticker=ticker,
-    ) from exc
+      upstream_error={"type": type(exc).__name__, "message": str(exc)},
+    )
 
   if error is not None:
     log.error("Corpus readiness transport error for %s: %s", ticker, error)
-    raise _unavailable_error(
+    return _unavailable_check(
+      requirement,
       "The corpus readiness service could not complete the check.",
-      ticker=ticker,
-      upstream_code=str(error.get("code") or "mcp_error") if isinstance(error, dict) else "mcp_error",
+      upstream_error=error,
     )
   if not isinstance(result, dict):
-    raise _unavailable_error(
+    return _unavailable_check(
+      requirement,
       "The corpus readiness service returned an invalid response.",
-      ticker=ticker,
+      upstream_result=result,
     )
 
   if result.get("status") == "error":
-    error_type = str(result.get("error_type") or "").strip()
-    if error_type == "invalid_input":
-      raise CorpusReadinessGateError(
-        422,
-        "invalid_corpus_requirements",
-        str(result.get("message") or result.get("error") or "Invalid corpus requirements."),
-        details={"ticker": ticker},
-      )
     log.error("Corpus readiness service error for %s: %s", ticker, result)
-    raise _unavailable_error(
+    return _unavailable_check(
+      requirement,
       "The corpus readiness service is temporarily unavailable.",
-      ticker=ticker,
-      upstream_code=error_type or "corpus_unavailable",
+      upstream_result=result,
     )
   if result.get("status") != "success" or not isinstance(result.get("ready"), bool):
-    raise _unavailable_error(
+    return _unavailable_check(
+      requirement,
       "The corpus readiness service returned an invalid response.",
-      ticker=ticker,
-    )
-  if result["ready"] is not True:
-    raise CorpusReadinessGateError(
-      409,
-      "corpus_not_ready",
-      f"Required corpus content is not ready for {ticker}.",
-      details={"ticker": ticker, "readiness": dict(result)},
+      upstream_result=result,
     )
   return dict(result)
 
@@ -146,16 +166,8 @@ def _normalize_requirements(
   payload: dict[str, Any],
 ) -> tuple[dict[str, Any], tuple[dict[str, Any], ...]]:
   normalized_payload = dict(payload)
-  template = str(payload.get("pipeline_template") or "").strip().lower()
   raw_requirements = payload.get(CORPUS_REQUIREMENTS_FIELD)
   if raw_requirements is None:
-    if template in CORPUS_GATED_PIPELINE_TEMPLATES:
-      raise CorpusReadinessGateError(
-        422,
-        "missing_corpus_requirements",
-        f"{template} batches require exact filing and transcript period declarations.",
-        details={"pipeline_template": template},
-      )
     return normalized_payload, ()
   if not isinstance(raw_requirements, list) or not raw_requirements:
     raise _invalid_requirements("corpus_requirements must be a non-empty array.")
@@ -257,30 +269,21 @@ def _invalid_requirements(message: str, **details: Any) -> CorpusReadinessGateEr
   )
 
 
-def _unavailable_error(
+def _unavailable_check(
+  requirement: dict[str, Any],
   message: str,
-  *,
-  ticker: str | None = None,
-  upstream_code: str | None = None,
-) -> CorpusReadinessGateError:
-  details = {
-    key: value
-    for key, value in {
-      "ticker": ticker,
-      "upstream_code": upstream_code,
-    }.items()
-    if value is not None
+  **details: Any,
+) -> dict[str, Any]:
+  return {
+    **requirement,
+    "status": "unavailable",
+    "ready": None,
+    "message": message,
+    **details,
   }
-  return CorpusReadinessGateError(
-    503,
-    "corpus_readiness_unavailable",
-    message,
-    details=details,
-  )
 
 
 __all__ = [
-  "CORPUS_GATED_PIPELINE_TEMPLATES",
   "CORPUS_READINESS_TOOL",
   "CORPUS_REQUIREMENTS_FIELD",
   "CorpusReadinessGateError",

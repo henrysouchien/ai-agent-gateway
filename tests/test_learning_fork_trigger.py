@@ -19,11 +19,7 @@ from agent_gateway.learning_fork_trigger import (
   submit_learning_fork_after_turn,
 )
 from agent_gateway.mcp_client import McpClientManager
-from agent_gateway.runner_fork_agents import (
-  LEARNING_FORK_ALLOWED_TOOLS,
-  build_learning_fork_tool_decisions,
-  cross_check_learning_memory_writes,
-)
+from agent_gateway.runner_fork_agents import cross_check_learning_memory_writes
 from agent_gateway.runner_notifications import build_notification_reminder
 from agent_gateway.task_registry import NotificationQueue
 from agent_gateway.tool_dispatcher import ToolDispatcher
@@ -142,41 +138,6 @@ def test_no_fire_or_counter_advance_for_unsuccessful_turns(
   assert not decision.should_submit
   assert decision.reason == terminal_flag
   assert (decision.memory_turns, decision.skill_iters) == (10, 10)
-
-
-def test_learning_policy_is_closed_and_fail_closed() -> None:
-  wire = [
-    {"name": name}
-    for name in sorted({
-      *LEARNING_FORK_ALLOWED_TOOLS,
-      "memory_store",
-      "memory_delete",
-      "memory_sync",
-      "invoke_skill",
-      "run_agent",
-      "unclassified_future_tool",
-    })
-  ]
-  decisions = {
-    item.tool: item.decision
-    for item in build_learning_fork_tool_decisions(wire)
-  }
-  assert {
-    name for name, decision in decisions.items() if decision == "allow"
-  } == LEARNING_FORK_ALLOWED_TOOLS
-  assert all(
-    decisions[name] == "deny"
-    for name in {
-      "memory_store",
-      "memory_delete",
-      "memory_sync",
-      "invoke_skill",
-      "run_agent",
-      "unclassified_future_tool",
-    }
-  )
-
-
 
 
 

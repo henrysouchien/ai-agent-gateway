@@ -4,7 +4,10 @@
 # research-gateway-uvicorn) calls run_gateway_server directly. This boundary
 # delegates to uvicorn.Config/Server.run with exactly one worker. Uvicorn 0.53
 # app-load/bind/lifespan failures exit 3 and are logged here; systemd
-# Restart=always still restarts them.
+# Restart=always still restarts them. A startup that raises
+# GatewaySchemaIncompatibleError exits 4 (failure_class=schema), which
+# gateway.service names in RestartPreventExitStatus: a store this code cannot
+# serve does not change on restart.
 # Owners: packages/agent-gateway/README.md;
 # docs/reference/local-gateway-immutable-runtime.md.
 
@@ -15,13 +18,17 @@ import ctypes
 import logging
 import resource
 import sys
-from typing import Sequence
+from typing import Any, Sequence
 
 import uvicorn
 
 from .claim_signing_authority import (
   GatewayClaimSigningAuthority,
   install_gateway_claim_signing_authority,
+)
+from .startup_failures import (
+  SCHEMA_INCOMPATIBLE_EXIT_CODE,
+  GatewaySchemaIncompatibleError,
 )
 
 
@@ -30,6 +37,26 @@ _TCP_HOST = "127.0.0.1"
 _TCP_PORT = 8001
 _PR_GET_DUMPABLE = 3
 _PR_SET_DUMPABLE = 4
+class _LifespanFailureRecorder:
+  """ASGI wrapper that keeps the exception the app's lifespan raised.
+
+  Uvicorn logs a failed startup and drops the exception, so the launch
+  boundary records it here to classify the failure.
+  """
+
+  def __init__(self, app: Any) -> None:
+    self.app = app
+    self.failure: BaseException | None = None
+
+  async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+    if scope["type"] != "lifespan":
+      await self.app(scope, receive, send)
+      return
+    try:
+      await self.app(scope, receive, send)
+    except BaseException as exc:
+      self.failure = exc
+      raise
 
 
 def harden_claim_signing_process_boundary() -> None:
@@ -67,9 +94,13 @@ def run_gateway_server(
   ssl_keyfile: str | None = None,
   ssl_certfile: str | None = None,
 ) -> None:
+  # Sessions, bearer verification and active turns live in this process's
+  # SessionStore memory, so a second worker would answer another worker's
+  # bearer as unknown and admit a second turn on the same session.
   if workers != 1:
     raise ValueError(
-      "the gateway launcher requires exactly one worker"
+      "the gateway launcher requires exactly one worker (session and turn "
+      "state is in-process); launch with workers=1"
     )
   if (
     isinstance(timeout_keep_alive, bool)
@@ -121,6 +152,15 @@ def run_gateway_server(
       ssl_keyfile=ssl_keyfile,
       ssl_certfile=ssl_certfile,
     )
+  recorder: list[_LifespanFailureRecorder] = []
+  load_app = config.load
+
+  def load_recording_lifespan() -> None:
+    load_app()
+    recorder.append(_LifespanFailureRecorder(config.loaded_app))
+    config.loaded_app = recorder[-1]
+
+  setattr(config, "load", load_recording_lifespan)
   server = uvicorn.Server(config)
   try:
     server.run()
@@ -143,6 +183,9 @@ def run_gateway_server(
       or (server.lifespan.error_occurred and config.lifespan == "on")
     ):
       failure_class = "lifespan"
+      if recorder and isinstance(recorder[-1].failure, GatewaySchemaIncompatibleError):
+        failure_class = "schema"
+        exit_code = SCHEMA_INCOMPATIBLE_EXIT_CODE
     else:
       failure_class = "bind"
     logging.getLogger(__name__).error(
@@ -150,7 +193,7 @@ def run_gateway_server(
       failure_class,
       exit_code,
     )
-    if isinstance(exc, SystemExit) and not exc.code:
+    if failure_class == "schema" or (isinstance(exc, SystemExit) and not exc.code):
       raise SystemExit(exit_code) from exc
     raise
 

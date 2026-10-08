@@ -16,9 +16,9 @@ from model_authority.binding import (
   ModelSelectionIntent,
   reauthorize_capability_bind,
   require_capability_execution_bind,
+  require_registered_capability_bind,
   resolve_capability_model,
 )
-from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
 from model_authority.capabilities import CAPABILITY_EXECUTION_PROCESS, CAPABILITY_IDS
 from model_authority.registry import ProductModelRegistry
 from model_authority.selection import ProductModelSelectionPolicy
@@ -86,30 +86,6 @@ class BoundCapabilityExecution:
     ):
       raise ValueError("auth_config provider does not match the capability bind")
 
-    try:
-      entry = self.registry.require(self.bind.model_key)
-    except KeyError as exc:
-      raise ValueError(
-        "bound execution registry does not contain the capability bind model_key"
-      ) from exc
-    bound_identity = (
-      self.bind.provider,
-      self.bind.upstream_model,
-      self.bind.adapter,
-      self.bind.protocol_profile,
-      self.bind.route,
-    )
-    registry_identity = (
-      entry.provider,
-      entry.upstream_model,
-      entry.adapter,
-      entry.protocol_profile,
-      entry.route,
-    )
-    if bound_identity != registry_identity:
-      raise ValueError("capability bind execution identity does not match its registry")
-    if self.bind.capability_id not in entry.capabilities:
-      raise ValueError("capability bind is not qualified by its registry entry")
     object.__setattr__(self, "auth_config", MappingProxyType(config))
     self.validate()
 
@@ -120,6 +96,7 @@ class BoundCapabilityExecution:
     return self.adapter
 
   def validate(self) -> None:
+    require_registered_capability_bind(self.bind, registry=self.registry)
     require_capability_execution_bind(
       self.bind,
       provider=self.adapter,
@@ -165,6 +142,10 @@ class CapabilityExecutionResolver:
       object.__setattr__(self, "executable_capability_ids", executable)
     self.selection_policy.admit_registry(self.registry)
     run_overrides = dict(self.authenticated_run_overrides)
+    # An authenticated run override applies only where the capability's
+    # policy admits one; this check is that rule's owner. Its authority is the
+    # authenticated request that built this resolver, so the intent's source
+    # label is not read here or in resolve_capability_model.
     for capability_id, intent in run_overrides.items():
       policy = self.selection_policy.capabilities.get(capability_id)
       if policy is None or not policy.allow_authenticated_run_override:
@@ -174,8 +155,6 @@ class CapabilityExecutionResolver:
           capability_id=capability_id,
           model_key=intent.model_key,
         )
-      if intent.source != "explicit_user":
-        raise ValueError("authenticated run overrides must be explicit_user intent")
     object.__setattr__(
       self,
       "authenticated_run_overrides",
@@ -205,16 +184,22 @@ class CapabilityExecutionResolver:
       capability_id=capability_id,
     )
 
-  def resolve(
+  def select_bind(
     self,
     capability_id: CapabilityId,
     *,
     explicit_intent: ModelSelectionIntent | None = None,
     saved_preference: ModelSelectionIntent | None = None,
     parent_bind: CapabilityBind | None = None,
-  ) -> BoundCapabilityExecution:
+    effort: str | None = None,
+  ) -> CapabilityBind:
+    """Select and authorize an exact bind without credentials or adapter effects.
+
+    ``effort`` is the operation's in-row request (its declared role's effort).
+    """
+
     self._require_executable_here(str(capability_id or "").strip())
-    bind = resolve_capability_model(
+    return resolve_capability_model(
       capability_id,
       registry=self.registry,
       selection_policy=self.selection_policy,
@@ -223,6 +208,22 @@ class CapabilityExecutionResolver:
       saved_preference=saved_preference,
       authenticated_run_override=self.authenticated_run_overrides.get(capability_id),
       trusted_channel=self.trusted_channel,
+      parent_bind=parent_bind,
+      requested_effort=effort,
+    )
+
+  def resolve(
+    self,
+    capability_id: CapabilityId,
+    *,
+    explicit_intent: ModelSelectionIntent | None = None,
+    saved_preference: ModelSelectionIntent | None = None,
+    parent_bind: CapabilityBind | None = None,
+  ) -> BoundCapabilityExecution:
+    bind = self.select_bind(
+      capability_id,
+      explicit_intent=explicit_intent,
+      saved_preference=saved_preference,
       parent_bind=parent_bind,
     )
     return self._materialize(bind)
@@ -344,8 +345,6 @@ def derive_batch_capability_execution(
 ) -> tuple[CapabilityExecutionResolver, BoundCapabilityExecution]:
   """Carry the exact session binding into a dedicated batch authorization."""
 
-  if parent_execution.bind.capability_id != SESSION_DRIVER_CAPABILITY:
-    raise ValueError("batch derivation requires a session.driver execution")
   parent_execution.validate()
   parent_auth = parent_resolver.auth_context
   parent_bind = parent_execution.bind

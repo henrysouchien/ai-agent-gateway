@@ -29,9 +29,8 @@ class _NoopRunner:
     *,
     messages: list[dict[str, object]],
     system_prompt: SystemPrompt | None = None,
-    max_turns: int | None = None,
   ) -> None:
-    _ = messages, system_prompt, max_turns
+    _ = messages, system_prompt
 
 
 def _build_noop_runner(

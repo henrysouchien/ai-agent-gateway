@@ -4,11 +4,16 @@ Admission resolves exactly one route value from the run's control authority and
 every consumer reads that value instead of testing whichever handle the
 executing process happens to hold.
 
-The two variants that can reach a ledger or a decision queue carry the
-`GatewaySession` they bind to as a required, type-exact field, so the pairing
+The variants that reach a ledger in this process carry the `GatewaySession`
+their decision queue binds to as a required, type-exact field, so the pairing
 "durable-local lifecycle without the session that records its decision" has no
-spelling at all. `NoApprovalRoute` is the only sessionless variant, and it
-records nothing.
+spelling at all. A child never receives `DurableLocalApprovalRoute`: an
+in-process child carries `InProcessDelegatedApprovalRoute` over its parent's
+ledger, a detached child carries `ParentDelegatedApprovalRoute` over its
+inherited channel. `ControlPlaneApprovalRoute` is a sessionless root's
+authority (a schedule fire): the gateway registry's ledger, decided by the
+control plane's authenticated deciders; no dispatcher executes on it.
+`NoApprovalRoute` records nothing.
 """
 
 from __future__ import annotations
@@ -75,33 +80,103 @@ class ParentDelegatedApprovalRoute:
 
 
 @dataclass(frozen=True, slots=True)
+class InProcessDelegatedApprovalRoute(Generic[_StoreT, _PolicyT]):
+  """An in-process child authors requests into its parent's ledger; the
+  parent's session records and decides them."""
+
+  parent_ledger: DurableLocalApprovalRoute[_StoreT, _PolicyT]
+
+  def __post_init__(self) -> None:
+    if type(self.parent_ledger) is not DurableLocalApprovalRoute:
+      raise TypeError(
+        "in-process delegated approval route requires its parent's exact "
+        "durable-local ledger"
+      )
+
+
+@dataclass(frozen=True, slots=True)
+class ControlPlaneApprovalRoute(Generic[_StoreT, _PolicyT]):
+  """A sessionless root's approval authority: the gateway registry's ledger
+  and policy, decided through the control plane."""
+
+  store: _StoreT
+  policy: _PolicyT
+
+  def __post_init__(self) -> None:
+    if self.store is None or self.policy is None:
+      raise ValueError(
+        "control-plane approval route requires a store and a policy"
+      )
+
+
+@dataclass(frozen=True, slots=True)
 class NoApprovalRoute:
-  """The run reaches no decider; a tool needing approval is refused at the door."""
+  """The run reaches no decider; a tool needing approval is refused at the door.
+
+  Only a live order needs approval (`approval_policy.MONEY_BOUNDARY_TOOL_CLASSES`),
+  and a live order nobody can decide must not spend the owner's money.
+  """
 
 
 ApprovalRoute = Union[
   DurableLocalApprovalRoute[_StoreT, _PolicyT],
   ParentDelegatedApprovalRoute,
+  InProcessDelegatedApprovalRoute[_StoreT, _PolicyT],
+  ControlPlaneApprovalRoute[_StoreT, _PolicyT],
   NoApprovalRoute,
 ]
 
 NO_APPROVAL_ROUTE = NoApprovalRoute()
 
 
+def route_ledger(
+  route: ApprovalRoute[_StoreT, _PolicyT],
+) -> DurableLocalApprovalRoute[_StoreT, _PolicyT] | None:
+  """The in-process durable ledger a route records into, if any."""
+
+  if isinstance(route, DurableLocalApprovalRoute):
+    return route
+  if isinstance(route, InProcessDelegatedApprovalRoute):
+    return route.parent_ledger
+  return None
+
+
+def child_approval_route(
+  route: ApprovalRoute[_StoreT, _PolicyT],
+) -> ApprovalRoute[_StoreT, _PolicyT]:
+  """The route an in-process child of ``route``'s owner admits with."""
+
+  if isinstance(route, DurableLocalApprovalRoute):
+    return InProcessDelegatedApprovalRoute(route)
+  return route
+
+
 def route_store(
   route: ApprovalRoute[_StoreT, _PolicyT],
 ) -> _StoreT | None:
-  """Project the durable ledger a route owns, if it owns one."""
+  """Project the durable ledger a route records into, if it reaches one."""
 
-  return route.store if isinstance(route, DurableLocalApprovalRoute) else None
+  ledger = route_ledger(route)
+  return ledger.store if ledger is not None else None
 
 
 def route_policy(
   route: ApprovalRoute[_StoreT, _PolicyT],
 ) -> _PolicyT | None:
-  """Project the opaque policy a route owns, if it owns one."""
+  """Project the opaque policy a route's ledger owner holds, if any."""
 
-  return route.policy if isinstance(route, DurableLocalApprovalRoute) else None
+  ledger = route_ledger(route)
+  return ledger.policy if ledger is not None else None
+
+
+def route_session(route: ApprovalRoute[_StoreT, _PolicyT]) -> "GatewaySession":
+  """The session whose ledger row and decision queue a dispatcher records to."""
+
+  if isinstance(route, (DurableLocalApprovalRoute, ParentDelegatedApprovalRoute)):
+    return route.session
+  if isinstance(route, InProcessDelegatedApprovalRoute):
+    return route.parent_ledger.session
+  raise TypeError(f"{type(route).__name__} carries no executing session")
 
 
 def session_approval_route(session: Any) -> ApprovalRoute[object, object]:
@@ -140,12 +215,17 @@ def bind_session_approval_route(
 __all__ = [
   "NO_APPROVAL_ROUTE",
   "ApprovalRoute",
+  "ControlPlaneApprovalRoute",
   "DurableLocalApprovalRoute",
+  "InProcessDelegatedApprovalRoute",
   "SQLiteApprovalStore",
   "NoApprovalRoute",
   "ParentDelegatedApprovalRoute",
   "bind_session_approval_route",
+  "child_approval_route",
+  "route_ledger",
   "route_policy",
+  "route_session",
   "route_store",
   "session_approval_route",
 ]

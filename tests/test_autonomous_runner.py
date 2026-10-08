@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import asyncio
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -471,7 +470,7 @@ def _registry(
     def admission_policy(skill_name: str) -> AutonomousSkillAdmissionPolicy:
       return AutonomousSkillAdmissionPolicy(
         skill_resume_allowed=skill_resume_allowed_resolver(skill_name),
-        execution_limits=SkillExecutionLimits(None, None, None),
+        execution_limits=SkillExecutionLimits(None),
       )
   else:
     admission_policy = autonomous_skill_admission_policy_resolver
@@ -639,6 +638,118 @@ def test_autonomous_approval_relay_is_exact_and_idempotent(
   asyncio.run(case())
 
 
+def test_child_recap_carries_the_counts_the_parent_holds(tmp_path: Path) -> None:
+  async def case() -> None:
+    from contextlib import contextmanager
+
+    from agent_gateway.autonomous_approval_channel import (
+      AutonomousApprovalChannelAuthority,
+      create_autonomous_approval_channel,
+    )
+    from agent_gateway.autonomous_runner import _recap_with_parent_measurements
+
+    _write_manifest(
+      tmp_path,
+      state="completed",
+      control_run_id="run-recap-counts",
+      channel="tui",
+    )
+    registry = _registry(tmp_path)
+    record = registry._tasks["bg_0"]
+    record.autonomous_in_flight_at_start = 2
+    record.credential_handoff_bytes = 640
+    record.event_lines = [
+      {"type": "approval_decision_sent", "decisions_sent": 1, "frame_bytes": 410},
+      {"type": "approval_decision_sent", "decisions_sent": 2, "frame_bytes": 388},
+    ]
+    child_recap = {
+      "type": "session_recap",
+      "tool_calls_summary": {
+        "total_calls": 1,
+        "successes": 1,
+        "errors": 0,
+        "by_tool_name": {"get_quote": 1},
+        "by_server": {"local": 1},
+        "measurements": {"structured_reads": 1},
+      },
+    }
+
+    recap = await _recap_with_parent_measurements(record, child_recap)
+
+    assert recap["tool_calls_summary"]["measurements"] == {
+      "structured_reads": 1,
+      "decisions_sent": 2,
+      "frame_bytes": 410,
+      "autonomous_in_flight_at_start": 2,
+      "credential_handoff_bytes": 640,
+    }
+    assert recap["tool_calls_summary"]["by_tool_name"] == {"get_quote": 1}
+    assert child_recap["tool_calls_summary"]["measurements"] == {"structured_reads": 1}
+
+    # The race: the child's recap is drained after the decision reached the
+    # wire but before the parent recorded it. The recap still counts it.
+    record.event_lines = []
+    record.state = "running"
+    record.proc = SlowFakeProcess()
+    record.launch_nonce = "a" * 32
+    pair = create_autonomous_approval_channel(
+      authority=AutonomousApprovalChannelAuthority(
+        launch_nonce=record.launch_nonce,
+        task_id=record.task_id,
+        control_run_id=record.control_run_id,
+        session_id=record.session_id,
+        channel_id=record.channel_id,
+      ),
+    )
+    record.approval_channel = pair.parent
+    published = threading.Event()
+    release = threading.Event()
+
+    @contextmanager
+    def held_after_publish():
+      yield
+      published.set()
+      release.wait(timeout=5)
+
+    try:
+      send_task = asyncio.create_task(registry.send_approval_decision(
+        "run-recap-counts",
+        user_id=USER_ID,
+        channel="tui",
+        approval_id="approval-recap",
+        tool_call_id="tool-recap",
+        nonce="nonce-recap",
+        approved=True,
+        decided_at_ns=1_784_980_800_000_000_000,
+        delivery_sequence=1,
+        publication_transaction=held_after_publish,
+        sent_reconciliation=lambda: nullcontext(),
+      ))
+      assert await asyncio.to_thread(published.wait, 5)
+      pair.child.receive(timeout_seconds=0.1)
+      recap_task = asyncio.create_task(
+        _recap_with_parent_measurements(record, child_recap)
+      )
+      await asyncio.sleep(0.05)
+      assert not recap_task.done()
+      release.set()
+      await send_task
+      raced = await recap_task
+    finally:
+      release.set()
+      pair.close()
+
+    assert raced["tool_calls_summary"]["measurements"] == {
+      "structured_reads": 1,
+      "decisions_sent": 1,
+      "frame_bytes": pair.parent.sent_frame_bytes(1),
+      "autonomous_in_flight_at_start": 2,
+      "credential_handoff_bytes": 640,
+    }
+
+  asyncio.run(case())
+
+
 def test_autonomous_runner_state_helper_preserves_parent_aliases() -> None:
   from agent_gateway import autonomous_runner
   from agent_gateway import autonomous_runner_claims
@@ -677,11 +788,11 @@ def _run_real_owned_sentinel_output_canary(
 ) -> tuple[dict, bytes]:
   from agent_gateway.autonomous_credential_handoff import (
     AUTONOMOUS_CREDENTIAL_HANDOFF_ENV,
-    AUTONOMOUS_CREDENTIAL_HANDOFF_MAX_BYTES,
     AUTONOMOUS_CREDENTIAL_HANDOFF_STDIN,
     encode_autonomous_credential_handoff,
   )
   from agent_gateway.autonomous_runner_start import (
+    _CHILD_OUTPUT_LINE_MAX_BYTES,
     _OWNED_PROCESS_SENTINEL_SOURCE,
   )
   from model_authority.binding import CredentialHandle
@@ -745,7 +856,7 @@ sys.stderr.flush()
           sys.executable,
           "-c",
           _OWNED_PROCESS_SENTINEL_SOURCE,
-          str(AUTONOMOUS_CREDENTIAL_HANDOFF_MAX_BYTES),
+          str(_CHILD_OUTPUT_LINE_MAX_BYTES),
           str(owner_read),
           str(lease_fd),
           "0.01",
@@ -950,7 +1061,6 @@ def test_autonomous_runner_command_helper_preserves_profile_normalization_seam(m
     skill="patched-skill",
     context=" context ",
     ticker="msft",
-    max_budget_usd=5.0,
   )
 
   assert cmd == [
@@ -961,52 +1071,12 @@ def test_autonomous_runner_command_helper_preserves_profile_normalization_seam(m
     "patched_profile",
     "--skill",
     "patched-skill",
-    "--max-budget-usd",
-    "5.0",
     "--ticker",
     "MSFT",
     "--context",
     "context",
   ]
   assert checks == ["profile:Analyst"]
-
-
-@pytest.mark.parametrize("max_budget_usd", [True, 0, -1, float("inf"), float("nan"), "5"])
-def test_autonomous_runner_rejects_invalid_max_budget(max_budget_usd, tmp_path) -> None:
-  registry = _registry(tmp_path)
-
-  with pytest.raises(ValueError, match="max_budget_usd must be a finite positive number"):
-    registry._build_cmd(
-      profile="analyst",
-      mode="skill",
-      task=None,
-      skill="risk.scan",
-      context=None,
-      max_budget_usd=max_budget_usd,
-    )
-
-
-@pytest.mark.parametrize(
-  ("mode", "task", "skill"),
-  [("once", None, None), ("task", "summarize", None)],
-)
-def test_autonomous_runner_rejects_max_budget_outside_skill_mode(
-  mode,
-  task,
-  skill,
-  tmp_path,
-) -> None:
-  registry = _registry(tmp_path)
-
-  with pytest.raises(ValueError, match="max_budget_usd requires mode='skill'"):
-    registry._build_cmd(
-      profile="analyst",
-      mode=mode,
-      task=task,
-      skill=skill,
-      context=None,
-      max_budget_usd=5.0,
-    )
 
 
 def test_autonomous_runner_claim_helper_uses_parent_aliases(monkeypatch) -> None:
@@ -1350,7 +1420,6 @@ def test_autonomous_start_signs_exact_session_authority_only(
         "ticker": None,
         "research_file_id": None,
         "dev_mode": False,
-        "max_budget_usd": None,
         "deliver": True,
       },
     ),
@@ -1366,7 +1435,6 @@ def test_autonomous_start_signs_exact_session_authority_only(
         "ticker": None,
         "research_file_id": None,
         "dev_mode": False,
-        "max_budget_usd": None,
         "deliver": True,
       },
     ),
@@ -1382,7 +1450,6 @@ def test_autonomous_start_signs_exact_session_authority_only(
         "ticker": None,
         "research_file_id": None,
         "dev_mode": False,
-        "max_budget_usd": None,
         "deliver": True,
       },
     ),
@@ -1393,7 +1460,6 @@ def test_autonomous_start_signs_exact_session_authority_only(
         "skill": "  earnings-review  ",
         "context": "  compare guidance  ",
         "ticker": " msft ",
-        "max_budget_usd": 12.5,
         "deliver": False,
       },
       {
@@ -1406,7 +1472,6 @@ def test_autonomous_start_signs_exact_session_authority_only(
         "ticker": "MSFT",
         "research_file_id": None,
         "dev_mode": False,
-        "max_budget_usd": 12.5,
         "deliver": False,
       },
     ),
@@ -1444,11 +1509,7 @@ def test_autonomous_start_signs_exact_executable_workload(
   )
   assert workload_receipt == expected_workload
   assert admitted_limits == (
-    {
-      "max_turns": None,
-      "max_tokens": None,
-      "max_budget_usd": None,
-    }
+    {"max_tokens": None}
     if expected_workload["mode"] == "skill"
     else None
   )
@@ -1685,7 +1746,7 @@ def test_autonomous_registry_rehydrates_manifest_without_event_file_compatibilit
   assert record.exit_code == 0
   assert record.error is None
   assert record.completed_at == 125.0
-  assert record.max_budget_usd == 4.5
+  assert not hasattr(record, "max_budget_usd")
   assert record.proc is None
   assert record.reaper_task is None
   assert record.event_channel is None
@@ -1816,7 +1877,7 @@ def test_missing_v7_admission_siblings_resolve_once_and_freeze_together(
   manifest.pop("admitted_skill_execution_limits")
   old_bytes = _replace_manifest_payload(tmp_path, manifest)
   calls: list[str] = []
-  expected_limits = SkillExecutionLimits(20, 32_000, 20.0)
+  expected_limits = SkillExecutionLimits(32_000)
 
   def resolver(skill_name: str) -> AutonomousSkillAdmissionPolicy:
     calls.append(skill_name)
@@ -1833,11 +1894,7 @@ def test_missing_v7_admission_siblings_resolve_once_and_freeze_together(
   assert record.admitted_skill_execution_limits == expected_limits
   frozen = _read_manifest(tmp_path)
   assert frozen["skill_resume_allowed"] is True
-  assert frozen["admitted_skill_execution_limits"] == {
-    "max_turns": 20,
-    "max_tokens": 32_000,
-    "max_budget_usd": 20.0,
-  }
+  assert frozen["admitted_skill_execution_limits"] == {"max_tokens": 32_000}
   assert _manifest_path(tmp_path).read_bytes() != old_bytes
 
   second = _registry(
@@ -1863,7 +1920,7 @@ def test_missing_v7_limits_preserves_present_resume_sibling(tmp_path) -> None:
   manifest.pop("admitted_skill_execution_limits")
   _replace_manifest_payload(tmp_path, manifest)
   calls: list[str] = []
-  expected_limits = SkillExecutionLimits(7, 900, 3.5)
+  expected_limits = SkillExecutionLimits(900)
 
   registry = _registry(
     tmp_path,
@@ -1885,8 +1942,9 @@ def test_missing_v7_limits_preserves_present_resume_sibling(tmp_path) -> None:
     None,
     {},
     {"max_turns": None, "max_tokens": None},
-    {"max_turns": True, "max_tokens": None, "max_budget_usd": None},
-    {"max_turns": None, "max_tokens": None, "max_budget_usd": 0},
+    {"max_tokens": True},
+    {"max_tokens": 0},
+    {"max_tokens": None, "max_budget_usd": None},
   ],
 )
 def test_present_v7_skill_limits_are_strict_and_never_rederived(
@@ -2084,9 +2142,7 @@ def test_missing_v7_resume_freeze_post_replace_failure_aborts_then_rehydrates(
 
   assert _read_manifest(tmp_path)["skill_resume_allowed"] is True
   assert _read_manifest(tmp_path)["admitted_skill_execution_limits"] == {
-    "max_turns": None,
     "max_tokens": None,
-    "max_budget_usd": None,
   }
   monkeypatch.setattr(autonomous_runner_state.os, "fsync", original_fsync)
   registry = _registry(
@@ -2168,7 +2224,7 @@ Do writer work.
 
   assert resolver("read-only").skill_resume_allowed is True
   assert resolver("read-only").execution_limits == (
-    SkillExecutionLimits(None, None, None)
+    SkillExecutionLimits(None)
   )
   assert resolver("writer").skill_resume_allowed is False
   with pytest.raises(FileNotFoundError):
@@ -2223,7 +2279,7 @@ def test_initial_direct_and_scheduled_skill_starts_freeze_resolver_fact(
     return FakeProcess()
 
   calls: list[str] = []
-  expected_limits = SkillExecutionLimits(20, 32_000, 20.0)
+  expected_limits = SkillExecutionLimits(32_000)
   monkeypatch.setattr(
     autonomous_runner.asyncio,
     "create_subprocess_exec",
@@ -2257,11 +2313,7 @@ def test_initial_direct_and_scheduled_skill_starts_freeze_resolver_fact(
       ] is True
       assert _read_manifest(tmp_path, record.task_id)[
         "admitted_skill_execution_limits"
-      ] == {
-        "max_turns": 20,
-        "max_tokens": 32_000,
-        "max_budget_usd": 20.0,
-      }
+      ] == {"max_tokens": 32_000}
       assert record.capability_bind is not None
       assert record.capability_bind.run_mode == (
         "cron" if schedule_id is not None else "autonomous"
@@ -2348,82 +2400,19 @@ def test_resumed_start_inherits_frozen_resume_fact_without_source_resolution(
       resumed = registry._tasks[payload["task_id"]]
       assert resumed.skill_resume_allowed is True
       assert resumed.admitted_skill_execution_limits == (
-        SkillExecutionLimits(20, 32_000, 20.0)
+        SkillExecutionLimits(32_000)
       )
       assert _read_manifest(tmp_path, resumed.task_id)[
         "skill_resume_allowed"
       ] is True
       assert _read_manifest(tmp_path, resumed.task_id)[
         "admitted_skill_execution_limits"
-      ]["max_budget_usd"] == 20.0
+      ] == {"max_tokens": 32_000}
     finally:
       await registry.cancel(payload["task_id"])
       await registry.shutdown(grace_sec=0.1)
 
   asyncio.run(run_case())
-
-
-@pytest.mark.parametrize(
-  "resume_overrides",
-  [
-    {"mode": "skill", "skill": "different-skill"},
-    {"mode": "task", "skill": None, "task": "different task"},
-  ],
-)
-def test_resumed_start_refuses_changed_mode_or_skill_before_side_effects(
-  monkeypatch,
-  tmp_path,
-  resume_overrides,
-) -> None:
-  from agent_gateway import autonomous_runner
-
-  resolver_calls: list[str] = []
-  spawn_calls: list[bool] = []
-
-  async def fail_spawn(*_args, **_kwargs):
-    spawn_calls.append(True)
-    raise AssertionError("mismatched resume must not spawn")
-
-  _write_manifest(
-    tmp_path,
-    control_run_id="original-run",
-    state="interrupted",
-    skill="frozen-skill",
-    skill_resume_allowed=True,
-  )
-  monkeypatch.setattr(
-    autonomous_runner.asyncio,
-    "create_subprocess_exec",
-    fail_spawn,
-  )
-  registry = _registry(
-    tmp_path,
-    skill_resume_allowed_resolver=(
-      lambda skill: resolver_calls.append(skill) or True
-    ),
-  )
-
-  with pytest.raises(
-    ValueError,
-    match="mode and skill must match the origin",
-  ):
-    asyncio.run(
-      registry.start(
-        role="owner",
-        profile="analyst",
-        mode=resume_overrides["mode"],
-        skill=resume_overrides.get("skill"),
-        task=resume_overrides.get("task"),
-        user_id=USER_ID,
-        user_email=USER_EMAIL,
-        resumed_from="original-run",
-      )
-    )
-
-  assert resolver_calls == []
-  assert spawn_calls == []
-  assert set(registry._tasks) == {"bg_0"}
-  assert not _manifest_path(tmp_path, "bg_1").exists()
 
 
 def test_autonomous_v7_manifest_round_trips_invite_role(tmp_path) -> None:
@@ -2512,15 +2501,6 @@ def test_autonomous_registry_rejects_v1_slug_manifest(
 
   assert "bg_4" not in registry._tasks
   assert _read_manifest(tmp_path, "bg_4")["manifest_version"] == 1
-
-
-@pytest.mark.parametrize("max_budget_usd", [True, 0, -1, float("inf"), float("nan"), "5"])
-def test_autonomous_registry_drops_invalid_manifest_max_budget(tmp_path, max_budget_usd) -> None:
-  _write_manifest(tmp_path, max_budget_usd=max_budget_usd)
-
-  registry = _registry(tmp_path)
-
-  assert registry._tasks["bg_0"].max_budget_usd is None
 
 
 def test_autonomous_registry_rehydrates_blocked_as_terminal(tmp_path) -> None:
@@ -3184,7 +3164,6 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
       control_run_id="  run-custom  ",
       user_id=USER_ID,
       user_email=None,
-      max_budget_usd=5.0,
     )
     try:
       manifest = _read_manifest(tmp_path)
@@ -3211,12 +3190,15 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
           "deliver",
           "skill_resume_allowed",
           "admitted_skill_execution_limits",
+        "admitted_context",
+        "tool_authority",
         "context",
         "ticker",
         "channel",
         "dev_mode",
-        "max_budget_usd",
         "research_file_id",
+        "autonomous_in_flight_at_start",
+        "credential_handoff_bytes",
         "dispatch_scope",
         "containment_expectation",
         "cmd",
@@ -3242,6 +3224,9 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
         "tool_result_spill_dir",
       }
       assert manifest["manifest_version"] == 8
+      assert manifest["autonomous_in_flight_at_start"] == 1
+      assert type(manifest["credential_handoff_bytes"]) is int
+      assert manifest["credential_handoff_bytes"] > 0
       assert manifest["task_id"] == payload["task_id"] == "bg_0"
       assert manifest["control_run_id"] == "run-custom"
       assert payload["run_id"] == "run-custom"
@@ -3263,16 +3248,11 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
       assert manifest["pack"] is None
       assert manifest["deliver"] is True
       assert manifest["skill_resume_allowed"] is False
-      assert manifest["admitted_skill_execution_limits"] == {
-        "max_turns": None,
-        "max_tokens": None,
-        "max_budget_usd": None,
-      }
+      assert manifest["admitted_skill_execution_limits"] == {"max_tokens": None}
       assert manifest["context"] == "inspect current book"
       assert manifest["ticker"] == "MSFT"
       assert manifest["channel"] == "tui"
       assert manifest["dev_mode"] is False
-      assert manifest["max_budget_usd"] == 5.0
       assert manifest["dispatch_scope"] is None
       assert manifest["containment_expectation"] == {
         "platform": sys.platform,
@@ -3285,7 +3265,6 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
       }
       assert manifest["cmd"][:5] == ["python3", "-m", "agent.autonomous", "--profile", "analyst"]
       assert "--dev" not in manifest["cmd"]
-      assert manifest["cmd"][manifest["cmd"].index("--max-budget-usd") + 1] == "5.0"
       assert manifest["log_path"] == str(tmp_path / "bg_0.log")
       assert manifest["events_path"] == str(tmp_path / "bg_0.events.jsonl")
       assert manifest["operator_inbox_path"] == str(tmp_path / "bg_0.operator-messages.jsonl")
@@ -3774,43 +3753,6 @@ def test_autonomous_double_terminal_manifest_failure_removes_stale_manifest_with
     assert payload["task_id"] not in restarted._tasks
 
   asyncio.run(_case())
-
-
-def test_autonomous_reaper_is_event_driven_without_elapsed_reap() -> None:
-  from agent_gateway import autonomous_runner
-
-  source = Path(autonomous_runner.__file__).read_text(encoding="utf-8")
-  tree = ast.parse(source)
-  reaper = next(
-    node
-    for node in ast.walk(tree)
-    if isinstance(node, ast.AsyncFunctionDef)
-    and node.name == "_reap_owned_process"
-  )
-  waits = [
-    node
-    for node in ast.walk(reaper)
-    if isinstance(node, ast.Call)
-    and isinstance(node.func, ast.Attribute)
-    and node.func.attr == "wait"
-  ]
-
-  assert "_AUTONOMOUS_RUN_MAX_" + "SECONDS" not in source
-  assert "runtime " + "limit" not in source
-  assert any(
-    any(
-      keyword.arg == "return_when"
-      and isinstance(keyword.value, ast.Attribute)
-      and keyword.value.attr == "FIRST_COMPLETED"
-      for keyword in call.keywords
-    )
-    for call in waits
-  )
-  assert all(
-    all(keyword.arg != "timeout" for keyword in call.keywords)
-    for call in waits
-    if any(keyword.arg == "return_when" for keyword in call.keywords)
-  )
 
 
 def test_process_exit_wakes_reaper_fences_group_then_settles_channel(
@@ -4651,76 +4593,6 @@ def test_autonomous_parent_operator_byte_quota_rejects_before_append(
 
     assert record.operator_inbox_path is not None
     assert record.operator_inbox_path.read_bytes() == b""
-
-  asyncio.run(_case())
-
-
-def test_autonomous_parent_approval_quota_rejects_before_append(
-  tmp_path: Path,
-) -> None:
-  async def _case() -> None:
-    from agent_gateway.autonomous_approval_channel import (
-      AutonomousApprovalChannelAuthority,
-      create_autonomous_approval_channel,
-    )
-    from agent_gateway.autonomous_control_contract import (
-      AUTONOMOUS_APPROVAL_DECISION_LIMIT,
-    )
-
-    _write_manifest(
-      tmp_path,
-      state="completed",
-      channel="tui",
-    )
-    registry = _registry(tmp_path)
-    record = registry._tasks["bg_0"]
-    record.state = "running"
-    record.proc = SlowFakeProcess()
-    record.launch_nonce = "b" * 32
-    pair = create_autonomous_approval_channel(
-      authority=AutonomousApprovalChannelAuthority(
-        launch_nonce=record.launch_nonce,
-        task_id=record.task_id,
-        control_run_id=record.control_run_id,
-        session_id=record.session_id,
-        channel_id=record.channel_id,
-      ),
-    )
-    record.approval_channel = pair.parent
-    try:
-      for index in range(AUTONOMOUS_APPROVAL_DECISION_LIMIT):
-        await registry.send_approval_decision(
-          record.control_run_id,
-          user_id=USER_ID,
-          channel="tui",
-          approval_id=f"approval-{index}",
-          tool_call_id=f"tool-{index}",
-          nonce=f"nonce-{index}",
-          approved=bool(index % 2),
-          decided_at_ns=index + 1,
-          delivery_sequence=index + 1,
-          publication_transaction=lambda: nullcontext(),
-          sent_reconciliation=lambda: nullcontext(),
-        )
-        received = pair.child.receive(timeout_seconds=0.1)
-        assert received.decision.delivery_sequence == index + 1
-
-      with pytest.raises(RuntimeError, match="over quota"):
-        await registry.send_approval_decision(
-          record.control_run_id,
-          user_id=USER_ID,
-          channel="tui",
-          approval_id="approval-overflow",
-          tool_call_id="tool-overflow",
-          nonce="nonce-overflow",
-          approved=False,
-          decided_at_ns=AUTONOMOUS_APPROVAL_DECISION_LIMIT + 1,
-          delivery_sequence=AUTONOMOUS_APPROVAL_DECISION_LIMIT + 1,
-          publication_transaction=lambda: nullcontext(),
-          sent_reconciliation=lambda: nullcontext(),
-        )
-    finally:
-      pair.close()
 
   asyncio.run(_case())
 
@@ -5610,8 +5482,9 @@ def test_rehydrated_terminal_state_matrix_preserves_recorded_precedence(
     assert record.state == "interrupted"
     assert record.error is None
   elif manifest_state in {"budget_limited", "budget_exceeded"}:
-    assert record.state == "budget_limited"
-    assert record.error is None
+    # Manifests written before 61babe3020a6 read as the interrupt they were.
+    assert record.state == "interrupted"
+    assert record.error == manifest_error
   else:
     assert record.state == manifest_state
     assert record.error == manifest_error

@@ -4,7 +4,7 @@ from copy import deepcopy
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -13,18 +13,11 @@ import yaml
 from agent_workflow_contracts import (
   AgentOperationRef,
   AgentOperationSnapshot,
-  CatalogToolEntry,
   ContractRef,
   EvidencePort,
-  OperationUnavailable,
-  PlatformToolCatalog,
   SemanticCapabilityRequirement,
 )
 
-from .capability_resolution import (
-  OperationDeclaration,
-  resolve_operation_authority,
-)
 from .canonical_json_target_lock import (
   LockedCanonicalJsonTarget,
   lock_canonical_json_path,
@@ -41,13 +34,10 @@ from ._io import (
   _atomic_write_json as _atomic_write_json,
   _read_json_object,
 )
-from .semantic_capability_routing import capability_for_tool
 from .sub_agent_capability import (
-  DelegationRoleResolutionError,
   resolve_delegation_role_capability,
   resolve_sub_agent_capability,
 )
-from .sub_agent_scope_receipt import _server_owned_effect
 from model_authority.thinking import resolve_effort_pair
 
 log = logging.getLogger("agent_gateway.skills")
@@ -85,9 +75,8 @@ GENERIC_EXPLORE_TOOL_IDS = frozenset({
 #: read route, of any kind", which the granular vocabulary cannot state: making
 #: either domain required would refuse `explore` in a parent that happens to
 #: offer only the other one, and `explore` is the fallback operation of last
-#: resort.  The "explore must have a live evidence route" rule keeps its own
-#: enforcement in the live catalog build, which refuses an empty tool scope for
-#: this operation by name.
+#: resort.  An explore whose parent offers neither domain still runs; its
+#: result's evidence observation records that no evidence tool ran.
 GENERIC_EXPLORE_CAPABILITIES: tuple[tuple[str, bool], ...] = (
   ("corpus.read/v1", False),
   ("web.read/v1", False),
@@ -99,8 +88,7 @@ _GENERIC_EXPLORE_INSTRUCTIONS = (
   "You are a focused research sub-agent. Investigate the assigned objective "
   "thoroughly, use available evidence tools when the claim depends on current "
   "or external facts, identify source gaps explicitly, and return the complete "
-  "substantive result in your terminal assistant message. You cannot delegate "
-  "to another agent."
+  "substantive result in your terminal assistant message."
 )
 @dataclass(frozen=True, slots=True)
 class ResolvedAgentOperation:
@@ -205,105 +193,6 @@ def _declared_semantic_requirements(
   return tuple(requirements[name] for name in sorted(requirements))
 
 
-def declared_ceiling_catalog(profile: "SkillProfile") -> PlatformToolCatalog:
-  """Describe the operation's declared ceiling as a platform catalog.
-
-  Compile time has no live routing table, so the ceiling is projected as if
-  every declared tool were routable.  The columns that decide authority —
-  effect and capability — come from the same server-owned derivations the live
-  snapshot uses, which is what makes the compile-time check and the
-  admission-time check the same computation.
-  """
-
-  metadata = getattr(profile, "metadata", None)
-  semantic = (
-    metadata.get("semantic_metadata") if isinstance(metadata, dict) else None
-  )
-  raw_refs = semantic.get("tool_refs") if isinstance(semantic, dict) else None
-  entries: dict[str, CatalogToolEntry] = {}
-  for raw in raw_refs if isinstance(raw_refs, (list, tuple)) else ():
-    if not isinstance(raw, dict):
-      continue
-    tool_id = str(raw.get("tool_id") or "").strip()
-    if not tool_id or tool_id in entries:
-      continue
-    is_local = raw.get("kind") != "mcp"
-    server_id = (
-      None if is_local else (str(raw.get("server_id") or "").strip() or None)
-    )
-    if not is_local and server_id is None:
-      continue
-    effect = _server_owned_effect(tool_id, server_id, is_local)
-    if effect is None:
-      continue
-    entries[tool_id] = CatalogToolEntry.model_validate({
-      "tool_id": tool_id,
-      "canonical_name": tool_id,
-      "effect": effect,
-      "origin": "local" if is_local else "mcp",
-      "server_id": server_id,
-      "capability": capability_for_tool(
-        canonical_name=tool_id,
-        server_id=server_id,
-        effect=effect,
-      ),
-    })
-  return PlatformToolCatalog(
-    tools=tuple(entries[name] for name in sorted(entries))
-  )
-
-
-def validate_operation_tool_coherence(profile: "SkillProfile") -> None:
-  """Reject a declaration its own ceiling cannot satisfy.
-
-  This is the *resolver*, run at compile time over the declared ceiling
-  instead of a live catalog (B-8).  It used to be a separate hand-written rule
-  ("required live-tool capability plus empty ceiling"), which meant compile
-  time and admission time could disagree about what "satisfied" means — and
-  they did, because the rule never looked at effects or capabilities at all.
-  One computation now answers both.
-
-  Methodology prose stays invisible here: authority is never inferred from
-  text, so a profile whose only tool-use signal is prose is indistinguishable
-  from a genuinely tool-free operation and cannot be rejected deterministically.
-  """
-
-  requirements = _declared_semantic_requirements(profile)
-  if not requirements:
-    return
-  ceiling = operation_tool_ids(profile)
-  catalog = declared_ceiling_catalog(profile)
-  if len(catalog.tools) != len(ceiling):
-    # At least one declared tool has no resolvable effect here — either the
-    # effect table is not importable in this process, or the tool is not one
-    # the platform knows.  A platform that cannot fully describe the ceiling
-    # cannot refute a declaration over it, so this is silence, not a verdict.
-    return
-  verdict = resolve_operation_authority(
-    OperationDeclaration(
-      operation_name=profile.name,
-      grant_id=f"coherence:{profile.name}",
-      workspace_scope=operation_workspace_scope(
-        profile.mutation_mode,
-        _declared_allowed_effects(profile),
-      ),
-      required_capabilities=requirements,
-      tool_ceiling=ceiling,
-    ),
-    catalog=catalog,
-  )
-  if isinstance(verdict, OperationUnavailable):
-    unmet = ", ".join(
-      sorted(item.capability for item in verdict.unsatisfied)
-    ) or verdict.detail
-    raise ValueError(
-      f"Methodology '{profile.name}' declares semantic capabilities its own "
-      f"declared tool ceiling cannot satisfy ({unmet}); declare the exact "
-      "tools in semantic_metadata.tool_refs or remove the capability "
-      "requirements"
-    )
-
-
 def _declared_evidence_ports(
   profile: "SkillProfile",
   required_context: tuple[str, ...],
@@ -356,7 +245,6 @@ def compile_agent_operation(
 
   if not profile.agent_callable:
     raise ValueError(f"Methodology '{profile.name}' is not agent-callable")
-  validate_operation_tool_coherence(profile)
   version = str(profile.version or "1.0").strip()
   methodology_text = profile.system_prompt.strip()
   instructions = (resolved_instructions or methodology_text).strip()
@@ -403,6 +291,8 @@ def compile_agent_operation(
     required_context=required_context,
     evidence_ports=evidence_ports,
     resumable=profile.resumable,
+    terminal_on_persist=profile.terminal_on_persist,
+    children=profile.children,
   )
 
 
@@ -482,7 +372,6 @@ class SkillProfile:
   system_prompt: str
   version: str | None = None
   model: str | None = None
-  max_turns: int | None = None
   tool_packs: list[str] | None = None
   persist_state: bool = False
   scope: str | None = None
@@ -491,9 +380,7 @@ class SkillProfile:
   mcp_servers: list[str] | None = None
   mcp_tools: dict[str, list[str]] | None = None
   session_inject_servers: list[str] | None = None
-  timeout_overrides: dict[str, int] | None = None
   state_dir: str | None = None
-  max_budget_usd: float | None = None
   max_tokens: int | None = None
   thinking: bool | None = None
   initial_message: str | None = None
@@ -501,9 +388,10 @@ class SkillProfile:
   agent_callable: bool = False
   agent_description: str | None = None
   resumable: bool = False
-  resume_mcp_session_reset_ok: bool = False
+  #: A persist_state-false skill ends on its first successful FMS door result unless it
+  #: declares otherwise (``terminal_on_persist: false``: it persists several units, then reports).
+  terminal_on_persist: bool = True
   mode: str = "full"
-  extra_excluded_tools: set[str] = field(default_factory=set)
   tool_packs_enabled: bool = True
   state_class: str | None = None
   mutation_mode: Mode | str | None = None
@@ -515,6 +403,7 @@ class SkillProfile:
   provider: str | None = None
   max_structured_reads: int | None = None
   delegation_role: str | None = None
+  children: tuple[str, ...] = ()
 
 
 def _clean_string(value: Any) -> str | None:
@@ -532,14 +421,7 @@ def _coerce_optional_delegation_role(value: Any, *, path: Path) -> str | None:
   role = value.strip()
   if not role:
     raise ValueError(f"{path}: 'delegation_role' must be non-empty when provided")
-  try:
-    resolve_delegation_role_capability(role)
-  except DelegationRoleResolutionError:
-    log.warning(
-      "%s: delegation_role %r is not mapped and will be rejected at dispatch",
-      path,
-      role,
-    )
+  resolve_delegation_role_capability(role)
   return role
 
 
@@ -560,23 +442,6 @@ def _coerce_optional_int(value: Any, *, field_name: str, path: Path) -> int | No
       except ValueError as exc:
         raise ValueError(f"{path}: '{field_name}' must be an integer") from exc
   raise ValueError(f"{path}: '{field_name}' must be an integer")
-
-
-def _coerce_optional_float(value: Any, *, field_name: str, path: Path) -> float | None:
-  if value is None:
-    return None
-  if isinstance(value, bool):
-    raise ValueError(f"{path}: '{field_name}' must be a number")
-  if isinstance(value, (int, float)):
-    return float(value)
-  if isinstance(value, str):
-    text = value.strip()
-    if text:
-      try:
-        return float(text)
-      except ValueError as exc:
-        raise ValueError(f"{path}: '{field_name}' must be a number") from exc
-  raise ValueError(f"{path}: '{field_name}' must be a number")
 
 
 def _coerce_optional_bool(value: Any, *, field_name: str, path: Path) -> bool:
@@ -623,36 +488,6 @@ def _coerce_optional_string_list(
   return items or None
 
 
-def _coerce_optional_string_set(
-  value: Any,
-  *,
-  field_name: str,
-  path: Path,
-  strict_shape: bool = False,
-  strict_items: bool = False,
-) -> set[str]:
-  if value is None:
-    return set()
-  raw_items: list[Any]
-  if isinstance(value, str):
-    if strict_shape:
-      raise ValueError(f"{path}: '{field_name}' must be a list of strings")
-    raw_items = [value]
-  elif isinstance(value, (list, tuple, set)):
-    raw_items = list(value)
-  else:
-    raise ValueError(f"{path}: '{field_name}' must be a list of strings")
-
-  items: set[str] = set()
-  for item in raw_items:
-    if strict_items and not isinstance(item, str):
-      raise ValueError(f"{path}: '{field_name}' entries must be strings")
-    text = _clean_string(item)
-    if text:
-      items.add(text)
-  return items
-
-
 def _coerce_optional_mcp_tools(
   value: Any,
   *,
@@ -689,32 +524,6 @@ def _coerce_optional_mcp_tools(
       deduped_tools.append(tool_name)
     declared[server_name] = deduped_tools
   return declared or None
-
-
-def _coerce_optional_timeout_overrides(
-  value: Any,
-  *,
-  field_name: str,
-  path: Path,
-) -> dict[str, int] | None:
-  if value is None:
-    return None
-  if not isinstance(value, dict):
-    raise ValueError(f"{path}: '{field_name}' must be a mapping of server names to timeout seconds")
-
-  overrides: dict[str, int] = {}
-  for raw_name, raw_timeout in value.items():
-    server_name = _clean_string(raw_name)
-    if server_name is None:
-      continue
-    timeout_value = _coerce_optional_int(
-      raw_timeout,
-      field_name=f"{field_name}.{server_name}",
-      path=path,
-    )
-    if timeout_value is not None:
-      overrides[server_name] = timeout_value
-  return overrides or None
 
 
 def _coerce_optional_scope(value: Any, *, field_name: str, path: Path) -> str | None:
@@ -793,7 +602,6 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
   raw_version = frontmatter.pop("version", None)
   raw_model = frontmatter.pop("model", None)
   raw_provider = frontmatter.pop("provider", None)
-  raw_max_turns = frontmatter.pop("max_turns", None)
   raw_tool_packs = frontmatter.pop("tool_packs", None)
   raw_persist_state = frontmatter.pop("persist_state", None)
   raw_scope = frontmatter.pop("scope", None)
@@ -801,11 +609,11 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
   raw_agent_callable = frontmatter.pop("agent_callable", None)
   raw_agent_description = frontmatter.pop("agent_description", None)
   raw_resumable = frontmatter.pop("resumable", None)
-  raw_resume_mcp_session_reset_ok = frontmatter.pop("resume_mcp_session_reset_ok", None)
+  raw_children = frontmatter.pop("children", None)
+  raw_terminal_on_persist = frontmatter.pop("terminal_on_persist", None)
   raw_mode = frontmatter.pop("mode", None)
   raw_state_class = frontmatter.pop("state_class", None)
   raw_mutation_mode = frontmatter.pop("mutation_mode", None)
-  raw_extra_excluded_tools = frontmatter.pop("extra_excluded_tools", None)
   raw_tool_packs_enabled = frontmatter.pop("tool_packs_enabled", None)
   raw_max_structured_reads = frontmatter.pop("max_structured_reads", None)
   raw_subagent_return_contract = frontmatter.pop("subagent_return_contract", None)
@@ -830,9 +638,7 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
 
   raw_mcp_servers = metadata.pop("mcp_servers", None)
   raw_session_inject_servers = metadata.pop("session_inject_servers", None)
-  raw_timeout_overrides = metadata.pop("timeout_overrides", None)
   raw_state_dir = metadata.pop("state_dir", None)
-  raw_max_budget_usd = metadata.pop("max_budget_usd", None)
   raw_max_tokens = metadata.pop("max_tokens", None)
   raw_thinking = metadata.pop("thinking", None)
   raw_effort = metadata.pop("effort", None)
@@ -859,17 +665,7 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
     strict_shape=True,
     strict_items=True,
   )
-  coerced_timeout_overrides = _coerce_optional_timeout_overrides(
-    raw_timeout_overrides,
-    field_name="timeout_overrides",
-    path=path,
-  )
   coerced_state_dir = _clean_string(raw_state_dir)
-  coerced_max_budget_usd = _coerce_optional_float(
-    raw_max_budget_usd,
-    field_name="max_budget_usd",
-    path=path,
-  )
   coerced_max_tokens = _coerce_optional_int(
     raw_max_tokens,
     field_name="max_tokens",
@@ -890,24 +686,23 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
     path=path,
   )
   coerced_agent_description = _clean_string(raw_agent_description)
-  coerced_resumable = _coerce_optional_bool(raw_resumable, field_name="resumable", path=path)
-  coerced_resume_mcp_session_reset_ok = _coerce_optional_bool(
-    raw_resume_mcp_session_reset_ok,
-    field_name="resume_mcp_session_reset_ok",
+  children = tuple(sorted(set(_coerce_optional_string_list(
+    raw_children,
+    field_name="children",
     path=path,
+    strict_shape=True,
+    strict_items=True,
+  ) or ())))
+  coerced_resumable = _coerce_optional_bool(raw_resumable, field_name="resumable", path=path)
+  coerced_terminal_on_persist = (
+    True if raw_terminal_on_persist is None
+    else _coerce_optional_bool(raw_terminal_on_persist, field_name="terminal_on_persist", path=path)
   )
   coerced_mode = _coerce_mode(raw_mode, field_name="mode", path=path)
   coerced_state_class = _coerce_optional_state_class(
     raw_state_class,
     field_name="state_class",
     path=path,
-  )
-  coerced_extra_excluded_tools = _coerce_optional_string_set(
-    raw_extra_excluded_tools,
-    field_name="extra_excluded_tools",
-    path=path,
-    strict_shape=True,
-    strict_items=True,
   )
   coerced_tool_packs_enabled = (
     True
@@ -930,9 +725,7 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
     ("mcp_servers", coerced_mcp_servers),
     ("mcp_tools", coerced_mcp_tools),
     ("session_inject_servers", coerced_session_inject_servers),
-    ("timeout_overrides", coerced_timeout_overrides),
     ("state_dir", coerced_state_dir),
-    ("max_budget_usd", coerced_max_budget_usd),
     ("thinking", coerced_thinking),
     ("effort", coerced_effort),
     ("initial_message", coerced_initial_message),
@@ -941,18 +734,11 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
     if key in original_metadata_keys:
       metadata[key] = coerced
 
-  if coerced_resumable and coerced_session_inject_servers and not coerced_resume_mcp_session_reset_ok:
-    raise ValueError(
-      f"{path}: 'resumable: true' with 'session_inject_servers' requires "
-      "'resume_mcp_session_reset_ok: true'"
-    )
-
   return SkillProfile(
     name=_clean_string(raw_name) or path.stem,
     system_prompt=body.strip(),
     version=_clean_string(raw_version),
     model=_clean_string(raw_model),
-    max_turns=_coerce_optional_int(raw_max_turns, field_name="max_turns", path=path),
     tool_packs=_coerce_optional_string_list(raw_tool_packs, field_name="tool_packs", path=path),
     persist_state=_coerce_optional_bool(raw_persist_state, field_name="persist_state", path=path),
     scope=_coerce_optional_scope(raw_scope, field_name="scope", path=path),
@@ -961,9 +747,7 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
     mcp_servers=coerced_mcp_servers,
     mcp_tools=coerced_mcp_tools,
     session_inject_servers=coerced_session_inject_servers,
-    timeout_overrides=coerced_timeout_overrides,
     state_dir=coerced_state_dir,
-    max_budget_usd=coerced_max_budget_usd,
     max_tokens=coerced_max_tokens,
     thinking=coerced_thinking,
     initial_message=coerced_initial_message,
@@ -971,9 +755,8 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
     agent_callable=coerced_agent_callable,
     agent_description=coerced_agent_description,
     resumable=coerced_resumable,
-    resume_mcp_session_reset_ok=coerced_resume_mcp_session_reset_ok,
+    terminal_on_persist=coerced_terminal_on_persist,
     mode=coerced_mode,
-    extra_excluded_tools=coerced_extra_excluded_tools,
     tool_packs_enabled=coerced_tool_packs_enabled,
     state_class=coerced_state_class,
     mutation_mode=_clean_string(raw_mutation_mode),
@@ -984,6 +767,7 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
       raw_delegation_role,
       path=path,
     ),
+    children=children,
   )
 
 
@@ -1365,5 +1149,4 @@ __all__ = [
   "parse_skill_file",
   "operation_tool_ids",
   "resolve_blocks",
-  "validate_operation_tool_coherence",
 ]

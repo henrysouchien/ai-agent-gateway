@@ -8,7 +8,6 @@ import struct
 import pytest
 
 from agent_gateway.autonomous_approval_channel import (
-  AUTONOMOUS_APPROVAL_CHANNEL_MAX_FRAME_BYTES,
   AutonomousApprovalChannelAuthority,
   AutonomousApprovalChannelProtocolError,
   AutonomousApprovalChannelStateError,
@@ -100,6 +99,34 @@ def test_channel_delivers_exact_decision_and_exact_duplicate() -> None:
     assert duplicate.decision is received.decision
     assert duplicate.duplicate is True
     pair.parent.require_sent(decision)
+  finally:
+    pair.close()
+
+
+def test_channel_delivers_past_the_former_decision_quota_and_reports_it() -> None:
+  authority = _authority()
+  pair = create_autonomous_approval_channel(
+    authority=authority,
+  )
+  try:
+    last = None
+    for sequence in range(1, 258):
+      last = _decision(
+        authority,
+        sequence=sequence,
+        approval_id=f"approval-{sequence}",
+      )
+      pair.parent.send(last)
+      assert pair.child.receive().decision == last
+    assert last is not None
+    assert pair.parent.decisions_sent == 257
+    last_body = json.dumps(
+      last.frame(),
+      sort_keys=True,
+      separators=(",", ":"),
+      ensure_ascii=False,
+    ).encode("utf-8")
+    assert pair.parent.sent_frame_bytes(257) == len(last_body)
   finally:
     pair.close()
 
@@ -222,7 +249,7 @@ def test_child_rejects_noncanonical_and_duplicate_key_json() -> None:
     child.close()
 
 
-@pytest.mark.parametrize("body_length", [0, AUTONOMOUS_APPROVAL_CHANNEL_MAX_FRAME_BYTES + 1])
+@pytest.mark.parametrize("body_length", [0])
 def test_child_rejects_invalid_frame_length(
   body_length: int,
 ) -> None:

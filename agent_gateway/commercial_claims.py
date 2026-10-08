@@ -277,7 +277,7 @@ class CommercialClaimVerifier:
     expires_at = _require_positive_int(payload, "exp")
     start_deadline = _require_positive_int(payload, "authorized_work_start_deadline")
     usage_accept_until = _require_positive_int(payload, "usage_accept_until")
-    if expires_at <= issued_at or expires_at - issued_at > 300:
+    if expires_at <= issued_at:
       raise CommercialClaimError("invalid_claim_lifetime")
     if not issued_at <= start_deadline <= expires_at <= usage_accept_until:
       raise CommercialClaimError("invalid_claim_window")

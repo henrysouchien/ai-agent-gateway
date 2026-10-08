@@ -166,8 +166,10 @@ class XAIProvider(ModelProvider):
       has_refresh = False
     if not token and not has_refresh:
       raise RuntimeError(f"No xAI {mode} credential configured")
+    # No read deadline of the provider's own: a quiet stream is bounded once, by
+    # the runner's stream watchdog (runner_streaming.py); connect stays bounded.
     client_kwargs: dict[str, Any] = {
-      "timeout": httpx.Timeout(timeout=timeout or 120.0, connect=10.0),
+      "timeout": httpx.Timeout(timeout=timeout, connect=10.0),
     }
     transport = config.get("_transport")
     if isinstance(transport, httpx.AsyncBaseTransport):

@@ -76,8 +76,6 @@ class ControlSkillSummary:
   required_context: tuple[str, ...]
   agent_callable: bool
   resumable: bool
-  max_turns: int | None
-  max_budget_usd: float | None
   persist_state: bool
   typed_contract: str | None
   catalog: bool
@@ -120,18 +118,6 @@ class ControlSkillSummary:
     ):
       if type(getattr(self, field_name)) is not bool:
         raise TypeError(f"{field_name} must be an exact bool")
-    if self.max_turns is not None and type(self.max_turns) is not int:
-      raise TypeError("max_turns must be None or an exact int")
-    if self.max_budget_usd is not None:
-      if type(self.max_budget_usd) not in {int, float}:
-        raise TypeError(
-          "max_budget_usd must be None or an exact int or float"
-        )
-      object.__setattr__(
-        self,
-        "max_budget_usd",
-        float(self.max_budget_usd),
-      )
     if self.typed_contract is not None and type(self.typed_contract) is not str:
       raise TypeError("typed_contract must be None or an exact str")
     for field_name in (

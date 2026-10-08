@@ -6,7 +6,11 @@ from typing import Any
 
 import pytest
 
-from agent_gateway.approval_route import DurableLocalApprovalRoute
+from agent_gateway.approval_route import (
+  DurableLocalApprovalRoute,
+  child_approval_route,
+  route_session,
+)
 from agent_gateway.agent_session_log import AgentSessionLog
 from agent_gateway.agent_session_log_records import LogEntry as SessionLogEntry, QueryCursor
 from agent_gateway.mcp_activation import McpActivationFold
@@ -16,18 +20,16 @@ from agent_gateway.event_log import EventLog
 from agent_gateway.session import GatewaySession
 from agent_gateway.providers import ModelInfo, ModelProvider
 from agent_gateway.providers.base import StreamEvent
-from agent_gateway.runner_budget import (
-  ChildCostAccumulator,
-  ObservationOnlyCostAccumulator,
-)
+from agent_gateway.runner_budget import CostAccumulator
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.multi_user.billing import _UsageAggregator
 import agent_gateway.runner as gateway_runner
 import agent_gateway.runner_sub_agents as runner_sub_agents
 import agent_gateway.runner_stream_turn as runner_stream_turn
 from agent_gateway.runner_sub_agents import RunnerSubAgentMixin
+from agent_gateway.session_recap import compute_recap
 from agent_gateway.sub_agent_result_evidence import SubAgentResultEvidence
-from agent_gateway.task_registry import TaskEntry
+from agent_gateway.task_registry import TaskEntry, TaskRegistry
 from agent_workflow_contracts import (
   AgentOperationRef,
   AttemptRef,
@@ -120,16 +122,20 @@ class _Dispatcher(ToolDispatcher):
 class _ParentProvider(ModelProvider):
   name = "parent-provider"
 
-def _approval_dispatcher(session: GatewaySession) -> ToolDispatcher:
+def _approval_dispatcher(
+  parent_session: GatewaySession,
+  executing_session: GatewaySession,
+) -> ToolDispatcher:
   return ToolDispatcher(
     mcp_client=McpClientManager(),
     event_log=EventLog(),
     session_id="parent-session",
-    approval_route=DurableLocalApprovalRoute(
+    session=executing_session,
+    approval_route=child_approval_route(DurableLocalApprovalRoute(
       object(),
       object(),
-      session,
-    ),
+      parent_session,
+    )),
     get_tool_definitions=_Dispatcher().get_tool_definitions,
   )
 
@@ -144,6 +150,7 @@ class _ChildRunner:
 
 
   def __init__(self, **kwargs: Any) -> None:
+    self._task_registry = TaskRegistry()
     self.kwargs = kwargs
     self._runner_id = f"runner-{kwargs['session_id']}"
     self.run_kwargs: dict[str, object] | None = None
@@ -161,6 +168,11 @@ class _ChildRunner:
     assert timeout == 2.0
     self.closed = True
 
+  def ensure_research_file_activity(self, workspace_dir: Path, research_file_id: int) -> bool:
+    # No FMS door runs in these children; record the request like a real run would hold it.
+    self.activity_requests = [*getattr(self, "activity_requests", []), (workspace_dir, research_file_id)]
+    return True
+
 
 class _FailedRetrievalChildRunner(_ChildRunner):
   """A child whose only granted source-capability retrieval failed."""
@@ -173,6 +185,24 @@ class _FailedRetrievalChildRunner(_ChildRunner):
       "tool_name": SOURCE_TOOL_ID,
       "is_error": True,
     })
+    self.kwargs["event_log"].append({
+      "type": "stream_complete",
+      "usage": {"input_tokens": 11, "output_tokens": 7},
+    })
+
+
+class _MeasuringChildRunner(_ChildRunner):
+  """A child whose structured reads advance the run's shared count."""
+
+  async def run(self, **kwargs: object) -> None:
+    self.run_kwargs = kwargs
+    for count in (2, 3, 4):
+      self.kwargs["event_log"].append({
+        "type": "interceptor_measurement",
+        "tool_call_id": f"call-read-{count}",
+        "tool_name": "get_quote",
+        "measurement": {"structured_reads": count},
+      })
     self.kwargs["event_log"].append({
       "type": "stream_complete",
       "usage": {"input_tokens": 11, "output_tokens": 7},
@@ -210,6 +240,32 @@ class _TerminalToolChildRunner(_ChildRunner):
     })
 
 
+class _PersistSeveralChildRunner(_ChildRunner):
+  """A child whose operation persists two units and then reports."""
+
+  async def run(self, **kwargs: object) -> None:
+    self.run_kwargs = kwargs
+    assert self.kwargs["terminal_tool_result_ids"] == set()
+    for _ in range(2):
+      self.kwargs["event_log"].append({
+        "type": "tool_call_start",
+        "tool_name": _TERMINAL_TOOL,
+      })
+      self.kwargs["event_log"].append({
+        "type": "tool_call_complete",
+        "tool_name": _TERMINAL_TOOL,
+        "result": dict(_TERMINAL_RESULT),
+        "dispatch": {"outcome": "ok"},
+        "is_error": False,
+        "error": None,
+        "semantic_error": None,
+      })
+    self.kwargs["event_log"].append({
+      "type": "stream_complete",
+      "usage": {"input_tokens": 11, "output_tokens": 7},
+    })
+
+
 class _CancelledAfterTerminalChildRunner(_TerminalToolChildRunner):
   async def run(self, **kwargs: object) -> None:
     await super().run(**kwargs)
@@ -240,7 +296,8 @@ class _ApprovalChildRunner(_ChildRunner):
         timeout_seconds=5,
       )
     )
-    session = dispatcher._session
+    session = route_session(dispatcher._approval_route)
+    assert dispatcher._session is not session
     for _ in range(100):
       if "call-start-quant" in session.approval_queues:
         break
@@ -284,6 +341,7 @@ class _SessionLog(AgentSessionLog):
 
 def _parent(tmp_path: Path, *, session_log: _SessionLog | AgentSessionLog | None) -> AgentRunner:
   runner = object.__new__(AgentRunner)
+  runner._task_registry = TaskRegistry()
   runner._sub_agent_config = None
   runner._provider = _ParentProvider()
   runner._auth_config = {"api_key": "parent"}
@@ -306,7 +364,6 @@ def _parent(tmp_path: Path, *, session_log: _SessionLog | AgentSessionLog | None
   runner._on_metric = None
   runner._compaction_trigger = 80
   runner._tool_call_timeout = 13.0
-  runner._on_max_turns = None
   runner._aggregator = _UsageAggregator(
     user_id="alice",
     session_id="parent-session",
@@ -337,7 +394,6 @@ def _spawn(parent: AgentRunner, **overrides: Any):
     "result_requirement": _RESULT,
     "result_provenance": _PROVENANCE,
     "dispatcher": _Dispatcher(),
-    "max_turns": 4,
   }
   kwargs.update(overrides)
   return asyncio.run(parent.spawn_sub_agent("research this", **kwargs))
@@ -355,7 +411,6 @@ def _resume(parent: AgentRunner, **overrides: Any):
     "result_requirement": _RESULT,
     "result_provenance": _PROVENANCE,
     "dispatcher": _Dispatcher(),
-    "max_turns": 4,
   }
   kwargs.update(overrides)
   return asyncio.run(parent.resume_sub_agent(**kwargs))
@@ -396,7 +451,6 @@ def test_spawn_sub_agent_materializes_exact_terminal_message(
   assert child.run_kwargs == {
     "messages": [{"role": "user", "content": "research this"}],
     "system_prompt": None,
-    "max_turns": 4,
   }
   assert child.closed is True
 
@@ -416,6 +470,25 @@ def test_spawn_sub_agent_never_injects_a_result_submission_tool(
     for tool in _ChildRunner.instances[-1].kwargs["get_tool_definitions"]()
   }
   assert "submit_report" not in names
+
+
+def test_child_measurements_reach_the_parent_session_recap(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  parent = _parent(tmp_path, session_log=_SessionLog("Done."))
+  monkeypatch.setattr(gateway_runner, "AgentRunner", _MeasuringChildRunner)
+  monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)
+
+  _spawn(parent)
+
+  recap = compute_recap(
+    parent._log,
+    session_id="parent",
+    started_at=0.0,
+    trigger="turn_end",
+  )
+  assert recap.tool_calls_summary.measurements == {"structured_reads": 4}
 
 
 @pytest.mark.parametrize("method", ["spawn", "resume"])
@@ -458,6 +531,47 @@ def test_named_child_projects_accepted_terminal_tool_result(
     "tool_name": _TERMINAL_TOOL,
     "result": _TERMINAL_RESULT,
   }
+
+
+@pytest.mark.parametrize("method", ["spawn", "resume"])
+def test_child_that_persists_several_units_settles_on_its_narrative(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  method: str,
+) -> None:
+  _PersistSeveralChildRunner.instances.clear()
+  admitted = sealed_admitted_task(
+    logical_task=_LOGICAL_TASK,
+    attempt=_ATTEMPT,
+    result_requirement=_RESULT,
+    tool_id=_TERMINAL_TOOL,
+    terminal_on_persist=False,
+  )
+  report = "Persisted FY2024 and FY2025; FY2023 remains."
+  parent = _parent(tmp_path, session_log=_SessionLog(report))
+  monkeypatch.setattr(gateway_runner, "AgentRunner", _PersistSeveralChildRunner)
+  monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)
+
+  result, error = (
+    _spawn(
+      parent,
+      admitted_task=admitted,
+      result_provenance=provenance_of(admitted),
+    )
+    if method == "spawn"
+    else _resume(
+      parent,
+      admitted_task=admitted,
+      result_provenance=provenance_of(admitted),
+    )
+  )
+
+  assert error is None
+  assert result is not None
+  assert result.execution.status == "succeeded"
+  assert result.values.projection is None
+  assert result.values.terminal_narrative is not None
+  assert result.values.terminal_narrative.content_chars == len(report)
 
 
 def test_resume_short_circuits_prior_terminal_success_before_provider(
@@ -797,7 +911,7 @@ def test_refused_child_settles_with_refusal_signal_and_keeps_its_narrative(
 
 
 @pytest.mark.parametrize("method", ["spawn", "resume"])
-def test_named_child_budget_wraps_observation_accumulator(
+def test_child_cost_accumulator_carries_observation_threshold(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
   method: str,
@@ -808,34 +922,24 @@ def test_named_child_budget_wraps_observation_accumulator(
   monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)
 
   result, error = (
-    _spawn(
-      parent,
-      max_budget_usd=6.0,
-      cost_observation_threshold_usd=3.0,
-    )
+    _spawn(parent, cost_observation_threshold_usd=3.0)
     if method == "spawn"
-    else _resume(
-      parent,
-      max_budget_usd=6.0,
-      cost_observation_threshold_usd=3.0,
-    )
+    else _resume(parent, cost_observation_threshold_usd=3.0)
   )
 
   assert error is None
   assert isinstance(result, TaskResult)
   child_kwargs = _ChildRunner.instances[0].kwargs
   accumulator = child_kwargs["_cost_accumulator"]
-  assert child_kwargs["max_budget_usd"] == pytest.approx(6.0)
-  assert isinstance(accumulator, ChildCostAccumulator)
-  assert isinstance(accumulator._parent, ObservationOnlyCostAccumulator)
-  assert accumulator._parent.observation_threshold_usd == pytest.approx(3.0)
+  assert isinstance(accumulator, CostAccumulator)
+  assert accumulator.observation_threshold_usd == pytest.approx(3.0)
   accumulator.add(1.25)
   assert accumulator.total == pytest.approx(1.25)
-  assert accumulator._parent.total == pytest.approx(1.25)
+  assert accumulator.observation_threshold_crossed is False
 
 
 @pytest.mark.parametrize("method", ["spawn", "resume"])
-def test_legacy_child_without_budget_remains_observation_only(
+def test_child_without_threshold_gets_plain_cost_accumulator(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
   method: str,
@@ -849,12 +953,9 @@ def test_legacy_child_without_budget_remains_observation_only(
 
   assert error is None
   assert isinstance(result, TaskResult)
-  child_kwargs = _ChildRunner.instances[0].kwargs
-  assert child_kwargs["max_budget_usd"] is None
-  assert isinstance(
-    child_kwargs["_cost_accumulator"],
-    ObservationOnlyCostAccumulator,
-  )
+  accumulator = _ChildRunner.instances[0].kwargs["_cost_accumulator"]
+  assert isinstance(accumulator, CostAccumulator)
+  assert accumulator.observation_threshold_usd is None
 
 
 @pytest.mark.parametrize("method,approved", [
@@ -886,14 +987,21 @@ def test_child_approval_uses_parent_session_and_parent_visible_child_log(
     expires_at=2,
     user_id="owner",
   )
-  dispatcher = _approval_dispatcher(parent_session)
+  child_session = GatewaySession(
+    session_id="sub0:parent-session",
+    api_key_hash="hash",
+    created_at=1,
+    expires_at=2,
+    user_id="owner",
+  )
+  dispatcher = _approval_dispatcher(parent_session, child_session)
   _ApprovalChildRunner.approved = approved
   monkeypatch.setattr(gateway_runner, "AgentRunner", _ApprovalChildRunner)
 
   result, error = (
-    _spawn(parent, dispatcher=dispatcher)
+    _spawn(parent, dispatcher=dispatcher, sub_session=child_session)
     if method == "spawn"
-    else _resume(parent, dispatcher=dispatcher)
+    else _resume(parent, dispatcher=dispatcher, sub_session=child_session)
   )
 
   assert error is None
@@ -929,6 +1037,9 @@ def test_child_approval_uses_parent_session_and_parent_visible_child_log(
   }
   assert parent_session.pending_tools == {}
   assert parent_session.approval_queues == {}
+  assert dispatcher._session is child_session
+  assert child_session.pending_tools == {}
+  assert child_session.approval_queues == {}
 
 
 def test_spawn_sub_agent_requires_durable_terminal_message_log(
@@ -939,14 +1050,6 @@ def test_spawn_sub_agent_requires_durable_terminal_message_log(
     match="narrative child execution requires a durable session log",
   ):
     _spawn(_parent(tmp_path, session_log=None))
-
-
-def test_spawn_sub_agent_rejects_non_node_capability(tmp_path: Path) -> None:
-  with pytest.raises(ValueError, match=r"requires a node\.\* capability bind"):
-    _spawn(
-      _parent(tmp_path, session_log=_SessionLog("Done.")),
-      capability_execution=_execution("session.driver"),
-    )
 
 
 def _admitted_entry() -> TaskEntry:

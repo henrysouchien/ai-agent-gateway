@@ -127,7 +127,7 @@ def _javascript_string_set(source: str, variable_name: str) -> list[str]:
 
 
 def authoring_manifest() -> dict[str, Any]:
-  """Generate the read-only authoring surface from packaged types and policy."""
+  """Generate the read-only authoring surface from packaged types, manifest, and policy."""
 
   directory = packaged_contract_directory()
   try:
@@ -148,6 +148,7 @@ def authoring_manifest() -> dict[str, Any]:
     "generated_from": [
       _COMPONENT_TYPES_FILE,
       _FORMATTER_TYPES_FILE,
+      _MANIFEST_FILE,
       "canvas_build/policy.mjs",
     ],
     "components": component_shapes,
@@ -158,7 +159,7 @@ def authoring_manifest() -> dict[str, Any]:
     },
     "formatters": _formatter_signatures(formatter_source),
     "module_policy": {
-      "allowed_imports": _javascript_string_set(policy_source, "allowedImports"),
+      "allowed_imports": list(manifest()["externals"]),
       "forbidden_identifiers": _javascript_string_set(policy_source, "forbidden"),
       "exactly_one_default_component_export": "defaults !== 1" in policy_source,
       "const_only_module_variables": "ts.NodeFlags.Const" in policy_source,

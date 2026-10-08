@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import hashlib
+from itertools import chain
 import re
 from typing import Any
 
@@ -738,9 +739,10 @@ def _read_parser_filing_sections(result: Mapping[str, Any]) -> list[dict[str, An
 
 
 def _read_metric_citations(result: Mapping[str, Any]) -> list[dict[str, Any]]:
-  matches = result.get("matches")
-  if not isinstance(matches, list) or not matches:
-    return []
+  matches = chain.from_iterable(
+    collection for name in ("matches", "series")
+    if isinstance(collection := result.get(name), list)
+  )
   identities: list[dict[str, Any]] = []
   for match in matches:
     if not isinstance(match, Mapping):
@@ -757,6 +759,82 @@ def _read_metric_citations(result: Mapping[str, Any]) -> list[dict[str, Any]]:
       )
       if record is not None:
         identities.append(record)
+  return identities
+
+
+def _read_positioning_filing_sources(
+  result: Mapping[str, Any],
+  _descriptor: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+  filing_sources = result.get("filing_sources")
+  if not isinstance(filing_sources, list):
+    return []
+  identities: list[dict[str, Any]] = []
+  for filing in filing_sources:
+    if not isinstance(filing, Mapping):
+      continue
+    manager_cik = _required_str(filing.get("manager_cik"))
+    year = _required_str(filing.get("year"))
+    quarter = _required_str(filing.get("quarter"))
+    source_url = _required_str(filing.get("source_url"))
+    if not manager_cik or not year or not quarter or not source_url:
+      continue
+    document_id = f"fmp:13f:{manager_cik}:{year}:Q{quarter}"
+    key_fields: dict[str, Any] = {
+      "manager_cik": manager_cik,
+      "year": filing["year"],
+      "quarter": filing["quarter"],
+    }
+    accession = _required_str(filing.get("accession"))
+    if accession:
+      document_id += f":{accession}"
+      key_fields["accession"] = accession
+    record = {
+      "document_id": document_id,
+      "source_kind": "vendor",
+      "provider": "fmp",
+      "endpoint": "get_topdown_positioning",
+      "key_fields": key_fields,
+      "source_url": source_url,
+    }
+    identities.append(record)
+  return identities
+
+
+def _read_producer_vendor_sources(
+  result: Mapping[str, Any],
+  _descriptor: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+  sources = result.get("sources")
+  if not isinstance(sources, list):
+    return []
+  identities: list[dict[str, Any]] = []
+  for source in sources:
+    if not isinstance(source, Mapping) or source.get("source_kind") != "vendor":
+      continue
+    provider = source.get("provider")
+    endpoint = source.get("endpoint")
+    source_url = source.get("source_url")
+    key_fields = source.get("key_fields")
+    if (
+      not isinstance(provider, str) or not provider.strip()
+      or not isinstance(endpoint, str) or not endpoint.strip()
+      or not isinstance(source_url, str) or not source_url.strip()
+      or not isinstance(key_fields, Mapping) or not key_fields
+    ):
+      continue
+    record: dict[str, Any] = {
+      "document_id": source_url,
+      "source_kind": "vendor",
+      "provider": provider,
+      "endpoint": endpoint,
+      "key_fields": dict(key_fields),
+      "source_url": source_url,
+    }
+    for field in ("section_label", "as_of", "as_of_basis"):
+      if field in source:
+        record[field] = source[field]
+    identities.append(record)
   return identities
 
 
@@ -782,6 +860,8 @@ _READERS = {
     lambda result, descriptor: _read_parser_filing_sections(result)
   ),
   "metric_citations": lambda result, descriptor: _read_metric_citations(result),
+  "positioning_filing_sources": _read_positioning_filing_sources,
+  "producer_vendor_sources": _read_producer_vendor_sources,
   "sandbox_computations": _read_sandbox_computations,
 }
 

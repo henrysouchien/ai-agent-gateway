@@ -10,8 +10,11 @@ from .sub_agent_result_contract import (
 from .tool_dispatch_classification import OUTCOME_OK
 
 
-_EVIDENCE_ADMISSION_WARNING = (
-  "child evidence exceeded the canonical admission contract"
+# The canonical evidence bound (``child_evidence_fits_externalization_bound``)
+# is a resource bound on untrusted tool output: evidence past it is not kept.
+# The child's own result still settles; the gap rides its mechanical outcome.
+EVIDENCE_GAP_RATIONALE = (
+  "child evidence exceeded the canonical evidence bound and was not recorded"
 )
 _K = TypeVar("_K")
 _V = TypeVar("_V")
@@ -58,7 +61,7 @@ class SubAgentResultEvidence:
   fms_results: tuple[Mapping[str, Any], ...]
   artifact_events: tuple[Mapping[str, Any], ...]
   warning_parts: tuple[str, ...]
-  admission_rejected: bool = False
+  gap: str | None = None
   observed_sources: tuple[Mapping[str, Any], ...] = ()
 
   @classmethod
@@ -69,24 +72,21 @@ class SubAgentResultEvidence:
       fms_results=(),
       artifact_events=(),
       warning_parts=(),
-      admission_rejected=False,
+      gap=None,
       observed_sources=(),
     )
 
 
-def _rejected_evidence(
+def _evidence_gap(
   warning_parts: Iterable[str] = (),
 ) -> SubAgentResultEvidence:
-  warnings = tuple(warning_parts)
-  if _EVIDENCE_ADMISSION_WARNING not in warnings:
-    warnings = (*warnings, _EVIDENCE_ADMISSION_WARNING)
   return SubAgentResultEvidence(
     usage={},
     tools_used=(),
     fms_results=(),
     artifact_events=(),
-    warning_parts=warnings,
-    admission_rejected=True,
+    warning_parts=tuple(warning_parts),
+    gap=EVIDENCE_GAP_RATIONALE,
     observed_sources=(),
   )
 
@@ -390,7 +390,7 @@ def collect_sub_agent_result_evidence(
     ],
     artifact_events=[],
   ):
-    return _rejected_evidence()
+    return _evidence_gap()
   tools_used = tuple(
     str(event.get("tool_name") or "")
     for event in event_list
@@ -433,7 +433,7 @@ def collect_sub_agent_result_evidence(
     else:
       usage_payload = merge_usage_payloads(*turn_usages)
   except UsageEvidenceMergeError:
-    return _rejected_evidence(warning_parts)
+    return _evidence_gap(warning_parts)
 
   fms_results = tuple(
     _ReadOnlyChainMap(
@@ -455,7 +455,7 @@ def collect_sub_agent_result_evidence(
     fms_results=fms_results,
     artifact_events=artifact_events,
     warning_parts=tuple(warning_parts),
-    admission_rejected=False,
+    gap=None,
     observed_sources=raw_observed_sources,
   )
   if not child_evidence_fits_externalization_bound(
@@ -464,7 +464,7 @@ def collect_sub_agent_result_evidence(
     fms_results=[*evidence.fms_results, *evidence.observed_sources],
     artifact_events=evidence.artifact_events,
   ):
-    return _rejected_evidence(evidence.warning_parts)
+    return _evidence_gap(evidence.warning_parts)
   return evidence
 
 
@@ -481,14 +481,16 @@ def merge_sub_agent_result_evidence(
     for item in evidence_items
     for warning in item.warning_parts
   )
-  if any(item.admission_rejected for item in evidence_items):
-    return _rejected_evidence(warning_parts)
+  gap = next(
+    (item.gap for item in evidence_items if item.gap is not None),
+    None,
+  )
   try:
     usage = merge_usage_payloads(
       *(item.usage for item in evidence_items)
     )
   except UsageEvidenceMergeError:
-    return _rejected_evidence(warning_parts)
+    return _evidence_gap(warning_parts)
   evidence = SubAgentResultEvidence(
     usage=usage,
     tools_used=tuple(
@@ -507,7 +509,7 @@ def merge_sub_agent_result_evidence(
       for event in item.artifact_events
     ),
     warning_parts=warning_parts,
-    admission_rejected=False,
+    gap=gap,
     observed_sources=_dedup_observed_source_records(
       record
       for item in evidence_items
@@ -520,7 +522,7 @@ def merge_sub_agent_result_evidence(
     fms_results=[*evidence.fms_results, *evidence.observed_sources],
     artifact_events=evidence.artifact_events,
   ):
-    return _rejected_evidence(evidence.warning_parts)
+    return _evidence_gap(evidence.warning_parts)
   return evidence
 
 

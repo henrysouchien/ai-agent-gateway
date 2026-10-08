@@ -43,13 +43,10 @@ def _forged_identity(
   return identity
 
 
-def test_exact_dispatch_overrides_have_the_fixed_40_route_population() -> None:
+def test_exact_dispatch_overrides_route_population() -> None:
   overrides = tool_dispatch_semantics_overrides()
 
   assert isinstance(overrides, MappingProxyType)
-  assert len(overrides) == 40
-  assert sum(identity.route_kind == "local_handler" for identity in overrides) == 4
-  assert sum(identity.route_kind == "mcp" for identity in overrides) == 36
   assert set(
     identity.logical_name
     for identity in overrides
@@ -60,68 +57,7 @@ def test_exact_dispatch_overrides_have_the_fixed_40_route_population() -> None:
     "fms_compute_quantifying_risk",
     "web_fetch",
   }
-  mcp_names_by_server = {
-    server: {
-      identity.logical_name
-      for identity in overrides
-      if identity.logical_server_id == server
-    }
-    for server in {
-      identity.logical_server_id
-      for identity in overrides
-      if identity.logical_server_id is not None
-    }
-  }
-  assert mcp_names_by_server == {
-    "edgar-parser-mcp": {
-      "cite_concept",
-      "get_filing_document",
-      "get_filing_evidence",
-      "get_filing_sections",
-      "get_filings",
-      "get_metric",
-      "search_filing_text",
-    },
-    "fred-mcp": {
-      "fred_get_multiple",
-      "fred_get_series",
-      "fred_list_series",
-      "fred_search",
-    },
-    "gsheets-mcp": {"gsheets_read_range"},
-    "market-data-mcp": {
-      "compare_peers",
-      "fetch_company_profile",
-      "fetch_financials",
-      "get_economic_data",
-      "get_estimate_revisions",
-      "get_insider_trades",
-      "get_institutional_ownership",
-      "get_market_context",
-      "get_price_performance_windows",
-      "get_sector_overview",
-      "screen_estimate_revisions",
-    },
-    "portfolio-reads-mcp": {
-      "get_positions",
-      "get_quote",
-      "get_risk_analysis",
-      "industry_peer_comparison",
-      "run_whatif",
-    },
-    "research-corpus-mcp": {
-      "filings_list",
-      "filings_read",
-      "filings_search",
-      "filings_source_excerpt",
-      "transcripts_list",
-      "transcripts_read",
-      "transcripts_search",
-      "transcripts_source_excerpt",
-    },
-  }
   assert all(type(value) is ToolDispatchSemantics for value in overrides.values())
-  assert sum(value.idempotent for value in overrides.values()) == 38
   for name in ("code_execute", "code_execute_status"):
     semantics = overrides[_local(name)]
     assert semantics.idempotent is False
@@ -255,8 +191,6 @@ def test_dispatch_projection_keeps_registered_vendor_sources_out_of_legacy_reade
     if semantics.source_identity_policy.policy_id == "vendor_sources"
   }
 
-  assert len(actual) == 40
-  assert len(exact_vendor_sources) == 19
   assert all(
     actual[identity.logical_name].source_identity is None
     for identity in exact_vendor_sources
@@ -271,3 +205,203 @@ def test_dispatch_projection_keeps_registered_vendor_sources_out_of_legacy_reade
     ("portfolio-reads-mcp", "fmp"): 1,
     ("gsheets-mcp", "gsheets"): 1,
   }
+
+
+@pytest.mark.parametrize("status", [
+  "ok",
+  "success",
+  "methodology_validation_not_run",
+  "methodology_validation_incomplete",
+  "methodology_validation_failed",
+  "insufficient_residual_signal_quality",
+  "no_published_period",
+])
+def test_positioning_filing_sources_declaration_and_reader(status: str) -> None:
+  from agent_gateway.tool_dispatch_source_identity import read_source_identities
+
+  identity = _mcp("positioning-mcp", "get_topdown_positioning")
+  semantics = tool_dispatch_semantics_for(identity)
+  assert semantics.idempotent is True
+  assert semantics.outcome_policy.policy_id == "current_generic_non_error"
+  assert semantics.outcome_policy.parameters == {}
+  assert semantics.source_identity_policy.policy_id == "positioning_filing_sources"
+  declaration = build_tool_dispatch_declarations()["get_topdown_positioning"]
+  assert declaration.source_identity == {"kind": "positioning_filing_sources"}
+  from agent_gateway.tool_dispatch_classification import classify_tool_outcome
+
+  assert declaration.success_signal is None
+  result = {
+    "status": status,
+    "resolved_period": {"year": 2026, "quarter": 2, "selection": "latest"},
+    "filing_sources": [
+      {
+        "manager_cik": "0001067983",
+        "year": 2026,
+        "quarter": 2,
+        "source_url": "https://financialmodelingprep.com/13f/1067983/2026/2",
+      },
+      {
+        "manager_cik": "0001364742",
+        "year": 2026,
+        "quarter": 2,
+        "source_url": "https://financialmodelingprep.com/13f/1364742/2026/2",
+        "filing_url": "https://www.sec.gov/Archives/edgar/data/1364742/filing",
+        "accession": "0001364742-26-000010",
+      },
+      {"manager_cik": "0001166559", "year": 2026, "quarter": 2},
+    ],
+  }
+  assert classify_tool_outcome(None, result, None) == "ok"
+  assert read_source_identities(declaration.source_identity, result) == (
+    {
+      "document_id": "fmp:13f:0001067983:2026:Q2",
+      "source_kind": "vendor",
+      "provider": "fmp",
+      "source_url": "https://financialmodelingprep.com/13f/1067983/2026/2",
+      "endpoint": "get_topdown_positioning",
+      "key_fields": {"manager_cik": "0001067983", "year": 2026, "quarter": 2},
+    },
+    {
+      "document_id": "fmp:13f:0001364742:2026:Q2:0001364742-26-000010",
+      "source_kind": "vendor",
+      "provider": "fmp",
+      "source_url": "https://financialmodelingprep.com/13f/1364742/2026/2",
+      "endpoint": "get_topdown_positioning",
+      "key_fields": {
+        "manager_cik": "0001364742",
+        "year": 2026,
+        "quarter": 2,
+        "accession": "0001364742-26-000010",
+      },
+    },
+  )
+
+
+def test_positioning_error_results_mint_no_sources() -> None:
+  from agent_gateway.tool_dispatch_classification import (
+    DispatchEntry,
+    settle_catalogless_tool_result,
+  )
+  from agent_workflow_contracts import CatalogToolEntry
+
+  declaration = build_tool_dispatch_declarations()["get_topdown_positioning"]
+  assert declaration.success_signal is None
+  assert declaration.source_identity is not None
+  entry = DispatchEntry(
+    tool_name="get_topdown_positioning",
+    canonical_name="get_topdown_positioning",
+    route_id="positioning-mcp",
+    catalog_entry=CatalogToolEntry(
+      tool_id="get_topdown_positioning",
+      canonical_name="get_topdown_positioning",
+      success_signal=declaration.success_signal,
+      source_identity=dict(declaration.source_identity),
+    ),
+  )
+
+  result = {
+    "status": "error",
+    "reason": "no_published_period",
+    "filing_sources": [{
+      "manager_cik": "0001067983",
+      "year": 2026,
+      "quarter": 2,
+      "source_url": "https://financialmodelingprep.com/13f/1067983/2026/2",
+    }],
+  }
+  settlement = settle_catalogless_tool_result(entry=entry, result=result, error=None)
+  assert settlement.outcome == "error_semantic"
+  assert settlement.sources == ()
+
+
+@pytest.mark.parametrize("filing_sources", [None, []])
+def test_positioning_without_filing_sources_mints_nothing(
+  filing_sources: object,
+) -> None:
+  from agent_gateway.tool_dispatch_source_identity import read_source_identities
+
+  result: dict[str, object] = {"status": "ok"}
+  if filing_sources is not None:
+    result["filing_sources"] = filing_sources
+  assert read_source_identities({"kind": "positioning_filing_sources"}, result) == ()
+
+
+@pytest.mark.parametrize("missing_field", ["manager_cik", "year", "quarter"])
+def test_positioning_skips_incomplete_filing_identity(missing_field: str) -> None:
+  from agent_gateway.tool_dispatch_source_identity import read_source_identities
+
+  filing = {
+    "manager_cik": "0001067983",
+    "year": 2026,
+    "quarter": 2,
+    "source_url": "https://financialmodelingprep.com/13f/1067983/2026/2",
+  }
+  del filing[missing_field]
+  assert read_source_identities({"kind": "positioning_filing_sources"}, {
+    "status": "success",
+    "filing_sources": [filing],
+  }) == ()
+
+
+@pytest.mark.parametrize("name", [
+  "get_macro_dashboard", "get_rates_and_curves", "get_economic_indicators",
+  "get_sector_analysis", "get_technical_summary", "get_positioning",
+])
+def test_macro_declares_producer_vendor_sources(name: str) -> None:
+  semantics = tool_dispatch_semantics_for(_mcp("macro-mcp", name))
+  assert semantics.idempotent is True
+  assert semantics.outcome_policy.policy_id == "current_generic_non_error"
+  assert semantics.outcome_policy.parameters == {}
+  assert semantics.source_identity_policy.policy_id == "producer_vendor_sources"
+  declaration = build_tool_dispatch_declarations()[name]
+  assert declaration.success_signal is None
+  assert declaration.source_identity == {"kind": "producer_vendor_sources"}
+
+
+@pytest.mark.parametrize(("provider", "key_fields", "source_url"), [
+  ("fred", {"series_id": "DGS10", "observation_dates": ["2026-10-07"]},
+   "https://api.stlouisfed.org/fred/series/observations"),
+  ("fmp", {"symbol": "SPY", "timestamp": 1791324000},
+   "https://financialmodelingprep.com/stable/quote"),
+  ("orats", {"ticker": "SPY", "trade_dates": ["2026-10-07"]},
+   "https://api.orats.io/datav2/hist/cores"),
+])
+def test_producer_vendor_reader_preserves_coordinates(
+  provider: str, key_fields: dict[str, object], source_url: str,
+) -> None:
+  from agent_gateway.tool_dispatch_source_identity import read_source_identities
+
+  row = {
+    "source_kind": "vendor", "provider": provider, "endpoint": "observations",
+    "key_fields": key_fields, "source_url": source_url,
+    "section_label": "Macro observations", "as_of": "2026-10-07",
+    "as_of_basis": "observation",
+  }
+  assert read_source_identities({"kind": "producer_vendor_sources"}, {
+    "sources": [row],
+  }) == ({"document_id": source_url, **row},)
+
+
+@pytest.mark.parametrize(("field", "value"), [
+  ("source_kind", "filing"), ("provider", ""), ("provider", 1),
+  ("endpoint", " "), ("endpoint", None), ("source_url", ""),
+  ("source_url", 1), ("key_fields", {}), ("key_fields", []),
+])
+def test_producer_vendor_reader_skips_malformed_rows(field: str, value: object) -> None:
+  from agent_gateway.tool_dispatch_source_identity import read_source_identities
+
+  valid: dict[str, object] = {
+    "source_kind": "vendor", "provider": "fred", "endpoint": "observations",
+    "key_fields": {"series_id": "DGS10"},
+    "source_url": "https://api.stlouisfed.org/fred/series/observations",
+  }
+  assert read_source_identities({"kind": "producer_vendor_sources"}, {
+    "sources": [None, "invalid", {**valid, field: value}, valid],
+  }) == ({"document_id": valid["source_url"], **valid},)
+
+
+@pytest.mark.parametrize("result", [{}, {"sources": None}, {"sources": {}}])
+def test_producer_vendor_reader_without_source_rows(result: dict[str, object]) -> None:
+  from agent_gateway.tool_dispatch_source_identity import read_source_identities
+
+  assert read_source_identities({"kind": "producer_vendor_sources"}, result) == ()

@@ -29,6 +29,7 @@ async def chat_subscribe_response(
       detail="schema_version is set at session init via POST /chat/init; create a new session to change versions",
     )
   requested_session_id = request.query_params.get("session_id") or session.session_id
+  # A chat bearer authorizes only the session it was minted for (auth).
   if requested_session_id != session.session_id:
     raise HTTPException(status_code=403, detail="Cannot subscribe to a different session")
 
@@ -86,6 +87,7 @@ async def chat_cancel_response(
 ) -> JSONResponse:
   token = get_bearer_token(request.headers.get("Authorization"))
   session = auth.verify_token(token)
+  # A chat bearer authorizes only the session it was minted for (auth).
   if body.session_id != session.session_id:
     raise HTTPException(status_code=403, detail="Cannot cancel a different session")
 
@@ -112,6 +114,7 @@ async def chat_recap_response(
 ) -> JSONResponse:
   token = get_bearer_token(request.headers.get("Authorization"))
   session = auth.verify_token(token)
+  # A chat bearer authorizes only the session it was minted for (auth).
   if body.session_id != session.session_id:
     raise HTTPException(status_code=403, detail="Cannot recap a different session")
 

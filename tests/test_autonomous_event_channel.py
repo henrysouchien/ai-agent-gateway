@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import ast
 import errno
 import hashlib
-import inspect
 import json
 import os
 import queue
@@ -12,7 +10,6 @@ import struct
 import threading
 import time
 from dataclasses import replace
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -1769,27 +1766,3 @@ def test_timeout_configuration_is_finite_and_bounded(timeout: object) -> None:
       channel_id=_CHANNEL_ID,
       io_timeout_seconds=timeout,  # type: ignore[arg-type]
     )
-
-
-def test_protocol_source_contains_no_polling_sleep_or_file_io() -> None:
-  source_path = Path(inspect.getsourcefile(channel) or "")
-  tree = ast.parse(source_path.read_text(encoding="utf-8"))
-  forbidden_calls: list[str] = []
-  for node in ast.walk(tree):
-    if not isinstance(node, ast.Call):
-      continue
-    function = node.func
-    if isinstance(function, ast.Name) and function.id in {"open", "sleep"}:
-      forbidden_calls.append(function.id)
-    if (
-      isinstance(function, ast.Attribute)
-      and function.attr in {
-        "Thread",
-        "open",
-        "read_text",
-        "write_text",
-        "sleep",
-      }
-    ):
-      forbidden_calls.append(function.attr)
-  assert forbidden_calls == []

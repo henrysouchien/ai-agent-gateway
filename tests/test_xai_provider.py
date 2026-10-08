@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+from typing import Any
 
+import httpx
 import pytest
 
 from agent_gateway import AuthConfig, OpenAIProvider, XAIProvider
@@ -353,6 +355,54 @@ def test_whole_chunk_tool_call_maps_raw_full_tool_lifecycle(
   assert done[0].raw_block["input"] == {"ticker": "XAI"}
   assert completed[-1].type == "message_end"
   assert completed[-1].stop_reason == "tool_use"
+  assert completed[-1].request_input_tokens == 3
+
+
+@pytest.mark.parametrize(
+  ("usage", "request_input_tokens", "billed_input", "cached"),
+  [
+    ({"input_tokens": 100, "input_tokens_details": {"cached_tokens": 25}}, 100, 75, 25),
+    ({"input_tokens": 100}, 100, 100, 0),
+    ({"input_tokens": 0}, 0, 0, 0),
+    ({}, None, 0, 0),
+    ({"input_tokens": None}, None, 0, 0),
+    ({"input_tokens_details": {"cached_tokens": 25}}, None, 0, 25),
+    (None, None, 0, 0),
+  ],
+)
+def test_stream_reports_absolute_request_input_separately_from_billing(
+  usage: dict[str, Any] | None,
+  request_input_tokens: int | None,
+  billed_input: int,
+  cached: int,
+) -> None:
+  response: dict[str, Any] = {"status": "completed"}
+  if usage is not None:
+    response["usage"] = {**usage, "output_tokens": 7}
+  payload = "data: " + json.dumps({"type": "response.completed", "response": response}) + "\n\n"
+
+  def handle_request(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=payload)
+
+  async def collect():
+    provider = XAIProvider()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle_request)) as client:
+      provider._client_state[client] = {
+        "token": "xai-test",
+        "auth_mode": "api",
+        "endpoint_url": "https://xai.example/v1/responses",
+        "headers": {},
+      }
+      return [event async for event in provider.stream(client, {"model": "grok-4.5"})]
+
+  events = asyncio.run(collect())
+  starts = [event for event in events if event.type == "message_start"]
+  ends = [event for event in events if event.type == "message_end"]
+  assert len(starts) == len(ends) == 1
+  assert (starts[0].input_tokens, starts[0].cache_read_tokens) == (billed_input, cached)
+  assert sum(event.output_tokens for event in events) == (7 if usage is not None else 0)
+  assert ends[0].request_input_tokens == request_input_tokens
+  assert ends[0].stop_reason == "end_turn"
 
 
 def test_single_done_event_whole_tool_call_maps_full_lifecycle() -> None:

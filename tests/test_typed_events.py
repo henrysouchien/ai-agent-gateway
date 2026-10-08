@@ -272,8 +272,8 @@ def test_skill_result_captured_event_round_trip() -> None:
     error=None,
     warnings=["source coverage limited"],
     approval_outcome="approval_timeout",
-    approval_id="approval-forecast-1",
-    approval_tool_name="fms_persist_forecast_assumptions",
+    approval_id="approval-model-update-1",
+    approval_tool_name="fms_persist_model_update",
   )
 
   payload = event_to_dict(event)
@@ -282,7 +282,7 @@ def test_skill_result_captured_event_round_trip() -> None:
   assert "skill_result_captured" in TYPED_EVENT_TYPES
   assert "skill_result_captured" in RUN_SCOPED_EVENT_TYPES
   assert payload["approval_outcome"] == "approval_timeout"
-  assert payload["approval_id"] == "approval-forecast-1"
+  assert payload["approval_id"] == "approval-model-update-1"
   assert event_from_dict(payload) == event
 
 
@@ -615,8 +615,7 @@ def test_session_recap_event_supports_all_failure_types() -> None:
     "terminal_error",
     "artifact_failed",
     "artifact_unavailable",
-    "budget_exceeded",
-    "max_turns_reached",
+    "soft_budget_abort",
   ]
 
   for failure_type in failure_types:

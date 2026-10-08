@@ -342,6 +342,37 @@ def _build_exact_dispatch_semantics_overrides(
     )
     for identity, provider, success_signal in vendor_source_rows
   )
+  rows.append((
+    _mcp("edgar-parser-mcp", "get_metric_series"),
+    _idempotent_semantics(
+      success_signal=MappingProxyType(
+        {"kind": "status_equals", "field": "status", "values": ("success", "partial")}
+      ),
+      source_identity=MappingProxyType({"kind": "metric_citations"}),
+    ),
+  ))
+  rows.append((
+    _mcp("positioning-mcp", "get_topdown_positioning"),
+    _idempotent_semantics(
+      source_identity=MappingProxyType({"kind": "positioning_filing_sources"}),
+    ),
+  ))
+  rows.extend(
+    (
+      _mcp("macro-mcp", name),
+      _idempotent_semantics(
+        source_identity=MappingProxyType({"kind": "producer_vendor_sources"}),
+      ),
+    )
+    for name in (
+      "get_macro_dashboard",
+      "get_rates_and_curves",
+      "get_economic_indicators",
+      "get_sector_analysis",
+      "get_technical_summary",
+      "get_positioning",
+    )
+  )
   rows.extend((identity, _IDEMPOTENT_GENERIC) for identity in generic_identities)
   rows.append((
     _local("fms_compute_quantifying_risk"),
@@ -360,8 +391,6 @@ def _build_exact_dispatch_semantics_overrides(
     if identity in by_identity:
       raise RuntimeError("duplicate exact dispatch-semantics identity")
     by_identity[identity] = semantics
-  if len(by_identity) != 40:
-    raise RuntimeError("exact dispatch-semantics override count must remain 40")
   return MappingProxyType(by_identity)
 
 

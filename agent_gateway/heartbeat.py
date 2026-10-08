@@ -310,9 +310,7 @@ class HeartbeatLoop:
       )
 
     self._state["consecutive_errors"] = 0
-    is_quiet = False
-    if not output.budget_exceeded and not output.max_turns_reached:
-      is_quiet = had_token and len(stripped_response.strip()) <= self.config.quiet_threshold
+    is_quiet = had_token and len(stripped_response.strip()) <= self.config.quiet_threshold
 
     if is_quiet:
       return await self._finalize_tick(
@@ -329,11 +327,6 @@ class HeartbeatLoop:
         callback=(self._on_quiet, "Quiet", output),
       )
 
-    outcome = "alert"
-    if output.budget_exceeded:
-      outcome = "budget_exceeded"
-    elif output.max_turns_reached:
-      outcome = "max_turns_reached"
     return await self._finalize_tick(
       output=output,
       skipped=False,
@@ -344,7 +337,7 @@ class HeartbeatLoop:
       tick_number=tick_number,
       started_at=started_at,
       started_monotonic=started_monotonic,
-      outcome=outcome,
+      outcome="alert",
       callback=(self._on_alert, "Alert", output),
     )
 

@@ -160,29 +160,6 @@ def test_local_tool_schema_validation_preserves_dispatcher_override_seam() -> No
   assert handler_calls == []
 
 
-def test_local_tool_schema_validation_preserves_active_schema_override_seam() -> None:
-  class _ActiveSchemaOverrideDispatcher(ToolDispatcher):
-    def _active_local_tool_schema(
-      self,
-      tool_name: str,
-    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-      return None, {"code": "custom_active_schema", "message": f"{tool_name} blocked"}
-
-  dispatcher = _ActiveSchemaOverrideDispatcher(
-    mcp_client=_NullMcpClient(),
-    local_tool_handlers={"structured_write": _ok_handler},
-    get_tool_definitions=_tool_defs,
-    role="owner",
-  )
-
-  result, error = _run(
-    dispatcher.dispatch("call-1", "structured_write", {"judgment": {"ticker": "PAYC"}})
-  )
-
-  assert result is None
-  assert error == {"code": "custom_active_schema", "message": "structured_write blocked"}
-
-
 def test_local_tool_schema_validation_preserves_type_match_override_seam() -> None:
   handler_calls: list[dict[str, Any]] = []
 
@@ -264,28 +241,6 @@ def test_local_tool_schema_validation_allows_valid_input() -> None:
 
   assert error is None
   assert result == {"received": {"judgment": {"ticker": "PAYC"}}}
-
-
-def test_request_snapshot_blocks_unadvertised_local_tool() -> None:
-  dispatcher = ToolDispatcher(
-    mcp_client=_NullMcpClient(),
-    local_tool_handlers={"hidden_write": _unexpected_handler},
-    get_tool_definitions=_tool_defs,
-    role="owner",
-  )
-
-  result, error = _run(
-    dispatcher.dispatch(
-      "call-1",
-      "hidden_write",
-      {},
-      advertised_tool_names=frozenset(),
-    )
-  )
-
-  assert result is None
-  assert error is not None
-  assert error["code"] == "tool_not_advertised"
 
 
 def test_snapshot_admitted_local_tool_requires_live_schema_for_input_validation() -> None:

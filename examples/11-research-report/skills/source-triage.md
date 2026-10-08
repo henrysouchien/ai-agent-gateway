@@ -3,7 +3,6 @@ name: source-triage
 agent_callable: true
 agent_description: Extract claims, uncertainties, and decision-relevant evidence from a source pack.
 persist_state: true
-max_turns: 4
 ---
 
 Review the source excerpts supplied by the parent agent. Return:

@@ -23,9 +23,9 @@ def _external_runtime(tmp_path: Path) -> Path:
   packaged = canvas.packaged_build_directory()
   for relative_path in canvas.CANVAS_RUNTIME_SUPPORT_FILES:
     shutil.copyfile(packaged / relative_path, runtime / relative_path)
-  tools = runtime / "node_modules" / ".bin"
-  tools.mkdir(parents=True)
-  for name in ("tsc", "esbuild"):
+  for package, name in (("typescript", "tsc"), ("esbuild", "esbuild")):
+    tools = runtime / "node_modules" / package / "bin"
+    tools.mkdir(parents=True)
     path = tools / name
     path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     path.chmod(0o755)
@@ -162,8 +162,8 @@ def test_build_executes_policy_and_bundle_from_preflight_runtime(
   preflight = canvas.CanvasBuildPreflight(
     build_dir=runtime,
     node=Path("node"),
-    tsc=runtime / "node_modules" / ".bin" / "tsc",
-    esbuild=runtime / "node_modules" / ".bin" / "esbuild",
+    tsc=runtime / "node_modules" / "typescript" / "bin" / "tsc",
+    esbuild=runtime / "node_modules" / "esbuild" / "bin" / "esbuild",
     toolchain_version="fixture",
   )
 

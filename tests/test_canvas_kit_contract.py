@@ -16,6 +16,7 @@ def test_authoring_manifest_is_generated_from_packaged_types_and_policy() -> Non
   assert value["generated_from"] == [
     "types/node_modules/@hank/canvas-kit/components/index.d.ts",
     "types/node_modules/@hank/canvas-kit/fmt.d.ts",
+    "canvas_kit_manifest.v1.json",
     "canvas_build/policy.mjs",
   ]
   assert "title: string" in value["components"]["SectionHeader"]

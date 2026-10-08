@@ -7,7 +7,6 @@ from .approval_route import (
   NO_APPROVAL_ROUTE,
   ApprovalRoute,
   DurableLocalApprovalRoute,
-  NoApprovalRoute,
 )
 from .session import GatewaySession
 from .policy_imports import resolve_effective_role
@@ -86,7 +85,6 @@ class DispatcherConstructionError(Exception):
 _MISSING = object()
 _SERVER_OWNED_PASSTHROUGH_KEYS = frozenset({
   "approval_key_qualifier",
-  "approval_predicate_context_factory",
   "channel",
   "input_preparation_context_factory",
   "mcp_client",
@@ -96,7 +94,6 @@ _SERVER_OWNED_PASSTHROUGH_KEYS = frozenset({
   "should_avoid_permission_prompts",
   "tool_policy_implementations",
   "tool_registration_catalog",
-  "registered_approval_overlay",
   "redaction_context_factory",
   "user_id",
 })
@@ -112,13 +109,11 @@ def build_tool_dispatcher(
   session_id: str,
   request_approval: Any,
   needs_approval: Any,
-  approved_tool_types: set[str],
   local_tool_handlers: dict[str, Any],
   interceptors: Any = None,
   get_tool_definitions: Any = None,
   commercial_mcp_servers: frozenset[str] | None = None,
   mcp_session_inject_servers: set[str] | None = None,
-  session_cache_denied_tools: frozenset[str] | None = None,
   run_context: Any = None,
   excel_wrap: bool = False,
   channel_registry: Any = None,
@@ -126,8 +121,6 @@ def build_tool_dispatcher(
   channel_context: str | None = None,
   tool_packs: dict[str, dict[str, Any]] | None = None,
   input_preparation_context_factory: Any = None,
-  approval_predicate_context_factory: Any = None,
-  registered_approval_overlay: Any = None,
   addin_input_preparation_context_factory: Any = None,
   **passthrough: Any,
 ) -> Any: ...
@@ -143,13 +136,11 @@ def build_tool_dispatcher(
   session_id: str,
   request_approval: Any,
   needs_approval: Any,
-  approved_tool_types: set[str],
   local_tool_handlers: dict[str, Any],
   interceptors: Any = None,
   get_tool_definitions: Any = None,
   commercial_mcp_servers: frozenset[str] | None = None,
   mcp_session_inject_servers: set[str] | None = None,
-  session_cache_denied_tools: frozenset[str] | None = None,
   run_context: Any = None,
   excel_wrap: Literal[True],
   channel_registry: Any = None,
@@ -157,8 +148,6 @@ def build_tool_dispatcher(
   channel_context: str | None = None,
   tool_packs: dict[str, dict[str, Any]] | None = None,
   input_preparation_context_factory: Any = None,
-  approval_predicate_context_factory: Any = None,
-  registered_approval_overlay: Any = None,
   addin_input_preparation_context_factory: Any = None,
   **passthrough: Any,
 ) -> Any: ...
@@ -174,13 +163,11 @@ def build_tool_dispatcher(
   session_id: str,
   request_approval: Any,
   needs_approval: Any,
-  approved_tool_types: set[str],
   local_tool_handlers: dict[str, Any],
   interceptors: Any = None,
   get_tool_definitions: Any = None,
   commercial_mcp_servers: frozenset[str] | None = None,
   mcp_session_inject_servers: set[str] | None = None,
-  session_cache_denied_tools: frozenset[str] | None = None,
   run_context: Any = None,
   excel_wrap: Literal[False] = False,
   channel_registry: Any = None,
@@ -188,8 +175,6 @@ def build_tool_dispatcher(
   channel_context: str | None = None,
   tool_packs: dict[str, dict[str, Any]] | None = None,
   input_preparation_context_factory: Any = None,
-  approval_predicate_context_factory: Any = None,
-  registered_approval_overlay: Any = None,
   addin_input_preparation_context_factory: Any = None,
   **passthrough: Any,
 ) -> ToolDispatcher: ...
@@ -205,13 +190,11 @@ def build_tool_dispatcher(
   session_id: str,
   request_approval: Any,
   needs_approval: Any,
-  approved_tool_types: set[str],
   local_tool_handlers: dict[str, Any],
   interceptors: Any = None,
   get_tool_definitions: Any = None,
   commercial_mcp_servers: frozenset[str] | None = None,
   mcp_session_inject_servers: set[str] | None = None,
-  session_cache_denied_tools: frozenset[str] | None = None,
   run_context: Any = None,
   excel_wrap: bool = False,
   channel_registry: Any = None,
@@ -219,8 +202,6 @@ def build_tool_dispatcher(
   channel_context: str | None = None,
   tool_packs: dict[str, dict[str, Any]] | None = None,
   input_preparation_context_factory: Any = None,
-  approval_predicate_context_factory: Any = None,
-  registered_approval_overlay: Any = None,
   addin_input_preparation_context_factory: Any = None,
   **passthrough: Any,
 ) -> Any: ...
@@ -235,13 +216,11 @@ def build_tool_dispatcher(
   session_id: str,
   request_approval: Any,
   needs_approval: Any,
-  approved_tool_types: set[str],
   local_tool_handlers: dict[str, Any],
   interceptors: Any = None,
   get_tool_definitions: Any = None,
   commercial_mcp_servers: frozenset[str] | None = None,
   mcp_session_inject_servers: set[str] | None = None,
-  session_cache_denied_tools: frozenset[str] | None = None,
   run_context: Any = None,
   excel_wrap: bool = False,
   channel_registry: Any = None,
@@ -249,8 +228,6 @@ def build_tool_dispatcher(
   channel_context: str | None = None,
   tool_packs: dict[str, dict[str, Any]] | None = None,
   input_preparation_context_factory: Any = None,
-  approval_predicate_context_factory: Any = None,
-  registered_approval_overlay: Any = None,
   addin_input_preparation_context_factory: Any = None,
   **passthrough: Any,
 ) -> Any:
@@ -315,7 +292,6 @@ def build_tool_dispatcher(
     "local_tool_handlers": local_tool_handlers,
     "needs_approval": needs_approval,
     "request_approval": request_approval,
-    "approved_tool_types": approved_tool_types,
     "event_log": event_log,
   }
   if deps.tool_registration_catalog is not None:
@@ -328,12 +304,6 @@ def build_tool_dispatcher(
     base_kwargs["input_preparation_context_factory"] = (
       input_preparation_context_factory
     )
-    base_kwargs["approval_predicate_context_factory"] = (
-      approval_predicate_context_factory
-    )
-    base_kwargs["registered_approval_overlay"] = (
-      registered_approval_overlay
-    )
     base_kwargs["redaction_context_factory"] = (
       deps.redaction_context_factory
     )
@@ -345,7 +315,6 @@ def build_tool_dispatcher(
     base_kwargs["mcp_session_inject_servers"] = mcp_session_inject_servers
     if principal.approval_key_qualifier is not None:
       base_kwargs["approval_key_qualifier"] = principal.approval_key_qualifier
-    base_kwargs["session_cache_denied_tools"] = session_cache_denied_tools
     base_kwargs["get_tool_definitions"] = get_tool_definitions
     base_kwargs.update(passthrough)
     base_kwargs["commercial_mcp_servers"] = commercial_mcp_servers
@@ -362,10 +331,7 @@ def build_tool_dispatcher(
     if mcp_session_inject_servers is not None:
       base_kwargs["mcp_session_inject_servers"] = mcp_session_inject_servers
     base_kwargs.update(passthrough)
-    base_kwargs["session_cache_denied_tools"] = session_cache_denied_tools
-    if isinstance(admitted_route, NoApprovalRoute):
-      # No route, so nothing carries the session: pass it as before.
-      base_kwargs["session"] = principal.session
+    base_kwargs["session"] = principal.session
     base_kwargs["run_context"] = run_context
     base_kwargs["get_tool_definitions"] = get_tool_definitions
     if commercial_mcp_servers is not None:

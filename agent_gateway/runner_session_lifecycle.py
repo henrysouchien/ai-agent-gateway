@@ -61,12 +61,14 @@ from .selected_content import serialize_selected_content_bindings
 from .secret_boundary import sanitize_tool_event
 from .task_registry import ParentMessage, TaskEntry, TaskRegistry, TaskState
 from .workflow_output_attachment import WorkflowOutputAttachment
+from .session_recap import terminal_recap_payload
 
 if TYPE_CHECKING:
   from .agent_session_log import AgentSessionLog
   from .event_log import EventLog
   from .providers import ModelProvider
   from .skill_lifecycle import TopLevelSkillResultPolicy
+  from .session import GatewaySession
 
 
 
@@ -121,12 +123,17 @@ class RunnerSessionLifecycleMixin:
   _terminal_closure_event: Dict[str, Any] | None = None
   _terminal_closure_receipts: list[Dict[str, Any]] | None = None
   _terminal_closure_interruption: tuple[str, Dict[str, Any] | None] | None = None
+  _terminal_recap_payload: Dict[str, Any] | None = None
 
   if TYPE_CHECKING:
     _agent_session_log: AgentSessionLog | None
     _client_kind: str
     _gateway_session_id: str
+    _gateway_session: GatewaySession | None
     _log: EventLog
+    _emit_session_recap: bool
+    _full_session_id: str
+    _session_started_at: float
     _pending_workflow_output_attachments: dict[
       str,
       WorkflowOutputAttachment,
@@ -548,6 +555,9 @@ class RunnerSessionLifecycleMixin:
       event[_TOP_LEVEL_SKILL_LIFECYCLE_ORIGIN_FIELD] = (
         _TOP_LEVEL_SKILL_LIFECYCLE_ORIGIN
       )
+      admission = getattr(self, "_top_level_skill_admission", None)
+      if admission is not None:
+        event["lease_fence_bytes"] = admission.lease_fence_bytes
       self._top_level_skill_started_event = deepcopy(event)
       self._top_level_skill_started_task = asyncio.create_task(
         self._persist_top_level_skill_started(deepcopy(event)),
@@ -1738,12 +1748,22 @@ class RunnerSessionLifecycleMixin:
   async def _emit_attach_event(self) -> None:
     time_module = _runner_attr(self, "time", time)
     socket_module = _runner_attr(self, "socket", socket)
+    gateway_session = self._gateway_session
     entry = await self._append_durable_event(
       _runner_attr(self, "_build_attach_event", _build_attach_event)(
         gateway_session_id=self._gateway_session_id,
         started_at=time_module.time(),
         client_kind=self._client_kind,
         hostname=socket_module.gethostname(),
+        user_id=(
+          gateway_session.user_id if gateway_session is not None else None
+        ),
+        channel=(
+          gateway_session.channel if gateway_session is not None else None
+        ),
+        api_key_hash=(
+          gateway_session.api_key_hash if gateway_session is not None else None
+        ),
       )
     )
     self._durable_attach_emitted = entry is not None
@@ -2074,8 +2094,20 @@ class RunnerSessionLifecycleMixin:
       expected_messages=parent_messages,
     )
 
-  async def _emit_stream_retry_event(self, *, attempt: int, error: str) -> None:
-    event = _runner_attr(self, "_build_stream_retry_event", _build_stream_retry_event)(attempt=attempt, error=error)
+  async def _emit_stream_retry_event(
+    self,
+    *,
+    attempt: int,
+    error: str,
+    attempt_elapsed_s: float,
+    backoff_s: float | None,
+  ) -> None:
+    event = _runner_attr(self, "_build_stream_retry_event", _build_stream_retry_event)(
+      attempt=attempt,
+      error=error,
+      attempt_elapsed_s=attempt_elapsed_s,
+      backoff_s=backoff_s,
+    )
     await self._append_durable_event(event)
     self._append(event)
 
@@ -2759,7 +2791,10 @@ class RunnerSessionLifecycleMixin:
         interruption[0] if decision.disposition != "error" and interruption is not None else reason,
         extra_fields=interruption[1] if interruption is not None else None,
       )
-      self._emit_detach_event_sync("error" if decision.disposition == "error" else decision.reason)
+      self._emit_detach_event_sync(
+        "error" if decision.disposition == "error" else decision.reason,
+        recap=self._recap_for_terminal_decision(decision),
+      )
 
     try:
       if decision.disposition == "success":
@@ -2822,7 +2857,10 @@ class RunnerSessionLifecycleMixin:
           )
         else:
           self._settle_unresolved_tool_calls_sync()
-        self._emit_detach_event_sync("error" if decision.disposition == "error" else decision.reason)
+        self._emit_detach_event_sync(
+          "error" if decision.disposition == "error" else decision.reason,
+          recap=self._recap_for_terminal_decision(decision),
+        )
     except Exception as exc:
       if lifecycle is not None:
         # Once the WAL pair commits, its outcome is immutable. Finish the
@@ -2837,11 +2875,14 @@ class RunnerSessionLifecycleMixin:
         else:
           self._settle_unresolved_tool_calls_sync()
         try:
-          self._emit_detach_event_sync(decision.reason)
+          self._emit_detach_event_sync(
+            decision.reason, recap=self._recap_for_terminal_decision(decision),
+          )
         except Exception as detach_error:
           self._emit_detach_event_sync(
             "persistence", failure=detach_error,
             committed_terminal=decision.terminal,
+            recap=self._recap_for_terminal_decision(decision),
           )
         return decision
       if decision.disposition == "success":
@@ -2856,6 +2897,27 @@ class RunnerSessionLifecycleMixin:
       if attached:
         append_failure(decision.cause or exc, decision.reason)
     return decision
+
+  def _recap_for_terminal_decision(
+    self, decision: TerminalClosureDecision,
+  ) -> Dict[str, Any] | None:
+    if not self._emit_session_recap or decision.terminal is None:
+      return None
+    if self._terminal_recap_payload is not None:
+      return self._terminal_recap_payload
+    pending_events = (
+      list(self._terminal_closure_receipts or [])
+      if decision.disposition == "success" else []
+    )
+    if decision.skill_result is not None:
+      pending_events.append(decision.skill_result)
+    return terminal_recap_payload(
+      self._log, decision.terminal, session_id=self._full_session_id,
+      started_at=self._session_started_at,
+      usage=getattr(self, "_session_usage_summary", None),
+      pending_events=pending_events,
+    )
+
 
   async def _run_durable_session_settlement(
     self,
@@ -2917,6 +2979,7 @@ class RunnerSessionLifecycleMixin:
     *,
     failure: BaseException | None = None,
     committed_terminal: Dict[str, Any] | None = None,
+    recap: Dict[str, Any] | None = None,
   ) -> None:
     event = _runner_attr(
       self,
@@ -2929,7 +2992,19 @@ class RunnerSessionLifecycleMixin:
     if failure is not None:
       event["error"] = _format_exc(failure)
       event["committed_terminal"] = deepcopy(committed_terminal)
-    entry = self._append_durable_event_sync(event)
+    if recap is not None and self._agent_session_log is not None:
+      recap_payload = self._durable_event_for_append(deepcopy(recap))
+      detach_payload = self._durable_event_for_append(deepcopy(event))
+      if recap_payload is not None and detach_payload is not None:
+        _, entry = self._agent_session_log.append_terminal_pair_sync(
+          recap_payload, detach_payload,
+        )
+        self._last_durable_seq = entry.seq
+        self._terminal_recap_payload = recap
+      else:
+        entry = self._append_durable_event_sync(event)
+    else:
+      entry = self._append_durable_event_sync(event)
     if self._top_level_skill_lifecycle is not None:
       if entry is None:
         raise RuntimeError(

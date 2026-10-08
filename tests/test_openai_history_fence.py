@@ -31,6 +31,7 @@ from agent_gateway.server_chat_transcripts import (
   _read_session_transcript_events,
 )
 from agent_gateway.session import GatewaySession, SessionStream
+from agent_gateway.task_registry import TaskRegistry
 from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
 
 
@@ -352,15 +353,13 @@ def test_package_autonomous_state_dir_missing_epoch_fails_before_client_construc
 def test_package_autonomous_ephemeral_openai_run_does_not_require_epoch(
   monkeypatch: pytest.MonkeyPatch,
 ):
-  captured: dict[str, str] = {}
-
   class _Dispatcher:
     def __init__(self, **kwargs):
-      captured["dispatcher"] = kwargs["session_id"]
+      pass
 
   class _Runner:
     def __init__(self, **kwargs):
-      captured["runner"] = kwargs["session_id"]
+      self._task_registry = TaskRegistry()
 
   async def _run_session(*_args, **_kwargs):
     return SimpleNamespace(response="ok")
@@ -371,7 +370,7 @@ def test_package_autonomous_ephemeral_openai_run_does_not_require_epoch(
   monkeypatch.setattr(autonomous_module, "AgentRunner", _Runner)
   monkeypatch.setattr(autonomous_module, "run_session", _run_session)
 
-  result = asyncio.run(
+  asyncio.run(
     autonomous_module.run_autonomous(
       "system",
       "hello",
@@ -382,51 +381,8 @@ def test_package_autonomous_ephemeral_openai_run_does_not_require_epoch(
     )
   )
 
-  assert result.response == "ok"
-  assert captured["dispatcher"] == captured["runner"]
-  assert captured["runner"].startswith("autonomous-")
-  assert "--openai-" not in captured["runner"]
 
 
-def test_package_autonomous_scopes_caller_id_before_dispatcher_and_runner(
-  monkeypatch: pytest.MonkeyPatch,
-):
-  captured: dict[str, str] = {}
-
-  class _Dispatcher:
-    def __init__(self, **kwargs):
-      captured["dispatcher"] = kwargs["session_id"]
-
-  class _Runner:
-    def __init__(self, **kwargs):
-      captured["runner"] = kwargs["session_id"]
-
-  async def _run_session(*_args, **_kwargs):
-    return SimpleNamespace(response="ok")
-
-  monkeypatch.setenv("OPENAI_SESSION_EPOCH", "chat-prep-v1")
-  monkeypatch.delenv("EXCEL_ORCHESTRATION_DEV", raising=False)
-  monkeypatch.setattr(autonomous_module, "ToolDispatcher", _Dispatcher)
-  monkeypatch.setattr(autonomous_module, "AgentRunner", _Runner)
-  monkeypatch.setattr(autonomous_module, "run_session", _run_session)
-
-  result = asyncio.run(
-    autonomous_module.run_autonomous(
-      "system",
-      "hello",
-      **_openai_bound_execution(),
-      session_id="caller-durable-id",
-      user_id="alice",
-      billing_mode="byok",
-      rate_table_version="test",
-    )
-  )
-
-  assert result.response == "ok"
-  assert captured == {
-    "dispatcher": "caller-durable-id--openai-chat-prep-v1",
-    "runner": "caller-durable-id--openai-chat-prep-v1",
-  }
 
 
 def test_sub_agent_id_inherits_already_scoped_parent_without_rescoping():

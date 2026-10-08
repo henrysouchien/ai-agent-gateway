@@ -26,28 +26,34 @@ from agent_workflow_contracts import (
   TaskResultProvenance,
 )
 
+from .admission import current_parent_context
 from .capability_execution import BoundCapabilityExecution
 from .event_log import EventLog
 from .runner_introspection import derive_sub_agent_id as _derive_sub_agent_id
 from .runner_session_lifecycle import _runner_attr
 from .runner_cleanup import cleanup_failure_notes
-from .runner_budget import (
-  ChildCostAccumulator,
-  ObservationOnlyCostAccumulator,
-)
+from .runner_budget import CostAccumulator
 from .runner_stream_turn import STREAM_GUARD_POLL_INTERVAL
 from .runner_streaming import STREAM_THINKING_STALL_TIMEOUT
 from .runner_state import user_turn_message as _user_turn_message
+from .skill_lifecycle import drain_owned_lifecycle_task
 from .sub_agent_result_evidence import SubAgentResultEvidence
 from .sub_agent_narrative_result import (
   final_child_visible_text,
   task_result_from_execution,
 )
 from .sub_agent_skill_state import (
-  declared_terminal_doors_from_grant,
   latest_successful_declared_terminal_tool_result,
+  terminal_result_doors,
 )
-from .task_registry import ParentMessage, TaskEntry, make_progress_tracker
+from .task_registry import (
+  ParentMessage,
+  RegistryOwner,
+  TaskEntry,
+  TaskRegistry,
+  make_progress_tracker,
+)
+from .tool_result_spill import job_spill_sink
 from .tool_dispatcher import ToolDispatcher
 
 if TYPE_CHECKING:
@@ -62,6 +68,11 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("agent_gateway.runner")
 _MISSING_SUB_AGENT_ID = object()
+# The parent's log carries a child's approval requests, which the parent
+# answers, and its interceptor measurements: the child shares the run's
+# counters, and session_recap reports them from the parent's log. The parent's
+# append is these events' one delivery.
+_PARENT_LOG_EVENT_TYPES = frozenset({"tool_approval_request", "interceptor_measurement"})
 # A child that emits nothing for this long with no tool in flight is wedged
 # (ACUI-1: an await outside both stream and tool). Derived from the stream
 # guard so the child's own stall guard always fires first on stream silence.
@@ -120,32 +131,6 @@ async def _await_child_under_activity_guard(
     raise
 
 
-def _child_cost_accumulator(
-  runner: Any,
-  *,
-  cost_observation_threshold_usd: float | None,
-  max_budget_usd: float | None,
-) -> Any:
-  """Create child hard-budget authority over observational telemetry."""
-
-  observation_accumulator_cls = _runner_attr(
-    runner,
-    "ObservationOnlyCostAccumulator",
-    ObservationOnlyCostAccumulator,
-  )
-  observation_accumulator = observation_accumulator_cls(
-    cost_observation_threshold_usd
-  )
-  if max_budget_usd is None:
-    return observation_accumulator
-  child_accumulator_cls = _runner_attr(
-    runner,
-    "ChildCostAccumulator",
-    ChildCostAccumulator,
-  )
-  return child_accumulator_cls(observation_accumulator, max_budget_usd)
-
-
 def _validate_child_result_requirement(
   requirement: ResultRequirement,
   *,
@@ -157,8 +142,6 @@ def _validate_child_result_requirement(
     )
   if not isinstance(skill_name, str) or not skill_name.strip():
     raise ValueError("sub-agent execution requires a non-empty skill_name")
-  if requirement.mode != "narrative":
-    raise ValueError("agent execution accepts terminal-message results only")
 
 
 def _build_child_event_log(
@@ -197,8 +180,10 @@ def _build_child_event_log(
         progress_cb(event_copy, session_id)
       except Exception:
         pass
-    if event_copy.get("type") == "tool_approval_request":
-      parent_log.append(event_copy)
+    if event_copy.get("type") in _PARENT_LOG_EVENT_TYPES:
+      # With a parent prepare, _composed_prepare_event already appended it.
+      if original_prepare_event is None:
+        parent_log.append(event_copy)
     elif original_on_event is not None:
       try:
         original_on_event(event_copy, session_id)
@@ -223,7 +208,17 @@ def _build_child_event_log(
       )
       event["sub_agent_id"] = sub_session_id
       try:
-        prepared = original_prepare_event(event)
+        parent_entry = (
+          parent_log.append(event)
+          if event.get("type") in _PARENT_LOG_EVENT_TYPES
+          else None
+        )
+        # A closed parent log records nothing; the event is still delivered.
+        prepared = (
+          original_prepare_event(event)
+          if parent_entry is None
+          else parent_entry.event
+        )
       finally:
         if prior_sub_agent_id is _MISSING_SUB_AGENT_ID:
           event.pop("sub_agent_id", None)
@@ -280,10 +275,6 @@ class RunnerSubAgentMixin:
     _on_late_usage_event: (
       Callable[[UsageEvent], Awaitable[None] | None] | None
     )
-    _on_max_turns: (
-      Callable[[List[Dict[str, Any]], int], Awaitable[str | None]]
-      | None
-    )
     _on_metric: Callable[[str, int], None] | None
     _on_tool_result: (
       Callable[
@@ -298,6 +289,7 @@ class RunnerSubAgentMixin:
     _request_id: str
     _skill_run_id: str | None
     _spill_dir_provider: SpillSink | None
+    _task_registry: TaskRegistry
     _stream_stall_timeout: float | None
     _sub_agent_config: SubAgentConfig | None
     _tool_call_timeout: float | None
@@ -319,14 +311,11 @@ class RunnerSubAgentMixin:
     dispatcher: ToolDispatcher,
     sub_session: Any | None = None,
     excluded_tools: Set[str] | None = None,
-    max_turns: int | None,
-    client_timeout: float = 90,
     max_tokens: int = 64000,
     call_index: int = 0,
     parent_turn_id: str | None = None,
     task_entry: TaskEntry | None = None,
     cost_observation_threshold_usd: float | None = None,
-    max_budget_usd: float | None = None,
     on_sub_event: Optional[Callable[[Dict[str, Any], str], None]] = None,
     skill_run_id: str | None = None,
     admitted_task: AdmittedTask | None = None,
@@ -345,8 +334,6 @@ class RunnerSubAgentMixin:
       raise TypeError(
         "spawn_sub_agent requires a BoundCapabilityExecution"
       )
-    if not capability_execution.bind.capability_id.startswith("node."):
-      raise ValueError("spawn_sub_agent requires a node.* capability bind")
     capability_execution.validate()
     _validate_child_result_requirement(
       result_requirement,
@@ -405,18 +392,14 @@ class RunnerSubAgentMixin:
       on_sub_event=on_sub_event,
     )
     dispatcher._event_log = sub_log
-    child_cost_accumulator = _child_cost_accumulator(
-      self,
-      cost_observation_threshold_usd=cost_observation_threshold_usd,
-      max_budget_usd=max_budget_usd,
-    )
+    child_cost_accumulator = CostAccumulator(cost_observation_threshold_usd)
     runner_cls = _runner_attr(self, "AgentRunner", type(self))
+    child_spill_sink = _child_spill_sink(self._spill_dir_provider, attempt)
     sub_runner = runner_cls(
       event_log=sub_log,
       dispatcher=dispatcher,
       session_id=sub_session_id,
       capability_execution=capability_execution,
-      client_timeout=client_timeout,
       max_tokens_override=max_tokens,
       stream_stall_timeout=self._stream_stall_timeout,
       mcp_client=self._mcp_client,
@@ -440,8 +423,6 @@ class RunnerSubAgentMixin:
       compaction_trigger=self._compaction_trigger,
       compaction_instructions=None,
       tool_call_timeout=self._tool_call_timeout,
-      on_max_turns=self._on_max_turns,
-      max_budget_usd=max_budget_usd,
       _cost_accumulator=child_cost_accumulator,
       _parent_aggregator=self._aggregator,
       max_concurrent_sub_agents=self._max_concurrent_sub_agents,
@@ -450,20 +431,23 @@ class RunnerSubAgentMixin:
       message_inbox=task_entry.message_inbox if task_entry else None,
       max_resume_chain_depth=self._max_resume_chain_depth,
       emit_session_recap=False,
-      code_execution_spill_dir_provider=self._spill_dir_provider,
+      code_execution_spill_dir_provider=child_spill_sink,
       commercial_usage_producer=getattr(self, "_commercial_usage_producer", None),
       skill_run_id=skill_run_id or self._skill_run_id,
       workspace_dir=self._workspace_dir,
       batch_id=getattr(self, "_batch_id", None),
       context_surfaces=self._context_surfaces_provider or self._context_surfaces_static,
-      terminal_tool_result_ids=set(
-        declared_terminal_doors_from_grant(
-          resolved_admitted_task.tool_grant
-          if resolved_admitted_task is not None
-          else None
-        )
-      ),
+      terminal_tool_result_ids=set(terminal_result_doors(resolved_admitted_task)),
     )
+    _bind_child_registry(
+      sub_runner,
+      parent_registry=self._task_registry,
+      attempt=attempt,
+      sub_session=sub_session,
+      task_entry=task_entry,
+      spill_sink=child_spill_sink,
+    )
+    dispatcher.bind_research_file_activity_owner(sub_runner.ensure_research_file_activity)
     stalled = False
     runtime_exception_detail: str | None = None
     cancelled_error: asyncio.CancelledError | None = None
@@ -473,7 +457,6 @@ class RunnerSubAgentMixin:
     coro = sub_runner.run(
       messages=[user_turn_message(task)],
       system_prompt=system_prompt,
-      max_turns=max_turns,
     )
     try:
       silence = await _await_child_under_activity_guard(coro, activity)
@@ -519,15 +502,12 @@ class RunnerSubAgentMixin:
         runtime_exception_detail=runtime_exception_detail,
         task_entry=task_entry,
         cleanup_warnings=cleanup_warnings,
+        sub_session=sub_session,
       )
 
     terminal_tool_result = latest_successful_declared_terminal_tool_result(
       sub_log.entries,
-      declared_terminal_doors=declared_terminal_doors_from_grant(
-        resolved_admitted_task.tool_grant
-        if resolved_admitted_task is not None
-        else None
-      ),
+      declared_terminal_doors=terminal_result_doors(resolved_admitted_task),
     )
     final_narrative = None
     if (
@@ -588,14 +568,11 @@ class RunnerSubAgentMixin:
     dispatcher: ToolDispatcher,
     sub_session: Any | None = None,
     excluded_tools: Set[str] | None = None,
-    max_turns: int | None,
-    client_timeout: float = 90,
     max_tokens: int = 64000,
     call_index: int = 0,
     parent_turn_id: str | None = None,
     task_entry: TaskEntry | None = None,
     cost_observation_threshold_usd: float | None = None,
-    max_budget_usd: float | None = None,
     on_sub_event: Optional[Callable[[Dict[str, Any], str], None]] = None,
     skill_run_id: str | None = None,
     admitted_task: AdmittedTask | None = None,
@@ -608,8 +585,6 @@ class RunnerSubAgentMixin:
       raise TypeError(
         "resume_sub_agent requires a BoundCapabilityExecution"
       )
-    if not capability_execution.bind.capability_id.startswith("node."):
-      raise ValueError("resume_sub_agent requires a node.* capability bind")
     capability_execution.validate()
     _validate_child_result_requirement(
       result_requirement,
@@ -685,18 +660,14 @@ class RunnerSubAgentMixin:
       on_sub_event=on_sub_event,
     )
     dispatcher._event_log = sub_log
-    child_cost_accumulator = _child_cost_accumulator(
-      self,
-      cost_observation_threshold_usd=cost_observation_threshold_usd,
-      max_budget_usd=max_budget_usd,
-    )
+    child_cost_accumulator = CostAccumulator(cost_observation_threshold_usd)
     runner_cls = _runner_attr(self, "AgentRunner", type(self))
+    child_spill_sink = _child_spill_sink(self._spill_dir_provider, attempt)
     sub_runner = runner_cls(
       event_log=sub_log,
       dispatcher=dispatcher,
       session_id=sub_session_id,
       capability_execution=capability_execution,
-      client_timeout=client_timeout,
       max_tokens_override=max_tokens,
       stream_stall_timeout=self._stream_stall_timeout,
       mcp_client=self._mcp_client,
@@ -720,8 +691,6 @@ class RunnerSubAgentMixin:
       compaction_trigger=self._compaction_trigger,
       compaction_instructions=None,
       tool_call_timeout=self._tool_call_timeout,
-      on_max_turns=self._on_max_turns,
-      max_budget_usd=max_budget_usd,
       _cost_accumulator=child_cost_accumulator,
       _parent_aggregator=self._aggregator,
       max_concurrent_sub_agents=self._max_concurrent_sub_agents,
@@ -730,20 +699,23 @@ class RunnerSubAgentMixin:
       message_inbox=task_entry.message_inbox if task_entry else None,
       max_resume_chain_depth=self._max_resume_chain_depth,
       emit_session_recap=False,
-      code_execution_spill_dir_provider=self._spill_dir_provider,
+      code_execution_spill_dir_provider=child_spill_sink,
       commercial_usage_producer=getattr(self, "_commercial_usage_producer", None),
       skill_run_id=skill_run_id or self._skill_run_id,
       workspace_dir=self._workspace_dir,
       batch_id=getattr(self, "_batch_id", None),
       context_surfaces=self._context_surfaces_provider or self._context_surfaces_static,
-      terminal_tool_result_ids=set(
-        declared_terminal_doors_from_grant(
-          resolved_admitted_task.tool_grant
-          if resolved_admitted_task is not None
-          else None
-        )
-      ),
+      terminal_tool_result_ids=set(terminal_result_doors(resolved_admitted_task)),
     )
+    _bind_child_registry(
+      sub_runner,
+      parent_registry=self._task_registry,
+      attempt=attempt,
+      sub_session=sub_session,
+      task_entry=task_entry,
+      spill_sink=child_spill_sink,
+    )
+    dispatcher.bind_research_file_activity_owner(sub_runner.ensure_research_file_activity)
     if bind_research_file_activity_lease_func is not None:
       bind_research_file_activity_lease_func(sub_runner)
     sub_runner._resume_parent_messages_for_ack = tuple(parent_messages)
@@ -756,7 +728,6 @@ class RunnerSubAgentMixin:
     coro = sub_runner.run(
       messages=reconstructed_messages[-1:] or [user_turn_message("")],
       system_prompt=system_prompt,
-      max_turns=max_turns,
       resume_initial_messages=reconstructed_messages,
     )
     try:
@@ -803,15 +774,12 @@ class RunnerSubAgentMixin:
         runtime_exception_detail=runtime_exception_detail,
         task_entry=task_entry,
         cleanup_warnings=cleanup_warnings,
+        sub_session=sub_session,
       )
 
     terminal_tool_result = latest_successful_declared_terminal_tool_result(
       sub_log.entries,
-      declared_terminal_doors=declared_terminal_doors_from_grant(
-        resolved_admitted_task.tool_grant
-        if resolved_admitted_task is not None
-        else None
-      ),
+      declared_terminal_doors=terminal_result_doors(resolved_admitted_task),
     )
     final_narrative = None
     if (
@@ -864,6 +832,46 @@ def _runtime_exception_detail(exc: Exception) -> str:
   return f"{type(exc).__name__}: {message}"
 
 
+def _child_spill_sink(
+  parent_sink: SpillSink | None,
+  attempt: AttemptRef,
+) -> SpillSink | None:
+  """The child job's own spill sink, under its parent's spill root."""
+
+  if parent_sink is None:
+    return None
+  return job_spill_sink(parent_sink, attempt.physical_task_id)
+
+
+def _bind_child_registry(
+  sub_runner: Any,
+  *,
+  parent_registry: TaskRegistry,
+  attempt: AttemptRef,
+  sub_session: Any | None,
+  task_entry: TaskEntry | None,
+  spill_sink: SpillSink | None,
+) -> None:
+  """Name the child job its registry belongs to and link it into the tree.
+
+  The child's own children register in ``sub_runner``'s registry; the link to
+  the parent's registry is what puts them on the tree roster. A background
+  child's mailbox is its task entry's inbox; a foreground child has none.
+  """
+
+  sub_runner._task_registry.bind_owner(RegistryOwner(
+    job_id=attempt.physical_task_id,
+    tenant=lambda: (
+      current_parent_context(sub_session).tenant
+      if sub_session is not None
+      else None
+    ),
+    inbox=task_entry.message_inbox if task_entry is not None else None,
+    parent=parent_registry,
+    spill_sink=spill_sink,
+  ))
+
+
 def _termination_signal(task_entry: TaskEntry | None) -> str:
   if (
     task_entry is not None
@@ -883,6 +891,7 @@ async def _close_sub_runner(
   runtime_exception_detail: str | None,
   task_entry: TaskEntry | None,
   cleanup_warnings: list[str],
+  sub_session: Any | None = None,
 ) -> tuple[
   asyncio.CancelledError | None,
   str | None,
@@ -923,6 +932,24 @@ async def _close_sub_runner(
     ):
       runtime_exception_detail = detail
       cleanup_warnings.remove(detail)
+  finally:
+    try:
+      if sub_session is not None:
+        from .code_execution import cleanup_code_execution
+
+        cleanup_task = asyncio.create_task(
+          cleanup_code_execution(sub_session),
+          name=f"sub-agent-session:{sub_session.session_id}:cleanup",
+        )
+        try:
+          await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as exc:
+          await drain_owned_lifecycle_task(cleanup_task)
+          if cancelled_error is None and not stalled:
+            cancelled_error = exc
+            cancellation_signal = _termination_signal(task_entry)
+    finally:
+      sub_runner._task_registry.complete_owner()
   return (
     cancelled_error,
     cancellation_signal,

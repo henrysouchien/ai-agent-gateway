@@ -20,12 +20,11 @@ class RunOutput:
   usage: dict[str, Any]
   error: str | None
   timed_out: bool
-  budget_exceeded: bool = False
-  max_turns_reached: bool = False
   operator_paused: bool = False
   max_tokens_reached: bool = False
   exit_reason: str | None = None
   post_run_guard: dict[str, Any] | None = None
+  session_recap: dict[str, Any] | None = None
 
 
 def _extract_summary(text: str, limit: int = 1500) -> str:
@@ -57,9 +56,8 @@ def collect_run_output(
   text_parts: list[str] = []
   tool_calls: list[str] = []
   usage: dict[str, Any] = {}
+  session_recap: dict[str, Any] | None = None
   error_msg: str | None = None
-  budget_exceeded = False
-  max_turns_reached = False
   operator_paused = False
   max_tokens_reached = False
   terminal_seen = False
@@ -67,6 +65,13 @@ def collect_run_output(
   for entry in event_log.entries:
     event = entry.event
     event_type = event.get("type")
+    if event_type == "session_recap":
+      session_recap = event
+      continue
+    # A deferred log can carry a recap after terminal settlement. Keep the
+    # first terminal's outcome and usage while reading those later snapshots.
+    if terminal_seen:
+      continue
     if event_type == "stream_retry":
       text_parts.clear()
       tool_calls.clear()
@@ -84,21 +89,12 @@ def collect_run_output(
         error_msg = f"invalid_terminal_disposition: {disposition!r}"
       elif disposition == "interrupted":
         reason = str(event.get("reason") or "unspecified")
-        if reason == "budget_exceeded":
-          budget_exceeded = True
-        elif reason == "max_turns_reached":
-          max_turns_reached = True
-        elif reason == "operator_pause":
+        if reason == "operator_pause":
           operator_paused = True
         elif reason == "timeout":
           pass
         else:
           error_msg = f"Autonomous run interrupted: {reason}"
-      break
-    elif event_type == "budget_exceeded":
-      budget_exceeded = True
-    elif event_type == "max_turns_reached":
-      max_turns_reached = True
     elif event_type == "max_tokens_reached":
       max_tokens_reached = True
     elif event_type == "assistant_message" and event.get("stop_reason") == "max_tokens":
@@ -110,7 +106,6 @@ def collect_run_output(
     elif event_type == "error":
       error_msg = str(event.get("error", "Autonomous run encountered an error"))
       terminal_seen = True
-      break
 
   if not terminal_seen:
     error_msg = "missing_terminal_event"
@@ -121,10 +116,9 @@ def collect_run_output(
     usage=usage,
     error=error_msg,
     timed_out=timed_out,
-    budget_exceeded=budget_exceeded,
-    max_turns_reached=max_turns_reached,
     operator_paused=operator_paused,
     max_tokens_reached=max_tokens_reached,
+    session_recap=session_recap,
   )
 
 
@@ -135,10 +129,6 @@ def run_output_exit_code(run_output: RunOutput) -> int:
     return 1
   if run_output.error:
     return 1
-  if run_output.budget_exceeded:
-    return 2
-  if run_output.max_turns_reached:
-    return 3
   if run_output.max_tokens_reached:
     return 4
   return 0
@@ -151,10 +141,6 @@ def run_output_outcome(run_output: RunOutput) -> str:
     return run_output.exit_reason
   if run_output.error:
     return "error"
-  if run_output.budget_exceeded:
-    return "budget_exceeded"
-  if run_output.max_turns_reached:
-    return "max_turns"
   if run_output.max_tokens_reached:
     return "max_tokens"
   if run_output.operator_paused:
@@ -247,8 +233,6 @@ def build_state_payload(
   state["model"] = model_name
   state["briefing_file"] = briefing_file
   state["timed_out"] = run_output.timed_out
-  state["budget_exceeded"] = run_output.budget_exceeded
-  state["max_turns_reached"] = run_output.max_turns_reached
   state["max_tokens_reached"] = run_output.max_tokens_reached
   state["operator_paused"] = run_output.operator_paused
   state["last_outcome"] = outcome
@@ -256,6 +240,7 @@ def build_state_payload(
   state["active_servers"] = active_server_names
   state["tools_used"] = sorted({name for name in run_output.tools_used if name})
   state["usage"] = run_output.usage
+  state["session_recap"] = run_output.session_recap
   state["last_summary"] = summary_fn(run_output.response)
 
   if run_output.error:
@@ -286,10 +271,6 @@ def format_run_summary(
     status = "post-run guard failed"
   elif run_output.error and not run_output.timed_out:
     status = "failed"
-  elif run_output.budget_exceeded:
-    status = "budget exceeded"
-  elif run_output.max_turns_reached:
-    status = "max turns reached"
   elif run_output.max_tokens_reached:
     status = "max tokens reached"
   elif run_output.operator_paused:

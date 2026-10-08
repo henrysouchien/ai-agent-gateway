@@ -890,7 +890,6 @@ def test_interrupted_notification_delivers_canonical_recovery_payload() -> None:
       "parent_turn_id": "turn-1",
       "call_index": 2,
       "task_type": "sub_agent",
-      "resumable": True,
     })
     entry.capability_bind_receipt = {
       "provider": "anthropic",
@@ -919,7 +918,8 @@ def test_interrupted_notification_delivers_canonical_recovery_payload() -> None:
     assert notification.payload == expected_payload
     assert _notification_result(notification.format_xml()) == expected_payload
     assert expected_payload["status"] == "interrupted"
-    assert expected_payload["resumable"] is True
+    assert "resumable" not in expected_payload
+    assert expected_payload["resume_chain_depth"] == 0
     assert expected_payload["resumed_as"] == [successor.task_id]
     assert expected_payload["latest_resume_task_id"] == successor.task_id
     assert expected_payload["capability_bind"] == entry.capability_bind_receipt

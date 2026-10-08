@@ -40,13 +40,26 @@ def build_attach_event(
   started_at: float,
   client_kind: str,
   hostname: str,
+  user_id: str | None,
+  channel: str | None,
+  api_key_hash: str | None,
 ) -> Dict[str, Any]:
+  """Build the attach event; its owner fields are the log's ownership record.
+
+  `user_id`, `channel` and `api_key_hash` come from the writer's gateway
+  session. Init-time session resume admits a log only when the first attach
+  carries all three and they equal the resolving caller.
+  """
+
   return {
     "type": "attach",
     "gateway_session_id": gateway_session_id,
     "started_at": started_at,
     "client_kind": client_kind,
     "hostname": hostname,
+    "user_id": user_id,
+    "channel": channel,
+    "api_key_hash": api_key_hash,
   }
 
 
@@ -349,14 +362,57 @@ def build_turn_complete_event(*, turn: int, usage: Dict[str, Any]) -> Dict[str, 
   }
 
 
-def build_max_turns_reached_event(*, turn_count: int, max_turns: int) -> Dict[str, Any]:
-  return {"type": "max_turns_reached", "turn_count": turn_count, "max_turns": max_turns}
+def build_tool_calls_planned_event(*, turn: int, calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+  return {
+    "type": "tool_calls_planned",
+    "turn": turn,
+    "calls": [dict(call) for call in calls],
+  }
 
 
-def build_max_turns_text_event(summary_text: str | None) -> Dict[str, Any]:
-  if summary_text:
-    return {"type": "text_delta", "text": f"\n\n[Max turns reached]\n{summary_text}"}
-  return {"type": "text_delta", "text": "\n\n[Sub-agent reached maximum turn limit]"}
+def _soft_budget_event(
+  event_type: str,
+  *,
+  kind: str,
+  observed: float,
+  threshold: float,
+) -> Dict[str, Any]:
+  return {
+    "type": event_type,
+    "kind": kind,
+    "observed": observed,
+    "threshold": threshold,
+  }
+
+
+def build_soft_budget_steer_event(
+  kind: str,
+  observed: float,
+  threshold: float,
+) -> Dict[str, Any]:
+  """The soft-budget ladder steered the run toward wrapping up."""
+
+  return _soft_budget_event(
+    "soft_budget_steer",
+    kind=kind,
+    observed=observed,
+    threshold=threshold,
+  )
+
+
+def build_soft_budget_final_event(
+  kind: str,
+  observed: float,
+  threshold: float,
+) -> Dict[str, Any]:
+  """The soft-budget ladder opened the forced-final report turn."""
+
+  return _soft_budget_event(
+    "soft_budget_final",
+    kind=kind,
+    observed=observed,
+    threshold=threshold,
+  )
 
 
 def build_runtime_guard_event(*, guard: str, message: str) -> Dict[str, Any]:
@@ -385,36 +441,6 @@ def build_refusal_event(stop_details: Dict[str, Any] | None) -> Dict[str, Any]:
     "category": details.get("category"),
     "explanation": details.get("explanation"),
     "guidance": REFUSAL_GUIDANCE,
-  }
-
-
-def build_budget_exceeded_event(
-  *,
-  total_cost: float,
-  budget: float,
-  reason: Any,
-) -> Dict[str, Any]:
-  return {
-    "type": "budget_exceeded",
-    "total_cost": round(total_cost, 4),
-    "budget": budget,
-    "reason": reason,
-  }
-
-
-def build_budget_exceeded_text_event(
-  *,
-  total_cost: float,
-  budget: float,
-  reason_suffix: str,
-) -> Dict[str, Any]:
-  return {
-    "type": "text_delta",
-    "text": (
-      "\n\n"
-      f"[Budget limit reached: ${total_cost:.4f} >= "
-      f"${budget:.4f}{reason_suffix}]"
-    ),
   }
 
 
@@ -579,11 +605,22 @@ def _provider_error_event_fields(error: str) -> Dict[str, Any]:
   return dict(projection) if isinstance(projection, Mapping) else {}
 
 
-def build_stream_retry_event(*, attempt: int, error: str) -> Dict[str, Any]:
+def build_stream_retry_event(
+  *,
+  attempt: int,
+  error: str,
+  attempt_elapsed_s: float,
+  backoff_s: float | None,
+) -> Dict[str, Any]:
+  """``attempt_elapsed_s``: monotonic seconds from the failed attempt's start
+  (after its own backoff sleep) to this retry. ``backoff_s``: the delay the
+  next attempt sleeps first; None when no attempt follows."""
   return {
     "type": "stream_retry",
     "attempt": attempt,
     "error": str(error),
+    "attempt_elapsed_s": attempt_elapsed_s,
+    "backoff_s": backoff_s,
     **_provider_error_event_fields(error),
   }
 
@@ -763,7 +800,7 @@ def terminal_closure_decision(
   skill_result: Dict[str, Any] | None = None,
   skill_effect: TopLevelSkillCompletionEffectPlan | None = None,
 ) -> TerminalClosureDecision:
-  """Decide one canonical pair from execution facts before durable publication."""
+  """Decide the canonical closure, including an unprepared escaping exception."""
   cause = run_error
   disposition: Literal["success", "error", "cancelled"]
   if persistence_error is not None:
@@ -793,6 +830,8 @@ def terminal_closure_decision(
     }
     if server_terminal_cause is not None:
       terminal["server_terminal_cause"] = server_terminal_cause
+  elif terminal is None and isinstance(run_error, Exception):
+    terminal = build_error_event(str(run_error))
   elif (
     terminal is not None
     and terminal.get("type") == "stream_complete"

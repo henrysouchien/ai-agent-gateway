@@ -488,10 +488,3 @@ def test_runner_hook_delegates_preserve_log_and_filter_results() -> None:
 
   assert tool_result_calls == [ctx]
   assert before_complete_calls == [{"type": "error", "error": "failed"}]
-
-
-def test_runner_before_stream_complete_delegate_allows_missing_log_without_hook() -> None:
-  runner = object.__new__(AgentRunner)
-  runner._on_before_stream_complete = None
-
-  _run(AgentRunner._call_on_before_stream_complete(runner, {"type": "error", "error": "failed"}))

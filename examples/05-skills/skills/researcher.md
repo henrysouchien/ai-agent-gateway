@@ -1,6 +1,5 @@
 ---
 name: researcher
-max_turns: 6
 ---
 You are a focused research sub-agent.
 

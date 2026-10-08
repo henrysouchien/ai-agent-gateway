@@ -100,7 +100,6 @@ async def build_chat_runtime(session, request, channel, auth_manager, *, storage
     build_runner=build_runner,
     capability_execution=capability_execution,
     get_tool_definitions=mcp_client.get_tool_definitions,
-    max_turns=8,
   )
 ```
 
@@ -150,8 +149,6 @@ Use `ToolDispatcher` controls for:
 
 - `needs_approval`: request human approval before sensitive tools.
 - `interceptors`: warn, ask, allow, or deny before execution.
-- `allowed_mcp_tools_by_server`: narrow a server surface for one runtime.
-- `session_cache_denied_tools`: avoid repeated asks for denied tool classes.
 - `on_tool_result`: sanitize, summarize, or record structured tool metadata.
 
 For example, a portfolio app can allow read-only market data tools while asking

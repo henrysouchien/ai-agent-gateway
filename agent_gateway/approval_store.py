@@ -1720,15 +1720,6 @@ class SQLiteApprovalStore:
         current = self._row_to_request(current_row)
         if expected_state_version is not None and current.state_version != expected_state_version:
           raise RuntimeError("approval request state_version changed")
-        if state in {"approved", "auto_approved"}:
-          if current.approval_constraint == "legacy_unknown":
-            raise ValueError(
-              "approval constraint is unknown; replan and reauthorize"
-            )
-          if current.approval_constraint == "fresh_human_owner":
-            raise ValueError(
-              "fresh owner approval constraint can only be approved by an owner vote"
-            )
         decided_at = utc_now() if state in TERMINAL_STATES else current.decided_at
         terminal_decision = decision
         if terminal_decision is None and state in {"approved", "denied", "auto_approved", "auto_denied", "expired"}:
@@ -2131,23 +2122,6 @@ class SQLiteApprovalStore:
             )
           terminal_event = "expired"
         else:
-          if vote.decision == "approved":
-            if current.approval_constraint == "legacy_unknown":
-              raise ValueError(
-                "approval constraint is unknown; replan and reauthorize"
-              )
-            if current.approval_constraint == "fresh_human_owner" and (
-              current.authorization_mode not in {
-                "HUMAN",
-                "OWNER_CONTROL_PLANE",
-              }
-              or vote.decider_id != current.required_owner_user_id
-              or vote.decider_role != "owner"
-            ):
-              raise ValueError(
-                "fresh owner approval constraint requires its exact owner vote"
-              )
-
           existing = conn.execute(
             "SELECT * FROM approval_votes WHERE approval_id = ? AND decider_id = ?",
             (approval_id, vote.decider_id),

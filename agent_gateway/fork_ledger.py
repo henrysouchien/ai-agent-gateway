@@ -3,7 +3,19 @@
 The fork ledger deliberately has its own schema and lifecycle, but reuses the
 launch nonce store's hardened SQLite file and connection primitives.
 All day windows are UTC calendar days.  Money is stored as integer micro-USD so
-budget decisions never depend on SQLite floating-point aggregation.
+day totals never depend on SQLite floating-point aggregation.
+
+An admission's reservation (``max_reserved_microusd``) is the in-flight cost
+estimate, not a cap: no fork runs under a cost ceiling, so settlement records
+the fork's actual spend exactly, at any non-negative amount.  The reservation
+stands in for the spend in the owner's UTC-day totals while the fork is
+reserved or started, and is what an abandoned fork is charged, because its
+actual spend was never reported.  The day totals are telemetry, never an
+admission refusal.
+
+Schema v2 dropped v1's ``settled_microusd <= max_reserved_microusd`` CHECK.
+Opening a v1 ledger migrates it forward in the same exclusive transaction that
+verifies it; any other schema is refused.
 
 Opening a ledger never reconciles another process instance's in-flight state.
 Recovery is explicit: a lifecycle owner supplies the complete live process set
@@ -36,7 +48,8 @@ from .launch_nonce_store import (
 )
 
 
-FORK_LEDGER_SCHEMA_VERSION = 1
+FORK_LEDGER_SCHEMA_VERSION = 2
+_V1_SCHEMA_VERSION = 1
 MICRO_USD = Decimal("0.000001")
 _MAX_TEXT_LENGTH = 4_096
 
@@ -47,7 +60,7 @@ _TransactionResult = TypeVar("_TransactionResult")
 _METADATA_SQL = """
   CREATE TABLE IF NOT EXISTS fork_ledger_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 2),
     day_boundary TEXT NOT NULL CHECK (day_boundary = 'UTC'),
     money_unit TEXT NOT NULL CHECK (money_unit = 'micro_usd')
   )
@@ -131,7 +144,6 @@ _ADMISSIONS_SQL = f"""
       OR (
         typeof(settled_microusd) = 'integer'
         AND settled_microusd >= 0
-        AND settled_microusd <= max_reserved_microusd
       )
     ),
     state TEXT NOT NULL CHECK (
@@ -178,6 +190,80 @@ _SCHEMA_OBJECTS = {
   ),
 }
 
+# Frozen v1 DDL, recognized only so a v1 ledger can be migrated to v2.  v1
+# differs from v2 in the metadata version CHECK and in bounding
+# ``settled_microusd`` by the reservation; every other object is identical.
+_V1_METADATA_SQL = """
+  CREATE TABLE IF NOT EXISTS fork_ledger_metadata (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    day_boundary TEXT NOT NULL CHECK (day_boundary = 'UTC'),
+    money_unit TEXT NOT NULL CHECK (money_unit = 'micro_usd')
+  )
+"""
+_V1_ADMISSIONS_SQL = f"""
+  CREATE TABLE IF NOT EXISTS fork_admissions (
+    fork_id TEXT PRIMARY KEY CHECK (
+      typeof(fork_id) = 'text'
+      AND length(fork_id) BETWEEN 1 AND {_MAX_TEXT_LENGTH}
+      AND fork_id = trim(fork_id)
+    ),
+    owner TEXT NOT NULL CHECK (
+      typeof(owner) = 'text'
+      AND length(owner) BETWEEN 1 AND {_MAX_TEXT_LENGTH}
+      AND owner = trim(owner)
+    ),
+    admission_date TEXT NOT NULL CHECK (
+      length(admission_date) = 10
+      AND admission_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+    ),
+    max_reserved_microusd INTEGER NOT NULL CHECK (
+      typeof(max_reserved_microusd) = 'integer'
+      AND max_reserved_microusd > 0
+    ),
+    settled_microusd INTEGER CHECK (
+      settled_microusd IS NULL
+      OR (
+        typeof(settled_microusd) = 'integer'
+        AND settled_microusd >= 0
+        AND settled_microusd <= max_reserved_microusd
+      )
+    ),
+    state TEXT NOT NULL CHECK (
+      state IN ('reserved', 'started', 'settled', 'abandoned')
+    ),
+    process_instance_id TEXT NOT NULL CHECK (
+      typeof(process_instance_id) = 'text'
+      AND length(process_instance_id) BETWEEN 1 AND {_MAX_TEXT_LENGTH}
+      AND process_instance_id = trim(process_instance_id)
+    ),
+    created_at_ns INTEGER NOT NULL CHECK (created_at_ns > 0),
+    updated_at_ns INTEGER NOT NULL CHECK (updated_at_ns >= created_at_ns),
+    started_at_ns INTEGER,
+    settled_at_ns INTEGER,
+    CHECK (
+      (state = 'reserved' AND started_at_ns IS NULL
+       AND settled_at_ns IS NULL AND settled_microusd IS NULL)
+      OR
+      (state = 'started' AND started_at_ns IS NOT NULL
+       AND settled_at_ns IS NULL AND settled_microusd IS NULL)
+      OR
+      (state IN ('settled', 'abandoned')
+       AND settled_at_ns IS NOT NULL AND settled_microusd IS NOT NULL)
+    )
+  ) WITHOUT ROWID
+"""
+_V1_SCHEMA_OBJECTS = {
+  **_SCHEMA_OBJECTS,
+  "fork_ledger_metadata": ("table", _V1_METADATA_SQL),
+  "fork_admissions": ("table", _V1_ADMISSIONS_SQL),
+}
+_ADMISSION_COLUMNS = (
+  "fork_id, owner, admission_date, max_reserved_microusd, settled_microusd,"
+  " state, process_instance_id, created_at_ns, updated_at_ns,"
+  " started_at_ns, settled_at_ns"
+)
+
 
 class ForkLedgerError(RuntimeError):
   """The durable fork ledger could not safely complete an operation."""
@@ -197,14 +283,6 @@ class ForkLedgerClockRollback(ForkLedgerError):
 
 class ForkLedgerDuplicate(ForkLedgerError):
   """A fork-keyed record already exists."""
-
-
-class ForkAdmissionQuotaExceeded(ForkLedgerError):
-  """The owner's UTC-day invocation quota is exhausted."""
-
-
-class ForkAdmissionBudgetExceeded(ForkLedgerError):
-  """The owner's UTC-day reserved/charged budget is exhausted."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +305,15 @@ class AdmissionRecord:
   settled_usd: Decimal | None
   state: AdmissionState
   process_instance_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionReservation:
+  """A new admission plus the owner's UTC-day totals including it."""
+
+  record: AdmissionRecord
+  day_invocations: int
+  day_charged_microusd: int
 
 
 def _required_text(value: object, *, field_name: str) -> str:
@@ -367,6 +454,11 @@ class ForkLedger:
         connection.execute(
           f"PRAGMA user_version={FORK_LEDGER_SCHEMA_VERSION}"
         )
+      elif (
+        connection.execute("PRAGMA user_version").fetchone()[0]
+        == _V1_SCHEMA_VERSION
+      ):
+        self._migrate_v1(connection)
       self._validate_schema(connection)
       connection.commit()
     except BaseException as exc:
@@ -414,9 +506,51 @@ class ForkLedger:
         raise
       raise self._translate_hardening_error(exc) from exc
 
-  def _validate_schema(self, connection: sqlite3.Connection) -> None:
-    version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version != FORK_LEDGER_SCHEMA_VERSION:
+  @staticmethod
+  def _migrate_v1(connection: sqlite3.Connection) -> None:
+    """Rebuild an exact v1 ledger as v2 inside the caller's transaction.
+
+    Every admission row is copied unchanged: v2 only drops the bound of
+    ``settled_microusd`` by the reservation, so each v1 row is a valid v2 row.
+    """
+
+    ForkLedger._validate_schema(
+      connection,
+      version=_V1_SCHEMA_VERSION,
+      objects=_V1_SCHEMA_OBJECTS,
+    )
+    for sql in (
+      "DROP INDEX idx_fork_admissions_owner_day",
+      "ALTER TABLE fork_admissions RENAME TO fork_admissions_v1",
+      _ADMISSIONS_SQL,
+      f"""
+      INSERT INTO fork_admissions ({_ADMISSION_COLUMNS})
+      SELECT {_ADMISSION_COLUMNS} FROM fork_admissions_v1
+      """,
+      "DROP TABLE fork_admissions_v1",
+      _ADMISSION_OWNER_DAY_INDEX_SQL,
+      "DROP TABLE fork_ledger_metadata",
+      _METADATA_SQL,
+    ):
+      connection.execute(sql)
+    connection.execute(
+      """
+      INSERT INTO fork_ledger_metadata (
+        singleton, schema_version, day_boundary, money_unit
+      ) VALUES (1, ?, 'UTC', 'micro_usd')
+      """,
+      (FORK_LEDGER_SCHEMA_VERSION,),
+    )
+    connection.execute(f"PRAGMA user_version={FORK_LEDGER_SCHEMA_VERSION}")
+
+  @staticmethod
+  def _validate_schema(
+    connection: sqlite3.Connection,
+    *,
+    version: int = FORK_LEDGER_SCHEMA_VERSION,
+    objects: dict[str, tuple[str, str]] = _SCHEMA_OBJECTS,
+  ) -> None:
+    if connection.execute("PRAGMA user_version").fetchone()[0] != version:
       raise ForkLedgerUnavailable("fork ledger schema version is incompatible")
     rows = connection.execute(
       """
@@ -426,9 +560,9 @@ class ForkLedger:
       """
     ).fetchall()
     observed = {row["name"]: (row["type"], row["sql"]) for row in rows}
-    if set(observed) != set(_SCHEMA_OBJECTS):
+    if set(observed) != set(objects):
       raise ForkLedgerUnavailable("fork ledger schema objects are incompatible")
-    for name, (kind, sql) in _SCHEMA_OBJECTS.items():
+    for name, (kind, sql) in objects.items():
       actual_kind, actual_sql = observed[name]
       if (
         actual_kind != kind
@@ -450,7 +584,7 @@ class ForkLedger:
     ).fetchall()
     if len(metadata) != 1 or tuple(metadata[0]) != (
       1,
-      FORK_LEDGER_SCHEMA_VERSION,
+      version,
       "UTC",
       "micro_usd",
     ):
@@ -812,29 +946,19 @@ class ForkLedger:
     fork_id: str,
     owner: str,
     max_reserved_usd: Decimal | int | float | str,
-    daily_budget_usd: Decimal | int | float | str,
-    daily_invocation_quota: int,
-  ) -> AdmissionRecord:
+  ) -> AdmissionReservation:
     fork_id = _required_text(fork_id, field_name="fork id")
     owner = _required_text(owner, field_name="owner")
     reserved = _usd_to_micros(
       max_reserved_usd,
-      field_name="fork maximum reservation",
-    )
-    daily_budget = _usd_to_micros(
-      daily_budget_usd,
-      field_name="daily fork budget",
-    )
-    quota = _positive_int(
-      daily_invocation_quota,
-      field_name="daily fork invocation quota",
+      field_name="fork reservation estimate",
     )
 
     def operation(
       connection: sqlite3.Connection,
       now_ns: int,
       day: str,
-    ) -> AdmissionRecord:
+    ) -> AdmissionReservation:
       if connection.execute(
         "SELECT 1 FROM fork_admissions WHERE fork_id = ?",
         (fork_id,),
@@ -855,12 +979,6 @@ class ForkLedger:
         """,
         (owner, day),
       ).fetchone()
-      if totals["invocations"] >= quota:
-        raise ForkAdmissionQuotaExceeded(
-          "daily fork invocation quota is exhausted"
-        )
-      if totals["charged_microusd"] + reserved > daily_budget:
-        raise ForkAdmissionBudgetExceeded("daily fork budget is exhausted")
       connection.execute(
         """
         INSERT INTO fork_admissions (
@@ -878,14 +996,18 @@ class ForkLedger:
           now_ns,
         ),
       )
-      return AdmissionRecord(
-        fork_id=fork_id,
-        owner=owner,
-        date=day,
-        max_reserved_usd=_micros_to_usd(reserved),
-        settled_usd=None,
-        state="reserved",
-        process_instance_id=self.process_instance_id,
+      return AdmissionReservation(
+        record=AdmissionRecord(
+          fork_id=fork_id,
+          owner=owner,
+          date=day,
+          max_reserved_usd=_micros_to_usd(reserved),
+          settled_usd=None,
+          state="reserved",
+          process_instance_id=self.process_instance_id,
+        ),
+        day_invocations=totals["invocations"] + 1,
+        day_charged_microusd=totals["charged_microusd"] + reserved,
       )
 
     return self._transaction(operation)
@@ -917,6 +1039,8 @@ class ForkLedger:
     fork_id: str,
     actual_cost_usd: Decimal | int | float | str,
   ) -> bool:
+    """Record the fork's actual spend exactly, whatever its reservation was."""
+
     fork_id = _required_text(fork_id, field_name="fork id")
     actual = _usd_to_micros(
       actual_cost_usd,
@@ -936,7 +1060,6 @@ class ForkLedger:
                settled_at_ns = ?, updated_at_ns = ?
          WHERE fork_id = ? AND state IN ('reserved', 'started')
            AND process_instance_id = ?
-           AND max_reserved_microusd >= ?
         """,
         (
           actual,
@@ -944,7 +1067,6 @@ class ForkLedger:
           now_ns,
           fork_id,
           self.process_instance_id,
-          actual,
         ),
       )
       return result.rowcount == 1
@@ -1004,8 +1126,7 @@ class ForkLedger:
 
 __all__ = [
   "AdmissionRecord",
-  "ForkAdmissionBudgetExceeded",
-  "ForkAdmissionQuotaExceeded",
+  "AdmissionReservation",
   "ForkLedger",
   "ForkLedgerClockRollback",
   "ForkLedgerDuplicate",

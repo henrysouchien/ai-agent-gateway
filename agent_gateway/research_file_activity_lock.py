@@ -55,7 +55,12 @@ def try_acquire_research_file_activity(
   research_file_id: int,
   exclusive: bool,
 ) -> ResearchFileActivityLease | None:
-  """Try one exact advisory lease without waiting or changing product state."""
+  """Try one exact advisory lease without waiting or changing product state.
+
+  Runs hold the shared lease and document erase holds the exclusive one, so a
+  run that proceeded without its lease could write erased private-document
+  state back into the research file after the erase committed.
+  """
 
   normalized_id = _research_file_id(research_file_id)
   _workspace, workspace_descriptor = _open_workspace(Path(workspace_dir))

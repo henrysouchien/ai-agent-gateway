@@ -41,7 +41,7 @@ from .session import (
   SessionStream,
   StreamSubscriber,
   bind_session_capability_selections,
-  session_ttl_elapsed,
+  session_admits_new_turn,
 )
 from .session_recap import emit_recap_then_terminal
 from .selected_content import SelectedContentAdmission
@@ -137,6 +137,28 @@ def _write_transcript(
     channel=channel,
     write_chat_log_meta=_maybe_write_chat_log_meta,
     warn=log.warning,
+  )
+
+
+def _write_turn_transcript_entry(
+  active_turn: SessionStream,
+  seq: int,
+  event: Dict[str, Any],
+  *,
+  transcript_dir: Optional[Path],
+  session_id: str,
+  user_id: str | None,
+  channel: str | None,
+) -> None:
+  return _chat_transcripts._write_turn_transcript_entry(
+    active_turn,
+    seq,
+    event,
+    transcript_dir=transcript_dir,
+    session_id=session_id,
+    user_id=user_id,
+    channel=channel,
+    write_transcript=_write_transcript,
   )
 
 
@@ -504,7 +526,7 @@ async def _stream_subscriber_sse(
     wait_for_fn=asyncio.wait_for,
     timeout_error=asyncio.TimeoutError,
     event_for_wire_fn=_event_for_wire,
-    write_transcript_fn=_write_transcript,
+    write_turn_transcript_entry_fn=_write_turn_transcript_entry,
     adapt_event_fn=adapt_event,
     stream_envelope_fn=_stream_envelope,
     json_dumps_fn=_json_dumps,
@@ -580,24 +602,11 @@ def _chat_turn_state_from_events(events: list[dict[str, Any]]) -> str:
     event_type = event.get("type")
     if event_type == "error":
       return "failed"
-    if event_type in {
-      "operator_pause",
-      "budget_exceeded",
-      "max_turns_reached",
-    }:
-      continue
     if event_type == "stream_complete":
       disposition = event.get("terminal_disposition")
       if disposition == "completed":
         return "completed"
       if disposition == "interrupted":
-        # Mirrors the autonomous classification in
-        # AutonomousRunnerState._terminal_event_outcome: an interrupted terminal
-        # that names the budget ceiling is a finished, non-resumable stop, not a
-        # resumable interrupt. An `error` terminal earlier in the log still wins
-        # above, so a channel failure keeps reporting `failed`.
-        if event.get("reason") == "budget_exceeded":
-          return "budget_limited"
         return "interrupted"
       return "failed"
   return "completed" if events else "starting"
@@ -906,18 +915,6 @@ def bind_init_capability_selections(
 ) -> None:
   """Validate, materialize, and freeze init-time role selections."""
 
-  selection_policy: ProductModelSelectionPolicy | None = getattr(
-    build_chat_runtime,
-    "_gateway_model_selection_policy",
-    None,
-  )
-  if selection_policy is None:
-    raise CapabilityResolutionError(
-      "capability_policy_missing",
-      "deployment capability policy is not configured",
-      capability_id=SESSION_DRIVER_CAPABILITY,
-    )
-
   normalized: dict[CapabilityId, CapabilitySelection] = {}
   for raw_capability_id, selection in selections.items():
     capability_id = str(raw_capability_id or "").strip()
@@ -927,17 +924,10 @@ def bind_init_capability_selections(
         f"unknown capability_id: {capability_id!r}",
         capability_id=capability_id,
       )
-    policy = selection_policy.capabilities.get(capability_id)
-    if (
-      policy is None
-      or capability_id in {SESSION_DRIVER_CAPABILITY, "node.fork"}
-      or not policy.allow_authenticated_run_override
-    ):
-      raise CapabilityResolutionError(
-        "capability_model_not_allowed",
-        f"run selection is not allowed for {capability_id}",
-        capability_id=capability_id,
-      )
+    # Which capabilities admit a run selection is
+    # CapabilityExecutionResolver's rule (the policy's
+    # allow_authenticated_run_override), applied when the resolver below is
+    # built with these overrides.
     normalized[capability_id] = selection
 
   run_overrides: dict[CapabilityId, ModelSelectionIntent] = {}
@@ -976,17 +966,23 @@ def prepare_session_driver_turn(
   )
   request_id = request_id or str(uuid.uuid4())
   context = dict(inputs.context or {})
+  # The route is written by the gateway itself (POST /control/runs kind=chat
+  # with a skill); an unreadable one is logged and the turn runs without it.
   stage_route = getattr(session, "stage_skill_route", None)
   if isinstance(stage_route, dict):
-    route_kind = str(stage_route.get("route_kind") or "").strip().lower()
     skill_name = str(stage_route.get("skill_name") or "").strip()
-    if route_kind != "stage" or not skill_name:
-      raise HTTPException(status_code=400, detail="Invalid stage skill route")
-    context["skill"] = skill_name
-    context["stage_skill_route"] = {
-      "route_kind": "stage",
-      "skill_name": skill_name,
-    }
+    if skill_name:
+      context["skill"] = skill_name
+      context["stage_skill_route"] = {
+        "route_kind": "stage",
+        "skill_name": skill_name,
+      }
+    else:
+      log.warning(
+        "Stage skill route has no skill name; running without it | session=%s | route=%r",
+        session.session_id,
+        stage_route,
+      )
   context["profile"] = _resolve_chat_profile_name(context)
   request = ChatRequest(
     messages=list(inputs.messages),
@@ -1150,13 +1146,20 @@ async def _dispatch_chat_turn_body(
   required_event_delivery: bool = False,
 ) -> ChatTurnResult:
   event_log = turn.event_log
+  # The commercial work start was consumed (once, irrevocably) under this
+  # owner token; only the request that consumed it may attach its turn, so a
+  # paid authorization is spent on exactly one turn.
   if (
     inputs.commercial_dispatch_owner is not None
     and session._commercial_dispatch_owner is not inputs.commercial_dispatch_owner
   ):
-    raise HTTPException(status_code=409, detail="Commercial dispatch ownership was lost")
-  if session.kind != "chat":
-    raise HTTPException(status_code=400, detail="control sessions cannot dispatch chat turns")
+    raise HTTPException(
+      status_code=409,
+      detail=(
+        "Commercial dispatch ownership was lost; re-send the turn with a "
+        "fresh commercial work authorization"
+      ),
+    )
   if not await _await_settling_active_turn(session):
     raise HTTPException(
       status_code=409,
@@ -1165,16 +1168,20 @@ async def _dispatch_chat_turn_body(
         f"released the session within {_ACTIVE_TURN_SETTLE_WAIT_SECONDS:g}s"
       ),
     )
+  # One session admits one active turn: its transcript, runner and event log
+  # take one writer, and a second concurrent turn would interleave writes.
   if _active_turn_is_running(session.active_turn):
     raise HTTPException(status_code=409, detail="A turn is already running; subscribe via /chat/subscribe")
   if session.active_turn is not None:
     _clear_active_turn(session, session.active_turn)
   if session.stream_active:
     raise HTTPException(status_code=409, detail="A turn is already running; subscribe via /chat/subscribe")
-  # The request was authenticated while the previous turn could still hold
-  # the session live past its TTL; admission reads the TTL again here, with no
-  # await before the attach below, so an expired session cannot start a turn.
-  if session_ttl_elapsed(session, expires_at=session.expires_at, now=int(time.time())):
+  # The request was authenticated while earlier work (a turn, or a batch it
+  # dispatched) could still hold the token valid past its TTL; admission reads
+  # its own predicate here, with no await before the attach below, so an
+  # expired session cannot start a turn: past its TTL the bearer no longer
+  # proves the principal it was issued to.
+  if not session_admits_new_turn(session, expires_at=session.expires_at, now=int(time.time())):
     raise HTTPException(status_code=401, detail="Session expired")
 
   prepared = prepared_turn or prepare_session_driver_turn(
@@ -1204,7 +1211,11 @@ async def _dispatch_chat_turn_body(
   if inputs.commercial_dispatch_owner is not None:
     if session._commercial_dispatch_owner is not inputs.commercial_dispatch_owner:
       raise HTTPException(
-        status_code=409, detail="Commercial dispatch ownership was lost"
+        status_code=409,
+        detail=(
+          "Commercial dispatch ownership was lost; re-send the turn with a "
+          "fresh commercial work authorization"
+        ),
       )
     session._commercial_dispatch_owner = None
   session.stream_active = True
@@ -1413,7 +1424,6 @@ async def _dispatch_chat_turn_body(
         await runner.run(
           messages=messages,
           system_prompt=runtime.system_prompt,
-          max_turns=runtime.max_turns,
         )
         if not log_has_terminal(event_log):
           log.warning(
@@ -1507,6 +1517,19 @@ async def _dispatch_chat_turn_body(
     if not log_has_terminal(event_log):
       _emit_terminal({"type": "error", "error": "stream closed"})
     event_log.close()
+    # The log's close owns the transcript tail: a client that stopped reading at
+    # the terminal never sent the entries after it (the turn's trailing
+    # citation_validation record), and no subscriber may be attached at all.
+    for entry in event_log.entries:
+      _write_turn_transcript_entry(
+        active_turn,
+        entry.seq,
+        _event_for_wire(entry, event_log),
+        transcript_dir=transcript_dir,
+        session_id=sid,
+        user_id=session.user_id,
+        channel=channel,
+      )
     await _stop_fanout_worker()
     setattr(event_log, "_on_event", previous_on_event)
     setattr(event_log, "_session_id", previous_session_id)
@@ -1541,5 +1564,4 @@ def _init_approval_subsystem(app: FastAPI, config: GatewayServerConfig) -> None:
   app.state.gateway_approval_audit_writer = subsystem.audit_writer
   app.state.gateway_approval_audit_emitter = subsystem.audit_emitter
   app.state.gateway_approval_store = subsystem.store
-  app.state.gateway_approval_preference_store = subsystem.preference_store
   app.state.gateway_approval_policy = subsystem.policy

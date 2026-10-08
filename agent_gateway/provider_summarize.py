@@ -9,6 +9,7 @@ from model_authority.binding import validate_reported_identity
 from .capability_execution import BoundCapabilityExecution
 from model_authority.thinking import parse_effort
 from .runner_stream_turn import STREAM_PROGRESS_LOG_INTERVAL
+from .runner_streaming import _stream_with_stall_timeout
 
 
 DEFAULT_SUMMARY_SYSTEM_PROMPT = "You write cumulative narrative summaries of autonomous analyst sessions."
@@ -56,6 +57,9 @@ def _add_usage_from_event(usage: dict[str, Any], event: Any) -> None:
     )
     usage["provider_units"] = int(usage.get("provider_units", 0) or 0) + int(getattr(event, "provider_units", 0) or 0)
     _apply_provider_unit_deltas(usage, getattr(event, "provider_unit_deltas", None))
+    wait_ms = int(getattr(event, "provider_wait_ms", 0) or 0)
+    if wait_ms:
+      usage["provider_wait_ms"] = int(usage.get("provider_wait_ms", 0) or 0) + wait_ms
     return
 
   if event_type == "usage_update":
@@ -84,7 +88,6 @@ async def provider_summarize(
   system_prompt: str | list[tuple[str, bool]] | None,
   tools: list[dict[str, Any]] | None = None,
   max_tokens: int,
-  timeout: float = 60.0,
   request_kwargs: dict[str, Any] | None = None,
   on_event: Callable[[dict[str, Any]], object] | None = None,
 ) -> ProviderSummarizeResult:
@@ -132,7 +135,7 @@ async def provider_summarize(
         f"with max_tokens={token_limit}"
       )
     )
-  client = provider.create_client(run_config, timeout=float(run_config.get("client_timeout") or timeout))
+  client = provider.create_client(run_config)
   try:
     kwargs = dict(request_kwargs or {})
     kwargs.update(
@@ -166,7 +169,13 @@ async def provider_summarize(
     stream_started_at = time.monotonic()
     next_heartbeat_at = stream_started_at + STREAM_PROGRESS_LOG_INTERVAL
     stream_events = 0
-    async for event in provider.stream(client, params):
+    async for event in _stream_with_stall_timeout(
+      provider.stream(client, params),
+      config=run_config,
+      model_info=model_info,
+      max_tokens=token_limit,
+      effort_resolution=effort_resolution,
+    ):
       event_type = getattr(event, "type", "")
       now = time.monotonic()
       # A provider heartbeat (an SSE keepalive ping) is not progress, as in

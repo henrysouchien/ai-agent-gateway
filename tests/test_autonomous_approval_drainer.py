@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from agent_gateway.autonomous_runner import AutonomousTask
+from agent_gateway.control_plane import autonomous_approval_drainer as drainer_module
 from agent_gateway.control_plane.autonomous_approval_drainer import (
   AutonomousApprovalDeliveryCoordinator,
   PermanentAutonomousApprovalDeliveryError,
@@ -491,24 +494,39 @@ def test_startup_recovery_read_failure_gets_one_shot_retry() -> None:
   asyncio.run(scenario())
 
 
-def test_recovery_read_exhaustion_sets_fatal_health() -> None:
+def test_sustained_recovery_read_failure_reports_health_and_keeps_retrying() -> None:
   async def scenario() -> None:
     store = FakeDeliveryStore(1, recovery_errors=5)
     coordinator = _coordinator(store, batch_limit=1)
+    delivery_started = asyncio.Event()
+    release_delivery = asyncio.Event()
+    delivered = asyncio.Event()
+
+    async def deliver(_delivery: dict[str, Any]) -> None:
+      delivery_started.set()
+      await release_delivery.wait()
+      store.rows[0]["state"] = "published"
+      delivered.set()
+
+    coordinator._deliver_one = deliver  # type: ignore[method-assign]
     coordinator.start()
-    await asyncio.wait_for(
-      store.recovery_error_event.wait(),
-      timeout=1,
-    )
+    await asyncio.wait_for(delivery_started.wait(), timeout=1)
+
+    # Five failed drains are reported, never latched: the sixth drain ran.
+    assert store.high_water_calls == 6
+    assert coordinator.fatal_error is not None
+    assert "failing after 5 attempts" in coordinator.fatal_error
+    assert coordinator.wake() is True
+
+    release_delivery.set()
+    await asyncio.wait_for(delivered.wait(), timeout=1)
     for _attempt in range(10):
-      if coordinator.fatal_error is not None:
+      if coordinator.fatal_error is None:
         break
       await asyncio.sleep(0)
     await coordinator.shutdown()
 
-    assert coordinator.fatal_error is not None
-    assert "failed closed after 5 attempts" in coordinator.fatal_error
-    assert coordinator.wake() is False
+    assert coordinator.fatal_error is None
 
   asyncio.run(scenario())
 
@@ -576,3 +594,116 @@ def test_drainer_has_no_polling_sleep() -> None:
   source = source_path.read_text(encoding="utf-8")
   assert "asyncio.sleep" not in source
   assert "time.sleep" not in source
+
+
+def _running_task(**overrides: Any) -> AutonomousTask:
+  # Only the fields _deliver_one reads before handing the row to delivery.
+  record = object.__new__(AutonomousTask)
+  fields = {
+    "task_id": "bg_1",
+    "control_run_id": "bg_1",
+    "session_id": "bg_1",
+    "channel_id": "chan_1",
+    "owner_user_id": "user-1",
+    "channel": "cli",
+    "state": "running",
+    "proc": None,
+    **overrides,
+  }
+  for name, value in fields.items():
+    setattr(record, name, value)
+  return record
+
+
+class _TaskRegistry:
+  def __init__(self, record: AutonomousTask) -> None:
+    self._tasks = {record.task_id: record}
+
+
+class _RequestStore:
+  def __init__(self, request: Any) -> None:
+    self.request = request
+
+  async def get(self, approval_id: str) -> Any:
+    assert approval_id == self.request.approval_id
+    return self.request
+
+
+def _delivery_row(**overrides: Any) -> dict[str, Any]:
+  return {
+    "approval_id": "approval-1",
+    "tool_call_id": "tool-1",
+    "nonce": "nonce-1",
+    "task_id": "bg_1",
+    "control_run_id": "bg_1",
+    "session_id": "bg_1",
+    "channel_id": "chan_1",
+    "allow_tool_type": False,
+    "approved": True,
+    "state": "pending",
+    **overrides,
+  }
+
+
+def _durable_request() -> SimpleNamespace:
+  return SimpleNamespace(
+    approval_id="approval-1",
+    tool_call_id="tool-1",
+    user_id="user-1",
+    request_id="bg_1",
+    run_id="bg_1",
+    session_id="bg_1",
+    channel="cli",
+    decider_id="user-1",
+    state="approved",
+  )
+
+
+def test_drainer_hands_a_matching_row_to_delivery(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  delivered: list[dict[str, Any]] = []
+
+  async def deliver(**kwargs: Any) -> None:
+    delivered.append(kwargs)
+
+  monkeypatch.setattr(drainer_module, "deliver_autonomous_approval_outbox", deliver)
+  coordinator = _coordinator(
+    _RequestStore(_durable_request()),
+    registry=_TaskRegistry(_running_task()),
+  )
+
+  asyncio.run(coordinator._deliver_one(_delivery_row()))  # type: ignore[arg-type]
+
+  assert [call["approval_id"] for call in delivered] == ["approval-1"]
+
+
+@pytest.mark.parametrize(
+  "changed",
+  [
+    {"control_run_id": "bg_other"},
+    {"session_id": "bg_other"},
+    {"channel_id": "chan_other"},
+  ],
+)
+def test_drainer_quarantines_a_row_whose_run_authority_changed(
+  monkeypatch: pytest.MonkeyPatch,
+  changed: dict[str, str],
+) -> None:
+  delivered: list[dict[str, Any]] = []
+
+  async def deliver(**kwargs: Any) -> None:
+    delivered.append(kwargs)
+
+  monkeypatch.setattr(drainer_module, "deliver_autonomous_approval_outbox", deliver)
+  coordinator = _coordinator(
+    _RequestStore(_durable_request()),
+    registry=_TaskRegistry(_running_task()),
+  )
+
+  with pytest.raises(
+    PermanentAutonomousApprovalDeliveryError,
+    match="outbox identity mismatch",
+  ):
+    asyncio.run(coordinator._deliver_one(_delivery_row(**changed)))  # type: ignore[arg-type]
+  assert delivered == []

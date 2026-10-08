@@ -149,12 +149,10 @@ class _CompletingRunner(_TestRunner):
     self,
     messages: list[dict[str, Any]],
     system_prompt: str | list[tuple[str, bool]] | None = None,
-    max_turns: int | None = None,
     **_kwargs,
   ) -> None:
     self._captured["messages"] = messages
     self._captured["system_prompt"] = system_prompt
-    self._captured["max_turns"] = max_turns
     self._log.append({"type": "text_delta", "text": "ok"})
     self._log.append({
       "type": "stream_complete",
@@ -174,10 +172,9 @@ class _FailingRunner(_TestRunner):
     self,
     messages: list[dict[str, Any]],
     system_prompt: str | list[tuple[str, bool]] | None = None,
-    max_turns: int | None = None,
     **_kwargs,
   ) -> None:
-    _ = messages, system_prompt, max_turns
+    _ = messages, system_prompt
     raise RuntimeError("runner failed")
 
 
@@ -207,10 +204,9 @@ class _MarkedFailingRunner(_FailingRunner):
     self,
     messages: list[dict[str, Any]],
     system_prompt: str | list[tuple[str, bool]] | None = None,
-    max_turns: int | None = None,
     **_kwargs,
   ) -> None:
-    _ = messages, system_prompt, max_turns
+    _ = messages, system_prompt
     raise self._error
 
 
@@ -226,10 +222,9 @@ class _SilentRunner(_TestRunner):
     self,
     messages: list[dict[str, Any]],
     system_prompt: str | list[tuple[str, bool]] | None = None,
-    max_turns: int | None = None,
     **_kwargs,
   ) -> None:
-    _ = messages, system_prompt, max_turns
+    _ = messages, system_prompt
     self._log.append({"type": "text_delta", "text": "partial"})
 
 

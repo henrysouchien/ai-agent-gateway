@@ -140,11 +140,10 @@ class _NoopRunner(AgentRunner):
     self,
     messages,
     system_prompt=None,
-    max_turns=None,
     *,
     resume_initial_messages=None,
   ) -> None:
-    _ = messages, system_prompt, max_turns, resume_initial_messages
+    _ = messages, system_prompt, resume_initial_messages
 
 
 def _make_app(
@@ -179,7 +178,7 @@ def _make_app(
       if control_skills_dir is not None
       else lambda skill_name: AutonomousSkillAdmissionPolicy(
         False,
-        SkillExecutionLimits(None, None, None),
+        SkillExecutionLimits(None),
       )
     )
   else:

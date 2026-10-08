@@ -16,24 +16,23 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.approval_route import DurableLocalApprovalRoute
+from agent_gateway.approval_route import DurableLocalApprovalRoute, ParentDelegatedApprovalRoute
+from agent_gateway.autonomous_approval_channel import AutonomousApprovalChannelChild
 from agent_gateway import SessionStore
 from agent_gateway.approval_policy import (
   ApprovalDecision as PolicyApprovalDecision,
   ApprovalRequest,
   ApprovalRequestPayload,
-  DelegationGrant,
   RunContext,
   ToolClass,
   build_approval_request,
-  utc_now,
 )
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.tool_dispatcher_helpers import ToolResult
 from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.approvals import _record_vote_and_unblock
 from agent_gateway.event_log import EventLog
-from agent_gateway.single_user_policy import DelegationApprovalPolicy
+from agent_gateway.single_user_policy import SingleUserApprovalPolicy
 from agent_gateway.tool_dispatcher import ApprovalDecision, InterceptDecision, ToolDispatcher
 
 
@@ -113,35 +112,8 @@ class _ManualApprovalBasePolicy:
     return True
 
 
-def _delegation_grant(
-  *,
-  ceiling: frozenset[ToolClass] = frozenset({"state_write"}),
-) -> DelegationGrant:
-  now = utc_now()
-  return DelegationGrant(
-    delegation_id="delegation-1",
-    delegator_user_id="alice",
-    delegator_run_id=None,
-    delegator_session_id="orchestrator-session-1",
-    delegator_profile="relay_qa_operator",
-    delegator_channel="excel",
-    bound_excel_session_id="excel-session-1",
-    bound_relay_request_id="request-1",
-    bound_workbook="Budget.xlsx",
-    tool_class_ceiling=ceiling,
-    args_predicate=None,
-    window_seconds=600,
-    created_at=now,
-    expires_at=None,
-  )
-
-
 def _decision_events(event_log: EventLog) -> list[dict[str, Any]]:
   return [entry.event for entry in event_log.entries if entry.event.get("type") == "tool_approval_decided"]
-
-
-def _legacy_headless_events(event_log: EventLog) -> list[dict[str, Any]]:
-  return [entry.event for entry in event_log.entries if entry.event.get("type") == "headless_auto_deny"]
 
 
 def _dispatcher(
@@ -149,8 +121,6 @@ def _dispatcher(
   *,
   needs_approval=None,
   request_approval=None,
-  approved_tool_types: set[str] | None = None,
-  session_cache_denied_tools: frozenset[str] | None = None,
   interceptors=(),
   should_avoid_permission_prompts: bool = False,
   on_headless_ask=None,
@@ -161,16 +131,14 @@ def _dispatcher(
     role="owner",
     needs_approval=needs_approval or (lambda _name, _tool_input, _qualifier: False),
     request_approval=request_approval,
-    approved_tool_types=approved_tool_types,
     event_log=event_log,
     interceptors=interceptors,
     should_avoid_permission_prompts=should_avoid_permission_prompts,
     on_headless_ask=on_headless_ask,
-    session_cache_denied_tools=session_cache_denied_tools,
   )
 
 
-def test_user_approved_emits_decided_and_real_allow_tool_type_gate() -> None:
+def test_user_approved_emits_decided_without_applying_allow_tool_type() -> None:
   async def _run() -> None:
     event_log = EventLog()
 
@@ -191,7 +159,7 @@ def test_user_approved_emits_decided_and_real_allow_tool_type_gate() -> None:
     assert len(events) == 1
     assert events[0]["decision_source"] == "user_approved"
     assert events[0]["outcome"] == "approved"
-    assert events[0]["allow_tool_type_applied"] is True
+    assert events[0]["allow_tool_type_applied"] is False
 
   asyncio.run(_run())
 
@@ -514,124 +482,116 @@ def test_interactive_irreversible_approval_coerces_allow_tool_type_false(tmp_pat
   asyncio.run(_run())
 
 
+def _background_child_dispatcher(
+  tmp_path: Path,
+  event_log: EventLog,
+  *,
+  tool_name: str,
+  tool_class: ToolClass,
+  executed: list[str],
+  delegated: bool = False,
+) -> tuple[ToolDispatcher, SQLiteApprovalStore, Any]:
+  async def _handler(_tool_input: dict[str, Any], **_kwargs: Any):
+    executed.append(tool_name)
+    return {"ok": True}, None
+
+  store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+  session = SessionStore(ttl=3600).create_session(
+    api_key_hash="hash",
+    user_id="alice",
+    role="owner",
+  )
+  policy = SingleUserApprovalPolicy(store=store)
+  dispatcher = _ClassifiedToolDispatcher(
+    mcp_client=_NullMcpClient(),
+    local_tool_handlers={tool_name: _handler},
+    role=session.role,
+    needs_approval=lambda _name, _tool_input, _qualifier: True,
+    event_log=event_log,
+    should_avoid_permission_prompts=True,
+    approval_route=(
+      ParentDelegatedApprovalRoute(object.__new__(AutonomousApprovalChannelChild), session)
+      if delegated
+      else DurableLocalApprovalRoute(store, policy, session)
+    ),
+    run_context=RunContext(
+      user_id="alice",
+      request_id="request-1",
+      session_id=session.session_id,
+      channel="web",
+    ),
+    tool_class=tool_class,
+  )
+  return dispatcher, store, session
+
+
 @pytest.mark.usefixtures("owner_session_host_policy")
-def test_delegated_lifecycle_auto_approval_emits_delegated_source(tmp_path: Path) -> None:
+def test_background_child_static_door_is_auto_approved(tmp_path: Path) -> None:
   async def _run() -> None:
     event_log = EventLog()
-    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
-    session = SessionStore(ttl=3600).create_session(
-      api_key_hash="hash",
-      user_id="alice",
-      role="owner",
-    )
-    policy = DelegationApprovalPolicy(base=_ManualApprovalBasePolicy())
-    dispatcher = _ClassifiedToolDispatcher(
-      mcp_client=_NullMcpClient(),
-      local_tool_handlers={"write_file": _ok_handler},
-      role=session.role,
-      needs_approval=lambda _name, _tool_input, _qualifier: True,
-      event_log=event_log,
-      approval_route=DurableLocalApprovalRoute(
-        store,
-        policy,
-        session,
-      ),
-      run_context=RunContext(
-        user_id="alice",
-        request_id="request-1",
-        session_id="excel-session-1",
-        channel="excel",
-        delegation=_delegation_grant(),
-        policy_bundle_hash=policy.policy_bundle_hash,
-      ),
+    executed: list[str] = []
+    dispatcher, store, _session = _background_child_dispatcher(
+      tmp_path,
+      event_log,
+      tool_name="fms_persist_scenario_set",
       tool_class="state_write",
+      executed=executed,
     )
 
-    result, error = await dispatcher.dispatch("tool-1", "write_file", {"path": "x"})
+    result, error = await dispatcher.dispatch("tool-1", "fms_persist_scenario_set", {"x": 1})
 
-    assert result == {"ok": True}
     assert error is None
+    assert result == {"ok": True}
+    assert executed == ["fms_persist_scenario_set"]
     stored = await store.get_by_tool_call_id("tool-1")
     assert stored is not None
     assert stored.state == "auto_approved"
-    assert stored.delegation_id == "delegation-1"
+    assert stored.decision_reason == "Only a live order requires a human decision"
     events = _decision_events(event_log)
     assert len(events) == 1
-    assert events[0]["decision_source"] == "delegated_auto_approved"
     assert events[0]["outcome"] == "approved"
 
   asyncio.run(_run())
 
 
+# The parent-delegated route (an autonomous run's `background: true` child) asks
+# its parent instead of a local ledger; headless still denies the ask without a
+# card rather than waiting on the parent.
+@pytest.mark.parametrize("delegated", [False, True])
 @pytest.mark.usefixtures("owner_session_host_policy")
-def test_delegated_lifecycle_external_write_escalates_without_auto_approval(monkeypatch, tmp_path: Path) -> None:
-  async def _run() -> None:
-    from agent_gateway import approval_settings
-
-    monkeypatch.setattr(approval_settings, "approval_wait_seconds", lambda: 0.01)
-
-    event_log = EventLog()
-    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
-    session = SessionStore(ttl=3600).create_session(
-      api_key_hash="hash",
-      user_id="alice",
-      role="owner",
-    )
-    policy = DelegationApprovalPolicy(base=_ManualApprovalBasePolicy())
-    dispatcher = _ClassifiedToolDispatcher(
-      mcp_client=_NullMcpClient(),
-      local_tool_handlers={"write_file": _ok_handler},
-      role=session.role,
-      needs_approval=lambda _name, _tool_input, _qualifier: True,
-      event_log=event_log,
-      approval_route=DurableLocalApprovalRoute(
-        store,
-        policy,
-        session,
-      ),
-      run_context=RunContext(
-        user_id="alice",
-        request_id="request-1",
-        session_id="excel-session-1",
-        channel="excel",
-        delegation=_delegation_grant(ceiling=frozenset({"read", "state_write"})),
-        policy_bundle_hash=policy.policy_bundle_hash,
-      ),
-      tool_class="external_write",
-    )
-
-    result, error = await dispatcher.dispatch("tool-1", "write_file", {"path": "x"})
-
-    assert result is None
-    assert error == {"code": "approval_timeout", "message": "User did not respond within timeout"}
-    request_events = [entry.event for entry in event_log.entries if entry.event.get("type") == "tool_approval_request"]
-    assert len(request_events) == 1
-    stored = await store.get_by_tool_call_id("tool-1")
-    assert stored is not None
-    assert stored.state == "expired"
-    events = _decision_events(event_log)
-    assert len(events) == 1
-    assert events[0]["decision_source"] == "approval_timeout"
-    assert all(event["decision_source"] != "delegated_auto_approved" for event in events)
-
-  asyncio.run(_run())
-
-
-def test_headless_static_auto_deny_emits_legacy_and_decided_events() -> None:
+def test_background_child_money_door_is_denied_without_a_card(tmp_path: Path, delegated: bool) -> None:
   async def _run() -> None:
     event_log = EventLog()
-    dispatcher = _dispatcher(
+    executed: list[str] = []
+    dispatcher, store, session = _background_child_dispatcher(
+      tmp_path,
       event_log,
-      needs_approval=lambda _name, _tool_input, _qualifier: True,
-      should_avoid_permission_prompts=True,
+      tool_name="place_order",
+      tool_class="irreversible",
+      executed=executed,
+      delegated=delegated,
     )
 
-    result, error = await dispatcher.dispatch("tool-1", "write_file", {"path": "x"})
+    result, error = await dispatcher.dispatch("tool-1", "place_order", {"x": 1})
 
     assert result is None
-    assert error is not None
-    assert error["code"] == "headless_auto_deny"
-    assert len(_legacy_headless_events(event_log)) == 1
+    assert error == {
+      "code": "headless_auto_deny",
+      "message": "Tool 'place_order' blocked in headless context.",
+    }
+    assert executed == []
+    assert session.pending_tools == {}
+    assert not [
+      entry.event for entry in event_log.entries if entry.event.get("type") == "tool_approval_request"
+    ]
+    stored = await store.get_by_tool_call_id("tool-1")
+    if delegated:
+      # The parent records the row; a request never raised leaves none.
+      assert stored is None
+    else:
+      assert stored is not None
+      assert stored.state == "auto_denied"
+      assert stored.decision_reason == "Headless context cannot collect required user approval"
     events = _decision_events(event_log)
     assert len(events) == 1
     assert events[0]["decision_source"] == "headless_auto_deny"
@@ -666,52 +626,7 @@ def test_headless_hook_allow_emits_decided_and_executes_tool() -> None:
   asyncio.run(_run())
 
 
-def test_session_cache_auto_approval_emits_standalone_decided_event() -> None:
-  async def _run() -> None:
-    event_log = EventLog()
-    dispatcher = _dispatcher(
-      event_log,
-      needs_approval=lambda _name, _tool_input, _qualifier: True,
-      approved_tool_types={"write_file"},
-    )
-
-    result, error = await dispatcher.dispatch("tool-1", "write_file", {"path": "x"})
-
-    assert result == {"ok": True}
-    assert error is None
-    events = _decision_events(event_log)
-    assert len(events) == 1
-    assert events[0]["decision_source"] == "session_cache_approved"
-    assert events[0]["outcome"] == "approved"
-    assert not any(
-      entry.event.get("type") == "tool_approval_request"
-      for entry in event_log.entries
-    )
-
-  asyncio.run(_run())
-
-
-def test_session_cache_denied_guard_suppresses_cache_approved_emission() -> None:
-  async def _run() -> None:
-    event_log = EventLog()
-    dispatcher = _dispatcher(
-      event_log,
-      needs_approval=lambda _name, _tool_input, _qualifier: True,
-      approved_tool_types={"write_file"},
-      session_cache_denied_tools=frozenset({"write_file"}),
-    )
-
-    result, error = await dispatcher.dispatch("tool-1", "write_file", {"path": "x"})
-
-    assert result is None
-    assert error is not None
-    assert error["code"] == "approval_required"
-    assert _decision_events(event_log) == []
-
-  asyncio.run(_run())
-
-
-def test_callback_headless_and_cache_decision_sources_have_decided_event_coverage() -> None:
+def test_callback_and_headless_decision_sources_have_decided_event_coverage() -> None:
   async def _run() -> None:
     sources = set()
 
@@ -742,11 +657,6 @@ def test_callback_headless_and_cache_decision_sources_have_decided_event_coverag
         should_avoid_permission_prompts=True,
         on_headless_ask=lambda _ctx, _decision: "allow",
       ),
-      _dispatcher(
-        EventLog(),
-        needs_approval=lambda *_args: True,
-        approved_tool_types={"write_file"},
-      ),
     ]
 
     for idx, dispatcher in enumerate(scenarios):
@@ -761,7 +671,6 @@ def test_callback_headless_and_cache_decision_sources_have_decided_event_coverag
       "approval_timeout",
       "headless_auto_deny",
       "headless_hook_approved",
-      "session_cache_approved",
     }
 
   asyncio.run(_run())

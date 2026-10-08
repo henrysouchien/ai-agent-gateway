@@ -88,6 +88,7 @@ def sealed_admitted_task(
   result_requirement: ResultRequirement,
   tool_id: str = SOURCE_TOOL_ID,
   capability: str = SOURCE_CAPABILITY,
+  terminal_on_persist: bool = True,
 ) -> AdmittedTask:
   """Return an admitted task granting exactly one source-reading tool."""
 
@@ -121,6 +122,7 @@ def sealed_admitted_task(
     execution_class="standard",
     workspace_scope="read_only",
     resumable=False,
+    terminal_on_persist=terminal_on_persist,
     result_modes=("narrative",),
   )
   execution_snapshot = AgentExecutionSnapshot(
@@ -128,7 +130,6 @@ def sealed_admitted_task(
     admission_date=_ADMISSION_DATE,
     persisted_methodology_state=None,
     result_instructions=_RESULT_INSTRUCTIONS,
-    max_turns=4,
     client_timeout_seconds=60.0,
     max_tokens=4096,
     resume_mechanics=AgentResumeMechanics(

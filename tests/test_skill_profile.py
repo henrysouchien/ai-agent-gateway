@@ -1,6 +1,5 @@
 import sys
 import textwrap
-from dataclasses import fields
 from pathlib import Path
 
 import pytest
@@ -25,7 +24,6 @@ from agent_gateway.skills import (
   parse_skill_file,
   parse_skill_source,
   resolve_blocks,
-  validate_operation_tool_coherence,
 )
 
 
@@ -76,7 +74,6 @@ def test_source_parser_matches_file_and_loader_parsing(tmp_path: Path) -> None:
     agent_description: Source parser parity.
     metadata:
       required_context: [ticker]
-      max_budget_usd: '1.25'
     semantic_metadata:
       allowed_profiles: [advisor]
     """,
@@ -115,11 +112,7 @@ def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
           - post_message
       session_inject_servers:
         - gmail
-      timeout_overrides:
-        gmail: "30"
-        slack: 45
       state_dir: daily-scan
-      max_budget_usd: "0.75"
       thinking: false
       initial_message: Run the workflow.
       delivery_label: Daily Scan
@@ -134,9 +127,7 @@ def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
     "slack": ["post_message"],
   }
   assert profile.session_inject_servers == ["gmail"]
-  assert profile.timeout_overrides == {"gmail": 30, "slack": 45}
   assert profile.state_dir == "daily-scan"
-  assert profile.max_budget_usd == 0.75
   assert profile.thinking is False
   assert profile.initial_message == "Run the workflow."
   assert profile.delivery_label == "Daily Scan"
@@ -147,9 +138,7 @@ def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
       "slack": ["post_message"],
     },
     "session_inject_servers": ["gmail"],
-    "timeout_overrides": {"gmail": 30, "slack": 45},
     "state_dir": "daily-scan",
-    "max_budget_usd": 0.75,
     "thinking": False,
     "initial_message": "Run the workflow.",
     "delivery_label": "Daily Scan",
@@ -243,17 +232,12 @@ def test_parse_delegation_role(tmp_path: Path) -> None:
   assert profile.metadata is None
 
 
-def test_parse_unmapped_delegation_role_warns_without_redefining_dispatch_policy(
-  tmp_path: Path,
-  caplog: pytest.LogCaptureFixture,
-) -> None:
+def test_parse_unmapped_delegation_role_loads(tmp_path: Path) -> None:
   skill_path = _write_skill(tmp_path, "delegation_role: typo-role")
 
   profile = parse_skill_file(skill_path)
 
   assert profile.delegation_role == "typo-role"
-  assert "delegation_role 'typo-role' is not mapped" in caplog.text
-  assert "will be rejected at dispatch" in caplog.text
 
 
 @pytest.mark.parametrize("raw", ["''", "'   '", "[]", "{}"])
@@ -325,10 +309,7 @@ def test_parse_lifts_top_level_keys(tmp_path: Path) -> None:
       - github
     session_inject_servers:
       - github
-    timeout_overrides:
-      github: "90"
     state_dir: top-level-state
-    max_budget_usd: 1.25
     thinking: "off"
     initial_message: Run from top level.
     delivery_label: Top Level
@@ -339,18 +320,14 @@ def test_parse_lifts_top_level_keys(tmp_path: Path) -> None:
 
   assert profile.mcp_servers == ["github"]
   assert profile.session_inject_servers == ["github"]
-  assert profile.timeout_overrides == {"github": 90}
   assert profile.state_dir == "top-level-state"
-  assert profile.max_budget_usd == 1.25
   assert profile.thinking is False
   assert profile.initial_message == "Run from top level."
   assert profile.delivery_label == "Top Level"
   assert profile.metadata == {
     "mcp_servers": ["github"],
     "session_inject_servers": ["github"],
-    "timeout_overrides": {"github": 90},
     "state_dir": "top-level-state",
-    "max_budget_usd": 1.25,
     "thinking": False,
     "initial_message": "Run from top level.",
     "delivery_label": "Top Level",
@@ -365,9 +342,6 @@ def test_parse_agent_fields_from_frontmatter(tmp_path: Path) -> None:
     agent_callable: true
     agent_description: Agent catalog description
     mode: recommend
-    extra_excluded_tools:
-      - execute_trade
-      - preview_trade
     tool_packs_enabled: false
     """,
   )
@@ -377,48 +351,7 @@ def test_parse_agent_fields_from_frontmatter(tmp_path: Path) -> None:
   assert profile.agent_callable is True
   assert profile.agent_description == "Agent catalog description"
   assert profile.mode == "recommend"
-  assert profile.extra_excluded_tools == {"execute_trade", "preview_trade"}
   assert profile.tool_packs_enabled is False
-
-
-def test_scalar_extra_excluded_tools_shape_rejected(tmp_path: Path) -> None:
-  skill_path = _write_skill(
-    tmp_path,
-    """
-    extra_excluded_tools: execute_trade
-    """,
-  )
-
-  with pytest.raises(ValueError, match="'extra_excluded_tools' must be a list of strings"):
-    parse_skill_file(skill_path)
-
-
-def test_invalid_extra_excluded_tools_entry_type_rejected(tmp_path: Path) -> None:
-  skill_path = _write_skill(
-    tmp_path,
-    """
-    extra_excluded_tools:
-      - execute_trade
-      - 7
-    """,
-  )
-
-  with pytest.raises(ValueError, match="'extra_excluded_tools' entries must be strings"):
-    parse_skill_file(skill_path)
-
-
-def test_null_extra_excluded_tools_entry_rejected(tmp_path: Path) -> None:
-  skill_path = _write_skill(
-    tmp_path,
-    """
-    extra_excluded_tools:
-      - execute_trade
-      -
-    """,
-  )
-
-  with pytest.raises(ValueError, match="'extra_excluded_tools' entries must be strings"):
-    parse_skill_file(skill_path)
 
 
 def test_parse_state_class_from_frontmatter(tmp_path: Path) -> None:
@@ -454,30 +387,14 @@ def test_parse_resumable_defaults_load_cleanly(tmp_path: Path) -> None:
   profile = parse_skill_file(skill_path)
 
   assert profile.resumable is False
-  assert profile.resume_mcp_session_reset_ok is False
   assert profile.state_class is None
 
 
-def test_parse_resumable_with_session_injection_requires_reset_ack(tmp_path: Path) -> None:
+def test_parse_resumable_with_session_injection_loads(tmp_path: Path) -> None:
   skill_path = _write_skill(
     tmp_path,
     """
     resumable: true
-    session_inject_servers:
-      - browser
-    """,
-  )
-
-  with pytest.raises(ValueError, match="resume_mcp_session_reset_ok"):
-    parse_skill_file(skill_path)
-
-
-def test_parse_resumable_with_session_injection_and_reset_ack_loads(tmp_path: Path) -> None:
-  skill_path = _write_skill(
-    tmp_path,
-    """
-    resumable: true
-    resume_mcp_session_reset_ok: true
     session_inject_servers:
       - browser
     """,
@@ -486,7 +403,6 @@ def test_parse_resumable_with_session_injection_and_reset_ack_loads(tmp_path: Pa
   profile = parse_skill_file(skill_path)
 
   assert profile.resumable is True
-  assert profile.resume_mcp_session_reset_ok is True
   assert profile.session_inject_servers == ["browser"]
 
 
@@ -556,25 +472,9 @@ def test_mixed_known_and_unknown_metadata(tmp_path: Path) -> None:
   }
 
 
-def test_timeout_overrides_coercion(tmp_path: Path) -> None:
-  skill_path = _write_skill(
-    tmp_path,
-    """
-    metadata:
-      timeout_overrides:
-        gmail: "120"
-        github: 45.0
-        "": 30
-    """,
-  )
-
-  profile = parse_skill_file(skill_path)
-
-  assert profile.timeout_overrides == {"gmail": 120, "github": 45}
-  assert profile.metadata == {"timeout_overrides": {"gmail": 120, "github": 45}}
-
-
-def test_timeout_overrides_invalid(tmp_path: Path) -> None:
+def test_declared_timeout_overrides_are_not_a_profile_field(tmp_path: Path) -> None:
+  # No per-skill MCP deadline exists; a note that still declares one parses and
+  # the value rides metadata untouched (observe-and-allow).
   skill_path = _write_skill(
     tmp_path,
     """
@@ -585,14 +485,17 @@ def test_timeout_overrides_invalid(tmp_path: Path) -> None:
     """,
   )
 
-  with pytest.raises(ValueError, match="timeout_overrides"):
-    parse_skill_file(skill_path)
+  profile = parse_skill_file(skill_path)
+
+  assert not hasattr(profile, "timeout_overrides")
+  assert profile.metadata == {"timeout_overrides": ["gmail", 30]}
 
 
-def test_max_budget_coercion(tmp_path: Path) -> None:
+def test_declared_turn_and_cost_numbers_are_not_profile_fields(tmp_path: Path) -> None:
   skill_path = _write_skill(
     tmp_path,
     """
+    max_turns: 20
     metadata:
       max_budget_usd: "0.75"
     """,
@@ -600,8 +503,9 @@ def test_max_budget_coercion(tmp_path: Path) -> None:
 
   profile = parse_skill_file(skill_path)
 
-  assert profile.max_budget_usd == 0.75
-  assert profile.metadata == {"max_budget_usd": 0.75}
+  assert not hasattr(profile, "max_turns")
+  assert not hasattr(profile, "max_budget_usd")
+  assert profile.metadata == {"max_budget_usd": "0.75", "max_turns": 20}
 
 
 def test_none_defaults(tmp_path: Path) -> None:
@@ -617,15 +521,12 @@ def test_none_defaults(tmp_path: Path) -> None:
   assert profile.metadata is None
   assert profile.mcp_servers is None
   assert profile.session_inject_servers is None
-  assert profile.timeout_overrides is None
   assert profile.state_dir is None
-  assert profile.max_budget_usd is None
   assert profile.initial_message is None
   assert profile.delivery_label is None
   assert profile.agent_callable is False
   assert profile.agent_description is None
   assert profile.mode == "full"
-  assert profile.extra_excluded_tools == set()
   assert profile.tool_packs_enabled is True
   assert profile.state_class is None
   assert profile.max_structured_reads is None
@@ -638,15 +539,12 @@ def test_dataclass_construction_defaults() -> None:
   assert profile.metadata is None
   assert profile.mcp_servers is None
   assert profile.session_inject_servers is None
-  assert profile.timeout_overrides is None
   assert profile.state_dir is None
-  assert profile.max_budget_usd is None
   assert profile.initial_message is None
   assert profile.delivery_label is None
   assert profile.agent_callable is False
   assert profile.agent_description is None
   assert profile.mode == "full"
-  assert profile.extra_excluded_tools == set()
   assert profile.tool_packs_enabled is True
   assert profile.state_class is None
   assert profile.max_structured_reads is None
@@ -654,12 +552,8 @@ def test_dataclass_construction_defaults() -> None:
 
 
 def test_positional_construction_compat() -> None:
-  profile = SkillProfile("name", "prompt", None, None, None, None, False, None, False, {"custom": 1})
+  profile = SkillProfile("name", "prompt", None, None, None, False, None, False, {"custom": 1})
 
-  assert [field.name for field in fields(SkillProfile)][-2:] == [
-    "max_structured_reads",
-    "delegation_role",
-  ]
   assert profile.name == "name"
   assert profile.system_prompt == "prompt"
   assert profile.metadata == {"custom": 1}
@@ -667,7 +561,6 @@ def test_positional_construction_compat() -> None:
   assert profile.delivery_label is None
   assert profile.agent_callable is False
   assert profile.mode == "full"
-  assert profile.extra_excluded_tools == set()
   assert profile.tool_packs_enabled is True
   assert profile.max_structured_reads is None
   assert profile.delegation_role is None
@@ -681,9 +574,7 @@ def test_agent_profile_subclass_compat() -> None:
   assert profile.metadata is None
   assert profile.mcp_servers is None
   assert profile.session_inject_servers is None
-  assert profile.timeout_overrides is None
   assert profile.state_dir is None
-  assert profile.max_budget_usd is None
   assert profile.initial_message is None
   assert profile.delivery_label is None
 
@@ -840,7 +731,13 @@ def test_scalar_mcp_tool_names_shape_rejected(tmp_path: Path) -> None:
 # --- PN-E2E-01: typed operation tool-coherence -------------------------------
 
 _PEER_COMPARISON_TOOLS_BY_SERVER = {
-  "edgar-parser-mcp": {"get_filing_sections", "get_filings"},
+  "edgar-parser-mcp": {
+    "get_event_filings",
+    "get_filing_document",
+    "get_filing_sections",
+    "get_filings",
+    "search_filing_text",
+  },
   "market-data-mcp": {"compare_peers", "fetch_company_profile", "fetch_financials"},
   "research-corpus-mcp": {"filings_read", "filings_search", "filings_source_excerpt"},
 }
@@ -880,15 +777,10 @@ class _StaticMcpClient:
 
 
 
-def test_operation_tool_coherence_rejects_requirements_without_ceiling(
+def test_compile_does_not_judge_declared_requirements_against_the_ceiling(
   tmp_path: Path,
 ) -> None:
-  """The coherence check IS the resolver now (B-8).
-
-  A declared capability with no ceiling entry that can serve it is refused at
-  compile time by exactly the computation that would refuse it at admission
-  time, so the two can no longer drift.
-  """
+  """Satisfaction is decided once, by live admission, not at compile time."""
 
   skill_path = _write_skill(
     tmp_path,
@@ -907,10 +799,11 @@ def test_operation_tool_coherence_rejects_requirements_without_ceiling(
   )
   profile = parse_skill_file(skill_path)
 
-  with pytest.raises(ValueError, match="cannot satisfy"):
-    validate_operation_tool_coherence(profile)
-  with pytest.raises(ValueError, match="market-data.read/v1"):
-    compile_agent_operation(profile, execution_class="node.explore")
+  operation = compile_agent_operation(profile, execution_class="node.explore")
+
+  assert [item.name for item in operation.required_capabilities] == [
+    "market-data.read/v1"
+  ]
 
 
 
@@ -943,7 +836,6 @@ def test_shim_named_profile_without_declarations_needs_nothing(
     )
   )
 
-  validate_operation_tool_coherence(profile)
   operation = compile_agent_operation(profile, execution_class="node.verify")
 
   assert operation.required_capabilities == ()

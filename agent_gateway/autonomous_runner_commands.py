@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import re
 from collections.abc import Callable
 from typing import Any
@@ -8,17 +7,6 @@ from typing import Any
 from .artifact_paths import canonicalize_ticker
 
 _AUTONOMOUS_PROFILE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
-
-
-def normalize_max_budget_usd(value: float | None) -> float | None:
-  if value is None:
-    return None
-  if isinstance(value, bool) or not isinstance(value, (int, float)):
-    raise ValueError("max_budget_usd must be a finite positive number")
-  normalized = float(value)
-  if not math.isfinite(normalized) or normalized <= 0:
-    raise ValueError("max_budget_usd must be a finite positive number")
-  return normalized
 
 
 def normalize_autonomous_profile(
@@ -46,7 +34,6 @@ def build_autonomous_cmd(
   context: str | None = None,
   ticker: str | None = None,
   research_file_id: int | None = None,
-  max_budget_usd: float | None = None,
   normalize_autonomous_profile_func: Callable[[str], str] = normalize_autonomous_profile,
 ) -> list[str]:
   normalized_profile = normalize_autonomous_profile_func(profile)
@@ -56,13 +43,10 @@ def build_autonomous_cmd(
     raise ValueError("mode must be once, task, skill, or pack")
   if type(deliver) is not bool:
     raise ValueError("deliver must be a boolean")
-  normalized_max_budget_usd = normalize_max_budget_usd(max_budget_usd)
-  if normalized_max_budget_usd is not None and normalized_mode != "skill":
-    raise ValueError("max_budget_usd requires mode='skill'")
-  if not deliver and normalized_mode != "skill":
-    raise ValueError("deliver=False requires mode='skill'")
 
   cmd = [python_executable, "-m", "agent.autonomous", "--profile", normalized_profile]
+  if not deliver:
+    cmd.append("--no-deliver")
 
   if normalized_mode == "once":
     if task or skill or pack or context or ticker:
@@ -96,12 +80,8 @@ def build_autonomous_cmd(
   if task or pack:
     raise ValueError("mode='skill' does not accept task or pack")
   cmd.extend(["--skill", skill.strip()])
-  if not deliver:
-    cmd.append("--no-deliver")
   if research_file_id is not None:
     cmd.extend(["--research-file-id", str(research_file_id)])
-  if normalized_max_budget_usd is not None:
-    cmd.extend(["--max-budget-usd", str(normalized_max_budget_usd)])
   if ticker and ticker.strip():
     cmd.extend(["--ticker", canonicalize_ticker(ticker)])
   if context and context.strip():
@@ -112,6 +92,5 @@ def build_autonomous_cmd(
 __all__ = [
   "_AUTONOMOUS_PROFILE_NAME_RE",
   "build_autonomous_cmd",
-  "normalize_max_budget_usd",
   "normalize_autonomous_profile",
 ]

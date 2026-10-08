@@ -7,7 +7,6 @@
     "running",
     "approval_pending",
     "completed",
-    "budget_limited",
     "failed",
     "interrupted",
     "cancelled"
@@ -44,12 +43,6 @@
       "cancellable": true
     },
     "completed": {
-      "active": false,
-      "terminal": true,
-      "resumable": false,
-      "cancellable": false
-    },
-    "budget_limited": {
       "active": false,
       "terminal": true,
       "resumable": false,

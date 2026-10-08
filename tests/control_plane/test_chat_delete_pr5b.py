@@ -109,11 +109,10 @@ class _ApprovalHoldingRunner(AgentRunner):
     self,
     messages: list[dict[str, Any]],
     system_prompt: str | list[tuple[str, bool]] | None = None,
-    max_turns: int | None = None,
     *,
     resume_initial_messages: list[dict[str, Any]] | None = None,
   ) -> None:
-    _ = messages, system_prompt, max_turns, resume_initial_messages
+    _ = messages, system_prompt, resume_initial_messages
     tool_call_id = f"tool-{uuid.uuid4().hex}"
     approval_id = f"appr-{uuid.uuid4().hex}"
     self._approval_id_holder.append(approval_id)

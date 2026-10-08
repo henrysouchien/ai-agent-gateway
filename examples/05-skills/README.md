@@ -51,6 +51,8 @@ curl -N http://127.0.0.1:8000/api/chat \
 ## What It Shows
 
 - Skills are plain markdown files with optional YAML frontmatter.
-- `run_agent` spawns focused sub-agents with their own turn budgets.
-- Named skill profiles set max-turn limits. Provider and model
+- `run_agent` spawns focused sub-agents. A delegated child meets the one soft
+  turn ladder (`agent_gateway/runner_soft_budget.py` `SOFT_TURN_BUDGET`); a
+  named skill declares no turn or cost limit.
+- Provider and model
   selection remain owned by the capability resolver.

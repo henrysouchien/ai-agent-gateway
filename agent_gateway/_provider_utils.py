@@ -114,10 +114,11 @@ def resolve_auth_config(
     if not resolved_token:
       from .providers.anthropic_oauth import (
         resolve_anthropic_credentials,
-        select_anthropic_credential,
+        select_anthropic_credential_source,
       )
 
-      resolved_token = select_anthropic_credential(resolve_anthropic_credentials())
+      selected = select_anthropic_credential_source(resolve_anthropic_credentials())
+      resolved_token = selected.token if selected is not None else ""
 
   # Resolve auth_mode with precedence chain
   explicit_mode = str(result.get("auth_mode", "")).strip().lower()

@@ -1,6 +1,5 @@
 ---
 name: summarizer
-max_turns: 4
 ---
 You are a focused summarization sub-agent.
 

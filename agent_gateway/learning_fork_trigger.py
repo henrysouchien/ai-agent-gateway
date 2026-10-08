@@ -11,11 +11,7 @@ from typing import Any
 import uuid
 
 from .fork_ledger import ForkLedger, ReceiptClaim
-from .fork_task_registry import (
-  ForkLaunchDecision,
-  ForkTaskRegistry,
-  learn_fork_enabled,
-)
+from .fork_task_registry import ForkLaunchDecision, ForkTaskRegistry
 from .task_registry import TaskNotification
 
 
@@ -241,7 +237,6 @@ def _runtime_for_runner(
     ledger,
     spawn_fork=spawn_learning_fork,
     telemetry=_registry_telemetry,
-    owner_operated_interactive=True,
   )
   config._ledger = ledger
   config._registry = registry
@@ -363,9 +358,6 @@ def submit_learning_fork_after_turn(
   try:
     factors, run_context_present, profile = _cohort_factors(runner, session)
     eligible = all(factors.values())
-    enabled = learn_fork_enabled(
-      owner_operated_interactive=eligible,
-    )
     memory_threshold = learn_memory_nudge_turns()
     skill_threshold = learn_skill_nudge_iters()
     decision = evaluate_learning_fork_trigger(
@@ -378,7 +370,7 @@ def submit_learning_fork_after_turn(
       errored=errored,
       aborted=aborted,
       cancelled=cancelled,
-      enabled=enabled,
+      enabled=eligible,
       memory_threshold=memory_threshold,
       skill_threshold=skill_threshold,
     )
@@ -398,7 +390,6 @@ def submit_learning_fork_after_turn(
           "profile_analyst": factors["profile_analyst"],
           "not_fork_mode": factors["not_fork_mode"],
           "eligible": eligible,
-          "enabled": enabled,
           "memory_counter": decision.memory_turns,
           "memory_nudge_threshold": memory_threshold,
           "skill_counter": decision.skill_iters,

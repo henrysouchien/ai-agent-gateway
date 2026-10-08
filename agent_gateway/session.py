@@ -7,6 +7,7 @@ import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Literal, Mapping, Optional, Set
 
@@ -37,6 +38,8 @@ if TYPE_CHECKING:
   from .autonomous_approval_channel import AutonomousApprovalChannelChild
   from .autonomous_launch_envelope import AutonomousControlAuthority
   from .batch_approval_projection import BatchApprovalScope
+  from .code_execution._backends._kernel import KernelState
+  from .code_execution._frame_reader import FrameReader
   from .runner_fork_agents import LearningForkConfig
   from .multi_user.billing import SessionUsageSummary
   from .tool_result_spill import SpillSink
@@ -48,7 +51,6 @@ JWT_HS256_MIN_SECRET_BYTES = 32
 SESSION_EXPIRY_RETRY_SECONDS = 0.05
 OnSessionExpiry = Callable[["GatewaySession"], Awaitable[None] | None]
 SessionExpiryBlocker = Callable[["GatewaySession"], int]
-_RESERVED_USER_IDS = {"_default"}
 WorkflowOutputReader = Callable[[str, str, int], Awaitable[WorkflowContentPage]]
 WorkflowSettlementObstructionReader = Callable[[], tuple[Any, ...]]
 
@@ -57,8 +59,6 @@ def _normalize_required_user_id(user_id: str | None) -> str:
   normalized = str(user_id or "").strip()
   if not normalized:
     raise ValueError("user_id is required")
-  if normalized in _RESERVED_USER_IDS:
-    raise ValueError("user_id '_default' is reserved")
   return normalized
 
 
@@ -223,9 +223,14 @@ class GatewaySession:
   schema_version: int = DEFAULT_SCHEMA_VERSION
   stream_active: bool = False
   active_turn: Optional[SessionStream] = None
+  #: Admitted batches running on this session's token, keyed
+  #: ``(owner_user_id, batch_id)``. Written and cleared only by
+  #: ``BatchTaskRegistry`` (admission, cancel, terminal). A batch is a unit of
+  #: work beside the turn slot, not in it: a turn's tool may dispatch a batch
+  #: that outlives the turn, and the turn's own clear must not end the batch.
+  admitted_batches: Set[tuple[str, int]] = field(default_factory=set)
   cached_usage: SessionUsageSummary | None = None
   pending_tools: Dict[str, Dict] = field(default_factory=dict)
-  approved_tool_types: Set[str] = field(default_factory=set)
   # The single writer of MCP load state (T3-I12). The loaded-server set, the
   # deferred-tool set and the dispatcher allowlist are all derived from this
   # fold by `mcp_activation.derive_live_surface`; none of them is stored, so
@@ -246,14 +251,19 @@ class GatewaySession:
   approval_route: ApprovalRoute = NO_APPROVAL_ROUTE
   approval_store: Any | None = None
   approval_policy: Any | None = None
-  max_budget_usd: float | None = None
   approval_expire_pending_task: asyncio.Task[Any] | None = None
   tool_sequence: int = 0
   result_queue: Optional[asyncio.Queue] = None
   code_execution_work_dir: Optional[str] = None
+  code_execution_frame_reader: FrameReader | None = field(default=None, repr=False, compare=False)
+  code_execution_kernels: Dict[str, KernelState] = field(default_factory=dict, repr=False, compare=False)
   request_id: str | None = None
   run_context: RunContext | None = field(default=None, repr=False)
   agent_session_log: AgentSessionLog | None = field(default=None, repr=False)
+  # The existing interactive log an init-time resume bound this session to.
+  # The session-log factory opens exactly this path instead of minting one
+  # keyed by `session_id`.
+  resume_log_path: Path | None = None
   approval_audit_emitter: ApprovalAuditEmitter | None = field(
     default=None,
     repr=False,
@@ -290,7 +300,6 @@ class GatewaySession:
   initial_message: str = ""
   dispatch_scope: dict[str, Any] | None = None
   stage_skill_route: dict[str, str] | None = None
-  control_stage_authority: Any | None = field(default=None, repr=False)
   purpose: str | None = None
   learn_memory_nudge_turns: int = 0
   learn_skill_nudge_iters: int = 0
@@ -323,6 +332,19 @@ class GatewaySession:
   )
   _expiring: bool = False
 
+  @property
+  def turn_in_progress(self) -> bool:
+    """Whether this session holds a chat turn that has not published its terminal."""
+
+    turn = self.active_turn
+    return turn is not None and turn.in_progress
+
+  @property
+  def unit_of_work_in_progress(self) -> bool:
+    """Whether a chat turn or an admitted batch is running on this session."""
+
+    return self.turn_in_progress or bool(self.admitted_batches)
+
 
 def session_ttl_elapsed(
   session: GatewaySession | None,
@@ -330,21 +352,39 @@ def session_ttl_elapsed(
   expires_at: int,
   now: int,
 ) -> bool:
-  """Whether a session's TTL has run out at ``now``.
+  """Whether a session's token has stopped authenticating at ``now``.
 
-  The TTL bounds a session between turns, never a turn in progress. A turn's
-  own tool calls authenticate with the session's token, so while the session
-  holds a turn that has not published its terminal event the session stays
-  live and the turn keeps its tools. A new turn is admitted only while this is
-  false at the moment it attaches (``_dispatch_chat_turn_body``), so an
-  expired session cannot start a turn even when its token was accepted while
-  the previous turn was still answering.
+  The TTL bounds a session between units of work, never one in progress: a
+  chat turn, or a batch admitted on this session's token. Both authenticate
+  their tool calls with the session's token, so while the session holds a turn
+  that has not published its terminal event, or a batch that has been neither
+  cancelled nor finished, the token stays valid and the work keeps its tools.
+  Whether a *new* turn may start is a separate question:
+  ``session_admits_new_turn``.
   """
 
   if now < expires_at:
     return False
-  turn = session.active_turn if session is not None else None
-  return turn is None or not turn.in_progress
+  return session is None or not session.unit_of_work_in_progress
+
+
+def session_admits_new_turn(
+  session: GatewaySession,
+  *,
+  expires_at: int,
+  now: int,
+) -> bool:
+  """Whether a new chat turn may attach to ``session`` at ``now``.
+
+  Work in progress keeps its own token valid (``session_ttl_elapsed``); it
+  does not admit new work past the TTL: an admitted batch keeps the token live
+  for its stages, but a session whose turn has ended cannot start another one
+  after ``expires_at`` while that batch runs. ``_dispatch_chat_turn_body`` has
+  already refused a running turn (409) and cleared a finished one before it
+  reads this, with no await before the attach, so admission is the clock alone.
+  """
+
+  return now < expires_at
 
 
 def bind_session_capability_selections(
@@ -629,6 +669,29 @@ class SessionStore:
       )
     )
 
+  def live_session_bound_to_log(self, path: Path) -> GatewaySession | None:
+    """Return the visible session whose durable log is `path`, if any.
+
+    A session is bound to a log once it was resumed onto it
+    (`resume_log_path`) or once its first turn opened it
+    (`agent_session_log`). Paths compare after resolution.
+    """
+
+    target = Path(path).resolve(strict=False)
+    for session in self.visible_sessions_snapshot():
+      bound_log = session.agent_session_log
+      bound_paths = (
+        session.resume_log_path,
+        bound_log.path if bound_log is not None else None,
+      )
+      if any(
+        candidate is not None
+        and Path(candidate).resolve(strict=False) == target
+        for candidate in bound_paths
+      ):
+        return session
+    return None
+
   def expire_session(self, session_id: str) -> None:
     session = self.sessions.get(session_id)
     if session is None:
@@ -779,6 +842,9 @@ class AuthManager:
   """Issue and verify JWT session tokens for the gateway HTTP API."""
 
   def __init__(self, secret: str, valid_keys: Set[str], session_store: SessionStore) -> None:
+    # Anyone holding the secret can mint a session for any user, and an HS256 key
+    # shorter than the hash output is brute-forceable from one issued token (RFC 7518
+    # §3.2), so a short secret is an auth hole, not a configuration preference.
     if len(secret.encode("utf-8")) < JWT_HS256_MIN_SECRET_BYTES:
       raise ValueError(
         f"JWT signing secret must be at least {JWT_HS256_MIN_SECRET_BYTES} bytes for {JWT_ALGORITHM}"
@@ -794,11 +860,18 @@ class AuthManager:
 
   @staticmethod
   def get_bearer_token(authorization: Optional[str]) -> str:
+    """Return the bearer: the only proof of which user's sessions and runs the caller may act on."""
     if not authorization or not authorization.startswith("Bearer "):
       raise HTTPException(status_code=401, detail="Missing Authorization header")
     return authorization.split(" ", 1)[1]
 
   def validate_api_key(self, api_key: str) -> None:
+    """Partition holders of a configured gateway key from everyone else at session init.
+
+    An empty key set means no partition, by `create_agent`'s contract (`easy.py`: any
+    non-empty key is accepted); a deployment that must partition configures keys, and
+    the product composition root (`api/auth.py`) refuses to boot without them.
+    """
     if not api_key:
       raise HTTPException(status_code=401, detail="Missing API key")
     if self._valid_keys and api_key not in self._valid_keys:
@@ -856,6 +929,7 @@ class AuthManager:
     ):
       raise HTTPException(status_code=401, detail="Invalid session payload")
 
+    # Past its TTL a bearer no longer proves the principal it was issued to.
     if self.session_store.ttl_elapsed(
       str(session_id),
       expires_at=int(expires_at),
@@ -874,6 +948,8 @@ class AuthManager:
     ):
       raise HTTPException(status_code=401, detail="Session kind integrity check failed")
 
+    # A bearer cannot reassert a different user, email, risk user or a higher
+    # role than the session store recorded when it issued the session.
     token_user_id = str(payload.get("user_id") or "").strip()
     if not token_user_id:
       raise HTTPException(status_code=401, detail="Invalid session user_id")
@@ -964,6 +1040,7 @@ __all__ = [
   "GatewaySession",
   "SessionStore",
   "bind_session_capability_selections",
+  "session_admits_new_turn",
   "session_owner_user_id",
   "session_ttl_elapsed",
 ]

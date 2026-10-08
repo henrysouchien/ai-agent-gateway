@@ -8,7 +8,6 @@ remain the authority for retry and resume.
 
 from __future__ import annotations
 
-import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -68,17 +67,6 @@ _EFFORTS = frozenset({
   "xhigh",
   "max",
 })
-_WORKSPACE_SCOPES_BY_MUTATION_MODE: Mapping[str, frozenset[str]] = (
-  MappingProxyType({
-    "read_only": frozenset({"read_only"}),
-    "preview": frozenset({"workspace_write"}),
-    "apply": frozenset({"workspace_write"}),
-    # Model writers that only materialize immutable artifacts legitimately use
-    # the narrower workspace scope; other model/thesis writers use model scope.
-    "model_writer": frozenset({"workspace_write", "model_write"}),
-    "thesis_writer": frozenset({"model_write"}),
-  })
-)
 _SERVER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
 _TOOL_ID_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _MCP_TOOL_ID_RE = re.compile(
@@ -115,19 +103,6 @@ def _require_optional_identifier(value: object, *, field_name: str) -> None:
 def _require_optional_positive_int(value: object, *, field_name: str) -> None:
   if value is not None and (type(value) is not int or value < 1):
     raise ValueError(f"{field_name} must be a positive integer")
-
-
-def _require_optional_positive_number(value: object, *, field_name: str) -> None:
-  if value is None:
-    return
-  if type(value) is int:
-    number = float(value)
-  elif type(value) is float:
-    number = value
-  else:
-    raise ValueError(f"{field_name} must be a finite positive number")
-  if not math.isfinite(number) or number <= 0:
-    raise ValueError(f"{field_name} must be a finite positive number")
 
 
 def _canonical_string_set(
@@ -172,15 +147,11 @@ class OperationRuntimePolicy:
   mcp_tools_by_server: Mapping[str, frozenset[str]]
   runtime_server_refs: frozenset[str]
   session_inject_servers: frozenset[str]
-  timeout_overrides: Mapping[str, int]
-  extra_excluded_tools: frozenset[str]
   tool_packs: tuple[str, ...] = ()
   tool_packs_enabled: bool = True
   model: str | None = None
   provider: str | None = None
-  max_turns: int | None = None
   max_tokens: int | None = None
-  max_budget_usd: float | None = None
   effort: Effort | None = None
   max_structured_reads: int | None = None
   initial_message: str | None = None
@@ -214,12 +185,6 @@ class OperationRuntimePolicy:
       _require_exact_bool(getattr(self, field_name), field_name=field_name)
     if self.persist_state and self.state_class == "advisor-no-state":
       raise ValueError("advisor-no-state operations cannot persist state")
-    if self.resumable and self.session_inject_servers:
-      if not self.resume_mcp_session_reset_ok:
-        raise ValueError(
-          "resumable operations with session injection must allow MCP "
-          "session reset"
-        )
 
     if self.state_dir is not None:
       state_dir = self.state_dir
@@ -240,15 +205,10 @@ class OperationRuntimePolicy:
     _require_optional_identifier(self.provider, field_name="provider")
     _require_optional_identifier(self.initial_message, field_name="initial_message")
     _require_optional_identifier(self.delivery_label, field_name="delivery_label")
-    _require_optional_positive_int(self.max_turns, field_name="max_turns")
     _require_optional_positive_int(self.max_tokens, field_name="max_tokens")
     _require_optional_positive_int(
       self.max_structured_reads,
       field_name="max_structured_reads",
-    )
-    _require_optional_positive_number(
-      self.max_budget_usd,
-      field_name="max_budget_usd",
     )
 
     exact_tool_ids = _canonical_string_set(
@@ -328,42 +288,6 @@ class OperationRuntimePolicy:
         "session_inject_servers must be a subset of runtime_server_refs"
       )
 
-    if not isinstance(self.timeout_overrides, Mapping):
-      raise TypeError("timeout_overrides must be a mapping")
-    timeout_overrides: dict[str, int] = {}
-    for server_id, timeout in self.timeout_overrides.items():
-      if type(server_id) is not str or _SERVER_ID_RE.fullmatch(server_id) is None:
-        raise ValueError(f"invalid timeout server identity: {server_id!r}")
-      if type(timeout) is not int or timeout <= 0:
-        raise ValueError("timeout overrides must be positive integer seconds")
-      timeout_overrides[server_id] = timeout
-    if not set(timeout_overrides).issubset(runtime_server_refs):
-      raise ValueError("timeout override servers must be runtime server refs")
-
-    extra_excluded_tools = _canonical_string_set(
-      self.extra_excluded_tools,
-      field_name="extra_excluded_tools",
-    )
-    for excluded_tool_id in extra_excluded_tools:
-      if excluded_tool_id.startswith("mcp__"):
-        if _MCP_TOOL_ID_RE.fullmatch(excluded_tool_id) is None:
-          raise ValueError(
-            f"invalid excluded MCP tool identity: {excluded_tool_id!r}"
-          )
-      elif _TOOL_ID_RE.fullmatch(excluded_tool_id) is None:
-        raise ValueError(
-          f"invalid excluded local tool identity: {excluded_tool_id!r}"
-        )
-    bare_mcp_tool_ids = frozenset(
-      tool_id
-      for tool_ids in mcp_tools_by_server.values()
-      for tool_id in tool_ids
-    )
-    if (exact_tool_ids | bare_mcp_tool_ids) & extra_excluded_tools:
-      raise ValueError(
-        "exact_tool_ids and extra_excluded_tools must not overlap"
-      )
-
     if isinstance(self.tool_packs, (str, bytes)):
       raise TypeError("tool_packs must be a tuple of strings")
     tool_packs = tuple(self.tool_packs)
@@ -383,12 +307,6 @@ class OperationRuntimePolicy:
     )
     object.__setattr__(self, "runtime_server_refs", runtime_server_refs)
     object.__setattr__(self, "session_inject_servers", session_inject_servers)
-    object.__setattr__(
-      self,
-      "timeout_overrides",
-      MappingProxyType(dict(sorted(timeout_overrides.items()))),
-    )
-    object.__setattr__(self, "extra_excluded_tools", extra_excluded_tools)
     object.__setattr__(self, "tool_packs", tool_packs)
 
 
@@ -406,14 +324,6 @@ class ResolvedOperationRuntime:
       raise TypeError("policy must be an exact OperationRuntimePolicy")
     if self.snapshot.resumable != self.policy.resumable:
       raise ValueError("snapshot and runtime policy must agree on resumability")
-    allowed_workspace_scopes = _WORKSPACE_SCOPES_BY_MUTATION_MODE[
-      self.policy.mutation_mode
-    ]
-    if self.snapshot.workspace_scope not in allowed_workspace_scopes:
-      raise ValueError(
-        "snapshot workspace_scope is incompatible with runtime policy "
-        "mutation_mode"
-      )
 
 
 @runtime_checkable

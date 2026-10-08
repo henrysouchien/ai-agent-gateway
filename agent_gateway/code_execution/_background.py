@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from ._backends import ExecutionBackend
+from ._frame_reader import CellChannel
 
 
 class OutputRingBuffer:
@@ -29,7 +30,13 @@ class OutputRingBuffer:
 
 @dataclass
 class BackgroundTask:
-  """Track an in-flight background code execution task."""
+  """Track an in-flight background code execution task.
+
+  `bridge` is the cell's frame channel. It lives on this session record, not
+  on the bundle that started the cell: the product builds a bundle per
+  request, and a later request's `code_execute_status` reads the cell's
+  `nested_calls` and `sources` from here when it collects.
+  """
 
   task_id: str
   handle: Any
@@ -37,6 +44,7 @@ class BackgroundTask:
   stdout_buf: OutputRingBuffer
   stderr_buf: OutputRingBuffer
   tool_call_id: str | None = None
+  bridge: CellChannel | None = None
   result: Optional[dict] = None
   started_at: float = 0.0
   _terminated: bool = False
@@ -55,6 +63,9 @@ class BackgroundTask:
     except BaseException:
       self._in_progress = False
       raise
+    await self.close_bridge()
+    if self.bridge is not None and isinstance(self.result, dict):
+      self.result.update(self.bridge.summary())
     return self.result
 
   async def safe_cancel(self, backend: ExecutionBackend) -> None:
@@ -68,3 +79,9 @@ class BackgroundTask:
     except BaseException:
       self._in_progress = False
       raise
+    await self.close_bridge()
+
+  async def close_bridge(self) -> None:
+    """End registration and await nested dispatch/fd cleanup; idempotent."""
+    if self.bridge is not None:
+      await self.bridge.aclose()

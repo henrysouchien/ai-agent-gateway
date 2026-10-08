@@ -49,7 +49,7 @@ class _UnusedClientSession:
     name: str,
     arguments: Mapping[str, object],
     *,
-    read_timeout_seconds: float,
+    read_timeout_seconds: float | None,
     meta: Mapping[str, object] | None = None,
   ) -> _ToolResult:
     raise AssertionError(f"unexpected physical MCP call: {name}")
@@ -649,86 +649,6 @@ def test_parent_apply_collision_filtering_uses_parent_logger(monkeypatch) -> Non
   assert logger.infos[1][1:4] == ("prefixed", 1, ["safe_remote_tool"])
 
 
-def test_policy_owner_prefilter_hides_split_server_duplicates_before_collision_warning(monkeypatch) -> None:
-  logger = _CaptureLogger()
-  monkeypatch.setattr(mcp_client_module, "log", logger)
-  manager = McpClientManager(config_path=None)
-  manager._servers = {
-    "portfolio-reads-mcp": _ServerState(
-      name="portfolio-reads-mcp",
-      session=_UnusedClientSession(),
-      exit_contexts=[],
-      tool_definitions=[
-        {"name": "get_mcp_context", "description": "reads owner", "input_schema": {}},
-      ],
-      tool_names={"get_mcp_context"},
-    ),
-    "portfolio-writes-mcp": _ServerState(
-      name="portfolio-writes-mcp",
-      session=_UnusedClientSession(),
-      exit_contexts=[],
-      tool_definitions=[
-        {"name": "get_mcp_context", "description": "stale residual duplicate", "input_schema": {}},
-        {"name": "apply_patch_ops", "description": "residual writer", "input_schema": {}},
-      ],
-      tool_names={"get_mcp_context", "apply_patch_ops"},
-    ),
-  }
-
-  manager._apply_collision_filtering(
-    policy_server_for_tool=lambda tool_name: (
-      "portfolio-reads-mcp" if tool_name == "get_mcp_context" else "portfolio-writes-mcp"
-    )
-  )
-
-  assert manager.get_tool_definitions() == [
-    {"name": "get_mcp_context", "description": "reads owner", "input_schema": {}},
-    {"name": "apply_patch_ops", "description": "residual writer", "input_schema": {}},
-  ]
-  assert manager.get_server_for_tool("get_mcp_context") == "portfolio-reads-mcp"
-  assert manager.get_server_for_tool("apply_patch_ops") == "portfolio-writes-mcp"
-  assert manager._servers["portfolio-writes-mcp"].tool_names == {"apply_patch_ops"}
-  assert "get_mcp_context" in manager.get_startup_diagnostics()["portfolio-writes-mcp"]["message"]
-  assert not any("collides with MCP tool" in str(warning[0]) for warning in logger.warnings)
-
-
-def test_policy_owner_mismatch_hides_residual_runtime_tool(monkeypatch) -> None:
-  logger = _CaptureLogger()
-  monkeypatch.setattr(mcp_client_module, "log", logger)
-  manager = McpClientManager(config_path=None)
-  manager._servers = {
-    "portfolio-reads-mcp": _ServerState(
-      name="portfolio-reads-mcp",
-      session=_UnusedClientSession(),
-      exit_contexts=[],
-      tool_definitions=[
-        {"name": "execute_trade", "description": "stale residual", "input_schema": {}},
-        {"name": "preview_trade", "description": "current residual", "input_schema": {}},
-      ],
-      tool_names={"execute_trade", "preview_trade"},
-    ),
-  }
-
-  manager._apply_collision_filtering(
-    policy_server_for_tool=lambda tool_name: (
-      "portfolio-trades-mcp" if tool_name == "execute_trade" else "portfolio-reads-mcp"
-    )
-  )
-
-  assert manager.get_tool_definitions() == [
-    {"name": "preview_trade", "description": "current residual", "input_schema": {}},
-  ]
-  assert manager.is_mcp_tool("execute_trade") is False
-  assert manager.is_mcp_tool("preview_trade") is True
-  assert manager.get_server_for_tool("execute_trade") is None
-  assert manager.get_server_for_tool("preview_trade") == "portfolio-reads-mcp"
-  assert manager._servers["portfolio-reads-mcp"].tool_names == {"preview_trade"}
-  assert manager.get_startup_diagnostics()["portfolio-reads-mcp"]["category"] == "policy_owner_mismatch"
-  assert "execute_trade" in manager.get_startup_diagnostics()["portfolio-reads-mcp"]["message"]
-  assert logger.errors
-
-
-
 def test_gsheets_exported_tools_reach_catalog_without_closed_world_gate() -> None:
   manager = McpClientManager(config_path=None)
   manager._servers = {
@@ -974,7 +894,7 @@ def test_provider_symbol_translation_uses_original_name_for_prefixed_tool(monkey
       name: str,
       arguments: Mapping[str, object],
       *,
-      read_timeout_seconds: float,
+      read_timeout_seconds: float | None,
       meta: Mapping[str, object] | None = None,
     ) -> _ToolResult:
       self.calls.append(

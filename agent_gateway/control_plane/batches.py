@@ -51,6 +51,8 @@ from agent_gateway.claim_signing_authority import (
 from agent_gateway.role_validation import require_exact_role
 from agent_gateway.session import AuthManager, GatewaySession
 
+from agent_gateway.admission import AdmittedContext, ParentContext, Refusal, SpawnRequest, root_context
+from agent_workflow_contracts import OperationUnavailable, ResolvedAuthority
 from .corpus_readiness import (
   CORPUS_REQUIREMENTS_FIELD,
   CorpusReadinessGateError,
@@ -62,13 +64,11 @@ _TERMINAL_BATCH_STATUSES = frozenset({
   "completed",
   "failed",
   "cancelled",
-  "budget_limited",
   "blocked",
 })
 _ACTIVE_BATCH_STATUSES = frozenset({"running", "cancelling", "remediating"})
 _DURABLE_CORPUS_REJECTION_CODES = frozenset({
   "invalid_corpus_requirements",
-  "missing_corpus_requirements",
 })
 log = logging.getLogger("agent_gateway.control_plane.batches")
 _SERVICE_BATCH_SESSION_LIFETIME_SECONDS = 24 * 60 * 60
@@ -94,6 +94,10 @@ class BatchBackend:
   registry_for_user: Callable[[str], Any]
   controller: Any
   open_captured_run_context: Callable[..., Any]
+  stage_admitter: Callable[
+    [ParentContext, CapabilityExecutionResolver, Any],
+    Callable[[SpawnRequest, frozenset[str]], AdmittedContext[ResolvedAuthority] | Refusal | OperationUnavailable],
+  ]
   terminal_event_payload: Callable[[int, dict[str, Any]], dict[str, Any]]
   active_batch_error: type[Exception]
   dispatch_replay: type[BatchDispatchReplayError]
@@ -211,6 +215,9 @@ class BatchTaskRegistry:
     self._tasks: dict[tuple[str, int], asyncio.Task[Any]] = {}
     self._monitors: dict[tuple[str, int], asyncio.Task[Any]] = {}
     self._cancel_admission_fences: set[tuple[str, int]] = set()
+    # The session whose token each admitted batch runs on; the batch keeps it
+    # live (``GatewaySession.admitted_batches``) until cancel or terminal.
+    self._live_sessions: dict[tuple[str, int], GatewaySession] = {}
     self._cancellation_progress: dict[
       tuple[str, int],
       _BatchCancellationProgress,
@@ -225,8 +232,14 @@ class BatchTaskRegistry:
     batch_id: int,
     task: asyncio.Task[Any],
     registry: Any,
+    live_session: GatewaySession | None,
     app_state: Any | None = None,
   ) -> None:
+    """Own an admitted batch's task, and keep ``live_session`` live while it runs.
+
+    ``live_session`` is the authenticated session whose token the batch
+    carries, or ``None`` for a sessionless dispatch.
+    """
     key = self._key(owner_user_id, batch_id)
     if self._shutdown_started or key in self._cancel_admission_fences:
       if not task.done():
@@ -236,6 +249,9 @@ class BatchTaskRegistry:
     if existing is not None and not existing.done():
       raise RuntimeError("batch task is already registered")
     self._tasks[key] = task
+    if live_session is not None:
+      live_session.admitted_batches.add(key)
+      self._live_sessions[key] = live_session
     self._monitors[key] = asyncio.create_task(
       self._consume(
         key,
@@ -340,6 +356,9 @@ class BatchTaskRegistry:
 
   async def cancel(self, *, owner_user_id: str, batch_id: int) -> bool:
     key = self._key(owner_user_id, batch_id)
+    # Cancel admission ends the batch's claim on its session, as chat cancel
+    # clears the turn; the task's unwind does not keep the token alive.
+    self._release_live_session(key)
     task = self._tasks.get(key)
     monitor = self._monitors.get(key)
     if task is None:
@@ -528,6 +547,8 @@ class BatchTaskRegistry:
     finally:
       if self._tasks.get(key) is task:
         self._tasks.pop(key, None)
+        # Terminal: the gateway has learned the batch ended.
+        self._release_live_session(key)
       self._monitors.pop(key, None)
       if not self._shutdown_started and key not in self._cancel_admission_fences:
         self.approval_projections.close_batch(
@@ -545,6 +566,11 @@ class BatchTaskRegistry:
     if not owner or normalized_batch_id < 1:
       raise ValueError("batch task owner and positive batch_id are required")
     return owner, normalized_batch_id
+
+  def _release_live_session(self, key: tuple[str, int]) -> None:
+    session = self._live_sessions.pop(key, None)
+    if session is not None:
+      session.admitted_batches.discard(key)
 
 
 def build_batches_router(*, auth: AuthManager) -> APIRouter:
@@ -733,18 +759,21 @@ def build_batches_router(*, auth: AuthManager) -> APIRouter:
       if not tickers:
         raise HTTPException(status_code=422, detail="batch has no failed tickers to retry")
       spec = _retry_spec(prior, tickers)
-      required_bind = _batch_bind_from_row(prior)
+      required_bind, prior_bind_state = _batch_bind_from_row(prior)
     finally:
       source_registry.close()
 
     dispatch_payload = dict(spec)
-    return await _dispatch_batch_for_authenticated(
+    result = await _dispatch_batch_for_authenticated(
       request,
       dispatch_payload,
       authenticated,
       dispatch_key=f"batch-retry-failed-{batch_id}",
       required_bind=required_bind,
     )
+    if prior_bind_state is not None:
+      result = {**result, "prior_capability_bind": prior_bind_state}
+    return result
 
   return router
 
@@ -927,6 +956,7 @@ def build_service_batch_session(
   user_slug: str | None = None,
   user_aliases: tuple[str, ...] | list[str] | None = None,
   identity_status: str | None = None,
+  session_token: str | None = None,
 ) -> GatewaySession:
   """Build the only parent session permitted for sessionless batch dispatch."""
   normalized_user_id = str(user_id or "").strip()
@@ -978,6 +1008,7 @@ def build_service_batch_session(
     kind="control",
     auth_config=auth_config,
     tenant_id=tenant_id,
+    session_token=session_token,
     session_credential_handle=None,
     channel=channel,
     owner_user_id=normalized_user_id,
@@ -1041,6 +1072,11 @@ def _batch_parent_session(
       if authenticated_session is not None
       else None
     ),
+    session_token=(
+      authenticated_session.session_token
+      if authenticated_session is not None
+      else None
+    ),
   )
 
 
@@ -1058,7 +1094,6 @@ async def _dispatch_batch_for_authenticated(
       app_state=request.app.state,
       user_id=_session_owner_user_id(authenticated),
       user_email=authenticated.user_email,
-      role=require_exact_role(getattr(authenticated, "role", None)),
       channel=getattr(authenticated, "channel", None),
       authenticated_session=authenticated,
       dispatch_key=dispatch_key,
@@ -1113,8 +1148,6 @@ async def dispatch_batch_in_process(
     if authenticated_session is not None
     else require_exact_role(role)
   )
-  if role is not None and require_exact_role(role) != exact_role:
-    raise ValueError("batch dispatch role does not match authenticated session")
   if required_bind is not None:
     if not isinstance(required_bind, CapabilityBind):
       raise TypeError("required_bind must be CapabilityBind")
@@ -1497,6 +1530,7 @@ def _acquire_and_start_batch(
       *,
       task_id: str,
       session_driver_execution: BoundCapabilityExecution,
+      admitted: AdmittedContext[ResolvedAuthority],
     ) -> Any:
       return await _batch_backend(app_state).open_captured_run_context(
         parent_session=parent_session,
@@ -1504,9 +1538,20 @@ def _acquire_and_start_batch(
         run_id=run_id,
         task_id=task_id,
         tool_call_id=None,
-      session_driver_execution=session_driver_execution,
+        session_driver_execution=session_driver_execution,
+        admitted=admitted,
         claim_signer=claim_signer,
         storage_root=storage_root,
+      )
+
+    def _admit_stage_factory(plan: Any):
+      parent = root_context(
+        parent_session,
+        withheld_tools=frozenset(),
+        research_file_id=plan.research_file_id,
+      )
+      return _batch_backend(app_state).stage_admitter(
+        parent, capability_execution_resolver, skill_application.operation_catalog
       )
 
     return asyncio.create_task(
@@ -1522,6 +1567,7 @@ def _acquire_and_start_batch(
         captured_run_context_factory=(
           _captured_run_context_factory
         ),
+        admit_stage_factory=_admit_stage_factory,
         skill_application=skill_application,
       )
     )
@@ -1538,6 +1584,7 @@ def _acquire_and_start_batch(
     batch_id=batch_id,
     task=task,
     registry=registry,
+    live_session=authenticated_session,
     app_state=app_state,
   )
   return batch_id
@@ -1807,6 +1854,16 @@ async def _deny_batch_pending_approvals_for_cancel(
         )
       continue
     try:
+      # The row's run_id is its stage's lifecycle id; the batch is request_id.
+      request_record = await projection.store.get(projection.approval_id)
+      if request_record is None:
+        request_record = getattr(projection, "request", None)
+      expected_run_id = (
+        str(request_record.run_id)
+        if request_record is not None
+        and approval_record_matches_projection(request_record, projection)
+        else projection.run_id
+      )
       result = await _cancel_pending_approval_and_unblock(
         target_session=projection.session,
         pending_entry=pending_entry,
@@ -1828,7 +1885,7 @@ async def _deny_batch_pending_approvals_for_cancel(
         authoritative_policy=projection.policy,
         expected_owner_user_id=projection.owner_user_id,
         expected_request_id=projection.run_id,
-        expected_run_id=projection.run_id,
+        expected_run_id=expected_run_id,
         expected_session_id=projection.session_id,
         expected_channel=projection.channel,
         system_override=trusted_lifecycle_authority,
@@ -1996,22 +2053,28 @@ def _retry_spec(batch_row: dict[str, Any], tickers: list[str]) -> dict[str, Any]
   return spec
 
 
-def _batch_bind_from_row(batch_row: dict[str, Any]) -> CapabilityBind:
-  """Require the original complete execution bind for same-admission retry."""
+def _batch_bind_from_row(
+  batch_row: dict[str, Any],
+) -> tuple[CapabilityBind | None, str | None]:
+  """Return the prior batch's execution bind for same-admission retry.
+
+  A prior row with no or an unreadable bind retries under the session's current
+  bind (the authority a fresh dispatch of that batch gets); the second element
+  records that on the response as ``"absent"`` or ``"invalid"``.
+  """
 
   raw_bind = batch_row.get("capability_bind")
   if raw_bind is None:
-    raise HTTPException(
-      status_code=409,
-      detail="prior batch has no durable capability bind; retry is blocked",
-    )
+    return None, "absent"
   try:
-    return CapabilityBind.from_json(raw_bind)
-  except (TypeError, ValueError) as exc:
-    raise HTTPException(
-      status_code=409,
-      detail="prior batch durable capability bind is invalid; retry is blocked",
-    ) from exc
+    return CapabilityBind.from_json(raw_bind), None
+  except (TypeError, ValueError):
+    log.warning(
+      "batch %s durable capability bind is invalid; retrying under the session bind",
+      batch_row.get("batch_id"),
+      exc_info=True,
+    )
+    return None, "invalid"
 
 
 def _set_retry_universe(spec: dict[str, Any], tickers: list[str]) -> None:

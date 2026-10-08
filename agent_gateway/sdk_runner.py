@@ -6,7 +6,8 @@ import json
 import logging
 import time
 import uuid
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Literal, Mapping, Sequence
+from pathlib import Path
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Sequence
 
 from .approval_policy import (
   ApprovalDecision as PolicyApprovalDecision,
@@ -35,12 +36,10 @@ from .usage_resilience import CommercialUsageCircuitOpen
 from .runner import (
   ToolResultContext,
   _ACTIVE_SKILL_ALLOW_RESULT_KEY,
-  _ACTIVE_SKILL_DENY_RESULT_KEY,
-  _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY,
-  _REPORT_DOOR_CLEAR_SUCCESS_STATUSES,
   _detect_user_id_param,
 )
 from .runner_introspection import detect_keyword_param as _detect_keyword_param
+from .runner_background_lifecycle import _RunResearchFileActivityLease
 from .runner_state import select_run_max_tokens
 from .run_identity import (
   MODEL_RUN_IDENTITY_LOCAL_TOOLS,
@@ -49,7 +48,6 @@ from .run_identity import (
   inject_run_identity_into_mcp_server_configs,
   validate_run_identity,
 )
-from .runner_skill_gate import is_report_door_clear_event as _is_report_door_clear_event
 from .runner_session_events import build_user_message_event
 from .selected_content import (
   SelectedContentBinding,
@@ -64,7 +62,6 @@ from .secret_boundary import (
 )
 from .skill_context import (
   clear_current_skill,
-  current_skill,
   current_skill_admission,
 )
 from .workflow_evidence_provenance import (
@@ -103,7 +100,7 @@ RegisteredMcpToolInputRedactor = Callable[
   dict[str, object],
 ]
 RegisteredMcpSdkToolCallPreparer = Callable[
-  [str, Mapping[str, object], object | None, Callable[..., bool] | None],
+  [str, Mapping[str, object], object | None],
   Any,
 ]
 
@@ -264,8 +261,6 @@ class _SDKSegmentQueryIterator:
     self._segment_turns = 0
     self._current_call_usage: dict[str, Any] | None = None
     self._resume_session_id: str | None = None
-    self._run_max_turns = options_kwargs.get("max_turns")
-    self._run_max_budget = options_kwargs.get("max_budget_usd")
     self._accounting_projected = False
     self._last_rebuild_context: str | None = None
     self._rebuild_transcript_cursor = len(runner._sdk_rebuild_transcript)
@@ -422,15 +417,6 @@ class _SDKSegmentQueryIterator:
     except Exception:
       pass
 
-  def _remaining_limits(self) -> tuple[int | None, float | None]:
-    remaining_turns = None
-    if isinstance(self._run_max_turns, int):
-      remaining_turns = self._run_max_turns - self._prior_turns
-    remaining_budget = None
-    if isinstance(self._run_max_budget, (int, float)):
-      remaining_budget = float(self._run_max_budget) - self._prior_cost_usd
-    return remaining_turns, remaining_budget
-
   def _provider_tool_surface_changed(self) -> bool:
     advertised = set(self._options_kwargs.get("disallowed_tools") or [])
     return advertised != set(self._runner._effective_disallowed_tools())
@@ -451,15 +437,6 @@ class _SDKSegmentQueryIterator:
       if not self._resume_session_id:
         raise RuntimeError(
           "sdk_tool_rebuild_transcript_unavailable: SDK session identity was not observed"
-        )
-      remaining_turns, remaining_budget = self._remaining_limits()
-      if remaining_turns is not None and remaining_turns <= 0:
-        raise RuntimeError(
-          "sdk_tool_rebuild_limits_exhausted: no run-scoped turns remain"
-        )
-      if remaining_budget is not None and remaining_budget <= 0:
-        raise RuntimeError(
-          "sdk_tool_rebuild_limits_exhausted: no run-scoped budget remains"
         )
       if pending_load:
         pending_error = self._runner._pending_sdk_load_error(
@@ -487,10 +464,6 @@ class _SDKSegmentQueryIterator:
     )
     self._options_kwargs["resume"] = self._resume_session_id
     self._options_kwargs["continue_conversation"] = False
-    if remaining_turns is not None:
-      self._options_kwargs["max_turns"] = remaining_turns
-    if remaining_budget is not None:
-      self._options_kwargs["max_budget_usd"] = remaining_budget
     new_context = self._runner._sdk_rebuild_transcript[
       self._rebuild_transcript_cursor:
     ]
@@ -528,8 +501,6 @@ class _SDKSegmentQueryIterator:
     result_turns = int(_get_attr(message, "num_turns") or 0)
     result_cost = _get_attr(message, "total_cost_usd")
     total_cost = self._prior_cost_usd + float(result_cost or 0.0)
-    self._options_kwargs["max_turns"] = self._run_max_turns
-    self._options_kwargs["max_budget_usd"] = self._run_max_budget
     return _SDKResultProxy(
       message,
       usage=aggregate,
@@ -587,7 +558,6 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     disallowed_tools: list[str] | None = None,
     mcp_server_configs: dict | None = None,
     allowed_tools: list[str] | None = None,
-    max_turns: int | None = None,
     max_tokens_override: int | None = None,
     on_usage: Callable[..., Any] | None = None,
     on_session_summary: Callable[..., Any] | None = None,
@@ -599,7 +569,6 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     prepare_registered_mcp_tool_call_for_sdk_tool: (
       RegisteredMcpSdkToolCallPreparer | None
     ) = None,
-    registered_approval_overlay: Callable[..., bool] | None = None,
     redact_registered_mcp_tool_input_for_sdk_tool: (
       RegisteredMcpToolInputRedactor | None
     ) = None,
@@ -609,7 +578,6 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     _parent_aggregator: _UsageAggregator | None = None,
     session: Any | None = None,
     approval_route: ApprovalRoute = NO_APPROVAL_ROUTE,
-    approval_lifecycle: Literal["required", "not_required"] = "required",
     run_context: RunContext | None = None,
     skill_run_id: str | None = None,
     mcp_run_identity_servers: frozenset[str] | None = None,
@@ -750,7 +718,6 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     self._sdk_rebuild_transcript: list[str] = []
     self._sdk_resume_session_id: str | None = None
     self._allowed_tools = list(allowed_tools or [])
-    self._max_turns = max_turns
     self._on_usage = on_usage
     self._commercial_usage_producer = commercial_usage_producer
     self._commercial_usage_emitted = False
@@ -781,18 +748,12 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
         "registered SDK MCP descriptor, preparation, redaction, and settlement "
         "owners must be provided together"
       )
-    if (
-      registered_approval_overlay is not None
-      and not callable(registered_approval_overlay)
-    ):
-      raise TypeError("registered_approval_overlay must be callable")
     self._registered_mcp_descriptor_for_sdk_tool = (
       registered_mcp_descriptor_for_sdk_tool
     )
     self._prepare_registered_mcp_tool_call_for_sdk_tool = (
       prepare_registered_mcp_tool_call_for_sdk_tool
     )
-    self._registered_approval_overlay = registered_approval_overlay
     self._redact_registered_mcp_tool_input_for_sdk_tool = (
       redact_registered_mcp_tool_input_for_sdk_tool
     )
@@ -835,8 +796,6 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     self._active_tool_use: _sdk_runner_stream._ActiveToolUse | None = None
     self._suppress_text_after_accepted_ui_blocks = False
     self._active_skill_allow: set[str] = set()
-    self._active_skill_deny: set[str] = set()
-    self._active_skill_report_doors: dict[str, str] = {}
     self._query_iter: Any = None
     self._usage: Dict[str, Any] = {
       "capability_bind": capability_bind.to_json(),
@@ -879,16 +838,13 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     self._agent_session_log = agent_session_log
     self._selected_content_bindings: tuple[SelectedContentBinding, ...] = ()
     self._selected_content_bindings_bound = False
-    self._research_file_activity_lease: Any | None = None
+    self._research_file_activity_lease: _RunResearchFileActivityLease | None = None
     self._selected_content_activity_lease: Any | None = None
     # One admitted route, read as a value; the handles below are its
     # projection and nothing infers authority from them.
     self._approval_route = approval_route
     self._approval_store = route_store(approval_route)
     self._approval_policy = route_policy(approval_route)
-    if approval_lifecycle not in {"required", "not_required"}:
-      raise ValueError("approval_lifecycle must be 'required' or 'not_required'")
-    self._approval_lifecycle = approval_lifecycle
     self._run_context = run_context
     self._skill_run_id = skill_run_id
     self._workspace_dir = workspace_dir
@@ -912,7 +868,25 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     self._selected_content_bindings_bound = True
 
   def bind_research_file_activity_lease(self, lease: Any) -> None:
-    self._bind_activity_lease("_research_file_activity_lease", lease)
+    if lease is None or not callable(getattr(lease, "release", None)):
+      raise TypeError("runner activity lease is invalid")
+    if self._research_file_activity_lease is not None:
+      raise RuntimeError("runner activity lease is already bound")
+    activity = _RunResearchFileActivityLease()
+    activity.bind(
+      lease,
+      getattr(getattr(self._session, "active_turn", None), "research_file_id", None),
+    )
+    self._research_file_activity_lease = activity
+
+  def ensure_research_file_activity(
+    self, workspace_dir: Path, research_file_id: int
+  ) -> bool:
+    activity = self._research_file_activity_lease
+    if activity is None:
+      activity = _RunResearchFileActivityLease()
+      self._research_file_activity_lease = activity
+    return activity.ensure(workspace_dir, research_file_id)
 
   def bind_selected_content_activity_lease(self, lease: Any) -> None:
     self._bind_activity_lease("_selected_content_activity_lease", lease)
@@ -1115,10 +1089,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
 
   def _effective_disallowed_tools(self) -> set[str]:
     return _SDKToolAdmissionSet(
-      list(
-        (set(self._disallowed_tools) - self._active_skill_allow)
-        | self._active_skill_deny
-      ),
+      list(set(self._disallowed_tools) - self._active_skill_allow),
       self,
     )
 
@@ -1323,16 +1294,6 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     self._pending_sdk_load_transcript.clear()
     return True, None
 
-  def _activate_skill_deny(self, tool_names: Any) -> None:
-    if isinstance(tool_names, str):
-      candidates = [tool_names]
-    elif isinstance(tool_names, (list, tuple, set, frozenset)):
-      candidates = list(tool_names)
-    else:
-      return
-    denied = {normalized for name in candidates if (normalized := str(name or "").strip())}
-    self._active_skill_deny = denied
-
   def _activate_skill_allow(self, tool_names: Any) -> None:
     if isinstance(tool_names, str):
       candidates = [tool_names]
@@ -1346,47 +1307,6 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       if (normalized := str(name or "").strip())
     }
 
-  def _activate_skill_report_doors(self, value: Any) -> None:
-    if isinstance(value, dict):
-      self._active_skill_report_doors = {
-        str(tool_name).strip(): str(skill_name).strip()
-        for tool_name, skill_name in value.items()
-        if str(tool_name).strip() and str(skill_name).strip()
-      }
-      return
-    if value is not None:
-      self._active_skill_report_doors = {}
-
-  def _clear_active_skill_if_report_door_completed(
-    self,
-    *,
-    tool_name: str,
-    result: Any,
-    error: Dict[str, Any] | None,
-  ) -> bool:
-    if error is not None:
-      return False
-    normalized_tool_name = str(tool_name or "").strip()
-    expected_skill = self._active_skill_report_doors.get(normalized_tool_name)
-    if not _is_report_door_clear_event(
-      {
-        "type": "tool_call_complete",
-        "tool_name": normalized_tool_name,
-        "result": result,
-        "error": None,
-      },
-      expected_skill=expected_skill,
-      success_statuses=_REPORT_DOOR_CLEAR_SUCCESS_STATUSES,
-    ):
-      return False
-    if current_skill() != expected_skill:
-      return False
-    clear_current_skill()
-    self._active_skill_allow.clear()
-    self._active_skill_deny.clear()
-    self._active_skill_report_doors.clear()
-    return True
-
   def _consume_private_tool_result_fields(self, result: Any, *, tool_name: str | None = None) -> Any:
     if isinstance(result, dict):
       if tool_name == _TRUSTED_SDK_LOAD_TOOLS_ID:
@@ -1397,19 +1317,9 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       # This runtime citation projection is private, so strip it before the
       # result reaches the model or the durable transcript.
       result.pop(_WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY, None)
-      report_doors = result.pop(_ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY, None)
       allowed_tools = result.pop(_ACTIVE_SKILL_ALLOW_RESULT_KEY, None)
-      denied_tools = result.pop(_ACTIVE_SKILL_DENY_RESULT_KEY, None)
       if tool_name == _TRUSTED_SDK_INVOKE_SKILL_ID:
-        self._activate_skill_report_doors(report_doors)
         self._activate_skill_allow(allowed_tools)
-        self._activate_skill_deny(denied_tools)
-      if tool_name is not None:
-        self._clear_active_skill_if_report_door_completed(
-          tool_name=tool_name,
-          result=result,
-          error=None,
-        )
     return result
 
   async def _post_tool_use_hook(
@@ -1444,14 +1354,9 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       and isinstance(result, dict)
       and "_load_servers" in result
     )
-    private_skill_keys = {
-      _ACTIVE_SKILL_ALLOW_RESULT_KEY,
-      _ACTIVE_SKILL_DENY_RESULT_KEY,
-      _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY,
-    }
     had_private_skill_signal = (
       isinstance(result, dict)
-      and bool(private_skill_keys.intersection(result))
+      and _ACTIVE_SKILL_ALLOW_RESULT_KEY in result
     )
     effective_disallowed_before = set(self._effective_disallowed_tools())
     result = self._consume_private_tool_result_fields(result, tool_name=tool_name)
@@ -1936,7 +1841,6 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     self,
     messages: list[dict],
     system_prompt: str | List[tuple[str, bool]] | None = None,
-    max_turns: int | None = None,
   ) -> None:
     if self._summary_emitted:
       raise RuntimeError("AgentSDKRunner is single-use; construct a new runner for subsequent runs")
@@ -2023,8 +1927,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       "continue_conversation": False,
       # Gateway policy owns execution; never load user/project/local hooks.
       "setting_sources": [],
-      "max_turns": max_turns if max_turns is not None else self._max_turns,
-      "max_budget_usd": self._sdk_config.max_budget_usd,
+      # The SDK transport is a primary run: no turn or cost ceiling.
       "disallowed_tools": sorted(self._effective_disallowed_tools()),
       "model": effective_model or None,
       "cwd": str(self._sdk_config.cwd) if self._sdk_config.cwd is not None else None,
@@ -2113,33 +2016,6 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
               outcome="tool_completion_unobserved"
             )
             self._emit_stream_complete()
-          elif result_subtype == "error_max_turns":
-            self._flush_pending_tool_calls(outcome="cancelled")
-            configured_max_turns = options_kwargs.get("max_turns")
-            if isinstance(configured_max_turns, int):
-              self._append({
-                "type": "max_turns_reached",
-                "turn_count": int(_get_attr(message, "num_turns") or 0),
-                "max_turns": configured_max_turns,
-              })
-            self._emit_stream_complete(
-              terminal_disposition="interrupted",
-              reason="max_turns_reached",
-            )
-          elif result_subtype == "error_max_budget_usd":
-            self._flush_pending_tool_calls(outcome="cancelled")
-            configured_max_budget = self._sdk_config.max_budget_usd
-            if isinstance(configured_max_budget, (int, float)):
-              self._append({
-                "type": "budget_exceeded",
-                "total_cost": float(_get_attr(message, "total_cost_usd") or 0.0),
-                "budget": float(configured_max_budget),
-                "reason": "sdk_max_budget_usd",
-              })
-            self._emit_stream_complete(
-              terminal_disposition="interrupted",
-              reason="budget_exceeded",
-            )
           else:
             result_detail = str(
               _get_attr(message, "result")
@@ -2260,8 +2136,6 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       self.release_selected_content_activity_lease_if_owned()
       clear_current_skill()
       self._active_skill_allow.clear()
-      self._active_skill_deny.clear()
-      self._active_skill_report_doors.clear()
       if self._parent_aggregator is None:
         try:
           await self._aggregator.close()

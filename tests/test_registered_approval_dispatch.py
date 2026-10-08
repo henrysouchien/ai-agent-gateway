@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,7 +13,7 @@ from gateway_test_support.host_policy import owner_session_host_policy
 from agent_gateway.approval_route import DurableLocalApprovalRoute
 from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.session import SessionStore
-from agent_gateway import ApprovalDecision, ToolDispatcher
+from agent_gateway import ToolDispatcher
 from agent_gateway.mcp_client import McpClientManager, RegisteredMcpDirectToolCall
 from agent_gateway.single_user_policy import SingleUserApprovalPolicy
 from agent_gateway.tool_definition import LiveToolRouteBinding, OriginatedToolDefinition
@@ -212,10 +212,7 @@ def _local_dispatcher(
   *,
   needs_approval: Any,
   request_approval: Any = None,
-  approved: set[str] | None = None,
-  context_factory: Any = lambda _declaration, _prepared_call: None,
   redaction_context_factory: Any = lambda _declaration: None,
-  overlay: Any = None,
   local_handler: Any = _local_handler,
   dispatcher_cls: type[ToolDispatcher] = ToolDispatcher,
 ) -> ToolDispatcher:
@@ -224,7 +221,6 @@ def _local_dispatcher(
     local_tool_handlers={declaration.identity.logical_name: local_handler},
     needs_approval=needs_approval,
     request_approval=request_approval,
-    approved_tool_types=approved,
     role="owner",
     get_tool_definitions=lambda: [{
       "name": declaration.identity.logical_name,
@@ -233,8 +229,6 @@ def _local_dispatcher(
     tool_registration_catalog=ToolRegistrationCatalog((declaration,), ()),
     tool_policy_implementations=registry,
     redaction_context_factory=redaction_context_factory,
-    approval_predicate_context_factory=context_factory,
-    registered_approval_overlay=overlay,
   )
 
 
@@ -596,11 +590,8 @@ def test_registered_native_mcp_durable_approval_uses_manager_redaction(
       exposed_name: str,
       prepared_call: PreparedToolCall,
       trusted_dispatch_scope: object | None,
-      registered_approval_overlay: (
-        Callable[[ToolRegistrationDeclaration, PreparedToolCall], bool] | None
-      ) = None,
     ) -> RegisteredMcpDirectToolCall:
-      _ = trusted_dispatch_scope, registered_approval_overlay
+      _ = trusted_dispatch_scope
       assert exposed_name == "provider__logical_write"
       return RegisteredMcpDirectToolCall(
         _registered_descriptor(exposed_name, declaration, server),
@@ -643,7 +634,6 @@ def test_registered_native_mcp_durable_approval_uses_manager_redaction(
     redaction_context_factory=lambda _declaration: (_ for _ in ()).throw(
       AssertionError("native MCP approval cannot use dispatcher context")
     ),
-    approval_predicate_context_factory=lambda *_args: None,
   )
   session = SessionStore(ttl=3600).create_session(
     api_key_hash="hash",
@@ -676,7 +666,6 @@ def test_registered_native_mcp_durable_approval_uses_manager_redaction(
 
 
 def test_registered_predicate_uses_prepared_call_and_never_legacy_policy() -> None:
-  context = object()
   predicate_calls: list[Any] = []
   cache_calls: list[Any] = []
 
@@ -700,11 +689,6 @@ def test_registered_predicate_uses_prepared_call_and_never_legacy_policy() -> No
       AssertionError("registered calls cannot consult legacy approval policy")
     ),
     request_approval=lambda _request: None,
-    context_factory=lambda _declaration, prepared: (
-      context
-      if prepared.exact_backend == "sandbox"
-      else (_ for _ in ()).throw(AssertionError("exact backend was lost"))
-    ),
   )
 
   assert dispatcher.requires_approval_prepared(
@@ -716,7 +700,6 @@ def test_registered_predicate_uses_prepared_call_and_never_legacy_policy() -> No
     PreparedToolCall({"write": True}, "sandbox"),
   ) is True
   assert [call.prepared_input["write"] for call in predicate_calls] == [False, True]
-  assert predicate_calls[-1].trusted_context is context
   assert cache_calls[-1].exact_backend == "sandbox"
 
 
@@ -863,77 +846,6 @@ def test_registered_mcp_outcome_resolves_exact_exposed_route_with_same_names() -
   ).outcome == "error_semantic"
 
 
-def test_registered_safe_key_is_the_only_installed_and_reused_cache_key() -> None:
-  approved = {"registered_write"}
-  approval_requests: list[Any] = []
-  cache_calls: list[Any] = []
-
-  def cache_key(_reference: Any, call: Any) -> str:
-    cache_calls.append(call)
-    return "safe:exact-prepared-call"
-
-  async def approve(request: Any) -> ApprovalDecision:
-    approval_requests.append(request)
-    return ApprovalDecision(approved=True, allow_tool_type=True)
-
-  declaration = _declaration(ToolApprovalPolicy(
-    "always",
-    cache_key=_ref("approval_cache_key"),
-  ))
-  dispatcher = _local_dispatcher(
-    declaration,
-    _registry(cache_key=cache_key),
-    needs_approval=lambda *_args: (_ for _ in ()).throw(
-      AssertionError("registered calls cannot consult legacy approval policy")
-    ),
-    request_approval=approve,
-    approved=approved,
-  )
-  prepared = PreparedToolCall({"value": 7}, "sandbox")
-
-  first = asyncio.run(
-    dispatcher.dispatch_prepared("call-1", "registered_write", prepared)
-  )
-  second = asyncio.run(
-    dispatcher.dispatch_prepared("call-2", "registered_write", prepared)
-  )
-
-  assert first == ({"received": {"value": 7}}, None)
-  assert second == first
-  assert len(approval_requests) == 1
-  assert approved == {"registered_write", "safe:exact-prepared-call"}
-  assert all(call.exact_backend == "sandbox" for call in cache_calls)
-
-
-def test_registered_overlay_adds_approval_and_disables_cache_reuse() -> None:
-  approved: set[str] = set()
-  approval_requests: list[Any] = []
-
-  async def approve(request: Any) -> ApprovalDecision:
-    approval_requests.append(request)
-    return ApprovalDecision(approved=True, allow_tool_type=True)
-
-  declaration = _declaration(ToolApprovalPolicy(
-    "always",
-    cache_key=_ref("approval_cache_key"),
-  ))
-  dispatcher = _local_dispatcher(
-    declaration,
-    _registry(),
-    needs_approval=lambda *_args: False,
-    request_approval=approve,
-    approved=approved,
-    overlay=lambda _declaration, _prepared: True,
-  )
-  prepared = PreparedToolCall({"value": 7})
-
-  asyncio.run(dispatcher.dispatch_prepared("call-1", "registered_write", prepared))
-  asyncio.run(dispatcher.dispatch_prepared("call-2", "registered_write", prepared))
-
-  assert len(approval_requests) == 2
-  assert approved == set()
-
-
 def test_registered_never_executes_without_legacy_approval_policy() -> None:
   declaration = _declaration(ToolApprovalPolicy(mode="never"))
   dispatcher = _local_dispatcher(
@@ -954,86 +866,6 @@ def test_registered_never_executes_without_legacy_approval_policy() -> None:
   ))
 
   assert result == ({"received": {"value": 7}}, None)
-
-
-@pytest.mark.parametrize("failure", ("predicate", "cache_key", "overlay"))
-def test_registered_policy_failure_stops_before_approval_and_execution(
-  failure: str,
-) -> None:
-  approval_requests: list[Any] = []
-  handler_calls: list[dict[str, Any]] = []
-
-  def fail(*_args: Any) -> Any:
-    raise RuntimeError("policy unavailable")
-
-  async def approve(request: Any) -> ApprovalDecision:
-    approval_requests.append(request)
-    return ApprovalDecision(approved=True)
-
-  async def handler(tool_input: dict[str, Any], **_kwargs: Any):
-    handler_calls.append(tool_input)
-    return {"received": tool_input}, None
-
-  approval = ToolApprovalPolicy(
-    "predicate" if failure == "predicate" else "always",
-    predicate=(
-      _ref("approval_predicate") if failure == "predicate" else None
-    ),
-    cache_key=_ref("approval_cache_key"),
-  )
-  dispatcher = _local_dispatcher(
-    _declaration(approval),
-    _registry(
-      predicate=fail if failure == "predicate" else (lambda _ref, _call: True),
-      cache_key=fail if failure == "cache_key" else (lambda _ref, _call: "safe"),
-    ),
-    needs_approval=lambda *_args: (_ for _ in ()).throw(
-      AssertionError("registered calls cannot consult legacy approval policy")
-    ),
-    request_approval=approve,
-    overlay=fail if failure == "overlay" else None,
-    local_handler=handler,
-  )
-  prepared = PreparedToolCall({"value": 1})
-
-  assert dispatcher.requires_approval_prepared(
-    "registered_write",
-    prepared,
-  ) is True
-  result, error = asyncio.run(
-    dispatcher.dispatch_prepared("call-1", "registered_write", prepared)
-  )
-
-  assert result is None
-  assert error == {
-    "code": "registered_approval_policy_failed",
-    "message": "Tool 'registered_write' approval policy could not be evaluated.",
-  }
-  assert approval_requests == []
-  assert handler_calls == []
-
-
-def test_catalog_without_registered_approval_runtime_preserves_legacy_policy() -> None:
-  declaration = _declaration(ToolApprovalPolicy(mode="never"))
-  legacy_calls: list[tuple[str, dict[str, Any], str]] = []
-
-  def legacy(tool_name: str, tool_input: dict[str, Any], qualifier: str) -> bool:
-    legacy_calls.append((tool_name, tool_input, qualifier))
-    return True
-
-  dispatcher = _local_dispatcher(
-    declaration,
-    _registry(),
-    needs_approval=legacy,
-    request_approval=lambda _request: None,
-    context_factory=None,
-  )
-
-  assert dispatcher.requires_approval_prepared(
-    "registered_write",
-    PreparedToolCall({"value": 1}),
-  ) is True
-  assert legacy_calls == [("registered_write", {"value": 1}, "")]
 
 
 def test_live_registered_mcp_resolves_its_descriptor_not_its_exposed_name() -> None:
@@ -1080,7 +912,6 @@ def test_live_registered_mcp_resolves_its_descriptor_not_its_exposed_name() -> N
     tool_registration_catalog=catalog,
     tool_policy_implementations=_registry(),
     redaction_context_factory=lambda _declaration: None,
-    approval_predicate_context_factory=lambda _declaration, _prepared: None,
   )
 
   assert dispatcher.requires_approval_prepared(

@@ -20,11 +20,6 @@ from agent_gateway.mcp_activation import (  # noqa: E402
 )
 
 
-CHANNEL_TIERS = {
-  None: {"always": {"portfolio-reads-mcp"}, "defer": {"market-data-mcp"}},
-  "web": {"always": set(), "defer": {"market-data-mcp", "portfolio-reads-mcp"}},
-}
-
 SERVER_CATALOG = {
   "portfolio-reads-mcp": {"tools": ["get_positions", "get_returns"]},
   "market-data-mcp": {"tools": ["screen_stocks", "compare_peers"]},
@@ -44,11 +39,9 @@ class _Profile:
     self.denied_mcp_servers = denied_mcp_servers
 
 
-def _surface(fold, *, profile=None, channel=None, denied=None):
+def _surface(fold, *, profile=None, denied=None):
   return derive_live_surface(
     profile=profile,
-    channel_context=channel,
-    channel_tiers=CHANNEL_TIERS,
     server_catalog=SERVER_CATALOG,
     activation_fold=fold,
     denied_mcp_servers=denied,
@@ -82,22 +75,22 @@ def test_whole_server_activation_is_distinct_from_a_scoped_one() -> None:
   assert fold.granted_tools("market-data-mcp") == frozenset()
 
 
-def test_empty_fold_surface_is_the_tier_always_set_under_the_profile_ceiling() -> None:
+def test_empty_fold_surface_is_every_catalog_server_under_the_profile_ceiling() -> None:
+  # No channel tier withholds a server: both connected servers are live. The
+  # registered ceiling still scopes portfolio-reads; market-data registers no
+  # ceiling and advertises its whole tool list.
   profile = _Profile(core_mcp_tools={"portfolio-reads-mcp": {"get_positions"}})
 
   surface = _surface(McpActivationFold(), profile=profile)
 
-  assert surface.active_servers == frozenset({"portfolio-reads-mcp"})
+  assert surface.active_servers == frozenset(SERVER_CATALOG)
   assert surface.allowed_mcp_tools_by_server == {
     "portfolio-reads-mcp": frozenset({"get_positions"}),
+    "market-data-mcp": frozenset({"screen_stocks", "compare_peers"}),
   }
-  assert surface.deferred_mcp_tools == frozenset(
-    {"get_returns", "screen_stocks", "compare_peers"}
-  )
+  assert surface.deferred_mcp_tools == frozenset({"get_returns"})
   assert surface.deferred_mcp_tool_ids == frozenset({
     "mcp__portfolio-reads-mcp__get_returns",
-    "mcp__market-data-mcp__screen_stocks",
-    "mcp__market-data-mcp__compare_peers",
   })
 
 
@@ -135,7 +128,10 @@ def test_live_surface_detaches_and_freezes_nested_authority_inputs() -> None:
 def test_one_activation_moves_advertised_and_allowed_together() -> None:
   # The desync class: a pack could leave the deferred set while the allowlist
   # never learned the grant. One fold makes the two the same fact.
-  profile = _Profile(core_mcp_tools={"portfolio-reads-mcp": {"get_positions"}})
+  profile = _Profile(core_mcp_tools={
+    "portfolio-reads-mcp": {"get_positions"},
+    "market-data-mcp": set(),
+  })
   fold = McpActivationFold()
   fold.record("market-data-mcp", tools=["screen_stocks"], source="load_tools")
 
@@ -206,4 +202,4 @@ def test_an_unscoped_active_server_defers_nothing() -> None:
   assert surface.allowed_mcp_tools_by_server["portfolio-reads-mcp"] == frozenset(
     {"get_positions", "get_returns"}
   )
-  assert surface.deferred_mcp_tools == frozenset({"screen_stocks", "compare_peers"})
+  assert "get_returns" not in surface.deferred_mcp_tools

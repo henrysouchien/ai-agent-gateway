@@ -72,7 +72,7 @@ class _UnusedMcpSession:
     name: str,
     arguments: dict[str, object],
     *,
-    read_timeout_seconds: float,
+    read_timeout_seconds: float | None,
     meta: dict[str, object] | None = None,
   ) -> McpToolCallResult:
     _ = name, arguments, read_timeout_seconds, meta
@@ -259,7 +259,7 @@ def test_event_only_blocks_stay_in_sse_but_not_normal_tool_next_turn() -> None:
     rate_table_version="unknown",
   )
 
-  _run(runner.run(messages=[{"role": "user", "content": "go"}], system_prompt="x", max_turns=2))
+  _run(runner.run(messages=[{"role": "user", "content": "go"}], system_prompt="x"))
 
   complete_events = [entry.event for entry in event_log.entries if entry.event.get("type") == "tool_call_complete"]
   assert complete_events
@@ -303,7 +303,7 @@ def test_runner_context_uses_trusted_router_provider_not_payload_claim(owner_ses
     rate_table_version="unknown",
   )
 
-  _run(runner.run(messages=[{"role": "user", "content": "go"}], system_prompt="x", max_turns=2))
+  _run(runner.run(messages=[{"role": "user", "content": "go"}], system_prompt="x"))
 
   assert len(contexts) == 1
   assert contexts[0].server == "market-data-mcp"
@@ -332,7 +332,7 @@ def test_event_only_blocks_are_filtered_from_batched_run_agent_next_turn() -> No
     rate_table_version="unknown",
   )
 
-  _run(runner.run(messages=[{"role": "user", "content": "go"}], system_prompt="x", max_turns=2))
+  _run(runner.run(messages=[{"role": "user", "content": "go"}], system_prompt="x"))
 
   complete_events = [entry.event for entry in event_log.entries if entry.event.get("type") == "tool_call_complete"]
   assert len(complete_events) == 2
@@ -382,7 +382,7 @@ def test_event_only_blocks_are_filtered_from_mixed_run_agent_and_normal_tools() 
     rate_table_version="unknown",
   )
 
-  _run(runner.run(messages=[{"role": "user", "content": "go"}], system_prompt="x", max_turns=2))
+  _run(runner.run(messages=[{"role": "user", "content": "go"}], system_prompt="x"))
 
   complete_events = [entry.event for entry in event_log.entries if entry.event.get("type") == "tool_call_complete"]
   assert len(complete_events) == 3
@@ -439,7 +439,7 @@ def test_run_agent_call_index_continues_across_separated_batches() -> None:
     rate_table_version="unknown",
   )
 
-  _run(runner.run(messages=[{"role": "user", "content": "go"}], system_prompt="x", max_turns=2))
+  _run(runner.run(messages=[{"role": "user", "content": "go"}], system_prompt="x"))
 
   assert sorted(tool_calls) == [
     ("lookup", "", 0),

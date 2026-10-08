@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from gateway_test_support.child_task_result import succeeded_child_task_result
 from gateway_test_support.host_policy import owner_session_host_policy
 from gateway_test_support.model_defaults import SESSION_DRIVER, capability_default
 from fastapi.testclient import TestClient
@@ -638,7 +639,7 @@ def test_create_agent_accepts_model_free_credential_material(monkeypatch: pytest
 def test_create_agent_budget_thinking_alias_binds_exact_high_effort() -> None:
   app = create_agent(
     "test",
-    model_key="anthropic.claude-opus-5",
+    model_key="anthropic.claude-opus-5-5",
     effort="high",
     api_key="test-key",
   )
@@ -664,7 +665,7 @@ def test_easy_policy_carries_base_revision_not_caller_choice() -> None:
   from model_authority.current import INITIAL_MODEL_SELECTION_POLICY
 
   entry, policy = _easy_model_selection_policy(
-    model_key="anthropic.claude-haiku-4-5",
+    model_key="anthropic.claude-haiku-5-5",
     effort="none",
   )
 
@@ -684,11 +685,11 @@ def test_easy_policy_carries_base_revision_not_caller_choice() -> None:
 
 
 def test_create_agent_refuses_unsupported_configured_effort() -> None:
-  with pytest.raises(ValueError, match="effort 'high' is not supported"):
+  with pytest.raises(ValueError, match="effort 'none' is not supported"):
     create_agent(
       "test",
-      model_key="anthropic.claude-haiku-4-5",
-      effort="high",
+      model_key="anthropic.claude-opus-5-5",
+      effort="none",
       api_key="test-key",
       max_tokens=1024,
     )
@@ -788,7 +789,7 @@ def test_create_agent_openai_provider_string_uses_openai_defaults() -> None:
   app = create_agent(
     "test",
     provider="openai",
-    model_key="openai.gpt-5-6",
+    model_key="openai.gpt-6-1-sol",
   )
 
   config = app.state.gateway_config
@@ -796,14 +797,14 @@ def test_create_agent_openai_provider_string_uses_openai_defaults() -> None:
   assert _service_auth_config(app) == {
     "max_tokens": 16000,
   }
-  assert _capability_models(app) == {"gpt-5.6"}
+  assert _capability_models(app) == {"gpt-6.1-sol"}
 
 
 def test_create_agent_codex_provider_string_uses_codex_defaults() -> None:
   app = create_agent(
     "test",
     provider="codex",
-    model_key="codex.gpt-5-6-terra",
+    model_key="codex.gpt-6-1-sol",
   )
 
   config = app.state.gateway_config
@@ -811,7 +812,7 @@ def test_create_agent_codex_provider_string_uses_codex_defaults() -> None:
   assert _service_auth_config(app) == {
     "max_tokens": 16000,
   }
-  assert _capability_models(app) == {"gpt-5.6-terra"}
+  assert _capability_models(app) == {"gpt-6.1-sol"}
 
 
 def test_create_agent_xai_provider_string_uses_xai_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -819,7 +820,7 @@ def test_create_agent_xai_provider_string_uses_xai_defaults(monkeypatch: pytest.
   app = create_agent(
     "test",
     provider="xai",
-    model_key="xai.grok-4-5",
+    model_key="xai.grok-4-7",
   )
 
   config = app.state.gateway_config
@@ -832,7 +833,7 @@ def test_create_agent_xai_provider_string_uses_xai_defaults(monkeypatch: pytest.
     "auth_token": "",
     "max_tokens": 16000,
   }
-  assert _capability_models(app) == {"grok-4.5"}
+  assert _capability_models(app) == {"grok-4.7"}
 
 
 def test_create_agent_accepts_provider_instance_when_model_is_explicit() -> None:
@@ -840,7 +841,7 @@ def test_create_agent_accepts_provider_instance_when_model_is_explicit() -> None
   app = create_agent(
     "test",
     provider=provider,
-    model_key="openai.gpt-5-6",
+    model_key="openai.gpt-6-1-sol",
   )
 
   config = app.state.gateway_config
@@ -848,7 +849,7 @@ def test_create_agent_accepts_provider_instance_when_model_is_explicit() -> None
   assert _service_auth_config(app) == {
     "max_tokens": 16000,
   }
-  assert _capability_models(app) == {"gpt-5.6"}
+  assert _capability_models(app) == {"gpt-6.1-sol"}
 
 
 def test_create_agent_provider_instance_must_match_model_key() -> None:
@@ -871,7 +872,7 @@ def test_create_agent_openai_snapshots_env_api_key(monkeypatch: pytest.MonkeyPat
   app = create_agent(
     "test",
     provider="openai",
-    model_key="openai.gpt-5-6",
+    model_key="openai.gpt-6-1-sol",
   )
   assert _service_auth_config(app) == {
     "auth_mode": "api",
@@ -885,7 +886,7 @@ def test_create_agent_openai_uses_explicit_api_key_and_provider_config() -> None
   app = create_agent(
     "test",
     provider="openai",
-    model_key="openai.gpt-5-6",
+    model_key="openai.gpt-6-1-sol",
     api_key="sk-openai",
     auth_token="ignored",
     provider_config={
@@ -907,7 +908,7 @@ def test_create_agent_openai_uses_explicit_auth_token() -> None:
   app = create_agent(
     "test",
     provider="openai",
-    model_key="openai.gpt-5-6",
+    model_key="openai.gpt-6-1-sol",
     auth_token="oat-xxx",
   )
 
@@ -923,7 +924,7 @@ def test_create_agent_codex_uses_explicit_auth_token() -> None:
   app = create_agent(
     "test",
     provider="codex",
-    model_key="codex.gpt-5-6-terra",
+    model_key="codex.gpt-6-1-sol",
     auth_token="oat-codex",
   )
 
@@ -1211,7 +1212,7 @@ def test_create_agent_forwards_skill_state_file(
   assert store.state_file == state_file
 
 
-def test_create_agent_forwards_needs_approval_and_cache_denylist() -> None:
+def test_create_agent_forwards_needs_approval() -> None:
   async def _tool(_tool_input, **_kwargs):
     return {"ok": True}, None
 
@@ -1220,7 +1221,6 @@ def test_create_agent_forwards_needs_approval_and_cache_denylist() -> None:
     api_key="test-key",
     tool_handlers={"execute_trade": _tool},
     needs_approval=lambda name, _tool_input=None, _qualifier="": name == "execute_trade",
-    session_cache_denied_tools=frozenset({"execute_trade"}),
   )
 
   session, runtime = _build_runtime(app)
@@ -1228,7 +1228,6 @@ def test_create_agent_forwards_needs_approval_and_cache_denylist() -> None:
   dispatcher = runner._dispatcher
 
   assert dispatcher._needs_approval("execute_trade", {}, "") is True
-  assert dispatcher._session_cache_denied == frozenset({"execute_trade"})
 
 
 def test_create_agent_skills_dir_does_not_duplicate_user_run_agent_tool_definition(tmp_path: Path) -> None:
@@ -1351,7 +1350,7 @@ Research deeply.
   async def _fake_spawn_sub_agent(task: str, **kwargs):
     captured["task"] = task
     captured.update(kwargs)
-    return {"response": "ok"}, None
+    return succeeded_child_task_result(kwargs), None
 
   runner.spawn_sub_agent = _fake_spawn_sub_agent
 
@@ -1363,7 +1362,7 @@ Research deeply.
   )
 
   assert error is None
-  assert result == {"response": "ok"}
+  assert result == succeeded_child_task_result(captured)
   assert captured["task"] == "Collect"
   execution = captured["capability_execution"]
   assert execution.bind.upstream_model == capability_default("node.explore").upstream_model  # type: ignore[union-attr]
@@ -1376,21 +1375,21 @@ def test_create_agent_rejects_request_model_outside_driver_policy(
   _write_skill(skills_dir, "deep-research", "Research deeply.")
   app = create_agent(
     "test",
-    model_key="anthropic.claude-haiku-4-5",
+    model_key="anthropic.claude-haiku-5-5",
     skills_dir=skills_dir,
   )
 
   with pytest.raises(CapabilityResolutionError) as exc_info:
-    _build_runtime(app, request_model="anthropic.claude-opus-5")
+    _build_runtime(app, request_model="anthropic.claude-opus-5-5")
   assert exc_info.value.to_error() == {
     "error_code": "capability_model_not_allowed",
     "capability_id": "session.driver",
-    "model_key": "anthropic.claude-opus-5",
+    "model_key": "anthropic.claude-opus-5-5",
     "provider": "anthropic",
-    "upstream_model": "claude-opus-5",
+    "upstream_model": "claude-opus-5-5",
     # Typed refusals carry the current eligible stable keys so the caller can
     # recover explicitly (design § Failure and fallback behavior).
-    "eligible_model_keys": ["anthropic.claude-haiku-4-5"],
+    "eligible_model_keys": ["anthropic.claude-haiku-5-5"],
   }
 
 
@@ -1484,14 +1483,8 @@ def test_create_agent_code_execution_wires_hooks_approval_and_expiry_cleanup(tmp
     "tool_result_read",
   }
   assert runner._dispatcher._request_approval is not None
-  assert runner._dispatcher._approved_tool_types is session.approved_tool_types
   assert session.tool_result_spill_sink is runner._spill_dir_provider
   assert session.tool_result_spill_sink.capabilities.spill_read
-  valid_code_execute_input = {"code": "print(1)", "host": "subprocess"}
-  assert runner._dispatcher._should_request_approval("code_execute", valid_code_execute_input, "subprocess") is True
-
-  session.approved_tool_types.add("code_execute:subprocess")
-  assert runner._dispatcher._should_request_approval("code_execute", valid_code_execute_input, "subprocess") is False
 
   ctx = ToolResultContext(
     tool_name="code_execute",
@@ -1535,10 +1528,10 @@ def test_create_agent_code_execution_cleans_up_active_sessions_on_shutdown(tmp_p
 def test_create_agent_model_and_cors_configuration() -> None:
   app = create_agent(
     "test",
-    model_key="anthropic.claude-haiku-4-5",
+    model_key="anthropic.claude-haiku-5-5",
     cors_origins=["https://x.com"],
   )
-  assert _capability_models(app) == {"claude-haiku-4-5"}
+  assert _capability_models(app) == {"claude-haiku-5-5"}
   assert app.state.gateway_config.cors_origins == ["https://x.com"]
 
   empty_cors_app = create_agent("test", cors_origins=[])
@@ -1590,3 +1583,74 @@ def test_create_agent_code_execution_uses_owner_sink_not_ce_bundle_shortcut(
   assert isinstance(sink, SpillSink)
   assert sink.capabilities.code_execute
   assert sink is not getattr(session, "code_execution_work_dir", None)
+
+
+def test_create_agent_first_handle_read_and_root_message(
+  tmp_path: Path,
+) -> None:
+  from agent_gateway.tool_result_spill import write_spill_set
+
+  async def _resolver(_api_key, _init_request):
+    return ResolverResult(
+      user_id="alice",
+      channel="web",
+      risk_user_id=101,
+      role="owner",
+      auth_config=AuthConfig.from_dict({
+        "provider": "anthropic",
+        "billing_mode": "byok",
+        "api_key": "test-key",
+        "max_tokens": 16000,
+      }),
+      credential_principal="service",
+      allow_service_for_interactive=True,
+      model_entitled_capabilities=frozenset({"session.driver"}),
+      model_entitled_keys=frozenset({DEFAULT_MODEL_KEY}),
+    )
+
+  app = create_agent(
+    "test",
+    api_key="test-key",
+    credentials_resolver=_resolver,
+    operation_catalog=_EmptyOperationCatalog(),
+    session_log_base_dir=tmp_path,
+    tool_definitions=[{
+      "name": "file_read",
+      "description": "Read evidence.",
+      "input_schema": {"type": "object"},
+    }],
+  )
+  with TestClient(app) as client:
+    initialized = client.post("/api/chat/init", json={"api_key": "test-key"})
+    assert initialized.status_code == 200
+    session = app.state.auth.verify_token(initialized.json()["session_token"])
+    runtime, _request = _prepare_runtime_for_session(
+      app,
+      session=session,
+      request=ChatRequest.model_validate({
+        "messages": [{"role": "user", "content": "read own evidence"}],
+        "context": {},
+      }),
+    )
+    runner = runtime.build_runner(EventLog(), session.session_id)
+    publication = write_spill_set(
+      sink=session.tool_result_spill_sink,
+      tool_name="file_read",
+      tool_use_id="first",
+      content="first-turn evidence",
+      model_max_chars=16000,
+    )
+    result, error = _run(runner._dispatcher._local["tool_result_read"]({
+      "spill_ref": publication.spill_ref,
+      "member_ref": "file_read_first.txt",
+    }))
+    assert error is None
+    assert result["content"] == "first-turn evidence"
+    result, error = _run(runner._dispatcher._local["send_message"]({
+      "to": session.session_id,
+      "message": "root evidence",
+    }))
+    assert error is None
+    accepted = runner._message_inbox.get_nowait()
+    assert accepted.text == "root evidence"
+    assert accepted.sender_job_id == session.session_id

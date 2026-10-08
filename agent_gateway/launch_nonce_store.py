@@ -23,7 +23,6 @@ from typing import Any, Callable
 
 from .autonomous_launch_envelope import (
   AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE,
-  AUTONOMOUS_CAPABILITY_ENVELOPE_MAX_TTL_SECONDS,
   AutonomousLaunchEnvelope,
 )
 
@@ -34,6 +33,8 @@ LAUNCH_NONCE_STORE_SCHEMA_VERSION = 2
 LAUNCH_NONCE_STORE_BUSY_TIMEOUT_MS = 5_000
 LAUNCH_NONCE_STORE_PAGE_SIZE = 4_096
 LAUNCH_NONCE_STORE_MAX_PAGE_COUNT = 65_536
+# Persisted in the ledger metadata row and exact-compared at
+# ``_validate_schema``; the row count is a health measurement, not a refusal.
 LAUNCH_NONCE_STORE_MAX_ROWS = 100_000
 LAUNCH_NONCE_STORE_CLEANUP_BATCH_SIZE = 512
 
@@ -247,12 +248,6 @@ class LaunchNonceExpired(
     super().__init__(message, code="launch_nonce_expired", transport="conflict")
 
 
-class LaunchNonceStoreCapacityExceeded(
-  LaunchNonceStoreError
-):
-  """The fixed store capacity was reached; the consume failed closed."""
-
-
 class LaunchNonceClockRollback(
   LaunchNonceStoreError
 ):
@@ -449,14 +444,6 @@ class LaunchNonceFacts:
     if expires_at_ns <= issued_at_ns:
       raise ValueError(
         "autonomous admission expiry must follow issuance"
-      )
-    if (
-      expires_at_ns - issued_at_ns
-      > AUTONOMOUS_CAPABILITY_ENVELOPE_MAX_TTL_SECONDS
-      * 1_000_000_000
-    ):
-      raise ValueError(
-        "autonomous admission TTL exceeds the envelope maximum"
       )
 
   @classmethod
@@ -1001,6 +988,30 @@ def _initialize_or_validate_schema(
     raise
 
 
+def launch_nonce_store_path(log_dir: Path) -> Path:
+  """The one ledger file a registry's canonical log directory holds."""
+
+  return log_dir / ".autonomous-admission-ledger.sqlite3"
+
+
+def launch_nonce_store_row_count(path: Path) -> int | None:
+  """Admission rows in the ledger; ``None`` before any launch has prepared it.
+
+  The count is a measurement read by the gateway health surface. Expired rows
+  are deleted on every consume, and the disk bound is ``max_page_count``.
+  """
+
+  if not path.exists():
+    return None
+  connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+  try:
+    return int(connection.execute(
+      "SELECT COUNT(*) FROM ordinary_autonomous_launch_admissions"
+    ).fetchone()[0])
+  finally:
+    connection.close()
+
+
 def prepare_launch_nonce_store(
   path: str | Path,
 ) -> LaunchNonceStoreIdentity:
@@ -1245,16 +1256,6 @@ def consume_launch_nonce(
             "autonomous launch nonce has already been consumed"
           ) from exc
         raise
-      row_count = connection.execute(
-        "SELECT COUNT(*) FROM ordinary_autonomous_launch_admissions"
-      ).fetchone()[0]
-      if (
-        type(row_count) is not int
-        or row_count > LAUNCH_NONCE_STORE_MAX_ROWS
-      ):
-        raise LaunchNonceStoreCapacityExceeded(
-          "launch nonce store reached its fixed row capacity"
-        )
       _verify_identity(expected_identity)
       connection.commit()
       committed = True
@@ -1329,11 +1330,12 @@ __all__ = [
   "LaunchNonceExpired",
   "LaunchNonceFacts",
   "LaunchNonceReplay",
-  "LaunchNonceStoreCapacityExceeded",
   "LaunchNonceStoreError",
   "LaunchNonceStoreIdentity",
   "LaunchNonceStoreIdentityError",
   "LaunchNonceStoreUnavailable",
   "consume_launch_nonce",
+  "launch_nonce_store_path",
+  "launch_nonce_store_row_count",
   "prepare_launch_nonce_store",
 ]

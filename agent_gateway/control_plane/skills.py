@@ -25,8 +25,6 @@ class SkillMetadataResponse(BaseModel):
   required_context: list[str]
   agent_callable: bool
   resumable: bool
-  max_turns: int | None
-  max_budget_usd: float | None
   persist_state: bool
   typed_contract: str | None
   catalog: bool

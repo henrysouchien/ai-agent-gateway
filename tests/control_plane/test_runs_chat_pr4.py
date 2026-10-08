@@ -21,7 +21,6 @@ from model_authority.binding import CredentialHandle
 from model_authority.capabilities import CAPABILITY_IDS
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.control_plane.runs_chat_helpers import _finalize_control_chat_task
-from agent_gateway.control_run_lifecycle import is_control_run_terminal_state
 from agent_gateway.event_log import EventLog
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.runner import AgentRunner
@@ -100,11 +99,10 @@ class _EchoTurnRunner(_TestTurnRunner):
     self,
     messages: list[dict[str, Any]],
     system_prompt: str | list[tuple[str, bool]] | None = None,
-    max_turns: int | None = None,
     *,
     resume_initial_messages: list[dict[str, Any]] | None = None,
   ) -> None:
-    _ = system_prompt, max_turns, resume_initial_messages
+    _ = system_prompt, resume_initial_messages
     last_user = next((message["content"] for message in reversed(messages) if message.get("role") == "user"), "")
     self._log.append({"type": "text_delta", "text": f"echo:{last_user}"})
     self._log.append({
@@ -119,11 +117,10 @@ class _FailingTurnRunner(_TestTurnRunner):
     self,
     messages: list[dict[str, Any]],
     system_prompt: str | list[tuple[str, bool]] | None = None,
-    max_turns: int | None = None,
     *,
     resume_initial_messages: list[dict[str, Any]] | None = None,
   ) -> None:
-    _ = messages, system_prompt, max_turns, resume_initial_messages
+    _ = messages, system_prompt, resume_initial_messages
     raise RuntimeError("provider stream failed")
 
 
@@ -149,11 +146,10 @@ class _HangingTurnRunner(_TestTurnRunner):
     self,
     messages: list[dict[str, Any]],
     system_prompt: str | list[tuple[str, bool]] | None = None,
-    max_turns: int | None = None,
     *,
     resume_initial_messages: list[dict[str, Any]] | None = None,
   ) -> None:
-    _ = messages, system_prompt, max_turns, resume_initial_messages
+    _ = messages, system_prompt, resume_initial_messages
     self.started.set()
     try:
       await asyncio.Event().wait()
@@ -171,11 +167,10 @@ class _StreamingHangingTurnRunner(_HangingTurnRunner):
     self,
     messages: list[dict[str, Any]],
     system_prompt: str | list[tuple[str, bool]] | None = None,
-    max_turns: int | None = None,
     *,
     resume_initial_messages: list[dict[str, Any]] | None = None,
   ) -> None:
-    _ = messages, system_prompt, max_turns, resume_initial_messages
+    _ = messages, system_prompt, resume_initial_messages
     self.started.set()
     self._log.append({"type": "text_delta", "text": "started"})
     try:
@@ -576,7 +571,6 @@ def test_control_chat_dispatch_reuses_immutable_credential_handle(
       "kind": "chat",
       "message": "Start a child chat.",
       "channel": "tui",
-      "max_budget_usd": 5.0,
     },
   )
 
@@ -589,8 +583,6 @@ def test_control_chat_dispatch_reuses_immutable_credential_handle(
   assert chat.session_credential_handle is control.session_credential_handle
   assert chat.tenant_id == control.tenant_id == "test-product"
   assert chat.allow_service_for_interactive is True
-  assert chat.max_budget_usd == 5.0
-  assert response.json()["run"]["max_budget_usd"] == 5.0
 
 
 def test_control_chat_dispatch_rejects_product_dev_mode(
@@ -663,7 +655,7 @@ def test_control_chat_start_and_continuation_bind_requested_model_and_effort() -
         "kind": "chat",
         "message": "Start with the alternate model.",
         "channel": "tui",
-        "model_key": "anthropic.claude-opus-5",
+        "model_key": "anthropic.claude-opus-5-5",
         "catalog_revision": INITIAL_MODEL_REGISTRY.revision,
         "effort": "LOW",
         "skill": "business-model-construction",
@@ -676,7 +668,7 @@ def test_control_chat_start_and_continuation_bind_requested_model_and_effort() -
       headers=_headers(control),
       json={
         "messages": [{"role": "user", "content": "Continue with the default model."}],
-        "model_key": "anthropic.claude-sonnet-5",
+        "model_key": "anthropic.claude-sonnet-5-5",
         "catalog_revision": INITIAL_MODEL_REGISTRY.revision,
         "effort": "none",
         "context": {
@@ -695,7 +687,7 @@ def test_control_chat_start_and_continuation_bind_requested_model_and_effort() -
   continuation_bind = captured_requests[1].capability_bind
   assert start_bind is not None
   assert continuation_bind is not None
-  assert (start_bind.upstream_model, start_bind.effort) == ("claude-opus-5", "low")
+  assert (start_bind.upstream_model, start_bind.effort) == ("claude-opus-5-5", "low")
   assert captured_requests[0].context["stage_skill_route"] == {
     "route_kind": "stage",
     "skill_name": "business-model-construction",
@@ -706,7 +698,7 @@ def test_control_chat_start_and_continuation_bind_requested_model_and_effort() -
     "skill_name": "business-model-construction",
   }
   assert (continuation_bind.upstream_model, continuation_bind.effort) == (
-    "claude-sonnet-5",
+    "claude-sonnet-5-5",
     "none",
   )
 
@@ -835,7 +827,7 @@ def test_capability_refusal_does_not_poison_continuation_dedupe() -> None:
       json={
         "messages": [{"role": "user", "content": "Retry with an approved model."}],
         "request_id": "retry-after-refusal",
-        "model_key": "anthropic.claude-opus-5",
+        "model_key": "anthropic.claude-opus-5-5",
         "catalog_revision": INITIAL_MODEL_REGISTRY.revision,
         "effort": "high",
       },
@@ -854,7 +846,7 @@ def test_capability_refusal_does_not_poison_continuation_dedupe() -> None:
   retried_bind = captured_requests[-1].capability_bind
   assert retried_bind is not None
   assert (retried_bind.upstream_model, retried_bind.effort) == (
-    "claude-opus-5",
+    "claude-opus-5-5",
     "high",
   )
 
@@ -1033,51 +1025,7 @@ def test_chat_interrupted_terminal_projects_interrupted_control_state() -> None:
     assert response.json()["state"] == "interrupted"
 
 
-def test_chat_budget_stop_projects_budget_limited_control_state() -> None:
-  app = _make_app()
-  with TestClient(app) as client:
-    control = _control_session(client, "alice")
-    chat = _chat_session(client, "alice")
-    session = app.state.auth.session_store.get_session(chat["session_id"])
-    assert session is not None
-    session.event_history.append({
-      "type": "budget_exceeded",
-      "total_cost": 0.42,
-      "budget": 0.4,
-      "reason": "sdk_max_budget_usd",
-    })
-    session.event_history.append({
-      "type": "stream_complete",
-      "terminal_disposition": "interrupted",
-      "reason": "budget_exceeded",
-      "usage": {},
-    })
-
-    response = client.get(
-      f"/api/control/runs/{chat['session_id']}",
-      headers=_headers(control),
-    )
-    logs = client.get(
-      f"/api/control/runs/{chat['session_id']}/logs",
-      headers=_headers(control),
-    )
-
-    assert response.status_code == 200, response.text
-    state = response.json()["state"]
-    assert state == "budget_limited"
-    assert is_control_run_terminal_state(state) is True
-    # The wire vocabulary is frozen: only the recorded run state is remapped.
-    assert logs.status_code == 200, logs.text
-    logged = [json.loads(line) for line in logs.json()["log_lines"]]
-    assert [event["type"] for event in logged][-2:] == [
-      "budget_exceeded",
-      "stream_complete",
-    ]
-    assert logged[-1]["reason"] == "budget_exceeded"
-    assert "budget_limited" not in logs.text
-
-
-def test_chat_interrupted_terminal_without_budget_reason_stays_interrupted() -> None:
+def test_chat_interrupted_terminal_stays_interrupted() -> None:
   app = _make_app()
   with TestClient(app) as client:
     control = _control_session(client, "alice")
@@ -1099,7 +1047,7 @@ def test_chat_interrupted_terminal_without_budget_reason_stays_interrupted() -> 
     assert response.json()["state"] == "interrupted"
 
 
-def test_chat_budget_stop_with_channel_error_projects_failed() -> None:
+def test_chat_interrupted_stop_with_channel_error_projects_failed() -> None:
   app = _make_app()
   with TestClient(app) as client:
     control = _control_session(client, "alice")
@@ -1107,17 +1055,10 @@ def test_chat_budget_stop_with_channel_error_projects_failed() -> None:
     session = app.state.auth.session_store.get_session(chat["session_id"])
     assert session is not None
     for event in [
-      {
-        "type": "budget_exceeded",
-        "total_cost": 0.42,
-        "budget": 0.4,
-        "reason": "sdk_max_budget_usd",
-      },
       {"type": "stream_error", "error": "control event channel corrupted"},
       {
         "type": "stream_complete",
         "terminal_disposition": "interrupted",
-        "reason": "budget_exceeded",
         "usage": {},
       },
     ]:
@@ -1315,8 +1256,17 @@ def test_chat_dispatch_uses_canonicalized_dispatch_scope() -> None:
   assert captured_contexts[-1]["portfolio_name"] == "taxable_combined"
 
 
-def test_chat_dispatch_rejects_context_authority_fields() -> None:
-  app = _make_app()
+_SESSION_SCOPE = {
+  "kind": "portfolio",
+  "source": "user_selected",
+  "portfolio_name": "taxable_combined",
+}
+
+
+def test_chat_dispatch_session_scope_and_channel_win_over_client_context() -> None:
+  """Client context is free-form; the session binding owns scope and channel."""
+  captured_contexts: list[dict[str, Any]] = []
+  app = _make_app(captured_contexts)
 
   with TestClient(app) as client:
     control = _control_session(client, "alice")
@@ -1327,15 +1277,26 @@ def test_chat_dispatch_rejects_context_authority_fields() -> None:
         "kind": "chat",
         "message": "Start portfolio chat.",
         "channel": "tui",
-        "context": {"nested": {"portfolioName": "spoofed"}},
+        "dispatch_scope": dict(_SESSION_SCOPE),
+        "context": {
+          "portfolio_name": "spoofed",
+          "channel": "public",
+          "nested": {"portfolioName": "spoofed"},
+        },
       },
     )
 
-  assert response.status_code == 422, response.text
+  assert response.status_code == 200, response.text
+  context = captured_contexts[-1]
+  assert context["portfolio_name"] == "taxable_combined"
+  assert context["channel"] == "tui"
+  assert context["dispatch_scope"]["portfolio_name"] == "taxable_combined"
+  assert context["nested"] == {"portfolioName": "spoofed"}
 
 
-def test_chat_continuation_rejects_context_authority_fields() -> None:
-  app = _make_app()
+def test_chat_continuation_session_scope_wins_over_client_context() -> None:
+  captured_contexts: list[dict[str, Any]] = []
+  app = _make_app(captured_contexts)
 
   with TestClient(app) as client:
     control = _control_session(client, "alice")
@@ -1346,6 +1307,7 @@ def test_chat_continuation_rejects_context_authority_fields() -> None:
         "kind": "chat",
         "message": "Start chat.",
         "channel": "tui",
+        "dispatch_scope": dict(_SESSION_SCOPE),
       },
     )
     assert start.status_code == 200, start.text
@@ -1356,11 +1318,17 @@ def test_chat_continuation_rejects_context_authority_fields() -> None:
       headers=_headers(control),
       json={
         "messages": [{"role": "user", "content": "Continue."}],
-        "context": {"dispatchScope": {"portfolio_name": "spoofed"}},
+        "context": {
+          "portfolio_name": "spoofed",
+          "dispatch_scope": {"portfolio_name": "spoofed"},
+        },
       },
     )
 
-  assert response.status_code == 422, response.text
+  assert response.status_code == 200, response.text
+  context = captured_contexts[-1]
+  assert context["portfolio_name"] == "taxable_combined"
+  assert context["dispatch_scope"]["portfolio_name"] == "taxable_combined"
 
 
 def test_get_run_returns_chat_run_shape_and_404s_unknown_or_cross_user() -> None:
@@ -1410,7 +1378,6 @@ def test_get_run_returns_chat_run_shape_and_404s_unknown_or_cross_user() -> None
       "started_at": payload["started_at"],
       "ended_at": None,
       "cost_usd": 0.09,
-      "max_budget_usd": None,
       "initial_message": "first",
       "skill_run_ids": ["skill-1"],
       "current_verdict": {
@@ -1861,3 +1828,145 @@ def test_expired_session_cannot_start_a_turn_when_its_running_turn_ends_mid_requ
     assert contexts == []
 
   asyncio.run(scenario())
+
+
+def test_admitted_batch_keeps_the_token_valid_but_does_not_admit_a_new_turn_past_the_ttl(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  # A turn's tool dispatched a batch and the turn ended. The batch keeps the
+  # session's token valid for its stages past the TTL; it does not let the
+  # expired session start a fresh turn (audit of b520d1220).
+  import httpx
+
+  async def scenario() -> None:
+    contexts: list[dict[str, Any]] = []
+    app = _make_app(contexts)
+    auth = app.state.auth
+    now = [1_000]
+    monkeypatch.setattr("agent_gateway.session.time.time", lambda: now[0])
+    monkeypatch.setattr("agent_gateway.server_chat_helpers.time.time", lambda: now[0])
+    session = auth.session_store.create_session(
+      api_key_hash="hash",
+      user_id="alice",
+      ttl_seconds=120,
+      tenant_id=_TEST_TENANT_ID,
+      allow_service_for_interactive=True,
+      model_entitled_capabilities=CAPABILITY_IDS,
+      model_entitled_keys=frozenset(INITIAL_MODEL_REGISTRY.models),
+    )
+    session.channel = "tui"
+    token = auth.issue_token(session)
+    session.admitted_batches.add(("alice", 1))
+    now[0] = session.expires_at + 1
+
+    async def post_turn(client: httpx.AsyncClient) -> httpx.Response:
+      return await client.post(
+        "/api/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+          "messages": [{"role": "user", "content": "a new turn after the TTL"}],
+          "context": {"channel": "tui"},
+        },
+      )
+
+    async with httpx.AsyncClient(
+      transport=httpx.ASGITransport(app=app),
+      base_url="http://test",
+    ) as client:
+      assert auth.verify_token(token) is session
+      while_batch_runs = await post_turn(client)
+
+      session.admitted_batches.clear()
+      with pytest.raises(HTTPException) as exc_info:
+        auth.verify_token(token)
+      after_batch = await post_turn(client)
+
+    assert while_batch_runs.status_code == 401, while_batch_runs.text
+    assert while_batch_runs.json()["detail"] == "Session expired"
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "Session expired"
+    assert after_batch.status_code == 401, after_batch.text
+    assert after_batch.json()["detail"] == "Session expired"
+    assert contexts == []
+
+  asyncio.run(scenario())
+
+
+
+class _TrailingRecordTurnRunner(_TestTurnRunner):
+  """Writes a citation record after its terminal, like a late validation."""
+
+  async def run(
+    self,
+    messages: list[dict[str, Any]],
+    system_prompt: str | list[tuple[str, bool]] | None = None,
+    *,
+    resume_initial_messages: list[dict[str, Any]] | None = None,
+  ) -> None:
+    _ = messages, system_prompt, resume_initial_messages
+    self._log.append({"type": "text_delta", "text": "answer"})
+    self._log.append({
+      "type": "stream_complete",
+      "terminal_disposition": "completed",
+      "usage": {},
+    })
+    await asyncio.sleep(0.01)
+    self._log.append({
+      "type": "citation_validation",
+      "schema_version": 1,
+      "turn": 1,
+      "violations": [],
+      "violation_count": 0,
+    })
+
+
+def test_control_chat_record_after_terminal_reaches_transcript(tmp_path: Path) -> None:
+  event_logs: list[EventLog] = []
+
+  async def _build_chat_runtime(
+    session: GatewaySession,
+    request: ChatRequest,
+    channel: str | None,
+    auth_manager: AuthManager | None,
+    *,
+    storage_root: Path | None = None,
+  ) -> ChatRuntime:
+    _ = session, channel, auth_manager, storage_root
+    capability_execution = _bound_capability_execution(request)
+
+    def build_runner(event_log: EventLog, sid: str, started_at: float) -> _TrailingRecordTurnRunner:
+      event_logs.append(event_log)
+      return _TrailingRecordTurnRunner(event_log, sid, started_at, capability_execution)
+
+    return ChatRuntime(
+      system_prompt="system",
+      build_runner=build_runner,
+      capability_execution=capability_execution,
+    )
+
+  app = create_gateway_app(
+    _test_gateway_config(
+      jwt_secret="runs-pr4-test-secret-0123456789x",
+      valid_api_keys={API_KEY},
+      build_chat_runtime=_build_chat_runtime,
+      transcript_dir=tmp_path,
+    )
+  )
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    start = client.post(
+      "/api/control/runs",
+      headers=_headers(control),
+      json={"kind": "chat", "message": "Answer with a citation.", "channel": "tui"},
+    )
+    assert start.status_code == 200, start.text
+    chat_session_id = start.json()["chat_session_id"]
+
+  assert len(event_logs) == 1
+  assert event_logs[0].closed is True
+  transcript_path = tmp_path / f"{chat_session_id}.jsonl"
+  transcript_types = [
+    json.loads(line).get("type")
+    for line in transcript_path.read_text(encoding="utf-8").splitlines()
+  ]
+  assert transcript_types[-2:] == ["stream_complete", "citation_validation"]

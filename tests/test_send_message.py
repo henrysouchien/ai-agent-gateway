@@ -24,15 +24,56 @@ from agent_gateway import (
   TaskRegistry,
   TaskState,
   ToolDispatcher,
-  make_send_message_handler,
-  make_send_message_tool_def,
 )
+from agent_gateway.sub_agent_messages import make_send_message_handler
 from agent_gateway.runner import StreamTurnResult
-import agent_gateway.sub_agent as sub_agent_module
-from agent_gateway.sub_agent import _DEFAULT_EXCLUDED_TOOLS
 from gateway_test_support.capability_execution_test_support import (
   stub_runner_capability_execution,
 )
+from agent_gateway.admission import ParentContext
+from agent_gateway.approval_route import NoApprovalRoute
+from agent_gateway.task_registry import RegistryOwner
+from agent_workflow_contracts.models import AdmittedResearchBinding, AdmittedTenant
+
+
+_TENANT = AdmittedTenant(tenant_id=None, storage_id="alice", role="owner")
+_ROOT_JOB = "sess-root"
+
+
+def _job_context(
+  job_id: str,
+  *,
+  tenant: AdmittedTenant | None = _TENANT,
+  handle_grants: frozenset[str] = frozenset(),
+) -> ParentContext:
+  return ParentContext(
+    tenant=tenant,
+    research_binding=AdmittedResearchBinding(),
+    children=None,
+    tool_ids=None,
+    withheld=frozenset(),
+    handle_grants=handle_grants,
+    remaining_usd=None,
+    job_id=job_id,
+    depth=0 if job_id == _ROOT_JOB else 1,
+    approval_route=NoApprovalRoute(),
+  )
+
+
+def _root_caller() -> ParentContext:
+  return _job_context(_ROOT_JOB)
+
+
+def _root_registry(
+  *,
+  inbox: asyncio.Queue[ParentMessage] | None = None,
+  tenant: AdmittedTenant | None = _TENANT,
+) -> TaskRegistry:
+  return TaskRegistry(owner=RegistryOwner(
+    job_id=_ROOT_JOB,
+    tenant=lambda: tenant,
+    inbox=inbox,
+  ))
 
 
 def _bind_receipt() -> dict[str, str]:
@@ -151,10 +192,10 @@ def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
 
 
 def test_make_send_message_handler_delivers_message_by_task_id() -> None:
-  registry = TaskRegistry()
+  registry = _root_registry()
   entry = registry.register("background_agent", agent_name="writer")
   registry.transition(entry.task_id, TaskState.RUNNING)
-  handler = make_send_message_handler([_RegistryRunner(registry)])
+  handler = make_send_message_handler([_RegistryRunner(registry)], caller=_root_caller)
 
   result, error = _run(handler({"to": entry.task_id, "message": "Check the appendix"}))
 
@@ -168,25 +209,8 @@ def test_make_send_message_handler_delivers_message_by_task_id() -> None:
   assert parent_message.message_id in entry.delivered_messages
 
 
-def test_make_send_message_handler_preserves_sub_agent_export() -> None:
-  assert make_send_message_handler is sub_agent_module.make_send_message_handler
-  registry = TaskRegistry()
-  entry = registry.register("background_agent", agent_name="writer")
-  registry.transition(entry.task_id, TaskState.RUNNING)
-  handler = sub_agent_module.make_send_message_handler([_RegistryRunner(registry)])
-
-  result, error = _run(handler({"to": entry.task_id, "message": "Use direct import"}))
-
-  assert error is None
-  assert result is not None
-  assert result["status"] == "queued"
-  assert result["task_id"] == entry.task_id
-  assert result["message_id"]
-  assert entry.message_inbox.get_nowait().text == "Use direct import"
-
-
 def test_make_send_message_handler_emits_parent_message_sent_with_correlation() -> None:
-  registry = TaskRegistry()
+  registry = _root_registry()
   entry = registry.register("background_agent", agent_name="writer")
   entry.capability_bind_receipt = _bind_receipt()
   entry.metadata.update(
@@ -202,7 +226,7 @@ def test_make_send_message_handler_emits_parent_message_sent_with_correlation() 
   )
   registry.transition(entry.task_id, TaskState.RUNNING)
   runner = _DurableRegistryRunner(registry)
-  handler = make_send_message_handler([runner])
+  handler = make_send_message_handler([runner], caller=_root_caller)
 
   result, error = _run(handler({"to": entry.task_id, "message": "Check the appendix"}))
 
@@ -230,12 +254,12 @@ def test_make_send_message_handler_emits_parent_message_sent_with_correlation() 
 
 
 def test_make_send_message_handler_emits_before_deliver() -> None:
-  registry = TaskRegistry()
+  registry = _root_registry()
   entry = registry.register("background_agent", agent_name="writer")
   registry.transition(entry.task_id, TaskState.RUNNING)
   runner = _DurableRegistryRunner(registry)
   entry.message_inbox = _RecordingQueue(runner.order)
-  handler = make_send_message_handler([runner])
+  handler = make_send_message_handler([runner], caller=_root_caller)
 
   result, error = _run(handler({"to": entry.task_id, "message": "Check ordering"}))
 
@@ -248,7 +272,7 @@ def test_make_send_message_handler_emits_before_deliver() -> None:
 
 
 def test_make_send_message_handler_is_idempotent_for_delivered_message_id() -> None:
-  registry = TaskRegistry()
+  registry = _root_registry()
   entry = registry.register("background_agent", agent_name="writer")
   entry.accepted_parent_messages["msg-existing"] = ParentMessage(
     message_id="msg-existing",
@@ -258,7 +282,7 @@ def test_make_send_message_handler_is_idempotent_for_delivered_message_id() -> N
   entry.delivered_messages.add("msg-existing")
   registry.transition(entry.task_id, TaskState.RUNNING)
   runner = _DurableRegistryRunner(registry)
-  handler = make_send_message_handler([runner])
+  handler = make_send_message_handler([runner], caller=_root_caller)
 
   result, error = _run(handler({"to": entry.task_id, "message": "Replay", "message_id": "msg-existing"}))
 
@@ -274,11 +298,11 @@ def test_make_send_message_handler_is_idempotent_for_delivered_message_id() -> N
 
 def test_send_message_uses_trusted_tool_call_identity_for_terminal_replay() -> None:
   async def _case() -> None:
-    registry = TaskRegistry()
+    registry = _root_registry()
     entry = registry.register("background_agent", agent_name="writer")
     registry.transition(entry.task_id, TaskState.RUNNING)
     runner = _DurableRegistryRunner(registry)
-    handler = make_send_message_handler([runner])
+    handler = make_send_message_handler([runner], caller=_root_caller)
     tool_ctx = SimpleNamespace(tool_call_id="toolu-send-1")
 
     first, first_error = await handler(
@@ -327,7 +351,7 @@ def test_send_message_uses_trusted_tool_call_identity_for_terminal_replay() -> N
 
 def test_send_message_and_completion_lock_order_is_truthful() -> None:
   async def _send_first() -> None:
-    registry = TaskRegistry()
+    registry = _root_registry()
     entry = registry.register("background_agent", agent_name="writer")
     registry.transition(entry.task_id, TaskState.RUNNING)
     runner = _DurableRegistryRunner(registry)
@@ -341,7 +365,7 @@ def test_send_message_and_completion_lock_order_is_truthful() -> None:
       return await original_append(event)
 
     runner._append_durable_event = _blocking_append
-    handler = make_send_message_handler([runner])
+    handler = make_send_message_handler([runner], caller=_root_caller)
     send = asyncio.create_task(handler({
       "to": entry.task_id,
       "message": "Accepted before completion",
@@ -370,11 +394,11 @@ def test_send_message_and_completion_lock_order_is_truthful() -> None:
     assert result is not None and result["status"] == "accepted"
 
   async def _completion_first() -> None:
-    registry = TaskRegistry()
+    registry = _root_registry()
     entry = registry.register("background_agent", agent_name="writer")
     registry.transition(entry.task_id, TaskState.RUNNING)
     runner = _DurableRegistryRunner(registry)
-    handler = make_send_message_handler([runner])
+    handler = make_send_message_handler([runner], caller=_root_caller)
     completion_started = asyncio.Event()
     release_completion = asyncio.Event()
 
@@ -416,7 +440,7 @@ def test_task_registry_rehydrates_acceptance_for_terminal_replay() -> None:
     "call_index": 3,
     "capability_bind": _bind_receipt(),
   }
-  registry = TaskRegistry()
+  registry = _root_registry()
   registry.load_from_events([
     {
       "type": "task_registered",
@@ -460,7 +484,7 @@ def test_task_registry_rehydrates_acceptance_for_terminal_replay() -> None:
     task_id="bg_3",
     sent_seq=2,
   )
-  handler = make_send_message_handler([_RegistryRunner(registry)])
+  handler = make_send_message_handler([_RegistryRunner(registry)], caller=_root_caller)
   result, error = _run(handler({
     "to": "bg_3",
     "message": "Use amended filing",
@@ -487,7 +511,7 @@ def test_task_registry_rejects_duplicate_durable_message_identity() -> None:
     "call_index": 3,
     "capability_bind": _bind_receipt(),
   }
-  registry = TaskRegistry()
+  registry = _root_registry()
   events = [
     {
       "type": "task_registered",
@@ -528,7 +552,6 @@ def test_task_registry_rejects_duplicate_durable_message_identity() -> None:
   "tamper",
   [
     "sub_agent_id",
-    "capability_bind",
     "owner_runner_id",
     "task_type",
   ],
@@ -556,11 +579,6 @@ def test_task_registry_rejects_parent_message_authority_mismatch(
   }
   if tamper == "sub_agent_id":
     sent["sub_agent_id"] = "sub-forged:sess-parent"
-  elif tamper == "capability_bind":
-    sent["capability_bind"] = {
-      **_bind_receipt(),
-      "model": "forged-model",
-    }
   elif tamper == "owner_runner_id":
     sent["owner_runner_id"] = "runner-forged"
   else:
@@ -580,7 +598,7 @@ def test_task_registry_rejects_parent_message_authority_mismatch(
   ]
 
   with pytest.raises(ValueError, match="invalid durable parent-message"):
-    TaskRegistry().load_from_events(events)
+    _root_registry().load_from_events(events)
 
 
 @pytest.mark.parametrize(
@@ -642,7 +660,7 @@ def test_task_registry_rejects_ambiguous_parent_message_lifecycle(
     events = [registration, sent, completion, duplicate]
 
   with pytest.raises(ValueError, match="ambiguous|invalid"):
-    TaskRegistry().load_from_events(events)
+    _root_registry().load_from_events(events)
 
 
 def test_task_registry_rejects_parent_message_after_completion() -> None:
@@ -689,14 +707,14 @@ def test_task_registry_rejects_parent_message_after_completion() -> None:
   ]
 
   with pytest.raises(ValueError, match="invalid durable parent-message"):
-    TaskRegistry().load_from_events(events)
+    _root_registry().load_from_events(events)
 
 
 def test_make_send_message_handler_updates_delivered_messages_after_successful_put() -> None:
-  registry = TaskRegistry()
+  registry = _root_registry()
   entry = registry.register("background_agent", agent_name="writer")
   registry.transition(entry.task_id, TaskState.RUNNING)
-  handler = make_send_message_handler([_RegistryRunner(registry)])
+  handler = make_send_message_handler([_RegistryRunner(registry)], caller=_root_caller)
 
   result, error = _run(handler({"to": entry.task_id, "message": "Track me", "message_id": "msg-new"}))
 
@@ -710,10 +728,10 @@ def test_make_send_message_handler_updates_delivered_messages_after_successful_p
 
 
 def test_make_send_message_handler_replays_exact_id_and_rejects_content_conflict() -> None:
-  registry = TaskRegistry()
+  registry = _root_registry()
   entry = registry.register("background_agent", agent_name="writer")
   registry.transition(entry.task_id, TaskState.RUNNING)
-  handler = make_send_message_handler([_RegistryRunner(registry)])
+  handler = make_send_message_handler([_RegistryRunner(registry)], caller=_root_caller)
   request = {
     "to": entry.task_id,
     "message": "Use the amended filing",
@@ -743,7 +761,7 @@ def test_make_send_message_handler_replays_exact_id_and_rejects_content_conflict
 
 
 def test_make_send_message_handler_preserves_resume_identity_and_content() -> None:
-  registry = TaskRegistry()
+  registry = _root_registry()
   entry = registry.register("background_agent", agent_name="writer")
   registry.transition(entry.task_id, TaskState.RUNNING)
   restored = ParentMessage(
@@ -755,7 +773,7 @@ def test_make_send_message_handler_preserves_resume_identity_and_content() -> No
   )
   entry.accepted_parent_messages[restored.message_id] = restored
   entry.delivered_messages.add(restored.message_id)
-  handler = make_send_message_handler([_RegistryRunner(registry)])
+  handler = make_send_message_handler([_RegistryRunner(registry)], caller=_root_caller)
 
   replay, replay_error = _run(handler({
     "to": entry.task_id,
@@ -789,11 +807,11 @@ def test_make_send_message_handler_preserves_resume_identity_and_content() -> No
 def test_make_send_message_handler_rejects_noncanonical_message_id(
   message_id: object,
 ) -> None:
-  registry = TaskRegistry()
+  registry = _root_registry()
   entry = registry.register("background_agent", agent_name="writer")
   registry.transition(entry.task_id, TaskState.RUNNING)
   runner = _DurableRegistryRunner(registry)
-  handler = make_send_message_handler([runner])
+  handler = make_send_message_handler([runner], caller=_root_caller)
 
   result, error = _run(handler({
     "to": entry.task_id,
@@ -811,12 +829,12 @@ def test_make_send_message_handler_rejects_noncanonical_message_id(
 
 
 def test_make_send_message_handler_does_not_update_delivered_messages_when_put_raises() -> None:
-  registry = TaskRegistry()
+  registry = _root_registry()
   entry = registry.register("background_agent", agent_name="writer")
   entry.message_inbox = _FailingQueue()
   registry.transition(entry.task_id, TaskState.RUNNING)
   runner = _DurableRegistryRunner(registry)
-  handler = make_send_message_handler([runner])
+  handler = make_send_message_handler([runner], caller=_root_caller)
 
   with pytest.raises(RuntimeError, match="queue closed"):
     _run(handler({"to": entry.task_id, "message": "Track me", "message_id": "msg-failed"}))
@@ -827,10 +845,10 @@ def test_make_send_message_handler_does_not_update_delivered_messages_when_put_r
 
 
 def test_make_send_message_handler_delivers_message_by_agent_name() -> None:
-  registry = TaskRegistry()
+  registry = _root_registry()
   entry = registry.register("background_agent", agent_name="writer")
   registry.transition(entry.task_id, TaskState.RUNNING)
-  handler = make_send_message_handler([_RegistryRunner(registry)])
+  handler = make_send_message_handler([_RegistryRunner(registry)], caller=_root_caller)
 
   result, error = _run(handler({"to": "writer", "message": "Focus on the risks"}))
 
@@ -844,14 +862,14 @@ def test_make_send_message_handler_delivers_message_by_agent_name() -> None:
 
 
 def test_make_send_message_handler_returns_ambiguous_target_for_duplicate_names() -> None:
-  registry = TaskRegistry()
+  registry = _root_registry()
   first = registry.register("background_agent", agent_name="writer")
   second = registry.register("background_agent", agent_name="writer")
   first.started_at = 1.0
   second.started_at = 2.0
   registry.transition(first.task_id, TaskState.RUNNING)
   registry.transition(second.task_id, TaskState.RUNNING)
-  handler = make_send_message_handler([_RegistryRunner(registry)])
+  handler = make_send_message_handler([_RegistryRunner(registry)], caller=_root_caller)
 
   result, error = _run(handler({"to": "writer", "message": "Status?"}))
 
@@ -862,20 +880,20 @@ def test_make_send_message_handler_returns_ambiguous_target_for_duplicate_names(
   }
 
 
-def test_make_send_message_handler_returns_not_found_for_unknown_target() -> None:
-  handler = make_send_message_handler([_RegistryRunner(TaskRegistry())])
+def test_make_send_message_handler_returns_not_on_roster_for_unknown_target() -> None:
+  handler = make_send_message_handler([_RegistryRunner(_root_registry())], caller=_root_caller)
 
   result, error = _run(handler({"to": "missing", "message": "Ping"}))
 
   assert result is None
-  assert error == {"code": "not_found", "message": "No running agent: missing"}
+  assert error is not None and error["code"] == "not_on_roster"
 
 
 def test_make_send_message_handler_returns_already_completed_for_terminal_task() -> None:
-  registry = TaskRegistry()
+  registry = _root_registry()
   entry = registry.register("background_agent", agent_name="writer")
   registry.transition(entry.task_id, TaskState.COMPLETED, result={"response": "done"})
-  handler = make_send_message_handler([_RegistryRunner(registry)])
+  handler = make_send_message_handler([_RegistryRunner(registry)], caller=_root_caller)
 
   result, error = _run(handler({"to": entry.task_id, "message": "One more thing"}))
 
@@ -884,7 +902,7 @@ def test_make_send_message_handler_returns_already_completed_for_terminal_task()
 
 
 def test_make_send_message_handler_returns_error_when_runner_not_initialized() -> None:
-  handler = make_send_message_handler([None])
+  handler = make_send_message_handler([None], caller=_root_caller)
 
   result, error = _run(handler({"to": "bg_0", "message": "Ping"}))
 
@@ -893,7 +911,7 @@ def test_make_send_message_handler_returns_error_when_runner_not_initialized() -
 
 
 def test_make_send_message_handler_returns_error_when_registry_not_configured() -> None:
-  handler = make_send_message_handler([object()])
+  handler = make_send_message_handler([object()], caller=_root_caller)
 
   result, error = _run(handler({"to": "bg_0", "message": "Ping"}))
 
@@ -916,31 +934,12 @@ def test_make_send_message_handler_validates_required_fields(
   tool_input: dict[str, Any],
   expected_message: str,
 ) -> None:
-  handler = make_send_message_handler([_RegistryRunner(TaskRegistry())])
+  handler = make_send_message_handler([_RegistryRunner(_root_registry())], caller=_root_caller)
 
   result, error = _run(handler(tool_input))
 
   assert result is None
   assert error == {"code": "invalid_input", "message": expected_message}
-
-
-def test_make_send_message_tool_def_has_expected_schema() -> None:
-  tool_def = make_send_message_tool_def()
-
-  assert tool_def["name"] == "send_message"
-  assert tool_def["input_schema"]["required"] == ["to", "message"]
-  assert set(tool_def["input_schema"]["properties"]) == {"to", "message"}
-  assert tool_def["input_schema"]["properties"]["to"]["description"] == "Task ID (e.g. bg_0) or agent name."
-  assert tool_def["input_schema"]["properties"]["message"]["description"] == "Message content to deliver to the agent."
-
-
-def test_send_message_is_in_default_excluded_tools() -> None:
-  assert _DEFAULT_EXCLUDED_TOOLS == frozenset({
-    "get_agent_result_content",
-    "get_background_result",
-    "run_agent",
-    "send_message",
-  })
 
 
 def test_parent_message_dataclass_round_trips_through_queue() -> None:
@@ -1014,7 +1013,7 @@ def test_run_drains_message_inbox_and_injects_parent_messages_between_turns() ->
 def test_send_message_durable_event_exists_when_queue_put_fails(tmp_path: Path) -> None:
   async def _case() -> None:
     log = AgentSessionLog(path=tmp_path / "sessions" / "send-message-crash-window.jsonl")
-    registry = TaskRegistry()
+    registry = _root_registry()
     entry = registry.register("background_agent", agent_name="writer")
     entry.message_inbox = _FailingQueue()
     registry.transition(entry.task_id, TaskState.RUNNING)
@@ -1035,7 +1034,7 @@ def test_send_message_durable_event_exists_when_queue_put_fails(tmp_path: Path) 
       rate_table_version="unknown",
     )
     runner._runner_id = "runner-test"
-    handler = make_send_message_handler([runner])
+    handler = make_send_message_handler([runner], caller=_root_caller)
 
     with pytest.raises(RuntimeError, match="queue closed"):
       await handler({"to": entry.task_id, "message": "Persist before delivery", "message_id": "msg-crash"})
@@ -1053,7 +1052,7 @@ def test_send_message_durable_event_exists_when_queue_put_fails(tmp_path: Path) 
 def test_send_message_persists_event_and_child_sees_parent_message_envelope(tmp_path: Path) -> None:
   async def _case() -> None:
     log = AgentSessionLog(path=tmp_path / "sessions" / "send-message-to-child.jsonl")
-    registry = TaskRegistry()
+    registry = _root_registry()
     entry = registry.register("background_agent", agent_name="writer")
     entry.metadata["sub_agent_id"] = "sub0:sess-send-message"
     registry.transition(entry.task_id, TaskState.RUNNING)
@@ -1074,7 +1073,7 @@ def test_send_message_persists_event_and_child_sees_parent_message_envelope(tmp_
       rate_table_version="unknown",
     )
     parent_runner._runner_id = "runner-parent"
-    handler = make_send_message_handler([parent_runner])
+    handler = make_send_message_handler([parent_runner], caller=_root_caller)
 
     result, error = await handler({"to": entry.task_id, "message": "Focus on regressions", "message_id": "msg-live"})
 
@@ -1158,3 +1157,211 @@ def test_send_message_persists_event_and_child_sees_parent_message_envelope(tmp_
     assert len(replayed_entries) == 1
 
   _run(_case())
+
+
+_CITED = "sha256:" + "a" * 64
+
+
+def _running_child(registry: TaskRegistry, name: str) -> Any:
+  entry = registry.register("background_agent", agent_name=name)
+  registry.transition(entry.task_id, TaskState.RUNNING)
+  return entry
+
+
+def _child_handler(registry: TaskRegistry, job_id: str, **context: Any):
+  return make_send_message_handler(
+    [_RegistryRunner(registry)],
+    caller=lambda: _job_context(job_id, **context),
+  )
+
+
+def test_sibling_message_is_delivered_as_the_senders_evidence() -> None:
+  registry = _root_registry()
+  sender = _running_child(registry, "reader")
+  recipient = _running_child(registry, "writer")
+
+  result, error = _run(_child_handler(registry, sender.task_id)({
+    "to": recipient.task_id,
+    "message": "Revenue mix is 93/7 in FY2026",
+  }))
+
+  assert error is None
+  assert result is not None and result["task_id"] == recipient.task_id
+  delivered = recipient.message_inbox.get_nowait()
+  assert delivered.sender_job_id == sender.task_id
+  assert delivered.evidence is True
+  assert sender.message_inbox.empty()
+
+
+def test_parent_send_to_its_child_is_a_steer_not_evidence() -> None:
+  registry = _root_registry()
+  child = _running_child(registry, "writer")
+
+  _, error = _run(make_send_message_handler(
+    [_RegistryRunner(registry)],
+    caller=_root_caller,
+  )({"to": child.task_id, "message": "Stop after section 2"}))
+
+  assert error is None
+  assert child.message_inbox.get_nowait().evidence is False
+
+
+def test_child_message_reaches_the_root_jobs_inbox() -> None:
+  inbox: asyncio.Queue[ParentMessage] = asyncio.Queue(maxsize=64)
+  registry = _root_registry(inbox=inbox)
+  child = _running_child(registry, "writer")
+
+  result, error = _run(_child_handler(registry, child.task_id)({
+    "to": _ROOT_JOB,
+    "message": "Found a restatement in Q3",
+  }))
+
+  assert error is None
+  assert result is not None and result["task_id"] == _ROOT_JOB
+  delivered = inbox.get_nowait()
+  assert (delivered.sender_job_id, delivered.evidence) == (child.task_id, True)
+
+
+def test_root_mailbox_full_is_reported_without_dropping() -> None:
+  inbox: asyncio.Queue[ParentMessage] = asyncio.Queue(maxsize=1)
+  registry = _root_registry(inbox=inbox)
+  child = _running_child(registry, "writer")
+  handler = _child_handler(registry, child.task_id)
+
+  _run(handler({"to": _ROOT_JOB, "message": "first"}))
+  result, error = _run(handler({"to": _ROOT_JOB, "message": "second"}))
+
+  assert result is None and error is not None
+  assert error["code"] == "mailbox_full"
+  assert inbox.get_nowait().text == "first"
+
+
+def test_linked_child_registry_puts_grandchildren_on_the_tree_roster() -> None:
+  root = _root_registry()
+  lead = _running_child(root, "lead")
+  worker_sibling = _running_child(root, "other")
+  lead_registry = TaskRegistry(
+    id_prefix="lead",
+    owner=RegistryOwner(
+      job_id=lead.task_id,
+      tenant=lambda: _TENANT,
+      inbox=lead.message_inbox,
+      parent=root,
+    ),
+  )
+  worker = _running_child(lead_registry, "worker")
+
+  # The worker reaches its parent's sibling through the linked registries.
+  _, error = _run(_child_handler(lead_registry, worker.task_id)({
+    "to": worker_sibling.task_id,
+    "message": "question",
+  }))
+  assert error is None
+  assert worker_sibling.message_inbox.get_nowait().sender_job_id == worker.task_id
+  # The root addresses the grandchild without sharing a task dict.
+  _, error = _run(make_send_message_handler(
+    [_RegistryRunner(root)],
+    caller=_root_caller,
+  )({"to": worker.task_id, "message": "go on"}))
+  assert error is None
+  assert worker.task_id not in {entry.task_id for entry in root.list_tasks()}
+  assert worker.message_inbox.get_nowait().evidence is True
+
+
+def test_job_in_another_tree_is_not_on_roster() -> None:
+  mine = _root_registry()
+  sender = _running_child(mine, "reader")
+  other = TaskRegistry(
+    id_prefix="other",
+    owner=RegistryOwner(job_id="sess-other", tenant=lambda: _TENANT),
+  )
+  stranger = _running_child(other, "writer")
+
+  result, error = _run(_child_handler(mine, sender.task_id)({
+    "to": stranger.task_id,
+    "message": "hello",
+  }))
+
+  assert result is None and error is not None
+  assert error["code"] == "not_on_roster"
+  assert stranger.message_inbox.empty()
+
+
+def test_sender_of_another_tenant_is_refused_by_admission() -> None:
+  registry = _root_registry()
+  recipient = _running_child(registry, "writer")
+  intruder = AdmittedTenant(tenant_id=None, storage_id="mallory", role="owner")
+
+  result, error = _run(_child_handler(registry, "bg_x", tenant=intruder)({
+    "to": recipient.task_id,
+    "message": "hello",
+  }))
+
+  assert result is None and error is not None
+  assert error["code"] == "tenant_mismatch"
+  assert recipient.message_inbox.empty()
+
+
+def test_sender_cannot_cite_a_handle_it_does_not_hold() -> None:
+  registry = _root_registry()
+  sender = _running_child(registry, "reader")
+  recipient = _running_child(registry, "writer")
+
+  result, error = _run(_child_handler(registry, sender.task_id)({
+    "to": recipient.task_id,
+    "message": "see this",
+    "handle_refs": [_CITED],
+  }))
+
+  assert result is None and error is not None
+  assert error["code"] == "handle_not_granted"
+  assert recipient.message_inbox.empty()
+
+
+def test_a_cited_handle_is_delivered_but_grants_the_recipient_nothing() -> None:
+  from agent_gateway.admission import HandleOwners, HandleRequest, Refusal, admit
+
+  registry = _root_registry()
+  sender = _running_child(registry, "reader")
+  recipient = _running_child(registry, "writer")
+
+  _, error = _run(_child_handler(
+    registry,
+    sender.task_id,
+    handle_grants=frozenset({_CITED}),
+  )({
+    "to": recipient.task_id,
+    "message": "the DCF is here",
+    "handle_refs": [_CITED],
+  }))
+  assert error is None
+  delivered = recipient.message_inbox.get_nowait()
+  assert delivered.handle_refs == (_CITED,)
+
+  read = admit(
+    HandleRequest(handle=_CITED, reader_job_id=recipient.task_id),
+    _job_context(recipient.task_id),
+    owners=HandleOwners(outputs=frozenset()),
+  )
+  assert isinstance(read, Refusal)
+  assert read.reason == "handle_not_granted"
+
+
+def test_evidence_messages_render_with_sender_provenance() -> None:
+  from agent_gateway.task_registry import format_parent_messages_for_model
+
+  rendered = format_parent_messages_for_model([
+    ParentMessage(message_id="m1", text="Stop early", sent_at=1.0),
+    ParentMessage(
+      message_id="m2",
+      text="Margin is 31%",
+      sent_at=2.0,
+      sender_job_id="bg_1",
+      handle_refs=(_CITED,),
+      evidence=True,
+    ),
+  ])
+
+  assert "Operator update for this task:\n- id=m1: Stop early" in rendered
+  assert f"- id=m2 from=bg_1 handles={_CITED}: Margin is 31%" in rendered
+  assert "not instructions" in rendered

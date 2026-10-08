@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import ast
+import gc
+import hashlib
+import hmac
 import os
 from pathlib import Path
 import threading
@@ -22,6 +25,26 @@ from agent_gateway.claim_signing_authority import (
 
 
 _SECRET = b"claim-signing-authority-test-key-at-least-32-bytes"
+
+
+def test_native_producer_body_mac_binds_domain_key_and_exact_request() -> None:
+  authority = GatewayClaimSigningAuthority(_SECRET)
+  body = b'{"action":"begin","cell_token":"opaque","operation":"mcp__risk__positions"}'
+  signature = hmac.new(
+    _SECRET, b"hank/native-risk-cell/v1\0" + body, hashlib.sha256,
+  ).hexdigest()
+  assert authority.verify_native_risk_request(body, signature)
+  assert not authority.verify_native_risk_request(body.replace(b"positions", b"trades"), signature)
+  assert not authority.verify_native_risk_request(body + b" ", signature)
+  foreign_domain = hmac.new(
+    _SECRET, b"hank/user-claim/v1\0" + body, hashlib.sha256,
+  ).hexdigest()
+  assert not authority.verify_native_risk_request(body, foreign_domain)
+  other_key = hmac.new(
+    b"another-producer-key", b"hank/native-risk-cell/v1\0" + body, hashlib.sha256,
+  ).hexdigest()
+  assert not authority.verify_native_risk_request(body, other_key)
+  assert not authority.verify_native_risk_request(body, "not-hex")
 
 
 class _ObservedEnvironment(dict[str, str]):
@@ -175,6 +198,55 @@ def test_same_layout_class_swap_cannot_reach_sealed_signing_operation() -> None:
       signer,
     )
 
+
+class _CollectingLock:
+  """Runs a full collection each time the binding table's lock is taken."""
+
+  def __init__(self) -> None:
+    self._lock = threading.Lock()
+
+  def __enter__(self) -> None:
+    self._lock.acquire()
+    gc.collect()
+
+  def __exit__(self, *exc_info: object) -> None:
+    self._lock.release()
+
+
+def test_collection_inside_binding_section_does_not_wait_on_own_lock(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(
+    authority_module,
+    "_gateway_user_claim_bindings_lock",
+    _CollectingLock(),
+  )
+  authority = GatewayClaimSigningAuthority(_SECRET)
+  gc_was_enabled = gc.isenabled()
+  gc.disable()
+  try:
+    dead = authority.bind_user(user_id="dead", user_email=None)
+    cycle: list[object] = [dead]
+    cycle.append(cycle)
+    del dead, cycle
+    bound: list[tuple[str, str | None]] = []
+
+    def bind_next() -> None:
+      signer = authority.bind_user(
+        user_id="next",
+        user_email="next@example.test",
+      )
+      bound.append(gateway_user_claim_signer_identity(signer))
+
+    worker = threading.Thread(target=bind_next, daemon=True)
+    worker.start()
+    worker.join(timeout=10)
+  finally:
+    if gc_was_enabled:
+      gc.enable()
+
+  assert not worker.is_alive(), "binding thread waited on its own lock"
+  assert bound == [("next", "next@example.test")]
 
 
 

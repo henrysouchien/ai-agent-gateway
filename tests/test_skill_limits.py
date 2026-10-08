@@ -29,39 +29,28 @@ from agent_gateway.skill_limits import (  # noqa: E402
 
 
 def _limits() -> SkillExecutionLimits:
-  return SkillExecutionLimits(20, 32_000, 20)
+  return SkillExecutionLimits(32_000)
 
 
-def test_limits_are_exact_frozen_normalized_values() -> None:
+def test_limits_are_exact_frozen_values() -> None:
   limits = _limits()
 
-  assert limits == SkillExecutionLimits(
-    max_turns=20,
-    max_tokens=32_000,
-    max_budget_usd=20.0,
-  )
-  assert type(limits.max_budget_usd) is float
+  assert limits == SkillExecutionLimits(max_tokens=32_000)
+  assert [field.name for field in dataclasses.fields(limits)] == ["max_tokens"]
   with pytest.raises(dataclasses.FrozenInstanceError):
-    limits.max_turns = 21  # type: ignore[misc]
+    limits.max_tokens = 21  # type: ignore[misc]
 
 
-@pytest.mark.parametrize("field", ["max_turns", "max_tokens"])
 @pytest.mark.parametrize("value", [True, False, 0, -1, 1.0, "1"])
-def test_limits_reject_invalid_integer_values(field: str, value: object) -> None:
-  payload = {"max_turns": 1, "max_tokens": 1, "max_budget_usd": 1.0}
-  payload[field] = value
+def test_limits_reject_invalid_max_tokens(value: object) -> None:
   with pytest.raises((TypeError, ValueError)):
-    SkillExecutionLimits(**payload)
+    SkillExecutionLimits(value)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize(
-  "value",
-  [True, False, 0, -1, 10**10_000, float("nan"), float("inf"), "1"],
-  ids=["true", "false", "zero", "negative", "huge-int", "nan", "inf", "string"],
-)
-def test_limits_reject_invalid_budget_values(value: object) -> None:
-  with pytest.raises((TypeError, ValueError)):
-    SkillExecutionLimits(1, 1, value)  # type: ignore[arg-type]
+@pytest.mark.parametrize("field", ["max_turns", "max_budget_usd"])
+def test_limits_carry_no_turn_or_cost_ceiling(field: str) -> None:
+  with pytest.raises(TypeError):
+    SkillExecutionLimits(**{"max_tokens": 1, field: 1})
 
 
 def test_closed_codecs_round_trip_fresh_mappings() -> None:
@@ -73,11 +62,20 @@ def test_closed_codecs_round_trip_fresh_mappings() -> None:
   active_payload = active_skill_admission_to_mapping(active)
   policy_payload = autonomous_skill_admission_policy_to_mapping(policy)
 
+  assert limits_payload == {"max_tokens": 32_000}
   assert skill_execution_limits_from_mapping(limits_payload) == limits
   assert active_skill_admission_from_mapping(active_payload) == active
   assert autonomous_skill_admission_policy_from_mapping(policy_payload) == policy
-  limits_payload["max_turns"] = 99
-  assert limits.max_turns == 20
+  limits_payload["max_tokens"] = 99
+  assert limits.max_tokens == 32_000
+
+
+def test_limits_codec_reads_legacy_record_and_drops_its_ceilings() -> None:
+  assert skill_execution_limits_from_mapping({
+    "max_turns": 20,
+    "max_tokens": 32_000,
+    "max_budget_usd": 20.0,
+  }) == SkillExecutionLimits(32_000)
 
 
 @pytest.mark.parametrize(
@@ -85,6 +83,7 @@ def test_closed_codecs_round_trip_fresh_mappings() -> None:
   [
     {},
     {"max_turns": None, "max_tokens": None},
+    {"max_tokens": None, "extra": None},
     {
       "max_turns": None,
       "max_tokens": None,
@@ -118,7 +117,7 @@ def test_active_admission_requires_exact_nested_type_and_canonical_name() -> Non
     ActiveSkillAdmission(" quant-research", _limits())
 
 
-def test_reconciliation_accepts_named_inline_equality_and_refuses_mismatch() -> None:
+def test_reconciliation_keeps_the_active_admission_on_mismatch() -> None:
   active = ActiveSkillAdmission("quant-research", _limits())
 
   assert reconcile_skill_admission(
@@ -131,12 +130,11 @@ def test_reconciliation_accepts_named_inline_equality_and_refuses_mismatch() -> 
     execution_limits=None,
     active_admission=active,
   ) is active
-  with pytest.raises(ValueError, match="do not match"):
-    reconcile_skill_admission(
-      skill_name="market-scan",
-      execution_limits=_limits(),
-      active_admission=active,
-    )
+  assert reconcile_skill_admission(
+    skill_name="market-scan",
+    execution_limits=_limits(),
+    active_admission=active,
+  ) is active
   with pytest.raises(TypeError):
     reconcile_skill_admission(
       skill_name="quant-research",
@@ -208,7 +206,7 @@ def test_skill_limits_leaf_is_importable_from_built_wheel(tmp_path: Path) -> Non
       (
         "from agent_gateway.skill_limits import "
         "SkillExecutionLimits; "
-        "print(SkillExecutionLimits(1, 2, 3).max_budget_usd)"
+        "print(SkillExecutionLimits(3).max_tokens)"
       ),
     ],
     cwd=installed,
@@ -217,4 +215,4 @@ def test_skill_limits_leaf_is_importable_from_built_wheel(tmp_path: Path) -> Non
     capture_output=True,
     text=True,
   )
-  assert result.stdout.strip() == "3.0"
+  assert result.stdout.strip() == "3"

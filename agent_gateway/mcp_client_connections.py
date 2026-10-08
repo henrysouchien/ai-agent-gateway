@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import os
 import threading
 from concurrent import futures
@@ -11,6 +12,9 @@ from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 
 from anyio import EndOfStream
 from mcp.types import PaginatedRequestParams
+
+
+log = logging.getLogger("agent_gateway.mcp_client")
 
 
 class _StdioReadStream:
@@ -93,7 +97,7 @@ class McpClientSession(Protocol):
     name: str,
     arguments: dict[str, object],
     *,
-    read_timeout_seconds: float,
+    read_timeout_seconds: float | None,
     meta: dict[str, object] | None = None,
   ) -> McpToolCallResult: ...
 
@@ -465,14 +469,23 @@ async def connect_streamable_http(
     headers_raw = config.get("headers")
     headers = runtime.build_http_headers(headers_raw if isinstance(headers_raw, dict) else None)
     timeout_seconds = float(config.get("timeout", manager._startup_timeout))
-    sse_read_timeout_seconds = float(config.get("sse_read_timeout", 300))
+    # GP19/GA-N2: no clock may end an in-flight call, transport included; the
+    # configured seconds are an expectation logged once when exceeded, and the
+    # SDK read_timeout is None at dispatch. Connect/write/pool keep the clock:
+    # a response that never starts is a connection, not a slow call.
+    sse_read_expected_seconds = float(config.get("sse_read_timeout", 300))
     terminate_on_close = bool(config.get("terminate_on_close", True))
     tool_prefix = str(config.get("tool_prefix", "") or "").strip()
     auth = manager._build_http_auth(name, url, config)
 
+    log.info(
+      "streamable-http for %s: no socket-read deadline; read expectation %gs",
+      name,
+      sse_read_expected_seconds,
+    )
     http_client = runtime.httpx_module.AsyncClient(
       headers=headers,
-      timeout=runtime.httpx_module.Timeout(timeout_seconds, read=sse_read_timeout_seconds),
+      timeout=runtime.httpx_module.Timeout(timeout_seconds, read=None),
       auth=auth,
     )
     await http_client.__aenter__()
@@ -593,7 +606,29 @@ async def initialize_session_state(
     tools = [tool for tool in tools if str(tool.name) in allowed_names]
 
   tool_definitions: list[dict[str, Any]] = []
+  code_dispositions: dict[str, str | None] = {}
   for tool in tools:
+    meta = tool.meta or {}
+    disposition: str | None = None
+    served_disposition = meta.get("hank/code-disposition")
+    reason = meta.get("hank/code-reason")
+    if "hank/code-disposition" in meta or "hank/code-reason" in meta:
+      if (
+        not isinstance(served_disposition, str)
+        or served_disposition not in {
+          "pure_local", "read_composable", "artifact_composable",
+          "tool_only", "internal_only", "unclassified",
+        }
+        or not isinstance(reason, str)
+        or not reason.strip()
+      ):
+        runtime.logger.warning(
+          "Malformed code disposition for MCP tool %s/%s; retaining existing policy coverage",
+          name, tool.name,
+        )
+      elif served_disposition != "unclassified":
+        disposition = served_disposition
+    code_dispositions[tool.name] = disposition
     input_schema = tool.input_schema or {"type": "object", "properties": {}}
     tool_definitions.append(
       {
@@ -611,6 +646,7 @@ async def initialize_session_state(
     tool_names={tool["name"] for tool in tool_definitions},
     exported_tool_names=frozenset(advertised_names),
     tool_metadata=tool_metadata,
+    code_dispositions=code_dispositions,
     tool_prefix=tool_prefix,
   )
 

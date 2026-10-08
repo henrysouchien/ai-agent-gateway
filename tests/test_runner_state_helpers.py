@@ -12,46 +12,12 @@ from agent_gateway import SubAgentConfig as PackageSubAgentConfig, ToolResultCon
 import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.runner_state import (  # noqa: E402
   BackgroundTask,
-  admit_provider_request_budget,
   budget_cost_progress,
-  budget_exceeded_state,
-  ChildCostAccumulator,
   CostAccumulator,
   StreamTurnResult,
   SubAgentConfig,
   ToolResultContext,
-  budget_reason_suffix,
 )
-from agent_gateway.runner_budget import (  # noqa: E402
-  ObservationOnlyCostAccumulator,
-  ProviderRequestBudgetError,
-)
-from agent_gateway.providers.anthropic import AnthropicProvider  # noqa: E402
-
-
-class _LinearCostProvider:
-  @staticmethod
-  def estimate_cost(
-    _model: str,
-    input_tokens: int,
-    output_tokens: int,
-    cache_read_tokens: int = 0,
-    cache_creation_tokens: int = 0,
-    **_kwargs: object,
-  ) -> object:
-    return type(
-      "Estimate",
-      (),
-      {
-        "total": (
-          input_tokens
-          + cache_read_tokens
-          + cache_creation_tokens
-          + output_tokens
-        )
-        / 1000.0
-      },
-    )()
 
 
 def test_runner_preserves_state_helper_aliases() -> None:
@@ -62,9 +28,7 @@ def test_runner_preserves_state_helper_aliases() -> None:
   assert gateway_runner.StreamTurnResult is StreamTurnResult
   assert gateway_runner.BackgroundTask is BackgroundTask
   assert gateway_runner.CostAccumulator is CostAccumulator
-  assert gateway_runner.ChildCostAccumulator is ChildCostAccumulator
   assert gateway_runner._budget_cost_progress is budget_cost_progress
-  assert gateway_runner._budget_exceeded_state is budget_exceeded_state
 
 
 def test_tool_result_context_defaults_are_optional() -> None:
@@ -126,253 +90,36 @@ def test_background_task_defaults_are_incomplete_without_payloads() -> None:
   assert task.completed_at is None
 
 
-def test_child_cost_accumulator_forwards_parent_spend_and_reports_child_limit() -> None:
-  parent = CostAccumulator(10.0)
-  child = ChildCostAccumulator(parent, 3.0)
-
-  child.add(3.5)
-
-  assert child.total == 3.5
-  assert parent.total == 3.5
-  assert child.exceeded is True
-  assert child.exceeded_reason == "child_budget"
-  assert child.effective_total == 3.5
-  assert child.effective_budget == 3.0
-  assert budget_reason_suffix(child.exceeded_reason) == " (child budget)"
-  state = budget_exceeded_state(child)
-  assert state is not None
-  assert state.total_cost == 3.5
-  assert state.budget == 3.0
-  assert state.reason == "child_budget"
-  assert state.reason_suffix == " (child budget)"
-
-
-def test_child_cost_accumulator_reports_parent_limit() -> None:
-  parent = CostAccumulator(4.0)
-  child = ChildCostAccumulator(parent, 10.0)
-
-  child.add(4.5)
-
-  assert parent.exceeded is True
-  assert child.exceeded is True
-  assert child.exceeded_reason == "parent_budget"
-  assert child.effective_total == 4.5
-  assert child.effective_budget == 4.0
-  assert budget_reason_suffix(child.exceeded_reason) == " (parent budget)"
-  assert budget_reason_suffix(None) == ""
-  state = budget_exceeded_state(child)
-  assert state is not None
-  assert state.total_cost == 4.5
-  assert state.budget == 4.0
-  assert state.reason == "parent_budget"
-  assert state.reason_suffix == " (parent budget)"
-
-
-def test_observation_only_cost_accumulator_records_without_enforcing() -> None:
-  accumulator = ObservationOnlyCostAccumulator(1.0)
+def test_cost_accumulator_records_without_enforcing() -> None:
+  accumulator = CostAccumulator(1.0)
 
   accumulator.add(2.5)
 
   assert accumulator.total == 2.5
-  assert accumulator.budget is None
   assert accumulator.observation_threshold_usd == 1.0
   assert accumulator.observation_threshold_crossed is True
-  assert accumulator.exceeded is False
-  assert accumulator.exceeded_reason is None
-  assert budget_exceeded_state(accumulator) is None
 
-  unestimated = ObservationOnlyCostAccumulator()
-  progress = budget_cost_progress(
+  unestimated = CostAccumulator()
+  budget_cost_progress(
     unestimated,
     running_total=3.0,
     last_reported_cost=0.0,
   )
   assert unestimated.total == 3.0
-  assert unestimated.budget is None
   assert unestimated.observation_threshold_usd is None
   assert unestimated.observation_threshold_crossed is False
-  assert unestimated.exceeded is False
-  assert progress.exceeded_state is None
-  assert budget_exceeded_state(unestimated) is None
-
-
-def test_cost_observation_threshold_never_gates_provider_admission() -> None:
-  class Provider:
-    @staticmethod
-    def estimate_cost(*_args, **_kwargs):
-      return type("Estimate", (), {"total": 100.0})()
-
-  accumulator = ObservationOnlyCostAccumulator(0.5)
-  accumulator.add(2.0)
-  admission = admit_provider_request_budget(
-    accumulator,
-    provider=Provider(),
-    model="test-model",
-    estimated_input_tokens=1_000,
-    cached_input_tokens=0,
-    requested_max_output_tokens=8_000,
-  )
-
-  assert accumulator.observation_threshold_crossed is True
-  assert admission.max_output_tokens == 8_000
-  assert admission.denied_state is None
-
-
-def test_child_provider_admission_uses_budget_over_observation_parent() -> None:
-  observation = ObservationOnlyCostAccumulator(2.0)
-  observation.add(100.0)
-  child = ChildCostAccumulator(observation, 0.06)
-
-  admission = admit_provider_request_budget(
-    child,
-    provider=_LinearCostProvider(),
-    model="test-model",
-    estimated_input_tokens=10,
-    cached_input_tokens=0,
-    requested_max_output_tokens=100,
-  )
-
-  assert admission.denied_state is None
-  assert admission.max_output_tokens == 50
-  assert admission.remaining_budget == pytest.approx(0.06)
-
-
-def test_child_provider_admission_uses_smaller_real_parent_budget() -> None:
-  child = ChildCostAccumulator(CostAccumulator(0.03), 0.10)
-
-  admission = admit_provider_request_budget(
-    child,
-    provider=_LinearCostProvider(),
-    model="test-model",
-    estimated_input_tokens=10,
-    cached_input_tokens=0,
-    requested_max_output_tokens=100,
-  )
-
-  assert admission.denied_state is None
-  assert admission.max_output_tokens == 20
-  assert admission.remaining_budget == pytest.approx(0.03)
-
-
-def test_child_keeps_its_turn_while_its_declared_budget_holds_spend() -> None:
-  # R2, 2026-09-17: a sniff-test child holding 83% of its $2.00 cap was
-  # refused its next turn because the prompt was priced at the uncached
-  # worst case on a byte-derived token bound (~4x the real token count).
-  # Priced as the provider bills it — the prefix it reported caching at the
-  # cache-read rate, the appended tool results uncached — the turn fits.
-  child = ChildCostAccumulator(None, 2.0)
-  child.add(0.3438)
-
-  admission = admit_provider_request_budget(
-    child,
-    provider=AnthropicProvider(),
-    model="claude-opus-5",
-    estimated_input_tokens=144_200,
-    cached_input_tokens=143_000,
-    requested_max_output_tokens=32_000,
-  )
-
-  assert admission.denied_state is None
-  assert admission.max_output_tokens == 32_000
-
-
-def test_cold_request_cannot_be_admitted_above_the_remaining_budget() -> None:
-  # Pricing every prompt as a cache read admitted a cold 400k-token request
-  # against $0.50 of budget and billed it at $2.00 of input
-  # (.git/codex-commit-audits/9dbe499838fa377b2b10fab8a45f7fc1478e698f.md P1).
-  # Nothing has been cached yet on a run's first request.
-  admission = admit_provider_request_budget(
-    CostAccumulator(0.50),
-    provider=AnthropicProvider(),
-    model="claude-opus-5",
-    estimated_input_tokens=400_000,
-    cached_input_tokens=0,
-    requested_max_output_tokens=32_000,
-  )
-
-  assert admission.max_output_tokens is None
-  assert admission.denied_state is not None
-  assert admission.projected_max_cost > 0.50
-
-
-def test_provider_admission_denial_reports_the_total_it_cannot_avoid() -> None:
-  # The denial reports observed spend plus the cheapest form of the request
-  # that cannot be funded: reporting the cap claimed a spend that never
-  # happened, and reporting bare spend rendered "$0.0800 >= $0.1000".
-  child = ChildCostAccumulator(None, 0.10)
-  child.add(0.08)
-
-  admission = admit_provider_request_budget(
-    child,
-    provider=_LinearCostProvider(),
-    model="test-model",
-    estimated_input_tokens=100,
-    cached_input_tokens=0,
-    requested_max_output_tokens=100,
-  )
-
-  assert admission.max_output_tokens is None
-  assert admission.denied_state is not None
-  assert admission.denied_state.total_cost == pytest.approx(0.08 + 0.101)
-  assert admission.denied_state.total_cost > admission.denied_state.budget
-  assert admission.denied_state.budget == pytest.approx(0.10)
-  assert admission.denied_state.reason == "child_budget"
-
-
-@pytest.mark.parametrize(
-  "budget,total",
-  [(None, 0.0), (1.0, float("nan")), (True, 0.0), (1.0, -1.0)],
-)
-def test_child_provider_admission_fails_closed_for_malformed_parent(
-  budget: object,
-  total: object,
-) -> None:
-  malformed_parent = type(
-    "MalformedParent",
-    (),
-    {"budget": budget, "total": total},
-  )()
-  child = ChildCostAccumulator(None, 1.0)
-  child._parent = malformed_parent  # type: ignore[assignment]
-
-  with pytest.raises(
-    ProviderRequestBudgetError,
-    match="provider request budget authority is invalid",
-  ):
-    admit_provider_request_budget(
-      child,
-      provider=_LinearCostProvider(),
-      model="test-model",
-      estimated_input_tokens=10,
-      cached_input_tokens=0,
-      requested_max_output_tokens=100,
-    )
 
 
 @pytest.mark.parametrize("value", [True, 0, -1, float("inf"), "1"])
-def test_observation_only_cost_accumulator_rejects_invalid_threshold(
+def test_cost_accumulator_rejects_invalid_threshold(
   value: object,
 ) -> None:
   with pytest.raises(ValueError, match="cost_observation_threshold_usd"):
-    ObservationOnlyCostAccumulator(value)  # type: ignore[arg-type]
-
-def test_budget_exceeded_state_handles_plain_accumulator_and_non_exceeded_state() -> None:
-  accumulator = CostAccumulator(1.0)
-
-  assert budget_exceeded_state(accumulator) is None
-
-  accumulator.add(1.25)
-  state = budget_exceeded_state(accumulator)
-
-  assert state is not None
-  assert state.total_cost == 1.25
-  assert state.budget == 1.0
-  assert state.reason is None
-  assert state.reason_suffix == ""
+    CostAccumulator(value)  # type: ignore[arg-type]
 
 
-def test_budget_cost_progress_adds_positive_delta_and_reports_exceeded_state() -> None:
-  accumulator = CostAccumulator(1.0)
+def test_budget_cost_progress_adds_positive_delta_to_the_accumulator() -> None:
+  accumulator = CostAccumulator()
 
   progress = budget_cost_progress(
     accumulator,
@@ -383,7 +130,6 @@ def test_budget_cost_progress_adds_positive_delta_and_reports_exceeded_state() -
   assert progress.incremental_cost == 0.75
   assert progress.last_reported_cost == 1.25
   assert accumulator.total == 0.75
-  assert progress.exceeded_state is None
 
   progress = budget_cost_progress(
     accumulator,
@@ -394,13 +140,10 @@ def test_budget_cost_progress_adds_positive_delta_and_reports_exceeded_state() -
   assert progress.incremental_cost == 0.25
   assert progress.last_reported_cost == 1.50
   assert accumulator.total == 1.0
-  assert progress.exceeded_state is not None
-  assert progress.exceeded_state.total_cost == 1.0
-  assert progress.exceeded_state.budget == 1.0
 
 
 def test_budget_cost_progress_ignores_non_positive_delta_but_updates_last_reported() -> None:
-  accumulator = CostAccumulator(1.0)
+  accumulator = CostAccumulator()
   accumulator.add(0.80)
 
   progress = budget_cost_progress(
@@ -412,7 +155,6 @@ def test_budget_cost_progress_ignores_non_positive_delta_but_updates_last_report
   assert progress.incremental_cost == 0.0
   assert progress.last_reported_cost == 0.40
   assert accumulator.total == 0.80
-  assert progress.exceeded_state is None
 
   progress = budget_cost_progress(
     accumulator,
@@ -423,4 +165,3 @@ def test_budget_cost_progress_ignores_non_positive_delta_but_updates_last_report
   assert progress.incremental_cost == 0.0
   assert progress.last_reported_cost == 0.40
   assert accumulator.total == 0.80
-  assert progress.exceeded_state is None

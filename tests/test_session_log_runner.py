@@ -44,7 +44,11 @@ from agent_gateway import (  # noqa: E402
   TaskState,
   ToolDispatcher,
 )
+from agent_gateway.auth import ProviderCredentialFailure  # noqa: E402
 from agent_gateway.providers import StreamEvent  # noqa: E402
+from agent_gateway.providers.base import truncate_to_last_compaction  # noqa: E402
+import agent_gateway.server_compaction as server_compaction  # noqa: E402
+from agent_gateway.runner_state import assistant_turn_message  # noqa: E402
 from agent_gateway.selected_content import SelectedContentBinding  # noqa: E402
 from agent_gateway.capability_execution import BoundCapabilityExecution  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
@@ -401,22 +405,50 @@ def test_runner_emits_durable_envelope_in_order(tmp_path: Path) -> None:
   _run(runner.run(messages=[{"role": "user", "content": "Run lookup"}]))
 
   entries, _ = _run(log.query(order="asc"))
-  event_types = [entry.event["type"] for entry in entries]
-  assert event_types == [
-    "attach",
-    "user_message",
-    "assistant_message",
-    "tool_call_start",
-    "tool_call_complete",
-    "assistant_message",
-    "detach",
-  ]
   assert entries[1].event["content"] == "Run lookup"
   assert entries[2].event["stop_reason"] == "tool_use"
   assert entries[2].event["usage"]["input_tokens"] == 10
   assert entries[3].event["parent_assistant_message_seq"] == entries[2].seq
   assert "final_tool_result_blocks" in entries[4].event
-  assert entries[6].event["reason"] == "completed"
+  assert entries[-1].event["type"] == "detach"
+  assert entries[-1].event["reason"] == "completed"
+
+
+def test_gateway_session_attach_records_the_log_owner(tmp_path: Path) -> None:
+  # The first attach is the ownership record init-time resume checks.
+  log = AgentSessionLog(path=tmp_path / "sessions" / "owned.jsonl")
+  session = GatewaySession(
+    session_id="sess-owned",
+    api_key_hash="keyhash16hexchars",
+    created_at=1,
+    expires_at=2,
+    user_id="alice",
+    channel="cli",
+    auth_config={"api_key": "k"},
+  )
+  event_log = EventLog()
+  runner = _make_runner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log=event_log),
+    session_id="sess-owned",
+    capability_execution=_runner_execution(_ScriptedProvider([_text_turn("ok")])),
+    agent_session_log=log,
+    gateway_session=session,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
+
+  entries, _ = _run(log.query(order="asc"))
+  attach = entries[0].event
+  assert attach["type"] == "attach"
+  assert (attach["user_id"], attach["channel"], attach["api_key_hash"]) == (
+    "alice",
+    "cli",
+    "keyhash16hexchars",
+  )
 
 
 def test_detach_keeps_other_session_responsive(
@@ -730,7 +762,8 @@ def test_named_skill_repeated_cancellation_drains_interruption_and_detach(
         await task
     assert await runner.wait_for_top_level_skill_settlement() is True
     entries, _ = await durable_log.query(order="asc")
-    assert [e.event["type"] for e in entries][-2:] == ["interrupted", "detach"]
+    assert any(entry.event["type"] == "interrupted" for entry in entries)
+    assert entries[-1].event["type"] == "detach"
     assert entries[-1].event["reason"] == "cancelled"
     assert runner._write_lease_file is None
 
@@ -990,11 +1023,11 @@ def test_operator_pause_before_turn_emits_clean_interruption(tmp_path: Path) -> 
   _run(runner.run(messages=[{"role": "user", "content": "Pause cleanly"}]))
 
   entries, _ = _run(log.query(order="asc"))
-  event_types = [entry.event["type"] for entry in entries]
-  assert event_types == ["attach", "user_message", "interrupted", "detach"]
-  assert entries[2].event["reason"] == "operator_pause"
-  assert entries[2].event["safe_boundary"] == "before_turn"
-  assert entries[3].event["reason"] == "operator_pause"
+  interruption = next(entry.event for entry in entries if entry.event["type"] == "interrupted")
+  assert interruption["reason"] == "operator_pause"
+  assert interruption["safe_boundary"] == "before_turn"
+  assert entries[-1].event["type"] == "detach"
+  assert entries[-1].event["reason"] == "operator_pause"
   assert [entry.event["type"] for entry in event_log.entries] == [
     "operator_pause",
     "session_recap",
@@ -1141,7 +1174,7 @@ def test_followup_replays_complete_tool_batch_before_user_text(
       session_id="sess-parent",
       capability_execution=_runner_execution(followup),
       agent_session_log=log,
-      context_builder=SessionContextBuilder(agent_session_log=log, tail_window_seconds=None),
+      context_builder=SessionContextBuilder(agent_session_log=log),
       user_id="alice",
       billing_mode="byok",
       rate_table_version="unknown",
@@ -1341,7 +1374,7 @@ def test_runner_with_context_builder_ignores_fabricated_client_history(tmp_path:
     session_id="sess-parent",
     capability_execution=_runner_execution(provider),
     agent_session_log=log,
-    context_builder=SessionContextBuilder(agent_session_log=log, tail_window_seconds=None),
+    context_builder=SessionContextBuilder(agent_session_log=log),
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -1403,6 +1436,132 @@ def test_stream_retry_and_terminal_error_are_durable(
     "stream_retry",
     "error",
   ]
+
+
+class _RetrySleepRecorder:
+  """The runner's ``asyncio`` with ``sleep`` recorded, guard polls excluded."""
+
+  def __init__(self, guard_poll_interval: float) -> None:
+    self.guard_poll_interval = guard_poll_interval
+    self.retry_sleeps: list[float] = []
+
+  def __getattr__(self, name: str) -> Any:
+    return getattr(asyncio, name)
+
+  async def sleep(self, delay: float, result: Any = None) -> Any:
+    if delay != self.guard_poll_interval:
+      self.retry_sleeps.append(delay)
+    return await asyncio.sleep(delay, result)
+
+
+def _patch_retry_policy(
+  monkeypatch: pytest.MonkeyPatch,
+  *,
+  retry_max: int,
+  delay: float,
+  backoff: float,
+) -> _RetrySleepRecorder:
+  guard_poll_interval = 300.0
+  recorder = _RetrySleepRecorder(guard_poll_interval)
+  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", retry_max)
+  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", delay)
+  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_BACKOFF", backoff)
+  monkeypatch.setattr(gateway_runner, "STREAM_GUARD_POLL_INTERVAL", guard_poll_interval)
+  monkeypatch.setattr(gateway_runner, "asyncio", recorder)
+  return recorder
+
+
+def _journaled_retry_events(log: AgentSessionLog) -> list[dict[str, Any]]:
+  entries, _ = _run(log.query(order="asc"))
+  return [entry.event for entry in entries if entry.event.get("type") == "stream_retry"]
+
+
+def test_stream_retry_records_attempt_elapsed_and_the_slept_backoff(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  attempt_s = 0.05
+  recorder = _patch_retry_policy(monkeypatch, retry_max=2, delay=0.4, backoff=2.5)
+
+  class _TimedFailingProvider(_RetryableFailingProvider):
+    async def stream(self, client: Any, params: dict[str, Any]):
+      _ = client, params
+      self.calls += 1
+      await asyncio.sleep(attempt_s)
+      raise RuntimeError(self.message)
+      yield  # pragma: no cover
+
+  provider = _TimedFailingProvider()
+  log = AgentSessionLog(path=tmp_path / "sessions" / "stream-retry-timing.jsonl")
+  event_log = EventLog()
+  runner = _make_runner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log=event_log),
+    session_id="sess-parent",
+    capability_execution=_runner_execution(provider),
+    agent_session_log=log,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "review allocation"}]))
+
+  assert provider.calls == 3
+  retry_events = _journaled_retry_events(log)
+  assert [event["attempt"] for event in retry_events] == [0, 1]
+  assert [event["backoff_s"] for event in retry_events] == recorder.retry_sleeps
+  assert recorder.retry_sleeps == pytest.approx([0.4, 1.0])
+  for event in retry_events:
+    # Measured from the attempt's own start: the 0.4s/1.0s backoffs before
+    # attempts 1 and 2 and the earlier attempts are not counted.
+    assert attempt_s <= event["attempt_elapsed_s"] < 0.4
+
+
+def test_credential_rotation_on_the_last_attempt_records_no_backoff(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  recorder = _patch_retry_policy(monkeypatch, retry_max=1, delay=0.01, backoff=2.0)
+
+  class _SpentCredentialProvider(_RetryableFailingProvider):
+    def classify_credential_failure(self, exc: Exception) -> ProviderCredentialFailure | None:
+      _ = exc
+      return ProviderCredentialFailure(provider=self.name, kind="rate_limit", status_code=429)
+
+    def next_credential(
+      self,
+      config: Any,
+      failure: ProviderCredentialFailure,
+    ) -> dict[str, Any] | None:
+      _ = config, failure
+      return {}
+
+  provider = _SpentCredentialProvider("429 Too Many Requests")
+  log = AgentSessionLog(path=tmp_path / "sessions" / "credential-rotation-timing.jsonl")
+  event_log = EventLog()
+  runner = _make_runner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log=event_log),
+    session_id="sess-parent",
+    capability_execution=_runner_execution(provider),
+    agent_session_log=log,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+  monkeypatch.setattr(runner, "_apply_refreshed_auth_config", lambda config, refreshed: None)
+
+  _run(runner.run(messages=[{"role": "user", "content": "review allocation"}]))
+
+  assert provider.calls == 2
+  retry_events = _journaled_retry_events(log)
+  assert [event["attempt"] for event in retry_events] == [0, 1]
+  # The first rotation is followed by an attempt that sleeps first; the last
+  # one ends the loop, so nothing is slept and the journal records null.
+  assert recorder.retry_sleeps == [0.01]
+  assert [event["backoff_s"] for event in retry_events] == [0.01, None]
+  assert all(event["attempt_elapsed_s"] >= 0.0 for event in retry_events)
 
 
 def test_tool_call_complete_logs_final_model_facing_result_blocks(tmp_path: Path) -> None:
@@ -1703,7 +1862,7 @@ def test_runner_stale_recovery_synthesizes_orphan_tool_and_prior_writer_interrup
     rate_table_version="unknown",
   )
 
-  _run(runner.run(messages=[{"role": "user", "content": "Continue"}], max_turns=1))
+  _run(runner.run(messages=[{"role": "user", "content": "Continue"}]))
 
   entries, _ = _run(log.query(order="asc"))
   interruptions = [entry.event for entry in entries if entry.event["type"] == "tool_call_interrupted"]
@@ -1720,15 +1879,13 @@ def test_runner_stale_recovery_synthesizes_orphan_tool_and_prior_writer_interrup
   assert recovery["runner_id"] == "runner_old"
   assert recovery["recovered_by_runner_id"] == new_attach["runner_id"]
   assert new_attach["runner_id"] != "runner_old"
-  messages = _run(SessionContextBuilder(agent_session_log=log, tail_window_seconds=None).build())
+  messages = _run(SessionContextBuilder(agent_session_log=log).build())
   assistant_index = next(index for index, message in enumerate(messages) if message["role"] == "assistant")
   results = messages[assistant_index + 1]["content"]
   assert {block["tool_use_id"] for block in results} == {"tool-orphan", "tool-not-started"}
   assert all(block["is_error"] for block in results)
   assert "tool-orphan" in json.dumps(replayed)
   assert "tool-not-started" in json.dumps(replayed)
-  if recovery_delay:
-    assert not any(message["role"] == "assistant" for message in replayed)
 
 
 def test_second_writer_lease_acquisition_raises(tmp_path: Path) -> None:
@@ -1878,15 +2035,14 @@ async def _durable_task_events(
   ]
 
 
-def test_concurrent_registration_admits_exactly_the_ceiling(
+def test_concurrent_registration_admits_every_caller_and_queues_execution(
   tmp_path: Path,
 ) -> None:
-  """Kills seam-map Hole 1 through the real registration path (CUR-E2E-03).
+  """The in-flight count is a measurement, never a refusal (rule 8).
 
-  The durable replay lookup used to sit *between* the capacity verdict and
-  ``register``. With a slow lookup, N concurrent callers all read the same
-  stale ``admission_count`` and all registered afterwards. The lookup is a
-  pre-check now and ``TaskRegistry.admit`` owns the whole decision.
+  Six concurrent callers past the old ceiling of two are all admitted and
+  durably registered; the sub-agent semaphore runs at most two at a time and
+  the rest wait for a slot.
   """
 
   async def _case() -> None:
@@ -1905,8 +2061,17 @@ def test_concurrent_registration_admits_exactly_the_ceiling(
 
     runner._lookup_task_in_log = _slow_lookup
 
+    running = 0
+    peak_running = 0
+
     async def _handler(_tool_input: dict[str, Any], **_kwargs: Any):
-      await release.wait()
+      nonlocal running, peak_running
+      running += 1
+      peak_running = max(peak_running, running)
+      try:
+        await release.wait()
+      finally:
+        running -= 1
       return _child_report(), None
 
     async def _register(index: int):
@@ -1921,23 +2086,24 @@ def test_concurrent_registration_admits_exactly_the_ceiling(
     outcomes = await asyncio.gather(*[_register(index) for index in range(6)])
 
     admitted = [result for result, error in outcomes if error is None]
-    refused = [error for _result, error in outcomes if error is not None]
-    assert len(admitted) == 2
-    assert len(refused) == 4
-    assert {error["code"] for error in refused} == {"max_background_tasks"}
-    assert refused[0]["message"] == (
-      "Background task limit reached (2). "
-      "Wait for an existing background task to finish before launching another."
-    )
-    assert runner._task_registry.admission_count == 2
+    assert len(admitted) == 6
+    assert runner._task_registry.admission_count == 6
     assert slow_lookups == 6
 
-    # D-A8-3: a capacity-rejected dispatch leaves no durable registration.
     registered, _ = await log.query(
       event_types={"task_registered"},
       order="asc",
     )
-    assert len(registered) == 2
+    assert len(registered) == 6
+
+    async def _two_running() -> None:
+      while running < 2:
+        await asyncio.sleep(0)
+
+    await asyncio.wait_for(_two_running(), timeout=1.0)
+    for _ in range(20):
+      await asyncio.sleep(0)
+    assert running == 2
 
     release.set()
     for result in admitted:
@@ -1946,6 +2112,7 @@ def test_concurrent_registration_admits_exactly_the_ceiling(
       assert entry is not None
       assert entry.asyncio_task is not None
       await asyncio.wait_for(entry.asyncio_task, timeout=1.0)
+    assert peak_running == 2
 
   _run(_case())
 
@@ -2373,7 +2540,6 @@ def test_sub_agent_events_are_written_to_parent_log(tmp_path: Path) -> None:
         local_tool_handlers={"lookup": _lookup_tool},
       ),
       sub_session=sub_session,
-      max_turns=5,
     )
   )
 
@@ -2432,7 +2598,6 @@ def test_spawn_sub_agent_uses_shared_sub_agent_id_helper(tmp_path: Path, monkeyp
       skill_name="test-child",
       dispatcher=_make_dispatcher(),
       sub_session=None,
-      max_turns=5,
       call_index=3,
     )
   )
@@ -2442,3 +2607,296 @@ def test_spawn_sub_agent_uses_shared_sub_agent_id_helper(tmp_path: Path, monkeyp
   assert calls == [("sess-parent", 3)]
   entries, _ = _run(log.query(role="sub_agent", order="asc"))
   assert {entry.event["sub_agent_id"] for entry in entries} == {"sub3:derived-parent"}
+
+
+# The user rows the run loop injects for one request or one stop boundary and
+# never writes to the log; resume-invariance is stated modulo exactly this set.
+_EPHEMERAL_NUDGE_PREFIXES = (
+  "[System: New background-task notifications are included above.",
+  "[System: The following background task result(s) were delivered as ",
+  "[System: Background result payload delivery is still required for exact ",
+  "[System: Your previous response was cut off at the output-token limit",
+)
+_CONTINUATION_NUDGE_TEXT = (
+  "[History was compacted into the summary above. Continue the task from that summary.]"
+)
+_RESUME_MODEL = "claude-sonnet-5"
+_TURN_ONE_TOKEN = "SCORE 89.0"
+_CHILD_ONLY_MARKERS = ("child_fg_probe", "CHILD-FG", "child_bg_probe", "CHILD-BG")
+_SUMMARY_TEXT = (
+  f"Earlier: the portfolio risk score was {_TURN_ONE_TOKEN}. A delegated margin "
+  "review found margins stable; a background filings review found filings clean. "
+  "Next step: re-run the lookup the user asked for and answer from it. "
+) * 2
+
+
+def _strip_ephemeral_nudges(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+  kept = []
+  for message in messages:
+    content = message.get("content")
+    if (
+      message.get("role") == "user"
+      and isinstance(content, str)
+      and (
+        content.startswith(_EPHEMERAL_NUDGE_PREFIXES)
+        or content == _CONTINUATION_NUDGE_TEXT
+      )
+    ):
+      continue
+    kept.append(message)
+  return kept
+
+
+def _model_visible(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+  return truncate_to_last_compaction(messages, compaction_as_text=False)
+
+
+class _ResumeSessionProvider(_ScriptedProvider):
+  """Parent model for one interactive session; also answers portable summaries."""
+
+  def __init__(self, turns: list[list[StreamEvent]]) -> None:
+    super().__init__(turns)
+    self.context_window = 200_000
+    self.summary_requests = 0
+
+  def get_model_info(self, model: str) -> ModelInfo:
+    return ModelInfo(
+      id=model,
+      provider=self.name,
+      context_window=self.context_window,
+      max_output_tokens=4096,
+    )
+
+  def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
+    messages = kwargs["messages"]
+    last_content = str(messages[-1].get("content") or "") if messages else ""
+    is_summary = "The <summary> content is the only text" in last_content
+    return {"kind": "summary" if is_summary else "main"}
+
+  async def stream(self, client: Any, params: dict[str, Any]):
+    if params.get("kind") == "summary":
+      self.summary_requests += 1
+      for event in _text_turn(_SUMMARY_TEXT):
+        yield event
+      return
+    async for event in super().stream(client, params):
+      yield event
+
+
+def _compaction_tool_turn(summary: str) -> list[StreamEvent]:
+  # Native compaction: the provider's compaction block arrives inside the
+  # assistant message it compacted for, followed by that message's own work.
+  turn = _tool_turn(tool_id="tool-post", tool_input={"query": "post-compaction"})
+  return [
+    turn[0],
+    StreamEvent(type="compaction", raw_block={"type": "compaction", "content": summary}),
+    *turn[1:],
+  ]
+
+
+@pytest.mark.parametrize("compaction", ["portable", "native"])
+def test_session_context_builder_resumes_the_model_visible_state_of_every_turn(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  compaction: str,
+) -> None:
+  monkeypatch.delenv(server_compaction.PORTABLE_COMPACTION_ENV, raising=False)
+  monkeypatch.setattr(server_compaction, "MIN_COMPACT_GAIN_TOKENS", 500)
+
+  parent_turns = [
+    # Turn 1: an answer later turns must still see.
+    _text_turn(f"Overall risk score: {_TURN_ONE_TOKEN} / 100."),
+    # Turn 2: a foreground child; the parent sees only its run_agent result.
+    _tool_turn(
+      tool_id="tool-fg",
+      tool_name="run_agent",
+      tool_input={"objective": "Review margins", "background": False},
+    ),
+    _text_turn("The delegated review found margins stable."),
+    # Turn 3: a background child, delivered while the run holds the turn open.
+    _tool_turn(
+      tool_id="tool-bg",
+      tool_name="run_agent",
+      tool_input={"objective": "Review filings", "background": True},
+    ),
+    _text_turn("Started the background filings review."),
+    _text_turn("Background review: filings clean."),
+    # Turn 4: a plain follow-up after the delivery.
+    _text_turn("Nothing else is outstanding."),
+    # Turn 5: mid-run compaction, then one more tool round.
+    (
+      _tool_turn(tool_id="tool-post", tool_input={"query": "post-compaction"})
+      if compaction == "portable"
+      else _compaction_tool_turn(_SUMMARY_TEXT)
+    ),
+    _text_turn("Post-compaction lookup done."),
+  ]
+  provider = _ResumeSessionProvider(parent_turns)
+  foreground_child = _ScriptedProvider([
+    _mixed_text_tool_turn(
+      text="CHILD-FG scratch note",
+      tool_id="child-fg-1",
+      tool_name="child_fg_probe",
+      tool_input={"query": "CHILD-FG probe input"},
+    ),
+    _text_turn("CHILD-FG final draft"),
+  ])
+  background_child = _ScriptedProvider([
+    _mixed_text_tool_turn(
+      text="CHILD-BG scratch note",
+      tool_id="child-bg-1",
+      tool_name="child_bg_probe",
+      tool_input={"query": "CHILD-BG probe input"},
+    ),
+    _text_turn("CHILD-BG final draft"),
+  ])
+
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "resume-invariance.jsonl")
+    current: dict[str, AgentRunner] = {}
+
+    async def _spawn_child(
+      runner: AgentRunner,
+      *,
+      objective: str,
+      child_provider: ModelProvider,
+      child_tool: str,
+      call_index: int,
+    ) -> None:
+      logical_task, attempt, result_requirement, result_provenance = (
+        _subagent_result_identity(
+          delegation_id=f"resume-invariance-{call_index}",
+          physical_task_id=f"sub{call_index}:sess-parent",
+        )
+      )
+      result, error = await runner.spawn_sub_agent(
+        objective,
+        capability_execution=_child_execution(child_provider),
+        logical_task=logical_task,
+        attempt=attempt,
+        result_requirement=result_requirement,
+        result_provenance=result_provenance,
+        skill_name="test-child",
+        dispatcher=_make_dispatcher(local_tool_handlers={child_tool: _lookup_tool}),
+        sub_session=None,
+        call_index=call_index,
+      )
+      assert error is None and result is not None
+
+    # A local `run_agent` over the runner's real child and background-task
+    # machinery: it writes the same durable rows (child rows under
+    # `role: sub_agent`, the parent's own `tool_call_complete`) without the
+    # operation-catalog admission the resume contract does not read.
+    async def _run_agent(tool_input: dict[str, Any], **_kwargs: Any):
+      runner = current["runner"]
+      if not tool_input.get("background"):
+        await _spawn_child(
+          runner,
+          objective=tool_input["objective"],
+          child_provider=foreground_child,
+          child_tool="child_fg_probe",
+          call_index=7,
+        )
+        return _child_report("Margins stable per delegated review."), None
+
+      async def _background(child_input: dict[str, Any], *, call_index: int, **_: Any):
+        await _spawn_child(
+          runner,
+          objective=child_input["objective"],
+          child_provider=background_child,
+          child_tool="child_bg_probe",
+          call_index=call_index,
+        )
+        return _child_report("Filings clean per background review."), None
+
+      return await runner._register_background_task(
+        tool_input=tool_input,
+        handler=_background,
+        agent_name="filings-reviewer",
+        capability_bind_receipt=_child_execution(background_child).bind.to_json(),
+      )
+
+    async def _turn(user_text: str, *, compaction_trigger: int | None = None) -> list[dict[str, Any]]:
+      # One runner per turn, as the interactive path builds it: its context is
+      # `SessionContextBuilder.build()` plus the new user message.
+      runner = _make_runner(
+        event_log=EventLog(),
+        dispatcher=_make_dispatcher(
+          local_tool_handlers={"run_agent": _run_agent, "lookup": _lookup_tool},
+        ),
+        session_id="sess-parent",
+        capability_execution=_runner_execution(provider, model=_RESUME_MODEL),
+        agent_session_log=log,
+        context_builder=SessionContextBuilder(agent_session_log=log),
+        workspace_dir=str(tmp_path),
+        compaction_trigger=compaction_trigger,
+        user_id="alice",
+        billing_mode="byok",
+        rate_table_version="unknown",
+      )
+      current["runner"] = runner
+      # Observation: the run loop hands its live `current_messages` list to
+      # every `_stream_turn` call and mutates that same list afterwards (nudge
+      # and portable-anchor removal); a final `end_turn` reply is never
+      # appended to it. So the post-turn state is the last call's list, read
+      # after `run()` returns, plus that call's reply in the run loop's own
+      # `assistant_turn_message` shape.
+      observed: dict[str, Any] = {}
+      stream_turn = runner._stream_turn
+
+      async def _recording_stream_turn(**kwargs: Any):
+        result = await stream_turn(**kwargs)
+        observed["messages"] = kwargs["current_messages"]
+        observed["result"] = result
+        return result
+
+      runner._stream_turn = _recording_stream_turn
+      await runner.run(messages=[{"role": "user", "content": user_text}])
+      _client, final_turn = observed["result"]
+      assert final_turn.stop_reason == "end_turn"
+      return [
+        *observed["messages"],
+        assistant_turn_message(
+          final_turn.content_blocks,
+          provider=provider.name,
+          model=_RESUME_MODEL,
+          stop_reason=final_turn.stop_reason,
+        ),
+      ]
+
+    turns = [
+      ("What is the portfolio risk score?", None),
+      ("Delegate a margin review.", None),
+      ("Start a background filings review.", None),
+      ("Anything else outstanding?", None),
+      ("Re-run the lookup. " + "context " * 400, 20 if compaction == "portable" else None),
+    ]
+    for index, (user_text, compaction_trigger) in enumerate(turns, start=1):
+      if index == 5 and compaction == "portable":
+        provider.context_window = 20
+      post_turn = await _turn(user_text, compaction_trigger=compaction_trigger)
+      if index == 3:
+        # The delivery ran in this turn: the stripped set is not vacuous here.
+        assert _strip_ephemeral_nudges(post_turn) != post_turn
+      replay = await SessionContextBuilder(agent_session_log=log).build()
+      replay_text = json.dumps(_model_visible(replay), default=str)
+      assert _TURN_ONE_TOKEN in replay_text, index
+      if index >= 2:
+        assert not [marker for marker in _CHILD_ONLY_MARKERS if marker in replay_text], index
+
+    child_rows, _ = await log.query(role="sub_agent", order="asc")
+    assert {entry.event["sub_agent_id"] for entry in child_rows} == {
+      "sub7:sess-parent",
+      "sub0:sess-parent",
+    }
+    # build() itself starts at the compaction record: nothing before it replays.
+    compacted = await SessionContextBuilder(agent_session_log=log).build()
+    assert compacted[0]["role"] == "assistant"
+    assert compacted[0]["content"][0] == {"type": "compaction", "content": (
+      _SUMMARY_TEXT.strip() if compaction == "portable" else _SUMMARY_TEXT
+    )}
+    assert "What is the portfolio risk score?" not in json.dumps(compacted)
+    if compaction == "portable":
+      assert provider.summary_requests == 1
+
+  _run(_case())

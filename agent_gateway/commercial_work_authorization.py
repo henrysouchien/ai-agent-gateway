@@ -243,6 +243,8 @@ class WorkAuthorizationVerifier:
       raise WorkAuthorizationError("billing_mode_mismatch")
     if authorization.capability_id != capability_id:
       raise WorkAuthorizationError("capability_mismatch")
+    # Money: a commercial start may run only the capabilities and operations
+    # the signed claim's scopes fund, else one paid claim funds unpriced work.
     required_scopes = self._capability_required_scopes.get(
       authorization.capability_id or ""
     )
@@ -316,11 +318,6 @@ class WorkAuthorizationVerifier:
     attempt_kind = payload.get("workflow_attempt_kind")
     if attempt_kind not in {"initial", "user_retry", "automatic_retry"}:
       raise WorkAuthorizationError("invalid_attempt_kind")
-    if attempt_kind == "initial":
-      if retry_of is not None or attempt_number != 1 or attempt_group_id != workflow_id:
-        raise WorkAuthorizationError("invalid_attempt_shape")
-    elif retry_of is None or attempt_number <= 1:
-      raise WorkAuthorizationError("invalid_attempt_shape")
     observability = payload.get("primary_inference_observability")
     if observability not in {
       "hank_metered", "hank_byok_observed", "external_unobserved", "none",
@@ -332,6 +329,8 @@ class WorkAuthorizationVerifier:
     reservation_id = _optional_uuid(payload, "reservation_id")
     if billing_mode not in {"byok", "metered"}:
       raise WorkAuthorizationError("invalid_billing_mode")
+    # Money: metered work spends Hank funds, billable only against the
+    # risk_module budget reservation the authorization names.
     if (billing_mode == "metered") != (reservation_id is not None):
       raise WorkAuthorizationError("invalid_authority_shape")
     if (billing_mode, observability) not in {
@@ -345,7 +344,7 @@ class WorkAuthorizationVerifier:
     session_id = _require_opaque_id(payload, "session_id")
     issued_at = _require_positive_int(payload, "iat")
     expires_at = _require_positive_int(payload, "exp")
-    if expires_at <= issued_at or expires_at - issued_at > 300:
+    if expires_at <= issued_at:
       raise WorkAuthorizationError("invalid_authorization_lifetime")
     return VerifiedWorkAuthorization(
       schema_version=1,

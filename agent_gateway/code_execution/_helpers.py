@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import errno
+import functools
 import os
 import stat as stat_module
 import tempfile
@@ -13,6 +14,7 @@ from ._config import CodeExecutionConfig
 
 if TYPE_CHECKING:
   from ._backends import ExecutionBackend
+  from ._backends._base import CellBridge
 
 
 OnOutputChunk = Callable[[str, str], None]
@@ -45,7 +47,6 @@ def _integer_input(
   *,
   default: int,
   minimum: int | None = None,
-  maximum: int | None = None,
 ) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
   raw_value = tool_input[key] if key in tool_input else default
   if isinstance(raw_value, bool):
@@ -56,8 +57,6 @@ def _integer_input(
     return None, {"code": "invalid_input", "message": f"{key} must be an integer"}
   if minimum is not None and raw_value < minimum:
     return None, {"code": "invalid_input", "message": f"{key} must be >= {minimum}"}
-  if maximum is not None and raw_value > maximum:
-    return None, {"code": "invalid_input", "message": f"{key} must be <= {maximum}"}
   return raw_value, None
 
 
@@ -103,7 +102,6 @@ def _timeout_ms_input(
     "timeout_ms",
     default=config.default_timeout_ms,
     minimum=1000,
-    maximum=config.max_timeout_ms,
   )
 
 
@@ -210,10 +208,28 @@ class _CodeExecutePyplotFinder(_importlib_abc.MetaPathFinder):
         return None
 
 
-_sys.meta_path.insert(0, _CodeExecutePyplotFinder())
+if "_code_execute_pyplot_finder" not in globals():
+    _code_execute_pyplot_finder = _CodeExecutePyplotFinder()
+    _sys.meta_path.insert(0, _code_execute_pyplot_finder)
 if "matplotlib.pyplot" in _sys.modules:
     _code_execute_patch_pyplot(_sys.modules["matplotlib.pyplot"])
 """
+
+
+@functools.cache
+def _bridge_client_source() -> str:
+  """Ship the one shared codec and client without importing the gateway."""
+  root = Path(__file__).parent
+  codec = (root / "_frame_codec.py").read_text(encoding="utf-8")
+  client = (root / "_bridge_client.py").read_text(encoding="utf-8")
+  return (
+    "import sys as _hank_sys, types as _hank_types\n"
+    "if '_hank_frame_codec' not in _hank_sys.modules:\n"
+    "    _hank_codec_module = _hank_types.ModuleType('_hank_frame_codec')\n"
+    "    _hank_sys.modules['_hank_frame_codec'] = _hank_codec_module\n"
+    f"    exec(compile({codec!r}, '_frame_codec.py', 'exec'), _hank_codec_module.__dict__)\n"
+    + client
+  )
 
 
 def _build_code_execute_preamble(config: CodeExecutionConfig, task_id: str = "") -> str:
@@ -221,6 +237,7 @@ def _build_code_execute_preamble(config: CodeExecutionConfig, task_id: str = "")
     return config.build_preamble(task_id)
 
   preamble = _default_code_execute_preamble(task_id).rstrip()
+  preamble = f"{preamble}\n\n{_bridge_client_source().strip()}"
   suffix = (config.preamble_suffix or "").strip("\n")
   if suffix:
     preamble = f"{preamble}\n\n{suffix}"
@@ -537,6 +554,7 @@ async def code_execute(
   on_output: Optional[OnOutputChunk] = None,
   backend: Optional["ExecutionBackend"] = None,
   config: CodeExecutionConfig | None = None,
+  bridge: Optional["CellBridge"] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
   cfg = config or CodeExecutionConfig()
 
@@ -583,24 +601,40 @@ async def code_execute(
         chunk_text = text
       on_output(stream_name, chunk_text)
 
-    result = await backend.execute(
-      code,
-      str(work_dir_path),
-      timeout_ms=timeout_ms,
-      env=env,
-      on_output=_emit_chunk if on_output is not None else None,
-    )
+    emit = _emit_chunk if on_output is not None else None
+    if bridge is not None:
+      result = await backend.execute_bridged(
+        code,
+        str(work_dir_path),
+        bridge=bridge,
+        timeout_ms=timeout_ms,
+        env=env,
+        on_output=emit,
+      )
+    else:
+      result = await backend.execute(
+        code,
+        str(work_dir_path),
+        timeout_ms=timeout_ms,
+        env=env,
+        on_output=emit,
+      )
     stdout = str(result.get("stdout") or "")
     stderr = _strip_code_execute_stderr_noise(str(result.get("stderr") or ""))
     stdout, stderr, truncated = _truncate_stdio(stdout, stderr, cfg.max_output_bytes)
-    return {
+    output = {
       "stdout": stdout,
       "stderr": stderr,
       "return_code": result.get("return_code"),
       "images": result.get("images") or [],
       "timed_out": bool(result.get("timed_out")),
+      "timeout_ms": timeout_ms,
       "duration_ms": result.get("duration_ms"),
       "truncated": bool(result.get("truncated")) or truncated,
-    }, None
+    }
+    for key in ("displays", "stdout_tail", "stderr_tail", "spill", "cancelled", "error", "protocol_error"):
+      if key in result:
+        output[key] = result[key]
+    return output, None
   except Exception as exc:
     return _error("tool_error", f"code_execute failed: {exc}")

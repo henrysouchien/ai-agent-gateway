@@ -25,10 +25,15 @@ from agent_workflow_contracts import (
   canonical_json_bytes,
   sha256_digest,
 )
+from agent_workflow_contracts.context_refs import read_back_refs
 
 from .skill_lifecycle import (
   SkillLifecycleArtifactIdentity,
   TopLevelSkillLifecycleMetadata,
+)
+from .sub_agent_result_contract import (
+  TERMINAL_TOOL_RESULT_RETURN_CONTRACT,
+  report_contract_ref,
 )
 from .task_registry import TaskNotification, TaskState
 from .workflow_evidence_provenance import build_child_evidence_projection
@@ -343,6 +348,26 @@ def _completion_terminal_reason(reason: str | None) -> str | None:
   return prefix[:low] + marker
 
 
+_TERMINAL_TOOL_RESULT_CONTRACT = report_contract_ref(TERMINAL_TOOL_RESULT_RETURN_CONTRACT)
+
+
+def _terminal_door_refs(task_result: TaskResult) -> dict[str, Any]:
+  """The refs the child's terminal door minted, read from its canonical value.
+
+  A terminal-tool-result projection is ``{tool_name, result}``: the door's own
+  answer, which the shared minter reads. Any other result names no door refs.
+  """
+  projection = task_result.values.projection
+  if (
+    projection is None
+    or projection.contract != _TERMINAL_TOOL_RESULT_CONTRACT
+    or not isinstance(projection.inline_view, Mapping)
+  ):
+    return {}
+  door_result = projection.inline_view.get("result")
+  return read_back_refs(door_result) if isinstance(door_result, Mapping) else {}
+
+
 def build_agent_completion_envelope(
   task_result: TaskResult,
   *,
@@ -357,6 +382,8 @@ def build_agent_completion_envelope(
   This function deliberately has no transcript fallback.  The terminal reader
   resolves the canonical narrative handle (and is expected to verify its
   digest); overflow follows the admitted policy before any bytes are read.
+  The refs the child's terminal door minted ride inline at ``stage_refs`` in
+  every arm, so an overflowed result still names what its door persisted.
   """
 
   if not isinstance(task_result, TaskResult):
@@ -469,6 +496,7 @@ def build_agent_completion_envelope(
       if child_evidence_payload is not None
       else None
     ),
+    stage_refs=_terminal_door_refs(task_result),
   )
 
 
@@ -803,22 +831,6 @@ async def drain_still_pending_background_tasks(
   return set(remaining)
 
 
-def background_task_limit_error(
-  *,
-  admission_count: int,
-  max_background_tasks: int,
-) -> Dict[str, Any] | None:
-  if admission_count < max_background_tasks:
-    return None
-  return {
-    "code": "max_background_tasks",
-    "message": (
-      f"Background task limit reached ({max_background_tasks}). "
-      "Wait for an existing background task to finish before launching another."
-    ),
-  }
-
-
 def call_before_background_task_start_hook(
   on_before_start: Callable[[], None] | None,
   *,
@@ -902,22 +914,15 @@ async def resumed_task_ids(
 async def resume_task_id_override(
   original_task_id: str | None,
   *,
-  max_resume_chain_depth: int,
   resume_chain_depth: Callable[[str], Awaitable[int]],
   resume_root: Callable[[str], Awaitable[str]],
-) -> tuple[str | None, Dict[str, Any] | None]:
+) -> str | None:
   if not original_task_id:
-    return None, None
+    return None
 
   depth = await resume_chain_depth(original_task_id)
-  if depth >= max_resume_chain_depth:
-    return None, {
-      "code": "max_resume_chain_depth",
-      "message": f"Resume chain depth limit reached ({max_resume_chain_depth}) for {original_task_id}",
-    }
-
   root_id = await resume_root(original_task_id)
-  return f"{root_id}_r{depth + 1}", None
+  return f"{root_id}_r{depth + 1}"
 
 
 def resume_root_task_id_from_registry(
@@ -1003,7 +1008,7 @@ def background_task_payload(
           else metadata.get("capability_bind")
         ),
         "original_task_id": getattr(bg_task, "original_task_id", None),
-        "resumable": bool(metadata.get("resumable", False)),
+        "resume_chain_depth": int(metadata.get("resume_chain_depth", 0)),
         "resumed_as": resumed_as,
         "latest_resume_task_id": resumed_as[-1] if resumed_as else None,
         "message": interrupted_message,
@@ -1291,8 +1296,8 @@ def background_task_registration_metadata(
     correlation[WORKFLOW_TASK_METADATA_KEY] = (
       normalized_workflow_task.payload()
     )
-  if "resumable" in tool_input:
-    correlation["resumable"] = bool(tool_input.get("resumable"))
+  if "resume_chain_depth" in tool_input:
+    correlation["resume_chain_depth"] = int(tool_input["resume_chain_depth"])
   return correlation
 
 

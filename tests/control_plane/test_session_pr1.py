@@ -255,3 +255,4 @@ def test_control_session_token_cannot_dispatch_chat(
 
   assert response.status_code == 400
   assert response.json()["error"] == "invalid_session_kind"
+  assert "POST /control/runs kind=chat" in response.json()["message"]

@@ -85,15 +85,13 @@ def test_auth_config() -> None:
   assert "model" not in rebuilt and "thinking" not in rebuilt
   print("  Round-trip preserved credential material without model selection")
 
-  try:
-    AuthConfig.from_dict({
-      **raw,
-      "model": "claude-sonnet-4-6",
-      "thinking": True,
-    })
-    assert False, "Should reject model-selection fields"
-  except ValueError as e:
-    assert "model, thinking" in str(e)
+  # Selection fields in credential material are not refused here; the run
+  # config owner (runner_state.normalized_run_config) overwrites them from the bind.
+  AuthConfig.from_dict({
+    **raw,
+    "model": "claude-sonnet-4-6",
+    "thinking": True,
+  })
 
   # Validation
   try:

@@ -21,6 +21,44 @@ import agent_gateway.agent_session_log_records as session_log_records
 from agent_gateway.agent_session_log import agent_session_logical_path_for_jsonl, slugify
 
 
+def test_terminal_pair_rolls_back_a_failed_fsync_before_retry(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+  import os
+
+  log = AgentSessionLog(tmp_path / "terminal-pair.jsonl")
+  first = log.append_sync({"type": "attach", "role": "writer"})
+  before = log.path.read_bytes()
+  inode = log.path.stat().st_ino
+  fsync = os.fsync
+  failed = False
+
+  def fail_pair_fsync(fd: int) -> None:
+    nonlocal failed
+    info = os.fstat(fd)
+    if info.st_ino == inode and info.st_size > len(before) and not failed:
+      failed = True
+      raise OSError("terminal pair fsync failed")
+    fsync(fd)
+
+  monkeypatch.setattr(os, "fsync", fail_pair_fsync)
+  with pytest.raises(OSError, match="terminal pair fsync failed"):
+    log.append_terminal_pair_sync(
+      {"type": "session_recap", "failures": []},
+      {"type": "detach", "reason": "completed"},
+    )
+  assert log.path.read_bytes() == before
+  entries, _ = _run(log.query(order="asc"))
+  assert [entry.seq for entry in entries] == [first.seq]
+  recap, detach = log.append_terminal_pair_sync(
+    {"type": "session_recap", "failures": [{"detail": "actual failure"}]},
+    {"type": "detach", "reason": "error"},
+  )
+  assert (recap.seq, detach.seq) == (first.seq + 1, first.seq + 2)
+  entries, _ = _run(log.query(order="asc"))
+  assert [entry.event for entry in entries[1:]] == [recap.event, detach.event]
+
+
 def test_session_rotation_unset_uses_64_mib_default(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,

@@ -1,10 +1,13 @@
 import fs from "node:fs";
+import path from "node:path";
 import ts from "typescript";
 
-const input = process.argv[2];
+const [input, contractDir] = process.argv.slice(2);
 const source = fs.readFileSync(input, "utf8");
 const ast = ts.createSourceFile(input, source, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TSX);
-const allowedImports = new Set(["react", "recharts", "@hank/canvas-kit"]);
+const manifest = JSON.parse(fs.readFileSync(path.join(contractDir, "canvas_kit_manifest.v1.json"), "utf8"));
+const allowedImports = new Set(Object.keys(manifest.externals));
+const allowedImportsHint = `Import only ${[...allowedImports].join(", ")}.`;
 const forbidden = new Set([
   "fetch", "XMLHttpRequest", "WebSocket", "EventSource", "importScripts", "eval", "Function",
   "localStorage", "sessionStorage", "indexedDB", "setTimeout", "setInterval", "postMessage",
@@ -35,8 +38,8 @@ for (const statement of ast.statements) {
   }
   if (ts.isImportDeclaration(statement)) {
     const specifier = ts.isStringLiteral(statement.moduleSpecifier) ? statement.moduleSpecifier.text : "";
-    if (!allowedImports.has(specifier)) add(statement, "import_allowlist", `Import '${specifier}' is not allowed.`, "Import only react, recharts, or @hank/canvas-kit.");
-    if (statement.importClause?.namedBindings && ts.isNamespaceImport(statement.importClause.namedBindings)) add(statement, "import_structure", "Namespace imports are not supported by the frozen externals ABI.", "Use default or named imports from the three allowed modules.");
+    if (!allowedImports.has(specifier)) add(statement, "import_allowlist", `Import '${specifier}' is not allowed.`, allowedImportsHint);
+    if (statement.importClause?.namedBindings && ts.isNamespaceImport(statement.importClause.namedBindings)) add(statement, "import_structure", "Namespace imports are not supported by the frozen externals ABI.", "Use default or named imports from the Canvas runtime externals.");
     continue;
   }
   if (ts.isVariableStatement(statement)) {

@@ -18,7 +18,7 @@ class _UnusedMcpSession:
     name: str,
     arguments: dict[str, object],
     *,
-    read_timeout_seconds: float,
+    read_timeout_seconds: float | None,
     meta: dict[str, object] | None = None,
   ) -> Never:
     _ = name, arguments, read_timeout_seconds, meta

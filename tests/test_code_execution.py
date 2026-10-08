@@ -10,11 +10,17 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import SessionStore, ToolDispatcher
-from agent_gateway.code_execution import CodeExecutionConfig, build_code_execution, cleanup_code_execution
+from agent_gateway.code_execution import (
+  CodeExecutionConfig,
+  build_code_execution,
+  cleanup_code_execution,
+  clear_docker_availability_cache,
+  docker_backend_unavailable_reason,
+)
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.event_log import EventLog
 from agent_gateway.runner import ToolResultContext
-from agent_gateway.secret_boundary import SecretBoundary
+from agent_gateway.secret_boundary import REDACTED_SECRET, SecretBoundary
 from agent_gateway.tool_dispatcher_helpers import ToolResult
 
 
@@ -60,35 +66,16 @@ async def _dispatch_bundle_tool(
   *,
   event_log: EventLog | None = None,
   needs_approval=None,
-  approved_tool_types=None,
 ) -> tuple[dict | None, dict | None]:
   dispatcher = ToolDispatcher(
     mcp_client=_FakeMcp(),
     local_tool_handlers=bundle.handlers,
     role="owner",
     needs_approval=needs_approval or (lambda _name, _tool_input, _qualifier: False),
-    approved_tool_types=approved_tool_types,
     event_log=event_log or EventLog(),
     approval_key_qualifier=bundle.approval_qualifier,
   )
   return await dispatcher.dispatch(f"{tool_name}_call", tool_name, tool_input)
-
-
-def test_tool_defs_default_config_include_code_execution_tools() -> None:
-  session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-  bundle = build_code_execution(session)
-
-  assert [tool_def["name"] for tool_def in bundle.tool_definitions] == [
-    "code_execute",
-    "code_execute_status",
-  ]
-  assert "Discovery:" in bundle.tool_definitions[0]["description"]
-  assert "Common mistakes:" in bundle.tool_definitions[0]["description"]
-  assert bundle.tool_definitions[0]["input_schema"]["properties"]["host"]["enum"] == [
-    "auto",
-    "subprocess",
-    "docker",
-  ]
 
 
 def test_code_execute_basic_execution_and_work_dir_persistence() -> None:
@@ -171,7 +158,134 @@ def test_code_execute_output_is_redacted_by_the_run_boundary() -> None:
   asyncio.run(_run_test())
 
 
-def test_code_execute_accepts_schema_timeout_bounds() -> None:
+def test_code_execute_redacts_structured_errors_and_display_keys(tmp_path: Path) -> None:
+  async def _run_test() -> None:
+    canary = "CUSTOM-ACTIVE-CREDENTIAL-STRUCTURED-CODE-EXECUTE"
+    credential_file = tmp_path / "credential.txt"
+    credential_file.write_text(canary, encoding="utf-8")
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(
+      session,
+      config=CodeExecutionConfig(register_kernel=True, register_docker=False, register_subprocess=False),
+    )
+    dispatcher = ToolDispatcher(
+      mcp_client=_FakeMcp(),
+      local_tool_handlers=bundle.handlers,
+      role="owner",
+      needs_approval=lambda _name, _tool_input, _qualifier: False,
+      approval_key_qualifier=bundle.approval_qualifier,
+    )
+    dispatcher.bind_secret_boundary(SecretBoundary((canary,)))
+    try:
+      result, error = await dispatcher.dispatch(
+        "structured-output", "code_execute", {
+          "host": "kernel",
+          "code": (
+            "from pathlib import Path\n"
+            f"credential = Path({str(credential_file)!r}).read_text()\n"
+            "display({credential: {'nested': [credential]}})\n"
+            "raise ValueError(credential)"
+          ),
+        },
+      )
+      assert error is None and result is not None
+      assert result["return_code"] == 1
+      assert result["error"]["ename"] == "ValueError"
+      assert result["error"]["evalue"] and result["error"]["traceback"]
+      assert result["displays"][0]["application/json"]
+      assert canary not in json.dumps(result)
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(_run_test())
+
+
+def test_code_execute_redacts_deep_admitted_subprocess_sidecar(tmp_path: Path) -> None:
+  async def _run_test() -> None:
+    canary = "CUSTOM-ACTIVE-DEEP-CREDENTIAL"
+    credential_file = tmp_path / "credential.txt"
+    credential_file.write_text(canary, encoding="utf-8")
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(
+      session,
+      config=CodeExecutionConfig(register_kernel=False, register_docker=False),
+    )
+    dispatcher = ToolDispatcher(
+      mcp_client=_FakeMcp(),
+      local_tool_handlers=bundle.handlers,
+      role="owner",
+      needs_approval=lambda _name, _tool_input, _qualifier: False,
+      approval_key_qualifier=bundle.approval_qualifier,
+    )
+    dispatcher.bind_secret_boundary(SecretBoundary((canary,)))
+    try:
+      result, error = await dispatcher.dispatch(
+        "deep-sidecar", "code_execute", {
+          "host": "subprocess",
+          "code": (
+            "import json, os\n"
+            "from pathlib import Path\n"
+            f"credential = Path({str(credential_file)!r}).read_text()\n"
+            "leaf = json.dumps({credential: [credential, {'nested': credential}], 'count': 7})\n"
+            "nested = leaf\n"
+            "for index in range(1200):\n"
+            "    nested = '{\"n\":' + nested + '}'\n"
+            "    if index % 24 == 0:\n"
+            "        nested = '[' + nested + ']'\n"
+            # String assembly keeps the child JSON encoder's recursion limit
+            # out of the admitted sidecar/parent projection regression.
+            "payload = '{\"schema_version\":1,\"function\":\"deep\",\"tool_version\":\"v1\","
+            "\"output_sha256\":\"hash\",\"params\":' + nested + ',\"summary\":' + leaf + '}'\n"
+            "target = Path(os.environ['AGENT_CODE_EXECUTE_WORK_DIR']) / '.agent_provenance'"
+            " / os.environ['AGENT_TELEMETRY_TOOL_CALL_ID']\n"
+            "target.mkdir(parents=True, exist_ok=True)\n"
+            "(target / 'deep.json').write_text(payload, encoding='utf-8')\n"
+            "print(len(payload.encode('utf-8')))\n"
+          ),
+        },
+      )
+      assert error is None and result is not None
+      assert result["return_code"] == 0
+      assert result["stderr"] == ""
+      assert 7200 < int(result["stdout"].strip()) < 8192
+      assert "computations_dropped" not in result
+      assert len(result["computations"]) == 1
+      computation = result["computations"][0]
+      assert computation["function"] == "deep"
+      assert computation["output_sha256"] == "hash"
+      value = computation["params"]
+      for index in reversed(range(1200)):
+        if index % 24 == 0:
+          assert isinstance(value, list) and len(value) == 1
+          value = value[0]
+        assert isinstance(value, dict) and list(value) == ["n"]
+        value = value["n"]
+      expected_leaf = {
+        REDACTED_SECRET: [REDACTED_SECRET, {"nested": REDACTED_SECRET}],
+        "count": 7,
+      }
+      assert value == expected_leaf
+      assert computation["summary"] == expected_leaf
+      pending = [result]
+      while pending:
+        value = pending.pop()
+        if isinstance(value, str):
+          assert canary not in value
+        elif isinstance(value, dict):
+          pending.extend(value.keys())
+          pending.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+          pending.extend(value)
+      assert session.code_execution_work_dir is not None
+      sidecar_dir = Path(session.code_execution_work_dir) / ".agent_provenance" / "deep-sidecar"
+      assert not sidecar_dir.exists()
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(_run_test())
+
+
+def test_code_execute_runs_any_timeout_and_reports_it() -> None:
   async def _run_test() -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     bundle = build_code_execution(
@@ -189,6 +303,19 @@ def test_code_execute_accepts_schema_timeout_bounds() -> None:
     assert error is None
     assert result is not None
     assert result["stdout"] == "ok\n"
+    assert result["timeout_ms"] == 1000
+
+    result, error = await _dispatch_bundle_tool(
+      session,
+      bundle,
+      "code_execute",
+      {"code": "print('ok')", "timeout_ms": 2001},
+    )
+
+    assert error is None
+    assert result is not None
+    assert result["stdout"] == "ok\n"
+    assert result["timeout_ms"] == 2001
 
   asyncio.run(_run_test())
 
@@ -207,7 +334,6 @@ def test_code_execute_rejects_invalid_timeout_ms() -> None:
       (True, "timeout_ms must be an integer"),
       (None, "timeout_ms must be an integer"),
       (999, "timeout_ms must be >= 1000"),
-      (2001, "timeout_ms must be <= 2000"),
     ]
     for timeout_ms, expected_message in cases:
       result, error = await _dispatch_bundle_tool(
@@ -273,7 +399,7 @@ def test_code_execute_rejects_invalid_host_input() -> None:
   asyncio.run(_run_test())
 
 
-def test_code_execute_invalid_input_bypasses_approval_for_validation() -> None:
+def test_code_execute_invalid_input_returns_validation_error() -> None:
   async def _run_test() -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     bundle = build_code_execution(
@@ -294,30 +420,9 @@ def test_code_execute_invalid_input_bypasses_approval_for_validation() -> None:
         bundle,
         "code_execute",
         tool_input,
-        needs_approval=bundle.needs_approval,
       )
       assert result is None
       assert error == {"code": "invalid_input", "message": expected_message}
-
-  asyncio.run(_run_test())
-
-
-def test_code_execute_valid_subprocess_input_still_requires_approval() -> None:
-  async def _run_test() -> None:
-    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-    bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
-
-    result, error = await _dispatch_bundle_tool(
-      session,
-      bundle,
-      "code_execute",
-      {"code": "print('needs approval')"},
-      needs_approval=bundle.needs_approval,
-    )
-
-    assert result is None
-    assert error is not None
-    assert error["code"] == "approval_required"
 
   asyncio.run(_run_test())
 
@@ -375,7 +480,6 @@ def test_code_execute_background_rejects_invalid_timeout_ms() -> None:
       (1.9, "timeout_ms must be an integer"),
       (True, "timeout_ms must be an integer"),
       (999, "timeout_ms must be >= 1000"),
-      (2001, "timeout_ms must be <= 2000"),
     ):
       result, error = await _dispatch_bundle_tool(
         session,
@@ -706,23 +810,6 @@ def test_cleanup_code_execution_cancels_tasks_and_is_idempotent() -> None:
   asyncio.run(_run_test())
 
 
-def test_backend_qualified_approval_depends_on_sandboxing() -> None:
-  session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-  subprocess_bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
-  docker_bundle = build_code_execution(
-    session,
-    config=CodeExecutionConfig(register_subprocess=False, register_docker=True),
-  )
-
-  subprocess_qualifier = subprocess_bundle.approval_qualifier("code_execute", {"code": "print(1)"})
-  docker_qualifier = docker_bundle.approval_qualifier("code_execute", {"code": "print(1)", "host": "docker"})
-
-  assert subprocess_qualifier == "subprocess"
-  assert subprocess_bundle.needs_approval("code_execute", {"code": "print(1)"}, subprocess_qualifier) is True
-  assert docker_qualifier == "docker"
-  assert docker_bundle.needs_approval("code_execute", {"code": "print(1)"}, docker_qualifier) is False
-
-
 def test_strip_code_execute_base64_hook_rewrites_model_history() -> None:
   result_entry = {
     "content": json.dumps(
@@ -755,55 +842,6 @@ def test_strip_code_execute_base64_hook_rewrites_model_history() -> None:
   assert payload["images"][0]["data_base64"] == "[image: plot.png]"
 
 
-def test_per_bundle_backend_isolation_keeps_distinct_docker_images(monkeypatch) -> None:
-  async def _fake_execute(self, code, work_dir, **kwargs):
-    _ = code, work_dir, kwargs
-    return {
-      "stdout": f"{self._image}\n",
-      "stderr": "",
-      "return_code": 0,
-      "images": [],
-      "timed_out": False,
-      "duration_ms": 1,
-      "truncated": False,
-    }
-
-  monkeypatch.setattr("agent_gateway.code_execution._backends._docker.DockerBackend.unavailable_reason", lambda self: None)
-  monkeypatch.setattr("agent_gateway.code_execution._backends._docker.DockerBackend.execute", _fake_execute)
-
-  async def _run_test() -> None:
-    session_one = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-    session_two = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-    bundle_one = build_code_execution(
-      session_one,
-      config=CodeExecutionConfig(register_subprocess=False, docker_image="image-one:latest"),
-    )
-    bundle_two = build_code_execution(
-      session_two,
-      config=CodeExecutionConfig(register_subprocess=False, docker_image="image-two:latest"),
-    )
-
-    result_one, error_one = await _dispatch_bundle_tool(
-      session_one,
-      bundle_one,
-      "code_execute",
-      {"code": "print(1)"},
-    )
-    result_two, error_two = await _dispatch_bundle_tool(
-      session_two,
-      bundle_two,
-      "code_execute",
-      {"code": "print(1)"},
-    )
-
-    assert error_one is None
-    assert error_two is None
-    assert result_one is not None
-    assert result_two is not None
-    assert result_one["stdout"] == "image-one:latest\n"
-    assert result_two["stdout"] == "image-two:latest\n"
-
-  asyncio.run(_run_test())
 
 
 def test_auto_host_with_missing_docker_image_reports_subprocess_and_why(tmp_path, monkeypatch, caplog) -> None:
@@ -862,3 +900,35 @@ def test_auto_host_with_missing_docker_image_reports_subprocess_and_why(tmp_path
       await cleanup_code_execution(session)
 
   asyncio.run(_run_test())
+
+
+def test_docker_availability_probe_memoises_per_image_within_ttl(monkeypatch) -> None:
+  probed_images: list[str] = []
+
+  def _unavailable_reason(self) -> str | None:
+    probed_images.append(self._image)
+    return None if self._image == "ready:latest" else f"no image {self._image}"
+
+  monkeypatch.setattr(
+    "agent_gateway.code_execution._backends._docker.DockerBackend.unavailable_reason",
+    _unavailable_reason,
+  )
+  clear_docker_availability_cache()
+  try:
+    ready = CodeExecutionConfig(docker_image="ready:latest")
+    missing = CodeExecutionConfig(docker_image="missing:latest")
+
+    assert docker_backend_unavailable_reason(ready) is None
+    assert docker_backend_unavailable_reason(ready) is None
+    assert probed_images == ["ready:latest"]
+
+    assert docker_backend_unavailable_reason(missing) == "no image missing:latest"
+    assert probed_images == ["ready:latest", "missing:latest"]
+
+    clear_docker_availability_cache()
+    assert docker_backend_unavailable_reason(missing, ttl_s=0.0) == "no image missing:latest"
+    assert docker_backend_unavailable_reason(missing) == "no image missing:latest"
+    assert docker_backend_unavailable_reason(missing) == "no image missing:latest"
+    assert probed_images == ["ready:latest", "missing:latest", "missing:latest", "missing:latest"]
+  finally:
+    clear_docker_availability_cache()

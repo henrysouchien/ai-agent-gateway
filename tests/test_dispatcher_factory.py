@@ -81,7 +81,6 @@ def _session(
     kind=kind,  # type: ignore[arg-type]
     channel=channel,
     auth_config={"api_key": "secret"},
-    approved_tool_types={"read"},
   )
 
 
@@ -163,7 +162,6 @@ def test_integrity_guard_uses_a_real_raise_after_session_kind_changes() -> None:
       session_id=session.session_id,
       request_approval=None,
       needs_approval=None,
-      approved_tool_types=set(),
       local_tool_handlers={},
     )
 
@@ -197,7 +195,6 @@ try:
     session_id="session",
     request_approval=None,
     needs_approval=None,
-    approved_tool_types=set(),
     local_tool_handlers={},
   )
 except DispatcherConstructionError:
@@ -239,7 +236,6 @@ def test_chat_embedded_golden_attribute_snapshot_matches_easy_inline() -> None:
     return [{"name": "local"}]
 
   mcp_session_servers = {"session-aware-mcp"}
-  cache_denied = frozenset({"never-cache"})
   commercial_work_start = object()
 
   def commercial_recheck(_context: Any) -> None:
@@ -252,12 +248,10 @@ def test_chat_embedded_golden_attribute_snapshot_matches_easy_inline() -> None:
     local_tool_handlers=local_handlers,
     needs_approval=needs_approval,
     request_approval=request_approval,
-    approved_tool_types=session.approved_tool_types,
     event_log=event_log,
     session_id=session.session_id,
     mcp_session_inject_servers=mcp_session_servers,
     approval_key_qualifier=qualifier,
-    session_cache_denied_tools=cache_denied,
     get_tool_definitions=get_tool_definitions,
     commercial_work_start=commercial_work_start,
     commercial_irreversible_recheck=commercial_recheck,
@@ -276,11 +270,9 @@ def test_chat_embedded_golden_attribute_snapshot_matches_easy_inline() -> None:
     local_tool_handlers=local_handlers,
     needs_approval=needs_approval,
     request_approval=request_approval,
-    approved_tool_types=session.approved_tool_types,
     event_log=event_log,
     session_id=session.session_id,
     mcp_session_inject_servers=mcp_session_servers,
-    session_cache_denied_tools=cache_denied,
     get_tool_definitions=get_tool_definitions,
     commercial_work_start=commercial_work_start,
     commercial_irreversible_recheck=commercial_recheck,

@@ -64,20 +64,27 @@ def test_delivery_schema_preserves_absent_version_v1_and_requires_explicit_v2() 
   )
 
 
-def test_result_requirement_schema_exposes_cross_field_invariants() -> None:
+def test_result_requirement_schema_preserves_declared_result_metadata() -> None:
   schema = public_json_schemas()["result-requirement"]
-  assert schema["properties"]["mode"]["const"] == "narrative"
-  assert schema["properties"]["projection"]["type"] == "null"
-  assert schema["properties"]["terminal_narrative"]["const"] == "required"
+  assert schema["properties"]["mode"]["type"] == "string"
+  assert schema["properties"]["terminal_narrative"]["type"] == "string"
 
   validator = Draft202012Validator(schema)
-  incoherent = {
-    "mode": "strict_projection",
-    "projection": {"contract": {}},
-    "terminal_narrative": "required",
+  declared = {
+    "mode": "domain_result",
+    "projection": {
+      "contract": {
+        "namespace": "agent-gateway",
+        "name": "result-projection",
+        "version": "1.0",
+        "digest": "sha256:" + "a" * 64,
+      },
+      "required": False,
+    },
+    "terminal_narrative": "optional",
     "outcome": {"required": False, "source": "none"},
   }
-  assert list(validator.iter_errors(incoherent))
+  assert list(validator.iter_errors(declared)) == []
 
 
 def test_public_wire_schemas_do_not_expose_storage_or_secret_fields() -> None:

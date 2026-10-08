@@ -12,7 +12,6 @@ from collections.abc import Iterable, Sequence
 from typing import Any, Literal
 
 from agent_workflow_contracts import (
-  AGENT_OPERATION_INSTRUCTIONS_MAX_CHARS,
   AgentOperationRef,
   AgentOperationSnapshot,
   COMMON_CHILD_OPERATION_INSTRUCTIONS,
@@ -121,11 +120,15 @@ def build_agent_operation_snapshot(
   resolved_instructions: str,
   description: str,
   execution_class: str,
+  role: str | None = None,
+  effort: str | None = None,
   required_capabilities: Sequence[SemanticCapabilityRequirement] = (),
   workspace_scope: WorkspaceScope = "read_only",
   required_context: Sequence[str] = (),
   evidence_ports: Sequence[EvidencePort] = (),
   resumable: bool = False,
+  terminal_on_persist: bool = True,
+  children: Sequence[str] = (),
 ) -> AgentOperationSnapshot:
   """Build the canonical immutable snapshot from scalar and wire values."""
 
@@ -141,6 +144,8 @@ def build_agent_operation_snapshot(
       raise ValueError(f"{field_name} must be a canonical non-empty string")
   if type(resumable) is not bool:
     raise TypeError("resumable must be a bool")
+  if type(terminal_on_persist) is not bool:
+    raise TypeError("terminal_on_persist must be a bool")
   if workspace_scope not in {"read_only", "workspace_write", "model_write"}:
     raise ValueError("workspace_scope is invalid")
   if type(methodology_instructions) is not str:
@@ -168,6 +173,9 @@ def build_agent_operation_snapshot(
   ports = _snapshot_sequence(evidence_ports, field_name="evidence_ports")
   if any(type(port) is not EvidencePort for port in ports):
     raise TypeError("evidence_ports must contain exact EvidencePort values")
+  child_names = _snapshot_sequence(children, field_name="children")
+  if any(type(child_name) is not str for child_name in child_names):
+    raise TypeError("children must contain strings")
   prompt_text = compose_operation_instructions(resolved_instructions)
   methodology = _contract_ref(
     namespace="skill-methodology",
@@ -193,11 +201,15 @@ def build_agent_operation_snapshot(
     description=description,
     instructions=prompt_text,
     execution_class=execution_class,
+    role=role,
+    effort=effort,
     required_capabilities=capabilities,
     workspace_scope=workspace_scope,
     required_context=context_names,
     evidence_ports=ports,
     resumable=resumable,
+    terminal_on_persist=terminal_on_persist,
+    children=child_names,
     result_modes=("narrative",),
     projection_contracts=(),
   )
@@ -215,7 +227,6 @@ def build_agent_operation_snapshot(
 
 
 __all__ = [
-  "AGENT_OPERATION_INSTRUCTIONS_MAX_CHARS",
   "COMMON_CHILD_OPERATION_INSTRUCTIONS",
   "OPERATION_LISTING_DESCRIPTION_MAX_CHARS",
   "WorkspaceScope",

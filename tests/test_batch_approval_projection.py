@@ -22,7 +22,10 @@ def _approval_request(
   approval_id: str,
   request_id: str,
   session_id: str,
+  run_id: str = "skill-run-stage",
 ) -> ApprovalRequest:
+  # A batch stage's row: request_id is the batch control id, run_id the
+  # stage's skill run id (api/agent/autonomous/runtime_approval.py).
   return ApprovalRequest(
     approval_id=approval_id,
     tool_call_id="tool-1",
@@ -30,7 +33,7 @@ def _approval_request(
     approval_chain_id=approval_id,
     request_id=request_id,
     session_id=session_id,
-    run_id=request_id,
+    run_id=run_id,
     user_id="1",
     profile="chat",
     channel="tui",
@@ -48,6 +51,7 @@ def _approval_request(
 class _BatchApprovalAdmissionStoreFake:
   def __init__(self, request: ApprovalRequest) -> None:
     self.request = request
+    self.abort_identities: list[tuple[str, str]] = []
 
   async def abort_unpublished_approval(
     self,
@@ -64,13 +68,12 @@ class _BatchApprovalAdmissionStoreFake:
     _ = (
       expected_tool_call_id,
       expected_user_id,
-      expected_request_id,
-      expected_run_id,
       expected_session_id,
       expected_channel,
       decision_reason,
     )
     assert approval_id == self.request.approval_id
+    self.abort_identities.append((expected_request_id, expected_run_id))
     return self.request, False, True
 
   async def fence_persistent_grants_for_cancellation(
@@ -203,12 +206,18 @@ def test_projection_is_exact_owner_channel_run_and_identity_scoped() -> None:
     tool_call_id="tool-1",
     user_id="1",
     request_id="batch_59",
-    run_id="batch_59",
+    run_id="skill-run-stage",
     session_id="stage-session",
     channel="tui",
   )
   assert approval_record_matches_projection(durable, projection)
   durable.user_id = "henry"
+  assert not approval_record_matches_projection(durable, projection)
+  durable.user_id = "1"
+  durable.request_id = "batch_60"
+  assert not approval_record_matches_projection(durable, projection)
+  durable.request_id = "batch_59"
+  durable.run_id = ""
   assert not approval_record_matches_projection(durable, projection)
 
 
@@ -443,6 +452,61 @@ def test_batch_freeze_drains_admitted_approval_before_snapshot() -> None:
     assert [projection.approval_id for projection in frozen] == [
       "approval-admitted-before-freeze"
     ]
+
+  asyncio.run(run_case())
+
+
+def test_admission_binds_stage_request_by_batch_request_id_and_aborts_by_its_run_id() -> None:
+  async def run_case() -> None:
+    registry = BatchApprovalProjectionRegistry()
+    session = _session()
+    request = _approval_request(
+      approval_id="approval-stage",
+      request_id="batch_21",
+      session_id=session.session_id,
+      run_id="skill-run-abc",
+    )
+    other_batch = _approval_request(
+      approval_id="approval-other-batch",
+      request_id="batch_22",
+      session_id=session.session_id,
+      run_id="skill-run-abc",
+    )
+    store = _BatchApprovalAdmissionStoreFake(request)
+    scope = BatchApprovalScope(
+      batch_id=21,
+      owner_user_id="1",
+      channel="tui",
+      store=store,
+      policy=object(),
+      registry=registry,
+    )
+    scope.register_session(session)
+
+    rejected = scope.acquire_admission(session)
+    with pytest.raises(ValueError, match="durable identity mismatch"):
+      rejected.bind_request(request=other_batch, store=store)
+    rejected.release()
+
+    admission = scope.acquire_admission(session)
+    admission.bind_request(request=request, store=store)
+    await admission.abort_unpublished()
+    admission.release()
+    assert store.abort_identities == [("batch_21", "skill-run-abc")]
+
+    published = scope.acquire_admission(session)
+    published.bind_request(request=request, store=store)
+    _install_pending(session, "approval-stage")
+    published.publish_pending()
+    projection = registry.find_projection(
+      run_id="batch_21",
+      approval_id="approval-stage",
+      owner_user_id="1",
+      channel="tui",
+    )
+    assert projection is not None
+    assert approval_record_matches_projection(request, projection)
+    assert not approval_record_matches_projection(other_batch, projection)
 
   asyncio.run(run_case())
 

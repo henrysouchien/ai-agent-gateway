@@ -10,6 +10,8 @@ from agent_workflow_contracts import (
   AgentExecutionSnapshot,
   ExecuteTaskDisposition,
   OrdinaryDelegationTaskRef,
+  OutcomeRequirement,
+  ResultRequirement,
   ToolGrant,
   ToolGrantEntry,
   canonical_json_bytes,
@@ -24,7 +26,6 @@ from agent_gateway.execution_snapshot import (
   resume_agent_execution_snapshot,
 )
 from agent_gateway.sub_agent import (
-  _canonical_result_requirement,
   _ordinary_admitted_task_factory,
   seal_admitted_task_payload,
 )
@@ -162,7 +163,7 @@ Explore the admitted question.
     policy_revision="test-policy.1",
     selection_source="internal_policy",
   )
-  requirement = _canonical_result_requirement(operation=operation)
+  requirement = ResultRequirement(outcome=OutcomeRequirement())
   execution_snapshot = build_agent_execution_snapshot(
     operation=operation,
     result_instructions=render_result_instructions(requirement),
@@ -171,8 +172,6 @@ Explore the admitted question.
       "reference": "/tmp/admitted-methodology.json",
     },
     methodology_state_instructions="Use the exact persisted methodology state.",
-    max_turns=10,
-    client_timeout_seconds=90,
     max_tokens=64_000,
     cost_observation_threshold_usd=50,
     provider_tool_definitions=(),
@@ -367,33 +366,3 @@ Explore the admitted question.
   )
   with pytest.raises(ValueError, match="exact ordered tool grant"):
     AdmittedTask.model_validate(seal_admitted_task_payload(reversed_routes))
-
-
-@pytest.mark.parametrize(
-  "value",
-  [True, "6", 0, -1, float("nan"), float("inf")],
-)
-def test_execution_snapshot_rejects_invalid_budget(
-  tmp_path: Path,
-  value: object,
-) -> None:
-  (tmp_path / "explore.md").write_text(
-    "---\nname: explore\nversion: '1.0'\nagent_callable: true\n"
-    "agent_description: Explore.\nmutation_mode: read_only\n---\nExplore.\n",
-    encoding="utf-8",
-  )
-  operation = SkillLoader(tmp_path).resolve_operation(None).snapshot
-  requirement = _canonical_result_requirement(operation=operation)
-  with pytest.raises(ValueError, match="max_budget_usd"):
-    build_agent_execution_snapshot(
-      operation=operation,
-      result_instructions=render_result_instructions(requirement),
-      admission_date="2026-08-19",
-      max_turns=1,
-      client_timeout_seconds=1,
-      max_tokens=1,
-      cost_observation_threshold_usd=None,
-      provider_tool_definitions=(),
-      max_resume_chain_depth=0,
-      max_budget_usd=value,  # type: ignore[arg-type]
-    )

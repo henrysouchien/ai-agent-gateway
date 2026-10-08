@@ -572,6 +572,41 @@ def test_stream_maps_sdk_objects_and_terminal_usage_once() -> None:
   assert collected[1].raw_block["textSignature"].startswith('{"v":"openai.responses.text.v1"')
   assert (collected[2].input_tokens, collected[2].cache_read_tokens) == (75, 25)
   assert (collected[3].output_tokens, collected[3].reasoning_tokens) == (40, 10)
+  assert collected[4].request_input_tokens == 100
+
+
+@pytest.mark.parametrize(
+  ("usage", "request_input_tokens", "billed_input", "cached"),
+  [
+    ({"input_tokens": 100, "input_tokens_details": {"cached_tokens": 25}}, 100, 75, 25),
+    ({"input_tokens": 100}, 100, 100, 0),
+    ({"input_tokens": 0}, 0, 0, 0),
+    ({}, None, 0, 0),
+    ({"input_tokens": None}, None, 0, 0),
+    ({"input_tokens_details": {"cached_tokens": 25}}, None, 0, 25),
+    (None, None, 0, 0),
+  ],
+)
+def test_stream_reports_absolute_request_input_separately_from_billing(
+  usage: dict[str, Any] | None,
+  request_input_tokens: int | None,
+  billed_input: int,
+  cached: int,
+) -> None:
+  response: dict[str, Any] = {"status": "completed"}
+  if usage is not None:
+    response["usage"] = {**usage, "output_tokens": 7}
+  client = _StreamingClient([{"type": "response.completed", "response": response}])
+
+  events = asyncio.run(_collect(OpenAIProvider(), client))
+
+  starts = [event for event in events if event.type == "message_start"]
+  ends = [event for event in events if event.type == "message_end"]
+  assert len(starts) == len(ends) == 1
+  assert (starts[0].input_tokens, starts[0].cache_read_tokens) == (billed_input, cached)
+  assert sum(event.output_tokens for event in events) == (7 if usage is not None else 0)
+  assert ends[0].request_input_tokens == request_input_tokens
+  assert ends[0].stop_reason == "end_turn"
 
 
 def test_failed_response_emits_billable_usage_and_terminal_event_before_error() -> None:
@@ -601,6 +636,7 @@ def test_failed_response_emits_billable_usage_and_terminal_event_before_error() 
   assert (collected[0].input_tokens, collected[0].cache_read_tokens) == (15, 3)
   assert (collected[1].output_tokens, collected[1].reasoning_tokens) == (7, 2)
   assert collected[2].stop_reason == "error"
+  assert collected[2].request_input_tokens == 18
 
 
 async def _collect(provider: OpenAIProvider, client: _StreamingClient):
@@ -868,7 +904,7 @@ def test_runner_executes_responses_tool_loop_and_replays_function_output() -> No
     rate_table_version="test",
     emit_session_recap=False,
   )
-  asyncio.run(runner.run([{"role": "user", "content": "look up x"}], max_turns=3))
+  asyncio.run(runner.run([{"role": "user", "content": "look up x"}]))
   assert len(responses.requests) == 2
   second_input = responses.requests[1]["input"]
   replayed_call = next(
@@ -1069,7 +1105,7 @@ def test_standalone_runner_keeps_raw_execution_separate_from_safe_history(
 
   monkeypatch.setattr(builtins, "__import__", import_without_host_redaction)
   caplog.set_level("INFO", logger="agent_gateway.runner")
-  asyncio.run(runner.run([{"role": "user", "content": "load prices"}], max_turns=4))
+  asyncio.run(runner.run([{"role": "user", "content": "load prices"}]))
 
   assert handler_inputs == [valid_input]
   assert len(responses.requests) == 3

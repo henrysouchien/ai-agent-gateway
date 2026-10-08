@@ -160,6 +160,53 @@ def test_typed_event_policy_projects_authored_text_and_leaves_results_alone() ->
   assert sanitize_tool_event(returned, sink="replay") == returned
 
 
+@pytest.mark.parametrize("sink", ["durable_event", "stream_event"])
+def test_planned_calls_redact_credentials_without_mutating_execution_input(sink: str) -> None:
+  secret = "CUSTOM-ACTIVE-PLANNED-CREDENTIAL-8f21d7"
+  tool_id = "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"
+  boundary = SecretBoundary.from_auth_config({"api_key": secret})
+  event = {
+    "type": "tool_calls_planned",
+    "turn": 1,
+    "calls": [
+      {
+        "tool_call_id": tool_id,
+        "tool_name": "search",
+        "tool_input": {"query": f"find {secret}"},
+        "display": {"label": "Searching", "detail": secret},
+      },
+      {
+        "tool_call_id": "quote-2",
+        "tool_name": "get_quote",
+        "tool_input": {"ticker": "NVDA"},
+        "display": {"label": "Get quote", "detail": "NVDA"},
+      },
+    ],
+  }
+
+  projected = sanitize_tool_event(event, sink=sink, boundary=boundary)
+
+  assert projected == {
+    **event,
+    "calls": [
+      {
+        **event["calls"][0],
+        "tool_input": {"query": f"find {REDACTED_SECRET}"},
+        "display": {"label": "Searching", "detail": REDACTED_SECRET},
+      },
+      event["calls"][1],
+    ],
+  }
+  started = sanitize_tool_event(
+    {"type": "tool_call_start", **event["calls"][0]},
+    sink=sink,
+    boundary=boundary,
+  )
+  assert projected["calls"][0]["tool_call_id"] == started["tool_call_id"] == tool_id
+  assert event["calls"][0]["tool_input"]["query"] == f"find {secret}"
+  assert event["calls"][0]["display"]["detail"] == secret
+
+
 def test_sanitizer_failure_returns_fixed_tombstone(monkeypatch: pytest.MonkeyPatch) -> None:
   def _raise(self, value, *, sink):
     del self, value, sink

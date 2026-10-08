@@ -13,11 +13,18 @@ import threading
 import pytest
 
 from agent_gateway.fork_ledger import (
-  ForkAdmissionBudgetExceeded,
-  ForkAdmissionQuotaExceeded,
+  FORK_LEDGER_SCHEMA_VERSION,
   ForkLedger,
   ForkLedgerClockRollback,
+  ForkLedgerUnavailable,
 )
+
+# Written by the v1 ``ForkLedger`` (9bc6620595) at 2026-07-27T12:00Z as
+# process ``boot-1``: ``v1-settled`` settled at $0.50 of a $2.00 reservation,
+# ``v1-abandoned`` abandoned at $2.00, ``v1-in-flight`` started with $2.00
+# reserved, ``v1-refused`` abandoned at its $1.00 reservation after v1 refused
+# to settle its $1.50 actual, and one pending receipt for ``v1-settled``.
+_V1_FIXTURE = Path(__file__).parent / "fixtures" / "fork_ledger_v1.sqlite3"
 
 
 def _ns(year: int, month: int, day: int, hour: int = 12) -> int:
@@ -63,15 +70,11 @@ def _reserve(
   *,
   owner: str = "owner-1",
   per_fork: str = "2.00",
-  daily: str = "10.00",
-  quota: int = 12,
 ):
   return ledger.reserve_admission(
     fork_id=fork_id,
     owner=owner,
     max_reserved_usd=per_fork,
-    daily_budget_usd=daily,
-    daily_invocation_quota=quota,
   )
 
 
@@ -130,13 +133,11 @@ def _process_reserve_worker(
   )
   barrier.wait()
   try:
-    _reserve(ledger, f"process-fork-{process_number}", quota=5)
-  except ForkAdmissionQuotaExceeded:
-    result = "refused"
+    reservation = _reserve(ledger, f"process-fork-{process_number}")
   except BaseException as exc:
-    result = f"error:{type(exc).__name__}:{exc}"
+    result: object = f"error:{type(exc).__name__}:{exc}"
   else:
-    result = "admitted"
+    result = reservation.day_invocations
   connection.send(result)
   connection.close()
 
@@ -331,56 +332,45 @@ def test_receipt_fork_id_dedup_is_idempotent_but_rejects_rebinding(
     )
 
 
-def test_atomic_owner_admission_allows_one_concurrent_caller(
+def test_concurrent_owner_admissions_count_each_exactly_once(
   tmp_path: Path,
 ) -> None:
   ledger = _ledger(tmp_path)
   barrier = threading.Barrier(2)
 
-  def reserve(fork_id: str) -> str:
+  def reserve(fork_id: str) -> int:
     barrier.wait()
-    try:
-      _reserve(ledger, fork_id, quota=1)
-    except ForkAdmissionQuotaExceeded:
-      return "quota"
-    return "reserved"
+    return _reserve(ledger, fork_id).day_invocations
 
   with ThreadPoolExecutor(max_workers=2) as pool:
     results = tuple(pool.map(reserve, ("fork-a", "fork-b")))
 
-  assert sorted(results) == ["quota", "reserved"]
-  records = [
-    ledger.get_admission("fork-a"),
-    ledger.get_admission("fork-b"),
-  ]
-  assert sum(record is not None for record in records) == 1
+  assert sorted(results) == [1, 2]
+  assert ledger.get_admission("fork-a") is not None
+  assert ledger.get_admission("fork-b") is not None
 
 
-def test_quota_and_budget_exhaustion_refuse_without_open_row(
+def test_day_totals_are_measured_past_any_former_quota_or_budget(
   tmp_path: Path,
 ) -> None:
   ledger = _ledger(tmp_path)
-  _reserve(ledger, "quota-first", quota=1)
-  with pytest.raises(ForkAdmissionQuotaExceeded):
-    _reserve(ledger, "quota-refused", quota=1)
-  assert ledger.get_admission("quota-refused") is None
+  reservations = [
+    _reserve(ledger, f"fork-{index}", per_fork="2.00")
+    for index in range(13)
+  ]
 
-  _reserve(
-    ledger,
-    "budget-first",
-    owner="owner-budget",
-    per_fork="2.00",
-    daily="3.00",
-  )
-  with pytest.raises(ForkAdmissionBudgetExceeded):
-    _reserve(
-      ledger,
-      "budget-refused",
-      owner="owner-budget",
-      per_fork="2.00",
-      daily="3.00",
-    )
-  assert ledger.get_admission("budget-refused") is None
+  assert [item.day_invocations for item in reservations] == list(range(1, 14))
+  assert reservations[-1].day_charged_microusd == 13 * 2_000_000
+  assert reservations[-1].record.state == "reserved"
+  assert ledger.get_admission("fork-12") is not None
+
+  assert ledger.mark_admission_started(fork_id="fork-0")
+  assert ledger.settle_admission(fork_id="fork-0", actual_cost_usd="0.50")
+  other = _reserve(ledger, "after-settle", per_fork="2.00")
+  assert other.day_charged_microusd == 500_000 + 13 * 2_000_000
+
+  isolated = _reserve(ledger, "other-owner", owner="owner-2")
+  assert isolated.day_invocations == 1
 
 
 def test_settle_records_actual_cost(tmp_path: Path) -> None:
@@ -398,6 +388,116 @@ def test_settle_records_actual_cost(tmp_path: Path) -> None:
   assert record.state == "settled"
   assert record.max_reserved_usd == Decimal("2.000000")
   assert record.settled_usd == Decimal("1.234567")
+
+
+def test_settle_records_actual_above_its_reservation(tmp_path: Path) -> None:
+  ledger = _ledger(tmp_path)
+  _reserve(ledger, "fork-1", per_fork="2.00")
+
+  assert ledger.mark_admission_started(fork_id="fork-1")
+  assert ledger.settle_admission(fork_id="fork-1", actual_cost_usd="7.654321")
+
+  record = ledger.get_admission("fork-1")
+  assert record is not None
+  assert record.state == "settled"
+  assert record.max_reserved_usd == Decimal("2.000000")
+  assert record.settled_usd == Decimal("7.654321")
+  assert _reserve(ledger, "fork-2").day_charged_microusd == (
+    7_654_321 + 2_000_000
+  )
+
+
+def _v1_ledger_file(tmp_path: Path) -> Path:
+  path = tmp_path / "fork-ledger.sqlite3"
+  path.write_bytes(_V1_FIXTURE.read_bytes())
+  path.chmod(0o600)
+  return path
+
+
+def test_v1_ledger_migrates_to_v2_and_settles_above_reservation(
+  tmp_path: Path,
+) -> None:
+  path = _v1_ledger_file(tmp_path)
+  with sqlite3.connect(path) as connection:
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+
+  ledger = _ledger(tmp_path, clock=MutableClock(_ns(2026, 7, 27, 13)))
+
+  with sqlite3.connect(path) as connection:
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert connection.execute(
+      "SELECT * FROM fork_ledger_metadata"
+    ).fetchall() == [(1, FORK_LEDGER_SCHEMA_VERSION, "UTC", "micro_usd")]
+    assert {
+      name for (name,) in connection.execute(
+        "SELECT name FROM sqlite_master WHERE name LIKE '%_v1'"
+      )
+    } == set()
+  preserved = {
+    fork_id: ledger.get_admission(fork_id)
+    for fork_id in ("v1-settled", "v1-abandoned", "v1-in-flight", "v1-refused")
+  }
+  assert {
+    fork_id: (
+      record.state,
+      record.max_reserved_usd,
+      record.settled_usd,
+      record.process_instance_id,
+    )
+    for fork_id, record in preserved.items()
+    if record is not None
+  } == {
+    "v1-settled": ("settled", Decimal("2.000000"), Decimal("0.500000"), "boot-1"),
+    "v1-abandoned": (
+      "abandoned", Decimal("2.000000"), Decimal("2.000000"), "boot-1",
+    ),
+    "v1-in-flight": ("started", Decimal("2.000000"), None, "boot-1"),
+    "v1-refused": (
+      "abandoned", Decimal("1.000000"), Decimal("1.000000"), "boot-1",
+    ),
+  }
+
+  assert ledger.settle_admission(
+    fork_id="v1-in-flight",
+    actual_cost_usd="3.250000",
+  )
+  in_flight = ledger.get_admission("v1-in-flight")
+  assert in_flight is not None
+  assert in_flight.state == "settled"
+  assert in_flight.settled_usd == Decimal("3.250000")
+
+  reservation = _reserve(ledger, "v2-fork", per_fork="1.00")
+  assert reservation.day_invocations == 5
+  assert reservation.day_charged_microusd == (
+    500_000 + 2_000_000 + 3_250_000 + 1_000_000 + 1_000_000
+  )
+  assert ledger.mark_admission_started(fork_id="v2-fork")
+  assert ledger.settle_admission(fork_id="v2-fork", actual_cost_usd="4.00")
+  settled = ledger.get_admission("v2-fork")
+  assert settled is not None
+  assert settled.settled_usd == Decimal("4.000000")
+
+  claims = ledger.claim_pending_receipts(
+    session_id="session-1",
+    owner="owner-1",
+    claiming_turn_id="turn-1",
+  )
+  assert [claim.receipt_text for claim in claims] == ["v1-settled completed."]
+
+
+def test_unrecognized_v1_schema_is_refused_unchanged(tmp_path: Path) -> None:
+  path = _v1_ledger_file(tmp_path)
+  with sqlite3.connect(path) as connection:
+    connection.execute("CREATE TABLE stray (value INTEGER)")
+
+  with pytest.raises(ForkLedgerUnavailable, match="objects are incompatible"):
+    _ledger(tmp_path, clock=MutableClock(_ns(2026, 7, 27, 13)))
+
+  with sqlite3.connect(path) as connection:
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert connection.execute(
+      "SELECT schema_version FROM fork_ledger_metadata"
+    ).fetchone()[0] == 1
 
 
 def test_fresh_boot_recovers_unknown_hard_death_and_redelivers_once(
@@ -458,7 +558,7 @@ def test_fresh_boot_recovers_unknown_hard_death_and_redelivers_once(
   ) == ()
 
 
-def test_atomic_owner_admission_across_processes_admits_exactly_quota(
+def test_cross_process_admissions_count_each_exactly_once(
   tmp_path: Path,
 ) -> None:
   context = multiprocessing.get_context("spawn")
@@ -486,25 +586,24 @@ def test_atomic_owner_admission_across_processes_admits_exactly_quota(
     process.join(15)
     assert process.exitcode == 0
 
-  assert not [result for result in results if result.startswith("error:")]
-  assert results.count("admitted") == 5
-  assert results.count("refused") == 7
+  assert sorted(results) == list(range(1, 13))
 
 
 
 
-def test_utc_day_rollover_resets_availability(tmp_path: Path) -> None:
+def test_utc_day_rollover_resets_day_totals(tmp_path: Path) -> None:
   clock = MutableClock(_ns(2026, 7, 27, 23))
   ledger = _ledger(tmp_path, clock=clock)
-  first = _reserve(ledger, "day-one", quota=1)
-  with pytest.raises(ForkAdmissionQuotaExceeded):
-    _reserve(ledger, "same-day", quota=1)
+  first = _reserve(ledger, "day-one")
+  same_day = _reserve(ledger, "same-day")
 
   clock.value = _ns(2026, 7, 28, 0)
-  second = _reserve(ledger, "day-two", quota=1)
+  second = _reserve(ledger, "day-two")
 
-  assert first.date == "2026-07-27"
-  assert second.date == "2026-07-28"
+  assert first.record.date == "2026-07-27"
+  assert same_day.day_invocations == 2
+  assert second.record.date == "2026-07-28"
+  assert second.day_invocations == 1
 
 
 def test_clock_rollback_is_detected_and_writes_nothing(

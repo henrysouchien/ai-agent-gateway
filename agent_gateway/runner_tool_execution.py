@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+from pathlib import Path
 import time
 from typing import AbstractSet, TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Protocol, Tuple, runtime_checkable
 
@@ -21,7 +22,7 @@ from .runner_session_events import (
   build_tool_call_start_event as _build_tool_call_start_event,
 )
 from .runner_session_lifecycle import _runner_attr
-from .policy_imports import load_server_policy_module
+from .policy_imports import role_policy_denies_tool
 from .runner_state import ToolResultContext
 from .secret_boundary import (
   SecretBoundary,
@@ -44,6 +45,7 @@ from .tool_dispatch_classification import (
   retry_decision,
 )
 from .tool_result_compaction import project_tool_call_complete_for_stream
+from .tool_result_spill import SpillPublication
 from .workflow_evidence_provenance import (
   WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY as _WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY,
 )
@@ -59,16 +61,14 @@ if TYPE_CHECKING:
   from .approval_policy import RunContext
   from .event_log import EventLog
   from .mcp_client import McpClientManager
+  from .task_registry import TaskRegistry
 
 
 
 log = logging.getLogger("agent_gateway.runner")
 _ACTIVE_SKILL_ALLOW_RESULT_KEY = "_active_skill_allow"
-_ACTIVE_SKILL_DENY_RESULT_KEY = "_active_skill_deny"
-_ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY = "_active_skill_report_doors"
 _READABLE_RESOURCE_SNAPSHOT_RESULT_KEY = "_readable_resource_snapshot"
 _READABLE_RESOURCE_MAX_CONTENT_BYTES = 2_000_000
-_REPEATED_TOOL_EXCLUDED_FINAL_ANSWER_COUNT = 2
 
 
 
@@ -183,49 +183,6 @@ class AgentRunnerDispatcher(Protocol):
     prepared_call: PreparedToolCall,
   ) -> ToolResultSettlement: ...
 
-_FMS_COMMIT_TOOL_ACTION_CODES = {
-  "fms_link_thesis": "link_thesis",
-  "fms_persist_business_model": "persist_business_model",
-  "fms_persist_dcf_relative_valuation": "persist_dcf_relative_valuation",
-  "fms_persist_earnings_scenarios": "persist_earnings_scenarios",
-  "fms_persist_forecast_assumptions": "persist_forecast_assumptions",
-  "fms_persist_model_update": "persist_model_update",
-  "fms_persist_scenario_multiple_pricing": "persist_scenario_multiple_pricing",
-  "fms_persist_ticker_triage": "persist_ticker_triage",
-  "fms_persist_valuation_inputs": "persist_valuation_inputs",
-  "fms_record_decision_log": "record_decision_log",
-  "fms_report_business_quality_assessment": "report_business_quality_assessment",
-  "fms_report_idea_to_thesis": "report_idea_to_thesis",
-  "fms_report_thesis_consultation": "report_thesis_consultation",
-  "fms_resolve_outcome_contracts": "resolve_outcome_contracts",
-}
-_FMS_COMMIT_TOOL_STAGES = {
-  "fms_link_thesis": "research",
-  "fms_persist_business_model": "bm",
-  "fms_persist_dcf_relative_valuation": "valuation",
-  "fms_persist_earnings_scenarios": "scenarios",
-  "fms_persist_forecast_assumptions": "forecast",
-  "fms_persist_model_update": "build",
-  "fms_persist_scenario_multiple_pricing": "valuation",
-  "fms_persist_ticker_triage": "research",
-  "fms_persist_valuation_inputs": "valuation",
-  "fms_record_decision_log": "review",
-  "fms_report_business_quality_assessment": "diligence",
-  "fms_report_idea_to_thesis": "research",
-  "fms_report_thesis_consultation": "diligence",
-  "fms_resolve_outcome_contracts": "review",
-}
-_OUTPUT_FILE_GATED_TOOL_ALTERNATIVES: dict[str, dict[str, Any]] = {
-  "analyze_stock": {
-    "suggested_tools": ["get_quote", "industry_peer_comparison"],
-    "resolution": (
-      "Use inline read tools instead: get_quote for price/profile context and "
-      "industry_peer_comparison(symbol=...) for peer metrics. For methodology-backed "
-      "risk analysis, use the quantifying-risk skill."
-    ),
-  },
-}
-
 
 def _canonical_agent_result_payload(result: Any) -> tuple[Any, dict[str, Any] | None]:
   """Serialize only the normalized agent-result wire models.
@@ -259,54 +216,59 @@ def _is_accepted_ui_blocks_result(tool_name: str, result: Any, error: Any) -> bo
   return isinstance(accepted, dict) and isinstance(accepted.get("ui_blocks_id"), str)
 
 
-def _record_tool_excluded_attempt(runner: Any, tool_name: str) -> int:
-  counts = getattr(runner, "_tool_excluded_attempt_counts", None)
-  if not isinstance(counts, dict):
-    counts = {}
-    setattr(runner, "_tool_excluded_attempt_counts", counts)
-  count = int(counts.get(tool_name, 0)) + 1
-  counts[tool_name] = count
-  return count
+_TOOL_EXCLUSION_OWNER_TEXT = {
+  "role": "the session role's denied tools (role policy)",
+  "skill_or_operation_grant": (
+    "this skill run's excluded tools (the profile's static excludes, the "
+    "skill's declared excludes and, in a delegated run, the tools its "
+    "operation grant omits; the run holds only their union, so it cannot "
+    "say which one)"
+  ),
+  "profile": "the profile's static excluded tools",
+}
 
 
-def final_answer_turn_reminder(tool_name: str) -> str:
-  """The model-visible instruction that spends the guarded last turn."""
-
-  return (
-    f"'{tool_name}' is excluded in this context and will not become "
-    "available; the run has stopped expanding. This is your final turn: "
-    "answer now from the evidence already produced, or state the blocked "
-    "or partial verdict. Do not call tools."
-  )
-
-
-def _augment_repeated_tool_excluded_error(
-  error: Dict[str, Any],
-  *,
+def _tool_excluded_error(
   tool_name: str,
-  exclusion_count: int,
+  *,
+  run_context: Any,
+  is_local: bool,
 ) -> Dict[str, Any]:
-  augmented = dict(error)
-  data = dict(augmented.get("data") or {})
-  resolution = (
-    "Do not retry this excluded tool in the current context. Use an available "
-    "tool path, emit the appropriate blocked/partial verdict, or finish with "
-    "the durable evidence already produced."
-  )
-  data.update({
-    "blocked_tool": tool_name,
-    "exclusion_count": exclusion_count,
-    "repeated_tool_excluded": True,
-    "final_answer_turn": True,
-    "resolution": resolution,
-  })
-  augmented["data"] = data
-  augmented["sub_code"] = "repeated_tool_excluded"
-  augmented["message"] = (
-    f"Tool '{tool_name}' is not available in this context and was retried "
-    f"{exclusion_count} times. {resolution}"
-  )
-  return augmented
+  """Name the set that excludes ``tool_name``; no set names an alternate."""
+
+  role = getattr(run_context, "decider_role", None)
+  profile = getattr(run_context, "profile", None)
+  skill = getattr(run_context, "skill", None)
+  if role is not None and role_policy_denies_tool(
+    role=role,
+    tool_name=tool_name,
+    is_local=is_local,
+  ):
+    owner = "role"
+  elif skill:
+    # sub_agent.py merges the skill's excludes and the tools operation
+    # admission left out of the grant into one `excluded_tools` set before
+    # this runner exists, and the run context carries no grant, so the
+    # owner names both rather than asserting the skill.
+    owner = "skill_or_operation_grant"
+  else:
+    owner = "profile"
+  data: Dict[str, Any] = {"excluding_owner": owner}
+  if profile:
+    data["profile"] = profile
+  if skill:
+    data["skill"] = skill
+  if owner == "role":
+    data["role"] = role
+  return {
+    "code": "tool_excluded",
+    "message": (
+      f"Tool '{tool_name}' is excluded by {_TOOL_EXCLUSION_OWNER_TEXT[owner]} "
+      "and is not available in this run."
+    ),
+    "data": data,
+    "next_call": None,
+  }
 
 
 def _readable_resource_created_at(timestamp: float) -> str:
@@ -400,99 +362,19 @@ def _readable_resource_event_from_snapshot(
   return event
 
 
-def _fms_commit_tool_names() -> frozenset[str]:
-  policy = load_server_policy_module()
-  return frozenset(getattr(policy, "FMS_MODEL_WRITER_TOOLS", ())) | frozenset(
-    getattr(policy, "FMS_THESIS_WRITER_TOOLS", ())
-  )
-
-
-def _output_file_gated_tool_names() -> frozenset[str]:
-  policy = load_server_policy_module()
-  getter = getattr(policy, "get_output_file_tools", None)
-  return frozenset(getter()) if getter is not None else frozenset()
-
-
-def _fms_commit_blocker_error(tool_name: str) -> Dict[str, Any] | None:
-  normalized = str(tool_name or "").strip()
-  if normalized not in _fms_commit_tool_names():
-    return None
-  action_code = _FMS_COMMIT_TOOL_ACTION_CODES.get(normalized, normalized)
-  stage = _FMS_COMMIT_TOOL_STAGES.get(normalized, "build")
-  resolution = (
-    "Run this commit tool in an interactive model-writer/thesis-writer "
-    "session with operator approval, then retry the blocked workflow."
-  )
-  message = (
-    f"Tool '{normalized}' is a canonical FMS commit tool and requires interactive "
-    "approval in this context. Emit BUILD_BLOCKED with error.data.pending_action, "
-    "preserve any approval-ready payload, then retry from an interactive session "
-    "after operator approval."
-  )
-  return {
-    "code": "tool_excluded",
-    "sub_code": "requires_interactive_approval",
-    "message": message,
-    "data": {
-      "blocked_tool": normalized,
-      "tool_family": "fms_commit",
-      "tool_class": "state_write",
-      "requires_interactive_approval": True,
-      "recommended_verdict": "BUILD_BLOCKED",
-      "resolution": resolution,
-      "pending_action": {
-        "code": action_code,
-        "stage": stage,
-        "message": f"Run {normalized} interactively with operator approval, then retry the workflow.",
-        "severity": "blocking",
-        "target": normalized,
-        "source": "runner_tool_exclusion",
-        "metadata": {
-          "blocked_tool": normalized,
-          "requires_interactive_approval": True,
-          "tool_class": "state_write",
-          "resolution": resolution,
-        },
-      },
-    },
-  }
-
-
-def _output_file_gated_tool_error(tool_name: str) -> Dict[str, Any] | None:
-  normalized = str(tool_name or "").strip()
-  if normalized not in _output_file_gated_tool_names():
-    return None
-  alternatives = _OUTPUT_FILE_GATED_TOOL_ALTERNATIVES.get(normalized, {})
-  resolution = str(
-    alternatives.get("resolution")
-    or "Use an available inline read tool, or retry from an approved file-output workflow."
-  )
-  data: Dict[str, Any] = {
-    "blocked_tool": normalized,
-    "tool_class": "read",
-    "output_file_gated": True,
-    "resolution": resolution,
-  }
-  suggested_tools = alternatives.get("suggested_tools")
-  if isinstance(suggested_tools, list) and suggested_tools:
-    data["suggested_tools"] = [str(tool) for tool in suggested_tools if str(tool or "").strip()]
-  return {
-    "code": "tool_excluded",
-    "sub_code": "output_file_gated_tool_excluded",
-    "message": (
-      f"Tool '{normalized}' is output-file gated and is not available in this "
-      f"context without an approved output='file' workflow. {resolution}"
-    ),
-    "data": data,
-  }
+# A refusal's model-visible repair facts ride in ``error.data``, the one place
+# the model reads them: FMS doors write them there, and every other producer
+# sets them top-level on its error dict, carried over here. ``next_call`` keeps
+# an explicit ``None`` — "no repair call" is the producer's answer too.
+_MODEL_VISIBLE_ERROR_KEYS = ("tool_usage_hint", "next_call", "missing_keys", "fix", "details")
 
 
 def _model_error_data(error: Dict[str, Any]) -> Dict[str, Any] | None:
   raw_data = error.get("data")
   data: Dict[str, Any] = dict(raw_data) if isinstance(raw_data, dict) else {}
-  hint = error.get("tool_usage_hint")
-  if isinstance(hint, str) and hint.strip() and "tool_usage_hint" not in data:
-    data["tool_usage_hint"] = hint
+  for key in _MODEL_VISIBLE_ERROR_KEYS:
+    if key in error and key not in data:
+      data[key] = error[key]
   return data or None
 
 
@@ -525,7 +407,10 @@ class RunnerToolExecutionMixin:
     _request_id: str
     _sid: str
     _skill_run_id: str | None
+    _task_registry: TaskRegistry
     _tool_abort_event: asyncio.Event
+    # Expected duration of a local tool call, a measurement logged when
+    # exceeded; never a deadline.
     _tool_call_timeout: float | None
     _workspace_dir: str | None
 
@@ -534,14 +419,6 @@ class RunnerToolExecutionMixin:
       tool_names: Any,
       base_kwargs: Dict[str, Any],
     ) -> None: ...
-
-    def _activate_skill_deny(
-      self,
-      tool_names: Any,
-      base_kwargs: Dict[str, Any],
-    ) -> None: ...
-
-    def _activate_skill_report_doors(self, value: Any) -> None: ...
 
     @staticmethod
     def _annotate_result(
@@ -573,17 +450,12 @@ class RunnerToolExecutionMixin:
       request_id: str | None = None,
     ) -> None: ...
 
-    def _clear_active_skill_if_report_door_completed(
-      self,
-      event: Dict[str, Any],
-      base_kwargs: Dict[str, Any],
-    ) -> bool: ...
-
     def _compact_model_tool_result_entry(
       self,
       result_entry: Dict[str, Any],
       *,
       tool_name: str,
+      on_spill_publication: Callable[[SpillPublication], None] | None = None,
     ) -> tuple[Dict[str, Any], Dict[str, Any]]: ...
 
     def _effective_excluded_tools(self) -> set[str]: ...
@@ -620,7 +492,6 @@ class RunnerToolExecutionMixin:
     logger = _runner_attr(self, "log", log)
     time_module = _runner_attr(self, "time", time)
     asyncio_module = _runner_attr(self, "asyncio", asyncio)
-    timeout_error_type = getattr(asyncio_module, "TimeoutError", asyncio.TimeoutError)
     cancelled_error_type = getattr(asyncio_module, "CancelledError", asyncio.CancelledError)
 
     prepared_call = PreparedToolCall(tool_input)
@@ -821,22 +692,11 @@ class RunnerToolExecutionMixin:
           ),
         }
       elif tool_name in self._effective_excluded_tools():
-        error = _fms_commit_blocker_error(tool_name) or _output_file_gated_tool_error(tool_name) or {
-          "code": "tool_excluded",
-          "message": f"Tool '{tool_name}' is not available in this context",
-        }
-        exclusion_count = _record_tool_excluded_attempt(self, tool_name)
-        if exclusion_count >= _REPEATED_TOOL_EXCLUDED_FINAL_ANSWER_COUNT:
-          error = _augment_repeated_tool_excluded_error(
-            error,
-            tool_name=tool_name,
-            exclusion_count=exclusion_count,
-          )
-          # Not a stop-after-tool-results settlement: an excluded tool call
-          # is a tool-level error, and the turn still owes the analyst the
-          # answer its evidence already supports. The run loop spends one
-          # guarded final turn on that answer.
-          setattr(self, "_final_answer_turn_tool_name", tool_name)
+        error = _tool_excluded_error(
+          tool_name,
+          run_context=getattr(self._dispatcher, "run_context", None),
+          is_local=server is None,
+        )
       else:
         dispatch_kwargs: Dict[str, Any] = {"call_index": call_index}
         if getattr(self, "_dispatcher_accepts_advertised_tool_names", False):
@@ -870,41 +730,32 @@ class RunnerToolExecutionMixin:
             )
           except Exception:
             pass
-        # MCP tools already carry per-server read timeouts in McpClientManager.
-        # Applying the runner's generic cap here would mask longer server policy.
-        has_mcp_server_timeout = server is not None
-        # run_name_pipeline and workflow_run dispatch captured LLM work whose
-        # duration is fundamentally unknowable — wall-clock caps on LLM work are the
-        # ACUI-25 anti-pattern (a cap terminally killed legitimate slow turns
-        # before the stall guard could act). Liveness for LLM work is the
-        # event-gap stall watchdog, never a timeout (operator ruling,
-        # 2026-08-01); the generic cap must not apply.
-        skip_timeout = (
-          tool_name == "get_background_result"
-          or tool_name == "run_name_pipeline"
-          or tool_name == "workflow_run"
-          or needs_approval
-          or has_mcp_server_timeout
+        # A tool call runs to its result; only the abort ends it early
+        # (GP19/GA-N2). `_tool_call_timeout` is the expected duration of a
+        # local tool: past it one warning is logged and the call keeps
+        # running. Tools whose duration is not the runner's to expect carry no
+        # expectation: an MCP tool (McpClientManager measures it against its
+        # registration), LLM work (run_agent, run_name_pipeline, workflow_run;
+        # liveness is the event-gap stall watchdog and the child activity
+        # guard, operator rulings 2026-08-01 and 2026-09-28),
+        # get_background_result, and an approval-gated call (it waits on a
+        # person).
+        expected_seconds = (
+          None
+          if (
+            server is not None
+            or tool_name in {"run_agent", "run_name_pipeline", "workflow_run", "get_background_result"}
+            or needs_approval
+          )
+          else self._tool_call_timeout
         )
-        effective_tool_timeout = self._tool_call_timeout
-        if tool_name == "run_agent":
-          # A sub-agent is agent-driven work, not a tool: no wall clock applies
-          # (operator ruling, 2026-09-28). Its liveness is the parent-side
-          # activity guard in runner_sub_agents, which ends a wedged child
-          # (ACUI-1) by the absence of child events, never by elapsed time.
-          effective_tool_timeout = None
         # B-2: one bounded, jittered retry loop owns transient dispatch
-        # failure. Both arms are inside it, because the skip_timeout
-        # population (MCP server timeouts) is exactly where 429 and transport
-        # failures actually appear. The tool_call_start event was appended
-        # before this loop and is never re-emitted; `attempts` carries the
-        # multiplicity. Approval-gated calls never retry (no approval
-        # re-entry), and the abort event is checked between attempts.
-        retry_deadline = (
-          tool_t0 + effective_tool_timeout * (1 + _MAX_TOOL_DISPATCH_RETRIES)
-          if effective_tool_timeout is not None
-          else None
-        )
+        # failure; its bound is the attempt count, never a clock. MCP tools are
+        # exactly where 429 and transport failures actually appear. The
+        # tool_call_start event was appended before this loop and is never
+        # re-emitted; `attempts` carries the multiplicity. Approval-gated calls
+        # never retry (no approval re-entry), and the abort event is checked
+        # between attempts.
         while True:
           result = None
           error = None
@@ -923,25 +774,23 @@ class RunnerToolExecutionMixin:
               **dispatch_kwargs,
             )
           )
-          if effective_tool_timeout is not None and not skip_timeout:
-            try:
-              result, error = await asyncio_module.wait_for(dispatch_coro, timeout=effective_tool_timeout)
-            except timeout_error_type:
-              elapsed = time_module.time() - tool_t0
-              logger.error(
-                "[%s] Tool %s timed out after %.1fs (limit %.0fs)",
-                self._sid,
-                tool_name,
-                elapsed,
-                effective_tool_timeout,
-              )
-              error = {
-                "code": "tool_timeout",
-                "sub_code": "timeout",
-                "message": f"Tool '{tool_name}' timed out after {effective_tool_timeout:.0f}s. The tool call was cancelled. You may retry or skip this tool.",
-              }
-          else:
+          expectation_timer = (
+            asyncio.get_running_loop().call_later(
+              expected_seconds,
+              logger.warning,
+              "[%s] Tool %s exceeded its expected %gs; still waiting for its result",
+              self._sid,
+              tool_name,
+              expected_seconds,
+            )
+            if expected_seconds is not None
+            else None
+          )
+          try:
             result, error = await dispatch_coro
+          finally:
+            if expectation_timer is not None:
+              expectation_timer.cancel()
 
           attempt_result = self._dispatcher.settle_tool_result(
             tool_name,
@@ -954,9 +803,6 @@ class RunnerToolExecutionMixin:
           settled_result = attempt_result
           abort_event = getattr(self, "_tool_abort_event", None)
           aborted = bool(abort_event is not None and abort_event.is_set())
-          wall_clock_exhausted = bool(
-            retry_deadline is not None and time_module.time() >= retry_deadline
-          )
           if (
             retry_decision(
               dispatch_entry,
@@ -964,7 +810,6 @@ class RunnerToolExecutionMixin:
               dispatch_attempts,
               needs_approval=bool(needs_approval),
               aborted=aborted,
-              wall_clock_exhausted=wall_clock_exhausted,
             )
             != "retry"
           ):
@@ -1039,20 +884,12 @@ class RunnerToolExecutionMixin:
         popped_local = result.pop("_load_local_tools", None)
         if isinstance(popped_local, list):
           load_local_tools_signal = [str(tool_name) for tool_name in popped_local if tool_name]
-        report_doors_key = _runner_attr(
-          self,
-          "_ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY",
-          _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY,
-        )
         skill_allow_key = _runner_attr(
           self,
           "_ACTIVE_SKILL_ALLOW_RESULT_KEY",
           _ACTIVE_SKILL_ALLOW_RESULT_KEY,
         )
-        skill_deny_key = _runner_attr(self, "_ACTIVE_SKILL_DENY_RESULT_KEY", _ACTIVE_SKILL_DENY_RESULT_KEY)
-        self._activate_skill_report_doors(result.pop(report_doors_key, None))
         self._activate_skill_allow(result.pop(skill_allow_key, None), base_kwargs)
-        self._activate_skill_deny(result.pop(skill_deny_key, None), base_kwargs)
         if set(result) != result_keys_before_control_projection:
           outcome_inputs_changed = True
 
@@ -1192,8 +1029,6 @@ class RunnerToolExecutionMixin:
         dispatch=dispatch_record,
         semantic_error=semantic_error,
       )
-      if error is None:
-        self._clear_active_skill_if_report_door_completed(tool_complete_event, base_kwargs)
       self._call_on_tool_timing(
         tool_name=tool_name,
         server=server,
@@ -1290,7 +1125,17 @@ class RunnerToolExecutionMixin:
       if isinstance(extra_blocks, list)
       else []
     )
-    live_entry, durable_entry = self._compact_model_tool_result_entry(result_entry, tool_name=tool_name)
+    spill_publication: SpillPublication | None = None
+
+    def _capture_spill_publication(publication: SpillPublication) -> None:
+      nonlocal spill_publication
+      spill_publication = publication
+
+    live_entry, durable_entry = self._compact_model_tool_result_entry(
+      result_entry,
+      tool_name=tool_name,
+      on_spill_publication=_capture_spill_publication,
+    )
     final_tool_result_blocks = [dict(durable_entry)]
     final_tool_result_blocks.extend(dict(block) for block in extra_blocks)
     tool_complete_event["final_tool_result_blocks"] = final_tool_result_blocks
@@ -1314,7 +1159,19 @@ class RunnerToolExecutionMixin:
       if streamed_is_projected
       else tool_complete_event
     )
-    await self._append_durable_event(tool_complete_event)
+    durable_tool_complete_event = tool_complete_event
+    if spill_publication is not None:
+      producer = self._task_registry.owner
+      if producer is not None:
+        # The committed publication and bound physical job identify custody.
+        # Keep its private location off the model and live/SSE projections.
+        durable_tool_complete_event = dict(tool_complete_event)
+        durable_tool_complete_event["spill_publication"] = {
+          "spill_ref": spill_publication.spill_ref,
+          "producer_job_id": producer.job_id,
+          "producer_root": str(Path(spill_publication.abspath).parent),
+        }
+    await self._append_durable_event(durable_tool_complete_event)
     self._append(streamed_tool_complete_event)
     if superseded_continuation_run_id is not None:
       # The continuation is durably accepted (tool_call_complete appended

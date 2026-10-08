@@ -104,23 +104,6 @@ def request_input_token_estimate(
   )
 
 
-def request_input_token_estimate_for_request(
-  *,
-  system_text: str,
-  messages: list[dict[str, Any]],
-  tools: list[dict[str, Any]],
-) -> int:
-  """Build the calibrated estimate from the exact final request surfaces."""
-
-  return request_input_token_estimate(
-    token_estimate_snapshot(
-      system_text=system_text,
-      messages=messages,
-      tools=tools,
-    )
-  )
-
-
 @dataclass(frozen=True)
 class ContextPressureReminderDecision:
   reminder_pct: int | None

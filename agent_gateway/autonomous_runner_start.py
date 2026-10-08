@@ -11,6 +11,7 @@ import signal
 import time
 from typing import Any, Mapping, TYPE_CHECKING
 
+from .admission import ParentContext
 from .autonomous_child_server_dotenv import (
   AUTONOMOUS_CHILD_SERVER_DOTENV_ENV,
   server_dotenv_payload,
@@ -20,6 +21,7 @@ from .autonomous_capability_handoff import (
   resolve_autonomous_capability_binding,
 )
 from .launch_nonce_store import (
+  launch_nonce_store_path,
   prepare_launch_nonce_store,
 )
 from .autonomous_control_files import (
@@ -35,7 +37,6 @@ from .autonomous_approval_channel import (
 )
 from .autonomous_credential_handoff import (
   AUTONOMOUS_CREDENTIAL_HANDOFF_ENV,
-  AUTONOMOUS_CREDENTIAL_HANDOFF_MAX_BYTES,
   AUTONOMOUS_CREDENTIAL_HANDOFF_STDIN,
   encode_autonomous_credential_handoff,
 )
@@ -73,14 +74,16 @@ from .claim_signing_authority import (
   GatewayClaimSigningAuthority,
   LEGACY_CLAIM_HMAC_KEY_ENV,
 )
-from .autonomous_runner_commands import (
-  normalize_autonomous_profile,
-  normalize_max_budget_usd,
-)
+from .autonomous_runner_commands import normalize_autonomous_profile
 from .artifact_paths import canonicalize_ticker
 from model_authority.binding import CredentialHandle
 from .events import DEFAULT_SCHEMA_VERSION
-from .gateway_address import GATEWAY_BASE_URL_ENV
+from .child_environment import (
+  AUTONOMOUS_CHILD_ENVIRONMENT,
+  AUTONOMOUS_CHILD_PROFILES,
+  AUTONOMOUS_CHILD_RUNTIME_ENV_NAMES,
+  filter_child_environment,
+)
 from .role_validation import require_exact_role
 from .named_refusal import NamedRefusal
 from .providers.anthropic_oauth import ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES
@@ -108,78 +111,10 @@ if TYPE_CHECKING:
 
 
 _SPAWN_CLEANUP_GRACE_SEC = 1.0
+# The sentinel redacts child output a line at a time; a longer line cannot be
+# sanitized whole, so it is replaced rather than split across the boundary.
+_CHILD_OUTPUT_LINE_MAX_BYTES = 128 * 1024
 _AUTONOMOUS_SESSION_AUTHORITY_TTL_SECONDS = 24 * 60 * 60
-_AUTONOMOUS_CHILD_BASE_ENV_NAMES = frozenset({
-  "PATH",
-  "PYTHONPATH",
-  "PYTHONHOME",
-  "VIRTUAL_ENV",
-  "HOME",
-  "USER",
-  "LOGNAME",
-  "SHELL",
-  "LANG",
-  "LC_ALL",
-  "LC_CTYPE",
-  "TZ",
-  "TMPDIR",
-  "SSL_CERT_FILE",
-  "SSL_CERT_DIR",
-  "REQUESTS_CA_BUNDLE",
-  "NO_PROXY",
-  "PRODUCT_ID",
-  "ENVIRONMENT",
-  "APP_ENV",
-  "AGENT_GATEWAY_ENV",
-  "HANK_MODEL_AUTHORITY_DIR",
-  "USER_DATA_DIR",
-  "CORPUS_LOG_DIR",
-  "CORPUS_STATE_DIR",
-  "LOG_DIR",
-  "GATEWAY_LOG_DIR",
-  "MCP_CONFIG_TMP_DIR",
-  "MCP_CONFIG_TEMPLATE",
-  "JUPYTER_ROOT",
-  "AI_EXCEL_ADDIN_DOTENV",
-  "INVESTMENT_TOOLS_DOTENV",
-  "RISK_MODULE_DOTENV",
-  "MCP_STARTUP_CONCURRENCY",
-  "MCP_STDIO_CONNECT_BACKOFF_S",
-  "MCP_STDIO_CONNECT_RETRIES",
-  "MCP_STDIO_CONNECT_STABILIZE_S",
-  "LOCAL_GATEWAY_PYTHON",
-  "LOCAL_GATEWAY_CONTROL_GENERATION",
-  "LOCAL_GATEWAY_CONTROL_GENERATION_ID",
-  "LOCAL_GATEWAY_CONTROL_STATE_ROOT",
-  "LOCAL_GATEWAY_RUNTIME_ROOT",
-  "LOCAL_GATEWAY_RUNTIME_MANIFEST",
-  "LOCAL_GATEWAY_RUNTIME_VERSION_ROOT",
-  GATEWAY_BASE_URL_ENV,
-  "GATEWAY_SSL_VERIFY",
-  "AGENT_API_CLAIM_TTL_SECONDS",
-  "AGENT_API_CLAIM_MAX_TTL_SECONDS",
-  "AGENT_GATEWAY_SKILLS_DIR",
-  "AGENT_SESSION_LOG_BASE_DIR",
-  SESSION_LOG_LAYOUT_ENV,
-  "AGENT_SESSION_LOG_MAX_ACTIVE_BYTES",
-  "AGENT_SDK_CWD",
-  "SUB_AGENT_MAX_CONCURRENCY",
-  "MEMORY_ENABLED",
-  "MEMORY_KEYWORD_WEIGHT",
-  "MEMORY_VECTOR_WEIGHT",
-  "MEMORY_MAX_PROMPT_TOKENS",
-  "CITATION_SESSION_REGISTRY_RETENTION_DAYS",
-  "EDGAR_USE_UPSTREAM_EQUIVALENCE",
-  "RISK_API_URL",
-  "RISK_CLIENT_PATH",
-  "RISK_MODULE_RESOLVER_URL",
-  "BROKERAGE_CONNECT_REQUIRED",
-  "CODE_EXECUTE_DOCKER_IMAGE",
-  "EDGAR_API_URL",
-  "EDGAR_UPDATER_ROOT",
-  "EXCEL_MCP_BACKEND_URL",
-  "MODEL_ENGINE_OVERRIDES_DIR",
-})
 _AUTONOMOUS_CHILD_PROVIDER_ENV_NAMES = {
   # A child binds a capability, not a token: the credential the parent selected
   # rides the handoff, and the pool that credential belongs to is configuration
@@ -204,52 +139,6 @@ _AUTONOMOUS_CHILD_PROVIDER_ENV_NAMES = {
 _AUTONOMOUS_CHILD_ANY_PROVIDER_ENV_NAMES = frozenset().union(
   *_AUTONOMOUS_CHILD_PROVIDER_ENV_NAMES.values()
 )
-_AUTONOMOUS_CHILD_RESEARCH_TOOL_ENV_NAMES = frozenset({
-  "FMP_API_KEY",
-  "FMP_CACHE_DIR",
-  "FRED_API_KEY",
-  "ORATS_API_KEY",
-  "EDGAR_API_KEY",
-  "SEC_BUDGET_SITE",
-  "SEC_USER_AGENT",
-  "SEC_EXPECTED_MACHINE_IDENTITY",
-  "DATABENTO_API_KEY",
-  "ALERTS_GATEWAY_API_KEY",
-})
-_AUTONOMOUS_CHILD_PROFILE_TOOL_ENV_NAMES = {
-  "analyst": _AUTONOMOUS_CHILD_RESEARCH_TOOL_ENV_NAMES,
-  "research_producer": _AUTONOMOUS_CHILD_RESEARCH_TOOL_ENV_NAMES,
-  "advisor": (
-    _AUTONOMOUS_CHILD_RESEARCH_TOOL_ENV_NAMES
-    | frozenset({
-      "IBKR_ENABLED",
-      "IBKR_FLEX_ENABLED",
-      "IBKR_FLEX_TOKEN",
-      "IBKR_FLEX_QUERY_ID",
-      "SCHWAB_CLIENT_ID",
-      "SCHWAB_CLIENT_SECRET",
-      "SNAPTRADE_CLIENT_ID",
-      "SNAPTRADE_CONSUMER_KEY",
-      "PLAID_CLIENT_ID",
-      "PLAID_SECRET",
-      "PLAID_ENV",
-    })
-  ),
-}
-_AUTONOMOUS_CHILD_PROFILE_ENV_NAMES = {
-  profile: frozenset({
-    f"{prefix}_AGENT_CLIENT_TIMEOUT",
-    f"{prefix}_AGENT_MAX_BUDGET_USD",
-    f"{prefix}_AGENT_MAX_TOKENS",
-    f"{prefix}_AGENT_MAX_TURNS",
-    f"{prefix}_AGENT_STREAM_STALL_TIMEOUT",
-  })
-  for profile, prefix in (
-    ("analyst", "ANALYST"),
-    ("advisor", "ADVISOR"),
-    ("research_producer", "RESEARCH_PRODUCER"),
-  )
-}
 _RETIRED_AUTONOMOUS_CHILD_ENV_NAMES = (
   "AUTONOMOUS_USER_ID",
   "AUTONOMOUS_RAW_USER_ID",
@@ -334,6 +223,7 @@ def _positive_autonomous_child_env(
   provider: str,
   profile: str,
   deliver: bool,
+  env_projection: tuple[str, ...] | None = None,
 ) -> dict[str, str]:
   """Project gateway state onto the child's explicit runtime contract."""
 
@@ -346,29 +236,31 @@ def _positive_autonomous_child_env(
   # The runtime vocabulary is what the launcher computes for the child: no file
   # speaks for it. Tool configuration is ordinary configuration whose value the
   # declaring application owns when this gateway carries none of it.
+  provider_env_names = _AUTONOMOUS_CHILD_PROVIDER_ENV_NAMES.get(
+    normalized_provider,
+    frozenset(),
+  )
   runtime_contract_names = (
-    _AUTONOMOUS_CHILD_BASE_ENV_NAMES
-    | _AUTONOMOUS_CHILD_PROVIDER_ENV_NAMES.get(
-      normalized_provider,
-      frozenset(),
-    )
-    | _AUTONOMOUS_CHILD_PROFILE_ENV_NAMES.get(
-      normalized_profile,
-      frozenset(),
-    )
+    AUTONOMOUS_CHILD_RUNTIME_ENV_NAMES | provider_env_names
   )
-  allowed_names = (
-    runtime_contract_names
-    | _AUTONOMOUS_CHILD_PROFILE_TOOL_ENV_NAMES.get(
-      normalized_profile,
-      frozenset(),
-    )
+  projected = (
+    filter_child_environment(environ, purpose=AUTONOMOUS_CHILD_ENVIRONMENT)
+    if env_projection is None
+    else {
+      name: value
+      for name in env_projection
+      if type((value := environ.get(name))) is str
+    }
   )
-  projected = {
+  if env_projection is not None:
+    for name in ("AGENT_SESSION_LOG_BASE_DIR", SESSION_LOG_LAYOUT_ENV):
+      if type((value := environ.get(name))) is str:
+        projected[name] = value
+  projected.update({
     name: value
-    for name in allowed_names
+    for name in provider_env_names
     if type((value := environ.get(name))) is str
-  }
+  })
   pinned_pythonpath = _pinned_autonomous_child_pythonpath(environ)
   if pinned_pythonpath is not None:
     # Selected-generation imports take precedence over inherited child packages.
@@ -382,11 +274,7 @@ def _positive_autonomous_child_env(
           paths.append(path)
           seen_paths.add(real_path)
     projected["PYTHONPATH"] = os.pathsep.join(paths)
-  if (
-    deliver
-    and normalized_profile
-    in _AUTONOMOUS_CHILD_PROFILE_ENV_NAMES
-  ):
+  if deliver and normalized_profile in AUTONOMOUS_CHILD_PROFILES:
     profile_prefix = normalized_profile.upper().replace("-", "_")
     for suffix in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
       destination = f"{profile_prefix}_{suffix}"
@@ -490,7 +378,7 @@ child_descriptors = tuple(
     )
     if descriptor is not None
 )
-credential_max_bytes = int(sys.argv[1])
+output_line_max_bytes = int(sys.argv[1])
 owner_lifeline_fd = canonical_fd(sys.argv[2], "owner lifeline descriptor")
 owner_lease_fd = canonical_fd(sys.argv[3], "owner lease descriptor")
 owner_cleanup_grace_seconds = float(sys.argv[4])
@@ -605,11 +493,11 @@ if (
             pass
     finally:
         raise SystemExit(125)
-credential_payload = sys.stdin.buffer.read(credential_max_bytes + 1)
-if not credential_payload or len(credential_payload) > credential_max_bytes:
+credential_payload = sys.stdin.buffer.read()
+if not credential_payload:
     close_child_descriptors()
     emit_status({
-        "error": "credential_handoff_invalid_size",
+        "error": "credential_handoff_missing",
         "kind": "error",
         "version": 1,
     })
@@ -685,17 +573,17 @@ def project_child_output():
         return
     try:
         while True:
-            raw_line = source.readline(credential_max_bytes + 1)
+            raw_line = source.readline(output_line_max_bytes + 1)
             if not raw_line:
                 break
             if (
-                len(raw_line) > credential_max_bytes
+                len(raw_line) > output_line_max_bytes
                 and not raw_line.endswith(b"\n")
             ):
                 projection_failed.set()
                 sys.stdout.buffer.write((SANITIZATION_FAILED + "\n").encode("utf-8"))
                 sys.stdout.buffer.flush()
-                while source.read(credential_max_bytes):
+                while source.read(output_line_max_bytes):
                     pass
                 return
             try:
@@ -914,7 +802,6 @@ class AutonomousRegistryStartMixin:
   if TYPE_CHECKING:
     _python: str
     _slot_lock: asyncio.Lock
-    _max_running: int
     _tasks: dict[str, AutonomousTask]
     _autonomous_capability_binding_resolver: (
       AutonomousCapabilityBindingResolver | None
@@ -962,7 +849,6 @@ class AutonomousRegistryStartMixin:
       deliver: bool = True,
       ticker: str | None = None,
       research_file_id: int | None = None,
-      max_budget_usd: float | None = None,
     ) -> list[str]: ...
 
     def _resolve_initial_skill_admission_policy(
@@ -998,6 +884,25 @@ class AutonomousRegistryStartMixin:
 
     def _start_payload(self, record: AutonomousTask) -> dict[str, Any]: ...
 
+  def live_user_role(self, user_id: str, user_email: str | None) -> str | None:
+    """Return the user's live GATEWAY_USER_KEYS role, the entry spawn narrows to.
+
+    None when no lookup is configured, the roster is malformed, or the user has no
+    entry with an exact role.
+    """
+    if self._mcp_user_key_lookup is None:
+      return None
+    try:
+      entry = self._mcp_user_key_lookup(user_id, user_email)
+    except SystemExit:
+      return None
+    if type(entry) is not dict:
+      return None
+    try:
+      return require_exact_role(entry.get("role"))
+    except ValueError:
+      return None
+
   def _owned_process_sentinel_cmd(
     self,
     target_cmd: list[str],
@@ -1009,7 +914,7 @@ class AutonomousRegistryStartMixin:
       self._python,
       "-c",
       _OWNED_PROCESS_SENTINEL_SOURCE,
-      str(AUTONOMOUS_CREDENTIAL_HANDOFF_MAX_BYTES),
+      str(_CHILD_OUTPUT_LINE_MAX_BYTES),
       str(owner_lifeline_fd),
       str(owner_lease_fd),
       str(_SPAWN_CLEANUP_GRACE_SEC),
@@ -1041,15 +946,11 @@ class AutonomousRegistryStartMixin:
         "prior autonomous run owner cleanup is still active"
       )
 
-  async def _reserve_slot(self) -> None:
+  async def _reserve_slot(self) -> int:
+    """Count this launch in flight and return the in-flight total it joins."""
     async with self._slot_lock:
-      if self._reserved_slots >= self._max_running:
-        raise NamedRefusal(
-          "autonomous_concurrency_limit",
-          f"Autonomous concurrency limit reached ({self._max_running})",
-          transport="busy",
-        )
       self._reserved_slots += 1
+      return self._reserved_slots
 
   async def _release_slot(self, record: AutonomousTask | None = None) -> None:
     async with self._slot_lock:
@@ -1345,7 +1246,6 @@ class AutonomousRegistryStartMixin:
       ticker=record.ticker,
       research_file_id=record.research_file_id,
       dev_mode=False,
-      max_budget_usd=record.max_budget_usd,
       deliver=record.deliver,
       admitted_skill_execution_limits=(
         record.admitted_skill_execution_limits
@@ -1366,6 +1266,8 @@ class AutonomousRegistryStartMixin:
       workload=workload,
       control_authority=control_authority,
       session_authority=session_authority,
+      admitted_context=record.admitted_context,
+      tool_authority=record.tool_authority,
     )
 
   @_with_run_mutation_lock
@@ -1390,15 +1292,15 @@ class AutonomousRegistryStartMixin:
     context: str | None = None,
     ticker: str | None = None,
     research_file_id: int | None = None,
-    max_budget_usd: float | None = None,
     channel: str | None = None,
     dispatch_scope: dict[str, Any] | None = None,
     resumed_from: str | None = None,
     schedule_id: str | None = None,
     schedule_name: str | None = None,
+    parent: ParentContext | None = None,
   ) -> dict[str, Any]:
     normalized_role = require_exact_role(role)
-    await self._reserve_slot()
+    in_flight_at_start = await self._reserve_slot()
     task_id = self._next_task_id()
     log_handle = None
     record: AutonomousTask | None = None
@@ -1461,7 +1363,6 @@ class AutonomousRegistryStartMixin:
       if dispatch_scope is not None and normalized_dispatch_scope is None:
         raise ValueError("dispatch_scope must be a redacted portfolio dispatch scope")
       normalized_research_file_id = research_file_id
-      normalized_max_budget_usd = normalize_max_budget_usd(max_budget_usd)
       normalize_profile = _runtime_attr(
         "normalize_autonomous_profile",
         normalize_autonomous_profile,
@@ -1517,13 +1418,6 @@ class AutonomousRegistryStartMixin:
           resumed_record.owner_user_id or resumed_record.user_id
         ) != normalized_owner_user_id:
           raise PermissionError("resumed autonomous run owner does not match launch owner")
-        if (
-          normalized_mode != resumed_record.mode
-          or normalized_skill != resumed_record.skill
-        ):
-          raise ValueError(
-            "resumed autonomous run mode and skill must match the origin"
-          )
         self._require_released_owner_lease(resumed_record)
         normalized_pack = resumed_record.pack
         normalized_deliver = resumed_record.deliver
@@ -1538,7 +1432,6 @@ class AutonomousRegistryStartMixin:
         context=context,
         ticker=ticker,
         research_file_id=normalized_research_file_id,
-        max_budget_usd=normalized_max_budget_usd,
       )
       skill_admission_policy = (
         None
@@ -1599,8 +1492,26 @@ class AutonomousRegistryStartMixin:
           source=binding_source,
           run_mode=binding_run_mode,
           required_bind=required_bind,
+          parent=parent if resumed_record is None else None,
+          task=(
+            context.strip()
+            if normalized_mode == "skill" and isinstance(context, str) and context.strip()
+            else task.strip() if isinstance(task, str) and task.strip() else None
+          ),
+          ticker=canonicalize_ticker(ticker) if isinstance(ticker, str) and ticker.strip() else None,
+          research_file_id=normalized_research_file_id,
+          env_names=frozenset(filter_child_environment(
+            os_module.environ, purpose=AUTONOMOUS_CHILD_ENVIRONMENT,
+          )),
         ),
       )
+      if resumed_record is not None:
+        admitted_context = resumed_record.admitted_context
+        tool_authority = resumed_record.tool_authority
+      else:
+        admitted = capability_binding.admitted
+        admitted_context = admitted.wire if admitted is not None else None
+        tool_authority = admitted.tool_authority if admitted is not None else None
       self._log_dir.mkdir(parents=True, exist_ok=True)
       canonical_log_dir = self._log_dir.resolve()
       log_path = canonical_log_dir / f"{task_id}.log"
@@ -1613,7 +1524,7 @@ class AutonomousRegistryStartMixin:
         canonical_log_dir / f"{task_id}.owner-lease"
       )
       admission_identity = prepare_launch_nonce_store(
-        canonical_log_dir / ".autonomous-admission-ledger.sqlite3"
+        launch_nonce_store_path(canonical_log_dir)
       )
 
       operator_fd, operator_stat = secure_create_owned_file(
@@ -1710,8 +1621,8 @@ class AutonomousRegistryStartMixin:
         started_at=time_module.time(),
         skill_resume_allowed=skill_resume_allowed,
         admitted_skill_execution_limits=admitted_skill_execution_limits,
-        max_budget_usd=normalized_max_budget_usd,
         research_file_id=normalized_research_file_id,
+        autonomous_in_flight_at_start=in_flight_at_start,
         state="starting",
         log_handle=log_handle,
         slot_reserved=True,
@@ -1729,6 +1640,8 @@ class AutonomousRegistryStartMixin:
         schedule_name=schedule_name.strip() if isinstance(schedule_name, str) and schedule_name.strip() else None,
         tool_result_spill_dir=tool_result_spill_dir,
         capability_bind=capability_binding.bind,
+        admitted_context=admitted_context,
+        tool_authority=tool_authority,
       )
       owner_lifeline_write_fd = -1
       self._attach_manifest_tracking(record)
@@ -1748,6 +1661,9 @@ class AutonomousRegistryStartMixin:
         provider=capability_binding.bind.provider,
         profile=record.profile,
         deliver=record.deliver,
+        env_projection=(
+          admitted_context.env_projection if admitted_context is not None else None
+        ),
       )
       for retired_name in _RETIRED_AUTONOMOUS_CHILD_ENV_NAMES:
         env.pop(retired_name, None)
@@ -1834,6 +1750,7 @@ class AutonomousRegistryStartMixin:
         capability_binding.materialized_credential,
         session_token=session_token,
       )
+      record.credential_handoff_bytes = len(credential_handoff_payload)
       env[_AUTONOMOUS_CHILD_NARROWED_GATEWAY_USER_KEYS_ENV] = _narrowed_mcp_gateway_user_keys(
         mcp_user_key_lookup=self._mcp_user_key_lookup,
         user_id=child_session.user_id,

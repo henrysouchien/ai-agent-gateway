@@ -30,8 +30,8 @@ from .approval_policy import (
 from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich_trade_approval_args
 from .approval_route import (
   ApprovalRoute,
-  DurableLocalApprovalRoute,
   ParentDelegatedApprovalRoute,
+  route_ledger,
 )
 from .batch_approval_projection import (
   BatchApprovalAdmissionStore,
@@ -160,10 +160,6 @@ _APPROVAL_WINNER_DELIVERY_TIMEOUT_SECONDS = 30.0
 _DELEGATED_APPROVAL_EXPIRY_SECONDS = 600.0
 
 
-class ApprovalSkillAdmissionMismatch(ValueError):
-  pass
-
-
 def _approval_wait_timeout_seconds(
   expiry_seconds: float | int | None,
   *,
@@ -290,7 +286,7 @@ async def _run_delegated_approval_lifecycle(
   tool_input: dict[str, Any],
   qualifier: str,
   reason: str | None,
-  profile_tightened_approval: bool,
+  deny_user_prompt: bool,
   await_user_approval_via_pending_tools_fn: Any,
   utc_now_fn: Any,
   os_urandom_fn: Any,
@@ -305,16 +301,13 @@ async def _run_delegated_approval_lifecycle(
   A delegated run is unattended by construction — no human sits at its decision
   channel — so every class outside the money boundary is settled here under the
   run owner's own authority, the same rule the interactive policy applies
-  (`MONEY_BOUNDARY_TOOL_CLASSES`, `agent_gateway.approval_policy`). A live order
-  still asks, and so does a door the running profile tightened, which the run's
-  owner authority may not waive.
+  (`MONEY_BOUNDARY_TOOL_CLASSES`, `agent_gateway.approval_policy`). Only a live
+  order still asks. A headless run (``deny_user_prompt``) has no human channel
+  to carry that ask, and a live order nobody decides must not spend the owner's
+  money, so it is denied here, the same rule the durable route applies.
   """
 
-  if (
-    request.tool_class not in MONEY_BOUNDARY_TOOL_CLASSES
-    and request.approval_constraint == "standard"
-    and not profile_tightened_approval
-  ):
+  if request.tool_class not in MONEY_BOUNDARY_TOOL_CLASSES:
     decided_at = utc_now_fn()
     request = replace(
       request,
@@ -332,6 +325,22 @@ async def _run_delegated_approval_lifecycle(
       "allow_tool_type": False,
       "request": request,
       "tool_input": tool_input,
+    }
+
+  if deny_user_prompt:
+    return {
+      "approved": False,
+      "allow_tool_type": False,
+      "request": replace(
+        request,
+        state="auto_denied",
+        decision="auto_denied",
+        decided_at=utc_now_fn(),
+        decider_id=run_context.user_id,
+        decider_role=run_context.decider_role,
+        decision_reason="Headless context cannot collect required user approval",
+      ),
+      "decision_source": "headless_auto_deny",
     }
 
   expires_at = request.requested_at + timedelta(
@@ -411,11 +420,9 @@ async def run_approval_lifecycle(
   resume_approval_request: PolicyApprovalRequest | None = None,
   approval_args_redacted: dict[str, Any] | None = None,
   approval_args_hash: str | None = None,
-  session_cache_approved: bool = False,
   automatic_approval_reason: str | None = None,
   automatic_denial_reason: str | None = None,
   deny_user_prompt: bool = False,
-  profile_tightened_approval: bool = False,
   resolve_run_context_fn: Any,
   current_skill_admission_fn: Any,
   redact_for_approval_request_fn: Any,
@@ -467,11 +474,9 @@ async def _run_approval_lifecycle_impl(
   resume_approval_request: PolicyApprovalRequest | None = None,
   approval_args_redacted: dict[str, Any] | None = None,
   approval_args_hash: str | None = None,
-  session_cache_approved: bool = False,
   automatic_approval_reason: str | None = None,
   automatic_denial_reason: str | None = None,
   deny_user_prompt: bool = False,
-  profile_tightened_approval: bool = False,
   resolve_run_context_fn: Any,
   current_skill_admission_fn: Any,
   redact_for_approval_request_fn: Any,
@@ -487,24 +492,22 @@ async def _run_approval_lifecycle_impl(
   batch_admission: Any | None = None,
   secret_boundary: SecretBoundary | None = None,
 ) -> dict[str, Any]:
+  ledger = route_ledger(route)
   if isinstance(route, ParentDelegatedApprovalRoute):
     store = None
     policy = None
-  elif isinstance(route, DurableLocalApprovalRoute):
-    store = route.store
-    policy = route.policy
+  elif ledger is not None:
+    store = ledger.store
+    policy = ledger.policy
   else:
     raise RuntimeError("approval lifecycle has no admitted route")
   run_context = resolve_run_context_fn()
   active_admission = current_skill_admission_fn()
-  try:
-    reconciled_admission = reconcile_skill_admission(
-      skill_name=run_context.skill,
-      execution_limits=run_context.admitted_skill_execution_limits,
-      active_admission=active_admission,
-    )
-  except (TypeError, ValueError) as exc:
-    raise ApprovalSkillAdmissionMismatch(str(exc)) from exc
+  reconciled_admission = reconcile_skill_admission(
+    skill_name=run_context.skill,
+    execution_limits=run_context.admitted_skill_execution_limits,
+    active_admission=active_admission,
+  )
   if reconciled_admission is not None:
     run_context = replace(
       run_context,
@@ -563,16 +566,7 @@ async def _run_approval_lifecycle_impl(
     raise RuntimeError(
       "prepared approval constraint changed; replan and reauthorize"
     )
-  if request.approval_constraint == "legacy_unknown":
-    session_cache_approved = False
-    automatic_approval_reason = None
-    allow_persistent = False
-  elif request.approval_constraint == "fresh_human_owner":
-    session_cache_approved = False
-    automatic_approval_reason = None
-    allow_persistent = False
   if request.approval_reuse_mode == "disabled":
-    session_cache_approved = False
     allow_persistent = False
   if batch_admission is not None:
     batch_admission.bind_request(request=request, store=store)
@@ -592,18 +586,7 @@ async def _run_approval_lifecycle_impl(
       policy_id=str(policy_id),
       policy_version=str(policy_version),
     )
-    if session_cache_approved:
-      cache_reference = (
-        request.approval_reuse_key
-        if request.approval_reuse_mode == "exact"
-        else f"session-cache:{tool_name}:{qualifier}"
-      )
-      request = replace(
-        request,
-        authorization_mode="CACHE_HIT",
-        cache_reference=cache_reference,
-      )
-    elif automatic_approval_reason is not None:
+    if automatic_approval_reason is not None:
       request = replace(request, authorization_mode="AUTO_ALLOW")
   if isinstance(route, ParentDelegatedApprovalRoute):
     return await _run_delegated_approval_lifecycle(
@@ -611,7 +594,7 @@ async def _run_approval_lifecycle_impl(
       tool_input=tool_input,
       qualifier=qualifier,
       reason=safe_reason,
-      profile_tightened_approval=profile_tightened_approval,
+      deny_user_prompt=deny_user_prompt,
       await_user_approval_via_pending_tools_fn=(
         await_user_approval_via_pending_tools_fn
       ),
@@ -619,8 +602,9 @@ async def _run_approval_lifecycle_impl(
       os_urandom_fn=os_urandom_fn,
       run_context=run_context,
     )
-  store = route.store
-  policy = route.policy
+  assert ledger is not None
+  store = ledger.store
+  policy = ledger.policy
   if resume_approval_request is not None:
     if prepared_business_model_change is None:
       raise RuntimeError("prepared approval resume requires its BusinessModel identity")
@@ -692,22 +676,15 @@ async def _run_approval_lifecycle_impl(
       prepared_payload=prepared_authorization_payload,
     )
 
-  if session_cache_approved or automatic_approval_reason is not None:
+  if automatic_approval_reason is not None:
     decision_reason = sanitize_boundary_value(
-      (
-      automatic_approval_reason
-      or "Session approval cache matched exact planned identity"
-      ),
+      automatic_approval_reason,
       sink="approval_decision",
       boundary=secret_boundary,
     )
     if not isinstance(decision_reason, str):
       decision_reason = SANITIZATION_FAILED
-    decision_source = (
-      "headless_hook_approved"
-      if automatic_approval_reason is not None
-      else "session_cache_approved"
-    )
+    decision_source = "headless_hook_approved"
     request = await store.transition_state(
       request.approval_id,
       "auto_approved",
@@ -1060,15 +1037,11 @@ def resolve_tool_class(
     original_tool_name = getattr(mcp, "get_original_tool_name", None)
     if callable(original_tool_name):
       policy_tool_name = original_tool_name(tool_name)
-  cls = resolve_server_policy_tool_class_fn(
+  return resolve_server_policy_tool_class_fn(
     tool_name,
     policy_tool_name=policy_tool_name,
     runtime_server=server,
-    default="",
   )
-  if cls:
-    return cls
-  return "state_write"
 
 
 def effective_trade_approval_decision(

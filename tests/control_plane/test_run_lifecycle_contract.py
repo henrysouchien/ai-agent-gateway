@@ -12,6 +12,7 @@ from agent_gateway.control_run_lifecycle import (
   ControlRunState,
   canonical_control_run_state,
   coerce_control_run_state,
+  read_persisted_autonomous_state,
 )
 from agent_gateway.control_run_lifecycle_contract import (
   control_run_lifecycle_contract_payload,
@@ -42,7 +43,7 @@ def test_control_run_response_literals_match_python_owner() -> None:
   assert set(get_args(ControlRunState)) == contract_states
   assert set(get_args(ChatRunState)) == contract_states
   assert set(get_args(AutonomousRunState)) == contract_states
-  assert "budget_limited" in contract_states
+  assert "budget_limited" not in contract_states
   assert "blocked" not in contract_states
   assert "remediating" not in contract_states
 
@@ -50,7 +51,6 @@ def test_control_run_response_literals_match_python_owner() -> None:
 def test_canonical_control_run_state_refuses_unknown_states() -> None:
   assert canonical_control_run_state("finished") == "completed"
   assert canonical_control_run_state("killed") == "cancelled"
-  assert canonical_control_run_state("budget_exceeded") == "budget_limited"
   assert canonical_control_run_state("blocked") == "failed"
   assert canonical_control_run_state("remediating") == "running"
   assert canonical_control_run_state(" Running ") == "running"
@@ -60,3 +60,11 @@ def test_canonical_control_run_state_refuses_unknown_states() -> None:
     canonical_control_run_state("not-a-state")
   with pytest.raises(ValueError, match="unknown control run state"):
     canonical_control_run_state(None)
+
+
+def test_retired_budget_stop_states_read_as_interrupted() -> None:
+  assert canonical_control_run_state("budget_limited") == "interrupted"
+  assert canonical_control_run_state("budget_exceeded") == "interrupted"
+  assert read_persisted_autonomous_state("budget_exceeded") == "interrupted"
+  assert read_persisted_autonomous_state("budget_limited") == "interrupted"
+  assert read_persisted_autonomous_state("killed") == "killed"

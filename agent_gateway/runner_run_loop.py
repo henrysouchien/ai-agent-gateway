@@ -26,10 +26,7 @@ from .learning_fork_trigger import (
   submit_learning_fork_after_turn,
   successful_memory_write_from_events,
 )
-from .runner_fork_agents import (
-  FORK_SUFFIX_WRAP_UP_REMINDER,
-  fork_suffix_messages,
-)
+from .runner_fork_agents import fork_suffix_messages
 from .runner_limits import (
   CONTEXT_PRESSURE_REMINDER_PCT,
   CONTEXT_PRESSURE_REMINDER_STEP_PCT,
@@ -39,7 +36,6 @@ from .runner_limits import (
   context_pressure_reminder_decision as _context_pressure_reminder_decision,
   effective_compaction_trigger as _effective_compaction_trigger,
   model_context_window as _model_context_window,
-  request_input_token_estimate_for_request as _request_input_token_estimate_for_request,
   system_prompt_estimate_text as _system_prompt_estimate_text,
   token_estimate_snapshot as _token_estimate_snapshot,
 )
@@ -61,7 +57,6 @@ from .runner_run_loop_defaults import (
   MAX_TOKENS_NUDGE as _MAX_TOKENS_NUDGE,
 )
 from .runner_session_lifecycle import _runner_attr
-from .runner_tool_execution import final_answer_turn_reminder
 from .secret_boundary import (
   sanitize_tool_event,
   sanitization_failure_tool_input,
@@ -69,31 +64,33 @@ from .secret_boundary import (
 from .skill_completion_wal import TopLevelSkillCompletionEffectPlan
 from .skill_context import reset_current_skill, set_current_skill
 from .runner_session_events import (
-  build_budget_exceeded_event as _build_budget_exceeded_event,
-  build_budget_exceeded_text_event as _build_budget_exceeded_text_event,
   build_chat_done_log_data as _build_chat_done_log_data,
   build_context_pressure_reminder as _build_context_pressure_reminder,
   build_context_warning_log_data as _build_context_warning_log_data,
-  build_max_turns_reached_event as _build_max_turns_reached_event,
-  build_max_turns_text_event as _build_max_turns_text_event,
+  build_soft_budget_final_event as _build_soft_budget_final_event,
+  build_soft_budget_steer_event as _build_soft_budget_steer_event,
   build_refusal_event as _build_refusal_event,
   build_runtime_guard_event as _build_runtime_guard_event,
   build_stream_complete_event as _build_stream_complete_event,
   build_token_estimate_log_data as _build_token_estimate_log_data,
+  build_tool_calls_planned_event as _build_tool_calls_planned_event,
   build_turn_complete_event as _build_turn_complete_event,
   build_turn_complete_log_data as _build_turn_complete_log_data,
 )
-from .runner_budget import BudgetExceededState, ProviderRequestBudgetAdmission
+from .runner_soft_budget import (
+  SoftBudgetAction,
+  SoftBudgetLadder,
+  configured_soft_turn_budget,
+  resolve_soft_turn_budget,
+  soft_budget_steer_notice,
+)
 from .runner_state import (
-  ProviderRequestBudgetError,
   NoToolUseTurnOutcome,
   SessionDrainState,
   TurnReminderState,
-  admit_provider_request_budget as _admit_provider_request_budget,
   assistant_turn_message as _assistant_turn_message,
   background_tasks_completed_user_message as _background_tasks_completed_user_message,
   budget_cost_progress as _budget_cost_progress,
-  budget_exceeded_state as _budget_exceeded_state,
   execute_tool_use_loop as _execute_tool_use_loop,
   model_visible_extra_blocks as _model_visible_extra_blocks,
   no_tool_use_turn_outcome as _no_tool_use_turn_outcome,
@@ -123,6 +120,7 @@ from .task_registry import (
   TaskState,
   format_parent_messages_for_model,
 )
+from .tool_display import resolve_display
 
 if TYPE_CHECKING:
   from .agent_session_log import AgentSessionLog
@@ -221,31 +219,8 @@ class _BuildRuntimeGuardEvent(Protocol):
   ) -> Dict[str, Any]: ...
 
 
-class _AdmitProviderRequestBudget(Protocol):
-  def __call__(
-    self,
-    cost_accumulator: CostAccumulator | None,
-    *,
-    provider: ModelProvider,
-    model: str,
-    estimated_input_tokens: int,
-    cached_input_tokens: int,
-    requested_max_output_tokens: int,
-  ) -> ProviderRequestBudgetAdmission: ...
-
-
 class _BuildContextPressureReminder(Protocol):
   def __call__(self, *, pct: int) -> str: ...
-
-
-class _RequestInputTokenEstimateForRequest(Protocol):
-  def __call__(
-    self,
-    *,
-    system_text: str,
-    messages: list[dict[str, Any]],
-    tools: list[dict[str, Any]],
-  ) -> int: ...
 
 
 class _ContextPressureReminderDecision(Protocol):
@@ -306,6 +281,36 @@ def _assistant_content_blocks_for_persistence(
       else sanitization_failure_tool_input()
     )
   return projected
+
+
+def _planned_tool_calls(
+  dispatcher: Any,
+  tool_uses: list[tuple[str, str, dict[str, Any]]],
+  display_for: Callable[[str, dict[str, Any]], dict[str, str] | None],
+) -> list[dict[str, Any]]:
+  """Project one model turn's tool uses, in model order, for the wire.
+
+  Inputs go through the same raw-input projection the persisted assistant
+  message uses; ``display`` is built from that redacted input exactly as
+  ``tool_call_start`` builds its own.
+  """
+
+  blocks = _assistant_content_blocks_for_persistence(
+    dispatcher,
+    [
+      {"type": "tool_use", "id": tool_id, "name": tool_name, "input": tool_input}
+      for tool_id, tool_name, tool_input in tool_uses
+    ],
+  )
+  return [
+    {
+      "tool_call_id": block["id"],
+      "tool_name": block["name"],
+      "tool_input": block["input"],
+      "display": display_for(block["name"], block["input"]),
+    }
+    for block in blocks
+  ]
 
 
 def _tool_result_ids(messages: list[dict[str, Any]]) -> set[str]:
@@ -488,9 +493,10 @@ def _unread_settled_handle_entries(runner: Any) -> list[Any]:
 #: at the next stop boundary instead of being silently marked reminded.
 _UNREAD_HANDLE_NUDGE_MAX_TASKS = 10
 
-#: The one turn the loop grants after `max_turns` exists to settle the run with
-#: what it has; unless the model is told so, it spends that turn launching
-#: more work and the stop discards the reply (m1-eval-research-build-journey-errors).
+#: The forced-final turn the soft-budget ladder (or the final-answer clamp)
+#: opens exists to settle the run with what it has; unless the model is
+#: told so, it spends that turn launching more work
+#: (m1-eval-research-build-journey-errors).
 MAX_TURNS_SYNTHESIS_REMINDER = (
   "The turn budget for this request is spent. This is your final turn: do not "
   "start new work or call tools. Write your answer now from the evidence "
@@ -863,6 +869,11 @@ def _merge_usage_totals(usage_totals: Dict[str, Any], usage: dict[str, Any] | No
     usage_totals["provider_unit_deltas"] = accumulated_units
   for operation, count in dict(usage.get("provider_unit_deltas") or {}).items():
     accumulated_units[str(operation)] = int(accumulated_units.get(str(operation), 0) or 0) + int(count or 0)
+  wait_ms = int(usage.get("provider_wait_ms", 0) or 0)
+  if wait_ms:
+    usage_totals["provider_wait_ms"] = (
+      int(usage_totals.get("provider_wait_ms", 0) or 0) + wait_ms
+    )
   for key in (
     "capability_bind",
     "provider_reported_model",
@@ -904,7 +915,6 @@ class _ToolTurnOutcome:
   action: Literal["break", "continue"]
   delivery_epoch_active: bool
   delivery_turn_compelled: bool
-  exceeded_state: BudgetExceededState | None
   terminal_failure: tuple[str, str] | None
   terminal_success_reason: str | None
 
@@ -921,9 +931,10 @@ class RunnerRunLoopMixin:
     _context_pressure_next_reminder_pct: int
     _background_notifications_enabled: bool
     _notification_queue: NotificationQueue
-    _cost_accumulator: CostAccumulator | None
+    _cost_accumulator: CostAccumulator
+    _soft_budget_kind: str
     _durable_attach_emitted: bool
-    _fork_suffix_ceiling_triggered: bool
+    _fork_suffix_tokens: int
     _first_text_at: float | None
     _last_context_manifest_digest: str | None
     _last_assistant_message_seq: int | None
@@ -931,17 +942,17 @@ class RunnerRunLoopMixin:
     _last_durable_seq: int
     _mid_turn_fork_handoff: ForkRequestHandoff | None
     _role: str
+    _sub_agent_id: str | None
     _runner_id: str | None
     _request_id: str
     _active_skill_allow: set[str]
-    _active_skill_deny: set[str]
-    _active_skill_report_doors: dict[str, str]
     _aggregator: _UsageAggregator
     _log: EventLog
     _parent_aggregator: _UsageAggregator | None
     _task_registry: TaskRegistry
     _top_level_skill_started_committed: bool
     _summary_emitted: bool
+    _session_usage_summary: SessionUsageSummary | None
 
     async def _acquire_writer_lease_and_recover(self) -> None: ...
     def _background_delivery_grace_credit_limit(self) -> int: ...
@@ -1096,14 +1107,10 @@ class RunnerRunLoopMixin:
     def _write_lease_metadata(self) -> None: ...
 
     _auth_config: Dict[str, Any]
-    _client_timeout: float | None
     _compaction_trigger: int | None
     _coordinator: CoordinatorConfig | None
     _dispatcher: AgentRunnerDispatcher
     _max_tokens_override: int | None
-    _on_max_turns: (
-      Callable[[List[Dict[str, Any]], int], Awaitable[str | None]] | None
-    )
     _pending_workflow_output_attachments: dict[
       str,
       WorkflowOutputAttachment,
@@ -1308,7 +1315,7 @@ class RunnerRunLoopMixin:
     self,
     *,
     active_delivery_obligation: tuple[str, int, str] | None,
-    delivery_epoch_from_max: bool,
+    delivery_epoch_forced_final: bool,
     delivery_grace_credit_limit: int | None,
     delivery_grace_credits: dict[tuple[str, int, str], int],
     delivery_grace_credits_granted: int,
@@ -1379,12 +1386,12 @@ class RunnerRunLoopMixin:
     if (
       (
         pending_model_visible_tool_result_ids
-        # B-3: at turn exhaustion the synthesis obligation is minted
+        # B-3: in the forced-final epoch the synthesis obligation is minted
         # unconditionally — this is the completion reserve that elicits a
-        # terminal narrative, and without it the honest-partial remap has
-        # no narrative to settle on. Still credit-capped below by the one
-        # synthesis credit and by delivery_grace_credit_limit.
-        or delivery_epoch_from_max
+        # terminal narrative the forced-final result settles on. Still
+        # credit-capped below by the one synthesis credit and by
+        # delivery_grace_credit_limit.
+        or delivery_epoch_forced_final
       )
       and not obligations
     ):
@@ -1429,10 +1436,10 @@ class RunnerRunLoopMixin:
     # otherwise a parent that legitimately keeps working between
     # deliveries, which is exactly what a staged fan-out does, spends a
     # budget sized for draining a queue and dies mid-flight. The frozen
-    # post-`max_turns` epoch stays metered unconditionally: there the
-    # turn budget is already spent and every turn is a delivery turn.
+    # forced-final epoch stays metered unconditionally: there the run was
+    # told to finish and every turn is a delivery turn.
     metered_delivery_turn = (
-      delivery_epoch_from_max or delivery_turn_compelled
+      delivery_epoch_forced_final or delivery_turn_compelled
     )
     delivery_turn_compelled = False
     if metered_delivery_turn:
@@ -1453,6 +1460,55 @@ class RunnerRunLoopMixin:
       obligations,
       active_delivery_obligation,
     )
+
+  async def _observe_soft_budget(
+    self,
+    ladder: SoftBudgetLadder,
+    *,
+    turn_count: int,
+    continuing_segment: bool = False,
+    build_soft_budget_steer_event: Callable[[str, float, float], Dict[str, Any]],
+    build_soft_budget_final_event: Callable[[str, float, float], Dict[str, Any]],
+    logger: logging.Logger,
+  ) -> SoftBudgetAction | None:
+    """Observe the run's one soft-budget ladder and record what fired.
+
+    Steer and final append their events; the abort stages the
+    ``interrupted`` event with the counters. The caller turns the stage into
+    loop control (steer notice, forced-final epoch, break).
+    """
+    action = ladder.observe(
+      turn_count=turn_count,
+      continuing_segment=continuing_segment,
+    )
+    if action is None:
+      return None
+    if action.stage == "abort":
+      logger.warning(
+        "[%s] Soft budget abort | kind=%s observed=%s threshold=%s grace_turns=%d",
+        self._sid,
+        action.kind,
+        action.observed,
+        action.threshold,
+        ladder.grace_turns,
+      )
+      await self._emit_interrupted_event(
+        "soft_budget_abort",
+        extra_fields={
+          "kind": action.kind,
+          "observed": action.observed,
+          "threshold": action.threshold,
+          "grace_turns": ladder.grace_turns,
+        },
+      )
+      return action
+    build = (
+      build_soft_budget_final_event
+      if action.stage == "final"
+      else build_soft_budget_steer_event
+    )
+    self._append(build(action.kind, action.observed, action.threshold))
+    return action
 
   async def _prepare_terminal_run(
     self,
@@ -1793,8 +1849,6 @@ class RunnerRunLoopMixin:
     except Exception:
       pass
     self._active_skill_allow.clear()
-    self._active_skill_deny.clear()
-    self._active_skill_report_doors.clear()
     try:
       await self._shutdown_background_tasks(was_cancelled)
     except BaseException as exc:
@@ -1809,6 +1863,25 @@ class RunnerRunLoopMixin:
           self._unsettled_workflow_obstruction_count()
         ),
       )
+      if self._parent_aggregator is None:
+        try:
+          await self._aggregator.close()
+          self._session_usage_summary = await self._aggregator.snapshot(
+            ended_at=time_module.time(),
+            drain_complete=drain_state.drain_complete,
+            in_flight_task_count=drain_state.in_flight_task_count,
+            context_surfaces=self._context_surface_records(),
+            stream_started_at=self._stream_started_at,
+            first_text_at=self._first_text_at,
+          )
+        except BaseException as exc:
+          if isinstance(exc, asyncio.CancelledError):
+            finalizer_errors.append(exc)
+          logger.error(
+            "[%s] session summary snapshot failed (non-fatal) | exception_type=%s",
+            self._sid,
+            type(exc).__name__,
+          )
       try:
         settlement_succeeded = await self._settle_run_closure(
           clean_detach_reason=clean_detach_reason,
@@ -1826,17 +1899,9 @@ class RunnerRunLoopMixin:
         self._run_closure_deferred = False
       if self._parent_aggregator is None:
         try:
-          await self._aggregator.close()
-          summary = await self._aggregator.snapshot(
-            ended_at=time_module.time(),
-            drain_complete=drain_state.drain_complete,
-            in_flight_task_count=drain_state.in_flight_task_count,
-            context_surfaces=self._context_surface_records(),
-            stream_started_at=self._stream_started_at,
-            first_text_at=self._first_text_at,
-          )
           self._summary_emitted = True
-          await self._call_on_session_summary(summary)
+          if self._session_usage_summary is not None:
+            await self._call_on_session_summary(self._session_usage_summary)
         except BaseException as exc:
           if isinstance(exc, asyncio.CancelledError):
             finalizer_errors.append(exc)
@@ -1993,8 +2058,8 @@ class RunnerRunLoopMixin:
       # model. Identifiers only — the notification's summary/payload
       # is untrusted child content and stays out of unsanitized
       # event fields. Durable-only, like context_manifest: never on
-      # the client wire, ignored by every fold. Sits after budget
-      # admission so the record means "carried by an issued request";
+      # the client wire, ignored by every fold. Sits at request
+      # preparation so the record means "carried by an issued request";
       # a request the provider failed to process can still leave a
       # record whose notifications were never acked, so forensics
       # dedupe by (task_id, notification_generation). Observability
@@ -2028,7 +2093,7 @@ class RunnerRunLoopMixin:
       and not delivery_request_nudge_recorded
     ):
       # The matching durable record for the request-scoped delivery
-      # nudge — emitted here, after budget admission, so it attests a
+      # nudge — emitted here, at request preparation, so it attests a
       # nudge an issued request actually carried.
       delivery_request_nudge_recorded = True
       try:
@@ -2052,11 +2117,9 @@ class RunnerRunLoopMixin:
     self,
     *,
     active_delivery_obligation: tuple[str, int, str] | None,
-    admit_provider_request_budget: _AdmitProviderRequestBudget,
     base_kwargs: Dict[str, Any],
     build_context_pressure_reminder: _BuildContextPressureReminder,
     build_runtime_guard_event: _BuildRuntimeGuardEvent,
-    cached_prefix_tokens: int,
     context_limit: int,
     context_pressure_reminder_decision: _ContextPressureReminderDecision,
     current_messages: list[dict[str, Any]],
@@ -2064,70 +2127,37 @@ class RunnerRunLoopMixin:
     delivered_notifications_recorded: bool,
     delivery_request_nudge_message: dict[str, Any] | None,
     delivery_request_nudge_recorded: bool,
-    emit_budget_exceeded_stop: Callable[[Any], Awaitable[None]],
-    emit_terminal_failure: Callable[[str, str], Awaitable[None]],
     wrap_up_reminder_text: str | None,
     logger: logging.Logger,
     max_tokens: int,
-    max_turns: int | None,
+    last_ordinary_turn: int | None,
     pending_notifications_at_render: int,
-    request_input_token_estimate_for_request: _RequestInputTokenEstimateForRequest,
     system_prompt: Optional[Union[str, List[Tuple[str, bool]]]],
     system_prompt_estimate_text: Callable[[Any], str],
     token_estimate_snapshot: _TokenEstimateSnapshot,
     turn_count: int,
     turn_reminder: TurnReminderState,
     user_turn_message: Callable[[Any], Dict[str, Any]],
-    upstream_model: str,
   ) -> tuple[
     int | None,
     str | None,
     dict[str, Any] | None,
     Optional[Union[str, List[Tuple[str, bool]]]],
+    bool,
+    bool,
     int,
-    bool,
-    bool,
-  ] | None:
-    if (
-      bool(getattr(self, "_fork_mode", False))
-      and not bool(
-        getattr(self, "_fork_suffix_ceiling_triggered", False)
-      )
-    ):
-      suffix_messages = fork_suffix_messages(
-        current_messages,
-        getattr(self, "_fork_marker_position"),
-      )
-      suffix_estimate = token_estimate_snapshot(
+  ]:
+    if bool(getattr(self, "_fork_mode", False)):
+      # Fork suffix size is a measurement (``fork_measurements``), never a
+      # stop: the fork runs to its own final message.
+      self._fork_suffix_tokens = token_estimate_snapshot(
         system_text="",
-        messages=suffix_messages,
+        messages=fork_suffix_messages(
+          current_messages,
+          getattr(self, "_fork_marker_position"),
+        ),
         tools=[],
-      )
-      if suffix_estimate.est_messages_tokens > int(
-        getattr(self, "_fork_suffix_max_tokens")
-      ):
-        self._fork_suffix_ceiling_triggered = True
-        wrap_up_reminder_text = (
-          FORK_SUFFIX_WRAP_UP_REMINDER
-        )
-        max_turns = (
-          turn_count
-          if max_turns is None
-          else min(max_turns, turn_count)
-        )
-    final_answer_tool = getattr(self, "_final_answer_turn_tool_name", None)
-    if final_answer_tool is not None:
-      # The excluded-tool guard bounds expansion, not the answer: the run
-      # gets exactly this one turn to finish with what it already has.
-      self._final_answer_turn_tool_name = None
-      wrap_up_reminder_text = final_answer_turn_reminder(
-        str(final_answer_tool)
-      )
-      max_turns = (
-        turn_count
-        if max_turns is None
-        else min(max_turns, turn_count)
-      )
+      ).est_messages_tokens
     if (
       active_delivery_obligation is not None
       and active_delivery_obligation[2]
@@ -2205,44 +2235,6 @@ class RunnerRunLoopMixin:
       )
     else:
       turn_system_prompt = system_prompt
-    try:
-      request_budget_admission = admit_provider_request_budget(
-        self._cost_accumulator,
-        provider=self._provider,
-        model=upstream_model,
-        estimated_input_tokens=(
-          request_input_token_estimate_for_request(
-            system_text=system_prompt_estimate_text(
-              turn_system_prompt
-            ),
-            messages=current_messages,
-            tools=base_kwargs.get("tools") or [],
-          )
-        ),
-        cached_input_tokens=cached_prefix_tokens,
-        requested_max_output_tokens=max_tokens,
-      )
-    except ProviderRequestBudgetError:
-      await emit_terminal_failure(
-        "budget_authority_invalid",
-        "Provider request budget authority could not be verified.",
-      )
-      return
-    if request_budget_admission.denied_state is not None:
-      await emit_budget_exceeded_stop(
-        request_budget_admission.denied_state
-      )
-      return
-    request_max_tokens = request_budget_admission.max_output_tokens
-    if request_max_tokens is None:  # pragma: no cover - denied above
-      raise RuntimeError("provider request budget admission is invalid")
-    if request_max_tokens < max_tokens:
-      logger.info(
-        "[%s] Provider max_tokens capped by remaining cost authority | requested=%d capped=%d",
-        self._sid,
-        max_tokens,
-        request_max_tokens,
-      )
     (
       delivered_notifications_recorded,
       delivery_request_nudge_recorded,
@@ -2264,13 +2256,13 @@ class RunnerRunLoopMixin:
       turn_system_prompt=turn_system_prompt,
     )
     return (
-      max_turns,
+      last_ordinary_turn,
       wrap_up_reminder_text,
       delivery_request_nudge_message,
       turn_system_prompt,
-      request_max_tokens,
       delivered_notifications_recorded,
       delivery_request_nudge_recorded,
+      request_estimate.est_total_tokens,
     )
 
   async def _handle_no_tool_turn(
@@ -2278,19 +2270,12 @@ class RunnerRunLoopMixin:
     *,
     assistant_turn_message: Callable[..., Dict[str, Any]],
     background_tasks_completed_user_message: Callable[[], Dict[str, Any]],
-    budget_exceeded_state: Callable[
-      [CostAccumulator], BudgetExceededState | None
-    ],
     build_runtime_guard_event: _BuildRuntimeGuardEvent,
     current_messages: list[dict[str, Any]],
     delivered_notifications: list[TaskNotification],
     delivery_epoch_active: bool,
-    delivery_epoch_from_max: bool,
+    delivery_epoch_forced_final: bool,
     delivery_turn_compelled: bool,
-    emit_budget_exceeded_stop: Callable[
-      [BudgetExceededState], Awaitable[None]
-    ],
-    exceeded_state: BudgetExceededState | None,
     is_child_logical_response: bool,
     learning_real_final_response: bool,
     logger: logging.Logger,
@@ -2299,7 +2284,7 @@ class RunnerRunLoopMixin:
     max_tokens_continuations: int,
     max_tokens_continuations_limit: int,
     max_tokens_nudge: str,
-    max_turns: int | None,
+    last_ordinary_turn: int | None,
     no_tool_use_turn_outcome: _NoToolUseTurnOutcome,
     persist_assistant_message_once: Callable[[], Awaitable[int]],
     task_state_cls: type[TaskState],
@@ -2333,9 +2318,6 @@ class RunnerRunLoopMixin:
       # The provider declined to continue. The delivered text stays the turn's
       # output; the client is told why, and nothing is reset or retried.
       self._append(_build_refusal_event(turn.stop_details))
-    if exceeded_state is not None:
-      await emit_budget_exceeded_stop(exceeded_state)
-      return finish("break")
     if self._operator_pause_requested():
       logger.info("[%s] Operator pause requested after turn; stopping before tool dispatch", self._sid)
       mark_terminal_interruption("operator_pause")
@@ -2432,17 +2414,11 @@ class RunnerRunLoopMixin:
         # registry task.
         or self._workflow_settlement_obstructed()
       )
-      and (max_turns is None or turn_count < max_turns)
+      # A forced-final answer waits too: the work the run started is the
+      # report's; a task that never settles is bounded by its own timeout,
+      # the containment layer's, not by this turn.
     ):
       await self._wait_for_background_notification()
-      if self._cost_accumulator is not None:
-        exceeded_state = (
-          budget_exceeded_state(self._cost_accumulator)
-          or exceeded_state
-        )
-      if exceeded_state is not None:
-        await emit_budget_exceeded_stop(exceeded_state)
-        return finish("break")
       if self._operator_pause_requested():
         logger.info(
           "[%s] Operator pause requested while awaiting background completion",
@@ -2472,13 +2448,13 @@ class RunnerRunLoopMixin:
       # latch `_background_delivery_grace_active`: that flag closes
       # admission of new background tasks and says so in words the run
       # would be lying about here ("past its normal turn limit" — this
-      # arm runs precisely when `max_turns is None`). Latching it on the
-      # first arriving notification made staged fan-out impossible: a
-      # parent that dispatches its next track once a slot frees had that
-      # dispatch rejected, and did the work inline instead until the
-      # delivery credits ran out. Only the post-`max_turns` epoch and the
-      # end of the loop close admission.
-      if max_turns is None:
+      # arm runs precisely when no forced-final turn is pending). Latching
+      # it on the first arriving notification made staged fan-out
+      # impossible: a parent that dispatches its next track once a slot
+      # frees had that dispatch rejected, and did the work inline instead
+      # until the delivery credits ran out. Only the forced-final epoch and
+      # the end of the loop close admission.
+      if last_ordinary_turn is None:
         delivery_epoch_active = True
         delivery_turn_compelled = True
       return finish("continue")
@@ -2516,7 +2492,7 @@ class RunnerRunLoopMixin:
           self._sid,
           type(exc).__name__,
         )
-      if max_turns is None:
+      if last_ordinary_turn is None:
         delivery_epoch_active = True
         delivery_turn_compelled = True
       return finish("continue")
@@ -2528,14 +2504,13 @@ class RunnerRunLoopMixin:
     if (
       delivery_follow_up_allowed
       and unread_handle_entries
-      and not delivery_epoch_from_max
-      # The reminder must never consume the run's LAST budgeted turn:
-      # crossing `max_turns` here would latch the from-max epoch and
-      # `_background_delivery_grace_active`, spend the synthesis
-      # credit, and turn an obeying model's read into a
-      # `max_turns_reached` interruption. On a bounded run whose
-      # finish lands on the limit, the reminder yields (fail-open).
-      and (max_turns is None or turn_count < max_turns)
+      and not delivery_epoch_forced_final
+      # The reminder must never consume the run's last ordinary turn:
+      # crossing it here would latch the forced-final epoch and
+      # `_background_delivery_grace_active` and spend the synthesis credit
+      # on an obeying model's read. When the finish lands on that turn,
+      # the reminder yields (fail-open).
+      and (last_ordinary_turn is None or turn_count < last_ordinary_turn)
     ):
       # CUR-E2E-08: the delivery contract ended at "rendered once and
       # acked", and a handle-shaped result whose notification landed
@@ -2563,7 +2538,7 @@ class RunnerRunLoopMixin:
       # exactly as the first one did.
       if (
         delivery_epoch_active
-        and not delivery_epoch_from_max
+        and not delivery_epoch_forced_final
         and not self._background_delivery_grace_obligations()
       ):
         delivery_epoch_active = False
@@ -2641,21 +2616,14 @@ class RunnerRunLoopMixin:
     self,
     *,
     background_tasks_completed_user_message: Callable[[], Dict[str, Any]],
-    budget_exceeded_state: Callable[
-      [CostAccumulator], BudgetExceededState | None
-    ],
     build_runtime_guard_event: _BuildRuntimeGuardEvent,
     current_messages: list[dict[str, Any]],
     delivery_epoch_active: bool,
-    delivery_epoch_from_max: bool,
+    delivery_epoch_forced_final: bool,
     delivery_turn_compelled: bool,
-    emit_budget_exceeded_stop: Callable[
-      [BudgetExceededState], Awaitable[None]
-    ],
-    exceeded_state: BudgetExceededState | None,
     logger: logging.Logger,
     mark_terminal_interruption: Callable[[str], None],
-    max_turns: int | None,
+    last_ordinary_turn: int | None,
     model_visible_tool_result_ids: set[str],
     pending_model_visible_tool_result_ids: set[str],
     task_state_cls: type[TaskState],
@@ -2671,26 +2639,11 @@ class RunnerRunLoopMixin:
         action=action,
         delivery_epoch_active=delivery_epoch_active,
         delivery_turn_compelled=delivery_turn_compelled,
-        exceeded_state=exceeded_state,
         terminal_failure=terminal_failure,
         terminal_success_reason=terminal_success_reason,
       )
 
     stop_after_tool_results_reason = getattr(self, "_stop_after_tool_results_reason", None)
-    # A terminal tool settlement has already incurred its model-turn cost;
-    # preserve that explicit settlement at this boundary. Other forced-stop
-    # reasons still yield to the budget guard.
-    if stop_after_tool_results_reason not in {
-      "terminal_tool_result",
-      "terminal_tool_failure",
-      "child_report_accepted",
-    }:
-      if self._cost_accumulator is not None:
-        exceeded_state = budget_exceeded_state(self._cost_accumulator) or exceeded_state
-      if exceeded_state is not None:
-        await emit_budget_exceeded_stop(exceeded_state)
-        return finish("break")
-
     if stop_after_tool_results_reason:
       stop_after_tool_results_tool_name = getattr(self, "_stop_after_tool_results_tool_name", None)
       logger.info(
@@ -2753,17 +2706,8 @@ class RunnerRunLoopMixin:
           # (§5.3, T2-I04).
           or self._workflow_settlement_obstructed()
         )
-        and (max_turns is None or turn_count < max_turns)
       ):
         await self._wait_for_background_notification()
-        if self._cost_accumulator is not None:
-          exceeded_state = (
-            budget_exceeded_state(self._cost_accumulator)
-            or exceeded_state
-          )
-        if exceeded_state is not None:
-          await emit_budget_exceeded_stop(exceeded_state)
-          return finish("break")
         if self._operator_pause_requested():
           logger.info(
             "[%s] Operator pause requested while awaiting background completion",
@@ -2778,7 +2722,7 @@ class RunnerRunLoopMixin:
         current_messages.append(
           background_tasks_completed_user_message()
         )
-        if max_turns is None:
+        if last_ordinary_turn is None:
           delivery_epoch_active = True
           delivery_turn_compelled = True
         return finish("continue")
@@ -2786,7 +2730,7 @@ class RunnerRunLoopMixin:
         getattr(self, "_pending_background_result_acks", {})
         or _pending_omitted_background_task_ids(self)
       ):
-        if max_turns is None:
+        if last_ordinary_turn is None:
           delivery_epoch_active = True
           delivery_turn_compelled = True
         return finish("continue")
@@ -2799,19 +2743,19 @@ class RunnerRunLoopMixin:
       ][:_UNREAD_HANDLE_NUDGE_MAX_TASKS]
       if (
         unread_handle_entries
-        and not delivery_epoch_from_max
-        and (max_turns is None or turn_count < max_turns)
+        and not delivery_epoch_forced_final
+        and (last_ordinary_turn is None or turn_count < last_ordinary_turn)
       ):
         # CUR-E2E-08, tools-then-end_turn stop boundary: same one
         # reminder per task, same unmetered/epoch-free contract, same
-        # turn-budget guard and epoch close-out as the no-tool arm (the
+        # last-ordinary-turn guard and epoch close-out as the no-tool arm (the
         # assistant turn is already in current_messages here).
         unread_handle_reminded_task_ids.update(
           entry.task_id for entry in unread_handle_entries
         )
         if (
           delivery_epoch_active
-          and not delivery_epoch_from_max
+          and not delivery_epoch_forced_final
           and not self._background_delivery_grace_obligations()
         ):
           delivery_epoch_active = False
@@ -2843,7 +2787,6 @@ class RunnerRunLoopMixin:
     self,
     messages: List[Dict[str, Any]],
     system_prompt: Optional[Union[str, List[Tuple[str, bool]]]] = None,
-    max_turns: Optional[int] = None,
     *,
     resume_initial_messages: List[Dict[str, Any]] | None = None,
   ) -> None:
@@ -2860,7 +2803,6 @@ class RunnerRunLoopMixin:
       await self._run_chat_loop(
         messages,
         system_prompt,
-        max_turns,
         resume_initial_messages=resume_initial_messages,
       )
     finally:
@@ -2870,11 +2812,11 @@ class RunnerRunLoopMixin:
     self,
     messages: List[Dict[str, Any]],
     system_prompt: Optional[Union[str, List[Tuple[str, bool]]]] = None,
-    max_turns: Optional[int] = None,
     *,
     resume_initial_messages: List[Dict[str, Any]] | None = None,
   ) -> None:
     _require_fresh_runner(self._summary_emitted)
+    self._session_usage_summary = None
     self._stream_started_at = None
     self._first_text_at = None
     self._background_delivery_grace_active = False
@@ -2918,20 +2860,15 @@ class RunnerRunLoopMixin:
       "_context_pressure_reminder_decision",
       _context_pressure_reminder_decision,
     )
-    request_input_token_estimate_for_request = _runner_attr(
-      self,
-      "_request_input_token_estimate_for_request",
-      _request_input_token_estimate_for_request,
-    )
     build_token_estimate_log_data = _runner_attr(
       self, "_build_token_estimate_log_data", _build_token_estimate_log_data
     )
     empty_usage_totals = _runner_attr(self, "_empty_usage_totals", _empty_usage_totals)
-    build_max_turns_reached_event = _runner_attr(
-      self, "_build_max_turns_reached_event", _build_max_turns_reached_event
+    build_soft_budget_steer_event = _runner_attr(
+      self, "_build_soft_budget_steer_event", _build_soft_budget_steer_event
     )
-    build_max_turns_text_event = _runner_attr(
-      self, "_build_max_turns_text_event", _build_max_turns_text_event
+    build_soft_budget_final_event = _runner_attr(
+      self, "_build_soft_budget_final_event", _build_soft_budget_final_event
     )
     turn_reminder_state = _runner_attr(self, "_turn_reminder_state", _turn_reminder_state)
     max_notifications_per_turn = _runner_attr(
@@ -2955,18 +2892,6 @@ class RunnerRunLoopMixin:
       self, "_build_turn_complete_log_data", _build_turn_complete_log_data
     )
     budget_cost_progress = _runner_attr(self, "_budget_cost_progress", _budget_cost_progress)
-    budget_exceeded_state = _runner_attr(self, "_budget_exceeded_state", _budget_exceeded_state)
-    admit_provider_request_budget = _runner_attr(
-      self,
-      "_admit_provider_request_budget",
-      _admit_provider_request_budget,
-    )
-    build_budget_exceeded_event = _runner_attr(
-      self, "_build_budget_exceeded_event", _build_budget_exceeded_event
-    )
-    build_budget_exceeded_text_event = _runner_attr(
-      self, "_build_budget_exceeded_text_event", _build_budget_exceeded_text_event
-    )
     build_runtime_guard_event = _runner_attr(
       self, "_build_runtime_guard_event", _build_runtime_guard_event
     )
@@ -3065,7 +2990,7 @@ class RunnerRunLoopMixin:
         return
 
       try:
-        client = self._provider.create_client(config, timeout=self._client_timeout)
+        client = self._provider.create_client(config)
         self._set_client(client)
       except Exception as exc:
         if getattr(self, "_allow_stub_response", False):
@@ -3199,7 +3124,23 @@ class RunnerRunLoopMixin:
       delivery_grace_credit_limit: int | None = None
       delivery_grace_credits_granted = 0
       delivery_epoch_active = False
-      delivery_epoch_from_max = False
+      delivery_epoch_forced_final = False
+      # The turn after which the forced-final epoch opens: set by the
+      # soft-budget ladder's final stage and by the final-answer clamp;
+      # ``None`` while the run works freely.
+      last_ordinary_turn: int | None = None
+      forced_final_delivery_turns = 0
+      soft_budget_kind = self._soft_budget_kind
+      soft_budget_ladder = SoftBudgetLadder(
+        turn_threshold=(
+          None
+          if soft_budget_kind == "writer"
+          else resolve_soft_turn_budget(
+            soft_budget_kind,
+            configured_soft_turn_budget(),
+          )
+        ),
+      )
       delivery_turn_compelled = False
       unread_handle_reminded_task_ids: set[str] = set()
       tools_used: List[str] = []
@@ -3233,11 +3174,6 @@ class RunnerRunLoopMixin:
       model_visible_synthesis_credits_granted = 0
       current_messages = list(messages)
       last_real_stream_input_tokens: int | None = None
-      # What the provider itself reported serving from, or writing into, its
-      # prompt cache on this run's last request: the prefix the next request
-      # will be billed at the cache-read rate. Zero until a response says
-      # otherwise, so a cold run prices its whole prompt uncached.
-      cached_prefix_tokens = 0
 
       def reset_logical_response_lineage() -> None:
         nonlocal logical_response_id
@@ -3260,33 +3196,6 @@ class RunnerRunLoopMixin:
         nonlocal terminal_interruption_reason
         clean_detach_reason = reason
         terminal_interruption_reason = reason
-
-      async def emit_budget_exceeded_stop(
-        exceeded_state: BudgetExceededState,
-      ) -> None:
-        logger.warning(
-          "[%s] Budget exceeded: $%.4f >= $%.4f%s — stopping",
-          self._sid,
-          exceeded_state.total_cost,
-          exceeded_state.budget,
-          exceeded_state.reason_suffix,
-        )
-        self._append(
-          build_budget_exceeded_event(
-            total_cost=exceeded_state.total_cost,
-            budget=exceeded_state.budget,
-            reason=exceeded_state.reason,
-          )
-        )
-        self._append(
-          build_budget_exceeded_text_event(
-            total_cost=exceeded_state.total_cost,
-            budget=exceeded_state.budget,
-            reason_suffix=exceeded_state.reason_suffix,
-          )
-        )
-        mark_terminal_interruption("budget_exceeded")
-        await self._emit_interrupted_event("budget_exceeded")
 
       async def emit_terminal_failure(
         reason: str,
@@ -3345,16 +3254,54 @@ class RunnerRunLoopMixin:
           and max_tokens_continuation_pending
         )
         max_tokens_continuation_pending = False
+        # Observed before every provider request, continuation segments
+        # included: the ladder counts requests, so a max_tokens chain that
+        # never completes a turn still steers, finalizes and meets the abort.
+        soft_budget_action = await self._observe_soft_budget(
+          soft_budget_ladder,
+          # Background-result delivery turns the forced-final epoch credits
+          # are bounded by its own credits; they settle work the run already
+          # started, so they do not spend the ladder's grace.
+          turn_count=turn_count - forced_final_delivery_turns,
+          continuing_segment=continuing_provider_segment,
+          build_soft_budget_steer_event=build_soft_budget_steer_event,
+          build_soft_budget_final_event=build_soft_budget_final_event,
+          logger=logger,
+        )
+        soft_budget_stage = (
+          None if soft_budget_action is None else soft_budget_action.stage
+        )
+        if soft_budget_stage == "abort":
+          mark_terminal_interruption("soft_budget_abort")
+          break
+        if soft_budget_stage == "final":
+          # The turn now starting is the forced final. On an ordinary turn
+          # that is turn_count + 1; on a continuation segment the logical
+          # turn is already counted, so the segment itself carries the
+          # synthesis reminder and opens the delivery epoch below.
+          final_boundary = (
+            turn_count - 1 if continuing_provider_segment else turn_count
+          )
+          last_ordinary_turn = (
+            final_boundary
+            if last_ordinary_turn is None
+            else min(last_ordinary_turn, final_boundary)
+          )
+        soft_budget_steer_text = (
+          soft_budget_steer_notice(soft_budget_action)
+          if soft_budget_action is not None and soft_budget_stage == "steer"
+          else None
+        )
         if not continuing_provider_segment:
           turn_count += 1
         active_delivery_obligation: tuple[str, int, str] | None = None
-        crossed_max_turns = (
-          max_turns is not None
-          and turn_count > max_turns
-        )
-        if crossed_max_turns and not delivery_epoch_active:
+        if (
+          last_ordinary_turn is not None
+          and turn_count > last_ordinary_turn
+          and not delivery_epoch_forced_final
+        ):
           delivery_epoch_active = True
-          delivery_epoch_from_max = True
+          delivery_epoch_forced_final = True
           self._background_delivery_grace_active = True
         if delivery_epoch_active:
           (
@@ -3367,7 +3314,7 @@ class RunnerRunLoopMixin:
             active_delivery_obligation,
           ) = self._prepare_delivery_epoch_turn(
             active_delivery_obligation=active_delivery_obligation,
-            delivery_epoch_from_max=delivery_epoch_from_max,
+            delivery_epoch_forced_final=delivery_epoch_forced_final,
             delivery_grace_credit_limit=delivery_grace_credit_limit,
             delivery_grace_credits=delivery_grace_credits,
             delivery_grace_credits_granted=(
@@ -3390,6 +3337,11 @@ class RunnerRunLoopMixin:
             delivery_grace_credits[
               active_delivery_obligation
             ] -= 1
+            if (
+              delivery_epoch_forced_final
+              and active_delivery_obligation[2] != "synthesis"
+            ):
+              forced_final_delivery_turns += 1
             logger.info(
               "[%s] Bounded background delivery turn "
               "(obligation=%s generation=%d phase=%s credits=%d/%d)",
@@ -3402,60 +3354,25 @@ class RunnerRunLoopMixin:
               ],
               delivery_grace_credit_limit,
             )
-          else:
-            if not delivery_epoch_from_max and not obligations:
+          elif not delivery_epoch_forced_final:
+            if not obligations:
               terminal_success_reason = "background_delivery_settled"
               break
-            if delivery_epoch_from_max:
-              # This iteration stops before any provider call; its increment
-              # counted a turn that never ran.
-              if not continuing_provider_segment:
-                turn_count -= 1
-              logger.warning(
-                "[%s] Max turns (%d) reached, stopping",
-                self._sid,
-                max_turns,
-              )
-              self._append(
-                build_max_turns_reached_event(
-                  turn_count=turn_count,
-                  max_turns=max_turns,
-                )
-              )
-              mark_terminal_interruption("max_turns_reached")
-              await self._emit_interrupted_event(
-                "max_turns_reached"
-              )
-              summary_text = None
-              if self._on_max_turns is not None:
-                try:
-                  summary_text = await self._on_max_turns(
-                    current_messages,
-                    turn_count,
-                  )
-                except Exception as exc:
-                  logger.warning(
-                    "[%s] on_max_turns callback failed: %s",
-                    self._sid,
-                    exc,
-                  )
-              self._append(
-                build_max_turns_text_event(summary_text)
-              )
-            else:
-              logger.warning(
-                "[%s] Bounded background delivery credits exhausted",
-                self._sid,
-              )
-              clean_detach_reason = "error"
-              await self._emit_error_event(
-                "background_delivery_exhausted: bounded background-result "
-                "delivery credits were exhausted before all retained "
-                "notifications were acknowledged."
-              )
-              await self._close_client(client, timeout=5.0)
-              return
-            break
+            logger.warning(
+              "[%s] Bounded background delivery credits exhausted",
+              self._sid,
+            )
+            clean_detach_reason = "error"
+            await self._emit_error_event(
+              "background_delivery_exhausted: bounded background-result "
+              "delivery credits were exhausted before all retained "
+              "notifications were acknowledged."
+            )
+            await self._close_client(client, timeout=5.0)
+            return
+          # A forced-final turn with no credited obligation left is still a
+          # turn: the run keeps working, and the soft-budget ladder owns
+          # the abort.
         turn_t0 = time_module.time()
         turn_t0_mono = time_module.monotonic()
 
@@ -3499,21 +3416,23 @@ class RunnerRunLoopMixin:
 
         turn_usage_before = usage_snapshot(usage_totals)
         turn_cost = 0.0
-        pending_compaction_block: dict[str, Any] | None = None
-        pending_compaction_usage: dict[str, Any] | None = None
-        provisional_anchor_message: dict[str, Any] | None = None
+        portable_compaction_applied = False
         request_scoped_nudge_message: dict[str, Any] | None = None
         delivery_request_nudge_message: dict[str, Any] | None = None
         delivery_request_nudge_recorded = False
-        # A turn past `max_turns` is the settlement turn; one that must
-        # retrieve an omitted background result carries its own nudge.
+        soft_budget_notice_recorded = False
+        # A forced-final turn is the settlement turn; one that must
+        # retrieve an omitted background result carries its own nudge. The
+        # ladder's steer rides the one turn it fired on.
         wrap_up_reminder_text: str | None = (
           MAX_TURNS_SYNTHESIS_REMINDER
-          if delivery_epoch_from_max
-          and active_delivery_obligation is not None
-          and active_delivery_obligation[2]
-          not in {"exact_retrieval", "ack_recovery"}
-          else None
+          if delivery_epoch_forced_final
+          and (
+            active_delivery_obligation is None
+            or active_delivery_obligation[2]
+            not in {"exact_retrieval", "ack_recovery"}
+          )
+          else soft_budget_steer_text
         )
 
         def remove_current_message(target: dict[str, Any] | None) -> None:
@@ -3528,25 +3447,13 @@ class RunnerRunLoopMixin:
               current_messages.pop(index)
               return
 
-        async def persist_anchor_only_and_return() -> None:
-          if pending_compaction_block is None:
-            return
-          await self._append_assistant_message_event(
-            content_blocks=[pending_compaction_block],
-            stop_reason="compaction",
-            model=upstream_model,
-            usage=dict(pending_compaction_usage or {}),
-            logical_response_id=(
-              f"logical_response_{uuid_module.uuid4().hex}"
-            ),
-            logical_response_segment_ordinal=0,
-          )
 
         async def apply_portable_compaction(*, force: bool = False) -> bool:
           nonlocal current_messages
-          nonlocal pending_compaction_block
-          nonlocal pending_compaction_usage
-          nonlocal provisional_anchor_message
+          nonlocal request_scoped_nudge_message
+          nonlocal portable_compaction_applied
+          nonlocal est_for_compaction
+          nonlocal last_real_stream_input_tokens
           nonlocal estimated_cost
           nonlocal turn_cost
           compact_result = await maybe_compact_current_messages(
@@ -3558,6 +3465,7 @@ class RunnerRunLoopMixin:
             turn_count=turn_count,
             last_compact_turn=getattr(self, "_portable_compaction_last_turn", None),
             failed_est_at=None if force else getattr(self, "_portable_compaction_failed_est_at", None),
+            preserve_tool_result_ids=pending_model_visible_tool_result_ids,
             tools=base_kwargs.get("tools") or [],
             force=force,
             on_event=self._append,
@@ -3575,15 +3483,61 @@ class RunnerRunLoopMixin:
             await self._call_on_usage(compaction_usage_event)
           if compact_result.applied:
             current_messages = compact_result.messages
+            if (
+              len(current_messages) == 2
+              and current_messages[-1] == {"role": "user", "content": CONTINUATION_NUDGE}
+            ):
+              request_scoped_nudge_message = current_messages[-1]
             _discard_unavailable_background_result_acks(
               self,
               available_tool_result_ids=_tool_result_ids(
                 current_messages
               ),
             )
-            pending_compaction_block = compact_result.anchor_block
-            pending_compaction_usage = compact_result.summarize_usage
-            provisional_anchor_message = current_messages[0] if current_messages else None
+            portable_compaction_applied = True
+            # Persist the prefix boundary now, not on a later response after
+            # the retained results. The existing summary cutoff replays the
+            # same suffix even if the next request pauses or fails.
+            if self._agent_session_log is not None:
+              log_end = await self._agent_session_log.latest_seq_current_strict()
+              retained_call_ids = {
+                str(block["id"])
+                for message in current_messages[1:]
+                for block in (
+                  message["content"] if isinstance(message.get("content"), list) else []
+                )
+                if isinstance(block, dict)
+                and block.get("type") in {"tool_use", "server_tool_use"}
+                and block.get("id")
+              }
+              assistant_entries, _ = await self._agent_session_log.query_current_strict(
+                event_types={"assistant_message"},
+                runner_id=self._runner_id,
+                before_seq=log_end,
+                order="asc",
+              )
+              retained_seqs = [
+                entry.seq
+                for entry in assistant_entries
+                if entry.event.get("role") == self._role
+                and entry.event.get("sub_agent_id") == self._sub_agent_id
+                and any(
+                  isinstance(block, dict)
+                  and block.get("type") in {"tool_use", "server_tool_use"}
+                  and block.get("id") in retained_call_ids
+                  for block in entry.event.get("content_blocks", [])
+                )
+              ]
+              await self._append_durable_event({
+                "type": "summary",
+                "summary_kind": "portable_compaction",
+                "covers": {"from_seq": 1, "to_seq": min(retained_seqs, default=log_end + 1) - 1},
+                "text": (compact_result.anchor_block or {}).get("content", ""),
+                "source_model": upstream_model,
+                "source_provider": self._provider.name,
+                "usage": dict(compact_result.summarize_usage or {}),
+              })
+            est_for_compaction = compact_result.est_after
             self._portable_compaction_last_turn = turn_count
             self._portable_compaction_failed_est_at = None
             self._append({
@@ -3600,6 +3554,7 @@ class RunnerRunLoopMixin:
               compact_result.summary_chars,
               last_real_stream_input_tokens if last_real_stream_input_tokens is not None else "n/a",
             )
+            last_real_stream_input_tokens = None
             return True
           if compact_result.reason == "summary_too_short":
             self._portable_compaction_failed_est_at = compact_result.est_before
@@ -3632,8 +3587,7 @@ class RunnerRunLoopMixin:
           await apply_portable_compaction()
 
         if (
-          pending_compaction_block is None
-          and effective_compaction_trigger is not None
+          effective_compaction_trigger is not None
           and not native_compaction
           and current_messages
           and _is_anchor_only_compaction_message(current_messages[-1])
@@ -3647,11 +3601,9 @@ class RunnerRunLoopMixin:
           usage_before_stream = usage_snapshot(usage_totals)
           request_preparation = await self._prepare_provider_request(
             active_delivery_obligation=active_delivery_obligation,
-            admit_provider_request_budget=admit_provider_request_budget,
             base_kwargs=base_kwargs,
             build_context_pressure_reminder=build_context_pressure_reminder,
             build_runtime_guard_event=build_runtime_guard_event,
-            cached_prefix_tokens=cached_prefix_tokens,
             context_limit=context_limit,
             context_pressure_reminder_decision=(
               context_pressure_reminder_decision
@@ -3665,17 +3617,12 @@ class RunnerRunLoopMixin:
             delivery_request_nudge_recorded=(
               delivery_request_nudge_recorded
             ),
-            emit_budget_exceeded_stop=emit_budget_exceeded_stop,
-            emit_terminal_failure=emit_terminal_failure,
             wrap_up_reminder_text=wrap_up_reminder_text,
             logger=logger,
             max_tokens=max_tokens,
-            max_turns=max_turns,
+            last_ordinary_turn=last_ordinary_turn,
             pending_notifications_at_render=(
               pending_notifications_at_render
-            ),
-            request_input_token_estimate_for_request=(
-              request_input_token_estimate_for_request
             ),
             system_prompt=system_prompt,
             system_prompt_estimate_text=system_prompt_estimate_text,
@@ -3683,19 +3630,31 @@ class RunnerRunLoopMixin:
             turn_count=turn_count,
             turn_reminder=turn_reminder,
             user_turn_message=user_turn_message,
-            upstream_model=upstream_model,
           )
-          if request_preparation is None:
-            return
           (
-            max_turns,
+            last_ordinary_turn,
             wrap_up_reminder_text,
             delivery_request_nudge_message,
             turn_system_prompt,
-            request_max_tokens,
             delivered_notifications_recorded,
             delivery_request_nudge_recorded,
+            request_est_input_tokens,
           ) = request_preparation
+          if soft_budget_action is not None and not soft_budget_notice_recorded:
+            build_budget_event = (
+              build_soft_budget_final_event
+              if soft_budget_action.stage == "final"
+              else build_soft_budget_steer_event
+            )
+            await self._append_durable_event({
+              **build_budget_event(
+                soft_budget_action.kind,
+                soft_budget_action.observed,
+                soft_budget_action.threshold,
+              ),
+              "notice": wrap_up_reminder_text,
+            })
+            soft_budget_notice_recorded = True
           request_tool_result_ids = _tool_result_ids(current_messages)
           turn_result = await self._stream_turn(
             client=client,
@@ -3704,7 +3663,7 @@ class RunnerRunLoopMixin:
             system_prompt=turn_system_prompt,
             current_messages=current_messages,
             base_kwargs=base_kwargs,
-            max_tokens=request_max_tokens,
+            max_tokens=max_tokens,
             turn_count=turn_count,
             turn_t0=turn_t0,
             turn_t0_mono=turn_t0_mono,
@@ -3722,7 +3681,7 @@ class RunnerRunLoopMixin:
             can_reactive_compact = (
               turn_result.is_context_length
               and not reactive_retry_attempted
-              and pending_compaction_block is None
+              and not portable_compaction_applied
               and effective_compaction_trigger is not None
               and not native_compaction
             )
@@ -3733,11 +3692,9 @@ class RunnerRunLoopMixin:
                   await self._close_client(client, timeout=2.0)
                 except Exception:
                   pass
-                client = self._provider.create_client(config, timeout=self._client_timeout)
+                client = self._provider.create_client(config)
                 self._set_client(client)
                 continue
-            if pending_compaction_block is not None:
-              await persist_anchor_only_and_return()
             await self._emit_error_event(turn_result.formatted_error)
             await self._close_client(client, timeout=5.0)
             return
@@ -3746,8 +3703,6 @@ class RunnerRunLoopMixin:
             remove_current_message(
               delivery_request_nudge_message
             )
-            if pending_compaction_block is not None:
-              await persist_anchor_only_and_return()
             return
           remove_current_message(request_scoped_nudge_message)
           request_scoped_nudge_message = None
@@ -3786,31 +3741,13 @@ class RunnerRunLoopMixin:
         base_kwargs["_request_advertised_tool_names"] = (
           getattr(turn, "advertised_tool_names", None)
         )
-        if pending_compaction_block is not None:
-          remove_current_message(provisional_anchor_message)
-          turn.content_blocks.insert(0, pending_compaction_block)
-          durable_assistant_content_blocks.insert(
-            0,
-            copy.deepcopy(pending_compaction_block),
-          )
-          pending_compaction_block = None
 
         turn_usage_state = usage_delta_state(turn_usage_before, usage_totals)
         turn_usage = turn_usage_state.usage
         stream_usage_state = usage_delta_state(usage_before_stream, usage_totals)
         stream_usage = stream_usage_state.usage
-        real_stream_input = (
-          int(stream_usage.get("input_tokens", 0) or 0)
-          + int(stream_usage.get("cache_read_input_tokens", 0) or 0)
-          + int(stream_usage.get("cache_creation_input_tokens", 0) or 0)
-        )
-        reported_cached_prefix = (
-          int(stream_usage.get("cache_read_input_tokens", 0) or 0)
-          + int(stream_usage.get("cache_creation_input_tokens", 0) or 0)
-        )
-        if real_stream_input > 0:
-          last_real_stream_input_tokens = real_stream_input
-          cached_prefix_tokens = reported_cached_prefix
+        real_stream_input = turn.request_input_tokens
+        last_real_stream_input_tokens = real_stream_input
         if stream_usage_state.has_tokens:
           stream_usage_event = self._build_usage_event(
             model=upstream_model, usage_totals=stream_usage,
@@ -3886,7 +3823,24 @@ class RunnerRunLoopMixin:
             )
           return persisted_segment_ordinal
 
-        self._append(build_turn_complete_event(turn=turn_count, usage=turn_usage_payload))
+        # Point-in-time context measurements of the last submitted request,
+        # beside, not inside, the usage counters (usage payloads are summed
+        # across turns and include any compaction call).
+        self._append({
+          **build_turn_complete_event(turn=turn_count, usage=turn_usage_payload),
+          "est_input_tokens": request_est_input_tokens,
+          "request_input_tokens": real_stream_input,
+          "context_window": context_limit,
+        })
+        if turn.tool_uses:
+          self._append(_build_tool_calls_planned_event(
+            turn=turn_count,
+            calls=_planned_tool_calls(
+              self._dispatcher,
+              turn.tool_uses,
+              _runner_attr(self, "resolve_display", resolve_display),
+            ),
+          ))
 
         turn_log_summary = stream_turn_log_summary(
           turn,
@@ -3917,16 +3871,12 @@ class RunnerRunLoopMixin:
           },
         )
 
-        if self._cost_accumulator is not None:
-          budget_progress = budget_cost_progress(
-            self._cost_accumulator,
-            running_total=estimated_cost,
-            last_reported_cost=self._last_reported_cost,
-          )
-          self._last_reported_cost = budget_progress.last_reported_cost
-          exceeded_state = budget_progress.exceeded_state
-        else:
-          exceeded_state = None
+        cost_progress = budget_cost_progress(
+          self._cost_accumulator,
+          running_total=estimated_cost,
+          last_reported_cost=self._last_reported_cost,
+        )
+        self._last_reported_cost = cost_progress.last_reported_cost
 
         if turn.stop_reason in {"error", "aborted"}:
           clean_detach_reason = "error"
@@ -3947,7 +3897,6 @@ class RunnerRunLoopMixin:
         if not turn.tool_uses:
           no_tool_turn = await self._handle_no_tool_turn(
             assistant_turn_message=assistant_turn_message,
-            budget_exceeded_state=budget_exceeded_state,
             background_tasks_completed_user_message=(
               background_tasks_completed_user_message
             ),
@@ -3955,10 +3904,8 @@ class RunnerRunLoopMixin:
             current_messages=current_messages,
             delivered_notifications=delivered_notifications,
             delivery_epoch_active=delivery_epoch_active,
-            delivery_epoch_from_max=delivery_epoch_from_max,
+            delivery_epoch_forced_final=delivery_epoch_forced_final,
             delivery_turn_compelled=delivery_turn_compelled,
-            emit_budget_exceeded_stop=emit_budget_exceeded_stop,
-            exceeded_state=exceeded_state,
             is_child_logical_response=is_child_logical_response,
             learning_real_final_response=learning_real_final_response,
             logger=logger,
@@ -3967,7 +3914,7 @@ class RunnerRunLoopMixin:
             max_tokens_continuations=max_tokens_continuations,
             max_tokens_continuations_limit=max_tokens_continuations_limit,
             max_tokens_nudge=max_tokens_nudge,
-            max_turns=max_turns,
+            last_ordinary_turn=last_ordinary_turn,
             no_tool_use_turn_outcome=no_tool_use_turn_outcome,
             persist_assistant_message_once=persist_assistant_message_once,
             task_state_cls=task_state_cls,
@@ -3999,7 +3946,7 @@ class RunnerRunLoopMixin:
         # Same boundary that acknowledges consumed background results: the
         # model answered the request that rendered these notifications, so
         # ack before the tool batch runs. A batch ending in
-        # `stop_after_tool_results_reason` (or a budget stop) can then no
+        # `stop_after_tool_results_reason` can then no
         # longer strand what the model already saw (A-M7, CUR-E2E-04).
         if delivered_notifications:
           self._ack_delivered_notifications(delivered_notifications)
@@ -4069,17 +4016,14 @@ class RunnerRunLoopMixin:
           background_tasks_completed_user_message=(
             background_tasks_completed_user_message
           ),
-          budget_exceeded_state=budget_exceeded_state,
           build_runtime_guard_event=build_runtime_guard_event,
           current_messages=current_messages,
           delivery_epoch_active=delivery_epoch_active,
-          delivery_epoch_from_max=delivery_epoch_from_max,
+          delivery_epoch_forced_final=delivery_epoch_forced_final,
           delivery_turn_compelled=delivery_turn_compelled,
-          emit_budget_exceeded_stop=emit_budget_exceeded_stop,
-          exceeded_state=exceeded_state,
           logger=logger,
           mark_terminal_interruption=mark_terminal_interruption,
-          max_turns=max_turns,
+          last_ordinary_turn=last_ordinary_turn,
           model_visible_tool_result_ids=model_visible_tool_result_ids,
           pending_model_visible_tool_result_ids=(
             pending_model_visible_tool_result_ids
@@ -4094,7 +4038,6 @@ class RunnerRunLoopMixin:
         )
         delivery_epoch_active = tool_turn.delivery_epoch_active
         delivery_turn_compelled = tool_turn.delivery_turn_compelled
-        exceeded_state = tool_turn.exceeded_state
         terminal_failure = tool_turn.terminal_failure
         terminal_success_reason = tool_turn.terminal_success_reason
         if tool_turn.action == "continue":

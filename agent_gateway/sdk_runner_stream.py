@@ -113,14 +113,6 @@ class _SDKRunnerStreamMixin:
       request_id: str | None = None,
     ) -> None: ...
 
-    def _clear_active_skill_if_report_door_completed(
-      self,
-      *,
-      tool_name: str,
-      result: Any,
-      error: Dict[str, Any] | None,
-    ) -> bool: ...
-
     def _redact_sdk_tool_input_for_event(
       self,
       tool_name: str,
@@ -311,11 +303,6 @@ class _SDKRunnerStreamMixin:
     )
     if semantic_error is None and _is_accepted_ui_blocks_result(info.tool_name, result, error):
       self._suppress_text_after_accepted_ui_blocks = True
-    self._clear_active_skill_if_report_door_completed(
-      tool_name=info.tool_name,
-      result=result,
-      error=error,
-    )
     self._append(event)
     self._call_on_tool_timing(
       tool_name=info.tool_name,

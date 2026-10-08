@@ -43,9 +43,9 @@ TOOL_RESULT_READ_TOOL_DEF: dict[str, Any] = {
   "name": "tool_result_read",
   "description": (
     "Read or search the full content behind an opaque spill_ref from a truncated "
-    "tool result. This tool can access only spill members emitted by this exact "
-    "run; it does not accept filesystem paths. Omit query to read a bounded "
-    "character page. Provide query for a bounded literal search."
+    "tool result. Reads cover this job's outputs, its read custody, and handles "
+    "explicitly passed to it within the same tenant; filesystem paths are not "
+    "accepted. Omit query to read a bounded character page. Provide query for a bounded literal search."
   ),
   "input_schema": {
     "type": "object",
@@ -59,8 +59,8 @@ TOOL_RESULT_READ_TOOL_DEF: dict[str, Any] = {
       "max_chars": {
         "type": "integer",
         "minimum": 1,
-        "maximum": SPILL_READ_MAX_CHARS,
         "default": SPILL_READ_DEFAULT_MAX_CHARS,
+        "description": f"Page size; values above {SPILL_READ_MAX_CHARS} are served at {SPILL_READ_MAX_CHARS}.",
       },
       "query": {
         "type": "string",
@@ -71,14 +71,17 @@ TOOL_RESULT_READ_TOOL_DEF: dict[str, Any] = {
       "max_results": {
         "type": "integer",
         "minimum": 1,
-        "maximum": SPILL_READ_MAX_RESULTS,
         "default": SPILL_READ_DEFAULT_MAX_RESULTS,
+        "description": f"Values above {SPILL_READ_MAX_RESULTS} are served at {SPILL_READ_MAX_RESULTS}.",
       },
       "context_chars": {
         "type": "integer",
         "minimum": 0,
-        "maximum": SPILL_READ_MAX_CONTEXT_CHARS,
         "default": SPILL_READ_DEFAULT_CONTEXT_CHARS,
+        "description": (
+          f"Characters around each match; values above {SPILL_READ_MAX_CONTEXT_CHARS} "
+          f"are served at {SPILL_READ_MAX_CONTEXT_CHARS}."
+        ),
       },
     },
     "required": ["spill_ref"],
@@ -173,6 +176,8 @@ class SpillSink:
   budget: SpillBudget = field(default_factory=SpillBudget)
   max_file_bytes: int | None = None
   after_commit: Callable[[], None] | None = None
+  # A job-scoped sink's parent job sink; ``None`` at the tree root.
+  job_parent: "SpillSink | None" = None
 
   def __call__(self) -> str:
     return self.root_provider()
@@ -180,6 +185,194 @@ class SpillSink:
   @property
   def lane(self) -> str:
     return self.capabilities.lane
+
+  def tree_root(self) -> "SpillSink":
+    sink = self
+    while sink.job_parent is not None:
+      sink = sink.job_parent
+    return sink
+
+
+# Each job's spills live under its parent's root at ``jobs/<job digest>``, so
+# a root directory holds exactly the spills of its job and its descendants.
+SPILL_JOB_DIRECTORY = "jobs"
+
+
+class _JobSpillBudget(SpillBudget):
+  """A job sink's reservations against its tree root's one budget."""
+
+  def __init__(self, parent: SpillSink) -> None:
+    super().__init__(parent.budget.max_bytes)
+    self._parent = parent
+
+  def reserve(self, root: Path, lane: str, amount: int) -> bool:
+    del root
+    return self._parent.budget.reserve(
+      _validated_root(Path(self._parent())),
+      lane,
+      amount,
+    )
+
+  def rollback(self, amount: int) -> None:
+    self._parent.budget.rollback(amount)
+
+
+def _job_directory_name(job_id: str) -> str:
+  return hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:32]
+
+
+def job_spill_sink(parent: SpillSink, job_id: str) -> SpillSink:
+  """Locate one child's spill root without creating its publication directories."""
+
+  if not job_id:
+    raise ValueError("job spill sink requires a job id")
+
+  def _root() -> str:
+    return str(Path(parent()) / SPILL_JOB_DIRECTORY / _job_directory_name(job_id))
+
+  return SpillSink(
+    root_provider=_root,
+    capabilities=parent.capabilities,
+    budget=_JobSpillBudget(parent),
+    max_file_bytes=parent.max_file_bytes,
+    after_commit=parent.after_commit,
+    job_parent=parent,
+  )
+
+
+def _job_roots(root: Path) -> list[Path]:
+  """``root`` and every descendant job root below it, never via a symlink."""
+
+  roots = [root]
+  index = 0
+  while index < len(roots):
+    jobs = roots[index] / SPILL_JOB_DIRECTORY
+    index += 1
+    try:
+      if jobs.is_symlink() or not jobs.is_dir():
+        continue
+      with os.scandir(jobs) as entries:
+        for entry in entries:
+          if entry.is_dir(follow_symlinks=False):
+            roots.append(Path(entry.path))
+    except OSError:
+      continue
+  return roots
+
+
+def resolve_spill_producer(sink: SpillSink, spill_ref: Any) -> Path | None:
+  """The job root under ``sink`` that published ``spill_ref``, if any.
+
+  Membership is content-bound: the pointer file must hash to the ref's
+  digest. Searching ``sink``'s own root and its descendants' roots is exactly
+  the reader's ``outputs of the job and its descendants`` for spills.
+  """
+
+  pointer_ref, pointer_digest = _parse_spill_ref(spill_ref)
+  try:
+    base = _validated_root(Path(sink()))
+  except Exception:  # noqa: BLE001 - an absent root holds no spills
+    return None
+  for root in _job_roots(base):
+    if _spill_pointer_matches(root, pointer_ref, pointer_digest, sink=sink):
+      return root
+  return None
+
+
+def _spill_read_file_cap(sink: SpillSink | None) -> int:
+  return (sink.max_file_bytes if sink is not None else None) or SPILL_READ_DEFAULT_FILE_MAX_BYTES
+
+
+def _spill_pointer_matches(
+  root: Path,
+  pointer_ref: str,
+  pointer_digest: str,
+  *,
+  sink: SpillSink | None,
+) -> bool:
+  try:
+    data = _read_spill_member_bytes(
+      root, pointer_ref, max_bytes=_spill_read_file_cap(sink),
+    )
+  except SpillReadError:
+    return False
+  return hmac.compare_digest(hashlib.sha256(data).hexdigest(), pointer_digest)
+
+
+async def resolve_job_spill_producer(
+  sink: SpillSink | None,
+  spill_ref: str,
+  *,
+  durable_log: Any | None,
+) -> tuple[Path, ...]:
+  """Locate every content-bound publication in the authenticated journal/tree.
+
+  Locations are facts, not read grants. Identical references may name several
+  physical publications; admission reads their output/custody projection.
+  """
+
+  pointer_ref, pointer_digest = _parse_spill_ref(spill_ref)
+  roots: dict[Path, None] = {}
+  if durable_log is not None:
+    publications, _ = await durable_log.query(event_types={"tool_call_complete"})
+    for item in publications:
+      publication = item.event.get("spill_publication")
+      if not isinstance(publication, dict) or publication.get("spill_ref") != spill_ref:
+        continue
+      producer_root = publication.get("producer_root")
+      if not isinstance(producer_root, str) or not Path(producer_root).is_absolute():
+        continue
+      root = Path(producer_root)
+      if root not in roots and _spill_pointer_matches(
+        root, pointer_ref, pointer_digest, sink=sink,
+      ):
+        roots[root] = None
+  if sink is not None:
+    try:
+      base = _validated_root(Path(sink.tree_root()()))
+    except Exception:  # noqa: BLE001 - an absent root holds no spills
+      base = None
+    if base is not None:
+      for root in _job_roots(base):
+        if root not in roots and _spill_pointer_matches(
+          root, pointer_ref, pointer_digest, sink=sink,
+        ):
+          roots[root] = None
+  return tuple(roots)
+
+
+async def job_spill_output_handles(
+  sink: SpillSink | None,
+  spill_ref: str,
+  *,
+  job_id: str,
+  durable_log: Any | None,
+) -> frozenset[str]:
+  """Project a requested spill's output facts, like ``job_output_handles``.
+
+  The job sink preserves physical own/descendant outputs. Cross-root outputs
+  and continuation custody derive from ``job_read_subtree`` in the reader's
+  tenant-scoped journal; neither session aliases nor cited refs add outputs.
+  Only admission combines these facts with explicitly passed handle grants.
+  """
+  from .task_registry import job_read_subtree
+
+  _parse_spill_ref(spill_ref)
+  outputs: set[str] = set()
+  if sink is not None and resolve_spill_producer(sink, spill_ref) is not None:
+    outputs.add(spill_ref)
+  if durable_log is not None:
+    subtree = await job_read_subtree(durable_log, job_id=job_id)
+    publications, _ = await durable_log.query(event_types={"tool_call_complete"})
+    for item in publications:
+      publication = item.event.get("spill_publication")
+      if (
+        isinstance(publication, dict)
+        and publication.get("spill_ref") == spill_ref
+        and publication.get("producer_job_id") in subtree
+      ):
+        outputs.add(spill_ref)
+  return frozenset(outputs)
 
 
 @dataclass(frozen=True)
@@ -252,6 +445,19 @@ def normalize_spill_sink(value: Callable[[], str] | SpillSink | None) -> SpillSi
   )
 
 
+def _publication_root(sink: SpillSink) -> Path:
+  """Create job directories only when publishing, validating each boundary."""
+
+  if sink.job_parent is None:
+    return _validated_root(Path(sink()))
+  parent_root = _publication_root(sink.job_parent)
+  jobs = parent_root / SPILL_JOB_DIRECTORY
+  jobs.mkdir(mode=0o700, exist_ok=True)
+  root = _validated_root(jobs) / Path(sink()).name
+  root.mkdir(mode=0o700, exist_ok=True)
+  return _validated_root(root)
+
+
 def write_spill_set(
   *,
   sink: SpillSink,
@@ -262,7 +468,7 @@ def write_spill_set(
   uuid_factory: Callable[[], Any] | None = None,
 ) -> SpillPublication:
   uuid_factory = uuid_factory or uuid.uuid4
-  root = _validated_root(Path(sink()))
+  root = _publication_root(sink)
   raw = f"{tool_name}_{tool_use_id or uuid_factory().hex}"
   base_stem = re.sub(r"[^A-Za-z0-9._-]", "_", raw)[:120]
 
@@ -356,7 +562,6 @@ def _read_int(
   name: str,
   default: int,
   minimum: int,
-  maximum: int | None = None,
 ) -> int:
   if value is None:
     return default
@@ -364,9 +569,24 @@ def _read_int(
     raise SpillReadInvalidInput(f"{name} must be an integer")
   if value < minimum:
     raise SpillReadInvalidInput(f"{name} must be >= {minimum}")
-  if maximum is not None and value > maximum:
-    raise SpillReadInvalidInput(f"{name} must be <= {maximum}")
   return value
+
+
+def _bounded_int(
+  value: Any,
+  *,
+  name: str,
+  default: int,
+  minimum: int,
+  maximum: int,
+  notes: list[str],
+) -> int:
+  """Read an integer limit; a value above ``maximum`` is served at it, with a note."""
+  read = _read_int(value, name=name, default=default, minimum=minimum)
+  if read <= maximum:
+    return read
+  notes.append(f"{name}={read} exceeds the reader limit; served with {name}={maximum}")
+  return maximum
 
 
 def _read_spill_member_bytes(
@@ -505,7 +725,7 @@ def _spill_read_result_fits(payload: dict[str, Any]) -> bool:
 
 
 def read_spill_result(
-  sink: SpillSink,
+  sink: SpillSink | None,
   *,
   spill_ref: Any,
   member_ref: Any = None,
@@ -514,36 +734,50 @@ def read_spill_result(
   query: Any = None,
   max_results: Any = None,
   context_chars: Any = None,
+  producer_root: Path | None = None,
 ) -> dict[str, Any]:
-  """Read one content-bound member from the exact sink captured by this run."""
+  """Read a content-bound member at the server-resolved publication root.
 
-  if not isinstance(sink, SpillSink) or not sink.capabilities.spill_read:
+  Without ``producer_root``, this is the original sink-only byte reader.
+  Journal-resolved reads need no live producer sink or writer lease and use
+  the current reader's file cap, or the standard read cap without a sink.
+  """
+
+  if producer_root is None and (
+    sink is None or not sink.capabilities.spill_read
+  ):
     raise SpillReadUnavailable("spill reader is unavailable for this run")
   pointer_ref, pointer_digest = _parse_spill_ref(spill_ref)
   requested_member_ref = pointer_ref if member_ref is None else member_ref
   if not isinstance(requested_member_ref, str):
     raise SpillReadInvalidInput("member_ref must be a string")
   read_offset = _read_int(offset, name="offset", default=0, minimum=0)
-  page_chars = _read_int(
+  # The page/result/context limits bound this reader's response; a request above
+  # one is served at the limit and says so, never refused.
+  notes: list[str] = []
+  page_chars = _bounded_int(
     max_chars,
     name="max_chars",
     default=SPILL_READ_DEFAULT_MAX_CHARS,
     minimum=1,
     maximum=SPILL_READ_MAX_CHARS,
+    notes=notes,
   )
-  result_limit = _read_int(
+  result_limit = _bounded_int(
     max_results,
     name="max_results",
     default=SPILL_READ_DEFAULT_MAX_RESULTS,
     minimum=1,
     maximum=SPILL_READ_MAX_RESULTS,
+    notes=notes,
   )
-  search_context = _read_int(
+  search_context = _bounded_int(
     context_chars,
     name="context_chars",
     default=SPILL_READ_DEFAULT_CONTEXT_CHARS,
     minimum=0,
     maximum=SPILL_READ_MAX_CONTEXT_CHARS,
+    notes=notes,
   )
   if query is not None and (
     not isinstance(query, str)
@@ -552,17 +786,20 @@ def read_spill_result(
   ):
     raise SpillReadInvalidInput("query must be a non-empty bounded string")
   if query is None and (max_results is not None or context_chars is not None):
-    raise SpillReadInvalidInput(
-      "max_results and context_chars require query"
-    )
+    notes.append("max_results and context_chars apply to a query; ignored for this page read")
   if query is not None and max_chars is not None:
-    raise SpillReadInvalidInput("max_chars is available only for page reads")
+    notes.append("max_chars applies to a page read; ignored for this query")
 
   try:
-    root = _validated_root(Path(sink()))
+    if producer_root is not None:
+      root = _validated_root(producer_root)
+    elif sink is not None:
+      root = _validated_root(Path(sink()))
+    else:
+      raise SpillReadUnavailable("spill reader is unavailable for this run")
   except Exception as exc:
     raise SpillReadUnavailable("spill is missing or expired") from exc
-  file_cap = sink.max_file_bytes or SPILL_READ_DEFAULT_FILE_MAX_BYTES
+  file_cap = _spill_read_file_cap(sink)
   pointer_data = _read_spill_member_bytes(root, pointer_ref, max_bytes=file_cap)
   if not hmac.compare_digest(
     hashlib.sha256(pointer_data).hexdigest(),
@@ -597,6 +834,7 @@ def read_spill_result(
     "spill_ref": spill_ref,
     "member_ref": requested_member_ref,
     "offset": read_offset,
+    **({"notes": notes} if notes else {}),
   }
   if query is None:
     requested_end = min(len(text), read_offset + page_chars)
@@ -671,13 +909,69 @@ def read_spill_result(
 
 def make_tool_result_read_handler(
   sink_provider: Callable[[], SpillSink | None],
+  *,
+  caller: Callable[[], Any],
+  journal: Callable[[], Any | None],
+) -> Any:
+  """Build ``tool_result_read`` for one executing job.
+
+  ``caller`` returns the reading job's admitted context; ``journal`` lazily
+  supplies its authenticated durable log. Locations and own/descendant/custody
+  outputs are separate facts; shared admission combines those outputs with
+  explicit grants before the existing byte/manifest integrity read.
+  The result is a ``JobScopedHandler``.
+  """
+
+  # admission imports session, which imports this module.
+  from .job_caller import JobScope, JobScopedHandler
+
+  return JobScopedHandler(
+    lambda scope: _tool_result_read_handler(scope.spill_sink, scope.caller, journal),
+    JobScope(caller=caller, spill_sink=sink_provider),
+  )
+
+
+def _tool_result_read_handler(
+  sink_provider: Callable[[], SpillSink | None],
+  caller: Callable[[], Any],
+  journal: Callable[[], Any | None],
 ) -> Callable[..., Any]:
+  from .admission import HandleOwners, HandleRequest, Refusal, admit
+
   async def _handle(tool_input: dict[str, Any], **_: Any) -> tuple[Any, Any]:
     try:
       sink = sink_provider()
-      if sink is None:
+      reader = caller()
+      if reader is None or reader.job_id is None:
         raise SpillReadUnavailable("spill reader is unavailable for this run")
-      return read_spill_result(sink, **dict(tool_input or {})), None
+      args = dict(tool_input or {})
+      spill_ref = args.get("spill_ref")
+      if not isinstance(spill_ref, str):
+        raise SpillReadInvalidInput("spill_ref must be a string")
+      _parse_spill_ref(spill_ref)
+      durable_log = journal()
+      producers = await resolve_job_spill_producer(
+        sink, spill_ref, durable_log=durable_log,
+      )
+      if not producers:
+        raise SpillReadUnavailable("spill is missing or expired")
+      admitted = admit(
+        HandleRequest(handle=spill_ref, reader_job_id=reader.job_id),
+        reader,
+        owners=HandleOwners(
+          outputs=await job_spill_output_handles(
+            sink, spill_ref, job_id=reader.job_id, durable_log=durable_log,
+          ),
+        ),
+      )
+      if isinstance(admitted, Refusal):
+        return None, {
+          "code": admitted.reason,
+          "message": admitted.detail,
+          "owner": admitted.owner,
+        }
+      args["producer_root"] = producers[0]
+      return read_spill_result(sink, **args), None
     except SpillReadError as exc:
       return None, {"code": exc.code, "message": str(exc)}
     except TypeError:
@@ -1208,8 +1502,18 @@ def _remove_attempt_members(linked: list[tuple[Path, int, _PublishedMember]]) ->
 
 
 def _scan_existing_spill_bytes(root: Path, lane: str) -> int:
+  """Bytes one tree's budget already holds: ``root`` and every job root below.
+
+  Child jobs spill under ``jobs/<digest>`` and reserve against the tree
+  root's one budget, so a rehydrated budget counts their retained bytes too.
+  """
+
   if not root.exists():
     return 0
+  return sum(_scan_root_spill_bytes(job_root, lane) for job_root in _job_roots(root))
+
+
+def _scan_root_spill_bytes(root: Path, lane: str) -> int:
   if lane != SPILL_LANE_FILE_TOOLS:
     return _scan_canonical_spill_bytes(root)
 

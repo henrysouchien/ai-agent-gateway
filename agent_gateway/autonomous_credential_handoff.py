@@ -13,7 +13,6 @@ AUTONOMOUS_CREDENTIAL_HANDOFF_ENV = (
   "AGENT_AUTONOMOUS_CREDENTIAL_HANDOFF"
 )
 AUTONOMOUS_CREDENTIAL_HANDOFF_STDIN = "stdin-json-v1"
-AUTONOMOUS_CREDENTIAL_HANDOFF_MAX_BYTES = 128 * 1024
 
 _HANDOFF_FIELDS = frozenset({
   "version",
@@ -98,7 +97,7 @@ def encode_autonomous_credential_handoff(
     "session_token": session_token,
   }
   try:
-    encoded = json.dumps(
+    return json.dumps(
       payload,
       sort_keys=True,
       separators=(",", ":"),
@@ -108,11 +107,6 @@ def encode_autonomous_credential_handoff(
     raise ValueError(
       "autonomous credential material is not JSON serializable"
     ) from exc
-  if not encoded or len(encoded) > AUTONOMOUS_CREDENTIAL_HANDOFF_MAX_BYTES:
-    raise ValueError(
-      "autonomous credential handoff exceeds the allowed size"
-    )
-  return encoded
 
 
 def read_autonomous_launch_secrets(
@@ -128,16 +122,12 @@ def read_autonomous_launch_secrets(
 
   source = stream if stream is not None else sys.stdin.buffer
   try:
-    raw = source.read(AUTONOMOUS_CREDENTIAL_HANDOFF_MAX_BYTES + 1)
+    raw = source.read()
   finally:
     if stream is None:
       source.close()
   if not isinstance(raw, bytes) or not raw:
     raise ValueError("autonomous credential handoff is missing")
-  if len(raw) > AUTONOMOUS_CREDENTIAL_HANDOFF_MAX_BYTES:
-    raise ValueError(
-      "autonomous credential handoff exceeds the allowed size"
-    )
   try:
     payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_closed_object)
   except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -239,7 +229,6 @@ def read_autonomous_credential_handoff(
 
 __all__ = [
   "AUTONOMOUS_CREDENTIAL_HANDOFF_ENV",
-  "AUTONOMOUS_CREDENTIAL_HANDOFF_MAX_BYTES",
   "AUTONOMOUS_CREDENTIAL_HANDOFF_STDIN",
   "AutonomousLaunchSecrets",
   "encode_autonomous_credential_handoff",

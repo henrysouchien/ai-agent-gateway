@@ -34,10 +34,10 @@ from agent_gateway.capability_execution import (
 from agent_gateway.mcp_client import McpClientManager
 from model_authority.current import INITIAL_MODEL_REGISTRY
 from agent_gateway.providers import AnthropicProvider, StreamEvent
-from agent_gateway.sub_agent import _DEFAULT_EXCLUDED_TOOLS
 from gateway_test_support.capability_execution_test_support import (
   stub_runner_capability_execution,
 )
+from gateway_test_support.child_task_result import succeeded_child_task_result
 from gateway_test_support.tool_catalog_test_support import OWNER_GATEWAY_SESSION
 
 
@@ -100,7 +100,7 @@ class _StubRunner:
 
   async def spawn_sub_agent(self, task: str, **kwargs: Any):
     self.calls.append({"task": task, **kwargs})
-    return {"response": "ok"}, None
+    return succeeded_child_task_result(kwargs), None
 
   def _get_tool_definitions(self) -> list[dict[str, str]]:
     return [
@@ -118,14 +118,15 @@ class _CapabilityResolver(CapabilityExecutionResolver):
     object.__setattr__(self, "registry", INITIAL_MODEL_REGISTRY)
     object.__setattr__(self, "calls", [])
 
-  def resolve(
+  def select_bind(
     self,
     capability_id: CapabilityId,
     *,
     explicit_intent: ModelSelectionIntent | None = None,
     saved_preference: ModelSelectionIntent | None = None,
     parent_bind: CapabilityBind | None = None,
-  ) -> BoundCapabilityExecution:
+    effort: str | None = None,
+  ) -> CapabilityBind:
     self.calls.append({
       "capability_id": capability_id,
       "explicit_intent": explicit_intent,
@@ -150,14 +151,15 @@ class _CapabilityResolver(CapabilityExecutionResolver):
       policy_revision="test.1",
       selection_source="internal_policy",
     )
+    return bind
+
+  def materialize_bind(self, bind: CapabilityBind) -> BoundCapabilityExecution:
+    entry = INITIAL_MODEL_REGISTRY.require(bind.model_key)
     return BoundCapabilityExecution(
       bind=bind,
       registry=INITIAL_MODEL_REGISTRY,
       adapter=AnthropicProvider(),
-      auth_config={
-        "provider": entry.provider,
-        "api_key": "coordinator-test-key",
-      },
+      auth_config={"provider": entry.provider, "api_key": "coordinator-test-key"},
     )
 
 
@@ -172,9 +174,6 @@ def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
     event_log=event_log or EventLog(),
     session_id="sess-coordinator",
   )
-
-def _raw_worker_excluded_tools(**worker_excluded_tools):
-  return worker_excluded_tools
 
 
 @pytest.fixture
@@ -192,18 +191,6 @@ def test_coordinator_config_defaults() -> None:
   assert config.max_workers == 3
   assert "do not poll running workers" in COORDINATOR_DEFAULT_PREAMBLE
   assert "automatic completion notifications" in COORDINATOR_DEFAULT_PREAMBLE
-
-
-def test_coordinator_config_owns_immutable_worker_exclusions() -> None:
-  worker_excluded_tools = {"memory_store"}
-  config = CoordinatorConfig(
-    enabled=True,
-    **_raw_worker_excluded_tools(worker_excluded_tools=worker_excluded_tools),
-  )
-
-  worker_excluded_tools.add("late_tool")
-
-  assert config.worker_excluded_tools == frozenset({"memory_store"})
 
 
 def test_coordinator_preamble_injected_into_string_system_prompt() -> None:
@@ -287,7 +274,7 @@ def test_coordinator_disabled_does_not_inject_preamble() -> None:
 
 
 @pytest.mark.usefixtures("worker_tool_policy")
-def test_make_run_agent_handler_merges_worker_excluded_tools() -> None:
+def test_make_run_agent_handler_subtracts_only_parent_exclusions() -> None:
   runner = _StubRunner()
   resolver = _CapabilityResolver()
   handler = make_run_agent_handler(
@@ -302,23 +289,19 @@ def test_make_run_agent_handler_merges_worker_excluded_tools() -> None:
       "web_search": _dummy_tool,
     },
     excluded_tools={"memory_read"},
-    coordinator_config=CoordinatorConfig(
-      enabled=True,
-      worker_excluded_tools=frozenset({"file_glob"}),
-    ),
     capability_execution_resolver=resolver,
   )
 
   result, error = _run(handler({"objective": "Collect", "background": False}))
 
   assert error is None
-  assert result == {"response": "ok"}
-  assert _DEFAULT_EXCLUDED_TOOLS | {
-    "file_glob",
-    "memory_read",
-  } <= runner.calls[0]["excluded_tools"]
+  assert result == succeeded_child_task_result(runner.calls[0])
+  excluded = runner.calls[0]["excluded_tools"]
+  assert "memory_read" in excluded
+  assert "file_glob" not in excluded
+  assert "run_agent" not in excluded
   worker_tools = runner.calls[0]["dispatcher"]._local
-  assert set(worker_tools) == {"file_read", "web_search"}
+  assert set(worker_tools) == {"file_glob", "file_read", "web_search"}
   assert worker_tools["file_read"] is _dummy_tool
   assert "report_door" not in runner.calls[0]
 
@@ -355,14 +338,13 @@ def test_make_run_agent_handler_uses_authenticated_worker_bind() -> None:
     skill_loader=None,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"file_read": _dummy_tool, "web_search": _dummy_tool},
-    coordinator_config=CoordinatorConfig(enabled=True),
     capability_execution_resolver=resolver,
   )
 
   result, error = _run(handler({"objective": "Collect", "background": False}))
 
   assert error is None
-  assert result == {"response": "ok"}
+  assert result == succeeded_child_task_result(runner.calls[0])
   assert runner.calls[0]["capability_execution"].bind.provider == "anthropic"
   assert runner.calls[0]["capability_execution"].bind.upstream_model == "claude-opus-5"
 
@@ -375,7 +357,6 @@ def test_make_run_agent_handler_rejects_provider_selection_input() -> None:
     skill_loader=None,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={},
-    coordinator_config=CoordinatorConfig(enabled=True),
     capability_execution_resolver=resolver,
   )
 
@@ -397,7 +378,6 @@ def test_make_run_agent_handler_rejects_model_selection_input() -> None:
     skill_loader=None,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={},
-    coordinator_config=CoordinatorConfig(enabled=True),
     capability_execution_resolver=resolver,
   )
 

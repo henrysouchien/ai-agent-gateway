@@ -1,67 +1,9 @@
 from __future__ import annotations
 
 import inspect
-from typing import AbstractSet, Any, Callable, Mapping, Set
+from typing import Callable
 
 from .tool_dispatcher_helpers import NeedsApprovalCallback
-
-
-def mcp_scope_error(
-  tool_name: str,
-  server_name: str | None,
-  *,
-  allowed_mcp_tools_by_server: Mapping[str, AbstractSet[str]] | None,
-  scope_context: str = "skill",
-  describe_scope_block: Callable[[str | None, str], str | None] | None = None,
-) -> dict[str, Any] | None:
-  if allowed_mcp_tools_by_server is None:
-    return None
-  is_profile_scope = scope_context == "profile"
-  sub_code = "profile_scope" if is_profile_scope else "skill_scope"
-  if not server_name:
-    if is_profile_scope:
-      message = describe_scope_block(server_name, tool_name) if describe_scope_block is not None else None
-      if not isinstance(message, str) or not message.strip():
-        message = (
-          f"MCP tool '{tool_name}' is not in this session's active MCP tool scope. "
-          "Check the session instructions' deferred servers and tool packs list, call load_tools "
-          "for the required server or pack, then retry; if it stays blocked after loading, "
-          "it is not available on this channel."
-        )
-      return {
-        "code": "mcp_tool_not_allowed",
-        "sub_code": sub_code,
-        "message": message,
-      }
-    return {
-      "code": "mcp_tool_not_allowed",
-      "sub_code": sub_code,
-      "message": f"MCP tool '{tool_name}' is not allowed in this scoped child run.",
-    }
-  allowed_tools = allowed_mcp_tools_by_server.get(server_name, set())
-  if tool_name in allowed_tools:
-    return None
-  if is_profile_scope:
-    message = describe_scope_block(server_name, tool_name) if describe_scope_block is not None else None
-    if not isinstance(message, str) or not message.strip():
-      message = (
-        f"MCP tool '{server_name}.{tool_name}' is not in this session's active MCP tool scope. "
-        f"Call load_tools(servers=['{server_name}']) to arm that server's available tools, "
-        "then retry; if it stays blocked after loading, it is not available on this channel."
-      )
-    return {
-      "code": "mcp_tool_not_allowed",
-      "sub_code": sub_code,
-      "message": message,
-    }
-  return {
-    "code": "mcp_tool_not_allowed",
-    "sub_code": sub_code,
-    "message": (
-      f"MCP tool '{server_name}.{tool_name}' is not allowed in this scoped child run. "
-      "Use one of the MCP tools declared by the active skill."
-    ),
-  }
 
 
 def normalize_needs_approval(
@@ -80,44 +22,3 @@ def normalize_needs_approval(
   if arg_count == 2:
     return lambda name, tool_input, _qualifier: needs_approval(name, tool_input)
   return needs_approval
-
-
-def qualified_key(tool_name: str, qualifier: str) -> str:
-  return f"{tool_name}:{qualifier}" if qualifier else tool_name
-
-
-def should_request_approval(
-  tool_name: str,
-  tool_input: dict[str, Any],
-  qualifier: str,
-  *,
-  session_cache_denied: frozenset[str],
-  approved_tool_types: Set[str],
-  needs_approval: NeedsApprovalCallback,
-  qualified_key_fn: Callable[[str, str], str] = qualified_key,
-) -> bool:
-  if tool_name not in session_cache_denied:
-    cache_key = qualified_key_fn(tool_name, qualifier)
-    if cache_key in approved_tool_types:
-      return False
-    if not qualifier and tool_name in approved_tool_types:
-      return False
-  return needs_approval(tool_name, tool_input, qualifier)
-
-
-def tool_was_cache_hit(
-  tool_name: str,
-  qualifier: str,
-  *,
-  session_cache_denied: frozenset[str],
-  approved_tool_types: Set[str],
-  qualified_key_fn: Callable[[str, str], str] = qualified_key,
-) -> bool:
-  if tool_name in session_cache_denied:
-    return False
-  cache_key = qualified_key_fn(tool_name, qualifier)
-  if cache_key in approved_tool_types:
-    return True
-  if not qualifier and tool_name in approved_tool_types:
-    return True
-  return False
