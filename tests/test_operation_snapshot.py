@@ -34,6 +34,7 @@ from agent_workflow_contracts.models import AdmittedLineage
 
 def test_legacy_profile_adapter_preserves_golden_snapshot_and_digests() -> None:
   profile = SkillProfile(
+    execution_class="analysis",
     name="golden-operation",
     version="2.1",
     system_prompt="Raw methodology.",
@@ -54,7 +55,6 @@ def test_legacy_profile_adapter_preserves_golden_snapshot_and_digests() -> None:
 
   legacy_adapter = compile_agent_operation(
     profile,
-    execution_class="analysis",
     resolved_instructions="Resolved instructions.",
   )
   primitive = build_agent_operation_snapshot(

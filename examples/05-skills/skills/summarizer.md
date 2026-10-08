@@ -1,5 +1,6 @@
 ---
 name: summarizer
+execution_class: node.implement
 ---
 You are a focused summarization sub-agent.
 

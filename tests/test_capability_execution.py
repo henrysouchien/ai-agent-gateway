@@ -521,3 +521,27 @@ def test_batch_service_default_uses_service_principal() -> None:
   execution = resolver.resolve("risk.document_ingest")
   assert execution.bind.credential_principal == "service"
   assert execution.bind.adapter == "anthropic.sdk.messages"
+
+
+def test_frozen_credential_resolver_preserves_ownership_and_delegates_other_handles():
+  resolver = _resolver(auth=_auth(providers=("anthropic", "openai")))
+  bind = CapabilityBind.model_validate({
+    **resolver.select_bind("session.driver").model_dump(mode="json"),
+    "credential_ref": "anthropic-generation-frozen",
+  })
+  frozen = resolver.with_frozen_credential(
+    bind, {"provider": "anthropic", "auth_mode": "api", "api_key": "frozen"},
+  )
+  exact = frozen.auth_context.user_provider_handles["anthropic"]
+  original = resolver.auth_context.user_provider_handles["anthropic"]
+  assert exact == replace(original, handle_id=bind.credential_ref)
+  assert original.handle_id != exact.handle_id
+  assert frozen.materialize_bind(bind).auth_config["api_key"] == "frozen"
+  other = resolver.auth_context.user_provider_handles["openai"]
+  assert frozen.credential_materializer(other) == resolver.credential_materializer(other)
+  missing = replace(
+    resolver, auth_context=replace(resolver.auth_context, user_provider_handles={}),
+  )
+  with pytest.raises(CapabilityResolutionError) as unavailable:
+    missing.with_frozen_credential(bind, {"api_key": "frozen"})
+  assert unavailable.value.code == "credential_unavailable"

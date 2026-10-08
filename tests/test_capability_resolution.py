@@ -515,7 +515,6 @@ def test_admit_operation_tools_is_now_the_resolver_itself() -> None:
 
   operation = compile_agent_operation(
     generic_explore_profile(),
-    execution_class="node.explore",
   )
   local = {"web_fetch": object(), "web_search": object()}
   mcp = _Mcp()

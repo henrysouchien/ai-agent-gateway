@@ -60,6 +60,7 @@ def _write_operation(path: Path) -> None:
   path.write_text(
     """---
 name: filing-review
+execution_class: node.implement
 version: '2.0'
 agent_callable: true
 agent_description: Review supplied filing evidence.
@@ -129,6 +130,7 @@ def test_ordinary_and_resumed_admission_are_exact_execute_tasks(
   (tmp_path / "explore.md").write_text(
     """---
 name: explore
+execution_class: node.explore
 version: '1.0'
 agent_callable: true
 agent_description: Explore exact evidence.

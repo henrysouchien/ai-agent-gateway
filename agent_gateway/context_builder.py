@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import dataclass, replace
@@ -12,6 +13,7 @@ from .research_file_current_projection import (
   load_research_file_current_projection,
 )
 from .secret_boundary import sanitize_tool_event
+from .skill_lifecycle import drain_owned_lifecycle_task
 
 Message = dict[str, Any]
 
@@ -38,11 +40,43 @@ class SessionContextBuilder:
   The replay is the parent writer's model-visible state: every current entry
   after the projection cutoff or durable summary, minus child (`sub_agent`)
   rows, cut at the last compaction block exactly as the provider request is.
+  A forked session's log opens with one `fork_seed` event holding its source
+  log's replay at fork time; that seed is the prefix until a summary covers it.
   """
 
   agent_session_log: AgentSessionLog
+  # The log this session forked from, read once to seed `agent_session_log`.
+  fork_source_log: AgentSessionLog | None = None
 
   async def build(self) -> list[Message]:
+    fork_source_log = self.fork_source_log
+    if fork_source_log is not None:
+      # Any seed, even one a later projection cutoff hides, means the source
+      # was already copied: it is copied once and never read again.
+      seeded, _ = await self.agent_session_log.query_current_strict(
+        event_types={"fork_seed"},
+        limit=1,
+      )
+      if not seeded:
+        async def append_fork_seed() -> None:
+          await self.agent_session_log.append({
+            "type": "fork_seed",
+            "source_log_path": str(fork_source_log.path),
+            "messages": await SessionContextBuilder(
+              agent_session_log=fork_source_log
+            ).build(),
+          })
+
+        # A cancelled first turn finishes cancelling only once the seed is
+        # durable: the accepted POST already made this log the workbook's, a
+        # later resume of it carries no source to seed from, and the turn's
+        # writer ownership must outlive the append.
+        seed_task = asyncio.ensure_future(append_fork_seed())
+        try:
+          await asyncio.shield(seed_task)
+        except asyncio.CancelledError:
+          await drain_owned_lifecycle_task(seed_task)
+          raise
     snapshot_max_seq = await self.agent_session_log.latest_seq_current_strict()
     current_projection = await load_research_file_current_projection(
       self.agent_session_log,
@@ -70,6 +104,13 @@ class SessionContextBuilder:
       **current_query,
     )
     latest_state_update = state_updates[0] if state_updates else None
+    fork_seeds, _ = await self.agent_session_log.query_current_strict(
+      event_types={"fork_seed"},
+      order="desc",
+      limit=1,
+      **current_query,
+    )
+    fork_seed = fork_seeds[0] if fork_seeds else None
     interrupted_context = await self._latest_interrupted_run_context(
       current_projection=current_projection,
       snapshot_max_seq=snapshot_max_seq,
@@ -80,6 +121,8 @@ class SessionContextBuilder:
       covers = latest_summary.event.get("covers") or {}
       covers_to_seq = int(covers.get("to_seq", 0) or 0)
       tail_after_seq = max(covers_to_seq + 1, tail_after_seq)
+      if fork_seed is not None and covers_to_seq >= fork_seed.seq:
+        fork_seed = None
     tail_entries, _ = await self.agent_session_log.query_current_strict(
       after_seq=tail_after_seq,
       order="asc",
@@ -91,7 +134,7 @@ class SessionContextBuilder:
     tail_entries = [
       entry
       for entry in tail_entries
-      if entry.event.get("type") not in {"summary", "state_update"}
+      if entry.event.get("type") not in {"summary", "state_update", "fork_seed"}
       and entry.event.get("role") != "sub_agent"
     ]
     if interrupted_context is not None:
@@ -117,6 +160,8 @@ class SessionContextBuilder:
     tail_messages = [message for group in tail_groups for message in group]
 
     messages: list[Message] = []
+    if fork_seed is not None:
+      messages.extend(fork_seed.event["messages"])
     if latest_summary is not None:
       messages.append(self._summary_to_message(latest_summary))
     if latest_state_update is not None:

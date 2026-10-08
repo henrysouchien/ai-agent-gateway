@@ -310,7 +310,7 @@ def test_run_agent_rejects_bare_upstream_model() -> None:
 def test_skill_profile_parses_provider_frontmatter(tmp_path: Path) -> None:
   skill_path = tmp_path / "worker.md"
   skill_path.write_text(
-    "---\nprovider: openai\n---\nUse the OpenAI worker.\n",
+    "---\nexecution_class: node.implement\nprovider: openai\n---\nUse the OpenAI worker.\n",
     encoding="utf-8",
   )
 
@@ -325,7 +325,7 @@ def test_run_agent_rejects_legacy_skill_and_task_selectors(tmp_path: Path) -> No
     skills_dir,
     "openai-worker",
     (
-      "---\nagent_callable: true\nagent_description: Uses the OpenAI worker.\n"
+      "---\nexecution_class: node.implement\nagent_callable: true\nagent_description: Uses the OpenAI worker.\n"
       "provider: openai\nmodel: gpt-4o-mini\nmutation_mode: read_only\n"
       "---\nUse the OpenAI worker."
     ),

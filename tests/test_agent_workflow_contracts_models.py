@@ -398,6 +398,42 @@ def test_task_result_keeps_execution_outcome_and_evidence_separate() -> None:
     )
 
 
+def test_awaiting_approval_round_trip_preserves_identity_and_usage_without_results() -> None:
+  original = result()
+  reason = "Awaiting the authenticated human approval decision."
+  parked = TaskResult.model_validate({
+    **original.model_dump(),
+    "execution": {"status": "awaiting_approval", "terminal_reason": reason},
+    "outcome": None,
+    "values": TaskResultValues().model_dump(),
+  })
+  restored = TaskResult.model_validate_json(parked.model_dump_json())
+
+  assert restored == parked
+  assert restored.execution.status == "awaiting_approval"
+  assert restored.execution.terminal_reason == reason
+  assert restored.task_result_id == original.task_result_id
+  assert restored.logical_task == original.logical_task
+  assert restored.attempt == original.attempt
+  assert restored.provenance == original.provenance
+  assert restored.observation == original.observation
+  assert restored.observation.usage == original.observation.usage
+  assert restored.outcome is None
+  assert restored.values.terminal_narrative is None
+  assert restored.values.projection is None
+  assert restored.values.artifacts == ()
+
+  projection = SettlementProjection(
+    execution_status=restored.execution.status,
+    terminal_reason=restored.execution.terminal_reason,
+  )
+  assert SettlementProjection.model_validate_json(projection.model_dump_json()) == projection
+  assert projection.execution_status == "awaiting_approval"
+  assert projection.terminal_reason == reason
+  assert projection.outcome_disposition is None
+
+
+
 def test_projection_inline_bytes_and_digest_are_canonical() -> None:
   value: JsonValue = {"verdict": "accepted", "score": 1}
   projection = CanonicalProjection(

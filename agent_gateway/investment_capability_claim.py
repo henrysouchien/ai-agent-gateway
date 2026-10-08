@@ -11,6 +11,7 @@ from typing import Any, Final, Mapping, NamedTuple
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from agent_workflow_contracts.models import AdmittedTenant
 
 from .skill_limits import SkillExecutionLimits
 
@@ -28,6 +29,8 @@ INVESTMENT_CAPABILITY_CLAIM_AUDIENCE: Final = "investment-tools"
 INVESTMENT_CAPABILITY_CLAIM_TTL_SECONDS: Final = 60
 INVESTMENT_CAPABILITY_CLAIM_KEY_BYTES: Final = 32
 INVESTMENT_SELECTED_CONTENT_CLAIM_PURPOSE: Final = "selected_content_read"
+INVESTMENT_JOB_PRINCIPAL_CLAIM_VERSION: Final = 3
+INVESTMENT_JOB_PRINCIPAL_CLAIM_KIND: Final = "job_principal"
 _MAX_ID_CHARS = 256
 _MAX_CHANNEL_CHARS = 64
 _MAX_RESEARCH_FILE_ID = (1 << 63) - 1
@@ -42,6 +45,13 @@ INVESTMENT_CAPABILITY_FACADE_TOOLS: Final = frozenset({
   "list_investment_capabilities",
   "start_investment_run",
   "start_quant_research",
+})
+
+INVESTMENT_JOB_PRINCIPAL_TOOLS: Final = frozenset({
+  "submit_research_task",
+  "send_research_task_message",
+  "start_research_pipeline",
+  "start_research_benchmark",
 })
 
 INVESTMENT_CAPABILITY_CLAIM_SERVER: Final = "idea-workbench-mcp"
@@ -197,6 +207,17 @@ def _signing_key() -> tuple[Ed25519PrivateKey, str]:
   return private_key, key_id
 
 
+def _sign(payload: dict[str, object]) -> str:
+  private_key, key_id = _signing_key()
+  header: dict[str, object] = {"alg": "EdDSA", "kid": key_id, "typ": "JWT"}
+  signing_input = b".".join((
+    _b64url(_canonical_json(header)).encode("ascii"),
+    _b64url(_canonical_json(payload)).encode("ascii"),
+  ))
+  signature = private_key.sign(signing_input)
+  return f"{signing_input.decode('ascii')}.{_b64url(signature)}"
+
+
 def investment_capability_signing_available() -> bool:
   """Whether the hydrated private key can issue Investment claims."""
 
@@ -301,12 +322,6 @@ def issue_investment_capability_claim(
       "investment capability claim requires an integer issuance time"
     )
 
-  private_key, key_id = _signing_key()
-  header: dict[str, object] = {
-    "alg": "EdDSA",
-    "kid": key_id,
-    "typ": "JWT",
-  }
   payload: dict[str, object] = {
     "allowed_capability_ids": sorted(grant.capability_ids),
     "aud": INVESTMENT_CAPABILITY_CLAIM_AUDIENCE,
@@ -330,12 +345,61 @@ def issue_investment_capability_claim(
     payload["approved_budget"] = approved_budget
   if routed_tool == "start_quant_research":
     payload["research_file_id"] = research_file_id
-  signing_input = b".".join((
-    _b64url(_canonical_json(header)).encode("ascii"),
-    _b64url(_canonical_json(payload)).encode("ascii"),
-  ))
-  signature = private_key.sign(signing_input)
-  return f"{signing_input.decode('ascii')}.{_b64url(signature)}"
+  return _sign(payload)
+
+
+def issue_investment_job_principal_claim(
+  *,
+  user_id: str,
+  tenant: AdmittedTenant | None,
+  session_id: str,
+  channel: str,
+  tool_name: str,
+  request_id: str,
+  jti: str,
+  now: int | None = None,
+) -> str:
+  """Bind a role-authorized job control to the executing authenticated principal.
+
+  The dispatcher owns role/route authorization. This form carries no business
+  skill or capability grant; Risk subject and tenant storage identity are distinct.
+  """
+  subject = _required_text(user_id, "user_id")
+  if not isinstance(tenant, AdmittedTenant):
+    raise InvestmentCapabilityClaimError(
+      "investment job principal claim requires an authenticated tenant"
+    )
+  session = _required_text(session_id, "session_id")
+  routed_channel = _required_text(channel, "channel", maximum=_MAX_CHANNEL_CHARS)
+  routed_tool = _required_text(tool_name, "tool_name")
+  request = _required_text(request_id, "request_id")
+  token_id = _required_text(jti, "jti")
+  if routed_tool not in INVESTMENT_JOB_PRINCIPAL_TOOLS:
+    raise InvestmentCapabilityClaimError(
+      "investment job principal claim cannot bind an unsupported control"
+    )
+  issued_at = int(time.time()) if now is None else now
+  if isinstance(issued_at, bool) or not isinstance(issued_at, int):
+    raise InvestmentCapabilityClaimError(
+      "investment job principal claim requires an integer issuance time"
+    )
+  payload: dict[str, object] = {
+    "aud": INVESTMENT_CAPABILITY_CLAIM_AUDIENCE,
+    "channel": routed_channel,
+    "exp": issued_at + INVESTMENT_CAPABILITY_CLAIM_TTL_SECONDS,
+    "iat": issued_at,
+    "iss": INVESTMENT_CAPABILITY_CLAIM_ISSUER,
+    "jti": token_id,
+    "kind": INVESTMENT_JOB_PRINCIPAL_CLAIM_KIND,
+    "request_id": request,
+    "session_id": session,
+    "sub": subject,
+    "tenant": tenant.model_dump(mode="json"),
+    "tool_name": routed_tool,
+    "user_id": subject,
+    "v": INVESTMENT_JOB_PRINCIPAL_CLAIM_VERSION,
+  }
+  return _sign(payload)
 
 
 def issue_investment_selected_content_claim(
@@ -356,12 +420,6 @@ def issue_investment_selected_content_claim(
       "investment selected-content claim requires an integer issuance time"
     )
 
-  private_key, key_id = _signing_key()
-  header: dict[str, object] = {
-    "alg": "EdDSA",
-    "kid": key_id,
-    "typ": "JWT",
-  }
   payload: dict[str, object] = {
     "artifact_id": selected_artifact_id,
     "aud": INVESTMENT_CAPABILITY_CLAIM_AUDIENCE,
@@ -374,12 +432,7 @@ def issue_investment_selected_content_claim(
     "v": 2,
     "view": selected_view,
   }
-  signing_input = b".".join((
-    _b64url(_canonical_json(header)).encode("ascii"),
-    _b64url(_canonical_json(payload)).encode("ascii"),
-  ))
-  signature = private_key.sign(signing_input)
-  return f"{signing_input.decode('ascii')}.{_b64url(signature)}"
+  return _sign(payload)
 
 
 __all__ = [
@@ -392,11 +445,15 @@ __all__ = [
   "INVESTMENT_CAPABILITY_CLAIM_TTL_SECONDS",
   "INVESTMENT_SELECTED_CONTENT_CLAIM_PURPOSE",
   "INVESTMENT_CAPABILITY_FACADE_TOOLS",
+  "INVESTMENT_JOB_PRINCIPAL_CLAIM_KIND",
+  "INVESTMENT_JOB_PRINCIPAL_CLAIM_VERSION",
+  "INVESTMENT_JOB_PRINCIPAL_TOOLS",
   "InvestmentCapabilityGrant",
   "InvestmentCapabilityClaimError",
   "configure_investment_capability_grants",
   "investment_capability_grants",
   "issue_investment_capability_claim",
+  "issue_investment_job_principal_claim",
   "issue_investment_selected_content_claim",
   "investment_capability_claim_unavailable_error",
   "investment_capability_signing_available",

@@ -745,3 +745,165 @@ def test_second_turn_context_exposes_completed_first_turn_recap_measurements(tmp
   assert 125_000 in measurements.values()
   assert messages.index(recap_messages[0]) < len(messages) - 1
   assert messages[-1] == {"role": "user", "content": "What happened last turn?"}
+
+
+def _files(root: Path) -> dict[str, bytes]:
+  return {
+    str(path.relative_to(root)): path.read_bytes()
+    for path in sorted(root.rglob("*"))
+    if path.is_file()
+  }
+
+
+def _fork_source_log(tmp_path: Path) -> AgentSessionLog:
+  log = AgentSessionLog(path=tmp_path / "source" / "source.jsonl")
+  _run(log.append({"type": "user_message", "content": "Remember the codeword PELICAN."}))
+  _run(log.append({
+    "type": "assistant_message",
+    "content_blocks": [{"type": "tool_use", "id": "tool-1", "name": "lookup", "input": {}}],
+  }))
+  _run(log.append({
+    "type": "tool_call_complete",
+    "tool_call_id": "tool-1",
+    "tool_name": "lookup",
+    "result": {"ok": True},
+    "error": None,
+    "final_tool_result_blocks": [
+      {"type": "tool_result", "tool_use_id": "tool-1", "content": "{\"ok\": true}"},
+    ],
+  }))
+  _run(log.append({"type": "assistant_message", "content": "The codeword is PELICAN."}))
+  return log
+
+
+def _read_only(log: AgentSessionLog) -> AgentSessionLog:
+  return AgentSessionLog(
+    path=log.path,
+    _create_active_on_open=False,
+    _repair_manifest_on_open=False,
+  )
+
+
+def _fork_seeds(log: AgentSessionLog) -> list[dict]:
+  entries, _ = _run(log.query_current_strict(event_types={"fork_seed"}))
+  return [entry.event for entry in entries]
+
+
+def test_fork_builder_seeds_once_and_replays_the_seed_before_its_own_turns(
+  tmp_path: Path,
+) -> None:
+  source = _fork_source_log(tmp_path)
+  source_messages = _run(SessionContextBuilder(agent_session_log=source).build())
+  assert len(source_messages) == 4
+  source_before = _files(tmp_path / "source")
+  own = AgentSessionLog(path=tmp_path / "fork" / "own.jsonl")
+  builder = SessionContextBuilder(
+    agent_session_log=own,
+    fork_source_log=_read_only(source),
+  )
+
+  assert _run(builder.build()) == source_messages
+  [seed] = _fork_seeds(own)
+  assert seed == {
+    "type": "fork_seed",
+    "source_log_path": str(source.path),
+    "messages": source_messages,
+    "event_schema_version": seed["event_schema_version"],
+  }
+  assert _files(tmp_path / "source") == source_before
+
+  # The original keeps its own log; its later turns never reach the fork.
+  _run(source.append({"type": "user_message", "content": "Original-only turn."}))
+  _run(own.append({"type": "user_message", "content": "What was the codeword?"}))
+  _run(own.append({"type": "assistant_message", "content": "PELICAN."}))
+  own_turns = [
+    {"role": "user", "content": "What was the codeword?"},
+    {"role": "assistant", "content": "PELICAN."},
+  ]
+
+  assert _run(builder.build()) == source_messages + own_turns
+  assert len(_fork_seeds(own)) == 1
+  # A restart builds the fork's own log with no source at all.
+  restarted = SessionContextBuilder(agent_session_log=AgentSessionLog(path=own.path))
+  assert _run(restarted.build()) == source_messages + own_turns
+
+
+def test_fork_seed_prefix_drops_once_a_summary_covers_it(tmp_path: Path) -> None:
+  source = _fork_source_log(tmp_path)
+  own = AgentSessionLog(path=tmp_path / "fork" / "own.jsonl")
+  builder = SessionContextBuilder(
+    agent_session_log=own,
+    fork_source_log=_read_only(source),
+  )
+  _run(builder.build())
+  own_entries, _ = _run(own.query_current_strict())
+  seed_seq = own_entries[-1].seq
+  _run(own.append({"type": "user_message", "content": "Fork turn."}))
+  _run(own.append({
+    "type": "summary",
+    "summary_kind": "cumulative",
+    "covers": {"from_seq": 1, "to_seq": seed_seq + 1},
+    "text": "The fork recalled the codeword.",
+  }))
+  _run(own.append({"type": "user_message", "content": "After the summary."}))
+
+  assert _run(builder.build()) == [
+    {"role": "user", "content": "## Prior session summary\n\nThe fork recalled the codeword."},
+    {"role": "user", "content": "After the summary."},
+  ]
+  assert len(_fork_seeds(own)) == 1
+
+
+def test_fork_seed_survives_a_cancelled_first_turn(tmp_path: Path) -> None:
+  source = _fork_source_log(tmp_path)
+  source_messages = _run(SessionContextBuilder(agent_session_log=source).build())
+  own = AgentSessionLog(path=tmp_path / "fork" / "own.jsonl")
+  slow_source = _read_only(source)
+  read_started = asyncio.Event()
+  release_read = asyncio.Event()
+  read_latest_seq = slow_source.latest_seq_current_strict
+
+  async def delayed_latest_seq() -> int:
+    read_started.set()
+    await release_read.wait()
+    return await read_latest_seq()
+
+  slow_source.latest_seq_current_strict = delayed_latest_seq
+
+  async def cancel_during_source_read() -> list:
+    turn = asyncio.ensure_future(
+      SessionContextBuilder(agent_session_log=own, fork_source_log=slow_source).build()
+    )
+    await read_started.wait()
+    turn.cancel()
+    await asyncio.sleep(0.05)
+    turn.cancel()
+    await asyncio.sleep(0.05)
+    # Cancellation stays pending while the seed is not yet durable, so the
+    # turn cannot hand off the fork's log before its seed is written.
+    assert not turn.done()
+    seeds, _cursor = await own.query_current_strict(event_types={"fork_seed"})
+    assert seeds == []
+    release_read.set()
+    with pytest.raises(asyncio.CancelledError):
+      await turn
+    # A resume of the fork's own log, which binds no source, keeps the history.
+    return await SessionContextBuilder(agent_session_log=AgentSessionLog(path=own.path)).build()
+
+  resumed = _run(cancel_during_source_read())
+  assert resumed == source_messages
+  assert "PELICAN" in json.dumps(resumed)
+
+
+def test_fork_seed_source_read_error_is_not_suppressed(tmp_path: Path) -> None:
+  source = _read_only(_fork_source_log(tmp_path))
+  own = AgentSessionLog(path=tmp_path / "fork" / "own.jsonl")
+
+  async def failing_latest_seq() -> int:
+    raise RuntimeError("source read failed")
+
+  source.latest_seq_current_strict = failing_latest_seq
+
+  with pytest.raises(RuntimeError, match="source read failed"):
+    _run(SessionContextBuilder(agent_session_log=own, fork_source_log=source).build())
+  assert _fork_seeds(own) == []

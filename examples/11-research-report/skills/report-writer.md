@@ -1,5 +1,6 @@
 ---
 name: report-writer
+execution_class: node.implement
 agent_callable: true
 agent_description: Draft a short research report from a triaged source summary.
 persist_state: true

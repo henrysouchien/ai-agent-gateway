@@ -1195,3 +1195,91 @@ def test_api_key_source_metadata_is_not_oauth_pool_membership(tmp_path: Path) ->
   with pytest.raises(AnthropicSourceError) as incompatible:
     resolve_anthropic_credentials(cfg, environ=env)
   assert incompatible.value.reason == "incompatible_source"
+
+
+@pytest.mark.parametrize("credential_kind", ["api_key", "auth_token"])
+def test_generation_auth_config_materializes_exact_source_and_rejects_retirement(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, credential_kind: str,
+) -> None:
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  frozen = register_anthropic_static_credential(
+    "frozen-material", credential_kind=credential_kind,
+    source="request:test:frozen", user_scope=7,
+  )
+  assert frozen is not None
+  register_anthropic_static_credential(
+    "other-material", credential_kind=credential_kind,
+    source="request:test:other", user_scope=7,
+  )
+  config = anthropic_oauth.anthropic_generation_auth_config(
+    frozen.generation_ref, user_scope=7,
+    base_config={"max_tokens": 123, "api_key": "wrong", "auth_token": "wrong"},
+  )
+  assert config["max_tokens"] == 123
+  assert config["credential_source"] == frozen.source_metadata()
+  assert config["auth_user_scope"] == "7"
+  assert config["api_key"] == ("frozen-material" if credential_kind == "api_key" else "")
+  assert config["auth_token"] == ("frozen-material" if credential_kind == "auth_token" else "")
+  register_anthropic_static_credential(
+    "replacement", credential_kind=credential_kind,
+    source="request:test:frozen", user_scope=7,
+  )
+  with pytest.raises(AnthropicSourceError):
+    anthropic_oauth.anthropic_generation_auth_config(
+      frozen.generation_ref, user_scope=7, base_config=config,
+    )
+
+
+@pytest.mark.parametrize("credential_kind", ["api_key", "auth_token"])
+def test_request_enrollment_without_material_preserves_existing_generation(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, credential_kind: str,
+) -> None:
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  existing = register_anthropic_static_credential(
+    "existing-material", credential_kind=credential_kind,
+    source=f"request:anthropic:{credential_kind}", user_scope=7,
+  )
+  assert existing is not None
+  path = resolve_anthropic_auth_store_path(user_scope=7)
+  before = path.read_bytes()
+  assert anthropic_oauth.enroll_request_anthropic_credential(
+    "  ", credential_kind=credential_kind, user_scope=7,
+  ) is None
+  assert path.read_bytes() == before
+  config = anthropic_oauth.anthropic_generation_auth_config(
+    existing.generation_ref, user_scope=7, base_config={},
+  )
+  assert config["credential_source"] == existing.source_metadata()
+
+
+@pytest.mark.parametrize("account_scope", [7, None])
+def test_request_enrollment_retains_oauth_account_refresh_authority(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, account_scope: int | None,
+) -> None:
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  path = resolve_anthropic_auth_store_path(user_scope=account_scope)
+  record = _record("request-account", expires_at=900.0)
+  upsert_anthropic_oauth_record(path, record)
+  owned = resolve_anthropic_credentials(user_scope=7).by_token(record.access_token)
+  assert owned is not None and owned.record is not None
+  entered = anthropic_oauth.enroll_request_anthropic_credential(
+    record.access_token, credential_kind="auth_token", user_scope=7,
+  )
+  assert entered is not None and entered.record is not None
+  assert entered.generation_ref == owned.generation_ref
+  assert entered.record.refresh_token == record.refresh_token
+  posts = []
+
+  def post(url, body):
+    posts.append(body)
+    return {"access_token": "fresh-bearer", "expires_in": 3600}
+
+  monkeypatch.setattr(anthropic_oauth, "_post_token_endpoint", post)
+  config = anthropic_oauth.anthropic_generation_auth_config(
+    entered.generation_ref, user_scope=7, base_config={},
+  )
+  assert anthropic_oauth.ensure_fresh_anthropic_credential(
+    entered.token, config=config, now=1000.0,
+  ) == "fresh-bearer"
+  assert len(posts) == 1
+  assert posts[0]["refresh_token"] == record.refresh_token

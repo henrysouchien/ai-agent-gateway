@@ -1803,7 +1803,7 @@ def test_run_autonomous_delegated_code_handler_keeps_its_executable_route(
   skills_dir = tmp_path / "skills"
   skills_dir.mkdir()
   (skills_dir / "kernel-child.md").write_text(
-    "---\nname: kernel-child\nversion: '1.0'\nagent_callable: true\n"
+    "---\nexecution_class: node.implement\nname: kernel-child\nversion: '1.0'\nagent_callable: true\n"
     "agent_description: Compute.\nmutation_mode: read_only\n"
     "allowed_tools: [code_execute]\nmcp_tools: {}\n"
     "semantic_metadata:\n  required_context: []\n"

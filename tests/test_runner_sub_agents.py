@@ -976,6 +976,9 @@ def test_child_approval_uses_parent_session_and_parent_visible_child_log(
   method: str,
   approved: bool,
 ) -> None:
+  from agent_gateway.admission import capture_job_context, root_context_from_identity
+  from agent_workflow_contracts.models import AdmittedResearchBinding
+
   _ChildRunner.instances.clear()
   parent_events: list[tuple[dict[str, Any], str]] = []
   parent = _parent(tmp_path, session_log=_SessionLog("Done."))
@@ -1001,6 +1004,14 @@ def test_child_approval_uses_parent_session_and_parent_visible_child_log(
     user_id="owner",
   )
   dispatcher = _approval_dispatcher(parent_session, child_session)
+  capture_job_context(child_session, root_context_from_identity(
+    tenant=None,
+    job_id=child_session.session_id,
+    tool_ids=frozenset(),
+    withheld_tools=frozenset(),
+    research_binding=AdmittedResearchBinding(research_file_id=42),
+    approval_route=dispatcher._approval_route,
+  ))
   _ApprovalChildRunner.approved = approved
   monkeypatch.setattr(gateway_runner, "AgentRunner", _ApprovalChildRunner)
 
@@ -1046,6 +1057,104 @@ def test_child_approval_uses_parent_session_and_parent_visible_child_log(
   assert dispatcher._session is child_session
   assert child_session.pending_tools == {}
   assert child_session.approval_queues == {}
+
+
+@pytest.mark.parametrize("method", ["spawn", "resume"])
+def test_child_runner_owns_captured_session_and_job_handler_context(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  method: str,
+) -> None:
+  from agent_gateway.admission import (
+    capture_job_context,
+    current_parent_context,
+    root_context_from_identity,
+  )
+  from agent_gateway.approval_route import NoApprovalRoute
+  from agent_workflow_contracts.models import AdmittedResearchBinding
+
+  parent = _parent(tmp_path, session_log=_SessionLog("Done."))
+  parent_session = GatewaySession(
+    session_id="parent-session",
+    api_key_hash="hash",
+    created_at=1,
+    expires_at=2,
+    user_id="parent-owner",
+  )
+  child_session = GatewaySession(
+    session_id="sub0:parent-session",
+    api_key_hash="hash",
+    created_at=1,
+    expires_at=2,
+    user_id="child-alias",
+    owner_user_id="child-owner",
+  )
+  for session, research_file_id in ((parent_session, 11), (child_session, 42)):
+    capture_job_context(session, root_context_from_identity(
+      tenant=None,
+      job_id=session.session_id,
+      tool_ids=frozenset(),
+      withheld_tools=frozenset(),
+      research_binding=AdmittedResearchBinding(research_file_id=research_file_id),
+      approval_route=NoApprovalRoute(),
+    ))
+  parent._gateway_session = parent_session
+  parent._context_research_file_id = 11
+  child_context = current_parent_context(child_session)
+  bound_runners: list[AgentRunner] = []
+  handler_contexts = []
+
+  def bind_job_runner(runner: AgentRunner) -> None:
+    bound_runners.append(runner)
+    job_handler = lambda: current_parent_context(runner._gateway_session)
+    handler_contexts.append(job_handler)
+
+  class SessionChildRunner(AgentRunner):
+    async def run(self, *args: Any, **kwargs: Any) -> None:
+      self._runner_id = f"runner-{self._full_session_id}"
+      assert handler_contexts[0]() is child_context
+      self._log.append({
+        "type": "stream_complete",
+        "usage": {"input_tokens": 11, "output_tokens": 7},
+      })
+
+    async def force_close(self, timeout: float = 2.0) -> None:
+      pass
+
+  monkeypatch.setattr(gateway_runner, "AgentRunner", SessionChildRunner)
+  kwargs = {
+    "capability_execution": _execution(),
+    "skill_name": "explore",
+    "logical_task": _LOGICAL_TASK,
+    "attempt": _ATTEMPT,
+    "result_requirement": _RESULT,
+    "result_provenance": _PROVENANCE,
+    "dispatcher": _approval_dispatcher(parent_session, child_session),
+    "sub_session": child_session,
+    "bind_job_runner": bind_job_runner,
+  }
+  result, error = asyncio.run(
+    parent.spawn_sub_agent("research this", **kwargs)
+    if method == "spawn"
+    else parent.resume_sub_agent(
+      original_task_id="task:prior",
+      reconstructed_messages=[{"role": "user", "content": "resume"}],
+      parent_messages=[],
+      **kwargs,
+    )
+  )
+
+  assert error is None
+  assert isinstance(result, TaskResult)
+  assert len(bound_runners) == 1
+  child_runner = bound_runners[0]
+  assert child_runner._gateway_session is child_session
+  assert child_runner._role == "sub_agent"
+  assert child_runner._sub_agent_id == child_session.session_id
+  assert child_runner._context_research_file_id == child_context.research_binding.research_file_id
+  assert child_runner._usage_user_id == "child-owner"
+  assert handler_contexts[0]() is child_context
+  assert handler_contexts[0]() is not current_parent_context(parent_session)
 
 
 def test_spawn_sub_agent_requires_durable_terminal_message_log(

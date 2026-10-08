@@ -438,3 +438,47 @@ async def test_dispatch_emits_exact_complete_bind_before_runtime_work() -> None:
     **capability_bind.to_json(),
   }
   assert "secret" not in str(bound_events[0])
+
+
+def test_session_creation_preserves_selected_anthropic_generation(tmp_path, monkeypatch):
+  from agent_gateway.providers.anthropic_oauth import register_anthropic_static_credential
+
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  def enroll(material):
+    return register_anthropic_static_credential(
+      material, source="request:anthropic:api_key", user_scope=101,
+    )
+
+  selected = enroll("first-key")
+  assert selected is not None
+  first_config = {
+    "provider": "anthropic", "auth_mode": "api", "api_key": selected.token,
+    "credential_source": selected.source_metadata(),
+  }
+  first = _session(auth_config=first_config)
+  same = _session(auth_config=dict(first_config))
+  replacement = enroll("replacement-key")
+  assert replacement is not None
+  changed = _session(auth_config={
+    **first_config, "api_key": replacement.token,
+    "credential_source": replacement.source_metadata(),
+  })
+  assert first.session_credential_handle is not None
+  assert same.session_credential_handle is not None
+  assert changed.session_credential_handle is not None
+  assert first.session_credential_handle.handle_id == selected.generation_ref
+  assert same.session_credential_handle == first.session_credential_handle
+  assert changed.session_credential_handle.handle_id == replacement.generation_ref
+  assert changed.session_credential_handle.handle_id != first.session_credential_handle.handle_id
+
+
+def test_non_anthropic_sessions_keep_independent_handles():
+  config = {
+    "provider": "openai", "api_key": "same-key",
+    "credential_source": {"generation_ref": "anthropic-generation-not-openai"},
+  }
+  first = _session(auth_config=config)
+  second = _session(auth_config=config)
+  assert first.session_credential_handle is not None
+  assert second.session_credential_handle is not None
+  assert first.session_credential_handle.handle_id != second.session_credential_handle.handle_id

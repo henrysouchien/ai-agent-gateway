@@ -54,7 +54,6 @@ class _Mcp:
 def _operation():
   return compile_agent_operation(
     generic_explore_profile(),
-    execution_class="node.explore",
   )
 
 
@@ -74,6 +73,7 @@ def _effect(
 
 def test_model_writer_with_artifact_only_contract_compiles_proposal_authority() -> None:
   profile = SkillProfile(
+    execution_class="node.implement",
     name="artifact-model-build",
     system_prompt="Build one immutable model artifact.",
     agent_callable=True,
@@ -106,7 +106,6 @@ def test_model_writer_with_artifact_only_contract_compiles_proposal_authority() 
   )
   operation = compile_agent_operation(
     profile,
-    execution_class="node.implement",
   )
 
   assert operation.workspace_scope == "workspace_write"
@@ -174,6 +173,7 @@ def test_required_semantic_capability_fails_closed_as_a_visible_offer() -> None:
   """
 
   profile = SkillProfile(
+    execution_class="node.explore",
     name="filings-only",
     system_prompt="Read filings.",
     agent_callable=True,
@@ -198,7 +198,7 @@ def test_required_semantic_capability_fails_closed_as_a_visible_offer() -> None:
     },
   )
   # Coherent against its own ceiling; the *parent* is what cannot route it.
-  operation = compile_agent_operation(profile, execution_class="node.explore")
+  operation = compile_agent_operation(profile)
 
   unavailable = admit_operation_tools(
     operation,

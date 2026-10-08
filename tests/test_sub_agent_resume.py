@@ -917,6 +917,7 @@ def _write_skill(skills_dir: Path, name: str, frontmatter: str = "", *, body: st
   skills_dir.mkdir(parents=True, exist_ok=True)
   lines = [
     "---",
+    "execution_class: node.implement",
     f"name: {name}",
     "agent_callable: true",
     "agent_description: Test skill.",
@@ -960,7 +961,7 @@ async def _append_interrupted_skill_task(
     agent_callable=True,
     resumable=resumable,
     mutation_mode="read_only",
-    delegation_role="implement",
+    execution_class=model_bind.capability_id,
     metadata={
       "semantic_metadata": {
         "required_context": list(required_context),
@@ -969,7 +970,6 @@ async def _append_interrupted_skill_task(
   )
   operation = compile_agent_operation(
     profile,
-    execution_class=model_bind.capability_id,
   )
   result_requirement = ResultRequirement(outcome=OutcomeRequirement())
   grant_id = f"grant:{task_id}"
@@ -6761,5 +6761,75 @@ def test_resume_captures_actual_job_and_replay_never_reattributes_custody(
     ]
     assert len(successor_registrations) == 1
     assert successor_registrations[0]["metadata"][ADMITTED_TASK_METADATA_KEY] == captured_wire
+
+  _run(_case())
+
+
+@pytest.mark.parametrize("retired", [False, True])
+def test_resume_uses_frozen_anthropic_generation_not_current_selection(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retired: bool,
+) -> None:
+  from agent_gateway.providers.anthropic_oauth import register_anthropic_static_credential
+
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "credentials"))
+  frozen = register_anthropic_static_credential(
+    "frozen-key", source="request:anthropic:api_key",
+  )
+  current = register_anthropic_static_credential(
+    "current-key",
+    source=("request:anthropic:api_key" if retired else "request:other:api_key"),
+  )
+  assert frozen is not None
+  assert current is not None
+
+  async def _case() -> None:
+    receipt = _bind_receipt()
+    receipt["credential_ref"] = frozen.generation_ref
+    seed_runner = _runner(tmp_path)
+    await _append_interrupted_skill_task(
+      seed_runner, task_id="bg_generation", agent_name="generation-resume",
+      user_message="Resume the frozen source.", capability_bind_receipt=receipt,
+    )
+    runner = _runner(tmp_path)
+    runner._runner_id = "runner-resume"
+    captured = {}
+
+    async def _resume_sub_agent(**kwargs):
+      captured.update(kwargs)
+      return await _successful_resume_task_result(
+        kwargs, "continued", workspace_dir=tmp_path,
+      ), None
+
+    runner.resume_sub_agent = _resume_sub_agent
+    resolver = stub_capability_execution_resolver()
+    handler = make_resume_handler(
+      [runner], mcp_client=_NullMcpClient(),
+      excluded_tools_resolver=frozenset, capability_execution_resolver=resolver,
+    )
+    result, error = await handler({"task_id": "bg_generation"})
+    if retired:
+      assert error is None
+      assert result.execution.terminal_reason.startswith("resume_abandoned:credential_unavailable:")
+      assert captured == {}
+      assert runner._agent_session_log is not None
+      events, _ = await runner._agent_session_log.query(
+        event_types={"task_completed"},
+      )
+      assert any(
+        "resume_abandoned" in json.dumps(entry.event)
+        and "credential_unavailable" in json.dumps(entry.event)
+        for entry in events
+      )
+    else:
+      assert error is None
+      entry = runner._task_registry.get(result["task_id"])
+      assert entry is not None
+      assert entry.asyncio_task is not None
+      await entry.asyncio_task
+      execution = captured["capability_execution"]
+      assert execution.bind.credential_ref == frozen.generation_ref
+      assert execution.auth_config["api_key"] == "frozen-key"
+      assert execution.auth_config["credential_source"]["generation_ref"] != current.generation_ref
+    assert resolver.auth_context.user_provider_handles["anthropic"].handle_id == "test-user:anthropic"
 
   _run(_case())

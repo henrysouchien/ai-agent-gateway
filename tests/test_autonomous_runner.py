@@ -2196,6 +2196,7 @@ def test_gateway_generic_admission_resolver_preserves_source_semantics(
   (skills_dir / "read-only.md").write_text(
     """---
 name: read-only
+execution_class: node.implement
 description: Read-only resumable work
 resumable: true
 mutation_mode: read_only
@@ -2208,6 +2209,7 @@ Resume the read-only work.
   (skills_dir / "writer.md").write_text(
     """---
 name: writer
+execution_class: node.mutate
 description: Writer work
 resumable: true
 mutation_mode: model_writer
@@ -2217,7 +2219,7 @@ Do writer work.
     encoding="utf-8",
   )
   (skills_dir / "malformed.md").write_text(
-    "---\nname: malformed\nresumable: []\n---\nMalformed policy.\n",
+    "---\nname: malformed\nexecution_class: node.implement\nresumable: []\n---\nMalformed policy.\n",
     encoding="utf-8",
   )
   resolver = _generic_skill_admission_policy_resolver(skills_dir)

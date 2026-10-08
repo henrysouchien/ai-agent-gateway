@@ -37,7 +37,7 @@ def _write_skill(
   root.mkdir(parents=True, exist_ok=True)
   path = root / f"{name}.md"
   path.write_text(
-    f"---\n{frontmatter.strip()}\n---\n{body}",
+    f"---\nexecution_class: node.implement\n{frontmatter.strip()}\n---\n{body}",
     encoding="utf-8",
   )
   return path
@@ -394,7 +394,7 @@ def test_one_source_snapshot_stabilizes_true_to_false_mutation(
     def load_source(self, source: str, *, path: Path):
       loads.append(path.stem)
       path.write_text(
-        "---\nname: changing-skill\ncatalog: false\n---\nChanged",
+        "---\nexecution_class: node.implement\nname: changing-skill\ncatalog: false\n---\nChanged",
         encoding="utf-8",
       )
       return SkillLoader(self._root).load_source(source, path=path)
@@ -435,6 +435,7 @@ def test_visible_universal_newline_snapshot_matches_file_parser(
     newline.join((
       b"---",
       b"name: newline-skill",
+      b"execution_class: node.implement",
       b"catalog: true",
       b"---",
       b"Line one.",
@@ -715,7 +716,7 @@ def test_directory_catalog_is_lazy_live_and_name_sorted(tmp_path: Path) -> None:
   )
 
   alpha.write_text(
-    "---\nname: alpha-skill\ndescription: Changed\n---\nChanged body",
+    "---\nexecution_class: node.implement\nname: alpha-skill\ndescription: Changed\n---\nChanged body",
     encoding="utf-8",
   )
   assert catalog.list_skills()[0].description == "Changed"

@@ -185,6 +185,6 @@ def test_chat_request_validates_and_canonicalizes_effort() -> None:
 
 def test_skill_effort_conflict_and_positional_boundary(tmp_path: Path) -> None:
   path = tmp_path / "skill.md"
-  path.write_text("---\nname: effort-skill\neffort: medium\nthinking: true\n---\nBody\n")
+  path.write_text("---\nexecution_class: node.implement\nname: effort-skill\neffort: medium\nthinking: true\n---\nBody\n")
   with pytest.raises(ValueError, match="conflicting"):
     parse_skill_file(path)

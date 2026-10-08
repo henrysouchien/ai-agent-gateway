@@ -191,6 +191,22 @@ def _format_entry_for_summary(entry: LogEntry) -> str | None:
   if event_type == "state_update":
     return f"{prefix} payload={_stringify(_compact_for_summary(event.get('payload')))}"
 
+  if event_type == "fork_seed":
+    # The seed is the inherited conversation itself; a summary covering it
+    # replaces it, so its messages are rendered, not elided as one payload.
+    lines = [prefix]
+    for message in event.get("messages") or []:
+      if not isinstance(message, dict):
+        continue
+      content = message.get("content")
+      text = (
+        _flatten_content_blocks(content)
+        if isinstance(content, list)
+        else _stringify(content).strip()
+      )
+      lines.append(f"{message.get('role')}: {text}")
+    return "\n".join(lines)
+
   return f"{prefix} payload={_stringify(_compact_for_summary(event))}"
 
 

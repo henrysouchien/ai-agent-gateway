@@ -264,6 +264,9 @@ class GatewaySession:
   # The session-log factory opens exactly this path instead of minting one
   # keyed by `session_id`.
   resume_log_path: Path | None = None
+  # The caller's existing log an init-time fork seeds its history from: read
+  # once, never bound; this session's own log is minted from `session_id`.
+  fork_source_log_path: Path | None = None
   approval_audit_emitter: ApprovalAuditEmitter | None = field(
     default=None,
     repr=False,
@@ -437,9 +440,16 @@ def bind_session_credentials(
     if credential_principal == "user"
     else None
   )
+  credential_provider = _session_credential_provider(session, provider)
+  credential_source = (session.auth_config or {}).get("credential_source")
+  generation_ref = (
+    credential_source.get("generation_ref")
+    if credential_provider == "anthropic" and isinstance(credential_source, Mapping)
+    else None
+  )
   handle = CredentialHandle(
-    handle_id=handle_id or f"cred_{uuid.uuid4().hex}",
-    provider=_session_credential_provider(session, provider),
+    handle_id=handle_id or generation_ref or f"cred_{uuid.uuid4().hex}",
+    provider=credential_provider,
     principal=credential_principal,
     tenant_id=normalized_tenant_id,
     actor_id=actor_id,

@@ -1,5 +1,6 @@
 ---
 name: researcher
+execution_class: node.implement
 ---
 You are a focused research sub-agent.
 

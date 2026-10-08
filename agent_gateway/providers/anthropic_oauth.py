@@ -39,6 +39,9 @@ ANTHROPIC_OAUTH_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20"
 ANTHROPIC_OAUTH_SOURCE = "anthropic-oauth-login"
 ANTHROPIC_OAUTH_STORE_VERSION = 3
+# A source generation's opaque reference; a frozen bind's `credential_ref`
+# carries it, so the format is owned here and nowhere else.
+_GENERATION_REF_PREFIX = "anthropic-generation-"
 
 # Sibling setup tokens, one per Claude subscription account, as a JSON array of
 # strings. Same encoding as the other multi-valued credential env in this
@@ -175,7 +178,7 @@ class AnthropicOAuthRecord:
 
   @property
   def generation_ref(self) -> str:
-    return f"anthropic-generation-{self.generation_id}" if self.generation_id else ""
+    return f"{_GENERATION_REF_PREFIX}{self.generation_id}" if self.generation_id else ""
 
   @property
   def account_identity(self) -> str:
@@ -681,6 +684,29 @@ def register_anthropic_static_credential(
     )
 
 
+def enroll_request_anthropic_credential(
+  material: str,
+  *,
+  credential_kind: str,
+  user_scope: Any,
+) -> AnthropicCredential | None:
+  """Enroll supplied request material without deleting or re-owning an account."""
+  normalized = str(material or "").strip()
+  if not normalized:
+    return None
+  if credential_kind == "auth_token":
+    sources = resolve_anthropic_credentials(user_scope=user_scope)
+    enrolled = sources.by_token(normalized)
+    if enrolled is not None:
+      return enrolled
+  return register_anthropic_static_credential(
+    normalized,
+    credential_kind=credential_kind,
+    source=f"request:anthropic:{credential_kind}",
+    user_scope=user_scope,
+  )
+
+
 def _environment_source_material(source: str, env: Mapping[str, str]) -> tuple[str, ...] | None:
   """Visible source material, or None when this process cannot observe the source."""
 
@@ -804,7 +830,7 @@ def resolve_anthropic_credentials(
             ), None)
             retired_id = store.retired_auth_token_grants.get(digest, "")
             known_ref = current.generation_ref if current is not None else (
-              f"anthropic-generation-{retired_id}" if retired_id else ""
+              f"{_GENERATION_REF_PREFIX}{retired_id}" if retired_id else ""
             )
           if known_ref:
             credential = _resolve_generation(
@@ -879,7 +905,7 @@ def _resolve_generation(
     (resolve_anthropic_auth_store_path(environ=environ, user_scope=scope), org_path)
     if scope else (org_path,)
   )
-  generation_id = generation_ref.removeprefix("anthropic-generation-")
+  generation_id = generation_ref.removeprefix(_GENERATION_REF_PREFIX)
   for path in paths:
     with _store_lock(path):
       store = _load_store_unlocked(path, migrate=False)
@@ -901,6 +927,35 @@ def _resolve_generation(
         key=key, token=record.access_token, record=record, store_path=path,
       )
   raise AnthropicSourceError("missing")
+
+
+def is_anthropic_generation_ref(ref: str) -> bool:
+  """Whether a credential reference names an Anthropic source generation."""
+  return ref.startswith(_GENERATION_REF_PREFIX)
+
+
+def anthropic_generation_auth_config(
+  generation_ref: str,
+  *,
+  user_scope: Any,
+  base_config: Mapping[str, Any],
+) -> dict[str, Any]:
+  """Materialize an exact active source generation without pool selection."""
+  credential = _resolve_generation(
+    generation_ref, environ=None, user_scope=user_scope,
+  )
+  assert credential.record is not None
+  is_api_key = credential.record.credential_kind == "api_key"
+  config = dict(base_config)
+  config.update(
+    provider="anthropic",
+    auth_mode="api" if is_api_key else "oauth",
+    api_key=credential.token if is_api_key else "",
+    auth_token="" if is_api_key else credential.token,
+    credential_source=credential.source_metadata(),
+    auth_user_scope=anthropic_user_scope(user_scope),
+  )
+  return config
 
 
 class AnthropicCredentialPool:
@@ -1450,10 +1505,13 @@ __all__ = [
   "REFRESH_FAILURE_BLOCK_SECONDS",
   "REFRESH_MARGIN_SECONDS",
   "UNDECLARED_LIMIT_BLOCK_SECONDS",
+  "anthropic_generation_auth_config",
+  "is_anthropic_generation_ref",
   "anthropic_token_store_is_private",
   "anthropic_user_scope",
   "complete_anthropic_login",
   "enroll_anthropic_setup_token",
+  "enroll_request_anthropic_credential",
   "ensure_fresh_anthropic_credential",
   "generate_pkce",
   "load_anthropic_oauth_store",

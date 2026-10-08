@@ -9,6 +9,8 @@ from typing import Any
 
 import pytest
 
+from agent_gateway.admission import root_context
+
 from agent_workflow_contracts import (
   AgentOperationRef,
   AttemptRef,
@@ -2521,6 +2523,7 @@ def test_sub_agent_events_are_written_to_parent_log(tmp_path: Path) -> None:
     user_id="alice",
     auth_config={"api_key": "k"},
   )
+  root_context(sub_session, withheld_tools=frozenset(), research_file_id=None)
   logical_task, attempt, result_requirement, result_provenance = (
     _subagent_result_identity(
       delegation_id="test-sub-agent-events",

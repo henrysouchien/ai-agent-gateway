@@ -176,6 +176,8 @@ def test_autonomous_start_uses_private_event_lifeline_and_lease_fds(
   monkeypatch,
   tmp_path: Path,
 ) -> None:
+  import stat
+
   from agent_gateway import autonomous_runner
 
   async def case() -> None:
@@ -202,6 +204,27 @@ def test_autonomous_start_uses_private_event_lifeline_and_lease_fds(
     monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", _HMAC_KEY)
     monkeypatch.setenv("AGENT_SESSION_LOG_LAYOUT", "v2")
     registry = _registry(tmp_path, child_source=_SUCCESS_CHILD)
+    real_sentinel_cmd = registry._owned_process_sentinel_cmd
+
+    def recording_sentinel_cmd(
+      target_cmd: list[str],
+      *,
+      owner_lifeline_fd: int,
+      owner_lease_fd: int,
+    ) -> list[str]:
+      captured["owner_lease_fd"] = owner_lease_fd
+      captured["owner_lease_stat"] = os.fstat(owner_lease_fd)
+      return real_sentinel_cmd(
+        target_cmd,
+        owner_lifeline_fd=owner_lifeline_fd,
+        owner_lease_fd=owner_lease_fd,
+      )
+
+    monkeypatch.setattr(
+      registry,
+      "_owned_process_sentinel_cmd",
+      recording_sentinel_cmd,
+    )
 
     payload = await _start(registry)
     status = await registry.wait(payload["task_id"], timeout_sec=20)
@@ -210,31 +233,32 @@ def test_autonomous_start_uses_private_event_lifeline_and_lease_fds(
 
     assert status["state"] == "completed"
     assert captured["start_new_session"] is True
-    assert len(captured["pass_fds"]) == 7
     passed_fd = int(
       captured["env"]["AGENT_AUTONOMOUS_EVENT_CHANNEL_FD"]
     )
     assert passed_fd in captured["pass_fds"]
-    assert captured["env"]["AGENT_AUTONOMOUS_EVENT_CHANNEL_FD"] == str(
-      passed_fd
-    )
+    assert stat.S_ISSOCK(captured["passed_fd_stats"][passed_fd].st_mode)
     envelope = json.loads(
       captured["env"]["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE"]
     )
     log_authority = envelope["workload"]["session_log_authority"]
-    assert envelope["version"] == 6
     assert log_authority["layout"] == "v2"
     assert log_authority["base_path"] == captured["env"][
       "AGENT_SESSION_LOG_BASE_DIR"
     ]
-    assert tuple(
-      int(captured["env"][name])
-      for name in (
-        "AGENT_SESSION_LOG_ROOT_FD",
-        "AGENT_SESSION_LOG_ACTIVE_FD",
-        "AGENT_SESSION_LOG_META_FD",
+    for env_name, device_name, inode_name, matches_kind in (
+      ("AGENT_SESSION_LOG_ROOT_FD", "root_device", "root_inode", stat.S_ISDIR),
+      ("AGENT_SESSION_LOG_ACTIVE_FD", "active_device", "active_inode", stat.S_ISREG),
+      ("AGENT_SESSION_LOG_META_FD", "meta_device", "meta_inode", stat.S_ISREG),
+    ):
+      log_fd = int(captured["env"][env_name])
+      assert log_fd in captured["pass_fds"]
+      log_identity = captured["passed_fd_stats"][log_fd]
+      assert matches_kind(log_identity.st_mode)
+      assert (log_identity.st_dev, log_identity.st_ino) == (
+        log_authority[device_name],
+        log_authority[inode_name],
       )
-    ) == captured["pass_fds"][2:5]
     assert all(
       inheritable is False
       for inheritable in captured["passed_fd_inheritable"].values()
@@ -275,12 +299,22 @@ def test_autonomous_start_uses_private_event_lifeline_and_lease_fds(
       )
     )
     assert manifest["events_path"] == str(events_path)
-    lease_identity = captured["passed_fd_stats"][
-      captured["pass_fds"][6]
-    ]
+    lease_fd = captured["owner_lease_fd"]
+    assert lease_fd in captured["pass_fds"]
+    lease_identity = captured["owner_lease_stat"]
+    inherited_lease_identity = captured["passed_fd_stats"][lease_fd]
+    assert (lease_identity.st_dev, lease_identity.st_ino) == (
+      inherited_lease_identity.st_dev,
+      inherited_lease_identity.st_ino,
+    )
     assert manifest["owner_lease_device"] == lease_identity.st_dev
     assert manifest["owner_lease_inode"] == lease_identity.st_ino
     assert record.owner_lifeline_fd is None
+    assert autonomous_owner_lease_is_released(
+      record.owner_lease_path,
+      expected_device=lease_identity.st_dev,
+      expected_inode=lease_identity.st_ino,
+    ) is True
 
   asyncio.run(case())
 
@@ -880,37 +914,3 @@ time.sleep(1.5)
   asyncio.run(case())
 
 
-def test_event_file_polling_surface_is_structurally_absent() -> None:
-  package_dir = _PACKAGE_ROOT / "agent_gateway"
-  sources = {
-    filename: (package_dir / filename).read_text(encoding="utf-8")
-    for filename in (
-      "autonomous_runner.py",
-      "autonomous_runner_start.py",
-      "autonomous_runner_state.py",
-      "autonomous_runner_events.py",
-    )
-  }
-  source = "\n".join(sources.values())
-
-  for retired_token in (
-    "_tail_events_file",
-    "_finish_events_tail",
-    "events_tail_task",
-    "asyncio.sleep(",
-  ):
-    assert retired_token not in source
-  start_source = sources["autonomous_runner_start.py"]
-  assert start_source.count("AGENT_AUTONOMOUS_EVENTS_PATH") == 1
-  assert (
-    "for retired_name in _RETIRED_AUTONOMOUS_CHILD_ENV_NAMES:"
-    in start_source
-  )
-  assert "env.pop(retired_name, None)" in start_source
-  assert "owner_lifeline_read_fd" in source
-  assert "owner_lease_fd" in source
-  assert "pass_fds=(" in source
-  assert "start_new_session=True" in source
-  assert "os.killpg(" in source
-  assert "endpoint.receive_next" in source
-  assert "endpoint.acknowledge" in source

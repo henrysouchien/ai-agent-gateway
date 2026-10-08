@@ -109,6 +109,7 @@ def default_skill_markdown() -> str:
   return (
     "---\n"
     "name: general\n"
+    "execution_class: node.implement\n"
     "agent_callable: true\n"
     "agent_description: General-purpose helper skill for small delegated tasks.\n"
     "persist_state: true\n"

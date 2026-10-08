@@ -50,7 +50,7 @@ from .capability_execution import (
   MaterializedCredential,
 )
 from model_authority.registry import ModelLifecycle, ProductModelRegistry, SelectionSource
-from model_authority.selection import ProductModelSelectionPolicy
+from model_authority.selection import ProductModelSelectionPolicy, SelectionSnapshot
 from .model_preferences import ModelPreferenceStore
 from .autonomous_capability_handoff import AutonomousCapabilityBindingResolver
 from .claim_signing_authority import GatewayClaimSigningAuthority
@@ -314,6 +314,15 @@ class ChatInitRequest(BaseModel):
     default_factory=dict
   )
   resume_session_id: str | None = None
+  # A log the caller owns that this new session forks from: its history is
+  # the new session's starting context, its session is left alone.
+  fork_from_session_id: str | None = None
+
+  @model_validator(mode="after")
+  def _resume_or_fork(self) -> "ChatInitRequest":
+    if self.resume_session_id is not None and self.fork_from_session_id is not None:
+      raise ValueError("resume_session_id and fork_from_session_id are mutually exclusive")
+    return self
 
 
 class CapabilitySelection(BaseModel):
@@ -426,6 +435,7 @@ class ChatInitResponse(BaseModel):
   schema_version: int
   capability_choices: Dict[str, CapabilityChoiceResponse]
   resumed_from_session_id: str | None = None
+  forked_from_session_id: str | None = None
 
 
 class ChatMessage(BaseModel):
@@ -606,6 +616,11 @@ class ChatRequest(BaseModel):
   _session_execution_policy: SessionExecutionPolicy | None = PrivateAttr(
     default=None
   )
+  _selection_snapshot: SelectionSnapshot | None = PrivateAttr(default=None)
+
+  @property
+  def selection_snapshot(self) -> SelectionSnapshot | None:
+    return self._selection_snapshot
 
   @model_validator(mode="before")
   @classmethod
@@ -803,6 +818,7 @@ class PreparedChatTurn:
   session_id: str
   request: ChatRequest
   channel: str | None
+  selection_snapshot: SelectionSnapshot | None = None
 
 
 @dataclass

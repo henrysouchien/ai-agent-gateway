@@ -1048,13 +1048,19 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
 
     api_key_hash = AuthManager.hash_api_key(payload.api_key)
     resume_log_path: Path | None = None
-    if payload.resume_session_id is not None:
+    fork_source_log_path: Path | None = None
+    presented_log_session_id = (
+      payload.resume_session_id
+      if payload.resume_session_id is not None
+      else payload.fork_from_session_id
+    )
+    if presented_log_session_id is not None:
       # Resolve, check and bind with no await in between: two inits presenting
       # one log cannot both pass the live-session check.
       resume_resolver = config.session_resume_resolver
       resume_outcome: Path | SessionResumeRefusalReason = (
         resume_resolver(
-          resume_session_id=payload.resume_session_id,
+          resume_session_id=presented_log_session_id,
           user_id=resolved_user_id,
           channel=resolved_channel,
           api_key_hash=api_key_hash,
@@ -1062,7 +1068,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         if resume_resolver is not None
         else "not_found"
       )
-      if isinstance(resume_outcome, Path):
+      if isinstance(resume_outcome, Path) and payload.resume_session_id is not None:
         prior_session = auth.session_store.live_session_bound_to_log(
           resume_outcome
         )
@@ -1081,7 +1087,12 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
           {"error": "session_resume_refused", "reason": resume_outcome},
           status_code=409,
         )
-      resume_log_path = resume_outcome
+      if payload.resume_session_id is not None:
+        resume_log_path = resume_outcome
+      else:
+        # A fork only reads the caller's log as its starting history, so the
+        # session holding that log keeps it, idle or answering.
+        fork_source_log_path = resume_outcome
 
     session = auth.session_store.create_session(
       api_key_hash=api_key_hash,
@@ -1105,6 +1116,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     )
     session.channel = resolved_channel
     session.resume_log_path = resume_log_path
+    session.fork_source_log_path = fork_source_log_path
     session.is_public = resolved_channel == "public"
     bind_session_approval_route(
       session,
@@ -1151,6 +1163,8 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       (
         f" (resumed from {payload.resume_session_id})"
         if resume_log_path is not None
+        else f" (forked from {payload.fork_from_session_id})"
+        if fork_source_log_path is not None
         else ""
       ),
     )
@@ -1167,6 +1181,9 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       ),
       resumed_from_session_id=(
         payload.resume_session_id if resume_log_path is not None else None
+      ),
+      forked_from_session_id=(
+        payload.fork_from_session_id if fork_source_log_path is not None else None
       ),
     )
 

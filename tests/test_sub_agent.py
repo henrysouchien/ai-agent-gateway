@@ -81,6 +81,7 @@ from agent_gateway.runner_background_tasks import (
 )
 from agent_gateway.final_narrative_artifact import publish_final_narrative
 from agent_gateway.operation_catalog import (
+  Effort,
   MutationMode,
   OperationRuntimePolicy,
   ResolvedOperationRuntime,
@@ -422,7 +423,7 @@ def test_rebound_run_agent_uses_child_authority_and_runner(
   monkeypatch.delenv("HANK_MAX_SPAWN_DEPTH", raising=False)
   owner_session_host_policy.get_local_tool_effect = lambda _name: "read"
 
-  _write_operation(tmp_path)
+  _write_operation(tmp_path, execution_class="node.implement")
   profile_path = tmp_path / "filing-review.md"
   profile_path.write_text(
     profile_path.read_text(encoding="utf-8").replace(
@@ -506,7 +507,7 @@ def test_rebound_run_agent_admits_typed_ticker_with_child_session_tenant(
   monkeypatch.delenv("HANK_MAX_SPAWN_DEPTH", raising=False)
   owner_session_host_policy.get_local_tool_effect = lambda _name: "read"
 
-  _write_operation(tmp_path, required_context=("ticker",))
+  _write_operation(tmp_path, required_context=("ticker",), execution_class="node.implement")
   profile_path = tmp_path / "filing-review.md"
   profile_path.write_text(
     profile_path.read_text(encoding="utf-8").replace(
@@ -582,6 +583,7 @@ def test_rebound_run_agent_admits_typed_ticker_with_child_session_tenant(
 def _write_operation(
   path: Path,
   *,
+  execution_class: str,
   resumable: bool = True,
   required_context: tuple[str, ...] = (),
   operation_name: str = "filing-review",
@@ -626,6 +628,7 @@ def _write_operation(
   (path / f"{operation_name}.md").write_text(
     f"""---
 name: {operation_name}
+execution_class: {execution_class}
 version: '1.0'
 agent_callable: true
 agent_description: Review filing evidence.
@@ -671,6 +674,7 @@ def _catalog_runtime(
   session_inject_servers: frozenset[str] = frozenset(),
   workspace_scope: WorkspaceScope = "read_only",
   mutation_mode: MutationMode = "read_only",
+  effort: Effort | None = None,
 ) -> ResolvedOperationRuntime:
   snapshot = build_agent_operation_snapshot(
     name=name,
@@ -679,6 +683,7 @@ def _catalog_runtime(
     resolved_instructions="Review canonical evidence.",
     description="Review canonical evidence.",
     execution_class="node.explore",
+    effort=effort,
     required_capabilities=required_capabilities,
     workspace_scope=workspace_scope,
     resumable=True,
@@ -700,6 +705,7 @@ def _catalog_runtime(
       runtime_server_refs=frozenset(mcp_tools),
       session_inject_servers=session_inject_servers,
       max_tokens=2_222,
+      effort=effort,
     ),
   )
 
@@ -826,7 +832,7 @@ def delegation_tool_policy(owner_session_host_policy):
 
 
 def test_run_agent_tool_schema_is_operation_first(tmp_path: Path) -> None:
-  schema = make_run_agent_tool_def(_write_operation(tmp_path))["input_schema"]
+  schema = make_run_agent_tool_def(_write_operation(tmp_path, execution_class="node.implement"))["input_schema"]
 
   assert schema["required"] == ["objective"]
   assert schema["additionalProperties"] is False
@@ -980,7 +986,7 @@ def test_declared_local_propose_route_is_admitted_when_parent_has_not_loaded_it(
 def test_run_agent_handler_rejects_catalog_and_loader_together(
   tmp_path: Path,
 ) -> None:
-  loader = _write_operation(tmp_path)
+  loader = _write_operation(tmp_path, execution_class="node.implement")
   catalog = _Catalog(_catalog_runtime())
 
   with pytest.raises(ValueError, match="either skill_loader or operation_catalog"):
@@ -1023,8 +1029,7 @@ def test_falsey_catalog_has_same_schema_and_handler_operation_view() -> None:
 
 
 def test_injected_catalog_admission_consumes_snapshot_and_policy_directly() -> None:
-  resolved = _catalog_runtime()
-  resolved = replace(resolved, policy=replace(resolved.policy, effort="low"))
+  resolved = _catalog_runtime(effort="low")
   catalog = _Catalog(resolved)
   runner = _Runner()
   operation_ref = resolved.snapshot.operation.model_dump(mode="json")
@@ -1632,7 +1637,7 @@ def test_direct_handler_typed_ticker_bypasses_prose_and_is_admitted(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  loader = _write_operation(tmp_path, required_context=("ticker",))
+  loader = _write_operation(tmp_path, required_context=("ticker",), execution_class="node.implement")
   runner = _Runner()
   extractor_calls = 0
 
@@ -1693,6 +1698,7 @@ def test_non_investment_research_context_keeps_existing_asserted_id_dispatch(
     tmp_path,
     required_context=("research_file_id",),
     operation_name=operation_name,
+    execution_class="node.implement",
   )
   runner = _Runner()
 
@@ -1773,6 +1779,7 @@ def test_named_child_first_message_carries_the_run_binding(
     tmp_path,
     required_context=required_context,
     operation_name=operation_name,
+    execution_class="node.implement",
   )
   runner = _Runner()
   for index, prior_result in enumerate(prior_results):
@@ -1821,7 +1828,7 @@ def test_named_child_missing_required_refs_does_not_spawn(
   background: bool,
 ) -> None:
   keys = ("model_version_ref", "source_bundle_id", "valuation_policy_ref")
-  loader = _write_operation(tmp_path, operation_name="postcompile-valuation", required_context=keys)
+  loader = _write_operation(tmp_path, operation_name="postcompile-valuation", required_context=keys, execution_class="node.implement")
   runner = _Runner()
   if prior_result is not None:
     runner._log.append({"type": "tool_call_complete", "result": prior_result})
@@ -1855,6 +1862,7 @@ def test_named_child_subject_context_is_not_a_turn_ref(
 ) -> None:
   loader = _write_operation(
     tmp_path, operation_name="industry-onboarding", required_context=(subject_key,),
+    execution_class="node.implement",
   )
   runner = _Runner()
   _, error = asyncio.run(_handler(runner, loader=loader)({
@@ -1871,6 +1879,7 @@ def test_named_child_refs_are_scoped_to_current_turn_successful_results(
 ) -> None:
   loader = _write_operation(
     tmp_path, operation_name="postcompile-valuation", required_context=("model_version_ref",),
+    execution_class="node.implement",
   )
   runner = _Runner()
   handler = _handler(runner, loader=loader)
@@ -1917,6 +1926,7 @@ _CF_REF = {"skill": "critical-factors", "artifact_id": "cf-exact", "content_sha2
 def _scenario_child_refs(runner: _Runner, tmp_path: Path) -> tuple[Any, Any]:
   loader = _write_operation(
     tmp_path, operation_name="earnings-scenarios", required_context=_SCENARIO_KEYS,
+    execution_class="node.implement",
   )
   result, error = asyncio.run(_handler(runner, loader=loader, trusted_research_file_id=1)({
     "operation": _operation(loader),
@@ -2188,7 +2198,7 @@ def test_a_current_model_read_does_not_displace_a_stage_set_a_door_persisted(
   keys = (
     "model_version_ref", "forecast_assumption_set_ref", "scenario_set_ref", "valuation_policy_ref",
   )
-  loader = _write_operation(tmp_path, operation_name="valuation-policy-precompile", required_context=keys)
+  loader = _write_operation(tmp_path, operation_name="valuation-policy-precompile", required_context=keys, execution_class="node.implement")
   fas = {name: {"set_id": f"fas-{name}", "content_sha256": "b" * 64} for name in "ABC"}
   scenario = {name: {"set_id": f"ss-{name}", "content_sha256": "c" * 64} for name in "AB"}
   policy = {name: {"policy_id": f"vp-{name}", "content_sha256": "d" * 64} for name in "AB"}
@@ -2277,6 +2287,7 @@ def test_investment_start_route_requires_verified_turn_despite_metadata_drift(
     required_context=required_context,
     operation_name="alternate-quant-method",
     investment_start_route=True,
+    execution_class="node.mutate",
   )
   runner = _Runner()
 
@@ -2330,6 +2341,7 @@ def test_verified_turn_remains_authoritative_for_non_investment_child(
   loader = _write_operation(
     tmp_path,
     required_context=("research_file_id",),
+    execution_class="node.implement",
   )
   runner = _Runner()
   handler = _handler(
@@ -2390,7 +2402,7 @@ def test_direct_handler_required_ticker_fails_before_effects(
   objective: str,
   message: str,
 ) -> None:
-  loader = _write_operation(tmp_path, required_context=("ticker",))
+  loader = _write_operation(tmp_path, required_context=("ticker",), execution_class="node.implement")
   runner = _Runner()
   resolver = _CapabilityResolver()
 
@@ -2427,7 +2439,7 @@ def test_direct_handler_required_ticker_fails_before_effects(
 def test_malformed_ticker_on_ticker_required_operation_names_ticker_to_add(
   tmp_path: Path,
 ) -> None:
-  loader = _write_operation(tmp_path, required_context=("ticker",))
+  loader = _write_operation(tmp_path, required_context=("ticker",), execution_class="node.implement")
   runner = _Runner()
 
   result, error = asyncio.run(_handler(
@@ -2453,7 +2465,7 @@ def test_malformed_ticker_on_ticker_free_operation_repairs_by_dropping_it(
   tmp_path: Path,
   ticker: str,
 ) -> None:
-  loader = _write_operation(tmp_path, required_context=())
+  loader = _write_operation(tmp_path, required_context=(), execution_class="node.implement")
   runner = _Runner()
   resolver = _CapabilityResolver()
 
@@ -2487,7 +2499,7 @@ def test_direct_handler_unambiguous_legacy_prose_is_promoted_once(
   tmp_path: Path,
   ticker: str,
 ) -> None:
-  loader = _write_operation(tmp_path, required_context=("ticker",))
+  loader = _write_operation(tmp_path, required_context=("ticker",), execution_class="node.implement")
   runner = _Runner()
 
   result, error = asyncio.run(_handler(runner, loader=loader)({
@@ -2506,7 +2518,7 @@ def test_direct_handler_unambiguous_legacy_prose_is_promoted_once(
 def test_direct_handler_binds_typed_research_file_over_objective_prose(
   tmp_path: Path,
 ) -> None:
-  loader = _write_operation(tmp_path)
+  loader = _write_operation(tmp_path, execution_class="node.implement")
   runner = _Runner()
   rebound: list[int] = []
 
@@ -3068,7 +3080,7 @@ def test_foreground_delegation_materializes_projection_only_result(
 def test_registered_operation_requires_full_ref_and_emits_lifecycle(
   tmp_path: Path,
 ) -> None:
-  loader = _write_operation(tmp_path)
+  loader = _write_operation(tmp_path, execution_class="node.implement")
   runner = _Runner()
 
   result, error = asyncio.run(_handler(runner, loader=loader)({
@@ -3098,7 +3110,7 @@ def test_registered_operation_settles_lifecycle_when_runner_result_is_invalid(
     runner.spawn_calls.append({"task": task, **kwargs})
     return {"response": "ok"}, None
 
-  loader = _write_operation(tmp_path)
+  loader = _write_operation(tmp_path, execution_class="node.implement")
   runner = _Runner()
   monkeypatch.setattr(runner, "spawn_sub_agent", _invalid_spawn)
 
@@ -3124,7 +3136,7 @@ def test_registered_operation_settles_lifecycle_when_runner_result_is_invalid(
 def test_registered_operation_captures_recoverable_fms_error_without_internal_error(
   tmp_path: Path,
 ) -> None:
-  loader = _write_operation(tmp_path)
+  loader = _write_operation(tmp_path, execution_class="node.implement")
   runner = _Runner()
   spawn_sub_agent = runner.spawn_sub_agent
 
@@ -3169,7 +3181,7 @@ def test_registered_operation_captures_recoverable_fms_error_without_internal_er
 def test_registered_operation_activates_declared_mcp_before_admission(
   tmp_path: Path,
 ) -> None:
-  loader = _write_operation(tmp_path)
+  loader = _write_operation(tmp_path, execution_class="node.implement")
   runner = _Runner()
   activated: list[str] = []
 
@@ -3195,7 +3207,7 @@ def test_registered_operation_activates_declared_mcp_before_admission(
 def test_registered_foreground_operation_inherits_parent_approval_lifecycle(
   tmp_path: Path,
 ) -> None:
-  loader = _write_operation(tmp_path)
+  loader = _write_operation(tmp_path, execution_class="node.implement")
   runner = _Runner()
   approval_store = object()
   approval_policy = object()
@@ -3240,7 +3252,7 @@ def test_registered_foreground_operation_inherits_parent_approval_lifecycle(
 def test_registered_operation_never_rebinds_fms_from_objective_prose(
   tmp_path: Path,
 ) -> None:
-  loader = _write_operation(tmp_path)
+  loader = _write_operation(tmp_path, execution_class="node.implement")
   runner = _Runner()
   rebound: list[tuple[int, set[str]]] = []
 
@@ -3266,7 +3278,7 @@ def test_registered_operation_never_rebinds_fms_from_objective_prose(
 def test_registered_operation_binds_explicit_research_file_to_child_run(
   tmp_path: Path,
 ) -> None:
-  loader = _write_operation(tmp_path)
+  loader = _write_operation(tmp_path, execution_class="node.implement")
   runner = _Runner()
   rebound: list[int] = []
 
@@ -3294,7 +3306,7 @@ def test_registered_operation_binds_explicit_research_file_to_child_run(
 def test_registered_operation_mcp_activation_error_prevents_dispatch(
   tmp_path: Path,
 ) -> None:
-  loader = _write_operation(tmp_path)
+  loader = _write_operation(tmp_path, execution_class="node.implement")
   runner = _Runner()
   activation_error = {
     "code": "mcp_tool_unavailable",
@@ -3341,7 +3353,7 @@ def test_generic_delegation_does_not_activate_named_operation_mcp(
 def test_registered_operation_fails_closed_without_durable_log(
   tmp_path: Path,
 ) -> None:
-  loader = _write_operation(tmp_path)
+  loader = _write_operation(tmp_path, execution_class="node.implement")
   runner = _Runner()
   runner._agent_session_log = None
 
@@ -3358,7 +3370,7 @@ def test_registered_operation_fails_closed_without_durable_log(
 
 
 def test_bare_operation_name_is_not_an_authority_reference(tmp_path: Path) -> None:
-  loader = _write_operation(tmp_path)
+  loader = _write_operation(tmp_path, execution_class="node.implement")
   runner = _Runner()
 
   result, error = asyncio.run(_handler(runner, loader=loader)({
@@ -3374,7 +3386,7 @@ def test_bare_operation_name_is_not_an_authority_reference(tmp_path: Path) -> No
 def test_background_registration_persists_exact_admitted_task(
   tmp_path: Path,
 ) -> None:
-  loader = _write_operation(tmp_path)
+  loader = _write_operation(tmp_path, execution_class="node.implement")
   runner = _Runner()
 
   result, error = asyncio.run(_handler(runner, loader=loader)({
@@ -3791,6 +3803,7 @@ def _write_kernel_child_operation(path: Path) -> SkillLoader:
   (path / "kernel-child.md").write_text(
     """---
 name: kernel-child
+execution_class: node.implement
 version: '1.0'
 agent_callable: true
 agent_description: Compute in the child's private interpreter.

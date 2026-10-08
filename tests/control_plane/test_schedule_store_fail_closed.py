@@ -14,6 +14,8 @@ from fastapi.testclient import TestClient
 
 from agent_gateway.control_plane import schedules as schedules_module
 from agent_gateway.autonomous_runner import AutonomousRegistry
+from agent_gateway.approval_store import SQLiteApprovalStore
+from agent_gateway.single_user_policy import SingleUserApprovalPolicy
 
 from .test_schedules_pr6 import (
   _agent_run_schedule_payload,
@@ -96,10 +98,13 @@ def _create_request(*, request_id: str = "request-1") -> Any:
 
 
 class _Registry(AutonomousRegistry):
-  def __init__(self, on_start: Callable[[], None] | None = None) -> None:
+  def __init__(self, tmp_root: Path, on_start: Callable[[], None] | None = None) -> None:
     super().__init__(
-      api_dir=Path(__file__).parent,
-      log_dir=Path(__file__).with_name("_unused_autonomous_logs"),
+      api_dir=tmp_root / "schedule-registry-api",
+      log_dir=tmp_root / "schedule-registry-logs",
+      tenant_id="test-product",
+      approval_store=SQLiteApprovalStore(tmp_root / "schedule-approvals.sqlite3"),
+      approval_policy=SingleUserApprovalPolicy(),
       mcp_user_key_lookup=lambda _user_id, _email: {"role": "owner"},
     )
     self.on_start = on_start
@@ -410,7 +415,7 @@ def test_fire_due_with_corrupt_store_returns_empty_and_preserves_bytes(tmp_path:
   path.write_bytes(b"{")
   runner = _runner_for_store(
     schedules_module.AgentRunScheduleStore(path),
-    _Registry(),
+    _Registry(tmp_path),
   )
   assert asyncio.run(runner.fire_due(now=NOW)) == []
   assert path.read_bytes() == b"{"
@@ -431,7 +436,7 @@ def test_fire_due_skips_record_when_corruption_arrives_before_claim(
     return [record]
 
   monkeypatch.setattr(store, "due_records", _due_records)
-  registry = _Registry()
+  registry = _Registry(tmp_path)
   runner = _runner_for_store(store, registry)
   assert asyncio.run(runner.fire_due(now=NOW)) == []
   assert registry.starts == []
@@ -449,7 +454,7 @@ def test_started_run_survives_result_persistence_failure(
   def _corrupt_store() -> None:
     path.write_bytes(b"{")
 
-  registry = _Registry(on_start=_corrupt_store)
+  registry = _Registry(tmp_path, on_start=_corrupt_store)
   runner = _runner_for_store(
     schedules_module.AgentRunScheduleStore(path),
     registry,
@@ -476,7 +481,7 @@ def test_run_now_uses_live_role_instead_of_persisted_dispatch_role(
   tmp_path: Path,
 ) -> None:
   record = _record()
-  registry = _Registry()
+  registry = _Registry(tmp_path)
   runner = _runner_for_store(
     schedules_module.AgentRunScheduleStore(_per_user_store_path(tmp_path)),
     registry,
@@ -505,7 +510,7 @@ def test_roleless_due_record_dispatches_as_invite_and_records_the_gap(
   record = _record()
   del record["dispatch_role"]
   _write_payload(path, record)
-  registry = _Registry()
+  registry = _Registry(tmp_path)
   store = schedules_module.AgentRunScheduleStore(path)
   runner = _runner_for_store(store, registry)
 
@@ -520,17 +525,17 @@ def test_roleless_due_record_dispatches_as_invite_and_records_the_gap(
 
 
 @pytest.mark.parametrize(
-  "record,registry",
+  "record,registry_type",
   [
-    ({**_record(), "dispatch": None}, _Registry()),
-    (_record(), None),
+    ({**_record(), "dispatch": None}, "normal"),
+    (_record(), "failing"),
   ],
   ids=["missing_dispatch", "registry_start_failure"],
 )
 def test_failed_fire_result_reports_unpersisted_for_both_failure_sites(
   tmp_path: Path,
   record: dict[str, Any],
-  registry: _Registry | None,
+  registry_type: str,
 ) -> None:
   path = tmp_path / "schedules.json"
   path.write_bytes(b"{")
@@ -540,9 +545,12 @@ def test_failed_fire_result_reports_unpersisted_for_both_failure_sites(
       _ = kwargs
       raise RuntimeError("start failed")
 
+  registry_class = _Registry if registry_type == "normal" else _FailingRegistry
+  registry = registry_class(tmp_path)
+
   runner = _runner_for_store(
     schedules_module.AgentRunScheduleStore(path),
-    registry or _FailingRegistry(),
+    registry,
   )
   result = asyncio.run(
     runner.fire_record_now(record, live_role="owner", now=NOW)
@@ -562,7 +570,7 @@ def test_run_now_route_returns_success_after_started_result_persistence_failure(
   def _corrupt_store() -> None:
     path.write_bytes(b"{")
 
-  registry = _Registry(on_start=_corrupt_store)
+  registry = _Registry(fake_schedule_backends["tmp_path"], on_start=_corrupt_store)
   app.state.agent_run_schedule_runner.autonomous_registry = registry
   task = types.SimpleNamespace(
     task_id="bg_1",
@@ -621,7 +629,7 @@ def test_run_loop_survives_multiple_unreadable_ticks_and_retains_interval_wait(
   path.write_bytes(b"{")
   runner = _runner_for_store(
     schedules_module.AgentRunScheduleStore(path),
-    _Registry(),
+    _Registry(tmp_path),
     poll_interval_seconds=7.5,
   )
   waits: list[float | None] = []
@@ -650,7 +658,7 @@ def test_corrupt_owner_store_does_not_block_other_owner_due_run(
     bob_path,
     _record(schedule_id="sched_bob", owner_user_id="bob", name="bob-review"),
   )
-  registry = _Registry()
+  registry = _Registry(tmp_path)
   runner = schedules_module.AgentRunScheduleRunner(
     store_for=lambda owner: schedules_module.AgentRunScheduleStore(
       tmp_path / "users" / str(owner) / "agent-run-schedules.json"
@@ -703,7 +711,7 @@ def test_cross_path_outage_has_one_store_owned_transition_and_recovery(
   path = _per_user_store_path(fake_schedule_backends["tmp_path"])
   path.write_bytes(b"{")
   app = _make_app(fake_schedule_backends["backend"])
-  app.state.agent_run_schedule_runner.autonomous_registry = _Registry()
+  app.state.agent_run_schedule_runner.autonomous_registry = _Registry(fake_schedule_backends["tmp_path"])
   caplog.set_level(logging.INFO, logger=STORE_LOGGER)
 
   with TestClient(app) as client:

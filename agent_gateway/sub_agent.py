@@ -1779,10 +1779,7 @@ def make_run_agent_handler(
     else:
       generic_profile = generic_explore_profile()
       resolved_operation = ResolvedAgentOperation(
-        snapshot=compile_agent_operation(
-          generic_profile,
-          execution_class="node.explore",
-        ),
+        snapshot=compile_agent_operation(generic_profile),
         methodology_profile=generic_profile,
       )
       operation = resolved_operation.snapshot
@@ -2287,7 +2284,8 @@ def make_run_agent_handler(
           operation=agent_name,
           task=task,
           handles=handles,
-          effort=runtime_policy.effort if runtime_policy is not None else None,
+          role=operation.role,
+          effort=operation.effort,
           binding=AdmittedResearchBinding(
             research_file_id=asserted_research_file_id,
             ticker=resolved_context_ticker,
@@ -2503,6 +2501,9 @@ def make_run_agent_handler(
         except Exception:
           log.warning("External sub-agent event callback failed", exc_info=True)
 
+      child_context = context_for_child(
+        admission, job_id=admitted_task.attempt.physical_task_id,
+      )
       sub_session = None
       if parent_session is not None:
         sub_session = GatewaySession(
@@ -2528,9 +2529,7 @@ def make_run_agent_handler(
             else None
           ),
         )
-        capture_job_context(sub_session, context_for_child(
-          admission, job_id=admitted_task.attempt.physical_task_id,
-        ))
+        capture_job_context(sub_session, child_context)
       try:
         # Without a factory, callers retain their own handler semantics.
         child_local = dict(sub_local)
@@ -2585,6 +2584,7 @@ def make_run_agent_handler(
           identity=dispatch_identity(
             session=parent_session,
             execution=operation_authority.identity,
+            context=child_context,
             user_id=effective_parent_user_id,
             credentials_resolver_active=credentials_resolver_active,
           ),
@@ -2801,7 +2801,7 @@ def make_run_agent_handler(
   return JobScopedHandler(
     _build,
     JobScope(
-      caller=lambda: root_context(
+      caller=lambda: _spawn_root_context(
         parent_session,
         withheld_tools=frozenset(excluded_tools or ()),
         research_file_id=trusted_research_file_id,
@@ -2809,6 +2809,32 @@ def make_run_agent_handler(
       spill_sink=lambda: None,
       runner=lambda: runner_ref[0],
       session=parent_session,
+    ),
+  )
+
+
+def _spawn_root_context(
+  parent_session: GatewaySession | None,
+  *,
+  withheld_tools: frozenset[str],
+  research_file_id: int | None,
+) -> ParentContext:
+  """Re-mint the spawning turn's root with this handler's tool scope.
+
+  The root keeps the selection snapshot the turn edge captured on the session:
+  the snapshot is taken once per turn, so this re-mint names it explicitly
+  rather than dropping it. An admitted child's context is returned unchanged
+  by ``root_context``."""
+
+  captured: ParentContext | None = getattr(
+    parent_session, "admitted_job_context", None
+  )
+  return root_context(
+    parent_session,
+    withheld_tools=withheld_tools,
+    research_file_id=research_file_id,
+    selection_snapshot=(
+      captured.selection_snapshot if captured is not None else None
     ),
   )
 
@@ -3114,9 +3140,33 @@ def make_resume_handler(
     resumer_job_id = root.job_id
 
     try:
-      execution = capability_execution_resolver.materialize_bind(
-        original_bind
+      resume_resolver = capability_execution_resolver
+      from .providers.anthropic_oauth import (
+        AnthropicSourceError,
+        anthropic_generation_auth_config,
+        is_anthropic_generation_ref,
       )
+
+      if (
+        original_bind.provider == "anthropic"
+        and is_anthropic_generation_ref(original_bind.credential_ref)
+      ):
+        try:
+          exact_config = anthropic_generation_auth_config(
+            original_bind.credential_ref,
+            user_scope=getattr(parent_session, "risk_user_id", None),
+            base_config=getattr(parent_session, "auth_config", None) or {},
+          )
+        except AnthropicSourceError as exc:
+          raise CapabilityResolutionError(
+            "credential_unavailable",
+            "resumed Anthropic credential generation is unavailable",
+            capability_id=original_bind.capability_id,
+          ) from exc
+        resume_resolver = resume_resolver.with_frozen_credential(
+          original_bind, exact_config,
+        )
+      execution = resume_resolver.materialize_bind(original_bind)
     except CapabilityResolutionError as exc:
       resolution_error = _capability_resolution_error(exc)
       return await _abandon(
@@ -3458,6 +3508,10 @@ def make_resume_handler(
     async def _dispatch_resume(_background_input: dict[str, Any], **background_kwargs: Any):
       background_call_index = int(background_kwargs.get("call_index", call_index) or 0)
       task_entry = background_kwargs.get("task_entry")
+      child_context = context_for_child(
+        continuation,
+        job_id=successor_admitted_task.attempt.physical_task_id,
+      )
       sub_session = None
       if parent_session is not None:
         sub_session = GatewaySession(
@@ -3483,10 +3537,7 @@ def make_resume_handler(
             else None
           ),
         )
-        capture_job_context(sub_session, context_for_child(
-          continuation,
-          job_id=successor_admitted_task.attempt.physical_task_id,
-        ))
+        capture_job_context(sub_session, child_context)
       try:
         child_local = dict(sub_local)
         child_spill_sink = (
@@ -3540,6 +3591,8 @@ def make_resume_handler(
           # state is not new dispatch authority.
           identity=dispatch_identity(
             session=parent_session,
+            execution=execution_identity_from_session(parent_session),
+            context=child_context,
             user_id=user_id or getattr(parent_session, "user_id", None),
             credentials_resolver_active=credentials_resolver_active,
           ),

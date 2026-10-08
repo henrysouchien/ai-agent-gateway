@@ -15,17 +15,19 @@ bound credential has no credential handle in its identity, and callers that
 require one say so out loud rather than reaching for a substitute.
 
 :class:`DispatchIdentity` is the dispatcher-facing bundle: the resolved
-``ExecutionIdentity`` plus the authenticated session the per-user MCP
-projection reads (AVGO-LIVE-02).  The five separate constructor arguments
-collapse into it.
+``ExecutionIdentity``, the admitted executing job context and the authenticated
+session the per-user MCP projection reads (AVGO-LIVE-02). Job authority is
+independent of credential identity and survives sessionless dispatch.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agent_workflow_contracts import ExecutionIdentity
+if TYPE_CHECKING:
+  from .admission import ParentContext
 
 
 def _text(value: Any) -> str:
@@ -93,12 +95,14 @@ def resolved_execution_identity(runner: Any) -> ExecutionIdentity | None:
 class DispatchIdentity:
   """The exact identity one :class:`ToolDispatcher` executes under.
 
-  ``execution`` is the frozen wire identity (``ResolvedAuthority.identity``);
+  ``context`` is the admitted executing job authority, independent of credentials;
+  ``execution`` is the frozen credential wire identity (``ResolvedAuthority.identity``);
   ``session`` is the authenticated :class:`GatewaySession` the per-user MCP
-  credential projection derives its subject from.  Credential *material* never
+  credential projection derives its subject from. Credential *material* never
   rides here.
   """
 
+  context: ParentContext | None
   execution: ExecutionIdentity | None = None
   session: Any | None = None
   user_id: str | None = None
@@ -122,24 +126,24 @@ class DispatchIdentity:
 def dispatch_identity(
   *,
   session: Any,
-  execution: ExecutionIdentity | None = None,
+  execution: ExecutionIdentity | None,
+  context: ParentContext | None,
   user_id: str | None = None,
   credentials_resolver_active: bool = False,
 ) -> DispatchIdentity:
-  """Bundle one session's dispatch identity.
+  """Bundle the executing job context and resolved credential dispatch identity.
 
-  ``execution`` is the authority's frozen identity when the caller resolved
-  one; absent it, the same single derivation runs over the same session, so
-  the dispatcher can never execute under an identity the resolver did not
-  produce.
+  ``execution`` is the identity the caller resolved, taken as given: ``None``
+  is a resolved absence, never a cue to derive one from ``session``.
+  Derivation happens once, where execution is resolved
+  (:func:`execution_identity_from_session`).
+  ``context`` is the executing job's admitted context, never inferred from
+  the optional session or credential identity.
   """
 
   return DispatchIdentity(
-    execution=(
-      execution
-      if execution is not None
-      else execution_identity_from_session(session)
-    ),
+    context=context,
+    execution=execution,
     session=session,
     user_id=(
       user_id

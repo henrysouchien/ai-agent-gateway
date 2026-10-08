@@ -1,5 +1,6 @@
 ---
 name: source-triage
+execution_class: node.implement
 agent_callable: true
 agent_description: Extract claims, uncertainties, and decision-relevant evidence from a source pack.
 persist_state: true

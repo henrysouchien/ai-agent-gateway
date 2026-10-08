@@ -37,6 +37,7 @@ from .runner_stream_turn import STREAM_GUARD_POLL_INTERVAL
 from .runner_streaming import STREAM_THINKING_STALL_TIMEOUT
 from .runner_state import user_turn_message as _user_turn_message
 from .skill_lifecycle import drain_owned_lifecycle_task
+from .session import session_owner_user_id
 from .sub_agent_result_evidence import SubAgentResultEvidence
 from .sub_agent_narrative_result import (
   final_child_visible_text,
@@ -400,6 +401,12 @@ class RunnerSubAgentMixin:
       event_log=sub_log,
       dispatcher=dispatcher,
       session_id=sub_session_id,
+      gateway_session=sub_session,
+      context_research_file_id=(
+        current_parent_context(sub_session).research_binding.research_file_id
+        if sub_session is not None
+        else None
+      ),
       capability_execution=capability_execution,
       max_tokens_override=max_tokens,
       stream_stall_timeout=self._stream_stall_timeout,
@@ -412,7 +419,11 @@ class RunnerSubAgentMixin:
       on_session_summary=None,
       on_late_usage_event=self._on_late_usage_event,
       on_tool_timing=self._on_tool_timing,
-      user_id=getattr(sub_session, "user_id", None) or self._usage_user_id,
+      user_id=(
+        session_owner_user_id(sub_session)
+        if sub_session is not None
+        else self._usage_user_id
+      ),
       request_id=self._request_id,
       parent_turn_id=parent_turn_id,
       billing_mode=self._billing_mode,
@@ -670,6 +681,12 @@ class RunnerSubAgentMixin:
       event_log=sub_log,
       dispatcher=dispatcher,
       session_id=sub_session_id,
+      gateway_session=sub_session,
+      context_research_file_id=(
+        current_parent_context(sub_session).research_binding.research_file_id
+        if sub_session is not None
+        else None
+      ),
       capability_execution=capability_execution,
       max_tokens_override=max_tokens,
       stream_stall_timeout=self._stream_stall_timeout,
@@ -682,7 +699,11 @@ class RunnerSubAgentMixin:
       on_session_summary=None,
       on_late_usage_event=self._on_late_usage_event,
       on_tool_timing=self._on_tool_timing,
-      user_id=getattr(sub_session, "user_id", None) or self._usage_user_id,
+      user_id=(
+        session_owner_user_id(sub_session)
+        if sub_session is not None
+        else self._usage_user_id
+      ),
       request_id=self._request_id,
       parent_turn_id=parent_turn_id,
       billing_mode=self._billing_mode,

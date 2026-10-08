@@ -28,7 +28,7 @@ from .capability_execution import CapabilityExecutionResolver
 from .control_run_lifecycle import coerce_control_run_state
 from model_authority.capabilities import GATEWAY_EXECUTED_CAPABILITY_IDS
 from model_authority.registry import ProductModelRegistry
-from model_authority.selection import ProductModelSelectionPolicy
+from model_authority.selection import ProductModelSelectionPolicy, capture_selection_snapshot
 from .event_adapter import adapt_event
 from .event_log import EventLog, log_has_terminal
 from .events import DEFAULT_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
@@ -1028,6 +1028,10 @@ def prepare_session_driver_turn(
     session=session,
     build_chat_runtime=build_chat_runtime,
   )
+  selection_snapshot = capture_selection_snapshot(
+    capability_execution_resolver.selection_policy
+  )
+  request._selection_snapshot = selection_snapshot
   execution_policy_resolver = getattr(
     build_chat_runtime,
     "_gateway_session_execution_policy_resolver",
@@ -1079,6 +1083,7 @@ def prepare_session_driver_turn(
     SESSION_DRIVER_CAPABILITY,
     explicit_intent=explicit_intent,
     saved_preference=saved_preference,
+    selection_snapshot=selection_snapshot,
   )
   request._bind_session_execution_policy(execution_policy)
   request._bind_session_driver(
@@ -1089,6 +1094,7 @@ def prepare_session_driver_turn(
     session_id=session.session_id,
     request=request,
     channel=channel,
+    selection_snapshot=selection_snapshot,
   )
 
 

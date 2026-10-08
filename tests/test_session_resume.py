@@ -98,12 +98,22 @@ def _make_app(
     capability_execution = request.capability_execution
     assert capability_execution is not None
     # The product factory's rule: a resumed session opens the bound log,
-    # any other session mints one keyed by its own id.
+    # any other session mints one keyed by its own id; a fork also reads its
+    # source log, without binding it, to seed that new log.
     session_log = session.agent_session_log or AgentSessionLog(
       path=session.resume_log_path or _log_path(logs_dir, session),
       gateway_session=session,
     )
     session.agent_session_log = session_log
+    fork_source_log = (
+      AgentSessionLog(
+        path=session.fork_source_log_path,
+        _create_active_on_open=False,
+        _repair_manifest_on_open=False,
+      )
+      if session.fork_source_log_path is not None
+      else None
+    )
 
     def _build_runner(event_log, session_id, _started_at=None):
       return AgentRunner(
@@ -123,7 +133,10 @@ def _make_app(
         billing_mode="byok",
         rate_table_version="unknown",
         agent_session_log=session_log,
-        context_builder=SessionContextBuilder(agent_session_log=session_log),
+        context_builder=SessionContextBuilder(
+          agent_session_log=session_log,
+          fork_source_log=fork_source_log,
+        ),
       )
 
     return ChatRuntime(
@@ -165,10 +178,13 @@ def _post_init(
   user_id: str = "alice",
   api_key: str = API_KEY,
   resume_session_id: str | None = None,
+  fork_from_session_id: str | None = None,
 ):
   payload: dict[str, Any] = {"api_key": api_key, "user_id": user_id}
   if resume_session_id is not None:
     payload["resume_session_id"] = resume_session_id
+  if fork_from_session_id is not None:
+    payload["fork_from_session_id"] = fork_from_session_id
   return client.post("/api/chat/init", json=payload)
 
 
@@ -422,3 +438,147 @@ def test_resume_retires_the_callers_idle_prior_session_on_the_same_log(
   assert live_ids == {resumed["session_id"]}
   assert "First turn." in json.dumps(provider.captured_messages[-1], default=str)
   assert sorted(p.name for p in logs_dir.glob("*.jsonl")) == [log_path.name]
+
+
+def _answering_turn(client: TestClient) -> SessionStream:
+  async def _answering() -> None:
+    await asyncio.Event().wait()
+
+  async def _start_turn() -> SessionStream:
+    task = asyncio.get_running_loop().create_task(_answering())
+    await asyncio.sleep(0)
+    return SessionStream(event_log=EventLog(), runner_task=task)
+
+  portal = client.portal
+  assert portal is not None
+  return portal.call(_start_turn)
+
+
+def test_fork_keeps_the_idle_source_session_and_replays_its_history(
+  tmp_path: Path,
+) -> None:
+  resolver = _ResumeResolver()
+  logs_dir = tmp_path / "logs"
+  provider = _ReplayProvider(["The codeword is PELICAN.", "PELICAN.", "Back."])
+  app = _make_app(logs_dir, provider, resolver)
+  with TestClient(app) as client:
+    original = _ready_session(client, _post_init(client).json())
+    _turn(client, original, "Remember the codeword PELICAN.")
+    store = app.state.auth.session_store
+    original_session = store.get_session(original["session_id"])
+    source_log = _log_path(logs_dir, original_session)
+    resolver.outcomes[original["session_id"]] = source_log
+    source_before = source_log.read_bytes()
+
+    response = _post_init(client, fork_from_session_id=original["session_id"])
+    assert response.status_code == 200, response.text
+    body = response.json()
+    fork_session = store.get_session(body["session_id"])
+    fork_state = (fork_session.fork_source_log_path, fork_session.resume_log_path)
+    live_after_fork = {session.session_id for session in store.visible_sessions_snapshot()}
+    fork = _ready_session(client, body)
+    _turn(client, fork, "What was the codeword?")
+    fork_model_input = json.dumps(provider.captured_messages[-1], default=str)
+    source_after_fork = source_log.read_bytes()
+
+    # The original workbook still resumes its own log while the fork lives.
+    resumed_response = _post_init(client, resume_session_id=original["session_id"])
+    assert resumed_response.status_code == 200, resumed_response.text
+    resumed = _ready_session(client, resumed_response.json())
+    _turn(client, resumed, "Are we still on the original?")
+    original_model_input = json.dumps(provider.captured_messages[-1], default=str)
+    live_after_resume = {session.session_id for session in store.visible_sessions_snapshot()}
+
+  assert body["forked_from_session_id"] == original["session_id"]
+  assert body["resumed_from_session_id"] is None
+  assert body["session_id"] != original["session_id"]
+  assert resolver.calls[0]["resume_session_id"] == original["session_id"]
+  assert fork_state == (source_log, None)
+  assert live_after_fork == {original["session_id"], body["session_id"]}
+  assert "Remember the codeword PELICAN." in fork_model_input
+  assert "The codeword is PELICAN." in fork_model_input
+  assert source_after_fork == source_before
+  fork_log = _log_path(logs_dir, fork_session)
+  fork_events = _events(fork_log)
+  assert [event["type"] for event in fork_events].count("fork_seed") == 1
+  assert any(
+    event["type"] == "user_message" and event["content"] == "What was the codeword?"
+    for event in fork_events
+  )
+  assert "What was the codeword?" not in original_model_input
+  assert "Remember the codeword PELICAN." in original_model_input
+  assert live_after_resume == {body["session_id"], resumed["session_id"]}
+  assert sorted(p.name for p in logs_dir.glob("*.jsonl")) == sorted(
+    [source_log.name, fork_log.name]
+  )
+
+
+def test_fork_is_not_refused_while_the_source_session_is_answering(
+  tmp_path: Path,
+) -> None:
+  resolver = _ResumeResolver()
+  logs_dir = tmp_path / "logs"
+  app = _make_app(logs_dir, _ReplayProvider(["First."]), resolver)
+  with TestClient(app) as client:
+    original = _ready_session(client, _post_init(client).json())
+    _turn(client, original, "First turn.")
+    store = app.state.auth.session_store
+    original_session = store.get_session(original["session_id"])
+    resolver.outcomes[original["session_id"]] = _log_path(logs_dir, original_session)
+    original_session.active_turn = _answering_turn(client)
+
+    response = _post_init(client, fork_from_session_id=original["session_id"])
+    still_live = store.get_session(original["session_id"])
+    fork_session = store.get_session(response.json().get("session_id", ""))
+    live_ids = {session.session_id for session in store.visible_sessions_snapshot()}
+    portal = client.portal
+    assert portal is not None
+    portal.call(_cancel_turn, original_session.active_turn)
+
+  assert response.status_code == 200, response.text
+  assert response.json()["forked_from_session_id"] == original["session_id"]
+  assert still_live is original_session
+  assert fork_session is not None
+  assert fork_session.fork_source_log_path == _log_path(logs_dir, original_session)
+  assert fork_session.resume_log_path is None
+  assert live_ids == {original["session_id"], fork_session.session_id}
+
+
+def test_fork_refusal_is_the_resume_refusal_and_both_ids_are_rejected(
+  tmp_path: Path,
+) -> None:
+  resolver = _ResumeResolver()
+  resolver.outcomes["sess_ambiguous"] = "ambiguous"
+  app = _make_app(tmp_path / "logs", _ReplayProvider([]), resolver)
+  with TestClient(app) as client:
+    refused = {
+      presented: _post_init(client, fork_from_session_id=presented)
+      for presented in ("sess_missing", "sess_ambiguous")
+    }
+    both = _post_init(
+      client,
+      resume_session_id="sess_missing",
+      fork_from_session_id="sess_missing",
+    )
+    live_sessions = app.state.auth.session_store.visible_sessions_snapshot()
+
+  assert {
+    presented: (response.status_code, response.json())
+    for presented, response in refused.items()
+  } == {
+    "sess_missing": (
+      409,
+      {"error": "session_resume_refused", "reason": "not_found"},
+    ),
+    "sess_ambiguous": (
+      409,
+      {"error": "session_resume_refused", "reason": "ambiguous"},
+    ),
+  }
+  assert both.status_code == 422
+  assert "mutually exclusive" in both.text
+  assert [call["resume_session_id"] for call in resolver.calls] == [
+    "sess_missing",
+    "sess_ambiguous",
+  ]
+  assert live_sessions == ()

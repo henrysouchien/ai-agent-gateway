@@ -4,7 +4,7 @@ from copy import deepcopy
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -33,10 +33,6 @@ from .operation_snapshot import (
 from ._io import (
   _atomic_write_json as _atomic_write_json,
   _read_json_object,
-)
-from .sub_agent_capability import (
-  resolve_delegation_role_capability,
-  resolve_sub_agent_capability,
 )
 from model_authority.thinking import resolve_effort_pair
 
@@ -238,7 +234,6 @@ def _declared_evidence_ports(
 def compile_agent_operation(
   profile: "SkillProfile",
   *,
-  execution_class: str,
   resolved_instructions: str | None = None,
 ) -> AgentOperationSnapshot:
   """Compile one callable methodology into its canonical runnable snapshot."""
@@ -282,7 +277,9 @@ def compile_agent_operation(
     methodology_instructions=methodology_text,
     resolved_instructions=instructions,
     description=str(description).strip(),
-    execution_class=execution_class,
+    execution_class=profile.execution_class,
+    role=profile.role,
+    effort=profile.effort,
     required_capabilities=required_capabilities,
     workspace_scope=operation_workspace_scope(
       profile.mutation_mode,
@@ -313,7 +310,7 @@ def generic_explore_profile() -> "SkillProfile":
     agent_description=_GENERIC_EXPLORE_DESCRIPTION,
     resumable=False,
     mutation_mode="read_only",
-    delegation_role="explore",
+    execution_class="node.explore",
     metadata={
       "semantic_metadata": {
         "tool_refs": [
@@ -395,14 +392,12 @@ class SkillProfile:
   tool_packs_enabled: bool = True
   state_class: str | None = None
   mutation_mode: Mode | str | None = None
-  # Append new fields BELOW this line. Positional construction is part of the
-  # contract (test_skill_profile_positional_construction_compat pins the order
-  # through mutation_mode); inserting a field mid-struct shifts later fields and
-  # breaks positional callers.
+  # The first nine positional fields through metadata are a public contract.
   effort: str | None = None
   provider: str | None = None
   max_structured_reads: int | None = None
-  delegation_role: str | None = None
+  execution_class: str = field(kw_only=True)
+  role: str | None = None
   children: tuple[str, ...] = ()
 
 
@@ -413,16 +408,12 @@ def _clean_string(value: Any) -> str | None:
   return text or None
 
 
-def _coerce_optional_delegation_role(value: Any, *, path: Path) -> str | None:
-  if value is None:
-    return None
-  if not isinstance(value, str):
-    raise ValueError(f"{path}: 'delegation_role' must be a string")
-  role = value.strip()
-  if not role:
-    raise ValueError(f"{path}: 'delegation_role' must be non-empty when provided")
-  resolve_delegation_role_capability(role)
-  return role
+def _coerce_authored_identifier(
+  value: Any, *, field_name: str, path: Path,
+) -> str:
+  if not isinstance(value, str) or not value.strip():
+    raise ValueError(f"{path}: '{field_name}' must be a non-empty string")
+  return value.strip()
 
 
 def _coerce_optional_int(value: Any, *, field_name: str, path: Path) -> int | None:
@@ -593,8 +584,8 @@ def resolve_blocks(content: str, blocks_dir: Path) -> str:
 def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
   """Parse one skill source snapshot into a `SkillProfile`.
 
-  The parser accepts optional YAML frontmatter delimited by `---` and treats the
-  remaining markdown body as the skill prompt.
+  YAML frontmatter declares the required execution class and optional selection;
+  the remaining markdown body is the skill prompt.
   """
   frontmatter, body = _split_frontmatter(text, path=path)
 
@@ -623,8 +614,16 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
       f"{path}: agent completion is always a normal terminal message; "
       "subagent_return_contract/subagent_result_mode are not supported"
     )
-  raw_delegation_role = frontmatter.pop("delegation_role", None)
+  raw_execution_class = frontmatter.pop("execution_class", None)
+  raw_role = frontmatter.pop("role", None)
   raw_metadata = frontmatter.pop("metadata", None)
+  execution_class = _coerce_authored_identifier(
+    raw_execution_class, field_name="execution_class", path=path,
+  )
+  role = (
+    None if raw_role is None
+    else _coerce_authored_identifier(raw_role, field_name="role", path=path)
+  )
 
   if raw_metadata is None:
     metadata: dict[str, Any] = {}
@@ -763,10 +762,8 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
     effort=coerced_effort,
     provider=_clean_string(raw_provider),
     max_structured_reads=coerced_max_structured_reads,
-    delegation_role=_coerce_optional_delegation_role(
-      raw_delegation_role,
-      path=path,
-    ),
+    execution_class=execution_class,
+    role=role,
     children=children,
   )
 
@@ -863,20 +860,12 @@ class SkillLoader:
       raise ValueError(
         f"Operation methodology '{operation_name}' is not agent-callable"
       )
-    execution_class = resolve_delegation_role_capability(
-      profile.delegation_role
-    ) if profile.delegation_role is not None else resolve_sub_agent_capability(
-      validated_agent_name=profile.name,
-      mutation_mode=profile.mutation_mode,
-      delegation_role=None,
-    )
     instructions = resolve_blocks(
       profile.system_prompt,
       self.skills_dir / "_blocks",
     )
     snapshot = compile_agent_operation(
       profile,
-      execution_class=execution_class,
       resolved_instructions=instructions,
     )
     if requested is not None and requested != snapshot.operation:
@@ -902,11 +891,6 @@ class SkillLoader:
         resolved = self.resolve_operation(
           compile_agent_operation(
             profile,
-            execution_class=resolve_sub_agent_capability(
-              validated_agent_name=profile.name,
-              mutation_mode=profile.mutation_mode,
-              delegation_role=profile.delegation_role,
-            ),
             resolved_instructions=resolve_blocks(
               profile.system_prompt,
               self.skills_dir / "_blocks",

@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = Path(__file__).resolve().parents[1]
@@ -13,6 +15,7 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import McpClientManager, ToolDispatcher
 from agent_gateway import tool_dispatcher_runtime as runtime
+from agent_gateway.mcp_client import McpInvocationReport
 from agent_gateway.tool_policy_registry import PreparedToolCall
 from agent_gateway.tool_dispatcher_helpers import ToolResult
 
@@ -271,3 +274,40 @@ def test_dispatcher_uses_original_tool_name_for_prefixed_mcp_argument_guidance()
   assert error["code"] == "mcp_tool_error"
   assert "research_file_id" in error["tool_usage_hint"]
   assert "Do not pass ticker" in error["tool_usage_hint"]
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_call_mcp_tool_forwards_invocation_report_unchanged(monkeypatch, cancelled) -> None:
+  async def scenario():
+    manager = McpClientManager(config_path=None)
+    report = McpInvocationReport(certainty="settled")
+    dispatcher = ToolDispatcher(
+      mcp_client=manager,
+      local_tool_handlers={},
+      role="owner",
+      get_tool_definitions=lambda: [],
+    )
+    seen = []
+
+    async def call_tool(_name, _tool_input, *, invocation_report, **_kwargs):
+      seen.append(invocation_report)
+      invocation_report.certainty = "unknown"
+      if cancelled:
+        raise asyncio.CancelledError()
+      invocation_report.certainty = "settled"
+      return {"ok": True}, None
+
+    monkeypatch.setattr(manager, "call_tool_reporting", call_tool)
+    if cancelled:
+      with pytest.raises(asyncio.CancelledError):
+        await dispatcher._call_mcp_tool("read", {}, invocation_report=report)
+      assert report.certainty == "unknown"
+    else:
+      assert await dispatcher._call_mcp_tool(
+        "read", {}, invocation_report=report,
+      ) == ({"ok": True}, None)
+      assert report.certainty == "settled"
+    assert seen == [report]
+    assert seen[0] is report
+
+  asyncio.run(scenario())

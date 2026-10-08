@@ -22,12 +22,17 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from agent_workflow_contracts.models import AdmittedResearchBinding, AdmittedTenant
+from agent_gateway.admission import capture_job_context, root_context_from_identity
+from agent_gateway.approval_route import NO_APPROVAL_ROUTE
+from agent_gateway.execution_identity import DispatchIdentity
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.approval_policy import RunContext
 from agent_gateway.investment_capability_claim import (
   INVESTMENT_CAPABILITY_FACADE_TOOLS,
   INVESTMENT_CAPABILITY_CLAIM_PRIVATE_KEY_ENV,
   INVESTMENT_CAPABILITY_CLAIM_PUBLIC_KEY_ENV,
+  INVESTMENT_JOB_PRINCIPAL_TOOLS,
   InvestmentCapabilityGrant,
   InvestmentCapabilityClaimError,
   configure_investment_capability_grants,
@@ -35,6 +40,7 @@ from agent_gateway.investment_capability_claim import (
   issue_investment_capability_claim,
   issue_investment_selected_content_claim,
   investment_capability_signing_available,
+  issue_investment_job_principal_claim,
 )
 from agent_gateway.skill_limits import (
   ActiveSkillAdmission,
@@ -42,6 +48,8 @@ from agent_gateway.skill_limits import (
 )
 from agent_gateway.skill_context import reset_current_skill, set_current_skill
 from agent_gateway.tool_dispatcher import ToolDispatcher
+from agent_gateway.session import GatewaySession
+from gateway_test_support.host_policy import owner_session_host_policy
 
 
 _PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
@@ -62,6 +70,7 @@ _PUBLIC_KEY_MATERIAL = base64.urlsafe_b64encode(
 ).rstrip(b"=").decode("ascii")
 _KEY_ID = f"ed25519-sha256:{hashlib.sha256(_PUBLIC_KEY_BYTES).hexdigest()}"
 _POLICY_BUNDLE_HASH = hashlib.sha256(b"test-policy-bundle").hexdigest()
+_TENANT = AdmittedTenant(tenant_id="tenant:desk", storage_id="sia-alice", role="owner")
 
 _READ_FACADE_TOOLS = (
   "cancel_investment_run",
@@ -88,7 +97,7 @@ _DECLARED_GRANTS = {
 
 
 @pytest.fixture(autouse=True)
-def _bind_declared_grants():
+def _bind_declared_grants(owner_session_host_policy):
   previous = investment_capability_grants()
   configure_investment_capability_grants(_DECLARED_GRANTS)
   yield
@@ -182,6 +191,29 @@ def _dispatcher(
   policy_bundle_hash: str = _POLICY_BUNDLE_HASH,
   research_file_id: int | None = 2,
 ) -> ToolDispatcher:
+  session = GatewaySession(
+    session_id="session-123",
+    api_key_hash="test-api-key-hash",
+    created_at=1_800_000_000,
+    expires_at=1_800_000_600,
+    user_id=_TENANT.storage_id,
+    owner_user_id=_TENANT.storage_id,
+    tenant_id=_TENANT.tenant_id,
+    risk_user_id=42,
+    channel="excel",
+    role="owner",
+  )
+  capture_job_context(
+    session,
+    root_context_from_identity(
+      tenant=_TENANT,
+      job_id="agent-run-123",
+      tool_ids=None,
+      withheld_tools=frozenset(),
+      research_binding=AdmittedResearchBinding(research_file_id=2),
+      approval_route=NO_APPROVAL_ROUTE,
+    ),
+  )
   return ToolDispatcher(
     mcp_client=mcp,
     session_id="session-123",
@@ -190,12 +222,13 @@ def _dispatcher(
     channel="excel",
     role="owner",
     mcp_meta_inject_servers=frozenset({"idea-workbench-mcp"}),
+    session=session,
     run_context=RunContext(
       user_id="sia-alice",
       request_id="request-123",
       session_id="session-123",
       run_id="agent-run-123",
-      profile=skill or "quant-research",
+      profile=skill or "analyst",
       channel="excel",
       skill=skill,
       admitted_skill_execution_limits=_limits_for_skill(skill),
@@ -1158,3 +1191,373 @@ def test_claim_rejects_fields_the_server_cannot_accept(
 
   with pytest.raises(InvestmentCapabilityClaimError):
     issue_investment_capability_claim(**inputs)
+
+
+
+
+@pytest.mark.parametrize("tool_name", sorted(INVESTMENT_JOB_PRINCIPAL_TOOLS))
+def test_job_principal_claim_is_exact_and_requires_no_business_skill_grant(
+  monkeypatch: pytest.MonkeyPatch,
+  tool_name: str,
+) -> None:
+  _set_signing_key(monkeypatch)
+  configure_investment_capability_grants({})
+  token = issue_investment_job_principal_claim(
+    user_id="42",
+    tenant=_TENANT,
+    session_id="session-123",
+    channel="excel",
+    tool_name=tool_name,
+    request_id="request-123",
+    jti="tool-call-123",
+    now=1_800_000_000,
+  )
+  header, payload = _decode_claim(token)
+  assert INVESTMENT_JOB_PRINCIPAL_TOOLS == frozenset({
+    "submit_research_task", "send_research_task_message",
+    "start_research_pipeline", "start_research_benchmark",
+  })
+  assert INVESTMENT_JOB_PRINCIPAL_TOOLS.isdisjoint(INVESTMENT_CAPABILITY_FACADE_TOOLS)
+  assert header == {"alg": "EdDSA", "kid": _KEY_ID, "typ": "JWT"}
+  assert payload == {
+    "aud": "investment-tools",
+    "channel": "excel",
+    "exp": 1_800_000_060,
+    "iat": 1_800_000_000,
+    "iss": "ai-excel-addin",
+    "jti": "tool-call-123",
+    "kind": "job_principal",
+    "request_id": "request-123",
+    "session_id": "session-123",
+    "sub": "42",
+    "tenant": _TENANT.model_dump(mode="json"),
+    "tool_name": tool_name,
+    "user_id": "42",
+    "v": 3,
+  }
+  signing_input, supplied_signature = token.rsplit(".", 1)
+  signature_bytes = base64.urlsafe_b64decode(
+    supplied_signature + "=" * (-len(supplied_signature) % 4)
+  )
+  _PUBLIC_KEY.verify(signature_bytes, signing_input.encode("ascii"))
+
+
+@pytest.mark.parametrize(
+  ("tenant", "tool_name"),
+  [(None, "submit_research_task"), (_TENANT, "start_investment_run")],
+)
+def test_job_principal_claim_requires_authenticated_tenant_and_exact_control(
+  monkeypatch: pytest.MonkeyPatch,
+  tenant: AdmittedTenant | None,
+  tool_name: str,
+) -> None:
+  _set_signing_key(monkeypatch)
+  with pytest.raises(InvestmentCapabilityClaimError):
+    issue_investment_job_principal_claim(
+      user_id="42",
+      tenant=tenant,
+      session_id="session-123",
+      channel="excel",
+      tool_name=tool_name,
+      request_id="request-123",
+      jti="tool-call-123",
+    )
+
+
+@pytest.mark.parametrize("tool_name", sorted(INVESTMENT_JOB_PRINCIPAL_TOOLS))
+@pytest.mark.parametrize("active_skill", [False, True])
+def test_owner_dispatch_uses_job_principal_with_or_without_active_skill(
+  monkeypatch: pytest.MonkeyPatch,
+  tool_name: str,
+  active_skill: bool,
+) -> None:
+  _set_signing_key(monkeypatch)
+  configure_investment_capability_grants({})
+  skill = (
+    ActiveSkillAdmission("quant-research", SkillExecutionLimits(32_000))
+    if active_skill else None
+  )
+  token = set_current_skill(skill)
+  try:
+    mcp = _FakeMcpClient(tool_name=tool_name)
+    result, error = _dispatch(
+      _dispatcher(mcp, skill=None),
+      tool_call_id="call-job-principal",
+      tool_name=tool_name,
+    )
+  finally:
+    reset_current_skill(token)
+  assert error is None
+  assert result == {"ok": True}
+  assert len(mcp.calls) == 1
+  signed_claim = mcp.calls[0]["meta"]["investment_capability_claim"]
+  _header, payload = _decode_claim(signed_claim)
+  assert payload["v"] == 3
+  assert payload["kind"] == "job_principal"
+  assert payload["tool_name"] == tool_name
+  assert payload["sub"] == payload["user_id"] == "42"
+  assert payload["tenant"] == _TENANT.model_dump(mode="json")
+  assert payload["tenant"]["storage_id"] != payload["sub"]
+  assert payload["jti"] == "call-job-principal"
+  assert not {"skill", "allowed_capability_ids", "effect_classes", "approved_budget"} & payload.keys()
+  signing_input, supplied_signature = signed_claim.rsplit(".", 1)
+  _PUBLIC_KEY.verify(
+    base64.urlsafe_b64decode(supplied_signature + "=" * (-len(supplied_signature) % 4)),
+    signing_input.encode("ascii"),
+  )
+
+
+@pytest.mark.parametrize("tool_name", sorted(INVESTMENT_JOB_PRINCIPAL_TOOLS))
+def test_sessionless_job_dispatch_returns_typed_issuer_unavailable(
+  monkeypatch: pytest.MonkeyPatch,
+  tool_name: str,
+) -> None:
+  _set_signing_key(monkeypatch)
+  configure_investment_capability_grants({})
+  mcp = _FakeMcpClient(tool_name=tool_name)
+  dispatcher = ToolDispatcher(
+    mcp_client=mcp,
+    session=None,
+    session_id="sessionless-request",
+    user_id="sia-alice",
+    risk_user_id=42,
+    channel="excel",
+    role="owner",
+    mcp_meta_inject_servers=frozenset({"idea-workbench-mcp"}),
+    run_context=RunContext(
+      user_id="sia-alice",
+      request_id="request-sessionless",
+      session_id="sessionless-request",
+      run_id="sessionless-job",
+      profile="analyst",
+      channel="excel",
+    ),
+  )
+  result, error = _dispatch(
+    dispatcher, tool_call_id="call-sessionless-job", tool_name=tool_name,
+  )
+  assert result is None
+  assert error is not None
+  assert error["code"] == "investment_capability_claim_unavailable"
+  assert mcp.calls == []
+
+
+@pytest.mark.parametrize("tool_name", sorted(INVESTMENT_JOB_PRINCIPAL_TOOLS))
+def test_session_without_admitted_tenant_cannot_mint_job_principal(
+  monkeypatch: pytest.MonkeyPatch,
+  tool_name: str,
+) -> None:
+  _set_signing_key(monkeypatch)
+  mcp = _FakeMcpClient(tool_name=tool_name)
+  dispatcher = _dispatcher(mcp, skill=None)
+  capture_job_context(
+    dispatcher._session,
+    root_context_from_identity(
+      tenant=None,
+      job_id="agent-run-123",
+      tool_ids=None,
+      withheld_tools=frozenset(),
+      research_binding=AdmittedResearchBinding(),
+      approval_route=NO_APPROVAL_ROUTE,
+    ),
+  )
+  result, error = _dispatch(
+    dispatcher, tool_call_id="call-unowned-job", tool_name=tool_name,
+  )
+  assert result is None
+  assert error is not None
+  assert error["code"] == "investment_capability_claim_unavailable"
+  assert mcp.calls == []
+
+
+@pytest.mark.parametrize("tool_name", sorted(INVESTMENT_JOB_PRINCIPAL_TOOLS))
+@pytest.mark.parametrize("tenant", [_TENANT, None])
+def test_sessionless_dispatch_identity_retains_actual_admitted_tenant(
+  monkeypatch: pytest.MonkeyPatch,
+  tool_name: str,
+  tenant: AdmittedTenant | None,
+) -> None:
+  _set_signing_key(monkeypatch)
+  configure_investment_capability_grants({})
+  admitted = root_context_from_identity(
+    tenant=tenant,
+    job_id="sessionless-owned-job",
+    tool_ids=None,
+    withheld_tools=frozenset(),
+    research_binding=AdmittedResearchBinding(),
+    approval_route=NO_APPROVAL_ROUTE,
+  )
+  identity = DispatchIdentity(
+    context=admitted if tenant is not None else None,
+    execution=None,
+    session=None,
+    user_id="sia-alice",
+    risk_user_id=42,
+    channel="excel",
+  )
+  mcp = _FakeMcpClient(tool_name=tool_name)
+  dispatcher = ToolDispatcher(
+    mcp_client=mcp,
+    identity=identity,
+    session_id="sessionless-request",
+    role="owner",
+    mcp_meta_inject_servers=frozenset({"idea-workbench-mcp"}),
+    run_context=RunContext(
+      user_id="sia-alice",
+      request_id="request-sessionless-owned",
+      session_id="sessionless-request",
+      run_id=admitted.job_id,
+      profile="analyst",
+      channel="excel",
+    ),
+  )
+  result, error = _dispatch(
+    dispatcher, tool_call_id="call-sessionless-owned", tool_name=tool_name,
+  )
+  if tenant is None:
+    assert result is None
+    assert error is not None
+    assert error["code"] == "investment_capability_claim_unavailable"
+    assert mcp.calls == []
+    return
+  assert error is None
+  assert result == {"ok": True}
+  assert len(mcp.calls) == 1
+  signed_claim = mcp.calls[0]["meta"]["investment_capability_claim"]
+  _header, payload = _decode_claim(signed_claim)
+  assert payload["v"] == 3
+  assert payload["kind"] == "job_principal"
+  assert payload["tool_name"] == tool_name
+  assert payload["tenant"] == tenant.model_dump(mode="json")
+  assert payload["sub"] == payload["user_id"] == "42"
+  assert payload["tenant"]["storage_id"] != payload["sub"]
+  assert not {"skill", "allowed_capability_ids", "effect_classes", "approved_budget"} & payload.keys()
+  signing_input, supplied_signature = signed_claim.rsplit(".", 1)
+  _PUBLIC_KEY.verify(
+    base64.urlsafe_b64decode(supplied_signature + "=" * (-len(supplied_signature) % 4)),
+    signing_input.encode("ascii"),
+  )
+
+
+@pytest.mark.parametrize("tool_name", sorted(INVESTMENT_JOB_PRINCIPAL_TOOLS))
+def test_in_process_child_context_precedes_parent_credential_session(
+  monkeypatch: pytest.MonkeyPatch,
+  tool_name: str,
+) -> None:
+  from dataclasses import replace
+
+  from agent_workflow_contracts import CatalogToolEntry, PlatformToolCatalog, SemanticCapabilityRequirement
+  from agent_gateway.admission import (
+    AdmittedContext, AdmissionOwners, OperationRegistration, SpawnRequest,
+    admit, context_for_child, current_parent_context,
+  )
+  from agent_gateway.capability_resolution import OperationDeclaration, resolve_operation_authority
+  from agent_gateway.semantic_capability_routing import capability_for_tool
+  from gateway_test_support.capability_execution_test_support import stub_capability_execution_resolver
+
+  _set_signing_key(monkeypatch)
+  configure_investment_capability_grants({})
+  mcp = _FakeMcpClient(tool_name=tool_name)
+  parent_dispatcher = _dispatcher(mcp, skill=None)
+  parent_session = parent_dispatcher._session
+  assert isinstance(parent_session, GatewaySession)
+  parent_context = current_parent_context(parent_session)
+  control_capability = capability_for_tool(
+    canonical_name=mcp.get_original_tool_name(tool_name),
+    server_id=mcp.get_server_for_tool(tool_name),
+    effect="write",
+  )
+  assert control_capability is not None
+  catalog = PlatformToolCatalog(tools=(
+    CatalogToolEntry(
+      tool_id=tool_name,
+      canonical_name=tool_name,
+      origin="mcp",
+      server_id="idea-workbench-mcp",
+      effect="write",
+      capability=control_capability,
+    ),
+  ))
+  parent_context = replace(
+    parent_context, tool_ids=frozenset(entry.tool_id for entry in catalog.tools),
+  )
+  capture_job_context(parent_session, parent_context)
+  assert parent_context.tool_ids == frozenset({tool_name})
+  declaration = OperationDeclaration(
+    operation_name="explore",
+    grant_id="grant:child-job-control",
+    workspace_scope="workspace_write",
+    tool_ceiling=frozenset({tool_name}),
+    required_capabilities=(
+      SemanticCapabilityRequirement(name=control_capability, binding_modes=("live_tool",)),
+    ),
+  )
+  admitted = admit(
+    SpawnRequest(operation="explore", task="Control the owned research job"),
+    parent_context,
+    owners=AdmissionOwners(
+      operation=OperationRegistration(
+        name="explore",
+        execution_class="node.explore",
+        route_ceiling=frozenset({tool_name}),
+        operation_routes=frozenset(),
+      ),
+      capability_execution_resolver=stub_capability_execution_resolver(
+        default_provider="openai", default_model="gpt-5.6-sol", default_effort="high",
+      ),
+      session=parent_session,
+      route_registered=lambda route_id: route_id == tool_name,
+      resolve_tool_authority=lambda tool_ids: resolve_operation_authority(
+        replace(declaration, tool_ceiling=tool_ids), catalog=catalog,
+      ),
+      placement="in_process",
+    ),
+  )
+  assert isinstance(admitted, AdmittedContext)
+  child_context = context_for_child(admitted, job_id="actual-child-job")
+  assert child_context.tenant is not None
+  assert child_context.depth == parent_context.depth + 1
+  assert child_context.tool_ids == frozenset({tool_name})
+  assert child_context.job_id != parent_context.job_id
+  identity = DispatchIdentity(
+    context=child_context,
+    execution=None,
+    session=parent_session,
+    user_id=_TENANT.storage_id,
+    risk_user_id=42,
+    channel="excel",
+  )
+  child_dispatcher = ToolDispatcher(
+    mcp_client=mcp,
+    identity=identity,
+    session_id=parent_session.session_id,
+    role="owner",
+    mcp_meta_inject_servers=frozenset({"idea-workbench-mcp"}),
+    run_context=RunContext(
+      user_id=_TENANT.storage_id,
+      request_id="request-child-control",
+      session_id=parent_session.session_id,
+      run_id=child_context.job_id,
+      profile="analyst",
+      channel="excel",
+    ),
+  )
+  executing_context = child_dispatcher._executing_context()
+  assert executing_context is not None
+  assert executing_context is child_context
+  assert executing_context.job_id == "actual-child-job"
+  assert current_parent_context(parent_session) is parent_context
+  assert current_parent_context(parent_session).job_id == "agent-run-123"
+  result, error = _dispatch(
+    child_dispatcher, tool_call_id="call-child-control", tool_name=tool_name,
+  )
+  assert error is None
+  assert result == {"ok": True}
+  assert len(mcp.calls) == 1
+  _header, payload = _decode_claim(mcp.calls[0]["meta"]["investment_capability_claim"])
+  assert payload["v"] == 3
+  assert payload["kind"] == "job_principal"
+  assert payload["tenant"] == child_context.tenant.model_dump(mode="json")
+  assert payload["sub"] == "42"
+  assert payload["tool_name"] == tool_name
+  assert current_parent_context(parent_session).job_id == "agent-run-123"

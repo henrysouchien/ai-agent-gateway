@@ -196,6 +196,39 @@ def test_generate_and_append_summary_skips_summary_only_slice(tmp_path: Path) ->
   assert len(summaries) == 1
 
 
+def test_summary_over_a_fork_seed_receives_the_inherited_conversation(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "fork.jsonl")
+  _run(log.append({
+    "type": "fork_seed",
+    "source_log_path": str(tmp_path / "source.jsonl"),
+    "messages": [
+      {"role": "user", "content": "Remember the codeword PELICAN."},
+      {"role": "assistant", "content": [{"type": "text", "text": "Noted: PELICAN."}]},
+    ],
+  }))
+  prompts: list[str] = []
+
+  async def _summarize(prompt_text: str) -> str:
+    prompts.append(prompt_text)
+    return "The user set the codeword PELICAN."
+
+  _run(
+    generate_and_append_summary(
+      log,
+      from_seq=1,
+      to_seq=1,
+      prompt="Summarize the analyst session.",
+      capability_execution=_execution(),
+      summarize_fn=_summarize,
+    )
+  )
+
+  [prompt_text] = prompts
+  assert "user: Remember the codeword PELICAN." in prompt_text
+  assert "assistant: Noted: PELICAN." in prompt_text
+
+
+
 def test_generate_and_append_summary_is_orthogonal_to_compaction_content_blocks(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "compaction-block.jsonl")
   _run(

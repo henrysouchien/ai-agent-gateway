@@ -404,6 +404,7 @@ async def run_approval_lifecycle(
   *,
   route: ApprovalRoute,
   session: Any | None,
+  producer_session: Any | None,
   tool_call_id: str,
   tool_name: str,
   tool_input: dict[str, Any],
@@ -438,7 +439,8 @@ async def run_approval_lifecycle(
   secret_boundary: SecretBoundary | None = None,
 ) -> dict[str, Any]:
   arguments = dict(locals())
-  batch_admission = acquire_batch_approval_admission(session)
+  # Batch scope belongs to the executing producer, not its parent's ledger.
+  batch_admission = acquire_batch_approval_admission(arguments.pop("producer_session"))
   arguments["batch_admission"] = batch_admission
   try:
     return await _run_approval_lifecycle_impl(**arguments)

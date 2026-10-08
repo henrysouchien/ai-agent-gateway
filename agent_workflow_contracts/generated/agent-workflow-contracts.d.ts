@@ -372,7 +372,7 @@ export type ExecuteTaskDisposition = {
 };
 
 export type ExecutionSettlement = {
-  readonly "status": "succeeded" | "failed" | "interrupted" | "cancelled" | "skipped";
+  readonly "status": "succeeded" | "failed" | "interrupted" | "cancelled" | "skipped" | "awaiting_approval";
   readonly "terminal_reason"?: (string) | (null);
 };
 
@@ -553,7 +553,7 @@ export type SettleWithoutExecutionDisposition = {
 };
 
 export type SettlementProjection = {
-  readonly "execution_status": "succeeded" | "failed" | "interrupted" | "cancelled" | "skipped";
+  readonly "execution_status": "succeeded" | "failed" | "interrupted" | "cancelled" | "skipped" | "awaiting_approval";
   readonly "outcome_disposition"?: ("complete" | "partial" | "insufficient_evidence" | "blocked" | "not_assessed") | (null);
   readonly "terminal_reason"?: (string) | (null);
 };

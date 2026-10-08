@@ -1072,7 +1072,7 @@ def test_create_agent_inline_mcp_uses_inline_only_config_and_builtin_filtering(
 
 def test_create_agent_skills_dir_registers_run_agent_handler_tool_def_and_builtin_name(tmp_path: Path) -> None:
   skills_dir = tmp_path / "skills"
-  _write_skill(skills_dir, "deep-research", "Research deeply.")
+  _write_skill(skills_dir, "deep-research", "---\nname: deep-research\nexecution_class: node.implement\n---\nResearch deeply.")
 
   app = create_agent(
     "test",
@@ -1232,7 +1232,7 @@ def test_create_agent_forwards_needs_approval() -> None:
 
 def test_create_agent_skills_dir_does_not_duplicate_user_run_agent_tool_definition(tmp_path: Path) -> None:
   skills_dir = tmp_path / "skills"
-  _write_skill(skills_dir, "deep-research", "Research deeply.")
+  _write_skill(skills_dir, "deep-research", "---\nname: deep-research\nexecution_class: node.implement\n---\nResearch deeply.")
   tool_def = {
     "name": "run_agent",
     "description": "custom",
@@ -1259,7 +1259,7 @@ def test_create_agent_skills_dir_respects_custom_run_agent_handler_override(tmp_
     return {"override": True}, None
 
   skills_dir = tmp_path / "skills"
-  _write_skill(skills_dir, "deep-research", "Research deeply.")
+  _write_skill(skills_dir, "deep-research", "---\nname: deep-research\nexecution_class: node.implement\n---\nResearch deeply.")
   app = create_agent(
     "test",
     api_key="test-key",
@@ -1284,6 +1284,7 @@ def test_create_agent_skills_dir_dispatches_bound_child_execution(
     "deep-research",
     """---
 name: deep-research
+execution_class: node.implement
 version: '1.0'
 agent_callable: true
 agent_description: Exercise exact child execution binding.
@@ -1372,7 +1373,7 @@ def test_create_agent_rejects_request_model_outside_driver_policy(
   tmp_path: Path,
 ) -> None:
   skills_dir = tmp_path / "skills"
-  _write_skill(skills_dir, "deep-research", "Research deeply.")
+  _write_skill(skills_dir, "deep-research", "---\nname: deep-research\nexecution_class: node.implement\n---\nResearch deeply.")
   app = create_agent(
     "test",
     model_key="anthropic.claude-haiku-5-5",

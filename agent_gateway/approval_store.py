@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 import hashlib
 import logging
@@ -14,6 +14,8 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, TYPE_CHECKING
+
+from agent_workflow_contracts import AgentCompletionEnvelope, TaskResult
 
 from . import approval_store_rows as _rows
 from . import prepared_business_model_store as _prepared_bm
@@ -33,12 +35,16 @@ from .approval_policy import (
   ApprovalVote,
   DelegationGrant,
   PersistentGrant,
+  approval_is_executable,
+  canonical_json_strict,
   revalidate_approval_request,
   utc_now,
 )
+from .tool_policy_registry import PreparedToolCall as CanonicalPreparedToolCall
 
 if TYPE_CHECKING:
   from .approval_audit import AuditEventType
+  from .tool_dispatcher_helpers import ToolResult
 
 
 class _ApprovalAuditEmitter(Protocol):
@@ -777,6 +783,214 @@ class PersistentGrantCancellationFenced(RuntimeError):
   """A grant cannot become visible after its approval entered cancellation."""
 
 
+ApprovalExecutableBindingErrorCode = Literal[
+  "missing_binding",
+  "nonce_mismatch",
+  "tenant_mismatch",
+  "call_identity_mismatch",
+  "operand_mismatch",
+  "decision_mismatch",
+  "execution_outcome_unknown",
+  "claim_token_mismatch",
+  "result_mismatch",
+]
+
+
+class ApprovalExecutableBindingError(ValueError):
+  """Private approval identity or operand integrity failed without exposing input."""
+
+  def __init__(self, code: ApprovalExecutableBindingErrorCode) -> None:
+    self.code = code
+    super().__init__(f"approval executable binding: {code}")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ExecutableApprovalBinding:
+  """Executor-only operands; never a public approval projection or audit payload."""
+
+  approval_id: str
+  job_id: str
+  tool_call_id: str
+  nonce: str
+  tenant_storage_id: str
+  tool_name: str
+  prepared_input: Mapping[str, object] = field(repr=False)
+  dispatch_context: Mapping[str, object] = field(repr=False)
+  exact_backend: str | None
+  credential_generation_ref: str | None
+  operand_digest: str
+
+  def __post_init__(self) -> None:
+    try:
+      prepared = CanonicalPreparedToolCall(
+        prepared_input=self.prepared_input,
+        exact_backend=self.exact_backend,
+      )
+      context = CanonicalPreparedToolCall(prepared_input=self.dispatch_context)
+    except (TypeError, ValueError):
+      raise ApprovalExecutableBindingError("operand_mismatch") from None
+    object.__setattr__(self, "prepared_input", prepared.prepared_input)
+    object.__setattr__(self, "dispatch_context", context.prepared_input)
+
+
+def _executable_operand_digest(
+  metadata: Mapping[str, Any] | sqlite3.Row,
+  prepared_input: dict[str, object],
+  dispatch_context: dict[str, object],
+) -> str:
+  # Identity is included so corrupted metadata cannot rebind valid operand bytes.
+  envelope = {
+    key: metadata[key]
+    for key in (
+      "approval_id",
+      "job_id",
+      "tool_call_id",
+      "nonce",
+      "tenant_storage_id",
+      "tool_name",
+      "exact_backend",
+      "credential_generation_ref",
+      "request_args_hash",
+    )
+  }
+  envelope["prepared_input"] = prepared_input
+  envelope["dispatch_context"] = dispatch_context
+  return "sha256:" + hashlib.sha256(
+    _rows.identity_json_dumps(envelope).encode("utf-8")
+  ).hexdigest()
+
+
+def _executable_result_digest(
+  binding: ExecutableApprovalBinding,
+  claim_token: str,
+  decision_state_version: int,
+  result_json: str,
+) -> str:
+  envelope = {
+    "operand_digest": binding.operand_digest,
+    "claim_token": claim_token,
+    "decision_state_version": decision_state_version,
+    "result_json": result_json,
+  }
+  return "sha256:" + hashlib.sha256(
+    _rows.identity_json_dumps(envelope).encode("utf-8")
+  ).hexdigest()
+
+
+def _executable_result_json(tool_result: ToolResult) -> str:
+  value, error = tool_result
+  kind = "json"
+  if isinstance(value, AgentCompletionEnvelope):
+    kind = "AgentCompletionEnvelope"
+    value = value.model_dump(mode="json")
+  elif isinstance(value, TaskResult):
+    kind = "TaskResult"
+    value = value.model_dump(mode="json")
+  # Keep the owner's typed result and private child evidence, rather than the
+  # runner's later public/model-bound projection or a lossy default=str encoding.
+  return canonical_json_strict([{"kind": kind, "value": value}, error])
+
+
+def _restore_executable_result(value: dict[str, Any]) -> Any:
+  if set(value) != {"kind", "value"}:
+    raise ApprovalExecutableBindingError("result_mismatch")
+  if value["kind"] == "json":
+    return value["value"]
+  if value["kind"] == "AgentCompletionEnvelope":
+    return AgentCompletionEnvelope.model_validate(value["value"])
+  if value["kind"] == "TaskResult":
+    return TaskResult.model_validate(value["value"])
+  raise ApprovalExecutableBindingError("result_mismatch")
+
+
+def _verify_executable_request_identity(
+  metadata: Mapping[str, Any] | sqlite3.Row,
+  request: ApprovalRequest,
+) -> None:
+  if request.user_id != metadata["tenant_storage_id"]:
+    raise ApprovalExecutableBindingError("tenant_mismatch")
+  if (
+    request.approval_id != metadata["approval_id"]
+    or request.tool_call_id != metadata["tool_call_id"]
+    or request.tool_name != metadata["tool_name"]
+  ):
+    raise ApprovalExecutableBindingError("call_identity_mismatch")
+  if request.args_hash != metadata["request_args_hash"]:
+    raise ApprovalExecutableBindingError("operand_mismatch")
+
+
+RootTurnRecordErrorCode = Literal[
+  "missing_root_turn", "tenant_mismatch", "snapshot_mismatch", "turn_link_mismatch",
+]
+
+
+class RootTurnRecordError(ValueError):
+  """Private root custody failed without exposing the retained authority."""
+
+  def __init__(self, code: RootTurnRecordErrorCode) -> None:
+    self.code = code
+    super().__init__(f"approval root turn: {code}")
+
+
+@dataclass(frozen=True, slots=True)
+class RootTurnExecutableRef:
+  tool_call_id: str
+  nonce: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class RootTurnRecord:
+  """Executor-only authority; JSON contains references, never credential material."""
+
+  job_id: str
+  turn_id: str
+  tenant_storage_id: str
+  capability_bind_json: str
+  credential_generation_ref: str | None
+  effective_grant_json: str
+  routes_json: str
+  grant_routes_digest: str
+  research_binding_json: str
+  selection_snapshot_json: str
+  approval_route_kind: str
+  policy_generation_ref: str
+  created_at: datetime
+  executable_refs: tuple[RootTurnExecutableRef, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyGeneration:
+  generation_ref: str
+  policy_id: str
+  policy_version: str
+  policy_bundle_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyGenerationMismatch:
+  recorded: str
+  current: str
+  code: Literal["approval_policy_generation_mismatch"] = (
+    "approval_policy_generation_mismatch"
+  )
+
+
+def verify_policy_generation(
+  recorded: str,
+  current: str,
+) -> PolicyGenerationMismatch | None:
+  """Compare canonical generation references; the caller owns restore behavior."""
+  if recorded == current:
+    return None
+  return PolicyGenerationMismatch(recorded=recorded, current=current)
+
+
+def _root_turn_snapshot_digest(snapshot: Mapping[str, Any]) -> str:
+  return "sha256:" + hashlib.sha256(
+    _rows.identity_json_dumps(dict(snapshot)).encode("utf-8")
+  ).hexdigest()
+
+
 class PreparedReconciliationConflict(StrEnum):
   MISSING_APPROVAL = "missing_approval"
   UNKNOWN_APPROVAL_STATE = "unknown_approval_state"
@@ -880,6 +1094,47 @@ class ApprovalRequestStore(Protocol):
     self,
     request: ApprovalRequest,
   ) -> tuple[ApprovalRequest, bool]: ...
+  async def record_executable_binding(
+    self,
+    *,
+    approval_id: str,
+    job_id: str,
+    tool_call_id: str,
+    nonce: str,
+    tenant_storage_id: str,
+    tool_name: str,
+    prepared_call: CanonicalPreparedToolCall,
+    dispatch_context: Mapping[str, object],
+    credential_generation_ref: str | None,
+  ) -> None: ...
+  async def _read_executable_binding_for_executor(
+    self,
+    *,
+    job_id: str,
+    tool_call_id: str,
+    nonce: str,
+    tenant_storage_id: str,
+  ) -> tuple[ExecutableApprovalBinding, ApprovalRequest]: ...
+  async def _read_completed_executable_result_for_executor(
+    self,
+    *,
+    binding: ExecutableApprovalBinding,
+  ) -> ToolResult | None: ...
+  async def _claim_executable_binding_for_executor(
+    self,
+    *,
+    binding: ExecutableApprovalBinding,
+    decision_state_version: int,
+    claim_token: str,
+  ) -> ToolResult | None: ...
+  async def _complete_executable_binding_for_executor(
+    self,
+    *,
+    binding: ExecutableApprovalBinding,
+    decision_state_version: int,
+    claim_token: str,
+    tool_result: ToolResult,
+  ) -> None: ...
   async def get(self, approval_id: str) -> ApprovalRequest | None: ...
   async def get_by_tool_call_id(self, tool_call_id: str) -> ApprovalRequest | None: ...
   async def update_request(self, request: ApprovalRequest) -> ApprovalRequest: ...
@@ -1190,6 +1445,60 @@ class SQLiteApprovalStore:
         CREATE INDEX IF NOT EXISTS idx_approval_requests_state_expires
           ON approval_requests(state, expires_at);
 
+        CREATE TABLE IF NOT EXISTS approval_executable_bindings (
+          approval_id TEXT PRIMARY KEY
+            REFERENCES approval_requests(approval_id) ON DELETE CASCADE,
+          job_id TEXT NOT NULL,
+          tool_call_id TEXT NOT NULL,
+          nonce TEXT NOT NULL,
+          tenant_storage_id TEXT NOT NULL,
+          tool_name TEXT NOT NULL,
+          prepared_input_json TEXT NOT NULL,
+          dispatch_context_json TEXT NOT NULL,
+          exact_backend TEXT,
+          credential_generation_ref TEXT,
+          request_args_hash TEXT NOT NULL,
+          operand_digest TEXT NOT NULL,
+          execution_state TEXT NOT NULL DEFAULT 'unclaimed'
+            CHECK (execution_state IN ('unclaimed', 'claimed', 'completed')),
+          execution_claim_token TEXT,
+          execution_decision_state_version INTEGER,
+          execution_result_json TEXT,
+          execution_result_digest TEXT,
+          UNIQUE(job_id, tool_call_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS approval_policy_generations (
+          generation_ref TEXT PRIMARY KEY,
+          policy_id TEXT NOT NULL,
+          policy_version TEXT NOT NULL,
+          policy_bundle_hash TEXT NOT NULL,
+          is_current INTEGER NOT NULL DEFAULT 0 CHECK (is_current IN (0, 1)),
+          UNIQUE (policy_id, policy_version, policy_bundle_hash)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_policy_current_generation
+          ON approval_policy_generations(is_current) WHERE is_current = 1;
+
+        CREATE TABLE IF NOT EXISTS approval_root_turns (
+          job_id TEXT NOT NULL,
+          turn_id TEXT NOT NULL,
+          tenant_storage_id TEXT NOT NULL,
+          capability_bind_json TEXT NOT NULL,
+          credential_generation_ref TEXT,
+          effective_grant_json TEXT NOT NULL,
+          routes_json TEXT NOT NULL,
+          grant_routes_digest TEXT NOT NULL,
+          research_binding_json TEXT NOT NULL,
+          selection_snapshot_json TEXT NOT NULL,
+          approval_route_kind TEXT NOT NULL,
+          policy_generation_ref TEXT NOT NULL
+            REFERENCES approval_policy_generations(generation_ref),
+          created_at TEXT NOT NULL,
+          snapshot_digest TEXT NOT NULL,
+          executable_refs_json TEXT NOT NULL DEFAULT '[]',
+          PRIMARY KEY (job_id, turn_id)
+        );
+
         CREATE TABLE IF NOT EXISTS approval_votes (
           vote_id TEXT PRIMARY KEY,
           approval_id TEXT NOT NULL REFERENCES approval_requests(approval_id) ON DELETE CASCADE,
@@ -1432,6 +1741,26 @@ class SQLiteApprovalStore:
           )
       _prepared_bm.ensure_schema(conn)
       _raw_patch_auth.ensure_schema(conn)
+      executable_columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(approval_executable_bindings)")
+      }
+      execution_columns = {
+        "execution_state": (
+          "TEXT NOT NULL DEFAULT 'unclaimed' "
+          "CHECK (execution_state IN ('unclaimed', 'claimed', 'completed'))"
+        ),
+        "execution_claim_token": "TEXT",
+        "execution_decision_state_version": "INTEGER",
+        "execution_result_json": "TEXT",
+        "execution_result_digest": "TEXT",
+      }
+      for column_name, column_type in execution_columns.items():
+        if column_name not in executable_columns:
+          conn.execute(
+            f"ALTER TABLE approval_executable_bindings "
+            f"ADD COLUMN {column_name} {column_type}"
+          )
 
   def _insert_request(
     self,
@@ -1616,6 +1945,737 @@ class SQLiteApprovalStore:
       await self._emit("request_created", stored_request)
     return stored_request, stored_record, created
 
+  async def record_policy_generation(
+    self,
+    *,
+    policy_id: str,
+    policy_version: str,
+    policy_bundle_hash: str,
+    make_current: bool = True,
+  ) -> PolicyGeneration:
+    """Record the existing policy tuple; assembly, not an approver, advances it."""
+    identity = {
+      "policy_id": policy_id,
+      "policy_version": policy_version,
+      "policy_bundle_hash": policy_bundle_hash,
+    }
+    generation = PolicyGeneration(
+      generation_ref="approval-policy:" + _root_turn_snapshot_digest(identity),
+      **identity,
+    )
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+          """
+          INSERT INTO approval_policy_generations (
+            generation_ref, policy_id, policy_version, policy_bundle_hash
+          ) VALUES (:generation_ref, :policy_id, :policy_version, :policy_bundle_hash)
+          ON CONFLICT(generation_ref) DO NOTHING
+          """,
+          {**identity, "generation_ref": generation.generation_ref},
+        )
+        row = conn.execute(
+          "SELECT * FROM approval_policy_generations WHERE generation_ref = ?",
+          (generation.generation_ref,),
+        ).fetchone()
+        if row is None or any(row[key] != value for key, value in identity.items()):
+          raise RootTurnRecordError("snapshot_mismatch")
+        if make_current:
+          conn.execute(
+            "UPDATE approval_policy_generations SET is_current = 0 WHERE is_current = 1"
+          )
+          conn.execute(
+            "UPDATE approval_policy_generations SET is_current = 1 WHERE generation_ref = ?",
+            (generation.generation_ref,),
+          )
+        conn.commit()
+    return generation
+
+  async def read_policy_generation(
+    self,
+    *,
+    generation_ref: str,
+  ) -> PolicyGeneration | None:
+    """Resolve an exact retained generation independently of the current pointer."""
+    async with self._lock:
+      with self._connection() as conn:
+        row = conn.execute(
+          """
+          SELECT generation_ref, policy_id, policy_version, policy_bundle_hash
+          FROM approval_policy_generations WHERE generation_ref = ?
+          """,
+          (generation_ref,),
+        ).fetchone()
+    return PolicyGeneration(**dict(row)) if row is not None else None
+
+  async def current_policy_generation(self) -> PolicyGeneration | None:
+    async with self._lock:
+      with self._connection() as conn:
+        row = conn.execute(
+          """
+          SELECT generation_ref, policy_id, policy_version, policy_bundle_hash
+          FROM approval_policy_generations WHERE is_current = 1
+          """
+        ).fetchone()
+    return PolicyGeneration(**dict(row)) if row is not None else None
+
+  async def record_root_turn(
+    self,
+    *,
+    job_id: str,
+    turn_id: str,
+    tenant_storage_id: str,
+    capability_bind: Mapping[str, object],
+    credential_generation_ref: str | None,
+    effective_grant: Mapping[str, object],
+    routes: Mapping[str, object],
+    research_binding: Mapping[str, object] | None,
+    selection_snapshot: Mapping[str, object],
+    approval_route_kind: str,
+    policy_generation_ref: str,
+    created_at: datetime | None = None,
+  ) -> None:
+    """Retain original root authority; an identical replay leaves it unchanged.
+
+    The launch producer supplies the secret-free CapabilityBind and the existing
+    canonical policy generation reference. Parked call refs attach separately,
+    since their identities do not exist when the root launches.
+    """
+    snapshot: dict[str, Any] = {
+      "job_id": job_id,
+      "turn_id": turn_id,
+      "tenant_storage_id": tenant_storage_id,
+      "credential_generation_ref": credential_generation_ref,
+      "approval_route_kind": approval_route_kind,
+      "policy_generation_ref": policy_generation_ref,
+    }
+    try:
+      snapshot.update(
+        capability_bind_json=_rows.identity_json_dumps(dict(capability_bind)),
+        effective_grant_json=_rows.identity_json_dumps(dict(effective_grant)),
+        routes_json=_rows.identity_json_dumps(dict(routes)),
+        research_binding_json=_rows.identity_json_dumps(
+          dict(research_binding) if research_binding is not None else None
+        ),
+        selection_snapshot_json=_rows.identity_json_dumps(dict(selection_snapshot)),
+      )
+    except (TypeError, ValueError):
+      raise RootTurnRecordError("snapshot_mismatch") from None
+    snapshot["grant_routes_digest"] = _root_turn_snapshot_digest({
+      "effective_grant_json": snapshot["effective_grant_json"],
+      "routes_json": snapshot["routes_json"],
+    })
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+          "SELECT * FROM approval_root_turns WHERE job_id = ? AND turn_id = ?",
+          (job_id, turn_id),
+        ).fetchone()
+        if existing is not None:
+          if existing["tenant_storage_id"] != tenant_storage_id:
+            raise RootTurnRecordError("tenant_mismatch")
+          snapshot["created_at"] = (
+            _dt_to_text(created_at) if created_at is not None
+            else existing["created_at"]
+          )
+          if (
+            any(existing[key] != value for key, value in snapshot.items())
+            or existing["snapshot_digest"] != _root_turn_snapshot_digest(snapshot)
+          ):
+            raise RootTurnRecordError("snapshot_mismatch")
+        else:
+          snapshot["created_at"] = _dt_to_text(created_at or utc_now())
+          conn.execute(
+            """
+            INSERT INTO approval_root_turns (
+              job_id, turn_id, tenant_storage_id, capability_bind_json,
+              credential_generation_ref, effective_grant_json, routes_json,
+              grant_routes_digest, research_binding_json, selection_snapshot_json,
+              approval_route_kind, policy_generation_ref, created_at, snapshot_digest
+            ) VALUES (
+              :job_id, :turn_id, :tenant_storage_id, :capability_bind_json,
+              :credential_generation_ref, :effective_grant_json, :routes_json,
+              :grant_routes_digest, :research_binding_json, :selection_snapshot_json,
+              :approval_route_kind, :policy_generation_ref, :created_at, :snapshot_digest
+            )
+            """,
+            {**snapshot, "snapshot_digest": _root_turn_snapshot_digest(snapshot)},
+          )
+        conn.commit()
+
+  async def _read_root_turn_for_executor(
+    self,
+    *,
+    job_id: str,
+    turn_id: str,
+    tenant_storage_id: str,
+  ) -> RootTurnRecord | None:
+    """Select private authority only within the executor's original tenant."""
+    async with self._lock:
+      with self._connection() as conn:
+        row = conn.execute(
+          """
+          SELECT * FROM approval_root_turns
+          WHERE job_id = ? AND turn_id = ? AND tenant_storage_id = ?
+          """,
+          (job_id, turn_id, tenant_storage_id),
+        ).fetchone()
+    if row is None:
+      return None
+    snapshot = {
+      key: row[key] for key in row.keys()
+      if key not in {"snapshot_digest", "executable_refs_json"}
+    }
+    if row["snapshot_digest"] != _root_turn_snapshot_digest(snapshot):
+      raise RootTurnRecordError("snapshot_mismatch")
+    try:
+      for key in (
+        "capability_bind_json", "effective_grant_json", "routes_json",
+        "research_binding_json", "selection_snapshot_json",
+      ):
+        _rows.identity_json_loads(row[key])
+      refs = _rows.identity_json_loads(row["executable_refs_json"])
+      created_at = _dt_from_text(row["created_at"])
+      if created_at is None:
+        raise ValueError("missing creation time")
+      executable_refs = tuple(RootTurnExecutableRef(**ref) for ref in refs)
+    except (TypeError, ValueError):
+      raise RootTurnRecordError("snapshot_mismatch") from None
+    return RootTurnRecord(
+      **{key: value for key, value in snapshot.items() if key != "created_at"},
+      created_at=created_at,
+      executable_refs=executable_refs,
+    )
+
+  async def link_root_turn_executable_binding(
+    self,
+    *,
+    job_id: str,
+    turn_id: str,
+    tool_call_id: str,
+    nonce: str,
+    tenant_storage_id: str,
+  ) -> None:
+    """Attach refs only, before publishing an existing private parked binding."""
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        root = conn.execute(
+          """
+          SELECT tenant_storage_id, executable_refs_json FROM approval_root_turns
+          WHERE job_id = ? AND turn_id = ?
+          """,
+          (job_id, turn_id),
+        ).fetchone()
+        if root is None:
+          raise RootTurnRecordError("missing_root_turn")
+        if root["tenant_storage_id"] != tenant_storage_id:
+          raise RootTurnRecordError("tenant_mismatch")
+        binding = conn.execute(
+          """
+          SELECT nonce, tenant_storage_id FROM approval_executable_bindings
+          WHERE job_id = ? AND tool_call_id = ?
+          """,
+          (job_id, tool_call_id),
+        ).fetchone()
+        if binding is None:
+          raise ApprovalExecutableBindingError("missing_binding")
+        if binding["tenant_storage_id"] != tenant_storage_id:
+          raise ApprovalExecutableBindingError("tenant_mismatch")
+        if binding["nonce"] != nonce:
+          raise ApprovalExecutableBindingError("nonce_mismatch")
+        # Root turns share a job: each captured call belongs to exactly one turn.
+        linked = conn.execute(
+          """
+          SELECT root.turn_id FROM approval_root_turns AS root,
+            json_each(root.executable_refs_json) AS ref
+          WHERE root.job_id = ? AND json_extract(ref.value, '$.tool_call_id') = ?
+          """,
+          (job_id, tool_call_id),
+        ).fetchall()
+        if any(row["turn_id"] != turn_id for row in linked):
+          raise RootTurnRecordError("turn_link_mismatch")
+        ref = {"tool_call_id": tool_call_id, "nonce": nonce}
+        refs = _rows.identity_json_loads(root["executable_refs_json"])
+        if ref not in refs:
+          refs.append(ref)
+          conn.execute(
+            """
+            UPDATE approval_root_turns SET executable_refs_json = ?
+            WHERE job_id = ? AND turn_id = ?
+            """,
+            (_rows.identity_json_dumps(refs), job_id, turn_id),
+          )
+        conn.commit()
+
+  async def _locate_root_turn_for_approval(
+    self,
+    *,
+    approval_id: str,
+    tenant_storage_id: str,
+  ) -> tuple[str, str, str, str] | None:
+    """Derive job/call/nonce/turn from existing custody and root refs, not a roster."""
+    async with self._lock:
+      with self._connection() as conn:
+        rows = conn.execute(
+          """
+          SELECT binding.job_id, binding.tool_call_id, binding.nonce, root.turn_id
+          FROM approval_executable_bindings AS binding
+          JOIN approval_root_turns AS root
+            ON root.job_id = binding.job_id
+            AND root.tenant_storage_id = binding.tenant_storage_id
+          JOIN json_each(root.executable_refs_json) AS ref
+            ON json_extract(ref.value, '$.tool_call_id') = binding.tool_call_id
+            AND json_extract(ref.value, '$.nonce') = binding.nonce
+          WHERE binding.approval_id = ? AND binding.tenant_storage_id = ?
+          """,
+          (approval_id, tenant_storage_id),
+        ).fetchall()
+    if not rows:
+      return None
+    if len(rows) != 1:
+      raise RootTurnRecordError("turn_link_mismatch")
+    row = rows[0]
+    return row["job_id"], row["tool_call_id"], row["nonce"], row["turn_id"]
+
+  async def record_executable_binding(
+    self,
+    *,
+    approval_id: str,
+    job_id: str,
+    tool_call_id: str,
+    nonce: str,
+    tenant_storage_id: str,
+    tool_name: str,
+    prepared_call: CanonicalPreparedToolCall,
+    dispatch_context: Mapping[str, object],
+    credential_generation_ref: str | None,
+  ) -> None:
+    """Bind original executable bytes before publishing a parked approval.
+
+    Repeated writes must retain the same identity, nonce, operands and credential
+    generation. Credentials themselves never enter this private table.
+    """
+
+    metadata = {
+      "approval_id": approval_id,
+      "job_id": job_id,
+      "tool_call_id": tool_call_id,
+      "nonce": nonce,
+      "tenant_storage_id": tenant_storage_id,
+      "tool_name": tool_name,
+      "exact_backend": prepared_call.exact_backend,
+      "credential_generation_ref": credential_generation_ref,
+    }
+    if any(
+      type(metadata[key]) is not str or not metadata[key]
+      for key in (
+        "approval_id", "job_id", "tool_call_id", "nonce",
+        "tenant_storage_id", "tool_name",
+      )
+    ):
+      raise ApprovalExecutableBindingError("call_identity_mismatch")
+    if credential_generation_ref is not None and (
+      type(credential_generation_ref) is not str or not credential_generation_ref
+    ):
+      raise ApprovalExecutableBindingError("call_identity_mismatch")
+    try:
+      prepared_input = prepared_call.materialize_input()
+      prepared_input_json = _rows.identity_json_dumps(prepared_input)
+      context = CanonicalPreparedToolCall(
+        prepared_input=dispatch_context,
+      ).materialize_input()
+      dispatch_context_json = _rows.identity_json_dumps(context)
+    except (TypeError, ValueError):
+      raise ApprovalExecutableBindingError("operand_mismatch") from None
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        request_row = conn.execute(
+          "SELECT * FROM approval_requests WHERE approval_id = ?",
+          (approval_id,),
+        ).fetchone()
+        if request_row is None:
+          raise ApprovalExecutableBindingError("missing_binding")
+        request = self._row_to_request(request_row)
+        metadata["request_args_hash"] = request.args_hash
+        _verify_executable_request_identity(metadata, request)
+        operand_digest = _executable_operand_digest(
+          metadata, prepared_input, context,
+        )
+        existing = conn.execute(
+          """
+          SELECT approval_id, job_id, tool_call_id, nonce, tenant_storage_id,
+            tool_name, exact_backend, credential_generation_ref, request_args_hash,
+            operand_digest
+          FROM approval_executable_bindings
+          WHERE approval_id = ? OR (job_id = ? AND tool_call_id = ?)
+          """,
+          (approval_id, job_id, tool_call_id),
+        ).fetchone()
+        if existing is not None:
+          if existing["tenant_storage_id"] != tenant_storage_id:
+            raise ApprovalExecutableBindingError("tenant_mismatch")
+          if existing["nonce"] != nonce:
+            raise ApprovalExecutableBindingError("nonce_mismatch")
+          if any(
+            existing[key] != metadata[key]
+            for key in ("approval_id", "job_id", "tool_call_id", "tool_name")
+          ):
+            raise ApprovalExecutableBindingError("call_identity_mismatch")
+          if existing["operand_digest"] != operand_digest or any(
+            existing[key] != metadata[key]
+            for key in (
+              "exact_backend", "credential_generation_ref", "request_args_hash",
+            )
+          ):
+            raise ApprovalExecutableBindingError("operand_mismatch")
+          operand_row = conn.execute(
+            """
+            SELECT prepared_input_json, dispatch_context_json
+            FROM approval_executable_bindings WHERE approval_id = ?
+            """,
+            (approval_id,),
+          ).fetchone()
+          if operand_row is None or (
+            operand_row["prepared_input_json"] != prepared_input_json
+            or operand_row["dispatch_context_json"] != dispatch_context_json
+          ):
+            raise ApprovalExecutableBindingError("operand_mismatch")
+        else:
+          conn.execute(
+            """
+            INSERT INTO approval_executable_bindings (
+              approval_id, job_id, tool_call_id, nonce, tenant_storage_id,
+              tool_name, prepared_input_json, dispatch_context_json, exact_backend,
+              credential_generation_ref, request_args_hash, operand_digest
+            ) VALUES (
+              :approval_id, :job_id, :tool_call_id, :nonce, :tenant_storage_id,
+              :tool_name, :prepared_input_json, :dispatch_context_json, :exact_backend,
+              :credential_generation_ref, :request_args_hash, :operand_digest
+            )
+            """,
+            {
+              **metadata,
+              "prepared_input_json": prepared_input_json,
+              "dispatch_context_json": dispatch_context_json,
+              "operand_digest": operand_digest,
+            },
+          )
+        conn.commit()
+
+  async def _read_executable_binding_for_executor(
+    self,
+    *,
+    job_id: str,
+    tool_call_id: str,
+    nonce: str,
+    tenant_storage_id: str,
+  ) -> tuple[ExecutableApprovalBinding, ApprovalRequest]:
+    """Read exact operands and the canonical decision from one private snapshot."""
+
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN")
+        binding, request = self._read_executable_binding_locked(
+          conn,
+          job_id=job_id,
+          tool_call_id=tool_call_id,
+          nonce=nonce,
+          tenant_storage_id=tenant_storage_id,
+        )
+        conn.commit()
+    return binding, request
+
+  def _read_executable_binding_locked(
+    self,
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    tool_call_id: str,
+    nonce: str,
+    tenant_storage_id: str,
+  ) -> tuple[ExecutableApprovalBinding, ApprovalRequest]:
+    metadata = conn.execute(
+      """
+      SELECT approval_id, job_id, tool_call_id, nonce, tenant_storage_id,
+        tool_name, exact_backend, credential_generation_ref, request_args_hash,
+        operand_digest
+      FROM approval_executable_bindings
+      WHERE job_id = ? AND tool_call_id = ?
+      """,
+      (job_id, tool_call_id),
+    ).fetchone()
+    if metadata is None:
+      raise ApprovalExecutableBindingError("missing_binding")
+    if metadata["tenant_storage_id"] != tenant_storage_id:
+      raise ApprovalExecutableBindingError("tenant_mismatch")
+    if metadata["nonce"] != nonce:
+      raise ApprovalExecutableBindingError("nonce_mismatch")
+    request_row = conn.execute(
+      "SELECT * FROM approval_requests WHERE approval_id = ?",
+      (metadata["approval_id"],),
+    ).fetchone()
+    if request_row is None:
+      raise ApprovalExecutableBindingError("missing_binding")
+    request = self._row_to_request(request_row)
+    _verify_executable_request_identity(metadata, request)
+    # Select raw operands only after caller scope and request identity match.
+    operand_row = conn.execute(
+      """
+      SELECT prepared_input_json, dispatch_context_json
+      FROM approval_executable_bindings
+      WHERE approval_id = ? AND job_id = ? AND tool_call_id = ?
+        AND nonce = ? AND tenant_storage_id = ?
+      """,
+      (metadata["approval_id"], job_id, tool_call_id, nonce, tenant_storage_id),
+    ).fetchone()
+    if operand_row is None:
+      raise ApprovalExecutableBindingError("call_identity_mismatch")
+    try:
+      prepared_input = _rows.identity_json_loads(operand_row["prepared_input_json"])
+      context = _rows.identity_json_loads(operand_row["dispatch_context_json"])
+      if not isinstance(prepared_input, dict) or not isinstance(context, dict):
+        raise ApprovalExecutableBindingError("operand_mismatch")
+      digest = _executable_operand_digest(metadata, prepared_input, context)
+    except (TypeError, ValueError):
+      raise ApprovalExecutableBindingError("operand_mismatch") from None
+    if digest != metadata["operand_digest"]:
+      raise ApprovalExecutableBindingError("operand_mismatch")
+    binding = ExecutableApprovalBinding(
+      approval_id=metadata["approval_id"],
+      job_id=job_id,
+      tool_call_id=tool_call_id,
+      nonce=nonce,
+      tenant_storage_id=tenant_storage_id,
+      tool_name=metadata["tool_name"],
+      prepared_input=prepared_input,
+      dispatch_context=context,
+      exact_backend=metadata["exact_backend"],
+      credential_generation_ref=metadata["credential_generation_ref"],
+      operand_digest=digest,
+    )
+    return binding, request
+
+  def _verify_executable_attempt_locked(
+    self,
+    conn: sqlite3.Connection,
+    *,
+    binding: ExecutableApprovalBinding,
+  ) -> tuple[ApprovalRequest, sqlite3.Row]:
+    current, request = self._read_executable_binding_locked(
+      conn,
+      job_id=binding.job_id,
+      tool_call_id=binding.tool_call_id,
+      nonce=binding.nonce,
+      tenant_storage_id=binding.tenant_storage_id,
+    )
+    if current != binding:
+      raise ApprovalExecutableBindingError("operand_mismatch")
+    row = conn.execute(
+      """
+      SELECT execution_state, execution_claim_token,
+        execution_decision_state_version, execution_result_digest
+      FROM approval_executable_bindings WHERE approval_id = ?
+      """,
+      (binding.approval_id,),
+    ).fetchone()
+    if row is None:
+      raise ApprovalExecutableBindingError("missing_binding")
+    return request, row
+
+  async def _read_completed_executable_result_for_executor(
+    self,
+    *,
+    binding: ExecutableApprovalBinding,
+  ) -> ToolResult | None:
+    """Read a known original outcome without authorizing or reserving execution."""
+
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN")
+        _request, row = self._verify_executable_attempt_locked(
+          conn, binding=binding,
+        )
+        result = (
+          self._read_executable_result_locked(conn, binding=binding, execution=row)
+          if row["execution_state"] == "completed" else None
+        )
+        conn.commit()
+    return result
+
+  async def _claim_executable_binding_for_executor(
+    self,
+    *,
+    binding: ExecutableApprovalBinding,
+    decision_state_version: int,
+    claim_token: str,
+  ) -> ToolResult | None:
+    """Reserve one original call attempt, or read its exact completed result.
+
+    The executor calls only at its final consumer frontier. A committed claim
+    with no returned result is outcome-unknown, never a retryable timed lease.
+    """
+
+    if type(claim_token) is not str or not claim_token:
+      raise ApprovalExecutableBindingError("claim_token_mismatch")
+    if type(decision_state_version) is not int:
+      raise ApprovalExecutableBindingError("decision_mismatch")
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        request, row = self._verify_executable_attempt_locked(
+          conn, binding=binding,
+        )
+        if row["execution_state"] == "completed":
+          result = self._read_executable_result_locked(
+            conn, binding=binding, execution=row,
+          )
+          conn.commit()
+          return result
+        if row["execution_state"] != "unclaimed":
+          raise ApprovalExecutableBindingError("execution_outcome_unknown")
+        if (
+          request.state_version != decision_state_version
+          or not approval_is_executable(request)
+        ):
+          raise ApprovalExecutableBindingError("decision_mismatch")
+        cursor = conn.execute(
+          """
+          UPDATE approval_executable_bindings
+          SET execution_state = 'claimed', execution_claim_token = ?,
+            execution_decision_state_version = ?
+          WHERE approval_id = ? AND job_id = ? AND tool_call_id = ?
+            AND nonce = ? AND tenant_storage_id = ? AND operand_digest = ?
+            AND execution_state = 'unclaimed'
+            AND execution_claim_token IS NULL
+            AND execution_decision_state_version IS NULL
+            AND execution_result_json IS NULL AND execution_result_digest IS NULL
+          """,
+          (
+            claim_token, decision_state_version, binding.approval_id,
+            binding.job_id, binding.tool_call_id, binding.nonce,
+            binding.tenant_storage_id, binding.operand_digest,
+          ),
+        )
+        if cursor.rowcount != 1:
+          raise ApprovalExecutableBindingError("execution_outcome_unknown")
+        conn.commit()
+    return None
+
+  async def _complete_executable_binding_for_executor(
+    self,
+    *,
+    binding: ExecutableApprovalBinding,
+    decision_state_version: int,
+    claim_token: str,
+    tool_result: ToolResult,
+  ) -> None:
+    """Persist a returned call result, not an assertion of successful effects."""
+    # Settlement records the outcome of the already-authorized original attempt;
+    # later approval eligibility cannot change what the consumer actually returned.
+
+    if type(claim_token) is not str or not claim_token:
+      raise ApprovalExecutableBindingError("claim_token_mismatch")
+    if type(decision_state_version) is not int:
+      raise ApprovalExecutableBindingError("decision_mismatch")
+    if (
+      type(tool_result) is not tuple
+      or len(tool_result) != 2
+      or (tool_result[1] is not None and not isinstance(tool_result[1], dict))
+    ):
+      raise ApprovalExecutableBindingError("result_mismatch")
+    try:
+      result_json = _executable_result_json(tool_result)
+      result_digest = _executable_result_digest(
+        binding, claim_token, decision_state_version, result_json,
+      )
+    except (TypeError, ValueError):
+      raise ApprovalExecutableBindingError("result_mismatch") from None
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _request, row = self._verify_executable_attempt_locked(
+          conn, binding=binding,
+        )
+        if row["execution_claim_token"] != claim_token:
+          raise ApprovalExecutableBindingError("claim_token_mismatch")
+        if row["execution_decision_state_version"] != decision_state_version:
+          raise ApprovalExecutableBindingError("decision_mismatch")
+        if row["execution_state"] == "completed":
+          existing = self._read_executable_result_locked(
+            conn, binding=binding, execution=row,
+          )
+          if _executable_result_json(existing) != result_json:
+            raise ApprovalExecutableBindingError("result_mismatch")
+        else:
+          cursor = conn.execute(
+            """
+            UPDATE approval_executable_bindings
+            SET execution_state = 'completed', execution_result_json = ?,
+              execution_result_digest = ?
+            WHERE approval_id = ? AND job_id = ? AND tool_call_id = ?
+              AND nonce = ? AND tenant_storage_id = ? AND operand_digest = ?
+              AND execution_state = 'claimed' AND execution_claim_token = ?
+              AND execution_decision_state_version = ?
+              AND execution_result_json IS NULL AND execution_result_digest IS NULL
+            """,
+            (
+              result_json, result_digest, binding.approval_id, binding.job_id,
+              binding.tool_call_id, binding.nonce, binding.tenant_storage_id,
+              binding.operand_digest, claim_token, decision_state_version,
+            ),
+          )
+          if cursor.rowcount != 1:
+            raise ApprovalExecutableBindingError("execution_outcome_unknown")
+        conn.commit()
+
+  def _read_executable_result_locked(
+    self,
+    conn: sqlite3.Connection,
+    *,
+    binding: ExecutableApprovalBinding,
+    execution: sqlite3.Row,
+  ) -> ToolResult:
+    result_row = conn.execute(
+      """
+      SELECT execution_result_json FROM approval_executable_bindings
+      WHERE approval_id = ? AND job_id = ? AND tool_call_id = ?
+        AND nonce = ? AND tenant_storage_id = ? AND operand_digest = ?
+        AND execution_state = 'completed'
+      """,
+      (
+        binding.approval_id, binding.job_id, binding.tool_call_id,
+        binding.nonce, binding.tenant_storage_id, binding.operand_digest,
+      ),
+    ).fetchone()
+    if result_row is None:
+      raise ApprovalExecutableBindingError("result_mismatch")
+    try:
+      result_json = result_row["execution_result_json"]
+      result = _rows.identity_json_loads(result_json)
+      if (
+        not isinstance(result, list) or len(result) != 2
+        or not isinstance(result[0], dict)
+        or (result[1] is not None and not isinstance(result[1], dict))
+        or type(execution["execution_claim_token"]) is not str
+        or not execution["execution_claim_token"]
+        or type(execution["execution_decision_state_version"]) is not int
+      ):
+        raise ApprovalExecutableBindingError("result_mismatch")
+      result_digest = _executable_result_digest(
+        binding, execution["execution_claim_token"],
+        execution["execution_decision_state_version"], result_json,
+      )
+      if result_digest != execution["execution_result_digest"]:
+        raise ApprovalExecutableBindingError("result_mismatch")
+      restored = _restore_executable_result(result[0])
+    except (TypeError, ValueError):
+      raise ApprovalExecutableBindingError("result_mismatch") from None
+    return restored, result[1]
+
   async def get(self, approval_id: str) -> ApprovalRequest | None:
     with self._connection() as conn:
       row = conn.execute(
@@ -1651,6 +2711,16 @@ class SQLiteApprovalStore:
             "claimed raw patch approval cannot be modified"
           )
         current = self._row_to_request(current_row)
+        binding_row = conn.execute(
+          """
+          SELECT approval_id, tool_call_id, tool_name, tenant_storage_id,
+            request_args_hash
+          FROM approval_executable_bindings WHERE approval_id = ?
+          """,
+          (request.approval_id,),
+        ).fetchone()
+        if binding_row is not None:
+          _verify_executable_request_identity(binding_row, request)
         identity_fields = (
           "approval_constraint",
           "required_owner_user_id",

@@ -22,7 +22,7 @@ import logging
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
-from typing import Any, Generic, Literal, TypeVar, overload
+from typing import Any, Generic, Literal, TypeVar, cast, overload
 
 from agent_workflow_contracts import AdmittedTask, OperationUnavailable, ResolvedAuthority
 from agent_workflow_contracts.models import (
@@ -32,6 +32,8 @@ from agent_workflow_contracts.models import (
   AdmittedTenant,
 )
 from model_authority.bind import CapabilityBind
+from pydantic import JsonValue
+from model_authority.selection import SelectionSnapshot
 
 from .capability_execution import CapabilityExecutionResolver
 from .approval_route import (
@@ -129,6 +131,7 @@ class ParentContext:
   job_id: str | None
   depth: int
   approval_route: ApprovalRoute[object, object]
+  selection_snapshot: SelectionSnapshot | None = None
 
 
 def root_context(
@@ -137,6 +140,7 @@ def root_context(
   withheld_tools: frozenset[str],
   research_file_id: int | None,
   remaining_usd: float | None = None,
+  selection_snapshot: SelectionSnapshot | None = None,
 ) -> ParentContext:
   """Capture a root turn after runtime setup; never re-root an admitted child."""
 
@@ -161,6 +165,7 @@ def root_context(
     research_binding=AdmittedResearchBinding(research_file_id=research_file_id),
     approval_route=session_approval_route(session),
     remaining_usd=remaining_usd,
+    selection_snapshot=selection_snapshot,
   )
   if session is not None:
     capture_job_context(session, context)
@@ -176,6 +181,7 @@ def root_context_from_identity(
   research_binding: AdmittedResearchBinding,
   approval_route: ApprovalRoute[object, object],
   remaining_usd: float | None = None,
+  selection_snapshot: SelectionSnapshot | None = None,
 ) -> ParentContext:
   """Mint from an authenticated edge's identity, live roster and control owner.
 
@@ -195,6 +201,7 @@ def root_context_from_identity(
     job_id=job_id,
     depth=0,
     approval_route=approval_route,
+    selection_snapshot=selection_snapshot,
   )
 
 
@@ -324,6 +331,11 @@ def context_for_child(
     job_id=job_id,
     depth=wire.lineage.depth,
     approval_route=admitted.approval_route,
+    selection_snapshot=(
+      SelectionSnapshot.from_json(wire.selection_snapshot)
+      if wire.selection_snapshot is not None
+      else None
+    ),
   )
 
 
@@ -479,6 +491,7 @@ def _admit_spawn(
       registration.execution_class,
       role=request.role if request.role is not None else registration.role,
       effort=request.effort if request.effort is not None else registration.effort,
+      selection_snapshot=parent.selection_snapshot,
     )
   )
 
@@ -526,6 +539,11 @@ def _admit_spawn(
     tenant=parent.tenant,
     research_binding=research_binding,
     capability_bind=capability_bind,
+    selection_snapshot=(
+      cast(dict[str, JsonValue], parent.selection_snapshot.to_json())
+      if parent.selection_snapshot is not None
+      else None
+    ),
     children=children,
     tool_grant=tuple(entry.tool_id for entry in tool_authority.grant.tools),
     withheld_tools=tuple(sorted(parent.withheld)),

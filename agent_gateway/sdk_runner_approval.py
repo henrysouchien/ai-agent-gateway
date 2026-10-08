@@ -209,6 +209,7 @@ async def can_use_tool_callback(
   lifecycle = await _approval_lifecycle_helpers.run_approval_lifecycle(
     route=route,
     session=runner._session,
+    producer_session=runner._session,
     tool_call_id=tool_call_id,
     tool_name=policy_tool,
     tool_input=prepared_input,

@@ -824,6 +824,7 @@ def test_delegated_run_settles_everything_but_the_money_boundary(
         session,
       ),
       session=session,
+      producer_session=session,
       tool_call_id="call-idea-triage",
       tool_name="idea_triage_decide",
       tool_input={"decisions": [{"id": 1, "verdict": "dismiss"}]},

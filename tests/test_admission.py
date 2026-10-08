@@ -58,6 +58,7 @@ from gateway_test_support.capability_execution_test_support import (
   stub_capability_execution_resolver,
 )
 from gateway_test_support.host_policy import owner_session_host_policy
+from model_authority.selection import SelectionSnapshot, capture_selection_snapshot
 
 @pytest.fixture(autouse=True)
 def _default_spawn_depth(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -101,6 +102,7 @@ class _PlainResolver:
 
   def select_bind(
     self, capability_id: str, *, role: str | None = None, effort: str | None = None,
+    selection_snapshot: SelectionSnapshot | None = None,
   ) -> Any:
     self.reads.append(capability_id)
     self.selections.append((role, effort))
@@ -170,6 +172,97 @@ def _root(**changes: Any) -> ParentContext:
 
 def _request(**changes: Any) -> SpawnRequest:
   return replace(SpawnRequest(operation="explore", task="Collect"), **changes)
+
+
+def test_historical_wire_omits_absent_selection_snapshot() -> None:
+  admitted = admit(_request(), _root(), owners=_owners(_resolver()))
+  assert isinstance(admitted, AdmittedContext)
+  payload = admitted.wire.model_dump(mode="json", exclude_none=False)
+  assert "selection_snapshot" not in payload
+  restored = AdmittedContextWire.model_validate(payload)
+  assert context_for_child(
+    replace(admitted, wire=restored), job_id="historical-child",
+  ).selection_snapshot is None
+
+
+def test_snapshot_survives_two_fresh_hops_and_wire_round_trip(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  resolver = _resolver()
+  snapshot = capture_selection_snapshot(resolver.selection_policy)
+  selected: list[SelectionSnapshot | None] = []
+  real_select = type(resolver).select_bind
+
+  def select(self: Any, *args: Any, **kwargs: Any) -> Any:
+    selected.append(kwargs.get("selection_snapshot"))
+    return real_select(self, *args, **kwargs)
+
+  monkeypatch.setattr(type(resolver), "select_bind", select)
+  first = admit(
+    _request(), _root(selection_snapshot=snapshot),
+    owners=_owners(resolver, children=("explore",)),
+  )
+  assert isinstance(first, AdmittedContext)
+  first_wire = AdmittedContextWire.model_validate_json(first.wire.model_dump_json())
+  assert first_wire.selection_snapshot == snapshot.to_json()
+  child = context_for_child(replace(first, wire=first_wire), job_id="child")
+  assert child.selection_snapshot == snapshot
+  second = admit(_request(), child, owners=_owners(resolver))
+  assert isinstance(second, AdmittedContext)
+  assert second.wire.selection_snapshot == snapshot.to_json()
+  assert selected == [snapshot, snapshot]
+  assert first.wire.capability_bind == second.wire.capability_bind
+
+
+def test_frozen_bind_does_not_select_under_snapshot(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  resolver = _resolver()
+  snapshot = capture_selection_snapshot(resolver.selection_policy)
+
+  def unexpected_selection(*args: Any, **kwargs: Any) -> Any:
+    raise AssertionError("frozen admission must not reselect")
+
+  monkeypatch.setattr(type(resolver), "select_bind", unexpected_selection)
+  admitted = admit(
+    _request(), _root(selection_snapshot=snapshot),
+    owners=replace(_owners(resolver), frozen_bind=_BIND),
+  )
+  assert isinstance(admitted, AdmittedContext)
+  assert admitted.wire.capability_bind is _BIND
+  assert admitted.wire.selection_snapshot == snapshot.to_json()
+
+
+def test_spawn_keeps_the_turns_snapshot_and_a_later_mint_does_not_inherit_it() -> None:
+  # Live roles-W3 acceptance at 9e1b7bdec630: the spawn handler re-mints the root
+  # and the admitted wire dropped the turn's captured snapshot.
+  resolver = _resolver()
+  session = _session()
+  turn = capture_selection_snapshot(resolver.selection_policy)
+  root_context(
+    session, withheld_tools=frozenset({"memory_read"}), research_file_id=42,
+    selection_snapshot=turn,
+  )
+  runner = _BackgroundRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    parent_session=session,
+    mcp_client=_McpClient(),
+    local_tool_handlers={"web_search": _tool, "file_read": _tool, "memory_read": _tool},
+    excluded_tools={"memory_read"},
+    user_id="actor-test",
+    trusted_research_file_id=42,
+    capability_execution_resolver=resolver,
+  )
+  _result, error = asyncio.run(handler({"objective": "Collect", "background": True}))
+  assert error is None, error
+  admitted = runner.background_calls[0]["admitted_task"].execution_snapshot.admitted_context
+  assert admitted is not None
+  assert admitted.selection_snapshot == turn.to_json()
+  # A root minted later without its own capture (schedule run-now, batch stage)
+  # resolves under current policy, not this turn's snapshot.
+  later = root_context(session, withheld_tools=frozenset(), research_file_id=None)
+  assert later.selection_snapshot is None
 
 
 # --- (a) one context for both doors -------------------------------------

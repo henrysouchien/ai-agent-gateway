@@ -22,6 +22,7 @@ from agent_workflow_contracts.tool_registration import (
   validate_tool_registration_declaration,
 )
 
+from .admission import ParentContext
 from . import approval_settings
 from .approval_policy import (
   ApprovalConstraint,
@@ -49,12 +50,14 @@ from .execution_identity import DispatchIdentity
 from .investment_capability_claim import (
   INVESTMENT_CAPABILITY_CLAIM_SERVER,
   INVESTMENT_CAPABILITY_FACADE_TOOLS,
+  INVESTMENT_JOB_PRINCIPAL_TOOLS,
   InvestmentCapabilityClaimError,
   investment_capability_claim_unavailable_error,
   issue_investment_capability_claim,
+  issue_investment_job_principal_claim,
 )
 from .mcp_client_catalog import tool_argument_guidance
-from .mcp_client import RegisteredMcpPlannedToolCall, RegisteredMcpToolCall, registered_mcp_dispatch_scope
+from .mcp_client import McpInvocationReport, RegisteredMcpPlannedToolCall, RegisteredMcpToolCall, registered_mcp_dispatch_scope
 from .policy_imports import (
   load_server_policy_module,
   authority_policy_denies_tool,
@@ -2715,6 +2718,28 @@ class ToolDispatcher:
           meta["batch_id"] = str(batch_id)
         if (
           server == INVESTMENT_CAPABILITY_CLAIM_SERVER
+          and lifecycle_tool_name in INVESTMENT_JOB_PRINCIPAL_TOOLS
+        ):
+          run_context = self._resolve_run_context()
+          executing_context = self._executing_context()
+          try:
+            meta["investment_capability_claim"] = (
+              issue_investment_job_principal_claim(
+                user_id=str(resolved_risk_user_id or ""),
+                tenant=executing_context.tenant if executing_context is not None else None,
+                session_id=str(self._session_id or run_context.session_id or ""),
+                channel=str(self._channel or run_context.channel or ""),
+                tool_name=lifecycle_tool_name,
+                request_id=str(run_context.request_id or ""),
+                jti=str(tool_call_id or ""),
+              )
+            )
+          except InvestmentCapabilityClaimError:
+            return None, investment_capability_claim_unavailable_error(
+              subject=f"tool '{lifecycle_tool_name}'",
+            )
+        elif (
+          server == INVESTMENT_CAPABILITY_CLAIM_SERVER
           and lifecycle_tool_name in INVESTMENT_CAPABILITY_FACADE_TOOLS
         ):
           run_context = self._resolve_run_context()
@@ -3129,6 +3154,7 @@ class ToolDispatcher:
     return await _approval_lifecycle_helpers.run_approval_lifecycle(
       route=self._approval_route,
       session=route_session(self._approval_route),
+      producer_session=self._session,
       tool_call_id=tool_call_id,
       tool_name=tool_name,
       tool_input=tool_input,
@@ -3182,6 +3208,7 @@ class ToolDispatcher:
     return await _approval_lifecycle_helpers.run_approval_lifecycle(
       route=self._approval_route,
       session=route_session(self._approval_route),
+      producer_session=self._session,
       tool_call_id=tool_call_id,
       tool_name=declaration.identity.logical_name,
       tool_input=tool_input,
@@ -3217,7 +3244,11 @@ class ToolDispatcher:
     durable_request: dict[str, Any] | None = None,
   ) -> dict[str, Any] | None:
     return await _approval_lifecycle_helpers.await_user_approval_via_pending_tools(
-      session=route_session(self._approval_route),
+      session=(
+        batch_admission.carrier.session
+        if batch_admission is not None
+        else route_session(self._approval_route)
+      ),
       approval_store=self._approval_store,
       append_event_fn=self._boundary_event_log.append,
       request=request,
@@ -3230,6 +3261,14 @@ class ToolDispatcher:
       batch_admission=batch_admission,
       durable_request=durable_request,
     )
+
+  def _executing_context(self) -> ParentContext | None:
+    """Read this execution's admitted context without deriving missing scope."""
+    if self._identity is not None:
+      return self._identity.context
+    if self._session is not None:
+      return self._session.admitted_job_context
+    return None
 
   def _resolve_run_context(self) -> RunContext:
     return _approval_lifecycle_helpers.resolve_run_context(
@@ -3460,6 +3499,7 @@ class ToolDispatcher:
     on_executed_prepared_call: (
       Callable[[PreparedToolCall], None] | None
     ) = None,
+    invocation_report: McpInvocationReport | None = None,
   ) -> ToolResult:
     kwargs: Dict[str, Any] = {}
     effective_meta = dict(meta or {})
@@ -3503,7 +3543,14 @@ class ToolDispatcher:
         else PreparedToolCall(transport_input)
       )
       on_executed_prepared_call(executed_prepared_call)
-    result, error = await self._mcp.call_tool(
+    call_tool = (
+      self._mcp.call_tool_reporting
+      if invocation_report is not None
+      else self._mcp.call_tool
+    )
+    if invocation_report is not None:
+      kwargs["invocation_report"] = invocation_report
+    result, error = await call_tool(
       tool_name,
       transport_input,
       **kwargs,

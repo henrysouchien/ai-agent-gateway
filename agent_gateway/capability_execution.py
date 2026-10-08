@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Literal
 
@@ -21,7 +21,7 @@ from model_authority.binding import (
 )
 from model_authority.capabilities import CAPABILITY_EXECUTION_PROCESS, CAPABILITY_IDS
 from model_authority.registry import ProductModelRegistry
-from model_authority.selection import ProductModelSelectionPolicy, TierDefaultInput
+from model_authority.selection import ProductModelSelectionPolicy, SelectionSnapshot, TierDefaultInput
 from .providers import ModelProvider
 
 
@@ -196,6 +196,7 @@ class CapabilityExecutionResolver:
     role_map: Mapping[str, TierDefaultInput] | None = None,
     role_map_source: Literal["saved_preference", "internal_policy"] | None = None,
     requested_role_source: Literal["explicit_user", "internal_policy"] = "internal_policy",
+    selection_snapshot: SelectionSnapshot | None = None,
   ) -> CapabilityBind:
     """Select and authorize an exact bind without credentials or adapter effects.
 
@@ -219,6 +220,7 @@ class CapabilityExecutionResolver:
       role_map=role_map,
       role_map_source=role_map_source,
       requested_role_source=requested_role_source,
+      selection_snapshot=selection_snapshot,
     )
 
   def resolve(
@@ -233,6 +235,7 @@ class CapabilityExecutionResolver:
     role_map: Mapping[str, TierDefaultInput] | None = None,
     role_map_source: Literal["saved_preference", "internal_policy"] | None = None,
     requested_role_source: Literal["explicit_user", "internal_policy"] = "internal_policy",
+    selection_snapshot: SelectionSnapshot | None = None,
   ) -> BoundCapabilityExecution:
     bind = self.select_bind(
       capability_id,
@@ -244,6 +247,7 @@ class CapabilityExecutionResolver:
       role_map=role_map,
       role_map_source=role_map_source,
       requested_role_source=requested_role_source,
+      selection_snapshot=selection_snapshot,
     )
     return self._materialize(bind)
 
@@ -257,6 +261,42 @@ class CapabilityExecutionResolver:
       auth=self.auth_context,
     )
     return self._materialize(bind, handle=handle)
+
+  def with_frozen_credential(
+    self, bind: CapabilityBind, auth_config: Mapping[str, Any],
+  ) -> CapabilityExecutionResolver:
+    """Offer an exact durable credential under the current ownership facts."""
+    handle_field = (
+      "user_provider_handles"
+      if bind.credential_principal == "user"
+      else "service_provider_handles"
+    )
+    handles = getattr(self.auth_context, handle_field)
+    current_handle = handles.get(bind.provider)
+    if current_handle is None:
+      raise CapabilityResolutionError(
+        "credential_unavailable",
+        "frozen credential ownership is unavailable",
+        capability_id=bind.capability_id,
+      )
+    exact_handle = replace(current_handle, handle_id=bind.credential_ref)
+    materialized = MaterializedCredential(
+      handle=exact_handle, auth_config=auth_config,
+    )
+
+    def _materialize(handle: CredentialHandle) -> MaterializedCredential:
+      if handle == exact_handle:
+        return materialized
+      return self.credential_materializer(handle)
+
+    return replace(
+      self,
+      auth_context=replace(
+        self.auth_context,
+        **{handle_field: {**handles, bind.provider: exact_handle}},
+      ),
+      credential_materializer=_materialize,
+    )
 
   def authorize_bind(self, bind: CapabilityBind) -> CapabilityBind:
     """Reauthorize a durable bind without credentials or adapter construction."""

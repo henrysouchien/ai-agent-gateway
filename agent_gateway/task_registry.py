@@ -43,6 +43,7 @@ class TaskState(Enum):
   FAILED = "failed"
   KILLED = "killed"
   INTERRUPTED = "interrupted"
+  AWAITING_APPROVAL = "awaiting_approval"
 
 
 TerminationIntent = Literal["cancelled", "killed"]
@@ -189,6 +190,8 @@ def task_state_for_result(result: TaskResult) -> TaskState:
     return TaskState.KILLED
   if status == "interrupted":
     return TaskState.INTERRUPTED
+  if status == "awaiting_approval":
+    return TaskState.AWAITING_APPROVAL
   return TaskState.FAILED
 
 

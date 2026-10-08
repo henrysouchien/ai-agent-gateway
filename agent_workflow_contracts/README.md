@@ -9,6 +9,12 @@ Optional `role` and `effort` declarations participate in its semantic identity;
 they do not resolve a model here. Both fields are omitted when `None`, preserving
 historical snapshot dumps and sealed admitted-task digests.
 
+`awaiting_approval` is an attempt settlement awaiting a human decision, not
+success or failure. It retains the exact admitted task identity, provenance,
+and observed usage, with a reason but no analytical outcome or result values.
+Executable approval binding and continuation belong to the gateway approval
+owner, not these wire contracts.
+
 | File | What it is |
 |---|---|
 | `models.py` | Frozen `WireModel` contracts including `CapabilityBind`, `AdmittedTask`, `TaskResult`, `DeliveryEnvelopeV1`/`V2`, `WorkflowView`, `PublishedOutput`, and `ContentHandle` |

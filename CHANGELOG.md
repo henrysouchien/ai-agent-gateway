@@ -4,6 +4,23 @@
 
 ### Changed
 
+- Investment job controls can carry an exact-operation signed job-principal
+  claim without a business skill grant. The four controls are submit, steer,
+  pipeline start and benchmark start. Facade v1 and selected-content v2 remain
+  unchanged in this additive release; tenant-bearing facade v4 ships separately.
+- `DispatchIdentity` requires the executing admitted context independently of
+  its credential session. Spawn, resume and native child dispatch retain their
+  own job identity, including sessionless admitted execution.
+
+- Approval executable bindings are private, separate from redacted approval
+  projections. The existing SQLite owner preserves original prepared operands,
+  backend, job/call/nonce/tenant identity and credential generation reference.
+  Original-call reservation uses a compare-and-swap; completed calls recover
+  their exact private result, while a lost or unfinished outcome has no timed
+  takeover. Canonical task/completion model results retain their types and child
+  evidence. This storage change does not remove approval clocks or publish a
+  parked continuation.
+
 - Mailbox sends and ordinary-result, workflow-output and spill reads admit the
   executing job's scope. Child handlers are rebound at spawn and resume; linked
   per-runner registries address parents and siblings without a second registry.

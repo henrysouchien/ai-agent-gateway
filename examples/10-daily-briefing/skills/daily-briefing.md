@@ -1,5 +1,6 @@
 ---
 name: daily-briefing
+execution_class: node.implement
 agent_callable: true
 agent_description: Turn provided source notes into a concise daily briefing with actions and risks.
 persist_state: true

@@ -24,7 +24,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import AbstractSet, Any, Callable, cast, Coroutine, Dict, List, Mapping, Sequence, Set, Tuple, TypedDict
+from typing import AbstractSet, Any, Callable, cast, Coroutine, Dict, List, Literal, Mapping, Sequence, Set, Tuple, TypedDict
 
 import httpx
 import httpx2
@@ -104,6 +104,19 @@ PER_USER_IDLE_REAP_SECONDS = 30 * 60
 PER_USER_REAPER_INTERVAL_SECONDS = 60.0
 PER_USER_INSTANCE_CAP = 32
 PER_USER_DRAIN_POLL_SECONDS = 0.05
+
+
+@dataclass
+class McpInvocationReport:
+  """Invocation-local output from the MCP call owner, not replay authority.
+
+  Start with ``certainty="settled"`` because nothing has been sent. Creating
+  the SDK call task makes the outcome unknown; receiving its validated result
+  settles it, including error responses. SDK validation failures stay unknown.
+  A retry without a result must not erase an earlier unknown outcome.
+  """
+
+  certainty: Literal["settled", "unknown"]
 
 
 class _McpCallKwargs(TypedDict, total=False):
@@ -2363,6 +2376,30 @@ class McpClientManager:
     allow_uncertain_replay: bool = True,
     trusted_dispatch_scope: Mapping[str, object] | None = None,
   ) -> Tuple[Any | None, Dict[str, Any] | None]:
+    return await self.call_tool_reporting(
+      name,
+      tool_input,
+      meta,
+      abort_event,
+      gateway_session,
+      allow_uncertain_replay,
+      trusted_dispatch_scope,
+      invocation_report=McpInvocationReport(certainty="settled"),
+    )
+
+  async def call_tool_reporting(
+    self,
+    name: str,
+    tool_input: Dict[str, Any] | PreparedToolCall,
+    meta: Dict[str, Any] | None = None,
+    abort_event: asyncio.Event | None = None,
+    gateway_session: Any | None = None,
+    allow_uncertain_replay: bool = True,
+    trusted_dispatch_scope: Mapping[str, object] | None = None,
+    *,
+    invocation_report: McpInvocationReport,
+  ) -> Tuple[Any | None, Dict[str, Any] | None]:
+    invocation_report.certainty = "settled"
     if type(allow_uncertain_replay) is not bool:
       raise TypeError("allow_uncertain_replay must be an exact bool")
     registered_descriptor = (
@@ -2540,6 +2577,7 @@ class McpClientManager:
         meta=meta,
         abort_event=abort_event,
         expected_seconds=expected_seconds,
+        invocation_report=invocation_report,
       )
     except Exception as exc:
       if per_user_state is not None:
@@ -2635,6 +2673,7 @@ class McpClientManager:
           abort_event=abort_event,
           expected_seconds=expected_seconds,
           cause=exc,
+          invocation_report=invocation_report,
         )
       except Exception as retry_exc:
         return None, _tool_error_from_exception(retry_exc)
@@ -2683,6 +2722,7 @@ class McpClientManager:
             meta=meta,
             abort_event=abort_event,
             expected_seconds=expected_seconds,
+            invocation_report=invocation_report,
           )
         except Exception as exc:
           key = (server_name, per_user_subject.user_id)
@@ -2795,6 +2835,7 @@ class McpClientManager:
     meta: Dict[str, Any] | None,
     abort_event: asyncio.Event | None,
     expected_seconds: float,
+    invocation_report: McpInvocationReport | None = None,
   ) -> _connection_helpers.McpToolCallResult:
     """Run one MCP tool call to its result; only the caller's abort ends it early.
 
@@ -2819,6 +2860,8 @@ class McpClientManager:
       tool_input,
       **call_kwargs,
     ))
+    if invocation_report is not None:
+      invocation_report.certainty = "unknown"
     abort_task: asyncio.Task[Any] | None = None
     try:
       wait_tasks: set[asyncio.Task[Any]] = {call_task}
@@ -2848,7 +2891,10 @@ class McpClientManager:
           reason="abort",
         )
         raise asyncio.CancelledError()
-      return await call_task
+      result = await call_task
+      if invocation_report is not None:
+        invocation_report.certainty = "settled"
+      return result
     except asyncio.CancelledError:
       await self._cancel_mcp_tool_call(
         call_task,
@@ -2890,6 +2936,7 @@ class McpClientManager:
     abort_event: asyncio.Event | None,
     expected_seconds: float,
     cause: Exception,
+    invocation_report: McpInvocationReport | None = None,
   ) -> _connection_helpers.McpToolCallResult | None:
     config = server.config
     if not config:
@@ -2927,6 +2974,7 @@ class McpClientManager:
       meta=meta,
       abort_event=abort_event,
       expected_seconds=expected_seconds,
+      invocation_report=invocation_report,
     )
 
   async def _reconnect_stdio_server_for_future(

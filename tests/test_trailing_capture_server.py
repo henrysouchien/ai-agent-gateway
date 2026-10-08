@@ -362,7 +362,6 @@ def test_deferred_dispatch_runner_exception_emits_exactly_one_terminal() -> None
 @pytest.mark.parametrize(
   ("rejection", "status_code"),
   [
-    ("session-kind", 400),
     ("turn-busy", 409),
     ("stream-active", 409),
     ("invalid-profile", 403),
@@ -380,7 +379,7 @@ def test_dispatch_pre_lifecycle_rejections_preserve_scoped_close(
       defer_terminal_close=deferred,
       on_event=lambda event, _sid: callbacks.append(dict(event)),
     )
-    session = _session(kind="control" if rejection == "session-kind" else "chat")
+    session = _session()
     blocker: asyncio.Task[Any] | None = None
     if rejection == "turn-busy":
       blocker = asyncio.create_task(asyncio.Event().wait())

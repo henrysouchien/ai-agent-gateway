@@ -100,6 +100,7 @@ def _write_resumable_skill(skills_dir: Path) -> None:
   (skills_dir / "resumable-skill.md").write_text(
     """---
 name: resumable-skill
+execution_class: node.implement
 description: Resumable test skill
 agent_callable: true
 resumable: true
@@ -2321,6 +2322,7 @@ def test_autonomous_resume_rejects_non_resumable_skill(monkeypatch, tmp_path) ->
   (skills_dir / "one-shot.md").write_text(
     """---
 name: one-shot
+execution_class: node.implement
 description: One shot test skill
 agent_callable: true
 resumable: false
@@ -2368,6 +2370,7 @@ def test_autonomous_resume_rejects_model_writer_skill_even_when_metadata_resumab
   (skills_dir / "model-update.md").write_text(
     """---
 name: model-update
+execution_class: node.mutate
 description: Model update writer
 agent_callable: true
 resumable: true

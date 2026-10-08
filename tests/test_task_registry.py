@@ -24,6 +24,7 @@ from agent_workflow_contracts import (
   OrdinaryDelegationTaskRef,
   OutcomeRequirement,
   ResultRequirement,
+  UsageObservation,
   canonical_json_bytes,
   sha256_digest,
   terminal_task_result,
@@ -66,12 +67,14 @@ from agent_gateway.task_registry import (
   TaskDurableEventConflictError,
   TASK_NOTIFICATION_INLINE_PAYLOAD_MAX_BYTES,
   TaskEntry,
+  TaskResultSettlementError,
   TaskRegistry,
   TaskState,
   _TERMINAL_STATES,
   job_output_handles,
   job_read_subtree,
   make_progress_tracker,
+  validate_task_result_settlement,
 )
 
 
@@ -2348,6 +2351,81 @@ def test_load_from_events_preserves_canonical_result_identity_without_receipt(
       "invalid_task_result"
       if tamper == "physical_identity"
       else "task_result_admission_mismatch"
+    )
+
+
+def test_load_from_events_preserves_canonical_awaiting_approval_result() -> None:
+  admitted = _canonical_admitted_task()
+  usage = UsageObservation(
+    input_tokens=120,
+    output_tokens=35,
+    cached_input_tokens=20,
+    tool_calls=2,
+    cost_usd=0.015,
+  )
+  task_result = terminal_task_result(
+    admitted,
+    status="awaiting_approval",
+    reason="Waiting for a human approval decision.",
+    usage=usage,
+  )
+  result = task_result.model_dump(mode="json")
+  task_id = admitted.attempt.physical_task_id
+  registry = TaskRegistry()
+  registry.load_from_events([
+    {
+      "type": "task_registered",
+      "event_schema_version": 2,
+      "task_id": task_id,
+      "task_type": "background_agent",
+      "started_at": 100.0,
+      "metadata": {"admitted_task": admitted.model_dump(mode="json")},
+    },
+    {
+      "type": "task_completed",
+      "task_id": task_id,
+      "final_state": "awaiting_approval",
+      "completed_at": 125.0,
+      "result": result,
+      "error": None,
+    },
+  ])
+
+  entry = registry.get(task_id)
+  assert entry is not None
+  assert entry.state is TaskState.AWAITING_APPROVAL
+  assert entry.completed is False
+  assert entry.error is None
+  assert entry.task_id == admitted.attempt.physical_task_id
+  assert entry.admitted_task == admitted
+  assert entry.metadata["admitted_task"] == admitted.model_dump(mode="json")
+  assert entry.result == result
+  assert entry.task_result == task_result
+  assert entry.task_result is not None
+  assert entry.task_result.logical_task == admitted.logical_task
+  assert entry.task_result.attempt == admitted.attempt
+  assert entry.task_result.provenance == provenance_of(admitted)
+  assert entry.task_result.observation.usage == usage
+  assert entry.task_result.observation.transcript.owner_id == task_id
+  assert entry.task_result.observation.activity.owner_id == task_id
+  assert entry.completed_at == 125.0
+  assert entry.completion_persistence_state == "committed"
+
+  with pytest.raises(
+    TaskResultSettlementError,
+  ):
+    validate_task_result_settlement(
+      task_result,
+      final_state=TaskState.INTERRUPTED,
+      error=None,
+    )
+  with pytest.raises(
+    TaskResultSettlementError,
+  ):
+    validate_task_result_settlement(
+      task_result,
+      final_state=TaskState.AWAITING_APPROVAL,
+      error={"code": "approval_timeout", "message": "Approval timed out."},
     )
 
 

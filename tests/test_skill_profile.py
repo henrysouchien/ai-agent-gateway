@@ -28,22 +28,22 @@ from agent_gateway.skills import (
 
 
 
-def _write_skill(tmp_path: Path, frontmatter: str | None, *, body: str = "# Skill\n\nPrompt") -> Path:
+def _write_skill(tmp_path: Path, frontmatter: str | None, *, execution_class: str, body: str = "# Skill\n\nPrompt") -> Path:
   skill_path = tmp_path / "test-skill.md"
   if frontmatter is None:
-    text = body
+    text = f"---\nexecution_class: {execution_class}\n---\n\n{body}\n"
   else:
-    text = f"---\n{textwrap.dedent(frontmatter).strip()}\n---\n\n{body}\n"
+    text = f"---\nexecution_class: {execution_class}\n{textwrap.dedent(frontmatter).strip()}\n---\n\n{body}\n"
   skill_path.write_text(text, encoding="utf-8")
   return skill_path
 
 
-def _write_named_skill(skills_dir: Path, name: str, frontmatter: str | None, *, body: str = "# Skill") -> None:
+def _write_named_skill(skills_dir: Path, name: str, frontmatter: str | None, *, execution_class: str, body: str = "# Skill") -> None:
   skills_dir.mkdir(parents=True, exist_ok=True)
   if frontmatter is None:
-    text = body
+    text = f"---\nexecution_class: {execution_class}\n---\n\n{body}\n"
   else:
-    text = f"---\n{textwrap.dedent(frontmatter).strip()}\n---\n\n{body}\n"
+    text = f"---\nexecution_class: {execution_class}\n{textwrap.dedent(frontmatter).strip()}\n---\n\n{body}\n"
   (skills_dir / f"{name}.md").write_text(text, encoding="utf-8")
 
 
@@ -78,6 +78,7 @@ def test_source_parser_matches_file_and_loader_parsing(tmp_path: Path) -> None:
       allowed_profiles: [advisor]
     """,
     body="Source body.\n\nSecond paragraph.",
+    execution_class="node.implement",
   )
   skill_path.write_bytes(
     skill_path.read_bytes().replace(b"\n", b"\r\n")
@@ -117,6 +118,7 @@ def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
       initial_message: Run the workflow.
       delivery_label: Daily Scan
     """,
+    execution_class="node.implement",
   )
 
   profile = parse_skill_file(skill_path)
@@ -170,6 +172,7 @@ def test_data_requirements_frontmatter_is_no_longer_a_declaration(
         freshness: immutable_history
     custom: value
     """,
+    execution_class="node.implement",
   )
 
   profile = parse_skill_file(skill_path)
@@ -182,7 +185,7 @@ def test_data_requirements_frontmatter_is_no_longer_a_declaration(
 
 @pytest.mark.parametrize("raw", ["7", 7, 7.0])
 def test_parse_max_structured_reads(tmp_path: Path, raw: object) -> None:
-  skill_path = _write_skill(tmp_path, f"max_structured_reads: {raw}")
+  skill_path = _write_skill(tmp_path, f"max_structured_reads: {raw}", execution_class="node.implement")
 
   profile = parse_skill_file(skill_path)
 
@@ -192,21 +195,21 @@ def test_parse_max_structured_reads(tmp_path: Path, raw: object) -> None:
 
 @pytest.mark.parametrize("raw", [0, -1])
 def test_parse_max_structured_reads_requires_positive_value(tmp_path: Path, raw: int) -> None:
-  skill_path = _write_skill(tmp_path, f"max_structured_reads: {raw}")
+  skill_path = _write_skill(tmp_path, f"max_structured_reads: {raw}", execution_class="node.implement")
 
   with pytest.raises(ValueError, match="greater than or equal to 1"):
     parse_skill_file(skill_path)
 
 
 def test_parse_max_structured_reads_rejects_non_integer(tmp_path: Path) -> None:
-  skill_path = _write_skill(tmp_path, "max_structured_reads: nope")
+  skill_path = _write_skill(tmp_path, "max_structured_reads: nope", execution_class="node.implement")
 
   with pytest.raises(ValueError, match="must be an integer"):
     parse_skill_file(skill_path)
 
 
 def test_parse_subagent_return_contract_is_rejected(tmp_path: Path) -> None:
-  skill_path = _write_skill(tmp_path, "subagent_return_contract: verify-finding-v1")
+  skill_path = _write_skill(tmp_path, "subagent_return_contract: verify-finding-v1", execution_class="node.implement")
 
   with pytest.raises(ValueError, match="not supported"):
     parse_skill_file(skill_path)
@@ -217,38 +220,12 @@ def test_parse_subagent_return_contract_rejects_invalid_value(
   tmp_path: Path,
   raw: str,
 ) -> None:
-  skill_path = _write_skill(tmp_path, f"subagent_return_contract: {raw}")
+  skill_path = _write_skill(tmp_path, f"subagent_return_contract: {raw}", execution_class="node.implement")
 
   with pytest.raises(ValueError, match="subagent_return_contract"):
     parse_skill_file(skill_path)
 
 
-def test_parse_delegation_role(tmp_path: Path) -> None:
-  skill_path = _write_skill(tmp_path, "delegation_role: verify-finding")
-
-  profile = parse_skill_file(skill_path)
-
-  assert profile.delegation_role == "verify-finding"
-  assert profile.metadata is None
-
-
-def test_parse_unmapped_delegation_role_loads(tmp_path: Path) -> None:
-  skill_path = _write_skill(tmp_path, "delegation_role: typo-role")
-
-  profile = parse_skill_file(skill_path)
-
-  assert profile.delegation_role == "typo-role"
-
-
-@pytest.mark.parametrize("raw", ["''", "'   '", "[]", "{}"])
-def test_parse_delegation_role_rejects_invalid_value(
-  tmp_path: Path,
-  raw: str,
-) -> None:
-  skill_path = _write_skill(tmp_path, f"delegation_role: {raw}")
-
-  with pytest.raises(ValueError, match="delegation_role"):
-    parse_skill_file(skill_path)
 
 
 def test_list_callable_skills_with_descriptions_filters_truncates_and_placeholders(
@@ -264,6 +241,7 @@ def test_list_callable_skills_with_descriptions_filters_truncates_and_placeholde
     agent_callable: true
     agent_description: Alpha reviews earnings.
     """,
+    execution_class="node.implement",
   )
   _write_named_skill(
     skills_dir,
@@ -271,6 +249,7 @@ def test_list_callable_skills_with_descriptions_filters_truncates_and_placeholde
     """
     agent_callable: true
     """,
+    execution_class="node.implement",
   )
   _write_named_skill(
     skills_dir,
@@ -279,6 +258,7 @@ def test_list_callable_skills_with_descriptions_filters_truncates_and_placeholde
     agent_callable: true
     agent_description: {long_description}
     """,
+    execution_class="node.implement",
   )
   _write_named_skill(
     skills_dir,
@@ -286,6 +266,7 @@ def test_list_callable_skills_with_descriptions_filters_truncates_and_placeholde
     """
     agent_description: Hidden from callable catalog.
     """,
+    execution_class="node.implement",
   )
 
   entries = SkillLoader(skills_dir).list_callable_skills_with_descriptions()
@@ -314,6 +295,7 @@ def test_parse_lifts_top_level_keys(tmp_path: Path) -> None:
     initial_message: Run from top level.
     delivery_label: Top Level
     """,
+    execution_class="node.implement",
   )
 
   profile = parse_skill_file(skill_path)
@@ -344,6 +326,7 @@ def test_parse_agent_fields_from_frontmatter(tmp_path: Path) -> None:
     mode: recommend
     tool_packs_enabled: false
     """,
+    execution_class="node.implement",
   )
 
   profile = parse_skill_file(skill_path)
@@ -361,6 +344,7 @@ def test_parse_state_class_from_frontmatter(tmp_path: Path) -> None:
     name: stateful-skill
     state_class: producer
     """,
+    execution_class="node.implement",
   )
 
   profile = parse_skill_file(skill_path)
@@ -375,6 +359,7 @@ def test_parse_invalid_state_class_raises(tmp_path: Path) -> None:
     """
     state_class: writes-sometimes
     """,
+    execution_class="node.implement",
   )
 
   with pytest.raises(ValueError, match="state_class"):
@@ -382,7 +367,7 @@ def test_parse_invalid_state_class_raises(tmp_path: Path) -> None:
 
 
 def test_parse_resumable_defaults_load_cleanly(tmp_path: Path) -> None:
-  skill_path = _write_skill(tmp_path, None)
+  skill_path = _write_skill(tmp_path, None, execution_class="node.implement")
 
   profile = parse_skill_file(skill_path)
 
@@ -398,6 +383,7 @@ def test_parse_resumable_with_session_injection_loads(tmp_path: Path) -> None:
     session_inject_servers:
       - browser
     """,
+    execution_class="node.implement",
   )
 
   profile = parse_skill_file(skill_path)
@@ -412,6 +398,7 @@ def test_scalar_session_inject_servers_shape_rejected(tmp_path: Path) -> None:
     """
     session_inject_servers: browser
     """,
+    execution_class="node.implement",
   )
 
   with pytest.raises(ValueError, match="'session_inject_servers' must be a list of strings"):
@@ -426,6 +413,7 @@ def test_invalid_session_inject_servers_entry_type_rejected(tmp_path: Path) -> N
       - browser
       - 7
     """,
+    execution_class="node.implement",
   )
 
   with pytest.raises(ValueError, match="'session_inject_servers' entries must be strings"):
@@ -440,6 +428,7 @@ def test_null_session_inject_servers_entry_rejected(tmp_path: Path) -> None:
       - browser
       -
     """,
+    execution_class="node.implement",
   )
 
   with pytest.raises(ValueError, match="'session_inject_servers' entries must be strings"):
@@ -458,6 +447,7 @@ def test_mixed_known_and_unknown_metadata(tmp_path: Path) -> None:
       owner: analyst
     custom_limit: 5
     """,
+    execution_class="node.implement",
   )
 
   profile = parse_skill_file(skill_path)
@@ -483,6 +473,7 @@ def test_declared_timeout_overrides_are_not_a_profile_field(tmp_path: Path) -> N
         - gmail
         - 30
     """,
+    execution_class="node.implement",
   )
 
   profile = parse_skill_file(skill_path)
@@ -499,6 +490,7 @@ def test_declared_turn_and_cost_numbers_are_not_profile_fields(tmp_path: Path) -
     metadata:
       max_budget_usd: "0.75"
     """,
+    execution_class="node.implement",
   )
 
   profile = parse_skill_file(skill_path)
@@ -508,51 +500,12 @@ def test_declared_turn_and_cost_numbers_are_not_profile_fields(tmp_path: Path) -
   assert profile.metadata == {"max_budget_usd": "0.75", "max_turns": 20}
 
 
-def test_none_defaults(tmp_path: Path) -> None:
-  skill_path = _write_skill(
-    tmp_path,
-    """
-    name: defaults
-    """,
-  )
-
-  profile = parse_skill_file(skill_path)
-
-  assert profile.metadata is None
-  assert profile.mcp_servers is None
-  assert profile.session_inject_servers is None
-  assert profile.state_dir is None
-  assert profile.initial_message is None
-  assert profile.delivery_label is None
-  assert profile.agent_callable is False
-  assert profile.agent_description is None
-  assert profile.mode == "full"
-  assert profile.tool_packs_enabled is True
-  assert profile.state_class is None
-  assert profile.max_structured_reads is None
-  assert profile.delegation_role is None
 
 
-def test_dataclass_construction_defaults() -> None:
-  profile = SkillProfile(name="x", system_prompt="y")
-
-  assert profile.metadata is None
-  assert profile.mcp_servers is None
-  assert profile.session_inject_servers is None
-  assert profile.state_dir is None
-  assert profile.initial_message is None
-  assert profile.delivery_label is None
-  assert profile.agent_callable is False
-  assert profile.agent_description is None
-  assert profile.mode == "full"
-  assert profile.tool_packs_enabled is True
-  assert profile.state_class is None
-  assert profile.max_structured_reads is None
-  assert profile.delegation_role is None
 
 
 def test_positional_construction_compat() -> None:
-  profile = SkillProfile("name", "prompt", None, None, None, False, None, False, {"custom": 1})
+  profile = SkillProfile("name", "prompt", None, None, None, False, None, False, {"custom": 1}, execution_class="node.implement")
 
   assert profile.name == "name"
   assert profile.system_prompt == "prompt"
@@ -563,11 +516,10 @@ def test_positional_construction_compat() -> None:
   assert profile.mode == "full"
   assert profile.tool_packs_enabled is True
   assert profile.max_structured_reads is None
-  assert profile.delegation_role is None
 
 
 def test_agent_profile_subclass_compat() -> None:
-  profile = SkillProfile(name="agent", system_prompt="", agent_description="Agent description")
+  profile = SkillProfile(name="agent", system_prompt="", agent_description="Agent description", execution_class="node.implement")
 
   assert profile.name == "agent"
   assert profile.agent_description == "Agent description"
@@ -585,6 +537,7 @@ def test_parse_invalid_mode_raises(tmp_path: Path) -> None:
     """
     mode: bogus
     """,
+    execution_class="node.implement",
   )
 
   with pytest.raises(ValueError, match="mode"):
@@ -600,6 +553,7 @@ def test_metadata_retains_known_keys(tmp_path: Path) -> None:
         - gmail
       delivery_label:
     """,
+    execution_class="node.implement",
   )
 
   profile = parse_skill_file(skill_path)
@@ -616,6 +570,7 @@ def test_empty_mcp_servers_is_none(tmp_path: Path) -> None:
     """
     mcp_servers: []
     """,
+    execution_class="node.implement",
   )
 
   profile = parse_skill_file(skill_path)
@@ -632,6 +587,7 @@ def test_invalid_mcp_server_entry_type_rejected(tmp_path: Path) -> None:
       - portfolio-reads-mcp
       - 7
     """,
+    execution_class="node.implement",
   )
 
   with pytest.raises(ValueError, match="'mcp_servers' entries must be strings"):
@@ -644,6 +600,7 @@ def test_scalar_mcp_servers_shape_rejected(tmp_path: Path) -> None:
     """
     mcp_servers: portfolio-reads-mcp
     """,
+    execution_class="node.implement",
   )
 
   with pytest.raises(ValueError, match="'mcp_servers' must be a list of strings"):
@@ -657,6 +614,7 @@ def test_empty_mcp_tools_is_none(tmp_path: Path) -> None:
     mcp_tools:
       portfolio-reads-mcp: []
     """,
+    execution_class="node.implement",
   )
 
   profile = parse_skill_file(skill_path)
@@ -672,6 +630,7 @@ def test_invalid_mcp_tools_shape_rejected(tmp_path: Path) -> None:
     mcp_tools:
       - get_model_insights
     """,
+    execution_class="node.implement",
   )
 
   with pytest.raises(ValueError, match="mcp_tools"):
@@ -686,6 +645,7 @@ def test_invalid_mcp_tools_server_name_type_rejected(tmp_path: Path) -> None:
       7:
         - search
     """,
+    execution_class="node.implement",
   )
 
   with pytest.raises(ValueError, match="'mcp_tools' server names must be strings"):
@@ -701,6 +661,7 @@ def test_invalid_mcp_tools_tool_name_type_rejected(tmp_path: Path) -> None:
         - search
         - 7
     """,
+    execution_class="node.implement",
   )
 
   with pytest.raises(ValueError, match="'mcp_tools.research-corpus-mcp' entries must be strings"):
@@ -714,6 +675,7 @@ def test_scalar_mcp_tool_names_shape_rejected(tmp_path: Path) -> None:
     mcp_tools:
       research-corpus-mcp: search
     """,
+    execution_class="node.implement",
   )
 
   with pytest.raises(ValueError, match="'mcp_tools.research-corpus-mcp' must be a list of strings"):
@@ -796,10 +758,11 @@ def test_compile_does_not_judge_declared_requirements_against_the_ceiling(
           required: true
           binding_modes: [live_tool]
     """,
+    execution_class="node.explore",
   )
   profile = parse_skill_file(skill_path)
 
-  operation = compile_agent_operation(profile, execution_class="node.explore")
+  operation = compile_agent_operation(profile)
 
   assert [item.name for item in operation.required_capabilities] == [
     "market-data.read/v1"
@@ -833,9 +796,10 @@ def test_shim_named_profile_without_declarations_needs_nothing(
       semantic_metadata:
         tool_refs: []
       """,
+      execution_class="node.verify",
     )
   )
 
-  operation = compile_agent_operation(profile, execution_class="node.verify")
+  operation = compile_agent_operation(profile)
 
   assert operation.required_capabilities == ()

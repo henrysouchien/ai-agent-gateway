@@ -41,6 +41,7 @@ class _StubMcpClient:
 class _StubRunner:
   def __init__(self) -> None:
     self._full_session_id = "session-sub-agent"
+    self._spill_dir_provider = None
     self.calls: list[dict[str, Any]] = []
 
   async def spawn_sub_agent(self, task: str, **kwargs: Any):

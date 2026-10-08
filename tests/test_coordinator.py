@@ -28,7 +28,7 @@ from agent_gateway import (
 )
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CapabilityId, ModelSelectionIntent
-from model_authority.selection import TierDefaultInput
+from model_authority.selection import SelectionSnapshot, TierDefaultInput
 from agent_gateway.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
@@ -134,6 +134,7 @@ class _CapabilityResolver(CapabilityExecutionResolver):
     role_map: Mapping[str, TierDefaultInput] | None = None,
     role_map_source: Literal["saved_preference", "internal_policy"] | None = None,
     requested_role_source: Literal["explicit_user", "internal_policy"] = "internal_policy",
+    selection_snapshot: SelectionSnapshot | None = None,
   ) -> CapabilityBind:
     self.calls.append({
       "capability_id": capability_id,

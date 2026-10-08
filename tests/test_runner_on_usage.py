@@ -12,6 +12,8 @@ from typing import Any
 import httpx
 import pytest
 
+from agent_gateway.admission import root_context
+
 from agent_workflow_contracts import (
   AgentOperationRef,
   AttemptRef,
@@ -1663,6 +1665,7 @@ def test_spawn_sub_agent_emits_usage_with_parent_turn_id(tmp_path: Path) -> None
     user_id="alice",
     auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
   )
+  root_context(sub_session, withheld_tools=frozenset(), research_file_id=None)
   child_runner_ref: list[Any] = []
   result, error = _run(
     parent_runner.spawn_sub_agent(

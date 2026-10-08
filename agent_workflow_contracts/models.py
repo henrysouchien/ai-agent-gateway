@@ -1149,7 +1149,7 @@ class AdmittedTask(WireModel):
 
 
 class ExecutionSettlement(WireModel):
-  status: Literal["succeeded", "failed", "interrupted", "cancelled", "skipped"]
+  status: Literal["succeeded", "failed", "interrupted", "cancelled", "skipped", "awaiting_approval"]
   terminal_reason: NonEmptyText | None = None
 
   @model_validator(mode="after")
@@ -1318,7 +1318,7 @@ class TaskResult(WireModel):
 def terminal_task_result(
   admitted_task: AdmittedTask,
   *,
-  status: Literal["failed", "interrupted", "cancelled", "skipped"],
+  status: Literal["failed", "interrupted", "cancelled", "skipped", "awaiting_approval"],
   reason: str,
   tools_used: tuple[str, ...] = (),
   usage: UsageObservation | None = None,
@@ -1330,7 +1330,7 @@ def terminal_task_result(
   admitted task instead of being independently supplied by the caller.
   """
 
-  if status not in {"failed", "interrupted", "cancelled", "skipped"}:
+  if status not in {"failed", "interrupted", "cancelled", "skipped", "awaiting_approval"}:
     raise ValueError("terminal task result requires a non-success status")
   execution = ExecutionSettlement(status=status, terminal_reason=reason)
   usage_observation = usage or UsageObservation()
@@ -1487,7 +1487,7 @@ ParentResultMaterialization: TypeAlias = Annotated[
 
 
 class SettlementProjection(WireModel):
-  execution_status: Literal["succeeded", "failed", "interrupted", "cancelled", "skipped"]
+  execution_status: Literal["succeeded", "failed", "interrupted", "cancelled", "skipped", "awaiting_approval"]
   outcome_disposition: Literal["complete", "partial", "insufficient_evidence", "blocked", "not_assessed"] | None = None
   terminal_reason: NonEmptyText | None = Field(
     default=None,

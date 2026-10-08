@@ -110,7 +110,7 @@ def test_create_agent_forwards_mcp_session_inject_servers_to_run_agent(
   tmp_path: Path,
 ) -> None:
   skills_dir = tmp_path / "skills"
-  _write_skill(skills_dir, "browser-worker", "Use the browser tools.")
+  _write_skill(skills_dir, "browser-worker", "---\nname: browser-worker\nexecution_class: node.implement\n---\nUse the browser tools.")
   captured: dict[str, Any] = {}
 
   async def _fake_run_agent(_tool_input, **_kwargs):
