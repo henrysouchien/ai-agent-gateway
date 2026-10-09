@@ -76,7 +76,7 @@ def _make_app(
     def _build_runner(event_log, session_id, started_at):
       return AgentRunner(
         event_log,
-        ToolDispatcher(mcp_client=McpClientManager(config_path=None)),
+        ToolDispatcher(capability_bind=request.capability_execution.bind, mcp_client=McpClientManager(config_path=None)),
         session_id,
         capability_execution=request.capability_execution,
         started_at=started_at,

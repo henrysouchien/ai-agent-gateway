@@ -13,7 +13,7 @@ from dataclasses import fields as dataclass_fields, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Literal, Mapping
 
 import pytest
 
@@ -22,10 +22,25 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import EventLog, ToolDispatcher
+from agent_gateway import AgentRunner, EventLog, ToolDispatcher
 from agent_gateway import policy_imports
 from agent_gateway import tool_dispatcher as dispatcher_module
 from agent_gateway import tool_dispatcher_approval_lifecycle as lifecycle_helpers
+from agent_gateway.admission import (
+  AdmittedContext, ContinuationOwners, ContinueRequest, admit, admit_root_turn,
+  capture_job_context, capture_root_turn, context_for_child, current_parent_context,
+  current_root_turn, record_root_turn_admission, root_context,
+)
+from agent_gateway.approval_store import SQLiteApprovalStore
+from agent_gateway.approvals import _approval_request_to_dict
+from agent_gateway.agent_session_log import AgentSessionLog
+from agent_gateway.capability_execution import CapabilityExecutionResolver
+from agent_gateway.execution_identity import DispatchIdentity
+from agent_gateway.providers import ModelInfo, ModelProvider, StreamEvent
+from agent_gateway.skills import SkillLoader
+from agent_gateway.sub_agent import make_run_agent_handler
+from gateway_test_support.capability_execution_test_support import stub_capability_execution_resolver
+from gateway_test_support.host_policy import owner_session_host_policy
 from agent_gateway.approval_policy import (
   ApprovalDecision as PolicyApprovalDecision,
   ApprovalRequest as PolicyApprovalRequest,
@@ -37,6 +52,8 @@ from agent_gateway.approval_policy import (
 )
 from agent_gateway.approval_route import (
   NoApprovalRoute,
+  DurableLocalApprovalRoute,
+  InProcessDelegatedApprovalRoute,
   ParentDelegatedApprovalRoute,
 )
 from agent_gateway.autonomous_approval_channel import (
@@ -825,6 +842,7 @@ def test_delegated_run_settles_everything_but_the_money_boundary(
       ),
       session=session,
       producer_session=session,
+      executable_capture=None,
       tool_call_id="call-idea-triage",
       tool_name="idea_triage_decide",
       tool_input={"decisions": [{"id": 1, "verdict": "dismiss"}]},
@@ -865,3 +883,804 @@ def test_delegated_run_settles_everything_but_the_money_boundary(
 
 
 
+
+class _NativeCapturePolicy(SingleUserApprovalPolicy):
+  def __init__(
+    self,
+    outcome: Literal["request_user_approval", "auto_approve", "auto_deny"],
+  ) -> None:
+    super().__init__()
+    self.outcome: Literal["request_user_approval", "auto_approve", "auto_deny"] = outcome
+
+  async def decide(self, **_kwargs: Any) -> PolicyApprovalDecision:
+    return PolicyApprovalDecision(outcome=self.outcome, reason="capture test")
+
+
+def _native_capture_dispatcher(
+  tmp_path: Path,
+  *,
+  outcome: Literal["request_user_approval", "auto_approve", "auto_deny"] = "request_user_approval",
+  delegated: bool = False,
+  admitted: bool = True,
+  credential_generation_ref: str | None = "anthropic-generation-original",
+) -> tuple[ToolDispatcher, SQLiteApprovalStore, GatewaySession]:
+  store = SQLiteApprovalStore(tmp_path / "native-capture.sqlite3")
+  parent = _gateway_session()
+  producer = _gateway_session(session_id="child-session") if delegated else parent
+  # Mutable session configuration deliberately disagrees with the frozen bind.
+  producer.auth_config = {
+    "credential_source": {"generation_ref": "anthropic-generation-session-rotated"},
+  }
+  ledger = DurableLocalApprovalRoute(store, _NativeCapturePolicy(outcome), parent)
+  route = InProcessDelegatedApprovalRoute(ledger) if delegated else ledger
+  producer.approval_route = route
+  if admitted:
+    context = root_context(
+      producer,
+      withheld_tools=frozenset(),
+      research_file_id=None,
+    )
+    capture_job_context(
+      producer,
+      replace(context, job_id="job-child" if delegated else "job-native"),
+    )
+
+  async def handler(_input: dict[str, Any], **_kwargs: Any) -> ToolResult:
+    return {"ok": True}, None
+
+  dispatcher = ToolDispatcher(
+    capability_bind=stub_capability_execution_resolver().resolve("session.driver").bind.model_copy(
+      update={"credential_ref": credential_generation_ref or "service:openai"},
+    ),
+    mcp_client=_NullMcp(),
+    local_tool_handlers={"native_write": handler},
+    needs_approval=lambda *_args: True,
+    session=producer,
+    role="owner",
+    approval_route=route,
+    run_context=RunContext(user_id="alice", request_id="capture-request"),
+  )
+  dispatcher.bind_secret_boundary(SecretBoundary(("raw-original-operand", "private-root-operand")))
+  return dispatcher, store, parent
+
+
+async def _wait_for_native_queue(
+  session: GatewaySession,
+  task: asyncio.Task[Any],
+  tool_call_id: str,
+) -> asyncio.Queue:
+  async def wait_for_publication() -> asyncio.Queue:
+    while tool_call_id not in session.approval_queues:
+      if task.done():
+        raise AssertionError(f"Native call exited before parking: {task.result()}")
+      await asyncio.sleep(0.01)
+    return session.approval_queues[tool_call_id]
+
+  return await asyncio.wait_for(wait_for_publication(), timeout=10)
+
+
+@pytest.mark.parametrize("advertised", [None, frozenset({"z_tool", "native_write", "a_tool"})])
+@pytest.mark.parametrize("delegated", [False, True])
+@pytest.mark.parametrize("credential_generation_ref", [None, "anthropic-generation-original"])
+def test_native_park_captures_exact_call_and_dispatch_operands(
+  tmp_path: Path,
+  owner_session_host_policy: Any,
+  monkeypatch: pytest.MonkeyPatch,
+  advertised: frozenset[str] | None,
+  delegated: bool,
+  credential_generation_ref: str | None,
+) -> None:
+  async def scenario() -> None:
+    dispatcher, store, parent = _native_capture_dispatcher(
+      tmp_path,
+      delegated=delegated,
+      credential_generation_ref=credential_generation_ref,
+    )
+    original = PreparedToolCall(
+      {"ticker": "MSFT", "api_key": "raw-original-operand"},
+      exact_backend="original-backend",
+    )
+    recorded_calls: list[PreparedToolCall] = []
+    record_binding = store.record_executable_binding
+
+    async def observe_binding(**kwargs: Any) -> None:
+      recorded_calls.append(kwargs["prepared_call"])
+      await record_binding(**kwargs)
+
+    monkeypatch.setattr(store, "record_executable_binding", observe_binding)
+    task = asyncio.create_task(dispatcher.dispatch_prepared(
+      "call-capture",
+      "native_write",
+      original,
+      call_index=7,
+      advertised_tool_names=advertised,
+      skill_run_id="original-skill",
+      step_id="original-step",
+      workspace_dir="/original/workspace",
+      batch_id="original-batch",
+      capture_readable_resource_snapshot=True,
+      allow_uncertain_mcp_replay=False,
+      abort_event=asyncio.Event(),
+      on_executed_prepared_call=lambda _call: None,
+    ))
+    queue = await _wait_for_native_queue(parent, task, "call-capture")
+    assert len(recorded_calls) == 1 and recorded_calls[0] is original
+    pending = parent.pending_tools["call-capture"]
+    binding, request = await store._read_executable_binding_for_executor(
+      job_id="job-child" if delegated else "job-native",
+      tool_call_id="call-capture",
+      nonce=pending["nonce"],
+      tenant_storage_id="alice",
+    )
+    assert request.state == "pending_user"
+    assert binding.approval_id == pending["approval_id"]
+    assert binding.prepared_input == original.prepared_input
+    assert binding.exact_backend == original.exact_backend
+    assert binding.credential_generation_ref == credential_generation_ref
+    assert binding.dispatch_context == PreparedToolCall({
+      "call_index": 7,
+      "advertised_tool_names": sorted(advertised) if advertised is not None else None,
+      "skill_run_id": "original-skill",
+      "step_id": "original-step",
+      "workspace_dir": "/original/workspace",
+      "batch_id": "original-batch",
+      "capture_readable_resource_snapshot": True,
+      "allow_uncertain_mcp_replay": False,
+    }).prepared_input
+    projection = _approval_request_to_dict(request)
+    assert "raw-original-operand" not in json.dumps(projection)
+    assert "prepared_input" not in projection
+    assert "dispatch_context" not in projection
+    assert "original-backend" not in json.dumps(projection)
+    await store.transition_state(
+      request.approval_id,
+      "denied",
+      expected_state_version=request.state_version,
+      decider_id="alice",
+      decider_role="owner",
+      decision="denied",
+    )
+    await queue.put({"approved": False, "allow_tool_type": False})
+    result, error = await task
+    assert result is None
+    assert error is not None and error["code"] == "user_denied"
+
+  asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("outcome", ["auto_approve", "auto_deny"])
+def test_native_automatic_decisions_record_no_executable_binding(
+  tmp_path: Path,
+  outcome: Literal["auto_approve", "auto_deny"],
+  owner_session_host_policy: Any,
+) -> None:
+  dispatcher, store, parent = _native_capture_dispatcher(tmp_path, outcome=outcome)
+  result, error = asyncio.run(dispatcher.dispatch_prepared(
+    "call-automatic",
+    "native_write",
+    PreparedToolCall({"ticker": "MSFT"}, exact_backend="original-backend"),
+  ))
+  assert (error is None) == (outcome == "auto_approve")
+  assert (result is not None) == (outcome == "auto_approve")
+  assert parent.pending_tools == {}
+  with store._connection() as conn:
+    assert conn.execute("SELECT COUNT(*) FROM approval_executable_bindings").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("missing_context", ["job", "tenant"])
+def test_native_park_without_admitted_job_observes_and_continues(
+  tmp_path: Path,
+  owner_session_host_policy: Any,
+  caplog: pytest.LogCaptureFixture,
+  missing_context: str,
+) -> None:
+  async def scenario() -> None:
+    dispatcher, store, parent = _native_capture_dispatcher(
+      tmp_path, admitted=missing_context == "tenant",
+    )
+    if missing_context == "tenant":
+      capture_job_context(parent, replace(current_parent_context(parent), tenant=None))
+    else:
+      assert parent.admitted_job_context is None
+      assert dispatcher._executing_context() is None
+    task = asyncio.create_task(dispatcher.dispatch_prepared(
+      "call-no-job",
+      "native_write",
+      PreparedToolCall({"ticker": "MSFT"}),
+    ))
+    queue = await _wait_for_native_queue(parent, task, "call-no-job")
+    assert parent.pending_tools["call-no-job"]["status"] == "approval_pending"
+    with store._connection() as conn:
+      assert conn.execute("SELECT COUNT(*) FROM approval_executable_bindings").fetchone()[0] == 0
+    await queue.put({"approved": False, "allow_tool_type": False})
+    result, error = await task
+    assert result is None
+    assert error is not None and error["code"] == "user_denied"
+    warnings = [record for record in caplog.records if "approval_capture_without_job_context" in record.message]
+    assert len(warnings) == 1
+    assert "native_write" in warnings[0].message
+    assert "call-no-job" in warnings[0].message
+    assert f"missing_job_id={missing_context == 'job'}" in warnings[0].message
+    assert "missing_tenant_storage_id=True" in warnings[0].message
+
+  asyncio.run(scenario())
+
+
+class _NativeChildCaptureProvider(ModelProvider):
+  name = "openai"
+
+  def __init__(self) -> None:
+    self.turn = 0
+
+  def has_active_credential(self, config: dict[str, Any]) -> bool:
+    return bool(config.get("api_key"))
+
+  def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
+    return object()
+
+  async def close_client(self, client: Any, timeout: float = 2.0) -> None:
+    return None
+
+  def get_model_info(self, model: str) -> ModelInfo:
+    return ModelInfo(id=model, provider=self.name)
+
+  def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
+    return kwargs
+
+  async def stream(self, client: Any, params: dict[str, Any]):
+    self.turn += 1
+    if self.turn == 1:
+      assert "web_search" in {definition["name"] for definition in params["tools"]}
+      tool_input = {"query": "exact child operand"}
+      yield StreamEvent(type="tool_use_start", tool_id="call-real-child", tool_name="web_search")
+      yield StreamEvent(
+        type="tool_use_end",
+        tool_id="call-real-child",
+        tool_name="web_search",
+        tool_input=tool_input,
+        raw_block={
+          "type": "tool_use",
+          "id": "call-real-child",
+          "name": "web_search",
+          "input": tool_input,
+        },
+      )
+      yield StreamEvent(type="message_end", stop_reason="tool_use")
+      return
+    text = "Child finished after the approval decision."
+    yield StreamEvent(type="text_delta", text=text)
+    yield StreamEvent(type="text_end", raw_block={"type": "text", "text": text})
+    yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+
+def test_real_in_process_child_capture_uses_child_job_not_parent_session(
+  tmp_path: Path,
+  owner_session_host_policy: Any,
+) -> None:
+  owner_session_host_policy.get_local_tool_effect = lambda _name: "read"
+
+  async def scenario() -> None:
+    parent = _gateway_session(
+      session_id="parent-capture-session",
+      tenant_id="tenant-capture",
+      auth_config={
+        "provider": "openai",
+        "api_key": "opaque",
+        "credential_source": {"generation_ref": "parent-bound-generation"},
+      },
+    )
+    store = SQLiteApprovalStore(tmp_path / "real-child.sqlite3")
+    policy = _NativeCapturePolicy("request_user_approval")
+    parent.approval_route = DurableLocalApprovalRoute(store, policy, parent)
+    parent.approval_store = store
+    parent.approval_policy = policy
+    parent_context = root_context(
+      parent,
+      withheld_tools=frozenset(),
+      research_file_id=None,
+    )
+
+    async def native_tool(_input: dict[str, Any], **_kwargs: Any) -> ToolResult:
+      raise AssertionError("The denied child's tool must not execute")
+
+    definition = {
+      "name": "web_search",
+      "description": "Native test tool requiring approval.",
+      "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}},
+    }
+    handlers: dict[str, LocalToolHandler] = {"web_search": native_tool}
+    mcp = _NullMcp()
+    dispatcher = ToolDispatcher(
+      capability_bind=stub_capability_execution_resolver(
+        default_provider="openai", default_model="gpt-5.6-sol",
+      ).resolve("session.driver").bind,
+      mcp_client=mcp,
+      local_tool_handlers=handlers,
+      session=parent,
+      approval_route=parent.approval_route,
+      session_id=parent.session_id,
+      event_log=EventLog(),
+      get_tool_definitions=lambda: [definition],
+    )
+    provider = _NativeChildCaptureProvider()
+    base = stub_capability_execution_resolver(
+      default_provider="openai",
+      default_model="gpt-5.6-sol",
+    )
+    resolver = CapabilityExecutionResolver(
+      registry=base.registry,
+      selection_policy=base.selection_policy,
+      auth_context=base.auth_context,
+      credential_materializer=base.credential_materializer,
+      adapter_resolver=lambda _adapter: provider,
+      trusted_channel=base.trusted_channel,
+      authenticated_run_overrides=base.authenticated_run_overrides,
+      executable_capability_ids=base.executable_capability_ids,
+    )
+    observed: dict[str, Any] = {}
+
+    class ObservingParentRunner(AgentRunner):
+      async def spawn_sub_agent(self, task: str, **kwargs: Any):
+        observed.update(kwargs)
+        return await super().spawn_sub_agent(task, **kwargs)
+
+    runner = ObservingParentRunner(
+      event_log=EventLog(),
+      dispatcher=dispatcher,
+      session_id=parent.session_id,
+      capability_execution=resolver.resolve("session.driver"),
+      get_tool_definitions=dispatcher.get_tool_definitions,
+      agent_session_log=AgentSessionLog(path=tmp_path / "sessions" / "capture.jsonl"),
+      workspace_dir=str(tmp_path),
+      user_id=parent.user_id,
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    runner._runner_id = "capture-parent"
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    (skills_dir / "native-capture-child.md").write_text(
+      "---\nname: native-capture-child\nexecution_class: node.explore\n"
+      "version: '1.0'\nagent_callable: true\nagent_description: Exercise native approval.\n"
+      "mutation_mode: read_only\nallowed_tools: [web_search]\nmcp_tools: {}\n"
+      "semantic_metadata:\n  required_context: []\n"
+      "  tool_refs:\n    - kind: local\n      tool_id: web_search\n"
+      "  capability_requirements:\n    - name: web.read/v1\n"
+      "      required: true\n      binding_modes: [live_tool]\n"
+      "---\nMake the admitted tool call.\n",
+      encoding="utf-8",
+    )
+    loader = SkillLoader(skills_dir)
+    operation = next(
+      item.snapshot.operation.model_dump(mode="json")
+      for item in loader.list_callable_operations()
+      if item.snapshot.operation.name == "native-capture-child"
+    )
+    spawn = make_run_agent_handler(
+      [runner],
+      parent_session=parent,
+      skill_loader=loader,
+      mcp_client=mcp,
+      local_tool_handlers=handlers,
+      capability_execution_resolver=resolver,
+      needs_approval=lambda *_args: True,
+      declared_local_tool_definitions=(
+        lambda requested: [definition] if "web_search" in requested else []
+      ),
+    )
+    task = asyncio.create_task(spawn({
+      "operation": operation,
+      "objective": "Make the native child tool call.",
+      "background": False,
+    }))
+    try:
+      async def wait_for_real_child_queue() -> asyncio.Queue:
+        while "call-real-child" not in parent.approval_queues:
+          if task.done():
+            raise AssertionError(f"Child exited before parking: {task.result()}")
+          await asyncio.sleep(0.01)
+        return parent.approval_queues["call-real-child"]
+
+      queue = await asyncio.wait_for(wait_for_real_child_queue(), timeout=10)
+      child_session = observed["sub_session"]
+      child_context = current_parent_context(child_session)
+      child_job_id = observed["admitted_task"].attempt.physical_task_id
+      assert child_session is not parent
+      assert observed["dispatcher"]._session is parent
+      assert child_context.job_id == child_job_id
+      assert child_job_id != parent_context.job_id
+      assert current_parent_context(parent).job_id == parent_context.job_id
+      assert child_context.tenant is not None
+      pending = parent.pending_tools["call-real-child"]
+      binding, request = await store._read_executable_binding_for_executor(
+        job_id=child_job_id,
+        tool_call_id="call-real-child",
+        nonce=pending["nonce"],
+        tenant_storage_id=child_context.tenant.storage_id,
+      )
+      assert binding.job_id == child_job_id
+      assert binding.job_id != parent_context.job_id
+      assert binding.approval_id == pending["approval_id"]
+      assert binding.prepared_input == {"query": "exact child operand"}
+      assert request.state == "pending_user"
+      await store.transition_state(
+        request.approval_id,
+        "denied",
+        expected_state_version=request.state_version,
+        decider_id="alice",
+        decider_role="owner",
+        decision="denied",
+      )
+      await queue.put({"approved": False, "allow_tool_type": False})
+      await asyncio.wait_for(task, timeout=10)
+
+      # A continuation retains its durable child's bind after parent rotation.
+      durable_child = observed["admitted_task"]
+      frozen_bind = durable_child.model_bind.model_copy(
+        update={"credential_ref": "anthropic-generation-child-frozen"},
+      )
+      durable_child = durable_child.model_copy(update={"model_bind": frozen_bind})
+      assert parent.auth_config is not None
+      parent.auth_config["credential_source"] = {
+        "generation_ref": "anthropic-generation-parent-rotated",
+      }
+      continued = admit(
+        ContinueRequest(child_job_id),
+        current_parent_context(parent),
+        owners=ContinuationOwners(
+          task=durable_child,
+          research_binding=child_context.research_binding,
+        ),
+      )
+      assert isinstance(continued, AdmittedContext)
+      assert continued.wire.capability_bind == frozen_bind
+      resumed_dispatcher = ToolDispatcher(
+        capability_bind=continued.wire.capability_bind,
+        mcp_client=mcp,
+        local_tool_handlers=handlers,
+        needs_approval=lambda *_args: True,
+        role="owner",
+        approval_route=continued.approval_route,
+        identity=DispatchIdentity(
+          context=context_for_child(continued, job_id=child_job_id),
+          session=parent,
+        ),
+      )
+      resumed_task = asyncio.create_task(resumed_dispatcher.dispatch_prepared(
+        "call-resumed-child", "web_search", PreparedToolCall({"query": "resumed child"}),
+      ))
+      try:
+        resumed_queue = await _wait_for_native_queue(parent, resumed_task, "call-resumed-child")
+        resumed_pending = parent.pending_tools["call-resumed-child"]
+        resumed_binding, resumed_request = await store._read_executable_binding_for_executor(
+          job_id=child_job_id,
+          tool_call_id="call-resumed-child",
+          nonce=resumed_pending["nonce"],
+          tenant_storage_id=child_context.tenant.storage_id,
+        )
+        assert resumed_binding.credential_generation_ref == frozen_bind.credential_ref
+        assert resumed_binding.job_id == child_job_id
+        assert resumed_dispatcher._executing_root_turn() is None
+        await store.transition_state(
+          resumed_request.approval_id,
+          "denied",
+          expected_state_version=resumed_request.state_version,
+          decider_id="alice", decider_role="owner", decision="denied",
+        )
+        await resumed_queue.put({"approved": False, "allow_tool_type": False})
+        _, resumed_error = await asyncio.wait_for(resumed_task, timeout=10)
+        assert resumed_error is not None and resumed_error["code"] == "user_denied"
+      finally:
+        if not resumed_task.done():
+          resumed_task.cancel()
+          with pytest.raises(asyncio.CancelledError):
+            await resumed_task
+    finally:
+      if not task.done():
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+          await task
+
+  asyncio.run(scenario())
+
+
+def test_native_root_park_links_captured_turn_on_ledger_store(
+  tmp_path: Path,
+  owner_session_host_policy: Any,
+) -> None:
+  async def scenario() -> None:
+    dispatcher, store, session = _native_capture_dispatcher(tmp_path)
+    execution = stub_capability_execution_resolver().resolve("session.driver")
+    execution = replace(execution, bind=dispatcher._capability_bind)
+    root_turn = admit_root_turn(
+      current_parent_context(session),
+      execution=execution,
+      tool_grant={"tool_ids": ["native_write"]},
+      approval_route=session.approval_route,
+    )
+    root_turn = await record_root_turn_admission(store, root_turn)
+    capture_root_turn(session, root_turn)
+    assert current_root_turn(session) is root_turn
+    assert dispatcher._executing_root_turn() is root_turn
+    task = asyncio.create_task(dispatcher.dispatch_prepared(
+      "call-root-park", "native_write", PreparedToolCall({"api_key": "private-root-operand"}),
+    ))
+    try:
+      queue = await _wait_for_native_queue(session, task, "call-root-park")
+      pending = session.pending_tools["call-root-park"]
+      reopened = SQLiteApprovalStore(store.path)
+      assert await reopened._locate_root_turn_for_approval(
+        approval_id=pending["approval_id"], tenant_storage_id="alice",
+      ) == ("job-native", "call-root-park", pending["nonce"], root_turn.turn_id)
+      record = await reopened._read_root_turn_for_executor(
+        job_id="job-native", turn_id=root_turn.turn_id, tenant_storage_id="alice",
+      )
+      assert record is not None
+      assert len(record.executable_refs) == 1
+      request = await store.get(pending["approval_id"])
+      assert request is not None and request.state == "pending_user"
+      assert "private-root-operand" not in json.dumps(_approval_request_to_dict(request))
+      await store.transition_state(
+        request.approval_id, "denied", expected_state_version=request.state_version,
+        decider_id="alice", decider_role="owner", decision="denied",
+      )
+      await queue.put({"approved": False, "allow_tool_type": False})
+      _, error = await task
+      assert error is not None and error["code"] == "user_denied"
+    finally:
+      if not task.done():
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+          await task
+
+  asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("child_identity", [False, True])
+@pytest.mark.parametrize("scheduled_learning_fork", [False, True])
+def test_fork_parks_against_its_spawning_turn_after_a_later_turn_begins(
+  tmp_path: Path,
+  owner_session_host_policy: Any,
+  scheduled_learning_fork: bool,
+  child_identity: bool,
+) -> None:
+  async def scenario() -> None:
+    dispatcher, store, session = _native_capture_dispatcher(tmp_path)
+    execution = replace(
+      stub_capability_execution_resolver().resolve("session.driver"),
+      bind=dispatcher._capability_bind,
+    )
+
+    async def begin_turn(job_id: str):
+      capture_job_context(session, replace(
+        root_context(session, withheld_tools=frozenset(), research_file_id=None),
+        job_id=job_id,
+      ))
+      turn = await record_root_turn_admission(store, admit_root_turn(
+        current_parent_context(session),
+        execution=execution,
+        tool_grant={"tool_ids": ["native_write"]},
+        approval_route=session.approval_route,
+      ))
+      capture_root_turn(session, turn)
+      return turn
+
+    turn_a = await begin_turn("job-turn-a")
+    from agent_gateway.fork_ledger import ForkLedger
+    from agent_gateway.fork_request_handoff import build_post_turn_handoff
+    from agent_gateway.fork_task_registry import ForkTaskRegistry
+    from model_authority.binding import CredentialHandle
+
+    source = SimpleNamespace(
+      _dispatcher=dispatcher,
+      _capability_execution=execution,
+      _gateway_session=SimpleNamespace(
+        tenant_id="alice",
+        session_credential_handle=CredentialHandle(
+          handle_id=execution.bind.credential_ref,
+          provider=execution.bind.provider, principal=execution.bind.credential_principal,
+          tenant_id="alice", actor_id="alice",
+        ),
+      ),
+      _billing_mode="byok",
+      _last_request_system_blocks=(("system", True),),
+      _last_request_wire_tools=[],
+      _last_request_message_marker_position=(0, 0),
+      _last_request_max_tokens=4096,
+    )
+    handoff = build_post_turn_handoff(
+      source, [{"role": "user", "content": "turn A"}],
+      {"role": "assistant", "content": "done"},
+    )
+
+    worker_ready = asyncio.Event()
+    child_context = replace(current_parent_context(session), job_id="job-child")
+
+    def install_child_identity(fork: ToolDispatcher) -> None:
+      if child_identity:
+        fork._identity = DispatchIdentity(context=child_context, session=session)
+
+    async def run_fork(_fork_id: str, submitted_handoff: Any) -> float:
+      await worker_ready.wait()
+      fork = dispatcher.fork_child(
+        capability_bind=execution.bind,
+        event_log=EventLog(), session_id="fork-of-turn-a",
+        spawning_turn=submitted_handoff.spawning_turn,
+      )
+      install_child_identity(fork)
+      _, error = await fork.dispatch_prepared(
+        "call-fork-park", "native_write",
+        PreparedToolCall({"api_key": "private-root-operand"}),
+      )
+      assert error is not None and error["code"] == "user_denied"
+      return 0.0
+
+    registry = ForkTaskRegistry(
+      ForkLedger(tmp_path / "fork-ledger.sqlite", process_instance_id="test"),
+      spawn_fork=run_fork,
+    )
+    task: asyncio.Task[Any]
+    if scheduled_learning_fork:
+      launch = registry.submit(
+        fork_id="learning-A", session_id=session.session_id, owner="alice",
+        handoff=handoff,
+      )
+      assert launch.launched
+      task = registry._tasks_by_session[session.session_id]
+    else:
+      fork = dispatcher.fork_child(
+        event_log=EventLog(), session_id="fork-of-turn-a",
+        capability_bind=execution.bind,
+        spawning_turn=handoff.spawning_turn,
+      )
+      install_child_identity(fork)
+      task = asyncio.create_task(fork.dispatch_prepared(
+        "call-fork-park", "native_write",
+        PreparedToolCall({"api_key": "private-root-operand"}),
+      ))
+    turn_b = await begin_turn("job-turn-b")
+    assert turn_b.turn_id != turn_a.turn_id
+    worker_ready.set()
+    try:
+      queue = await _wait_for_native_queue(session, task, "call-fork-park")
+      pending = session.pending_tools["call-fork-park"]
+      root_link = await SQLiteApprovalStore(store.path)._locate_root_turn_for_approval(
+        approval_id=pending["approval_id"], tenant_storage_id="alice",
+      )
+      if child_identity:
+        binding, _ = await store._read_executable_binding_for_executor(
+          job_id="job-child", tool_call_id="call-fork-park",
+          nonce=pending["nonce"], tenant_storage_id="alice",
+        )
+        assert binding.job_id == "job-child"
+        assert root_link is None
+      else:
+        assert root_link == (
+          "job-turn-a", "call-fork-park", pending["nonce"], turn_a.turn_id,
+        )
+      request = await store.get(pending["approval_id"])
+      assert request is not None
+      await store.transition_state(
+        request.approval_id, "denied", expected_state_version=request.state_version,
+        decider_id="alice", decider_role="owner", decision="denied",
+      )
+      await queue.put({"approved": False, "allow_tool_type": False})
+      result = await task
+      if not scheduled_learning_fork:
+        _, error = result
+        assert error is not None and error["code"] == "user_denied"
+    finally:
+      if not task.done():
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+          await task
+
+  asyncio.run(scenario())
+
+
+def test_native_parks_before_and_after_rotation_capture_their_original_generations(
+  tmp_path: Path,
+  owner_session_host_policy: Any,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  from agent_gateway.providers.anthropic import AnthropicProvider
+  import agent_gateway.providers.anthropic as anthropic_module
+  from agent_gateway.providers.anthropic_oauth import (
+    AnthropicCredentialPool, resolve_anthropic_credentials,
+  )
+  from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
+
+  token_a = "sk-ant-oat01-capture-member-A"
+  token_b = "sk-ant-oat01-capture-member-B"
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", token_a)
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([token_a, token_b]))
+  monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+  monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "oauth.json"))
+  monkeypatch.setattr(anthropic_module, "ANTHROPIC_CREDENTIAL_POOL", AnthropicCredentialPool())
+  sources = resolve_anthropic_credentials()
+  member_a = sources.by_token(token_a)
+  member_b = sources.by_token(token_b)
+  assert member_a is not None and member_b is not None
+  generation_a = member_a.source_metadata()["generation_ref"]
+  generation_b = member_b.source_metadata()["generation_ref"]
+
+  class RateLimitedError(RuntimeError):
+    status_code = 429
+
+  async def scenario() -> None:
+    dispatcher, store, session = _native_capture_dispatcher(tmp_path)
+    parked: dict[str, tuple[asyncio.Task[ToolResult], asyncio.Queue]] = {}
+
+    class RotatingProvider(AnthropicProvider):
+      def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
+        return config["auth_token"]
+
+      async def close_client(self, client: Any, timeout: float = 2.0) -> None:
+        pass
+
+      async def stream(self, client: Any, params: dict[str, Any]):
+        call_id = "call-before-rotation" if client == token_a else "call-after-rotation"
+        task = asyncio.create_task(dispatcher.dispatch_prepared(
+          call_id, "native_write", PreparedToolCall({"ticker": "MSFT"}),
+        ))
+        parked[call_id] = (task, await _wait_for_native_queue(session, task, call_id))
+        if client == token_a:
+          raise RateLimitedError("Anthropic rate limit exceeded")
+        yield StreamEvent(type="text_delta", text="rotated")
+        yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+    execution = stub_bound_capability_execution(
+      provider=RotatingProvider(), model="claude-sonnet-5", effort="none",
+      credential_principal=dispatcher._capability_bind.credential_principal,
+      credential_ref=generation_a,
+      auth_config={
+        "auth_mode": "oauth", "auth_token": token_a, "max_tokens": 1024,
+        "credential_source": member_a.source_metadata(),
+      },
+    )
+    dispatcher.replace_capability_bind(execution.bind)
+    root_turn = await record_root_turn_admission(store, admit_root_turn(
+      current_parent_context(session), execution=execution,
+      tool_grant={"tool_ids": ["native_write"]},
+      approval_route=session.approval_route,
+    ))
+    capture_root_turn(session, root_turn)
+    event_log = EventLog()
+    runner = AgentRunner(
+      capability_execution=execution, dispatcher=dispatcher, event_log=event_log,
+      session_id=session.session_id, user_id="alice", billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    try:
+      await runner.run(messages=[{"role": "user", "content": "rotate then park"}])
+      assert any(entry.event.get("type") == "credential_refreshed" for entry in event_log.entries)
+      assert runner.capability_execution.bind.credential_ref == generation_b
+      assert dispatcher._capability_bind is runner.capability_execution.bind
+      assert set(parked) == {"call-before-rotation", "call-after-rotation"}
+      for call_id, generation in (
+        ("call-before-rotation", generation_a), ("call-after-rotation", generation_b),
+      ):
+        pending = session.pending_tools[call_id]
+        binding, request = await store._read_executable_binding_for_executor(
+          job_id="job-native", tool_call_id=call_id, nonce=pending["nonce"],
+          tenant_storage_id="alice",
+        )
+        assert binding.credential_generation_ref == generation
+        assert await store._locate_root_turn_for_approval(
+          approval_id=request.approval_id, tenant_storage_id="alice",
+        ) == ("job-native", call_id, pending["nonce"], root_turn.turn_id)
+        await store.transition_state(
+          request.approval_id, "denied", expected_state_version=request.state_version,
+          decider_id="alice", decider_role="owner", decision="denied",
+        )
+        task, queue = parked[call_id]
+        await queue.put({"approved": False, "allow_tool_type": False})
+        _, error = await task
+        assert error is not None and error["code"] == "user_denied"
+    finally:
+      for task, _queue in parked.values():
+        if not task.done():
+          task.cancel()
+      await asyncio.gather(*(task for task, _queue in parked.values()), return_exceptions=True)
+
+  asyncio.run(scenario())

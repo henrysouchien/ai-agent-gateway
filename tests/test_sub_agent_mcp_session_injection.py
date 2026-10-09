@@ -8,6 +8,7 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from agent_gateway.capability_execution import BoundCapabilityExecution  # noqa: E402
 from agent_gateway.sub_agent import (  # noqa: E402
   _effective_mcp_session_inject_servers,
   make_run_agent_handler,
@@ -39,6 +40,8 @@ class _StubMcpClient:
 
 
 class _StubRunner:
+  capability_execution: BoundCapabilityExecution
+
   def __init__(self) -> None:
     self._full_session_id = "session-sub-agent"
     self._spill_dir_provider = None
@@ -60,6 +63,7 @@ def test_make_run_agent_handler_bounds_session_injection_to_admitted_scope(
   )
   runner = _StubRunner()
   capability_execution_resolver = stub_capability_execution_resolver()
+  runner.capability_execution = capability_execution_resolver.resolve("session.driver")
   handler = make_run_agent_handler(
     [runner],
     skill_loader=None,

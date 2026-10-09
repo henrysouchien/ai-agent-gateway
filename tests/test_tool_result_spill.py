@@ -1,3 +1,4 @@
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import json
 import sys
@@ -226,6 +227,7 @@ def _dispatcher(
   approval_key_qualifier: Callable[[str, dict[str, Any]], str] | None = None,
 ) -> ToolDispatcher:
   return ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers=handlers,
     event_log=event_log,
@@ -316,6 +318,7 @@ def test_emit_dashboard_artifact_oversize_guard_returns_error_before_dispatch() 
 
 async def _dispatch_bundle_tool(bundle: Any, tool_name: str, tool_input: dict[str, Any]):
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers=bundle.handlers,
     event_log=EventLog(),
@@ -1415,12 +1418,7 @@ def test_run_agent_sub_runner_spills_into_own_job_root(
       event_log=event_log,
       dispatcher=_dispatcher(event_log, local_handlers, approval_key_qualifier=bundle.approval_qualifier),
       session_id="sess-parent",
-      capability_execution=stub_runner_capability_execution(
-        provider=provider,
-        auth_config={"api_key": "k"},
-        model="stub-model",
-        effort="none",
-      ),
+      capability_execution=capability_execution_resolver.resolve("session.driver"),
       get_tool_definitions=lambda: [
         _tool_def("run_agent"),
         _tool_def("file_read"),

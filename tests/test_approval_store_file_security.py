@@ -4,11 +4,12 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import timedelta
+import fcntl
 import json
 import os
 from pathlib import Path
 import stat
-from threading import Barrier
+from threading import Barrier, Event, get_ident
 from typing import Any
 
 from agent_workflow_contracts import models as workflow_models
@@ -73,8 +74,8 @@ def test_approval_store_rejects_bound_inode_replacement(
   )
   os.close(replacement_fd)
 
-  with pytest.raises(RuntimeError, match="identity"):
-    store._connect()
+  with pytest.raises(RuntimeError), store._connection():
+    pass
 
   assert path.stat().st_ino != original.st_ino
 
@@ -185,6 +186,84 @@ async def _persist_binding(
   await store.create(request)
   await store.record_executable_binding(**_binding_arguments(request, prepared))
   return request, prepared
+
+
+def test_last_connection_close_cannot_unlink_sidecars_during_secure_preflight(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  path = tmp_path / "approvals.sqlite3"
+  first = SQLiteApprovalStore(path)
+  request, _ = asyncio.run(_persist_binding(first))
+  second = SQLiteApprovalStore(path)
+  ready = Event()
+  start_close = Event()
+  close_observed = Event()
+  closing_thread = 0
+  opening_thread = 0
+  real_open = os.open
+  real_flock = fcntl.flock
+
+  def observe_flock(fd: int, operation: int) -> None:
+    if (
+      get_ident() == closing_thread
+      and operation == fcntl.LOCK_EX
+      and start_close.is_set()
+    ):
+      close_observed.set()
+    real_flock(fd, operation)
+
+  def pause_existing_wal(
+    filename: str | os.PathLike[str],
+    flags: int,
+    mode: int = 0o777,
+    *,
+    dir_fd: int | None = None,
+  ) -> int:
+    try:
+      return real_open(filename, flags, mode, dir_fd=dir_fd)
+    except FileExistsError:
+      if (
+        get_ident() == opening_thread
+        and os.fspath(filename) == f"{path.name}-wal"
+        and flags & os.O_EXCL
+      ):
+        # Stop at the real existing-WAL preflight, then let the other real
+        # connection try its last close. Only production custody can defer it.
+        start_close.set()
+        assert close_observed.wait(timeout=10)
+      raise
+
+  def close_first() -> None:
+    nonlocal closing_thread
+    closing_thread = get_ident()
+    with first._connection() as conn:
+      assert conn.execute(
+        "SELECT state FROM approval_requests WHERE approval_id = ?",
+        (request.approval_id,),
+      ).fetchone()[0] == "pending_user"
+      ready.set()
+      assert start_close.wait(timeout=10)
+    # Without custody, this signal follows SQLite's actual WAL/SHM unlink.
+    close_observed.set()
+
+  def open_second() -> str:
+    nonlocal opening_thread
+    opening_thread = get_ident()
+    assert ready.wait(timeout=10)
+    with second._connection() as conn:
+      return str(conn.execute(
+        "SELECT state FROM approval_requests WHERE approval_id = ?",
+        (request.approval_id,),
+      ).fetchone()[0])
+
+  monkeypatch.setattr(os, "open", pause_existing_wal)
+  monkeypatch.setattr(fcntl, "flock", observe_flock)
+  with ThreadPoolExecutor(max_workers=2) as pool:
+    closing = pool.submit(close_first)
+    opening = pool.submit(open_second)
+    assert opening.result(timeout=15) == "pending_user"
+    closing.result(timeout=15)
 
 
 def test_private_binding_cold_reopen_preserves_secret_and_current_decision(
@@ -561,12 +640,30 @@ def test_claim_without_returned_result_stays_unknown_after_cold_reopen(
     path = tmp_path / "approvals.sqlite3"
     store = SQLiteApprovalStore(path)
     binding, decision = await _approved_executable_binding(store)
+    assert await store._read_completed_executable_result_for_executor(
+      binding=binding,
+    ) is None
     assert await store._claim_executable_binding_for_executor(
       binding=binding,
       decision_state_version=decision.state_version,
       claim_token="token-original",
     ) is None
     reopened = SQLiteApprovalStore(path)
+    with pytest.raises(ApprovalExecutableBindingError) as readonly_error:
+      await reopened._read_completed_executable_result_for_executor(
+        binding=binding,
+      )
+    assert readonly_error.value.code == "execution_outcome_unknown"
+    for alteration, expected_code in (
+      ({"nonce": "nonce-other"}, "nonce_mismatch"),
+      ({"tenant_storage_id": "bob"}, "tenant_mismatch"),
+      ({"operand_digest": "sha256:corrupted"}, "operand_mismatch"),
+    ):
+      with pytest.raises(ApprovalExecutableBindingError) as scope_error:
+        await reopened._read_completed_executable_result_for_executor(
+          binding=replace(binding, **alteration),
+        )
+      assert scope_error.value.code == expected_code
     for token in ("token-original", "token-after-process-loss"):
       with pytest.raises(ApprovalExecutableBindingError) as error:
         await reopened._claim_executable_binding_for_executor(
@@ -765,8 +862,17 @@ def test_completion_requires_original_token_and_cannot_replace_returned_result(
   asyncio.run(case())
 
 
+@pytest.mark.parametrize(
+  "column",
+  [
+    "execution_result_json",
+    "execution_claim_token",
+    "execution_decision_state_version",
+  ],
+)
 def test_completed_result_corruption_never_replays_or_exposes_private_result(
   tmp_path: Path,
+  column: str,
 ) -> None:
   async def case() -> None:
     store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
@@ -782,13 +888,15 @@ def test_completed_result_corruption_never_replays_or_exposes_private_result(
       claim_token="token-original",
       tool_result=({"secret": "secret-returned-result"}, None),
     )
+    replacement = {
+      "execution_result_json": '[{"kind":"json","value":{"secret":"corrupted-secret"}},null]',
+      "execution_claim_token": "token-corrupted",
+      "execution_decision_state_version": decision.state_version + 1,
+    }[column]
     with store._connection() as conn:
       conn.execute(
-        """
-        UPDATE approval_executable_bindings SET execution_result_json = ?
-        WHERE approval_id = ?
-        """,
-        ('[{"secret":"corrupted-secret"},null]', binding.approval_id),
+        f"UPDATE approval_executable_bindings SET {column} = ? WHERE approval_id = ?",
+        (replacement, binding.approval_id),
       )
     with pytest.raises(ApprovalExecutableBindingError) as error:
       await store._claim_executable_binding_for_executor(
@@ -897,11 +1005,15 @@ def test_completed_attempt_preserves_canonical_result_models_and_child_evidence(
 
 def test_claimed_result_completes_after_expiry_clock_without_changing_approval(
   tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   async def case() -> None:
     path = tmp_path / "approvals.sqlite3"
     store = SQLiteApprovalStore(path)
     request, _ = await _persist_binding(store)
+    clock = request.requested_at
+    monkeypatch.setattr("agent_gateway.approval_store.utc_now", lambda: clock)
+    monkeypatch.setattr("agent_gateway.approval_policy.utc_now", lambda: clock)
     expires_at = request.requested_at + timedelta(minutes=20)
     await store.transition_state(
       request.approval_id, "pending_user",
@@ -917,7 +1029,7 @@ def test_claimed_result_completes_after_expiry_clock_without_changing_approval(
         decider_role=None,
         decision="approved",
         decision_reason=None,
-        decided_at=utc_now(),
+        decided_at=clock,
       ),
     )
     binding, decision = await store._read_executable_binding_for_executor(
@@ -927,16 +1039,16 @@ def test_claimed_result_completes_after_expiry_clock_without_changing_approval(
       tenant_storage_id="alice",
     )
     assert decision.expires_at == expires_at
+    assert clock < expires_at
     assert await store._claim_executable_binding_for_executor(
       binding=binding,
       decision_state_version=decision.state_version,
       claim_token="token-original",
     ) is None
-    # Exercise the existing expiry owner at a later clock, rather than
-    # fabricating an expired/denied approval that it would not produce.
-    maintenance = await store.maintain_pending(
-      now=expires_at + timedelta(seconds=1),
-    )
+    # Advance the owners' clocks after the original claim, including any
+    # completion/readback eligibility checks, not only pending maintenance.
+    clock = expires_at + timedelta(seconds=1)
+    maintenance = await store.maintain_pending(now=clock)
     assert maintenance.approvals_expired == 0
     result = ({"committed": True, "secret": "secret-returned-result"}, None)
     await store._complete_executable_binding_for_executor(
@@ -1037,12 +1149,176 @@ async def _root_turn_arguments(
     },
     "credential_generation_ref": "grant-generation-original",
     "effective_grant": {"tool_ids": ["registered_write"], "withheld_tools": []},
-    "routes": {"registered_write": {"backend": "remote", "server": "registered"}},
     "research_binding": {"file_id": 12, "revision": "research-original"},
     "selection_snapshot": {"role": "analyst", "effort": "high"},
     "approval_route_kind": "DurableLocalApprovalRoute",
     "policy_generation_ref": generation.generation_ref,
   }
+
+
+@pytest.mark.parametrize(
+  ("with_row", "tampered", "future_shape_digest"),
+  [(False, False, False), (True, False, False), (True, True, False), (True, False, True)],
+  ids=["empty", "untampered", "expanded-grant", "future-shape-digest"],
+)
+def test_released_root_turn_schema_migrates_and_accepts_new_records(
+  tmp_path: Path,
+  with_row: bool,
+  tampered: bool,
+  future_shape_digest: bool,
+) -> None:
+  from agent_gateway.approval_store import RootTurnRecordError, _root_turn_snapshot_digest
+  from agent_gateway import approval_store_rows
+
+  async def case() -> None:
+    path = tmp_path / "released.sqlite3"
+    store = SQLiteApprovalStore(path)
+    arguments = await _root_turn_arguments(store)
+    request, _ = await _persist_binding(store)
+    # The root table shipped in ai-agent-gateway 0.23.1 (2ab1eb1ed9c5).
+    with store._connection() as conn:
+      conn.execute("DROP TABLE approval_root_turns")
+      conn.execute("""
+        CREATE TABLE IF NOT EXISTS approval_root_turns (
+          job_id TEXT NOT NULL,
+          turn_id TEXT NOT NULL,
+          tenant_storage_id TEXT NOT NULL,
+          capability_bind_json TEXT NOT NULL,
+          credential_generation_ref TEXT,
+          effective_grant_json TEXT NOT NULL,
+          routes_json TEXT NOT NULL,
+          grant_routes_digest TEXT NOT NULL,
+          research_binding_json TEXT NOT NULL,
+          selection_snapshot_json TEXT NOT NULL,
+          approval_route_kind TEXT NOT NULL,
+          policy_generation_ref TEXT NOT NULL
+            REFERENCES approval_policy_generations(generation_ref),
+          created_at TEXT NOT NULL,
+          snapshot_digest TEXT NOT NULL,
+          executable_refs_json TEXT NOT NULL DEFAULT '[]',
+          PRIMARY KEY (job_id, turn_id)
+        );
+      """)
+      old_snapshot = {
+        key: value for key, value in arguments.items()
+        if key not in {
+          "capability_bind", "effective_grant", "research_binding", "selection_snapshot",
+        }
+      }
+      for key in (
+        "capability_bind", "effective_grant", "research_binding", "selection_snapshot",
+      ):
+        old_snapshot[f"{key}_json"] = approval_store_rows.identity_json_dumps(
+          arguments[key],
+        )
+      old_snapshot["routes_json"] = '{"registered_write":{"route_kind":"mcp"}}'
+      old_snapshot["grant_routes_digest"] = _root_turn_snapshot_digest({
+        key: old_snapshot[key] for key in ("effective_grant_json", "routes_json")
+      })
+      old_snapshot["created_at"] = utc_now().isoformat()
+      old_digest = _root_turn_snapshot_digest(old_snapshot)
+      retained = {
+        **old_snapshot,
+        "snapshot_digest": old_digest,
+        "executable_refs_json": approval_store_rows.identity_json_dumps([
+          {"tool_call_id": request.tool_call_id, "nonce": "nonce-original"},
+        ]),
+      }
+      expanded_grant = {
+        "tool_ids": ["registered_write", "another_write"], "withheld_tools": [],
+      }
+      if with_row:
+        conn.execute(
+          f"INSERT INTO approval_root_turns ({', '.join(retained)}) "
+          f"VALUES ({', '.join(':' + key for key in retained)})",
+          retained,
+        )
+        stored = conn.execute("SELECT * FROM approval_root_turns").fetchone()
+        assert stored is not None
+        assert stored["snapshot_digest"] == _root_turn_snapshot_digest({
+          key: stored[key] for key in stored.keys()
+          if key not in {"snapshot_digest", "executable_refs_json"}
+        })
+        if tampered:
+          conn.execute(
+            "UPDATE approval_root_turns SET effective_grant_json = ?",
+            (approval_store_rows.identity_json_dumps(expanded_grant),),
+          )
+        if future_shape_digest:
+          # A stored value crafted to equal the post-migration shape's digest
+          # fails the 0.23.1 check and must not become readable.
+          new_shape = {
+            key: value for key, value in old_snapshot.items()
+            if key not in {"routes_json", "grant_routes_digest"}
+          }
+          new_shape["grant_digest"] = _root_turn_snapshot_digest({
+            "effective_grant_json": new_shape["effective_grant_json"],
+          })
+          old_digest = _root_turn_snapshot_digest(new_shape)
+          conn.execute("UPDATE approval_root_turns SET snapshot_digest = ?", (old_digest,))
+      conn.commit()
+    unverified = tampered or future_shape_digest
+    reopened = SQLiteApprovalStore(path)
+    if unverified:
+      for reader in (reopened, SQLiteApprovalStore(path)):
+        with pytest.raises(RootTurnRecordError) as error:
+          await reader._read_root_turn_for_executor(
+            job_id=arguments["job_id"], turn_id=arguments["turn_id"],
+            tenant_storage_id="alice",
+          )
+        assert error.value.code == "snapshot_mismatch"
+    with reopened._connection() as conn:
+      columns = {row["name"] for row in conn.execute("PRAGMA table_info(approval_root_turns)")}
+      assert "routes_json" not in columns
+      assert "grant_routes_digest" not in columns
+      assert "grant_digest" in columns
+      migrated = conn.execute("SELECT * FROM approval_root_turns").fetchone()
+      expected = {
+        key: value for key, value in old_snapshot.items()
+        if key not in {"routes_json", "grant_routes_digest"}
+      }
+      if tampered:
+        expected["effective_grant_json"] = approval_store_rows.identity_json_dumps(
+          expanded_grant,
+        )
+      expected["grant_digest"] = _root_turn_snapshot_digest({
+        "effective_grant_json": expected["effective_grant_json"],
+      })
+      if with_row:
+        assert migrated is not None
+        if unverified:
+          assert migrated["snapshot_digest"] == "migration-unverified:" + old_digest
+          assert migrated["snapshot_digest"] != _root_turn_snapshot_digest(expected)
+        else:
+          assert migrated["snapshot_digest"] == _root_turn_snapshot_digest(expected)
+          assert migrated["snapshot_digest"] != old_digest
+        for key, value in expected.items():
+          assert migrated[key] == value
+        assert migrated["executable_refs_json"] == retained["executable_refs_json"]
+    if with_row and not unverified:
+      record = await reopened._read_root_turn_for_executor(
+        job_id=arguments["job_id"], turn_id=arguments["turn_id"], tenant_storage_id="alice",
+      )
+      assert record is not None
+      assert json.loads(record.effective_grant_json) == arguments["effective_grant"]
+      assert record.grant_digest == expected["grant_digest"]
+      assert record.executable_refs[0].tool_call_id == request.tool_call_id
+      assert record.executable_refs[0].nonce == "nonce-original"
+      assert await reopened._locate_root_turn_for_approval(
+        approval_id=request.approval_id, tenant_storage_id="alice",
+      ) == ("job-original", request.tool_call_id, "nonce-original", "turn-original")
+      twice = SQLiteApprovalStore(path)
+      assert await twice._read_root_turn_for_executor(
+        job_id=arguments["job_id"], turn_id=arguments["turn_id"], tenant_storage_id="alice",
+      ) == record
+      with twice._connection() as conn:
+        assert dict(conn.execute("SELECT * FROM approval_root_turns").fetchone()) == dict(migrated)
+    await reopened.record_root_turn(**{**arguments, "turn_id": "turn-after-upgrade"})
+    assert await SQLiteApprovalStore(path)._read_root_turn_for_executor(
+      job_id=arguments["job_id"], turn_id="turn-after-upgrade", tenant_storage_id="alice",
+    ) is not None
+
+  asyncio.run(case())
 
 
 def test_root_turn_cold_reopen_preserves_exact_private_authority(
@@ -1065,7 +1341,6 @@ def test_root_turn_cold_reopen_preserves_exact_private_authority(
     assert json.loads(record.capability_bind_json) == arguments["capability_bind"]
     assert record.credential_generation_ref == arguments["credential_generation_ref"]
     assert json.loads(record.effective_grant_json) == arguments["effective_grant"]
-    assert json.loads(record.routes_json) == arguments["routes"]
     assert json.loads(record.research_binding_json) == arguments["research_binding"]
     assert json.loads(record.selection_snapshot_json) == arguments["selection_snapshot"]
     assert record.approval_route_kind == arguments["approval_route_kind"]
@@ -1128,7 +1403,6 @@ def test_root_turn_replay_preserves_creation_time_and_attached_call(
     ("capability_bind", {"credential_ref": "replacement"}, "snapshot_mismatch"),
     ("credential_generation_ref", "replacement", "snapshot_mismatch"),
     ("effective_grant", {"tool_ids": ["another_tool"]}, "snapshot_mismatch"),
-    ("routes", {"registered_write": {"backend": "local"}}, "snapshot_mismatch"),
     ("research_binding", None, "snapshot_mismatch"),
     ("selection_snapshot", {"effort": "low"}, "snapshot_mismatch"),
     ("approval_route_kind", "ControlPlaneApprovalRoute", "snapshot_mismatch"),

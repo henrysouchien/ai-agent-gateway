@@ -1,3 +1,4 @@
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import hashlib
 import json
@@ -2277,6 +2278,7 @@ def test_fred_runner_owns_every_physical_attempt_with_real_dispatcher_manager(
     lambda **_kwargs: asyncio.sleep(0, result=True),
   )
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=manager,
     local_tool_handlers={},
     role="owner",

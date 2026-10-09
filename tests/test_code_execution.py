@@ -1,8 +1,11 @@
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import json
 import sys
 from pathlib import Path
 from typing import Any, Dict
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = Path(__file__).resolve().parents[1]
@@ -68,6 +71,7 @@ async def _dispatch_bundle_tool(
   needs_approval=None,
 ) -> tuple[dict | None, dict | None]:
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_FakeMcp(),
     local_tool_handlers=bundle.handlers,
     role="owner",
@@ -122,6 +126,7 @@ def test_code_execute_output_is_redacted_by_the_run_boundary() -> None:
     bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
     event_log = EventLog()
     dispatcher = ToolDispatcher(
+      capability_bind=TEST_CAPABILITY_BIND,
       mcp_client=_FakeMcp(),
       local_tool_handlers=bundle.handlers,
       role="owner",
@@ -169,6 +174,7 @@ def test_code_execute_redacts_structured_errors_and_display_keys(tmp_path: Path)
       config=CodeExecutionConfig(register_kernel=True, register_docker=False, register_subprocess=False),
     )
     dispatcher = ToolDispatcher(
+      capability_bind=TEST_CAPABILITY_BIND,
       mcp_client=_FakeMcp(),
       local_tool_handlers=bundle.handlers,
       role="owner",
@@ -194,91 +200,6 @@ def test_code_execute_redacts_structured_errors_and_display_keys(tmp_path: Path)
       assert result["error"]["evalue"] and result["error"]["traceback"]
       assert result["displays"][0]["application/json"]
       assert canary not in json.dumps(result)
-    finally:
-      await cleanup_code_execution(session)
-
-  asyncio.run(_run_test())
-
-
-def test_code_execute_redacts_deep_admitted_subprocess_sidecar(tmp_path: Path) -> None:
-  async def _run_test() -> None:
-    canary = "CUSTOM-ACTIVE-DEEP-CREDENTIAL"
-    credential_file = tmp_path / "credential.txt"
-    credential_file.write_text(canary, encoding="utf-8")
-    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-    bundle = build_code_execution(
-      session,
-      config=CodeExecutionConfig(register_kernel=False, register_docker=False),
-    )
-    dispatcher = ToolDispatcher(
-      mcp_client=_FakeMcp(),
-      local_tool_handlers=bundle.handlers,
-      role="owner",
-      needs_approval=lambda _name, _tool_input, _qualifier: False,
-      approval_key_qualifier=bundle.approval_qualifier,
-    )
-    dispatcher.bind_secret_boundary(SecretBoundary((canary,)))
-    try:
-      result, error = await dispatcher.dispatch(
-        "deep-sidecar", "code_execute", {
-          "host": "subprocess",
-          "code": (
-            "import json, os\n"
-            "from pathlib import Path\n"
-            f"credential = Path({str(credential_file)!r}).read_text()\n"
-            "leaf = json.dumps({credential: [credential, {'nested': credential}], 'count': 7})\n"
-            "nested = leaf\n"
-            "for index in range(1200):\n"
-            "    nested = '{\"n\":' + nested + '}'\n"
-            "    if index % 24 == 0:\n"
-            "        nested = '[' + nested + ']'\n"
-            # String assembly keeps the child JSON encoder's recursion limit
-            # out of the admitted sidecar/parent projection regression.
-            "payload = '{\"schema_version\":1,\"function\":\"deep\",\"tool_version\":\"v1\","
-            "\"output_sha256\":\"hash\",\"params\":' + nested + ',\"summary\":' + leaf + '}'\n"
-            "target = Path(os.environ['AGENT_CODE_EXECUTE_WORK_DIR']) / '.agent_provenance'"
-            " / os.environ['AGENT_TELEMETRY_TOOL_CALL_ID']\n"
-            "target.mkdir(parents=True, exist_ok=True)\n"
-            "(target / 'deep.json').write_text(payload, encoding='utf-8')\n"
-            "print(len(payload.encode('utf-8')))\n"
-          ),
-        },
-      )
-      assert error is None and result is not None
-      assert result["return_code"] == 0
-      assert result["stderr"] == ""
-      assert 7200 < int(result["stdout"].strip()) < 8192
-      assert "computations_dropped" not in result
-      assert len(result["computations"]) == 1
-      computation = result["computations"][0]
-      assert computation["function"] == "deep"
-      assert computation["output_sha256"] == "hash"
-      value = computation["params"]
-      for index in reversed(range(1200)):
-        if index % 24 == 0:
-          assert isinstance(value, list) and len(value) == 1
-          value = value[0]
-        assert isinstance(value, dict) and list(value) == ["n"]
-        value = value["n"]
-      expected_leaf = {
-        REDACTED_SECRET: [REDACTED_SECRET, {"nested": REDACTED_SECRET}],
-        "count": 7,
-      }
-      assert value == expected_leaf
-      assert computation["summary"] == expected_leaf
-      pending = [result]
-      while pending:
-        value = pending.pop()
-        if isinstance(value, str):
-          assert canary not in value
-        elif isinstance(value, dict):
-          pending.extend(value.keys())
-          pending.extend(value.values())
-        elif isinstance(value, (list, tuple)):
-          pending.extend(value)
-      assert session.code_execution_work_dir is not None
-      sidecar_dir = Path(session.code_execution_work_dir) / ".agent_provenance" / "deep-sidecar"
-      assert not sidecar_dir.exists()
     finally:
       await cleanup_code_execution(session)
 
@@ -577,6 +498,48 @@ def test_code_execute_captures_images_and_extra_env(tmp_path: Path) -> None:
     assert result["images"][0]["filename"] == "_plot_1.png"
     assert result["images"][0]["media_type"] == "image/png"
     assert result["images"][0]["data_base64"]
+
+  asyncio.run(_run_test())
+
+
+def test_code_execute_extra_env_replaces_scalars_and_prepends_path_lists(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setenv("RISK_API_URL", "http://inherited.example:5001")
+  monkeypatch.setenv("PYTHONPATH", "/inherited/root")
+
+  async def _run_test() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(
+      session,
+      config=CodeExecutionConfig(
+        register_docker=False,
+        extra_env={
+          "RISK_API_URL": "http://127.0.0.1:5262",
+          "PYTHONPATH": str(tmp_path),
+        },
+      ),
+    )
+
+    result, error = await _dispatch_bundle_tool(
+      session,
+      bundle,
+      "code_execute",
+      {
+        "code": (
+          "import os\n"
+          "print(os.environ['RISK_API_URL'])\n"
+          "print(os.environ['PYTHONPATH'].split(os.pathsep)[:2])\n"
+        )
+      },
+    )
+
+    assert error is None
+    assert result is not None
+    lines = result["stdout"].splitlines()
+    assert lines[0] == "http://127.0.0.1:5262"
+    assert lines[1] == repr([str(tmp_path), "/inherited/root"])
 
   asyncio.run(_run_test())
 

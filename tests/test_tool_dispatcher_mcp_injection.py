@@ -1,3 +1,4 @@
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import sys
 from pathlib import Path
@@ -50,6 +51,7 @@ class _CaptureMcpClient(McpClientManager):
 def test_dispatch_injects_session_id_only_for_configured_mcp_servers() -> None:
   mcp_client = _CaptureMcpClient()
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp_client,
     local_tool_handlers={},
     role="owner",
@@ -87,6 +89,7 @@ def test_dispatch_injects_session_id_only_for_configured_mcp_servers() -> None:
 def test_dispatch_runs_mcp_tool_outside_scoped_allowlist() -> None:
   mcp_client = _CaptureMcpClient()
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp_client,
     local_tool_handlers={},
     role="owner",

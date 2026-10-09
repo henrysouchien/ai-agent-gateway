@@ -33,6 +33,7 @@ from .secret_boundary import (
 from .tool_display import resolve_display
 from .tool_policy_registry import PreparedToolCall, ToolInputPreparationError
 from .tool_dispatcher_helpers import LocalToolHandler, ToolResult
+from .tool_dispatcher import _SpawningTurn
 from .tool_dispatch_classification import (
   DispatchEntry,
   DEFAULT_MAX_TOOL_RETRIES as _MAX_TOOL_DISPATCH_RETRIES,
@@ -58,6 +59,8 @@ from .workflow_output_attachment import (
 )
 
 if TYPE_CHECKING:
+  from model_authority.bind import CapabilityBind
+
   from .approval_policy import RunContext
   from .event_log import EventLog
   from .mcp_client import McpClientManager
@@ -88,14 +91,22 @@ class AgentRunnerDispatcher(Protocol):
 
   def bind_secret_boundary(self, boundary: SecretBoundary) -> None: ...
 
+  def replace_capability_bind(self, bind: CapabilityBind) -> None: ...
+
+  def local_tool_handlers(self) -> Mapping[str, LocalToolHandler]: ...
+
   @property
   def run_context(self) -> RunContext | None: ...
+
+  def capture_spawning_turn(self) -> _SpawningTurn: ...
 
   def fork_child(
     self,
     *,
     event_log: EventLog,
     session_id: str,
+    capability_bind: CapabilityBind,
+    spawning_turn: _SpawningTurn,
     local_handler_scopes: Mapping[
       str, Callable[[LocalToolHandler], LocalToolHandler]
     ] | None = None,

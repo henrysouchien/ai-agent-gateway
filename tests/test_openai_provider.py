@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import builtins
 import json
@@ -881,23 +882,25 @@ def test_runner_executes_responses_tool_loop_and_replays_function_output() -> No
       return await dispatch_lookup(prepared_call.materialize_input())
 
   event_log = EventLog(session_id="responses-tool-loop")
+  provider = Provider()
+  _dispatcher_execution_885 = stub_runner_capability_execution(
+        provider=provider,
+        model="gpt-6-astra",
+        effort="low",
+        auth_config={"api_key": "sk-test", "max_tokens": 512},
+      )
   dispatcher = Dispatcher(
+    capability_bind=_dispatcher_execution_885.bind,
     mcp_client=McpClientManager(config_path=None),
     local_tool_handlers={"lookup": dispatch_lookup},
     event_log=event_log,
     session_id="responses-tool-loop",
   )
-  provider = Provider()
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=dispatcher,
     session_id="responses-tool-loop",
-    capability_execution=stub_runner_capability_execution(
-      provider=provider,
-      model="gpt-6-astra",
-      effort="low",
-      auth_config={"api_key": "sk-test", "max_tokens": 512},
-    ),
+    capability_execution=_dispatcher_execution_885,
     get_tool_definitions=lambda: [{"name": "lookup", "description": "lookup", "input_schema": {"type": "object"}}],
     user_id="alice",
     billing_mode="byok",
@@ -1067,7 +1070,14 @@ def test_standalone_runner_keeps_raw_execution_separate_from_safe_history(
     },
   }
   event_log = EventLog(session_id="standalone-redaction")
+  _dispatcher_execution_1072 = stub_runner_capability_execution(
+        provider=Provider(),
+        model="gpt-6-astra",
+        effort="low",
+        auth_config={"api_key": "sk-test", "max_tokens": 512},
+      )
   dispatcher = ToolDispatcher(
+    capability_bind=_dispatcher_execution_1072.bind,
     mcp_client=McpClientManager(config_path=None),
     local_tool_handlers={"data_historical_prices": handler},
     event_log=event_log,
@@ -1082,12 +1092,7 @@ def test_standalone_runner_keeps_raw_execution_separate_from_safe_history(
     event_log=event_log,
     dispatcher=dispatcher,
     session_id="standalone-redaction",
-    capability_execution=stub_runner_capability_execution(
-      provider=Provider(),
-      model="gpt-6-astra",
-      effort="low",
-      auth_config={"api_key": "sk-test", "max_tokens": 512},
-    ),
+    capability_execution=_dispatcher_execution_1072,
     get_tool_definitions=lambda: [tool_definition],
     user_id="alice",
     billing_mode="byok",
@@ -1233,6 +1238,7 @@ def test_shipped_openai_alias_is_retained_by_real_agent_runner_response() -> Non
   execution = _shipped_openai_execution(Provider())
   event_log = EventLog(session_id="openai-reported-identity")
   dispatcher = Dispatcher(
+    capability_bind=execution.bind,
     mcp_client=McpClientManager(config_path=None),
     local_tool_handlers={},
     event_log=event_log,

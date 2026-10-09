@@ -62,15 +62,12 @@ def _rotated_execution(
   capability_execution: BoundCapabilityExecution,
   exc: Exception,
 ) -> BoundCapabilityExecution | None:
-  """The same bind on the provider's next pool credential, or None.
+  """Rebind the provider's next eligible credential generation, or return None.
 
-  The provider decides which failures a sibling credential can answer and
-  parks the rejected one (`classify_credential_failure` / `next_credential`,
-  the policy the runner uses); only credential material changes, so the bind,
-  model, and effort stay what the caller resolved. Each rotation parks the
-  credential it leaves, so the pool bounds the attempts.
+  The provider parks the rejected member and selects a sibling. The resolver
+  names that sibling in the new bind while retaining the model and effort.
   """
-  from .capability_execution import BoundCapabilityExecution
+  from .capability_execution import CapabilityExecutionResolver
   from .runner_auth import merge_refreshed_auth_config
 
   provider = capability_execution.provider
@@ -80,20 +77,22 @@ def _rotated_execution(
   rotated = provider.next_credential(capability_execution.auth_config, failure)
   if rotated is None:
     return None
+  execution = CapabilityExecutionResolver.rebind_rotated_credential(
+    capability_execution,
+    rotated,
+    merged_auth_config=merge_refreshed_auth_config(
+      dict(capability_execution.auth_config),
+      rotated,
+    ),
+  )
+  if execution is None:
+    return None
   log.info(
     "send_prompt credential rotated after provider %s failure (status=%s); retrying",
     failure.kind,
     failure.status_code,
   )
-  return BoundCapabilityExecution(
-    bind=capability_execution.bind,
-    registry=capability_execution.registry,
-    adapter=capability_execution.adapter,
-    auth_config=merge_refreshed_auth_config(
-      dict(capability_execution.auth_config),
-      rotated,
-    ),
-  )
+  return execution
 
 
 async def send_prompt(

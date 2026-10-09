@@ -22,7 +22,9 @@ import logging
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
-from typing import Any, Generic, Literal, TypeVar, cast, overload
+from typing import Any, Generic, Literal, Protocol, TypeVar, cast, overload
+from types import MappingProxyType
+from uuid import uuid4
 
 from agent_workflow_contracts import AdmittedTask, OperationUnavailable, ResolvedAuthority
 from agent_workflow_contracts.models import (
@@ -35,17 +37,21 @@ from model_authority.bind import CapabilityBind
 from pydantic import JsonValue
 from model_authority.selection import SelectionSnapshot
 
-from .capability_execution import CapabilityExecutionResolver
+from .capability_execution import BoundCapabilityExecution, CapabilityExecutionResolver
 from .approval_route import (
   ApprovalRoute,
+  DurableLocalApprovalRoute,
   NoApprovalRoute,
   child_approval_route,
+  route_policy,
   session_approval_route,
 )
 from .child_environment import CHILD_ENVIRONMENT_ALLOWLISTS
 from .policy_imports import require_inherited_role, role_denied_tools_for_session
 from .session import session_owner_user_id
 from .sub_agent_helpers import RUN_AGENT_TOOL_NAME
+from .approval_store import SQLiteApprovalStore
+from .providers.anthropic_oauth import is_anthropic_generation_ref
 
 log = logging.getLogger("agent_gateway.admission")
 
@@ -132,6 +138,128 @@ class ParentContext:
   depth: int
   approval_route: ApprovalRoute[object, object]
   selection_snapshot: SelectionSnapshot | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RootTurnAdmission:
+  """One turn's exact root authority, captured before its first tool call."""
+
+  job_id: str | None
+  turn_id: str
+  tenant: AdmittedTenant | None
+  capability_bind: CapabilityBind
+  credential_generation_ref: str | None
+  tool_grant: Mapping[str, object]
+  research_binding: AdmittedResearchBinding
+  selection_snapshot: SelectionSnapshot | None
+  approval_route_kind: str
+  approval_route: ApprovalRoute[Any, Any] = field(repr=False, compare=False)
+  policy_generation_ref: str | None = None
+
+
+def admit_root_turn(
+  context: ParentContext,
+  *,
+  execution: BoundCapabilityExecution,
+  tool_grant: Mapping[str, object],
+  approval_route: ApprovalRoute[Any, Any],
+) -> RootTurnAdmission:
+  """Capture owner facts without selecting authority or materializing credentials."""
+
+  bind = execution.bind
+  return RootTurnAdmission(
+    job_id=context.job_id,
+    turn_id="turn:" + uuid4().hex,
+    tenant=context.tenant,
+    capability_bind=bind,
+    credential_generation_ref=(
+      bind.credential_ref if is_anthropic_generation_ref(bind.credential_ref) else None
+    ),
+    tool_grant=MappingProxyType(dict(tool_grant)),
+    research_binding=context.research_binding,
+    selection_snapshot=context.selection_snapshot,
+    approval_route_kind=_approval_route_name(approval_route),
+    approval_route=approval_route,
+  )
+
+
+def capture_root_turn(session: Any, admission: RootTurnAdmission) -> None:
+  """Install the exact admission the root park closure reads."""
+
+  session.admitted_root_turn = admission
+
+
+def current_root_turn(session: Any) -> RootTurnAdmission | None:
+  """Read the captured turn; never infer it from a session or skill identity."""
+
+  return getattr(session, "admitted_root_turn", None)
+
+
+async def record_root_turn_admission(
+  store: SQLiteApprovalStore,
+  admission: RootTurnAdmission,
+) -> RootTurnAdmission:
+  """Persist the route owner's policy generation, then the private root snapshot."""
+
+  policy = route_policy(admission.approval_route)
+  if policy is None or admission.job_id is None or admission.tenant is None:
+    return admission
+  generation = await store.record_policy_generation(
+    policy_id=cast(Any, policy).policy_id,
+    policy_version=cast(Any, policy).policy_version,
+    policy_bundle_hash=cast(Any, policy).policy_bundle_hash,
+  )
+  recorded = replace(admission, policy_generation_ref=generation.generation_ref)
+  await store.record_root_turn(
+    job_id=admission.job_id,
+    turn_id=recorded.turn_id,
+    tenant_storage_id=admission.tenant.storage_id,
+    capability_bind=recorded.capability_bind.to_json(),
+    credential_generation_ref=recorded.credential_generation_ref,
+    effective_grant=recorded.tool_grant,
+    research_binding=recorded.research_binding.model_dump(mode="json"),
+    selection_snapshot=(
+      recorded.selection_snapshot.to_json()
+      if recorded.selection_snapshot is not None else {}
+    ),
+    approval_route_kind=recorded.approval_route_kind,
+    policy_generation_ref=generation.generation_ref,
+  )
+  return recorded
+
+
+class RootParkStore(Protocol):
+  """The ledger operation used to attach a root turn's parked executable."""
+
+  async def link_root_turn_executable_binding(
+    self,
+    *,
+    job_id: str,
+    turn_id: str,
+    tool_call_id: str,
+    nonce: str,
+    tenant_storage_id: str,
+  ) -> None: ...
+
+
+async def link_root_park(
+  store: RootParkStore,
+  admission: RootTurnAdmission,
+  *,
+  tool_call_id: str,
+  nonce: str,
+) -> None:
+  """Attach an existing executable binding without copying its private operands."""
+
+  if admission.job_id is None or admission.tenant is None:
+    return
+  await store.link_root_turn_executable_binding(
+    job_id=admission.job_id,
+    turn_id=admission.turn_id,
+    tool_call_id=tool_call_id,
+    nonce=nonce,
+    tenant_storage_id=admission.tenant.storage_id,
+  )
 
 
 def root_context(
@@ -684,10 +812,14 @@ def _admit_handle(
 
 def _approval_route_name(
   route: ApprovalRoute[object, object],
-) -> Literal["no_approval_route", "parent_delegated"]:
-  """Label a child's route; a child never holds a durable-local route."""
+) -> Literal["no_approval_route", "parent_delegated", "durable_local"]:
+  """Label the admitted route at the root or child edge."""
 
-  return "no_approval_route" if isinstance(route, NoApprovalRoute) else "parent_delegated"
+  if isinstance(route, NoApprovalRoute):
+    return "no_approval_route"
+  if isinstance(route, DurableLocalApprovalRoute):
+    return "durable_local"
+  return "parent_delegated"
 
 
 def _environment_projection(
@@ -722,11 +854,17 @@ __all__ = [
   "OperationRegistration",
   "ParentContext",
   "Refusal",
+  "RootTurnAdmission",
   "SpawnRequest",
   "admit",
+  "admit_root_turn",
   "capture_job_context",
+  "capture_root_turn",
   "context_for_child",
   "current_parent_context",
+  "current_root_turn",
+  "link_root_park",
+  "record_root_turn_admission",
   "root_context",
   "root_context_from_identity",
 ]

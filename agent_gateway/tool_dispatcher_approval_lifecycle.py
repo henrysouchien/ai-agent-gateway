@@ -6,7 +6,7 @@ import logging
 import os
 import time
 from datetime import datetime, timedelta
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, Protocol, TYPE_CHECKING
 
 from . import approval_settings
@@ -49,9 +49,23 @@ from .secret_boundary import (
 )
 from .skill_limits import reconcile_skill_admission
 from . import tool_redaction as _redaction
+from .tool_policy_registry import PreparedToolCall
+from . import admission
 
 if TYPE_CHECKING:
   from .prepared_business_model_store import PreparedBusinessModelChange
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ExecutableCapture:
+  """Private original native call operands, separate from public approval data."""
+
+  prepared_call: PreparedToolCall
+  dispatch_context: Mapping[str, object]
+  job_id: str | None
+  tenant_storage_id: str | None
+  credential_generation_ref: str | None
+  root_turn: admission.RootTurnAdmission | None
 
 
 class ApprovalWaitStore(Protocol):
@@ -76,13 +90,27 @@ class ApprovalWaitStore(Protocol):
   ) -> PolicyApprovalRequest: ...
 
 
-class ApprovalLifecycleStore(ApprovalWaitStore, Protocol):
+class ApprovalLifecycleStore(ApprovalWaitStore, admission.RootParkStore, Protocol):
   """Durable methods called by one local approval lifecycle."""
 
   async def create(
     self,
     request: PolicyApprovalRequest,
   ) -> PolicyApprovalRequest: ...
+
+  async def record_executable_binding(
+    self,
+    *,
+    approval_id: str,
+    job_id: str,
+    tool_call_id: str,
+    nonce: str,
+    tenant_storage_id: str,
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+    dispatch_context: Mapping[str, object],
+    credential_generation_ref: str | None,
+  ) -> None: ...
 
   async def create_raw_patch_authorization(
     self,
@@ -405,6 +433,7 @@ async def run_approval_lifecycle(
   route: ApprovalRoute,
   session: Any | None,
   producer_session: Any | None,
+  executable_capture: ExecutableCapture | None,
   tool_call_id: str,
   tool_name: str,
   tool_input: dict[str, Any],
@@ -460,6 +489,7 @@ async def _run_approval_lifecycle_impl(
     ApprovalLifecyclePolicy,
   ],
   session: Any | None,
+  executable_capture: ExecutableCapture | None,
   tool_call_id: str,
   tool_name: str,
   tool_input: dict[str, Any],
@@ -805,6 +835,37 @@ async def _run_approval_lifecycle_impl(
       "policy_modified_tool_args": policy_modified_tool_args,
     }
 
+  nonce = os_urandom_fn(8).hex()
+  if executable_capture is not None:
+    if executable_capture.job_id is None or executable_capture.tenant_storage_id is None:
+      logging.getLogger("agent_gateway.approval_capture").warning(
+        "approval_capture_without_job_context | tool_name=%s | tool_call_id=%s"
+        " | missing_job_id=%s | missing_tenant_storage_id=%s",
+        tool_name,
+        tool_call_id,
+        executable_capture.job_id is None,
+        executable_capture.tenant_storage_id is None,
+      )
+    else:
+      await store.record_executable_binding(
+        approval_id=request.approval_id,
+        job_id=executable_capture.job_id,
+        tool_call_id=tool_call_id,
+        nonce=nonce,
+        tenant_storage_id=executable_capture.tenant_storage_id,
+        tool_name=tool_name,
+        prepared_call=executable_capture.prepared_call,
+        dispatch_context=executable_capture.dispatch_context,
+        credential_generation_ref=executable_capture.credential_generation_ref,
+      )
+    if executable_capture.root_turn is not None:
+      await admission.link_root_park(
+        store,
+        executable_capture.root_turn,
+        tool_call_id=tool_call_id,
+        nonce=nonce,
+      )
+
   expires_at = utc_now_fn() + timedelta(seconds=decision.expiry_seconds or 600)
   request = await store.transition_state(
     request.approval_id,
@@ -824,7 +885,6 @@ async def _run_approval_lifecycle_impl(
         "Failed to enqueue approval notification intent for %s | failure=true",
         request.approval_id,
       )
-  nonce = os_urandom_fn(8).hex()
   approval = await await_user_approval_via_pending_tools_fn(
     request,
     decision,

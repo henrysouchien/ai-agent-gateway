@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import hashlib
 import hmac
@@ -370,6 +371,7 @@ def test_dispatcher_passes_authenticated_session_to_per_user_mcp(monkeypatch, ow
 
     monkeypatch.setattr(manager, "call_tool", call_tool)
     dispatcher = ToolDispatcher(
+      capability_bind=TEST_CAPABILITY_BIND,
       mcp_client=manager,
       session=session,
       risk_user_id=7,
@@ -1129,6 +1131,7 @@ def test_future_dispatch_reuses_refreshed_per_user_sheets_session(monkeypatch, o
     monkeypatch.setattr(manager, "_get_per_user_server", resolve)
     monkeypatch.setattr(manager, "_call_tool_once", invoke)
     dispatcher = ToolDispatcher(
+      capability_bind=TEST_CAPABILITY_BIND,
       mcp_client=manager,
       local_tool_handlers={},
       role="owner",

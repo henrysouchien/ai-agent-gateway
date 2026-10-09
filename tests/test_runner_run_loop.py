@@ -1,3 +1,4 @@
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 import hashlib
@@ -296,18 +297,19 @@ def _make_no_credential_runner(
   auth_model: str | None = None,
 ) -> AgentRunner:
   event_log = EventLog()
-  dispatcher = ToolDispatcher(
-    mcp_client=_NullMcpClient(),
-    local_tool_handlers={},
-    event_log=event_log,
-    session_id="sess_run_loop",
-  )
   model = auth_model if auth_model is not None else "bound-model"
   execution = stub_bound_capability_execution(
     provider=provider,
     model=model,
     effort="none",
     auth_config={"api_key": "k"},
+  )
+  dispatcher = ToolDispatcher(
+    capability_bind=execution.bind,
+    mcp_client=_NullMcpClient(),
+    local_tool_handlers={},
+    event_log=event_log,
+    session_id="sess_run_loop",
   )
   runner = AgentRunner(
     event_log=event_log,
@@ -403,7 +405,15 @@ def _make_credential_runner(
   channel: str | None = None,
 ) -> AgentRunner:
   event_log = EventLog()
+  selected_provider = provider or _CredentialProvider()
+  _dispatcher_execution_408 = stub_bound_capability_execution(
+        provider=selected_provider,
+        model="stub-model",
+        effort="none",
+        auth_config={"api_key": api_key},
+      )
   dispatcher = ToolDispatcher(
+    capability_bind=_dispatcher_execution_408.bind,
     mcp_client=_NullMcpClient(),
     local_tool_handlers=local_tool_handlers or {},
     event_log=event_log,
@@ -424,18 +434,12 @@ def _make_credential_runner(
 
   dispatcher._raw_history_input_redactor = redact_raw_history_input
   dispatcher._prepared_tool_input_redactor = redact_prepared_tool_input
-  selected_provider = provider or _CredentialProvider()
   return AgentRunner(
     event_log=event_log,
     dispatcher=dispatcher,
     gateway_session=gateway_session,
     session_id="sess_run_loop",
-    capability_execution=stub_bound_capability_execution(
-      provider=selected_provider,
-      model="stub-model",
-      effort="none",
-      auth_config={"api_key": api_key},
-    ),
+    capability_execution=_dispatcher_execution_408,
     allow_stub_response=allow_stub_response,
     get_tool_definitions=lambda: [],
     coordinator=coordinator,

@@ -1,6 +1,67 @@
 # Changelog
 
-## Unreleased
+## 0.24.0 (2026-10-08)
+
+### Breaking
+
+- `ToolDispatcher` requires the keyword-only `capability_bind`, the frozen bind of the execution it dispatches for; `fork_child()` requires the fork execution's `capability_bind` as well. Investment callers migrate together with the `>=0.24,<0.25` dependency range: production `research/task_runner.py` (two sites) and `research/web.py`, and five sites in `tests/unit/test_capability_task_runner_policy.py`. `build_tool_dispatcher()` requires the same argument.
+- `CapabilityExecutionResolver.select_bind()` and `.resolve()` remove `role_map`, `role_map_source` and `requested_role_source`; pass the frozen `selection_snapshot` instead.
+- `RootTurnRecord` removes `routes_json` and replaces `grant_routes_digest` with `grant_digest`; `SQLiteApprovalStore.record_root_turn()` removes `routes`. On open, `SQLiteApprovalStore` rebuilds the 0.23.1 `approval_root_turns` table, preserving rows, executable references and indexes while recomputing grant digests. Snapshot digests are recomputed only after validating the original snapshot; altered rows retain their original digest and remain unreadable as `snapshot_mismatch`.
+- `AgentRunnerDispatcher` implementations must provide `replace_capability_bind()` and `local_tool_handlers()`, and accept the required keyword-only `capability_bind` in `fork_child()`.
+- `issue_investment_capability_claim()` requires the keyword-only `tenant` argument and an authenticated `AdmittedTenant`; the emitted facade claim remains version 1.
+- `run_approval_lifecycle()` requires `executable_capture` (pass `None` without native capture); `ApprovalLifecycleStore` implementations must provide `record_executable_binding()` and `link_root_turn_executable_binding()`.
+
+- `ToolDispatcher.fork_child` requires `spawning_turn`, captured synchronously
+  with `capture_spawning_turn()` before scheduling the fork. Fork request
+  handoffs carry that scope so learning-fork approvals retain the submitting
+  job and root turn even if a later turn starts before the worker runs.
+  Independently admitted child identities retain their own job context and
+  do not attach approval bindings to the parent's root turn.
+- Code execution no longer reads or consumes legacy computation JSON sidecars.
+  Native nested-call provenance and settled `dispatch.sources` remain available
+  in terminal results; the sidecar-only size/count limits and deduplication are removed.
+
+### Added
+
+- `RootTurnAdmission` and `admit_root_turn()`, `capture_root_turn()`, `current_root_turn()`, `record_root_turn_admission()` and `link_root_park()` capture each root turn’s exact authority and link parked calls to its durable snapshot.
+- `reserve_admitted_successor()` and `resume_admitted_successor()` provide a trusted host entry for workflow-owner-admitted successors, separate from model-driven resume.
+- `child_gateway_session()` constructs child sessions from admitted tenancy and materialized child credentials.
+- `BoundCapabilityExecution.resolver` retains its materializing resolver; `CapabilityExecutionResolver.rebind_rotated_credential()` authorizes a rotated credential generation under a new exact bind.
+- `ToolDispatcher.replace_capability_bind()` updates the current credential bind without changing execution authority; `local_tool_handlers()` exposes configured job-rebound local handlers.
+
+### Changed
+
+- `ToolDispatcher.dispatch_prepared()` captures the original native prepared call and dispatch context in private approval custody before publishing a park, including the executing job, tenant and credential generation.
+- `run_autonomous()` records root-turn admission before root tool dispatch; SDK approval calls can link durable requests to root turns without native executable capture.
+
+### Fixed
+
+- An uncaptured `GatewaySession` declares absent admitted job context as `None`. Investment claim issuance returns its typed authority gap rather than failing on an undeclared attribute.
+- `ToolDispatcher.fork_child()` retains the spawning turn’s admitted job context and root-turn admission even after the shared session advances, and carries the fork execution's capability bind so learning forks rotate runner and dispatcher together.
+- `AgentRunner` and `send_prompt()` rebind rotated credentials through the execution’s resolver; `make_run_agent_handler()` resolves descendants through the live execution’s resolver rather than stale construction-time credentials. `run_autonomous()` pairs a prebound execution that lacks a resolver with an explicitly supplied resolver before constructing its runner.
+- `resume_admitted_successor()` tells the model the workflow owner’s frozen `resume_instruction`.
+- `SQLiteApprovalStore` serializes secure connection open and close across stores and processes to prevent concurrent WAL/SHM unlink races; its executable-result lookup reports claimed execution as `execution_outcome_unknown` rather than an absent result.
+- `code_execute` prepends `extra_env` values only for `PATH` and `PYTHONPATH`; scalar environment variables replace inherited values.
+- `SessionContextBuilder.build()` drains the initial fork-seed existence lookup as well as the append before cancellation completes.
+- `AgentRunner` preserves exact root-writer mailbox consumption lineage without requiring or fabricating a child id.
+- `AutonomousRegistryStartMixin` registers prepared session-log launch inputs through the admitted child environment projection instead of injecting them afterward.
+
+## 0.23.1 (2026-10-08)
+
+This heading covers every change since 0.21.1, because 0.22.0, 0.22.2 and 0.23.0 were
+published without their own. 0.23.1 was cut as a patch, but it carries the breaking
+changes listed next. No in-forest consumer (Risk, Investment) calls the changed APIs.
+
+### Breaking
+
+- `dispatch_identity()` requires the keyword-only arguments `execution` and `context`.
+  `execution` is taken as given (`None` is a resolved absence and is no longer derived
+  from the session), and `DispatchIdentity` gains a required `context` field.
+- `agent_gateway.sub_agent_capability` is removed; operations author their execution
+  class.
+- (0.23.0) `select_anthropic_credential()` and `rotate_anthropic_credential()` are
+  removed; use `select_anthropic_credential_source()` and
+  `rotate_anthropic_credential_source()`.
 
 ### Changed
 
@@ -11,6 +72,11 @@
 - `DispatchIdentity` requires the executing admitted context independently of
   its credential session. Spawn, resume and native child dispatch retain their
   own job identity, including sessionless admitted execution.
+- Consumption of root-writer-authored mailbox facts preserves the exact accepted
+  root job, message, runner and role without fabricating a child id. Those audits
+  omit absent child namespace fields and remain replay-idempotent. Child
+  consumption retains its existing parent-to-child lineage; child-authored sends
+  to the root are not repaired by this change.
 
 - Approval executable bindings are private, separate from redacted approval
   projections. The existing SQLite owner preserves original prepared operands,
@@ -20,6 +86,10 @@
   takeover. Canonical task/completion model results retain their types and child
   evidence. This storage change does not remove approval clocks or publish a
   parked continuation.
+  Secure connection open/close now holds a verified parent-directory lock across
+  WAL/SHM preflight and cleanup, preventing concurrent sidecar unlink races.
+  Read-only result lookup reports an existing claim as outcome unknown; valid
+  completed results still recover exactly without a second invocation.
 
 - Mailbox sends and ordinary-result, workflow-output and spill reads admit the
   executing job's scope. Child handlers are rebound at spawn and resume; linked

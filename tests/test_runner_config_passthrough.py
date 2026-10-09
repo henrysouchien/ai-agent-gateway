@@ -1,3 +1,4 @@
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import sys
 from pathlib import Path
@@ -70,23 +71,25 @@ class _CaptureProvider(ModelProvider):
 
 def _make_runner(*, stream_stall_timeout: float | None = None) -> AgentRunner:
   event_log = EventLog()
+  provider = _CaptureProvider()
+  _dispatcher_execution_74 = stub_bound_capability_execution(
+        provider=provider,
+        model="capture-model",
+        effort="high",
+        auth_config={"api_key": "k"},
+      )
   dispatcher = ToolDispatcher(
+    capability_bind=_dispatcher_execution_74.bind,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={},
     event_log=event_log,
     session_id="sess_watchdog",
   )
-  provider = _CaptureProvider()
   return AgentRunner(
     event_log=event_log,
     dispatcher=dispatcher,
     session_id="sess_watchdog",
-    capability_execution=stub_bound_capability_execution(
-      provider=provider,
-      model="capture-model",
-      effort="high",
-      auth_config={"api_key": "k"},
-    ),
+    capability_execution=_dispatcher_execution_74,
     get_tool_definitions=lambda: [],
     stream_stall_timeout=stream_stall_timeout,
     user_id="alice",
@@ -174,7 +177,18 @@ def test_runner_stall_timeout_delegate_uses_runner_module_constants(monkeypatch)
 
 def test_runner_preserves_extra_auth_config_keys_for_provider_create_client() -> None:
   provider = _CaptureProvider()
+  _dispatcher_execution_179 = stub_bound_capability_execution(
+        provider=provider,
+        model="claude-sonnet-5",
+        effort="high",
+        auth_config={
+          "api_key": "k",
+          "base_url": "https://custom.example/v1",
+          "compat": {"streaming": True},
+        },
+      )
   dispatcher = ToolDispatcher(
+    capability_bind=_dispatcher_execution_179.bind,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={},
     event_log=EventLog(),
@@ -184,16 +198,7 @@ def test_runner_preserves_extra_auth_config_keys_for_provider_create_client() ->
     event_log=EventLog(),
     dispatcher=dispatcher,
     session_id="sess_passthrough",
-    capability_execution=stub_bound_capability_execution(
-      provider=provider,
-      model="claude-sonnet-5",
-      effort="high",
-      auth_config={
-        "api_key": "k",
-        "base_url": "https://custom.example/v1",
-        "compat": {"streaming": True},
-      },
-    ),
+    capability_execution=_dispatcher_execution_179,
     mcp_client=McpClientManager(config_path=None),
     get_tool_definitions=lambda: [],
     user_id="alice",

@@ -9,6 +9,7 @@ construction funnel.
 """
 
 from __future__ import annotations
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
 import dataclasses
@@ -202,6 +203,7 @@ def test_gateway_construction_funnel_has_one_route_writer(
     principal = InvocationPrincipal.from_session(session)
     build_tool_dispatcher(
       deps,
+      capability_bind=TEST_CAPABILITY_BIND,
       principal=principal,
       profile=profile,
       event_log=None,

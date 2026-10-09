@@ -1,3 +1,4 @@
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import sys
 from pathlib import Path
@@ -256,8 +257,8 @@ def test_tool_history_preserves_a_semantic_copy_without_changing_execution_input
       )
 
   class _Dispatcher(ToolDispatcher):
-    def __init__(self) -> None:
-      super().__init__(McpClientManager(config_path=None))
+    def __init__(self, *, capability_bind = TEST_CAPABILITY_BIND) -> None:
+      super().__init__(McpClientManager(config_path=None), capability_bind=capability_bind)
 
     def redact_raw_tool_input_for_history(self, tool_name, tool_input):
       _ = self, tool_name, tool_input
@@ -271,7 +272,7 @@ def test_tool_history_preserves_a_semantic_copy_without_changing_execution_input
   provider = _Provider()
   runner = object.__new__(AgentRunner)
   runner._provider = provider
-  runner._dispatcher = _Dispatcher()
+  runner._dispatcher = _Dispatcher(capability_bind=TEST_CAPABILITY_BIND)
   runner._capability_execution = stub_runner_capability_execution(
     provider=provider,
     model="model",
@@ -625,9 +626,16 @@ def _refusal_runner(
   )
 
   event_log = EventLog()
+  _dispatcher_execution_631 = stub_bound_capability_execution(
+        provider=provider,
+        model="claude-opus-5",
+        effort="none",
+        auth_config={"api_key": "k"},
+      )
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=ToolDispatcher(
+      capability_bind=_dispatcher_execution_631.bind,
       mcp_client=McpClientManager(config_path=None),
       local_tool_handlers={},
       event_log=event_log,
@@ -635,12 +643,7 @@ def _refusal_runner(
       get_tool_definitions=None,
     ),
     session_id="sess-refusal",
-    capability_execution=stub_bound_capability_execution(
-      provider=provider,
-      model="claude-opus-5",
-      effort="none",
-      auth_config={"api_key": "k"},
-    ),
+    capability_execution=_dispatcher_execution_631,
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",

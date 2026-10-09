@@ -4,6 +4,7 @@ import asyncio
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
+import fcntl
 import hashlib
 import logging
 import os
@@ -948,8 +949,7 @@ class RootTurnRecord:
   capability_bind_json: str
   credential_generation_ref: str | None
   effective_grant_json: str
-  routes_json: str
-  grant_routes_digest: str
+  grant_digest: str
   research_binding_json: str
   selection_snapshot_json: str
   approval_route_kind: str
@@ -983,6 +983,9 @@ def verify_policy_generation(
   if recorded == current:
     return None
   return PolicyGenerationMismatch(recorded=recorded, current=current)
+
+
+_UNVERIFIED_ROOT_TURN_DIGEST_PREFIX = "migration-unverified:"
 
 
 def _root_turn_snapshot_digest(snapshot: Mapping[str, Any]) -> str:
@@ -1313,8 +1316,7 @@ class SQLiteApprovalStore:
         Path(f"{self.path}{suffix}")
       )
 
-  def _connect(self) -> sqlite3.Connection:
-    self._require_bound_file()
+  def _connect_locked(self) -> sqlite3.Connection:
     self._prepare_sidecars()
     database_uri = f"{self.path.as_uri()}?mode=rw"
     conn = sqlite3.connect(
@@ -1343,12 +1345,34 @@ class SQLiteApprovalStore:
 
   @contextmanager
   def _connection(self) -> Iterator[sqlite3.Connection]:
-    conn = self._connect()
+    parent_fd, bound_parent_stat = _open_secure_sqlite_parent(self.path)
     try:
-      with conn:
-        yield conn
+      # SQLite's last close unlinks WAL/SHM. Share custody of open/close across
+      # stores and processes, but leave transactions to SQLite's own locks.
+      # Lock the directory: closing an extra database fd can drop POSIX locks
+      # held by another SQLite connection in this process.
+      fcntl.flock(parent_fd, fcntl.LOCK_EX)
+      try:
+        _require_matching_sqlite_identity(
+          self.path,
+          parent_fd=parent_fd,
+          bound_parent_stat=bound_parent_stat,
+          file_stat=self._require_bound_file(),
+        )
+        conn = self._connect_locked()
+      finally:
+        fcntl.flock(parent_fd, fcntl.LOCK_UN)
+      try:
+        with conn:
+          yield conn
+      finally:
+        fcntl.flock(parent_fd, fcntl.LOCK_EX)
+        try:
+          conn.close()
+        finally:
+          fcntl.flock(parent_fd, fcntl.LOCK_UN)
     finally:
-      conn.close()
+      os.close(parent_fd)
 
   def _init_schema(self) -> None:
     with self._connection() as conn:
@@ -1486,8 +1510,7 @@ class SQLiteApprovalStore:
           capability_bind_json TEXT NOT NULL,
           credential_generation_ref TEXT,
           effective_grant_json TEXT NOT NULL,
-          routes_json TEXT NOT NULL,
-          grant_routes_digest TEXT NOT NULL,
+          grant_digest TEXT NOT NULL,
           research_binding_json TEXT NOT NULL,
           selection_snapshot_json TEXT NOT NULL,
           approval_route_kind TEXT NOT NULL,
@@ -1665,6 +1688,75 @@ class SQLiteApprovalStore:
           );
         """
       )
+      root_columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(approval_root_turns)")
+      }
+      if "routes_json" in root_columns:
+        conn.execute("BEGIN IMMEDIATE")
+        index_definitions = [
+          row["sql"] for row in conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'index' AND tbl_name = 'approval_root_turns' AND sql IS NOT NULL"
+          )
+        ]
+        conn.execute("""
+          CREATE TABLE approval_root_turns_new (
+            job_id TEXT NOT NULL,
+            turn_id TEXT NOT NULL,
+            tenant_storage_id TEXT NOT NULL,
+            capability_bind_json TEXT NOT NULL,
+            credential_generation_ref TEXT,
+            effective_grant_json TEXT NOT NULL,
+            grant_digest TEXT NOT NULL,
+            research_binding_json TEXT NOT NULL,
+            selection_snapshot_json TEXT NOT NULL,
+            approval_route_kind TEXT NOT NULL,
+            policy_generation_ref TEXT NOT NULL
+              REFERENCES approval_policy_generations(generation_ref),
+            created_at TEXT NOT NULL,
+            snapshot_digest TEXT NOT NULL,
+            executable_refs_json TEXT NOT NULL DEFAULT '[]',
+            PRIMARY KEY (job_id, turn_id)
+          )
+        """)
+        for row in conn.execute("SELECT * FROM approval_root_turns"):
+          old_snapshot = {
+            key: row[key] for key in row.keys()
+            if key not in {"snapshot_digest", "executable_refs_json"}
+          }
+          verified = row["snapshot_digest"] == _root_turn_snapshot_digest(old_snapshot)
+          snapshot = {
+            key: value for key, value in old_snapshot.items()
+            if key not in {"routes_json", "grant_routes_digest"}
+          }
+          snapshot["grant_digest"] = _root_turn_snapshot_digest({
+            "effective_grant_json": snapshot["effective_grant_json"],
+          })
+          # An unverified row keeps its stored digest behind a prefix no
+          # computed digest carries, so the executor reader still refuses it
+          # even if the stored value happens to equal the new shape's digest.
+          copied = {
+            **snapshot,
+            "snapshot_digest": (
+              _root_turn_snapshot_digest(snapshot)
+              if verified
+              else _UNVERIFIED_ROOT_TURN_DIGEST_PREFIX + str(row["snapshot_digest"])
+            ),
+            "executable_refs_json": row["executable_refs_json"],
+          }
+          columns_sql = ", ".join(copied)
+          values_sql = ", ".join(f":{key}" for key in copied)
+          conn.execute(
+            f"INSERT INTO approval_root_turns_new ({columns_sql}) "
+            f"VALUES ({values_sql})",
+            copied,
+          )
+        conn.execute("DROP TABLE approval_root_turns")
+        conn.execute("ALTER TABLE approval_root_turns_new RENAME TO approval_root_turns")
+        for definition in index_definitions:
+          conn.execute(definition)
+        conn.commit()
       outbox_columns = {
         str(row["name"])
         for row in conn.execute(
@@ -2029,7 +2121,6 @@ class SQLiteApprovalStore:
     capability_bind: Mapping[str, object],
     credential_generation_ref: str | None,
     effective_grant: Mapping[str, object],
-    routes: Mapping[str, object],
     research_binding: Mapping[str, object] | None,
     selection_snapshot: Mapping[str, object],
     approval_route_kind: str,
@@ -2054,7 +2145,6 @@ class SQLiteApprovalStore:
       snapshot.update(
         capability_bind_json=_rows.identity_json_dumps(dict(capability_bind)),
         effective_grant_json=_rows.identity_json_dumps(dict(effective_grant)),
-        routes_json=_rows.identity_json_dumps(dict(routes)),
         research_binding_json=_rows.identity_json_dumps(
           dict(research_binding) if research_binding is not None else None
         ),
@@ -2062,9 +2152,8 @@ class SQLiteApprovalStore:
       )
     except (TypeError, ValueError):
       raise RootTurnRecordError("snapshot_mismatch") from None
-    snapshot["grant_routes_digest"] = _root_turn_snapshot_digest({
+    snapshot["grant_digest"] = _root_turn_snapshot_digest({
       "effective_grant_json": snapshot["effective_grant_json"],
-      "routes_json": snapshot["routes_json"],
     })
     async with self._lock:
       with self._connection() as conn:
@@ -2091,13 +2180,13 @@ class SQLiteApprovalStore:
             """
             INSERT INTO approval_root_turns (
               job_id, turn_id, tenant_storage_id, capability_bind_json,
-              credential_generation_ref, effective_grant_json, routes_json,
-              grant_routes_digest, research_binding_json, selection_snapshot_json,
+              credential_generation_ref, effective_grant_json,
+              grant_digest, research_binding_json, selection_snapshot_json,
               approval_route_kind, policy_generation_ref, created_at, snapshot_digest
             ) VALUES (
               :job_id, :turn_id, :tenant_storage_id, :capability_bind_json,
-              :credential_generation_ref, :effective_grant_json, :routes_json,
-              :grant_routes_digest, :research_binding_json, :selection_snapshot_json,
+              :credential_generation_ref, :effective_grant_json,
+              :grant_digest, :research_binding_json, :selection_snapshot_json,
               :approval_route_kind, :policy_generation_ref, :created_at, :snapshot_digest
             )
             """,
@@ -2132,7 +2221,7 @@ class SQLiteApprovalStore:
       raise RootTurnRecordError("snapshot_mismatch")
     try:
       for key in (
-        "capability_bind_json", "effective_grant_json", "routes_json",
+        "capability_bind_json", "effective_grant_json",
         "research_binding_json", "selection_snapshot_json",
       ):
         _rows.identity_json_loads(row[key])
@@ -2158,7 +2247,7 @@ class SQLiteApprovalStore:
     nonce: str,
     tenant_storage_id: str,
   ) -> None:
-    """Attach refs only, before publishing an existing private parked binding."""
+    """Attach call refs before park publication, including SDK calls without capture."""
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -2181,11 +2270,20 @@ class SQLiteApprovalStore:
           (job_id, tool_call_id),
         ).fetchone()
         if binding is None:
-          raise ApprovalExecutableBindingError("missing_binding")
-        if binding["tenant_storage_id"] != tenant_storage_id:
-          raise ApprovalExecutableBindingError("tenant_mismatch")
-        if binding["nonce"] != nonce:
-          raise ApprovalExecutableBindingError("nonce_mismatch")
+          request = conn.execute(
+            """
+            SELECT approval_id FROM approval_requests
+            WHERE session_id = ? AND tool_call_id = ? AND user_id = ?
+            """,
+            (job_id, tool_call_id, tenant_storage_id),
+          ).fetchone()
+          if request is None:
+            raise ApprovalExecutableBindingError("missing_binding")
+        else:
+          if binding["tenant_storage_id"] != tenant_storage_id:
+            raise ApprovalExecutableBindingError("tenant_mismatch")
+          if binding["nonce"] != nonce:
+            raise ApprovalExecutableBindingError("nonce_mismatch")
         # Root turns share a job: each captured call belongs to exactly one turn.
         linked = conn.execute(
           """
@@ -2216,7 +2314,7 @@ class SQLiteApprovalStore:
     approval_id: str,
     tenant_storage_id: str,
   ) -> tuple[str, str, str, str] | None:
-    """Derive job/call/nonce/turn from existing custody and root refs, not a roster."""
+    """Locate a captured or SDK call from durable request identity and root refs."""
     async with self._lock:
       with self._connection() as conn:
         rows = conn.execute(
@@ -2230,8 +2328,22 @@ class SQLiteApprovalStore:
             ON json_extract(ref.value, '$.tool_call_id') = binding.tool_call_id
             AND json_extract(ref.value, '$.nonce') = binding.nonce
           WHERE binding.approval_id = ? AND binding.tenant_storage_id = ?
+          UNION ALL
+          SELECT root.job_id, request.tool_call_id,
+            json_extract(ref.value, '$.nonce') AS nonce, root.turn_id
+          FROM approval_requests AS request
+          JOIN approval_root_turns AS root
+            ON root.job_id = request.session_id
+            AND root.tenant_storage_id = request.user_id
+          JOIN json_each(root.executable_refs_json) AS ref
+            ON json_extract(ref.value, '$.tool_call_id') = request.tool_call_id
+          WHERE request.approval_id = ? AND request.user_id = ?
+            AND NOT EXISTS (
+              SELECT 1 FROM approval_executable_bindings AS binding
+              WHERE binding.approval_id = request.approval_id
+            )
           """,
-          (approval_id, tenant_storage_id),
+          (approval_id, tenant_storage_id, approval_id, tenant_storage_id),
         ).fetchall()
     if not rows:
       return None
@@ -2499,6 +2611,8 @@ class SQLiteApprovalStore:
         _request, row = self._verify_executable_attempt_locked(
           conn, binding=binding,
         )
+        if row["execution_state"] == "claimed":
+          raise ApprovalExecutableBindingError("execution_outcome_unknown")
         result = (
           self._read_executable_result_locked(conn, binding=binding, execution=row)
           if row["execution_state"] == "completed" else None

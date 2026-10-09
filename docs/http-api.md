@@ -1146,7 +1146,12 @@ Additional fields:
 
 #### `parent_message_sent`
 
-Emitted when the parent sends a message to a running background sub-agent.
+Emitted when an admitted message reaches a running sub-agent or the root job's
+mailbox. `task_id` identifies the recipient job; `runner_id` and `role`
+identify the authoring runner. On a send to a child, `sub_agent_id` identifies
+the recipient child and is supplied by task correlation. On a send to the
+root, the author's durable namespace supplies any `sub_agent_id`.
+The example below is a parent-authored send to a child.
 
 Schema:
 
@@ -1180,6 +1185,19 @@ Additional fields:
 | `sender` | object | Sender metadata with `session_id` and `user_id`, each string or null |
 | `sent_at` | number | Unix timestamp when the parent message was sent |
 | `message` | string | Message text delivered to the sub-agent |
+
+Consumption is bound to the durable `assistant_message` fact through
+`parent_message_consumptions`: exact `task_id`, `message_id`,
+`parent_message_seq` and `consumer_turn`. Its durable
+`parent_message_consumed` audit also references `assistant_message_seq`.
+For root-writer-authored sent facts, root consumption retains that exact
+`runner_id` and `role`, without minting a task entry or child namespace.
+Child consumption retains the consuming child's namespace; its parent-authored
+sent runner need not equal the consuming child runner. Replaying either
+supported assistant fact does not duplicate the consumption audit.
+A child-authored send to the root is accepted, but its consumption still fails
+the existing sender/consumer namespace check; the root-writer repair does not
+cover that path.
 
 ### Typed Domain Events
 

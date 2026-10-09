@@ -279,6 +279,7 @@ def make_test_app():
 
           if dispatcher is None:
             dispatcher_obj = ToolDispatcher(
+              capability_bind=capability_execution.bind,
               mcp_client=_NullMcpClient(),
               local_tool_handlers={},
               event_log=event_log,

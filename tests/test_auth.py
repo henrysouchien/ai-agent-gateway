@@ -25,6 +25,7 @@ from agent_gateway.auth import (
   ResolverResult,
 )
 from agent_gateway.fork_request_handoff import ForkRequestHandoff
+from agent_gateway.tool_dispatcher import _SpawningTurn
 from agent_gateway.providers import AnthropicProvider
 from agent_gateway.session import GatewaySession
 from gateway_test_support.capability_execution_test_support import stub_runner_capability_execution
@@ -92,6 +93,7 @@ def test_credential_material_is_omitted_from_runtime_object_repr() -> None:
     billing_mode="byok",
     message_marker_position=(0, 0),
     boundary_kind="mid_turn",
+    spawning_turn=_SpawningTurn(None, None),
   )
 
   for value in (auth_config, resolver_result, session, handoff):

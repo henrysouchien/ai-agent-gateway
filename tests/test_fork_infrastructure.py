@@ -1,4 +1,5 @@
 from __future__ import annotations
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
 import copy
@@ -112,6 +113,7 @@ def _runner() -> SimpleNamespace:
     validate=lambda: None,
   )
   return SimpleNamespace(
+    _dispatcher=ToolDispatcher(McpClientManager(), capability_bind=_bind()),
     _capability_execution=execution,
     _gateway_session=SimpleNamespace(
       session_credential_handle=CredentialHandle(
@@ -299,8 +301,8 @@ def test_fork_tail_shares_placeholder_prefix_and_requests_normal_message() -> No
 
 
 class _Dispatcher(ToolDispatcher):
-  def __init__(self, definitions: list[dict[str, Any]]) -> None:
-    super().__init__(McpClientManager())
+  def __init__(self, definitions: list[dict[str, Any]], *, capability_bind = TEST_CAPABILITY_BIND) -> None:
+    super().__init__(McpClientManager(), capability_bind=capability_bind)
     self.definitions = definitions
     self.calls: list[str] = []
     self.replay_controls: list[bool] = []
@@ -593,7 +595,7 @@ def test_spawn_fork_reuses_resume_seed_and_fresh_tagged_log(
         outcome=OutcomeRequirement(required=False, source="none"),
       ),
       result_provenance=result_provenance,
-      dispatcher=_Dispatcher(handoff.wire_tools),
+      dispatcher=_Dispatcher(handoff.wire_tools, capability_bind=execution.bind),
     )
   )
 
@@ -727,7 +729,7 @@ def test_fork_settlement_derives_the_outcome_from_admitted_authority(
       attempt=attempt,
       result_requirement=result_requirement,
       result_provenance=provenance_of(admitted),
-      dispatcher=_Dispatcher(handoff.wire_tools),
+      dispatcher=_Dispatcher(handoff.wire_tools, capability_bind=execution.bind),
       task_entry=task_entry,
     )
   )
@@ -844,7 +846,7 @@ def _spawn_minimal_fork(tmp_path, cls: type[_SpawnRunner]) -> TaskResult:
         capability_binding_digest=digest,
         tool_grant_digest=digest,
       ),
-      dispatcher=_Dispatcher(handoff.wire_tools),
+      dispatcher=_Dispatcher(handoff.wire_tools, capability_bind=execution.bind),
     ),
     # Far past the patched gap: a fork the guard does not reach fails here
     # instead of hanging the suite.

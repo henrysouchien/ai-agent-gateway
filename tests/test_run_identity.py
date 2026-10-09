@@ -1,4 +1,5 @@
 from __future__ import annotations
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
 from typing import Any
@@ -164,6 +165,7 @@ def test_custom_dispatcher_routes_same_run_identity_to_model_mcp_tools(
     run_id="skill-run-custom",
   )
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,  # type: ignore[arg-type]
     local_tool_handlers={},
     session_id="session-1",
@@ -201,7 +203,15 @@ def test_custom_runner_preserves_request_snapshot_and_run_identity() -> None:
       session_id="session-runner",
       run_id="skill-run-custom",
     )
+    provider = _Provider()
+    _dispatcher_execution_206 = stub_bound_capability_execution(
+            provider=provider,
+            model="stub-model",
+            effort="none",
+            auth_config={"api_key": "test"},
+          )
     dispatcher = ToolDispatcher(
+      capability_bind=_dispatcher_execution_206.bind,
       mcp_client=mcp,  # type: ignore[arg-type]
       local_tool_handlers={},
       event_log=event_log,
@@ -213,17 +223,11 @@ def test_custom_runner_preserves_request_snapshot_and_run_identity() -> None:
       run_context=run_context,
       mcp_meta_inject_servers=frozenset({"portfolio-producers-mcp"}),
     )
-    provider = _Provider()
     runner = AgentRunner(
       event_log=event_log,
       dispatcher=dispatcher,
       session_id="session-runner",
-      capability_execution=stub_bound_capability_execution(
-        provider=provider,
-        model="stub-model",
-        effort="none",
-        auth_config={"api_key": "test"},
-      ),
+      capability_execution=_dispatcher_execution_206,
       get_tool_definitions=mcp.get_tool_definitions,
       user_id="alice",
       billing_mode="byok",
@@ -269,6 +273,7 @@ def test_custom_dispatcher_gives_author_chain_legacy_attribution() -> None:
   """``author_model_spec`` is an ordinary non-lifecycle tool: attribution only."""
   mcp = _McpClient("author_model_spec")
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,  # type: ignore[arg-type]
     local_tool_handlers={},
     session_id="session-1",
@@ -316,6 +321,7 @@ def test_custom_dispatcher_forwards_lifecycle_call_to_the_identity_owner(
   missing or malformed identity; the dispatcher keys nothing on the tool name."""
   mcp = _McpClient("build_model")
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,  # type: ignore[arg-type]
     local_tool_handlers={},
     role="owner",
@@ -348,6 +354,7 @@ def test_custom_dispatcher_routes_prefixed_model_tool_identity_metadata() -> Non
   prefixed_name = "mcp__portfolio-producers-mcp__build_model"
   mcp = _McpClient(prefixed_name, original_tool_name="build_model")
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,  # type: ignore[arg-type]
     local_tool_handlers={},
     role="owner",
@@ -389,6 +396,7 @@ def test_custom_report_context_matches_runtime_run_identity() -> None:
     return {"recorded": True}, None
 
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_McpClient("unused"),  # type: ignore[arg-type]
     local_tool_handlers={"fms_report_build_model": report_handler},
     role="owner",

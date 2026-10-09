@@ -437,6 +437,7 @@ class _TerminalRunner(AgentRunner):
     super().__init__(
       event_log=event_log,
       dispatcher=ToolDispatcher(
+        capability_bind=capability_execution.bind,
         mcp_client=_NullMcp(),
         event_log=event_log,
         session_id="sess-ui-blocks",
@@ -521,7 +522,7 @@ def test_pin_and_run_object_survive_full_gateway_dispatch_chain(tmp_path) -> Non
         session_id="sess-ui-blocks",
       )
       captured["run_context"] = run_context
-      dispatcher = ToolDispatcher(mcp_client=_NullMcp(), run_context=run_context)
+      dispatcher = ToolDispatcher(capability_bind=capability_bind, mcp_client=_NullMcp(), run_context=run_context)
       captured["tool_context"] = dispatcher._new_tool_execution_context(
         tool_call_id="call-1",
         tool_name="emit_ui_blocks",

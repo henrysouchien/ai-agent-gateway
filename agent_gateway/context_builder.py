@@ -51,14 +51,14 @@ class SessionContextBuilder:
   async def build(self) -> list[Message]:
     fork_source_log = self.fork_source_log
     if fork_source_log is not None:
-      # Any seed, even one a later projection cutoff hides, means the source
-      # was already copied: it is copied once and never read again.
-      seeded, _ = await self.agent_session_log.query_current_strict(
-        event_types={"fork_seed"},
-        limit=1,
-      )
-      if not seeded:
-        async def append_fork_seed() -> None:
+      async def ensure_fork_seed() -> None:
+        # Any seed, even one a later projection cutoff hides, means the source
+        # was already copied: it is copied once and never read again.
+        seeded, _ = await self.agent_session_log.query_current_strict(
+          event_types={"fork_seed"},
+          limit=1,
+        )
+        if not seeded:
           await self.agent_session_log.append({
             "type": "fork_seed",
             "source_log_path": str(fork_source_log.path),
@@ -67,16 +67,16 @@ class SessionContextBuilder:
             ).build(),
           })
 
-        # A cancelled first turn finishes cancelling only once the seed is
-        # durable: the accepted POST already made this log the workbook's, a
-        # later resume of it carries no source to seed from, and the turn's
-        # writer ownership must outlive the append.
-        seed_task = asyncio.ensure_future(append_fork_seed())
-        try:
-          await asyncio.shield(seed_task)
-        except asyncio.CancelledError:
-          await drain_owned_lifecycle_task(seed_task)
-          raise
+      # A cancelled first turn finishes cancelling only once the seed is
+      # durable: the accepted POST already made this log the workbook's, a
+      # later resume of it carries no source to seed from, and the turn's
+      # writer ownership must outlive the lookup and append.
+      seed_task = asyncio.ensure_future(ensure_fork_seed())
+      try:
+        await asyncio.shield(seed_task)
+      except asyncio.CancelledError:
+        await drain_owned_lifecycle_task(seed_task)
+        raise
     snapshot_max_seq = await self.agent_session_log.latest_seq_current_strict()
     current_projection = await load_research_file_current_projection(
       self.agent_session_log,

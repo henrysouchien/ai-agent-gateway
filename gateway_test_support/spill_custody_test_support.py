@@ -115,7 +115,12 @@ async def publish_custody_spill(
 
   event_log = EventLog()
   provider = _SpillPublisherProvider(tool_use_id)
+  capability_execution = stub_runner_capability_execution(
+    provider=provider, auth_config={"api_key": "k"},
+    model="stub-model", effort="none",
+  )
   dispatcher = ToolDispatcher(
+    capability_bind=capability_execution.bind,
     mcp_client=McpClientManager(config_path=None),
     local_tool_handlers={"big_data": _big_data},
     event_log=event_log,
@@ -126,10 +131,7 @@ async def publish_custody_spill(
     event_log=event_log,
     dispatcher=dispatcher,
     session_id="session-alias",
-    capability_execution=stub_runner_capability_execution(
-      provider=provider, auth_config={"api_key": "k"},
-      model="stub-model", effort="none",
-    ),
+    capability_execution=capability_execution,
     get_tool_definitions=lambda: [_tool_definition()],
     user_id=context.tenant.storage_id,
     request_id=f"request:{tool_use_id}",

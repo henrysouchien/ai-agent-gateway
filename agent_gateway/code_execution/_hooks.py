@@ -33,7 +33,7 @@ def strip_code_execute_base64_hook(ctx: ToolResultContext) -> None:
     return
 
   updated = False
-  for key in ("computations", "computations_dropped"):
+  for key in ("computations",):
     if key in result:
       result.pop(key, None)
       updated = True

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from typing import Any, AsyncIterator, Iterable, cast
 
 from model_authority.bind import CapabilityBind
@@ -376,6 +377,7 @@ def stub_bound_capability_execution(
   capability_id: str = "session.driver",
   run_mode: RunMode = "interactive",
   credential_principal: CredentialPrincipal = "service",
+  credential_ref: str | None = None,
 ) -> BoundCapabilityExecution:
   """Wrap a behavioral test provider in one strict immutable execution."""
 
@@ -424,7 +426,7 @@ def stub_bound_capability_execution(
     route="test.in_process",
     effort=effort,
     credential_principal=credential_principal,
-    credential_ref=f"test-{credential_principal}:{provider_name}",
+    credential_ref=credential_ref or f"test-{credential_principal}:{provider_name}",
     run_mode=run_mode,
     registry_revision="test-capability-execution.1",
     policy_revision="test-capability-execution.1",
@@ -450,17 +452,64 @@ def stub_bound_capability_execution(
     reported_identities=frozenset({normalized_model}),
     compat=compat_for_profile(bind.protocol_profile),
   )
+  # The policy owner requires every capability slot. Keep the execution's
+  # model qualified only for its own slot; other slots get a separate entry.
+  other_entry = replace(
+    entry,
+    key=f"{entry.key}.other-capabilities",
+    route=f"{entry.route}.other-capabilities",
+    capabilities={slot: "internal" for slot in CAPABILITY_IDS if slot != capability_id},
+  )
   registry = ProductModelRegistry(
     schema=SCHEMA,
     revision="test-capability-execution.1",
-    models={entry.key: entry},
+    models={entry.key: entry, other_entry.key: other_entry},
   )
-  return BoundCapabilityExecution(
-    bind=bind,
+  handle = CredentialHandle(
+    handle_id=bind.credential_ref,
+    provider=bind.provider,
+    principal=credential_principal,
+    tenant_id="test-tenant",
+    actor_id="test-actor" if credential_principal == "user" else None,
+  )
+  resolver = CapabilityExecutionResolver(
     registry=registry,
-    adapter=provider,
-    auth_config=config,
+    selection_policy=ProductModelSelectionPolicy(
+      schema=SCHEMA,
+      revision=bind.policy_revision,
+      capabilities={
+        slot: CapabilitySelectionPolicy(
+          capability_id=slot,
+          default=CapabilityDefault(
+            kind="model",
+            model_key=entry.key if slot == capability_id else other_entry.key,
+            effort=effort,
+          ),
+          by_channel={},
+          allowed_model_keys=frozenset({entry.key if slot == capability_id else other_entry.key}),
+        )
+        for slot in CAPABILITY_IDS
+      },
+    ),
+    auth_context=AuthContext(
+      run_mode=run_mode,
+      actor_id="test-actor",
+      tenant_id="test-tenant",
+      user_provider_handles={bind.provider: handle} if credential_principal == "user" else {},
+      service_provider_handles={bind.provider: handle} if credential_principal == "service" else {},
+      entitled_capabilities=frozenset({capability_id}),
+      entitled_model_keys=frozenset({bind.model_key}),
+      run_scoped_user_providers=(
+        frozenset({bind.provider}) if credential_principal == "user" else frozenset()
+      ),
+      allow_service_for_interactive=True,
+    ),
+    credential_materializer=lambda selected: MaterializedCredential(
+      handle=selected, auth_config=config,
+    ),
+    adapter_resolver=lambda adapter: provider,
   )
+  return resolver.materialize_bind(bind)
 
 
 def stub_runner_capability_execution(

@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import gc
 import sys
@@ -237,21 +238,23 @@ def _notification_registry_runner(
   task_entry: TaskEntry | None = None,
 ) -> AgentRunner:
   event_log = EventLog()
+  _dispatcher_execution_243 = stub_runner_capability_execution(
+        provider=SimpleNamespace(name="stub"),
+        model="stub-model",
+        effort="none",
+        auth_config={"api_key": "test-only"},
+      )
   child = AgentRunner(
     event_log=event_log,
     dispatcher=ToolDispatcher(
+      capability_bind=_dispatcher_execution_243.bind,
       mcp_client=McpClientManager(config_path=None),
       local_tool_handlers={},
       event_log=event_log,
       session_id=task_id,
     ),
     session_id=task_id,
-    capability_execution=stub_runner_capability_execution(
-      provider=SimpleNamespace(name="stub"),
-      model="stub-model",
-      effort="none",
-      auth_config={"api_key": "test-only"},
-    ),
+    capability_execution=_dispatcher_execution_243,
     user_id="registry-test",
     billing_mode="byok",
     rate_table_version="unknown",

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any
 
 from model_authority.bind import CapabilityBind
 from model_authority.binding import (
@@ -21,7 +21,7 @@ from model_authority.binding import (
 )
 from model_authority.capabilities import CAPABILITY_EXECUTION_PROCESS, CAPABILITY_IDS
 from model_authority.registry import ProductModelRegistry
-from model_authority.selection import ProductModelSelectionPolicy, SelectionSnapshot, TierDefaultInput
+from model_authority.selection import ProductModelSelectionPolicy, SelectionSnapshot
 from .providers import ModelProvider
 
 
@@ -69,6 +69,7 @@ class BoundCapabilityExecution:
   registry: ProductModelRegistry
   adapter: ModelProvider
   auth_config: Mapping[str, Any] = field(repr=False)
+  resolver: CapabilityExecutionResolver | None = field(default=None, repr=False, compare=False)
 
   def __post_init__(self) -> None:
     if not isinstance(self.bind, CapabilityBind):
@@ -193,15 +194,12 @@ class CapabilityExecutionResolver:
     parent_bind: CapabilityBind | None = None,
     effort: str | None = None,
     role: str | None = None,
-    role_map: Mapping[str, TierDefaultInput] | None = None,
-    role_map_source: Literal["saved_preference", "internal_policy"] | None = None,
-    requested_role_source: Literal["explicit_user", "internal_policy"] = "internal_policy",
     selection_snapshot: SelectionSnapshot | None = None,
   ) -> CapabilityBind:
     """Select and authorize an exact bind without credentials or adapter effects.
 
     ``role`` and ``effort`` are already-lowered spawn/operation requests;
-    the admission owner supplies the inherited effective ``role_map``.
+    the admission owner supplies the frozen ``selection_snapshot``.
     """
 
     self._require_executable_here(str(capability_id or "").strip())
@@ -217,9 +215,6 @@ class CapabilityExecutionResolver:
       parent_bind=parent_bind,
       requested_effort=effort,
       requested_role=role,
-      role_map=role_map,
-      role_map_source=role_map_source,
-      requested_role_source=requested_role_source,
       selection_snapshot=selection_snapshot,
     )
 
@@ -232,9 +227,6 @@ class CapabilityExecutionResolver:
     parent_bind: CapabilityBind | None = None,
     effort: str | None = None,
     role: str | None = None,
-    role_map: Mapping[str, TierDefaultInput] | None = None,
-    role_map_source: Literal["saved_preference", "internal_policy"] | None = None,
-    requested_role_source: Literal["explicit_user", "internal_policy"] = "internal_policy",
     selection_snapshot: SelectionSnapshot | None = None,
   ) -> BoundCapabilityExecution:
     bind = self.select_bind(
@@ -244,9 +236,6 @@ class CapabilityExecutionResolver:
       parent_bind=parent_bind,
       effort=effort,
       role=role,
-      role_map=role_map,
-      role_map_source=role_map_source,
-      requested_role_source=requested_role_source,
       selection_snapshot=selection_snapshot,
     )
     return self._materialize(bind)
@@ -261,6 +250,35 @@ class CapabilityExecutionResolver:
       auth=self.auth_context,
     )
     return self._materialize(bind, handle=handle)
+
+  @staticmethod
+  def rebind_rotated_credential(
+    execution: BoundCapabilityExecution,
+    rotated_auth_config: Mapping[str, Any],
+    *,
+    merged_auth_config: Mapping[str, Any],
+  ) -> BoundCapabilityExecution | None:
+    """Reauthorize a sibling generation; never put it under the previous bind."""
+    from .providers.anthropic_oauth import is_anthropic_generation_ref
+
+    source = rotated_auth_config.get("credential_source")
+    generation_ref = source.get("generation_ref") if isinstance(source, Mapping) else None
+    if not isinstance(generation_ref, str) or not is_anthropic_generation_ref(generation_ref):
+      if is_anthropic_generation_ref(execution.bind.credential_ref):
+        return None
+      # Providers without generation handles retain their per-session identity.
+      return replace(execution, auth_config=merged_auth_config)
+
+    resolver = execution.resolver
+    if resolver is None:
+      return None
+    # CapabilityBind is a validated Pydantic value, not a dataclass. Its wire
+    # fields are the identity; there is no separately cached bind digest.
+    bind = CapabilityBind.model_validate({
+      **execution.bind.to_json(),
+      "credential_ref": generation_ref,
+    })
+    return resolver.with_frozen_credential(bind, merged_auth_config).materialize_bind(bind)
 
   def with_frozen_credential(
     self, bind: CapabilityBind, auth_config: Mapping[str, Any],
@@ -395,6 +413,7 @@ class CapabilityExecutionResolver:
       registry=self.registry,
       adapter=adapter,
       auth_config=auth_config,
+      resolver=self,
     )
 
 

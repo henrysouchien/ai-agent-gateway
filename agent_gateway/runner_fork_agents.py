@@ -105,8 +105,8 @@ class LearningForkWorkItem:
   fork_events: Sequence[Any] = ()
 
   @property
-  def _fork_retained_payload(self) -> ForkRequestHandoff:
-    return self.handoff
+  def _fork_retained_payload(self) -> Mapping[str, Any]:
+    return self.handoff._fork_retained_payload
 
   def on_admission_settled(self, fork_id: str) -> None:
     self.ledger.write_receipt(
@@ -131,6 +131,7 @@ def _bind_learning_fork_execution(
     registry=parent_execution.registry,
     adapter=parent_execution.adapter,
     auth_config=parent_execution.auth_config,
+    resolver=parent_execution.resolver,
   )
 
 
@@ -443,6 +444,8 @@ async def spawn_fork_agent(
   child_dispatcher = dispatcher.fork_child(
     event_log=sub_log,
     session_id=sub_session_id,
+    capability_bind=capability_execution.bind,
+    spawning_turn=handoff.spawning_turn,
     local_handler_scopes=local_handler_scopes,
   )
   wire_tools = copy.deepcopy(list(handoff.wire_tools))

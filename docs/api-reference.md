@@ -261,11 +261,9 @@ effort before returning.
 
 `select_bind()` selects a secret-free `CapabilityBind` without materializing a
 credential or adapter. Both selection methods accept optional `role`, exact
-`effort`, `role_map: Mapping[str, TierDefaultInput]`, `role_map_source`
-(`saved_preference` or `internal_policy`), and `requested_role_source`
-(`explicit_user` or `internal_policy`, defaulting to `internal_policy`).
-An explicit map requires its source. Admission supplies the frozen effective
-map; this adapter does not derive it from a runtime session. `authorize_bind()`
+`effort`, and `selection_snapshot: SelectionSnapshot | None`. Admission supplies
+the frozen selection snapshot; this adapter does not derive it from a runtime
+session. `authorize_bind()`
 and `materialize_bind()` retain exact frozen-bind reauthorization without
 reselection.
 
@@ -497,7 +495,10 @@ Pass the actual executing session through `session`, or bundle it with its
 authenticated user and credential identity in `DispatchIdentity`. Local-handler
 context, role policy, per-user MCP authentication, and source-pack capture use
 that execution authority. A `DispatchIdentity` cannot also be supplied alongside
-separate execution-identity arguments.
+separate execution-identity arguments. Build it with `dispatch_identity(session=...,
+execution=..., context=...)`: `execution` is the identity the caller resolved, and
+`None` means a resolved absence, never derived from the session. `context` is the
+executing admitted context. Both are required keyword arguments.
 
 `approval_route` is independent: its ledger and policy authorize the money
 boundary, and its session owns pending approval cards and decision queues. An

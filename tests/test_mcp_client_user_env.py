@@ -1,4 +1,5 @@
 from __future__ import annotations
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
 import json
@@ -299,6 +300,7 @@ def test_dispatcher_preserves_meta_and_authenticated_session_for_user_server(mon
 
     monkeypatch.setattr(manager, "call_tool", call_tool)
     dispatcher = ToolDispatcher(
+      capability_bind=TEST_CAPABILITY_BIND,
       mcp_client=manager,
       session=gateway_session,
       session_id="session-7",

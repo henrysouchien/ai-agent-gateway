@@ -1,4 +1,5 @@
 from __future__ import annotations
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import inspect
 import os
@@ -156,6 +157,7 @@ def test_integrity_guard_uses_a_real_raise_after_session_kind_changes() -> None:
   with pytest.raises(DispatcherConstructionError, match="does not match"):
     build_tool_dispatcher(
       _deps(),
+      capability_bind=TEST_CAPABILITY_BIND,
       principal=principal,
       profile="chat_embedded",
       event_log=None,
@@ -169,6 +171,7 @@ def test_integrity_guard_uses_a_real_raise_after_session_kind_changes() -> None:
 def test_integrity_guard_survives_optimized_python_mode() -> None:
   package_dir = Path(__file__).resolve().parents[1]
   script = """
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 from types import SimpleNamespace
 from agent_gateway.dispatcher_factory import (
   DispatcherConstructionError,
@@ -189,6 +192,7 @@ session.kind = "control"
 try:
   build_tool_dispatcher(
     GatewayDispatcherDeps(None, None, None, frozenset()),
+    capability_bind=TEST_CAPABILITY_BIND,
     principal=principal,
     profile="chat_embedded",
     event_log=None,
@@ -244,6 +248,7 @@ def test_chat_embedded_golden_attribute_snapshot_matches_easy_inline() -> None:
   commercial_servers = frozenset({"portfolio-trades-mcp"})
 
   expected = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp_client,
     local_tool_handlers=local_handlers,
     needs_approval=needs_approval,
@@ -262,6 +267,7 @@ def test_chat_embedded_golden_attribute_snapshot_matches_easy_inline() -> None:
       mcp_client=mcp_client,
       mcp_meta_inject_servers=frozenset(),
     ),
+    capability_bind=TEST_CAPABILITY_BIND,
     principal=InvocationPrincipal.from_session(
       session,
       approval_key_qualifier=qualifier,

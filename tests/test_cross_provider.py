@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import inspect
 from dataclasses import replace
@@ -165,6 +166,7 @@ def _make_dispatcher(
   get_tool_definitions: Any | None = None,
 ) -> ToolDispatcher:
   return ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=McpClientManager(config_path=None),
     local_tool_handlers={},
     event_log=event_log or EventLog(),

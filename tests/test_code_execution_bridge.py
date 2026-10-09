@@ -7,6 +7,7 @@ registration, through the bound dispatcher under the outer call, records it in
 the outer result's `nested_calls`, and carries registered producer settlement
 identities plus the bound extractor's richer handles in `sources`.
 """
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import errno
 import json
@@ -171,6 +172,7 @@ def _bind(bundle: Any, mcp: _CaptureMcp, *, extract_sources: Any = None) -> Tool
   """One request's dispatcher over `bundle`, bound as the product's builder binds it."""
   definitions = _tool_definitions(bundle)
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     local_tool_handlers={**bundle.handlers, "file_read": _file_read},
     role="owner",
@@ -623,6 +625,7 @@ def test_hank_outside_a_bridged_cell_and_unbound_dispatcher_report_bridge_unavai
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
     dispatcher = ToolDispatcher(
+      capability_bind=TEST_CAPABILITY_BIND,
       mcp_client=_CaptureMcp(),
       local_tool_handlers=bundle.handlers,
       role="owner",
@@ -994,7 +997,7 @@ def test_registered_settlement_sources_match_direct_dispatch_and_are_json_serial
     ) for name in handlers)
     definitions = [{"name": name, "input_schema": {"type": "object"}} for name in handlers]
     dispatcher = ToolDispatcher(
-      mcp_client=_CaptureMcp(), local_tool_handlers=handlers, role="owner",
+      capability_bind=TEST_CAPABILITY_BIND, mcp_client=_CaptureMcp(), local_tool_handlers=handlers, role="owner",
       get_tool_definitions=lambda: definitions,
       tool_registration_catalog=ToolRegistrationCatalog(declarations, ()),
       tool_policy_implementations=registry, redaction_context_factory=lambda _declaration: None,
@@ -1206,6 +1209,61 @@ def test_native_calls_share_bridge_authority_ordinals_and_sources() -> None:
       later = reader.open_cell("disposed", abort_event=None, active=True)
       await reader.aclose()
       assert lookup_active_cell(later.token) is None
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(run())
+
+
+def test_native_nested_computation_sources_settle_without_filesystem_reader(monkeypatch: Any) -> None:
+  async def run() -> None:
+    sources = [
+      {"document_id": "sandbox:load_statements:sha=aaaaaaaaaaaa", "source_kind": "computation"},
+      {"document_id": "sandbox:render_sourced_table:sha=bbbbbbbbbbbb", "source_kind": "computation"},
+    ]
+    session, _bundle, _mcp, dispatcher = _setup(
+      extract_sources=lambda _operation, result: result["sources"],
+    )
+    from dataclasses import replace
+    settle = dispatcher.settle_tool_result
+
+    def settle_computation(operation: Any, entry: Any, result: Any, error: Any, *args: Any, **kwargs: Any) -> Any:
+      settlement = settle(operation, entry, result, error, *args, **kwargs)
+      if operation != GET_FILINGS:
+        return settlement
+      return replace(settlement, sources=tuple(result["sources"]))
+
+    monkeypatch.setattr(dispatcher, "settle_tool_result", settle_computation)
+
+    async def execute(_input: Any, *, bridge: Any, **_kwargs: Any) -> Any:
+      from agent_gateway.code_execution._frame_reader import lookup_active_cell
+      bridge.activate()
+      active = lookup_active_cell(bridge.token)
+      assert active is not None
+      for index, function in enumerate(("load_statements", "render_sourced_table")):
+        entry = active.start_native(GET_FILINGS, {"cik": "AAPL"})
+        active.settle_native(
+          entry, result={**_FILINGS_RESULT, "sources": [sources[index]]}, error=None,
+          provenance={
+            "function": function, "tool_version": "risk-v1",
+            "output_sha256": ("a" if index == 0 else "b") * 64,
+          },
+        )
+      return {"return_code": 0, "stdout": "", "stderr": ""}, None
+
+    monkeypatch.setattr("agent_gateway.code_execution._handlers.code_execute", execute)
+    try:
+      result, error = await _run_cell(dispatcher, "pass", host="subprocess")
+      assert error is None
+      assert result["sources"] == [
+        {**source, "produced_by_tool": "get_filings"} for source in sources
+      ]
+      assert [row["function"] for row in result["computations"]] == [
+        "load_statements", "render_sourced_table",
+      ]
+      assert [row["nested_call_id"] for row in result["computations"]] == [
+        row["nested_call_id"] for row in result["nested_calls"]
+      ]
     finally:
       await cleanup_code_execution(session)
 

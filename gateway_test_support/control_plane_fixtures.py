@@ -35,6 +35,7 @@ class _ControlTestRunner(AgentRunner):
     super().__init__(
       event_log=event_log,
       dispatcher=ToolDispatcher(
+        capability_bind=capability_execution.bind,
         mcp_client=McpClientManager(config_path=None),
         local_tool_handlers={},
         event_log=event_log,

@@ -1,3 +1,4 @@
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import json
 import logging
@@ -988,6 +989,7 @@ def _make_dispatcher(
   event_log: EventLog | None = None,
 ) -> ToolDispatcher:
   return ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_null_mcp_client(),
     local_tool_handlers={},
     event_log=event_log or EventLog(),

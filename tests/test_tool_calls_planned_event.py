@@ -1,4 +1,5 @@
 """`tool_calls_planned`: one event per tool-using model turn, before execution."""
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
 from typing import Any
@@ -139,9 +140,16 @@ def _tool_def(name: str) -> dict[str, Any]:
 def _run_turns(turns: list[list[StreamEvent]]) -> list[dict[str, Any]]:
   event_log = EventLog()
   provider = _ScriptedProvider(turns)
+  _dispatcher_execution_145 = stub_bound_capability_execution(
+        provider=provider,
+        model="stub-model",
+        effort="none",
+        auth_config={"api_key": "k"},
+      )
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=ToolDispatcher(
+      capability_bind=_dispatcher_execution_145.bind,
       mcp_client=_NullMcpClient(),
       local_tool_handlers={"lookup": _ok_handler, "get_quote": _ok_handler},
       event_log=event_log,
@@ -149,12 +157,7 @@ def _run_turns(turns: list[list[StreamEvent]]) -> list[dict[str, Any]]:
       role="owner",
     ),
     session_id="sess-planned",
-    capability_execution=stub_bound_capability_execution(
-      provider=provider,
-      model="stub-model",
-      effort="none",
-      auth_config={"api_key": "k"},
-    ),
+    capability_execution=_dispatcher_execution_145,
     get_tool_definitions=lambda: [_tool_def("lookup"), _tool_def("get_quote")],
     user_id="alice",
     billing_mode="byok",

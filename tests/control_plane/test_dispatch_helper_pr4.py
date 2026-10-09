@@ -122,6 +122,7 @@ class _TestRunner(AgentRunner):
     super().__init__(
       event_log=event_log,
       dispatcher=ToolDispatcher(
+        capability_bind=capability_execution.bind,
         mcp_client=McpClientManager(inline_servers={}),
         local_tool_handlers={},
         event_log=event_log,

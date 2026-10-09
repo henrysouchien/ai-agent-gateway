@@ -237,6 +237,7 @@ async def build_chat_runtime(
 
   def build_runner(event_log, session_id, started_at):
     dispatcher = ToolDispatcher(
+      capability_bind=capability_execution.bind,
       mcp_client=mcp_client,
       local_tool_handlers=LOCAL_HANDLERS,
       needs_approval=lambda tool_name, _tool_input, _qualifier: tool_name == "write_report",

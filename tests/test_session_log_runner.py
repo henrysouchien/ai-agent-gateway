@@ -1,3 +1,4 @@
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import hashlib
 import json
@@ -227,6 +228,7 @@ class _RetryableFailingProvider(_ScriptedProvider):
 
 def _make_dispatcher(
   *,
+  capability_bind = TEST_CAPABILITY_BIND,
   event_log: EventLog | None = None,
   local_tool_handlers: dict[str, Any] | None = None,
 ) -> ToolDispatcher:
@@ -243,6 +245,7 @@ def _make_dispatcher(
     for name in handlers
   ]
   return ToolDispatcher(
+    capability_bind=capability_bind,
     mcp_client=_NullMcpClient(),
     local_tool_handlers=handlers,
     event_log=event_log or EventLog(),
@@ -392,11 +395,12 @@ def test_runner_emits_durable_envelope_in_order(tmp_path: Path) -> None:
     _text_turn("done"),
   ])
   event_log = EventLog()
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=event_log,
-    dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"lookup": _lookup_tool}),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=event_log, local_tool_handlers={"lookup": _lookup_tool}),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     workspace_dir=str(tmp_path),
     user_id="alice",
@@ -429,11 +433,12 @@ def test_gateway_session_attach_records_the_log_owner(tmp_path: Path) -> None:
     auth_config={"api_key": "k"},
   )
   event_log = EventLog()
+  capability_execution = _runner_execution(_ScriptedProvider([_text_turn("ok")]))
   runner = _make_runner(
     event_log=event_log,
-    dispatcher=_make_dispatcher(event_log=event_log),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=event_log),
     session_id="sess-owned",
-    capability_execution=_runner_execution(_ScriptedProvider([_text_turn("ok")])),
+    capability_execution=capability_execution,
     agent_session_log=log,
     gateway_session=session,
     user_id="alice",
@@ -466,17 +471,17 @@ def test_detach_keeps_other_session_responsive(
     runners = [
       _make_runner(
         event_log=events[index],
-        dispatcher=_make_dispatcher(event_log=events[index]),
+        dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=events[index]),
         session_id=f"session-{index}",
-        capability_execution=_runner_execution(
-          _ScriptedProvider([_text_turn(f"answer-{index}")])
-        ),
+        capability_execution=capability_execution,
         agent_session_log=logs[index],
         user_id=f"user-{index}",
         billing_mode="byok",
         rate_table_version="unknown",
       )
-      for index in range(2)
+      for index in range(2) for capability_execution in (_runner_execution(
+          _ScriptedProvider([_text_turn(f"answer-{index}")])
+        ),)
     ]
     loop = asyncio.get_running_loop()
     scan_started = asyncio.Event()
@@ -537,11 +542,12 @@ def test_cancellation_during_recovery_settles_without_starting_provider(
     })
     provider = _ScriptedProvider([_text_turn("Must not execute")])
     event_log = EventLog()
+    capability_execution = _runner_execution(provider)
     runner = _make_runner(
       event_log=event_log,
-      dispatcher=_make_dispatcher(event_log=event_log),
+      dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=event_log),
       session_id="cancelled-recovery",
-      capability_execution=_runner_execution(provider),
+      capability_execution=capability_execution,
       agent_session_log=durable_log,
       user_id="alice",
       billing_mode="byok",
@@ -604,13 +610,14 @@ def test_detach_commits_after_cancellation_during_terminal_scan(
   async def _case() -> None:
     durable_log = AgentSessionLog(path=tmp_path / "cancelled-detach.jsonl")
     event_log = EventLog()
+    capability_execution = _runner_execution(
+        _ScriptedProvider([_text_turn("Completed answer")])
+      )
     runner = _make_runner(
       event_log=event_log,
-      dispatcher=_make_dispatcher(event_log=event_log),
+      dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=event_log),
       session_id="cancelled-detach",
-      capability_execution=_runner_execution(
-        _ScriptedProvider([_text_turn("Completed answer")])
-      ),
+      capability_execution=capability_execution,
       agent_session_log=durable_log,
       user_id="alice",
       billing_mode="byok",
@@ -663,10 +670,11 @@ def test_post_sse_cancellation_keeps_durable_detach(tmp_path: Path) -> None:
   async def case() -> None:
     durable_log = AgentSessionLog(tmp_path / "post-sse-cancellation.jsonl")
     event_log = EventLog()
+    capability_execution = _runner_execution(_ScriptedProvider([_text_turn("done")]))
     runner = _make_runner(
-      event_log=event_log, dispatcher=_make_dispatcher(event_log=event_log),
+      event_log=event_log, dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=event_log),
       session_id="post-sse-cancellation",
-      capability_execution=_runner_execution(_ScriptedProvider([_text_turn("done")])),
+      capability_execution=capability_execution,
       agent_session_log=durable_log, user_id="alice",
       billing_mode="byok", rate_table_version="unknown",
     )
@@ -709,10 +717,11 @@ def test_named_skill_repeated_cancellation_drains_interruption_and_detach(
       scope="ticker", ticker="PCTY", portfolio_id=None,
     )
     event_log = EventLog()
-    dispatcher = _make_dispatcher(event_log=event_log)
+    capability_execution = _runner_execution(_ScriptedProvider([_text_turn("unused")]))
+    dispatcher = _make_dispatcher(capability_bind=capability_execution.bind, event_log=event_log)
     runner = AgentRunner(
       event_log=event_log, dispatcher=dispatcher, session_id="named-cancellation",
-      capability_execution=_runner_execution(_ScriptedProvider([_text_turn("unused")])),
+      capability_execution=capability_execution,
       agent_session_log=durable_log,
       get_tool_definitions=dispatcher.get_tool_definitions,
       top_level_skill_admission=TopLevelSkillAdmission.acquire(durable_log.path),
@@ -802,11 +811,12 @@ def test_runner_commits_selected_content_on_user_fact_before_provider_setup(
 
   provider = _CommitCheckingProvider([_text_turn("done")])
   event_log = EventLog()
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=event_log,
-    dispatcher=_make_dispatcher(event_log=event_log),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=event_log),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     workspace_dir=str(tmp_path),
     user_id="alice",
@@ -838,11 +848,12 @@ def test_runner_suppresses_text_from_tool_only_turns(
     _text_turn("done"),
   ])
   event_log = EventLog()
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=event_log,
-    dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"lookup": _lookup_tool}),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=event_log, local_tool_handlers={"lookup": _lookup_tool}),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     workspace_dir=str(tmp_path),
     user_id="alice",
@@ -884,11 +895,12 @@ def test_semantic_tool_error_is_visible_in_trace_and_timing(tmp_path: Path) -> N
     _tool_turn(tool_input={"query": "X"}),
     _text_turn("handled"),
   ])
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=event_log,
-    dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"lookup": _semantic_error_tool}),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=event_log, local_tool_handlers={"lookup": _semantic_error_tool}),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     on_tool_timing=lambda *args: timing_calls.append(args),
     user_id="alice",
@@ -928,11 +940,12 @@ def test_semantic_tool_error_without_detail_warns_model_context(tmp_path: Path) 
     _tool_turn(tool_name="get_skill_artifact", tool_input={"ticker": "ADI"}),
     _text_turn("handled"),
   ])
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=event_log,
-    dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"get_skill_artifact": _empty_status_error_tool}),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=event_log, local_tool_handlers={"get_skill_artifact": _empty_status_error_tool}),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
@@ -973,14 +986,16 @@ def test_native_runner_semantic_error_includes_validation_details(tmp_path: Path
     _tool_turn(tool_name="thesis_append_decisions_log", tool_input={"research_file_id": 1, "entry": {}}),
     _text_turn("handled"),
   ])
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=event_log,
     dispatcher=_make_dispatcher(
+      capability_bind=capability_execution.bind,
       event_log=event_log,
       local_tool_handlers={"thesis_append_decisions_log": _decision_log_validation_error_tool},
     ),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
@@ -1010,11 +1025,12 @@ def test_operator_pause_before_turn_emits_clean_interruption(tmp_path: Path) -> 
   pause_event = asyncio.Event()
   pause_event.set()
   provider = _ScriptedProvider([])
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=event_log,
-    dispatcher=_make_dispatcher(event_log=event_log),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=event_log),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     operator_pause_event=pause_event,
     user_id="alice",
@@ -1057,11 +1073,12 @@ def test_operator_pause_after_turn_stops_before_tool_dispatch(tmp_path: Path) ->
     [_tool_turn()],
     after_turn=lambda _turn_index: pause_event.set(),
   )
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=event_log,
-    dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"lookup": _unexpected_tool}),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=event_log, local_tool_handlers={"lookup": _unexpected_tool}),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     operator_pause_event=pause_event,
     user_id="alice",
@@ -1108,11 +1125,12 @@ def test_followup_replays_complete_tool_batch_before_user_text(
         if ending == "operator_pause" else None
       ),
     )
+    capability_execution = _runner_execution(opening)
     runner = _make_runner(
       event_log=EventLog(),
-      dispatcher=_make_dispatcher(local_tool_handlers={"lookup": _lookup}),
+      dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, local_tool_handlers={"lookup": _lookup}),
       session_id="sess-parent",
-      capability_execution=_runner_execution(opening),
+      capability_execution=capability_execution,
       agent_session_log=log,
       operator_pause_event=pause_event,
       on_tool_result=lambda _: [{"type": "text", "text": "Source annotation"}],
@@ -1170,11 +1188,12 @@ def test_followup_replays_complete_tool_batch_before_user_text(
         return params
 
     followup = _FollowupProvider([_text_turn("Follow-up answer")])
+    capability_execution_2 = _runner_execution(followup)
     followup_runner = _make_runner(
       event_log=EventLog(),
-      dispatcher=_make_dispatcher(),
+      dispatcher=_make_dispatcher(capability_bind=capability_execution_2.bind),
       session_id="sess-parent",
-      capability_execution=_runner_execution(followup),
+      capability_execution=capability_execution_2,
       agent_session_log=log,
       context_builder=SessionContextBuilder(agent_session_log=log),
       user_id="alice",
@@ -1215,11 +1234,12 @@ def test_provider_client_creation_failure_terminalizes_without_raising(
   )
   provider = _StartupFailureProvider([])
   event_log = EventLog()
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=event_log,
-    dispatcher=_make_dispatcher(event_log=event_log),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=event_log),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     shutdown_signal_provider=lambda: {"signal_name": "SIGTERM"},
     emit_session_recap=False,
@@ -1258,11 +1278,12 @@ def test_sub_agent_cancelled_run_emits_sub_agent_interrupted_reason(tmp_path: Pa
 
   log = AgentSessionLog(path=tmp_path / "sessions" / "sub-agent-cancelled.jsonl")
   provider = _BlockingProvider([])
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=EventLog(),
-    dispatcher=_make_dispatcher(),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind),
     session_id="sub-worker:parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
@@ -1319,11 +1340,12 @@ def test_runner_without_context_builder_does_not_inject_prior_durable_history(tm
       )
 
   provider = _CapturingProvider([_text_turn("done")])
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=EventLog(),
-    dispatcher=_make_dispatcher(),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     context_builder=None,
     user_id="alice",
@@ -1370,11 +1392,12 @@ def test_runner_with_context_builder_ignores_fabricated_client_history(tmp_path:
       )
 
   provider = _CapturingProvider([_text_turn("done")])
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=EventLog(),
-    dispatcher=_make_dispatcher(),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     context_builder=SessionContextBuilder(agent_session_log=log),
     user_id="alice",
@@ -1410,11 +1433,12 @@ def test_stream_retry_and_terminal_error_are_durable(
   provider = _RetryableFailingProvider()
   log = AgentSessionLog(path=tmp_path / "sessions" / "stream-retry.jsonl")
   event_log = EventLog()
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=event_log,
-    dispatcher=_make_dispatcher(event_log=event_log),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=event_log),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
@@ -1496,11 +1520,12 @@ def test_stream_retry_records_attempt_elapsed_and_the_slept_backoff(
   provider = _TimedFailingProvider()
   log = AgentSessionLog(path=tmp_path / "sessions" / "stream-retry-timing.jsonl")
   event_log = EventLog()
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=event_log,
-    dispatcher=_make_dispatcher(event_log=event_log),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=event_log),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
@@ -1542,17 +1567,18 @@ def test_credential_rotation_on_the_last_attempt_records_no_backoff(
   provider = _SpentCredentialProvider("429 Too Many Requests")
   log = AgentSessionLog(path=tmp_path / "sessions" / "credential-rotation-timing.jsonl")
   event_log = EventLog()
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=event_log,
-    dispatcher=_make_dispatcher(event_log=event_log),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=event_log),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
   )
-  monkeypatch.setattr(runner, "_apply_refreshed_auth_config", lambda config, refreshed: None)
+  monkeypatch.setattr(runner, "_apply_refreshed_auth_config", lambda config, refreshed: True)
 
   _run(runner.run(messages=[{"role": "user", "content": "review allocation"}]))
 
@@ -1573,11 +1599,12 @@ def test_tool_call_complete_logs_final_model_facing_result_blocks(tmp_path: Path
     _text_turn("done"),
   ])
   event_log = EventLog()
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=event_log,
-    dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"warn_lookup": _warning_tool}),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=event_log, local_tool_handlers={"warn_lookup": _warning_tool}),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
@@ -1604,11 +1631,12 @@ def test_tool_call_complete_pre_and_final_results_differ_when_annotated(tmp_path
     _text_turn("done"),
   ])
   event_log = EventLog()
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=event_log,
-    dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"warn_lookup": _warning_tool}),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=event_log, local_tool_handlers={"warn_lookup": _warning_tool}),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
@@ -1635,16 +1663,18 @@ def test_tool_completion_retains_interceptor_warning_provenance(
     _text_turn("done"),
   ])
   event_log = EventLog()
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=event_log,
     dispatcher=_make_dispatcher(
+      capability_bind=capability_execution.bind,
       event_log=event_log,
       local_tool_handlers={
         "warning_source": _interceptor_warning_tool,
       },
     ),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
@@ -1677,11 +1707,12 @@ def test_large_tool_result_is_compacted_only_for_model_context(tmp_path: Path, m
     _text_turn("done"),
   ])
   event_log = EventLog()
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=event_log,
-    dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"large_lookup": _large_result_tool}),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=event_log, local_tool_handlers={"large_lookup": _large_result_tool}),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
@@ -1738,11 +1769,12 @@ def test_rebuild_task_registry_ignores_tool_call_complete_final_blocks(tmp_path:
     )
   )
   provider = _ScriptedProvider([_text_turn("unused")])
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=EventLog(),
-    dispatcher=_make_dispatcher(local_tool_handlers={}),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, local_tool_handlers={}),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     task_registry=TaskRegistry(),
     user_id="alice",
@@ -1852,11 +1884,12 @@ def test_runner_stale_recovery_synthesizes_orphan_tool_and_prior_writer_interrup
       return {}
 
   provider = _RecoveryProvider([_text_turn("recovered")])
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=EventLog(),
-    dispatcher=_make_dispatcher(local_tool_handlers={}),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, local_tool_handlers={}),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     context_builder=SessionContextBuilder(agent_session_log=log),
     user_id="alice",
@@ -1893,22 +1926,24 @@ def test_runner_stale_recovery_synthesizes_orphan_tool_and_prior_writer_interrup
 def test_second_writer_lease_acquisition_raises(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "lease.jsonl")
   provider_one = _ScriptedProvider([_text_turn("one")])
+  capability_execution = _runner_execution(provider_one)
   runner_one = _make_runner(
     event_log=EventLog(),
-    dispatcher=_make_dispatcher(),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind),
     session_id="sess-one",
-    capability_execution=_runner_execution(provider_one),
+    capability_execution=capability_execution,
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
   )
   provider_two = _ScriptedProvider([_text_turn("two")])
+  capability_execution_2 = _runner_execution(provider_two)
   runner_two = _make_runner(
     event_log=EventLog(),
-    dispatcher=_make_dispatcher(),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution_2.bind),
     session_id="sess-two",
-    capability_execution=_runner_execution(provider_two),
+    capability_execution=capability_execution_2,
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
@@ -1940,11 +1975,12 @@ def test_register_background_task_emits_task_registered_with_correlation(
 
     monkeypatch.setattr(gateway_runner, "_derive_sub_agent_id", _fake_derive)
     provider = _ScriptedProvider([_text_turn("unused")])
+    capability_execution = _runner_execution(provider)
     runner = _make_runner(
       event_log=EventLog(),
-      dispatcher=_make_dispatcher(),
+      dispatcher=_make_dispatcher(capability_bind=capability_execution.bind),
       session_id="sess-parent",
-      capability_execution=_runner_execution(provider),
+      capability_execution=capability_execution,
       agent_session_log=log,
       user_id="alice",
       billing_mode="byok",
@@ -2003,11 +2039,12 @@ def _a_m8_runner(
   max_concurrent_sub_agents: int | None = None,
 ) -> AgentRunner:
   provider = _ScriptedProvider([_text_turn("unused")])
+  capability_execution = _runner_execution(provider)
   runner = _make_runner(
     event_log=EventLog(),
-    dispatcher=_make_dispatcher(),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     max_concurrent_sub_agents=max_concurrent_sub_agents,
     user_id="alice",
@@ -2316,11 +2353,12 @@ class _AsyncioProxy:
 def test_task_completed_is_durable_before_terminal_transition() -> None:
   async def _case() -> None:
     provider = _ScriptedProvider([_text_turn("unused")])
+    capability_execution = _runner_execution(provider)
     runner = _make_runner(
       event_log=EventLog(),
-      dispatcher=_make_dispatcher(),
+      dispatcher=_make_dispatcher(capability_bind=capability_execution.bind),
       session_id="sess-parent",
-      capability_execution=_runner_execution(provider),
+      capability_execution=capability_execution,
       user_id="alice",
       billing_mode="byok",
       rate_table_version="unknown",
@@ -2420,11 +2458,12 @@ def test_rebuild_hot_set_lazy_lookup_and_seq_restore(tmp_path: Path) -> None:
       }
     )
     registry = TaskRegistry(max_retained=2)
+    capability_execution = _runner_execution(provider)
     runner = _make_runner(
       event_log=EventLog(),
-      dispatcher=_make_dispatcher(),
+      dispatcher=_make_dispatcher(capability_bind=capability_execution.bind),
       session_id="sess-parent",
-      capability_execution=_runner_execution(provider),
+      capability_execution=capability_execution,
       agent_session_log=log,
       task_registry=registry,
       user_id="alice",
@@ -2464,11 +2503,12 @@ def test_rebuild_renders_interrupted_and_completed_crash_cases(tmp_path: Path) -
     await log.append({"type": "task_completed", **base, "task_id": "bg_1", "sub_agent_id": "sub1:sess-parent", "call_index": 1, "final_state": "completed", "completed_at": 120.0, "result": _child_report(), "error": None})
     await log.append({"type": "task_registered", **base, "task_id": "bg_2", "sub_agent_id": "sub2:sess-parent", "call_index": 2, "agent_name": "killed", "started_at": 130.0})
 
+    capability_execution = _runner_execution(provider)
     runner = _make_runner(
       event_log=EventLog(),
-      dispatcher=_make_dispatcher(),
+      dispatcher=_make_dispatcher(capability_bind=capability_execution.bind),
       session_id="sess-parent",
-      capability_execution=_runner_execution(provider),
+      capability_execution=capability_execution,
       agent_session_log=log,
       user_id="alice",
       billing_mode="byok",
@@ -2504,11 +2544,12 @@ def test_sub_agent_events_are_written_to_parent_log(tmp_path: Path) -> None:
     _tool_turn(tool_id="tool-sub", tool_input={"query": "MSFT"}),
     _text_turn("sub done"),
   ])
+  capability_execution = _runner_execution(provider)
   parent_runner = _make_runner(
     event_log=EventLog(),
-    dispatcher=_make_dispatcher(local_tool_handlers={"lookup": _lookup_tool}),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, local_tool_handlers={"lookup": _lookup_tool}),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     workspace_dir=str(tmp_path),
     user_id="alice",
@@ -2531,10 +2572,11 @@ def test_sub_agent_events_are_written_to_parent_log(tmp_path: Path) -> None:
     )
   )
   child_runner_ref: list[Any] = []
+  capability_execution_2 = _child_execution(parent_runner._provider)
   result, error = _run(
     parent_runner.spawn_sub_agent(
       "Collect background context",
-      capability_execution=_child_execution(parent_runner._provider),
+      capability_execution=capability_execution_2,
       bind_job_runner=child_runner_ref.append,
       logical_task=logical_task,
       attempt=attempt,
@@ -2542,7 +2584,8 @@ def test_sub_agent_events_are_written_to_parent_log(tmp_path: Path) -> None:
       result_provenance=result_provenance,
       skill_name="test-child",
       dispatcher=_make_dispatcher(
-        local_tool_handlers={"lookup": _lookup_tool},
+        capability_bind=capability_execution_2.bind,
+      local_tool_handlers={"lookup": _lookup_tool},
       ),
       sub_session=sub_session,
     )
@@ -2575,11 +2618,12 @@ def test_spawn_sub_agent_uses_shared_sub_agent_id_helper(tmp_path: Path, monkeyp
 
   monkeypatch.setattr(gateway_runner, "_derive_sub_agent_id", _fake_derive)
   provider = _ScriptedProvider([_text_turn("sub done")])
+  capability_execution = _runner_execution(provider)
   parent_runner = _make_runner(
     event_log=EventLog(),
-    dispatcher=_make_dispatcher(),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind),
     session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
+    capability_execution=capability_execution,
     agent_session_log=log,
     workspace_dir=str(tmp_path),
     user_id="alice",
@@ -2593,17 +2637,18 @@ def test_spawn_sub_agent_uses_shared_sub_agent_id_helper(tmp_path: Path, monkeyp
     )
   )
   child_runner_ref: list[Any] = []
+  capability_execution_2 = _child_execution(parent_runner._provider)
   result, error = _run(
     parent_runner.spawn_sub_agent(
       "Collect background context",
-      capability_execution=_child_execution(parent_runner._provider),
+      capability_execution=capability_execution_2,
       bind_job_runner=child_runner_ref.append,
       logical_task=logical_task,
       attempt=attempt,
       result_requirement=result_requirement,
       result_provenance=result_provenance,
       skill_name="test-child",
-      dispatcher=_make_dispatcher(),
+      dispatcher=_make_dispatcher(capability_bind=capability_execution_2.bind),
       sub_session=None,
       call_index=3,
     )
@@ -2777,16 +2822,17 @@ def test_session_context_builder_resumes_the_model_visible_state_of_every_turn(
         )
       )
       child_runner_ref: list[Any] = []
+      capability_execution = _child_execution(child_provider)
       result, error = await runner.spawn_sub_agent(
         objective,
-        capability_execution=_child_execution(child_provider),
+        capability_execution=capability_execution,
         bind_job_runner=child_runner_ref.append,
         logical_task=logical_task,
         attempt=attempt,
         result_requirement=result_requirement,
         result_provenance=result_provenance,
         skill_name="test-child",
-        dispatcher=_make_dispatcher(local_tool_handlers={child_tool: _lookup_tool}),
+        dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, local_tool_handlers={child_tool: _lookup_tool}),
         sub_session=None,
         call_index=call_index,
       )
@@ -2828,13 +2874,15 @@ def test_session_context_builder_resumes_the_model_visible_state_of_every_turn(
     async def _turn(user_text: str, *, compaction_trigger: int | None = None) -> list[dict[str, Any]]:
       # One runner per turn, as the interactive path builds it: its context is
       # `SessionContextBuilder.build()` plus the new user message.
+      capability_execution = _runner_execution(provider, model=_RESUME_MODEL)
       runner = _make_runner(
         event_log=EventLog(),
         dispatcher=_make_dispatcher(
-          local_tool_handlers={"run_agent": _run_agent, "lookup": _lookup_tool},
+          capability_bind=capability_execution.bind,
+        local_tool_handlers={"run_agent": _run_agent, "lookup": _lookup_tool},
         ),
         session_id="sess-parent",
-        capability_execution=_runner_execution(provider, model=_RESUME_MODEL),
+        capability_execution=capability_execution,
         agent_session_log=log,
         context_builder=SessionContextBuilder(agent_session_log=log),
         workspace_dir=str(tmp_path),

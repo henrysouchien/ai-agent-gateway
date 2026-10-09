@@ -5,7 +5,6 @@ import logging
 import shutil
 
 from ..session import GatewaySession
-from ._provenance import delete_computation_sidecar_dir
 
 log = logging.getLogger(__name__)
 
@@ -26,10 +25,6 @@ async def cleanup_code_execution(session: GatewaySession) -> None:
       await task.close_bridge()
     except Exception:
       log.warning("code_execute background bridge close failed during cleanup", exc_info=True)
-    try:
-      delete_computation_sidecar_dir(task.handle.work_dir, getattr(task, "tool_call_id", None))
-    except Exception:
-      log.warning("code_execute sidecar removal failed during cleanup", exc_info=True)
   session.background_tasks.clear()
   kernels = tuple(session.code_execution_kernels.values())
   session.code_execution_kernels.clear()

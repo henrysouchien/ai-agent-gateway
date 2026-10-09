@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import sys
 from pathlib import Path
@@ -97,6 +98,7 @@ def _tool_defs() -> list[dict[str, Any]]:
 def test_local_tool_schema_validation_rejects_missing_required_before_handler() -> None:
   event_log = EventLog()
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"structured_write": _unexpected_handler},
     event_log=event_log,
@@ -144,6 +146,7 @@ def test_local_tool_schema_validation_preserves_dispatcher_override_seam() -> No
       return {"code": "custom_schema_gate", "message": "blocked by override"}
 
   dispatcher = _OverrideDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"structured_write": _handler},
     get_tool_definitions=_tool_defs,
@@ -174,6 +177,7 @@ def test_local_tool_schema_validation_preserves_type_match_override_seam() -> No
       return True
 
   dispatcher = _LenientTypeDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"structured_write": _handler},
     get_tool_definitions=_tool_defs,
@@ -191,6 +195,7 @@ def test_local_tool_schema_validation_preserves_type_match_override_seam() -> No
 
 def test_local_tool_schema_validation_rejects_unknown_top_level_field() -> None:
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"structured_write": _unexpected_handler},
     get_tool_definitions=_tool_defs,
@@ -209,6 +214,7 @@ def test_local_tool_schema_validation_rejects_unknown_top_level_field() -> None:
 
 def test_local_tool_schema_validation_rejects_top_level_type_mismatch() -> None:
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"structured_write": _unexpected_handler},
     get_tool_definitions=_tool_defs,
@@ -229,6 +235,7 @@ def test_local_tool_schema_validation_rejects_top_level_type_mismatch() -> None:
 
 def test_local_tool_schema_validation_allows_valid_input() -> None:
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"structured_write": _ok_handler},
     get_tool_definitions=_tool_defs,
@@ -252,6 +259,7 @@ def test_snapshot_admitted_local_tool_requires_live_schema_for_input_validation(
   ]
   request_snapshot = frozenset({"hidden_write"})
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"hidden_write": _unexpected_handler},
     get_tool_definitions=lambda: list(live_definitions),
@@ -285,6 +293,7 @@ def test_snapshot_admitted_local_tool_requires_live_schema_for_input_validation(
 
 def test_snapshot_admitted_local_tool_requires_schema_in_live_definition() -> None:
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"hidden_write": _unexpected_handler},
     get_tool_definitions=lambda: [{"name": "hidden_write"}],
@@ -311,6 +320,7 @@ def test_snapshot_admitted_local_tool_requires_schema_in_live_definition() -> No
 
 def test_catalog_free_local_caller_remains_supported_without_request_snapshot() -> None:
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"package_read": _ok_handler},
     role="owner",
@@ -338,6 +348,7 @@ def test_local_tool_schema_validation_rechecks_approval_modified_args(tmp_path: 
     role="owner",
   )
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"structured_write": _handler},
     needs_approval=lambda _name, _tool_input, _qualifier: True,

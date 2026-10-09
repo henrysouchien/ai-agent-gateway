@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import copy
 import datetime
+import inspect
 import logging
 from functools import partial
 import secrets
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Mapping, cast
 from collections.abc import Collection, Sequence, Set as AbstractSet
 
 from pydantic import JsonValue, ValidationError
@@ -42,6 +43,7 @@ from agent_workflow_contracts import (
   TaskResultProvenance,
   UsageObservation,
   WorkspaceGrant,
+  WorkflowNodeTaskRef,
   canonical_json_bytes,
   sha256_digest,
   terminal_task_result,
@@ -58,6 +60,7 @@ from agent_workflow_contracts.ticker_contract import (
 
 from .admission import (
   AdmissionOwners,
+  AdmittedContext,
   ContinuationOwners,
   ContinueRequest,
   OperationRegistration,
@@ -124,7 +127,7 @@ from .runner_background_tasks import (
 )
 from .directory_control_skill_catalog import PORTFOLIO_CONTEXT_NAMES
 from .runner_session_events import build_agent_completion_event
-from .session import GatewaySession
+from .session import GatewaySession, child_gateway_session
 from .skill_limits import SkillExecutionLimits
 from .skill_lifecycle import drain_owned_lifecycle_task
 from .skills import (
@@ -184,6 +187,7 @@ from .sub_agent_narrative_result import read_task_result_terminal_narrative
 from . import sub_agent_skill_state as _sub_agent_skill_state
 from . import sub_agent_tool_definitions as _sub_agent_tool_definitions
 from .task_registry import (
+  ResumeSuccessorConflictError,
   TaskEntry,
   TaskState,
   task_state_for_result,
@@ -2278,14 +2282,15 @@ def make_run_agent_handler(
     if handles and workflow_handle_membership is not None:
       outputs = outputs | await workflow_handle_membership(root, frozenset(handles))
 
+    spawn_resolver = cast(
+      CapabilityExecutionResolver, runner.capability_execution.resolver,
+    )
     try:
       admission = admit(
         SpawnRequest(
           operation=agent_name,
           task=task,
           handles=handles,
-          role=operation.role,
-          effort=operation.effort,
           binding=AdmittedResearchBinding(
             research_file_id=asserted_research_file_id,
             ticker=resolved_context_ticker,
@@ -2308,7 +2313,7 @@ def make_run_agent_handler(
             role=operation.role,
             effort=operation.effort,
           ),
-          capability_execution_resolver=capability_execution_resolver,
+          capability_execution_resolver=spawn_resolver,
           session=parent_session,
           route_registered=_route_registered,
           resolve_tool_authority=_resolve_tool_authority,
@@ -2359,7 +2364,7 @@ def make_run_agent_handler(
     operation_authority = admission.tool_authority
     context_research_file_id = admitted_context.research_binding.research_file_id
     try:
-      execution = capability_execution_resolver.materialize_bind(
+      execution = spawn_resolver.materialize_bind(
         admitted_context.capability_bind
       )
     except CapabilityResolutionError as exc:
@@ -2506,28 +2511,13 @@ def make_run_agent_handler(
       )
       sub_session = None
       if parent_session is not None:
-        sub_session = GatewaySession(
+        sub_session = child_gateway_session(
+          parent_session,
           session_id=_derive_sub_agent_id(parent_session, background_call_index),
-          api_key_hash=parent_session.api_key_hash,
-          created_at=parent_session.created_at,
-          expires_at=parent_session.expires_at,
+          tenant=admitted_context.tenant,
+          auth_config=execution.auth_config,
           user_id=effective_parent_user_id or parent_session.user_id,
           user_email=effective_parent_user_email,
-          risk_user_id=getattr(parent_session, "risk_user_id", 0),
-          owner_user_id=(
-            admitted_context.tenant.storage_id
-            if admitted_context.tenant is not None
-            else None
-          ),
-          role=require_inherited_role(parent_session),
-          auth_config=dict(execution.auth_config),
-          channel=getattr(parent_session, "channel", None),
-          is_public=getattr(parent_session, "is_public", False),
-          tenant_id=(
-            admitted_context.tenant.tenant_id
-            if admitted_context.tenant is not None
-            else None
-          ),
         )
         capture_job_context(sub_session, child_context)
       try:
@@ -2559,6 +2549,7 @@ def make_run_agent_handler(
           else None
         )
         sub_dispatcher = ToolDispatcher(
+          capability_bind=execution.bind,
           mcp_client=mcp_client,
           local_tool_handlers=child_local,
           plan_validator=getattr(getattr(runner, "_dispatcher", None), "plan_validator", None),
@@ -2839,6 +2830,110 @@ def _spawn_root_context(
   )
 
 
+def _admitted_resume_source_error(
+  entry: TaskEntry | None,
+  task_id: str,
+) -> dict[str, Any] | None:
+  if entry is None:
+    return {"code": "not_found", "message": f"Unknown background task: {task_id}"}
+  if (
+    entry.completion_finalizer_detached
+    or entry.completion_persistence_state in {"in_flight", "uncertain"}
+  ):
+    return {
+      "code": "completion_pending",
+      "message": f"Task {task_id} has an unresolved completion",
+    }
+  if entry.state not in {TaskState.AWAITING_APPROVAL, TaskState.INTERRUPTED}:
+    return {"code": "not_resumable", "message": f"Task {task_id} is not parked"}
+  if not isinstance(entry.admitted_task, AdmittedTask):
+    return {
+      "code": "invalid_task_metadata",
+      "message": f"Task {task_id} has no canonical admitted task",
+    }
+  return None
+
+
+async def _admitted_resume_source(runner: Any, task_id: str) -> TaskEntry | None:
+  entry = runner._task_registry.get(task_id)
+  if entry is None:
+    entry = await runner._lookup_task_in_log(task_id)
+  return entry
+
+
+async def reserve_admitted_successor(
+  runner,
+  *,
+  parked_task_id: str,
+) -> tuple[str | None, dict | None]:
+  """Reserve physical lineage only; the workflow owner supplies admission."""
+  entry = await _admitted_resume_source(runner, parked_task_id)
+  error = _admitted_resume_source_error(entry, parked_task_id)
+  if error is not None:
+    return None, error
+  depth = await runner._resume_chain_depth(parked_task_id)
+  root_id = await runner._resume_root_task_id(parked_task_id)
+  error = _admitted_resume_source_error(
+    runner._task_registry.get(parked_task_id) or entry, parked_task_id,
+  )
+  if error is not None:
+    return None, error
+  successor_id = f"{root_id}_r{depth + 1}"
+  assert entry is not None
+  try:
+    runner._task_registry.claim_resume_successor(
+      "background",
+      task_id=successor_id,
+      original_task_id=parked_task_id,
+      agent_name=entry.agent_name,
+    )
+  except ResumeSuccessorConflictError as exc:
+    return None, {"code": "resume_successor_conflict", "message": str(exc)}
+  return successor_id, None
+
+
+class _ResumeHandler(JobScopedHandler):
+  """Carry a host-only entry beside, never through, the model handler."""
+
+  def __init__(self, build, scope, admitted_entry) -> None:
+    super().__init__(build, scope)
+    self._scope = scope
+    self._admitted_entry = admitted_entry
+
+  def for_job(self, scope: JobScope) -> "_ResumeHandler":
+    return _ResumeHandler(self._build, scope, self._admitted_entry)
+
+
+async def resume_admitted_successor(
+  runner,
+  *,
+  parked_task_id: str,
+  successor: AdmittedTask,
+  on_complete: Callable[[TaskEntry], Awaitable[None] | None],
+) -> tuple[TaskEntry | None, dict | None]:
+  """Execute a trusted workflow-owner admission using configured resume wiring."""
+  handler = next(
+    (
+      value
+      for value in runner._dispatcher.local_tool_handlers().values()
+      if isinstance(value, _ResumeHandler)
+    ),
+    None,
+  )
+  if handler is None:
+    return None, {
+      "code": "not_available",
+      "message": "Host successor entry requires configured resume wiring",
+    }
+  return await handler._admitted_entry(
+    runner,
+    parked_task_id=parked_task_id,
+    successor=successor,
+    on_complete=on_complete,
+    caller=handler._scope.caller,
+  )
+
+
 def make_resume_handler(
   runner_ref: list[Any],
   *,
@@ -2900,13 +2995,16 @@ def make_resume_handler(
       research_file_id=None,
     )
 
-  async def _handle_resume(
+  async def _execute_resume(
+    runner: Any,
     tool_input: dict[str, Any],
     *,
     caller: CallerContext,
-    **kwargs: Any,
+    supplied_successor: AdmittedTask | None = None,
+    supplied_on_complete: Callable[[TaskEntry], Awaitable[None] | None] | None = None,
+    dispatch_kwargs: dict[str, Any],
   ):
-    runner = runner_ref[0]
+    kwargs = dispatch_kwargs
     if runner is None:
       return None, {"code": "internal_error", "message": "Sub-agent runner not initialized"}
     root = caller()
@@ -2965,24 +3063,30 @@ def make_resume_handler(
         "message": f"Task {task_id} is not available in current history",
       }
 
-    await runner._rebuild_task_registry_from_log()
-    entry = runner._task_registry.get(task_id)
-    if entry is None:
-      reconstructed_entry = await runner._lookup_task_in_log(task_id)
-      if reconstructed_entry is not None:
-        if reconstructed_entry.state != TaskState.INTERRUPTED:
-          return None, {
-            "code": "not_interrupted",
-            "message": f"Task {task_id} is not interrupted",
-          }
-        entry = runner._task_registry.adopt_interrupted(
-          reconstructed_entry
-        )
+    if supplied_successor is not None:
+      entry = await _admitted_resume_source(runner, task_id)
+    else:
+      await runner._rebuild_task_registry_from_log()
+      entry = runner._task_registry.get(task_id)
+      if entry is None:
+        reconstructed_entry = await runner._lookup_task_in_log(task_id)
+        if reconstructed_entry is not None:
+          if reconstructed_entry.state != TaskState.INTERRUPTED:
+            return None, {
+              "code": "not_interrupted",
+              "message": f"Task {task_id} is not interrupted",
+            }
+          entry = runner._task_registry.adopt_interrupted(
+            reconstructed_entry
+          )
     if entry is None:
       return None, {"code": "not_found", "message": f"Unknown background task: {task_id}"}
 
     def _source_state_error() -> dict[str, Any] | None:
       current = runner._task_registry.get(task_id) or entry
+      if supplied_successor is not None:
+        return _admitted_resume_source_error(current, task_id)
+      assert current is not None
       if (
         current.completion_finalizer_detached
         or current.completion_persistence_state
@@ -3012,6 +3116,8 @@ def make_resume_handler(
       code: str,
       message: str,
     ) -> tuple[Any | None, dict[str, Any] | None]:
+      if supplied_successor is not None:
+        return None, {"code": code, "message": message}
       return await _finalize_resume_abandoned(
         runner=runner,
         entry=entry,
@@ -3021,11 +3127,13 @@ def make_resume_handler(
       )
 
     try:
-      original_admitted_task = (
-        entry.admitted_task
-        if isinstance(getattr(entry, "admitted_task", None), AdmittedTask)
-        else AdmittedTask.model_validate(metadata.get(ADMITTED_TASK_METADATA_KEY))
-      )
+      canonical_admission = getattr(entry, "admitted_task", None)
+      if isinstance(canonical_admission, AdmittedTask):
+        original_admitted_task = canonical_admission
+      else:
+        original_admitted_task = AdmittedTask.model_validate(
+          metadata.get(ADMITTED_TASK_METADATA_KEY),
+        )
     except Exception as exc:
       return await _abandon(
         "invalid_task_metadata",
@@ -3049,6 +3157,56 @@ def make_resume_handler(
         "invalid_task_metadata",
         f"Task {task_id} admission does not match its physical/model bind",
       )
+    successor_context = None
+    if supplied_successor is not None:
+      source_context = original_execution_snapshot.admitted_context
+      successor_snapshot = supplied_successor.execution_snapshot
+      successor_context = (
+        successor_snapshot.admitted_context if successor_snapshot is not None else None
+      )
+      reserved = runner._task_registry.get(
+        supplied_successor.attempt.physical_task_id,
+      )
+      if supplied_successor.logical_task != original_admitted_task.logical_task:
+        return None, {
+          "code": "logical_task_mismatch",
+          "message": "Successor must retain the parked logical task",
+        }
+      if (
+        root.tenant is None
+        or source_context is None
+        or successor_context is None
+        or source_context.tenant != root.tenant
+        or successor_context.tenant != root.tenant
+      ):
+        return None, {
+          "code": "tenant_mismatch",
+          "message": "Successor must retain the authenticated parked tenant",
+        }
+      if supplied_successor.attempt.resume_of_task_id != task_id:
+        return None, {
+          "code": "resume_source_mismatch",
+          "message": "Successor must name the parked attempt as its resume source",
+        }
+      if (
+        reserved is None
+        or reserved.original_task_id != task_id
+        or supplied_successor.admitted_task_id != reserved.task_id
+      ):
+        return None, {
+          "code": "resume_successor_conflict",
+          "message": "Successor must use its reserved physical and admitted task id",
+        }
+      if supplied_successor.tool_grant != original_admitted_task.tool_grant:
+        return None, {
+          "code": "tool_grant_mismatch",
+          "message": "Successor must retain the parked attempt's exact tool grant",
+        }
+      if supplied_successor.model_bind != original_bind:
+        return None, {
+          "code": "capability_bind_mismatch",
+          "message": "Successor must retain the parked capability bind",
+        }
     depth = await runner._resume_chain_depth(task_id)
     source_state_error = _source_state_error()
     if source_state_error is not None:
@@ -3068,23 +3226,32 @@ def make_resume_handler(
       for entry in original_admitted_task.tool_grant.tools
     )
     try:
-      original_logical_task = _ordinary_logical_task(original_admitted_task)
-      logical_invocation_owner = _ordinary_logical_invocation_owner(
-        original_logical_task
-      )
-      admitted_ticker = _ticker_from_admitted_inputs(
-        original_admitted_task.inputs,
-        required=ticker_required,
-        owner_invocation_id=logical_invocation_owner,
-      )
-      admitted_research_file_id = _research_file_id_from_admitted_inputs(
-        original_admitted_task.inputs,
-        required=(
-          trusted_research_origin_required
-          or artifact_writer_requires_fenced_identity
-        ),
-        owner_invocation_id=logical_invocation_owner,
-      )
+      if (
+        supplied_successor is not None
+        and isinstance(original_admitted_task.logical_task, WorkflowNodeTaskRef)
+      ):
+        assert successor_context is not None
+        logical_invocation_owner = None
+        admitted_ticker = successor_context.research_binding.ticker
+        admitted_research_file_id = successor_context.research_binding.research_file_id
+      else:
+        original_logical_task = _ordinary_logical_task(original_admitted_task)
+        logical_invocation_owner = _ordinary_logical_invocation_owner(
+          original_logical_task
+        )
+        admitted_ticker = _ticker_from_admitted_inputs(
+          original_admitted_task.inputs,
+          required=ticker_required,
+          owner_invocation_id=logical_invocation_owner,
+        )
+        admitted_research_file_id = _research_file_id_from_admitted_inputs(
+          original_admitted_task.inputs,
+          required=(
+            trusted_research_origin_required
+            or artifact_writer_requires_fenced_identity
+          ),
+          owner_invocation_id=logical_invocation_owner,
+        )
     except ValueError as exc:
       return await _abandon(
         "invalid_task_metadata",
@@ -3118,25 +3285,35 @@ def make_resume_handler(
     if source_state_error is not None:
       return None, source_state_error
 
-    continuation = admit(
-      ContinueRequest(
-        job_id=task_id,
-        cause="revive",
-        message=additional_context,
-      ),
-      root,
-      owners=ContinuationOwners(
-        task=original_admitted_task,
-        research_binding=AdmittedResearchBinding(
-          research_file_id=admitted_research_file_id,
-          ticker=admitted_ticker,
+    if supplied_successor is not None:
+      from .approval_route import child_approval_route
+
+      assert successor_context is not None
+      continuation = AdmittedContext(
+        successor_context,
+        supplied_successor,
+        child_approval_route(root.approval_route),
+      )
+    else:
+      continuation = admit(
+        ContinueRequest(
+          job_id=task_id,
+          cause="revive",
+          message=additional_context,
         ),
-        placement="in_process",
-      ),
-    )
-    if isinstance(continuation, Refusal):
-      return await _abandon(continuation.reason, continuation.detail)
-    original_admitted_task = continuation.tool_authority
+        root,
+        owners=ContinuationOwners(
+          task=original_admitted_task,
+          research_binding=AdmittedResearchBinding(
+            research_file_id=admitted_research_file_id,
+            ticker=admitted_ticker,
+          ),
+          placement="in_process",
+        ),
+      )
+      if isinstance(continuation, Refusal):
+        return await _abandon(continuation.reason, continuation.detail)
+      original_admitted_task = continuation.tool_authority
     resumer_job_id = root.job_id
 
     try:
@@ -3231,7 +3408,11 @@ def make_resume_handler(
         durable_log,
         task_id,
       )
-      current_entry = await runner._lookup_task_in_log(task_id)
+      current_entry = (
+        await _admitted_resume_source(runner, task_id)
+        if supplied_successor is not None
+        else await runner._lookup_task_in_log(task_id)
+      )
     except ResearchFileCurrentProjectionUnavailable:
       _release_activity_ref(outer_activity_lease_ref)
       _release_activity_ref(child_activity_lease_ref)
@@ -3242,7 +3423,11 @@ def make_resume_handler(
     if (
       not source_task_is_current
       or current_entry is None
-      or current_entry.state != TaskState.INTERRUPTED
+      or (
+        _admitted_resume_source_error(current_entry, task_id) is not None
+        if supplied_successor is not None
+        else current_entry.state != TaskState.INTERRUPTED
+      )
       or current_entry.admitted_task != original_admitted_task
     ):
       _release_activity_ref(outer_activity_lease_ref)
@@ -3282,7 +3467,7 @@ def make_resume_handler(
         return
       if (
         getattr(successor_entry, "completion_callback", None)
-        is not _release_outer_activity
+        is not completion_callback
       ):
         _release_activity_ref(outer_activity_lease_ref)
       worker_task = getattr(successor_entry, "asyncio_task", None)
@@ -3300,6 +3485,17 @@ def make_resume_handler(
 
     def _release_outer_activity(_entry: Any) -> None:
       _release_activity_ref(outer_activity_lease_ref)
+
+    async def _fanout_completion(completed: TaskEntry) -> None:
+      _release_outer_activity(completed)
+      if supplied_on_complete is not None:
+        returned = supplied_on_complete(completed)
+        if inspect.isawaitable(returned):
+          await returned
+
+    completion_callback = (
+      _fanout_completion if supplied_successor is not None else _release_outer_activity
+    )
 
     current_task = asyncio.current_task()
     if current_task is not None:
@@ -3347,21 +3543,28 @@ def make_resume_handler(
       task_id,
       datetime.datetime.now(datetime.UTC).timestamp(),
     )
-    exact_resume_instruction = (
-      additional_context.strip()
-      if additional_context is not None and additional_context.strip()
-      else "Resume the admitted task from its durable transcript."
-    )
+    if supplied_successor is not None:
+      # The workflow owner's frozen snapshot records what the model is told.
+      assert supplied_successor.execution_snapshot is not None
+      successor_execution_snapshot = supplied_successor.execution_snapshot
+      exact_resume_instruction = successor_execution_snapshot.resume_instruction
+      assert exact_resume_instruction is not None
+    else:
+      exact_resume_instruction = (
+        additional_context.strip()
+        if additional_context is not None and additional_context.strip()
+        else "Resume the admitted task from its durable transcript."
+      )
+      successor_execution_snapshot = resume_agent_execution_snapshot(
+        original_execution_snapshot,
+        resume_instruction=exact_resume_instruction,
+      ).model_copy(update={"admitted_context": continuation.wire})
     reconstructed_messages = place_resume_messages(
       transcript,
       synthetic_results,
       parent_messages,
       exact_resume_instruction,
     )
-    successor_execution_snapshot = resume_agent_execution_snapshot(
-      original_execution_snapshot,
-      resume_instruction=exact_resume_instruction,
-    ).model_copy(update={"admitted_context": continuation.wire})
     if successor_execution_snapshot.provider_tool_definitions is None:
       successor_execution_snapshot = successor_execution_snapshot.model_copy(
         update={"provider_tool_definitions": ()}
@@ -3402,22 +3605,34 @@ def make_resume_handler(
     resume_root_id = await runner._resume_root_task_id(task_id)
     successor_task_id = f"{resume_root_id}_r{depth + 1}"
     successor_task_id_ref[0] = successor_task_id
-    successor_attempt = AttemptRef(
-      attempt_number=original_admitted_task.attempt.attempt_number + 1,
-      attempt_id=(
-        f"{successor_task_id}:attempt:"
-        f"{original_admitted_task.attempt.attempt_number + 1}"
-      ),
-      physical_task_id=successor_task_id,
-      resume_of_task_id=task_id,
-      resumer_job_id=resumer_job_id,
-    )
+    if supplied_successor is not None:
+      if supplied_successor.attempt.physical_task_id != successor_task_id:
+        _release_activity_ref(outer_activity_lease_ref)
+        _release_activity_ref(child_activity_lease_ref)
+        return None, {
+          "code": "resume_successor_conflict",
+          "message": "Successor does not match the deterministic reserved lineage",
+        }
+      successor_attempt = supplied_successor.attempt
+    else:
+      successor_attempt = AttemptRef(
+        attempt_number=original_admitted_task.attempt.attempt_number + 1,
+        attempt_id=(
+          f"{successor_task_id}:attempt:"
+          f"{original_admitted_task.attempt.attempt_number + 1}"
+        ),
+        physical_task_id=successor_task_id,
+        resume_of_task_id=task_id,
+        resumer_job_id=resumer_job_id,
+      )
     successor_admitted_task_ref: list[AdmittedTask | None] = [None]
 
     def _successor_context_ticker() -> str | None:
       successor_admitted_task = successor_admitted_task_ref[0]
       if successor_admitted_task is None:
         raise RuntimeError("successor admission is unavailable before dispatch")
+      if supplied_successor is not None:
+        return admitted_ticker
       return _ticker_from_admitted_inputs(
         successor_admitted_task.inputs,
         required=ticker_required,
@@ -3456,27 +3671,30 @@ def make_resume_handler(
     # A current local handler may share the ID of a persisted MCP route. Drop
     # that handler, but keep the ID dispatchable through its admitted server.
     child_excluded |= candidate_local_names - admitted_dispatch_tools
-    successor_grant = reissue_tool_grant(
-      original_admitted_task.tool_grant,
-      grant_id=f"grant:{successor_task_id}",
-    )
-    successor_payload = original_admitted_task.model_dump(
-      mode="json", exclude={"admitted_task_digest"},
-    )
-    successor_payload.update({
-      "schema_version": "1.2",
-      "admitted_task_id": f"admitted:{successor_task_id}",
-      "attempt": successor_attempt.model_dump(mode="json"),
-      "objective": f"Resume interrupted delegation {task_id}",
-      "execution_snapshot": successor_execution_snapshot.model_dump(mode="json"),
-      "tool_grant": successor_grant.model_dump(mode="json"),
-      "tool_grant_digest": successor_grant.digest,
-      "tool_routes": [
-        route.model_dump(mode="json") for route in persisted_tool_routes
-      ],
-    })
-    seal_admitted_task_payload(successor_payload)
-    successor_admitted_task = AdmittedTask.model_validate(successor_payload)
+    if supplied_successor is not None:
+      successor_admitted_task = supplied_successor
+    else:
+      successor_grant = reissue_tool_grant(
+        original_admitted_task.tool_grant,
+        grant_id=f"grant:{successor_task_id}",
+      )
+      successor_payload = original_admitted_task.model_dump(
+        mode="json", exclude={"admitted_task_digest"},
+      )
+      successor_payload.update({
+        "schema_version": "1.2",
+        "admitted_task_id": f"admitted:{successor_task_id}",
+        "attempt": successor_attempt.model_dump(mode="json"),
+        "objective": f"Resume interrupted delegation {task_id}",
+        "execution_snapshot": successor_execution_snapshot.model_dump(mode="json"),
+        "tool_grant": successor_grant.model_dump(mode="json"),
+        "tool_grant_digest": successor_grant.digest,
+        "tool_routes": [
+          route.model_dump(mode="json") for route in persisted_tool_routes
+        ],
+      })
+      seal_admitted_task_payload(successor_payload)
+      successor_admitted_task = AdmittedTask.model_validate(successor_payload)
     successor_admitted_task_ref[0] = successor_admitted_task
     context_ticker = _successor_context_ticker()
     successor_provenance = TaskResultProvenance(
@@ -3514,28 +3732,13 @@ def make_resume_handler(
       )
       sub_session = None
       if parent_session is not None:
-        sub_session = GatewaySession(
+        sub_session = child_gateway_session(
+          parent_session,
           session_id=_derive_sub_agent_id(parent_session, background_call_index),
-          api_key_hash=parent_session.api_key_hash,
-          created_at=parent_session.created_at,
-          expires_at=parent_session.expires_at,
+          tenant=continuation.wire.tenant,
+          auth_config=execution.auth_config,
           user_id=parent_session.user_id,
           user_email=parent_session.user_email,
-          risk_user_id=getattr(parent_session, "risk_user_id", 0),
-          owner_user_id=(
-            continuation.wire.tenant.storage_id
-            if continuation.wire.tenant is not None
-            else None
-          ),
-          role=require_inherited_role(parent_session),
-          auth_config=dict(execution.auth_config),
-          channel=getattr(parent_session, "channel", None),
-          is_public=getattr(parent_session, "is_public", False),
-          tenant_id=(
-            continuation.wire.tenant.tenant_id
-            if continuation.wire.tenant is not None
-            else None
-          ),
         )
         capture_job_context(sub_session, child_context)
       try:
@@ -3567,6 +3770,7 @@ def make_resume_handler(
           else None
         )
         sub_dispatcher = ToolDispatcher(
+          capability_bind=original_bind,
           mcp_client=mcp_client,
           local_tool_handlers=child_local,
           plan_validator=getattr(getattr(runner, "_dispatcher", None), "plan_validator", None),
@@ -3702,13 +3906,19 @@ def make_resume_handler(
         error,
       )
 
+    if supplied_successor is not None:
+      source_state_error = _source_state_error()
+      if source_state_error is not None:
+        _release_activity_ref(outer_activity_lease_ref)
+        _release_activity_ref(child_activity_lease_ref)
+        return None, source_state_error
     try:
       result, error = await runner._register_background_task(
         tool_input=resume_tool_input,
         handler=_dispatch_resume,
         agent_name=agent_name,
         parent_turn_id=parent_turn_id,
-        on_complete=_release_outer_activity,
+        on_complete=completion_callback,
         capability_bind_receipt=execution.bind.to_json(),
         admitted_task=successor_admitted_task,
         task_id_override=successor_task_id,
@@ -3720,7 +3930,7 @@ def make_resume_handler(
           skill_event_emitter.project_result_captured
         ),
         original_task_id=task_id,
-        validate_resume_source=True,
+        validate_resume_source=supplied_successor is None,
         resume_source_entry=entry,
       )
     except BaseException:
@@ -3729,19 +3939,42 @@ def make_resume_handler(
     _release_untransferred_activity_after_entry()
     if error is not None:
       return None, error
+    if supplied_successor is not None:
+      return runner._task_registry.get(successor_task_id), None
     return result, None
+
+  async def _admitted_entry(
+    runner: Any,
+    *,
+    parked_task_id: str,
+    successor: AdmittedTask,
+    on_complete: Callable[[TaskEntry], Awaitable[None] | None],
+    caller: CallerContext,
+  ) -> tuple[TaskEntry | None, dict | None]:
+    return await _execute_resume(
+      runner,
+      {"task_id": parked_task_id},
+      caller=caller,
+      supplied_successor=successor,
+      supplied_on_complete=on_complete,
+      dispatch_kwargs={},
+    )
 
   def _build(scope: JobScope):
     async def _scoped_resume(tool_input: dict[str, Any], **kwargs: Any):
-      return await _handle_resume(tool_input, caller=scope.caller, **kwargs)
+      # Dispatch kwargs remain data: they cannot select the trusted host path.
+      return await _execute_resume(
+        runner_ref[0], tool_input, caller=scope.caller, dispatch_kwargs=kwargs,
+      )
     return _scoped_resume
 
-  return JobScopedHandler(
+  return _ResumeHandler(
     _build,
     JobScope(
       caller=caller if caller is not None else _current_caller,
       spill_sink=lambda: None,
     ),
+    _admitted_entry,
   )
 
 
@@ -3751,6 +3984,8 @@ def make_send_message_handler(runner_ref: list[Any], *, caller):
 
 __all__ = [
   "seal_admitted_task_payload",
+  "reserve_admitted_successor",
+  "resume_admitted_successor",
   "make_get_background_result_handler",
   "make_get_background_result_tool_def",
   "make_send_message_handler",

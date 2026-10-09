@@ -1,9 +1,11 @@
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import io
 import json
 import sys
 import time
 from datetime import datetime, timezone
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +51,7 @@ from agent_gateway.providers.anthropic_oauth import (  # noqa: E402
   upsert_anthropic_oauth_record,
 )
 from agent_gateway.runner_auth import merge_refreshed_auth_config  # noqa: E402
+from agent_gateway.runner_fork_agents import _bind_learning_fork_execution
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_bound_capability_execution,
 )
@@ -165,8 +168,9 @@ def _run(coro):
   return asyncio.run(coro)
 
 
-def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
+def _make_dispatcher(event_log: EventLog | None = None, *, capability_bind = TEST_CAPABILITY_BIND) -> ToolDispatcher:
   return ToolDispatcher(
+    capability_bind=capability_bind,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={},
     event_log=event_log or EventLog(),
@@ -177,16 +181,17 @@ def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
 def _make_runner() -> AgentRunner:
   event_log = EventLog()
   provider = _StubProvider()
-  return AgentRunner(
-    event_log=event_log,
-    dispatcher=_make_dispatcher(event_log),
-    session_id="sess-auth",
-    capability_execution=stub_bound_capability_execution(
+  capability_execution = stub_bound_capability_execution(
       provider=provider,
       model="stub-model",
       effort="none",
       auth_config={"api_key": "old", "max_tokens": 512},
-    ),
+    )
+  return AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log, capability_bind=capability_execution.bind),
+    session_id="sess-auth",
+    capability_execution=capability_execution,
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -268,8 +273,9 @@ def test_merge_refreshed_auth_config_rejects_selection_material() -> None:
     merge_refreshed_auth_config(config, {"execution_transport": "native"})
 
 
+@pytest.mark.parametrize("has_generation_metadata", [True, False])
 def test_usage_limited_credential_rotates_to_sibling_and_keeps_bound_model(
-  monkeypatch: Any,
+  monkeypatch: Any, tmp_path: Path, has_generation_metadata: bool,
 ) -> None:
   reset_at = time.time() + 4 * 3600
   pool = AnthropicCredentialPool()
@@ -277,24 +283,37 @@ def test_usage_limited_credential_rotates_to_sibling_and_keeps_bound_model(
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", _TOKEN_A)
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([_TOKEN_A, _TOKEN_B]))
   monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+  monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "oauth.json"))
   monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.0)
 
   provider = _PooledAnthropicProvider(limited_tokens=(_TOKEN_A,), reset_at=reset_at)
+  sources = resolve_anthropic_credentials()
+  member_a = sources.by_token(_TOKEN_A)
+  member_b = sources.by_token(_TOKEN_B)
+  assert member_a is not None and member_b is not None
+  if not has_generation_metadata:
+    monkeypatch.setattr(
+      provider, "next_credential",
+      lambda config, failure: {"auth_token": _TOKEN_B},
+    )
   event_log = EventLog()
-  runner = AgentRunner(
-    event_log=event_log,
-    dispatcher=_make_dispatcher(event_log),
-    session_id="sess-pool",
-    capability_execution=stub_bound_capability_execution(
+  capability_execution = stub_bound_capability_execution(
       provider=provider,
       model="claude-pool-test",
       effort="none",
+      credential_ref=member_a.source_metadata()["generation_ref"],
       auth_config={
         "auth_mode": "oauth",
         "auth_token": _TOKEN_A,
+        "credential_source": member_a.source_metadata(),
         "max_tokens": 512,
       },
-    ),
+    )
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log, capability_bind=capability_execution.bind),
+    session_id="sess-pool",
+    capability_execution=capability_execution,
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -304,11 +323,108 @@ def test_usage_limited_credential_rotates_to_sibling_and_keeps_bound_model(
   _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
 
   event_types = [entry.event.get("type") for entry in event_log.entries]
+  if has_generation_metadata:
+    assert provider.streamed_tokens == [_TOKEN_A, _TOKEN_B]
+    assert "credential_refreshed" in event_types
+    assert "error" not in event_types
+    assert runner.capability_execution.bind.credential_ref == member_b.source_metadata()["generation_ref"]
+    assert runner.capability_execution.auth_config["auth_token"] == _TOKEN_B
+    assert runner._auth_config["auth_token"] == _TOKEN_B
+    assert pool.blocked_until(_TOKEN_A) == pytest.approx(reset_at, abs=2.0)
+    assert pool.blocked_until(_TOKEN_B) == 0.0
+  else:
+    assert provider.streamed_tokens == [_TOKEN_A]
+    assert "credential_refreshed" not in event_types
+    assert "error" in event_types
+    assert runner.capability_execution is capability_execution
+    assert runner._auth_config["auth_token"] == _TOKEN_A
+  assert runner.capability_execution.bind.model_key == bound_model_key
+  dispatcher = runner._dispatcher
+  assert isinstance(dispatcher, ToolDispatcher)
+  assert dispatcher._capability_bind is runner.capability_execution.bind
+  # Child admission's parent-binding reader sees the current execution's bind.
+  assert runner.capability_execution.bind.credential_ref == (
+    member_b if has_generation_metadata else member_a
+  ).source_metadata()["generation_ref"]
+
+
+def test_learning_fork_rotates_runner_and_dispatcher_to_sibling(
+  monkeypatch: Any, tmp_path: Path,
+) -> None:
+  reset_at = time.time() + 4 * 3600
+  pool = AnthropicCredentialPool()
+  monkeypatch.setattr(anthropic_provider_module, "ANTHROPIC_CREDENTIAL_POOL", pool)
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", _TOKEN_A)
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([_TOKEN_A, _TOKEN_B]))
+  monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+  monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "oauth.json"))
+  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.0)
+  provider = _PooledAnthropicProvider(limited_tokens=(_TOKEN_A,), reset_at=reset_at)
+  sources = resolve_anthropic_credentials()
+  member_a = sources.by_token(_TOKEN_A)
+  member_b = sources.by_token(_TOKEN_B)
+  assert member_a is not None and member_b is not None
+  parent_execution = stub_bound_capability_execution(
+    provider=provider,
+    model="claude-pool-test",
+    effort="none",
+    credential_ref=member_a.source_metadata()["generation_ref"],
+    auth_config={
+      "auth_mode": "oauth",
+      "auth_token": _TOKEN_A,
+      "credential_source": member_a.source_metadata(),
+      "max_tokens": 512,
+    },
+  )
+  resolver = parent_execution.resolver
+  assert resolver is not None
+  entry = parent_execution.registry.models[parent_execution.bind.model_key]
+  registry = replace(parent_execution.registry, models={
+    **parent_execution.registry.models,
+    entry.key: replace(entry, capabilities={
+      **entry.capabilities, "node.fork": "internal",
+    }),
+  })
+  resolver = replace(
+    resolver,
+    registry=registry,
+    auth_context=replace(resolver.auth_context, entitled_capabilities=frozenset({
+      *resolver.auth_context.entitled_capabilities, "node.fork",
+    })),
+  )
+  parent_execution = replace(parent_execution, registry=registry, resolver=resolver)
+  fork_execution = _bind_learning_fork_execution(parent_execution)
+  parent_dispatcher = _make_dispatcher(capability_bind=parent_execution.bind)
+  event_log = EventLog()
+  fork_dispatcher = parent_dispatcher.fork_child(
+    event_log=event_log,
+    session_id="sess-learning-fork",
+    capability_bind=fork_execution.bind,
+    spawning_turn=parent_dispatcher.capture_spawning_turn(),
+  )
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=fork_dispatcher,
+    session_id="sess-learning-fork",
+    capability_execution=fork_execution,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "remember this"}]))
+
   assert provider.streamed_tokens == [_TOKEN_A, _TOKEN_B]
+  event_types = [entry.event.get("type") for entry in event_log.entries]
   assert "credential_refreshed" in event_types
   assert "error" not in event_types
-  assert runner.capability_execution.bind.model_key == bound_model_key
-  assert runner._auth_config["auth_token"] == _TOKEN_B
+  assert runner.capability_execution.bind.capability_id == "node.fork"
+  assert runner.capability_execution.bind.credential_ref == (
+    member_b.source_metadata()["generation_ref"]
+  )
+  assert runner.capability_execution.auth_config["auth_token"] == _TOKEN_B
+  assert fork_dispatcher._capability_bind is runner.capability_execution.bind
+  assert parent_dispatcher._capability_bind is parent_execution.bind
   assert pool.blocked_until(_TOKEN_A) == pytest.approx(reset_at, abs=2.0)
   assert pool.blocked_until(_TOKEN_B) == 0.0
 
@@ -413,11 +529,7 @@ def test_pool_of_one_ends_the_turn_with_the_reported_reset_window(
 
   provider = _SanitizingPooledProvider(limited_tokens=(_TOKEN_A,), reset_at=reset_at)
   event_log = EventLog()
-  runner = AgentRunner(
-    event_log=event_log,
-    dispatcher=_make_dispatcher(event_log),
-    session_id="sess-pool-of-one",
-    capability_execution=stub_bound_capability_execution(
+  capability_execution = stub_bound_capability_execution(
       provider=provider,
       model="claude-pool-test",
       effort="none",
@@ -426,7 +538,12 @@ def test_pool_of_one_ends_the_turn_with_the_reported_reset_window(
         "auth_token": _TOKEN_A,
         "max_tokens": 512,
       },
-    ),
+    )
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log, capability_bind=capability_execution.bind),
+    session_id="sess-pool-of-one",
+    capability_execution=capability_execution,
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -462,11 +579,7 @@ def test_every_credential_limited_stops_rotating_instead_of_circling(
     reset_at=reset_at,
   )
   event_log = EventLog()
-  runner = AgentRunner(
-    event_log=event_log,
-    dispatcher=_make_dispatcher(event_log),
-    session_id="sess-pool-exhausted",
-    capability_execution=stub_bound_capability_execution(
+  capability_execution = stub_bound_capability_execution(
       provider=provider,
       model="claude-pool-test",
       effort="none",
@@ -475,7 +588,12 @@ def test_every_credential_limited_stops_rotating_instead_of_circling(
         "auth_token": _TOKEN_A,
         "max_tokens": 512,
       },
-    ),
+    )
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log, capability_bind=capability_execution.bind),
+    session_id="sess-pool-exhausted",
+    capability_execution=capability_execution,
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -571,16 +689,17 @@ def test_autonomous_child_rotates_on_the_pool_its_projection_carries(
 
   provider = _SanitizingPooledProvider(limited_tokens=(_TOKEN_A,), reset_at=reset_at)
   event_log = EventLog()
-  runner = AgentRunner(
-    event_log=event_log,
-    dispatcher=_make_dispatcher(event_log),
-    session_id="sess-autonomous-child",
-    capability_execution=stub_bound_capability_execution(
+  capability_execution = stub_bound_capability_execution(
       provider=provider,
       model="claude-pool-test",
       effort="none",
       auth_config=dict(child_credential.auth_config),
-    ),
+    )
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log, capability_bind=capability_execution.bind),
+    session_id="sess-autonomous-child",
+    capability_execution=capability_execution,
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -762,16 +881,17 @@ def test_autonomous_child_of_a_user_scoped_run_inherits_that_users_pool(
 
   provider = _SanitizingPooledProvider(limited_tokens=(primary,), reset_at=reset_at)
   event_log = EventLog()
-  runner = AgentRunner(
-    event_log=event_log,
-    dispatcher=_make_dispatcher(event_log),
-    session_id="sess-user-scoped-child",
-    capability_execution=stub_bound_capability_execution(
+  capability_execution = stub_bound_capability_execution(
       provider=provider,
       model="claude-pool-test",
       effort="none",
       auth_config=dict(child_credential.auth_config),
-    ),
+    )
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log, capability_bind=capability_execution.bind),
+    session_id="sess-user-scoped-child",
+    capability_execution=capability_execution,
     user_id="3",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -842,3 +962,22 @@ def test_rotated_credential_source_matches_prepared_provider_authentication(
       await client.close()
 
   _run(prepare_request())
+
+
+@pytest.mark.parametrize(
+  ("field", "value"),
+  [("capability_id", "node.fork"), ("run_mode", "batch"), ("credential_principal", "user")],
+)
+def test_dispatcher_credential_rebind_preserves_execution_authority(
+  field: str, value: str,
+) -> None:
+  runner = _make_runner()
+  original = runner.capability_execution.bind
+  incompatible = type(original).model_validate({**original.to_json(), field: value})
+
+  with pytest.raises(ValueError, match="changes execution authority"):
+    runner._dispatcher.replace_capability_bind(incompatible)
+
+  dispatcher = runner._dispatcher
+  assert isinstance(dispatcher, ToolDispatcher)
+  assert dispatcher._capability_bind is original

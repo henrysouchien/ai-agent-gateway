@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import sys
 from pathlib import Path
@@ -67,6 +68,7 @@ def _build_interactive_dispatcher(
       approval_policy=None,
       mcp_meta_inject_servers=frozenset({"portfolio-reads-mcp"}),
     ),
+    capability_bind=TEST_CAPABILITY_BIND,
     principal=InvocationPrincipal.from_session(session),
     profile="interactive",
     event_log=None,
@@ -142,6 +144,7 @@ def _dispatch_scope(**overrides: Any) -> dict[str, Any]:
 def test_tool_dispatcher_injects_user_id_into_mcp_meta(server_name: str) -> None:
   mcp = _FakeMcpClient(server_name=server_name)
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-1",
@@ -225,6 +228,7 @@ def test_non_positive_risk_user_id_is_not_serialized_as_mcp_identity() -> None:
     tool_name="get_current_model",
   )
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-legacy",
@@ -266,6 +270,7 @@ def test_cli_channel_research_corpus_meta_carries_caller_session_token() -> None
   )
   mcp = _FakeMcpClient(server_name="research-corpus-mcp", tool_name="thesis_list")
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     local_tool_handlers={},
     session=session,
@@ -302,6 +307,7 @@ def test_cli_channel_research_corpus_meta_carries_caller_session_token() -> None
 def test_tool_dispatcher_injects_run_context_into_mcp_meta_when_present() -> None:
   mcp = _FakeMcpClient()
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-1",
@@ -345,6 +351,7 @@ def test_tool_dispatcher_injects_run_context_into_mcp_meta_when_present() -> Non
 def test_tool_dispatcher_omits_run_context_from_mcp_meta_when_absent() -> None:
   mcp = _FakeMcpClient()
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-1",
@@ -380,6 +387,7 @@ def test_tool_dispatcher_omits_run_context_from_mcp_meta_when_absent() -> None:
 def test_tool_dispatcher_defaults_portfolio_scope_for_portfolio_mcp_tool() -> None:
   mcp = _FakeMcpClient()
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-1",
@@ -405,6 +413,7 @@ def test_tool_dispatcher_defaults_portfolio_scope_for_portfolio_mcp_tool() -> No
 def test_tool_dispatcher_defaults_portfolio_scope_for_split_portfolio_mcp_tool() -> None:
   mcp = _FakeMcpClient(server_name="portfolio-reads-mcp")
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-1",
@@ -430,6 +439,7 @@ def test_tool_dispatcher_defaults_portfolio_scope_for_split_portfolio_mcp_tool()
 def test_tool_dispatcher_preserves_explicit_portfolio_tool_input() -> None:
   mcp = _FakeMcpClient()
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-1",
@@ -449,6 +459,7 @@ def test_tool_dispatcher_preserves_explicit_portfolio_tool_input() -> None:
 def test_tool_dispatcher_defaults_when_portfolio_tool_input_is_null_or_blank() -> None:
   mcp = _FakeMcpClient()
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-1",
@@ -477,6 +488,7 @@ def test_tool_dispatcher_defaults_when_portfolio_tool_input_is_null_or_blank() -
 def test_tool_dispatcher_skips_portfolio_default_when_schema_does_not_accept_it() -> None:
   mcp = _FakeMcpClient()
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-1",
@@ -500,6 +512,7 @@ def test_tool_dispatcher_uses_original_tool_name_for_prefixed_portfolio_default(
     original_names={tool_name: "get_positions"},
   )
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-1",
@@ -525,7 +538,14 @@ def test_tool_dispatcher_uses_original_tool_name_for_prefixed_portfolio_default(
 def test_runner_tool_start_event_uses_effective_dispatch_scope_input() -> None:
   mcp = _FakeMcpClient(server_name="portfolio-reads-mcp")
   event_log = EventLog()
+  _dispatcher_execution_541 = stub_runner_capability_execution(
+        provider=SimpleNamespace(name="stub"),
+        auth_config={"api_key": "test-secret"},
+        model="stub-model",
+        effort="none",
+      )
   dispatcher = ToolDispatcher(
+    capability_bind=_dispatcher_execution_541.bind,
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-1",
@@ -539,12 +559,7 @@ def test_runner_tool_start_event_uses_effective_dispatch_scope_input() -> None:
     event_log=event_log,
     dispatcher=dispatcher,
     session_id="sess-1",
-    capability_execution=stub_runner_capability_execution(
-      provider=SimpleNamespace(name="stub"),
-      auth_config={"api_key": "test-secret"},
-      model="stub-model",
-      effort="none",
-    ),
+    capability_execution=_dispatcher_execution_541,
     mcp_client=mcp,
     get_tool_definitions=lambda: [_portfolio_tool_def()],
     user_id="alice",
@@ -572,6 +587,7 @@ def test_runner_tool_start_event_uses_effective_dispatch_scope_input() -> None:
 def test_tool_dispatcher_session_param_injection_still_works() -> None:
   mcp = _FakeMcpClient(server_name="session-param-server")
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-1",
@@ -589,6 +605,7 @@ def test_tool_dispatcher_session_param_injection_still_works() -> None:
 def test_tool_dispatcher_fails_closed_without_user_id_in_strict_mode() -> None:
   mcp = _FakeMcpClient()
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-1",

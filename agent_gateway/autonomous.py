@@ -15,7 +15,7 @@ import inspect
 import logging
 import os
 import secrets
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
@@ -1134,7 +1134,26 @@ async def run_autonomous(
       withheld_tools=frozenset(excluded_tools or ()),
       research_file_id=None,
     )
+    if context.children is None:
+      from typing import cast
+      from .admission import admit_root_turn, capture_root_turn, record_root_turn_admission
+      from .approval_route import SQLiteApprovalStore, route_store
+
+      admission = admit_root_turn(
+        context,
+        execution=capability_execution,
+        tool_grant={
+          "tool_ids": context.tool_ids,
+          "withheld_tools": sorted(context.withheld),
+        },
+        approval_route=approval_route,
+      )
+      approval_store = route_store(approval_route)
+      if approval_store is not None:
+        admission = await record_root_turn_admission(cast(SQLiteApprovalStore, approval_store), admission)
+      capture_root_turn(session, admission)
     dispatcher = ToolDispatcher(
+      capability_bind=capability_bind,
       mcp_client=mcp_client or _NullMcpClient(),
       local_tool_handlers=local_handlers,
       needs_approval=needs_approval,
@@ -1161,6 +1180,13 @@ async def run_autonomous(
       redaction_context_factory=redaction_context_factory,
     )
     root_inbox: asyncio.Queue[ParentMessage] = asyncio.Queue(maxsize=64)
+    if (
+      capability_execution_resolver is not None
+      and capability_execution.resolver is None
+    ):
+      capability_execution = replace(
+        capability_execution, resolver=capability_execution_resolver,
+      )
     runner = AgentRunner(
       event_log=event_log,
       dispatcher=dispatcher,

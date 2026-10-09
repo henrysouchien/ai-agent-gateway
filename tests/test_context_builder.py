@@ -854,7 +854,8 @@ def test_fork_seed_prefix_drops_once_a_summary_covers_it(tmp_path: Path) -> None
   assert len(_fork_seeds(own)) == 1
 
 
-def test_fork_seed_survives_a_cancelled_first_turn(tmp_path: Path) -> None:
+@pytest.mark.parametrize("blocked_stage", ["seed_lookup", "source_read"])
+def test_fork_seed_survives_a_cancelled_first_turn(tmp_path: Path, blocked_stage: str) -> None:
   source = _fork_source_log(tmp_path)
   source_messages = _run(SessionContextBuilder(agent_session_log=source).build())
   own = AgentSessionLog(path=tmp_path / "fork" / "own.jsonl")
@@ -868,9 +869,19 @@ def test_fork_seed_survives_a_cancelled_first_turn(tmp_path: Path) -> None:
     await release_read.wait()
     return await read_latest_seq()
 
-  slow_source.latest_seq_current_strict = delayed_latest_seq
+  query_own = own.query_current_strict
 
-  async def cancel_during_source_read() -> list:
+  async def delayed_seed_lookup(**kwargs):
+    read_started.set()
+    await release_read.wait()
+    return await query_own(**kwargs)
+
+  if blocked_stage == "seed_lookup":
+    own.query_current_strict = delayed_seed_lookup
+  else:
+    slow_source.latest_seq_current_strict = delayed_latest_seq
+
+  async def cancel_during_seed() -> list:
     turn = asyncio.ensure_future(
       SessionContextBuilder(agent_session_log=own, fork_source_log=slow_source).build()
     )
@@ -882,7 +893,7 @@ def test_fork_seed_survives_a_cancelled_first_turn(tmp_path: Path) -> None:
     # Cancellation stays pending while the seed is not yet durable, so the
     # turn cannot hand off the fork's log before its seed is written.
     assert not turn.done()
-    seeds, _cursor = await own.query_current_strict(event_types={"fork_seed"})
+    seeds, _cursor = await query_own(event_types={"fork_seed"})
     assert seeds == []
     release_read.set()
     with pytest.raises(asyncio.CancelledError):
@@ -890,7 +901,7 @@ def test_fork_seed_survives_a_cancelled_first_turn(tmp_path: Path) -> None:
     # A resume of the fork's own log, which binds no source, keeps the history.
     return await SessionContextBuilder(agent_session_log=AgentSessionLog(path=own.path)).build()
 
-  resumed = _run(cancel_during_source_read())
+  resumed = _run(cancel_during_seed())
   assert resumed == source_messages
   assert "PELICAN" in json.dumps(resumed)
 

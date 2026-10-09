@@ -396,6 +396,7 @@ def test_chat_stream_rebuilds_multi_turn_memory_from_session_log(tmp_path: Path)
       return AgentRunner(
         event_log=event_log,
         dispatcher=ToolDispatcher(
+          capability_bind=capability_execution.bind,
           mcp_client=McpClientManager(config_path=None),
           local_tool_handlers={},
           event_log=event_log,
@@ -554,6 +555,7 @@ def test_chat_stream_rebuilds_memory_past_large_context_manifest(tmp_path: Path)
       return AgentRunner(
         event_log=event_log,
         dispatcher=ToolDispatcher(
+          capability_bind=capability_execution.bind,
           mcp_client=McpClientManager(config_path=None),
           local_tool_handlers={},
           event_log=event_log,

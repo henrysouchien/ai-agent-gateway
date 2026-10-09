@@ -1,3 +1,4 @@
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import json
 from typing import Any
@@ -175,6 +176,7 @@ def _end_turn() -> list[StreamEvent]:
 
 def _dispatcher(event_log: EventLog, handlers: dict[str, Any]) -> ToolDispatcher:
   return ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers=handlers,
     event_log=event_log,
@@ -283,10 +285,12 @@ def test_runner_context_uses_trusted_router_provider_not_payload_claim(owner_ses
   async def record_context(ctx: ToolResultContext) -> list[dict[str, Any]]:
     contexts.append(ctx)
     return []
+  _dispatcher_execution_291 = _execution(provider)
 
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=ToolDispatcher(
+      capability_bind=_dispatcher_execution_291.bind,
       mcp_client=mcp_client,
       local_tool_handlers={},
       event_log=event_log,
@@ -294,7 +298,7 @@ def test_runner_context_uses_trusted_router_provider_not_payload_claim(owner_ses
       role="owner",
     ),
     session_id="sess-provider-identity",
-    capability_execution=_execution(provider),
+    capability_execution=_dispatcher_execution_291,
     mcp_client=mcp_client,
     get_tool_definitions=mcp_client.get_tool_definitions,
     on_tool_result=record_context,

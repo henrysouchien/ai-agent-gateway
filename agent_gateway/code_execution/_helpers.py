@@ -132,6 +132,12 @@ def _truncate_stdio(stdout: str, stderr: str, limit: int) -> Tuple[str, str, boo
   )
 
 
+# PATH and PYTHONPATH are os.pathsep-separated lists: a configured entry goes in
+# front of the inherited ones. Every other variable is a single value that the
+# configured extra_env replaces.
+_PATH_LIST_ENV_KEYS = frozenset({"PATH", "PYTHONPATH"})
+
+
 def _build_subprocess_env(extra_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
   env = os.environ.copy()
   for key, value in (extra_env or {}).items():
@@ -139,7 +145,10 @@ def _build_subprocess_env(extra_env: Optional[Dict[str, str]] = None) -> Dict[st
       continue
     text_value = str(value)
     existing = env.get(key)
-    env[key] = f"{text_value}{os.pathsep}{existing}" if existing else text_value
+    if key in _PATH_LIST_ENV_KEYS and existing:
+      env[key] = f"{text_value}{os.pathsep}{existing}"
+    else:
+      env[key] = text_value
   return env
 
 

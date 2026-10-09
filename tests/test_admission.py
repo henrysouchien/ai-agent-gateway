@@ -4,6 +4,8 @@ import asyncio
 import copy
 import json
 import logging
+from contextlib import nullcontext
+from pathlib import Path, PurePosixPath
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -35,6 +37,11 @@ from agent_gateway.admission import (
   Refusal,
   SpawnRequest,
   admit,
+  admit_root_turn,
+  capture_root_turn,
+  current_root_turn,
+  link_root_park,
+  record_root_turn_admission,
   capture_job_context,
   context_for_child,
   current_parent_context,
@@ -50,6 +57,10 @@ from agent_gateway.approval_route import (
   route_ledger,
   route_session,
 )
+from agent_gateway.approval_policy import RunContext, build_approval_request, sha256_args
+from agent_gateway.approval_store import SQLiteApprovalStore
+from agent_gateway.single_user_policy import SingleUserApprovalPolicy
+from agent_gateway.tool_policy_registry import PreparedToolCall
 from agent_gateway.capability_resolution import OperationDeclaration, resolve_operation_authority
 from agent_gateway.session import GatewaySession, SessionStore
 from agent_gateway.sub_agent import make_run_agent_handler, seal_admitted_task_payload
@@ -270,6 +281,7 @@ def test_spawn_keeps_the_turns_snapshot_and_a_later_mint_does_not_inherit_it() -
 
 class _BackgroundRunner:
   def __init__(self) -> None:
+    self.capability_execution = _resolver().resolve("session.driver")
     self._full_session_id = "session-admission"
     self._agent_session_log = object()
     self.background_calls: list[dict[str, Any]] = []
@@ -1451,3 +1463,296 @@ def test_message_cannot_cite_an_ungranted_handle() -> None:
     ),
   )
   assert isinstance(result, Refusal) and result.reason == "handle_not_granted"
+
+
+def _root_execution(credential_ref: str | None = None, *, run_mode: str = "interactive"):
+  execution = stub_capability_execution_resolver(
+    default_provider="openai", default_model="gpt-5.6-sol",
+    default_effort="high", run_mode=run_mode,
+  ).resolve("session.driver")
+  if credential_ref is not None:
+    execution = replace(
+      execution, bind=execution.bind.model_copy(update={"credential_ref": credential_ref}),
+    )
+  return execution
+
+
+@pytest.mark.parametrize("credential_ref", ["service:openai", "anthropic-generation-test"])
+def test_root_turn_admission_preserves_exact_owner_facts_and_mints_once(
+  credential_ref: str,
+) -> None:
+  session = _session()
+  snapshot = capture_selection_snapshot(_resolver().selection_policy)
+  context = root_context(
+    session, withheld_tools=frozenset({"write_record"}),
+    research_file_id=42, selection_snapshot=snapshot,
+  )
+  execution = _root_execution(credential_ref)
+  arguments: dict[str, Any] = {
+    "execution": execution,
+    "tool_grant": {"tool_ids": context.tool_ids, "withheld_tools": sorted(context.withheld)},
+    "approval_route": NO_APPROVAL_ROUTE,
+  }
+  first = admit_root_turn(context, **arguments)
+  second = admit_root_turn(context, **arguments)
+  assert first.job_id == context.job_id
+  assert first.tenant is context.tenant
+  assert first.capability_bind is execution.bind
+  assert first.research_binding is context.research_binding
+  assert first.selection_snapshot is snapshot
+  assert first.tool_grant == arguments["tool_grant"]
+  assert first.approval_route_kind == "no_approval_route"
+  assert first.credential_generation_ref == (
+    credential_ref if credential_ref.startswith("anthropic-generation-") else None
+  )
+  assert first.turn_id.startswith("turn:")
+  assert first.turn_id != second.turn_id
+  assert first.policy_generation_ref is None
+  assert current_root_turn(session) is None
+  capture_root_turn(session, first)
+  assert current_root_turn(session) is first
+  capture_root_turn(session, second)
+  assert current_root_turn(session) is second
+
+
+async def _root_approval(
+  store: SQLiteApprovalStore,
+  *,
+  session: GatewaySession,
+  with_binding: bool,
+) -> tuple[str, str, str]:
+  assert session.owner_user_id is not None
+  prepared = PreparedToolCall(prepared_input={"path": "retained.txt"}, exact_backend="local")
+  call_id, nonce = "root-call", "root-nonce"
+  request = build_approval_request(
+    tool_call_id=call_id, tool_name="file_read", tool_class="read",
+    tool_args_redacted=prepared.materialize_input(),
+    args_hash=sha256_args(prepared.materialize_input()),
+    run_context=RunContext(
+      user_id=session.owner_user_id, session_id=session.session_id,
+      request_id="root-request", run_id="root-run",
+    ),
+    state="pending_user",
+  )
+  await store.create(request)
+  if with_binding:
+    await store.record_executable_binding(
+      approval_id=request.approval_id, job_id=session.session_id,
+      tool_call_id=call_id, nonce=nonce, tenant_storage_id=session.owner_user_id,
+      tool_name="file_read", prepared_call=prepared, dispatch_context={},
+      credential_generation_ref=None,
+    )
+  return request.approval_id, call_id, nonce
+
+
+@pytest.mark.parametrize(
+  "with_binding",
+  [
+    pytest.param(True, id="autonomous-parks-always-carry-executable-binding"),
+    pytest.param(False, id="interactive-sdk-park-without-executable-binding"),
+  ],
+)
+def test_interactive_sdk_and_autonomous_bound_root_parks_locate_after_cold_reopen(
+  tmp_path: Path,
+  with_binding: bool,
+) -> None:
+  async def case() -> None:
+    path = tmp_path / "root.sqlite3"
+    store = SQLiteApprovalStore(path)
+    session = _session()
+    assert session.owner_user_id is not None
+    policy = SingleUserApprovalPolicy(store=store)
+    route = DurableLocalApprovalRoute(store, policy, session)
+    context = root_context(
+      session, withheld_tools=frozenset(), research_file_id=42,
+      selection_snapshot=capture_selection_snapshot(_resolver().selection_policy),
+    )
+    initial = admit_root_turn(
+      context, execution=_root_execution(
+        "anthropic-generation-retained",
+        run_mode="autonomous" if with_binding else "interactive",
+      ),
+      tool_grant={"tool_ids": context.tool_ids, "withheld_tools": sorted(context.withheld)},
+      approval_route=route,
+    )
+    admission = await record_root_turn_admission(store, initial)
+    reopened = SQLiteApprovalStore(path)
+    generation = await reopened.current_policy_generation()
+    assert generation is not None
+    assert (
+      generation.policy_id, generation.policy_version, generation.policy_bundle_hash,
+    ) == (policy.policy_id, policy.policy_version, policy.policy_bundle_hash)
+    assert admission.policy_generation_ref == generation.generation_ref
+    record = await reopened._read_root_turn_for_executor(
+      job_id=session.session_id, turn_id=admission.turn_id,
+      tenant_storage_id=session.owner_user_id,
+    )
+    assert record is not None
+    assert json.loads(record.capability_bind_json) == initial.capability_bind.to_json()
+    assert record.credential_generation_ref == "anthropic-generation-retained"
+    assert json.loads(record.effective_grant_json) == dict(admission.tool_grant)
+    assert json.loads(record.research_binding_json) == context.research_binding.model_dump(mode="json")
+    assert context.selection_snapshot is not None
+    assert json.loads(record.selection_snapshot_json) == context.selection_snapshot.to_json()
+    assert record.approval_route_kind == "durable_local"
+    approval_id, call_id, nonce = await _root_approval(
+      reopened, session=session, with_binding=with_binding,
+    )
+    await link_root_park(reopened, admission, tool_call_id=call_id, nonce=nonce)
+    cold = SQLiteApprovalStore(path)
+    assert await cold._locate_root_turn_for_approval(
+      approval_id=approval_id, tenant_storage_id=session.owner_user_id,
+    ) == (session.session_id, call_id, nonce, admission.turn_id)
+    assert await cold._locate_root_turn_for_approval(
+      approval_id=approval_id, tenant_storage_id="foreign-tenant",
+    ) is None
+    if not with_binding:
+      with cold._connection() as conn:
+        assert conn.execute("SELECT count(*) FROM approval_executable_bindings").fetchone()[0] == 0
+
+  asyncio.run(case())
+
+
+@pytest.mark.parametrize("durable", [True, False])
+def test_interactive_root_turn_records_before_tools_in_dispatchers_store(
+  tmp_path: Path,
+  durable: bool,
+  owner_session_host_policy: Any,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  owner_session_host_policy.get_local_tool_effect = lambda _name: "read"
+  from agent.interactive import runtime_chat_builder
+  from agent.shared.tool_registration import build_product_tool_registration_composition
+  from agent.skills.composition import compile_skill_application
+  from agent_gateway.dispatcher_factory import (
+    GatewayDispatcherDeps, InvocationPrincipal, build_tool_dispatcher,
+  )
+  from agent_gateway.event_log import EventLog
+
+  async def case() -> None:
+    store = SQLiteApprovalStore(tmp_path / "dispatcher.sqlite3")
+    old_store = SQLiteApprovalStore(tmp_path / "session.sqlite3")
+    session = _session()
+    assert session.owner_user_id is not None
+    old_route = DurableLocalApprovalRoute(old_store, SingleUserApprovalPolicy(store=old_store), session)
+    session.approval_route = old_route
+    deps = GatewayDispatcherDeps(
+      mcp_client=SimpleNamespace(is_mcp_tool=lambda _name: False),
+      approval_store=store if durable else None,
+      approval_policy=SingleUserApprovalPolicy(store=store) if durable else None,
+      mcp_meta_inject_servers=frozenset(),
+    )
+    session._gateway_dispatcher_deps = deps
+    execution = _root_execution()
+    skill_application = compile_skill_application(
+      skills_root=Path(__file__).resolve().parents[3] / "api/memory/workspace/notes/skills",
+      source_prefix=PurePosixPath("skills"),
+      tool_registration_catalog=build_product_tool_registration_composition().catalog,
+    )
+    calls: list[str] = []
+
+    async def tool_handler(
+      _input: dict[str, Any], **_kwargs: Any,
+    ) -> tuple[dict[str, Any], None]:
+      calls.append("file_read")
+      return {"content": "retained"}, None
+
+    def root_count(owner: SQLiteApprovalStore) -> int:
+      with owner._connection() as conn:
+        return conn.execute("SELECT count(*) FROM approval_root_turns").fetchone()[0]
+
+    def load_citation_validation_settings() -> Any:
+      return SimpleNamespace(citation_session_registry_enabled=False)
+
+    def prepare_runtime_tooling(**_kwargs: Any) -> Any:
+      return SimpleNamespace(
+        active_tool_definitions=lambda: [{"name": "file_read"}, {"name": "unbound"}],
+        unregistered_needs_approval=lambda *_args: False,
+        input_preparation_context_factory=None,
+        ce_bundle=None, child_code_execution_factory=None, child_code_execution_binder=None,
+      )
+
+    async def prepare_runtime_coordination(**_kwargs: Any) -> Any:
+      return SimpleNamespace(unbound_local_tools=frozenset({"unbound"}))
+
+    def build_chat_runtime_from_coordination(**_kwargs: Any) -> Any:
+      # The builder has not dispatched any tools; the private snapshot already exists.
+      assert calls == []
+      assert root_count(store) == (1 if durable else 0)
+      assert root_count(old_store) == 0
+      return build_tool_dispatcher(
+        deps, principal=InvocationPrincipal.from_session(session), profile="interactive",
+        capability_bind=execution.bind,
+        event_log=EventLog(), session_id=session.session_id, request_approval=None,
+        needs_approval=lambda *_args: False,
+        local_tool_handlers={"file_read": tool_handler},
+        _excel_tool_dispatcher_cls=lambda **kwargs: kwargs["base"],
+      )
+
+    monkeypatch.setattr(
+      runtime_chat_builder, "_load_citation_validation_settings",
+      load_citation_validation_settings,
+    )
+    monkeypatch.setattr(
+      runtime_chat_builder, "get_or_create_interceptors", lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+      runtime_chat_builder, "_prepare_runtime_tooling", prepare_runtime_tooling,
+    )
+    monkeypatch.setattr(
+      runtime_chat_builder, "_prepare_runtime_coordination", prepare_runtime_coordination,
+    )
+    monkeypatch.setattr(
+      runtime_chat_builder, "_build_chat_runtime_from_coordination",
+      build_chat_runtime_from_coordination,
+    )
+
+    prompting = SimpleNamespace(
+      skill_application=skill_application, research_turn=None, trusted_research_file_id=None,
+      prompt_context={}, profile_composition=SimpleNamespace(config=SimpleNamespace(name="analyst")),
+      execution_policy=None, profile_denied_mcp_servers=set(), skill_catalog_entries=[],
+      workspace_dir=None, local_tool_handlers={"file_read": tool_handler},
+      code_execution_extra_env={}, system_prompt="root", approval_fn=lambda *_args: False,
+      excluded_tools=set(), profile_deferred_mcp_tools=None, profile_allowed_mcp_tools_by_server=None,
+      profile_describe_mcp_scope_block=None, tool_surface=None, live_tool_surface=None,
+      fms_rebinder=None, stage_skill_name=None, filesystem_access_mode="trusted_local_unconfined",
+    )
+    dispatcher = await runtime_chat_builder._assemble_chat_runtime(
+      session=session,
+      request=SimpleNamespace(
+        capability_execution=execution, capability_execution_resolver=_resolver(),
+        selection_snapshot=None,
+      ),
+      channel="cli", auth_manager=None,
+      channel_registry=SimpleNamespace(get_channel_for_tool=lambda _name: None),
+      mcp_client_manager=deps.mcp_client, mcp_relay=None, sdk_config=None, risk_preamble="",
+      clear_source_pack_session_fn=lambda _session: None,
+      session_storage_user_id_fn=lambda _session, **_kwargs: session.owner_user_id,
+      memory_scope_for_user_fn=lambda _user: nullcontext(),
+      prepare_prompting_state_fn=lambda **_kwargs: prompting,
+      skill_application=skill_application,
+    )
+    admission = current_root_turn(session)
+    assert admission is not None
+    assert admission.capability_bind is execution.bind
+    assert admission.tool_grant == {"tool_ids": None, "withheld_tools": ["unbound"]}
+    assert session.approval_route is old_route  # Capturing does not rebind session routing.
+    if durable:
+      assert dispatcher._approval_store is store
+      approval_id, call_id, nonce = await _root_approval(
+        dispatcher._approval_store, session=session, with_binding=True,
+      )
+      await link_root_park(store, admission, tool_call_id=call_id, nonce=nonce)
+      assert await SQLiteApprovalStore(store.path)._locate_root_turn_for_approval(
+        approval_id=approval_id, tenant_storage_id=session.owner_user_id,
+      ) == (session.session_id, call_id, nonce, admission.turn_id)
+    else:
+      assert dispatcher._approval_store is None
+      assert admission.policy_generation_ref is None
+    result, error = await dispatcher.dispatch("first-tool", "file_read", {"path": "retained.txt"})
+    assert error is None, error
+    assert result == {"content": "retained"}
+    assert calls == ["file_read"]
+    assert root_count(store) == (1 if durable else 0)
+
+  asyncio.run(case())

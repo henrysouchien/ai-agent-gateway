@@ -1,4 +1,5 @@
 from __future__ import annotations
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
 from collections.abc import Mapping
@@ -87,6 +88,7 @@ def test_irreversible_rechecks_after_approval_and_injects_token_free_lineage() -
     rechecks.append(context)
 
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     role="owner",
     needs_approval=lambda *_args, **_kwargs: True,
@@ -136,6 +138,7 @@ def test_irreversible_live_recheck_failure_never_calls_mcp() -> None:
     raise RuntimeError("revoked")
 
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     role="owner",
     needs_approval=lambda *_args, **_kwargs: False,
@@ -165,6 +168,7 @@ def test_irreversible_live_recheck_failure_never_calls_mcp() -> None:
 def test_commercial_dispatch_denies_untrusted_mcp_without_metadata_leak() -> None:
   mcp = _Mcp()
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     role="owner",
     needs_approval=lambda *_args, **_kwargs: False,
@@ -192,6 +196,7 @@ def test_commercial_dispatch_denies_untrusted_mcp_without_metadata_leak() -> Non
 def test_missing_irreversible_recheck_fails_closed() -> None:
   mcp = _Mcp()
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     role="owner",
     needs_approval=lambda *_args, **_kwargs: False,
@@ -218,6 +223,7 @@ def test_missing_irreversible_recheck_fails_closed() -> None:
 def test_noncommercial_dispatch_remains_metadata_free() -> None:
   mcp = _Mcp()
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     role="owner",
     needs_approval=lambda *_args, **_kwargs: False,

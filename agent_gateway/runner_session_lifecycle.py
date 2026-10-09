@@ -2000,11 +2000,24 @@ class RunnerSessionLifecycleMixin:
           or sent_entries[0].seq >= assistant.seq
           or sent_entries[0].event.get("sub_agent_id")
           != assistant.event.get("sub_agent_id")
-          or assistant.event.get("role") != "sub_agent"
+          or (
+            assistant.event.get("sub_agent_id") is not None
+            and assistant.event.get("role") != "sub_agent"
+          )
+          or (
+            assistant.event.get("sub_agent_id") is None
+            and (
+              sent_entries[0].event.get("runner_id")
+              != assistant.event.get("runner_id")
+              or sent_entries[0].event.get("role")
+              != assistant.event.get("role")
+              or assistant.event.get("role") != self._role
+            )
+          )
           or type(assistant.event.get("runner_id")) is not str
         ):
           raise RuntimeError(
-            "assistant consumption binding lacks exact sent/child lineage"
+            "assistant consumption binding lacks exact sent/consumer lineage"
           )
         bound[identity] = (assistant, binding)
 
@@ -2056,9 +2069,11 @@ class RunnerSessionLifecycleMixin:
         "consumer_turn": binding["consumer_turn"],
         "assistant_message_seq": assistant.seq,
         "consumed_at": _runner_attr(self, "time", time).time(),
-        "runner_id": assistant.event["runner_id"],
-        "role": assistant.event["role"],
-        "sub_agent_id": assistant.event["sub_agent_id"],
+        **{
+          key: assistant.event[key]
+          for key in ("runner_id", "role", "sub_agent_id")
+          if key in assistant.event
+        },
       }
       appended = await self._append_durable_event(event)
       if appended is None:

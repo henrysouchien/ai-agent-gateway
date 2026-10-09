@@ -545,3 +545,78 @@ def test_frozen_credential_resolver_preserves_ownership_and_delegates_other_hand
   with pytest.raises(CapabilityResolutionError) as unavailable:
     missing.with_frozen_credential(bind, {"api_key": "frozen"})
   assert unavailable.value.code == "credential_unavailable"
+
+
+@pytest.mark.parametrize("principal", ["user", "service"])
+def test_rotation_rebinds_generation_and_reauthorizes_its_ownership(
+  principal: CredentialPrincipal,
+) -> None:
+  resolver = _resolver(auth=replace(
+    _auth(run_mode="batch", principal=principal),
+    run_scoped_user_providers=frozenset({"anthropic"}) if principal == "user" else frozenset(),
+  ))
+  execution = resolver.resolve("risk.document_ingest")
+  original = CapabilityBind.model_validate({
+    **execution.bind.to_json(), "credential_ref": "anthropic-generation-A",
+  })
+  execution = resolver.with_frozen_credential(
+    original, execution.auth_config,
+  ).materialize_bind(original)
+  rotated_config = {
+    **execution.auth_config,
+    "api_key": "sibling-secret",
+    "credential_source": {"generation_ref": "anthropic-generation-B"},
+  }
+
+  rotated = CapabilityExecutionResolver.rebind_rotated_credential(
+    execution, rotated_config, merged_auth_config=rotated_config,
+  )
+
+  assert rotated is not None
+  assert rotated.bind.to_json() == {
+    **original.to_json(), "credential_ref": "anthropic-generation-B",
+  }
+  assert rotated.auth_config["api_key"] == "sibling-secret"
+  assert rotated.resolver is not None
+  assert rotated.resolver.authorize_bind(rotated.bind) == rotated.bind
+  assert execution.bind.credential_ref == "anthropic-generation-A"
+
+
+@pytest.mark.parametrize("source", [None, {}, {"generation_ref": "session-id"}])
+def test_generation_rotation_without_generation_metadata_keeps_original_execution(
+  source: object,
+) -> None:
+  resolver = _resolver()
+  bind = CapabilityBind.model_validate({
+    **resolver.select_bind("session.driver").to_json(),
+    "credential_ref": "anthropic-generation-A",
+  })
+  execution = resolver.with_frozen_credential(
+    bind, {"api_key": "original-secret"},
+  ).materialize_bind(bind)
+  raw = {"api_key": "sibling-secret", "credential_source": source}
+  # Inherited source metadata in a merge must not count as B's identity.
+  merged = {**raw, "credential_source": {"generation_ref": bind.credential_ref}}
+
+  assert CapabilityExecutionResolver.rebind_rotated_credential(
+    execution, raw, merged_auth_config=merged,
+  ) is None
+  assert execution.auth_config["api_key"] == "original-secret"
+
+
+def test_generation_rotation_without_resolver_does_not_swap_material() -> None:
+  execution = _resolver().resolve("session.driver")
+  execution = replace(
+    execution,
+    bind=CapabilityBind.model_validate({
+      **execution.bind.to_json(), "credential_ref": "anthropic-generation-A",
+    }),
+    resolver=None,
+  )
+  rotated_config = {
+    "api_key": "sibling-secret",
+    "credential_source": {"generation_ref": "anthropic-generation-B"},
+  }
+  assert CapabilityExecutionResolver.rebind_rotated_credential(
+    execution, rotated_config, merged_auth_config=rotated_config,
+  ) is None

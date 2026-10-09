@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import sys
 from pathlib import Path
@@ -184,6 +185,7 @@ class _StubProvider:
 
 def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
   return ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={},
     event_log=event_log or EventLog(),
@@ -1155,6 +1157,187 @@ def test_send_message_persists_event_and_child_sees_parent_message_envelope(tmp_
       order="asc",
     )
     assert len(replayed_entries) == 1
+
+  _run(_case())
+
+
+def test_root_message_consumption_preserves_exact_writer_lineage(tmp_path: Path) -> None:
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "send-message-to-root.jsonl")
+    inbox: asyncio.Queue[ParentMessage] = asyncio.Queue()
+    registry = _root_registry(inbox=inbox)
+    runner = AgentRunner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(),
+      session_id=_ROOT_JOB,
+      capability_execution=stub_runner_capability_execution(
+        provider=_StubProvider(),
+        auth_config={"api_key": "k"},
+        model="stub-model",
+        effort="none",
+      ),
+      agent_session_log=log,
+      task_registry=registry,
+      get_tool_definitions=lambda: [],
+      message_inbox=inbox,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    handler = make_send_message_handler(
+      [runner],
+      caller=_root_caller,
+    )
+    seen_messages: list[list[dict[str, Any]]] = []
+
+    async def _fake_stream_turn(**kwargs: Any):
+      seen_messages.append(list(kwargs["current_messages"]))
+      if len(seen_messages) == 1:
+        result, error = await handler({
+          "to": _ROOT_JOB,
+          "message": "Found a restatement in Q3",
+          "message_id": "msg-root",
+        })
+        assert error is None
+        assert result == {
+          "status": "accepted",
+          "task_id": _ROOT_JOB,
+          "message_id": "msg-root",
+        }
+        return object(), StreamTurnResult(
+          full_text="working",
+          stop_reason="pause_turn",
+          content_blocks=[{"type": "text", "text": "working"}],
+        )
+      return object(), StreamTurnResult(
+        full_text="done",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "done"}],
+      )
+
+    runner._stream_turn = _fake_stream_turn
+    await runner.run(messages=[{"role": "user", "content": "Start"}])
+
+    assert len(seen_messages) == 2
+    assert "Found a restatement in Q3" in seen_messages[1][-1]["content"]
+    assert inbox.empty()
+    sent_entries, _ = await log.query(
+      event_types={"parent_message_sent"}, order="asc",
+    )
+    assistant_entries, _ = await log.query(
+      event_types={"assistant_message"}, order="asc",
+    )
+    consumed_entries, _ = await log.query(
+      event_types={"parent_message_consumed"}, order="asc",
+    )
+    error_entries, _ = await log.query(
+      event_types={"run_error", "error", "run_interrupted"}, order="asc",
+    )
+    assert registry.get(_ROOT_JOB) is None
+    assert error_entries == []
+    assert len(sent_entries) == len(consumed_entries) == 1
+    assert len(assistant_entries) == 2
+    sent = sent_entries[0]
+    assistant = assistant_entries[1]
+    consumed = consumed_entries[0]
+    assert assistant.event["parent_message_consumptions"] == [{
+      "task_id": _ROOT_JOB,
+      "message_id": "msg-root",
+      "parent_message_seq": sent.seq,
+      "consumer_turn": 2,
+    }]
+    assert consumed.event["task_id"] == sent.event["task_id"] == _ROOT_JOB
+    assert consumed.event["message_id"] == sent.event["message_id"] == "msg-root"
+    assert consumed.event["parent_message_seq"] == sent.seq
+    assert consumed.event["assistant_message_seq"] == assistant.seq
+    assert consumed.event["consumer_turn"] == 2
+    assert sent.seq < assistant.seq < consumed.seq
+    assert (
+      sent.event["runner_id"]
+      == assistant.event["runner_id"]
+      == consumed.event["runner_id"]
+      == runner._runner_id
+    )
+    assert sent.event["role"] == assistant.event["role"] == consumed.event["role"] == "writer"
+    assert all("sub_agent_id" not in entry.event for entry in (sent, assistant, consumed))
+    assert "message" not in consumed.event
+
+    await runner._materialize_parent_message_consumption_audits()
+    replayed_entries, _ = await log.query(
+      event_types={"parent_message_consumed"}, order="asc",
+    )
+    assert [(entry.seq, entry.event) for entry in replayed_entries] == [
+      (consumed.seq, consumed.event),
+    ]
+
+  _run(_case())
+
+
+@pytest.mark.parametrize(
+  ("conflicting_field", "conflicting_value"),
+  [("runner_id", "runner-other"), ("role", "sub_agent")],
+)
+def test_root_message_consumption_rejects_conflicting_writer_lineage(
+  tmp_path: Path,
+  conflicting_field: str,
+  conflicting_value: str,
+) -> None:
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "root-lineage-conflict.jsonl")
+    inbox: asyncio.Queue[ParentMessage] = asyncio.Queue()
+    registry = _root_registry(inbox=inbox)
+    runner = AgentRunner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(),
+      session_id=_ROOT_JOB,
+      capability_execution=stub_runner_capability_execution(
+        provider=_StubProvider(),
+        auth_config={"api_key": "k"},
+        model="stub-model",
+        effort="none",
+      ),
+      agent_session_log=log,
+      task_registry=registry,
+      message_inbox=inbox,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    runner._runner_id = "runner-root"
+    handler = make_send_message_handler(
+      [runner],
+      caller=_root_caller,
+    )
+    result, error = await handler({
+      "to": _ROOT_JOB,
+      "message": "Found a restatement in Q3",
+      "message_id": "msg-root-conflict",
+    })
+    assert error is None
+    assert result is not None and result["status"] == "accepted"
+    accepted = inbox.get_nowait()
+    assistant = await log.append({
+      "type": "assistant_message",
+      "runner_id": runner._runner_id,
+      "role": runner._role,
+      "parent_message_consumptions": [{
+        "task_id": accepted.task_id,
+        "message_id": accepted.message_id,
+        "parent_message_seq": accepted.sent_seq,
+        "consumer_turn": 2,
+      }],
+      conflicting_field: conflicting_value,
+    })
+
+    with pytest.raises(RuntimeError):
+      await runner._materialize_parent_message_consumption_audits(
+        assistant_message_seq=assistant.seq,
+        expected_messages=[accepted],
+      )
+    consumed_entries, _ = await log.query(
+      event_types={"parent_message_consumed"}, order="asc",
+    )
+    assert consumed_entries == []
 
   _run(_case())
 

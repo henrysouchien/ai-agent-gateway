@@ -784,6 +784,7 @@ def create_agent(
         approval_key_qualifier=approval_qualifier,
       )
       dispatcher = build_tool_dispatcher(
+        capability_bind=capability_execution.bind,
         deps=dispatcher_deps,
         principal=principal,
         profile="chat_embedded",

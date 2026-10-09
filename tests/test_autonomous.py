@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import logging
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, AsyncIterator
@@ -1778,6 +1779,83 @@ def test_split_messages_force_split_long_line() -> None:
   assert autonomous.split_messages("ABCDEFGHIJ", max_len=4) == ["ABCD", "EFGH", "IJ"]
 
 
+def test_run_autonomous_pairs_prebound_execution_with_explicit_resolver_for_background_child(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  owner_session_host_policy: Any,
+) -> None:
+  from dataclasses import FrozenInstanceError
+
+  from agent_gateway.skills import SkillLoader
+  from gateway_test_support.capability_execution_test_support import stub_capability_execution_resolver
+
+  skills_dir = tmp_path / "skills"
+  skills_dir.mkdir()
+  (skills_dir / "resolver-child.md").write_text(
+    "---\nexecution_class: node.implement\nname: resolver-child\nversion: '1.0'\n"
+    "agent_callable: true\nagent_description: Read.\nmutation_mode: read_only\n"
+    "allowed_tools: []\nmcp_tools: {}\n"
+    "semantic_metadata:\n  required_context: []\n  tool_refs: []\n"
+    "---\nRead and return the result.\n",
+    encoding="utf-8",
+  )
+  loader = SkillLoader(skills_dir)
+  operation = next(
+    item.snapshot.operation.model_dump(mode="json")
+    for item in loader.list_callable_operations()
+    if item.snapshot.operation.name == "resolver-child"
+  )
+  provider = _StubProvider()
+  provider.name = "openai"
+  resolver = replace(
+    stub_capability_execution_resolver(
+      default_provider="openai", default_model="gpt-5.6-sol",
+      run_mode="autonomous",
+    ),
+    adapter_resolver=lambda _adapter: provider,
+  )
+  authority = _bound_execution()
+  resolved_execution = resolver.resolve("session.driver")
+  execution = replace(
+    resolved_execution,
+    auth_config={**resolved_execution.auth_config, "max_tokens": 16_000},
+    resolver=None,
+  )
+  execution.validate()
+  authority["capability_execution"] = execution
+
+  async def run_parent(runner: Any, _log: EventLog, **_kwargs: Any):
+    result, error = await runner._dispatcher.dispatch("delegate", "run_agent", {
+      "operation": operation, "objective": "Read.", "background": True,
+    })
+    assert error is None, error
+    assert result is not None and result["task_id"]
+    entry = runner._task_registry.get(result["task_id"])
+    assert entry is not None
+    assert entry.admitted_task is not None
+    paired = runner.capability_execution
+    assert paired is not execution
+    assert paired.resolver is resolver
+    assert paired.bind is execution.bind
+    assert paired.registry is execution.registry
+    assert paired.adapter is execution.adapter
+    assert paired.auth_config == execution.auth_config
+    paired.validate()
+    with pytest.raises(FrozenInstanceError):
+      paired.resolver = None
+    return autonomous.RunOutput("Spawned.", [], {}, None, False)
+
+  monkeypatch.setattr(autonomous, "run_session", run_parent)
+  output = _run(autonomous.run_autonomous(
+    "System", "Delegate a read.", **authority,
+    skills_dir=skills_dir,
+    capability_execution_resolver=resolver,
+    user_id="alice", billing_mode="byok", rate_table_version="unknown",
+  ))
+  assert output.response == "Spawned."
+  assert execution.resolver is None
+
+
 @pytest.mark.parametrize("use_factory", [False, True])
 def test_run_autonomous_delegated_code_handler_keeps_its_executable_route(
   monkeypatch: pytest.MonkeyPatch,
@@ -1820,8 +1898,13 @@ def test_run_autonomous_delegated_code_handler_keeps_its_executable_route(
   )
   resolver = stub_capability_execution_resolver(
     default_provider="openai", default_model="gpt-5.6-sol",
+    run_mode="autonomous",
   )
   authority = _bound_execution()
+  execution = resolver.resolve("session.driver")
+  authority["capability_execution"] = replace(
+    execution, auth_config={**execution.auth_config, "max_tokens": 16_000},
+  )
   parent_bundle = build_code_execution(
     authority["session"],
     config=CodeExecutionConfig(register_docker=False, register_kernel=False),
@@ -1857,6 +1940,7 @@ def test_run_autonomous_delegated_code_handler_keeps_its_executable_route(
   class ParentRunner:
     def __init__(self, **kwargs: Any) -> None:
       self._dispatcher = kwargs["dispatcher"]
+      self.capability_execution = kwargs["capability_execution"]
       self._get_tool_definitions = kwargs["get_tool_definitions"]
       self._full_session_id = authority["session"].session_id
       self._agent_session_log = object()
@@ -1892,7 +1976,7 @@ def test_run_autonomous_delegated_code_handler_keeps_its_executable_route(
   async def run_parent(runner: Any, _log: EventLog, **_kwargs: Any):
     if use_factory:
       parent_dispatcher = ToolDispatcher(
-        mcp_client=autonomous._NullMcpClient(), local_tool_handlers=parent_handlers,
+        capability_bind=authority['capability_execution'].bind, mcp_client=autonomous._NullMcpClient(), local_tool_handlers=parent_handlers,
         role="owner", approval_key_qualifier=parent_bundle.approval_qualifier,
         get_tool_definitions=lambda: definitions,
       )

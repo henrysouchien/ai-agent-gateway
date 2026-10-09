@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import hashlib
 import json
@@ -58,6 +59,8 @@ from agent_gateway.sub_agent import (
   make_run_agent_handler,
   make_resume_handler as _make_resume_handler,
   make_resume_tool_def,
+  reserve_admitted_successor,
+  resume_admitted_successor,
 )
 from dataclasses import replace
 from agent_gateway.admission import (
@@ -86,6 +89,7 @@ from agent_workflow_contracts.models import (
 from agent_workflow_contracts import (
   ActivityHandle,
   AdmittedTask,
+  AdmittedWorkflowNodeIdentity,
   AdmittedToolRoute,
   AgentOperationRef,
   AttemptRef,
@@ -105,6 +109,7 @@ from agent_workflow_contracts import (
   ToolGrantEntry,
   TranscriptHandle,
   sha256_digest,
+  WorkflowNodeTaskRef,
 )
 from agent_gateway.transcript import (
   ChildRunSegment,
@@ -115,7 +120,10 @@ from agent_gateway.transcript import (
   reconstruct_messages_for_task,
   reconstruct_parent_messages,
 )
-from agent_gateway.capability_execution import CapabilityExecutionResolver
+from agent_gateway.capability_execution import (
+  BoundCapabilityExecution,
+  CapabilityExecutionResolver,
+)
 from agent_gateway.skill_context import (
   current_skill_admission,
   reset_current_skill_admission,
@@ -773,8 +781,8 @@ class _ResumeTestProvider(ModelProvider):
       yield StreamEvent(type="message_start")
 
 
-def _dispatcher() -> ToolDispatcher:
-  return ToolDispatcher(mcp_client=_NullMcpClient(), local_tool_handlers={}, event_log=EventLog(), session_id="sess")
+def _dispatcher(*, capability_bind = TEST_CAPABILITY_BIND) -> ToolDispatcher:
+  return ToolDispatcher(capability_bind=capability_bind, mcp_client=_NullMcpClient(), local_tool_handlers={}, event_log=EventLog(), session_id="sess")
 
 
 def _runner(
@@ -782,13 +790,11 @@ def _runner(
   *,
   max_resume_chain_depth: int = 3,
   max_retained_tasks: int = 50,
+  capability_execution: BoundCapabilityExecution | None = None,
 ) -> _ResumeTestRunner:
   provider = _ResumeTestProvider()
-  runner = _ResumeTestRunner(
-    event_log=EventLog(),
-    dispatcher=_dispatcher(),
-    session_id="sess-parent",
-    capability_execution=stub_bound_capability_execution(
+  if capability_execution is None:
+    capability_execution = stub_bound_capability_execution(
       provider=provider,
       model="claude-sonnet-4-6",
       effort="none",
@@ -796,7 +802,12 @@ def _runner(
         "auth_mode": "api",
         "api_key": "test-secret",
       },
-    ),
+    )
+  runner = _ResumeTestRunner(
+    event_log=EventLog(),
+    dispatcher=_dispatcher(capability_bind=capability_execution.bind),
+    session_id="sess-parent",
+    capability_execution=capability_execution,
     agent_session_log=AgentSessionLog(path=tmp_path / "sessions" / "runner.jsonl"),
     workspace_dir=str(tmp_path),
     task_registry=TaskRegistry(max_retained=max_retained_tasks),
@@ -947,6 +958,8 @@ async def _append_interrupted_skill_task(
   provider_tool_definitions: tuple[dict[str, Any], ...] | None = None,
   legacy_schema_version: str | None = None,
   admitted_context: AdmittedContextWire | None = None,
+  workflow_node: bool = False,
+  parked_state: TaskState = TaskState.INTERRUPTED,
 ) -> None:
   if tuple(route.tool_id for route in allowed_tool_routes) != tuple(
     sorted(set(allowed_tools))
@@ -1077,13 +1090,32 @@ async def _append_interrupted_skill_task(
     admitted_task = AdmittedTask.model_validate(
       admitted_task.model_dump(mode="json")
     )
+  if workflow_node:
+    identity = AdmittedWorkflowNodeIdentity(
+      workflow_run_id="workflow:resume",
+      plan_id="plan:resume",
+      phase_number=1,
+      revision=1,
+      node_id="node:resume",
+    )
+    logical = WorkflowNodeTaskRef(
+      **identity.model_dump(), operation=admitted_task.operation.operation,
+    )
+    payload = admitted_task.model_dump(mode="json", exclude={"admitted_task_digest"})
+    payload.update({
+      "logical_task": logical.model_dump(mode="json"),
+      "workflow_identity": identity.model_dump(mode="json"),
+      "admitted_plan_digest": sha256_digest({"plan": "resume"}),
+    })
+    sub_agent_module.seal_admitted_task_payload(payload)
+    admitted_task = AdmittedTask.model_validate(payload)
   entry = runner._task_registry.register(
     "background_agent",
     agent_name=agent_name,
     task_id=task_id,
     original_task_id=original_task_id,
   )
-  entry.state = TaskState.INTERRUPTED
+  entry.state = parked_state
   entry.capability_bind_receipt = receipt
   entry.admitted_task = admitted_task
   entry.metadata.update({
@@ -1206,7 +1238,10 @@ semantic_metadata:
       if item.snapshot.operation.name == "resume-shared-interceptors"
     )
 
-    initial_runner = _runner(tmp_path)
+    resolver = stub_capability_execution_resolver()
+    initial_runner = _runner(
+      tmp_path, capability_execution=resolver.resolve("session.driver"),
+    )
     initial_runner._runner_id = "runner-initial"
     initial_runner._get_tool_definitions = lambda: [{
       "name": "web_search",
@@ -1229,9 +1264,10 @@ semantic_metadata:
       mcp_client=_NullMcpClient(),
       local_tool_handlers={"web_search": web_search},
       interceptors=interceptors,
-      capability_execution_resolver=stub_capability_execution_resolver(),
+      capability_execution_resolver=resolver,
     )
     parent_dispatcher = ToolDispatcher(
+      capability_bind=initial_runner.capability_execution.bind,
       mcp_client=_NullMcpClient(),
       local_tool_handlers={"run_agent": initial_handler},
       interceptors=interceptors,
@@ -1470,7 +1506,9 @@ semantic_metadata:
       credential_materializer=base.credential_materializer,
       adapter_resolver=lambda _adapter: provider,
     )
-    runner = _runner(tmp_path)
+    runner = _runner(
+      tmp_path, capability_execution=resolver.resolve("session.driver"),
+    )
     runner._get_tool_definitions = lambda: [{
       "name": "web_search",
       "description": "Read-only evidence search.",
@@ -1499,6 +1537,7 @@ semantic_metadata:
       capability_execution_resolver=resolver,
     )
     parent_dispatcher = ToolDispatcher(
+      capability_bind=runner.capability_execution.bind,
       mcp_client=_NullMcpClient(),
       local_tool_handlers={"run_agent": handler},
       session_id="parent",
@@ -6831,5 +6870,368 @@ def test_resume_uses_frozen_anthropic_generation_not_current_selection(
       assert execution.auth_config["api_key"] == "frozen-key"
       assert execution.auth_config["credential_source"]["generation_ref"] != current.generation_ref
     assert resolver.auth_context.user_provider_handles["anthropic"].handle_id == "test-user:anthropic"
+
+  _run(_case())
+
+
+async def _trusted_workflow_resume_setup(
+  tmp_path: Path,
+  *,
+  parked_state: TaskState = TaskState.INTERRUPTED,
+  receipt: dict[str, str] | None = None,
+  research_file_id: int | None = None,
+) -> tuple[_ResumeTestRunner, TaskEntry, AdmittedTask]:
+  runner = _runner(tmp_path)
+  session = GatewaySession(
+    session_id="workflow-host",
+    api_key_hash="hash",
+    created_at=10,
+    expires_at=20,
+    user_id="alice",
+    tenant_id="tenant-test",
+  )
+  parent = root_context(session, withheld_tools=frozenset(), research_file_id=None)
+  context = AdmittedContextWire(
+    tenant=parent.tenant,
+    research_binding=AdmittedResearchBinding(research_file_id=research_file_id),
+    capability_bind=CapabilityBind.from_json(receipt or _bind_receipt()),
+    children=(),
+    tool_grant=("probe",),
+    withheld_tools=(),
+    budget_share=None,
+    env_projection=(),
+    approval_route="parent_delegated",
+    handle_grants=(),
+    placement="in_process",
+    lineage=AdmittedLineage(parent_job_id="workflow-host-job", depth=1),
+  )
+  await _append_interrupted_skill_task(
+    runner,
+    task_id="workflow_physical",
+    agent_name="workflow-resume",
+    user_message="Continue this admitted workflow node.",
+    allowed_tools=("probe",),
+    allowed_tool_routes=(AdmittedToolRoute(tool_id="probe", origin="local", server_id=None),),
+    required_context=(),
+    ticker=None,
+    admitted_context=context,
+    workflow_node=True,
+    parked_state=parked_state,
+    capability_bind_receipt=receipt,
+  )
+  source = runner._task_registry.get("workflow_physical")
+  assert source is not None and source.admitted_task is not None
+  async def _probe(tool_input: dict[str, Any], **kwargs: Any):
+    return {"resumed": True}, None
+
+  handler = make_resume_handler(
+    [runner],
+    parent_session=session,
+    mcp_client=_NullMcpClient(),
+    local_tool_handlers={"probe": _probe},
+    excluded_tools_resolver=frozenset,
+    capability_execution_resolver=stub_capability_execution_resolver(),
+  )
+  assert isinstance(runner._dispatcher, ToolDispatcher)
+  runner._dispatcher._local["resume"] = handler
+  successor_id, error = await reserve_admitted_successor(
+    runner, parked_task_id=source.task_id,
+  )
+  assert error is None and successor_id is not None
+  original = source.admitted_task
+  assert original.execution_snapshot is not None
+  snapshot = sub_agent_module.resume_agent_execution_snapshot(
+    original.execution_snapshot,
+    resume_instruction="Continue the workflow-owner admitted node.",
+  )
+  payload = original.model_dump(mode="json", exclude={"admitted_task_digest"})
+  payload.update({
+    "admitted_task_id": successor_id,
+    "attempt": AttemptRef(
+      attempt_number=2,
+      attempt_id="workflow:resume:node:resume:attempt:2",
+      physical_task_id=successor_id,
+      resume_of_task_id=source.task_id,
+    ).model_dump(mode="json"),
+    "execution_snapshot": snapshot.model_dump(mode="json"),
+  })
+  sub_agent_module.seal_admitted_task_payload(payload)
+  return runner, source, AdmittedTask.model_validate(payload)
+
+
+@pytest.mark.parametrize("state", [TaskState.INTERRUPTED, TaskState.AWAITING_APPROVAL])
+def test_reserve_admitted_successor_is_deterministic_and_idempotent(
+  tmp_path: Path, state: TaskState,
+) -> None:
+  async def _case() -> None:
+    runner, source, successor = await _trusted_workflow_resume_setup(
+      tmp_path, parked_state=state,
+    )
+    reservations = await asyncio.gather(*(
+      reserve_admitted_successor(runner, parked_task_id=source.task_id)
+      for _ in range(4)
+    ))
+    assert reservations == [("workflow_physical_r1", None)] * 4
+    reserved = runner._task_registry.get(successor.attempt.physical_task_id)
+    assert reserved is not None
+    assert reserved.original_task_id == source.task_id
+    assert reserved.admitted_task is None
+    assert source.state == state
+
+  _run(_case())
+
+
+@pytest.mark.parametrize(
+  ("mismatch", "code"),
+  [
+    ("logical_task", "logical_task_mismatch"),
+    ("tenant", "tenant_mismatch"),
+    ("resume_of", "resume_source_mismatch"),
+    ("admitted_id", "resume_successor_conflict"),
+    ("physical_id", "resume_successor_conflict"),
+    ("grant", "tool_grant_mismatch"),
+    ("bind", "capability_bind_mismatch"),
+  ],
+)
+def test_supplied_successor_refuses_mismatched_authority(
+  tmp_path: Path, mismatch: str, code: str,
+) -> None:
+  async def _case() -> None:
+    runner, source, successor = await _trusted_workflow_resume_setup(tmp_path)
+    payload = successor.model_dump(mode="json", exclude={"admitted_task_digest"})
+    if mismatch == "logical_task":
+      payload["logical_task"]["node_id"] = "node:other"
+      payload["workflow_identity"]["node_id"] = "node:other"
+    elif mismatch == "tenant":
+      payload["execution_snapshot"]["admitted_context"]["tenant"]["tenant_id"] = "other"
+    elif mismatch == "resume_of":
+      payload["attempt"]["resume_of_task_id"] = "other-parked-attempt"
+    elif mismatch == "admitted_id":
+      payload["admitted_task_id"] = "admitted:wrong"
+    elif mismatch == "physical_id":
+      payload["attempt"]["physical_task_id"] = "unreserved-physical"
+    elif mismatch == "grant":
+      grant = sub_agent_module.reissue_tool_grant(
+        successor.tool_grant, grant_id="grant:other",
+      )
+      payload["tool_grant"] = grant.model_dump(mode="json")
+      payload["tool_grant_digest"] = grant.digest
+    elif mismatch == "bind":
+      payload["model_bind"]["credential_ref"] = "test-other:anthropic"
+      payload["model_bind_digest"] = sha256_digest(payload["model_bind"])
+    sub_agent_module.seal_admitted_task_payload(payload)
+    invalid_successor = AdmittedTask.model_validate(payload)
+    completed: list[TaskEntry] = []
+    registered, error = await resume_admitted_successor(
+      runner,
+      parked_task_id=source.task_id,
+      successor=invalid_successor,
+      on_complete=lambda entry: completed.append(entry),
+    )
+    assert registered is None and error is not None
+    assert error["code"] == code
+    assert source.state == TaskState.INTERRUPTED
+    reserved = runner._task_registry.get(successor.attempt.physical_task_id)
+    assert reserved is not None and reserved.admitted_task is None
+    assert reserved.asyncio_task is None
+    assert completed == []
+
+  _run(_case())
+
+
+@pytest.mark.parametrize("async_completion", [False, True])
+@pytest.mark.parametrize("state", [TaskState.INTERRUPTED, TaskState.AWAITING_APPROVAL])
+def test_supplied_workflow_successor_executes_frozen_admission_and_fanout(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  async_completion: bool,
+  state: TaskState,
+) -> None:
+  from agent_gateway.providers.anthropic_oauth import register_anthropic_static_credential
+
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "credentials"))
+  frozen = register_anthropic_static_credential(
+    "frozen-workflow-key", source="request:anthropic:api_key",
+  )
+  assert frozen is not None
+  receipt = _bind_receipt()
+  receipt["credential_ref"] = frozen.generation_ref
+  activity: list[str] = []
+
+  class _Lease:
+    def __init__(self, index: int) -> None:
+      self.index = index
+
+    def release(self) -> None:
+      activity.append(f"release:{self.index}")
+
+  def _acquire(*args: Any, **kwargs: Any) -> _Lease:
+    activity.append("acquire")
+    return _Lease(activity.count("acquire"))
+
+  monkeypatch.setattr(sub_agent_module, "try_acquire_research_file_activity", _acquire)
+
+  async def _case() -> None:
+    runner, source, successor = await _trusted_workflow_resume_setup(
+      tmp_path, parked_state=state, receipt=receipt, research_file_id=37,
+    )
+    captured: dict[str, Any] = {}
+    finished = asyncio.Event()
+
+    async def _resume_sub_agent(**kwargs: Any):
+      captured.update(kwargs)
+      result, error = await kwargs["dispatcher"].dispatch("probe", {})
+      assert error is None and result == {"resumed": True}
+      return await _successful_resume_task_result(
+        kwargs, "Workflow node completed.", workspace_dir=tmp_path,
+      ), None
+
+    runner.resume_sub_agent = _resume_sub_agent
+
+    def _on_complete(entry: TaskEntry) -> None:
+      assert "release:1" in activity
+      assert entry.admitted_task == successor
+      activity.append("complete")
+      finished.set()
+
+    async def _async_on_complete(entry: TaskEntry) -> None:
+      await asyncio.sleep(0)
+      _on_complete(entry)
+
+    registered, error = await resume_admitted_successor(
+      runner,
+      parked_task_id=source.task_id,
+      successor=successor,
+      on_complete=_async_on_complete if async_completion else _on_complete,
+    )
+    assert error is None and registered is not None
+    assert registered.task_id == "workflow_physical_r1"
+    assert registered.admitted_task is successor
+    assert source.admitted_task is not None
+    assert successor.tool_grant == source.admitted_task.tool_grant
+    assert successor.tool_grant.model_dump_json() == source.admitted_task.tool_grant.model_dump_json()
+    assert registered.asyncio_task is not None
+    await registered.asyncio_task
+    await asyncio.wait_for(finished.wait(), timeout=5)
+    assert activity.index("release:1") < activity.index("complete")
+    assert activity.count("release:1") == 1
+    assert captured["admitted_task"] is successor
+    assert captured["attempt"].attempt_id == "workflow:resume:node:resume:attempt:2"
+    assert captured["capability_execution"].auth_config["api_key"] == "frozen-workflow-key"
+    assert captured["dispatcher"]._capability_bind == successor.model_bind
+    assert successor.execution_snapshot is not None
+    assert successor.execution_snapshot.admitted_context is not None
+    assert captured["dispatcher"]._identity.context.tenant == (
+      successor.execution_snapshot.admitted_context.tenant
+    )
+    assert captured["system_prompt"] == successor.execution_snapshot.system_prompt
+    told = json.dumps(captured["reconstructed_messages"])
+    assert "Continue the workflow-owner admitted node." in told
+    assert "Resume the admitted task from its durable transcript." not in told
+    assert runner._agent_session_log is not None
+    registrations, _ = await runner._agent_session_log.query(event_types={"task_registered"})
+    successor_events = [
+      entry.event for entry in registrations
+      if entry.event["task_id"] == registered.task_id
+    ]
+    assert len(successor_events) == 1
+    assert successor_events[0]["metadata"][ADMITTED_TASK_METADATA_KEY] == (
+      successor.model_dump(mode="json")
+    )
+
+  _run(_case())
+
+
+def test_model_resume_cannot_supply_a_workflow_successor(tmp_path: Path) -> None:
+  async def _case() -> None:
+    runner, source, successor = await _trusted_workflow_resume_setup(tmp_path)
+    assert isinstance(runner._dispatcher, ToolDispatcher)
+    handler = runner._dispatcher._local["resume"]
+    result, error = await handler(
+      {"task_id": source.task_id, "successor": successor.model_dump(mode="json")},
+      supplied_successor=successor,
+      supplied_on_complete=lambda entry: None,
+    )
+    _assert_resume_abandoned(result, error, code="invalid_task_metadata")
+    reserved = runner._task_registry.get(successor.attempt.physical_task_id)
+    assert reserved is not None and reserved.admitted_task is None
+    assert reserved.asyncio_task is None
+
+  _run(_case())
+
+
+@pytest.mark.parametrize(
+  ("condition", "code"),
+  [
+    ("missing", "not_found"),
+    ("running", "not_resumable"),
+    ("completion_pending", "completion_pending"),
+    ("cross_lineage", "resume_successor_conflict"),
+  ],
+)
+def test_reserve_admitted_successor_preserves_source_and_lineage_boundaries(
+  tmp_path: Path, condition: str, code: str,
+) -> None:
+  async def _case() -> None:
+    runner = _runner(tmp_path)
+    if condition == "missing":
+      task_id = "unknown"
+    else:
+      task_id = "parked"
+      await _append_interrupted_skill_task(
+        runner,
+        task_id=task_id,
+        agent_name="reservation-boundary",
+        user_message="Resume the canonical parked task.",
+      )
+      source = runner._task_registry.get(task_id)
+      assert source is not None
+      if condition == "running":
+        source.state = TaskState.RUNNING
+      elif condition == "completion_pending":
+        source.completion_persistence_state = "uncertain"
+      else:
+        runner._task_registry.claim_resume_successor(
+          "background", task_id="parked_r1", original_task_id="other-lineage",
+        )
+    successor_id, error = await reserve_admitted_successor(
+      runner, parked_task_id=task_id,
+    )
+    assert successor_id is None and error is not None
+    assert error["code"] == code
+    if condition == "cross_lineage":
+      existing = runner._task_registry.get("parked_r1")
+      assert existing is not None and existing.original_task_id == "other-lineage"
+    else:
+      assert runner._task_registry.get(f"{task_id}_r1") is None
+
+  _run(_case())
+
+
+def test_trusted_successor_entries_refuse_source_without_admission(tmp_path: Path) -> None:
+  async def _case() -> None:
+    runner, source, successor = await _trusted_workflow_resume_setup(tmp_path)
+    # A fork/older entry is not an admitted workflow attempt. Metadata is
+    # deliberately retained: the supplied entry must not reconstruct authority.
+    source.admitted_task = None
+    successor_id, reservation_error = await reserve_admitted_successor(
+      runner, parked_task_id=source.task_id,
+    )
+    assert successor_id is None and reservation_error is not None
+    assert reservation_error["code"] == "invalid_task_metadata"
+    completed: list[TaskEntry] = []
+    registered, resume_error = await resume_admitted_successor(
+      runner,
+      parked_task_id=source.task_id,
+      successor=successor,
+      on_complete=lambda entry: completed.append(entry),
+    )
+    assert registered is None and resume_error is not None
+    assert resume_error["code"] == "invalid_task_metadata"
+    reserved = runner._task_registry.get(successor.attempt.physical_task_id)
+    assert reserved is not None and reserved.admitted_task is None
+    assert reserved.asyncio_task is None
+    assert source.admitted_task is None
+    assert completed == []
 
   _run(_case())

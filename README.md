@@ -51,9 +51,15 @@ and authorizes a secret-free bind through that owner, without materializing
 credentials or constructing an adapter. `resolve()` selects and materializes
 once; `materialize_bind()` executes an already selected bind without reselection.
 Both selection methods accept already-lowered `role`/exact `effort` and the
-admission owner's effective `role_map` with its source. They use the shared
+admission owner's frozen `selection_snapshot`. They use the shared
 model-authority resolver; this adapter does not capture principal preferences
 or own a map registry.
+Bound executions retain their resolver for mid-run credential rotation.
+`rebind_rotated_credential()` reauthorizes a new bind naming the selected
+Anthropic source generation. Fresh spawns select and materialize through the
+current scoped runner's execution resolver, so later descendants inherit the
+rotated generation. Generation-bound executions do not rotate to material
+without source-generation metadata.
 [`agent_gateway/providers/`](agent_gateway/providers/README.md) builds each request
 from the bound entry. Mechanism: `docs/reference/model-authority.md`.
 
@@ -99,6 +105,23 @@ authenticated identity, live roster and approval owner.
 execution authority. Duplicate registration/message bind receipts are optional
 observations, not prerequisites or competing authority; canonical corruption and
 task/result/message identity checks still apply.
+
+Workflow-node continuation belongs to the workflow owner, not model-facing
+`revive`. A trusted host first calls
+`sub_agent.reserve_admitted_successor(runner, parked_task_id=...)` to reserve the
+kernel's deterministic physical successor, then supplies its workflow admission
+to `sub_agent.resume_admitted_successor(runner, parked_task_id=..., successor=...,
+on_complete=...)`. The runner's dispatcher must contain the handler built by
+`make_resume_handler`; this reuses its configured child-runtime wiring without
+exposing supplied admissions through tool inputs. The admission retains the
+parked logical task, authenticated tenant and frozen capability bind, names the
+parked physical attempt in `resume_of_task_id`, uses the reserved successor ID as
+both physical and admitted task ID, and carries the original grant unchanged
+(including its grant ID and digest). Workflow attempt IDs and resume lifecycle events remain
+workflow-owned. Completion releases the gateway's activity lease before invoking
+the host callback, including an awaitable callback. Ordinary `revive` still
+accepts only ordinary delegation identity and mints its existing ordinary
+successor admission.
 
 ## Quick start
 
@@ -166,6 +189,20 @@ HTTP client
 
 Headless calls use the same runner, tools, skills, and provider abstractions,
 but return `RunOutput` instead of exposing an HTTP/SSE session.
+
+Code execution settles native and bridged nested calls through the cell ledger.
+Their `dispatch.sources` remain in the outer result's `sources`; native computation
+provenance is projected into `computations` with its `nested_call_id`, without
+entry or byte caps. Computation JSON sidecars are no longer read or consumed.
+
+Native calls parked for local approval capture their original `PreparedToolCall`
+and dispatch operands privately on the route's ledger store, before publication.
+Custody uses the executing job's admitted context (including in-process children),
+and an Anthropic generation reference comes only from the dispatcher's frozen
+capability bind. A captured root turn links that same park to its root admission.
+Automatic decisions and detached delegated approval do not record a native
+binding; a missing admitted job or tenant is observed with a warning and approval continues.
+Public approval projections remain redacted and carry none of these private operands.
 
 ## Develop and verify
 

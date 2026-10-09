@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 
 from __future__ import annotations
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
 import hashlib
@@ -550,10 +551,16 @@ async def test_long_failure_reason_still_queues_completion(
   class _NoDispatchDispatcher(ToolDispatcher):
     async def dispatch(self, *args: object, **kwargs: object) -> ToolResult:
       raise AssertionError("settlement does not dispatch tools")
+  _dispatcher_execution_557 = stub_runner_capability_execution(
+        provider=SimpleNamespace(name="anthropic"),
+        model="claude-sonnet-4-6",
+        effort="none",
+      )
 
   runner = AgentRunner(
     event_log=EventLog(),
     dispatcher=_NoDispatchDispatcher(
+      capability_bind=_dispatcher_execution_557.bind,
       mcp_client=McpClientManager(config_path=None),
       local_tool_handlers={},
       event_log=EventLog(),
@@ -563,11 +570,7 @@ async def test_long_failure_reason_still_queues_completion(
     user_id="test-user",
     billing_mode="byok",
     rate_table_version="test",
-    capability_execution=stub_runner_capability_execution(
-      provider=SimpleNamespace(name="anthropic"),
-      model="claude-sonnet-4-6",
-      effort="none",
-    ),
+    capability_execution=_dispatcher_execution_557,
     agent_session_log=AgentSessionLog(tmp_path / "session.jsonl"),
   )
   runner._runner_id = "parent-runner"

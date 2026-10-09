@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Literal, overload
+from model_authority.bind import CapabilityBind
 
 from .approval_route import (
   NO_APPROVAL_ROUTE,
@@ -103,6 +104,7 @@ _SERVER_OWNED_PASSTHROUGH_KEYS = frozenset({
 def build_tool_dispatcher(
   deps: GatewayDispatcherDeps,
   *,
+  capability_bind: CapabilityBind,
   principal: InvocationPrincipal,
   profile: Literal["interactive"],
   event_log: Any,
@@ -130,6 +132,7 @@ def build_tool_dispatcher(
 def build_tool_dispatcher(
   deps: GatewayDispatcherDeps,
   *,
+  capability_bind: CapabilityBind,
   principal: InvocationPrincipal,
   profile: Literal["chat_embedded"],
   event_log: Any,
@@ -157,6 +160,7 @@ def build_tool_dispatcher(
 def build_tool_dispatcher(
   deps: GatewayDispatcherDeps,
   *,
+  capability_bind: CapabilityBind,
   principal: InvocationPrincipal,
   profile: Literal["chat_embedded"],
   event_log: Any,
@@ -184,6 +188,7 @@ def build_tool_dispatcher(
 def build_tool_dispatcher(
   deps: GatewayDispatcherDeps,
   *,
+  capability_bind: CapabilityBind,
   principal: InvocationPrincipal,
   profile: Literal["chat_embedded", "interactive"],
   event_log: Any,
@@ -210,6 +215,7 @@ def build_tool_dispatcher(
 def build_tool_dispatcher(
   deps: GatewayDispatcherDeps,
   *,
+  capability_bind: CapabilityBind,
   principal: InvocationPrincipal,
   profile: Literal["chat_embedded", "interactive"],
   event_log: Any,
@@ -288,6 +294,7 @@ def build_tool_dispatcher(
     )
 
   base_kwargs: dict[str, Any] = {
+    "capability_bind": capability_bind,
     "mcp_client": deps.mcp_client,
     "local_tool_handlers": local_tool_handlers,
     "needs_approval": needs_approval,

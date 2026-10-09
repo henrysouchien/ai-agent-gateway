@@ -1,4 +1,5 @@
 from __future__ import annotations
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
 from contextlib import redirect_stdout
@@ -9,7 +10,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import pytest
 from pydantic import JsonValue, ValidationError
@@ -318,7 +319,12 @@ def _spawn_result(kwargs: dict[str, Any]) -> TaskResult:
 
 
 class _Runner:
-  def __init__(self) -> None:
+  def __init__(
+    self, *, capability_execution: BoundCapabilityExecution | None = None,
+  ) -> None:
+    self.capability_execution = (
+      capability_execution or _CapabilityResolver().resolve("session.driver")
+    )
     self._full_session_id = "session-test"
     self._agent_session_log: object | None = object()
     self._spill_dir_provider: SpillSink | None = None
@@ -398,6 +404,11 @@ def _handler(
   bind_session_approval_route(parent_session, approval_store, approval_policy)
   if parent_sessions is not None:
     parent_sessions.append(parent_session)
+  resolver = resolver or _CapabilityResolver()
+  if runner is not None:
+    runner.capability_execution = resolver.materialize_bind(
+      runner.capability_execution.bind,
+    )
   return make_run_agent_handler(
     [runner],
     parent_session=parent_session,
@@ -405,7 +416,7 @@ def _handler(
     operation_catalog=operation_catalog,
     mcp_client=mcp_client or _McpClient(),
     local_tool_handlers=handlers,
-    capability_execution_resolver=resolver or _CapabilityResolver(),
+    capability_execution_resolver=resolver,
     operation_mcp_activator=operation_mcp_activator,
     mcp_session_inject_servers=mcp_session_inject_servers,
     mcp_meta_inject_servers=mcp_meta_inject_servers,
@@ -451,6 +462,7 @@ def test_rebound_run_agent_uses_child_authority_and_runner(
           calls.append(call)
           child_session = kwargs["sub_session"]
           child_runner = SlotRunner(self.depth + 1)
+          child_runner.capability_execution = kwargs["capability_execution"]
           handlers = {"run_agent": handler}
           rebind_job_handlers(handlers, JobScope(
             caller=lambda: current_parent_context(child_session),
@@ -499,6 +511,147 @@ def test_rebound_run_agent_uses_child_authority_and_runner(
   asyncio.run(exercise())
 
 
+def test_run_agent_spawn_uses_current_rotated_parent_credential(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  owner_session_host_policy: Any,
+) -> None:
+  monkeypatch.delenv("HANK_MAX_SPAWN_DEPTH", raising=False)
+  owner_session_host_policy.get_local_tool_effect = lambda _name: "read"
+  loader = _write_operation(tmp_path / "skills", execution_class="node.implement")
+
+  class CredentialProvider(ModelProvider):
+    name = "anthropic"
+
+    def __init__(self) -> None:
+      self.used_credentials: list[tuple[str, str]] = []
+
+    def has_active_credential(self, config: dict[str, Any]) -> bool:
+      return bool(config.get("api_key"))
+
+    def create_client(
+      self, config: dict[str, Any], *, timeout: float | None = None,
+    ) -> Any:
+      return dict(config)
+
+    async def close_client(self, client: Any, timeout: float = 2.0) -> None:
+      pass
+
+    def get_model_info(self, model: str) -> ModelInfo:
+      return ModelInfo(id=model, provider=self.name, supports_thinking=True)
+
+    def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
+      return kwargs
+
+    async def stream(self, client: Any, params: dict[str, Any]):
+      self.used_credentials.append((
+        client["api_key"], client["credential_source"]["generation_ref"],
+      ))
+      text = "The child reviewed the filing evidence."
+      yield StreamEvent(type="text_delta", text=text)
+      yield StreamEvent(type="text_end", raw_block={"type": "text", "text": text})
+      yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+  async def exercise() -> None:
+    provider = CredentialProvider()
+    base = replace(
+      stub_capability_execution_resolver(),
+      adapter_resolver=lambda _adapter: provider,
+    )
+    bind_a = CapabilityBind.model_validate({
+      **base.select_bind("session.driver").to_json(),
+      "credential_ref": "anthropic-generation-A",
+    })
+    config_a = {
+      "provider": "anthropic",
+      "auth_mode": "api",
+      "api_key": "secret-A",
+      "credential_source": {"generation_ref": "anthropic-generation-A"},
+    }
+    resolver_a = base.with_frozen_credential(bind_a, config_a)
+    execution_a = resolver_a.materialize_bind(bind_a)
+    parent_session = GatewaySession(
+      session_id="rotation-parent",
+      api_key_hash="hash",
+      created_at=1,
+      expires_at=2,
+      user_id="test-actor",
+      owner_user_id="test-actor",
+      role="owner",
+      tenant_id="test-tenant",
+      channel="cli",
+      auth_config=config_a,
+    )
+    bind_session_approval_route(parent_session, None, None)
+    definitions = _Runner()._get_tool_definitions()
+    dispatcher = ToolDispatcher(
+      capability_bind=execution_a.bind,
+      mcp_client=cast(Any, _McpClient()),
+      local_tool_handlers={"web_search": _tool},
+      event_log=EventLog(),
+      session_id=parent_session.session_id,
+      role="owner",
+      get_tool_definitions=lambda: definitions,
+    )
+    runner = AgentRunner(
+      event_log=EventLog(),
+      dispatcher=dispatcher,
+      session_id=parent_session.session_id,
+      capability_execution=execution_a,
+      get_tool_definitions=dispatcher.get_tool_definitions,
+      agent_session_log=AgentSessionLog(tmp_path / "sessions" / "rotation.jsonl"),
+      workspace_dir=str(tmp_path),
+      user_id=parent_session.user_id,
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    runner._runner_id = "rotation-parent-runner"
+    spawn_calls: list[dict[str, Any]] = []
+    spawn_sub_agent = runner.spawn_sub_agent
+
+    async def record_spawn(task: str, **kwargs: Any):
+      spawn_calls.append(kwargs)
+      return await spawn_sub_agent(task, **kwargs)
+
+    monkeypatch.setattr(runner, "spawn_sub_agent", record_spawn)
+    handler = make_run_agent_handler(
+      [runner],
+      parent_session=parent_session,
+      skill_loader=loader,
+      mcp_client=_McpClient(),
+      local_tool_handlers={"web_search": _tool},
+      capability_execution_resolver=resolver_a,
+    )
+    config_b = {
+      **config_a,
+      "api_key": "secret-B",
+      "credential_source": {"generation_ref": "anthropic-generation-B"},
+    }
+    # The real refresh owner calls rebind_rotated_credential after the handler
+    # captured A and installs the replacement execution/resolver on its parent.
+    assert runner._apply_refreshed_auth_config({}, config_b)
+    assert runner.capability_execution.bind.credential_ref == "anthropic-generation-B"
+    try:
+      result, error = await handler({
+        "operation": _operation(loader),
+        "objective": "Review the filing evidence.",
+        "background": False,
+      })
+      assert error is None and result is not None
+      assert len(spawn_calls) == 1
+      call = spawn_calls[0]
+      admitted = call["admitted_task"].execution_snapshot.admitted_context
+      assert admitted.capability_bind.credential_ref == "anthropic-generation-B"
+      execution = call["capability_execution"]
+      assert execution.bind == admitted.capability_bind
+      assert execution.auth_config["api_key"] == "secret-B"
+      assert provider.used_credentials == [("secret-B", "anthropic-generation-B")]
+    finally:
+      await runner.force_close()
+
+  asyncio.run(exercise())
+
+
 def test_rebound_run_agent_admits_typed_ticker_with_child_session_tenant(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
@@ -536,6 +689,7 @@ def test_rebound_run_agent_admits_typed_ticker_with_child_session_tenant(
           if self.depth == 0:
             child_session = kwargs["sub_session"]
             child_runner = SlotRunner(self.depth + 1)
+            child_runner.capability_execution = kwargs["capability_execution"]
             handlers = {"run_agent": handler}
             rebind_job_handlers(handlers, JobScope(
               caller=lambda: current_parent_context(child_session),
@@ -3887,7 +4041,21 @@ def test_child_kernel_is_isolated_and_disposed_through_real_run_lifetime(
     )
     parent_bundle = build_code_execution(parent_session, config=config)
     mcp_client = McpClientManager(config_path=None)
+    child_sessions: list[GatewaySession] = []
+    child_processes: list[Any] = []
+
+    def record_child_process() -> None:
+      if termination in {"unavailable", "unavailable_status", "custom"}:
+        return
+      child_runtime = child_sessions[-1].code_execution_kernels["kernel"].runner
+      assert child_runtime is not None and child_runtime.process is not None
+      child_processes.append(child_runtime.process)
+
+    provider = _KernelChildProvider(termination, record_child_process)
+    resolver = _kernel_child_resolver(provider)
+    _dispatcher_execution_3891 = resolver.resolve("session.driver")
     parent_dispatcher = ToolDispatcher(
+      capability_bind=_dispatcher_execution_3891.bind,
       mcp_client=mcp_client,
       local_tool_handlers=parent_bundle.handlers,
       event_log=EventLog(),
@@ -3900,26 +4068,14 @@ def test_child_kernel_is_isolated_and_disposed_through_real_run_lifetime(
       parent_dispatcher,
       tool_definitions=parent_dispatcher.get_tool_definitions,
     )
-    child_sessions: list[GatewaySession] = []
     child_readers: list[Any] = []
-    child_processes: list[Any] = []
     child_workdirs: list[Path] = []
-
-    def record_child_process() -> None:
-      if termination in {"unavailable", "unavailable_status", "custom"}:
-        return
-      child_runtime = child_sessions[-1].code_execution_kernels["kernel"].runner
-      assert child_runtime is not None and child_runtime.process is not None
-      child_processes.append(child_runtime.process)
-
-    provider = _KernelChildProvider(termination, record_child_process)
-    resolver = _kernel_child_resolver(provider)
     session_log = AgentSessionLog(path=tmp_path / "sessions" / "kernel.jsonl")
     runner = AgentRunner(
       event_log=EventLog(),
       dispatcher=parent_dispatcher,
       session_id=parent_session.session_id,
-      capability_execution=resolver.resolve("session.driver"),
+      capability_execution=_dispatcher_execution_3891,
       get_tool_definitions=parent_dispatcher.get_tool_definitions,
       agent_session_log=session_log,
       workspace_dir=str(tmp_path),
@@ -4033,7 +4189,7 @@ def test_child_kernel_is_isolated_and_disposed_through_real_run_lifetime(
       else:
         # Persist a canonical interrupted attempt, then drive the actual
         # resume handler, background registration and AgentRunner child loop.
-        seed = _Runner()
+        seed = _Runner(capability_execution=_dispatcher_execution_3891)
         seed._get_tool_definitions = lambda: parent_bundle.tool_definitions
         seed_handler = make_run_agent_handler(
           [seed],

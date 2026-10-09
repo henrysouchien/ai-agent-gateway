@@ -47,6 +47,7 @@ class _CompleteRunner(AgentRunner):
     super().__init__(
       event_log=event_log,
       dispatcher=ToolDispatcher(
+        capability_bind=execution.bind,
         mcp_client=mcp_client,
         local_tool_handlers={},
         event_log=event_log,

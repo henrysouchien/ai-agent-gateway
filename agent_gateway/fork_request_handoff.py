@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 from model_authority.bind import CapabilityBind
 from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
 from .execution_identity import resolved_execution_identity
+from .tool_dispatcher import _SpawningTurn
 
 
 MarkerPosition = tuple[int, int]
@@ -60,6 +61,7 @@ class ForkRequestHandoff:
   billing_mode: str
   message_marker_position: MarkerPosition
   boundary_kind: str
+  spawning_turn: _SpawningTurn
 
   def __post_init__(self) -> None:
     object.__setattr__(self, "_messages", _freeze(self._messages))
@@ -125,6 +127,15 @@ class ForkRequestHandoff:
     ).strip().lower()
     if configured_provider and configured_provider != self.capability_bind.provider:
       raise ValueError("fork handoff auth provider does not match its bind")
+
+  @property
+  def _fork_retained_payload(self) -> Mapping[str, Any]:
+    """Request payload accounting excludes the parent's runtime scope binding."""
+    return {
+      item.name: getattr(self, item.name)
+      for item in fields(self)
+      if item.name != "spawning_turn"
+    }
 
   @property
   def messages(self) -> list[dict[str, Any]]:
@@ -238,6 +249,7 @@ def _build_handoff(
     billing_mode=str(getattr(runner, "_billing_mode", "") or ""),
     message_marker_position=marker,
     boundary_kind=boundary_kind,
+    spawning_turn=runner._dispatcher.capture_spawning_turn(),
   )
 
 

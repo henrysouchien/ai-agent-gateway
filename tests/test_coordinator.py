@@ -1,11 +1,11 @@
 # ruff: noqa: E402
 
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
-from collections.abc import Mapping
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Literal
+from typing import Any
 
 import pytest
 
@@ -28,7 +28,7 @@ from agent_gateway import (
 )
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CapabilityId, ModelSelectionIntent
-from model_authority.selection import SelectionSnapshot, TierDefaultInput
+from model_authority.selection import SelectionSnapshot
 from agent_gateway.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
@@ -37,6 +37,7 @@ from agent_gateway.mcp_client import McpClientManager
 from model_authority.current import INITIAL_MODEL_REGISTRY
 from agent_gateway.providers import AnthropicProvider, StreamEvent
 from gateway_test_support.capability_execution_test_support import (
+  stub_capability_execution_resolver,
   stub_runner_capability_execution,
 )
 from gateway_test_support.child_task_result import succeeded_child_task_result
@@ -97,6 +98,7 @@ class _PromptCaptureProvider(ModelProvider):
 
 class _StubRunner:
   _spill_dir_provider = None
+  capability_execution: BoundCapabilityExecution
 
   def __init__(self) -> None:
     self._full_session_id = "session-coordinator"
@@ -131,9 +133,6 @@ class _CapabilityResolver(CapabilityExecutionResolver):
     parent_bind: CapabilityBind | None = None,
     role: str | None = None,
     effort: str | None = None,
-    role_map: Mapping[str, TierDefaultInput] | None = None,
-    role_map_source: Literal["saved_preference", "internal_policy"] | None = None,
-    requested_role_source: Literal["explicit_user", "internal_policy"] = "internal_policy",
     selection_snapshot: SelectionSnapshot | None = None,
   ) -> CapabilityBind:
     self.calls.append({
@@ -178,6 +177,7 @@ async def _dummy_tool(_tool_input, **_kwargs):
 
 def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
   return ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={},
     event_log=event_log or EventLog(),
@@ -285,7 +285,10 @@ def test_coordinator_disabled_does_not_inject_preamble() -> None:
 @pytest.mark.usefixtures("worker_tool_policy")
 def test_make_run_agent_handler_subtracts_only_parent_exclusions() -> None:
   runner = _StubRunner()
-  resolver = _CapabilityResolver()
+  resolver = stub_capability_execution_resolver(
+    default_provider="anthropic", default_model="claude-opus-5",
+  )
+  runner.capability_execution = resolver.resolve("session.driver")
   handler = make_run_agent_handler(
     [runner],
     parent_session=OWNER_GATEWAY_SESSION,
@@ -340,7 +343,10 @@ def test_coordinator_max_workers_overrides_max_background_tasks() -> None:
 @pytest.mark.usefixtures("worker_tool_policy")
 def test_make_run_agent_handler_uses_authenticated_worker_bind() -> None:
   runner = _StubRunner()
-  resolver = _CapabilityResolver()
+  resolver = stub_capability_execution_resolver(
+    default_provider="anthropic", default_model="claude-opus-5",
+  )
+  runner.capability_execution = resolver.resolve("session.driver")
   handler = make_run_agent_handler(
     [runner],
     parent_session=OWNER_GATEWAY_SESSION,

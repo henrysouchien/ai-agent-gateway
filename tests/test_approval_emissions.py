@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import sys
 from pathlib import Path
@@ -126,6 +127,7 @@ def _dispatcher(
   on_headless_ask=None,
 ) -> ToolDispatcher:
   return ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"write_file": _ok_handler},
     role="owner",
@@ -282,6 +284,7 @@ def test_lifecycle_approval_request_times_out_without_user_response(monkeypatch,
       role="owner",
     )
     dispatcher = ToolDispatcher(
+      capability_bind=TEST_CAPABILITY_BIND,
       mcp_client=_NullMcpClient(),
       local_tool_handlers={"write_file": _ok_handler},
       role=session.role,
@@ -359,6 +362,7 @@ def test_lifecycle_user_denial_emits_ordinary_provenance_and_error(tmp_path: Pat
       role="owner",
     )
     dispatcher = ToolDispatcher(
+      capability_bind=TEST_CAPABILITY_BIND,
       mcp_client=_NullMcpClient(),
       local_tool_handlers={"write_file": _ok_handler},
       role=session.role,
@@ -503,6 +507,7 @@ def _background_child_dispatcher(
   )
   policy = SingleUserApprovalPolicy(store=store)
   dispatcher = _ClassifiedToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={tool_name: _handler},
     role=session.role,

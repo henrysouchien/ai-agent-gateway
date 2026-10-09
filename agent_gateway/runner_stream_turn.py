@@ -99,7 +99,7 @@ class RunnerStreamTurnMixin:
       self,
       config: Dict[str, Any],
       refreshed: Dict[str, Any],
-    ) -> None: ...
+    ) -> bool: ...
 
     def _build_usage_event(
       self,
@@ -735,8 +735,7 @@ class RunnerStreamTurnMixin:
           # model is untouched, so a spent credential costs one attempt of this
           # turn instead of the run.
           rotated_config = self._provider.next_credential(config, credential_failure)
-          if rotated_config is not None:
-            self._apply_refreshed_auth_config(config, rotated_config)
+          if rotated_config is not None and self._apply_refreshed_auth_config(config, rotated_config):
             usage_totals.clear()
             usage_totals.update(usage_before_attempt)
             stream_error = RuntimeError(f"credential rotated after {credential_failure.kind}")

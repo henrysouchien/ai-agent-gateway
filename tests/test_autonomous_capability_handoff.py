@@ -1499,7 +1499,10 @@ def test_admitted_node_binding_signs_projects_persists_and_resumes(monkeypatch, 
     assert envelope.bind == bind
     assert "FMP_API_KEY" not in environment
     assert environment["PYTHONUNBUFFERED"] == "1"
-    assert environment["AGENT_SESSION_LOG_BASE_DIR"]
+    session_log_authority = envelope.workload.session_log_authority
+    assert session_log_authority is not None
+    assert environment["AGENT_SESSION_LOG_BASE_DIR"] == session_log_authority.base_path
+    assert environment["AGENT_SESSION_LOG_LAYOUT"] == session_log_authority.layout
   record = restored._tasks[resumed["task_id"]]
   assert record.capability_bind == bind
   assert record.admitted_context == admitted.wire
@@ -1513,6 +1516,7 @@ def test_binding_rejects_bind_differing_from_admitted_context() -> None:
   bind = _bind(run_mode="autonomous")
   with pytest.raises(ValueError, match="does not match admitted context"):
     replace(_service_binding(bind), admitted=_admitted(bind.model_copy(update={"capability_id": "node.verify"})))
+
 
 
 def test_binding_resolver_rejects_different_required_node_bind() -> None:

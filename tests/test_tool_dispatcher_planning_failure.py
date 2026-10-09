@@ -10,6 +10,7 @@ runner renamed it ``internal_error``, message only; (seq 62) a stored-model
 """
 
 from __future__ import annotations
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
 import sys
@@ -62,6 +63,7 @@ def _unused_validator(*_args: object) -> Mapping[str, Any]:
 
 def _dispatch(exc: Exception, tool_input: dict[str, Any]) -> ToolResult:
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned_write": _RaisingPlannedHandler(exc)},
@@ -125,6 +127,7 @@ class _RaisingLocalTool:
 
 def _dispatch_local(exc: Exception, tool_input: dict[str, Any]) -> ToolResult:
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"local_write": _RaisingLocalTool(exc)},

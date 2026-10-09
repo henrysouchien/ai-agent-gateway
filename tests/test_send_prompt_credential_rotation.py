@@ -17,8 +17,8 @@ if str(PKG_DIR) not in sys.path:
 import agent_gateway.providers.anthropic as anthropic_provider_module
 from agent_gateway.providers import StreamEvent
 from agent_gateway.providers.anthropic import AnthropicProvider
-from agent_gateway.providers.anthropic_oauth import AnthropicCredentialPool
-from agent_gateway.send_prompt import send_prompt
+from agent_gateway.providers.anthropic_oauth import AnthropicCredentialPool, resolve_anthropic_credentials
+from agent_gateway.send_prompt import _rotated_execution, send_prompt
 from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
 
 _REFUSED = "sk-ant-oat01-refused-org"
@@ -144,3 +144,46 @@ def test_send_prompt_tries_each_pool_member_once_then_raises_the_provider_reject
     _run(provider)
 
   assert provider.tokens_used == [_REFUSED, _SERVING]
+
+
+@pytest.mark.parametrize("has_generation_metadata", [True, False])
+def test_send_prompt_rotation_names_the_sibling_generation(
+  pool: AnthropicCredentialPool,
+  monkeypatch: pytest.MonkeyPatch,
+  has_generation_metadata: bool,
+) -> None:
+  rejection = _status_error(429, _RATE_LIMIT_BODY)
+  provider = _PoolProvider({_REFUSED: rejection, _SERVING: "answered"})
+  sources = resolve_anthropic_credentials()
+  member_a = sources.by_token(_REFUSED)
+  member_b = sources.by_token(_SERVING)
+  assert member_a is not None and member_b is not None
+  execution = stub_bound_capability_execution(
+    provider=provider,
+    model="claude-sonnet-5",
+    effort="none",
+    credential_ref=member_a.source_metadata()["generation_ref"],
+    auth_config={
+      "auth_mode": "oauth", "auth_token": _REFUSED, "max_tokens": 1024,
+      "credential_source": member_a.source_metadata(),
+    },
+  )
+  if not has_generation_metadata:
+    monkeypatch.setattr(
+      provider, "next_credential", lambda config, failure: {"auth_token": _SERVING},
+    )
+
+  rotated = _rotated_execution(execution, rejection)
+
+  if has_generation_metadata:
+    assert rotated is not None
+    assert rotated.bind.credential_ref == member_b.source_metadata()["generation_ref"]
+    assert rotated.auth_config["auth_token"] == _SERVING
+    assert rotated.bind.to_json() == {
+      **execution.bind.to_json(),
+      "credential_ref": member_b.source_metadata()["generation_ref"],
+    }
+  else:
+    assert rotated is None
+    assert execution.bind.credential_ref == member_a.source_metadata()["generation_ref"]
+    assert execution.auth_config["auth_token"] == _REFUSED

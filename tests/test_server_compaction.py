@@ -1,4 +1,5 @@
 from __future__ import annotations
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
 from dataclasses import replace
@@ -72,10 +73,12 @@ class _NullMcpClient(McpClientManager):
 
 def _make_dispatcher(
   *,
+  capability_bind = TEST_CAPABILITY_BIND,
   event_log: EventLog | None = None,
   local_tool_handlers: dict[str, Any] | None = None,
 ) -> ToolDispatcher:
   return ToolDispatcher(
+    capability_bind=capability_bind,
     mcp_client=_NullMcpClient(),
     local_tool_handlers=local_tool_handlers or {},
     event_log=event_log or EventLog(),
@@ -401,7 +404,7 @@ def _run_runner(
   )
   runner = AgentRunner(
     event_log=log,
-    dispatcher=_make_dispatcher(event_log=log, local_tool_handlers={"lookup": _lookup_tool}),
+    dispatcher=_make_dispatcher(capability_bind=capability_execution.bind, event_log=log, local_tool_handlers={"lookup": _lookup_tool}),
     session_id="sess-portable",
     capability_execution=capability_execution,
     user_id="alice",

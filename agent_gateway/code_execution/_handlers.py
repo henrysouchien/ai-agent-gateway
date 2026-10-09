@@ -22,7 +22,7 @@ from ._config import CodeExecutionConfig
 from ._frame_reader import CatalogMetadata, CodeCallable, FrameReader, SourceExtractor, SourceKey
 from ._helpers import _boolean_input, _prepare_code_execute_env, _string_input, _timeout_ms_input, code_execute
 from ._hooks import strip_code_execute_base64_hook
-from ._provenance import AGENT_CODE_EXECUTE_WORK_DIR_ENV, collect_computation_sidecars, delete_computation_sidecar_dir
+from ._provenance import AGENT_CODE_EXECUTE_WORK_DIR_ENV, collect_native_computations
 from ._tool_defs import make_code_execute_status_tool_def, make_code_execute_tool_def
 
 log = logging.getLogger(__name__)
@@ -200,10 +200,10 @@ def build_code_execution(
     """Redact the child's own bytes before they leave this handler.
 
     A child can print or display a credential read from disk, and errors,
-    sources and sidecars can carry those same bytes. Redact the whole
+    sources and native provenance can carry those same bytes. Redact the whole
     model-visible result, including mapping keys, at this producer boundary.
     """
-    # Admitted sidecars can be deeper than Python's call stack. Project them
+    # Child results can be deeper than Python's call stack. Project them
     # post-order without recursion, preserving containers and mapping keys.
     pending: list[tuple[Any, bool]] = [(result, False)]
     values: list[Any] = []
@@ -387,12 +387,7 @@ def build_code_execution(
     if result is not None:
       result.update(_backend_identity(host, backend))
       result.update(cell.summary())
-    if result is not None and tool_ctx is not None:
-      collect_computation_sidecars(
-        result,
-        work_dir=work_dir,
-        tool_call_id=getattr(tool_ctx, "tool_call_id", None),
-      )
+      collect_native_computations(result)
     return _redact_execution_output(result, redact), error
 
   async def _handle_code_execute_status(tool_input: Dict[str, Any], **kwargs: Any):
@@ -430,16 +425,11 @@ def build_code_execution(
         if task._terminated:
           session.background_tasks.pop(task_id, None)
         if isinstance(result, dict):
-          collect_computation_sidecars(
-            result,
-            work_dir=task.handle.work_dir,
-            tool_call_id=task.tool_call_id,
-          )
+          collect_native_computations(result)
         return _redact_execution_output(result, redact), None
       await task.safe_cancel(backend)
       if task._terminated:
         session.background_tasks.pop(task_id, None)
-      delete_computation_sidecar_dir(task.handle.work_dir, task.tool_call_id)
       return {"status": "cancelled", "task_id": task_id}, None
 
     if poll_result.get("status") == "completed" or _handle_has_exited(task.handle):
@@ -447,11 +437,7 @@ def build_code_execution(
       if task._terminated:
         session.background_tasks.pop(task_id, None)
       if isinstance(result, dict):
-        collect_computation_sidecars(
-          result,
-          work_dir=task.handle.work_dir,
-          tool_call_id=task.tool_call_id,
-        )
+        collect_native_computations(result)
       return _redact_execution_output(result, redact), None
 
     stdout_tail = task.stdout_buf.tail(20) or str(poll_result.get("stdout_tail") or "")

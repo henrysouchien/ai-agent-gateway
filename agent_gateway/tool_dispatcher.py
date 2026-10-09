@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 import asyncio
 import copy
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import AbstractSet, Any, Callable, cast, Dict, get_args, Mapping, Optional, Protocol, Sequence, TYPE_CHECKING, TypeGuard
 
 from pydantic import ValidationError
+from model_authority.bind import CapabilityBind
 
 from agent_workflow_contracts.tool_registration import (
   RegisteredToolIdentity,
@@ -23,6 +25,8 @@ from agent_workflow_contracts.tool_registration import (
 )
 
 from .admission import ParentContext
+from . import admission
+from .providers.anthropic_oauth import is_anthropic_generation_ref
 from . import approval_settings
 from .approval_policy import (
   ApprovalConstraint,
@@ -257,6 +261,14 @@ def _scope_text(value: Any) -> str | None:
   return value if value.strip() else None
 
 
+@dataclass(frozen=True)
+class _SpawningTurn:
+  """The admitted scope a fork keeps from the turn that spawned it."""
+
+  context: ParentContext | None
+  root_turn: admission.RootTurnAdmission | None
+
+
 class _BoundaryEventLogProjection:
   """Sanitize dispatcher-owned durable events while preserving log reads."""
 
@@ -328,8 +340,11 @@ class ToolDispatcher:
     redaction_context_factory: (
       Callable[[ToolRegistrationDeclaration], object | None] | None
     ) = None,
+    *,
+    capability_bind: CapabilityBind,
   ) -> None:
     self._mcp = mcp_client
+    self._capability_bind = capability_bind
     self._local = local_tool_handlers or {}
     self._plan_validator = plan_validator
     self._plan_review_renderer = plan_review_renderer
@@ -469,6 +484,7 @@ class ToolDispatcher:
       channel = identity.channel
       credentials_resolver_active = identity.credentials_resolver_active
     self._identity = identity
+    self._spawning_turn: _SpawningTurn | None = None
     self._execution_identity = (
       identity.execution if identity is not None else None
     )
@@ -529,6 +545,22 @@ class ToolDispatcher:
 
     return route_policy(self._approval_route)
 
+  def replace_capability_bind(self, bind: CapabilityBind) -> None:
+    """Use the runner's current credential bind for subsequent tool captures."""
+    current = self._capability_bind
+    if (
+      bind.capability_id != current.capability_id
+      or bind.run_mode != current.run_mode
+      or bind.credential_principal != current.credential_principal
+    ):
+      raise ValueError("replacement capability bind changes execution authority")
+    self._capability_bind = bind
+
+  def local_tool_handlers(self) -> Mapping[str, LocalToolHandler]:
+    """The configured local handlers, as rebound for the current job."""
+
+    return self._local
+
   def bind_secret_boundary(self, boundary: SecretBoundary) -> None:
     """Bind lifecycle-local secret knowledge supplied by the owning runner."""
 
@@ -575,11 +607,20 @@ class ToolDispatcher:
     """Product review projection inherited with its plan validator."""
     return self._plan_review_renderer
 
+  def capture_spawning_turn(self) -> _SpawningTurn:
+    """Capture the submitting turn before a fork worker can be scheduled."""
+    return _SpawningTurn(
+      context=self._executing_context(),
+      root_turn=self._executing_root_turn(),
+    )
+
   def fork_child(
     self,
     *,
     event_log: EventLog,
     session_id: str,
+    capability_bind: CapabilityBind,
+    spawning_turn: _SpawningTurn,
     local_handler_scopes: Mapping[
       str, Callable[[LocalToolHandler], LocalToolHandler]
     ] | None = None,
@@ -591,7 +632,13 @@ class ToolDispatcher:
     ``local_handler_scopes`` entry replaces that stock local handler with
     ``scope(stock)``. A fork narrows what its parent already dispatches
     locally; it never adds a route the parent lacks, so a missing stock
-    handler raises ``KeyError``.
+    handler raises ``KeyError``. The clone keeps the spawning turn's admitted
+    job context and root-turn admission: a later turn on the same session
+    moves the session's, never the fork's.
+    An independently admitted child identity takes precedence over that
+    inherited scope and never links its calls to the parent's root turn.
+    The fork dispatcher carries the bind of the execution the fork runs,
+    so a rotation re-binds runner and dispatcher as one object.
     """
 
     local = dict(self._local)
@@ -604,7 +651,9 @@ class ToolDispatcher:
     clone._local = local
     clone._event_log = event_log
     clone._session_id = session_id
+    clone._capability_bind = capability_bind
     clone._boundary_event_log = _BoundaryEventLogProjection(clone)
+    clone._spawning_turn = spawning_turn
     return clone
 
   def _append_event(self, event: dict[str, Any]) -> Any | None:
@@ -1470,6 +1519,41 @@ class ToolDispatcher:
   ) -> ToolResult:
     """Dispatch one exact prepared call without executing preparation again."""
 
+    return await self._dispatch_prepared_with_approval(
+      tool_call_id,
+      tool_name,
+      prepared_call,
+      call_index=call_index,
+      advertised_tool_names=advertised_tool_names,
+      abort_event=abort_event,
+      skill_run_id=skill_run_id,
+      step_id=step_id,
+      workspace_dir=workspace_dir,
+      batch_id=batch_id,
+      capture_readable_resource_snapshot=capture_readable_resource_snapshot,
+      allow_uncertain_mcp_replay=allow_uncertain_mcp_replay,
+      on_executed_prepared_call=on_executed_prepared_call,
+    )
+
+  async def _dispatch_prepared_with_approval(
+    self,
+    tool_call_id: str,
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+    *,
+    call_index: int,
+    advertised_tool_names: AbstractSet[str] | None,
+    abort_event: asyncio.Event | None,
+    skill_run_id: str | None,
+    step_id: str | None,
+    workspace_dir: str | None,
+    batch_id: int | str | None,
+    capture_readable_resource_snapshot: bool,
+    allow_uncertain_mcp_replay: bool,
+    on_executed_prepared_call: Callable[[PreparedToolCall], None] | None,
+  ) -> ToolResult:
+    """Own and dispatch the original prepared call through native approval."""
+
     if type(prepared_call) is not PreparedToolCall:
       raise TypeError("prepared_call must be an exact PreparedToolCall")
     if type(allow_uncertain_mcp_replay) is not bool:
@@ -1486,6 +1570,8 @@ class ToolDispatcher:
         tool_name,
         prepared_call.materialize_input(),
         call_index=call_index,
+        advertised_tool_names=advertised_tool_names,
+        original_prepared_call=prepared_call,
         abort_event=abort_event,
         skill_run_id=skill_run_id,
         step_id=step_id,
@@ -1535,6 +1621,8 @@ class ToolDispatcher:
     tool_name: str,
     tool_input: Dict[str, Any],
     *,
+    advertised_tool_names: AbstractSet[str] | None,
+    original_prepared_call: PreparedToolCall,
     call_index: int = 0,
     abort_event: asyncio.Event | None = None,
     skill_run_id: str | None = None,
@@ -2098,6 +2186,7 @@ class ToolDispatcher:
             **approval_args_redacted,
             "planned_change": trusted_plan.approval_review(),
           }
+        execution_context = self._executing_context()
         lifecycle = (
           {
             "approved": True,
@@ -2108,6 +2197,34 @@ class ToolDispatcher:
           }
           if skip_approval_lifecycle
           else await self._run_approval_lifecycle(
+            executable_capture=_approval_lifecycle_helpers.ExecutableCapture(
+              prepared_call=original_prepared_call,
+              dispatch_context={
+                "call_index": call_index,
+                "advertised_tool_names": (
+                  sorted(advertised_tool_names)
+                  if advertised_tool_names is not None else None
+                ),
+                "skill_run_id": skill_run_id,
+                "step_id": step_id,
+                "workspace_dir": workspace_dir,
+                "batch_id": batch_id,
+                "capture_readable_resource_snapshot": capture_readable_resource_snapshot,
+                "allow_uncertain_mcp_replay": allow_uncertain_mcp_replay,
+              },
+              job_id=execution_context.job_id if execution_context is not None else None,
+              tenant_storage_id=(
+                execution_context.tenant.storage_id
+                if execution_context is not None and execution_context.tenant is not None
+                else None
+              ),
+              credential_generation_ref=(
+                self._capability_bind.credential_ref
+                if is_anthropic_generation_ref(self._capability_bind.credential_ref)
+                else None
+              ),
+              root_turn=self._executing_root_turn(),
+            ),
             tool_call_id=tool_call_id,
             tool_name=tool_name,
             tool_input=tool_input,
@@ -2454,7 +2571,36 @@ class ToolDispatcher:
                 registered_prepared_call,
               )
             )
+          execution_context = self._executing_context()
           lifecycle = await self._run_approval_lifecycle(
+            executable_capture=_approval_lifecycle_helpers.ExecutableCapture(
+              prepared_call=original_prepared_call,
+              dispatch_context={
+                "call_index": call_index,
+                "advertised_tool_names": (
+                  sorted(advertised_tool_names)
+                  if advertised_tool_names is not None else None
+                ),
+                "skill_run_id": skill_run_id,
+                "step_id": step_id,
+                "workspace_dir": workspace_dir,
+                "batch_id": batch_id,
+                "capture_readable_resource_snapshot": capture_readable_resource_snapshot,
+                "allow_uncertain_mcp_replay": allow_uncertain_mcp_replay,
+              },
+              job_id=execution_context.job_id if execution_context is not None else None,
+              tenant_storage_id=(
+                execution_context.tenant.storage_id
+                if execution_context is not None and execution_context.tenant is not None
+                else None
+              ),
+              credential_generation_ref=(
+                self._capability_bind.credential_ref
+                if is_anthropic_generation_ref(self._capability_bind.credential_ref)
+                else None
+              ),
+              root_turn=self._executing_root_turn(),
+            ),
             tool_call_id=tool_call_id,
             tool_name=tool_name,
             tool_input=tool_input,
@@ -2791,10 +2937,12 @@ class ToolDispatcher:
               return None, investment_capability_claim_unavailable_error(
                 subject=f"tool '{lifecycle_tool_name}'",
               )
+          executing_context = self._executing_context()
           try:
             meta["investment_capability_claim"] = (
               issue_investment_capability_claim(
                 user_id=str(resolved_risk_user_id or ""),
+                tenant=executing_context.tenant if executing_context is not None else None,
                 session_id=str(self._session_id or run_context.session_id or ""),
                 skill_run_id=str(skill_run_id or ""),
                 channel=str(self._channel or run_context.channel or ""),
@@ -3131,6 +3279,7 @@ class ToolDispatcher:
   async def _run_approval_lifecycle(
     self,
     *,
+    executable_capture: _approval_lifecycle_helpers.ExecutableCapture | None,
     tool_call_id: str,
     tool_name: str,
     tool_input: Dict[str, Any],
@@ -3155,6 +3304,7 @@ class ToolDispatcher:
       route=self._approval_route,
       session=route_session(self._approval_route),
       producer_session=self._session,
+      executable_capture=executable_capture,
       tool_call_id=tool_call_id,
       tool_name=tool_name,
       tool_input=tool_input,
@@ -3209,6 +3359,7 @@ class ToolDispatcher:
       route=self._approval_route,
       session=route_session(self._approval_route),
       producer_session=self._session,
+      executable_capture=None,
       tool_call_id=tool_call_id,
       tool_name=declaration.identity.logical_name,
       tool_input=tool_input,
@@ -3266,9 +3417,22 @@ class ToolDispatcher:
     """Read this execution's admitted context without deriving missing scope."""
     if self._identity is not None:
       return self._identity.context
+    if self._spawning_turn is not None:
+      return self._spawning_turn.context
     if self._session is not None:
       return self._session.admitted_job_context
     return None
+
+  def _executing_root_turn(self) -> admission.RootTurnAdmission | None:
+    """Read root admission only for this session's non-child execution."""
+    if self._identity is not None:
+      return None
+    if self._spawning_turn is not None:
+      return self._spawning_turn.root_turn
+    ctx = self._executing_context()
+    if ctx is None or ctx.children is not None:
+      return None
+    return admission.current_root_turn(self._session)
 
   def _resolve_run_context(self) -> RunContext:
     return _approval_lifecycle_helpers.resolve_run_context(

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
 from dataclasses import replace
@@ -154,6 +155,7 @@ def test_policy_cannot_offer_persistence_without_authorizing_it(
 
 def test_resume_cannot_change_approval_reuse_identity(tmp_path: Any) -> None:
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NoMcp(),
     approval_route=DurableLocalApprovalRoute(
       SQLiteApprovalStore(tmp_path / "approvals.sqlite3"),
@@ -168,6 +170,7 @@ def test_resume_cannot_change_approval_reuse_identity(tmp_path: Any) -> None:
       tool_call_id="call-resume",
       tool_name="registered_write",
       tool_input={"ticker": "AAPL"},
+      executable_capture=None,
       qualifier="",
       reason="",
       allow_persistent=False,
@@ -312,6 +315,7 @@ def test_dynamic_ask_disables_registered_exact_reuse() -> None:
     return tool_input, None
 
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NoMcp(),
     local_tool_handlers={"registered_write": handler},
     needs_approval=lambda *_args: True,

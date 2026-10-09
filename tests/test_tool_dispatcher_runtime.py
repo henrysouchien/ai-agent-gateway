@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import sys
 from pathlib import Path
@@ -159,6 +160,7 @@ def test_runtime_normalizes_needs_approval_arities() -> None:
 def test_tool_dispatcher_forwards_the_exact_replay_control_to_every_client() -> None:
   strict = _ReplayControlledMcpClient()
   strict_dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=strict,
     local_tool_handlers={},
     role="owner",
@@ -167,6 +169,7 @@ def test_tool_dispatcher_forwards_the_exact_replay_control_to_every_client() -> 
   )
   kwargs_only = _ScopedCorpusMcpClient()
   kwargs_dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=kwargs_only,
     local_tool_handlers={},
     role="owner",
@@ -204,6 +207,7 @@ def test_tool_dispatcher_forwards_the_exact_replay_control_to_every_client() -> 
 
 def test_dispatcher_adds_argument_guidance_to_direct_mcp_validation_errors() -> None:
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_ValidationErrorMcpClient(),
     local_tool_handlers={},
     role="owner",
@@ -228,6 +232,7 @@ def test_dispatcher_adds_argument_guidance_to_direct_mcp_validation_errors() -> 
 
 def test_dispatcher_does_not_add_argument_guidance_to_non_validation_mcp_errors() -> None:
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NonValidationErrorMcpClient(),
     local_tool_handlers={},
     role="owner",
@@ -251,6 +256,7 @@ def test_dispatcher_does_not_add_argument_guidance_to_non_validation_mcp_errors(
 
 def test_dispatcher_uses_original_tool_name_for_prefixed_mcp_argument_guidance() -> None:
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_ValidationErrorMcpClient(
       exposed_name="portfolio_get_price_target",
       original_name="get_price_target",
@@ -282,6 +288,7 @@ def test_call_mcp_tool_forwards_invocation_report_unchanged(monkeypatch, cancell
     manager = McpClientManager(config_path=None)
     report = McpInvocationReport(certainty="settled")
     dispatcher = ToolDispatcher(
+      capability_bind=TEST_CAPABILITY_BIND,
       mcp_client=manager,
       local_tool_handlers={},
       role="owner",

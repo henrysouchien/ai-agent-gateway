@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 
 from __future__ import annotations
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
 import base64
@@ -215,6 +216,7 @@ def _dispatcher(
     ),
   )
   return ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     session_id="session-123",
     user_id="sia-alice",
@@ -379,6 +381,7 @@ def test_claim_grant_is_the_bound_skill_declaration(
   })
   inputs: dict[str, Any] = {
     "user_id": "42",
+    "tenant": _TENANT,
     "session_id": "session-123",
     "skill_run_id": "skill-run-123",
     "channel": "excel",
@@ -423,6 +426,7 @@ def test_market_scan_claim_is_exact_and_has_no_quant_budget_or_origin(
 
   token = issue_investment_capability_claim(
     user_id="42",
+    tenant=_TENANT,
     session_id="session-123",
     skill_run_id="skill-run-123",
     channel="excel",
@@ -482,6 +486,7 @@ def test_cross_skill_submission_tools_fail_closed_before_signing(
   ):
     issue_investment_capability_claim(
       user_id="42",
+      tenant=_TENANT,
       session_id="session-123",
       skill_run_id="skill-run-123",
       channel="excel",
@@ -502,6 +507,7 @@ def test_claim_is_canonical_signed_short_lived_and_exactly_bound(
 
   token = issue_investment_capability_claim(
     user_id="42",
+    tenant=_TENANT,
     session_id="session-123",
     skill_run_id="skill-run-123",
     channel="excel",
@@ -836,6 +842,7 @@ def test_quant_claim_rejects_missing_or_malformed_trusted_research_origin(
   ):
     issue_investment_capability_claim(
       user_id="42",
+      tenant=_TENANT,
       session_id="session-123",
       skill_run_id="skill-run-123",
       channel="excel",
@@ -927,6 +934,7 @@ def test_quant_claim_signs_the_admitted_budget_numbers_present(
 
   token = issue_investment_capability_claim(
     user_id="42",
+    tenant=_TENANT,
     session_id="session-123",
     skill_run_id="skill-run-123",
     channel="excel",
@@ -1052,6 +1060,7 @@ def test_signed_grant_tampering_invalidates_signature(
   _set_signing_key(monkeypatch)
   token = issue_investment_capability_claim(
     user_id="42",
+    tenant=_TENANT,
     session_id="session-123",
     skill_run_id="skill-run-123",
     channel="excel",
@@ -1116,6 +1125,7 @@ def test_private_key_validation_error_never_echoes_key_material(
   with pytest.raises(InvestmentCapabilityClaimError) as exc_info:
     issue_investment_capability_claim(
       user_id="42",
+      tenant=_TENANT,
       session_id="session-123",
       skill_run_id="skill-run-123",
       channel="excel",
@@ -1149,6 +1159,7 @@ def test_legacy_shared_secret_and_public_key_cannot_enable_signing(
   with pytest.raises(InvestmentCapabilityClaimError):
     issue_investment_capability_claim(
       user_id="42",
+      tenant=_TENANT,
       session_id="session-123",
       skill_run_id="skill-run-123",
       channel="excel",
@@ -1177,6 +1188,7 @@ def test_claim_rejects_fields_the_server_cannot_accept(
   _set_signing_key(monkeypatch)
   inputs = {
     "user_id": "42",
+    "tenant": _TENANT,
     "session_id": "session-123",
     "skill_run_id": "skill-run-123",
     "channel": "excel",
@@ -1316,6 +1328,7 @@ def test_sessionless_job_dispatch_returns_typed_issuer_unavailable(
   configure_investment_capability_grants({})
   mcp = _FakeMcpClient(tool_name=tool_name)
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     session=None,
     session_id="sessionless-request",
@@ -1335,6 +1348,43 @@ def test_sessionless_job_dispatch_returns_typed_issuer_unavailable(
   )
   result, error = _dispatch(
     dispatcher, tool_call_id="call-sessionless-job", tool_name=tool_name,
+  )
+  assert result is None
+  assert error is not None
+  assert error["code"] == "investment_capability_claim_unavailable"
+  assert mcp.calls == []
+
+
+@pytest.mark.parametrize("tool_name", sorted(INVESTMENT_JOB_PRINCIPAL_TOOLS))
+def test_uncaptured_session_returns_typed_job_principal_gap(
+  monkeypatch: pytest.MonkeyPatch,
+  tool_name: str,
+) -> None:
+  _set_signing_key(monkeypatch)
+  mcp = _FakeMcpClient(tool_name=tool_name)
+  session = GatewaySession(
+    session_id="uncaptured-session",
+    api_key_hash="test-api-key-hash",
+    created_at=1_800_000_000,
+    expires_at=1_800_000_600,
+    user_id=_TENANT.storage_id,
+    risk_user_id=42,
+    channel="excel",
+    role="owner",
+  )
+  dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
+    mcp_client=mcp,
+    session=session,
+    session_id=session.session_id,
+    user_id=session.user_id,
+    risk_user_id=session.risk_user_id,
+    channel="excel",
+    role="owner",
+    mcp_meta_inject_servers=frozenset({"idea-workbench-mcp"}),
+  )
+  result, error = _dispatch(
+    dispatcher, tool_call_id="call-uncaptured-job", tool_name=tool_name,
   )
   assert result is None
   assert error is not None
@@ -1397,6 +1447,7 @@ def test_sessionless_dispatch_identity_retains_actual_admitted_tenant(
   )
   mcp = _FakeMcpClient(tool_name=tool_name)
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
     identity=identity,
     session_id="sessionless-request",
@@ -1528,6 +1579,7 @@ def test_in_process_child_context_precedes_parent_credential_session(
     channel="excel",
   )
   child_dispatcher = ToolDispatcher(
+    capability_bind=admitted.wire.capability_bind,
     mcp_client=mcp,
     identity=identity,
     session_id=parent_session.session_id,
@@ -1561,3 +1613,24 @@ def test_in_process_child_context_precedes_parent_credential_session(
   assert payload["sub"] == "42"
   assert payload["tool_name"] == tool_name
   assert current_parent_context(parent_session).job_id == "agent-run-123"
+
+
+
+def test_claim_requires_explicit_authenticated_tenant(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _set_signing_key(monkeypatch)
+  with pytest.raises(InvestmentCapabilityClaimError, match="authenticated tenant"):
+    issue_investment_capability_claim(
+      user_id="42",
+      tenant=None,
+      session_id="session-123",
+      skill_run_id="skill-run-123",
+      channel="excel",
+      tool_name="get_investment_run",
+      request_id="request-123",
+      jti="tool-call-123",
+      skill="market-scan",
+      admitted_skill_execution_limits=_limits_for_skill("market-scan"),
+      policy_bundle_hash=_POLICY_BUNDLE_HASH,
+    )

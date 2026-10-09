@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 
 from __future__ import annotations
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import sys
 from pathlib import Path
@@ -66,6 +67,7 @@ def test_tool_dispatcher_skill_tool_wrapper_preserves_parent_current_skill_seam(
     gateway_local_skill_tools={"skill_name": "patched-skill", "handlers": {"dynamic_tool": _handler}}
   )
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={},
     session=session,

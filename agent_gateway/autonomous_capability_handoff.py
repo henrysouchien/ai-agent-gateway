@@ -102,12 +102,12 @@ class AutonomousCapabilityBinding:
   def __post_init__(self) -> None:
     if not isinstance(self.bind, CapabilityBind):
       raise TypeError("autonomous capability binding bind must be CapabilityBind")
-    if self.admitted is not None and self.bind != self.admitted.wire.capability_bind:
-      raise ValueError("autonomous capability binding does not match admitted context")
     if self.bind.run_mode not in {"autonomous", "cron"}:
       raise ValueError(
         "autonomous capability binding requires autonomous or cron run mode"
       )
+    if self.admitted is not None and self.bind != self.admitted.wire.capability_bind:
+      raise ValueError("autonomous capability binding does not match admitted context")
     materialized = self.materialized_credential
     if not isinstance(materialized, MaterializedCredential):
       raise ValueError(
@@ -203,10 +203,7 @@ async def resolve_autonomous_capability_binding(
     )
   if request.required_bind is not None and resolved.bind != request.required_bind:
     raise ValueError("resume capability binding does not match the persisted exact bind")
-  if resolved.admitted is not None:
-    if resolved.bind != resolved.admitted.wire.capability_bind:
-      raise ValueError("autonomous capability binding does not match admitted context")
-  elif request.required_bind is None and resolved.bind.capability_id != SESSION_DRIVER_CAPABILITY:
+  if resolved.admitted is None and request.required_bind is None and resolved.bind.capability_id != SESSION_DRIVER_CAPABILITY:
     raise ValueError("unadmitted autonomous capability binding requires a session.driver bind")
   return resolved
 

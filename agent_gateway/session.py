@@ -15,6 +15,7 @@ import jwt
 from fastapi import HTTPException
 
 from agent_workflow_contracts import WorkflowContentPage
+from agent_workflow_contracts.models import AdmittedTenant
 
 from .approval_route import NO_APPROVAL_ROUTE, ApprovalRoute
 from model_authority.binding import (
@@ -29,8 +30,10 @@ from .event_log import EventLog, log_has_terminal
 from .mcp_activation import McpActivationFold
 from .session_event_history import SessionEventHistory
 from .session_capabilities import normalize_session_capabilities
+from .policy_imports import require_inherited_role
 
 if TYPE_CHECKING:
+  from .admission import ParentContext
   from .agent_session_log import AgentSessionLog, AgentSessionLogLocation
   from .agent_session_log_layout import AutonomousSessionLogAuthority
   from .approval_audit import ApprovalAuditEmitter
@@ -249,6 +252,7 @@ class GatewaySession:
   # `approval_policy` below are a projection of this route written only by
   # admission; no consumer may test them to infer the run's authority.
   approval_route: ApprovalRoute = NO_APPROVAL_ROUTE
+  admitted_job_context: ParentContext | None = field(default=None, repr=False, compare=False)
   approval_store: Any | None = None
   approval_policy: Any | None = None
   approval_expire_pending_task: asyncio.Task[Any] | None = None
@@ -347,6 +351,33 @@ class GatewaySession:
     """Whether a chat turn or an admitted batch is running on this session."""
 
     return self.turn_in_progress or bool(self.admitted_batches)
+
+
+def child_gateway_session(
+  parent: GatewaySession,
+  *,
+  session_id: str,
+  tenant: AdmittedTenant | None,
+  auth_config: Mapping[str, Any],
+  user_id: str,
+  user_email: str | None,
+) -> GatewaySession:
+  """Mint a child session from admitted tenancy and materialized child auth."""
+  return GatewaySession(
+    session_id=session_id,
+    api_key_hash=parent.api_key_hash,
+    created_at=parent.created_at,
+    expires_at=parent.expires_at,
+    user_id=user_id,
+    user_email=user_email,
+    risk_user_id=parent.risk_user_id,
+    owner_user_id=tenant.storage_id if tenant is not None else None,
+    role=tenant.role if tenant is not None else require_inherited_role(parent),
+    auth_config=dict(auth_config),
+    channel=parent.channel,
+    is_public=parent.is_public,
+    tenant_id=tenant.tenant_id if tenant is not None else None,
+  )
 
 
 def session_ttl_elapsed(

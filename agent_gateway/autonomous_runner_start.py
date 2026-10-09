@@ -5,6 +5,7 @@ import fcntl
 import functools
 import json
 import os
+from collections import ChainMap
 from datetime import datetime, timezone
 from pathlib import Path
 import signal
@@ -252,10 +253,6 @@ def _positive_autonomous_child_env(
       if type((value := environ.get(name))) is str
     }
   )
-  if env_projection is not None:
-    for name in ("AGENT_SESSION_LOG_BASE_DIR", SESSION_LOG_LAYOUT_ENV):
-      if type((value := environ.get(name))) is str:
-        projected[name] = value
   projected.update({
     name: value
     for name in provider_env_names
@@ -1656,20 +1653,8 @@ class AutonomousRegistryStartMixin:
       except Exception as exc:
         raise RuntimeError(f"autonomous spill directory setup failed: {exc}") from exc
 
-      env = _positive_autonomous_child_env(
-        os_module.environ,
-        provider=capability_binding.bind.provider,
-        profile=record.profile,
-        deliver=record.deliver,
-        env_projection=(
-          admitted_context.env_projection if admitted_context is not None else None
-        ),
-      )
-      for retired_name in _RETIRED_AUTONOMOUS_CHILD_ENV_NAMES:
-        env.pop(retired_name, None)
-      env["PYTHONUNBUFFERED"] = "1"
       session_log_base_dir = str(
-        env.get("AGENT_SESSION_LOG_BASE_DIR", "") or ""
+        os_module.environ.get("AGENT_SESSION_LOG_BASE_DIR", "") or ""
       ).strip()
       if not session_log_base_dir:
         raise RuntimeError(
@@ -1682,22 +1667,40 @@ class AutonomousRegistryStartMixin:
         )
       prepared_session_log = prepare_autonomous_session_log(
         base_dir=session_log_base_dir,
-        layout=resolve_agent_session_log_layout(env),
+        layout=resolve_agent_session_log_layout(os_module.environ),
         tenant=tenant_id,
         owner=record.owner_user_id or record.user_id,
         workload_profile=record.profile,
         provider=capability_binding.bind.provider,
         provider_session_epoch=(
-          env.get("OPENAI_SESSION_EPOCH")
+          os_module.environ.get("OPENAI_SESSION_EPOCH")
           if capability_binding.bind.provider == "openai"
           else None
         ),
         now_iso=lambda: datetime.now(timezone.utc).isoformat(),
       )
-      env["AGENT_SESSION_LOG_BASE_DIR"] = (
-        prepared_session_log.authority.base_path
+      # Session-log authority is a launch input, registered by child_environment,
+      # not an exception applied after the admitted environment projection.
+      session_log_inputs = filter_child_environment(
+        {
+          "AGENT_SESSION_LOG_BASE_DIR": prepared_session_log.authority.base_path,
+          SESSION_LOG_LAYOUT_ENV: prepared_session_log.authority.layout,
+        },
+        purpose=AUTONOMOUS_CHILD_ENVIRONMENT,
       )
-      env[SESSION_LOG_LAYOUT_ENV] = prepared_session_log.authority.layout
+      env = _positive_autonomous_child_env(
+        ChainMap(session_log_inputs, os_module.environ),
+        provider=capability_binding.bind.provider,
+        profile=record.profile,
+        deliver=record.deliver,
+        env_projection=(
+          admitted_context.env_projection + tuple(session_log_inputs)
+          if admitted_context is not None else None
+        ),
+      )
+      for retired_name in _RETIRED_AUTONOMOUS_CHILD_ENV_NAMES:
+        env.pop(retired_name, None)
+      env["PYTHONUNBUFFERED"] = "1"
       if prepared_session_log.authority.layout == SESSION_LOG_LAYOUT_V2:
         env[SESSION_LOG_ROOT_FD_ENV] = str(
           prepared_session_log.root_fd

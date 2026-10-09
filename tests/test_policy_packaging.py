@@ -76,6 +76,25 @@ sys.path.insert(0, str(installed))
 import agent_gateway
 from agent_gateway import ToolDispatcher
 from agent_gateway import policy_imports
+from model_authority.bind import CapabilityBind
+
+TEST_CAPABILITY_BIND = CapabilityBind(
+  schema_version="1.0",
+  capability_id="session.driver",
+  model_key="anthropic.test-autonomous",
+  provider="anthropic",
+  upstream_model="claude-test",
+  adapter="anthropic.messages",
+  protocol_profile="messages.standard",
+  route="anthropic.public",
+  effort="high",
+  credential_principal="service",
+  credential_ref="autonomous-service:test-handle",
+  run_mode="autonomous",
+  registry_revision="test-registry-1",
+  policy_revision="test-policy-1",
+  selection_source="capability_default",
+)
 
 
 class Mcp:
@@ -107,6 +126,7 @@ async def main():
   outcomes = {}
   for role in ("owner", "invite", None):
     dispatcher = ToolDispatcher(
+      capability_bind=TEST_CAPABILITY_BIND,
       mcp_client=Mcp(),
       local_tool_handlers={"rw_list_studies": handler},
       role=role,
@@ -122,6 +142,7 @@ async def main():
     outcomes[str(role)] = {"result": result, "error": error}
 
   owner_dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=Mcp(),
     local_tool_handlers={"rw_list_studies": handler},
     role="owner",

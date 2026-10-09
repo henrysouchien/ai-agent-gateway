@@ -118,6 +118,9 @@ def _bind(
     selection_source="capability_default",
   )
 
+
+TEST_CAPABILITY_BIND = _bind()
+
 def _credential_handle(
   *,
   tenant_id: str = "tenant-ordinary",

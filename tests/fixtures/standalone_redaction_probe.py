@@ -255,7 +255,9 @@ async def _run_scenario(
     return {"rows": 1}, None
 
   event_log = EventLog(session_id=name)
+  _dispatcher_execution_259 = _execution(_Provider(responses))
   dispatcher = ToolDispatcher(
+    capability_bind=_dispatcher_execution_259.bind,
     mcp_client=_Mcp(),
     local_tool_handlers={TOOL_NAME: handler},
     event_log=event_log,
@@ -270,7 +272,7 @@ async def _run_scenario(
     event_log=event_log,
     dispatcher=dispatcher,
     session_id=name,
-    capability_execution=_execution(_Provider(responses)),
+    capability_execution=_dispatcher_execution_259,
     get_tool_definitions=lambda: [TOOL_DEFINITION],
     user_id="alice",
     billing_mode="byok",

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
 import json
@@ -217,6 +218,7 @@ def _local_dispatcher(
   dispatcher_cls: type[ToolDispatcher] = ToolDispatcher,
 ) -> ToolDispatcher:
   return dispatcher_cls(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NoMcp(),
     local_tool_handlers={declaration.identity.logical_name: local_handler},
     needs_approval=needs_approval,
@@ -355,6 +357,7 @@ def test_registered_dispatcher_requires_redaction_owner_at_construction() -> Non
     match="registered tool catalog requires a redaction context factory",
   ):
     ToolDispatcher(
+      capability_bind=TEST_CAPABILITY_BIND,
       mcp_client=_NoMcp(),
       local_tool_handlers={"registered_write": _local_handler},
       tool_registration_catalog=ToolRegistrationCatalog((declaration,), ()),
@@ -463,6 +466,7 @@ def test_registered_native_mcp_redaction_delegates_to_live_manager_owner() -> No
       return {"credential": "<manager-redaction>"}
 
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_RegisteredMcp(),
     tool_registration_catalog=ToolRegistrationCatalog(
       (declaration,),
@@ -508,6 +512,7 @@ def test_registered_native_mcp_history_redaction_delegates_raw_input() -> None:
       return {"credential": "<manager-redaction>"}
 
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_RegisteredMcp(),
     tool_registration_catalog=ToolRegistrationCatalog(
       (declaration,),
@@ -623,6 +628,7 @@ def test_registered_native_mcp_durable_approval_uses_manager_redaction(
       return {"status": "ok"}, None
 
   dispatcher = _CapturingDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_RegisteredMcp(),
     role="owner",
     needs_approval=lambda *_args: False,
@@ -761,6 +767,7 @@ def test_registered_local_outcome_uses_the_exact_declaration_policy() -> None:
 
 def test_catalogless_dispatcher_preserves_generic_outcome_behavior() -> None:
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NoMcp(),
     local_tool_handlers={"legacy_read": _local_handler},
   )
@@ -818,6 +825,7 @@ def test_registered_mcp_outcome_resolves_exact_exposed_route_with_same_names() -
       return _registered_descriptor(exposed_name, declaration, server)
 
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_RegisteredMcp(),
     tool_registration_catalog=ToolRegistrationCatalog(
       (declaration_a, declaration_b),
@@ -904,6 +912,7 @@ def test_live_registered_mcp_resolves_its_descriptor_not_its_exposed_name() -> N
     return None
 
   dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_RegisteredMcp(),
     needs_approval=lambda *_args: (_ for _ in ()).throw(
       AssertionError("registered calls cannot consult legacy approval policy")

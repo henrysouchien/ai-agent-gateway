@@ -29,6 +29,8 @@ INVESTMENT_CAPABILITY_CLAIM_AUDIENCE: Final = "investment-tools"
 INVESTMENT_CAPABILITY_CLAIM_TTL_SECONDS: Final = 60
 INVESTMENT_CAPABILITY_CLAIM_KEY_BYTES: Final = 32
 INVESTMENT_SELECTED_CONTENT_CLAIM_PURPOSE: Final = "selected_content_read"
+INVESTMENT_CAPABILITY_CLAIM_VERSION: Final = 4
+INVESTMENT_CAPABILITY_CLAIM_KIND: Final = "facade"
 INVESTMENT_JOB_PRINCIPAL_CLAIM_VERSION: Final = 3
 INVESTMENT_JOB_PRINCIPAL_CLAIM_KIND: Final = "job_principal"
 _MAX_ID_CHARS = 256
@@ -251,6 +253,7 @@ def _approved_budget(
 def issue_investment_capability_claim(
   *,
   user_id: str,
+  tenant: AdmittedTenant | None,
   session_id: str,
   skill_run_id: str,
   channel: str,
@@ -265,11 +268,16 @@ def issue_investment_capability_claim(
 ) -> str:
   """Issue the short-lived gateway assertion consumed by investment-tools.
 
-  The model never supplies this payload. The gateway binds authenticated
-  session identity and the exact routed MCP tool immediately before dispatch.
+  The model never supplies this payload. The gateway binds the executing
+  job's admitted tenant and the exact routed MCP tool before dispatch.
+  ``user_id`` is the resolved Risk subject, not the tenant's storage identity.
   """
 
   subject = _required_text(user_id, "user_id")
+  if not isinstance(tenant, AdmittedTenant):
+    raise InvestmentCapabilityClaimError(
+      "investment capability claim requires an authenticated tenant"
+    )
   session = _required_text(session_id, "session_id")
   skill_run = _required_text(skill_run_id, "skill_run_id")
   routed_channel = _required_text(
@@ -439,6 +447,8 @@ __all__ = [
   "INVESTMENT_CAPABILITY_CLAIM_AUDIENCE",
   "INVESTMENT_CAPABILITY_CLAIM_ISSUER",
   "INVESTMENT_CAPABILITY_CLAIM_KEY_BYTES",
+  "INVESTMENT_CAPABILITY_CLAIM_KIND",
+  "INVESTMENT_CAPABILITY_CLAIM_VERSION",
   "INVESTMENT_CAPABILITY_CLAIM_PRIVATE_KEY_ENV",
   "INVESTMENT_CAPABILITY_CLAIM_PUBLIC_KEY_ENV",
   "INVESTMENT_CAPABILITY_CLAIM_SERVER",

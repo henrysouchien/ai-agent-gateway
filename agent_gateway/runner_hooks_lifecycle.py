@@ -11,7 +11,7 @@ from typing import (
   List,
 )
 
-from .capability_execution import BoundCapabilityExecution
+from .capability_execution import BoundCapabilityExecution, CapabilityExecutionResolver
 from .multi_user.billing import (
   BillingMode,
   SessionUsageSummary,
@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
   from .event_log import EventLog
   from .multi_user.billing import _UsageAggregator
+  from .runner_tool_execution import AgentRunnerDispatcher
 
 log = logging.getLogger("agent_gateway.runner")
 
@@ -54,6 +55,7 @@ class RunnerHooksLifecycleMixin:
     _aggregator: _UsageAggregator
     _auth_config: Dict[str, Any]
     _billing_mode: BillingMode
+    _dispatcher: AgentRunnerDispatcher
     _channel: str | None
     _context_surface_records: Callable[[], List[Dict[str, Any]]]
     _full_session_id: str
@@ -147,7 +149,7 @@ class RunnerHooksLifecycleMixin:
       logger=log,
     )
 
-  def _apply_refreshed_auth_config(self, config: Dict[str, Any], refreshed: Dict[str, Any]) -> None:
+  def _apply_refreshed_auth_config(self, config: Dict[str, Any], refreshed: Dict[str, Any]) -> bool:
     execution = getattr(self, "_capability_execution", None)
     if not isinstance(execution, BoundCapabilityExecution):
       raise RuntimeError(
@@ -160,17 +162,19 @@ class RunnerHooksLifecycleMixin:
     if getattr(self, "_rate_table_version", None):
       active_config["rate_table_version"] = self._rate_table_version
     merged = _runner_attr(self, "_merge_refreshed_auth_config", _merge_refreshed_auth_config)(active_config, refreshed)
-    refreshed_execution = BoundCapabilityExecution(
-      bind=execution.bind,
-      registry=execution.registry,
-      adapter=execution.adapter,
-      auth_config=merged,
+    refreshed_execution = CapabilityExecutionResolver.rebind_rotated_credential(
+      execution,
+      refreshed,
+      merged_auth_config=merged,
     )
+    if refreshed_execution is None:
+      return False
     refreshed_run_config = normalized_run_config(
       refreshed_execution.auth_config,
       upstream_model=refreshed_execution.bind.upstream_model,
       effort=refreshed_execution.bind.effort,
     )
+    self._dispatcher.replace_capability_bind(refreshed_execution.bind)
     config.clear()
     config.update(refreshed_run_config)
     self._auth_config.clear()
@@ -192,6 +196,7 @@ class RunnerHooksLifecycleMixin:
     )
     if callable(bind_dispatcher_boundary):
       bind_dispatcher_boundary(self._secret_boundary)
+    return True
 
   @staticmethod
   def _usage_has_tokens(usage_totals: Dict[str, int]) -> bool:

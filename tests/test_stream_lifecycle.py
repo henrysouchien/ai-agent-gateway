@@ -1,4 +1,5 @@
 from __future__ import annotations
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
 import json
@@ -565,6 +566,7 @@ def _install_fake_agent_sdk(monkeypatch: pytest.MonkeyPatch, iterator_factory) -
 
 def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
   return ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_null_mcp_client(),
     local_tool_handlers={},
     event_log=event_log or EventLog(),
@@ -1549,19 +1551,21 @@ def test_credential_rotation_retries_stream_with_new_auth_config(monkeypatch: py
     monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.0)
     provider = _CredentialFailureProvider()
     event_log = EventLog()
+    _dispatcher_execution_1556 = _native_execution(
+            provider,
+            api_key="old-key",
+          )
     runner = AgentRunner(
       event_log=event_log,
       dispatcher=ToolDispatcher(
+        capability_bind=_dispatcher_execution_1556.bind,
         mcp_client=_null_mcp_client(),
         local_tool_handlers={},
         event_log=event_log,
         session_id="sess-refresh",
       ),
       session_id="sess-refresh",
-      capability_execution=_native_execution(
-        provider,
-        api_key="old-key",
-      ),
+      capability_execution=_dispatcher_execution_1556,
       user_id="alice",
       billing_mode="byok",
       rate_table_version="unknown",
@@ -1617,19 +1621,21 @@ def test_merge_refreshed_auth_config_rejects_selection_material() -> None:
 
 def test_runner_apply_refreshed_auth_config_updates_request_and_runner_config() -> None:
   event_log = EventLog()
+  _dispatcher_execution_1625 = _native_execution(
+        _CompletingProvider(),
+        api_key="old-key",
+      )
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=ToolDispatcher(
+      capability_bind=_dispatcher_execution_1625.bind,
       mcp_client=_null_mcp_client(),
       local_tool_handlers={},
       event_log=event_log,
       session_id="sess-refresh",
     ),
     session_id="sess-refresh",
-    capability_execution=_native_execution(
-      _CompletingProvider(),
-      api_key="old-key",
-    ),
+    capability_execution=_dispatcher_execution_1625,
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",

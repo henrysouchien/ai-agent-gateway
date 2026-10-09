@@ -1,6 +1,7 @@
 """ACUI-27: a turn that exhausts max_tokens with no usable tool call must not
 silently end the run — the runner nudges and continues (bounded), and request
 max_tokens is clamped to the model's max_output_tokens."""
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
 import re
@@ -82,21 +83,23 @@ def _make_runner(
   max_tokens_override: int | None = None,
 ) -> AgentRunner:
   event_log = EventLog()
+  _dispatcher_execution_88 = stub_runner_capability_execution(
+        provider=provider,
+        model="stub-model",
+        effort="none",
+        auth_config=auth_config,
+      )
   return AgentRunner(
     event_log=event_log,
     dispatcher=ToolDispatcher(
+      capability_bind=_dispatcher_execution_88.bind,
       mcp_client=_NullMcpClient(),
       local_tool_handlers={},
       event_log=event_log,
       session_id=session_id,
     ),
     session_id=session_id,
-    capability_execution=stub_runner_capability_execution(
-      provider=provider,
-      model="stub-model",
-      effort="none",
-      auth_config=auth_config,
-    ),
+    capability_execution=_dispatcher_execution_88,
     get_tool_definitions=lambda: [],
     max_tokens_override=max_tokens_override,
     agent_session_log=agent_session_log,

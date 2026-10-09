@@ -352,6 +352,7 @@ def test_lifecycle_persistence_failure_emits_no_notification_intent() -> None:
         ),
         session=session,
         producer_session=session,
+        executable_capture=None,
         tool_call_id="tool-1",
         tool_name="execute_trade",
         tool_input={"preview_id": "raw-preview"},

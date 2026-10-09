@@ -1,3 +1,4 @@
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import time
 from pathlib import Path
@@ -107,7 +108,8 @@ def _execution(capability_id: str = "node.explore") -> BoundCapabilityExecution:
 
 
 class _Dispatcher(ToolDispatcher):
-  def __init__(self) -> None:
+  def __init__(self, *, capability_bind = TEST_CAPABILITY_BIND) -> None:
+    self._capability_bind = capability_bind
     self._event_log = EventLog()
     self._session_id = "parent-session"
 
@@ -125,8 +127,9 @@ class _ParentProvider(ModelProvider):
 def _approval_dispatcher(
   parent_session: GatewaySession,
   executing_session: GatewaySession,
-) -> ToolDispatcher:
+*, capability_bind = TEST_CAPABILITY_BIND) -> ToolDispatcher:
   return ToolDispatcher(
+    capability_bind=capability_bind,
     mcp_client=McpClientManager(),
     event_log=EventLog(),
     session_id="parent-session",
@@ -136,7 +139,7 @@ def _approval_dispatcher(
       object(),
       parent_session,
     )),
-    get_tool_definitions=_Dispatcher().get_tool_definitions,
+    get_tool_definitions=_Dispatcher(capability_bind=capability_bind).get_tool_definitions,
   )
 
 
@@ -386,14 +389,15 @@ def _parent(tmp_path: Path, *, session_log: _SessionLog | AgentSessionLog | None
 
 
 def _spawn(parent: AgentRunner, **overrides: Any):
+  capability_execution = overrides['capability_execution'] if 'capability_execution' in overrides else _execution()
   kwargs = {
-    "capability_execution": _execution(),
+    "capability_execution": capability_execution,
     "skill_name": "explore",
     "logical_task": _LOGICAL_TASK,
     "attempt": _ATTEMPT,
     "result_requirement": _RESULT,
     "result_provenance": _PROVENANCE,
-    "dispatcher": _Dispatcher(),
+    "dispatcher": _Dispatcher(capability_bind=capability_execution.bind),
   }
   kwargs.update(overrides)
   child_runner_ref: list[Any] = []
@@ -403,17 +407,18 @@ def _spawn(parent: AgentRunner, **overrides: Any):
 
 
 def _resume(parent: AgentRunner, **overrides: Any):
+  capability_execution = overrides['capability_execution'] if 'capability_execution' in overrides else _execution()
   kwargs = {
     "original_task_id": "task:prior",
     "reconstructed_messages": [{"role": "user", "content": "resume"}],
     "parent_messages": [],
-    "capability_execution": _execution(),
+    "capability_execution": capability_execution,
     "skill_name": "explore",
     "logical_task": _LOGICAL_TASK,
     "attempt": _ATTEMPT,
     "result_requirement": _RESULT,
     "result_provenance": _PROVENANCE,
-    "dispatcher": _Dispatcher(),
+    "dispatcher": _Dispatcher(capability_bind=capability_execution.bind),
   }
   kwargs.update(overrides)
   child_runner_ref: list[Any] = []
@@ -666,14 +671,57 @@ def test_spawn_sub_agent_uses_exact_child_skill_run_identity(
   assert _ChildRunner.instances[0].kwargs["skill_run_id"] == "child-skill-run"
 
 
+class _ActivityClock:
+  def __init__(self) -> None:
+    self.now = 0.0
+    self.guard_poll = asyncio.Event()
+
+  async def wait_for_guard(self) -> None:
+    self.guard_poll.clear()
+    await self.guard_poll.wait()
+
+
+@pytest.fixture
+def _activity_clock(monkeypatch: pytest.MonkeyPatch) -> _ActivityClock:
+  clock = _ActivityClock()
+  virtual_time = SimpleNamespace(**{
+    **vars(time),
+    "monotonic": lambda: clock.now,
+  })
+  # Replace module bindings, not time.monotonic globally: asyncio's scheduler
+  # keeps its real clock, while both liveness guards share frozen virtual time.
+  monkeypatch.setattr(runner_sub_agents, "time", virtual_time)
+  monkeypatch.setattr(gateway_runner, "time", virtual_time)
+  monkeypatch.setattr(runner_stream_turn, "time", virtual_time)
+
+  async def wait_for_child(*args: Any, **kwargs: Any):
+    result = await asyncio.wait(*args, **kwargs)
+    clock.guard_poll.set()
+    # The guard checks activity synchronously after this return, before the
+    # waiting child can resume and advance virtual time again.
+    return result
+
+  monkeypatch.setattr(runner_sub_agents, "asyncio", SimpleNamespace(**{
+    **vars(asyncio),
+    "wait": wait_for_child,
+  }))
+  for child_cls in (
+    _WedgedChildRunner, _HeartbeatOnlyChildRunner, _ToolInFlightChildRunner,
+  ):
+    monkeypatch.setattr(child_cls, "activity_clock", clock, raising=False)
+  return clock
+
+
 class _WedgedChildRunner(_ChildRunner):
   """A child whose inner await never resolves and that emits nothing."""
 
   cancelled = False
+  activity_clock: _ActivityClock
 
   async def run(self, **kwargs: object) -> None:
     self.run_kwargs = kwargs
     try:
+      self.activity_clock.now += 0.1
       await asyncio.Event().wait()
     except asyncio.CancelledError:
       self.cancelled = True
@@ -684,17 +732,19 @@ class _HeartbeatOnlyChildRunner(_ChildRunner):
   """A live child whose only events, past the gap, are stream heartbeats."""
 
   cancelled = False
+  activity_clock: _ActivityClock
 
   async def run(self, **kwargs: object) -> None:
     try:
       for _ in range(10):
-        await asyncio.sleep(0.02)
+        self.activity_clock.now += 0.02
         self.kwargs["event_log"].append({
           "type": "heartbeat",
           "elapsed_s": 0,
           "last_progress_s": 0,
           "events": 1,
         })
+        await self.activity_clock.wait_for_guard()
     except asyncio.CancelledError:
       self.cancelled = True
       raise
@@ -705,6 +755,7 @@ class _ToolInFlightChildRunner(_ChildRunner):
   """A child silent past the gap while one of its tool calls is running."""
 
   cancelled = False
+  activity_clock: _ActivityClock
 
   async def run(self, **kwargs: object) -> None:
     event_log = self.kwargs["event_log"]
@@ -715,7 +766,8 @@ class _ToolInFlightChildRunner(_ChildRunner):
       "tool_input": {"query": "filings"},
     })
     try:
-      await asyncio.sleep(0.2)
+      self.activity_clock.now += 0.2
+      await self.activity_clock.wait_for_guard()
     except asyncio.CancelledError:
       self.cancelled = True
       raise
@@ -738,6 +790,7 @@ def _short_activity_gap(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_wedged_child_is_cancelled_by_the_activity_guard(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
+  _activity_clock: _ActivityClock,
 ) -> None:
   _ChildRunner.instances.clear()
   parent = _parent(tmp_path, session_log=_SessionLog("never reached"))
@@ -775,6 +828,7 @@ def test_live_child_outlasts_the_activity_gap(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
   child_cls: type[_ChildRunner],
+  _activity_clock: _ActivityClock,
 ) -> None:
   _ChildRunner.instances.clear()
   parent = _parent(tmp_path, session_log=_SessionLog("Done."))
@@ -793,6 +847,16 @@ def test_live_child_outlasts_the_activity_gap(
 class _ToolInputStreamingProvider(_Provider):
   """A child provider composing a large tool input: deltas only, past the gap."""
 
+  def __init__(
+    self,
+    clock: _ActivityClock,
+    heartbeat: asyncio.Event,
+    guard_poll: asyncio.Event,
+  ) -> None:
+    self.clock = clock
+    self.heartbeat = heartbeat
+    self.guard_poll = guard_poll
+
   def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> object:
     return object()
 
@@ -803,10 +867,16 @@ class _ToolInputStreamingProvider(_Provider):
     return {}
 
   async def stream(self, client: Any, params: dict[str, Any]):
-    deadline = time.monotonic() + 0.3
-    while time.monotonic() < deadline:
-      await asyncio.sleep(0.01)
+    for _ in range(12):
+      self.heartbeat.clear()
+      self.clock.now += 0.025
       yield StreamEvent(type="tool_use_delta", tool_input_json="x")
+      await self.heartbeat.wait()
+      # Do not finish before the parent has checked activity at this time.
+      # Without heartbeat observation, that check cancels the child once the
+      # virtual stream duration exceeds the activity gap.
+      self.guard_poll.clear()
+      await self.guard_poll.wait()
     yield StreamEvent(type="text_delta", text="Done.")
     yield StreamEvent(type="text_end", raw_block={"type": "text", "text": "Done."})
     yield StreamEvent(type="message_end", stop_reason="end_turn")
@@ -815,14 +885,18 @@ class _ToolInputStreamingProvider(_Provider):
 def test_real_child_streaming_tool_input_outlasts_the_activity_gap(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
+  _activity_clock: _ActivityClock,
 ) -> None:
   monkeypatch.setattr(runner_sub_agents, "SUB_AGENT_ACTIVITY_GAP", 0.1)
   monkeypatch.setattr(runner_sub_agents, "STREAM_GUARD_POLL_INTERVAL", 0.01)
   monkeypatch.setattr(runner_stream_turn, "STREAM_PROGRESS_LOG_INTERVAL", 0.02)
   monkeypatch.setattr(gateway_runner, "STREAM_GUARD_POLL_INTERVAL", 0.02)
+  clock = _activity_clock
+  heartbeat = asyncio.Event()
+  guard_poll = clock.guard_poll
   parent = _parent(tmp_path, session_log=AgentSessionLog(tmp_path / "session.jsonl"))
   execution = stub_bound_capability_execution(
-    provider=_ToolInputStreamingProvider(),
+    provider=_ToolInputStreamingProvider(clock, heartbeat, guard_poll),
     model="child-model",
     effort="medium",
     capability_id="node.explore",
@@ -831,10 +905,15 @@ def test_real_child_streaming_tool_input_outlasts_the_activity_gap(
   )
   observed: list[object] = []
 
+  def observe(event: dict[str, Any], _sid: str) -> None:
+    observed.append(event.get("type"))
+    if event.get("type") == "heartbeat":
+      heartbeat.set()
+
   result, error = _spawn(
     parent,
     capability_execution=execution,
-    on_sub_event=lambda event, _sid: observed.append(event.get("type")),
+    on_sub_event=observe,
   )
 
   assert error is None
@@ -846,6 +925,7 @@ def test_real_child_streaming_tool_input_outlasts_the_activity_gap(
   assert observed[:first_text]
   assert set(observed[:first_text]) == {"heartbeat"}
   assert "error" not in observed
+  assert clock.now > runner_sub_agents.SUB_AGENT_ACTIVITY_GAP
 
 
 class _RefusingChildProvider(_Provider):
@@ -1003,7 +1083,8 @@ def test_child_approval_uses_parent_session_and_parent_visible_child_log(
     expires_at=2,
     user_id="owner",
   )
-  dispatcher = _approval_dispatcher(parent_session, child_session)
+  capability_execution = _execution()
+  dispatcher = _approval_dispatcher(parent_session, child_session, capability_bind=capability_execution.bind)
   capture_job_context(child_session, root_context_from_identity(
     tenant=None,
     job_id=child_session.session_id,
@@ -1016,9 +1097,9 @@ def test_child_approval_uses_parent_session_and_parent_visible_child_log(
   monkeypatch.setattr(gateway_runner, "AgentRunner", _ApprovalChildRunner)
 
   result, error = (
-    _spawn(parent, dispatcher=dispatcher, sub_session=child_session)
+    _spawn(parent, capability_execution=capability_execution, dispatcher=dispatcher, sub_session=child_session)
     if method == "spawn"
-    else _resume(parent, dispatcher=dispatcher, sub_session=child_session)
+    else _resume(parent, capability_execution=capability_execution, dispatcher=dispatcher, sub_session=child_session)
   )
 
   assert error is None
@@ -1122,14 +1203,15 @@ def test_child_runner_owns_captured_session_and_job_handler_context(
       pass
 
   monkeypatch.setattr(gateway_runner, "AgentRunner", SessionChildRunner)
+  capability_execution = _execution()
   kwargs = {
-    "capability_execution": _execution(),
+    "capability_execution": capability_execution,
     "skill_name": "explore",
     "logical_task": _LOGICAL_TASK,
     "attempt": _ATTEMPT,
     "result_requirement": _RESULT,
     "result_provenance": _PROVENANCE,
-    "dispatcher": _approval_dispatcher(parent_session, child_session),
+    "dispatcher": _approval_dispatcher(parent_session, child_session, capability_bind=capability_execution.bind),
     "sub_session": child_session,
     "bind_job_runner": bind_job_runner,
   }

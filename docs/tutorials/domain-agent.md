@@ -73,6 +73,7 @@ async def build_chat_runtime(session, request, channel, auth_manager, *, storage
 
   def build_runner(event_log, session_id: str, started_at: float) -> AgentRunner:
     dispatcher = ToolDispatcher(
+      capability_bind=capability_execution.bind,
       mcp_client=mcp_client,
       local_tool_handlers=tool_handlers,
       event_log=event_log,
@@ -138,7 +139,7 @@ tool_definitions = [
 ]
 ```
 
-Pass those into `ToolDispatcher(local_tool_handlers=tool_handlers)` and return
+Pass those into `ToolDispatcher(capability_bind=capability_execution.bind, local_tool_handlers=tool_handlers)` and return
 `tool_definitions + mcp_client.get_tool_definitions()` from `ChatRuntime`.
 
 ## Validate Tool Use
