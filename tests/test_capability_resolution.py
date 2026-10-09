@@ -20,6 +20,7 @@ from agent_gateway.capability_resolution import (
   admitted_catalog_routes,
   derive_dispatcher_allowlist,
   granted_tool_ids,
+  inherited_operation_declaration,
   lookup_catalog_entry,
   resolve_operation_authority,
   snapshot_platform_catalog,
@@ -792,3 +793,231 @@ def test_snapshot_declarations_override_is_the_only_table_input() -> None:
 
   assert catalog.tools
   assert all(entry.effect == "write" for entry in catalog.tools)
+
+
+@pytest.fixture
+def inherited_catalog() -> PlatformToolCatalog:
+  return PlatformToolCatalog(tools=(
+    CatalogToolEntry(
+      tool_id="external_write",
+      canonical_name="external_write",
+      effect="external_effect",
+      origin="mcp",
+      server_id="external-mcp",
+      capability="state.mutate/v1",
+    ),
+    CatalogToolEntry(
+      tool_id="filings_search",
+      canonical_name="filings_search",
+      effect="read",
+      origin="mcp",
+      server_id="research-corpus-mcp",
+      capability="filings.read/v1",
+    ),
+    CatalogToolEntry(
+      tool_id="memory_read",
+      canonical_name="memory_read",
+      effect="read",
+      origin="local",
+    ),
+    CatalogToolEntry(
+      tool_id="memory_write",
+      canonical_name="memory_write",
+      effect="write",
+      origin="local",
+      capability="state.mutate/v1",
+    ),
+    CatalogToolEntry(
+      tool_id="web_fetch",
+      canonical_name="web_fetch",
+      effect="read",
+      origin="local",
+      capability="web.read/v1",
+    ),
+  ))
+
+
+def test_inherited_declaration_keeps_read_write_external_and_local_routes(
+  inherited_catalog: PlatformToolCatalog,
+) -> None:
+  ceiling = frozenset({
+    "external_write", "memory_write", "web_fetch",
+  })
+  declaration = inherited_operation_declaration(
+    inherited_catalog,
+    operation_name="learning-fork",
+    grant_id="grant:inherited",
+    tool_ceiling=ceiling,
+  )
+
+  assert declaration.operation_name == "learning-fork"
+  assert declaration.grant_id == "grant:inherited"
+  assert declaration.tool_ceiling is ceiling
+  assert declaration.workspace_scope == "model_write"
+  assert declaration.mcp_tool_ceiling is None
+  assert declaration.inputs == ()
+  # The two state mutation routes produce one requirement, not duplicates.
+  assert declaration.required_capabilities == (
+    _requirement("state.mutate/v1"),
+    _requirement("web.read/v1"),
+  )
+  authority = resolve_operation_authority(declaration, catalog=inherited_catalog)
+
+  assert isinstance(authority, ResolvedAuthority)
+  assert granted_tool_ids(authority) == ceiling
+  assert "memory_write" in granted_tool_ids(authority)
+  assert "external_write" in granted_tool_ids(authority)
+  assert "filings_search" not in granted_tool_ids(authority)
+  assert derive_dispatcher_allowlist(authority) == {
+    "external-mcp": frozenset({"external_write"}),
+  }
+
+
+def test_empty_semantic_declaration_drops_capability_bearing_inherited_routes(
+  inherited_catalog: PlatformToolCatalog,
+) -> None:
+  """A ceiling alone is not inheritance: undeclared capabilities are dropped."""
+
+  declaration = OperationDeclaration(
+    operation_name="learning-fork",
+    grant_id="grant:empty-requirements",
+    workspace_scope="model_write",
+    required_capabilities=(),
+    tool_ceiling=frozenset({
+      "external_write", "memory_write", "web_fetch",
+    }),
+  )
+  authority = resolve_operation_authority(declaration, catalog=inherited_catalog)
+
+  assert isinstance(authority, ResolvedAuthority)
+  assert granted_tool_ids(authority) == frozenset()
+
+
+@pytest.mark.parametrize(
+  ("ceiling", "workspace_scope"),
+  (
+    (frozenset(), "read_only"),
+    (frozenset({"web_fetch"}), "read_only"),
+    (frozenset({"web_fetch", "memory_write"}), "workspace_write"),
+    (frozenset({"external_write"}), "model_write"),
+    (frozenset({"web_fetch", "absent_tool"}), "read_only"),
+  ),
+)
+def test_inherited_declaration_uses_narrowest_scope_and_catalog_routes(
+  inherited_catalog: PlatformToolCatalog,
+  ceiling: frozenset[str],
+  workspace_scope: str,
+) -> None:
+  declaration = inherited_operation_declaration(
+    inherited_catalog,
+    operation_name="learning-fork",
+    grant_id="grant:inherited-scope",
+    tool_ceiling=ceiling,
+  )
+
+  assert declaration.workspace_scope == workspace_scope
+  assert declaration.tool_ceiling is ceiling
+  authority = resolve_operation_authority(declaration, catalog=inherited_catalog)
+
+  assert isinstance(authority, ResolvedAuthority)
+  assert granted_tool_ids(authority) == ceiling & frozenset(
+    entry.tool_id for entry in inherited_catalog.tools
+  )
+  if not ceiling:
+    assert declaration.required_capabilities == ()
+
+
+def test_inherited_declaration_logs_and_omits_effectless_routes(
+  inherited_catalog: PlatformToolCatalog,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  effectless = CatalogToolEntry(
+    tool_id="effectless_tool",
+    canonical_name="effectless_tool",
+    origin="local",
+  )
+  catalog = PlatformToolCatalog(tools=tuple(sorted(
+    (*inherited_catalog.tools, effectless),
+    key=lambda entry: entry.tool_id,
+  )))
+  ceiling = frozenset({
+    "effectless_tool", "external_write", "memory_write", "web_fetch",
+  })
+
+  declaration = inherited_operation_declaration(
+    catalog,
+    operation_name="learning-fork",
+    grant_id="grant:effectless-inheritance",
+    tool_ceiling=ceiling,
+  )
+  authority = resolve_operation_authority(declaration, catalog=catalog)
+
+  assert isinstance(authority, ResolvedAuthority)
+  assert granted_tool_ids(authority) == ceiling - {"effectless_tool"}
+  assert declaration.tool_ceiling == ceiling - {"effectless_tool"}
+  assert declaration.workspace_scope == "model_write"
+  assert declaration.required_capabilities == (
+    _requirement("state.mutate/v1"),
+    _requirement("web.read/v1"),
+  )
+  warnings = [
+    record for record in caplog.records
+    if record.name == "agent_gateway.capability_resolution"
+    and record.levelname == "WARNING"
+  ]
+  assert len(warnings) == 1
+  assert "inherited route has no declared effect; not delegable" in warnings[0].message
+  assert "learning-fork" in warnings[0].message
+  assert "effectless_tool" in warnings[0].message
+  assert "admitted without it" in warnings[0].message
+
+
+def test_inherited_declaration_rejects_a_non_catalog_input() -> None:
+  with pytest.raises(CapabilityResolutionInputError, match="PlatformToolCatalog"):
+    inherited_operation_declaration(
+      object(),  # type: ignore[arg-type]
+      operation_name="learning-fork",
+      grant_id="grant:malformed-inheritance",
+      tool_ceiling=frozenset(),
+    )
+
+
+@pytest.mark.parametrize(
+  "ceiling",
+  (
+    frozenset({"memory_read"}),
+    frozenset({"memory_read", "web_fetch", "filings_search"}),
+  ),
+)
+def test_inherited_declaration_rejects_untagged_routes_before_resolution(
+  inherited_catalog: PlatformToolCatalog,
+  ceiling: frozenset[str],
+) -> None:
+  with pytest.raises(CapabilityResolutionInputError) as error:
+    inherited_operation_declaration(
+      inherited_catalog,
+      operation_name="learning-fork",
+      grant_id="grant:untagged-inheritance",
+      tool_ceiling=ceiling,
+    )
+
+  assert str(error.value) == (
+    "learning-fork: an inherited ceiling can only name routes the catalog tags; "
+    "memory_read have no capability"
+  )
+
+
+def test_inherited_tagged_ceiling_grants_exactly_its_routes(
+  inherited_catalog: PlatformToolCatalog,
+) -> None:
+  ceiling = frozenset({"web_fetch", "filings_search"})
+  declaration = inherited_operation_declaration(
+    inherited_catalog,
+    operation_name="learning-fork",
+    grant_id="grant:tagged-inheritance",
+    tool_ceiling=ceiling,
+  )
+  authority = resolve_operation_authority(declaration, catalog=inherited_catalog)
+
+  assert isinstance(authority, ResolvedAuthority)
+  assert granted_tool_ids(authority) == ceiling

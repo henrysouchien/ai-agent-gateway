@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationInfo, field_validator, model_validator
+from model_authority.selection import capture_selection_snapshot
 
 from agent_gateway.admission import ParentContext, root_context, root_context_from_identity
 from agent_gateway.approval_route import ControlPlaneApprovalRoute
@@ -1195,6 +1196,7 @@ class AgentRunScheduleRunner:
 
     try:
       if parent is None:
+        selection_policy = registry.selection_policy
         parent = root_context_from_identity(
           tenant=AdmittedTenant(
             tenant_id=registry._tenant_id,
@@ -1210,6 +1212,11 @@ class AgentRunScheduleRunner:
             registry._approval_policy,
           ),
           remaining_usd=None,
+          selection_snapshot=(
+            capture_selection_snapshot(selection_policy)
+            if selection_policy is not None
+            else None
+          ),
         )
       dispatch_scope = dispatch.get("dispatch_scope")
       if not isinstance(dispatch_scope, dict):
@@ -1662,6 +1669,11 @@ def build_schedules_router(
         session,
         withheld_tools=frozenset(),
         research_file_id=None,
+        selection_snapshot=(
+          capture_selection_snapshot(agent_schedule_runner.autonomous_registry.selection_policy)
+          if agent_schedule_runner.autonomous_registry.selection_policy is not None
+          else None
+        ),
       ),
     )
     if result is None:

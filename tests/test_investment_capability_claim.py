@@ -453,15 +453,17 @@ def test_market_scan_claim_is_exact_and_has_no_quant_budget_or_origin(
     "iat": 1_800_000_000,
     "iss": "ai-excel-addin",
     "jti": "tool-call-market-scan",
+    "kind": "facade",
     "policy_bundle_hash": _POLICY_BUNDLE_HASH,
     "request_id": "request-123",
     "session_id": "session-123",
     "skill": "market-scan",
     "skill_run_id": "skill-run-123",
     "sub": "42",
+    "tenant": _TENANT.model_dump(mode="json"),
     "tool_name": "start_investment_run",
     "user_id": "42",
-    "v": 1,
+    "v": 4,
   }
 
 
@@ -536,6 +538,7 @@ def test_claim_is_canonical_signed_short_lived_and_exactly_bound(
     "iat": 1_800_000_000,
     "iss": "ai-excel-addin",
     "jti": "tool-call-123",
+    "kind": "facade",
     "policy_bundle_hash": _POLICY_BUNDLE_HASH,
     "request_id": "request-123",
     "research_file_id": 2,
@@ -543,9 +546,10 @@ def test_claim_is_canonical_signed_short_lived_and_exactly_bound(
     "skill": "quant-research",
     "skill_run_id": "skill-run-123",
     "sub": "42",
+    "tenant": _TENANT.model_dump(mode="json"),
     "tool_name": "start_quant_research",
     "user_id": "42",
-    "v": 1,
+    "v": 4,
   }
   signing_input, supplied_signature = token.rsplit(".", 1)
   signature_bytes = base64.urlsafe_b64decode(
@@ -1614,6 +1618,42 @@ def test_in_process_child_context_precedes_parent_credential_session(
   assert payload["tool_name"] == tool_name
   assert current_parent_context(parent_session).job_id == "agent-run-123"
 
+
+
+@pytest.mark.parametrize("role", ["owner", "invite"])
+def test_claim_signs_canonical_tenant_without_conflating_risk_subject(
+  monkeypatch: pytest.MonkeyPatch,
+  role: str,
+) -> None:
+  _set_signing_key(monkeypatch)
+  tenant = AdmittedTenant.model_validate({
+    "tenant_id": None,
+    "storage_id": "sia-alice",
+    "role": role,
+  })
+  token = issue_investment_capability_claim(
+    user_id="42",
+    tenant=tenant,
+    session_id="session-123",
+    skill_run_id="skill-run-123",
+    channel="excel",
+    tool_name="get_investment_run",
+    request_id="request-123",
+    jti="tool-call-123",
+    skill="market-scan",
+    admitted_skill_execution_limits=_limits_for_skill("market-scan"),
+    policy_bundle_hash=_POLICY_BUNDLE_HASH,
+    now=1_800_000_000,
+  )
+  _header, payload = _decode_claim(token)
+  assert payload["tenant"] == {
+    "tenant_id": None,
+    "storage_id": "sia-alice",
+    "role": role,
+  }
+  assert payload["sub"] == payload["user_id"] == "42"
+  assert payload["allowed_capability_ids"] == sorted(_DECLARED_GRANTS["market-scan"].capability_ids)
+  assert payload["effect_classes"] == sorted(_DECLARED_GRANTS["market-scan"].effect_classes)
 
 
 def test_claim_requires_explicit_authenticated_tenant(

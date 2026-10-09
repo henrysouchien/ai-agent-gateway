@@ -46,6 +46,7 @@ from agent_gateway.event_log import EventLog
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.runner_sub_agents import _bind_child_registry, _close_sub_runner
 from agent_gateway.runner_background_lifecycle import RunnerBackgroundLifecycleMixin
+from agent_gateway.runner_session_lifecycle import RunnerSessionLifecycleMixin
 from agent_gateway.runner_background_tasks import (
   background_task_payload,
   build_agent_completion_envelope,
@@ -388,6 +389,859 @@ class _BackgroundLifecycleHarness(RunnerBackgroundLifecycleMixin):
   async def _append_durable_event(self, event: dict[str, object]) -> None:
     self.append_invocations += 1
     self.durable_events.append(event)
+
+
+def test_park_callback_observes_committed_attempt_once_without_terminal_callback(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    durable_log = AgentSessionLog(tmp_path / "park-callback.jsonl")
+    append_started = asyncio.Event()
+    allow_append = asyncio.Event()
+    append_committed = asyncio.Event()
+    allow_acknowledgement = asyncio.Event()
+    park_entered = asyncio.Event()
+    allow_park_return = asyncio.Event()
+
+    class _DurableParkHarness(_BackgroundLifecycleHarness):
+      async def _append_durable_event(self, event: dict[str, object]) -> None:
+        self.append_invocations += 1
+        append_started.set()
+        await allow_append.wait()
+        await durable_log.append(event)
+        self.durable_events.append(event)
+        append_committed.set()
+        await allow_acknowledgement.wait()
+
+    harness = _DurableParkHarness()
+    admitted = _canonical_admitted_task()
+    admission_before = admitted.model_dump(mode="json")
+    usage = UsageObservation(
+      input_tokens=120,
+      output_tokens=35,
+      cached_input_tokens=20,
+      tool_calls=2,
+      cost_usd=0.015,
+    )
+    canonical = terminal_task_result(
+      admitted,
+      status="awaiting_approval",
+      reason="Waiting for a human approval decision.",
+      usage=usage,
+    )
+    result = canonical.model_dump(mode="json")
+    parked = harness._task_registry.register(
+      "background_agent",
+      task_id=admitted.attempt.physical_task_id,
+      admitted_task=admission_before,
+    )
+    parked.admitted_task = admitted
+    parked.task_result = canonical
+    harness._task_registry.transition(parked.task_id, TaskState.RUNNING)
+    park_calls: list[TaskEntry] = []
+    final_calls: list[TaskEntry] = []
+    callback_observations: list[tuple[object, ...]] = []
+    lock_held_in_callback: list[bool] = []
+
+    async def _on_park(entry: TaskEntry) -> None:
+      park_calls.append(entry)
+      lock_held_in_callback.append(entry.finalization_lock.locked())
+      durable, _cursor = await durable_log.query(event_types={"task_completed"})
+      callback_observations.append((
+        entry.completion_persistence_state,
+        entry.state,
+        entry.completed,
+        entry.admitted_task,
+        entry.task_result,
+        entry.result,
+        [item.event for item in durable],
+      ))
+      park_entered.set()
+      await allow_park_return.wait()
+
+    async def _on_final(entry: TaskEntry) -> None:
+      final_calls.append(entry)
+
+    parked.park_callback = _on_park
+    parked.completion_callback = _on_final
+    finalizer = asyncio.create_task(harness._finalize_background_agent(
+      parked,
+      final_state=TaskState.AWAITING_APPROVAL,
+      result=result,
+      error=None,
+    ))
+    notifier: asyncio.Task[None] | None = None
+    try:
+      await append_started.wait()
+      durable, _cursor = await durable_log.query(event_types={"task_completed"})
+      assert durable == []
+      assert parked.completion_persistence_state == "in_flight"
+      await harness._invoke_background_park_callback(parked)
+      await harness._invoke_background_completion_callback(parked)
+      assert park_calls == final_calls == []
+      assert parked.park_callback_invoked is False
+
+      allow_append.set()
+      await append_committed.wait()
+      durable, _cursor = await durable_log.query(event_types={"task_completed"})
+      assert len(durable) == 1
+      assert durable[0].event["final_state"] == "awaiting_approval"
+      assert durable[0].event["result"] == result
+      assert parked.completion_persistence_state == "in_flight"
+      await harness._invoke_background_park_callback(parked)
+      assert park_calls == []
+
+      allow_acknowledgement.set()
+      await finalizer
+      # The commit holds the finalization lock; the park callback does not.
+      assert park_calls == []
+      notifier = asyncio.create_task(
+        harness._invoke_background_completion_callback(parked),
+      )
+      await park_entered.wait()
+      assert lock_held_in_callback == [False]
+      async with parked.finalization_lock:
+        pass
+      assert len(park_calls) == 1
+      assert park_calls[0] is parked
+      observation = callback_observations[0]
+      assert observation[:3] == ("committed", TaskState.AWAITING_APPROVAL, False)
+      assert observation[3] is admitted
+      assert observation[4] is canonical
+      assert observation[5] == result
+      assert observation[6] == [durable[0].event]
+      assert parked.park_callback_invoked is True
+
+      await harness._invoke_background_park_callback(parked)
+      await harness._settle_and_commit_background_completion_live(
+        parked,
+        final_state=TaskState.AWAITING_APPROVAL,
+        result=result,
+        error=None,
+      )
+      await harness._invoke_background_completion_callback(parked)
+      assert len(park_calls) == 1
+      assert final_calls == []
+      assert parked.completion_callback_invoked is False
+    finally:
+      allow_append.set()
+      allow_acknowledgement.set()
+      allow_park_return.set()
+      await finalizer
+      if notifier is not None:
+        await notifier
+
+    assert harness._task_registry.get(parked.task_id) is parked
+    assert parked.state is TaskState.AWAITING_APPROVAL
+    assert parked.completed is False
+    assert parked.error is None
+    assert parked.admitted_task is admitted
+    assert admitted.model_dump(mode="json") == admission_before
+    assert parked.task_result is canonical
+    assert canonical.model_dump(mode="json") == result
+    assert canonical.observation.usage == usage
+    assert parked.result == result
+    assert parked.completion_persistence_state == "committed"
+    assert harness.append_invocations == 1
+    durable, _cursor = await durable_log.query(event_types={"task_completed"})
+    assert len(durable) == 1
+    assert durable[0].event["task_id"] == parked.task_id
+    assert durable[0].event["result"] == result
+    assert durable[0].event["error"] is None
+    assert len(park_calls) == 1
+    assert final_calls == []
+
+  _run(_case())
+
+
+def test_late_fsync_park_reconciliation_restores_same_nonterminal_attempt(
+  tmp_path: Path,
+) -> None:
+  from agent_gateway.runner_session_lifecycle import RunnerSessionLifecycleMixin
+
+  async def _case() -> None:
+    durable_log = AgentSessionLog(tmp_path / "late-fsync-park.jsonl")
+    append_started = asyncio.Event()
+    allow_fsync = asyncio.Event()
+    fsync_committed = asyncio.Event()
+    park_calls: list[TaskEntry] = []
+    final_calls: list[TaskEntry] = []
+    observations: list[tuple[object, ...]] = []
+
+    class _LateFsyncParkHarness(
+      _BackgroundLifecycleHarness,
+      RunnerSessionLifecycleMixin,
+    ):
+      async def _append_durable_event(self, event: dict[str, object]) -> None:
+        self.append_invocations += 1
+        append_started.set()
+        await allow_fsync.wait()
+        await durable_log.append(event)
+        self.durable_events.append(event)
+        fsync_committed.set()
+        raise OSError("Lost completion append acknowledgement after fsync.")
+
+    harness = _LateFsyncParkHarness()
+    harness._agent_session_log = durable_log
+    harness._background_completion_persist_timeout_seconds = 0.0
+    admitted = _canonical_admitted_task()
+    admission_before = admitted.model_dump(mode="json")
+    usage = UsageObservation(
+      input_tokens=120,
+      output_tokens=35,
+      cached_input_tokens=20,
+      tool_calls=2,
+      cost_usd=0.015,
+    )
+    canonical = terminal_task_result(
+      admitted,
+      status="awaiting_approval",
+      reason="Waiting for a human approval decision.",
+      usage=usage,
+    )
+    result = canonical.model_dump(mode="json")
+    parked = harness._task_registry.register(
+      "background_agent",
+      task_id=admitted.attempt.physical_task_id,
+      admitted_task=admission_before,
+    )
+    parked.admitted_task = admitted
+    parked.task_result = canonical
+    await durable_log.append({
+      "type": "task_registered",
+      "event_schema_version": 2,
+      "task_id": parked.task_id,
+      "task_type": parked.task_type,
+      "started_at": parked.started_at,
+      "metadata": dict(parked.metadata),
+    })
+    harness._task_registry.transition(parked.task_id, TaskState.RUNNING)
+
+    async def _on_park(entry: TaskEntry) -> None:
+      park_calls.append(entry)
+      observations.append((
+        entry.completion_persistence_state,
+        entry.state,
+        entry.completed,
+        entry.completed_at,
+        entry.error,
+        entry.admitted_task,
+        entry.task_result,
+        entry.result,
+      ))
+
+    async def _on_final(entry: TaskEntry) -> None:
+      final_calls.append(entry)
+
+    parked.park_callback = _on_park
+    parked.completion_callback = _on_final
+    finalizer = asyncio.create_task(harness._finalize_background_agent(
+      parked,
+      final_state=TaskState.AWAITING_APPROVAL,
+      result=result,
+      error=None,
+    ))
+    try:
+      await append_started.wait()
+      with pytest.raises(asyncio.TimeoutError):
+        await finalizer
+      await asyncio.gather(*tuple(harness._pending_background_initializations))
+      assert parked.state is TaskState.INTERRUPTED
+      assert parked.completion_persistence_state == "uncertain"
+      assert parked.completion_finalizer_detached is True
+      assert park_calls == final_calls == []
+      assert parked.park_callback_invoked is False
+      durable, _cursor = await durable_log.query(event_types={"task_completed"})
+      assert durable == []
+      append_task, = tuple(harness._pending_background_completion_appends)
+
+      allow_fsync.set()
+      await fsync_committed.wait()
+      with pytest.raises(OSError, match="after fsync"):
+        await append_task
+      await asyncio.gather(*tuple(harness._pending_background_initializations))
+
+      assert len(park_calls) == 1
+      assert park_calls[0] is parked
+      observation = observations[0]
+      assert observation[:5] == (
+        "committed", TaskState.AWAITING_APPROVAL, False, None, None,
+      )
+      assert observation[5] is admitted
+      assert observation[6] is canonical
+      assert observation[7] == result
+      assert (
+        parked.task_id, TaskState.INTERRUPTED, TaskState.AWAITING_APPROVAL,
+      ) in harness.listener.transitions
+      assert harness._task_registry.get(parked.task_id) is parked
+      assert parked.state is TaskState.AWAITING_APPROVAL
+      assert parked.completed is False
+      assert parked.completed_at is None
+      assert parked.error is None
+      assert parked.completion_persistence_error is None
+      assert parked.completion_finalizer_detached is False
+      assert parked.admitted_task is admitted
+      assert admitted.model_dump(mode="json") == admission_before
+      assert parked.task_result is canonical
+      assert canonical.model_dump(mode="json") == result
+      assert canonical.observation.usage == usage
+      assert parked.result == result
+
+      await harness._reconcile_detached_background_completion(parked)
+      await harness._invoke_background_park_callback(parked)
+      await harness._invoke_background_completion_callback(parked)
+      assert len(park_calls) == 1
+      assert final_calls == []
+      assert parked.completion_callback_invoked is False
+      assert harness.append_invocations == 1
+      durable, _cursor = await durable_log.query(event_types={"task_completed"})
+      assert len(durable) == 1
+      assert durable[0].event["task_id"] == parked.task_id
+      assert durable[0].event["final_state"] == "awaiting_approval"
+      assert durable[0].event["result"] == result
+      assert durable[0].event["error"] is None
+    finally:
+      allow_fsync.set()
+      await asyncio.gather(finalizer, return_exceptions=True)
+      await asyncio.gather(
+        *tuple(harness._pending_background_completion_appends),
+        return_exceptions=True,
+      )
+      await asyncio.gather(
+        *tuple(harness._pending_background_initializations),
+        return_exceptions=True,
+      )
+
+  _run(_case())
+
+
+class _DurableParkedStopHarness(
+  _BackgroundLifecycleHarness,
+  RunnerSessionLifecycleMixin,
+):
+  def __init__(self, durable_log: AgentSessionLog) -> None:
+    super().__init__()
+    self._agent_session_log = durable_log
+    self.durable_log = durable_log
+    self.termination_started = asyncio.Event()
+    self.allow_termination = asyncio.Event()
+    self.allow_termination.set()
+    self.append_failure: BaseException | None = None
+    self.fail_after_append = False
+    self.park_calls: list[TaskEntry] = []
+    self.final_calls: list[TaskEntry] = []
+    self.final_observations: list[tuple[object, ...]] = []
+
+  async def _append_durable_event(self, event: dict[str, object]) -> None:
+    termination = event.get("type") == "task_terminated"
+    if termination:
+      self.termination_started.set()
+      await self.allow_termination.wait()
+      if self.append_failure is not None and not self.fail_after_append:
+        failure = self.append_failure
+        self.append_failure = None
+        raise failure
+    self.append_invocations += 1
+    await self.durable_log.append(event)
+    self.durable_events.append(event)
+    if termination and self.append_failure is not None:
+      failure = self.append_failure
+      self.append_failure = None
+      raise failure
+
+  async def on_park(self, entry: TaskEntry) -> None:
+    self.park_calls.append(entry)
+
+  async def on_final(self, entry: TaskEntry) -> None:
+    # The callback may enter the same control owner: STOP must release its lock.
+    async with entry.finalization_lock:
+      events, _cursor = await self.durable_log.query(
+        event_types={"task_terminated"},
+      )
+      self.final_calls.append(entry)
+      self.final_observations.append((
+        entry.state,
+        entry.completed,
+        entry.task_result,
+        [event.event for event in events],
+      ))
+
+
+async def _durably_park_stop_entry(
+  harness: _DurableParkedStopHarness,
+) -> TaskEntry:
+  admitted = _canonical_admitted_task()
+  usage = UsageObservation(
+    input_tokens=120,
+    output_tokens=35,
+    cached_input_tokens=20,
+    tool_calls=2,
+    cost_usd=0.015,
+  )
+  parked = terminal_task_result(
+    admitted,
+    status="awaiting_approval",
+    reason="Waiting for a human approval decision.",
+    tools_used=("web_search", "read"),
+    usage=usage,
+  )
+  entry = harness._task_registry.register(
+    "background_agent",
+    task_id=admitted.attempt.physical_task_id,
+    admitted_task=admitted.model_dump(mode="json"),
+  )
+  entry.admitted_task = admitted
+  entry.task_result = parked
+  entry.park_callback = harness.on_park
+  entry.completion_callback = harness.on_final
+  await harness.durable_log.append({
+    "type": "task_registered",
+    "event_schema_version": 2,
+    "task_id": entry.task_id,
+    "task_type": entry.task_type,
+    "started_at": entry.started_at,
+    "metadata": dict(entry.metadata),
+  })
+  harness._task_registry.transition(entry.task_id, TaskState.RUNNING)
+  await harness._finalize_background_agent(
+    entry,
+    final_state=TaskState.AWAITING_APPROVAL,
+    result=parked.model_dump(mode="json"),
+    error=None,
+  )
+  # The worker notifies after releasing the finalization lock.
+  await harness._invoke_background_completion_callback(entry)
+  return entry
+
+
+def test_parked_stop_journals_once_preserves_usage_and_replays(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    harness = _DurableParkedStopHarness(
+      AgentSessionLog(tmp_path / "parked-stop.jsonl"),
+    )
+    entry = await _durably_park_stop_entry(harness)
+    admitted = entry.admitted_task
+    parked = entry.task_result
+    assert admitted is not None and parked is not None
+    admission_before = admitted.model_dump(mode="json")
+    park_before = parked.model_dump(mode="json")
+    park_events, _cursor = await harness.durable_log.query(
+      event_types={"task_completed"},
+    )
+    park_receipt = park_events[0].event
+    # Progress is deliberately incomplete: the canonical park owns all spend.
+    entry.progress.input_tokens = 1
+    entry.progress.output_tokens = 1
+    harness.allow_termination.clear()
+    first = asyncio.create_task(
+      harness.terminate_parked_background_task(entry.task_id),
+    )
+    await harness.termination_started.wait()
+    assert entry.finalization_lock.locked()
+    assert entry.state is TaskState.AWAITING_APPROVAL
+    assert harness.final_calls == []
+    durable, _cursor = await harness.durable_log.query(
+      event_types={"task_terminated"},
+    )
+    assert durable == []
+    second = asyncio.create_task(
+      harness.terminate_parked_background_task(entry.task_id),
+    )
+    harness.allow_termination.set()
+    assert await asyncio.gather(first, second) == [True, False]
+    assert await harness.terminate_parked_background_task(entry.task_id) is False
+
+    cancelled = entry.task_result
+    assert cancelled is not None
+    assert entry.state is TaskState.KILLED
+    assert entry.completed is True
+    assert entry.termination_intent == "cancelled"
+    assert entry.error is None
+    assert entry.admitted_task is admitted
+    assert admitted.model_dump(mode="json") == admission_before
+    assert parked.model_dump(mode="json") == park_before
+    assert cancelled.execution.status == "cancelled"
+    assert cancelled.execution.terminal_reason == "cancelled"
+    assert cancelled.logical_task == admitted.logical_task
+    assert cancelled.attempt == admitted.attempt
+    assert cancelled.provenance == parked.provenance
+    assert cancelled.observation == parked.observation
+    assert cancelled.evidence.tools_used == parked.evidence.tools_used
+    assert entry.result == cancelled.model_dump(mode="json")
+    assert harness.park_calls == [entry]
+    assert harness.final_calls == [entry]
+    assert harness.append_invocations == 2
+    park_events, _cursor = await harness.durable_log.query(
+      event_types={"task_completed"},
+    )
+    assert [event.event for event in park_events] == [park_receipt]
+    terminated, _cursor = await harness.durable_log.query(
+      event_types={"task_terminated"},
+    )
+    assert len(terminated) == 1
+    assert terminated[0].event["result"] == entry.result
+    assert harness.final_observations == [(
+      TaskState.KILLED,
+      True,
+      cancelled,
+      [terminated[0].event],
+    )]
+    events, _cursor = await harness.durable_log.query(
+      event_types={"task_registered", "task_completed", "task_terminated"},
+      order="asc",
+    )
+    durable_events = [
+      {**event.event, "_durable_seq": event.seq}
+      for event in events
+    ]
+    for source in (durable_events, list(reversed(durable_events))):
+      replay = TaskRegistry()
+      replay.load_from_events(source)
+      restored = replay.get(entry.task_id)
+      assert restored is not None
+      assert restored.state is TaskState.KILLED
+      assert restored.completed is True
+      assert restored.admitted_task == admitted
+      assert restored.task_result == cancelled
+      assert restored.result == entry.result
+      assert restored.completed_at == entry.completed_at
+      assert restored.termination_intent == "cancelled"
+      assert restored.completion_persistence_state == "committed"
+      assert source[1]["result"] == park_before
+
+  _run(_case())
+
+
+@pytest.mark.parametrize("failure", [OSError, asyncio.CancelledError])
+def test_parked_stop_confirms_lost_acknowledgement_without_duplicate(
+  tmp_path: Path,
+  failure: type[BaseException],
+) -> None:
+  async def _case() -> None:
+    harness = _DurableParkedStopHarness(
+      AgentSessionLog(tmp_path / "parked-stop-readback.jsonl"),
+    )
+    entry = await _durably_park_stop_entry(harness)
+    harness.append_failure = failure("Lost STOP acknowledgement after fsync.")
+    harness.fail_after_append = True
+    if failure is asyncio.CancelledError:
+      with pytest.raises(asyncio.CancelledError):
+        await harness.terminate_parked_background_task(entry.task_id)
+    else:
+      assert await harness.terminate_parked_background_task(entry.task_id) is True
+    assert await harness.terminate_parked_background_task(entry.task_id) is False
+    assert entry.state is TaskState.KILLED
+    assert entry.task_result is not None
+    assert entry.task_result.execution.status == "cancelled"
+    assert harness.final_calls == [entry]
+    terminated, _cursor = await harness.durable_log.query(
+      event_types={"task_terminated"},
+    )
+    assert len(terminated) == 1
+    assert terminated[0].event["result"] == entry.result
+    assert harness.append_invocations == 2
+
+  _run(_case())
+
+
+def test_parked_stop_failed_append_keeps_park_then_retry_commits(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    harness = _DurableParkedStopHarness(
+      AgentSessionLog(tmp_path / "parked-stop-retry.jsonl"),
+    )
+    entry = await _durably_park_stop_entry(harness)
+    parked = entry.task_result
+    harness.append_failure = OSError("STOP append failed before fsync.")
+    with pytest.raises(OSError, match="before fsync"):
+      await harness.terminate_parked_background_task(entry.task_id)
+    assert entry.state is TaskState.AWAITING_APPROVAL
+    assert entry.task_result is parked
+    assert entry.termination_intent is None
+    assert entry.completion_callback_invoked is False
+    assert harness.final_calls == []
+    terminated, _cursor = await harness.durable_log.query(
+      event_types={"task_terminated"},
+    )
+    assert terminated == []
+    assert await harness.terminate_parked_background_task(entry.task_id) is True
+    assert harness.final_calls == [entry]
+    terminated, _cursor = await harness.durable_log.query(
+      event_types={"task_terminated"},
+    )
+    assert len(terminated) == 1
+
+  _run(_case())
+
+
+def test_parked_stop_retry_reads_committed_termination_after_readback_failure(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    class _ReadbackFailureHarness(_DurableParkedStopHarness):
+      lookup_unavailable = False
+
+      async def _append_durable_event(self, event: dict[str, object]) -> None:
+        await super()._append_durable_event(event)
+        if event.get("type") == "task_terminated":
+          self.lookup_unavailable = True
+
+      def _lookup_task_in_log_current_sync(self, task_id: str) -> TaskEntry | None:
+        if self.lookup_unavailable:
+          self.lookup_unavailable = False
+          raise OSError("STOP readback temporarily unavailable.")
+        return super()._lookup_task_in_log_current_sync(task_id)
+
+    harness = _ReadbackFailureHarness(
+      AgentSessionLog(tmp_path / "parked-stop-readback-retry.jsonl"),
+    )
+    entry = await _durably_park_stop_entry(harness)
+    parked = entry.task_result
+    with pytest.raises(OSError, match="temporarily unavailable"):
+      await harness.terminate_parked_background_task(entry.task_id)
+    assert entry.state is TaskState.AWAITING_APPROVAL
+    assert entry.task_result is parked
+    assert harness.final_calls == []
+    assert harness._writer_lease_poisoned is True
+    terminated, _cursor = await harness.durable_log.query(
+      event_types={"task_terminated"},
+    )
+    assert len(terminated) == 1
+    assert await harness.terminate_parked_background_task(entry.task_id) is True
+    assert entry.state is TaskState.KILLED
+    assert entry.result == terminated[0].event["result"]
+    assert harness.final_calls == [entry]
+    assert harness.append_invocations == 2
+    after_retry, _cursor = await harness.durable_log.query(
+      event_types={"task_terminated"},
+    )
+    assert [event.event for event in after_retry] == [terminated[0].event]
+
+  _run(_case())
+
+
+def test_parked_stop_targets_registered_running_successor(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    harness = _DurableParkedStopHarness(
+      AgentSessionLog(tmp_path / "parked-stop-successor.jsonl"),
+    )
+    original = await _durably_park_stop_entry(harness)
+    parked = original.task_result
+    started = asyncio.Event()
+
+    async def _running_successor() -> None:
+      started.set()
+      await asyncio.Event().wait()
+
+    async with original.finalization_lock:
+      successor, created = harness._task_registry.claim_resume_successor(
+        "background_agent",
+        task_id="bg_7_r1",
+        original_task_id=original.task_id,
+      )
+      assert created is True
+      successor.asyncio_task = asyncio.create_task(_running_successor())
+      harness._task_registry.transition(successor.task_id, TaskState.RUNNING)
+    await started.wait()
+    try:
+      assert await harness.terminate_parked_background_task(original.task_id) is True
+      await asyncio.gather(successor.asyncio_task, return_exceptions=True)
+      assert successor.asyncio_task.cancelled()
+      assert successor.termination_intent == "cancelled"
+      assert original.termination_intent is None
+      assert original.state is TaskState.AWAITING_APPROVAL
+      assert original.task_result is parked
+      assert harness.final_calls == []
+      terminated, _cursor = await harness.durable_log.query(
+        event_types={"task_terminated"},
+      )
+      assert terminated == []
+    finally:
+      successor.asyncio_task.cancel()
+      await asyncio.gather(successor.asyncio_task, return_exceptions=True)
+
+  _run(_case())
+
+
+def test_parked_stop_terminates_original_past_unstarted_reservation(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    harness = _DurableParkedStopHarness(
+      AgentSessionLog(tmp_path / "parked-stop-reservation.jsonl"),
+    )
+    original = await _durably_park_stop_entry(harness)
+    reservation, created = harness._task_registry.claim_resume_successor(
+      "background_agent",
+      task_id="bg_7_r1",
+      original_task_id=original.task_id,
+    )
+    assert created is True
+    order: list[str] = []
+
+    async def _persist_request() -> None:
+      assert original.finalization_lock.locked()
+      order.append("request")
+
+    assert await harness.terminate_parked_background_task(
+      original.task_id,
+      persist_request=_persist_request,
+    ) is True
+    assert order == ["request"]
+    assert original.state is TaskState.KILLED
+    assert reservation.state is TaskState.PENDING
+    assert reservation.termination_intent is None
+    terminated, _cursor = await harness.durable_log.query(
+      event_types={"task_terminated"},
+    )
+    assert [event.event["task_id"] for event in terminated] == [original.task_id]
+    assert harness.final_calls == [original]
+
+  _run(_case())
+
+
+def test_parked_stop_records_no_request_for_a_settled_task(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    harness = _DurableParkedStopHarness(
+      AgentSessionLog(tmp_path / "parked-stop-settled.jsonl"),
+    )
+    entry = await _durably_park_stop_entry(harness)
+    assert await harness.terminate_parked_background_task(entry.task_id) is True
+    requests: list[str] = []
+
+    async def _persist_request() -> None:
+      requests.append(entry.task_id)
+
+    assert await harness.terminate_parked_background_task(
+      entry.task_id,
+      persist_request=_persist_request,
+    ) is False
+    assert requests == []
+    terminated, _cursor = await harness.durable_log.query(
+      event_types={"task_terminated"},
+    )
+    assert len(terminated) == 1
+
+  _run(_case())
+
+
+def _parked_stop_replay_events() -> list[dict[str, object]]:
+  admitted = _canonical_admitted_task()
+  usage = UsageObservation(
+    input_tokens=120,
+    output_tokens=35,
+    cached_input_tokens=20,
+    tool_calls=2,
+    cost_usd=0.015,
+  )
+  parked = terminal_task_result(
+    admitted,
+    status="awaiting_approval",
+    reason="Waiting for approval.",
+    usage=usage,
+  )
+  cancelled = terminal_task_result(
+    admitted,
+    status="cancelled",
+    reason="cancelled",
+    usage=usage,
+  )
+  return [
+    {
+      "type": "task_registered",
+      "event_schema_version": 2,
+      "task_id": admitted.attempt.physical_task_id,
+      "task_type": "background_agent",
+      "started_at": 100.0,
+      "metadata": {"admitted_task": admitted.model_dump(mode="json")},
+      "_durable_seq": 1,
+    },
+    {
+      "type": "task_completed",
+      "task_id": admitted.attempt.physical_task_id,
+      "final_state": "awaiting_approval",
+      "completed_at": 125.0,
+      "result": parked.model_dump(mode="json"),
+      "error": None,
+      "_durable_seq": 2,
+    },
+    {
+      "type": "task_terminated",
+      "task_id": admitted.attempt.physical_task_id,
+      "final_state": "killed",
+      "completed_at": 150.0,
+      "result": cancelled.model_dump(mode="json"),
+      "error": None,
+      "_durable_seq": 3,
+    },
+  ]
+
+
+def test_parked_stop_replay_accepts_exact_duplicate_and_rejects_conflict() -> None:
+  events = _parked_stop_replay_events()
+  replay = TaskRegistry()
+  replay.load_from_events([
+    *events,
+    {**events[0], "_durable_seq": 4},
+    {**events[1], "_durable_seq": 5},
+    {**events[-1], "_durable_seq": 6},
+  ])
+  restored = replay.get("bg_7")
+  assert restored is not None
+  assert restored.state is TaskState.KILLED
+  assert restored.result == events[-1]["result"]
+  assert restored.completed_at == 150.0
+  with pytest.raises(
+    TaskDurableEventConflictError,
+    match="conflicting durable task_terminated",
+  ):
+    TaskRegistry().load_from_events([
+      *events,
+      {**events[-1], "_durable_seq": 4, "completed_at": 151.0},
+    ])
+
+
+@pytest.mark.parametrize(
+  "tamper",
+  ["no_park", "before_park", "outer_state", "usage", "authority", "park_receipt"],
+)
+def test_parked_stop_replay_quarantines_invalid_termination(tamper: str) -> None:
+  events = _parked_stop_replay_events()
+  terminated = events[-1]
+  if tamper == "no_park":
+    events.pop(1)
+  elif tamper == "before_park":
+    terminated["_durable_seq"] = 1
+  elif tamper == "outer_state":
+    terminated["final_state"] = "completed"
+  else:
+    payload = events[1]["result"] if tamper == "park_receipt" else terminated["result"]
+    assert isinstance(payload, dict)
+    if tamper == "usage":
+      payload["observation"]["usage"]["cached_input_tokens"] = 0
+      payload["observation"]["usage"]["cost_usd"] = 0.0
+    elif tamper == "authority":
+      payload["provenance"]["admitted_task_digest"] = f"sha256:{'9' * 64}"
+    else:
+      events[1]["final_state"] = "completed"
+  replay = TaskRegistry()
+  replay.load_from_events(events)
+  restored = replay.get("bg_7")
+  assert restored is not None
+  assert restored.state is TaskState.FAILED
+  assert restored.error is not None
+  assert restored.error["code"] == (
+    "task_result_settlement_mismatch"
+    if tamper == "park_receipt"
+    else "invalid_task_termination"
+  )
 
 
 async def _kill_registry_owner(
@@ -1348,7 +2202,7 @@ def test_finalize_interrupted_is_explicit_and_idempotent() -> None:
   ]
 
 
-def test_adopt_interrupted_accepts_only_reconstructed_interrupted_tasks() -> None:
+def test_adopt_reconstructed_retains_canonical_entry_and_accepts_durable_states() -> None:
   registry = TaskRegistry()
   entry = TaskEntry(
     task_id="bg_17",
@@ -1356,20 +2210,38 @@ def test_adopt_interrupted_accepts_only_reconstructed_interrupted_tasks() -> Non
     state=TaskState.INTERRUPTED,
     reconstructed_from_log=True,
   )
-
-  adopted = registry.adopt_interrupted(entry)
-  repeated = registry.adopt_interrupted(entry)
-
-  assert adopted is entry
+  reconstruction = TaskEntry(
+    task_id=entry.task_id,
+    task_type=entry.task_type,
+    state=TaskState.COMPLETED,
+    reconstructed_from_log=True,
+  )
+  assert reconstruction.finalization_lock is not entry.finalization_lock
+  assert registry.adopt_reconstructed(entry) is entry
+  repeated = registry.adopt_reconstructed(reconstruction)
   assert repeated is entry
+  assert repeated.finalization_lock is entry.finalization_lock
+  assert entry.state == TaskState.INTERRUPTED
   assert registry.get(entry.task_id) is entry
   assert registry.register("background_agent").task_id == "bg_18"
 
-  with pytest.raises(
-    ValueError,
-    match="only reconstructed interrupted tasks",
-  ):
-    registry.adopt_interrupted(
+  for state in (TaskState.AWAITING_APPROVAL, TaskState.COMPLETED, TaskState.FAILED):
+    durable = TaskEntry(
+      task_id=f"durable_{state.value}",
+      task_type="background_agent",
+      state=state,
+      reconstructed_from_log=True,
+      completion_persistence_state="committed",
+      completed_at=42,
+    )
+    assert registry.adopt_reconstructed(durable) is durable
+    assert durable.state == state
+    assert durable.completion_persistence_state == "committed"
+    assert durable.completed_at == 42
+    assert durable.completion_callback is None
+
+  with pytest.raises(ValueError, match="only reconstructed tasks"):
+    registry.adopt_reconstructed(
       TaskEntry(
         task_id="bg_live",
         task_type="background_agent",
@@ -2539,6 +3411,69 @@ def test_load_from_events_quarantines_task_result_settlement_mismatch(
   assert entry.task_result is None
   assert entry.error is not None
   assert entry.error["code"] == "task_result_settlement_mismatch"
+
+
+@pytest.mark.parametrize("final_state", ["pending", "running"])
+def test_load_from_events_quarantines_nonagent_live_completion(
+  final_state: str,
+) -> None:
+  registry = TaskRegistry()
+  result = {"response": "ordinary plan result", "steps": ["first", "second"]}
+  events = [
+    {
+      "type": "task_registered",
+      "event_schema_version": 2,
+      "task_id": "plan_7",
+      "task_type": "plan_run",
+      "agent_name": "planner",
+      "started_at": 100.0,
+    },
+    {
+      "type": "task_completed",
+      "task_id": "plan_7",
+      "final_state": final_state,
+      "completed_at": 125.0,
+      "result": result,
+      "error": None,
+    },
+  ]
+  source_events = [
+    {**events[0]},
+    {**events[1], "result": {"response": result["response"], "steps": ["first", "second"]}},
+  ]
+
+  registry.load_from_events(events)
+
+  entry = registry.get("plan_7")
+  assert entry is not None
+  assert entry.state is TaskState.FAILED
+  assert entry.completed is True
+  assert entry.error is not None
+  assert entry.error["code"] == "task_result_settlement_mismatch"
+  assert entry.result == result
+  assert entry.task_result is None
+  assert entry.completed_at == 125.0
+  assert entry.completion_persistence_state == "committed"
+  assert entry.reconstructed_from_log is True
+  assert entry.asyncio_task is None
+  assert registry.admission_count == 0
+  assert registry.inflight_count == 0
+  assert events == source_events
+
+  canonical = TaskRegistry()
+  lock = entry.finalization_lock
+  assert canonical.adopt_reconstructed(entry) is entry
+  replay = TaskRegistry()
+  replay.load_from_events(events)
+  repeated = replay.get("plan_7")
+  assert repeated is not None
+  assert repeated is not entry
+  assert canonical.adopt_reconstructed(repeated) is entry
+  assert canonical.get("plan_7") is entry
+  assert entry.finalization_lock is lock
+  assert canonical.admission_count == 0
+  assert canonical.inflight_count == 0
+  assert entry.asyncio_task is None
 
 
 def test_load_from_events_rejects_raw_completed_child_payload() -> None:

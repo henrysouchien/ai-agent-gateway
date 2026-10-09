@@ -347,12 +347,14 @@ def _request_facts():
 def test_gate_is_default_off_and_ignores_commercial_headers() -> None:
   gate = CommercialWorkStartGate(enabled=False)
   session, request, headers = _request_facts()
-  assert gate.verify_request(
-    {}, session=session, request=request, channel="mcp"
-  ) is None
-  assert gate.verify_request(
-    headers, session=session, request=request, channel="mcp"
-  ) is None
+  for commercial_headers in ({}, headers):
+    verified_claim = gate.verify_claim(commercial_headers, session=session)
+    assert verified_claim is None
+    pending = gate.authorize_request(
+      verified_claim, session=session, request=request, channel="mcp"
+    )
+    assert pending is None
+    assert gate.consume(pending) is None
 
 
 def test_enabled_gate_requires_complete_dependencies_and_both_headers() -> None:
@@ -362,24 +364,33 @@ def test_enabled_gate_requires_complete_dependencies_and_both_headers() -> None:
   gate, *_ = _gate(order)
   session, request, _ = _request_facts()
   with pytest.raises(CommercialWorkStartError) as raised:
-    gate.verify_request(
+    gate.verify_claim(
       {COMMERCIAL_CLAIM_HEADER: CLAIM_TOKEN},
       session=session,
-      request=request,
-      channel="mcp",
     )
   assert raised.value.status_code == 401
   assert raised.value.code == "commercial_work_authority_required"
   assert order == []
 
 
-def test_gate_verifies_exact_facts_then_consumes_without_retaining_tokens() -> None:
+def test_gate_claim_precedes_bound_facts_and_consumes_without_retaining_tokens() -> None:
   order: list[str] = []
   gate, _, authorization_verifier, store = _gate(order)
   session, request, headers = _request_facts()
 
-  pending = gate.verify_request(
-    headers, session=session, request=request, channel="mcp"
+  verified_claim = gate.verify_claim(headers, session=session)
+  assert verified_claim is not None
+  assert (
+    verified_claim.claim.commercial_account_id
+    == _verified_claim().commercial_account_id
+  )
+  assert authorization_verifier.calls == []
+  assert store.attached == []
+  assert "resolve_facts" not in order
+  assert CLAIM_TOKEN not in repr(verified_claim)
+  assert WORK_TOKEN not in repr(verified_claim)
+  pending = gate.authorize_request(
+    verified_claim, session=session, request=request, channel="mcp"
   )
   context = gate.consume(pending)
 
@@ -394,12 +405,9 @@ def test_gate_verifies_exact_facts_then_consumes_without_retaining_tokens() -> N
     "billing_mode": "metered",
     "capability_id": "portfolio.review",
   }]
-  assert order == [
-    "resolve_facts",
-    "verify_claim",
-    "verify_authorization",
-    "consume",
-  ]
+  assert order.index("verify_claim") < order.index("resolve_facts")
+  assert order.index("resolve_facts") < order.index("verify_authorization")
+  assert order.index("verify_authorization") < order.index("consume")
   assert CLAIM_TOKEN not in repr(pending)
   assert WORK_TOKEN not in repr(pending)
   assert CLAIM_TOKEN not in repr(context)
@@ -413,12 +421,39 @@ def test_gate_rejects_claim_for_a_different_session_owner_before_authorization()
   session.owner_user_id = "202"
 
   with pytest.raises(CommercialWorkStartError) as raised:
-    gate.verify_request(headers, session=session, request=request, channel="mcp")
+    gate.verify_claim(headers, session=session)
 
   assert raised.value.code == "commercial_work_subject_mismatch"
   assert raised.value.status_code == 403
   assert authorization_verifier.calls == []
+  assert "resolve_facts" not in order
   assert store.attached == []
+
+
+@pytest.mark.parametrize("invalid_facts", (False, True))
+def test_gate_facts_failure_does_not_authorize_or_consume(invalid_facts: bool) -> None:
+  order: list[str] = []
+  gate, _, authorization_verifier, store = _gate(order)
+  session, request, headers = _request_facts()
+
+  def unavailable(_session, _request, _channel) -> Any:
+    if invalid_facts:
+      return None
+    raise RuntimeError("facts unavailable")
+
+  gate._facts_resolver = unavailable
+  verified_claim = gate.verify_claim(headers, session=session)
+  with pytest.raises(CommercialWorkStartError) as raised:
+    gate.authorize_request(
+      verified_claim, session=session, request=request, channel="mcp"
+    )
+
+  assert raised.value.code == "commercial_work_start_unavailable"
+  assert raised.value.status_code == 503
+  assert authorization_verifier.calls == []
+  assert store.attached == []
+  assert CLAIM_TOKEN not in str(raised.value)
+  assert WORK_TOKEN not in str(raised.value)
 
 
 def test_gate_runs_durability_preflight_before_consuming_authority() -> None:
@@ -431,8 +466,9 @@ def test_gate_runs_durability_preflight_before_consuming_authority() -> None:
   gate, _, _, store = _gate(order, pre_consume=unavailable)
   session, request, headers = _request_facts()
 
-  pending = gate.verify_request(
-    headers, session=session, request=request, channel="mcp"
+  verified_claim = gate.verify_claim(headers, session=session)
+  pending = gate.authorize_request(
+    verified_claim, session=session, request=request, channel="mcp"
   )
   with pytest.raises(CommercialWorkStartError) as raised:
     gate.consume(pending)
@@ -440,9 +476,8 @@ def test_gate_runs_durability_preflight_before_consuming_authority() -> None:
   assert raised.value.code == "commercial_work_start_unavailable"
   assert raised.value.status_code == 503
   assert store.attached == []
-  assert order == [
-    "resolve_facts", "verify_claim", "verify_authorization", "preflight",
-  ]
+  assert "preflight" in order
+  assert "consume" not in order
 
 
 def test_child_provider_must_match_verified_root_authority() -> None:
@@ -470,19 +505,22 @@ def test_gate_maps_invalid_replay_conflict_and_storage_failure_to_no_start() -> 
   session, request, headers = _request_facts()
   claim_verifier.error = CommercialClaimError("unknown_key")
   with pytest.raises(CommercialWorkStartError) as invalid:
-    gate.verify_request(
-      headers, session=session, request=request, channel="mcp"
-    )
+    gate.verify_claim(headers, session=session)
   assert invalid.value.code == "commercial_work_authority_invalid"
   assert invalid.value.status_code == 403
   assert "unknown_key" in str(invalid.value)
   assert store.attached == []
+  assert "resolve_facts" not in order
+  assert authorization_verifier.calls == []
 
   claim_verifier.error = None
   authorization_verifier.error = WorkAuthorizationError("key_retired")
   with pytest.raises(CommercialWorkStartError) as retired:
-    gate.verify_request(
-      headers, session=session, request=request, channel="mcp"
+    gate.authorize_request(
+      gate.verify_claim(headers, session=session),
+      session=session,
+      request=request,
+      channel="mcp",
     )
   assert retired.value.code == "commercial_work_authority_invalid"
   assert retired.value.status_code == 403
@@ -490,8 +528,11 @@ def test_gate_maps_invalid_replay_conflict_and_storage_failure_to_no_start() -> 
   assert store.attached == []
 
   authorization_verifier.error = None
-  pending = gate.verify_request(
-    headers, session=session, request=request, channel="mcp"
+  pending = gate.authorize_request(
+    gate.verify_claim(headers, session=session),
+    session=session,
+    request=request,
+    channel="mcp",
   )
   cases = (
     (
@@ -615,8 +656,30 @@ def _chat_headers(token: str, work_token: str = WORK_TOKEN) -> dict[str, str]:
 
 def test_server_consumes_before_runtime_and_never_transcripts_raw_tokens(
   tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  app, _, store, order, observed = _server_app(tmp_path)
+  import agent_gateway.server as server
+
+  app, gate, store, order, observed = _server_app(tmp_path)
+  resolve_facts = gate._facts_resolver
+  assert resolve_facts is not None
+
+  def bound_facts(session, request, channel):
+    assert request.capability_bind is not None
+    assert request.bound_auth_config is not None
+    return resolve_facts(session, request, channel)
+
+  gate._facts_resolver = bound_facts
+  prepare_turn = server.prepare_session_driver_turn
+
+  def prepare(*args, **kwargs):
+    assert "verify_claim" in order
+    assert "resolve_facts" not in order
+    assert store.attached == []
+    order.append("prepare")
+    return prepare_turn(*args, **kwargs)
+
+  monkeypatch.setattr(server, "prepare_session_driver_turn", prepare)
   with TestClient(app) as client:
     token = _session_token(client)
     with client.stream(
@@ -633,6 +696,9 @@ def test_server_consumes_before_runtime_and_never_transcripts_raw_tokens(
       assert response.status_code == 200
       list(response.iter_lines())
 
+  assert order.index("verify_claim") < order.index("prepare")
+  assert order.index("prepare") < order.index("resolve_facts")
+  assert order.index("resolve_facts") < order.index("verify_authorization")
   assert order.index("verify_authorization") < order.index("consume")
   assert order.index("consume") < order.index("runtime")
   assert order.index("runtime") < order.index("provider_start")
@@ -641,6 +707,56 @@ def test_server_consumes_before_runtime_and_never_transcripts_raw_tokens(
   persisted = b"".join(path.read_bytes() for path in tmp_path.glob("*.jsonl"))
   assert CLAIM_TOKEN.encode() not in persisted
   assert WORK_TOKEN.encode() not in persisted
+
+
+@pytest.mark.parametrize("refusal", ("claim", "subject"))
+def test_server_claim_refusal_never_prepares_or_resolves_facts(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  caplog: pytest.LogCaptureFixture,
+  refusal: str,
+) -> None:
+  import agent_gateway.server as server
+
+  app, gate, store, order, _ = _server_app(tmp_path)
+  claim_verifier = gate._claim_verifier
+  assert isinstance(claim_verifier, _ClaimVerifier)
+  if refusal == "claim":
+    claim_verifier.error = CommercialClaimError("unknown_key")
+    expected_code = "commercial_work_authority_invalid"
+  else:
+    claim_verifier.claim = replace(claim_verifier.claim, subject="user:202")
+    expected_code = "commercial_work_subject_mismatch"
+
+  def unexpected_prepare(*_args, **_kwargs):
+    pytest.fail("a refused commercial claim must not resolve a driver model")
+
+  monkeypatch.setattr(server, "prepare_session_driver_turn", unexpected_prepare)
+  with TestClient(app) as client:
+    token = _session_token(client)
+    response = client.post(
+      "/api/chat",
+      headers=_chat_headers(token),
+      json={
+        "request_id": "request-1",
+        "user_id": "101",
+        "context": {"channel": "mcp"},
+        "messages": [{"role": "user", "content": "hello"}],
+      },
+    )
+
+  assert response.status_code == 403
+  assert response.json()["error"] == expected_code
+  if refusal == "claim":
+    assert "unknown_key" in response.json()["message"]
+  assert "resolve_facts" not in order
+  assert "verify_authorization" not in order
+  assert "runtime" not in order
+  assert store.attached == []
+  assert CLAIM_TOKEN not in response.text
+  assert WORK_TOKEN not in response.text
+  assert CLAIM_TOKEN not in caplog.text
+  assert WORK_TOKEN not in caplog.text
 
 
 def test_server_rejects_missing_or_replayed_authority_before_runtime(

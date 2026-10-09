@@ -1,50 +1,70 @@
 # Changelog
 
+## 0.24.1 (2026-10-08)
+
+### Breaking
+
+- Investment facade claims use version 4 and `kind=facade`, signing the executing
+  admitted tenant alongside the Risk subject. Consumers migrate their facade
+  verifier with the package upgrade. Selected-content version 2 and
+  job-principal version 3 retain their distinct forms.
+- `ApprovalRequestStore` adds the required Protocol members `locate_request` and `_locate_request_for_decision`; custom store implementations must provide both.
+- `TaskRegistry.adopt_interrupted()` is removed in favor of `adopt_reconstructed()`, which keeps an existing canonical live entry or adopts a durable reconstruction regardless of task state.
+- `resume_admitted_successor()` requires the keyword-only `on_park` (an async callback or `None`) and installs it before the successor worker starts.
+- `dispatch_identity()` requires the keyword-only `attempt_lineage` (`None` for an initial dispatch, a trusted async resume-ancestry lookup for a successor).
+- `make_resume_handler()` requires the keyword-only `operation_resume_bindings` (`None` when no operation-specific resume wiring is installed), and `AgentRunner.resume_sub_agent()` requires `usage_aggregator`.
+- `ToolDispatcherApprovalStore` adds the required Protocol members `_read_executable_binding_for_executor`, `_read_completed_executable_result_for_executor`, `_claim_executable_binding_for_executor` and `_complete_executable_binding_for_executor`.
+- The autonomous event channel adds the `PRIVATE_EXECUTABLE_CAPTURE` frame: `AutonomousEventChannelParent.receive_next()` can return `AutonomousPrivateExecutableCapture`, and bulk `receive()` rejects a stream containing one.
+- `create_delegated_autonomous_approval()` requires a verified `AutonomousClaimBroker` even when no capture is supplied.
+
+### Added
+
+- `ToolDispatcher.execute_approved_binding(*, job_id, tool_call_id, nonce, abort_event, on_executed_prepared_call)` executes the exact durably bound original call after approval: same job or a trusted resume successor, authenticated tenant, original grant membership and frozen credential generation; one claimed attempt, completed results replay, unknown MCP outcomes stay unknown.
+- `continue_approved_child(runner, *, parked_task_id, job_id, tool_call_id, nonce, on_complete, on_park)` (host-side) mints the ordinary resume successor with the original `ToolGrant` object and, before the provider runs, executes the approved original call once through the successor's `execute_approved_binding`, replacing only that tool use's synthetic result.
+- Autonomous children send the original approved call's executable operands on a private event-channel frame (`AutonomousEventChannelChild.send_private_executable_capture`); the parent verifies identity against the signed launch envelope and records the private binding before publishing the request.
+- `AgentRunner.attach_background_task(task_id, *, on_complete, on_park)` attaches lifecycle callbacks to a live or adopted durable task without starting it or resetting its state; `OperationResumeBinding` supplies scoped local handlers, an operation-selected usage aggregator and an optional settlement callback that `make_resume_handler()` applies after releasing activity ownership.
+- `resume_binding_for(runner, task_id)` returns the adopted entry plus prior durable journal evidence and the operation's resume bindings when a restored learning-fork child asks.
+- `TaskRegistry.commit_parked_termination()` and `restore_committed_awaiting()` publish a durable parked cancellation and restore an interrupted projection to its committed approval park.
+- `inherited_operation_declaration()` derives a child declaration from the parent's tool ceiling using catalog-owned capabilities and effects, picks the narrowest admitting workspace scope, and excludes effect-less routes with a warning.
+- `learning_child_session_id(job_id)` derives a learning fork's session id from its logical job id.
+
+### Changed
+
+- `resume_admitted_successor` documents its cancellation contract: caller cancellation leaves initialization running with an unknown outcome, retrying the same successor returns its live entry, and an error result is returned only before a worker exists.
+- `TaskRegistry.load_from_events()` replays ordered `task_terminated` records as cancelled parked attempts without replacing the original park receipt (a durable event-log record; no SQLite change).
+- `ToolDispatcher` execution audits use canonical result settlement and semantic tool-error classification, and approval-binding and planned-write errors carry recovery guidance in `data.next_call` plus `approval_id`, `tool_call_id` and `state` when known.
+
+### Fixed
+
+- Parked skill settlement is nonfinal: `classify_child_outcome()` classifies
+  `awaiting_approval` without error and with `is_final=False`, emitting no
+  terminal `skill_result_captured` event and leaving durable run and outcome
+  counters unincremented until the final outcome is published.
+
+- A parked background task (`awaiting_approval`) stays non-terminal; its park callback fires once after the durable park commits, including when the append acknowledgement is lost after fsync; `terminate_parked_background_task` stops a parked task by journaling one `task_terminated` with the same admission and full cumulative usage under the original task finalization lock.
+- Approval decisions resolve the durable request under the authenticated tenant and original call/nonce when the live queue is gone; the vote commits before the installed root or child continuation hook runs, and an absent hook reports the uninstalled owner.
+- `collect_run_output`, `build_state_payload` and `format_run_summary` keep `awaiting_approval` a non-error autonomous outcome, retain approval references only while parked, and display the pending approval instead of reporting completion.
+- `RunnerSessionLifecycleMixin` accepts child-authored messages addressed to the root mailbox and reconciles their consumption through the owning task and the consumer's attach provenance.
+- `make_resume_handler` adopts reconstructed parked tasks into the canonical registry, serializes admitted-successor installation with a parked source's STOP, discards an unstarted successor whose source has terminated, and holds the source lock until shielded initialization settles after caller cancellation.
+- A credential rotation that lands on an untried pool member no longer spends a transient stream retry, so a run can cycle through all parked members before the turn fails.
+
 ## 0.24.0 (2026-10-08)
 
 ### Breaking
 
-- `ToolDispatcher` requires the keyword-only `capability_bind`, the frozen bind of the execution it dispatches for; `fork_child()` requires the fork execution's `capability_bind` as well. Investment callers migrate together with the `>=0.24,<0.25` dependency range: production `research/task_runner.py` (two sites) and `research/web.py`, and five sites in `tests/unit/test_capability_task_runner_policy.py`. `build_tool_dispatcher()` requires the same argument.
-- `CapabilityExecutionResolver.select_bind()` and `.resolve()` remove `role_map`, `role_map_source` and `requested_role_source`; pass the frozen `selection_snapshot` instead.
-- `RootTurnRecord` removes `routes_json` and replaces `grant_routes_digest` with `grant_digest`; `SQLiteApprovalStore.record_root_turn()` removes `routes`. On open, `SQLiteApprovalStore` rebuilds the 0.23.1 `approval_root_turns` table, preserving rows, executable references and indexes while recomputing grant digests. Snapshot digests are recomputed only after validating the original snapshot; altered rows retain their original digest and remain unreadable as `snapshot_mismatch`.
-- `AgentRunnerDispatcher` implementations must provide `replace_capability_bind()` and `local_tool_handlers()`, and accept the required keyword-only `capability_bind` in `fork_child()`.
-- `issue_investment_capability_claim()` requires the keyword-only `tenant` argument and an authenticated `AdmittedTenant`; the emitted facade claim remains version 1.
-- `run_approval_lifecycle()` requires `executable_capture` (pass `None` without native capture); `ApprovalLifecycleStore` implementations must provide `record_executable_binding()` and `link_root_turn_executable_binding()`.
-
-- `ToolDispatcher.fork_child` requires `spawning_turn`, captured synchronously
-  with `capture_spawning_turn()` before scheduling the fork. Fork request
-  handoffs carry that scope so learning-fork approvals retain the submitting
-  job and root turn even if a later turn starts before the worker runs.
-  Independently admitted child identities retain their own job context and
-  do not attach approval bindings to the parent's root turn.
-- Code execution no longer reads or consumes legacy computation JSON sidecars.
-  Native nested-call provenance and settled `dispatch.sources` remain available
-  in terminal results; the sidecar-only size/count limits and deduplication are removed.
-
-### Added
-
-- `RootTurnAdmission` and `admit_root_turn()`, `capture_root_turn()`, `current_root_turn()`, `record_root_turn_admission()` and `link_root_park()` capture each root turn’s exact authority and link parked calls to its durable snapshot.
-- `reserve_admitted_successor()` and `resume_admitted_successor()` provide a trusted host entry for workflow-owner-admitted successors, separate from model-driven resume.
-- `child_gateway_session()` constructs child sessions from admitted tenancy and materialized child credentials.
-- `BoundCapabilityExecution.resolver` retains its materializing resolver; `CapabilityExecutionResolver.rebind_rotated_credential()` authorizes a rotated credential generation under a new exact bind.
-- `ToolDispatcher.replace_capability_bind()` updates the current credential bind without changing execution authority; `local_tool_handlers()` exposes configured job-rebound local handlers.
-
-### Changed
-
-- `ToolDispatcher.dispatch_prepared()` captures the original native prepared call and dispatch context in private approval custody before publishing a park, including the executing job, tenant and credential generation.
-- `run_autonomous()` records root-turn admission before root tool dispatch; SDK approval calls can link durable requests to root turns without native executable capture.
+- `ToolDispatcher` requires the keyword-only `capability_bind`, the frozen bind
+  of the execution it dispatches for; forks retain that bind. Investment callers
+  migrate their production and test constructions together with the
+  `>=0.24,<0.25` dependency range.
 
 ### Fixed
 
-- An uncaptured `GatewaySession` declares absent admitted job context as `None`. Investment claim issuance returns its typed authority gap rather than failing on an undeclared attribute.
-- `ToolDispatcher.fork_child()` retains the spawning turn’s admitted job context and root-turn admission even after the shared session advances, and carries the fork execution's capability bind so learning forks rotate runner and dispatcher together.
-- `AgentRunner` and `send_prompt()` rebind rotated credentials through the execution’s resolver; `make_run_agent_handler()` resolves descendants through the live execution’s resolver rather than stale construction-time credentials. `run_autonomous()` pairs a prebound execution that lacks a resolver with an explicitly supplied resolver before constructing its runner.
-- `resume_admitted_successor()` tells the model the workflow owner’s frozen `resume_instruction`.
-- `SQLiteApprovalStore` serializes secure connection open and close across stores and processes to prevent concurrent WAL/SHM unlink races; its executable-result lookup reports claimed execution as `execution_outcome_unknown` rather than an absent result.
-- `code_execute` prepends `extra_env` values only for `PATH` and `PYTHONPATH`; scalar environment variables replace inherited values.
-- `SessionContextBuilder.build()` drains the initial fork-seed existence lookup as well as the append before cancellation completes.
-- `AgentRunner` preserves exact root-writer mailbox consumption lineage without requiring or fabricating a child id.
-- `AutonomousRegistryStartMixin` registers prepared session-log launch inputs through the admitted child environment projection instead of injecting them afterward.
+- An uncaptured `GatewaySession` declares absent admitted job context as `None`.
+  Investment claim issuance returns its typed authority gap rather than failing
+  on an undeclared attribute.
+
+- Autonomous output preserves `awaiting_approval` as a non-successful, non-error
+  outcome, retaining usage and safe approval references in state and summaries.
 
 ## 0.23.1 (2026-10-08)
 
@@ -72,11 +92,12 @@ changes listed next. No in-forest consumer (Risk, Investment) calls the changed 
 - `DispatchIdentity` requires the executing admitted context independently of
   its credential session. Spawn, resume and native child dispatch retain their
   own job identity, including sessionless admitted execution.
-- Consumption of root-writer-authored mailbox facts preserves the exact accepted
-  root job, message, runner and role without fabricating a child id. Those audits
-  omit absent child namespace fields and remain replay-idempotent. Child
-  consumption retains its existing parent-to-child lineage; child-authored sends
-  to the root are not repaired by this change.
+- Root mailbox consumption accepts root-writer- and child-authored sent facts
+  without rewriting sender provenance or fabricating a child namespace.
+  Recipient authority comes from the bound registry owner; the consumer writer
+  comes from an earlier matching attach, including historical replay.
+  Child-recipient lineage and exact binding/conflict checks remain enforced,
+  and consumption audits remain replay-idempotent.
 
 - Approval executable bindings are private, separate from redacted approval
   projections. The existing SQLite owner preserves original prepared operands,

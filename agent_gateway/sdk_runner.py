@@ -16,6 +16,7 @@ from .approval_policy import (
   utc_now,
 )
 from . import approval_settings
+from . import admission as _admission
 from .agent_session_log import AgentSessionLog
 from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich_trade_approval_args
 from .approval_route import (
@@ -241,6 +242,9 @@ class _SDKSegmentQueryIterator:
     self._initial_prompt = initial_prompt
     self._options_kwargs = options_kwargs
     self._iterator: AsyncIterator[Any] | None = None
+    self._client: Any | None = None
+    self._start_task: asyncio.Task[AsyncIterator[Any]] | None = None
+    self._transport_error: Exception | None = None
     self._closed = False
     self._prior_usage = {
       "input_tokens": 0,
@@ -403,19 +407,12 @@ class _SDKSegmentQueryIterator:
     self._segment_turns = 0
 
   async def _close_current(self) -> None:
-    iterator = self._iterator
+    client = self._client
+    start_task = self._start_task
+    self._client = None
+    self._start_task = None
     self._iterator = None
-    if iterator is None:
-      return
-    close_fn = getattr(iterator, "aclose", None) or getattr(iterator, "close", None)
-    if close_fn is None:
-      return
-    try:
-      closed = close_fn()
-      if asyncio.iscoroutine(closed):
-        await closed
-    except Exception:
-      pass
+    await self._runner._close_sdk_client(client, start_task=start_task)
 
   def _provider_tool_surface_changed(self) -> bool:
     advertised = set(self._options_kwargs.get("disallowed_tools") or [])
@@ -479,17 +476,24 @@ class _SDKSegmentQueryIterator:
       prompt += f" The triggering tool result was:\n\n{self._last_rebuild_context}"
     return prompt
 
-  def _start_segment(self) -> AsyncIterator[Any]:
+  async def _start_segment(self) -> AsyncIterator[Any]:
+    if self._closed:
+      raise asyncio.CancelledError
     prompt_text = (
       self._initial_prompt
       if self._iterator is None and self._prior_turns == 0
       else self._continuation_prompt()
     )
     options = getattr(self._sdk, "ClaudeAgentOptions")(**self._options_kwargs)
-    iterator = getattr(self._sdk, "query")(
-      prompt=_PromptMessages(prompt_text),
-      options=options,
-    )
+    client = getattr(self._sdk, "ClaudeSDKClient")(options=options)
+    self._client = client
+    await client.connect()
+    if self._closed:
+      raise asyncio.CancelledError
+    await client.query(prompt=_PromptMessages(prompt_text))
+    if self._closed:
+      raise asyncio.CancelledError
+    iterator = client.receive_response()
     self._iterator = iterator
     return iterator
 
@@ -509,20 +513,33 @@ class _SDKSegmentQueryIterator:
     )
 
   async def __anext__(self) -> Any:
-    if self._closed:
-      raise StopAsyncIteration
     while True:
+      if self._closed:
+        raise StopAsyncIteration
       if self._rebuild_required() and self._iterator is None:
         await self._rebuild()
+      if self._closed:
+        raise StopAsyncIteration
       iterator = self._iterator
       if iterator is None:
-        iterator = self._start_segment()
+        start_task = asyncio.create_task(self._start_segment())
+        self._start_task = start_task
+        try:
+          iterator = await start_task
+        finally:
+          if self._start_task is start_task:
+            self._start_task = None
+      if self._closed:
+        raise StopAsyncIteration
       try:
         message = await iterator.__anext__()
       except StopAsyncIteration:
         if self._rebuild_required():
           await self._rebuild()
           continue
+        raise
+      except Exception as exc:
+        self._transport_error = exc
         raise
       self._observe_message(message)
       if self._rebuild_required():
@@ -536,8 +553,10 @@ class _SDKSegmentQueryIterator:
 
   async def aclose(self) -> None:
     self._closed = True
-    self._runner._discard_pending_sdk_load()
-    await self._close_current()
+    try:
+      self._runner._discard_pending_sdk_load()
+    finally:
+      await self._close_current()
 
 
 class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
@@ -797,6 +816,8 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     self._suppress_text_after_accepted_ui_blocks = False
     self._active_skill_allow: set[str] = set()
     self._query_iter: Any = None
+    self._permission_tasks: set[asyncio.Task[Any]] = set()
+    self._query_close_task: asyncio.Task[None] | None = None
     self._usage: Dict[str, Any] = {
       "capability_bind": capability_bind.to_json(),
       "provider_reported_model": None,
@@ -835,6 +856,12 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     )
     self._summary_emitted = False
     self._session = session
+    producer_context = getattr(session, "admitted_job_context", None)
+    self._root_turn_admission: _admission.RootTurnAdmission | None = (
+      _admission.current_root_turn(session)
+      if getattr(producer_context, "children", None) is None
+      else None
+    )
     self._agent_session_log = agent_session_log
     self._selected_content_bindings: tuple[SelectedContentBinding, ...] = ()
     self._selected_content_bindings_bound = False
@@ -1593,64 +1620,156 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     return _approval_queue_timeout_seconds(expiry_seconds)
 
   async def _can_use_tool_callback(self, tool_name: str, input_data: dict[str, Any], _context: Any) -> Any:
-    if tool_name in MODEL_RUN_IDENTITY_LOCAL_TOOLS:
-      import claude_agent_sdk
+    task = asyncio.current_task()
+    if task is not None:
+      self._permission_tasks.add(task)
+    try:
+      if self._query_close_task is not None and not self._query_close_task.done():
+        raise asyncio.CancelledError
+      if tool_name in MODEL_RUN_IDENTITY_LOCAL_TOOLS:
+        import claude_agent_sdk
 
-      deny_cls = getattr(claude_agent_sdk, "PermissionResultDeny")
-      try:
-        carrier = self._run_identity_carrier
-        if carrier is None:
-          raise RunIdentityCarrierError(
-            "run_identity_required",
-            f"Tool '{tool_name}' requires a server-owned run identity.",
+        deny_cls = getattr(claude_agent_sdk, "PermissionResultDeny")
+        try:
+          carrier = self._run_identity_carrier
+          if carrier is None:
+            raise RunIdentityCarrierError(
+              "run_identity_required",
+              f"Tool '{tool_name}' requires a server-owned run identity.",
+            )
+          context_run_id = validate_run_identity(
+            self._resolve_run_context().run_id
           )
-        context_run_id = validate_run_identity(
-          self._resolve_run_context().run_id
-        )
-        if context_run_id != carrier.run_id:
-          raise RunIdentityCarrierError(
-            "run_identity_mismatch",
-            f"Tool '{tool_name}' received conflicting run identities.",
-          )
-      except RunIdentityCarrierError as exc:
-        return deny_cls(message=f"[{exc.code}] {exc}")
-    return await _sdk_runner_approval.can_use_tool_callback(
-      self,
-      tool_name,
-      input_data,
-      _context,
-      current_skill_admission_fn=current_skill_admission,
-      enrich_trade_approval_args_fn=enrich_trade_approval_args,
-      uuid_hex_fn=lambda: uuid.uuid4().hex,
-    )
+          if context_run_id != carrier.run_id:
+            raise RunIdentityCarrierError(
+              "run_identity_mismatch",
+              f"Tool '{tool_name}' received conflicting run identities.",
+            )
+        except RunIdentityCarrierError as exc:
+          return deny_cls(message=f"[{exc.code}] {exc}")
+      return await _sdk_runner_approval.can_use_tool_callback(
+        self,
+        tool_name,
+        input_data,
+        _context,
+        current_skill_admission_fn=current_skill_admission,
+        enrich_trade_approval_args_fn=enrich_trade_approval_args,
+        uuid_hex_fn=lambda: uuid.uuid4().hex,
+      )
+    finally:
+      if task is not None:
+        self._permission_tasks.discard(task)
+
+  async def _drain_permission_tasks(self) -> None:
+    current = asyncio.current_task()
+    while True:
+      tasks = tuple(
+        task for task in self._permission_tasks
+        if task is not current
+      )
+      if not tasks:
+        return
+      for task in tasks:
+        if not task.done() and not task.cancelling():
+          task.cancel()
+      results = await asyncio.gather(*tasks, return_exceptions=True)
+      for result in results:
+        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+          raise result
+
+  async def _close_sdk_client(
+    self,
+    client: Any | None,
+    *,
+    start_task: asyncio.Task[AsyncIterator[Any]] | None = None,
+  ) -> None:
+    current = asyncio.current_task()
+    close_task = self._query_close_task
+    if close_task is None and client is None and start_task is None and not self._permission_tasks:
+      return
+    if close_task is not None and (
+      current is close_task or current in self._permission_tasks
+    ):
+      # A handler's cancellation cleanup must finish, not await its own drain.
+      return
+    if close_task is None:
+
+      async def close() -> None:
+        try:
+          await self._drain_permission_tasks()
+        finally:
+          try:
+            if start_task is not None and start_task is not current:
+              if not start_task.done() and not start_task.cancelling():
+                start_task.cancel()
+              try:
+                await start_task
+              except asyncio.CancelledError:
+                pass
+          finally:
+            if client is not None:
+              await client.disconnect()
+
+      close_task = asyncio.create_task(close())
+      self._query_close_task = close_task
+    if current in self._permission_tasks:
+      # The owner cancels this initiator; propagate it so its drain can finish.
+      await asyncio.shield(close_task)
+      return
+    cancelled = False
+    try:
+      while not close_task.done():
+        try:
+          await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+          cancelled = True
+      close_task.result()
+    finally:
+      if self._query_close_task is close_task:
+        self._query_close_task = None
+    if cancelled:
+      raise asyncio.CancelledError
 
   async def _close_query_iterator(self) -> None:
     iterator = self._query_iter
     self._query_iter = None
-    if iterator is None:
-      return
-    close_fn = getattr(iterator, "aclose", None)
-    if close_fn is not None:
-      try:
-        await close_fn()
-      except Exception:
-        pass
-      return
-    close_fn = getattr(iterator, "close", None)
-    if close_fn is None:
-      return
-    try:
-      maybe_awaitable = close_fn()
-      if asyncio.iscoroutine(maybe_awaitable):
-        await maybe_awaitable
-    except Exception:
-      pass
+    if iterator is not None:
+      await iterator.aclose()
+    else:
+      await self._close_sdk_client(None)
 
   async def on_disconnect(self) -> None:
-    try:
-      await self._close_query_iterator()
-    except Exception as exc:
-      log.warning("[%s] query iterator close on disconnect failed (non-fatal): %s", self._sid, exc)
+    await self._close_query_iterator()
+
+  async def _pending_root_approval_park(
+    self,
+  ) -> _approval_lifecycle_helpers.ApprovalPark | None:
+    root = self._root_turn_admission
+    store = self._approval_store
+    if root is None or root.job_id is None or root.tenant is None or store is None:
+      return None
+    record = await store._read_root_turn_for_executor(
+      job_id=root.job_id,
+      turn_id=root.turn_id,
+      tenant_storage_id=root.tenant.storage_id,
+    )
+    if record is None:
+      return None
+    for ref in record.executable_refs:
+      located = await store._locate_request_for_decision(
+        tenant_storage_id=root.tenant.storage_id,
+        tool_call_id=ref.tool_call_id,
+        nonce=ref.nonce,
+      )
+      if located is not None and located[0].state == "pending_user":
+        return _approval_lifecycle_helpers.ApprovalPark(
+          job_id=root.job_id,
+          original_tool_call_id=ref.tool_call_id,
+          approval_id=located[0].approval_id,
+          nonce=ref.nonce,
+          root_turn_id=root.turn_id,
+        )
+    return None
 
   def _update_usage(self, usage: Any, *, total_cost_usd: float | None = None, num_turns: int | None = None) -> None:
     usage_dict = _as_dict(usage)
@@ -1939,6 +2058,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     }
     options_kwargs = {key: value for key, value in options_kwargs.items() if value is not None}
 
+    query_iter: _SDKSegmentQueryIterator | None = None
     try:
       result_seen = False
       result_error: RuntimeError | None = None
@@ -2011,12 +2131,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
             # With no prior per-call emission, the cumulative ResultMessage is
             # the single commercial observation for the whole query.
             self._sdk_provider_call_usage = None
-          if result_succeeded:
-            self._flush_pending_tool_calls(
-              outcome="tool_completion_unobserved"
-            )
-            self._emit_stream_complete()
-          else:
+          if not result_succeeded:
             result_detail = str(
               _get_attr(message, "result")
               or result_subtype
@@ -2025,9 +2140,6 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
             result_error = RuntimeError(
               f"agent_sdk_result_error: {result_detail}"
             )
-            self._flush_pending_tool_calls(outcome="tool_error")
-            self._append({"type": "error", "error": str(result_error)})
-            self._stream_terminal_emitted = True
           break
 
         if hasattr(message, "subtype") and hasattr(message, "data"):
@@ -2038,13 +2150,26 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
           self._handle_assistant_message(message)
           continue
 
+      await self._close_query_iterator()
       if result_error is not None:
         raise result_error
+      park = await self._pending_root_approval_park()
+      if park is not None:
+        raise park
       if not result_seen:
         raise RuntimeError(
           "agent_sdk_stream_ended_without_result: SDK iterator ended before "
           "a ResultMessage proved completion"
         )
+      self._flush_pending_tool_calls(outcome="tool_completion_unobserved")
+      self._emit_stream_complete()
+    except _approval_lifecycle_helpers.ApprovalPark as park:
+      await self._close_query_iterator()
+      self._emit_stream_complete(
+        terminal_disposition="awaiting_approval",
+        approval_park=park,
+      )
+      raise
     except CommercialUsageCircuitOpen as exc:
       await self._close_query_iterator()
       self._flush_pending_tool_calls(outcome="usage_durability_blocked")
@@ -2055,7 +2180,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       })
       self._stream_terminal_emitted = True
       raise
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as cancelled_exc:
       usage_cleanup_error: Exception | None = None
       try:
         if self._commercial_usage_producer is not None and self._sdk_provider_call_usage is not None:
@@ -2069,6 +2194,13 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
         usage_cleanup_error = exc
       await self._close_query_iterator()
       if usage_cleanup_error is None:
+        park = await self._pending_root_approval_park()
+        if park is not None:
+          self._emit_stream_complete(
+            terminal_disposition="awaiting_approval",
+            approval_park=park,
+          )
+          raise park from cancelled_exc
         self._flush_pending_tool_calls(outcome="cancelled")
         self._emit_stream_complete(
           terminal_disposition="interrupted",
@@ -2109,6 +2241,18 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       except Exception as cleanup_exc:
         usage_cleanup_error = cleanup_exc
       await self._close_query_iterator()
+      if (
+        usage_cleanup_error is None
+        and query_iter is not None
+        and query_iter._transport_error is exc
+      ):
+        park = await self._pending_root_approval_park()
+        if park is not None:
+          self._emit_stream_complete(
+            terminal_disposition="awaiting_approval",
+            approval_park=park,
+          )
+          raise park from exc
       if not self._stream_terminal_emitted:
         interruption_reason = (
           "usage_durability_blocked"
@@ -2132,30 +2276,32 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
         self._stream_terminal_emitted = True
       raise
     finally:
-      self.release_research_file_activity_lease_if_owned()
-      self.release_selected_content_activity_lease_if_owned()
-      clear_current_skill()
-      self._active_skill_allow.clear()
-      if self._parent_aggregator is None:
-        try:
-          await self._aggregator.close()
-          summary = await self._aggregator.snapshot(
-            ended_at=time.time(),
-            drain_complete=True,
-            in_flight_task_count=0,
-            context_surfaces=self._context_surface_records(),
-          )
+      try:
+        await self._close_query_iterator()
+      finally:
+        self.release_research_file_activity_lease_if_owned()
+        self.release_selected_content_activity_lease_if_owned()
+        clear_current_skill()
+        self._active_skill_allow.clear()
+        if self._parent_aggregator is None:
+          try:
+            await self._aggregator.close()
+            summary = await self._aggregator.snapshot(
+              ended_at=time.time(),
+              drain_complete=True,
+              in_flight_task_count=0,
+              context_surfaces=self._context_surface_records(),
+            )
+            self._summary_emitted = True
+            await self._call_on_session_summary(summary)
+          except Exception as exc:
+            log.warning(
+              "[%s] session summary emission failed (non-fatal) | exception_type=%s",
+              self._sid,
+              type(exc).__name__,
+            )
+        else:
           self._summary_emitted = True
-          await self._call_on_session_summary(summary)
-        except Exception as exc:
-          log.warning(
-            "[%s] session summary emission failed (non-fatal) | exception_type=%s",
-            self._sid,
-            type(exc).__name__,
-          )
-      else:
-        self._summary_emitted = True
-      await self._close_query_iterator()
 
 
 __all__ = ["AgentSDKRunner"]

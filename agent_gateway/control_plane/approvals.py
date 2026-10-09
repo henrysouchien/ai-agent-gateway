@@ -12,6 +12,7 @@ from agent_gateway.approvals import (
   TERMINAL_APPROVAL_STATES,
   ApprovalActionError,
   _approval_request_to_dict,
+  _record_durable_vote_and_continue,
   _record_vote_and_unblock,
 )
 from agent_gateway.approval_store import SQLiteApprovalStore
@@ -254,7 +255,11 @@ async def _approval_records_for_autonomous_task(store: Any, record: AutonomousTa
         tool_call_id=tool_call_id,
       )
       if any(
-        getattr(request_record, field_name, None) != expected
+        (
+          not _channel_matches(expected, getattr(request_record, field_name, None))
+          if field_name == "channel"
+          else getattr(request_record, field_name, None) != expected
+        )
         for field_name, expected in expected_identity.items()
       ):
         continue
@@ -410,6 +415,89 @@ def _approval_retry_state_error(request_record: Any, approval_id: str) -> JSONRe
   return None
 
 
+async def _resolve_parked_approval_decision(
+  *,
+  request: Request,
+  auth: AuthManager,
+  authenticated: GatewaySession,
+  approval_id: str,
+  payload: ControlApprovalDecisionRequest,
+) -> JSONResponse | None:
+  store: SQLiteApprovalStore | None = getattr(request.app.state, "gateway_approval_store", None)
+  if store is None:
+    return None
+  tenant_storage_id = _session_owner_user_id(authenticated)
+  located = await store._locate_request_for_decision(
+    approval_id=approval_id,
+    tenant_storage_id=tenant_storage_id,
+  )
+  if located is None:
+    return None
+  request_record, locator, original_nonce = located
+  # Legacy autonomous/batch delivery retains its own authoritative route.
+  # A captured native call or linked SDK root has an actual durable job.
+  if locator.job_id is None:
+    return None
+  if not _channel_matches(request_record.channel, authenticated.channel):
+    if not await _approval_visible_via_delegation(
+      store,
+      request_record,
+      tenant_storage_id,
+      {},
+    ):
+      return _json_error(404, "Run approval not found")
+  target_session = (
+    auth.session_store.get_session(request_record.session_id)
+    if request_record.session_id is not None
+    else None
+  )
+  pending = (
+    target_session.pending_tools.get(request_record.tool_call_id)
+    if target_session is not None and _session_matches_owner(target_session, tenant_storage_id)
+    else None
+  )
+  try:
+    if (
+      pending is not None
+      and target_session is not None
+      and target_session.approval_queues.get(request_record.tool_call_id) is not None
+    ):
+      result = await _record_vote_and_unblock(
+        target_session=target_session,
+        pending_entry=pending,
+        tool_call_id=request_record.tool_call_id,
+        nonce=original_nonce,
+        decider_id=_session_owner_user_id(authenticated),
+        decider_role=getattr(authenticated, "role", None),
+        approved=payload.approved,
+        allow_tool_type=payload.allow_tool_type,
+        reason=payload.reason,
+        app_state=request.app.state,
+      )
+    else:
+      policy = getattr(request.app.state, "gateway_approval_policy", None)
+      if policy is None:
+        return _json_error(503, "Approval subsystem unavailable")
+      result = await _record_durable_vote_and_continue(
+        authenticated=authenticated,
+        tenant_storage_id=tenant_storage_id,
+        request_record=request_record,
+        locator=locator,
+        nonce=original_nonce,
+        store=store,
+        policy=policy,
+        decider_id=_session_owner_user_id(authenticated),
+        decider_role=getattr(authenticated, "role", None),
+        approved=payload.approved,
+        allow_tool_type=payload.allow_tool_type,
+        reason=payload.reason,
+        app_state=request.app.state,
+      )
+  except ApprovalActionError as exc:
+    return JSONResponse(exc.payload, status_code=exc.status_code)
+  return JSONResponse(result)
+
+
 def build_approvals_router(
   *,
   auth: AuthManager,
@@ -516,6 +604,15 @@ def build_approvals_router(
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
     owner_user_id = _session_owner_user_id(authenticated)
+    parked_decision = await _resolve_parked_approval_decision(
+      request=request,
+      auth=auth,
+      authenticated=authenticated,
+      approval_id=approval_id,
+      payload=payload,
+    )
+    if parked_decision is not None:
+      return parked_decision
     target_session = _target_chat_session_for_user(auth, run_id, owner_user_id, authenticated.channel)
     batch_request_record = None
     batch_projection = None
@@ -642,6 +739,16 @@ def build_approvals_router(
         shim_session.raw_user_id = getattr(record, "raw_user_id", None) or record.user_id
         shim_session.pending_tools[tool_call_id] = pending_entry
         shim_session.approval_queues[tool_call_id] = approval_queue
+        request_record = await store.get(approval_id)
+        authoritative_identity = autonomous_approval_authoritative_identity(
+          record,
+          approval_id=approval_id,
+          tool_call_id=tool_call_id,
+        )
+        if request_record is not None and _channel_matches(
+          authoritative_identity["channel"], request_record.channel,
+        ):
+          authoritative_identity["channel"] = request_record.channel
         try:
           result = await _record_vote_and_unblock(
             target_session=shim_session,
@@ -660,11 +767,8 @@ def build_approvals_router(
               "gateway_approval_policy",
               None,
             ),
-            authoritative_identity=autonomous_approval_authoritative_identity(
-              record,
-              approval_id=approval_id,
-              tool_call_id=tool_call_id,
-            ),
+            authoritative_identity=authoritative_identity,
+            durable_request=request_record,
             autonomous_delivery=autonomous_approval_delivery_context(
               record,
               tool_call_id=tool_call_id,

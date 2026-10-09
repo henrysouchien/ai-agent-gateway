@@ -2138,6 +2138,12 @@ class WorkflowViewNodeState(WireModel):
   task_id: OpaqueId | None = None
   action_required: Literal["publish_result", "restart", "retry", "resume"] | None = None
   settlement: SettlementProjection | None = None
+  # Physical attempt settlement (e.g. awaiting_approval) while the logical node
+  # is still running; distinct from ``settlement``, which is logical-settled only.
+  attempt_settlement: SettlementProjection | None = Field(
+    default=None,
+    exclude_if=lambda value: value is None,
+  )
 
 
 class WorkflowAuthorFailureView(WireModel):

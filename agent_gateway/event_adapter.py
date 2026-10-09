@@ -6,10 +6,9 @@ from .control_run_lifecycle import canonical_control_run_state
 from .events import DEFAULT_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
 
 
-# Terminal disposition vocabulary for the stream_complete wire event.  This is
-# the single owner; consumers pivot on "completed" vs everything-else and must
-# not enumerate the set.
-TerminalDisposition = Literal["completed", "interrupted"]
+# Terminal disposition vocabulary for a physically settled stream attempt.
+# Awaiting approval leaves the logical job open for durable continuation.
+TerminalDisposition = Literal["completed", "interrupted", "awaiting_approval"]
 TERMINAL_DISPOSITIONS: Final[frozenset[str]] = frozenset(
   get_args(TerminalDisposition)
 )
@@ -157,12 +156,19 @@ V1_FIELD_PROJECTION: dict[str, frozenset[str]] = {
     "usage",
     "terminal_disposition",
     "reason",
+    "job_id",
+    "root_turn_id",
+    "approval_id",
+    "original_tool_call_id",
   ),
   "stream_error": _fields("error"),
   "error": _fields("error"),
   "tool_approval_request": _fields(
     "tool_call_id",
     "approval_id",
+    "job_id",
+    "root_turn_id",
+    "original_tool_call_id",
     "nonce",
     "tool_name",
     "tool_input",

@@ -5,12 +5,19 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Pattern, Sequence
+from typing import Any, Callable, Iterable, Pattern, Sequence, TypedDict
 
 from ._io import _atomic_write_json, _read_json_object
 
 _STATE_JSON_MARKER = "## STATE_UPDATE_JSON"
 _JSON_FENCE_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
+
+
+class ApprovalReferences(TypedDict, total=False):
+  approval_id: str
+  job_id: str
+  original_tool_call_id: str
+  root_turn_id: str
 
 
 @dataclass
@@ -25,6 +32,7 @@ class RunOutput:
   exit_reason: str | None = None
   post_run_guard: dict[str, Any] | None = None
   session_recap: dict[str, Any] | None = None
+  approval_refs: ApprovalReferences | None = None
 
 
 def _extract_summary(text: str, limit: int = 1500) -> str:
@@ -61,6 +69,8 @@ def collect_run_output(
   operator_paused = False
   max_tokens_reached = False
   terminal_seen = False
+  exit_reason: str | None = None
+  approval_refs: ApprovalReferences | None = None
 
   for entry in event_log.entries:
     event = entry.event
@@ -85,7 +95,14 @@ def collect_run_output(
       if isinstance(event_usage, dict):
         usage = event_usage
       disposition = event.get("terminal_disposition")
-      if disposition not in {"completed", "interrupted"}:
+      if disposition == "awaiting_approval":
+        exit_reason = "awaiting_approval"
+        approval_refs = {}
+        for key in ("approval_id", "job_id", "original_tool_call_id", "root_turn_id"):
+          value = event.get(key)
+          if isinstance(value, str) and value:
+            approval_refs[key] = value
+      elif disposition not in {"completed", "interrupted"}:
         error_msg = f"invalid_terminal_disposition: {disposition!r}"
       elif disposition == "interrupted":
         reason = str(event.get("reason") or "unspecified")
@@ -119,6 +136,8 @@ def collect_run_output(
     operator_paused=operator_paused,
     max_tokens_reached=max_tokens_reached,
     session_recap=session_recap,
+    exit_reason=exit_reason,
+    approval_refs=approval_refs,
   )
 
 
@@ -242,6 +261,10 @@ def build_state_payload(
   state["usage"] = run_output.usage
   state["session_recap"] = run_output.session_recap
   state["last_summary"] = summary_fn(run_output.response)
+  if outcome == "awaiting_approval" and run_output.approval_refs is not None:
+    state["approval_refs"] = dict(run_output.approval_refs)
+  else:
+    state.pop("approval_refs", None)
 
   if run_output.error:
     state["error"] = run_output.error
@@ -267,7 +290,9 @@ def format_run_summary(
   extract_summary_fn: Callable[..., str] | None = None,
 ) -> str:
   status = "timed out" if run_output.timed_out else "completed"
-  if run_output.exit_reason == "post_run_guard_failed" and not run_output.timed_out:
+  if run_output.exit_reason == "awaiting_approval" and not run_output.timed_out:
+    status = "awaiting approval"
+  elif run_output.exit_reason == "post_run_guard_failed" and not run_output.timed_out:
     status = "post-run guard failed"
   elif run_output.error and not run_output.timed_out:
     status = "failed"
@@ -289,6 +314,10 @@ def format_run_summary(
     label or "Autonomous run",
     f"Status: {status}",
   ]
+  if run_output.exit_reason == "awaiting_approval" and run_output.approval_refs:
+    approval_id = run_output.approval_refs.get("approval_id")
+    if approval_id:
+      lines.append(f"Approval: {approval_id}")
   if isinstance(state, dict) and state.get("briefing_file"):
     lines.append(f"Briefing: {state['briefing_file']}")
   lines.extend([

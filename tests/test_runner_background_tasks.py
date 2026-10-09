@@ -64,11 +64,26 @@ from agent_gateway.runner_background_tasks import (  # noqa: E402
   WORKFLOW_TASK_METADATA_KEY,
 )
 from agent_gateway.task_registry import TaskState  # noqa: E402
+from agent_gateway.agent_session_log import AgentSessionLog  # noqa: E402
+from agent_gateway.sub_agent import seal_admitted_task_payload  # noqa: E402
 from agent_workflow_contracts import (  # noqa: E402
   AgentOperationRef,
+  AdmittedTask,
+  AttemptRef,
+  LogicalTaskRef,
+  OrdinaryDelegationTaskRef,
   OutcomeRequirement,
   ResultRequirement,
+  sha256_digest,
+  terminal_task_result,
 )
+from agent_workflow_contracts.models import (  # noqa: E402
+  AdmittedContextWire,
+  AdmittedLineage,
+  AdmittedResearchBinding,
+  AdmittedTenant,
+)
+from gateway_test_support.admitted_authority_test_support import sealed_admitted_task  # noqa: E402
 
 
 def _progress(**overrides: Any) -> TaskProgress:
@@ -2018,3 +2033,249 @@ def test_runner_cancel_background_task_requests_idempotent_cancellation() -> Non
   assert runner.cancel_background_task("bg_missing") is False
   with pytest.raises(ValueError, match="canonical non-empty"):
     runner.cancel_background_task(" bg_1")
+
+
+def _resume_lineage_admission(
+  task_id: str,
+  *,
+  resume_of: AdmittedTask | None = None,
+  restart_of_attempt_id: str | None = None,
+  storage_id: str = "alice",
+  logical_task: LogicalTaskRef | None = None,
+) -> AdmittedTask:
+  if logical_task is None:
+    logical_task = (
+      resume_of.logical_task
+      if resume_of is not None
+      else OrdinaryDelegationTaskRef(
+        delegation_id="delegation:approval-lineage",
+        operation=AgentOperationRef(
+          namespace="agent-operation",
+          name="research",
+          version="1",
+          digest=sha256_digest({"operation": "research"}),
+        ),
+      )
+    )
+  base = sealed_admitted_task(
+    logical_task=logical_task,
+    attempt=AttemptRef(
+      attempt_number=1,
+      attempt_id=f"attempt:{task_id}",
+      physical_task_id=task_id,
+      restart_of_attempt_id=restart_of_attempt_id,
+    ),
+    result_requirement=ResultRequirement(outcome=OutcomeRequirement()),
+  )
+  assert base.model_bind is not None
+  payload = base.model_dump(mode="json", exclude={"admitted_task_digest"})
+  payload["operation"]["resumable"] = True
+  payload["execution_snapshot"]["resume_mechanics"]["resumable"] = True
+  payload["execution_snapshot"]["admitted_context"] = AdmittedContextWire(
+    tenant=AdmittedTenant(
+      tenant_id=f"tenant:{storage_id}",
+      storage_id=storage_id,
+      role="owner",
+    ),
+    research_binding=AdmittedResearchBinding(research_file_id=None),
+    capability_bind=base.model_bind,
+    children=(),
+    tool_grant=tuple(tool.tool_id for tool in base.tool_grant.tools),
+    budget_share=None,
+    env_projection=(),
+    approval_route="parent_delegated",
+    handle_grants=(),
+    placement="in_process",
+    lineage=AdmittedLineage(parent_job_id="root:approval-lineage", depth=1),
+  ).model_dump(mode="json")
+  if resume_of is not None:
+    payload["attempt"]["attempt_number"] = resume_of.attempt.attempt_number + 1
+    payload["attempt"]["resume_of_task_id"] = resume_of.attempt.physical_task_id
+    payload["execution_snapshot"]["resume_instruction"] = "Continue the exact admitted task."
+  seal_admitted_task_payload(payload)
+  return AdmittedTask.model_validate(payload)
+
+
+def _resume_lineage_runner(*tasks: AdmittedTask) -> AgentRunner:
+  runner = object.__new__(AgentRunner)
+  runner._task_registry = TaskRegistry()
+  runner._agent_session_log = None
+  for admitted in tasks:
+    entry = runner._task_registry.register(
+      "background_agent",
+      task_id=admitted.attempt.physical_task_id,
+      original_task_id=admitted.attempt.resume_of_task_id,
+    )
+    entry.admitted_task = admitted
+  return runner
+
+
+def test_runner_resume_successor_matches_exact_direct_and_multihop_admission() -> None:
+  async def _case() -> None:
+    original = _resume_lineage_admission("bg_original")
+    first = _resume_lineage_admission("bg_first", resume_of=original)
+    successor = _resume_lineage_admission("bg_successor", resume_of=first)
+    runner = _resume_lineage_runner(original, first, successor)
+
+    assert await runner._is_resume_successor(first, "bg_original") is True
+    assert await runner._is_resume_successor(successor, "bg_original") is True
+    assert await runner._is_resume_successor(successor, "bg_first") is True
+    assert await runner._is_resume_successor(first, "bg_successor") is False
+    assert await runner._is_resume_successor(successor, "bg_successor") is False
+
+  asyncio.run(_case())
+
+
+@pytest.mark.parametrize(
+  "invalid_lineage",
+  [
+    "sibling",
+    "restart",
+    "restart_and_resume",
+    "cross_tenant",
+    "cross_tenant_intermediate",
+    "unrelated_logical_task",
+    "cycle",
+    "registration_link_mismatch",
+    "physical_id_mismatch",
+    "missing_tenant",
+    "missing_admission",
+    "executing_admission_mismatch",
+  ],
+)
+def test_runner_resume_successor_rejects_non_resume_authority(
+  invalid_lineage: str,
+) -> None:
+  async def _case() -> None:
+    original = _resume_lineage_admission("bg_original")
+    successor = _resume_lineage_admission("bg_successor", resume_of=original)
+    target_id = "bg_original"
+    extra_tasks: tuple[AdmittedTask, ...] = ()
+    if invalid_lineage == "sibling":
+      sibling = _resume_lineage_admission("bg_sibling", resume_of=original)
+      extra_tasks = (sibling,)
+      target_id = "bg_sibling"
+    elif invalid_lineage == "restart":
+      successor = _resume_lineage_admission(
+        "bg_successor",
+        restart_of_attempt_id=original.attempt.attempt_id,
+      )
+    elif invalid_lineage == "restart_and_resume":
+      successor = _resume_lineage_admission(
+        "bg_successor",
+        resume_of=original,
+        restart_of_attempt_id=original.attempt.attempt_id,
+      )
+    elif invalid_lineage == "cross_tenant":
+      successor = _resume_lineage_admission(
+        "bg_successor", resume_of=original, storage_id="bob",
+      )
+    elif invalid_lineage == "cross_tenant_intermediate":
+      first = _resume_lineage_admission(
+        "bg_first", resume_of=original, storage_id="bob",
+      )
+      successor = _resume_lineage_admission("bg_successor", resume_of=first)
+      extra_tasks = (first,)
+    elif invalid_lineage == "unrelated_logical_task":
+      successor = _resume_lineage_admission(
+        "bg_successor",
+        resume_of=original,
+        logical_task=OrdinaryDelegationTaskRef(
+          delegation_id="delegation:unrelated",
+          operation=original.logical_task.operation,
+        ),
+      )
+    elif invalid_lineage == "cycle":
+      original = _resume_lineage_admission("bg_original", resume_of=successor)
+    elif invalid_lineage == "missing_tenant":
+      payload = successor.model_dump(mode="json", exclude={"admitted_task_digest"})
+      payload["execution_snapshot"]["admitted_context"]["tenant"] = None
+      seal_admitted_task_payload(payload)
+      successor = AdmittedTask.model_validate(payload)
+    runner = _resume_lineage_runner(original, successor, *extra_tasks)
+    successor_entry = runner._task_registry.get("bg_successor")
+    original_entry = runner._task_registry.get("bg_original")
+    assert successor_entry is not None and original_entry is not None
+    if invalid_lineage == "registration_link_mismatch":
+      successor_entry.original_task_id = "bg_unrelated"
+    elif invalid_lineage == "physical_id_mismatch":
+      original_entry.task_id = "bg_different_physical_id"
+    elif invalid_lineage == "missing_admission":
+      original_entry.admitted_task = None
+    elif invalid_lineage == "executing_admission_mismatch":
+      payload = successor.model_dump(mode="json", exclude={"admitted_task_digest"})
+      payload["objective"] = "A different admission at the same physical id."
+      seal_admitted_task_payload(payload)
+      successor_entry.admitted_task = AdmittedTask.model_validate(payload)
+
+    assert await runner._is_resume_successor(successor, target_id) is False
+
+  asyncio.run(_case())
+
+
+@pytest.mark.parametrize("durable_link_matches", [True, False])
+def test_runner_resume_successor_uses_evicted_canonical_durable_predecessors(
+  tmp_path: Path,
+  durable_link_matches: bool,
+) -> None:
+  async def _case() -> None:
+    original = _resume_lineage_admission("bg_original")
+    first = _resume_lineage_admission("bg_first", resume_of=original)
+    successor = _resume_lineage_admission("bg_successor", resume_of=first)
+    runner = _resume_lineage_runner()
+    runner._task_registry = TaskRegistry(max_retained=0)
+    durable_log = AgentSessionLog(path=tmp_path / "lineage.jsonl")
+    runner._agent_session_log = durable_log
+    for admitted in (original, first):
+      task_id = admitted.attempt.physical_task_id
+      entry = runner._task_registry.register(
+        "background_agent",
+        task_id=task_id,
+        original_task_id=admitted.attempt.resume_of_task_id,
+      )
+      entry.admitted_task = admitted
+      registration = {
+        "type": "task_registered",
+        "event_schema_version": 2,
+        "task_id": task_id,
+        "task_type": "background_agent",
+        "started_at": 100.0,
+        "original_task_id": (
+          "bg_unrelated"
+          if task_id == "bg_first" and not durable_link_matches
+          else admitted.attempt.resume_of_task_id
+        ),
+        "metadata": {"admitted_task": admitted.model_dump(mode="json")},
+      }
+      await durable_log.append(registration)
+      result = terminal_task_result(
+        admitted,
+        status="interrupted",
+        reason="The admitted attempt requires continuation.",
+      )
+      await durable_log.append({
+        "type": "task_completed",
+        "task_id": task_id,
+        "final_state": "interrupted",
+        "completed_at": 125.0,
+        "result": result.model_dump(mode="json"),
+        "error": None,
+      })
+      runner._task_registry.transition(
+        task_id, TaskState.INTERRUPTED, result=result.model_dump(mode="json"),
+      )
+    successor_entry = runner._task_registry.register(
+      "background_agent",
+      task_id="bg_successor",
+      original_task_id="bg_first",
+    )
+    successor_entry.admitted_task = successor
+    assert runner._task_registry.get("bg_original") is None
+    assert runner._task_registry.get("bg_first") is None
+
+    assert (
+      await runner._is_resume_successor(successor, "bg_original")
+      is durable_link_matches
+    )
+
+  asyncio.run(_case())

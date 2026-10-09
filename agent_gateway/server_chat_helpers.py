@@ -48,6 +48,7 @@ from .selected_content import SelectedContentAdmission
 from . import server_chat_stream_core as _chat_stream_core
 from . import server_chat_transcripts as _chat_transcripts
 from .tool_dispatcher import ApprovalDecision, ApprovalRequest
+from .tool_dispatcher_approval_lifecycle import ApprovalPark
 from .tool_redaction import get_audit_hmac_secret, redact_tool_input as default_redact_tool_input
 from .ui_blocks_run import (
   UiBlocksRunContext,
@@ -1438,6 +1439,23 @@ async def _dispatch_chat_turn_body(
           )
       except asyncio.CancelledError:
         raise
+      except ApprovalPark as park:
+        terminal = next(
+          (
+            entry.event for entry in event_log.entries
+            if entry.event.get("type") == "stream_complete"
+          ),
+          None,
+        )
+        if (
+          terminal is None
+          or terminal.get("terminal_disposition") != "awaiting_approval"
+          or terminal.get("job_id") != park.job_id
+          or terminal.get("approval_id") != park.approval_id
+          or terminal.get("original_tool_call_id") != park.original_tool_call_id
+          or terminal.get("root_turn_id") != park.root_turn_id
+        ):
+          raise
       except Exception as exc:
         error_text = str(exc)
         log.error(

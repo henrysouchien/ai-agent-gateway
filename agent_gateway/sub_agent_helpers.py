@@ -235,6 +235,18 @@ def make_run_agent_tool_def(
           "type": "string",
           "description": "The objective for the admitted child task.",
         },
+        "role": {
+          "type": "string",
+          "description": (
+            "Optional model role such as fast or deep selected from policy, "
+            "independent of the operation."
+          ),
+        },
+        "effort": {
+          "type": "string",
+          "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+          "description": "Optional exact model reasoning effort for the child.",
+        },
         "handles": {
           "type": "array",
           "items": {"type": "string"},

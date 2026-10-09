@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Awaitable, Protocol, runtime_checkable
+from typing import Any, Awaitable, Literal, Protocol, runtime_checkable
 
 from agent_workflow_contracts import (
   AdmittedTask,
@@ -128,13 +128,16 @@ def _logical_response_identity(
 
 def _narrative_query_filters(
   *,
-  sub_session_id: str,
+  role: Literal["writer", "sub_agent"],
+  sub_agent_id: str | None,
   runner_id: str | None,
 ) -> dict[str, Any]:
   filters: dict[str, Any] = {
     "event_types": {"assistant_message"},
-    "sub_agent_id": sub_session_id,
+    "sub_agent_id": sub_agent_id if role == "sub_agent" else None,
   }
+  if role == "writer":
+    filters["role"] = "writer"
   if runner_id is not None:
     normalized_runner_id = str(runner_id).strip()
     if not normalized_runner_id:
@@ -249,10 +252,16 @@ async def final_child_visible_text(
   session_log: Any,
   *,
   sub_session_id: str,
+  role: Literal["writer", "sub_agent"],
+  sub_agent_id: str | None,
   workspace_dir: str,
   runner_id: str | None = None,
 ) -> FinalChildVisibleText:
-  """Materialize the child's final durable logical assistant response."""
+  """Materialize the run's own final durable logical assistant response.
+
+  Writers emit top-level assistant events; child runs emit events scoped to
+  their sub-agent identity. ``sub_session_id`` retains the artifact identity.
+  """
 
   query = getattr(session_log, "query", None)
   if not isinstance(query, _NarrativeQuery):
@@ -260,7 +269,8 @@ async def final_child_visible_text(
       "narrative child execution requires a queryable durable session log"
     )
   query_filters = _narrative_query_filters(
-    sub_session_id=sub_session_id,
+    role=role,
+    sub_agent_id=sub_agent_id,
     runner_id=runner_id,
   )
   entries, _ = await query(

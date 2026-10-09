@@ -7,6 +7,7 @@ from typing import Any, Mapping, Protocol
 
 from fastapi.encoders import jsonable_encoder
 
+from .approval_continuation import ChildContinueRequest, RootContinueRequest
 from .approval_policy import (
   ApprovalPolicy,
   ApprovalRequest,
@@ -17,7 +18,11 @@ from .approval_policy import (
   new_approval_id,
   utc_now,
 )
-from .approval_store import ApprovalRequestStore, PersistentGrantCancellationFenced
+from .approval_store import (
+  ApprovalRequestLocator,
+  ApprovalRequestStore,
+  PersistentGrantCancellationFenced,
+)
 from .policy_controls import effective_allow_tool_type
 from .session import GatewaySession
 
@@ -106,8 +111,8 @@ def _approval_resolution_lock(target_session: GatewaySession, tool_call_id: str)
   return lock
 
 
-def _cancellation_requested(pending_entry: dict[str, Any]) -> bool:
-  return pending_entry.get("_approval_cancel_requested") is True
+def _cancellation_requested(pending_entry: dict[str, Any] | None) -> bool:
+  return pending_entry is not None and pending_entry.get("_approval_cancel_requested") is True
 
 
 async def _revoke_persistent_grants_for_cancel(store: ApprovalRequestStore, approval_id: str) -> None:
@@ -156,7 +161,7 @@ def _release_cancelled_approval(
     )
 
 
-def _validate_pending_entry(*, pending_entry: dict[str, Any], tool_call_id: str, nonce: str, target_session: GatewaySession) -> Any:
+def _validate_pending_entry(*, pending_entry: dict[str, Any], tool_call_id: str, nonce: str | None, target_session: GatewaySession) -> Any:
   if pending_entry.get("status") == "approval_received":
     raise ApprovalActionError(409, {"error": "Approval already submitted"})
 
@@ -176,9 +181,9 @@ def _validate_pending_entry(*, pending_entry: dict[str, Any], tool_call_id: str,
 async def _record_vote_and_unblock(
   *,
   target_session: GatewaySession,
-  pending_entry: dict[str, Any],
+  pending_entry: dict[str, Any] | None,
   tool_call_id: str,
-  nonce: str,
+  nonce: str | None,
   decider_id: str,
   decider_role: str | None,
   approved: bool,
@@ -189,6 +194,7 @@ async def _record_vote_and_unblock(
   authoritative_policy: Any | None = None,
   authoritative_identity: Mapping[str, Any] | None = None,
   autonomous_delivery: Mapping[str, Any] | None = None,
+  durable_request: ApprovalRequest | None = None,
 ) -> dict[str, Any]:
   lock = _approval_resolution_lock(target_session, tool_call_id)
   async with lock:
@@ -207,15 +213,16 @@ async def _record_vote_and_unblock(
       authoritative_policy=authoritative_policy,
       authoritative_identity=authoritative_identity,
       autonomous_delivery=autonomous_delivery,
+      durable_request=durable_request,
     )
 
 
 async def _record_vote_and_unblock_locked(
   *,
   target_session: GatewaySession,
-  pending_entry: dict[str, Any],
+  pending_entry: dict[str, Any] | None,
   tool_call_id: str,
-  nonce: str,
+  nonce: str | None,
   decider_id: str,
   decider_role: str | None,
   approved: bool,
@@ -226,14 +233,19 @@ async def _record_vote_and_unblock_locked(
   authoritative_policy: Any | None = None,
   authoritative_identity: Mapping[str, Any] | None = None,
   autonomous_delivery: Mapping[str, Any] | None = None,
+  durable_request: ApprovalRequest | None = None,
 ) -> dict[str, Any]:
-  approval_queue = _validate_pending_entry(
-    pending_entry=pending_entry,
-    tool_call_id=tool_call_id,
-    nonce=nonce,
-    target_session=target_session,
-  )
-  approval_id = pending_entry.get("approval_id")
+  approval_queue = None
+  if pending_entry is not None:
+    approval_queue = _validate_pending_entry(
+      pending_entry=pending_entry,
+      tool_call_id=tool_call_id,
+      nonce=nonce,
+      target_session=target_session,
+    )
+    approval_id = pending_entry.get("approval_id")
+  else:
+    approval_id = durable_request.approval_id if durable_request is not None else None
   store, policy = _resolve_store_and_policy(
     target_session=target_session,
     app_state=app_state,
@@ -241,6 +253,8 @@ async def _record_vote_and_unblock_locked(
     authoritative_policy=authoritative_policy,
   )
   if not approval_id:
+    if pending_entry is None or approval_queue is None:
+      raise ApprovalActionError(404, {"error": "Approval request not found"})
     effective_allow = effective_allow_tool_type(
       pending_entry.get("tool_class"),
       pending_entry.get("tool_name"),
@@ -254,7 +268,7 @@ async def _record_vote_and_unblock_locked(
   if store is None or policy is None:
     raise ApprovalActionError(503, {"error": "Approval subsystem unavailable", "approval_id": str(approval_id)})
 
-  request_record = await store.get(str(approval_id))
+  request_record = durable_request if durable_request is not None else await store.get(str(approval_id))
   if request_record is None:
     raise ApprovalActionError(404, {"error": "Approval request not found", "approval_id": str(approval_id)})
   if authoritative_identity is not None and not _approval_matches_authoritative_identity(
@@ -271,6 +285,8 @@ async def _record_vote_and_unblock_locked(
     raise ApprovalActionError(410, {"error": "Approval request expired", "approval_id": str(approval_id)})
 
   if request_record.state in TERMINAL_APPROVAL_STATES:
+    if pending_entry is None:
+      return {"approval": _approval_request_to_dict(request_record)}
     raise ApprovalActionError(409, {"error": "Approval request already resolved", "approval_id": str(approval_id)})
 
   if request_record.state != "pending_user":
@@ -292,9 +308,10 @@ async def _record_vote_and_unblock_locked(
       and approval_reuse_scope_authorized(request_record)
     ),
   )
-  pending_entry["tool_class"] = request_record.tool_class
-  pending_entry["tool_name"] = request_record.tool_name
-  pending_entry["allow_tool_type"] = effective_allow
+  if pending_entry is not None:
+    pending_entry["tool_class"] = request_record.tool_class
+    pending_entry["tool_name"] = request_record.tool_name
+    pending_entry["allow_tool_type"] = effective_allow
 
   if approved and not policy.role_authorized_for_class(
     decider_role=decider_role,
@@ -364,6 +381,10 @@ async def _record_vote_and_unblock_locked(
         "approval_id": str(approval_id),
       },
     )
+  # The store can return the winner of a concurrent decision. Read it back
+  # without resolving policy or creating reuse grants a second time.
+  if request_record.decided_at != vote.decided_at:
+    return {"approval": _approval_request_to_dict(request_record)}
 
   await policy.on_resolve(request=request_record)
   if _cancellation_requested(pending_entry):
@@ -413,23 +434,119 @@ async def _record_vote_and_unblock_locked(
       "status": "cancellation_pending",
       "approval": _approval_request_to_dict(request_record),
     }
-  pending_entry["status"] = "approval_received"
   executable = approval_is_executable(request_record)
-  await approval_queue.put(
-    {
-      "approved": executable,
-      "allow_tool_type": effective_allow,
-      "approval_id": str(approval_id),
-    }
-  )
+  if pending_entry is not None and approval_queue is not None:
+    pending_entry["status"] = "approval_received"
+    await approval_queue.put(
+      {
+        "approved": executable,
+        "allow_tool_type": effective_allow,
+        "approval_id": str(approval_id),
+      }
+    )
   log.info(
     "Tool approval: %s | approved=%s allow_tool_type=%s approval_id=%s",
-    pending_entry.get("tool_name", "?"),
+    request_record.tool_name,
     executable,
     effective_allow,
     approval_id,
   )
   return {"approval": _approval_request_to_dict(request_record)}
+
+
+async def _record_durable_vote_and_continue(
+  *,
+  authenticated: GatewaySession,
+  tenant_storage_id: str,
+  request_record: ApprovalRequest,
+  locator: ApprovalRequestLocator,
+  nonce: str | None,
+  store: ApprovalRequestStore,
+  policy: ApprovalPolicy,
+  decider_id: str,
+  decider_role: str | None,
+  approved: bool,
+  allow_tool_type: bool,
+  reason: str | None,
+  app_state: Any,
+) -> dict[str, Any]:
+  """Record a tenant-verified vote without inventing a waiting queue or job."""
+  result = await _record_vote_and_unblock(
+    target_session=authenticated,
+    pending_entry=None,
+    tool_call_id=request_record.tool_call_id,
+    nonce=nonce,
+    decider_id=decider_id,
+    decider_role=decider_role,
+    approved=approved,
+    allow_tool_type=allow_tool_type,
+    reason=reason,
+    app_state=app_state,
+    authoritative_store=store,
+    authoritative_policy=policy,
+    durable_request=request_record,
+  )
+  root_hook = getattr(app_state, "root_continue_hook", None)
+  if root_hook is None:
+    result["continuation"] = {
+      "available": False,
+      "unavailable_owner": "root_continue_hook",
+      "job_id": locator.job_id,
+      "executable_binding_state": locator.executable_binding_state,
+    }
+    return result
+  try:
+    root_outcome = await root_hook(
+      RootContinueRequest(
+        approval_id=locator.approval_id,
+        tenant_storage_id=tenant_storage_id,
+      )
+    )
+  except Exception:
+    log.warning("Root approval continuation failed | approval_id=%s", locator.approval_id)
+    result["continuation"] = {
+      "status": "outcome_unknown",
+      "failed_owner": "root_continue_hook",
+    }
+    return result
+  if root_outcome.status != "not_root":
+    result["continuation"] = {
+      "status": root_outcome.status,
+      "job_id": root_outcome.job_id,
+      "turn_id": root_outcome.turn_id,
+      "tool_call_id": root_outcome.tool_call_id,
+    }
+    return result
+  child_hook = getattr(app_state, "child_continue_hook", None)
+  if child_hook is None:
+    result["continuation"] = {
+      "available": False,
+      "unavailable_owner": "child_continue_hook",
+      "job_id": locator.job_id,
+      "executable_binding_state": locator.executable_binding_state,
+    }
+    return result
+  try:
+    child_outcome = await child_hook(
+      ChildContinueRequest(
+        approval_id=locator.approval_id,
+        tenant_storage_id=tenant_storage_id,
+      )
+    )
+  except Exception:
+    log.warning("Child approval continuation failed | approval_id=%s", locator.approval_id)
+    result["continuation"] = {
+      "status": "outcome_unknown",
+      "failed_owner": "child_continue_hook",
+      "job_id": locator.job_id,
+    }
+    return result
+  result["continuation"] = {
+    "status": child_outcome.status,
+    "job_id": child_outcome.job_id,
+    "tool_call_id": child_outcome.tool_call_id,
+  }
+  return result
 
 
 async def _cancel_pending_approval_and_unblock(
@@ -659,6 +776,7 @@ async def _cancel_pending_approval_and_unblock(
 __all__ = [
   "ApprovalActionError",
   "_approval_request_to_dict",
+  "_record_durable_vote_and_continue",
   "_cancel_pending_approval_and_unblock",
   "_release_cancelled_approval",
   "_record_vote_and_unblock",

@@ -46,6 +46,15 @@ class CommercialWorkStartFacts:
 
 
 @dataclass(frozen=True)
+class VerifiedCommercialWorkStartClaim:
+  """Verified account identity awaiting facts from the prepared request."""
+
+  claim: VerifiedCommercialClaim
+  _authorization_token: str = field(repr=False, compare=False)
+  _gate_binding: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
 class PendingCommercialWorkStart:
   """Token-free verified authority awaiting durable one-time consumption."""
 
@@ -138,14 +147,12 @@ class CommercialWorkStartGate:
         "store, and a trusted facts resolver"
       )
 
-  def verify_request(
+  def verify_claim(
     self,
     headers: Mapping[str, str],
     *,
     session: Any,
-    request: Any,
-    channel: str | None,
-  ) -> PendingCommercialWorkStart | None:
+  ) -> VerifiedCommercialWorkStartClaim | None:
     if not self.enabled:
       # Headers carry no spend authority on their own: without a gate that
       # verifies them the work runs on the session's own credentials.
@@ -159,30 +166,10 @@ class CommercialWorkStartGate:
         status_code=401,
       )
     claim_verifier = self._claim_verifier
-    authorization_verifier = self._authorization_verifier
-    facts_resolver = self._facts_resolver
-    if (
-      claim_verifier is None
-      or authorization_verifier is None
-      or facts_resolver is None
-    ):
+    if claim_verifier is None:
       raise CommercialWorkStartError(
         "commercial_work_start_unavailable",
         "Commercial work-start verification is unavailable.",
-        status_code=503,
-      )
-    try:
-      facts = facts_resolver(session, request, channel)
-    except Exception as exc:
-      raise CommercialWorkStartError(
-        "commercial_work_start_unavailable",
-        "Commercial work-start facts could not be resolved.",
-        status_code=503,
-      ) from exc
-    if not isinstance(facts, CommercialWorkStartFacts):
-      raise CommercialWorkStartError(
-        "commercial_work_start_unavailable",
-        "Commercial work-start facts are invalid.",
         status_code=503,
       )
     try:
@@ -204,10 +191,48 @@ class CommercialWorkStartGate:
         "Commercial work-start authority is bound to a different session owner.",
         status_code=403,
       )
+    return VerifiedCommercialWorkStartClaim(
+      claim=claim,
+      _authorization_token=authorization_token,
+      _gate_binding=self._binding,
+    )
+
+  def authorize_request(
+    self,
+    verified_claim: VerifiedCommercialWorkStartClaim | None,
+    *,
+    session: Any,
+    request: Any,
+    channel: str | None,
+  ) -> PendingCommercialWorkStart | None:
+    if not self.enabled or verified_claim is None:
+      return None
+    authorization_verifier = self._authorization_verifier
+    facts_resolver = self._facts_resolver
+    if authorization_verifier is None or facts_resolver is None:
+      raise CommercialWorkStartError(
+        "commercial_work_start_unavailable",
+        "Commercial work-start verification is unavailable.",
+        status_code=503,
+      )
+    try:
+      facts = facts_resolver(session, request, channel)
+    except Exception as exc:
+      raise CommercialWorkStartError(
+        "commercial_work_start_unavailable",
+        "Commercial work-start facts could not be resolved.",
+        status_code=503,
+      ) from exc
+    if not isinstance(facts, CommercialWorkStartFacts):
+      raise CommercialWorkStartError(
+        "commercial_work_start_unavailable",
+        "Commercial work-start facts are invalid.",
+        status_code=503,
+      )
     try:
       authorization = authorization_verifier.verify_for_attach(
-        authorization_token,
-        execution_claim=claim,
+        verified_claim._authorization_token,
+        execution_claim=verified_claim.claim,
         request_id=request.request_id,
         session_id=session.session_id,
         operation=facts.operation,
@@ -223,9 +248,9 @@ class CommercialWorkStartGate:
         status_code=403,
       ) from exc
     return PendingCommercialWorkStart(
-      claim=claim,
+      claim=verified_claim.claim,
       authorization=authorization,
-      _gate_binding=self._binding,
+      _gate_binding=verified_claim._gate_binding,
     )
 
   def consume(

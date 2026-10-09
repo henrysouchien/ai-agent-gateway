@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import Any, Mapping, Protocol
 
@@ -15,7 +15,13 @@ from agent_gateway.autonomous_runner import (
 )
 from agent_gateway.autonomous_approval_channel import (
   AutonomousApprovalChannelParent,
+  AutonomousApprovalChannelAuthority,
 )
+from agent_gateway.autonomous_claim_broker import AutonomousClaimBroker
+from agent_gateway.approval_store import ApprovalExecutableBindingError
+from agent_gateway.tool_policy_registry import PreparedToolCall
+from agent_gateway.providers.anthropic_oauth import is_anthropic_generation_ref
+from agent_gateway.admission import root_context
 
 
 class _EnsureAutonomousApprovalDeliveryAudited(Protocol):
@@ -114,6 +120,104 @@ def autonomous_approval_authoritative_identity(
     "channel": record.channel,
   }
 
+@dataclass(frozen=True, slots=True, repr=False)
+class DelegatedAutonomousExecutableCapture:
+  """Original operands correlated once against the authenticated child launch."""
+
+  approval_id: str
+  tool_call_id: str
+  nonce: str
+  tool_name: str
+  job_id: str
+  tenant_storage_id: str
+  credential_generation_ref: str | None
+  prepared_call: PreparedToolCall
+  dispatch_context: Mapping[str, object]
+
+
+def admit_delegated_executable_capture(
+  record: AutonomousTask,
+  payload: dict[str, Any],
+) -> DelegatedAutonomousExecutableCapture:
+  """Read child identity from the verified launch, never from private operands."""
+
+  broker = record.claim_broker
+  channel = record.approval_channel
+  if (
+    type(broker) is not AutonomousClaimBroker
+    or type(channel) is not AutonomousApprovalChannelParent
+  ):
+    raise ApprovalExecutableBindingError("call_identity_mismatch")
+  envelope = broker.envelope
+  expected_channel = AutonomousApprovalChannelAuthority(
+    launch_nonce=envelope.nonce,
+    task_id=envelope.task_id,
+    control_run_id=envelope.control_run_id,
+    session_id=envelope.session_authority.ordinary_authority.session_id,
+    channel_id=envelope.channel_id,
+  )
+  if (
+    channel.authority != expected_channel
+    or envelope.task_id != record.task_id
+    or envelope.control_run_id != record.control_run_id
+    or envelope.channel_id != record.channel_id
+    or envelope.owner_user_id != record.owner_user_id
+    or record.event_channel is None
+    or record.event_channel.channel_id != envelope.channel_id
+  ):
+    raise ApprovalExecutableBindingError("call_identity_mismatch")
+  if envelope.admitted is not None:
+    tenant = envelope.admitted[0].tenant
+    job_id = envelope.task_id
+  else:
+    context = root_context(
+      envelope.session_authority.to_gateway_session(),
+      withheld_tools=frozenset(),
+      research_file_id=envelope.workload.research_file_id,
+    )
+    tenant = context.tenant
+    job_id = context.job_id
+  generation_ref = (
+    envelope.bind.credential_ref
+    if is_anthropic_generation_ref(envelope.bind.credential_ref)
+    else None
+  )
+  if (
+    tenant is None
+    or job_id is None
+    or payload.get("job_id") != job_id
+    or payload.get("tenant_storage_id") != tenant.storage_id
+    or tenant.storage_id != envelope.owner_user_id
+    or payload.get("credential_generation_ref") != generation_ref
+    or any(
+      type(payload.get(key)) is not str or not payload[key]
+      for key in ("approval_id", "tool_call_id", "nonce", "tool_name")
+    )
+  ):
+    raise ApprovalExecutableBindingError("call_identity_mismatch")
+  try:
+    prepared_call = PreparedToolCall(
+      prepared_input=payload["prepared_input"],
+      exact_backend=payload["exact_backend"],
+    )
+    dispatch_context = PreparedToolCall(
+      prepared_input=payload["dispatch_context"],
+    ).prepared_input
+  except (KeyError, TypeError, ValueError):
+    raise ApprovalExecutableBindingError("operand_mismatch") from None
+  return DelegatedAutonomousExecutableCapture(
+    approval_id=payload["approval_id"],
+    tool_call_id=payload["tool_call_id"],
+    nonce=payload["nonce"],
+    tool_name=payload["tool_name"],
+    job_id=job_id,
+    tenant_storage_id=tenant.storage_id,
+    credential_generation_ref=generation_ref,
+    prepared_call=prepared_call,
+    dispatch_context=dispatch_context,
+  )
+
+
 
 async def create_delegated_autonomous_approval(
   *,
@@ -121,6 +225,7 @@ async def create_delegated_autonomous_approval(
   policy: Any | None,
   record: AutonomousTask,
   event: dict[str, Any],
+  private_executable_capture: DelegatedAutonomousExecutableCapture | None = None,
 ) -> Any:
   """Record the durable row for a request a delegated child authored.
 
@@ -151,10 +256,26 @@ async def create_delegated_autonomous_approval(
     raise RuntimeError(
       "autonomous approval request projection disagrees with its event"
     )
+  if private_executable_capture is not None and (
+    private_executable_capture.approval_id != approval_id
+    or private_executable_capture.tool_call_id != tool_call_id
+    or private_executable_capture.nonce != nonce
+    or private_executable_capture.tool_name != request.tool_name
+    or event.get("tool_name") != request.tool_name
+  ):
+    raise ApprovalExecutableBindingError("call_identity_mismatch")
   authoritative_identity = autonomous_approval_authoritative_identity(
     record,
     approval_id=approval_id,
     tool_call_id=tool_call_id,
+  )
+  broker = record.claim_broker
+  if type(broker) is not AutonomousClaimBroker:
+    raise ApprovalExecutableBindingError("call_identity_mismatch")
+  # This row retains the signed child's concrete channel. The run's optional
+  # channel remains an operator restriction, where None means unrestricted.
+  authoritative_identity["channel"] = (
+    broker.envelope.session_authority.ordinary_authority.channel
   )
   requested_at = utc_now()
   request = replace(
@@ -199,6 +320,18 @@ async def create_delegated_autonomous_approval(
     ),
   )
   stored, _created = await store.create_or_get_by_tool_call_id(request)
+  if private_executable_capture is not None:
+    await store.record_executable_binding(
+      approval_id=stored.approval_id,
+      job_id=private_executable_capture.job_id,
+      tool_call_id=private_executable_capture.tool_call_id,
+      nonce=private_executable_capture.nonce,
+      tenant_storage_id=private_executable_capture.tenant_storage_id,
+      tool_name=private_executable_capture.tool_name,
+      prepared_call=private_executable_capture.prepared_call,
+      dispatch_context=private_executable_capture.dispatch_context,
+      credential_generation_ref=private_executable_capture.credential_generation_ref,
+    )
   return stored
 
 
@@ -217,6 +350,8 @@ def require_matching_autonomous_delivery(
   Delivering such a row would hand one request's or run's decision to another
   run, so a mismatch is treated as corruption, never delivered.
   """
+  from .approvals import _channel_matches
+
   expected_delivery = {
     "approval_id": approval_id,
     "tool_call_id": tool_call_id,
@@ -247,7 +382,11 @@ def require_matching_autonomous_delivery(
     "decider_id": str(record.owner_user_id or "").strip(),
   }
   if any(
-    getattr(request_record, field_name, None) != expected
+    (
+      not _channel_matches(expected, getattr(request_record, field_name, None))
+      if field_name == "channel"
+      else getattr(request_record, field_name, None) != expected
+    )
     for field_name, expected in expected_request.items()
   ):
     raise RuntimeError(

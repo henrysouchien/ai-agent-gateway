@@ -21,6 +21,10 @@ from agent_gateway.event_log import EventLog
 from agent_gateway.session import GatewaySession
 from agent_gateway.providers import ModelInfo, ModelProvider
 from agent_gateway.providers.base import StreamEvent
+from agent_gateway.providers.anthropic import (
+  AnthropicProvider,
+  _is_cacheable_message_block,
+)
 from agent_gateway.runner_budget import CostAccumulator
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.multi_user.billing import _UsageAggregator
@@ -150,6 +154,8 @@ class _EventLog(EventLog):
 class _ChildRunner:
   instances: list["_ChildRunner"] = []
   approval_result: dict[str, object]
+  _fork_mode: bool
+  _fork_marker_position: tuple[int, int]
 
 
   def __init__(self, **kwargs: Any) -> None:
@@ -412,6 +418,7 @@ def _resume(parent: AgentRunner, **overrides: Any):
     "original_task_id": "task:prior",
     "reconstructed_messages": [{"role": "user", "content": "resume"}],
     "parent_messages": [],
+    "usage_aggregator": parent._aggregator,
     "capability_execution": capability_execution,
     "skill_name": "explore",
     "logical_task": _LOGICAL_TASK,
@@ -583,6 +590,82 @@ def test_child_that_persists_several_units_settles_on_its_narrative(
   assert result.values.projection is None
   assert result.values.terminal_narrative is not None
   assert result.values.terminal_narrative.content_chars == len(report)
+
+
+@pytest.mark.parametrize("prefix_content", [
+  "Recovered child objective",
+  [
+    {"type": "text", "text": "Recovered child objective"},
+    {"type": "text", "text": ""},
+  ],
+])
+def test_resume_fork_thinking_only_max_tokens_history_pins_cacheable_block(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  prefix_content: Any,
+) -> None:
+  _ChildRunner.instances.clear()
+  admitted = sealed_admitted_task(
+    logical_task=_LOGICAL_TASK,
+    attempt=_ATTEMPT,
+    result_requirement=_RESULT,
+  )
+  admitted = admitted.model_copy(update={
+    "operation": admitted.operation.model_copy(update={"execution_class": "node.fork"}),
+  })
+  # max_tokens can park a stream after thinking without producing visible text.
+  messages = [
+    {"role": "user", "content": prefix_content},
+    {"role": "assistant", "content": [
+      {"type": "thinking", "thinking": "Unfinished reasoning", "signature": "signature"},
+    ]},
+    {"role": "user", "content": "Continue the parked child"},
+  ]
+  parent = _parent(tmp_path, session_log=_SessionLog("Done."))
+  monkeypatch.setattr(gateway_runner, "AgentRunner", _ChildRunner)
+  monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)
+
+  result, error = _resume(
+    parent,
+    reconstructed_messages=messages,
+    admitted_task=admitted,
+    result_provenance=provenance_of(admitted),
+  )
+
+  assert error is None
+  assert result is not None
+  child = _ChildRunner.instances[-1]
+  assert child._fork_mode is True
+  assert child._fork_marker_position == (0, 0)
+  assert child.run_kwargs is not None
+  assert child.run_kwargs["resume_initial_messages"] == messages
+  provider = AnthropicProvider()
+  request = provider.build_request_params(
+    model="claude-sonnet-5",
+    messages=messages,
+    system_prompt=None,
+    tools=[],
+    max_tokens=4096,
+    fork_mode=child._fork_mode,
+    fork_marker_position=child._fork_marker_position,
+  )
+  marked = [
+    (message_index, block_index, block)
+    for message_index, message in enumerate(request["messages"])
+    for block_index, block in enumerate(message["content"])
+    if isinstance(block, dict) and "cache_control" in block
+  ]
+  assert [(message_index, block_index) for message_index, block_index, _ in marked] == [(0, 0)]
+  assert _is_cacheable_message_block(marked[0][2])
+  assert request["messages"][1]["content"] == messages[1]["content"]
+  parent_request = provider.build_request_params(
+    model="claude-sonnet-5",
+    messages=messages[:1],
+    system_prompt=None,
+    tools=[],
+    max_tokens=4096,
+  )
+  assert request["messages"][0] == parent_request["messages"][0]
 
 
 def test_resume_short_circuits_prior_terminal_success_before_provider(
@@ -1222,6 +1305,7 @@ def test_child_runner_owns_captured_session_and_job_handler_context(
       original_task_id="task:prior",
       reconstructed_messages=[{"role": "user", "content": "resume"}],
       parent_messages=[],
+      usage_aggregator=parent._aggregator,
       **kwargs,
     )
   )

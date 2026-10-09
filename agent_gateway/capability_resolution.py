@@ -33,6 +33,7 @@ and the gateway never statically imports ``agent.*``.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -65,6 +66,8 @@ from .tool_dispatch_declarations import (
   canonical_dispatch_tool_name,
   tool_dispatch_declarations,
 )
+
+log = logging.getLogger(__name__)
 
 
 class CapabilityResolutionInputError(ValueError):
@@ -537,6 +540,82 @@ def _unsatisfied_capabilities(
   return tuple(unsatisfied)
 
 
+def inherited_operation_declaration(
+  catalog: PlatformToolCatalog,
+  *,
+  operation_name: str,
+  grant_id: str,
+  tool_ceiling: frozenset[str],
+) -> OperationDeclaration:
+  """Describe inheritance of a parent's offered tools, not a fresh semantic compile.
+
+  Every capability and effect comes from the catalog owner. Registry names use
+  the existing live-tool requirement shape; workspace authority follows the
+  owner's ordered effect ceilings. Effect-less routes remain undelegable;
+  every remaining inherited route must carry its owner's capability tag.
+  """
+
+  if not isinstance(catalog, PlatformToolCatalog):
+    raise CapabilityResolutionInputError(
+      "inherited_operation_declaration requires a PlatformToolCatalog"
+    )
+
+  entries = tuple(
+    entry for entry in catalog.tools if entry.tool_id in tool_ceiling
+  )
+  effectless = frozenset(entry.tool_id for entry in entries if entry.effect is None)
+  for tool_id in sorted(effectless):
+    log.warning(
+      "inherited route has no declared effect; not delegable: %s declares %s; "
+      "admitted without it",
+      operation_name,
+      tool_id,
+    )
+  if effectless:
+    tool_ceiling = tool_ceiling - effectless
+    entries = tuple(entry for entry in entries if entry.effect is not None)
+  untagged = tuple(entry.tool_id for entry in entries if entry.capability is None)
+  if untagged:
+    raise CapabilityResolutionInputError(
+      f"{operation_name}: an inherited ceiling can only name routes the catalog "
+      f"tags; {', '.join(untagged)} have no capability"
+    )
+  for workspace_scope, effect_ceiling in _WORKSPACE_EFFECT_CEILINGS.items():
+    if all(_has_admitted_effect(entry, ceiling=effect_ceiling) for entry in entries):
+      break
+  else:
+    unsupported = next(
+      entry for entry in entries
+      if not any(
+        _has_admitted_effect(entry, ceiling=effect_ceiling)
+        for effect_ceiling in _WORKSPACE_EFFECT_CEILINGS.values()
+      )
+    )
+    raise CapabilityResolutionInputError(
+      f"inherited tool {unsupported.tool_id!r} has no admitting workspace scope "
+      f"for effect {unsupported.effect!r}"
+    )
+
+  capability_names = sorted({
+    entry.capability for entry in entries if entry.capability is not None
+  })
+  return OperationDeclaration(
+    operation_name=operation_name,
+    grant_id=grant_id,
+    workspace_scope=workspace_scope,
+    required_capabilities=tuple(
+      SemanticCapabilityRequirement(
+        name=DEFAULT_SEMANTIC_CAPABILITY_REGISTRY.require(name).name,
+        binding_modes=("live_tool",),
+      )
+      for name in capability_names
+    ),
+    tool_ceiling=tool_ceiling,
+    mcp_tool_ceiling=None,
+    inputs=(),
+  )
+
+
 def resolve_operation_authority(
   declaration: OperationDeclaration,
   *,
@@ -664,6 +743,7 @@ __all__ = [
   "declarative_platform_catalog",
   "derive_dispatcher_allowlist",
   "granted_tool_ids",
+  "inherited_operation_declaration",
   "lookup_catalog_entry",
   "reset_platform_catalog_cache",
   "resolve_operation_authority",

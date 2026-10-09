@@ -563,7 +563,7 @@ class AutonomousApprovalDeliveryCoordinator:
       nonce=nonce,
       approved=approved,
       user_id=str(record.owner_user_id or "").strip(),
-      channel=record.channel,
+      channel=request_record.channel,
     )
 
   async def _record_failure(

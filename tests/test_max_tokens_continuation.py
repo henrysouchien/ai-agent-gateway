@@ -31,7 +31,7 @@ from agent_gateway import (  # noqa: E402
 from agent_gateway.runner import _MAX_TOKENS_CONTINUATIONS, _MAX_TOKENS_NUDGE, StreamTurnResult  # noqa: E402
 from agent_gateway.final_narrative_artifact import read_final_narrative  # noqa: E402
 from agent_gateway.sub_agent_narrative_result import final_child_visible_text  # noqa: E402
-from agent_gateway.task_registry import ParentMessage  # noqa: E402
+from agent_gateway.task_registry import ParentMessage, RegistryOwner  # noqa: E402
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_runner_capability_execution,
 )
@@ -312,6 +312,11 @@ def test_parent_message_breaks_child_max_tokens_logical_response(
       agent_session_log=durable_log,
       message_inbox=inbox,
     )
+    runner._task_registry.bind_owner(RegistryOwner(
+      job_id="bg-steered",
+      tenant=lambda: None,
+      inbox=inbox,
+    ))
     seen_messages: list[list[dict[str, Any]]] = []
 
     async def _fake_stream_turn(**kwargs: Any):
@@ -378,6 +383,8 @@ def test_parent_message_breaks_child_max_tokens_logical_response(
     visible = await final_child_visible_text(
       durable_log,
       sub_session_id="sub_parent:1",
+      role="sub_agent",
+      sub_agent_id="sub_parent:1",
       workspace_dir=str(tmp_path),
       runner_id=runner._runner_id,
     )

@@ -1590,6 +1590,7 @@ class RunnerSessionLifecycleMixin:
         event_types={
           "task_registered",
           "task_completed",
+          "task_terminated",
           "agent_completion",
           "parent_message_sent",
           "skill_result_captured",
@@ -1668,6 +1669,7 @@ class RunnerSessionLifecycleMixin:
       event_types={
         "task_registered",
         "task_completed",
+        "task_terminated",
         "agent_completion",
         "parent_message_sent",
         "skill_result_captured",
@@ -1712,6 +1714,7 @@ class RunnerSessionLifecycleMixin:
       event_types={
         "task_registered",
         "task_completed",
+        "task_terminated",
         "agent_completion",
         "parent_message_sent",
         "skill_result_captured",
@@ -1899,7 +1902,12 @@ class RunnerSessionLifecycleMixin:
         or len(sent_entries) != 1
         or sent_entries[0].seq != message.sent_seq
         or sent_entries[0].event.get("message") != message.text
-        or sent_entries[0].event.get("sub_agent_id") != self._sub_agent_id
+        or self._task_registry.owner is None
+        or message.task_id != self._task_registry.owner.job_id
+        or (
+          self._sub_agent_id is not None
+          and sent_entries[0].event.get("sub_agent_id") != self._sub_agent_id
+        )
       ):
         raise RuntimeError(
           "parent message consumption lacks one exact durable sent fact"
@@ -1926,6 +1934,7 @@ class RunnerSessionLifecycleMixin:
       return
     entries, _ = await durable_log.query(
       event_types={
+        "attach",
         "assistant_message",
         "parent_message_sent",
         "parent_message_consumed",
@@ -1935,9 +1944,19 @@ class RunnerSessionLifecycleMixin:
     sent_by_identity: dict[tuple[str, str], list[Any]] = {}
     consumed_by_identity: dict[tuple[str, str], list[Any]] = {}
     assistant_entries: list[Any] = []
+    attached_consumers: dict[tuple[Any, Any, Any], int] = {}
+    assistant_attach_seqs: dict[int, int | None] = {}
     for entry in entries:
       event = entry.event
       event_type = event.get("type")
+      writer_identity = (
+        event.get("runner_id"),
+        event.get("role"),
+        event.get("sub_agent_id"),
+      )
+      if event_type == "attach":
+        attached_consumers[writer_identity] = entry.seq
+        continue
       if event_type == "assistant_message":
         if (
           event.get("sub_agent_id") == self._sub_agent_id
@@ -1947,6 +1966,9 @@ class RunnerSessionLifecycleMixin:
           )
         ):
           assistant_entries.append(entry)
+          # The earlier attach owns historical consumer provenance, not the sender
+          # or the runner performing this replay.
+          assistant_attach_seqs[entry.seq] = attached_consumers.get(writer_identity)
         continue
       task_id = event.get("task_id")
       message_id = event.get("message_id")
@@ -1998,8 +2020,12 @@ class RunnerSessionLifecycleMixin:
           len(sent_entries) != 1
           or sent_entries[0].seq != binding["parent_message_seq"]
           or sent_entries[0].seq >= assistant.seq
-          or sent_entries[0].event.get("sub_agent_id")
-          != assistant.event.get("sub_agent_id")
+          or self._task_registry.owner is None
+          or binding["task_id"] != self._task_registry.owner.job_id
+          or (
+            self._sub_agent_id is not None
+            and sent_entries[0].event.get("sub_agent_id") != self._sub_agent_id
+          )
           or (
             assistant.event.get("sub_agent_id") is not None
             and assistant.event.get("role") != "sub_agent"
@@ -2007,11 +2033,8 @@ class RunnerSessionLifecycleMixin:
           or (
             assistant.event.get("sub_agent_id") is None
             and (
-              sent_entries[0].event.get("runner_id")
-              != assistant.event.get("runner_id")
-              or sent_entries[0].event.get("role")
-              != assistant.event.get("role")
-              or assistant.event.get("role") != self._role
+              assistant.event.get("role") != self._role
+              or assistant_attach_seqs[assistant.seq] is None
             )
           )
           or type(assistant.event.get("runner_id")) is not str

@@ -39,9 +39,11 @@ from .autonomous_control_contract import (
 from .autonomous_launch_envelope import AutonomousControlAuthority
 from .claim_signing_authority import GatewayClaimSigningAuthority
 from model_authority.binding import CredentialHandle
+from model_authority.selection import ProductModelSelectionPolicy
 from .session import GatewaySession
 from .autonomous_event_channel import (
   AutonomousEventRecord,
+  AutonomousPrivateExecutableCapture,
   ReceivedAutonomousEventStream,
 )
 from .autonomous_runner_claims import (
@@ -297,6 +299,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     autonomous_capability_binding_resolver: (
       AutonomousCapabilityBindingResolver | None
     ) = None,
+    autonomous_selection_policy: ProductModelSelectionPolicy | None = None,
     autonomous_skill_admission_policy_resolver: (
       AutonomousSkillAdmissionPolicyResolver | None
     ) = None,
@@ -341,6 +344,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     self._autonomous_capability_binding_resolver = (
       autonomous_capability_binding_resolver
     )
+    self._selection_policy = autonomous_selection_policy
     if (
       autonomous_skill_admission_policy_resolver is not None
       and not callable(autonomous_skill_admission_policy_resolver)
@@ -383,6 +387,11 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     self._reserved_slots = 0
     self._cleanup_uncommitted_spill_starts()
     self.rehydrate()
+
+  @property
+  def selection_policy(self) -> ProductModelSelectionPolicy | None:
+    """Selection policy declared by the autonomous binding owner."""
+    return self._selection_policy
 
   async def _expire_autonomous_gateway_session(
     self,
@@ -819,6 +828,13 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     if record is None or record.event_channel is None:
       raise RuntimeError("autonomous event channel owner is unavailable")
     endpoint = record.event_channel
+    from .approval_store import ApprovalExecutableBindingError
+    from .control_plane.autonomous_approval_delivery import (
+      admit_delegated_executable_capture,
+      create_delegated_autonomous_approval,
+    )
+
+    pending_captures: dict[tuple[str, str, str], Any] = {}
     first_receive = True
     try:
       while True:
@@ -834,6 +850,20 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
           first_receive = False
         else:
           result = await asyncio.to_thread(endpoint.receive_next)
+        if isinstance(result, AutonomousPrivateExecutableCapture):
+          try:
+            capture = admit_delegated_executable_capture(record, result.payload)
+          finally:
+            result.payload.clear()
+          identity = (capture.approval_id, capture.tool_call_id, capture.nonce)
+          if any(
+            existing[0] == identity[0] or existing[1] == identity[1]
+            for existing in pending_captures
+          ):
+            raise ApprovalExecutableBindingError("call_identity_mismatch")
+          pending_captures[identity] = capture
+          del capture
+          continue
         if isinstance(result, AutonomousEventRecord):
           record.event_channel_records.append(result)
           if result.event.get("type") == (
@@ -868,17 +898,31 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
                 "delegated autonomous approval request is missing its "
                 "durable projection"
               )
-            from .control_plane.autonomous_approval_delivery import (
-              create_delegated_autonomous_approval,
-            )
 
-            async with record.approval_decision_lock:
-              await create_delegated_autonomous_approval(
-                store=self._approval_store,
-                policy=self._approval_policy,
-                record=record,
-                event=result.event,
-              )
+            request_event = result.event
+            capture_identity = (
+              request_event["approval_id"],
+              request_event["tool_call_id"],
+              request_event["nonce"],
+            )
+            private_capture = pending_captures.pop(capture_identity, None)
+            if private_capture is None and any(
+              identity[0] == capture_identity[0]
+              or identity[1] == capture_identity[1]
+              for identity in pending_captures
+            ):
+              raise ApprovalExecutableBindingError("call_identity_mismatch")
+            try:
+              async with record.approval_decision_lock:
+                await create_delegated_autonomous_approval(
+                  store=self._approval_store,
+                  policy=self._approval_policy,
+                  record=record,
+                  event=request_event,
+                  private_executable_capture=private_capture,
+                )
+            finally:
+              del private_capture
           # The child's recap carries its own log's counts; the parent's join
           # it before the run record keeps it.
           event = result.event
@@ -914,6 +958,8 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
             "autonomous event channel stream identity differs from delivered records"
           )
         record.event_channel_stream = result
+        if pending_captures:
+          raise ApprovalExecutableBindingError("call_identity_mismatch")
         if record.cancellation_requested:
           raise asyncio.CancelledError(
             "autonomous event channel acknowledgement cancelled by run owner"
@@ -926,6 +972,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
         record.event_channel_acknowledgement = acknowledgement
         return result
     except BaseException:
+      pending_captures.clear()
       try:
         endpoint.close()
       except Exception:

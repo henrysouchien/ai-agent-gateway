@@ -965,6 +965,12 @@ class RunnerRunLoopMixin:
     _top_level_skill_lifecycle: TopLevelSkillLifecycleMetadata | None
 
     def _append(self, event: Dict[str, Any]) -> Any | None: ...
+    async def _execute_resume_approved_call(
+      self,
+      messages: List[Dict[str, Any]],
+      base_kwargs: Dict[str, Any],
+    ) -> None: ...
+
 
     async def _append_durable_event(
       self,
@@ -3046,6 +3052,7 @@ class RunnerRunLoopMixin:
       base_kwargs: Dict[str, Any] = {
         "tools": cached_tools,
       }
+      await self._execute_resume_approved_call(messages, base_kwargs)
       logger.info("[%s] Effort requested | effort=%s", self._sid, bound_effort)
 
       effective_compaction_trigger = effective_compaction_trigger_fn(self._compaction_trigger, model_info)

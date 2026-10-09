@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
+from model_authority.selection import project_tier
 from model_authority.schema import (
   AnthropicMessagesCompat,
   AnthropicThinking,
@@ -32,12 +33,14 @@ class CapabilityDefault:
 
 
 def capability_default(capability_id: str) -> CapabilityDefault:
-  """Packaged policy default for a capability whose default kind is 'model'; raises for inherit_parent."""
+  """Concrete packaged default, projecting tier assignments through their owner."""
   default = INITIAL_MODEL_SELECTION_POLICY.capabilities[capability_id].default
-  if default.kind != "model" or default.model_key is None or default.effort is None:
-    raise ValueError(
-      f"{capability_id} has no packaged model default (kind={default.kind!r})"
+  if default.kind == "tier" and default.tier is not None:
+    default = project_tier(
+      INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY, capability_id, default.tier,
     )
+  if default.model_key is None or default.effort is None:
+    raise ValueError(f"{capability_id} has no packaged model default")
   return CapabilityDefault(
     capability_id=capability_id,
     model_key=default.model_key,

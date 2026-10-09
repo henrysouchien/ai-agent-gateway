@@ -563,6 +563,9 @@ class RunnerStreamTurnMixin:
           next_progress_log_at = now + STREAM_PROGRESS_LOG_INTERVAL
 
     stream_error: Exception | None = None
+    tried_credential_refs = {self._capability_execution.bind.credential_ref}
+    transient_retries = 0
+    attempt = -1
 
     def _raise_if_disconnected(exc: Exception | None = None) -> None:
       if not self._disconnected:
@@ -576,25 +579,30 @@ class RunnerStreamTurnMixin:
     def _retry_delay(next_attempt: int) -> float:
       return stream_retry_delay * (stream_retry_backoff ** (next_attempt - 1))
 
-    async def _emit_stream_retry(attempt: int, attempt_start_mono: float, error: str) -> None:
+    async def _emit_stream_retry(
+      attempt: int, attempt_start_mono: float, error: str, *, new_credential: bool = False,
+    ) -> None:
       await self._emit_stream_retry_event(
         attempt=attempt,
         error=error,
         attempt_elapsed_s=time_module.monotonic() - attempt_start_mono,
-        backoff_s=_retry_delay(attempt + 1) if attempt < stream_retry_max else None,
+        backoff_s=(
+          _retry_delay(attempt + 1)
+          if new_credential or transient_retries < stream_retry_max else None
+        ),
       )
 
-    for attempt in range(1 + stream_retry_max):
+    while transient_retries <= stream_retry_max:
+      attempt += 1
       if attempt > 0:
         _raise_if_disconnected()
         await self._close_client(client, timeout=2.0)
         client = self._provider.create_client(config)
         self._set_client(client)
         logger.warning(
-          "[%s] Stream retry %d/%d on turn %d after %s",
+          "[%s] Stream retry %d on turn %d after %s",
           self._sid,
           attempt,
-          stream_retry_max,
           turn_count,
           _runner_attr(self, "_format_exc", _format_exc)(stream_error) if stream_error is not None else "unknown error",
         )
@@ -685,7 +693,7 @@ class RunnerStreamTurnMixin:
 
         action, guard_error, guard_kind = self._classify_guard_outcome(
           guard_reason,
-          attempt,
+          transient_retries,
           stream_retry_max,
         )
         if action != "not_guard":
@@ -699,15 +707,17 @@ class RunnerStreamTurnMixin:
               )
             _raise_if_disconnected(stream_error)
             logger.warning(
-              "[%s] Stream watchdog stall on turn %d after %.1fs (attempt %d/%d), retrying: %s",
+              "[%s] Stream watchdog stall on turn %d after %.1fs (attempt %d, transient retries %d/%d), retrying: %s",
               self._sid,
               turn_count,
               time_module.time() - turn_t0,
               attempt + 1,
-              1 + stream_retry_max,
+              transient_retries,
+              stream_retry_max,
               guard_message,
             )
             await _emit_stream_retry(attempt, attempt_start_mono, guard_error)
+            transient_retries += 1
             continue
           logger.error(
             "[%s] Stream watchdog on turn %d after %.1fs (%s): %s | %s",
@@ -731,11 +741,14 @@ class RunnerStreamTurnMixin:
         except Exception as classify_exc:
           logger.warning("[%s] credential failure classification failed (non-fatal): %s", self._sid, classify_exc)
         if credential_failure is not None:
-          # The provider owns which credentials are interchangeable; the bound
-          # model is untouched, so a spent credential costs one attempt of this
-          # turn instead of the run.
+          # The provider owns interchangeable credentials. A generation's first
+          # attempt does not spend the transient-error retry budget; revisiting
+          # a generation (including an unchanged bind) does.
           rotated_config = self._provider.next_credential(config, credential_failure)
           if rotated_config is not None and self._apply_refreshed_auth_config(config, rotated_config):
+            credential_ref = self._capability_execution.bind.credential_ref
+            new_credential = credential_ref not in tried_credential_refs
+            tried_credential_refs.add(credential_ref)
             usage_totals.clear()
             usage_totals.update(usage_before_attempt)
             stream_error = RuntimeError(f"credential rotated after {credential_failure.kind}")
@@ -752,12 +765,15 @@ class RunnerStreamTurnMixin:
               attempt,
               attempt_start_mono,
               f"credential rotated after provider {credential_failure.kind} failure",
+              new_credential=new_credential,
             )
             if partial_usage_state.has_tokens:
               await self._call_on_usage(
                 self._build_usage_event(model=config["model"], usage_totals=partial_usage),
                 usage_state="failed_billable",
               )
+            if not new_credential:
+              transient_retries += 1
             continue
 
         formatted_exc = _runner_attr(self, "_format_exc", _format_exc)(exc)
@@ -797,15 +813,16 @@ class RunnerStreamTurnMixin:
           return await self._finish_failed_stream_turn(client, event_error)
 
         logger.warning(
-          "[%s] Transient stream error on turn %d after %.1fs (attempt %d/%d): %s",
+          "[%s] Transient stream error on turn %d after %.1fs (attempt %d, transient retries %d/%d): %s",
           self._sid,
           turn_count,
           time_module.time() - turn_t0,
           attempt + 1,
-          1 + stream_retry_max,
+          transient_retries,
+          stream_retry_max,
           logged_exc,
         )
-        if attempt < stream_retry_max:
+        if transient_retries < stream_retry_max:
           if partial_usage_state.has_tokens:
             await self._call_on_usage(
               self._build_usage_event(model=config["model"], usage_totals=partial_usage),
@@ -813,16 +830,18 @@ class RunnerStreamTurnMixin:
             )
           _raise_if_disconnected(exc)
           await _emit_stream_retry(attempt, attempt_start_mono, event_error)
+          transient_retries += 1
           continue
         if partial_usage_state.has_tokens:
           await self._call_on_usage(
             self._build_usage_event(model=config["model"], usage_totals=partial_usage),
             usage_state="failed_billable",
           )
+        transient_retries += 1
       else:
         action, guard_error, _ = self._classify_guard_outcome(
           guard_reason,
-          attempt,
+          transient_retries,
           stream_retry_max,
         )
         if action != "not_guard":
@@ -840,15 +859,17 @@ class RunnerStreamTurnMixin:
               )
             _raise_if_disconnected(stream_error)
             logger.warning(
-              "[%s] Stream watchdog stall on turn %d after %.1fs (attempt %d/%d), retrying: %s",
+              "[%s] Stream watchdog stall on turn %d after %.1fs (attempt %d, transient retries %d/%d), retrying: %s",
               self._sid,
               turn_count,
               time_module.time() - turn_t0,
               attempt + 1,
-              1 + stream_retry_max,
+              transient_retries,
+              stream_retry_max,
               guard_message,
             )
             await _emit_stream_retry(attempt, attempt_start_mono, guard_error)
+            transient_retries += 1
             continue
           if partial_usage_state.has_tokens:
             await self._call_on_usage(

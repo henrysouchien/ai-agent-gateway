@@ -211,6 +211,7 @@ async def can_use_tool_callback(
     session=runner._session,
     producer_session=runner._session,
     executable_capture=None,
+    root_turn_admission=runner._root_turn_admission,
     tool_call_id=tool_call_id,
     tool_name=policy_tool,
     tool_input=prepared_input,

@@ -52,6 +52,7 @@ class ChildOutcomeClassification:
   succeeded: bool
   error: dict[str, Any] | None
   execution_status: str = "failed"
+  is_final: bool = True
 
 
 def declared_terminal_doors_from_grant(grant: ToolGrant | None) -> frozenset[str]:
@@ -360,6 +361,14 @@ def classify_child_outcome(
   task_result = TaskResult.model_validate(result)
 
   execution = task_result.execution
+  if execution.status == "awaiting_approval":
+    return ChildOutcomeClassification(
+      outcome="awaiting_approval",
+      succeeded=False,
+      error=None,
+      execution_status=execution.status,
+      is_final=False,
+    )
   if execution.status != "succeeded":
     reason = execution.terminal_reason or execution.status
     return _failure_classification(
@@ -438,6 +447,8 @@ async def persist_skill_state(
     else getattr(profile, "version", None)
   )
   classification = classify_child_outcome(result, error)
+  if not classification.is_final:
+    return
   model_state: dict[str, Any] = {}
   if classification.succeeded:
     response_text = result_response_text_fn(result)

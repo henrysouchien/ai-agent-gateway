@@ -43,6 +43,10 @@ from agent_workflow_contracts import (
   sha256_digest,
 )
 from agent_gateway.autonomous_output import extract_state_update
+from agent_gateway.agent_session_log import AgentSessionLog
+from agent_gateway.event_log import EventLog
+from agent_gateway.skills import SkillStateStore
+from agent_gateway.sub_agent_skill_events import SkillRunEventEmitter
 
 
 class _Store:
@@ -207,6 +211,43 @@ def test_classify_child_outcome_uses_execution_settlement_failure() -> None:
     "child_outcome": "interrupted",
     "next_call": None,
   }
+
+
+def test_classify_awaiting_approval_is_nonfinal_without_an_error() -> None:
+  result = _task_result(
+    "", status="awaiting_approval", terminal_reason="approval_required",
+  )
+  classification = skill_state.classify_child_outcome(
+    result,
+    None,
+    declared_terminal_doors={"fms_propose_demo"},
+    door_results=({
+      "tool_name": "fms_propose_demo",
+      "status": "error",
+      "gate_code": "STOP",
+    },),
+  )
+
+  assert classification.outcome == "awaiting_approval"
+  assert classification.execution_status == "awaiting_approval"
+  assert classification.is_final is False
+  assert classification.succeeded is False
+  assert classification.error is None
+
+
+def test_real_error_on_parked_result_remains_final() -> None:
+  error = {"code": "provider_failed", "message": "provider failed"}
+  classification = skill_state.classify_child_outcome(
+    _task_result(
+      "", status="awaiting_approval", terminal_reason="approval_required",
+    ),
+    error,
+  )
+
+  assert classification.is_final is True
+  assert classification.outcome == "error"
+  assert classification.execution_status == "failed"
+  assert classification.error == error
 
 
 def test_classify_child_outcome_rejects_success_claim_from_error() -> None:
@@ -621,5 +662,106 @@ def test_persist_skill_state_skips_when_profile_does_not_persist() -> None:
     )
 
     assert store.saved == {}
+
+  asyncio.run(scenario())
+
+
+def test_parked_skill_settles_events_and_state_only_after_success(
+  tmp_path: Path,
+) -> None:
+  async def scenario() -> None:
+    store = SkillStateStore(tmp_path / "skill_state.json")
+    initial = {
+      "run_count": 2,
+      "outcome_counts": {"complete": 2},
+      "last_outcome": "complete",
+      "last_run": "previous-run",
+      "alerts": ["stable"],
+    }
+    store.set("skill-a", initial)
+    before_park = store.state_file.read_bytes()
+    event_log = EventLog()
+    journal = AgentSessionLog(tmp_path / "session.jsonl")
+    projected: list[dict[str, Any]] = []
+
+    async def confirm(event: dict[str, Any]) -> dict[str, Any] | None:
+      entries, _ = await journal.query(event_types={event["type"]})
+      return next(
+        (
+          entry.event
+          for entry in entries
+          if all(entry.event.get(key) == value for key, value in event.items())
+        ),
+        None,
+      )
+
+    emitter = SkillRunEventEmitter(
+      skill_run_id="skill-run-parked",
+      skill_name="skill-a",
+      semantic_scope=None,
+      context_ticker=None,
+      portfolio_id=None,
+      event_log_getter=lambda: event_log,
+      tool_ctx=SimpleNamespace(emit=projected.append),
+      durable_appender=journal.append,
+      durable_confirmer=confirm,
+      time_fn=lambda: 1.0,
+    )
+    state_args: dict[str, Any] = {
+      "agent_name": "skill-a",
+      "profile": None,
+      "persist_state": True,
+      "skill_state_store": store,
+      "skill_state_lock": asyncio.Lock(),
+      "effective_model": "model-a",
+      "extract_state_update_fn": extract_state_update,
+      "logger": SimpleNamespace(warning=lambda *_args, **_kwargs: None),
+    }
+    parked = _task_result(
+      "", status="awaiting_approval", terminal_reason="approval_required",
+    )
+    for _ in range(2):
+      assert await emitter.emit_result_captured(parked, None) is False
+      await skill_state.persist_skill_state(parked, None, **state_args)
+    parked_entries, _ = await journal.query()
+    durable = [entry.event for entry in parked_entries]
+    assert store.state_file.read_bytes() == before_park
+    assert store.get("skill-a") == initial
+    assert [event["type"] for event in durable] == ["skill_run_started"]
+    assert [event["type"] for event in projected] == ["skill_run_started"]
+    assert [entry.event["type"] for entry in event_log.entries] == [
+      "skill_run_started",
+    ]
+
+    final = _task_result(
+      '## STATE_UPDATE_JSON\n```json\n{"alerts":["settled"]}\n```'
+    )
+    assert await emitter.emit_result_captured(final, None) is True
+    await skill_state.persist_skill_state(final, None, **state_args)
+    assert await emitter.emit_result_captured(final, None) is True
+    final_entries, _ = await journal.query()
+    durable = [entry.event for entry in final_entries]
+    assert [event["type"] for event in durable] == [
+      "skill_run_started",
+      "skill_result_captured",
+    ]
+    assert [event["type"] for event in projected] == [
+      "skill_run_started",
+      "skill_result_captured",
+    ]
+    assert [entry.event["type"] for entry in event_log.entries] == [
+      "skill_run_started",
+      "skill_result_captured",
+    ]
+    assert durable[-1]["exit_code"] == 0
+    assert durable[-1]["outcome"] == "success"
+    assert durable[-1]["status"] == "complete"
+    saved = store.get("skill-a")
+    assert saved["alerts"] == ["settled"]
+    assert saved["run_count"] == 3
+    assert saved["outcome_counts"] == {"complete": 3}
+    assert saved["last_outcome"] == "complete"
+    assert saved["last_run"] != "previous-run"
+    assert "last_error" not in saved
 
   asyncio.run(scenario())

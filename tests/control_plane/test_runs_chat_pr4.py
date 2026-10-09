@@ -1121,6 +1121,64 @@ def test_chat_missing_terminal_disposition_projects_failed_control_state() -> No
     assert response.json()["state"] == "failed"
 
 
+def test_chat_awaiting_approval_terminal_projects_approval_pending() -> None:
+  app = _make_app()
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    chat = _chat_session(client, "alice")
+    session = app.state.auth.session_store.get_session(chat["session_id"])
+    assert session is not None
+    # A parked turn leaves no transient pending_tools entry and is not streaming;
+    # the durable root terminal event alone records the open approval wait.
+    session.pending_tools.clear()
+    session.stream_active = False
+    session.event_history.append({
+      "type": "stream_complete",
+      "terminal_disposition": "awaiting_approval",
+      "job_id": "job-parked-1",
+      "approval_id": "appr-parked-1",
+      "root_turn_id": "turn-parked-1",
+      "original_tool_call_id": "call-parked-1",
+      "usage": {},
+    })
+
+    response = client.get(
+      f"/api/control/runs/{chat['session_id']}",
+      headers=_headers(control),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "approval_pending"
+
+
+def test_chat_child_awaiting_approval_does_not_settle_root_state() -> None:
+  app = _make_app()
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    chat = _chat_session(client, "alice")
+    session = app.state.auth.session_store.get_session(chat["session_id"])
+    assert session is not None
+    session.pending_tools.clear()
+    session.stream_active = False
+    session.event_history.append({
+      "type": "stream_complete",
+      "terminal_disposition": "awaiting_approval",
+      "sub_agent_id": "child-agent-1",
+      "job_id": "job-child-1",
+      "approval_id": "appr-child-1",
+      "usage": {},
+    })
+
+    response = client.get(
+      f"/api/control/runs/{chat['session_id']}",
+      headers=_headers(control),
+    )
+
+    assert response.status_code == 200, response.text
+    # A child's park is the child's; the root run is untouched.
+    assert response.json()["state"] == "starting"
+
+
 def test_chat_dispatch_persists_redacted_dispatch_scope() -> None:
   captured_contexts: list[dict[str, Any]] = []
   app = _make_app(captured_contexts)

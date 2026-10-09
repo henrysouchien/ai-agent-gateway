@@ -263,6 +263,8 @@ class SkillRunEventEmitter:
         result,
         error,
       )
+    if self._result_event is None:
+      return False
     return await self._emit_durable_parent_event(
       deepcopy(self._result_event),
       projector=self.project_result_captured,
@@ -272,7 +274,7 @@ class SkillRunEventEmitter:
     self,
     result: Any | None,
     error: dict[str, Any] | None,
-  ) -> dict[str, Any]:
+  ) -> dict[str, Any] | None:
     started_ts = (
       self._started_event.get("ts")
       if isinstance(self._started_event, dict)
@@ -304,7 +306,9 @@ class SkillRunEventEmitter:
   ) -> bool:
     if self._result_task is not None and self._result_task.done():
       try:
-        return self._result_task.result()
+        if self._result_task.result():
+          return True
+        self._result_task = None
       except BaseException:
         self._result_task = None
     if self._result_task is None:

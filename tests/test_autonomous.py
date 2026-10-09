@@ -418,6 +418,77 @@ def test_collect_run_output() -> None:
   assert output.max_tokens_reached is False
 
 
+def test_collect_approval_park_preserves_state_and_exposes_only_safe_references() -> None:
+  event_log = EventLog(defer_terminal_close=True)
+  event_log.append({"type": "text_delta", "text": "Waiting for the requested operation."})
+  event_log.append({"type": "tool_call_start", "tool_name": "execute_operation"})
+  usage = {"input_tokens": 31, "output_tokens": 17, "estimated_cost": 0.02}
+  references = {
+    "approval_id": "approval-park",
+    "job_id": "job-original",
+    "original_tool_call_id": "call-original",
+    "root_turn_id": "turn-original",
+  }
+  event_log.append({
+    "type": "stream_complete",
+    "terminal_disposition": "awaiting_approval",
+    "usage": usage,
+    **references,
+    "nonce": "private-nonce",
+    "operands": {"secret": "private-operand"},
+    "prepared_tool_call": {"arguments": "private-arguments"},
+  })
+  event_log.append({
+    "type": "stream_complete",
+    "terminal_disposition": "completed",
+    "usage": {"input_tokens": 1, "output_tokens": 1},
+  })
+  recap = {"type": "session_recap", "summary": "Approval is pending."}
+  event_log.append(recap)
+
+  output = autonomous.collect_run_output(event_log, timed_out=False)
+
+  assert autonomous.run_output_outcome(output) == "awaiting_approval"
+  assert output.exit_reason == "awaiting_approval"
+  assert output.error is None
+  assert output.operator_paused is False
+  assert output.timed_out is False
+  assert output.response == "Waiting for the requested operation."
+  assert output.tools_used == ["execute_operation"]
+  assert output.usage == usage
+  assert output.session_recap == recap
+  assert output.approval_refs == references
+  state = autonomous.build_state_payload(
+    previous_state={"position": "original", "error": "stale"},
+    model_state={"position": "uncommitted", "new_model_field": True},
+    run_output=output,
+  )
+  assert state["position"] == "original"
+  assert "new_model_field" not in state
+  assert "error" not in state
+  assert state["last_outcome"] == "awaiting_approval"
+  assert state["approval_refs"] == references
+  assert state["usage"] == usage
+  summary = autonomous.format_run_summary(output, state=state)
+  assert "Status: awaiting approval" in summary
+  assert "Approval: approval-park" in summary
+  assert "completed" not in summary
+  assert "Error:" not in summary
+  for private_value in ("private-nonce", "private-operand", "private-arguments"):
+    assert private_value not in repr(output)
+    assert private_value not in repr(state)
+    assert private_value not in summary
+
+  settled_state = autonomous.build_state_payload(
+    previous_state=state,
+    model_state={"position": "settled"},
+    run_output=autonomous.RunOutput("Done.", [], {}, None, False),
+  )
+  assert settled_state["position"] == "settled"
+  assert settled_state["last_outcome"] == "success"
+  assert "approval_refs" not in settled_state
+
+
 def test_collect_run_output_detects_max_tokens_stop_reason() -> None:
   event_log = EventLog()
   event_log.append({"type": "text_delta", "text": "partial"})
@@ -895,6 +966,7 @@ def test_run_session_writer_lease_collision_is_info_skip(
 
 
 def test_run_autonomous_uses_exact_prebound_model(monkeypatch: pytest.MonkeyPatch) -> None:
+  from gateway_test_support.capability_execution_test_support import stub_capability_execution_resolver
   captured: dict[str, Any] = {}
 
   async def _fake_run_session(
@@ -1636,6 +1708,7 @@ def test_run_autonomous_skills_dir_registers_send_message_tool_and_builtin_name(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
 ) -> None:
+  from gateway_test_support.capability_execution_test_support import stub_capability_execution_resolver
   captured: dict[str, Any] = {}
   skills_dir = tmp_path / "skills"
   skills_dir.mkdir(parents=True, exist_ok=True)
@@ -1708,7 +1781,9 @@ def test_run_autonomous_skills_dir_registers_send_message_tool_and_builtin_name(
       "Run the task.",
       **_bound_execution(),
       skills_dir=skills_dir,
-      **_raw_capability_execution_resolver(capability_execution_resolver=object()),
+      **_raw_capability_execution_resolver(
+        capability_execution_resolver=stub_capability_execution_resolver(run_mode="autonomous"),
+      ),
       mcp_servers={"filesystem": {"command": "npx", "args": ["-y", "server"]}},
       trusted_mcp_allowed_servers={"filesystem"},
       user_id="alice",

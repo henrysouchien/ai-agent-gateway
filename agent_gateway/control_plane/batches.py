@@ -1545,10 +1545,15 @@ def _acquire_and_start_batch(
       )
 
     def _admit_stage_factory(plan: Any):
+      from model_authority.selection import capture_selection_snapshot
+
       parent = root_context(
         parent_session,
         withheld_tools=frozenset(),
         research_file_id=plan.research_file_id,
+        selection_snapshot=capture_selection_snapshot(
+          capability_execution_resolver.selection_policy,
+        ),
       )
       return _batch_backend(app_state).stage_admitter(
         parent, capability_execution_resolver, skill_application.operation_catalog

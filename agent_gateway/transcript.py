@@ -438,6 +438,17 @@ async def reconstruct_messages_for_task(log: AgentSessionLog, task_id: str) -> l
 
   messages: list[Message] = []
   pending_tool_results: list[ToolResultBlock] = []
+  # Keep a replayed call's latest durable result beside its original use.
+  # A parked cancellation and its later approved execution are one call,
+  # not two independently consumable results.
+  latest_tool_results: dict[str | int, list[ToolResultBlock]] = {}
+  for segment in lineage:
+    for entry in segment.entries:
+      if entry.event.get("type") == "tool_call_complete":
+        key = entry.event.get("tool_call_id") or entry.seq
+        latest_tool_results[key] = _tool_result_blocks_from_event(entry.event)
+  emitted_tool_results: set[str | int] = set()
+
 
   def flush_tool_results() -> None:
     nonlocal pending_tool_results
@@ -453,7 +464,10 @@ async def reconstruct_messages_for_task(log: AgentSessionLog, task_id: str) -> l
     event = entry.event
     event_type = str(event.get("type") or "")
     if event_type == "tool_call_complete":
-      pending_tool_results.extend(_tool_result_blocks_from_event(event))
+      key = event.get("tool_call_id") or entry.seq
+      if key not in emitted_tool_results:
+        pending_tool_results.extend(latest_tool_results[key])
+        emitted_tool_results.add(key)
       continue
     flush_tool_results()
     if event_type == "user_message":

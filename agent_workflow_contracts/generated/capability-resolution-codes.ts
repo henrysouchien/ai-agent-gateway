@@ -18,6 +18,7 @@ export const CAPABILITY_RESOLUTION_CODES = [
   "capability_model_retired",
   "capability_model_revoked",
   "capability_model_unavailable",
+  "capability_model_unqualified",
   "capability_policy_missing",
   "capability_role_unavailable",
   "capability_role_unknown",

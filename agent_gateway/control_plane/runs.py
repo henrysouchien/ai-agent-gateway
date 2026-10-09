@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request, Response
+from model_authority.selection import capture_selection_snapshot
 
 from agent_gateway.admission import root_context
 from agent_gateway.autonomous_capability_handoff import AutonomousLaunchAdmissionRefused
@@ -224,6 +225,11 @@ def build_runs_router(
           authenticated,
           withheld_tools=frozenset(),
           research_file_id=payload.research_file_id,
+          selection_snapshot=(
+            capture_selection_snapshot(registry.selection_policy)
+            if registry.selection_policy is not None
+            else None
+          ),
         ),
         role=authenticated.role,
         profile=payload.profile,

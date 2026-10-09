@@ -41,7 +41,7 @@ from .operation_catalog import AgentOperationCatalog
 from .multi_user.billing import DEFAULT_USAGE_DLQ_PATH, SessionUsageSummary, UsageEvent, UsageLedger
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from model_authority.registry import ModelRegistryEntry
-from model_authority.selection import CapabilityDefault, ProductModelSelectionPolicy
+from model_authority.selection import CapabilityDefault, ProductModelSelectionPolicy, project_tier
 from .providers import AnthropicProvider, ModelProvider
 from model_authority.rates import load_rate_table
 from .admission import current_parent_context, root_context
@@ -70,9 +70,16 @@ _SESSION_LOG_BASE_DIR_ENV = "AGENT_SESSION_LOG_BASE_DIR"
 _INITIAL_DRIVER_DEFAULT = INITIAL_MODEL_SELECTION_POLICY.capabilities[
   SESSION_DRIVER_CAPABILITY
 ].default
-if _INITIAL_DRIVER_DEFAULT.kind != "model" or _INITIAL_DRIVER_DEFAULT.model_key is None:
+_DEFAULT_EASY_MODEL_KEY = (
+  project_tier(
+    INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY,
+    SESSION_DRIVER_CAPABILITY, _INITIAL_DRIVER_DEFAULT.tier,
+  ).model_key
+  if _INITIAL_DRIVER_DEFAULT.kind == "tier" and _INITIAL_DRIVER_DEFAULT.tier is not None
+  else _INITIAL_DRIVER_DEFAULT.model_key
+)
+if _DEFAULT_EASY_MODEL_KEY is None:
   raise RuntimeError("initial session.driver policy must select a stable model key")
-_DEFAULT_EASY_MODEL_KEY = _INITIAL_DRIVER_DEFAULT.model_key
 
 
 def _resolve_session_log_base_dir(
@@ -814,10 +821,15 @@ def create_agent(
         },
       )
       session.tool_result_spill_sink = configured_spill_sink
+      from model_authority.selection import capture_selection_snapshot
+
       context = root_context(
         session,
         withheld_tools=frozenset(),
         research_file_id=None,
+        selection_snapshot=capture_selection_snapshot(
+          capability_execution_resolver.selection_policy,
+        ),
       )
       root_inbox: asyncio.Queue[ParentMessage] = asyncio.Queue(maxsize=64)
       runner = AgentRunner(

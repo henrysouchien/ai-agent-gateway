@@ -40,6 +40,11 @@ from pydantic import (
 from pydantic_core import PydanticCustomError
 
 from .auth import CredentialsResolver
+from .approval_continuation import (
+  ChildContinueHook,
+  RootContinueHook,
+  WorkflowContinueHook,
+)
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CredentialHandle
 from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
@@ -423,6 +428,20 @@ class ModelPreferenceResponse(BaseModel):
   capability: str
   model_key: str | None
   effort: str | None
+
+
+class ModelPresetUpdate(BaseModel):
+  model_config = ConfigDict(extra="forbid", frozen=True)
+
+  name: str = Field(min_length=1)
+
+
+class ModelPresetResponse(BaseModel):
+  model_config = ConfigDict(extra="forbid", frozen=True)
+
+  name: str | None
+  policy_revision: str | None
+  updated_at: int | None
 
 
 class ChatInitResponse(BaseModel):
@@ -1031,6 +1050,8 @@ class GatewayServerConfig:
       resolves and materializes the exact profile/skill-aware session-driver
       bind before an autonomous subprocess is launched. Resume requests carry
       the persisted bind as an exact requirement.
+    autonomous_selection_policy: The binding callback's selection policy,
+      retained by the registry for root snapshots before launch admission.
     autonomous_skill_admission_policy_resolver: Trusted synchronous callback
       deriving the static resume fact and execution limits coherently for a
       new skill admission. Resumed admissions inherit persisted facts.
@@ -1053,6 +1074,15 @@ class GatewayServerConfig:
     session_resume_resolver: Application lookup for `resume_session_id` at
       init: returns the caller's own existing interactive log or a refusal
       reason. Without it every resume is refused as `not_found`.
+    root_continue_hook: Optional host-private root approval delivery adapter.
+      The caller supplies route-verified tenant storage identity.
+    workflow_continue_hook: Optional host-private workflow approval delivery
+      adapter. It resolves the session-owned service for the parked task.
+    child_continue_hook: Optional host-private non-root approval delivery
+      adapter. It restores the owning session runtime and selects the workflow
+      or ordinary child continuation for the parked task.
+      No hook is exposed through model arguments or public workflow schemas.
+      An omitted hook leaves that continuation consumer uninstalled.
     on_startup: Optional startup callback.
     on_shutdown: Optional shutdown callback.
     transcript_dir: Optional directory where request and event transcripts are
@@ -1141,6 +1171,7 @@ class GatewayServerConfig:
   autonomous_capability_binding_resolver: (
     AutonomousCapabilityBindingResolver | None
   ) = None
+  autonomous_selection_policy: ProductModelSelectionPolicy | None = None
   autonomous_skill_admission_policy_resolver: (
     AutonomousSkillAdmissionPolicyResolver | None
   ) = None
@@ -1174,3 +1205,6 @@ class GatewayServerConfig:
   log_name: str = "gateway"
   prefix: str = "/api"
   autonomous_api_dir: Path | None = None
+  root_continue_hook: RootContinueHook | None = None
+  workflow_continue_hook: WorkflowContinueHook | None = None
+  child_continue_hook: ChildContinueHook | None = None

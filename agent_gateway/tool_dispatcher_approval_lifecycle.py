@@ -56,9 +56,39 @@ if TYPE_CHECKING:
   from .prepared_business_model_store import PreparedBusinessModelChange
 
 
+class ApprovalPark(Exception):
+  """A physical attempt yielded with its original call still unresolved."""
+
+  __slots__ = (
+    "job_id", "original_tool_call_id", "approval_id", "nonce", "root_turn_id",
+  )
+
+  def __init__(
+    self,
+    *,
+    job_id: str,
+    original_tool_call_id: str,
+    approval_id: str,
+    nonce: str,
+    root_turn_id: str | None = None,
+  ) -> None:
+    super().__init__("execution awaiting approval")
+    self.job_id = job_id
+    self.original_tool_call_id = original_tool_call_id
+    self.approval_id = approval_id
+    self.nonce = nonce
+    self.root_turn_id = root_turn_id
+
+  def __str__(self) -> str:
+    return "execution awaiting approval"
+
+  def __repr__(self) -> str:
+    return "ApprovalPark()"
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class ExecutableCapture:
-  """Private original native call operands, separate from public approval data."""
+  """Private original call operands, separate from public approval data."""
 
   prepared_call: PreparedToolCall
   dispatch_context: Mapping[str, object]
@@ -310,6 +340,8 @@ async def _reconcile_approval_timeout_winner(
 
 async def _run_delegated_approval_lifecycle(
   *,
+  route: ParentDelegatedApprovalRoute,
+  executable_capture: ExecutableCapture | None,
   request: PolicyApprovalRequest,
   tool_input: dict[str, Any],
   qualifier: str,
@@ -387,6 +419,20 @@ async def _run_delegated_approval_lifecycle(
     allow_persistent_grant=False,
   )
   nonce = os_urandom_fn(8).hex()
+  if executable_capture is not None and route.private_capture_writer is not None:
+    prepared = executable_capture.prepared_call
+    await route.private_capture_writer({
+      "approval_id": request.approval_id,
+      "tool_call_id": request.tool_call_id,
+      "nonce": nonce,
+      "tool_name": request.tool_name,
+      "prepared_input": prepared.materialize_input(),
+      "exact_backend": prepared.exact_backend,
+      "dispatch_context": dict(executable_capture.dispatch_context),
+      "job_id": executable_capture.job_id,
+      "tenant_storage_id": executable_capture.tenant_storage_id,
+      "credential_generation_ref": executable_capture.credential_generation_ref,
+    })
   approval = await await_user_approval_via_pending_tools_fn(
     request,
     decision,
@@ -434,6 +480,7 @@ async def run_approval_lifecycle(
   session: Any | None,
   producer_session: Any | None,
   executable_capture: ExecutableCapture | None,
+  root_turn_admission: admission.RootTurnAdmission | None = None,
   tool_call_id: str,
   tool_name: str,
   tool_input: dict[str, Any],
@@ -469,7 +516,7 @@ async def run_approval_lifecycle(
 ) -> dict[str, Any]:
   arguments = dict(locals())
   # Batch scope belongs to the executing producer, not its parent's ledger.
-  batch_admission = acquire_batch_approval_admission(arguments.pop("producer_session"))
+  batch_admission = acquire_batch_approval_admission(arguments["producer_session"])
   arguments["batch_admission"] = batch_admission
   try:
     return await _run_approval_lifecycle_impl(**arguments)
@@ -489,7 +536,9 @@ async def _run_approval_lifecycle_impl(
     ApprovalLifecyclePolicy,
   ],
   session: Any | None,
+  producer_session: Any | None,
   executable_capture: ExecutableCapture | None,
+  root_turn_admission: admission.RootTurnAdmission | None = None,
   tool_call_id: str,
   tool_name: str,
   tool_input: dict[str, Any],
@@ -622,6 +671,8 @@ async def _run_approval_lifecycle_impl(
       request = replace(request, authorization_mode="AUTO_ALLOW")
   if isinstance(route, ParentDelegatedApprovalRoute):
     return await _run_delegated_approval_lifecycle(
+      route=route,
+      executable_capture=executable_capture,
       request=request,
       tool_input=tool_input,
       qualifier=qualifier,
@@ -836,6 +887,7 @@ async def _run_approval_lifecycle_impl(
     }
 
   nonce = os_urandom_fn(8).hex()
+  executable_nonce: str | None = None
   if executable_capture is not None:
     if executable_capture.job_id is None or executable_capture.tenant_storage_id is None:
       logging.getLogger("agent_gateway.approval_capture").warning(
@@ -858,13 +910,20 @@ async def _run_approval_lifecycle_impl(
         dispatch_context=executable_capture.dispatch_context,
         credential_generation_ref=executable_capture.credential_generation_ref,
       )
-    if executable_capture.root_turn is not None:
-      await admission.link_root_park(
-        store,
-        executable_capture.root_turn,
-        tool_call_id=tool_call_id,
-        nonce=nonce,
-      )
+      executable_nonce = nonce
+
+  root_turn = (
+    executable_capture.root_turn
+    if executable_capture is not None
+    else root_turn_admission
+  )
+  if root_turn is not None:
+    await admission.link_root_park(
+      store,
+      root_turn,
+      tool_call_id=tool_call_id,
+      nonce=nonce,
+    )
 
   expires_at = utc_now_fn() + timedelta(seconds=decision.expiry_seconds or 600)
   request = await store.transition_state(
@@ -915,6 +974,7 @@ async def _run_approval_lifecycle_impl(
     "request": request,
     "tool_input": final_tool_input,
     "policy_modified_tool_args": policy_modified_tool_args,
+    **({"executable_nonce": executable_nonce} if executable_nonce is not None else {}),
   }
 
 

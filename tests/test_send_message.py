@@ -31,6 +31,7 @@ from agent_gateway.runner import StreamTurnResult
 from gateway_test_support.capability_execution_test_support import (
   stub_runner_capability_execution,
 )
+from gateway_test_support.host_policy import owner_session_host_policy
 from agent_gateway.admission import ParentContext
 from agent_gateway.approval_route import NoApprovalRoute
 from agent_gateway.task_registry import RegistryOwner
@@ -1101,6 +1102,12 @@ def test_send_message_persists_event_and_child_sees_parent_message_envelope(tmp_
       ),
       agent_session_log=log,
       get_tool_definitions=lambda: [],
+      task_registry=TaskRegistry(owner=RegistryOwner(
+        job_id=entry.task_id,
+        tenant=lambda: _TENANT,
+        inbox=entry.message_inbox,
+        parent=registry,
+      )),
       message_inbox=entry.message_inbox,
       user_id="alice",
       billing_mode="byok",
@@ -1304,6 +1311,7 @@ def test_root_message_consumption_rejects_conflicting_writer_lineage(
       rate_table_version="unknown",
     )
     runner._runner_id = "runner-root"
+    await runner._emit_attach_event()
     handler = make_send_message_handler(
       [runner],
       caller=_root_caller,
@@ -1338,6 +1346,381 @@ def test_root_message_consumption_rejects_conflicting_writer_lineage(
       event_types={"parent_message_consumed"}, order="asc",
     )
     assert consumed_entries == []
+
+  _run(_case())
+
+
+def test_spawned_child_message_is_consumed_by_historical_root_writer(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  owner_session_host_policy: Any,
+) -> None:
+  from dataclasses import replace
+  import json
+  from uuid import uuid4
+  from collections.abc import AsyncIterator
+
+  from agent_gateway.admission import current_parent_context, root_context
+  from agent_gateway.approval_route import bind_session_approval_route
+  from agent_gateway.providers import ModelProvider, StreamEvent
+  from agent_gateway.session import GatewaySession
+  from agent_gateway.skills import SkillLoader
+  from agent_gateway.sub_agent import make_run_agent_handler, make_send_message_tool_def
+  from agent_gateway.tool_dispatcher_helpers import LocalToolHandler
+  from gateway_test_support.capability_execution_test_support import (
+    stub_capability_execution_resolver,
+  )
+
+  monkeypatch.delenv("HANK_MAX_SPAWN_DEPTH", raising=False)
+  owner_session_host_policy.get_local_tool_effect = {"send_message": "read"}.get
+  skills_dir = tmp_path / "skills"
+  skills_dir.mkdir()
+  (skills_dir / "report-to-parent.md").write_text(
+    """---
+name: report-to-parent
+execution_class: node.implement
+version: '1.0'
+agent_callable: true
+agent_description: Report filing evidence to the parent.
+mutation_mode: read_only
+resumable: true
+allowed_tools:
+  - send_message
+mcp_tools: {}
+semantic_metadata:
+  required_context: []
+  tool_refs:
+    - kind: local
+      tool_id: send_message
+  capability_requirements:
+    - name: corpus.read/v1
+      required: true
+      binding_modes: [live_tool]
+---
+Send the filing evidence to the parent, then return a short conclusion.
+""",
+    encoding="utf-8",
+  )
+  loader = SkillLoader(skills_dir)
+  operation = next(
+    item.snapshot.operation.model_dump(mode="json")
+    for item in loader.list_callable_operations()
+    if item.snapshot.operation.name == "report-to-parent"
+  )
+  message_id = "msg-spawned-child-root"
+  message_text = "Found a restatement in Q3"
+
+  class SendingChildProvider(ModelProvider):
+    name = "anthropic"
+
+    def __init__(self) -> None:
+      self.turn = 0
+      self.recipient_job_id = _ROOT_JOB
+      self.receipts: list[dict[str, Any]] = []
+
+    def has_active_credential(self, config: dict[str, Any]) -> bool:
+      return bool(config.get("api_key"))
+
+    def create_client(
+      self, config: dict[str, Any], *, timeout: float | None = None,
+    ) -> object:
+      return object()
+
+    async def close_client(self, client: object, timeout: float = 2.0) -> None:
+      pass
+
+    def get_model_info(self, model: str) -> ModelInfo:
+      return ModelInfo(id=model, provider=self.name)
+
+    def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
+      return kwargs
+
+    async def stream(
+      self, client: object, params: dict[str, Any],
+    ) -> AsyncIterator[StreamEvent]:
+      self.turn += 1
+      assert "send_message" in {
+        definition["name"] for definition in params["tools"]
+      }
+      if self.turn == 1:
+        tool_input = {"to": self.recipient_job_id, "message": message_text}
+        yield StreamEvent(
+          type="tool_use_start",
+          tool_id=message_id,
+          tool_name="send_message",
+        )
+        yield StreamEvent(
+          type="tool_use_end",
+          tool_id=message_id,
+          tool_name="send_message",
+          tool_input=tool_input,
+          raw_block={
+            "type": "tool_use",
+            "id": message_id,
+            "name": "send_message",
+            "input": tool_input,
+          },
+        )
+        yield StreamEvent(type="message_end", stop_reason="tool_use")
+        return
+      for message in params["messages"]:
+        content = message.get("content")
+        if isinstance(content, list):
+          for block in content:
+            if (
+              isinstance(block, dict)
+              and block.get("type") == "tool_result"
+              and block.get("tool_use_id") == message_id
+            ):
+              assert not block.get("is_error")
+              self.receipts.append(json.loads(block["content"]))
+      assert self.receipts == [{
+        "status": "accepted",
+        "task_id": self.recipient_job_id,
+        "message_id": message_id,
+      }]
+      text = "Reported the restatement to the parent."
+      yield StreamEvent(type="text_delta", text=text)
+      yield StreamEvent(type="text_end", raw_block={"type": "text", "text": text})
+      yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+  async def _case() -> None:
+    log = AgentSessionLog(tmp_path / "sessions" / "spawned-child-root.jsonl")
+    provider = SendingChildProvider()
+    resolver = replace(
+      stub_capability_execution_resolver(),
+      adapter_resolver=lambda _adapter: provider,
+    )
+    execution = resolver.resolve("session.driver")
+    parent_session = GatewaySession(
+      session_id=_ROOT_JOB,
+      api_key_hash="hash",
+      created_at=1,
+      expires_at=2,
+      user_id="alice",
+      owner_user_id="alice",
+      role="owner",
+      tenant_id=None,
+      channel="cli",
+      auth_config=dict(execution.auth_config),
+    )
+    bind_session_approval_route(parent_session, None, None)
+    context = root_context(
+      parent_session,
+      withheld_tools=frozenset(),
+      research_file_id=None,
+    )
+    inbox: asyncio.Queue[ParentMessage] = asyncio.Queue()
+    registry = _root_registry(inbox=inbox, tenant=context.tenant)
+    assert registry.owner is not None
+    provider.recipient_job_id = registry.owner.job_id
+
+    def make_root_runner(
+      journal: AgentSessionLog,
+      root_registry: TaskRegistry,
+      root_inbox: asyncio.Queue[ParentMessage],
+    ) -> tuple[AgentRunner, dict[str, LocalToolHandler], ToolDispatcher]:
+      runner_ref: list[Any] = []
+      local_handlers: dict[str, LocalToolHandler] = {
+        "send_message": make_send_message_handler(
+          runner_ref,
+          caller=lambda: current_parent_context(parent_session),
+        ),
+      }
+      definitions = [make_send_message_tool_def()]
+      event_log = EventLog()
+      dispatcher = ToolDispatcher(
+        capability_bind=execution.bind,
+        mcp_client=_NullMcpClient(),
+        local_tool_handlers=local_handlers,
+        event_log=event_log,
+        session_id=parent_session.session_id,
+        role=parent_session.role,
+        get_tool_definitions=lambda: definitions,
+      )
+      root_runner = AgentRunner(
+        event_log=event_log,
+        dispatcher=dispatcher,
+        session_id=parent_session.session_id,
+        gateway_session=parent_session,
+        capability_execution=execution,
+        agent_session_log=journal,
+        task_registry=root_registry,
+        get_tool_definitions=dispatcher.get_tool_definitions,
+        message_inbox=root_inbox,
+        workspace_dir=str(tmp_path),
+        user_id="alice",
+        billing_mode="byok",
+        rate_table_version="unknown",
+      )
+      runner_ref.append(root_runner)
+      return root_runner, local_handlers, dispatcher
+
+    runner, _, root_dispatcher = make_root_runner(log, registry, inbox)
+    child_runner_ref: list[AgentRunner] = []
+    admitted_tasks: list[Any] = []
+    spawn_sub_agent = runner.spawn_sub_agent
+
+    async def record_spawn(task: str, **kwargs: Any):
+      admitted_tasks.append(kwargs["admitted_task"])
+      bind_job_runner = kwargs["bind_job_runner"]
+
+      def record_child(child: AgentRunner) -> None:
+        child_runner_ref.append(child)
+        bind_job_runner(child)
+
+      kwargs["bind_job_runner"] = record_child
+      return await spawn_sub_agent(task, **kwargs)
+
+    monkeypatch.setattr(runner, "spawn_sub_agent", record_spawn)
+    # This host-composed operation binds its public producer to the actual child.
+    # The default copied root handler rebinds caller scope, but retains its writer.
+    operation_local_handlers: dict[str, LocalToolHandler] = {
+      "send_message": make_send_message_handler(
+        child_runner_ref,
+        caller=lambda: current_parent_context(parent_session),
+      ),
+    }
+    spawn_handler = make_run_agent_handler(
+      [runner],
+      parent_session=parent_session,
+      skill_loader=loader,
+      mcp_client=_NullMcpClient(),
+      local_tool_handlers=operation_local_handlers,
+      capability_execution_resolver=resolver,
+      declared_local_tool_definitions=lambda requested: [
+        definition for definition in root_dispatcher.get_tool_definitions()
+        if definition["name"] in requested
+      ],
+    )
+    seen_messages: list[list[dict[str, Any]]] = []
+
+    async def root_stream_turn(**kwargs: Any):
+      seen_messages.append(list(kwargs["current_messages"]))
+      if len(seen_messages) == 1:
+        result, error = await spawn_handler({
+          "operation": operation,
+          "objective": "Report the Q3 restatement to the parent.",
+          "background": False,
+        })
+        assert error is None
+        assert result is not None
+        return object(), StreamTurnResult(
+          full_text="Waiting for the filing report.",
+          stop_reason="pause_turn",
+          content_blocks=[{"type": "text", "text": "Waiting for the filing report."}],
+        )
+      return object(), StreamTurnResult(
+        full_text="The child reported the Q3 restatement.",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "The child reported the Q3 restatement."}],
+      )
+
+    runner._stream_turn = root_stream_turn
+    await runner.run(messages=[{"role": "user", "content": "Review the filing."}])
+    assert len(child_runner_ref) == len(admitted_tasks) == 1
+    child = child_runner_ref[0]
+    assert child._task_registry.owner is not None
+    child_job_id = child._task_registry.owner.job_id
+    assert child_job_id == admitted_tasks[0].attempt.physical_task_id
+    assert child_job_id != _ROOT_JOB
+    assert provider.turn == 2
+    assert len(seen_messages) == 2
+    assert message_text in seen_messages[1][-1]["content"]
+    assert inbox.empty()
+    assert registry.get(_ROOT_JOB) is None
+    sent_entries, _ = await log.query(event_types={"parent_message_sent"}, order="asc")
+    consumed_entries, _ = await log.query(event_types={"parent_message_consumed"}, order="asc")
+    assistant_entries, _ = await log.query(event_types={"assistant_message"}, order="asc")
+    root_assistants = [
+      entry for entry in assistant_entries
+      if entry.event.get("runner_id") == runner._runner_id
+    ]
+    error_entries, _ = await log.query(
+      event_types={"run_error", "error", "run_interrupted"}, order="asc",
+    )
+    assert error_entries == []
+    assert len(sent_entries) == len(consumed_entries) == 1
+    assert len(root_assistants) == 2
+    sent = sent_entries[0]
+    assistant = root_assistants[1]
+    consumed = consumed_entries[0]
+    assert sent.event["task_id"] == consumed.event["task_id"] == _ROOT_JOB
+    assert sent.event["sender"]["job_id"] == child_job_id
+    assert sent.event["runner_id"] == child._runner_id != runner._runner_id
+    assert sent.event["role"] == "sub_agent"
+    assert sent.event["sub_agent_id"] == child._sub_agent_id
+    assert sent.event["evidence"] is True
+    assert assistant.event["parent_message_consumptions"] == [{
+      "task_id": _ROOT_JOB,
+      "message_id": message_id,
+      "parent_message_seq": sent.seq,
+      "consumer_turn": 2,
+    }]
+    assert consumed.event["message_id"] == sent.event["message_id"] == message_id
+    assert consumed.event["parent_message_seq"] == sent.seq
+    assert consumed.event["assistant_message_seq"] == assistant.seq
+    assert consumed.event["consumer_turn"] == 2
+    assert sent.seq < assistant.seq < consumed.seq
+    assert assistant.event["runner_id"] == consumed.event["runner_id"] == runner._runner_id
+    assert assistant.event["role"] == consumed.event["role"] == "writer"
+    assert all("sub_agent_id" not in entry.event for entry in (assistant, consumed))
+    assert "message" not in consumed.event
+    attaches, _ = await log.query(event_types={"attach"}, order="asc")
+    assert any(
+      entry.seq < sent.seq
+      and entry.event["runner_id"] == sent.event["runner_id"]
+      and entry.event["role"] == "sub_agent"
+      and entry.event["sub_agent_id"] == child._sub_agent_id
+      for entry in attaches
+    )
+    assert any(
+      entry.seq < assistant.seq
+      and entry.event["runner_id"] == assistant.event["runner_id"]
+      and entry.event["role"] == "writer"
+      and "sub_agent_id" not in entry.event
+      for entry in attaches
+    )
+
+    replay_inbox: asyncio.Queue[ParentMessage] = asyncio.Queue()
+    replay, _, _ = make_root_runner(
+      log,
+      _root_registry(inbox=replay_inbox, tenant=context.tenant),
+      replay_inbox,
+    )
+    replay._runner_id = f"runner_{uuid4().hex}"
+    assert replay._runner_id != runner._runner_id
+    await replay._emit_attach_event()
+    await replay._materialize_parent_message_consumption_audits()
+    await replay._materialize_parent_message_consumption_audits()
+    replayed, _ = await log.query(event_types={"parent_message_consumed"}, order="asc")
+    assert [(entry.seq, entry.event) for entry in replayed] == [
+      (consumed.seq, consumed.event),
+    ]
+
+    # Corrupt both consumer facts consistently: a later real attach still cannot
+    # authorize an earlier assistant, even when its audit writer agrees.
+    conflicting_log = AgentSessionLog(tmp_path / "sessions" / "conflicting-root-writer.jsonl")
+    journal_entries, _ = await log.query(order="asc")
+    for entry in journal_entries:
+      event = dict(entry.event)
+      if entry.seq in (assistant.seq, consumed.seq):
+        event["runner_id"] = replay._runner_id
+      copied = await conflicting_log.append(event)
+      assert copied.seq == entry.seq
+    conflicting, _, _ = make_root_runner(
+      conflicting_log,
+      _root_registry(tenant=context.tenant),
+      asyncio.Queue(),
+    )
+    with pytest.raises(RuntimeError):
+      await conflicting._materialize_parent_message_consumption_audits()
+    conflicting_consumed, _ = await conflicting_log.query(
+      event_types={"parent_message_consumed"}, order="asc",
+    )
+    assert [(entry.seq, entry.event) for entry in conflicting_consumed] == [
+      (consumed.seq, {**consumed.event, "runner_id": replay._runner_id}),
+    ]
 
   _run(_case())
 

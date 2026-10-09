@@ -36,7 +36,12 @@ from .approval_policy import (
   ApprovalRequest as PolicyApprovalRequest,
   RunContext,
   ToolClass,
+  approval_is_executable,
   utc_now,
+)
+from .approval_store import (
+  ApprovalExecutableBindingError,
+  ExecutableApprovalBinding,
 )
 from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich_trade_approval_args
 from .approval_route import (
@@ -84,6 +89,7 @@ from .tool_policy_registry import (
   ToolInputPreparationError,
   ToolPolicyImplementationRegistry,
 )
+from .tool_result_semantics import classify_semantic_tool_error
 from .skill_context import current_skill, current_skill_admission
 from .skill_limits import reconcile_skill_admission
 from . import tool_dispatcher_audit as _audit_helpers
@@ -142,13 +148,53 @@ _PORTFOLIO_SCOPE_FIELDS = frozenset({"portfolio_id", "portfolio_name"})
 _CATALOG_ACTION_UNSET = object()
 _TOOL_CLASSES = frozenset(get_args(ToolClass))
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _VerifiedExecutableApproval:
+  """Private execution authority read with the exact durable operands."""
+
+  binding: ExecutableApprovalBinding
+  decision: PolicyApprovalRequest
+
+
 class ToolDispatcherApprovalStore(Protocol):
-  """Prepared-plan methods called by the dispatch gate."""
+  """Private executable bindings and prepared-plan custody used by dispatch."""
 
   async def get(
     self,
     approval_id: str,
   ) -> PolicyApprovalRequest | None: ...
+
+  async def _read_executable_binding_for_executor(
+    self,
+    *,
+    job_id: str,
+    tool_call_id: str,
+    nonce: str,
+    tenant_storage_id: str,
+  ) -> tuple[ExecutableApprovalBinding, PolicyApprovalRequest]: ...
+
+  async def _read_completed_executable_result_for_executor(
+    self,
+    *,
+    binding: ExecutableApprovalBinding,
+  ) -> ToolResult | None: ...
+
+  async def _claim_executable_binding_for_executor(
+    self,
+    *,
+    binding: ExecutableApprovalBinding,
+    decision_state_version: int,
+    claim_token: str,
+  ) -> ToolResult | None: ...
+
+  async def _complete_executable_binding_for_executor(
+    self,
+    *,
+    binding: ExecutableApprovalBinding,
+    decision_state_version: int,
+    claim_token: str,
+    tool_result: ToolResult,
+  ) -> None: ...
 
   async def get_prepared_business_model_change(
     self,
@@ -1498,6 +1544,180 @@ class ToolDispatcher:
       trusted_context,
     )
 
+  @staticmethod
+  def _approved_binding_error(
+    code: str,
+    message: str,
+    *,
+    request: PolicyApprovalRequest | None = None,
+    next_call: str | None = None,
+  ) -> dict[str, Any]:
+    """Expose approval state and its authenticated reader, never operands."""
+
+    return {
+      "code": code,
+      "message": message,
+      "data": {
+        "next_call": (
+          next_call
+          if next_call is not None
+          else {"method": "GET", "path": "/control/approvals"}
+        ),
+        **(
+          {
+            "approval_id": request.approval_id,
+            "tool_call_id": request.tool_call_id,
+            "state": request.state,
+          }
+          if request is not None
+          else {}
+        ),
+      },
+    }
+
+  async def execute_approved_binding(
+    self,
+    *,
+    job_id: str,
+    tool_call_id: str,
+    nonce: str,
+    abort_event: asyncio.Event | None,
+    on_executed_prepared_call: Callable[[PreparedToolCall], None] | None,
+  ) -> ToolResult:
+    """Read the original outcome or execute its admitted private prepared call."""
+
+    context = self._executing_context()
+    if context is None:
+      return None, self._approved_binding_error(
+        "approval_execution_context_missing",
+        "Continue the original admitted job before executing its approval.",
+      )
+    if context.job_id != job_id:
+      attempt_lineage = (
+        self._identity.attempt_lineage if self._identity is not None else None
+      )
+      if attempt_lineage is None or not await attempt_lineage(job_id):
+        return None, self._approved_binding_error(
+          "approval_binding_call_identity_mismatch",
+          "The captured execution is not the original job or its admitted resume successor.",
+          next_call=(
+            "Continue the original admitted job or its registered resume successor; "
+            "do not execute this call from another job."
+          ),
+        )
+    if context.tenant is None:
+      return None, self._approved_binding_error(
+        "approval_binding_tenant_mismatch",
+        "The executing job has no authenticated tenant binding.",
+      )
+    store = self._approval_store
+    if store is None:
+      return None, self._approved_binding_error(
+        "approval_binding_missing_binding",
+        "The original admitted approval ledger is unavailable.",
+      )
+    try:
+      binding, decision = await store._read_executable_binding_for_executor(
+        job_id=job_id,
+        tool_call_id=tool_call_id,
+        nonce=nonce,
+        tenant_storage_id=context.tenant.storage_id,
+      )
+      completed = await store._read_completed_executable_result_for_executor(
+        binding=binding,
+      )
+    except ApprovalExecutableBindingError as exc:
+      return None, self._approved_binding_error(
+        f"approval_binding_{exc.code}",
+        (
+          "The original call's execution attempt has no settled outcome."
+          if exc.code == "execution_outcome_unknown"
+          else "The original call's approval binding could not be authenticated."
+        ),
+        next_call=(
+          "Return the original call's unknown effect outcome to its job; "
+          "do not retry or reauthorize this call."
+          if exc.code == "execution_outcome_unknown"
+          else None
+        ),
+      )
+    if completed is not None:
+      return completed
+
+    if decision.state in {"denied", "auto_denied"}:
+      self._emit_approval_decided(
+        tool_call_id,
+        binding.tool_name,
+        outcome="denied",
+        decision_source="durable_approval_denied",
+        allow_tool_type_applied=False,
+      )
+      return None, self._approved_binding_error(
+        "user_denied",
+        "The original approval was denied; the stored call was not executed.",
+        request=decision,
+        next_call="Return the denied decision to the original job without executing or retrying this call.",
+      )
+    if decision.state == "expired":
+      return None, self._approved_binding_error(
+        "approval_expired",
+        "The canonical approval is expired; the stored call was not executed.",
+        request=decision,
+        next_call="Return the expired decision to the original caller; a new invocation must obtain its own authorization.",
+      )
+    if decision.state in {"created", "pending_user"}:
+      return None, self._approved_binding_error(
+        "awaiting_approval",
+        "The original approval is still awaiting its authenticated decision.",
+        request=decision,
+      )
+    if not approval_is_executable(decision):
+      return None, self._approved_binding_error(
+        "approval_execution_not_authorized",
+        "The canonical decision does not satisfy its original authorization constraint.",
+        request=decision,
+      )
+    if context.tool_ids is not None and binding.tool_name not in context.tool_ids:
+      return None, self._approved_binding_error(
+        "approval_execution_grant_mismatch",
+        "The original call is not in the captured job's executable tool grant.",
+        request=decision,
+      )
+    credential_generation_ref = (
+      self._capability_bind.credential_ref
+      if is_anthropic_generation_ref(self._capability_bind.credential_ref)
+      else None
+    )
+    if credential_generation_ref != binding.credential_generation_ref:
+      return None, self._approved_binding_error(
+        "approval_credential_generation_mismatch",
+        "Continue with the original bound credential generation before execution.",
+        request=decision,
+      )
+
+    prepared_call = PreparedToolCall(
+      binding.prepared_input,
+      binding.exact_backend,
+    )
+    verified = _VerifiedExecutableApproval(binding=binding, decision=decision)
+    try:
+      execution = self._dispatch_prepared_with_approval(
+        tool_call_id,
+        binding.tool_name,
+        prepared_call,
+        executable_approval=verified,
+        abort_event=abort_event,
+        on_executed_prepared_call=on_executed_prepared_call,
+        **cast(dict[str, Any], binding.dispatch_context),
+      )
+    except TypeError:
+      return None, self._approved_binding_error(
+        "approval_binding_operand_mismatch",
+        "The durable call lacks its exact original execution context.",
+        request=decision,
+      )
+    return await execution
+
   async def dispatch_prepared(
     self,
     tool_call_id: str,
@@ -1551,8 +1771,43 @@ class ToolDispatcher:
     capture_readable_resource_snapshot: bool,
     allow_uncertain_mcp_replay: bool,
     on_executed_prepared_call: Callable[[PreparedToolCall], None] | None,
+    executable_approval: _VerifiedExecutableApproval | None = None,
   ) -> ToolResult:
     """Own and dispatch the original prepared call through native approval."""
+
+
+    if executable_approval is not None:
+      binding = executable_approval.binding
+      if (
+        binding.tool_call_id != tool_call_id
+        or binding.tool_name != tool_name
+        or binding.prepared_input != prepared_call.prepared_input
+        or binding.exact_backend != prepared_call.exact_backend
+        or executable_approval.decision.approval_id != binding.approval_id
+        or executable_approval.decision.tool_call_id != binding.tool_call_id
+        or executable_approval.decision.tool_name != binding.tool_name
+        or not approval_is_executable(executable_approval.decision)
+      ):
+        return None, self._approved_binding_error(
+          "approval_binding_operand_mismatch",
+          "The durable approval does not authorize this exact prepared call.",
+          request=executable_approval.decision,
+        )
+      if (
+        type(call_index) is not int
+        or any(
+          value is not None and not isinstance(value, str)
+          for value in (skill_run_id, step_id, workspace_dir)
+        )
+        or (batch_id is not None and type(batch_id) not in {int, str})
+        or type(capture_readable_resource_snapshot) is not bool
+        or type(allow_uncertain_mcp_replay) is not bool
+      ):
+        return None, self._approved_binding_error(
+          "approval_binding_operand_mismatch",
+          "The stored execution context is not a valid original dispatch context.",
+          request=executable_approval.decision,
+        )
 
     if type(prepared_call) is not PreparedToolCall:
       raise TypeError("prepared_call must be an exact PreparedToolCall")
@@ -1580,6 +1835,7 @@ class ToolDispatcher:
         capture_readable_resource_snapshot=capture_readable_resource_snapshot,
         allow_uncertain_mcp_replay=allow_uncertain_mcp_replay,
         on_executed_prepared_call=on_executed_prepared_call,
+        executable_approval=executable_approval,
         registered_prepared_call=(
           prepared_call
           if (
@@ -1635,6 +1891,7 @@ class ToolDispatcher:
       Callable[[PreparedToolCall], None] | None
     ) = None,
     registered_prepared_call: PreparedToolCall | None = None,
+    executable_approval: _VerifiedExecutableApproval | None = None,
     own_prepared: Callable[[Any], None],
   ) -> ToolResult:
     """Execute one tool call and return `(result, error)`.
@@ -1695,6 +1952,24 @@ class ToolDispatcher:
     )
     if not ir.proceed:
       return None, ir.error
+    if executable_approval is not None:
+      try:
+        intercepted_call = PreparedToolCall(
+          tool_input,
+          original_prepared_call.exact_backend,
+        )
+      except (TypeError, ValueError):
+        intercepted_call = None
+      if (
+        intercepted_call is None
+        or intercepted_call.prepared_input
+        != executable_approval.binding.prepared_input
+      ):
+        return None, self._approved_binding_error(
+          "approval_binding_operand_mismatch",
+          "The call operands changed after durable authorization.",
+          request=executable_approval.decision,
+        )
     registered_code_declaration = self._registered_code_declaration(tool_name)
     registered_approval_declaration = (
       self._registered_approval_declaration(tool_name)
@@ -1743,6 +2018,60 @@ class ToolDispatcher:
     prepared_business_model_context: (
       tuple[ToolDispatcherApprovalStore, dict[str, Any]] | None
     ) = None
+    # This claims one original call attempt, not exactly-once effects. A raised
+    # or cancelled consumer leaves its claim intact; no retry or time takeover.
+    execution_claim_token: str | None = None
+    execution_result_known = False
+
+    async def claim_original_call() -> ToolResult | None:
+      nonlocal executable_approval, execution_claim_token
+      store = self._approval_store
+      if executable_approval is None and executable_nonce is None:
+        return None
+      assert store is not None, "captured executable approval requires its ledger"
+      claim_token = os.urandom(16).hex()
+      try:
+        if executable_approval is None:
+          context = self._executing_context()
+          assert context is not None and context.job_id is not None
+          assert context.tenant is not None and executable_nonce is not None
+          binding, decision = await store._read_executable_binding_for_executor(
+            job_id=context.job_id,
+            tool_call_id=tool_call_id,
+            nonce=executable_nonce,
+            tenant_storage_id=context.tenant.storage_id,
+          )
+          executable_approval = _VerifiedExecutableApproval(
+            binding=binding,
+            decision=decision,
+          )
+        completed = await store._claim_executable_binding_for_executor(
+          binding=executable_approval.binding,
+          decision_state_version=executable_approval.decision.state_version,
+          claim_token=claim_token,
+        )
+      except ApprovalExecutableBindingError as exc:
+        return None, self._approved_binding_error(
+          f"approval_binding_{exc.code}",
+          "The original call could not acquire its single execution attempt.",
+          next_call=(
+            "Return this call's current outcome to its original job; do not "
+            "retry a claimed call or create another approval for it."
+          ),
+        )
+      if completed is not None:
+        return completed
+      execution_claim_token = claim_token
+      return None
+
+    def note_unknown_execution(error: dict[str, Any]) -> None:
+      if execution_claim_token is not None:
+        data = error.setdefault("data", {})
+        data["execution_outcome"] = "unknown"
+        data["next_call"] = (
+          "Return the original call's unknown effect outcome to its job; "
+          "do not retry or reauthorize this call."
+        )
     if local_handler is not None:
       tool_ctx = self._new_tool_execution_context(
         tool_call_id=tool_call_id,
@@ -1832,6 +2161,7 @@ class ToolDispatcher:
       and registered_approval_declaration.identity.route_kind == "mcp"
       and registered_approval_declaration.semantics.planning_policy.policy_id
       != "none"
+      and executable_approval is None
     ):
       try:
         assert registered_prepared_call is not None
@@ -1867,7 +2197,11 @@ class ToolDispatcher:
         )
 
     registered_approval_reuse_key: str | None = None
-    if registered_approval_declaration is not None:
+    if executable_approval is not None:
+      # The canonical decision already owns approval; a restored raw-patch
+      # call must not recreate a plan or evaluate plan-bound cache policies.
+      static_needs_approval = True
+    elif registered_approval_declaration is not None:
       assert registered_prepared_call is not None
       if registered_mcp_call is not None:
         static_needs_approval = registered_mcp_call.approval_required
@@ -1900,6 +2234,7 @@ class ToolDispatcher:
       approval_reuse_key = registered_approval_reuse_key
     final_tool_input = tool_input
     approval_request_record: PolicyApprovalRequest | None = None
+    executable_nonce: str | None = None
     registered_prepared_authorization = (
       registered_mcp_call.prepared_authorization
       if registered_mcp_call is not None
@@ -2191,6 +2526,15 @@ class ToolDispatcher:
           {
             "approved": True,
             "allow_tool_type": False,
+            "request": executable_approval.decision,
+            "tool_input": tool_input,
+            "decision_source": "durable_approved_binding",
+          }
+          if executable_approval is not None
+          else
+          {
+            "approved": True,
+            "allow_tool_type": False,
             "request": resume_approval_request,
             "tool_input": tool_input,
             "decision_source": "prepared_business_model_resume",
@@ -2265,6 +2609,7 @@ class ToolDispatcher:
         }
 
       approval_request_record = lifecycle.get("request")
+      executable_nonce = lifecycle.get("executable_nonce")
       if prepared_business_model_context is not None:
         prepared_business_model_store, prepared_business_model_change = (
           prepared_business_model_context
@@ -2379,10 +2724,11 @@ class ToolDispatcher:
           tool_name,
           type(exc).__name__,
         )
-        return None, {
-          "code": "planned_write_authorization_identity_invalid",
-          "message": f"Tool '{tool_name}' approval did not bind the exact planned identity.",
-        }
+        return None, self._approved_binding_error(
+          "planned_write_authorization_identity_invalid",
+          f"Tool '{tool_name}' approval did not bind the exact planned identity.",
+          request=approval_request_record,
+        )
 
       if tool_ctx is not None:
         tool_ctx.approval_id = approval_request_record.approval_id
@@ -2462,6 +2808,33 @@ class ToolDispatcher:
             else "user_approved"
           )
         ),
+        allow_tool_type_applied=False,
+      )
+
+    elif executable_approval is not None:
+      approval_request_record = executable_approval.decision
+      if tool_ctx is not None:
+        tool_ctx.approval_id = approval_request_record.approval_id
+        tool_ctx.approval_chain_id = approval_request_record.approval_chain_id
+      if (
+        registered_approval_declaration is not None
+        and registered_approval_declaration.identity.route_kind == "mcp"
+        and registered_approval_declaration.semantics.planning_policy.policy_id
+        == "raw-patch-ops"
+      ):
+        from .raw_patch_authorization_store import encode_reference
+
+        # The existing outward owner restores the immutable prepared payload,
+        # verifies these original operands, and owns claim/receipt concurrency.
+        final_tool_input = {
+          **tool_input,
+          "authorization_ref": encode_reference(tool_call_id),
+        }
+      self._emit_approval_decided(
+        tool_call_id,
+        tool_name,
+        outcome="approved",
+        decision_source="durable_approved_binding",
         allow_tool_type_applied=False,
       )
 
@@ -2614,6 +2987,7 @@ class ToolDispatcher:
             deny_user_prompt=self._should_avoid_permission_prompts,
           )
           approval_request_record = lifecycle.get("request")
+          executable_nonce = lifecycle.get("executable_nonce")
           if lifecycle.get("timeout"):
             self._emit_approval_decided(
               tool_call_id,
@@ -2740,10 +3114,11 @@ class ToolDispatcher:
           or not tool_ctx.approval_id
           or not tool_ctx.approval_chain_id
         ):
-          return None, {
-            "code": "planned_write_trusted_plan_lost",
-            "message": f"Tool '{tool_name}' lost its trusted exact-write authorization.",
-          }
+          return None, self._approved_binding_error(
+            "planned_write_trusted_plan_lost",
+            f"Tool '{tool_name}' lost its trusted exact-write authorization.",
+            request=approval_request_record,
+          )
         executor_parameters = inspect.signature(
           planned_executor
         ).parameters
@@ -2760,10 +3135,11 @@ class ToolDispatcher:
             tool_name,
             type(exc).__name__,
           )
-          return None, {
-            "code": "planned_write_trusted_plan_lost",
-            "message": f"Tool '{tool_name}' lost its trusted exact-write authorization.",
-          }
+          return None, self._approved_binding_error(
+            "planned_write_trusted_plan_lost",
+            f"Tool '{tool_name}' lost its trusted exact-write authorization.",
+            request=approval_request_record,
+          )
         exact_kwargs = {
           "authorized_identity": trusted_plan.identity,
           "approval_id": tool_ctx.approval_id,
@@ -2775,6 +3151,9 @@ class ToolDispatcher:
           for parameter in executor_parameters.values()
         ):
           exact_kwargs["approval_request"] = approval_request_record
+        completed = await claim_original_call()
+        if completed is not None:
+          return completed
         try:
           exact_result = planned_executor(
             trusted_plan.prepared,
@@ -2791,15 +3170,20 @@ class ToolDispatcher:
           result, error = None, self._owner_failure_error(
             tool_name, final_tool_input, exc, code="local_tool_failed"
           )
+          note_unknown_execution(error)
         else:
           if type(exact_result) is not tuple or len(exact_result) != 2:
             raise TrustedToolPlanError(
               "exact planned-write executor must return a ToolResult pair"
             )
           result, error = exact_result
+          execution_result_known = True
       else:
         if capture_readable_resource_snapshot:
           local_kwargs["capture_readable_resource_snapshot"] = True
+        completed = await claim_original_call()
+        if completed is not None:
+          return completed
         try:
           result, error = await local_handler(final_tool_input, **local_kwargs)
         except Exception as exc:
@@ -2811,6 +3195,9 @@ class ToolDispatcher:
           result, error = None, self._owner_failure_error(
             tool_name, final_tool_input, exc, code="local_tool_failed"
           )
+          note_unknown_execution(error)
+        else:
+          execution_result_known = True
     elif self._mcp.is_mcp_tool(tool_name):
       server = self._mcp.get_server_for_tool(tool_name)
       if (
@@ -2825,6 +3212,11 @@ class ToolDispatcher:
         server
         and callable(getattr(self._mcp, "is_per_user_server", None))
         and self._mcp.is_per_user_server(server)
+      )
+      invocation_report = (
+        McpInvocationReport(certainty="settled")
+        if executable_approval is not None or executable_nonce is not None
+        else None
       )
       if server and server in self._mcp_meta_inject_servers:
         resolved_risk_user_id = (
@@ -2961,6 +3353,9 @@ class ToolDispatcher:
             return None, investment_capability_claim_unavailable_error(
               subject=f"tool '{lifecycle_tool_name}'",
             )
+        completed = await claim_original_call()
+        if completed is not None:
+          return completed
         result, error = await ToolDispatcher._call_mcp_tool(
           self,
           tool_name,
@@ -2971,8 +3366,12 @@ class ToolDispatcher:
           gateway_session=self._session if per_user_server else None,
           allow_uncertain_replay=allow_uncertain_mcp_replay,
           on_executed_prepared_call=on_executed_prepared_call,
+          invocation_report=invocation_report,
         )
       elif server and per_user_server:
+        completed = await claim_original_call()
+        if completed is not None:
+          return completed
         result, error = await ToolDispatcher._call_mcp_tool(
           self,
           tool_name,
@@ -2982,9 +3381,13 @@ class ToolDispatcher:
           gateway_session=self._session,
           allow_uncertain_replay=allow_uncertain_mcp_replay,
           on_executed_prepared_call=on_executed_prepared_call,
+          invocation_report=invocation_report,
         )
       elif server and server in self._mcp_session_inject_servers:
         final_tool_input = {**final_tool_input, "_session_id": self._session_id}
+        completed = await claim_original_call()
+        if completed is not None:
+          return completed
         result, error = await ToolDispatcher._call_mcp_tool(
           self,
           tool_name,
@@ -2993,8 +3396,12 @@ class ToolDispatcher:
           abort_event=abort_event,
           allow_uncertain_replay=allow_uncertain_mcp_replay,
           on_executed_prepared_call=on_executed_prepared_call,
+          invocation_report=invocation_report,
         )
       else:
+        completed = await claim_original_call()
+        if completed is not None:
+          return completed
         result, error = await ToolDispatcher._call_mcp_tool(
           self,
           tool_name,
@@ -3003,7 +3410,12 @@ class ToolDispatcher:
           abort_event=abort_event,
           allow_uncertain_replay=allow_uncertain_mcp_replay,
           on_executed_prepared_call=on_executed_prepared_call,
+          invocation_report=invocation_report,
         )
+      if invocation_report is not None:
+        execution_result_known = invocation_report.certainty == "settled"
+        if not execution_result_known and error is not None:
+          note_unknown_execution(error)
     else:
       result, error = None, {"code": "unknown_tool", "message": f"Unknown tool: {tool_name}"}
 
@@ -3114,12 +3526,47 @@ class ToolDispatcher:
             consumed_at=utc_now().isoformat(),
           )
 
+    semantic_error = classify_semantic_tool_error(result)
+    audit_outcome = self.settle_tool_result(
+      tool_name,
+      None,
+      result,
+      error,
+      semantic_error,
+      prepared_call=original_prepared_call,
+    ).outcome if approval_request_record is not None else None
+
+    if execution_claim_token is not None and execution_result_known:
+      assert executable_approval is not None
+      store = self._approval_store
+      assert store is not None
+      try:
+        await store._complete_executable_binding_for_executor(
+          binding=executable_approval.binding,
+          decision_state_version=executable_approval.decision.state_version,
+          claim_token=execution_claim_token,
+          tool_result=(result, error),
+        )
+      except ApprovalExecutableBindingError as exc:
+        return None, self._approved_binding_error(
+          f"approval_binding_{exc.code}",
+          "The original call returned, but its exact outcome could not be retained.",
+          next_call=(
+            "Return this persistence failure to the original call's owner; "
+            "inspect its effect rather than executing the call again."
+          ),
+        )
+
     await _audit_helpers.emit_execution_audit(
       approval_request_record,
       final_tool_input,
       approval_store=self._approval_store,
-      outcome="tool_error" if error is not None else "success",
-      error_summary=str(error)[:500] if error is not None else None,
+      outcome="success" if audit_outcome == OUTCOME_OK else "tool_error",
+      error_summary=(
+        str(error)[:500]
+        if error is not None
+        else semantic_error.get("message") if semantic_error is not None else None
+      ),
       boundary_sanitizer=lambda value, sink: sanitize_boundary_value(
         value,
         sink=sink,

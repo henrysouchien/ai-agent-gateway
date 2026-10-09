@@ -30,6 +30,7 @@ from agent_gateway.autonomous_event_channel import (
   AutonomousEventChannelTransportError,
   AutonomousEventRecord,
   ReceivedAutonomousEventStream,
+  AutonomousPrivateExecutableCapture,
   adopt_inherited_autonomous_event_channel,
   create_autonomous_event_channel,
   snapshot_autonomous_event,
@@ -346,6 +347,86 @@ def test_incremental_receive_returns_live_records_in_order_before_final_stream()
     assert child_ack == parent_ack
   finally:
     pair.close()
+
+def test_private_capture_is_not_retained_or_counted_as_a_public_event() -> None:
+  pair = create_autonomous_event_channel(
+    channel_id=_CHANNEL_ID,
+    io_timeout_seconds=2,
+  )
+  canary = "private-original-operand-not-an-event"
+  payload = {
+    "approval_id": "approval-private",
+    "tool_call_id": "call-private",
+    "nonce": "nonce-original",
+    "prepared_input": {"content": canary},
+  }
+  public = {"type": "tool_approval_request", "approval_id": "approval-private"}
+  terminal = {"type": "stream_complete"}
+  child_result: queue.Queue[object] = queue.Queue()
+
+  def child_work() -> None:
+    try:
+      pair.child.start(timeout_seconds=2)
+      pair.child.send_private_executable_capture(payload, timeout_seconds=2)
+      pair.child.send_event(public, timeout_seconds=2)
+      child_result.put(pair.child.complete(terminal, timeout_seconds=2))
+    except BaseException as exc:
+      child_result.put(exc)
+
+  worker = threading.Thread(target=child_work, daemon=True)
+  worker.start()
+  try:
+    private = pair.parent.receive_next(timeout_seconds=2)
+    assert isinstance(private, AutonomousPrivateExecutableCapture)
+    assert private.channel_id == _CHANNEL_ID
+    assert private.payload == payload
+    assert canary not in repr(private)
+    assert pair.parent._receive_records == []
+    assert pair.parent._receive_event_bytes == 0
+    request_record = pair.parent.receive_next()
+    terminal_record = pair.parent.receive_next()
+    stream = pair.parent.receive_next()
+    assert isinstance(request_record, AutonomousEventRecord)
+    assert isinstance(terminal_record, AutonomousEventRecord)
+    assert isinstance(stream, ReceivedAutonomousEventStream)
+    expected_frames = (
+      _canonical_frame(_event(0, public)),
+      _canonical_frame(_event(1, terminal)),
+    )
+    assert stream.raw_event_frames == expected_frames
+    assert stream.events == (public, terminal)
+    assert stream.event_count == 2
+    assert stream.event_digest == _event_digest(*expected_frames)
+    assert stream.exact_event_frame_bytes == sum(map(len, expected_frames))
+    assert canary.encode() not in b"".join(stream.raw_event_frames)
+    ack = pair.parent.acknowledge(stream, timeout_seconds=2)
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert child_result.get_nowait() == ack
+  finally:
+    pair.close()
+
+
+def test_private_capture_cannot_cross_inherited_channel_identity() -> None:
+  parent, raw_child = _raw_parent_pair()
+  _send_raw_stream(raw_child, [
+    _canonical_frame(_hello()),
+    _canonical_frame({
+      "kind": "PRIVATE_EXECUTABLE_CAPTURE",
+      "version": 1,
+      "channel_id": _OTHER_CHANNEL_ID,
+      "private_executable_capture": {"prepared_input": {"secret": "private"}},
+    }),
+  ])
+  try:
+    with pytest.raises(AutonomousEventChannelProtocolError):
+      parent.receive_next(timeout_seconds=1)
+    assert parent._receive_records == []
+    assert parent._receive_event_bytes == 0
+  finally:
+    raw_child.close()
+    parent.close()
+
 
 
 def test_incremental_delivery_pause_consumes_original_absolute_deadline(

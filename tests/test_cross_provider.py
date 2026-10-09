@@ -364,9 +364,10 @@ def test_run_agent_rejects_legacy_skill_and_task_selectors(tmp_path: Path) -> No
 def test_run_agent_tool_schema_omits_model_selection_authority() -> None:
   schema = make_run_agent_tool_def()["input_schema"]
 
-  assert not {"provider", "model", "model_key", "effort"} & set(
+  assert not {"provider", "model", "model_key"} & set(
     schema["properties"]
   )
+  assert {"role", "effort"} <= set(schema["properties"])
   assert schema["required"] == ["objective"]
   assert schema["additionalProperties"] is False
 

@@ -805,6 +805,17 @@ class ApprovalExecutableBindingError(ValueError):
     super().__init__(f"approval executable binding: {code}")
 
 
+@dataclass(frozen=True, slots=True)
+class ApprovalRequestLocator:
+  """Safe durable call references, without executor operands or approval nonce."""
+
+  approval_id: str
+  tool_call_id: str
+  job_id: str | None
+  root_turn_id: str | None
+  executable_binding_state: Literal["captured", "not_restorable"]
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class ExecutableApprovalBinding:
   """Executor-only operands; never a public approval projection or audit payload."""
@@ -1097,6 +1108,20 @@ class ApprovalRequestStore(Protocol):
     self,
     request: ApprovalRequest,
   ) -> tuple[ApprovalRequest, bool]: ...
+  async def locate_request(
+    self,
+    *,
+    approval_id: str,
+    tenant_storage_id: str,
+  ) -> ApprovalRequestLocator | None: ...
+  async def _locate_request_for_decision(
+    self,
+    *,
+    tenant_storage_id: str,
+    approval_id: str | None = None,
+    tool_call_id: str | None = None,
+    nonce: str | None = None,
+  ) -> tuple[ApprovalRequest, ApprovalRequestLocator, str | None] | None: ...
   async def record_executable_binding(
     self,
     *,
@@ -2307,6 +2332,127 @@ class SQLiteApprovalStore:
             (_rows.identity_json_dumps(refs), job_id, turn_id),
           )
         conn.commit()
+
+  async def locate_request(
+    self,
+    *,
+    approval_id: str,
+    tenant_storage_id: str,
+  ) -> ApprovalRequestLocator | None:
+    """Locate an original request within its authenticated storage tenant.
+
+    A binding identifies a child job independently of its owning session. Without
+    capture, only a linked root turn can identify a job; an unlinked request stays
+    not_restorable with no invented job. Voting and private restoration retain
+    their existing nonce and authority checks.
+    """
+    async with self._lock:
+      with self._connection() as conn:
+        row = self._locate_request_locked(
+          conn, approval_id=approval_id, tenant_storage_id=tenant_storage_id,
+        )
+    return self._request_locator_from_row(row) if row is not None else None
+
+  async def _locate_request_for_decision(
+    self,
+    *,
+    tenant_storage_id: str,
+    approval_id: str | None = None,
+    tool_call_id: str | None = None,
+    nonce: str | None = None,
+  ) -> tuple[ApprovalRequest, ApprovalRequestLocator, str | None] | None:
+    """Read canonical decision identity privately, matching every supplied ref.
+
+    The chat edge supplies the original call and nonce; the control edge supplies
+    approval_id. An uncaptured, unlinked request has no recoverable nonce. Neither
+    this private read nor its safe locator selects prepared operands or credentials.
+    """
+    async with self._lock:
+      with self._connection() as conn:
+        row = self._locate_request_locked(
+          conn, tenant_storage_id=tenant_storage_id, approval_id=approval_id,
+          tool_call_id=tool_call_id, nonce=nonce,
+        )
+    if row is None:
+      return None
+    return (
+      self._row_to_request(row),
+      self._request_locator_from_row(row),
+      row["original_nonce"],
+    )
+
+  def _locate_request_locked(
+    self,
+    conn: sqlite3.Connection,
+    *,
+    tenant_storage_id: str,
+    approval_id: str | None = None,
+    tool_call_id: str | None = None,
+    nonce: str | None = None,
+  ) -> sqlite3.Row | None:
+    rows = conn.execute(
+      """
+      SELECT request.*, binding.approval_id AS binding_approval_id,
+        binding.job_id, binding.tool_call_id AS binding_tool_call_id,
+        binding.tenant_storage_id AS binding_tenant_storage_id,
+        binding.tool_name AS binding_tool_name, binding.request_args_hash,
+        root.job_id AS root_job_id, root.turn_id,
+        COALESCE(binding.nonce, json_extract(ref.value, '$.nonce')) AS original_nonce
+      FROM approval_requests AS request
+      LEFT JOIN approval_executable_bindings AS binding
+        ON binding.approval_id = request.approval_id
+      LEFT JOIN approval_root_turns AS root
+        ON root.job_id = CASE WHEN binding.approval_id IS NOT NULL
+          THEN binding.job_id ELSE request.session_id END
+        AND root.tenant_storage_id = request.user_id
+        AND EXISTS (
+          SELECT 1 FROM json_each(root.executable_refs_json) AS root_ref
+          WHERE json_extract(root_ref.value, '$.tool_call_id') = request.tool_call_id
+            AND (binding.approval_id IS NULL
+              OR json_extract(root_ref.value, '$.nonce') = binding.nonce)
+        )
+      LEFT JOIN json_each(root.executable_refs_json) AS ref
+        ON json_extract(ref.value, '$.tool_call_id') = request.tool_call_id
+          AND (binding.approval_id IS NULL
+            OR json_extract(ref.value, '$.nonce') = binding.nonce)
+      WHERE request.user_id = ?
+        AND (? IS NULL OR request.approval_id = ?)
+        AND (? IS NULL OR request.tool_call_id = ?)
+        AND (? IS NULL OR COALESCE(binding.nonce, json_extract(ref.value, '$.nonce')) = ?)
+      """,
+      (
+        tenant_storage_id, approval_id, approval_id, tool_call_id, tool_call_id,
+        nonce, nonce,
+      ),
+    ).fetchall()
+    if not rows:
+      return None
+    if len(rows) != 1:
+      raise RootTurnRecordError("turn_link_mismatch")
+    row = rows[0]
+    captured = row["binding_approval_id"] is not None
+    if captured:
+      if row["binding_tenant_storage_id"] != row["user_id"]:
+        raise ApprovalExecutableBindingError("tenant_mismatch")
+      if (
+        row["binding_tool_call_id"] != row["tool_call_id"]
+        or row["binding_tool_name"] != row["tool_name"]
+      ):
+        raise ApprovalExecutableBindingError("call_identity_mismatch")
+      if row["request_args_hash"] != row["args_hash"]:
+        raise ApprovalExecutableBindingError("operand_mismatch")
+    return row
+
+  @staticmethod
+  def _request_locator_from_row(row: sqlite3.Row) -> ApprovalRequestLocator:
+    captured = row["binding_approval_id"] is not None
+    return ApprovalRequestLocator(
+      approval_id=row["approval_id"],
+      tool_call_id=row["tool_call_id"],
+      job_id=row["job_id"] if captured else row["root_job_id"],
+      root_turn_id=row["turn_id"],
+      executable_binding_state="captured" if captured else "not_restorable",
+    )
 
   async def _locate_root_turn_for_approval(
     self,

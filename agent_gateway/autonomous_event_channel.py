@@ -45,9 +45,14 @@ _MAX_JSON_NESTING = 128
 _MAX_JSON_VALUE_NODES = 100_000
 _TERMINAL_EVENT_TYPES = frozenset({"stream_complete", "error"})
 _FORBIDDEN_EVENT_TYPES = frozenset({"stream_error"})
-_PROTOCOL_KINDS = frozenset({"HELLO", "EVENT", "END", "ACK"})
+_PROTOCOL_KINDS = frozenset({
+  "HELLO", "EVENT", "END", "ACK", "PRIVATE_EXECUTABLE_CAPTURE",
+})
 _HELLO_FIELDS = frozenset({"kind", "version", "channel_id"})
 _EVENT_FIELDS = frozenset({"kind", "version", "channel_id", "seq", "event"})
+_PRIVATE_CAPTURE_FIELDS = frozenset({
+  "kind", "version", "channel_id", "private_executable_capture",
+})
 _SUMMARY_FIELDS = frozenset({
   "kind",
   "version",
@@ -110,6 +115,14 @@ class AutonomousEventSnapshot:
   @property
   def event(self) -> dict[str, Any]:
     return _decode_canonical_json_object(self.event_line_bytes[:-1])
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class AutonomousPrivateExecutableCapture:
+  """An ephemeral control operand, never an event or retained stream record."""
+
+  channel_id: str
+  payload: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1060,6 +1073,40 @@ class AutonomousEventChannelChild(_OwnedEventChannelEndpoint):
         self._state = "failed"
         raise
 
+  def send_private_executable_capture(
+    self,
+    payload: dict[str, Any],
+    *,
+    timeout_seconds: float | None = None,
+  ) -> None:
+    """Send original operands on the inherited lifeline, outside EVENT custody."""
+
+    with self._exclusive_operation():
+      try:
+        if self._state != "started":
+          raise AutonomousEventChannelStateError(
+            "autonomous event channel is not accepting private captures"
+          )
+        if type(payload) is not dict:
+          raise AutonomousEventChannelProtocolError(
+            "autonomous private executable capture must be a JSON object"
+          )
+        frame = _encode_wire_frame({
+          "kind": "PRIVATE_EXECUTABLE_CAPTURE",
+          "version": AUTONOMOUS_EVENT_CHANNEL_VERSION,
+          "channel_id": self._channel_id,
+          "private_executable_capture": payload,
+        })
+        _send_wire_frame(
+          self._require_socket(),
+          frame,
+          deadline=time.monotonic() + self._timeout(timeout_seconds),
+        )
+      except BaseException:
+        self._abort()
+        self._state = "failed"
+        raise
+
   def complete(
     self,
     terminal_event: dict[str, Any],
@@ -1354,7 +1401,7 @@ class AutonomousEventChannelParent(_OwnedEventChannelEndpoint):
 
   def _advance_receive(
     self,
-  ) -> AutonomousEventRecord:
+  ) -> AutonomousEventRecord | AutonomousPrivateExecutableCapture:
     deadline, unbounded = self._receive_mode()
     wire = _recv_wire_frame(
       self._require_socket(),
@@ -1371,6 +1418,19 @@ class AutonomousEventChannelParent(_OwnedEventChannelEndpoint):
     if self._receive_terminal_seen and kind != "END":
       raise AutonomousEventChannelProtocolError(
         "autonomous event channel terminal event was not the final EVENT"
+      )
+    if kind == "PRIVATE_EXECUTABLE_CAPTURE":
+      _require_exact_fields(value, _PRIVATE_CAPTURE_FIELDS, kind=kind)
+      _require_version(value)
+      _require_frame_channel(value, self._channel_id)
+      payload = value["private_executable_capture"]
+      if type(payload) is not dict:
+        raise AutonomousEventChannelProtocolError(
+          "autonomous private executable capture must be a JSON object"
+        )
+      return AutonomousPrivateExecutableCapture(
+        channel_id=self._channel_id,
+        payload=payload,
       )
     if kind == "EVENT":
       record = self._receive_event_record(value, wire)
@@ -1402,8 +1462,12 @@ class AutonomousEventChannelParent(_OwnedEventChannelEndpoint):
     *,
     timeout_seconds: float | None = None,
     unbounded_stream: bool | None = None,
-  ) -> AutonomousEventRecord | ReceivedAutonomousEventStream:
-    """Return one record; hold a terminal record through END/EOF validation."""
+  ) -> (
+    AutonomousEventRecord
+    | AutonomousPrivateExecutableCapture
+    | ReceivedAutonomousEventStream
+  ):
+    """Return a private control operand or event; retain only EVENT records."""
 
     if unbounded_stream is not None and type(unbounded_stream) is not bool:
       raise TypeError("unbounded_stream must be an exact boolean or None")
@@ -1463,7 +1527,11 @@ class AutonomousEventChannelParent(_OwnedEventChannelEndpoint):
       try:
         self._begin_receive(timeout_seconds)
         while True:
-          self._advance_receive()
+          result = self._advance_receive()
+          if isinstance(result, AutonomousPrivateExecutableCapture):
+            raise AutonomousEventChannelStateError(
+              "private executable capture requires incremental owner ingestion"
+            )
           if self._state == "final_pending":
             return self._expose_final_stream()
       except BaseException:
@@ -1687,6 +1755,7 @@ __all__ = [
   "AutonomousEventChannelTransportError",
   "AutonomousEventRecord",
   "AutonomousEventSnapshot",
+  "AutonomousPrivateExecutableCapture",
   "ReceivedAutonomousEventStream",
   "adopt_inherited_autonomous_event_channel",
   "autonomous_event_fits_frame",

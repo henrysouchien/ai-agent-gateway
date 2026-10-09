@@ -1129,10 +1129,17 @@ async def run_autonomous(
 
     event_log = EventLog()
     approval_route = session_approval_route(session)
+    from model_authority.selection import capture_selection_snapshot
+
     context = root_context(
       session,
       withheld_tools=frozenset(excluded_tools or ()),
       research_file_id=None,
+      selection_snapshot=(
+        capture_selection_snapshot(capability_execution_resolver.selection_policy)
+        if capability_execution_resolver is not None
+        else None
+      ),
     )
     if context.children is None:
       from typing import cast

@@ -3,23 +3,39 @@
 from __future__ import annotations
 
 from contextlib import closing
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import sqlite3
 from threading import RLock
 import time
+from uuid import UUID
 
 from model_authority.binding import ModelSelectionIntent
 from model_authority.capabilities import CAPABILITY_IDS
 
 
+@dataclass(frozen=True, slots=True)
+class ModelPresetReference:
+  name: str
+  policy_revision: str
+  updated_at: int
+
+
 class ModelPreferenceStore:
   """SQLite preference store keyed by tenant, account, and capability."""
 
-  def __init__(self, path: str | Path) -> None:
+  def __init__(
+    self,
+    path: str | Path,
+    *,
+    known_preset_names: frozenset[str] = frozenset(),
+  ) -> None:
     self.path = Path(path).expanduser().resolve(strict=False)
     self.path.parent.mkdir(parents=True, exist_ok=True)
     self._lock = RLock()
+    # Supplied by the policy owner; references never contain custom role maps.
+    self.known_preset_names = frozenset(known_preset_names)
     # ``with connection`` scopes the transaction only; ``closing`` releases
     # the sqlite handle deterministically instead of at garbage collection.
     with closing(self._connect()) as connection, connection:
@@ -35,6 +51,28 @@ class ModelPreferenceStore:
           effort TEXT,
           updated_at INTEGER NOT NULL,
           PRIMARY KEY (tenant_id, actor_id, capability_id)
+        )
+        """
+      )
+      connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_model_presets (
+          tenant_id TEXT NOT NULL,
+          actor_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          policy_revision TEXT NOT NULL,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (tenant_id, actor_id)
+        )
+        """
+      )
+      connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS firm_model_presets (
+          commercial_account_id TEXT PRIMARY KEY NOT NULL,
+          name TEXT NOT NULL,
+          policy_revision TEXT NOT NULL,
+          updated_at INTEGER NOT NULL
         )
         """
       )
@@ -149,5 +187,118 @@ class ModelPreferenceStore:
       deleted = cursor.rowcount > 0
     return deleted
 
+  @staticmethod
+  def _preset_identity(tenant_id: str, actor_id: str) -> tuple[str, str]:
+    tenant = str(tenant_id or "").strip()
+    actor = str(actor_id or "").strip()
+    if not tenant or not actor:
+      raise ValueError("preference identity requires tenant_id and actor_id")
+    return tenant, actor
 
-__all__ = ["ModelPreferenceStore"]
+  @staticmethod
+  def _preset_reference(row: sqlite3.Row | None) -> ModelPresetReference | None:
+    if row is None:
+      return None
+    return ModelPresetReference(
+      name=str(row["name"]),
+      policy_revision=str(row["policy_revision"]),
+      updated_at=int(row["updated_at"]),
+    )
+
+  def get_user_preset(
+    self, *, tenant_id: str, actor_id: str,
+  ) -> ModelPresetReference | None:
+    identity = self._preset_identity(tenant_id, actor_id)
+    with self._lock, closing(self._connect()) as connection, connection:
+      row = connection.execute(
+        """
+        SELECT name, policy_revision, updated_at FROM user_model_presets
+        WHERE tenant_id = ? AND actor_id = ?
+        """,
+        identity,
+      ).fetchone()
+    return self._preset_reference(row)
+
+  def put_user_preset(
+    self, *, tenant_id: str, actor_id: str, name: str, policy_revision: str,
+  ) -> ModelPresetReference:
+    identity = self._preset_identity(tenant_id, actor_id)
+    reference = ModelPresetReference(name, policy_revision, int(time.time()))
+    with self._lock, closing(self._connect()) as connection, connection:
+      connection.execute(
+        """
+        INSERT INTO user_model_presets (
+          tenant_id, actor_id, name, policy_revision, updated_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (tenant_id, actor_id) DO UPDATE SET
+          name = excluded.name,
+          policy_revision = excluded.policy_revision,
+          updated_at = excluded.updated_at
+        """,
+        (*identity, reference.name, reference.policy_revision, reference.updated_at),
+      )
+    return reference
+
+  def delete_user_preset(self, *, tenant_id: str, actor_id: str) -> bool:
+    identity = self._preset_identity(tenant_id, actor_id)
+    with self._lock, closing(self._connect()) as connection, connection:
+      cursor = connection.execute(
+        "DELETE FROM user_model_presets WHERE tenant_id = ? AND actor_id = ?",
+        identity,
+      )
+      return cursor.rowcount > 0
+
+  @staticmethod
+  def _firm_identity(commercial_account_id: UUID) -> str:
+    # The caller obtains this UUID from a verified commercial claim, not a
+    # tenant id or an authenticated tenant role.
+    if not isinstance(commercial_account_id, UUID):
+      raise ValueError("firm preset identity requires a commercial_account_id UUID")
+    return str(commercial_account_id)
+
+  def get_firm_preset(
+    self, *, commercial_account_id: UUID,
+  ) -> ModelPresetReference | None:
+    identity = self._firm_identity(commercial_account_id)
+    with self._lock, closing(self._connect()) as connection, connection:
+      row = connection.execute(
+        """
+        SELECT name, policy_revision, updated_at FROM firm_model_presets
+        WHERE commercial_account_id = ?
+        """,
+        (identity,),
+      ).fetchone()
+    return self._preset_reference(row)
+
+  def put_firm_preset(
+    self, *, commercial_account_id: UUID, name: str, policy_revision: str,
+  ) -> ModelPresetReference:
+    """The commercial-account owner authorizes writes before calling this store."""
+    identity = self._firm_identity(commercial_account_id)
+    reference = ModelPresetReference(name, policy_revision, int(time.time()))
+    with self._lock, closing(self._connect()) as connection, connection:
+      connection.execute(
+        """
+        INSERT INTO firm_model_presets (
+          commercial_account_id, name, policy_revision, updated_at
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT (commercial_account_id) DO UPDATE SET
+          name = excluded.name,
+          policy_revision = excluded.policy_revision,
+          updated_at = excluded.updated_at
+        """,
+        (identity, reference.name, reference.policy_revision, reference.updated_at),
+      )
+    return reference
+
+  def delete_firm_preset(self, *, commercial_account_id: UUID) -> bool:
+    identity = self._firm_identity(commercial_account_id)
+    with self._lock, closing(self._connect()) as connection, connection:
+      cursor = connection.execute(
+        "DELETE FROM firm_model_presets WHERE commercial_account_id = ?",
+        (identity,),
+      )
+      return cursor.rowcount > 0
+
+
+__all__ = ["ModelPreferenceStore", "ModelPresetReference"]

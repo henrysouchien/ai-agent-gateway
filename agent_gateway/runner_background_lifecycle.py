@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple, TypeGuard, Union
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple, TypeGuard, TypeVar, Union
 
 from agent_workflow_contracts import (
   AdmittedTask,
@@ -134,7 +134,7 @@ RequiredSkillResultEventFactory = Callable[
     dict[str, Any] | None,
     dict[str, Any] | None,
   ],
-  dict[str, Any],
+  dict[str, Any] | None,
 ]
 RequiredSkillResultProjector = Callable[
   [dict[str, Any]],
@@ -267,6 +267,46 @@ def _runner_module_attr(name: str, fallback: Any) -> Any:
   return getattr(module, name, fallback)
 
 
+_TaskCallback = TypeVar(
+  "_TaskCallback", bound=Callable[[TaskEntry], Awaitable[None] | None],
+)
+
+
+class _TaskCallbackFanout:
+  """Run every attached owner's callback once, in attachment order."""
+
+  def __init__(
+    self,
+    callbacks: tuple[Callable[[TaskEntry], Awaitable[None] | None], ...],
+  ) -> None:
+    self.callbacks = callbacks
+
+  async def __call__(self, entry: TaskEntry) -> None:
+    for callback in self.callbacks:
+      outcome = callback(entry)
+      if inspect.isawaitable(outcome):
+        await outcome
+
+
+def _attach_task_callback(
+  existing: _TaskCallback | _TaskCallbackFanout | None,
+  added: _TaskCallback | None,
+) -> _TaskCallback | _TaskCallbackFanout | None:
+  """Add one owner's callback beside the ones already attached, once."""
+  if added is None:
+    return existing
+  if existing is None:
+    return added
+  attached = (
+    existing.callbacks
+    if isinstance(existing, _TaskCallbackFanout)
+    else (existing,)
+  )
+  if any(callback is added for callback in attached):
+    return existing
+  return _TaskCallbackFanout((*attached, added))
+
+
 class RunnerBackgroundLifecycleMixin:
   if TYPE_CHECKING:
     _background_notifications_enabled: bool
@@ -327,11 +367,80 @@ class RunnerBackgroundLifecycleMixin:
       now=_runner_attr(self, "time", time).time(),
     )
 
+  async def attach_background_task(
+    self,
+    task_id: str,
+    *,
+    on_complete: Callable[[TaskEntry], Awaitable[None] | None],
+    on_park: Callable[[TaskEntry], Awaitable[None]] | None,
+  ) -> TaskEntry | None:
+    """Attach lifecycle handling without starting or resetting a task.
+
+    Callbacks already on the entry (for example the activity release a
+    resume installed) keep running; the attaching owner's callbacks run after
+    them, once each, however many times the same owner attaches.
+    """
+    entry = self._task_registry.get(task_id)
+    if entry is None:
+      reconstructed = await self._lookup_task_in_log(task_id)
+      if reconstructed is None:
+        return None
+      entry = self._task_registry.adopt_reconstructed(reconstructed)
+    entry.completion_callback = _attach_task_callback(
+      entry.completion_callback, on_complete,
+    )
+    entry.park_callback = _attach_task_callback(entry.park_callback, on_park)
+    return entry
+
   async def _task_entry_for_chain(self, task_id: str) -> TaskEntry | None:
     entry = self._task_registry.get(task_id)
     if entry is not None:
       return entry
     return await self._lookup_task_in_log(task_id)
+
+  async def _is_resume_successor(
+    self,
+    successor: AdmittedTask,
+    original_task_id: str,
+  ) -> bool:
+    """Authorize only this admitted attempt's exact same-tenant resume ancestry."""
+    snapshot = successor.execution_snapshot
+    context = snapshot.admitted_context if snapshot is not None else None
+    tenant = context.tenant if context is not None else None
+    if tenant is None or not tenant.storage_id:
+      return False
+    successor_task_id = successor.attempt.physical_task_id
+    if not original_task_id or original_task_id == successor_task_id:
+      return False
+    current_task_id = successor_task_id
+    seen: set[str] = set()
+    while current_task_id not in seen:
+      seen.add(current_task_id)
+      entry = await self._task_entry_for_chain(current_task_id)
+      if entry is None or entry.admitted_task is None:
+        return False
+      admitted = entry.admitted_task
+      snapshot = admitted.execution_snapshot
+      context = snapshot.admitted_context if snapshot is not None else None
+      current_tenant = context.tenant if context is not None else None
+      predecessor = admitted.attempt.resume_of_task_id
+      if (
+        entry.task_id != current_task_id
+        or admitted.attempt.physical_task_id != current_task_id
+        or admitted.logical_task != successor.logical_task
+        or current_tenant is None
+        or current_tenant.storage_id != tenant.storage_id
+        or entry.original_task_id != predecessor
+        or predecessor in seen
+        or (current_task_id == successor_task_id and admitted != successor)
+      ):
+        return False
+      if current_task_id == original_task_id:
+        return True
+      if predecessor is None or admitted.attempt.restart_of_attempt_id is not None:
+        return False
+      current_task_id = predecessor
+    return False
 
   async def _resume_chain_depth(self, task_id: str) -> int:
     return await _runner_attr(self, "_resume_chain_depth", _resume_chain_depth)(
@@ -701,7 +810,22 @@ class RunnerBackgroundLifecycleMixin:
     self,
     bg_task: TaskEntry,
   ) -> None:
+    # Callers run this after releasing the finalization lock: a committed park
+    # notifies its park callback here, so callback owners may take their own
+    # locks without inverting against this task's finalization lock.
+    if bg_task.state == TaskState.AWAITING_APPROVAL:
+      await self._invoke_background_park_callback(bg_task)
+      return
     callback = bg_task.completion_callback
+    if (
+      bg_task.completion_persistence_state != "committed"
+      or bg_task.state not in {
+        TaskState.COMPLETED,
+        TaskState.FAILED,
+        TaskState.KILLED,
+      }
+    ):
+      return
     if callback is None or bg_task.completion_callback_invoked:
       return
     bg_task.completion_callback_invoked = True
@@ -709,6 +833,35 @@ class RunnerBackgroundLifecycleMixin:
       maybe_awaitable = callback(bg_task)
       if asyncio.iscoroutine(maybe_awaitable):
         await maybe_awaitable
+    except Exception:
+      pass
+
+  async def _invoke_background_park_callback(
+    self,
+    bg_task: TaskEntry,
+  ) -> None:
+    callback = bg_task.park_callback
+    canonical = bg_task.task_result
+    admitted = bg_task.admitted_task
+    if (
+      callback is None
+      or bg_task.park_callback_invoked
+      or bg_task.completion_persistence_state != "committed"
+      or bg_task.state != TaskState.AWAITING_APPROVAL
+      or canonical is None
+      or canonical.execution.status != "awaiting_approval"
+      or admitted is None
+      or canonical.attempt.physical_task_id != bg_task.task_id
+      or canonical.logical_task != admitted.logical_task
+      or canonical.attempt != admitted.attempt
+      or canonical.provenance.admitted_task_digest != admitted.admitted_task_digest
+      or bg_task.error is not None
+      or bg_task.result != canonical.model_dump(mode="json")
+    ):
+      return
+    bg_task.park_callback_invoked = True
+    try:
+      await callback(bg_task)
     except Exception:
       pass
 
@@ -871,7 +1024,7 @@ class RunnerBackgroundLifecycleMixin:
     self,
     bg_task: TaskEntry,
     lifecycle: dict[str, Any],
-  ) -> dict[str, Any]:
+  ) -> dict[str, Any] | None:
     if bg_task.pending_final_state is not None:
       result = bg_task.pending_result
       error = bg_task.pending_error
@@ -881,11 +1034,10 @@ class RunnerBackgroundLifecycleMixin:
     event_factory = bg_task.required_skill_result_event_factory
     if event_factory is not None:
       event = event_factory(bg_task, result, error)
-      if not isinstance(event, dict):
+      if event is not None and not isinstance(event, dict):
         raise RuntimeError(
           "required skill result event factory must return an object"
         )
-      event = dict(event)
     else:
       durable_log = getattr(self, "_agent_session_log", None)
       if durable_log is None:
@@ -919,6 +1071,9 @@ class RunnerBackgroundLifecycleMixin:
         error=error,
         canonical_result_evidence_authoritative=True,
       )
+    if event is None:
+      return None
+    event = dict(event)
 
     event.update({
       "type": "skill_result_captured",
@@ -989,6 +1144,8 @@ class RunnerBackgroundLifecycleMixin:
         bg_task,
         lifecycle,
       )
+      if event is None:
+        return False
       append_failure: BaseException | None = None
       try:
         durable_entry = await self._append_durable_event(event)
@@ -1273,13 +1430,34 @@ class RunnerBackgroundLifecycleMixin:
     error: dict[str, Any] | None,
   ) -> None:
     bg_task.completion_persistence_state = "in_flight"
+
+    async def _append_and_settle_detached_completion() -> None:
+      # A late append's acknowledgement includes its live projection. A done
+      # callback cannot order that projection before awaiters of this task.
+      try:
+        await self._append_task_completed_event(
+          bg_task,
+          final_state,
+          result=result,
+          error=error,
+        )
+      except BaseException as exc:
+        self._record_completion_persistence_uncertainty(bg_task, exc)
+        if bg_task.completion_finalizer_detached:
+          await self._reconcile_detached_background_completion(bg_task)
+        raise
+      bg_task.completion_persistence_state = "committed"
+      bg_task.completion_persistence_error = None
+      if bg_task.completion_finalizer_detached:
+        await self._commit_detached_background_completion(
+          bg_task,
+          final_state=final_state,
+          result=result,
+          error=error,
+        )
+
     append_task = asyncio.create_task(
-      self._append_task_completed_event(
-        bg_task,
-        final_state,
-        result=result,
-        error=error,
-      ),
+      _append_and_settle_detached_completion(),
       name=f"{bg_task.task_id}:persist-completion",
     )
     self._track_background_completion_append(
@@ -1563,6 +1741,7 @@ class RunnerBackgroundLifecycleMixin:
           TaskState.COMPLETED,
           TaskState.FAILED,
           TaskState.KILLED,
+          TaskState.AWAITING_APPROVAL,
         }
       ):
         await self._invoke_background_completion_callback(bg_task)
@@ -1657,6 +1836,17 @@ class RunnerBackgroundLifecycleMixin:
         if callable(lookup_sync)
         else await self._lookup_task_in_log(bg_task.task_id)
       )
+    if (
+      durable_entry is not None
+      and durable_entry.state == TaskState.AWAITING_APPROVAL
+      and durable_entry.task_result is not None
+      and durable_entry.task_result.execution.status == "awaiting_approval"
+      and durable_entry.task_id == bg_task.task_id
+      and durable_entry.admitted_task == bg_task.admitted_task
+      and durable_entry.task_result == bg_task.task_result
+      and durable_entry.error is None
+    ):
+      return durable_entry
     if durable_entry is None or durable_entry.state not in {
       TaskState.COMPLETED,
       TaskState.FAILED,
@@ -1679,7 +1869,15 @@ class RunnerBackgroundLifecycleMixin:
     bg_task.pending_result = result
     bg_task.pending_error = error
     bg_task.completion_finalizer_detached = False
-    if bg_task.state == TaskState.INTERRUPTED:
+    if (
+      bg_task.state == TaskState.INTERRUPTED
+      and final_state == TaskState.AWAITING_APPROVAL
+    ):
+      self._task_registry.restore_committed_awaiting(
+        bg_task.task_id,
+        result=result,
+      )
+    elif bg_task.state == TaskState.INTERRUPTED:
       self._task_registry.finalize_interrupted(
         bg_task.task_id,
         final_state,
@@ -1710,6 +1908,18 @@ class RunnerBackgroundLifecycleMixin:
     bg_task.pending_final_state = final_state
     bg_task.pending_result = result
     bg_task.pending_error = error
+    if (
+      final_state == TaskState.AWAITING_APPROVAL
+      and bg_task.task_result is not None
+      and bg_task.task_result.execution.status == "awaiting_approval"
+    ):
+      self._commit_background_completion_live(
+        bg_task,
+        final_state=final_state,
+        result=result,
+        error=error,
+      )
+      return
     await self._ensure_required_skill_result_settled(bg_task)
     await self._ensure_agent_completion_published(bg_task)
     self._commit_background_completion_live(
@@ -1897,6 +2107,140 @@ class RunnerBackgroundLifecycleMixin:
         result=result,
         error=error,
       )
+
+  async def terminate_parked_background_task(
+    self,
+    task_id: str,
+    *,
+    persist_request: Callable[[], Awaitable[None]] | None = None,
+  ) -> bool:
+    """Durably STOP a parked attempt, or cancel its actual resume successor.
+
+    Successor registration and this decision share the original entry's
+    finalization_lock. ``persist_request`` is the trusted caller's durable
+    STOP record; it runs inside that lock only when the STOP is actionable (a
+    started successor, a committed park, or a running attempt whose completion
+    is not already committing), so no successor can install between the
+    request and the decision, and a settled task records no request. Only a
+    started successor is routed;
+    an unstarted reservation stays behind and its own source check sees the
+    stopped original. The journal append/readback and parked-control commit
+    stay inside the lock; the final callback runs outside it.
+    """
+    if (
+      type(task_id) is not str
+      or not task_id
+      or task_id != task_id.strip()
+    ):
+      raise ValueError("task_id must be canonical non-empty text")
+    entry = self._task_registry.get(task_id)
+    if entry is None:
+      return False
+    successor_id: str | None = None
+    changed = False
+    cancelled_waiter: asyncio.CancelledError | None = None
+    async with entry.finalization_lock:
+      successors = [
+        successor
+        for successor in self._task_registry.list_tasks()
+        if successor.original_task_id == entry.task_id
+        and (
+          successor.state != TaskState.PENDING
+          or successor.asyncio_task is not None
+        )
+      ]
+      if successors:
+        if persist_request is not None:
+          await persist_request()
+        successor_id = successors[-1].task_id
+      elif entry.state == TaskState.AWAITING_APPROVAL:
+        if persist_request is not None:
+          await persist_request()
+        if getattr(self, "_agent_session_log", None) is None:
+          raise RuntimeError("parked STOP requires the task's durable event log")
+        parked = entry.task_result
+        admitted = entry.admitted_task
+        if parked is None or admitted is None:
+          raise RuntimeError("parked STOP requires the original admitted TaskResult")
+        cancelled = terminal_task_result(
+          admitted,
+          status="cancelled",
+          reason="cancelled",
+          tools_used=parked.evidence.tools_used,
+          usage=parked.observation.usage,
+        )
+
+        async def _confirmed() -> TaskEntry | None:
+          try:
+            durable = await self._confirmed_durable_background_completion(entry)
+          except BaseException:
+            self._writer_lease_poisoned = True
+            raise
+          if durable is None:
+            raise RuntimeError("parked STOP could not confirm the durable park")
+          if durable.admitted_task != admitted or durable.error is not None:
+            raise RuntimeError("parked STOP readback conflicts with original admission")
+          if durable.state == TaskState.KILLED and durable.task_result == cancelled:
+            return durable
+          if (
+            durable.state != TaskState.AWAITING_APPROVAL
+            or durable.task_result != parked
+            or durable.result != parked.model_dump(mode="json")
+          ):
+            raise RuntimeError("parked STOP readback conflicts with the canonical park")
+          return None
+
+        confirmed = await _confirmed()
+        completed_at = _runner_attr(self, "time", time).time()
+        if confirmed is None:
+          payload = self._task_correlation_payload(entry)
+          payload.update({
+            "type": "task_terminated",
+            "final_state": TaskState.KILLED.value,
+            "completed_at": completed_at,
+            "result": cancelled.model_dump(mode="json"),
+            "error": None,
+          })
+          try:
+            await self._append_durable_event(payload)
+          except BaseException as failure:
+            # append owns its fsync decision even if the caller is cancelled.
+            # Read back that decision before publishing or permitting a retry.
+            confirmed = await _confirmed()
+            if confirmed is None:
+              raise
+            if isinstance(failure, asyncio.CancelledError):
+              cancelled_waiter = failure
+          else:
+            confirmed = await _confirmed()
+            if confirmed is None:
+              raise RuntimeError("parked STOP append did not commit its termination")
+        if confirmed is not None:
+          if confirmed.completed_at is None:
+            raise RuntimeError("parked STOP readback has no completion time")
+          completed_at = confirmed.completed_at
+        self._task_registry.commit_parked_termination(
+          entry.task_id,
+          result=cancelled,
+          completed_at=completed_at,
+        )
+        changed = True
+      elif entry.state not in {
+        TaskState.COMPLETED,
+        TaskState.FAILED,
+        TaskState.KILLED,
+        TaskState.INTERRUPTED,
+      } and entry.pending_final_state is None:
+        # A running attempt whose completion is not already committing.
+        if persist_request is not None:
+          await persist_request()
+        return self.cancel_background_task(entry.task_id)
+    if successor_id is not None:
+      return await self.terminate_parked_background_task(successor_id)
+    await self._invoke_background_completion_callback(entry)
+    if cancelled_waiter is not None:
+      raise cancelled_waiter
+    return changed
 
   async def _reconcile_background_agent(
     self,
@@ -2097,6 +2441,7 @@ class RunnerBackgroundLifecycleMixin:
     agent_name: str | None,
     parent_turn_id: str | None,
     on_complete: BackgroundTaskCallback | None,
+    on_park: Callable[[TaskEntry], Awaitable[None]] | None,
     on_before_start: Callable[[], None] | None,
     required_skill_lifecycle: dict[str, Any] | None,
     workflow_task_metadata: WorkflowTaskMetadata | None,
@@ -2166,6 +2511,8 @@ class RunnerBackgroundLifecycleMixin:
     )
     if on_complete is not None and entry.completion_callback is None:
       entry.completion_callback = on_complete
+    if on_park is not None and entry.park_callback is None:
+      entry.park_callback = on_park
 
     durable_existing: TaskEntry | None = None
     registration_state = getattr(
@@ -2538,6 +2885,21 @@ class RunnerBackgroundLifecycleMixin:
       # tracked. The original cancellation is re-raised by the caller.
       pass
 
+  async def _started_background_task(self, task_id: str) -> TaskEntry | None:
+    """Replay a started worker, never an unstarted registration reservation."""
+    entry = self._task_registry.get(task_id)
+    if entry is None:
+      return None
+    initialization = entry.initialization_task
+    if initialization is not None and not initialization.done():
+      await asyncio.shield(initialization)
+    if entry.asyncio_task is not None or (
+      entry.registration_persistence_state == "committed"
+      and entry.state != TaskState.PENDING
+    ):
+      return entry
+    return None
+
   async def _register_background_task(
     self,
     *,
@@ -2547,6 +2909,7 @@ class RunnerBackgroundLifecycleMixin:
     agent_name: str | None = None,
     parent_turn_id: str | None = None,
     on_complete: BackgroundTaskCallback | None = None,
+    on_park: Callable[[TaskEntry], Awaitable[None]] | None = None,
     on_before_start: Callable[[], None] | None = None,
     required_skill_lifecycle: dict[str, Any] | None = None,
     workflow_task_metadata: WorkflowTaskMetadata | None = None,
@@ -2784,6 +3147,7 @@ class RunnerBackgroundLifecycleMixin:
         agent_name=agent_name,
         parent_turn_id=parent_turn_id,
         on_complete=on_complete,
+        on_park=on_park,
         on_before_start=on_before_start,
         required_skill_lifecycle=required_skill_lifecycle,
         workflow_task_metadata=workflow_task_metadata,

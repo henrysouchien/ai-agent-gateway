@@ -4275,6 +4275,7 @@ def test_child_kernel_is_isolated_and_disposed_through_real_run_lifetime(
         })
         handler = make_resume_handler(
           [runner], excluded_tools_resolver=frozenset, **child_kwargs,
+          operation_resume_bindings=None,
         )
         materialized_binds.clear()
         result, resume_error = await handler({"task_id": original_id})

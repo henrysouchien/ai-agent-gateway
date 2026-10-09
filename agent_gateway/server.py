@@ -111,6 +111,8 @@ from .server_models import (  # noqa: F401
   ChatRuntime,
   ModelPreferenceResponse,
   ModelPreferenceUpdate,
+  ModelPresetResponse,
+  ModelPresetUpdate,
   _call_build_chat_runtime,
   RequestContext,
   GatewayServerConfig,
@@ -783,6 +785,9 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   setattr(_build_chat_runtime_for_dispatch, "_gateway_resolver_timeout_seconds", config.resolver_timeout_seconds)
   app.state.gateway_build_chat_runtime = _build_chat_runtime_for_dispatch
   app.state.user_event_bus = UserEventBus()
+  app.state.root_continue_hook = config.root_continue_hook
+  app.state.workflow_continue_hook = config.workflow_continue_hook
+  app.state.child_continue_hook = config.child_continue_hook
   _init_approval_subsystem(app, config)
   dispatcher_deps = GatewayDispatcherDeps(
     mcp_client=config.mcp_client,
@@ -858,6 +863,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     autonomous_capability_binding_resolver=(
       config.autonomous_capability_binding_resolver
     ),
+    autonomous_selection_policy=config.autonomous_selection_policy,
     autonomous_skill_admission_policy_resolver=(
       autonomous_skill_admission_policy_resolver
     ),
@@ -1319,6 +1325,79 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       effort=None,
     )
 
+  @router.put("/model-presets/self", response_model=ModelPresetResponse)
+  async def put_model_preset(
+    request: Request,
+    body: ModelPresetUpdate,
+  ) -> ModelPresetResponse | JSONResponse:
+    session = _model_preference_session(request)
+    store = config.model_preference_store
+    if store is None:
+      raise HTTPException(status_code=503, detail="model preference store is unavailable")
+    known_preset_names = store.known_preset_names
+    if body.name not in known_preset_names:
+      return JSONResponse(
+        {
+          "error_code": "model_preset_unknown",
+          "name": body.name,
+          "policy_revision": model_selection_policy.revision,
+          "known_preset_names": sorted(known_preset_names),
+          "message": "The requested preset is not published by model-selection policy.",
+        },
+        status_code=422,
+      )
+    resolver = _capability_execution_resolver_for_session(
+      session=session,
+      build_chat_runtime=app.state.gateway_build_chat_runtime,
+    )
+    stored = store.put_user_preset(
+      tenant_id=resolver.auth_context.tenant_id,
+      actor_id=resolver.auth_context.actor_id,
+      name=body.name,
+      policy_revision=model_selection_policy.revision,
+    )
+    return ModelPresetResponse(
+      name=stored.name,
+      policy_revision=stored.policy_revision,
+      updated_at=stored.updated_at,
+    )
+
+  @router.get("/model-presets/self", response_model=ModelPresetResponse)
+  async def get_model_preset(request: Request) -> ModelPresetResponse:
+    session = _model_preference_session(request)
+    store = config.model_preference_store
+    if store is None:
+      raise HTTPException(status_code=503, detail="model preference store is unavailable")
+    resolver = _capability_execution_resolver_for_session(
+      session=session,
+      build_chat_runtime=app.state.gateway_build_chat_runtime,
+    )
+    stored = store.get_user_preset(
+      tenant_id=resolver.auth_context.tenant_id,
+      actor_id=resolver.auth_context.actor_id,
+    )
+    return ModelPresetResponse(
+      name=stored.name if stored is not None else None,
+      policy_revision=stored.policy_revision if stored is not None else None,
+      updated_at=stored.updated_at if stored is not None else None,
+    )
+
+  @router.delete("/model-presets/self", response_model=ModelPresetResponse)
+  async def delete_model_preset(request: Request) -> ModelPresetResponse:
+    session = _model_preference_session(request)
+    store = config.model_preference_store
+    if store is None:
+      raise HTTPException(status_code=503, detail="model preference store is unavailable")
+    resolver = _capability_execution_resolver_for_session(
+      session=session,
+      build_chat_runtime=app.state.gateway_build_chat_runtime,
+    )
+    store.delete_user_preset(
+      tenant_id=resolver.auth_context.tenant_id,
+      actor_id=resolver.auth_context.actor_id,
+    )
+    return ModelPresetResponse(name=None, policy_revision=None, updated_at=None)
+
   @router.post("/chat", response_model=None)
   async def chat_stream(
     request: Request,
@@ -1442,18 +1521,23 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       else None
     )
     try:
-      pending_work_start = None
-      if commercial_gate is not None and commercial_gate.enabled:
-        commercial_dispatch_owner = object()
-        session._commercial_dispatch_owner = commercial_dispatch_owner
+      verified_commercial_claim = None
+      if commercial_gate is not None:
+        verified_commercial_claim = commercial_gate.verify_claim(
+          request.headers,
+          session=session,
+        )
+        if commercial_gate.enabled:
+          commercial_dispatch_owner = object()
+          session._commercial_dispatch_owner = commercial_dispatch_owner
       prepared_turn = prepare_session_driver_turn(
         session,
         inputs,
         build_chat_runtime=app.state.gateway_build_chat_runtime,
       )
       if commercial_gate is not None:
-        pending_work_start = commercial_gate.verify_request(
-          request.headers,
+        pending_work_start = commercial_gate.authorize_request(
+          verified_commercial_claim,
           session=session,
           request=prepared_turn.request,
           channel=prepared_turn.channel,

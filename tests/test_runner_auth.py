@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 
 import httpx2
 import pytest
@@ -346,6 +347,210 @@ def test_usage_limited_credential_rotates_to_sibling_and_keeps_bound_model(
   assert runner.capability_execution.bind.credential_ref == (
     member_b if has_generation_metadata else member_a
   ).source_metadata()["generation_ref"]
+
+
+def _make_rotation_budget_runner(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  provider: _PooledAnthropicProvider,
+  tokens: tuple[str, ...],
+) -> tuple[AgentRunner, EventLog]:
+  monkeypatch.setattr(
+    anthropic_provider_module, "ANTHROPIC_CREDENTIAL_POOL", AnthropicCredentialPool(),
+  )
+  for name in ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES:
+    monkeypatch.delenv(name, raising=False)
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", tokens[0])
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps(tokens))
+  monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "oauth.json"))
+  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 3)
+  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.0)
+  member = resolve_anthropic_credentials().by_token(tokens[0])
+  assert member is not None
+  event_log = EventLog()
+  capability_execution = stub_bound_capability_execution(
+    provider=provider,
+    model="claude-pool-test",
+    effort="none",
+    credential_ref=member.source_metadata()["generation_ref"],
+    auth_config={
+      "auth_mode": "oauth",
+      "auth_token": tokens[0],
+      "credential_source": member.source_metadata(),
+      "max_tokens": 512,
+    },
+  )
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log, capability_bind=capability_execution.bind),
+    session_id="sess-rotation-budget",
+    capability_execution=capability_execution,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+  return runner, event_log
+
+
+def test_five_credential_generations_reach_the_usable_member_beyond_retry_budget(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+  tokens = (
+    _TOKEN_A,
+    _TOKEN_B,
+    "sk-ant-oat01-pool-third-credential-000000000000",
+    "sk-ant-oat01-pool-fourth-credential-000000000000",
+    "sk-ant-oat01-pool-fifth-credential-000000000000",
+  )
+  provider = _PooledAnthropicProvider(
+    limited_tokens=tokens[:-1], reset_at=time.time() + 4 * 3600,
+  )
+  runner, event_log = _make_rotation_budget_runner(monkeypatch, tmp_path, provider, tokens)
+  member_five = resolve_anthropic_credentials().by_token(tokens[-1])
+  assert member_five is not None
+  retry_sleeps: list[float] = []
+  retry_delay = 0.001
+  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", retry_delay)
+  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_BACKOFF", 2.0)
+
+  async def record_sleep(delay: float, result: Any = None) -> Any:
+    if delay != gateway_runner.STREAM_GUARD_POLL_INTERVAL:
+      retry_sleeps.append(delay)
+    return await asyncio.sleep(0, result)
+
+  monkeypatch.setattr(
+    gateway_runner, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": record_sleep}),
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
+
+  assert provider.streamed_tokens == list(tokens)
+  assert runner.capability_execution.bind.credential_ref == member_five.source_metadata()["generation_ref"]
+  assert runner.capability_execution.auth_config["auth_token"] == tokens[-1]
+  events = [entry.event for entry in event_log.entries]
+  assert len([event for event in events if event["type"] == "credential_refreshed"]) == 4
+  retry_events = [event for event in events if event["type"] == "stream_retry"]
+  assert [event["attempt"] for event in retry_events] == [0, 1, 2, 3]
+  assert retry_sleeps == pytest.approx([0.001, 0.002, 0.004, 0.008])
+  assert [event["backoff_s"] for event in retry_events] == retry_sleeps
+  assert not any(event["type"] == "error" for event in events)
+  [completion] = [event for event in events if event["type"] == "stream_complete"]
+  assert completion["terminal_disposition"] == "completed"
+
+
+def test_free_rotation_preserves_the_full_transient_retry_budget(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+  class _TransientSiblingProvider(_PooledAnthropicProvider):
+    async def stream(self, client: Any, params: dict[str, Any]):
+      if client["auth_token"] == _TOKEN_B:
+        self.streamed_tokens.append(_TOKEN_B)
+        raise RuntimeError("transient transport error")
+      async for event in super().stream(client, params):
+        yield event
+
+    def is_retryable_error(self, exc: Exception) -> bool:
+      return str(exc) == "transient transport error" or super().is_retryable_error(exc)
+
+  provider = _TransientSiblingProvider(
+    limited_tokens=(_TOKEN_A,), reset_at=time.time() + 4 * 3600,
+  )
+  runner, event_log = _make_rotation_budget_runner(
+    monkeypatch, tmp_path, provider, (_TOKEN_A, _TOKEN_B),
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
+
+  assert provider.streamed_tokens == [_TOKEN_A] + [_TOKEN_B] * (1 + gateway_runner.STREAM_RETRY_MAX)
+  events = [entry.event for entry in event_log.entries]
+  assert len([event for event in events if event["type"] == "credential_refreshed"]) == 1
+  retry_events = [event for event in events if event["type"] == "stream_retry"]
+  assert [event["attempt"] for event in retry_events] == [0, 1, 2, 3]
+  assert sum("transient transport error" in event["error"] for event in retry_events) == gateway_runner.STREAM_RETRY_MAX
+  [error] = [event for event in events if event["type"] == "error"]
+  assert "transient transport error" in error["error"]
+
+
+@pytest.mark.parametrize("cycle_generations", [False, True])
+def test_rotations_to_tried_generations_consume_transient_retry_budget(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cycle_generations: bool,
+) -> None:
+  provider = _PooledAnthropicProvider(
+    limited_tokens=(_TOKEN_A, _TOKEN_B), reset_at=time.time() + 4 * 3600,
+  )
+  runner, event_log = _make_rotation_budget_runner(
+    monkeypatch, tmp_path, provider, (_TOKEN_A, _TOKEN_B),
+  )
+  sources = resolve_anthropic_credentials()
+
+  def next_credential(
+    config: Any, failure: ProviderCredentialFailure,
+  ) -> dict[str, Any]:
+    _ = failure
+    token = (
+      (_TOKEN_B if config["auth_token"] == _TOKEN_A else _TOKEN_A)
+      if cycle_generations else config["auth_token"]
+    )
+    member = sources.by_token(token)
+    assert member is not None
+    return {"auth_token": token, "credential_source": member.source_metadata()}
+
+  monkeypatch.setattr(provider, "next_credential", next_credential)
+
+  _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
+
+  expected_tokens = (
+    [_TOKEN_A, _TOKEN_B, _TOKEN_A, _TOKEN_B, _TOKEN_A]
+    if cycle_generations else [_TOKEN_A] * (1 + gateway_runner.STREAM_RETRY_MAX)
+  )
+  assert provider.streamed_tokens == expected_tokens
+  events = [entry.event for entry in event_log.entries]
+  assert len([event for event in events if event["type"] == "credential_refreshed"]) == len(expected_tokens)
+  retry_events = [event for event in events if event["type"] == "stream_retry"]
+  assert [event["attempt"] for event in retry_events] == list(range(len(expected_tokens)))
+  assert [event["backoff_s"] for event in retry_events] == [0.0] * (len(expected_tokens) - 1) + [None]
+  assert len([event for event in events if event["type"] == "error"]) == 1
+
+
+def test_cancellation_during_a_free_rotation_retry_cancels_the_turn(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+  provider = _PooledAnthropicProvider(
+    limited_tokens=(_TOKEN_A,), reset_at=time.time() + 4 * 3600,
+  )
+  runner, event_log = _make_rotation_budget_runner(
+    monkeypatch, tmp_path, provider, (_TOKEN_A, _TOKEN_B),
+  )
+  retry_started = asyncio.Event()
+  retry_delay = 45.0
+  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", retry_delay)
+
+  async def record_sleep(delay: float, result: Any = None) -> Any:
+    if delay == retry_delay:
+      retry_started.set()
+    return await asyncio.sleep(delay, result)
+
+  monkeypatch.setattr(
+    gateway_runner, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": record_sleep}),
+  )
+
+  async def cancel_retry() -> None:
+    task = asyncio.create_task(runner.run(messages=[{"role": "user", "content": "hello"}]))
+    await asyncio.wait_for(retry_started.wait(), timeout=5.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await task
+    assert task.cancelled()
+
+  _run(cancel_retry())
+
+  assert provider.streamed_tokens == [_TOKEN_A]
+  member_b = resolve_anthropic_credentials().by_token(_TOKEN_B)
+  assert member_b is not None
+  assert runner.capability_execution.bind.credential_ref == member_b.source_metadata()["generation_ref"]
+  events = [entry.event for entry in event_log.entries]
+  assert len([event for event in events if event["type"] == "credential_refreshed"]) == 1
+  assert not any(event["type"] == "error" for event in events)
 
 
 def test_learning_fork_rotates_runner_and_dispatcher_to_sibling(

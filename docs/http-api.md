@@ -375,11 +375,35 @@ Schema:
 | `approved` | boolean | yes | `true` to execute, `false` to deny |
 | `allow_tool_type` | boolean | no | Request a persistent grant for this approval; honored only when the request's `allow_persistent_approval` is true and the session's approval policy mints grants |
 
-Success response:
+When the call has a durable approval record, the response contains its canonical
+`approval` projection. A live SDK waiter receives one queue decision and the
+response has no `continuation` field. Calls without a durable ledger retain the
+`{"status": "ok"}` response.
 
-```json
-{"status": "ok"}
-```
+After a native call has parked and its live queue has been removed, the gateway
+resolves the original call and nonce under the current bearer's tenant. It
+records the vote before invoking the installed host continuation adapter. The
+receiving session address is not execution authority, and a missing cached
+queue does not make the original approval disappear.
+
+The response's `continuation` reports the installed owning adapter's delivery
+status. Without an installed adapter it instead reports `available: false`,
+`unavailable_owner`, and the safe original job and capture state; it does not
+invent a delivery outcome. An accepted durable vote is not a claim that execution
+resumed. An ended SDK call can accept its durable vote but cannot be restored as
+a native prepared call. `outcome_unknown` means the effect outcome is unresolved,
+not an invitation to automatically retry it.
+
+The route calls the configured root adapter first. Only its `not_root` outcome
+dispatches the host-private child adapter, using the approval ID and verified
+tenant rather than a model-supplied task or receiving address. That host owner
+restores the actual job and selects workflow versus ordinary child continuation
+from its original admitted logical task. The HTTP route does not select a runner
+or send arbitrary child approvals directly to a workflow service.
+
+The control decision route keeps its control-session, tenant, channel/delegation,
+and decision-role policy. Its run address likewise does not replace the
+canonical tenant-bound approval and original parked job.
 
 Example:
 
@@ -1190,14 +1214,14 @@ Consumption is bound to the durable `assistant_message` fact through
 `parent_message_consumptions`: exact `task_id`, `message_id`,
 `parent_message_seq` and `consumer_turn`. Its durable
 `parent_message_consumed` audit also references `assistant_message_seq`.
-For root-writer-authored sent facts, root consumption retains that exact
-`runner_id` and `role`, without minting a task entry or child namespace.
-Child consumption retains the consuming child's namespace; its parent-authored
-sent runner need not equal the consuming child runner. Replaying either
-supported assistant fact does not duplicate the consumption audit.
-A child-authored send to the root is accepted, but its consumption still fails
-the existing sender/consumer namespace check; the root-writer repair does not
-cover that path.
+Root consumption binds the recipient to the bound registry owner's `job_id`.
+The sent fact retains its author's runner, role and optional child namespace;
+these need not equal the root consumer's writer identity. The consuming
+assistant's writer must have an earlier matching `attach`, including during
+historical replay. Root consumers do not acquire a child namespace.
+Child consumption retains its existing task-correlated lineage. Exact
+message/body/sequence and duplicate/conflict checks remain enforced; replay
+does not duplicate the consumption audit.
 
 ### Typed Domain Events
 
@@ -1370,7 +1394,9 @@ When a tool needs approval:
 1. The server emits `tool_approval_request`.
 2. Your client decides whether to approve or deny.
 3. Your client calls `POST /api/chat/tool-approval`.
-4. The runner resumes and emits the rest of the tool lifecycle events.
+4. A live SDK waiter resumes through its existing queue. A parked native call is
+   delivered by its installed host owner, if available; otherwise the response
+   reports the missing continuation owner without claiming execution.
 
 There is no session approval cache: each approval decides one call. For code execution, the qualifier usually resolves to `docker` or `subprocess`, naming the backend the approval covers.
 

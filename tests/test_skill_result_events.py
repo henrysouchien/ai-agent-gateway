@@ -97,7 +97,7 @@ def _captured_event(
   result: dict[str, Any],
   error: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-  return build_skill_result_captured_event(
+  event = build_skill_result_captured_event(
     skill_run_id="skill-run-1",
     skill="test-skill",
     ticker=None,
@@ -107,6 +107,8 @@ def _captured_event(
     result=result,
     error=error,
   )
+  assert event is not None
+  return event
 
 
 def test_skill_result_event_accepts_only_validated_report_as_success() -> None:
@@ -176,6 +178,7 @@ def test_skill_result_event_treats_recoverable_fms_error_as_failure() -> None:
     result=_report_result(),
     error=None,
   )
+  assert event is not None
 
   assert event["exit_code"] == 1
   assert event["outcome"] == "error"
@@ -199,6 +202,7 @@ def test_skill_result_event_counts_compactions_from_single_pass_entries() -> Non
     result=_report_result(),
     error=None,
   )
+  assert event is not None
 
   assert event["compaction_count"] == 2
 
@@ -218,6 +222,7 @@ def test_skill_result_event_preserves_exact_lifecycle_identity() -> None:
     result=_report_result(),
     error=None,
   )
+  assert event is not None
 
   assert {
     field_name: event[field_name]
@@ -254,6 +259,7 @@ def test_skill_result_event_deep_owns_nested_receipt_values() -> None:
     result=_report_result(),
     error=None,
   )
+  assert event is not None
   artifact_event["metadata"]["tags"].append("mutated")
 
   assert event["artifact_events"][0]["metadata"]["tags"] == ["original"]
@@ -302,3 +308,26 @@ def test_skill_result_event_rejects_invalid_lifecycle_identity(
       result=_report_result(),
       error=None,
     )
+
+
+def test_awaiting_approval_has_no_terminal_skill_result_event() -> None:
+  result = _task_result(
+    execution=ExecutionSettlement(
+      status="awaiting_approval",
+      terminal_reason="approval_required",
+    ),
+    include_narrative=False,
+  )
+
+  event = build_skill_result_captured_event(
+    skill_run_id="skill-run-parked",
+    skill="test-skill",
+    ticker=None,
+    scope="portfolio",
+    portfolio_id=None,
+    entries=[],
+    result=result,
+    error=None,
+  )
+
+  assert event is None

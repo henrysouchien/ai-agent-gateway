@@ -554,12 +554,34 @@ def _install_fake_agent_sdk(monkeypatch: pytest.MonkeyPatch, iterator_factory) -
     def __init__(self, **kwargs: Any) -> None:
       self.kwargs = kwargs
 
+  class _ClaudeSDKClient:
+    def __init__(self, *, options: Any) -> None:
+      self.options = options
+      self.iterator = None
+      self.connected = False
+
+    async def connect(self) -> None:
+      self.connected = True
+
+    async def query(self, *, prompt: Any) -> None:
+      self.iterator = iterator_factory(prompt, self.options)
+
+    def receive_response(self):
+      return self.iterator
+
+    async def disconnect(self) -> None:
+      iterator = self.iterator
+      self.iterator = None
+      if iterator is not None:
+        await iterator.aclose()
+      self.connected = False
+
   module = types.ModuleType("claude_agent_sdk")
   module.__dict__.update({
     "__version__": SDK_PINNED_VERSION,
     "HookMatcher": _HookMatcher,
     "ClaudeAgentOptions": _ClaudeAgentOptions,
-    "query": lambda prompt, options: iterator_factory(prompt, options),
+    "ClaudeSDKClient": _ClaudeSDKClient,
   })
   monkeypatch.setitem(sys.modules, "claude_agent_sdk", module)
 

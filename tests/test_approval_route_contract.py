@@ -147,15 +147,8 @@ def test_delegated_route_requires_its_exact_channel_and_session() -> None:
 
 def test_no_approval_route_is_the_only_sessionless_variant() -> None:
   assert [f.name for f in dataclasses.fields(NoApprovalRoute)] == []
-  assert {f.name for f in dataclasses.fields(DurableLocalApprovalRoute)} == {
-    "store",
-    "policy",
-    "session",
-  }
-  assert {f.name for f in dataclasses.fields(ParentDelegatedApprovalRoute)} == {
-    "channel",
-    "session",
-  }
+  for route in (DurableLocalApprovalRoute, ParentDelegatedApprovalRoute):
+    assert "session" in {f.name for f in dataclasses.fields(route)}
 
 
 # --- S12 -------------------------------------------------------------------

@@ -339,15 +339,17 @@ def issue_investment_capability_claim(
     "iat": issued_at,
     "iss": INVESTMENT_CAPABILITY_CLAIM_ISSUER,
     "jti": token_id,
+    "kind": INVESTMENT_CAPABILITY_CLAIM_KIND,
     "policy_bundle_hash": trusted_policy_bundle,
     "request_id": request,
     "session_id": session,
     "skill": trusted_skill,
     "skill_run_id": skill_run,
     "sub": subject,
+    "tenant": tenant.model_dump(mode="json"),
     "tool_name": routed_tool,
     "user_id": subject,
-    "v": 1,
+    "v": INVESTMENT_CAPABILITY_CLAIM_VERSION,
   }
   if approved_budget is not None:
     payload["approved_budget"] = approved_budget

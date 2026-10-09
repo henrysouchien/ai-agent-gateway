@@ -9,7 +9,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 import re
-from typing import Any, Callable, Literal, Protocol, TypeGuard
+from typing import Any, Awaitable, Callable, Literal, Protocol, TypeGuard
 
 from agent_workflow_contracts import (
   AdmittedTask,
@@ -788,13 +788,19 @@ class TaskEntry:
     compare=False,
   )
   completion_callback_invoked: bool = False
+  park_callback: Callable[["TaskEntry"], Awaitable[None]] | None = field(
+    default=None,
+    repr=False,
+    compare=False,
+  )
+  park_callback_invoked: bool = False
   required_skill_result_event_factory: Callable[
     [
       "TaskEntry",
       dict[str, Any] | None,
       dict[str, Any] | None,
     ],
-    dict[str, Any],
+    dict[str, Any] | None,
   ] | None = field(
     default=None,
     repr=False,
@@ -1783,6 +1789,69 @@ class TaskRegistry:
       self._prune_completed_owner()
     return entry
 
+  def commit_parked_termination(
+    self,
+    task_id: str,
+    *,
+    result: TaskResult,
+    completed_at: float,
+  ) -> TaskEntry:
+    """Publish an already durable STOP without replacing the park receipt."""
+    entry = self._tasks.get(task_id)
+    if entry is None:
+      raise KeyError(f"Unknown task: {task_id}")
+    if entry.state == TaskState.KILLED and entry.task_result == result:
+      return entry
+    parked = entry.task_result
+    admitted = entry.admitted_task
+    if (
+      entry.state != TaskState.AWAITING_APPROVAL
+      or entry.completion_persistence_state != "committed"
+      or parked is None
+      or admitted is None
+      or entry.error is not None
+      or entry.result != parked.model_dump(mode="json")
+    ):
+      raise TaskResultSettlementError(
+        "parked termination requires the durably committed canonical park"
+      )
+    validate_task_result_admission(parked, admitted)
+    validate_task_result_settlement(
+      parked,
+      final_state=TaskState.AWAITING_APPROVAL,
+      error=None,
+    )
+    validate_task_result_admission(result, admitted)
+    validate_task_result_settlement(
+      result,
+      final_state=TaskState.KILLED,
+      error=None,
+    )
+    if (
+      parked.attempt.physical_task_id != task_id
+      or result.attempt.physical_task_id != task_id
+      or result.execution.terminal_reason != "cancelled"
+      or result.observation.usage != parked.observation.usage
+    ):
+      raise TaskResultSettlementError(
+        "parked termination must retain the original attempt and cumulative usage"
+      )
+    old_state = entry.state
+    entry.state = TaskState.KILLED
+    entry.task_result = result
+    entry.result = result.model_dump(mode="json")
+    entry.error = None
+    entry.termination_intent = "cancelled"
+    entry.completed_at = completed_at
+    entry.pending_final_state = TaskState.KILLED
+    entry.pending_result = entry.result
+    entry.pending_error = None
+    entry.notification_generation += 1
+    for listener in self._listeners:
+      listener.on_transition(entry, old_state, entry.state)
+    self._prune_completed_owner()
+    return entry
+
   def finalize_interrupted(
     self,
     task_id: str,
@@ -1818,19 +1887,61 @@ class TaskRegistry:
     self._prune_completed_owner()
     return entry
 
-  def adopt_interrupted(self, entry: TaskEntry) -> TaskEntry:
-    """Adopt one lazily reconstructed interrupted task into this registry."""
+  def restore_committed_awaiting(
+    self,
+    task_id: str,
+    *,
+    result: dict[str, Any] | None,
+  ) -> TaskEntry:
+    """Restore a late-fsync canonical park, never reopen an interrupted attempt."""
+    entry = self._tasks.get(task_id)
+    if entry is None:
+      raise KeyError(f"Unknown task: {task_id}")
+    if entry.state != TaskState.INTERRUPTED:
+      raise TaskResultSettlementError(
+        "canonical park restoration requires an interrupted live projection"
+      )
+    if entry.completion_persistence_state != "committed":
+      raise TaskResultSettlementError(
+        "canonical park restoration requires durably committed completion"
+      )
+    canonical = entry.task_result
+    admitted = entry.admitted_task
+    if canonical is None or admitted is None:
+      raise TaskResultSettlementError(
+        "canonical park restoration requires the exact admitted TaskResult"
+      )
+    validate_task_result_admission(canonical, admitted)
+    validate_task_result_settlement(
+      canonical,
+      final_state=TaskState.AWAITING_APPROVAL,
+      error=None,
+    )
+    if (
+      canonical.attempt.physical_task_id != task_id
+      or result is None
+      or result != canonical.model_dump(mode="json")
+    ):
+      raise TaskResultSettlementError(
+        "canonical park restoration conflicts with the committed attempt result"
+      )
+    old_state = entry.state
+    entry.state = TaskState.AWAITING_APPROVAL
+    entry.result = dict(result)
+    entry.error = None
+    entry.completed_at = None
+    for listener in self._listeners:
+      listener.on_transition(entry, old_state, entry.state)
+    return entry
+
+  def adopt_reconstructed(self, entry: TaskEntry) -> TaskEntry:
+    """Store a durable reconstruction, retaining the canonical live entry."""
 
     existing = self._tasks.get(entry.task_id)
     if existing is not None:
       return existing
-    if (
-      entry.state != TaskState.INTERRUPTED
-      or not entry.reconstructed_from_log
-    ):
-      raise ValueError(
-        "only reconstructed interrupted tasks may be adopted"
-      )
+    if not entry.reconstructed_from_log:
+      raise ValueError("only reconstructed tasks may be adopted")
     self._tasks[entry.task_id] = entry
     suffix = self._numeric_suffix(entry.task_id)
     if suffix is not None:
@@ -1923,7 +2034,7 @@ class TaskRegistry:
     grouped: dict[str, dict[str, Any]] = {}
     global_skill_results: list[dict[str, Any]] = []
     max_suffix: int | None = None
-    for event in events:
+    for event_index, event in enumerate(events):
       event_type = str(event.get("type") or "")
       if event_type == "skill_result_captured":
         global_skill_results.append(dict(event))
@@ -1935,14 +2046,23 @@ class TaskRegistry:
         {
           "registrations": [],
           "completions": [],
+          "terminations": [],
+          "registration_order": [],
+          "completion_order": [],
+          "termination_order": [],
           "agent_completions": [],
           "messages": [],
         },
       )
       if event_type == "task_registered":
         bucket["registrations"].append(dict(event))
+        bucket["registration_order"].append(event_index)
       elif event_type == "task_completed":
         bucket["completions"].append(dict(event))
+        bucket["completion_order"].append(event_index)
+      elif event_type == "task_terminated":
+        bucket["terminations"].append(dict(event))
+        bucket["termination_order"].append(event_index)
       elif event_type == "agent_completion":
         bucket["agent_completions"].append(dict(event))
       elif event_type == "parent_message_sent":
@@ -2075,6 +2195,15 @@ class TaskRegistry:
             "code": "invalid_task_result",
             "message": "Agent task completion requires canonical TaskResult",
           }
+        if state in _ADMISSION_SLOT_STATES:
+          state = TaskState.FAILED
+          error = {
+            "code": "task_result_settlement_mismatch",
+            "message": (
+              "Persisted task completion has malformed live final-state "
+              f"{raw_final_state!r}"
+            ),
+          }
         completed_at = completed.get("completed_at", completed_at)
 
       agent_completions = list(bucket.get("agent_completions", []))
@@ -2206,6 +2335,84 @@ class TaskRegistry:
             "message": f"Persisted ParentResultPolicy is invalid: {exc}",
           }
 
+      terminations = list(bucket.get("terminations", []))
+      terminated = _require_exact_duplicate_events(
+        terminations,
+        task_id=task_id,
+        event_type="task_terminated",
+      )
+      if terminated is not None and error is None:
+        try:
+          if (
+            not isinstance(completed, dict)
+            or state != TaskState.AWAITING_APPROVAL
+            or task_result is None
+            or admitted_task is None
+            or error is not None
+            or result != task_result.model_dump(mode="json")
+          ):
+            raise TaskResultSettlementError(
+              "task_terminated requires a valid committed canonical park"
+            )
+          ordered_events = [*registrations, *completions, *terminations]
+          sequences = [event.get("_durable_seq") for event in ordered_events]
+          if any(sequence is not None for sequence in sequences):
+            if not all(
+              type(sequence) is int and sequence > 0
+              for sequence in sequences
+            ):
+              raise TaskResultSettlementError(
+                "task_terminated has invalid durable event ordering"
+              )
+            registration_order = [
+              int(event["_durable_seq"]) for event in registrations
+            ]
+            completion_order = [
+              int(event["_durable_seq"]) for event in completions
+            ]
+            termination_order = [
+              int(event["_durable_seq"]) for event in terminations
+            ]
+          else:
+            registration_order = bucket["registration_order"]
+            completion_order = bucket["completion_order"]
+            termination_order = bucket["termination_order"]
+          if (
+            min(registration_order) >= min(completion_order)
+            or min(completion_order) >= min(termination_order)
+          ):
+            raise TaskResultSettlementError(
+              "task_terminated must follow registration and committed park"
+            )
+          cancelled = TaskResult.model_validate(terminated.get("result"))
+          validate_task_result_admission(cancelled, admitted_task)
+          validate_task_result_settlement(
+            cancelled,
+            final_state=terminated.get("final_state"),
+            error=terminated.get("error"),
+          )
+          if (
+            cancelled.execution.status != "cancelled"
+            or cancelled.execution.terminal_reason != "cancelled"
+            or cancelled.attempt.physical_task_id != task_id
+            or cancelled.observation.usage != task_result.observation.usage
+          ):
+            raise TaskResultSettlementError(
+              "task_terminated must retain the parked attempt and cumulative usage"
+            )
+        except (TypeError, ValueError) as exc:
+          state = TaskState.FAILED
+          error = {
+            "code": "invalid_task_termination",
+            "message": f"Persisted parked termination is invalid: {exc}",
+          }
+        else:
+          state = TaskState.KILLED
+          task_result = cancelled
+          result = cancelled.model_dump(mode="json")
+          completed_at = terminated.get("completed_at", completed_at)
+          termination_intent = "cancelled"
+
       entry = TaskEntry(
         task_id=task_id,
         task_type=str(registered.get("task_type") or "background_agent"),
@@ -2240,7 +2447,7 @@ class TaskRegistry:
           required_skill_result_settled
         ),
       )
-      self._tasks[task_id] = entry
+      self.adopt_reconstructed(entry)
 
     if max_suffix is not None:
       self._seq = max(self._seq, max_suffix + 1)

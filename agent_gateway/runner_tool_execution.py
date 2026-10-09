@@ -65,6 +65,7 @@ if TYPE_CHECKING:
   from .event_log import EventLog
   from .mcp_client import McpClientManager
   from .task_registry import TaskRegistry
+  from .sub_agent import ApprovedCallRef
 
 
 
@@ -84,6 +85,18 @@ class _EffectiveToolInputResolver(Protocol):
   ) -> Dict[str, Any]: ...
 
 
+
+
+class ApprovedBindingExecutor(Protocol):
+  async def __call__(
+    self,
+    *,
+    job_id: str,
+    tool_call_id: str,
+    nonce: str,
+    abort_event: asyncio.Event,
+    on_executed_prepared_call: Callable[[PreparedToolCall], None] | None,
+  ) -> ToolResult: ...
 
 
 class AgentRunnerDispatcher(Protocol):
@@ -488,6 +501,52 @@ class RunnerToolExecutionMixin:
       _new_servers: List[str],
     ) -> None: ...
 
+  def bind_resume_approved_call(
+    self,
+    approved_call: ApprovedCallRef,
+    executor: ApprovedBindingExecutor,
+  ) -> None:
+    """Install the host-selected call for replay inside this child's run."""
+    self._resume_approved_call: ApprovedCallRef | None = approved_call
+    self._resume_approved_executor = executor
+
+  async def _execute_resume_approved_call(
+    self,
+    messages: List[Dict[str, Any]],
+    base_kwargs: Dict[str, Any],
+  ) -> None:
+    approved_call = getattr(self, "_resume_approved_call", None)
+    if approved_call is None:
+      return
+    self._resume_approved_call = None
+    tool_use = next(
+      block
+      for message in messages
+      if isinstance(message.get("content"), list)
+      for block in message["content"]
+      if block.get("type") == "tool_use" and block.get("id") == approved_call.tool_call_id
+    )
+    result_block, _, extra_blocks = await self._execute_single_tool(
+      approved_call.tool_call_id,
+      tool_use["name"],
+      tool_use["input"],
+      base_kwargs,
+      approved_call=approved_call,
+    )
+    for message in messages:
+      content = message.get("content")
+      if isinstance(content, list):
+        message["content"] = [
+          replacement
+          for block in content
+          for replacement in (
+            [result_block, *extra_blocks]
+            if block.get("type") == "tool_result"
+            and block.get("tool_use_id") == approved_call.tool_call_id
+            else [block]
+          )
+        ]
+
   async def _execute_single_tool(
     self,
     tool_id: str,
@@ -495,6 +554,8 @@ class RunnerToolExecutionMixin:
     tool_input: Dict[str, Any],
     base_kwargs: Dict[str, Any],
     call_index: int = 0,
+    *,
+    approved_call: ApprovedCallRef | None = None,
   ) -> Tuple[Dict[str, Any], str, List[Dict[str, Any]]]:
     json_module = _runner_attr(self, "json", json)
     logger = _runner_attr(self, "log", log)
@@ -507,7 +568,7 @@ class RunnerToolExecutionMixin:
     preparation_error: Dict[str, Any] | None = None
     prepare_tool_call = getattr(self._dispatcher, "prepare_tool_call", None)
     dispatch_prepared = getattr(self._dispatcher, "dispatch_prepared", None)
-    if callable(prepare_tool_call) and callable(dispatch_prepared):
+    if approved_call is None and callable(prepare_tool_call) and callable(dispatch_prepared):
       try:
         candidate = await self._dispatcher.prepare_tool_call_async(tool_name, tool_input)
         if type(candidate) is not PreparedToolCall:
@@ -527,7 +588,7 @@ class RunnerToolExecutionMixin:
         )
         tool_input = {}
         preparation_failed = True
-    else:
+    elif approved_call is None:
       effective_tool_input = tool_input
       resolve_effective_tool_input = getattr(
         self._dispatcher,
@@ -710,13 +771,13 @@ class RunnerToolExecutionMixin:
         dispatch_kwargs["on_executed_prepared_call"] = (
           capture_executed_prepared_call
         )
-        needs_approval = False
+        needs_approval = approved_call is not None
         requires_approval_fn = (
           getattr(self._dispatcher, "requires_approval_prepared", None)
           if callable(dispatch_prepared)
           else getattr(self._dispatcher, "requires_approval", None)
         )
-        if requires_approval_fn is not None:
+        if approved_call is None and requires_approval_fn is not None:
           try:
             needs_approval = requires_approval_fn(
               tool_name,
@@ -754,18 +815,28 @@ class RunnerToolExecutionMixin:
           result = None
           error = None
           dispatch_coro = (
-            self._dispatcher.dispatch_prepared(
-              tool_id,
-              tool_name,
-              prepared_call,
-              **dispatch_kwargs,
+            self._resume_approved_executor(
+              job_id=approved_call.job_id,
+              tool_call_id=approved_call.tool_call_id,
+              nonce=approved_call.nonce,
+              abort_event=self._tool_abort_event,
+              on_executed_prepared_call=capture_executed_prepared_call,
             )
-            if callable(dispatch_prepared)
-            else self._dispatcher.dispatch(
-              tool_id,
-              tool_name,
-              tool_input,
-              **dispatch_kwargs,
+            if approved_call is not None
+            else (
+              self._dispatcher.dispatch_prepared(
+                tool_id,
+                tool_name,
+                prepared_call,
+                **dispatch_kwargs,
+              )
+              if callable(dispatch_prepared)
+              else self._dispatcher.dispatch(
+                tool_id,
+                tool_name,
+                tool_input,
+                **dispatch_kwargs,
+              )
             )
           )
           expectation_timer = (

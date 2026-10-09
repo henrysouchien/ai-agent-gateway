@@ -29,6 +29,7 @@ from agent_workflow_contracts import (
 from .admission import current_parent_context
 from .capability_execution import BoundCapabilityExecution
 from .event_log import EventLog
+from .providers.anthropic import _is_cacheable_message_block
 from .runner_introspection import derive_sub_agent_id as _derive_sub_agent_id
 from .runner_session_lifecycle import _runner_attr
 from .runner_cleanup import cleanup_failure_notes
@@ -59,6 +60,7 @@ from .tool_dispatcher import ToolDispatcher
 
 if TYPE_CHECKING:
   from pathlib import Path
+  from .sub_agent import ApprovedCallRef
 
   from .agent_session_log import AgentSessionLog
   from .mcp_activation import McpActivationFold
@@ -536,6 +538,8 @@ class RunnerSubAgentMixin:
       narrative_text = await final_child_visible_text(
         self._agent_session_log,
         sub_session_id=sub_session_id,
+        role="sub_agent",
+        sub_agent_id=sub_session_id,
         workspace_dir=self._workspace_dir,
         runner_id=sub_runner_id,
       )
@@ -591,6 +595,8 @@ class RunnerSubAgentMixin:
     admitted_task: AdmittedTask | None = None,
     prior_terminal_tool_result: Mapping[str, Any] | None = None,
     bind_job_runner: Callable[[Any], None],
+    usage_aggregator: _UsageAggregator | None,
+    approved_call: ApprovedCallRef | None = None,
     bind_research_file_activity_lease_func: (
       Callable[[Any], None] | None
     ) = None,
@@ -716,7 +722,7 @@ class RunnerSubAgentMixin:
       compaction_instructions=None,
       tool_call_timeout=self._tool_call_timeout,
       _cost_accumulator=child_cost_accumulator,
-      _parent_aggregator=self._aggregator,
+      _parent_aggregator=usage_aggregator,
       max_concurrent_sub_agents=self._max_concurrent_sub_agents,
       result_requirement=result_requirement,
       agent_session_log=self._agent_session_log,
@@ -731,6 +737,31 @@ class RunnerSubAgentMixin:
       context_surfaces=self._context_surfaces_provider or self._context_surfaces_static,
       terminal_tool_result_ids=set(terminal_result_doors(resolved_admitted_task)),
     )
+    if (
+      resolved_admitted_task is not None
+      and resolved_admitted_task.operation.execution_class == "node.fork"
+    ):
+      sub_runner._fork_mode = True
+      sub_runner._soft_budget_kind = "fork"
+      sub_runner._fork_suffix_tokens = 0
+      # The continued suffix starts after its own recovered child history,
+      # never after a fresh snapshot of the parent's current conversation.
+      # A child interrupted before its first message pins the continuation.
+      sub_runner._fork_marker_position = next(
+        (message_index, block_index)
+        for message_index in (
+          *range(len(reconstructed_messages) - 2, -1, -1),
+          len(reconstructed_messages) - 1,
+        )
+        for content in [reconstructed_messages[message_index].get("content")]
+        for blocks in [
+          [{"type": "text", "text": content}]
+          if isinstance(content, str)
+          else content if isinstance(content, list) else []
+        ]
+        for block_index in range(len(blocks) - 1, -1, -1)
+        if _is_cacheable_message_block(blocks[block_index])
+      )
     _bind_child_registry(
       sub_runner,
       parent_registry=self._task_registry,
@@ -740,6 +771,10 @@ class RunnerSubAgentMixin:
       spill_sink=child_spill_sink,
       bind_job_runner=bind_job_runner,
     )
+    if approved_call is not None:
+      sub_runner.bind_resume_approved_call(
+        approved_call, dispatcher.execute_approved_binding,
+      )
     dispatcher.bind_research_file_activity_owner(sub_runner.ensure_research_file_activity)
     if bind_research_file_activity_lease_func is not None:
       bind_research_file_activity_lease_func(sub_runner)
@@ -820,6 +855,8 @@ class RunnerSubAgentMixin:
       narrative_text = await final_child_visible_text(
         self._agent_session_log,
         sub_session_id=sub_session_id,
+        role="sub_agent",
+        sub_agent_id=sub_session_id,
         workspace_dir=self._workspace_dir,
         runner_id=sub_runner_id,
       )

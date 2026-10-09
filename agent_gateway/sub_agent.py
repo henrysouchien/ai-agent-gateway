@@ -4,7 +4,9 @@ import asyncio
 import copy
 import datetime
 import inspect
+import json
 import logging
+from dataclasses import dataclass
 from functools import partial
 import secrets
 from pathlib import Path
@@ -98,6 +100,7 @@ from .commercial_work_start import (
   require_commercial_child_provider,
 )
 from .event_log import EventLog
+from .multi_user.billing import _UsageAggregator
 from .execution_snapshot import (
   build_agent_execution_snapshot,
   provider_tool_definitions_for_grant,
@@ -194,7 +197,7 @@ from .task_registry import (
   is_canonical_handle_ref,
   job_output_handles,
 )
-from .tool_dispatcher import ToolDispatcher, ToolInterceptor
+from .tool_dispatcher import LocalToolHandler, ToolDispatcher, ToolInterceptor
 from .transcript import (
   ChildRunSegment,
   build_synthetic_tool_results,
@@ -1657,6 +1660,8 @@ def make_run_agent_handler(
       "cost_observation_threshold_usd",
       "background",
       "handles",
+      "role",
+      "effort",
     })
     unknown_input_keys = sorted(set(tool_input) - allowed_input_keys)
     if unknown_input_keys:
@@ -1705,6 +1710,23 @@ def make_run_agent_handler(
     raw_context_ticker = tool_input.get("ticker")
     raw_operation = tool_input.get("operation")
     named_operation = raw_operation is not None
+    role = tool_input.get("role")
+    effort = tool_input.get("effort")
+    for name, value in (("role", role), ("effort", effort)):
+      if value is not None and not isinstance(value, str):
+        return None, {
+          "code": "invalid_input",
+          "message": f"{name} must be a string",
+          "next_call": None,
+        }
+    if effort is not None and effort not in {
+      "none", "minimal", "low", "medium", "high", "xhigh", "max",
+    }:
+      return None, {
+        "code": "invalid_input",
+        "message": "effort must be an exact model reasoning effort",
+        "next_call": None,
+      }
 
     background = tool_input.get("background", True)
     if not isinstance(background, bool):
@@ -2291,6 +2313,8 @@ def make_run_agent_handler(
           operation=agent_name,
           task=task,
           handles=handles,
+          role=role,
+          effort=effort,
           binding=AdmittedResearchBinding(
             research_file_id=asserted_research_file_id,
             ticker=resolved_context_ticker,
@@ -2576,6 +2600,7 @@ def make_run_agent_handler(
             session=parent_session,
             execution=operation_authority.identity,
             context=child_context,
+            attempt_lineage=None,
             user_id=effective_parent_user_id,
             credentials_resolver_active=credentials_resolver_active,
           ),
@@ -2678,7 +2703,7 @@ def make_run_agent_handler(
         _bg_task: Any,
         result: dict[str, Any] | None,
         error: dict[str, Any] | None,
-      ) -> dict[str, Any]:
+      ) -> dict[str, Any] | None:
         if skill_event_emitter is None:
           raise RuntimeError("background skill lifecycle is not configured")
         return skill_event_emitter.build_result_captured_event(
@@ -2858,6 +2883,8 @@ async def _admitted_resume_source(runner: Any, task_id: str) -> TaskEntry | None
   entry = runner._task_registry.get(task_id)
   if entry is None:
     entry = await runner._lookup_task_in_log(task_id)
+    if entry is not None:
+      entry = runner._task_registry.adopt_reconstructed(entry)
   return entry
 
 
@@ -2895,13 +2922,29 @@ async def reserve_admitted_successor(
 class _ResumeHandler(JobScopedHandler):
   """Carry a host-only entry beside, never through, the model handler."""
 
-  def __init__(self, build, scope, admitted_entry) -> None:
+  def __init__(
+    self, build, scope, admitted_entry, approved_entry, operation_resume_bindings,
+  ) -> None:
     super().__init__(build, scope)
     self._scope = scope
     self._admitted_entry = admitted_entry
+    self._approved_entry = approved_entry
+    self._operation_resume_bindings = operation_resume_bindings
 
   def for_job(self, scope: JobScope) -> "_ResumeHandler":
-    return _ResumeHandler(self._build, scope, self._admitted_entry)
+    return _ResumeHandler(
+      self._build, scope, self._admitted_entry, self._approved_entry,
+      self._operation_resume_bindings,
+    )
+
+
+@dataclass(frozen=True)
+class ApprovedCallRef:
+  """Exact durable original call selected by a trusted continuation host."""
+
+  job_id: str
+  tool_call_id: str
+  nonce: str
 
 
 async def resume_admitted_successor(
@@ -2909,9 +2952,18 @@ async def resume_admitted_successor(
   *,
   parked_task_id: str,
   successor: AdmittedTask,
+  approved_call: ApprovedCallRef | None,
   on_complete: Callable[[TaskEntry], Awaitable[None] | None],
+  on_park: Callable[[TaskEntry], Awaitable[None]] | None,
 ) -> tuple[TaskEntry | None, dict | None]:
-  """Execute a trusted workflow-owner admission using configured resume wiring."""
+  """Execute a trusted workflow-owner admission using configured resume wiring.
+
+  Return ``(entry, None)`` whenever the successor started or already exists;
+  ``(None, error)`` is returned only before any worker exists. ``CancelledError``
+  leaves successor state unknown: initialization continues, and re-calling with
+  the same successor returns its live entry. Other exceptions mean the successor
+  did not start or was compensated to a terminal state.
+  """
   handler = next(
     (
       value
@@ -2930,13 +2982,59 @@ async def resume_admitted_successor(
     parked_task_id=parked_task_id,
     successor=successor,
     on_complete=on_complete,
+    on_park=on_park,
+    approved_call=approved_call,
     caller=handler._scope.caller,
   )
+
+
+async def continue_approved_child(
+  runner,
+  *,
+  parked_task_id: str,
+  approved_call: ApprovedCallRef,
+  on_complete: Callable[[TaskEntry], Awaitable[None] | None],
+  on_park: Callable[[TaskEntry], Awaitable[None]] | None,
+) -> tuple[TaskEntry | None, dict | None]:
+  """Continue a parked native call through host wiring, never model arguments.
+
+  Return and cancellation semantics are those of ``resume_admitted_successor``.
+  """
+  handler = next((
+    value for value in runner._dispatcher.local_tool_handlers().values()
+    if isinstance(value, _ResumeHandler)
+  ), None)
+  if handler is None:
+    return None, {
+      "code": "not_available",
+      "message": "Host successor entry requires configured resume wiring",
+    }
+  return await handler._approved_entry(
+    runner, parked_task_id=parked_task_id, approved_call=approved_call,
+    on_complete=on_complete,
+    on_park=on_park, caller=handler._scope.caller,
+  )
+
+
+@dataclass(frozen=True)
+class OperationResumeBinding:
+  """Runtime-only operation wiring selected from the parked admission.
+
+  A ``None`` usage aggregator gives the successor independent accounting.
+  Settlement receives its canonical cumulative result after activity release.
+  """
+
+  local_handler_scopes: Mapping[
+    str, Callable[[LocalToolHandler], LocalToolHandler]
+  ]
+  usage_aggregator: _UsageAggregator | None
+  on_settled: Callable[[TaskEntry], Awaitable[None]] | None
 
 
 def make_resume_handler(
   runner_ref: list[Any],
   *,
+  operation_resume_bindings: Callable[[AdmittedTask], OperationResumeBinding | None] | None,
   parent_session: GatewaySession | None = None,
   caller: CallerContext | None = None,
   mcp_client: Any,
@@ -3002,11 +3100,23 @@ def make_resume_handler(
     caller: CallerContext,
     supplied_successor: AdmittedTask | None = None,
     supplied_on_complete: Callable[[TaskEntry], Awaitable[None] | None] | None = None,
+    supplied_on_park: Callable[[TaskEntry], Awaitable[None]] | None,
+    approved_call: ApprovedCallRef | None = None,
     dispatch_kwargs: dict[str, Any],
   ):
     kwargs = dispatch_kwargs
     if runner is None:
       return None, {"code": "internal_error", "message": "Sub-agent runner not initialized"}
+    if supplied_successor is not None:
+      existing = runner._task_registry.get(supplied_successor.attempt.physical_task_id)
+      if (
+        existing is not None
+        and existing.original_task_id == tool_input.get("task_id")
+        and existing.admitted_task == supplied_successor
+      ):
+        started = await runner._started_background_task(existing.task_id)
+        if started is not None:
+          return started, None
     root = caller()
     durable_log = getattr(runner, "_agent_session_log", None)
     if durable_log is None:
@@ -3076,7 +3186,7 @@ def make_resume_handler(
               "code": "not_interrupted",
               "message": f"Task {task_id} is not interrupted",
             }
-          entry = runner._task_registry.adopt_interrupted(
+          entry = runner._task_registry.adopt_reconstructed(
             reconstructed_entry
           )
     if entry is None:
@@ -3157,7 +3267,13 @@ def make_resume_handler(
         "invalid_task_metadata",
         f"Task {task_id} admission does not match its physical/model bind",
       )
+    operation_resume_binding = (
+      operation_resume_bindings(original_admitted_task)
+      if operation_resume_bindings is not None
+      else None
+    )
     successor_context = None
+    reserved: TaskEntry | None = None
     if supplied_successor is not None:
       source_context = original_execution_snapshot.admitted_context
       successor_snapshot = supplied_successor.execution_snapshot
@@ -3488,13 +3604,21 @@ def make_resume_handler(
 
     async def _fanout_completion(completed: TaskEntry) -> None:
       _release_outer_activity(completed)
+      _release_activity_ref(child_activity_lease_ref)
+      if (
+        operation_resume_binding is not None
+        and operation_resume_binding.on_settled is not None
+      ):
+        await operation_resume_binding.on_settled(completed)
       if supplied_on_complete is not None:
         returned = supplied_on_complete(completed)
         if inspect.isawaitable(returned):
           await returned
 
     completion_callback = (
-      _fanout_completion if supplied_successor is not None else _release_outer_activity
+      _fanout_completion
+      if supplied_successor is not None or operation_resume_binding is not None
+      else _release_outer_activity
     )
 
     current_task = asyncio.current_task()
@@ -3723,6 +3847,12 @@ def make_resume_handler(
         configured_servers=mcp_session_inject_servers,
       )
     )
+    async def _attempt_lineage(original_task_id: str) -> bool:
+      return await runner._is_resume_successor(
+        successor_admitted_task,
+        original_task_id,
+      )
+
     async def _dispatch_resume(_background_input: dict[str, Any], **background_kwargs: Any):
       background_call_index = int(background_kwargs.get("call_index", call_index) or 0)
       task_entry = background_kwargs.get("task_entry")
@@ -3742,7 +3872,7 @@ def make_resume_handler(
         )
         capture_job_context(sub_session, child_context)
       try:
-        child_local = dict(sub_local)
+        child_local: dict[str, LocalToolHandler] = dict(sub_local)
         child_spill_sink = (
           job_spill_sink(
             runner._spill_dir_provider,
@@ -3769,6 +3899,12 @@ def make_resume_handler(
           if code_execution_input_preparation_factory is not None
           else None
         )
+        if operation_resume_binding is not None:
+          for tool_name, scope in operation_resume_binding.local_handler_scopes.items():
+            stock = child_local.get(tool_name)
+            if not callable(stock):
+              raise KeyError(tool_name)
+            child_local[tool_name] = scope(stock)
         sub_dispatcher = ToolDispatcher(
           capability_bind=original_bind,
           mcp_client=mcp_client,
@@ -3797,6 +3933,7 @@ def make_resume_handler(
             session=parent_session,
             execution=execution_identity_from_session(parent_session),
             context=child_context,
+            attempt_lineage=_attempt_lineage,
             user_id=user_id or getattr(parent_session, "user_id", None),
             credentials_resolver_active=credentials_resolver_active,
           ),
@@ -3827,6 +3964,8 @@ def make_resume_handler(
         if code_execution is not None and code_execution_binder is not None:
           code_execution_binder(code_execution, sub_dispatcher)
         await _emit_skill_run_started()
+        def _bind_resumed_runner(sub_runner: Any) -> None:
+          child_runner_ref.append(sub_runner)
         return await runner.resume_sub_agent(
           original_task_id=task_id,
           reconstructed_messages=reconstructed_messages,
@@ -3842,7 +3981,8 @@ def make_resume_handler(
           system_prompt=system_prompt,
           dispatcher=sub_dispatcher,
           sub_session=sub_session,
-          bind_job_runner=child_runner_ref.append,
+          bind_job_runner=_bind_resumed_runner,
+          approved_call=approved_call,
           excluded_tools=child_excluded,
           max_tokens=successor_execution_snapshot.max_tokens,
           skill_run_id=skill_run_id,
@@ -3859,6 +3999,11 @@ def make_resume_handler(
             else None
           ),
           admitted_task=successor_admitted_task,
+          usage_aggregator=(
+            operation_resume_binding.usage_aggregator
+            if operation_resume_binding is not None
+            else runner._aggregator
+          ),
         )
       finally:
         await _dispose_child_code_execution(sub_session)
@@ -3900,25 +4045,45 @@ def make_resume_handler(
       _bg_task: Any,
       result: dict[str, Any] | None,
       error: dict[str, Any] | None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
       return skill_event_emitter.build_result_captured_event(
         result,
         error,
       )
 
-    if supplied_successor is not None:
-      source_state_error = _source_state_error()
-      if source_state_error is not None:
-        _release_activity_ref(outer_activity_lease_ref)
-        _release_activity_ref(child_activity_lease_ref)
-        return None, source_state_error
+    source_lock: asyncio.Lock | None = (
+      entry.finalization_lock if supplied_successor is not None else None
+    )
+    if source_lock is not None:
+      # Parked STOP and successor installation share the source's lock.
+      # Registration and completion only finalize the successor entry.
+      await source_lock.acquire()
     try:
+      if supplied_successor is not None:
+        source_state_error = _source_state_error()
+        if source_state_error is not None:
+          current_source = runner._task_registry.get(task_id) or entry
+          if current_source.state not in {
+            TaskState.AWAITING_APPROVAL, TaskState.INTERRUPTED,
+          }:
+            source_state_error = {
+              "code": "source_terminated",
+              "message": f"Task {task_id} is no longer parked",
+            }
+          assert reserved is not None
+          runner._task_registry.discard_unstarted(
+            successor_task_id, expected=reserved,
+          )
+          _release_activity_ref(outer_activity_lease_ref)
+          _release_activity_ref(child_activity_lease_ref)
+          return None, source_state_error
       result, error = await runner._register_background_task(
         tool_input=resume_tool_input,
         handler=_dispatch_resume,
         agent_name=agent_name,
         parent_turn_id=parent_turn_id,
         on_complete=completion_callback,
+        on_park=supplied_on_park,
         capability_bind_receipt=execution.bind.to_json(),
         admitted_task=successor_admitted_task,
         task_id_override=successor_task_id,
@@ -3936,6 +4101,21 @@ def make_resume_handler(
     except BaseException:
       _release_untransferred_activity_after_entry()
       raise
+    finally:
+      if source_lock is not None:
+        successor_entry = runner._task_registry.get(successor_task_id)
+        initialization_task = (
+          successor_entry.initialization_task
+          if successor_entry is not None else None
+        )
+        if initialization_task is not None and not initialization_task.done():
+          # Cancellation leaves shielded initialization running. Keep STOP
+          # excluded until that registration has durably started or settled.
+          initialization_task.add_done_callback(
+            lambda _task, lock=source_lock: lock.release(),
+          )
+        else:
+          source_lock.release()
     _release_untransferred_activity_after_entry()
     if error is not None:
       return None, error
@@ -3948,7 +4128,9 @@ def make_resume_handler(
     *,
     parked_task_id: str,
     successor: AdmittedTask,
+    approved_call: ApprovedCallRef | None,
     on_complete: Callable[[TaskEntry], Awaitable[None] | None],
+    on_park: Callable[[TaskEntry], Awaitable[None]] | None,
     caller: CallerContext,
   ) -> tuple[TaskEntry | None, dict | None]:
     return await _execute_resume(
@@ -3957,14 +4139,69 @@ def make_resume_handler(
       caller=caller,
       supplied_successor=successor,
       supplied_on_complete=on_complete,
+      supplied_on_park=on_park,
+      approved_call=approved_call,
       dispatch_kwargs={},
+    )
+
+  async def _approved_entry(
+    runner: Any,
+    *,
+    parked_task_id: str,
+    approved_call: ApprovedCallRef,
+    on_complete: Callable[[TaskEntry], Awaitable[None] | None],
+    on_park: Callable[[TaskEntry], Awaitable[None]] | None,
+    caller: CallerContext,
+  ) -> tuple[TaskEntry | None, dict | None]:
+    successor_id, error = await reserve_admitted_successor(
+      runner, parked_task_id=parked_task_id,
+    )
+    if error is not None:
+      return None, error
+    assert successor_id is not None
+    existing = runner._task_registry.get(successor_id)
+    if existing is not None:
+      started = await runner._started_background_task(successor_id)
+      if started is not None:
+        return started, None
+    source = await _admitted_resume_source(runner, parked_task_id)
+    assert source is not None and isinstance(source.admitted_task, AdmittedTask)
+    original = source.admitted_task
+    snapshot = original.execution_snapshot
+    assert snapshot is not None
+    attempt_number = original.attempt.attempt_number + 1
+    payload = original.model_dump(mode="json", exclude={"admitted_task_digest"})
+    payload.update({
+      "admitted_task_id": successor_id,
+      "attempt": AttemptRef(
+        attempt_number=attempt_number,
+        attempt_id=f"{successor_id}:attempt:{attempt_number}",
+        physical_task_id=successor_id,
+        resume_of_task_id=parked_task_id,
+        resumer_job_id=approved_call.job_id,
+      ).model_dump(mode="json"),
+      "execution_snapshot": resume_agent_execution_snapshot(
+        snapshot,
+        resume_instruction="Resume the admitted task from its durable transcript.",
+      ).model_dump(mode="json"),
+    })
+    seal_admitted_task_payload(payload)
+    successor = AdmittedTask.model_validate(payload).model_copy(
+      update={"tool_grant": original.tool_grant},
+    )
+    return await _execute_resume(
+      runner, {"task_id": parked_task_id}, caller=caller,
+      supplied_successor=successor, supplied_on_complete=on_complete,
+      supplied_on_park=on_park,
+      approved_call=approved_call, dispatch_kwargs={},
     )
 
   def _build(scope: JobScope):
     async def _scoped_resume(tool_input: dict[str, Any], **kwargs: Any):
       # Dispatch kwargs remain data: they cannot select the trusted host path.
       return await _execute_resume(
-        runner_ref[0], tool_input, caller=scope.caller, dispatch_kwargs=kwargs,
+        runner_ref[0], tool_input, caller=scope.caller,
+        supplied_on_park=None, dispatch_kwargs=kwargs,
       )
     return _scoped_resume
 
@@ -3975,6 +4212,8 @@ def make_resume_handler(
       spill_sink=lambda: None,
     ),
     _admitted_entry,
+    _approved_entry,
+    operation_resume_bindings,
   )
 
 
@@ -3982,10 +4221,45 @@ def make_send_message_handler(runner_ref: list[Any], *, caller):
   return _make_send_message_handler(runner_ref, caller=caller)
 
 
+async def resume_binding_for(
+  runner: Any,
+  task_id: str,
+) -> tuple[
+  TaskEntry, SubAgentResultEvidence | None, OperationResumeBinding | None,
+] | None:
+  """Attach an admitted task and recover its own durable resume inputs."""
+  entry = await runner.attach_background_task(
+    task_id, on_complete=None, on_park=None,
+  )
+  if entry is None or not isinstance(entry.admitted_task, AdmittedTask):
+    return None
+  durable_log = runner._agent_session_log
+  lineage = (
+    await reconstruct_child_run_lineage(durable_log, task_id)
+    if durable_log is not None
+    else []
+  )
+  evidence = _prior_result_evidence(lineage) if lineage else None
+  handler = next((
+    value for value in runner._dispatcher.local_tool_handlers().values()
+    if isinstance(value, _ResumeHandler)
+  ), None)
+  binding = (
+    handler._operation_resume_bindings(entry.admitted_task)
+    if handler is not None and handler._operation_resume_bindings is not None
+    else None
+  )
+  return entry, evidence, binding
+
+
 __all__ = [
+  "OperationResumeBinding",
   "seal_admitted_task_payload",
   "reserve_admitted_successor",
   "resume_admitted_successor",
+  "resume_binding_for",
+  "ApprovedCallRef",
+  "continue_approved_child",
   "make_get_background_result_handler",
   "make_get_background_result_tool_def",
   "make_send_message_handler",

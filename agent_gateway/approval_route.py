@@ -18,8 +18,8 @@ control plane's authenticated deciders; no dispatcher executes on it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Generic, TypeVar, Union
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Generic, TypeVar, Union
 
 from .autonomous_approval_channel import AutonomousApprovalChannelChild
 from .approval_store import SQLiteApprovalStore
@@ -66,6 +66,9 @@ class ParentDelegatedApprovalRoute:
 
   channel: AutonomousApprovalChannelChild
   session: "GatewaySession"
+  private_capture_writer: Callable[[dict[str, Any]], Awaitable[None]] | None = field(
+    default=None, kw_only=True, repr=False, compare=False,
+  )
 
   def __post_init__(self) -> None:
     if type(self.channel) is not AutonomousApprovalChannelChild:

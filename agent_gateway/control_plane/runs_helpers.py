@@ -198,6 +198,12 @@ def _state_from_session(session: GatewaySession, events: list[dict[str, Any]]) -
       return "completed"
     if disposition == "interrupted":
       return "interrupted"
+    if disposition == "awaiting_approval":
+      # A parked turn leaves the logical job open for durable continuation, so
+      # its run state is the existing approval_pending, not a failure.  The
+      # transient pending_tools entry is gone once the turn has parked; the
+      # root terminal event is the durable record of the wait.
+      return "approval_pending"
     return "failed"
   return "starting"
 

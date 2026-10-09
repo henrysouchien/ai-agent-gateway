@@ -587,6 +587,8 @@ async def spawn_fork_agent(
   narrative_text = await final_child_visible_text(
     parent._agent_session_log,
     sub_session_id=sub_session_id,
+    role="sub_agent",
+    sub_agent_id=sub_session_id,
     workspace_dir=parent._workspace_dir,
     runner_id=sub_runner_id,
   )

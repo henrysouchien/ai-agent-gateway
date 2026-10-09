@@ -757,6 +757,7 @@ outcome qualifiers; the embed exists now so that population is reshape-free
 export type WorkflowViewNodeState = {
   readonly "action_required"?: ("publish_result" | "restart" | "retry" | "resume") | (null);
   readonly "attempt_number"?: (number) | (null);
+  readonly "attempt_settlement"?: (SettlementProjection) | (null);
   readonly "node_id": string;
   readonly "phase_number": number;
   readonly "revision": number;

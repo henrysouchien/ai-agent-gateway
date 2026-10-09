@@ -24,7 +24,11 @@ from agent_workflow_contracts import (
 )
 from model_authority.bind import CapabilityBind
 
-from agent_gateway.final_narrative_artifact import read_final_narrative
+from agent_gateway.agent_session_log import AgentSessionLog
+from agent_gateway.final_narrative_artifact import (
+  publish_final_narrative,
+  read_final_narrative,
+)
 from agent_gateway.runner_background_tasks import (
   build_agent_completion_envelope,
   ordinary_parent_result_policy,
@@ -123,6 +127,8 @@ async def test_terminal_narrative_is_exact_and_never_prefix_clipped(tmp_path) ->
   visible = await final_child_visible_text(
     _NarrativeLog([entry]),
     sub_session_id="child-1",
+    role="sub_agent",
+    sub_agent_id="child-1",
     workspace_dir=str(tmp_path),
   )
 
@@ -135,6 +141,79 @@ async def test_terminal_narrative_is_exact_and_never_prefix_clipped(tmp_path) ->
     workspace_dir=tmp_path,
     reference=visible.final_narrative,
   ) == text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["writer", "sub_agent"])
+async def test_independent_run_narrative_uses_own_durable_response(
+  tmp_path, role,
+) -> None:
+  logical, attempt, provenance = _task_identity()
+  log = AgentSessionLog(tmp_path / "independent-run.jsonl")
+  sub_agent_id = None if role == "writer" else "child-1"
+  runner_id = "independent-run"
+  identity = {
+    "runner_id": runner_id,
+    "role": role,
+    "sub_agent_id": sub_agent_id,
+  }
+  first = await log.append({
+    **_assistant_entry(
+      "Learning ", seq=1, ordinal=0, terminal=False,
+    ).event,
+    **identity,
+  })
+  terminal = await log.append({
+    **_assistant_entry(
+      "fork narrative.", seq=2, ordinal=1, terminal=True,
+      prior_seq=first.seq,
+    ).event,
+    **identity,
+  })
+  # Neither another writer run nor a child in the same journal supplies this
+  # run's newest terminal segment, even if logical response IDs coincide.
+  await log.append({
+    **_assistant_entry("Other run.", seq=3, ordinal=0, terminal=True).event,
+    "runner_id": "other-run",
+    "role": "writer",
+  })
+  await log.append({
+    **_assistant_entry("Nested child.", seq=4, ordinal=0, terminal=True).event,
+    "runner_id": runner_id,
+    "role": "sub_agent",
+    "sub_agent_id": "nested-child",
+  })
+
+  visible = await final_child_visible_text(
+    log,
+    sub_session_id="child-1",
+    role=role,
+    sub_agent_id=sub_agent_id,
+    workspace_dir=str(tmp_path),
+    runner_id=runner_id,
+  )
+  assert visible.text == "Learning fork narrative."
+  assert visible.final_narrative is not None
+  assert visible.final_narrative.terminal_event_seq == terminal.seq
+  assert visible.final_narrative == publish_final_narrative(
+    workspace_dir=tmp_path,
+    sub_agent_id="child-1",
+    terminal_event_seq=terminal.seq,
+    text="Learning fork narrative.",
+  )
+  result = task_result_from_execution(
+    (),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=visible.final_narrative,
+    stalled=False,
+  )
+  assert result.execution.status == "succeeded"
+  assert read_task_result_terminal_narrative(
+    result, workspace_dir=str(tmp_path),
+  ) == "Learning fork narrative."
 
 
 @pytest.mark.asyncio
@@ -156,6 +235,8 @@ async def test_terminal_narrative_materializes_all_lineaged_pages(tmp_path) -> N
   visible = await final_child_visible_text(
     log,
     sub_session_id="child-1",
+    role="sub_agent",
+    sub_agent_id="child-1",
     workspace_dir=str(tmp_path),
   )
 
@@ -178,6 +259,8 @@ async def test_terminal_narrative_requires_durable_lineage(tmp_path) -> None:
     await final_child_visible_text(
       _NarrativeLog([entry]),
       sub_session_id="child-1",
+      role="sub_agent",
+      sub_agent_id="child-1",
       workspace_dir=str(tmp_path),
     )
 
@@ -192,6 +275,8 @@ async def test_newest_nonterminal_message_never_falls_back_to_stale_answer(
   visible = await final_child_visible_text(
     _NarrativeLog([stale, partial]),
     sub_session_id="child-1",
+    role="sub_agent",
+    sub_agent_id="child-1",
     workspace_dir=str(tmp_path),
   )
 
@@ -207,6 +292,8 @@ async def test_narrative_execution_returns_canonical_task_result(tmp_path) -> No
       _assistant_entry("Exact canonical answer.", seq=7, ordinal=0, terminal=True)
     ]),
     sub_session_id="child-1",
+    role="sub_agent",
+    sub_agent_id="child-1",
     workspace_dir=str(tmp_path),
   )
 
@@ -258,6 +345,8 @@ async def test_child_source_observations_populate_task_result_evidence(
       _assistant_entry("Sourced answer.", seq=9, ordinal=0, terminal=True)
     ]),
     sub_session_id="child-1",
+    role="sub_agent",
+    sub_agent_id="child-1",
     workspace_dir=str(tmp_path),
   )
 
@@ -325,6 +414,8 @@ async def test_no_citation_context_child_yields_no_fabricated_citations(
       _assistant_entry("Observed answer.", seq=11, ordinal=0, terminal=True)
     ]),
     sub_session_id="child-1",
+    role="sub_agent",
+    sub_agent_id="child-1",
     workspace_dir=str(tmp_path),
   )
 
@@ -463,6 +554,8 @@ async def _narrative(tmp_path, text: str = "Partial but real answer."):
       _assistant_entry(text, seq=11, ordinal=0, terminal=True)
     ]),
     sub_session_id="child-1",
+    role="sub_agent",
+    sub_agent_id="child-1",
     workspace_dir=str(tmp_path),
   )
   return visible.final_narrative
@@ -617,6 +710,8 @@ async def test_refused_child_settles_interrupted_and_keeps_delivered_narrative(
   visible = await final_child_visible_text(
     _NarrativeLog([refused]),
     sub_session_id="child-1",
+    role="sub_agent",
+    sub_agent_id="child-1",
     workspace_dir=str(tmp_path),
   )
   assert visible.text == "Delivered before the stop."

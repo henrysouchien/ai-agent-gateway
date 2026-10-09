@@ -41,6 +41,7 @@ from agent_gateway.skills import SkillLoader
 from agent_gateway.sub_agent import make_run_agent_handler
 from gateway_test_support.capability_execution_test_support import stub_capability_execution_resolver
 from gateway_test_support.host_policy import owner_session_host_policy
+from gateway_test_support.approval_policy_test_support import FixedOutcomeApprovalPolicy
 from agent_gateway.approval_policy import (
   ApprovalDecision as PolicyApprovalDecision,
   ApprovalRequest as PolicyApprovalRequest,
@@ -884,17 +885,6 @@ def test_delegated_run_settles_everything_but_the_money_boundary(
 
 
 
-class _NativeCapturePolicy(SingleUserApprovalPolicy):
-  def __init__(
-    self,
-    outcome: Literal["request_user_approval", "auto_approve", "auto_deny"],
-  ) -> None:
-    super().__init__()
-    self.outcome: Literal["request_user_approval", "auto_approve", "auto_deny"] = outcome
-
-  async def decide(self, **_kwargs: Any) -> PolicyApprovalDecision:
-    return PolicyApprovalDecision(outcome=self.outcome, reason="capture test")
-
 
 def _native_capture_dispatcher(
   tmp_path: Path,
@@ -911,7 +901,7 @@ def _native_capture_dispatcher(
   producer.auth_config = {
     "credential_source": {"generation_ref": "anthropic-generation-session-rotated"},
   }
-  ledger = DurableLocalApprovalRoute(store, _NativeCapturePolicy(outcome), parent)
+  ledger = DurableLocalApprovalRoute(store, FixedOutcomeApprovalPolicy(outcome), parent)
   route = InProcessDelegatedApprovalRoute(ledger) if delegated else ledger
   producer.approval_route = route
   if admitted:
@@ -1048,6 +1038,133 @@ def test_native_park_captures_exact_call_and_dispatch_operands(
   asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("with_writer", [False, True])
+@pytest.mark.parametrize("exact_backend", [None, "private-backend"])
+@pytest.mark.parametrize("generation_ref", [None, "anthropic-generation-original"])
+def test_detached_park_sends_private_capture_before_public_approval(
+  tmp_path: Path,
+  owner_session_host_policy: Any,
+  monkeypatch: pytest.MonkeyPatch,
+  with_writer: bool,
+  exact_backend: str | None,
+  generation_ref: str | None,
+) -> None:
+  async def scenario() -> None:
+    dispatcher, store, session = _native_capture_dispatcher(
+      tmp_path, credential_generation_ref=generation_ref,
+    )
+    capture_job_context(
+      session, replace(current_parent_context(session), job_id="job-detached"),
+    )
+    captures: list[dict[str, Any]] = []
+    order: list[str] = []
+    event_log = EventLog()
+    session_log = AgentSessionLog(path=tmp_path / "child-events.jsonl")
+    session_events: list[dict[str, Any]] = []
+    append_session_event = session_log.append
+
+    async def observe_session_event(event: dict[str, Any]):
+      session_events.append(dict(event))
+      return await append_session_event(event)
+
+    monkeypatch.setattr(session_log, "append", observe_session_event)
+    session.agent_session_log = session_log
+    dispatcher._event_log = event_log
+
+    async def write_private_capture(payload: dict[str, Any]) -> None:
+      assert session.pending_tools == {}
+      assert event_log.entries == []
+      assert session_events == []
+      captures.append(payload)
+      order.append("private")
+      await asyncio.sleep(0)
+
+    route = ParentDelegatedApprovalRoute(
+      object.__new__(AutonomousApprovalChannelChild),
+      session,
+      private_capture_writer=write_private_capture if with_writer else None,
+    )
+    session.approval_route = route
+    dispatcher._approval_route = route
+    monkeypatch.setattr(dispatcher, "_resolve_tool_class", lambda _name: "irreversible")
+    append_event = dispatcher._append_event
+
+    def observe_public(event: dict[str, Any]) -> Any:
+      if event["type"] == "tool_approval_request":
+        assert len(captures) == int(with_writer)
+        order.append("public")
+      return append_event(event)
+
+    monkeypatch.setattr(dispatcher, "_append_event", observe_public)
+    original = PreparedToolCall(
+      {"ticker": "MSFT", "api_key": "raw-original-operand"},
+      exact_backend=exact_backend,
+    )
+    task = asyncio.create_task(dispatcher.dispatch_prepared(
+      "call-detached",
+      "native_write",
+      original,
+      call_index=7,
+      advertised_tool_names=frozenset({"z_tool", "native_write", "a_tool"}),
+      skill_run_id="private-skill",
+      step_id="private-step",
+      workspace_dir="/private/workspace",
+      batch_id="private-batch",
+      capture_readable_resource_snapshot=True,
+      allow_uncertain_mcp_replay=False,
+    ))
+    queue = await _wait_for_native_queue(session, task, "call-detached")
+    pending = session.pending_tools["call-detached"]
+    assert order == (["private", "public"] if with_writer else ["public"])
+    if with_writer:
+      assert captures == [{
+        "approval_id": pending["approval_id"],
+        "tool_call_id": "call-detached",
+        "nonce": pending["nonce"],
+        "tool_name": "native_write",
+        "prepared_input": original.materialize_input(),
+        "exact_backend": exact_backend,
+        "dispatch_context": {
+          "call_index": 7,
+          "advertised_tool_names": ["a_tool", "native_write", "z_tool"],
+          "skill_run_id": "private-skill",
+          "step_id": "private-step",
+          "workspace_dir": "/private/workspace",
+          "batch_id": "private-batch",
+          "capture_readable_resource_snapshot": True,
+          "allow_uncertain_mcp_replay": False,
+        },
+        "job_id": "job-detached",
+        "tenant_storage_id": "alice",
+        "credential_generation_ref": generation_ref,
+      }]
+    else:
+      assert captures == []
+    public = json.dumps({
+      "events": [entry.event for entry in event_log.entries],
+      "session_log": session_events,
+      "pending_tools": session.pending_tools,
+    })
+    for private_value in (
+      "raw-original-operand", "private-backend", "prepared_input",
+      "dispatch_context", "private-skill", "private-step", "/private/workspace",
+      "private-batch", "credential_generation_ref", "anthropic-generation-original",
+    ):
+      assert private_value not in public
+    with store._connection() as conn:
+      assert conn.execute("SELECT COUNT(*) FROM approval_executable_bindings").fetchone()[0] == 0
+    await queue.put({
+      "approval_id": pending["approval_id"],
+      "approved": False,
+      "allow_tool_type": False,
+    })
+    result, error = await task
+    assert result is None
+    assert error is not None and error["code"] == "user_denied"
+
+  asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("outcome", ["auto_approve", "auto_deny"])
 def test_native_automatic_decisions_record_no_executable_binding(
   tmp_path: Path,
@@ -1170,7 +1287,7 @@ def test_real_in_process_child_capture_uses_child_job_not_parent_session(
       },
     )
     store = SQLiteApprovalStore(tmp_path / "real-child.sqlite3")
-    policy = _NativeCapturePolicy("request_user_approval")
+    policy = FixedOutcomeApprovalPolicy("request_user_approval")
     parent.approval_route = DurableLocalApprovalRoute(store, policy, parent)
     parent.approval_store = store
     parent.approval_policy = policy

@@ -23,7 +23,7 @@ independent of credential identity and survives sessionless dispatch.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from agent_workflow_contracts import ExecutionIdentity
 if TYPE_CHECKING:
@@ -109,6 +109,7 @@ class DispatchIdentity:
   risk_user_id: int | None = None
   channel: str | None = None
   credentials_resolver_active: bool = False
+  attempt_lineage: Callable[[str], Awaitable[bool]] | None = None
 
   @property
   def tenant_id(self) -> str | None:
@@ -128,6 +129,7 @@ def dispatch_identity(
   session: Any,
   execution: ExecutionIdentity | None,
   context: ParentContext | None,
+  attempt_lineage: Callable[[str], Awaitable[bool]] | None,
   user_id: str | None = None,
   credentials_resolver_active: bool = False,
 ) -> DispatchIdentity:
@@ -139,10 +141,13 @@ def dispatch_identity(
   (:func:`execution_identity_from_session`).
   ``context`` is the executing job's admitted context, never inferred from
   the optional session or credential identity.
+  ``attempt_lineage`` is the trusted runner's async resume ancestry lookup,
+  bound to this executing admission; initial dispatch has no such lookup.
   """
 
   return DispatchIdentity(
     context=context,
+    attempt_lineage=attempt_lineage,
     execution=execution,
     session=session,
     user_id=(

@@ -20,6 +20,24 @@ policy and identity callbacks plus optional batch/operator-schedule backends in
 embedding application. `server_policy` is process-scoped: configure it before
 building runtimes and use one product policy per gateway process.
 
+`sub_agent.continue_approved_child()` is a host-only continuation entry through
+the configured resume handler. It reserves the parked attempt's ordinary resume
+successor, retains its exact tool grant and tenant, and executes the original
+approval binding after the child's runner and job registry are bound, before
+requesting the model. The runner publishes the approved call's result durably
+through the same tool-execution path used for model-issued calls.
+The required `approved_call=sub_agent.ApprovedCallRef(job_id, tool_call_id, nonce)`
+identifies that exact durable original call.
+The stored call's real result (including typed errors) replaces only its orphan
+tool result; other orphan calls remain synthetic. Registration reservations that
+have not started a worker remain retryable. Existing workers are replayed before
+credential materialization. Completion releases activity, including an
+untransferred child lease, before notifying the host.
+Model-facing resume still reissues the grant and synthesizes interrupted calls.
+Callers supply `on_complete` and the required `on_park` keyword (`None` when no
+park callback is needed). Configured operation-resume bindings apply to this
+successor just as they do to the other resume paths.
+
 ## Main entrypoints
 
 | Source | Primary symbol | Use it for |
@@ -78,6 +96,11 @@ reconstruction, attempt creation and credential materialization remain outside
 this pure step. A valid older task without the context projection keeps its
 durable authority; missing durable routes/definitions retain the resume owner's
 existing handling.
+Detached approvals may carry a private capture writer on their admitted route.
+For a parked call, the lifecycle sends original prepared input, exact backend,
+dispatch context and admitted job/tenant/credential identity through that writer
+before publishing the public approval request. A route without a writer publishes
+no executable capture; public events and pending-tool maps never carry it.
 `AdmissionOwners.frozen_bind` retains a plan-frozen model bind without
 reselection; `materialize_bind()` is the single reauthorization owner. Fresh spawns select effort within the registered role; profile
 overlays remain deferred. Declared operation children determine nested spawning.
@@ -105,13 +128,27 @@ authenticated identity, live roster and approval owner.
 execution authority. Duplicate registration/message bind receipts are optional
 observations, not prerequisites or competing authority; canonical corruption and
 task/result/message identity checks still apply.
+Completion replay is dormant: even a non-agent ordinary result cannot reconstruct
+a pending/running worker from `task_completed`. Such a corrupted final state
+projects as failed with `task_result_settlement_mismatch`; the result and journal
+remain unchanged. `adopt_reconstructed()` retains one registry entry and lock,
+returning an existing entry rather than replacing it with a fresh replay copy.
 
 Workflow-node continuation belongs to the workflow owner, not model-facing
 `revive`. A trusted host first calls
 `sub_agent.reserve_admitted_successor(runner, parked_task_id=...)` to reserve the
 kernel's deterministic physical successor, then supplies its workflow admission
 to `sub_agent.resume_admitted_successor(runner, parked_task_id=..., successor=...,
-on_complete=...)`. The runner's dispatcher must contain the handler built by
+approved_call=..., on_complete=..., on_park=...)`. Pass an `ApprovedCallRef` to
+execute the approved original call with this supplied successor's dispatcher
+before the provider runs, replacing only that call's synthetic result. Pass
+`approved_call=None` to retain synthetic results for every interrupted call.
+The supplied successor and its grant are unchanged. The async park callback is installed before the
+successor worker starts and observes that same entry once its parked result is
+durably committed; pass `None` when no park handling is needed.
+`attach_background_task(task_id, on_complete=..., on_park=...)` binds missing
+lifecycle callbacks on live or adopted entries without replacing existing ones.
+The runner's dispatcher must contain the handler built by
 `make_resume_handler`; this reuses its configured child-runtime wiring without
 exposing supplied admissions through tool inputs. The admission retains the
 parked logical task, authenticated tenant and frozen capability bind, names the
@@ -119,9 +156,41 @@ parked physical attempt in `resume_of_task_id`, uses the reserved successor ID a
 both physical and admitted task ID, and carries the original grant unchanged
 (including its grant ID and digest). Workflow attempt IDs and resume lifecycle events remain
 workflow-owned. Completion releases the gateway's activity lease before invoking
-the host callback, including an awaitable callback. Ordinary `revive` still
-accepts only ordinary delegation identity and mints its existing ordinary
-successor admission.
+the host callback, including an awaitable callback. Supplied successor installation
+serializes with parked STOP under the source entry's finalization lock until
+registration settles, including initialization left running by caller cancellation.
+If STOP wins before installation, resume returns `source_terminated` and releases
+the unstarted successor reservation; a registered successor is the source's resumed
+marker. Ordinary `revive` still accepts only ordinary delegation identity and mints
+its existing ordinary successor admission.
+
+`make_resume_handler` requires the `operation_resume_bindings` keyword; pass
+`None` for ordinary resume wiring. An application may supply a callback from the
+parked `AdmittedTask` to the frozen, runtime-only `OperationResumeBinding` in
+`agent_gateway.sub_agent`. The binding scopes existing local handlers (a missing
+stock handler raises `KeyError`), selects a usage aggregator, and optionally
+awaits `on_settled(entry)` after successor completion and activity release, before
+the workflow host's completion callback. A binding's `usage_aggregator=None`
+keeps the child's own accounting and charges nothing to its parent; a callback
+returning no binding preserves ordinary parent accounting. The lower-level
+`resume_sub_agent` also requires an explicit `usage_aggregator`: pass the parent's
+aggregator to share accounting or `None` to keep it independent. The entry's
+canonical `TaskResult` contains cumulative usage across attempts. Operation identity comes
+only from the parked admission; no binding is persisted.
+`await sub_agent.resume_binding_for(runner, task_id)` attaches the existing
+admitted task without installing lifecycle callbacks and returns its entry,
+evidence recovered from that runner's own durable child lineage, and the
+configured operation binding. Unknown or unadmitted tasks return `None`; no
+configured operation-binding callback yields a `None` binding.
+Continued `node.fork` operations retain fork mode and soft-budget measurements,
+with their resumed suffix marked after the reconstructed child history. Resume
+uses the child's journal and frozen execution snapshot, never a new parent
+conversation or system prompt.
+Final narratives use the exact durable logical-response lineage for the run's
+role: child callers supply `role="sub_agent"` and their session ID as
+`sub_agent_id`; independent writer runs supply `role="writer"` and
+`sub_agent_id=None`, with their exact `runner_id`. Both retain the session ID
+as the narrative artifact identity.
 
 ## Quick start
 

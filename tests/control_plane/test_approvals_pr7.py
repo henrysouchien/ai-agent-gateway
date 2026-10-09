@@ -28,12 +28,19 @@ from agent_gateway.autonomous_launch_envelope import (
 )
 from agent_gateway.approval_audit import ApprovalAuditEmitter
 from agent_gateway.approval_notifications import ApprovalNotificationDestination
+from agent_gateway.approval_continuation import (
+  ChildContinueOutcome,
+  ChildContinueRequest,
+  RootContinueOutcome,
+  RootContinueRequest,
+)
 from agent_gateway.approval_policy import (
   ApprovalRequest,
   ApprovalRequestPayload,
   DelegationGrant,
   RunContext,
   utc_now,
+  sha256_args,
 )
 from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.audit_writer import JSONLAuditWriter
@@ -45,6 +52,7 @@ from agent_gateway.capability_execution import MaterializedCredential
 from agent_gateway.control_plane import approvals as approvals_module
 from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
+from agent_gateway.tool_policy_registry import PreparedToolCall
 
 
 API_KEY = "approvals-pr7-key"
@@ -442,6 +450,75 @@ def _install_pending_approval(
   }
   session.approval_queues[tool_call_id] = queue
   return request_record, queue
+
+
+def _install_captured_approval(
+  *,
+  store: SQLiteApprovalStore,
+  chat_payload: dict[str, Any],
+  user_id: str,
+) -> tuple[ApprovalRequest, str]:
+  approval_id = f"appr-{uuid.uuid4().hex}"
+  prepared = PreparedToolCall(
+    {"ticker": "AAPL", "token": "private-original-operand"},
+    exact_backend="remote",
+  )
+  approval = replace(
+    _approval_record(
+      chat_payload=chat_payload,
+      approval_id=approval_id,
+      tool_call_id=f"tool-{uuid.uuid4().hex}",
+      user_id=user_id,
+    ),
+    args_hash=sha256_args(prepared.materialize_input()),
+  )
+  nonce = f"nonce-{approval_id}"
+  _run(store.create(approval))
+  _run(store.record_executable_binding(
+    approval_id=approval.approval_id,
+    job_id=f"child-{approval_id}",
+    tool_call_id=approval.tool_call_id,
+    nonce=nonce,
+    tenant_storage_id=user_id,
+    tool_name=approval.tool_name,
+    prepared_call=prepared,
+    dispatch_context={"call_index": 0},
+    credential_generation_ref="private-original-generation",
+  ))
+  return approval, nonce
+
+
+def _link_sdk_root_approval(store: SQLiteApprovalStore, approval: ApprovalRequest) -> None:
+  session_id = approval.session_id
+  assert session_id is not None
+  generation = _run(store.record_policy_generation(
+    policy_id=approval.policy_id,
+    policy_version=approval.policy_version,
+    policy_bundle_hash=approval.policy_bundle_hash,
+  ))
+  _run(store.record_root_turn(
+    job_id=session_id,
+    turn_id=f"turn-{approval.approval_id}",
+    tenant_storage_id=approval.user_id,
+    capability_bind={
+      "model_key": _MODEL_ENTRY.key,
+      "provider": _MODEL_ENTRY.provider,
+      "credential_ref": _SERVICE_HANDLE.handle_id,
+    },
+    credential_generation_ref=None,
+    effective_grant={"tool_ids": [approval.tool_name], "withheld_tools": []},
+    research_binding=None,
+    selection_snapshot={"role": "owner", "effort": "high"},
+    approval_route_kind="DurableLocalApprovalRoute",
+    policy_generation_ref=generation.generation_ref,
+  ))
+  _run(store.link_root_turn_executable_binding(
+    job_id=session_id,
+    turn_id=f"turn-{approval.approval_id}",
+    tool_call_id=approval.tool_call_id,
+    nonce=f"nonce-{approval.approval_id}",
+    tenant_storage_id=approval.user_id,
+  ))
 
 
 def _create_delegation_grant(
@@ -1987,3 +2064,390 @@ def test_chat_tool_approval_endpoint_uses_shared_helper(tmp_path) -> None:
       "allow_tool_type": False,
       "approval_id": approval.approval_id,
     }
+
+
+def test_control_captured_approval_votes_after_cache_clear_and_stale_address(tmp_path) -> None:
+  app, store, policy, _writer = _make_app(tmp_path)
+  with TestClient(app) as client:
+    control = _control_session(client, "alice-control-alias")
+    chat = _chat_session(client, "alice-chat-alias")
+    for payload in (control, chat):
+      owner_session = _session(app, payload)
+      owner_session.owner_user_id = "101"
+      owner_session.risk_user_id = 101
+    control = _with_role(app, control, "owner")
+    approval, nonce = _install_captured_approval(
+      store=store,
+      chat_payload=chat,
+      user_id="101",
+    )
+    session = _session(app, chat)
+    session.pending_tools[approval.tool_call_id] = {
+      "approval_id": approval.approval_id,
+      "nonce": nonce,
+      "status": "approval_pending",
+    }
+    session.approval_queues[approval.tool_call_id] = asyncio.Queue(maxsize=1)
+    session.pending_tools.clear()
+    session.approval_queues.clear()
+
+    response = client.post(
+      f"/api/control/runs/stale-receiving-address/approvals/{approval.approval_id}",
+      headers=_headers(control),
+      json={"approved": True, "reason": "current owner decision"},
+    )
+    assert response.status_code == 200, response.text
+    stored = _run(store.get(approval.approval_id))
+    assert stored is not None
+    assert (stored.state, stored.decider_id, stored.decider_role, stored.decision_reason) == (
+      "approved", "101", "owner", "current owner decision",
+    )
+    assert response.json()["continuation"] == {
+      "available": False,
+      "unavailable_owner": "root_continue_hook",
+      "job_id": f"child-{approval.approval_id}",
+      "executable_binding_state": "captured",
+    }
+    for private_value in ("private-original-operand", "private-original-generation", nonce):
+      assert private_value not in response.text
+    assert session.pending_tools == {}
+    assert session.approval_queues == {}
+
+    replay = client.post(
+      f"/api/control/runs/another-address/approvals/{approval.approval_id}",
+      headers=_headers(control),
+      json={"approved": False, "reason": "cannot replace durable decision"},
+    )
+    assert replay.status_code == 200, replay.text
+    assert _run(store.get(approval.approval_id)) == stored
+    assert policy.resolved == [approval.approval_id]
+
+
+def test_captured_approval_keeps_auth_tenant_channel_and_current_role_policy(tmp_path) -> None:
+  app, store, policy, _writer = _make_app(
+    tmp_path,
+    policy=_NoopPolicy(owner_only_classes={"external_write"}),
+  )
+  with TestClient(app) as client:
+    old_chat = _with_role(app, _chat_session(client, "alice"), "owner")
+    current_chat = _with_role(app, _chat_session(client, "alice"), "invite")
+    bob_chat = _chat_session(client, "bob")
+    web_control = _control_session(client, "alice", channel="web")
+    approval, nonce = _install_captured_approval(
+      store=store,
+      chat_payload=old_chat,
+      user_id="alice",
+    )
+    continuations: list[Any] = []
+
+    async def unexpected_continuation(request):
+      continuations.append(request)
+      raise AssertionError("An unauthorized vote must not reach continuation")
+
+    app.state.root_continue_hook = unexpected_continuation
+    payload = {
+      "tool_call_id": approval.tool_call_id,
+      "nonce": nonce,
+      "approved": True,
+      "role": "owner",
+      "user_id": "alice",
+    }
+    unauthenticated = client.post("/api/chat/tool-approval", json=payload)
+    assert unauthenticated.status_code == 401
+    cross_tenant = client.post(
+      "/api/chat/tool-approval",
+      headers=_headers(bob_chat),
+      json=payload,
+    )
+    assert cross_tenant.status_code == 404
+    assert approval.approval_id not in cross_tenant.text
+    assert nonce not in cross_tenant.text
+    channel_denied = client.post(
+      f"/api/control/runs/old-address/approvals/{approval.approval_id}",
+      headers=_headers(web_control),
+      json={"approved": True},
+    )
+    assert channel_denied.status_code == 404
+    wrong_nonce = client.post(
+      "/api/chat/tool-approval",
+      headers=_headers(current_chat),
+      json={**payload, "nonce": "not-the-original-nonce"},
+    )
+    assert wrong_nonce.status_code == 404
+    role_denied = client.post(
+      "/api/chat/tool-approval",
+      headers=_headers(current_chat),
+      json=payload,
+    )
+    for private_value in ("private-original-operand", "private-original-generation", nonce):
+      assert private_value not in role_denied.text
+    pending = _run(store.get(approval.approval_id))
+    assert pending == approval
+    assert policy.resolved == []
+    assert continuations == []
+    binding, canonical = _run(store._read_executable_binding_for_executor(
+      job_id=f"child-{approval.approval_id}",
+      tool_call_id=approval.tool_call_id,
+      nonce=nonce,
+      tenant_storage_id="alice",
+    ))
+    assert canonical == approval
+    assert _run(store._read_completed_executable_result_for_executor(binding=binding)) is None
+
+
+def test_current_invite_control_can_deny_captured_approval_without_executing_it(tmp_path) -> None:
+  app, store, policy, _writer = _make_app(
+    tmp_path,
+    policy=_NoopPolicy(owner_only_classes={"external_write"}),
+  )
+  with TestClient(app) as client:
+    chat = _with_role(app, _chat_session(client, "alice"), "owner")
+    control = _with_role(app, _control_session(client, "alice"), "invite")
+    approval, nonce = _install_captured_approval(
+      store=store,
+      chat_payload=chat,
+      user_id="alice",
+    )
+    denied = client.post(
+      f"/api/control/runs/stale-address/approvals/{approval.approval_id}",
+      headers=_headers(control),
+      json={"approved": False},
+    )
+    assert denied.status_code == 200, denied.text
+    stored = _run(store.get(approval.approval_id))
+    assert stored is not None
+    assert (stored.state, stored.decider_id, stored.decider_role) == ("denied", "alice", "invite")
+    assert policy.resolved == [approval.approval_id]
+    binding, canonical = _run(store._read_executable_binding_for_executor(
+      job_id=f"child-{approval.approval_id}",
+      tool_call_id=approval.tool_call_id,
+      nonce=nonce,
+      tenant_storage_id="alice",
+    ))
+    assert canonical == stored
+    assert _run(store._read_completed_executable_result_for_executor(binding=binding)) is None
+
+
+def test_linked_live_sdk_approval_uses_original_queue_once_without_native_restore(tmp_path) -> None:
+  app, store, policy, _writer = _make_app(tmp_path)
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    chat = _chat_session(client, "alice")
+    approval, queue = _install_pending_approval(
+      app=app, store=store, chat_payload=chat, user_id="alice",
+    )
+    _link_sdk_root_approval(store, approval)
+    response = client.post(
+      f"/api/control/runs/stale-address/approvals/{approval.approval_id}",
+      headers=_headers(control),
+      json={"approved": True},
+    )
+    assert response.status_code == 200, response.text
+    assert "continuation" not in response.json()
+    assert queue.get_nowait() == {
+      "approved": True,
+      "allow_tool_type": False,
+      "approval_id": approval.approval_id,
+    }
+    replay = client.post(
+      f"/api/control/runs/stale-address/approvals/{approval.approval_id}",
+      headers=_headers(control),
+      json={"approved": False},
+    )
+    assert replay.status_code == 409
+    assert queue.empty()
+    assert policy.resolved == [approval.approval_id]
+    locator = _run(store.locate_request(
+      approval_id=approval.approval_id, tenant_storage_id="alice",
+    ))
+    assert locator is not None
+    assert locator.executable_binding_state == "not_restorable"
+
+
+def test_ended_sdk_approval_accepts_durable_vote_without_fabricating_native_call(tmp_path) -> None:
+  app, store, policy, _writer = _make_app(tmp_path)
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    chat = _chat_session(client, "alice")
+    approval, queue = _install_pending_approval(
+      app=app, store=store, chat_payload=chat, user_id="alice",
+    )
+    _link_sdk_root_approval(store, approval)
+    session = _session(app, chat)
+    session.pending_tools.clear()
+    session.approval_queues.clear()
+    response = client.post(
+      f"/api/control/runs/no-longer-live/approvals/{approval.approval_id}",
+      headers=_headers(control),
+      json={"approved": True},
+    )
+    assert response.status_code == 200, response.text
+    stored = _run(store.get(approval.approval_id))
+    assert stored is not None and stored.state == "approved"
+    assert response.json()["continuation"] == {
+      "available": False,
+      "unavailable_owner": "root_continue_hook",
+      "job_id": chat["session_id"],
+      "executable_binding_state": "not_restorable",
+    }
+    assert queue.empty()
+    assert policy.resolved == [approval.approval_id]
+    locator = _run(store.locate_request(
+      approval_id=approval.approval_id, tenant_storage_id="alice",
+    ))
+    assert locator is not None
+    assert locator.job_id == chat["session_id"]
+    assert locator.executable_binding_state == "not_restorable"
+
+
+def test_child_hook_consumes_committed_vote_and_reports_failure_without_retry(tmp_path) -> None:
+  app, store, policy, _writer = _make_app(tmp_path)
+  child_requests: list[ChildContinueRequest] = []
+  failed_approval_ids: set[str] = set()
+
+  async def classify_root(request: RootContinueRequest) -> RootContinueOutcome:
+    root = await store._locate_root_turn_for_approval(
+      approval_id=request.approval_id,
+      tenant_storage_id=request.tenant_storage_id,
+    )
+    assert root is None
+    return RootContinueOutcome(status="not_root")
+
+  async def consume_child_vote(request: ChildContinueRequest) -> ChildContinueOutcome:
+    located = await store._locate_request_for_decision(
+      approval_id=request.approval_id,
+      tenant_storage_id=request.tenant_storage_id,
+    )
+    assert located is not None
+    decision, locator, _nonce = located
+    # The real durable decision must be visible to the installed consumer,
+    # not merely queued or projected as an approved HTTP response.
+    assert decision.state == "approved"
+    assert decision.decider_id == request.tenant_storage_id
+    assert decision.decided_at is not None
+    child_requests.append(request)
+    if request.approval_id in failed_approval_ids:
+      raise RuntimeError("private-child-adapter-fault")
+    # This fixture has no restored runtime: do not claim an execution effect.
+    return ChildContinueOutcome(
+      status="not_restorable",
+      job_id=locator.job_id,
+      tool_call_id=locator.tool_call_id,
+    )
+
+  with TestClient(app) as client:
+    app.state.root_continue_hook = classify_root
+    app.state.child_continue_hook = consume_child_vote
+    control = _with_role(app, _control_session(client, "alice"), "owner")
+    chat = _chat_session(client, "alice")
+    approvals: list[ApprovalRequest] = []
+    for fail_delivery in (False, True):
+      approval, _nonce = _install_captured_approval(
+        store=store,
+        chat_payload=chat,
+        user_id="alice",
+      )
+      approvals.append(approval)
+      if fail_delivery:
+        failed_approval_ids.add(approval.approval_id)
+      response = client.post(
+        f"/api/control/runs/not-the-owning-address/approvals/{approval.approval_id}",
+        headers=_headers(control),
+        json={
+          "approved": True,
+          "tenant_storage_id": "bob",
+          "parked_task_id": "invented-task",
+        },
+      )
+      assert response.status_code == 200, response.text
+      stored = _run(store.get(approval.approval_id))
+      assert stored is not None and stored.state == "approved"
+      if fail_delivery:
+        assert response.json()["continuation"] == {
+          "status": "outcome_unknown",
+          "failed_owner": "child_continue_hook",
+          "job_id": f"child-{approval.approval_id}",
+        }
+        assert "private-child-adapter-fault" not in response.text
+      else:
+        assert response.json()["continuation"] == {
+          "status": "not_restorable",
+          "job_id": f"child-{approval.approval_id}",
+          "tool_call_id": approval.tool_call_id,
+        }
+    assert child_requests == [
+      ChildContinueRequest(approval.approval_id, "alice")
+      for approval in approvals
+    ]
+    assert policy.resolved == [approval.approval_id for approval in approvals]
+
+
+def test_unrestricted_autonomous_launch_row_is_listed_and_votable_from_web(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from agent_gateway import autonomous_runner
+  from agent_gateway.approval_policy import approval_request_projection
+  from agent_gateway.control_plane.autonomous_approval_delivery import (
+    create_delegated_autonomous_approval,
+  )
+
+  async def fake_exec(*args, **kwargs):
+    return _FakeAutonomousProcess(os.dup(kwargs["pass_fds"][0]))
+
+  _patch_fake_autonomous_spawn(monkeypatch, autonomous_runner, fake_exec)
+  app, store, policy, _writer = _make_app(tmp_path)
+  with TestClient(app) as client:
+    control = _control_session(client, "alice", channel="web")
+    registry = app.state.subprocess_registry
+    assert client.portal is not None
+    started = client.portal.call(lambda: registry.start(
+      role="owner", profile="analyst", mode="task", task="unrestricted approval",
+      user_id="alice", user_email="alice@example.test", channel=None,
+    ))
+    record = registry._find_by_control_run_id(started["run_id"])
+    assert record is not None
+    assert record.channel is None
+    request = _approval_record(
+      chat_payload={"session_id": record.session_id},
+      tool_call_id="unrestricted-tool-call",
+      approval_id="unrestricted-approval",
+      user_id="alice",
+      channel="child-projection-is-not-authority",
+    )
+    nonce = "unrestricted-original-nonce"
+    event = {
+      "type": "tool_approval_request",
+      "approval_id": request.approval_id,
+      "tool_call_id": request.tool_call_id,
+      "nonce": nonce,
+      "tool_name": request.tool_name,
+      "tool_input": dict(request.tool_args_redacted),
+      "durable_request": approval_request_projection(request),
+    }
+    stored = client.portal.call(lambda: create_delegated_autonomous_approval(
+      store=store, policy=policy, record=record, event=event,
+    ))
+    assert stored.channel == "cli"
+    assert record.channel is None
+    record.event_lines.append(event)
+    record.state = "approval_pending"
+    listed = client.get("/api/control/approvals", headers=_headers(control))
+    assert listed.status_code == 200, listed.text
+    assert [row["approval_id"] for row in listed.json()["approvals"]] == [
+      request.approval_id,
+    ]
+    response = client.post(
+      f"/api/control/runs/{record.control_run_id}/approvals/{request.approval_id}",
+      headers=_headers(control),
+      json={"approved": True, "reason": "authorized web vote"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["approval"]["state"] == "approved"
+    assert response.json()["approval"]["channel"] == "cli"
+    assert record.channel is None
+    delivery = _run(store.get_autonomous_approval_delivery(
+      request.approval_id, tool_call_id=request.tool_call_id, nonce=nonce,
+    ))
+    assert delivery is not None
+    assert delivery["approved"] is True

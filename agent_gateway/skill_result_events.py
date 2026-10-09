@@ -30,7 +30,7 @@ def build_skill_result_captured_event(
   output_memory_file: str | None = None,
   duration_s: float | None = None,
   canonical_result_evidence_authoritative: bool = False,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
   artifact_identity = SkillLifecycleArtifactIdentity(
     scope=scope,
     ticker=ticker,
@@ -62,6 +62,8 @@ def build_skill_result_captured_event(
     declared_terminal_doors=door_names,
     door_results=fms_results,
   )
+  if not classification.is_final:
+    return None
   primary_door_status = (
     str(primary_fms.get("status")).strip().lower()
     if isinstance(primary_fms, dict) and primary_fms.get("status") is not None

@@ -29,6 +29,7 @@ if TYPE_CHECKING:
   from .capability_execution import BoundCapabilityExecution
   from .event_log import EventLog
   from .tool_dispatch_classification import DispatchEntry, ToolResultSettlement
+  from .tool_dispatcher_approval_lifecycle import ApprovalPark
 
 
 log = logging.getLogger("agent_gateway.sdk_runner")
@@ -392,6 +393,7 @@ class _SDKRunnerStreamMixin:
     *,
     terminal_disposition: TerminalDisposition = "completed",
     reason: str | None = None,
+    approval_park: ApprovalPark | None = None,
   ) -> None:
     if self._stream_terminal_emitted:
       return
@@ -418,6 +420,14 @@ class _SDKRunnerStreamMixin:
       "terminal_disposition": terminal_disposition,
       "usage": usage,
     }
+    if approval_park is not None:
+      terminal_event.update({
+        "job_id": approval_park.job_id,
+        "approval_id": approval_park.approval_id,
+        "original_tool_call_id": approval_park.original_tool_call_id,
+      })
+      if approval_park.root_turn_id is not None:
+        terminal_event["root_turn_id"] = approval_park.root_turn_id
     if terminal_disposition == "interrupted":
       terminal_event["reason"] = str(reason).strip()
     self._append(terminal_event)

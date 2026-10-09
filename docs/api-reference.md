@@ -496,9 +496,11 @@ authenticated user and credential identity in `DispatchIdentity`. Local-handler
 context, role policy, per-user MCP authentication, and source-pack capture use
 that execution authority. A `DispatchIdentity` cannot also be supplied alongside
 separate execution-identity arguments. Build it with `dispatch_identity(session=...,
-execution=..., context=...)`: `execution` is the identity the caller resolved, and
-`None` means a resolved absence, never derived from the session. `context` is the
-executing admitted context. Both are required keyword arguments.
+execution=..., context=..., attempt_lineage=None)`: `execution` is the identity the
+caller resolved, and `None` means a resolved absence, never derived from the
+session. `context` is the executing admitted context. `execution`, `context`, and
+`attempt_lineage` are required keyword arguments. Pass `attempt_lineage=None` for
+a non-resume attempt; a successor supplies its trusted async resume-ancestry lookup.
 
 `approval_route` is independent: its ledger and policy authorize the money
 boundary, and its session owns pending approval cards and decision queues. An
@@ -707,6 +709,18 @@ Factory for the local `resume_background_agent` handler. Its optional trusted
 cloning or reordering its stateful elements. Production initial and resume
 wiring supplies the same finalized instances. A caller-supplied custom
 `run_agent` handler remains caller-owned and is not wrapped or replaced.
+
+The required keyword `operation_resume_bindings` is either `None` or a callback
+from the parked `AdmittedTask` to `OperationResumeBinding | None`. The frozen
+binding is exported from `agent_gateway.sub_agent` and carries
+`local_handler_scopes`, `usage_aggregator`, and `on_settled`. Scopes wrap existing
+stock local handlers, raising `KeyError` for a missing handler. A non-`None`
+aggregator receives successor usage instead of the parent's; `None` inside a
+binding gives the child independent accounting. Returning no binding preserves
+ordinary resume behavior. The optional async settlement callback receives the
+canonical entry with cumulative `TaskResult` usage after activity release, before
+the workflow host completion callback. These bindings are runtime-only; identity
+is selected from the parked admission, never an added persisted field.
 
 Successful continuation records one additive custody event on the canonical
 successor `AttemptRef.resumer_job_id`: the actual admitted resumer job receives

@@ -678,6 +678,28 @@ def test_drainer_hands_a_matching_row_to_delivery(
   assert [call["approval_id"] for call in delivered] == ["approval-1"]
 
 
+def test_drainer_redelivers_uncaptured_row_from_unrestricted_launch(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  delivered: list[dict[str, Any]] = []
+
+  async def deliver(**kwargs: Any) -> None:
+    delivered.append(kwargs)
+
+  monkeypatch.setattr(drainer_module, "deliver_autonomous_approval_outbox", deliver)
+  record = _running_task(channel=None)
+  request = _durable_request()
+  coordinator = _coordinator(
+    _RequestStore(request),
+    registry=_TaskRegistry(record),
+  )
+  asyncio.run(coordinator._deliver_one(_delivery_row()))  # type: ignore[arg-type]
+  assert record.channel is None
+  assert len(delivered) == 1
+  assert delivered[0]["request_record"] is request
+  assert delivered[0]["channel"] == "cli"
+
+
 @pytest.mark.parametrize(
   "changed",
   [

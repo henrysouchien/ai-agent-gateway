@@ -1630,3 +1630,169 @@ def test_existing_approval_store_gains_root_tables_without_rebinding_calls(
     ) == ("job-original", request.tool_call_id, "nonce-original", "turn-original")
 
   asyncio.run(case())
+
+
+@pytest.mark.parametrize("root_linked", [False, True], ids=["native-child", "native-root"])
+def test_safe_approval_locator_cold_reads_original_native_call_without_private_payload(
+  tmp_path: Path,
+  root_linked: bool,
+) -> None:
+  from dataclasses import asdict
+
+  async def case() -> None:
+    path = tmp_path / "approvals.sqlite3"
+    store = SQLiteApprovalStore(path)
+    request, prepared = await _persist_binding(store)
+    assert request.session_id != "job-original"
+    if root_linked:
+      arguments = await _root_turn_arguments(store)
+      await store.record_root_turn(**arguments)
+      await store.record_root_turn(**{**arguments, "turn_id": "turn-unrelated"})
+      await store.link_root_turn_executable_binding(
+        job_id="job-original", turn_id="turn-original",
+        tool_call_id=request.tool_call_id, nonce="nonce-original",
+        tenant_storage_id="alice",
+      )
+    reopened = SQLiteApprovalStore(path)
+    locator = await reopened.locate_request(
+      approval_id=request.approval_id, tenant_storage_id="alice",
+    )
+    assert locator is not None
+    assert asdict(locator) == {
+      "approval_id": request.approval_id,
+      "tool_call_id": request.tool_call_id,
+      "job_id": "job-original",
+      "root_turn_id": "turn-original" if root_linked else None,
+      "executable_binding_state": "captured",
+    }
+    decision_lookup = await reopened._locate_request_for_decision(
+      tenant_storage_id="alice", tool_call_id=request.tool_call_id,
+      nonce="nonce-original",
+    )
+    assert decision_lookup is not None
+    durable_request, decision_locator, original_nonce = decision_lookup
+    assert _approval_request_to_dict(durable_request) == _approval_request_to_dict(request)
+    assert decision_locator == locator
+    assert original_nonce == "nonce-original"
+    assert await reopened._locate_request_for_decision(
+      tenant_storage_id="alice", approval_id=request.approval_id,
+    ) == decision_lookup
+    assert await reopened._locate_request_for_decision(
+      tenant_storage_id="alice", tool_call_id=request.tool_call_id,
+      nonce="replacement-nonce",
+    ) is None
+    assert await reopened._locate_request_for_decision(
+      tenant_storage_id="alice", tool_call_id="replacement-call",
+      nonce="nonce-original",
+    ) is None
+    assert await reopened._locate_request_for_decision(
+      tenant_storage_id="alice", approval_id="replacement-approval",
+      tool_call_id=request.tool_call_id, nonce="nonce-original",
+    ) is None
+    for other_tenant in ("bob", "tenant-public-id"):
+      assert await reopened.locate_request(
+        approval_id=request.approval_id, tenant_storage_id=other_tenant,
+      ) is None
+      assert await reopened._locate_request_for_decision(
+        tenant_storage_id=other_tenant, tool_call_id=request.tool_call_id,
+        nonce="nonce-original",
+      ) is None
+    assert await reopened.locate_request(
+      approval_id="absent", tenant_storage_id="alice",
+    ) is None
+    assert locator.job_id == "job-original"
+    binding, original_request = await reopened._read_executable_binding_for_executor(
+      job_id=locator.job_id, tool_call_id=locator.tool_call_id,
+      nonce="nonce-original", tenant_storage_id="alice",
+    )
+    assert binding.prepared_input == prepared.prepared_input
+    assert binding.credential_generation_ref == "grant-generation-original"
+    assert original_request.approval_id == request.approval_id
+    public = await reopened.get(request.approval_id)
+    assert public is not None
+    assert _approval_request_to_dict(public) == _approval_request_to_dict(request)
+    safe_projection = json.dumps({
+      "locator": asdict(locator),
+      "request": _approval_request_to_dict(public),
+    })
+    for private_value in (
+      "nonce-original", "secret-original-operand", "grant-generation-original",
+      "/workspace/original",
+    ):
+      assert private_value not in safe_projection
+
+  asyncio.run(case())
+
+
+@pytest.mark.parametrize("root_linked", [False, True], ids=["uncaptured-child", "sdk-root"])
+def test_safe_approval_locator_missing_capture_is_not_restorable_without_invented_job(
+  tmp_path: Path,
+  root_linked: bool,
+) -> None:
+  from dataclasses import asdict
+
+  async def case() -> None:
+    source = SQLiteApprovalStore(tmp_path / "source.sqlite3")
+    original, _ = await _persist_binding(source)
+    request = replace(original, session_id="job-original")
+    path = tmp_path / "uncaptured.sqlite3"
+    store = SQLiteApprovalStore(path)
+    await store.create(request)
+    # An owning root session alone does not identify an uncaptured child job.
+    arguments = await _root_turn_arguments(store)
+    await store.record_root_turn(**arguments)
+    if root_linked:
+      await store.link_root_turn_executable_binding(
+        job_id="job-original", turn_id="turn-original",
+        tool_call_id=request.tool_call_id, nonce="nonce-sdk-original",
+        tenant_storage_id="alice",
+      )
+    reopened = SQLiteApprovalStore(path)
+    locator = await reopened.locate_request(
+      approval_id=request.approval_id, tenant_storage_id="alice",
+    )
+    assert locator is not None
+    assert asdict(locator) == {
+      "approval_id": request.approval_id,
+      "tool_call_id": request.tool_call_id,
+      "job_id": "job-original" if root_linked else None,
+      "root_turn_id": "turn-original" if root_linked else None,
+      "executable_binding_state": "not_restorable",
+    }
+    decision_lookup = await reopened._locate_request_for_decision(
+      tenant_storage_id="alice", approval_id=request.approval_id,
+    )
+    assert decision_lookup is not None
+    durable_request, decision_locator, original_nonce = decision_lookup
+    assert _approval_request_to_dict(durable_request) == _approval_request_to_dict(request)
+    assert decision_locator == locator
+    assert original_nonce == ("nonce-sdk-original" if root_linked else None)
+    chat_lookup = await reopened._locate_request_for_decision(
+      tenant_storage_id="alice", tool_call_id=request.tool_call_id,
+      nonce="nonce-sdk-original",
+    )
+    assert chat_lookup == (decision_lookup if root_linked else None)
+    assert await reopened._locate_request_for_decision(
+      tenant_storage_id="alice", tool_call_id=request.tool_call_id,
+      nonce="replacement-nonce",
+    ) is None
+    assert await reopened._locate_request_for_decision(
+      tenant_storage_id="bob", approval_id=request.approval_id,
+    ) is None
+    assert await reopened.locate_request(
+      approval_id=request.approval_id, tenant_storage_id="bob",
+    ) is None
+    with pytest.raises(ApprovalExecutableBindingError) as missing:
+      await reopened._read_executable_binding_for_executor(
+        job_id="job-original", tool_call_id=request.tool_call_id,
+        nonce="nonce-sdk-original", tenant_storage_id="alice",
+      )
+    assert missing.value.code == "missing_binding"
+    public = await reopened.get(request.approval_id)
+    assert public is not None
+    assert _approval_request_to_dict(public) == _approval_request_to_dict(request)
+    assert "nonce-sdk-original" not in json.dumps(asdict(locator))
+    assert "grant-generation-original" not in json.dumps(asdict(locator))
+    assert "secret-original-operand" not in json.dumps(asdict(locator))
+
+  asyncio.run(case())

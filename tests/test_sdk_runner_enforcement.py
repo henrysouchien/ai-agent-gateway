@@ -20,17 +20,24 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog, SessionStore  # noqa: E402
 from agent_gateway import sdk_runner_approval  # noqa: E402
+from agent_gateway.admission import (
+  admit_root_turn,
+  capture_root_turn,
+  record_root_turn_admission,
+  root_context,
+)
 from agent_gateway.approval_policy import ApprovalDecision as PolicyApprovalDecision, ApprovalRequest, ApprovalRequestPayload, ApprovalState, RunContext, sha256_args  # noqa: E402
 from agent_gateway.approval_route import (
   DurableLocalApprovalRoute,
   NoApprovalRoute,
   ParentDelegatedApprovalRoute,
+  bind_session_approval_route,
 )
 from agent_gateway.autonomous_approval_channel import (
   AutonomousApprovalChannelChild,
 )
 from agent_gateway.approval_store import SQLiteApprovalStore  # noqa: E402
-from agent_gateway.approvals import _record_vote_and_unblock  # noqa: E402
+from agent_gateway.approvals import ApprovalActionError, _record_vote_and_unblock  # noqa: E402
 from agent_gateway.batch_approval_projection import (  # noqa: E402
   BatchApprovalProjectionRegistry,
   BatchApprovalScope,
@@ -41,8 +48,10 @@ from agent_gateway.skill_context import clear_current_skill, current_skill, set_
 from agent_gateway.skill_limits import ActiveSkillAdmission, SkillExecutionLimits  # noqa: E402
 from agent_gateway.single_user_policy import SingleUserApprovalPolicy  # noqa: E402
 from agent_gateway.sdk_runner_stream import ToolCallInfo  # noqa: E402
+from agent_gateway.sdk_runner import _SDKSegmentQueryIterator  # noqa: E402
 from agent_gateway.mcp_client import RegisteredMcpRawPatchAuthorization  # noqa: E402
 from agent_gateway.tool_dispatch_classification import ToolResultSettlement  # noqa: E402
+from agent_gateway.tool_dispatcher_approval_lifecycle import ApprovalPark  # noqa: E402
 from agent_gateway.tool_policy_registry import PlanDecision, PreparedToolCall  # noqa: E402
 from gateway_test_support.sdk_capability_execution_test_support import stub_sdk_capability_execution  # noqa: E402
 
@@ -156,14 +165,40 @@ def _install_fake_agent_sdk(
   monkeypatch: pytest.MonkeyPatch,
   iterator_factory: Callable[[Any, Any], Any] | None = None,
 ) -> types.SimpleNamespace:
-  state = types.SimpleNamespace(options=[], prompts=[])
+  state = types.SimpleNamespace(options=[], prompts=[], clients=[])
 
-  def _query(prompt: Any, options: Any):
-    state.prompts.append(prompt)
-    state.options.append(options)
-    if iterator_factory is not None:
-      return iterator_factory(prompt, options)
-    return _AsyncMessages([_sdk_result_message()])
+  class _ClaudeSDKClient:
+    def __init__(self, *, options: _ClaudeAgentOptions) -> None:
+      self.options = options
+      self.iterator: Any | None = None
+      self.connected = False
+      self.disconnected = False
+      state.clients.append(self)
+
+    async def connect(self) -> None:
+      self.connected = True
+
+    async def query(self, prompt: Any, session_id: str = "default") -> None:
+      state.prompts.append(prompt)
+      state.options.append(self.options)
+      self.iterator = (
+        iterator_factory(prompt, self.options)
+        if iterator_factory is not None
+        else _AsyncMessages([_sdk_result_message()])
+      )
+
+    def receive_response(self) -> Any:
+      assert self.iterator is not None
+      return self.iterator
+
+    async def disconnect(self) -> None:
+      if self.disconnected:
+        return
+      if self.iterator is not None:
+        await self.iterator.aclose()
+      self.disconnected = True
+
+  state.client_type = _ClaudeSDKClient
 
   module = types.ModuleType("claude_agent_sdk")
   module.__dict__.update({
@@ -172,7 +207,7 @@ def _install_fake_agent_sdk(
     "ClaudeAgentOptions": _ClaudeAgentOptions,
     "PermissionResultAllow": _PermissionResultAllow,
     "PermissionResultDeny": _PermissionResultDeny,
-    "query": _query,
+    "ClaudeSDKClient": _ClaudeSDKClient,
   })
   monkeypatch.setitem(sys.modules, "claude_agent_sdk", module)
   return state
@@ -887,17 +922,25 @@ def test_sdk_runner_user_denial_uses_ordinary_message(
   _run(_case())
 
 
-def test_sdk_runner_approval_expiry_interrupts_turn_instead_of_reading_as_denial(
+@pytest.mark.parametrize(
+  "ending",
+  ["normal", "eof", "transport_error", "cancel", "disconnect", "rebuild", "failed_result"],
+)
+@pytest.mark.parametrize("root_capture", ["absent", "current", "superseded"])
+def test_sdk_runner_transport_end_drains_detached_permission_before_release(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
+  ending: str,
+  root_capture: str,
 ) -> None:
-  _install_fake_agent_sdk(monkeypatch)
-
   class _Policy:
+    policy_id = "sdk-detached-permission-policy"
+    policy_version = "1"
     policy_bundle_hash = "test-policy"
 
     def __init__(self) -> None:
-      self.request: ApprovalRequest | None = None
+      self.decision_started = asyncio.Event()
+      self.release_decision = asyncio.Event()
 
     async def decide(
       self,
@@ -905,30 +948,523 @@ def test_sdk_runner_approval_expiry_interrupts_turn_instead_of_reading_as_denial
       payload: ApprovalRequestPayload,
       request: ApprovalRequest,
       run_context: RunContext,
-    ):
-      _ = payload, run_context
-      self.request = request
+    ) -> PolicyApprovalDecision:
+      if root_capture == "superseded" and not self.decision_started.is_set():
+        self.decision_started.set()
+        await self.release_decision.wait()
       return PolicyApprovalDecision(
         outcome="request_user_approval",
         reason="Tool requires approval",
-        expiry_seconds=0.2,
-        allow_persistent_grant=True,
+        expiry_seconds=600,
       )
 
     async def on_resolve(self, *, request: ApprovalRequest) -> None:
-      _ = request
-
-    async def revoke_persistent_grant(self, *, grant_id: str, reason: str) -> None:
-      _ = grant_id, reason
+      pass
 
     def role_authorized_for_class(self, *, decider_role: str | None, tool_class: str) -> bool:
-      _ = decider_role, tool_class
       return True
 
   async def _case() -> None:
-    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+    published = asyncio.Event()
+    replacement_published = asyncio.Event()
+    publication_count = 0
+    receiving = asyncio.Event()
+    transport_end = asyncio.Event()
+    handler_cancelled = asyncio.Event()
+    finish_handler = asyncio.Event()
+    permission_results: list[Any] = []
+    transport_releases: list[tuple[bool, bool]] = []
+    summaries: list[bool] = []
+    transport_error = RuntimeError("transport failed")
+    store = SQLiteApprovalStore(tmp_path / f"lifetime-{ending}.sqlite3")
+    session = SessionStore(ttl=3600).create_session(
+      api_key_hash="hash",
+      user_id="alice",
+    )
     policy = _Policy()
-    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    execution = stub_sdk_capability_execution()
+    route = bind_session_approval_route(session, store, policy)
+
+    async def record_turn():
+      context = root_context(
+        session, withheld_tools=frozenset(), research_file_id=None,
+      )
+      turn = await record_root_turn_admission(store, admit_root_turn(
+        context,
+        execution=execution,
+        tool_grant={
+          "tool_ids": context.tool_ids,
+          "withheld_tools": sorted(context.withheld),
+        },
+        approval_route=route,
+      ))
+      capture_root_turn(session, turn)
+      return turn
+
+    root_a = await record_turn() if root_capture != "absent" else None
+    root_b = None
+
+    class _ApprovalLog(EventLog):
+      def append(self, event: dict[str, Any]) -> Any:
+        nonlocal publication_count
+        entry = super().append(event)
+        if event.get("type") == "tool_approval_request":
+          published.set()
+          publication_count += 1
+          if publication_count == 2:
+            replacement_published.set()
+        return entry
+
+    class _DetachedPermissionIterator(_AsyncMessages):
+      def __init__(self, options: _ClaudeAgentOptions) -> None:
+        super().__init__([])
+        self.options = options
+        self.segment = len(iterators)
+        self.handler: asyncio.Task[Any] | None = None
+
+      async def __anext__(self) -> Any:
+        async def permission_handler() -> None:
+          try:
+            result = await self.options.kwargs["can_use_tool"](
+              "file_write",
+              {"path": "x"},
+              None,
+            )
+            permission_results.append(result)
+          except asyncio.CancelledError:
+            handler_cancelled.set()
+            await finish_handler.wait()
+            raise
+
+        self.handler = asyncio.create_task(permission_handler())
+        await published.wait()
+        receiving.set()
+        await transport_end.wait()
+        if ending == "rebuild":
+          if self.segment == 0:
+            runner._disallowed_tools.append("Read")
+          else:
+            await self.handler
+          result_message = _sdk_result_message()
+          result_message.session_id = "sdk-lifetime-session"
+          return result_message
+        if ending == "normal":
+          return _sdk_result_message()
+        if ending == "failed_result":
+          result_message = _sdk_result_message()
+          result_message.subtype = "error_during_execution"
+          result_message.is_error = True
+          result_message.result = "provider failed"
+          return result_message
+        if ending == "transport_error":
+          raise transport_error
+        raise StopAsyncIteration
+
+      async def aclose(self) -> None:
+        assert self.handler is not None
+        transport_releases.append((
+          self.handler.done(),
+          not session.pending_tools and not session.approval_queues,
+        ))
+        await super().aclose()
+        transport_end.set()
+
+    iterators: list[_DetachedPermissionIterator] = []
+
+    def query(_prompt: Any, options: _ClaudeAgentOptions) -> _DetachedPermissionIterator:
+      iterator = _DetachedPermissionIterator(options)
+      iterators.append(iterator)
+      return iterator
+
+    _install_fake_agent_sdk(monkeypatch, query)
+    event_log = _ApprovalLog()
+    runner = AgentSDKRunner(
+      event_log=event_log,
+      session_id=session.session_id,
+      sdk_config=AgentSDKConfig(
+        user_id="alice",
+        billing_mode="byok",
+        rate_table_version="unknown",
+      ),
+      capability_execution=execution,
+      system_prompt="test",
+      session=session,
+      approval_route=route,
+      on_session_summary=lambda _summary: summaries.append(
+        all(iterator.handler is not None and iterator.handler.done() for iterator in iterators)
+      ),
+    )
+    run_task = asyncio.create_task(
+      runner.run(messages=[{"role": "user", "content": "write"}])
+    )
+    disconnects: list[asyncio.Task[None]] = []
+    new_call_id: str | None = None
+    new_pending: dict[str, Any] | None = None
+    try:
+      if root_capture == "superseded":
+        await asyncio.wait_for(policy.decision_started.wait(), timeout=5)
+        root_b = await record_turn()
+        assert root_a is not None
+        assert root_b.turn_id != root_a.turn_id
+        policy.release_decision.set()
+      await asyncio.wait_for(receiving.wait(), timeout=5)
+      tool_call_id, pending = next(iter(session.pending_tools.items()))
+      approval_id = str(pending["approval_id"])
+      nonce = pending["nonce"]
+      approval_event = next(
+        entry.event for entry in event_log.entries
+        if entry.event.get("type") == "tool_approval_request"
+        and entry.event["tool_call_id"] == tool_call_id
+      )
+      assert approval_event["approval_id"] == approval_id
+      assert approval_event["nonce"] == nonce
+      if root_a is not None:
+        assert session.owner_user_id is not None
+        assert await SQLiteApprovalStore(store.path)._locate_root_turn_for_approval(
+          tenant_storage_id=session.owner_user_id, approval_id=approval_id,
+        ) == (session.session_id, tool_call_id, nonce, root_a.turn_id)
+      if ending == "cancel":
+        run_task.cancel()
+      elif ending == "disconnect":
+        disconnects = [
+          asyncio.create_task(runner.on_disconnect()),
+          asyncio.create_task(runner.on_disconnect()),
+        ]
+      else:
+        transport_end.set()
+      await asyncio.wait_for(handler_cancelled.wait(), timeout=5)
+      assert not run_task.done()
+      assert all(not task.done() for task in disconnects)
+      assert transport_releases == []
+      assert summaries == []
+      assert session.pending_tools == {}
+      assert session.approval_queues == {}
+      assert permission_results == []
+      if ending == "rebuild":
+        assert len(iterators) == 1
+      if ending == "disconnect":
+        run_task.cancel()
+      finish_handler.set()
+      if ending == "rebuild":
+        await asyncio.wait_for(replacement_published.wait(), timeout=5)
+        new_call_id, new_pending = next(iter(session.pending_tools.items()))
+        assert new_call_id != tool_call_id
+        await _record_vote_and_unblock(
+          target_session=session,
+          pending_entry=new_pending,
+          tool_call_id=new_call_id,
+          nonce=new_pending["nonce"],
+          decider_id="alice",
+          decider_role="owner",
+          approved=True,
+          allow_tool_type=False,
+          reason=None,
+          app_state=SimpleNamespace(
+            gateway_approval_store=store,
+            gateway_approval_policy=policy,
+          ),
+        )
+      if disconnects:
+        await asyncio.gather(*disconnects)
+      if root_a is not None and ending != "failed_result":
+        with pytest.raises(ApprovalPark) as parked:
+          await asyncio.wait_for(run_task, timeout=5)
+        assert type(parked.value) is ApprovalPark
+        assert (
+          parked.value.job_id,
+          parked.value.approval_id,
+          parked.value.original_tool_call_id,
+          parked.value.nonce,
+          parked.value.root_turn_id,
+        ) == (
+          session.session_id, approval_id, tool_call_id, nonce, root_a.turn_id,
+        )
+        if ending == "transport_error":
+          assert parked.value.__cause__ is transport_error
+      elif ending in {"cancel", "disconnect"}:
+        with pytest.raises(asyncio.CancelledError):
+          await asyncio.wait_for(run_task, timeout=5)
+      elif ending in {"normal", "rebuild"}:
+        await asyncio.wait_for(run_task, timeout=5)
+      else:
+        with pytest.raises(RuntimeError) as raised:
+          await asyncio.wait_for(run_task, timeout=5)
+        if ending == "transport_error":
+          assert raised.value is transport_error
+        if ending == "failed_result":
+          assert str(raised.value) == "agent_sdk_result_error: provider failed"
+      assert iterators[0].handler is not None
+      assert iterators[0].handler.cancelled()
+      assert transport_releases == [(True, True)] * (2 if ending == "rebuild" else 1)
+      assert summaries == [True]
+      if ending == "rebuild":
+        assert len(permission_results) == 1
+        assert permission_results[0].behavior == "allow"
+        assert iterators[1].handler is not None
+        assert not iterators[1].handler.cancelled()
+      else:
+        assert permission_results == []
+      stored = await store.get(approval_id)
+      assert stored is not None
+      assert stored.approval_id == approval_id
+      assert stored.state == "pending_user"
+      assert stored.tool_call_id == tool_call_id
+      if root_a is not None:
+        terminal_events = [
+          entry.event for entry in event_log.entries
+          if entry.event.get("type") == "stream_complete"
+        ]
+        if ending == "failed_result":
+          assert terminal_events == []
+          assert [
+            entry.event["error"] for entry in event_log.entries
+            if entry.event.get("type") == "error"
+          ] == ["agent_sdk_result_error: provider failed"]
+        else:
+          assert len(terminal_events) == 1
+          terminal = terminal_events[0]
+          assert terminal["terminal_disposition"] == "awaiting_approval"
+          assert {key: terminal[key] for key in (
+            "job_id", "approval_id", "original_tool_call_id", "root_turn_id",
+          )} == {
+            "job_id": session.session_id,
+            "approval_id": approval_id,
+            "original_tool_call_id": tool_call_id,
+            "root_turn_id": root_a.turn_id,
+          }
+          assert "nonce" not in terminal
+          assert nonce not in json.dumps(terminal)
+        assert session.owner_user_id is not None
+        reopened = SQLiteApprovalStore(store.path)
+        located = await reopened._locate_request_for_decision(
+          tenant_storage_id=session.owner_user_id,
+          approval_id=approval_id,
+        )
+        assert located is not None
+        durable_request, locator, original_nonce = located
+        assert durable_request.approval_id == approval_id
+        assert durable_request.state == "pending_user"
+        assert original_nonce == nonce
+        assert locator.job_id == session.session_id
+        assert locator.root_turn_id == root_a.turn_id
+        assert locator.executable_binding_state == "not_restorable"
+        assert await reopened.locate_request(
+          tenant_storage_id=session.owner_user_id, approval_id=approval_id,
+        ) == locator
+        assert await reopened._locate_root_turn_for_approval(
+          tenant_storage_id=session.owner_user_id, approval_id=approval_id,
+        ) == (session.session_id, tool_call_id, nonce, root_a.turn_id)
+        if ending == "rebuild":
+          assert new_call_id is not None and new_pending is not None
+          replacement = await reopened.get(str(new_pending["approval_id"]))
+          assert replacement is not None
+          assert replacement.state == "approved"
+          assert await reopened._locate_root_turn_for_approval(
+            tenant_storage_id=session.owner_user_id,
+            approval_id=replacement.approval_id,
+          ) == (
+            session.session_id, new_call_id, new_pending["nonce"], root_a.turn_id,
+          )
+        if root_b is not None:
+          later_turn = await reopened._read_root_turn_for_executor(
+            job_id=session.session_id,
+            turn_id=root_b.turn_id,
+            tenant_storage_id=session.owner_user_id,
+          )
+          assert later_turn is not None
+          assert later_turn.executable_refs == ()
+    finally:
+      finish_handler.set()
+      transport_end.set()
+      tasks: list[asyncio.Task[Any]] = [run_task, *disconnects]
+      tasks.extend(iterator.handler for iterator in iterators if iterator.handler is not None)
+      for task in tasks:
+        if not task.done():
+          task.cancel()
+      await asyncio.gather(*tasks, return_exceptions=True)
+
+  _run(_case())
+
+
+@pytest.mark.parametrize("startup_phase", ["connect", "query"])
+def test_sdk_runner_disconnect_drains_owned_client_startup_before_resource_release(
+  monkeypatch: pytest.MonkeyPatch,
+  startup_phase: str,
+) -> None:
+  state = _install_fake_agent_sdk(monkeypatch)
+
+  async def _case() -> None:
+    startup_started = asyncio.Event()
+    startup_cleaning_up = asyncio.Event()
+    finish_startup_cleanup = asyncio.Event()
+    startup_settled = asyncio.Event()
+    client_close_states: list[bool] = []
+
+    async def pause_startup() -> None:
+      try:
+        startup_started.set()
+        await asyncio.Event().wait()
+      finally:
+        startup_cleaning_up.set()
+        await finish_startup_cleanup.wait()
+        startup_settled.set()
+
+    class _StartingClient(state.client_type):
+      async def connect(self) -> None:
+        await super().connect()
+        if startup_phase == "connect":
+          await pause_startup()
+
+      async def query(self, prompt: Any, session_id: str = "default") -> None:
+        if startup_phase == "query":
+          await pause_startup()
+        await super().query(prompt, session_id)
+
+      async def disconnect(self) -> None:
+        client_close_states.append(startup_settled.is_set())
+        await super().disconnect()
+
+    monkeypatch.setattr(sys.modules["claude_agent_sdk"], "ClaudeSDKClient", _StartingClient)
+    runner = _make_runner()
+    run_task = asyncio.create_task(
+      runner.run(messages=[{"role": "user", "content": "hello"}])
+    )
+    disconnects: list[asyncio.Task[None]] = []
+    try:
+      await asyncio.wait_for(startup_started.wait(), timeout=5)
+      disconnects.append(asyncio.create_task(runner.on_disconnect()))
+      await asyncio.wait_for(startup_cleaning_up.wait(), timeout=5)
+      disconnects.append(asyncio.create_task(runner.on_disconnect()))
+      await asyncio.sleep(0)
+      disconnects[0].cancel()
+      await asyncio.sleep(0)
+      assert not run_task.done()
+      assert all(not task.done() for task in disconnects)
+      assert not state.clients[0].disconnected
+      finish_startup_cleanup.set()
+      with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(disconnects[0], timeout=5)
+      await asyncio.wait_for(disconnects[1], timeout=5)
+      with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(run_task, timeout=5)
+      assert startup_settled.is_set()
+      assert all(client_close_states)
+      assert state.clients[0].disconnected
+      assert state.prompts == []
+    finally:
+      finish_startup_cleanup.set()
+      tasks: list[asyncio.Task[Any]] = [run_task, *disconnects]
+      for task in tasks:
+        if not task.done():
+          task.cancel()
+      await asyncio.gather(*tasks, return_exceptions=True)
+
+  _run(_case())
+
+
+@pytest.mark.parametrize("cleanup_raises", [False, True])
+def test_sdk_runner_public_client_close_is_a_shared_resource_barrier(
+  monkeypatch: pytest.MonkeyPatch,
+  cleanup_raises: bool,
+) -> None:
+  state = _install_fake_agent_sdk(monkeypatch)
+
+  async def _case() -> None:
+    close_started = asyncio.Event()
+    finish_close = asyncio.Event()
+    close_error = RuntimeError("client disconnect failed")
+
+    class _ClosingClient(state.client_type):
+      async def disconnect(self) -> None:
+        close_started.set()
+        await finish_close.wait()
+        await super().disconnect()
+        if cleanup_raises:
+          raise close_error
+
+    monkeypatch.setattr(sys.modules["claude_agent_sdk"], "ClaudeSDKClient", _ClosingClient)
+    runner = _make_runner()
+    run_task = asyncio.create_task(
+      runner.run(messages=[{"role": "user", "content": "hello"}])
+    )
+    disconnects: list[asyncio.Task[None]] = []
+    try:
+      await asyncio.wait_for(close_started.wait(), timeout=5)
+      disconnects = [
+        asyncio.create_task(runner.on_disconnect()),
+        asyncio.create_task(runner.on_disconnect()),
+      ]
+      await asyncio.sleep(0)
+      assert not run_task.done()
+      assert all(not task.done() for task in disconnects)
+      assert not state.clients[0].disconnected
+      finish_close.set()
+      results = await asyncio.gather(run_task, *disconnects, return_exceptions=True)
+      if cleanup_raises:
+        assert all(result is close_error for result in results)
+      else:
+        assert results == [None, None, None]
+      assert state.clients[0].disconnected
+    finally:
+      finish_close.set()
+      tasks: list[asyncio.Task[Any]] = [run_task, *disconnects]
+      for task in tasks:
+        if not task.done():
+          task.cancel()
+      await asyncio.gather(*tasks, return_exceptions=True)
+
+  _run(_case())
+
+
+def test_sdk_runner_external_disconnect_drains_self_closing_permission_handler(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  state = _install_fake_agent_sdk(monkeypatch)
+
+  async def _case() -> None:
+    transport_closing = asyncio.Event()
+    finish_transport_close = asyncio.Event()
+    handler_cleaning_up = asyncio.Event()
+    finish_handler_cleanup = asyncio.Event()
+    store = SQLiteApprovalStore(tmp_path / "self-closing-permission.sqlite3")
+    session = SessionStore(ttl=3600).create_session(
+      api_key_hash="hash",
+      user_id="alice",
+    )
+
+    class _Policy:
+      policy_bundle_hash = "test-policy"
+
+      async def decide(
+        self,
+        *,
+        payload: ApprovalRequestPayload,
+        request: ApprovalRequest,
+        run_context: RunContext,
+      ) -> PolicyApprovalDecision:
+        try:
+          await runner.on_disconnect()
+          await asyncio.Event().wait()
+        finally:
+          await runner.on_disconnect()
+          handler_cleaning_up.set()
+          await finish_handler_cleanup.wait()
+        return PolicyApprovalDecision(
+          outcome="request_user_approval",
+          reason="Tool requires approval",
+          expiry_seconds=600,
+        )
+
+      async def on_resolve(self, *, request: ApprovalRequest) -> None:
+        pass
+
+    class _ClosingClient(state.client_type):
+      async def disconnect(self) -> None:
+        transport_closing.set()
+        await finish_transport_close.wait()
+        await super().disconnect()
+
     runner = AgentSDKRunner(
       event_log=EventLog(),
       session_id=session.session_id,
@@ -940,33 +1476,175 @@ def test_sdk_runner_approval_expiry_interrupts_turn_instead_of_reading_as_denial
       capability_execution=stub_sdk_capability_execution(),
       system_prompt="test",
       session=session,
-      approval_route=DurableLocalApprovalRoute(
-        store,
-        policy,
-        session,
-      ),
-      run_context=RunContext(
-        user_id="alice",
-        request_id="request-1",
-        session_id=session.session_id,
-        channel="web",
-      ),
+      approval_route=DurableLocalApprovalRoute(store, _Policy(), session),
+    )
+    client = _ClosingClient(options=_ClaudeAgentOptions())
+    await client.connect()
+    segment = _SDKSegmentQueryIterator(
+      runner=runner,
+      sdk_module=sys.modules["claude_agent_sdk"],
+      initial_prompt="test",
+      options_kwargs={},
+    )
+    segment._client = client
+    runner._query_iter = segment
+    handler = asyncio.create_task(
+      runner._can_use_tool_callback("file_write", {"path": "x"}, None)
+    )
+    external: asyncio.Task[None] | None = None
+    second_external: asyncio.Task[None] | None = None
+    try:
+      await asyncio.wait_for(handler_cleaning_up.wait(), timeout=5)
+      external = asyncio.create_task(runner.on_disconnect())
+      second_external = asyncio.create_task(runner.on_disconnect())
+      await asyncio.sleep(0)
+      assert not external.done()
+      assert not second_external.done()
+      assert not handler.done()
+      assert not transport_closing.is_set()
+      assert not client.disconnected
+      finish_handler_cleanup.set()
+      await asyncio.wait_for(transport_closing.wait(), timeout=5)
+      assert handler.done()
+      assert not external.done()
+      assert not second_external.done()
+      assert not client.disconnected
+      finish_transport_close.set()
+      await asyncio.wait_for(
+        asyncio.gather(external, second_external),
+        timeout=5,
+      )
+      assert client.disconnected
+      with pytest.raises(asyncio.CancelledError):
+        await handler
+    finally:
+      finish_transport_close.set()
+      finish_handler_cleanup.set()
+      tasks: list[asyncio.Task[Any]] = [handler]
+      if external is not None:
+        tasks.append(external)
+      if second_external is not None:
+        tasks.append(second_external)
+      for task in tasks:
+        if not task.done():
+          task.cancel()
+      await asyncio.gather(*tasks, return_exceptions=True)
+
+  _run(_case())
+
+
+@pytest.mark.parametrize("cleanup_raises", [False, True])
+def test_sdk_runner_disconnect_drain_survives_reentrant_cleanup_and_caller_cancellation(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  cleanup_raises: bool,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+
+  class _Policy:
+    policy_bundle_hash = "test-policy"
+
+    async def decide(
+      self,
+      *,
+      payload: ApprovalRequestPayload,
+      request: ApprovalRequest,
+      run_context: RunContext,
+    ) -> PolicyApprovalDecision:
+      return PolicyApprovalDecision(
+        outcome="request_user_approval",
+        reason="Tool requires approval",
+        expiry_seconds=600,
+      )
+
+    async def on_resolve(self, *, request: ApprovalRequest) -> None:
+      pass
+
+  async def _case() -> None:
+    published = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    finish_cleanup = asyncio.Event()
+    cleanup_error = RuntimeError("permission cleanup failed")
+    store = SQLiteApprovalStore(tmp_path / "reentrant-lifetime.sqlite3")
+    session = SessionStore(ttl=3600).create_session(
+      api_key_hash="hash",
+      user_id="alice",
     )
 
-    # Nobody ever votes: the queue wait must expire.
-    denied = await runner._can_use_tool_callback("file_write", {"path": "x"}, None)
+    class _ApprovalLog(EventLog):
+      def append(self, event: dict[str, Any]) -> Any:
+        entry = super().append(event)
+        if event.get("type") == "tool_approval_request":
+          published.set()
+        return entry
 
-    assert denied.behavior == "deny"
-    assert denied.interrupt is True
-    assert "approval_timeout" in denied.message
-    assert "user denied" not in denied.message
-    assert session.pending_tools == {}
-    assert session.approval_queues == {}
+    runner = AgentSDKRunner(
+      event_log=_ApprovalLog(),
+      session_id=session.session_id,
+      sdk_config=AgentSDKConfig(
+        user_id="alice",
+        billing_mode="byok",
+        rate_table_version="unknown",
+      ),
+      capability_execution=stub_sdk_capability_execution(),
+      system_prompt="test",
+      session=session,
+      approval_route=DurableLocalApprovalRoute(store, _Policy(), session),
+    )
+    original_wait = runner._await_user_approval_via_pending_tools
 
-    assert policy.request is not None
-    stored = await store.get(policy.request.approval_id)
-    assert stored is not None
-    assert stored.state == "expired"
+    async def wait_with_cleanup(*args: Any, **kwargs: Any) -> Any:
+      try:
+        return await original_wait(*args, **kwargs)
+      finally:
+        await runner.on_disconnect()
+        cleanup_started.set()
+        await finish_cleanup.wait()
+        if cleanup_raises:
+          raise cleanup_error
+
+    runner._await_user_approval_via_pending_tools = wait_with_cleanup
+    handler = asyncio.create_task(
+      runner._can_use_tool_callback("file_write", {"path": "x"}, None)
+    )
+    disconnects: list[asyncio.Task[None]] = []
+    try:
+      await asyncio.wait_for(published.wait(), timeout=5)
+      approval_id = str(next(iter(session.pending_tools.values()))["approval_id"])
+      disconnects.append(asyncio.create_task(runner.on_disconnect()))
+      await asyncio.wait_for(cleanup_started.wait(), timeout=5)
+      disconnects.append(asyncio.create_task(runner.on_disconnect()))
+      await asyncio.sleep(0)
+      disconnects[0].cancel()
+      await asyncio.sleep(0)
+      disconnects[0].cancel()
+      await asyncio.sleep(0)
+      assert not handler.done()
+      assert all(not task.done() for task in disconnects)
+      assert session.pending_tools == {}
+      assert session.approval_queues == {}
+      finish_cleanup.set()
+      if cleanup_raises:
+        for task in [handler, *disconnects]:
+          with pytest.raises(RuntimeError) as raised:
+            await asyncio.wait_for(task, timeout=5)
+          assert raised.value is cleanup_error
+      else:
+        with pytest.raises(asyncio.CancelledError):
+          await asyncio.wait_for(disconnects[0], timeout=5)
+        await asyncio.wait_for(disconnects[1], timeout=5)
+        with pytest.raises(asyncio.CancelledError):
+          await handler
+      stored = await store.get(approval_id)
+      assert stored is not None
+      assert stored.state == "pending_user"
+    finally:
+      finish_cleanup.set()
+      tasks = [handler, *disconnects]
+      for task in tasks:
+        if not task.done():
+          task.cancel()
+      await asyncio.gather(*tasks, return_exceptions=True)
 
   _run(_case())
 
@@ -978,7 +1656,7 @@ def test_sdk_runner_approval_expiry_interrupts_turn_instead_of_reading_as_denial
     ("denied", False, "deny"),
   ],
 )
-def test_sdk_runner_approval_timeout_uses_shared_durable_winner(
+def test_sdk_runner_connected_vote_settles_original_callback_once(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
   winner_state: ApprovalState,
@@ -1001,20 +1679,33 @@ def test_sdk_runner_approval_timeout_uses_shared_durable_winner(
       return PolicyApprovalDecision(
         outcome="request_user_approval",
         reason="Tool requires approval",
-        expiry_seconds=0.01,
+        expiry_seconds=600,
       )
 
     async def on_resolve(self, *, request: ApprovalRequest) -> None:
       _ = request
 
+    def role_authorized_for_class(self, *, decider_role: str | None, tool_class: str) -> bool:
+      return True
+
   async def _case() -> None:
+    published = asyncio.Event()
+
+    class _ApprovalLog(EventLog):
+      def append(self, event: dict[str, Any]) -> Any:
+        entry = super().append(event)
+        if event.get("type") == "tool_approval_request":
+          published.set()
+        return entry
+
     store = SQLiteApprovalStore(tmp_path / f"winner-{winner_state}.sqlite3")
     session = SessionStore(ttl=3600).create_session(
       api_key_hash="hash",
       user_id="alice",
     )
+    policy = _Policy()
     runner = AgentSDKRunner(
-      event_log=EventLog(),
+      event_log=_ApprovalLog(),
       session_id=session.session_id,
       sdk_config=AgentSDKConfig(
         user_id="alice",
@@ -1026,7 +1717,7 @@ def test_sdk_runner_approval_timeout_uses_shared_durable_winner(
       session=session,
       approval_route=DurableLocalApprovalRoute(
         store,
-        _Policy(),
+        policy,
         session,
       ),
     )
@@ -1034,41 +1725,44 @@ def test_sdk_runner_approval_timeout_uses_shared_durable_winner(
     callback_task = asyncio.create_task(
       runner._can_use_tool_callback("file_write", {"path": "x"}, None)
     )
-    for _ in range(100):
-      if session.pending_tools:
-        break
-      await asyncio.sleep(0.001)
-    else:
-      raise AssertionError("approval request was not queued")
+    await asyncio.wait_for(published.wait(), timeout=5)
 
     tool_call_id, pending = next(iter(session.pending_tools.items()))
     request = await store.get(str(pending["approval_id"]))
     assert request is not None
-    await store.transition_state(
-      request.approval_id,
-      winner_state,
-      expected_state_version=request.state_version,
-      decider_id="alice",
-      decider_role="owner",
-      decision_reason="race winner",
-    )
-    await asyncio.sleep(0.12)
-    session.approval_queues[tool_call_id].put_nowait({
-      "approval_id": request.approval_id,
+    vote: dict[str, Any] = {
+      "target_session": session,
+      "pending_entry": pending,
+      "tool_call_id": tool_call_id,
+      "nonce": pending["nonce"],
+      "decider_id": "alice",
+      "decider_role": "owner",
       "approved": approved,
       "allow_tool_type": False,
-    })
+      "reason": None,
+      "app_state": SimpleNamespace(
+        gateway_approval_store=store,
+        gateway_approval_policy=policy,
+      ),
+    }
+    await _record_vote_and_unblock(**vote)
+    with pytest.raises(ApprovalActionError) as duplicate:
+      await _record_vote_and_unblock(**vote)
+    assert duplicate.value.status_code == 409
 
     result = await callback_task
     assert result.behavior == expected_behavior
     assert not getattr(result, "interrupt", False)
     assert session.pending_tools == {}
     assert session.approval_queues == {}
+    stored = await store.get(request.approval_id)
+    assert stored is not None
+    assert stored.state == winner_state
 
   _run(_case())
 
 
-def test_sdk_batch_admission_cancel_before_pending_publish_aborts_durable_row(
+def test_sdk_batch_admission_disconnect_before_pending_publish_aborts_durable_row(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
 ) -> None:
@@ -1171,7 +1865,7 @@ def test_sdk_batch_admission_cancel_before_pending_publish_aborts_durable_row(
       runner._can_use_tool_callback("file_write", {"path": "x"}, None)
     )
     await pending_committed.wait()
-    callback_task.cancel()
+    await runner.on_disconnect()
     with pytest.raises(asyncio.CancelledError):
       await callback_task
 

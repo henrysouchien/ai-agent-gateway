@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from dataclasses import replace
 import pytest
 
 from agent_gateway.autonomous_capability_handoff import (
@@ -28,6 +29,7 @@ from agent_gateway.claim_signing_authority import (
 )
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 
+from agent_gateway.approval_store import SQLiteApprovalStore
 from gateway_test_support.control_plane_identity import fake_identity_resolver, fake_mcp_user_key_lookup
 
 
@@ -101,6 +103,7 @@ def _registry(
   *,
   child_source: str,
   user_event_bus: Any | None = None,
+  approval_store: SQLiteApprovalStore | None = None,
 ) -> AutonomousRegistry:
   registry = AutonomousRegistry(
     api_dir=_REPO_API_DIR,
@@ -109,6 +112,7 @@ def _registry(
     log_dir=tmp_path,
     max_running=1,
     user_event_bus=user_event_bus,
+    approval_store=approval_store,
     service_provider_handles={
       "anthropic": _service_credential_handle(),
     },
@@ -914,3 +918,249 @@ time.sleep(1.5)
   asyncio.run(case())
 
 
+_PRIVATE_CAPTURE_CHILD = """
+import json,os
+from agent_gateway.autonomous_event_channel import (
+  AUTONOMOUS_EVENT_CHANNEL_FD_ENV, adopt_inherited_autonomous_event_channel,
+)
+from agent_gateway.autonomous_launch_envelope import AutonomousSessionAuthority
+from agent_gateway.admission import root_context
+from agent_gateway.approval_policy import (
+  ApprovalRequest, approval_request_projection, sha256_args, utc_now,
+)
+from agent_gateway.providers.anthropic_oauth import is_anthropic_generation_ref
+envelope=json.loads(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE"])
+channel=adopt_inherited_autonomous_event_channel(
+  int(os.environ[AUTONOMOUS_EVENT_CHANNEL_FD_ENV]), channel_id=envelope["channel_id"],
+)
+session=AutonomousSessionAuthority.from_receipt(
+  envelope["session_authority"],
+).to_gateway_session()
+context=root_context(session, withheld_tools=frozenset(), research_file_id=None)
+admitted=envelope.get("admitted_context")
+tenant_storage_id=admitted["tenant"]["storage_id"] if admitted else context.tenant.storage_id
+job_id=envelope["task_id"] if admitted else context.job_id
+bind=envelope["capability_bind"]
+generation=bind["credential_ref"] if is_anthropic_generation_ref(bind["credential_ref"]) else None
+channel.start(timeout_seconds=20)
+requests=[]
+for index in (1,2):
+  tool_call_id=f"private-call-{index}"
+  approval_id=f"private-approval-{index}"
+  nonce=f"original-private-nonce-{index}"
+  prepared={"account":"original-account", "quantity":index, "secret":"private-"+"canary-"+str(index)}
+  request=ApprovalRequest(
+    approval_id=approval_id,tool_call_id=tool_call_id,parent_approval_id=None,
+    approval_chain_id=approval_id,request_id="child-projected-run",session_id=session.session_id,
+    run_id="child-projected-run",user_id=session.user_id,profile="analyst",channel="cli",
+    tool_name="place_order",tool_class="irreversible",tool_args_redacted={"quantity":index},
+    args_hash=sha256_args(prepared),reason="live order",blast_radius_summary="trade",
+    state="pending_user",requested_at=utc_now(),policy_id="private-test",policy_version="1",
+    policy_bundle_hash="private-test-bundle",
+  )
+  private={
+    "approval_id":approval_id,"tool_call_id":tool_call_id,"nonce":nonce,"tool_name":"place_order",
+    "prepared_input":prepared,"exact_backend":"docker","job_id":job_id,
+    "tenant_storage_id":tenant_storage_id,"credential_generation_ref":generation,
+    "dispatch_context":{
+      "call_index":index,"advertised_tool_names":["place_order"],"skill_run_id":"original-skill",
+      "step_id":"original-step","workspace_dir":"original-workspace","batch_id":None,
+      "capture_readable_resource_snapshot":False,"allow_uncertain_mcp_replay":False,
+    },
+  }
+  PRIVATE_PAYLOAD_OVERRIDE
+  channel.send_private_executable_capture(private,timeout_seconds=20)
+  requests.append({
+    "type":"tool_approval_request","approval_id":approval_id,"tool_call_id":tool_call_id,
+    "nonce":nonce,"tool_name":"place_order","tool_input":{"quantity":index},
+    "durable_request":approval_request_projection(request),
+  })
+# Interleaved asks must consume their own original operands, not the last capture.
+for event in reversed(requests):
+  channel.send_event(event,timeout_seconds=20)
+channel.complete({"type":"stream_complete","terminal_disposition":"completed"},timeout_seconds=20)
+"""
+
+
+@pytest.mark.parametrize("admitted_child", [False, True])
+def test_private_child_operands_are_cold_readable_before_publication(
+  tmp_path: Path,
+  admitted_child: bool,
+) -> None:
+  async def case() -> None:
+    store_path = tmp_path / "approvals.sqlite3"
+    store = SQLiteApprovalStore(store_path)
+    observed: list[dict[str, Any]] = []
+
+    class PublicationObserver:
+      async def publish(self, user_id, control_run_id, event) -> None:
+        if event.get("type") == "tool_approval_request":
+          cold = SQLiteApprovalStore(store_path)
+          actual_child = registry._find_by_control_run_id(control_run_id)
+          assert actual_child is not None
+          binding, request = await cold._read_executable_binding_for_executor(
+            job_id=actual_child.task_id,
+            tool_call_id=event["tool_call_id"],
+            nonce=event["nonce"],
+            tenant_storage_id="owner-1",
+          )
+          index = int(event["tool_call_id"].rsplit("-", 1)[1])
+          assert dict(binding.prepared_input) == {
+            "account": "original-account",
+            "quantity": index,
+            "secret": f"private-canary-{index}",
+          }
+          assert binding.exact_backend == "docker"
+          assert request.request_id == control_run_id
+          assert request.channel == "cli"
+          observed.append(event)
+
+      async def cleanup_run(self, user_id, control_run_id) -> None:
+        return None
+
+    registry = _registry(
+      tmp_path / "runs",
+      child_source=_PRIVATE_CAPTURE_CHILD.replace("PRIVATE_PAYLOAD_OVERRIDE", "pass"),
+      user_event_bus=PublicationObserver(),
+      approval_store=store,
+    )
+    if admitted_child:
+      from agent_workflow_contracts import ResolvedAuthority
+      from agent_workflow_contracts.models import (
+        AdmittedContextWire, AdmittedLineage, AdmittedResearchBinding, AdmittedTenant, ToolGrant,
+      )
+      from agent_gateway.admission import AdmittedContext
+      from agent_gateway.approval_route import NoApprovalRoute
+
+      def admitted_binding(request):
+        binding = _binding(request)
+        handle = CredentialHandle(
+          handle_id="anthropic-generation-private-source",
+          provider="anthropic", principal="service", tenant_id=_TENANT_ID, actor_id=None,
+        )
+        binding = replace(
+          binding,
+          bind=binding.bind.model_copy(update={"credential_ref": handle.handle_id}),
+          materialized_credential=MaterializedCredential(
+            handle=handle, auth_config=binding.materialized_credential.auth_config,
+          ),
+        )
+        wire = AdmittedContextWire(
+          tenant=AdmittedTenant(tenant_id=_TENANT_ID, storage_id="owner-1", role="owner"),
+          research_binding=AdmittedResearchBinding(),
+          capability_bind=binding.bind,
+          children=(),
+          tool_grant=(),
+          budget_share=None,
+          env_projection=("PATH",),
+          approval_route="parent_delegated",
+          handle_grants=(),
+          placement="local_stub",
+          lineage=AdmittedLineage(parent_job_id="actual-parent-not-child-job", depth=1),
+        )
+        admitted = AdmittedContext(
+          wire=wire,
+          tool_authority=ResolvedAuthority(
+            operation_name="private.capture",
+            grant=ToolGrant(grant_id="private-grant", tools=(), digest="sha256:" + "0" * 64),
+          ),
+          approval_route=NoApprovalRoute(),
+        )
+        return replace(binding, admitted=admitted)
+
+      registry._autonomous_capability_binding_resolver = admitted_binding
+    payload = await _start(registry)
+    status = await registry.wait(payload["task_id"], timeout_sec=60)
+    assert status["state"] == "completed"
+    assert len(observed) == 2
+    record = registry._tasks[payload["task_id"]]
+    assert record.channel is None
+    cold = SQLiteApprovalStore(store_path)
+    for index in (1, 2):
+      binding, request = await cold._read_executable_binding_for_executor(
+        job_id=record.task_id,
+        tool_call_id=f"private-call-{index}",
+        nonce=f"original-private-nonce-{index}",
+        tenant_storage_id="owner-1",
+      )
+      assert request.user_id == "owner-1"
+      assert request.channel == "cli"
+      assert binding.job_id != "actual-parent-not-child-job"
+      assert binding.credential_generation_ref == (
+        "anthropic-generation-private-source" if admitted_child else None
+      )
+      assert dict(binding.dispatch_context) == {
+        "call_index": index, "advertised_tool_names": ("place_order",),
+        "skill_run_id": "original-skill", "step_id": "original-step",
+        "workspace_dir": "original-workspace", "batch_id": None,
+        "capture_readable_resource_snapshot": False, "allow_uncertain_mcp_replay": False,
+      }
+    with cold._connection() as conn:
+      assert conn.execute("SELECT COUNT(*) FROM approval_executable_bindings").fetchone()[0] == 2
+    public_bytes = json.dumps(record.event_lines).encode()
+    public_bytes += b"".join(item.frame_bytes for item in record.event_channel_records)
+    for path in (record.log_path, record.events_path):
+      if path is not None and path.exists():
+        public_bytes += path.read_bytes()
+    assert b"private-canary" not in public_bytes
+    assert b"private_executable_capture" not in public_bytes
+    assert b"private-canary" not in registry._manifest_path(record.task_id).read_bytes()
+
+  asyncio.run(case())
+
+
+@pytest.mark.parametrize("field,replacement", [
+  ("job_id", "parent-job-not-child"),
+  ("tenant_storage_id", "another-owner"),
+  ("credential_generation_ref", "anthropic-generation-another-source"),
+  ("nonce", "different-from-public-nonce"),
+  ("tool_name", "different-from-public-tool"),
+  ("approval_id", "different-from-public-approval"),
+  ("tool_call_id", "different-from-public-call"),
+])
+def test_private_capture_rejects_forged_child_identity_without_storing_request(
+  tmp_path: Path,
+  field: str,
+  replacement: str,
+) -> None:
+  async def case() -> None:
+    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+    source = _PRIVATE_CAPTURE_CHILD.replace(
+      "PRIVATE_PAYLOAD_OVERRIDE", f"private[{field!r}]={replacement!r}",
+    ).replace("for index in (1,2):", "for index in (1,):")
+    registry = _registry(tmp_path / "runs", child_source=source, approval_store=store)
+    payload = await _start(registry)
+    status = await registry.wait(payload["task_id"], timeout_sec=60)
+    assert status["state"] == "failed"
+    assert await store.get_by_tool_call_id("private-call-1") is None
+    with store._connection() as conn:
+      assert conn.execute("SELECT COUNT(*) FROM approval_executable_bindings").fetchone()[0] == 0
+    assert "private-canary" not in json.dumps(status)
+    record = registry._tasks[payload["task_id"]]
+    assert not any(
+      event.get("type") == "tool_approval_request" for event in record.event_lines or ()
+    )
+
+  asyncio.run(case())
+
+
+def test_private_capture_cannot_overwrite_pending_original_call(tmp_path: Path) -> None:
+  async def case() -> None:
+    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+    source = _PRIVATE_CAPTURE_CHILD.replace(
+      "PRIVATE_PAYLOAD_OVERRIDE", "pass",
+    ).replace(
+      "channel.send_private_executable_capture(private,timeout_seconds=20)",
+      "channel.send_private_executable_capture(private,timeout_seconds=20)\n"
+      "  private['prepared_input']['quantity']=999\n"
+      "  channel.send_private_executable_capture(private,timeout_seconds=20)",
+    )
+    registry = _registry(tmp_path / "runs", child_source=source, approval_store=store)
+    payload = await _start(registry)
+    status = await registry.wait(payload["task_id"], timeout_sec=60)
+    assert status["state"] == "failed"
+    assert await store.get_by_tool_call_id("private-call-1") is None
+    with store._connection() as conn:
+      assert conn.execute("SELECT COUNT(*) FROM approval_executable_bindings").fetchone()[0] == 0
+
+  asyncio.run(case())
