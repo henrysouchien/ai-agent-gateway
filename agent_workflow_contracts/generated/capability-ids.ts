@@ -30,6 +30,7 @@ export const CAPABILITY_IDS = [
   "risk.interpretation",
   "risk.overview_editorial",
   "risk.peer_generation",
+  "session.compact",
   "session.driver",
 ] as const;
 

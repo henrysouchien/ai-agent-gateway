@@ -1750,7 +1750,6 @@ def test_delete_running_control_chat_cancels_background_task_and_disconnects() -
     assert session is not None
     assert session.stream_active is True
     assert any(key.startswith("control_chat_turn:") for key in session.control_chat_tasks)
-    assert not any(key.startswith("control_chat_turn:") for key in session.background_tasks)
 
     deleted = client.delete(f"/api/control/runs/{chat_session_id}", headers=_headers(control))
     assert deleted.status_code == 200, deleted.text

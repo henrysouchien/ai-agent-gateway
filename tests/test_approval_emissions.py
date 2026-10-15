@@ -17,8 +17,7 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.approval_route import DurableLocalApprovalRoute, ParentDelegatedApprovalRoute
-from agent_gateway.autonomous_approval_channel import AutonomousApprovalChannelChild
+from agent_gateway.approval_route import DurableLocalApprovalRoute
 from agent_gateway import SessionStore
 from agent_gateway.approval_policy import (
   ApprovalDecision as PolicyApprovalDecision,
@@ -123,8 +122,6 @@ def _dispatcher(
   needs_approval=None,
   request_approval=None,
   interceptors=(),
-  should_avoid_permission_prompts: bool = False,
-  on_headless_ask=None,
 ) -> ToolDispatcher:
   return ToolDispatcher(
     capability_bind=TEST_CAPABILITY_BIND,
@@ -135,8 +132,6 @@ def _dispatcher(
     request_approval=request_approval,
     event_log=event_log,
     interceptors=interceptors,
-    should_avoid_permission_prompts=should_avoid_permission_prompts,
-    on_headless_ask=on_headless_ask,
   )
 
 
@@ -216,110 +211,6 @@ def test_dynamic_ask_user_approval_emits_without_persistent_cache_install() -> N
   asyncio.run(_run())
 
 
-def test_approval_timeout_emits_decided_event() -> None:
-  async def _run() -> None:
-    event_log = EventLog()
-
-    async def timeout(_request):
-      return None
-
-    dispatcher = _dispatcher(
-      event_log,
-      needs_approval=lambda _name, _tool_input, _qualifier: True,
-      request_approval=timeout,
-    )
-
-    result, error = await dispatcher.dispatch("tool-1", "write_file", {"path": "x"})
-
-    assert result is None
-    assert error == {"code": "approval_timeout", "message": "User did not respond within timeout"}
-    events = _decision_events(event_log)
-    assert len(events) == 1
-    assert events[0]["decision_source"] == "approval_timeout"
-    assert events[0]["outcome"] == "timeout"
-
-  asyncio.run(_run())
-
-
-@pytest.mark.usefixtures("owner_session_host_policy")
-def test_lifecycle_approval_request_times_out_without_user_response(monkeypatch, tmp_path: Path) -> None:
-  async def _run() -> None:
-    from agent_gateway import approval_settings
-
-    monkeypatch.setattr(approval_settings, "approval_wait_seconds", lambda: 0.01)
-
-    class _Policy:
-      policy_bundle_hash = "test-policy"
-
-      async def decide(
-        self,
-        *,
-        payload: ApprovalRequestPayload,
-        request: ApprovalRequest,
-        run_context: RunContext,
-      ):
-        _ = payload, request, run_context
-        return PolicyApprovalDecision(
-          outcome="request_user_approval",
-          reason="Tool requires approval",
-          expiry_seconds=600,
-          allow_persistent_grant=True,
-        )
-
-      async def on_resolve(self, *, request: ApprovalRequest) -> None:
-        _ = request
-
-      async def revoke_persistent_grant(self, *, grant_id: str, reason: str) -> None:
-        _ = grant_id, reason
-
-      def role_authorized_for_class(self, *, decider_role: str | None, tool_class: str) -> bool:
-        _ = decider_role, tool_class
-        return True
-
-    event_log = EventLog()
-    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
-    session = SessionStore(ttl=3600).create_session(
-      api_key_hash="hash",
-      user_id="alice",
-      role="owner",
-    )
-    dispatcher = ToolDispatcher(
-      capability_bind=TEST_CAPABILITY_BIND,
-      mcp_client=_NullMcpClient(),
-      local_tool_handlers={"write_file": _ok_handler},
-      role=session.role,
-      needs_approval=lambda _name, _tool_input, _qualifier: True,
-      event_log=event_log,
-      approval_route=DurableLocalApprovalRoute(
-        store,
-        _Policy(),
-        session,
-      ),
-      run_context=RunContext(
-        user_id="alice",
-        request_id="request-1",
-        session_id=session.session_id,
-        channel="web",
-      ),
-    )
-
-    result, error = await dispatcher.dispatch("tool-1", "write_file", {"path": "x"})
-
-    assert result is None
-    assert error == {"code": "approval_timeout", "message": "User did not respond within timeout"}
-    approval_events = [
-      entry.event for entry in event_log.entries if entry.event.get("type") == "tool_approval_request"
-    ]
-    assert len(approval_events) == 1
-    stored = await store.get(approval_events[0]["approval_id"])
-    assert stored is not None
-    assert stored.state == "expired"
-    events = _decision_events(event_log)
-    assert len(events) == 1
-    assert events[0]["decision_source"] == "approval_timeout"
-    assert events[0]["outcome"] == "timeout"
-
-  asyncio.run(_run())
 
 
 @pytest.mark.usefixtures("owner_session_host_policy")
@@ -493,7 +384,6 @@ def _background_child_dispatcher(
   tool_name: str,
   tool_class: ToolClass,
   executed: list[str],
-  delegated: bool = False,
 ) -> tuple[ToolDispatcher, SQLiteApprovalStore, Any]:
   async def _handler(_tool_input: dict[str, Any], **_kwargs: Any):
     executed.append(tool_name)
@@ -513,12 +403,7 @@ def _background_child_dispatcher(
     role=session.role,
     needs_approval=lambda _name, _tool_input, _qualifier: True,
     event_log=event_log,
-    should_avoid_permission_prompts=True,
-    approval_route=(
-      ParentDelegatedApprovalRoute(object.__new__(AutonomousApprovalChannelChild), session)
-      if delegated
-      else DurableLocalApprovalRoute(store, policy, session)
-    ),
+    approval_route=DurableLocalApprovalRoute(store, policy, session),
     run_context=RunContext(
       user_id="alice",
       request_id="request-1",
@@ -559,79 +444,7 @@ def test_background_child_static_door_is_auto_approved(tmp_path: Path) -> None:
   asyncio.run(_run())
 
 
-# The parent-delegated route (an autonomous run's `background: true` child) asks
-# its parent instead of a local ledger; headless still denies the ask without a
-# card rather than waiting on the parent.
-@pytest.mark.parametrize("delegated", [False, True])
-@pytest.mark.usefixtures("owner_session_host_policy")
-def test_background_child_money_door_is_denied_without_a_card(tmp_path: Path, delegated: bool) -> None:
-  async def _run() -> None:
-    event_log = EventLog()
-    executed: list[str] = []
-    dispatcher, store, session = _background_child_dispatcher(
-      tmp_path,
-      event_log,
-      tool_name="place_order",
-      tool_class="irreversible",
-      executed=executed,
-      delegated=delegated,
-    )
-
-    result, error = await dispatcher.dispatch("tool-1", "place_order", {"x": 1})
-
-    assert result is None
-    assert error == {
-      "code": "headless_auto_deny",
-      "message": "Tool 'place_order' blocked in headless context.",
-    }
-    assert executed == []
-    assert session.pending_tools == {}
-    assert not [
-      entry.event for entry in event_log.entries if entry.event.get("type") == "tool_approval_request"
-    ]
-    stored = await store.get_by_tool_call_id("tool-1")
-    if delegated:
-      # The parent records the row; a request never raised leaves none.
-      assert stored is None
-    else:
-      assert stored is not None
-      assert stored.state == "auto_denied"
-      assert stored.decision_reason == "Headless context cannot collect required user approval"
-    events = _decision_events(event_log)
-    assert len(events) == 1
-    assert events[0]["decision_source"] == "headless_auto_deny"
-    assert events[0]["outcome"] == "denied"
-
-  asyncio.run(_run())
-
-
-def test_headless_hook_allow_emits_decided_and_executes_tool() -> None:
-  async def _run() -> None:
-    event_log = EventLog()
-
-    async def ask(_ctx):
-      return InterceptDecision(action="ask", message="Needs confirmation")
-
-    dispatcher = _dispatcher(
-      event_log,
-      interceptors=[ask],
-      should_avoid_permission_prompts=True,
-      on_headless_ask=lambda _ctx, _decision: "allow",
-    )
-
-    result, error = await dispatcher.dispatch("tool-1", "write_file", {"path": "x"})
-
-    assert result == {"ok": True}
-    assert error is None
-    events = _decision_events(event_log)
-    assert len(events) == 1
-    assert events[0]["decision_source"] == "headless_hook_approved"
-    assert events[0]["outcome"] == "approved"
-
-  asyncio.run(_run())
-
-
-def test_callback_and_headless_decision_sources_have_decided_event_coverage() -> None:
+def test_callback_decision_sources_have_decided_event_coverage() -> None:
   async def _run() -> None:
     sources = set()
 
@@ -641,27 +454,9 @@ def test_callback_and_headless_decision_sources_have_decided_event_coverage() ->
     async def deny(_request):
       return ApprovalDecision(approved=False)
 
-    async def timeout(_request):
-      return None
-
-    async def ask(_ctx):
-      return InterceptDecision(action="ask", message="Needs confirmation")
-
     scenarios = [
       _dispatcher(EventLog(), needs_approval=lambda *_args: True, request_approval=approve),
       _dispatcher(EventLog(), needs_approval=lambda *_args: True, request_approval=deny),
-      _dispatcher(EventLog(), needs_approval=lambda *_args: True, request_approval=timeout),
-      _dispatcher(
-        EventLog(),
-        needs_approval=lambda *_args: True,
-        should_avoid_permission_prompts=True,
-      ),
-      _dispatcher(
-        EventLog(),
-        interceptors=[ask],
-        should_avoid_permission_prompts=True,
-        on_headless_ask=lambda _ctx, _decision: "allow",
-      ),
     ]
 
     for idx, dispatcher in enumerate(scenarios):
@@ -670,12 +465,6 @@ def test_callback_and_headless_decision_sources_have_decided_event_coverage() ->
       assert event_log is not None
       sources.update(event["decision_source"] for event in _decision_events(event_log))
 
-    assert sources == {
-      "user_approved",
-      "user_denied",
-      "approval_timeout",
-      "headless_auto_deny",
-      "headless_hook_approved",
-    }
+    assert sources == {"user_approved", "user_denied"}
 
   asyncio.run(_run())

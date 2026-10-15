@@ -2,17 +2,28 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
-from .commercial_claims import (
+from hank_contracts.commercial_claims import (
   CommercialClaimError,
-  CommercialClaimVerifier,
   VerifiedCommercialClaim,
 )
-from .commercial_work_authorization import (
+from .commercial_claims import (
+  CommercialClaimVerifier,
+)
+from hank_contracts.commercial_work import (
+  COMMERCIAL_CLAIM_HEADER,
+  COMMERCIAL_WORK_AUTHORIZATION_HEADER,
   VerifiedWorkAuthorization,
   WorkAuthorizationError,
+  CommercialWorkStartFacts,
+  VerifiedCommercialWorkStartClaim,
+  PendingCommercialWorkStart,
+  CommercialWorkStartContext,
+  CommercialWorkStartFactsResolver,
+  CommercialWorkStartPreflight,
+)
+from .commercial_work_authorization import (
   WorkAuthorizationVerifier,
 )
 from .work_authorization_consumption import (
@@ -24,10 +35,6 @@ from .work_authorization_consumption import (
 )
 
 
-COMMERCIAL_CLAIM_HEADER = "X-Hank-Commercial-Claim"
-COMMERCIAL_WORK_AUTHORIZATION_HEADER = "X-Hank-Work-Authorization"
-
-
 class CommercialWorkStartError(RuntimeError):
   """A commercial request cannot safely proceed to runtime construction."""
 
@@ -37,56 +44,18 @@ class CommercialWorkStartError(RuntimeError):
     super().__init__(message)
 
 
-@dataclass(frozen=True)
-class CommercialWorkStartFacts:
-  operation: str
-  provider: str
-  billing_mode: str
-  capability_id: str | None
 
 
-@dataclass(frozen=True)
-class VerifiedCommercialWorkStartClaim:
-  """Verified account identity awaiting facts from the prepared request."""
 
-  claim: VerifiedCommercialClaim
-  _authorization_token: str = field(repr=False, compare=False)
-  _gate_binding: object = field(repr=False, compare=False)
-
-
-@dataclass(frozen=True)
-class PendingCommercialWorkStart:
-  """Token-free verified authority awaiting durable one-time consumption."""
-
-  claim: VerifiedCommercialClaim
-  authorization: VerifiedWorkAuthorization
-  _gate_binding: object = field(repr=False, compare=False)
-
-
-@dataclass(frozen=True)
-class CommercialWorkStartContext:
-  """Token-free request context available only after durable consumption."""
-
-  claim: VerifiedCommercialClaim
-  authorization: VerifiedWorkAuthorization
-  consumption: WorkAuthorizationConsumptionRecord
-
-
-CommercialWorkStartFactsResolver = Callable[
-  [Any, Any, str | None], CommercialWorkStartFacts
-]
-CommercialWorkStartPreflight = Callable[[PendingCommercialWorkStart], None]
-
-
-def require_commercial_child_provider(
+def require_commercial_child_account(
   work_start: CommercialWorkStartContext | None,
-  provider: str | None,
+  credential_principal: str,
 ) -> None:
-  """Bind delegated provider work to the root authorization before dispatch.
+  """Bind delegated work to the root authorization's credential principal.
 
-  Money: the child resolves its own provider bind, which the root
-  authorization's request-path provider check never sees, and a child on
-  another provider would spend under a funding route authorized for one.
+  Money (rulings-index WA-ACCOUNT-BUDGET): a child may spend on any provider
+  or model. It must spend under the same credential principal, or the call
+  would be attributed to a different account.
   """
   if work_start is None:
     return
@@ -96,21 +65,43 @@ def require_commercial_child_provider(
       "Commercial child authority is invalid.",
       status_code=503,
     )
-  resolved_provider = str(provider or "").strip().lower()
-  if not resolved_provider:
+  authorized_principal = work_start.authorization.credential_principal
+  if credential_principal != authorized_principal:
     raise CommercialWorkStartError(
-      "commercial_child_provider_unavailable",
-      "Commercial child provider is unavailable.",
-      status_code=503,
-    )
-  if resolved_provider != work_start.authorization.provider:
-    raise CommercialWorkStartError(
-      "commercial_child_provider_mismatch",
-      "Commercial child provider differs from authorized work: bind the "
-      f"child to {work_start.authorization.provider!r} or start it under a "
-      f"work authorization for {resolved_provider!r}.",
+      "commercial_child_credential_principal_mismatch",
+      "Commercial child credential principal differs from authorized work: "
+      f"bind the child to the {authorized_principal!r} principal or start it "
+      f"under a work authorization for {credential_principal!r}.",
       status_code=403,
     )
+
+
+
+
+def commercial_budget_stop_fields(producer: object | None) -> dict[str, int] | None:
+  """Metered reserved spend already reached, else None.
+
+  The ledger lives on the work-start context the usage producer holds.
+  Children share that producer, so they share the ledger. A byok ticket
+  has no reservation and never stops. rulings-index WA-ACCOUNT-BUDGET.
+  """
+  work_start = (
+    getattr(producer, "_work_start", None) if producer is not None else None
+  )
+  ledger = (
+    getattr(work_start, "spend_ledger", None)
+    if work_start is not None else None
+  )
+  if ledger is None or not ledger.reached():
+    return None
+  reserved = ledger.reserved_spend_microusd
+  if not isinstance(reserved, int):
+    return None
+  return {
+    "spent_microusd": ledger.spent_microusd,
+    "reserved_spend_microusd": reserved,
+  }
+
 
 
 class CommercialWorkStartGate:
@@ -236,9 +227,9 @@ class CommercialWorkStartGate:
         request_id=request.request_id,
         session_id=session.session_id,
         operation=facts.operation,
-        provider=facts.provider,
         billing_mode=facts.billing_mode,
         capability_id=facts.capability_id,
+        credential_principal=facts.credential_principal,
       )
     except WorkAuthorizationError as exc:
       raise CommercialWorkStartError(
@@ -332,14 +323,8 @@ class CommercialWorkStartGate:
 
 
 __all__ = [
-  "COMMERCIAL_CLAIM_HEADER",
-  "COMMERCIAL_WORK_AUTHORIZATION_HEADER",
-  "CommercialWorkStartContext",
   "CommercialWorkStartError",
-  "CommercialWorkStartFacts",
-  "CommercialWorkStartFactsResolver",
-  "CommercialWorkStartPreflight",
   "CommercialWorkStartGate",
-  "PendingCommercialWorkStart",
-  "require_commercial_child_provider",
+  "require_commercial_child_account",
+  "commercial_budget_stop_fields",
 ]

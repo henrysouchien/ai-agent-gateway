@@ -3,6 +3,20 @@ from __future__ import annotations
 from typing import Any, Dict, Sequence
 
 from ._config import CodeExecutionConfig
+from ._frame_reader import BRIDGE_OPERATIONS
+
+
+def _bridge_operation_names() -> str:
+  """`hank.<name>(<args>)` for every registered bridge op, in registration order."""
+  return ", ".join(
+    f"hank.{row['name']}({', '.join(row['arguments'])})" for row in BRIDGE_OPERATIONS
+  )
+
+def _model_call_operation_names() -> str:
+  """Registered leaf model-call operations."""
+  from ..capability_execution import list_model_call_operations
+
+  return ", ".join(op.name for op in list_model_call_operations())
 
 
 def make_code_execute_tool_def(
@@ -23,12 +37,15 @@ def make_code_execute_tool_def(
       "and spill paths for complete output. For an oversized tool-result preview, use tool_result_read "
       "with its opaque spill_ref.\n\n"
       "Discovery: use code_execute when you need arithmetic verification, data wrangling, chart "
-      "generation, or repeatable Python analysis. For long-running work, set background=true and "
-      "poll with code_execute_status.\n\n"
-      "Sibling tools: use code_execute_status for background progress or cancellation. Use run_bash "
-      "for non-Python shell commands and file tools for simple file inspection.\n\n"
+      "generation, or repeatable Python analysis. For long-running work, set background=true: the "
+      "cell runs as a background job and its result is delivered like any background task "
+      "result (task notification, or get_background_result(task_id=...) when notifications are off).\n\n"
+      "Sibling tools: use run_bash for non-Python shell commands and file tools for simple file "
+      "inspection.\n\n"
       "For multi-step filing, market or portfolio analysis, use the preloaded hank client inside "
-      "the cell: hank.search(query), hank.describe(operation), hank.call(operation, **arguments). "
+      "the cell: hank.search(query), hank.describe(operation), hank.call(operation, **arguments); "
+      f"and to delegate from a cell, {_bridge_operation_names()}. "
+      f"Registered leaf model-call operations for completion and judge: {_model_call_operation_names()}. "
       "Use discovered names/schemas; retain fetched data in variables and display derived summaries. "
       "Granted domain reads run through the gateway, which holds credentials and returns source "
       "identities. Docker has no direct network access; do not copy secrets into Python. "
@@ -45,7 +62,24 @@ def make_code_execute_tool_def(
         "timeout_ms": {
           "type": "integer",
           "minimum": 1000,
-          "description": f"Timeout in milliseconds. Default: {config.default_timeout_ms}.",
+          "description": (
+            "Compute timeout in milliseconds. On docker/kernel hosts, time the cell's own thread spends "
+            "blocked on hank calls does not count; the result reports it as host_wait_ms beside compute_ms. "
+            f"Subprocess bounds total wall time. Default: {config.default_timeout_ms}."
+          ),
+        },
+        "host_wait_ms": {
+          "type": "integer",
+          "description": (
+            "Expected time blocked on hank calls, in milliseconds. Recorded and echoed on the result "
+            "as requested_host_wait_ms beside the measured host_wait_ms; not a timeout, a blocked "
+            "call is never interrupted for it."
+            + (
+              f" Default: {config.default_host_wait_ms}."
+              if config.default_host_wait_ms is not None
+              else ""
+            )
+          ),
         },
         "background": {
           "type": "boolean",
@@ -58,27 +92,5 @@ def make_code_execute_tool_def(
         },
       },
       "required": ["code"],
-    },
-  }
-
-
-def make_code_execute_status_tool_def() -> Dict[str, Any]:
-  """Build the public tool schema for `code_execute_status`."""
-  return {
-    "name": "code_execute_status",
-    "description": "Check or cancel a background code_execute task.",
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "task_id": {
-          "type": "string",
-          "description": "Background task id returned by code_execute(background=true).",
-        },
-        "cancel": {
-          "type": "boolean",
-          "description": "Set true to cancel the task.",
-        },
-      },
-      "required": ["task_id"],
     },
   }

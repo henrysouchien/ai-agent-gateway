@@ -2,10 +2,37 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence, SupportsFloat
+
+
+def oauth_token_cache_path(
+  cache_dir: Path,
+  server_name: str,
+  *,
+  credential_principal: str,
+  credential_owner: str | None = None,
+) -> Path:
+  """Partition an MCP OAuth cache by credential ownership, not server name.
+
+  A user principal gets that owner's file. A product credential (disposition 2,
+  principal ``service``) keeps one store, not a copy per acting user.
+  """
+  safe_server = re.sub(r"[^A-Za-z0-9_.-]+", "_", server_name).strip("._") or "server"
+  if credential_principal == "service":
+    return cache_dir / "product" / f"{safe_server}.json"
+  if credential_principal == "user":
+    owner = str(credential_owner or "").strip()
+    if not owner:
+      raise ValueError("user-owned MCP OAuth cache requires a credential owner")
+    safe_owner = re.sub(r"[^A-Za-z0-9_.-]+", "_", owner).strip("._") or "owner"
+    return cache_dir / "user" / safe_owner / f"{safe_server}.json"
+  raise ValueError(
+    "MCP OAuth cache requires credential_principal 'user' or 'service'"
+  )
 
 
 class JsonFileKeyValue:
@@ -160,4 +187,4 @@ class JsonFileKeyValue:
     return deleted
 
 
-__all__ = ["JsonFileKeyValue"]
+__all__ = ["JsonFileKeyValue", "oauth_token_cache_path"]

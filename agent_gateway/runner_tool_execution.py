@@ -23,7 +23,11 @@ from .runner_session_events import (
 )
 from .runner_session_lifecycle import _runner_attr
 from .policy_imports import role_policy_denies_tool
-from .runner_state import ToolResultContext
+from .runner_state import (
+  ToolResultContext,
+  append_deferred_tool_extras,
+  model_visible_extra_blocks,
+)
 from .secret_boundary import (
   SecretBoundary,
   sanitize_boundary_value,
@@ -33,6 +37,7 @@ from .secret_boundary import (
 from .tool_display import resolve_display
 from .tool_policy_registry import PreparedToolCall, ToolInputPreparationError
 from .tool_dispatcher_helpers import LocalToolHandler, ToolResult
+from .tool_dispatcher_approval_lifecycle import ApprovalPark
 from .tool_dispatcher import _SpawningTurn
 from .tool_dispatch_classification import (
   DispatchEntry,
@@ -62,6 +67,9 @@ if TYPE_CHECKING:
   from model_authority.bind import CapabilityBind
 
   from .approval_policy import RunContext
+  from .approval_route import ApprovalRoute
+  from .execution_identity import DispatchIdentity
+  from .session import GatewaySession
   from .event_log import EventLog
   from .mcp_client import McpClientManager
   from .task_registry import TaskRegistry
@@ -113,6 +121,16 @@ class AgentRunnerDispatcher(Protocol):
 
   def capture_spawning_turn(self) -> _SpawningTurn: ...
 
+  async def execute_approved_binding(
+    self,
+    *,
+    job_id: str,
+    tool_call_id: str,
+    nonce: str,
+    abort_event: asyncio.Event | None,
+    on_executed_prepared_call: Callable[[PreparedToolCall], None] | None,
+  ) -> ToolResult: ...
+
   def fork_child(
     self,
     *,
@@ -120,6 +138,9 @@ class AgentRunnerDispatcher(Protocol):
     session_id: str,
     capability_bind: CapabilityBind,
     spawning_turn: _SpawningTurn,
+    identity: DispatchIdentity | None,
+    session: GatewaySession | None,
+    approval_route: ApprovalRoute | None,
     local_handler_scopes: Mapping[
       str, Callable[[LocalToolHandler], LocalToolHandler]
     ] | None = None,
@@ -495,6 +516,12 @@ class RunnerToolExecutionMixin:
       base_kwargs: Dict[str, Any],
     ) -> None: ...
 
+    def _newly_exposed_tool_names(
+      self,
+      base_kwargs: Dict[str, Any],
+      advertised_before: frozenset[str],
+    ) -> List[str]: ...
+
     def _refresh_tools(
       self,
       base_kwargs: Dict[str, Any],
@@ -535,17 +562,21 @@ class RunnerToolExecutionMixin:
     )
     for message in messages:
       content = message.get("content")
-      if isinstance(content, list):
-        message["content"] = [
-          replacement
-          for block in content
-          for replacement in (
-            [result_block, *extra_blocks]
-            if block.get("type") == "tool_result"
-            and block.get("tool_use_id") == approved_call.tool_call_id
-            else [block]
-          )
-        ]
+      if not isinstance(content, list) or not any(
+        block.get("type") == "tool_result"
+        and block.get("tool_use_id") == approved_call.tool_call_id
+        for block in content
+      ):
+        continue
+      replaced = [
+        result_block
+        if block.get("type") == "tool_result"
+        and block.get("tool_use_id") == approved_call.tool_call_id
+        else block
+        for block in content
+      ]
+      append_deferred_tool_extras(replaced, model_visible_extra_blocks(extra_blocks))
+      message["content"] = replaced
 
   async def _execute_single_tool(
     self,
@@ -724,6 +755,8 @@ class RunnerToolExecutionMixin:
     error: Optional[Dict[str, Any]] = None
     semantic_error: Optional[Dict[str, Any]] = None
     cancelled_exc: BaseException | None = None
+    approval_park: ApprovalPark | None = None
+    settled_exit: tuple[dict[str, Any], dict[str, Any]] | None = None
     dispatch_attempts = 1
     dispatch_retries_exhausted = False
     settled_result: ToolResultSettlement | None = None
@@ -732,6 +765,8 @@ class RunnerToolExecutionMixin:
     duration_ms = 0
     load_servers_signal: Optional[List[str]] = None
     load_local_tools_signal: Optional[List[str]] = None
+    skill_allow_signal = False
+    advertised_before: frozenset[str] = frozenset()
     readable_resource_snapshot: dict[str, Any] | None = None
     child_evidence: dict[str, Any] | None = None
     background_result_ack: tuple[str, int] | None = None
@@ -905,6 +940,11 @@ class RunnerToolExecutionMixin:
       # it for _refresh_tools (called after finally), then remove from result.
       if error is None and isinstance(result, dict):
         result_keys_before_control_projection = set(result)
+        # No await separates this snapshot from the rebuilds below, so the
+        # diff is this call's alone even when sibling calls run concurrently.
+        advertised_before = frozenset(
+          str(tool["name"]) for tool in base_kwargs.get("tools") or []
+        )
         popped_background_result_ack = result.pop(
           _BACKGROUND_RESULT_ACK_RESULT_KEY,
           None,
@@ -954,6 +994,7 @@ class RunnerToolExecutionMixin:
           "_ACTIVE_SKILL_ALLOW_RESULT_KEY",
           _ACTIVE_SKILL_ALLOW_RESULT_KEY,
         )
+        skill_allow_signal = skill_allow_key in result
         self._activate_skill_allow(result.pop(skill_allow_key, None), base_kwargs)
         if set(result) != result_keys_before_control_projection:
           outcome_inputs_changed = True
@@ -1035,6 +1076,9 @@ class RunnerToolExecutionMixin:
       cancelled_exc = exc
       error = {"code": "cancelled", "message": "Task was cancelled"}
       outcome_inputs_changed = True
+    except ApprovalPark as exc:
+      approval_park = exc
+      raise
     except Exception as exc:
       # Dispatch runs on the privileged plane, so an exception raised there can
       # quote credential material this process does own. The hook still sees
@@ -1051,58 +1095,62 @@ class RunnerToolExecutionMixin:
       error = {"code": "internal_error", "message": safe_exc}
       outcome_inputs_changed = True
     finally:
-      duration_ms = int((time_module.time() - tool_t0) * 1000)
-      if isinstance(error, dict):
-        enriched_error = _error_with_model_error_data(error)
-        if enriched_error is not error:
-          outcome_inputs_changed = True
-        error = enriched_error
-      # Every exit path funnels here — normal, semantic error, exclusion,
-      # timeout, cancellation, unhandled exception — so the dispatch record
-      # settles unconditionally, and it is on the event before the cancelled
-      # arm's early append below.
-      final_result = (
-        self._dispatcher.settle_tool_result(
-          tool_name,
-          dispatch_entry,
-          result,
-          error,
-          semantic_error,
-          prepared_call=executed_prepared_call,
+      if approval_park is None:
+        duration_ms = int((time_module.time() - tool_t0) * 1000)
+        if isinstance(error, dict):
+          enriched_error = _error_with_model_error_data(error)
+          if enriched_error is not error:
+            outcome_inputs_changed = True
+          error = enriched_error
+        # A parked call has no result to settle. All resolved exits, including
+        # genuine failure and cancellation, retain their dispatch completion.
+        final_result = (
+          self._dispatcher.settle_tool_result(
+            tool_name,
+            dispatch_entry,
+            result,
+            error,
+            semantic_error,
+            prepared_call=executed_prepared_call,
+          )
+          if settled_result is None or outcome_inputs_changed
+          else settled_result
         )
-        if settled_result is None or outcome_inputs_changed
-        else settled_result
-      )
-      dispatch_record = build_dispatch_record_from_sources(
-        entry=dispatch_entry,
-        outcome=final_result.outcome,
-        sources=final_result.sources,
-        attempts=dispatch_attempts,
-        retries_exhausted=dispatch_retries_exhausted,
-      )
-      tool_complete_event = _runner_attr(
-        self,
-        "_build_tool_call_complete_event",
-        _build_tool_call_complete_event,
-      )(
-        tool_call_id=tool_id,
-        tool_name=tool_name,
-        result=result,
-        error=error,
-        duration_ms=duration_ms,
-        server=server,
-        dispatch=dispatch_record,
-        semantic_error=semantic_error,
-      )
-      self._call_on_tool_timing(
-        tool_name=tool_name,
-        server=server,
-        duration_ms=duration_ms,
-        is_error=tool_complete_event["is_error"],
-        result_bytes=result_bytes,
-        tool_call_id=tool_id,
-        request_id=self._request_id,
-      )
+        dispatch_record = build_dispatch_record_from_sources(
+          entry=dispatch_entry,
+          outcome=final_result.outcome,
+          sources=final_result.sources,
+          attempts=dispatch_attempts,
+          retries_exhausted=dispatch_retries_exhausted,
+        )
+        tool_complete_event = _runner_attr(
+          self,
+          "_build_tool_call_complete_event",
+          _build_tool_call_complete_event,
+        )(
+          tool_call_id=tool_id,
+          tool_name=tool_name,
+          result=result,
+          error=error,
+          duration_ms=duration_ms,
+          server=server,
+          dispatch=dispatch_record,
+          semantic_error=semantic_error,
+        )
+        self._call_on_tool_timing(
+          tool_name=tool_name,
+          server=server,
+          duration_ms=duration_ms,
+          is_error=tool_complete_event["is_error"],
+          result_bytes=result_bytes,
+          tool_call_id=tool_id,
+          request_id=self._request_id,
+        )
+        settled_exit = (dispatch_record, tool_complete_event)
+
+    # Every exit but an approval park settled above; a park re-raised.
+    assert settled_exit is not None
+    dispatch_record, tool_complete_event = settled_exit
 
     if cancelled_exc is not None:
       result_entry = self._make_error_result(
@@ -1133,17 +1181,18 @@ class RunnerToolExecutionMixin:
         len(base_kwargs.get("tools") or []),
       )
 
+    exposed_tools = (
+      self._newly_exposed_tool_names(base_kwargs, advertised_before)
+      if load_servers_signal or load_local_tools_signal or skill_allow_signal
+      else []
+    )
+
     model_result = result
     if error is None:
       model_result = self._annotate_result(result, tool_name=tool_name)
 
     if error is not None:
       error_code = str(error.get("code", "tool_error"))
-      if error_code == "approval_timeout":
-        # An expired approval is not an answer. Stop after this tool result
-        # instead of letting the model retry the same stale approval.
-        setattr(self, "_stop_after_tool_results_reason", "approval_timeout")
-        setattr(self, "_stop_after_tool_results_tool_name", tool_name)
       result_entry = self._make_error_result(
         tool_id,
         error_code,
@@ -1157,6 +1206,8 @@ class RunnerToolExecutionMixin:
         "tool_use_id": tool_id,
         "content": json_module.dumps(model_result, default=str),
       }
+      if exposed_tools:
+        result_entry["exposed_tools"] = exposed_tools
       if tool_complete_event["is_error"]:
         result_entry["is_error"] = True
 

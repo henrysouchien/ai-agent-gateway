@@ -13,43 +13,17 @@ from typing import Any, Callable, Generic, Literal, Protocol, TypeVar
 from uuid import uuid4
 
 from .usage_outbox import CommercialUsageOutbox
+from hank_contracts.usage import (
+  CommercialUsageCircuitOpen,
+  CommercialUsageSpoolError,
+  CommercialUsageOutboxSink,
+  CommercialUsageOutboxT,
+  CommercialUsageCircuitSnapshot,
+)
 
 
 _SPOOL_MAGIC = "HANK-COMMERCIAL-USAGE-SPOOL-V1"
 _FRAME_MAGIC = "BATCH"
-
-
-class CommercialUsageCircuitOpen(RuntimeError):
-  """New Hank-funded work is blocked while commercial durability is unsafe."""
-
-
-class CommercialUsageSpoolError(RuntimeError):
-  """Emergency spool framing, persistence, or replay failed."""
-
-
-class CommercialUsageOutboxSink(Protocol):
-  def enqueue_batch(self, payloads: list[dict[str, Any]]) -> None: ...
-
-  def health(self) -> dict[str, Any]: ...
-
-
-CommercialUsageOutboxT = TypeVar(
-  "CommercialUsageOutboxT",
-  bound=CommercialUsageOutboxSink,
-)
-
-
-@dataclass(frozen=True)
-class CommercialUsageCircuitSnapshot:
-  tripped: bool
-  reason: str | None
-  tripped_at: str | None
-  byok_allowed_until: str | None
-  last_reset_at: str | None = None
-  last_reset_operator_id: str | None = None
-  last_reset_evidence_id: str | None = None
-  last_reset_prior_tripped_at: str | None = None
-
 
 class CommercialUsageCircuitBreaker:
   def __init__(

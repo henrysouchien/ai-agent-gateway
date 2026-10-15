@@ -23,7 +23,12 @@ class TranscriptIntegrityError(RuntimeError):
 
 @dataclass(frozen=True)
 class ChildRunSegment:
-  """Exact durable child-run evidence associated with one task registration."""
+  """Exact durable child-run evidence associated with one task registration.
+
+  ``initial_context`` holds the messages a task's own writer journaled before
+  registering itself (an inherited prefix); a child registered in its parent's
+  journal has none.
+  """
 
   task_id: str
   original_task_id: str | None
@@ -31,6 +36,7 @@ class ChildRunSegment:
   completion: LogEntry | None
   runner_id: str | None
   entries: tuple[LogEntry, ...]
+  initial_context: tuple[LogEntry, ...] = ()
 
 
 def _sub_agent_id(event: dict[str, Any]) -> str | None:
@@ -89,6 +95,35 @@ async def _next_sub_agent_registration(
   return next((entry for entry in entries if _sub_agent_id(entry.event) == sub_agent_id), None)
 
 
+async def _own_writer_attach(
+  log: AgentSessionLog,
+  registration: LogEntry,
+  sub_agent_id: str,
+) -> LogEntry | None:
+  """Return the registering writer's attach when its session is the registered sub-agent.
+
+  A task that runs on its own top-level journal (a learning fork) is
+  registered there by the writer runner whose gateway session is the task's
+  sub-agent session (stable across its resume attempts); a child registered in
+  a parent's journal is registered by the parent's runner, of another session.
+  """
+  event = registration.event
+  runner_id = event.get("runner_id")
+  if event.get("role") != "writer" or not isinstance(runner_id, str) or not runner_id:
+    return None
+  attach_entries, _ = await log.query(
+    event_types={"attach"},
+    runner_id=runner_id,
+    role="writer",
+    before_seq=registration.seq - 1,
+    order="asc",
+  )
+  return next(
+    (entry for entry in attach_entries if entry.event.get("gateway_session_id") == sub_agent_id),
+    None,
+  )
+
+
 async def child_run_segment_for_task(
   log: AgentSessionLog,
   task_id: str,
@@ -125,6 +160,35 @@ async def child_run_segment_for_task(
       completion=completion,
       runner_id=None,
       entries=(),
+    )
+
+  own_writer_attach = await _own_writer_attach(log, registration, sub_agent_id)
+  if own_writer_attach is not None:
+    own_runner_id = own_writer_attach.event["runner_id"]
+    initial_context, _ = await log.query(
+      event_types={"user_message", "assistant_message"},
+      runner_id=own_runner_id,
+      role="writer",
+      after_seq=own_writer_attach.seq + 1,
+      before_seq=registration.seq - 1,
+      order="asc",
+    )
+    # The own writer journals its task_completed too; the attempt ends before it.
+    entries, _ = await log.query(
+      runner_id=own_runner_id,
+      role="writer",
+      after_seq=registration.seq + 1,
+      before_seq=completion.seq - 1 if completion is not None else before_seq,
+      order="asc",
+    )
+    return ChildRunSegment(
+      task_id=task_id,
+      original_task_id=original_task_id,
+      registration=registration,
+      completion=completion,
+      runner_id=own_runner_id,
+      entries=tuple(entries),
+      initial_context=tuple(initial_context),
     )
 
   attach_entries, _ = await log.query(
@@ -459,7 +523,7 @@ async def reconstruct_messages_for_task(log: AgentSessionLog, task_id: str) -> l
   for entry in (
     entry
     for segment in lineage
-    for entry in segment.entries
+    for entry in (*segment.initial_context, *segment.entries)
   ):
     event = entry.event
     event_type = str(event.get("type") or "")

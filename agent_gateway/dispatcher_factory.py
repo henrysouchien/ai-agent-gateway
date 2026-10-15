@@ -92,7 +92,6 @@ _SERVER_OWNED_PASSTHROUGH_KEYS = frozenset({
   "mcp_meta_inject_servers",
   "risk_user_id",
   "role",
-  "should_avoid_permission_prompts",
   "tool_policy_implementations",
   "tool_registration_catalog",
   "redaction_context_factory",
@@ -345,7 +344,6 @@ def build_tool_dispatcher(
       base_kwargs["commercial_mcp_servers"] = commercial_mcp_servers
 
   base_kwargs["mcp_meta_inject_servers"] = deps.mcp_meta_inject_servers
-  base_kwargs["should_avoid_permission_prompts"] = False
   base_kwargs["approval_route"] = admitted_route
 
   base_dispatcher = dispatcher_cls(**base_kwargs)

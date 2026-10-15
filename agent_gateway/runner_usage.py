@@ -167,13 +167,33 @@ def turn_usage_payload(
 
 def estimate_usage_cost(provider: Any, model: str, usage_totals: Dict[str, Any]) -> Any:
   uncached_input = max(0, usage_totals["input_tokens"])
-  return provider.estimate_cost(
+  cost = provider.estimate_cost(
     model,
     uncached_input,
     usage_totals["output_tokens"],
     cache_read_tokens=usage_totals["cache_read_input_tokens"],
     cache_creation_tokens=usage_totals["cache_creation_input_tokens"],
   )
+  if hasattr(cost, "cost_known"):
+    usage_totals["cost_known"] = bool(cost.cost_known)
+  return cost
+
+
+_UNPRICED_PROVIDERS = frozenset({
+  "google",
+  "google_antigravity",
+  "muse",
+  "ollama",
+  "ollama_cloud",
+})
+_UNPRICED_ROUTES = frozenset({
+  "google.antigravity",
+  "google.public",
+  "muse.api",
+  "ollama.local",
+  "ollama.daemon_cloud",
+  "ollama.cloud",
+})
 
 
 def build_usage_event(
@@ -190,12 +210,29 @@ def build_usage_event(
   rate_table_version: str,
   billing_mode: BillingMode,
   channel: str | None,
+  selection_provenance: dict[str, Any] | None = None,
+  cost_known: bool = True,
 ) -> UsageEvent:
   bind_receipt = usage_totals.get("capability_bind")
   if not isinstance(bind_receipt, dict):
     raise ValueError("provider-call usage requires a capability bind receipt")
   if provider_name is None:
     raise ValueError("provider-call usage requires a provider projection")
+  resolved_cost_known = bool(cost_known)
+  if "cost_known" in usage_totals:
+    if not usage_totals["cost_known"]:
+      resolved_cost_known = False
+  provider_key = str(provider_name or "").strip().lower()
+  bind_provider = str(bind_receipt.get("provider") or "").strip().lower()
+  bind_route = str(bind_receipt.get("route") or "").strip().lower()
+  if (
+    provider_key in _UNPRICED_PROVIDERS
+    or bind_provider in _UNPRICED_PROVIDERS
+    or bind_route in _UNPRICED_ROUTES
+    or bind_route.startswith(("google.", "muse.", "ollama."))
+  ):
+    resolved_cost_known = False
+  usage_totals["cost_known"] = resolved_cost_known
   return UsageEvent(
     user_id=user_id,
     session_id=session_id,
@@ -220,6 +257,8 @@ def build_usage_event(
     rate_table_version=rate_table_version,
     billing_mode=billing_mode,
     channel=channel,
+    cost_known=resolved_cost_known,
+    selection_provenance=selection_provenance,
   )
 
 
@@ -251,11 +290,20 @@ async def call_session_summary_hook(
   log_session_id: str,
   logger: Any,
   commercial_usage_producer: CommercialUsageReconciler | None = None,
+  reconciled: SessionUsageSummary | None = None,
   emit_metric: Callable[[str, int], None] | None = None,
 ) -> None:
+  """Reconcile commercial usage, then deliver `summary` to the session hook.
+
+  `reconciled` is the total the producer compares when it differs from the
+  session's own `summary` (a root's row counts the root alone; the commercial
+  events cover its whole dispatch tree).
+  """
   if commercial_usage_producer is not None:
     try:
-      await commercial_usage_producer.reconcile(summary)
+      await commercial_usage_producer.reconcile(
+        summary if reconciled is None else reconciled
+      )
     except Exception as exc:
       logger.error(
         "[%s] commercial usage reconciliation failed | exception_type=%s",

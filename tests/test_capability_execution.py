@@ -19,7 +19,6 @@ from agent_gateway.capability_execution import (
   MaterializedCredential,
   derive_batch_capability_execution,
 )
-from agent_gateway.runner_fork_agents import _bind_learning_fork_execution
 from agent_gateway.runner_hooks_lifecycle import RunnerHooksLifecycleMixin
 from agent_gateway.send_prompt import _prepare_bound_execution
 from model_authority.bind import CapabilityBind
@@ -428,13 +427,6 @@ def _rebound_to_unqualified_fork() -> BoundCapabilityExecution:
     }),
   )
   return execution
-
-
-def test_learning_fork_rebind_to_unqualified_model_is_refused() -> None:
-  with pytest.raises(CapabilityResolutionError) as refused:
-    _bind_learning_fork_execution(_driver_execution_unqualified_for_fork())
-  assert refused.value.code == "capability_model_not_allowed"
-  assert refused.value.capability_id == "node.fork"
 
 
 def test_credential_refresh_of_unqualified_rebind_is_refused() -> None:

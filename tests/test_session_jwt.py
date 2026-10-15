@@ -23,6 +23,7 @@ from agent_gateway.session import (
   session_admits_new_turn,
 )
 from agent_gateway.session_capabilities import TEAM_WORKSPACE_WRITE_CAPABILITY
+from agent_gateway.ttl_policy import SESSION_TTL
 
 _JWT_SECRET = "jwt-secret-with-at-least-32-bytes"
 
@@ -85,7 +86,10 @@ def test_auth_manager_with_configured_keys_refuses_an_unknown_key() -> None:
 
 
 def test_session_store_ttl_override_and_kind_are_store_only() -> None:
-  store = SessionStore(ttl=3600)
+  def ttl_resolver(_subject: str, _ttl_name: str) -> int | None:
+    raise AssertionError("explicit TTL must bypass entitlement resolution")
+
+  store = SessionStore(ttl=3600, ttl_resolver=ttl_resolver)
   auth = AuthManager(secret=_JWT_SECRET, valid_keys={"gateway-key"}, session_store=store)
   session = store.create_session(
     api_key_hash="hash",
@@ -100,6 +104,24 @@ def test_session_store_ttl_override_and_kind_are_store_only() -> None:
   assert session.kind == "control"
   assert session.expires_at == session.created_at + 900
   assert "kind" not in claims
+
+
+def test_session_store_resolves_ttl_per_normalized_user_with_default_fallback() -> None:
+  calls: list[tuple[str, str]] = []
+
+  def ttl_resolver(subject: str, ttl_name: str) -> int | None:
+    calls.append((subject, ttl_name))
+    return {"alice": 120, "bob": 480}.get(subject)
+
+  store = SessionStore(ttl=3600, ttl_resolver=ttl_resolver)
+  sessions = [
+    store.create_session(api_key_hash="hash", user_id=user_id)
+    for user_id in (" alice ", "bob", "carol")
+  ]
+
+  assert [item.expires_at - item.created_at for item in sessions] == [120, 480, 3600]
+  assert calls == [("alice", SESSION_TTL), ("bob", SESSION_TTL), ("carol", SESSION_TTL)]
+
 
 
 def test_visible_session_snapshot_matches_auth_expiry_without_mutation(

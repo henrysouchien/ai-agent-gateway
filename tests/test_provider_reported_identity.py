@@ -356,6 +356,7 @@ def test_send_prompt_validates_and_emits_reported_identity_without_rebinding() -
       capability_execution=execution,
       user_id="user-1",
       on_usage=events.append,
+      completion_record_root=None,
     )
   )
 
@@ -376,6 +377,7 @@ def test_send_prompt_rejects_unadmitted_reported_identity() -> None:
         "hello",
         capability_execution=execution,
         user_id="user-1",
+        completion_record_root=None,
       )
     )
   except CapabilityResolutionError as exc:

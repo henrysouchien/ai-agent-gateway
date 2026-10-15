@@ -33,6 +33,7 @@ from agent_workflow_contracts import (
   LiteralSelector,
   OperationUnavailable,
   OrdinaryDelegationTaskRef,
+  PipelineStageTaskRef,
   OutcomePolicy,
   OutcomeRequirement,
   OutcomeRoute,
@@ -50,7 +51,7 @@ from agent_workflow_contracts import (
   sha256_digest,
   terminal_task_result,
 )
-from agent_workflow_contracts.context_refs import declared_ref_lines, read_back_refs
+from agent_workflow_contracts.context_refs import read_back_refs
 from agent_workflow_contracts.models import AdmittedResearchBinding
 from agent_workflow_contracts.research_file_contract import (
   context_text_with_run_binding,
@@ -77,7 +78,15 @@ from .admission import (
 )
 from .autonomous_output import extract_state_update
 from .approval_policy import RunContext
-from .agent_result_content import make_get_agent_result_content_handler
+from .agent_result_content import (
+  ResultContentUnavailable,
+  make_get_agent_result_content_handler,
+)
+from .stage_ref_handles import (
+  pipeline_stage_completion_handles,
+  render_resolved_ref_lines,
+  resolve_handle_refs,
+)
 from .job_caller import CallerContext, JobScope, JobScopedHandler, rebind_job_handlers
 from .tool_result_spill import (
   SPILL_REF_PREFIX,
@@ -87,17 +96,17 @@ from .tool_result_spill import (
 )
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CapabilityResolutionError
-from .capability_execution import CapabilityExecutionResolver
+from .capability_execution import CapabilityExecutionResolver, materialize_frozen_bind
+from .child_completion import CompletionTransport, publish_child_completion
 from .code_execution import (
   CodeExecutionBundle,
   CodeExecutionConfig,
   cleanup_code_execution,
-  make_code_execute_status_tool_def,
   make_code_execute_tool_def,
 )
 from .commercial_work_start import (
   CommercialWorkStartError,
-  require_commercial_child_provider,
+  require_commercial_child_account,
 )
 from .event_log import EventLog
 from .multi_user.billing import _UsageAggregator
@@ -130,6 +139,7 @@ from .runner_background_tasks import (
 )
 from .directory_control_skill_catalog import PORTFOLIO_CONTEXT_NAMES
 from .runner_session_events import build_agent_completion_event
+from .runner_state import user_turn_message
 from .session import GatewaySession, child_gateway_session
 from .skill_limits import SkillExecutionLimits
 from .skill_lifecycle import drain_owned_lifecycle_task
@@ -348,13 +358,9 @@ def _durable_skill_event_persistence_error() -> dict[str, str]:
 
 log = logging.getLogger("agent_gateway.sub_agent")
 
-_CODE_EXECUTION_TOOL_NAMES = frozenset(
-  definition["name"]
-  for definition in (
-    make_code_execute_tool_def(CodeExecutionConfig(), ()),
-    make_code_execute_status_tool_def(),
-  )
-)
+_CODE_EXECUTION_TOOL_NAMES = frozenset({
+  make_code_execute_tool_def(CodeExecutionConfig(), ())["name"],
+})
 
 
 def _child_tool_definitions_getter(
@@ -714,30 +720,22 @@ async def _publish_foreground_completion(
     parent_result_policy=policy,
     completion_envelope=envelope,
   )
-  correlation = task_correlation_payload(
-    entry,
-    runner_id=runner_id,
-    role=role,
-  )
-  append = runner._append_durable_event
-  await append(task_registered_event_payload(
-    entry,
-    correlation_payload=correlation,
+  return await publish_child_completion(
+    transport=CompletionTransport(
+      append=runner._append_durable_event,
+      workspace_dir=str(workspace_dir),
+      parent_session_id=gateway_session_id,
+      principal_id=runner_id,
+      role=role,
+      runner_id=runner_id,
+    ),
+    entry=entry,
+    admitted_task=admitted_task,
+    result=result,
+    capability_bind_receipt=capability_bind_receipt,
     agent_name=agent_name,
-    parent_session_id=gateway_session_id,
-  ))
-  await append(task_completed_event_payload(
-    entry,
-    entry.state,
-    correlation_payload=correlation,
     completed_at=now,
-  ))
-  await append(build_agent_completion_event(
-    task_id=entry.task_id,
-    envelope=envelope,
-    ts=now,
-  ))
-  return envelope
+  )
 
 
 def seal_admitted_task_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1222,7 +1220,26 @@ def _ordinary_logical_invocation_owner(
   return str(logical_task.delegation_id or "").strip()
 
 
-def _ordinary_admitted_task_factory(
+_SESSION_WORKSPACE_PREFIX = "session:"
+
+
+def session_workspace_id(session_id: str) -> str:
+  """The workspace grant id of a task admitted beneath one chat session."""
+  return f"{_SESSION_WORKSPACE_PREFIX}{session_id}"
+
+
+def session_of_workspace(workspace_id: str) -> str:
+  """The chat session a session workspace grant id names.
+
+  Raises ``ValueError`` for any other workspace: a caller that reads the
+  owning session from a grant holds a task admitted beneath a session.
+  """
+  if not workspace_id.startswith(_SESSION_WORKSPACE_PREFIX):
+    raise ValueError(f"workspace {workspace_id!r} is not a session workspace")
+  return workspace_id[len(_SESSION_WORKSPACE_PREFIX):]
+
+
+def ordinary_admitted_task_factory(
   *,
   operation: Any,
   execution_snapshot: Any,
@@ -1236,7 +1253,7 @@ def _ordinary_admitted_task_factory(
   inputs: tuple[AdmittedInputBinding, ...] = (),
   attempt_number: int = 1,
   resume_of_task_id: str | None = None,
-  logical_task_override: OrdinaryDelegationTaskRef | None = None,
+  logical_task_override: OrdinaryDelegationTaskRef | PipelineStageTaskRef | None = None,
 ) -> Callable[[Any], AdmittedTask]:
   model_bind_digest = sha256_digest(model_bind)
   capability_binding_digest = sha256_digest([
@@ -1258,10 +1275,11 @@ def _ordinary_admitted_task_factory(
       delegation_id=task_id,
       operation=operation.operation,
     )
+    session_id = str(getattr(parent_session, "session_id", "") or "").strip()
     workspace = WorkspaceGrant(
       workspace_id=(
-        f"session:{getattr(parent_session, 'session_id', '')}"
-        if str(getattr(parent_session, "session_id", "") or "").strip()
+        session_workspace_id(session_id)
+        if session_id
         else f"delegation:{task_id}"
       ),
       scope=operation.workspace_scope,
@@ -1301,6 +1319,89 @@ def _ordinary_admitted_task_factory(
     return AdmittedTask.model_validate(payload)
 
   return _factory
+
+
+def _inline_declared_refs(admitted_task: AdmittedTask) -> dict[str, Any]:
+  """The caller's own admitted values, not a copy of another stage's bag."""
+
+  required_ref_keys = (
+    frozenset(admitted_task.operation.required_context) - _SUBJECT_CONTEXT_KEYS
+  )
+  return {
+    binding.name: binding.context.content
+    for binding in admitted_task.inputs
+    if binding.name in required_ref_keys
+    and isinstance(binding.context, InlineExactContextView)
+  }
+
+
+
+async def admitted_task_message_from_handles(
+  admitted_task: AdmittedTask,
+  *,
+  admitted: AdmittedContext[Any],
+  job_id: str,
+  ticker: str | None,
+  research_file_id: int | None,
+  durable_log: Any,
+  workspace_dir: str | None,
+) -> str | Refusal:
+  """The first-attempt message, and the revive of an attempt that took no
+  model turn. Inline inputs and stage-completion refs are one map; a handle
+  wins the same key. Granting a handle does not decide whether the child
+  starts: only a pipeline-stage completion is read, and a failed read of that
+  completion is a refusal. Other grants stay for the child to read."""
+
+  objective = admitted_task.objective
+  assert isinstance(objective, str)
+  refs = _inline_declared_refs(admitted_task)
+  handles = tuple(admitted.wire.handle_grants)
+  if handles and durable_log is not None and workspace_dir:
+    stage_handles = await pipeline_stage_completion_handles(
+      durable_log, handles,
+    )
+    if stage_handles:
+      resolved = await resolve_handle_refs(
+        reader=context_for_child(admitted, job_id=job_id),
+        durable_log=durable_log,
+        workspace_dir=workspace_dir,
+        handles=stage_handles,
+        declared_keys=tuple(
+          key for key in admitted_task.operation.required_context
+          if key not in _SUBJECT_CONTEXT_KEYS
+        ),
+      )
+      if isinstance(resolved, Refusal):
+        return resolved
+      refs.update(resolved)
+  lines = render_resolved_ref_lines(
+    refs, admitted_task.operation.required_context,
+  )
+  body = "\n".join((objective, *lines)) if lines else objective
+  return context_text_with_run_binding(
+    body,
+    ticker=ticker,
+    research_file_id=research_file_id,
+  )
+
+
+def _handle_read_error(failure: Refusal | ResultContentUnavailable) -> dict[str, Any]:
+  if isinstance(failure, Refusal):
+    error: dict[str, Any] = {
+      "code": failure.reason,
+      "message": failure.detail,
+      "owner": failure.owner,
+      "next_call": failure.next_call,
+    }
+    if failure.classification is not None:
+      error["classification"] = failure.classification
+    return error
+  return {
+    "code": failure.code,
+    "message": failure.detail,
+    "owner": "agent_result_content",
+    "next_call": None,
+  }
 
 
 def _prior_result_evidence(
@@ -1366,7 +1467,10 @@ async def _finalize_resume_abandoned(
   async def _owned_finalizer() -> tuple[Any | None, dict[str, Any] | None]:
     async def _reconcile_durable_completion() -> tuple[Any | None, dict[str, Any] | None] | None:
       durable_entry = await runner._lookup_task_in_log(entry.task_id)
-      if durable_entry is None or durable_entry.state == TaskState.INTERRUPTED:
+      if durable_entry is None or durable_entry.state in {
+        TaskState.INTERRUPTED,
+        TaskState.PARKED,
+      }:
         return None
       durable_result = (
         dict(durable_entry.result)
@@ -1402,7 +1506,7 @@ async def _finalize_resume_abandoned(
       }
 
     async with entry.finalization_lock:
-      if entry.state != TaskState.INTERRUPTED:
+      if entry.state not in {TaskState.INTERRUPTED, TaskState.PARKED}:
         existing = getattr(entry, "task_result", None)
         if existing == task_result:
           return existing, None
@@ -1507,7 +1611,8 @@ def _install_child_code_execution(
   *,
   admitted_local_tools: Collection[str],
   session: GatewaySession | None,
-  factory: Callable[[GatewaySession], CodeExecutionBundle | None] | None,
+  factory: Callable[..., CodeExecutionBundle | None] | None,
+  job_runner: Callable[[], Any],
 ) -> CodeExecutionBundle | None:
   if factory is None:
     return None
@@ -1515,7 +1620,9 @@ def _install_child_code_execution(
   # Inherited session closures are not an alternative child interpreter.
   for name in _CODE_EXECUTION_TOOL_NAMES:
     handlers.pop(name, None)
-  bundle = factory(session) if session is not None else None
+  # The child's own runner owns its background cells; it is bound after the
+  # bundle exists, so the factory receives the accessor, not the runner.
+  bundle = factory(session, job_runner=job_runner) if session is not None else None
   if bundle is not None:
     handlers.update({
       name: handler
@@ -1582,7 +1689,7 @@ def make_run_agent_handler(
   tool_policy_implementations: Any | None = None,
   redaction_context_factory: Callable[..., Any] | None = None,
   code_execution_factory: (
-    Callable[[GatewaySession], CodeExecutionBundle | None] | None
+    Callable[..., CodeExecutionBundle | None] | None
   ) = None,
   code_execution_input_preparation_factory: (
     Callable[[CodeExecutionBundle | None], Callable[..., Any] | None] | None
@@ -1710,6 +1817,8 @@ def make_run_agent_handler(
     raw_context_ticker = tool_input.get("ticker")
     raw_operation = tool_input.get("operation")
     named_operation = raw_operation is not None
+    if named_operation and asserted_research_file_id is None and trusted_research_file_id is not None:
+      asserted_research_file_id = trusted_research_file_id
     role = tool_input.get("role")
     effort = tool_input.get("effort")
     for name, value in (("role", role), ("effort", effort)):
@@ -2343,6 +2452,7 @@ def make_run_agent_handler(
           resolve_tool_authority=_resolve_tool_authority,
           # The spawn core's executor is this process's runner.
           placement="in_process",
+          containment=runner._containment,
           outputs=outputs,
         ),
       )
@@ -2394,9 +2504,9 @@ def make_run_agent_handler(
     except CapabilityResolutionError as exc:
       return None, _capability_resolution_error(exc)
     try:
-      require_commercial_child_provider(
+      require_commercial_child_account(
         commercial_work_start,
-        execution.bind.provider,
+        execution.bind.credential_principal,
       )
     except CommercialWorkStartError as exc:
       return None, {"code": exc.code, "message": str(exc)}
@@ -2440,7 +2550,7 @@ def make_run_agent_handler(
       admitted_context=admitted_context,
     )
     system_prompt = execution_snapshot.system_prompt
-    admitted_task_factory = _ordinary_admitted_task_factory(
+    admitted_task_factory = ordinary_admitted_task_factory(
       operation=operation,
       execution_snapshot=execution_snapshot,
       capability_bindings=operation_authority.bindings,
@@ -2458,18 +2568,23 @@ def make_run_agent_handler(
     admitted_task_ref[0] = admitted_task
     context_ticker = _admitted_context_ticker()
     child_research_file_id = _admitted_context_research_file_id()
-    # Both paths render the declared refs from admitted server-held values.
-    child_refs = {
-      binding.name: binding.context.content
-      for binding in admitted_task.inputs
-      if binding.name in required_ref_keys
-      and isinstance(binding.context, InlineExactContextView)
-    }
-    child_message = context_text_with_run_binding(
-      "\n".join((task, *declared_ref_lines(operation, child_refs))),
-      ticker=context_ticker,
-      research_file_id=child_research_file_id,
-    )
+    try:
+      child_message = await admitted_task_message_from_handles(
+        admitted_task,
+        admitted=admission,
+        job_id=ordinary_task_id,
+        ticker=context_ticker,
+        research_file_id=child_research_file_id,
+        durable_log=durable_log,
+        workspace_dir=(
+          None if getattr(runner, "_workspace_dir", None) is None
+          else str(runner._workspace_dir)
+        ),
+      )
+    except ResultContentUnavailable as exc:
+      return None, _handle_read_error(exc)
+    if isinstance(child_message, Refusal):
+      return None, _handle_read_error(child_message)
     result_provenance = TaskResultProvenance(
       admitted_task_digest=admitted_task.admitted_task_digest,
       model_bind_digest=admitted_task.model_bind_digest,
@@ -2492,6 +2607,9 @@ def make_run_agent_handler(
         tool_ctx=tool_ctx,
         durable_appender=durable_skill_event_transport[0],
         durable_confirmer=durable_skill_event_transport[1],
+        declared_terminal_doors=(
+          _sub_agent_skill_state.persist_expectation_doors(admitted_task)
+        ),
       )
       if (
         skill_run_id
@@ -2566,6 +2684,7 @@ def make_run_agent_handler(
           admitted_local_tools=sub_local,
           session=sub_session,
           factory=code_execution_factory,
+          job_runner=lambda: child_runner_ref[0] if child_runner_ref else None,
         )
         child_input_preparation = (
           code_execution_input_preparation_factory(code_execution)
@@ -2582,7 +2701,6 @@ def make_run_agent_handler(
           event_log=sub_log,
           interceptors=interceptors,
           session_id=getattr(runner, "_full_session_id", ""),
-          should_avoid_permission_prompts=background,
           approval_key_qualifier=(
             code_execution.approval_qualifier
             if code_execution is not None
@@ -2837,10 +2955,11 @@ def _spawn_root_context(
 ) -> ParentContext:
   """Re-mint the spawning turn's root with this handler's tool scope.
 
-  The root keeps the selection snapshot the turn edge captured on the session:
-  the snapshot is taken once per turn, so this re-mint names it explicitly
-  rather than dropping it. An admitted child's context is returned unchanged
-  by ``root_context``."""
+  The root keeps the selection snapshot and provenance the turn edge captured
+  on the session: both are taken once per turn, so this re-mint names them
+  explicitly rather than dropping them (a dropped provenance loses the turn's
+  preset from every child it spawns). An admitted child's context is returned
+  unchanged by ``root_context``."""
 
   captured: ParentContext | None = getattr(
     parent_session, "admitted_job_context", None
@@ -2851,6 +2970,9 @@ def _spawn_root_context(
     research_file_id=research_file_id,
     selection_snapshot=(
       captured.selection_snapshot if captured is not None else None
+    ),
+    selection_provenance=(
+      captured.selection_provenance if captured is not None else None
     ),
   )
 
@@ -2869,7 +2991,11 @@ def _admitted_resume_source_error(
       "code": "completion_pending",
       "message": f"Task {task_id} has an unresolved completion",
     }
-  if entry.state not in {TaskState.AWAITING_APPROVAL, TaskState.INTERRUPTED}:
+  if entry.state not in {
+    TaskState.AWAITING_APPROVAL,
+    TaskState.INTERRUPTED,
+    TaskState.PARKED,
+  }:
     return {"code": "not_resumable", "message": f"Task {task_id} is not parked"}
   if not isinstance(entry.admitted_task, AdmittedTask):
     return {
@@ -3055,7 +3181,7 @@ def make_resume_handler(
   tool_policy_implementations: Any | None = None,
   redaction_context_factory: Callable[..., Any] | None = None,
   code_execution_factory: (
-    Callable[[GatewaySession], CodeExecutionBundle | None] | None
+    Callable[..., CodeExecutionBundle | None] | None
   ) = None,
   code_execution_input_preparation_factory: (
     Callable[[CodeExecutionBundle | None], Callable[..., Any] | None] | None
@@ -3181,10 +3307,13 @@ def make_resume_handler(
       if entry is None:
         reconstructed_entry = await runner._lookup_task_in_log(task_id)
         if reconstructed_entry is not None:
-          if reconstructed_entry.state != TaskState.INTERRUPTED:
+          if reconstructed_entry.state not in {
+            TaskState.INTERRUPTED,
+            TaskState.PARKED,
+          }:
             return None, {
-              "code": "not_interrupted",
-              "message": f"Task {task_id} is not interrupted",
+              "code": "not_resumable_state",
+              "message": f"Task {task_id} is not parked or interrupted",
             }
           entry = runner._task_registry.adopt_reconstructed(
             reconstructed_entry
@@ -3209,10 +3338,10 @@ def make_resume_handler(
             "durable outcome settles"
           ),
         }
-      if current.state != TaskState.INTERRUPTED:
+      if current.state not in {TaskState.INTERRUPTED, TaskState.PARKED}:
         return {
-          "code": "not_interrupted",
-          "message": f"Task {task_id} is not interrupted",
+          "code": "not_resumable_state",
+          "message": f"Task {task_id} is not parked or interrupted",
         }
       return None
 
@@ -3433,33 +3562,11 @@ def make_resume_handler(
     resumer_job_id = root.job_id
 
     try:
-      resume_resolver = capability_execution_resolver
-      from .providers.anthropic_oauth import (
-        AnthropicSourceError,
-        anthropic_generation_auth_config,
-        is_anthropic_generation_ref,
+      execution = materialize_frozen_bind(
+        capability_execution_resolver, original_bind,
+        user_scope=getattr(parent_session, "risk_user_id", None),
+        base_config=getattr(parent_session, "auth_config", None) or {},
       )
-
-      if (
-        original_bind.provider == "anthropic"
-        and is_anthropic_generation_ref(original_bind.credential_ref)
-      ):
-        try:
-          exact_config = anthropic_generation_auth_config(
-            original_bind.credential_ref,
-            user_scope=getattr(parent_session, "risk_user_id", None),
-            base_config=getattr(parent_session, "auth_config", None) or {},
-          )
-        except AnthropicSourceError as exc:
-          raise CapabilityResolutionError(
-            "credential_unavailable",
-            "resumed Anthropic credential generation is unavailable",
-            capability_id=original_bind.capability_id,
-          ) from exc
-        resume_resolver = resume_resolver.with_frozen_credential(
-          original_bind, exact_config,
-        )
-      execution = resume_resolver.materialize_bind(original_bind)
     except CapabilityResolutionError as exc:
       resolution_error = _capability_resolution_error(exc)
       return await _abandon(
@@ -3467,9 +3574,9 @@ def make_resume_handler(
         str(resolution_error["message"]),
       )
     try:
-      require_commercial_child_provider(
+      require_commercial_child_account(
         commercial_work_start,
-        execution.bind.provider,
+        execution.bind.credential_principal,
       )
     except CommercialWorkStartError as exc:
       return None, {"code": exc.code, "message": str(exc)}
@@ -3542,7 +3649,8 @@ def make_resume_handler(
       or (
         _admitted_resume_source_error(current_entry, task_id) is not None
         if supplied_successor is not None
-        else current_entry.state != TaskState.INTERRUPTED
+        else current_entry.state
+        not in {TaskState.INTERRUPTED, TaskState.PARKED}
       )
       or current_entry.admitted_task != original_admitted_task
     ):
@@ -3667,6 +3775,17 @@ def make_resume_handler(
       task_id,
       datetime.datetime.now(datetime.UTC).timestamp(),
     )
+    # An attempt interrupted before its first model turn did no work there is
+    # to resume: a revive starts its successor as the first attempt started,
+    # from the admitted objective, and claims no prior progress.
+    restart_from_objective = supplied_successor is None and not any(
+      message.get("role") == "assistant" for message in transcript
+    )
+    operator_note = (
+      additional_context.strip()
+      if additional_context is not None and additional_context.strip()
+      else None
+    )
     if supplied_successor is not None:
       # The workflow owner's frozen snapshot records what the model is told.
       assert supplied_successor.execution_snapshot is not None
@@ -3675,19 +3794,47 @@ def make_resume_handler(
       assert exact_resume_instruction is not None
     else:
       exact_resume_instruction = (
-        additional_context.strip()
-        if additional_context is not None and additional_context.strip()
-        else "Resume the admitted task from its durable transcript."
+        operator_note or "Resume the admitted task from its durable transcript."
       )
       successor_execution_snapshot = resume_agent_execution_snapshot(
         original_execution_snapshot,
         resume_instruction=exact_resume_instruction,
       ).model_copy(update={"admitted_context": continuation.wire})
-    reconstructed_messages = place_resume_messages(
-      transcript,
-      synthetic_results,
-      parent_messages,
-      exact_resume_instruction,
+    context_research_file_id = admitted_research_file_id
+    if context_research_file_id == 0:
+      context_research_file_id = None
+    resume_workspace = getattr(runner, "_workspace_dir", None)
+    if restart_from_objective:
+      try:
+        restart_message = await admitted_task_message_from_handles(
+          original_admitted_task,
+          admitted=continuation,
+          job_id=task_id,
+          ticker=admitted_ticker,
+          research_file_id=context_research_file_id,
+          durable_log=durable_log,
+          workspace_dir=None if resume_workspace is None else str(resume_workspace),
+        )
+      except ResultContentUnavailable as exc:
+        return await _abandon(exc.code, exc.detail)
+      if isinstance(restart_message, Refusal):
+        return await _abandon(restart_message.reason, restart_message.detail)
+    else:
+      restart_message = ""
+    reconstructed_messages = (
+      place_resume_messages(
+        [user_turn_message(restart_message)],
+        [],
+        parent_messages,
+        operator_note,
+      )
+      if restart_from_objective
+      else place_resume_messages(
+        transcript,
+        synthetic_results,
+        parent_messages,
+        exact_resume_instruction,
+      )
     )
     if successor_execution_snapshot.provider_tool_definitions is None:
       successor_execution_snapshot = successor_execution_snapshot.model_copy(
@@ -3721,9 +3868,6 @@ def make_resume_handler(
     parent_turn_id = getattr(tool_ctx, "tool_call_id", None)
     call_index = int(kwargs.get("call_index", 0) or 0)
     skill_run_id = secrets.token_hex(16)
-    context_research_file_id = admitted_research_file_id
-    if context_research_file_id == 0:
-      context_research_file_id = None
     if fms_rebinder is not None and context_research_file_id is not None and context_research_file_id > 0:
       fms_rebinder(sub_local, context_research_file_id)
     resume_root_id = await runner._resume_root_task_id(task_id)
@@ -3809,7 +3953,11 @@ def make_resume_handler(
         "schema_version": "1.2",
         "admitted_task_id": f"admitted:{successor_task_id}",
         "attempt": successor_attempt.model_dump(mode="json"),
-        "objective": f"Resume interrupted delegation {task_id}",
+        "objective": (
+          original_admitted_task.objective
+          if restart_from_objective
+          else f"Resume interrupted delegation {task_id}"
+        ),
         "execution_snapshot": successor_execution_snapshot.model_dump(mode="json"),
         "tool_grant": successor_grant.model_dump(mode="json"),
         "tool_grant_digest": successor_grant.digest,
@@ -3840,6 +3988,11 @@ def make_resume_handler(
       tool_ctx=tool_ctx,
       durable_appender=runner._append_durable_event,
       durable_confirmer=runner._confirm_durable_skill_event,
+      declared_terminal_doors=(
+        _sub_agent_skill_state.persist_expectation_doors(
+          successor_admitted_task
+        )
+      ),
     )
     effective_session_inject_servers = (
       _effective_mcp_session_inject_servers(
@@ -3864,7 +4017,10 @@ def make_resume_handler(
       if parent_session is not None:
         sub_session = child_gateway_session(
           parent_session,
-          session_id=_derive_sub_agent_id(parent_session, background_call_index),
+          # The id the hosting runner registered this successor under, so its
+          # own attach is the segment its lineage reads; a learning fork's host
+          # runs on the fork's session, not the handler's owning session.
+          session_id=_derive_sub_agent_id(runner._gateway_session_id, background_call_index),
           tenant=continuation.wire.tenant,
           auth_config=execution.auth_config,
           user_id=parent_session.user_id,
@@ -3893,6 +4049,7 @@ def make_resume_handler(
           admitted_local_tools=admitted_local_tool_ids,
           session=sub_session,
           factory=code_execution_factory,
+          job_runner=lambda: child_runner_ref[0] if child_runner_ref else None,
         )
         child_input_preparation = (
           code_execution_input_preparation_factory(code_execution)
@@ -3915,7 +4072,6 @@ def make_resume_handler(
           event_log=sub_log,
           interceptors=interceptors,
           session_id=getattr(runner, "_full_session_id", ""),
-          should_avoid_permission_prompts=True,
           approval_key_qualifier=(
             code_execution.approval_qualifier
             if code_execution is not None
@@ -4064,7 +4220,9 @@ def make_resume_handler(
         if source_state_error is not None:
           current_source = runner._task_registry.get(task_id) or entry
           if current_source.state not in {
-            TaskState.AWAITING_APPROVAL, TaskState.INTERRUPTED,
+            TaskState.AWAITING_APPROVAL,
+            TaskState.INTERRUPTED,
+            TaskState.PARKED,
           }:
             source_state_error = {
               "code": "source_terminated",
@@ -4258,6 +4416,8 @@ __all__ = [
   "reserve_admitted_successor",
   "resume_admitted_successor",
   "resume_binding_for",
+  "session_of_workspace",
+  "session_workspace_id",
   "ApprovedCallRef",
   "continue_approved_child",
   "make_get_background_result_handler",

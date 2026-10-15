@@ -12,6 +12,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import AgentRunner, ToolDispatcher  # noqa: E402
+from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
 from agent_gateway.mcp_client import McpClientManager  # noqa: E402
 from agent_gateway.multi_user.billing import UsageTotals  # noqa: E402
 from agent_gateway.providers import ModelInfo, ModelProvider
@@ -271,6 +272,7 @@ def test_tool_history_preserves_a_semantic_copy_without_changing_execution_input
 
   provider = _Provider()
   runner = object.__new__(AgentRunner)
+  runner._containment = ContainmentSettings()
   runner._provider = provider
   runner._dispatcher = _Dispatcher(capability_bind=TEST_CAPABILITY_BIND)
   runner._capability_execution = stub_runner_capability_execution(
@@ -380,6 +382,7 @@ def test_stream_turn_cancellation_preserves_primary_when_internal_close_fails(
 
   provider = _Provider()
   runner = object.__new__(AgentRunner)
+  runner._containment = ContainmentSettings()
   runner._provider = provider
   runner._capability_execution = stub_runner_capability_execution(
     provider=provider,
@@ -506,6 +509,7 @@ def test_stream_guard_appends_heartbeat_while_tool_input_streams(
 
   provider = _Provider()
   runner = object.__new__(AgentRunner)
+  runner._containment = ContainmentSettings()
   runner._provider = provider
   runner._capability_execution = stub_runner_capability_execution(
     provider=provider,
@@ -812,7 +816,6 @@ def test_queued_child_heartbeats_preserve_parent_liveness_and_peer_stall(
   monkeypatch.setattr(stream_turn_module, "STREAM_PROGRESS_LOG_INTERVAL", 0.03)
   monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 0)
   monkeypatch.setattr(children, "STREAM_GUARD_POLL_INTERVAL", 0.01)
-  monkeypatch.setattr(children, "SUB_AGENT_ACTIVITY_GAP", 0.15)
 
   async def case():
     bucket = AnthropicTokenBucket(rpm=120)
@@ -861,7 +864,7 @@ def test_queued_child_heartbeats_preserve_parent_liveness_and_peer_stall(
       ))
 
     parent_stall = await children._await_child_under_activity_guard(
-      child_run(), activity,
+      child_run(), activity, silence_timeout=0.15,
     )
     assert parent_stall is None
     assert provider_wait[0] > 0.35

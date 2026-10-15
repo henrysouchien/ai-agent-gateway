@@ -128,6 +128,7 @@ def build_agent_operation_snapshot(
   evidence_ports: Sequence[EvidencePort] = (),
   resumable: bool = False,
   terminal_on_persist: bool = True,
+  result_requires_persist: bool = False,
   children: Sequence[str] = (),
 ) -> AgentOperationSnapshot:
   """Build the canonical immutable snapshot from scalar and wire values."""
@@ -146,6 +147,8 @@ def build_agent_operation_snapshot(
     raise TypeError("resumable must be a bool")
   if type(terminal_on_persist) is not bool:
     raise TypeError("terminal_on_persist must be a bool")
+  if type(result_requires_persist) is not bool:
+    raise TypeError("result_requires_persist must be a bool")
   if workspace_scope not in {"read_only", "workspace_write", "model_write"}:
     raise ValueError("workspace_scope is invalid")
   if type(methodology_instructions) is not str:
@@ -209,6 +212,7 @@ def build_agent_operation_snapshot(
     evidence_ports=ports,
     resumable=resumable,
     terminal_on_persist=terminal_on_persist,
+    result_requires_persist=result_requires_persist,
     children=child_names,
     result_modes=("narrative",),
     projection_contracts=(),

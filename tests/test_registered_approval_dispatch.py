@@ -18,7 +18,11 @@ from agent_gateway import ToolDispatcher
 from agent_gateway.mcp_client import McpClientManager, RegisteredMcpDirectToolCall
 from agent_gateway.single_user_policy import SingleUserApprovalPolicy
 from agent_gateway.tool_definition import LiveToolRouteBinding, OriginatedToolDefinition
-from agent_gateway.tool_dispatcher_helpers import ToolResult, TransportApprovalRequest
+from agent_gateway.tool_dispatcher_helpers import (
+  ToolResult,
+  TransportApprovalRequest,
+  TransportApprovalResult,
+)
 from agent_gateway.tool_policy_registry import (
   PlanDecision,
   PreparedToolCall,
@@ -908,8 +912,8 @@ def test_live_registered_mcp_resolves_its_descriptor_not_its_exposed_name() -> N
 
   async def _request_approval(
     _request: TransportApprovalRequest,
-  ) -> None:
-    return None
+  ) -> TransportApprovalResult:
+    return TransportApprovalResult(approved=False)
 
   dispatcher = ToolDispatcher(
     capability_bind=TEST_CAPABILITY_BIND,

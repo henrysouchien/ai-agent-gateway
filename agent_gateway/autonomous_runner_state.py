@@ -131,11 +131,32 @@ _REHYDRATION_INTERRUPTED_ERROR = "gateway restarted while run was active"
 _REHYDRATE_EVENTS_SIZE_CAP_BYTES = 5 * 1024 * 1024
 _REHYDRATE_EVENTS_TAIL_LINES = 2000
 _TASK_MANIFEST_VERSION = 8
+_TOOL_SURFACE_FIELDS = (
+  "active_servers",
+  "allowed_mcp_tools_by_server",
+  "allowed_tools",
+  "visible_tool_count",
+)
 _RUN_SEQUENCE_CURSOR_FILE = ".autonomous-sequence.json"
 _SKIP_WARNED_FILE = ".manifest-skip-warned.json"
 _SKIP_WARNED: set[str] = set()
 _SKIP_WARNED_LOADED_DIRS: set[str] = set()
 _LOGGER = logging.getLogger("agent_gateway.autonomous_runner")
+
+
+def _tool_surface_from_mapping(source: dict[str, Any]) -> dict[str, Any] | None:
+  """The tool-surface fields `source` (a manifest or the child's event) carries.
+
+  None when it carries none: records written before the fields existed, and
+  runs whose child has not reported yet.
+  """
+
+  surface = {
+    field_name: source[field_name]
+    for field_name in _TOOL_SURFACE_FIELDS
+    if source.get(field_name) is not None
+  }
+  return surface or None
 
 
 def _skip_warned_key(manifest_path: Path, message: str, mtime_ns: int) -> str:
@@ -168,6 +189,23 @@ def is_root_terminal_event(event: Any) -> bool:
     is_root_run_event(event)
     and event.get("type") in _ROOT_TERMINAL_EVENT_TYPES
   )
+
+
+def _terminal_cause_text(
+  event: dict[str, Any],
+  fields: tuple[str, str],
+) -> str | None:
+  """``code: message`` from a terminal, each part once, or None if neither."""
+  parts: list[str] = []
+  for field in fields:
+    value = event.get(field)
+    if not value:
+      continue
+    text = str(value)
+    if any(text in part for part in parts):
+      continue
+    parts.append(text)
+  return ": ".join(parts) or None
 
 
 def _runtime_module() -> Any:
@@ -368,6 +406,7 @@ class AutonomousTask:
   manifest_version: int = _TASK_MANIFEST_VERSION
   research_file_id: int | None = None
   autonomous_in_flight_at_start: int | None = None
+  owner_run_limit: int | None = None
   credential_handoff_bytes: int | None = None
   state: str = "running"
   exit_code: int | None = None
@@ -416,6 +455,7 @@ class AutonomousTask:
   claim_broker: AutonomousClaimBroker | None = None
   launch_nonce: str | None = None
   approval_channel: AutonomousApprovalChannelParent | None = None
+  tool_surface: dict[str, Any] | None = None
 
   def __post_init__(self) -> None:
     if self.mode not in {"once", "task", "skill", "pack"}:
@@ -1041,6 +1081,7 @@ class AutonomousRegistryStateMixin:
       "dev_mode": record.dev_mode,
       "research_file_id": record.research_file_id,
       "autonomous_in_flight_at_start": record.autonomous_in_flight_at_start,
+      "owner_run_limit": record.owner_run_limit,
       "credential_handoff_bytes": record.credential_handoff_bytes,
       "dispatch_scope": _normalize_dispatch_scope(record.dispatch_scope),
       "containment_expectation": {
@@ -1098,6 +1139,12 @@ class AutonomousRegistryStateMixin:
       record.tool_authority.model_dump(mode="json")
       if record.tool_authority is not None else None
     )
+    # The tool surface the child launched with, reported by its
+    # `tool_surface_declared` event; null until reported and on records
+    # written before the field existed.
+    surface = record.tool_surface or {}
+    for field_name in _TOOL_SURFACE_FIELDS:
+      payload[field_name] = surface.get(field_name)
     return payload
 
   def _attach_manifest_tracking(self, record: AutonomousTask) -> None:
@@ -1440,7 +1487,7 @@ class AutonomousRegistryStateMixin:
           )
         return (
           "failed",
-          str(event.get("error") or event.get("message") or event_type),
+          _terminal_cause_text(event, ("error", "message")) or event_type,
           None,
         )
       if event_type != "stream_complete":
@@ -1455,7 +1502,15 @@ class AutonomousRegistryStateMixin:
           )
         return "completed", None, None
       if disposition == "interrupted":
-        return "interrupted", None, terminal_reason
+        # The enum reason is the record's typed field; any other reason the
+        # child ended on is the run's stated cause and rides `error`.
+        return (
+          "interrupted",
+          None
+          if terminal_reason is not None
+          else _terminal_cause_text(event, ("reason", "message")),
+          terminal_reason,
+        )
       return (
         "failed",
         f"Invalid stream_complete terminal_disposition: {disposition!r}",
@@ -1479,7 +1534,7 @@ class AutonomousRegistryStateMixin:
     fallback (manifest state, or an abandoned run) decides.
     """
     if outcome == "interrupted":
-      return "interrupted", None, terminal_reason
+      return "interrupted", terminal_error, terminal_reason
     if outcome == "completed":
       if exit_code == 0:
         return "completed", None, None
@@ -1526,6 +1581,33 @@ class AutonomousRegistryStateMixin:
   def _coerce_manifest_str(self, manifest: dict[str, Any], field_name: str) -> str | None:
     value = manifest.get(field_name)
     return value if isinstance(value, str) else None
+
+  def _record_tool_surface(
+    self,
+    record: AutonomousTask,
+    event: dict[str, Any],
+  ) -> None:
+    """Keep the child's launch-time `tool_surface_declared` facts on the record.
+
+    The first declaration is the run's launch surface; later ones come from
+    session objects the same run builds again and are not a second launch.
+    """
+
+    if record.tool_surface is not None:
+      return
+    surface = _tool_surface_from_mapping(event)
+    if surface is None:
+      return
+    record.tool_surface = surface
+    if not self._write_task_manifest(record, checked=True):
+      record.error = (
+        "autonomous tool surface manifest write failed; "
+        f"run continues but its record omits the declared tool surface for {record.task_id}"
+      )
+      _LOGGER.warning(
+        "Autonomous tool surface manifest write failed for %s",
+        record.task_id,
+      )
 
   def _task_from_manifest(
     self,
@@ -1888,6 +1970,12 @@ class AutonomousRegistryStateMixin:
     record_autonomous_in_flight_at_start = _positive_int(
       manifest.get("autonomous_in_flight_at_start")
     )
+    record_owner_run_limit = manifest.get("owner_run_limit")
+    if (
+      type(record_owner_run_limit) is not int
+      or record_owner_run_limit < 0
+    ):
+      record_owner_run_limit = None
     record_credential_handoff_bytes = _positive_int(
       manifest.get("credential_handoff_bytes")
     )
@@ -1923,6 +2011,7 @@ class AutonomousRegistryStateMixin:
         require_exists=False,
       )
     )
+    record_tool_surface = _tool_surface_from_mapping(manifest)
     try:
       record_role = require_exact_role(manifest.get("role"))
       record = AutonomousTask(
@@ -1962,6 +2051,7 @@ class AutonomousRegistryStateMixin:
         manifest_version=manifest_version,
         research_file_id=record_research_file_id,
         autonomous_in_flight_at_start=record_autonomous_in_flight_at_start,
+        owner_run_limit=record_owner_run_limit,
         credential_handoff_bytes=record_credential_handoff_bytes,
         state=raw_state,
         exit_code=exit_code,
@@ -1988,6 +2078,7 @@ class AutonomousRegistryStateMixin:
         admitted_context=admitted_context,
         tool_authority=tool_authority,
         tool_result_spill_dir=record_tool_result_spill_dir,
+        tool_surface=record_tool_surface,
       )
     except (TypeError, ValueError):
       _LOGGER.warning(

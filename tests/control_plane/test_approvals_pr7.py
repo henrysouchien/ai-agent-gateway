@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from dataclasses import replace
+from datetime import UTC, datetime
 from itertools import count
 from pathlib import Path
 from types import SimpleNamespace
@@ -775,7 +776,7 @@ def test_control_approval_list_resolve_unblocks_queue_persists_grant_and_audits(
       )
     )
     assert grant is not None
-    entries, _cursor = _run(writer.query(approval_id=approval.approval_id, event_type="vote_recorded"))
+    entries, _cursor = _run(writer.query(owner_user_id="alice", approval_id=approval.approval_id, event_type="vote_recorded"))
     assert len(entries) == 1
     assert entries[0].decider_id == "alice"
     assert entries[0].decider_role == "owner"
@@ -1216,7 +1217,7 @@ def test_batch_approval_rejects_cross_user_channel_run_and_durable_identity_mism
     assert mismatch_queue.empty()
 
 
-def test_batch_approval_expiry_wins_over_late_vote(tmp_path) -> None:
+def test_batch_approval_delivers_late_authenticated_vote_after_old_expiry(tmp_path) -> None:
   app, store, _policy, _writer = _make_app(tmp_path)
   with TestClient(app) as client:
     alice = _control_session(client, "alice")
@@ -1225,19 +1226,23 @@ def test_batch_approval_expiry_wins_over_late_vote(tmp_path) -> None:
       store=store,
       batch_id=61,
       owner_user_id="alice",
-      expires_at=utc_now(),
+      expires_at=datetime(2000, 1, 1, tzinfo=UTC),
     )
-    assert _run(store.expire_pending()) == 1
+    pending_record = _run(store.get(approval.approval_id))
+    assert pending_record is not None
+    assert pending_record.state == "pending_user"
     response = client.post(
       f"/api/control/runs/batch_61/approvals/{approval.approval_id}",
       headers=_headers(alice),
       json={"approved": True},
     )
-    assert response.status_code == 409
-    assert response.json()["error"] == "Approval request already resolved"
-    expired_record = _run(store.get(approval.approval_id))
-    assert expired_record is not None
-    assert expired_record.state == "expired"
+    assert response.status_code == 200, response.text
+    approved_record = _run(store.get(approval.approval_id))
+    assert approved_record is not None
+    assert approved_record.state == "approved"
+    assert approved_record.decider_id == "alice"
+    delivered = queue.get_nowait()
+    assert delivered["approved"] is True
     assert queue.empty()
 
 
@@ -2121,6 +2126,59 @@ def test_control_captured_approval_votes_after_cache_clear_and_stale_address(tmp
     assert replay.status_code == 200, replay.text
     assert _run(store.get(approval.approval_id)) == stored
     assert policy.resolved == [approval.approval_id]
+
+
+def test_control_lists_parked_approval_without_live_session_entry(tmp_path) -> None:
+  app, store, policy, _writer = _make_app(tmp_path)
+  with TestClient(app) as client:
+    chat = _with_role(app, _chat_session(client, "alice"), "owner")
+    control = _with_role(app, _control_session(client, "alice"), "owner")
+    web_control = _control_session(client, "alice", channel="web")
+    bob_control = _control_session(client, "bob")
+    approval, nonce = _install_captured_approval(
+      store=store,
+      chat_payload=chat,
+      user_id="alice",
+    )
+    session = _session(app, chat)
+    assert approval.tool_call_id not in session.pending_tools
+
+    listed = client.get("/api/control/approvals", headers=_headers(control))
+    assert listed.status_code == 200, listed.text
+    approvals = listed.json()["approvals"]
+    assert [item["approval_id"] for item in approvals] == [approval.approval_id]
+    assert approvals[0]["state"] == "pending_user"
+    assert approvals[0]["tool_call_id"] == approval.tool_call_id
+    assert "nonce" not in approvals[0]
+    for private_value in ("private-original-operand", "private-original-generation", nonce):
+      assert private_value not in listed.text
+
+    session.pending_tools[approval.tool_call_id] = {
+      "approval_id": approval.approval_id,
+      "nonce": nonce,
+      "status": "approval_pending",
+    }
+    live_and_parked = client.get("/api/control/approvals", headers=_headers(control))
+    assert [item["approval_id"] for item in live_and_parked.json()["approvals"]] == [
+      approval.approval_id
+    ]
+    session.pending_tools.clear()
+
+    for outsider in (bob_control, web_control):
+      hidden = client.get("/api/control/approvals", headers=_headers(outsider))
+      assert hidden.status_code == 200, hidden.text
+      assert hidden.json()["approvals"] == []
+
+    decided = client.post(
+      f"/api/control/runs/{chat['session_id']}/approvals/{approval.approval_id}",
+      headers=_headers(control),
+      json={"approved": True, "reason": "found it parked"},
+    )
+    assert decided.status_code == 200, decided.text
+    assert policy.resolved == [approval.approval_id]
+    after_decision = client.get("/api/control/approvals", headers=_headers(control))
+    assert after_decision.status_code == 200, after_decision.text
+    assert after_decision.json()["approvals"] == []
 
 
 def test_captured_approval_keeps_auth_tenant_channel_and_current_role_policy(tmp_path) -> None:

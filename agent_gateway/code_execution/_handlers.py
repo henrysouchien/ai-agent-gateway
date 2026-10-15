@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 import tempfile
@@ -9,21 +11,27 @@ from dataclasses import dataclass, replace
 from itertools import islice
 from typing import AbstractSet, Any, Callable, Dict, List, Optional
 
+from agent_workflow_contracts.models import AdmittedTenant
 from ..agent_telemetry import make_prepare_env_with_agent_telemetry
 from ..runner import ToolResultContext
-from ..secret_boundary import SecretBoundary
+from ..secret_boundary import SecretBoundary, sanitization_failure_tool_input, sanitize_boundary_value
 from ..session import GatewaySession
+from ..task_registry import TASK_NOTIFICATION_INLINE_PAYLOAD_MAX_BYTES, TaskState
+from ..tool_dispatch_classification import (
+  build_dispatch_record_from_sources, classify_semantic_tool_error, resolve_dispatch_entry,
+)
 from ..tool_dispatcher import ApprovalKeyQualifier, LocalToolHandler
 from ..tool_policy_registry import PreparedToolCall, ToolInputPreparationError
-from ._background import BackgroundTask, OutputRingBuffer
 from ._backends import DockerBackend, ExecutionBackend, SubprocessBackend
 from ._backends._kernel import KernelBackend, KernelState
 from ._config import CodeExecutionConfig
 from ._frame_reader import CatalogMetadata, CodeCallable, FrameReader, SourceExtractor, SourceKey
-from ._helpers import _boolean_input, _prepare_code_execute_env, _string_input, _timeout_ms_input, code_execute
-from ._hooks import strip_code_execute_base64_hook
+from ._helpers import (
+  _boolean_input, _host_wait_ms_input, _prepare_code_execute_env, _string_input, _timeout_ms_input, code_execute,
+)
+from ._hooks import strip_code_execute_base64_content, strip_code_execute_base64_hook
 from ._provenance import AGENT_CODE_EXECUTE_WORK_DIR_ENV, collect_native_computations
-from ._tool_defs import make_code_execute_status_tool_def, make_code_execute_tool_def
+from ._tool_defs import make_code_execute_tool_def
 
 log = logging.getLogger(__name__)
 
@@ -78,16 +86,94 @@ class CodeExecutionBundle:
     )
 
 
+def _code_job_model_result(runner: Any, task_id: str, result: Dict[str, Any]) -> Any:
+  """The model-facing form of a background cell's result, stored on its job.
+
+  The projection a foreground cell's result entry gets — runner annotation,
+  image bytes stripped, bulk spilled through the runner's sink — bounded by
+  what the registry delivers inline.
+  """
+  content = strip_code_execute_base64_content(
+    json.dumps(runner._annotate_result(result, tool_name="code_execute"), default=str),
+  )
+  live_entry, _ = runner._compact_model_tool_result_entry(
+    {"type": "tool_result", "tool_use_id": task_id, "content": content},
+    tool_name="code_execute",
+    max_chars=TASK_NOTIFICATION_INLINE_PAYLOAD_MAX_BYTES,
+  )
+  return json.loads(live_entry["content"])
+
+
+def _code_job_result_context(
+  runner: Any,
+  *,
+  prepared_call: PreparedToolCall,
+  result: Dict[str, Any],
+  model_result: Any,
+  tool_call_id: str,
+  duration_ms: int,
+) -> ToolResultContext:
+  """The `on_tool_result` context of a completed background cell.
+
+  Settled through the runner's dispatcher as the foreground call settles, so
+  the citation hooks mint the cell's sources and computations.
+  """
+  dispatcher = runner._dispatcher
+  dispatch_entry = resolve_dispatch_entry(
+    "code_execute", origin=dispatcher.route_origin_for_tool("code_execute"),
+  )
+  settlement = dispatcher.settle_tool_result(
+    "code_execute", dispatch_entry, result, None, classify_semantic_tool_error(result),
+    prepared_call=prepared_call,
+  )
+  boundary = getattr(runner, "_secret_boundary", None)
+  redacted = sanitize_boundary_value(
+    dispatcher.redact_prepared_tool_input("code_execute", prepared_call),
+    sink="tool_input",
+    boundary=boundary,
+  )
+  return ToolResultContext(
+    tool_name="code_execute",
+    tool_input=prepared_call.materialize_input(),
+    redacted_tool_input=redacted if isinstance(redacted, dict) else sanitization_failure_tool_input(),
+    result=result,
+    error=None,
+    duration_ms=duration_ms,
+    tool_call_id=tool_call_id,
+    session_id=runner._full_session_id,
+    server=None,
+    result_entry={
+      "type": "tool_result",
+      "tool_use_id": tool_call_id,
+      "content": json.dumps(model_result, default=str),
+    },
+    skill_run_id=runner._skill_run_id,
+    workspace_dir=runner._workspace_dir,
+    batch_id=getattr(runner, "_batch_id", None),
+    dispatch=build_dispatch_record_from_sources(
+      entry=dispatch_entry, outcome=settlement.outcome, sources=settlement.sources,
+    ),
+    boundary_sanitizer=lambda value, sink: sanitize_boundary_value(value, sink=sink, boundary=boundary),
+  )
+
+
 def build_code_execution(
   session: GatewaySession,
   config: CodeExecutionConfig | None = None,
+  *,
+  job_runner: Callable[[], Any] | None = None,
 ) -> CodeExecutionBundle:
   """Create built-in code execution tools for a session.
 
   `host=auto` prefers Docker, then a registered host kernel, then subprocess;
   skipped backend reasons are logged and returned with the selected backend.
-  Reader, persistent interpreter states, work directory and background tasks
-  belong to the session. Each bundle carries the current request's config.
+  Reader, persistent interpreter states and work directory belong to the
+  session. Each bundle carries the current request's config.
+
+  `job_runner()` answers the `AgentRunner` that owns this request's task
+  registry, or None, at call time: runners are built after their bundles.
+  A `background=true` cell is a `code` job on that registry, inspected,
+  waited on and killed through the registry; without a runner it is refused.
   """
   cfg = config or CodeExecutionConfig()
 
@@ -155,12 +241,23 @@ def build_code_execution(
 
   work_dir_lock = threading.Lock()
   if session.code_execution_frame_reader is None:
-    session.code_execution_frame_reader = FrameReader(principal={
-      "user_id": session.user_id,
-      "user_email": session.user_email,
-      "risk_user_id": session.risk_user_id,
-    })
+    job_context = getattr(session, "admitted_job_context", None)
+    admitted_tenant = (
+      job_context.tenant
+      if job_context is not None and isinstance(job_context.tenant, AdmittedTenant)
+      else None
+    )
+    session.code_execution_frame_reader = FrameReader(
+      principal={
+        "user_id": session.user_id,
+        "user_email": session.user_email,
+        "risk_user_id": session.risk_user_id,
+      },
+      session_id=session.session_id,
+      tenant=admitted_tenant,
+    )
   frame_reader = session.code_execution_frame_reader
+  frame_reader.bind_job_runner(job_runner)
 
   def _ensure_code_execution_work_dir() -> str:
     if session.code_execution_work_dir:
@@ -306,48 +403,102 @@ def build_code_execution(
       if error is not None:
         return None, error
       assert timeout_ms is not None
+      _, error = _host_wait_ms_input(tool_input, cfg)
+      if error is not None:
+        return None, error
+      runner = job_runner() if job_runner is not None else None
+      if runner is None:
+        return None, {
+          "code": "code_execution_unavailable",
+          "message": "background cells need the session's job runner",
+        }
       env = _prepare_code_execute_env(per_call_config)
       task_id = f"ce_{os.urandom(4).hex()}"
-      stdout_buf = OutputRingBuffer()
-      stderr_buf = OutputRingBuffer()
+      identity = _backend_identity(host, backend)
+      job_redact = _output_redactor(tool_ctx)
+      prepared_call = PreparedToolCall(dict(tool_input), backend.name)
+      launched_at = time.time()
+      # The cell's own result: its model projection drops the native
+      # computations and may elide the sources the citation hooks mint.
+      cell_result: List[Dict[str, Any]] = []
 
-      def _on_bg_output(stream_name: str, text: str) -> None:
-        if stream_name == "stderr":
-          stderr_buf.append(stream_name, text)
-          return
-        stdout_buf.append(stream_name, text)
-
-      # A background cell outlives this turn; its own cancellation closes the
-      # registration while the session's interpreter remains available.
-      cell = frame_reader.open_cell(outer_call_id, abort_event=None, active=False)
-      try:
-        handle = await backend.start_bridged(
-          code,
-          work_dir,
-          bridge=cell,
-          task_id=task_id,
-          timeout_ms=timeout_ms,
-          env=env,
-          on_output=_on_bg_output,
+      async def _run_code_job(_job_input: Dict[str, Any], **_job_kwargs: Any):
+        # The registry owns this job's lifetime: its kill cancels this
+        # coroutine, which stops the process and closes the cell.
+        cell = frame_reader.open_cell(
+          outer_call_id, abort_event=None, active=False, tool_ctx=tool_ctx,
         )
-      except BaseException:
-        await cell.aclose()
-        raise
-      session.background_tasks[task_id] = BackgroundTask(
-        task_id=task_id,
-        handle=handle,
-        backend=backend,
-        stdout_buf=stdout_buf,
-        stderr_buf=stderr_buf,
-        started_at=time.time(),
-        tool_call_id=getattr(tool_ctx, "tool_call_id", None),
-        bridge=cell,
+        cell.job = (runner, task_id)
+        try:
+          handle = await backend.start_bridged(
+            code,
+            work_dir,
+            bridge=cell,
+            task_id=task_id,
+            timeout_ms=timeout_ms,
+            env=env,
+          )
+        except BaseException:
+          await cell.aclose()
+          raise
+        try:
+          while True:
+            poll_result = await backend.poll(handle)
+            if poll_result.get("status") == "completed" or _handle_has_exited(handle):
+              break
+            await asyncio.sleep(0.25)
+          result = await backend.collect(handle)
+        except BaseException:
+          try:
+            await backend.cancel(handle)
+            await backend.cleanup(handle.work_dir, task_id=task_id)
+          finally:
+            await cell.aclose()
+          raise
+        try:
+          await backend.cleanup(handle.work_dir, task_id=task_id)
+        finally:
+          await cell.aclose()
+        result.update(identity)
+        result.update(cell.summary())
+        collect_native_computations(result)
+        result = _redact_execution_output(result, job_redact)
+        cell_result.append(result)
+        return _code_job_model_result(runner, task_id, result), None
+
+      async def _on_code_job_complete(entry: Any) -> None:
+        # A completed cell's result settles and reaches `on_tool_result` as a
+        # foreground cell's does, under the call that launched it.
+        if entry.state != TaskState.COMPLETED or not cell_result:
+          return
+        await runner._call_on_tool_result(_code_job_result_context(
+          runner,
+          prepared_call=prepared_call,
+          result=cell_result[0],
+          model_result=entry.result,
+          tool_call_id=outer_call_id,
+          duration_ms=int((time.time() - launched_at) * 1000),
+        ))
+
+      launched, error = await runner._register_background_task(
+        tool_input=dict(tool_input),
+        handler=_run_code_job,
+        task_type="code",
+        task_id_override=task_id,
+        capability_bind_receipt=runner.capability_execution.bind.to_json(),
+        on_complete=_on_code_job_complete,
       )
+      if error is not None:
+        return None, error
+      assert launched is not None
       return {
-        "status": "running",
-        "task_id": task_id,
-        "message": "Use code_execute_status(task_id=...) to check progress.",
-        **_backend_identity(host, backend),
+        **launched,
+        "message": (
+          "The cell runs as a background job; its result arrives as a task "
+          "notification, or via get_background_result(task_id=...) when "
+          "notifications are off."
+        ),
+        **identity,
       }, None
 
     chunk_seq = [0]
@@ -372,6 +523,7 @@ def build_code_execution(
       outer_call_id,
       abort_event=getattr(tool_ctx, "abort_event", None),
       active=False,
+      tool_ctx=tool_ctx,
     )
     try:
       result, error = await code_execute(
@@ -389,68 +541,6 @@ def build_code_execution(
       result.update(cell.summary())
       collect_native_computations(result)
     return _redact_execution_output(result, redact), error
-
-  async def _handle_code_execute_status(tool_input: Dict[str, Any], **kwargs: Any):
-    redact = _output_redactor(kwargs.get("tool_ctx"))
-    task_id, error = _string_input(
-      tool_input,
-      "task_id",
-      required_message="task_id is required",
-      non_empty=True,
-    )
-    if error is not None:
-      return None, error
-    assert task_id is not None
-    task_id = task_id.strip()
-    cancel, error = _boolean_input(tool_input, "cancel", default=False)
-    if error is not None:
-      return None, error
-    assert cancel is not None
-    task = session.background_tasks.get(task_id)
-    if task is None:
-      return None, {"code": "not_found", "message": f"Unknown task_id: {task_id}"}
-
-    backend = task.backend
-    if task._in_progress:
-      return {
-        "status": "running",
-        "task_id": task_id,
-        "message": "Lifecycle op in progress",
-      }, None
-
-    poll_result = await backend.poll(task.handle)
-    if cancel:
-      if poll_result.get("status") == "completed" or _handle_has_exited(task.handle):
-        result = await task.safe_collect(backend)
-        if task._terminated:
-          session.background_tasks.pop(task_id, None)
-        if isinstance(result, dict):
-          collect_native_computations(result)
-        return _redact_execution_output(result, redact), None
-      await task.safe_cancel(backend)
-      if task._terminated:
-        session.background_tasks.pop(task_id, None)
-      return {"status": "cancelled", "task_id": task_id}, None
-
-    if poll_result.get("status") == "completed" or _handle_has_exited(task.handle):
-      result = await task.safe_collect(backend)
-      if task._terminated:
-        session.background_tasks.pop(task_id, None)
-      if isinstance(result, dict):
-        collect_native_computations(result)
-      return _redact_execution_output(result, redact), None
-
-    stdout_tail = task.stdout_buf.tail(20) or str(poll_result.get("stdout_tail") or "")
-    stderr_tail = task.stderr_buf.tail(5) or str(poll_result.get("stderr_tail") or "")
-    return _redact_execution_output(
-      {
-        "status": "running",
-        "task_id": task_id,
-        "stdout_tail": stdout_tail,
-        "stderr_tail": stderr_tail,
-      },
-      redact,
-    ), None
 
   def _approval_qualifier(tool_name: str, tool_input: Dict[str, Any]) -> str:
     if tool_name != "code_execute":
@@ -495,6 +585,9 @@ def build_code_execution(
     _, error = _timeout_ms_input(prepared, cfg)
     if error is not None:
       raise ToolInputPreparationError(error)
+    _, error = _host_wait_ms_input(prepared, cfg)
+    if error is not None:
+      raise ToolInputPreparationError(error)
     try:
       backend = _get_backend(host if host != "auto" else None)
     except Exception as exc:
@@ -524,11 +617,9 @@ def build_code_execution(
   return CodeExecutionBundle(
     handlers={
       "code_execute": _handle_code_execute,
-      "code_execute_status": _handle_code_execute_status,
     },
     tool_definitions=[
       make_code_execute_tool_def(cfg, available_hosts),
-      make_code_execute_status_tool_def(),
     ],
     approval_qualifier=_approval_qualifier,
     sanitize_hook=strip_code_execute_base64_hook,

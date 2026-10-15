@@ -1,6 +1,7 @@
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import json
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict
@@ -12,9 +13,10 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import SessionStore, ToolDispatcher
+from agent_gateway import AgentRunner, SessionStore, ToolDispatcher
 from agent_gateway.code_execution import (
   CodeExecutionConfig,
+  SubprocessBackend,
   build_code_execution,
   cleanup_code_execution,
   clear_docker_availability_cache,
@@ -24,7 +26,15 @@ from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.event_log import EventLog
 from agent_gateway.runner import ToolResultContext
 from agent_gateway.secret_boundary import REDACTED_SECRET, SecretBoundary
+from agent_gateway.task_registry import TASK_NOTIFICATION_INLINE_PAYLOAD_MAX_BYTES, TaskState
 from agent_gateway.tool_dispatcher_helpers import ToolResult
+from agent_gateway.tool_result_spill import SpillCapabilities, SpillSink, resolve_spill_producer
+from tests.host_timing_test_support import harness_wait_seconds
+from gateway_test_support.capability_execution_test_support import stub_runner_capability_execution
+
+# Cells that cold-import matplotlib took 12-32s on the loaded 12-worker gate; the 30s
+# product default killed them. The cell's compute bound is a hang guard here.
+_COLD_MATPLOTLIB_TIMEOUT_MS = 120_000
 
 
 def _run(coro):
@@ -417,9 +427,11 @@ def test_code_execute_background_rejects_invalid_timeout_ms() -> None:
 def test_code_execute_background_accepts_integral_float_timeout_ms() -> None:
   async def _run_test() -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    runner = _job_runner()
     bundle = build_code_execution(
       session,
       config=CodeExecutionConfig(register_docker=False, default_timeout_ms=1000, max_timeout_ms=2000),
+      job_runner=lambda: runner,
     )
 
     try:
@@ -437,6 +449,10 @@ def test_code_execute_background_accepts_integral_float_timeout_ms() -> None:
       assert error is None
       assert result is not None
       assert result["status"] == "running"
+      entry = runner._task_registry.get(result["task_id"])
+      assert entry is not None and entry.asyncio_task is not None
+      await asyncio.wait_for(entry.asyncio_task, timeout=10)
+      assert entry.state == TaskState.COMPLETED
     finally:
       await cleanup_code_execution(session)
 
@@ -473,7 +489,11 @@ def test_code_execute_captures_images_and_extra_env(tmp_path: Path) -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     bundle = build_code_execution(
       session,
-      config=CodeExecutionConfig(register_docker=False, extra_env={"PYTHONPATH": str(support_dir)}),
+      config=CodeExecutionConfig(
+        register_docker=False,
+        default_timeout_ms=_COLD_MATPLOTLIB_TIMEOUT_MS,
+        extra_env={"PYTHONPATH": str(support_dir)},
+      ),
     )
 
     result, error = await _dispatch_bundle_tool(
@@ -601,10 +621,75 @@ def test_code_execute_streaming_emits_chunk_events() -> None:
   asyncio.run(_run_test())
 
 
-def test_code_execute_background_status_and_cancel_flow() -> None:
+class _StubProvider:
+  name = "stub"
+
+
+def _job_runner(spill_dir: Path | None = None) -> AgentRunner:
+  """A real runner whose task registry owns the session's background cells."""
+  event_log = EventLog()
+  return AgentRunner(
+    event_log=event_log,
+    dispatcher=ToolDispatcher(
+      capability_bind=TEST_CAPABILITY_BIND,
+      mcp_client=_FakeMcp(),
+      local_tool_handlers={},
+      event_log=event_log,
+      session_id="sess-code-jobs",
+    ),
+    session_id="sess-code-jobs",
+    capability_execution=stub_runner_capability_execution(
+      provider=_StubProvider(),
+      model="stub-model",
+      effort="none",
+    ),
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+    code_execution_spill_dir_provider=(
+      SpillSink(
+        root_provider=lambda: str(spill_dir),
+        capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+      )
+      if spill_dir is not None
+      else None
+    ),
+  )
+
+
+def _record_started_handles(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+  handles: list[Any] = []
+  start_bridged = SubprocessBackend.start_bridged
+
+  async def _recording_start_bridged(self: Any, *args: Any, **kwargs: Any) -> Any:
+    handle = await start_bridged(self, *args, **kwargs)
+    handles.append(handle)
+    return handle
+
+  monkeypatch.setattr(SubprocessBackend, "start_bridged", _recording_start_bridged)
+  return handles
+
+
+async def _until(predicate: Any) -> None:
+  for _ in range(400):
+    if predicate():
+      return
+    await asyncio.sleep(0.01)
+  raise AssertionError("condition not reached")
+
+
+def test_code_execute_background_cell_is_a_code_job_that_completes_and_is_killed(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
   async def _run_test() -> None:
+    handles = _record_started_handles(monkeypatch)
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-    bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
+    runner = _job_runner()
+    bundle = build_code_execution(
+      session,
+      config=CodeExecutionConfig(register_docker=False),
+      job_runner=lambda: runner,
+    )
 
     try:
       start_result, start_error = await _dispatch_bundle_tool(
@@ -615,7 +700,7 @@ def test_code_execute_background_status_and_cancel_flow() -> None:
           "code": (
             "import time\n"
             "print('started', flush=True)\n"
-            "time.sleep(0.5)\n"
+            "time.sleep(0.3)\n"
             "print('finished', flush=True)\n"
           ),
           "background": True,
@@ -625,122 +710,143 @@ def test_code_execute_background_status_and_cancel_flow() -> None:
       assert start_error is None
       assert start_result is not None
       assert start_result["status"] == "running"
+      assert start_result["message"].startswith("The cell runs as a background job")
+      assert start_result["backend"] == "subprocess"
       task_id = start_result["task_id"]
-
-      running_result = None
-      for _ in range(10):
-        await asyncio.sleep(0.05)
-        running_result, running_error = await _dispatch_bundle_tool(
-          session,
-          bundle,
-          "code_execute_status",
-          {"task_id": task_id},
-        )
-        assert running_error is None
-        if running_result and "started" in running_result.get("stdout_tail", ""):
-          break
-      assert running_result is not None
-      assert running_result["status"] == "running"
-      assert "started" in running_result["stdout_tail"]
-
-      await asyncio.sleep(0.8)
-
-      complete_result, complete_error = await _dispatch_bundle_tool(
-        session,
-        bundle,
-        "code_execute_status",
-        {"task_id": task_id},
-      )
-      assert complete_error is None
-      assert complete_result is not None
-      assert complete_result["stdout"] == "started\nfinished\n"
-      assert task_id not in session.background_tasks
+      entry = runner._task_registry.get(task_id)
+      assert entry is not None
+      assert entry.task_type == "code"
+      assert entry.asyncio_task is not None
+      await asyncio.wait_for(entry.asyncio_task, timeout=10)
+      assert entry.state == TaskState.COMPLETED
+      payload = runner._background_task_payload(entry)
+      assert payload["status"] == "completed"
+      assert payload["stdout"] == "started\nfinished\n"
+      assert payload["backend"] == "subprocess"
+      assert bundle.frame_reader._cells == {}
 
       start_result, start_error = await _dispatch_bundle_tool(
         session,
         bundle,
         "code_execute",
-        {
-          "code": (
-            "import time\n"
-            "print('begin', flush=True)\n"
-            "time.sleep(30)\n"
-          ),
-          "background": True,
-        },
+        {"code": "import time\nprint('begin', flush=True)\ntime.sleep(30)\n", "background": True},
       )
       assert start_error is None
       assert start_result is not None
-      cancel_task_id = start_result["task_id"]
-      task = session.background_tasks[cancel_task_id]
+      kill_entry = runner._task_registry.get(start_result["task_id"])
+      assert kill_entry is not None and kill_entry.asyncio_task is not None
+      await _until(lambda: len(handles) == 2)
 
-      cancel_result, cancel_error = await _dispatch_bundle_tool(
-        session,
-        bundle,
-        "code_execute_status",
-        {"task_id": cancel_task_id, "cancel": True},
-      )
+      assert runner.cancel_background_task(kill_entry.task_id) is True
+      await asyncio.wait_for(kill_entry.asyncio_task, timeout=10)
 
-      assert cancel_error is None
-      assert cancel_result == {"status": "cancelled", "task_id": cancel_task_id}
-      assert cancel_task_id not in session.background_tasks
-      assert task.handle._backend_data["process"].returncode is not None
+      assert kill_entry.state == TaskState.KILLED
+      assert handles[1]._backend_data["process"].returncode is not None
+      assert bundle.frame_reader._cells == {}
     finally:
       await cleanup_code_execution(session)
 
   asyncio.run(_run_test())
 
 
-def test_code_execute_status_rejects_invalid_cancel_flag_before_task_lookup() -> None:
+def test_code_execute_background_result_is_the_bounded_model_projection(tmp_path: Path) -> None:
   async def _run_test() -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-    bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
-
-    for cancel in ("true", 1, None):
-      result, error = await _dispatch_bundle_tool(
-        session,
-        bundle,
-        "code_execute_status",
-        {"task_id": "missing-task", "cancel": cancel},
-      )
-      assert result is None
-      assert error == {"code": "invalid_input", "message": "cancel must be a boolean"}
-
-  asyncio.run(_run_test())
-
-
-def test_code_execute_status_rejects_invalid_task_id_type() -> None:
-  async def _run_test() -> None:
-    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-    bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
-
-    for task_id in (123, True, None):
-      result, error = await _dispatch_bundle_tool(
-        session,
-        bundle,
-        "code_execute_status",
-        {"task_id": task_id},
-      )
-      assert result is None
-      assert error == {"code": "invalid_input", "message": "task_id must be a string"}
-
-    result, error = await _dispatch_bundle_tool(
+    runner = _job_runner(spill_dir=tmp_path)
+    bundle = build_code_execution(
       session,
-      bundle,
-      "code_execute_status",
-      {"task_id": ""},
+      config=CodeExecutionConfig(
+        register_docker=False,
+        default_timeout_ms=_COLD_MATPLOTLIB_TIMEOUT_MS,
+      ),
+      job_runner=lambda: runner,
     )
+    results: dict[str, Any] = {}
+    try:
+      for name, code in (
+        ("bulk", "print('x' * 60000)\n"),
+        (
+          "plot",
+          "import matplotlib.pyplot as plt\n"
+          "plt.figure(figsize=(1, 1))\n"
+          "plt.plot([1, 2], [2, 1])\n"
+          "plt.show()\n",
+        ),
+      ):
+        start_result, start_error = await _dispatch_bundle_tool(
+          session, bundle, "code_execute", {"code": code, "background": True},
+        )
+        assert start_error is None and start_result is not None
+        entry = runner._task_registry.get(start_result["task_id"])
+        assert entry is not None and entry.asyncio_task is not None
+        await asyncio.wait_for(
+          entry.asyncio_task,
+          timeout=harness_wait_seconds(_COLD_MATPLOTLIB_TIMEOUT_MS / 1000 + 30),
+        )
+        assert entry.state == TaskState.COMPLETED
+        serialized = json.dumps(entry.result, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        assert len(serialized) <= TASK_NOTIFICATION_INLINE_PAYLOAD_MAX_BYTES
+        assert entry.notification_delivery_state not in {"payload_omitted", "queue_omitted"}
+        results[name] = entry.result
+    finally:
+      await cleanup_code_execution(session)
 
-    assert result is None
-    assert error == {"code": "invalid_input", "message": "task_id is required"}
+    bulk = results["bulk"]
+    assert bulk["_runner_truncated"] is True
+    assert bulk["original_chars"] > 60_000
+    spill_sink = runner._spill_dir_provider
+    assert spill_sink is not None
+    assert resolve_spill_producer(spill_sink, bulk["spill_ref"]) is not None
+    plot = results["plot"]
+    image = plot["images"][0]
+    assert image["data_base64"] == f"[image: {image['filename']}]"
+    assert "iVBORw0KGgo" not in json.dumps(plot)
 
   asyncio.run(_run_test())
 
 
-def test_cleanup_code_execution_cancels_tasks_and_is_idempotent() -> None:
+def test_code_execute_background_without_a_job_runner_is_unavailable() -> None:
   async def _run_test() -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-    bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
+    unavailable = {
+      "code": "code_execution_unavailable",
+      "message": "background cells need the session's job runner",
+    }
+    try:
+      for job_runner in (None, lambda: None):
+        bundle = build_code_execution(
+          session,
+          config=CodeExecutionConfig(register_docker=False),
+          job_runner=job_runner,
+        )
+        result, error = await _dispatch_bundle_tool(
+          session,
+          bundle,
+          "code_execute",
+          {"code": "print('never')", "background": True},
+        )
+        assert result is None
+        assert error == unavailable
+      assert session.code_execution_frame_reader is not None
+      assert session.code_execution_frame_reader._cells == {}
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(_run_test())
+
+
+def test_cleanup_code_execution_kills_its_cells_jobs_without_a_live_turn(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def _run_test() -> None:
+    handles = _record_started_handles(monkeypatch)
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    runner = _job_runner()
+    bundle = build_code_execution(
+      session,
+      config=CodeExecutionConfig(register_docker=False),
+      job_runner=lambda: runner,
+    )
 
     start_result, start_error = await _dispatch_bundle_tool(
       session,
@@ -755,20 +861,72 @@ def test_cleanup_code_execution_cancels_tasks_and_is_idempotent() -> None:
         "background": True,
       },
     )
-
     assert start_error is None
     assert start_result is not None
-    task = session.background_tasks[start_result["task_id"]]
+    entry = runner._task_registry.get(start_result["task_id"])
+    assert entry is not None
+    await _until(lambda: len(handles) == 1)
+
+    # A job no cell launched, observed by a foreground cell's `hank.wait`.
+    async def _observed_job(_tool_input: Dict[str, Any], **_kwargs: Any):
+      await asyncio.sleep(30)
+      return {}, None
+
+    observed, observed_error = await runner._register_background_task(
+      tool_input={},
+      handler=_observed_job,
+      task_type="code",
+      task_id_override="ce_observed",
+      capability_bind_receipt=runner.capability_execution.bind.to_json(),
+      on_complete=None,
+    )
+    assert observed_error is None and observed is not None
+    observed_entry = runner._task_registry.get("ce_observed")
+    assert observed_entry is not None and observed_entry.asyncio_task is not None
+    waiter = asyncio.create_task(_dispatch_bundle_tool(
+      session,
+      bundle,
+      "code_execute",
+      {"code": (
+        "try:\n"
+        "  hank.wait(['ce_observed'], timeout=30)\n"
+        "except Exception as exc:\n"
+        "  print(type(exc).__name__)\n"
+      )},
+    ))
+    reader = bundle.frame_reader
+    await _until(lambda: any(
+      cell.job is None and cell._inflight for cell in reader._cells.values()
+    ))
+    assert [cell.job for cell in reader._cells.values() if cell.job is not None] == [
+      (runner, entry.task_id),
+    ]
+
+    # Session expiry and autonomous teardown run cleanup with no live turn.
+    session.active_turn = None
     work_dir = Path(session.code_execution_work_dir or "")
+    at_removal: list[tuple[Any, Any]] = []
+    rmtree = shutil.rmtree
 
+    def _recording_rmtree(path: Any, *args: Any, **kwargs: Any) -> None:
+      at_removal.append((entry.state, handles[0]._backend_data["process"].returncode))
+      rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", _recording_rmtree)
     await cleanup_code_execution(session)
     await cleanup_code_execution(session)
 
-    assert session.background_tasks == {}
-    assert task._terminated is True
-    assert task.handle._backend_data["process"].returncode is not None
+    assert entry.state == TaskState.KILLED
+    assert at_removal[0][0] == TaskState.KILLED
+    assert at_removal[0][1] is not None
     assert session.code_execution_work_dir is None
     assert not work_dir.exists()
+    # The waiting cell's close does not reach the job it observed.
+    assert observed_entry.state == TaskState.RUNNING
+    await asyncio.wait_for(waiter, timeout=30)
+    assert observed_entry.state == TaskState.RUNNING
+    assert runner.cancel_background_task("ce_observed") is True
+    await asyncio.wait_for(observed_entry.asyncio_task, timeout=10)
 
   asyncio.run(_run_test())
 

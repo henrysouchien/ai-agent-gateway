@@ -58,7 +58,8 @@ from .openai_history_fence import (
 )
 from .admission import current_parent_context, root_context
 from .approval_policy import RunContext
-from .runner import AgentRunner, ToolResultContext, DEFAULT_MAX_BACKGROUND_TASKS
+from .containment_settings import ContainmentSettings, resolve_containment_settings
+from .runner import AgentRunner, ToolResultContext
 from .runner_session_lifecycle import WriterLeaseAlreadyHeldError
 from .skill_lifecycle import (
   TopLevelServerTerminalCause,
@@ -465,14 +466,27 @@ async def run_session(
   *,
   initial_message: str,
   system_prompt: str | list[tuple[str, bool]] | None,
+  resume_initial_messages: list[dict[str, Any]] | None = None,
 ) -> RunOutput:
   timed_out = False
   error_msg: str | None = None
   lease_skip = False
   enrolled_top_level_skill = _top_level_skill_enrolled(runner)
+  # A resumed run's fresh-turn message is the last of the transcript it
+  # resumes from, as a resumed child's is (`runner_sub_agents`).
+  resume = (
+    {"resume_initial_messages": resume_initial_messages}
+    if resume_initial_messages
+    else {}
+  )
   coro = runner.run(
-    messages=[{"role": "user", "content": initial_message}],
+    messages=(
+      resume_initial_messages[-1:]
+      if resume_initial_messages
+      else [{"role": "user", "content": initial_message}]
+    ),
     system_prompt=system_prompt,
+    **resume,
   )
   run_task: asyncio.Task[None] | None = None
   try:
@@ -585,14 +599,16 @@ def split_messages(text: str, max_len: int = 4096) -> list[str]:
 
 async def send_telegram(message: str, bot_token: str, chat_id: str) -> None:
   url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-  payload = {
-    "chat_id": chat_id,
-    "text": message,
-    "disable_web_page_preview": True,
-  }
+  chunks = split_messages(message)
   async with httpx.AsyncClient(timeout=10.0) as client:
-    response = await client.post(url, json=payload)
-    response.raise_for_status()
+    for chunk in chunks:
+      payload = {
+        "chat_id": chat_id,
+        "text": chunk,
+        "disable_web_page_preview": True,
+      }
+      response = await client.post(url, json=payload)
+      response.raise_for_status()
 
 
 async def send_telegram_file(path: Path | str, bot_token: str, chat_id: str) -> None:
@@ -694,11 +710,9 @@ async def run_autonomous(
   local_input_preparation_context_factory: Callable[..., object | None] | None = None,
   redaction_context_factory: Callable[..., object | None] | None = None,
   tool_handlers: dict[str, LocalToolHandler] | None = None,
-  code_execution_factory: Callable[[GatewaySession], CodeExecutionBundle | None] | None = None,
+  code_execution_factory: Callable[..., CodeExecutionBundle | None] | None = None,
   code_execution_binder: Callable[[CodeExecutionBundle, ToolDispatcher], None] | None = None,
   tool_definitions: list[dict[str, Any]] | None = None,
-  skill_local_tool_ceiling: frozenset[str] | None = None,
-  skill_mcp_tool_ceiling: Mapping[str, frozenset[str]] | None = None,
   skills_dir: str | Path | None = None,
   operation_catalog: AgentOperationCatalog | None = None,
   skills_excluded_tools: set[str] | None = None,
@@ -708,7 +722,7 @@ async def run_autonomous(
   needs_approval: Callable[..., bool] | None = None,
   excluded_tools: set[str] | None = None,
   interceptors: Sequence[ToolInterceptor] | None = None,
-  max_concurrent_sub_agents: int | None = DEFAULT_MAX_BACKGROUND_TASKS,
+  containment: ContainmentSettings | None = None,
   compaction_instructions: str | None = None,
   state_dir: str | Path | None = None,
   state_file: str = "state.json",
@@ -745,47 +759,17 @@ async def run_autonomous(
   `on_usage` / `on_session_summary`.
   Supplied execution-limit observations are optional and pass through to the
   session's RunContext unchanged, whether or not this is a named skill run.
+  `containment` is the process's resolved `ContainmentSettings`; `None`
+  resolves it from `os.environ` here, at this standalone entry point.
   Standalone top-level skill callers must bind both `top_level_skill_name` and
   a unique `skill_run_id`; these values are trusted runtime context, not model input.
   """
+  if containment is None:
+    containment = resolve_containment_settings(os.environ)
   if skills_dir is not None and operation_catalog is not None:
     raise ValueError(
       "run_autonomous accepts either skills_dir or operation_catalog, not both"
     )
-  if (
-    skill_local_tool_ceiling is not None
-    or skill_mcp_tool_ceiling is not None
-  ) and top_level_skill_name is None:
-    raise ValueError(
-      "run_autonomous skill tool ceilings require top_level_skill_name"
-    )
-  if skill_local_tool_ceiling is not None and type(skill_local_tool_ceiling) is not frozenset:
-    raise TypeError("skill_local_tool_ceiling must be an exact frozenset")
-  if skill_local_tool_ceiling is not None and any(
-    type(tool_name) is not str
-    or not tool_name
-    or tool_name != tool_name.strip()
-    for tool_name in skill_local_tool_ceiling
-  ):
-    raise ValueError("skill local ceiling tool ids must be canonical text")
-  normalized_mcp_ceiling: dict[str, frozenset[str]] | None = None
-  if skill_mcp_tool_ceiling is not None:
-    if not isinstance(skill_mcp_tool_ceiling, Mapping):
-      raise TypeError("skill_mcp_tool_ceiling must be a mapping")
-    normalized_mcp_ceiling = {}
-    for server_id, tool_names in skill_mcp_tool_ceiling.items():
-      if type(server_id) is not str or not server_id or server_id != server_id.strip():
-        raise ValueError("skill MCP ceiling server ids must be canonical text")
-      if type(tool_names) is not frozenset:
-        raise TypeError("skill MCP ceiling tool sets must be exact frozensets")
-      if any(
-        type(tool_name) is not str
-        or not tool_name
-        or tool_name != tool_name.strip()
-        for tool_name in tool_names
-      ):
-        raise ValueError("skill MCP ceiling tool ids must be canonical text")
-      normalized_mcp_ceiling[server_id] = tool_names
   if type(session) is not GatewaySession:
     raise TypeError("run_autonomous requires an exact GatewaySession")
   if not isinstance(capability_execution, BoundCapabilityExecution):
@@ -829,15 +813,8 @@ async def run_autonomous(
         "run_autonomous top-level skill requires a canonical skill_run_id"
       )
     policy_bundle_hash = str(
-      getattr(session.approval_policy, "policy_bundle_hash", "")
-    ).strip()
-    if (
-      len(policy_bundle_hash) != 64
-      or any(character not in "0123456789abcdef" for character in policy_bundle_hash)
-    ):
-      raise ValueError(
-        "run_autonomous top-level skill requires a trusted policy bundle"
-      )
+      getattr(session.approval_policy, "policy_bundle_hash", "unknown")
+    )
     trusted_skill_name = top_level_skill_name
     trusted_skill_run_id = skill_run_id
   max_tokens = resolved_auth_config.get("max_tokens")
@@ -994,60 +971,6 @@ async def run_autonomous(
       connected_servers = set(mcp_client.get_server_names())
       active_servers = set(connected_servers)
 
-    resolved_mcp_ceiling: dict[str, set[str]] | None = None
-    allowed_exposed_mcp_tools: frozenset[str] | None = None
-    if normalized_mcp_ceiling is not None:
-      if mcp_client is None and any(normalized_mcp_ceiling.values()):
-        raise ValueError("skill MCP ceiling requires an MCP client")
-      resolved_mcp_ceiling = {}
-      exposed_names: set[str] = set()
-      if mcp_client is not None:
-        records_by_identity = {
-          (record.server_id, record.name): record
-          for record in mcp_client.get_server_tool_definition_records(
-            set(normalized_mcp_ceiling)
-          )
-        }
-        for server_id, original_names in normalized_mcp_ceiling.items():
-          for original_name in original_names:
-            exact_record = records_by_identity.get(
-              (server_id, original_name)
-            )
-            exposed_name = (
-              exact_record.name
-              if exact_record is not None
-              else mcp_client.resolve_tool_name(
-                server_id,
-                original_name,
-              )
-            )
-            if exposed_name is None:
-              raise ValueError(
-                "declared skill MCP tool is unavailable: "
-                f"{server_id}/{original_name}"
-              )
-            owner = mcp_client.get_server_for_tool(exposed_name)
-            if (
-              owner != server_id
-              or (
-                exact_record is None
-                and mcp_client.get_original_tool_name(exposed_name)
-                != original_name
-              )
-            ):
-              raise ValueError(
-                "declared skill MCP tool resolved to incoherent identity: "
-                f"{server_id}/{original_name}"
-              )
-            if exposed_name in exposed_names:
-              raise ValueError(
-                "declared skill MCP tools resolve to a duplicate exposed name: "
-                f"{exposed_name}"
-              )
-            exposed_names.add(exposed_name)
-            resolved_mcp_ceiling.setdefault(server_id, set()).add(exposed_name)
-      allowed_exposed_mcp_tools = frozenset(exposed_names)
-
     local_handlers = dict(tool_handlers or {})
     extra_tool_defs = list(tool_definitions or [])
     runner_ref: list[Any] = [None]
@@ -1093,29 +1016,10 @@ async def run_autonomous(
       if not any(definition.get("name") == "send_message" for definition in extra_tool_defs):
         extra_tool_defs.append(make_send_message_tool_def())
 
-    if skill_local_tool_ceiling is not None:
-      local_handlers = {
-        name: handler
-        for name, handler in local_handlers.items()
-        if name in skill_local_tool_ceiling
-      }
-      extra_tool_defs = [
-        definition
-        for definition in extra_tool_defs
-        if definition.get("name") in skill_local_tool_ceiling
-      ]
-
     def _get_tool_defs() -> list[dict[str, Any]]:
       defs: list[dict[str, Any]] = []
       if mcp_client is not None:
-        mcp_definitions = mcp_client.get_tool_definitions()
-        if allowed_exposed_mcp_tools is not None:
-          mcp_definitions = [
-            definition
-            for definition in mcp_definitions
-            if definition.get("name") in allowed_exposed_mcp_tools
-          ]
-        defs.extend(mcp_definitions)
+        defs.extend(mcp_client.get_tool_definitions())
       defs.extend(extra_tool_defs)
       return defs
 
@@ -1129,6 +1033,7 @@ async def run_autonomous(
 
     event_log = EventLog()
     approval_route = session_approval_route(session)
+    from agent_workflow_contracts.models import SelectionProvenance
     from model_authority.selection import capture_selection_snapshot
 
     context = root_context(
@@ -1139,6 +1044,12 @@ async def run_autonomous(
         capture_selection_snapshot(capability_execution_resolver.selection_policy)
         if capability_execution_resolver is not None
         else None
+      ),
+      selection_provenance=SelectionProvenance(
+        role="default",
+        role_source="spawn",
+        effort_source="spawn",
+        preset=None,
       ),
     )
     if context.children is None:
@@ -1167,7 +1078,6 @@ async def run_autonomous(
       event_log=event_log,
       interceptors=runtime_interceptors,
       session_id=sid,
-      should_avoid_permission_prompts=True,
       mcp_session_inject_servers=mcp_session_inject_servers,
       mcp_meta_inject_servers=mcp_meta_inject_servers,
       user_id=session.user_id,
@@ -1178,7 +1088,6 @@ async def run_autonomous(
       approval_route=approval_route,
       run_context=run_context,
       get_tool_definitions=_get_tool_defs,
-      allowed_mcp_tools_by_server=resolved_mcp_ceiling,
       tool_registration_catalog=tool_registration_catalog,
       tool_policy_implementations=tool_policy_implementations,
       input_preparation_context_factory=(
@@ -1212,7 +1121,7 @@ async def run_autonomous(
       user_id=user_id,
       billing_mode=billing_mode,
       rate_table_version=rate_table_version,
-      max_concurrent_sub_agents=max_concurrent_sub_agents,
+      containment=containment,
       skill_run_id=trusted_skill_run_id,
       compaction_instructions=compaction_instructions,
       coordinator=coordinator,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 import fcntl
 import hashlib
@@ -456,6 +456,7 @@ def _registry(
   ) = None,
   identity_resolver=fake_identity_resolver,
   mcp_user_key_lookup=fake_mcp_user_key_lookup,
+  ttl_resolver: Callable[[str, str], int | None] | None = None,
 ) -> AutonomousRegistry:
   from agent_gateway.autonomous_runner import AutonomousRegistry
   from agent_gateway.claim_signing_authority import (
@@ -488,6 +489,7 @@ def _registry(
     autonomous_skill_admission_policy_resolver=admission_policy,
     identity_resolver=identity_resolver,
     mcp_user_key_lookup=mcp_user_key_lookup,
+    ttl_resolver=ttl_resolver,
     claim_signing_authority=GatewayClaimSigningAuthority(HMAC_KEY),
   )
 
@@ -558,6 +560,166 @@ def test_owner_capacity_counts_only_live_processes_for_exact_owner(
   assert resolve_autonomous_owner_run_limit("alice", 2) is None
   with pytest.raises(ValueError, match="owner_user_id is required"):
     registry.live_process_count_for_owner("")
+
+
+def test_owner_run_limit_is_measured_and_emitted_not_refused(
+  monkeypatch,
+  tmp_path: Path,
+) -> None:
+  """Reading B (rule 8, later than U-D1): the entitlement figure is a measurement.
+
+  A resolver returning 1 for alice emits that figure on both of alice's
+  launch records, and alice's second launch still starts. Bob's launch
+  starts. Nothing refuses.
+  """
+  async def _case() -> None:
+    from agent_gateway import autonomous_runner
+    from agent_gateway import autonomous_runner_start
+
+    channels = [_FakeEventChannelPair() for _ in range(3)]
+    procs = [SlowFakeProcess() for _ in range(3)]
+
+    def channel_factory(**_kwargs):
+      return channels.pop(0) if channels else _FakeEventChannelPair()
+
+    async def fake_exec(*args, **kwargs):
+      _ = args, kwargs
+      return procs.pop(0) if procs else SlowFakeProcess()
+
+    monkeypatch.setattr(
+      autonomous_runner_start,
+      "create_autonomous_event_channel",
+      channel_factory,
+    )
+    monkeypatch.setattr(
+      autonomous_runner.asyncio,
+      "create_subprocess_exec",
+      fake_exec,
+    )
+    monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+
+    roster: dict[str, dict[str, str]] = {
+      "alice": {"role": "owner", "channel": "mcp", "key": "key-alice"},
+      "bob": {"role": "owner", "channel": "mcp", "key": "key-bob"},
+    }
+    def user_key_lookup(user_id: str, email: str | None = None) -> dict[str, str] | None:
+      del email
+      return roster.get(user_id)
+
+    registry = _registry(tmp_path, mcp_user_key_lookup=user_key_lookup)
+    registry._owner_run_limit_resolver = lambda owner, count: 1 if owner == "alice" else None
+
+    payload_alice_1 = await registry.start(
+      user_id="alice",
+      user_email="alice@example.com",
+      **_START_KWARGS,
+    )
+    payload_alice_2 = await registry.start(
+      user_id="alice",
+      user_email="alice@example.com",
+      **_START_KWARGS,
+    )
+    payload_bob = await registry.start(
+      user_id="bob",
+      user_email="bob@example.com",
+      **_START_KWARGS,
+    )
+
+    assert payload_alice_1["owner_run_limit"] == 1
+    assert payload_alice_2["owner_run_limit"] == 1
+    assert payload_bob["owner_run_limit"] is None
+    assert registry._tasks[payload_alice_2["task_id"]].owner_run_limit == 1
+    assert registry.owner_capacity("alice")["limit"] == 1
+
+    await registry.shutdown(grace_sec=0.1)
+
+  asyncio.run(_case())
+
+
+def test_live_task_ids_names_only_runs_whose_process_is_running(
+  tmp_path: Path,
+) -> None:
+  _write_manifest(tmp_path)
+  registry = _registry(tmp_path)
+  base_record = registry._tasks["bg_0"]
+  finished = SlowFakeProcess()
+  finished.returncode = 143
+  registry._tasks = {}
+  for task_id, proc in (
+    ("bg_3", SlowFakeProcess()),
+    ("bg_2", finished),
+    ("bg_1", SlowFakeProcess()),
+    ("bg_4", None),
+  ):
+    record = replace(base_record, proc=proc)
+    record.task_id = task_id
+    registry._tasks[task_id] = record
+
+  assert registry.live_task_ids() == ["bg_1", "bg_3"]
+
+
+def test_start_restart_lease_refuses_before_reservation_and_counts_unspawned_run(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  from agent_gateway.autonomous_runner import AutonomousAdmissionClosed
+
+  lock_path = tmp_path / "restart.lock"
+  lock_path.touch()
+  registry = _registry(tmp_path)
+
+  @contextmanager
+  def admission_lease():
+    with lock_path.open("rb") as shared:
+      try:
+        fcntl.flock(shared, fcntl.LOCK_SH | fcntl.LOCK_NB)
+      except BlockingIOError as exc:
+        raise AutonomousAdmissionClosed() from exc
+      try:
+        yield
+      finally:
+        fcntl.flock(shared, fcntl.LOCK_UN)
+
+  registry.set_admission_lease(admission_lease)
+  sequence_before = registry._seq
+
+  def unexpected_task_id() -> str:
+    raise RuntimeError("restart admitted a run")
+
+  monkeypatch.setattr(registry, "_next_task_id", unexpected_task_id)
+
+  async def case() -> None:
+    with lock_path.open("rb") as exclusive:
+      fcntl.flock(exclusive, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      with pytest.raises(AutonomousAdmissionClosed):
+        await registry.start(
+          profile="analyst", mode="once", task="test",
+          user_id=USER_ID, user_email=USER_EMAIL, role="owner",
+        )
+      assert registry.admitted_count() == 0
+      assert registry._seq == sequence_before
+      assert registry.live_task_ids() == []
+
+    def observe_before_task_id() -> str:
+      assert registry.admitted_count() == 1
+      assert registry.live_task_ids() == []
+      # The lease covers reservation only, not identity or process creation.
+      with lock_path.open("rb") as exclusive:
+        fcntl.flock(exclusive, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      raise RuntimeError("observed reserved run before process creation")
+
+    monkeypatch.setattr(registry, "_next_task_id", observe_before_task_id)
+    try:
+      with pytest.raises(RuntimeError, match="observed reserved run"):
+        await registry.start(
+          profile="analyst", mode="once", task="test",
+          user_id=USER_ID, user_email=USER_EMAIL, role="owner",
+        )
+    finally:
+      await registry._release_slot()
+    assert registry.admitted_count() == 0
+
+  asyncio.run(case())
 
 
 def test_autonomous_approval_relay_is_exact_and_idempotent(
@@ -1172,6 +1334,7 @@ async def _start_and_capture_env(
   start_overrides: dict | None = None,
   identity_resolver=fake_identity_resolver,
   mcp_user_key_lookup=fake_mcp_user_key_lookup,
+  ttl_resolver: Callable[[str, str], int | None] | None = None,
 ) -> dict[str, str]:
   from agent_gateway import autonomous_runner
 
@@ -1192,6 +1355,7 @@ async def _start_and_capture_env(
     tmp_path,
     identity_resolver=identity_resolver,
     mcp_user_key_lookup=mcp_user_key_lookup,
+    ttl_resolver=ttl_resolver,
   )
   start_kwargs = {
     "role": "owner",
@@ -1378,6 +1542,14 @@ def test_autonomous_start_signs_exact_session_authority_only(
     verify_autonomous_launch_envelope,
   )
 
+  from agent_gateway.ttl_policy import AUTONOMOUS_SESSION_AUTHORITY_TTL
+
+  resolver_calls: list[tuple[str, str]] = []
+
+  def ttl_resolver(subject: str, ttl_name: str) -> int:
+    resolver_calls.append((subject, ttl_name))
+    return 7200
+
   monkeypatch.setenv(
     "AGENT_AUTONOMOUS_GATEWAY_SESSION_ID",
     "ambient-session",
@@ -1386,7 +1558,9 @@ def test_autonomous_start_signs_exact_session_authority_only(
     "AGENT_AUTONOMOUS_DISPATCH_SCOPE_JSON",
     '{"kind":"portfolio"}',
   )
-  env = asyncio.run(_start_and_capture_env(monkeypatch, tmp_path))
+  env = asyncio.run(
+    _start_and_capture_env(monkeypatch, tmp_path, ttl_resolver=ttl_resolver)
+  )
 
   assert "AGENT_AUTONOMOUS_GATEWAY_SESSION_ID" not in env
   assert "AGENT_AUTONOMOUS_DISPATCH_SCOPE_JSON" not in env
@@ -1401,8 +1575,94 @@ def test_autonomous_start_signs_exact_session_authority_only(
   assert authority.user_id == USER_ID
   assert authority.owner_user_id == USER_ID
   assert authority.channel == "cli"
-  assert authority.expires_at - authority.created_at == 24 * 60 * 60
+  assert authority.expires_at - authority.created_at == 7200
+  assert resolver_calls == [(USER_ID, AUTONOMOUS_SESSION_AUTHORITY_TTL)]
   assert authority.credential_handle == _test_service_credential_handle()
+
+
+def test_autonomous_session_authority_ttl_observes_each_owner(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from agent_gateway.autonomous_launch_envelope import (
+    AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+    verify_autonomous_launch_envelope,
+  )
+  from agent_gateway.ttl_policy import AUTONOMOUS_SESSION_AUTHORITY_TTL
+
+  resolver_calls: list[tuple[str, str]] = []
+  entitlements = {"alice": 1800, "bob": 3600}
+
+  def ttl_resolver(subject: str, ttl_name: str) -> int | None:
+    resolver_calls.append((subject, ttl_name))
+    return entitlements.get(subject)
+
+  for owner, expected_ttl in entitlements.items():
+    env = asyncio.run(
+      _start_and_capture_env(
+        monkeypatch,
+        tmp_path / owner,
+        user_id=f"{owner}-raw",
+        owner_user_id=owner,
+        identity_resolver=None,
+        mcp_user_key_lookup=fake_mcp_user_key_lookup,
+        ttl_resolver=ttl_resolver,
+      )
+    )
+    authority = verify_autonomous_launch_envelope(
+      HMAC_KEY,
+      env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+    ).session_authority.ordinary_authority
+    assert authority is not None
+    assert authority.user_id == owner
+    assert authority.owner_user_id == owner
+    assert authority.raw_user_id == f"{owner}-raw"
+    assert authority.expires_at - authority.created_at == expected_ttl
+
+  assert resolver_calls == [
+    ("alice", AUTONOMOUS_SESSION_AUTHORITY_TTL),
+    ("bob", AUTONOMOUS_SESSION_AUTHORITY_TTL),
+  ]
+
+
+@pytest.mark.parametrize("configured_resolver", [False, True])
+def test_autonomous_session_authority_ttl_none_keeps_default(
+  monkeypatch,
+  tmp_path,
+  configured_resolver,
+) -> None:
+  from agent_gateway.autonomous_launch_envelope import (
+    AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+    verify_autonomous_launch_envelope,
+  )
+  from agent_gateway.ttl_policy import AUTONOMOUS_SESSION_AUTHORITY_TTL
+
+  resolver_calls: list[tuple[str, str]] = []
+
+  def ttl_resolver(subject: str, ttl_name: str) -> None:
+    resolver_calls.append((subject, ttl_name))
+    return None
+
+  env = asyncio.run(
+    _start_and_capture_env(
+      monkeypatch,
+      tmp_path,
+      ttl_resolver=ttl_resolver if configured_resolver else None,
+    )
+  )
+  authority = verify_autonomous_launch_envelope(
+    HMAC_KEY,
+    env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+  ).session_authority.ordinary_authority
+  assert authority is not None
+  assert authority.user_id == USER_ID
+  assert authority.owner_user_id == USER_ID
+  assert authority.expires_at - authority.created_at == 86400
+  assert resolver_calls == (
+    [(USER_ID, AUTONOMOUS_SESSION_AUTHORITY_TTL)]
+    if configured_resolver
+    else []
+  )
 
 
 @pytest.mark.parametrize(
@@ -2525,6 +2785,54 @@ def test_autonomous_registry_rehydrates_blocked_as_terminal(tmp_path) -> None:
   assert registry._terminal_state_for_record(record) == "blocked"
 
 
+def test_manifest_records_tool_surface_the_child_declared_and_rehydrates_it(tmp_path) -> None:
+  _write_manifest(tmp_path, "bg_8", state="blocked", exit_code=0, error="x", completed_at=200.0)
+  registry = _registry(tmp_path)
+  record = registry._tasks["bg_8"]
+  assert record.tool_surface is None
+  declared = {
+    "type": "tool_surface_declared",
+    "active_servers": ["portfolio-reads-mcp"],
+    "allowed_mcp_tools_by_server": {"portfolio-reads-mcp": ["get_positions"]},
+    "allowed_tools": ["get_positions", "web_search"],
+    "visible_tool_count": 7,
+  }
+
+  registry._record_tool_surface(record, declared)
+  registry._record_tool_surface(
+    record,
+    {**declared, "active_servers": [], "visible_tool_count": 1},
+  )
+
+  manifest = _read_manifest(tmp_path, "bg_8")
+  assert manifest["active_servers"] == ["portfolio-reads-mcp"]
+  assert manifest["allowed_mcp_tools_by_server"] == {
+    "portfolio-reads-mcp": ["get_positions"]
+  }
+  assert manifest["allowed_tools"] == ["get_positions", "web_search"]
+  assert manifest["visible_tool_count"] == 7
+  assert "type" not in manifest
+
+  rehydrated = _registry(tmp_path)._tasks["bg_8"]
+  assert rehydrated.tool_surface == {
+    key: declared[key]
+    for key in (
+      "active_servers",
+      "allowed_mcp_tools_by_server",
+      "allowed_tools",
+      "visible_tool_count",
+    )
+  }
+
+
+def test_manifest_without_tool_surface_fields_rehydrates_with_none(tmp_path) -> None:
+  _write_manifest(tmp_path, "bg_8", state="blocked", exit_code=0, error="x", completed_at=200.0)
+
+  record = _registry(tmp_path)._tasks["bg_8"]
+
+  assert record.tool_surface is None
+
+
 @pytest.mark.parametrize("state", ["running", "approval_pending", "queued", "waiting", "remediating"])
 def test_autonomous_registry_rehydrates_active_states_as_interrupted(
   monkeypatch,
@@ -3200,6 +3508,7 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
         "dev_mode",
         "research_file_id",
         "autonomous_in_flight_at_start",
+        "owner_run_limit",
         "credential_handoff_bytes",
         "dispatch_scope",
         "containment_expectation",
@@ -3224,8 +3533,16 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
         "schedule_name",
         "capability_bind",
         "tool_result_spill_dir",
+        "active_servers",
+        "allowed_mcp_tools_by_server",
+        "allowed_tools",
+        "visible_tool_count",
       }
       assert manifest["manifest_version"] == 8
+      assert manifest["active_servers"] is None
+      assert manifest["allowed_mcp_tools_by_server"] is None
+      assert manifest["allowed_tools"] is None
+      assert manifest["visible_tool_count"] is None
       assert manifest["autonomous_in_flight_at_start"] == 1
       assert type(manifest["credential_handoff_bytes"]) is int
       assert manifest["credential_handoff_bytes"] > 0
@@ -3444,13 +3761,12 @@ def test_autonomous_post_spawn_manifest_failure_terminates_child_and_cleans_spil
     monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
     registry = _registry(tmp_path)
     original_write = registry._write_task_manifest
-    calls = 0
+    failed_running_commit = False
 
     def fail_running_commit(record, *, checked: bool = False):
-      nonlocal calls
-      calls += 1
-      if calls == 2:
-        assert checked is True
+      nonlocal failed_running_commit
+      if checked and record.state == "running" and not failed_running_commit:
+        failed_running_commit = True
         return False
       return original_write(record, checked=checked)
 
@@ -3466,6 +3782,7 @@ def test_autonomous_post_spawn_manifest_failure_terminates_child_and_cleans_spil
       )
 
     assert process.returncode == -15
+    assert failed_running_commit
     assert not (tmp_path / "bg_0.tool_result_spill").exists()
     assert not _manifest_path(tmp_path).exists()
     assert registry._tasks == {}
@@ -4126,6 +4443,102 @@ def test_writer_lease_terminal_reason_persists_and_rehydrates(
   )
 
 
+@pytest.mark.parametrize(
+  ("terminal_event", "exit_code", "state", "error"),
+  [
+    (
+      {
+        "type": "error",
+        "error": "fms_prerequisite_missing",
+        "message": "run comparative-analysis for PCTY first",
+        "terminal_reason": None,
+      },
+      1,
+      "failed",
+      "fms_prerequisite_missing: run comparative-analysis for PCTY first",
+    ),
+    (
+      {
+        "type": "error",
+        "error": "autonomous_process_failed",
+        "reason": "autonomous_process_failed",
+        "message": "exit_code=17",
+        "terminal_reason": None,
+      },
+      17,
+      "failed",
+      "autonomous_process_failed: exit_code=17",
+    ),
+    (
+      {
+        "type": "stream_complete",
+        "terminal_disposition": "interrupted",
+        "reason": "fms_prerequisite_missing",
+        "message": "run thesis-pre-mortem for PCTY first",
+        "terminal_reason": None,
+      },
+      0,
+      "interrupted",
+      "fms_prerequisite_missing: run thesis-pre-mortem for PCTY first",
+    ),
+  ],
+  ids=["typed-error", "process-failure", "typed-interruption"],
+)
+def test_carried_terminal_cause_renders_in_run_record(
+  monkeypatch,
+  tmp_path,
+  terminal_event: dict,
+  exit_code: int,
+  state: str,
+  error: str,
+) -> None:
+  async def _case() -> None:
+    from agent_gateway import autonomous_runner
+
+    process = SlowFakeProcess()
+
+    async def fake_exec(*args, **kwargs):
+      _ = args, kwargs
+      return process
+
+    monkeypatch.setattr(
+      autonomous_runner.asyncio,
+      "create_subprocess_exec",
+      fake_exec,
+    )
+    monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+    registry = _registry(tmp_path)
+    payload = await registry.start(
+      role="owner",
+      profile="analyst",
+      mode="task",
+      task="summarize",
+      user_id=USER_ID,
+      user_email=USER_EMAIL,
+    )
+    record = registry._tasks[payload["task_id"]]
+    projected = await registry._record_and_publish_event(
+      record,
+      terminal_event,
+      strict=True,
+    )
+    assert projected is not None
+    record.event_channel_projected_events.append(projected)
+    process.returncode = exit_code
+
+    await registry.wait(payload["task_id"], timeout_sec=1)
+
+    assert record.state == state
+    assert record.exit_code == exit_code
+    assert record.error == error
+    assert record.terminal_reason is None
+    manifest = _read_manifest(tmp_path)
+    assert manifest["error"] == error
+
+  asyncio.run(_case())
+
+
+
 def test_autonomous_manifest_updates_on_reaper_failure(monkeypatch, tmp_path) -> None:
   from agent_gateway import autonomous_runner
 
@@ -4414,17 +4827,19 @@ def test_autonomous_post_spawn_manifest_commit_failure_aborts_unowned_child(
       _ = args, kwargs
       return SlowFakeProcess()
 
-    original_replace = autonomous_runner.os.replace
-
-    def fail_replace(src, dst):
-      if Path(dst) == _manifest_path(tmp_path) and Path(dst).exists():
-        raise OSError("readonly-ish")
-      return original_replace(src, dst)
-
     monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
-    monkeypatch.setattr(autonomous_runner.os, "replace", fail_replace)
     monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
     registry = _registry(tmp_path)
+
+    original_write = registry._write_task_manifest
+
+    def fail_running_commit(record, *, checked: bool = False):
+      if record.state == "running":
+        return False
+      return original_write(record, checked=checked)
+
+    registry._write_task_manifest = fail_running_commit
+
     with caplog.at_level(logging.WARNING, logger="agent_gateway.autonomous_runner"):
       with pytest.raises(RuntimeError, match="commit running autonomous task manifest"):
         await registry.start(
@@ -4439,7 +4854,6 @@ def test_autonomous_post_spawn_manifest_commit_failure_aborts_unowned_child(
     assert registry._tasks == {}
     assert registry._reserved_slots == 0
     assert not _manifest_path(tmp_path).exists()
-    assert "Failed to write autonomous task manifest for bg_0" in caplog.text
 
   asyncio.run(_case())
 
@@ -4815,6 +5229,145 @@ def test_autonomous_start_resolves_slug_metadata_to_canonical_owner(monkeypatch,
     "role": "owner",
   }]
   assert "must-not-reach-child" not in env["GATEWAY_USER_KEYS"]
+
+
+def test_autonomous_skill_start_seals_session_authority_from_admitted_identity(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from dataclasses import replace
+
+  from agent_gateway import autonomous_runner, autonomous_runner_start
+  from agent_gateway.admission import (
+    AdmissionOwners,
+    AdmittedChildIdentity,
+    AdmittedContext,
+    OperationRegistration,
+    SpawnRequest,
+    admit,
+    root_context_from_identity,
+  )
+  from agent_gateway.approval_route import NO_APPROVAL_ROUTE
+  from agent_gateway.autonomous_launch_envelope import (
+    AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+    verify_autonomous_launch_envelope,
+  )
+  from agent_gateway.child_environment import AUTONOMOUS_CHILD_ENVIRONMENT
+  from agent_gateway.containment_settings import ContainmentSettings
+  from agent_workflow_contracts import ResolvedAuthority
+  from agent_workflow_contracts.models import (
+    AdmittedResearchBinding,
+    AdmittedTenant,
+    ToolGrant,
+  )
+  from gateway_test_support.capability_execution_test_support import (
+    stub_capability_execution_resolver,
+  )
+
+  def resolver_must_not_run(*_args, **_kwargs):
+    raise AssertionError("an admitted launch must not resolve identity beside admit()")
+
+  monkeypatch.setattr(autonomous_runner_start, "_start_identity_payload", resolver_must_not_run)
+  captured: dict[str, str] = {}
+
+  async def fake_exec(*args, **kwargs):
+    captured.update(dict(kwargs["env"]))
+    return FakeProcess()
+
+  monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
+  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+  parent = root_context_from_identity(
+    tenant=AdmittedTenant(tenant_id=TENANT_ID, storage_id=USER_ID, role="owner"),
+    job_id="launch-root",
+    tool_ids=None,
+    withheld_tools=frozenset(),
+    research_binding=AdmittedResearchBinding(),
+    approval_route=NO_APPROVAL_ROUTE,
+  )
+  requests = []
+
+  def admitting_binding(request):
+    requests.append(request)
+    binding = _test_autonomous_capability_binding(request)
+    admitted = admit(
+      SpawnRequest(operation="risk.scan", task=request.task or ""),
+      parent,
+      owners=AdmissionOwners(
+        operation=OperationRegistration(
+          name="risk.scan",
+          execution_class=binding.bind.capability_id,
+          route_ceiling=frozenset(),
+          operation_routes=frozenset(),
+        ),
+        capability_execution_resolver=stub_capability_execution_resolver(),
+        session=None,
+        route_registered=lambda _tool_id: False,
+        resolve_tool_authority=lambda _tool_ids: ResolvedAuthority(
+          operation_name="risk.scan",
+          grant=ToolGrant(grant_id="grant-admitted", tools=(), digest="sha256:" + "0" * 64),
+        ),
+        placement="local_stub",
+        containment=ContainmentSettings(),
+        env_contract=AUTONOMOUS_CHILD_ENVIRONMENT,
+        env_names=request.env_names,
+        frozen_bind=binding.bind,
+        identity=AdmittedChildIdentity(
+          user_id=request.owner_user_id,
+          raw_user_id=request.raw_user_id,
+          user_email=request.user_email,
+          user_slug="admitted-slug",
+          risk_user_id=request.risk_user_id,
+          user_aliases=(*request.user_aliases, "admitted-slug"),
+          identity_status="admitted",
+          role="owner",
+        ),
+      ),
+    )
+    assert isinstance(admitted, AdmittedContext)
+    return replace(binding, admitted=admitted)
+
+  registry = _registry(tmp_path, identity_resolver=resolver_must_not_run)
+  registry._autonomous_capability_binding_resolver = admitting_binding
+
+  async def run():
+    payload = await registry.start(
+      role="owner",
+      profile="analyst",
+      mode="skill",
+      skill="risk.scan",
+      context="inspect current book",
+      user_id="henry",
+      user_email=USER_EMAIL,
+      owner_user_id=USER_ID,
+      risk_user_id=1,
+      parent=parent,
+    )
+    await registry.wait(payload["task_id"], timeout_sec=1)
+    return registry._tasks[payload["task_id"]]
+
+  record = asyncio.run(run())
+
+  assert requests[0].parent is parent
+  assert requests[0].role == "owner"
+  authority = verify_autonomous_launch_envelope(
+    HMAC_KEY,
+    captured[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+  ).session_authority.ordinary_authority
+  assert authority is not None
+  assert (
+    authority.user_id,
+    authority.owner_user_id,
+    authority.raw_user_id,
+    authority.user_email,
+    authority.user_slug,
+    authority.risk_user_id,
+    authority.identity_status,
+    authority.role,
+  ) == (USER_ID, USER_ID, "henry", USER_EMAIL, "admitted-slug", 1, "admitted", "owner")
+  assert authority.user_aliases[-1] == "admitted-slug"
+  assert (record.user_slug, record.identity_status, record.user_aliases[-1]) == (
+    "admitted-slug", "admitted", "admitted-slug",
+  )
 
 
 def test_autonomous_start_narrows_mcp_key_by_envelope_session_slug(
@@ -5908,6 +6461,111 @@ def test_autonomous_cancel_survives_process_group_signal_failure(
     assert record.reaper_task.exception() is None
     manifest = _read_manifest(tmp_path)
     assert manifest["state"] == "killed"
+
+    await registry.shutdown(grace_sec=0.1)
+
+  asyncio.run(_case())
+
+
+def test_user_revocation_terminates_runs_and_disables_schedules(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  async def _case() -> None:
+    from agent_gateway import autonomous_runner
+    from agent_gateway import autonomous_runner_start
+    process_alice = SlowFakeProcess()
+    process_bob = SlowFakeProcess()
+    pair_alice = _FakeEventChannelPair()
+    pair_bob = _FakeEventChannelPair()
+
+    channels = [pair_alice, pair_bob]
+    procs = [process_alice, process_bob]
+
+    def channel_factory(**_kwargs):
+      return channels.pop(0) if channels else _FakeEventChannelPair()
+
+    async def fake_exec(*args, **kwargs):
+      return procs.pop(0) if procs else SlowFakeProcess()
+
+    monkeypatch.setattr(
+      autonomous_runner_start,
+      "create_autonomous_event_channel",
+      channel_factory,
+    )
+    monkeypatch.setattr(
+      autonomous_runner.asyncio,
+      "create_subprocess_exec",
+      fake_exec,
+    )
+    monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+
+    # Roster mapping: alice and bob initially admitted
+    roster: dict[str, dict[str, str]] = {
+      "alice": {"role": "owner", "channel": "mcp", "key": "key-alice"},
+      "bob": {"role": "owner", "channel": "mcp", "key": "key-bob"},
+    }
+    def user_key_lookup(user_id: str, email: str | None = None) -> dict[str, str] | None:
+      del email
+      return roster.get(user_id)
+
+    registry = _registry(tmp_path, mcp_user_key_lookup=user_key_lookup)
+    payload_alice = await registry.start(
+      user_id="alice",
+      user_email="alice@example.com",
+      **_START_KWARGS,
+    )
+    # Start run for bob
+    payload_bob = await registry.start(
+      user_id="bob",
+      user_email="bob@example.com",
+      **_START_KWARGS,
+    )
+
+    # Fake schedule store
+    class FakeScheduleStore:
+      def __init__(self) -> None:
+        self.schedules = {
+          "alice": [
+            {"schedule_id": "sched_a1", "enabled": True, "dispatch_role": "owner"},
+            {"schedule_id": "sched_a2", "enabled": True, "dispatch_role": "owner"},
+          ],
+          "bob": [
+            {"schedule_id": "sched_b1", "enabled": True, "dispatch_role": "owner"},
+          ],
+        }
+        self.disabled_calls: list[tuple[str, str, bool]] = []
+
+      def list_for_owner(self, owner_user_id: str) -> list[dict[str, object]]:
+        return self.schedules.get(owner_user_id, [])
+
+      def set_enabled(self, owner_user_id: str, identifier: str, *, enabled: bool, **_kwargs) -> None:
+        self.disabled_calls.append((owner_user_id, identifier, enabled))
+        for s in self.schedules.get(owner_user_id, []):
+          if s["schedule_id"] == identifier:
+            s["enabled"] = enabled
+
+    sched_store = FakeScheduleStore()
+
+    # Simulate operator removing alice from the roster
+    roster.pop("alice", None)
+
+    # check_active_runs_roster detects alice is no longer in the roster and revokes her
+    cancelled = await registry.check_active_runs_roster(schedule_store_for=lambda _uid: sched_store)
+    assert payload_alice["task_id"] in cancelled
+    assert set(sched_store.disabled_calls) == {("alice", "sched_a1", False), ("alice", "sched_a2", False)}
+    task_alice = registry._tasks[payload_alice["task_id"]]
+    assert task_alice.state == "killed"
+    assert "Process terminated due to user revocation" in (task_alice.error or "")
+
+    # Bob's task is untouched and still running
+    task_bob = registry._tasks[payload_bob["task_id"]]
+    assert task_bob.state == "running"
+    assert task_bob.cancellation_requested is False
+
+    # Bob's schedule is untouched and still enabled
+    assert sched_store.schedules["bob"][0]["enabled"] is True
+    assert ("bob", "sched_b1", False) not in sched_store.disabled_calls
 
     await registry.shutdown(grace_sec=0.1)
 

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from collections import Counter
-from types import MappingProxyType
+from types import SimpleNamespace
 
 import pytest
 
+from agent_gateway import tool_dispatch_declarations as declarations
 from agent_gateway.tool_dispatch_declarations import (
   DEFAULT_TOOL_DISPATCH_SEMANTICS,
   ToolDispatchSemantics,
@@ -12,7 +12,10 @@ from agent_gateway.tool_dispatch_declarations import (
   tool_dispatch_semantics_for,
   tool_dispatch_semantics_overrides,
 )
-from agent_workflow_contracts.tool_registration import RegisteredToolIdentity
+from agent_workflow_contracts.tool_registration import (
+  RegisteredToolIdentity,
+  VersionedPolicyRef,
+)
 
 
 def _local(name: str) -> RegisteredToolIdentity:
@@ -25,6 +28,61 @@ def _mcp(server: str, name: str) -> RegisteredToolIdentity:
     logical_server_id=server,
     logical_name=name,
   )
+
+
+def _semantics(
+  *,
+  outcome_id: str = "current_generic_non_error",
+  outcome_parameters: dict[str, object] | None = None,
+  source_id: str = "current_no_gateway_extraction",
+  source_parameters: dict[str, object] | None = None,
+) -> ToolDispatchSemantics:
+  return ToolDispatchSemantics(
+    idempotent=True,
+    outcome_policy=VersionedPolicyRef(
+      kind="outcome",
+      policy_id=outcome_id,
+      version="v1",
+      parameters=outcome_parameters or {},
+    ),
+    source_identity_policy=VersionedPolicyRef(
+      kind="source_identity",
+      policy_id=source_id,
+      version="v1",
+      parameters=source_parameters or {},
+    ),
+  )
+
+
+_EXACT = _mcp("research-corpus-mcp", "filings_search")
+_VENDOR = _mcp("market-data-mcp", "fetch_financials")
+_POSITIONING = _mcp("positioning-mcp", "get_topdown_positioning")
+_DECLARED = {
+  _EXACT: _semantics(
+    outcome_id="current-declared-status-equals",
+    outcome_parameters={"field": "status", "values": ("success",)},
+    source_id="search_hits",
+    source_parameters={"container": "hits", "default_source_kind": "filing"},
+  ),
+  _VENDOR: _semantics(
+    source_id="vendor_sources",
+    source_parameters={"provider": "fmp"},
+  ),
+  _POSITIONING: _semantics(source_id="positioning_filing_sources"),
+}
+
+
+@pytest.fixture(autouse=True)
+def declared_dispatch_semantics(monkeypatch: pytest.MonkeyPatch) -> None:
+  """Registration owners declare each route's dispatch semantics; the gateway
+  reads that declaration through the bound policy and keeps no list of its own."""
+
+  monkeypatch.setattr(
+    declarations,
+    "load_server_policy_module",
+    lambda: SimpleNamespace(get_dispatch_semantics_overrides=lambda: _DECLARED),
+  )
+  monkeypatch.setattr(declarations, "_CACHED_DECLARATIONS", None)
 
 
 class _Text(str):
@@ -43,41 +101,21 @@ def _forged_identity(
   return identity
 
 
-def test_exact_dispatch_overrides_route_population() -> None:
-  overrides = tool_dispatch_semantics_overrides()
+def test_unbound_policy_declares_no_dispatch_semantics(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(declarations, "load_server_policy_module", lambda: None)
 
-  assert isinstance(overrides, MappingProxyType)
-  assert set(
-    identity.logical_name
-    for identity in overrides
-    if identity.route_kind == "local_handler"
-  ) == {
-    "code_execute",
-    "code_execute_status",
-    "fms_compute_quantifying_risk",
-    "web_fetch",
-  }
-  assert all(type(value) is ToolDispatchSemantics for value in overrides.values())
-  for name in ("code_execute", "code_execute_status"):
-    semantics = overrides[_local(name)]
-    assert semantics.idempotent is False
-    assert semantics.outcome_policy.policy_id == "current_generic_non_error"
-    assert semantics.source_identity_policy.policy_id == "sandbox_computations"
-  compute = overrides[_local("fms_compute_quantifying_risk")]
-  assert compute.idempotent is True
-  assert compute.outcome_policy.parameters == {
-    "field": "status",
-    "values": ("ok",),
-  }
-  assert compute.source_identity_policy.policy_id == "fms-computation"
+  assert dict(tool_dispatch_semantics_overrides()) == {}
+  assert tool_dispatch_semantics_for(_EXACT) is DEFAULT_TOOL_DISPATCH_SEMANTICS
+  assert dict(build_tool_dispatch_declarations()) == {}
 
 
 def test_dispatch_semantics_are_total_by_exact_identity_only() -> None:
-  exact = _mcp("research-corpus-mcp", "filings_search")
   wrong_local = _local("filings_search")
   wrong_mcp = _mcp("market-data-mcp", "filings_search")
 
-  assert tool_dispatch_semantics_for(exact) is tool_dispatch_semantics_overrides()[exact]
+  assert tool_dispatch_semantics_for(_EXACT) is _DECLARED[_EXACT]
   assert tool_dispatch_semantics_for(wrong_local) is DEFAULT_TOOL_DISPATCH_SEMANTICS
   assert tool_dispatch_semantics_for(wrong_mcp) is DEFAULT_TOOL_DISPATCH_SEMANTICS
   assert DEFAULT_TOOL_DISPATCH_SEMANTICS.idempotent is False
@@ -92,7 +130,7 @@ def test_dispatch_semantics_are_total_by_exact_identity_only() -> None:
   )
   assert DEFAULT_TOOL_DISPATCH_SEMANTICS.source_identity_policy.version == "v1"
   with pytest.raises(TypeError, match="exact RegisteredToolIdentity"):
-    tool_dispatch_semantics_for(exact.materialize())  # type: ignore[arg-type]
+    tool_dispatch_semantics_for(_EXACT.materialize())  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -123,87 +161,38 @@ def test_dispatch_semantics_revalidate_forged_exact_class_identities(
     tool_dispatch_semantics_for(identity)
 
 
+def test_dispatch_projection_names_must_be_unique(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(
+    declarations,
+    "load_server_policy_module",
+    lambda: SimpleNamespace(
+      get_dispatch_semantics_overrides=lambda: {
+        _mcp("a-mcp", "shared_name"): _semantics(),
+        _mcp("b-mcp", "shared_name"): _semantics(),
+      },
+    ),
+  )
 
-
-_SUCCESS_SOURCE_DESCRIPTORS = {
-  "fms_compute_quantifying_risk": {"kind": "fms-computation"},
-  "web_fetch": {"kind": "web_fetch"},
-  "filings_search": {
-    "kind": "search_hits",
-    "container": "hits",
-    "default_source_kind": "filing",
-  },
-  "transcripts_search": {
-    "kind": "search_hits",
-    "container": "hits",
-    "default_source_kind": "transcript",
-  },
-  "filings_list": {
-    "kind": "documents",
-    "container": "documents",
-    "source_kind": "filing",
-  },
-  "transcripts_list": {
-    "kind": "documents",
-    "container": "documents",
-    "source_kind": "transcript",
-  },
-  "filings_read": {"kind": "single_document", "source_kind": "filing"},
-  "transcripts_read": {
-    "kind": "single_document",
-    "source_kind": "transcript",
-  },
-  "filings_source_excerpt": {
-    "kind": "single_document",
-    "source_kind": "filing",
-  },
-  "transcripts_source_excerpt": {
-    "kind": "single_document",
-    "source_kind": "transcript",
-  },
-  "get_filings": {"kind": "parser_filings"},
-  "get_filing_sections": {"kind": "parser_filing_sections"},
-  "search_filing_text": {
-    "kind": "parser_items",
-    "container": "hits",
-    "default_source_kind": "filing",
-  },
-  "get_filing_evidence": {
-    "kind": "parser_items",
-    "container": "evidence",
-    "default_source_kind": "filing_evidence",
-  },
-  "cite_concept": {
-    "kind": "parser_items",
-    "container": "citations",
-    "default_source_kind": "concept_citation",
-  },
-  "get_filing_document": {"kind": "parser_document"},
-  "get_metric": {"kind": "metric_citations"},
-}
+  with pytest.raises(RuntimeError, match="must be unique"):
+    build_tool_dispatch_declarations()
 
 
 def test_dispatch_projection_keeps_registered_vendor_sources_out_of_legacy_reader() -> None:
   actual = build_tool_dispatch_declarations(effect_resolver=lambda _name: "read")
-  exact_vendor_sources = {
-    identity: semantics.source_identity_policy.parameters["provider"]
-    for identity, semantics in tool_dispatch_semantics_overrides().items()
-    if semantics.source_identity_policy.policy_id == "vendor_sources"
-  }
 
-  assert all(
-    actual[identity.logical_name].source_identity is None
-    for identity in exact_vendor_sources
-  )
-  assert Counter(
-    (identity.logical_server_id, provider)
-    for identity, provider in exact_vendor_sources.items()
-  ) == {
-    ("market-data-mcp", "fmp"): 11,
-    ("fred-mcp", "fred"): 2,
-    ("portfolio-reads-mcp", "portfolio"): 4,
-    ("portfolio-reads-mcp", "fmp"): 1,
-    ("gsheets-mcp", "gsheets"): 1,
+  assert actual["fetch_financials"].source_identity is None
+  assert actual["fetch_financials"].idempotent is True
+  assert actual["filings_search"].success_signal == {
+    "kind": "status_equals",
+    "field": "status",
+    "values": ("success",),
+  }
+  assert actual["filings_search"].source_identity == {
+    "kind": "search_hits",
+    "container": "hits",
+    "default_source_kind": "filing",
   }
 
 
@@ -219,12 +208,6 @@ def test_dispatch_projection_keeps_registered_vendor_sources_out_of_legacy_reade
 def test_positioning_filing_sources_declaration_and_reader(status: str) -> None:
   from agent_gateway.tool_dispatch_source_identity import read_source_identities
 
-  identity = _mcp("positioning-mcp", "get_topdown_positioning")
-  semantics = tool_dispatch_semantics_for(identity)
-  assert semantics.idempotent is True
-  assert semantics.outcome_policy.policy_id == "current_generic_non_error"
-  assert semantics.outcome_policy.parameters == {}
-  assert semantics.source_identity_policy.policy_id == "positioning_filing_sources"
   declaration = build_tool_dispatch_declarations()["get_topdown_positioning"]
   assert declaration.source_identity == {"kind": "positioning_filing_sources"}
   from agent_gateway.tool_dispatch_classification import classify_tool_outcome
@@ -323,21 +306,6 @@ def test_positioning_without_filing_sources_mints_nothing(
   if filing_sources is not None:
     result["filing_sources"] = filing_sources
   assert read_source_identities({"kind": "positioning_filing_sources"}, result) == ()
-
-
-@pytest.mark.parametrize("name", [
-  "get_macro_dashboard", "get_rates_and_curves", "get_economic_indicators",
-  "get_sector_analysis", "get_technical_summary", "get_positioning",
-])
-def test_macro_declares_producer_vendor_sources(name: str) -> None:
-  semantics = tool_dispatch_semantics_for(_mcp("macro-mcp", name))
-  assert semantics.idempotent is True
-  assert semantics.outcome_policy.policy_id == "current_generic_non_error"
-  assert semantics.outcome_policy.parameters == {}
-  assert semantics.source_identity_policy.policy_id == "producer_vendor_sources"
-  declaration = build_tool_dispatch_declarations()[name]
-  assert declaration.success_signal is None
-  assert declaration.source_identity == {"kind": "producer_vendor_sources"}
 
 
 @pytest.mark.parametrize(("provider", "key_fields", "source_url"), [

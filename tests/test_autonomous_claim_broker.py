@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass, replace
 from contextlib import ExitStack
 from tempfile import TemporaryDirectory
+from typing import Any
 
 from agent_gateway.autonomous_launch_envelope import (
   AutonomousControlAuthority,
@@ -35,6 +36,7 @@ from agent_gateway.launch_nonce_store import prepare_launch_nonce_store
 from agent_gateway.server_artifact_helpers import (
   _verify_agent_claim_headers,
 )
+from agent_gateway.ttl_policy import AGENT_API_CLAIM_TTL, TtlResolver
 from gateway_test_support.autonomous_launch_test_support import (
   _bind,
   _ordinary_session_authority,
@@ -70,6 +72,8 @@ def _broker_runtime(
   *,
   broker_max_requests: int = broker_module.AUTONOMOUS_CLAIM_BROKER_MAX_REQUESTS,
   broker_max_ttl_seconds: int = 600,
+  ttl_resolver: TtlResolver | None = None,
+  session_ttl_seconds: int = 600,
 ) -> _BrokerRuntime:
   now_ns = time.time_ns()
   now_seconds = now_ns // 1_000_000_000
@@ -78,7 +82,7 @@ def _broker_runtime(
     replace(
       authority.ordinary_authority,
       created_at=now_seconds - 1,
-      expires_at=now_seconds + 600,
+      expires_at=now_seconds + session_ttl_seconds,
     ),
   )
   with ExitStack() as resources:
@@ -109,7 +113,7 @@ def _broker_runtime(
       now_ns=now_ns,
     )
     broker = AutonomousClaimBroker(
-      GatewayClaimSigningAuthority(_SECRET),
+      GatewayClaimSigningAuthority(_SECRET, ttl_resolver=ttl_resolver),
       envelope_json,
       max_requests=broker_max_requests,
       max_ttl_seconds=broker_max_ttl_seconds,
@@ -157,6 +161,120 @@ def test_broker_enforces_ttl_and_closes_after_rejection() -> None:
   try:
     with pytest.raises(AutonomousClaimBrokerError):
       runtime.claim_signer.sign_claim(ttl_seconds=31)
+    with pytest.raises(AutonomousClaimBrokerError, match="closed"):
+      runtime.claim_signer.sign_claim(ttl_seconds=30)
+  finally:
+    runtime.close()
+
+
+def test_broker_resolves_stateful_entitlement_once_per_signing() -> None:
+  calls: list[tuple[str, str]] = []
+
+  def resolver(user_id: str, ttl_name: str) -> int:
+    calls.append((user_id, ttl_name))
+    return len(calls) * 90
+
+  runtime = _broker_runtime(ttl_resolver=resolver)
+  try:
+    for expected in (90, 180):
+      claim = runtime.claim_signer.sign_claim(ttl_seconds=45)
+      assert (
+        int(claim["AGENT_API_CLAIM_EXPIRY"])
+        - int(claim["AGENT_API_CLAIM_ISSUED_AT"])
+      ) == expected
+      assert _verify_agent_claim_headers(_SECRET, _claim_headers(claim)) is not None
+    assert calls == [("42", AGENT_API_CLAIM_TTL)] * 2
+  finally:
+    runtime.close()
+
+
+@pytest.mark.parametrize(
+  ("resolved_ttl", "max_ttl", "session_ttl", "reason"),
+  (
+    (31, 30, 600, "sign request is invalid"),
+    (180, 600, 100, "session authority has expired"),
+  ),
+)
+def test_broker_validates_resolved_ttl_before_minting(
+  monkeypatch: pytest.MonkeyPatch,
+  resolved_ttl: int,
+  max_ttl: int,
+  session_ttl: int,
+  reason: str,
+) -> None:
+  calls: list[tuple[str, str]] = []
+  minted: list[int] = []
+  original_mint = GatewayClaimSigningAuthority._sign_resolved_user_claim
+
+  def resolver(user_id: str, ttl_name: str) -> int:
+    calls.append((user_id, ttl_name))
+    return resolved_ttl
+
+  def record_mint(
+    self: GatewayClaimSigningAuthority,
+    *,
+    user_id: str,
+    user_email: str | None,
+    ttl_seconds: int,
+  ) -> dict[str, str]:
+    minted.append(ttl_seconds)
+    return original_mint(
+      self, user_id=user_id, user_email=user_email, ttl_seconds=ttl_seconds,
+    )
+
+  monkeypatch.setattr(
+    GatewayClaimSigningAuthority, "_sign_resolved_user_claim", record_mint,
+  )
+  runtime = _broker_runtime(
+    ttl_resolver=resolver,
+    broker_max_ttl_seconds=max_ttl,
+    session_ttl_seconds=session_ttl,
+  )
+  try:
+    with pytest.raises(AutonomousClaimBrokerError, match=reason):
+      runtime.claim_signer.sign_claim(ttl_seconds=20)
+    assert calls == [("42", AGENT_API_CLAIM_TTL)]
+    assert minted == []
+  finally:
+    runtime.close()
+
+
+def test_broker_validates_entitlement_not_requested_fallback_ttl() -> None:
+  runtime = _broker_runtime(
+    ttl_resolver=lambda user_id, ttl_name: 20,
+    broker_max_ttl_seconds=30,
+  )
+  try:
+    claim = runtime.claim_signer.sign_claim(ttl_seconds=45)
+    assert (
+      int(claim["AGENT_API_CLAIM_EXPIRY"])
+      - int(claim["AGENT_API_CLAIM_ISSUED_AT"])
+    ) == 20
+  finally:
+    runtime.close()
+
+
+@pytest.mark.parametrize("response_ttl", (None, True, 30.0, 0, -1, 601, 31))
+def test_signer_binds_claim_to_exact_resolved_ttl_response(
+  monkeypatch: pytest.MonkeyPatch,
+  response_ttl: object,
+) -> None:
+  original_recv = broker_module._recv_frame
+
+  def change_resolved_ttl(
+    *args: Any,
+    **kwargs: Any,
+  ) -> dict[str, Any]:
+    response = original_recv(*args, **kwargs)
+    if "claim" in response:
+      response["ttl_seconds"] = response_ttl
+    return response
+
+  monkeypatch.setattr(broker_module, "_recv_frame", change_resolved_ttl)
+  runtime = _broker_runtime()
+  try:
+    with pytest.raises(AutonomousClaimBrokerError, match="invalid"):
+      runtime.claim_signer.sign_claim(ttl_seconds=30)
     with pytest.raises(AutonomousClaimBrokerError, match="closed"):
       runtime.claim_signer.sign_claim(ttl_seconds=30)
   finally:

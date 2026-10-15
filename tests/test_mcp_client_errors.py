@@ -452,6 +452,42 @@ def test_cancellation_certainty_tracks_sdk_task_creation(cancel_phase) -> None:
   asyncio.run(scenario())
 
 
+def test_response_completing_with_abort_settles_invocation(monkeypatch) -> None:
+  import anyio
+
+  async def scenario():
+    write_stream, read_stream = anyio.create_memory_object_stream(0)
+    session = ClientSession(read_stream, write_stream)
+    session._tool_output_schemas["read"] = {
+      "type": "object",
+      "required": ["writes"],
+    }
+    report = McpInvocationReport(certainty="settled")
+    abort = asyncio.Event()
+    sent = asyncio.Event()
+    respond = asyncio.Event()
+
+    async def send_request(*_args, **_kwargs):
+      sent.set()
+      await respond.wait()
+      return CallToolResult(content=[], structured_content={"writes": 1})
+
+    monkeypatch.setattr(session, "send_request", send_request)
+    manager = _certainty_manager(session)
+    task = asyncio.create_task(manager.call_tool_reporting("read", {}, abort_event=abort, invocation_report=report))
+    await sent.wait()
+    assert report.certainty == "unknown"
+    respond.set()
+    abort.set()
+    with pytest.raises(asyncio.CancelledError):
+      await task
+    assert report.certainty == "settled"
+    await write_stream.aclose()
+    await read_stream.aclose()
+
+  asyncio.run(scenario())
+
+
 def test_concurrent_invocations_do_not_share_certainty() -> None:
   async def scenario():
     pending = asyncio.Event()

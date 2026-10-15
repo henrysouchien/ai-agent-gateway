@@ -96,7 +96,7 @@ def test_env_token_precedes_enrolled_accounts_and_both_are_siblings(tmp_path: Pa
   env_credential = sources.by_token("sk-ant-oat01-existing-session")
   assert env_credential is not None
   assert env_credential.record is not None
-  assert env_credential.record.source == "env:ANTHROPIC_AUTH_TOKEN"
+  assert env_credential.record.source.startswith("env:ANTHROPIC_AUTH_TOKEN:")
   assert env_credential.store_path == path
 
 
@@ -1054,12 +1054,12 @@ def test_bound_environment_config_preserves_original_org_source_without_user_clo
   assert repeated is not None
   assert repeated.generation_ref == original.generation_ref
   assert repeated.store_path == original_sources.store_path
-  assert repeated.record is not None and repeated.record.source == "env:ANTHROPIC_AUTH_TOKEN"
+  assert repeated.record is not None and repeated.record.source.startswith("env:ANTHROPIC_AUTH_TOKEN:")
   assert anthropic_oauth.ensure_fresh_anthropic_credential(original.token, config=cfg, environ=env) == original.token
   assert original_sources.user_store_path is not None
   assert not original_sources.user_store_path.exists()
   saved = json.loads(original_sources.store_path.read_text())
-  assert saved["static_credentials"][0]["source"] == "env:ANTHROPIC_AUTH_TOKEN"
+  assert saved["static_credentials"][0]["source"].startswith("env:ANTHROPIC_AUTH_TOKEN:")
 
   env["ANTHROPIC_AUTH_TOKEN"] = ""
   with pytest.raises(AnthropicSourceError) as removed:
@@ -1070,7 +1070,13 @@ def test_bound_environment_config_preserves_original_org_source_without_user_clo
       {"credential_source": original.source_metadata()}, environ=env, user_scope=7,
     )
   assert not original_sources.user_store_path.exists()
-  assert original.token not in original_sources.store_path.read_text()
+  if with_metadata:
+    # An exact `credential_source` lookup only reads: the emptied source is
+    # reported `removed` and the store is left byte-for-byte unchanged.
+    assert original.token in original_sources.store_path.read_text()
+  else:
+    # A pool resolve reconciles the observed empty source and retires it.
+    assert original.token not in original_sources.store_path.read_text()
 
 
 def test_bound_source_metadata_retains_original_grant_after_access_token_refresh(
@@ -1185,17 +1191,6 @@ def test_partial_environment_retires_only_observed_empty_source(
   ).credentials[0].token == second.token
 
 
-def test_api_key_source_metadata_is_not_oauth_pool_membership(tmp_path: Path) -> None:
-  env = {"USER_DATA_DIR": str(tmp_path), "ANTHROPIC_API_KEY": "fixture-api-key"}
-  key = register_anthropic_static_credential(env["ANTHROPIC_API_KEY"], environ=env)
-  assert key is not None
-  cfg: dict[str, object] = {"auth_mode": "api", "api_key": key.token, "credential_source": key.source_metadata()}
-  assert resolve_anthropic_credentials(cfg, environ=env).credentials == ()
-  cfg["auth_mode"] = "oauth"
-  with pytest.raises(AnthropicSourceError) as incompatible:
-    resolve_anthropic_credentials(cfg, environ=env)
-  assert incompatible.value.reason == "incompatible_source"
-
 
 @pytest.mark.parametrize("credential_kind", ["api_key", "auth_token"])
 def test_generation_auth_config_materializes_exact_source_and_rejects_retirement(
@@ -1283,3 +1278,147 @@ def test_request_enrollment_retains_oauth_account_refresh_authority(
   ) == "fresh-bearer"
   assert len(posts) == 1
   assert posts[0]["refresh_token"] == record.refresh_token
+
+
+@pytest.mark.parametrize("user_scope", [None, "7"])
+def test_bare_bound_tokens_of_different_requests_never_retire_each_other(
+  tmp_path: Path, user_scope: str | None,
+) -> None:
+  env = {"USER_DATA_DIR": str(tmp_path)}
+  generations: list[str] = []
+  for token in ("fixture-user-a-token", "fixture-user-b-token", "fixture-user-a-token"):
+    cfg: dict[str, object] = {"auth_mode": "oauth", "auth_token": token}
+    if user_scope is not None:
+      cfg[ANTHROPIC_USER_SCOPE_FIELD] = user_scope
+    bound = resolve_anthropic_credentials(cfg, environ=env).credentials[0]
+    assert bound.token == token
+    generations.append(bound.generation_ref)
+    assert anthropic_oauth.ensure_fresh_anthropic_credential(token, config=cfg, environ=env) == token
+  first_a, b, second_a = generations
+  assert first_a == second_a and first_a != b
+  path = resolve_anthropic_auth_store_path(environ=env, user_scope=user_scope)
+  saved = json.loads(path.read_text())
+  assert saved["retirements"] == {}
+  assert saved["retired_auth_token_grants"] == {}
+  assert len(saved["static_credentials"]) == 2
+  for ref in (first_a, b):
+    resolved = resolve_anthropic_credentials(
+      {"credential_source": {"generation_ref": ref}}, environ=env, user_scope=user_scope,
+    ).credentials[0]
+    assert resolved.generation_ref == ref
+
+
+@pytest.mark.parametrize("credential_kind", ["api_key", "auth_token"])
+@pytest.mark.parametrize("user_scope", [None, 7])
+def test_request_enrollment_of_different_material_keeps_every_generation(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+  credential_kind: str, user_scope: int | None,
+) -> None:
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  first, second, again = (
+    anthropic_oauth.enroll_request_anthropic_credential(
+      material, credential_kind=credential_kind, user_scope=user_scope,
+    )
+    for material in ("first-session-material", "second-session-material", "first-session-material")
+  )
+  assert first is not None and second is not None and again is not None
+  assert again.generation_ref == first.generation_ref != second.generation_ref
+  for enrolled in (first, second):
+    config = anthropic_oauth.anthropic_generation_auth_config(
+      enrolled.generation_ref, user_scope=user_scope, base_config={},
+    )
+    assert config["credential_source"] == enrolled.source_metadata()
+
+
+def test_exact_lookup_and_read_paths_never_write_a_read_only_store(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """Regression a: a read path opens the store read-only, never a raw OSError.
+
+  A store directory and lock file this process cannot open for write is exactly
+  a read-only deployment. The exact lookup reads through it; the pool writer
+  raises the owner's typed store error. The store bytes never change.
+  """
+  path = tmp_path / "anthropic" / "oauth.json"
+  [record] = upsert_anthropic_oauth_record(path, _record("readonly@example.com"))
+  saved = path.read_bytes()
+  lock_path = path.with_name(f".{path.name}.lock")
+  # Deny every write to the store's directory and lock file while leaving the
+  # store itself readable: `os.open(..., O_WRONLY)` and `mkdir` both fail.
+  real_open = os.open
+
+  def guarded_open(target, flags, *args, **kwargs):
+    target_path = Path(target)
+    if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT) and (
+      target_path == lock_path or target_path == path
+      or target_path.parent == path.parent
+    ):
+      raise PermissionError(13, "Permission denied", str(target))
+    return real_open(target, flags, *args, **kwargs)
+
+  real_mkdir = Path.mkdir
+
+  def guarded_mkdir(self, *args, **kwargs):
+    if self == path.parent:
+      raise PermissionError(13, "Permission denied", str(self))
+    return real_mkdir(self, *args, **kwargs)
+
+  monkeypatch.setattr(os, "open", guarded_open)
+  monkeypatch.setattr(Path, "mkdir", guarded_mkdir)
+
+  # The exact lookup only reads: it succeeds and leaves the store unchanged.
+  resolved = resolve_anthropic_credentials(
+    {"credential_source": record.source_metadata()},
+    environ={"ANTHROPIC_AUTH_STORE_PATH": str(path)},
+  )
+  assert resolved.credentials[0].generation_ref == record.generation_ref
+  assert path.read_bytes() == saved
+  # A pool resolve reconciles env and therefore writes: an unwritable store is
+  # the owner's typed error, never a raw PermissionError.
+  from agent_gateway.providers.anthropic_oauth import AnthropicStoreError
+
+  with pytest.raises(AnthropicStoreError) as unreadable:
+    resolve_anthropic_credentials(
+      environ={"ANTHROPIC_AUTH_STORE_PATH": str(path), "ANTHROPIC_AUTH_TOKEN": "fixture"},
+    )
+  assert unreadable.value.code == "store_unreadable"
+
+
+def test_exact_lookup_does_not_sync_environment_or_mutate_the_store(
+  tmp_path: Path,
+) -> None:
+  """Regression b: an exact generation resolve reports the bound generation, no sync."""
+  path = tmp_path / "anthropic" / "oauth.json"
+  [record] = upsert_anthropic_oauth_record(path, _record("bound@example.com"))
+  saved = path.read_bytes()
+  cfg = {"auth_token": record.access_token, "credential_source": record.source_metadata()}
+  env = {"ANTHROPIC_AUTH_STORE_PATH": str(path), "ANTHROPIC_AUTH_TOKEN": "fixture-env-token"}
+  resolved = resolve_anthropic_credentials(cfg, environ=env)
+  assert len(resolved.credentials) == 1
+  assert resolved.credentials[0].token == record.access_token
+  assert resolved.credentials[0].generation_ref == record.generation_ref
+  # No env sync happened: the store bytes are exactly as enrolled.
+  assert path.read_bytes() == saved
+
+
+def test_two_processes_with_different_env_tokens_do_not_retire_each_other(
+  tmp_path: Path,
+) -> None:
+  """Regression c: differing env tokens sharing one org store stay resolvable."""
+  path = tmp_path / "anthropic" / "oauth.json"
+  base = {"ANTHROPIC_AUTH_STORE_PATH": str(path)}
+  first = resolve_anthropic_credentials(
+    environ={**base, "ANTHROPIC_AUTH_TOKEN": "fixture-token-a"},
+  ).by_token("fixture-token-a")
+  assert first is not None
+  second = resolve_anthropic_credentials(
+    environ={**base, "ANTHROPIC_AUTH_TOKEN": "fixture-token-b"},
+  ).by_token("fixture-token-b")
+  assert second is not None
+  # Both generations remain resolvable by their own exact source.
+  for credential, env_token in ((first, "fixture-token-a"), (second, "fixture-token-b")):
+    again = resolve_anthropic_credentials(
+      {"credential_source": credential.source_metadata()},
+      environ={**base, "ANTHROPIC_AUTH_TOKEN": env_token},
+    )
+    assert again.credentials[0].generation_ref == credential.generation_ref

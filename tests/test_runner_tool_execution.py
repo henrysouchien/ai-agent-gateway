@@ -37,6 +37,11 @@ from agent_gateway import AgentRunner, AgentSessionLog, EventLog, SessionContext
 from agent_gateway.mcp_client import McpClientManager, _ServerState  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.approval_policy import RunContext  # noqa: E402
+from agent_gateway.approval_route import DurableLocalApprovalRoute  # noqa: E402
+from agent_gateway.approval_store import SQLiteApprovalStore  # noqa: E402
+from agent_gateway.session import SessionStore  # noqa: E402
+from agent_gateway.single_user_policy import SingleUserApprovalPolicy  # noqa: E402
+from agent_gateway.tool_dispatcher_approval_lifecycle import ApprovalPark  # noqa: E402
 import agent_gateway.runner_tool_execution as runner_tool_execution  # noqa: E402
 from agent_gateway.runner_background_tasks import (  # noqa: E402
   _BACKGROUND_RESULT_ACK_RESULT_KEY,
@@ -268,25 +273,6 @@ class _RefusalDispatcher(_Dispatcher):
   ):
     _ = tool_id, tool_name, tool_input, call_index
     return None, dict(self._error)
-
-
-
-class _ApprovalTimeoutDispatcher(_Dispatcher):
-  async def dispatch(
-    self,
-    tool_id: str,
-    tool_name: str,
-    tool_input: dict[str, Any],
-    *,
-    call_index: int = 0,
-    allow_uncertain_mcp_replay: bool = True,
-    on_executed_prepared_call: Any | None = None,
-  ):
-    _ = tool_id, tool_name, tool_input, call_index
-    return None, {
-      "code": "approval_timeout",
-      "message": "User did not respond within timeout",
-    }
 
 
 class _ReadableResourceDispatcher(_Dispatcher):
@@ -1328,27 +1314,6 @@ def test_repeated_excluded_tool_returns_the_same_result_and_never_forces_a_final
   assert not hasattr(runner, "_final_answer_turn_tool_name")
 
 
-def test_execute_single_tool_stops_after_expired_approval() -> None:
-  runner = AgentRunner(
-    event_log=EventLog(session_id="test"),
-    dispatcher=_ApprovalTimeoutDispatcher(),  # type: ignore[arg-type]
-    session_id="test-approval-timeout",
-    capability_execution=_capability_execution(),
-    user_id="alice",
-    billing_mode="byok",
-    rate_table_version="unknown",
-  )
-
-  live_entry, tool_name, _extra_blocks = _run(
-    runner._execute_single_tool("tool-1", "file_write", {"path": "x"}, {"tools": []})
-  )
-
-  assert tool_name == "file_write"
-  error = json.loads(live_entry["content"])["error"]
-  assert error["code"] == "approval_timeout"
-  assert runner._stop_after_tool_results_reason == "approval_timeout"
-  assert runner._stop_after_tool_results_tool_name == "file_write"
-
 
 
 
@@ -1859,6 +1824,73 @@ def _complete_event(runner: AgentRunner) -> dict[str, Any]:
   return events[-1]
 
 
+@pytest.mark.parametrize("with_code", [False, True])
+def test_pane_remediation_reaches_model_through_real_addin_dispatch(
+  monkeypatch: pytest.MonkeyPatch, with_code: bool,
+) -> None:
+  from agent.interactive import addin_execution
+  from agent.interactive.tool_dispatcher import ExcelToolDispatcher
+  from excel_mcp.relay import Channel, ChannelRegistry, ChannelType
+
+  async def scenario() -> None:
+    clock = [100.0]
+    monkeypatch.setattr(addin_execution, "time", SimpleNamespace(
+      time=lambda: 100, monotonic=lambda: clock[0],
+    ))
+    message = "Excel lost focus for this workbook. Bring the workbook to the front and retry."
+    pane_error: dict[str, Any] = {
+      "message": message,
+      "details": {"office_code": "InvalidOperation"},
+    }
+    if with_code:
+      pane_error["code"] = "focus_lost"
+    result_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    session = SimpleNamespace(session_id="pane-errors", pending_tools={})
+    event_log = EventLog()
+    execute_addin = addin_execution._make_execute_addin(
+      SimpleNamespace(session=session, result_queue=result_queue, event_log=event_log),
+      redact_tool_input_fn=lambda _name, value, **_kwargs: dict(value),
+      get_audit_hmac_secret_fn=lambda: b"secret",
+      resolve_display_fn=lambda _name, _value: None,
+    )
+    channels = ChannelRegistry()
+    await channels.register(Channel("excel", ChannelType.EXCEL, {"read_cells"}))
+    dispatcher = ExcelToolDispatcher(
+      base=ToolDispatcher(
+        capability_bind=TEST_CAPABILITY_BIND,
+        mcp_client=McpClientManager(config_path=None),
+        local_tool_handlers={},
+      ),
+      channel_registry=channels,
+      execute_addin=execute_addin,
+    )
+    runner = _dispatch_runner(dispatcher)
+    execution = asyncio.create_task(runner._execute_single_tool(
+      "focus-call", "read_cells", {"range": "A1"}, {"tools": []},
+    ))
+    while not event_log.entries:
+      await asyncio.sleep(0)
+    assert event_log.entries[-1].event["type"] == "tool_execute_request"
+    clock[0] += 0.5
+    await result_queue.put({"result": None, "error": pane_error})
+    live_entry, tool_name, extra_blocks = await execution
+    assert tool_name == "read_cells"
+    assert live_entry["is_error"] is True
+    assert extra_blocks == []
+    model_error = json.loads(live_entry["content"])["error"]
+    assert model_error["code"] == "focus_lost"
+    assert model_error["message"] == message
+    assert model_error["data"]["details"] == {
+      "office_code": "InvalidOperation",
+      "elapsed_seconds": 0.5,
+    }
+    assert _complete_event(runner)["final_tool_result_blocks"][0]["content"] == live_entry["content"]
+    assert pane_error["details"] == {"office_code": "InvalidOperation"}
+    assert session.pending_tools == {}
+
+  _run(scenario())
+
+
 def _start_event_count(runner: AgentRunner) -> int:
   return len(
     [
@@ -1874,6 +1906,11 @@ def declared_read_effects(monkeypatch: pytest.MonkeyPatch, owner_session_host_po
   """Supply the live test routes and read effects used by retry scenarios."""
 
   from agent_gateway import tool_dispatch_declarations as declarations
+  from agent_gateway.tool_dispatch_declarations import ToolDispatchSemantics
+  from agent_workflow_contracts.tool_registration import (
+    RegisteredToolIdentity,
+    VersionedPolicyRef,
+  )
 
   owner_session_host_policy.get_server_for_policy_tool = lambda name: (
     "fred-mcp"
@@ -1882,6 +1919,47 @@ def declared_read_effects(monkeypatch: pytest.MonkeyPatch, owner_session_host_po
   )
   owner_session_host_policy.get_local_tool_effect = lambda _name: None
   owner_session_host_policy.get_tool_class = lambda _server, _name: "read"
+  # The registration owner declares each route's dispatch semantics.
+  owner_session_host_policy.get_dispatch_semantics_overrides = lambda: {
+    RegisteredToolIdentity(
+      route_kind="mcp",
+      logical_server_id="research-corpus-mcp",
+      logical_name="filings_search",
+    ): ToolDispatchSemantics(
+      idempotent=True,
+      outcome_policy=VersionedPolicyRef(
+        kind="outcome",
+        policy_id="current-declared-status-equals",
+        version="v1",
+        parameters={"field": "status", "values": ("success",)},
+      ),
+      source_identity_policy=VersionedPolicyRef(
+        kind="source_identity",
+        policy_id="search_hits",
+        version="v1",
+        parameters={"container": "hits", "default_source_kind": "filing"},
+      ),
+    ),
+    RegisteredToolIdentity(
+      route_kind="mcp",
+      logical_server_id="fred-mcp",
+      logical_name="fred_search",
+    ): ToolDispatchSemantics(
+      idempotent=True,
+      outcome_policy=VersionedPolicyRef(
+        kind="outcome",
+        policy_id="current_generic_non_error",
+        version="v1",
+        parameters={},
+      ),
+      source_identity_policy=VersionedPolicyRef(
+        kind="source_identity",
+        policy_id="current_no_gateway_extraction",
+        version="v1",
+        parameters={},
+      ),
+    ),
+  }
 
   monkeypatch.setattr(
     declarations,
@@ -2017,6 +2095,203 @@ def test_dispatch_record_is_on_the_event_before_the_cancelled_arm_appends() -> N
   event = _complete_event(runner)
   assert event["dispatch"]["outcome"] == "cancelled"
   assert event["final_tool_result_blocks"]
+
+
+@pytest.mark.parametrize("exact_write", [True, False])
+def test_approval_park_leaves_original_call_unsettled(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  exact_write: bool,
+) -> None:
+  park = ApprovalPark(
+    job_id="job-park",
+    original_tool_call_id="call-park",
+    approval_id="approval-park",
+    nonce="private-park-nonce",
+  )
+  identity = object()
+  prepared = object()
+  expected_seconds = 3600.0
+  timings: list[dict[str, Any]] = []
+  result_hooks: list[Any] = []
+  expectation_timers: list[asyncio.TimerHandle] = []
+  plan_fields = {
+    "change_set_id": "change-park",
+    "change_hash": "a" * 64,
+    "base_vector_hash": "b" * 64,
+  }
+
+  class _PlannedHandler:
+    PLANNING_IDENTITY = "change_set"
+
+    async def __call__(self, *_args: Any, **_kwargs: Any) -> Never:
+      raise AssertionError("parked writes must not execute")
+
+    async def plan_change(
+      self,
+      _tool_input: dict[str, Any],
+      **_kwargs: Any,
+    ) -> tuple[object, object]:
+      return identity, prepared
+
+    async def execute_prepared_change(
+      self,
+      *_args: Any,
+      **_kwargs: Any,
+    ) -> Never:
+      raise AssertionError("parked writes must not execute")
+
+  class _ParkingLifecycleDispatcher(ToolDispatcher):
+    async def _run_approval_lifecycle(
+      self,
+      **_kwargs: Any,
+    ) -> dict[str, Any]:
+      raise park
+
+  class _UnclassifiedParkingDispatcher(_Dispatcher):
+    async def dispatch(
+      self,
+      tool_id: str,
+      tool_name: str,
+      tool_input: dict[str, Any],
+      *,
+      call_index: int = 0,
+      allow_uncertain_mcp_replay: bool = True,
+      on_executed_prepared_call: Any | None = None,
+    ) -> Never:
+      raise park
+
+  def _validate_plan(
+    _source: str,
+    _identity: object,
+    _prepared: object,
+  ) -> dict[str, Any]:
+    return dict(plan_fields)
+
+  def _review_plan(
+    _source: str,
+    _identity: object,
+    _prepared: object,
+  ) -> dict[str, Any]:
+    return {"change_set_id": plan_fields["change_set_id"]}
+
+  def _capture_timing(**kwargs: Any) -> None:
+    timings.append(kwargs)
+
+  async def _capture_result(ctx: Any) -> list[dict[str, Any]]:
+    result_hooks.append(ctx)
+    return []
+
+  session = SessionStore(ttl=3600).create_session(
+    api_key_hash="hash",
+    user_id="alice",
+    role="owner",
+  )
+  dispatcher: ToolDispatcher | _Dispatcher
+  if exact_write:
+    dispatcher = _ParkingLifecycleDispatcher(
+      mcp_client=McpClientManager(config_path=None),
+      local_tool_handlers={"planned_write": _PlannedHandler()},
+      capability_bind=TEST_CAPABILITY_BIND,
+      role="owner",
+      needs_approval=lambda *_args: False,
+      approval_route=DurableLocalApprovalRoute(
+        SQLiteApprovalStore(tmp_path / "approvals.sqlite3"),
+        SingleUserApprovalPolicy(),
+        session,
+      ),
+      local_tool_class_resolver=lambda _name: "state_write",
+      local_catalog_action_resolver=lambda _name: None,
+      plan_validator=_validate_plan,
+      plan_review_renderer=_review_plan,
+    )
+  else:
+    dispatcher = _UnclassifiedParkingDispatcher()
+  session_log = AgentSessionLog(path=tmp_path / "sessions" / "park.jsonl")
+  runner = _dispatch_runner(
+    dispatcher,
+    agent_session_log=session_log,
+    on_tool_timing=_capture_timing,
+    on_tool_result=_capture_result,
+    tool_call_timeout=expected_seconds,
+  )
+  runner._runner_id = "writer-park"
+  original_call = {
+    "type": "tool_use",
+    "id": park.original_tool_call_id,
+    "name": "planned_write",
+    "input": {"value": "unresolved original write"},
+  }
+
+  async def _scenario() -> None:
+    original_entry = await session_log.append({
+      "type": "assistant_message",
+      "content_blocks": [original_call],
+      "runner_id": runner._runner_id,
+      "role": "writer",
+    })
+    runner._last_assistant_message_seq = original_entry.seq
+    loop = asyncio.get_running_loop()
+    call_later = loop.call_later
+
+    def _record_timer(
+      delay: float,
+      callback: Any,
+      *args: Any,
+      **kwargs: Any,
+    ) -> asyncio.TimerHandle:
+      timer = call_later(delay, callback, *args, **kwargs)
+      if delay == expected_seconds:
+        expectation_timers.append(timer)
+      return timer
+
+    monkeypatch.setattr(loop, "call_later", _record_timer)
+    with pytest.raises(ApprovalPark) as caught:
+      await runner._execute_single_tool(
+        park.original_tool_call_id,
+        "planned_write",
+        original_call["input"],
+        {"tools": []},
+      )
+
+    assert caught.value is park
+    assert len(expectation_timers) == (0 if exact_write else 1)
+    assert all(timer.cancelled() for timer in expectation_timers)
+    assert timings == []
+    assert result_hooks == []
+    durable, _ = await session_log.query(order="asc")
+    for events in (
+      [entry.event for entry in runner._log.entries],
+      [entry.event for entry in durable],
+    ):
+      call_events = [
+        event
+        for event in events
+        if event.get("tool_call_id") == park.original_tool_call_id
+      ]
+      assert [event["type"] for event in call_events] == ["tool_call_start"]
+      assert call_events[0]["parent_assistant_message_seq"] == original_entry.seq
+      assert all("dispatch" not in event for event in call_events)
+      assert park.nonce not in json.dumps(events)
+
+    replay = await SessionContextBuilder(agent_session_log=session_log).build()
+    blocks = [
+      block
+      for message in replay
+      if isinstance(message.get("content"), list)
+      for block in message["content"]
+    ]
+    assert [block for block in blocks if block.get("type") == "tool_use"] == [
+      original_call
+    ]
+    assert not [
+      block
+      for block in blocks
+      if block.get("type") == "tool_result"
+      and block.get("tool_use_id") == park.original_tool_call_id
+    ]
+
+  _run(_scenario())
 
 
 def test_transient_read_failure_is_retried_and_settles_ok(

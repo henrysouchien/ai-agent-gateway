@@ -472,7 +472,14 @@ def compact_model_tool_result_entry(
   logger: Any,
   uuid_factory: Callable[[], Any] | None = None,
   on_spill_publication: Callable[[SpillPublication], None] | None = None,
+  max_chars: int | None = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+  """Project one tool result entry for model context, spilling what it elides.
+
+  `max_chars` is the bound the projected content must fit; it defaults to the
+  model's tool-result limit, and a delivery channel with a smaller inline
+  bound passes that bound.
+  """
   content = result_entry.get("content")
   if not isinstance(content, str):
     return result_entry, result_entry
@@ -506,7 +513,8 @@ def compact_model_tool_result_entry(
     )
     return projected_entry, projected_entry
 
-  max_chars = model_tool_result_max_chars()
+  if max_chars is None:
+    max_chars = model_tool_result_max_chars()
   plain_compacted_content, was_truncated = truncate_model_tool_result_content(
     content,
     tool_name=tool_name,

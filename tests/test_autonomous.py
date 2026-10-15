@@ -362,9 +362,6 @@ def test_autonomous_output_wrappers_preserve_parent_private_hooks(monkeypatch: p
   )
   assert payload["last_summary"] == "patched:1500:body"
   assert payload["alerts"] == ["patched-list:['keep']"]
-  assert "patched:1200:body" in autonomous.format_run_summary(
-    autonomous_output.RunOutput("body", [], {}, None, False)
-  )
 
   monkeypatch.setattr(autonomous, "_STATE_JSON_MARKER", "## CUSTOM_STATE")
   text = """
@@ -415,7 +412,6 @@ def test_collect_run_output() -> None:
   assert output.timed_out is False
   assert autonomous.run_output_outcome(output) == "success"
   assert autonomous.run_output_exit_code(output) == 0
-  assert output.max_tokens_reached is False
 
 
 def test_collect_approval_park_preserves_state_and_exposes_only_safe_references() -> None:
@@ -489,25 +485,40 @@ def test_collect_approval_park_preserves_state_and_exposes_only_safe_references(
   assert "approval_refs" not in settled_state
 
 
-def test_collect_run_output_detects_max_tokens_stop_reason() -> None:
+def test_length_stopped_run_records_measurement_and_keeps_terminal_status() -> None:
   event_log = EventLog()
-  event_log.append({"type": "text_delta", "text": "partial"})
+  event_log.append({"type": "text_delta", "text": "partial, then continued"})
   event_log.append({
     "type": "assistant_message",
     "content_blocks": [{"type": "text", "text": "partial"}],
     "stop_reason": "max_tokens",
   })
   event_log.append({
-    "type": "stream_complete",
-    "terminal_disposition": "completed",
-    "usage": {"input_tokens": 1, "output_tokens": 2},
+    "type": "assistant_message",
+    "content_blocks": [{"type": "text", "text": ", then continued"}],
+    "stop_reason": "end_turn",
   })
+  emit_recap_then_terminal(
+    event_log,
+    {
+      "type": "stream_complete",
+      "terminal_disposition": "completed",
+      "usage": {"input_tokens": 1, "output_tokens": 2},
+    },
+    session_id="standalone",
+    started_at=1.0,
+  )
 
   output = autonomous.collect_run_output(event_log, timed_out=False)
 
-  assert output.response == "partial"
-  assert output.max_tokens_reached is True
+  assert output.response == "partial, then continued"
   assert output.error is None
+  assert autonomous.run_output_outcome(output) == "success"
+  assert autonomous.run_output_exit_code(output) == 0
+  assert output.session_recap is not None
+  assert output.session_recap["tool_calls_summary"]["measurements"] == {
+    "max_tokens_stops": 1,
+  }
 
 
 def test_collect_run_output_detects_operator_pause() -> None:
@@ -703,7 +714,6 @@ def test_collect_run_output_carries_recap_to_durable_state(
   if terminal_order != "missing":
     event_log.append({"type": "text_delta", "text": "not part of the result"})
     event_log.append({"type": "operator_pause"})
-    event_log.append({"type": "max_tokens_reached"})
     event_log.append({
       "type": "stream_complete",
       "terminal_disposition": "completed",
@@ -714,7 +724,6 @@ def test_collect_run_output_carries_recap_to_durable_state(
   assert output.response == "partial"
   assert output.tools_used == ["model_preview"]
   assert output.operator_paused is False
-  assert output.max_tokens_reached is False
   expected_error = {
     "error": "provider failed",
     "missing": "missing_terminal_event",
@@ -1045,7 +1054,7 @@ def test_run_autonomous_binds_trusted_top_level_skill_identity(
   assert authority["session"].run_context.policy_bundle_hash == "a" * 64
 
 
-def test_run_autonomous_enforces_exact_top_level_skill_tool_ceiling(
+def test_run_autonomous_top_level_skill_exposes_every_supplied_tool(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   captured: dict[str, Any] = {}
@@ -1132,10 +1141,6 @@ def test_run_autonomous_enforces_exact_top_level_skill_tool_ceiling(
         {"name": "declared_local", "input_schema": {"type": "object"}},
         {"name": "extra_local", "input_schema": {"type": "object"}},
       ],
-      skill_local_tool_ceiling=frozenset({"declared_local"}),
-      skill_mcp_tool_ceiling={
-        "market-data-mcp": frozenset({"fetch_financials"})
-      },
       top_level_skill_name="market-scan",
       skill_run_id="run-skill-market-scan-test",
       user_id="alice",
@@ -1147,12 +1152,12 @@ def test_run_autonomous_enforces_exact_top_level_skill_tool_ceiling(
   assert output.response == "ok"
   assert captured["tool_defs"] == {
     "declared_local",
+    "extra_local",
     "fetch_financials",
+    "search_companies",
   }
-  assert captured["local_handlers"] == {"declared_local"}
-  assert captured["mcp_scope"] == {
-    "market-data-mcp": {"fetch_financials"}
-  }
+  assert captured["local_handlers"] == {"declared_local", "extra_local"}
+  assert captured["mcp_scope"] is None
   assert captured["manager_kwargs"]["logical_server_routes"] == {
     "market-data-mcp": "fmp-mcp"
   }
@@ -1221,22 +1226,6 @@ def test_run_autonomous_preserves_manager_alias_precedence_without_logical_route
   assert captured["canonical_servers"] == {
     "canonical-server": {"command": "canonical"}
   }
-
-
-def test_run_autonomous_rejects_top_level_skill_without_trusted_policy() -> None:
-  with pytest.raises(ValueError, match="trusted policy bundle"):
-    _run(
-      autonomous.run_autonomous(
-        "System",
-        "Hello",
-        **_bound_execution(),
-        top_level_skill_name="market-scan",
-        skill_run_id="run-skill-market-scan-test",
-        user_id="alice",
-        billing_mode="byok",
-        rate_table_version="unknown",
-      )
-    )
 
 
 def test_run_autonomous_public_surface_requires_prebound_execution() -> None:
@@ -1405,7 +1394,6 @@ def test_run_autonomous_sync_rejects_removed_raw_selection_fields() -> None:
   [
     (autonomous.RunOutput("ok", [], {}, None, False), 0),
     (autonomous.RunOutput("ok", [], {}, "boom", False), 1),
-    (autonomous.RunOutput("ok", [], {}, None, False, max_tokens_reached=True), 4),
     (autonomous.RunOutput("ok", [], {}, None, False, operator_paused=True), 0),
     (autonomous.RunOutput("ok", [], {}, "guard failed", False, exit_reason="post_run_guard_failed"), 1),
     (autonomous.RunOutput("ok", [], {}, None, True), 124),
@@ -1421,7 +1409,6 @@ def test_run_output_exit_code(output: autonomous.RunOutput, expected: int) -> No
     (autonomous.RunOutput("ok", [], {}, None, False), "success"),
     (autonomous.RunOutput("ok", [], {}, None, True), "timeout"),
     (autonomous.RunOutput("ok", [], {}, "boom", False), "error"),
-    (autonomous.RunOutput("ok", [], {}, None, False, max_tokens_reached=True), "max_tokens"),
     (autonomous.RunOutput("ok", [], {}, None, False, operator_paused=True), "operator_pause"),
     (
       autonomous.RunOutput("ok", [], {}, "guard failed", False, exit_reason="post_run_guard_failed"),
@@ -1519,7 +1506,6 @@ def test_build_state_payload() -> None:
   assert payload["usage"] == {"input_tokens": 5}
   assert payload["session_recap"] is None
   assert payload["operator_paused"] is False
-  assert payload["max_tokens_reached"] is False
   assert payload["last_outcome"] == "success"
   assert payload["last_summary"] == "Long summary text"
   assert payload["alerts"] == ["fresh"]
@@ -1541,20 +1527,8 @@ def test_build_state_payload() -> None:
       "error",
       "provider failed",
     ),
-    (
-      autonomous.RunOutput(
-        response="partial response",
-        tools_used=["file_read"],
-        usage={"input_tokens": 5},
-        error=None,
-        timed_out=False,
-        max_tokens_reached=True,
-      ),
-      "max_tokens",
-      None,
-    ),
   ],
-  ids=["terminal-error", "interrupted-max-tokens"],
+  ids=["terminal-error"],
 )
 def test_build_state_payload_rejects_model_state_from_non_successful_run(
   output: autonomous.RunOutput,
@@ -1637,6 +1611,41 @@ def test_deliver_telegram(monkeypatch: pytest.MonkeyPatch) -> None:
   assert len(calls) == 1
   assert calls[0]["url"] == "https://api.telegram.org/botbot-token/sendMessage"
   assert "Run label" in str(calls[0]["json"]["text"])
+
+
+def test_format_run_summary_preserves_long_reply_whole_for_transport_splitting() -> None:
+  reply = "\n".join(f"Finding {index}: " + "x" * 90 for index in range(120))
+  output = autonomous.RunOutput(reply, ["tool_a"], {"input_tokens": 10, "output_tokens": 20, "estimated_cost": 0.05}, None, False)
+  message = autonomous.format_run_summary(output, label="Nightly analyst run")
+  assert reply in message
+  chunks = autonomous.split_messages(message, max_len=4096)
+  assert len(chunks) > 1
+  assert all(len(chunk) <= 4096 for chunk in chunks)
+  assert reply in "".join(chunks)
+
+
+def test_deliver_telegram_sends_a_long_reply_whole_in_limit_sized_messages(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  calls: list[dict[str, Any]] = []
+  monkeypatch.setattr(autonomous.httpx, "AsyncClient", lambda *args, **kwargs: _RecordingAsyncClient(calls, *args, **kwargs))
+  reply = "\n".join(f"Finding {index}: " + "x" * 90 for index in range(120))
+
+  _run(
+    autonomous.deliver(
+      autonomous.DeliveryConfig(
+        telegram_bot_token="bot-token",
+        telegram_chat_id="chat-id",
+        telegram_label="Run label",
+      ),
+      autonomous.RunOutput(reply, [], {}, None, False),
+    )
+  )
+
+  texts = [str(call["json"]["text"]) for call in calls]
+  assert len(texts) > 1
+  assert all(len(text) <= 4096 for text in texts)
+  assert reply in "".join(texts)
 
 
 def test_deliver_telegram_briefing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1949,8 +1958,11 @@ def test_run_autonomous_delegated_code_handler_keeps_its_executable_route(
   from agent_gateway.task_registry import TaskRegistry
   from gateway_test_support.capability_execution_test_support import stub_capability_execution_resolver
   owner_session_host_policy.get_local_tool_effect = {
-    "code_execute": "read", "code_execute_status": "read", "parent_read": "read",
+    "code_execute": "read", "parent_read": "read",
   }.get
+  owner_session_host_policy.get_read_capability = lambda name, _server: (
+    "computation.execute/v1" if name == "code_execute" else None
+  )
 
   captured: dict[str, Any] = {}
   skills_dir = tmp_path / "skills"
@@ -2004,17 +2016,18 @@ def test_run_autonomous_delegated_code_handler_keeps_its_executable_route(
       code_callable=lambda name: name in parent_handlers,
     )
 
-  def child_factory(session: GatewaySession):
+  def child_factory(session: GatewaySession, *, job_runner: Any):
     captured["child_session"] = session
     bundle = build_code_execution(session, config=CodeExecutionConfig(
       register_docker=False, register_kernel=False,
-    ))
+    ), job_runner=job_runner)
     captured["child_bundle"] = bundle
     return bundle
 
   class ParentRunner:
     def __init__(self, **kwargs: Any) -> None:
       self._dispatcher = kwargs["dispatcher"]
+      self._containment = kwargs["containment"]
       self.capability_execution = kwargs["capability_execution"]
       self._get_tool_definitions = kwargs["get_tool_definitions"]
       self._full_session_id = authority["session"].session_id

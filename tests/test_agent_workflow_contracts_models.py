@@ -768,19 +768,19 @@ def test_v2_delivery_pairing_uses_the_recorded_preview_policy() -> None:
       ),
       envelope=envelope,
     )
-  with pytest.raises(ValidationError, match="version-2 delivery forbids"):
-    DeliverySettlement(
-      status="complete",
-      phase_number=2,
-      revision=1,
-      spec=spec,
-      envelope=envelope,
-      warning=DeliveryWarning(
-        code="delivery_summary_oversized",
-        message="not part of the version-2 contract",
-        omitted_outputs=("summary",),
-      ),
-    )
+  warned = DeliverySettlement(
+    status="complete",
+    phase_number=2,
+    revision=1,
+    spec=spec,
+    envelope=envelope,
+    warning=DeliveryWarning(
+      code="delivery_outputs_omitted",
+      message="an additional selector had no producer",
+      omitted_outputs=("appendix",),
+    ),
+  )
+  assert DeliverySettlement.model_validate_json(warned.model_dump_json()) == warned
 
 
 def test_complete_v2_preview_rejects_mismatched_non_string_exact_inline_value() -> None:
@@ -876,3 +876,25 @@ def test_complete_v2_preview_rejects_mismatched_non_string_exact_inline_value() 
       ),
       continuation_state=ContinuationState(status="not_available"),
     )
+
+
+
+def test_pipeline_stage_task_ref_is_a_logical_task() -> None:
+  from pydantic import TypeAdapter
+  from agent_workflow_contracts import LogicalTaskRef, PipelineStageTaskRef
+
+  stage = PipelineStageTaskRef(
+    pipeline_id="pipeline-1",
+    stage_id="stage-1",
+    operation=operation(),
+  )
+  parsed = TypeAdapter(LogicalTaskRef).validate_python(stage.model_dump(mode="json"))
+  assert isinstance(parsed, PipelineStageTaskRef)
+  assert parsed.kind == "pipeline_stage"
+  assert parsed.stage_id == "stage-1"
+  # Recorded default: an ordinary delegation with the stage run id is the revert.
+  ordinary = OrdinaryDelegationTaskRef(
+    delegation_id=stage.stage_id,
+    operation=stage.operation,
+  )
+  assert ordinary.kind == "ordinary_delegation"

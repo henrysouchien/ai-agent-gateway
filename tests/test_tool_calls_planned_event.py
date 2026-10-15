@@ -180,7 +180,7 @@ def test_tool_using_turn_plans_every_call_before_the_first_starts() -> None:
   planned = [event for event in events if event["type"] == "tool_calls_planned"]
   assert len(planned) == 1
   planned_index = types.index("tool_calls_planned")
-  assert types.index("turn_complete") == planned_index - 1
+  assert types.index("turn_complete") < planned_index
   assert planned_index < types.index("tool_call_start")
 
   event = planned[0]

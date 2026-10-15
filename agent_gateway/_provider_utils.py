@@ -43,7 +43,6 @@ def resolve_auth_config(
   max_tokens: int | None = None,
   infer_mode_from_prefix: bool = False,
   read_env: bool = True,
-  read_env_auth_mode: bool = False,
   raise_on_missing: bool = False,
 ) -> dict[str, Any]:
   """Resolve provider auth config from args, config dict, and env vars.
@@ -51,6 +50,11 @@ def resolve_auth_config(
   Precedence: explicit args > auth_config dict > environment variables.
   Env vars are only consulted when ``auth_config`` is None and ``read_env``
   is True.  Extra keys in ``auth_config`` are preserved in the result.
+
+  Anthropic material never comes from the ambient process environment: an
+  Anthropic record missing from args and ``auth_config`` is filled from the
+  gateway credential pool only (ruling u9-hank-evals-env-fallback-ruling,
+  2026-10-12), never from ``ANTHROPIC_API_KEY`` or ``ANTHROPIC_AUTH_MODE``.
 
   This function resolves credential and provider request-limit material only.
   Model and effort selection live exclusively in a ``CapabilityBind``.
@@ -102,28 +106,22 @@ def resolve_auth_config(
     return result
 
   # --- Anthropic path ---
-  # Resolve credentials: args > config dict > env (env only if no config)
-  use_env = read_env and auth_config is None
+  # Resolve credentials: args > config dict > pool (pool only if no config)
+  use_pool = read_env and auth_config is None
 
   resolved_key = (api_key or "").strip() or str(result.get("api_key", "")).strip()
   resolved_token = (auth_token or "").strip() or str(result.get("auth_token", "")).strip()
 
-  if use_env:
-    resolved_key = resolved_key or os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    resolved_token = resolved_token or os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
-    if not resolved_token:
-      from .providers.anthropic_oauth import (
-        resolve_anthropic_credentials,
-        select_anthropic_credential_source,
-      )
+  if use_pool and not resolved_token:
+    from .providers.anthropic_oauth import (
+      resolve_anthropic_credentials,
+      select_anthropic_credential_source,
+    )
 
-      selected = select_anthropic_credential_source(resolve_anthropic_credentials())
-      resolved_token = selected.token if selected is not None else ""
-
+    selected = select_anthropic_credential_source(resolve_anthropic_credentials())
+    resolved_token = selected.token if selected is not None else ""
   # Resolve auth_mode with precedence chain
   explicit_mode = str(result.get("auth_mode", "")).strip().lower()
-  if not explicit_mode and read_env_auth_mode and auth_config is None:
-    explicit_mode = os.environ.get("ANTHROPIC_AUTH_MODE", "").strip().lower()
 
   if explicit_mode:
     auth_mode = explicit_mode
@@ -143,17 +141,17 @@ def resolve_auth_config(
     if auth_mode == "oauth" and not resolved_token:
       raise RuntimeError(
         "auth_mode is 'oauth' but no auth_token found. "
-        "Set ANTHROPIC_AUTH_TOKEN or pass auth_token=."
+        "Enroll an account in the gateway credential pool or pass auth_token=."
       )
     if auth_mode == "api" and not resolved_key:
       raise RuntimeError(
         "auth_mode is 'api' but no api_key found. "
-        "Set ANTHROPIC_API_KEY or pass api_key=."
+        "Pass api_key= or an auth_config carrying it."
       )
 
   result["auth_mode"] = auth_mode
   if auth_config is None:
-    # Building from scratch (args + env) — normalize: blank the inactive credential
+    # Building from scratch (args + pool) — normalize: blank the inactive credential
     result["api_key"] = resolved_key if auth_mode == "api" else ""
     result["auth_token"] = resolved_token if auth_mode == "oauth" else ""
   else:

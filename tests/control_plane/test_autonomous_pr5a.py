@@ -1852,11 +1852,6 @@ def test_frozen_true_resume_fact_survives_source_deletion_and_control_reads(
       headers=_headers(alice),
       json={"message": "continue", "message_id": "frozen-message"},
     )
-    resumed = client.post(
-      "/api/control/runs/bg_0/resume",
-      headers=_headers(alice),
-      json={},
-    )
 
     assert detail.status_code == 200, detail.text
     assert detail.json()["resumable"] is True
@@ -1866,8 +1861,9 @@ def test_frozen_true_resume_fact_survives_source_deletion_and_control_reads(
     assert next(
       item for item in listing.json()["runs"] if item["run_id"] == "bg_0"
     )["resumable"] is True
-    assert message.status_code == 500, message.text
-    assert resumed.status_code == 200, resumed.text
+    assert message.status_code == 200, message.text
+    assert message.json()["delivery_status"] == "delivered"
+    assert message.json()["run"]["resumed_from"] == "bg_0"
     successor = app.state.subprocess_registry._tasks["bg_1"]
     assert successor.skill_resume_allowed is True
     cancelled = client.delete(
@@ -2684,6 +2680,11 @@ def test_control_profiles_lists_backend_available_profiles(monkeypatch, tmp_path
     "community": SimpleNamespace(
       name="community",
       channel_context="discord",
+      supports_autonomous_execution=True,
+    ),
+    "interactive_only": SimpleNamespace(
+      name="interactive_only",
+      channel_context="excel",
       supports_autonomous_execution=False,
     ),
   }
@@ -2701,19 +2702,24 @@ def test_control_profiles_lists_backend_available_profiles(monkeypatch, tmp_path
 
     assert response.status_code == 200, response.text
     profile_names = {entry["name"] for entry in response.json()["profiles"]}
-    assert profile_names == {"analyst", "advisor", "research_producer"}
+    assert profile_names == {
+      "analyst",
+      "advisor",
+      "research_producer",
+      "community",
+    }
 
 
-def test_autonomous_dispatch_leaves_the_profile_class_to_the_runner(
+def test_autonomous_dispatch_admits_the_community_profile(
   monkeypatch,
   tmp_path,
 ) -> None:
-  """The runner's ``require_autonomous_profile`` owns the interactive-only refusal."""
+  """Dispatch hands the profile to the runner; community supports autonomous execution."""
   processes, _envs = _install_fake_spawn(monkeypatch)
   profiles = {
     "community": SimpleNamespace(
       name="community",
-      supports_autonomous_execution=False,
+      supports_autonomous_execution=True,
     ),
   }
   app = _make_app(
@@ -2815,6 +2821,75 @@ def test_autonomous_waiting_run_accepts_operator_message(monkeypatch, tmp_path) 
     assert response.json()["run"]["state"] == "waiting"
     assert record.operator_inbox_path is not None
     assert "continue with read-only scope" in record.operator_inbox_path.read_text(encoding="utf-8")
+
+
+def _start_ended_resumable_run(
+  client: TestClient,
+  app: Any,
+  processes: list[Any],
+  alice: dict[str, Any],
+  *,
+  internal_state: str,
+  skill: str | None,
+) -> None:
+  body: dict[str, Any] = {"kind": "autonomous", "profile": "analyst", "mode": "task", "task": "summarize"}
+  if skill is not None:
+    body = {"kind": "autonomous", "profile": "analyst", "mode": "skill", "skill": skill}
+  start = client.post("/api/control/runs", headers=_headers(alice), json=body)
+  assert start.status_code == 200, start.text
+  record = app.state.subprocess_registry._tasks["bg_0"]
+  record.state = internal_state
+  record.exit_code = 1
+  record.completed_at = time.time()
+  processes[0].returncode = 1
+
+
+def test_message_to_an_interrupted_resumable_run_continues_it_with_the_message(monkeypatch, tmp_path) -> None:
+  processes, _envs = _install_fake_spawn(monkeypatch)
+  skills_dir = tmp_path / "skills"
+  _write_resumable_skill(skills_dir)
+  app = _make_app(monkeypatch, tmp_path, control_skills_dir=skills_dir)
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice", email="alice@example.com")
+    _start_ended_resumable_run(
+      client, app, processes, alice, internal_state="interrupted", skill="resumable-skill"
+    )
+
+    response = client.post(
+      "/api/control/runs/bg_0/messages",
+      headers=_headers(alice),
+      json={"message": "pick this up from the cache", "message_id": "revive-1"},
+    )
+
+  assert response.status_code == 200, response.text
+  assert response.json()["delivery_status"] == "delivered"
+  assert response.json()["message_id"] == "revive-1"
+  assert response.json()["run"]["resumed_from"] == "bg_0"
+  resumed_record = app.state.subprocess_registry._tasks["bg_1"]
+  assert resumed_record.context is not None
+  assert "pick this up from the cache" in resumed_record.context
+
+
+def test_message_to_a_settled_run_stays_terminal(monkeypatch, tmp_path) -> None:
+  processes, _envs = _install_fake_spawn(monkeypatch)
+  app = _make_app(monkeypatch, tmp_path)
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice")
+    _start_ended_resumable_run(
+      client, app, processes, alice, internal_state="finished", skill=None
+    )
+
+    response = client.post(
+      "/api/control/runs/bg_0/messages",
+      headers=_headers(alice),
+      json={"message": "one more thing", "message_id": "late-1"},
+    )
+
+  assert response.status_code == 409, response.text
+  assert "not resumable" in response.json()["detail"]
+  assert "bg_1" not in app.state.subprocess_registry._tasks
 
 
 def test_autonomous_dispatch_records_in_flight_count_without_refusing(monkeypatch, tmp_path) -> None:

@@ -11,7 +11,13 @@ from .skill_lifecycle import (
   SkillLifecycleScope,
   TopLevelSkillLifecycleMetadata,
 )
-from .sub_agent_skill_state import classify_child_outcome
+from .sub_agent_skill_state import (
+  ChildOutcomeClassification,
+  classify_child_outcome,
+  is_context_door_name,
+  is_declared_terminal_door,
+  terminal_fms_result_disposition,
+)
 
 
 FMS_DOOR_PREFIX = "fms_"
@@ -30,7 +36,12 @@ def build_skill_result_captured_event(
   output_memory_file: str | None = None,
   duration_s: float | None = None,
   canonical_result_evidence_authoritative: bool = False,
+  declared_terminal_doors: Iterable[str] | None = None,
 ) -> dict[str, Any] | None:
+  # ``declared_terminal_doors`` is the persist expectation:
+  # ``persist_expectation_doors(admitted_task)`` — the terminal-result doors,
+  # and only when the operation declares ``result_requires_persist``. A
+  # coordinator carries its children's doors without owing a persist of its own.
   artifact_identity = SkillLifecycleArtifactIdentity(
     scope=scope,
     ticker=ticker,
@@ -43,6 +54,10 @@ def build_skill_result_captured_event(
   )
   entry_list = list(entries)
   fms_results = extract_fms_results(entry_list)
+  # The door answers the child actually received, in order; the outcome is
+  # classified on these on every path. Canonical evidence below replaces only
+  # what is published (artifacts), never which doors answered.
+  door_results = extract_door_results(entry_list)
   artifact_events = extract_artifact_events(entry_list)
   canonical_evidence = _canonical_task_result_evidence(result)
   if (
@@ -50,18 +65,41 @@ def build_skill_result_captured_event(
     and canonical_evidence is not None
   ):
     fms_results, artifact_events = canonical_evidence
+  artifact_refs = _artifact_refs(fms_results, artifact_events)
   primary_fms = _primary_fms(fms_results)
   door_names = {
     str(item.get("tool_name"))
-    for item in fms_results
-    if isinstance(item, dict) and item.get("tool_name")
+    for item in door_results
+    if item.get("tool_name")
   }
   classification = classify_child_outcome(
     result,
     error,
     declared_terminal_doors=door_names,
-    door_results=fms_results,
+    door_results=door_results,
   )
+  declared_terminals = frozenset(declared_terminal_doors or ())
+  if (
+    classification.succeeded
+    and declared_terminals
+    and not artifact_refs
+    and not any(
+      item.get("tool_name") in declared_terminals
+      and terminal_fms_result_disposition(item) == "success"
+      for item in door_results
+    )
+  ):
+    # The grant declares a terminal door; ending with no accepted answer from
+    # it and no artifact is not a success, whatever the narrative claims.
+    classification = ChildOutcomeClassification(
+      outcome="blocked",
+      succeeded=False,
+      error={
+        "code": "no_gate_produced",
+        "message": "skill ended without an accepted terminal door result or artifact",
+        "child_outcome": "blocked",
+      },
+    )
   if not classification.is_final:
     return None
   primary_door_status = (
@@ -84,10 +122,11 @@ def build_skill_result_captured_event(
     # Door statuses stay visible inside ``fms_results``.
     "status": classification.outcome,
     "gate_code": _gate_code(primary_fms),
-    "artifact_refs": _artifact_refs(fms_results, artifact_events),
+    "artifact_refs": artifact_refs,
     "proposal_ids": _proposal_ids(fms_results),
     "verdict_echo": _verdict_echo(primary_fms),
     "fms_results": fms_results,
+    "last_failed_door_answer": extract_last_failed_door_answer(entry_list),
     "artifact_events": artifact_events,
     "output_memory_file": output_memory_file,
     "cost_usd": _canonical_task_result_cost_usd(result),
@@ -148,6 +187,41 @@ def _canonical_task_result_evidence(
   )
 
 
+def extract_last_failed_door_answer(
+  entries: Iterable[Any],
+) -> dict[str, Any] | None:
+  """Copy the last failed tool's answer, independent of its door namespace."""
+
+  last_answer: dict[str, Any] | None = None
+  for entry in entries:
+    event = _entry_event(entry)
+    if event is None or event.get("type") != "tool_call_complete":
+      continue
+    result = event.get("result")
+    if not isinstance(result, dict):
+      continue
+    error = result.get("error")
+    if isinstance(error, dict):
+      data = error.get("data")
+      next_call = (
+        data["next_call"]
+        if isinstance(data, dict) and "next_call" in data
+        else error.get("next_call")
+      )
+      code = error.get("code")
+    elif result.get("status") == "error":
+      code = result.get("error_type")
+      next_call = result.get("next_call")
+    else:
+      continue
+    last_answer = {
+      "tool_name": event.get("tool_name"),
+      "code": code,
+      "next_call": next_call,
+    }
+  return last_answer
+
+
 def extract_fms_results(
   entries: Iterable[Any],
   *,
@@ -163,6 +237,34 @@ def extract_fms_results(
       continue
     annotated = dict(result)
     annotated["tool_name"] = event.get("tool_name")
+    results.append(annotated)
+  return results
+
+
+def extract_door_results(entries: Iterable[Any]) -> list[dict[str, Any]]:
+  """Collect terminal (``fms_*``) and context (``get_*_context``) door answers
+  in entry order, each annotated with its ``tool_name``.
+
+  The last answer decides the child's outcome and a later accepted door
+  supersedes an earlier refusal (``classify_child_outcome``), so order is
+  the contract.
+  """
+
+  results: list[dict[str, Any]] = []
+  for entry in entries:
+    event = _entry_event(entry)
+    if event is None or event.get("type") != "tool_call_complete":
+      continue
+    tool_name = event.get("tool_name")
+    if not isinstance(tool_name, str) or not (
+      is_declared_terminal_door(tool_name) or is_context_door_name(tool_name)
+    ):
+      continue
+    result = event.get("result")
+    if not isinstance(result, dict):
+      continue
+    annotated = dict(result)
+    annotated["tool_name"] = tool_name
     results.append(annotated)
   return results
 
@@ -261,10 +363,9 @@ def _verdict_echo(primary_fms: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _gate_code(primary_fms: dict[str, Any]) -> str | None:
+  # The door envelope carries the normalized FMS gate code; the event
+  # normalizer (``skill_lifecycle.GATE_CODES``) owns which values are valid.
   raw_gate = primary_fms.get("gate_code")
-  verdict_echo = _verdict_echo(primary_fms)
-  if raw_gate is None and isinstance(verdict_echo, dict):
-    raw_gate = verdict_echo.get("gate_code") or verdict_echo.get("verdict")
   return str(raw_gate) if raw_gate is not None else None
 
 
@@ -313,4 +414,5 @@ __all__ = [
   "build_skill_result_captured_event",
   "extract_artifact_events",
   "extract_fms_results",
+  "extract_door_results",
 ]

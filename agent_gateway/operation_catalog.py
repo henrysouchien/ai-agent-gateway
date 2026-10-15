@@ -139,7 +139,6 @@ class OperationRuntimePolicy:
   state_class: StateClass
   persist_state: bool
   resumable: bool
-  resume_mcp_session_reset_ok: bool
   state_dir: str | None
   mutation_mode: MutationMode
   run_mode: RunMode
@@ -179,7 +178,6 @@ class OperationRuntimePolicy:
     for field_name in (
       "persist_state",
       "resumable",
-      "resume_mcp_session_reset_ok",
       "tool_packs_enabled",
     ):
       _require_exact_bool(getattr(self, field_name), field_name=field_name)

@@ -54,6 +54,7 @@ Schema:
 | `api_key` | string | yes | Must be non-empty. |
 | `schema_version` | integer | no | Wire schema version requested for this session. Defaults to `1`. Unsupported versions return HTTP `400` with `{"error":"unsupported_schema_version", "message":"Unsupported schema_version <N>; supported: [1]"}`. |
 | `user_id` | string | yes without resolver | Stable user identity. The gateway uses this for credential resolution and as the session identity. When a credentials resolver is configured, the resolver may derive the user from the API key; otherwise clients must send a top-level user_id. `_default` is reserved-invalid. |
+| `model_preset` | string | no | A model preset name the serving model-selection policy publishes (`GET /api/model-presets/self` lists them). It is frozen on the session as the authenticated run level: every root turn's role map is that preset, above the caller's saved preset and the firm's, and roles it omits come from policy. `capability_choices` (`selected`, `roles`) reflects it, with `reason` `internal_policy` where the preset decides. A name the policy does not publish returns HTTP `422` with `error_code` `capability_selection_invalid` and no session; a blank name is a request validation error. Omit it for user > firm > policy. |
 
 Response body:
 
@@ -242,7 +243,7 @@ missing, unavailable, and integrity-failed output paths return structured
 ### PUT /api/model-preferences/{capability_id}
 
 Save an authenticated stable-key preference for a capability whose product
-policy permits saved preferences. The bearer token must name a chat session.
+policy permits saved preferences. Either a control or a chat bearer works.
 
 ```json
 {
@@ -535,6 +536,15 @@ Use the generated OpenAPI document for exact control-plane request and response
 models; those routes are intended for operator clients rather than the basic
 chat flow.
 
+`POST /api/control/runs` with `kind: "autonomous"` accepts an optional
+`model_preset`: a preset name the model-selection policy publishes (listed by
+`GET /api/model-presets/self` as `known_preset_names`). The launched skill run
+and its descendants bind from that preset's whole role map; roles it omits come
+from base policy. A blank name, or a `model_preset` with a `mode` other than
+`skill`, is a 422; so is an unpublished name, whose detail names the preset
+and the policy revision. A resume keeps the run's frozen bind and never takes a
+preset.
+
 ## SSE Event Types
 
 Each SSE message is a JSON object under a `data:` line with the envelope
@@ -705,7 +715,7 @@ Fields:
 #### `stream_complete`
 
 Terminal run-settlement event. `terminal_disposition` distinguishes a successfully
-completed run from an intentional interruption. This is not necessarily transport
+completed run from an intentional interruption or an approval park. This is not necessarily transport
 EOF: citation validation can follow the terminal event. Continue reading through
 EOF to receive those settlements; do not persist or present an interrupted run as
 successful.
@@ -733,9 +743,14 @@ Schema:
 turn's system-prompt and tool-definition sections, respectively, not provider
 token counts.
 
-`terminal_disposition` is `"completed"` or `"interrupted"`. Interrupted
-closures also carry a machine-readable `reason`, such as `"operator_pause"`
-or `"soft_budget_abort"`.
+`terminal_disposition` is `"completed"`, `"interrupted"` or
+`"awaiting_approval"`. Interrupted closures also carry a machine-readable
+`reason`, such as `"operator_pause"` or `"soft_budget_abort"`. An
+`awaiting_approval` closure ends a run whose tool call parked for approval: it
+carries `job_id`, `approval_id`, `original_tool_call_id` and, when known,
+`root_turn_id`; the parked call has no `tool_call_complete`, the logical job
+stays open for its approved continuation, and the chat turn state reads
+`approval_pending`. Do not present it as completed or failed.
 
 The first terminal event fixes the run outcome; trailing events cannot replace it. An unknown non-null
 `terminal_disposition` is a protocol error and must fail closed; it must never
@@ -828,7 +843,7 @@ Fields:
 
 #### `headless_auto_deny`
 
-Emitted when a tool approval request is automatically denied because the runtime is configured to avoid permission prompts in a headless context.
+Historical. No producer since GP47 (2026-10-09), when background, delegated and resumed runs began to park on a human ask instead of denying it. The type stays in the event vocabulary so recorded logs still parse. It was emitted when a tool approval request was automatically denied because the runtime avoided permission prompts in a headless context.
 
 Schema:
 
@@ -998,6 +1013,28 @@ Schema:
 }
 ```
 
+#### `model_fallback`
+
+Emitted when the turn's model cannot continue — its account pool is rate-limited, out of credit or denied with no account left that serves, or a provider outage outlasts the retry budget — and the runner rebinds the turn's remaining attempts to the next eligible entry of the role's fallback chain (the shipped chains run Codex, then the other Anthropic tier where ruled, then the OpenAI API pool, then Grok, each only where the slot's ceiling and the entry's efforts admit it). A `stream_retry` follows. The next turn binds the primary again. `reason` is `usage_limit`, `credential_denied` or `provider_outage`; `reset_at` is the primary's block end in epoch seconds, or `null` when unknown; `skipped` lists chain entries refused before the chosen one, with the refusal code.
+
+A child run's hop appears on its parent's stream, once, carrying the child's `sub_agent_id`; a hop without `sub_agent_id` is the turn's own.
+
+Schema:
+
+```json
+{
+  "type": "model_fallback",
+  "from": {"model_key": "anthropic.claude-opus-5-5", "label": "Claude Opus 5.5", "provider": "anthropic", "upstream_model": "claude-opus-5-5", "effort": "high"},
+  "to": {"model_key": "anthropic.claude-sonnet-5-5", "label": "Claude Sonnet 5.5", "provider": "anthropic", "upstream_model": "claude-sonnet-5-5", "effort": "high"},
+  "reason": "usage_limit",
+  "reset_at": 1760050800.0,
+  "role": "deep",
+  "chain_index": 1,
+  "skipped": [{"model_key": "codex.gpt-6-1-sol", "code": "default_not_eligible"}],
+  "sub_agent_id": "sub0:..."  // present only when a child run hopped
+}
+```
+
 #### `stream_error`
 
 Emitted when SSE serialization itself fails.
@@ -1030,7 +1067,7 @@ Informational markers from the one soft containment guard on delegated runs
 (`runner_soft_budget.py`; `docs/engineering/soft-budget-containment-reference.md`).
 Neither stops the run. `soft_budget_steer` says the run's provider requests
 (turns plus `max_tokens` continuation segments) reached the threshold from the
-bundled `SOFT_TURN_BUDGET` table, and a wrap-up notice naming the `observed`
+`ContainmentSettings.soft_turn_budget` table, and a wrap-up notice naming the `observed`
 request count and the `threshold` rides the child's next turn;
 `soft_budget_final` says 1.5x the threshold was reached and the next turn
 is the forced final report. `kind` is always `"turns"`; `observed` is the
@@ -1404,8 +1441,8 @@ The default `SingleUserApprovalPolicy` never mints a persistent grant: it asks o
 
 ## Notes For Frontend Clients
 
-- Treat `stream_complete`, `error`, and `stream_error` as terminal events.
-- On `stream_complete`, use `terminal_disposition` to distinguish success from interruption; both close the transport.
+- Treat `stream_complete` and `error` as terminal events. `stream_error` does not end the turn by itself: the gateway substitutes it for an event it cannot adapt and keeps streaming. After a serialization failure it sends `stream_error` and closes the body with no terminal event, which a client reports as an incomplete turn.
+- On `stream_complete`, use `terminal_disposition` to distinguish its three values; each closes the transport. `completed` is success and `interrupted` an interruption. `awaiting_approval` means the job parked on an approval that is still pending: the event carries `job_id`, `approval_id` and `original_tool_call_id`, and the job continues once that approval is decided.
 - Do not treat lifecycle and background-task events such as `turn_complete`, `interrupted`, `task_registered`, or `task_completed` as terminal.
 - `heartbeat` is liveness, not content: render it as a progress indicator or ignore it, but never append it to the assistant message.
 - `refusal` is a notice, not a failure and not a terminal: keep the text already delivered, show the category, explanation and guidance under it, and wait for `stream_complete`.

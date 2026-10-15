@@ -46,7 +46,6 @@ _SEED_MAP: dict[str, _DisplaySpec] = {
   "compare_peers": _spec("Comparing peers", "ticker", "peer_tickers"),
   "get_estimate_revisions": _spec("Pulling {ticker} estimate revisions", "period"),
   # Model / spreadsheet work.
-  "build_model": _spec("Building a model", "ticker", "model"),
   "model_forecast": _spec("Forecasting model values", "ticker", "scenario"),
   "model_find": _spec("Finding model items", "ticker", "query"),
   "model_values": _spec("Reading model values", "ticker", "range"),
@@ -79,7 +78,6 @@ _SEED_MAP: dict[str, _DisplaySpec] = {
   "fms_propose_model_review": _spec("Drafting model review", "ticker"),
   "fms_propose_model_vs_consensus": _spec("Drafting model-vs-consensus view", "ticker"),
   "fms_propose_thesis_articulation": _spec("Drafting thesis articulation", "ticker"),
-  "fms_report_build_model": _spec("Writing model-build report", "ticker"),
   "fms_report_business_quality_assessment": _spec("Writing business-quality report", "ticker"),
   "fms_report_idea_to_thesis": _spec("Writing idea-to-thesis report", "ticker"),
   "fms_report_thesis_consultation": _spec("Writing thesis-consultation report", "ticker"),

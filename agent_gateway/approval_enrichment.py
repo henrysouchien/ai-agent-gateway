@@ -48,7 +48,6 @@ _SUMMARY_METADATA_FIELDS = (
   "broker_provider",
 )
 
-DEFAULT_APPROVAL_EXPIRY_SECONDS = 600.0
 MIN_APPROVAL_EXPIRY_SECONDS = 0.1
 TRADE_PREVIEW_APPROVAL_DISPATCH_MARGIN_SECONDS = 30.0
 
@@ -128,29 +127,34 @@ def effective_trade_approval_expiry_seconds(
   approval_args: Mapping[str, Any] | None,
   *,
   requested_expiry_seconds: float | int | None,
-  max_wait_seconds: float | int | None,
   now: datetime | None = None,
-) -> float:
-  """Return the approval window after applying trade-preview freshness caps."""
+) -> float | None:
+  """Return the approval window after applying trade-preview freshness caps.
 
-  requested = _positive_float(requested_expiry_seconds, DEFAULT_APPROVAL_EXPIRY_SECONDS)
+  Only a trade's preview lifetime shortens the window; any other request keeps
+  the expiry its policy asked for, including none.
+  """
+
+  requested = _positive_float(requested_expiry_seconds)
   if _policy_tool_name(tool_name) not in _TRADE_EXECUTE_TO_PREVIEW_TOOLS:
-    return max(MIN_APPROVAL_EXPIRY_SECONDS, requested)
-
-  max_wait = _positive_float(max_wait_seconds, requested)
-  effective = min(requested, max_wait)
+    return requested
 
   args = approval_args or {}
   summary = args.get("approval_summary") if isinstance(args, Mapping) else None
   if not isinstance(summary, Mapping):
-    return max(MIN_APPROVAL_EXPIRY_SECONDS, effective)
+    return requested
 
   remaining = _seconds_until_expiry(summary.get("expires_at"), now=now)
   if remaining is None:
-    return max(MIN_APPROVAL_EXPIRY_SECONDS, effective)
+    return requested
 
-  preview_safe_window = remaining - TRADE_PREVIEW_APPROVAL_DISPATCH_MARGIN_SECONDS
-  return max(MIN_APPROVAL_EXPIRY_SECONDS, min(effective, preview_safe_window))
+  preview_safe_window = max(
+    MIN_APPROVAL_EXPIRY_SECONDS,
+    remaining - TRADE_PREVIEW_APPROVAL_DISPATCH_MARGIN_SECONDS,
+  )
+  if requested is None:
+    return preview_safe_window
+  return min(requested, preview_safe_window)
 
 
 def _find_trade_preview_summary(
@@ -360,12 +364,12 @@ def _parse_datetime(value: Any) -> datetime | None:
     return None
 
 
-def _positive_float(value: Any, default: float) -> float:
+def _positive_float(value: Any) -> float | None:
   try:
     parsed = float(value)
   except (TypeError, ValueError):
-    return default
-  return parsed if parsed > 0 else default
+    return None
+  return parsed if parsed > 0 else None
 
 
 def _copy_if_present(target: dict[str, Any], source: Mapping[str, Any], key: str) -> None:

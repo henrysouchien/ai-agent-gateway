@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 import inspect
@@ -15,23 +14,24 @@ from uuid import NAMESPACE_URL, uuid5
 from jsonschema import Draft202012Validator
 from model_authority.bind import CapabilityBind
 
-from .commercial_claims import VerifiedCommercialClaim
+from hank_contracts.commercial_claims import VerifiedCommercialClaim
 from .commercial_contract import (
   canonical_usage_payload_sha256,
   packaged_usage_v3_contract_directory,
 )
-from .commercial_work_start import CommercialWorkStartContext
+from hank_contracts.commercial_work import CommercialWorkStartContext
 from .multi_user.billing import (
   BillingMode,
   SessionUsageSummary,
   UsageEvent,
   UsageState,
 )
-from .usage_reconciliation import (
+from hank_contracts.usage import (
+  CommercialUsageLineage as CommercialUsageLineage,
   CommercialUsageReconciliationReport,
-  CommercialUsageReconciliationTracker,
   UsageDurability,
 )
+from .usage_reconciliation import CommercialUsageReconciliationTracker
 
 logger = logging.getLogger(__name__)
 
@@ -46,36 +46,6 @@ class CommercialUsageReconciler(Protocol):
     self,
     summary: SessionUsageSummary,
   ) -> CommercialUsageReconciliationReport | None: ...
-
-
-@dataclass(frozen=True)
-class CommercialUsageLineage:
-  source_product: str
-  workflow_run_id: str
-  funding_route_id: str
-  operation: str
-  reservation_id: str | None = None
-  capability_id: str | None = None
-
-  def __post_init__(self) -> None:
-    for name in ("source_product",):
-      value = getattr(self, name)
-      if not isinstance(value, str) or not _CODE.fullmatch(value):
-        raise ValueError(f"commercial usage {name} is invalid")
-    for name in ("workflow_run_id", "funding_route_id", "operation"):
-      value = getattr(self, name)
-      if not isinstance(value, str) or not value or len(value) > 512:
-        raise ValueError(f"commercial usage {name} is invalid")
-    if self.reservation_id is not None and (
-      not isinstance(self.reservation_id, str)
-      or not self.reservation_id
-      or len(self.reservation_id) > 512
-    ):
-      raise ValueError("commercial usage reservation_id is invalid")
-    for name in ("capability_id",):
-      value = getattr(self, name)
-      if value is not None and (not isinstance(value, str) or not _CODE.fullmatch(value)):
-        raise ValueError(f"commercial usage {name} is invalid")
 
 
 class CommercialUsageProducer:
@@ -310,6 +280,8 @@ class CommercialUsageProducer:
         "workflow_attempt_kind": authorization.workflow_attempt_kind,
         "work_authorization_id": str(authorization.authorization_id),
       })
+    if event.selection_provenance is not None:
+      payload["selection_provenance"] = event.selection_provenance
     payloads = [payload]
     for operation, count in sorted((event.provider_unit_deltas or {}).items()):
       if not _CODE.fullmatch(operation) or not isinstance(count, int) or count <= 0:
@@ -336,6 +308,12 @@ class CommercialUsageProducer:
       errors = sorted(self._validator.iter_errors(candidate), key=lambda error: list(error.path))
       if errors:
         raise ValueError(f"commercial usage event is invalid: {errors[0].message}")
+    # rulings-index WA-ACCOUNT-BUDGET: one ledger per work start, fed only here.
+    ledger = None if self._work_start is None else getattr(
+      self._work_start, "spend_ledger", None
+    )
+    if ledger is not None:
+      ledger.record_usd(payload.get("producer_estimated_cost_usd"))
     result = sink(payloads)
     if inspect.isawaitable(result):
       result = await result

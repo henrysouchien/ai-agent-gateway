@@ -425,6 +425,48 @@ def test_rehydrated_budget_counts_retained_child_job_spills(tmp_path: Path) -> N
   assert rehydrated.used_bytes == child_bytes
 
 
+@pytest.mark.parametrize("linked", ["jobs", "job"])
+def test_job_spill_reader_never_follows_a_symlinked_jobs_boundary(
+  tmp_path: Path,
+  linked: str,
+) -> None:
+  tree_a = tmp_path / "a"
+  tree_b = tmp_path / "b"
+  tree_a.mkdir()
+  tree_b.mkdir()
+  foreign = job_spill_sink(_sink(tree_a), "bg_0")
+  spill_ref = _spill(foreign, "foreign-call")
+  foreign_root = Path(foreign())
+  if linked == "jobs":
+    (tree_b / "jobs").symlink_to(tree_a / "jobs")
+  else:
+    (tree_b / "jobs").mkdir()
+    (tree_b / "jobs" / foreign_root.name).symlink_to(foreign_root)
+  # Job ids repeat across trees, so tree B's ``bg_0`` names A's directory.
+  reader = job_spill_sink(_sink(tree_b), "bg_0")
+  assert Path(reader()).name == foreign_root.name
+
+  assert spill_module.resolve_spill_producer(reader, spill_ref) is None
+  with pytest.raises(SpillReadUnavailable):
+    read_spill_result(reader, spill_ref=spill_ref)
+  with pytest.raises(SpillError):
+    _spill(reader, "through-link")
+
+
+def test_job_spill_reads_locate_without_creating_directories(tmp_path: Path) -> None:
+  tree = tmp_path / "tree"
+  elsewhere = tmp_path / "elsewhere"
+  tree.mkdir()
+  elsewhere.mkdir()
+  spill_ref = _spill(_sink(elsewhere), "elsewhere-call")
+  worker = job_spill_sink(job_spill_sink(_sink(tree), "bg_0"), "lead_0")
+
+  assert spill_module.resolve_spill_producer(worker, spill_ref) is None
+  with pytest.raises(SpillReadUnavailable):
+    read_spill_result(worker, spill_ref=spill_ref)
+  assert list(tree.iterdir()) == []
+
+
 @pytest.mark.parametrize("collision_role", ["index", "sidecar", "manifest"])
 def test_file_set_collision_reformats_and_republishes_one_fresh_stem(
   tmp_path: Path,

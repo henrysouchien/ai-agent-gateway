@@ -32,11 +32,6 @@ VALUATION_READY_BATCH_DISPATCH_TOOL_DEF: dict[str, Any] = {
         "description": "Optional total batch budget. Defaults to the valuation-ready catalog suggestion.",
         "minimum": 0,
       },
-      "max_concurrency": {
-        "type": "integer",
-        "description": "Optional max concurrent ticker runs. Single-ticker dispatch defaults to 1.",
-        "minimum": 1,
-      },
       "required_filings": {
         "type": "array",
         "description": "Exact SEC filing fiscal periods checked before spend (YYYY-Q1..Q4 or YYYY-FY); periods not yet ready return as warnings.",
@@ -152,30 +147,11 @@ def _dispatch_spec(
         "message": "budget_usd must be non-negative.",
         "details": {"verdict": "INSUFFICIENT_DATA", "reason": "invalid_budget"},
       }
-  max_concurrency_raw = (tool_input or {}).get("max_concurrency")
-  if max_concurrency_raw is None:
-    max_concurrency = 1
-  else:
-    try:
-      max_concurrency = int(max_concurrency_raw)
-    except (TypeError, ValueError):
-      return None, {
-        "code": "invalid_max_concurrency",
-        "message": "max_concurrency must be an integer when provided.",
-        "details": {"verdict": "INSUFFICIENT_DATA", "reason": "invalid_max_concurrency"},
-      }
-    if max_concurrency < 1:
-      return None, {
-        "code": "invalid_max_concurrency",
-        "message": "max_concurrency must be at least 1.",
-        "details": {"verdict": "INSUFFICIENT_DATA", "reason": "invalid_max_concurrency"},
-      }
   return {
     "source": EXPLICIT_TICKER_SOURCE,
     "universe": [ticker],
     "pipeline_template": VALUATION_READY_TEMPLATE,
     "budget_usd": budget_usd,
-    "max_concurrency": max_concurrency,
     "corpus_requirements": [{
       "ticker": ticker,
       "required_filings": (tool_input or {}).get("required_filings"),
@@ -261,7 +237,6 @@ def _make_dispatch_handler(*, app_state: Any, session: Any) -> LocalToolHandler:
       "pipeline_template": VALUATION_READY_TEMPLATE,
       "ticker": spec["universe"][0],
       "budget_usd": spec["budget_usd"],
-      "max_concurrency": spec["max_concurrency"],
     }, None
 
   return _handle

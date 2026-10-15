@@ -68,7 +68,6 @@ class SingleUserApprovalPolicy:
           if request.approval_constraint == "fresh_human_owner"
           else f"{request.tool_class} tool requires explicit user approval"
         ),
-        expiry_seconds=600,
         allow_persistent_grant=False,
         policy_id=self.policy_id,
         policy_version=self.policy_version,

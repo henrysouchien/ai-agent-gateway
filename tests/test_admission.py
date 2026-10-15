@@ -24,6 +24,7 @@ from agent_workflow_contracts.models import (
   AdmittedResearchBinding,
 )
 from agent_gateway.admission import (
+  AdmittedChildIdentity,
   AdmittedContext,
   AdmissionOwners,
   ContinuationOwners,
@@ -49,6 +50,7 @@ from agent_gateway.admission import (
   root_context_from_identity,
 )
 from agent_gateway.child_environment import RUN_BASH_ENVIRONMENT
+from agent_gateway.containment_settings import ContainmentSettings
 from agent_gateway.approval_route import (
   NO_APPROVAL_ROUTE,
   ControlPlaneApprovalRoute,
@@ -58,7 +60,7 @@ from agent_gateway.approval_route import (
   route_session,
 )
 from agent_gateway.approval_policy import RunContext, build_approval_request, sha256_args
-from agent_gateway.approval_store import SQLiteApprovalStore
+from agent_gateway.approval_store import RootTurnRecordError, SQLiteApprovalStore
 from agent_gateway.single_user_policy import SingleUserApprovalPolicy
 from agent_gateway.tool_policy_registry import PreparedToolCall
 from agent_gateway.capability_resolution import OperationDeclaration, resolve_operation_authority
@@ -70,11 +72,6 @@ from gateway_test_support.capability_execution_test_support import (
 )
 from gateway_test_support.host_policy import owner_session_host_policy
 from model_authority.selection import SelectionSnapshot, capture_selection_snapshot
-
-@pytest.fixture(autouse=True)
-def _default_spawn_depth(monkeypatch: pytest.MonkeyPatch) -> None:
-  monkeypatch.delenv("HANK_MAX_SPAWN_DEPTH", raising=False)
-
 
 
 def _session() -> GatewaySession:
@@ -129,6 +126,7 @@ def _owners(
   env_contract: str | None = None,
   env_names: frozenset[str] = frozenset(),
   children: tuple[str, ...] = (),
+  containment: ContainmentSettings = ContainmentSettings(),
 ) -> AdmissionOwners:
   known = ceiling if registered is None else registered
   declaration = OperationDeclaration(
@@ -163,6 +161,7 @@ def _owners(
     session=_session(),
     route_registered=lambda tool_id: tool_id in known,
     placement="in_process",
+    containment=containment,
     resolve_tool_authority=lambda tool_ids: resolve_operation_authority(
       replace(declaration, tool_ceiling=tool_ids),
       catalog=catalog,
@@ -280,6 +279,8 @@ def test_spawn_keeps_the_turns_snapshot_and_a_later_mint_does_not_inherit_it() -
 
 
 class _BackgroundRunner:
+  _containment = ContainmentSettings()
+
   def __init__(self) -> None:
     self.capability_execution = _resolver().resolve("session.driver")
     self._full_session_id = "session-admission"
@@ -591,13 +592,12 @@ def test_spawn_after_zero_or_overrun_spend_retains_admitted_authority(
 @pytest.mark.parametrize("maximum", [0, 1, 3])
 def test_configured_spawn_depth_omits_only_the_spawn_tool_at_the_boundary(
   maximum: int,
-  monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  monkeypatch.setenv("HANK_MAX_SPAWN_DEPTH", str(maximum))
   owners = _owners(
     _PlainResolver(),
     ceiling=frozenset({"file_read", "run_agent"}),
     children=("explore",),
+    containment=ContainmentSettings(max_spawn_depth=maximum),
   )
   parent = _root()
   for depth in range(1, maximum + 1):
@@ -626,9 +626,7 @@ def test_configured_spawn_depth_omits_only_the_spawn_tool_at_the_boundary(
 def test_negative_spawn_depth_limit_disables_refusal_and_tool_omission(
   maximum: int,
   parent_depth: int,
-  monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  monkeypatch.setenv("HANK_MAX_SPAWN_DEPTH", str(maximum))
   result = admit(
     _request(),
     _root(depth=parent_depth, remaining_usd=-1.25),
@@ -636,6 +634,7 @@ def test_negative_spawn_depth_limit_disables_refusal_and_tool_omission(
       _PlainResolver(),
       ceiling=frozenset({"file_read", "run_agent"}),
       children=("explore",),
+      containment=ContainmentSettings(max_spawn_depth=maximum),
     ),
   )
   assert isinstance(result, AdmittedContext)
@@ -666,9 +665,7 @@ def test_direct_or_stale_spawn_at_or_past_default_depth_is_a_resource_refusal(
   assert resolver.reads == []
 
 
-def test_spawn_boundary_preserves_other_grants_and_does_not_mutate_inputs(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_spawn_boundary_preserves_other_grants_and_does_not_mutate_inputs() -> None:
   resolver = _PlainResolver()
   ceiling = frozenset({
     "file_read", "run_agent", "send_message", "private_read",
@@ -690,8 +687,10 @@ def test_spawn_boundary_preserves_other_grants_and_does_not_mutate_inputs(
   before = copy.deepcopy(parent)
   request = _request(handles=("h:1",))
   bounded = admit(request, parent, owners=owners)
-  monkeypatch.setenv("HANK_MAX_SPAWN_DEPTH", "-1")
-  unbounded = admit(request, parent, owners=owners)
+  unbounded = admit(
+    request, parent,
+    owners=replace(owners, containment=ContainmentSettings(max_spawn_depth=-1)),
+  )
 
   assert isinstance(bounded, AdmittedContext)
   assert isinstance(unbounded, AdmittedContext)
@@ -812,27 +811,79 @@ def test_handles_outside_parent_grants_refuse_handle_not_granted() -> None:
   assert result.reason == "handle_not_granted"
 
 
+def test_descendant_output_handles_are_admissible_on_spawn() -> None:
+  handle = "sha256:" + "a" * 64
+  owners = replace(_owners(_PlainResolver()), outputs=frozenset({handle}))
+  admitted = admit(_request(handles=(handle,)), _root(), owners=owners)
+  assert isinstance(admitted, AdmittedContext)
+  assert admitted.wire.handle_grants == (handle,)
+  dropped = admit(
+    _request(handles=(handle,)),
+    _root(),
+    owners=replace(owners, outputs=frozenset()),
+  )
+  assert isinstance(dropped, Refusal)
+  assert dropped.reason == "handle_not_granted"
+
+
+
 def test_binding_other_than_parents_refuses_binding_not_granted() -> None:
   refused = admit(
     _request(binding=AdmittedResearchBinding(research_file_id=43)),
     _root(research_binding=AdmittedResearchBinding(research_file_id=42)),
     owners=_owners(_PlainResolver()),
   )
-  inherited = admit(
+  assert isinstance(refused, Refusal)
+  assert refused.reason == "binding_not_granted"
+
+
+def test_ticker_only_child_under_research_bound_parent_refuses_binding_ambiguous() -> None:
+  # Interim (b) under XIB-binding ruling: ticker-only child under a research-bound parent
+  # is refused binding_ambiguous rather than inheriting the parent's research file.
+  refused = admit(
     _request(binding=AdmittedResearchBinding(ticker="AAPL")),
     _root(research_binding=AdmittedResearchBinding(research_file_id=42)),
     owners=_owners(_PlainResolver()),
   )
-
   assert isinstance(refused, Refusal)
-  assert refused.reason == "binding_not_granted"
-  assert isinstance(inherited, AdmittedContext)
-  assert inherited.wire.research_binding == AdmittedResearchBinding(
+  assert refused.reason == "binding_ambiguous"
+  assert "ticker-only child delegation requested" in refused.detail
+  assert refused.owner == "admission research_binding"
+
+  # Under an unbound parent, a ticker-only request is admitted with research_file_id=None.
+  unbound_parent_child = admit(
+    _request(binding=AdmittedResearchBinding(ticker="AAPL")),
+    _root(research_binding=AdmittedResearchBinding(research_file_id=None)),
+    owners=_owners(_PlainResolver()),
+  )
+  assert isinstance(unbound_parent_child, AdmittedContext)
+  assert unbound_parent_child.wire.research_binding == AdmittedResearchBinding(
+    research_file_id=None,
+    ticker="AAPL",
+  )
+
+  # Under a bound parent, providing the matching research_file_id is admitted.
+  matching_child = admit(
+    _request(binding=AdmittedResearchBinding(research_file_id=42, ticker="AAPL")),
+    _root(research_binding=AdmittedResearchBinding(research_file_id=42)),
+    owners=_owners(_PlainResolver()),
+  )
+  assert isinstance(matching_child, AdmittedContext)
+  assert matching_child.wire.research_binding == AdmittedResearchBinding(
     research_file_id=42,
     ticker="AAPL",
   )
 
-
+  # When the child requests no binding at all, it inherits the parent binding.
+  no_binding_child = admit(
+    _request(binding=None),
+    _root(research_binding=AdmittedResearchBinding(research_file_id=42)),
+    owners=_owners(_PlainResolver()),
+  )
+  assert isinstance(no_binding_child, AdmittedContext)
+  assert no_binding_child.wire.research_binding == AdmittedResearchBinding(
+    research_file_id=42,
+  )
 # --- (c) no side effect -------------------------------------------------
 
 
@@ -849,6 +900,76 @@ def test_root_tenant_storage_id_is_the_minted_owner_not_the_channel_user_id() ->
   root = root_context(session, withheld_tools=frozenset(), research_file_id=None)
   assert root.tenant is not None
   assert root.tenant.storage_id == "1"
+
+
+def _child_identity(**changes: Any) -> AdmittedChildIdentity:
+  return replace(
+    AdmittedChildIdentity(
+      user_id="actor-test",
+      raw_user_id="actor-raw",
+      user_email="actor@example.com",
+      user_slug="actor",
+      risk_user_id=7,
+      user_aliases=("actor-test", "actor-raw", "actor"),
+      identity_status="canonical",
+      role="owner",
+    ),
+    **changes,
+  )
+
+
+def test_spawn_returns_the_launch_identity_bound_to_the_parent_tenant() -> None:
+  identity = _child_identity()
+  admitted = admit(
+    _request(),
+    _root(),
+    owners=replace(_owners(_resolver()), identity=identity),
+  )
+
+  assert isinstance(admitted, AdmittedContext)
+  assert admitted.identity is identity
+  assert "identity" not in admitted.wire.model_dump(mode="json")
+
+
+@pytest.mark.parametrize(
+  ("changes", "parent_changes"),
+  [
+    ({"user_id": "someone-else"}, {}),
+    ({"role": "invite"}, {}),
+    ({}, {"tenant": None}),
+  ],
+)
+def test_spawn_refuses_an_identity_outside_the_parent_tenant(
+  changes: dict[str, Any],
+  parent_changes: dict[str, Any],
+) -> None:
+  refused = admit(
+    _request(),
+    _root(**parent_changes),
+    owners=replace(_owners(_resolver()), identity=_child_identity(**changes)),
+  )
+
+  assert isinstance(refused, Refusal)
+  assert refused.reason == "tenant_mismatch"
+  assert refused.owner == "admission tenant"
+
+
+@pytest.mark.parametrize("role", ["Owner", "", "admin"])
+def test_spawn_refuses_an_inexact_identity_role(role: str) -> None:
+  with pytest.raises(ValueError, match="role must be exactly"):
+    admit(
+      _request(),
+      _root(),
+      owners=replace(_owners(_resolver()), identity=_child_identity(role=role)),
+    )
+
+
+def test_spawn_without_a_launch_identity_admits_none() -> None:
+  admitted = admit(_request(), _root(), owners=_owners(_resolver()))
+
+  assert isinstance(admitted, AdmittedContext)
+  assert admitted.identity is None
+
 
 
 def test_admitted_grant_is_the_semantic_owners_executable_grant() -> None:
@@ -933,6 +1054,16 @@ def test_admit_writes_nothing_to_its_inputs() -> None:
   assert first == second
   assert resolver.reads == ["node.explore", "node.explore"]
 
+
+def test_admit_defaults_selection_provenance_role_when_unspecified() -> None:
+  resolver = _PlainResolver()
+  owners = _owners(resolver)
+  parent = _root()
+  request = _request(role=None)
+  admitted = admit(request, parent, owners=owners)
+  assert isinstance(admitted, AdmittedContext)
+  assert admitted.wire.selection_provenance is not None
+  assert admitted.wire.selection_provenance.role == "default"
 
 # --- (d) unknown names are logged, never refused ------------------------
 
@@ -1067,7 +1198,6 @@ def test_continuation_keeps_frozen_spawn_grant_after_depth_limit_changes(
   cause: Any,
   caplog: pytest.LogCaptureFixture,
   owner_session_host_policy: Any,
-  monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   owner_session_host_policy.get_local_tool_effect = lambda _name: "read"
   admitted = admit(
@@ -1111,7 +1241,6 @@ def test_continuation_keeps_frozen_spawn_grant_after_depth_limit_changes(
   seal_admitted_task_payload(payload)
   task = AdmittedTask.model_validate(payload)
   before = task.model_dump(mode="json")
-  monkeypatch.setenv("HANK_MAX_SPAWN_DEPTH", "0")
   result = admit(
     ContinueRequest(task.attempt.physical_task_id, cause=cause),
     _root(depth=7, tool_ids=frozenset(), remaining_usd=0.0),
@@ -1603,9 +1732,11 @@ def test_interactive_sdk_and_autonomous_bound_root_parks_locate_after_cold_reope
     assert await cold._locate_root_turn_for_approval(
       approval_id=approval_id, tenant_storage_id=session.owner_user_id,
     ) == (session.session_id, call_id, nonce, admission.turn_id)
-    assert await cold._locate_root_turn_for_approval(
-      approval_id=approval_id, tenant_storage_id="foreign-tenant",
-    ) is None
+    with pytest.raises(RootTurnRecordError) as tenant_error:
+      await cold._locate_root_turn_for_approval(
+        approval_id=approval_id, tenant_storage_id="foreign-tenant",
+      )
+    assert tenant_error.value.code == "tenant_mismatch"
     if not with_binding:
       with cold._connection() as conn:
         assert conn.execute("SELECT count(*) FROM approval_executable_bindings").fetchone()[0] == 0
@@ -1721,7 +1852,7 @@ def test_interactive_root_turn_records_before_tools_in_dispatchers_store(
       session=session,
       request=SimpleNamespace(
         capability_execution=execution, capability_execution_resolver=_resolver(),
-        selection_snapshot=None,
+        selection_snapshot=None, selection_provenance=None,
       ),
       channel="cli", auth_manager=None,
       channel_registry=SimpleNamespace(get_channel_for_tool=lambda _name: None),
@@ -1731,6 +1862,7 @@ def test_interactive_root_turn_records_before_tools_in_dispatchers_store(
       memory_scope_for_user_fn=lambda _user: nullcontext(),
       prepare_prompting_state_fn=lambda **_kwargs: prompting,
       skill_application=skill_application,
+      containment=ContainmentSettings(),
     )
     admission = current_root_turn(session)
     assert admission is not None

@@ -30,10 +30,16 @@ ContinueStatus = Literal[
 
 @dataclass(frozen=True)
 class RootContinueRequest:
-  """Root approval ID and tenant storage identity verified by the calling route."""
+  """Root approval ID and tenant storage identity verified by the calling route.
+
+  ``reissued_from`` names the approval this one re-issued under the current
+  policy generation: the host publishes the new ask on the job's durable log
+  instead of delivering anything.
+  """
 
   approval_id: str
   tenant_storage_id: str
+  reissued_from: str | None = None
 
 
 @dataclass(frozen=True)

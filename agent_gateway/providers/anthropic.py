@@ -49,6 +49,7 @@ from .anthropic_helpers import (
 )
 from .anthropic_oauth import (
   ANTHROPIC_CREDENTIAL_POOL,
+  ANTHROPIC_DEPLOYMENT_API_KEY_FIELD,
   UNDECLARED_LIMIT_BLOCK_SECONDS,
   ensure_fresh_anthropic_credential,
   resolve_anthropic_credentials,
@@ -446,6 +447,140 @@ def _prepare_anthropic_tools(
   return prepare_anthropic_tools(tools)
 
 
+# A tool_result entry names the tools its call made callable under this key
+# (provider-neutral: other providers' transcripts ignore it). The rendering
+# below turns it into `tool_reference` blocks.
+_EXPOSED_TOOLS_KEY = "exposed_tools"
+
+
+def referenced_tool_names(messages: list[dict[str, Any]]) -> frozenset[str]:
+  """Names the visible history exposes through its tool_result entries."""
+
+  return frozenset(
+    name
+    for message in messages
+    if message.get("role") == "user" and isinstance(message.get("content"), list)
+    for block in message["content"]
+    if isinstance(block, dict)
+    and block.get("type") == "tool_result"
+    for name in block.get(_EXPOSED_TOOLS_KEY) or ()
+  )
+
+
+def _prefix_stable_tools(
+  tools: list[dict[str, Any]],
+  anchor: list[dict[str, Any]],
+  referenced: frozenset[str],
+  framing_tool: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+  """Lay the request tools out so later additions never touch the cached prefix.
+
+  Anthropic's cache prefix is tools, then system, then messages, so any change
+  to the non-deferred tool list rewrites everything after it.  The anchor (the
+  wire definitions the conversation's first request sent) is re-sent unchanged
+  and in order.  Every other tool follows it, and whether it is deferred is a
+  pure function of the visible history: a tool is sent ``defer_loading`` only
+  when a ``tool_reference`` for it renders from ``referenced`` (the API expands
+  that reference into the definition), and is otherwise sent plain so the model
+  can see it.  Order: anchor, plain tools by name, deferred tools by name.  A
+  deferred tool cannot carry ``cache_control``.
+  """
+
+  anchor_names = {tool["name"] for tool in anchor}
+  others = sorted(
+    (
+      {
+        key: value
+        for key, value in tool.items()
+        if key not in {"cache_control", "defer_loading"}
+      }
+      for tool in tools
+      if tool["name"] not in anchor_names
+    ),
+    key=lambda tool: tool["name"],
+  )
+  plain = [tool for tool in others if tool["name"] not in referenced]
+  deferred = [tool for tool in others if tool["name"] in referenced]
+  if (
+    framing_tool is not None
+    and framing_tool.get("name")
+    and framing_tool["name"] not in anchor_names
+    and not any(t["name"] == framing_tool["name"] for t in others)
+  ):
+    clean_framing = {
+      key: value for key, value in framing_tool.items()
+      if key not in {"cache_control", "defer_loading"}
+    }
+    deferred.append(clean_framing)
+  return [
+    *anchor,
+    *_prepare_anthropic_tools(plain),
+    *(
+      {**tool, "defer_loading": True}
+      for tool in _prepare_anthropic_tools(deferred)
+    ),
+  ]
+
+
+def _render_tool_references(
+  messages: list[dict[str, Any]],
+  deferred_names: set[str],
+) -> list[dict[str, Any]]:
+  """Render each tool_result's exposed tools as ``tool_reference`` blocks.
+
+  A reference to a tool the request does not carry as deferred is a 400, so
+  only names in ``deferred_names`` are rendered.  The entry key is always
+  removed: the API rejects it.  The API also rejects a tool_result that mixes
+  ``tool_reference`` blocks with any other content ("Tool definitions/code
+  execution functions cannot be mixed with other content", observed live
+  2026-10-13), so a referencing tool_result carries the references alone and
+  its own result moves, unchanged and labelled by ``tool_use_id``, to the end
+  of the same user message.  The layout is a pure function of the stored
+  entry, so every later request re-sends the same bytes.
+  """
+
+  rendered: list[dict[str, Any]] = []
+  for message in messages:
+    content = message.get("content")
+    if message.get("role") != "user" or not isinstance(content, list):
+      rendered.append(message)
+      continue
+    next_content: list[Any] = []
+    moved_results: list[Any] = []
+    for block in content:
+      if not (
+        isinstance(block, dict)
+        and block.get("type") == "tool_result"
+        and _EXPOSED_TOOLS_KEY in block
+      ):
+        next_content.append(block)
+        continue
+      next_block = {
+        key: value for key, value in block.items() if key != _EXPOSED_TOOLS_KEY
+      }
+      references = [
+        {"type": "tool_reference", "tool_name": name}
+        for name in block[_EXPOSED_TOOLS_KEY]
+        if name in deferred_names
+      ]
+      if references:
+        result_content = next_block.get("content")
+        if isinstance(result_content, str):
+          parts = [{"type": "text", "text": result_content}] if result_content else []
+        else:
+          parts = list(result_content or [])
+        next_block["content"] = references
+        if parts:
+          moved_results.append({
+            "type": "text",
+            "text": f"Result of tool call {next_block.get('tool_use_id')}:",
+          })
+          moved_results.extend(parts)
+      next_content.append(next_block)
+    rendered.append({**message, "content": [*next_content, *moved_results]})
+  return rendered
+
+
 # `thinking.effort_control` names how a request carries effort; the request's
 # thinking parameter follows from it (see `_thinking_param`).
 _THINKING_MODE_BY_EFFORT_CONTROL: dict[str, Literal["adaptive", "budget", "none"]] = {
@@ -525,22 +660,29 @@ class AnthropicProvider(ModelProvider):
   ) -> dict[str, Any] | None:
     """The next unblocked sibling credential for the same bound model.
 
-    Subscription limits are per credential, not per model: a 5h/7d rejection
-    says this Claude account is spent, not that the run needs a different
-    model. So the pool parks the rejected credential until the reset the
-    limiter itself reported and hands back a sibling; the caller rebuilds its
-    client from the same `model_key`. With no sibling left the run keeps the
-    existing rate-limit retry.
+    Limits and denials park the rejected API key or OAuth seat until the reset
+    the provider reported. The sibling retains its own authentication mode;
+    the caller rebuilds its client from that material and the same `model_key`.
+    With no sibling left the run keeps the existing rate-limit retry.
     """
 
-    if str(config.get("auth_mode", "api")).strip().lower() != "oauth":
+    mode = str(config.get("auth_mode", "api")).strip().lower()
+    # A seat's `billing` denial is the organisation refusing the client and
+    # parks nothing; an API key's is its credits spent, which the seats
+    # behind it are there to absorb (Henry 2026-10-13).
+    rotatable = _ROTATABLE_CREDENTIAL_FAILURES | ({"billing"} if mode == "api" else frozenset())
+    if failure.kind not in rotatable:
       return None
-    if failure.kind not in _ROTATABLE_CREDENTIAL_FAILURES:
-      return None
-    current = str(config.get("auth_token") or "").strip()
+    current = str(config.get("auth_token" if mode == "oauth" else "api_key") or "").strip()
     if not current:
       return None
-    sources = resolve_anthropic_credentials(config)
+    # Rotation resolves the pool, not the exact frozen-generation bind: drop
+    # `credential_source` so this is the caller's whole pool (user store + org),
+    # and the sibling the resolver names is a genuinely eligible generation.
+    # This is also what lets a bound generation that was retired at its owner
+    # rotate: the pool path neither raises for the stale bind nor rewrites it.
+    pool_config = {key: value for key, value in config.items() if key != "credential_source"}
+    sources = resolve_anthropic_credentials(pool_config)
     if failure.reset_at is None:
       log.info(
         "Anthropic %s failure (status=%s) reported no reset window; parking this "
@@ -567,10 +709,16 @@ class AnthropicProvider(ModelProvider):
         len(sources.credentials),
       )
       return None
-    return {
-      "auth_token": selected.token,
+    is_api_key = selected.record is not None and selected.record.credential_kind == "api_key"
+    rotated: dict[str, Any] = {
+      "auth_mode": "api" if is_api_key else "oauth",
+      "api_key": selected.token if is_api_key else "",
+      "auth_token": "" if is_api_key else selected.token,
       "credential_source": selected.source_metadata(),
     }
+    if ANTHROPIC_DEPLOYMENT_API_KEY_FIELD in config:
+      rotated[ANTHROPIC_DEPLOYMENT_API_KEY_FIELD] = config[ANTHROPIC_DEPLOYMENT_API_KEY_FIELD]
+    return rotated
 
   def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
     try:
@@ -704,7 +852,40 @@ class AnthropicProvider(ModelProvider):
         else:
           system_blocks.append(block)
 
-    prepared_tools = _prepare_anthropic_tools(tools)
+    tool_anchor = kwargs.get("tool_anchor")
+    raw_framing = kwargs.get("framing_tool")
+    framing_tool = (
+      dict(raw_framing)
+      if isinstance(raw_framing, dict) and raw_framing.get("name")
+      else None
+    )
+    referenced = referenced_tool_names(messages)
+    if tool_anchor is None:
+      prepared_tools = _prepare_anthropic_tools(tools)
+      if (
+        framing_tool is not None
+        and not any(t.get("name") == framing_tool["name"] for t in prepared_tools)
+      ):
+        clean_framing = {
+          key: value for key, value in framing_tool.items()
+          if key not in {"cache_control", "defer_loading"}
+        }
+        prepared_tools.append({**clean_framing, "defer_loading": True})
+    else:
+      prepared_tools = _prefix_stable_tools(
+        tools,
+        tool_anchor,
+        referenced,
+        framing_tool=framing_tool,
+      )
+    messages = _render_tool_references(
+      messages,
+      {
+        tool["name"]
+        for tool in prepared_tools
+        if tool.get("defer_loading") is True
+      },
+    )
     preceding_breakpoint_count = (
       sum(
         1
@@ -883,6 +1064,11 @@ class AnthropicProvider(ModelProvider):
 
           if block_type in {"tool_use", "server_tool_use"}:
             next_block = dict(block)
+            if not is_same_model:
+              # Thought signatures belong to the model that produced them;
+              # Anthropic rejects a foreign one as an extra tool_use input.
+              next_block.pop("thought_signature", None)
+              next_block.pop("thoughtSignature", None)
             tool_id = str(block.get("id", ""))
             if tool_id:
               normalized_id = _normalize_tool_call_id(tool_id)

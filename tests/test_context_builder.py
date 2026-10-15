@@ -369,6 +369,26 @@ def test_context_builder_uses_latest_of_multiple_compactions(tmp_path: Path) -> 
   ]
 
 
+
+def test_context_builder_projects_checklist_after_summary(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "checklist-projection.jsonl")
+  _run(log.append({"type": "todo_snapshot", "revision": 2, "phases": [
+    {"name": "Research", "items": [{"id": "a1", "content": "Reconcile revenue", "status": "completed"}]},
+    {"name": "Synthesis", "items": [{"id": "a2", "content": "Assess thesis", "status": "pending"}]},
+  ], "gateway_session_id": "sess_x", "actor": "agent", "op": "done"}))
+  _run(log.append({"type": "summary", "summary_kind": "portable_compaction", "covers": {"to_seq": 1}}))
+  _run(log.append({"type": "user_message", "content": "Next"}))
+
+  messages = _run(SessionContextBuilder(agent_session_log=log).build())
+
+  user = [m for m in messages if m["role"] == "user"]
+  assert len(user) == 2
+  assert "Current checklist (revision 2)" in user[0]["content"]
+  assert "[x] Reconcile revenue" in user[0]["content"]
+  assert "Assess thesis" in user[0]["content"]
+  assert user[1]["content"] == "Next"
+
+
 def test_context_builder_resumes_from_anchor_only_compaction_row(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "anchor-only-compaction.jsonl")
   _run(log.append({"type": "user_message", "content": "Heavy turn"}))
@@ -745,6 +765,158 @@ def test_second_turn_context_exposes_completed_first_turn_recap_measurements(tmp
   assert 125_000 in measurements.values()
   assert messages.index(recap_messages[0]) < len(messages) - 1
   assert messages[-1] == {"role": "user", "content": "What happened last turn?"}
+
+
+def _recap_with_surfaces(*, turns: int, surfaces: int) -> dict:
+  from agent_gateway.events import event_to_dict
+  from agent_gateway.session_recap import compute_recap_from_events
+
+  recap = event_to_dict(compute_recap_from_events(
+    [
+      {"type": "tool_call_start", "tool_call_id": "call-1", "tool_name": "load_tools"},
+      {"type": "tool_call_complete", "tool_call_id": "call-1", "tool_name": "load_tools", "result": {}},
+      {"type": "error", "error": "provider overloaded"},
+    ],
+    session_id="recap-session",
+    started_at=1.0,
+    trigger="turn_end",
+  ))
+  recap["runner_id"] = "runner_abc"
+  recap["usage"] = {
+    "user_id": "1",
+    "session_id": "recap-session",
+    "request_id": "req-1",
+    "input_tokens": 18,
+    "output_tokens": 633,
+    "cache_read_tokens": 530_095,
+    "cache_creation_tokens": 217_373,
+    "cost": 1.25,
+    "turns": turns,
+    "model": "claude-opus-5-5",
+    "usage_event_ids": [f"event-{index}" for index in range(turns)],
+    "context_surfaces": [
+      {"surface": f"surface-{index}", "path": "/x" * 200, "tokens": index} for index in range(surfaces)
+    ],
+  }
+  return recap
+
+
+def _recap_texts(messages: list[dict]) -> list[str]:
+  return [
+    message["content"] for message in messages
+    if isinstance(message["content"], str) and message["content"].startswith("## Previous turn recap\n\n")
+  ]
+
+
+def test_recap_replays_byte_identically_and_without_context_surfaces(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "recap-stability.jsonl")
+  recap_one = _recap_with_surfaces(turns=7, surfaces=300)
+  recap_two = _recap_with_surfaces(turns=3, surfaces=300)
+  recap_two["usage"]["cost"] = 0.5
+  builder = SessionContextBuilder(agent_session_log=log)
+
+  _run(log.append({"type": "user_message", "content": "turn one"}))
+  _run(log.append({"type": "assistant_message", "content": "answer one"}))
+  _run(log.append(recap_one))
+  _run(log.append({"type": "stream_complete", "terminal_disposition": "completed"}))
+  _run(log.append({"type": "user_message", "content": "turn two"}))
+  turn_two = _recap_texts(_run(builder.build()))
+
+  _run(log.append({"type": "assistant_message", "content": "answer two"}))
+  _run(log.append(recap_two))
+  _run(log.append({"type": "stream_complete", "terminal_disposition": "completed"}))
+  _run(log.append({"type": "user_message", "content": "turn three"}))
+  turn_three = _recap_texts(_run(builder.build()))
+
+  assert len(turn_two) == 1
+  assert len(turn_three) == 2
+  assert turn_three[0] == turn_two[0]
+  assert turn_three[1] != turn_three[0]
+  for text in turn_three:
+    assert "context_surfaces" not in text
+    assert "surface-" not in text
+    assert "runner_abc" not in text
+    assert "usage_event_ids" not in text
+    assert len(text.encode()) < 2_000
+  rendered = json.loads(turn_three[0].split("\n\n", 1)[1])
+  assert rendered["trigger"] == "turn_end"
+  assert rendered["tool_calls_summary"]["by_tool_name"] == {"load_tools": 1}
+  assert rendered["failures"] == [{"failure_type": "terminal_error", "detail": "provider overloaded"}]
+  assert rendered["usage"]["cache_read_tokens"] == 530_095
+  assert rendered["usage"]["turns"] == 7
+
+
+def _tool_results(messages: list[dict], tool_use_id: str) -> list[dict]:
+  return [
+    block
+    for message in messages if isinstance(message["content"], list)
+    for block in message["content"]
+    if block.get("type") == "tool_result" and block.get("tool_use_id") == tool_use_id
+  ]
+
+
+@pytest.mark.parametrize("terminal_names_call", [True, False])
+@pytest.mark.parametrize("settlement", ["tool_call_complete", "tool_call_interrupted"])
+def test_parked_call_replays_awaiting_approval_until_its_real_result(
+  tmp_path: Path, terminal_names_call: bool, settlement: str,
+) -> None:
+  # The live park (GP19 F2): one root turn parks execute_trade, then an
+  # unrelated turn runs in the same session before the Continue delivers.
+  log = AgentSessionLog(path=tmp_path / "sessions" / "parked.jsonl")
+  call_id, approval_id = "toolu_parked", "3e22702e-d988-4947-bcd4-484499f96f39"
+  call = {"type": "tool_use", "id": call_id, "name": "execute_trade", "input": {"preview_id": "p-1"}}
+  _run(log.append({"type": "user_message", "content": "Execute preview p-1."}))
+  _run(log.append({"type": "assistant_message", "content_blocks": [call]}))
+  _run(log.append({
+    "type": "tool_call_start", "tool_call_id": call_id, "tool_name": "execute_trade",
+    "tool_input": {"preview_id": "p-1"},
+  }))
+  _run(log.append({
+    "type": "tool_approval_request", "tool_call_id": call_id, "approval_id": approval_id,
+    "nonce": "secret-nonce", "tool_name": "execute_trade", "tool_input": {"preview_id": "p-1"},
+  }))
+  terminal = {"type": "stream_complete", "terminal_disposition": "awaiting_approval"}
+  if terminal_names_call:
+    terminal |= {"approval_id": approval_id, "original_tool_call_id": call_id}
+  _run(log.append(terminal))
+  _run(log.append({"type": "detach", "reason": "awaiting_approval"}))
+  _run(log.append({"type": "user_message", "content": "Unrelated: what is 17 times 23?"}))
+  provider = AnthropicProvider()
+  model = provider.get_model_info("claude-opus-5")
+
+  unrelated = provider.normalize_messages(
+    _run(SessionContextBuilder(agent_session_log=log).build()), model,
+  )
+  parked = _tool_results(unrelated, call_id)
+  assert len(parked) == 1
+  assert not parked[0].get("is_error")
+  assert json.loads(parked[0]["content"]) == {"status": "awaiting_approval", "approval_id": approval_id}
+  assert "missing_tool_result" not in json.dumps(unrelated)
+  assert "secret-nonce" not in json.dumps(unrelated)
+  # A replay projection only: the durable call stays unsettled for Continue.
+  settled, _ = _run(log.query(event_types={"tool_call_complete", "tool_call_interrupted"}))
+  assert settled == []
+
+  _run(log.append({"type": "assistant_message", "content_blocks": [{"type": "text", "text": "391"}]}))
+  real = {"type": "tool_result", "tool_use_id": call_id, "content": "{\"status\": \"filled\"}"}
+  _run(log.append({
+    "type": settlement, "tool_call_id": call_id, "tool_name": "execute_trade",
+    "result": {"status": "filled"}, "error": None, "final_tool_result_blocks": [real],
+  }))
+
+  continued = provider.normalize_messages(
+    _run(SessionContextBuilder(agent_session_log=log).build()), model,
+  )
+  assert _tool_results(continued, call_id) == [real]
+  assert "awaiting_approval" not in json.dumps(continued)
+  calling = next(
+    index for index, message in enumerate(continued)
+    if message["role"] == "assistant" and call in message["content"]
+  )
+  # The settled-later result stays with its assistant, before later user text.
+  assert _tool_results([continued[calling + 1]], call_id) == [real]
+  assert continued[calling + 2]["role"] == "user"
+  assert "17 times 23" in json.dumps(continued[calling + 2]["content"])
 
 
 def _files(root: Path) -> dict[str, bytes]:

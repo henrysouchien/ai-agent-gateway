@@ -43,6 +43,17 @@ class AutonomousCapabilityBindingRequest:
   ticker: str | None = None
   research_file_id: int | None = None
   env_names: frozenset[str] = frozenset()
+  # The launch edge's user facts beside ``owner_user_id``/``raw_user_id``/
+  # ``user_email``; an admitting resolver hands them to ``admit`` as the
+  # child's identity.
+  role: str | None = None
+  user_slug: str | None = None
+  risk_user_id: int = 0
+  user_aliases: tuple[str, ...] = ()
+  identity_status: str | None = None
+  # A published preset name a fresh skill launch admits under (design §6.4);
+  # a resume's ``required_bind`` never reselects, so it never carries one.
+  model_preset: str | None = None
 
   def __post_init__(self) -> None:
     object.__setattr__(self, "task_id", _required_text(self.task_id, field_name="task_id"))
@@ -76,6 +87,12 @@ class AutonomousCapabilityBindingRequest:
         self,
         "channel",
         _required_text(self.channel, field_name="channel").lower(),
+      )
+    if self.model_preset is not None:
+      object.__setattr__(
+        self,
+        "model_preset",
+        _required_text(self.model_preset, field_name="model_preset"),
       )
     if self.source not in {"start", "resume", "schedule"}:
       raise ValueError(f"unsupported autonomous capability binding source: {self.source!r}")
@@ -144,7 +161,7 @@ class AutonomousLaunchAdmissionRefused(Exception):
       403
       if isinstance(refusal, Refusal) and refusal.reason in {
         "tenant_mismatch", "grant_exceeds_parent", "binding_not_granted",
-        "handle_not_granted", "invite_effect_not_allowed",
+        "binding_ambiguous", "handle_not_granted", "invite_effect_not_allowed",
       }
       else 422
     )

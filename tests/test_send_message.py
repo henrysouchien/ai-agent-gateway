@@ -505,6 +505,39 @@ def test_task_registry_rehydrates_acceptance_for_terminal_replay() -> None:
   assert conflict_error["code"] == "message_id_conflict"
 
 
+def test_replayed_parked_job_accepts_a_new_message() -> None:
+  correlation = {
+    "owner_runner_id": "runner-parent",
+    "owner_role": "writer",
+    "sub_agent_id": "sub3:sess-parent",
+    "parent_turn_id": "turn-3",
+    "call_index": 3,
+    "capability_bind": _bind_receipt(),
+  }
+  registry = _root_registry()
+  registry.load_from_events([{
+    "type": "task_registered",
+    "event_schema_version": 2,
+    "task_id": "bg_3",
+    "task_type": "background_agent",
+    "started_at": 1.0,
+    **correlation,
+    "metadata": {**correlation, "task_type": "background"},
+    "_durable_seq": 1,
+  }])
+  entry = registry.get("bg_3")
+  assert entry is not None
+  assert entry.state is TaskState.PARKED
+  handler = make_send_message_handler([_RegistryRunner(registry)], caller=_root_caller)
+
+  result, error = _run(handler({"to": "bg_3", "message": "Continue with the amendment"}))
+
+  assert error is None
+  assert result is not None
+  assert result["status"] == "queued"
+  assert entry.message_inbox.get_nowait().text == "Continue with the amendment"
+
+
 def test_task_registry_rejects_duplicate_durable_message_identity() -> None:
   correlation = {
     "owner_runner_id": "runner-parent",
@@ -847,10 +880,17 @@ def test_make_send_message_handler_does_not_update_delivered_messages_when_put_r
   assert "msg-failed" not in entry.delivered_messages
 
 
-def test_make_send_message_handler_delivers_message_by_agent_name() -> None:
+@pytest.mark.parametrize(
+  "state",
+  [TaskState.RUNNING, TaskState.IDLE, TaskState.PARKED],
+)
+def test_make_send_message_handler_delivers_message_by_agent_name(
+  state: TaskState,
+) -> None:
   registry = _root_registry()
   entry = registry.register("background_agent", agent_name="writer")
   registry.transition(entry.task_id, TaskState.RUNNING)
+  registry.transition(entry.task_id, state)
   handler = make_send_message_handler([_RegistryRunner(registry)], caller=_root_caller)
 
   result, error = _run(handler({"to": "writer", "message": "Focus on the risks"}))
@@ -872,6 +912,7 @@ def test_make_send_message_handler_returns_ambiguous_target_for_duplicate_names(
   second.started_at = 2.0
   registry.transition(first.task_id, TaskState.RUNNING)
   registry.transition(second.task_id, TaskState.RUNNING)
+  registry.park(second.task_id)
   handler = make_send_message_handler([_RegistryRunner(registry)], caller=_root_caller)
 
   result, error = _run(handler({"to": "writer", "message": "Status?"}))
@@ -879,7 +920,7 @@ def test_make_send_message_handler_returns_ambiguous_target_for_duplicate_names(
   assert result is None
   assert error == {
     "code": "ambiguous_target",
-    "message": "Multiple running agents named 'writer': bg_0, bg_1. Use task_id instead.",
+    "message": "Multiple live agents named 'writer': bg_0, bg_1. Use task_id instead.",
   }
 
 
@@ -1008,6 +1049,72 @@ def test_run_drains_message_inbox_and_injects_parent_messages_between_turns() ->
       ),
     }
     assert seen_messages[1][1]["role"] == "assistant"
+    assert inbox.empty()
+
+  _run(_case())
+
+
+def test_message_accepted_during_the_final_turn_is_delivered_before_finishing() -> None:
+  async def _case() -> None:
+    inbox: asyncio.Queue[ParentMessage] = asyncio.Queue()
+    runner = AgentRunner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(),
+      session_id="sess-send-message",
+      capability_execution=stub_runner_capability_execution(
+        provider=_StubProvider(),
+        auth_config={"api_key": "k"},
+        model="stub-model",
+        effort="none",
+      ),
+      get_tool_definitions=lambda: [],
+      message_inbox=inbox,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    seen_messages: list[list[dict[str, Any]]] = []
+
+    async def _fake_stream_turn(**kwargs: Any):
+      seen_messages.append(list(kwargs["current_messages"]))
+      if len(seen_messages) == 1:
+        # The parent's send is accepted while the model is producing what it
+        # meant to be its final answer.
+        await inbox.put(
+          ParentMessage(message_id="msg-late", text="Tell your sibling", sent_at=1.0)
+        )
+        return object(), StreamTurnResult(
+          full_text="first answer",
+          stop_reason="end_turn",
+          content_blocks=[{"type": "text", "text": "first answer"}],
+        )
+      return object(), StreamTurnResult(
+        full_text="answer after the message",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "answer after the message"}],
+      )
+
+    runner._stream_turn = _fake_stream_turn
+
+    await runner.run(
+      messages=[{"role": "user", "content": "Start"}],
+      system_prompt="You are helpful.",
+    )
+
+    assert len(seen_messages) == 2
+    # The model sees its own earlier answer, then the late message.
+    assert [message["role"] for message in seen_messages[1]] == [
+      "user",
+      "assistant",
+      "user",
+    ]
+    assert seen_messages[1][1]["content"] == [
+      {"type": "text", "text": "first answer"},
+    ]
+    assert seen_messages[1][-1] == {
+      "role": "user",
+      "content": "Operator update for this task:\n- id=msg-late: Tell your sibling",
+    }
     assert inbox.empty()
 
   _run(_case())
@@ -1164,6 +1271,98 @@ def test_send_message_persists_event_and_child_sees_parent_message_envelope(tmp_
       order="asc",
     )
     assert len(replayed_entries) == 1
+
+  _run(_case())
+
+
+def test_a_new_sibling_does_not_validate_another_childs_consumption(tmp_path: Path) -> None:
+  # Every child of one session writes under the same sub_agent_id namespace.
+  # A child started after its sibling consumed a message must replay only its
+  # own consumption facts, not refuse to start on the sibling's.
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "sibling-consumption.jsonl")
+    registry = _root_registry()
+    first = registry.register("background_agent", agent_name="writer")
+    later = registry.register("background_agent", agent_name="writer")
+    for entry in (first, later):
+      entry.metadata["sub_agent_id"] = "sub0:sess-send-message"
+      registry.transition(entry.task_id, TaskState.RUNNING)
+    parent_runner = AgentRunner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(),
+      session_id="sess-send-message",
+      capability_execution=stub_runner_capability_execution(
+        provider=_StubProvider(),
+        auth_config={"api_key": "k"},
+        model="stub-model",
+        effort="none",
+      ),
+      agent_session_log=log,
+      task_registry=registry,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    parent_runner._runner_id = "runner-parent"
+    handler = make_send_message_handler([parent_runner], caller=_root_caller)
+    _result, error = await handler(
+      {"to": first.task_id, "message": "Tell your sibling", "message_id": "msg-first"}
+    )
+    assert error is None
+
+    def _child(entry: Any, runner_id: str) -> AgentRunner:
+      runner = AgentRunner(
+        event_log=EventLog(),
+        dispatcher=_make_dispatcher(),
+        session_id="sess-child",
+        capability_execution=stub_runner_capability_execution(
+          provider=_StubProvider(),
+          auth_config={"api_key": "k"},
+          model="stub-model",
+          effort="none",
+        ),
+        agent_session_log=log,
+        get_tool_definitions=lambda: [],
+        task_registry=TaskRegistry(owner=RegistryOwner(
+          job_id=entry.task_id,
+          tenant=lambda: _TENANT,
+          inbox=entry.message_inbox,
+          parent=registry,
+        )),
+        message_inbox=entry.message_inbox,
+        user_id="alice",
+        billing_mode="byok",
+        rate_table_version="unknown",
+      )
+      runner._runner_id = runner_id
+      runner._role = "sub_agent"
+      runner._sub_agent_id = "sub0:sess-send-message"
+
+      async def _fake_stream_turn(**_kwargs: Any):
+        return object(), StreamTurnResult(
+          full_text="done",
+          stop_reason="end_turn",
+          content_blocks=[{"type": "text", "text": "done"}],
+        )
+
+      runner._stream_turn = _fake_stream_turn
+      return runner
+
+    await _child(first, "runner-first").run(messages=[{"role": "user", "content": "Start"}])
+    consumed_before, _ = await log.query(
+      event_types={"parent_message_consumed"}, order="asc",
+    )
+    assert [e.event["task_id"] for e in consumed_before] == [first.task_id]
+
+    later_runner = _child(later, "runner-later")
+    await later_runner.run(messages=[{"role": "user", "content": "Start"}])
+
+    consumed_after, _ = await log.query(
+      event_types={"parent_message_consumed"}, order="asc",
+    )
+    assert [e.seq for e in consumed_after] == [e.seq for e in consumed_before]
+    run_errors, _ = await log.query(event_types={"run_error"}, order="asc")
+    assert run_errors == []
 
   _run(_case())
 
@@ -1371,7 +1570,6 @@ def test_spawned_child_message_is_consumed_by_historical_root_writer(
     stub_capability_execution_resolver,
   )
 
-  monkeypatch.delenv("HANK_MAX_SPAWN_DEPTH", raising=False)
   owner_session_host_policy.get_local_tool_effect = {"send_message": "read"}.get
   skills_dir = tmp_path / "skills"
   skills_dir.mkdir()

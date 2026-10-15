@@ -400,6 +400,7 @@ def collect_sub_agent_result_evidence(
 
   stream_usage: dict[str, Any] | None = None
   turn_usages: list[Mapping[str, Any]] = []
+  turns = 0
   durable_usages: list[Mapping[str, Any]] = []
   warning_parts: list[str] = []
   for event in event_list:
@@ -409,6 +410,7 @@ def collect_sub_agent_result_evidence(
       if isinstance(usage, Mapping):
         stream_usage = dict(usage)
     elif event_type == "turn_complete":
+      turns += 1
       usage = event.get("usage")
       if isinstance(usage, Mapping):
         turn_usages.append(usage)
@@ -434,6 +436,8 @@ def collect_sub_agent_result_evidence(
       usage_payload = merge_usage_payloads(*turn_usages)
   except UsageEvidenceMergeError:
     return _evidence_gap(warning_parts)
+  if turns:
+    usage_payload.setdefault("turns", turns)
 
   fms_results = tuple(
     _ReadOnlyChainMap(

@@ -2,11 +2,14 @@ import asyncio
 from collections import deque
 from collections.abc import Awaitable, Callable
 import json
+import logging
 import os
+import re
 import signal
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from anyio import ClosedResourceError
@@ -681,6 +684,184 @@ def test_invalid_allowed_tools_leaves_optional_server_unadvertised() -> None:
   )
 
 
+def test_startup_timeout_measures_waiting_for_cancellation_settlement(monkeypatch) -> None:
+  manager = SimpleNamespace(_startup_timeout=0.01)
+  clock = SimpleNamespace(now=100.0)
+  # Replace this owner's clock, not time.monotonic used by asyncio's scheduler.
+  monkeypatch.setattr(
+    mcp_client_connections, "time", SimpleNamespace(monotonic=lambda: clock.now),
+  )
+
+  async def scenario():
+    cancelled = asyncio.Event()
+    acknowledge_cancellation = asyncio.Event()
+
+    async def unanswered_step():
+      try:
+        await asyncio.Event().wait()
+      except asyncio.CancelledError:
+        cancelled.set()
+        await acknowledge_cancellation.wait()
+        raise
+
+    startup = asyncio.create_task(mcp_client_connections._bounded_startup_step(
+      manager, "initialize", unanswered_step(), name="slow-cancellation",
+    ))
+    try:
+      await asyncio.wait_for(cancelled.wait(), timeout=1)
+      clock.now += manager._startup_timeout
+      await asyncio.sleep(0)
+      assert not startup.done()
+      clock.now += 0.125
+      acknowledge_cancellation.set()
+      with pytest.raises(TimeoutError) as raised:
+        await asyncio.wait_for(startup, timeout=1)
+      return str(raised.value)
+    finally:
+      acknowledge_cancellation.set()
+      startup.cancel()
+      await asyncio.gather(startup, return_exceptions=True)
+
+  message = asyncio.run(scenario())
+  assert "MCP server slow-cancellation startup initialize" in message
+  measured = re.search(r"after ([0-9.]+)s: no response", message)
+  assert measured is not None
+  assert float(measured.group(1)) == pytest.approx(0.135, abs=0.001)
+  assert float(measured.group(1)) > manager._startup_timeout
+
+
+@pytest.mark.parametrize("step", ["initialize", "list_tools"])
+def test_startup_preserves_native_timeout_cause(monkeypatch, step) -> None:
+  manager = SimpleNamespace(_startup_timeout=15)
+  clock = SimpleNamespace(now=100.0)
+  monkeypatch.setattr(
+    mcp_client_connections, "time", SimpleNamespace(monotonic=lambda: clock.now),
+  )
+
+  async def upstream_timeout():
+    clock.now += 0.375
+    raise TimeoutError("upstream socket timed out")
+
+  with pytest.raises(TimeoutError) as raised:
+    asyncio.run(mcp_client_connections._bounded_startup_step(
+      manager, step, upstream_timeout(), name="upstream-child",
+    ))
+  message = str(raised.value)
+  assert f"MCP server upstream-child startup {step}" in message
+  assert "after 0.375s: upstream socket timed out" in message
+  assert "no response" not in message
+  diagnostic = mcp_client_module._startup_failure_from_exception(raised.value)
+  assert diagnostic["category"] == "transient_timeout"
+  assert diagnostic["retryable"] is True
+
+
+@pytest.mark.parametrize(
+  ("step", "method"), [("initialize", "initialize"), ("list_tools", "tools/list")],
+)
+def test_hung_stdio_startup_publishes_healthy_sibling_and_reaps_children(
+  tmp_path, monkeypatch, caplog, step, method,
+) -> None:
+  monkeypatch.setattr(mcp_client_module, "_stdio_connect_retries", lambda: 0)
+  monkeypatch.setattr(mcp_client_module, "_stdio_connect_stabilize_delay", lambda: 0)
+  caplog.set_level(logging.INFO, logger="agent_gateway.mcp_client")
+  server_script = tmp_path / "startup_server.py"
+  server_script.write_text("""
+import json
+import os
+import sys
+from pathlib import Path
+
+name, unanswered_method = sys.argv[1:]
+Path(f"{name}.pid").write_text(str(os.getpid()))
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    with Path(f"{name}.requests").open("a") as stream:
+        stream.write(str(method) + "\\n")
+    if "id" not in request or method == unanswered_method:
+        continue
+    if method == "initialize":
+        result = {
+            "protocolVersion": request["params"]["protocolVersion"],
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": name, "version": "1.0"},
+        }
+    elif method == "tools/list":
+        result = {"tools": [{
+            "name": "healthy_echo",
+            "description": "Report the responding server",
+            "inputSchema": {"type": "object", "properties": {}},
+        }]}
+    elif method == "tools/call":
+        result = {"content": [], "structuredContent": {"server": name}}
+    else:
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+""")
+  hung_name = f"hung-{step}"
+  healthy_name = "healthy-sibling"
+
+  async def scenario():
+    manager = McpClientManager(
+      config_path=None,
+      startup_timeout=1,
+      inline_servers={
+        name: {
+          "command": sys.executable,
+          "args": [str(server_script), name, unanswered_method],
+          "cwd": str(tmp_path),
+        }
+        for name, unanswered_method in ((hung_name, method), (healthy_name, "none"))
+      },
+    )
+    try:
+      started = time.monotonic()
+      await asyncio.wait_for(manager.startup(), timeout=10)
+      elapsed = time.monotonic() - started
+      diagnostic = manager.get_startup_diagnostics()[hung_name]
+      assert diagnostic["server"] == hung_name
+      assert diagnostic["category"] == "transient_timeout"
+      assert diagnostic["retryable"] is True
+      assert manager.get_server_names() == {healthy_name}
+      assert {tool["name"] for tool in manager.get_tool_definitions()} == {"healthy_echo"}
+      assert manager.get_server_for_tool("healthy_echo") == healthy_name
+      assert await asyncio.wait_for(manager.call_tool("healthy_echo", {}), timeout=2) == (
+        {"server": healthy_name}, None,
+      )
+      assert method in (tmp_path / f"{hung_name}.requests").read_text().splitlines()
+      with pytest.raises(ProcessLookupError):
+        os.kill(int((tmp_path / f"{hung_name}.pid").read_text()), 0)
+      return diagnostic, elapsed
+    finally:
+      await asyncio.wait_for(manager.shutdown(), timeout=5)
+      assert manager.get_server_names() == set()
+      for name in (hung_name, healthy_name):
+        pid_file = tmp_path / f"{name}.pid"
+        if pid_file.exists():
+          with pytest.raises(ProcessLookupError):
+            os.kill(int(pid_file.read_text()), 0)
+
+  diagnostic, elapsed = asyncio.run(scenario())
+  message = diagnostic["message"]
+  assert f"MCP server {hung_name}" in message
+  step_duration = re.search(
+    rf"startup {step} failed after ([0-9.]+)s: no response", message,
+  )
+  total_duration = re.search(r"startup failed after ([0-9.]+)s:", message)
+  assert step_duration is not None
+  assert total_duration is not None
+  assert float(step_duration.group(1)) >= 0.999
+  assert float(total_duration.group(1)) >= float(step_duration.group(1))
+  assert float(total_duration.group(1)) == pytest.approx(elapsed, abs=0.05)
+  connected = next(
+    record.getMessage() for record in caplog.records
+    if record.getMessage().startswith(f"MCP server {healthy_name} connected after ")
+  )
+  success_duration = re.search(r"connected after ([0-9.]+)s", connected)
+  assert success_duration is not None
+  assert 0 < float(success_duration.group(1)) <= elapsed
+
+
 def test_failed_stdio_child_reports_bounded_stderr_tail(monkeypatch, caplog) -> None:
   monkeypatch.setattr(mcp_client_module, "_stdio_connect_retries", lambda: 0)
   script = (
@@ -692,13 +873,25 @@ def test_failed_stdio_child_reports_bounded_stderr_tail(monkeypatch, caplog) -> 
   async def scenario():
     manager = McpClientManager(config_path=None)
     try:
+      started = time.monotonic()
       assert await manager._connect_or_warn(
         "broken-child", {"command": sys.executable, "args": ["-c", script]},
       ) is None
+      elapsed = time.monotonic() - started
+      diagnostic = manager.get_startup_diagnostics()["broken-child"]
+      return diagnostic, elapsed
     finally:
       await manager.shutdown()
 
-  asyncio.run(scenario())
+  diagnostic, elapsed = asyncio.run(scenario())
+  message = diagnostic["message"]
+  assert "MCP server broken-child" in message
+  assert "Connection closed" in message
+  assert "exit code unavailable" not in message.lower()
+  measured = re.search(r"startup failed after ([0-9.]+)s:", message)
+  assert measured is not None
+  assert 0 < float(measured.group(1))
+  assert float(measured.group(1)) == pytest.approx(elapsed, abs=0.02)
   diagnostics = [
     record.getMessage() for record in caplog.records
     if "broken-child" in record.getMessage() and "stderr" in record.getMessage()

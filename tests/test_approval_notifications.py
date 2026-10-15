@@ -365,7 +365,6 @@ def test_lifecycle_persistence_failure_emits_no_notification_intent() -> None:
         resolve_tool_class_fn=lambda _tool_name: "irreversible",
         effective_trade_approval_decision_fn=lambda _tool_name, _tool_args, decision: decision,
         await_user_approval_via_pending_tools_fn=lambda *_args, **_kwargs: None,
-        approval_queue_timeout_seconds_fn=lambda _seconds: 0.01,
       )
 
     assert store.notifications == []

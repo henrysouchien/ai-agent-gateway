@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from typing import Any, Callable
 
 from fastapi import Request
@@ -21,7 +20,6 @@ async def tool_result_response(
   *,
   auth: AuthManager,
   log: Any,
-  time_time: Callable[[], float] | None = None,
 ) -> JSONResponse:
   token = AuthManager.get_bearer_token(request.headers.get("Authorization"))
   session = auth.verify_token(token)
@@ -45,13 +43,6 @@ async def tool_result_response(
   # another call's nonce was not produced for this one.
   if pending.get("nonce") != payload.nonce:
     return JSONResponse({"error": "Nonce mismatch"}, status_code=409)
-
-  # The pending call was already released at its deadline, so a late result has
-  # no waiting turn to deliver to.
-  current_time = time.time if time_time is None else time_time
-  if int(current_time()) > int(pending.get("expires_at", 0)):
-    session.pending_tools.pop(payload.tool_call_id, None)
-    return JSONResponse({"error": "Tool call expired"}, status_code=410)
 
   pending["status"] = "received"
   if session.result_queue is None:

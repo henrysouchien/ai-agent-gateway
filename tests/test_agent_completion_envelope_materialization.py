@@ -371,12 +371,13 @@ async def test_background_completion_derives_policy_from_projection_result(
 ) -> None:
   class _Harness(RunnerBackgroundLifecycleMixin):
     def __init__(self) -> None:
-      self._agent_session_log = AgentSessionLog(tmp_path / "session.jsonl")
+      self._journal = AgentSessionLog(tmp_path / "session.jsonl")
+      self._agent_session_log = self._journal
       self._workspace_dir = str(tmp_path)
       self._runner_id = "parent-runner"
 
     async def _append_durable_event(self, event: dict[str, object]) -> object:
-      return await self._agent_session_log.append(event)
+      return await self._journal.append(event)
 
   result, value = _projection_only_result()
   entry = TaskEntry(
@@ -402,12 +403,13 @@ async def test_background_completion_publishes_projection_without_workspace(
 ) -> None:
   class _Harness(RunnerBackgroundLifecycleMixin):
     def __init__(self) -> None:
-      self._agent_session_log = AgentSessionLog(tmp_path / "session.jsonl")
+      self._journal = AgentSessionLog(tmp_path / "session.jsonl")
+      self._agent_session_log = self._journal
       self._workspace_dir = None
       self._runner_id = "parent-runner"
 
     async def _append_durable_event(self, event: dict[str, object]) -> object:
-      return await self._agent_session_log.append(event)
+      return await self._journal.append(event)
 
   result, value = _projection_only_result()
   entry = TaskEntry(
@@ -432,12 +434,13 @@ async def test_background_terminal_settlement_without_content_survives_replay(
 ) -> None:
   class _Harness(RunnerBackgroundLifecycleMixin):
     def __init__(self) -> None:
-      self._agent_session_log = AgentSessionLog(tmp_path / "session.jsonl")
+      self._journal = AgentSessionLog(tmp_path / "session.jsonl")
+      self._agent_session_log = self._journal
       self._workspace_dir = None
       self._runner_id = "parent-runner"
 
     async def _append_durable_event(self, event: dict[str, object]) -> object:
-      return await self._agent_session_log.append(event)
+      return await self._journal.append(event)
 
   payload = _task_result("unpublished").model_dump(mode="json")
   payload["execution"] = {
@@ -470,7 +473,7 @@ async def test_background_terminal_settlement_without_content_survives_replay(
   entry.completion_envelope = None
   await _Harness()._ensure_agent_completion_published(entry)
   assert entry.completion_envelope == envelope
-  events, _ = await runner._agent_session_log.query(event_types={"agent_completion"})
+  events, _ = await runner._journal.query(event_types={"agent_completion"})
   assert len(events) == 1
 
 
@@ -480,12 +483,13 @@ async def test_pre_reason_failed_completion_replays_published_bytes(
 ) -> None:
   class _Harness(RunnerBackgroundLifecycleMixin):
     def __init__(self) -> None:
-      self._agent_session_log = AgentSessionLog(tmp_path / "session.jsonl")
+      self._journal = AgentSessionLog(tmp_path / "session.jsonl")
+      self._agent_session_log = self._journal
       self._workspace_dir = str(tmp_path)
       self._runner_id = "parent-runner"
 
     async def _append_durable_event(self, event: dict[str, object]) -> object:
-      return await self._agent_session_log.append(event)
+      return await self._journal.append(event)
 
   text = "STATUS: BLOCKED"
   payload = _task_result(text).model_dump(mode="json")
@@ -517,7 +521,7 @@ async def test_pre_reason_failed_completion_replays_published_bytes(
     ts=1.0,
   ))
   runner = _Harness()
-  published = await runner._agent_session_log.append(event)
+  published = await runner._journal.append(event)
   entry = TaskEntry(
     task_id=result.attempt.physical_task_id,
     task_type="background_agent",
@@ -531,7 +535,7 @@ async def test_pre_reason_failed_completion_replays_published_bytes(
   assert canonical_json_bytes(entry.completion_envelope.model_dump(mode="json")) == (
     canonical_json_bytes(envelope_payload)
   )
-  stored, _ = await runner._agent_session_log.query(event_types={"agent_completion"})
+  stored, _ = await runner._journal.query(event_types={"agent_completion"})
   assert [row.event for row in stored] == [published.event]
   runner._workspace_dir = None
   entry.completion_envelope = None

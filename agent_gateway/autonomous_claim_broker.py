@@ -29,7 +29,7 @@ from .claim_signing_authority import GatewayClaimSigningAuthority
 AUTONOMOUS_CLAIM_BROKER_FD_ENV = (
   "AGENT_AUTONOMOUS_CLAIM_BROKER_FD"
 )
-AUTONOMOUS_CLAIM_BROKER_PROTOCOL_VERSION = 2
+AUTONOMOUS_CLAIM_BROKER_PROTOCOL_VERSION = 3
 AUTONOMOUS_CLAIM_BROKER_MAX_FRAME_BYTES = 6 * 1024 * 1024
 AUTONOMOUS_CLAIM_BROKER_MAX_REQUESTS = 256
 AUTONOMOUS_CLAIM_BROKER_MAX_TTL_SECONDS = 600
@@ -566,8 +566,15 @@ class AutonomousClaimBroker:
           or _REQUEST_ID_RE.fullmatch(request_id) is None
           or isinstance(ttl_seconds, bool)
           or not isinstance(ttl_seconds, int)
-          or not 1 <= ttl_seconds <= self._max_ttl_seconds
         ):
+          raise AutonomousClaimBrokerError(
+            "autonomous claim broker sign request is invalid"
+          )
+        ttl_seconds = self._authority.resolve_user_claim_ttl_seconds(
+          user_id=self._binding.user_id,
+          ttl_seconds=ttl_seconds,
+        )
+        if not 1 <= ttl_seconds <= self._max_ttl_seconds:
           raise AutonomousClaimBrokerError(
             "autonomous claim broker sign request is invalid"
           )
@@ -587,7 +594,7 @@ class AutonomousClaimBroker:
           raise AutonomousClaimBrokerError(
             "autonomous claim broker session authority has expired"
           )
-        claim = self._authority.sign_user_claim(
+        claim = self._authority._sign_resolved_user_claim(
           user_id=self._binding.user_id,
           user_email=self._binding.user_email,
           ttl_seconds=ttl_seconds,
@@ -599,6 +606,7 @@ class AutonomousClaimBroker:
             "ok": True,
             "op": "sign",
             "request_id": request_id,
+            "ttl_seconds": ttl_seconds,
             "version": AUTONOMOUS_CLAIM_BROKER_PROTOCOL_VERSION,
           },
           deadline=_io_deadline(self._io_timeout_seconds),
@@ -837,6 +845,7 @@ class AutonomousClaimSigner:
           "ok",
           "op",
           "request_id",
+          "ttl_seconds",
           "version",
         }),
         message="autonomous claim broker sign response is invalid",
@@ -851,6 +860,10 @@ class AutonomousClaimSigner:
       or response["version"]
       != AUTONOMOUS_CLAIM_BROKER_PROTOCOL_VERSION
       or type(response["claim"]) is not dict
+      or type(response["ttl_seconds"]) is not int
+      or not 1
+      <= response["ttl_seconds"]
+      <= AUTONOMOUS_CLAIM_BROKER_MAX_TTL_SECONDS
     ):
       self.close()
       raise AutonomousClaimBrokerError(
@@ -879,7 +892,7 @@ class AutonomousClaimSigner:
       or claim["AGENT_API_CLAIM_USER_ID"] != self._user_id
       or claim["AGENT_API_CLAIM_USER_EMAIL"]
       != (self._user_email or "")
-      or expiry - issued_at != ttl_seconds
+      or expiry - issued_at != response["ttl_seconds"]
       or issued_at > int(time.time()) + 5
       or expiry <= int(time.time())
       or type(claim["AGENT_API_CLAIM_NONCE"]) is not str

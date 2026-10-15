@@ -15,8 +15,10 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 import agent_gateway.providers.anthropic as anthropic_provider_module
+import agent_gateway.providers.anthropic_oauth as anthropic_oauth_module
 from agent_gateway.providers import StreamEvent
 from agent_gateway.providers.anthropic import AnthropicProvider
+from agent_gateway import resolve_auth_config
 from agent_gateway.providers.anthropic_oauth import AnthropicCredentialPool, resolve_anthropic_credentials
 from agent_gateway.send_prompt import _rotated_execution, send_prompt
 from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
@@ -95,6 +97,11 @@ class _PoolProvider(AnthropicProvider):
 def pool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AnthropicCredentialPool:
   process_pool = AnthropicCredentialPool()
   monkeypatch.setattr(anthropic_provider_module, "ANTHROPIC_CREDENTIAL_POOL", process_pool)
+  monkeypatch.setattr(anthropic_oauth_module, "ANTHROPIC_CREDENTIAL_POOL", process_pool)
+  # The root tests/conftest.py forces api mode with a fake API key process-wide;
+  # these oauth-pool tests declare their own mode.
+  monkeypatch.setenv("ANTHROPIC_AUTH_MODE", "oauth")
+  monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", _REFUSED)
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([_REFUSED, _SERVING]))
   monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
@@ -110,7 +117,7 @@ def _run(provider: _PoolProvider) -> str:
     effort="none",
     auth_config={"auth_mode": "oauth", "auth_token": _REFUSED, "max_tokens": 1024},
   )
-  return asyncio.run(send_prompt("hello", capability_execution=execution, user_id="alice"))
+  return asyncio.run(send_prompt("hello", capability_execution=execution, user_id="alice", completion_record_root=None))
 
 
 @pytest.mark.parametrize(
@@ -187,3 +194,68 @@ def test_send_prompt_rotation_names_the_sibling_generation(
     assert rotated is None
     assert execution.bind.credential_ref == member_a.source_metadata()["generation_ref"]
     assert execution.auth_config["auth_token"] == _REFUSED
+
+
+def test_send_prompt_parking_persists_across_second_bind(
+  pool: AnthropicCredentialPool,
+) -> None:
+  # 1. First bind selects the default ANTHROPIC_AUTH_TOKEN (_REFUSED)
+  first_config = resolve_auth_config(max_tokens=1024)
+  assert first_config["auth_token"] == _REFUSED
+
+  # First run encounters 429 on _REFUSED and rotates to _SERVING, answering successfully
+  provider1 = _PoolProvider({_REFUSED: _status_error(429, _RATE_LIMIT_BODY), _SERVING: "answered-1"})
+  first_execution = stub_bound_capability_execution(
+    provider=provider1,
+    model="claude-sonnet-5",
+    effort="none",
+    auth_config=first_config,
+  )
+  assert asyncio.run(send_prompt("hello", capability_execution=first_execution, user_id="alice", completion_record_root=None)) == "answered-1"
+  assert provider1.tokens_used == [_REFUSED, _SERVING]
+
+  # 2. Second bind: parking persists in the pool; resolve_auth_config binds _SERVING directly
+  second_config = resolve_auth_config(max_tokens=1024)
+  assert second_config["auth_token"] == _SERVING
+
+  provider2 = _PoolProvider({_SERVING: "answered-2"})
+  second_execution = stub_bound_capability_execution(
+    provider=provider2,
+    model="claude-sonnet-5",
+    effort="none",
+    auth_config=second_config,
+  )
+  assert asyncio.run(send_prompt("hello again", capability_execution=second_execution, user_id="alice", completion_record_root=None)) == "answered-2"
+  # _REFUSED was never touched on the second run
+  assert provider2.tokens_used == [_SERVING]
+
+
+def test_send_prompt_pool_of_one_selects_and_does_not_rotate_infinitely(
+  pool: AnthropicCredentialPool,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  anthropic = pytest.importorskip("anthropic")
+  # Single token configured: pool of one
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token-solo")
+  monkeypatch.delenv("ANTHROPIC_AUTH_TOKENS", raising=False)
+
+  # 1. Initial resolution selects it
+  initial_config = resolve_auth_config(max_tokens=1024)
+  assert initial_config["auth_token"] == "token-solo"
+
+  # 2. 429 raises provider rejection; no sibling exists, so no infinite rotation
+  provider = _PoolProvider({"token-solo": _status_error(429, _RATE_LIMIT_BODY)})
+  execution = stub_bound_capability_execution(
+    provider=provider,
+    model="claude-sonnet-5",
+    effort="none",
+    auth_config=initial_config,
+  )
+  with pytest.raises(anthropic.RateLimitError):
+    asyncio.run(send_prompt("hello", capability_execution=execution, user_id="alice", completion_record_root=None))
+
+  assert provider.tokens_used == ["token-solo"]
+
+  # 3. Subsequent bind on pool of one still binds it (select fallback)
+  parked_config = resolve_auth_config(max_tokens=1024)
+  assert parked_config["auth_token"] == "token-solo"

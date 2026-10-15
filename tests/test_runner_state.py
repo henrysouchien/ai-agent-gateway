@@ -35,6 +35,7 @@ from agent_gateway.runner_state import (
   usage_cache_status,
   user_turn_message,
 )
+from agent_gateway.tool_dispatcher_approval_lifecycle import ApprovalPark
 
 
 def test_tool_execution_order_preserves_model_authored_order() -> None:
@@ -1101,6 +1102,132 @@ def test_execute_tool_use_loop_processes_batches_and_single_tools_in_order() -> 
   ]
   assert len(excluded_tool_checks) >= 4
   assert exception_events == []
+
+
+@pytest.mark.parametrize(
+  "mode,sibling_failure",
+  [("serial", None), ("parallel", None), ("parallel", "error"), ("parallel", "cancel")],
+)
+def test_approval_park_preserves_completed_siblings_without_synthetic_errors(
+  mode: str,
+  sibling_failure: str | None,
+) -> None:
+  async def case() -> None:
+    approval_park = ApprovalPark(
+      job_id="job-park",
+      original_tool_call_id="call-park",
+      approval_id="approval-park",
+      nonce="private-park-nonce",
+    )
+    parked = asyncio.Event()
+    executed: list[str] = []
+    completed: list[str] = []
+    errors: list[tuple[str, str]] = []
+    exceptions: list[BaseException] = []
+    failure: BaseException | None = (
+      RuntimeError("real sibling failure")
+      if sibling_failure == "error"
+      else asyncio.CancelledError()
+      if sibling_failure == "cancel"
+      else None
+    )
+    tool_name = "run_agent" if mode == "parallel" else "lookup"
+    completed_ids = ["call-before"]
+    if mode == "parallel" and failure is None:
+      completed_ids.append("call-after")
+    visible_extras = {
+      call_id: {"type": "text", "text": f"evidence:{call_id}"}
+      for call_id in completed_ids
+    }
+
+    async def execute_single_tool(
+      tool_id: str,
+      name: str,
+      _tool_input: dict[str, object],
+      _base_kwargs: dict[str, object],
+      **_kwargs: object,
+    ):
+      executed.append(tool_id)
+      if tool_id == "call-park":
+        parked.set()
+        raise approval_park
+      if tool_id == "call-after":
+        await parked.wait()
+        await asyncio.sleep(0)
+        if failure is not None:
+          raise failure
+      completed.append(tool_id)
+      return (
+        {"type": "tool_result", "tool_use_id": tool_id, "content": tool_id},
+        name,
+        [
+          visible_extras[tool_id],
+          {"type": "source_envelope", "_event_only": True},
+        ],
+      )
+
+    def make_error_result(tool_id: str, code: str, _message: str):
+      errors.append((tool_id, code))
+      return {"type": "tool_result", "tool_use_id": tool_id, "is_error": True}
+
+    calls = [
+      ("call-before", tool_name, {}),
+      ("call-park", tool_name, {}),
+    ]
+    if mode == "parallel":
+      calls.append(("call-after", tool_name, {}))
+    calls.append(("call-unscheduled", "lookup", {}))
+    result = await execute_tool_use_loop(
+      calls,
+      base_kwargs={},
+      sub_agent_semaphore=asyncio.Semaphore(2),
+      effective_excluded_tools=lambda: set(),
+      execute_single_tool=execute_single_tool,
+      gather_fn=asyncio.gather,
+      batch_error=sub_agent_batch_error,
+      make_error_result=make_error_result,
+      model_visible_extra_blocks=model_visible_extra_blocks,
+      on_exception=exceptions.append,
+      should_stop_after_tool_result=parked.is_set,
+    )
+
+    assert result.approval_park is approval_park
+    assert completed == completed_ids
+    assert executed == (
+      ["call-before", "call-park", "call-after"]
+      if mode == "parallel"
+      else ["call-before", "call-park"]
+    )
+    genuine_error_blocks = (
+      [{"type": "tool_result", "tool_use_id": "call-after", "is_error": True}]
+      if failure is not None
+      else []
+    )
+    assert result.tool_results_content == [
+      *[
+        {"type": "tool_result", "tool_use_id": call_id, "content": call_id}
+        for call_id in completed_ids
+      ],
+      *genuine_error_blocks,
+      *[visible_extras[call_id] for call_id in completed_ids],
+    ]
+    assert result.tools_used == [tool_name] * (
+      len(completed_ids) + len(genuine_error_blocks)
+    )
+    assert errors == (
+      [("call-after", "cancelled" if sibling_failure == "cancel" else "sub_agent_error")]
+      if failure is not None
+      else []
+    )
+    if sibling_failure == "cancel":
+      assert [type(exception) for exception in exceptions] == [asyncio.CancelledError]
+    elif failure is not None:
+      assert len(exceptions) == 1
+      assert exceptions[0] is failure
+    else:
+      assert exceptions == []
+
+  asyncio.run(case())
 
 
 def test_execute_tool_use_loop_treats_excluded_run_agent_as_single_tool() -> None:

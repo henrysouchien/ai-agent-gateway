@@ -103,8 +103,15 @@ def build_parser() -> argparse.ArgumentParser:
     "risk_user_id whose credential pool this account belongs to; omit for the "
     "deployment's org pool."
   )
+  from .login_flows import registered_login_flows
+  _flow_choices = sorted(registered_login_flows().keys())
   auth_login = auth_sub.add_parser("login", help="Sign in to a provider.")
-  auth_login.add_argument("provider", choices=["anthropic", "codex", "openai", "xai"])
+  auth_login.add_argument("provider", choices=_flow_choices)
+  auth_login.add_argument(
+    "--api-key",
+    action="store_true",
+    help="Log in with a direct API key instead of subscription OAuth/device code.",
+  )
   auth_login.add_argument("--no-browser", action="store_true", help="Do not open the verification URL.")
   auth_login.add_argument("--store", default=None, help="Override the OAuth token-store path.")
   auth_login.add_argument("--user", default=None, help=_USER_SCOPE_HELP)
@@ -124,23 +131,47 @@ def build_parser() -> argparse.ArgumentParser:
   auth_enroll.add_argument("--store", default=None, help="Override the OAuth token-store path.")
   auth_enroll.add_argument("--user", default=None, help=_USER_SCOPE_HELP)
   auth_status = auth_sub.add_parser("status", help="Show provider authentication status.")
-  auth_status.add_argument("provider", choices=["anthropic", "codex", "openai", "xai"])
+  auth_status.add_argument("provider", choices=_flow_choices)
+  auth_status.add_argument(
+    "--api-key",
+    action="store_true",
+    help="Inspect the API-key store instead of subscription OAuth/device code.",
+  )
   auth_status.add_argument("--store", default=None, help="Override the OAuth token-store path.")
   auth_status.add_argument("--user", default=None, help=_USER_SCOPE_HELP)
   auth_logout = auth_sub.add_parser("logout", help="Remove persisted provider authentication.")
-  auth_logout.add_argument("provider", choices=["anthropic", "xai"])
+  auth_logout.add_argument("provider", choices=_flow_choices)
+  auth_logout.add_argument(
+    "--account",
+    default=None,
+    help="Account identity to remove (default: remove all accounts in target store).",
+  )
+  auth_logout.add_argument(
+    "--api-key",
+    action="store_true",
+    help="Remove from the API-key store instead of subscription OAuth/device code.",
+  )
   auth_logout.add_argument("--store", default=None, help="Override the OAuth token-store path.")
   auth_logout.add_argument("--user", default=None, help=_USER_SCOPE_HELP)
   auth_list = auth_sub.add_parser("list", help="List enrolled provider accounts.")
-  auth_list.add_argument("provider", choices=["anthropic"])
+  auth_list.add_argument("provider", choices=_flow_choices)
+  auth_list.add_argument(
+    "--api-key",
+    action="store_true",
+    help="List accounts in the API-key store instead of subscription OAuth/device code.",
+  )
   auth_list.add_argument("--store", default=None, help="Override the OAuth token-store path.")
   auth_list.add_argument("--user", default=None, help=_USER_SCOPE_HELP)
   auth_remove = auth_sub.add_parser("remove", help="Remove one enrolled provider account.")
-  auth_remove.add_argument("provider", choices=["anthropic"])
+  auth_remove.add_argument("provider", choices=_flow_choices)
   auth_remove.add_argument("identity", help="Account identity reported by `auth list`.")
+  auth_remove.add_argument(
+    "--api-key",
+    action="store_true",
+    help="Remove from the API-key store instead of subscription OAuth/device code.",
+  )
   auth_remove.add_argument("--store", default=None, help="Override the OAuth token-store path.")
   auth_remove.add_argument("--user", default=None, help=_USER_SCOPE_HELP)
-
   list_parser = subparsers.add_parser("list", help="Show the resolved project config.")
   list_parser.add_argument(
     "--config",
@@ -350,40 +381,14 @@ def _anthropic_store_path(args: argparse.Namespace) -> Path:
 
 
 def _auth_login(args: argparse.Namespace, *, stdout: TextIO) -> int:
-  if args.provider == "anthropic":
-    return _auth_login_anthropic(args, stdout=stdout)
-  if args.provider == "codex":
-    return _auth_login_codex(args, stdout=stdout)
-  if args.provider == "openai":
-    raise AgentProjectError(
-      "The OpenAI API does not provide ChatGPT subscription OAuth login. "
-      "Use OPENAI_API_KEY for provider=openai, or run "
-      "`python3 -m agent_gateway.cli auth login codex` "
-      "for ChatGPT subscription authentication. No credentials were changed."
-    )
-
-  from .providers.xai_oauth import XAIDeviceCode, login_xai_device_code
-
-  async def on_verification(device: XAIDeviceCode) -> None:
-    url = device.verification_uri_complete or device.verification_uri
-    stdout.write("\nxAI OAuth device authorization\n")
-    stdout.write(f"Open: {url}\n")
-    stdout.write(f"Code: {device.user_code}\n")
-    stdout.write(f"Expires in approximately {max(1, round(device.expires_in / 60))} minutes.\n")
-    stdout.write("Waiting for authorization...\n")
-    stdout.flush()
-    if not args.no_browser:
-      webbrowser.open(url)
-
+  from .login_flows import get_login_flow
   try:
-    _record, path = asyncio.run(
-      login_xai_device_code(config=_xai_auth_config(args), on_verification=on_verification)
-    )
-  except (RuntimeError, ValueError, httpx.HTTPError) as exc:
+    flow = get_login_flow(args.provider)
+    return flow.login(args, stdout=stdout)
+  except AgentProjectError:
+    raise
+  except Exception as exc:
     raise AgentProjectError(str(exc)) from exc
-  stdout.write(f"xAI OAuth login complete. Token store: {path}\n")
-  return 0
-
 
 def _auth_login_anthropic(args: argparse.Namespace, *, stdout: TextIO) -> int:
   """Enroll one Claude account in this gateway's own credential pool.
@@ -489,65 +494,14 @@ def _auth_login_codex(args: argparse.Namespace, *, stdout: TextIO) -> int:
 
 
 def _auth_status(args: argparse.Namespace, *, stdout: TextIO) -> int:
-  if args.provider == "anthropic":
-    return _auth_status_anthropic(args, stdout=stdout)
-  if args.provider == "codex":
-    try:
-      status = subprocess.run(
-        ["codex", "login", "status"],
-        check=False,
-        capture_output=True,
-        text=True,
-      )
-    except OSError as exc:
-      raise AgentProjectError("Unable to launch `codex`; install Codex first") from exc
-    detail = str(status.stdout or status.stderr or "").strip()
-    stdout.write(f"Codex: {detail or 'not logged in'}\n")
-    return 0 if status.returncode == 0 else 1
-  if args.provider == "openai":
-    api_key_present = bool(os.environ.get("OPENAI_API_KEY", "").strip())
-    access_token_present = bool(os.environ.get("OPENAI_AUTH_TOKEN", "").strip())
-    if api_key_present or access_token_present:
-      kind = "API key" if api_key_present else "bearer access token"
-      stdout.write(f"OpenAI API: {kind} configured in the environment; no gateway OAuth store.\n")
-      return 0
-    stdout.write(
-      "OpenAI API: no credential configured. Set OPENAI_API_KEY; for ChatGPT subscription "
-      "auth use provider=codex and `python3 -m agent_gateway.cli auth login codex`.\n"
-    )
-    return 1
-
-  from .providers.xai_oauth import (
-    load_xai_token_record,
-    resolve_xai_oauth_settings,
-    token_needs_refresh,
-    token_store_is_private,
-    xai_record_requires_reauth,
-  )
-
-  settings = resolve_xai_oauth_settings(_xai_auth_config(args))
-  record = load_xai_token_record(settings.store_path)
-  if not record:
-    stdout.write(f"xAI OAuth: not logged in ({settings.store_path})\n")
-    return 1
-  if xai_record_requires_reauth(record):
-    if record.get("reauth_required"):
-      stdout.write("xAI OAuth: logged out — re-authentication required\n")
-    else:
-      stdout.write(
-        "xAI OAuth: previous refresh did not complete — re-authentication required\n"
-      )
-    return 1
-  # This check is local-only: it reads the stored record and its expiry, and never contacts xAI.
-  # A refresh token the server has REVOKED still looks fine here, so do not report it as "active"
-  # — that is a claim this code cannot support, and it has misled an operator into trusting a dead
-  # credential. Say exactly what was checked.
-  state = "refresh required" if token_needs_refresh(record) else "stored; not server-validated"
-  permissions = "0600" if token_store_is_private(settings.store_path) else "insecure permissions"
-  stdout.write(f"xAI OAuth: {state}; store={settings.store_path}; permissions={permissions}\n")
-  return 0
-
-
+  from .login_flows import get_login_flow
+  try:
+    flow = get_login_flow(args.provider)
+    return flow.status(args, stdout=stdout)
+  except AgentProjectError:
+    raise
+  except Exception as exc:
+    raise AgentProjectError(str(exc)) from exc
 def _auth_status_anthropic(args: argparse.Namespace, *, stdout: TextIO) -> int:
   from .providers.anthropic_oauth import (
     anthropic_token_store_is_private,
@@ -569,81 +523,142 @@ def _auth_status_anthropic(args: argparse.Namespace, *, stdout: TextIO) -> int:
   return 0
 
 
-def _auth_list(args: argparse.Namespace, *, stdout: TextIO) -> int:
-  from .providers.anthropic_oauth import (
-    load_anthropic_oauth_store,
-    mask_anthropic_token,
+def _resolve_pool_store_target(
+  args: argparse.Namespace,
+) -> tuple[Path, str, tuple[str, ...]]:
+  from .providers.api_key_store import resolve_api_key_store_path
+  from .providers.copilot_oauth import resolve_copilot_oauth_settings
+  from .providers.credential_pool import USER_SCOPE_FIELD, resolve_provider_store_path
+  from .providers.google_antigravity_oauth import resolve_antigravity_store_path
+  from .providers.google_oauth import resolve_google_oauth_settings
+  from .providers.kimi_code_oauth import resolve_kimi_code_store_path
+  from .providers.muse_oauth import resolve_muse_store_path
+  from .providers.xai_oauth import resolve_xai_oauth_settings
+
+  provider = str(getattr(args, "provider", "") or "").strip().lower()
+  store = str(getattr(args, "store", None) or "").strip()
+  api_key_mode = bool(getattr(args, "api_key", False))
+  user_scope = getattr(args, "user", None)
+
+  if provider == "kimi-code":
+    if api_key_mode:
+      cfg = {"api_key_store_path": store} if store else {}
+      return resolve_api_key_store_path("kimi_code", cfg, user_scope=user_scope), "kimi_code", ("api_key",)
+    cfg = {"auth_store_path": store} if store else {}
+    return resolve_kimi_code_store_path(cfg, user_scope=user_scope), "kimi_code", ("access_token", "refresh_token")
+  if provider == "gemini":
+    if api_key_mode:
+      cfg = {"api_key_store_path": store} if store else {}
+      return resolve_api_key_store_path("google", cfg, user_scope=user_scope), "google", ("api_key",)
+    cfg = {"auth_store_path": store} if store else {}
+    return resolve_antigravity_store_path(cfg, user_scope=user_scope), "antigravity", ("access_token", "refresh_token")
+  if provider == "google":
+    if api_key_mode:
+      cfg = {"api_key_store_path": store} if store else {}
+      return resolve_api_key_store_path("google", cfg, user_scope=user_scope), "google", ("api_key",)
+    cfg = {"auth_store_path": store} if store else {}
+    return resolve_google_oauth_settings(cfg, user_scope=user_scope).store_path, "google", ("access_token", "refresh_token")
+  if provider == "copilot":
+    cfg = {"auth_store_path": store} if store else {}
+    return resolve_copilot_oauth_settings(cfg, user_scope=user_scope).store_path, "copilot", ("access_token", "refresh_token")
+  if provider == "muse":
+    if api_key_mode:
+      cfg = {"api_key_store_path": store} if store else {}
+      return resolve_api_key_store_path("muse", cfg, user_scope=user_scope), "muse", ("api_key",)
+    cfg = {"auth_store_path": store} if store else {}
+    return resolve_muse_store_path(cfg, user_scope=user_scope), "muse", ("api_key",)
+  if provider == "ollama-cloud":
+    cfg = {"api_key_store_path": store} if store else {}
+    return resolve_api_key_store_path("ollama_cloud", cfg, user_scope=user_scope), "ollama_cloud", ("api_key",)
+  if provider == "xai":
+    cfg_xai: dict[str, Any] = {"auth_store_path": store} if store else {}
+    if user_scope is not None:
+      cfg_xai[USER_SCOPE_FIELD] = user_scope
+    return resolve_xai_oauth_settings(cfg_xai).store_path, "xai", ("access_token", "refresh_token")
+  cfg_generic = {"auth_store_path": store} if store else {}
+  return (
+    resolve_provider_store_path(provider, "oauth.json", cfg_generic, user_scope=user_scope),
+    provider,
+    ("access_token", "refresh_token", "api_key"),
   )
 
-  path = _anthropic_store_path(args)
-  records = load_anthropic_oauth_store(path)
-  if not records:
-    stdout.write(f"Anthropic OAuth: no enrolled accounts ({path})\n")
+
+def _auth_list(args: argparse.Namespace, *, stdout: TextIO) -> int:
+  if args.provider == "anthropic":
+    from .providers.anthropic_oauth import (
+      load_anthropic_oauth_store,
+      mask_anthropic_token,
+    )
+
+    path = _anthropic_store_path(args)
+    records = load_anthropic_oauth_store(path)
+    if not records:
+      stdout.write(f"Anthropic OAuth: no enrolled accounts ({path})\n")
+      return 1
+    now = time.time()
+    for record in records:
+      remaining = record.expires_at - now
+      if not record.refresh_token:
+        expiry = "no refresh token (enroll again to make it refreshable)"
+      elif remaining <= 0:
+        expiry = "access token expired; refreshes before next use"
+      else:
+        expiry = f"access token valid for {remaining / 60:.0f} min"
+      line = f"{record.identity}  {mask_anthropic_token(record.access_token)}  {expiry}"
+      if record.last_error:
+        line += f"  last error: {record.last_error}"
+      stdout.write(f"{line}\n")
+    return 0
+
+  from .providers.credential_pool import load_pool_accounts
+
+  path, prefix, req_keys = _resolve_pool_store_target(args)
+  accounts = load_pool_accounts(path, default_prefix=prefix, required_any_keys=req_keys)
+  if not accounts:
+    stdout.write(f"{args.provider}: no enrolled accounts ({path})\n")
     return 1
-  now = time.time()
-  for record in records:
-    remaining = record.expires_at - now
-    if not record.refresh_token:
-      expiry = "no refresh token (enroll again to make it refreshable)"
-    elif remaining <= 0:
-      expiry = "access token expired; refreshes before next use"
-    else:
-      expiry = f"access token valid for {remaining / 60:.0f} min"
-    line = f"{record.identity}  {mask_anthropic_token(record.access_token)}  {expiry}"
-    if record.last_error:
-      line += f"  last error: {record.last_error}"
-    stdout.write(f"{line}\n")
+  for acc in accounts:
+    identity = str(acc.get("identity") or "")
+    details: list[str] = [identity]
+    if acc.get("project_id"):
+      details.append(f"project={acc['project_id']}")
+    if acc.get("source"):
+      details.append(f"source={acc['source']}")
+    stdout.write("  ".join(details) + "\n")
   return 0
 
 
 def _auth_remove(args: argparse.Namespace, *, stdout: TextIO) -> int:
-  from .providers.anthropic_oauth import remove_anthropic_oauth_record
-
-  path = _anthropic_store_path(args)
   identity = str(args.identity or "").strip()
-  if not remove_anthropic_oauth_record(path, identity):
-    stdout.write(f"Anthropic OAuth: no enrolled account {identity!r} in {path}\n")
-    return 1
-  stdout.write(f"Removed Anthropic OAuth account {identity} from {path}\n")
-  stdout.write("Claude Code's saved login was not modified.\n")
-  return 0
+  if args.provider == "anthropic":
+    from .providers.anthropic_oauth import remove_anthropic_oauth_record
 
+    path = _anthropic_store_path(args)
+    if not remove_anthropic_oauth_record(path, identity):
+      stdout.write(f"Anthropic OAuth: no enrolled account {identity!r} in {path}\n")
+      return 1
+    stdout.write(f"Removed Anthropic OAuth account {identity} from {path}\n")
+    stdout.write("Claude Code's saved login was not modified.\n")
+    return 0
+
+  from .providers.credential_pool import remove_pool_account
+
+  path, prefix, req_keys = _resolve_pool_store_target(args)
+  if not remove_pool_account(path, identity, default_prefix=prefix, required_any_keys=req_keys):
+    stdout.write(f"{args.provider}: no enrolled account {identity!r} in {path}\n")
+    return 1
+  stdout.write(f"Removed {args.provider} account {identity} from {path}\n")
+  return 0
 
 def _auth_logout(args: argparse.Namespace, *, stdout: TextIO) -> int:
-  if args.provider == "anthropic":
-    path = _anthropic_store_path(args)
-    provider_label = "Anthropic"
-  else:
-    from .providers.xai_oauth import (
-      _store_lock,
-      _write_reauth_tombstone,
-      resolve_xai_oauth_settings,
-    )
-
-    path = resolve_xai_oauth_settings(_xai_auth_config(args)).store_path
-    provider_label = "xAI"
-
-    async def logout_xai() -> None:
-      async with _store_lock(path):
-        _write_reauth_tombstone(path)
-
-    try:
-      asyncio.run(logout_xai())
-    except OSError as exc:
-      raise AgentProjectError(f"Unable to update {provider_label} OAuth token store: {path}") from exc
-    stdout.write(f"Removed {provider_label} OAuth token store: {path}\n")
-    return 0
+  from .login_flows import get_login_flow
   try:
-    path.unlink()
-  except FileNotFoundError:
-    pass
-  except OSError as exc:
-    raise AgentProjectError(f"Unable to remove {provider_label} OAuth token store: {path}") from exc
-  stdout.write(f"Removed {provider_label} OAuth token store: {path}\n")
-  if args.provider == "anthropic":
-    stdout.write("Claude Code's saved login was not modified.\n")
-  return 0
-
+    flow = get_login_flow(args.provider)
+    return flow.logout(args, stdout=stdout)
+  except AgentProjectError:
+    raise
+  except Exception as exc:
+    raise AgentProjectError(str(exc)) from exc
 
 if __name__ == "__main__":
   raise SystemExit(main())

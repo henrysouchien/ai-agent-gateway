@@ -13,10 +13,148 @@ import stat
 from typing import Callable, Literal
 from uuid import UUID
 
-from .commercial_work_authorization import VerifiedWorkAuthorization
+from hank_contracts.commercial_work import VerifiedWorkAuthorization
 
 
 _TABLE_SQL = """
+  CREATE TABLE IF NOT EXISTS commercial_work_authorization_consumptions (
+    authorization_id TEXT PRIMARY KEY,
+    schema_version INTEGER NOT NULL CHECK (schema_version IN (1, 2, 3)),
+    token_sha256 TEXT NOT NULL UNIQUE CHECK (
+      length(token_sha256) = 71
+      AND substr(token_sha256, 1, 7) = 'sha256:'
+      AND substr(token_sha256, 8) NOT GLOB '*[^0-9a-f]*'
+    ),
+    content_sha256 TEXT NOT NULL CHECK (
+      length(content_sha256) = 71
+      AND substr(content_sha256, 1, 7) = 'sha256:'
+      AND substr(content_sha256, 8) NOT GLOB '*[^0-9a-f]*'
+    ),
+    key_id TEXT NOT NULL,
+    environment TEXT NOT NULL CHECK (environment IN ('dev', 'staging', 'prod')),
+    execution_context_id TEXT NOT NULL,
+    workflow_run_id TEXT NOT NULL UNIQUE,
+    workflow_attempt_group_id TEXT NOT NULL,
+    workflow_attempt_number INTEGER NOT NULL CHECK (workflow_attempt_number > 0),
+    retry_of_workflow_run_id TEXT,
+    workflow_attempt_kind TEXT NOT NULL CHECK (
+      workflow_attempt_kind IN ('initial', 'user_retry', 'automatic_retry')
+    ),
+    primary_inference_observability TEXT NOT NULL CHECK (
+      primary_inference_observability IN (
+        'hank_metered', 'hank_byok_observed', 'external_unobserved', 'none'
+      )
+    ),
+    funding_route_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    billing_mode TEXT NOT NULL CHECK (billing_mode IN ('byok', 'metered')),
+    reservation_id TEXT,
+    operation TEXT NOT NULL,
+    capability_id TEXT,
+    request_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    issued_at INTEGER NOT NULL CHECK (issued_at > 0),
+    expires_at INTEGER NOT NULL CHECK (expires_at > issued_at),
+    attached_at TEXT NOT NULL,
+    model_key TEXT,
+    credential_principal TEXT,
+    reserved_spend_microusd INTEGER,
+    CHECK ((billing_mode = 'metered') = (reservation_id IS NOT NULL)),
+    CHECK (
+      (
+        schema_version = 1
+        AND model_key IS NULL
+        AND credential_principal IS NULL
+        AND reserved_spend_microusd IS NULL
+      )
+      OR (
+        schema_version = 2
+        AND model_key IS NOT NULL
+        AND credential_principal IN ('user', 'service')
+        AND reserved_spend_microusd IS NULL
+      )
+      OR (
+        schema_version = 3
+        AND model_key IS NULL
+        AND credential_principal IN ('user', 'service')
+        AND (
+          (billing_mode = 'byok' AND reserved_spend_microusd IS NULL)
+          OR (
+            billing_mode = 'metered'
+            AND reserved_spend_microusd IS NOT NULL
+            AND reserved_spend_microusd >= 0
+          )
+        )
+      )
+    )
+  )
+"""
+_V3_METERED_OBSERVABILITY_TABLE_SQL = _TABLE_SQL.replace(
+  "primary_inference_observability IN (\n"
+  "        'hank_metered', 'hank_byok_observed', 'external_unobserved', 'none'\n"
+  "      )",
+  "primary_inference_observability IN ('hank_metered', 'hank_byok_observed')",
+)
+# The V2 table shape, kept solely to recognize a store that predates the
+# reserved-spend column and rebuild it on open. Rows read back unchanged.
+_V2_TABLE_SQL = """
+  CREATE TABLE IF NOT EXISTS commercial_work_authorization_consumptions (
+    authorization_id TEXT PRIMARY KEY,
+    schema_version INTEGER NOT NULL CHECK (schema_version IN (1, 2)),
+    token_sha256 TEXT NOT NULL UNIQUE CHECK (
+      length(token_sha256) = 71
+      AND substr(token_sha256, 1, 7) = 'sha256:'
+      AND substr(token_sha256, 8) NOT GLOB '*[^0-9a-f]*'
+    ),
+    content_sha256 TEXT NOT NULL CHECK (
+      length(content_sha256) = 71
+      AND substr(content_sha256, 1, 7) = 'sha256:'
+      AND substr(content_sha256, 8) NOT GLOB '*[^0-9a-f]*'
+    ),
+    key_id TEXT NOT NULL,
+    environment TEXT NOT NULL CHECK (environment IN ('dev', 'staging', 'prod')),
+    execution_context_id TEXT NOT NULL,
+    workflow_run_id TEXT NOT NULL UNIQUE,
+    workflow_attempt_group_id TEXT NOT NULL,
+    workflow_attempt_number INTEGER NOT NULL CHECK (workflow_attempt_number > 0),
+    retry_of_workflow_run_id TEXT,
+    workflow_attempt_kind TEXT NOT NULL CHECK (
+      workflow_attempt_kind IN ('initial', 'user_retry', 'automatic_retry')
+    ),
+    primary_inference_observability TEXT NOT NULL CHECK (
+      primary_inference_observability IN ('hank_metered', 'hank_byok_observed')
+    ),
+    funding_route_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    billing_mode TEXT NOT NULL CHECK (billing_mode IN ('byok', 'metered')),
+    reservation_id TEXT,
+    operation TEXT NOT NULL,
+    capability_id TEXT,
+    request_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    issued_at INTEGER NOT NULL CHECK (issued_at > 0),
+    expires_at INTEGER NOT NULL CHECK (expires_at > issued_at),
+    attached_at TEXT NOT NULL,
+    model_key TEXT,
+    credential_principal TEXT,
+    CHECK ((billing_mode = 'metered') = (reservation_id IS NOT NULL)),
+    CHECK (
+      (
+        schema_version = 1
+        AND model_key IS NULL
+        AND credential_principal IS NULL
+      )
+      OR (
+        schema_version = 2
+        AND model_key IS NOT NULL
+        AND credential_principal IN ('user', 'service')
+      )
+    )
+  )
+"""
+# The V1-only table shape, kept solely to recognize a store that predates the
+# V2 model and credential-principal columns and rebuild it on open.
+_PREVIOUS_TABLE_SQL = """
   CREATE TABLE IF NOT EXISTS commercial_work_authorization_consumptions (
     authorization_id TEXT PRIMARY KEY,
     schema_version INTEGER NOT NULL CHECK (schema_version = 1),
@@ -76,8 +214,11 @@ _COLUMNS = (
   "workflow_attempt_number", "retry_of_workflow_run_id", "workflow_attempt_kind",
   "primary_inference_observability", "funding_route_id", "provider",
   "billing_mode", "reservation_id", "operation", "capability_id", "request_id",
-  "session_id", "issued_at", "expires_at", "attached_at",
+  "session_id", "issued_at", "expires_at", "attached_at", "model_key",
+  "credential_principal", "reserved_spend_microusd",
 )
+_V1_COLUMNS = _COLUMNS[: _COLUMNS.index("attached_at") + 1]
+_V2_COLUMNS = _COLUMNS[: _COLUMNS.index("reserved_spend_microusd")]
 
 
 def _normalized_ddl(sql: str | None) -> str:
@@ -124,6 +265,10 @@ class WorkAuthorizationConsumptionRecord:
   issued_at: int
   expires_at: int
   attached_at: str
+  # None exactly for schema_version 1. model_key is set only on old V2 rows.
+  model_key: str | None = None
+  credential_principal: Literal["user", "service"] | None = None
+  reserved_spend_microusd: int | None = None
 
 
 class WorkAuthorizationConsumptionStore:
@@ -198,6 +343,18 @@ class WorkAuthorizationConsumptionStore:
     with self._connect() as connection:
       connection.execute("BEGIN IMMEDIATE")
       self._secure_database_files()
+      existing = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("commercial_work_authorization_consumptions",),
+      ).fetchone()
+      if existing is not None:
+        normalized = _normalized_ddl(existing[0])
+        if normalized == _normalized_ddl(_PREVIOUS_TABLE_SQL):
+          _rebuild_previous_table(connection, _V1_COLUMNS)
+        elif normalized == _normalized_ddl(_V2_TABLE_SQL):
+          _rebuild_previous_table(connection, _V2_COLUMNS)
+        elif normalized == _normalized_ddl(_V3_METERED_OBSERVABILITY_TABLE_SQL):
+          _rebuild_previous_table(connection, _COLUMNS)
       connection.execute(_TABLE_SQL)
       for trigger in _TRIGGERS:
         connection.execute(trigger)
@@ -285,6 +442,11 @@ class WorkAuthorizationConsumptionStore:
         )
         connection.commit()
         self._secure_database_files()
+      except sqlite3.IntegrityError as exc:
+        connection.rollback()
+        raise WorkAuthorizationConsumptionError(
+          f"work authorization storage constraint violated: {exc}"
+        ) from exc
       except BaseException:
         connection.rollback()
         raise
@@ -353,9 +515,45 @@ class WorkAuthorizationConsumptionStore:
     }
 
 
+def _rebuild_previous_table(
+  connection: sqlite3.Connection,
+  copied_columns: tuple[str, ...],
+) -> None:
+  """Rebuild a previous table in the caller's transaction, rows unchanged.
+
+  The old table is renamed aside rather than the new one renamed in, because
+  SQLite rewrites a renamed table's stored DDL with a quoted name, which the
+  exact-DDL check in ``_migrate`` would then refuse.
+  """
+  previous_columns = ", ".join(copied_columns)
+  for trigger in _TRIGGERS:
+    trigger_name = trigger.split("TRIGGER IF NOT EXISTS ", 1)[1].split()[0]
+    connection.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+  connection.execute(
+    "ALTER TABLE commercial_work_authorization_consumptions "
+    "RENAME TO commercial_work_authorization_consumptions_previous"
+  )
+  connection.execute(_TABLE_SQL)
+  connection.execute(
+    f"""
+    INSERT INTO commercial_work_authorization_consumptions ({previous_columns})
+    SELECT {previous_columns}
+    FROM commercial_work_authorization_consumptions_previous
+    """
+  )
+  connection.execute(
+    "DROP TABLE commercial_work_authorization_consumptions_previous"
+  )
+
+
 def _content_sha256(authorization: VerifiedWorkAuthorization) -> str:
   payload = asdict(authorization)
   payload.pop("token_sha256")
+  if authorization.schema_version == 1:
+    # V1 content identity predates later fields; keep existing rows' hashes.
+    payload.pop("credential_principal", None)
+    payload.pop("reserved_spend_microusd", None)
+    payload.pop("model_key", None)
   encoded = json.dumps(
     payload,
     sort_keys=True,
@@ -387,6 +585,9 @@ def _values(
     authorization.operation, authorization.capability_id,
     authorization.request_id, authorization.session_id,
     authorization.issued_at, authorization.expires_at, attached_at,
+    None,
+    authorization.credential_principal,
+    authorization.reserved_spend_microusd,
   )
 
 
@@ -417,6 +618,9 @@ def _record(row: sqlite3.Row) -> WorkAuthorizationConsumptionRecord:
     issued_at=row["issued_at"],
     expires_at=row["expires_at"],
     attached_at=row["attached_at"],
+    model_key=row["model_key"],
+    credential_principal=row["credential_principal"],
+    reserved_spend_microusd=row["reserved_spend_microusd"],
   )
 
 

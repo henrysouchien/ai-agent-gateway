@@ -8,17 +8,14 @@ import sys
 import time
 from typing import Any
 
-_AGENT_API_CLAIM_AUDIENCE = "agent_api_v1"
-_AGENT_API_CLAIM_TTL_SECONDS_DEFAULT = 300
-_AGENT_API_CLAIM_ENV_VARS = {
-  "audience": "AGENT_API_CLAIM_AUDIENCE",
-  "issued_at": "AGENT_API_CLAIM_ISSUED_AT",
-  "expiry": "AGENT_API_CLAIM_EXPIRY",
-  "user_id": "AGENT_API_CLAIM_USER_ID",
-  "user_email": "AGENT_API_CLAIM_USER_EMAIL",
-  "nonce": "AGENT_API_CLAIM_NONCE",
-  "signature": "AGENT_API_CLAIM_SIGNATURE",
-}
+from .ttl_policy import AGENT_API_CLAIM_TTL, TtlResolver, resolve_ttl_seconds
+
+from hank_contracts.agent_api import (
+  AGENT_API_CLAIM_AUDIENCE as _AGENT_API_CLAIM_AUDIENCE,
+  AGENT_API_CLAIM_TTL_SECONDS_DEFAULT as _AGENT_API_CLAIM_TTL_SECONDS_DEFAULT,
+  AGENT_API_CLAIM_ENV_VARS as _AGENT_API_CLAIM_ENV_VARS,
+  canonical_agent_api_claim_bytes,
+)
 
 
 def _runtime_module() -> Any:
@@ -37,16 +34,22 @@ def _time_time() -> float:
   return _runtime_attr("time", time).time()
 
 
-def get_agent_api_claim_ttl_seconds() -> int:
+def get_agent_api_claim_ttl_seconds(
+  user_id: str | None = None,
+  ttl_resolver: TtlResolver | None = None,
+) -> int:
   raw = os.getenv("AGENT_API_CLAIM_TTL_SECONDS", "").strip()
   default_ttl = _runtime_attr("_AGENT_API_CLAIM_TTL_SECONDS_DEFAULT", _AGENT_API_CLAIM_TTL_SECONDS_DEFAULT)
-  if not raw:
-    return default_ttl
   try:
     ttl_seconds = int(raw)
   except ValueError:
-    return default_ttl
-  return ttl_seconds if ttl_seconds > 0 else default_ttl
+    ttl_seconds = default_ttl
+  fallback = ttl_seconds if ttl_seconds > 0 else default_ttl
+  if ttl_resolver is None or user_id is None:
+    return fallback
+  return resolve_ttl_seconds(
+    ttl_resolver, user_id, AGENT_API_CLAIM_TTL, fallback,
+  )
 
 
 def sign_user_claim(
@@ -65,8 +68,13 @@ def sign_user_claim(
   expiry = issued_at + ttl_seconds
   nonce = secrets.token_hex(16)
   normalized_email = user_email or ""
-  canonical = f"{audience}\n{issued_at}\n{expiry}\n{user_id}\n{normalized_email}\n{nonce}".encode(
-    "utf-8"
+  canonical = canonical_agent_api_claim_bytes(
+    audience=audience,
+    issued_at=issued_at,
+    expiry=expiry,
+    user_id=user_id,
+    user_email=normalized_email,
+    nonce=nonce,
   )
   signature = hmac.new(hmac_key.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
 

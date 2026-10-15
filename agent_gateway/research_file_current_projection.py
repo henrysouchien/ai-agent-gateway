@@ -349,6 +349,7 @@ def _select_owner_locations(
       allowed_stream_kinds=frozenset({
         "canonical", "batch", "pipeline", "ephemeral",
       }),
+      strict_classification=False,
     )
   except (AgentSessionLogEnumerationError, SessionLogInventoryError) as exc:
     raise ResearchFileCurrentProjectionUnavailable(

@@ -27,6 +27,12 @@ _BILLING_PATTERNS = (
   re.compile(r"\bsubscription\b", re.IGNORECASE),
   re.compile(r"\bpermission denied\b", re.IGNORECASE),
   re.compile(r"\bpermissiondenied\b", re.IGNORECASE),
+  re.compile(r"\b(?:api\s+)?usage\s+limit(?:s)?\b", re.IGNORECASE),
+  re.compile(r"\breached your specified (?:api )?usage limit(?:s)?\b", re.IGNORECASE),
+)
+_REGAIN_ACCESS_RE = re.compile(
+  r"\bregain access on (\d{4}-\d{2}-\d{2}) at (\d{2}:\d{2})(?::(\d{2}))?\s+UTC\b",
+  re.IGNORECASE,
 )
 _AUTH_PATTERNS = (
   re.compile(r"\bunauthorized\b", re.IGNORECASE),
@@ -82,11 +88,16 @@ class ModelInfo:
   output_cost_per_mtok: float = 0.0
   cache_read_cost_per_mtok: float = 0.0
   cache_write_cost_per_mtok: float = 0.0
+  rates_known: bool = True
   thinking_mode: ThinkingMode | None = None
   compat: FamilyCompat | None = None
   # The entry's supported efforts in canonical ``ThinkingLevel`` order.
   effort_values: tuple[str, ...] = ()
   rate_tiers: tuple[ContextRateTier, ...] = ()
+  # Transport fact: the wire emits no stream event until the serving host has
+  # prefilled the whole prompt (local inference). The no-progress bound then
+  # scales with ``context_window`` (runner_streaming.effective_stream_stall_timeout).
+  first_progress_after_prefill: bool = False
 
   def __post_init__(self) -> None:
     if self.thinking_mode is None:
@@ -168,6 +179,7 @@ def model_info_from_entry(
     rates = rate_table.lookup(entry.provider, model_id)
   except UnknownModelError:
     log.warning("%s model %r has no rate row; using zero-cost estimates", entry.provider, model_id)
+    info.rates_known = False
     return info
   info.input_cost_per_mtok = rates.input_cost_per_mtok
   info.output_cost_per_mtok = rates.output_cost_per_mtok
@@ -218,6 +230,7 @@ class CostEstimate:
   cache_read_cost: float = 0.0
   cache_write_cost: float = 0.0
   total: float = 0.0
+  cost_known: bool = True
 
 
 def _status_code_from_exception(exc: Exception) -> int | None:
@@ -307,6 +320,17 @@ def _credential_reset_at(exc: Exception, *, now: float | None = None) -> float |
     window_reset = _projected_epoch_seconds(getattr(exc, reset_field, None), now=moment)
     if window_reset is not None:
       candidates.append(window_reset)
+  message = " ".join(part for part in (str(exc), _response_text(exc)) if part)
+  match = _REGAIN_ACCESS_RE.search(message)
+  if match:
+    iso = f"{match.group(1)}T{match.group(2)}:{match.group(3) or '00'}+00:00"
+    try:
+      parsed = datetime.fromisoformat(iso)
+      if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+      candidates.append(parsed.timestamp())
+    except ValueError:
+      pass
   return max(candidates) if candidates else None
 
 
@@ -492,6 +516,14 @@ class ModelProvider:
     raise NotImplementedError
 
   async def close_client(self, client: Any, timeout: float = 2.0) -> None:
+    """Release a client's transport; ``timeout`` bounds shutdown, never a turn.
+
+    A peer that has already hung up can leave ``aclose`` waiting on a socket
+    that will not close, and a torn-down client holds nothing the next turn
+    needs, so an implementation gives the close this many seconds and then
+    abandons it; a teardown error is likewise dropped rather than surfaced
+    over the result the caller already has.
+    """
     raise NotImplementedError
 
   def get_model_info(self, model: str) -> ModelInfo:
@@ -585,4 +617,5 @@ class ModelProvider:
       cache_read_cost=cache_read_cost,
       cache_write_cost=cache_write_cost,
       total=input_cost + output_cost + cache_read_cost + cache_write_cost,
+      cost_known=info.rates_known,
     )

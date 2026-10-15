@@ -63,7 +63,7 @@ def declared_terminal_doors_from_grant(grant: ToolGrant | None) -> frozenset[str
   return frozenset(
     entry.tool_id
     for entry in grant.tools
-    if _is_declared_terminal_door(entry.tool_id)
+    if is_declared_terminal_door(entry.tool_id)
   )
 
 
@@ -82,10 +82,39 @@ def terminal_result_doors(admitted_task: AdmittedTask | None) -> frozenset[str]:
   return declared_terminal_doors_from_grant(admitted_task.tool_grant)
 
 
-def _is_declared_terminal_door(tool_id: str) -> bool:
+def persist_expectation_doors(admitted_task: AdmittedTask | None) -> frozenset[str]:
+  """Return the terminal doors a child owes a persist through, or none.
+
+  Whether an operation owes a persist is authored (``result_requires_persist``),
+  not derivable from its grant: a coordinator carries its children's writer
+  doors and a read-only skill keeps its narrative outcome. The lifecycle event
+  settles a child that ends with no accepted terminal door and no artifact as
+  blocked only for an operation that declares the expectation.
+  """
+
+  if admitted_task is None or not admitted_task.operation.result_requires_persist:
+    return frozenset()
+  return terminal_result_doors(admitted_task)
+
+
+def is_declared_terminal_door(tool_id: str) -> bool:
   if not tool_id.startswith(_FMS_DOOR_PREFIX):
     return False
   return not tool_id.startswith(_FMS_NON_TERMINAL_PREFIXES)
+
+
+def is_context_door_name(tool_id: str) -> bool:
+  """Name shape of a context door: ``get_<artifact>_context``.
+
+  The grant additionally requires a read effect
+  (:func:`declared_context_doors_from_grant`); a recorded tool event carries
+  no effect, so event readers match the name alone.
+  """
+
+  return (
+    tool_id.startswith(_CONTEXT_DOOR_PREFIX)
+    and tool_id.endswith(_CONTEXT_DOOR_SUFFIX)
+  )
 
 
 def declared_context_doors_from_grant(grant: ToolGrant | None) -> frozenset[str]:
@@ -97,8 +126,7 @@ def declared_context_doors_from_grant(grant: ToolGrant | None) -> frozenset[str]
     entry.tool_id
     for entry in grant.tools
     if entry.effect == "read"
-    and entry.tool_id.startswith(_CONTEXT_DOOR_PREFIX)
-    and entry.tool_id.endswith(_CONTEXT_DOOR_SUFFIX)
+    and is_context_door_name(entry.tool_id)
   )
 
 
@@ -182,6 +210,8 @@ def _door_result_classification(
       detail = error.get("message") or error.get("type")
       if detail:
         message = str(detail)
+    elif isinstance(error, str) and error.strip():
+      message = error.strip()
     return ChildOutcomeClassification(
       outcome="blocked",
       succeeded=False,
@@ -523,6 +553,7 @@ __all__ = [
   "declared_terminal_doors_from_grant",
   "declared_terminal_tool_result_disposition",
   "latest_successful_declared_terminal_tool_result",
+  "persist_expectation_doors",
   "persist_skill_state",
   "result_response_text",
   "skill_state_prompt",

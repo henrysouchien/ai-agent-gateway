@@ -28,6 +28,7 @@ from agent_workflow_contracts import (
   sha256_digest,
 )
 from agent_workflow_contracts.models import CatalogToolEffect
+from gateway_test_support.host_policy import owner_session_host_policy
 
 
 class _Mcp:
@@ -132,7 +133,10 @@ def test_model_writer_with_artifact_only_contract_compiles_proposal_authority() 
   } == {"artifact.propose/v1", "corpus.read/v1"}
 
 
-def test_semantic_route_compiles_exact_read_only_tool_grant() -> None:
+def test_semantic_route_compiles_exact_read_only_tool_grant(owner_session_host_policy) -> None:
+  owner_session_host_policy.get_read_capability = lambda name, _server: (
+    "web.read/v1" if name == "web_search" else None
+  )
   authority = admit_operation_tools(
     _operation(),
     grant_id="grant:task-1",

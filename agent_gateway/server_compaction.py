@@ -439,6 +439,12 @@ async def summarize_messages(
       "portable compaction requires a BoundCapabilityExecution"
     )
   capability_execution.validate()
+  if capability_execution.resolver is None:
+    raise ValueError("portable compaction requires a CapabilityExecutionResolver")
+  capability_execution = capability_execution.resolver.resolve(
+    "session.compact",
+    parent_bind=capability_execution.bind,
+  )
   provider = capability_execution.provider
   compact_instructions = (instructions or DEFAULT_SERVER_COMPACTION_INSTRUCTIONS).strip()
   summarize_tools, request_kwargs = _summary_tools(provider, tools)

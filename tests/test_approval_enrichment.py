@@ -296,7 +296,6 @@ def test_trade_approval_expiry_caps_to_preview_remaining_with_dispatch_margin() 
     "execute_trade",
     {"approval_summary": {"expires_at": expires_at}},
     requested_expiry_seconds=600,
-    max_wait_seconds=270,
     now=now,
   ) == 70.0
 
@@ -308,22 +307,8 @@ def test_trade_approval_expiry_treats_naive_preview_expiry_as_utc() -> None:
     "execute_trade",
     {"approval_summary": {"expires_at": "2026-06-15T12:01:40"}},
     requested_expiry_seconds=600,
-    max_wait_seconds=270,
     now=now,
   ) == 70.0
-
-
-def test_trade_approval_expiry_uses_global_wait_when_preview_lives_longer() -> None:
-  now = datetime(2026, 6, 15, 12, 0, tzinfo=UTC)
-  expires_at = (now + timedelta(seconds=900)).isoformat()
-
-  assert effective_trade_approval_expiry_seconds(
-    "execute_trade",
-    {"approval_summary": {"expires_at": expires_at}},
-    requested_expiry_seconds=600,
-    max_wait_seconds=270,
-    now=now,
-  ) == 270.0
 
 
 def test_trade_approval_expiry_fails_nearly_closed_when_preview_margin_is_gone() -> None:
@@ -334,7 +319,6 @@ def test_trade_approval_expiry_fails_nearly_closed_when_preview_margin_is_gone()
     "execute_trade",
     {"approval_summary": {"expires_at": expires_at}},
     requested_expiry_seconds=600,
-    max_wait_seconds=270,
     now=now,
   ) == 0.1
 
@@ -346,7 +330,6 @@ def test_trade_approval_expiry_does_not_change_non_trade_tools() -> None:
     "memory_write",
     {"approval_summary": {"expires_at": (now + timedelta(seconds=20)).isoformat()}},
     requested_expiry_seconds=600,
-    max_wait_seconds=270,
     now=now,
   ) == 600.0
 

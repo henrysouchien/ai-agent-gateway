@@ -20,17 +20,21 @@ from jsonschema import Draft202012Validator
 from model_authority.bind import CapabilityBind
 
 from .commercial_contract import canonical_usage_payload_sha256
+from hank_contracts.usage import (
+  OUTBOX_SCHEMA_VERSION,
+  SHIPPABLE_USAGE_PAYLOAD_SCHEMA_VERSION,
+  OutboxState,
+  ReconciliationShipmentState,
+  CommercialUsageOutboxError,
+  CommercialUsageOutboxConflict,
+  CommercialUsageOutboxRow,
+  CommercialUsageReconciliationRow,
+  CommercialUsageReconciliationShipmentRow,
+)
 
 
 log = logging.getLogger("agent_gateway.usage_outbox")
 
-OUTBOX_SCHEMA_VERSION = 3
-# The only usage-event payload contract this artifact may forward to ingest.
-# Queued rows at any other payload schema version are dead-lettered loudly at
-# ship time instead of shipping opaquely; draining the outbox under the
-# producing artifact remains the cutover procedure (product decision 6) — this
-# gate makes a violated drain observable.
-SHIPPABLE_USAGE_PAYLOAD_SCHEMA_VERSION = 3
 _V1_OUTBOX_TABLE_INFO = (
   ("event_id", "TEXT", 0, None, 1),
   ("payload_sha256", "TEXT", 1, None, 0),
@@ -350,102 +354,6 @@ _OUTBOX_GUARD_TRIGGERS = {
   BEGIN SELECT RAISE(ABORT, 'commercial usage source evidence is append-only'); END
   """,
 }
-OutboxState = Literal["pending", "sending", "accepted", "retryable", "dead"]
-ReconciliationShipmentState = Literal[
-  "held", "pending", "sending", "accepted", "retryable", "dead"
-]
-
-
-class CommercialUsageOutboxError(RuntimeError):
-  """Base class for durable commercial outbox failures."""
-
-
-class CommercialUsageOutboxConflict(CommercialUsageOutboxError):
-  """An immutable source event ID was reused with different payload bytes."""
-
-
-@dataclass(frozen=True)
-class CommercialUsageOutboxRow:
-  event_id: str
-  payload_sha256: str
-  payload_json: str
-  environment: str
-  source_product: str
-  occurred_at: str
-  request_id: str
-  session_id: str
-  state: OutboxState
-  attempt_count: int
-  next_attempt_at: str | None
-  sending_lease_token: str | None
-  sending_lease_expires_at: str | None
-  ingest_status: str | None
-  canonical_event_id: str | None
-  ingest_reason_code: str | None
-  ingest_decided_at: str | None
-  accepted_at: str | None
-  last_error: str | None
-  created_at: str
-
-  @property
-  def payload(self) -> dict[str, Any]:
-    value = json.loads(self.payload_json)
-    if not isinstance(value, dict):
-      raise CommercialUsageOutboxError("stored commercial payload is not an object")
-    return value
-
-
-@dataclass(frozen=True)
-class CommercialUsageReconciliationRow:
-  report_id: str
-  environment: str
-  source_product: str
-  request_id: str
-  session_id: str
-  revision: int
-  supersedes_report_sha256: str | None
-  content_sha256: str
-  report_sha256: str
-  payload_json: str
-  status: Literal["match", "mismatch", "incomplete"]
-  recorded_at: str
-
-  @property
-  def payload(self) -> dict[str, Any]:
-    value = json.loads(self.payload_json)
-    if not isinstance(value, dict):
-      raise CommercialUsageOutboxError("stored reconciliation report is not an object")
-    return value
-
-
-@dataclass(frozen=True)
-class CommercialUsageReconciliationShipmentRow:
-  report_id: str
-  environment: str
-  source_product: str
-  request_id: str
-  session_id: str
-  revision: int
-  report_sha256: str
-  payload_json: str
-  state: ReconciliationShipmentState
-  attempt_count: int
-  next_attempt_at: str | None
-  sending_lease_token: str | None
-  sending_lease_expires_at: str | None
-  ingest_status: str | None
-  ingest_reason_code: str | None
-  ingest_decided_at: str | None
-  accepted_at: str | None
-  last_error: str | None
-  created_at: str
-
-  @property
-  def envelope(self) -> dict[str, Any]:
-    evidence = json.loads(self.payload_json)
-    if not isinstance(evidence, dict):
-      raise CommercialUsageOutboxError("stored reconciliation evidence is not an object")
-    return {"report_sha256": self.report_sha256, "evidence": evidence}
 
 
 def _utc_now() -> datetime:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from fnmatch import fnmatchcase
 import json
 import logging
 import time
@@ -15,7 +14,6 @@ from .approval_policy import (
   RunContext,
   utc_now,
 )
-from . import approval_settings
 from . import admission as _admission
 from .agent_session_log import AgentSessionLog
 from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich_trade_approval_args
@@ -34,6 +32,7 @@ from .product_config import gateway_product_id
 from .providers.agent_sdk import AgentSDKConfig, estimate_cost, _validate_sdk_version
 from .providers.anthropic import _server_tool_unit_deltas
 from .usage_resilience import CommercialUsageCircuitOpen
+from .commercial_work_start import commercial_budget_stop_fields
 from .runner import (
   ToolResultContext,
   _ACTIVE_SKILL_ALLOW_RESULT_KEY,
@@ -42,13 +41,7 @@ from .runner import (
 from .runner_introspection import detect_keyword_param as _detect_keyword_param
 from .runner_background_lifecycle import _RunResearchFileActivityLease
 from .runner_state import select_run_max_tokens
-from .run_identity import (
-  MODEL_RUN_IDENTITY_LOCAL_TOOLS,
-  RunIdentityCarrier,
-  RunIdentityCarrierError,
-  inject_run_identity_into_mcp_server_configs,
-  validate_run_identity,
-)
+from .run_identity import RunIdentityCarrier
 from .runner_session_events import build_user_message_event
 from .selected_content import (
   SelectedContentBinding,
@@ -121,10 +114,6 @@ _should_escrow_raw_tool_input = _sdk_runner_helpers.should_escrow_raw_tool_input
 _summarize_error_payload = _sdk_runner_helpers.summarize_error_payload
 
 
-def _approval_queue_timeout_seconds(expiry_seconds: float | int | None) -> float:
-  return min(float(expiry_seconds or 600), approval_settings.approval_wait_seconds())
-
-
 def _agent_sdk_credential_env(
   capability_execution: BoundCapabilityExecution,
 ) -> dict[str, str]:
@@ -176,36 +165,6 @@ class _PromptMessages:
         "content": [{"type": "text", "text": self.text}],
       },
     }
-
-
-class _SDKToolAdmissionSet(set[str]):
-  """Set-like view that applies SDK wildcard and MCP-server admission rules."""
-
-  def __init__(self, values: Sequence[str], runner: "AgentSDKRunner") -> None:
-    super().__init__(values)
-    self._runner = runner
-
-  def __contains__(self, value: object) -> bool:
-    if not isinstance(value, str):
-      return super().__contains__(value)
-    if super().__contains__(value):
-      return True
-    if any("*" in pattern and fnmatchcase(value, pattern) for pattern in self):
-      return True
-    if value.startswith("mcp__") and self._runner._sdk_admission_enforced:
-      parts = value.split("__", 2)
-      if len(parts) != 3 or not parts[1] or not parts[2]:
-        return True
-      server_name = parts[1]
-      if server_name not in self._runner._mcp_server_configs:
-        return True
-      advertised = self._runner._sdk_advertised_mcp_tool_ids_by_server.get(
-        server_name
-      )
-      if advertised is None:
-        return True
-      return value not in advertised
-    return False
 
 
 class _SDKResultProxy:
@@ -330,6 +289,7 @@ class _SDKSegmentQueryIterator:
       raw_event = _as_dict(getattr(message, "event"))
       event_type = str(raw_event.get("type") or "")
       if event_type == "message_start":
+        self._runner._capability_execution.revalidate()
         message_payload = _as_dict(raw_event.get("message"))
         usage = _as_dict(message_payload.get("usage"))
         self._segment_turns += 1
@@ -429,6 +389,7 @@ class _SDKSegmentQueryIterator:
     pending_load = bool(self._runner._pending_sdk_load)
     surface_changed = self._provider_tool_surface_changed()
     try:
+      self._runner._capability_execution.revalidate()
       if not self._resume_session_id:
         self._resume_session_id = self._runner._sdk_resume_session_id
       if not self._resume_session_id:
@@ -521,6 +482,13 @@ class _SDKSegmentQueryIterator:
       if self._closed:
         raise StopAsyncIteration
       iterator = self._iterator
+      self._runner._capability_execution.revalidate()
+      if iterator is None and commercial_budget_stop_fields(
+        self._runner._commercial_usage_producer
+      ) is not None:
+        self._closed = True
+        self._runner._commercial_budget_halted = True
+        raise StopAsyncIteration
       if iterator is None:
         start_task = asyncio.create_task(self._start_segment())
         self._start_task = start_task
@@ -599,7 +567,6 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     approval_route: ApprovalRoute = NO_APPROVAL_ROUTE,
     run_context: RunContext | None = None,
     skill_run_id: str | None = None,
-    mcp_run_identity_servers: frozenset[str] | None = None,
     workspace_dir: str | None = None,
     batch_id: int | str | None = None,
     started_at: float | None = None,
@@ -663,37 +630,13 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     self._disallowed_tools = list(disallowed_tools or sdk_config.disallowed_tools)
     mcp_config_metadata = mcp_server_configs
     self._run_identity_carrier = RunIdentityCarrier.from_optional(skill_run_id)
-    self._mcp_run_identity_servers = frozenset(
-      mcp_run_identity_servers or frozenset()
-    )
-    if self._mcp_run_identity_servers and self._run_identity_carrier is None:
-      raise RunIdentityCarrierError(
-        "run_identity_required",
-        "run-bound MCP servers require a server-owned run identity",
-      )
-    if run_context is not None and self._run_identity_carrier is not None:
-      context_carrier = RunIdentityCarrier.from_optional(run_context.run_id)
-      if (
-        context_carrier is None
-        or context_carrier.run_id != self._run_identity_carrier.run_id
-      ):
-        raise RunIdentityCarrierError(
-          "run_identity_mismatch",
-          "SDK run context and transport carrier identities must match",
-        )
-    self._mcp_server_configs = inject_run_identity_into_mcp_server_configs(
-      mcp_server_configs or {},
-      server_names=self._mcp_run_identity_servers,
-      carrier=self._run_identity_carrier,
-    )
-    self._deferred_mcp_server_configs = inject_run_identity_into_mcp_server_configs(
+    self._mcp_server_configs = dict(mcp_server_configs or {})
+    self._deferred_mcp_server_configs = dict(
       getattr(
         mcp_config_metadata,
         "deferred_mcp_server_configs",
         getattr(sdk_config, "_deferred_mcp_server_configs", {}),
-      ) or {},
-      server_names=self._mcp_run_identity_servers,
-      carrier=self._run_identity_carrier,
+      ) or {}
     )
     self._deferred_mcp_tool_ids = set(
       getattr(
@@ -709,23 +652,6 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
         getattr(sdk_config, "_deferred_mcp_server_patterns", set()),
       ) or set()
     )
-    self._sdk_admission_enforced = bool(
-      getattr(
-        mcp_config_metadata,
-        "sdk_admission_enforced",
-        getattr(sdk_config, "_sdk_admission_enforced", False),
-      )
-    )
-    self._sdk_advertised_mcp_tool_ids_by_server = {
-      str(server_name): set(tool_ids)
-      for server_name, tool_ids in (
-        getattr(
-          mcp_config_metadata,
-          "advertised_mcp_tool_ids_by_server",
-          getattr(sdk_config, "_advertised_mcp_tool_ids_by_server", {}),
-        ) or {}
-      ).items()
-    }
     self._sdk_load_transaction_manager = getattr(
       mcp_config_metadata,
       "load_transaction_manager",
@@ -739,6 +665,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     self._allowed_tools = list(allowed_tools or [])
     self._on_usage = on_usage
     self._commercial_usage_producer = commercial_usage_producer
+    self._commercial_budget_halted = False
     self._commercial_usage_emitted = False
     self._sdk_provider_call_usage: dict[str, Any] | None = None
     self._pending_sdk_usage_deltas: list[dict[str, Any]] = []
@@ -1115,10 +1042,11 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       return sanitization_failure_tool_input()
 
   def _effective_disallowed_tools(self) -> set[str]:
-    return _SDKToolAdmissionSet(
-      list(set(self._disallowed_tools) - self._active_skill_allow),
-      self,
-    )
+    # The one owner of the run's excluded set: the `disallowed_tools` the SDK
+    # is given (profile exclusions, the stage ceiling's deferred MCP tool ids,
+    # and wildcard patterns, all enforced by the SDK itself). The callback
+    # holds no second copy of the membership.
+    return set(self._disallowed_tools) - self._active_skill_allow
 
   @staticmethod
   def _sdk_tool_entry_names(entries: Any) -> set[str]:
@@ -1301,14 +1229,6 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     self._mcp_server_configs.update(new_configs)
     for server_name in new_configs:
       self._deferred_mcp_server_configs.pop(server_name, None)
-      self._sdk_advertised_mcp_tool_ids_by_server[server_name] = set(
-        admitted_by_server.get(server_name, set())
-      )
-    for server_name, server_admitted_ids in admitted_by_server.items():
-      if server_name in self._sdk_advertised_mcp_tool_ids_by_server:
-        self._sdk_advertised_mcp_tool_ids_by_server[server_name].update(
-          server_admitted_ids
-        )
     self._deferred_mcp_tool_ids.difference_update(removable_ids)
     self._deferred_mcp_server_patterns.difference_update(server_patterns)
     removed = removable_ids | server_patterns
@@ -1581,21 +1501,20 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     nonce: str,
     resolved_qualifier: str,
     allow_persistent: bool,
-    timeout_seconds: float,
     batch_admission: Any | None = None,
-  ) -> dict[str, Any] | None:
+    park: _approval_lifecycle_helpers.ApprovalPark | None = None,
+  ) -> dict[str, Any]:
     return await _approval_lifecycle_helpers.await_user_approval_via_pending_tools(
       session=self._session,
-      approval_store=self._approval_store,
       append_event_fn=self._append,
       request=request,
       decision=decision,
       nonce=nonce,
       resolved_qualifier=resolved_qualifier,
       allow_persistent=allow_persistent,
-      timeout_seconds=timeout_seconds,
       log=log,
       batch_admission=batch_admission,
+      park=park,
     )
 
   def _effective_trade_approval_decision(
@@ -1609,15 +1528,8 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       tool_args_redacted,
       decision,
       effective_trade_approval_expiry_seconds_fn=effective_trade_approval_expiry_seconds,
-      approval_wait_seconds_fn=approval_settings.approval_wait_seconds,
       utc_now_fn=utc_now,
     )
-
-  def _approval_queue_timeout_seconds(
-    self,
-    expiry_seconds: float | int | None,
-  ) -> float:
-    return _approval_queue_timeout_seconds(expiry_seconds)
 
   async def _can_use_tool_callback(self, tool_name: str, input_data: dict[str, Any], _context: Any) -> Any:
     task = asyncio.current_task()
@@ -1626,27 +1538,6 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     try:
       if self._query_close_task is not None and not self._query_close_task.done():
         raise asyncio.CancelledError
-      if tool_name in MODEL_RUN_IDENTITY_LOCAL_TOOLS:
-        import claude_agent_sdk
-
-        deny_cls = getattr(claude_agent_sdk, "PermissionResultDeny")
-        try:
-          carrier = self._run_identity_carrier
-          if carrier is None:
-            raise RunIdentityCarrierError(
-              "run_identity_required",
-              f"Tool '{tool_name}' requires a server-owned run identity.",
-            )
-          context_run_id = validate_run_identity(
-            self._resolve_run_context().run_id
-          )
-          if context_run_id != carrier.run_id:
-            raise RunIdentityCarrierError(
-              "run_identity_mismatch",
-              f"Tool '{tool_name}' received conflicting run identities.",
-            )
-        except RunIdentityCarrierError as exc:
-          return deny_cls(message=f"[{exc.code}] {exc}")
       return await _sdk_runner_approval.can_use_tool_callback(
         self,
         tool_name,
@@ -1986,7 +1877,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
           self._selected_content_bindings
         ),
       ))
-    self._capability_execution.validate()
+    self._capability_execution.revalidate()
     capability_bind = self._capability_execution.bind
     effective_model = capability_bind.upstream_model
     self._effective_model = effective_model
@@ -1994,6 +1885,12 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       commercial_guard = getattr(self._commercial_usage_producer, "assert_work_allowed", None)
       if callable(commercial_guard):
         commercial_guard(self._billing_mode)
+    if commercial_budget_stop_fields(self._commercial_usage_producer) is not None:
+      self._emit_stream_complete(
+        terminal_disposition="interrupted",
+        reason="commercial_budget_reached",
+      )
+      return
     _validate_sdk_version()
     try:
       import claude_agent_sdk
@@ -2083,6 +1980,15 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
               # The SDK iterator cannot advance to another provider turn after
               # a durability incident observed at this response boundary.
               commercial_guard(self._billing_mode)
+          # After this call's usage is emitted, before the next provider turn.
+          # rulings-index WA-ACCOUNT-BUDGET. Disjoint from the revalidate calls.
+          if commercial_budget_stop_fields(self._commercial_usage_producer) is not None:
+            await self._close_query_iterator()
+            self._emit_stream_complete(
+              terminal_disposition="interrupted",
+              reason="commercial_budget_reached",
+            )
+            return
           continue
 
         if hasattr(message, "duration_ms") and hasattr(message, "num_turns"):
@@ -2151,6 +2057,12 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
           continue
 
       await self._close_query_iterator()
+      if self._commercial_budget_halted:
+        self._emit_stream_complete(
+          terminal_disposition="interrupted",
+          reason="commercial_budget_reached",
+        )
+        return
       if result_error is not None:
         raise result_error
       park = await self._pending_root_approval_park()

@@ -26,7 +26,7 @@ def test_auth_config_cannot_select_effort_or_thinking() -> None:
     )
 
 
-def test_legacy_thinking_is_rejected_at_run_and_refresh_boundaries() -> None:
+def test_legacy_thinking_is_rejected_at_run_and_dropped_at_refresh_boundaries() -> None:
   with pytest.raises(ValueError, match="must not contain model selection"):
     normalized_run_config(
       {"api_key": "k", "thinking": True},
@@ -52,11 +52,10 @@ def test_legacy_thinking_is_rejected_at_run_and_refresh_boundaries() -> None:
     "thinking",
     "thinking_enabled_requested",
   }.isdisjoint(refreshed)
-  with pytest.raises(ValueError, match="must not contain model selection"):
-    merge_refreshed_auth_config(
-      credential_config,
-      {"api_key": "new", "thinking": False},
-    )
+  assert "thinking" not in merge_refreshed_auth_config(
+    credential_config,
+    {"api_key": "new", "thinking": False},
+  )
 
 
 def test_sonnet5_none_always_emits_disabled_below_gate() -> None:

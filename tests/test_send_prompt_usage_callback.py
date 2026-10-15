@@ -205,6 +205,7 @@ def test_send_prompt_usage_event_sets_provider() -> None:
       capability_execution=_bound_execution(bind=bind, provider_adapter=provider),
       user_id="alice",
       on_usage=events.append,
+      completion_record_root=None,
     )
   )
 
@@ -259,6 +260,7 @@ def test_send_prompt_clamps_max_tokens_to_model_max_output() -> None:
         max_tokens=200_000,
       ),
       user_id="alice",
+      completion_record_root=None,
     )
   )
 
@@ -320,6 +322,7 @@ def test_send_prompt_emits_partial_commercial_usage_on_terminal_stream_paths(
       commercial_usage_producer=producer,
       request_id="req-1", rate_table_version="v1", billing_mode="metered",
       channel="mcp",
+      completion_record_root=None,
     ))
 
   assert len(producer.items) == 1
@@ -339,6 +342,7 @@ def test_send_prompt_rejects_blank_commercial_identity_before_provider_call() ->
       user_id="alice",
       commercial_usage_producer=object(), request_id=" ",
       rate_table_version="v1", billing_mode="metered", channel=" ",
+      completion_record_root=None,
     ))
   assert provider.create_client_calls == 0
 
@@ -385,6 +389,7 @@ def test_send_prompt_rejects_bound_execution_disagreement_before_client_creation
         "hello",
         capability_execution=execution,
         user_id="alice",
+        completion_record_root=None,
       )
     )
 
@@ -411,6 +416,7 @@ def test_send_prompt_does_not_fall_back_to_process_credentials(
       "hello",
       capability_execution=execution,
       user_id="alice",
+      completion_record_root=None,
     ))
 
   assert refused.value.code == "credential_unavailable"

@@ -19,9 +19,13 @@ verifies it; any other schema is refused.
 
 Opening a ledger never reconciles another process instance's in-flight state.
 Recovery is explicit: a lifecycle owner supplies the complete live process set
-at startup, or a process instance whose death has been established.  Exclusion
-recovery makes unidentified crash remnants recoverable without risking rows
-owned by another known-live ledger opener.
+at startup, or a process instance whose death has been established, plus the
+reader of each fork's own journal.  Exclusion recovery makes unidentified
+crash remnants recoverable without risking rows owned by another known-live
+ledger opener.  A dead instance's started fork whose own journal holds a
+committed approval park is adopted by the recovering instance, so its Continue
+settles through the ordinary owner-checked transition; every other dead
+in-flight fork is abandoned at its reservation.
 """
 
 from __future__ import annotations
@@ -33,8 +37,10 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 import sqlite3
 import time
-from typing import Callable, Literal, overload, TypeVar
+from typing import TYPE_CHECKING, Callable, Literal, overload, TypeVar
 from uuid import uuid4
+
+from agent_workflow_contracts import OrdinaryDelegationTaskRef
 
 from .launch_nonce_store import (
   LaunchNonceStoreError,
@@ -46,6 +52,14 @@ from .launch_nonce_store import (
   _verify_parent_directory as _verify_hardened_parent_directory,
   _verify_sidecars as _verify_hardened_sidecars,
 )
+from .research_file_current_projection import (
+  RESEARCH_FILE_CURRENT_PROJECTION_UNAVAILABLE_EVENT_TYPE,
+  project_research_file_current_projection,
+)
+from .task_registry import TaskRegistry, TaskState
+
+if TYPE_CHECKING:
+  from .agent_session_log import AgentSessionLog
 
 
 FORK_LEDGER_SCHEMA_VERSION = 2
@@ -377,6 +391,55 @@ def _normalized_ddl(sql: str | None) -> str:
   return " ".join((sql or "").replace("IF NOT EXISTS ", "").split())
 
 
+def _journal_holds_committed_park(
+  journal: AgentSessionLog | None,
+  fork_id: str,
+) -> bool:
+  """Whether the fork's latest attempt in its own journal is a committed park.
+
+  Reads the journal's committed prefix: the fork's writer is dead, and a
+  torn trailing line it left was never acknowledged, so it is skipped just
+  as that writer's own recovery would truncate it.
+  """
+
+  if journal is None:
+    return False
+  entries, _ = journal.query_sync(
+    event_types={
+      RESEARCH_FILE_CURRENT_PROJECTION_UNAVAILABLE_EVENT_TYPE,
+      "task_registered",
+      "task_completed",
+      "task_terminated",
+    },
+    order="asc",
+  )
+  current_projection = project_research_file_current_projection(
+    entry for entry in entries
+    if entry.event.get("type")
+    == RESEARCH_FILE_CURRENT_PROJECTION_UNAVAILABLE_EVENT_TYPE
+  )
+  registry = TaskRegistry()
+  registry.load_from_events([
+    {**entry.event, "_durable_seq": entry.seq}
+    for entry in entries
+    if not current_projection.excludes(entry)
+  ])
+  attempts = [
+    (admitted.attempt.attempt_number, task)
+    for task in registry.list_tasks()
+    if (admitted := task.admitted_task) is not None
+    and isinstance(admitted.logical_task, OrdinaryDelegationTaskRef)
+    and admitted.logical_task.delegation_id == fork_id
+  ]
+  if not attempts:
+    return False
+  _, latest = max(attempts, key=lambda attempt: attempt[0])
+  return (
+    latest.state == TaskState.AWAITING_APPROVAL
+    and latest.completion_persistence_state == "committed"
+  )
+
+
 class ForkLedger:
   """One process lineage's durable fork receipt and admission authority."""
 
@@ -671,10 +734,17 @@ class ForkLedger:
   def reconcile_startup(
     self,
     *,
+    fork_journal: Callable[[str], AgentSessionLog | None],
     live_process_instance_ids: Collection[str] | None = None,
     dead_process_instance_id: str | None = None,
   ) -> tuple[int, int]:
-    """Recover crash remnants outside a live set, or one established death."""
+    """Recover crash remnants outside a live set, or one established death.
+
+    ``fork_journal`` reads one fork's own journal, or ``None`` when it has
+    none. A dead started fork whose journal holds a committed park moves to
+    this instance; the other dead in-flight forks are abandoned. Returns the
+    released receipt claims and the abandoned admissions.
+    """
 
     if (live_process_instance_ids is None) == (
       dead_process_instance_id is None
@@ -739,16 +809,12 @@ class ForkLedger:
           )
         """
         receipt_parameters = (now_ns,)
-        admission_parameters = (now_ns, now_ns)
+        admission_owner_parameters = ()
       else:
         receipt_owner_predicate = "process_instance_id = ?"
         admission_owner_predicate = "process_instance_id = ?"
         receipt_parameters = (now_ns, dead_process_instance_id)
-        admission_parameters = (
-          now_ns,
-          now_ns,
-          dead_process_instance_id,
-        )
+        admission_owner_parameters = (dead_process_instance_id,)
 
       receipts = connection.execute(
         f"""
@@ -760,6 +826,27 @@ class ForkLedger:
         """,
         receipt_parameters,
       ).rowcount
+      dead_started = connection.execute(
+        f"""
+        SELECT fork_id FROM fork_admissions
+         WHERE state = 'started' AND {admission_owner_predicate}
+        """,
+        admission_owner_parameters,
+      ).fetchall()
+      connection.executemany(
+        """
+        UPDATE fork_admissions
+           SET process_instance_id = ?, updated_at_ns = ?
+         WHERE fork_id = ? AND state = 'started'
+        """,
+        (
+          (self.process_instance_id, now_ns, row["fork_id"])
+          for row in dead_started
+          if _journal_holds_committed_park(
+            fork_journal(row["fork_id"]), row["fork_id"],
+          )
+        ),
+      )
       admissions = connection.execute(
         f"""
         UPDATE fork_admissions
@@ -769,7 +856,7 @@ class ForkLedger:
          WHERE state IN ('reserved', 'started')
            AND {admission_owner_predicate}
         """,
-        admission_parameters,
+        (now_ns, now_ns, *admission_owner_parameters),
       ).rowcount
       return receipts, admissions
 

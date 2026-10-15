@@ -63,6 +63,7 @@ def test_collect_live_evidence_sums_turn_usage_without_stream_complete() -> None
     },
     "estimated_cost": 0.375,
     "output_tokens": 5,
+    "turns": 2,
   }
   assert evidence.tools_used == ("docs_search",)
 
@@ -90,6 +91,7 @@ def test_stream_complete_is_authoritative_for_current_segment() -> None:
     "input_tokens": 10,
     "output_tokens": 4,
     "estimated_cost": 0.3,
+    "turns": 1,
   }
 
 
@@ -121,6 +123,7 @@ def test_durable_evidence_uses_assistant_and_guarded_draft_usage() -> None:
     "input_tokens": 4,
     "estimated_cost": 0.30000000000000004,
     "output_tokens": 6,
+    "turns": 1,
   }
   assert evidence.warning_parts == (
     "Prior child run was interrupted: process restart",

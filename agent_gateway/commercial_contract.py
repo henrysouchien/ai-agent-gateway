@@ -13,12 +13,14 @@ from uuid import UUID
 
 
 def packaged_usage_v3_contract_directory() -> Path:
-  return Path(str(files("agent_gateway") / "contracts" / "commercial-usage-v3"))
+  return Path(str(files("hank_contracts") / "contracts" / "commercial-usage-v3"))
 
 
 def _normalized_usage_body(event: dict) -> dict:
   body = dict(event)
   body.pop("source_payload_sha256", None)
+  if body.get("selection_provenance") is None:
+    body.pop("selection_provenance", None)
   for field in (
     "separately_billed_tool_cost_usd",
     "producer_estimated_cost_usd",

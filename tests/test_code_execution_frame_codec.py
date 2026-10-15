@@ -88,7 +88,7 @@ def test_client_receives_aggregate_protocol_error_not_silent_close():
     try:
       # Fill a real (small test) aggregate with a stdout frame, sharing the
       # very same budget the reader charges for request and reply frames.
-      cell.budget = codec.CellBudget(aggregate_limit=1024)
+      cell.budget = codec.CellBudget(aggregate_limit=4096)
       await asyncio.to_thread(client._open)
       remaining = cell.budget.aggregate_limit - cell.budget.used_bytes
       overhead = len(codec.encode_frame({"type": "stdout", "text": ""}))

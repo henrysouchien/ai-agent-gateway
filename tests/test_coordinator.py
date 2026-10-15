@@ -33,6 +33,7 @@ from agent_gateway.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
 )
+from agent_gateway.containment_settings import ContainmentSettings
 from agent_gateway.mcp_client import McpClientManager
 from model_authority.current import INITIAL_MODEL_REGISTRY
 from agent_gateway.providers import AnthropicProvider, StreamEvent
@@ -98,6 +99,7 @@ class _PromptCaptureProvider(ModelProvider):
 
 class _StubRunner:
   _spill_dir_provider = None
+  _containment = ContainmentSettings()
   capability_execution: BoundCapabilityExecution
 
   def __init__(self) -> None:
@@ -221,10 +223,7 @@ def test_coordinator_preamble_injected_into_string_system_prompt() -> None:
 
   _run(runner.run(messages=[{"role": "user", "content": "hello"}], system_prompt="Base prompt"))
 
-  reminder = runner._build_notification_reminder()
-  assert provider.system_prompts == [
-    f"{COORDINATOR_DEFAULT_PREAMBLE}\n\nBase prompt\n\n{reminder}"
-  ]
+  assert provider.system_prompts == [f"{COORDINATOR_DEFAULT_PREAMBLE}\n\nBase prompt"]
 
 
 def test_coordinator_custom_preamble_overrides_default_for_prompt_blocks() -> None:
@@ -251,11 +250,9 @@ def test_coordinator_custom_preamble_overrides_default_for_prompt_blocks() -> No
     )
   )
 
-  reminder = runner._build_notification_reminder()
   assert provider.system_prompts == [[
     ("Custom coordinator preamble", False),
     ("Base prompt", True),
-    (reminder, False),
   ]]
 
 
@@ -278,8 +275,7 @@ def test_coordinator_disabled_does_not_inject_preamble() -> None:
 
   _run(runner.run(messages=[{"role": "user", "content": "hello"}], system_prompt="Base prompt"))
 
-  reminder = runner._build_notification_reminder()
-  assert provider.system_prompts == [f"Base prompt\n\n{reminder}"]
+  assert provider.system_prompts == ["Base prompt"]
 
 
 @pytest.mark.usefixtures("worker_tool_policy")
@@ -329,7 +325,7 @@ def test_coordinator_max_workers_overrides_max_background_tasks() -> None:
       model="stub-model",
       effort="none",
     ),
-    max_concurrent_sub_agents=1,
+    containment=ContainmentSettings(max_concurrent_children=1),
     coordinator=CoordinatorConfig(enabled=True, max_workers=5),
     user_id="alice",
     billing_mode="byok",

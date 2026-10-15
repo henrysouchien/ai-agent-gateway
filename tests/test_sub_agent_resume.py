@@ -55,7 +55,7 @@ from agent_gateway.sub_agent import (
   ApprovedCallRef,
   _finalize_resume_abandoned,
   OperationResumeBinding,
-  _ordinary_admitted_task_factory,
+  ordinary_admitted_task_factory,
   _prior_result_evidence,
   _research_file_id_admitted_input,
   _research_file_id_from_admitted_inputs,
@@ -117,6 +117,9 @@ from agent_workflow_contracts import (
   TranscriptHandle,
   sha256_digest,
   WorkflowNodeTaskRef,
+)
+from agent_workflow_contracts.research_file_contract import (
+  context_text_with_run_binding,
 )
 from agent_gateway.transcript import (
   ChildRunSegment,
@@ -184,6 +187,7 @@ def _interrupted_task_correlation(
   capability_bind_receipt: dict[str, str],
 ) -> dict[str, Any]:
   return {
+    "task_id": task_id,
     "owner_runner_id": getattr(runner, "_runner_id", None),
     "owner_role": getattr(runner, "_role", "writer"),
     "sub_agent_id": f"sub:{task_id}",
@@ -968,6 +972,7 @@ async def _append_interrupted_skill_task(
   admitted_context: AdmittedContextWire | None = None,
   workflow_node: bool = False,
   parked_state: TaskState = TaskState.INTERRUPTED,
+  first_message_logged: bool = True,
 ) -> None:
   if tuple(route.tool_id for route in allowed_tool_routes) != tuple(
     sorted(set(allowed_tools))
@@ -1062,7 +1067,7 @@ async def _append_interrupted_skill_task(
     and "research_file_id" in required_context
     else ()
   )
-  admitted_task = _ordinary_admitted_task_factory(
+  admitted_task = ordinary_admitted_task_factory(
     operation=operation,
     execution_snapshot=execution_snapshot,
     capability_bindings=(),
@@ -1163,16 +1168,17 @@ async def _append_interrupted_skill_task(
       "role": "sub_agent",
     }
   )
-  await log.append(
-    {
-      "type": "user_message",
-      "task_id": task_id,
-      "sub_agent_id": f"sub:{task_id}",
-      "runner_id": child_runner_id,
-      "role": "sub_agent",
-      "content": user_message,
-    }
-  )
+  if first_message_logged:
+    await log.append(
+      {
+        "type": "user_message",
+        "task_id": task_id,
+        "sub_agent_id": f"sub:{task_id}",
+        "runner_id": child_runner_id,
+        "role": "sub_agent",
+        "content": user_message,
+      }
+    )
 
 
 @pytest.mark.parametrize("configured", [False, True])
@@ -1282,6 +1288,9 @@ def test_parent_initial_and_resume_share_one_stateful_interceptor_chain(
 ) -> None:
   owner_session_host_policy.get_local_tool_effect = lambda name: (
     "read" if name == "web_search" else None
+  )
+  owner_session_host_policy.get_read_capability = lambda name, _server: (
+    "web.read/v1" if name == "web_search" else None
   )
   async def _case() -> None:
     observed: list[tuple[str, str]] = []
@@ -1445,7 +1454,7 @@ semantic_metadata:
     assert resume_result is not None
     recovered_initial = resume_runner._task_registry.get(initial_entry.task_id)
     assert recovered_initial is not None
-    assert recovered_initial.state == TaskState.INTERRUPTED
+    assert recovered_initial.state == TaskState.PARKED
     assert recovered_initial.admitted_task == initial_entry.admitted_task
     resumed_entry = resume_runner._task_registry.get(resume_result["task_id"])
     assert resumed_entry is not None
@@ -1519,6 +1528,9 @@ def test_run_agent_child_reconciles_its_own_skill_not_the_parents(
   """
   owner_session_host_policy.get_local_tool_effect = lambda name: (
     "read" if name == "web_search" else None
+  )
+  owner_session_host_policy.get_read_capability = lambda name, _server: (
+    "web.read/v1" if name == "web_search" else None
   )
 
   class _ScriptedChildProvider(ModelProvider):
@@ -1946,17 +1958,22 @@ def test_operation_resume_binding_restores_private_runtime(
     assert len(children) == 1
     child = children[0]
     assert child._aggregator is (
-      distinct if accounting == "bound"
-      else runner._aggregator if accounting == "ordinary"
-      else child._aggregator
+      distinct if accounting == "bound" else child._aggregator
     )
+    if accounting == "ordinary":
+      assert child._aggregator is not runner._aggregator
+      assert child._parent_aggregator is None
+      assert child._usage_parent is runner._aggregator
     if accounting == "independent":
       assert child._aggregator is not runner._aggregator
       assert child._parent_aggregator is None
     parent_usage = await runner._aggregator.snapshot()
     binding_usage = await distinct.snapshot()
     child_usage = await child._aggregator.snapshot()
-    assert parent_usage.input_tokens == (20 if accounting == "ordinary" else 0)
+    # The resumed child keeps its own row; the parent's row counts the parent alone.
+    assert parent_usage.input_tokens == 0
+    if accounting == "ordinary":
+      assert (await runner._aggregator.fleet_snapshot()).input_tokens == 20
     assert binding_usage.input_tokens == (20 if accounting == "bound" else 0)
     assert child_usage.input_tokens == 20
     assert child_usage.output_tokens == 4
@@ -4363,7 +4380,7 @@ def test_pending_resume_registration_holds_its_slot_without_durable_ghost(
     restarted_source = restarted._task_registry.get(source.task_id)
     restarted_successor = restarted._task_registry.get(successor.task_id)
     assert restarted_source is not None
-    assert restarted_source.state == TaskState.INTERRUPTED
+    assert restarted_source.state == TaskState.PARKED
     assert restarted_successor is not None
     assert restarted_successor.state == TaskState.COMPLETED
     assert restarted._task_registry.admission_count == 0
@@ -4721,7 +4738,7 @@ def test_resume_successor_reconciles_registration_failure_after_fsync(
   _run(_case())
 
 
-def test_resume_source_reference_survives_retention_eviction(
+def test_resume_source_is_retained_while_parked_and_resume_succeeds(
   tmp_path: Path,
 ) -> None:
   async def _case() -> None:
@@ -4761,7 +4778,12 @@ def test_resume_source_reference_survives_retention_eviction(
     assert started is not None
     successor = runner._task_registry.get(started["task_id"])
     assert successor is not None
-    assert runner._task_registry.get(task_id) is None
+    # A parked source is resumable paid work, not terminal: retention never
+    # drops it, so the successor continues exactly the recorded attempt.
+    source = runner._task_registry.get(task_id)
+    assert source is not None
+    assert source.state is TaskState.PARKED
+    assert source.admitted_task is not None
     assert successor.asyncio_task is not None
     await successor.asyncio_task
     assert successor.state == TaskState.COMPLETED
@@ -4864,7 +4886,7 @@ def test_resume_tool_def_schema() -> None:
   assert tool_def["input_schema"]["required"] == ["task_id"]
 
 
-def test_resume_handler_rejects_non_interrupted_task(tmp_path: Path) -> None:
+def test_resume_handler_rejects_task_neither_parked_nor_interrupted(tmp_path: Path) -> None:
   async def _case() -> None:
     runner = _runner(tmp_path)
     entry = runner._task_registry.register("background_agent", agent_name="earnings-review", task_id="bg_3")
@@ -4886,7 +4908,7 @@ def test_resume_handler_rejects_non_interrupted_task(tmp_path: Path) -> None:
 
     assert result is None
     assert error is not None
-    assert error["code"] == "not_interrupted"
+    assert error["code"] == "not_resumable_state"
 
   _run(_case())
 
@@ -4934,7 +4956,7 @@ def test_resume_handler_rejects_evicted_durable_terminal_task(
 
     assert result is None
     assert error is not None
-    assert error["code"] == "not_interrupted"
+    assert error["code"] == "not_resumable_state"
     assert runner._task_registry.get(task_id) is None
     assert runner._task_registry.get(f"{task_id}_r1") is None
 
@@ -5317,9 +5339,14 @@ def test_cancelled_resume_abandonment_is_bounded_while_append_hangs(
   _run(_case())
 
 
+@pytest.mark.parametrize(
+  "source_state",
+  [TaskState.INTERRUPTED, TaskState.PARKED],
+)
 def test_resume_abandoned_reconciles_append_failure_after_fsync(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
+  source_state: TaskState,
 ) -> None:
   async def _case() -> None:
     runner = _runner(tmp_path)
@@ -5330,6 +5357,7 @@ def test_resume_abandoned_reconciles_append_failure_after_fsync(
       agent_name="email-responder",
       user_message="Reconcile fsync resume abandonment.",
       resumable=False,
+      parked_state=source_state,
     )
     entry = runner._task_registry.get("bg_fsync_finalize")
     assert entry is not None
@@ -5717,7 +5745,7 @@ def test_resume_handler_adopts_old_interrupted_task_before_abandonment(
     assert adopted.state == TaskState.FAILED
     newer_entry = runner._task_registry.get("bg_2")
     assert isinstance(newer_entry, TaskEntry)
-    assert newer_entry.state == TaskState.INTERRUPTED
+    assert newer_entry.state == TaskState.PARKED
 
   _run(_case())
 
@@ -6339,7 +6367,107 @@ def test_resume_handler_uses_exact_admitted_prompt_after_skill_source_changes(
     )
     assert "max_turns" not in captured
     assert "max_budget_usd" not in captured
-    assert captured["dispatcher"]._should_avoid_permission_prompts is True
+
+  _run(_case())
+
+
+def test_revive_before_first_model_turn_starts_from_admitted_objective(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  # Live leg C1 (docs/qa/host-admit-hops-dc2-dc7-live-2026-10-09.md): a child
+  # killed between task_registered and its first user_message, then revived.
+  objective = "Read the PCTY 10-K risk factors for 2019 through 2026."
+  started = "Reading the PCTY 10-K risk factors."
+  refused = "I can't resume this task because I don't have the original objective."
+  requests: list[list[dict[str, Any]]] = []
+
+  class _Provider(_ResumeTestProvider):
+    name = "anthropic"
+
+    def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
+      requests.append(copy.deepcopy(kwargs["messages"]))
+      return {"told": json.dumps(kwargs["messages"])}
+
+    async def stream(self, client: Any, params: dict[str, Any]):
+      # Mirrors the live child: with no objective it declines the work.
+      text = started if objective in params["told"] else refused
+      yield StreamEvent(type="message_start", input_tokens=10)
+      yield StreamEvent(type="text_delta", text=text)
+      yield StreamEvent(
+        type="text_end", raw_block={"type": "text", "text": text},
+      )
+      yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+  provider = _Provider()
+  resolver_factory = stub_capability_execution_resolver
+
+  def _resolver_factory(*args: Any, **kwargs: Any):
+    delegate = resolver_factory(*args, **kwargs)
+
+    class _Resolver:
+      def authorize_bind(self, bind: CapabilityBind):
+        return delegate.authorize_bind(bind)
+
+      def materialize_bind(self, bind: CapabilityBind):
+        return replace(delegate.materialize_bind(bind), adapter=provider)
+
+    return _Resolver()
+
+  monkeypatch.setitem(globals(), "stub_capability_execution_resolver", _resolver_factory)
+
+  async def _case() -> None:
+    runner = _runner(tmp_path)
+    await _append_interrupted_skill_task(
+      runner,
+      task_id="bg_unstarted",
+      agent_name="earnings-review",
+      user_message=objective,
+      capability_bind_receipt=_bind_receipt(effort="none"),
+      first_message_logged=False,
+    )
+    log = runner._agent_session_log
+    assert log is not None
+    assert await sub_agent_module.reconstruct_messages_for_task(
+      log, "bg_unstarted",
+    ) == []
+    handler = make_resume_handler(
+      [runner],
+      operation_resume_bindings=None,
+      mcp_client=_NullMcpClient(),
+      excluded_tools_resolver=frozenset,
+    )
+
+    result, error = await handler({"task_id": "bg_unstarted"})
+
+    assert error is None and result is not None
+    successor = runner._task_registry.get(result["task_id"])
+    assert successor is not None
+    assert isinstance(successor.asyncio_task, asyncio.Task)
+    await successor.asyncio_task
+    assert requests, successor.error
+    assert successor.state == TaskState.COMPLETED
+    # The successor is told what the first attempt would have been told.
+    assert [
+      (message["role"], message["content"]) for message in requests[0]
+    ] == [(
+      "user",
+      context_text_with_run_binding(objective, ticker="PCTY", research_file_id=None),
+    )]
+    assert "Resume interrupted delegation" not in json.dumps(requests[0])
+    assert "Resume the admitted task" not in json.dumps(requests[0])
+    assert successor.admitted_task is not None
+    assert successor.admitted_task.objective == objective
+    # The settled result is the real attempt's, not a success for no work.
+    assistant_text, _ = await log.query(
+      event_types={"assistant_message"}, order="asc",
+    )
+    assert [
+      block["text"]
+      for entry in assistant_text
+      for block in entry.event["content_blocks"]
+      if block.get("type") == "text"
+    ] == [started]
 
   _run(_case())
 
@@ -6765,7 +6893,7 @@ def test_resume_ticker_owner_survives_two_exact_successor_hops(
     assert first_logical_task.delegation_id == logical_owner
 
     # A fresh process recovers the durably registered, incomplete first
-    # successor as interrupted. Its exact admission is the second-hop source.
+    # successor as parked. Its exact admission is the second-hop source.
     restarted = _runner(tmp_path)
     restarted._runner_id = "runner-test-restarted"
     second_resolver = _TestResumeCapabilityExecutionResolver()
@@ -6804,7 +6932,7 @@ def test_resume_ticker_owner_survives_two_exact_successor_hops(
     assert second_error is None and second is not None
     recovered_first = restarted._task_registry.get(first_entry.task_id)
     assert recovered_first is not None
-    assert recovered_first.state == TaskState.INTERRUPTED
+    assert recovered_first.state == TaskState.PARKED
     assert recovered_first.admitted_task is not None
     assert recovered_first.admitted_task.inputs == original_inputs
     second_entry = restarted._task_registry.get(second["task_id"])
@@ -8125,6 +8253,76 @@ def test_resume_retries_unstarted_registration_reservation(
   _run(_case())
 
 
+def test_approved_retry_owns_completion_callback_after_unstarted_reservation(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    session = GatewaySession(
+      session_id="settlement-host", api_key_hash="hash", created_at=10,
+      expires_at=20, user_id="alice", tenant_id="tenant-test",
+    )
+    runner, source, successor = await _trusted_workflow_resume_setup(
+      tmp_path, parked_state=TaskState.AWAITING_APPROVAL, session=session,
+      research_file_id=41, probe_name="fms_probe",
+    )
+    settled: list[TaskEntry] = []
+    first_completed: list[TaskEntry] = []
+    completed: list[TaskEntry] = []
+    attempts: list[str] = []
+
+    async def on_settled(entry: TaskEntry) -> None:
+      lease = try_acquire_research_file_activity(
+        tmp_path, research_file_id=41, exclusive=True,
+      )
+      assert lease is not None, "settlement ran before activity release"
+      lease.release()
+      settled.append(entry)
+
+    handler = make_resume_handler(
+      [runner], parent_session=session,
+      operation_resume_bindings=lambda admitted: OperationResumeBinding(
+        local_handler_scopes={"missing_stock": lambda stock: stock},
+        usage_aggregator=None, on_settled=on_settled,
+      ),
+      mcp_client=_NullMcpClient(),
+      local_tool_handlers={"fms_probe": lambda *args, **kwargs: pytest.fail("no tool executes")},
+      excluded_tools_resolver=frozenset,
+    )
+    assert isinstance(runner._dispatcher, ToolDispatcher)
+    runner._dispatcher._local["resume"] = handler
+    append = runner._append_durable_event
+
+    async def fail_first_append(event: dict[str, Any], **kwargs: Any):
+      if event.get("type") == "task_registered":
+        attempts.append(event["task_id"])
+        if len(attempts) == 1:
+          raise OSError("registration append unavailable")
+      return await append(event, **kwargs)
+
+    runner._append_durable_event = fail_first_append
+    approved_call = ApprovedCallRef(source.task_id, "approved-call", "nonce")
+    with pytest.raises(OSError, match="registration append unavailable"):
+      await sub_agent_module.continue_approved_child(
+        runner, parked_task_id=source.task_id, approved_call=approved_call,
+        on_complete=first_completed.append, on_park=None,
+      )
+    reservation = runner._task_registry.get(successor.attempt.physical_task_id)
+    assert reservation is not None and reservation.asyncio_task is None
+    entry, error = await sub_agent_module.continue_approved_child(
+      runner, parked_task_id=source.task_id, approved_call=approved_call,
+      on_complete=completed.append, on_park=None,
+    )
+    assert error is None and entry is not None and entry is reservation
+    assert entry.asyncio_task is not None
+    await entry.asyncio_task
+    assert entry.state == TaskState.FAILED
+    assert settled == [entry]
+    assert completed == [entry]
+    assert first_completed == []
+
+  _run(_case())
+
+
 def test_supplied_successor_replay_precedes_credential_materialization(
   tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -8339,6 +8537,68 @@ def test_continue_approved_child_preserves_grant_and_replays_real_result(
       assert approved["is_error"]
     other = next(block for block in blocks if block["tool_use_id"] == "other-call")
     assert other == build_synthetic_tool_results(["other-call"])[0]
+
+  _run(_case())
+
+
+def test_continue_approved_child_projects_hook_extras_like_ordinary_tools(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  requests = _capture_approved_resume_requests(monkeypatch)
+
+  async def _case() -> None:
+    runner, source, _ = await _trusted_workflow_resume_setup(
+      tmp_path, parked_state=TaskState.AWAITING_APPROVAL,
+      receipt=_bind_receipt(effort="none"),
+    )
+    transcript = [{"role": "assistant", "content": [
+      {"type": "tool_use", "id": "approved-call", "name": "probe", "input": {}},
+      {"type": "tool_use", "id": "other-call", "name": "probe", "input": {}},
+    ]}]
+
+    async def _transcript(*args: Any):
+      return transcript
+
+    async def _mixed_extra_blocks(_ctx: Any) -> list[dict[str, Any]]:
+      return [
+        {"type": "text", "text": "visible citation map"},
+        {"type": "source_envelope", "_event_only": True, "data": "hidden from model"},
+      ]
+
+    async def _execute(dispatcher: ToolDispatcher, **kwargs: Any):
+      return await dispatcher.local_tool_handlers()["probe"]({})
+
+    monkeypatch.setattr(sub_agent_module, "reconstruct_messages_for_task", _transcript)
+    monkeypatch.setattr(ToolDispatcher, "execute_approved_binding", _execute)
+    runner._on_tool_result = _mixed_extra_blocks
+    entry, error = await sub_agent_module.continue_approved_child(
+      runner, parked_task_id=source.task_id,
+      approved_call=ApprovedCallRef(source.task_id, "approved-call", "approved-nonce"),
+      on_complete=lambda entry: None, on_park=None,
+    )
+    assert error is None and entry is not None and entry.asyncio_task is not None
+    await entry.asyncio_task
+    assert requests, entry.error
+    messages = requests[0]["messages"]
+    assert all(
+      not block.get("_event_only") and block.get("type") != "source_envelope"
+      for message in messages
+      if isinstance(message["content"], list)
+      for block in message["content"]
+    )
+    results_message = next(
+      message["content"] for message in messages
+      if isinstance(message["content"], list)
+      and any(block.get("tool_use_id") == "approved-call" for block in message["content"])
+    )
+    assert [
+      (block["type"], block.get("tool_use_id"), block.get("text"))
+      for block in results_message
+    ] == [
+      ("tool_result", "approved-call", None),
+      ("tool_result", "other-call", None),
+      ("text", None, "visible citation map"),
+    ]
 
   _run(_case())
 

@@ -17,6 +17,7 @@ import pytest
 import agent_gateway.runner as gateway_runner
 import agent_gateway.server as gateway_server
 import agent_gateway.server_chat_helpers as chat_helpers
+import agent_gateway.server_models as server_models
 from agent_gateway.event_log import EventLog
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.providers import AnthropicProvider, OpenAIProvider
@@ -27,7 +28,7 @@ from agent_gateway.runner_auth import merge_refreshed_auth_config
 from agent_gateway.sdk_runner import AgentSDKRunner
 from agent_gateway.server import ChatRuntime
 from agent_gateway.session import SessionStream
-from agent_gateway.tool_dispatcher import ToolDispatcher
+from agent_gateway.tool_dispatcher import ToolDispatcher, _SpawningTurn
 from agent_gateway.runner_tool_audit import redact_tool_input_for_event
 from agent_gateway.tool_dispatch_classification import (
   ToolResultSettlement,
@@ -467,7 +468,7 @@ class _HangingDispatcher:
     allow_uncertain_mcp_replay: bool = True,
     on_executed_prepared_call: Any | None = None,
     abort_event: asyncio.Event | None = None,
-  ):
+  ) -> tuple[Any, dict[str, Any] | None]:
     _ = tool_call_id, tool_name, tool_input, call_index
     self.dispatch_calls += 1
     if abort_event is not None:
@@ -480,10 +481,14 @@ class _HangingDispatcher:
       self.cancelled_calls += 1
       await asyncio.sleep(self.cancel_delay)
       raise
+    raise AssertionError("a never-resolved future cannot complete")
 
   def requires_approval(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
     _ = tool_name, tool_input
     return False
+
+  def capture_spawning_turn(self) -> _SpawningTurn:
+    return _SpawningTurn(context=None, root_turn=None)
 
   @staticmethod
   def redact_prepared_tool_input(
@@ -628,7 +633,10 @@ def test_close_client_handles_real_openai_contract() -> None:
   _run(case())
 
 
-def test_disconnect_cleanup_removes_subscriber_without_cancelling_turn(make_test_app) -> None:
+def test_disconnect_cleanup_removes_subscriber_without_cancelling_turn(
+  make_test_app, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(server_models, "_ACTIVE_TURN_GRACE_SECONDS", 0.5)
   async def case() -> None:
     provider = _HangingProvider()
     app = make_test_app(provider=provider, runner_class=_ObservedAgentRunner)
@@ -645,21 +653,73 @@ def test_disconnect_cleanup_removes_subscriber_without_cancelling_turn(make_test
         json=_chat_payload(),
       ) as response:
         assert response.status_code == 200
-        first_event = await _read_sse_event(response)
+        lines = response.aiter_lines()
+        async for line in lines:
+          if line.startswith("data: "):
+            first_event = _unwrap_sse_payload(json.loads(line[6:]))
+            break
+        else:
+          raise AssertionError("Expected first SSE event")
         assert first_event["type"] == "text_delta"
+        result_queue: asyncio.Queue = asyncio.Queue()
+        session.result_queue = result_queue
+        session.pending_tools["pending-client-tool"] = {
+          "status": "pending",
+          "nonce": "client-tool-nonce",
+        }
 
       elapsed = await _wait_for(
         lambda: session.active_turn is not None
         and session.active_turn.subscribers == {}
         and session.active_turn.is_running,
         timeout=1.0,
+        interval=0.001,
       )
 
       assert elapsed < 1.0
+      assert session.active_turn.client_disconnect_handle is not None
       assert session.stream_active is True
       assert app.state.test_state.disconnect_hook_calls == 0
       assert getattr(app.state.test_state.runner, "cancelled_calls", 0) == 0
       assert provider.close_calls == 0
+      assert session.result_queue is result_queue
+      assert session.pending_tools["pending-client-tool"]["status"] == "pending"
+      assert result_queue.empty()
+      async with client.stream(
+        "GET",
+        f"/api/chat/subscribe?session_id={session_info['session_id']}&after_seq=0",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+      ) as subscriber_response:
+        assert subscriber_response.status_code == 200
+        subscriber_lines = subscriber_response.aiter_lines()
+        async for line in subscriber_lines:
+          if line.startswith("data: "):
+            break
+        else:
+          raise AssertionError("Expected resumed SSE event")
+        assert session.active_turn.subscribers
+        assert session.active_turn.client_disconnect_handle is None
+        await asyncio.sleep(0.6)
+        assert session.pending_tools["pending-client-tool"]["status"] == "pending"
+        assert session.active_turn.client_disconnect_handle is None
+        assert session.active_turn.subscribers
+        assert result_queue.empty()
+        tool_response = await client.post(
+          "/api/chat/tool-result",
+          headers={"Authorization": f"Bearer {session_info['session_token']}"},
+          json={
+            "tool_call_id": "pending-client-tool",
+            "nonce": "client-tool-nonce",
+            "result": {"value": "completed-after-reconnect"},
+          },
+        )
+        assert tool_response.status_code == 200
+        assert tool_response.json() == {"status": "ok"}
+        assert result_queue.get_nowait() == {
+          "result": {"value": "completed-after-reconnect"},
+          "error": None,
+        }
+        assert result_queue.empty()
 
       await _expire_session_and_shutdown_bus(app, session_info["session_id"])
       assert app.state.test_state.disconnect_hook_calls == 1
@@ -697,21 +757,157 @@ def test_chat_cancel_endpoint_cancels_backend_turn(make_test_app) -> None:
         and session.active_turn.is_running,
         timeout=1.0,
       )
+      runtime = app.state.test_state.runtime
+      assert runtime is not None
+      disconnect_handler = runtime.disconnect_handler
+      assert disconnect_handler is not None
+      result_queue: asyncio.Queue = asyncio.Queue()
+      session.result_queue = result_queue
+      session.pending_tools["pending-client-tool"] = {
+        "status": "pending",
+        "nonce": "client-tool-nonce",
+      }
+      disconnect_results: list[dict[str, Any]] = []
+
+      async def observe_disconnect() -> None:
+        assert session.result_queue is result_queue
+        assert "pending-client-tool" not in session.pending_tools
+        disconnect_results.append(result_queue.get_nowait())
+        assert result_queue.empty()
+        assert disconnect_results[0]["result"] is None
+        assert disconnect_results[0]["error"]["code"] == "caller_aborted"
+        await disconnect_handler()
+
+      runtime.disconnect_handler = observe_disconnect
 
       cancel_response = await client.post(
         "/api/chat/cancel",
         headers={"Authorization": f"Bearer {session_info['session_token']}"},
         json={"session_id": session_info["session_id"]},
       )
-
       assert cancel_response.status_code == 200
-      assert cancel_response.json() == {"status": "cancelled", "session_id": session_info["session_id"]}
+      assert cancel_response.json() == {
+        "status": "cancelled", "session_id": session_info["session_id"],
+      }
       assert session.active_turn is None
+      assert len(disconnect_results) == 1
       assert session.stream_active is False
       assert app.state.test_state.disconnect_hook_calls == 1
       assert getattr(app.state.test_state.runner, "cancelled_calls", 0) == 1
       assert provider.close_calls >= 1
       await app.state.user_event_bus.shutdown()
+
+  _run(case())
+
+
+def test_disconnected_pending_client_call_settles_and_accepts_next_turn(
+  make_test_app, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(server_models, "_ACTIVE_TURN_GRACE_SECONDS", 0.05)
+
+  class _ClientCallProvider(_CompletingProvider):
+    def __init__(self) -> None:
+      super().__init__()
+      self.stream_calls = 0
+
+    async def stream(self, client: Any, params: dict[str, Any]):
+      self.stream_calls += 1
+      if self.stream_calls == 1:
+        async for event in _ToolCallProvider().stream(client, params):
+          yield event
+      else:
+        async for event in super().stream(client, params):
+          yield event
+
+  class _PendingClientDispatcher(_HangingDispatcher):
+    def __init__(self, session) -> None:
+      super().__init__(cancel_delay=0)
+      self.session = session
+      self.started = asyncio.Event()
+      self.outcome: dict[str, Any] | None = None
+
+    async def dispatch(
+      self, tool_call_id, tool_name, tool_input, **kwargs,
+    ) -> tuple[Any, dict[str, Any] | None]:
+      self.dispatch_calls += 1
+      self.session.pending_tools[tool_call_id] = {
+        "status": "pending", "nonce": "client-tool-nonce",
+      }
+      self.started.set()
+      outcome: dict[str, Any] = await self.session.result_queue.get()
+      self.outcome = outcome
+      return outcome["result"], outcome["error"]
+
+  async def case() -> None:
+    dispatchers: list[_PendingClientDispatcher] = []
+
+    def make_dispatcher(event_log, session_id, session):
+      dispatcher = _PendingClientDispatcher(session)
+      dispatchers.append(dispatcher)
+      return dispatcher
+
+    app = make_test_app(
+      provider=_ClientCallProvider(),
+      runner_class=_ObservedAgentRunner,
+      dispatcher=make_dispatcher,
+      tool_definitions=[{
+        "name": "hang_tool",
+        "description": "Wait for the pane result",
+        "input_schema": {"type": "object", "properties": {}},
+      }],
+    )
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      session = app.state.auth.session_store.get_session(session_info["session_id"])
+      assert session is not None
+      headers = {"Authorization": f"Bearer {session_info['session_token']}"}
+      async with client.stream("POST", "/api/chat", headers=headers, json=_chat_payload()) as response:
+        assert response.status_code == 200
+        # Keep the iterator alive until the explicit response close: the
+        # streaming test transport treats iterator finalization as disconnect.
+        lines = response.aiter_lines()
+        async for line in lines:
+          if line.startswith("data: "):
+            event = _unwrap_sse_payload(json.loads(line[6:]))
+            if event["type"] == "tool_call_start":
+              break
+        else:
+          raise AssertionError("Expected tool_call_start")
+        dispatcher = dispatchers[0]
+        await asyncio.wait_for(dispatcher.started.wait(), timeout=1.0)
+        active_turn = session.active_turn
+        assert active_turn is not None
+        assert active_turn.session is session
+        assert active_turn.subscribers
+        runner = app.state.test_state.runner
+        # A connected working pane has no call deadline, even past the
+        # reconnect window used only after the last subscriber leaves.
+        await asyncio.sleep(0.1)
+        assert dispatcher.outcome is None
+        assert session.pending_tools["tool_1"]["status"] == "pending"
+        assert active_turn.client_disconnect_handle is None
+        assert active_turn.is_running
+
+      assert active_turn.subscribers == {}
+      assert active_turn.client_disconnect_handle is not None or dispatcher.outcome is not None
+      await _wait_for(lambda: dispatcher.outcome is not None, timeout=1.0, interval=0.001)
+      await asyncio.wait_for(active_turn.settled.wait(), timeout=2.0)
+      assert dispatcher.outcome is not None
+      assert dispatcher.outcome["result"] is None
+      assert dispatcher.outcome["error"]["code"] == "pane_disconnected"
+      assert dispatcher.outcome["error"]["message"]
+      assert session.pending_tools == {}
+      assert session.result_queue.empty()
+      assert active_turn.event_log.has_terminal
+      assert not active_turn.is_running
+      assert session.stream_active is False
+      assert runner.cancelled_calls == 0
+
+      async with client.stream("POST", "/api/chat", headers=headers, json=_chat_payload()) as response:
+        assert response.status_code == 200, response.text
+        events = await _collect_sse_events(response)
+        assert any(event["type"] == "stream_complete" for event in events)
+      await _expire_session_and_shutdown_bus(app, session_info["session_id"])
 
   _run(case())
 
@@ -1454,6 +1650,65 @@ def test_subscribe_resume_cursor_replays_tail_through_terminal(make_test_app) ->
   _run(case())
 
 
+def test_subscribe_after_grace_clear_replays_completed_turn(make_test_app, monkeypatch: pytest.MonkeyPatch) -> None:
+  # A client whose idle read tripped during the quiet tail reconnects after the
+  # turn's grace clear (ETN :8253, 2026-10-13: turn 144 done 02:56:26Z, re-subscribe
+  # 02:57:42Z met 404). The finished log still replays through its terminal.
+  monkeypatch.setattr(chat_helpers, "_ACTIVE_TURN_GRACE_SECONDS", 0.05)
+  async def case() -> None:
+    app = make_test_app(provider=_CompletingProvider(text="done"))
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      session = app.state.auth.session_store.get_session(session_info["session_id"])
+      assert session is not None
+
+      async with client.stream(
+        "POST",
+        "/api/chat",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+        json=_chat_payload(),
+      ) as response:
+        assert response.status_code == 200
+        payloads = []
+        async for line in response.aiter_lines():
+          if line.startswith("data: "):
+            payloads.append(json.loads(line[6:]))
+      assert payloads[-1]["event"]["type"] == "stream_complete"
+      last_seq = payloads[-1]["seq"]
+
+      await _wait_for(lambda: session.active_turn is None, timeout=2.0)
+      assert session.last_completed_turn is not None
+
+      async with client.stream(
+        "GET",
+        f"/api/chat/subscribe?session_id={session_info['session_id']}&after_seq={last_seq - 1}",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+      ) as subscriber_response:
+        assert subscriber_response.status_code == 200
+        replayed = []
+        async for line in subscriber_response.aiter_lines():
+          if line.startswith("data: "):
+            replayed.append(json.loads(line[6:]))
+
+      assert [payload["seq"] for payload in replayed] == [last_seq]
+      assert replayed[-1]["event"]["type"] == "stream_complete"
+
+      # The next turn's attach drops the parked one.
+      async with client.stream(
+        "POST",
+        "/api/chat",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+        json=_chat_payload(),
+      ) as response:
+        assert response.status_code == 200
+        assert session.last_completed_turn is None
+        async for _line in response.aiter_lines():
+          pass
+
+  _run(case())
+
+
 def test_subscribe_persists_reconnected_tail_to_transcript(make_test_app, tmp_path: Path) -> None:
   async def case() -> None:
     provider = _ReleaseCompletingProvider(text="tail")
@@ -1633,12 +1888,24 @@ def test_merge_refreshed_auth_config_preserves_runtime_controls_and_normalizes()
   }
 
 
-def test_merge_refreshed_auth_config_rejects_selection_material() -> None:
-  with pytest.raises(ValueError, match="must not contain model selection"):
-    merge_refreshed_auth_config(
-      {"api_key": "old-key", "provider": "anthropic"},
-      {"api_key": "new-key", "model_key": "anthropic.claude-opus-5"},
-    )
+def test_merge_refreshed_auth_config_drops_selection_and_keeps_bound_values() -> None:
+  merged = merge_refreshed_auth_config(
+    {"api_key": "old-key", "provider": "anthropic", "max_tokens": 256},
+    {
+      "api_key": "new-key",
+      "model_key": "anthropic.claude-opus-5",
+      "provider": "openai",
+      "max_tokens": 9,
+    },
+  )
+
+  assert merged == {
+    "api_key": "new-key",
+    "auth_token": "",
+    "auth_mode": "api",
+    "provider": "anthropic",
+    "max_tokens": 256,
+  }
 
 
 def test_runner_apply_refreshed_auth_config_updates_request_and_runner_config() -> None:

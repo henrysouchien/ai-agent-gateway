@@ -16,19 +16,21 @@ from agent_gateway.commercial_contract import canonical_usage_payload_sha256
 from agent_gateway.multi_user.billing import SessionUsageSummary
 from agent_gateway.usage_outbox import CommercialUsageOutbox
 from agent_gateway.usage_reconciliation import CommercialUsageReconciliationTracker
-from agent_gateway.usage_shipper import (
+from hank_contracts.usage import (
   AcceptanceStatus,
   CommercialUsageBatchSender,
-  CommercialUsageReconciliationIngestClient,
-  CommercialUsageReconciliationShipper,
-  CommercialUsageIngestClient,
   CommercialUsagePermanentDeliveryError,
   CommercialUsageResponseError,
-  CommercialUsageShipper,
   CommercialUsageShipperConfig,
-  UsageAcceptance,
-  _signature_message,
   ReconciliationAcceptance,
+  UsageAcceptance,
+)
+from agent_gateway.usage_shipper import (
+  CommercialUsageIngestClient,
+  CommercialUsageReconciliationIngestClient,
+  CommercialUsageReconciliationShipper,
+  CommercialUsageShipper,
+  _signature_message,
 )
 
 

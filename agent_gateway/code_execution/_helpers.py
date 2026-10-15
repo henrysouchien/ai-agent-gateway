@@ -105,6 +105,17 @@ def _timeout_ms_input(
   )
 
 
+def _host_wait_ms_input(
+  tool_input: Dict[str, Any],
+  config: CodeExecutionConfig,
+) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
+  """The recorded host-wait operand: echoed on the result, never armed as a wait."""
+  default = config.default_host_wait_ms
+  if "host_wait_ms" not in tool_input and default is None:
+    return None, None
+  return _integer_input(tool_input, "host_wait_ms", default=0 if default is None else default)
+
+
 def _truncate_text(text: str, max_bytes: int) -> Tuple[str, bool]:
   encoded = text.encode("utf-8", errors="replace")
   if len(encoded) <= max_bytes:
@@ -581,6 +592,9 @@ async def code_execute(
   if error is not None:
     return None, error
   assert timeout_ms is not None
+  requested_host_wait_ms, error = _host_wait_ms_input(tool_input, cfg)
+  if error is not None:
+    return None, error
 
   work_dir_path = Path(session_work_dir or os.getcwd()).expanduser().resolve()
   try:
@@ -641,7 +655,12 @@ async def code_execute(
       "duration_ms": result.get("duration_ms"),
       "truncated": bool(result.get("truncated")) or truncated,
     }
-    for key in ("displays", "stdout_tail", "stderr_tail", "spill", "cancelled", "error", "protocol_error"):
+    if requested_host_wait_ms is not None:
+      output["requested_host_wait_ms"] = requested_host_wait_ms
+    for key in (
+      "compute_ms", "host_wait_ms", "displays", "stdout_tail", "stderr_tail", "spill", "cancelled", "error",
+      "protocol_error",
+    ):
       if key in result:
         output[key] = result[key]
     return output, None

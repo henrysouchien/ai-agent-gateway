@@ -18,6 +18,9 @@ from gateway_test_support.capability_execution_test_support import stub_capabili
 @pytest.fixture(autouse=True)
 def _read_routes(owner_session_host_policy: Any) -> None:
   owner_session_host_policy.get_local_tool_effect = lambda _name: "read"
+  owner_session_host_policy.get_read_capability = lambda name, _server: (
+    "web.read/v1" if name == "web_search" else None
+  )
 
 
 def _invoke(tmp_path: Path, resolver: _CapabilityResolver, **fields: Any):
@@ -117,7 +120,7 @@ def test_invalid_selection_input(tmp_path: Path, fields: dict[str, Any]) -> None
 
 
 @pytest.mark.parametrize("fields, refusal", [
-  ({"role": "deep"}, "capability_role_unknown"),
+  ({"role": "no-such-role"}, "capability_role_unknown"),
   ({"effort": "low"}, None),
 ])
 def test_packaged_policy_selection(

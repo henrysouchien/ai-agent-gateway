@@ -19,7 +19,9 @@ from agent_gateway.code_execution import CodeExecutionConfig, build_code_executi
 from agent_gateway.code_execution._frame_reader import FrameReader
 from agent_gateway.code_execution._backends._kernel import KernelBackend, KernelState
 from agent_gateway.code_execution._frame_codec import MAX_FRAME_BYTES, decode_frame
-from test_code_execution_bridge import FRED_SERIES, GET_FILINGS, _CODE_CALLABLE, _CaptureMcp, _bind, _filings_extractor, _policy
+from agent_gateway.event_log import EventLog
+from agent_gateway.session import SessionStream
+from test_code_execution_bridge import FRED_SERIES, GET_FILINGS, _CODE_CALLABLE, _CaptureMcp, _bind, _filings_extractor, _job_runner, _policy
 
 
 @contextlib.asynccontextmanager
@@ -177,9 +179,110 @@ def test_timeout_keeps_locals_and_each_cell_gets_a_fresh_budget(tmp_path: Path) 
       pid = backend.runtime.pid
       result = await backend.execute("import time\ntime.sleep(60)", str(tmp_path), timeout_ms=300)
       assert result["timed_out"] and result["return_code"] == 124
+      assert "[cell interrupted after 300 ms timeout; kernel state kept]" in result["stderr"]
+      assert 290 <= result["compute_ms"] < 5_000 and result["host_wait_ms"] == 0
       following = await backend.execute("print(saved)", str(tmp_path))
       assert following["stdout"] == "23\n" and following["return_code"] == 0
       assert backend.runtime.pid == pid
+
+  asyncio.run(run())
+
+
+def test_host_wait_longer_than_timeout_does_not_interrupt_the_cell(tmp_path: Path, _policy: Any) -> None:
+  async def run() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    config = CodeExecutionConfig(register_kernel=True, register_docker=False, register_subprocess=False, work_dir_root=str(tmp_path))
+    bundle = build_code_execution(session, config=config)
+    mcp = _CaptureMcp(delay_s=1.6, frame_reader=bundle.frame_reader)
+    dispatcher = _bind(bundle, mcp)
+    try:
+      # A warm interpreter keeps cold boot out of the 1000 ms compute window.
+      warm, error = await dispatcher.dispatch("cell-warm", "code_execute", {"host": "kernel", "code": "pass"})
+      assert error is None and warm is not None and warm["return_code"] == 0, error
+      result, error = await dispatcher.dispatch("cell-wait", "code_execute", {
+        "host": "kernel", "timeout_ms": 1000, "host_wait_ms": 2000,
+        "code": f"saved = 61\nfilings = hank.call({GET_FILINGS!r}, cik='0000320193')\nprint(filings['filings'][0]['form'])",
+      })
+      assert error is None and result is not None, error
+      assert result["timed_out"] is False and result["return_code"] == 0, result["stderr"]
+      assert result["stdout"] == "10-K\n"
+      assert result["host_wait_ms"] >= 1600
+      assert result["compute_ms"] < 1000
+      assert result["requested_host_wait_ms"] == 2000
+      state = session.code_execution_kernels["kernel"]
+      pid = state.pid
+      following, error = await dispatcher.dispatch("cell-after", "code_execute", {"host": "kernel", "code": "print(saved)"})
+      assert error is None and following is not None and following["stdout"] == "61\n"
+      assert following["host_wait_ms"] == 0 and "requested_host_wait_ms" not in following
+      assert state.pid == pid
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(run())
+
+
+def test_kernel_cell_bridge_operation_is_answered(tmp_path: Path, _policy: Any) -> None:
+  # A registered bridge op (here `wait`) reaches the bridge from a kernel cell
+  # and its reply comes back; the reader must not drop it as a stale frame.
+  async def run() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    runner = _job_runner()
+    session.active_turn = SessionStream(event_log=EventLog(), runner_task=None, runtime_owner=runner)
+    config = CodeExecutionConfig(register_kernel=True, register_docker=False, register_subprocess=False, work_dir_root=str(tmp_path))
+    bundle = build_code_execution(session, config=config, job_runner=lambda: runner)
+    dispatcher = _bind(bundle, _CaptureMcp(frame_reader=bundle.frame_reader))
+    try:
+      result, error = await asyncio.wait_for(dispatcher.dispatch("cell-wait-op", "code_execute", {
+        "host": "kernel",
+        "code": "import json\nprint(json.dumps(hank.wait(['bg_9'], timeout=0)))",
+      }), timeout=30)
+      assert error is None and result is not None, error
+      assert result["return_code"] == 0, result["stderr"]
+      assert json.loads(result["stdout"])["unknown"] == ["bg_9"]
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(run())
+
+
+def test_spawned_thread_host_call_does_not_pause_the_compute_deadline(tmp_path: Path, _policy: Any) -> None:
+  async def run() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    config = CodeExecutionConfig(register_kernel=True, register_docker=False, register_subprocess=False, work_dir_root=str(tmp_path))
+    bundle = build_code_execution(session, config=config)
+    mcp = _CaptureMcp(delay_s=2.0, frame_reader=bundle.frame_reader)
+    dispatcher = _bind(bundle, mcp)
+    thread_call = (
+      "import threading, time\nbox = {}\n"
+      f"worker = threading.Thread(target=lambda: box.update(filings=hank.call({GET_FILINGS!r}, cik='0000320193')))\n"
+      "worker.start()\n"
+    )
+    try:
+      # A warm interpreter keeps cold boot out of the 1000 ms compute window.
+      warm, error = await dispatcher.dispatch("cell-warm", "code_execute", {"host": "kernel", "code": "pass"})
+      assert error is None and warm is not None and warm["return_code"] == 0, error
+      result, error = await dispatcher.dispatch("cell-spin", "code_execute", {
+        "host": "kernel", "timeout_ms": 1000,
+        "code": thread_call + "end = time.monotonic() + 1.5\nwhile time.monotonic() < end:\n    pass\nworker.join()\nprint('finished')",
+      })
+      assert error is None and result is not None, error
+      assert result["timed_out"] is True and result["return_code"] == 124, result
+      assert "finished" not in result["stdout"]
+      assert result["compute_ms"] >= 1000
+      assert result["host_wait_ms"] == 0
+      assert mcp.calls == [(GET_FILINGS, {"cik": "0000320193"})]
+      # Reply routing for a spawned thread is unchanged; its wait is compute.
+      following, error = await dispatcher.dispatch("cell-join", "code_execute", {
+        "host": "kernel", "timeout_ms": 30_000,
+        "code": thread_call + "worker.join()\nprint(box['filings']['filings'][0]['form'])",
+      })
+      assert error is None and following is not None, error
+      assert following["timed_out"] is False and following["return_code"] == 0, following["stderr"]
+      assert following["stdout"] == "10-K\n"
+      assert following["host_wait_ms"] == 0
+      assert following["compute_ms"] >= 2000
+    finally:
+      await cleanup_code_execution(session)
 
   asyncio.run(run())
 

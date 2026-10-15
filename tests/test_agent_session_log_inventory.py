@@ -184,6 +184,35 @@ def test_v1_legacy_sidecarless_stream_fails_classification(
       allowed_stream_kinds=SUPPORTED_SESSION_LOG_STREAM_KINDS,
     )
 
+  skipped = enumerate_selected_agent_session_logs(
+    tmp_path / "sessions",
+    layout="v1",
+    trusted_product_id="hank",
+    allowed_product_ids=frozenset({"hank"}),
+    allowed_stream_kinds=SUPPORTED_SESSION_LOG_STREAM_KINDS,
+    strict_classification=False,
+  )
+  assert skipped == ()
+
+
+def test_filter_before_strict_excludes_unselected_product_before_validation(
+  tmp_path: Path,
+) -> None:
+  other = tmp_path / "sessions" / "analyst" / "agentsess_other.jsonl"
+  other.parent.mkdir(parents=True)
+  other.write_text("", encoding="utf-8")
+  other_meta = other.with_name(other.name.removesuffix(".jsonl") + ".meta.json")
+  other_meta.write_text(json.dumps({"product_id": "other_product", "schema_version": 999}))
+
+  selected = enumerate_selected_agent_session_logs(
+    tmp_path / "sessions",
+    layout="v1",
+    trusted_product_id="hank",
+    allowed_product_ids=frozenset({"hank"}),
+    allowed_stream_kinds=SUPPORTED_SESSION_LOG_STREAM_KINDS,
+    strict_classification=True,
+  )
+  assert selected == ()
 
 @pytest.mark.parametrize("field", ["tenant_id", "product_id"])
 def test_v2_rejects_wrong_trusted_tenant(tmp_path: Path, field: str) -> None:

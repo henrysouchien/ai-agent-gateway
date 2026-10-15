@@ -37,6 +37,7 @@ from agent_gateway.sub_agent_scope_receipt import (
 )
 from agent_gateway.skills import compile_agent_operation, generic_explore_profile
 from agent_gateway.tool_dispatch_declarations import (
+  ToolDispatchSemantics,
   build_tool_dispatch_declarations,
 )
 from agent_workflow_contracts import (
@@ -51,6 +52,10 @@ from agent_workflow_contracts import (
   sha256_digest,
 )
 from agent_workflow_contracts.models import CatalogToolEffect
+from agent_workflow_contracts.tool_registration import (
+  RegisteredToolIdentity,
+  VersionedPolicyRef,
+)
 
 
 _MCP_ROUTES = {
@@ -143,6 +148,115 @@ def _routed_catalog(
     mcp_client=mcp if mcp is not None else _Mcp(),
     effect_resolver=_effect,
   )
+
+
+_DECLARED_READ_CAPABILITY = {
+  "web_search": "web.read/v1",
+  "web_fetch": "web.read/v1",
+  "filings_search": "filings.read/v1",
+  "transcripts_search": "transcripts.read/v1",
+  "memory_read": "corpus.read/v1",
+  "fetch_financials": "market-data.read/v1",
+}
+
+
+@pytest.fixture(autouse=True)
+def declared_read_capabilities(monkeypatch: pytest.MonkeyPatch) -> None:
+  """The registration owner declares each read route's capability; the
+  gateway reads that declaration and keeps no per-tool list of its own."""
+  from agent_gateway import semantic_capability_routing
+
+  monkeypatch.setattr(
+    semantic_capability_routing,
+    "load_server_policy_module",
+    lambda: SimpleNamespace(
+      get_read_capability=lambda name, _server: _DECLARED_READ_CAPABILITY.get(name),
+    ),
+  )
+
+
+def _declared_semantics(
+  *,
+  outcome_id: str = "current_generic_non_error",
+  outcome_parameters: dict[str, object] | None = None,
+  source_id: str = "current_no_gateway_extraction",
+  source_parameters: dict[str, object] | None = None,
+) -> ToolDispatchSemantics:
+  return ToolDispatchSemantics(
+    idempotent=True,
+    outcome_policy=VersionedPolicyRef(
+      kind="outcome",
+      policy_id=outcome_id,
+      version="v1",
+      parameters=outcome_parameters or {},
+    ),
+    source_identity_policy=VersionedPolicyRef(
+      kind="source_identity",
+      policy_id=source_id,
+      version="v1",
+      parameters=source_parameters or {},
+    ),
+  )
+
+
+_SUCCESS_STATUS = {"field": "status", "values": ("success",)}
+_DECLARED_DISPATCH_SEMANTICS = {
+  RegisteredToolIdentity(
+    route_kind="local_handler",
+    logical_name="web_fetch",
+  ): _declared_semantics(
+    outcome_id="current-declared-status-equals",
+    outcome_parameters=_SUCCESS_STATUS,
+    source_id="web_fetch",
+  ),
+  RegisteredToolIdentity(
+    route_kind="mcp",
+    logical_server_id="research-corpus-mcp",
+    logical_name="filings_search",
+  ): _declared_semantics(
+    outcome_id="current-declared-status-equals",
+    outcome_parameters=_SUCCESS_STATUS,
+    source_id="search_hits",
+    source_parameters={"container": "hits", "default_source_kind": "filing"},
+  ),
+  RegisteredToolIdentity(
+    route_kind="mcp",
+    logical_server_id="research-corpus-mcp",
+    logical_name="transcripts_search",
+  ): _declared_semantics(
+    outcome_id="current-declared-status-equals",
+    outcome_parameters=_SUCCESS_STATUS,
+    source_id="search_hits",
+    source_parameters={
+      "container": "hits",
+      "default_source_kind": "transcript",
+    },
+  ),
+  RegisteredToolIdentity(
+    route_kind="mcp",
+    logical_server_id="market-data-mcp",
+    logical_name="fetch_financials",
+  ): _declared_semantics(
+    source_id="vendor_sources",
+    source_parameters={"provider": "fmp"},
+  ),
+}
+
+
+@pytest.fixture(autouse=True)
+def declared_dispatch_semantics(monkeypatch: pytest.MonkeyPatch) -> None:
+  """The registration owner declares each route's dispatch semantics; the
+  gateway reads that declaration and keeps no per-tool list of its own."""
+  from agent_gateway import tool_dispatch_declarations
+
+  monkeypatch.setattr(
+    tool_dispatch_declarations,
+    "load_server_policy_module",
+    lambda: SimpleNamespace(
+      get_dispatch_semantics_overrides=lambda: _DECLARED_DISPATCH_SEMANTICS,
+    ),
+  )
+  monkeypatch.setattr(tool_dispatch_declarations, "_CACHED_DECLARATIONS", None)
 
 
 @pytest.fixture

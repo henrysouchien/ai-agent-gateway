@@ -204,7 +204,11 @@ def _install_fake_spawn(monkeypatch) -> None:
   )
 
 
-def _make_app(turns: list[list[dict[str, Any]]] | None = None) -> FastAPI:
+def _make_app(
+  turns: list[list[dict[str, Any]]] | None = None,
+  *,
+  runtime_session_tokens: list[str | None] | None = None,
+) -> FastAPI:
   turns = turns if turns is not None else []
 
   async def _build_chat_runtime(
@@ -215,7 +219,9 @@ def _make_app(turns: list[list[dict[str, Any]]] | None = None) -> FastAPI:
     *,
     storage_root: Path | None = None,
   ) -> ChatRuntime:
-    _ = session, channel, auth_manager
+    _ = channel, auth_manager
+    if runtime_session_tokens is not None:
+      runtime_session_tokens.append(session.session_token)
     capability_execution = request.capability_execution
     assert capability_execution is not None
     return ChatRuntime(
@@ -317,6 +323,16 @@ def test_messages_openapi_keeps_typed_request_union() -> None:
   encoded = json.dumps(request_schema)
   assert "ChatContinuationRequest" in encoded
   assert "AutonomousRunMessageRequest" in encoded
+
+
+def test_control_chat_dispatch_carries_the_bearer_on_the_session_during_the_turn() -> None:
+  tokens: list[str | None] = []
+  app = _make_app(runtime_session_tokens=tokens)
+  with TestClient(app) as client:
+    control = _control_session(app, client, "alice")
+    dispatched = _dispatch_chat(client, control, "first")
+
+  assert tokens == [dispatched["chat_session_token"]]
 
 
 def test_chat_messages_continue_with_chat_session_token_and_full_transcript() -> None:

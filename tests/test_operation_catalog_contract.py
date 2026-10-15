@@ -61,7 +61,6 @@ def _policy_kwargs() -> dict[str, Any]:
     "state_class": "advisor-no-state",
     "persist_state": False,
     "resumable": False,
-    "resume_mcp_session_reset_ok": False,
     "state_dir": None,
     "mutation_mode": "read_only",
     "run_mode": "full",

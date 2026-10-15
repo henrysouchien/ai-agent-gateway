@@ -187,6 +187,238 @@ def test_skill_result_event_treats_recoverable_fms_error_as_failure() -> None:
   assert event["error"] == "active research file is required"
 
 
+def _gate_door(**fields: Any) -> dict[str, Any]:
+  return {
+    "type": "tool_call_complete",
+    "tool_name": "fms_persist_scenario_set",
+    "result": {
+      "status": "staged",
+      "subcommand": "persist_scenario_set",
+      "mutation_mode": "model_writer",
+      **fields,
+    },
+  }
+
+
+def test_skill_result_event_reports_the_door_gate_code() -> None:
+  event = _event_for_entries([_gate_door(gate_code="INSUFFICIENT_DATA")])
+
+  assert event["gate_code"] == "INSUFFICIENT_DATA"
+
+
+def test_skill_result_event_does_not_read_a_gate_from_the_verdict_echo() -> None:
+  event = _event_for_entries([
+    _gate_door(verdict_echo={"verdict": "SCENARIOS_BUILT"}),
+  ])
+
+  assert event["gate_code"] is None
+  assert event["verdict_echo"] == {"verdict": "SCENARIOS_BUILT"}
+
+
+def test_skill_result_event_fails_at_the_owner_on_an_unknown_gate_code() -> None:
+  with pytest.raises(RuntimeError, match="gate_code must be one of"):
+    _event_for_entries([_gate_door(gate_code="SCENARIOS_BUILT")])
+
+
+_REFUSED_CONTEXT_DOOR = {
+  "type": "tool_call_complete",
+  "tool_name": "get_scenario_set_context",
+  "result": {
+    "status": "error",
+    "error": "research_file_id must be a positive integer",
+    "validation_error": True,
+  },
+}
+_ACCEPTED_TERMINAL_DOOR = {
+  "type": "tool_call_complete",
+  "tool_name": "fms_persist_scenario_set",
+  "result": {
+    "status": "staged",
+    "subcommand": "persist_scenario_set",
+    "mutation_mode": "model_writer",
+  },
+}
+
+
+def _event_for_entries(
+  entries: list[dict[str, Any]],
+  *,
+  declared_terminal_doors: tuple[str, ...] | None = None,
+  result: dict[str, Any] | None = None,
+  canonical_result_evidence_authoritative: bool = False,
+) -> dict[str, Any]:
+  event = build_skill_result_captured_event(
+    skill_run_id="skill-run-doors",
+    skill="test-skill",
+    ticker=None,
+    scope="portfolio",
+    portfolio_id=None,
+    entries=entries,
+    result=result if result is not None else _report_result(),
+    error=None,
+    declared_terminal_doors=declared_terminal_doors,
+    canonical_result_evidence_authoritative=canonical_result_evidence_authoritative,
+  )
+  assert event is not None
+  return event
+
+
+def test_skill_result_event_refused_context_door_is_not_success() -> None:
+  event = _event_for_entries([_REFUSED_CONTEXT_DOOR])
+
+  assert event["exit_code"] == 1
+  assert event["outcome"] == "error"
+  assert event["status"] == "blocked"
+  assert event["error"] == "research_file_id must be a positive integer"
+  assert event["last_failed_door_answer"]["tool_name"] == "get_scenario_set_context"
+
+
+def test_skill_result_event_accepted_terminal_door_supersedes_refused_context_door() -> None:
+  event = _event_for_entries([_REFUSED_CONTEXT_DOOR, _ACCEPTED_TERMINAL_DOOR])
+
+  assert event["exit_code"] == 0
+  assert event["outcome"] == "success"
+  assert event["status"] == "not_assessed"
+  assert event["error"] is None
+
+
+def test_skill_result_event_refused_context_door_after_accepted_terminal_door_is_not_success() -> None:
+  event = _event_for_entries([_ACCEPTED_TERMINAL_DOOR, _REFUSED_CONTEXT_DOOR])
+
+  assert event["exit_code"] == 1
+  assert event["status"] == "blocked"
+
+
+def test_skill_result_event_without_door_events_keeps_process_outcome() -> None:
+  event = _event_for_entries([
+    {"type": "tool_call_complete", "tool_name": "read_file", "result": {"status": "ok"}},
+  ])
+
+  assert event["exit_code"] == 0
+  assert event["outcome"] == "success"
+  assert event["error"] is None
+
+
+_DOCS_FETCH_ONLY = [
+  {"type": "tool_call_complete", "tool_name": "docs_fetch", "result": {"status": "ok"}},
+]
+_DECLARED = ("fms_persist_scenario_set",)
+
+
+def test_skill_result_event_declared_terminal_door_never_called_is_not_success() -> None:
+  event = _event_for_entries(_DOCS_FETCH_ONLY, declared_terminal_doors=_DECLARED)
+
+  assert event["exit_code"] == 1
+  assert event["outcome"] == "error"
+  assert event["status"] == "blocked"
+  assert event["artifact_refs"] == []
+  assert event["fms_results"] == []
+  assert event["error"] == (
+    "skill ended without an accepted terminal door result or artifact"
+  )
+
+
+def test_skill_result_event_declared_terminal_door_with_artifact_is_success() -> None:
+  event = _event_for_entries(
+    [
+      *_DOCS_FETCH_ONLY,
+      {"type": "artifact_ready", "artifact_ref": "artifacts/report.json"},
+    ],
+    declared_terminal_doors=_DECLARED,
+  )
+
+  assert event["exit_code"] == 0
+  assert event["outcome"] == "success"
+  assert event["artifact_refs"] == ["artifacts/report.json"]
+
+
+def test_skill_result_event_declared_terminal_door_accepted_is_success() -> None:
+  event = _event_for_entries(
+    [*_DOCS_FETCH_ONLY, _ACCEPTED_TERMINAL_DOOR],
+    declared_terminal_doors=_DECLARED,
+  )
+
+  assert event["exit_code"] == 0
+  assert event["outcome"] == "success"
+
+
+def test_skill_result_event_canonical_evidence_keeps_accepted_terminal_door() -> None:
+  # Canonical evidence replaces the terminal door list with its artifacts, so
+  # an accepted door answer in the entries must still count as persisted.
+  event = _event_for_entries(
+    [*_DOCS_FETCH_ONLY, _ACCEPTED_TERMINAL_DOOR],
+    declared_terminal_doors=_DECLARED,
+    canonical_result_evidence_authoritative=True,
+  )
+
+  assert event["exit_code"] == 0
+  assert event["outcome"] == "success"
+
+
+def test_skill_result_event_authoritative_path_accepted_door_supersedes_refusal() -> None:
+  # Durable settlement (canonical_result_evidence_authoritative=True) used to
+  # drop the entry-derived terminal doors, so a refused context door that a
+  # later accepted persist superseded still read blocked (audit P1 on
+  # ace98b0426). The doors that answered decide, on every path.
+  event = _event_for_entries(
+    [_REFUSED_CONTEXT_DOOR, _ACCEPTED_TERMINAL_DOOR],
+    canonical_result_evidence_authoritative=True,
+  )
+
+  assert event["exit_code"] == 0
+  assert event["outcome"] == "success"
+  assert event["error"] is None
+
+def test_skill_result_event_canonical_without_door_or_artifact_is_not_success() -> None:
+  event = _event_for_entries(
+    _DOCS_FETCH_ONLY,
+    declared_terminal_doors=_DECLARED,
+    canonical_result_evidence_authoritative=True,
+  )
+
+  assert event["exit_code"] == 1
+  assert event["status"] == "blocked"
+
+
+def test_skill_result_event_declared_door_other_than_called_one_is_not_persisted() -> None:
+  event = _event_for_entries(
+    [*_DOCS_FETCH_ONLY, _ACCEPTED_TERMINAL_DOOR],
+    declared_terminal_doors=("fms_persist_other_set",),
+  )
+
+  assert event["exit_code"] == 1
+  assert event["status"] == "blocked"
+
+
+def test_skill_result_event_without_declared_doors_keeps_process_outcome() -> None:
+  event = _event_for_entries(_DOCS_FETCH_ONLY)
+
+  assert event["exit_code"] == 0
+  assert event["outcome"] == "success"
+
+def test_skill_result_event_coordinator_calls_no_terminal_result_door_is_success() -> None:
+  # A coordinator (diligence-fanout shape) carries writer doors on its grant
+  # for its children, but its operation declares no terminal-result door of
+  # its own (terminal_result_doors == ()), so delegating and reading back a
+  # child's artifact is a success with nothing persisted by the coordinator.
+  entries = [
+    {
+      "type": "tool_call_complete",
+      "tool_name": "run_agent",
+      "result": {"status": "success"},
+    },
+    {
+      "type": "tool_call_complete",
+      "tool_name": "get_skill_artifact",
+      "result": {"status": "ok"},
+    },
+  ]
+  event = _event_for_entries(entries, declared_terminal_doors=())
+
+  assert event["exit_code"] == 0
+  assert event["outcome"] == "success"
+
+
 def test_skill_result_event_counts_compactions_from_single_pass_entries() -> None:
   event = build_skill_result_captured_event(
     skill_run_id="skill-run-1",

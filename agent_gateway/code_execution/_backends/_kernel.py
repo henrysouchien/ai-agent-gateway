@@ -23,7 +23,7 @@ from ...child_environment import CODE_EXECUTE_ENVIRONMENT, filter_child_environm
 
 from .._config import CodeExecutionConfig
 from .._frame_codec import CellBudget, MAX_CELL_BYTES, MAX_FRAME_BYTES, ProtocolError, decode_frame, encode_frame
-from .._frame_reader import CELL_TOKEN_ENV, _error_reply
+from .._frame_reader import CELL_TOKEN_ENV, REQUEST_FRAME_TYPES, _error_reply
 from .._helpers import (
   _collect_generated_images,
   _prepare_code_execute_env,
@@ -347,6 +347,7 @@ class KernelBackend(ExecutionBackend):
         return {
           "stdout": "", "stderr": "", "stdout_tail": "", "images": [], "displays": [],
           "return_code": 130, "cancelled": True, "timed_out": False, "truncated": False,
+          "host_wait_ms": 0, "compute_ms": 0,
           "duration_ms": int((time.monotonic() - started_at) * 1000),
         }
       work_dir = Path(handle.work_dir)
@@ -379,7 +380,9 @@ class KernelBackend(ExecutionBackend):
       started_ns = time.time_ns()
       try:
         if bridge is not None:
-          token = bridge.child_env()[CELL_TOKEN_ENV]
+          bridge_child_env = bridge.child_env()
+          token = bridge_child_env.get(CELL_TOKEN_ENV)
+          cell_env.update(bridge_child_env)
           bridge.activate()
           bridge.close_child_ends()
         else:
@@ -442,6 +445,40 @@ class KernelBackend(ExecutionBackend):
     protocol_error: str | None = None
     displays: list[Dict[str, Any]] = []
     images: list[Dict[str, Any]] = []
+    # Two clocks: `timeout_ms` bounds compute only. The runner brackets every
+    # bridge request made on the cell's own thread with host_wait_begin/
+    # host_wait_end (a spawned thread's call sends none, so it never pauses a
+    # computing interpreter); while any is open the compute deadline is paused,
+    # and the runner's `blocked_ms` sum is `host_wait_ms`. A host wait never
+    # times the cell out or interrupts it.
+    host_waits: set[str] = set()
+    host_wait_ms = 0
+    compute_s = 0.0
+    resumed_at: float | None = None
+    clock = asyncio.Event()
+
+    def pause_compute() -> None:
+      nonlocal compute_s, resumed_at
+      if resumed_at is not None:
+        compute_s += time.monotonic() - resumed_at
+        resumed_at = None
+      clock.set()
+
+    def resume_compute() -> None:
+      nonlocal resumed_at
+      if resumed_at is None and not host_waits:
+        resumed_at = time.monotonic()
+      clock.set()
+
+    def compute_remaining_s() -> float | None:
+      """Seconds of compute left; None while a host wait holds an unspent clock.
+
+      A pause never hides compute already spent: a begin frame read after the
+      deadline passed (a stalled loop) still times the cell out.
+      """
+      spent = compute_s + (time.monotonic() - resumed_at if resumed_at is not None else 0.0)
+      remaining = timeout_ms / 1000 - spent
+      return None if resumed_at is None and remaining > 0 else remaining
 
     def fail_protocol(message: str) -> None:
       nonlocal protocol_error
@@ -477,6 +514,7 @@ class KernelBackend(ExecutionBackend):
           raise _KernelLost("runner closed stdin") from None
 
     async def read_frames() -> Dict[str, Any]:
+      nonlocal host_wait_ms
       while True:
         try:
           line = await stdout.readline()
@@ -502,7 +540,7 @@ class KernelBackend(ExecutionBackend):
           except ProtocolError:
             continue
         kind = frame.get("type")
-        if kind in ("hello", "catalog", "tool_call"):
+        if kind in REQUEST_FRAME_TYPES:
           if protocol_error is None:
             requests.put_nowait(frame)
           continue
@@ -515,6 +553,17 @@ class KernelBackend(ExecutionBackend):
           if frame.get("protocol_error") or budget.error:
             fail_protocol(str(frame.get("protocol_error") or budget.error))
           return frame
+        if kind == "host_wait_begin":
+          host_waits.add(str(frame.get("call_id")))
+          pause_compute()
+          continue
+        if kind == "host_wait_end":
+          host_waits.discard(str(frame.get("call_id")))
+          blocked_ms = frame.get("blocked_ms")
+          if isinstance(blocked_ms, int):
+            host_wait_ms += blocked_ms
+          resume_compute()
+          continue
         if protocol_error is not None:
           continue
         if kind in ("stdout", "stderr") and isinstance(frame.get("text"), str):
@@ -528,15 +577,32 @@ class KernelBackend(ExecutionBackend):
     fault_task = asyncio.create_task(fault.wait())
     data["reader_task"] = reader_task
     timed_out = cancelled = False
+    compute_ms = 0
     done: Dict[str, Any] | None = None
     lost: str | None = None
     try:
       stdin.write(encode_frame(cell_frame, budget))
       await stdin.drain()
-      finished, _ = await asyncio.wait(
-        {reader_task, interrupt_task, fault_task, dispatch_task},
-        timeout=timeout_ms / 1000, return_when=asyncio.FIRST_COMPLETED,
-      )
+      # The deadline is rearmed on every host-wait transition: `clock` wakes
+      # this wait, and only unpaused elapsed time is spent from `timeout_ms`.
+      # An expired deadline still collects tasks that finished at that moment.
+      resume_compute()
+      while True:
+        remaining = compute_remaining_s()
+        clock.clear()
+        clock_task = asyncio.create_task(clock.wait())
+        try:
+          finished, _ = await asyncio.wait(
+            {reader_task, interrupt_task, fault_task, dispatch_task, clock_task},
+            timeout=None if remaining is None else max(remaining, 0.0), return_when=asyncio.FIRST_COMPLETED,
+          )
+        finally:
+          clock_task.cancel()
+        finished.discard(clock_task)
+        if finished or (remaining is not None and remaining <= 0):
+          break
+      pause_compute()
+      compute_ms = int(compute_s * 1000)
       if dispatch_task in finished:
         dispatch_task.result()
       if reader_task not in finished:
@@ -594,6 +660,7 @@ class KernelBackend(ExecutionBackend):
     result: Dict[str, Any] = {
       "return_code": return_code, "images": images, "displays": displays,
       "timed_out": timed_out, "cancelled": cancelled,
+      "host_wait_ms": host_wait_ms, "compute_ms": compute_ms,
     }
     if error is not None:
       result["error"] = error

@@ -5,6 +5,7 @@ import json
 import re
 from typing import Any
 
+from ..tool_result_compaction import make_error_result
 from .base import ModelInfo
 
 
@@ -249,12 +250,7 @@ def _synthetic_tool_result(tool_id: str, tool_name: str) -> dict[str, Any]:
   error_message = "No result provided"
   if tool_name:
     error_message = f"No result provided for tool {tool_name}"
-  return {
-    "type": "tool_result",
-    "tool_use_id": tool_id,
-    "content": json.dumps({"error": {"code": "missing_tool_result", "message": error_message}}),
-    "is_error": True,
-  }
+  return make_error_result(tool_id, "missing_tool_result", error_message)
 
 
 def _has_tool_result_block(message: dict[str, Any]) -> bool:

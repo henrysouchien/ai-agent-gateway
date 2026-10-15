@@ -10,16 +10,16 @@ are log lines: one ``admitted`` line and one line per unknown name.
 
 ``budget_share`` records observed remaining spend, including overruns and an
 unknown value; ``runner_soft_budget`` owns spend containment. Fresh spawns
-default to depth two (root 0 → lead 1 → worker 2); ``HANK_MAX_SPAWN_DEPTH``
-sets that resource bound and a negative value disables it. At the deepest
-tier the executable grant omits ``run_agent``; continuations retain their
-original grant and lineage without applying a fresh-spawn bound.
+default to depth two (root 0 → lead 1 → worker 2); the bound is
+``AdmissionOwners.containment.max_spawn_depth``, which ``ContainmentSettings``
+resolves from ``HANK_MAX_SPAWN_DEPTH``, and a negative value disables it. At
+the deepest tier the executable grant omits ``run_agent``; continuations retain
+their original grant and lineage without applying a fresh-spawn bound.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Generic, Literal, Protocol, TypeVar, cast, overload
@@ -32,12 +32,18 @@ from agent_workflow_contracts.models import (
   AdmittedLineage,
   AdmittedResearchBinding,
   AdmittedTenant,
+  SelectionPresetProvenance,
+  SelectionProvenance,
 )
 from model_authority.bind import CapabilityBind
 from pydantic import JsonValue
 from model_authority.selection import SelectionSnapshot
 
-from .capability_execution import BoundCapabilityExecution, CapabilityExecutionResolver
+from .capability_execution import (
+  BoundCapabilityExecution,
+  CapabilityExecutionResolver,
+  preset_selection_snapshot,
+)
 from .approval_route import (
   ApprovalRoute,
   DurableLocalApprovalRoute,
@@ -47,7 +53,9 @@ from .approval_route import (
   session_approval_route,
 )
 from .child_environment import CHILD_ENVIRONMENT_ALLOWLISTS
+from .containment_settings import ContainmentSettings
 from .policy_imports import require_inherited_role, role_denied_tools_for_session
+from .role_validation import require_exact_role
 from .session import session_owner_user_id
 from .sub_agent_helpers import RUN_AGENT_TOOL_NAME
 from .approval_store import SQLiteApprovalStore
@@ -62,6 +70,7 @@ RefusalReason = Literal[
   "invite_effect_not_allowed",
   "handle_not_granted",
   "binding_not_granted",
+  "binding_ambiguous",
   "depth_exceeded",
 ]
 Placement = Literal["in_process", "local_stub", "hosted_stub"]
@@ -87,7 +96,8 @@ class SpawnRequest:
   binding: AdmittedResearchBinding | None = None
   effort: str | None = None
   role: str | None = None
-  profile: str | None = None
+  # A published preset name that starts a new subtree scope (design §6.4).
+  model_preset: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +148,8 @@ class ParentContext:
   depth: int
   approval_route: ApprovalRoute[object, object]
   selection_snapshot: SelectionSnapshot | None = None
+  # Provenance of this context's own bind; descendants inherit its preset.
+  selection_provenance: SelectionProvenance | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,8 +279,10 @@ def root_context(
   *,
   withheld_tools: frozenset[str],
   research_file_id: int | None,
+  ticker: str | None = None,
   remaining_usd: float | None = None,
   selection_snapshot: SelectionSnapshot | None = None,
+  selection_provenance: SelectionProvenance | None = None,
 ) -> ParentContext:
   """Capture a root turn after runtime setup; never re-root an admitted child."""
 
@@ -290,10 +304,14 @@ def root_context(
     job_id=getattr(session, "session_id", None),
     tool_ids=None,
     withheld_tools=withheld_tools,
-    research_binding=AdmittedResearchBinding(research_file_id=research_file_id),
+    research_binding=AdmittedResearchBinding(
+      research_file_id=research_file_id,
+      ticker=ticker,
+    ),
     approval_route=session_approval_route(session),
     remaining_usd=remaining_usd,
     selection_snapshot=selection_snapshot,
+    selection_provenance=selection_provenance,
   )
   if session is not None:
     capture_job_context(session, context)
@@ -310,6 +328,7 @@ def root_context_from_identity(
   approval_route: ApprovalRoute[object, object],
   remaining_usd: float | None = None,
   selection_snapshot: SelectionSnapshot | None = None,
+  selection_provenance: SelectionProvenance | None = None,
 ) -> ParentContext:
   """Mint from an authenticated edge's identity, live roster and control owner.
 
@@ -318,6 +337,10 @@ def root_context_from_identity(
   scope; the grant loop applies withheld tools to a supplied roster.
   """
 
+  # A root driver never requests a role, so a root always carries a provenance.
+  recorded = selection_provenance or SelectionProvenance(
+    role=None, role_source=None, effort_source=None, preset=None,
+  )
   return ParentContext(
     tenant=tenant,
     research_binding=research_binding,
@@ -330,6 +353,7 @@ def root_context_from_identity(
     depth=0,
     approval_route=approval_route,
     selection_snapshot=selection_snapshot,
+    selection_provenance=recorded,
   )
 
 
@@ -374,6 +398,25 @@ class OperationRegistration:
 
 
 @dataclass(frozen=True, slots=True)
+class AdmittedChildIdentity:
+  """The user an autonomous child runs as, from the authenticated launch edge.
+
+  ``admit`` binds it to the parent tenant (``user_id`` is the tenant's
+  ``storage_id``, ``role`` its exact role) and returns it on the admitted
+  context; the launch seals the child's session authority from it.
+  """
+
+  user_id: str
+  raw_user_id: str
+  user_email: str | None
+  user_slug: str | None
+  risk_user_id: int
+  user_aliases: tuple[str, ...]
+  identity_status: str
+  role: str
+
+
+@dataclass(frozen=True, slots=True)
 class AdmissionOwners:
   """The owner objects ``admit`` reads; nothing here is written."""
 
@@ -391,10 +434,15 @@ class AdmissionOwners:
   # ``child_environment`` purpose of its launch contract (``None``: the
   # backend launches no process, so nothing is projected).
   placement: Placement
+  # The process's containment bounds; ``_admit_spawn`` reads the spawn depth.
+  containment: ContainmentSettings
   env_contract: str | None = None
   env_names: frozenset[str] = frozenset()
   outputs: frozenset[str] = frozenset()
   frozen_bind: CapabilityBind | None = None
+  # The launch edge's user facts for an autonomous child (``None``: the child
+  # runs inside its parent's session identity).
+  identity: AdmittedChildIdentity | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -438,6 +486,7 @@ class AdmittedContext(Generic[_AuthorityT]):
   wire: AdmittedContextWire
   tool_authority: _AuthorityT
   approval_route: ApprovalRoute[object, object]
+  identity: AdmittedChildIdentity | None = None
 
 
 def context_for_child(
@@ -464,6 +513,7 @@ def context_for_child(
       if wire.selection_snapshot is not None
       else None
     ),
+    selection_provenance=wire.selection_provenance,
   )
 
 
@@ -542,7 +592,7 @@ def _admit_spawn(
   admission adds no refusal around it.
   """
 
-  max_spawn_depth = int(os.getenv("HANK_MAX_SPAWN_DEPTH", "2"))
+  max_spawn_depth = owners.containment.max_spawn_depth
   if max_spawn_depth >= 0 and parent.depth >= max_spawn_depth:
     return Refusal(
       reason="depth_exceeded",
@@ -558,6 +608,24 @@ def _admit_spawn(
       ),
     )
   child_depth = parent.depth + 1
+
+  identity = owners.identity
+  if identity is not None:
+    require_exact_role(identity.role)
+    tenant = parent.tenant
+    if (
+      tenant is None
+      or identity.user_id != tenant.storage_id
+      or identity.role != tenant.role
+    ):
+      return Refusal(
+        reason="tenant_mismatch",
+        owner="admission tenant",
+        detail=(
+          f"child identity {identity.user_id!r} ({identity.role}) is not the "
+          "parent tenant's owner"
+        ),
+      )
 
   registration = owners.operation
   if parent.children is not None and request.operation not in parent.children:
@@ -593,6 +661,24 @@ def _admit_spawn(
           f"parent's bound research file {parent_binding.research_file_id}"
         ),
       )
+    if (
+      parent_binding.research_file_id is not None
+      and requested_binding.research_file_id is None
+      and requested_binding.ticker is not None
+      and (
+        parent_binding.ticker is None
+        or requested_binding.ticker != parent_binding.ticker
+      )
+    ):
+      return Refusal(
+        reason="binding_ambiguous",
+        owner="admission research_binding",
+        detail=(
+          f"ticker-only child delegation requested for '{requested_binding.ticker}' "
+          f"under research-bound parent ({parent_binding.research_file_id}); "
+          "cross-issuer work requires explicit research_file_id or coverage-set authority"
+        ),
+      )
     research_binding = AdmittedResearchBinding(
       research_file_id=(
         requested_binding.research_file_id
@@ -605,23 +691,65 @@ def _admit_spawn(
         else parent_binding.ticker
       ),
     )
-  if request.profile is not None:
-    log.warning(
-      "admission ignored profile for %s: profile=%r",
-      request.operation,
-      request.profile,
-    )
 
+  # A frozen bind never reselects; an explicit preset scopes this subtree.
+  subtree_snapshot = (
+    preset_selection_snapshot(
+      owners.capability_execution_resolver.selection_policy, request.model_preset,
+    )
+    if owners.frozen_bind is None and request.model_preset is not None
+    else None
+  )
+  selection_snapshot = (
+    subtree_snapshot if subtree_snapshot is not None else parent.selection_snapshot
+  )
+  requested_role = request.role if request.role is not None else registration.role
+  requested_effort = request.effort if request.effort is not None else registration.effort
   capability_bind = (
     owners.frozen_bind
     if owners.frozen_bind is not None
     else owners.capability_execution_resolver.select_bind(
       registration.execution_class,
-      role=request.role if request.role is not None else registration.role,
-      effort=request.effort if request.effort is not None else registration.effort,
-      selection_snapshot=parent.selection_snapshot,
+      role=requested_role,
+      effort=requested_effort,
+      selection_snapshot=selection_snapshot,
     )
   )
+  if owners.frozen_bind is not None:
+    selection_provenance = None
+  else:
+    parent_provenance = parent.selection_provenance
+    effective_role = requested_role
+    if effective_role is None and parent_provenance is not None:
+      effective_role = parent_provenance.role
+    if effective_role is None and selection_snapshot is not None:
+      slot_defaults = selection_snapshot.frozen_slot(registration.execution_class)
+      if slot_defaults.default.kind == "tier" and slot_defaults.default.tier is not None:
+        effective_role = slot_defaults.default.tier
+    if effective_role is None:
+      effective_role = "default"
+    selection_provenance = SelectionProvenance(
+      role=effective_role,
+      role_source=(
+        "spawn" if request.role is not None
+        else "operation" if registration.role is not None
+        else (parent_provenance.role_source if parent_provenance is not None else None)
+      ),
+      effort_source=(
+        "spawn" if request.effort is not None
+        else "operation" if registration.effort is not None
+        else None
+      ),
+      preset=(
+        SelectionPresetProvenance(
+          name=request.model_preset,
+          scope="subtree",
+          policy_revision=subtree_snapshot.policy_revision,
+        )
+        if subtree_snapshot is not None and request.model_preset is not None
+        else parent_provenance.preset if parent_provenance is not None else None
+      ),
+    )
 
   children = registration.children
   role_denied = role_denied_tools_for_session(
@@ -668,10 +796,11 @@ def _admit_spawn(
     research_binding=research_binding,
     capability_bind=capability_bind,
     selection_snapshot=(
-      cast(dict[str, JsonValue], parent.selection_snapshot.to_json())
-      if parent.selection_snapshot is not None
+      cast(dict[str, JsonValue], selection_snapshot.to_json())
+      if selection_snapshot is not None
       else None
     ),
+    selection_provenance=selection_provenance,
     children=children,
     tool_grant=tuple(entry.tool_id for entry in tool_authority.grant.tools),
     withheld_tools=tuple(sorted(parent.withheld)),
@@ -687,7 +816,7 @@ def _admit_spawn(
     registration.name,
     context.model_dump_json(),
   )
-  return AdmittedContext(context, tool_authority, approval_route)
+  return AdmittedContext(context, tool_authority, approval_route, identity)
 
 
 def _admit_continuation(
@@ -843,6 +972,7 @@ def _environment_projection(
 
 
 __all__ = [
+  "AdmittedChildIdentity",
   "AdmittedContext",
   "AdmissionOwners",
   "ContinuationOwners",

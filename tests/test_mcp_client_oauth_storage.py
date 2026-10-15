@@ -15,7 +15,7 @@ if str(PKG_DIR) not in sys.path:
 
 import agent_gateway.mcp_client as mcp_client_module
 from agent_gateway.mcp_client import _JsonFileKeyValue
-from agent_gateway.mcp_client_oauth_storage import JsonFileKeyValue
+from agent_gateway.mcp_client_oauth_storage import JsonFileKeyValue, oauth_token_cache_path
 
 
 def _run(coro):
@@ -165,3 +165,28 @@ def test_parent_json_file_key_value_active_value_keeps_class_level_call_shape(
     "token": "a"
   }
   assert storage._active_value({"value": {"token": "a"}, "expires_at": 99.0}) is None
+
+
+def test_oauth_cache_partitions_by_credential_owner(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+  alice = oauth_token_cache_path(
+    tmp_path, "finance-cli", credential_principal="user", credential_owner="alice",
+  )
+  bob = oauth_token_cache_path(
+    tmp_path, "finance-cli", credential_principal="user", credential_owner="bob",
+  )
+  product_for_alice = oauth_token_cache_path(
+    tmp_path, "finance-cli", credential_principal="service", credential_owner="alice",
+  )
+  product_for_bob = oauth_token_cache_path(
+    tmp_path, "finance-cli", credential_principal="service", credential_owner="bob",
+  )
+  print(f"user alice: {alice}")
+  print(f"user bob: {bob}")
+  print(f"product: {product_for_alice}")
+  assert alice != bob
+  assert alice.parent != bob.parent
+  assert product_for_alice == product_for_bob
+  assert product_for_alice.parent != alice.parent
+  captured = capsys.readouterr()
+  assert "user alice:" in captured.out
+  assert "product:" in captured.out

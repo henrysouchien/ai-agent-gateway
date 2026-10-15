@@ -12,6 +12,7 @@ from agent_gateway.server import ChatTurnInputs
 from agent_gateway.server_chat_helpers import prepare_session_driver_turn
 from agent_gateway.server_models import ChatMessage
 from gateway_test_support.model_defaults import SESSION_DRIVER
+from model_authority.selection import project_capability_default
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -41,10 +42,12 @@ def test_custom_gateway_examples_consume_exact_session_driver_bind(
   assert init_response.status_code == 200
   assert init_response.json()["user_id"] == "demo-user"
 
-  policy = config.model_selection_policy.capabilities["session.driver"]
-  assert policy.default.model_key == SESSION_DRIVER.model_key
-  assert policy.default.effort == module["DEFAULT_EFFORT"]
-  entry = config.model_registry.require(policy.default.model_key)
+  projection = project_capability_default(
+    config.model_registry, config.model_selection_policy, "session.driver",
+  )
+  assert projection.model_key == SESSION_DRIVER.model_key
+  assert projection.effort == module["DEFAULT_EFFORT"]
+  entry = config.model_registry.require(projection.model_key or "")
   assert entry.provider == "anthropic"
   assert entry.upstream_model == module["DEFAULT_MODEL"]
   assert entry.adapter == "anthropic.messages"

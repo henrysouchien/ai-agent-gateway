@@ -1,6 +1,6 @@
 # 04 Code Execution
 
-This example enables the built-in `code_execute` and `code_execute_status` tools.
+This example enables the built-in `code_execute` tool.
 
 ## Prerequisites
 
@@ -61,5 +61,5 @@ curl -N http://127.0.0.1:8000/api/chat \
 
 - `code_execution=True` adds built-in code execution tools.
 - Foreground runs stream `tool_output_chunk` events as stdout and stderr arrive.
-- Background runs return a `task_id` that can be polled with `code_execute_status`.
+- Background runs return a `task_id`; the cell runs as a background job on the turn's task registry and its result is delivered like any background task result.
 - Docker is preferred for sandboxing; subprocess is the fallback for development environments.

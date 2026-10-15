@@ -30,6 +30,14 @@
       ],
       "title": "Capability Id"
     },
+    "credential_principal": {
+      "enum": [
+        "user",
+        "service"
+      ],
+      "title": "Credential Principal",
+      "type": "string"
+    },
     "environment": {
       "enum": [
         "dev",
@@ -119,6 +127,18 @@
       ],
       "title": "Reservation Id"
     },
+    "reserved_spend_microusd": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Reserved Spend Microusd"
+    },
     "retry_of_workflow_run_id": {
       "anyOf": [
         {
@@ -132,7 +152,7 @@
       "title": "Retry Of Workflow Run Id"
     },
     "schema_version": {
-      "const": 1,
+      "const": 3,
       "title": "Schema Version",
       "type": "integer"
     },
@@ -190,9 +210,11 @@
     "capability_id",
     "request_id",
     "session_id",
+    "credential_principal",
+    "reserved_spend_microusd",
     "iat",
     "exp"
   ],
-  "title": "CommercialWorkAuthorizationV1",
+  "title": "CommercialWorkAuthorizationV3",
   "type": "object"
 }

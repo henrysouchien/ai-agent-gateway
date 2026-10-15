@@ -7,6 +7,7 @@ from typing import Any
 from agent_gateway.agent_session_log import AgentSessionLog
 from agent_gateway.transcript import (
   child_run_segment_for_task,
+  detect_orphan_tool_uses,
   reconstruct_child_run_lineage,
   reconstruct_messages_for_task,
 )
@@ -182,6 +183,209 @@ def test_reconstruct_child_run_lineage_orders_two_hops_root_to_immediate(
       {"role": "user", "content": "root"},
       {"role": "user", "content": "first resume"},
       {"role": "user", "content": "second resume"},
+    ]
+
+  _run(_case())
+
+
+_FORK_ID = "learn-0123abcd"
+_FORK_RUNNER = "runner_383ea2cf81a24dbd9ef30e72c519b02a"
+_PARKED_TOOL_USES = [
+  {"type": "tool_use", "id": "call-fork-sibling", "name": "web_search", "input": {"query": "completed"}},
+  {"type": "tool_use", "id": "call-fork-approval", "name": "web_search", "input": {"query": "pending"}},
+  {"type": "tool_use", "id": "call-fork-unscheduled", "name": "web_search", "input": {"query": "later"}},
+]
+_SIBLING_RESULT = {
+  "type": "tool_result",
+  "tool_use_id": "call-fork-sibling",
+  "content": "{\"value\": \"completed evidence\"}",
+}
+
+
+def _writer(event: dict[str, Any], runner_id: str = _FORK_RUNNER) -> dict[str, Any]:
+  return {**event, "runner_id": runner_id, "role": "writer", "event_schema_version": 2}
+
+
+def _fork_attach(runner_id: str = _FORK_RUNNER) -> dict[str, Any]:
+  return _writer(
+    {"type": "attach", "gateway_session_id": _FORK_ID, "client_kind": "cron", "user_id": "fork-owner"},
+    runner_id,
+  )
+
+
+def _fork_registration(
+  task_id: str = _FORK_ID,
+  runner_id: str = _FORK_RUNNER,
+  original_task_id: str | None = None,
+) -> dict[str, Any]:
+  event: dict[str, Any] = {
+    "type": "task_registered",
+    "task_id": task_id,
+    "owner_runner_id": runner_id,
+    "owner_role": "writer",
+    "sub_agent_id": _FORK_ID,
+    "task_type": "agent",
+    "parent_session_id": _FORK_ID,
+  }
+  if original_task_id is not None:
+    event["original_task_id"] = original_task_id
+  return _writer(event, runner_id)
+
+
+async def _append_parked_fork_attempt(log: AgentSessionLog) -> None:
+  """Append the fork's parked run as the real runner journals it.
+
+  Payloads are the journal written by
+  test_fork_infrastructure.py::test_approval_park_preserves_fork_admission_usage_and_owner[clean],
+  trimmed of fields reconstruction does not read (usage, admitted-task metadata).
+  """
+  await log.append(_writer({
+    "type": "assistant_message",
+    "content_blocks": _PARKED_TOOL_USES,
+    "stop_reason": "tool_use",
+    "model": "claude-sonnet-5",
+    "provider": "anthropic",
+  }))
+  await log.append(_writer({
+    "type": "tool_call_start", "tool_call_id": "call-fork-sibling",
+    "tool_name": "web_search", "tool_input": {"query": "completed"},
+  }))
+  await log.append(_writer({
+    "type": "tool_call_complete", "tool_call_id": "call-fork-sibling",
+    "tool_name": "web_search", "result": {"value": "completed evidence"},
+    "error": None, "is_error": False,
+    "final_tool_result_blocks": [_SIBLING_RESULT],
+  }))
+  await log.append(_writer({
+    "type": "tool_call_start", "tool_call_id": "call-fork-approval",
+    "tool_name": "web_search", "tool_input": {"query": "pending"},
+  }))
+  await log.append(_writer({
+    "type": "stream_complete", "terminal_disposition": "awaiting_approval",
+    "job_id": _FORK_ID, "approval_id": "approval-fork",
+    "original_tool_call_id": "call-fork-approval",
+  }))
+  await log.append(_writer({"type": "detach", "reason": "awaiting_approval"}))
+  await log.append(_writer({
+    "type": "task_completed", "task_id": _FORK_ID,
+    "owner_runner_id": _FORK_RUNNER, "owner_role": "writer",
+    "sub_agent_id": _FORK_ID, "task_type": "background",
+    "final_state": "awaiting_approval",
+  }))
+
+
+_PARKED_TRANSCRIPT = [
+  {
+    "role": "assistant",
+    "content": _PARKED_TOOL_USES,
+    "model": "claude-sonnet-5",
+    "stop_reason": "tool_use",
+    "provider": "anthropic",
+  },
+  {"role": "user", "content": [_SIBLING_RESULT]},
+]
+
+
+def test_own_writer_fork_reconstructs_its_parked_attempt(tmp_path: Path) -> None:
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / f"{_FORK_ID}.jsonl")
+    await log.append(_fork_attach())
+    await log.append(_fork_registration())
+    await _append_parked_fork_attempt(log)
+
+    lineage = await reconstruct_child_run_lineage(log, _FORK_ID)
+    assert [segment.runner_id for segment in lineage] == [_FORK_RUNNER]
+    assert lineage[0].initial_context == ()
+    assert lineage[0].completion is not None
+    assert "task_completed" not in {entry.event["type"] for entry in lineage[0].entries}
+    transcript = await reconstruct_messages_for_task(log, _FORK_ID)
+    assert transcript == _PARKED_TRANSCRIPT
+    assert detect_orphan_tool_uses(transcript) == [
+      "call-fork-approval",
+      "call-fork-unscheduled",
+    ]
+
+  _run(_case())
+
+
+def test_own_writer_fork_includes_its_journaled_inherited_prefix(tmp_path: Path) -> None:
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / f"{_FORK_ID}.jsonl")
+    inherited_use = {"type": "tool_use", "id": "call-parent", "name": "web_search", "input": {"query": "seed"}}
+    inherited_result = {"type": "tool_result", "tool_use_id": "call-parent", "content": "seed evidence"}
+    await log.append(_fork_attach())
+    await log.append(_writer({"type": "user_message", "content": "Prepare the admitted fork."}))
+    await log.append(_writer({"type": "assistant_message", "content_blocks": [inherited_use]}))
+    await log.append(_writer({"type": "user_message", "content": [inherited_result]}))
+    await log.append(_writer({
+      "type": "assistant_message",
+      "content_blocks": [{"type": "text", "text": "Ready to fork."}],
+    }))
+    # Another runner's message before registration is not this fork's prefix.
+    await log.append(_writer({"type": "user_message", "content": "other runner"}, "runner-other"))
+    await log.append(_fork_registration())
+    await log.append(_writer({"type": "user_message", "content": "finish the side quest"}))
+    await _append_parked_fork_attempt(log)
+
+    assert await reconstruct_messages_for_task(log, _FORK_ID) == [
+      {"role": "user", "content": "Prepare the admitted fork."},
+      {"role": "assistant", "content": [inherited_use]},
+      {"role": "user", "content": [inherited_result]},
+      {"role": "assistant", "content": [{"type": "text", "text": "Ready to fork."}]},
+      {"role": "user", "content": "finish the side quest"},
+      *_PARKED_TRANSCRIPT,
+    ]
+
+  _run(_case())
+
+
+def test_own_writer_fork_lineage_spans_resume_attempts(tmp_path: Path) -> None:
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / f"{_FORK_ID}.jsonl")
+    await log.append(_fork_attach())
+    await log.append(_fork_registration())
+    await _append_parked_fork_attempt(log)
+    resumed = f"{_FORK_ID}_r1"
+    await log.append(_fork_attach("runner-resume"))
+    await log.append(_fork_registration(resumed, "runner-resume", original_task_id=_FORK_ID))
+    await log.append(_writer({"type": "user_message", "content": "Resume."}, "runner-resume"))
+
+    lineage = await reconstruct_child_run_lineage(log, resumed)
+    assert [(segment.task_id, segment.runner_id) for segment in lineage] == [
+      (_FORK_ID, _FORK_RUNNER),
+      (resumed, "runner-resume"),
+    ]
+    assert await reconstruct_messages_for_task(log, resumed) == [
+      *_PARKED_TRANSCRIPT,
+      {"role": "user", "content": "Resume."},
+    ]
+
+  _run(_case())
+
+
+def test_child_registered_by_parent_writer_ignores_parent_messages(tmp_path: Path) -> None:
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "parent-session.jsonl")
+    await log.append(_writer(
+      {"type": "attach", "gateway_session_id": "parent-session"},
+      "parent-runner",
+    ))
+    await log.append(_writer({"type": "user_message", "content": "parent turn"}, "parent-runner"))
+    await _append_child_run(
+      log,
+      task_id="bg_0",
+      sub_agent_id="sub0:parent-session",
+      runner_id="runner-child",
+      message="child directive",
+      complete=True,
+    )
+
+    segment = await child_run_segment_for_task(log, "bg_0")
+    assert segment is not None
+    assert segment.runner_id == "runner-child"
+    assert segment.initial_context == ()
+    assert await reconstruct_messages_for_task(log, "bg_0") == [
+      {"role": "user", "content": "child directive"}
     ]
 
   _run(_case())

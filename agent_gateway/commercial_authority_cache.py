@@ -7,61 +7,15 @@ from dataclasses import dataclass
 import json
 import time
 from threading import RLock
-from typing import Callable, Literal
+from typing import Callable
 from uuid import UUID
 
-from .commercial_claims import CommercialContextState
+from hank_contracts.commercial_authority import (
+  CommercialAuthorityInvalidation,
+  CommercialAuthoritySnapshot,
+)
+from hank_contracts.commercial_claims import CommercialContextState
 
-
-@dataclass(frozen=True)
-class CommercialAuthoritySnapshot:
-  context_id: UUID
-  active: bool
-  entitlement_revision: int
-  commercial_account_id: int | None
-  token_id: UUID | None
-
-  def __post_init__(self) -> None:
-    if type(self.context_id) is not UUID or (
-      self.token_id is not None and type(self.token_id) is not UUID
-    ):
-      raise ValueError("commercial authority UUID identity is invalid")
-    if type(self.active) is not bool:
-      raise ValueError("commercial authority active state must be boolean")
-    if type(self.entitlement_revision) is not int or self.entitlement_revision < 0:
-      raise ValueError("commercial authority revision cannot be negative")
-    if self.commercial_account_id is not None and (
-      type(self.commercial_account_id) is not int or self.commercial_account_id <= 0
-    ):
-      raise ValueError("commercial account identity must be positive")
-
-
-@dataclass(frozen=True)
-class CommercialAuthorityInvalidation:
-  kind: Literal["context", "token", "entitlement", "agreement", "emergency"]
-  commercial_account_id: int
-  entitlement_revision: int
-  context_id: UUID | None = None
-  token_id: UUID | None = None
-
-  def __post_init__(self) -> None:
-    if self.kind not in {"context", "token", "entitlement", "agreement", "emergency"}:
-      raise ValueError("commercial invalidation kind is invalid")
-    if (
-      self.context_id is not None and type(self.context_id) is not UUID
-    ) or (self.token_id is not None and type(self.token_id) is not UUID):
-      raise ValueError("commercial invalidation UUID identity is invalid")
-    if (
-      type(self.commercial_account_id) is not int
-      or type(self.entitlement_revision) is not int
-      or self.commercial_account_id <= 0
-      or self.entitlement_revision <= 0
-    ):
-      raise ValueError("commercial invalidation identity is invalid")
-    if self.kind == "context" and self.context_id is None:
-      raise ValueError("context invalidation requires context identity")
-    if self.kind == "token" and self.token_id is None:
-      raise ValueError("token invalidation requires token identity")
 
 
 @dataclass(frozen=True)
@@ -193,7 +147,5 @@ class CommercialAuthorityStateCache:
 
 
 __all__ = [
-  "CommercialAuthorityInvalidation",
-  "CommercialAuthoritySnapshot",
   "CommercialAuthorityStateCache",
 ]

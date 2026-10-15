@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 import json
 
 import pytest
@@ -10,6 +11,7 @@ from agent_gateway.raw_patch_authorization_store import (
   RawPatchAuthorizationError,
   claim,
   encode_reference,
+  get_prepared,
   release_claim,
 )
 
@@ -153,3 +155,76 @@ async def test_claim_excludes_approval_state_transition_until_finalization(
     conn.commit()
   transitioned = await store.transition_state(request.approval_id, "denied")
   assert transitioned.state == "denied"
+
+
+@pytest.mark.asyncio
+async def test_claim_accepts_an_approval_past_its_expires_at_but_not_a_changed_identity(
+  tmp_path,
+) -> None:
+  store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+  identity = {
+    "identity_source": "reviewed_change_binding",
+    "change_set_id": "reviewed-change:v1:" + "b" * 64,
+    "change_hash": "sha256:" + "c" * 64,
+    "base_vector_hash": "sha256:" + "d" * 64,
+    "reviewed_change_binding_digest": "sha256:" + "e" * 64,
+    "execution_semantics_digest": "sha256:" + "f" * 64,
+  }
+  request = build_approval_request(
+    tool_call_id="tool-call-late",
+    tool_name="apply_patch_ops",
+    tool_class="state_write",
+    tool_args_redacted={},
+    args_hash="args-hash",
+    run_context=RunContext(user_id="alice", request_id="request-late"),
+    approval_identity=identity,
+  )
+  prepared_payload = json.dumps(
+    {"schema_version": 1, "binding": {"change_set_id": identity["change_set_id"]}},
+    sort_keys=True,
+    separators=(",", ":"),
+    ensure_ascii=True,
+    allow_nan=False,
+  ).encode()
+  await store.create_raw_patch_authorization(request, prepared_payload=prepared_payload)
+  approved = await store.transition_state(
+    request.approval_id,
+    "approved",
+    expires_at=datetime(2000, 1, 1, tzinfo=UTC),
+    decider_id="alice",
+    decider_role="owner",
+  )
+  assert approved.expires_at is not None
+  assert approved.expires_at < datetime.now(UTC)
+  with store._connection() as conn:
+    prepared = get_prepared(conn, approval_id=request.approval_id)
+  assert prepared is not None
+  bound = {
+    "approval_id": approved.approval_id,
+    "approval_chain_id": approved.approval_chain_id,
+    "authorization_mode": approved.authorization_mode,
+    "grant_reference": approved.grant_reference,
+    "cache_reference": approved.cache_reference,
+    "user_id": approved.user_id,
+    "tool_name": approved.tool_name,
+    "args_hash": approved.args_hash,
+    "change_set_id": identity["change_set_id"],
+    "change_hash": identity["change_hash"],
+    "base_vector_hash": identity["base_vector_hash"],
+    "reviewed_change_binding_digest": identity["reviewed_change_binding_digest"],
+    "execution_semantics_digest": identity["execution_semantics_digest"],
+    "prepared_payload_digest": prepared.prepared_payload_digest,
+  }
+
+  with pytest.raises(RawPatchAuthorizationError, match="prepared patch identity changed"):
+    await store.claim_raw_patch_authorization(
+      **{**bound, "prepared_payload_digest": "sha256:" + "0" * 64},
+    )
+  with pytest.raises(RawPatchAuthorizationError, match="approval identity changed"):
+    await store.claim_raw_patch_authorization(
+      **{**bound, "change_hash": "sha256:" + "1" * 64},
+    )
+
+  claimed = await store.claim_raw_patch_authorization(**bound)
+  assert claimed.approval_id == approved.approval_id
+  assert claimed.prepared_payload_digest == prepared.prepared_payload_digest

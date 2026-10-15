@@ -48,7 +48,7 @@ def test_compute_recap_buckets_renderer_visible_events() -> None:
       "type": "artifact_ready",
       "artifact_id": "artifact-1",
       "skill": "earnings-scenarios",
-      "contract_name": "EarningsScenarios",
+      "contract_name": "earnings-scenarios",
       "ticker": "PCTY",
       "artifact_path": "artifacts/research/PCTY/earnings-scenarios.json",
       "ts": 2.0,
@@ -134,6 +134,38 @@ def test_compute_recap_buckets_renderer_visible_events() -> None:
   ]
   assert recap.failures[-1].detail == "kind=turns observed=152 threshold=100 grace_turns=2"
 
+def test_recap_keeps_every_produced_decision_source() -> None:
+  # Sources the dispatcher emits outside the human-ask path: a parked call
+  # decided through Continue, and an exact write whose arguments changed
+  # during authorization. The recap names each, never a timeout nothing
+  # produced, and building it at turn end never raises.
+  event_log = EventLog(session_id="session-park")
+  for call, outcome, source in (
+    ("call-approved", "approved", "durable_approved_binding"),
+    ("call-denied", "denied", "durable_approval_denied"),
+    ("call-replan", "approved", "planned_write_reinvocation_required"),
+    ("call-bm-resume", "approved", "prepared_business_model_resume"),
+  ):
+    event_log.append({
+      "type": "tool_approval_decided",
+      "tool_call_id": call,
+      "tool_name": "memory_write",
+      "outcome": outcome,
+      "decision_source": source,
+      "allow_tool_type_applied": False,
+      "ts": 1.0,
+    })
+
+  recap = compute_recap(event_log, session_id="session-park", started_at=0.0, trigger="turn_end")
+
+  assert [(a.tool_call_id, a.outcome, a.decision_source) for a in recap.approvals] == [
+    ("call-approved", "approved", "durable_approved_binding"),
+    ("call-denied", "denied", "durable_approval_denied"),
+    ("call-replan", "approved", "planned_write_reinvocation_required"),
+    ("call-bm-resume", "approved", "prepared_business_model_resume"),
+  ]
+
+
 
 def test_compute_recap_consumes_the_canonical_tool_error_fold() -> None:
   event_log = EventLog(session_id="session-fold")
@@ -181,6 +213,7 @@ def test_compute_recap_carries_the_run_counts_other_owners_report() -> None:
     "day_invocations": 3,
     "day_charged_microusd": 6_000_000,
   })
+  event_log.append({"type": "fork_measurements", "turns": 4, "suffix_tokens": 25000})
   for index, tool_name in enumerate(
     ["mcp__model-engine__model_scenario", "model_sensitivity", "get_quote"]
   ):
@@ -205,6 +238,8 @@ def test_compute_recap_carries_the_run_counts_other_owners_report() -> None:
     "retained_bytes": 9000,
     "day_invocations": 3,
     "day_charged_microusd": 6_000_000,
+    "turns": 4,
+    "suffix_tokens": 25000,
     "model_calls": 2,
   }
   assert event_from_dict(event_to_dict(recap)) == recap
@@ -216,6 +251,8 @@ def test_compute_recap_carries_the_run_counts_other_owners_report() -> None:
     "retained_bytes": 9000,
     "day_invocations": 3,
     "day_charged_microusd": 6_000_000,
+    "turns": 4,
+    "suffix_tokens": 25000,
   }
 
 
@@ -988,5 +1025,85 @@ def test_create_agent_usage_summary_populates_cached_usage_without_observer() ->
 
     assert recap_response.status_code == 200, recap_response.text
     assert recap_response.json()["usage"]["session_id"] == session_info["session_id"]
+
+  _run(case())
+
+
+def test_create_agent_recap_keeps_delegated_child_tree_total_while_row_summary_stays_root_only(
+  monkeypatch: Any,
+) -> None:
+  from dataclasses import replace
+  import agent_gateway.easy as easy_mod
+  from agent_gateway.multi_user.billing import UsageEvent, _UsageAggregator
+
+  row_summaries: list[SessionUsageSummary] = []
+  runner_holder: list[Any] = [None]
+  real_runner = easy_mod.AgentRunner
+
+  def _capturing_runner(*args: Any, **kwargs: Any):
+    runner = real_runner(*args, **kwargs)
+    runner_holder[0] = runner
+    return runner
+
+  monkeypatch.setattr(easy_mod, "AgentRunner", _capturing_runner)
+
+  async def _on_usage(event: UsageEvent) -> None:
+    runner = runner_holder[0]
+    assert runner is not None
+    child = _UsageAggregator(
+      user_id=event.user_id,
+      session_id=f"sub0:{event.session_id}",
+      request_id=event.request_id,
+      channel=event.channel,
+      parent=runner._aggregator,
+    )
+    await child.record(
+      replace(
+        event,
+        session_id=f"sub0:{event.session_id}",
+        input_tokens=100,
+      )
+    )
+
+  async def case() -> None:
+    app = create_agent(
+      "test",
+      provider=_UsageProvider(),
+      model_key="anthropic.claude-opus-5-5",
+      valid_api_keys={"gateway-key"},
+      jwt_secret="session-recap-create-agent-secret-0123456789",
+      on_usage=_on_usage,
+      on_session_summary=row_summaries.append,
+    )
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      session = app.state.auth.session_store.get_session(session_info["session_id"])
+      assert session is not None
+      session.model_entitled_capabilities = frozenset({"session.driver"})
+      session.model_entitled_keys = frozenset({"anthropic.claude-opus-5-5"})
+      session_info["session_token"] = app.state.auth.issue_token(session)
+      async with client.stream(
+        "POST",
+        "/api/chat",
+        headers=_headers(session_info),
+        json={"messages": [{"role": "user", "content": "hello"}], "user_id": "alice", "context": {}},
+      ) as response:
+        assert response.status_code == 200
+        async for _ in response.aiter_lines():
+          pass
+
+      recap_response = await client.post(
+        "/api/chat/recap",
+        headers=_headers(session_info),
+        json={"session_id": session_info["session_id"], "scope": "active_turn"},
+      )
+
+    assert len(row_summaries) == 1
+    assert row_summaries[0].input_tokens == 3
+    assert row_summaries[0].turns == 1
+    assert recap_response.status_code == 200, recap_response.text
+    recap_usage = recap_response.json()["usage"]
+    assert recap_usage["input_tokens"] == 103
+    assert recap_usage["turns"] == 2
 
   _run(case())

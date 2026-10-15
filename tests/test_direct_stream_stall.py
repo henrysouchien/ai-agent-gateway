@@ -154,6 +154,7 @@ async def _call_direct(
     capability_execution=execution,
     user_id="alice",
     on_usage=usage_events.append,
+    completion_record_root=None,
   )
 
 

@@ -254,6 +254,12 @@ def test_auth_exceptions_have_actionable_default_messages() -> None:
     ("401 Unauthorized: invalid api key", "auth"),
     ("403 PermissionDeniedError: billing quota exhausted", "billing"),
     ("insufficient_quota: exceeded your current quota", "billing"),
+    (
+      "Anthropic request rejected (stage=stream): status=400; provider_error=BadRequestError; "
+      "type=invalid_request_error; message=You have reached your specified API usage limits. "
+      "You will regain access on 2026-11-01 at 00:00 UTC.",
+      "billing",
+    ),
   ],
 )
 def test_provider_classifies_credential_refresh_failures(message: str, kind: str) -> None:
@@ -263,3 +269,16 @@ def test_provider_classifies_credential_refresh_failures(message: str, kind: str
   assert failure.provider == "anthropic"
   assert failure.kind == kind
   assert failure.retryable_with_new_credentials is True
+
+
+def test_anthropic_api_usage_limits_400_parses_regain_access_reset_timestamp() -> None:
+  msg = (
+    "Anthropic request rejected (stage=stream): status=400; provider_error=BadRequestError; "
+    "type=invalid_request_error; message=You have reached your specified API usage limits. "
+    "You will regain access on 2026-11-01 at 00:00 UTC."
+  )
+  failure = AnthropicProvider().classify_credential_failure(RuntimeError(msg))
+  assert failure is not None
+  assert failure.kind == "billing"
+  assert failure.status_code == 400
+  assert failure.reset_at == 1793491200.0

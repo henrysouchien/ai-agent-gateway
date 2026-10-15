@@ -30,7 +30,7 @@ from agent_gateway.package_info import (
 )
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 from agent_gateway.selected_content import SelectedContentAdmission
-from agent_gateway.investment_capability_claim import (
+from hank_contracts.investment_claims import (
   INVESTMENT_CAPABILITY_CLAIM_PRIVATE_KEY_ENV,
 )
 

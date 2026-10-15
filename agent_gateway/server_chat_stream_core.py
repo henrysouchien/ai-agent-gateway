@@ -10,6 +10,47 @@ from .events import DEFAULT_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
 from .product_config import gateway_product_id
 from .server_artifact_helpers import _json_dumps
 from .session import GatewaySession, SessionStream, StreamSubscriber
+from . import server_models
+
+
+def settle_pending_client_tools(session: GatewaySession, cause: str) -> None:
+  """Release waiting client calls on teardown or an expired reattach window."""
+  for tool_call_id, pending in list(session.pending_tools.items()):
+    if pending.get("status") == "pending":
+      session.pending_tools.pop(tool_call_id, None)
+      if session.result_queue is not None:
+        session.result_queue.put_nowait({
+          "result": None,
+          "error": {
+            "code": cause,
+            "message": f"The client tool call ended because of {cause}.",
+          },
+        })
+
+
+def cancel_client_disconnect(active_turn: SessionStream) -> None:
+  handle = active_turn.client_disconnect_handle
+  if handle is not None:
+    handle.cancel()
+    active_turn.client_disconnect_handle = None
+
+
+def schedule_client_disconnect(active_turn: SessionStream) -> None:
+  """Bound only an absent client's reattach window, never a connected call."""
+  session = active_turn.session
+  if (
+    not active_turn.subscribers
+    and active_turn.client_disconnect_handle is None
+    and session is not None
+    and any(pending.get("status") == "pending" for pending in session.pending_tools.values())
+  ):
+    def settle_disconnected_client() -> None:
+      active_turn.client_disconnect_handle = None
+      settle_pending_client_tools(session, "pane_disconnected")
+
+    active_turn.client_disconnect_handle = asyncio.get_running_loop().call_later(
+      server_models._ACTIVE_TURN_GRACE_SECONDS, settle_disconnected_client,
+    )
 
 
 def event_for_wire(
@@ -120,6 +161,7 @@ def register_stream_subscriber(
     client_label=client_label,
   )
   active_turn.subscribers[subscriber.subscriber_id] = subscriber
+  cancel_client_disconnect(active_turn)
   pump = default_pump_stream_subscriber if pump_stream_subscriber is None else pump_stream_subscriber
   subscriber.pump_task = task_factory(pump(active_turn, subscriber, subscriber.last_sent_seq))
   return subscriber
@@ -134,6 +176,8 @@ async def cleanup_stream_subscriber(
   subscriber = active_turn.subscribers.pop(subscriber_id, None)
   if subscriber is None:
     return
+  # Arm before the disconnect cancellation can interrupt pump cleanup.
+  schedule_client_disconnect(active_turn)
   pump_task = subscriber.pump_task
   if pump_task is not None and not pump_task.done():
     pump_task.cancel()

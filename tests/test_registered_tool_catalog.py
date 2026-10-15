@@ -368,6 +368,7 @@ def test_manager_binds_only_live_registered_routes_and_allows_offline_rows() -> 
   ({"hank/code-disposition": "pure_local", "hank/code-reason": "Local calculation"}, "pure_local", False),
   ({"hank/code-disposition": "tool_only", "hank/code-reason": "Warm cache"}, "tool_only", False),
   ({"hank/code-disposition": "artifact_composable", "hank/code-reason": "Writes artifact"}, "artifact_composable", False),
+  ({"hank/code-disposition": "write_composable", "hank/code-reason": "Ledgered write"}, "write_composable", False),
   ({"hank/code-disposition": "internal_only", "hank/code-reason": "Owner operation"}, "internal_only", False),
   ({"hank/code-disposition": "unclassified", "hank/code-reason": "Not reviewed"}, None, False),
   ({"hank/code-disposition": "unknown", "hank/code-reason": "Unknown review"}, None, True),

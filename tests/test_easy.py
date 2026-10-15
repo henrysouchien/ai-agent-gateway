@@ -28,9 +28,11 @@ from agent_gateway.tool_result_spill import SpillSink, TOOL_RESULT_READ_TOOL_DEF
 from agent_gateway.auth import AuthConfig, ResolverResult
 from agent_gateway._provider_utils import _resolve_provider
 from model_authority.binding import CapabilityResolutionError
-from agent_gateway.commercial_claims import VerifiedCommercialClaim
-from agent_gateway.commercial_work_authorization import VerifiedWorkAuthorization
-from agent_gateway.commercial_work_start import CommercialWorkStartContext
+from hank_contracts.commercial_claims import VerifiedCommercialClaim
+from hank_contracts.commercial_work import (
+  CommercialWorkStartContext,
+  VerifiedWorkAuthorization,
+)
 from agent_gateway.commercial_authority_cache import CommercialAuthorityStateCache
 from agent_gateway.commercial_authority_subscriber import CommercialAuthoritySubscriber
 from agent_gateway.providers import AnthropicProvider, CodexProvider, OpenAIProvider, XAIProvider
@@ -153,6 +155,26 @@ def _clear_credential_env(monkeypatch: pytest.MonkeyPatch):
   monkeypatch.delenv("XAI_API_KEY", raising=False)
 
 
+def _entitled_keys(
+  app,
+  capabilities: frozenset[str],
+) -> frozenset[str]:
+  """The model keys this test grants a session for the capabilities it exercises.
+
+  Stands in for the credential resolver's `model_entitled_keys`: an easy app
+  wires no resolver, so the real `/api/chat/init` grant would be empty (or the
+  caller's), never derived from the policy ceilings. The grant is the union of
+  the ceilings of the exercised capabilities, so it covers the cheap model the
+  remapped `node.explore`/`node.verify`/`node.choose` policy selects.
+  """
+  policy = app.state.gateway_config.model_selection_policy
+  return frozenset(
+    key
+    for capability_id in capabilities
+    for key in policy.capabilities[capability_id].allowed_model_keys
+  )
+
+
 def _create_session(
   app,
   *,
@@ -170,9 +192,7 @@ def _create_session(
       config.allow_service_credentials_for_interactive
     ),
     model_entitled_capabilities=model_entitled_capabilities,
-    model_entitled_keys=config.model_selection_policy.capabilities[
-      "session.driver"
-    ].allowed_model_keys,
+    model_entitled_keys=_entitled_keys(app, model_entitled_capabilities),
   )
   session.channel = channel
   return session
@@ -566,11 +586,13 @@ def test_create_agent_uses_explicit_api_key() -> None:
 
 
 @pytest.mark.parametrize("value", ["", "   "])
-def test_create_agent_blank_api_key_falls_back_to_env(value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_create_agent_blank_api_key_never_fills_from_ambient_env(value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+  # u9 ruling (2026-10-12): Anthropic material comes from args, auth_config or the
+  # gateway pool; a blank arg never falls through to ANTHROPIC_API_KEY.
   monkeypatch.setenv("ANTHROPIC_API_KEY", "env-key")
   app = create_agent("test", api_key=value)
   assert _service_auth_config(app)["auth_mode"] == "api"
-  assert _service_auth_config(app)["api_key"] == "env-key"
+  assert _service_auth_config(app)["api_key"] == ""
 
 
 def test_create_agent_uses_explicit_auth_token() -> None:
@@ -717,9 +739,7 @@ def test_create_agent_threads_request_metadata_to_runner() -> None:
       config.allow_service_credentials_for_interactive
     ),
     model_entitled_capabilities=frozenset({"session.driver"}),
-    model_entitled_keys=config.model_selection_policy.capabilities[
-      "session.driver"
-    ].allowed_model_keys,
+    model_entitled_keys=_entitled_keys(app, frozenset({"session.driver"})),
   )
   session.channel = "web"
   runtime, _prepared_request = _prepare_runtime_for_session(
@@ -766,9 +786,7 @@ def test_create_agent_runner_binds_session_whose_slug_differs_from_owner() -> No
       config.allow_service_credentials_for_interactive
     ),
     model_entitled_capabilities=frozenset({"session.driver"}),
-    model_entitled_keys=config.model_selection_policy.capabilities[
-      "session.driver"
-    ].allowed_model_keys,
+    model_entitled_keys=_entitled_keys(app, frozenset({"session.driver"})),
   )
   session.channel = "web"
   assert session.user_id == "alice"
@@ -1067,7 +1085,7 @@ def test_create_agent_inline_mcp_uses_inline_only_config_and_builtin_filtering(
   assert isinstance(mcp_client, McpClientManager)
   assert mcp_client._config_path is None
   assert mcp_client._inline_servers == {"filesystem": {"command": "npx", "args": ["-y", "server"]}}
-  assert mcp_client._builtin_tool_names >= {"local_tool", "code_execute", "code_execute_status"}
+  assert mcp_client._builtin_tool_names >= {"local_tool", "code_execute"}
 
 
 def test_create_agent_skills_dir_registers_run_agent_handler_tool_def_and_builtin_name(tmp_path: Path) -> None:
@@ -1475,12 +1493,11 @@ def test_create_agent_code_execution_wires_hooks_approval_and_expiry_cleanup(tmp
   session, runtime = _build_runtime(app)
   runner = runtime.build_runner(EventLog(), session.session_id)
 
-  assert {"code_execute", "code_execute_status", "tool_result_read"} <= set(
+  assert {"code_execute", "tool_result_read"} <= set(
     runner._dispatcher._local
   )
   assert {tool["name"] for tool in runtime.get_tool_definitions()} == {
     "code_execute",
-    "code_execute_status",
     "tool_result_read",
   }
   assert runner._dispatcher._request_approval is not None

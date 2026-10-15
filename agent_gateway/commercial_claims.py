@@ -4,101 +4,28 @@ from __future__ import annotations
 
 import base64
 import binascii
-from dataclasses import dataclass
 import json
 import re
 import time
-from typing import Callable, Mapping, TypeGuard
+from typing import Callable
 from uuid import UUID
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from cryptography.hazmat.primitives.serialization import load_pem_public_key
 import jwt
 
 
-COMMERCIAL_CLAIM_ALGORITHM = "EdDSA"
-COMMERCIAL_CLAIM_ISSUER = "risk-module-commercial-control"
-COMMERCIAL_CLAIM_AUDIENCE = "hank-agent-gateway"
-_STABLE_CODE = re.compile(r"^[a-z][a-z0-9._:-]{0,127}$")
+from hank_contracts.commercial_claims import (
+  CommercialClaimError as CommercialClaimError,
+  CommercialClaimTrustSnapshot as CommercialClaimTrustSnapshot,
+  VerifiedCommercialClaim as VerifiedCommercialClaim,
+  COMMERCIAL_CLAIM_ALGORITHM,
+  COMMERCIAL_CLAIM_ISSUER,
+  COMMERCIAL_CLAIM_AUDIENCE,
+  COMMERCIAL_CLAIM_REQUIRED_FIELDS as COMMERCIAL_CLAIM_REQUIRED_FIELDS,
+  _STABLE_CODE,
+  _load_ed25519_public_key,
+  _valid_version,
+)
 _SUBJECT = re.compile(r"^user:[1-9][0-9]*$")
-COMMERCIAL_CLAIM_REQUIRED_FIELDS = frozenset({
-  "schema_version", "kid", "iss", "aud", "sub", "environment", "surface",
-  "commercial_account_id", "agreement_id", "agreement_terms_revision",
-  "offer_code", "effective_scopes", "entitlement_revision", "payer_policy_version",
-  "budget_policy_version", "shadow_rate_version", "manifest_version",
-  "authorized_work_start_deadline", "usage_accept_until", "iat", "exp", "jti",
-})
-
-
-class CommercialClaimError(ValueError):
-  def __init__(self, code: str) -> None:
-    self.code = code
-    super().__init__(code)
-
-
-def _load_ed25519_public_key(pem: bytes) -> Ed25519PublicKey:
-  key = load_pem_public_key(pem)
-  if not isinstance(key, Ed25519PublicKey):
-    raise ValueError("commercial verification keys must be Ed25519")
-  return key
-
-
-@dataclass(frozen=True)
-class CommercialContextState:
-  active: bool
-  entitlement_revision: int
-
-
-@dataclass(frozen=True)
-class CommercialClaimTrustSnapshot:
-  public_keys_by_id: Mapping[str, bytes]
-  environment: str
-  manifest_versions: frozenset[str]
-  payer_policy_versions: frozenset[str]
-  budget_policy_versions: frozenset[str]
-  shadow_rate_versions: frozenset[str]
-  current_agreement_terms_revision: Callable[[UUID], int | None]
-  resolve_context_state: Callable[[UUID], CommercialContextState] | None = None
-
-  def __post_init__(self) -> None:
-    if self.environment not in {"dev", "staging", "prod"}:
-      raise ValueError("commercial trust environment is invalid")
-    if not self.public_keys_by_id:
-      raise ValueError("commercial trust snapshot requires verification keys")
-    for key_id, pem in self.public_keys_by_id.items():
-      if not _STABLE_CODE.fullmatch(key_id):
-        raise ValueError("commercial verification key id is invalid")
-      _load_ed25519_public_key(pem)
-    for versions in (
-      self.manifest_versions, self.payer_policy_versions,
-      self.budget_policy_versions, self.shadow_rate_versions,
-    ):
-      if not versions or any(not _valid_version(value) for value in versions):
-        raise ValueError("commercial trust versions must be non-empty bounded strings")
-
-
-@dataclass(frozen=True)
-class VerifiedCommercialClaim:
-  schema_version: int
-  key_id: str
-  subject: str
-  environment: str
-  surface: str
-  commercial_account_id: UUID
-  agreement_id: UUID
-  agreement_terms_revision: int
-  offer_code: str
-  effective_scopes: tuple[str, ...]
-  entitlement_revision: int
-  payer_policy_version: str
-  budget_policy_version: str
-  shadow_rate_version: str
-  manifest_version: str
-  authorized_work_start_deadline: int
-  usage_accept_until: int
-  issued_at: int
-  expires_at: int
-  context_id: UUID
 
 
 class CommercialClaimVerifier:
@@ -148,14 +75,6 @@ class CommercialClaimVerifier:
       raise CommercialClaimError("start_authority_expired")
     if claim.environment != self._trust.environment:
       raise CommercialClaimError("environment_mismatch")
-    if claim.manifest_version not in self._trust.manifest_versions:
-      raise CommercialClaimError("manifest_skew")
-    if claim.payer_policy_version not in self._trust.payer_policy_versions:
-      raise CommercialClaimError("unknown_payer_policy")
-    if claim.budget_policy_version not in self._trust.budget_policy_versions:
-      raise CommercialClaimError("unknown_budget_policy")
-    if claim.shadow_rate_version not in self._trust.shadow_rate_versions:
-      raise CommercialClaimError("unknown_rate_policy")
     current_terms_revision = self._trust.current_agreement_terms_revision(
       claim.agreement_id
     )
@@ -303,10 +222,6 @@ class CommercialClaimVerifier:
       usage_accept_until=usage_accept_until, issued_at=issued_at,
       expires_at=expires_at, context_id=context_id,
     )
-
-
-def _valid_version(value: object) -> TypeGuard[str]:
-  return isinstance(value, str) and 1 <= len(value) <= 256 and not value.isspace()
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict:

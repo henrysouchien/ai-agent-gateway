@@ -1,26 +1,31 @@
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
 import importlib
 from uuid import uuid4
 
 import pytest
 from model_authority.bind import CapabilityBind
 
-from agent_gateway.commercial_claims import VerifiedCommercialClaim
-from agent_gateway.commercial_work_authorization import VerifiedWorkAuthorization
-from agent_gateway.commercial_work_start import CommercialWorkStartContext
-from agent_gateway.commercial_contract import canonical_usage_payload_sha256
-from agent_gateway.commercial_usage import (
-  CommercialUsageLineage,
-  CommercialUsageProducer,
+from hank_contracts.commercial_claims import VerifiedCommercialClaim
+from hank_contracts.commercial_work import (
+  CommercialWorkStartContext,
+  VerifiedWorkAuthorization,
+  WorkStartSpendLedger,
 )
+from agent_gateway.commercial_contract import canonical_usage_payload_sha256
+from hank_contracts.usage import (
+  CommercialUsageLineage,
+  CommercialUsageOutboxError,
+  CommercialUsageCircuitOpen,
+)
+from agent_gateway.commercial_usage import CommercialUsageProducer
 from agent_gateway.multi_user.billing import SessionUsageSummary, UsageEvent
 from agent_gateway.usage_reconciliation import CommercialUsageReconciliationTracker
 from agent_gateway.runner_usage import call_usage_event_hook
 from agent_gateway.providers import CostEstimate, ModelInfo, ModelProvider, StreamEvent
-from agent_gateway.usage_outbox import CommercialUsageOutboxError
 from agent_gateway.usage_resilience import (
-  CommercialUsageCircuitOpen,
   CommercialUsageDurability,
 )
 from agent_gateway.work_authorization_consumption import (
@@ -229,6 +234,46 @@ async def test_producer_keeps_reported_model_distinct_from_exact_bind() -> None:
   assert payload["model"] == "claude-sonnet-test"
   assert payload["capability_bind"]["upstream_model"] == "claude-sonnet-test"
 
+
+@pytest.mark.asyncio
+async def test_producer_emits_schema_valid_selection_provenance() -> None:
+  provenance = {
+    "role": "fast",
+    "role_source": None,
+    "effort_source": None,
+    "preset": {
+      "name": "desk-default",
+      "scope": "user",
+      "policy_revision": "test-v1",
+    },
+    "fallback": {
+      "primary_model_key": "anthropic.claude-sonnet-test",
+      "role": "fast",
+      "chain_index": 0,
+      "reason": "usage_limit",
+    },
+  }
+  producer = CommercialUsageProducer(
+    enabled=True, claim=_claim(), lineage=_lineage(), sink=lambda _events: "outbox"
+  )
+  payload = await producer.emit(_event(selection_provenance=provenance))
+
+  assert payload is not None
+  assert payload["selection_provenance"] == provenance
+  denied = {**provenance, "fallback": {**provenance["fallback"], "reason": "credential_denied"}}
+  denied_payload = await producer.emit(_event(selection_provenance=denied, event_id="evt_002"))
+  assert denied_payload is not None
+  assert denied_payload["selection_provenance"]["fallback"]["reason"] == "credential_denied"
+
+@pytest.mark.asyncio
+async def test_producer_omits_absent_selection_provenance() -> None:
+  producer = CommercialUsageProducer(
+    enabled=True, claim=_claim(), lineage=_lineage(), sink=lambda _events: "outbox"
+  )
+  payload = await producer.emit(_event())
+
+  assert payload is not None
+  assert "selection_provenance" not in payload
 
 @pytest.mark.asyncio
 async def test_producer_bills_the_bind_when_lineage_capability_differs() -> None:
@@ -751,6 +796,7 @@ async def test_send_prompt_real_producer_emits_metered_canonical_identity() -> N
     request_id="req-1",
     rate_table_version="rates-v1", billing_mode="metered", channel="mcp",
     commercial_usage_producer=producer,
+    completion_record_root=None,
   )
 
   assert len(emitted) == 3
@@ -764,3 +810,163 @@ async def test_send_prompt_real_producer_emits_metered_canonical_identity() -> N
   assert len({event["source_event_id"] for event in emitted}) == 3
   assert all(event["cost_observation_kind"] == "unknown" for event in emitted[1:])
   assert all(event["producer_estimated_cost_usd"] is None for event in emitted[1:])
+
+
+def _metered_work_start(reserved_spend_microusd: int) -> CommercialWorkStartContext:
+  base = _work_start()
+  return replace(
+    base,
+    authorization=replace(
+      base.authorization,
+      schema_version=3,
+      credential_principal="user",
+      billing_mode="metered",
+      reserved_spend_microusd=reserved_spend_microusd,
+    ),
+    spend_ledger=None,
+  )
+
+
+def _byok_work_start() -> CommercialWorkStartContext:
+  base = _work_start()
+  return replace(
+    base,
+    authorization=replace(
+      base.authorization,
+      schema_version=3,
+      credential_principal="user",
+      billing_mode="byok",
+      reservation_id=None,
+      primary_inference_observability="hank_byok_observed",
+      reserved_spend_microusd=None,
+    ),
+    spend_ledger=None,
+  )
+
+
+def _runner_harness():
+  import importlib.util
+  from pathlib import Path
+
+  path = Path(__file__).with_name("test_runner_run_loop.py")
+  spec = importlib.util.spec_from_file_location("runner_run_loop_harness", path)
+  assert spec is not None and spec.loader is not None
+  module = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(module)
+  return module
+
+
+@pytest.mark.asyncio
+async def test_emit_ceils_cost_onto_the_shared_work_start_ledger() -> None:
+  work_start = _metered_work_start(5_000_000)
+  sink = lambda _events: "outbox"
+  root = CommercialUsageProducer(
+    enabled=True, claim=None, lineage=None, sink=sink, work_start=work_start,
+  )
+  child = CommercialUsageProducer(
+    enabled=True, claim=None, lineage=None, sink=sink, work_start=work_start,
+  )
+  await root.emit(_event(cost_usd=0.0125, event_id="evt-root"))
+  await child.emit(_event(
+    cost_usd=0.0125,
+    event_id="evt-child",
+    provider="openai",
+  ))
+  ledger = work_start.spend_ledger
+  assert ledger is not None
+  assert ledger.authorization_id == work_start.authorization.authorization_id
+  assert ledger.spent_microusd == 25_000
+  assert ledger.reached() is False
+  fractional = WorkStartSpendLedger(
+    authorization_id=ledger.authorization_id,
+    reserved_spend_microusd=2,
+  )
+  fractional.record_usd("0.0000004")
+  fractional.record_usd("0.0000004")
+  assert fractional.spent_microusd == 2
+  assert fractional.reached() is True
+  assert ledger.reached() is False
+
+
+def test_runner_stops_when_emitted_spend_reaches_the_reserved_budget() -> None:
+  async def case() -> None:
+    harness = _runner_harness()
+    work_start = _metered_work_start(1)
+    producer = CommercialUsageProducer(
+      enabled=True, claim=None, lineage=None, sink=lambda _events: "outbox",
+      work_start=work_start,
+    )
+    runner = harness._make_credential_runner()
+    runner._commercial_usage_producer = producer
+    calls = 0
+
+    async def stream_turn(**_kwargs):
+      nonlocal calls
+      calls += 1
+      await producer.emit(_event(cost_usd=0.01, event_id=f"evt-{calls}"))
+      runner._append({"type": "partial_result", "text": "partial answer"})
+      return object(), harness.StreamTurnResult(
+        full_text="partial answer",
+        stop_reason="pause_turn",
+        content_blocks=[{"type": "text", "text": "partial answer"}],
+      )
+
+    runner._stream_turn = stream_turn
+    harness._soft_budget_threshold(runner, 20)
+    await runner.run(messages=[{"role": "user", "content": "work"}])
+
+    assert calls == 1
+    events = [entry.event for entry in runner._log.entries]
+    assert any(
+      event.get("type") == "partial_result" and event.get("text") == "partial answer"
+      for event in events
+    )
+    completion = events[-1]
+    assert completion["type"] == "stream_complete"
+    assert completion["terminal_disposition"] == "interrupted"
+    assert completion["reason"] == "commercial_budget_reached"
+
+  asyncio.run(case())
+
+
+def test_byok_runner_is_not_stopped_when_emitted_spend_grows() -> None:
+  async def case() -> None:
+    harness = _runner_harness()
+    work_start = _byok_work_start()
+    producer = CommercialUsageProducer(
+      enabled=True, claim=None, lineage=None, sink=lambda _events: "outbox",
+      work_start=work_start,
+    )
+    runner = harness._make_credential_runner()
+    runner._commercial_usage_producer = producer
+    calls = 0
+
+    async def stream_turn(**_kwargs):
+      nonlocal calls
+      calls += 1
+      await producer.emit(_event(
+        cost_usd=25, event_id=f"evt-byok-{calls}", billing_mode="byok",
+      ))
+      if calls == 1:
+        return object(), harness.StreamTurnResult(
+          full_text="still going",
+          stop_reason="pause_turn",
+          content_blocks=[{"type": "text", "text": "still going"}],
+        )
+      return object(), harness.StreamTurnResult(
+        full_text="done",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "done"}],
+      )
+
+    runner._stream_turn = stream_turn
+    harness._soft_budget_threshold(runner, 20)
+    await runner.run(messages=[{"role": "user", "content": "work"}])
+
+    assert calls == 2
+    assert work_start.spend_ledger is not None
+    assert work_start.spend_ledger.reached() is False
+    completion = runner._log.entries[-1].event
+    assert completion.get("reason") != "commercial_budget_reached"
+
+  asyncio.run(case())

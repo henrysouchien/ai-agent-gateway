@@ -28,6 +28,7 @@ from agent_gateway import (  # noqa: E402
   ModelInfo,
   ToolDispatcher,
 )
+from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
 from agent_gateway.runner import _MAX_TOKENS_CONTINUATIONS, _MAX_TOKENS_NUDGE, StreamTurnResult  # noqa: E402
 from agent_gateway.final_narrative_artifact import read_final_narrative  # noqa: E402
 from agent_gateway.sub_agent_narrative_result import final_child_visible_text  # noqa: E402
@@ -81,6 +82,7 @@ def _make_runner(
   agent_session_log: AgentSessionLog | None = None,
   message_inbox: asyncio.Queue[ParentMessage] | None = None,
   max_tokens_override: int | None = None,
+  containment: ContainmentSettings = ContainmentSettings(),
 ) -> AgentRunner:
   event_log = EventLog()
   _dispatcher_execution_88 = stub_runner_capability_execution(
@@ -104,6 +106,7 @@ def _make_runner(
     max_tokens_override=max_tokens_override,
     agent_session_log=agent_session_log,
     message_inbox=message_inbox,
+    containment=containment,
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -248,15 +251,13 @@ def test_child_max_tokens_segments_are_one_logical_response(
 
 def test_child_max_tokens_segments_advance_the_soft_budget(
   tmp_path: Path,
-  monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  monkeypatch.setenv("HANK_SOFT_TURN_BUDGET", "3")
-
   async def _case() -> None:
     runner = _make_runner(
       _StubProvider(),
       session_id="sub_parent:2",
       agent_session_log=AgentSessionLog(tmp_path / "child.jsonl"),
+      containment=ContainmentSettings(soft_turn_budget_cap=3),
     )
     calls = 0
 
@@ -503,15 +504,13 @@ def test_sdk_run_output_limit_resolves_like_the_run_loop(
 
 def test_child_max_tokens_chain_that_never_answers_meets_the_abort(
   tmp_path: Path,
-  monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  monkeypatch.setenv("HANK_SOFT_TURN_BUDGET", "3")
-
   async def _case() -> None:
     runner = _make_runner(
       _StubProvider(),
       session_id="sub_parent:3",
       agent_session_log=AgentSessionLog(tmp_path / "child.jsonl"),
+      containment=ContainmentSettings(soft_turn_budget_cap=3),
     )
     calls = 0
 

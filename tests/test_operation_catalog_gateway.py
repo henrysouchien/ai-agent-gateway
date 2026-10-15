@@ -26,7 +26,7 @@ from agent_gateway.execution_snapshot import (
   resume_agent_execution_snapshot,
 )
 from agent_gateway.sub_agent import (
-  _ordinary_admitted_task_factory,
+  ordinary_admitted_task_factory,
   seal_admitted_task_payload,
 )
 from agent_gateway.sub_agent_helpers import make_run_agent_tool_def
@@ -110,7 +110,12 @@ def test_run_agent_schema_exposes_operation_and_objective(tmp_path: Path) -> Non
   assert "task" not in schema["properties"]
   description = schema["properties"]["operation"]["description"]
   assert "agent-operation/filing-review@2.0" in description
-  assert "sha256:" in description
+  assert "list_skills" in description
+  assert "sha256:" not in description
+  assert schema["properties"]["operation"]["required"] == [
+    "namespace", "name", "version", "digest",
+  ]
+  assert "digest" in schema["properties"]["operation"]["properties"]
 
 
 def test_omitted_operation_selects_registered_generic_explore(tmp_path: Path) -> None:
@@ -179,7 +184,7 @@ Explore the admitted question.
     provider_tool_definitions=(),
     max_resume_chain_depth=3,
   )
-  first = _ordinary_admitted_task_factory(
+  first = ordinary_admitted_task_factory(
     operation=operation,
     execution_snapshot=execution_snapshot,
     capability_bindings=(),
@@ -194,7 +199,7 @@ Explore the admitted question.
     parent_session=None,
   )(SimpleNamespace(task_id="bg_1"))
   assert isinstance(first.logical_task, OrdinaryDelegationTaskRef)
-  resumed = _ordinary_admitted_task_factory(
+  resumed = ordinary_admitted_task_factory(
     operation=operation,
     execution_snapshot=resume_agent_execution_snapshot(
       execution_snapshot,

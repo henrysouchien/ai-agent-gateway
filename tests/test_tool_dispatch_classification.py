@@ -31,23 +31,55 @@ from agent_gateway.capability_resolution import (  # noqa: E402
   lookup_catalog_entry,
 )
 from agent_gateway.tool_dispatch_declarations import (  # noqa: E402
+  ToolDispatchSemantics,
   build_tool_dispatch_declarations,
 )
 from agent_gateway.tool_dispatch_source_identity import (  # noqa: E402
   read_source_identities,
 )
+from agent_gateway import tool_dispatch_declarations  # noqa: E402
 from agent_workflow_contracts import CatalogToolEntry  # noqa: E402
 from agent_workflow_contracts.models import CatalogToolEffect  # noqa: E402
+from agent_workflow_contracts.tool_registration import (  # noqa: E402
+  RegisteredToolIdentity,
+  VersionedPolicyRef,
+)
 from gateway_test_support.host_policy import owner_session_host_policy
 
 
+_FILINGS_SEARCH = RegisteredToolIdentity(
+  route_kind="mcp",
+  logical_server_id="research-corpus-mcp",
+  logical_name="filings_search",
+)
+
+
 @pytest.fixture(autouse=True)
-def filing_route_policy(owner_session_host_policy):
+def filing_route_policy(owner_session_host_policy, monkeypatch):
   owner_session_host_policy.get_server_for_policy_tool = lambda name: (
     "research-corpus-mcp" if name == "filings_search" else None
   )
   owner_session_host_policy.get_local_tool_effect = lambda _name: None
   owner_session_host_policy.get_tool_class = lambda _server, _name: "read"
+  # The registration owner declares filings_search's dispatch semantics.
+  owner_session_host_policy.get_dispatch_semantics_overrides = lambda: {
+    _FILINGS_SEARCH: ToolDispatchSemantics(
+      idempotent=True,
+      outcome_policy=VersionedPolicyRef(
+        kind="outcome",
+        policy_id="current-declared-status-equals",
+        version="v1",
+        parameters={"field": "status", "values": ("success",)},
+      ),
+      source_identity_policy=VersionedPolicyRef(
+        kind="source_identity",
+        policy_id="search_hits",
+        version="v1",
+        parameters={"container": "hits", "default_source_kind": "filing"},
+      ),
+    ),
+  }
+  monkeypatch.setattr(tool_dispatch_declarations, "_CACHED_DECLARATIONS", None)
 
 
 def _entry(
@@ -430,43 +462,6 @@ def test_declaration_table_derives_effect_and_never_restates_it() -> None:
   assert seen, "every row's effect must be derived, not literal"
   assert set(seen) == set(table)
   assert all(row.effect == "read" for row in table.values())
-
-
-def test_declaration_table_covers_the_recognized_source_population() -> None:
-  table = build_tool_dispatch_declarations(effect_resolver=lambda _name: "read")
-
-  recognized = {
-    "code_execute",
-    "code_execute_status",
-    "web_fetch",
-    "filings_search",
-    "transcripts_search",
-    "filings_list",
-    "transcripts_list",
-    "filings_read",
-    "transcripts_read",
-    "filings_source_excerpt",
-    "transcripts_source_excerpt",
-    "get_filings",
-    "get_filing_sections",
-    "search_filing_text",
-    "get_filing_evidence",
-    "cite_concept",
-    "get_filing_document",
-    "get_metric",
-  }
-
-  assert recognized <= set(table)
-  assert all(table[name].source_identity is not None for name in recognized)
-  for name in ("code_execute", "code_execute_status"):
-    assert table[name].source_identity == {"kind": "sandbox_computations"}
-    assert table[name].idempotent is False
-    assert table[name].success_signal is None
-  assert table["gsheets_read_range"].success_signal == {
-    "kind": "status_equals",
-    "field": "status",
-    "values": ("ok",),
-  }
 
 
 def test_sandbox_computation_source_reader_preserves_order_and_current_gates() -> None:

@@ -96,9 +96,9 @@ def _strict_session_driver_config(
         label=f"{provider} {model}",
         provider=provider,
         upstream_model=model,
-        # A real execution identity the installed adapter declares: startup
-        # closure now rejects registry entries asserting profiles/routes the
-        # installed implementation does not provide.
+        # A real execution identity the installed adapter declares, so the
+        # entry is executable here: an undeclared profile/route is skipped at
+        # bind time (`provider_unavailable`).
         adapter=f"{provider}.responses" if provider != "anthropic" else "anthropic.messages",
         protocol_profile=protocol_profile,
         compat=compat_for_profile(protocol_profile),

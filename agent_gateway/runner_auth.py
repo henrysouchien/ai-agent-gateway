@@ -16,39 +16,36 @@ def merge_refreshed_auth_config(
   config: Dict[str, Any],
   refreshed: Dict[str, Any],
 ) -> Dict[str, Any]:
-  """Rotate credential material without reopening execution selection."""
+  """Rotate credential material; execution selection and bound values stay.
 
-  duplicated = sorted(
-    _SELECTION_AUTH_CONFIG_FIELDS & (set(config) | set(refreshed))
-  )
-  if duplicated:
-    raise ValueError(
-      "credential refresh material must not contain model selection: "
-      + ", ".join(duplicated)
-    )
+  The execution bind owns model selection, provider and max_tokens. Auth mode
+  belongs to the serving credential: refreshed material replaces it when
+  supplied, otherwise the current mode remains. Provider pool fields
+  (project_id, account_identity, auth_store_path, auth_user_scope,
+  credential_source, refresh_token, token_expires_at) follow that same rule:
+  preserve existing material, then replace fields supplied by the new seat.
+  Selection copies are dropped and bound values overwrite the resolver.
+  """
+
   provider = str(config.get("provider") or "").strip().lower()
 
-  immutable_values = {
-    "auth_mode": str(config.get("auth_mode", "api")).strip().lower(),
+  bound_values: Dict[str, Any] = {
     "max_tokens": int(config.get("max_tokens", 16000)),
   }
   if provider:
-    immutable_values["provider"] = provider
-  for key, expected in immutable_values.items():
-    if key not in refreshed:
-      continue
-    candidate = refreshed[key]
-    if key in {"provider", "auth_mode"}:
-      candidate = str(candidate or "").strip().lower()
-    elif key == "max_tokens":
-      candidate = int(candidate)
-    if candidate != expected:
-      raise ValueError(
-        f"credential refresh cannot change bound {key}"
-      )
-  merged = dict(config)
-  merged.update(refreshed)
-  merged.update(immutable_values)
+    bound_values["provider"] = provider
+  merged = {
+    key: value
+    for key, value in config.items()
+    if key not in _SELECTION_AUTH_CONFIG_FIELDS
+  }
+  merged.update(
+    (key, value)
+    for key, value in refreshed.items()
+    if key not in _SELECTION_AUTH_CONFIG_FIELDS
+  )
+  merged["auth_mode"] = str(merged.get("auth_mode", "api")).strip().lower()
+  merged.update(bound_values)
   for key in ("billing_mode", "rate_table_version"):
     if config.get(key):
       merged[key] = config[key]

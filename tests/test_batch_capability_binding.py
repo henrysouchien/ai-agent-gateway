@@ -146,6 +146,10 @@ def test_authenticated_batch_marks_exact_user_handle_run_scoped() -> None:
   })
   assert execution.bind.credential_principal == "user"
   assert execution.auth_config["api_key"] == "user-secret"
+  assert "node.implement" in resolver.auth_context.entitled_capabilities
+  assert "node.explore" in resolver.auth_context.entitled_capabilities
+  assert "session.driver" in resolver.auth_context.entitled_capabilities
+  assert "anthropic.claude-opus-5-5" in resolver.auth_context.entitled_model_keys
 
 
 def test_standalone_batch_materializes_only_service_principal() -> None:

@@ -40,6 +40,7 @@ from agent_gateway.investment_capability_claim import (
   investment_capability_grants,
   issue_investment_capability_claim,
   issue_investment_selected_content_claim,
+  issue_risk_job_capability_claim,
   investment_capability_signing_available,
   issue_investment_job_principal_claim,
 )
@@ -279,6 +280,10 @@ def _assert_names_grant_and_issuance_route(error: dict[str, Any], *, subject: st
     "agent-operation/market-scan",
     "agent-operation/quant-research",
   ]
+  assert error["next_call"] == {
+    "tool_name": "run_agent",
+    "arguments": {"operation": "agent-operation/market-scan"},
+  }
 
 
 def test_claim_unavailable_error_names_grant_and_issuance_route() -> None:
@@ -1035,11 +1040,8 @@ def test_conflicting_trusted_skill_contexts_fail_closed(
   assert mcp.calls == []
 
 
-@pytest.mark.parametrize(
-  "policy_bundle_hash",
-  ["unknown", _POLICY_BUNDLE_HASH.upper(), "0" * 63],
-)
-def test_invalid_policy_bundle_identity_fails_closed(
+@pytest.mark.parametrize("policy_bundle_hash", ["unknown", ""])
+def test_run_without_policy_bundle_dispatches_with_null_bundle_identity(
   monkeypatch: pytest.MonkeyPatch,
   policy_bundle_hash: str,
 ) -> None:
@@ -1048,14 +1050,17 @@ def test_invalid_policy_bundle_identity_fails_closed(
 
   result, error = _dispatch(
     _dispatcher(mcp, policy_bundle_hash=policy_bundle_hash),
-    tool_call_id="call-unknown-policy",
+    tool_call_id="call-no-policy-bundle",
     tool_name="get_investment_run",
   )
 
-  assert result is None
-  assert error is not None
-  assert error["code"] == "investment_capability_claim_unavailable"
-  assert mcp.calls == []
+  assert error is None
+  assert result == {"ok": True}
+  assert len(mcp.calls) == 1
+  meta = mcp.calls[0]["meta"]
+  assert isinstance(meta, dict)
+  _header, payload = _decode_claim(meta["investment_capability_claim"])
+  assert payload["policy_bundle_hash"] is None
 
 
 def test_signed_grant_tampering_invalidates_signature(
@@ -1507,6 +1512,7 @@ def test_in_process_child_context_precedes_parent_credential_session(
     admit, context_for_child, current_parent_context,
   )
   from agent_gateway.capability_resolution import OperationDeclaration, resolve_operation_authority
+  from agent_gateway.containment_settings import ContainmentSettings
   from agent_gateway.semantic_capability_routing import capability_for_tool
   from gateway_test_support.capability_execution_test_support import stub_capability_execution_resolver
 
@@ -1566,6 +1572,7 @@ def test_in_process_child_context_precedes_parent_credential_session(
         replace(declaration, tool_ceiling=tool_ids), catalog=catalog,
       ),
       placement="in_process",
+      containment=ContainmentSettings(),
     ),
   )
   assert isinstance(admitted, AdmittedContext)
@@ -1673,4 +1680,46 @@ def test_claim_requires_explicit_authenticated_tenant(
       skill="market-scan",
       admitted_skill_execution_limits=_limits_for_skill("market-scan"),
       policy_bundle_hash=_POLICY_BUNDLE_HASH,
+    )
+
+
+def test_issue_risk_job_capability_claim_signs_granted_operations(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _set_signing_key(monkeypatch)
+  tenant = AdmittedTenant(tenant_id="tenant-alpha", storage_id="storage-99", role="invite")
+  token = issue_risk_job_capability_claim(
+    user_id="user-42",
+    tenant=tenant,
+    session_id="session-test",
+    granted_operations=["load_statements", "get_positions"],
+    cell_token="cell-token-xyz",
+  )
+  _header, payload = _decode_claim(token)
+  assert payload["iss"] == "ai-excel-addin"
+  assert payload["aud"] == "risk-module"
+  assert payload["sub"] == "user-42"
+  assert payload["session_id"] == "session-test"
+  assert payload["cell_token"] == "cell-token-xyz"
+  assert payload["granted_operations"] == ["get_positions", "load_statements"]
+  assert payload["tenant"] == {
+    "tenant_id": "tenant-alpha",
+    "storage_id": "storage-99",
+    "role": "invite",
+  }
+  assert payload["v"] == 4
+  assert payload["kind"] == "risk_job_capability"
+
+
+def test_risk_job_capability_claim_requires_authenticated_tenant(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _set_signing_key(monkeypatch)
+  with pytest.raises(InvestmentCapabilityClaimError, match="authenticated tenant"):
+    issue_risk_job_capability_claim(
+      user_id="user-42",
+      tenant=None,  # type: ignore[arg-type]
+      session_id="session-test",
+      granted_operations=["load_statements"],
+      cell_token="cell-token-xyz",
     )

@@ -250,6 +250,73 @@ def test_local_tool_schema_validation_allows_valid_input() -> None:
   assert result == {"received": {"judgment": {"ticker": "PAYC"}}}
 
 
+def test_local_handler_declaring_authoritative_validation_receives_schema_invalid_input() -> None:
+  received: list[Any] = []
+
+  async def owning_handler(tool_input: Any, **_kwargs: Any):
+    received.append(tool_input)
+    return {"owned": True}, None
+
+  setattr(owning_handler, "__gateway_authoritative_input_validation__", True)
+  dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
+    mcp_client=_NullMcpClient(),
+    local_tool_handlers={"structured_write": owning_handler},
+    get_tool_definitions=_tool_defs,
+    role="owner",
+  )
+
+  for tool_input in (
+    {"judgment": ["not", "an", "object"], "research_file_id": 1},
+    {},
+  ):
+    result, error = _run(dispatcher.dispatch("call-1", "structured_write", tool_input))
+    assert error is None
+    assert result == {"owned": True}
+
+  assert received == [
+    {"judgment": ["not", "an", "object"], "research_file_id": 1},
+    {},
+  ]
+
+
+def test_unmarked_local_handler_stays_schema_gated_beside_a_marked_one() -> None:
+  received: list[Any] = []
+
+  async def owning_handler(tool_input: Any, **_kwargs: Any):
+    received.append(tool_input)
+    return {"owned": True}, None
+
+  setattr(owning_handler, "__gateway_authoritative_input_validation__", True)
+
+  def two_tool_defs() -> list[dict[str, Any]]:
+    [definition] = _tool_defs()
+    return [definition, {**definition, "name": "other_write"}]
+
+  dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
+    mcp_client=_NullMcpClient(),
+    local_tool_handlers={
+      "structured_write": owning_handler,
+      "other_write": _unexpected_handler,
+    },
+    get_tool_definitions=two_tool_defs,
+    role="owner",
+  )
+
+  result, error = _run(
+    dispatcher.dispatch("call-1", "other_write", {"judgment": ["not", "an", "object"]})
+  )
+
+  assert result is None
+  assert error is not None
+  assert error["code"] == "invalid_tool_input_schema"
+  assert error["details"]["type_errors"] == [
+    {"field": "judgment", "expected": "object", "got": "array"}
+  ]
+  assert received == []
+
+
 def test_snapshot_admitted_local_tool_requires_live_schema_for_input_validation() -> None:
   live_definitions = [
     {

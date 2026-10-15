@@ -20,6 +20,12 @@ from model_authority.registry import ProductModelRegistry
 import agent_gateway.sdk_runner as sdk_runner  # noqa: E402
 from agent_gateway.sdk_runner_stream import ToolCallInfo, _SDKRunnerStreamMixin  # noqa: E402
 from agent_gateway.tool_dispatch_classification import ToolResultSettlement  # noqa: E402
+from agent_gateway import tool_dispatch_declarations  # noqa: E402
+from agent_gateway.tool_dispatch_declarations import ToolDispatchSemantics  # noqa: E402
+from agent_workflow_contracts.tool_registration import (  # noqa: E402
+  RegisteredToolIdentity,
+  VersionedPolicyRef,
+)
 from gateway_test_support.sdk_capability_execution_test_support import stub_sdk_capability_execution  # noqa: E402
 from gateway_test_support.host_policy import owner_session_host_policy
 
@@ -577,6 +583,7 @@ def test_sdk_runner_keeps_text_after_ui_blocks_validation_failure() -> None:
 
 def test_sdk_producer_settles_a_dispatch_record_through_the_shared_builder(
   owner_session_host_policy,
+  monkeypatch,
 ) -> None:
   """D-B1-1: the second producer must not degrade the fold to the fallback."""
 
@@ -585,6 +592,31 @@ def test_sdk_producer_settles_a_dispatch_record_through_the_shared_builder(
   )
   owner_session_host_policy.get_local_tool_effect = lambda _name: None
   owner_session_host_policy.get_tool_class = lambda _server, _name: "read"
+  # The registration owner's declaration for this route (GP54): the shared
+  # builder settles `sources` only from a declared source identity.
+  owner_session_host_policy.get_dispatch_semantics_overrides = lambda: {
+    RegisteredToolIdentity(
+      route_kind="mcp",
+      logical_server_id="research-corpus-mcp",
+      logical_name="filings_search",
+    ): ToolDispatchSemantics(
+      idempotent=True,
+      outcome_policy=VersionedPolicyRef(
+        kind="outcome",
+        policy_id="current-declared-status-equals",
+        version="v1",
+        parameters={"field": "status", "values": ("success",)},
+      ),
+      source_identity_policy=VersionedPolicyRef(
+        kind="source_identity",
+        policy_id="search_hits",
+        version="v1",
+        parameters={"container": "hits", "default_source_kind": "filing"},
+      ),
+    ),
+  }
+  # The table is cached process-wide on first use; build it from this policy.
+  monkeypatch.setattr(tool_dispatch_declarations, "_CACHED_DECLARATIONS", None)
 
   runner = _make_runner()
   runner._pending_tool_calls["tool-1"] = ToolCallInfo(

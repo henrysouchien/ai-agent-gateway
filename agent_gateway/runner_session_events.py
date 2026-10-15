@@ -5,15 +5,19 @@ import asyncio
 from collections.abc import Mapping
 from copy import deepcopy
 import json
-from typing import Any, Callable, Dict, Iterable, List, Literal
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Literal
 
 from agent_workflow_contracts import AgentCompletionEnvelope
 
 from .events import AgentCompletionEvent, event_to_dict
+from .event_adapter import TerminalDisposition
 from .skill_completion_wal import TopLevelSkillCompletionEffectPlan
 from .skill_lifecycle import TopLevelSkillLifecycleMetadata
 from .tool_dispatch_classification import OUTCOME_OK
 from .workflow_output_attachment import WorkflowOutputAttachment
+
+if TYPE_CHECKING:
+  from .tool_dispatcher_approval_lifecycle import ApprovalPark
 
 
 def durable_event_payload(
@@ -118,14 +122,18 @@ def build_user_message_event(
   client_kind: str,
   received_at: float,
   selected_content: tuple[dict[str, object], ...],
+  operator_messages: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
 ) -> Dict[str, Any]:
-  return {
+  payload: Dict[str, Any] = {
     "type": "user_message",
     "content": content,
     "client_kind": client_kind,
     "received_at": received_at,
     "selected_content": list(selected_content),
   }
+  if operator_messages is not None:
+    payload["operator_messages"] = list(operator_messages)
+  return payload
 
 
 def build_agent_completion_event(
@@ -171,6 +179,7 @@ def build_skill_result_failure_event(
     "proposal_ids": [],
     "verdict_echo": None,
     "fms_results": [],
+    "last_failed_door_answer": None,
     "artifact_events": [],
     "output_memory_file": None,
     "cost_usd": None,
@@ -189,7 +198,7 @@ def build_assistant_message_event(
   content_blocks: List[Dict[str, Any]],
   stop_reason: str | None,
   stop_details: Dict[str, Any] | None = None,
-  model: str,
+  model: str | None,
   provider: str | None,
   usage: Dict[str, Any],
   parent_message_consumptions: List[Dict[str, Any]] | None = None,
@@ -423,6 +432,22 @@ def build_runtime_guard_event(*, guard: str, message: str) -> Dict[str, Any]:
   }
 
 
+def build_todo_snapshot_event(
+  checklist: Any,
+  *,
+  actor: Literal["agent", "analyst"],
+  op: str,
+  gateway_session_id: str,
+) -> Dict[str, Any]:
+  """One accepted checklist change; the fold of these is the checklist (§5)."""
+  from .todo_checklist import build_todo_snapshot_payload
+
+  return build_todo_snapshot_payload(
+    checklist, actor=actor, op=op, gateway_session_id=gateway_session_id
+  )
+
+
+
 REFUSAL_GUIDANCE = (
   "Anthropic recommends starting a fresh conversation before continuing; "
   "further turns in this context may be refused again."
@@ -450,10 +475,12 @@ def build_stream_complete_event(
   estimated_cost: float,
   est_system_tokens: int,
   est_tools_tokens: int,
+  todo_measurements: Dict[str, int] | None = None,
+  terminal_disposition: TerminalDisposition = "completed",
 ) -> Dict[str, Any]:
-  return {
+  payload: Dict[str, Any] = {
     "type": "stream_complete",
-    "terminal_disposition": "completed",
+    "terminal_disposition": terminal_disposition,
     "usage": {
       "input_tokens": usage_totals["input_tokens"],
       "output_tokens": usage_totals["output_tokens"],
@@ -464,6 +491,9 @@ def build_stream_complete_event(
       "est_tools_tokens": est_tools_tokens,
     },
   }
+  if todo_measurements is not None:
+    payload.update(todo_measurements)
+  return payload
 
 
 def build_context_warning_log_data(
@@ -768,7 +798,7 @@ class NamedSkillClosure:
 
 @dataclass(frozen=True)
 class TerminalClosureDecision:
-  disposition: Literal["success", "error", "cancelled"]
+  disposition: Literal["success", "error", "cancelled", "awaiting_approval"]
   reason: str
   cause: BaseException | None = None
   terminal: Dict[str, Any] | None = None
@@ -788,6 +818,36 @@ class TerminalClosureDecision:
     return NamedSkillClosure(self.skill_result, self.terminal, self.skill_effect)
 
 
+def run_terminal_for_disposition(
+  terminal_event: Dict[str, Any] | None,
+  *,
+  disposition: str,
+  reason: str,
+  cause: BaseException | None,
+  server_terminal_cause: str | None,
+) -> Dict[str, Any] | None:
+  """Project the run's own terminal onto a decided disposition.
+
+  Never synthesizes a terminal: a run that produced none keeps ``None``, so
+  the owner that closes it (a named skill's closure) builds its own.
+  """
+  if (
+    terminal_event is None
+    or terminal_event.get("type") != "stream_complete"
+    or terminal_event.get("terminal_disposition") == "interrupted"
+    or disposition in {"success", "awaiting_approval"}
+  ):
+    return terminal_event
+  terminal = (
+    {**terminal_event, "terminal_disposition": "interrupted", "reason": reason}
+    if disposition == "cancelled"
+    else build_error_event(str(cause or reason))
+  )
+  if server_terminal_cause is not None:
+    terminal["server_terminal_cause"] = server_terminal_cause
+  return terminal
+
+
 def terminal_closure_decision(
   *,
   clean_detach_reason: str,
@@ -799,10 +859,11 @@ def terminal_closure_decision(
   skill_lifecycle: TopLevelSkillLifecycleMetadata | None = None,
   skill_result: Dict[str, Any] | None = None,
   skill_effect: TopLevelSkillCompletionEffectPlan | None = None,
+  approval_park: ApprovalPark | None = None,
 ) -> TerminalClosureDecision:
   """Decide the canonical closure, including an unprepared escaping exception."""
   cause = run_error
-  disposition: Literal["success", "error", "cancelled"]
+  disposition: Literal["success", "error", "cancelled", "awaiting_approval"]
   if persistence_error is not None:
     disposition, reason, cause = "error", "persistence", persistence_error
   elif isinstance(run_error, asyncio.CancelledError):
@@ -814,8 +875,12 @@ def terminal_closure_decision(
     cause = RuntimeError(str(terminal_event.get("error", "")))
   elif clean_detach_reason == "error":
     disposition, reason = "error", "error"
-  elif server_terminal_cause is not None or clean_detach_reason != "completed":
-    disposition, reason = "cancelled", server_terminal_cause or clean_detach_reason
+  elif server_terminal_cause is not None:
+    disposition, reason = "cancelled", server_terminal_cause
+  elif approval_park is not None and clean_detach_reason == "awaiting_approval":
+    disposition, reason = "awaiting_approval", "awaiting_approval"
+  elif clean_detach_reason != "completed":
+    disposition, reason = "cancelled", clean_detach_reason
   else:
     disposition, reason = "success", "completed"
 
@@ -832,21 +897,47 @@ def terminal_closure_decision(
       terminal["server_terminal_cause"] = server_terminal_cause
   elif terminal is None and isinstance(run_error, Exception):
     terminal = build_error_event(str(run_error))
-  elif (
-    terminal is not None
-    and terminal.get("type") == "stream_complete"
-    and terminal.get("terminal_disposition") != "interrupted"
-    and disposition != "success"
-  ):
-    terminal = (
-      {**terminal, "terminal_disposition": "interrupted", "reason": reason}
-      if disposition == "cancelled"
-      else build_error_event(str(cause or reason))
+  else:
+    terminal = run_terminal_for_disposition(
+      terminal,
+      disposition=disposition,
+      reason=reason,
+      cause=cause,
+      server_terminal_cause=server_terminal_cause,
     )
-    if server_terminal_cause is not None:
-      terminal["server_terminal_cause"] = server_terminal_cause
 
-  if skill_lifecycle is not None:
+  if disposition == "awaiting_approval":
+    skill_result = None
+    skill_effect = None
+    if terminal is not None and approval_park is not None:
+      terminal = {
+        **terminal,
+        "terminal_disposition": "awaiting_approval",
+        "job_id": approval_park.job_id,
+        "approval_id": approval_park.approval_id,
+        "original_tool_call_id": approval_park.original_tool_call_id,
+      }
+      if approval_park.root_turn_id is not None:
+        terminal["root_turn_id"] = approval_park.root_turn_id
+  elif skill_lifecycle is not None:
+    if (
+      disposition == "success"
+      and terminal is not None
+      and terminal.get("type") == "stream_complete"
+      and skill_result is not None
+      and (
+        skill_result.get("exit_code", 0) != 0
+        or skill_result.get("outcome") in {"error", "blocked"}
+      )
+    ):
+      # The stream completed, but the named skill's own result failed: the
+      # run's terminal states the skill's verdict, never a bare ``completed``.
+      terminal = {
+        **build_error_event(
+          str(skill_result.get("error") or skill_result.get("outcome") or "error")
+        ),
+        "reason": str(skill_result.get("outcome") or "error"),
+      }
     if persistence_error is not None or (
       disposition != "success"
       and skill_result is not None

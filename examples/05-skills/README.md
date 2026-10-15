@@ -54,7 +54,7 @@ curl -N http://127.0.0.1:8000/api/chat \
   required `execution_class` (the work-kind capability row, e.g.
   `node.implement`).
 - `run_agent` spawns focused sub-agents. A delegated child meets the one soft
-  turn ladder (`agent_gateway/runner_soft_budget.py` `SOFT_TURN_BUDGET`); a
+  turn ladder (`agent_gateway/runner_soft_budget.py`, thresholds in `ContainmentSettings`); a
   named skill declares no turn or cost limit.
 - Provider and model
   selection remain owned by the capability resolver.

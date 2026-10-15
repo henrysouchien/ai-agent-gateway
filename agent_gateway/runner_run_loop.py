@@ -8,11 +8,12 @@ import logging
 import time
 import types
 import uuid
-from typing import Awaitable, Callable, Iterable, Literal, Protocol, Sequence, TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import Awaitable, Callable, Iterable, Literal, Protocol, Sequence, TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, cast
 
-from agent_workflow_contracts import AgentCompletionEnvelope
+from agent_workflow_contracts import AdmittedTask, AgentCompletionEnvelope
 
 from .context_capture import ContextCapture, build_context_manifest_event, canonical_manifest_digest
+from .event_adapter import TerminalDisposition
 from .fork_request_handoff import (
   ForkRequestHandoff,
   build_mid_turn_handoff,
@@ -22,15 +23,13 @@ from .fork_request_handoff import (
 from .learning_fork_trigger import (
   LearningReceiptDelivery,
   claim_learning_receipts,
+  flush_learning_fork_events,
   settle_learning_receipts,
   submit_learning_fork_after_turn,
   successful_memory_write_from_events,
 )
 from .runner_fork_agents import fork_suffix_messages
 from .runner_limits import (
-  CONTEXT_PRESSURE_REMINDER_PCT,
-  CONTEXT_PRESSURE_REMINDER_STEP_PCT,
-  CONTEXT_WARNING_PCT,
   ContextPressureReminderDecision,
   TokenEstimateSnapshot,
   context_pressure_reminder_decision as _context_pressure_reminder_decision,
@@ -39,6 +38,7 @@ from .runner_limits import (
   system_prompt_estimate_text as _system_prompt_estimate_text,
   token_estimate_snapshot as _token_estimate_snapshot,
 )
+from .session_recap import build_context_composition_event, context_chars_by_group
 from .server_compaction import (
   CONTINUATION_NUDGE,
   MIN_COMPACT_GAIN_TOKENS,
@@ -49,7 +49,12 @@ from .runner_prompt_rules import (
   last_user_message,
   prepend_system_prompt_preamble as _prepend_system_prompt_preamble,
 )
-from .runner_background_tasks import dispatch_objective_echo
+from .runner_background_lifecycle import _attach_task_callback
+from .runner_background_tasks import (
+  dispatch_objective_echo,
+  prepare_background_task_registration,
+  task_registered_event_payload,
+)
 from .runner_cleanup import attach_cleanup_failure
 from .runner_run_loop_defaults import (
   MAX_NOTIFICATIONS_PER_TURN as _MAX_NOTIFICATIONS_PER_TURN,
@@ -64,6 +69,9 @@ from .secret_boundary import (
 from .skill_completion_wal import TopLevelSkillCompletionEffectPlan
 from .skill_context import reset_current_skill, set_current_skill
 from .runner_session_events import (
+  build_user_message_event as _build_user_message_event,
+  build_todo_snapshot_event as _build_todo_snapshot_event,
+  build_assistant_message_event as _build_assistant_message_event,
   build_chat_done_log_data as _build_chat_done_log_data,
   build_context_pressure_reminder as _build_context_pressure_reminder,
   build_context_warning_log_data as _build_context_warning_log_data,
@@ -77,13 +85,16 @@ from .runner_session_events import (
   build_turn_complete_event as _build_turn_complete_event,
   build_turn_complete_log_data as _build_turn_complete_log_data,
 )
+from .todo_checklist import (
+  TodoSessionState,
+  todo_session_state as _todo_session_state,
+)
 from .runner_soft_budget import (
   SoftBudgetAction,
   SoftBudgetLadder,
-  configured_soft_turn_budget,
-  resolve_soft_turn_budget,
   soft_budget_steer_notice,
 )
+from .commercial_work_start import commercial_budget_stop_fields
 from .runner_state import (
   NoToolUseTurnOutcome,
   SessionDrainState,
@@ -112,20 +123,25 @@ from .runner_usage import (
   usage_snapshot,
 )
 from .task_registry import (
+  TaskState,
+  # … existing members remain; the state owner import sits beside it
   COORDINATOR_DEFAULT_PREAMBLE,
   CoordinatorConfig,
   NotificationQueue,
   ParentMessage,
+  TaskEntry,
   TaskNotification,
   TaskState,
   format_parent_messages_for_model,
 )
 from .tool_display import resolve_display
+from .tool_dispatcher_approval_lifecycle import ApprovalPark
 
 if TYPE_CHECKING:
   from .agent_session_log import AgentSessionLog
   from .agent_session_log_records import LogEntry
   from .capability_execution import BoundCapabilityExecution
+  from .containment_settings import ContainmentSettings
   from .context_builder import SessionContextBuilder
   from .event_log import EventLog
   from .multi_user.billing import SessionUsageSummary, UsageEvent, _UsageAggregator
@@ -134,6 +150,7 @@ if TYPE_CHECKING:
   from .runner_tool_execution import AgentRunnerDispatcher
   from .skill_lifecycle import TopLevelSkillLifecycleMetadata
   from .task_registry import TaskRegistry
+  from .sub_agent_result_evidence import SubAgentResultEvidence
   from .workflow_output_attachment import WorkflowOutputAttachment
 
 log = logging.getLogger("agent_gateway.runner")
@@ -159,6 +176,7 @@ class _BuildStreamCompleteEvent(Protocol):
     estimated_cost: float,
     est_system_tokens: int,
     est_tools_tokens: int,
+    terminal_disposition: TerminalDisposition = "completed",
   ) -> Dict[str, Any]: ...
 
 
@@ -230,8 +248,8 @@ class _ContextPressureReminderDecision(Protocol):
     est_tokens: int,
     context_limit: int,
     next_threshold_pct: int,
-    initial_threshold_pct: int = CONTEXT_PRESSURE_REMINDER_PCT,
-    step_pct: int = CONTEXT_PRESSURE_REMINDER_STEP_PCT,
+    initial_threshold_pct: int,
+    step_pct: int,
   ) -> ContextPressureReminderDecision: ...
 
 
@@ -281,6 +299,26 @@ def _assistant_content_blocks_for_persistence(
       else sanitization_failure_tool_input()
     )
   return projected
+
+
+def _provider_startup_error_message(provider: Any, exc: BaseException) -> str:
+  """The typed terminal for a provider client-creation failure.
+
+  A credential error the owner typed carries its own code and next call; that
+  typed terminal surfaces here (`credential_unavailable` for a retired,
+  superseded or removed generation, `store_unreadable` for an unreadable
+  store), never a bare "could not create client". Anything else keeps the
+  existing provider-startup wording.
+  """
+  credential_code = getattr(exc, "code", None)
+  if credential_code in {"credential_unavailable", "store_unreadable"}:
+    next_call = getattr(exc, "next_call", None)
+    message = f"{credential_code}: {exc}"
+    if next_call:
+      message = f"{message} | next: {next_call}"
+    return message
+  provider_name = str(getattr(provider, "name", "unknown") or "unknown")
+  return f"Provider startup failed: could not create client for provider={provider_name}."
 
 
 def _planned_tool_calls(
@@ -597,9 +635,12 @@ def _background_success_snapshot(
 
   blockers: list[str] = []
   registry = runner._task_registry
-  entries = registry.list_tasks()
-  if registry.admission_count > 0:
-    blockers.append("pending_or_running_tasks")
+  self_task = getattr(runner, "_admitted_self_task", None)
+  # The runner's own admitted job settles after this child-obligation fence.
+  entries = [
+    entry for entry in registry.list_tasks()
+    if entry is not self_task
+  ]
 
   initialization_unfinished, initialization_fingerprint = (
     _task_collection_snapshot(
@@ -620,9 +661,6 @@ def _background_success_snapshot(
   for entry in entries:
     initialization_task = _async_task_fingerprint(
       getattr(entry, "initialization_task", None)
-    )
-    asyncio_task = _async_task_fingerprint(
-      getattr(entry, "asyncio_task", None)
     )
     required_skill_result_task = _async_task_fingerprint(
       getattr(entry, "required_skill_result_task", None)
@@ -685,7 +723,6 @@ def _background_success_snapshot(
       settlement_owned,
       required_skill_result_task,
       initialization_task,
-      asyncio_task,
     ))
     if (
       requires_skill_result
@@ -701,11 +738,6 @@ def _background_success_snapshot(
       or (
         initialization_task[0] == "task"
         and initialization_task[2] is not True
-      )
-      or asyncio_task[0] not in {"none", "task"}
-      or (
-        asyncio_task[0] == "task"
-        and asyncio_task[2] is not True
       )
     ):
       blockers.append("background_finalization")
@@ -917,13 +949,31 @@ class _ToolTurnOutcome:
   delivery_turn_compelled: bool
   terminal_failure: tuple[str, str] | None
   terminal_success_reason: str | None
+  approval_park: ApprovalPark | None = None
+
+
+def _deliver_todo_analyst_note(
+  todo_state: TodoSessionState | None,
+  current_messages: list[dict[str, Any]],
+  user_turn_message: Callable[[Any], Dict[str, Any]],
+) -> None:
+  """An analyst edit accepted while the turn ran reaches the model at the
+  next request boundary, once; delivering it marks the revision seen."""
+  if todo_state is None:
+    return
+  note = todo_state.take_analyst_note()
+  if note is not None:
+    current_messages.append(user_turn_message(note))
 
 
 class RunnerRunLoopMixin:
   _stream_started_at: float | None = None
+  _approval_park: ApprovalPark | None = None
 
   if TYPE_CHECKING:
     _agent_session_log: AgentSessionLog | None
+    _admitted_self_task: TaskEntry | None
+    _admitted_self_prior_evidence: SubAgentResultEvidence | None
     _capability_execution: BoundCapabilityExecution
     _compaction_instructions: str | None
     _context_builder: SessionContextBuilder | None
@@ -941,6 +991,10 @@ class RunnerRunLoopMixin:
     _message_inbox: asyncio.Queue[ParentMessage] | None
     _last_durable_seq: int
     _mid_turn_fork_handoff: ForkRequestHandoff | None
+    _full_session_id: str
+    _gateway_session_id: str
+    _gateway_session: Any
+    _parent_turn_id: str | None
     _role: str
     _sub_agent_id: str | None
     _runner_id: str | None
@@ -988,6 +1042,8 @@ class RunnerRunLoopMixin:
     async def _call_on_session_summary(
       self,
       summary: SessionUsageSummary,
+      *,
+      reconciled: SessionUsageSummary | None = None,
     ) -> None: ...
 
     async def _close_client(
@@ -1110,10 +1166,24 @@ class RunnerRunLoopMixin:
 
     async def _rebuild_task_registry_from_log(self) -> None: ...
 
+    async def _lookup_task_in_log(self, task_id: str) -> TaskEntry | None: ...
+
+    def _task_correlation_payload(self, entry: TaskEntry) -> Dict[str, Any]: ...
+
+    async def _finalize_admitted_self_task(
+      self,
+      entry: TaskEntry,
+      *,
+      run_error: BaseException | None,
+      was_cancelled: bool,
+      prior_evidence: SubAgentResultEvidence | None,
+    ) -> None: ...
+
     def _write_lease_metadata(self) -> None: ...
 
     _auth_config: Dict[str, Any]
     _compaction_trigger: int | None
+    _containment: ContainmentSettings
     _coordinator: CoordinatorConfig | None
     _dispatcher: AgentRunnerDispatcher
     _max_tokens_override: int | None
@@ -1179,7 +1249,7 @@ class RunnerRunLoopMixin:
 
     def _effective_excluded_tools(self) -> set[str]: ...
 
-    def _ensure_sub_agent_semaphore(self) -> asyncio.Semaphore | None: ...
+    def _ensure_sub_agent_semaphore(self) -> asyncio.Semaphore: ...
 
     async def _execute_single_tool(
       self,
@@ -1260,6 +1330,92 @@ class RunnerRunLoopMixin:
     if self._role == "sub_agent":
       await self._materialize_parent_message_consumption_audits()
     await self._rebuild_task_registry_from_log()
+    if self._admitted_self_task is not None:
+      supplied_entry = self._admitted_self_task
+      reconstructed = await self._lookup_task_in_log(supplied_entry.task_id)
+      if reconstructed is not None:
+        entry = self._task_registry.adopt_reconstructed(reconstructed)
+        entry.completion_callback = _attach_task_callback(
+          entry.completion_callback, supplied_entry.completion_callback,
+        )
+        entry.park_callback = _attach_task_callback(
+          entry.park_callback, supplied_entry.park_callback,
+        )
+      else:
+        # A fresh own job journals the conversation it starts from: the
+        # inherited prefix before its registration, the opening user message
+        # after it (transcript.ChildRunSegment.initial_context).
+        if resume_initial_messages is not None:
+          for message in resume_initial_messages[:-1]:
+            if message["role"] == "assistant":
+              content = message["content"]
+              await self._append_durable_event(_build_assistant_message_event(
+                content_blocks=(
+                  [{"type": "text", "text": content}]
+                  if isinstance(content, str) else content
+                ),
+                stop_reason=message.get("stop_reason"),
+                model=message.get("model"),
+                provider=message.get("provider"),
+                usage={},
+              ))
+            else:
+              await self._append_user_message_event(message)
+        entry = self._task_registry._tasks.setdefault(
+          supplied_entry.task_id, supplied_entry,
+        )
+        admitted = cast(AdmittedTask, entry.admitted_task)
+        entry.metadata["admitted_task"] = admitted.model_dump(mode="json")
+        if entry.parent_result_policy is not None:
+          entry.metadata["parent_result_policy"] = (
+            entry.parent_result_policy.model_dump(mode="json")
+          )
+        prepare_background_task_registration(
+          entry,
+          tool_input={},
+          capability_bind_receipt=self._capability_execution.bind.to_json(),
+          owner_runner_id=self._runner_id,
+          owner_role=self._role,
+          sub_agent_id_for_call_index=lambda _index: self._full_session_id,
+          parent_turn_id=self._parent_turn_id,
+          original_task_id=entry.original_task_id,
+        )
+        await self._append_durable_event(
+          task_registered_event_payload(
+            entry,
+            correlation_payload=self._task_correlation_payload(entry),
+            agent_name=entry.agent_name,
+            parent_session_id=self._gateway_session_id,
+          )
+        )
+        entry.registration_persistence_state = "committed"
+        entry.registration_persistence_error = None
+        if resume_initial_messages is not None:
+          tail = resume_initial_messages[-1]
+          if tail.get("role") == "assistant":
+            # The continuation's tail can be an assistant turn (the parked
+            # stage's transcript ends where its ladder was spent); journal
+            # it with its own role, never as a fresh user message.
+            content = tail.get("content")
+            content_blocks: list[dict[str, Any]] = (
+              [{"type": "text", "text": content}]
+              if isinstance(content, str)
+              else [
+                block
+                for block in (content or [])
+                if isinstance(block, dict)
+              ]
+            )
+            await self._append_durable_event(_build_assistant_message_event(
+              content_blocks=content_blocks,
+              stop_reason=tail.get("stop_reason"),
+              model=tail.get("model"),
+              provider=tail.get("provider"),
+              usage={},
+            ))
+          else:
+            await self._append_user_message_event(tail)
+      self._admitted_self_task = entry
     if resume_initial_messages is not None:
       messages = [dict(message) for message in resume_initial_messages]
     elif self._context_builder is not None:
@@ -1467,6 +1623,58 @@ class RunnerRunLoopMixin:
       active_delivery_obligation,
     )
 
+  async def _observe_provider_request_boundary(
+    self,
+    ladder: SoftBudgetLadder,
+    *,
+    turn_count: int,
+    continuing_segment: bool,
+    build_soft_budget_steer_event: Callable[[str, float, float], Dict[str, Any]],
+    build_soft_budget_final_event: Callable[[str, float, float], Dict[str, Any]],
+    logger: logging.Logger,
+  ) -> SoftBudgetAction | None:
+    """Provider-request boundary: reserved spend, then the soft ladder.
+
+    A metered job whose ledger has reached reserved_spend_microusd ends
+    here, before the next provider request, in the interrupted shape the
+    soft-budget abort uses. rulings-index WA-ACCOUNT-BUDGET.
+    """
+    commercial_budget = self._commercial_budget_stop_fields()
+    if commercial_budget is not None:
+      self._request_boundary_stop_reason = "commercial_budget_reached"
+      await self._emit_interrupted_event(
+        "commercial_budget_reached",
+        extra_fields=commercial_budget,
+      )
+      return SoftBudgetAction(
+        kind="turns",
+        stage="abort",
+        observed=float(commercial_budget["spent_microusd"]),
+        threshold=float(commercial_budget["reserved_spend_microusd"]),
+      )
+    action = await self._observe_soft_budget(
+      ladder,
+      turn_count=turn_count,
+      continuing_segment=continuing_segment,
+      build_soft_budget_steer_event=build_soft_budget_steer_event,
+      build_soft_budget_final_event=build_soft_budget_final_event,
+      logger=logger,
+    )
+    if action is not None and action.stage == "abort":
+      self._request_boundary_stop_reason = "soft_budget_abort"
+    return action
+
+  def _commercial_budget_stop_fields(self) -> dict[str, int] | None:
+    """Metered reserved spend already reached, else None.
+
+    The ledger lives on the work-start context the usage producer holds.
+    Children share that producer, so they share the ledger. A byok ticket
+    has no reservation and never stops. rulings-index WA-ACCOUNT-BUDGET.
+    """
+    return commercial_budget_stop_fields(
+      getattr(self, "_commercial_usage_producer", None)
+    )
+
   async def _observe_soft_budget(
     self,
     ladder: SoftBudgetLadder,
@@ -1522,6 +1730,7 @@ class RunnerRunLoopMixin:
     terminal_assistant_turn_message: Callable[[], Dict[str, Any]],
     build_chat_done_log_data: _BuildChatDoneLogData,
     build_stream_complete_event: _BuildStreamCompleteEvent,
+    todo_measurements: dict[str, int] | None,
     chat_t0: float,
     client: object,
     current_messages: list[dict[str, Any]],
@@ -1724,7 +1933,7 @@ class RunnerRunLoopMixin:
       )
       await self._emit_run_error_event(exc, phase="client_close_after_stream_complete")
 
-  def _consume_parent_messages(
+  async def _consume_parent_messages(
     self,
     *,
     current_messages: list[dict[str, Any]],
@@ -1757,9 +1966,8 @@ class RunnerRunLoopMixin:
         reset_logical_response_lineage()
         max_tokens_continuation_pending = False
         max_tokens_continuations = 0
-      current_messages.append(user_turn_message(
-        format_parent_messages(parent_messages)
-      ))
+      formatted = format_parent_messages(parent_messages)
+      current_messages.append(user_turn_message(formatted))
       pending_parent_message_acks.update({
         (message.task_id, message.sent_seq): message
         for message in parent_messages
@@ -1768,6 +1976,25 @@ class RunnerRunLoopMixin:
           and message.sent_seq is not None
         )
       })
+      operator_msgs = [
+        message for message in parent_messages
+        if getattr(message, "origin", None) == "operator_inbox"
+      ]
+      if operator_msgs:
+        steer_event = _runner_attr(
+          self, "_build_user_message_event", _build_user_message_event
+        )(
+          content=formatted,
+          client_kind="operator",
+          received_at=_runner_attr(self, "time", time).time(),
+          selected_content=(),
+          operator_messages=[
+            {"message_id": m.message_id, "sent_at": m.sent_at}
+            for m in operator_msgs
+          ],
+        )
+        self._append(steer_event)
+        await self._append_durable_event(steer_event)
     return max_tokens_continuation_pending, max_tokens_continuations
 
   def _log_turn_context_estimate(
@@ -1830,6 +2057,42 @@ class RunnerRunLoopMixin:
       )
     return estimate_snapshot
 
+  async def _close_and_snapshot_usage(
+    self,
+    *,
+    time_module: types.ModuleType,
+    drain_state: Any,
+  ) -> SessionUsageSummary:
+    """Close the run's aggregator; return its own billing row.
+
+    The session's own billing row counts this run alone; the recap and the
+    commercial reconciliation read the whole dispatch tree's total, kept on
+    `_session_usage_summary`.
+    """
+    await self._aggregator.close()
+    snapshot_kwargs: dict[str, Any] = {
+      "ended_at": time_module.time(),
+      "drain_complete": drain_state.drain_complete,
+      "in_flight_task_count": drain_state.in_flight_task_count,
+      "context_surfaces": self._context_surface_records(),
+      "stream_started_at": self._stream_started_at,
+      "first_text_at": self._first_text_at,
+    }
+    self._session_usage_summary = await self._aggregator.fleet_snapshot(
+      **snapshot_kwargs,
+    )
+    return await self._aggregator.snapshot(**snapshot_kwargs)
+
+  async def _emit_session_summary(
+    self, row_summary: SessionUsageSummary | None,
+  ) -> None:
+    self._summary_emitted = True
+    if row_summary is not None:
+      await self._call_on_session_summary(
+        row_summary,
+        reconciled=self._session_usage_summary,
+      )
+
   async def _finalize_run(
     self,
     *,
@@ -1847,7 +2110,6 @@ class RunnerRunLoopMixin:
   ) -> None:
     finalizer_errors: list[BaseException] = []
     settlement_succeeded = False
-    shutdown_failed = False
     try:
       from .skill_context import clear_current_skill
 
@@ -1855,69 +2117,74 @@ class RunnerRunLoopMixin:
     except Exception:
       pass
     self._active_skill_allow.clear()
+    running_entries = self._task_registry.list_tasks(state=task_state_cls.RUNNING)
+    drain_state = session_drain_state(
+      running_entries,
+      # Children survive the parent turn; session teardown owns the kill, so
+      # turn end has no shutdown that could fail.
+      shutdown_failed=False,
+      unsettled_workflow_obstructions=(
+        self._unsettled_workflow_obstruction_count()
+      ),
+    )
+    row_summary: SessionUsageSummary | None = None
+    if self._parent_aggregator is None:
+      try:
+        row_summary = await self._close_and_snapshot_usage(
+          time_module=time_module, drain_state=drain_state,
+        )
+      except BaseException as exc:
+        if isinstance(exc, asyncio.CancelledError):
+          finalizer_errors.append(exc)
+        logger.error(
+          "[%s] session summary snapshot failed (non-fatal) | exception_type=%s",
+          self._sid,
+          type(exc).__name__,
+        )
     try:
-      await self._shutdown_background_tasks(was_cancelled)
+      flush_learning_fork_events(self)
+      settlement_succeeded = await self._settle_run_closure(
+        clean_detach_reason=clean_detach_reason,
+        run_error=run_error or (finalizer_errors[0] if finalizer_errors else None),
+      )
+    except asyncio.CancelledError as exc:
+      was_cancelled = True
+      if not isinstance(run_error, asyncio.CancelledError):
+        run_error = exc
+      if exc.__cause__ is not None:
+        finalizer_errors.append(exc.__cause__)
     except BaseException as exc:
       finalizer_errors.append(exc)
-      shutdown_failed = True
     finally:
-      running_entries = self._task_registry.list_tasks(state=task_state_cls.RUNNING)
-      drain_state = session_drain_state(
-        running_entries,
-        shutdown_failed=shutdown_failed,
-        unsettled_workflow_obstructions=(
-          self._unsettled_workflow_obstruction_count()
-        ),
-      )
-      if self._parent_aggregator is None:
-        try:
-          await self._aggregator.close()
-          self._session_usage_summary = await self._aggregator.snapshot(
-            ended_at=time_module.time(),
-            drain_complete=drain_state.drain_complete,
-            in_flight_task_count=drain_state.in_flight_task_count,
-            context_surfaces=self._context_surface_records(),
-            stream_started_at=self._stream_started_at,
-            first_text_at=self._first_text_at,
-          )
-        except BaseException as exc:
-          if isinstance(exc, asyncio.CancelledError):
-            finalizer_errors.append(exc)
-          logger.error(
-            "[%s] session summary snapshot failed (non-fatal) | exception_type=%s",
-            self._sid,
-            type(exc).__name__,
-          )
+      self._run_closure_deferred = False
+    if self._parent_aggregator is None:
       try:
-        settlement_succeeded = await self._settle_run_closure(
-          clean_detach_reason=clean_detach_reason,
-          run_error=run_error or (finalizer_errors[0] if finalizer_errors else None),
+        await self._emit_session_summary(row_summary)
+      except BaseException as exc:
+        if isinstance(exc, asyncio.CancelledError):
+          finalizer_errors.append(exc)
+        logger.error(
+          "[%s] session summary emission failed (non-fatal) | exception_type=%s",
+          self._sid,
+          type(exc).__name__,
         )
-      except asyncio.CancelledError as exc:
-        was_cancelled = True
-        if not isinstance(run_error, asyncio.CancelledError):
-          run_error = exc
-        if exc.__cause__ is not None:
-          finalizer_errors.append(exc.__cause__)
+    else:
+      self._summary_emitted = True
+    self_task = self._admitted_self_task
+    # Only a durably registered own job has a journal entry to settle.
+    if (
+      self_task is not None
+      and self_task.registration_persistence_state == "committed"
+    ):
+      try:
+        await self._finalize_admitted_self_task(
+          self_task,
+          run_error=run_error or (finalizer_errors[0] if finalizer_errors else None),
+          was_cancelled=was_cancelled,
+          prior_evidence=self._admitted_self_prior_evidence,
+        )
       except BaseException as exc:
         finalizer_errors.append(exc)
-      finally:
-        self._run_closure_deferred = False
-      if self._parent_aggregator is None:
-        try:
-          self._summary_emitted = True
-          if self._session_usage_summary is not None:
-            await self._call_on_session_summary(self._session_usage_summary)
-        except BaseException as exc:
-          if isinstance(exc, asyncio.CancelledError):
-            finalizer_errors.append(exc)
-          logger.error(
-            "[%s] session summary emission failed (non-fatal) | exception_type=%s",
-            self._sid,
-            type(exc).__name__,
-          )
-      else:
-        self._summary_emitted = True
     try:
       await self._await_write_lease_handoff()
     except BaseException as exc:
@@ -2119,6 +2386,67 @@ class RunnerRunLoopMixin:
         )
     return delivered_notifications_recorded, delivery_request_nudge_recorded
 
+  def _child_trust_reminder(self, base_kwargs: Dict[str, Any]) -> str:
+    # The child-result trust policy rides the reminder only where child
+    # results can arrive: run_agent is advertised to this run, or a child
+    # notification is already queued (background tasks and forks enqueue
+    # without the run_agent tool).
+    child_results_possible = (
+      self._notification_queue.pending_count > 0
+      or any(
+        tool.get("name") == "run_agent"
+        for tool in base_kwargs.get("tools") or []
+      )
+    )
+    return self._build_notification_reminder() if child_results_possible else ""
+
+  def _append_tool_calls_planned(self, turn: Any, turn_count: int) -> None:
+    if turn.tool_uses:
+      self._append(_build_tool_calls_planned_event(
+        turn=turn_count,
+        calls=_planned_tool_calls(
+          self._dispatcher,
+          turn.tool_uses,
+          _runner_attr(self, "resolve_display", resolve_display),
+        ),
+      ))
+
+  def _record_context_composition(
+    self,
+    turn: Any,
+    turn_count: int,
+    turn_system_prompt: Any,
+    base_kwargs: Dict[str, Any],
+    system_chars: int,
+  ) -> None:
+    """One ``context_composition`` event per provider request
+    (``session_recap.CONTEXT_COMPOSITION_FIELDS``): what the request carried,
+    per disclosure layer. Counters, not names; the names are already in the
+    log's tool events. Sizes fold as the run's peak; the invoked counts are
+    cumulative so the peak is the total. A measurement, never a gate."""
+    self._context_tools_invoked += len(turn.tool_uses)
+    self._context_skills_invoked += sum(
+      1 for _tid, tool_name, _input in turn.tool_uses
+      if tool_name == "invoke_skill"
+    )
+    try:
+      system_total = len(_system_prompt_estimate_text(turn_system_prompt))
+      self._append(build_context_composition_event(
+        turn=turn_count,
+        group_chars=self._context_group_chars,
+        system_total=system_total,
+        reminders=max(0, system_total - system_chars),
+        tools_advertised=len(base_kwargs.get("tools") or []),
+        tools_invoked=self._context_tools_invoked,
+        skills_invoked=self._context_skills_invoked,
+      ))
+    except Exception as exc:
+      log.warning(
+        "[%s] context composition suppressed | exception_type=%s",
+        self._sid,
+        type(exc).__name__,
+      )
+
   async def _prepare_provider_request(
     self,
     *,
@@ -2203,16 +2531,17 @@ class RunnerRunLoopMixin:
       messages=current_messages,
       tools=base_kwargs.get("tools") or [],
     )
+    containment = self._containment
     context_pressure = context_pressure_reminder_decision(
       est_tokens=request_estimate.est_total_tokens,
       context_limit=context_limit,
       next_threshold_pct=getattr(
         self,
         "_context_pressure_next_reminder_pct",
-        CONTEXT_PRESSURE_REMINDER_PCT,
+        containment.context_pressure_reminder_pct,
       ),
-      initial_threshold_pct=CONTEXT_PRESSURE_REMINDER_PCT,
-      step_pct=CONTEXT_PRESSURE_REMINDER_STEP_PCT,
+      initial_threshold_pct=containment.context_pressure_reminder_pct,
+      step_pct=containment.context_pressure_reminder_step_pct,
     )
     self._context_pressure_next_reminder_pct = (
       context_pressure.next_threshold_pct
@@ -2292,6 +2621,7 @@ class RunnerRunLoopMixin:
     max_tokens_nudge: str,
     last_ordinary_turn: int | None,
     no_tool_use_turn_outcome: _NoToolUseTurnOutcome,
+    todo_state: TodoSessionState | None,
     persist_assistant_message_once: Callable[[], Awaitable[int]],
     task_state_cls: type[TaskState],
     terminal_failure: tuple[str, str] | None,
@@ -2576,6 +2906,56 @@ class RunnerRunLoopMixin:
           type(exc).__name__,
         )
       return finish("continue")
+    if (
+      todo_state is not None
+      and turn.stop_reason in {"end_turn", "refusal"}
+      and todo_state.reminder_due()
+      and not delivery_epoch_forced_final
+      and (last_ordinary_turn is None or turn_count < last_ordinary_turn)
+    ):
+      reminder_text = todo_state.next_reminder()
+      current_messages.append(
+        assistant_turn_message(
+          turn.content_blocks,
+          provider=self._provider.name,
+          model=upstream_model,
+          stop_reason=turn.stop_reason,
+        )
+      )
+      current_messages.append(user_turn_message(reminder_text))
+      try:
+        await self._append_durable_event(
+          _build_todo_snapshot_event(
+            todo_state.checklist,
+            actor="agent",
+            op="todo_reminder",
+            gateway_session_id=todo_state.gateway_session_id,
+          )
+        )
+      except Exception as exc:
+        logger.warning(
+          "[%s] todo reminder record suppressed | exception_type=%s",
+          self._sid,
+          type(exc).__name__,
+        )
+      return finish("continue")
+    if (
+      turn.stop_reason == "end_turn"
+      and self._message_inbox is not None
+      and not self._message_inbox.empty()
+    ):
+      # A send accepted while this turn was in flight has not been read yet.
+      # Finishing here would drop it; keep this answer in context and let the
+      # next loop pass deliver the message after it.
+      current_messages.append(
+        assistant_turn_message(
+          turn.content_blocks,
+          provider=self._provider.name,
+          model=upstream_model,
+          stop_reason=turn.stop_reason,
+        )
+      )
+      return finish("continue")
     if turn.stop_reason in {"end_turn", "refusal"}:
       terminal_success_reason = turn.stop_reason
     else:
@@ -2631,6 +3011,7 @@ class RunnerRunLoopMixin:
     mark_terminal_interruption: Callable[[str], None],
     last_ordinary_turn: int | None,
     model_visible_tool_result_ids: set[str],
+    todo_state: TodoSessionState | None,
     pending_model_visible_tool_result_ids: set[str],
     task_state_cls: type[TaskState],
     terminal_failure: tuple[str, str] | None,
@@ -2647,7 +3028,11 @@ class RunnerRunLoopMixin:
         delivery_turn_compelled=delivery_turn_compelled,
         terminal_failure=terminal_failure,
         terminal_success_reason=terminal_success_reason,
+        approval_park=self._approval_park,
       )
+
+    if self._approval_park is not None:
+      return finish("break")
 
     stop_after_tool_results_reason = getattr(self, "_stop_after_tool_results_reason", None)
     if stop_after_tool_results_reason:
@@ -2675,12 +3060,6 @@ class RunnerRunLoopMixin:
             else ""
           )
           + ".",
-        )
-      elif stop_after_tool_results_reason == "approval_timeout":
-        terminal_failure = (
-          "approval_timeout",
-          "approval_timeout: approval expired before the user "
-          "answered; a fresh tool call and approval are required.",
         )
       elif stop_after_tool_results_reason in {
         "terminal_tool_result",
@@ -2785,9 +3164,51 @@ class RunnerRunLoopMixin:
             type(exc).__name__,
           )
         return finish("continue")
+      if (
+        todo_state is not None
+        and turn.stop_reason in {"end_turn", "refusal"}
+        and todo_state.reminder_due()
+        and not delivery_epoch_forced_final
+        and (last_ordinary_turn is None or turn_count < last_ordinary_turn)
+      ):
+        reminder_text = todo_state.next_reminder()
+        current_messages.append(user_turn_message(reminder_text))
+        try:
+          await self._append_durable_event(
+            _build_todo_snapshot_event(
+              todo_state.checklist,
+              actor="agent",
+              op="todo_reminder",
+              gateway_session_id=todo_state.gateway_session_id,
+            )
+          )
+        except Exception as exc:
+          logger.warning(
+            "[%s] todo reminder record suppressed | exception_type=%s",
+            self._sid,
+            type(exc).__name__,
+          )
+        return finish("continue")
       terminal_success_reason = "end_turn_after_tools"
       return finish("break")
     return finish("continue")
+
+  async def _load_todo_run_state(self) -> TodoSessionState | None:
+    """Read the session's live checklist, fold it from the journal, and reset
+    its per-turn reminder count. Returns ``None`` when the session has no
+    state (children, SDK sessions, or a run without a checklist)."""
+    if getattr(self, "_role", None) != "writer" or self._gateway_session is None:
+      return None
+    from .todo_checklist import ensure_todo_session_state
+    scope_to_run = getattr(self, "_soft_budget_kind", None) == "autonomous"
+    state = ensure_todo_session_state(
+      self._gateway_session,
+      gateway_session_id=self._gateway_session_id,
+      scope_to_run=scope_to_run,
+    )
+    await state.load(self._agent_session_log)
+    state.reset_turn()
+    return state
 
   async def run(
     self,
@@ -2822,6 +3243,7 @@ class RunnerRunLoopMixin:
     resume_initial_messages: List[Dict[str, Any]] | None = None,
   ) -> None:
     _require_fresh_runner(self._summary_emitted)
+    self._approval_park = None
     self._session_usage_summary = None
     self._stream_started_at = None
     self._first_text_at = None
@@ -2836,7 +3258,8 @@ class RunnerRunLoopMixin:
     queue_empty = getattr(asyncio_module, "QueueEmpty", asyncio.QueueEmpty)
     cancelled_error = getattr(asyncio_module, "CancelledError", asyncio.CancelledError)
     gather_fn = getattr(asyncio_module, "gather", asyncio.gather)
-    context_warning_pct = _runner_attr(self, "CONTEXT_WARNING_PCT", CONTEXT_WARNING_PCT)
+    containment = self._containment
+    context_warning_pct = containment.context_warning_pct
     coordinator_default_preamble = _runner_attr(
       self, "COORDINATOR_DEFAULT_PREAMBLE", COORDINATOR_DEFAULT_PREAMBLE
     )
@@ -2943,6 +3366,13 @@ class RunnerRunLoopMixin:
       messages,
       resume_initial_messages,
     )
+    # The prompt object the runner was handed still carries its section
+    # records (api ``PromptBlocks``); later transforms return plain lists.
+    self._context_group_chars = context_chars_by_group(
+      getattr(system_prompt, "prompt_sections", None)
+    )
+    self._context_tools_invoked = 0
+    self._context_skills_invoked = 0
     self._run_closure_deferred = True
     try:
       if self._agent_session_log is None:
@@ -3002,8 +3432,7 @@ class RunnerRunLoopMixin:
         if getattr(self, "_allow_stub_response", False):
           await self._emit_stub_response(messages)
           return
-        provider_name = str(getattr(self._provider, "name", "unknown") or "unknown")
-        message = f"Provider startup failed: could not create client for provider={provider_name}."
+        message = _provider_startup_error_message(self._provider, exc)
         logger.error(
           "[%s] %s | exception_type=%s",
           self._sid,
@@ -3055,7 +3484,9 @@ class RunnerRunLoopMixin:
       await self._execute_resume_approved_call(messages, base_kwargs)
       logger.info("[%s] Effort requested | effort=%s", self._sid, bound_effort)
 
-      effective_compaction_trigger = effective_compaction_trigger_fn(self._compaction_trigger, model_info)
+      effective_compaction_trigger = effective_compaction_trigger_fn(
+        self._compaction_trigger, model_info, containment,
+      )
       native_compaction = model_info.supports_native_compaction
       if effective_compaction_trigger is not None:
         compaction_mode = (
@@ -3071,7 +3502,7 @@ class RunnerRunLoopMixin:
         )
       else:
         logger.info("[%s] Compaction enabled | mode=disabled", self._sid)
-      context_limit = model_context_window(model_info)
+      context_limit = model_context_window(model_info, containment)
 
       logger.info("[%s] Chat start | model=%s max_tokens=%d messages=%d", self._sid, upstream_model, max_tokens, len(messages))
 
@@ -3124,6 +3555,7 @@ class RunnerRunLoopMixin:
       self._last_reported_cost = 0.0
       self._ensure_sub_agent_semaphore()
       turn_count = 0
+      todo_state = await self._load_todo_run_state()
       delivery_grace_credits: dict[
         tuple[str, int, str],
         int,
@@ -3142,11 +3574,10 @@ class RunnerRunLoopMixin:
         turn_threshold=(
           None
           if soft_budget_kind == "writer"
-          else resolve_soft_turn_budget(
-            soft_budget_kind,
-            configured_soft_turn_budget(),
-          )
+          else containment.soft_turn_threshold(soft_budget_kind)
         ),
+        final_factor=containment.soft_budget_final_factor,
+        grace_turns=containment.soft_budget_grace_turns,
       )
       delivery_turn_compelled = False
       unread_handle_reminded_task_ids: set[str] = set()
@@ -3242,7 +3673,7 @@ class RunnerRunLoopMixin:
         (
           max_tokens_continuation_pending,
           max_tokens_continuations,
-        ) = self._consume_parent_messages(
+        ) = await self._consume_parent_messages(
           current_messages=current_messages,
           format_parent_messages=format_parent_messages,
           is_child_logical_response=is_child_logical_response,
@@ -3255,6 +3686,7 @@ class RunnerRunLoopMixin:
           reset_logical_response_lineage=reset_logical_response_lineage,
           user_turn_message=user_turn_message,
         )
+        _deliver_todo_analyst_note(todo_state, current_messages, user_turn_message)
 
         continuing_provider_segment = (
           is_child_logical_response
@@ -3264,7 +3696,7 @@ class RunnerRunLoopMixin:
         # Observed before every provider request, continuation segments
         # included: the ladder counts requests, so a max_tokens chain that
         # never completes a turn still steers, finalizes and meets the abort.
-        soft_budget_action = await self._observe_soft_budget(
+        soft_budget_action = await self._observe_provider_request_boundary(
           soft_budget_ladder,
           # Background-result delivery turns the forced-final epoch credits
           # are bounded by its own credits; they settle work the run already
@@ -3279,7 +3711,7 @@ class RunnerRunLoopMixin:
           None if soft_budget_action is None else soft_budget_action.stage
         )
         if soft_budget_stage == "abort":
-          mark_terminal_interruption("soft_budget_abort")
+          mark_terminal_interruption(self._request_boundary_stop_reason)
           break
         if soft_budget_stage == "final":
           # The turn now starting is the forced final. On an ordinary turn
@@ -3398,7 +3830,7 @@ class RunnerRunLoopMixin:
         )
 
         bg_reminder = self._background_task_reminder_text()
-        notif_reminder = self._build_notification_reminder()
+        notif_reminder = self._child_trust_reminder(base_kwargs)
         turn_reminder = turn_reminder_state(
           bg_reminder,
           notif_reminder,
@@ -3678,6 +4110,20 @@ class RunnerRunLoopMixin:
             tools_chars=tools_chars,
             usage_totals=usage_totals,
           )
+          # A model_fallback hop inside the stream turn rebinds the runner:
+          # the serving model's facts bill this request and shape the next.
+          upstream_model = self._capability_execution.bind.upstream_model
+          model_info = self._provider.get_model_info(upstream_model)
+          max_tokens = select_run_max_tokens(
+            config,
+            max_tokens_override=self._max_tokens_override,
+            model_info=model_info,
+          ).value
+          effective_compaction_trigger = effective_compaction_trigger_fn(
+            self._compaction_trigger, model_info, containment,
+          )
+          native_compaction = model_info.supports_native_compaction
+          context_limit = model_context_window(model_info, containment)
           if isinstance(turn_result, StreamTurnFailure):
             remove_current_message(request_scoped_nudge_message)
             request_scoped_nudge_message = None
@@ -3702,10 +4148,13 @@ class RunnerRunLoopMixin:
                 client = self._provider.create_client(config)
                 self._set_client(client)
                 continue
+            clean_detach_reason = "error"
             await self._emit_error_event(turn_result.formatted_error)
             await self._close_client(client, timeout=5.0)
             return
           if turn_result is None:
+            # _stream_turn emitted its error event before returning None.
+            clean_detach_reason = "error"
             remove_current_message(request_scoped_nudge_message)
             remove_current_message(
               delivery_request_nudge_message
@@ -3717,6 +4166,9 @@ class RunnerRunLoopMixin:
             delivery_request_nudge_message
           )
           delivery_request_nudge_message = None
+          break
+        if getattr(self, "_request_boundary_stop_reason", None) == "commercial_budget_reached":
+          mark_terminal_interruption("commercial_budget_reached")
           break
 
         client, turn = turn_result
@@ -3839,15 +4291,13 @@ class RunnerRunLoopMixin:
           "request_input_tokens": real_stream_input,
           "context_window": context_limit,
         })
-        if turn.tool_uses:
-          self._append(_build_tool_calls_planned_event(
-            turn=turn_count,
-            calls=_planned_tool_calls(
-              self._dispatcher,
-              turn.tool_uses,
-              _runner_attr(self, "resolve_display", resolve_display),
-            ),
-          ))
+        # Measurement only (``session_recap.CONTEXT_COMPOSITION_FIELDS``):
+        # what this request carried, per disclosure layer. Counters, not names;
+        # the names are already in the log's tool events.
+        self._record_context_composition(
+          turn, turn_count, turn_system_prompt, base_kwargs, system_chars
+        )
+        self._append_tool_calls_planned(turn, turn_count)
 
         turn_log_summary = stream_turn_log_summary(
           turn,
@@ -3927,6 +4377,7 @@ class RunnerRunLoopMixin:
             task_state_cls=task_state_cls,
             terminal_failure=terminal_failure,
             terminal_success_reason=terminal_success_reason,
+            todo_state=todo_state,
             turn=turn,
             turn_count=turn_count,
             unread_handle_reminded_task_ids=unread_handle_reminded_task_ids,
@@ -3993,7 +4444,8 @@ class RunnerRunLoopMixin:
           ),
         )
         tools_used.extend(tool_loop.tools_used)
-        current_messages.append(user_turn_message(tool_loop.tool_results_content))
+        if tool_loop.tool_results_content or tool_loop.approval_park is None:
+          current_messages.append(user_turn_message(tool_loop.tool_results_content))
         completion_contract_error = _agent_completion_contract_error(
           tool_uses=turn.tool_uses,
           tool_result_blocks=tool_loop.tool_results_content,
@@ -4004,6 +4456,8 @@ class RunnerRunLoopMixin:
             completion_contract_error,
           )
           break
+        if todo_state is not None:
+          todo_state.note_tool_call()
         model_visible_tool_result_ids = {
           str(block["tool_use_id"])
           for block in tool_loop.tool_results_content
@@ -4019,6 +4473,7 @@ class RunnerRunLoopMixin:
             model_visible_tool_result_ids
           )
 
+        self._approval_park = tool_loop.approval_park
         tool_turn = await self._finish_tool_turn(
           background_tasks_completed_user_message=(
             background_tasks_completed_user_message
@@ -4038,6 +4493,7 @@ class RunnerRunLoopMixin:
           task_state_cls=task_state_cls,
           terminal_failure=terminal_failure,
           terminal_success_reason=terminal_success_reason,
+          todo_state=todo_state,
           turn=turn,
           turn_count=turn_count,
           unread_handle_reminded_task_ids=unread_handle_reminded_task_ids,
@@ -4047,9 +4503,20 @@ class RunnerRunLoopMixin:
         delivery_turn_compelled = tool_turn.delivery_turn_compelled
         terminal_failure = tool_turn.terminal_failure
         terminal_success_reason = tool_turn.terminal_success_reason
+        self._approval_park = tool_turn.approval_park
         if tool_turn.action == "continue":
           continue
         break
+      if self._approval_park is not None:
+        self._terminal_closure_event = build_stream_complete_event(
+          usage_totals=usage_totals,
+          estimated_cost=estimated_cost,
+          est_system_tokens=initial_estimate.est_system_tokens,
+          est_tools_tokens=initial_estimate.est_tools_tokens,
+          terminal_disposition="awaiting_approval",
+        )
+        clean_detach_reason = "awaiting_approval"
+        return
       self._background_delivery_grace_active = True
       if terminal_failure is not None:
         await emit_terminal_failure(*terminal_failure)
@@ -4080,6 +4547,9 @@ class RunnerRunLoopMixin:
         terminal_assistant_turn_message=terminal_assistant_turn_message,
         build_chat_done_log_data=build_chat_done_log_data,
         build_stream_complete_event=build_stream_complete_event,
+        todo_measurements=(
+          todo_state.measurements() if todo_state is not None else None
+        ),
         chat_t0=chat_t0,
         client=client,
         current_messages=current_messages,

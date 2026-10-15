@@ -511,6 +511,25 @@ class AutonomousApprovalDeliveryCoordinator:
       raise PermanentAutonomousApprovalDeliveryError(
         "autonomous approval owner task is not active"
       )
+    owner_user_id = str(record.owner_user_id or "").strip()
+    if owner_user_id:
+      live_role = getattr(self._registry, "live_user_role", None)
+      lookup = getattr(self._registry, "_mcp_user_key_lookup", None)
+      if callable(live_role):
+        role = live_role(owner_user_id, getattr(record, "user_email", None))
+        if role is None and lookup is not None:
+          raise PermanentAutonomousApprovalDeliveryError(
+            f"User {owner_user_id!r} is no longer admitted on the roster; approval delivery stopped"
+          )
+      elif callable(lookup):
+        try:
+          entry = lookup(owner_user_id, getattr(record, "user_email", None))
+        except SystemExit:
+          entry = None
+        if not isinstance(entry, dict):
+          raise PermanentAutonomousApprovalDeliveryError(
+            f"User {owner_user_id!r} is no longer admitted on the roster; approval delivery stopped"
+          )
     approval_id = delivery.get("approval_id")
     tool_call_id = delivery.get("tool_call_id")
     nonce = delivery.get("nonce")

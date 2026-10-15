@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 from decimal import Decimal
 import threading
 from typing import Any, Literal
@@ -12,100 +11,11 @@ from model_authority.bind import CapabilityBind
 
 from .multi_user.billing import SessionUsageSummary
 
-UsageDurability = Literal["outbox", "emergency_spool", "lost"]
-# Single owner of the durability vocabulary and its recovery ordering.
-# A durability outside this set is a broken sink contract and fails loudly.
-USAGE_DURABILITY_RANK: dict[str, int] = {
-  "lost": 0,
-  "emergency_spool": 1,
-  "outbox": 2,
-}
-
-
-@dataclass(frozen=True)
-class CommercialUsageReconciliationReport:
-  environment: str
-  source_product: str
-  request_id: str
-  session_id: str
-  execution_context_id: str
-  workflow_run_id: str
-  status: Literal["match", "mismatch", "incomplete"]
-  commercial_event_count: int
-  provider_call_event_count: int
-  durable_provider_call_event_count: int
-  separate_unit_event_count: int
-  expected_provider_call_count: int
-  provider_call_count_delta: int
-  missing_event_id_count: int
-  missing_source_event_ids: tuple[str, ...]
-  emergency_spooled_event_count: int
-  durability_lost_event_count: int
-  conflicting_event_id_count: int
-  conflicting_source_event_ids: tuple[str, ...]
-  late_event_count: int
-  late_source_event_ids: tuple[str, ...]
-  observed_source_event_ids: tuple[str, ...]
-  summary_usage_event_ids: tuple[str, ...]
-  event_lines: tuple[dict[str, Any], ...]
-  commercial_input_tokens: int
-  summary_input_tokens: int
-  input_token_delta: int
-  commercial_output_tokens: int
-  summary_output_tokens: int
-  output_token_delta: int
-  commercial_cache_read_tokens: int
-  summary_cache_read_tokens: int
-  cache_read_token_delta: int
-  commercial_cache_write_tokens: int
-  summary_cache_write_tokens: int
-  cache_write_token_delta: int
-  reasoning_tokens_observed: int
-  provider_units: Decimal
-  commercial_producer_estimate_usd: Decimal
-  summary_estimate_usd: Decimal
-  estimate_delta_usd: Decimal
-  drain_complete: bool
-  in_flight_task_count: int
-  summary_started_at: float
-  summary_ended_at: float
-  summary_emitted_as_cost_event: Literal[False] = False
-  workflow_attempt_group_id: str | None = None
-  workflow_attempt_number: int | None = None
-  retry_of_workflow_run_id: str | None = None
-  workflow_attempt_kind: str | None = None
-  work_authorization_id: str | None = None
-  source_usage_schema_version: Literal[1, 2, 3] = 1
-
-  @property
-  def evidence_schema_version(self) -> Literal[1, 2, 3]:
-    if self.source_usage_schema_version == 3:
-      return 3
-    return 2 if self.workflow_attempt_group_id is not None else 1
-
-  def as_dict(self) -> dict[str, Any]:
-    value = asdict(self)
-    for field in (
-      "provider_units", "commercial_producer_estimate_usd",
-      "summary_estimate_usd", "estimate_delta_usd",
-    ):
-      value[field] = str(value[field])
-    for field in (
-      "missing_source_event_ids", "late_source_event_ids",
-      "conflicting_source_event_ids", "observed_source_event_ids",
-      "summary_usage_event_ids", "event_lines",
-    ):
-      value[field] = list(value[field])
-    if self.evidence_schema_version != 3:
-      value.pop("source_usage_schema_version")
-    if self.evidence_schema_version == 1:
-      for field in (
-        "workflow_attempt_group_id", "workflow_attempt_number",
-        "retry_of_workflow_run_id", "workflow_attempt_kind",
-        "work_authorization_id",
-      ):
-        value.pop(field)
-    return value
+from hank_contracts.usage import (
+  UsageDurability,
+  USAGE_DURABILITY_RANK,
+  CommercialUsageReconciliationReport as CommercialUsageReconciliationReport,
+)
 
 
 class CommercialUsageReconciliationTracker:

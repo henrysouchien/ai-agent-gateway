@@ -45,6 +45,7 @@ from model_authority.selection import CapabilityDefault, ProductModelSelectionPo
 from .providers import AnthropicProvider, ModelProvider
 from model_authority.rates import load_rate_table
 from .admission import current_parent_context, root_context
+from .containment_settings import resolve_containment_settings
 from .runner import AgentRunner, ToolResultContext
 from .runtime_spill import build_spill_sink
 from .tool_result_spill import (
@@ -207,12 +208,11 @@ def _easy_model_selection_policy(
   # Revisions are configuration provenance, never a carrier for the caller's
   # model/effort choice (which is also unbounded and can exceed the 64-char
   # Version cap on durable bindings). The derived policy keeps the base
-  # revision; the caller's choice is expressed as the session.driver default
-  # below and surfaces in every binding as model_key/effort with
-  # selection_source="capability_default".
-  policy = ProductModelSelectionPolicy(
-    schema=INITIAL_MODEL_SELECTION_POLICY.schema,
-    revision=INITIAL_MODEL_SELECTION_POLICY.revision,
+  # revision, tiers and presets; the caller's choice is expressed as the
+  # session.driver default below and surfaces in every binding as
+  # model_key/effort with selection_source="capability_default".
+  policy = replace(
+    INITIAL_MODEL_SELECTION_POLICY,
     capabilities={
       **INITIAL_MODEL_SELECTION_POLICY.capabilities,
       SESSION_DRIVER_CAPABILITY: replace(
@@ -351,7 +351,8 @@ def create_agent(
     outputs_dir: Directory for named-skill output files. Stale same-day outputs are cleaned before background sub-agent launch.
     session_log_base_dir: Durable parent/child session-log root. Defaults to
       `AGENT_SESSION_LOG_BASE_DIR`, then `~/.cache/agent-gateway/agent-sessions`.
-    code_execution: Enable built-in `code_execute` and `code_execute_status`.
+    code_execution: Enable built-in `code_execute`; a `background=true` cell
+      runs as a `code` job on the turn runner's task registry.
       Docker is preferred; subprocess is the fallback when registered.
     code_execution_config: Optional `CodeExecutionConfig` override.
     valid_api_keys: API keys accepted by `/chat/init`. If empty, any non-empty
@@ -362,7 +363,7 @@ def create_agent(
     cors_origins: Allowed CORS origins. Defaults to `["*"]`.
     prefix: Route prefix. Defaults to `/api`.
     on_usage: Optional usage hook invoked after each completed stream turn.
-    on_session_summary: Optional hook invoked once with aggregate session usage.
+    on_session_summary: Optional hook invoked once per session run with that run's own usage: the root's, and each delegated sub-agent's (`session_id` `sub<N>:<root session id>`), under the root's `unit_kind` / `unit_id`.
     on_tool_result: Optional hook invoked after each tool result is prepared.
     on_tool_timing: Optional hook invoked after each tool finishes.
     on_startup: Optional async or sync startup callback.
@@ -419,6 +420,8 @@ def create_agent(
     )
     ```
   """
+  # This application's composition root: its containment bounds resolve once.
+  containment = resolve_containment_settings(os.environ)
   if skills_dir is not None and operation_catalog is not None:
     raise ValueError(
       "create_agent accepts either skills_dir or operation_catalog, not both"
@@ -557,7 +560,7 @@ def create_agent(
   if mcp_servers or resolved_mcp_config_path:
     builtin_names = set((tool_handlers or {}).keys()) | {"tool_result_read"}
     if code_execution:
-      builtin_names |= {"code_execute", "code_execute_status"}
+      builtin_names |= {"code_execute"}
     if operation_source is not None and "run_agent" not in builtin_names:
       builtin_names |= {
         "run_agent",
@@ -653,7 +656,11 @@ def create_agent(
 
     ce_bundle = None
     if code_execution:
-      ce_bundle = build_code_execution(session, config=code_execution_config)
+      ce_bundle = build_code_execution(
+        session,
+        config=code_execution_config,
+        job_runner=lambda: runner_ref[0],
+      )
       local_handlers.update(ce_bundle.handlers)
       extra_tool_defs.extend(ce_bundle.tool_definitions)
 
@@ -683,7 +690,9 @@ def create_agent(
         capability_execution_resolver=capability_execution_resolver,
         approval_key_qualifier=ce_bundle.approval_qualifier if ce_bundle else None,
         code_execution_factory=(
-          (lambda child_session: build_code_execution(child_session, config=code_execution_config))
+          (lambda child_session, *, job_runner: build_code_execution(
+            child_session, config=code_execution_config, job_runner=job_runner,
+          ))
           if code_execution
           else None
         ),
@@ -764,7 +773,16 @@ def create_agent(
           )
 
     async def _combined_on_session_summary(summary: SessionUsageSummary) -> None:
-      session.cached_usage = summary
+      # Each delegated child delivers its own summary through this hook; the
+      # session's cached usage is the whole dispatch tree's total.
+      if summary.session_id == session.session_id:
+        root_runner = runner_ref[0]
+        fleet = (
+          getattr(root_runner, "_session_usage_summary", None)
+          if root_runner is not None
+          else None
+        )
+        session.cached_usage = fleet or summary
       if on_session_summary is not None:
         result = on_session_summary(summary)
         if inspect.isawaitable(result):
@@ -857,6 +875,7 @@ def create_agent(
         code_execution_spill_dir_provider=configured_spill_sink,
         message_inbox=root_inbox,
         commercial_usage_producer=commercial_usage_producer,
+        containment=containment,
       )
       job_id = context.job_id
       assert job_id is not None, "the executing job must have an admitted identity"

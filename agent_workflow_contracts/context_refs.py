@@ -1,19 +1,13 @@
 """Exact workflow refs shared by pipeline stages and named child admission.
 
-The producer's readback mints artifact refs; consumers render only the keys their
-skill declares. No artifact lookup or model-authored reference copying lives here.
+The producer's readback mints artifact refs. Consumers do not paste that bag:
+a granted content handle is the transport, and one owner renders the lines.
 """
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
-from typing import Any, Protocol
-
-
-class RequiredContext(Protocol):
-  @property
-  def required_context(self) -> tuple[str, ...]: ...
+from typing import Any
 
 
 def read_back_refs(primary_fms_result: Mapping[str, Any]) -> dict[str, Any]:
@@ -97,23 +91,3 @@ def _published_model_version_refs(readback: Mapping[str, Any]) -> dict[str, Any]
     }
   return refs
 
-
-def declared_ref_lines(
-  skill_definition: RequiredContext,
-  refs: Mapping[str, Any],
-) -> tuple[str, ...]:
-  """Render declared refs from the caller's server-held bag, without lookup.
-
-  Missing-key policy belongs to the caller: pipeline context doors answer for
-  absent upstream refs; named child admission refuses before spawning a child.
-  """
-  bound = [key for key in skill_definition.required_context if key in refs]
-  if not bound:
-    return ()
-  return (
-    "Workflow-injected refs from prior tool results; pass each one unchanged where this skill names it:",
-    *(
-      f"{key}={json.dumps(refs[key], sort_keys=True, separators=(',', ':'))}"
-      for key in bound
-    ),
-  )

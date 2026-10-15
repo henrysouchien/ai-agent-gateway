@@ -15,6 +15,7 @@ from typing import (
   Optional,
   Set,
   Tuple,
+  cast,
 )
 
 from agent_workflow_contracts import (
@@ -24,6 +25,7 @@ from agent_workflow_contracts import (
   ResultRequirement,
   TaskResult,
   TaskResultProvenance,
+  terminal_task_result,
 )
 
 from .admission import current_parent_context
@@ -35,11 +37,15 @@ from .runner_session_lifecycle import _runner_attr
 from .runner_cleanup import cleanup_failure_notes
 from .runner_budget import CostAccumulator
 from .runner_stream_turn import STREAM_GUARD_POLL_INTERVAL
-from .runner_streaming import STREAM_THINKING_STALL_TIMEOUT
 from .runner_state import user_turn_message as _user_turn_message
 from .skill_lifecycle import drain_owned_lifecycle_task
 from .session import session_owner_user_id
-from .sub_agent_result_evidence import SubAgentResultEvidence
+from .sub_agent_result_contract import _usage_observation
+from .sub_agent_result_evidence import (
+  SubAgentResultEvidence,
+  collect_sub_agent_result_evidence,
+  merge_sub_agent_result_evidence,
+)
 from .sub_agent_narrative_result import (
   final_child_visible_text,
   task_result_from_execution,
@@ -57,29 +63,28 @@ from .task_registry import (
 )
 from .tool_result_spill import job_spill_sink
 from .tool_dispatcher import ToolDispatcher
+from .tool_dispatcher_approval_lifecycle import ApprovalPark
 
 if TYPE_CHECKING:
   from pathlib import Path
   from .sub_agent import ApprovedCallRef
 
   from .agent_session_log import AgentSessionLog
+  from .containment_settings import ContainmentSettings
   from .mcp_activation import McpActivationFold
   from .mcp_client import McpClientManager
-  from .multi_user.billing import UsageEvent, _UsageAggregator
+  from .multi_user.billing import SessionUsageSummary, UsageEvent, _UsageAggregator
   from .runner_state import SubAgentConfig, ToolResultContext
   from .tool_result_spill import SpillSink
 
 log = logging.getLogger("agent_gateway.runner")
 _MISSING_SUB_AGENT_ID = object()
 # The parent's log carries a child's approval requests, which the parent
-# answers, and its interceptor measurements: the child shares the run's
-# counters, and session_recap reports them from the parent's log. The parent's
-# append is these events' one delivery.
-_PARENT_LOG_EVENT_TYPES = frozenset({"tool_approval_request", "interceptor_measurement"})
-# A child that emits nothing for this long with no tool in flight is wedged
-# (ACUI-1: an await outside both stream and tool). Derived from the stream
-# guard so the child's own stall guard always fires first on stream silence.
-SUB_AGENT_ACTIVITY_GAP = 2 * STREAM_THINKING_STALL_TIMEOUT
+# answers, its interceptor measurements (the child shares the run's counters,
+# and session_recap reports them from the parent's log) and its model
+# fallback hops, which the user sees on every path (design §6.5 R9). The
+# parent's append is these events' one delivery.
+_PARENT_LOG_EVENT_TYPES = frozenset({"tool_approval_request", "interceptor_measurement", "model_fallback"})
 
 
 class _ChildActivity:
@@ -104,8 +109,16 @@ class _ChildActivity:
 async def _await_child_under_activity_guard(
   child_run: Awaitable[Any],
   activity: _ChildActivity,
+  *,
+  silence_timeout: float,
 ) -> float | None:
   """Await one child run; cancel it once it is silent with no tool in flight.
+
+  A child silent for ``silence_timeout`` seconds with no tool open is wedged
+  (ACUI-1: an await outside both stream and tool);
+  ``ContainmentSettings.child_silence_timeout_seconds`` supplies it, kept
+  above the stream stall guard so the child's own guard fires first on stream
+  silence, and ``0`` never cancels.
 
   Returns the silence in seconds when the guard cancelled the child, else
   None. A child exception or cancellation propagates unchanged, and a parent
@@ -123,7 +136,11 @@ async def _await_child_under_activity_guard(
         child.result()
         return None
       silence = time.monotonic() - activity.last_at
-      if not activity.tools_in_flight and silence > SUB_AGENT_ACTIVITY_GAP:
+      if (
+        silence_timeout > 0
+        and not activity.tools_in_flight
+        and silence > silence_timeout
+      ):
         child.cancel()
         await asyncio.wait({child})
         return silence
@@ -271,7 +288,7 @@ class RunnerSubAgentMixin:
     _context_surfaces_static: list[dict[str, Any]]
     _full_session_id: str
     _log: EventLog
-    _max_concurrent_sub_agents: int | None
+    _containment: ContainmentSettings
     _max_resume_chain_depth: int
     _mcp_activation_fold: McpActivationFold
     _mcp_client: McpClientManager | None
@@ -279,6 +296,9 @@ class RunnerSubAgentMixin:
       Callable[[UsageEvent], Awaitable[None] | None] | None
     )
     _on_metric: Callable[[str, int], None] | None
+    _on_session_summary: (
+      Callable[[SessionUsageSummary], Awaitable[None] | None] | None
+    )
     _on_tool_result: (
       Callable[
         [ToolResultContext],
@@ -338,7 +358,7 @@ class RunnerSubAgentMixin:
       raise TypeError(
         "spawn_sub_agent requires a BoundCapabilityExecution"
       )
-    capability_execution.validate()
+    capability_execution.revalidate()
     _validate_child_result_requirement(
       result_requirement,
       skill_name=skill_name,
@@ -418,7 +438,7 @@ class RunnerSubAgentMixin:
       get_tool_definitions=child_get_tool_definitions,
       on_tool_result=self._on_tool_result,
       on_usage=self._on_usage,
-      on_session_summary=None,
+      on_session_summary=self._on_session_summary,
       on_late_usage_event=self._on_late_usage_event,
       on_tool_timing=self._on_tool_timing,
       user_id=(
@@ -438,8 +458,8 @@ class RunnerSubAgentMixin:
       compaction_instructions=None,
       tool_call_timeout=self._tool_call_timeout,
       _cost_accumulator=child_cost_accumulator,
-      _parent_aggregator=self._aggregator,
-      max_concurrent_sub_agents=self._max_concurrent_sub_agents,
+      _usage_parent=self._aggregator,
+      containment=self._containment,
       result_requirement=result_requirement,
       agent_session_log=self._agent_session_log,
       message_inbox=task_entry.message_inbox if task_entry else None,
@@ -474,7 +494,10 @@ class RunnerSubAgentMixin:
       system_prompt=system_prompt,
     )
     try:
-      silence = await _await_child_under_activity_guard(coro, activity)
+      silence = await _await_child_under_activity_guard(
+        coro, activity,
+        silence_timeout=self._containment.child_silence_timeout_seconds,
+      )
       if silence is not None:
         stalled = True
         detail = f"Sub-agent stalled: no activity for {silence:.0f}s"
@@ -491,6 +514,8 @@ class RunnerSubAgentMixin:
       )
       _runner_attr(self, "log", log).warning("[%s] Sub-agent cancelled (parent disconnect or shutdown)", sub_session_id)
       sub_log.append({"type": "error", "error": "Sub-agent cancelled"})
+    except ApprovalPark:
+      raise
     except Exception as exc:
       runtime_exception_detail = _runtime_exception_detail(exc)
       cleanup_warnings.extend(cleanup_failure_notes(exc))
@@ -503,6 +528,7 @@ class RunnerSubAgentMixin:
         {"type": "error", "error": runtime_exception_detail}
       )
     finally:
+      approval_park = sub_runner._approval_park
       (
         cancelled_error,
         cancellation_signal,
@@ -512,6 +538,7 @@ class RunnerSubAgentMixin:
         sub_runner,
         sub_log,
         stalled=stalled,
+        approval_park=approval_park,
         cancelled_error=cancelled_error,
         cancellation_signal=cancellation_signal,
         runtime_exception_detail=runtime_exception_detail,
@@ -519,6 +546,26 @@ class RunnerSubAgentMixin:
         cleanup_warnings=cleanup_warnings,
         sub_session=sub_session,
       )
+
+    if (
+      approval_park is not None
+      and sub_runner._terminal_closure_event is not None
+      and sub_runner._terminal_closure_event.get("terminal_disposition") == "awaiting_approval"
+      and cancelled_error is None
+      and runtime_exception_detail is None
+      and not stalled
+    ):
+      evidence = collect_sub_agent_result_evidence(sub_log.entries, durable=False)
+      return terminal_task_result(
+        cast(AdmittedTask, resolved_admitted_task),
+        status="awaiting_approval",
+        reason=(
+          f"approval:{approval_park.approval_id} "
+          f"call:{approval_park.original_tool_call_id}"
+        ),
+        tools_used=evidence.tools_used,
+        usage=_usage_observation(evidence.usage),
+      ), None
 
     terminal_tool_result = latest_successful_declared_terminal_tool_result(
       sub_log.entries,
@@ -605,7 +652,7 @@ class RunnerSubAgentMixin:
       raise TypeError(
         "resume_sub_agent requires a BoundCapabilityExecution"
       )
-    capability_execution.validate()
+    capability_execution.revalidate()
     _validate_child_result_requirement(
       result_requirement,
       skill_name=skill_name,
@@ -681,6 +728,12 @@ class RunnerSubAgentMixin:
     )
     dispatcher._event_log = sub_log
     child_cost_accumulator = CostAccumulator(cost_observation_threshold_usd)
+    # The parent's own aggregator is ordinary delegation: the resumed child
+    # keeps its own row under the parent's unit. Any other aggregator is
+    # shared as given; None keeps the child's accounting independent.
+    delegated_child = (
+      usage_aggregator is not None and usage_aggregator is self._aggregator
+    )
     runner_cls = _runner_attr(self, "AgentRunner", type(self))
     child_spill_sink = _child_spill_sink(self._spill_dir_provider, attempt)
     sub_runner = runner_cls(
@@ -702,7 +755,9 @@ class RunnerSubAgentMixin:
       get_tool_definitions=child_get_tool_definitions,
       on_tool_result=self._on_tool_result,
       on_usage=self._on_usage,
-      on_session_summary=None,
+      on_session_summary=(
+        self._on_session_summary if delegated_child else None
+      ),
       on_late_usage_event=self._on_late_usage_event,
       on_tool_timing=self._on_tool_timing,
       user_id=(
@@ -722,8 +777,9 @@ class RunnerSubAgentMixin:
       compaction_instructions=None,
       tool_call_timeout=self._tool_call_timeout,
       _cost_accumulator=child_cost_accumulator,
-      _parent_aggregator=usage_aggregator,
-      max_concurrent_sub_agents=self._max_concurrent_sub_agents,
+      _parent_aggregator=None if delegated_child else usage_aggregator,
+      _usage_parent=self._aggregator if delegated_child else None,
+      containment=self._containment,
       result_requirement=result_requirement,
       agent_session_log=self._agent_session_log,
       message_inbox=task_entry.message_inbox if task_entry else None,
@@ -791,7 +847,10 @@ class RunnerSubAgentMixin:
       resume_initial_messages=reconstructed_messages,
     )
     try:
-      silence = await _await_child_under_activity_guard(coro, activity)
+      silence = await _await_child_under_activity_guard(
+        coro, activity,
+        silence_timeout=self._containment.child_silence_timeout_seconds,
+      )
       if silence is not None:
         stalled = True
         detail = f"Sub-agent stalled: no activity for {silence:.0f}s"
@@ -808,6 +867,8 @@ class RunnerSubAgentMixin:
       )
       _runner_attr(self, "log", log).warning("[%s] Resumed sub-agent cancelled (parent disconnect or shutdown)", sub_session_id)
       sub_log.append({"type": "error", "error": "Sub-agent cancelled"})
+    except ApprovalPark:
+      raise
     except Exception as exc:
       runtime_exception_detail = _runtime_exception_detail(exc)
       cleanup_warnings.extend(cleanup_failure_notes(exc))
@@ -820,6 +881,7 @@ class RunnerSubAgentMixin:
         {"type": "error", "error": runtime_exception_detail}
       )
     finally:
+      approval_park = sub_runner._approval_park
       (
         cancelled_error,
         cancellation_signal,
@@ -829,6 +891,7 @@ class RunnerSubAgentMixin:
         sub_runner,
         sub_log,
         stalled=stalled,
+        approval_park=approval_park,
         cancelled_error=cancelled_error,
         cancellation_signal=cancellation_signal,
         runtime_exception_detail=runtime_exception_detail,
@@ -836,6 +899,29 @@ class RunnerSubAgentMixin:
         cleanup_warnings=cleanup_warnings,
         sub_session=sub_session,
       )
+
+    if (
+      approval_park is not None
+      and sub_runner._terminal_closure_event is not None
+      and sub_runner._terminal_closure_event.get("terminal_disposition") == "awaiting_approval"
+      and cancelled_error is None
+      and runtime_exception_detail is None
+      and not stalled
+    ):
+      evidence = merge_sub_agent_result_evidence(
+        prior_evidence,
+        collect_sub_agent_result_evidence(sub_log.entries, durable=False),
+      )
+      return terminal_task_result(
+        cast(AdmittedTask, resolved_admitted_task),
+        status="awaiting_approval",
+        reason=(
+          f"approval:{approval_park.approval_id} "
+          f"call:{approval_park.original_tool_call_id}"
+        ),
+        tools_used=evidence.tools_used,
+        usage=_usage_observation(evidence.usage),
+      ), None
 
     terminal_tool_result = latest_successful_declared_terminal_tool_result(
       sub_log.entries,
@@ -950,6 +1036,7 @@ async def _close_sub_runner(
   sub_log: Any,
   *,
   stalled: bool,
+  approval_park: ApprovalPark | None,
   cancelled_error: asyncio.CancelledError | None,
   cancellation_signal: str | None,
   runtime_exception_detail: str | None,
@@ -997,6 +1084,7 @@ async def _close_sub_runner(
       runtime_exception_detail = detail
       cleanup_warnings.remove(detail)
   finally:
+    session_cleanup_completed = False
     try:
       if sub_session is not None:
         from .code_execution import cleanup_code_execution
@@ -1008,12 +1096,27 @@ async def _close_sub_runner(
         try:
           await asyncio.shield(cleanup_task)
         except asyncio.CancelledError as exc:
-          await drain_owned_lifecycle_task(cleanup_task)
+          # The waiter's cancellation and the cleanup's own re-raised
+          # cancellation are one outcome: drain the release, record it once.
+          try:
+            await drain_owned_lifecycle_task(cleanup_task)
+          except asyncio.CancelledError:
+            pass
           if cancelled_error is None and not stalled:
             cancelled_error = exc
             cancellation_signal = _termination_signal(task_entry)
+      session_cleanup_completed = True
     finally:
-      sub_runner._task_registry.complete_owner()
+      if (
+        approval_park is None
+        or sub_runner._terminal_closure_event is None
+        or sub_runner._terminal_closure_event.get("terminal_disposition") != "awaiting_approval"
+        or cancelled_error is not None
+        or runtime_exception_detail is not None
+        or stalled
+        or not session_cleanup_completed
+      ):
+        sub_runner._task_registry.complete_owner()
   return (
     cancelled_error,
     cancellation_signal,

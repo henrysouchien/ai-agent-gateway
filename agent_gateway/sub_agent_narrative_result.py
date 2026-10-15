@@ -11,6 +11,7 @@ from agent_workflow_contracts import (
   ExecutionSettlement,
   LogicalTaskRef,
   OrdinaryDelegationTaskRef,
+  PipelineStageTaskRef,
   ResultRequirement,
   TaskResult,
   TaskResultProvenance,
@@ -51,7 +52,6 @@ _TERMINAL_REASON_PRECEDENCE = (
   "killed",
   "stalled",
   "soft_budget_abort",
-  "retries_exhausted",
   "runtime_error",
 )
 
@@ -334,10 +334,12 @@ async def final_child_visible_text(
   )
 
 
-def _execution_settlement(
+def execution_settlement(
   signals: Sequence[str],
   *,
   error_detail: str | None,
+  resumable: bool,
+  next_calls: Mapping[str, Any] | None = None,
 ) -> ExecutionSettlement:
   if not signals:
     return ExecutionSettlement(status="succeeded")
@@ -355,6 +357,17 @@ def _execution_settlement(
     )
     if reason is None:
       raise ValueError("at least one terminal signal is required")
+  if reason == "soft_budget_abort" and resumable:
+    # A resumable operation's exhausted ladder stops work it can continue:
+    # the registry reads this exact reason as PARKED
+    # (``task_registry.task_state_for_result``). The ladder counts turns only
+    # (``runner_soft_budget.SoftBudgetAction.kind``), so ``share_spent`` has
+    # no producer here.
+    return ExecutionSettlement(
+      status="interrupted",
+      terminal_reason="turns_exhausted",
+      next_call=(next_calls or {}).get(reason),
+    )
   detail = str(error_detail or "").strip()
   terminal_reason = f"{reason}: {detail}" if detail else reason
   if reason == "cancelled":
@@ -366,6 +379,7 @@ def _execution_settlement(
   return ExecutionSettlement(
     status=status,
     terminal_reason=terminal_reason,
+    next_call=(next_calls or {}).get(reason),
   )
 
 
@@ -400,7 +414,7 @@ def task_result_from_execution(
 
   if not isinstance(
     logical_task,
-    (OrdinaryDelegationTaskRef, WorkflowNodeTaskRef),
+    (OrdinaryDelegationTaskRef, WorkflowNodeTaskRef, PipelineStageTaskRef),
   ):
     raise TypeError("task result requires an exact LogicalTaskRef")
   if not isinstance(attempt, AttemptRef):
@@ -421,7 +435,6 @@ def task_result_from_execution(
     collect_sub_agent_result_evidence(entry_list, durable=False),
   )
   allowed_signals = {
-    "retries_exhausted",
     "stalled",
     "cancelled",
     "killed",
@@ -466,6 +479,7 @@ def task_result_from_execution(
     else None
   )
   refusal_category: str | None = None
+  next_calls: dict[str, Any] = {}
   for event in event_list:
     event_type = event.get("type")
     if terminal_tool_result is not None:
@@ -478,11 +492,14 @@ def task_result_from_execution(
       # the forced final. A run that answered after them never reaches here
       # and settles as an ordinary result.
       signals.append("soft_budget_abort")
+      next_calls["soft_budget_abort"] = event.get("next_call")
     elif event_type in {"run_error", "error"}:
       signals.append("runtime_error")
       if error_detail is None:
         raw = str(event.get("error") or event.get("message") or "").strip()
         error_detail = raw or None
+      if event.get("error_sub_code") == "stalled":
+        next_calls["stalled"] = event.get("next_call")
     elif event_type == "refusal":
       # The provider ended the child's turn with ``stop_reason=refusal``. The
       # delivered text is still the child's narrative; the signal says why it
@@ -547,9 +564,13 @@ def task_result_from_execution(
       ),
     )
   else:
-    execution = _execution_settlement(
+    execution = execution_settlement(
       settled_signals,
       error_detail=error_detail,
+      next_calls=next_calls,
+      resumable=(
+        admitted_task is not None and admitted_task.operation.resumable
+      ),
     )
   if execution.status != "succeeded":
     if not refused:
@@ -622,6 +643,7 @@ def read_task_result_terminal_narrative(
 
 __all__ = [
   "FinalChildVisibleText",
+  "execution_settlement",
   "final_child_visible_text",
   "read_task_result_terminal_narrative",
   "task_result_from_execution",

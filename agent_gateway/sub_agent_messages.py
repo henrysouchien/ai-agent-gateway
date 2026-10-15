@@ -339,7 +339,7 @@ async def enqueue_parent_message(
     return None, {"code": "not_available", "message": "Task registry not configured"}
   entry = registry.get(task_id)
   if entry is None:
-    return None, {"code": "not_found", "message": f"No running agent: {task_id}"}
+    return None, {"code": "not_found", "message": f"Unknown task: {task_id}"}
   if message_id is not None and not _canonical_message_id(message_id):
     return None, {
       "code": "invalid_input",
@@ -389,7 +389,7 @@ async def send_job_message(
     return None, {
       "code": "ambiguous_target",
       "message": (
-        f"Multiple running agents named '{target}': {ambiguous}. "
+        f"Multiple live agents named '{target}': {ambiguous}. "
         "Use task_id instead."
       ),
     }

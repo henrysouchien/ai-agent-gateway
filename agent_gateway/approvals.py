@@ -19,12 +19,17 @@ from .approval_policy import (
   utc_now,
 )
 from .approval_store import (
+  ApprovalExecutableBindingError,
   ApprovalRequestLocator,
   ApprovalRequestStore,
   PersistentGrantCancellationFenced,
+  RootTurnRecordError,
+  SQLiteApprovalStore,
+  verify_policy_generation,
 )
 from .policy_controls import effective_allow_tool_type
 from .session import GatewaySession
+from .tool_dispatcher import ToolDispatcher
 
 
 log = logging.getLogger("agent_gateway.approvals")
@@ -471,6 +476,19 @@ async def _record_durable_vote_and_continue(
   app_state: Any,
 ) -> dict[str, Any]:
   """Record a tenant-verified vote without inventing a waiting queue or job."""
+  # The decision route owns the vote and its one policy-generation check: no vote
+  # lands under a generation other than the root turn's. The continuation hook
+  # owns execution and executes nothing under another generation.
+  if request_record.state == "pending_user" and locator.executable_binding_state == "captured":
+    reissued = await _reissue_under_current_policy_generation(
+      store=store,
+      policy=policy,
+      request_record=request_record,
+      tenant_storage_id=tenant_storage_id,
+      app_state=app_state,
+    )
+    if reissued is not None:
+      return reissued
   result = await _record_vote_and_unblock(
     target_session=authenticated,
     pending_entry=None,
@@ -503,13 +521,27 @@ async def _record_durable_vote_and_continue(
       )
     )
   except Exception:
-    log.warning("Root approval continuation failed | approval_id=%s", locator.approval_id)
+    log.warning("Root approval continuation failed | approval_id=%s", locator.approval_id, exc_info=True)
     result["continuation"] = {
       "status": "outcome_unknown",
       "failed_owner": "root_continue_hook",
     }
     return result
   if root_outcome.status != "not_root":
+    approval_state = (result.get("approval") or {}).get("state")
+    if root_outcome.status == "policy_generation_changed" and approval_state == "approved":
+      # Only a row voted approved, unclaimed, before the pre-vote check existed
+      # reaches here (the stranded shape): the pre-vote check skips an approved
+      # row, and the hook refuses to execute it, so its owner re-issues it.
+      reissued = await _reissue_under_current_policy_generation(
+        store=store,
+        policy=policy,
+        request_record=request_record,
+        tenant_storage_id=tenant_storage_id,
+        app_state=app_state,
+      )
+      if reissued is not None:
+        return reissued
     result["continuation"] = {
       "status": root_outcome.status,
       "job_id": root_outcome.job_id,
@@ -547,6 +579,111 @@ async def _record_durable_vote_and_continue(
     "tool_call_id": child_outcome.tool_call_id,
   }
   return result
+
+
+async def _reissue_under_current_policy_generation(
+  *,
+  store: ApprovalRequestStore,
+  policy: ApprovalPolicy,
+  request_record: ApprovalRequest,
+  tenant_storage_id: str,
+  app_state: Any,
+) -> dict[str, Any] | None:
+  """Re-issue a captured root call whose turn's policy generation is not current.
+
+  Nothing is voted, resolved or executed: the store re-issues the call under the
+  current generation, the root hook publishes the new ask on the job's durable
+  log, and the response names the new approval's decision. A concurrent
+  decision that finds the call already re-issued names the same successor and
+  publishes nothing. None means the generation still matches, or the call has
+  no root turn to compare.
+  """
+  if not isinstance(store, SQLiteApprovalStore):
+    return None
+  # Only a root turn records its admitting policy generation; no child durable
+  # record carries one, so child calls are not verified here.
+  try:
+    located = await store._locate_root_turn_for_approval(
+      approval_id=request_record.approval_id, tenant_storage_id=tenant_storage_id,
+    )
+    if located is None:
+      return None
+    job_id, tool_call_id, nonce, turn_id = located
+    record = await store._read_root_turn_for_executor(
+      job_id=job_id, turn_id=turn_id, tenant_storage_id=tenant_storage_id,
+    )
+  except RootTurnRecordError:
+    # Unreadable custody is the continuation's to classify.
+    return None
+  if record is None:
+    return None
+  current_policy: Any = policy
+  generation = await store.record_policy_generation(
+    policy_id=current_policy.policy_id,
+    policy_version=current_policy.policy_version,
+    policy_bundle_hash=current_policy.policy_bundle_hash,
+    make_current=False,
+  )
+  mismatch = verify_policy_generation(record.policy_generation_ref, generation.generation_ref)
+  if mismatch is None:
+    return None
+  try:
+    successor, _published_nonce, successor_turn_id, created = await store.reissue_parked_approval(
+      approval_id=request_record.approval_id,
+      job_id=job_id,
+      tool_call_id=tool_call_id,
+      nonce=nonce,
+      turn_id=turn_id,
+      tenant_storage_id=tenant_storage_id,
+      generation=generation,
+    )
+  except (RootTurnRecordError, ApprovalExecutableBindingError) as exc:
+    raise ApprovalActionError(
+      409,
+      {
+        "error": "Approval request could not be re-issued under the current policy",
+        "approval_id": request_record.approval_id,
+        "code": mismatch.code,
+      },
+    ) from exc
+  root_hook = getattr(app_state, "root_continue_hook", None)
+  if created and root_hook is None:
+    log.warning("Re-issued approval ask unpublished: no root_continue_hook | approval_id=%s", successor.approval_id)
+  elif created and root_hook is not None:
+    try:
+      published = await root_hook(
+        RootContinueRequest(
+          approval_id=successor.approval_id,
+          tenant_storage_id=tenant_storage_id,
+          reissued_from=request_record.approval_id,
+        )
+      )
+      if published.status != "policy_generation_changed":
+        log.warning(
+          "Re-issued approval ask unpublished | approval_id=%s status=%s",
+          successor.approval_id, published.status,
+        )
+    except Exception:
+      log.warning("Re-issued approval ask unpublished | approval_id=%s", successor.approval_id, exc_info=True)
+  superseded = await store.get(request_record.approval_id)
+  return {
+    "approval": _approval_request_to_dict(superseded or request_record),
+    "continuation": {
+      "status": "policy_generation_changed",
+      "job_id": job_id,
+      "turn_id": successor_turn_id,
+      "tool_call_id": tool_call_id,
+      "error": ToolDispatcher._approved_binding_error(
+        mismatch.code,
+        "The approval policy changed since this call parked; it was re-issued for a decision under the current policy.",
+        request=successor,
+        next_call=(
+          "Decide the re-issued approval under the current policy: "
+          f"POST /control/runs/{job_id}/approvals/{successor.approval_id} with {{\"approved\": true|false}}"
+        ),
+      ),
+    },
+  }
 
 
 async def _cancel_pending_approval_and_unblock(

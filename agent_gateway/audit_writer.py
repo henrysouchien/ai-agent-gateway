@@ -21,12 +21,24 @@ APPROVAL_AUDIT_MAX_RECORD_BYTES = 512 * 1024
 APPROVAL_AUDIT_MAX_RECORDS = 32_768
 
 
+def owner_key(user_id: str) -> str:
+  """One path component, injective in user_id. The audit root does not move."""
+  return "u-" + hashlib.sha256(user_id.encode("utf-8")).hexdigest()
+
+
+def _require_owner_user_id(owner_user_id: str) -> str:
+  if not isinstance(owner_user_id, str) or not owner_user_id.strip():
+    raise ValueError("approval audit owner_user_id is blank")
+  return owner_user_id
+
+
 class AuditWriter(Protocol):
   async def write(self, entry: ApprovalAuditEntry) -> None: ...
   async def flush(self) -> None: ...
   async def query(
     self,
     *,
+    owner_user_id: str,
     approval_id: str | None = None,
     request_id: str | None = None,
     tool_call_id: str | None = None,
@@ -42,8 +54,15 @@ class AuditWriter(Protocol):
     cursor: str | None = None,
     order: Literal["asc", "desc"] = "desc",
   ) -> tuple[list[ApprovalAuditEntry], str | None]: ...
-  async def apply_retention(self) -> int: ...
-  async def export_for_legal_hold(self, *, case_id: str, filter: dict[str, Any], destination: str) -> str: ...
+  async def apply_retention(self, *, owner_user_id: str) -> int: ...
+  async def export_for_legal_hold(
+    self,
+    *,
+    owner_user_id: str,
+    case_id: str,
+    filter: dict[str, Any],
+    destination: str,
+  ) -> str: ...
 
 
 class JSONLAuditWriter:
@@ -77,6 +96,36 @@ class JSONLAuditWriter:
       )
     return directory_stat
 
+  def _owner_directory(self, user_id: str) -> Path:
+    return self.root / owner_key(user_id)
+
+  def _ensure_owner_directory(self, user_id: str) -> Path:
+    owner_dir = self._owner_directory(user_id)
+    try:
+      os.mkdir(owner_dir, 0o700)
+    except FileExistsError:
+      pass
+    return owner_dir
+
+  @staticmethod
+  def _is_real_directory(path: Path) -> bool:
+    try:
+      directory_stat = os.lstat(path)
+    except FileNotFoundError:
+      return False
+    return stat.S_ISDIR(directory_stat.st_mode)
+
+  def _owner_segment_paths(self, owner_user_id: str) -> list[Path]:
+    """Segments for this owner only. A missing directory does not walk the root."""
+    owner_dir = self._owner_directory(owner_user_id)
+    if not self._is_real_directory(owner_dir):
+      return []
+    return sorted(owner_dir.glob("*.jsonl"))
+
+  def _legacy_paths(self) -> list[Path]:
+    """Pre-partition flat files. Direct children only; never another owner's dir."""
+    return sorted(self.root.glob("*.jsonl"))
+
   async def write(self, entry: ApprovalAuditEntry) -> None:
     await asyncio.to_thread(self._write_sync, entry)
 
@@ -94,9 +143,13 @@ class JSONLAuditWriter:
       raise RuntimeError(
         "approval audit record exceeds its byte limit"
       )
-    parent_stat = self._require_private_directory(self.root)
+    # The root keeps its unsafe-identity check. The directory fd, identity
+    # compare, and segment append then run against the owner directory.
+    self._require_private_directory(self.root)
+    owner_dir = self._ensure_owner_directory(entry.user_id)
+    parent_stat = self._require_private_directory(owner_dir)
     directory_fd = os.open(
-      self.root,
+      owner_dir,
       os.O_RDONLY
       | getattr(os, "O_DIRECTORY", 0)
       | getattr(os, "O_CLOEXEC", 0),
@@ -104,18 +157,18 @@ class JSONLAuditWriter:
     try:
       opened_parent_stat = self._require_private_directory_stat(
         os.fstat(directory_fd),
-        path=self.root,
+        path=owner_dir,
       )
       if (
         opened_parent_stat.st_dev != parent_stat.st_dev
         or opened_parent_stat.st_ino != parent_stat.st_ino
       ):
         raise RuntimeError(
-          f"approval audit directory identity changed: {self.root}"
+          f"approval audit directory identity changed: {owner_dir}"
         )
       segment = 0
       while True:
-        path = self._segment_path(entry.ts, segment)
+        path = owner_dir / self._segment_name(entry.ts, segment)
         if self._append_to_segment(
           directory_fd=directory_fd,
           parent_stat=parent_stat,
@@ -283,6 +336,7 @@ class JSONLAuditWriter:
   async def query(
     self,
     *,
+    owner_user_id: str,
     approval_id: str | None = None,
     request_id: str | None = None,
     tool_call_id: str | None = None,
@@ -298,7 +352,9 @@ class JSONLAuditWriter:
     cursor: str | None = None,
     order: Literal["asc", "desc"] = "desc",
   ) -> tuple[list[ApprovalAuditEntry], str | None]:
+    owner_user_id = _require_owner_user_id(owner_user_id)
     filters = {
+      "owner_user_id": owner_user_id,
       "approval_id": approval_id,
       "request_id": request_id,
       "tool_call_id": tool_call_id,
@@ -317,9 +373,7 @@ class JSONLAuditWriter:
     if cursor_state is not None and cursor_state.get("filters_hash") != filters_hash:
       raise ValueError("audit query cursor does not match filters")
 
-    entries = []
-    for path in sorted(self.root.glob("*.jsonl")):
-      entries.extend(self._read_file(path))
+    entries = self._entries_for_owner(owner_user_id)
     entries.sort(key=lambda entry: (entry.ts, entry.entry_id), reverse=order == "desc")
     if cursor_state is not None:
       last_ts = datetime.fromisoformat(cursor_state["last_ts"])
@@ -360,34 +414,75 @@ class JSONLAuditWriter:
       )
     return page, next_cursor
 
-  async def apply_retention(self) -> int:
+  def _entries_for_owner(self, owner_user_id: str) -> list[ApprovalAuditEntry]:
+    entries: list[ApprovalAuditEntry] = []
+    for path in self._owner_segment_paths(owner_user_id):
+      entries.extend(self._read_file(path))
+    for path in self._legacy_paths():
+      entries.extend(
+        entry for entry in self._read_file(path)
+        if entry.user_id == owner_user_id
+      )
+    return entries
+
+  async def apply_retention(self, *, owner_user_id: str) -> int:
+    owner_user_id = _require_owner_user_id(owner_user_id)
     now = datetime.now(UTC)
     deleted = 0
-    for path in sorted(self.root.glob("*.jsonl")):
+    for path in self._owner_segment_paths(owner_user_id):
+      if self._retention_deletes(self._read_file(path), now):
+        path.unlink(missing_ok=True)
+        deleted += 1
+    for path in self._legacy_paths():
       entries = self._read_file(path)
-      if not entries:
+      # A mixed legacy file is never rewritten or split, and never deleted
+      # while it still holds another owner's record.
+      if any(entry.user_id != owner_user_id for entry in entries):
         continue
-      if any(entry.legal_hold for entry in entries):
-        continue
-      retention_days = max(
-        APPROVAL_AUDIT_RETENTION_DAYS[entry.retention_class] for entry in entries
-      )
-      newest = max(entry.ts for entry in entries)
-      if newest + timedelta(days=retention_days) < now:
+      if self._retention_deletes(entries, now):
         path.unlink(missing_ok=True)
         deleted += 1
     return deleted
 
-  async def export_for_legal_hold(self, *, case_id: str, filter: dict[str, Any], destination: str) -> str:
+  @staticmethod
+  def _retention_deletes(entries: list[ApprovalAuditEntry], now: datetime) -> bool:
+    if not entries:
+      return False
+    if any(entry.legal_hold for entry in entries):
+      return False
+    retention_days = max(
+      APPROVAL_AUDIT_RETENTION_DAYS[entry.retention_class] for entry in entries
+    )
+    newest = max(entry.ts for entry in entries)
+    return newest + timedelta(days=retention_days) < now
+
+  async def export_for_legal_hold(
+    self,
+    *,
+    owner_user_id: str,
+    case_id: str,
+    filter: dict[str, Any],
+    destination: str,
+  ) -> str:
+    owner_user_id = _require_owner_user_id(owner_user_id)
     dest = Path(destination)
     dest.mkdir(parents=True, exist_ok=True)
     archive_path = dest / f"{case_id}-approval-audit.tar.gz"
-    manifest = {"case_id": case_id, "files": []}
+    manifest: dict[str, Any] = {"case_id": case_id, "files": []}
     with tarfile.open(archive_path, "w:gz") as archive:
-      for path in sorted(self.root.glob("*.jsonl")):
+      for path in self._owner_segment_paths(owner_user_id):
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         manifest["files"].append({"path": str(path), "sha256": digest})
         archive.add(path, arcname=path.name)
+      for path in self._legacy_paths():
+        member = self._legacy_owner_bytes(path, owner_user_id)
+        if not member:
+          continue
+        digest = hashlib.sha256(member).hexdigest()
+        manifest["files"].append({"path": str(path), "sha256": digest})
+        info = tarfile.TarInfo(f"legacy/{path.name}")
+        info.size = len(member)
+        archive.addfile(info, fileobj=_BytesReader(member))
       manifest_bytes = json.dumps(manifest, sort_keys=True, indent=2).encode("utf-8")
       info = tarfile.TarInfo("manifest.json")
       info.size = len(manifest_bytes)
@@ -395,12 +490,31 @@ class JSONLAuditWriter:
     os.chmod(archive_path, 0o600)
     return str(archive_path)
 
-  def _segment_path(self, ts: datetime, index: int) -> Path:
+  @staticmethod
+  def _legacy_owner_bytes(path: Path, owner_user_id: str) -> bytes:
+    kept: list[bytes] = []
+    for line in path.read_bytes().splitlines():
+      if not line.strip():
+        continue
+      record = json.loads(line)
+      if not isinstance(record, dict):
+        raise RuntimeError(
+          "approval audit file contains a non-object record"
+        )
+      if record.get("user_id") == owner_user_id:
+        kept.append(line)
+    if not kept:
+      return b""
+    return b"\n".join(kept) + b"\n"
+
+  def _segment_name(self, ts: datetime, index: int) -> str:
     if ts.tzinfo is None:
       ts = ts.astimezone()
     day = ts.astimezone().date().isoformat()
-    name = f"{day}.jsonl" if index == 0 else f"{day}.{index}.jsonl"
-    return self.root / name
+    return f"{day}.jsonl" if index == 0 else f"{day}.{index}.jsonl"
+
+  def _segment_path(self, ts: datetime, index: int, *, user_id: str) -> Path:
+    return self._owner_directory(user_id) / self._segment_name(ts, index)
 
   def _read_file(self, path: Path) -> list[ApprovalAuditEntry]:
     entries: list[ApprovalAuditEntry] = []

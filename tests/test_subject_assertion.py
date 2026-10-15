@@ -10,11 +10,13 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 import jwt
 import pytest
 
-from agent_gateway.subject_assertion import (
-  GatewaySubjectAssertionVerifier,
+from hank_contracts.subject_assertion import (
   SUBJECT_ASSERTION_AUDIENCE,
   SUBJECT_ASSERTION_ISSUER,
   SubjectAssertionError,
+)
+from agent_gateway.subject_assertion import (
+  GatewaySubjectAssertionVerifier,
   load_subject_assertion_public_keys,
 )
 

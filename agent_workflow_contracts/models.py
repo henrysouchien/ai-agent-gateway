@@ -19,7 +19,9 @@ from pydantic import (
   Field,
   JsonValue,
   StringConstraints,
+  SerializerFunctionWrapHandler,
   field_validator,
+  model_serializer,
   model_validator,
 )
 
@@ -675,6 +677,15 @@ class AgentOperationSnapshot(WireModel):
     default=True,
     exclude_if=lambda value: value is True,
   )
+  # True when the operation owes a persist: a child that ends with no accepted
+  # terminal door result and no artifact settles blocked/no_gate_produced. A
+  # coordinator or read-only operation keeps its narrative outcome. Omitted
+  # from dumps at its default so snapshots and digests recorded before the
+  # field replay byte-identically.
+  result_requires_persist: bool = Field(
+    default=False,
+    exclude_if=lambda value: value is False,
+  )
   result_modes: tuple[str, ...] = Field(min_length=1)
   projection_contracts: tuple[ContractRef, ...] = ()
 
@@ -740,6 +751,23 @@ class AdmittedLineage(WireModel):
   depth: int = Field(ge=0)
 
 
+class SelectionPresetProvenance(WireModel):
+  """The winning preset recorded beside one bind (design §7.4)."""
+
+  name: str
+  scope: Literal["user", "firm", "run", "subtree"]
+  policy_revision: str
+
+
+class SelectionProvenance(WireModel):
+  """Role, effort and preset sources beside an exact bind; every key is present."""
+
+  role: str | None
+  role_source: Literal["spawn", "operation"] | None
+  effort_source: Literal["explicit", "spawn", "operation"] | None
+  preset: SelectionPresetProvenance | None
+
+
 class AdmittedContextWire(WireModel):
   """Everything `admit` derives for one spawned job (execution-boundary design §3.2)."""
 
@@ -760,6 +788,11 @@ class AdmittedContextWire(WireModel):
     exclude_if=lambda value: not value,
   )
   selection_snapshot: dict[str, JsonValue] | None = Field(
+    default=None,
+    exclude_if=lambda value: value is None,
+  )
+  # Absent on historical records and on a frozen bind; every key is present when set.
+  selection_provenance: SelectionProvenance | None = Field(
     default=None,
     exclude_if=lambda value: value is None,
   )
@@ -791,6 +824,18 @@ class AgentExecutionSnapshot(WireModel):
     ),
   )
   max_tokens: int = Field(ge=1)
+  temperature: float | None = Field(
+    default=None,
+    ge=0.0,
+    le=2.0,
+    exclude_if=lambda value: value is None,
+  )
+  top_p: float | None = Field(
+    default=None,
+    ge=0.0,
+    le=1.0,
+    exclude_if=lambda value: value is None,
+  )
   cost_observation_threshold_usd: float | None = Field(
     default=None,
     gt=0,
@@ -910,8 +955,21 @@ class WorkflowNodeTaskRef(WireModel):
   operation: AgentOperationRef
 
 
+class PipelineStageTaskRef(WireModel):
+  """One pipeline stage attempt, a durable child of the execution that runs it.
+
+  Recorded as a default where the logical-task contract was open. Revert site:
+  use OrdinaryDelegationTaskRef with delegation_id set to the stage run id.
+  """
+
+  kind: Literal["pipeline_stage"] = "pipeline_stage"
+  pipeline_id: OpaqueId
+  stage_id: OpaqueId
+  operation: AgentOperationRef
+
+
 LogicalTaskRef: TypeAlias = Annotated[
-  OrdinaryDelegationTaskRef | WorkflowNodeTaskRef,
+  OrdinaryDelegationTaskRef | WorkflowNodeTaskRef | PipelineStageTaskRef,
   Field(discriminator="kind"),
 ]
 
@@ -1151,6 +1209,17 @@ class AdmittedTask(WireModel):
 class ExecutionSettlement(WireModel):
   status: Literal["succeeded", "failed", "interrupted", "cancelled", "skipped", "awaiting_approval"]
   terminal_reason: NonEmptyText | None = None
+  next_call: JsonValue = None
+
+  @model_serializer(mode="wrap")
+  def _stated_next_call_only(self, handler: SerializerFunctionWrapHandler):  # noqa: ANN202
+    # A settlement states its next_call (a value or an explicit null) only
+    # when its producer set one. A record written before the field existed
+    # serializes byte-identically, so persisted events and result ids hold.
+    data = handler(self)
+    if "next_call" not in self.model_fields_set:
+      data.pop("next_call", None)
+    return data
 
   @model_validator(mode="after")
   def _terminal_reason(self) -> ExecutionSettlement:
@@ -1264,7 +1333,17 @@ class UsageObservation(WireModel):
   output_tokens: int = Field(default=0, ge=0)
   cached_input_tokens: int = Field(default=0, ge=0)
   tool_calls: int = Field(default=0, ge=0)
+  turns: int = Field(default=0, ge=0)
   cost_usd: float = Field(default=0.0, ge=0)
+
+  @model_serializer(mode="wrap")
+  def _counted_turns_only(self, handler: SerializerFunctionWrapHandler):  # noqa: ANN202
+    # turns is stated only when a producer counted it, so an observation
+    # written before the counter existed serializes byte-identically.
+    data = handler(self)
+    if "turns" not in self.model_fields_set:
+      data.pop("turns", None)
+    return data
 
   @field_validator("cost_usd")
   @classmethod
@@ -2044,25 +2123,21 @@ class DeliverySettlement(WireModel):
           raise ValueError(
             "delivery preview completeness disagrees with its recorded policy"
           )
-        if self.warning is not None:
-          raise ValueError("version-2 delivery forbids authored-summary warnings")
     elif self.envelope is not None or self.failure is None:
       raise ValueError("failed delivery requires failure and forbids envelope")
     if self.warning is not None:
-      if not isinstance(self.spec, WorkflowDeliverySpecV1):
-        raise ValueError("delivery warning requires a version-1 spec")
       if self.status != "complete" or self.envelope is None:
         raise ValueError("a delivery warning is only legal on a complete delivery")
-      if not isinstance(self.envelope, DeliveryEnvelopeV1):
-        raise ValueError("delivery warning requires a version-1 envelope")
-      if self.envelope.summary is not None:
-        raise ValueError("a delivery warning must explain an omitted authored summary")
-      if (
-        self.spec is None
-        or self.spec.summary_selector is None
-        or self.warning.omitted_outputs != (self.spec.summary_selector,)
+      if isinstance(self.spec, WorkflowDeliverySpecV1) and isinstance(
+        self.envelope, DeliveryEnvelopeV1
       ):
-        raise ValueError("a delivery warning must name the omitted summary selector")
+        if self.envelope.summary is not None:
+          raise ValueError("a delivery warning must explain an omitted authored summary")
+        if (
+          self.spec.summary_selector is None
+          or self.warning.omitted_outputs != (self.spec.summary_selector,)
+        ):
+          raise ValueError("a delivery warning must name the omitted summary selector")
     return self
 
 
@@ -2252,6 +2327,10 @@ class WorkflowView(WireModel):
   max_phases: int = Field(ge=1)
   phase: WorkflowViewPhase | None = None
   node_states: tuple[WorkflowViewNodeState, ...] = ()
+  # Node attempts the runner held on a capacity ``Deferred`` and node
+  # attempts the governor denied: measurements, nothing gates on them.
+  capacity_deferred_count: int = Field(default=0, ge=0)
+  governor_denied_count: int = Field(default=0, ge=0)
   published_output_reads: tuple[WorkflowOutputReadRecipe, ...] = ()
   admitted_plan_ref: AdmittedPlanRef | None = None
   terminal_phase_revision: TerminalPhaseRevision | None = None
@@ -2389,6 +2468,8 @@ __all__ = [
   "AdmittedTenant",
   "AdmittedResearchBinding",
   "AdmittedLineage",
+  "SelectionPresetProvenance",
+  "SelectionProvenance",
   "AdmittedContextWire",
   "AgentExecutionSnapshot",
   "ProjectionRequirement",
@@ -2400,6 +2481,7 @@ __all__ = [
   "ValidationVerdictAcceptancePolicy",
   "OrdinaryDelegationTaskRef",
   "WorkflowNodeTaskRef",
+  "PipelineStageTaskRef",
   "AttemptRef",
   "AdmittedWorkflowNodeIdentity",
   "ExecuteTaskDisposition",

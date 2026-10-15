@@ -729,3 +729,82 @@ def test_drainer_quarantines_a_row_whose_run_authority_changed(
   ):
     asyncio.run(coordinator._deliver_one(_delivery_row(**changed)))  # type: ignore[arg-type]
   assert delivered == []
+
+
+def test_drainer_stops_delivery_when_user_removed_from_roster(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  delivered: list[dict[str, Any]] = []
+
+  async def deliver(**kwargs: Any) -> None:
+    delivered.append(kwargs)
+
+  monkeypatch.setattr(drainer_module, "deliver_autonomous_approval_outbox", deliver)
+
+  alice_task = _running_task(task_id="bg_alice", control_run_id="bg_alice", session_id="bg_alice", channel_id="chan_alice", owner_user_id="alice")
+  bob_task = _running_task(task_id="bg_bob", control_run_id="bg_bob", session_id="bg_bob", channel_id="chan_bob", owner_user_id="bob")
+
+  class MultiTaskRegistry:
+    def __init__(self, tasks: list[AutonomousTask], roster: dict[str, dict[str, Any]]) -> None:
+      self._tasks = {t.task_id: t for t in tasks}
+      self._roster = roster
+
+    def live_user_role(self, user_id: str, email: str | None = None) -> str | None:
+      del email
+      entry = self._roster.get(user_id)
+      if not entry:
+        return None
+      return str(entry.get("role") or "owner")
+
+    def _mcp_user_key_lookup(self, user_id: str, email: str | None = None) -> dict[str, Any] | None:
+      del email
+      return self._roster.get(user_id)
+
+  # alice was removed from the roster; bob is still in the roster
+  roster = {"bob": {"role": "owner"}}
+  registry = MultiTaskRegistry([alice_task, bob_task], roster)
+
+  req_alice = SimpleNamespace(
+    approval_id="app-alice",
+    tool_call_id="tool-alice",
+    user_id="alice",
+    request_id="bg_alice",
+    run_id="bg_alice",
+    session_id="bg_alice",
+    channel="cli",
+    decider_id="alice",
+    state="approved",
+  )
+  req_bob = SimpleNamespace(
+    approval_id="app-bob",
+    tool_call_id="tool-bob",
+    user_id="bob",
+    request_id="bg_bob",
+    run_id="bg_bob",
+    session_id="bg_bob",
+    channel="cli",
+    decider_id="bob",
+    state="approved",
+  )
+
+  class MultiRequestStore:
+    async def get(self, approval_id: str) -> Any:
+      if approval_id == "app-alice":
+        return req_alice
+      if approval_id == "app-bob":
+        return req_bob
+      return None
+
+  coordinator = _coordinator(MultiRequestStore(), registry=registry)
+
+  row_alice = _delivery_row(approval_id="app-alice", tool_call_id="tool-alice", nonce="n-alice", task_id="bg_alice", control_run_id="bg_alice", session_id="bg_alice", channel_id="chan_alice")
+  row_bob = _delivery_row(approval_id="app-bob", tool_call_id="tool-bob", nonce="n-bob", task_id="bg_bob", control_run_id="bg_bob", session_id="bg_bob", channel_id="chan_bob")
+
+  # 1. Attempting delivery for alice fails permanently because she is removed from roster
+  with pytest.raises(PermanentAutonomousApprovalDeliveryError, match="no longer admitted on the roster"):
+    asyncio.run(coordinator._deliver_one(row_alice))  # type: ignore[arg-type]
+
+  # 2. Attempting delivery for bob succeeds because bob is still on the roster
+  asyncio.run(coordinator._deliver_one(row_bob))  # type: ignore[arg-type]
+  # Delivered calls contain bob only; alice was stopped
+  assert [call["user_id"] for call in delivered] == ["bob"]

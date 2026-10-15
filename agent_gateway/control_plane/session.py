@@ -16,6 +16,12 @@ from agent_gateway.auth import (
 )
 from agent_gateway.approval_route import bind_session_approval_route
 from agent_gateway.session import AuthManager
+from agent_gateway.ttl_policy import (
+  CONTROL_SESSION_TTL,
+  TtlResolver,
+  default_ttl_resolver,
+  resolve_ttl_seconds,
+)
 
 
 CONTROL_SESSION_TTL_SECONDS = 900
@@ -47,6 +53,9 @@ class ControlSessionResponse(BaseModel):
   user_slug: str | None = None
   user_email: str | None = None
   channel: str | None = None
+  # Entitlements the resolver supplied that name no registered capability:
+  # they grant nothing and are reported so the operator can correct the grant.
+  unknown_model_entitled_capabilities: list[str] = Field(default_factory=list)
   identity: ControlSessionIdentityResponse
 
 
@@ -195,6 +204,7 @@ def build_session_router(
   tenant_id: str | None,
   allow_service_credentials_for_interactive: bool,
   identity_resolver: Callable[..., Any] | None = None,
+  ttl_resolver: TtlResolver = default_ttl_resolver,
   approval_store: Any | None = None,
   approval_policy: Any | None = None,
 ) -> APIRouter:
@@ -221,6 +231,7 @@ def build_session_router(
     resolved_role: Literal["owner", "invite"] = "invite"
     resolved_capabilities: frozenset[str] = frozenset()
     resolved_model_entitled_capabilities: frozenset[str] = frozenset()
+    resolved_unknown_model_entitled_capabilities: frozenset[str] = frozenset()
     resolved_model_entitled_keys: frozenset[str] = frozenset()
     resolved_credential_principal = None
     resolved_allow_service_for_interactive = (
@@ -271,6 +282,9 @@ def build_session_router(
       resolved_role = result.role
       resolved_capabilities = result.capabilities
       resolved_model_entitled_capabilities = result.model_entitled_capabilities
+      resolved_unknown_model_entitled_capabilities = (
+        result.unknown_model_entitled_capabilities
+      )
       resolved_model_entitled_keys = result.model_entitled_keys
       resolved_auth_config = result.auth_config.to_dict()
       resolved_credential_principal = result.credential_principal
@@ -317,7 +331,9 @@ def build_session_router(
       model_entitled_keys=resolved_model_entitled_keys,
       kind="control",
       auth_config=resolved_auth_config,
-      ttl_seconds=CONTROL_SESSION_TTL_SECONDS,
+      ttl_seconds=resolve_ttl_seconds(
+        ttl_resolver, resolved_user_id, CONTROL_SESSION_TTL, CONTROL_SESSION_TTL_SECONDS,
+      ),
       owner_user_id=str(identity.owner_user_id),
       raw_user_id=str(identity.raw_user_id),
       user_slug=identity.user_slug,
@@ -344,6 +360,9 @@ def build_session_router(
       user_slug=identity.user_slug,
       user_email=identity.user_email,
       channel=session.channel,
+      unknown_model_entitled_capabilities=sorted(
+        resolved_unknown_model_entitled_capabilities
+      ),
       identity=_identity_response(identity),
     )
 

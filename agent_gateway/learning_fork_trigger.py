@@ -226,12 +226,14 @@ def _runtime_for_runner(
 
   from .runner_fork_agents import spawn_learning_fork
 
+  owner = _owner(session)
   ledger = ForkLedger(
-    config.ledger_path(_owner(session)),
+    config.ledger_path(owner),
     process_instance_id=_process_instance_id,
   )
   ledger.reconcile_startup(
     live_process_instance_ids={_process_instance_id},
+    fork_journal=config.fork_journal_reader,
   )
   registry = ForkTaskRegistry(
     ledger,
@@ -424,14 +426,42 @@ def submit_learning_fork_after_turn(
       session_id=str(session.session_id),
       owner=_owner(session),
       handoff=work_item,
+      on_settled=work_item.on_admission_settled,
     )
     if launch.launched:
+      session.learning_fork_config._pending_events.setdefault(
+        str(session.session_id), [],
+      ).append({
+        "type": "learning_fork_launched",
+        "fork_id": launch.fork_id,
+        "session_id": str(session.session_id),
+        "in_flight": launch.in_flight,
+        "day_invocations": launch.day_invocations,
+        "day_charged_microusd": launch.day_charged_microusd,
+        "retained_bytes": launch.retained_bytes,
+      })
       session.learn_skill_nudge_iters = 0
     return launch
   except Exception:
     _emit_metric(runner, "learning_fork_trigger_failed")
     log.warning("Learning-fork trigger failed", exc_info=True)
     return None
+
+
+def flush_learning_fork_events(runner: Any) -> None:
+  """Append this session's pending counts while its turn's writer is held."""
+
+  session = _gateway_session(runner)
+  config = getattr(session, "learning_fork_config", None)
+  if session is None or config is None:
+    return
+  session_id = str(session.session_id)
+  events = config._pending_events.get(session_id, [])
+  while events:
+    if runner._log.append(events[0]) is None:
+      return
+    events.pop(0)
+  config._pending_events.pop(session_id, None)
 
 
 def successful_memory_write_from_events(

@@ -513,6 +513,27 @@ def test_create_client_isolates_bound_credentials_and_routes_concurrently(
   assert "x-api-key" not in oauth_request.headers
 
 
+def test_create_client_serves_each_users_bare_bound_token_across_turns(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+  pytest.importorskip("anthropic")
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  for name in (
+    "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKENS", "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_AUTH_STORE_PATH",
+  ):
+    monkeypatch.delenv(name, raising=False)
+  provider = AnthropicProvider()
+
+  # User 1 turn 1, user 2 turn 1, user 1 turn 2: neither token retires the other.
+  for token in ("fixture-user-one-token", "fixture-user-two-token", "fixture-user-one-token"):
+    client = provider.create_client({"auth_mode": "oauth", "auth_token": token})
+    try:
+      assert client.auth_token == token
+    finally:
+      asyncio.run(provider.close_client(client))
+
+
 @pytest.mark.parametrize(
   ("config", "custom_headers", "header", "expected", "omitted_header"),
   [
@@ -1248,6 +1269,13 @@ def test_normalize_messages_synthetic_tool_result_has_no_internal_tool_name() ->
   assert synthetic_block["is_error"] is True
   assert "tool_name" not in synthetic_block
   assert "lookup" in synthetic_block["content"]
+  assert json.loads(synthetic_block["content"]) == {
+    "error": {
+      "code": "missing_tool_result",
+      "message": "No result provided for tool lookup",
+      "data": {"next_call": None},
+    },
+  }
 
 
 def test_normalize_messages_removes_replayed_tool_result_tool_name() -> None:
@@ -1280,6 +1308,46 @@ def test_normalize_messages_removes_replayed_tool_result_tool_name() -> None:
     "tool_use_id": "tool-1",
     "content": "{\"ok\": true}",
   }
+
+
+def test_normalize_messages_drops_foreign_thought_signature_on_tool_use() -> None:
+  # L1 2026-10-13: a Gemini turn replayed after fallback to Anthropic was
+  # rejected: `tool_use.thoughtSignature: Extra inputs are not permitted`.
+  # The signature is the producing model's; a same-model replay keeps it.
+  provider = AnthropicProvider()
+  info = _model_info()
+  foreign = {
+    "role": "assistant",
+    "provider": "google_antigravity",
+    "model": "gemini-model",
+    "content": [
+      {
+        "type": "tool_use", "id": "call-1", "name": "lookup", "input": {},
+        "thoughtSignature": "sig", "thought_signature": "sig",
+      },
+    ],
+  }
+  own = {
+    "role": "assistant",
+    "provider": info.provider,
+    "model": info.id,
+    "content": [
+      {"type": "tool_use", "id": "call-2", "name": "lookup", "input": {}, "thoughtSignature": "sig"},
+    ],
+  }
+  tool_result = lambda call: {  # noqa: E731
+    "role": "user",
+    "content": [{"type": "tool_result", "tool_use_id": call, "content": "ok"}],
+  }
+
+  normalized = provider.normalize_messages(
+    [foreign, tool_result("call-1"), own, tool_result("call-2")], info,
+  )
+
+  assert normalized[0]["content"][0] == {
+    "type": "tool_use", "id": "call-1", "name": "lookup", "input": {},
+  }
+  assert normalized[2]["content"][0]["thoughtSignature"] == "sig"
 
 
 class _FailingStreamContext:
@@ -1615,6 +1683,8 @@ def test_org_refusing_oauth_parks_that_member_and_rotates_to_the_next(
   serving_member = anthropic_provider_module.resolve_anthropic_credentials().by_token(serving)
   assert serving_member is not None
   assert provider.next_credential({"auth_mode": "oauth", "auth_token": refused}, failure) == {
+    "auth_mode": "oauth",
+    "api_key": "",
     "auth_token": serving,
     "credential_source": serving_member.source_metadata(),
   }

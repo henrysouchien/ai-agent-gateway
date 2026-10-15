@@ -11,8 +11,8 @@ from agent_gateway.semantic_capability_routing import (
   FILINGS_READ,
   MARKET_DATA_READ,
   SEMANTIC_CAPABILITY_CORRECTIONS_BY_EFFECT,
-  SEMANTIC_CAPABILITY_CORRECTIONS_BY_IDENTITY,
   STATE_MUTATE,
+  TRANSCRIPTS_READ,
   WEB_READ,
   WORKSPACE_WRITE,
   semantic_capability_for_registration,
@@ -56,89 +56,96 @@ def _forged_identity(
 
 
 @pytest.mark.parametrize(
-  ("identity", "effect", "expected"),
+  ("identity", "effect", "declared", "expected"),
   [
-    (_local("web_fetch"), "read", WEB_READ),
-    (_mcp("research-corpus-mcp", "filings_search"), "read", FILINGS_READ),
-    (_mcp("market-data-mcp", "get_quote"), "read", MARKET_DATA_READ),
-    (_local("unknown_read"), "support", CORPUS_READ),
+    (_local("web_fetch"), "read", WEB_READ, WEB_READ),
+    (
+      _mcp("research-corpus-mcp", "filings_search"),
+      "read",
+      FILINGS_READ,
+      FILINGS_READ,
+    ),
+    (_mcp("market-data-mcp", "get_quote"), "read", MARKET_DATA_READ, MARKET_DATA_READ),
+    (_local("unknown_read"), "support", None, CORPUS_READ),
     (
       _mcp("model-engine", "unknown_transform"),
       "pure_transform",
       COMPUTATION_EXECUTE,
+      COMPUTATION_EXECUTE,
     ),
-    (_local("preview"), "preview", ARTIFACT_PROPOSE),
+    (_local("preview"), "preview", None, ARTIFACT_PROPOSE),
     (
       _mcp("portfolio-writes-mcp", "artifact"),
       "artifact_write",
+      None,
       ARTIFACT_PROPOSE,
     ),
-    (_local("local_write"), "state_write", WORKSPACE_WRITE),
-    (_addin("addin_write"), "state_write", WORKSPACE_WRITE),
-    (_mcp("finance-cli-mcp", "server_write"), "state_write", STATE_MUTATE),
-    (_mcp("alerts", "notify"), "external_write", STATE_MUTATE),
+    (_local("local_write"), "state_write", None, WORKSPACE_WRITE),
+    (_addin("addin_write"), "state_write", None, WORKSPACE_WRITE),
+    (_mcp("finance-cli-mcp", "server_write"), "state_write", None, STATE_MUTATE),
+    (_mcp("alerts", "notify"), "external_write", None, STATE_MUTATE),
     (
       _mcp("portfolio-config-mcp", "configure"),
       "portfolio_config",
+      None,
       STATE_MUTATE,
     ),
     (
       _mcp("portfolio-trades-mcp", "execute_trade"),
       "irreversible",
+      None,
       STATE_MUTATE,
     ),
-    (_mcp("timesfm", "timesfm_forecast"), "read", COMPUTATION_EXECUTE),
   ],
 )
 def test_registration_capability_preserves_current_versioned_vocabulary(
   identity: RegisteredToolIdentity,
   effect: str,
+  declared: str | None,
   expected: str,
 ) -> None:
-  actual = semantic_capability_for_registration(identity, effect)  # type: ignore[arg-type]
+  actual = semantic_capability_for_registration(
+    identity,
+    effect,  # type: ignore[arg-type]
+    read_capability=declared,
+  )
 
   assert actual == expected
   assert actual.endswith("/v1")
   assert not actual.startswith("tool:")
 
 
-def test_tool_capability_overrides_do_not_leak_across_same_bare_routes() -> None:
+def test_read_capability_is_the_owner_declaration_never_a_routing_list() -> None:
+  # The same identity serves whatever its registration owner declares; with no
+  # declaration a read still serves corpus.read, never "satisfies anything".
+  identity = _mcp("research-corpus-mcp", "filings_search")
   assert semantic_capability_for_registration(
-    _mcp("research-corpus-mcp", "filings_search"),
+    identity,
     "read",
-  ) == FILINGS_READ
+    read_capability=TRANSCRIPTS_READ,
+  ) == TRANSCRIPTS_READ
   assert semantic_capability_for_registration(
-    _local("filings_search"),
+    identity,
     "read",
+    read_capability=None,
   ) == CORPUS_READ
+  # Write-like effects derive from the effect; a read declaration does not move them.
   assert semantic_capability_for_registration(
-    _mcp("market-data-mcp", "filings_search"),
-    "read",
-  ) == MARKET_DATA_READ
-
-  assert semantic_capability_for_registration(
-    _mcp("timesfm", "timesfm_forecast"),
-    "read",
-  ) == COMPUTATION_EXECUTE
-  assert semantic_capability_for_registration(
-    _local("timesfm_forecast"),
-    "read",
-  ) == CORPUS_READ
-  assert semantic_capability_for_registration(
-    _mcp("market-data-mcp", "timesfm_forecast"),
-    "read",
-  ) == MARKET_DATA_READ
+    identity,
+    "state_write",
+    read_capability=FILINGS_READ,
+  ) == STATE_MUTATE
 
 
 def test_registration_capability_requires_exact_contract_values() -> None:
   identity = _local("web_fetch")
 
   with pytest.raises(TypeError, match="exact RegisteredToolIdentity"):
-    semantic_capability_for_registration(identity.materialize(), "read")  # type: ignore[arg-type]
+    semantic_capability_for_registration(identity.materialize(), "read", read_capability=None)  # type: ignore[arg-type]
   with pytest.raises(TypeError, match="effect must be an exact str"):
-    semantic_capability_for_registration(identity, None)  # type: ignore[arg-type]
+    semantic_capability_for_registration(identity, None, read_capability=None)  # type: ignore[arg-type]
   with pytest.raises(ToolRegistrationContractError, match="unsupported"):
-    semantic_capability_for_registration(identity, "unknown")  # type: ignore[arg-type]
+    semantic_capability_for_registration(identity, "unknown", read_capability=None)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -166,18 +173,14 @@ def test_registration_capability_revalidates_forged_exact_class_identities(
   identity: RegisteredToolIdentity,
 ) -> None:
   with pytest.raises(TypeError):
-    semantic_capability_for_registration(identity, "read")
+    semantic_capability_for_registration(identity, "read", read_capability=None)
 
 
 def test_registration_capability_corrections_are_frozen_and_exact() -> None:
   assert isinstance(SEMANTIC_CAPABILITY_CORRECTIONS_BY_EFFECT, MappingProxyType)
-  assert isinstance(SEMANTIC_CAPABILITY_CORRECTIONS_BY_IDENTITY, MappingProxyType)
   assert dict(SEMANTIC_CAPABILITY_CORRECTIONS_BY_EFFECT) == {
     "irreversible": STATE_MUTATE,
     "portfolio_config": STATE_MUTATE,
-  }
-  assert dict(SEMANTIC_CAPABILITY_CORRECTIONS_BY_IDENTITY) == {
-    _mcp("timesfm", "timesfm_forecast"): COMPUTATION_EXECUTE,
   }
   with pytest.raises(TypeError):
     SEMANTIC_CAPABILITY_CORRECTIONS_BY_EFFECT["read"] = CORPUS_READ  # type: ignore[index]

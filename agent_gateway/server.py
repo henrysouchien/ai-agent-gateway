@@ -55,7 +55,7 @@ from .event_log import EventLog, UserEventBus
 from .approval_route import bind_session_approval_route
 from .dispatcher_factory import GatewayDispatcherDeps
 from .approvals import ApprovalActionError, _record_vote_and_unblock  # noqa: F401
-from .approval_store import expire_pending_loop
+from .approval_store import maintain_pending_loop
 from .package_info import (
   CONTRACT_CHAT_ATTACHMENTS_V1,
   CONTRACT_INVESTMENT_SELECTED_CONTENT_V1,
@@ -103,6 +103,7 @@ from .server_models import (  # noqa: F401
   ChatRequest,
   ChatRecapRequest,
   ChatCancelRequest,
+  ChatTodoPatchRequest,
   ChatTurnInputs,
   ChatTurnResult,
   PreparedChatTurn,
@@ -257,6 +258,14 @@ def _has_investment_selected_content_reader(
     return False
 
 
+class _CapabilityAdapterFamilyMismatch(ValueError):
+  """Installed resolver returned a provider family the registry does not name.
+
+  Wiring, not artifact data: startup still fails.  Distinct so the closure's
+  observe-and-allow catch does not swallow it.
+  """
+
+
 def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   """Create a FastAPI gateway application from explicit runtime configuration.
 
@@ -349,6 +358,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     )
     if default_adapter is not None:
       capability_adapter_cache[default_adapter] = configured_default_provider
+  log = logging.getLogger(config.log_name)
 
   def _resolve_capability_adapter(adapter_id: str) -> ModelProvider:
     normalized_adapter = str(adapter_id or "").strip()
@@ -379,18 +389,16 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     if resolved_family == "agent-sdk":
       resolved_family = "anthropic"
     if expected_providers != {resolved_family}:
-      raise ValueError(
+      raise _CapabilityAdapterFamilyMismatch(
         f"capability adapter {normalized_adapter!r} returned provider "
         f"{resolved_family!r}; expected {sorted(expected_providers)}"
       )
 
-    # Closure against the implementation's own protocol declaration.  On the
-    # built-in path the installed adapter class must declare this adapter id,
-    # and every gateway-executed registry entry bound to it must use a
-    # declared protocol profile and route.  Deployment-vouched implementations
-    # (test doubles and app-owned wrappers included) skip only this
-    # declaration check; the packaged/deployment-selected INITIAL artifacts
-    # are still closed against installed declarations at import admission.
+    # On the built-in path the installed class must declare this adapter id.
+    # A gateway-executed entry whose profile or route that declaration does
+    # not cover is logged and left for selection to skip
+    # (``provider_unavailable``); the adapter still resolves for the entries
+    # it does declare.  Deployment-vouched implementations skip this check.
     if not deployment_vouched:
       declaration = provider.adapter_route_support()
       if declaration is None:
@@ -408,27 +416,41 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         if not (set(entry.capabilities) & GATEWAY_EXECUTED_CAPABILITY_IDS):
           continue
         if not declaration.supports(entry):
-          raise ValueError(
-            f"registry entry {entry.key!r} requires protocol profile "
-            f"{entry.protocol_profile!r} on route {entry.route!r}, which "
-            f"installed adapter {normalized_adapter!r} does not declare"
+          log.warning(
+            "registry entry %r requires protocol profile %r on route %r, which "
+            "installed adapter %r does not declare; selection skips it",
+            entry.key,
+            entry.protocol_profile,
+            entry.route,
+            normalized_adapter,
           )
     capability_adapter_cache[normalized_adapter] = provider
     return provider
 
-  # Full startup closure over the configured registry (design § Configuration
-  # and evolution step 4): every entry serving a capability this gateway
-  # process executes must resolve to an installed, declared adapter now —
-  # never `provider_unavailable` at first use.  Entries serving only
-  # externally-executed capabilities (risk.*, investment.*) are admitted
-  # registry facts for their own serving processes and are excluded here by
-  # explicit designation, not silently skipped.
+  # Observe installed adapters against the configured registry.  An entry
+  # whose adapter is not installed, or whose installed adapter does not
+  # declare its profile and route, is logged and skipped at selection
+  # (``provider_unavailable``) — the artifact deploys ahead of this process's
+  # code, so that fact is not a startup failure.  A resolver that returns the
+  # wrong provider family is wiring and still fails startup.  Entries serving
+  # only externally-executed capabilities are excluded by designation; they
+  # are facts for their own processes.
   for adapter_id in sorted({
     entry.adapter
     for entry in model_registry.models.values()
     if set(entry.capabilities) & GATEWAY_EXECUTED_CAPABILITY_IDS
   }):
-    _resolve_capability_adapter(adapter_id)
+    try:
+      _resolve_capability_adapter(adapter_id)
+    except _CapabilityAdapterFamilyMismatch:
+      raise
+    except (LookupError, ValueError) as exc:
+      log.warning(
+        "capability adapter %r is unavailable in this process (%s); "
+        "its entries are skipped at selection",
+        adapter_id,
+        exc,
+      )
 
   auth = config.auth_manager or AuthManager(
     secret=config.jwt_secret,
@@ -464,7 +486,6 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   auth.session_store.add_on_expiry(_write_session_gc_recap_on_expiry)
   auth.session_store.add_on_expiry(_cleanup_active_turn_on_expiry)
   auth.session_store.add_on_expiry(cleanup_control_chat_tasks)
-  log = logging.getLogger(config.log_name)
   route_prefix = _normalize_prefix(config.prefix)
 
   @asynccontextmanager
@@ -476,7 +497,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         transcript_retention_days=config.transcript_retention_days,
       )
     )
-    approval_expire_task = asyncio.create_task(expire_pending_loop(app.state.gateway_approval_store))
+    approval_maintenance_task = asyncio.create_task(maintain_pending_loop(app.state.gateway_approval_store))
     retention_task: asyncio.Task[Any] | None = None
 
     async def _retention_loop() -> None:
@@ -543,7 +564,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
 
       maintenance_tasks = [
         cleanup_task,
-        approval_expire_task,
+        approval_maintenance_task,
         *([retention_task] if retention_task is not None else []),
       ]
       for maintenance_task in maintenance_tasks:
@@ -954,6 +975,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     resolved_role: str = "invite"
     resolved_capabilities: frozenset[str] = frozenset()
     resolved_model_entitled_capabilities: frozenset[str] = frozenset()
+    resolved_unknown_model_entitled_capabilities: frozenset[str] = frozenset()
     resolved_model_entitled_keys: frozenset[str] = frozenset()
     resolved_credential_principal = None
     resolved_allow_service_for_interactive = (
@@ -1009,6 +1031,9 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       resolved_role = result.role
       resolved_capabilities = result.capabilities
       resolved_model_entitled_capabilities = result.model_entitled_capabilities
+      resolved_unknown_model_entitled_capabilities = (
+        result.unknown_model_entitled_capabilities
+      )
       resolved_model_entitled_keys = result.model_entitled_keys
       resolved_auth_config = result.auth_config.to_dict()
       resolved_credential_principal = result.credential_principal
@@ -1148,6 +1173,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       bind_init_capability_selections(
         session=session,
         selections=payload.capability_selections,
+        model_preset=payload.model_preset,
         build_chat_runtime=app.state.gateway_build_chat_runtime,
       )
     except CapabilityResolutionError as exc:
@@ -1178,6 +1204,9 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     return ChatInitResponse(
       user_id=resolved_user_id,
       session_token=token,
+      unknown_model_entitled_capabilities=sorted(
+        resolved_unknown_model_entitled_capabilities
+      ),
       session_id=session.session_id,
       expires_at=session.expires_at,
       schema_version=session.schema_version,
@@ -1360,6 +1389,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       name=stored.name,
       policy_revision=stored.policy_revision,
       updated_at=stored.updated_at,
+      known_preset_names=sorted(known_preset_names),
     )
 
   @router.get("/model-presets/self", response_model=ModelPresetResponse)
@@ -1380,6 +1410,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       name=stored.name if stored is not None else None,
       policy_revision=stored.policy_revision if stored is not None else None,
       updated_at=stored.updated_at if stored is not None else None,
+      known_preset_names=sorted(store.known_preset_names),
     )
 
   @router.delete("/model-presets/self", response_model=ModelPresetResponse)
@@ -1396,7 +1427,10 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       tenant_id=resolver.auth_context.tenant_id,
       actor_id=resolver.auth_context.actor_id,
     )
-    return ModelPresetResponse(name=None, policy_revision=None, updated_at=None)
+    return ModelPresetResponse(
+      name=None, policy_revision=None, updated_at=None,
+      known_preset_names=sorted(store.known_preset_names),
+    )
 
   @router.post("/chat", response_model=None)
   async def chat_stream(
@@ -1534,6 +1568,11 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         session,
         inputs,
         build_chat_runtime=app.state.gateway_build_chat_runtime,
+        commercial_account_id=(
+          verified_commercial_claim.claim.commercial_account_id
+          if verified_commercial_claim is not None
+          else None
+        ),
       )
       if commercial_gate is not None:
         pending_work_start = commercial_gate.authorize_request(
@@ -1690,6 +1729,18 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
 
     return StreamingResponse(event_generator(), headers=headers, background=BackgroundTask(response_cleanup))
 
+  async def _append_todo_snapshot_event(session: Any, event: dict) -> None:
+    """Persist the accepted checklist change to the session's durable log."""
+    log = getattr(session, "agent_session_log", None)
+    if log is not None:
+      await log.append(event)
+
+  def _emit_todo_snapshot_event(session: Any, event: dict) -> None:
+    """Push the same event onto the session's live event log so clients see it."""
+    active = getattr(session, "active_turn", None)
+    if active is not None and getattr(active, "event_log", None) is not None:
+      active.event_log.append(event)
+
   @router.get("/chat/subscribe")
   async def chat_subscribe(request: Request) -> StreamingResponse:
     return await _server_chat_control_routes.chat_subscribe_response(
@@ -1728,6 +1779,28 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       write_transcript=_write_transcript,
     )
 
+  @router.get("/chat/todo")
+  async def chat_todo_get(request: Request) -> JSONResponse:
+    return await _server_chat_control_routes.chat_todo_get_response(
+      request,
+      auth=auth,
+      get_bearer_token=AuthManager.get_bearer_token,
+    )
+
+  @router.patch("/chat/todo")
+  async def chat_todo_patch(
+    request: Request,
+    body: ChatTodoPatchRequest = Body(...),
+  ) -> JSONResponse:
+    return await _server_chat_control_routes.chat_todo_patch_response(
+      request,
+      body,
+      auth=auth,
+      get_bearer_token=AuthManager.get_bearer_token,
+      append_todo_snapshot=_append_todo_snapshot_event,
+      emit_to_session=_emit_todo_snapshot_event,
+    )
+
   @router.get("/workflow-outputs/{workflow_run_id}/{output_id}")
   async def workflow_output(
     request: Request,
@@ -1751,7 +1824,6 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       payload,
       auth=auth,
       log=log,
-      time_time=time.time,
     )
 
   @router.post("/chat/tool-approval")

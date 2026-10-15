@@ -58,12 +58,14 @@ def _delivery() -> dict[str, str]:
   }
 
 
-@pytest.mark.parametrize("trusted_offset_ns", [0, 1])
-def test_vote_at_or_after_deadline_expires_atomically_without_vote_or_outbox(
+@pytest.mark.parametrize("trusted_offset_ns", [0, 1, 3_600 * 10**9])
+def test_vote_at_or_after_recorded_expiry_is_delivered(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path,
   trusted_offset_ns: int,
 ) -> None:
+  # Elapsed time never decides a non-money approval: a late authenticated vote
+  # is recorded and its autonomous delivery is queued.
   deadline = datetime(2035, 1, 1, tzinfo=UTC)
   deadline_ns = approval_store_module._datetime_to_epoch_ns(deadline)
   monkeypatch.setattr(
@@ -82,46 +84,13 @@ def test_vote_at_or_after_deadline_expires_atomically_without_vote_or_outbox(
     )
   )
 
-  assert resolved.state == "expired"
-  assert resolved.decision == "expired"
+  assert resolved.state == "approved"
   with store._connection() as conn:
     vote_count = conn.execute(
       "SELECT COUNT(*) FROM approval_votes WHERE approval_id = ?",
       ("approval-deadline",),
     ).fetchone()[0]
-  assert vote_count == 0
-  assert asyncio.run(
-    store.get_autonomous_approval_delivery(
-      "approval-deadline",
-      tool_call_id="tool-deadline",
-      nonce="nonce-deadline",
-    )
-  ) is None
-
-
-def test_vote_one_nanosecond_before_deadline_is_accepted(
-  monkeypatch: pytest.MonkeyPatch,
-  tmp_path,
-) -> None:
-  deadline = datetime(2035, 1, 1, tzinfo=UTC)
-  deadline_ns = approval_store_module._datetime_to_epoch_ns(deadline)
-  monkeypatch.setattr(
-    approval_store_module.time,
-    "time_ns",
-    lambda: deadline_ns - 1,
-  )
-  store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
-  asyncio.run(store.create(_request(deadline=deadline)))
-
-  resolved = asyncio.run(
-    store.record_vote_with_autonomous_delivery(
-      "approval-deadline",
-      _vote(decided_at=deadline),
-      delivery=_delivery(),
-    )
-  )
-
-  assert resolved.state == "approved"
+  assert vote_count == 1
   delivery = asyncio.run(
     store.get_autonomous_approval_delivery(
       "approval-deadline",

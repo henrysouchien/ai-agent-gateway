@@ -4,123 +4,30 @@ from __future__ import annotations
 
 import base64
 import binascii
-from dataclasses import dataclass
 import hashlib
 import json
 import re
 import time
-from typing import Callable, Literal, Mapping
+from typing import Callable
 from uuid import UUID
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from cryptography.hazmat.primitives.serialization import load_pem_public_key
 import jwt
 
-from .commercial_claims import VerifiedCommercialClaim
-
-
-WORK_AUTHORIZATION_ALGORITHM = "EdDSA"
-WORK_AUTHORIZATION_ISSUER = "risk-module-commercial-work-control"
-WORK_AUTHORIZATION_AUDIENCE = "hank-agent-gateway-work-start"
-_CODE = re.compile(r"^[a-z][a-z0-9._:-]{0,127}$")
+from hank_contracts.commercial_claims import VerifiedCommercialClaim
+from hank_contracts.commercial_work import (
+  _CODE,
+  _load_ed25519_public_key,
+  WORK_AUTHORIZATION_ALGORITHM,
+  WORK_AUTHORIZATION_AUDIENCE,
+  WORK_AUTHORIZATION_ISSUER,
+  WORK_AUTHORIZATION_REQUIRED_FIELDS as WORK_AUTHORIZATION_REQUIRED_FIELDS,
+  WORK_AUTHORIZATION_V3_REQUIRED_FIELDS as WORK_AUTHORIZATION_V3_REQUIRED_FIELDS,
+  WorkAuthorizationError as WorkAuthorizationError,
+  WorkAuthorizationTrustSnapshot as WorkAuthorizationTrustSnapshot,
+  VerifiedWorkAuthorization as VerifiedWorkAuthorization,
+)
 _OPAQUE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$")
 _BASE64URL_SEGMENT = re.compile(r"^[A-Za-z0-9_-]+$")
-WORK_AUTHORIZATION_REQUIRED_FIELDS = frozenset({
-  "schema_version", "kid", "iss", "aud", "jti", "environment",
-  "execution_claim_jti", "workflow_run_id", "workflow_attempt_group_id",
-  "workflow_attempt_number", "retry_of_workflow_run_id",
-  "workflow_attempt_kind", "primary_inference_observability",
-  "funding_route_id", "provider", "billing_mode", "reservation_id",
-  "operation", "capability_id", "request_id", "session_id", "iat", "exp",
-})
-
-
-def _load_ed25519_public_key(pem: bytes) -> Ed25519PublicKey:
-  key = load_pem_public_key(pem)
-  if not isinstance(key, Ed25519PublicKey):
-    raise ValueError("work authorization verification keys must be Ed25519")
-  return key
-
-
-class WorkAuthorizationError(ValueError):
-  def __init__(self, code: str) -> None:
-    self.code = code
-    super().__init__(code)
-
-
-@dataclass(frozen=True)
-class WorkAuthorizationTrustSnapshot:
-  public_keys_by_id: Mapping[str, bytes]
-  environment: str
-  manifest_version: str
-  capability_required_scopes: Mapping[str, frozenset[str]]
-  capability_allowed_operations: Mapping[str, frozenset[str]]
-  retired_at_by_key_id: Mapping[str, int | None]
-
-  def __post_init__(self) -> None:
-    if self.environment not in {"dev", "staging", "prod"}:
-      raise ValueError("work authorization trust environment is invalid")
-    if not isinstance(self.manifest_version, str) or not self.manifest_version:
-      raise ValueError("work authorization manifest version is invalid")
-    if not self.public_keys_by_id:
-      raise ValueError("work authorization trust requires verification keys")
-    if set(self.retired_at_by_key_id) != set(self.public_keys_by_id):
-      raise ValueError("work authorization key retirement inventory is incomplete")
-    for key_id, pem in self.public_keys_by_id.items():
-      if not _CODE.fullmatch(key_id):
-        raise ValueError("work authorization verification key id is invalid")
-      _load_ed25519_public_key(pem)
-      retired_at = self.retired_at_by_key_id[key_id]
-      if retired_at is not None and (type(retired_at) is not int or retired_at <= 0):
-        raise ValueError("work authorization retirement cutoff is invalid")
-    if not self.capability_required_scopes:
-      raise ValueError("work authorization manifest capability map is empty")
-    if set(self.capability_allowed_operations) != set(
-      self.capability_required_scopes
-    ):
-      raise ValueError("work authorization manifest operation map is incomplete")
-    for capability, scopes in self.capability_required_scopes.items():
-      if (
-        not _CODE.fullmatch(capability)
-        or not isinstance(scopes, frozenset)
-        or not scopes
-      ):
-        raise ValueError("work authorization manifest capability is invalid")
-      if any(not _CODE.fullmatch(scope) for scope in scopes):
-        raise ValueError("work authorization manifest scope is invalid")
-      operations = self.capability_allowed_operations[capability]
-      if (
-        not isinstance(operations, frozenset)
-        or not operations
-        or any(not _CODE.fullmatch(operation) for operation in operations)
-      ):
-        raise ValueError("work authorization manifest operation is invalid")
-
-
-@dataclass(frozen=True)
-class VerifiedWorkAuthorization:
-  schema_version: int
-  key_id: str
-  token_sha256: str
-  authorization_id: UUID
-  environment: str
-  execution_context_id: UUID
-  workflow_run_id: UUID
-  workflow_attempt_group_id: UUID
-  workflow_attempt_number: int
-  retry_of_workflow_run_id: UUID | None
-  workflow_attempt_kind: str
-  primary_inference_observability: str
-  funding_route_id: UUID
-  provider: str
-  billing_mode: Literal["byok", "metered"]
-  reservation_id: UUID | None
-  operation: str
-  capability_id: str | None
-  request_id: str
-  session_id: str
-  issued_at: int
-  expires_at: int
 
 
 class WorkAuthorizationVerifier:
@@ -155,9 +62,9 @@ class WorkAuthorizationVerifier:
     request_id: str,
     session_id: str,
     operation: str,
-    provider: str,
     billing_mode: str,
     capability_id: str | None,
+    credential_principal: str,
   ) -> VerifiedWorkAuthorization:
     current = self._clock()
     if type(current) is not int:
@@ -165,9 +72,8 @@ class WorkAuthorizationVerifier:
     for name, value in (("request", request_id), ("session", session_id)):
       if not isinstance(value, str) or not _OPAQUE_ID.fullmatch(value):
         raise WorkAuthorizationError(f"invalid_{name}_id")
-    for name, value in (("operation", operation), ("provider", provider)):
-      if not isinstance(value, str) or not _CODE.fullmatch(value):
-        raise WorkAuthorizationError(f"invalid_{name}")
+    if not isinstance(operation, str) or not _CODE.fullmatch(operation):
+      raise WorkAuthorizationError("invalid_operation")
     if billing_mode not in {"byok", "metered"}:
       raise WorkAuthorizationError("invalid_billing_mode")
     if capability_id is not None and (
@@ -237,8 +143,6 @@ class WorkAuthorizationVerifier:
       raise WorkAuthorizationError("session_mismatch")
     if authorization.operation != operation:
       raise WorkAuthorizationError("operation_mismatch")
-    if authorization.provider != provider:
-      raise WorkAuthorizationError("provider_mismatch")
     if authorization.billing_mode != billing_mode:
       raise WorkAuthorizationError("billing_mode_mismatch")
     if authorization.capability_id != capability_id:
@@ -257,6 +161,10 @@ class WorkAuthorizationVerifier:
     ]
     if authorization.operation not in allowed_operations:
       raise WorkAuthorizationError("operation_not_authorized")
+    # Money (rulings-index WA-ACCOUNT-BUDGET): the ticket binds the account,
+    # not the provider or model the call happens to use.
+    if authorization.credential_principal != credential_principal:
+      raise WorkAuthorizationError("credential_principal_mismatch")
     return authorization
 
   @staticmethod
@@ -296,10 +204,16 @@ class WorkAuthorizationVerifier:
   def _validate_payload(
     payload: dict, *, key_id: str, token_sha256: str
   ) -> VerifiedWorkAuthorization:
-    if set(payload) != WORK_AUTHORIZATION_REQUIRED_FIELDS:
-      raise WorkAuthorizationError("unknown_or_missing_claim")
-    if payload.get("schema_version") != 1:
+    fields = set(payload)
+    version = payload.get("schema_version")
+    # V1 and V2 tickets are not accepted. The gate is off, so none are live.
+    if type(version) is int and version in (1, 2):
       raise WorkAuthorizationError("unknown_schema")
+    if fields != WORK_AUTHORIZATION_V3_REQUIRED_FIELDS:
+      raise WorkAuthorizationError("unknown_or_missing_claim")
+    if type(version) is not int or version != 3:
+      raise WorkAuthorizationError("unknown_schema")
+    schema_version = 3
     if payload.get("kid") != key_id:
       raise WorkAuthorizationError("key_id_mismatch")
     if payload.get("iss") != WORK_AUTHORIZATION_ISSUER:
@@ -333,11 +247,6 @@ class WorkAuthorizationVerifier:
     # risk_module budget reservation the authorization names.
     if (billing_mode == "metered") != (reservation_id is not None):
       raise WorkAuthorizationError("invalid_authority_shape")
-    if (billing_mode, observability) not in {
-      ("metered", "hank_metered"),
-      ("byok", "hank_byok_observed"),
-    }:
-      raise WorkAuthorizationError("invalid_authority_shape")
     operation = _require_code(payload, "operation")
     capability = _optional_code(payload, "capability_id")
     request_id = _require_opaque_id(payload, "request_id")
@@ -346,8 +255,18 @@ class WorkAuthorizationVerifier:
     expires_at = _require_positive_int(payload, "exp")
     if expires_at <= issued_at:
       raise WorkAuthorizationError("invalid_authorization_lifetime")
+    credential_principal = payload.get("credential_principal")
+    if credential_principal not in {"user", "service"}:
+      raise WorkAuthorizationError("invalid_credential_principal")
+    reserved_spend = payload.get("reserved_spend_microusd")
+    # Money: metered work stops at the reservation hold; byok has no hold.
+    if billing_mode == "byok":
+      if reserved_spend is not None:
+        raise WorkAuthorizationError("invalid_authority_shape")
+    elif type(reserved_spend) is not int or reserved_spend < 0:
+      raise WorkAuthorizationError("invalid_authority_shape")
     return VerifiedWorkAuthorization(
-      schema_version=1,
+      schema_version=schema_version,
       key_id=key_id,
       token_sha256=token_sha256,
       authorization_id=authorization_id,
@@ -369,6 +288,8 @@ class WorkAuthorizationVerifier:
       session_id=session_id,
       issued_at=issued_at,
       expires_at=expires_at,
+      reserved_spend_microusd=reserved_spend,
+      credential_principal=credential_principal,
     )
 
 
@@ -454,6 +375,7 @@ __all__ = [
   "WORK_AUTHORIZATION_AUDIENCE",
   "WORK_AUTHORIZATION_ISSUER",
   "WORK_AUTHORIZATION_REQUIRED_FIELDS",
+  "WORK_AUTHORIZATION_V3_REQUIRED_FIELDS",
   "WorkAuthorizationError",
   "WorkAuthorizationTrustSnapshot",
   "WorkAuthorizationVerifier",

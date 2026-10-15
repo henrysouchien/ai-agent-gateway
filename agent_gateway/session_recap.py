@@ -9,8 +9,6 @@ from typing import Any, Protocol
 
 from .event_log import LogEntry, log_has_terminal
 from .events import (
-  ApprovalDecisionSource,
-  ApprovalOutcome,
   Confidence,
   RecapApproval,
   RecapArtifact,
@@ -19,11 +17,92 @@ from .events import (
   RecapVerdict,
   SessionRecapEvent,
   ToolCallsSummary,
+  _approval_decision_source,
+  _approval_outcome,
 )
 from .multi_user.billing import SessionUsageSummary
 
 
 log = logging.getLogger("agent_gateway.session_recap")
+
+#: Section name -> disclosure-layer group for ``context_chars.<group>``; a name
+#: not listed here is ``other``. Measurement labels only.
+CONTEXT_SECTION_GROUPS: dict[str, str] = {
+  "identity_section": "identity",
+  "persistent_memory": "memory_files",
+  "memory_section": "memory_db",
+  "memory_instructions": "doctrine",
+  "citation_rules": "doctrine",
+  "column_identification": "doctrine",
+  "excel_tool_usage": "doctrine",
+  "no_excel": "doctrine",
+  "edgar_guidance": "doctrine",
+  "methodology": "doctrine",
+  "general_rules": "doctrine",
+  "tool_validation": "doctrine",
+  "active_mcp_tools": "mcp_sections",
+  "deferred_mcp_tools": "mcp_sections",
+  "tool_packs_section": "packs",
+  "skills_catalog": "skills_preamble",
+  "interactive_analyst_friction_capture": "friction",
+}
+CONTEXT_GROUPS = (
+  "identity",
+  "memory_files",
+  "memory_db",
+  "doctrine",
+  "mcp_sections",
+  "packs",
+  "skills_preamble",
+  "friction",
+  "reminders",
+  "other",
+)
+CONTEXT_COMPOSITION_FIELDS = (
+  "context_chars.system_total",
+  *(f"context_chars.{group}" for group in CONTEXT_GROUPS),
+  "context_tools.advertised",
+  "context_tools.invoked",
+  "context_skills.invoked",
+)
+
+
+def context_chars_by_group(prompt_sections: Any) -> dict[str, int]:
+  """Characters per ``CONTEXT_GROUPS`` entry over a prompt's section records
+  (``name``/``text`` attributes); empty when the prompt carries none."""
+
+  chars: dict[str, int] = {}
+  for section in prompt_sections or ():
+    group = CONTEXT_SECTION_GROUPS.get(str(getattr(section, "name", "")), "other")
+    key = f"context_chars.{group}"
+    chars[key] = chars.get(key, 0) + len(str(getattr(section, "text", "") or ""))
+  return chars
+
+
+def build_context_composition_event(
+  *,
+  turn: int,
+  group_chars: dict[str, int],
+  system_total: int,
+  reminders: int,
+  tools_advertised: int,
+  tools_invoked: int,
+  skills_invoked: int,
+) -> dict[str, Any]:
+  """One per provider request; flat int fields named in ``CONTEXT_COMPOSITION_FIELDS``."""
+
+  event: dict[str, Any] = {
+    "type": "context_composition",
+    "turn": turn,
+    **group_chars,
+    "context_chars.system_total": system_total,
+    "context_chars.reminders": reminders,
+    "context_tools.advertised": tools_advertised,
+    "context_tools.invoked": tools_invoked,
+    "context_skills.invoked": skills_invoked,
+  }
+  return event
+
 
 #: Counts other owners report on events this recap folds, by event type. Each
 #: replaced a refusal; the recap keeps the largest value per name in
@@ -39,11 +118,20 @@ RUN_MEASUREMENT_FIELDS: dict[str, tuple[str, ...]] = {
     "day_charged_microusd",
     "retained_bytes",
   ),
+  # runner_fork_agents._prepare_fork_child
+  "fork_measurements": ("turns", "suffix_tokens"),
   # runner_session_lifecycle._emit_top_level_skill_started (skill_lifecycle admission)
   "skill_run_started": ("lease_fence_bytes",),
+  # runner_run_loop: one per provider request; sizes are the run's peak,
+  # the ``invoked`` counts are cumulative so the peak is the total
+  "context_composition": CONTEXT_COMPOSITION_FIELDS,
 }
 #: Calls to the model engine's ``model_*`` tools, counted from the tool calls.
 MODEL_CALLS_MEASUREMENT = "model_calls"
+#: Provider responses that stopped on the output-length cap
+#: (``assistant_message.stop_reason == "max_tokens"``): a measurement of the
+#: run, never its outcome.
+MAX_TOKENS_STOPS_MEASUREMENT = "max_tokens_stops"
 
 
 class _SessionRecapSource(Protocol):
@@ -347,6 +435,10 @@ class _ToolCallAccumulator:
       self.measurements[name] = max(int(value), self.measurements.get(name, 0))
 
   def record_run_measurements(self, event_type: str, event: dict[str, Any]) -> None:
+    if event_type == "assistant_message" and event.get("stop_reason") == "max_tokens":
+      self.measurements[MAX_TOKENS_STOPS_MEASUREMENT] = (
+        self.measurements.get(MAX_TOKENS_STOPS_MEASUREMENT, 0) + 1
+      )
     for name in RUN_MEASUREMENT_FIELDS.get(event_type, ()):
       value = event.get(name)
       if value is not None:
@@ -392,8 +484,9 @@ def _bare_tool_name(tool_name: str) -> str:
 
 
 def fold_run_measurements(events: Iterable[dict[str, Any]]) -> dict[str, int]:
-  """The ``RUN_MEASUREMENT_FIELDS`` peaks over ``events``: the fold the recap
-  runs, for an owner that adds counts from a log the recap did not see."""
+  """The ``RUN_MEASUREMENT_FIELDS`` peaks and the ``max_tokens_stops`` count over
+  ``events``: the fold the recap runs, for an owner that adds counts from a log
+  the recap did not see."""
 
   accumulator = _ToolCallAccumulator()
   for event in events:
@@ -458,34 +551,6 @@ def _confidence(value: Any) -> Confidence | None:
   return None
 
 
-def _approval_outcome(value: Any) -> ApprovalOutcome:
-  if value == "approved":
-    return "approved"
-  if value == "denied":
-    return "denied"
-  if value == "timeout":
-    return "timeout"
-  return "timeout"
-
-
-def _approval_decision_source(value: Any) -> ApprovalDecisionSource:
-  if value == "user_approved":
-    return "user_approved"
-  if value == "delegated_auto_approved":
-    return "delegated_auto_approved"
-  if value == "user_denied":
-    return "user_denied"
-  if value == "relay_policy_denied":
-    return "relay_policy_denied"
-  if value == "headless_auto_deny":
-    return "headless_auto_deny"
-  if value == "headless_hook_approved":
-    return "headless_hook_approved"
-  if value == "session_cache_approved":
-    return "session_cache_approved"
-  return "approval_timeout"
-
-
 def _failure_detail(event: dict[str, Any]) -> str:
   for key in ("error_detail", "error", "message", "reason", "detail"):
     value = event.get(key)
@@ -501,6 +566,7 @@ def _soft_budget_abort_detail(event: dict[str, Any]) -> str:
 
 
 __all__ = [
+  "MAX_TOKENS_STOPS_MEASUREMENT",
   "MODEL_CALLS_MEASUREMENT",
   "RUN_MEASUREMENT_FIELDS",
   "SessionRecapEventLog",

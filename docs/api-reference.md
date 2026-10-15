@@ -67,7 +67,11 @@ Key parameters:
 - `outputs_dir`: directory for named-skill output files; stale same-day outputs are cleaned before background `run_agent` launch
 - `state_dir`: optional directory for persisted run state (JSON load/save between runs)
 - `delivery`: optional `DeliveryConfig` for webhook, Telegram, briefing file, or callback output
-- `max_concurrent_sub_agents`: optional concurrency limit for sub-agents
+- `containment`: optional `ContainmentSettings` (spawn depth, concurrent children,
+  soft-ladder knobs, hung-child silence, context thresholds); `None` resolves
+  `resolve_containment_settings(os.environ)` when the call starts; an unreadable
+  `HANK_MAX_SPAWN_DEPTH` raises `ContainmentSettingError` naming the setting, and
+  any other invalid value logs a warning and keeps its default
 - `compaction_instructions`: optional instructions for context compaction
 - `interceptors`: optional trusted interceptor sequence; automatic `run_agent`
   children retain the same stateful instances in the same order as the parent
@@ -98,9 +102,10 @@ delegated run (a `run_agent` child or a learning fork) meets the soft-budget lad
 forced final report at 1.5x, and an `interrupted` run with reason
 `soft_budget_abort` only if the child still has not finished two provider
 requests later. The ladder counts provider requests (turns plus `max_tokens`
-continuation segments). Its threshold has one source, the bundled
-`SOFT_TURN_BUDGET` table keyed by run kind (`default` 100, `fork` 10); nothing
-a skill, profile or caller declares feeds it. `HANK_SOFT_TURN_BUDGET` can only
+continuation segments). Its threshold has one source, the
+`ContainmentSettings.soft_turn_budget` table keyed by run kind (`default` 100,
+`autonomous` 100, `fork` 10); nothing a skill, profile or caller declares feeds
+it. `HANK_SOFT_TURN_BUDGET` (`soft_turn_budget_cap`) can only
 lower it, and `0` disables the ladder. A primary run has no ladder, and no run
 carries a cost ceiling: spend is measured (`stream_complete.usage`, usage
 events), never enforced.
@@ -123,7 +128,7 @@ Result of an autonomous run. Fields:
 - `timed_out: bool` — timeout marker retained in the result contract; the
   autonomous entry point applies no wall clock, so it stays False
 - `operator_paused: bool` — True when an operator intentionally paused the run
-- `max_tokens_reached: bool` — True when generation reached its token bound
+- `max_tokens_reached: bool` — REMOVED. A provider length stop is not a result field; it is the `max_tokens_stops` measurement on `session_recap.tool_calls_summary.measurements`.
 - `exit_reason: str | None` — more specific terminal reason, when one exists
 - `post_run_guard: dict | None` — structured post-run guard failure details
 
@@ -140,10 +145,11 @@ Where results go after a run completes.
 ### `run_output_exit_code()` and `run_output_outcome()`
 
 Map a `RunOutput` to process exit codes: `0` for success or operator pause, `1`
-for errors and post-run guard failures, `4` for max tokens, and `124` for
-timeout. Semantic outcomes include `success`, `timeout`, `error`, `max_tokens`,
-`operator_pause`, or a more specific `exit_reason`. Exit codes are for process
-semantics; outcomes are for persisted state tracking.
+for errors and post-run guard failures, and `124` for timeout. Semantic outcomes
+include `success`, `timeout`, `error`, `operator_pause`, or a more specific
+`exit_reason`. Exit codes are for process semantics; outcomes are for persisted
+state tracking. A provider length stop changes neither: it is counted in
+`session_recap.tool_calls_summary.measurements["max_tokens_stops"]`.
 
 ### `HeartbeatLoop`
 
@@ -467,7 +473,7 @@ Per-provider-request billing event (a portable compaction request emits its own 
 
 ### `SessionUsageSummary`
 
-Aggregated billing record emitted **once per chat** after background-task drain. Fields include summed tokens/cost, `turns`, `request_id`, plus `drain_complete: bool` and `in_flight_task_count: int` for detecting incomplete drains. Sub-agent `UsageEvent`s roll into the parent runner's summary via the internal aggregator.
+Billing record emitted **once per session run** after background-task drain: one for the root run and one for each delegated sub-agent run (`session_id` `sub<N>:<root session id>`). Fields include summed tokens/cost, `turns`, `request_id`, `unit_kind` / `unit_id` (the root's declared unit, shared by every run in the dispatch tree), plus `drain_complete: bool` and `in_flight_task_count: int` for detecting incomplete drains. A summary counts only its own run's `UsageEvent`s and its own model; the root's summary does not include its sub-agents' usage. `session_recap.usage` and the commercial usage reconciliation read the whole dispatch tree's total.
 
 ### `normalize_identity()`
 
@@ -562,10 +568,10 @@ Contains:
 `bundle.bind_dispatcher(...)` binds the turn's dispatcher, a `code_callable(operation)`
 predicate the embedding application derives from the exact installed route's producer
 policy and served disposition retained on its registered live binding (a same-named
-operation on another server is decided by that server and route). Served
-`artifact_composable`, `tool_only` and `internal_only` reviews exclude the route;
-`read_composable` and `pure_local` never widen the policy read-effect requirement.
-Absent, malformed or `unclassified` producer metadata keeps existing policy coverage;
+operation on another server is decided by that server and route). Callable unless
+the served review is `tool_only` or `internal_only`, the operation is in that
+server's internal-only audience, or its effect class is `irreversible`.
+Absent, malformed or `unclassified` producer metadata does not exclude the route;
 malformed metadata logs once at registration without rejecting the tool. Optional
 `catalog_metadata(operation)` supplies route identities, alongside the application's source extraction
 and identity callbacks. Cells compose those granted operations through the injected
@@ -576,7 +582,7 @@ source identities. Complete deduplicated `sources` stay inline; model-output
 spilling handles large envelopes. Nested payloads go to the cell, not directly
 to the model. A cell registration permits repeated frames until that cell ends.
 
-### `build_code_execution(session, config=None)`
+### `build_code_execution(session, config=None, *, job_runner=None)`
 
 Inject built-in code execution tools into a runtime.
 
@@ -585,11 +591,13 @@ Behavior:
 - `host=auto` prefers Docker when available
 - falls back to a registered host kernel, then subprocess; skipped-backend reasons are logged at `WARNING`
 - every `code_execute` result names where it ran: `backend`, `sandboxed`, and `skipped_backends` (`[{backend, sandboxed, reason}]`, empty unless `host=auto` skipped one)
-- stores reader, interpreter states, background tasks and work directory on the session
+- stores reader, interpreter states and work directory on the session
+- `job_runner()` answers the `AgentRunner` that owns the request's task registry, or `None`, at call time; a `background=true` cell registers there as a `code` job and is inspected, waited on and killed through the registry, and with no runner it returns `code_execution_unavailable`
 
 ### `cleanup_code_execution(session)`
 
-Cancel background tasks, await interpreter shutdown and nested dispatch closure,
+Kill and await the running `code` jobs of the session's live turn runner, await
+interpreter shutdown and nested dispatch closure,
 then remove the session work directory. Call this on final session expiry,
 task teardown or app shutdown if you manage runtimes yourself. Ordinary cell
 completion or interruption does not dispose a persistent interpreter.
@@ -629,13 +637,12 @@ Subprocess timeout measures process exit independently of stream drainage:
 readers stay active through termination grace, then have a two-second drain
 bound so a descendant holding a writer cannot stall teardown.
 
-### `OutputRingBuffer` and `BackgroundTask`
+### `make_code_execute_tool_def()`
 
-Helpers used by background code execution.
-
-### `make_code_execute_tool_def()` and `make_code_execute_status_tool_def()`
-
-Factories for the public tool schemas exposed to the model.
+Factory for the public `code_execute` tool schema exposed to the model. A
+`background=true` cell runs as a `code` job on the task registry of the runner
+`build_code_execution(..., job_runner=...)` answers; its result is delivered as
+any background task result.
 
 ### `strip_code_execute_base64_hook()`
 

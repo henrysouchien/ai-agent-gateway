@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from agent_gateway import session as session_module
@@ -12,8 +12,10 @@ from agent_gateway.control_plane.middleware import CONTROL_PLANE_VERSION_HEADER
 from agent_gateway.event_log import EventLog
 from agent_gateway.runner import AgentRunner
 from agent_gateway.control_plane import session as control_session_module
-from agent_gateway.control_plane.session import CONTROL_SESSION_TTL_SECONDS
+from agent_gateway.control_plane.session import CONTROL_SESSION_TTL_SECONDS, build_session_router
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
+from agent_gateway.session import AuthManager, SessionStore
+from agent_gateway.ttl_policy import CONTROL_SESSION_TTL
 
 from gateway_test_support.control_plane_identity import fake_identity_resolver
 
@@ -24,6 +26,53 @@ def _unused_runner(
   _started_at: float,
 ) -> AgentRunner:
   raise AssertionError("control session tests never run a chat turn")
+
+
+def test_control_session_resolves_ttl_per_user_with_default_fallback(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  now = 1_700_000_000
+  monkeypatch.setattr(session_module.time, "time", lambda: now)
+  calls: list[tuple[str, str]] = []
+
+  def ttl_resolver(subject: str, ttl_name: str) -> int | None:
+    calls.append((subject, ttl_name))
+    return {"101": 120, "102": 480}.get(subject)
+
+  def store_ttl_resolver(_subject: str, _ttl_name: str) -> int | None:
+    raise AssertionError("control TTL must override the ordinary session TTL")
+
+  auth = AuthManager(
+    secret="control-plane-test-secret-0123456789",
+    valid_keys={"legacy-key"},
+    session_store=SessionStore(ttl_resolver=store_ttl_resolver),
+  )
+  app = FastAPI()
+  app.include_router(build_session_router(
+    auth=auth,
+    credentials_resolver=None,
+    resolver_timeout_seconds=1,
+    tenant_id="test-product",
+    allow_service_credentials_for_interactive=False,
+    identity_resolver=fake_identity_resolver,
+    ttl_resolver=ttl_resolver,
+  ))
+
+  with TestClient(app) as client:
+    responses = [
+      client.post("/session", json={"api_key": "legacy-key", "user_id": user_id})
+      for user_id in (" 101 ", "102", "103")
+    ]
+
+  assert [response.status_code for response in responses] == [200, 200, 200]
+  assert [response.json()["expires_at"] - now for response in responses] == [
+    120, 480, CONTROL_SESSION_TTL_SECONDS,
+  ]
+  assert calls == [
+    ("101", CONTROL_SESSION_TTL),
+    ("102", CONTROL_SESSION_TTL),
+    ("103", CONTROL_SESSION_TTL),
+  ]
 
 
 def test_control_session_lifecycle_create_use_expire_recreate(

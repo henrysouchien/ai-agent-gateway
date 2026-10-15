@@ -13,7 +13,15 @@ from .session_capabilities import normalize_session_capabilities
 logger = logging.getLogger(__name__)
 
 
-_VALID_PROVIDERS = {"anthropic", "openai", "codex", "xai"}
+def _installed_provider_names() -> frozenset[str]:
+  """Provider families the installed adapters declare; their own declarations own the set."""
+
+  # Imported here: the providers package imports this module for its failure types.
+  from .providers import installed_adapter_route_support
+
+  return frozenset(support.provider for support in installed_adapter_route_support().values())
+
+
 _VALID_BILLING_MODES = {"byok", "metered"}
 CredentialFailureKind = Literal["rate_limit", "billing", "auth"]
 
@@ -22,7 +30,7 @@ CredentialFailureKind = Literal["rate_limit", "billing", "auth"]
 class AuthConfig:
   """Typed wrapper over the existing auth_config dict shape."""
 
-  provider: Literal["anthropic", "openai", "codex", "xai"]
+  provider: str
   billing_mode: Literal["byok", "metered"]
   max_tokens: int | None
   _raw: Mapping[str, Any] = field(repr=False)
@@ -38,8 +46,9 @@ class AuthConfig:
 
     provider = str(d["provider"]).strip().lower()
     billing_mode = str(d["billing_mode"]).strip().lower()
-    if provider not in _VALID_PROVIDERS:
-      expected = ", ".join(sorted(_VALID_PROVIDERS))
+    installed = _installed_provider_names()
+    if provider not in installed:
+      expected = ", ".join(sorted(installed))
       raise ValueError(f"Unsupported provider '{provider}'. Expected one of: {expected}.")
     if billing_mode not in _VALID_BILLING_MODES:
       raise ValueError(f"Unsupported billing_mode '{billing_mode}'. Expected 'byok' or 'metered'.")
@@ -50,7 +59,7 @@ class AuthConfig:
       max_tokens = int(max_tokens)
 
     return cls(
-      provider=provider,  # type: ignore[arg-type]
+      provider=provider,
       billing_mode=billing_mode,  # type: ignore[arg-type]
       max_tokens=max_tokens,
       _raw=MappingProxyType(raw),

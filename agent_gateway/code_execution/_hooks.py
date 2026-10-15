@@ -6,10 +6,7 @@ from typing import Any, Dict
 from ..runner import ToolResultContext
 
 
-def _load_result_payload(ctx: ToolResultContext) -> Dict[str, Any] | None:
-  if ctx.result_entry is None:
-    return None
-  content = ctx.result_entry.get("content")
+def _load_result_payload(content: Any) -> Dict[str, Any] | None:
   if not isinstance(content, str):
     return None
   try:
@@ -19,18 +16,17 @@ def _load_result_payload(ctx: ToolResultContext) -> Dict[str, Any] | None:
   return parsed if isinstance(parsed, dict) else None
 
 
-def strip_code_execute_base64_hook(ctx: ToolResultContext) -> None:
-  """Sanitize model-visible code-execution results.
+def strip_code_execute_base64_content(content: str) -> str:
+  """The model-visible form of one serialized `code_execute` result.
 
-  Use this in `on_tool_result` pipelines when you want tool results to stay
-  readable in logs or downstream model messages.
+  Image bytes become `[image: <name>]` placeholders and native `computations`
+  are dropped; content that is not a result object is returned unchanged.
+  A foreground cell's result entry and a background cell's job result both
+  pass through here.
   """
-  if ctx.tool_name not in {"code_execute", "code_execute_status"} or ctx.result_entry is None or ctx.error is not None:
-    return
-
-  result = _load_result_payload(ctx)
+  result = _load_result_payload(content)
   if result is None:
-    return
+    return content
 
   updated = False
   for key in ("computations",):
@@ -47,27 +43,37 @@ def strip_code_execute_base64_hook(ctx: ToolResultContext) -> None:
           bundle[mime] = f"[image: display_{index + 1}]"
           updated = True
 
-
   images = result.get("images")
-  if not isinstance(images, list):
-    if updated:
-      ctx.result_entry["content"] = json.dumps(result, default=str)
-    return
-
-  sanitized_images = []
-  for image in images:
-    if not isinstance(image, dict):
-      sanitized_images.append(image)
-      continue
-    next_image = dict(image)
-    if "data_base64" in next_image:
-      filename = str(next_image.get("filename") or "image")
-      next_image["data_base64"] = f"[image: {filename}]"
-      updated = True
-    sanitized_images.append(next_image)
+  if isinstance(images, list):
+    sanitized_images = []
+    for image in images:
+      if not isinstance(image, dict):
+        sanitized_images.append(image)
+        continue
+      next_image = dict(image)
+      if "data_base64" in next_image:
+        filename = str(next_image.get("filename") or "image")
+        next_image["data_base64"] = f"[image: {filename}]"
+        updated = True
+      sanitized_images.append(next_image)
+    result["images"] = sanitized_images
 
   if not updated:
-    return
+    return content
+  return json.dumps(result, default=str)
 
-  result["images"] = sanitized_images
-  ctx.result_entry["content"] = json.dumps(result, default=str)
+
+def strip_code_execute_base64_hook(ctx: ToolResultContext) -> None:
+  """Sanitize model-visible code-execution results.
+
+  Use this in `on_tool_result` pipelines when you want tool results to stay
+  readable in logs or downstream model messages.
+  """
+  if ctx.tool_name != "code_execute" or ctx.result_entry is None or ctx.error is not None:
+    return
+  content = ctx.result_entry.get("content")
+  if not isinstance(content, str):
+    return
+  stripped = strip_code_execute_base64_content(content)
+  if stripped is not content:
+    ctx.result_entry["content"] = stripped

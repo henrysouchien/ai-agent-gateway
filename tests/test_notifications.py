@@ -15,6 +15,15 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from agent_workflow_contracts import (  # noqa: E402
+  AgentOperationRef,
+  AttemptRef,
+  OrdinaryDelegationTaskRef,
+  OutcomeRequirement,
+  ResultRequirement,
+  sha256_digest,
+  terminal_task_result,
+)
 from agent_gateway import (  # noqa: E402
   AgentRunner,
   AgentSessionLog,
@@ -44,6 +53,9 @@ from agent_gateway.runner_background_tasks import (  # noqa: E402
 )
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_runner_capability_execution,
+)
+from gateway_test_support.admitted_authority_test_support import (  # noqa: E402
+  sealed_admitted_task,
 )
 
 
@@ -937,6 +949,57 @@ def test_interrupted_notification_delivers_canonical_recovery_payload() -> None:
     assert error["code"] == "background_result_auto_notify"
 
   asyncio.run(_case())
+
+
+def test_parking_a_running_child_notifies_its_parent_with_the_reason() -> None:
+  runner = _make_runner()
+  entry = runner._task_registry.register(
+    "background_agent",
+    agent_name="writer",
+  )
+  admitted = sealed_admitted_task(
+    logical_task=OrdinaryDelegationTaskRef(
+      delegation_id=f"delegation:{entry.task_id}",
+      operation=AgentOperationRef(
+        namespace="agent-operation",
+        name="research",
+        version="1",
+        digest=sha256_digest({"operation": "research"}),
+      ),
+    ),
+    attempt=AttemptRef(
+      attempt_number=1,
+      attempt_id=f"attempt:{entry.task_id}",
+      physical_task_id=entry.task_id,
+    ),
+    result_requirement=ResultRequirement(outcome=OutcomeRequirement()),
+  )
+  parked = terminal_task_result(
+    admitted,
+    status="interrupted",
+    reason="turns_exhausted",
+  )
+  entry.admitted_task = admitted
+  entry.task_result = parked
+  runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
+
+  runner._task_registry.park(
+    entry.task_id,
+    result=parked.model_dump(mode="json"),
+  )
+
+  notifications = runner._notification_queue.peek()
+  assert len(notifications) == 1
+  notification = notifications[0]
+  assert notification.task_id == entry.task_id
+  assert notification.event == "parked"
+  assert notification.notification_generation == entry.notification_generation
+  assert notification.payload == runner._background_task_payload(entry)
+  assert notification.payload["status"] == "parked"
+  assert notification.payload["completed"] is False
+  assert "turns_exhausted" in notification.payload["message"]
+  assert entry.notification_delivery_state == "queued"
+  assert entry.completed_at is None
 
 
 def test_oversized_notification_payload_is_retrievable_without_polling() -> None:

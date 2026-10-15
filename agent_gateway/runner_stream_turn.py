@@ -8,6 +8,9 @@ import time
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
 
 from .auth import ProviderCredentialFailure
+from .providers.anthropic import referenced_tool_names
+from .providers.anthropic_oauth import AnthropicSourceError
+from .capability_execution import CapabilityExecutionResolver, FallbackSkip, ModelFallbackHop
 from model_authority.binding import validate_reported_identity
 from .providers import ModelInfo
 from .rate_limit import local_queue_left_at, locally_queued
@@ -16,7 +19,10 @@ from model_authority.thinking import EffortResolution, ThinkingLevel, parse_effo
 from .runner_introspection import format_exc as _format_exc
 from .runner_limits import (
   effective_compaction_trigger as _effective_compaction_trigger,
+  model_context_window,
+  system_prompt_estimate_text,
   token_breakdown_snapshot as _token_breakdown_snapshot,
+  token_estimate_snapshot,
 )
 from .runner_prompt_rules import (
   messages_require_tool_only_turns as _messages_require_tool_only_turns,
@@ -25,7 +31,8 @@ from .runner_prompt_rules import (
 from .runner_session_events import error_with_provider_projection
 from .runner_cleanup import attach_cleanup_failure
 from .runner_session_lifecycle import _runner_attr
-from .runner_state import StreamTurnFailure, StreamTurnResult
+from .commercial_work_start import commercial_budget_stop_fields
+from .runner_state import StreamTurnFailure, StreamTurnResult, select_run_max_tokens
 from .runner_streaming import (
   STREAM_STALL_TIMEOUT,
   STREAM_THINKING_STALL_TIMEOUT,
@@ -43,9 +50,12 @@ from .runner_usage import (
 
 if TYPE_CHECKING:
   from .capability_execution import BoundCapabilityExecution
+  from .containment_settings import ContainmentSettings
   from .multi_user.billing import UsageEvent, UsageState
   from .providers import ModelProvider
   from .runner_hooks_lifecycle import _UsageTotals
+  from .runner_tool_execution import AgentRunnerDispatcher
+  from .session import RequestToolPrefix
 
 
 
@@ -76,19 +86,29 @@ def _format_error_with_rejection_detail(
 
 class RunnerStreamTurnMixin:
   _first_text_at: float | None = None
+  # This runner's last fallback hop: the chain position the next hop walks
+  # on from. The next turn's runner starts on the primary with none.
+  _model_fallback_hop: ModelFallbackHop | None = None
+  _model_fallback_reason: Literal["usage_limit", "credential_denied", "provider_outage"] | None = None
 
   if TYPE_CHECKING:
     _billing_mode: Literal["byok", "metered"]
     _capability_execution: BoundCapabilityExecution
     _compaction_instructions: str | None
     _compaction_trigger: int | None
+    _containment: ContainmentSettings
     _disconnected: bool
+    _dispatcher: AgentRunnerDispatcher
+    _effort_resolution: EffortResolution | None
     _last_request_max_tokens: int
     _last_request_message_marker_position: (
       tuple[int, int] | None
     )
     _last_request_system_blocks: tuple[tuple[str, bool], ...]
     _last_request_wire_tools: list[dict[str, Any]]
+    _last_request_advertised_tool_names: frozenset[str]
+    _tool_prefix: RequestToolPrefix
+    _max_tokens_override: int | None
     _provider: ModelProvider
     _sid: str
     _stream_stall_timeout: float | None
@@ -109,6 +129,12 @@ class RunnerStreamTurnMixin:
     ) -> UsageEvent: ...
 
     def _call_metric(self, name: str, value: int = 1) -> None: ...
+
+    def _install_capability_execution(
+      self,
+      config: Dict[str, Any],
+      execution: BoundCapabilityExecution,
+    ) -> None: ...
 
     async def _call_on_usage(
       self,
@@ -231,49 +257,167 @@ class RunnerStreamTurnMixin:
     last_progress_at = time_module.monotonic()
     progress_events = 0
     guard_reason: tuple[str, str] | None = None
-    requested_effort = parse_effort(
-      config.get("effort"),
-      field_name="capability_execution.effort",
-    )
-    if requested_effort is None:
-      raise ValueError(
-        "native execution requires an explicitly bound effort"
+
+    def _bound_request_facts() -> tuple[ThinkingLevel, EffortResolution, float]:
+      requested = parse_effort(
+        config.get("effort"),
+        field_name="capability_execution.effort",
       )
-    bound_effort = self._capability_execution.bind.effort
-    if requested_effort.value != bound_effort:
-      raise ValueError(
-        "runtime effort does not match the immutable capability bind"
-      )
-    effort_resolution = self._provider.resolve_effort(
-      requested=requested_effort,
-      model=config["model"],
-      model_info=model_info,
-      max_tokens=max_tokens,
-      auth_mode=config.get("auth_mode"),
-      base_url=config.get("base_url") or config.get("baseURL"),
-      compat=config.get("compat"),
-    )
-    if (
-      effort_resolution.requested != requested_effort
-      or effort_resolution.effective != requested_effort
-    ):
-      raise ValueError(
-        (
-          f"native execution cannot preserve bound effort "
-          f"{requested_effort.value!r} for "
-          f"{self._capability_execution.bind.provider}:"
-          f"{self._capability_execution.bind.upstream_model} "
-          f"with max_tokens={max_tokens}"
+      if requested is None:
+        raise ValueError(
+          "native execution requires an explicitly bound effort"
         )
+      bound_effort = self._capability_execution.bind.effort
+      if requested.value != bound_effort:
+        raise ValueError(
+          "runtime effort does not match the immutable capability bind"
+        )
+      resolution = self._provider.resolve_effort(
+        requested=requested,
+        model=config["model"],
+        model_info=model_info,
+        max_tokens=max_tokens,
+        auth_mode=config.get("auth_mode"),
+        base_url=config.get("base_url") or config.get("baseURL"),
+        compat=config.get("compat"),
       )
-    self._effort_resolution = effort_resolution
-    _effective_stall_timeout = self._effective_stream_stall_timeout(
-      config=config,
-      model_info=model_info,
-      max_tokens=max_tokens,
-      current_messages=current_messages,
-      effort_resolution=effort_resolution,
-    )
+      if (
+        resolution.requested != requested
+        or resolution.effective != requested
+      ):
+        raise ValueError(
+          (
+            f"native execution cannot preserve bound effort "
+            f"{requested.value!r} for "
+            f"{self._capability_execution.bind.provider}:"
+            f"{self._capability_execution.bind.upstream_model} "
+            f"with max_tokens={max_tokens}"
+          )
+        )
+      self._effort_resolution = resolution
+      stall_timeout = self._effective_stream_stall_timeout(
+        config=config,
+        model_info=model_info,
+        max_tokens=max_tokens,
+        current_messages=current_messages,
+        effort_resolution=resolution,
+      )
+      return requested, resolution, stall_timeout
+
+    requested_effort, effort_resolution, _effective_stall_timeout = _bound_request_facts()
+
+    def _history_fits(execution: BoundCapabilityExecution) -> bool:
+      estimate = token_estimate_snapshot(
+        system_text=system_prompt_estimate_text(system_prompt),
+        messages=current_messages,
+        tools=base_kwargs.get("tools") or [],
+      )
+      return estimate.est_total_tokens <= model_context_window(
+        execution.provider.get_model_info(execution.bind.upstream_model),
+        self._containment,
+      )
+
+    def _model_ref(execution: BoundCapabilityExecution) -> Dict[str, Any]:
+      bind = execution.bind
+      entry = execution.registry.models.get(bind.model_key)
+      return {
+        "model_key": bind.model_key,
+        "label": entry.label if entry is not None else bind.model_key,
+        "provider": bind.provider,
+        "upstream_model": bind.upstream_model,
+        "effort": bind.effort,
+      }
+
+    async def _hop_model_fallback(
+      reason: Literal["usage_limit", "credential_denied", "provider_outage"],
+      reset_at: float | None,
+    ) -> bool:
+      """Move the remaining attempts to the next chain entry (design §6.5).
+
+      The hop happens at this attempt boundary: the failed attempt's partial
+      output is already discarded and completed tool effects stay in the
+      transcript, never replayed. Hop state is this runner's only; the next
+      turn's runner binds the primary again.
+      """
+
+      nonlocal client, model_info, max_tokens, requested_effort, effort_resolution, _effective_stall_timeout
+      # A reached reservation ends the job before the next provider request.
+      # This is not a hop reason. rulings-index WA-ACCOUNT-BUDGET.
+      stop = commercial_budget_stop_fields(
+        getattr(self, "_commercial_usage_producer", None)
+      )
+      if stop is not None:
+        setattr(self, "_request_boundary_stop_reason", "commercial_budget_reached")
+        emit_interrupted = _runner_attr(self, "_emit_interrupted_event", None)
+        if emit_interrupted is not None:
+          await emit_interrupted(
+            "commercial_budget_reached",
+            extra_fields=stop,
+          )
+        return False
+      context = self._dispatcher.capture_spawning_turn().context
+      snapshot = context.selection_snapshot if context is not None else None
+      if snapshot is None or context is None:
+        return False
+      primary = self._capability_execution
+      skipped_reasons: list[FallbackSkip] = []
+      hop = CapabilityExecutionResolver.rebind_model_fallback(
+        primary, snapshot,
+        selection_provenance=context.selection_provenance,
+        history_fits=_history_fits,
+        previous=self._model_fallback_hop,
+        skipped_out=skipped_reasons,
+      )
+      if hop is None:
+        reasons_summary = "; ".join(f"{s.model_key}: {s.code}" for s in skipped_reasons) if skipped_reasons else "none evaluated"
+        logger.warning(
+          "[%s] %s on %s with no eligible fallback chain entry (evaluated candidates: %s)",
+          self._sid,
+          reason,
+          primary.bind.model_key,
+          reasons_summary,
+        )
+        return False
+      # The failed attempt's client belongs to the provider that created it;
+      # the retry below builds the next one from the fallback's provider.
+      await self._close_client(client, timeout=2.0)
+      client = None
+      self._install_capability_execution(config, hop.execution)
+      self._model_fallback_hop = hop
+      self._model_fallback_reason = reason
+      model_info = self._provider.get_model_info(hop.execution.bind.upstream_model)
+      max_tokens = select_run_max_tokens(
+        config,
+        max_tokens_override=self._max_tokens_override,
+        model_info=model_info,
+      ).value
+      requested_effort, effort_resolution, _effective_stall_timeout = _bound_request_facts()
+      tried_credential_refs.add(hop.execution.bind.credential_ref)
+      logger.warning(
+        "[%s] Model fallback on turn %d: %s -> %s (%s, role %s, chain index %d)",
+        self._sid,
+        turn_count,
+        primary.bind.model_key,
+        hop.execution.bind.model_key,
+        reason,
+        hop.role,
+        hop.chain_index,
+      )
+      self._call_metric("gateway.model_fallback", 1)
+      self._append({
+        "type": "model_fallback",
+        "from": _model_ref(primary),
+        "to": _model_ref(hop.execution),
+        "reason": reason,
+        "reset_at": reset_at,
+        "role": hop.role,
+        "chain_index": hop.chain_index,
+        "skipped": [
+          {"model_key": skip.model_key, "code": skip.code}
+          for skip in hop.skipped
+        ],
+      })
+      return True
 
     def _make_params() -> tuple[Dict[str, Any], frozenset[str]]:
       normalized_messages = self._provider.normalize_messages(current_messages, model_info)
@@ -284,8 +428,47 @@ class RunnerStreamTurnMixin:
         if isinstance(definition, dict)
         and str(definition.get("name") or "").strip()
       )
+      is_anthropic = getattr(self._provider, "name", None) == "anthropic"
       fork_kwargs: Dict[str, Any] = {}
-      if getattr(self._provider, "name", None) == "anthropic":
+      if is_anthropic:
+        prefix = self._tool_prefix
+        if not any(
+          message.get("role") == "assistant" for message in normalized_messages
+        ):
+          # A conversation with no assistant turn yet is a new one (a pack
+          # runs several skills, each from fresh history, on one session): it
+          # anchors on its own first request, not on a predecessor's.
+          prefix.anchor = None
+          prefix.exposed.clear()
+          prefix.framing_tool = None
+        if prefix.anchor is None:
+          prefix.framing_tool = None
+          candidates: list[dict[str, Any]] = []
+          mcp_client = getattr(self, "_mcp_client", None)
+          if mcp_client is not None and hasattr(mcp_client, "get_tool_definitions"):
+            try:
+              raw_mcp_defs = mcp_client.get_tool_definitions()
+              if isinstance(raw_mcp_defs, list):
+                candidates.extend(raw_mcp_defs)
+            except Exception:
+              pass
+          default_defs_fn = getattr(self, "_default_tool_definitions", None)
+          if callable(default_defs_fn):
+            try:
+              raw_default_defs = default_defs_fn()
+              if isinstance(raw_default_defs, list):
+                candidates.extend(raw_default_defs)
+            except Exception:
+              pass
+          for tool in candidates:
+            if not isinstance(tool, dict):
+              continue
+            name = str(tool.get("name") or "").strip()
+            if name and name not in advertised_tool_names:
+              prefix.framing_tool = {
+                key: value for key, value in tool.items() if key != "cache_control"
+              }
+              break
         fork_kwargs = {
           "fork_mode": bool(getattr(self, "_fork_mode", False)),
           "fork_marker_position": getattr(
@@ -293,7 +476,19 @@ class RunnerStreamTurnMixin:
             "_fork_marker_position",
             None,
           ),
+          "tool_anchor": copy.deepcopy(prefix.anchor),
+          "framing_tool": copy.deepcopy(prefix.framing_tool),
         }
+        if prefix.anchor is not None:
+          # A tool the visible history references keeps its definition even
+          # after it leaves the advertised set, or the reference is a 400.  It
+          # is on the wire for that reference only and confers no authority.
+          referenced = referenced_tool_names(normalized_messages)
+          request_tools.extend(
+            copy.deepcopy(definition)
+            for name, definition in prefix.exposed.items()
+            if name in referenced and name not in advertised_tool_names
+          )
       params = self._provider.build_request_params(
         model=config["model"],
         messages=normalized_messages,
@@ -308,10 +503,17 @@ class RunnerStreamTurnMixin:
         compaction_trigger=_runner_attr(self, "_effective_compaction_trigger", _effective_compaction_trigger)(
           self._compaction_trigger,
           model_info,
+          self._containment,
         ),
         compaction_instructions=self._compaction_instructions,
         **fork_kwargs,
       )
+      if is_anthropic and self._tool_prefix.anchor is None:
+        anchor = [
+          tool for tool in params.get("tools") or []
+          if not tool.get("defer_loading")
+        ]
+        self._tool_prefix.anchor = copy.deepcopy(anchor) if anchor else None
       rendered_system_blocks: list[tuple[str, bool]] = []
       for block in params.get("system") or []:
         if not isinstance(block, dict):
@@ -342,6 +544,7 @@ class RunnerStreamTurnMixin:
       self._last_request_wire_tools = copy.deepcopy(
         params.get("tools") or []
       )
+      self._last_request_advertised_tool_names = advertised_tool_names
       self._last_request_message_marker_position = (
         marker_locations[0] if len(marker_locations) == 1 else None
       )
@@ -565,7 +768,9 @@ class RunnerStreamTurnMixin:
     stream_error: Exception | None = None
     tried_credential_refs = {self._capability_execution.bind.credential_ref}
     transient_retries = 0
+    next_retry_delay: float = 0.0
     attempt = -1
+    attempt_start_mono = time_module.monotonic()
 
     def _raise_if_disconnected(exc: Exception | None = None) -> None:
       if not self._disconnected:
@@ -576,28 +781,115 @@ class RunnerStreamTurnMixin:
         raise stream_error
       raise asyncio_module.CancelledError()
 
-    def _retry_delay(next_attempt: int) -> float:
-      return stream_retry_delay * (stream_retry_backoff ** (next_attempt - 1))
+    def _retry_delay(next_transient_retry: int) -> float:
+      return stream_retry_delay * (stream_retry_backoff ** (next_transient_retry - 1))
 
     async def _emit_stream_retry(
       attempt: int, attempt_start_mono: float, error: str, *, new_credential: bool = False,
     ) -> None:
+      nonlocal next_retry_delay
+      if new_credential:
+        backoff_s: float | None = 0.0
+        next_retry_delay = 0.0
+      elif transient_retries < stream_retry_max:
+        backoff_s = _retry_delay(transient_retries + 1)
+        next_retry_delay = backoff_s
+      else:
+        backoff_s = None
+        next_retry_delay = 0.0
       await self._emit_stream_retry_event(
         attempt=attempt,
         error=error,
         attempt_elapsed_s=time_module.monotonic() - attempt_start_mono,
-        backoff_s=(
-          _retry_delay(attempt + 1)
-          if new_credential or transient_retries < stream_retry_max else None
-        ),
+        backoff_s=backoff_s,
       )
+
+    def _credential_failure_for(exc: Exception) -> ProviderCredentialFailure | None:
+      """The credential failure `exc` names, including a typed source error.
+
+      A typed `AnthropicSourceError` (a retired/removed/superseded bound
+      generation) is a credential failure exactly like a 401: it goes through
+      the same rotation path. Everything else is the provider's own
+      classification.
+      """
+      if isinstance(exc, AnthropicSourceError):
+        return ProviderCredentialFailure(
+          provider=str(getattr(self._provider, "name", "unknown") or "unknown"),
+          kind="auth",
+          error_code=getattr(exc, "code", None),
+          message=str(exc),
+        )
+      try:
+        return self._provider.classify_credential_failure(exc)
+      except Exception as classify_exc:
+        logger.warning(
+          "[%s] credential failure classification failed (non-fatal): %s",
+          self._sid,
+          classify_exc,
+        )
+        return None
+
+    async def _rotate_credential(
+      credential_failure: ProviderCredentialFailure,
+      attempt: int,
+      attempt_start_mono: float,
+    ) -> bool:
+      """Swap in the provider's next eligible generation; True when it rotated.
+
+      The provider parks the rejected member and the resolver names the
+      sibling in a new bind (CRED-ROTATION-REBIND); a generation's first
+      attempt does not spend the transient-retry budget, revisiting one does.
+      A frozen generation bind never reaches here: it fails typed at
+      materialization, before the turn.
+      """
+      nonlocal transient_retries
+      rotated_config = self._provider.next_credential(config, credential_failure)
+      if rotated_config is None or not self._apply_refreshed_auth_config(config, rotated_config):
+        return False
+      credential_ref = self._capability_execution.bind.credential_ref
+      new_credential = credential_ref not in tried_credential_refs
+      tried_credential_refs.add(credential_ref)
+      self._call_metric("gateway.credential_rotated", 1)
+      self._append(
+        {
+          "type": "credential_refreshed",
+          "provider": credential_failure.provider,
+          "kind": credential_failure.kind,
+          "status_code": credential_failure.status_code,
+        }
+      )
+      await _emit_stream_retry(
+        attempt,
+        attempt_start_mono,
+        f"credential rotated after provider {credential_failure.kind} failure",
+        new_credential=new_credential,
+      )
+      if not new_credential:
+        transient_retries += 1
+      return True
+
+    async def _rotate_after_source_error(
+      source_exc: AnthropicSourceError, attempt: int, attempt_start_mono: float,
+    ) -> bool:
+      failure = _credential_failure_for(source_exc)
+      if failure is None:
+        return False
+      return await _rotate_credential(failure, attempt, attempt_start_mono)
 
     while transient_retries <= stream_retry_max:
       attempt += 1
       if attempt > 0:
         _raise_if_disconnected()
         await self._close_client(client, timeout=2.0)
-        client = self._provider.create_client(config)
+        try:
+          client = self._provider.create_client(config)
+        except AnthropicSourceError as source_exc:
+          # The bind's exact generation was retired at its owner between
+          # attempts: rotate through the same credential path a 401/429 takes,
+          # rather than letting the typed error escape the retry loop.
+          if await _rotate_after_source_error(source_exc, attempt, attempt_start_mono):
+            continue
+          raise
         self._set_client(client)
         logger.warning(
           "[%s] Stream retry %d on turn %d after %s",
@@ -607,7 +899,7 @@ class RunnerStreamTurnMixin:
           _runner_attr(self, "_format_exc", _format_exc)(stream_error) if stream_error is not None else "unknown error",
         )
         _raise_if_disconnected()
-        delay = _retry_delay(attempt)
+        delay = next_retry_delay
         await asyncio_module.sleep(delay)
 
       last_progress_at = attempt_start_mono = time_module.monotonic()
@@ -735,46 +1027,55 @@ class RunnerStreamTurnMixin:
             )
           return await self._finish_failed_stream_turn(client, guard_error)
 
-        credential_failure: ProviderCredentialFailure | None = None
-        try:
-          credential_failure = self._provider.classify_credential_failure(exc)
-        except Exception as classify_exc:
-          logger.warning("[%s] credential failure classification failed (non-fatal): %s", self._sid, classify_exc)
+        credential_failure = _credential_failure_for(exc)
         if credential_failure is not None:
           # The provider owns interchangeable credentials. A generation's first
           # attempt does not spend the transient-error retry budget; revisiting
-          # a generation (including an unchanged bind) does.
-          rotated_config = self._provider.next_credential(config, credential_failure)
-          if rotated_config is not None and self._apply_refreshed_auth_config(config, rotated_config):
-            credential_ref = self._capability_execution.bind.credential_ref
-            new_credential = credential_ref not in tried_credential_refs
-            tried_credential_refs.add(credential_ref)
-            usage_totals.clear()
-            usage_totals.update(usage_before_attempt)
-            stream_error = RuntimeError(f"credential rotated after {credential_failure.kind}")
-            self._call_metric("gateway.credential_rotated", 1)
-            self._append(
-              {
-                "type": "credential_refreshed",
-                "provider": credential_failure.provider,
-                "kind": credential_failure.kind,
-                "status_code": credential_failure.status_code,
-              }
-            )
-            await _emit_stream_retry(
-              attempt,
-              attempt_start_mono,
-              f"credential rotated after provider {credential_failure.kind} failure",
-              new_credential=new_credential,
-            )
+          # a generation (including an unchanged bind) does. A typed
+          # AnthropicSourceError (a retired bound generation) rotates here too,
+          # via the resolver, exactly like a 401.
+          usage_totals.clear()
+          usage_totals.update(usage_before_attempt)
+          if await _rotate_credential(credential_failure, attempt, attempt_start_mono):
             if partial_usage_state.has_tokens:
               await self._call_on_usage(
                 self._build_usage_event(model=config["model"], usage_totals=partial_usage),
                 usage_state="failed_billable",
               )
-            if not new_credential:
-              transient_retries += 1
             continue
+          # No sibling account serves this model: a spent limit, or a denied
+          # or uncredited pool. The remaining attempts move to the next chain
+          # entry. The failed attempt's partial usage bills the model that
+          # served it.
+          _exhausted_pool_reason: dict[str, Literal["usage_limit", "credential_denied"]] = {
+            "rate_limit": "usage_limit",
+            "auth": "credential_denied",
+            "billing": "credential_denied",
+          }
+          hop_reason = _exhausted_pool_reason.get(credential_failure.kind)
+          if hop_reason is not None:
+            primary_usage = (
+              self._build_usage_event(model=config["model"], usage_totals=partial_usage)
+              if partial_usage_state.has_tokens
+              else None
+            )
+            if await _hop_model_fallback(hop_reason, credential_failure.reset_at):
+              stream_error = RuntimeError(f"model fallback after provider {credential_failure.kind} failure")
+              await _emit_stream_retry(
+                attempt,
+                attempt_start_mono,
+                f"model fallback after provider {credential_failure.kind} failure",
+                new_credential=True,
+              )
+              if primary_usage is not None:
+                await self._call_on_usage(primary_usage, usage_state="failed_billable")
+              # A hop consumes one attempt of the budget but always gets its own.
+              transient_retries = min(transient_retries + 1, stream_retry_max)
+              continue
+            if getattr(self, "_request_boundary_stop_reason", None) == "commercial_budget_reached":
+              if primary_usage is not None:
+                await self._call_on_usage(primary_usage, usage_state="failed_billable")
+              return client, result
 
         formatted_exc = _runner_attr(self, "_format_exc", _format_exc)(exc)
         logged_exc = _format_error_with_rejection_detail(formatted_exc, exc)
@@ -832,6 +1133,25 @@ class RunnerStreamTurnMixin:
           await _emit_stream_retry(attempt, attempt_start_mono, event_error)
           transient_retries += 1
           continue
+        if credential_failure is None and not self._disconnected:
+          # The provider is still failing after this request's retry budget:
+          # the next chain entry gets the remaining attempt. A disconnected
+          # client takes today's path below, which bills the partial usage.
+          primary_usage = (
+            self._build_usage_event(model=config["model"], usage_totals=partial_usage)
+            if partial_usage_state.has_tokens
+            else None
+          )
+          if await _hop_model_fallback("provider_outage", None):
+            stream_error = exc
+            await _emit_stream_retry(attempt, attempt_start_mono, event_error, new_credential=True)
+            if primary_usage is not None:
+              await self._call_on_usage(primary_usage, usage_state="failed_billable")
+            continue
+          if getattr(self, "_request_boundary_stop_reason", None) == "commercial_budget_reached":
+            if primary_usage is not None:
+              await self._call_on_usage(primary_usage, usage_state="failed_billable")
+            return client, result
         if partial_usage_state.has_tokens:
           await self._call_on_usage(
             self._build_usage_event(model=config["model"], usage_totals=partial_usage),
@@ -839,7 +1159,7 @@ class RunnerStreamTurnMixin:
           )
         transient_retries += 1
       else:
-        action, guard_error, _ = self._classify_guard_outcome(
+        action, guard_error, guard_kind = self._classify_guard_outcome(
           guard_reason,
           transient_retries,
           stream_retry_max,
@@ -871,6 +1191,25 @@ class RunnerStreamTurnMixin:
             await _emit_stream_retry(attempt, attempt_start_mono, guard_error)
             transient_retries += 1
             continue
+          if guard_kind == "stall" and not self._disconnected:
+            # A provider that stays silent through the retry budget is failing
+            # exactly like one that errors through it (design §R9 outage
+            # trigger), so the last stall takes the exception branch's hop.
+            primary_usage = (
+              self._build_usage_event(model=config["model"], usage_totals=partial_usage)
+              if partial_usage_state.has_tokens
+              else None
+            )
+            if await _hop_model_fallback("provider_outage", None):
+              stream_error = RuntimeError(guard_error)
+              await _emit_stream_retry(attempt, attempt_start_mono, guard_error, new_credential=True)
+              if primary_usage is not None:
+                await self._call_on_usage(primary_usage, usage_state="failed_billable")
+              continue
+            if getattr(self, "_request_boundary_stop_reason", None) == "commercial_budget_reached":
+              if primary_usage is not None:
+                await self._call_on_usage(primary_usage, usage_state="failed_billable")
+              return client, result
           if partial_usage_state.has_tokens:
             await self._call_on_usage(
               self._build_usage_event(model=config["model"], usage_totals=partial_usage),

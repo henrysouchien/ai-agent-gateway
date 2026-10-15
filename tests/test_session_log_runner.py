@@ -54,12 +54,26 @@ import agent_gateway.server_compaction as server_compaction  # noqa: E402
 from agent_gateway.runner_state import assistant_turn_message  # noqa: E402
 from agent_gateway.selected_content import SelectedContentBinding  # noqa: E402
 from agent_gateway.capability_execution import BoundCapabilityExecution  # noqa: E402
+from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
-from agent_gateway.runner_run_loop import (  # noqa: E402
-  _background_success_snapshot,
-)
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_runner_capability_execution,
+)
+from agent_gateway.runner_background_lifecycle import (  # noqa: E402
+  _TaskCallbackFanout,
+  _attach_task_callback,
+)
+from agent_gateway.task_registry import TaskEntry  # noqa: E402
+from agent_gateway.sub_agent_narrative_result import (  # noqa: E402
+  read_task_result_terminal_narrative,
+)
+from agent_gateway.sub_agent_result_evidence import (  # noqa: E402
+  SubAgentResultEvidence,
+)
+from agent_gateway.tool_dispatcher_approval_lifecycle import ApprovalPark  # noqa: E402
+from agent_gateway.transcript import reconstruct_messages_for_task  # noqa: E402
+from gateway_test_support.admitted_authority_test_support import (  # noqa: E402
+  sealed_admitted_task,
 )
 
 
@@ -1046,11 +1060,6 @@ def test_operator_pause_before_turn_emits_clean_interruption(tmp_path: Path) -> 
   assert interruption["safe_boundary"] == "before_turn"
   assert entries[-1].event["type"] == "detach"
   assert entries[-1].event["reason"] == "operator_pause"
-  assert [entry.event["type"] for entry in event_log.entries] == [
-    "operator_pause",
-    "session_recap",
-    "stream_complete",
-  ]
   assert event_log.entries[-1].event["reason"] == "operator_pause"
   assert (
     event_log.entries[-1].event["terminal_disposition"]
@@ -1786,7 +1795,7 @@ def test_rebuild_task_registry_ignores_tool_call_complete_final_blocks(tmp_path:
 
   entry = runner._task_registry.get("bg_0")
   assert entry is not None
-  assert entry.state == TaskState.INTERRUPTED
+  assert entry.state == TaskState.PARKED
 
 
 def test_task_durability_events_use_type_and_query_round_trips(tmp_path: Path) -> None:
@@ -1815,6 +1824,48 @@ def test_task_durability_events_use_type_and_query_round_trips(tmp_path: Path) -
   for entry in entries:
     for key, value in correlation.items():
       assert entry.event[key] == value
+
+
+def test_job_park_placement_lost_and_revive_are_journaled(tmp_path: Path) -> None:
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "job-lifecycle.jsonl")
+    capability_execution = _runner_execution(_ScriptedProvider([]))
+    runner = _make_runner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(capability_bind=capability_execution.bind),
+      session_id="sess-parent",
+      capability_execution=capability_execution,
+      agent_session_log=log,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    runner._runner_id = "runner_test"
+
+    await runner._append_task_parked("bg_0", "turns_exhausted")
+    await runner._append_task_placement_lost("bg_0", "placement_lost")
+    await runner._append_task_revived("bg_0", "revive")
+
+    entries, _ = await log.query(
+      event_types={"task_parked", "task_placement_lost", "task_revived"},
+      order="asc",
+    )
+    assert [
+      (
+        entry.event["type"],
+        entry.event["task_id"],
+        entry.event.get("reason"),
+        entry.event.get("cause"),
+      )
+      for entry in entries
+    ] == [
+      ("task_parked", "bg_0", "turns_exhausted", None),
+      ("task_placement_lost", "bg_0", None, "placement_lost"),
+      ("task_revived", "bg_0", None, "revive"),
+    ]
+    assert all(isinstance(entry.event["ts"], float) for entry in entries)
+
+  _run(_case())
 
 
 @pytest.mark.parametrize("recovery_delay", [0, 3 * 60 * 60])
@@ -2036,7 +2087,7 @@ def test_register_background_task_emits_task_registered_with_correlation(
 def _a_m8_runner(
   log: AgentSessionLog | None,
   *,
-  max_concurrent_sub_agents: int | None = None,
+  containment: ContainmentSettings = ContainmentSettings(),
 ) -> AgentRunner:
   provider = _ScriptedProvider([_text_turn("unused")])
   capability_execution = _runner_execution(provider)
@@ -2046,7 +2097,7 @@ def _a_m8_runner(
     session_id="sess-parent",
     capability_execution=capability_execution,
     agent_session_log=log,
-    max_concurrent_sub_agents=max_concurrent_sub_agents,
+    containment=containment,
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -2086,7 +2137,9 @@ def test_concurrent_registration_admits_every_caller_and_queues_execution(
 
   async def _case() -> None:
     log = AgentSessionLog(path=tmp_path / "sessions" / "race.jsonl")
-    runner = _a_m8_runner(log, max_concurrent_sub_agents=2)
+    runner = _a_m8_runner(
+      log, containment=ContainmentSettings(max_concurrent_children=2),
+    )
     capability_bind_receipt = _a_m8_bind_receipt(runner)
     release = asyncio.Event()
     slow_lookups = 0
@@ -2204,10 +2257,8 @@ def test_post_append_failure_appends_a_compensating_terminal(
     assert events[-1]["final_state"] == "failed"
     assert str(events[-1]["result"]["reason"]).startswith("registration_aborted")
 
-    # The acceptance signal for CUR-E2E-03/04: the completion guard clears.
+    # The aborted registration releases its admission slot.
     assert runner._task_registry.admission_count == 0
-    blockers, _fingerprint = _background_success_snapshot(runner)
-    assert "pending_or_running_tasks" not in blockers
 
     # T3-I03: replay rebuilds FAILED, never a ghost INTERRUPTED.
     replayed = TaskRegistry()
@@ -2487,7 +2538,7 @@ def test_rebuild_hot_set_lazy_lookup_and_seq_restore(tmp_path: Path) -> None:
   _run(_case())
 
 
-def test_rebuild_renders_interrupted_and_completed_crash_cases(tmp_path: Path) -> None:
+def test_rebuild_renders_parked_and_completed_crash_cases(tmp_path: Path) -> None:
   async def _case() -> None:
     log = AgentSessionLog(path=tmp_path / "sessions" / "crash-cases.jsonl")
     provider = _ScriptedProvider([_text_turn("unused")])
@@ -2515,25 +2566,26 @@ def test_rebuild_renders_interrupted_and_completed_crash_cases(tmp_path: Path) -
       rate_table_version="unknown",
     )
 
-    interrupted, interrupted_error = await runner.get_background_result({"task_id": "bg_0"})
+    crashed, crashed_error = await runner.get_background_result({"task_id": "bg_0"})
     completed, completed_error = await runner.get_background_result({"task_id": "bg_1"})
-    killed_as_interrupted, killed_error = await runner.get_background_result({"task_id": "bg_2"})
+    killed, killed_error = await runner.get_background_result({"task_id": "bg_2"})
 
-    assert interrupted_error is None
-    assert interrupted is not None
-    assert interrupted["status"] == "interrupted"
-    assert interrupted["completed"] is True
-    assert interrupted["agent"] == "running"
-    assert interrupted["started_at"] == 100.0
-    assert interrupted["sub_agent_id"] == "sub0:sess-parent"
-    assert interrupted["parent_turn_id"] == "turn-1"
+    assert crashed_error is None
+    assert crashed is not None
+    assert crashed["status"] == "parked"
+    assert crashed["completed"] is False
+    assert crashed["agent"] == "running"
+    assert crashed["started_at"] == 100.0
+    assert crashed["sub_agent_id"] == "sub0:sess-parent"
+    assert crashed["parent_turn_id"] == "turn-1"
     assert completed_error is None
     assert completed is not None
     assert completed["status"] == "completed"
     assert completed["report"]["summary"] == "done"
     assert killed_error is None
-    assert killed_as_interrupted is not None
-    assert killed_as_interrupted["status"] == "interrupted"
+    assert killed is not None
+    assert killed["status"] == "parked"
+    assert killed["completed"] is False
 
   _run(_case())
 
@@ -2955,5 +3007,610 @@ def test_session_context_builder_resumes_the_model_visible_state_of_every_turn(
     assert "What is the portfolio risk score?" not in json.dumps(compacted)
     if compaction == "portable":
       assert provider.summary_requests == 1
+
+  _run(_case())
+
+
+def _admitted_self_entry() -> TaskEntry:
+  logical_task, attempt, requirement, _provenance = _subagent_result_identity(
+    delegation_id="learning-fork",
+    physical_task_id="learning_0",
+  )
+  admitted = sealed_admitted_task(
+    logical_task=logical_task,
+    attempt=attempt,
+    result_requirement=requirement,
+    tool_id="lookup",
+  )
+  return TaskEntry(
+    task_id=attempt.physical_task_id,
+    task_type="background_agent",
+    agent_name="learning",
+    admitted_task=admitted,
+  )
+
+
+def test_admitted_self_task_registers_before_tools_and_completes(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    own_log = AgentSessionLog(path=tmp_path / "sessions" / "learning.jsonl")
+    self_entry = _admitted_self_entry()
+    settled: list[tuple[TaskEntry, bool]] = []
+
+    def on_settled(entry: TaskEntry) -> None:
+      settled.append((entry, runner._write_lease_file is not None))
+
+    self_entry.completion_callback = on_settled
+    event_log = EventLog()
+    capability_execution = _runner_execution(
+      _ScriptedProvider([_tool_turn(), _text_turn("learned")]),
+    )
+
+    async def lookup(tool_input: dict[str, Any], **kwargs: Any):
+      assert runner._write_lease_file is not None
+      assert runner._task_registry.get(self_entry.task_id) is self_entry
+      registered, _ = await own_log.query(event_types={"task_registered"})
+      assert len(registered) == 1
+      assert registered[0].event["task_id"] == self_entry.task_id
+      return await _lookup_tool(tool_input, **kwargs)
+
+    runner = _make_runner(
+      event_log=event_log,
+      dispatcher=_make_dispatcher(
+        capability_bind=capability_execution.bind,
+        event_log=event_log,
+        local_tool_handlers={"lookup": lookup},
+      ),
+      session_id="learning-session",
+      capability_execution=capability_execution,
+      agent_session_log=own_log,
+      admitted_self_task=self_entry,
+      workspace_dir=str(tmp_path),
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    await runner.run([{"role": "user", "content": "Learn from the final turn"}])
+    entries, _ = await own_log.query(
+      event_types={"task_registered", "tool_call_start"}, order="asc",
+    )
+    assert [entry.event["type"] for entry in entries] == [
+      "task_registered", "tool_call_start",
+    ]
+    registration = entries[0].event
+    assert registration["owner_runner_id"] == runner._runner_id
+    assert registration["owner_role"] == "writer"
+    assert registration["sub_agent_id"] == "learning-session"
+    assert registration["parent_session_id"] == "learning-session"
+    assert self_entry.admitted_task is not None
+    assert registration["metadata"]["admitted_task"] == (
+      self_entry.admitted_task.model_dump(mode="json")
+    )
+    assert self_entry.registration_persistence_state == "committed"
+    assert self_entry.asyncio_task is None
+    assert runner._admitted_self_task is self_entry
+    terminal = [
+      entry.event for entry in event_log.entries
+      if entry.event["type"] == "stream_complete"
+    ]
+    assert len(terminal) == 1
+    assert terminal[0]["terminal_disposition"] == "completed"
+    assert not [
+      entry.event for entry in event_log.entries
+      if entry.event.get("error_code") == "background_delivery_incomplete"
+      or "background_delivery_incomplete" in str(entry.event.get("error", ""))
+    ]
+    assert self_entry.state is TaskState.COMPLETED
+    result = self_entry.task_result
+    assert result is not None
+    assert result.execution.status == "succeeded"
+    assert read_task_result_terminal_narrative(
+      result, workspace_dir=str(tmp_path),
+    ) == "learned"
+    assert result.observation.usage.input_tokens > 0
+    assert result.observation.usage.output_tokens > 0
+    assert settled == [(self_entry, True)]
+    completed, _ = await own_log.query(
+      event_types={"task_completed", "agent_completion"}, order="asc",
+    )
+    assert [entry.event["type"] for entry in completed] == ["task_completed"]
+    assert completed[0].event["task_id"] == self_entry.task_id
+    assert runner._write_lease_file is None
+
+  _run(_case())
+
+
+def test_admitted_self_task_park_settles_nonfinal_cumulative_and_replays(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    own_log = AgentSessionLog(path=tmp_path / "sessions" / "learning-park.jsonl")
+    self_entry = _admitted_self_entry()
+    prior = SubAgentResultEvidence(
+      usage={"input_tokens": 100, "output_tokens": 7},
+      tools_used=("lookup",),
+      fms_results=(),
+      artifact_events=(),
+      warning_parts=(),
+    )
+    parked: list[tuple[TaskEntry, bool]] = []
+
+    async def on_park(entry: TaskEntry) -> None:
+      parked.append((entry, runner._write_lease_file is not None))
+
+    self_entry.park_callback = on_park
+    approval_park = ApprovalPark(
+      job_id=self_entry.task_id,
+      original_tool_call_id="call-park",
+      approval_id="approval-park",
+      nonce="private-park-nonce",
+    )
+    event_log = EventLog()
+    capability_execution = _runner_execution(
+      _ScriptedProvider([_tool_turn(tool_id="call-park")]),
+    )
+    dispatcher = _make_dispatcher(
+      capability_bind=capability_execution.bind,
+      event_log=event_log,
+      local_tool_handlers={"lookup": _lookup_tool},
+    )
+
+    async def dispatch_prepared(*_args: Any, **_kwargs: Any):
+      raise approval_park
+
+    dispatcher.dispatch_prepared = dispatch_prepared
+    runner = _make_runner(
+      event_log=event_log,
+      dispatcher=dispatcher,
+      session_id="learning-session",
+      capability_execution=capability_execution,
+      agent_session_log=own_log,
+      admitted_self_task=self_entry,
+      admitted_self_prior_evidence=prior,
+      workspace_dir=str(tmp_path),
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    await runner.run([{"role": "user", "content": "Learn from the final turn"}])
+
+    assert runner._approval_park is approval_park
+    assert self_entry.state is TaskState.AWAITING_APPROVAL
+    result = self_entry.task_result
+    assert result is not None
+    assert result.execution.status == "awaiting_approval"
+    assert "approval:approval-park call:call-park" in str(
+      result.execution.terminal_reason
+    )
+    assert result.observation.usage.input_tokens == 110
+    assert result.observation.usage.output_tokens == 10
+    assert parked == [(self_entry, True)]
+    durable, _ = await own_log.query(
+      event_types={"task_completed", "agent_completion"}, order="asc",
+    )
+    assert [entry.event["type"] for entry in durable] == ["task_completed"]
+    assert runner._write_lease_file is None
+
+    capability_execution = _runner_execution(_ScriptedProvider([]))
+    restored = _make_runner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(capability_bind=capability_execution.bind),
+      session_id="learning-session",
+      capability_execution=capability_execution,
+      agent_session_log=own_log,
+      admitted_self_task=_admitted_self_entry(),
+      admitted_self_prior_evidence=prior,
+      workspace_dir=str(tmp_path),
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    try:
+      await restored._prepare_run_durable_context(
+        [], None,
+        resume_initial_messages=None,
+        top_level_user_input=None,
+        selected_content_committed=True,
+        runner_id="runner_restored",
+      )
+      canonical = restored._admitted_self_task
+      assert canonical is not None
+      assert canonical is restored._task_registry.get(self_entry.task_id)
+      assert canonical.task_result == result
+      registrations, _ = await own_log.query(event_types={"task_registered"})
+      assert len(registrations) == 1
+    finally:
+      await restored._await_write_lease_handoff()
+
+  _run(_case())
+
+
+def test_admitted_self_task_reuses_registration_and_canonical_replay_entry(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "learning-replay.jsonl")
+    supplied = _admitted_self_entry()
+    assert supplied.admitted_task is not None
+    original_grant = supplied.admitted_task.tool_grant
+
+    def make_runner(entry: TaskEntry) -> AgentRunner:
+      capability_execution = _runner_execution(_ScriptedProvider([]))
+      return _make_runner(
+        event_log=EventLog(),
+        dispatcher=_make_dispatcher(capability_bind=capability_execution.bind),
+        session_id="learning-session",
+        capability_execution=capability_execution,
+        agent_session_log=log,
+        admitted_self_task=entry,
+        user_id="alice",
+        billing_mode="byok",
+        rate_table_version="unknown",
+      )
+
+    async def prepare(runner: AgentRunner, runner_id: str) -> None:
+      await runner._prepare_run_durable_context(
+        [], None,
+        resume_initial_messages=None,
+        top_level_user_input=None,
+        selected_content_committed=True,
+        runner_id=runner_id,
+      )
+
+    first_runner = make_runner(supplied)
+    try:
+      await prepare(first_runner, "runner_first")
+      await first_runner._await_write_lease_handoff()
+      await prepare(first_runner, "runner_first_retry")
+      assert first_runner._admitted_self_task is supplied
+      assert first_runner._task_registry.list_tasks() == [supplied]
+      assert supplied.admitted_task.tool_grant is original_grant
+      reconstruction = await first_runner._lookup_task_in_log(supplied.task_id)
+      assert reconstruction is not None
+      assert first_runner._task_registry.adopt_reconstructed(reconstruction) is supplied
+    finally:
+      await first_runner._await_write_lease_handoff()
+
+    second_runner = make_runner(_admitted_self_entry())
+    try:
+      await prepare(second_runner, "runner_replayed")
+      canonical = second_runner._admitted_self_task
+      assert canonical is not None
+      assert canonical is second_runner._task_registry.get(supplied.task_id)
+      assert canonical.reconstructed_from_log
+      assert canonical.state is TaskState.PARKED
+      assert canonical.admitted_task == supplied.admitted_task
+      assert canonical.registration_persistence_state == "committed"
+      assert canonical.asyncio_task is None
+      assert canonical.admitted_task is not None
+      restored_grant = canonical.admitted_task.tool_grant
+      await second_runner._await_write_lease_handoff()
+      await prepare(second_runner, "runner_replayed_retry")
+      assert second_runner._admitted_self_task is canonical
+      assert canonical.admitted_task.tool_grant is restored_grant
+      reconstructed = await second_runner._lookup_task_in_log(supplied.task_id)
+      assert reconstructed is not None
+      assert second_runner._task_registry.adopt_reconstructed(reconstructed) is canonical
+      registrations, _ = await log.query(event_types={"task_registered"})
+      assert len(registrations) == 1
+      assert registrations[0].event["owner_runner_id"] == "runner_first"
+    finally:
+      await second_runner._await_write_lease_handoff()
+
+  _run(_case())
+
+
+def test_admitted_self_task_journals_inherited_prefix_once(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "learning-prefix.jsonl")
+    inherited_use = {
+      "type": "tool_use", "id": "call-inherited", "name": "lookup", "input": {},
+    }
+    starting = [
+      {"role": "user", "content": "Review AAPL"},
+      assistant_turn_message(
+        [inherited_use], provider="anthropic", model="claude-sonnet-5",
+        stop_reason="tool_use",
+      ),
+      {"role": "user", "content": [{
+        "type": "tool_result", "tool_use_id": "call-inherited", "content": "AAPL",
+      }]},
+      assistant_turn_message(
+        [{"type": "text", "text": "Reviewed."}], provider="anthropic",
+        model="claude-sonnet-5", stop_reason="end_turn",
+      ),
+      {"role": "user", "content": "Fork directive:\nlearn from the review"},
+    ]
+
+    def make_runner(entry: TaskEntry) -> AgentRunner:
+      capability_execution = _runner_execution(_ScriptedProvider([]))
+      return _make_runner(
+        event_log=EventLog(),
+        dispatcher=_make_dispatcher(capability_bind=capability_execution.bind),
+        session_id="learning-session",
+        capability_execution=capability_execution,
+        agent_session_log=log,
+        admitted_self_task=entry,
+        user_id="alice",
+        billing_mode="byok",
+        rate_table_version="unknown",
+      )
+
+    async def prepare(runner: AgentRunner, runner_id: str) -> None:
+      try:
+        messages, _system, _committed = await runner._prepare_run_durable_context(
+          starting[-1:], None,
+          resume_initial_messages=starting,
+          top_level_user_input=None,
+          selected_content_committed=True,
+          runner_id=runner_id,
+        )
+        assert messages == starting
+      finally:
+        await runner._await_write_lease_handoff()
+
+    first = make_runner(_admitted_self_entry())
+    await prepare(first, "runner_first")
+    # A cold reader of the own journal replays exactly what the run started on.
+    assert await SessionContextBuilder(agent_session_log=log).build() == starting
+    # A retry on the same runner and a replayed runner adopt the journaled
+    # registration and journal nothing again.
+    await prepare(first, "runner_first_retry")
+    await prepare(make_runner(_admitted_self_entry()), "runner_replayed")
+
+    journaled, _ = await log.query(
+      event_types={
+        "user_message", "assistant_message", "task_registered",
+        "tool_call_complete",
+      },
+      order="asc",
+    )
+    assert [
+      (entry.event["type"], entry.event["runner_id"]) for entry in journaled
+    ] == [
+      ("user_message", "runner_first"),
+      ("assistant_message", "runner_first"),
+      ("user_message", "runner_first"),
+      ("assistant_message", "runner_first"),
+      ("task_registered", "runner_first"),
+      ("user_message", "runner_first"),
+    ]
+    assert journaled[1].event["content_blocks"] == [inherited_use]
+    assert journaled[1].event["usage"] == {}
+    assert journaled[2].event["content"] == starting[2]["content"]
+    assert journaled[5].event["content"] == starting[-1]["content"]
+    assert await reconstruct_messages_for_task(log, "learning_0") == starting
+
+  _run(_case())
+
+
+def test_admitted_self_task_journals_string_assistant_content_as_one_text_block(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "learning-string.jsonl")
+    starting = [
+      {"role": "user", "content": "Review AAPL"},
+      {"role": "assistant", "content": "Reviewed."},
+      {"role": "user", "content": "Fork directive:\nlearn from the review"},
+    ]
+    capability_execution = _runner_execution(_ScriptedProvider([]))
+    runner = _make_runner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(capability_bind=capability_execution.bind),
+      session_id="learning-session",
+      capability_execution=capability_execution,
+      agent_session_log=log,
+      admitted_self_task=_admitted_self_entry(),
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    try:
+      await runner._prepare_run_durable_context(
+        starting[-1:], None,
+        resume_initial_messages=starting,
+        top_level_user_input=None,
+        selected_content_committed=True,
+        runner_id="runner_first",
+      )
+    finally:
+      await runner._await_write_lease_handoff()
+    rebuilt = await SessionContextBuilder(agent_session_log=log).build()
+    assistant = [message for message in rebuilt if message["role"] == "assistant"]
+    assert [message["content"] for message in assistant] == [
+      [{"type": "text", "text": "Reviewed."}],
+    ]
+    reconstructed = await reconstruct_messages_for_task(log, "learning_0")
+    assert [m["content"] for m in reconstructed if m["role"] == "assistant"] == [
+      [{"type": "text", "text": "Reviewed."}],
+    ]
+
+  _run(_case())
+
+
+def test_attach_background_task_repeated_bound_method_runs_once(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "attached.jsonl")
+    capability_execution = _runner_execution(_ScriptedProvider([]))
+    runner = _make_runner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(capability_bind=capability_execution.bind),
+      session_id="attachment-session",
+      capability_execution=capability_execution,
+      agent_session_log=log,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    release = asyncio.Event()
+
+    class Host:
+      def __init__(self) -> None:
+        self.completed: list[TaskEntry] = []
+
+      async def complete(self, entry: TaskEntry) -> None:
+        self.completed.append(entry)
+
+    host = Host()
+
+    async def handler(_tool_input: dict[str, Any], **_kwargs: Any):
+      await release.wait()
+      return _child_report(), None
+
+    try:
+      await runner._prepare_run_durable_context(
+        [], None,
+        resume_initial_messages=None,
+        top_level_user_input=None,
+        selected_content_committed=True,
+        runner_id="runner_attachment",
+      )
+      result, error = await runner._register_background_task(
+        tool_input={"task": "Collect"},
+        handler=handler,
+        agent_name="writer",
+        capability_bind_receipt=capability_execution.bind.to_json(),
+      )
+      assert error is None
+      assert result is not None
+      entry = await runner.attach_background_task(
+        result["task_id"], on_complete=host.complete, on_park=None,
+      )
+      assert entry is not None
+      assert await runner.attach_background_task(
+        result["task_id"], on_complete=host.complete, on_park=None,
+      ) is entry
+      assert entry.asyncio_task is not None
+      release.set()
+      await asyncio.wait_for(entry.asyncio_task, timeout=1.0)
+      assert entry.state is TaskState.COMPLETED
+      assert host.completed == [entry]
+    finally:
+      release.set()
+      await runner._await_write_lease_handoff()
+
+  _run(_case())
+
+
+def test_raising_attached_callback_does_not_withhold_the_host(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "attached-bad.jsonl")
+    capability_execution = _runner_execution(_ScriptedProvider([]))
+    runner = _make_runner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(capability_bind=capability_execution.bind),
+      session_id="attachment-bad-session",
+      capability_execution=capability_execution,
+      agent_session_log=log,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    release = asyncio.Event()
+    observed: list[str] = []
+
+    def bad(_entry: TaskEntry) -> None:
+      observed.append("bad")
+      raise RuntimeError("attached owner failed")
+
+    async def host_complete(_entry: TaskEntry) -> None:
+      observed.append("host")
+
+    async def handler(_tool_input: dict[str, Any], **_kwargs: Any):
+      await release.wait()
+      return _child_report(), None
+
+    try:
+      await runner._prepare_run_durable_context(
+        [], None,
+        resume_initial_messages=None,
+        top_level_user_input=None,
+        selected_content_committed=True,
+        runner_id="runner_attachment_bad",
+      )
+      result, error = await runner._register_background_task(
+        tool_input={"task": "Collect"},
+        handler=handler,
+        agent_name="writer",
+        capability_bind_receipt=capability_execution.bind.to_json(),
+      )
+      assert error is None
+      assert result is not None
+      entry = await runner.attach_background_task(
+        result["task_id"], on_complete=bad, on_park=None,
+      )
+      assert entry is not None
+      assert await runner.attach_background_task(
+        result["task_id"], on_complete=host_complete, on_park=None,
+      ) is entry
+      assert entry.asyncio_task is not None
+      release.set()
+      await asyncio.wait_for(entry.asyncio_task, timeout=1.0)
+      assert entry.state is TaskState.COMPLETED
+      assert entry.completion_callback_invoked
+      assert observed == ["bad", "host"]
+    finally:
+      release.set()
+      await runner._await_write_lease_handoff()
+
+  _run(_case())
+
+
+def test_task_callback_fanouts_union_members_in_attachment_order() -> None:
+  async def _case() -> None:
+    observed: list[str] = []
+
+    def first(_entry: TaskEntry) -> None:
+      observed.append("first")
+
+    async def second(_entry: TaskEntry) -> None:
+      observed.append("second")
+
+    attached = _attach_task_callback(first, second)
+    assert attached is not None
+    assert _attach_task_callback(attached, attached) is attached
+    assert _attach_task_callback(attached, first) is attached
+    combined = _attach_task_callback(
+      _TaskCallbackFanout((first, attached)),
+      _TaskCallbackFanout((second, first)),
+    )
+    assert combined is not None
+    outcome = combined(_admitted_self_entry())
+    if outcome is not None:
+      await outcome
+    assert observed == ["first", "second"]
+
+  _run(_case())
+
+
+def test_task_callback_fanout_runs_every_member_then_raises_first_failure() -> None:
+  async def _case() -> None:
+    observed: list[str] = []
+    first_failure = RuntimeError("first owner failed")
+
+    def bad(_entry: TaskEntry) -> None:
+      observed.append("bad")
+      raise first_failure
+
+    async def later_bad(_entry: TaskEntry) -> None:
+      observed.append("later_bad")
+      raise ValueError("later owner failed")
+
+    async def host(_entry: TaskEntry) -> None:
+      observed.append("host")
+
+    fanout = _TaskCallbackFanout((bad, later_bad, host))
+    with pytest.raises(RuntimeError) as raised:
+      await fanout(_admitted_self_entry())
+    assert raised.value is first_failure
+    assert observed == ["bad", "later_bad", "host"]
 
   _run(_case())

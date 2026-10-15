@@ -12,6 +12,7 @@ import threading
 
 import pytest
 
+from agent_gateway.agent_session_log import AgentSessionLog
 from agent_gateway.fork_ledger import (
   FORK_LEDGER_SCHEMA_VERSION,
   ForkLedger,
@@ -53,6 +54,10 @@ def _ledger(
     process_instance_id=boot,
     clock_ns=clock or MutableClock(_ns(2026, 7, 27)),
   )
+
+
+def _empty_journal(tmp_path: Path) -> AgentSessionLog:
+  return AgentSessionLog(tmp_path / "empty-fork-journal.jsonl")
 
 
 def _receipt(ledger: ForkLedger, fork_id: str = "fork-1") -> None:
@@ -248,6 +253,7 @@ def test_explicit_reconciliation_recovers_only_named_dead_instance(
   ) == ()
   assert current_boot.reconcile_startup(
     dead_process_instance_id="boot-old",
+    fork_journal=lambda _fork_id: _empty_journal(tmp_path),
   ) == (1, 0)
   current = current_boot.claim_pending_receipts(
     session_id="session-1",
@@ -257,6 +263,7 @@ def test_explicit_reconciliation_recovers_only_named_dead_instance(
   assert {claim.fork_id for claim in current} == {"prior"}
   assert current_boot.reconcile_startup(
     dead_process_instance_id="boot-old",
+    fork_journal=lambda _fork_id: _empty_journal(tmp_path),
   ) == (0, 0)
   assert current_boot.claim_pending_receipts(
     session_id="session-1",
@@ -288,6 +295,7 @@ def test_second_process_opener_preserves_live_instance_state(
   )
   assert second.reconcile_startup(
     live_process_instance_ids={"gateway-live", "autonomous-live"},
+    fork_journal=lambda _fork_id: _empty_journal(tmp_path),
   ) == (0, 0)
   reserved = second.get_admission("live-reserved")
   started = second.get_admission("live-started")
@@ -536,6 +544,7 @@ def test_fresh_boot_recovers_unknown_hard_death_and_redelivers_once(
 
   assert recovery.reconcile_startup(
     live_process_instance_ids={"recovery-instance"},
+    fork_journal=lambda _fork_id: _empty_journal(tmp_path),
   ) == (1, 1)
   after = recovery.get_admission("killed-admission")
   assert after is not None

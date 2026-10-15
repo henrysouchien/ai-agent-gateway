@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -28,6 +29,18 @@ UsageTotals: TypeAlias = dict[str, UsageValue]
 
 DEFAULT_USAGE_DLQ_PATH = Path("~/.gateway/usage_dlq.jsonl").expanduser()
 
+
+def default_usage_dlq_path(user_id: str) -> Path:
+  """Return the canonical owner-scoped usage DLQ spool path for a user."""
+  clean_id = str(user_id or "").strip()
+  if not clean_id:
+    raise ValueError("user_id must not be blank")
+  user_data = os.getenv("USER_DATA_DIR", "").strip()
+  if user_data:
+    base = Path(user_data).expanduser()
+  else:
+    base = Path("~/.gateway").expanduser()
+  return base / "users" / clean_id / "usage_dlq.jsonl"
 
 @dataclass(frozen=True)
 class UsageEvent:
@@ -64,8 +77,10 @@ class UsageEvent:
   provider_unit_deltas: dict[str, int] | None = None
   is_batch: bool = False
   product_id: str | None = None
+  cost_known: bool = True
   event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
   projection_divergence: dict[str, str] | None = None
+  selection_provenance: dict[str, Any] | None = None
 
   def __post_init__(self) -> None:
     bind = CapabilityBind.from_json(self.capability_bind)
@@ -126,6 +141,9 @@ class SessionUsageSummary:
   stream_started_at: float | None = None
   first_text_at: float | None = None
   projection_divergence: dict[str, str] | None = None
+  cost_known: bool = True
+  unit_kind: str = "none"
+  unit_id: str | None = None
 
   @property
   def wall_time_s(self) -> float:
@@ -217,6 +235,12 @@ class _UsageAggregator:
 
   This is an internal runner coordination primitive. It is protected by an
   asyncio.Lock and is not cross-loop or thread safe.
+
+  A delegated child run keeps its own aggregator, built with `parent=` the
+  delegating run's: its `snapshot()` is the child's own billing row, the unit
+  (`declare_unit`) is owned by the root of the tree, and the root's
+  `fleet_snapshot()` is the whole dispatch tree's total. `snapshot()` of any
+  aggregator counts only the runs that recorded into it directly.
   """
 
   def __init__(
@@ -229,6 +253,7 @@ class _UsageAggregator:
     rate_table_version: str | None = None,
     billing_mode: BillingMode | None = None,
     started_at: float | None = None,
+    parent: "_UsageAggregator | None" = None,
   ) -> None:
     self._lock = asyncio.Lock()
     self._user_id = user_id
@@ -251,6 +276,13 @@ class _UsageAggregator:
     self._event_ids: list[str] = []
     self._compaction_count = 0
     self._closed = False
+    self._unit_kind = "none"
+    self._unit_id = request_id
+    self._cost_known = True
+    self._parent = parent
+    self._children: list[_UsageAggregator] = []
+    if parent is not None:
+      parent._children.append(self)
 
   async def record(self, event: UsageEvent) -> bool:
     async with self._lock:
@@ -267,6 +299,8 @@ class _UsageAggregator:
       self._last_capability_bind = dict(event.capability_bind)
       self._last_provider_reported_model = event.provider_reported_model
       self._event_ids.append(event.event_id)
+      if not getattr(event, "cost_known", True):
+        self._cost_known = False
       return True
 
   def record_compaction_nowait(self) -> bool:
@@ -275,6 +309,28 @@ class _UsageAggregator:
       return False
     self._compaction_count += 1
     return True
+
+  async def declare_unit(self, unit_kind: str, unit_id: str | None = None) -> tuple[str, str]:
+    """Record the agent's declared outcome id (`A1` … `F2`) for this unit of work.
+
+    `unit_kind` is carried as declared; an undeclared unit stays `none`.
+    `unit_id` defaults to the request id, which every delegated child shares.
+    A child's declaration is the tree's: the root records it.
+    Returns the `(unit_kind, unit_id)` now recorded.
+    """
+    if self._parent is not None:
+      return await self._parent.declare_unit(unit_kind, unit_id)
+    async with self._lock:
+      self._unit_kind = str(unit_kind)
+      if unit_id is not None:
+        self._unit_id = str(unit_id)
+      return self._unit_kind, self._unit_id
+
+  async def _unit(self) -> tuple[str, str]:
+    if self._parent is not None:
+      return await self._parent._unit()
+    async with self._lock:
+      return self._unit_kind, self._unit_id
 
   async def close(self) -> None:
     async with self._lock:
@@ -294,6 +350,7 @@ class _UsageAggregator:
     stream_started_at: float | None = None,
     first_text_at: float | None = None,
   ) -> SessionUsageSummary:
+    unit_kind, unit_id = await self._unit()
     async with self._lock:
       return SessionUsageSummary(
         user_id=self._user_id,
@@ -326,7 +383,62 @@ class _UsageAggregator:
         ],
         usage_event_count=len(self._event_ids),
         usage_event_ids=tuple(self._event_ids),
+        cost_known=self._cost_known,
+        unit_kind=unit_kind,
+        unit_id=unit_id,
       )
+
+  async def fleet_snapshot(
+    self,
+    *,
+    ended_at: float | None = None,
+    drain_complete: bool = True,
+    in_flight_task_count: int = 0,
+    context_surfaces: list[dict[str, Any]] | None = None,
+    stream_started_at: float | None = None,
+    first_text_at: float | None = None,
+  ) -> SessionUsageSummary:
+    """This aggregator's own usage plus every descendant's, under this identity.
+
+    The total the commercial reconciliation and the session recap read; the
+    per-session billing rows read `snapshot()`.
+    """
+    kwargs: dict[str, Any] = {
+      "ended_at": ended_at if ended_at is not None else time.time(),
+      "drain_complete": drain_complete,
+      "in_flight_task_count": in_flight_task_count,
+      "context_surfaces": context_surfaces,
+      "stream_started_at": stream_started_at,
+      "first_text_at": first_text_at,
+    }
+    own = await self.snapshot(**kwargs)
+    descendants = [
+      await child.fleet_snapshot(**kwargs) for child in tuple(self._children)
+    ]
+    if not descendants:
+      return own
+    parts = [own, *descendants]
+    observed = next((part for part in parts if part.usage_event_count), own)
+    return replace(
+      own,
+      input_tokens=sum(part.input_tokens for part in parts),
+      output_tokens=sum(part.output_tokens for part in parts),
+      cache_read_tokens=sum(part.cache_read_tokens for part in parts),
+      cache_creation_tokens=sum(part.cache_creation_tokens for part in parts),
+      cost=sum(part.cost for part in parts),
+      turns=sum(part.turns for part in parts),
+      compaction_count=sum(part.compaction_count for part in parts),
+      usage_event_count=sum(part.usage_event_count for part in parts),
+      usage_event_ids=tuple(
+        event_id for part in parts for event_id in part.usage_event_ids
+      ),
+      cost_known=all(part.cost_known for part in parts),
+      model=observed.model,
+      provider=observed.provider,
+      capability_bind=observed.capability_bind,
+      provider_reported_model=observed.provider_reported_model,
+      projection_divergence=observed.projection_divergence,
+    )
 
 
 class UsageLedger(Protocol):
@@ -347,9 +459,10 @@ class UsageLedger(Protocol):
 class SqliteUsageLedger:
   """Reference implementation backed by SQLite with WAL mode."""
 
-  def __init__(self, db_path: str | Path):
+  def __init__(self, db_path: str | Path, *, dlq_path: Path | str | None = None):
     self._db_path = Path(db_path)
     self._db_path.parent.mkdir(parents=True, exist_ok=True)
+    self._dlq_path = Path(dlq_path).expanduser() if dlq_path is not None else None
     self._init_conn = self._connect()
     self._ensure_schema(self._init_conn)
     self._closed = False
@@ -520,6 +633,20 @@ class SqliteUsageLedger:
       until=until,
     )
 
+  async def drain_dlq(self, user_id: str, *, spool_path: Path | str | None = None) -> dict[str, int]:
+    """Drain spooled DLQ events for user_id into this ledger."""
+    clean_id = str(user_id or "").strip()
+    if not clean_id:
+      return {"total": 0, "replayed": 0, "failed": 0, "invalid": 0}
+    target_spool: Path | None
+    if spool_path is not None:
+      target_spool = Path(spool_path).expanduser()
+    elif self._dlq_path is not None:
+      target_spool = self._dlq_path
+    else:
+      target_spool = default_usage_dlq_path(clean_id)
+    return await replay_dlq(self, target_spool, user_id=clean_id)
+
   async def get_total(
     self,
     user_id: str,
@@ -529,7 +656,10 @@ class SqliteUsageLedger:
     billing_mode: BillingMode | None = None,
     model: str | None = None,
     provider: str | None = None,
+    drain_dlq: bool = True,
   ) -> UsageTotal:
+    if drain_dlq:
+      await self.drain_dlq(user_id)
     return await asyncio.to_thread(
       self._get_total_sync,
       user_id,
@@ -539,7 +669,6 @@ class SqliteUsageLedger:
       model=model,
       provider=provider,
     )
-
   def close(self) -> None:
     if self._closed:
       return
@@ -547,30 +676,54 @@ class SqliteUsageLedger:
     self._init_conn.close()
 
 
-def write_dlq(event: UsageEvent, spool_path: Path) -> None:
-  """Append event as JSON line to spool file. Called when record() fails."""
-  spool_path = Path(spool_path).expanduser()
-  spool_path.parent.mkdir(parents=True, exist_ok=True)
-  with spool_path.open("a", encoding="utf-8") as handle:
+def write_dlq(event: UsageEvent, spool_path: Path | str | None = None) -> Path:
+  """Append event as JSON line to spool file. Called when record() fails.
+
+  When spool_path is omitted or equals DEFAULT_USAGE_DLQ_PATH, the event is
+  partitioned into the owning user's DLQ spool (default_usage_dlq_path).
+  """
+  if spool_path is None or Path(spool_path).expanduser() == DEFAULT_USAGE_DLQ_PATH:
+    resolved_path = default_usage_dlq_path(event.user_id)
+  else:
+    resolved_path = Path(spool_path).expanduser()
+  resolved_path.parent.mkdir(parents=True, exist_ok=True)
+  with resolved_path.open("a", encoding="utf-8") as handle:
     handle.write(json.dumps({
       "usage_event_schema_version": 2,
       "event": asdict(event),
     }, sort_keys=True) + "\n")
+  return resolved_path
 
 
-async def replay_dlq(ledger: UsageLedger, spool_path: Path) -> dict:
-  """Read spool, attempt to write each event to ledger, return stats."""
-  spool_path = Path(spool_path).expanduser()
+async def replay_dlq(
+  ledger: UsageLedger,
+  spool_path: Path | str | None = None,
+  *,
+  user_id: str | None = None,
+) -> dict[str, int]:
+  """Read spool, attempt to write each event to ledger, return stats.
+
+  When user_id is provided, only events matching user_id are replayed onto
+  ledger; events belonging to other owners remain in the spool and are not
+  replayed into another user's totals.
+  """
+  target_user = str(user_id or "").strip() if user_id is not None else None
+  if spool_path is None:
+    if target_user is None:
+      raise ValueError("user_id is required when spool_path is omitted")
+    resolved_path = default_usage_dlq_path(target_user)
+  else:
+    resolved_path = Path(spool_path).expanduser()
+
   stats = {"total": 0, "replayed": 0, "failed": 0, "invalid": 0}
-  if not spool_path.exists():
+  if not resolved_path.exists():
     return stats
 
-  raw_lines = spool_path.read_text(encoding="utf-8").splitlines()
+  raw_lines = resolved_path.read_text(encoding="utf-8").splitlines()
   keep_lines: list[str] = []
   for line in raw_lines:
     if not line.strip():
       continue
-    stats["total"] += 1
     try:
       payload = json.loads(line)
       if (
@@ -581,10 +734,16 @@ async def replay_dlq(ledger: UsageLedger, spool_path: Path) -> dict:
         raise ValueError("usage DLQ envelope version is unsupported")
       event = UsageEvent(**payload["event"])
     except Exception:
+      stats["total"] += 1
       stats["invalid"] += 1
       keep_lines.append(line)
       continue
 
+    if target_user is not None and event.user_id != target_user:
+      keep_lines.append(line)
+      continue
+
+    stats["total"] += 1
     try:
       await ledger.record(event)
     except Exception:
@@ -595,14 +754,14 @@ async def replay_dlq(ledger: UsageLedger, spool_path: Path) -> dict:
     stats["replayed"] += 1
 
   if keep_lines:
-    spool_path.write_text("".join(f"{line}\n" for line in keep_lines), encoding="utf-8")
+    resolved_path.write_text("".join(f"{line}\n" for line in keep_lines), encoding="utf-8")
   else:
-    spool_path.unlink(missing_ok=True)
+    resolved_path.unlink(missing_ok=True)
   return stats
-
 
 __all__ = [
   "DEFAULT_USAGE_DLQ_PATH",
+  "default_usage_dlq_path",
   "SqliteUsageLedger",
   "SessionUsageSummary",
   "UsageEvent",

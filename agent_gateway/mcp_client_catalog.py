@@ -69,7 +69,7 @@ _MCP_TOOL_DESCRIPTION_GUIDANCE: dict[str, str] = {
     "research-corpus-mcp.list_research_files, then retry with the returned research_file_id."
   ),
   "industry_peer_comparison": (
-    "Argument guidance: Pass symbol such as symbol='MSCI'. Do not pass ticker. Use this for portfolio "
+    "Argument guidance: Pass symbol=<TICKER> (the company's ticker). Do not pass ticker. Use this for portfolio "
     "peer/industry comparison readbacks. For custom peer sets or metric-specific comparisons, use "
     "compare_peers with its schema-supported symbol and peer arguments."
   ),

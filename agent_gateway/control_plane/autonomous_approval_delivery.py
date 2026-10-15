@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
-from datetime import timedelta
 from typing import Any, Mapping, Protocol
 
 from agent_gateway.approval_policy import (
@@ -54,11 +53,6 @@ class _RecordAutonomousApprovalDeliveryFailure(Protocol):
     nonce: str,
     error: str,
   ) -> dict[str, Any]: ...
-
-
-# The durable pending_user window an operator gets on a delegated request; the
-# child's wait is bounded by the same value.
-DELEGATED_APPROVAL_EXPIRY_SECONDS = 600
 
 
 def autonomous_run_accepts_approval_decisions(
@@ -286,9 +280,7 @@ async def create_delegated_autonomous_approval(
     cache_reference=None,
     grant_reference=None,
     requested_at=requested_at,
-    expires_at=requested_at + timedelta(
-      seconds=DELEGATED_APPROVAL_EXPIRY_SECONDS,
-    ),
+    expires_at=None,
     decided_at=None,
     decider_id=None,
     decider_role=None,
@@ -528,7 +520,6 @@ async def deliver_autonomous_approval_outbox(
 
 
 __all__ = [
-  "DELEGATED_APPROVAL_EXPIRY_SECONDS",
   "autonomous_approval_authoritative_identity",
   "create_delegated_autonomous_approval",
   "autonomous_approval_delivery_context",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 import json
 import logging
 import os
@@ -85,12 +86,26 @@ from .autonomous_run_lock import AutonomousRunMutationLock
 from .skill_limits import AutonomousSkillAdmissionPolicyResolver
 from .ui_blocks_metrics import record as record_package_counter
 from .session_recap import fold_run_measurements
+from .named_refusal import NamedRefusal
 
 _STATUS_TAIL_LINES = 40
 _POST_EXIT_SETTLE_SECONDS = 5.0
 _AUTONOMOUS_PROFILE_NAME_RE = _runner_commands._AUTONOMOUS_PROFILE_NAME_RE
 _LOGGER = logging.getLogger(__name__)
 _APPROVAL_DECISION_AUTONOMOUS_STATES = {"running", "approval_pending", "remediating"}
+
+
+class AutonomousAdmissionClosed(NamedRefusal):
+  """A host restart holds the admission lease: retry once the restart finishes."""
+
+  def __init__(self) -> None:
+    super().__init__(
+      "gateway_restart_in_progress",
+      "A gateway restart is in progress and autonomous admission is closed "
+      "until it finishes. Retry after the restart.",
+      transport="unavailable",
+    )
+
 
 def _required_control_text(
   value: Any,
@@ -315,6 +330,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     owner_run_limit_resolver: Callable[[str, int], int | None] = (
       resolve_autonomous_owner_run_limit
     ),
+    ttl_resolver: Callable[[str, str], int | None] | None = None,
   ) -> None:
     self._api_dir = Path(api_dir)
     self._tenant_id = str(tenant_id or "").strip() or None
@@ -324,6 +340,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     self._log_dir = (log_dir or Path("~/.cache/agent-gateway/autonomous").expanduser()).expanduser()
     self._max_running = max_running
     self._owner_run_limit_resolver = owner_run_limit_resolver
+    self._ttl_resolver = ttl_resolver
     self._user_event_bus: _AutonomousUserEventBus | None = user_event_bus
     if approval_store is not None:
       required_store_methods = (
@@ -385,6 +402,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     self._seq = self._initial_task_seq()
     self._slot_lock = asyncio.Lock()
     self._reserved_slots = 0
+    self._admission_lease: Callable[[], ContextManager[None]] = nullcontext
     self._cleanup_uncommitted_spill_starts()
     self.rehydrate()
 
@@ -413,6 +431,17 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     user_event_bus: _AutonomousUserEventBus | None,
   ) -> None:
     self._user_event_bus = user_event_bus
+
+  def set_admission_lease(
+    self,
+    factory: Callable[[], ContextManager[None]],
+  ) -> None:
+    """Install the host's lease for atomic autonomous admission.
+
+    The factory's context manager raises `AutonomousAdmissionClosed` while a
+    restart holds admission closed.
+    """
+    self._admission_lease = factory
 
   def _next_task_id(self) -> str:
     task_id = f"bg_{self._seq}"
@@ -454,6 +483,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
       "mode": record.mode,
       "pack": record.pack,
       "deliver": record.deliver,
+      "owner_run_limit": record.owner_run_limit,
       "log_path": str(record.log_path),
       "started_at": int(record.started_at),
       "cmd": list(record.cmd),
@@ -755,9 +785,14 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
       None,
     )
 
-  def live_process_count(self) -> int:
-    return sum(
-      1
+  def admitted_count(self) -> int:
+    """Runs admitted for launch, including those without a process yet."""
+    return self._reserved_slots
+
+  def live_task_ids(self) -> list[str]:
+    """Sorted ids of runs whose owned process is still running."""
+    return sorted(
+      record.task_id
       for record in self._tasks.values()
       if record.proc is not None and record.proc.returncode is None
     )
@@ -938,6 +973,8 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
               "autonomous event channel record was suppressed as a duplicate"
             )
           record.event_channel_projected_events.append(projected_event)
+          if event.get("type") == "tool_surface_declared":
+            self._record_tool_surface(record, event)
           continue
         if not isinstance(result, ReceivedAutonomousEventStream):
           raise RuntimeError(
@@ -2032,6 +2069,98 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
           ) from exc
     return self._status_payload(record)
 
+  async def revoke_user(
+    self,
+    user_id: str,
+    *,
+    schedule_store: Any | None = None,
+  ) -> dict[str, Any]:
+    """Revoke a user: terminate in-flight runs, stop deliveries, disable owned schedules.
+
+    Per U12 invariant:
+    Removing a user from the roster or revoking their entitlement terminates
+    their in-flight runs, stops their pending approval deliveries, and disables
+    their owned schedules. A second user's runs, deliveries, and schedules are untouched.
+    """
+    owner = str(user_id or "").strip()
+    if not owner:
+      raise ValueError("user_id must not be blank")
+
+    cancelled_tasks: list[str] = []
+    live_records = [
+      record
+      for record in self._tasks.values()
+      if record.owner_user_id == owner and self._is_active_process_state(record)
+    ]
+    for record in live_records:
+      record.error = record.error or "Process terminated due to user revocation"
+      await self.cancel(record.task_id)
+      cancelled_tasks.append(record.task_id)
+
+    disabled_schedules: list[str] = []
+    store = schedule_store
+    if store is None:
+      try:
+        from agent_gateway.control_plane.schedules import schedule_store_for
+        store = schedule_store_for(owner)
+      except Exception:
+        store = None
+
+    if store is not None:
+      list_for_owner = getattr(store, "list_for_owner", None)
+      set_enabled = getattr(store, "set_enabled", None)
+      if callable(list_for_owner) and callable(set_enabled):
+        try:
+          schedules = list_for_owner(owner)
+          if isinstance(schedules, list):
+            for sched in schedules:
+              if isinstance(sched, dict):
+                sched_id = str(sched.get("schedule_id") or sched.get("name") or "").strip()
+                if sched_id and sched.get("enabled", True):
+                  set_enabled(
+                    owner,
+                    sched_id,
+                    enabled=False,
+                    updated_by=owner,
+                    live_role=str(sched.get("dispatch_role") or "owner"),
+                  )
+                  disabled_schedules.append(sched_id)
+        except Exception as exc:
+          _LOGGER.warning("Could not disable schedules for revoked user %s: %s", owner, exc)
+
+    return {
+      "user_id": owner,
+      "cancelled_tasks": cancelled_tasks,
+      "disabled_schedules": disabled_schedules,
+    }
+
+  async def check_active_runs_roster(
+    self,
+    *,
+    schedule_store_for: Any | None = None,
+  ) -> list[str]:
+    """Check active runs against the live roster and revoke any whose user was removed."""
+    terminated: list[str] = []
+    if self._mcp_user_key_lookup is None:
+      return terminated
+    active = [
+      record
+      for record in self._tasks.values()
+      if self._is_active_process_state(record) and record.owner_user_id
+    ]
+    seen_revoked_users: set[str] = set()
+    for record in active:
+      owner_id = str(record.owner_user_id or "").strip()
+      if not owner_id or owner_id in seen_revoked_users:
+        continue
+      role = self.live_user_role(owner_id, record.user_email)
+      if role is None:
+        seen_revoked_users.add(owner_id)
+        store = schedule_store_for(owner_id) if callable(schedule_store_for) else None
+        res = await self.revoke_user(owner_id, schedule_store=store)
+        terminated.extend(res.get("cancelled_tasks", []))
+    return terminated
+
   async def shutdown(self, *, grace_sec: float = 10.0) -> None:
     live_records = [
       record
@@ -2100,4 +2229,9 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
       self._close_owner_lifeline(record)
 
 
-__all__ = ["AutonomousRegistry", "AutonomousTask", "normalize_autonomous_profile"]
+__all__ = [
+  "AutonomousAdmissionClosed",
+  "AutonomousRegistry",
+  "AutonomousTask",
+  "normalize_autonomous_profile",
+]

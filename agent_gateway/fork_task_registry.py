@@ -10,9 +10,11 @@ import json
 import logging
 import math
 import os
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
+from agent_workflow_contracts import OrdinaryDelegationTaskRef, TaskResult
 from .fork_ledger import ForkLedger
+from .task_registry import TaskEntry
 
 
 log = logging.getLogger("agent_gateway.fork_task_registry")
@@ -24,7 +26,7 @@ ForkSkipReason = Literal[
   "session_cap",
   "shutting_down",
 ]
-ForkSpawn = Callable[[str, Any], Awaitable[Decimal | int | float | str]]
+ForkSpawn = Callable[[str, Any], Awaitable[TaskEntry]]
 TelemetrySink = Callable[[str, Mapping[str, Any]], None]
 
 
@@ -199,6 +201,7 @@ class ForkTaskRegistry:
     session_id: str,
     owner: str,
     handoff: Any,
+    on_settled: Callable[[str], None] | None,
   ) -> ForkLaunchDecision:
     """Admit and own a fork without awaiting the new task."""
 
@@ -216,8 +219,16 @@ class ForkTaskRegistry:
 
     try:
       self._handoffs[fork_id] = handoff
+      if not self._ledger.mark_admission_started(fork_id=fork_id):
+        raise RuntimeError("fork admission could not transition to started")
+      execution = self._spawn_fork(fork_id, handoff)
       task = loop.create_task(
-        self._run(fork_id=fork_id, session_id=session_id),
+        self._run(
+          fork_id=fork_id,
+          session_id=session_id,
+          execution=execution,
+          on_settled=on_settled,
+        ),
         name=f"learning-fork:{fork_id}",
       )
       self._tasks_by_session[session_id] = task
@@ -244,23 +255,51 @@ class ForkTaskRegistry:
       day_charged_microusd=reservation.day_charged_microusd,
     )
 
-  async def _run(self, *, fork_id: str, session_id: str) -> None:
-    settled = False
+  async def settle_task(
+    self,
+    *,
+    entry: TaskEntry,
+    on_settled: Callable[[str], None] | None,
+  ) -> None:
+    """Settle one final canonical result, including cumulative Continue usage."""
+    canonical = cast(TaskResult, entry.task_result)
+    fork_id = cast(OrdinaryDelegationTaskRef, canonical.logical_task).delegation_id
+    if canonical.execution.status == "awaiting_approval":
+      return
     try:
-      if not self._ledger.mark_admission_started(fork_id=fork_id):
-        raise RuntimeError("fork admission could not transition to started")
-      handoff = self._handoffs[fork_id]
-      actual_cost = await self._spawn_fork(fork_id, handoff)
-      if not self._ledger.settle_admission(
-        fork_id=fork_id,
-        actual_cost_usd=actual_cost,
-      ):
-        raise RuntimeError("fork admission could not be settled")
-      settled = True
-      on_settled = getattr(handoff, "on_admission_settled", None)
-      if callable(on_settled):
-        on_settled(fork_id)
-      self._emit("learning_fork_completed", fork_id=fork_id)
+      if canonical.execution.status == "succeeded":
+        if self._ledger.settle_admission(
+          fork_id=fork_id,
+          actual_cost_usd=canonical.observation.usage.cost_usd,
+        ):
+          if on_settled is not None:
+            on_settled(fork_id)
+          self._emit("learning_fork_completed", fork_id=fork_id)
+      else:
+        self._ledger.abandon_admission(fork_id=fork_id)
+    finally:
+      self._handoffs.pop(fork_id, None)
+
+  async def _run(
+    self,
+    *,
+    fork_id: str,
+    session_id: str,
+    execution: Awaitable[TaskEntry],
+    on_settled: Callable[[str], None] | None,
+  ) -> None:
+    retained = False
+    finalized = False
+    try:
+      entry = await execution
+      canonical = cast(TaskResult, entry.task_result)
+      retained = canonical.execution.status == "awaiting_approval"
+      if not retained:
+        await self.settle_task(
+          entry=entry,
+          on_settled=on_settled,
+        )
+        finalized = True
     except asyncio.CancelledError:
       self._emit("learning_fork_cancelled", fork_id=fork_id)
       raise
@@ -272,12 +311,13 @@ class ForkTaskRegistry:
       )
       log.warning("Learning fork %s failed", fork_id, exc_info=True)
     finally:
-      if not settled:
-        try:
-          self._ledger.abandon_admission(fork_id=fork_id)
-        except Exception:
-          log.exception("Failed to abandon fork admission %s", fork_id)
-      self._handoffs.pop(fork_id, None)
+      if not retained:
+        if not finalized:
+          try:
+            self._ledger.abandon_admission(fork_id=fork_id)
+          except Exception:
+            log.exception("Failed to abandon fork admission %s", fork_id)
+        self._handoffs.pop(fork_id, None)
       current = asyncio.current_task()
       if self._tasks_by_session.get(session_id) is current:
         self._tasks_by_session.pop(session_id, None)

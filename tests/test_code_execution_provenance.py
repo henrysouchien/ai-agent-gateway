@@ -11,7 +11,7 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import SessionStore, ToolDispatcher
+from agent_gateway import AgentRunner, SessionStore, ToolDispatcher
 from agent_gateway.agent_telemetry import (
   AGENT_TELEMETRY_TOOL_CALL_ID_ENV,
 )
@@ -23,7 +23,9 @@ from agent_gateway.code_execution._provenance import (
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.event_log import EventLog
 from agent_gateway.runner import ToolResultContext
+from agent_gateway.task_registry import TaskState
 from agent_gateway.tool_dispatch_source_identity import sandbox_computation_source_rows
+from gateway_test_support.capability_execution_test_support import stub_runner_capability_execution
 
 
 def _run(coro):
@@ -151,24 +153,42 @@ def _write_sidecars_code(entries: list[tuple[str, dict[str, Any]]], *, sleep_s: 
   )
 
 
-async def _wait_for_terminal_status(session, bundle, task_id: str) -> tuple[dict | None, dict | None]:
-  for _ in range(60):
-    result, error = await _dispatch_bundle_tool(
-      session,
-      bundle,
-      "code_execute_status",
-      {"task_id": task_id},
-    )
-    if error is not None or not (isinstance(result, dict) and result.get("status") == "running"):
-      return result, error
-    await asyncio.sleep(0.05)
-  raise AssertionError(f"task did not reach terminal status: {task_id}")
+class _StubProvider:
+  name = "stub"
+
+
+def _job_runner() -> AgentRunner:
+  event_log = EventLog()
+  return AgentRunner(
+    event_log=event_log,
+    dispatcher=ToolDispatcher(
+      capability_bind=TEST_CAPABILITY_BIND,
+      mcp_client=_FakeMcp(),
+      local_tool_handlers={},
+      event_log=event_log,
+      session_id="sess-code-provenance",
+    ),
+    session_id="sess-code-provenance",
+    capability_execution=stub_runner_capability_execution(
+      provider=_StubProvider(),
+      model="stub-model",
+      effort="none",
+    ),
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
 
 
 def test_code_execute_sets_work_dir_env_for_foreground_and_background_subprocess() -> None:
   async def _run_test() -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-    bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
+    runner = _job_runner()
+    bundle = build_code_execution(
+      session,
+      config=CodeExecutionConfig(register_docker=False),
+      job_runner=lambda: runner,
+    )
 
     result, error = await _dispatch_bundle_tool(
       session,
@@ -211,17 +231,19 @@ def test_code_execute_sets_work_dir_env_for_foreground_and_background_subprocess
     )
     assert start_error is None
     assert start_result is not None
-    task_id = start_result["task_id"]
-    assert session.background_tasks[task_id].tool_call_id == "code_execute_call"
-
-    complete_result, complete_error = await _wait_for_terminal_status(session, bundle, task_id)
-    assert complete_error is None
-    assert complete_result is not None
+    entry = runner._task_registry.get(start_result["task_id"])
+    assert entry is not None and entry.task_type == "code"
+    assert entry.asyncio_task is not None
+    await asyncio.wait_for(entry.asyncio_task, timeout=10)
+    assert entry.state == TaskState.COMPLETED
+    complete_result = runner._background_task_payload(entry)
+    assert complete_result["status"] == "completed"
     payload = json.loads(complete_result["stdout"])
     assert payload == {
       "work_dir": session.code_execution_work_dir,
       "tool_call_id": "code_execute_call",
     }
+    await cleanup_code_execution(session)
 
   _run(_run_test())
 
@@ -252,8 +274,8 @@ def test_foreground_ignores_legacy_sidecars() -> None:
   _run(_run_test())
 
 
-def test_sanitize_hook_strips_computations_from_result_entry_only_for_code_execute_tools() -> None:
-  for tool_name in ("code_execute", "code_execute_status"):
+def test_sanitize_hook_strips_computations_from_result_entry_only_for_code_execute() -> None:
+  for tool_name in ("code_execute",):
     result = {
       "stdout": "",
       "return_code": 0,

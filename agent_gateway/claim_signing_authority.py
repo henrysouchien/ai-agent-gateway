@@ -7,7 +7,8 @@ import threading
 import weakref
 from typing import Any, Mapping, NamedTuple, Protocol
 
-from .autonomous_runner_claims import sign_user_claim
+from .autonomous_runner_claims import get_agent_api_claim_ttl_seconds, sign_user_claim
+from .ttl_policy import AGENT_API_CLAIM_TTL, TtlResolver, resolve_ttl_seconds
 
 
 GATEWAY_CLAIM_SIGNING_AUTHORITY_ENV = (
@@ -57,10 +58,16 @@ def _canonical_secret(secret: bytes | str) -> str:
 class GatewayClaimSigningAuthority:
   """Process-local signing authority whose secret is never child authority."""
 
-  __slots__ = ("__secret",)
+  __slots__ = ("__secret", "_ttl_resolver")
 
-  def __init__(self, secret: bytes | str) -> None:
+  def __init__(
+    self,
+    secret: bytes | str,
+    *,
+    ttl_resolver: TtlResolver | None = None,
+  ) -> None:
     self.__secret = _canonical_secret(secret)
+    self._ttl_resolver = ttl_resolver
 
   def __repr__(self) -> str:
     return "GatewayClaimSigningAuthority(secret=<redacted>)"
@@ -69,6 +76,8 @@ class GatewayClaimSigningAuthority:
   def from_one_shot_fd(
     cls,
     fd: int,
+    *,
+    ttl_resolver: TtlResolver | None = None,
   ) -> GatewayClaimSigningAuthority:
     if type(fd) is not int or fd < 0:
       raise ValueError(
@@ -98,15 +107,49 @@ class GatewayClaimSigningAuthority:
       raise ValueError(
         "gateway claim-signing key exceeds its byte bound"
       )
-    return cls(secret)
+    return cls(secret, ttl_resolver=ttl_resolver)
+
+  def resolve_user_claim_ttl_seconds(
+    self,
+    *,
+    user_id: str,
+    ttl_seconds: int | None = None,
+  ) -> int:
+    fallback = (
+      get_agent_api_claim_ttl_seconds()
+      if ttl_seconds is None else ttl_seconds
+    )
+    if self._ttl_resolver is None:
+      return fallback
+    return resolve_ttl_seconds(
+      self._ttl_resolver, user_id, AGENT_API_CLAIM_TTL, fallback,
+    )
 
   def sign_user_claim(
     self,
     *,
     user_id: str,
     user_email: str | None,
+    ttl_seconds: int | None = None,
+  ) -> dict[str, str]:
+    resolved_ttl = self.resolve_user_claim_ttl_seconds(
+      user_id=user_id,
+      ttl_seconds=ttl_seconds,
+    )
+    return self._sign_resolved_user_claim(
+      user_id=user_id,
+      user_email=user_email,
+      ttl_seconds=resolved_ttl,
+    )
+
+  def _sign_resolved_user_claim(
+    self,
+    *,
+    user_id: str,
+    user_email: str | None,
     ttl_seconds: int,
   ) -> dict[str, str]:
+    """Mint the exact TTL already resolved and validated by the caller."""
     return sign_user_claim(
       self.__secret,
       user_id=user_id,
@@ -284,7 +327,7 @@ def gateway_user_claim_signer_identity(
 def sign_gateway_user_claim(
   signer: GatewayUserClaimSigner,
   *,
-  ttl_seconds: int,
+  ttl_seconds: int | None = None,
 ) -> dict[str, str]:
   """Sign through the module-owned exact-type gateway capability."""
 

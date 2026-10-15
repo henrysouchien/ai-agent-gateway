@@ -41,6 +41,7 @@ from agent_gateway import (  # noqa: E402
 )
 from agent_gateway.capability_execution import BoundCapabilityExecution  # noqa: E402
 from agent_gateway.commercial_usage import CommercialUsageProducer  # noqa: E402
+from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.multi_user.billing import (  # noqa: E402
   SessionUsageSummary,
@@ -88,6 +89,8 @@ def test_runner_usage_wrappers_resolve_parent_module_helpers(monkeypatch: pytest
   runner._billing_mode = "metered"
   runner._channel = "web"
   runner._estimate_usage_cost = lambda _model, _usage_totals: CostEstimate(total=0.5)  # type: ignore[method-assign]
+  runner._dispatcher = SimpleNamespace(capture_spawning_turn=lambda: SimpleNamespace(context=None))  # type: ignore[assignment]
+  runner._model_fallback_hop = None
   monkeypatch.setattr(gateway_runner, "time", SimpleNamespace(time=lambda: 42.0))
   monkeypatch.setattr(
     gateway_runner,
@@ -121,6 +124,8 @@ def test_compaction_event_seam_counts_once_rearms_and_shares_root_total() -> Non
     child._aggregator = aggregator
     parent._log = EventLog()
     child._log = EventLog()
+    parent._containment = ContainmentSettings()
+    child._containment = ContainmentSettings(context_pressure_reminder_pct=50)
     parent._context_pressure_next_reminder_pct = 90
     child._context_pressure_next_reminder_pct = 80
 
@@ -131,7 +136,7 @@ def test_compaction_event_seam_counts_once_rearms_and_shares_root_total() -> Non
     summary = await aggregator.snapshot()
     assert summary.compaction_count == 2
     assert parent._context_pressure_next_reminder_pct == 60
-    assert child._context_pressure_next_reminder_pct == 60
+    assert child._context_pressure_next_reminder_pct == 50
     assert [
       entry.event["type"]
       for entry in parent._log.entries
@@ -1796,7 +1801,7 @@ def test_native_compaction_block_counts_once_in_session_summary(
   monkeypatch.setattr(
     gateway_runner,
     "_model_context_window",
-    lambda _model_info: 1_000,
+    lambda _model_info, _settings: 1_000,
   )
 
   def token_snapshot(
@@ -1897,12 +1902,9 @@ def test_runner_emits_session_summary_once_after_run() -> None:
   assert summary.provider == "stub"
 
 
-def test_runner_session_summary_reports_failed_drain_and_in_flight_tasks() -> None:
-  class _DrainFailureRunner(AgentRunner):
-    async def _shutdown_background_tasks(self, was_cancelled: bool) -> None:
-      _ = was_cancelled
-      raise RuntimeError("drain failed")
-
+def test_runner_session_summary_reports_in_flight_tasks_when_a_child_outlives_the_turn() -> None:
+  # A background child is not drained at turn end (jobs-park-and-continue);
+  # the run completes and the summary reports the child still in flight.
   async def case() -> None:
     summaries: list[SessionUsageSummary] = []
     pending_task = asyncio.create_task(asyncio.Event().wait())
@@ -1913,7 +1915,7 @@ def test_runner_session_summary_reports_failed_drain_and_in_flight_tasks() -> No
     task_registry.transition("bg-pending", TaskState.RUNNING)
 
     provider = _UsageProvider()
-    runner = _DrainFailureRunner(
+    runner = AgentRunner(
       event_log=EventLog(),
       dispatcher=_make_dispatcher(),
       session_id="sess-parent",
@@ -1935,10 +1937,9 @@ def test_runner_session_summary_reports_failed_drain_and_in_flight_tasks() -> No
     runner._wait_for_background_notification = _no_notification
 
     try:
-      with pytest.raises(RuntimeError, match="drain failed"):
-        await runner.run(
-          messages=[{"role": "user", "content": "hello"}],
-        )
+      await runner.run(
+        messages=[{"role": "user", "content": "hello"}],
+      )
 
       assert len(summaries) == 1
       assert summaries[0].drain_complete is False
@@ -2045,6 +2046,61 @@ def test_spawn_sub_agent_no_wall_clock(
   assert result is not None
   assert result.execution.status == "succeeded"
   assert result.values.terminal_narrative is not None
+
+
+def test_spawned_sub_agent_delivers_its_own_summary_under_the_roots_unit(
+  tmp_path: Path,
+) -> None:
+  async def case() -> None:
+    summaries: list[SessionUsageSummary] = []
+    parent = AgentRunner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(),
+      session_id="sess-parent",
+      capability_execution=_runner_execution(_UsageProvider()),
+      agent_session_log=AgentSessionLog(path=tmp_path / "unit-parent.jsonl"),
+      workspace_dir=str(tmp_path),
+      user_id="alice",
+      request_id="req-tree",
+      on_session_summary=summaries.append,
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    await parent._aggregator.declare_unit("A5")
+    await parent._aggregator.record(_usage_event())
+
+    result, error = await parent.spawn_sub_agent(
+      "Collect usage",
+      capability_execution=_child_execution(
+        _UsageProvider(), model="claude-haiku-4-5",
+      ),
+      bind_job_runner=lambda _runner: None,
+      **_subagent_identity("sub0:sess-parent"),
+      skill_name="test-child",
+      dispatcher=_make_dispatcher(),
+    )
+
+    assert error is None and result is not None
+    # The child delivered its own summary through the hook the root uses.
+    assert len(summaries) == 1
+    child = summaries[0]
+    assert child.session_id == "sub0:sess-parent"
+    assert child.request_id == "req-tree"
+    assert child.model == "claude-haiku-4-5"
+    assert (child.input_tokens, child.output_tokens, child.turns) == (100, 50, 1)
+    assert (child.unit_kind, child.unit_id) == ("A5", "req-tree")
+
+    # The root's own row counts the root alone; the tree total is the sum.
+    root = await parent._aggregator.snapshot()
+    assert root.session_id == "sess-parent"
+    assert root.model == "claude-sonnet-4-6"
+    assert (root.input_tokens, root.turns) == (10, 1)
+    assert (root.unit_kind, root.unit_id) == ("A5", "req-tree")
+    fleet = await parent._aggregator.fleet_snapshot()
+    assert (fleet.input_tokens, fleet.turns, fleet.usage_event_count) == (110, 2, 2)
+    assert fleet.session_id == "sess-parent"
+
+  _run(case())
 
 
 def test_failed_response_usage_reaches_runner_as_failed_billable() -> None:

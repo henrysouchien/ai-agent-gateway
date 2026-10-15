@@ -2,18 +2,25 @@ import asyncio
 import json
 import logging
 import time
+from types import SimpleNamespace
 
 from anyio import ClosedResourceError
 from mcp import MCPError
 from mcp.types import CONNECTION_CLOSED, CallToolResult
 import agent_gateway.mcp_client as mcp_client_module
+import agent_gateway.mcp_client_connections as mcp_client_connections
 from agent_gateway.mcp_client import McpClientManager
 
 
-def test_connect_or_warn_logs_timeout_exception_class(caplog):
+def test_connect_or_warn_logs_timeout_exception_class(monkeypatch, caplog):
   manager = McpClientManager(config_path=None)
+  clock = SimpleNamespace(now=100.0)
+  monkeypatch.setattr(
+    mcp_client_connections, "time", SimpleNamespace(monotonic=lambda: clock.now),
+  )
 
   async def _raise_timeout(name, config):
+    clock.now += 2.345
     raise asyncio.TimeoutError()
 
   manager._connect = _raise_timeout
@@ -26,12 +33,12 @@ def test_connect_or_warn_logs_timeout_exception_class(caplog):
   result = asyncio.run(_run())
 
   assert result is None
-  assert "MCP server portfolio-reads-mcp failed to connect: TimeoutError" in caplog.text
+  assert "MCP server portfolio-reads-mcp failed to connect after 2.345s: TimeoutError" in caplog.text
   assert manager.get_startup_diagnostics()["portfolio-reads-mcp"] == {
     "server": "portfolio-reads-mcp",
     "category": "transient_timeout",
     "retryable": True,
-    "message": "TimeoutError",
+    "message": "MCP server portfolio-reads-mcp startup failed after 2.345s: TimeoutError",
     "error_type": "TimeoutError",
   }
 
@@ -152,10 +159,15 @@ def test_stdio_connect_exhausts_bounded_retries(monkeypatch, caplog):
   monkeypatch.setenv("MCP_STDIO_CONNECT_RETRIES", "2")
   monkeypatch.setenv("MCP_STDIO_CONNECT_BACKOFF_S", "0")
   manager = McpClientManager(config_path=None)
+  clock = SimpleNamespace(now=100.0)
+  monkeypatch.setattr(
+    mcp_client_connections, "time", SimpleNamespace(monotonic=lambda: clock.now),
+  )
   attempts: list[int] = []
 
   async def _always_closed(name, config):
     attempts.append(1)
+    clock.now += 0.25
     raise ExceptionGroup(
       "unhandled errors in a TaskGroup",
       [MCPError(code=CONNECTION_CLOSED, message="Connection closed")],
@@ -172,7 +184,14 @@ def test_stdio_connect_exhausts_bounded_retries(monkeypatch, caplog):
   assert result is None
   assert len(attempts) == 3
   assert caplog.text.count("retrying in 0.00s") == 2
-  assert "MCP server fmp-mcp failed to connect: unhandled errors in a TaskGroup" in caplog.text
+  assert (
+    "MCP server fmp-mcp failed to connect after 0.750s: unhandled errors in a TaskGroup"
+    in caplog.text
+  )
+  assert manager.get_startup_diagnostics()["fmp-mcp"]["message"] == (
+    "MCP server fmp-mcp startup failed after 0.750s: "
+    "unhandled errors in a TaskGroup (1 sub-exception): Connection closed"
+  )
   assert manager.get_startup_diagnostics()["fmp-mcp"]["category"] == "transient_transport"
   assert manager.get_startup_diagnostics()["fmp-mcp"]["retryable"] is True
 

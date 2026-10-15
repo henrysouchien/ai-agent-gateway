@@ -3,77 +3,46 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import time
 from types import MappingProxyType
-from typing import Any, Final, Mapping, NamedTuple
+from typing import Any, Final, Mapping, Sequence
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from agent_workflow_contracts.models import AdmittedTenant
 
 from .skill_limits import SkillExecutionLimits
+from hank_contracts.investment_claims import (
+  INVESTMENT_CAPABILITY_CLAIM_PRIVATE_KEY_ENV as INVESTMENT_CAPABILITY_CLAIM_PRIVATE_KEY_ENV,
+  INVESTMENT_CAPABILITY_CLAIM_PUBLIC_KEY_ENV as INVESTMENT_CAPABILITY_CLAIM_PUBLIC_KEY_ENV,
+  INVESTMENT_CAPABILITY_CLAIM_ISSUER as INVESTMENT_CAPABILITY_CLAIM_ISSUER,
+  INVESTMENT_CAPABILITY_CLAIM_AUDIENCE as INVESTMENT_CAPABILITY_CLAIM_AUDIENCE,
+  INVESTMENT_CAPABILITY_CLAIM_TTL_SECONDS as INVESTMENT_CAPABILITY_CLAIM_TTL_SECONDS,
+  INVESTMENT_CAPABILITY_CLAIM_KEY_BYTES as INVESTMENT_CAPABILITY_CLAIM_KEY_BYTES,
+  INVESTMENT_SELECTED_CONTENT_CLAIM_PURPOSE as INVESTMENT_SELECTED_CONTENT_CLAIM_PURPOSE,
+  INVESTMENT_CAPABILITY_CLAIM_VERSION as INVESTMENT_CAPABILITY_CLAIM_VERSION,
+  INVESTMENT_CAPABILITY_CLAIM_KIND as INVESTMENT_CAPABILITY_CLAIM_KIND,
+  INVESTMENT_JOB_PRINCIPAL_CLAIM_VERSION as INVESTMENT_JOB_PRINCIPAL_CLAIM_VERSION,
+  INVESTMENT_JOB_PRINCIPAL_CLAIM_KIND as INVESTMENT_JOB_PRINCIPAL_CLAIM_KIND,
+  INVESTMENT_CAPABILITY_CLAIM_SERVER as INVESTMENT_CAPABILITY_CLAIM_SERVER,
+  RISK_CAPABILITY_CLAIM_AUDIENCE as RISK_CAPABILITY_CLAIM_AUDIENCE,
+  RISK_JOB_CAPABILITY_CLAIM_VERSION as RISK_JOB_CAPABILITY_CLAIM_VERSION,
+  RISK_JOB_CAPABILITY_CLAIM_KIND as RISK_JOB_CAPABILITY_CLAIM_KIND,
+  INVESTMENT_CAPABILITY_FACADE_TOOLS as INVESTMENT_CAPABILITY_FACADE_TOOLS,
+  INVESTMENT_JOB_PRINCIPAL_TOOLS as INVESTMENT_JOB_PRINCIPAL_TOOLS,
+  InvestmentCapabilityGrant as InvestmentCapabilityGrant,
+)
 
-INVESTMENT_CAPABILITY_CLAIM_PRIVATE_KEY_ENV: Final = (
-  "INVESTMENT_CAPABILITY_CLAIM_ED25519_PRIVATE_KEY"
-)
-INVESTMENT_CAPABILITY_CLAIM_PUBLIC_KEY_ENV: Final = (
-  "INVESTMENT_CAPABILITY_CLAIM_ED25519_PUBLIC_KEY"
-)
-INVESTMENT_CAPABILITY_CLAIM_ISSUER: Final = "ai-excel-addin"
-INVESTMENT_CAPABILITY_CLAIM_AUDIENCE: Final = "investment-tools"
-# ``exp`` is the replay bound of a signed claim: a captured token stops
-# authorizing a user's investment tools 60 seconds after issuance, and
-# investment-tools rejects any claim whose exp - iat exceeds this.
-INVESTMENT_CAPABILITY_CLAIM_TTL_SECONDS: Final = 60
-INVESTMENT_CAPABILITY_CLAIM_KEY_BYTES: Final = 32
-INVESTMENT_SELECTED_CONTENT_CLAIM_PURPOSE: Final = "selected_content_read"
-INVESTMENT_CAPABILITY_CLAIM_VERSION: Final = 4
-INVESTMENT_CAPABILITY_CLAIM_KIND: Final = "facade"
-INVESTMENT_JOB_PRINCIPAL_CLAIM_VERSION: Final = 3
-INVESTMENT_JOB_PRINCIPAL_CLAIM_KIND: Final = "job_principal"
+logger = logging.getLogger(__name__)
+
 _MAX_ID_CHARS = 256
 _MAX_CHANNEL_CHARS = 64
 _MAX_RESEARCH_FILE_ID = (1 << 63) - 1
+
 _POLICY_BUNDLE_HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-
-INVESTMENT_CAPABILITY_FACADE_TOOLS: Final = frozenset({
-  "cancel_investment_run",
-  "get_investment_artifact",
-  "get_investment_capability",
-  "get_investment_run",
-  "list_investment_artifacts",
-  "list_investment_capabilities",
-  "start_investment_run",
-  "start_quant_research",
-})
-
-INVESTMENT_JOB_PRINCIPAL_TOOLS: Final = frozenset({
-  "submit_research_task",
-  "send_research_task_message",
-  "start_research_pipeline",
-  "start_research_benchmark",
-})
-
-INVESTMENT_CAPABILITY_CLAIM_SERVER: Final = "idea-workbench-mcp"
-
-
-class InvestmentCapabilityGrant(NamedTuple):
-  """One skill's investment grant, projected from its own skill note.
-
-  ``capability_ids`` and ``effect_classes`` are the note's
-  ``semantic_metadata.investment_grant``; ``tool_names`` are the tools its
-  ``tool_refs`` declare on ``INVESTMENT_CAPABILITY_CLAIM_SERVER``.
-  investment-tools owns both vocabularies and intersects every claim with the
-  routed tool's own maximum, so the gateway restates neither.
-  """
-
-  capability_ids: tuple[str, ...]
-  effect_classes: tuple[str, ...]
-  tool_names: tuple[str, ...]
-
-
 _skill_grants: Mapping[str, InvestmentCapabilityGrant] = MappingProxyType({})
 
 
@@ -126,6 +95,11 @@ def investment_capability_claim_unavailable_error(
     "required_grants": list(grants),
     "route": "run_agent",
     "operations": list(operations),
+    "next_call": (
+      {"tool_name": "run_agent", "arguments": {"operation": operations[0]}}
+      if operations
+      else None
+    ),
   }
 
 
@@ -262,7 +236,7 @@ def issue_investment_capability_claim(
   jti: str,
   skill: str,
   admitted_skill_execution_limits: SkillExecutionLimits | None,
-  policy_bundle_hash: str,
+  policy_bundle_hash: str | None,
   research_file_id: int | None = None,
   now: int | None = None,
 ) -> str:
@@ -289,14 +263,20 @@ def issue_investment_capability_claim(
   request = _required_text(request_id, "request_id")
   token_id = _required_text(jti, "jti")
   trusted_skill = _required_text(skill, "skill")
-  trusted_policy_bundle = _required_text(
-    policy_bundle_hash,
-    "policy_bundle_hash",
-  )
-  if _POLICY_BUNDLE_HASH_PATTERN.fullmatch(trusted_policy_bundle) is None:
-    raise InvestmentCapabilityClaimError(
-      "investment capability claim requires policy_bundle_hash"
+  # The bundle hash is provenance, not authority (the grants below are). A run
+  # with no approval route has no policy bundle, so the claim carries none
+  # rather than refusing the gateway's own run context.
+  trusted_policy_bundle: str | None = policy_bundle_hash
+  if (
+    not isinstance(policy_bundle_hash, str)
+    or _POLICY_BUNDLE_HASH_PATTERN.fullmatch(policy_bundle_hash) is None
+  ):
+    logger.info(
+      "investment capability claim for %s carries no policy bundle (run context: %r)",
+      routed_tool,
+      policy_bundle_hash,
     )
+    trusted_policy_bundle = None
   grant = _skill_grants.get(trusted_skill)
   if grant is None:
     raise InvestmentCapabilityClaimError(
@@ -411,6 +391,44 @@ def issue_investment_job_principal_claim(
   }
   return _sign(payload)
 
+def issue_risk_job_capability_claim(
+  *,
+  user_id: str,
+  tenant: AdmittedTenant,
+  session_id: str,
+  channel: str = "code_execute",
+  granted_operations: Sequence[str],
+  cell_token: str,
+  now: int | None = None,
+) -> str:
+  """Issue the short-lived gateway job capability claim consumed by native Risk."""
+  subject = _required_text(user_id, "user_id")
+  if not isinstance(tenant, AdmittedTenant):
+    raise InvestmentCapabilityClaimError(
+      "risk job capability claim requires an authenticated tenant"
+    )
+  session = _required_text(session_id, "session_id")
+  token_id = _required_text(cell_token, "cell_token")
+  issued_at = int(time.time()) if now is None else now
+  payload: dict[str, object] = {
+    "aud": RISK_CAPABILITY_CLAIM_AUDIENCE,
+    "channel": channel,
+    "exp": issued_at + INVESTMENT_CAPABILITY_CLAIM_TTL_SECONDS,
+    "granted_operations": sorted(set(granted_operations)),
+    "iat": issued_at,
+    "iss": INVESTMENT_CAPABILITY_CLAIM_ISSUER,
+    "jti": token_id,
+    "cell_token": token_id,
+    "kind": RISK_JOB_CAPABILITY_CLAIM_KIND,
+    "session_id": session,
+    "sub": subject,
+    "tenant": tenant.model_dump(mode="json"),
+    "user_id": subject,
+    "v": RISK_JOB_CAPABILITY_CLAIM_VERSION,
+  }
+  return _sign(payload)
+
+
 
 def issue_investment_selected_content_claim(
   *,
@@ -467,6 +485,7 @@ __all__ = [
   "issue_investment_capability_claim",
   "issue_investment_job_principal_claim",
   "issue_investment_selected_content_claim",
+  "issue_risk_job_capability_claim",
   "investment_capability_claim_unavailable_error",
   "investment_capability_signing_available",
 ]

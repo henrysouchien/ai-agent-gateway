@@ -8,6 +8,7 @@ import time
 import weakref
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -41,6 +42,12 @@ from gateway_test_support.resumer_custody_test_support import (
 )
 
 from agent_gateway import AgentRunner, ToolDispatcher
+from agent_gateway import task_registry as task_registry_module
+from agent_gateway.admission import (
+  ContinuationOwners,
+  ContinueRequest,
+  ParentContext,
+)
 from agent_gateway.agent_session_log import AgentSessionLog
 from agent_gateway.event_log import EventLog
 from agent_gateway.mcp_client import McpClientManager
@@ -72,10 +79,12 @@ from agent_gateway.task_registry import (
   TaskResultSettlementError,
   TaskRegistry,
   TaskState,
+  _ADMISSION_SLOT_STATES,
   _TERMINAL_STATES,
   job_output_handles,
   job_read_subtree,
   make_progress_tracker,
+  task_state_for_result,
   validate_task_result_settlement,
 )
 
@@ -287,6 +296,7 @@ def _close_registry_runner(
     child,
     EventLog(),
     stalled=False,
+    approval_park=None,
     cancelled_error=cancelled_error,
     cancellation_signal="cancelled" if cancelled_error is not None else None,
     runtime_exception_detail=None,
@@ -383,8 +393,8 @@ class _BackgroundLifecycleHarness(RunnerBackgroundLifecycleMixin):
     self.append_invocations = 0
     self._pending_background_initializations = set()
 
-  def _ensure_sub_agent_semaphore(self) -> None:
-    return None
+  def _ensure_sub_agent_semaphore(self) -> asyncio.Semaphore:
+    return asyncio.Semaphore(1)
 
   async def _append_durable_event(self, event: dict[str, object]) -> None:
     self.append_invocations += 1
@@ -721,7 +731,7 @@ class _DurableParkedStopHarness(
 ):
   def __init__(self, durable_log: AgentSessionLog) -> None:
     super().__init__()
-    self._agent_session_log = durable_log
+    self._agent_session_log: AgentSessionLog | None = durable_log
     self.durable_log = durable_log
     self.termination_started = asyncio.Event()
     self.allow_termination = asyncio.Event()
@@ -1131,6 +1141,28 @@ def test_parked_stop_records_no_request_for_a_settled_task(
 
   _run(_case())
 
+def test_running_task_with_termination_in_flight_records_no_request(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    harness = _DurableParkedStopHarness(
+      AgentSessionLog(tmp_path / "running-cancel-flight.jsonl"),
+    )
+    entry = harness._task_registry.register("background_agent", task_id="running-1")
+    harness._task_registry.transition(entry.task_id, TaskState.RUNNING)
+    entry.termination_intent = "cancelled"
+    requests: list[str] = []
+
+    async def _persist_request() -> None:
+      requests.append(entry.task_id)
+
+    assert await harness.terminate_parked_background_task(
+      entry.task_id,
+      persist_request=_persist_request,
+    ) is False
+    assert requests == []
+
+  _run(_case())
 
 def _parked_stop_replay_events() -> list[dict[str, object]]:
   admitted = _canonical_admitted_task()
@@ -1265,6 +1297,7 @@ async def _kill_registry_owner(
         child,
         EventLog(),
         stalled=False,
+        approval_park=None,
         cancelled_error=exc,
         cancellation_signal="killed",
         runtime_exception_detail=None,
@@ -2542,6 +2575,73 @@ def test_completed_foreground_registry_keeps_live_background_descendant_on_roste
   assert [job.job_id for job in root.roster()] == ["root"]
 
 
+def test_a_parked_job_resumed_by_a_successor_is_no_longer_a_name_destination() -> None:
+  registry = TaskRegistry(owner=RegistryOwner(job_id="root", tenant=lambda: None))
+  source = registry.register("background_agent", agent_name="earnings-review")
+  registry.transition(source.task_id, TaskState.RUNNING)
+  registry.park(source.task_id, result={"kind": "parked"})
+  successor, _ = registry.claim_resume_successor(
+    "background_agent",
+    task_id=f"{source.task_id}_r1",
+    original_task_id=source.task_id,
+    agent_name="earnings-review",
+  )
+  registry.transition(successor.task_id, TaskState.RUNNING)
+  registry.transition(successor.task_id, TaskState.COMPLETED)
+
+  assert registry.find_on_roster("earnings-review") is None
+  assert registry.find_on_roster(source.task_id) is not None
+
+  assert registry.evict_completed(max_age_seconds=0) == 1
+  assert registry.get(successor.task_id) is None
+  assert registry.find_on_roster("earnings-review") is None
+
+  fresh = registry.register("background_agent", agent_name="earnings-review")
+  registry.transition(fresh.task_id, TaskState.RUNNING)
+  found = registry.find_on_roster("earnings-review")
+  assert found is not None and found.entry is fresh
+
+
+def test_a_replayed_parked_source_with_a_successor_is_no_longer_a_name_destination() -> None:
+  registry = TaskRegistry(owner=RegistryOwner(job_id="root", tenant=lambda: None))
+  registry.adopt_reconstructed(TaskEntry(
+    task_id="bg_source_r1",
+    task_type="background_agent",
+    agent_name="earnings-review",
+    state=TaskState.RUNNING,
+    original_task_id="bg_source",
+    reconstructed_from_log=True,
+  ))
+  registry.adopt_reconstructed(TaskEntry(
+    task_id="bg_source",
+    task_type="background_agent",
+    agent_name="earnings-review",
+    state=TaskState.PARKED,
+    reconstructed_from_log=True,
+  ))
+
+  found = registry.find_on_roster("earnings-review")
+  assert found is not None and found.job_id == "bg_source_r1"
+
+
+def test_a_discarded_uncommitted_successor_restores_its_source_as_a_name_destination() -> None:
+  registry = TaskRegistry(owner=RegistryOwner(job_id="root", tenant=lambda: None))
+  source = registry.register("background_agent", agent_name="earnings-review")
+  registry.transition(source.task_id, TaskState.RUNNING)
+  registry.park(source.task_id, result={"kind": "parked"})
+  successor, _ = registry.claim_resume_successor(
+    "background_agent",
+    task_id=f"{source.task_id}_r1",
+    original_task_id=source.task_id,
+    agent_name="earnings-review",
+  )
+
+  assert registry.find_on_roster("earnings-review") is None
+  assert registry.discard_unstarted(successor.task_id, expected=successor) is True
+  found = registry.find_on_roster("earnings-review")
+  assert found is not None and found.entry is source
+
+
 def test_retention_eviction_releases_killed_owner_with_unretrieved_result() -> None:
   async def _case() -> None:
     root = TaskRegistry(
@@ -2828,6 +2928,147 @@ def test_interrupted_is_terminal_for_send_kill_and_completion() -> None:
   assert registry.kill(entry.task_id) is False
 
 
+@pytest.mark.parametrize("state", [TaskState.PARKED, TaskState.IDLE])
+def test_parked_and_idle_are_open_transitionable_and_killable(
+  state: TaskState,
+) -> None:
+  registry = TaskRegistry()
+  entry = registry.register("background_agent", agent_name="analyst")
+  registry.transition(entry.task_id, TaskState.RUNNING)
+  registry.transition(entry.task_id, state)
+
+  assert state not in _TERMINAL_STATES
+  assert state not in _ADMISSION_SLOT_STATES
+  assert entry.completed is False
+  assert entry.completed_at is None
+  assert registry.admission_count == 0
+  named = registry.find_on_roster("analyst")
+  assert named is not None
+  assert named.entry is entry
+  assert registry.kill(entry.task_id) is True
+  assert entry.termination_intent == "killed"
+  assert registry.transition(entry.task_id, TaskState.KILLED).state is TaskState.KILLED
+  assert entry.completed is True
+
+
+def test_park_and_revive_move_one_job_between_running_and_parked() -> None:
+  registry = TaskRegistry()
+  listener = _RecordingListener()
+  registry.add_listener(listener)
+  entry = registry.register("background_agent")
+  registry.transition(entry.task_id, TaskState.RUNNING)
+  generation = entry.notification_generation
+
+  assert registry.park(entry.task_id, result={"kind": "parked"}) is entry
+  assert entry.state is TaskState.PARKED
+  assert entry.result == {"kind": "parked"}
+  assert entry.notification_generation == generation + 1
+  assert entry.completed_at is None
+  assert registry.revive_to_running(entry.task_id) is entry
+  assert entry.state is TaskState.RUNNING
+  assert listener.transitions[-2:] == [
+    (entry.task_id, TaskState.RUNNING, TaskState.PARKED),
+    (entry.task_id, TaskState.PARKED, TaskState.RUNNING),
+  ]
+
+
+def test_continue_task_admits_one_continue_request(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  calls: list[tuple[object, object, object]] = []
+  admitted = object()
+
+  def _admit(request: object, parent: object, *, owners: object) -> object:
+    calls.append((request, parent, owners))
+    return admitted
+
+  monkeypatch.setattr(task_registry_module, "admit", _admit)
+  parent = cast(ParentContext, object())
+  owners = cast(ContinuationOwners, object())
+
+  assert TaskRegistry().continue_task(
+    "bg_3",
+    "revive",
+    parent=parent,
+    owners=owners,
+    message="pick up the filing",
+  ) is admitted
+  assert calls == [(
+    ContinueRequest(job_id="bg_3", cause="revive", message="pick up the filing"),
+    parent,
+    owners,
+  )]
+
+
+@pytest.mark.parametrize("reason", ["turns_exhausted", "share_spent"])
+def test_resumable_exhaustion_settles_and_replays_parked(reason: str) -> None:
+  admitted = _canonical_admitted_task()
+  parked = terminal_task_result(admitted, status="interrupted", reason=reason)
+  interrupted = terminal_task_result(admitted, status="interrupted", reason="killed")
+
+  assert task_state_for_result(parked) is TaskState.PARKED
+  assert task_state_for_result(interrupted) is TaskState.INTERRUPTED
+  registry = TaskRegistry()
+  registry.load_from_events([
+    {
+      "type": "task_registered",
+      "event_schema_version": 2,
+      "task_id": "bg_7",
+      "task_type": "background_agent",
+      "started_at": 100.0,
+      "metadata": {"admitted_task": admitted.model_dump(mode="json")},
+    },
+    {
+      "type": "task_completed",
+      "task_id": "bg_7",
+      "final_state": "parked",
+      "completed_at": 125.0,
+      "result": parked.model_dump(mode="json"),
+      "error": None,
+    },
+  ])
+
+  entry = registry.get("bg_7")
+  assert entry is not None
+  assert entry.state is TaskState.PARKED
+  assert entry.error is None
+  assert entry.task_result == parked
+  assert entry.completed is False
+  assert entry.completion_persistence_state == "committed"
+
+
+def test_restore_committed_park_reopens_a_committed_job_park() -> None:
+  registry = TaskRegistry()
+  listener = _RecordingListener()
+  registry.add_listener(listener)
+  entry = registry.register("background_agent")
+  admitted = _canonical_admitted_task(entry.task_id)
+  parked = terminal_task_result(
+    admitted,
+    status="interrupted",
+    reason="turns_exhausted",
+  )
+  entry.admitted_task = admitted
+  entry.task_result = parked
+  registry.transition(entry.task_id, TaskState.RUNNING)
+  registry.transition(entry.task_id, TaskState.INTERRUPTED)
+  entry.completion_persistence_state = "committed"
+
+  restored = registry.restore_committed_park(
+    entry.task_id,
+    result=parked.model_dump(mode="json"),
+  )
+
+  assert restored is entry
+  assert entry.state is TaskState.PARKED
+  assert entry.completed_at is None
+  assert listener.transitions[-1] == (
+    entry.task_id,
+    TaskState.INTERRUPTED,
+    TaskState.PARKED,
+  )
+
+
 def test_task_entry_message_inbox_exists_at_creation() -> None:
   entry = TaskRegistry().register("background_agent")
 
@@ -2927,30 +3168,31 @@ def test_load_from_events_reconstructs_tasks_restores_seq_and_bypasses_listeners
   )
 
   completed = registry.get("bg_7")
-  interrupted = registry.get("bg_9")
+  parked = registry.get("bg_9")
   assert completed is not None
-  assert interrupted is not None
+  assert parked is not None
   assert completed.state == TaskState.COMPLETED
   assert completed.result == completed_result
   assert completed.completed_at == 125.0
   assert completed.metadata["custom"] == "value"
-  assert interrupted.state == TaskState.INTERRUPTED
-  assert interrupted.completed_at == 200.0
-  assert interrupted.task_type == "plan_run"
-  assert interrupted.reconstructed_from_log is True
-  assert interrupted.capability_bind_receipt == _bind_receipt(
+  assert parked.state == TaskState.PARKED
+  assert parked.completed is False
+  assert parked.completed_at == 200.0
+  assert parked.task_type == "plan_run"
+  assert parked.reconstructed_from_log is True
+  assert parked.capability_bind_receipt == _bind_receipt(
     provider="openai",
     model="gpt-5.2",
   )
-  assert interrupted.metadata["parent_messages"][0]["message_id"] == "msg-1"
-  assert interrupted.accepted_parent_messages["msg-1"] == ParentMessage(
+  assert parked.metadata["parent_messages"][0]["message_id"] == "msg-1"
+  assert parked.accepted_parent_messages["msg-1"] == ParentMessage(
     message_id="msg-1",
     text="status",
     sent_at=210.0,
     task_id="bg_9",
     sent_seq=4,
   )
-  assert interrupted.delivered_messages == {"msg-1"}
+  assert parked.delivered_messages == {"msg-1"}
   assert registry.register("background_agent").task_id == "bg_10"
   assert listener.transitions == []
 
@@ -3094,7 +3336,7 @@ def test_load_from_events_recovers_canonical_authority_independent_of_receipt(
 
   entry = registry.get("bg_7")
   assert entry is not None
-  assert entry.state is TaskState.INTERRUPTED
+  assert entry.state is TaskState.PARKED
   assert entry.error is None
   assert entry.reconstructed_from_log is True
   assert entry.registration_persistence_state == "committed"
@@ -3132,7 +3374,7 @@ def test_load_from_events_retains_noncanonical_registration_without_receipt() ->
 
   entry = registry.get("bg_7")
   assert entry is not None
-  assert entry.state is TaskState.INTERRUPTED
+  assert entry.state is TaskState.PARKED
   assert entry.admitted_task is None
   assert entry.capability_bind_receipt is None
   assert entry.metadata["custom"] == metadata["custom"]

@@ -16,6 +16,7 @@ from agent_workflow_contracts import (
   OutcomeRequirement,
   ProjectionInline,
   ResultRequirement,
+  TaskResult,
   TaskResultProvenance,
   ToolGrant,
   ToolGrantEntry,
@@ -33,12 +34,14 @@ from agent_gateway.runner_background_tasks import (
   build_agent_completion_envelope,
   ordinary_parent_result_policy,
 )
-from agent_gateway.sub_agent import _ordinary_admitted_task_factory
+from agent_gateway.sub_agent import ordinary_admitted_task_factory
 from agent_gateway.sub_agent_narrative_result import (
   final_child_visible_text,
   read_task_result_terminal_narrative,
   task_result_from_execution,
 )
+from agent_gateway.sub_agent_result_evidence import collect_sub_agent_result_evidence
+from agent_gateway.task_registry import TaskState, task_state_for_result
 
 
 class _NarrativeLog:
@@ -456,7 +459,11 @@ async def test_no_citation_context_child_yields_no_fabricated_citations(
   assert all(ref.kind != "citation" for ref in observed)
 
 
-def _admitted_task(*, tool_ids: tuple[str, ...] = ("filings_search",)):
+def _admitted_task(
+  *,
+  tool_ids: tuple[str, ...] = ("filings_search",),
+  resumable: bool = False,
+):
   """Build the real admission contract consumed by settlement."""
 
   logical, _, _ = _task_identity()
@@ -470,7 +477,7 @@ def _admitted_task(*, tool_ids: tuple[str, ...] = ("filings_search",)):
     digest=sha256_digest({"grant": list(tool_ids)}),
   )
   result_instructions = "Return one exact terminal narrative."
-  factory = _ordinary_admitted_task_factory(
+  factory = ordinary_admitted_task_factory(
     operation=AgentOperationSnapshot(
       operation=logical.operation,
       methodology=ContractRef(
@@ -490,6 +497,7 @@ def _admitted_task(*, tool_ids: tuple[str, ...] = ("filings_search",)):
       execution_class="test",
       workspace_scope="read_only",
       result_modes=("narrative",),
+      resumable=resumable,
     ),
     execution_snapshot=AgentExecutionSnapshot(
       system_prompt=f"2026-09-01\n{result_instructions}",
@@ -503,8 +511,8 @@ def _admitted_task(*, tool_ids: tuple[str, ...] = ("filings_search",)):
         for tool_id in tool_ids
       ),
       resume_mechanics=AgentResumeMechanics(
-        resumable=False,
-        max_chain_depth=0,
+        resumable=resumable,
+        max_chain_depth=1 if resumable else 0,
         transcript_strategy="durable_reconstruction",
         prompt_strategy="reuse_exact",
         tool_grant_strategy="reissue_exact",
@@ -602,26 +610,52 @@ async def test_forced_final_answer_settles_as_an_ordinary_completed_result(
   assert laddered.observation.usage.output_tokens == 20
 
 
+_SOFT_BUDGET_ABORT_EVENT = {
+  "type": "interrupted",
+  "reason": "soft_budget_abort",
+  "kind": "turns",
+  "observed": 7,
+  "threshold": 3,
+  "grace_turns": 2,
+}
+
+
 @pytest.mark.asyncio
-async def test_soft_budget_abort_settles_failed_with_its_terminal_reason(
+async def test_resumable_soft_budget_abort_settles_interrupted_turns_exhausted(
+  tmp_path,
+) -> None:
+  # A resumable operation's exhausted ladder is a park, not a failure: the
+  # registry reads ``turns_exhausted`` as PARKED.
+  logical, attempt, provenance = _task_identity()
+
+  result = task_result_from_execution(
+    (_STEER_EVENT, _FINAL_EVENT, _SOFT_BUDGET_ABORT_EVENT, _STREAM_COMPLETE_EVENT),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=await _narrative(tmp_path),
+    stalled=False,
+    admitted_task=_admitted_task(resumable=True),
+  )
+
+  assert result.execution.status == "interrupted"
+  assert result.execution.terminal_reason == "turns_exhausted"
+  assert result.execution.model_dump(mode="json")["next_call"] is None
+  assert task_state_for_result(result) == TaskState.PARKED
+  assert result.outcome is None
+  assert result.values.terminal_narrative is None
+  assert result.observation.usage.input_tokens == 40
+
+
+@pytest.mark.asyncio
+async def test_non_resumable_soft_budget_abort_settles_failed_with_its_terminal_reason(
   tmp_path,
 ) -> None:
   logical, attempt, provenance = _task_identity()
 
   result = task_result_from_execution(
-    (
-      _STEER_EVENT,
-      _FINAL_EVENT,
-      {
-        "type": "interrupted",
-        "reason": "soft_budget_abort",
-        "kind": "turns",
-        "observed": 7,
-        "threshold": 3,
-        "grace_turns": 2,
-      },
-      _STREAM_COMPLETE_EVENT,
-    ),
+    (_STEER_EVENT, _FINAL_EVENT, _SOFT_BUDGET_ABORT_EVENT, _STREAM_COMPLETE_EVENT),
     logical_task=logical,
     attempt=attempt,
     requirement=_narrative_requirement(),
@@ -633,6 +667,8 @@ async def test_soft_budget_abort_settles_failed_with_its_terminal_reason(
 
   assert result.execution.status == "failed"
   assert result.execution.terminal_reason == "soft_budget_abort"
+  assert result.execution.model_dump(mode="json")["next_call"] is None
+  assert task_state_for_result(result) == TaskState.FAILED
   assert result.outcome is None
   assert result.values.terminal_narrative is None
   assert result.observation.usage.input_tokens == 40
@@ -658,8 +694,98 @@ async def test_soft_budget_abort_beside_a_harder_signal_keeps_its_precedence(
   assert result.execution.status == "interrupted"
   assert result.execution.terminal_reason is not None
   assert result.execution.terminal_reason.startswith("stalled:")
+  assert result.execution.model_dump(mode="json")["next_call"] is None
   assert result.outcome is None
   assert result.values.terminal_narrative is None
+
+
+@pytest.mark.parametrize("reason", ("stalled", "soft_budget_abort"))
+@pytest.mark.parametrize("next_call", (
+  None,
+  {"tool_name": "resume_agent", "arguments": {"task_id": "child-1"}},
+))
+def test_terminal_settlement_copies_its_producers_next_call(reason, next_call) -> None:
+  logical, attempt, provenance = _task_identity()
+  event = (
+    {"type": "error", "error_sub_code": "stalled", "error": "No activity"}
+    if reason == "stalled"
+    else {"type": "interrupted", "reason": reason}
+  )
+  event["next_call"] = next_call
+  result = task_result_from_execution(
+    (event,),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=None,
+    stalled=reason == "stalled",
+    admitted_task=_admitted_task(),
+  )
+
+  assert result.execution.terminal_reason is not None
+  assert result.execution.terminal_reason.startswith(reason)
+  assert result.execution.model_dump(mode="json")["next_call"] == next_call
+
+
+
+def test_usage_turns_merge_prior_attempt_without_double_counting_stream_usage() -> None:
+  logical, attempt, provenance = _task_identity()
+  prior = collect_sub_agent_result_evidence(
+    ({"type": "turn_complete"}, {"type": "turn_complete"}),
+    durable=False,
+  )
+  result = task_result_from_execution(
+    (
+      {"type": "turn_complete", "usage": {"input_tokens": 10}},
+      {"type": "turn_complete", "usage": {"input_tokens": 20}},
+      {"type": "stream_complete", "usage": {"input_tokens": 30}},
+      {"type": "interrupted", "reason": "soft_budget_abort"},
+    ),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=None,
+    stalled=False,
+    prior_evidence=prior,
+    admitted_task=_admitted_task(),
+  )
+
+  assert result.observation.usage.turns == 4
+  assert result.observation.usage.input_tokens == 30
+
+
+def test_pre_measurement_persisted_task_result_loads_without_rewriting_identity() -> None:
+  logical, attempt, provenance = _task_identity()
+  result = task_result_from_execution(
+    ({"type": "interrupted", "reason": "soft_budget_abort"},),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=None,
+    stalled=False,
+    admitted_task=_admitted_task(),
+  )
+  persisted = result.model_dump(mode="json")
+  persisted["execution"].pop("next_call", None)
+  persisted["observation"]["usage"].pop("turns", None)
+  old_digest = sha256_digest({
+    key: value for key, value in persisted.items() if key != "task_result_id"
+  })
+  persisted["task_result_id"] = f"task-result:{old_digest}"
+
+  loaded = TaskResult.model_validate(persisted)
+
+  assert loaded.task_result_id == persisted["task_result_id"]
+  assert loaded.execution.next_call is None
+  assert loaded.observation.usage.turns == 0
+  # A record without the fields reserializes byte-identically.
+  reloaded = loaded.model_dump(mode="json")
+  assert "next_call" not in reloaded["execution"]
+  assert "turns" not in reloaded["observation"]["usage"]
+  assert reloaded == persisted
 
 
 @pytest.mark.asyncio

@@ -25,10 +25,12 @@ from agent_gateway.approval_route import ControlPlaneApprovalRoute
 from agent_workflow_contracts.models import AdmittedResearchBinding, AdmittedTenant
 from agent_gateway.autonomous_capability_handoff import AutonomousLaunchAdmissionRefused
 from agent_gateway.artifact_paths import user_data_dir
-from agent_gateway.autonomous_runner import AutonomousRegistry
+from agent_gateway.autonomous_runner import AutonomousAdmissionClosed, AutonomousRegistry
 from agent_gateway.session import AuthManager, GatewaySession
 from agent_gateway.role_validation import require_exact_role
+from agent_gateway.named_refusal import NamedRefusal
 
+from .runs_chat_helpers import _require_control_session
 from .runs_helpers import (
   AutonomousDispatchResponse,
   _autonomous_run_from_task,
@@ -969,8 +971,10 @@ class AgentRunScheduleStore:
         return None
       record.pop("running_claim_id", None)
       record.pop("running_claimed_at", None)
-      record["last_run_id"] = run_id
-      record["last_run_at"] = _iso_from_datetime(timestamp)
+      # A deferred admission never started a run; retain the last actual fire.
+      if status_text != "deferred":
+        record["last_run_id"] = run_id
+        record["last_run_at"] = _iso_from_datetime(timestamp)
       record["last_status"] = status_text
       if error:
         record["last_error"] = error
@@ -1167,6 +1171,31 @@ class AgentRunScheduleRunner:
       elif stored_role == "invite":
         dispatch_role = "invite"
       else:
+        if roster_role is None:
+          # No live roster entry: do not start. A stored invite already fired above.
+          warning = (
+            f"Stored schedule has no live roster entry for {user_id!r}; not started."
+          )
+          logger.warning("Schedule %s: %s", schedule_id, warning)
+          result = {
+            "schedule_id": schedule_id,
+            "status": "failed",
+            "error": warning,
+          }
+          try:
+            store.record_fire_result(
+              schedule_id,
+              run_id=None,
+              status_text="failed",
+              error=warning,
+              warning=warning,
+              fired_at=now,
+              claim_id=claim_id,
+              advance_next_run=advance_next_run,
+            )
+          except ScheduleStoreUnreadableError:
+            result["result_persisted"] = False
+          return result
         warning = (
           f"Stored dispatch_role 'owner' exceeds the owner's live role ({roster_role!r}); "
           "fired as invite."
@@ -1264,23 +1293,25 @@ class AgentRunScheduleRunner:
         schedule_name=str(record.get("name") or ""),
       )
     except Exception as exc:
+      restart_deferred = isinstance(exc, AutonomousAdmissionClosed)
+      status_text = "deferred" if restart_deferred else "failed"
       result = {
         "schedule_id": schedule_id,
-        "status": "failed",
+        "status": status_text,
         "error": exc.payload() if isinstance(exc, AutonomousLaunchAdmissionRefused) else str(exc),
       }
-      if isinstance(exc, AutonomousLaunchAdmissionRefused):
+      if isinstance(exc, (AutonomousLaunchAdmissionRefused, NamedRefusal)):
         result["error_status"] = exc.http_status
       try:
         store.record_fire_result(
           schedule_id,
           run_id=None,
-          status_text="failed",
+          status_text=status_text,
           error=str(exc),
           warning=warning,
           fired_at=now,
           claim_id=claim_id,
-          advance_next_run=advance_next_run,
+          advance_next_run=advance_next_run and not restart_deferred,
         )
       except ScheduleStoreUnreadableError:
         result["result_persisted"] = False
@@ -1503,9 +1534,10 @@ def build_schedules_router(
 
   def _can_access_operator_schedules(session: GatewaySession) -> bool:
     # Operator schedules are the deployment's host-wide launchd and jobs-mcp jobs,
-    # shared by every user rather than stored per user, so an invite principal
-    # must not see or change them; the 404 also hides that a name exists.
-    return require_exact_role(getattr(session, "role", None)) == "owner"
+    # shared by every user rather than stored per user. Only an owner control session
+    # can see or change them (§3.6); chat-kind and non-owner sessions receive 404 to
+    # hide that the schedule exists.
+    return getattr(session, "kind", None) == "control" and require_exact_role(getattr(session, "role", None)) == "owner"
 
   def _operator_schedule_not_found(name: str) -> HTTPException:
     return HTTPException(

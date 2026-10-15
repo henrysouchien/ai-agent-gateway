@@ -496,14 +496,24 @@ def test_run_now_uses_live_role_instead_of_persisted_dispatch_role(
   assert registry.starts[0]["role"] == "invite"
 
 
+
+def _live_role_none(user_id: str, user_email: str | None) -> str | None:
+  del user_id, user_email
+  return None
+
+
+def _live_role_invite(user_id: str, user_email: str | None) -> str | None:
+  del user_id, user_email
+  return "invite"
+
+
 def test_roleless_due_record_dispatches_as_invite_and_records_the_gap(
   tmp_path: Path,
 ) -> None:
-  """A stored schedule without a dispatch_role still runs, never as owner.
+  """A due record with no live roster entry does not start.
 
-  dispatch_role is unattested JSON in the user store, so a missing value takes
-  the session plane's unknown-principal role (invite) and the fire record names
-  the gap for the operator.
+  live_user_role None is a missing roster entry. The fire is recorded failed.
+  A stored invite still fires as invite; that path is the branch above this one.
   """
 
   path = _per_user_store_path(tmp_path)
@@ -511,6 +521,25 @@ def test_roleless_due_record_dispatches_as_invite_and_records_the_gap(
   del record["dispatch_role"]
   _write_payload(path, record)
   registry = _Registry(tmp_path)
+  registry.live_user_role = _live_role_none
+  store = schedules_module.AgentRunScheduleStore(path)
+  runner = _runner_for_store(store, registry)
+
+  results = asyncio.run(runner.fire_due(now=NOW))
+
+  assert [row["status"] for row in results] == ["failed"]
+  assert registry.starts == []
+  stored = store.get_for_owner("alice", "sched_alice")
+  assert stored is not None
+  assert stored["last_status"] == "failed"
+  assert "no live roster entry" in stored["last_fire_warning"]
+
+
+def test_stored_owner_with_live_invite_starts_as_invite(tmp_path: Path) -> None:
+  path = _per_user_store_path(tmp_path)
+  _write_payload(path, _record())
+  registry = _Registry(tmp_path)
+  registry.live_user_role = _live_role_invite
   store = schedules_module.AgentRunScheduleStore(path)
   runner = _runner_for_store(store, registry)
 
@@ -520,8 +549,23 @@ def test_roleless_due_record_dispatches_as_invite_and_records_the_gap(
   assert [start["role"] for start in registry.starts] == ["invite"]
   stored = store.get_for_owner("alice", "sched_alice")
   assert stored is not None
-  assert stored["last_status"] == "started"
-  assert "no valid dispatch_role" in stored["last_fire_warning"]
+  assert "exceeds the owner's live role" in stored["last_fire_warning"]
+
+
+def test_stored_invite_starts_as_invite(tmp_path: Path) -> None:
+  path = _per_user_store_path(tmp_path)
+  record = _record()
+  record["dispatch_role"] = "invite"
+  _write_payload(path, record)
+  registry = _Registry(tmp_path)
+  registry.live_user_role = _live_role_none
+  store = schedules_module.AgentRunScheduleStore(path)
+  runner = _runner_for_store(store, registry)
+
+  results = asyncio.run(runner.fire_due(now=NOW))
+
+  assert [row["status"] for row in results] == ["started"]
+  assert [start["role"] for start in registry.starts] == ["invite"]
 
 
 @pytest.mark.parametrize(

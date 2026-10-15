@@ -37,6 +37,32 @@ from gateway_test_support.capability_execution_test_support import (
 )
 
 
+def test_normalize_messages_missing_tool_result_carries_native_error() -> None:
+  provider = OpenAIProvider()
+  model_info = provider.get_model_info("gpt-5.6")
+  messages = [
+    {
+      "role": "assistant",
+      "content": [
+        {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {}},
+      ],
+    },
+    {"role": "assistant", "content": [{"type": "text", "text": "continuing"}]},
+  ]
+
+  normalized = provider.normalize_messages(messages, model_info)
+  result = normalized[1]["content"][0]
+  assert result["is_error"] is True
+  assert result["tool_name"] == "lookup"
+  assert json.loads(result["content"]) == {
+    "error": {
+      "code": "missing_tool_result",
+      "message": "No result provided",
+      "data": {"next_call": None},
+    },
+  }
+
+
 class _EventStream:
   def __init__(self, events: list[Any]):
     self.events = events
@@ -797,6 +823,28 @@ def test_single_part_reasoning_summary_has_no_trailing_separator() -> None:
   durable_thinking = next(event.thinking_text for event in events if event.type == "thinking_end")
   assert client_thinking == durable_thinking == "only"
 
+
+
+def test_reasoning_summary_survives_signature_encode_failure() -> None:
+  # When encrypted_content is missing or signature encoding fails, thinking_end
+  # survives with its summary text kept and signature marked absent.
+  state = _ResponsesStreamState()
+  events = map_event(
+    {
+      "type": "response.output_item.done",
+      "item": {
+        "type": "reasoning",
+        "id": "",
+        "summary": [{"type": "summary_text", "text": "preserved summary without cipher"}],
+      },
+    },
+    state,
+  )
+  thinking_ends = [event for event in events if event.type == "thinking_end"]
+  assert len(thinking_ends) == 1
+  assert thinking_ends[0].thinking_text == "preserved summary without cipher"
+  assert thinking_ends[0].signature == ""
+  assert "signature" not in thinking_ends[0].raw_block
 
 def test_private_durable_replay_storage_and_marker(tmp_path: Path) -> None:
   path = tmp_path / "sessions" / "run.jsonl"

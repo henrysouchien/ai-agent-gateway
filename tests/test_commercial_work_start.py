@@ -19,24 +19,30 @@ from model_authority.binding import CredentialHandle
 from agent_gateway.auth import AuthConfig, ResolverResult
 from model_authority.capabilities import CAPABILITY_IDS
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
-from agent_gateway.commercial_claims import (
+from hank_contracts.commercial_claims import (
   CommercialClaimError,
-  CommercialClaimVerifier,
   VerifiedCommercialClaim,
 )
-from agent_gateway.commercial_work_authorization import (
+from agent_gateway.commercial_claims import (
+  CommercialClaimVerifier,
+)
+from hank_contracts.commercial_work import (
   VerifiedWorkAuthorization,
   WorkAuthorizationError,
+)
+from agent_gateway.commercial_work_authorization import (
   WorkAuthorizationVerifier,
 )
-from agent_gateway.commercial_work_start import (
+from hank_contracts.commercial_work import (
   COMMERCIAL_CLAIM_HEADER,
   COMMERCIAL_WORK_AUTHORIZATION_HEADER,
-  CommercialWorkStartError,
   CommercialWorkStartFacts,
-  CommercialWorkStartGate,
   CommercialWorkStartContext,
-  require_commercial_child_provider,
+)
+from agent_gateway.commercial_work_start import (
+  CommercialWorkStartError,
+  CommercialWorkStartGate,
+  require_commercial_child_account,
 )
 from agent_gateway.server import (
   ChatRuntime,
@@ -251,9 +257,9 @@ class _AuthorizationVerifier(WorkAuthorizationVerifier):
     request_id: str,
     session_id: str,
     operation: str,
-    provider: str,
     billing_mode: str,
     capability_id: str | None,
+    credential_principal: str,
   ) -> VerifiedWorkAuthorization:
     self.order.append("verify_authorization")
     assert token in {WORK_TOKEN, WORK_TOKEN_2}
@@ -264,9 +270,9 @@ class _AuthorizationVerifier(WorkAuthorizationVerifier):
       "request_id": request_id,
       "session_id": session_id,
       "operation": operation,
-      "provider": provider,
       "billing_mode": billing_mode,
       "capability_id": capability_id,
+      "credential_principal": credential_principal,
     }
     self.calls.append(facts)
     return replace(
@@ -312,9 +318,9 @@ def _gate(order: list[str], *, pre_consume=None):
     assert channel == "mcp"
     return CommercialWorkStartFacts(
       operation="messages.create",
-      provider="anthropic",
       billing_mode="metered",
       capability_id="portfolio.review",
+      credential_principal="service",
     )
 
   gate = CommercialWorkStartGate(
@@ -328,8 +334,8 @@ def _gate(order: list[str], *, pre_consume=None):
   return gate, claim_verifier, authorization_verifier, store
 
 
-def _require_raw_child_provider(work_start, provider):
-  return require_commercial_child_provider(work_start, provider)
+def _require_raw_child_account(work_start, credential_principal="service"):
+  return require_commercial_child_account(work_start, credential_principal)
 
 
 
@@ -401,9 +407,9 @@ def test_gate_claim_precedes_bound_facts_and_consumes_without_retaining_tokens()
     "request_id": "request-1",
     "session_id": "session-1",
     "operation": "messages.create",
-    "provider": "anthropic",
     "billing_mode": "metered",
     "capability_id": "portfolio.review",
+    "credential_principal": "service",
   }]
   assert order.index("verify_claim") < order.index("resolve_facts")
   assert order.index("resolve_facts") < order.index("verify_authorization")
@@ -480,23 +486,44 @@ def test_gate_runs_durability_preflight_before_consuming_authority() -> None:
   assert "consume" not in order
 
 
-def test_child_provider_must_match_verified_root_authority() -> None:
+def test_child_on_another_provider_same_principal_is_allowed() -> None:
   work_start = CommercialWorkStartContext(
     claim=_verified_claim(),
-    authorization=_verified_authorization(),
+    authorization=replace(
+      _verified_authorization(),
+      schema_version=3,
+      credential_principal="service",
+      reserved_spend_microusd=1_000_000,
+      provider="anthropic",
+    ),
     consumption=_consumption_record(),
   )
 
-  require_commercial_child_provider(work_start, "anthropic")
-  with pytest.raises(CommercialWorkStartError) as mismatch:
-    require_commercial_child_provider(work_start, "openai")
-  assert mismatch.value.code == "commercial_child_provider_mismatch"
-  assert mismatch.value.status_code == 403
+  # Provider is not an input: a child on another provider, same principal, runs.
+  require_commercial_child_account(work_start, "service")
 
   with pytest.raises(CommercialWorkStartError) as invalid:
-    _require_raw_child_provider(SimpleNamespace(), "anthropic")
+    _require_raw_child_account(SimpleNamespace())
   assert invalid.value.code == "commercial_child_authority_invalid"
   assert invalid.value.status_code == 503
+
+
+def test_child_under_another_principal_is_refused() -> None:
+  work_start = CommercialWorkStartContext(
+    claim=_verified_claim(),
+    authorization=replace(
+      _verified_authorization(),
+      schema_version=3,
+      credential_principal="service",
+      reserved_spend_microusd=1_000_000,
+    ),
+    consumption=_consumption_record(),
+  )
+
+  with pytest.raises(CommercialWorkStartError) as mismatch:
+    require_commercial_child_account(work_start, "user")
+  assert mismatch.value.code == "commercial_child_credential_principal_mismatch"
+  assert mismatch.value.status_code == 403
 
 
 def test_gate_maps_invalid_replay_conflict_and_storage_failure_to_no_start() -> None:
@@ -599,9 +626,9 @@ def _server_app(tmp_path: Path, *, provider_delay: float = 0):
     assert channel == "mcp"
     return CommercialWorkStartFacts(
       operation="messages.create",
-      provider="anthropic",
       billing_mode="metered",
       capability_id="portfolio.review",
+      credential_principal="service",
     )
 
   gate._facts_resolver = facts_resolver

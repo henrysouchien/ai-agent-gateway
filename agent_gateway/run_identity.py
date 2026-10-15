@@ -2,23 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Any, Mapping
 
 
-RUN_IDENTITY_MCP_ENV = "AGENT_SKILL_RUN_ID"
-RUN_IDENTITY_MCP_TOOLS_ENV = "AGENT_SKILL_RUN_ID_TOOLS"
-
-# The value of RUN_IDENTITY_MCP_TOOLS_ENV. Risk's MCP carrier
-# (utils/gateway_context.py:resolve_skill_run_id_for_mcp_call) refuses a
-# lifecycle call whose name this list omits, or a list naming a tool outside
-# its own copy, so the wire value is this exact pair until Risk reads the list
-# without a mirror (risk queue gateway-run-identity-tool-sets-are-local-mirrors).
-# Nothing in the gateway keys a refusal on it.
-MODEL_RUN_IDENTITY_MCP_TOOLS = frozenset({
-  "build_model",
-  "prepare_model_build",
-})
-MODEL_RUN_IDENTITY_LOCAL_TOOLS = frozenset({"fms_report_build_model"})
 RUN_IDENTITY_MAX_LENGTH = 128
 _RUN_IDENTITY_PATTERN = re.compile(
   rf"^[A-Za-z0-9][A-Za-z0-9._:-]{{0,{RUN_IDENTITY_MAX_LENGTH - 1}}}$"
@@ -62,73 +47,10 @@ class RunIdentityCarrier:
       return None
     return cls(value)
 
-  def mcp_environment(self) -> dict[str, str]:
-    return {
-      RUN_IDENTITY_MCP_ENV: self.run_id,
-      RUN_IDENTITY_MCP_TOOLS_ENV: ",".join(
-        sorted(MODEL_RUN_IDENTITY_MCP_TOOLS)
-      ),
-    }
-
-
-def inject_run_identity_into_mcp_server_configs(
-  configs: Mapping[str, Any],
-  *,
-  server_names: set[str] | frozenset[str],
-  carrier: RunIdentityCarrier | None,
-) -> dict[str, Any]:
-  """Copy SDK MCP configs and bind the run carrier to selected stdio servers."""
-
-  copied = dict(configs)
-  if carrier is None:
-    return copied
-  carrier_env = carrier.mcp_environment()
-  for server_name in sorted(set(server_names) & set(copied)):
-    raw_config = copied[server_name]
-    if not isinstance(raw_config, Mapping):
-      raise RunIdentityCarrierError(
-        "run_identity_transport_invalid",
-        f"MCP server {server_name!r} cannot carry run identity"
-      )
-    config = dict(raw_config)
-    if not str(config.get("command") or "").strip():
-      raise RunIdentityCarrierError(
-        "run_identity_transport_invalid",
-        f"MCP server {server_name!r} requires a run-scoped stdio carrier"
-      )
-    raw_env = config.get("env")
-    if raw_env is not None and not isinstance(raw_env, Mapping):
-      raise RunIdentityCarrierError(
-        "run_identity_transport_invalid",
-        f"MCP server {server_name!r} has invalid environment config"
-      )
-    env = {
-      str(key): str(value)
-      for key, value in dict(raw_env or {}).items()
-    }
-    # The server-owned run id decides which run directory the MCP child
-    # writes; config that overrides it would let one run write as another.
-    for key, expected in carrier_env.items():
-      existing = env.get(key)
-      if existing is not None and existing != expected:
-        raise RunIdentityCarrierError(
-          "run_identity_mismatch",
-          f"MCP server {server_name!r} attempted to override {key}"
-        )
-      env[key] = expected
-    config["env"] = env
-    copied[server_name] = config
-  return copied
-
 
 __all__ = [
-  "MODEL_RUN_IDENTITY_LOCAL_TOOLS",
-  "MODEL_RUN_IDENTITY_MCP_TOOLS",
-  "RUN_IDENTITY_MCP_ENV",
   "RUN_IDENTITY_MAX_LENGTH",
-  "RUN_IDENTITY_MCP_TOOLS_ENV",
   "RunIdentityCarrier",
   "RunIdentityCarrierError",
-  "inject_run_identity_into_mcp_server_configs",
   "validate_run_identity",
 ]

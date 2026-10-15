@@ -25,19 +25,35 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import SessionStore, ToolDispatcher
-from agent_gateway.code_execution import CodeExecutionConfig, build_code_execution, cleanup_code_execution
+from agent_gateway import AgentRunner, SessionStore, ToolDispatcher
+from agent_gateway.approval_policy import RunContext
+from agent_gateway.code_execution import (
+  CodeExecutionConfig,
+  SubprocessBackend,
+  build_code_execution,
+  cleanup_code_execution,
+)
 from agent_gateway.code_execution._frame_codec import decode_frame
 from agent_gateway.event_log import EventLog
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.policy_imports import configure_server_policy, load_server_policy_module
+from agent_gateway.session import SessionStream
+from agent_gateway.task_registry import TaskEntry, TaskState
 from agent_gateway.tool_dispatcher_helpers import ToolResult
 from agent_gateway.tool_policy_registry import PreparedToolCall
+from gateway_test_support.capability_execution_test_support import stub_runner_capability_execution
+from agent_gateway import tool_dispatch_declarations
+from agent_gateway.tool_dispatch_declarations import ToolDispatchSemantics
+from agent_workflow_contracts.tool_registration import (
+  RegisteredToolIdentity,
+  VersionedPolicyRef,
+)
 
 GET_FILINGS = "mcp__edgar-parser-mcp__get_filings"
 FRED_SERIES = "mcp__fred-mcp__fred_get_series"
 REFRESH_FILINGS = "mcp__edgar-parser-mcp__refresh_filings"
 SEARCH_FILINGS = "mcp__edgar-parser-mcp__search_filings"
+EXECUTE_TRADE = "mcp__portfolio-trades-mcp__execute_trade"
 OUTER_ID = "toolu_outer_1"
 # The code-callable decision the product binds, keyed by exact route here.
 # `search_filings` is registered and routable but never in the grant.
@@ -49,6 +65,7 @@ _SERVERS = {
   FRED_SERIES: "fred-mcp",
   REFRESH_FILINGS: "edgar-parser-mcp",
   SEARCH_FILINGS: "edgar-parser-mcp",
+  EXECUTE_TRADE: "portfolio-trades-mcp",
 }
 # Ledger telemetry only: the reader's decision never reads a class.
 _POLICY_CLASSES = {
@@ -56,6 +73,22 @@ _POLICY_CLASSES = {
   ("fred-mcp", "fred_get_series"): "read",
   ("edgar-parser-mcp", "refresh_filings"): "state_write",
   ("edgar-parser-mcp", "search_filings"): "read",
+}
+# The registration owner's dispatch semantics for the producer route this module
+# settles (GP54): the reader settles `sources` only from a declared source identity.
+_DISPATCH_SEMANTICS = {
+  RegisteredToolIdentity(
+    route_kind="mcp", logical_server_id="edgar-parser-mcp", logical_name="get_filings",
+  ): ToolDispatchSemantics(
+    idempotent=True,
+    outcome_policy=VersionedPolicyRef(
+      kind="outcome", policy_id="current-declared-status-equals", version="v1",
+      parameters={"field": "status", "values": ("success",)},
+    ),
+    source_identity_policy=VersionedPolicyRef(
+      kind="source_identity", policy_id="parser_filings", version="v1", parameters={},
+    ),
+  ),
 }
 _FILINGS_RESULT = {
   "status": "success",
@@ -89,7 +122,10 @@ def _raising_extractor(operation: str, result: Any) -> list[dict[str, Any]]:
 
 
 @pytest.fixture(autouse=True)
-def _policy() -> Any:
+def _policy(monkeypatch: pytest.MonkeyPatch) -> Any:
+  # The declaration table is cached process-wide on first use; build it from
+  # this module's policy and drop it at teardown so it never leaks.
+  monkeypatch.setattr(tool_dispatch_declarations, "_CACHED_DECLARATIONS", None)
   previous = load_server_policy_module()
   configure_server_policy(types.SimpleNamespace(
     get_forbidden_tools_for_session=lambda *_args, **_kwargs: frozenset(),
@@ -101,6 +137,7 @@ def _policy() -> Any:
     }.get(name),
     get_tool_class=lambda server, tool: _POLICY_CLASSES.get((server, tool)),
     get_local_tool_effect=lambda _name: None,
+    get_dispatch_semantics_overrides=lambda: _DISPATCH_SEMANTICS,
   ))
   yield
   configure_server_policy(previous)
@@ -146,6 +183,8 @@ class _CaptureMcp(McpClientManager):
       return None, {"code": "not_found", "message": "no such company"}
     if name == GET_FILINGS:
       return dict(_FILINGS_RESULT), None
+    if name == REFRESH_FILINGS:
+      return {"refreshed": True}, None
     return dict(_FRED_RESULT), None
 
 
@@ -160,6 +199,7 @@ def _tool_definitions(bundle: Any) -> list[dict[str, Any]]:
       "input_schema": {"type": "object", "properties": {"series_id": {"type": "string"}}, "required": ["series_id"]},
     },
     {"name": REFRESH_FILINGS, "description": "Refresh cached filings.", "input_schema": object_schema},
+    {"name": EXECUTE_TRADE, "description": "Execute a portfolio trade.", "input_schema": object_schema},
     {"name": "file_read", "description": "Read a file.", "input_schema": object_schema},
   ]
 
@@ -168,7 +208,14 @@ async def _file_read(tool_input: dict[str, Any], **_kwargs: Any) -> ToolResult:
   return {"text": "local"}, None
 
 
-def _bind(bundle: Any, mcp: _CaptureMcp, *, extract_sources: Any = None) -> ToolDispatcher:
+def _bind(
+  bundle: Any,
+  mcp: _CaptureMcp,
+  *,
+  extract_sources: Any = None,
+  code_callable: Any = None,
+  run_context: RunContext | None = None,
+) -> ToolDispatcher:
   """One request's dispatcher over `bundle`, bound as the product's builder binds it."""
   definitions = _tool_definitions(bundle)
   dispatcher = ToolDispatcher(
@@ -180,25 +227,89 @@ def _bind(bundle: Any, mcp: _CaptureMcp, *, extract_sources: Any = None) -> Tool
     event_log=EventLog(),
     approval_key_qualifier=bundle.approval_qualifier,
     get_tool_definitions=lambda: definitions,
+    run_context=run_context,
   )
   bundle.bind_dispatcher(
     dispatcher,
     tool_definitions=dispatcher.get_tool_definitions,
     extract_sources=extract_sources,
-    code_callable=_CODE_CALLABLE,
+    code_callable=code_callable if code_callable is not None else _CODE_CALLABLE,
   )
   return dispatcher
+
+
+class _StubProvider:
+  name = "stub"
+
+
+def _job_runner() -> AgentRunner:
+  """The runner whose task registry owns the session's background cells."""
+  event_log = EventLog()
+  return AgentRunner(
+    event_log=event_log,
+    dispatcher=ToolDispatcher(
+      capability_bind=TEST_CAPABILITY_BIND,
+      mcp_client=_CaptureMcp(),
+      local_tool_handlers={},
+      event_log=event_log,
+      session_id="sess-code-bridge",
+    ),
+    session_id="sess-code-bridge",
+    capability_execution=stub_runner_capability_execution(
+      provider=_StubProvider(),
+      model="stub-model",
+      effort="none",
+    ),
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
 
 
 def _setup(
   *,
   delay_s: float = 0.0,
   extract_sources: Any = None,
+  code_callable: Any = None,
 ) -> tuple[Any, Any, _CaptureMcp, ToolDispatcher]:
+  """A session on a live turn whose runner owns background cells as `code` jobs."""
   session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-  bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
+  runner = _job_runner()
+  session.active_turn = SessionStream(event_log=EventLog(), runner_task=None, runtime_owner=runner)
+  bundle = build_code_execution(
+    session,
+    config=CodeExecutionConfig(register_docker=False),
+    job_runner=lambda: runner,
+  )
   mcp = _CaptureMcp(delay_s=delay_s, frame_reader=bundle.frame_reader)
-  return session, bundle, mcp, _bind(bundle, mcp, extract_sources=extract_sources)
+  return session, bundle, mcp, _bind(bundle, mcp, extract_sources=extract_sources, code_callable=code_callable)
+
+
+def _code_job(session: Any, task_id: str) -> TaskEntry:
+  entry = session.active_turn.runtime_owner._task_registry.get(task_id)
+  assert entry is not None and entry.task_type == "code"
+  return entry
+
+
+def _record_started_handles(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+  handles: list[Any] = []
+  start_bridged = SubprocessBackend.start_bridged
+
+  async def _recording_start_bridged(self: Any, *args: Any, **kwargs: Any) -> Any:
+    handle = await start_bridged(self, *args, **kwargs)
+    handles.append(handle)
+    return handle
+
+  monkeypatch.setattr(SubprocessBackend, "start_bridged", _recording_start_bridged)
+  return handles
+
+
+async def _until(predicate: Any) -> None:
+  for _ in range(400):
+    if predicate():
+      return
+    await asyncio.sleep(0.01)
+  raise AssertionError("condition not reached")
 
 
 def _record_open_cells(bundle: Any) -> list[tuple[Any, dict[int, os.stat_result]]]:
@@ -216,15 +327,12 @@ def _record_open_cells(bundle: Any) -> list[tuple[Any, dict[int, os.stat_result]
   return opened
 
 
-async def _collect_background(dispatcher: ToolDispatcher, task_id: str) -> Any:
-  result: Any = None
-  for _ in range(200):
-    result, error = await dispatcher.dispatch("toolu_status", "code_execute_status", {"task_id": task_id})
-    assert error is None, error
-    if result.get("status") != "running":
-      break
-    await asyncio.sleep(0.05)
-  return result
+async def _collect_background(session: Any, task_id: str) -> Any:
+  """Await the `code` job and read it through the registry's result payload."""
+  entry = _code_job(session, task_id)
+  assert entry.asyncio_task is not None
+  await entry.asyncio_task
+  return session.active_turn.runtime_owner._background_task_payload(entry)
 
 
 async def _run_cell(dispatcher: ToolDispatcher, code: str, **extra: Any) -> tuple[Any, Any]:
@@ -233,6 +341,63 @@ async def _run_cell(dispatcher: ToolDispatcher, code: str, **extra: Any) -> tupl
     "code_execute",
     {"code": textwrap.dedent(code), "host": "subprocess", **extra},
   )
+
+
+@pytest.mark.parametrize("background", [False, True])
+@pytest.mark.parametrize("skill_run_id", ["run-enclosing", "run-foreign"])
+def test_nested_dispatch_inherits_enclosing_execution_context(
+  monkeypatch: pytest.MonkeyPatch, background: bool, skill_run_id: str,
+) -> None:
+  async def _run() -> None:
+    contexts: list[Any] = []
+
+    async def capture_context(tool_input: dict[str, Any], **kwargs: Any) -> ToolResult:
+      contexts.append(kwargs["tool_ctx"])
+      return {"text": "captured"}, None
+
+    monkeypatch.setattr(sys.modules[__name__], "_file_read", capture_context)
+    session, bundle, mcp, _dispatcher = _setup()
+    dispatcher = _bind(
+      bundle, mcp, code_callable=lambda operation: operation == "file_read",
+      run_context=RunContext(
+        user_id="alice", request_id="request-enclosing", run_id="run-enclosing",
+      ),
+    )
+    dispatch_context = {
+      "skill_run_id": skill_run_id,
+      "step_id": "step-enclosing",
+      "workspace_dir": session.code_execution_work_dir,
+      "batch_id": "batch-enclosing",
+    }
+    try:
+      direct, error = await dispatcher.dispatch("direct", "file_read", {}, **dispatch_context)
+      assert error is None and direct == {"text": "captured"}
+      result, error = await dispatcher.dispatch(
+        OUTER_ID, "code_execute",
+        {
+          "code": 'print(hank.call("file_read"))',
+          "host": "subprocess",
+          "background": background,
+        },
+        **dispatch_context,
+      )
+      assert error is None
+      assert result is not None
+      if background:
+        await _collect_background(session, result["task_id"])
+      assert len(contexts) == 2, result
+      direct_ctx, nested_ctx = contexts
+      # step_id is not part of the dispatch_prepared contract (runner_tool_execution.py).
+      for field in ("skill_run_id", "workspace_dir", "batch_id", "run_id", "request_id", "user_id"):
+        assert getattr(nested_ctx, field) == getattr(direct_ctx, field), field
+      assert nested_ctx.skill_run_id == skill_run_id
+      assert nested_ctx.run_id == "run-enclosing"
+      assert (nested_ctx.skill_run_id == nested_ctx.run_id) is (skill_run_id == "run-enclosing")
+      assert nested_ctx.tool_call_id != direct_ctx.tool_call_id
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(_run())
 
 
 def _fd_closed(fd: int, original: os.stat_result) -> bool:
@@ -394,7 +559,7 @@ def test_exited_cell_with_in_group_output_holder_is_not_timed_out(tmp_path: Path
       # when released, leaving its in-group descendant holding both pipes.
       release_path.touch()
       result = await asyncio.wait_for(
-        _collect_background(dispatcher, started["task_id"]), timeout=7,
+        _collect_background(session, started["task_id"]), timeout=7,
       )
       assert result["return_code"] == 0
       assert result["timed_out"] is False
@@ -663,7 +828,7 @@ def test_background_cell_reports_its_nested_calls_on_collection() -> None:
       )
       assert error is None, error
       task_id = started["task_id"]
-      result = await _collect_background(dispatcher, task_id)
+      result = await _collect_background(session, task_id)
       assert result["stdout"] == "CPIAUCSL\n", result
       assert mcp.calls == [(FRED_SERIES, {"series_id": "CPIAUCSL"})]
       assert [(entry["nested_call_id"], entry["ok"]) for entry in result["nested_calls"]] == [(f"{OUTER_ID}.1", True)]
@@ -674,8 +839,8 @@ def test_background_cell_reports_its_nested_calls_on_collection() -> None:
   asyncio.run(_run())
 
 
-def test_background_cell_collected_through_a_later_request_bundle_keeps_its_bridge() -> None:
-  """The product builds a bundle per request; the cell's channel lives on the session's task."""
+def test_background_cell_is_a_code_job_whose_result_carries_its_bridge() -> None:
+  """The product builds a bundle per request; the cell's channel lives on its `code` job."""
 
   async def _run() -> None:
     session, bundle, mcp, dispatcher = _setup(extract_sources=_filings_extractor)
@@ -691,13 +856,18 @@ def test_background_cell_collected_through_a_later_request_bundle_keeps_its_brid
       )
       assert error is None, error
       task_id = started["task_id"]
-      later_bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
-      later_dispatcher = _bind(later_bundle, mcp, extract_sources=_filings_extractor)
-      result = await _collect_background(later_dispatcher, task_id)
+      later_bundle = build_code_execution(
+        session,
+        config=CodeExecutionConfig(register_docker=False),
+        job_runner=lambda: session.active_turn.runtime_owner,
+      )
+      _bind(later_bundle, mcp, extract_sources=_filings_extractor)
+      result = await _collect_background(session, task_id)
+      assert _code_job(session, task_id).state == TaskState.COMPLETED
+      assert result["status"] == "completed"
       assert result["stdout"] == "10-K\n", result
       assert [(entry["nested_call_id"], entry["ok"]) for entry in result["nested_calls"]] == [(f"{OUTER_ID}.1", True)]
       assert result["sources"] == [{**handle, "produced_by_tool": "get_filings"} for handle in _FILING_HANDLES]
-      assert task_id not in session.background_tasks
       [(cell, original_fds)] = opened
       assert all(_fd_closed(fd, original) for fd, original in original_fds.items())
       assert bundle.frame_reader.active_cells() == ()
@@ -707,8 +877,48 @@ def test_background_cell_collected_through_a_later_request_bundle_keeps_its_brid
   asyncio.run(_run())
 
 
-def test_session_cleanup_closes_a_running_background_cell() -> None:
+def test_registry_kill_cancels_a_running_background_cell_and_closes_it(monkeypatch: pytest.MonkeyPatch) -> None:
   async def _run() -> None:
+    handles = _record_started_handles(monkeypatch)
+    session, bundle, mcp, dispatcher = _setup(delay_s=30.0)
+    opened = _record_open_cells(bundle)
+    try:
+      started, error = await _run_cell(
+        dispatcher,
+        f"""
+        hank.call({FRED_SERIES!r}, series_id="CPIAUCSL")
+        """,
+        background=True,
+      )
+      assert error is None, error
+      assert started["status"] == "running"
+      entry = _code_job(session, started["task_id"])
+      await _until(lambda: bool(mcp.calls))
+      assert mcp.calls == [(FRED_SERIES, {"series_id": "CPIAUCSL"})]
+      [(cell, original_fds)] = opened
+      assert bundle.frame_reader.active_cells() == (OUTER_ID,)
+
+      assert session.active_turn.runtime_owner.cancel_background_task(entry.task_id) is True
+      assert entry.asyncio_task is not None
+      await asyncio.wait_for(entry.asyncio_task, timeout=7)
+
+      assert entry.state == TaskState.KILLED
+      assert bundle.frame_reader.active_cells() == ()
+      assert bundle.frame_reader._cells == {}
+      assert mcp.cancelled is True
+      [handle] = handles
+      assert handle._backend_data["process"].returncode is not None
+      assert handle._backend_data["reader_task"].done()
+      assert all(_fd_closed(fd, original) for fd, original in original_fds.items())
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(_run())
+
+
+def test_session_cleanup_closes_a_running_background_cell(monkeypatch: pytest.MonkeyPatch) -> None:
+  async def _run() -> None:
+    handles = _record_started_handles(monkeypatch)
     session, bundle, mcp, dispatcher = _setup(delay_s=30.0)
     opened = _record_open_cells(bundle)
     started, error = await _run_cell(
@@ -720,29 +930,31 @@ def test_session_cleanup_closes_a_running_background_cell() -> None:
     )
     assert error is None, error
     assert started["status"] == "running"
-    background_task = session.background_tasks[started["task_id"]]
-    for _ in range(200):
-      if mcp.calls:
-        break
-      await asyncio.sleep(0.05)
+    entry = _code_job(session, started["task_id"])
+    await _until(lambda: bool(mcp.calls))
     assert mcp.calls == [(FRED_SERIES, {"series_id": "CPIAUCSL"})]
     [(cell, original_fds)] = opened
     assert bundle.frame_reader.active_cells() == (OUTER_ID,)
 
     await cleanup_code_execution(session)
 
-    assert session.background_tasks == {}
+    assert entry.state == TaskState.KILLED
     assert bundle.frame_reader.active_cells() == ()
     assert mcp.cancelled is True
-    assert background_task.handle._backend_data["reader_task"].done()
+    [handle] = handles
+    assert handle._backend_data["reader_task"].done()
     assert all(_fd_closed(fd, original) for fd, original in original_fds.items())
 
   asyncio.run(_run())
 
 
 @pytest.mark.parametrize("termination", ["cleanup", "timeout"])
-def test_background_teardown_does_not_wait_for_detached_descendant_output(termination: str) -> None:
+def test_background_teardown_does_not_wait_for_detached_descendant_output(
+  termination: str,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
   async def _run() -> None:
+    handles = _record_started_handles(monkeypatch)
     session, bundle, mcp, dispatcher = _setup(delay_s=30.0)
     descendant_pid = None
     try:
@@ -763,23 +975,21 @@ def test_background_teardown_does_not_wait_for_detached_descendant_output(termin
         timeout_ms=1000 if termination == "timeout" else 30000,
       )
       assert error is None, error
-      task = session.background_tasks[started["task_id"]]
-      for _ in range(200):
-        if mcp.calls:
-          break
-        await asyncio.sleep(0.05)
+      entry = _code_job(session, started["task_id"])
+      await _until(lambda: bool(mcp.calls))
       assert mcp.calls == [(FRED_SERIES, {"series_id": "CPIAUCSL"})]
-      descendant_pid = int((Path(task.handle.work_dir) / "detached.pid").read_text())
+      [handle] = handles
+      descendant_pid = int((Path(handle.work_dir) / "detached.pid").read_text())
 
       if termination == "cleanup":
         await asyncio.wait_for(cleanup_code_execution(session), timeout=7)
-        assert session.background_tasks == {}
+        assert entry.state == TaskState.KILLED
       else:
         result = await asyncio.wait_for(
-          _collect_background(dispatcher, started["task_id"]), timeout=7,
+          _collect_background(session, started["task_id"]), timeout=7,
         )
         assert result["timed_out"] is True
-      assert task.handle._backend_data["reader_task"].done()
+      assert handle._backend_data["reader_task"].done()
       assert mcp.cancelled is True
       assert bundle.frame_reader.active_cells() == ()
     finally:
@@ -1270,33 +1480,6 @@ def test_native_nested_computation_sources_settle_without_filesystem_reader(monk
   asyncio.run(run())
 
 
-def test_background_process_exit_revokes_token_before_status_collection() -> None:
-  from agent_gateway.code_execution._frame_reader import lookup_active_cell
-
-  async def run() -> None:
-    session, bundle, _mcp, dispatcher = _setup()
-    opened = _record_open_cells(bundle)
-    try:
-      result, error = await _run_cell(dispatcher, "import time; time.sleep(0.05)", background=True)
-      assert error is None
-      task = session.background_tasks[result["task_id"]]
-      cell = opened[0][0]
-      process = task.handle._backend_data["process"]
-      await process.wait()
-      # The backend observes the child watcher's returncode independently of
-      # Process.wait(), which also waits for inherited stream EOF.
-      for _ in range(200):
-        if lookup_active_cell(cell.token) is None:
-          break
-        await asyncio.sleep(0.005)
-      assert lookup_active_cell(cell.token) is None
-      assert task.result is None
-    finally:
-      await cleanup_code_execution(session)
-
-  asyncio.run(run())
-
-
 def test_native_settlement_retrieves_live_entry_without_repreparing_executed_input(monkeypatch: Any) -> None:
   from agent_gateway.code_execution._frame_reader import lookup_active_cell
   from agent_gateway.tool_policy_registry import ToolInputPreparationError
@@ -1344,11 +1527,15 @@ def test_native_settlement_retrieves_live_entry_without_repreparing_executed_inp
   asyncio.run(run())
 
 
-def test_exited_cell_revokes_token_while_descendant_holds_output_pipes(tmp_path: Path) -> None:
+def test_exited_cell_revokes_token_while_descendant_holds_output_pipes(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
   from agent_gateway.code_execution._frame_codec import encode_frame
   from agent_gateway.code_execution._frame_reader import lookup_active_cell
 
   async def run() -> None:
+    handles = _record_started_handles(monkeypatch)
     session, bundle, _mcp, dispatcher = _setup()
     pid_path = tmp_path / "holder.pid"
     release_path = tmp_path / "release-cell"
@@ -1376,8 +1563,9 @@ def test_exited_cell_revokes_token_while_descendant_holds_output_pipes(tmp_path:
       assert pid_path.exists()
       cell, = bundle.frame_reader._cells.values()
       assert lookup_active_cell(cell.token) is not None
-      task = session.background_tasks[started["task_id"]]
-      data = task.handle._backend_data
+      entry = _code_job(session, started["task_id"])
+      [handle] = handles
+      data = handle._backend_data
       release_path.touch()
       # Observe the leader's exit without Process.wait(), which also waits for
       # the descendant's inherited stdout/stderr descriptors to reach EOF.
@@ -1394,7 +1582,7 @@ def test_exited_cell_revokes_token_while_descendant_holds_output_pipes(tmp_path:
         await asyncio.sleep(0.005)
       os.kill(int(pid_path.read_text()), 0)
       assert not data["reader_task"].done()
-      assert task.result is None
+      assert not entry.completed
       assert lookup_active_cell(cell.token) is None
       reply = decode_frame(await cell.handle_frame(encode_frame({
         "type": "hello", "call_id": "after-exit", "cell_token": cell.token,
@@ -1409,3 +1597,77 @@ def test_exited_cell_revokes_token_while_descendant_holds_output_pipes(tmp_path:
       await cleanup_code_execution(session)
 
   asyncio.run(run())
+
+
+def test_skills_as_code_bridge_read_path_exercises_library_and_denies_writes() -> None:
+  """Phase 3+: cell exercises new library (dilution) over bridge read path;
+  asserts permitted writes like refresh_filings are code-callable;
+  proves protected money-class ops (execute_trade) are denied as not_code_callable.
+  """
+  from api.agent.shared.server_policies import server_tool_is_code_callable
+
+  def _real_code_callable(op: str) -> bool:
+    if op.startswith("mcp__"):
+      parts = op.split("__")
+      if len(parts) >= 3:
+        return server_tool_is_code_callable(parts[1], parts[2])
+    return False
+
+  async def _run() -> None:
+    session, bundle, mcp, dispatcher = _setup(code_callable=_real_code_callable)
+    try:
+      result, error = await _run_cell(dispatcher, f"""
+        from dilution.treasury_stock import OptionTranche, treasury_stock_method
+        import json
+
+        # 1. Read path via domain-clients bridge
+        filings = hank.call({GET_FILINGS!r}, cik="0000320193", limit=2)
+        assert len(filings["filings"]) == 2
+
+        # 2. Compute dilution with new library
+        tranches = [
+            OptionTranche(strike_price=50.0, shares=1000.0),
+            OptionTranche(strike_price=80.0, shares=1000.0),
+        ]
+        dilution_res = treasury_stock_method(tranches, stock_price=100.0)
+        print("net_dilutive_shares:", dilution_res.net_dilutive_shares)
+
+        # 3. Permitted write (cache refresh) IS code-callable under code-callable-by-default
+        refresh_res = hank.call({REFRESH_FILINGS!r}, cik="0000320193")
+        assert refresh_res["refreshed"] is True
+        print("permitted_write: success")
+
+        # 4. Genuinely registered protected-category op (execute_trade, money class) is denied
+        denied_error = None
+        try:
+            hank.call({EXECUTE_TRADE!r}, preview_id="pv-123")
+        except HankBridgeError as exc:
+            denied_error = exc.code
+        print("protected_write_denied:", denied_error)
+      """)
+      assert error is None, error
+      assert result["return_code"] == 0, result["stderr"]
+      assert "net_dilutive_shares: 700.0" in result["stdout"]
+      assert "permitted_write: success" in result["stdout"]
+      assert "protected_write_denied: not_code_callable" in result["stdout"]
+
+      # Verify bridge dispatched the read and permitted write, but NEVER the protected trade
+      assert mcp.calls == [
+        (GET_FILINGS, {"cik": "0000320193", "limit": 2}),
+        (REFRESH_FILINGS, {"cik": "0000320193"}),
+      ]
+      nested = result["nested_calls"]
+      assert len(nested) == 3
+      assert nested[0]["operation"] == GET_FILINGS
+      assert nested[0]["ok"] is True
+      assert nested[1]["operation"] == REFRESH_FILINGS
+      assert nested[1]["ok"] is True
+      assert nested[2]["operation"] == EXECUTE_TRADE
+      assert nested[2]["ok"] is False
+      assert nested[2]["error_code"] == "not_code_callable"
+
+      await cleanup_code_execution(session)
+    finally:
+      pass
+
+  asyncio.run(_run())

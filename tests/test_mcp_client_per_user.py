@@ -28,6 +28,7 @@ from agent_gateway.mcp_client import (
   _ServerState,
 )
 from agent_gateway.session import GatewaySession
+from agent_gateway.ttl_policy import GSHEETS_BROKER_SESSION_TTL
 from agent_gateway.tool_dispatcher import ToolDispatcher
 import agent_gateway.mcp_client as mcp_client_module
 from gateway_test_support.host_policy import owner_session_host_policy
@@ -323,6 +324,60 @@ def test_tier_one_hmac_uses_canonical_session_subject(monkeypatch):
     )
     expected_signature = hmac.new(b"test-key", signed_message, hashlib.sha256).hexdigest()
     assert captured["headers"]["X-Resolver-Signature"] == expected_signature
+
+  asyncio.run(scenario())
+
+
+def test_tier_one_ttl_resolves_per_user_and_defaults_on_none(monkeypatch):
+  async def scenario():
+    resolved = []
+    captured = []
+    ttls = {"7": 1200, "8": 7200}
+
+    def resolve_ttl(user_id, ttl_name):
+      resolved.append((user_id, ttl_name))
+      return ttls.get(user_id)
+
+    manager = McpClientManager(config_path=None, ttl_resolver=resolve_ttl)
+
+    class Response:
+      status_code = 200
+
+      def json(self):
+        return {
+          "session_token": "tier-two",
+          "expires_at": time.time() + 3600,
+        }
+
+    class Client:
+      def __init__(self, **_kwargs):
+        pass
+
+      async def __aenter__(self):
+        return self
+
+      async def __aexit__(self, *_args):
+        pass
+
+      async def post(self, _url, *, json, headers):
+        captured.append(json)
+        return Response()
+
+    monkeypatch.setenv("GOOGLE_SHEETS_BROKER_URL", "https://risk.example")
+    monkeypatch.setenv("GATEWAY_GOOGLE_SHEETS_BROKER_HMAC_KEY", "test-key")
+    monkeypatch.setattr(mcp_client_module.httpx, "AsyncClient", Client)
+    for user_id in (7, 8, 9):
+      await manager._mint_gsheets_broker_session(_subject(user_id))
+
+    assert resolved == [
+      (str(user_id), GSHEETS_BROKER_SESSION_TTL)
+      for user_id in (7, 8, 9)
+    ]
+    assert [(body["user_id"], body["ttl_s"]) for body in captured] == [
+      ("7", 1200),
+      ("8", 7200),
+      ("9", mcp_client_module.PER_USER_SESSION_TTL_SECONDS),
+    ]
 
   asyncio.run(scenario())
 

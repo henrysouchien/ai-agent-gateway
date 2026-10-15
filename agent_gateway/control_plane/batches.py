@@ -66,7 +66,7 @@ _TERMINAL_BATCH_STATUSES = frozenset({
   "cancelled",
   "blocked",
 })
-_ACTIVE_BATCH_STATUSES = frozenset({"running", "cancelling", "remediating"})
+_ACTIVE_BATCH_STATUSES = frozenset({"running", "cancelling"})
 _DURABLE_CORPUS_REJECTION_CODES = frozenset({
   "invalid_corpus_requirements",
 })
@@ -860,7 +860,13 @@ def _batch_capability_execution_context(
           "selected batch session credential has no credential material"
         )
 
-  session_driver_policy = selection_policy.capabilities[SESSION_DRIVER_CAPABILITY]
+  entitled_capabilities = frozenset(GATEWAY_EXECUTED_CAPABILITY_IDS)
+  entitled_model_keys = frozenset(
+    key
+    for capability_id in entitled_capabilities
+    if capability_id in selection_policy.capabilities
+    for key in selection_policy.capabilities[capability_id].allowed_model_keys
+  )
 
   auth_context = AuthContext(
     run_mode="batch",
@@ -868,8 +874,8 @@ def _batch_capability_execution_context(
     tenant_id=tenant_id,
     user_provider_handles=user_handles,
     service_provider_handles=service_handles,
-    entitled_capabilities=frozenset({SESSION_DRIVER_CAPABILITY}),
-    entitled_model_keys=session_driver_policy.allowed_model_keys,
+    entitled_capabilities=entitled_capabilities,
+    entitled_model_keys=entitled_model_keys,
     run_scoped_user_providers=frozenset(run_scoped_user_providers),
   )
   service_materializer = getattr(
@@ -1551,6 +1557,7 @@ def _acquire_and_start_batch(
         parent_session,
         withheld_tools=frozenset(),
         research_file_id=plan.research_file_id,
+        ticker=getattr(plan, "ticker", None),
         selection_snapshot=capture_selection_snapshot(
           capability_execution_resolver.selection_policy,
         ),
@@ -1565,6 +1572,7 @@ def _acquire_and_start_batch(
         batch_id,
         payload,
         registry=registry,
+        parent_session=parent_session,
         _identity=(user_id, user_email),
         _on_finalize=None,
         capability_execution_resolver=capability_execution_resolver,
@@ -1630,7 +1638,7 @@ async def _complete_authorized_batch_cancellation(
     transitioned = registry.transition_status_if_current(
       batch_id,
       "cancelling",
-      expected_statuses={"running", "remediating"},
+      expected_statuses={"running"},
     )
     if transitioned is True:
       progress.boundary_crossed = True
@@ -1785,7 +1793,7 @@ async def _complete_authorized_batch_cancellation(
       transitioned = transition(
         batch_id,
         "cancelled",
-        expected_statuses={"running", "cancelling", "remediating"},
+        expected_statuses=set(_ACTIVE_BATCH_STATUSES),
       )
       if transitioned is True:
         progress.boundary_crossed = True
@@ -2101,6 +2109,9 @@ def _require_batch_owner(registry: Any, batch_id: int, user_id: str) -> dict[str
     digest = registry.get_batch_digest(batch_id)
   except KeyError as exc:
     raise HTTPException(status_code=404, detail="Batch not found") from exc
+  # Tenant partition: a batch belongs to the user who dispatched it. Another
+  # user's batch answers the same 404 as an absent id, so a caller cannot
+  # learn that someone else's batch exists.
   if str(digest.get("user_id") or "") != str(user_id):
     raise HTTPException(status_code=404, detail="Batch not found")
   return digest
@@ -2151,21 +2162,18 @@ def _force_rerun_retry_spec(batch: dict[str, Any], *, ticker: str) -> dict[str, 
 
 
 def _set_status_if_not_terminal(registry: Any, batch_id: int, status: str, *, error: str | None = None) -> None:
-  try:
-    transition = getattr(registry, "transition_status_if_current", None)
-    if callable(transition):
-      transition(
-        batch_id,
-        status,
-        expected_statuses={"running", "cancelling", "remediating"},
-        error=error,
-      )
-      return
-    current_status = str(registry.get_batch_digest(batch_id).get("status") or "")
-    if current_status not in _TERMINAL_BATCH_STATUSES:
-      registry.set_status(batch_id, status, error=error)
-  except Exception:
+  transition = getattr(registry, "transition_status_if_current", None)
+  if callable(transition):
+    transition(
+      batch_id,
+      status,
+      expected_statuses=set(_ACTIVE_BATCH_STATUSES),
+      error=error,
+    )
     return
+  current_status = str(registry.get_batch_digest(batch_id).get("status") or "")
+  if current_status not in _TERMINAL_BATCH_STATUSES:
+    registry.set_status(batch_id, status, error=error)
 
 
 def _require_batch_user_event_bus(app_state: Any) -> object:

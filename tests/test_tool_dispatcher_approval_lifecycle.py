@@ -56,6 +56,7 @@ from agent_gateway.approval_route import (
   DurableLocalApprovalRoute,
   InProcessDelegatedApprovalRoute,
   ParentDelegatedApprovalRoute,
+  child_approval_route,
 )
 from agent_gateway.autonomous_approval_channel import (
   AutonomousApprovalChannelChild,
@@ -203,62 +204,6 @@ def _decision() -> PolicyApprovalDecision:
   )
 
 
-class _ApprovalWaitStoreFake:
-  def __init__(
-    self,
-    *,
-    request: PolicyApprovalRequest,
-    transition_error: Exception | None = None,
-    transition_request: PolicyApprovalRequest | None = None,
-    transition_event: asyncio.Event | None = None,
-  ) -> None:
-    self.request = request
-    self.transition_error = transition_error
-    self.transition_request = transition_request
-    self.transition_event = transition_event
-    self.transitions: list[dict[str, object]] = []
-
-  async def get(self, approval_id: str) -> PolicyApprovalRequest:
-    assert approval_id == self.request.approval_id
-    return self.request
-
-  async def transition_state(
-    self,
-    approval_id: str,
-    state: ApprovalState,
-    *,
-    expected_state_version: int | None = None,
-    expires_at: datetime | None = None,
-    decider_id: str | None = None,
-    decider_role: str | None = None,
-    decision: str | None = None,
-    decision_reason: str | None = None,
-  ) -> PolicyApprovalRequest:
-    assert approval_id == self.request.approval_id
-    assert state == "expired"
-    assert expected_state_version == self.request.state_version
-    self.transitions.append({
-      "approval_id": approval_id,
-      "state": state,
-      "expected_state_version": expected_state_version,
-      "decision_reason": decision_reason,
-    })
-    _ = (expires_at, decider_id, decider_role, decision)
-    if self.transition_request is not None:
-      self.request = self.transition_request
-    if self.transition_event is not None:
-      self.transition_event.set()
-    if self.transition_error is not None:
-      raise self.transition_error
-    self.request = replace(
-      self.request,
-      state=state,
-      state_version=self.request.state_version + 1,
-      decision_reason=decision_reason,
-    )
-    return self.request
-
-
 def test_resolve_run_context_uses_canonical_session_owner_for_approval_identity() -> None:
   session = _gateway_session(
     user_id="henry",
@@ -312,29 +257,6 @@ async def _wait_for_queue(session: GatewaySession, tool_call_id: str) -> asyncio
   raise AssertionError("approval queue was not registered")
 
 
-def test_projected_batch_approval_waits_through_its_advertised_expiry() -> None:
-  calls: list[float | int | None] = []
-
-  def globally_capped(expiry_seconds: float | int | None) -> float:
-    calls.append(expiry_seconds)
-    return 270.0
-
-  assert lifecycle_helpers._approval_wait_timeout_seconds(
-    600,
-    batch_admission=object(),
-    approval_queue_timeout_seconds_fn=globally_capped,
-  ) == 600.0
-  assert calls == []
-
-
-def test_non_batch_approval_keeps_global_wait_ceiling() -> None:
-  assert lifecycle_helpers._approval_wait_timeout_seconds(
-    600,
-    batch_admission=None,
-    approval_queue_timeout_seconds_fn=lambda _expiry: 270.0,
-  ) == 270.0
-
-
 def test_durable_interactive_approval_event_carries_stable_id_and_cleans_up() -> None:
   async def scenario() -> None:
     session_log = _SessionLog()
@@ -344,14 +266,12 @@ def test_durable_interactive_approval_event_carries_stable_id_and_cleans_up() ->
     task = asyncio.create_task(
       lifecycle_helpers.await_user_approval_via_pending_tools(
         session=session,
-        approval_store=None,
         append_event_fn=event_log.append,
         request=request,
         decision=_decision(),
         nonce="nonce-1",
         resolved_qualifier="qual-1",
         allow_persistent=True,
-        timeout_seconds=5,
         log=logging.getLogger("test"),
       )
     )
@@ -404,14 +324,12 @@ def test_pending_tool_exposes_only_trusted_planned_change_projection() -> None:
     task = asyncio.create_task(
       lifecycle_helpers.await_user_approval_via_pending_tools(
         session=session,
-        approval_store=None,
         append_event_fn=event_log.append,
         request=request,
         decision=_decision(),
         nonce="nonce-1",
         resolved_qualifier="qual-1",
         allow_persistent=False,
-        timeout_seconds=5,
         log=logging.getLogger("test"),
       )
     )
@@ -448,14 +366,12 @@ def test_projected_pending_tool_binds_stage_identity_to_projection_and_event() -
 
     result = await lifecycle_helpers.await_user_approval_via_pending_tools(
       session=session,
-      approval_store=None,
       append_event_fn=event_log.append,
       request=request,
       decision=_decision(),
       nonce="nonce-1",
       resolved_qualifier="qual-1",
       allow_persistent=False,
-      timeout_seconds=5,
       log=logging.getLogger("test"),
       batch_admission=Admission(),
     )
@@ -486,14 +402,12 @@ def test_projected_pending_tool_rejects_invalid_stage_identity(
     asyncio.run(
       lifecycle_helpers.await_user_approval_via_pending_tools(
         session=session,
-        approval_store=None,
         append_event_fn=None,
         request=_request(),
         decision=_decision(),
         nonce="nonce-1",
         resolved_qualifier="",
         allow_persistent=False,
-        timeout_seconds=5,
         log=logging.getLogger("test"),
         batch_admission=object(),
       )
@@ -502,181 +416,200 @@ def test_projected_pending_tool_rejects_invalid_stage_identity(
   assert session.approval_queues == {}
 
 
-def test_pending_tool_helper_expires_store_request_on_timeout() -> None:
+class _AdvancingClockLoop(asyncio.SelectorEventLoop):
+  """An event loop whose clock the test moves forward without sleeping.
 
-  async def scenario() -> None:
-    store = _ApprovalWaitStoreFake(request=_request(state_version=7))
-    session = _gateway_session(pending_tools={}, approval_queues={}, agent_session_log=None)
+  Every asyncio timer is scheduled against ``loop.time()``, so advancing the
+  offset fires any deadline a wait would have set as of that elapsed time.
+  """
 
-    result = await lifecycle_helpers.await_user_approval_via_pending_tools(
-      session=session,
-      approval_store=store,
-      append_event_fn=None,
-      request=_request(),
-      decision=_decision(),
-      nonce="nonce-1",
-      resolved_qualifier="",
-      allow_persistent=False,
-      timeout_seconds=0,
-      log=logging.getLogger("test"),
-    )
+  def __init__(self) -> None:
+    super().__init__()
+    self.offset = 0.0
 
-    assert result is None
-    assert store.transitions == [
-      {
-        "approval_id": "approval-1",
-        "state": "expired",
-        "expected_state_version": 7,
-        "decision_reason": "Timed out waiting for user approval",
-      }
-    ]
-    assert session.pending_tools == {}
-    assert session.approval_queues == {}
-
-  asyncio.run(scenario())
+  def time(self) -> float:
+    return super().time() + self.offset
 
 
-def test_pending_tool_timeout_observes_concurrent_durable_vote() -> None:
-  async def scenario() -> None:
-    vote_won = asyncio.Event()
-    session = _gateway_session(
-      pending_tools={},
-      approval_queues={},
-      agent_session_log=None,
-    )
-
-
-    store = _ApprovalWaitStoreFake(
-      request=_request(state_version=7),
-      transition_error=RuntimeError("approval request state_version changed"),
-      transition_request=_request(state="approved", state_version=8),
-      transition_event=vote_won,
-    )
-    task = asyncio.create_task(
-      lifecycle_helpers.await_user_approval_via_pending_tools(
-        session=session,
-        approval_store=store,
-        append_event_fn=None,
-        request=_request(),
-        decision=_decision(),
-        nonce="nonce-1",
-        resolved_qualifier="",
-        allow_persistent=False,
-        timeout_seconds=0,
-        log=logging.getLogger("test"),
-      )
-    )
-
-    await asyncio.wait_for(vote_won.wait(), timeout=1)
-    await asyncio.sleep(0)
-    assert not task.done()
-    assert "call-1" in session.pending_tools
-    approval_queue = session.approval_queues["call-1"]
-    approval_queue.put_nowait({
-      "approved": True,
-      "allow_tool_type": False,
-      "approval_id": "approval-1",
-    })
-
-    assert await asyncio.wait_for(task, timeout=1) == {
-      "approved": True,
-      "allow_tool_type": False,
-      "approval_id": "approval-1",
-    }
-    assert session.pending_tools == {}
-    assert session.approval_queues == {}
-
-  asyncio.run(scenario())
-
-
-def test_pending_tool_timeout_rejects_mismatched_vote_delivery() -> None:
-  async def scenario() -> None:
-    session = _gateway_session(
-      pending_tools={},
-      approval_queues={},
-      agent_session_log=None,
-    )
-
-
-    store = _ApprovalWaitStoreFake(
-      request=_request(state_version=7),
-      transition_error=RuntimeError("approval request state_version changed"),
-      transition_request=_request(state="denied", state_version=8),
-    )
-    task = asyncio.create_task(
-      lifecycle_helpers.await_user_approval_via_pending_tools(
-        session=session,
-        approval_store=store,
-        append_event_fn=None,
-        request=_request(),
-        decision=_decision(),
-        nonce="nonce-1",
-        resolved_qualifier="",
-        allow_persistent=False,
-        timeout_seconds=0,
-        log=logging.getLogger("test"),
-      )
-    )
-
-    queue = await _wait_for_queue(session, "call-1")
-    await asyncio.sleep(0.11)
-    queue.put_nowait({
-      "approved": False,
-      "allow_tool_type": False,
-      "approval_id": "different-approval",
-    })
-
-    with pytest.raises(
-      RuntimeError,
-      match="different approval",
-    ):
-      await asyncio.wait_for(task, timeout=1)
-    assert session.pending_tools == {}
-    assert session.approval_queues == {}
-
-  asyncio.run(scenario())
-
-
-def test_pending_tool_timeout_bounds_missing_winner_delivery(
-  monkeypatch,
+def _run_on_advancing_clock(
+  scenario: Callable[[_AdvancingClockLoop], Awaitable[None]],
 ) -> None:
-  async def scenario() -> None:
-    session = _gateway_session(
-      pending_tools={},
-      approval_queues={},
-      agent_session_log=None,
-    )
+  loop = _AdvancingClockLoop()
+  try:
+    loop.run_until_complete(scenario(loop))
+  finally:
+    loop.close()
 
 
-    store = _ApprovalWaitStoreFake(
-      request=_request(state="approved", state_version=8),
-    )
-    monkeypatch.setattr(
-      lifecycle_helpers,
-      "_APPROVAL_WINNER_DELIVERY_TIMEOUT_SECONDS",
-      0.01,
-    )
-    with pytest.raises(
-      RuntimeError,
-      match="reconciliation deadline",
-    ):
-      await lifecycle_helpers.await_user_approval_via_pending_tools(
+def test_late_vote_reaches_the_live_wait_after_hours_elapse() -> None:
+  async def scenario(loop: _AdvancingClockLoop) -> None:
+    session = _gateway_session(pending_tools={}, approval_queues={}, agent_session_log=None)
+    request = _request()
+    task = asyncio.create_task(
+      lifecycle_helpers.await_user_approval_via_pending_tools(
         session=session,
-        approval_store=store,
         append_event_fn=None,
-        request=_request(),
+        request=request,
         decision=_decision(),
         nonce="nonce-1",
         resolved_qualifier="",
         allow_persistent=False,
-        timeout_seconds=0,
         log=logging.getLogger("test"),
       )
+    )
+    queue = await _wait_for_queue(session, request.tool_call_id)
+
+    loop.offset += 6 * 60 * 60
+    for _ in range(3):
+      await asyncio.sleep(0)
+
+    assert not task.done()
+    assert session.approval_queues[request.tool_call_id] is queue
+    queue.put_nowait({"approved": True, "allow_tool_type": False, "approval_id": request.approval_id})
+    assert await task == {"approved": True, "allow_tool_type": False, "approval_id": request.approval_id}
+    assert session.pending_tools == {}
+    assert session.approval_queues == {}
+
+  _run_on_advancing_clock(scenario)
+
+
+def test_cancelled_wait_releases_the_live_entry_and_leaves_no_decision() -> None:
+  async def scenario() -> None:
+    session = _gateway_session(pending_tools={}, approval_queues={}, agent_session_log=None)
+    request = _request()
+    task = asyncio.create_task(
+      lifecycle_helpers.await_user_approval_via_pending_tools(
+        session=session,
+        append_event_fn=None,
+        request=request,
+        decision=_decision(),
+        nonce="nonce-1",
+        resolved_qualifier="",
+        allow_persistent=False,
+        log=logging.getLogger("test"),
+      )
+    )
+    await _wait_for_queue(session, request.tool_call_id)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await task
     assert session.pending_tools == {}
     assert session.approval_queues == {}
 
   asyncio.run(scenario())
 
+
+def test_wait_cancelled_during_publication_releases_the_live_entry() -> None:
+  async def scenario() -> None:
+    published = asyncio.Event()
+
+    class _BlockingSessionLog:
+      async def append(self, _event: dict[str, Any]) -> None:
+        published.set()
+        await asyncio.Event().wait()
+
+    session = _gateway_session(
+      pending_tools={},
+      approval_queues={},
+      agent_session_log=_BlockingSessionLog(),
+    )
+    request = _request()
+    task = asyncio.create_task(
+      lifecycle_helpers.await_user_approval_via_pending_tools(
+        session=session,
+        append_event_fn=None,
+        request=request,
+        decision=_decision(),
+        nonce="nonce-1",
+        resolved_qualifier="",
+        allow_persistent=False,
+        log=logging.getLogger("test"),
+      )
+    )
+    await published.wait()
+    assert request.tool_call_id in session.pending_tools
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await task
+    assert session.pending_tools == {}
+    assert session.approval_queues == {}
+
+  asyncio.run(scenario())
+
+
+def test_delegated_money_wait_is_not_bounded_by_elapsed_time() -> None:
+  async def scenario(loop: _AdvancingClockLoop) -> None:
+    session = _gateway_session(pending_tools={}, approval_queues={}, agent_session_log=None)
+    tool_call_id = "call-delegated"
+    projected: list[dict[str, Any]] = []
+
+    async def wait(
+      request: PolicyApprovalRequest,
+      decision: PolicyApprovalDecision,
+      **kwargs: Any,
+    ) -> dict[str, Any]:
+      projected.append(dict(kwargs["durable_request"]))
+      assert decision.expiry_seconds is None
+      return await lifecycle_helpers.await_user_approval_via_pending_tools(
+        session=session,
+        append_event_fn=None,
+        request=request,
+        decision=decision,
+        log=logging.getLogger("test"),
+        **kwargs,
+      )
+
+    task = asyncio.create_task(
+      lifecycle_helpers.run_approval_lifecycle(
+        route=ParentDelegatedApprovalRoute(
+          object.__new__(AutonomousApprovalChannelChild),
+          session,
+        ),
+        session=session,
+        producer_session=session,
+        executable_capture=None,
+        tool_call_id=tool_call_id,
+        tool_name="place_order",
+        tool_input={"ticker": "MSFT"},
+        qualifier="",
+        reason="live order",
+        allow_persistent=False,
+        resolve_run_context_fn=lambda: RunContext(
+          user_id="owner-1",
+          request_id="control-run-1",
+          profile="analyst",
+          channel="cli",
+          decider_role="owner",
+        ),
+        current_skill_admission_fn=lambda: None,
+        redact_for_approval_request_fn=lambda *_args: ({}, "args-hash"),
+        resolve_tool_class_fn=lambda _tool_name: "irreversible",
+        effective_trade_approval_decision_fn=(
+          lambda _name, _args, decision: decision
+        ),
+        await_user_approval_via_pending_tools_fn=wait,
+      )
+    )
+    queue = await _wait_for_queue(session, tool_call_id)
+    assert projected[0]["expires_at"] is None
+
+    loop.offset += 2 * 60 * 60
+    for _ in range(3):
+      await asyncio.sleep(0)
+
+    assert not task.done()
+    approval_id = projected[0]["approval_id"]
+    queue.put_nowait({"approved": True, "allow_tool_type": False, "approval_id": approval_id})
+    result = await task
+    assert result["approved"] is True
+    assert result["request"].state == "approved"
+    assert result["request"].expires_at is None
+    assert session.pending_tools == {}
+    assert session.approval_queues == {}
+
+  _run_on_advancing_clock(scenario)
 
 
 
@@ -812,7 +745,7 @@ _DEFAULT_BUSINESS_MODEL_RESTORE = object()
   ("tool_class", "expected_state", "expected_mode"),
   [
     ("state_write", "auto_approved", "OWNER_CONTROL_PLANE"),
-    ("irreversible", "pending_user", "HUMAN"),
+    ("irreversible", "denied", "HUMAN"),
   ],
 )
 def test_delegated_run_settles_everything_but_the_money_boundary(
@@ -824,16 +757,20 @@ def test_delegated_run_settles_everything_but_the_money_boundary(
 
   The delegated route is an autonomous child's only route and no operator is
   guaranteed to sit at it, so every class outside the money boundary is settled
-  under the run owner's authority instead of parked until the durable expiry
-  fails the whole run. Placing an order is the one class that still waits.
+  under the run owner's authority. Placing an order is the one class that still
+  waits for the operator's decision.
   """
 
   session = _gateway_session()
   prompts: list[str] = []
 
-  async def record_prompt(*_args: Any, **_kwargs: Any) -> None:
+  async def record_prompt(
+    request: PolicyApprovalRequest,
+    *_args: Any,
+    **_kwargs: Any,
+  ) -> dict[str, Any]:
     prompts.append("prompted")
-    return None
+    return {"approval_id": request.approval_id, "approved": False}
 
   result = asyncio.run(
     lifecycle_helpers.run_approval_lifecycle(
@@ -864,7 +801,6 @@ def test_delegated_run_settles_everything_but_the_money_boundary(
         lambda _name, _args, decision: decision
       ),
       await_user_approval_via_pending_tools_fn=record_prompt,
-      approval_queue_timeout_seconds_fn=lambda _expiry: 1.0,
     )
   )
 
@@ -873,13 +809,11 @@ def test_delegated_run_settles_everything_but_the_money_boundary(
   assert request.authorization_mode == expected_mode
   if expected_state == "auto_approved":
     assert result["approved"] is True
-    assert result.get("timeout") is None
     assert request.decider_id == "owner-1"
     assert request.decider_role == "owner"
     assert prompts == []
   else:
     assert result["approved"] is False
-    assert result["timeout"] is True
     assert prompts == ["prompted"]
 
 
@@ -971,39 +905,44 @@ def test_native_park_captures_exact_call_and_dispatch_operands(
       exact_backend="original-backend",
     )
     recorded_calls: list[PreparedToolCall] = []
-    record_binding = store.record_executable_binding
+    park_binding = store.park_executable_binding
 
-    async def observe_binding(**kwargs: Any) -> None:
+    async def observe_binding(**kwargs: Any) -> str:
       recorded_calls.append(kwargs["prepared_call"])
-      await record_binding(**kwargs)
+      return await park_binding(**kwargs)
 
-    monkeypatch.setattr(store, "record_executable_binding", observe_binding)
-    task = asyncio.create_task(dispatcher.dispatch_prepared(
-      "call-capture",
-      "native_write",
-      original,
-      call_index=7,
-      advertised_tool_names=advertised,
-      skill_run_id="original-skill",
-      step_id="original-step",
-      workspace_dir="/original/workspace",
-      batch_id="original-batch",
-      capture_readable_resource_snapshot=True,
-      allow_uncertain_mcp_replay=False,
-      abort_event=asyncio.Event(),
-      on_executed_prepared_call=lambda _call: None,
-    ))
-    queue = await _wait_for_native_queue(parent, task, "call-capture")
+    monkeypatch.setattr(store, "park_executable_binding", observe_binding)
+    with pytest.raises(lifecycle_helpers.ApprovalPark) as raised:
+      await dispatcher.dispatch_prepared(
+        "call-capture",
+        "native_write",
+        original,
+        call_index=7,
+        advertised_tool_names=advertised,
+        skill_run_id="original-skill",
+        step_id="original-step",
+        workspace_dir="/original/workspace",
+        batch_id="original-batch",
+        capture_readable_resource_snapshot=True,
+        allow_uncertain_mcp_replay=False,
+        abort_event=asyncio.Event(),
+        on_executed_prepared_call=lambda _call: None,
+      )
+    park = raised.value
+    job_id = "job-child" if delegated else "job-native"
+    assert (park.job_id, park.original_tool_call_id, park.root_turn_id) == (
+      job_id, "call-capture", None,
+    )
     assert len(recorded_calls) == 1 and recorded_calls[0] is original
-    pending = parent.pending_tools["call-capture"]
+    assert parent.pending_tools == {} and parent.approval_queues == {}
     binding, request = await store._read_executable_binding_for_executor(
-      job_id="job-child" if delegated else "job-native",
+      job_id=job_id,
       tool_call_id="call-capture",
-      nonce=pending["nonce"],
+      nonce=park.nonce,
       tenant_storage_id="alice",
     )
     assert request.state == "pending_user"
-    assert binding.approval_id == pending["approval_id"]
+    assert binding.approval_id == park.approval_id
     assert binding.prepared_input == original.prepared_input
     assert binding.exact_backend == original.exact_backend
     assert binding.credential_generation_ref == credential_generation_ref
@@ -1022,18 +961,6 @@ def test_native_park_captures_exact_call_and_dispatch_operands(
     assert "prepared_input" not in projection
     assert "dispatch_context" not in projection
     assert "original-backend" not in json.dumps(projection)
-    await store.transition_state(
-      request.approval_id,
-      "denied",
-      expected_state_version=request.state_version,
-      decider_id="alice",
-      decider_role="owner",
-      decision="denied",
-    )
-    await queue.put({"approved": False, "allow_tool_type": False})
-    result, error = await task
-    assert result is None
-    assert error is not None and error["code"] == "user_denied"
 
   asyncio.run(scenario())
 
@@ -1275,6 +1202,9 @@ def test_real_in_process_child_capture_uses_child_job_not_parent_session(
   owner_session_host_policy: Any,
 ) -> None:
   owner_session_host_policy.get_local_tool_effect = lambda _name: "read"
+  owner_session_host_policy.get_read_capability = lambda name, _server: (
+    "web.read/v1" if name == "web_search" else None
+  )
 
   async def scenario() -> None:
     parent = _gateway_session(
@@ -1385,118 +1315,88 @@ def test_real_in_process_child_capture_uses_child_job_not_parent_session(
         lambda requested: [definition] if "web_search" in requested else []
       ),
     )
-    task = asyncio.create_task(spawn({
+    # The child parks its call; its spawn settles without a decision.
+    await asyncio.wait_for(spawn({
       "operation": operation,
       "objective": "Make the native child tool call.",
       "background": False,
-    }))
-    try:
-      async def wait_for_real_child_queue() -> asyncio.Queue:
-        while "call-real-child" not in parent.approval_queues:
-          if task.done():
-            raise AssertionError(f"Child exited before parking: {task.result()}")
-          await asyncio.sleep(0.01)
-        return parent.approval_queues["call-real-child"]
+    }), timeout=10)
+    assert provider.turn == 1
+    assert parent.pending_tools == {} and parent.approval_queues == {}
+    child_session = observed["sub_session"]
+    child_context = current_parent_context(child_session)
+    child_job_id = observed["admitted_task"].attempt.physical_task_id
+    assert child_session is not parent
+    assert observed["dispatcher"]._session is parent
+    assert child_context.job_id == child_job_id
+    assert child_job_id != parent_context.job_id
+    assert current_parent_context(parent).job_id == parent_context.job_id
+    assert child_context.tenant is not None
+    with store._connection() as conn:
+      approval_id, nonce = conn.execute(
+        "SELECT approval_id, nonce FROM approval_executable_bindings WHERE tool_call_id = ?",
+        ("call-real-child",),
+      ).fetchone()
+    binding, request = await store._read_executable_binding_for_executor(
+      job_id=child_job_id,
+      tool_call_id="call-real-child",
+      nonce=nonce,
+      tenant_storage_id=child_context.tenant.storage_id,
+    )
+    assert binding.job_id == child_job_id
+    assert binding.job_id != parent_context.job_id
+    assert binding.approval_id == approval_id
+    assert binding.prepared_input == {"query": "exact child operand"}
+    assert request.state == "pending_user"
 
-      queue = await asyncio.wait_for(wait_for_real_child_queue(), timeout=10)
-      child_session = observed["sub_session"]
-      child_context = current_parent_context(child_session)
-      child_job_id = observed["admitted_task"].attempt.physical_task_id
-      assert child_session is not parent
-      assert observed["dispatcher"]._session is parent
-      assert child_context.job_id == child_job_id
-      assert child_job_id != parent_context.job_id
-      assert current_parent_context(parent).job_id == parent_context.job_id
-      assert child_context.tenant is not None
-      pending = parent.pending_tools["call-real-child"]
-      binding, request = await store._read_executable_binding_for_executor(
-        job_id=child_job_id,
-        tool_call_id="call-real-child",
-        nonce=pending["nonce"],
-        tenant_storage_id=child_context.tenant.storage_id,
-      )
-      assert binding.job_id == child_job_id
-      assert binding.job_id != parent_context.job_id
-      assert binding.approval_id == pending["approval_id"]
-      assert binding.prepared_input == {"query": "exact child operand"}
-      assert request.state == "pending_user"
-      await store.transition_state(
-        request.approval_id,
-        "denied",
-        expected_state_version=request.state_version,
-        decider_id="alice",
-        decider_role="owner",
-        decision="denied",
-      )
-      await queue.put({"approved": False, "allow_tool_type": False})
-      await asyncio.wait_for(task, timeout=10)
-
-      # A continuation retains its durable child's bind after parent rotation.
-      durable_child = observed["admitted_task"]
-      frozen_bind = durable_child.model_bind.model_copy(
-        update={"credential_ref": "anthropic-generation-child-frozen"},
-      )
-      durable_child = durable_child.model_copy(update={"model_bind": frozen_bind})
-      assert parent.auth_config is not None
-      parent.auth_config["credential_source"] = {
-        "generation_ref": "anthropic-generation-parent-rotated",
-      }
-      continued = admit(
-        ContinueRequest(child_job_id),
-        current_parent_context(parent),
-        owners=ContinuationOwners(
-          task=durable_child,
-          research_binding=child_context.research_binding,
-        ),
-      )
-      assert isinstance(continued, AdmittedContext)
-      assert continued.wire.capability_bind == frozen_bind
-      resumed_dispatcher = ToolDispatcher(
-        capability_bind=continued.wire.capability_bind,
-        mcp_client=mcp,
-        local_tool_handlers=handlers,
-        needs_approval=lambda *_args: True,
-        role="owner",
-        approval_route=continued.approval_route,
-        identity=DispatchIdentity(
-          context=context_for_child(continued, job_id=child_job_id),
-          session=parent,
-        ),
-      )
-      resumed_task = asyncio.create_task(resumed_dispatcher.dispatch_prepared(
+    # A continuation retains its durable child's bind after parent rotation.
+    durable_child = observed["admitted_task"]
+    frozen_bind = durable_child.model_bind.model_copy(
+      update={"credential_ref": "anthropic-generation-child-frozen"},
+    )
+    durable_child = durable_child.model_copy(update={"model_bind": frozen_bind})
+    assert parent.auth_config is not None
+    parent.auth_config["credential_source"] = {
+      "generation_ref": "anthropic-generation-parent-rotated",
+    }
+    continued = admit(
+      ContinueRequest(child_job_id),
+      current_parent_context(parent),
+      owners=ContinuationOwners(
+        task=durable_child,
+        research_binding=child_context.research_binding,
+      ),
+    )
+    assert isinstance(continued, AdmittedContext)
+    assert continued.wire.capability_bind == frozen_bind
+    resumed_dispatcher = ToolDispatcher(
+      capability_bind=continued.wire.capability_bind,
+      mcp_client=mcp,
+      local_tool_handlers=handlers,
+      needs_approval=lambda *_args: True,
+      role="owner",
+      approval_route=continued.approval_route,
+      identity=DispatchIdentity(
+        context=context_for_child(continued, job_id=child_job_id),
+        session=parent,
+      ),
+    )
+    with pytest.raises(lifecycle_helpers.ApprovalPark) as raised:
+      await resumed_dispatcher.dispatch_prepared(
         "call-resumed-child", "web_search", PreparedToolCall({"query": "resumed child"}),
-      ))
-      try:
-        resumed_queue = await _wait_for_native_queue(parent, resumed_task, "call-resumed-child")
-        resumed_pending = parent.pending_tools["call-resumed-child"]
-        resumed_binding, resumed_request = await store._read_executable_binding_for_executor(
-          job_id=child_job_id,
-          tool_call_id="call-resumed-child",
-          nonce=resumed_pending["nonce"],
-          tenant_storage_id=child_context.tenant.storage_id,
-        )
-        assert resumed_binding.credential_generation_ref == frozen_bind.credential_ref
-        assert resumed_binding.job_id == child_job_id
-        assert resumed_dispatcher._executing_root_turn() is None
-        await store.transition_state(
-          resumed_request.approval_id,
-          "denied",
-          expected_state_version=resumed_request.state_version,
-          decider_id="alice", decider_role="owner", decision="denied",
-        )
-        await resumed_queue.put({"approved": False, "allow_tool_type": False})
-        _, resumed_error = await asyncio.wait_for(resumed_task, timeout=10)
-        assert resumed_error is not None and resumed_error["code"] == "user_denied"
-      finally:
-        if not resumed_task.done():
-          resumed_task.cancel()
-          with pytest.raises(asyncio.CancelledError):
-            await resumed_task
-    finally:
-      if not task.done():
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-          await task
+      )
+    resumed_park = raised.value
+    assert (resumed_park.job_id, resumed_park.root_turn_id) == (child_job_id, None)
+    resumed_binding, resumed_request = await store._read_executable_binding_for_executor(
+      job_id=child_job_id,
+      tool_call_id="call-resumed-child",
+      nonce=resumed_park.nonce,
+      tenant_storage_id=child_context.tenant.storage_id,
+    )
+    assert resumed_binding.credential_generation_ref == frozen_bind.credential_ref
+    assert resumed_binding.job_id == child_job_id
+    assert resumed_request.state == "pending_user"
+    assert resumed_dispatcher._executing_root_turn() is None
 
   asyncio.run(scenario())
 
@@ -1519,36 +1419,169 @@ def test_native_root_park_links_captured_turn_on_ledger_store(
     capture_root_turn(session, root_turn)
     assert current_root_turn(session) is root_turn
     assert dispatcher._executing_root_turn() is root_turn
-    task = asyncio.create_task(dispatcher.dispatch_prepared(
-      "call-root-park", "native_write", PreparedToolCall({"api_key": "private-root-operand"}),
-    ))
-    try:
-      queue = await _wait_for_native_queue(session, task, "call-root-park")
-      pending = session.pending_tools["call-root-park"]
-      reopened = SQLiteApprovalStore(store.path)
-      assert await reopened._locate_root_turn_for_approval(
-        approval_id=pending["approval_id"], tenant_storage_id="alice",
-      ) == ("job-native", "call-root-park", pending["nonce"], root_turn.turn_id)
-      record = await reopened._read_root_turn_for_executor(
-        job_id="job-native", turn_id=root_turn.turn_id, tenant_storage_id="alice",
+    with pytest.raises(lifecycle_helpers.ApprovalPark) as raised:
+      await dispatcher.dispatch_prepared(
+        "call-root-park", "native_write", PreparedToolCall({"api_key": "private-root-operand"}),
       )
-      assert record is not None
-      assert len(record.executable_refs) == 1
-      request = await store.get(pending["approval_id"])
-      assert request is not None and request.state == "pending_user"
-      assert "private-root-operand" not in json.dumps(_approval_request_to_dict(request))
-      await store.transition_state(
-        request.approval_id, "denied", expected_state_version=request.state_version,
-        decider_id="alice", decider_role="owner", decision="denied",
+    park = raised.value
+    assert (park.job_id, park.original_tool_call_id, park.root_turn_id) == (
+      "job-native", "call-root-park", root_turn.turn_id,
+    )
+    assert session.pending_tools == {} and session.approval_queues == {}
+    reopened = SQLiteApprovalStore(store.path)
+    assert await reopened._locate_root_turn_for_approval(
+      approval_id=park.approval_id, tenant_storage_id="alice",
+    ) == ("job-native", "call-root-park", park.nonce, root_turn.turn_id)
+    record = await reopened._read_root_turn_for_executor(
+      job_id="job-native", turn_id=root_turn.turn_id, tenant_storage_id="alice",
+    )
+    assert record is not None
+    assert len(record.executable_refs) == 1
+    request = await store.get(park.approval_id)
+    assert request is not None and request.state == "pending_user"
+    assert "private-root-operand" not in json.dumps(_approval_request_to_dict(request))
+
+  asyncio.run(scenario())
+
+
+def _binding_rows(store: SQLiteApprovalStore) -> list[tuple[str, str, str]]:
+  with store._connection() as conn:
+    return [
+      (row["approval_id"], row["tool_call_id"], row["nonce"])
+      for row in conn.execute(
+        "SELECT approval_id, tool_call_id, nonce FROM approval_executable_bindings",
       )
-      await queue.put({"approved": False, "allow_tool_type": False})
-      _, error = await task
-      assert error is not None and error["code"] == "user_denied"
-    finally:
-      if not task.done():
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-          await task
+    ]
+
+
+@pytest.mark.parametrize("pending_call_id", ["call-resumed", "call-retry"])
+def test_native_repark_of_resumed_approval_binds_the_pending_call(
+  tmp_path: Path,
+  owner_session_host_policy: Any,
+  pending_call_id: str,
+) -> None:
+  """A producer that died while parked leaves a pending, bound approval.
+
+  Re-dispatching the resumed request parks again on that approval: one binding,
+  re-presented to the call now pending, and the Continue executes that call.
+  """
+
+  async def scenario() -> None:
+    dispatcher, store, _session = _native_capture_dispatcher(tmp_path)
+    original = PreparedToolCall({"ticker": "MSFT"}, exact_backend="original-backend")
+    with pytest.raises(lifecycle_helpers.ApprovalPark) as raised:
+      await dispatcher.dispatch_prepared(
+        "call-resumed", "native_write", original, call_index=3,
+      )
+    first = raised.value
+    resumed = await store.get(first.approval_id)
+    assert resumed is not None and resumed.state == "pending_user"
+    first_binding, _ = await store._read_executable_binding_for_executor(
+      job_id="job-native", tool_call_id="call-resumed", nonce=first.nonce,
+      tenant_storage_id="alice",
+    )
+    resumed_context = {**first_binding.dispatch_context, "call_index": 4}
+    event_log = EventLog()
+    dispatcher._event_log = event_log
+    with pytest.raises(lifecycle_helpers.ApprovalPark) as raised:
+      await dispatcher._run_approval_lifecycle(
+        executable_capture=lifecycle_helpers.ExecutableCapture(
+          prepared_call=original,
+          dispatch_context=resumed_context,
+          job_id="job-native",
+          tenant_storage_id="alice",
+          credential_generation_ref="anthropic-generation-original",
+          root_turn=None,
+        ),
+        tool_call_id=pending_call_id,
+        tool_name="native_write",
+        tool_input=original.materialize_input(),
+        qualifier="",
+        reason="",
+        allow_persistent=False,
+        prepared_business_model_change={},
+        resume_approval_request=resumed,
+      )
+    park = raised.value
+    assert (park.job_id, park.approval_id, park.original_tool_call_id) == (
+      "job-native", first.approval_id, pending_call_id,
+    )
+    if pending_call_id == "call-resumed":
+      assert park.nonce == first.nonce
+    [asked] = [
+      entry.event for entry in event_log.entries
+      if entry.event["type"] == "tool_approval_request"
+    ]
+    assert (asked["approval_id"], asked["tool_call_id"], asked["nonce"]) == (
+      first.approval_id, pending_call_id, park.nonce,
+    )
+    assert _binding_rows(store) == [(first.approval_id, pending_call_id, park.nonce)]
+    pending = await store.get(first.approval_id)
+    assert pending is not None
+    assert (pending.state, pending.tool_call_id) == ("pending_user", pending_call_id)
+    binding, _ = await store._read_executable_binding_for_executor(
+      job_id="job-native", tool_call_id=pending_call_id, nonce=park.nonce,
+      tenant_storage_id="alice",
+    )
+    assert binding.dispatch_context == resumed_context
+    await store.transition_state(
+      first.approval_id, "approved", expected_state_version=pending.state_version,
+      decider_id="alice", decider_role="owner",
+    )
+    result, error = await dispatcher.execute_approved_binding(
+      job_id="job-native", tool_call_id=pending_call_id, nonce=park.nonce,
+      abort_event=None, on_executed_prepared_call=None,
+    )
+    assert error is None and result == {"ok": True}
+    if pending_call_id != "call-resumed":
+      _stale, stale_error = await dispatcher.execute_approved_binding(
+        job_id="job-native", tool_call_id="call-resumed", nonce=first.nonce,
+        abort_event=None, on_executed_prepared_call=None,
+      )
+      assert stale_error is not None
+      assert stale_error["code"] == "approval_binding_missing_binding"
+
+  asyncio.run(scenario())
+
+
+def test_native_call_parks_again_after_its_denied_approval(
+  tmp_path: Path,
+  owner_session_host_policy: Any,
+) -> None:
+  """The same call id parking twice in one job binds its new approval."""
+
+  async def scenario() -> None:
+    dispatcher, store, _session = _native_capture_dispatcher(tmp_path)
+    original = PreparedToolCall({"ticker": "MSFT"}, exact_backend="original-backend")
+    with pytest.raises(lifecycle_helpers.ApprovalPark) as raised:
+      await dispatcher.dispatch_prepared("call-twice", "native_write", original)
+    first = raised.value
+    denied = await store.get(first.approval_id)
+    assert denied is not None
+    await store.transition_state(
+      first.approval_id, "denied", expected_state_version=denied.state_version,
+    )
+    with pytest.raises(lifecycle_helpers.ApprovalPark) as raised:
+      await dispatcher.dispatch_prepared("call-twice", "native_write", original)
+    second = raised.value
+    assert second.approval_id != first.approval_id
+    assert (second.job_id, second.original_tool_call_id, second.nonce) == (
+      "job-native", "call-twice", first.nonce,
+    )
+    assert _binding_rows(store) == [(second.approval_id, "call-twice", second.nonce)]
+    first_request = await store.get(first.approval_id)
+    pending = await store.get(second.approval_id)
+    assert first_request is not None and first_request.state == "denied"
+    assert pending is not None and pending.state == "pending_user"
+    await store.transition_state(
+      second.approval_id, "approved", expected_state_version=pending.state_version,
+      decider_id="alice", decider_role="owner",
+    )
+    result, error = await dispatcher.execute_approved_binding(
+      job_id="job-native", tool_call_id="call-twice", nonce=second.nonce,
+      abort_event=None, on_executed_prepared_call=None,
+    )
+    assert error is None and result == {"ok": True}
 
   asyncio.run(scenario())
 
@@ -1586,6 +1619,12 @@ def test_fork_parks_against_its_spawning_turn_after_a_later_turn_begins(
     from agent_gateway.fork_ledger import ForkLedger
     from agent_gateway.fork_request_handoff import build_post_turn_handoff
     from agent_gateway.fork_task_registry import ForkTaskRegistry
+    from agent_gateway.task_registry import TaskEntry
+    from agent_workflow_contracts import (
+      AgentOperationRef, AttemptRef, OrdinaryDelegationTaskRef, OutcomeRequirement,
+      ResultRequirement, sha256_digest, terminal_task_result,
+    )
+    from gateway_test_support.admitted_authority_test_support import sealed_admitted_task
     from model_authority.binding import CredentialHandle
 
     source = SimpleNamespace(
@@ -1611,26 +1650,66 @@ def test_fork_parks_against_its_spawning_turn_after_a_later_turn_begins(
     )
 
     worker_ready = asyncio.Event()
-    child_context = replace(current_parent_context(session), job_id="job-child")
+    # The independently admitted child publishes on its own route: a distinct
+    # session and ledger, so publication proves the clone installed it.
+    child_session = _gateway_session(session_id="learning-child-session")
+    child_store = SQLiteApprovalStore(tmp_path / "learning-child.sqlite3")
+    child_route = child_approval_route(DurableLocalApprovalRoute(
+      child_store, FixedOutcomeApprovalPolicy("request_user_approval"), child_session,
+    ))
+    child_context = replace(
+      current_parent_context(session), job_id="job-child", approval_route=child_route,
+    )
+    child_scope: dict[str, Any] = (
+      {
+        "identity": DispatchIdentity(context=child_context, session=child_session),
+        "session": child_session,
+        "approval_route": child_context.approval_route,
+      }
+      if child_identity
+      else {"identity": None, "session": None, "approval_route": None}
+    )
+    publication_session = child_session if child_identity else session
+    publication_store = child_store if child_identity else store
 
-    def install_child_identity(fork: ToolDispatcher) -> None:
-      if child_identity:
-        fork._identity = DispatchIdentity(context=child_context, session=session)
+    parks: list[lifecycle_helpers.ApprovalPark] = []
 
-    async def run_fork(_fork_id: str, submitted_handoff: Any) -> float:
+    async def run_fork(fork_id: str, submitted_handoff: Any) -> TaskEntry:
       await worker_ready.wait()
       fork = dispatcher.fork_child(
         capability_bind=execution.bind,
         event_log=EventLog(), session_id="fork-of-turn-a",
         spawning_turn=submitted_handoff.spawning_turn,
+        **child_scope,
       )
-      install_child_identity(fork)
-      _, error = await fork.dispatch_prepared(
-        "call-fork-park", "native_write",
-        PreparedToolCall({"api_key": "private-root-operand"}),
+      with pytest.raises(lifecycle_helpers.ApprovalPark) as raised:
+        await fork.dispatch_prepared(
+          "call-fork-park", "native_write",
+          PreparedToolCall({"api_key": "private-root-operand"}),
+        )
+      parks.append(raised.value)
+      admitted = sealed_admitted_task(
+        logical_task=OrdinaryDelegationTaskRef(
+          delegation_id=fork_id,
+          operation=AgentOperationRef(
+            namespace="agent-operation", name="learning-fork", version="1.0",
+            digest=sha256_digest({"operation": "learning-fork"}),
+          ),
+        ),
+        attempt=AttemptRef(
+          physical_task_id=fork_id, attempt_id=f"{fork_id}:attempt:1", attempt_number=1,
+        ),
+        result_requirement=ResultRequirement(
+          mode="narrative", terminal_narrative="required",
+          outcome=OutcomeRequirement(required=False, source="none"),
+        ),
       )
-      assert error is not None and error["code"] == "user_denied"
-      return 0.0
+      entry = TaskEntry(task_id=fork_id, task_type="agent", admitted_task=admitted)
+      entry.task_result = terminal_task_result(
+        admitted, status="awaiting_approval",
+        reason=f"approval:{raised.value.approval_id} call:call-fork-park",
+      )
+      return entry
 
     registry = ForkTaskRegistry(
       ForkLedger(tmp_path / "fork-ledger.sqlite", process_instance_id="test"),
@@ -1640,7 +1719,7 @@ def test_fork_parks_against_its_spawning_turn_after_a_later_turn_begins(
     if scheduled_learning_fork:
       launch = registry.submit(
         fork_id="learning-A", session_id=session.session_id, owner="alice",
-        handoff=handoff,
+        handoff=handoff, on_settled=None,
       )
       assert launch.launched
       task = registry._tasks_by_session[session.session_id]
@@ -1649,8 +1728,8 @@ def test_fork_parks_against_its_spawning_turn_after_a_later_turn_begins(
         event_log=EventLog(), session_id="fork-of-turn-a",
         capability_bind=execution.bind,
         spawning_turn=handoff.spawning_turn,
+        **child_scope,
       )
-      install_child_identity(fork)
       task = asyncio.create_task(fork.dispatch_prepared(
         "call-fork-park", "native_write",
         PreparedToolCall({"api_key": "private-root-operand"}),
@@ -1658,39 +1737,36 @@ def test_fork_parks_against_its_spawning_turn_after_a_later_turn_begins(
     turn_b = await begin_turn("job-turn-b")
     assert turn_b.turn_id != turn_a.turn_id
     worker_ready.set()
-    try:
-      queue = await _wait_for_native_queue(session, task, "call-fork-park")
-      pending = session.pending_tools["call-fork-park"]
-      root_link = await SQLiteApprovalStore(store.path)._locate_root_turn_for_approval(
-        approval_id=pending["approval_id"], tenant_storage_id="alice",
+    if scheduled_learning_fork:
+      await asyncio.wait_for(task, timeout=10)
+      (park,) = parks
+    else:
+      with pytest.raises(lifecycle_helpers.ApprovalPark) as raised:
+        await asyncio.wait_for(task, timeout=10)
+      park = raised.value
+    assert publication_session.pending_tools == {}
+    assert publication_session.approval_queues == {}
+    root_link = await SQLiteApprovalStore(
+      publication_store.path,
+    )._locate_root_turn_for_approval(
+      approval_id=park.approval_id, tenant_storage_id="alice",
+    )
+    if child_identity:
+      assert park.root_turn_id is None
+      assert await store.get(park.approval_id) is None
+      binding, _ = await child_store._read_executable_binding_for_executor(
+        job_id="job-child", tool_call_id="call-fork-park",
+        nonce=park.nonce, tenant_storage_id="alice",
       )
-      if child_identity:
-        binding, _ = await store._read_executable_binding_for_executor(
-          job_id="job-child", tool_call_id="call-fork-park",
-          nonce=pending["nonce"], tenant_storage_id="alice",
-        )
-        assert binding.job_id == "job-child"
-        assert root_link is None
-      else:
-        assert root_link == (
-          "job-turn-a", "call-fork-park", pending["nonce"], turn_a.turn_id,
-        )
-      request = await store.get(pending["approval_id"])
-      assert request is not None
-      await store.transition_state(
-        request.approval_id, "denied", expected_state_version=request.state_version,
-        decider_id="alice", decider_role="owner", decision="denied",
+      assert binding.job_id == "job-child"
+      assert root_link is None
+    else:
+      assert park.root_turn_id == turn_a.turn_id
+      assert root_link == (
+        "job-turn-a", "call-fork-park", park.nonce, turn_a.turn_id,
       )
-      await queue.put({"approved": False, "allow_tool_type": False})
-      result = await task
-      if not scheduled_learning_fork:
-        _, error = result
-        assert error is not None and error["code"] == "user_denied"
-    finally:
-      if not task.done():
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-          await task
+    request = await publication_store.get(park.approval_id)
+    assert request is not None and request.state == "pending_user"
 
   asyncio.run(scenario())
 
@@ -1726,7 +1802,7 @@ def test_native_parks_before_and_after_rotation_capture_their_original_generatio
 
   async def scenario() -> None:
     dispatcher, store, session = _native_capture_dispatcher(tmp_path)
-    parked: dict[str, tuple[asyncio.Task[ToolResult], asyncio.Queue]] = {}
+    parked: dict[str, lifecycle_helpers.ApprovalPark] = {}
 
     class RotatingProvider(AnthropicProvider):
       def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
@@ -1737,10 +1813,11 @@ def test_native_parks_before_and_after_rotation_capture_their_original_generatio
 
       async def stream(self, client: Any, params: dict[str, Any]):
         call_id = "call-before-rotation" if client == token_a else "call-after-rotation"
-        task = asyncio.create_task(dispatcher.dispatch_prepared(
-          call_id, "native_write", PreparedToolCall({"ticker": "MSFT"}),
-        ))
-        parked[call_id] = (task, await _wait_for_native_queue(session, task, call_id))
+        with pytest.raises(lifecycle_helpers.ApprovalPark) as raised:
+          await dispatcher.dispatch_prepared(
+            call_id, "native_write", PreparedToolCall({"ticker": "MSFT"}),
+          )
+        parked[call_id] = raised.value
         if client == token_a:
           raise RateLimitedError("Anthropic rate limit exceeded")
         yield StreamEvent(type="text_delta", text="rotated")
@@ -1768,36 +1845,25 @@ def test_native_parks_before_and_after_rotation_capture_their_original_generatio
       session_id=session.session_id, user_id="alice", billing_mode="byok",
       rate_table_version="unknown",
     )
-    try:
-      await runner.run(messages=[{"role": "user", "content": "rotate then park"}])
-      assert any(entry.event.get("type") == "credential_refreshed" for entry in event_log.entries)
-      assert runner.capability_execution.bind.credential_ref == generation_b
-      assert dispatcher._capability_bind is runner.capability_execution.bind
-      assert set(parked) == {"call-before-rotation", "call-after-rotation"}
-      for call_id, generation in (
-        ("call-before-rotation", generation_a), ("call-after-rotation", generation_b),
-      ):
-        pending = session.pending_tools[call_id]
-        binding, request = await store._read_executable_binding_for_executor(
-          job_id="job-native", tool_call_id=call_id, nonce=pending["nonce"],
-          tenant_storage_id="alice",
-        )
-        assert binding.credential_generation_ref == generation
-        assert await store._locate_root_turn_for_approval(
-          approval_id=request.approval_id, tenant_storage_id="alice",
-        ) == ("job-native", call_id, pending["nonce"], root_turn.turn_id)
-        await store.transition_state(
-          request.approval_id, "denied", expected_state_version=request.state_version,
-          decider_id="alice", decider_role="owner", decision="denied",
-        )
-        task, queue = parked[call_id]
-        await queue.put({"approved": False, "allow_tool_type": False})
-        _, error = await task
-        assert error is not None and error["code"] == "user_denied"
-    finally:
-      for task, _queue in parked.values():
-        if not task.done():
-          task.cancel()
-      await asyncio.gather(*(task for task, _queue in parked.values()), return_exceptions=True)
+    await runner.run(messages=[{"role": "user", "content": "rotate then park"}])
+    assert any(entry.event.get("type") == "credential_refreshed" for entry in event_log.entries)
+    assert runner.capability_execution.bind.credential_ref == generation_b
+    assert dispatcher._capability_bind is runner.capability_execution.bind
+    assert set(parked) == {"call-before-rotation", "call-after-rotation"}
+    assert session.pending_tools == {} and session.approval_queues == {}
+    for call_id, generation in (
+      ("call-before-rotation", generation_a), ("call-after-rotation", generation_b),
+    ):
+      park = parked[call_id]
+      assert park.root_turn_id == root_turn.turn_id
+      binding, request = await store._read_executable_binding_for_executor(
+        job_id="job-native", tool_call_id=call_id, nonce=park.nonce,
+        tenant_storage_id="alice",
+      )
+      assert binding.credential_generation_ref == generation
+      assert request.state == "pending_user"
+      assert await store._locate_root_turn_for_approval(
+        approval_id=request.approval_id, tenant_storage_id="alice",
+      ) == ("job-native", call_id, park.nonce, root_turn.turn_id)
 
   asyncio.run(scenario())

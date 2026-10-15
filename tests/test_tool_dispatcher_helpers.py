@@ -21,7 +21,6 @@ def test_tool_dispatcher_helper_exports_are_parent_aliases() -> None:
     "ToolResult",
     "NeedsApprovalCallback",
     "ApprovalKeyQualifier",
-    "_approval_queue_timeout_seconds",
     "TransportApprovalRequest",
     "TransportApprovalResult",
     "ApprovalCallback",
@@ -32,7 +31,6 @@ def test_tool_dispatcher_helper_exports_are_parent_aliases() -> None:
     "InterceptDecision",
     "InterceptResult",
     "ToolInterceptor",
-    "HeadlessAskCallback",
     "ToolExecutionContext",
   )
 

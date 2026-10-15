@@ -445,7 +445,7 @@ def stub_bound_capability_execution(
     protocol_profile=bind.protocol_profile,
     route=bind.route,
     lifecycle="active",
-    capabilities={capability_id: "internal"},
+    capabilities={capability_id: "internal", "session.compact": "internal"},
     supported_efforts=frozenset({effort}),
     default_effort=effort,
     features=frozenset({"tools", "streaming"}),
@@ -453,12 +453,14 @@ def stub_bound_capability_execution(
     compat=compat_for_profile(bind.protocol_profile),
   )
   # The policy owner requires every capability slot. Keep the execution's
-  # model qualified only for its own slot; other slots get a separate entry.
+  # model qualified only for its own slot (and for `session.compact`, which the
+  # shipped policy answers with `inherit_parent`: the portable summary runs on
+  # the parent's own model); other slots get a separate entry.
   other_entry = replace(
     entry,
     key=f"{entry.key}.other-capabilities",
     route=f"{entry.route}.other-capabilities",
-    capabilities={slot: "internal" for slot in CAPABILITY_IDS if slot != capability_id},
+    capabilities={slot: "internal" for slot in CAPABILITY_IDS if slot not in (capability_id, "session.compact")},
   )
   registry = ProductModelRegistry(
     schema=SCHEMA,
@@ -480,13 +482,19 @@ def stub_bound_capability_execution(
       capabilities={
         slot: CapabilitySelectionPolicy(
           capability_id=slot,
-          default=CapabilityDefault(
-            kind="model",
-            model_key=entry.key if slot == capability_id else other_entry.key,
-            effort=effort,
+          default=(
+            CapabilityDefault(kind="inherit_parent")
+            if slot == "session.compact"
+            else CapabilityDefault(
+              kind="model",
+              model_key=entry.key if slot == capability_id else other_entry.key,
+              effort=effort,
+            )
           ),
           by_channel={},
-          allowed_model_keys=frozenset({entry.key if slot == capability_id else other_entry.key}),
+          allowed_model_keys=frozenset(
+            {entry.key} if slot in (capability_id, "session.compact") else {other_entry.key}
+          ),
         )
         for slot in CAPABILITY_IDS
       },
@@ -497,7 +505,7 @@ def stub_bound_capability_execution(
       tenant_id="test-tenant",
       user_provider_handles={bind.provider: handle} if credential_principal == "user" else {},
       service_provider_handles={bind.provider: handle} if credential_principal == "service" else {},
-      entitled_capabilities=frozenset({capability_id}),
+      entitled_capabilities=frozenset({capability_id, "session.compact"}),
       entitled_model_keys=frozenset({bind.model_key}),
       run_scoped_user_providers=(
         frozenset({bind.provider}) if credential_principal == "user" else frozenset()

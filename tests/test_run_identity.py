@@ -10,11 +10,8 @@ from agent_gateway import AgentRunner, CostEstimate, EventLog, ModelInfo, ModelP
 from agent_gateway.approval_policy import RunContext
 from agent_gateway.runner import StreamTurnResult
 from agent_gateway.run_identity import (
-  RUN_IDENTITY_MCP_ENV,
-  RUN_IDENTITY_MCP_TOOLS_ENV,
   RunIdentityCarrier,
   RunIdentityCarrierError,
-  inject_run_identity_into_mcp_server_configs,
 )
 from agent_gateway.tool_dispatcher import ToolDispatcher
 from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
@@ -114,43 +111,6 @@ def test_run_identity_carrier_rejects_malformed_ids(run_id: str) -> None:
     RunIdentityCarrier(run_id)
 
   assert raised.value.code == "run_identity_invalid"
-
-
-def test_sdk_stdio_carrier_is_server_owned_and_copy_on_write() -> None:
-  source = {
-    "portfolio-producers-mcp": {
-      "command": "python",
-      "args": ["producer.py"],
-      "env": {"EXISTING": "1"},
-    },
-    "research-corpus-mcp": {"command": "python", "args": ["corpus.py"]},
-  }
-
-  bound = inject_run_identity_into_mcp_server_configs(
-    source,
-    server_names=frozenset({"portfolio-producers-mcp"}),
-    carrier=RunIdentityCarrier("skill-run-sdk"),
-  )
-
-  assert source["portfolio-producers-mcp"]["env"] == {"EXISTING": "1"}
-  assert bound["portfolio-producers-mcp"]["env"] == {
-    "EXISTING": "1",
-    RUN_IDENTITY_MCP_ENV: "skill-run-sdk",
-    RUN_IDENTITY_MCP_TOOLS_ENV: "build_model,prepare_model_build",
-  }
-  assert RUN_IDENTITY_MCP_ENV not in bound["research-corpus-mcp"].get("env", {})
-
-  with pytest.raises(RunIdentityCarrierError, match="attempted to override"):
-    inject_run_identity_into_mcp_server_configs(
-      {
-        "portfolio-producers-mcp": {
-          "command": "python",
-          "env": {RUN_IDENTITY_MCP_ENV: "attacker-run"},
-        }
-      },
-      server_names=frozenset({"portfolio-producers-mcp"}),
-      carrier=RunIdentityCarrier("skill-run-sdk"),
-    )
 
 
 @pytest.mark.parametrize("tool_name", ["prepare_model_build", "build_model"])

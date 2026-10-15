@@ -43,6 +43,7 @@ from .runner_usage import (
 if TYPE_CHECKING:
   from pathlib import Path
 
+  from .capability_execution import ModelFallbackHop
   from .event_log import EventLog
   from .multi_user.billing import _UsageAggregator
   from .runner_tool_execution import AgentRunnerDispatcher
@@ -86,6 +87,7 @@ class RunnerHooksLifecycleMixin:
     _request_id: str
     _sid: str
     _summary_emitted: bool
+    _model_fallback_hop: ModelFallbackHop | None
     _usage_ledger_dlq_path: Path
     _usage_user_id: str
 
@@ -169,25 +171,39 @@ class RunnerHooksLifecycleMixin:
     )
     if refreshed_execution is None:
       return False
-    refreshed_run_config = normalized_run_config(
-      refreshed_execution.auth_config,
-      upstream_model=refreshed_execution.bind.upstream_model,
-      effort=refreshed_execution.bind.effort,
+    self._install_capability_execution(config, refreshed_execution)
+    return True
+
+  def _install_capability_execution(
+    self,
+    config: Dict[str, Any],
+    execution: BoundCapabilityExecution,
+  ) -> None:
+    """Make a rebound execution the runner's and its dispatcher's.
+
+    Credential rotation and a model-fallback hop both land here: the request
+    config, provider adapter, secret boundary and tool-capture bind all follow
+    the one execution for the remaining attempts.
+    """
+    run_config = normalized_run_config(
+      execution.auth_config,
+      upstream_model=execution.bind.upstream_model,
+      effort=execution.bind.effort,
     )
-    self._dispatcher.replace_capability_bind(refreshed_execution.bind)
+    self._dispatcher.replace_capability_bind(execution.bind)
     config.clear()
-    config.update(refreshed_run_config)
+    config.update(run_config)
     self._auth_config.clear()
-    self._auth_config.update(refreshed_execution.auth_config)
-    self._provider = refreshed_execution.provider
-    self._capability_execution = refreshed_execution
+    self._auth_config.update(execution.auth_config)
+    self._provider = execution.provider
+    self._capability_execution = execution
     current_boundary = getattr(self, "_secret_boundary", None)
     self._secret_boundary = (
       current_boundary.extended_for_capability_execution(
-        refreshed_execution
+        execution
       )
       if isinstance(current_boundary, SecretBoundary)
-      else SecretBoundary.from_capability_execution(refreshed_execution)
+      else SecretBoundary.from_capability_execution(execution)
     )
     bind_dispatcher_boundary = getattr(
       getattr(self, "_dispatcher", None),
@@ -196,7 +212,6 @@ class RunnerHooksLifecycleMixin:
     )
     if callable(bind_dispatcher_boundary):
       bind_dispatcher_boundary(self._secret_boundary)
-    return True
 
   @staticmethod
   def _usage_has_tokens(usage_totals: Dict[str, int]) -> bool:
@@ -221,7 +236,30 @@ class RunnerHooksLifecycleMixin:
       rate_table_version=self._rate_table_version,
       billing_mode=self._billing_mode,
       channel=self._channel,
+      selection_provenance=self._usage_selection_provenance(),
     )
+
+  def _usage_selection_provenance(self) -> dict[str, Any] | None:
+    """V3 provenance for this call, or None when the runner captured none."""
+    context = self._dispatcher.capture_spawning_turn().context
+    if context is None:
+      return None
+    provenance = context.selection_provenance
+    if provenance is None:
+      return None
+    recorded = provenance.model_dump(mode="json")
+    hop = self._model_fallback_hop
+    reason = getattr(self, "_model_fallback_reason", None)
+    if hop is not None and reason in ("usage_limit", "provider_outage", "credential_denied"):
+      recorded["fallback"] = {
+        "primary_model_key": hop.primary_model_key,
+        "role": hop.role,
+        "chain_index": hop.chain_index,
+        "reason": reason,
+      }
+    else:
+      recorded["fallback"] = None
+    return recorded
 
   async def _call_on_usage(
     self, usage_event: UsageEvent, *, usage_state: UsageState = "succeeded"
@@ -248,13 +286,24 @@ class RunnerHooksLifecycleMixin:
       logger=log,
     )
 
-  async def _call_on_session_summary(self, summary: SessionUsageSummary) -> None:
+  async def _call_on_session_summary(
+    self,
+    summary: SessionUsageSummary,
+    *,
+    reconciled: SessionUsageSummary | None = None,
+  ) -> None:
+    # Only the root run reconciles commercial usage, against the whole tree.
     await _runner_attr(self, "_call_session_summary_hook", _call_session_summary_hook)(
       self._on_session_summary,
       summary,
       log_session_id=self._sid,
       logger=log,
-      commercial_usage_producer=getattr(self, "_commercial_usage_producer", None),
+      commercial_usage_producer=(
+        None
+        if getattr(self, "_usage_parent", None) is not None
+        else getattr(self, "_commercial_usage_producer", None)
+      ),
+      reconciled=reconciled,
       emit_metric=self._call_metric,
     )
 

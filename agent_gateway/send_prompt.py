@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
+from pathlib import Path
 import time
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -108,12 +110,18 @@ async def send_prompt(
   channel: str | None = None,
   on_usage: Callable[..., None] | None = None,
   commercial_usage_producer: CommercialUsageProducer | None = None,
+  completion_record_root: Path | None,
 ) -> str:
   """Execute one already-resolved capability bind and return plain text.
 
   Capability, provider, credential, model, and effort selection must happen
   before this execution-only helper is called. The exact provider adapter and
   bound credential snapshot are validated before a provider client is created.
+
+  `completion_record_root` has no default: every caller states whether its
+  calls are captured. When set, each provider attempt (ok, error, canceled)
+  appends one `completion_record` v1 row at `capture_level="stream"`; the
+  returned text is unchanged and a write failure never fails the call.
   """
   from model_authority.binding import validate_reported_identity
   from .multi_user.billing import UsageEvent, UsageState, normalize_identity
@@ -159,6 +167,48 @@ async def send_prompt(
   provider_unit_deltas: dict[str, int] = {}
   provider_reported_model: str | None = None
   stop_reason = ""
+  content_blocks: list[dict[str, Any]] = []
+  attempt_started_at = datetime.now(timezone.utc)
+  params: dict[str, Any] = {}
+
+  async def _record_attempt(status: str, exc: BaseException | None = None) -> None:
+    if completion_record_root is None:
+      return
+    from .completion_record import append_completion_record, build_completion_record
+
+    now = datetime.now(timezone.utc)
+    record = build_completion_record(
+      source_repo=None,
+      call_site=capability_bind.capability_id,
+      provider=capability_bind.provider,
+      model=model,
+      capture_level="stream",
+      request=dict(params),
+      response=(
+        {"content_blocks": list(content_blocks), "stop_reason": stop_reason or None}
+        if status == "ok" else None
+      ),
+      status=status,  # type: ignore[arg-type]
+      started_at=attempt_started_at,
+      recorded_at=now,
+      duration_ms=int((now - attempt_started_at).total_seconds() * 1000),
+      caller="send_prompt",
+      session_id=session_id,
+      request_id=normalized_request_id or None,
+      user_id=usage_user_id,
+      provider_reported_model=provider_reported_model,
+      capability_bind=capability_bind.to_json(),
+      usage={
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_creation_tokens": cache_creation_tokens,
+        "reasoning_tokens": reasoning_tokens,
+      },
+      error_type=None if exc is None else type(exc).__name__,
+      error_message=None if exc is None else str(exc)[:2000],
+    )
+    await asyncio.to_thread(append_completion_record, completion_record_root, record)
 
   async def _emit_usage(usage_state: UsageState) -> None:
     if on_usage is None and commercial_usage_producer is None:
@@ -199,6 +249,7 @@ async def send_prompt(
   try:
     while True:
       client = provider.create_client(config=config)
+      attempt_started_at = datetime.now(timezone.utc)
       params = provider.build_request_params(
         model=model,
         messages=[{"role": "user", "content": prompt}],
@@ -224,6 +275,11 @@ async def send_prompt(
               text_parts.append(text)
             continue
 
+          if event.type in ("text_end", "thinking_end"):
+            if isinstance(event.raw_block, dict):
+              content_blocks.append(event.raw_block)
+            continue
+
           if event.type == "message_start":
             input_tokens += int(event.input_tokens or 0)
             cache_read_tokens += int(event.cache_read_tokens or 0)
@@ -247,13 +303,15 @@ async def send_prompt(
 
           if event.type == "message_end":
             stop_reason = str(event.stop_reason or "")
-      except asyncio.CancelledError:
+      except asyncio.CancelledError as exc:
         if input_tokens or output_tokens or cache_read_tokens or cache_creation_tokens:
           await _emit_usage("canceled")
+        await _record_attempt("canceled", exc)
         raise
       except Exception as exc:
         if input_tokens or output_tokens or cache_read_tokens or cache_creation_tokens:
           await _emit_usage("failed_billable")
+        await _record_attempt("error", exc)
         rotated_execution = _rotated_execution(execution, exc)
         if rotated_execution is None:
           raise
@@ -263,6 +321,7 @@ async def send_prompt(
         provider = execution.provider
         config, max_tokens, effort_resolution = _prepare_bound_execution(execution)
         text_parts.clear()
+        content_blocks.clear()
         input_tokens = output_tokens = reasoning_tokens = 0
         cache_read_tokens = cache_creation_tokens = 0
         provider_unit_deltas.clear()
@@ -272,6 +331,7 @@ async def send_prompt(
       break
 
     await _emit_usage("succeeded")
+    await _record_attempt("ok")
 
     log.info(
       "[%s] Prompt done | model=%s | stop=%s | tokens in=%d out=%d | cache read=%d create=%d",

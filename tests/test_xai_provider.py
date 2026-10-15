@@ -437,13 +437,14 @@ def test_error_event_identifies_xai() -> None:
   ],
 )
 def test_xai_windows_come_from_the_authority_entry(model_id: str, expected_window: int, expected_trigger: int) -> None:
+  from agent_gateway.containment_settings import ContainmentSettings
   from agent_gateway.runner_limits import effective_compaction_trigger
 
   provider = XAIProvider()
   info = provider.get_model_info(model_id)
 
   assert info.context_window == expected_window
-  assert effective_compaction_trigger(160_000, info) == expected_trigger
+  assert effective_compaction_trigger(160_000, info, ContainmentSettings()) == expected_trigger
 
 
 # Aliases and retired ids the authority does not list for xai.responses.

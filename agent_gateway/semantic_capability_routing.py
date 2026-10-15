@@ -7,15 +7,15 @@ single coarse ``research-evidence.read/v1`` requirement, ``file_read``
 included.  That is why a methodology could declare "I need evidence" and be
 admitted by a tool that cannot possibly supply it.
 
-This module is the one place that answers "which capability does this tool
-serve".  Static registration derives from an exact registered identity first,
-then its owning MCP server and intrinsic effect.  The existing bare-name
-helper remains a compatibility projection for current runtime readers only.
+A read route's capability is the one its registration owner declares (the
+server policy for an MCP route, the local-effect policy for a local handler);
+a write route's capability follows from its intrinsic effect.  This module
+holds the vocabulary and that derivation, and no per-tool or per-server list.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from types import MappingProxyType
 
 from agent_workflow_contracts.tool_registration import (
@@ -24,6 +24,8 @@ from agent_workflow_contracts.tool_registration import (
   ToolRegistrationContractError,
   validate_registered_tool_identity,
 )
+
+from .policy_imports import load_server_policy_module
 
 
 # ---------------------------------------------------------------------------
@@ -49,79 +51,9 @@ STATE_MUTATE = "state.mutate/v1"
 MARKET_DATA_HISTORY = "market-data.history/v1"
 
 
-def _local(logical_name: str) -> RegisteredToolIdentity:
-  return RegisteredToolIdentity(
-    route_kind="local_handler",
-    logical_name=logical_name,
-  )
-
-
-def _mcp(logical_server_id: str, logical_name: str) -> RegisteredToolIdentity:
-  return RegisteredToolIdentity(
-    route_kind="mcp",
-    logical_server_id=logical_server_id,
-    logical_name=logical_name,
-  )
-
-
-#: Exact registered identity -> read capability.  Identity overrides precede
-#: the owning-server default and cannot leak to a same-bare-name route.
-_READ_CAPABILITY_BY_IDENTITY: Mapping[RegisteredToolIdentity, str] = (
-  MappingProxyType({
-    _local("docs_fetch"): WEB_READ,
-    _local("docs_search"): WEB_READ,
-    _local("web_fetch"): WEB_READ,
-    _local("web_search"): WEB_READ,
-    _mcp("research-corpus-mcp", "filings_list"): FILINGS_READ,
-    _mcp("research-corpus-mcp", "filings_read"): FILINGS_READ,
-    _mcp("research-corpus-mcp", "filings_search"): FILINGS_READ,
-    _mcp("research-corpus-mcp", "filings_source_excerpt"): FILINGS_READ,
-    _mcp("market-data-mcp", "get_earnings_transcript"): TRANSCRIPTS_READ,
-    _mcp("research-corpus-mcp", "transcripts_list"): TRANSCRIPTS_READ,
-    _mcp("research-corpus-mcp", "transcripts_read"): TRANSCRIPTS_READ,
-    _mcp("research-corpus-mcp", "transcripts_search"): TRANSCRIPTS_READ,
-    _mcp("research-corpus-mcp", "transcripts_source_excerpt"): TRANSCRIPTS_READ,
-    _local("file_glob"): CORPUS_READ,
-    _local("file_grep"): CORPUS_READ,
-    _local("file_read"): CORPUS_READ,
-    _local("memory_list"): CORPUS_READ,
-    _local("memory_read"): CORPUS_READ,
-    _local("memory_recall"): CORPUS_READ,
-    _local("fms_compute_quantifying_risk"): COMPUTATION_EXECUTE,
-    _local("code_execute"): COMPUTATION_EXECUTE,
-    _local("code_execute_status"): COMPUTATION_EXECUTE,
-    _local("invoke_skill"): COMPUTATION_EXECUTE,
-    _local("load_tools"): COMPUTATION_EXECUTE,
-    _local("valuation_ready_batch_read"): COMPUTATION_EXECUTE,
-  })
-)
-
-# Current runtime readers still pass a bare name.  This compatibility view is
-# projected one way from exact overrides and is not consulted by registration.
-_LEGACY_READ_CAPABILITY_BY_TOOL: Mapping[str, str] = MappingProxyType({
-  identity.logical_name: capability
-  for identity, capability in _READ_CAPABILITY_BY_IDENTITY.items()
-})
-
-#: MCP server -> read capability for every tool it owns that the tool map
-#: above does not claim.
-_READ_CAPABILITY_BY_SERVER: Mapping[str, str] = MappingProxyType({
-  "edgar-parser-mcp": FILINGS_READ,
-  "research-corpus-mcp": CORPUS_READ,
-  "market-data-mcp": MARKET_DATA_READ,
-  "fred-mcp": MARKET_DATA_READ,
-  "macro-mcp": MARKET_DATA_READ,
-  "positioning-mcp": MARKET_DATA_READ,
-  "sheetsfinance": MARKET_DATA_READ,
-  "idea-workbench-mcp": MARKET_DATA_READ,
-  "model-engine": COMPUTATION_EXECUTE,
-  "portfolio-reads-mcp": COMPUTATION_EXECUTE,
-  "gsheets-mcp": COMPUTATION_EXECUTE,
-})
-
-#: A read route the platform cannot place in a named domain still gets a
-#: capability: an unplaceable route must never fall back to "satisfies
-#: anything", which is exactly the vacuous admission B-8 removes.
+#: A read route whose owner declares no capability still gets one: an
+#: unplaceable route must never fall back to "satisfies anything", which is
+#: exactly the vacuous admission B-8 removes.
 _DEFAULT_READ_CAPABILITY = CORPUS_READ
 
 
@@ -131,16 +63,21 @@ SEMANTIC_CAPABILITY_CORRECTIONS_BY_EFFECT: Mapping[str, str] = MappingProxyType(
   "irreversible": STATE_MUTATE,
   "portfolio_config": STATE_MUTATE,
 })
-SEMANTIC_CAPABILITY_CORRECTIONS_BY_IDENTITY: Mapping[
-  RegisteredToolIdentity, str
-] = (
-  MappingProxyType({
-    _mcp("timesfm", "timesfm_forecast"): COMPUTATION_EXECUTE,
-  })
-)
 
 _READ_INTRINSIC_EFFECTS = frozenset({"read", "pure_transform", "support"})
 _PROPOSE_INTRINSIC_EFFECTS = frozenset({"preview", "artifact_write"})
+
+
+def _declared_read_capability(name: str, server_id: str | None) -> str | None:
+  """The read capability the bound registration owner declares, if any."""
+
+  policy = load_server_policy_module()
+  resolve: Callable[[str, str | None], str | None] | None = (
+    getattr(policy, "get_read_capability", None)
+    if policy is not None
+    else None
+  )
+  return resolve(name, server_id) if resolve is not None else None
 
 
 def capability_for_tool(
@@ -158,12 +95,7 @@ def capability_for_tool(
 
   name = str(canonical_name or "").strip()
   if effect == "read":
-    by_tool = _LEGACY_READ_CAPABILITY_BY_TOOL.get(name)
-    if by_tool is not None:
-      return by_tool
-    if server_id is not None:
-      return _READ_CAPABILITY_BY_SERVER.get(server_id, _DEFAULT_READ_CAPABILITY)
-    return _DEFAULT_READ_CAPABILITY
+    return _declared_read_capability(name, server_id) or _DEFAULT_READ_CAPABILITY
   if effect == "propose":
     return ARTIFACT_PROPOSE
   if effect == "write":
@@ -178,12 +110,14 @@ def capability_for_tool(
 def semantic_capability_for_registration(
   identity: RegisteredToolIdentity,
   effect: ToolEffect,
+  *,
+  read_capability: str | None,
 ) -> str:
-  """Derive the existing versioned capability for static intrinsic semantics.
+  """Derive the versioned capability for static intrinsic semantics.
 
-  The exact identity is authoritative.  Identity overrides cannot leak across
-  routes that share a bare name, and this function never calls the legacy
-  bare-name compatibility resolver.
+  ``read_capability`` is the registration owner's declaration for this exact
+  identity; it decides every read-like effect.  Write-like effects derive
+  from the effect itself.
   """
 
   canonical = validate_registered_tool_identity(identity)
@@ -193,19 +127,7 @@ def semantic_capability_for_registration(
   if by_effect is not None:
     return by_effect
   if effect in _READ_INTRINSIC_EFFECTS:
-    correction = SEMANTIC_CAPABILITY_CORRECTIONS_BY_IDENTITY.get(canonical)
-    if correction is not None:
-      return correction
-    by_identity = _READ_CAPABILITY_BY_IDENTITY.get(canonical)
-    if by_identity is not None:
-      return by_identity
-    if canonical.route_kind == "mcp":
-      assert canonical.logical_server_id is not None
-      return _READ_CAPABILITY_BY_SERVER.get(
-        canonical.logical_server_id,
-        _DEFAULT_READ_CAPABILITY,
-      )
-    return _DEFAULT_READ_CAPABILITY
+    return read_capability or _DEFAULT_READ_CAPABILITY
   if effect in _PROPOSE_INTRINSIC_EFFECTS:
     return ARTIFACT_PROPOSE
   if effect == "state_write":
@@ -226,7 +148,6 @@ __all__ = [
   "MARKET_DATA_READ",
   "STATE_MUTATE",
   "SEMANTIC_CAPABILITY_CORRECTIONS_BY_EFFECT",
-  "SEMANTIC_CAPABILITY_CORRECTIONS_BY_IDENTITY",
   "TRANSCRIPTS_READ",
   "WEB_READ",
   "WORKSPACE_WRITE",

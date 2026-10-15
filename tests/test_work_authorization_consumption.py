@@ -5,12 +5,15 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import sqlite3
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from agent_gateway import work_authorization_consumption as consumption_module
-from agent_gateway.commercial_work_authorization import VerifiedWorkAuthorization
+from hank_contracts.commercial_work import (
+  VerifiedWorkAuthorization,
+  WorkAuthorizationError,
+)
 from agent_gateway.work_authorization_consumption import (
   WorkAuthorizationAlreadyAttached,
   WorkAuthorizationConsumptionConflict,
@@ -197,6 +200,86 @@ def test_same_columns_with_weakened_constraints_fail_closed(tmp_path) -> None:
     WorkAuthorizationConsumptionStore(path)
 
 
+def test_previous_v1_store_is_rebuilt_and_old_row_reads_back(tmp_path) -> None:
+  path = tmp_path / "usage.sqlite3"
+  v1 = _verified()
+  previous_columns = consumption_module._V1_COLUMNS
+  values = consumption_module._values(
+    v1,
+    consumption_module._content_sha256(v1),
+    "2026-07-11T12:00:01.000000Z",
+  )[: len(previous_columns)]
+  with sqlite3.connect(path) as connection:
+    connection.execute(consumption_module._PREVIOUS_TABLE_SQL)
+    for trigger in consumption_module._TRIGGERS:
+      connection.execute(trigger)
+    connection.execute(
+      "INSERT INTO commercial_work_authorization_consumptions "
+      f"({', '.join(previous_columns)}) "
+      f"VALUES ({', '.join('?' for _ in previous_columns)})",
+      values,
+    )
+
+  store = _store(path)
+
+  migrated = store.get(v1.authorization_id)
+  assert migrated is not None
+  assert migrated.schema_version == 1
+  assert migrated.model_key is None
+  assert migrated.credential_principal is None
+  assert migrated.reserved_spend_microusd is None
+  assert migrated.request_id == v1.request_id
+  with pytest.raises(WorkAuthorizationAlreadyAttached):
+    store.attach_once(v1)
+  v3 = _verified(
+    schema_version=3,
+    credential_principal="user",
+    reserved_spend_microusd=250_000,
+  )
+  record = store.attach_once(v3)
+  assert record.schema_version == 3
+  assert record.model_key is None
+  assert (record.credential_principal, record.reserved_spend_microusd) == (
+    "user",
+    250_000,
+  )
+
+
+def test_previous_v2_store_is_rebuilt_and_old_row_reads_back(tmp_path) -> None:
+  path = tmp_path / "usage.sqlite3"
+  v2 = _verified(schema_version=2)
+  columns = consumption_module._V2_COLUMNS
+  values = list(consumption_module._values(
+    v2,
+    consumption_module._content_sha256(v2),
+    "2026-07-11T12:00:01.000000Z",
+  )[: len(columns)])
+  model_key_index = columns.index("model_key")
+  principal_index = columns.index("credential_principal")
+  values[model_key_index] = "anthropic.claude-sonnet-5-5"
+  values[principal_index] = "service"
+  with sqlite3.connect(path) as connection:
+    connection.execute(consumption_module._V2_TABLE_SQL)
+    for trigger in consumption_module._TRIGGERS:
+      connection.execute(trigger)
+    connection.execute(
+      "INSERT INTO commercial_work_authorization_consumptions "
+      f"({', '.join(columns)}) "
+      f"VALUES ({', '.join('?' for _ in columns)})",
+      values,
+    )
+
+  store = _store(path)
+  migrated = store.get(v2.authorization_id)
+  assert migrated is not None
+  assert migrated.schema_version == 2
+  assert migrated.model_key == "anthropic.claude-sonnet-5-5"
+  assert migrated.credential_principal == "service"
+  assert migrated.reserved_spend_microusd is None
+  assert migrated.provider == v2.provider
+  assert migrated.request_id == v2.request_id
+
+
 def test_same_columns_with_case_changed_digest_constraint_fail_closed(
   tmp_path,
 ) -> None:
@@ -233,3 +316,120 @@ def test_store_fails_closed_when_permissions_cannot_be_secured(
   monkeypatch.setattr(consumption_module.os, "chmod", denied)
   with pytest.raises(WorkAuthorizationConsumptionError, match="permissions"):
     WorkAuthorizationConsumptionStore(tmp_path / "usage.sqlite3")
+
+@pytest.mark.parametrize(
+  "observability",
+  ("hank_metered", "hank_byok_observed", "external_unobserved", "none"),
+)
+def test_attach_admits_all_verifier_observabilities(tmp_path, observability) -> None:
+  path = tmp_path / "usage.sqlite3"
+  store = _store(path)
+  auth = _verified(
+    schema_version=3,
+    primary_inference_observability=observability,
+    credential_principal="user",
+    billing_mode="byok",
+    reservation_id=None,
+    reserved_spend_microusd=None,
+  )
+  record = store.attach_once(auth)
+  assert record.primary_inference_observability == observability
+
+
+def test_store_migrates_v3_metered_observability_table(tmp_path) -> None:
+  path = tmp_path / "usage.sqlite3"
+  old_auth = _verified(
+    schema_version=3,
+    primary_inference_observability="hank_byok_observed",
+    credential_principal="user",
+    billing_mode="byok",
+    reservation_id=None,
+    reserved_spend_microusd=None,
+  )
+  content_sha = consumption_module._content_sha256(old_auth)
+  values = consumption_module._values(old_auth, content_sha, "2026-07-11T12:00:01Z")
+  with sqlite3.connect(path) as connection:
+    connection.execute(consumption_module._V3_METERED_OBSERVABILITY_TABLE_SQL)
+    cols = ", ".join(consumption_module._COLUMNS)
+    q = ", ".join("?" for _ in consumption_module._COLUMNS)
+    connection.execute(
+      f"INSERT INTO commercial_work_authorization_consumptions ({cols}) VALUES ({q})",
+      values,
+    )
+  store = _store(path)
+  # Pre-existing row survived migration intact
+  migrated = store.get(old_auth.authorization_id)
+  assert migrated is not None
+  assert migrated.primary_inference_observability == "hank_byok_observed"
+
+  # New row with external_unobserved attaches cleanly
+  auth = _verified(
+    schema_version=3,
+    primary_inference_observability="external_unobserved",
+    credential_principal="user",
+    billing_mode="byok",
+    reservation_id=None,
+    reserved_spend_microusd=None,
+  )
+  record = store.attach_once(auth)
+  assert record.primary_inference_observability == "external_unobserved"
+
+
+def test_verify_for_attach_then_attach_admits_external_unobserved(tmp_path) -> None:
+  # Loaded by path: under full-suite collection the name ``tests`` is the
+  # repository's root test package, not this one.
+  import importlib.util
+  from pathlib import Path
+
+  spec = importlib.util.spec_from_file_location(
+    "_gateway_commercial_work_authorization_helpers",
+    Path(__file__).with_name("test_commercial_work_authorization.py"),
+  )
+  assert spec is not None and spec.loader is not None
+  helpers = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(helpers)
+  _claim = helpers._claim
+  _keypair = helpers._keypair
+  _payload = helpers._payload
+  _token = helpers._token
+  _trust = helpers._trust
+  from agent_gateway.commercial_work_authorization import WorkAuthorizationVerifier
+
+  private, public = _keypair()
+  now_ts = int((NOW + timedelta(seconds=1)).timestamp())
+  verifier = WorkAuthorizationVerifier(
+    _trust(public, retired_at_by_key_id={"work-signing-v1": now_ts + 60}),
+    clock=lambda: now_ts,
+  )
+  payload = _payload(
+    schema_version=3,
+    primary_inference_observability="external_unobserved",
+    credential_principal="user",
+    billing_mode="byok",
+    reservation_id=None,
+    reserved_spend_microusd=None,
+    iat=now_ts - 10,
+    exp=now_ts + 300,
+  )
+  token = _token(private, payload)
+  verified = verifier.verify_for_attach(
+    token,
+    execution_claim=_claim(
+      context_id=UUID(payload["execution_claim_jti"]),
+      issued_at=now_ts - 10,
+      expires_at=now_ts + 300,
+      authorized_work_start_deadline=now_ts + 300,
+    ),
+    request_id="request-1",
+    session_id="session-1",
+    operation="messages.create",
+    billing_mode="byok",
+    capability_id="portfolio.review",
+    credential_principal="user",
+  )
+  assert verified.primary_inference_observability == "external_unobserved"
+
+  path = tmp_path / "usage.sqlite3"
+  store = _store(path)
+  record = store.attach_once(verified)
+  assert record.primary_inference_observability == "external_unobserved"

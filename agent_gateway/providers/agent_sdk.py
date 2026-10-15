@@ -5,7 +5,8 @@ import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
+from collections.abc import Set as AbstractSet
 
 from .anthropic import AnthropicProvider
 from .base import CostEstimate
@@ -14,6 +15,12 @@ from ..policy_imports import (
   load_server_policy_module,
   resolve_effective_role,
 )
+
+# A channel tier is the registration-derived view
+# (`agent.shared.tool_catalog.CHANNEL_TIERS`) or any mapping with `always` and
+# `defer` server sets; these readers only call `.get` on it.
+ChannelTier = Mapping[str, AbstractSet[str]]
+ChannelTiers = Mapping[Optional[str], ChannelTier]
 
 
 SDK_PINNED_VERSION = "0.2.153"
@@ -147,8 +154,8 @@ class AgentSDKConfig:
 
 def _resolve_channel_tier(
   channel: Optional[str],
-  channel_tiers: Dict[Optional[str], Dict[str, set[str]]],
-) -> Dict[str, set[str]]:
+  channel_tiers: ChannelTiers,
+) -> ChannelTier:
   default_tier = channel_tiers.get(None, {"always": set(), "defer": set()})
   return channel_tiers.get(channel, default_tier)
 
@@ -201,7 +208,7 @@ def _unclassified_tool_denials(available_tools: set[str]) -> set[str]:
 
 def build_disallowed_tools(
   channel: Optional[str],
-  channel_tiers: Dict[Optional[str], Dict[str, set[str]]],
+  channel_tiers: ChannelTiers,
   extra_blocked: set[str] | None = None,
   session: Any | None = None,
   available_tools: set[str] | None = None,

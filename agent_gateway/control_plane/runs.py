@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import APIRouter, Body, HTTPException, Query, Request, Response
 from model_authority.selection import capture_selection_snapshot
 
+from agent_workflow_contracts.models import SelectionProvenance
 from agent_gateway.admission import root_context
 from agent_gateway.autonomous_capability_handoff import AutonomousLaunchAdmissionRefused
 from agent_gateway.approval_route import bind_session_approval_route
@@ -181,6 +182,9 @@ def build_runs_router(
         chat_session.dispatch_scope = dispatch_scope
 
       try:
+        # The bearer lands on the session first: the dispatcher injects it as
+        # MCP meta.session_token for producer tools during the turn.
+        chat_session_token = auth.issue_token(chat_session)
         run = await _dispatch_control_chat_turn(
           request=request,
           session=chat_session,
@@ -194,7 +198,7 @@ def build_runs_router(
         )
         response = ChatDispatchResponse(
           run=run,
-          chat_session_token=auth.issue_token(chat_session),
+          chat_session_token=chat_session_token,
           chat_session_id=chat_session.session_id,
           chat_session_expires_at=chat_session.expires_at,
         )
@@ -214,6 +218,16 @@ def build_runs_router(
     channel = session_channel or requested_channel
     if not payload.profile or not payload.mode:
       raise HTTPException(status_code=422, detail="profile and mode are required")
+    # Only a skill launch admits through the selection snapshot a preset
+    # scopes; other modes resolve the session driver with no snapshot.
+    if payload.model_preset is not None and payload.mode != "skill":
+      raise HTTPException(
+        status_code=422,
+        detail=(
+          "model_preset applies only to mode='skill': only skill launches admit "
+          "through the selection snapshot a preset scopes"
+        ),
+      )
 
     registry = _require_autonomous_registry(autonomous_registry)
     registry.set_user_event_bus(getattr(request.app.state, "user_event_bus", None))
@@ -230,10 +244,17 @@ def build_runs_router(
             if registry.selection_policy is not None
             else None
           ),
+          selection_provenance=SelectionProvenance(
+            role="default",
+            role_source="spawn",
+            effort_source="spawn",
+            preset=None,
+          ),
         ),
         role=authenticated.role,
         profile=payload.profile,
         mode=payload.mode,
+        model_preset=payload.model_preset,
         task=payload.task,
         skill=payload.skill,
         pack=payload.pack,
@@ -269,6 +290,86 @@ def build_runs_router(
       cmd=list(record.cmd),
     )
 
+  async def _resume_autonomous_record(
+    authenticated: Any,
+    owner_user_id: str,
+    registry: Any,
+    record: AutonomousTask,
+    resume_payload: AutonomousResumeRequest,
+  ) -> AutonomousDispatchResponse:
+    async with record.resume_lock, registry.run_mutation_lock:
+      if not _autonomous_task_resumable(record):
+        raise HTTPException(status_code=409, detail="Autonomous run is not resumable")
+
+      for resumed_run_id in reversed(record.resumed_as):
+        resumed_record = registry._find_by_control_run_id(resumed_run_id)
+        resumed_state = _autonomous_run_from_task(resumed_record).state if resumed_record is not None else None
+        if is_control_run_active_state(resumed_state):
+          raise HTTPException(status_code=409, detail="Autonomous run already has an active resume")
+
+      resume_context = _build_autonomous_resume_context(record, resume_payload)
+      try:
+        start_payload = await registry.start(
+          # Resume follows current authority in both promotion and revocation directions.
+          role=authenticated.role,
+          profile=record.profile,
+          mode=record.mode,
+          task=record.task,
+          skill=record.skill,
+          context=resume_context,
+          ticker=record.ticker,
+          research_file_id=record.research_file_id,
+          channel=record.channel,
+          user_id=getattr(record, "raw_user_id", None) or authenticated.user_id,
+          user_email=authenticated.user_email,
+          owner_user_id=owner_user_id,
+          user_slug=getattr(authenticated, "user_slug", None) or record.user_slug,
+          risk_user_id=authenticated.risk_user_id or record.risk_user_id,
+          user_aliases=list(getattr(authenticated, "user_aliases", ()) or record.user_aliases or (owner_user_id,)),
+          identity_status=getattr(authenticated, "identity_status", None) or record.identity_status,
+          dispatch_scope=record.dispatch_scope,
+          resumed_from=record.control_run_id,
+        )
+      except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+      except NamedRefusal as exc:
+        raise HTTPException(status_code=exc.http_status, detail=str(exc)) from exc
+      except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+      resumed_record = _autonomous_task_for_user(registry, str(start_payload["task_id"]), owner_user_id)
+      record.resumed_as.append(resumed_record.control_run_id)
+      resume_event = {
+        "type": "run_resumed",
+        "run_id": record.control_run_id,
+        "control_run_id": record.control_run_id,
+        "resumed_run_id": resumed_record.control_run_id,
+        "resumed_task_id": resumed_record.task_id,
+        "request_id": resume_payload.request_id,
+        "ts": int(time.time()),
+      }
+      resumed_event = {
+        "type": "run_resumed_from",
+        "run_id": resumed_record.control_run_id,
+        "control_run_id": resumed_record.control_run_id,
+        "resumed_from": record.control_run_id,
+        "resumed_from_task_id": record.task_id,
+        "request_id": resume_payload.request_id,
+        "ts": int(time.time()),
+      }
+      await registry._record_and_publish_event(record, resume_event)
+      await registry._record_and_publish_event(resumed_record, resumed_event)
+
+      return AutonomousDispatchResponse(
+        run=_autonomous_run_from_task(resumed_record),
+        task_id=resumed_record.task_id,
+        run_id=resumed_record.control_run_id,
+        log_path=str(resumed_record.log_path),
+        started_at=int(resumed_record.started_at),
+        cmd=list(resumed_record.cmd),
+        resumed_from=record.control_run_id,
+      )
+
   @router.post("/{control_run_id}/messages", response_model=RunEnvelopeResponse)
   async def continue_chat_run(
     request: Request,
@@ -287,15 +388,35 @@ def build_runs_router(
       _require_control_session(authenticated)
       if not isinstance(payload, AutonomousRunMessageRequest):
         raise HTTPException(status_code=422, detail="Autonomous runs require message")
-      if (
-        not is_control_run_active_state(
-          _autonomous_state(delivery_target.state)
-        )
-        and not _autonomous_task_resumable(delivery_target)
+      if not is_control_run_active_state(
+        _autonomous_state(delivery_target.state)
       ):
-        raise HTTPException(
-          status_code=409,
-          detail="Run does not accept additional messages",
+        # A parked or exhausted-resumable run takes the message as its
+        # continuation instruction. A settled run (completed, or failed
+        # without a resumable skill) has nothing to continue and stays
+        # terminal.
+        if not _autonomous_task_resumable(delivery_target):
+          raise HTTPException(
+            status_code=409,
+            detail="Run has settled and is not resumable; start a new run",
+          )
+        registry = _require_autonomous_registry(autonomous_registry)
+        registry.set_user_event_bus(getattr(request.app.state, "user_event_bus", None))
+        _require_autonomous_channel(delivery_target, authenticated.channel)
+        resumed = await _resume_autonomous_record(
+          authenticated,
+          owner_user_id,
+          registry,
+          delivery_target,
+          AutonomousResumeRequest(
+            message=payload.message,
+            request_id=payload.message_id,
+          ),
+        )
+        return RunEnvelopeResponse(
+          run=resumed.run,
+          message_id=payload.message_id,
+          delivery_status="delivered",
         )
 
       assert autonomous_registry is not None
@@ -378,79 +499,13 @@ def build_runs_router(
     record = _autonomous_task_for_user(registry, control_run_id, owner_user_id)
     _require_autonomous_channel(record, authenticated.channel)
 
-    async with record.resume_lock, registry.run_mutation_lock:
-      if not _autonomous_task_resumable(record):
-        raise HTTPException(status_code=409, detail="Autonomous run is not resumable")
-
-      for resumed_run_id in reversed(record.resumed_as):
-        resumed_record = registry._find_by_control_run_id(resumed_run_id)
-        resumed_state = _autonomous_run_from_task(resumed_record).state if resumed_record is not None else None
-        if is_control_run_active_state(resumed_state):
-          raise HTTPException(status_code=409, detail="Autonomous run already has an active resume")
-
-      resume_payload = payload or AutonomousResumeRequest()
-      resume_context = _build_autonomous_resume_context(record, resume_payload)
-      try:
-        start_payload = await registry.start(
-          # Resume follows current authority in both promotion and revocation directions.
-          role=authenticated.role,
-          profile=record.profile,
-          mode=record.mode,
-          task=record.task,
-          skill=record.skill,
-          context=resume_context,
-          ticker=record.ticker,
-          research_file_id=record.research_file_id,
-          channel=record.channel,
-          user_id=getattr(record, "raw_user_id", None) or authenticated.user_id,
-          user_email=authenticated.user_email,
-          owner_user_id=owner_user_id,
-          user_slug=getattr(authenticated, "user_slug", None) or record.user_slug,
-          risk_user_id=authenticated.risk_user_id or record.risk_user_id,
-          user_aliases=list(getattr(authenticated, "user_aliases", ()) or record.user_aliases or (owner_user_id,)),
-          identity_status=getattr(authenticated, "identity_status", None) or record.identity_status,
-          dispatch_scope=record.dispatch_scope,
-          resumed_from=record.control_run_id,
-        )
-      except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-      except NamedRefusal as exc:
-        raise HTTPException(status_code=exc.http_status, detail=str(exc)) from exc
-      except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-      resumed_record = _autonomous_task_for_user(registry, str(start_payload["task_id"]), owner_user_id)
-      record.resumed_as.append(resumed_record.control_run_id)
-      resume_event = {
-        "type": "run_resumed",
-        "run_id": record.control_run_id,
-        "control_run_id": record.control_run_id,
-        "resumed_run_id": resumed_record.control_run_id,
-        "resumed_task_id": resumed_record.task_id,
-        "request_id": resume_payload.request_id,
-        "ts": int(time.time()),
-      }
-      resumed_event = {
-        "type": "run_resumed_from",
-        "run_id": resumed_record.control_run_id,
-        "control_run_id": resumed_record.control_run_id,
-        "resumed_from": record.control_run_id,
-        "resumed_from_task_id": record.task_id,
-        "request_id": resume_payload.request_id,
-        "ts": int(time.time()),
-      }
-      await registry._record_and_publish_event(record, resume_event)
-      await registry._record_and_publish_event(resumed_record, resumed_event)
-
-      return AutonomousDispatchResponse(
-        run=_autonomous_run_from_task(resumed_record),
-        task_id=resumed_record.task_id,
-        run_id=resumed_record.control_run_id,
-        log_path=str(resumed_record.log_path),
-        started_at=int(resumed_record.started_at),
-        cmd=list(resumed_record.cmd),
-        resumed_from=record.control_run_id,
-      )
+    return await _resume_autonomous_record(
+      authenticated,
+      owner_user_id,
+      registry,
+      record,
+      payload or AutonomousResumeRequest(),
+    )
 
   @router.get("", response_model=RunsListResponse)
   async def list_runs(

@@ -25,7 +25,23 @@ from agent_gateway.providers import (
   XAIProvider,
 )
 from model_authority.thinking import ThinkingLevel
-from model_authority.binding import CapabilityEffort
+from model_authority.binding import (
+  AuthContext,
+  CapabilityEffort,
+  CapabilityResolutionError,
+  CredentialHandle,
+  ModelSelectionIntent,
+  resolve_capability_model,
+)
+from model_authority.capabilities import CAPABILITY_IDS
+from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
+from model_authority.selection import CapabilityDefault, CapabilitySelectionPolicy, TierModelsDefault
+from agent_gateway.capability_execution import (
+  BoundCapabilityExecution,
+  CapabilityExecutionResolver,
+  MaterializedCredential,
+)
+from agent_gateway.providers import installed_adapter_providers
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.providers.base import truncate_to_last_compaction
 from agent_gateway.context_builder import SessionContextBuilder
@@ -49,8 +65,45 @@ from agent_gateway.server_compaction import (
 import agent_gateway.runner_run_loop as runner_run_loop
 import agent_gateway.server_compaction as server_compaction
 from gateway_test_support.capability_execution_test_support import (
-  stub_bound_capability_execution,
+  stub_bound_capability_execution as _stub_bound_capability_execution,
 )
+
+def stub_bound_capability_execution(**kwargs: Any) -> BoundCapabilityExecution:
+  """Keep these behavioral doubles eligible for exact compact inheritance."""
+  execution = _stub_bound_capability_execution(**kwargs)
+  resolver = execution.resolver
+  assert resolver is not None
+  entry = execution.registry.require(execution.bind.model_key)
+  registry = replace(
+    execution.registry,
+    models={
+      **execution.registry.models,
+      entry.key: replace(entry, capabilities={**entry.capabilities, "session.compact": "internal"}),
+    },
+  )
+  policy = replace(
+    resolver.selection_policy,
+    capabilities={
+      **resolver.selection_policy.capabilities,
+      "session.compact": CapabilitySelectionPolicy(
+        capability_id="session.compact",
+        default=CapabilityDefault(kind="inherit_parent"),
+        by_channel={},
+        allowed_model_keys=frozenset({entry.key}),
+      ),
+    },
+  )
+  resolver = replace(
+    resolver,
+    registry=registry,
+    selection_policy=policy,
+    auth_context=replace(
+      resolver.auth_context,
+      entitled_capabilities=resolver.auth_context.entitled_capabilities | {"session.compact"},
+    ),
+  )
+  return resolver.materialize_bind(execution.bind)
+
 
 
 def _run(coro):
@@ -394,9 +447,10 @@ def _run_runner(
   compaction_trigger: int = 20,
   effort: CapabilityEffort = "high",
   model: str = "model",
+  capability_execution: BoundCapabilityExecution | None = None,
 ) -> EventLog:
   log = event_log or EventLog()
-  capability_execution = stub_bound_capability_execution(
+  capability_execution = capability_execution or stub_bound_capability_execution(
     provider=provider,
     model=model,
     effort=effort,
@@ -591,6 +645,173 @@ def test_server_compaction_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
 
   assert should is False
   assert reason == "disabled_by_env"
+
+
+@pytest.mark.parametrize(
+  ("model_key", "effort"),
+  [
+    (model_key, effort)
+    for model_key in sorted({
+      key
+      for slot, policy in INITIAL_MODEL_SELECTION_POLICY.capabilities.items()
+      if slot in {"session.driver", "plan.author"} or slot.startswith("node.")
+      for key in policy.allowed_model_keys
+    })
+    for effort in sorted(INITIAL_MODEL_REGISTRY.require(model_key).supported_efforts)
+  ],
+)
+@pytest.mark.parametrize(
+  ("principal", "run_mode"),
+  [("user", "interactive"), ("service", "autonomous")],
+)
+@pytest.mark.parametrize("rendered", [False, True])
+def test_portable_summary_inherits_packaged_parent_execution_whole(
+  monkeypatch: pytest.MonkeyPatch,
+  model_key: str,
+  effort: CapabilityEffort,
+  principal,
+  run_mode,
+  rendered: bool,
+) -> None:
+  entry = INITIAL_MODEL_REGISTRY.require(model_key)
+  handle = CredentialHandle(
+    handle_id=f"compact-test:{principal}:{entry.provider}",
+    provider=entry.provider,
+    principal=principal,
+    tenant_id="tenant",
+    actor_id="alice" if principal == "user" else None,
+  )
+  provider = installed_adapter_providers()[entry.adapter]()
+  resolver = CapabilityExecutionResolver(
+    registry=INITIAL_MODEL_REGISTRY,
+    selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+    auth_context=AuthContext(
+      run_mode=run_mode,
+      actor_id="alice",
+      tenant_id="tenant",
+      user_provider_handles={entry.provider: handle} if principal == "user" else {},
+      service_provider_handles={entry.provider: handle} if principal == "service" else {},
+      entitled_capabilities=CAPABILITY_IDS,
+      entitled_model_keys=frozenset(INITIAL_MODEL_REGISTRY.models),
+    ),
+    credential_materializer=lambda selected: MaterializedCredential(
+      handle=selected,
+      auth_config={
+        "api_key": "test-secret",
+        "auth_token": "test-token",
+        "project_id": "test-project",
+        "auth_mode": "api",
+        "compat": entry.compat,
+      },
+    ),
+    adapter_resolver=lambda adapter: provider,
+  )
+  if entry.capabilities.get("session.driver") == "user_selectable":
+    parent_bind = resolver.select_bind(
+      "session.driver",
+      explicit_intent=ModelSelectionIntent(
+        model_key=model_key, effort=effort, source="explicit_user",
+      ),
+    )
+  else:
+    slot = next(
+      name for name in (
+        "session.driver", "plan.author", "node.explore", "node.implement",
+        "node.mutate", "node.verify", "node.choose", "node.fork",
+      )
+      if model_key in resolver.selection_policy.capabilities[name].allowed_model_keys
+    )
+    slot_default = resolver.selection_policy.capabilities[slot].default
+    if slot_default.kind != "tier" or slot_default.tier is None:
+      raise RuntimeError(f"{slot} default is not a tier")
+    role = slot_default.tier
+    parent_bind = resolve_capability_model(
+      slot,
+      registry=resolver.registry,
+      selection_policy=resolver.selection_policy,
+      auth=resolver.auth_context,
+      requested_effort=effort,
+      requested_role=role,
+      role_map={role: TierModelsDefault((model_key,), effort)},
+      role_map_source="internal_policy",
+    )
+  # A later registry/policy load must not rewrite the parent's frozen provenance.
+  parent_bind = parent_bind.model_copy(update={
+    "registry_revision": "parent-registry.1",
+    "policy_revision": "parent-policy.1",
+  })
+  parent = resolver.materialize_bind(parent_bind)
+  calls: list[dict[str, Any]] = []
+
+  async def _summarize(**kwargs: Any):
+    calls.append(kwargs)
+    return SimpleNamespace(text=LONG_SUMMARY, usage={"input_tokens": 17}, saw_tool_use=False)
+
+  monkeypatch.setattr(server_compaction, "provider_summarize", _summarize)
+  monkeypatch.setattr(server_compaction, "RENDER_CHAR_BUDGET", 0 if rendered else 100_000)
+  original_bind = parent.bind.to_json()
+  summary, usage = _run(summarize_messages(
+    [{"role": "user", "content": "Preserve the approved implementation."}],
+    "Summarize exactly.",
+    capability_execution=parent,
+  ))
+
+  assert summary == ANCHOR_SUMMARY
+  assert usage == {"input_tokens": 17}
+  assert len(calls) == 1
+  compact = calls[0]["capability_execution"]
+  assert compact.bind.to_json() == {
+    **original_bind,
+    "capability_id": "session.compact",
+    "selection_source": "parent_binding",
+  }
+  assert parent.bind.to_json() == original_bind
+  assert compact.registry is parent.registry
+  assert compact.adapter is parent.adapter
+  assert compact.auth_config == parent.auth_config
+  assert compact.resolver is resolver
+  assert calls[0]["tools"] == []
+  assert calls[0]["max_tokens"] == SUMMARY_MAX_TOKENS
+
+
+@pytest.mark.parametrize("missing_resolver", [False, True])
+def test_runner_compact_resolution_failure_preserves_original_history(
+  missing_resolver: bool,
+) -> None:
+  provider = _PortableRunnerProvider(main_turns=[_text_turn("complete")])
+  execution = stub_bound_capability_execution(
+    provider=provider, model="model", effort="high",
+    auth_config={"api_key": "test", "max_tokens": 512},
+  )
+  resolver = execution.resolver
+  assert resolver is not None
+  execution = replace(
+    execution,
+    resolver=None if missing_resolver else replace(
+      resolver,
+      auth_context=replace(
+        resolver.auth_context,
+        entitled_capabilities=resolver.auth_context.entitled_capabilities - {"session.compact"},
+      ),
+    ),
+  )
+  messages = [{"role": "user", "content": LONG_INPUT}]
+  original_messages = [dict(message) for message in messages]
+  log = EventLog()
+  if missing_resolver:
+    expected_error = ValueError
+    expected_message = "requires a CapabilityExecutionResolver"
+  else:
+    expected_error = CapabilityResolutionError
+    expected_message = "session.compact"
+  with pytest.raises(expected_error, match=expected_message):
+    _run_runner(
+      provider, messages=messages, event_log=log, capability_execution=execution,
+    )
+  assert messages == original_messages
+  assert provider.summary_requests == 0
+  assert provider.main_requests == []
+  assert not any(entry.event.get("type") == "compaction" for entry in log.entries)
 
 
 def test_server_compaction_summarize_params(monkeypatch: pytest.MonkeyPatch) -> None:

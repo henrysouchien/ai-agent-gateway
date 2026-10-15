@@ -1041,6 +1041,7 @@ def enumerate_selected_agent_session_logs(
   allowed_stream_kinds: frozenset[SessionLogStreamKind],
   strict_rotated: bool = True,
   allow_missing_manifest_segments: bool = False,
+  strict_classification: bool = True,
 ) -> tuple[SelectedAgentSessionLog, ...]:
   """Return the streams selected by the current v1/v2 operational choice."""
 
@@ -1069,12 +1070,30 @@ def enumerate_selected_agent_session_logs(
       base_dir=base,
       allow_missing_manifest_segments=allow_missing_manifest_segments,
     )
-    product_id = _require_flat_stream(
-      item,
-      strict_rotated=strict_rotated,
-      allow_missing_manifest_segments=allow_missing_manifest_segments,
-    )
-    item = _bind_flat_file_classification(item)
+    if item.sidecar_payload is not None:
+      hint_product = item.sidecar_payload.get("product_id")
+      if isinstance(hint_product, str) and hint_product not in allowed_product_ids:
+        continue
+      if item.stream_kind != "unknown" and item.stream_kind not in allowed_stream_kinds:
+        continue
+    if not strict_classification:
+      try:
+        product_id = _require_flat_stream(
+          item,
+          strict_rotated=strict_rotated,
+          allow_missing_manifest_segments=allow_missing_manifest_segments,
+        )
+        item = _bind_flat_file_classification(item)
+      except SessionLogInventoryError as exc:
+        log.warning("skipping unclassifiable session log %s: %s", location.path, exc)
+        continue
+    else:
+      product_id = _require_flat_stream(
+        item,
+        strict_rotated=strict_rotated,
+        allow_missing_manifest_segments=allow_missing_manifest_segments,
+      )
+      item = _bind_flat_file_classification(item)
     if product_id not in allowed_product_ids:
       continue
     if selected_layout == SESSION_LOG_LAYOUT_V1:
@@ -1091,14 +1110,28 @@ def enumerate_selected_agent_session_logs(
     except AgentSessionLogEnumerationError as exc:
       raise SessionLogInventoryError("v2 session-log inventory is unavailable") from exc
     for location in v2_locations:
-      item = _inventory_item(
-        location,
-        storage_layout=SESSION_LOG_LAYOUT_V2,
-        base_dir=base,
-        trusted_product_id=trusted_product_id,
-        strict_rotated=strict_rotated,
-        allow_missing_manifest_segments=allow_missing_manifest_segments,
-      )
+      if not strict_classification:
+        try:
+          item = _inventory_item(
+            location,
+            storage_layout=SESSION_LOG_LAYOUT_V2,
+            base_dir=base,
+            trusted_product_id=trusted_product_id,
+            strict_rotated=strict_rotated,
+            allow_missing_manifest_segments=allow_missing_manifest_segments,
+          )
+        except SessionLogInventoryError as exc:
+          log.warning("skipping unclassifiable v2 session log %s: %s", location.path, exc)
+          continue
+      else:
+        item = _inventory_item(
+          location,
+          storage_layout=SESSION_LOG_LAYOUT_V2,
+          base_dir=base,
+          trusted_product_id=trusted_product_id,
+          strict_rotated=strict_rotated,
+          allow_missing_manifest_segments=allow_missing_manifest_segments,
+        )
       if item.stream_kind in allowed_stream_kinds:
         items.append(item)
   by_path: dict[Path, SelectedAgentSessionLog] = {}

@@ -5,9 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 from collections import OrderedDict
-from dataclasses import dataclass
 import json
-import re
 import threading
 import time
 from typing import Mapping
@@ -17,84 +15,21 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 import jwt
 
 
-SUBJECT_ASSERTION_ALGORITHM = "EdDSA"
-SUBJECT_ASSERTION_ISSUER = "risk-module-web-auth"
-SUBJECT_ASSERTION_AUDIENCE = "agent-gateway-session-init"
-SUBJECT_ASSERTION_PUBLIC_KEYS_ENV = "GATEWAY_SUBJECT_ASSERTION_ED25519_PUBLIC_KEYS"
-SUBJECT_ASSERTION_MAX_LIFETIME_SECONDS = 90
-SUBJECT_ASSERTION_CLOCK_SKEW_SECONDS = 5
-SUBJECT_ASSERTION_REPLAY_CACHE_SIZE = 10_000
-_KEY_ID = re.compile(r"^[a-z][a-z0-9._:-]{0,127}$")
-_SUBJECT = re.compile(r"^[1-9][0-9]*$")
-_REQUIRED_CLAIMS = frozenset({
-  "schema_version",
-  "iss",
-  "aud",
-  "sub",
-  "email",
-  "channel",
-  "request_id",
-  "iat",
-  "exp",
-  "jti",
-})
-
-
-class SubjectAssertionError(ValueError):
-  """A subject assertion is missing, invalid, expired, or already consumed."""
-
-  def __init__(self, code: str) -> None:
-    self.code = code
-    super().__init__(code)
-
-
-@dataclass(frozen=True, slots=True)
-class VerifiedGatewaySubject:
-  """Token-free identity derived from verified upstream authority."""
-
-  user_id: str
-  risk_user_id: int
-  email: str | None
-  channel: str
-  request_id: str
-
-  @classmethod
-  def trusted_internal(
-    cls,
-    *,
-    owner_user_id: str,
-    email: str | None,
-    channel: str,
-    request_id: str,
-  ) -> "VerifiedGatewaySubject":
-    """Build identity from an already-verified gateway-owned control record."""
-    subject = str(owner_user_id or "").strip()
-    if not _SUBJECT.fullmatch(subject):
-      raise SubjectAssertionError("invalid_trusted_subject")
-    normalized_channel = str(channel or "").strip().lower()
-    if normalized_channel != "web":
-      raise SubjectAssertionError("invalid_trusted_channel")
-    normalized_request_id = str(request_id or "").strip()
-    if not normalized_request_id:
-      raise SubjectAssertionError("invalid_trusted_request_id")
-    return cls(
-      user_id=subject,
-      risk_user_id=int(subject),
-      email=_normalize_email(email),
-      channel=normalized_channel,
-      request_id=normalized_request_id,
-    )
-
-
-def _normalize_email(value: object) -> str | None:
-  if value is None:
-    return None
-  if not isinstance(value, str):
-    raise SubjectAssertionError("invalid_email")
-  normalized = value.strip().lower()
-  if not normalized or len(normalized) > 320:
-    raise SubjectAssertionError("invalid_email")
-  return normalized
+from hank_contracts.subject_assertion import (
+  SUBJECT_ASSERTION_ALGORITHM,
+  SUBJECT_ASSERTION_ISSUER,
+  SUBJECT_ASSERTION_AUDIENCE,
+  SUBJECT_ASSERTION_PUBLIC_KEYS_ENV,
+  SUBJECT_ASSERTION_MAX_LIFETIME_SECONDS,
+  SUBJECT_ASSERTION_CLOCK_SKEW_SECONDS,
+  SUBJECT_ASSERTION_REPLAY_CACHE_SIZE,
+  _KEY_ID,
+  _SUBJECT,
+  _REQUIRED_CLAIMS,
+  _normalize_email,
+  SubjectAssertionError,
+  VerifiedGatewaySubject,
+)
 
 
 def _canonical_uuid(value: object, *, code: str) -> str:

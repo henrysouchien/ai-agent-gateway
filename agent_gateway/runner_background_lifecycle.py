@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple, TypeGuard, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple, TypeGuard, TypeVar, Union, cast
 
 from agent_workflow_contracts import (
   AdmittedTask,
@@ -18,6 +18,7 @@ from agent_workflow_contracts import (
   ContentReadGrant,
   ParentResultPolicy,
   TaskResult,
+  TaskResultProvenance,
   TaskResultRef,
   UsageObservation,
   sha256_digest,
@@ -82,7 +83,20 @@ from .skill_result_events import build_skill_result_captured_event
 from .runner_state import BackgroundTask
 from .skill_lifecycle import TopLevelSkillLifecycleMetadata
 from .sub_agent_narrative_result import (
+  final_child_visible_text,
   read_task_result_terminal_narrative,
+  task_result_from_execution,
+)
+from .sub_agent_result_contract import _usage_observation
+from .sub_agent_result_evidence import (
+  SubAgentResultEvidence,
+  collect_sub_agent_result_evidence,
+  merge_sub_agent_result_evidence,
+)
+from .sub_agent_skill_state import (
+  latest_successful_declared_terminal_tool_result,
+  persist_expectation_doors,
+  terminal_result_doors,
 )
 from .tool_result_compaction import model_tool_result_max_chars
 from .task_registry import (
@@ -96,6 +110,12 @@ from .task_registry import (
   resolve_required_skill_result_marker,
   task_state_for_result,
 )
+
+if TYPE_CHECKING:
+  from .agent_session_log import AgentSessionLog
+  from .containment_settings import ContainmentSettings
+  from .event_log import EventLog
+  from .tool_dispatcher_approval_lifecycle import ApprovalPark
 
 
 class _RunResearchFileActivityLease:
@@ -217,10 +237,10 @@ def _resume_source_admission_error(
         "after its durable outcome settles"
       ),
     }
-  if source.state != TaskState.INTERRUPTED:
+  if source.state not in {TaskState.INTERRUPTED, TaskState.PARKED}:
     return {
       "code": "not_interrupted",
-      "message": f"Task {original_task_id} is not interrupted",
+      "message": f"Task {original_task_id} is not parked or interrupted",
     }
   return None
 
@@ -273,7 +293,12 @@ _TaskCallback = TypeVar(
 
 
 class _TaskCallbackFanout:
-  """Run every attached owner's callback once, in attachment order."""
+  """Run every attached owner's callback once, in attachment order.
+
+  One owner's failure never withholds a later owner's callback; the first
+  failure is raised once every member has run, to the caller that already
+  owns callback-failure handling.
+  """
 
   def __init__(
     self,
@@ -282,42 +307,72 @@ class _TaskCallbackFanout:
     self.callbacks = callbacks
 
   async def __call__(self, entry: TaskEntry) -> None:
+    first_failure: Exception | None = None
     for callback in self.callbacks:
-      outcome = callback(entry)
-      if inspect.isawaitable(outcome):
-        await outcome
+      try:
+        outcome = callback(entry)
+        if inspect.isawaitable(outcome):
+          await outcome
+      except Exception as exc:
+        if first_failure is None:
+          first_failure = exc
+    if first_failure is not None:
+      raise first_failure
 
 
 def _attach_task_callback(
   existing: _TaskCallback | _TaskCallbackFanout | None,
-  added: _TaskCallback | None,
+  added: _TaskCallback | _TaskCallbackFanout | None,
 ) -> _TaskCallback | _TaskCallbackFanout | None:
-  """Add one owner's callback beside the ones already attached, once."""
-  if added is None:
+  """Union attached owners by equality, preserving their attachment order."""
+  callbacks: list[Callable[[TaskEntry], Awaitable[None] | None]] = []
+
+  def collect(callback: Callable[[TaskEntry], Awaitable[None] | None]) -> None:
+    if isinstance(callback, _TaskCallbackFanout):
+      for member in callback.callbacks:
+        collect(member)
+    elif not any(member == callback for member in callbacks):
+      callbacks.append(callback)
+
+  for callback in (existing, added):
+    if callback is not None:
+      collect(callback)
+  if not callbacks:
+    return None
+  if len(callbacks) == 1:
+    if existing is not None and not isinstance(existing, _TaskCallbackFanout):
+      return existing
+    if added is not None and not isinstance(added, _TaskCallbackFanout):
+      return added
+  if isinstance(existing, _TaskCallbackFanout) and tuple(callbacks) == existing.callbacks:
     return existing
-  if existing is None:
+  if isinstance(added, _TaskCallbackFanout) and tuple(callbacks) == added.callbacks:
     return added
-  attached = (
-    existing.callbacks
-    if isinstance(existing, _TaskCallbackFanout)
-    else (existing,)
-  )
-  if any(callback is added for callback in attached):
-    return existing
-  return _TaskCallbackFanout((*attached, added))
+  return _TaskCallbackFanout(tuple(callbacks))
 
 
 class RunnerBackgroundLifecycleMixin:
+  # The runner's own admitted job, when this run is an independent child.
+  _admitted_self_task: TaskEntry | None = None
+  _background_grace_wait_timeout_seconds: float = _BACKGROUND_GRACE_WAIT_TIMEOUT_SECONDS
+  _background_kill_drain_timeout_seconds: float = _BACKGROUND_KILL_DRAIN_TIMEOUT_SECONDS
+
   if TYPE_CHECKING:
+    _agent_session_log: AgentSessionLog | None
+    _approval_park: ApprovalPark | None
+    _full_session_id: str
+    _log: EventLog
+    _sub_agent_id: str | None
+    _terminal_closure_event: Dict[str, Any] | None
     _background_notifications_enabled: bool
     _gateway_session_id: str
-    _max_concurrent_sub_agents: int | None
     _notification_queue: NotificationQueue
     _parent_turn_id: str | None
     _role: str
     _runner_id: str | None
     _sid: str
     _task_registry: TaskRegistry
+    _containment: ContainmentSettings
     _workspace_dir: str | None
 
     def _append(self, event: Dict[str, Any]) -> Any | None: ...
@@ -325,6 +380,12 @@ class RunnerBackgroundLifecycleMixin:
     async def _append_durable_event(
       self,
       event: Dict[str, Any],
+    ) -> Any | None: ...
+
+    async def _append_task_parked(
+      self,
+      task_id: str,
+      reason: str,
     ) -> Any | None: ...
 
     async def _confirm_durable_skill_event(
@@ -348,14 +409,15 @@ class RunnerBackgroundLifecycleMixin:
 
     def _release_write_lease(self) -> None: ...
 
-  def _ensure_sub_agent_semaphore(self) -> asyncio.Semaphore | None:
+  def _ensure_sub_agent_semaphore(self) -> asyncio.Semaphore:
     asyncio_module = _runner_attr(self, "asyncio", asyncio)
-    self._sub_agent_semaphore = _runner_attr(self, "_ensure_sub_agent_semaphore", _ensure_sub_agent_semaphore)(
+    semaphore: asyncio.Semaphore = _runner_attr(self, "_ensure_sub_agent_semaphore", _ensure_sub_agent_semaphore)(
       self._sub_agent_semaphore,
-      self._max_concurrent_sub_agents,
+      self._containment.max_concurrent_children,
       semaphore_factory=asyncio_module.Semaphore,
     )
-    return self._sub_agent_semaphore
+    self._sub_agent_semaphore = semaphore
+    return semaphore
 
   @staticmethod
   def _background_timeout_value(raw_timeout: Any) -> float:
@@ -479,7 +541,7 @@ class RunnerBackgroundLifecycleMixin:
     now = _runner_attr(self, "time", time).time()
     resumed_task_ids = (
       self._resumed_task_ids_from_registry(bg_task.task_id)
-      if getattr(bg_task, "state", None) == TaskState.INTERRUPTED
+      if getattr(bg_task, "state", None) in {TaskState.INTERRUPTED, TaskState.PARKED}
       else None
     )
     return _runner_attr(self, "_background_task_payload", _background_task_payload)(
@@ -1070,6 +1132,9 @@ class RunnerBackgroundLifecycleMixin:
         result=result,
         error=error,
         canonical_result_evidence_authoritative=True,
+        declared_terminal_doors=persist_expectation_doors(
+          bg_task.admitted_task
+        ),
       )
     if event is None:
       return None
@@ -1618,11 +1683,7 @@ class RunnerBackgroundLifecycleMixin:
     error: dict[str, Any] | None = None
     final_state = TaskState.FAILED
     try:
-      semaphore = self._ensure_sub_agent_semaphore()
-      if semaphore is not None:
-        async with semaphore:
-          handler_result, handler_error = await handler(tool_input, call_index=call_index)
-      else:
+      async with self._ensure_sub_agent_semaphore():
         handler_result, handler_error = await handler(tool_input, call_index=call_index)
       error = handler_error
       if isinstance(handler_result, TaskResult):
@@ -1847,6 +1908,14 @@ class RunnerBackgroundLifecycleMixin:
       and durable_entry.error is None
     ):
       return durable_entry
+    # A park is confirmable only off the canonical TaskResult row; a
+    # registration-only rebuild defaults to PARKED without one.
+    if (
+      durable_entry is not None
+      and durable_entry.state == TaskState.PARKED
+      and durable_entry.task_result is not None
+    ):
+      return durable_entry
     if durable_entry is None or durable_entry.state not in {
       TaskState.COMPLETED,
       TaskState.FAILED,
@@ -1877,6 +1946,16 @@ class RunnerBackgroundLifecycleMixin:
         bg_task.task_id,
         result=result,
       )
+    elif (
+      bg_task.state == TaskState.INTERRUPTED
+      and final_state == TaskState.PARKED
+    ):
+      self._task_registry.restore_committed_park(
+        bg_task.task_id,
+        result=result,
+      )
+    elif final_state == TaskState.PARKED:
+      self._task_registry.park(bg_task.task_id, result=result)
     elif bg_task.state == TaskState.INTERRUPTED:
       self._task_registry.finalize_interrupted(
         bg_task.task_id,
@@ -1920,8 +1999,27 @@ class RunnerBackgroundLifecycleMixin:
         error=error,
       )
       return
+    if final_state == TaskState.PARKED:
+      # A parked job owes no completion: no skill result, no parent
+      # publication. The journal records the park; ``continue_task`` resumes it.
+      self._commit_background_completion_live(
+        bg_task,
+        final_state=final_state,
+        result=result,
+        error=error,
+      )
+      # PARKED is only ever derived from this task's canonical result
+      # (``task_state_for_result``), so the result is present.
+      parked_result = cast(TaskResult, bg_task.task_result)
+      await self._append_task_parked(
+        bg_task.task_id,
+        reason=str(parked_result.execution.terminal_reason),
+      )
+      return
     await self._ensure_required_skill_result_settled(bg_task)
-    await self._ensure_agent_completion_published(bg_task)
+    if bg_task is not self._admitted_self_task:
+      # A run's own job settles here; only a child is a parent's obligation.
+      await self._ensure_agent_completion_published(bg_task)
     self._commit_background_completion_live(
       bg_task,
       final_state=final_state,
@@ -2108,6 +2206,101 @@ class RunnerBackgroundLifecycleMixin:
         error=error,
       )
 
+  async def _finalize_admitted_self_task(
+    self,
+    entry: TaskEntry,
+    *,
+    run_error: BaseException | None,
+    was_cancelled: bool,
+    prior_evidence: SubAgentResultEvidence | None,
+  ) -> None:
+    """Settle this run's own admitted job from its committed run closure.
+
+    The result comes from the owners an ordinary child's settlement uses,
+    over this run's own events and journal, with the restored attempt's
+    evidence merged so usage stays cumulative. It commits through the
+    registered-task finalizer while the writer lease is still held.
+    """
+    from .runner_sub_agents import _runtime_exception_detail
+
+    admitted = cast(AdmittedTask, entry.admitted_task)
+    events = self._log.entries
+    approval_park = self._approval_park
+    terminal = self._terminal_closure_event
+    cancelled = was_cancelled or isinstance(run_error, asyncio.CancelledError)
+    if (
+      approval_park is not None
+      and terminal is not None
+      and terminal.get("terminal_disposition") == "awaiting_approval"
+      and run_error is None
+      and not cancelled
+    ):
+      evidence = merge_sub_agent_result_evidence(
+        prior_evidence,
+        collect_sub_agent_result_evidence(events, durable=False),
+      )
+      result = terminal_task_result(
+        admitted,
+        status="awaiting_approval",
+        reason=(
+          f"approval:{approval_park.approval_id} "
+          f"call:{approval_park.original_tool_call_id}"
+        ),
+        tools_used=evidence.tools_used,
+        usage=_usage_observation(evidence.usage),
+      )
+    else:
+      final_narrative = None
+      if (
+        latest_successful_declared_terminal_tool_result(
+          events,
+          declared_terminal_doors=terminal_result_doors(admitted),
+        ) is None
+        and admitted.result_requirement.terminal_narrative != "forbidden"
+        and self._workspace_dir is not None
+      ):
+        narrative = await final_child_visible_text(
+          self._agent_session_log,
+          sub_session_id=self._full_session_id,
+          role=cast(Literal["writer", "sub_agent"], self._role),
+          sub_agent_id=self._sub_agent_id,
+          workspace_dir=self._workspace_dir,
+          runner_id=self._runner_id,
+        )
+        final_narrative = narrative.final_narrative
+      result = task_result_from_execution(
+        events,
+        logical_task=admitted.logical_task,
+        attempt=admitted.attempt,
+        requirement=admitted.result_requirement,
+        provenance=TaskResultProvenance(
+          admitted_task_digest=admitted.admitted_task_digest,
+          model_bind_digest=admitted.model_bind_digest,
+          capability_binding_digest=admitted.capability_binding_digest,
+          tool_grant_digest=admitted.tool_grant_digest,
+        ),
+        final_narrative=final_narrative,
+        stalled=False,
+        runtime_error_detail=(
+          _runtime_exception_detail(run_error)
+          if isinstance(run_error, Exception)
+          else None
+        ),
+        external_terminal_signals=(
+          [entry.termination_intent or "cancelled"] if cancelled else []
+        ),
+        prior_evidence=prior_evidence,
+        admitted_task=admitted,
+      )
+    entry.task_result = result
+    await self._finalize_background_agent(
+      entry,
+      final_state=_task_state_from_task_result(result),
+      result=result.model_dump(mode="json"),
+      error=None,
+    )
+    await self._invoke_background_completion_callback(entry)
+
   async def terminate_parked_background_task(
     self,
     task_id: str,
@@ -2230,7 +2423,7 @@ class RunnerBackgroundLifecycleMixin:
         TaskState.FAILED,
         TaskState.KILLED,
         TaskState.INTERRUPTED,
-      } and entry.pending_final_state is None:
+      } and entry.pending_final_state is None and entry.termination_intent is None:
         # A running attempt whose completion is not already committing.
         if persist_request is not None:
           await persist_request()
@@ -2509,11 +2702,53 @@ class RunnerBackgroundLifecycleMixin:
       event_factory=required_skill_result_event_factory,
       projector=required_skill_result_projector,
     )
-    if on_complete is not None and entry.completion_callback is None:
+    # The attempt that installs lifecycle callbacks owns them only if it
+    # starts or settles the registration; an unstarted reservation retained
+    # for retry gets the retrying attempt's callbacks.
+    completion_installed = (
+      on_complete is not None and entry.completion_callback is None
+    )
+    if completion_installed:
       entry.completion_callback = on_complete
-    if on_park is not None and entry.park_callback is None:
+    park_installed = on_park is not None and entry.park_callback is None
+    if park_installed:
       entry.park_callback = on_park
+    try:
+      return await self._reconcile_and_start_background_task(
+        entry=entry,
+        tool_input=tool_input,
+        handler=handler,
+        agent_name=agent_name,
+        on_complete=on_complete,
+        on_before_start=on_before_start,
+        call_index=call_index,
+        original_task_id=original_task_id,
+        reconcile_registration=reconcile_registration,
+        validate_resume_source=validate_resume_source,
+        resume_source_entry=resume_source_entry,
+      )
+    finally:
+      if entry.asyncio_task is None and entry.state == TaskState.PENDING:
+        if completion_installed and entry.completion_callback is on_complete:
+          entry.completion_callback = None
+        if park_installed and entry.park_callback is on_park:
+          entry.park_callback = None
 
+  async def _reconcile_and_start_background_task(
+    self,
+    *,
+    entry: TaskEntry,
+    tool_input: Dict[str, Any],
+    handler: BackgroundTaskHandler,
+    agent_name: str | None,
+    on_complete: BackgroundTaskCallback | None,
+    on_before_start: Callable[[], None] | None,
+    call_index: int,
+    original_task_id: str | None,
+    reconcile_registration: bool,
+    validate_resume_source: bool,
+    resume_source_entry: TaskEntry | None,
+  ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     durable_existing: TaskEntry | None = None
     registration_state = getattr(
       entry,
@@ -2671,7 +2906,7 @@ class RunnerBackgroundLifecycleMixin:
       before the exception leaves, shielded on cancellation. Without it a
       PENDING ghost holds ``admission_count > 0`` forever, the run loop
       refuses clean success with ``background_delivery_incomplete``, and
-      replay rebuilds the task as INTERRUPTED instead of FAILED
+      replay rebuilds the task as PARKED instead of FAILED
       (CUR-E2E-03, seam-map Hole 2).
     """
 
@@ -2840,7 +3075,7 @@ class RunnerBackgroundLifecycleMixin:
     The compensating terminal is what makes registration transactional: the
     durable ``task_registered`` is answered by a durable
     ``task_completed(final_state="failed")`` so replay rebuilds FAILED rather
-    than a ghost INTERRUPTED entry, and ``admission_count`` returns to zero
+    than a ghost PARKED entry, and ``admission_count`` returns to zero
     so the session-completion guard stops reporting
     ``pending_or_running_tasks`` (D-A8-2/3; the notification the FAILED
     transition emits is the accepted D-A8-4 cost for direct dispatch —
@@ -3834,26 +4069,8 @@ class RunnerBackgroundLifecycleMixin:
           pending,
           kill_task=self._task_registry.kill,
           wait_fn=asyncio_module.wait,
-          wait_timeout=max(
-            0.0,
-            float(
-              getattr(
-                self,
-                "_background_grace_wait_timeout_seconds",
-                _BACKGROUND_GRACE_WAIT_TIMEOUT_SECONDS,
-              )
-            ),
-          ),
-          drain_timeout=max(
-            0.0,
-            float(
-              getattr(
-                self,
-                "_background_kill_drain_timeout_seconds",
-                _BACKGROUND_KILL_DRAIN_TIMEOUT_SECONDS,
-              )
-            ),
-          ),
+          wait_timeout=max(0.0, self._background_grace_wait_timeout_seconds),
+          drain_timeout=max(0.0, self._background_kill_drain_timeout_seconds),
         )
     finally:
       await self._reconcile_background_agents(

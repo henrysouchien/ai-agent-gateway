@@ -166,6 +166,57 @@ async def _approval_visible_via_delegation(
   grant = await _delegation_grant_for_id(store, delegation_id, delegation_grant_cache)
   return grant is not None and _delegator_user_id_for_grant(grant) == user_id
 
+def _session_owner_ids(session: GatewaySession) -> tuple[str, ...]:
+  ids: list[str] = []
+  canonical = _session_owner_user_id(session)
+  if canonical:
+    ids.append(canonical)
+  user_id = str(getattr(session, "user_id", None) or "").strip()
+  if user_id and user_id not in ids:
+    ids.append(user_id)
+  return tuple(ids)
+
+
+async def _store_get(
+  store: Any,
+  approval_id: str,
+  *,
+  owner_user_id: str | tuple[str, ...] | list[str] | set[str] | None = None,
+  session: GatewaySession | None = None,
+) -> Any | None:
+  owners: list[str] = []
+  if session is not None:
+    owners = list(_session_owner_ids(session))
+  elif owner_user_id is not None:
+    if isinstance(owner_user_id, str):
+      owners = [owner_user_id.strip()]
+    else:
+      owners = [str(o).strip() for o in owner_user_id if str(o).strip()]
+
+  if not owners:
+    return await store.get(approval_id)
+
+  first_owner = owners[0]
+  target_arg: str | tuple[str, ...] = tuple(owners) if len(owners) > 1 else first_owner
+  try:
+    return await store.get(approval_id, owner_user_id=target_arg)
+  except TypeError:
+    pass
+
+  try:
+    return await store.get(approval_id, owner_user_id=first_owner)
+  except TypeError:
+    pass
+  record = await store.get(approval_id)
+  if record is not None:
+    record_owner = str(
+      getattr(record, "user_id", None)
+      or getattr(record, "owner_user_id", None)
+      or ""
+    ).strip()
+    if record_owner and record_owner not in owners:
+      return None
+  return record
 
 async def _approval_records_for_session(
   store: Any,
@@ -185,7 +236,7 @@ async def _approval_records_for_session(
     if approval_id_text in seen:
       continue
     seen.add(approval_id_text)
-    request_record = await store.get(approval_id_text)
+    request_record = await _store_get(store, approval_id_text, session=session)
     if request_record is not None and request_record.state == "pending_user":
       if delegated_to_user_id is not None and not await _approval_visible_via_delegation(
         store,
@@ -195,6 +246,31 @@ async def _approval_records_for_session(
       ):
         continue
       approvals.append(_approval_request_to_dict(request_record))
+  return approvals
+
+
+async def _parked_approval_records(
+  store: SQLiteApprovalStore,
+  *,
+  owner_user_id: str,
+  channel: str | None,
+  listed_approval_ids: set[str],
+  delegation_grant_cache: dict[str, Any | None],
+) -> list[dict[str, Any]]:
+  # A parked request has no live pending_tools entry; it is visible exactly as
+  # `_resolve_parked_approval_decision` decides it: channel match, else delegation.
+  approvals: list[dict[str, Any]] = []
+  for request_record in await store.list_parked_requests(owner_user_id):
+    if request_record.approval_id in listed_approval_ids:
+      continue
+    if not _channel_matches(request_record.channel, channel) and not await _approval_visible_via_delegation(
+      store,
+      request_record,
+      owner_user_id,
+      delegation_grant_cache,
+    ):
+      continue
+    approvals.append(_approval_request_to_dict(request_record))
   return approvals
 
 
@@ -220,7 +296,7 @@ async def _delegated_pending_approval_for_user(
   pending = _find_pending_approval(session, approval_id)
   if pending is None:
     return None
-  request_record = await store.get(approval_id)
+  request_record = await _store_get(store, approval_id, session=session)
   if request_record is None:
     return None
   if not await _approval_visible_via_delegation(store, request_record, user_id, delegation_grant_cache):
@@ -244,7 +320,7 @@ async def _approval_records_for_autonomous_task(store: Any, record: AutonomousTa
     if approval_id_text in seen:
       continue
     seen.add(approval_id_text)
-    request_record = await store.get(approval_id_text)
+    request_record = await _store_get(store, approval_id_text, owner_user_id=str(record.user_id or "").strip())
     if request_record is not None and request_record.state == "pending_user":
       tool_call_id = str(event.get("tool_call_id") or "")
       if not tool_call_id:
@@ -347,7 +423,7 @@ async def _visible_pending_approval_for_run(
   if target_session is not None and store is not None:
     pending = _find_pending_approval(target_session, approval_id)
     if pending is not None:
-      request_record = await store.get(approval_id)
+      request_record = await _store_get(store, approval_id, owner_user_id=owner_user_id)
       return (store, request_record) if request_record is not None else None
 
   if store is not None:
@@ -361,7 +437,8 @@ async def _visible_pending_approval_for_run(
       {},
     )
     if delegated_target is not None:
-      request_record = await store.get(approval_id)
+      delegated_session, _, _ = delegated_target
+      request_record = await _store_get(store, approval_id, owner_user_id=_session_owner_user_id(delegated_session))
       return (store, request_record) if request_record is not None else None
 
   batch_projection = _batch_projection_for_user(
@@ -391,7 +468,7 @@ async def _visible_pending_approval_for_run(
     return None
   if store is None:
     return None
-  request_record = await store.get(approval_id)
+  request_record = await _store_get(store, approval_id, owner_user_id=owner_user_id)
   return (store, request_record) if request_record is not None else None
 
 
@@ -543,6 +620,16 @@ def build_approvals_router(
         channel=authenticated.channel,
       )
     )
+    if store is not None:
+      approvals.extend(
+        await _parked_approval_records(
+          store,
+          owner_user_id=owner_user_id,
+          channel=authenticated.channel,
+          listed_approval_ids={str(approval.get("approval_id")) for approval in approvals},
+          delegation_grant_cache=delegation_grant_cache,
+        )
+      )
     if store is None and not approvals:
       return _json_error(503, "Approval subsystem unavailable")
     return JSONResponse({"approvals": approvals})
@@ -677,7 +764,7 @@ def build_approvals_router(
         )
         if existing_delivery is not None:
           wake_autonomous_approval_delivery(request.app.state)
-          request_record = await store.get(approval_id)
+          request_record = await _store_get(store, approval_id, owner_user_id=owner_user_id)
           if request_record is None:
             return _json_error(
               409,
@@ -739,7 +826,7 @@ def build_approvals_router(
         shim_session.raw_user_id = getattr(record, "raw_user_id", None) or record.user_id
         shim_session.pending_tools[tool_call_id] = pending_entry
         shim_session.approval_queues[tool_call_id] = approval_queue
-        request_record = await store.get(approval_id)
+        request_record = await _store_get(store, approval_id, owner_user_id=owner_user_id)
         authoritative_identity = autonomous_approval_authoritative_identity(
           record,
           approval_id=approval_id,
@@ -785,7 +872,7 @@ def build_approvals_router(
             tool_call_id=tool_call_id,
             nonce=nonce,
           )
-          request_record = await store.get(approval_id)
+          request_record = await _store_get(store, approval_id, owner_user_id=owner_user_id)
           if delivery is None or request_record is None:
             return _json_error(
               503,
@@ -820,12 +907,6 @@ def build_approvals_router(
       tool_call_id, pending_entry = pending
     else:
       tool_call_id, pending_entry = delegated_pending
-
-    if batch_request_record is not None:
-      if batch_request_record.state in TERMINAL_APPROVAL_STATES:
-        return _json_error(409, "Approval request already resolved")
-      if batch_request_record.state != "pending_user":
-        return _json_error(409, "Invalid approval request state for approval submission")
 
     try:
       result = await _record_vote_and_unblock(

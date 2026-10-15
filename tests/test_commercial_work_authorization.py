@@ -8,12 +8,14 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 import jwt
 import pytest
 
-from agent_gateway.commercial_claims import VerifiedCommercialClaim
-from agent_gateway.commercial_work_authorization import (
+from hank_contracts.commercial_claims import VerifiedCommercialClaim
+from hank_contracts.commercial_work import (
   WORK_AUTHORIZATION_AUDIENCE,
   WORK_AUTHORIZATION_ISSUER,
   WorkAuthorizationError,
   WorkAuthorizationTrustSnapshot,
+)
+from agent_gateway.commercial_work_authorization import (
   WorkAuthorizationVerifier,
 )
 
@@ -62,7 +64,7 @@ def _claim(**changes) -> VerifiedCommercialClaim:
 
 def _payload(**changes) -> dict:
   payload = {
-    "schema_version": 1,
+    "schema_version": 3,
     "kid": "work-signing-v1",
     "iss": WORK_AUTHORIZATION_ISSUER,
     "aud": WORK_AUTHORIZATION_AUDIENCE,
@@ -85,8 +87,21 @@ def _payload(**changes) -> dict:
     "session_id": "session-1",
     "iat": NOW,
     "exp": NOW + 120,
+    "credential_principal": "user",
+    "reserved_spend_microusd": 1_500_000,
   }
   payload.update(changes)
+  return payload
+
+
+def _legacy_payload(version: int) -> dict:
+  payload = _payload()
+  payload["schema_version"] = version
+  payload.pop("reserved_spend_microusd")
+  payload.pop("credential_principal")
+  if version == 2:
+    payload["credential_principal"] = "user"
+    payload["model_key"] = "anthropic.claude-sonnet-5-5"
   return payload
 
 
@@ -129,9 +144,9 @@ def _verify(verifier, token, **changes):
     "request_id": "request-1",
     "session_id": "session-1",
     "operation": "messages.create",
-    "provider": "anthropic",
     "billing_mode": "metered",
     "capability_id": "portfolio.review",
+    "credential_principal": "user",
   }
   facts.update(changes)
   return verifier.verify_for_attach(token, **facts)
@@ -157,7 +172,7 @@ def test_verifier_accepts_exact_intersection_without_retaining_raw_token() -> No
     ({"request_id": "request-2"}, "request_mismatch"),
     ({"session_id": "session-2"}, "session_mismatch"),
     ({"operation": "responses.create"}, "operation_mismatch"),
-    ({"provider": "openai"}, "provider_mismatch"),
+    ({"credential_principal": "service"}, "credential_principal_mismatch"),
     ({"billing_mode": "byok"}, "billing_mode_mismatch"),
     ({"capability_id": "trade.execute"}, "capability_mismatch"),
   ),
@@ -166,6 +181,42 @@ def test_verifier_rejects_request_path_drift(changes, expected) -> None:
   private, public = _keypair()
   with pytest.raises(WorkAuthorizationError, match=expected):
     _verify(_verifier(public), _token(private), **changes)
+
+
+def test_verifier_accepts_v3_ticket_without_comparing_provider() -> None:
+  private, public = _keypair()
+  verified = _verify(
+    _verifier(public),
+    _token(private, _payload(provider="openai")),
+  )
+  assert verified.schema_version == 3
+  assert verified.provider == "openai"
+  assert verified.credential_principal == "user"
+  assert verified.reserved_spend_microusd == 1_500_000
+  assert not hasattr(verified, "model_key")
+
+
+def test_verifier_accepts_byok_ticket_with_null_budget() -> None:
+  private, public = _keypair()
+  verified = _verify(
+    _verifier(public),
+    _token(private, _payload(
+      billing_mode="byok",
+      reservation_id=None,
+      primary_inference_observability="hank_byok_observed",
+      reserved_spend_microusd=None,
+    )),
+    billing_mode="byok",
+  )
+  assert verified.billing_mode == "byok"
+  assert verified.reserved_spend_microusd is None
+
+
+@pytest.mark.parametrize("version", (1, 2))
+def test_verifier_rejects_v1_and_v2_tokens(version: int) -> None:
+  private, public = _keypair()
+  with pytest.raises(WorkAuthorizationError, match="unknown_schema"):
+    _verify(_verifier(public), _token(private, _legacy_payload(version)))
 
 
 def test_verifier_intersects_execution_claim_manifest_and_scopes() -> None:
@@ -219,8 +270,9 @@ def test_verifier_enforces_key_retirement_iat_and_token_window() -> None:
   (
     ({"kid": "other-key"}, "key_id_mismatch"),
     ({"reservation_id": None}, "invalid_authority_shape"),
-    ({"primary_inference_observability": "hank_byok_observed"},
-     "invalid_authority_shape"),
+    ({"reserved_spend_microusd": None}, "invalid_authority_shape"),
+    ({"reserved_spend_microusd": -1}, "invalid_authority_shape"),
+    ({"reserved_spend_microusd": True}, "invalid_authority_shape"),
     ({"request_id": "prompt text\nsecret"}, "invalid_request_id"),
   ),
 )

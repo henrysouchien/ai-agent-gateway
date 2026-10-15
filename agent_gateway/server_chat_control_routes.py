@@ -41,6 +41,10 @@ async def chat_subscribe_response(
 
   active_turn = session.active_turn
   if active_turn is None:
+    # The turn finished and its grace clear ran before this reconnect; the
+    # finished log replays from after_seq and ends at its terminal.
+    active_turn = session.last_completed_turn
+  if active_turn is None:
     raise HTTPException(status_code=404, detail="No active turn for this session")
 
   subscriber = register_stream_subscriber(
@@ -135,6 +139,9 @@ async def chat_recap_response(
 
   recap_payload = compute_session_recap_payload(session, active_turn, trigger="explicit")
   if log_has_terminal(active_turn.event_log):
+
+
+
     write_transcript(
       transcript_dir,
       session.session_id,
@@ -218,8 +225,107 @@ def _session_cumulative_recap_response(
   return JSONResponse(content=recap_payload)
 
 
+
+async def chat_todo_get_response(
+  request: Request,
+  *,
+  auth: Any,
+  get_bearer_token: Callable[[str | None], str],
+) -> JSONResponse:
+  """Current checklist snapshot for the session, with its revision."""
+  token = get_bearer_token(request.headers.get("Authorization"))
+  session = auth.verify_token(token)
+  state = getattr(session, "todo_checklist_state", None)
+  if state is None:
+    from agent_gateway.todo_checklist import ensure_todo_session_state
+
+    state = ensure_todo_session_state(
+      session,
+      gateway_session_id=getattr(session, "session_id", None) or "",
+      scope_to_run=False,
+    )
+    log = getattr(session, "agent_session_log", None)
+    if log is not None:
+      await state.load(log)
+  return JSONResponse(content=state.checklist.to_payload())
+
+
+async def chat_todo_patch_response(
+  request: Request,
+  body: Any,
+  *,
+  auth: Any,
+  get_bearer_token: Callable[[str | None], str],
+  append_todo_snapshot: Callable[[Any, dict], Any],
+  emit_to_session: Callable[[Any, dict], None],
+) -> JSONResponse:
+  """Revision-guarded analyst edit: replace the checklist's phases.
+
+  A stale revision is rejected with the current snapshot so the client can
+  rebase; the model's in-flight `init`/`done`-all is rejected the same way
+  when an analyst edit moves first.
+  """
+  from agent_gateway.todo_checklist import TodoError
+
+  token = get_bearer_token(request.headers.get("Authorization"))
+  session = auth.verify_token(token)
+  state = getattr(session, "todo_checklist_state", None)
+  if state is None:
+    from agent_gateway.todo_checklist import ensure_todo_session_state
+
+    state = ensure_todo_session_state(
+      session,
+      gateway_session_id=getattr(session, "session_id", None) or "",
+      scope_to_run=False,
+    )
+    log = getattr(session, "agent_session_log", None)
+    if log is not None:
+      await state.load(log)
+  expected_revision = getattr(body, "expected_revision", None)
+  if expected_revision is None or expected_revision != state.checklist.revision:
+    raise HTTPException(
+      status_code=409,
+      detail={
+        "code": "stale_revision",
+        "message": f"checklist is at revision {state.checklist.revision}, PATCH was made against {expected_revision}",
+        "checklist": state.checklist.to_payload(),
+      },
+    )
+  try:
+    updated = state.apply_analyst(
+      expected_revision=expected_revision,
+      phases=getattr(body, "phases", None),
+    )
+  except TodoError as exc:
+    raise HTTPException(
+      status_code=422,
+      detail={"code": exc.code, "message": exc.message, **exc.fields},
+    )
+  # The model's in-flight init/done-all formed at an older revision is rejected
+  # on its next call; the edit note (session's state.pending_analyst_note) reaches
+  # it at its next request boundary.
+  event = {
+    "type": "todo_snapshot",
+    "gateway_session_id": getattr(session, "gateway_session_id", None)
+      or getattr(session, "session_id", None),
+    "actor": "analyst",
+    "op": "patch",
+    "revision": updated.revision,
+    "phases": [p.to_payload() for p in updated.phases],
+    "analyst_revision": updated.analyst_revision,
+    "analyst_change": updated.analyst_change,
+  }
+  if state.scope_to_run and not event["gateway_session_id"]:
+    event["gateway_session_id"] = getattr(session, "session_id", None)
+  await append_todo_snapshot(session, event)
+  emit_to_session(session, event)
+  return JSONResponse(content=updated.to_payload())
+
+
 __all__ = [
   "chat_cancel_response",
   "chat_recap_response",
   "chat_subscribe_response",
+  "chat_todo_get_response",
+  "chat_todo_patch_response",
 ]

@@ -10,6 +10,27 @@ import weakref
 import pytest
 
 from agent_gateway.fork_ledger import ForkLedger
+from agent_gateway import AgentSessionLog
+from agent_gateway.final_narrative_artifact import publish_final_narrative
+from agent_gateway.runner_background_tasks import (
+  task_completed_event_payload,
+  task_correlation_payload,
+  task_registered_event_payload,
+)
+from agent_gateway.sub_agent_narrative_result import task_result_from_execution
+from agent_gateway.task_registry import TaskEntry, TaskRegistry, task_state_for_result
+from agent_workflow_contracts import (
+  AgentOperationRef,
+  AttemptRef,
+  OrdinaryDelegationTaskRef,
+  OutcomeRequirement,
+  ResultRequirement,
+  sha256_digest,
+)
+from gateway_test_support.admitted_authority_test_support import (
+  provenance_of,
+  sealed_admitted_task,
+)
 from agent_gateway.fork_task_registry import (
   ForkTaskRegistry,
   learn_fork_cost_estimate_usd,
@@ -29,6 +50,67 @@ def _ledger(tmp_path: Path) -> ForkLedger:
     process_instance_id="boot-1",
     clock_ns=_clock,
   )
+
+
+def _completed_fork_entry(tmp_path: Path, fork_id: str, cost: Decimal | float) -> TaskEntry:
+  logical = OrdinaryDelegationTaskRef(
+    delegation_id=fork_id,
+    operation=AgentOperationRef(
+      namespace="agent-operation", name="test-fork", version="1.0",
+      digest=sha256_digest({"operation": "test-fork"}),
+    ),
+  )
+  attempt = AttemptRef(
+    physical_task_id=fork_id, attempt_id=f"{fork_id}:attempt:1", attempt_number=1,
+  )
+  requirement = ResultRequirement(
+    mode="narrative", terminal_narrative="required",
+    outcome=OutcomeRequirement(required=False, source="none"),
+  )
+  admitted = sealed_admitted_task(
+    logical_task=logical, attempt=attempt, result_requirement=requirement,
+  )
+  assert admitted.model_bind is not None
+  entry = TaskEntry(
+    task_id=fork_id, task_type="agent", admitted_task=admitted,
+    capability_bind_receipt=admitted.model_bind.to_json(),
+    metadata={"admitted_task": admitted.model_dump(mode="json")},
+  )
+  journal = AgentSessionLog(tmp_path / f"{fork_id}.jsonl")
+  correlation = task_correlation_payload(entry, runner_id=None, role="writer")
+  registration = journal.append_sync(task_registered_event_payload(
+    entry, correlation_payload=correlation, agent_name="test-fork",
+    parent_session_id="session-1",
+  ))
+  usage = journal.append_sync({
+    "type": "turn_complete", "usage": {"cost_usd": float(cost)},
+  })
+  text = "Completed the inherited learning task."
+  terminal_message = journal.append_sync({
+    "type": "assistant_message", "stop_reason": "end_turn",
+    "content_blocks": [{"type": "text", "text": text}],
+  })
+  terminal = journal.append_sync({"type": "stream_complete"})
+  narrative = publish_final_narrative(
+    workspace_dir=tmp_path, sub_agent_id=fork_id,
+    terminal_event_seq=terminal_message.seq, text=text,
+  )
+  result = task_result_from_execution(
+    (usage, terminal_message, terminal),
+    logical_task=logical, attempt=attempt, requirement=requirement,
+    provenance=provenance_of(admitted), final_narrative=narrative,
+    stalled=False, admitted_task=admitted,
+  )
+  entry.result = result.model_dump(mode="json")
+  completion = journal.append_sync(task_completed_event_payload(
+    entry, task_state_for_result(result), correlation_payload=correlation,
+    completed_at=entry.started_at,
+  ))
+  registry = TaskRegistry()
+  registry.load_from_events([registration.event, completion.event])
+  restored = registry.get(fork_id)
+  assert restored is not None
+  return restored
 
 
 def _registry(
@@ -55,7 +137,7 @@ async def test_per_session_cap_skips_second_without_queue_or_reservation(
 
   async def spawn(_fork_id, _handoff):
     await release.wait()
-    return Decimal("0.50")
+    return _completed_fork_entry(tmp_path, _fork_id, Decimal("0.50"))
 
   ledger, registry, events = _registry(tmp_path, spawn)
   first = registry.submit(
@@ -63,12 +145,14 @@ async def test_per_session_cap_skips_second_without_queue_or_reservation(
     session_id="session-1",
     owner="owner-1",
     handoff={"messages": ["one"]},
+    on_settled=None,
   )
   second = registry.submit(
     fork_id="fork-2",
     session_id="session-1",
     owner="owner-1",
     handoff={"messages": ["two"]},
+    on_settled=None,
   )
 
   assert first.launched
@@ -90,7 +174,7 @@ async def test_concurrent_sessions_launch_and_emit_in_flight_count(
 
   async def spawn(_fork_id, _handoff):
     await release.wait()
-    return 0
+    return _completed_fork_entry(tmp_path, _fork_id, 0)
 
   ledger, registry, events = _registry(tmp_path, spawn)
   for index in range(3):
@@ -99,6 +183,7 @@ async def test_concurrent_sessions_launch_and_emit_in_flight_count(
       session_id=f"session-{index}",
       owner="owner-1",
       handoff={},
+      on_settled=None,
     ).launched
 
   launched = [fields for event, fields in events if event == "learning_fork_launched"]
@@ -116,7 +201,7 @@ async def test_large_handoff_launches_whole_and_emits_its_bytes(
 
   async def spawn(_fork_id, handoff):
     calls.append(handoff)
-    return 0
+    return _completed_fork_entry(tmp_path, _fork_id, 0)
 
   _ledger_, registry, events = _registry(tmp_path, spawn)
   handoff = {"transcript": "x" * 100_000}
@@ -126,6 +211,7 @@ async def test_large_handoff_launches_whole_and_emits_its_bytes(
     session_id="session-1",
     owner="owner-1",
     handoff=handoff,
+    on_settled=None,
   )
   await registry.shutdown()
 
@@ -162,7 +248,7 @@ async def test_owned_task_survives_request_task_cancellation(
     started.set()
     await release.wait()
     completed.set()
-    return "0.25"
+    return _completed_fork_entry(tmp_path, _fork_id, Decimal("0.25"))
 
   ledger, registry, _events = _registry(tmp_path, spawn)
 
@@ -172,6 +258,7 @@ async def test_owned_task_survives_request_task_cancellation(
       session_id="session-1",
       owner="owner-1",
       handoff={"transcript": "retained"},
+      on_settled=None,
     ).launched
     await asyncio.Future()
 
@@ -196,7 +283,7 @@ async def test_fork_spend_above_estimate_settles_exactly(
   tmp_path: Path,
 ) -> None:
   async def spawn(_fork_id, _handoff):
-    return Decimal("5.125")
+    return _completed_fork_entry(tmp_path, _fork_id, Decimal("5.125"))
 
   ledger, registry, events = _registry(
     tmp_path,
@@ -208,6 +295,7 @@ async def test_fork_spend_above_estimate_settles_exactly(
     session_id="session-1",
     owner="owner-1",
     handoff={},
+    on_settled=None,
   ).launched
   await registry.shutdown()
 
@@ -230,7 +318,7 @@ async def test_shutdown_waits_for_cooperative_task(
   async def spawn(_fork_id, _handoff):
     await release.wait()
     exited.set()
-    return 0
+    return _completed_fork_entry(tmp_path, _fork_id, 0)
 
   _ledger_value, registry, _events = _registry(
     tmp_path,
@@ -242,6 +330,7 @@ async def test_shutdown_waits_for_cooperative_task(
     session_id="session-1",
     owner="owner-1",
     handoff={},
+    on_settled=None,
   )
   shutdown = asyncio.create_task(registry.shutdown())
   await asyncio.sleep(0)
@@ -275,6 +364,7 @@ async def test_shutdown_cancels_at_bound_and_abandons(
     session_id="session-1",
     owner="owner-1",
     handoff={},
+    on_settled=None,
   )
 
   await asyncio.wait_for(registry.shutdown(), timeout=0.5)
@@ -295,7 +385,7 @@ async def test_handoff_reference_released_on_completion(
     pass
 
   async def spawn(_fork_id, _handoff):
-    return 0
+    return _completed_fork_entry(tmp_path, _fork_id, 0)
 
   _ledger_value, registry, _events = _registry(tmp_path, spawn)
   handoff = Handoff()
@@ -305,6 +395,7 @@ async def test_handoff_reference_released_on_completion(
     session_id="session-1",
     owner="owner-1",
     handoff=handoff,
+    on_settled=None,
   )
   del handoff
 
@@ -323,7 +414,7 @@ async def test_daily_invocations_and_charge_are_emitted_never_refused(
 
   async def spawn(_fork_id, _handoff):
     await release.wait()
-    return 0
+    return _completed_fork_entry(tmp_path, _fork_id, 0)
 
   ledger, registry, events = _registry(
     tmp_path,
@@ -336,6 +427,7 @@ async def test_daily_invocations_and_charge_are_emitted_never_refused(
       session_id=f"session-{index}",
       owner="owner-1",
       handoff={},
+      on_settled=None,
     ).launched
 
   launched = [fields for event, fields in events if event == "learning_fork_launched"]

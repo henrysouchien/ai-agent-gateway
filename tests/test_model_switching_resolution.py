@@ -14,7 +14,7 @@ from agent_gateway.capability_execution import (
 )
 from model_authority.capabilities import CAPABILITY_IDS
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
-from agent_gateway.providers import ModelInfo, ModelProvider
+from agent_gateway.providers import ModelInfo, ModelProvider, installed_adapter_route_support
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 from gateway_test_support.model_defaults import SESSION_DRIVER
 
@@ -79,7 +79,7 @@ def _make_app():
   calls: list[dict[str, Any]] = []
   providers = {
     family: _ExactProvider(family)
-    for family in {"anthropic", "codex", "openai", "xai"}
+    for family in {support.provider for support in installed_adapter_route_support().values()}
   }
   service_handles = {
     family: CredentialHandle(

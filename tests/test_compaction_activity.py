@@ -17,22 +17,29 @@ import agent_gateway.runner as gateway_runner  # noqa: E402
 import agent_gateway.runner_sub_agents as runner_sub_agents  # noqa: E402
 import agent_gateway.server_compaction as server_compaction  # noqa: E402
 from agent_gateway.agent_session_log import AgentSessionLog  # noqa: E402
+from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
 from agent_gateway.providers.base import StreamEvent  # noqa: E402
 from agent_workflow_contracts import TaskResult  # noqa: E402
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_bound_capability_execution,
 )
 from test_runner_sub_agents import _Provider, _parent, _spawn  # noqa: E402
+from tests.host_timing_test_support import harness_wait_seconds  # noqa: E402
 
 _SUMMARY_CHUNK = "The child read the filings and kept every figure. "
-_SUMMARY_WINDOW_S = 0.4
+# The parent's activity gap scales with host load (0.1 s was below what a loaded
+# 12-worker gate delivers to a 20 ms progress log). Every other cadence in this
+# module stays fixed and small, so the gap stays >=25x the heartbeat interval; the
+# summary always outlasts the gap by 4x, which is what both tests need.
+_SUMMARY_WINDOW_FACTOR = 4
 
 
 class _CompactingChildProvider(_Provider):
   """A child provider whose summary request outlasts the parent's activity gap."""
 
-  def __init__(self, *, summary_streams_progress: bool) -> None:
+  def __init__(self, *, summary_streams_progress: bool, summary_window_s: float) -> None:
     self._summary_streams_progress = summary_streams_progress
+    self._summary_window_s = summary_window_s
 
   def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> object:
     return object()
@@ -49,7 +56,7 @@ class _CompactingChildProvider(_Provider):
 
   async def stream(self, client: Any, params: dict[str, Any]):
     if params["summary"]:
-      deadline = time.monotonic() + _SUMMARY_WINDOW_S
+      deadline = time.monotonic() + self._summary_window_s
       if self._summary_streams_progress:
         while time.monotonic() < deadline:
           await asyncio.sleep(0.01)
@@ -69,7 +76,6 @@ class _CompactingChildProvider(_Provider):
 
 @pytest.fixture
 def _child_compacts_first_turn(monkeypatch: pytest.MonkeyPatch) -> None:
-  monkeypatch.setattr(runner_sub_agents, "SUB_AGENT_ACTIVITY_GAP", 0.1)
   monkeypatch.setattr(runner_sub_agents, "STREAM_GUARD_POLL_INTERVAL", 0.01)
   monkeypatch.setattr(provider_summarize, "STREAM_PROGRESS_LOG_INTERVAL", 0.02)
   monkeypatch.setattr(gateway_runner, "STREAM_GUARD_POLL_INTERVAL", 0.02)
@@ -90,10 +96,18 @@ def _spawn_compacting_child(
   *,
   summary_streams_progress: bool,
 ) -> tuple[Any, Any, list[object]]:
-  parent = _parent(tmp_path, session_log=AgentSessionLog(tmp_path / "session.jsonl"))
+  silence_seconds = harness_wait_seconds(0.5)
+  parent = _parent(
+    tmp_path,
+    session_log=AgentSessionLog(tmp_path / "session.jsonl"),
+    containment=ContainmentSettings(
+      max_concurrent_children=2, child_silence_timeout_seconds=silence_seconds,
+    ),
+  )
   execution = stub_bound_capability_execution(
     provider=_CompactingChildProvider(
       summary_streams_progress=summary_streams_progress,
+      summary_window_s=silence_seconds * _SUMMARY_WINDOW_FACTOR,
     ),
     model="child-model",
     effort="medium",

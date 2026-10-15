@@ -5,6 +5,7 @@ import copy
 import logging
 import os
 import threading
+import time
 from concurrent import futures
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,8 @@ from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 from anyio import EndOfStream
 from mcp.types import PaginatedRequestParams
 
+from .mcp_client_config import iter_exception_tree
+from .mcp_client_oauth_storage import oauth_token_cache_path
 
 log = logging.getLogger("agent_gateway.mcp_client")
 
@@ -262,21 +265,35 @@ async def connect_or_warn(
   config: dict[str, Any],
   runtime: McpConnectionRuntime,
 ) -> Any | None:
+  started = time.monotonic()
   try:
     state = await manager._connect(name, config)
+    runtime.logger.info(
+      "MCP server %s connected after %.3fs", name, time.monotonic() - started,
+    )
     manager._startup_diagnostics.pop(manager._canonical_server_name(name), None)
     return state
   except Exception as exc:
-    message = str(exc).strip() or type(exc).__name__
+    elapsed = time.monotonic() - started
+    message = ": ".join(
+      str(cause).strip() or type(cause).__name__
+      for cause in iter_exception_tree(exc)
+    )
     diagnostic = runtime.startup_failure_from_exception(exc)
     manager._set_startup_diagnostic(
       name,
       category=str(diagnostic["category"]),
-      message=str(diagnostic["message"]),
+      message=(
+        f"MCP server {name} startup failed after {elapsed:.3f}s: "
+        f"{message}"
+      ),
       retryable=bool(diagnostic["retryable"]),
       error_type=str(diagnostic["error_type"]) if diagnostic.get("error_type") else None,
     )
-    runtime.logger.warning("MCP server %s failed to connect: %s", name, message)
+    runtime.logger.warning(
+      "MCP server %s failed to connect after %.3fs: %s",
+      name, elapsed, message,
+    )
     return None
 
 
@@ -300,6 +317,11 @@ async def connect_stdio_with_retries(
   config: dict[str, Any],
   runtime: McpConnectionRuntime,
 ) -> Any:
+  # A stdio child that dies during startup (broken pipe, EOF) is a flapping
+  # launch, not a missing server; the count bounds a launch that never settles
+  # so one dead command cannot hold startup open. It is a measurement of
+  # effort, not a verdict: every attempt is logged below with its number and
+  # the last attempt's real error reaches `connect_or_warn` unchanged.
   total_attempts = 1 + runtime.stdio_connect_retries()
   for attempt in range(1, total_attempts + 1):
     try:
@@ -538,7 +560,15 @@ def build_http_auth(
         str(runtime.path_factory.home() / ".cache" / "agent-gateway" / "mcp-oauth"),
       )
     )
-    cache_path = cache_dir / f"{runtime.safe_cache_name(name)}.json"
+    cache_path = oauth_token_cache_path(
+      cache_dir,
+      name,
+      credential_principal=str(oauth_config.get("credential_principal") or ""),
+      credential_owner=(
+        None if oauth_config.get("credential_owner") is None
+        else str(oauth_config.get("credential_owner"))
+      ),
+    )
   storage = runtime.json_file_key_value_factory(runtime.path_factory(str(cache_path)).expanduser())
   scopes = oauth_config.get("scopes")
   callback_port = oauth_config.get("callback_port")
@@ -554,6 +584,37 @@ def build_http_auth(
   )
 
 
+async def _bounded_startup_step(
+  manager: Any,
+  step: str,
+  awaitable: Any,
+  *,
+  name: str | None = None,
+) -> Any:
+  """Contain an unanswered handshake that otherwise holds startup and shutdown's lock."""
+  started = time.monotonic()
+  request = asyncio.ensure_future(awaitable)
+  server = f"MCP server {name}" if name is not None else "MCP server"
+  try:
+    return await asyncio.wait_for(request, timeout=manager._startup_timeout)
+  except asyncio.TimeoutError as exc:
+    elapsed = time.monotonic() - started
+    # A peer's own TimeoutError is its cause, not our no-response diagnosis.
+    cause = (
+      f"no response (startup resource bound {manager._startup_timeout:g}s)"
+      if request.cancelled() else str(exc).strip() or type(exc).__name__
+    )
+    raise TimeoutError(
+      f"{server} startup {step} failed after {elapsed:.3f}s: {cause}"
+    ) from exc
+  except Exception as exc:
+    log.warning(
+      "%s startup %s failed after %.3fs: %s",
+      server, step, time.monotonic() - started, str(exc).strip() or type(exc).__name__,
+    )
+    raise
+
+
 async def initialize_session_state(
   manager: Any,
   *,
@@ -564,7 +625,7 @@ async def initialize_session_state(
   allowed_tools: tuple[str, ...] | None,
   runtime: McpConnectionRuntime,
 ) -> Any:
-  await asyncio.wait_for(session.initialize(), timeout=manager._startup_timeout)
+  await _bounded_startup_step(manager, "initialize", session.initialize(), name=name)
 
   tools: list[McpListedTool] = []
   cursor: str | None = None
@@ -573,9 +634,11 @@ async def initialize_session_state(
   # enumerated forever here — withholding every other server's catalog and
   # holding the manager lock against shutdown for good.
   for _page in range(_LIST_TOOLS_PAGE_CEILING):
-    listed = await asyncio.wait_for(
+    listed = await _bounded_startup_step(
+      manager,
+      "list_tools",
       session.list_tools(params=PaginatedRequestParams(cursor=cursor)),
-      timeout=manager._startup_timeout,
+      name=name,
     )
     tools.extend(listed.tools or [])
     if listed.next_cursor is None:
@@ -616,7 +679,7 @@ async def initialize_session_state(
       if (
         not isinstance(served_disposition, str)
         or served_disposition not in {
-          "pure_local", "read_composable", "artifact_composable",
+          "pure_local", "read_composable", "artifact_composable", "write_composable",
           "tool_only", "internal_only", "unclassified",
         }
         or not isinstance(reason, str)
@@ -659,9 +722,10 @@ async def verify_stdio_session_stable(
   delay = runtime.stdio_connect_stabilize_delay()
   if delay > 0:
     await asyncio.sleep(delay)
-  await asyncio.wait_for(
+  await _bounded_startup_step(
+    manager,
+    "stability check",
     session.list_tools(params=PaginatedRequestParams()),
-    timeout=manager._startup_timeout,
   )
 
 

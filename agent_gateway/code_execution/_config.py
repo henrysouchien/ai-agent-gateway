@@ -36,6 +36,9 @@ class CodeExecutionConfig:
   max_images: int = 5
   max_image_base64_bytes: int = 500 * 1024
   default_timeout_ms: int = 30_000
+  # Recorded beside the measured host wait on a result; never armed as a wait,
+  # interrupt or refusal. `default_timeout_ms` bounds compute only.
+  default_host_wait_ms: int | None = None
   max_timeout_ms: int = 120_000
 
   # Tool schema

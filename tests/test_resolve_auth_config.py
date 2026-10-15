@@ -88,20 +88,22 @@ def test_resolve_auth_config_explicit_auth_mode_is_used() -> None:
   assert resolved["auth_token"] == "cfg-token"
 
 
-def test_resolve_auth_config_env_fallback_api_key() -> None:
+def test_resolve_auth_config_ignores_ambient_anthropic_api_key() -> None:
+  # u9 ruling (2026-10-12): an Anthropic record missing from args/config is
+  # filled from the gateway pool only, never from the process environment.
   monkeypatch = pytest.MonkeyPatch()
   monkeypatch.setenv("ANTHROPIC_API_KEY", "env-key")
   try:
     assert resolve_auth_config() == {
       "auth_mode": "api",
-      "api_key": "env-key",
+      "api_key": "",
       "auth_token": "",
     }
   finally:
     monkeypatch.undo()
 
 
-def test_resolve_auth_config_env_fallback_auth_token() -> None:
+def test_resolve_auth_config_binds_the_pool_token() -> None:
   monkeypatch = pytest.MonkeyPatch()
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "env-token")
   try:
@@ -114,49 +116,50 @@ def test_resolve_auth_config_env_fallback_auth_token() -> None:
     monkeypatch.undo()
 
 
-def test_resolve_auth_config_env_auth_mode_takes_precedence_when_enabled() -> None:
+def test_resolve_auth_config_consults_pool_first_and_respects_parked_token() -> None:
+  import json
+  import time
+  from agent_gateway.providers.anthropic_oauth import ANTHROPIC_CREDENTIAL_POOL
+
+  monkeypatch = pytest.MonkeyPatch()
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token-1")
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps(["token-1", "token-2"]))
+  try:
+    # 1. Unblocked token-1 binds first
+    resolved_1 = resolve_auth_config()
+    assert resolved_1["auth_token"] == "token-1"
+
+    # 2. Block token-1; pool selection chooses unblocked sibling token-2
+    ANTHROPIC_CREDENTIAL_POOL.block("token-1", until=time.time() + 3600)
+    resolved_2 = resolve_auth_config()
+    assert resolved_2["auth_token"] == "token-2"
+
+    # 3. Pool of one fallback when blocked: select binds it, avoiding upfront failure
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKENS")
+    resolved_3 = resolve_auth_config()
+    assert resolved_3["auth_token"] == "token-1"
+  finally:
+    ANTHROPIC_CREDENTIAL_POOL._blocked_until.pop("token-1", None)
+    monkeypatch.undo()
+
+
+def test_resolve_auth_config_never_reads_env_auth_mode() -> None:
+  # The mode follows the material that resolved, not ANTHROPIC_AUTH_MODE.
   monkeypatch = pytest.MonkeyPatch()
   monkeypatch.setenv("ANTHROPIC_API_KEY", "env-key")
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "env-token")
-  monkeypatch.setenv("ANTHROPIC_AUTH_MODE", "oauth")
+  monkeypatch.setenv("ANTHROPIC_AUTH_MODE", "api")
   try:
-    resolved = resolve_auth_config(read_env_auth_mode=True)
+    resolved = resolve_auth_config()
+    with_config = resolve_auth_config(auth_config={"api_key": "cfg-key"})
   finally:
     monkeypatch.undo()
 
   assert resolved["auth_mode"] == "oauth"
   assert resolved["api_key"] == ""
   assert resolved["auth_token"] == "env-token"
-
-
-def test_resolve_auth_config_env_auth_mode_ignored_by_default() -> None:
-  monkeypatch = pytest.MonkeyPatch()
-  monkeypatch.setenv("ANTHROPIC_API_KEY", "env-key")
-  monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "env-token")
-  monkeypatch.setenv("ANTHROPIC_AUTH_MODE", "oauth")
-  try:
-    resolved = resolve_auth_config()
-  finally:
-    monkeypatch.undo()
-
-  assert resolved["auth_mode"] == "api"
-  assert resolved["api_key"] == "env-key"
-  assert resolved["auth_token"] == ""
-
-
-def test_resolve_auth_config_env_auth_mode_ignored_when_auth_config_provided() -> None:
-  monkeypatch = pytest.MonkeyPatch()
-  monkeypatch.setenv("ANTHROPIC_AUTH_MODE", "oauth")
-  try:
-    resolved = resolve_auth_config(
-      auth_config={"api_key": "cfg-key"},
-      read_env_auth_mode=True,
-    )
-  finally:
-    monkeypatch.undo()
-
-  assert resolved["auth_mode"] == "api"
-  assert resolved["api_key"] == "cfg-key"
+  assert with_config["auth_mode"] == "api"
+  assert with_config["api_key"] == "cfg-key"
 
 
 def test_resolve_auth_config_precedence_arg_over_config_over_env() -> None:
@@ -414,9 +417,9 @@ def test_resolve_auth_config_preserves_extra_auth_config_keys() -> None:
   assert resolved["auth_mode"] == "api"
 
 
-def test_resolve_auth_config_read_env_false_skips_env_fallback() -> None:
+def test_resolve_auth_config_read_env_false_skips_the_pool() -> None:
   monkeypatch = pytest.MonkeyPatch()
-  monkeypatch.setenv("ANTHROPIC_API_KEY", "env-key")
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "env-token")
   try:
     resolved = resolve_auth_config(read_env=False)
   finally:
@@ -445,11 +448,11 @@ def test_resolve_auth_config_blanks_non_active_credential_without_auth_config() 
   assert resolved["auth_token"] == ""
 
 
-def test_resolve_provider_does_not_read_anthropic_auth_mode_env() -> None:
+def test_resolve_provider_binds_anthropic_from_the_pool_only() -> None:
   monkeypatch = pytest.MonkeyPatch()
   monkeypatch.setenv("ANTHROPIC_API_KEY", "env-key")
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "env-token")
-  monkeypatch.setenv("ANTHROPIC_AUTH_MODE", "oauth")
+  monkeypatch.setenv("ANTHROPIC_AUTH_MODE", "api")
   try:
     _provider, _provider_name, config = _resolve_provider(
       "anthropic", "claude-opus-5", None, None, None
@@ -457,9 +460,9 @@ def test_resolve_provider_does_not_read_anthropic_auth_mode_env() -> None:
   finally:
     monkeypatch.undo()
 
-  assert config["auth_mode"] == "api"
-  assert config["api_key"] == "env-key"
-  assert config["auth_token"] == ""
+  assert config["auth_mode"] == "oauth"
+  assert config["api_key"] == ""
+  assert config["auth_token"] == "env-token"
 
 
 def test_resolve_provider_requires_bound_upstream_model() -> None:

@@ -15,6 +15,8 @@ import time
 import urllib.parse
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
+from .credential_pool import ProviderCredentialPool, _PROVIDER_POOLS
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -62,6 +64,10 @@ ANTHROPIC_STORE_BASE_ENV = "USER_DATA_DIR"
 # autonomous child reading the stdin credential handoff — resolves the same
 # user's pool without having to be told again.
 ANTHROPIC_USER_SCOPE_FIELD = "auth_user_scope"
+# Only the gateway materializer enrolls the deployment key. This explicit
+# generation reference retains membership across rotation without giving
+# ambient operator credentials to other pool consumers.
+ANTHROPIC_DEPLOYMENT_API_KEY_FIELD = "deployment_api_key_source"
 # A limiter that rejects a credential without naming a reset window keeps it out
 # of rotation for this long. The window is a representation of "unknown reset",
 # not a policy: the next attempt on that credential re-blocks it if it is still
@@ -98,6 +104,28 @@ class AnthropicSourceError(AnthropicOAuthError):
   def __init__(self, reason: str) -> None:
     self.reason = reason
     super().__init__(f"Anthropic source generation is {reason}; run `{self.next_call}`")
+
+
+class AnthropicStoreError(AnthropicOAuthError):
+  """The credential store could not be read or written where it was expected.
+
+  A read path (`load`, an exact `credential_source` resolve, `ensure_fresh`)
+  never needs to create the store, its directory, or its lock file; a store
+  it cannot open is this typed error with its own next call, never a raw
+  `OSError`. A writer that cannot open the store raises the same typed error.
+  """
+
+  code = "store_unreadable"
+  next_call = (
+    "ensure the credential store path exists and its directory is readable "
+    "(writable for enrollment), then retry"
+  )
+
+  def __init__(self, path: Path, exc: OSError | None = None) -> None:
+    self.reason = "store_unreadable"
+    self.path = path
+    detail = f": {exc}" if exc is not None else ""
+    super().__init__(f"Unable to access Anthropic credential store {path}{detail}")
 
 def _anthropic_store_base(env: Mapping[str, str]) -> Path:
   """The root every Anthropic token store of this deployment lives under."""
@@ -348,12 +376,52 @@ def mask_anthropic_token(token: str) -> str:
 def _store_lock(path: Path) -> Iterator[None]:
   """Serialize store mutation across processes: login and refresh both write it."""
 
-  path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-  lock_path = path.with_name(f".{path.name}.lock")
-  fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
   try:
-    os.fchmod(fd, 0o600)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+  except OSError as exc:
+    raise AnthropicStoreError(path, exc) from exc
+  lock_path = path.with_name(f".{path.name}.lock")
+  try:
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+  except OSError as exc:
+    raise AnthropicStoreError(path, exc) from exc
+  try:
+    try:
+      os.fchmod(fd, 0o600)
+    except OSError:
+      pass
     fcntl.flock(fd, fcntl.LOCK_EX)
+    yield
+  finally:
+    try:
+      fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+      os.close(fd)
+
+
+@contextlib.contextmanager
+def _store_read_lock(path: Path) -> Iterator[None]:
+  """Take a shared lock on the store without creating anything.
+
+  A read path (an exact `credential_source` resolve, `load`, `ensure_fresh`)
+  must open the store read-only: no directory creation, no lock-file creation,
+  no write lock. When the lock file the writers use is present, a shared lock
+  keeps the read consistent with an in-flight writer; when it is absent (a
+  read-only deployment that never wrote here) the read is a lock-free
+  snapshot. A store directory this process cannot read is ``AnthropicStoreError``,
+  never a raw ``OSError``.
+  """
+
+  lock_path = path.with_name(f".{path.name}.lock")
+  try:
+    fd = os.open(lock_path, os.O_RDONLY)
+  except FileNotFoundError:
+    yield
+    return
+  except OSError as exc:
+    raise AnthropicStoreError(path, exc) from exc
+  try:
+    fcntl.flock(fd, fcntl.LOCK_SH)
     yield
   finally:
     try:
@@ -397,7 +465,7 @@ def _load_store_unlocked(path: Path, *, migrate: bool = True) -> _AnthropicStore
   except FileNotFoundError:
     return _AnthropicStore()
   except OSError as exc:
-    raise AnthropicOAuthError("Unable to read Anthropic credential store") from exc
+    raise AnthropicStoreError(path, exc) from exc
   except json.JSONDecodeError:
     raise AnthropicOAuthError("Invalid Anthropic credential store JSON") from None
   if not isinstance(parsed, dict):
@@ -441,10 +509,22 @@ def _load_store_unlocked(path: Path, *, migrate: bool = True) -> _AnthropicStore
 
 
 def load_anthropic_oauth_store(path: Path) -> tuple[AnthropicOAuthRecord, ...]:
-  """Active pool accounts in enrollment order; migrate legacy/v2 once under lock."""
+  """Active pool accounts in enrollment order; migrate legacy/v2 once under lock.
 
-  with _store_lock(path):
-    return tuple(_load_store_unlocked(path).accounts)
+  The read itself is a read-only snapshot (no store or lock-file creation).
+  Migration is a write, so it is the only case that takes the write lock.
+  """
+
+  with _store_read_lock(path):
+    store = _load_store_unlocked(path, migrate=False)
+  if any(
+    not record.generation_id or not record.grant_hash
+    for records in (store.accounts, store.static_credentials)
+    for record in records
+  ):
+    with _store_lock(path):
+      store = _load_store_unlocked(path)
+  return tuple(store.accounts)
 
 
 def _write_store_unlocked(path: Path, store: _AnthropicStore) -> None:
@@ -461,7 +541,10 @@ def _write_store_unlocked(path: Path, store: _AnthropicStore) -> None:
   except OSError:
     pass
   temp_path = path.with_name(f".{path.name}.{secrets.token_hex(12)}.tmp")
-  fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+  try:
+    fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+  except OSError as exc:
+    raise AnthropicStoreError(path, exc) from exc
   try:
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
       json.dump(payload, handle, indent=2, sort_keys=True)
@@ -660,9 +743,10 @@ def register_anthropic_static_credential(
   """Register the effective opaque key/token in this existing source store.
 
   Source slots identify custody, not remote accounts: environment slots belong
-  to the org; request slots belong to the authenticated user's store. Same
-  source/material retains its generation, replacement retires it, and empty
-  material removes it. API keys never enter the OAuth pool projection.
+  to the org; a request source (`_request_source`) belongs to the store of the
+  scope that carried it. Same source/material retains its generation,
+  replacement retires it, and empty material removes it. API keys and OAuth
+  tokens retain their own credential kind within the pool.
   """
 
   path = resolve_anthropic_auth_store_path(
@@ -684,6 +768,30 @@ def register_anthropic_static_credential(
     )
 
 
+def _request_source(credential_kind: str, material: str) -> str:
+  """A request-carried key/token's own source, named by its material's digest.
+
+  Concurrent runs and users carry different material, so a request source is
+  never a shared slot: one request's material cannot supersede another's, and
+  the same material resolves its own generation again.
+  """
+  digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+  return f"request:anthropic:{credential_kind}:{digest}"
+
+
+def _environment_source(name: str, material: str) -> str:
+  """An environment token's own source, keyed by its material's digest.
+
+  Every pool form keys by its own material, so two processes that share the
+  org store but present different values for one name occupy distinct sources
+  and never retire each other's generation. A name's slot is retired only when
+  that name is observed empty (see `_sync_environment_tokens`).
+  """
+
+  digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+  return f"env:{name}:{digest}"
+
+
 def enroll_request_anthropic_credential(
   material: str,
   *,
@@ -702,7 +810,7 @@ def enroll_request_anthropic_credential(
   return register_anthropic_static_credential(
     normalized,
     credential_kind=credential_kind,
-    source=f"request:anthropic:{credential_kind}",
+    source=_request_source(credential_kind, normalized),
     user_scope=user_scope,
   )
 
@@ -713,8 +821,6 @@ def _environment_source_material(source: str, env: Mapping[str, str]) -> tuple[s
   name = source.removeprefix("env:").split(":", 1)[0]
   if name not in env:
     return None
-  if name == "ANTHROPIC_API_KEY":
-    return _single_token(env[name])
   for env_name, read_form in _ENV_POOL_FORMS:
     if name == env_name:
       return read_form(env[name])
@@ -726,7 +832,18 @@ def _sync_environment_tokens(
   env: Mapping[str, str],
   enrolled_tokens: Mapping[str, tuple[Path, AnthropicOAuthRecord]],
 ) -> dict[tuple[str, str], AnthropicOAuthRecord]:
-  """Reconcile observed org-env members; an absent name has no retirement authority."""
+  """Reconcile observed org-env members; an absent name has no retirement authority.
+
+  Each setup token's source is named by its own material's digest, exactly as a
+  request-carried token is (`_request_source`). The deployment API key is
+  registered separately by the gateway materializer. Two processes that share
+  the org store but carry different setup values for a name therefore occupy
+  distinct sources: neither retires the other's generation.
+  A process retires only the members of a source it actually observes to have
+  changed or emptied — a name present-but-empty still retires that name's slot
+  (per the reference: an emptied env name retires its slot), while an absent
+  name asserts nothing.
+  """
 
   selected: dict[tuple[str, str], AnthropicOAuthRecord] = {}
   with _store_lock(path):
@@ -737,21 +854,32 @@ def _sync_environment_tokens(
       for token in read_form(env.get(name, "")):
         if token in enrolled_tokens:
           continue
-        source = f"env:{name}"
-        if name == ANTHROPIC_AUTH_TOKENS_ENV:
-          source += f":{hashlib.sha256(token.encode('utf-8')).hexdigest()}"
+        source = _environment_source(name, token)
         desired.add(source)
         record = _register_static_unlocked(
           store, token, credential_kind="auth_token", source=source,
         )
         if record is not None:
           selected[(name, token)] = record
-    pool_sources = tuple(f"env:{name}" for name, _read in _ENV_POOL_FORMS if name in env)
+    pool_names = {name for name, _read in _ENV_POOL_FORMS}
     for record in tuple(store.static_credentials):
-      if any(record.source == prefix or record.source.startswith(prefix + ":") for prefix in pool_sources):
+      if not record.source.startswith("env:"):
+        continue
+      name = record.source.removeprefix("env:").split(":", 1)[0]
+      # A name this process cannot observe asserts nothing.
+      if name not in pool_names or name not in env:
+        continue
+      if name == ANTHROPIC_AUTH_TOKENS_ENV:
+        # Membership reconciliation: an array member this observation no longer
+        # names is retired as removed.
         if record.source not in desired:
           _retire_generation(store, record, "removed")
           store.static_credentials.remove(record)
+      elif _environment_source_material(record.source, env) == ():
+        # A single-valued name retires its slot only when observed empty: a
+        # different non-empty value is a co-existing source, not a retirement.
+        _retire_generation(store, record, "removed")
+        store.static_credentials.remove(record)
     if before != tuple(record.generation_id for record in store.static_credentials):
       _write_store_unlocked(path, store)
   return selected
@@ -765,11 +893,12 @@ def resolve_anthropic_credentials(
 ) -> AnthropicCredentialSources:
   """The pool bound to one user identity, highest precedence first.
 
-  One ordered derivation, not a choice between two modes: the credential this
-  request already carries, then the accounts enrolled for this user, then the
-  org credentials (the environment forms, then the accounts enrolled for the
-  deployment). A user who has enrolled nothing therefore resolves exactly the
-  org pool, and a user who has enrolled accounts spends those first.
+  One ordered derivation: the credential this request already carries, the
+  accounts enrolled for this user, the deployment API key explicitly enrolled
+  by the gateway, then org credentials (environment setup tokens, then accounts
+  enrolled for the deployment). Exact generation lookup remains read-only and
+  serves only the member that the request already bound. Ambient API keys are
+  never a source for this resolver.
 
   An environment token that happens to be an enrolled account's current access
   token resolves to that account, so it is refreshable and parks under the
@@ -778,6 +907,7 @@ def resolve_anthropic_credentials(
 
   cfg = config or {}
   env = os.environ if environ is None else environ
+  deployment_key_ref = str(cfg.get(ANTHROPIC_DEPLOYMENT_API_KEY_FIELD) or "")
   scope = anthropic_user_scope(
     user_scope if user_scope is not None else cfg.get(ANTHROPIC_USER_SCOPE_FIELD)
   )
@@ -786,6 +916,42 @@ def resolve_anthropic_credentials(
     resolve_anthropic_auth_store_path(cfg, environ=env, user_scope=scope) if scope else None
   )
   store_paths = (org_path,) if user_path is None else (user_path, org_path)
+  bound_source = cfg.get("credential_source")
+  if isinstance(bound_source, Mapping):
+    # The documented read-only exact lookup. A bound `credential_source` names
+    # one immutable generation: read it under the store's read lock without
+    # creating the store, without an env sync, and without registering or
+    # retiring anything. A retired/removed/superseded generation is the typed
+    # source error with its recorded reason; a changed env source is reported
+    # here too, never rewritten. Reconciliation is the pool path below.
+    credential = _resolve_generation(
+      str(bound_source.get("generation_ref") or ""),
+      environ=env, user_scope=scope, store_paths=store_paths,
+      deployment_api_key_source=deployment_key_ref,
+    )
+    return AnthropicCredentialSources(
+      credentials=(credential,),
+      store_path=org_path,
+      user_scope=scope,
+      user_store_path=user_path,
+    )
+  api_credential = None
+  if deployment_key_ref:
+    # Membership reads active records only. A retired key no longer belongs to
+    # the pool, but does not prevent the remaining seats from serving rotation.
+    with _store_read_lock(org_path):
+      org_store = _load_store_unlocked(org_path, migrate=False)
+      deployment_key = next((
+        record for record in org_store.static_credentials
+        if record.generation_ref == deployment_key_ref
+        and record.source == "env:ANTHROPIC_API_KEY"
+        and record.credential_kind == "api_key"
+      ), None)
+    if deployment_key is not None:
+      api_credential = AnthropicCredential(
+        key=deployment_key.identity, token=deployment_key.access_token,
+        record=deployment_key, store_path=org_path,
+      )
   stores = tuple((path, load_anthropic_oauth_store(path)) for path in store_paths)
   # The user's own record wins when the same access token sits in both stores:
   # it names the account the request is entitled to refresh and park under.
@@ -839,7 +1005,7 @@ def resolve_anthropic_credentials(
             _append(credential)
             return
         credential = register_anthropic_static_credential(
-          token, credential_kind="auth_token", source="request:anthropic:auth_token",
+          token, credential_kind="auth_token", source=_request_source("auth_token", token),
           config=cfg, environ=env, user_scope=scope,
         )
         if credential is None:
@@ -865,20 +1031,12 @@ def resolve_anthropic_credentials(
       ))
 
   bound = str(cfg.get("auth_token") or "").strip()
-  bound_source = cfg.get("credential_source") if cfg.get("auth_mode") != "api" else None
-  if isinstance(bound_source, Mapping):
-    credential = _resolve_generation(
-      str(bound_source.get("generation_ref") or ""),
-      environ=env, user_scope=scope, store_paths=store_paths,
-    )
-    if credential.record is not None and credential.record.credential_kind != "auth_token":
-      # OAuth bearer pool membership never admits API billing credentials.
-      raise AnthropicSourceError("incompatible_source")
-    _append(credential)
-  elif bound:
+  if bound:
     _append_token(bound)
   for path, records in stores[:-1]:
     _append_records(path, records)
+  if api_credential is not None:
+    _append(api_credential)
   for name, read_form in _ENV_POOL_FORMS:
     for token in read_form(env.get(name, "")):
       _append_token(token, name=name)
@@ -898,6 +1056,7 @@ def _resolve_generation(
   environ: Mapping[str, str] | None,
   user_scope: Any,
   store_paths: Sequence[Path] | None = None,
+  deployment_api_key_source: str = "",
 ) -> AnthropicCredential:
   scope = anthropic_user_scope(user_scope)
   org_path = resolve_anthropic_auth_store_path(environ=environ, user_scope="")
@@ -907,7 +1066,7 @@ def _resolve_generation(
   )
   generation_id = generation_ref.removeprefix(_GENERATION_REF_PREFIX)
   for path in paths:
-    with _store_lock(path):
+    with _store_read_lock(path):
       store = _load_store_unlocked(path, migrate=False)
       try:
         record = _current_generation(store, generation_id)
@@ -915,14 +1074,21 @@ def _resolve_generation(
         if exc.reason != "missing":
           raise
         continue
-      if record.source.startswith("env:"):
+      if record.source == "env:ANTHROPIC_API_KEY":
+        if record.generation_ref != deployment_api_key_source:
+          raise AnthropicSourceError("unobservable")
+      elif record.source.startswith("env:"):
         env = os.environ if environ is None else environ
         available = _environment_source_material(record.source, env)
         if available is None:
           raise AnthropicSourceError("unobservable")
         if record.access_token not in available:
           raise AnthropicSourceError("superseded" if available else "removed")
-      key = record.identity if record in store.accounts else record.access_token
+      key = (
+        record.identity
+        if record in store.accounts or record.credential_kind == "api_key"
+        else record.access_token
+      )
       return AnthropicCredential(
         key=key, token=record.access_token, record=record, store_path=path,
       )
@@ -943,6 +1109,7 @@ def anthropic_generation_auth_config(
   """Materialize an exact active source generation without pool selection."""
   credential = _resolve_generation(
     generation_ref, environ=None, user_scope=user_scope,
+    deployment_api_key_source=str(base_config.get(ANTHROPIC_DEPLOYMENT_API_KEY_FIELD) or ""),
   )
   assert credential.record is not None
   is_api_key = credential.record.credential_kind == "api_key"
@@ -958,7 +1125,7 @@ def anthropic_generation_auth_config(
   return config
 
 
-class AnthropicCredentialPool:
+class AnthropicCredentialPool(ProviderCredentialPool):
   """Which sibling credential is usable right now, for this process.
 
   The resolver owns the order; the limiter's own reset headers own the block
@@ -967,33 +1134,13 @@ class AnthropicCredentialPool:
   token), so a refreshed access token stays parked for its account's window.
   """
 
-  def __init__(self) -> None:
-    self._blocked_until: dict[str, float] = {}
-
-  def blocked_until(self, key: str) -> float:
-    return self._blocked_until.get(str(key or "").strip(), 0.0)
-
-  def block(self, key: str, *, until: float) -> None:
-    normalized = str(key or "").strip()
-    if not normalized:
-      return
-    self._blocked_until[normalized] = max(
-      self._blocked_until.get(normalized, 0.0),
-      float(until),
-    )
-
-  def first_unblocked(self, keys: Sequence[str], *, now: float | None = None) -> str:
-    moment = time.time() if now is None else now
-    for key in keys:
-      if self.blocked_until(key) <= moment:
-        return str(key)
-    return ""
 
 
 # Usage limits outlive a single request and a single session, so the block state
 # is process-wide: a credential the limiter rejected for the next five hours must
 # not be handed to the next session that starts.
 ANTHROPIC_CREDENTIAL_POOL = AnthropicCredentialPool()
+_PROVIDER_POOLS["anthropic"] = ANTHROPIC_CREDENTIAL_POOL
 _LOGGED_POOL_SUMMARIES: dict[str, str] = {}
 
 
@@ -1487,6 +1634,7 @@ __all__ = [
   "ANTHROPIC_AUTH_TOKENS_ENV",
   "ANTHROPIC_CREDENTIAL_POOL",
   "ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES",
+  "ANTHROPIC_DEPLOYMENT_API_KEY_FIELD",
   "ANTHROPIC_OAUTH_AUTHORIZE_URL",
   "ANTHROPIC_OAUTH_CLIENT_ID",
   "ANTHROPIC_OAUTH_REDIRECT_URI",
@@ -1509,11 +1657,11 @@ __all__ = [
   "is_anthropic_generation_ref",
   "anthropic_token_store_is_private",
   "anthropic_user_scope",
+  "generate_pkce",
   "complete_anthropic_login",
   "enroll_anthropic_setup_token",
   "enroll_request_anthropic_credential",
   "ensure_fresh_anthropic_credential",
-  "generate_pkce",
   "load_anthropic_oauth_store",
   "mask_anthropic_token",
   "parse_anthropic_callback",

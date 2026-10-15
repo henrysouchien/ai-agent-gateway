@@ -336,7 +336,9 @@ def test_sdk_runner_without_a_decider_refuses_only_a_live_order(
   denied = _run(runner._can_use_tool_callback("execute_trade", {"ticker": "MSFT"}, None))
 
   assert denied.behavior == "deny"
-  assert "[approval_route_absent]" in denied.message
+  error = json.loads(denied.message)["error"]
+  assert error["code"] == "approval_route_absent"
+  assert error["data"]["next_call"]
 
 
 def test_sdk_runner_parent_delegated_non_money_call_reaches_the_class_check(
@@ -711,48 +713,7 @@ def test_sdk_runner_projects_max_tokens_override_to_pinned_sdk_environment() -> 
   assert runner._credential_env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "32000"
 
 
-def test_sdk_runner_denies_forged_same_server_tool_outside_advertised_stage_scope(
-  monkeypatch: pytest.MonkeyPatch,
-  tmp_path: Path,
-) -> None:
-  _install_fake_agent_sdk(monkeypatch)
-
-  class _StageMcpConfigs(dict[str, Any]):
-    sdk_admission_enforced = True
-    advertised_mcp_tool_ids_by_server = {
-      "research-corpus-mcp": {
-        "mcp__research-corpus-mcp__filings_read",
-      }
-    }
-
-  runner = _make_runner(
-    mcp_server_configs=_StageMcpConfigs({
-      "research-corpus-mcp": {"command": "research-corpus"},
-    }),
-    approval_store_path=tmp_path / "approvals.sqlite3",
-  )
-
-  allowed = _run(
-    runner._can_use_tool_callback(
-      "mcp__research-corpus-mcp__filings_read",
-      {},
-      None,
-    )
-  )
-  denied = _run(
-    runner._can_use_tool_callback(
-      "mcp__research-corpus-mcp__transcripts_read",
-      {},
-      None,
-    )
-  )
-
-  assert allowed.behavior == "allow"
-  assert denied.behavior == "deny"
-  assert "not available in this context" in denied.message
-
-
-def test_sdk_runner_static_disallowed_tool_denied_without_approval(
+def test_sdk_runner_hands_the_excluded_set_to_the_sdk_and_callback_does_not_recheck(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
 ) -> None:
@@ -765,13 +726,10 @@ def test_sdk_runner_static_disallowed_tool_denied_without_approval(
   _run(runner.run([{"role": "user", "content": "hello"}]))
 
   assert state.options
+  assert state.options[0].kwargs["disallowed_tools"] == ["file_write"]
   callback = state.options[0].kwargs["can_use_tool"]
   assert getattr(callback, "__self__", None) is runner
   assert getattr(callback, "__func__", None) is AgentSDKRunner._can_use_tool_callback
-
-  denied = _run(callback("file_write", {"path": "x"}, None))
-  assert denied.behavior == "deny"
-  assert denied.message == "Tool 'file_write' is not available in this context"
 
   allowed = _run(callback("file_read", {"path": "x"}, None))
   assert allowed.behavior == "allow"
@@ -802,22 +760,7 @@ def test_sdk_runner_executes_report_admission_with_same_carried_run_identity(
   assert runner._resolve_run_context().run_id == "skill-run-sdk-report"
 
 
-def test_sdk_runner_report_admission_fails_closed_without_carrier(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  _install_fake_agent_sdk(monkeypatch)
-  runner = _make_runner()
-
-  decision = _run(
-    runner._can_use_tool_callback("fms_report_build_model", {}, None)
-  )
-
-  assert decision.behavior == "deny"
-  assert "[run_identity_required]" in decision.message
-
-
-
-def test_sdk_runner_user_denial_uses_ordinary_message(
+def test_sdk_runner_user_denial_carries_code_and_next_call(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
 ) -> None:
@@ -916,7 +859,8 @@ def test_sdk_runner_user_denial_uses_ordinary_message(
     denied = await callback_task
 
     assert denied.behavior == "deny"
-    assert denied.message == "user denied"
+    assert json.loads(denied.message)["error"]["code"] == "user_denied"
+    assert json.loads(denied.message)["error"]["data"]["next_call"]
     assert not denied.interrupt
 
   _run(_case())
@@ -1845,20 +1789,21 @@ def test_sdk_batch_admission_disconnect_before_pending_publish_aborts_durable_ro
       nonce: str,
       resolved_qualifier: str,
       allow_persistent: bool,
-      timeout_seconds: float,
       batch_admission: Any | None = None,
-    ) -> None:
+      park: Any | None = None,
+    ) -> dict[str, Any]:
       _ = (
         request,
         decision,
         nonce,
         resolved_qualifier,
         allow_persistent,
-        timeout_seconds,
         batch_admission,
+        park,
       )
       pending_committed.set()
       await asyncio.Event().wait()
+      raise AssertionError("the pending wait is cancelled before it returns")
 
     runner._await_user_approval_via_pending_tools = pause_before_pending_publish
     callback_task = asyncio.create_task(
@@ -2288,10 +2233,6 @@ def test_sdk_runner_legacy_skill_result_does_not_activate_active_skill_gate(
   assert hook_result == {}
   assert runner._active_skill_allow == set()
 
-  static_denied = _run(runner._can_use_tool_callback("run_bash", {"command": "date"}, None))
-  assert static_denied.behavior == "deny"
-  assert static_denied.message == "Tool 'run_bash' is not available in this context"
-
   dynamic_allowed = _run(runner._can_use_tool_callback("file_write", {"path": "x"}, None))
   assert dynamic_allowed.behavior == "allow"
 
@@ -2360,3 +2301,63 @@ def test_sdk_runner_active_skill_allow_clears_on_success_and_error(monkeypatch: 
 
   _run(_run_error())
   assert error_runner._active_skill_allow == set()
+
+
+
+def test_sdk_runner_fails_closed_when_credential_admission_revoked(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  from dataclasses import replace
+  from model_authority.binding import CapabilityResolutionError
+
+  _install_fake_agent_sdk(monkeypatch)
+  execution = stub_sdk_capability_execution()
+  assert execution.resolver is not None
+  revoked_auth = replace(execution.resolver.auth_context, entitled_capabilities=frozenset())
+  revoked_resolver = replace(execution.resolver, auth_context=revoked_auth)
+  revoked_execution = replace(execution, resolver=revoked_resolver)
+
+  runner = _make_runner()
+  runner._capability_execution = revoked_execution
+
+  with pytest.raises(CapabilityResolutionError) as exc_info:
+    _run(runner.run([{"role": "user", "content": "hello"}]))
+  assert exc_info.value.code == "credential_unavailable"
+
+
+def test_sub_agent_fails_closed_when_credential_admission_revoked() -> None:
+  from dataclasses import replace
+  from model_authority.binding import CapabilityResolutionError
+
+  execution = stub_sdk_capability_execution()
+  assert execution.resolver is not None
+  revoked_auth = replace(execution.resolver.auth_context, entitled_capabilities=frozenset())
+  revoked_resolver = replace(execution.resolver, auth_context=revoked_auth)
+  revoked_execution = replace(execution, resolver=revoked_resolver)
+
+  with pytest.raises(CapabilityResolutionError) as exc_info:
+    revoked_execution.revalidate()
+  assert exc_info.value.code == "credential_unavailable"
+
+
+def test_provider_summarize_fails_closed_when_credential_admission_revoked() -> None:
+  from dataclasses import replace
+  from model_authority.binding import CapabilityResolutionError
+  from agent_gateway.provider_summarize import provider_summarize
+
+  execution = stub_sdk_capability_execution()
+  assert execution.resolver is not None
+  revoked_auth = replace(execution.resolver.auth_context, entitled_capabilities=frozenset())
+  revoked_resolver = replace(execution.resolver, auth_context=revoked_auth)
+  revoked_execution = replace(execution, resolver=revoked_resolver)
+
+  with pytest.raises(CapabilityResolutionError) as exc_info:
+    _run(
+      provider_summarize(
+        capability_execution=revoked_execution,
+        messages=[{"role": "user", "content": "summarize"}],
+        system_prompt="test",
+        max_tokens=100,
+      )
+    )
+  assert exc_info.value.code == "credential_unavailable"

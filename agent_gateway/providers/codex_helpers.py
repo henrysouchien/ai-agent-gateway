@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 
+from ..tool_result_compaction import make_error_result
 from .base import ModelInfo, StreamEvent
 
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
@@ -160,13 +161,9 @@ def _same_model_message(message: dict[str, Any], model_info: ModelInfo) -> bool:
 
 
 def _synthetic_tool_result(tool_id: str, tool_name: str) -> dict[str, Any]:
-  return {
-    "type": "tool_result",
-    "tool_use_id": tool_id,
-    "content": json.dumps({"error": {"code": "missing_tool_result", "message": "No result provided"}}),
-    "is_error": True,
-    "tool_name": tool_name,
-  }
+  result = make_error_result(tool_id, "missing_tool_result", "No result provided")
+  result["tool_name"] = tool_name
+  return result
 
 
 def _normalize_responses_tool_call_id(tool_id: str) -> str:

@@ -236,8 +236,6 @@ class ChatDispatchRequest(BaseModel):
 
   @model_validator(mode="after")
   def _require_complete_selection(self) -> "ChatDispatchRequest":
-    if self.effort is not None and self.model_key is None:
-      raise ValueError("effort requires an explicit model_key")
     if self.catalog_revision is not None and self.model_key is None:
       raise ValueError("catalog_revision requires an explicit model_key")
     return self
@@ -257,6 +255,8 @@ class AutonomousDispatchRequest(BaseModel):
   channel: str | None = None
   research_file_id: int | None = Field(default=None, ge=1)
   dispatch_scope: DispatchScope | None = None
+  # A published preset name the skill launch's subtree admits under.
+  model_preset: str | None = None
 
   @field_validator("research_file_id", mode="before")
   @classmethod
@@ -266,6 +266,16 @@ class AutonomousDispatchRequest(BaseModel):
     if not is_research_file_id(value):
       raise ValueError("research_file_id must be a positive integer")
     return value
+
+  @field_validator("model_preset")
+  @classmethod
+  def _require_named_model_preset(cls, value: str | None) -> str | None:
+    if value is None:
+      return None
+    name = value.strip()
+    if not name:
+      raise ValueError("model_preset must be a published preset name")
+    return name
 
   @model_validator(mode="after")
   def _require_exclusive_mode_payload(self) -> "AutonomousDispatchRequest":
@@ -357,8 +367,6 @@ class ChatContinuationRequest(BaseModel):
 
   @model_validator(mode="after")
   def _require_complete_selection(self) -> "ChatContinuationRequest":
-    if self.effort is not None and self.model_key is None:
-      raise ValueError("effort requires an explicit model_key")
     if self.catalog_revision is not None and self.model_key is None:
       raise ValueError("catalog_revision requires an explicit model_key")
     return self

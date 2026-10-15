@@ -4,13 +4,14 @@ import asyncio
 import fcntl
 import functools
 import json
+import logging
 import os
 from collections import ChainMap
 from datetime import datetime, timezone
 from pathlib import Path
 import signal
 import time
-from typing import Any, Mapping, TYPE_CHECKING
+from typing import Any, ContextManager, Mapping, TYPE_CHECKING
 
 from .admission import ParentContext
 from .autonomous_child_server_dotenv import (
@@ -88,6 +89,11 @@ from .child_environment import (
 from .role_validation import require_exact_role
 from .named_refusal import NamedRefusal
 from .providers.anthropic_oauth import ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES
+from .ttl_policy import (
+  AUTONOMOUS_SESSION_AUTHORITY_TTL,
+  default_ttl_resolver,
+  resolve_ttl_seconds,
+)
 
 from .autonomous_runner_state import (
   AutonomousTask,
@@ -112,6 +118,7 @@ if TYPE_CHECKING:
 
 
 _SPAWN_CLEANUP_GRACE_SEC = 1.0
+_LOGGER = logging.getLogger("agent_gateway.autonomous_runner")
 # The sentinel redacts child output a line at a time; a longer line cannot be
 # sanitized whole, so it is replaced rather than split across the boundary.
 _CHILD_OUTPUT_LINE_MAX_BYTES = 128 * 1024
@@ -732,7 +739,7 @@ def _narrowed_mcp_gateway_user_keys(
     ) from exc
 
 
-def _start_identity_payload(
+def _launch_identity_payload(
   *,
   raw_user_id: str,
   user_email: str | None,
@@ -741,13 +748,44 @@ def _start_identity_payload(
   risk_user_id: int | None,
   user_aliases: list[str] | tuple[str, ...] | None,
   identity_status: str | None,
-  identity_resolver: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
+  """Normalize the identity facts a launch edge supplied; no resolver I/O."""
+
   explicit_owner = str(owner_user_id or "").strip() or None
   normalized_slug = str(user_slug or "").strip() or None
   normalized_risk = _positive_int(risk_user_id)
+  fallback_owner = explicit_owner or (str(normalized_risk) if normalized_risk is not None else raw_user_id)
+  fallback_slug = normalized_slug
+  if fallback_slug is None and raw_user_id != fallback_owner and not raw_user_id.isdecimal():
+    fallback_slug = raw_user_id
+  return _fallback_identity_payload(
+    user_id=fallback_owner,
+    user_email=user_email,
+    identity_status=identity_status
+    or ("risk_user_id_authoritative" if normalized_risk is not None else "legacy_user_id_fallback"),
+    risk_user_id=normalized_risk,
+    owner_user_id=fallback_owner,
+    raw_user_id=raw_user_id,
+    user_slug=fallback_slug,
+    user_aliases=list(user_aliases or ()),
+  )
 
-  if explicit_owner is None and identity_resolver is not None:
+
+def _start_identity_payload(
+  *,
+  raw_user_id: str,
+  user_email: str | None,
+  user_slug: str | None,
+  risk_user_id: int | None,
+  user_aliases: list[str] | tuple[str, ...] | None,
+  identity_status: str | None,
+  identity_resolver: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+  """Resolve the canonical owner for a launch edge that supplied none."""
+
+  normalized_slug = str(user_slug or "").strip() or None
+
+  if identity_resolver is not None:
     try:
       identity = identity_resolver(
         raw_user_id,
@@ -777,21 +815,14 @@ def _start_identity_payload(
       ) from exc
     except ValueError as exc:
       raise ValueError(f"Unable to resolve canonical autonomous user identity for {raw_user_id!r}") from exc
-
-  fallback_owner = explicit_owner or (str(normalized_risk) if normalized_risk is not None else raw_user_id)
-  fallback_slug = normalized_slug
-  if fallback_slug is None and raw_user_id != fallback_owner and not raw_user_id.isdecimal():
-    fallback_slug = raw_user_id
-  return _fallback_identity_payload(
-    user_id=fallback_owner,
-    user_email=user_email,
-    identity_status=identity_status
-    or ("risk_user_id_authoritative" if normalized_risk is not None else "legacy_user_id_fallback"),
-    risk_user_id=normalized_risk,
-    owner_user_id=fallback_owner,
+  return _launch_identity_payload(
     raw_user_id=raw_user_id,
-    user_slug=fallback_slug,
-    user_aliases=list(user_aliases or ()),
+    user_email=user_email,
+    owner_user_id=None,
+    user_slug=user_slug,
+    risk_user_id=risk_user_id,
+    user_aliases=user_aliases,
+    identity_status=identity_status,
   )
 
 
@@ -799,17 +830,22 @@ class AutonomousRegistryStartMixin:
   if TYPE_CHECKING:
     _python: str
     _slot_lock: asyncio.Lock
+    _admission_lease: Callable[[], ContextManager[None]]
     _tasks: dict[str, AutonomousTask]
     _autonomous_capability_binding_resolver: (
       AutonomousCapabilityBindingResolver | None
     )
     _log_dir: Path
+    _api_dir: Path
     _autonomous_session_token_issuer: (
       Callable[[GatewaySession], str] | None
     )
-    _api_dir: Path
-    _approval_store: _AutonomousApprovalAckStore | None
     _identity_resolver: Callable[..., Any] | None
+    _owner_run_limit_resolver: Callable[[str, int], int | None]
+    _ttl_resolver: Callable[[str, str], int | None] | None
+
+    def live_process_count_for_owner(self, owner_user_id: str) -> int: ...
+    _approval_store: _AutonomousApprovalAckStore | None
     _mcp_user_key_lookup: Callable[[str, str | None], dict[str, Any] | None] | None
 
     async def _expire_autonomous_gateway_session(
@@ -1143,6 +1179,17 @@ class AutonomousRegistryStartMixin:
           record.tool_result_spill_dir,
         )
       self._delete_task_manifest(task_id)
+      events_path = self._log_dir / f"{task_id}.events.jsonl"
+      if events_path.exists():
+        try:
+          events_path.unlink()
+          fsync_owned_file_directory(events_path)
+        except OSError:
+          _LOGGER.warning(
+            "Failed to remove orphan autonomous events file for %s",
+            task_id,
+            exc_info=True,
+          )
 
   def _signed_launch_envelope(
     self,
@@ -1209,7 +1256,12 @@ class AutonomousRegistryStartMixin:
         owner_user_id=record.owner_user_id or record.user_id,
         created_at=created_at,
         expires_at=(
-          created_at + _AUTONOMOUS_SESSION_AUTHORITY_TTL_SECONDS
+          created_at + resolve_ttl_seconds(
+            self._ttl_resolver or default_ttl_resolver,
+            record.owner_user_id or record.user_id,
+            AUTONOMOUS_SESSION_AUTHORITY_TTL,
+            _AUTONOMOUS_SESSION_AUTHORITY_TTL_SECONDS,
+          )
         ),
         user_email=record.user_email,
         risk_user_id=record.risk_user_id,
@@ -1295,9 +1347,10 @@ class AutonomousRegistryStartMixin:
     schedule_id: str | None = None,
     schedule_name: str | None = None,
     parent: ParentContext | None = None,
+    model_preset: str | None = None,
   ) -> dict[str, Any]:
-    normalized_role = require_exact_role(role)
-    in_flight_at_start = await self._reserve_slot()
+    with self._admission_lease():
+      in_flight_at_start = await self._reserve_slot()
     task_id = self._next_task_id()
     log_handle = None
     record: AutonomousTask | None = None
@@ -1341,21 +1394,30 @@ class AutonomousRegistryStartMixin:
       raw_user_id = str(user_id or "").strip()
       if not raw_user_id:
         raise ValueError("user_id is required")
-      identity = _start_identity_payload(
-        identity_resolver=self._identity_resolver,
-        raw_user_id=raw_user_id,
-        user_email=user_email,
-        owner_user_id=owner_user_id,
-        user_slug=user_slug,
-        risk_user_id=risk_user_id,
-        user_aliases=user_aliases,
-        identity_status=identity_status,
+      # The launch edge's identity facts, carried to the binding resolver; only
+      # an edge that supplied no owner resolves one here.
+      launch_identity = (
+        _launch_identity_payload(
+          raw_user_id=raw_user_id,
+          user_email=user_email,
+          owner_user_id=owner_user_id,
+          user_slug=user_slug,
+          risk_user_id=risk_user_id,
+          user_aliases=user_aliases,
+          identity_status=identity_status,
+        )
+        if str(owner_user_id or "").strip()
+        else _start_identity_payload(
+          identity_resolver=self._identity_resolver,
+          raw_user_id=raw_user_id,
+          user_email=user_email,
+          user_slug=user_slug,
+          risk_user_id=risk_user_id,
+          user_aliases=user_aliases,
+          identity_status=identity_status,
+        )
       )
-      normalized_owner_user_id = str(identity["owner_user_id"])
-      normalized_user_slug = identity["user_slug"]
-      normalized_risk_user_id = int(identity["risk_user_id"])
-      normalized_identity_status = str(identity["identity_status"])
-      aliases = list(identity["user_aliases"])
+      launch_owner_user_id = str(launch_identity["owner_user_id"])
       normalized_dispatch_scope = _normalize_dispatch_scope(dispatch_scope)
       if dispatch_scope is not None and normalized_dispatch_scope is None:
         raise ValueError("dispatch_scope must be a redacted portfolio dispatch scope")
@@ -1413,7 +1475,7 @@ class AutonomousRegistryStartMixin:
           )
         if (
           resumed_record.owner_user_id or resumed_record.user_id
-        ) != normalized_owner_user_id:
+        ) != launch_owner_user_id:
           raise PermissionError("resumed autonomous run owner does not match launch owner")
         self._require_released_owner_lease(resumed_record)
         normalized_pack = resumed_record.pack
@@ -1479,7 +1541,7 @@ class AutonomousRegistryStartMixin:
         AutonomousCapabilityBindingRequest(
           task_id=task_id,
           control_run_id=control_run_id,
-          owner_user_id=normalized_owner_user_id,
+          owner_user_id=launch_owner_user_id,
           raw_user_id=raw_user_id,
           user_email=user_email,
           profile=normalized_profile,
@@ -1490,6 +1552,8 @@ class AutonomousRegistryStartMixin:
           run_mode=binding_run_mode,
           required_bind=required_bind,
           parent=parent if resumed_record is None else None,
+          # A frozen resume bind never reselects (design §6.4).
+          model_preset=model_preset if required_bind is None else None,
           task=(
             context.strip()
             if normalized_mode == "skill" and isinstance(context, str) and context.strip()
@@ -1500,8 +1564,14 @@ class AutonomousRegistryStartMixin:
           env_names=frozenset(filter_child_environment(
             os_module.environ, purpose=AUTONOMOUS_CHILD_ENVIRONMENT,
           )),
+          role=role,
+          user_slug=launch_identity["user_slug"],
+          risk_user_id=int(launch_identity["risk_user_id"]),
+          user_aliases=tuple(launch_identity["user_aliases"]),
+          identity_status=str(launch_identity["identity_status"]),
         ),
       )
+      child_identity = None
       if resumed_record is not None:
         admitted_context = resumed_record.admitted_context
         tool_authority = resumed_record.tool_authority
@@ -1509,6 +1579,27 @@ class AutonomousRegistryStartMixin:
         admitted = capability_binding.admitted
         admitted_context = admitted.wire if admitted is not None else None
         tool_authority = admitted.tool_authority if admitted is not None else None
+        child_identity = admitted.identity if admitted is not None else None
+      if child_identity is not None:
+        # ``admit`` bound the child's identity to its tenant; the record and the
+        # session authority it seals carry that identity.
+        normalized_role = child_identity.role
+        normalized_owner_user_id = child_identity.user_id
+        normalized_raw_user_id = child_identity.raw_user_id
+        normalized_user_email = child_identity.user_email
+        normalized_user_slug = child_identity.user_slug
+        normalized_risk_user_id = child_identity.risk_user_id
+        normalized_identity_status = child_identity.identity_status
+        aliases = list(child_identity.user_aliases)
+      else:
+        normalized_role = require_exact_role(role)
+        normalized_owner_user_id = launch_owner_user_id
+        normalized_raw_user_id = raw_user_id
+        normalized_user_email = user_email
+        normalized_user_slug = launch_identity["user_slug"]
+        normalized_risk_user_id = int(launch_identity["risk_user_id"])
+        normalized_identity_status = str(launch_identity["identity_status"])
+        aliases = list(launch_identity["user_aliases"])
       self._log_dir.mkdir(parents=True, exist_ok=True)
       canonical_log_dir = self._log_dir.resolve()
       log_path = canonical_log_dir / f"{task_id}.log"
@@ -1533,15 +1624,6 @@ class AutonomousRegistryStartMixin:
         operator_stat.st_ino,
       ))
       os_module.close(operator_fd)
-
-      events_fd, events_stat = secure_create_owned_file(events_path)
-      created_run_files.append((
-        events_path,
-        events_stat.st_dev,
-        events_stat.st_ino,
-      ))
-      os_module.close(events_fd)
-      fsync_owned_file_directory(events_path)
 
       owner_lease_fd, owner_lease_stat = secure_create_owned_file(
         owner_lease_path
@@ -1584,13 +1666,17 @@ class AutonomousRegistryStartMixin:
       ) = _create_owner_lifeline()
       time_module = _runtime_attr("time", time)
       tool_result_spill_dir = self._expected_tool_result_spill_dir(task_id)
+      owner_run_limit_at_start = self._owner_run_limit_resolver(
+        normalized_owner_user_id,
+        self.live_process_count_for_owner(normalized_owner_user_id),
+      )
       record = AutonomousTask(
         task_id=task_id,
         control_run_id=control_run_id,
         session_id=task_id,
         channel_id=event_channel_parent.channel_id,
         user_id=normalized_owner_user_id,
-        user_email=user_email,
+        user_email=normalized_user_email,
         role=normalized_role,
         profile=normalized_profile,
         mode=normalized_mode,
@@ -1606,13 +1692,12 @@ class AutonomousRegistryStartMixin:
         cmd=cmd,
         log_path=log_path,
         events_path=events_path,
-        events_device=events_stat.st_dev,
-        events_inode=events_stat.st_ino,
         events_evidence_status="complete",
         operator_inbox_path=operator_inbox_path,
         approval_decisions_path=approval_decisions_path,
         control_authority=control_authority,
         owner_lease_path=owner_lease_path,
+        owner_run_limit=owner_run_limit_at_start,
         owner_lease_device=owner_lease_stat.st_dev,
         owner_lease_inode=owner_lease_stat.st_ino,
         started_at=time_module.time(),
@@ -1627,7 +1712,7 @@ class AutonomousRegistryStartMixin:
         event_channel=event_channel_parent,
         owner_lifeline_fd=owner_lifeline_write_fd,
         owner_user_id=normalized_owner_user_id,
-        raw_user_id=raw_user_id,
+        raw_user_id=normalized_raw_user_id,
         user_slug=normalized_user_slug,
         risk_user_id=normalized_risk_user_id,
         user_aliases=aliases,
@@ -1648,6 +1733,20 @@ class AutonomousRegistryStartMixin:
       if not self._write_task_manifest(record, checked=True):
         record.tool_result_spill_dir = None
         raise RuntimeError("failed to persist starting autonomous task manifest")
+      # The events file is created only after the starting manifest is durable:
+      # no live run may ever leave an events file with no sibling manifest.
+      events_fd, events_stat = secure_create_owned_file(events_path)
+      created_run_files.append((
+        events_path,
+        events_stat.st_dev,
+        events_stat.st_ino,
+      ))
+      os_module.close(events_fd)
+      fsync_owned_file_directory(events_path)
+      record.events_device = events_stat.st_dev
+      record.events_inode = events_stat.st_ino
+      if not self._write_task_manifest(record, checked=True):
+        raise RuntimeError("failed to persist autonomous events identity in manifest")
       try:
         tool_result_spill_dir.mkdir(mode=0o700)
       except Exception as exc:

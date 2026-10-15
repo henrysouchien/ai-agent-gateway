@@ -9,6 +9,7 @@ from .runner_budget import (
   budget_cost_progress as budget_cost_progress,
 )
 from model_authority.thinking import parse_effort
+from .tool_dispatcher_approval_lifecycle import ApprovalPark
 
 
 def normalized_run_config(
@@ -307,6 +308,7 @@ class RunAgentBatchResult:
   tool_results_content: List[Dict[str, Any]]
   deferred_extras: List[Dict[str, Any]]
   tools_used: List[str]
+  approval_park: ApprovalPark | None = None
 
 
 @dataclass(frozen=True)
@@ -326,6 +328,7 @@ class SingleToolCallStepResult:
 class ToolUseLoopResult:
   tool_results_content: List[Dict[str, Any]]
   tools_used: List[str]
+  approval_park: ApprovalPark | None = None
 
 
 def append_tool_execution_result(
@@ -441,9 +444,13 @@ def process_run_agent_batch_results(
   tool_results_content: List[Dict[str, Any]] = []
   deferred_extras: List[Dict[str, Any]] = []
   tools_used: List[str] = []
+  approval_park: ApprovalPark | None = None
   for j, result_or_exc in enumerate(results):
     _, batch_tool_id, batch_tool_name, _ = batch[j]
-    if isinstance(result_or_exc, BaseException):
+    if isinstance(result_or_exc, ApprovalPark):
+      if approval_park is None:
+        approval_park = result_or_exc
+    elif isinstance(result_or_exc, BaseException):
       error = batch_error(result_or_exc)
       on_exception(result_or_exc)
       tool_results_content.append(
@@ -459,6 +466,7 @@ def process_run_agent_batch_results(
     tool_results_content=tool_results_content,
     deferred_extras=deferred_extras,
     tools_used=tools_used,
+    approval_park=approval_park,
   )
 
 
@@ -485,12 +493,20 @@ async def execute_single_tool_call(
   execute_single_tool: Callable[..., Awaitable[Any]],
   model_visible_extra_blocks: Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]],
 ) -> RunAgentBatchResult:
-  result_entry, used_name, extra_blocks = await execute_single_tool(
-    tool_call_id,
-    tool_call_name,
-    tool_call_input,
-    base_kwargs,
-  )
+  try:
+    result_entry, used_name, extra_blocks = await execute_single_tool(
+      tool_call_id,
+      tool_call_name,
+      tool_call_input,
+      base_kwargs,
+    )
+  except ApprovalPark as approval_park:
+    return RunAgentBatchResult(
+      tool_results_content=[],
+      deferred_extras=[],
+      tools_used=[],
+      approval_park=approval_park,
+    )
   return process_single_tool_result(
     result_entry,
     used_name,
@@ -610,6 +626,7 @@ async def execute_tool_use_loop(
   tool_results_content: List[Dict[str, Any]] = []
   deferred_extras: List[Dict[str, Any]] = []
   tools_used: List[str] = []
+  approval_park: ApprovalPark | None = None
   i = 0
   run_agent_seq = 0
   while i < len(ordered_tool_uses):
@@ -644,6 +661,7 @@ async def execute_tool_use_loop(
         tools_used,
         batch_call.batch_result,
       )
+      approval_park = batch_call.batch_result.approval_park
     else:
       single_call = await execute_single_tool_call_step(
         tool_id,
@@ -661,6 +679,9 @@ async def execute_tool_use_loop(
         single_call.tool_result,
       )
       i = single_call.next_index
+      approval_park = single_call.tool_result.approval_park
+    if approval_park is not None:
+      break
     if should_stop_after_tool_result():
       for skipped_tool_id, skipped_tool_name, _ in ordered_tool_uses[i:]:
         tool_results_content.append(
@@ -679,6 +700,7 @@ async def execute_tool_use_loop(
   return ToolUseLoopResult(
     tool_results_content=tool_results_content,
     tools_used=tools_used,
+    approval_park=approval_park,
   )
 
 

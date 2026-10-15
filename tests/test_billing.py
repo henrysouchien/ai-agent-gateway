@@ -19,6 +19,7 @@ from agent_gateway.multi_user.billing import (  # noqa: E402
   SqliteUsageLedger,
   UsageEvent,
   _UsageAggregator,
+  default_usage_dlq_path,
   normalize_identity,
   replay_dlq,
   write_dlq,
@@ -264,8 +265,80 @@ def test_dlq_write_and_replay_round_trip(tmp_path: Path) -> None:
   assert not spool_path.exists()
   total = _run(ledger.get_total("alice"))
   assert total.event_count == 1
+def test_dlq_event_for_owner_a_replays_only_onto_a_ledger(tmp_path: Path) -> None:
+  """Invariant: A usage event that fails to post is drained to the owning user's ledger.
+  One user's spool is not replayed into another user's totals.
+  """
+  spool_path = tmp_path / "shared_spool.jsonl"
+  event_alice = _event(user_id="alice", request_id="req-alice")
+  event_bob = _event(user_id="bob", request_id="req-bob")
+
+  write_dlq(event_alice, spool_path)
+  write_dlq(event_bob, spool_path)
+  assert spool_path.exists()
+  assert spool_path.read_text(encoding="utf-8").count("\n") == 2
+
+  ledger_alice = SqliteUsageLedger(tmp_path / "alice.db", dlq_path=spool_path)
+  ledger_bob = SqliteUsageLedger(tmp_path / "bob.db", dlq_path=spool_path)
+
+  # 1. Querying alice's total triggers the production drain call site in get_total -> drain_dlq
+  total_alice = _run(ledger_alice.get_total("alice"))
+  assert total_alice.event_count == 1
+  assert total_alice.input_tokens == 100
+  assert total_alice.cost_usd == pytest.approx(0.125)
+
+  # Bob's events were not replayed into alice's ledger
+  assert _run(ledger_alice.get_total("bob", drain_dlq=False)).event_count == 0
+
+  # Bob's event is still preserved in the spool
+  assert spool_path.exists()
+  spool_content = spool_path.read_text(encoding="utf-8")
+  assert '"user_id": "bob"' in spool_content
+  assert '"user_id": "alice"' not in spool_content
+
+  # 2. Querying bob's total triggers the drain for bob
+  total_bob = _run(ledger_bob.get_total("bob"))
+  assert total_bob.event_count == 1
+  assert total_bob.input_tokens == 100
+  assert total_bob.cost_usd == pytest.approx(0.125)
+
+  # Alice's events were not replayed into bob's ledger
+  assert _run(ledger_bob.get_total("alice", drain_dlq=False)).event_count == 0
+
+  # Spool is now completely drained and unlinked
+  assert not spool_path.exists()
 
 
+def test_default_usage_dlq_path_partitions_by_user_id(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+  data_dir = tmp_path / "user_data"
+  monkeypatch.setenv("USER_DATA_DIR", str(data_dir))
+
+  path_alice = default_usage_dlq_path("alice")
+  path_bob = default_usage_dlq_path("bob")
+
+  assert path_alice != path_bob
+  assert path_alice == data_dir / "users" / "alice" / "usage_dlq.jsonl"
+  assert path_bob == data_dir / "users" / "bob" / "usage_dlq.jsonl"
+
+  event_alice = _event(user_id="alice", request_id="req-alice-def")
+  event_bob = _event(user_id="bob", request_id="req-bob-def")
+
+  # write_dlq without explicit spool partitions by default
+  written_alice = write_dlq(event_alice)
+  written_bob = write_dlq(event_bob)
+
+  assert written_alice == path_alice
+  assert written_bob == path_bob
+  assert path_alice.exists()
+  assert path_bob.exists()
+
+  ledger = SqliteUsageLedger(tmp_path / "central.db")
+  # get_total("alice") drains alice's default spool
+  tot_alice = _run(ledger.get_total("alice"))
+  assert tot_alice.event_count == 1
+  assert not path_alice.exists()
+  # bob's default spool is untouched
+  assert path_bob.exists()
 def test_dlq_spool_survives_as_file_on_disk(tmp_path: Path) -> None:
   spool_path = tmp_path / "nested" / "usage_dlq.jsonl"
 
@@ -440,6 +513,88 @@ def test_usage_aggregator_compaction_count_is_exact_and_closed_fail_closed() -> 
 
     summary = await aggregator.snapshot()
     assert summary.compaction_count == 2
+
+  _run(case())
+
+
+def test_usage_aggregator_snapshot_carries_declared_unit() -> None:
+  async def case() -> None:
+    aggregator = _UsageAggregator(user_id="alice", session_id="sess", request_id="req", channel="web")
+
+    undeclared = await aggregator.snapshot()
+    assert (undeclared.unit_kind, undeclared.unit_id) == ("none", "req")
+
+    await aggregator.declare_unit("A5")
+    declared = await aggregator.snapshot()
+    assert (declared.unit_kind, declared.unit_id) == ("A5", "req")
+
+    await aggregator.declare_unit("A1", "unit-7")
+    redeclared = await aggregator.snapshot()
+    assert (redeclared.unit_kind, redeclared.unit_id) == ("A1", "unit-7")
+
+  _run(case())
+
+
+def test_child_aggregator_keeps_its_own_usage_and_shares_the_roots_unit() -> None:
+  async def case() -> None:
+    root = _UsageAggregator(user_id="alice", session_id="sess", request_id="req", channel="web", started_at=1.0)
+    child = _UsageAggregator(
+      user_id="alice", session_id="sub0:sess", request_id="req", channel="web",
+      started_at=2.0, parent=root,
+    )
+    grandchild = _UsageAggregator(
+      user_id="alice", session_id="sub0:sub0:sess", request_id="req", channel="web",
+      parent=child,
+    )
+    await root.record(_event(request_id="req"))
+    await child.record(_event(request_id="req", model="gpt-5.5", provider="codex"))
+    await grandchild.record(_event(request_id="req", model="gpt-5.5", provider="codex"))
+
+    # A declaration made anywhere in the tree is the root's, and every row reads it.
+    assert await grandchild.declare_unit("A5") == ("A5", "req")
+    for aggregator in (root, child, grandchild):
+      summary = await aggregator.snapshot()
+      assert (summary.unit_kind, summary.unit_id) == ("A5", "req")
+
+    root_row = await root.snapshot()
+    child_row = await child.snapshot()
+    assert root_row.session_id == "sess"
+    assert (root_row.input_tokens, root_row.turns, root_row.model) == (100, 1, "claude-sonnet-4-6")
+    assert child_row.session_id == "sub0:sess"
+    assert child_row.started_at == 2.0
+    assert (child_row.input_tokens, child_row.turns, child_row.model) == (100, 1, "gpt-5.5")
+    assert child_row.provider == "codex"
+
+  _run(case())
+
+
+def test_fleet_snapshot_sums_the_dispatch_tree_under_the_roots_identity() -> None:
+  async def case() -> None:
+    root = _UsageAggregator(user_id="alice", session_id="sess", request_id="req", channel="web")
+    child = _UsageAggregator(
+      user_id="alice", session_id="sub0:sess", request_id="req", channel="web", parent=root,
+    )
+    solo = _UsageAggregator(user_id="alice", session_id="solo", request_id="req", channel="web")
+    root_event = _event(request_id="req")
+    child_event = _event(request_id="req", model="gpt-5.5", provider="codex")
+    await root.record(root_event)
+    await child.record(child_event)
+    root.record_compaction_nowait()
+    child.record_compaction_nowait()
+    await solo.record(_event(request_id="req"))
+
+    fleet = await root.fleet_snapshot()
+    assert fleet.session_id == "sess"
+    assert (fleet.input_tokens, fleet.output_tokens, fleet.turns) == (200, 100, 2)
+    assert fleet.cost == pytest.approx(0.25)
+    assert fleet.compaction_count == 2
+    assert fleet.usage_event_count == 2
+    assert fleet.usage_event_ids == (root_event.event_id, child_event.event_id)
+    assert (await root.snapshot()).input_tokens == 100
+
+    # A run with no delegated child reports its own usage unchanged.
+    solo_fleet = await solo.fleet_snapshot()
+    assert (solo_fleet.session_id, solo_fleet.input_tokens, solo_fleet.turns) == ("solo", 100, 1)
 
   _run(case())
 

@@ -6,7 +6,7 @@ import stat
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -2186,12 +2186,66 @@ def test_repeated_cancellation_during_plan_drain_commits_once(
   _run(_case())
 
 
+class _RequestParamsFailingProvider(_ScriptedProvider):
+  def __init__(self, failure: Exception) -> None:
+    super().__init__([])
+    self.failure = failure
+
+  def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
+    _ = kwargs
+    raise self.failure
+
+
+@pytest.mark.parametrize(
+  ("failure", "expected_error"),
+  [
+    (
+      ValueError("bad request params"),
+      "ValueError: ValueError('bad request params')",
+    ),
+    (TimeoutError(), "TimeoutError: TimeoutError()"),
+  ],
+  ids=["value_error", "timeout_error"],
+)
+def test_escaping_exception_closes_named_skill_with_its_type_and_text(
+  tmp_path: Path,
+  failure: Exception,
+  expected_error: str,
+) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "escaping.jsonl")
+  event_log = EventLog()
+  runner = _runner(
+    log=log,
+    provider=_RequestParamsFailingProvider(failure),
+    event_log=event_log,
+  )
+
+  with pytest.raises(type(failure)):
+    _run(runner.run(messages=[{"role": "user", "content": "Run the skill"}]))
+
+  entries, _ = _run(log.query(order="asc"))
+  durable_events = [entry.event for entry in entries]
+  live_events = [entry.event for entry in event_log.entries]
+  for events in (durable_events, live_events):
+    terminals = [event for event in events if event["type"] == "error"]
+    results = [
+      event for event in events if event["type"] == "skill_result_captured"
+    ]
+    assert len(terminals) == 1 and len(results) == 1
+    assert terminals[0]["error"] == expected_error
+    assert terminals[0]["error_type"] == type(failure).__name__
+    assert expected_error in results[0]["error"]
+
+
+
 @pytest.mark.parametrize(
   ("field_name", "invalid_value", "message"),
   [
     ("exit_code", True, "non-negative integer"),
     ("exit_code", -1, "non-negative integer"),
     ("gate_code", 1, "must be a string"),
+    ("gate_code", "SCENARIOS_BUILT", "must be one of"),
+    ("gate_code", "proceed", "must be one of"),
     ("artifact_refs", "not-a-list", "must be a list"),
     ("artifact_refs", [1], "must be a string"),
     ("fms_results", ["not-a-mapping"], "must be a mapping"),
@@ -2271,6 +2325,53 @@ def test_result_policy_rejects_unexpected_fields() -> None:
 
   with pytest.raises(RuntimeError, match="unexpected fields"):
     lifecycle.normalize_result_event(event)
+
+
+def test_resume_preflight_accepts_assistant_transcript_tail(tmp_path: Path) -> None:
+  """A parked stage's transcript can end on an assistant turn; the
+  continuation resumes it without a fresh user message."""
+
+  class _ResultPolicy:
+    def prepare(self, proposed: Any) -> Any:
+      return proposed
+
+    async def prepare_system_prompt(self, proposed: Any) -> Any:
+      return proposed
+
+  lifecycle = _metadata()
+  runner = object.__new__(AgentRunner)
+  runner._top_level_skill_lifecycle = lifecycle
+  runner._agent_session_log = AgentSessionLog(tmp_path / "session.jsonl")
+  runner._role = "writer"
+  runner._top_level_skill_result_policy = cast(
+    Any, _ResultPolicy()
+  )
+  runner._skill_run_id = lifecycle.skill_run_id
+
+  assistant_tail = {"role": "assistant", "content": [{"type": "text", "text": "partial"}]}
+  resumed = runner._preflight_top_level_skill_run(
+    [assistant_tail],
+    [{"role": "user", "content": "start"}, assistant_tail],
+  )
+  assert resumed == assistant_tail
+
+  user_tail = {"role": "user", "content": "continue"}
+  resumed_user = runner._preflight_top_level_skill_run(
+    [user_tail],
+    [{"role": "user", "content": "start"}, user_tail],
+  )
+  assert resumed_user == user_tail
+
+  with pytest.raises(RuntimeError, match="exactly one fresh incoming user message"):
+    runner._preflight_top_level_skill_run(
+      [assistant_tail],
+      None,
+    )
+  with pytest.raises(RuntimeError, match="exactly one fresh incoming user message"):
+    runner._preflight_top_level_skill_run(
+      [{"role": "system", "content": "not a turn"}],
+      [{"role": "user", "content": "start"}, {"role": "system", "content": "not a turn"}],
+    )
 
 
 def test_projection_flag_changes_only_after_successful_append() -> None:
@@ -2675,3 +2776,567 @@ def test_completion_effect_rejects_cas_conflict_without_overwrite(
 
 
 
+
+@pytest.mark.parametrize("closure_fault", [None, "persistence", "cancellation"])
+def test_recovery_preserves_awaiting_approval_skill_without_final_settlement(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  closure_fault: str | None,
+) -> None:
+  from agent_gateway.tool_dispatcher_approval_lifecycle import ApprovalPark
+  from agent_gateway.tool_policy_registry import PreparedToolCall
+
+  async def case() -> None:
+    path = tmp_path / "sessions" / "parked-skill.jsonl"
+    log = AgentSessionLog(path)
+    lifecycle = _metadata()
+    event_log = EventLog()
+    prepared_terminals: list[dict[str, Any]] = []
+    state_path = tmp_path / "skill-state.json"
+    state_path.write_text('{"status":"open"}\n', encoding="utf-8")
+
+    def prepare_completion(
+      _event_log: EventLog, terminal: dict[str, Any],
+    ) -> TopLevelSkillCompletionPlan:
+      prepared_terminals.append(dict(terminal))
+      result = _result_event(lifecycle, terminal)
+      return _completion_plan(
+        result,
+        terminal,
+        effect=TopLevelSkillCompletionEffectPlan.canonical_json_update(
+          workspace_path=tmp_path,
+          target_path=state_path,
+          update=lambda _exists, _before: {"status": result["outcome"]},
+        ),
+      )
+
+    park = ApprovalPark(
+      job_id="retained-root-job",
+      original_tool_call_id="retained-original-call",
+      approval_id="retained-approval",
+      nonce="private-park-nonce",
+      root_turn_id="turn:retained-root",
+    )
+
+    async def unexecuted_lookup(
+      _tool_input: dict[str, Any], **_kwargs: Any,
+    ) -> Any:
+      raise AssertionError("the parked original call executed")
+
+    dispatcher = _make_dispatcher(
+      event_log=event_log,
+      local_tool_handlers={"lookup": unexecuted_lookup},
+    )
+
+    async def parked_dispatch(
+      tool_call_id: str,
+      tool_name: str,
+      prepared_call: PreparedToolCall,
+      **_kwargs: Any,
+    ) -> Any:
+      assert tool_call_id == park.original_tool_call_id
+      assert tool_name == "lookup"
+      assert type(prepared_call) is PreparedToolCall
+      assert prepared_call.materialize_input() == {"query": "AAPL"}
+      raise park
+
+    # The producer's control is the input to this consumer test; the actual
+    # runner, journal settlement, named-skill policy and recovery remain live.
+    monkeypatch.setattr(dispatcher, "dispatch_prepared", parked_dispatch)
+    runner = _runner(
+      log=log,
+      provider=_ScriptedProvider([
+        _tool_turn(tool_id=park.original_tool_call_id),
+      ]),
+      event_log=event_log,
+      dispatcher=dispatcher,
+      lifecycle=lifecycle,
+      policy=TopLevelSkillResultPolicy(
+        prepare_provider=lambda proposed: proposed,
+        prepare_completion=prepare_completion,
+      ),
+      workspace_dir=tmp_path,
+    )
+    persistence_failure = OSError("actual park recap/detach persistence failed")
+    if closure_fault == "persistence":
+      append_pair = log.append_terminal_pair_sync
+
+      def fail_park_detach(
+        recap: dict[str, Any], detach: dict[str, Any],
+      ) -> Any:
+        if detach.get("reason") == "awaiting_approval":
+          raise persistence_failure
+        return append_pair(recap, detach)
+
+      monkeypatch.setattr(log, "append_terminal_pair_sync", fail_park_detach)
+    elif closure_fault == "cancellation":
+      async def cancel_before_closure(**_kwargs: Any) -> Any:
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        await asyncio.sleep(0)
+        raise AssertionError("owner cancellation was not delivered")
+
+      monkeypatch.setattr(runner._aggregator, "snapshot", cancel_before_closure)
+
+    run_task = asyncio.create_task(runner.run(
+      messages=[{"role": "user", "content": "Run the named skill"}],
+    ))
+    if closure_fault == "cancellation":
+      with pytest.raises(asyncio.CancelledError):
+        await run_task
+    elif closure_fault == "persistence":
+      with pytest.raises(OSError) as failure:
+        await run_task
+      assert failure.value is persistence_failure
+    else:
+      await run_task
+
+    initial_entries, _ = await log.query(order="asc")
+    original_records = [
+      entry.event for entry in initial_entries
+      if entry.event.get("runner_id") == runner._runner_id
+    ]
+    original_start = next(
+      entry for entry in initial_entries
+      if entry.event.get("type") == "skill_run_started"
+    )
+    original_detach = next(
+      entry for entry in initial_entries
+      if entry.event.get("type") == "detach"
+    )
+    if closure_fault is None:
+      assert runner._approval_park is park
+    else:
+      assert runner._approval_park is None
+    if closure_fault == "cancellation":
+      assert len(prepared_terminals) == 1
+      assert json.loads(state_path.read_text(encoding="utf-8")) == {"status": "error"}
+      assert original_detach.event["reason"] == "cancelled"
+    else:
+      assert prepared_terminals == []
+      assert json.loads(state_path.read_text(encoding="utf-8")) == {"status": "open"}
+      assert SkillCompletionWal(path).load() is None
+      awaiting = next(
+        entry for entry in initial_entries
+        if entry.event.get("terminal_disposition") == "awaiting_approval"
+      )
+      assert original_start.seq < awaiting.seq < original_detach.seq
+      assert awaiting.event["usage"]["input_tokens"] == 10
+      assert awaiting.event["usage"]["output_tokens"] == 3
+      assert awaiting.event["job_id"] == park.job_id
+      assert awaiting.event["root_turn_id"] == park.root_turn_id
+      assert "skill_run_id" not in awaiting.event
+      assert "nonce" not in awaiting.event
+      if closure_fault == "persistence":
+        assert original_detach.event["reason"] == "error"
+        assert any(
+          entry.event.get("type") == "error"
+          and "actual park recap/detach persistence failed" in entry.event.get("error", "")
+          and awaiting.seq < entry.seq < original_detach.seq
+          for entry in initial_entries
+        )
+      else:
+        assert original_detach.event["reason"] == "awaiting_approval"
+        assert not any(
+          event["type"] in {
+            "skill_result_captured", "error", "interrupted", "tool_call_interrupted",
+          }
+          for event in original_records
+        )
+
+    # A supported unrelated turn uses a fresh runner and a cold journal handle,
+    # completing its own real named result while the old approval remains open.
+    fresh_lifecycle = TopLevelSkillLifecycleMetadata(
+      skill_run_id="unrelated-fresh-skill",
+      skill=lifecycle.skill,
+      scope=lifecycle.scope,
+      ticker=lifecycle.ticker,
+    )
+    fresh_events = EventLog()
+    fresh = _runner(
+      log=AgentSessionLog(path),
+      provider=_ScriptedProvider([_text_turn("Unrelated skill finished")]),
+      event_log=fresh_events,
+      lifecycle=fresh_lifecycle,
+      policy=_policy(fresh_lifecycle),
+      workspace_dir=tmp_path,
+    )
+    await fresh.run(messages=[{"role": "user", "content": "Run unrelated work"}])
+    assert fresh._runner_id != runner._runner_id
+    fresh_result = fresh.committed_top_level_skill_result_event
+    assert fresh_result is not None
+    assert fresh_result["outcome"] == "success"
+    fresh_terminal = next(
+      entry.event for entry in fresh_events.entries
+      if entry.event.get("type") == "stream_complete"
+    )
+    assert fresh_terminal["usage"]["input_tokens"] == 12
+    assert fresh_terminal["usage"]["output_tokens"] == 5
+    after_entries, _ = await AgentSessionLog(path).query(order="asc")
+    after_original = [
+      entry.event for entry in after_entries
+      if entry.event.get("runner_id") == runner._runner_id
+    ]
+    if closure_fault is None:
+      assert after_original == original_records
+      assert json.loads(state_path.read_text(encoding="utf-8")) == {"status": "open"}
+    else:
+      final_results = [
+        entry.event for entry in after_entries
+        if entry.event.get("type") == "skill_result_captured"
+        and entry.event.get("skill_run_id") == lifecycle.skill_run_id
+      ]
+      assert len(final_results) == 1
+      assert final_results[0]["outcome"] == "error"
+      assert final_results[0]["exit_code"] == 1
+    wal_before = SkillCompletionWal(path).load()
+    assert wal_before is not None
+    assert wal_before["record_type"] == "settled"
+    assert wal_before["skill_run_id"] == fresh_lifecycle.skill_run_id
+    journal_before = path.read_bytes()
+    state_before = state_path.read_bytes()
+    for index in range(2):
+      cold_lifecycle = TopLevelSkillLifecycleMetadata(
+        skill_run_id=f"cold-reader-{index}",
+        skill=lifecycle.skill,
+        scope=lifecycle.scope,
+        ticker=lifecycle.ticker,
+      )
+      cold = _runner(
+        log=AgentSessionLog(path),
+        provider=_ScriptedProvider([]),
+        lifecycle=cold_lifecycle,
+        policy=_policy(cold_lifecycle),
+        workspace_dir=tmp_path,
+      )
+      try:
+        await cold._acquire_writer_lease_and_recover()
+      finally:
+        cold._release_write_lease()
+      assert path.read_bytes() == journal_before
+      assert state_path.read_bytes() == state_before
+      assert SkillCompletionWal(path).load() == wal_before
+    assert len(prepared_terminals) == (1 if closure_fault == "cancellation" else 0)
+
+  _run(case())
+
+
+@pytest.mark.parametrize("failure_stage", [None, "append", "readback", "recap_detach"])
+def test_named_approval_park_completes_physical_settlement_handshake(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  failure_stage: str | None,
+) -> None:
+  from agent_gateway.autonomous import run_session
+  from agent_gateway.tool_dispatcher_approval_lifecycle import ApprovalPark
+  from agent_gateway.tool_policy_registry import PreparedToolCall
+
+  async def case() -> None:
+    log = AgentSessionLog(tmp_path / "sessions" / "park-handshake.jsonl")
+    event_log = EventLog()
+    lifecycle = _metadata()
+    park = ApprovalPark(
+      job_id="admitted-handshake-job",
+      original_tool_call_id="original-handshake-call",
+      approval_id="public-handshake-approval",
+      nonce="private-handshake-nonce",
+      root_turn_id="turn:admitted-handshake",
+    )
+    preparation_calls: list[dict[str, Any]] = []
+    state_path = tmp_path / "named-skill-state.json"
+    state_path.write_text('{"state":"open"}\n', encoding="utf-8")
+
+    def prepare_completion(
+      _event_log: EventLog, terminal: dict[str, Any],
+    ) -> TopLevelSkillCompletionPlan:
+      preparation_calls.append(dict(terminal))
+      return _completion_plan(
+        _result_event(lifecycle, terminal),
+        terminal,
+        effect=TopLevelSkillCompletionEffectPlan.canonical_json_update(
+          workspace_path=tmp_path,
+          target_path=state_path,
+          update=lambda _exists, _before: {"state": "final"},
+        ),
+      )
+
+    async def unexecuted_lookup(
+      _tool_input: dict[str, Any], **_kwargs: Any,
+    ) -> Any:
+      raise AssertionError("the original parked call executed")
+
+    dispatcher = _make_dispatcher(
+      event_log=event_log,
+      local_tool_handlers={"lookup": unexecuted_lookup},
+    )
+
+    async def parked_dispatch(
+      tool_call_id: str,
+      tool_name: str,
+      prepared_call: PreparedToolCall,
+      **_kwargs: Any,
+    ) -> Any:
+      assert tool_call_id == park.original_tool_call_id
+      assert tool_name == "lookup"
+      assert type(prepared_call) is PreparedToolCall
+      assert prepared_call.materialize_input() == {"query": "AAPL"}
+      raise park
+
+    monkeypatch.setattr(dispatcher, "dispatch_prepared", parked_dispatch)
+    runner = _runner(
+      log=log,
+      provider=_ScriptedProvider([
+        _tool_turn(tool_id=park.original_tool_call_id),
+      ]),
+      event_log=event_log,
+      dispatcher=dispatcher,
+      lifecycle=lifecycle,
+      policy=TopLevelSkillResultPolicy(
+        prepare_provider=lambda proposed: proposed,
+        prepare_completion=prepare_completion,
+      ),
+      workspace_dir=tmp_path,
+    )
+    append_sync = log.append_sync
+    query_sync = log.query_sync
+    append_pair = log.append_terminal_pair_sync
+    persistence_failure = OSError(
+      "actual handshake terminal append failed"
+      if failure_stage == "append"
+      else "actual handshake recap/detach append failed"
+    )
+
+    def append_with_fault(event: dict[str, Any]) -> Any:
+      if failure_stage == "append" and (
+        event.get("terminal_disposition") == "awaiting_approval"
+      ):
+        raise persistence_failure
+      return append_sync(event)
+
+    def readback_with_fault(**kwargs: Any) -> Any:
+      entries, cursor = query_sync(**kwargs)
+      if failure_stage == "readback" and (
+        kwargs.get("after_seq") is not None
+        and kwargs.get("after_seq") == kwargs.get("before_seq")
+        and entries
+        and entries[0].event.get("terminal_disposition") == "awaiting_approval"
+      ):
+        return [], cursor
+      return entries, cursor
+
+    def pair_with_fault(
+      recap: dict[str, Any], detach: dict[str, Any],
+    ) -> Any:
+      if failure_stage == "recap_detach" and (
+        detach.get("reason") == "awaiting_approval"
+      ):
+        raise persistence_failure
+      return append_pair(recap, detach)
+
+    monkeypatch.setattr(log, "append_sync", append_with_fault)
+    monkeypatch.setattr(log, "query_sync", readback_with_fault)
+    monkeypatch.setattr(log, "append_terminal_pair_sync", pair_with_fault)
+    assert runner.top_level_skill_enrolled
+    session_task = asyncio.create_task(run_session(
+      runner,
+      event_log,
+      initial_message="Run a named skill until its human door",
+      system_prompt=None,
+    ))
+    if failure_stage is None:
+      output = await asyncio.wait_for(session_task, timeout=10)
+      assert output.error is None
+      assert output.usage["input_tokens"] == 10
+      assert output.usage["output_tokens"] == 3
+      assert await runner.wait_for_top_level_skill_settlement()
+      assert runner._approval_park is park
+    else:
+      expected_type = RuntimeError if failure_stage == "readback" else OSError
+      with pytest.raises(expected_type) as failure:
+        await asyncio.wait_for(session_task, timeout=10)
+      if failure_stage == "readback":
+        assert str(failure.value) == "Durable approval park terminal readback is missing"
+      else:
+        assert failure.value is persistence_failure
+      assert failure.value is runner._top_level_skill_settlement_error
+      with pytest.raises(expected_type) as published:
+        await runner.wait_for_top_level_skill_settlement()
+      assert published.value is failure.value
+      assert runner._approval_park is None
+    assert session_task.done() and not session_task.cancelled()
+    assert runner._top_level_skill_settlement_complete.is_set()
+    assert runner._write_lease_file is None
+    assert runner._top_level_skill_detach_committed
+    assert runner.committed_top_level_skill_result_event is None
+    assert runner._top_level_skill_result_event is None
+    assert runner._top_level_skill_completion_effect_plan is None
+    assert not runner._top_level_skill_result_committed
+    assert preparation_calls == []
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {"state": "open"}
+    assert SkillCompletionWal(log.path).load() is None
+
+    # Reacquire the real writer lock only after the enrolled journey's existing
+    # physical handshake, rather than substituting a lease-status fixture.
+    admission = TopLevelSkillAdmission.acquire(log.path)
+    assert admission.release()
+    entries, _ = query_sync(order="asc")
+    events = [entry.event for entry in entries]
+    assert not any(event["type"] == "skill_result_captured" for event in events)
+    assert events[-2]["type"] == "session_recap"
+    assert events[-1]["type"] == "detach"
+    terminal = runner._terminal_closure_event
+    assert terminal is not None
+    if failure_stage is None:
+      assert terminal["terminal_disposition"] == "awaiting_approval"
+      assert terminal["job_id"] == park.job_id
+      assert terminal["root_turn_id"] == park.root_turn_id
+      assert "nonce" not in terminal
+      assert events[-1]["reason"] == "awaiting_approval"
+      assert not any(
+        event["type"] in {"error", "interrupted", "tool_call_interrupted"}
+        for event in events
+      )
+    else:
+      assert terminal["type"] == "error"
+      assert terminal["reason"] == "persistence"
+      assert events[-1]["reason"] == "error"
+
+  _run(case())
+
+
+def test_recovery_reconciles_awaiting_terminal_without_recap_detach(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  from agent_gateway.tool_dispatcher_approval_lifecycle import ApprovalPark
+  from agent_gateway.tool_policy_registry import PreparedToolCall
+  import uuid
+
+  async def case() -> None:
+    producer_log = AgentSessionLog(tmp_path / "producer" / "session.jsonl")
+    lifecycle = _metadata()
+    events = EventLog()
+    park = ApprovalPark(
+      job_id="incomplete-park-job",
+      original_tool_call_id="incomplete-park-call",
+      approval_id="incomplete-park-approval",
+      nonce="private-incomplete-park-nonce",
+      root_turn_id="turn:incomplete-park",
+    )
+    async def unexecuted_lookup(
+      _tool_input: dict[str, Any], **_kwargs: Any,
+    ) -> Any:
+      raise AssertionError("the original parked call executed")
+
+    dispatcher = _make_dispatcher(
+      event_log=events,
+      local_tool_handlers={"lookup": unexecuted_lookup},
+    )
+
+    async def parked_dispatch(
+      tool_call_id: str,
+      tool_name: str,
+      prepared_call: PreparedToolCall,
+      **_kwargs: Any,
+    ) -> Any:
+      assert tool_call_id == park.original_tool_call_id
+      assert tool_name == "lookup"
+      assert type(prepared_call) is PreparedToolCall
+      assert prepared_call.materialize_input() == {"query": "AAPL"}
+      raise park
+
+    monkeypatch.setattr(dispatcher, "dispatch_prepared", parked_dispatch)
+    producer = _runner(
+      log=producer_log,
+      provider=_ScriptedProvider([_tool_turn(tool_id=park.original_tool_call_id)]),
+      event_log=events,
+      dispatcher=dispatcher,
+      lifecycle=lifecycle,
+      policy=_policy(lifecycle),
+      workspace_dir=tmp_path,
+    )
+    await producer.run(messages=[{"role": "user", "content": "Run named work"}])
+    produced, _ = await producer_log.query(order="asc")
+    # Replay the actual durable prefix at the crash boundary into a fresh
+    # journal. No terminal, owner, or lifecycle metadata is fabricated.
+    path = tmp_path / "crashed" / "session.jsonl"
+    crash_log = AgentSessionLog(path)
+    for entry in produced:
+      crash_log.append_sync(entry.event)
+      if entry.event.get("terminal_disposition") == "awaiting_approval":
+        break
+    before, _ = await crash_log.query(order="asc")
+    assert before[-1].event["terminal_disposition"] == "awaiting_approval"
+    assert not any(
+      entry.event["type"] in {"session_recap", "detach", "skill_result_captured"}
+      for entry in before
+    )
+    assert SkillCompletionWal(path).load() is None
+    snapshots: list[tuple[bytes, dict[str, Any], list[dict[str, Any]]]] = []
+    for index in range(2):
+      reader_lifecycle = TopLevelSkillLifecycleMetadata(
+        skill_run_id=f"incomplete-park-reader-{index}",
+        skill=lifecycle.skill,
+        scope=lifecycle.scope,
+        ticker=lifecycle.ticker,
+      )
+      reader = _runner(
+        log=AgentSessionLog(path),
+        provider=_ScriptedProvider([]),
+        lifecycle=reader_lifecycle,
+        policy=_policy(reader_lifecycle),
+        workspace_dir=tmp_path,
+      )
+      try:
+        await reader._prepare_run_durable_context(
+          [],
+          None,
+          resume_initial_messages=[],
+          top_level_user_input=None,
+          selected_content_committed=True,
+          runner_id=f"runner_{uuid.uuid4().hex}",
+        )
+      finally:
+        reader._release_write_lease()
+      recovered, _ = await AgentSessionLog(path).query(order="asc")
+      results = [
+        entry.event for entry in recovered
+        if entry.event["type"] == "skill_result_captured"
+        and entry.event.get("skill_run_id") == lifecycle.skill_run_id
+      ]
+      assert len(results) == 1
+      assert results[0]["outcome"] == "error"
+      assert results[0]["exit_code"] == 1
+      assert len([
+        entry for entry in recovered
+        if entry.event["type"] == "interrupted"
+        and entry.event.get("skill_run_id") == lifecycle.skill_run_id
+        and entry.event.get("recovery_kind") == "top_level_skill_orphan_reconciled"
+      ]) == 1
+      assert len([
+        entry for entry in recovered
+        if entry.event["type"] == "tool_call_interrupted"
+        and entry.event.get("tool_call_id") == park.original_tool_call_id
+      ]) == 1
+      wal = SkillCompletionWal(path).load()
+      assert wal is not None
+      assert wal["record_type"] == "settled"
+      assert wal["skill_run_id"] == lifecycle.skill_run_id
+      original_records = [
+        entry.event for entry in recovered
+        if entry.event.get("runner_id") == producer._runner_id
+        or entry.event.get("skill_run_id") == lifecycle.skill_run_id
+      ]
+      snapshots.append((path.read_bytes(), wal, original_records))
+
+    # Each real begin appends its own attach; the recovered original
+    # closure and its settled WAL must remain immutable.
+    (settled_bytes, settled_wal, settled_records), (later_bytes, later_wal, later_records) = (
+      snapshots
+    )
+    assert later_bytes.startswith(settled_bytes)
+    assert later_records == settled_records
+    assert later_wal == settled_wal
+
+  _run(case())

@@ -86,27 +86,26 @@ if TYPE_CHECKING:
   )
   from .model_preferences import ModelPreferenceStore
   from .code_execution import (
-    BackgroundTask,
     CodeExecutionBundle,
     CodeExecutionConfig,
     DockerBackend,
-    OutputRingBuffer,
     SubprocessBackend,
     build_code_execution,
     cleanup_code_execution,
-    make_code_execute_status_tool_def,
     make_code_execute_tool_def,
     strip_code_execute_base64_hook,
   )
   from .compaction import SummaryFn, generate_and_append_summary
-  from .commercial_work_start import (
+  from hank_contracts.commercial_work import (
     COMMERCIAL_CLAIM_HEADER,
     COMMERCIAL_WORK_AUTHORIZATION_HEADER,
     CommercialWorkStartContext,
-    CommercialWorkStartError,
     CommercialWorkStartFacts,
-    CommercialWorkStartGate,
     PendingCommercialWorkStart,
+  )
+  from .commercial_work_start import (
+    CommercialWorkStartError,
+    CommercialWorkStartGate,
   )
   from .context_builder import Message, SessionContextBuilder
   from .events import (
@@ -170,15 +169,15 @@ if TYPE_CHECKING:
     package_health,
   )
   from .run_identity import (
-    MODEL_RUN_IDENTITY_LOCAL_TOOLS,
-    MODEL_RUN_IDENTITY_MCP_TOOLS,
-    RUN_IDENTITY_MCP_ENV,
     RUN_IDENTITY_MAX_LENGTH,
-    RUN_IDENTITY_MCP_TOOLS_ENV,
     RunIdentityCarrier,
     RunIdentityCarrierError,
-    inject_run_identity_into_mcp_server_configs,
     validate_run_identity,
+  )
+  from .containment_settings import (
+    ContainmentSettingError,
+    ContainmentSettings,
+    resolve_containment_settings,
   )
   from .runner import AgentRunner, SubAgentConfig, ToolResultContext, _derive_sub_agent_id
   from .runner_background_tasks import WorkflowTaskMetadata
@@ -324,15 +323,12 @@ _EXPORTS = {
   "CredentialMaterializer": ("agent_gateway.capability_execution", "CredentialMaterializer"),
   "MaterializedCredential": ("agent_gateway.capability_execution", "MaterializedCredential"),
   "ModelPreferenceStore": ("agent_gateway.model_preferences", "ModelPreferenceStore"),
-  "BackgroundTask": ("agent_gateway.code_execution", "BackgroundTask"),
   "CodeExecutionBundle": ("agent_gateway.code_execution", "CodeExecutionBundle"),
   "CodeExecutionConfig": ("agent_gateway.code_execution", "CodeExecutionConfig"),
   "DockerBackend": ("agent_gateway.code_execution", "DockerBackend"),
-  "OutputRingBuffer": ("agent_gateway.code_execution", "OutputRingBuffer"),
   "SubprocessBackend": ("agent_gateway.code_execution", "SubprocessBackend"),
   "build_code_execution": ("agent_gateway.code_execution", "build_code_execution"),
   "cleanup_code_execution": ("agent_gateway.code_execution", "cleanup_code_execution"),
-  "make_code_execute_status_tool_def": ("agent_gateway.code_execution", "make_code_execute_status_tool_def"),
   "make_code_execute_tool_def": ("agent_gateway.code_execution", "make_code_execute_tool_def"),
   "strip_code_execute_base64_hook": ("agent_gateway.code_execution", "strip_code_execute_base64_hook"),
   "SummaryFn": ("agent_gateway.compaction", "SummaryFn"),
@@ -409,15 +405,16 @@ _EXPORTS = {
   "SOURCE_COMMIT": ("agent_gateway.package_info", "SOURCE_COMMIT"),
   "__version__": ("agent_gateway.package_info", "__version__"),
   "package_health": ("agent_gateway.package_info", "package_health"),
-  "MODEL_RUN_IDENTITY_LOCAL_TOOLS": ("agent_gateway.run_identity", "MODEL_RUN_IDENTITY_LOCAL_TOOLS"),
-  "MODEL_RUN_IDENTITY_MCP_TOOLS": ("agent_gateway.run_identity", "MODEL_RUN_IDENTITY_MCP_TOOLS"),
-  "RUN_IDENTITY_MCP_ENV": ("agent_gateway.run_identity", "RUN_IDENTITY_MCP_ENV"),
   "RUN_IDENTITY_MAX_LENGTH": ("agent_gateway.run_identity", "RUN_IDENTITY_MAX_LENGTH"),
-  "RUN_IDENTITY_MCP_TOOLS_ENV": ("agent_gateway.run_identity", "RUN_IDENTITY_MCP_TOOLS_ENV"),
   "RunIdentityCarrier": ("agent_gateway.run_identity", "RunIdentityCarrier"),
   "RunIdentityCarrierError": ("agent_gateway.run_identity", "RunIdentityCarrierError"),
-  "inject_run_identity_into_mcp_server_configs": ("agent_gateway.run_identity", "inject_run_identity_into_mcp_server_configs"),
   "validate_run_identity": ("agent_gateway.run_identity", "validate_run_identity"),
+  "ContainmentSettingError": ("agent_gateway.containment_settings", "ContainmentSettingError"),
+  "ContainmentSettings": ("agent_gateway.containment_settings", "ContainmentSettings"),
+  "resolve_containment_settings": (
+    "agent_gateway.containment_settings",
+    "resolve_containment_settings",
+  ),
   "AgentRunner": ("agent_gateway.runner", "AgentRunner"),
   "SubAgentConfig": ("agent_gateway.runner", "SubAgentConfig"),
   "ToolResultContext": ("agent_gateway.runner", "ToolResultContext"),
@@ -558,7 +555,6 @@ __all__ = [
   "AutonomousCapabilityBindingSource",
   "AutonomousLaunchEnvelope",
   "ChannelMismatchError",
-  "BackgroundTask",
   "CONTRACTS",
   "CONTRACT_AUTONOMOUS_OPERATOR_MESSAGES_V1",
   "CONTRACT_CHAT_ATTACHMENTS_V1",
@@ -573,6 +569,8 @@ __all__ = [
   "CommercialWorkStartFacts",
   "CommercialWorkStartGate",
   "COORDINATOR_DEFAULT_PREAMBLE",
+  "ContainmentSettingError",
+  "ContainmentSettings",
   "CoordinatorConfig",
   "CostEstimate",
   "BoundCapabilityExecution",
@@ -623,7 +621,6 @@ __all__ = [
   "NoCredentialError",
   "NotificationQueue",
   "OpenAIProvider",
-  "OutputRingBuffer",
   "XAIProvider",
   "PACKAGE_NAME",
   "ProviderCredentialFailure",
@@ -643,14 +640,11 @@ __all__ = [
   "RunOutput",
   "RunIdentityCarrier",
   "RunIdentityCarrierError",
-  "RUN_IDENTITY_MCP_ENV",
   "RUN_IDENTITY_MAX_LENGTH",
-  "RUN_IDENTITY_MCP_TOOLS_ENV",
-  "MODEL_RUN_IDENTITY_LOCAL_TOOLS",
-  "MODEL_RUN_IDENTITY_MCP_TOOLS",
   "resolve_agent_session_id",
   "resolve_auth_config",
   "resolve_autonomous_capability_binding",
+  "resolve_containment_settings",
   "send_prompt",
   "send_prompt_sync",
   "SessionRecapEvent",
@@ -695,7 +689,6 @@ __all__ = [
   "UsageTotal",
   "__version__",
   "normalize_identity",
-  "inject_run_identity_into_mcp_server_configs",
   "validate_run_identity",
   "build_state_payload",
   "bind_session_credentials",
@@ -716,7 +709,6 @@ __all__ = [
   "load_state",
   "mark_post_run_guard_failure",
   "package_health",
-  "make_code_execute_status_tool_def",
   "make_code_execute_tool_def",
   "make_get_background_result_handler",
   "make_get_background_result_tool_def",

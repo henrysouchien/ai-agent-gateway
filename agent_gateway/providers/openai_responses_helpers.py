@@ -8,6 +8,7 @@ from typing import Any
 from model_authority.rates import RateTable
 from model_authority.registry import AdapterRouteSupport
 from model_authority.schema import OpenAIResponsesCompat
+from ..tool_result_compaction import make_error_result
 from ..openai_history_fence import REASONING_SIGNATURE_MARKER, TEXT_SIGNATURE_MARKER
 from .base import ModelInfo, StreamEvent, admitted_entry, model_info_from_entry
 
@@ -117,13 +118,9 @@ def _stringify_tool_result_content(content: Any) -> str:
 
 
 def _synthetic_tool_result(tool_id: str, tool_name: str) -> dict[str, Any]:
-  return {
-    "type": "tool_result",
-    "tool_use_id": tool_id,
-    "content": json.dumps({"error": {"code": "missing_tool_result", "message": "No result provided"}}),
-    "is_error": True,
-    "tool_name": tool_name,
-  }
+  result = make_error_result(tool_id, "missing_tool_result", "No result provided")
+  result["tool_name"] = tool_name
+  return result
 
 
 def _is_tool_result_message(message: dict[str, Any]) -> bool:
@@ -516,11 +513,15 @@ def map_event(event_value: Any, state: _ResponsesStreamState) -> list[StreamEven
     signature = _encode_reasoning_signature(item)
     state.current_block_type = None
     state.current_item = None
-    if not signature:
-      return []
+    raw_block: dict[str, Any] = {"type": "thinking", "thinking": thinking}
+    if signature:
+      raw_block["signature"] = signature
+      raw_block["thinkingSignature"] = signature
     return [StreamEvent(
-      type="thinking_end", thinking_text=thinking, signature=signature,
-      raw_block={"type": "thinking", "thinking": thinking, "signature": signature, "thinkingSignature": signature},
+      type="thinking_end",
+      thinking_text=thinking,
+      signature=signature or "",
+      raw_block=raw_block,
     )]
   if item_type == "message":
     raw_content = item.get("content")

@@ -16,6 +16,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from dataclasses import replace
+from model_authority.selection import TierModelsDefault
 from agent_gateway import AgentRunner, McpClientManager, ToolDispatcher
 
 from agent_gateway.auth import AuthConfig, ResolverResult
@@ -298,10 +299,27 @@ def _stale_preference_deployment(
     )
     for capability_id, policy in INITIAL_MODEL_SELECTION_POLICY.capabilities.items()
   }
-  selection_policy = ProductModelSelectionPolicy(
-    schema=SCHEMA,
+  # A deployment that retires a model drops it from every role chain and tier
+  # ceiling too: load admission refuses an unavailable fallback entry.
+  tiers = {
+    name: replace(
+      tier,
+      allowed_model_keys=(
+        None if tier.allowed_model_keys is None
+        else tier.allowed_model_keys - {"xai.grok-4-7"}
+      ),
+      fallback=(
+        None if tier.fallback is None
+        else tuple(entry for entry in tier.fallback if entry.model != "xai.grok-4-7")
+      ),
+    )
+    for name, tier in INITIAL_MODEL_SELECTION_POLICY.tiers.items()
+  }
+  selection_policy = replace(
+    INITIAL_MODEL_SELECTION_POLICY,
     revision=f"post-{lifecycle}",
     capabilities=capabilities,
+    tiers=tiers,
   )
   selection_policy.admit_registry(registry)
   return registry, selection_policy
@@ -501,6 +519,24 @@ def test_chat_init_response_includes_resolved_user_id() -> None:
 
   assert response.status_code == 200
   assert response.json()["user_id"] == "alice"
+
+
+def test_chat_init_reports_unknown_model_entitlements_the_resolver_supplied() -> None:
+  async def _resolver(_api_key: str, _init_request: Any) -> ResolverResult:
+    result = _resolver_result(channel="cli")
+    return replace(
+      result,
+      model_entitled_capabilities=result.model_entitled_capabilities
+      | {"not.a.capability"},
+    )
+
+  app = _make_app(_resolver)
+
+  with TestClient(app) as client:
+    response = client.post("/api/chat/init", json={"api_key": "cli-key"})
+
+  assert response.status_code == 200, response.text
+  assert response.json()["unknown_model_entitled_capabilities"] == ["not.a.capability"]
 
 
 def test_chat_init_returns_only_session_executable_stable_key_choices() -> None:
@@ -721,6 +757,75 @@ def test_chat_init_rejects_selection_without_eligible_credential() -> None:
   assert response.json()["error_code"] == "credential_unavailable"
   assert response.json()["provider"] == "openai"
   assert "session_token" not in response.json()
+  assert app.state.auth.session_store.sessions == {}
+
+
+_RUN_PRESET_POLICY = replace(
+  INITIAL_MODEL_SELECTION_POLICY,
+  presets={
+    "eval_economy": {
+      "default": TierModelsDefault(("anthropic.claude-sonnet-5-5",), "low"),
+    },
+  },
+)
+
+
+def test_chat_init_model_preset_freezes_and_catalogue_selects_it() -> None:
+  async def _resolver(_api_key: str, _init_request: Any) -> ResolverResult:
+    return _resolver_result(channel="cli")
+
+  app = _make_app(_resolver, model_selection_policy=_RUN_PRESET_POLICY)
+
+  with TestClient(app) as client:
+    response = client.post(
+      "/api/chat/init",
+      json={"api_key": "cli-key", "model_preset": "eval_economy"},
+    )
+
+  assert response.status_code == 200
+  session = app.state.auth.session_store.get_session(response.json()["session_id"])
+  assert session is not None
+  assert session.model_preset == "eval_economy"
+  selected = response.json()["capability_choices"]["session.driver"]["selected"]
+  assert (selected["model_key"], selected["effort"], selected["reason"]) == (
+    "anthropic.claude-sonnet-5-5",
+    "low",
+    "internal_policy",
+  )
+
+
+def test_chat_init_refuses_unpublished_model_preset_before_issuing_token() -> None:
+  async def _resolver(_api_key: str, _init_request: Any) -> ResolverResult:
+    return _resolver_result(channel="cli")
+
+  app = _make_app(_resolver, model_selection_policy=_RUN_PRESET_POLICY)
+
+  with TestClient(app) as client:
+    response = client.post(
+      "/api/chat/init",
+      json={"api_key": "cli-key", "model_preset": "not_published"},
+    )
+
+  assert response.status_code == 422
+  assert response.json()["error_code"] == "capability_selection_invalid"
+  assert "session_token" not in response.json()
+  assert app.state.auth.session_store.sessions == {}
+
+
+@pytest.mark.parametrize("model_preset", ["", "   ", 7])
+def test_chat_init_rejects_blank_or_non_text_model_preset(model_preset: Any) -> None:
+  async def _resolver(_api_key: str, _init_request: Any) -> ResolverResult:
+    return _resolver_result(channel="cli")
+
+  app = _make_app(_resolver, model_selection_policy=_RUN_PRESET_POLICY)
+
+  with TestClient(app) as client:
+    response = client.post(
+      "/api/chat/init",
+      json={"api_key": "cli-key", "model_preset": model_preset},
+    )
+
+  assert response.status_code == 422
   assert app.state.auth.session_store.sessions == {}
 
 

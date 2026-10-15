@@ -16,6 +16,7 @@ from agent_gateway import AgentRunner, AgentSessionLog, LogEntry  # noqa: E402
 from agent_gateway.agent_session_log_records import EVENT_SCHEMA_VERSION  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.providers import ModelProvider  # noqa: E402
+from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND  # noqa: E402
 from agent_gateway.runner_session_events import (  # noqa: E402
   build_assistant_message_event,
   build_attach_event,
@@ -49,6 +50,12 @@ from agent_gateway.runner_session_events import (  # noqa: E402
   write_lease_metadata,
 )
 from agent_gateway.skill_completion_wal import SkillCompletionWalCorruptError  # noqa: E402
+from agent_gateway.event_adapter import adapt_event  # noqa: E402
+from agent_gateway.event_log import EventLog  # noqa: E402
+from agent_gateway.multi_user.billing import SessionUsageSummary  # noqa: E402
+from agent_gateway.skill_lifecycle import TopLevelSkillLifecycleMetadata  # noqa: E402
+from agent_gateway.tool_dispatcher_approval_lifecycle import ApprovalPark  # noqa: E402
+from agent_gateway.server_chat_helpers import _chat_turn_state_from_events  # noqa: E402
 
 
 def test_context_pressure_reminder_copy_is_model_actionable() -> None:
@@ -987,6 +994,44 @@ def test_unprepared_exception_terminal_preserves_cancellation_and_persistence() 
   }
 
 
+@pytest.mark.parametrize(
+  "skill_result",
+  [
+    {"exit_code": 1, "outcome": "post_run_guard_failed"},
+    {"exit_code": 0, "outcome": "blocked", "error": "terminal door never called"},
+    {"exit_code": 0, "outcome": "error"},
+  ],
+)
+def test_success_disposition_with_failed_skill_result_yields_error_terminal(
+  skill_result: dict[str, Any],
+) -> None:
+  lifecycle = TopLevelSkillLifecycleMetadata(
+    skill_run_id="guard-failed-skill", skill="review", scope="ticker", ticker="MSFT",
+  )
+  terminal = build_stream_complete_event(
+    usage_totals={
+      "input_tokens": 1, "output_tokens": 1,
+      "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+    },
+    estimated_cost=0.01,
+    est_system_tokens=1,
+    est_tools_tokens=1,
+  )
+  decision = terminal_closure_decision(
+    clean_detach_reason="completed",
+    run_error=None,
+    terminal_event=terminal,
+    server_terminal_cause=None,
+    skill_lifecycle=lifecycle,
+    skill_result={"type": "skill_result_captured", **skill_result},
+  )
+  assert decision.terminal is not None
+  assert decision.terminal["type"] == "error"
+  assert "terminal_disposition" not in decision.terminal
+  assert decision.terminal["reason"] == skill_result["outcome"]
+  assert decision.terminal["error"] == skill_result.get("error", skill_result["outcome"])
+
+
 def test_run_interrupted_reason_preserves_shutdown_reason_except_cancelled_sub_agent() -> None:
   shutdown_extra_fields = {"shutdown": {"signal_name": "SIGTERM"}}
 
@@ -1107,3 +1152,272 @@ def test_runner_stub_response_delegate_appends_built_events(monkeypatch) -> None
     "usage": {},
   }
   assert sleep_delays == [0.05] * (len(appended) - 1)
+
+
+@pytest.mark.parametrize("summary_present", [True, False])
+@pytest.mark.parametrize("failure_stage", [None, "append", "readback", "detach"])
+def test_approval_park_closure_preserves_attempt_usage_without_final_skill_effect(
+  tmp_path: Path,
+  monkeypatch: Any,
+  summary_present: bool,
+  failure_stage: str | None,
+) -> None:
+  park = ApprovalPark(
+    job_id="admitted-original-job",
+    original_tool_call_id="original-call",
+    approval_id="approval-public-id",
+    nonce="private-nonce",
+    root_turn_id="admitted-root-turn" if summary_present else None,
+  )
+  terminal = build_stream_complete_event(
+    usage_totals={
+      "input_tokens": 31,
+      "output_tokens": 7,
+      "cache_creation_input_tokens": 3,
+      "cache_read_input_tokens": 11,
+    },
+    estimated_cost=0.03123,
+    est_system_tokens=101,
+    est_tools_tokens=203,
+    terminal_disposition="awaiting_approval",
+  )
+  lifecycle = TopLevelSkillLifecycleMetadata(
+    skill_run_id="still-pending-skill",
+    skill="review",
+    scope="ticker",
+    ticker="MSFT",
+  )
+  facts: dict[str, Any] = {
+    "clean_detach_reason": "awaiting_approval",
+    "run_error": None,
+    "terminal_event": terminal,
+    "server_terminal_cause": None,
+    "approval_park": park,
+  }
+  pending = terminal_closure_decision(**facts, skill_lifecycle=lifecycle)
+  assert (pending.disposition, pending.reason) == (
+    "awaiting_approval", "awaiting_approval",
+  )
+  assert pending.skill_result is None and pending.skill_effect is None
+  run_failure = RuntimeError("provider failed after capture")
+  cancellation = asyncio.CancelledError("caller disconnected")
+  persistence_failure = OSError("journal unavailable")
+  for overrides, disposition, reason, cause in (
+    ({"run_error": run_failure}, "error", "error", run_failure),
+    ({"run_error": cancellation}, "cancelled", "cancelled", cancellation),
+    ({"server_terminal_cause": "shutdown"}, "cancelled", "shutdown", None),
+    (
+      {"run_error": cancellation, "persistence_error": persistence_failure},
+      "error", "persistence", persistence_failure,
+    ),
+  ):
+    decision = terminal_closure_decision(**{**facts, **overrides})
+    assert (decision.disposition, decision.reason, decision.cause) == (
+      disposition, reason, cause,
+    )
+    assert decision.terminal is None or (
+      decision.terminal.get("terminal_disposition") != "awaiting_approval"
+    )
+
+  session_log = AgentSessionLog(tmp_path / "park.jsonl")
+  event_log = EventLog()
+  for event in (
+    {"type": "skill_run_started", **lifecycle.identity_fields()},
+    {
+      "type": "assistant_message",
+      "content_blocks": [
+        {"type": "tool_use", "id": park.original_tool_call_id, "name": "write_record"},
+      ],
+    },
+    {
+      "type": "tool_call_start",
+      "tool_call_id": park.original_tool_call_id,
+      "tool_name": "write_record",
+      "started_at": 2.0,
+    },
+  ):
+    event_log.append(event)
+    session_log.append_sync({**event, "runner_id": "attempt-runner", "role": "writer"})
+  summary = SessionUsageSummary(
+    user_id="owner",
+    session_id="physical-session-not-job",
+    request_id="attempt-request",
+    input_tokens=41,
+    output_tokens=10,
+    cache_read_tokens=13,
+    cache_creation_tokens=5,
+    cost=0.04,
+    turns=2,
+    channel="web",
+    started_at=1.0,
+    ended_at=3.0,
+    drain_complete=False,
+    in_flight_task_count=2,
+    usage_event_count=2,
+    usage_event_ids=("observed-root-usage", "observed-child-usage"),
+    capability_bind=TEST_CAPABILITY_BIND.to_json(),
+  )
+  runner = object.__new__(AgentRunner)
+  runner._agent_session_log = session_log
+  runner._log = event_log
+  runner._runner_id = "attempt-runner"
+  runner._role = "writer"
+  runner._sub_agent_id = None
+  runner._gateway_session = None
+  runner._durable_attach_emitted = True
+  runner._last_durable_seq = 3
+  runner._approval_park = park
+  runner._terminal_closure_event = terminal
+  runner._terminal_closure_receipts = None
+  runner._terminal_closure_interruption = None
+  runner._terminal_recap_payload = None
+  runner._emit_session_recap = True
+  runner._full_session_id = "physical-session-not-job"
+  runner._session_started_at = 1.0
+  runner._session_usage_summary = summary if summary_present else None
+  runner._top_level_skill_lifecycle = lifecycle
+  runner._top_level_skill_result_policy = None
+  runner._top_level_skill_started_committed = True
+  runner._top_level_skill_result_committed = False
+  runner._top_level_skill_terminal_committed = False
+  runner._top_level_skill_detach_committed = False
+  runner._top_level_skill_result_event = None
+  runner._top_level_skill_completion_effect_plan = None
+  runner._top_level_skill_result_task = None
+  runner._deferred_top_level_terminal_event = None
+  effect_path = tmp_path / "final-named-skill-effect"
+
+  async def prepare_final_result(**_kwargs: Any) -> bool:
+    effect_path.write_text("incorrect final result", encoding="utf-8")
+    raise AssertionError("park entered final named-skill preparation")
+
+  def commit_final_result(**_kwargs: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    effect_path.write_text("incorrect final effect", encoding="utf-8")
+    raise AssertionError("park entered final named-skill completion")
+
+  runner._prepare_top_level_skill_closure = prepare_final_result
+  runner._commit_top_level_skill_plan_sync = commit_final_result
+  append_sync = session_log.append_sync
+  query_sync = session_log.query_sync
+  append_pair = session_log.append_terminal_pair_sync
+
+  def append_with_fault(event: dict[str, Any]) -> LogEntry:
+    if failure_stage == "append" and event.get("terminal_disposition") == "awaiting_approval":
+      raise OSError("park append failed")
+    return append_sync(event)
+
+  def readback_with_fault(**kwargs: Any):
+    if failure_stage == "readback" and (
+      kwargs.get("after_seq") == kwargs.get("before_seq") == 4
+    ):
+      return [], None
+    return query_sync(**kwargs)
+
+  def detach_with_fault(recap: dict[str, Any], detach: dict[str, Any]):
+    if failure_stage == "detach" and detach.get("reason") == "awaiting_approval":
+      raise OSError("park detach failed")
+    return append_pair(recap, detach)
+
+  monkeypatch.setattr(session_log, "append_sync", append_with_fault)
+  monkeypatch.setattr(session_log, "query_sync", readback_with_fault)
+  monkeypatch.setattr(session_log, "append_terminal_pair_sync", detach_with_fault)
+  settle = runner._settle_run_closure(
+    clean_detach_reason="awaiting_approval", run_error=None,
+  )
+  if failure_stage is None:
+    assert _run(settle) is True
+  else:
+    # The failed closure commits first; the park's persistence cause is then raised.
+    with pytest.raises((OSError, RuntimeError)):
+      _run(settle)
+  durable, _ = query_sync(order="asc")
+  events = [entry.event for entry in durable]
+  if failure_stage is None:
+    assert runner._approval_park is park
+  else:
+    assert runner._approval_park is None
+  assert not effect_path.exists()
+  assert runner._top_level_skill_result_task is None
+  assert runner._top_level_skill_result_event is None
+  assert runner._top_level_skill_completion_effect_plan is None
+  assert not runner._top_level_skill_result_committed
+  assert not runner._top_level_skill_terminal_committed
+  assert not any(event["type"] == "skill_result_captured" for event in events)
+  assert events[-2]["type"] == "session_recap"
+  assert events[-1]["type"] == "detach"
+  live_terminal = runner._terminal_closure_event
+  assert live_terminal is not None
+  if failure_stage is not None:
+    assert live_terminal["type"] == "error"
+    assert live_terminal["reason"] == "persistence"
+    assert events[-1]["reason"] == "error"
+    assert events[-2]["failures"]
+    assert _chat_turn_state_from_events(
+      [entry.event for entry in event_log.entries]
+    ) == "failed"
+    return
+
+  expected_usage = {
+    "input_tokens": 31,
+    "output_tokens": 7,
+    "cache_creation_input_tokens": 3,
+    "cache_read_input_tokens": 11,
+    "estimated_cost": 0.0312,
+    "est_system_tokens": 101,
+    "est_tools_tokens": 203,
+  }
+  parked_terminals = [
+    event for event in events
+    if event["type"] == "stream_complete"
+  ]
+  assert len(parked_terminals) == 1
+  assert parked_terminals[0]["usage"] == live_terminal["usage"] == expected_usage
+  assert parked_terminals[0]["terminal_disposition"] == "awaiting_approval"
+  assert parked_terminals[0]["job_id"] == park.job_id
+  assert parked_terminals[0]["job_id"] != runner._full_session_id
+  if park.root_turn_id is not None:
+    assert parked_terminals[0]["root_turn_id"] == park.root_turn_id
+  else:
+    assert "root_turn_id" not in parked_terminals[0]
+  assert "nonce" not in parked_terminals[0]
+  assert parked_terminals[0]["approval_id"] == park.approval_id
+  assert parked_terminals[0]["original_tool_call_id"] == park.original_tool_call_id
+  assert "skill_run_id" not in parked_terminals[0]
+  live_events = [entry.event for entry in event_log.entries]
+  assert live_events[-2]["type"] == "session_recap"
+  assert live_events[-1] == live_terminal
+  assert live_events[-2]["usage"] == events[-2]["usage"]
+  assert _chat_turn_state_from_events(live_events) == "approval_pending"
+  assert not any(
+    event["type"] in {"error", "interrupted", "tool_call_interrupted", "tool_call_complete"}
+    for event in events
+  )
+  assert events[-1]["reason"] == "awaiting_approval"
+  assert events[-2]["failures"] == []
+  recap_usage = events[-2]["usage"]
+  if summary_present:
+    assert recap_usage["input_tokens"] == summary.input_tokens
+    assert recap_usage["cost"] == summary.cost
+    assert recap_usage["drain_complete"] is False
+    assert recap_usage["in_flight_task_count"] == 2
+    assert recap_usage["usage_event_ids"] == list(summary.usage_event_ids)
+  else:
+    assert recap_usage is None
+  projected = adapt_event({
+    **live_terminal,
+    "nonce": park.nonce,
+    "prepared_input": {"secret": "must-not-be-public"},
+    "credential_generation_ref": "private-generation",
+  }, 1)
+  assert projected is not None
+  assert projected["usage"] == expected_usage
+  assert projected["job_id"] == park.job_id
+  if park.root_turn_id is not None:
+    assert projected["root_turn_id"] == park.root_turn_id
+  else:
+    assert "root_turn_id" not in projected
+  assert projected["approval_id"] == park.approval_id
+  assert projected["original_tool_call_id"] == park.original_tool_call_id
+  assert "nonce" not in projected
+  assert "prepared_input" not in projected
+  assert "credential_generation_ref" not in projected

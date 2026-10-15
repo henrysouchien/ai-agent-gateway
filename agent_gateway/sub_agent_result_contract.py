@@ -165,6 +165,7 @@ def _usage_observation(value: Mapping[str, Any] | None) -> UsageObservation:
       "cache_read_input_tokens",
     ),
     tool_calls=_counter("tool_calls"),
+    **({"turns": _counter("turns")} if "turns" in usage else {}),
     cost_usd=cost_usd,
   )
 

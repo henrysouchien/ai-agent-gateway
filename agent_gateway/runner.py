@@ -36,8 +36,8 @@ from .runner_introspection import (
   detect_user_id_param as _detect_user_id_param,
   is_sub_agent_session_id as _is_sub_agent_session_id,
 )
+from .containment_settings import ContainmentSettings
 from .runner_limits import (
-  CONTEXT_PRESSURE_REMINDER_PCT as CONTEXT_PRESSURE_REMINDER_PCT,
   effective_compaction_trigger as _effective_compaction_trigger,  # noqa: F401 - compatibility alias
   model_context_window as _model_context_window,  # noqa: F401 - compatibility alias
   token_estimate_snapshot as _token_estimate_snapshot,  # noqa: F401 - compatibility alias
@@ -139,7 +139,8 @@ from .runner_usage import (
   usage_has_tokens as _usage_has_tokens,  # noqa: F401 - compatibility alias
 )
 from .session_recap import emit_recap_then_terminal
-from .session import GatewaySession, session_owner_user_id
+from .session import GatewaySession, RequestToolPrefix, session_owner_user_id
+from .sub_agent_result_evidence import SubAgentResultEvidence
 from .task_registry import (
   CoordinatorConfig,
   NotificationQueue,
@@ -193,9 +194,6 @@ OnMetric = Callable[[str, int], None]
 ShutdownSignalProvider = Callable[[], Dict[str, Any] | None]
 
 
-# certified by VRT at 4 tracks; re-run owed at 7
-DEFAULT_MAX_BACKGROUND_TASKS = 6
-
 class AgentRunner(
   RunnerSessionLifecycleMixin,
   RunnerBackgroundLifecycleMixin,
@@ -222,9 +220,11 @@ class AgentRunner(
   - A delegated run (sub-agent or fork) meets the soft-budget ladder
     (`runner_soft_budget`), keyed by `_soft_budget_kind`; a primary
     (`writer`) run has none.
-  - Concurrent children queue on this runner's six slots by default. A child
-    runner inherits the slot count, not the semaphore: its own queue lets a
-    parent await grandchildren without holding a shared tree-wide permit.
+  - Concurrent children queue on this runner's
+    `ContainmentSettings.max_concurrent_children` slots (`containment`). A
+    child runner inherits the slot count, not the semaphore: its own queue
+    lets a parent await grandchildren without holding a shared tree-wide
+    permit.
   """
   _billing_mode: BillingMode
 
@@ -290,12 +290,15 @@ class AgentRunner(
     tool_call_timeout: float | None = 120.0,
     _cost_accumulator: CostAccumulator | None = None,
     _parent_aggregator: _UsageAggregator | None = None,
-    max_concurrent_sub_agents: int | None = DEFAULT_MAX_BACKGROUND_TASKS,
+    _usage_parent: _UsageAggregator | None = None,
+    containment: ContainmentSettings = ContainmentSettings(),
     soft_budget_kind: str | None = None,
     result_requirement: ResultRequirement | None = None,
     agent_session_log: AgentSessionLog | None = None,
     context_builder: SessionContextBuilder | None = None,
     task_registry: TaskRegistry | None = None,
+    admitted_self_task: TaskEntry | None = None,
+    admitted_self_prior_evidence: SubAgentResultEvidence | None = None,
     message_inbox: asyncio.Queue[ParentMessage] | None = None,
     coordinator: CoordinatorConfig | None = None,
     max_resume_chain_depth: int = 3,
@@ -347,8 +350,6 @@ class AgentRunner(
         "AgentRunner requires a BoundCapabilityExecution"
       )
     capability_execution.validate()
-    if max_concurrent_sub_agents is not None and max_concurrent_sub_agents <= 0:
-      raise ValueError("max_concurrent_sub_agents must be positive when provided")
     if max_resume_chain_depth <= 0:
       raise ValueError("max_resume_chain_depth must be positive")
     if (
@@ -472,6 +473,15 @@ class AgentRunner(
     self._selected_content_bindings: tuple[SelectedContentBinding, ...] = ()
     self._selected_content_bindings_bound = False
     self._gateway_session = gateway_session
+    self._tool_prefix = (
+      gateway_session.request_tool_prefix
+      if gateway_session is not None
+      else RequestToolPrefix()
+    )
+    # The advertised tool names of the last request built: what a learning
+    # fork's route ceiling reads (the wire list also carries anchor tools the
+    # session no longer advertises, and definitions kept for history references).
+    self._last_request_advertised_tool_names: frozenset[str] = frozenset()
     self._spill_dir_provider = normalize_spill_sink(code_execution_spill_dir_provider)
     self._capability_execution = capability_execution
     self._secret_boundary = SecretBoundary.from_capability_execution(
@@ -541,6 +551,9 @@ class AgentRunner(
       channel,
     )
     self._parent_aggregator = _parent_aggregator
+    # A delegated child's own aggregator reports under the delegating run's:
+    # the child writes its own session summary, the root owns the unit.
+    self._usage_parent = _usage_parent
     self._aggregator = _parent_aggregator or _UsageAggregator(
       user_id=self._usage_user_id,
       session_id=self._full_session_id,
@@ -548,6 +561,7 @@ class AgentRunner(
       channel=self._channel,
       rate_table_version=self._rate_table_version,
       billing_mode=self._billing_mode,
+      parent=_usage_parent,
     )
     self._summary_emitted = False
     self._usage_ledger_dlq_path = (
@@ -557,8 +571,9 @@ class AgentRunner(
     self._sub_agent_config = sub_agent_config
     self._compaction_trigger = compaction_trigger
     self._compaction_instructions = compaction_instructions
+    self._containment = containment
     self._context_pressure_next_reminder_pct = (
-      CONTEXT_PRESSURE_REMINDER_PCT
+      containment.context_pressure_reminder_pct
     )
     self._portable_compaction_failed_est_at: int | None = None
     self._portable_compaction_last_turn: int | None = None
@@ -570,10 +585,7 @@ class AgentRunner(
     self._last_reported_cost = 0.0
     self._coordinator = coordinator
     self._max_resume_chain_depth = max_resume_chain_depth
-    self._max_concurrent_sub_agents = max_concurrent_sub_agents
-    self._max_background_tasks = (
-      max_concurrent_sub_agents or DEFAULT_MAX_BACKGROUND_TASKS
-    )
+    self._max_background_tasks = containment.max_concurrent_children
     self._result_requirement = result_requirement
     self._sub_agent_semaphore: asyncio.Semaphore | None = None
     self._active_client: Any | None = None
@@ -627,11 +639,16 @@ class AgentRunner(
         _ = self, old_state
         if _workflow_owns_terminal_notification(entry):
           return
+        # Pipeline stages settle on this registry; their delivery is the
+        # pipeline's own stage record, not a background-task notification.
+        if entry.task_type == "pipeline_stage":
+          return
         if new_state in (
           TaskState.COMPLETED,
           TaskState.FAILED,
           TaskState.KILLED,
           TaskState.INTERRUPTED,
+          TaskState.PARKED,
         ):
           if entry.completion_envelope is not None:
             notification = _agent_completion_notification(
@@ -651,7 +668,7 @@ class AgentRunner(
             dict,
           ):
             payload = _bounded_background_error(entry.error)
-          elif new_state == TaskState.INTERRUPTED:
+          elif new_state in (TaskState.INTERRUPTED, TaskState.PARKED):
             payload = runner._background_task_payload(entry)
           summary = ""
           if entry.result and isinstance(entry.result, dict):
@@ -694,6 +711,9 @@ class AgentRunner(
     )
     self._role = "sub_agent" if _is_sub_agent_session_id(self._full_session_id) else "writer"
     self._sub_agent_id = self._full_session_id if self._role == "sub_agent" else None
+    self._admitted_self_task = admitted_self_task
+    # The restored attempt's own durable evidence; usage settles cumulatively.
+    self._admitted_self_prior_evidence = admitted_self_prior_evidence
     # The run kind keying ``SOFT_TURN_BUDGET``. By default the session role:
     # a ``sub_agent`` child meets the ladder, a ``writer`` (a watched primary
     # chat) has none. A composition root names a kind explicitly when the
@@ -834,7 +854,11 @@ class AgentRunner(
     return policy.set_server_terminal_cause(cause)
 
   async def wait_for_top_level_skill_settlement(self) -> bool:
-    """Wait until receipt, terminal, detach, and lease handoff all settle."""
+    """Wait for durable physical-attempt closure, detach, and lease handoff.
+
+    Awaiting approval leaves the logical named skill open without a final
+    result receipt; normal final attempts also settle their result and effect.
+    """
 
     if self._top_level_skill_lifecycle is None:
       return False
@@ -842,29 +866,6 @@ class AgentRunner(
     error = self._top_level_skill_settlement_error
     if error is not None:
       raise error
-    if self._write_lease_file is not None:
-      raise RuntimeError(
-        "Top-level skill settlement completed before lease handoff"
-      )
-    if not self._top_level_skill_result_committed:
-      raise RuntimeError(
-        "Top-level skill settlement completed without a result receipt"
-      )
-    if self._deferred_top_level_terminal_event is None:
-      raise RuntimeError(
-        "Top-level skill settlement completed without a terminal event"
-      )
-    if not self._deferred_top_level_terminal_flushed:
-      raise RuntimeError(
-        "Top-level skill settlement completed before terminal projection"
-      )
-    if (
-      self._durable_attach_emitted
-      and not self._top_level_skill_detach_committed
-    ):
-      raise RuntimeError(
-        "Top-level skill settlement completed before durable detach"
-      )
     return True
 
   @property
@@ -987,7 +988,7 @@ class AgentRunner(
     if event.get("type") == "compaction":
       _record_compaction(self._aggregator)
       self._context_pressure_next_reminder_pct = (
-        CONTEXT_PRESSURE_REMINDER_PCT
+        self._containment.context_pressure_reminder_pct
       )
     if event.get("type") in {"stream_complete", "error"}:
       return emit_recap_then_terminal(
@@ -1029,6 +1030,7 @@ class AgentRunner(
     *,
     tool_name: str,
     on_spill_publication: Callable[[SpillPublication], None] | None = None,
+    max_chars: int | None = None,
   ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     return _compact_model_tool_result_entry(
       result_entry,
@@ -1038,6 +1040,7 @@ class AgentRunner(
       logger=log,
       uuid_factory=uuid.uuid4,
       on_spill_publication=on_spill_publication,
+      max_chars=max_chars,
     )
 
   @staticmethod
@@ -1080,6 +1083,36 @@ class AgentRunner(
       return
     self._active_skill_allow = allowed
     self._rebuild_filtered_tool_definitions(base_kwargs)
+
+  def _newly_exposed_tool_names(
+    self,
+    base_kwargs: Dict[str, Any],
+    advertised_before: frozenset[str],
+  ) -> List[str]:
+    """Name the tools one call newly made advertised, outside the anchor.
+
+    Under an anchored (Anthropic) request a tool outside the anchor is sent
+    deferred once a `tool_reference` in the visible history names it, and the
+    call that made it callable is where that reference lives.  The exposure is
+    the call's own after-minus-before diff of the advertised set, so a tool
+    that was already advertised (and so already visible) is never flipped to
+    deferred later.  The definitions are kept so a reference stays valid after
+    the tool leaves the advertised set; dispatch still gates execution
+    (`_effective_excluded_tools`), so a retained definition grants nothing.
+    """
+
+    anchor = self._tool_prefix.anchor
+    if anchor is None:
+      return []
+    anchored = {tool["name"] for tool in anchor}
+    exposed = {
+      str(tool["name"]): tool
+      for tool in base_kwargs.get("tools") or []
+      if tool["name"] not in anchored and tool["name"] not in advertised_before
+    }
+    for name, definition in exposed.items():
+      self._tool_prefix.exposed[name] = deepcopy(definition)
+    return sorted(exposed)
 
   def _refresh_tools(self, base_kwargs: Dict[str, Any], _new_servers: List[str]) -> None:
     """Re-advertise after a load; the activation itself is already recorded.

@@ -17,9 +17,6 @@ AUTONOMOUS_APPROVAL_CHANNEL_FD_ENV = (
 )
 AUTONOMOUS_APPROVAL_CHANNEL_VERSION = 1
 AUTONOMOUS_APPROVAL_CHANNEL_DEFAULT_SEND_TIMEOUT_SECONDS = 5.0
-AUTONOMOUS_APPROVAL_CHANNEL_DEFAULT_RECEIVE_TIMEOUT_SECONDS = (
-  24 * 60 * 60.0
-)
 AUTONOMOUS_APPROVAL_CHANNEL_MAX_TIMEOUT_SECONDS = 24 * 60 * 60.0
 
 _FRAME_HEADER = struct.Struct("!I")
@@ -391,15 +388,21 @@ def _validate_socket(sock: socket.socket) -> None:
     )
 
 
+def _deadline(timeout_seconds: float | None) -> float | None:
+  return None if timeout_seconds is None else time.monotonic() + timeout_seconds
+
+
 def _wait_for(
   sock: socket.socket,
   *,
   readable: bool,
-  deadline: float,
+  deadline: float | None,
 ) -> None:
+  """Wait for readiness; a ``None`` deadline waits until the peer acts or closes."""
+
   while True:
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
+    remaining = None if deadline is None else deadline - time.monotonic()
+    if remaining is not None and remaining <= 0:
       raise AutonomousApprovalChannelTimeout(
         "autonomous approval channel operation timed out"
       )
@@ -428,7 +431,7 @@ def _send_all(
   sock: socket.socket,
   payload: bytes,
   *,
-  deadline: float,
+  deadline: float | None,
 ) -> None:
   view = memoryview(payload)
   offset = 0
@@ -453,7 +456,7 @@ def _receive_exact(
   sock: socket.socket,
   size: int,
   *,
-  deadline: float,
+  deadline: float | None,
   field_name: str,
 ) -> bytes:
   chunks: list[bytes] = []
@@ -483,7 +486,7 @@ class _OwnedApprovalEndpoint:
     sock: socket.socket,
     *,
     authority: AutonomousApprovalChannelAuthority,
-    timeout_seconds: float,
+    timeout_seconds: float | None,
   ) -> None:
     if type(authority) is not AutonomousApprovalChannelAuthority:
       raise TypeError(
@@ -637,7 +640,7 @@ class AutonomousApprovalChannelParent(_OwnedApprovalEndpoint):
       _send_all(
         self._require_socket(),
         payload,
-        deadline=time.monotonic() + resolved_timeout,
+        deadline=_deadline(resolved_timeout),
       )
       if prior_body is None:
         self._sent_by_sequence[decision.delivery_sequence] = body
@@ -686,7 +689,7 @@ class AutonomousApprovalChannelChild(_OwnedApprovalEndpoint):
     sock: socket.socket,
     *,
     authority: AutonomousApprovalChannelAuthority,
-    timeout_seconds: float,
+    timeout_seconds: float | None,
   ) -> None:
     super().__init__(
       sock,
@@ -738,7 +741,7 @@ class AutonomousApprovalChannelChild(_OwnedApprovalEndpoint):
         if timeout_seconds is None
         else _timeout(timeout_seconds, field_name="timeout_seconds")
       )
-      deadline = time.monotonic() + resolved_timeout
+      deadline = _deadline(resolved_timeout)
       header = _receive_exact(
         self._require_socket(),
         _FRAME_HEADER.size,
@@ -820,9 +823,7 @@ def create_autonomous_approval_channel(
   send_timeout_seconds: float = (
     AUTONOMOUS_APPROVAL_CHANNEL_DEFAULT_SEND_TIMEOUT_SECONDS
   ),
-  receive_timeout_seconds: float = (
-    AUTONOMOUS_APPROVAL_CHANNEL_DEFAULT_RECEIVE_TIMEOUT_SECONDS
-  ),
+  receive_timeout_seconds: float | None = None,
 ) -> AutonomousApprovalChannelPair:
   if type(authority) is not AutonomousApprovalChannelAuthority:
     raise TypeError(
@@ -832,9 +833,10 @@ def create_autonomous_approval_channel(
     send_timeout_seconds,
     field_name="send_timeout_seconds",
   )
-  receive_timeout = _timeout(
-    receive_timeout_seconds,
-    field_name="receive_timeout_seconds",
+  receive_timeout = (
+    None
+    if receive_timeout_seconds is None
+    else _timeout(receive_timeout_seconds, field_name="receive_timeout_seconds")
   )
   parent_sock: socket.socket | None = None
   child_sock: socket.socket | None = None
@@ -877,9 +879,7 @@ def adopt_inherited_autonomous_approval_channel(
   fd: int,
   *,
   authority: AutonomousApprovalChannelAuthority,
-  receive_timeout_seconds: float = (
-    AUTONOMOUS_APPROVAL_CHANNEL_DEFAULT_RECEIVE_TIMEOUT_SECONDS
-  ),
+  receive_timeout_seconds: float | None = None,
 ) -> AutonomousApprovalChannelChild:
   if type(fd) is not int or fd < 0:
     raise ValueError(
@@ -902,9 +902,10 @@ def adopt_inherited_autonomous_approval_channel(
     child = AutonomousApprovalChannelChild(
       sock,
       authority=authority,
-      timeout_seconds=_timeout(
-        receive_timeout_seconds,
-        field_name="receive_timeout_seconds",
+      timeout_seconds=(
+        None
+        if receive_timeout_seconds is None
+        else _timeout(receive_timeout_seconds, field_name="receive_timeout_seconds")
       ),
     )
     sock = None
@@ -921,7 +922,6 @@ def adopt_inherited_autonomous_approval_channel(
 
 
 __all__ = [
-  "AUTONOMOUS_APPROVAL_CHANNEL_DEFAULT_RECEIVE_TIMEOUT_SECONDS",
   "AUTONOMOUS_APPROVAL_CHANNEL_DEFAULT_SEND_TIMEOUT_SECONDS",
   "AUTONOMOUS_APPROVAL_CHANNEL_FD_ENV",
   "AUTONOMOUS_APPROVAL_CHANNEL_MAX_TIMEOUT_SECONDS",

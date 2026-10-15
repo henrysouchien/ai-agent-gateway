@@ -15,16 +15,20 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.commercial_claims import (  # noqa: E402
+from hank_contracts.commercial_claims import (  # noqa: E402
   COMMERCIAL_CLAIM_AUDIENCE,
   COMMERCIAL_CLAIM_ISSUER,
   CommercialClaimError,
   CommercialClaimTrustSnapshot,
-  CommercialClaimVerifier,
   CommercialContextState,
 )
-from agent_gateway.commercial_authority_cache import (  # noqa: E402
+from agent_gateway.commercial_claims import (  # noqa: E402
+  CommercialClaimVerifier,
+)
+from hank_contracts.commercial_authority import (  # noqa: E402
   CommercialAuthoritySnapshot,
+)
+from agent_gateway.commercial_authority_cache import (  # noqa: E402
   CommercialAuthorityStateCache,
 )
 from agent_gateway.commercial_authority_subscriber import (  # noqa: E402
@@ -153,8 +157,6 @@ def test_verifier_accepts_valid_offline_claim_and_overlapping_keys() -> None:
   (
     ({"schema_version": 2}, {}, NOW + 1, "unknown_schema"),
     ({"environment": "staging"}, {}, NOW + 1, "environment_mismatch"),
-    ({"manifest_version": "mcp_exposure@old"}, {}, NOW + 1, "manifest_skew"),
-    ({"shadow_rate_version": "unknown@v1"}, {}, NOW + 1, "unknown_rate_policy"),
     ({"agreement_terms_revision": 3}, {}, NOW + 1, "agreement_terms_stale"),
     ({"effective_scopes": ["trade-preview", "read"]}, {}, NOW + 1, "invalid_scopes"),
     ({"iat": NOW + 60, "exp": NOW + 300}, {}, NOW + 1, "claim_not_yet_valid"),

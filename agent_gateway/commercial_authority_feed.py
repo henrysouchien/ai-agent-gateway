@@ -2,34 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime
-from importlib.resources import files
-import json
 from typing import Any
 from uuid import UUID
 
-from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
-from .commercial_authority_cache import CommercialAuthorityInvalidation
-
-
-_SCHEMA_PATH = (
-  files("agent_gateway")
-  / "contracts"
-  / "commercial-authority-v1"
-  / "commercial-authority-invalidation-feed-v1.schema.json"
+from hank_contracts.commercial_authority import (
+  _VALIDATOR,
+  CommercialAuthorityInvalidation,
+  DecodedCommercialAuthorityFeedPage,
 )
-_SCHEMA = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
-_VALIDATOR = Draft202012Validator(_SCHEMA)
 
-
-@dataclass(frozen=True)
-class DecodedCommercialAuthorityFeedPage:
-  invalidations: tuple[CommercialAuthorityInvalidation, ...]
-  next_sequence: int
-  high_water_sequence: int
 
 
 def decode_commercial_authority_feed_v1(
@@ -101,6 +85,5 @@ def decode_commercial_authority_feed_v1(
 
 
 __all__ = [
-  "DecodedCommercialAuthorityFeedPage",
   "decode_commercial_authority_feed_v1",
 ]

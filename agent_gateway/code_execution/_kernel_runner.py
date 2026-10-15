@@ -173,6 +173,17 @@ class _CellTransport:
     self.closed = False
 
   def exchange(self, payload):
+    """Send one bridge request and block on its reply.
+
+    The gateway's compute clock is paused between `host_wait_begin` and
+    `host_wait_end`, so only the thread executing the cell (the main
+    interpreter thread, which runs every `<cell>` frame) brackets its call: a
+    pause then means the interpreter is idle. A cell-spawned thread's call is
+    routed the same way but sends no frames, so the cell's compute keeps
+    running. `blocked_ms` times the cell thread's reply wait alone. Begin
+    precedes the request on the same ordered stdout, so a single long call is
+    paused before the gateway starts dispatching it.
+    """
     call_id = payload["call_id"]
     if not self.token:
       return {"call_id": call_id, "ok": False, "error": {"code": "bridge_unavailable", "message": "no bridge for this cell"}}
@@ -183,15 +194,31 @@ class _CellTransport:
       if self.closed:
         raise OSError("the originating cell has ended")
       self._pending[call_id] = waiter
+    pauses_cell = threading.current_thread() is threading.main_thread()
+    blocked_ms = 0
     try:
+      if pauses_cell:
+        self._send({"type": "host_wait_begin", "id": self.cell_id, "call_id": call_id}, self.budget)
       self._send(payload, self.budget)
-      waiter["event"].wait()
+      started = time.monotonic()
+      try:
+        waiter["event"].wait()
+      finally:
+        blocked_ms = int((time.monotonic() - started) * 1000)
       if waiter["reply"] is None:
         raise OSError("the originating cell has ended")
       return waiter["reply"]
     finally:
       with self._pending_lock:
         self._pending.pop(call_id, None)
+      if pauses_cell:
+        end = {"type": "host_wait_end", "id": self.cell_id, "call_id": call_id, "blocked_ms": blocked_ms}
+        # Like `done`, the end frame must reach the gateway on a poisoned budget,
+        # or its compute clock would stay paused.
+        try:
+          self._send(end, self.budget)
+        except ProtocolError:
+          self._send(end)
 
   def close(self):
     with self._pending_lock:

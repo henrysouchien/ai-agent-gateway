@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, TypeAlias, Union, cast
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, Union, cast, get_args
 
 from agent_workflow_contracts import AgentCompletionEnvelope, sha256_digest
 
-from .skill_lifecycle import TopLevelSkillLifecycleMetadata
+from .skill_lifecycle import GateCode, TopLevelSkillLifecycleMetadata
 from .workflow_output_attachment import WorkflowOutputAttachment
 
 if TYPE_CHECKING:
@@ -38,6 +38,12 @@ ApprovalDecisionSource: TypeAlias = Literal[
   "headless_auto_deny",
   "headless_hook_approved",
   "session_cache_approved",
+  "durable_approved_binding",
+  "durable_approval_denied",
+  "planned_write_reinvocation_required",
+  "prepared_business_model_resume",
+  # Historical: no producer since approval clocks were deleted (GP19); kept
+  # so recorded logs still parse.
   "approval_timeout",
 ]
 RecapTrigger: TypeAlias = Literal["turn_end", "explicit", "session_gc"]
@@ -72,11 +78,12 @@ class SkillResultCapturedEvent:
   exit_code: int
   outcome: str
   status: str
-  gate_code: str | None
+  gate_code: GateCode | None
   artifact_refs: list[str]
   proposal_ids: list[str]
   verdict_echo: dict[str, Any] | None
   fms_results: list[dict[str, Any]]
+  last_failed_door_answer: dict[str, Any] | None
   artifact_events: list[dict[str, Any]]
   output_memory_file: str | None
   cost_usd: float | None
@@ -457,6 +464,7 @@ def event_from_dict(payload: dict[str, Any]) -> TypedEvent:
       proposal_ids=canonical["proposal_ids"],
       verdict_echo=canonical["verdict_echo"],
       fms_results=canonical["fms_results"],
+      last_failed_door_answer=canonical.get("last_failed_door_answer"),
       artifact_events=canonical["artifact_events"],
       output_memory_file=canonical["output_memory_file"],
       cost_usd=canonical["cost_usd"],
@@ -816,16 +824,7 @@ def _approval_outcome(value: Any) -> ApprovalOutcome:
 
 
 def _approval_decision_source(value: Any) -> ApprovalDecisionSource:
-  if value in {
-    "user_approved",
-    "delegated_auto_approved",
-    "user_denied",
-    "relay_policy_denied",
-    "headless_auto_deny",
-    "headless_hook_approved",
-    "session_cache_approved",
-    "approval_timeout",
-  }:
+  if value in get_args(ApprovalDecisionSource):
     return str(value)  # type: ignore[return-value]
   raise ValueError(f"Unknown approval decision source: {value!r}")
 

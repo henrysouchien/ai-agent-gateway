@@ -21,11 +21,19 @@ def _render_agent_param_description(
   )
   if not entries:
     return base
-  lines = [base, "", "Available operations:"]
+  lines = [
+    base,
+    "",
+    "Registered operations are listed below by identity and one-line "
+    "description; call list_skills for the full catalog, including each "
+    "operation's exact AgentOperationRef (admission validates its digest).",
+    "",
+    "Available operations:",
+  ]
   for operation, description in entries:
     lines.append(
-      f"- {operation.namespace}/{operation.name}@{operation.version} "
-      f"({operation.digest}): {description}"
+      f"- {operation.namespace}/{operation.name}@{operation.version}: "
+      f"{description}"
     )
   return "\n".join(lines)
 
@@ -200,8 +208,9 @@ def make_run_agent_tool_def(
 ) -> dict[str, Any]:
   """Build the public tool schema for `run_agent`.
 
-  When an operation source is provided, each listed operation includes its
-  full immutable reference and parent-facing dispatch description.
+  When an operation source is provided, each listed operation's identity
+  (namespace/name@version) and parent-facing dispatch description appear in
+  the `operation` parameter description; digests stay out of prose.
   """
   operations = (
     _catalog_operation_entries(operation_source)

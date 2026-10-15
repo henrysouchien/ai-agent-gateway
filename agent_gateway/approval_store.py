@@ -15,6 +15,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, TYPE_CHECKING
+from uuid import uuid4
 
 from agent_workflow_contracts import AgentCompletionEnvelope, TaskResult
 
@@ -38,6 +39,7 @@ from .approval_policy import (
   PersistentGrant,
   approval_is_executable,
   canonical_json_strict,
+  new_approval_id,
   revalidate_approval_request,
   utc_now,
 )
@@ -931,6 +933,82 @@ def _verify_executable_request_identity(
     raise ApprovalExecutableBindingError("operand_mismatch")
 
 
+def _executable_binding_payload(
+  *,
+  approval_id: str,
+  job_id: str,
+  tool_call_id: str,
+  nonce: str,
+  tenant_storage_id: str,
+  tool_name: str,
+  prepared_call: CanonicalPreparedToolCall,
+  dispatch_context: Mapping[str, object],
+  credential_generation_ref: str | None,
+) -> tuple[dict[str, Any], Any, str, Any, str]:
+  """Validate binding identity and canonicalize its private operands."""
+
+  metadata: dict[str, Any] = {
+    "approval_id": approval_id,
+    "job_id": job_id,
+    "tool_call_id": tool_call_id,
+    "nonce": nonce,
+    "tenant_storage_id": tenant_storage_id,
+    "tool_name": tool_name,
+    "exact_backend": prepared_call.exact_backend,
+    "credential_generation_ref": credential_generation_ref,
+  }
+  if any(
+    type(metadata[key]) is not str or not metadata[key]
+    for key in (
+      "approval_id", "job_id", "tool_call_id", "nonce",
+      "tenant_storage_id", "tool_name",
+    )
+  ):
+    raise ApprovalExecutableBindingError("call_identity_mismatch")
+  if credential_generation_ref is not None and (
+    type(credential_generation_ref) is not str or not credential_generation_ref
+  ):
+    raise ApprovalExecutableBindingError("call_identity_mismatch")
+  try:
+    prepared_input = prepared_call.materialize_input()
+    prepared_input_json = _rows.identity_json_dumps(prepared_input)
+    context = CanonicalPreparedToolCall(
+      prepared_input=dispatch_context,
+    ).materialize_input()
+    dispatch_context_json = _rows.identity_json_dumps(context)
+  except (TypeError, ValueError):
+    raise ApprovalExecutableBindingError("operand_mismatch") from None
+  return metadata, prepared_input, prepared_input_json, context, dispatch_context_json
+
+
+def _insert_executable_binding(
+  conn: sqlite3.Connection,
+  metadata: Mapping[str, Any],
+  prepared_input_json: str,
+  dispatch_context_json: str,
+  operand_digest: str,
+) -> None:
+  conn.execute(
+    """
+    INSERT INTO approval_executable_bindings (
+      approval_id, job_id, tool_call_id, nonce, tenant_storage_id,
+      tool_name, prepared_input_json, dispatch_context_json, exact_backend,
+      credential_generation_ref, request_args_hash, operand_digest
+    ) VALUES (
+      :approval_id, :job_id, :tool_call_id, :nonce, :tenant_storage_id,
+      :tool_name, :prepared_input_json, :dispatch_context_json, :exact_backend,
+      :credential_generation_ref, :request_args_hash, :operand_digest
+    )
+    """,
+    {
+      **metadata,
+      "prepared_input_json": prepared_input_json,
+      "dispatch_context_json": dispatch_context_json,
+      "operand_digest": operand_digest,
+    },
+  )
+
+
 RootTurnRecordErrorCode = Literal[
   "missing_root_turn", "tenant_mismatch", "snapshot_mismatch", "turn_link_mismatch",
 ]
@@ -996,6 +1074,9 @@ def verify_policy_generation(
   return PolicyGenerationMismatch(recorded=recorded, current=current)
 
 
+# A predecessor expired by a policy-generation re-issue names its successor.
+_REISSUED_AS = "approval policy generation changed; re-issued as "
+
 _UNVERIFIED_ROOT_TURN_DIGEST_PREFIX = "migration-unverified:"
 
 
@@ -1058,7 +1139,6 @@ class TargetedPreparedReconciliationResult:
 
 @dataclass(frozen=True)
 class ApprovalMaintenanceResult:
-  approvals_expired: int
   prepared: PreparedReconciliationResult
 
 
@@ -1135,6 +1215,20 @@ class ApprovalRequestStore(Protocol):
     dispatch_context: Mapping[str, object],
     credential_generation_ref: str | None,
   ) -> None: ...
+  async def park_executable_binding(
+    self,
+    *,
+    approval_id: str,
+    job_id: str,
+    tool_call_id: str,
+    nonce: str,
+    tenant_storage_id: str,
+    tool_name: str,
+    prepared_call: CanonicalPreparedToolCall,
+    dispatch_context: Mapping[str, object],
+    credential_generation_ref: str | None,
+    policy_generation_ref: str | None = None,
+  ) -> str: ...
   async def _read_executable_binding_for_executor(
     self,
     *,
@@ -1247,11 +1341,9 @@ class ApprovalRequestStore(Protocol):
     now: datetime | None = None,
   ) -> DelegationGrant | None: ...
   async def revoke_delegation_grant(self, delegation_id: str, *, revoked_at: datetime | None = None) -> None: ...
-  async def expire_pending(self, *, now: datetime | None = None) -> int: ...
   async def maintain_pending(
     self,
     *,
-    now: datetime | None = None,
     prepared_cursor: PreparedReconciliationCursor | None = None,
     prepared_page_size: int = 100,
   ) -> ApprovalMaintenanceResult: ...
@@ -1261,7 +1353,6 @@ class ApprovalRequestStore(Protocol):
     caller_kind: str,
     user_scope: str,
     idempotency_locator: str,
-    now: datetime | None = None,
   ) -> TargetedPreparedReconciliationResult: ...
 
 
@@ -2158,6 +2249,41 @@ class SQLiteApprovalStore:
     canonical policy generation reference. Parked call refs attach separately,
     since their identities do not exist when the root launches.
     """
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        self._record_root_turn_locked(
+          conn,
+          job_id=job_id,
+          turn_id=turn_id,
+          tenant_storage_id=tenant_storage_id,
+          capability_bind=capability_bind,
+          credential_generation_ref=credential_generation_ref,
+          effective_grant=effective_grant,
+          research_binding=research_binding,
+          selection_snapshot=selection_snapshot,
+          approval_route_kind=approval_route_kind,
+          policy_generation_ref=policy_generation_ref,
+          created_at=created_at,
+        )
+        conn.commit()
+
+  @staticmethod
+  def _record_root_turn_locked(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    turn_id: str,
+    tenant_storage_id: str,
+    capability_bind: Mapping[str, object],
+    credential_generation_ref: str | None,
+    effective_grant: Mapping[str, object],
+    research_binding: Mapping[str, object] | None,
+    selection_snapshot: Mapping[str, object],
+    approval_route_kind: str,
+    policy_generation_ref: str,
+    created_at: datetime | None,
+  ) -> None:
     snapshot: dict[str, Any] = {
       "job_id": job_id,
       "turn_id": turn_id,
@@ -2180,44 +2306,40 @@ class SQLiteApprovalStore:
     snapshot["grant_digest"] = _root_turn_snapshot_digest({
       "effective_grant_json": snapshot["effective_grant_json"],
     })
-    async with self._lock:
-      with self._connection() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        existing = conn.execute(
-          "SELECT * FROM approval_root_turns WHERE job_id = ? AND turn_id = ?",
-          (job_id, turn_id),
-        ).fetchone()
-        if existing is not None:
-          if existing["tenant_storage_id"] != tenant_storage_id:
-            raise RootTurnRecordError("tenant_mismatch")
-          snapshot["created_at"] = (
-            _dt_to_text(created_at) if created_at is not None
-            else existing["created_at"]
-          )
-          if (
-            any(existing[key] != value for key, value in snapshot.items())
-            or existing["snapshot_digest"] != _root_turn_snapshot_digest(snapshot)
-          ):
-            raise RootTurnRecordError("snapshot_mismatch")
-        else:
-          snapshot["created_at"] = _dt_to_text(created_at or utc_now())
-          conn.execute(
-            """
-            INSERT INTO approval_root_turns (
-              job_id, turn_id, tenant_storage_id, capability_bind_json,
-              credential_generation_ref, effective_grant_json,
-              grant_digest, research_binding_json, selection_snapshot_json,
-              approval_route_kind, policy_generation_ref, created_at, snapshot_digest
-            ) VALUES (
-              :job_id, :turn_id, :tenant_storage_id, :capability_bind_json,
-              :credential_generation_ref, :effective_grant_json,
-              :grant_digest, :research_binding_json, :selection_snapshot_json,
-              :approval_route_kind, :policy_generation_ref, :created_at, :snapshot_digest
-            )
-            """,
-            {**snapshot, "snapshot_digest": _root_turn_snapshot_digest(snapshot)},
-          )
-        conn.commit()
+    existing = conn.execute(
+      "SELECT * FROM approval_root_turns WHERE job_id = ? AND turn_id = ?",
+      (job_id, turn_id),
+    ).fetchone()
+    if existing is not None:
+      if existing["tenant_storage_id"] != tenant_storage_id:
+        raise RootTurnRecordError("tenant_mismatch")
+      snapshot["created_at"] = (
+        _dt_to_text(created_at) if created_at is not None
+        else existing["created_at"]
+      )
+      if (
+        any(existing[key] != value for key, value in snapshot.items())
+        or existing["snapshot_digest"] != _root_turn_snapshot_digest(snapshot)
+      ):
+        raise RootTurnRecordError("snapshot_mismatch")
+      return
+    snapshot["created_at"] = _dt_to_text(created_at or utc_now())
+    conn.execute(
+      """
+      INSERT INTO approval_root_turns (
+        job_id, turn_id, tenant_storage_id, capability_bind_json,
+        credential_generation_ref, effective_grant_json,
+        grant_digest, research_binding_json, selection_snapshot_json,
+        approval_route_kind, policy_generation_ref, created_at, snapshot_digest
+      ) VALUES (
+        :job_id, :turn_id, :tenant_storage_id, :capability_bind_json,
+        :credential_generation_ref, :effective_grant_json,
+        :grant_digest, :research_binding_json, :selection_snapshot_json,
+        :approval_route_kind, :policy_generation_ref, :created_at, :snapshot_digest
+      )
+      """,
+      {**snapshot, "snapshot_digest": _root_turn_snapshot_digest(snapshot)},
+    )
 
   async def _read_root_turn_for_executor(
     self,
@@ -2229,15 +2351,29 @@ class SQLiteApprovalStore:
     """Select private authority only within the executor's original tenant."""
     async with self._lock:
       with self._connection() as conn:
-        row = conn.execute(
-          """
-          SELECT * FROM approval_root_turns
-          WHERE job_id = ? AND turn_id = ? AND tenant_storage_id = ?
-          """,
-          (job_id, turn_id, tenant_storage_id),
-        ).fetchone()
-    if row is None:
-      return None
+        row = self._read_root_turn_row_locked(
+          conn, job_id=job_id, turn_id=turn_id, tenant_storage_id=tenant_storage_id,
+        )
+    return self._root_turn_record_from_row(row) if row is not None else None
+
+  @staticmethod
+  def _read_root_turn_row_locked(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    turn_id: str,
+    tenant_storage_id: str,
+  ) -> sqlite3.Row | None:
+    return conn.execute(
+      """
+      SELECT * FROM approval_root_turns
+      WHERE job_id = ? AND turn_id = ? AND tenant_storage_id = ?
+      """,
+      (job_id, turn_id, tenant_storage_id),
+    ).fetchone()
+
+  @staticmethod
+  def _root_turn_record_from_row(row: sqlite3.Row) -> RootTurnRecord:
     snapshot = {
       key: row[key] for key in row.keys()
       if key not in {"snapshot_digest", "executable_refs_json"}
@@ -2276,62 +2412,81 @@ class SQLiteApprovalStore:
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        root = conn.execute(
-          """
-          SELECT tenant_storage_id, executable_refs_json FROM approval_root_turns
-          WHERE job_id = ? AND turn_id = ?
-          """,
-          (job_id, turn_id),
-        ).fetchone()
-        if root is None:
-          raise RootTurnRecordError("missing_root_turn")
-        if root["tenant_storage_id"] != tenant_storage_id:
-          raise RootTurnRecordError("tenant_mismatch")
-        binding = conn.execute(
-          """
-          SELECT nonce, tenant_storage_id FROM approval_executable_bindings
-          WHERE job_id = ? AND tool_call_id = ?
-          """,
-          (job_id, tool_call_id),
-        ).fetchone()
-        if binding is None:
-          request = conn.execute(
-            """
-            SELECT approval_id FROM approval_requests
-            WHERE session_id = ? AND tool_call_id = ? AND user_id = ?
-            """,
-            (job_id, tool_call_id, tenant_storage_id),
-          ).fetchone()
-          if request is None:
-            raise ApprovalExecutableBindingError("missing_binding")
-        else:
-          if binding["tenant_storage_id"] != tenant_storage_id:
-            raise ApprovalExecutableBindingError("tenant_mismatch")
-          if binding["nonce"] != nonce:
-            raise ApprovalExecutableBindingError("nonce_mismatch")
-        # Root turns share a job: each captured call belongs to exactly one turn.
-        linked = conn.execute(
-          """
-          SELECT root.turn_id FROM approval_root_turns AS root,
-            json_each(root.executable_refs_json) AS ref
-          WHERE root.job_id = ? AND json_extract(ref.value, '$.tool_call_id') = ?
-          """,
-          (job_id, tool_call_id),
-        ).fetchall()
-        if any(row["turn_id"] != turn_id for row in linked):
-          raise RootTurnRecordError("turn_link_mismatch")
-        ref = {"tool_call_id": tool_call_id, "nonce": nonce}
-        refs = _rows.identity_json_loads(root["executable_refs_json"])
-        if ref not in refs:
-          refs.append(ref)
-          conn.execute(
-            """
-            UPDATE approval_root_turns SET executable_refs_json = ?
-            WHERE job_id = ? AND turn_id = ?
-            """,
-            (_rows.identity_json_dumps(refs), job_id, turn_id),
-          )
+        self._link_root_turn_executable_binding_locked(
+          conn, job_id=job_id, turn_id=turn_id, tool_call_id=tool_call_id,
+          nonce=nonce, tenant_storage_id=tenant_storage_id,
+        )
         conn.commit()
+
+  @staticmethod
+  def _link_root_turn_executable_binding_locked(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    turn_id: str,
+    tool_call_id: str,
+    nonce: str,
+    tenant_storage_id: str,
+  ) -> None:
+    root = conn.execute(
+      """
+      SELECT tenant_storage_id, executable_refs_json FROM approval_root_turns
+      WHERE job_id = ? AND turn_id = ?
+      """,
+      (job_id, turn_id),
+    ).fetchone()
+    if root is None:
+      raise RootTurnRecordError("missing_root_turn")
+    if root["tenant_storage_id"] != tenant_storage_id:
+      raise RootTurnRecordError("tenant_mismatch")
+    binding = conn.execute(
+      """
+      SELECT nonce, tenant_storage_id FROM approval_executable_bindings
+      WHERE job_id = ? AND tool_call_id = ?
+      """,
+      (job_id, tool_call_id),
+    ).fetchone()
+    if binding is None:
+      request = conn.execute(
+        """
+        SELECT approval_id FROM approval_requests
+        WHERE session_id = ? AND tool_call_id = ? AND user_id = ?
+        """,
+        (job_id, tool_call_id, tenant_storage_id),
+      ).fetchone()
+      if request is None:
+        raise ApprovalExecutableBindingError("missing_binding")
+    else:
+      if binding["tenant_storage_id"] != tenant_storage_id:
+        raise ApprovalExecutableBindingError("tenant_mismatch")
+      if binding["nonce"] != nonce:
+        raise ApprovalExecutableBindingError("nonce_mismatch")
+    # Root turns share a job: a captured call's current nonce belongs to
+    # exactly one turn. A nonce superseded under an earlier policy generation
+    # stays on the turn that issued it.
+    held_nonce = binding["nonce"] if binding is not None else None
+    linked = conn.execute(
+      """
+      SELECT root.turn_id FROM approval_root_turns AS root,
+        json_each(root.executable_refs_json) AS ref
+      WHERE root.job_id = ? AND json_extract(ref.value, '$.tool_call_id') = ?
+        AND (? IS NULL OR json_extract(ref.value, '$.nonce') = ?)
+      """,
+      (job_id, tool_call_id, held_nonce, held_nonce),
+    ).fetchall()
+    if any(row["turn_id"] != turn_id for row in linked):
+      raise RootTurnRecordError("turn_link_mismatch")
+    ref = {"tool_call_id": tool_call_id, "nonce": nonce}
+    refs = _rows.identity_json_loads(root["executable_refs_json"])
+    if ref not in refs:
+      refs.append(ref)
+      conn.execute(
+        """
+        UPDATE approval_root_turns SET executable_refs_json = ?
+        WHERE job_id = ? AND turn_id = ?
+        """,
+        (_rows.identity_json_dumps(refs), job_id, turn_id),
+      )
 
   async def locate_request(
     self,
@@ -2352,6 +2507,28 @@ class SQLiteApprovalStore:
           conn, approval_id=approval_id, tenant_storage_id=tenant_storage_id,
         )
     return self._request_locator_from_row(row) if row is not None else None
+
+  async def list_parked_requests(self, tenant_storage_id: str) -> list[ApprovalRequest]:
+    """List a tenant's parked requests: `pending_user` with an unclaimed binding.
+
+    A parked request outlives its live session, so the owner finds it here and
+    decides it by approval_id. Pure read; the projection never carries the
+    binding's nonce or prepared operands.
+    """
+    with self._connection() as conn:
+      rows = conn.execute(
+        """
+        SELECT request.* FROM approval_requests AS request
+        JOIN approval_executable_bindings AS binding
+          ON binding.approval_id = request.approval_id
+        WHERE binding.tenant_storage_id = ?
+          AND binding.execution_state = 'unclaimed'
+          AND request.state = 'pending_user'
+        ORDER BY request.requested_at, request.approval_id
+        """,
+        (tenant_storage_id,),
+      ).fetchall()
+    return [self._row_to_request_with_projection(row) for row in rows]
 
   async def _locate_request_for_decision(
     self,
@@ -2390,6 +2567,8 @@ class SQLiteApprovalStore:
     tool_call_id: str | None = None,
     nonce: str | None = None,
   ) -> sqlite3.Row | None:
+    # An unbound request never claims a root ref whose nonce another approval's
+    # binding holds: a superseded request keeps only the turn that issued it.
     rows = conn.execute(
       """
       SELECT request.*, binding.approval_id AS binding_approval_id,
@@ -2408,13 +2587,23 @@ class SQLiteApprovalStore:
         AND EXISTS (
           SELECT 1 FROM json_each(root.executable_refs_json) AS root_ref
           WHERE json_extract(root_ref.value, '$.tool_call_id') = request.tool_call_id
-            AND (binding.approval_id IS NULL
-              OR json_extract(root_ref.value, '$.nonce') = binding.nonce)
+            AND CASE WHEN binding.approval_id IS NULL
+              THEN NOT EXISTS (
+                SELECT 1 FROM approval_executable_bindings AS held
+                WHERE held.job_id = root.job_id AND held.tool_call_id = request.tool_call_id
+                  AND held.nonce = json_extract(root_ref.value, '$.nonce')
+              )
+              ELSE json_extract(root_ref.value, '$.nonce') = binding.nonce END
         )
       LEFT JOIN json_each(root.executable_refs_json) AS ref
         ON json_extract(ref.value, '$.tool_call_id') = request.tool_call_id
-          AND (binding.approval_id IS NULL
-            OR json_extract(ref.value, '$.nonce') = binding.nonce)
+          AND CASE WHEN binding.approval_id IS NULL
+            THEN NOT EXISTS (
+              SELECT 1 FROM approval_executable_bindings AS held
+              WHERE held.job_id = root.job_id AND held.tool_call_id = request.tool_call_id
+                AND held.nonce = json_extract(ref.value, '$.nonce')
+            )
+            ELSE json_extract(ref.value, '$.nonce') = binding.nonce END
       WHERE request.user_id = ?
         AND (? IS NULL OR request.approval_id = ?)
         AND (? IS NULL OR request.tool_call_id = ?)
@@ -2488,9 +2677,32 @@ class SQLiteApprovalStore:
               SELECT 1 FROM approval_executable_bindings AS binding
               WHERE binding.approval_id = request.approval_id
             )
+            AND NOT EXISTS (
+              SELECT 1 FROM approval_executable_bindings AS held
+              WHERE held.job_id = root.job_id AND held.tool_call_id = request.tool_call_id
+                AND held.nonce = json_extract(ref.value, '$.nonce')
+            )
           """,
           (approval_id, tenant_storage_id, approval_id, tenant_storage_id),
         ).fetchall()
+        if not rows:
+          mismatched = conn.execute(
+            """
+            SELECT 1 FROM approval_requests AS request
+            JOIN approval_root_turns AS root
+              ON root.job_id = COALESCE(
+                (SELECT binding.job_id FROM approval_executable_bindings AS binding
+                 WHERE binding.approval_id = request.approval_id),
+                request.session_id
+              )
+            JOIN json_each(root.executable_refs_json) AS ref
+              ON json_extract(ref.value, '$.tool_call_id') = request.tool_call_id
+            WHERE request.approval_id = ? AND root.tenant_storage_id != ?
+            """,
+            (approval_id, tenant_storage_id),
+          ).fetchone()
+          if mismatched is not None:
+            raise RootTurnRecordError("tenant_mismatch")
     if not rows:
       return None
     if len(rows) != 1:
@@ -2517,37 +2729,19 @@ class SQLiteApprovalStore:
     generation. Credentials themselves never enter this private table.
     """
 
-    metadata = {
-      "approval_id": approval_id,
-      "job_id": job_id,
-      "tool_call_id": tool_call_id,
-      "nonce": nonce,
-      "tenant_storage_id": tenant_storage_id,
-      "tool_name": tool_name,
-      "exact_backend": prepared_call.exact_backend,
-      "credential_generation_ref": credential_generation_ref,
-    }
-    if any(
-      type(metadata[key]) is not str or not metadata[key]
-      for key in (
-        "approval_id", "job_id", "tool_call_id", "nonce",
-        "tenant_storage_id", "tool_name",
+    metadata, prepared_input, prepared_input_json, context, dispatch_context_json = (
+      _executable_binding_payload(
+        approval_id=approval_id,
+        job_id=job_id,
+        tool_call_id=tool_call_id,
+        nonce=nonce,
+        tenant_storage_id=tenant_storage_id,
+        tool_name=tool_name,
+        prepared_call=prepared_call,
+        dispatch_context=dispatch_context,
+        credential_generation_ref=credential_generation_ref,
       )
-    ):
-      raise ApprovalExecutableBindingError("call_identity_mismatch")
-    if credential_generation_ref is not None and (
-      type(credential_generation_ref) is not str or not credential_generation_ref
-    ):
-      raise ApprovalExecutableBindingError("call_identity_mismatch")
-    try:
-      prepared_input = prepared_call.materialize_input()
-      prepared_input_json = _rows.identity_json_dumps(prepared_input)
-      context = CanonicalPreparedToolCall(
-        prepared_input=dispatch_context,
-      ).materialize_input()
-      dispatch_context_json = _rows.identity_json_dumps(context)
-    except (TypeError, ValueError):
-      raise ApprovalExecutableBindingError("operand_mismatch") from None
+    )
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -2603,26 +2797,329 @@ class SQLiteApprovalStore:
           ):
             raise ApprovalExecutableBindingError("operand_mismatch")
         else:
-          conn.execute(
-            """
-            INSERT INTO approval_executable_bindings (
-              approval_id, job_id, tool_call_id, nonce, tenant_storage_id,
-              tool_name, prepared_input_json, dispatch_context_json, exact_backend,
-              credential_generation_ref, request_args_hash, operand_digest
-            ) VALUES (
-              :approval_id, :job_id, :tool_call_id, :nonce, :tenant_storage_id,
-              :tool_name, :prepared_input_json, :dispatch_context_json, :exact_backend,
-              :credential_generation_ref, :request_args_hash, :operand_digest
-            )
-            """,
-            {
-              **metadata,
-              "prepared_input_json": prepared_input_json,
-              "dispatch_context_json": dispatch_context_json,
-              "operand_digest": operand_digest,
-            },
+          _insert_executable_binding(
+            conn, metadata, prepared_input_json, dispatch_context_json, operand_digest,
           )
         conn.commit()
+
+  async def park_executable_binding(
+    self,
+    *,
+    approval_id: str,
+    job_id: str,
+    tool_call_id: str,
+    nonce: str,
+    tenant_storage_id: str,
+    tool_name: str,
+    prepared_call: CanonicalPreparedToolCall,
+    dispatch_context: Mapping[str, object],
+    credential_generation_ref: str | None,
+    policy_generation_ref: str | None = None,
+  ) -> str:
+    """Bind the call a park is about to publish; return the nonce it publishes.
+
+    A first park records ``nonce``. A re-park keeps one binding per approval and
+    per ``(job_id, tool_call_id)``: a call already bound keeps its nonce, and an
+    approval still awaiting its decision whose bound call never executed moves to
+    the call now pending, its request's tool-call ID with it. A call bound to an
+    approval that was denied or expired without executing is bound to the new
+    approval. A call bound to an undecided or approved approval whose call never
+    executed and whose linked root turn was admitted under a generation other
+    than ``policy_generation_ref`` (the generation the new approval is issued
+    under) is superseded: in this one transaction the binding moves to the new
+    approval with ``nonce``, never the superseded one's, and the predecessor
+    expires. Any other existing binding refuses, as in
+    ``record_executable_binding``.
+    """
+
+    payload = _executable_binding_payload(
+      approval_id=approval_id,
+      job_id=job_id,
+      tool_call_id=tool_call_id,
+      nonce=nonce,
+      tenant_storage_id=tenant_storage_id,
+      tool_name=tool_name,
+      prepared_call=prepared_call,
+      dispatch_context=dispatch_context,
+      credential_generation_ref=credential_generation_ref,
+    )
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        published, expired = self._park_executable_binding_locked(
+          conn, payload, policy_generation_ref=policy_generation_ref,
+        )
+        conn.commit()
+    for predecessor_request in expired:
+      await self._emit(self._event_type_for_state(predecessor_request.state), predecessor_request)
+    return published
+
+  def _park_executable_binding_locked(
+    self,
+    conn: sqlite3.Connection,
+    payload: tuple[dict[str, Any], Any, str, Any, str],
+    *,
+    policy_generation_ref: str | None,
+  ) -> tuple[str, list[ApprovalRequest]]:
+    """``park_executable_binding``'s transaction body: the published nonce and expired predecessors."""
+    metadata, prepared_input, prepared_input_json, context, dispatch_context_json = payload
+    approval_id, job_id, tool_call_id = metadata["approval_id"], metadata["job_id"], metadata["tool_call_id"]
+    tenant_storage_id, tool_name = metadata["tenant_storage_id"], metadata["tool_name"]
+    request_row = conn.execute(
+      "SELECT * FROM approval_requests WHERE approval_id = ?",
+      (approval_id,),
+    ).fetchone()
+    if request_row is None:
+      raise ApprovalExecutableBindingError("missing_binding")
+    request = self._row_to_request(request_row)
+    undecided = request.state in {"created", "pending_user"}
+    existing = conn.execute(
+      """
+      SELECT binding.approval_id, binding.job_id, binding.tool_call_id,
+        binding.nonce, binding.tenant_storage_id, binding.tool_name,
+        binding.execution_state, request.state AS approval_state
+      FROM approval_executable_bindings AS binding
+      JOIN approval_requests AS request
+        ON request.approval_id = binding.approval_id
+      WHERE binding.approval_id = ?
+        OR (binding.job_id = ? AND binding.tool_call_id = ?)
+      """,
+      (approval_id, job_id, tool_call_id),
+    ).fetchall()
+    superseded: list[str] = []
+    for row in existing:
+      if row["tenant_storage_id"] != tenant_storage_id:
+        raise ApprovalExecutableBindingError("tenant_mismatch")
+      if row["tool_name"] != tool_name or row["execution_state"] != "unclaimed":
+        raise ApprovalExecutableBindingError("call_identity_mismatch")
+      if row["approval_id"] == approval_id:
+        if not undecided:
+          raise ApprovalExecutableBindingError("call_identity_mismatch")
+      elif (
+        policy_generation_ref is not None
+        and row["approval_state"] in {"created", "pending_user", "approved"}
+        and self._linked_root_generation_locked(conn, row) not in {None, policy_generation_ref}
+      ):
+        superseded.append(row["approval_id"])
+        continue
+      elif row["approval_state"] not in {"denied", "auto_denied", "expired"}:
+        raise ApprovalExecutableBindingError("call_identity_mismatch")
+      if (row["job_id"], row["tool_call_id"]) == (job_id, tool_call_id):
+        metadata["nonce"] = row["nonce"]
+    if request.tool_call_id != tool_call_id:
+      if not undecided:
+        raise ApprovalExecutableBindingError("call_identity_mismatch")
+      conn.execute(
+        "UPDATE approval_requests SET tool_call_id = ? WHERE approval_id = ?",
+        (tool_call_id, approval_id),
+      )
+      request = replace(request, tool_call_id=tool_call_id)
+    metadata["request_args_hash"] = request.args_hash
+    _verify_executable_request_identity(metadata, request)
+    operand_digest = _executable_operand_digest(
+      metadata, prepared_input, context,
+    )
+    conn.execute(
+      """
+      DELETE FROM approval_executable_bindings
+      WHERE approval_id = ? OR (job_id = ? AND tool_call_id = ?)
+      """,
+      (approval_id, job_id, tool_call_id),
+    )
+    _insert_executable_binding(
+      conn, metadata, prepared_input_json, dispatch_context_json, operand_digest,
+    )
+    expired: list[ApprovalRequest] = []
+    for predecessor_id in superseded:
+      predecessor = self._row_to_request(conn.execute(
+        "SELECT * FROM approval_requests WHERE approval_id = ?", (predecessor_id,),
+      ).fetchone())
+      expired.append(replace(
+        predecessor,
+        state="expired",
+        state_version=predecessor.state_version + 1,
+        decided_at=utc_now(),
+        decision="expired",
+        decision_reason=_REISSUED_AS + approval_id,
+      ))
+      self._write_request_transition_locked(conn, expired[-1])
+    return str(metadata["nonce"]), expired
+
+  @staticmethod
+  def _linked_root_generation_locked(conn: sqlite3.Connection, binding: sqlite3.Row) -> str | None:
+    """The policy generation of the one root turn linking this binding's nonce."""
+    rows = conn.execute(
+      """
+      SELECT root.policy_generation_ref FROM approval_root_turns AS root
+      JOIN json_each(root.executable_refs_json) AS ref
+        ON json_extract(ref.value, '$.tool_call_id') = ?
+        AND json_extract(ref.value, '$.nonce') = ?
+      WHERE root.job_id = ? AND root.tenant_storage_id = ?
+      """,
+      (binding["tool_call_id"], binding["nonce"], binding["job_id"], binding["tenant_storage_id"]),
+    ).fetchall()
+    return rows[0]["policy_generation_ref"] if len(rows) == 1 else None
+
+  async def reissue_parked_approval(
+    self,
+    *,
+    approval_id: str,
+    job_id: str,
+    tool_call_id: str,
+    nonce: str,
+    turn_id: str,
+    tenant_storage_id: str,
+    generation: PolicyGeneration,
+  ) -> tuple[ApprovalRequest, str, str, bool]:
+    """Re-issue an unexecuted parked root call under the current policy generation.
+
+    The successor is a new approval and nonce for the same captured call and
+    operands, linked from a new root-turn row admitted under ``generation``
+    with the original turn's authority; the original turn row is never
+    rewritten. One transaction creates the successor and its turn, moves the
+    binding, expires the original request and makes the successor pending, so
+    the call always has exactly one decidable approval. A decision that finds
+    the original already re-issued gets that successor back. Returns the
+    successor, the nonce it publishes, its root-turn ID and whether this call
+    created it.
+    """
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        predecessor_row = conn.execute(
+          "SELECT * FROM approval_requests WHERE approval_id = ?", (approval_id,),
+        ).fetchone()
+        if predecessor_row is None:
+          raise RootTurnRecordError("missing_root_turn")
+        request = self._row_to_request(predecessor_row)
+        if request.state == "expired":
+          issued = self._reissued_successor_locked(
+            conn, request, job_id=job_id, tool_call_id=tool_call_id,
+            tenant_storage_id=tenant_storage_id,
+          )
+          if issued is not None:
+            conn.commit()
+            return (*issued, False)
+        record_row = self._read_root_turn_row_locked(
+          conn, job_id=job_id, turn_id=turn_id, tenant_storage_id=tenant_storage_id,
+        )
+        if record_row is None:
+          raise RootTurnRecordError("missing_root_turn")
+        record = self._root_turn_record_from_row(record_row)
+        binding, _decision = self._read_executable_binding_locked(
+          conn, job_id=job_id, tool_call_id=tool_call_id, nonce=nonce,
+          tenant_storage_id=tenant_storage_id,
+        )
+        now = utc_now()
+        created = revalidate_approval_request(replace(
+          request,
+          approval_id=new_approval_id(),
+          state="created",
+          state_version=0,
+          requested_at=now,
+          decided_at=None,
+          expires_at=None,
+          decider_id=None,
+          decider_role=None,
+          decision=None,
+          decision_reason=None,
+          notification=None,
+          policy_id=generation.policy_id,
+          policy_version=generation.policy_version,
+          policy_bundle_hash=generation.policy_bundle_hash,
+        ))
+        self._insert_request(conn, created)
+        successor_turn_id = "turn:" + uuid4().hex
+        self._record_root_turn_locked(
+          conn,
+          job_id=job_id,
+          turn_id=successor_turn_id,
+          tenant_storage_id=tenant_storage_id,
+          capability_bind=_rows.identity_json_loads(record.capability_bind_json),
+          credential_generation_ref=record.credential_generation_ref,
+          effective_grant=_rows.identity_json_loads(record.effective_grant_json),
+          research_binding=_rows.identity_json_loads(record.research_binding_json),
+          selection_snapshot=_rows.identity_json_loads(record.selection_snapshot_json),
+          approval_route_kind=record.approval_route_kind,
+          policy_generation_ref=generation.generation_ref,
+          created_at=None,
+        )
+        published, expired = self._park_executable_binding_locked(
+          conn,
+          _executable_binding_payload(
+            approval_id=created.approval_id,
+            job_id=job_id,
+            tool_call_id=tool_call_id,
+            nonce=secrets.token_hex(8),
+            tenant_storage_id=tenant_storage_id,
+            tool_name=binding.tool_name,
+            prepared_call=CanonicalPreparedToolCall(
+              prepared_input=binding.prepared_input, exact_backend=binding.exact_backend,
+            ),
+            dispatch_context=binding.dispatch_context,
+            credential_generation_ref=binding.credential_generation_ref,
+          ),
+          policy_generation_ref=generation.generation_ref,
+        )
+        self._link_root_turn_executable_binding_locked(
+          conn, job_id=job_id, turn_id=successor_turn_id, tool_call_id=tool_call_id,
+          nonce=published, tenant_storage_id=tenant_storage_id,
+        )
+        parked = self._row_to_request(conn.execute(
+          "SELECT * FROM approval_requests WHERE approval_id = ?", (created.approval_id,),
+        ).fetchone())
+        successor = replace(
+          parked,
+          state="pending_user",
+          state_version=parked.state_version + 1,
+          expires_at=(
+            now + (request.expires_at - request.requested_at)
+            if request.expires_at is not None else None
+          ),
+        )
+        self._write_request_transition_locked(conn, successor)
+        conn.commit()
+    await self._emit("request_created", created)
+    for predecessor_request in expired:
+      await self._emit(self._event_type_for_state(predecessor_request.state), predecessor_request)
+    await self._emit(self._event_type_for_state(successor.state), successor)
+    return successor, published, successor_turn_id, True
+
+  def _reissued_successor_locked(
+    self,
+    conn: sqlite3.Connection,
+    predecessor: ApprovalRequest,
+    *,
+    job_id: str,
+    tool_call_id: str,
+    tenant_storage_id: str,
+  ) -> tuple[ApprovalRequest, str, str] | None:
+    """The successor a re-issue expired ``predecessor`` for: request, nonce, root turn."""
+    bound = conn.execute(
+      """
+      SELECT approval_id, nonce FROM approval_executable_bindings
+      WHERE job_id = ? AND tool_call_id = ? AND tenant_storage_id = ?
+      """,
+      (job_id, tool_call_id, tenant_storage_id),
+    ).fetchone()
+    if bound is None or predecessor.decision_reason != _REISSUED_AS + bound["approval_id"]:
+      return None
+    turns = conn.execute(
+      """
+      SELECT root.turn_id FROM approval_root_turns AS root
+      JOIN json_each(root.executable_refs_json) AS ref
+        ON json_extract(ref.value, '$.tool_call_id') = ?
+        AND json_extract(ref.value, '$.nonce') = ?
+      WHERE root.job_id = ? AND root.tenant_storage_id = ?
+      """,
+      (tool_call_id, bound["nonce"], job_id, tenant_storage_id),
+    ).fetchall()
+    if len(turns) != 1:
+      return None
+    successor = self._row_to_request(conn.execute(
+      "SELECT * FROM approval_requests WHERE approval_id = ?", (bound["approval_id"],),
+    ).fetchone())
+    return successor, str(bound["nonce"]), str(turns[0]["turn_id"])
 
   async def _read_executable_binding_for_executor(
     self,
@@ -2936,20 +3433,56 @@ class SQLiteApprovalStore:
       raise ApprovalExecutableBindingError("result_mismatch") from None
     return restored, result[1]
 
-  async def get(self, approval_id: str) -> ApprovalRequest | None:
+  async def get(
+    self,
+    approval_id: str,
+    *,
+    owner_user_id: str | tuple[str, ...] | list[str] | set[str] | None = None,
+  ) -> ApprovalRequest | None:
     with self._connection() as conn:
-      row = conn.execute(
-        "SELECT * FROM approval_requests WHERE approval_id = ?",
-        (approval_id,),
-      ).fetchone()
+      if owner_user_id is not None:
+        if isinstance(owner_user_id, str):
+          owners = (owner_user_id.strip(),)
+        else:
+          owners = tuple(str(o).strip() for o in owner_user_id if str(o).strip())
+        if not owners:
+          return None
+        placeholders = ",".join("?" for _ in owners)
+        row = conn.execute(
+          f"SELECT * FROM approval_requests WHERE approval_id = ? AND user_id IN ({placeholders})",
+          (approval_id, *owners),
+        ).fetchone()
+      else:
+        row = conn.execute(
+          "SELECT * FROM approval_requests WHERE approval_id = ?",
+          (approval_id,),
+        ).fetchone()
     return self._row_to_request_with_projection(row) if row is not None else None
 
-  async def get_by_tool_call_id(self, tool_call_id: str) -> ApprovalRequest | None:
+  async def get_by_tool_call_id(
+    self,
+    tool_call_id: str,
+    *,
+    owner_user_id: str | tuple[str, ...] | list[str] | set[str] | None = None,
+  ) -> ApprovalRequest | None:
     with self._connection() as conn:
-      row = conn.execute(
-        "SELECT * FROM approval_requests WHERE tool_call_id = ? ORDER BY requested_at DESC LIMIT 1",
-        (tool_call_id,),
-      ).fetchone()
+      if owner_user_id is not None:
+        if isinstance(owner_user_id, str):
+          owners = (owner_user_id.strip(),)
+        else:
+          owners = tuple(str(o).strip() for o in owner_user_id if str(o).strip())
+        if not owners:
+          return None
+        placeholders = ",".join("?" for _ in owners)
+        row = conn.execute(
+          f"SELECT * FROM approval_requests WHERE tool_call_id = ? AND user_id IN ({placeholders}) ORDER BY requested_at DESC LIMIT 1",
+          (tool_call_id, *owners),
+        ).fetchone()
+      else:
+        row = conn.execute(
+          "SELECT * FROM approval_requests WHERE tool_call_id = ? ORDER BY requested_at DESC LIMIT 1",
+          (tool_call_id,),
+        ).fetchone()
     return self._row_to_request_with_projection(row) if row is not None else None
 
   async def update_request(self, request: ApprovalRequest) -> ApprovalRequest:
@@ -3065,24 +3598,27 @@ class SQLiteApprovalStore:
           decision=terminal_decision,
           decision_reason=decision_reason if decision_reason is not None else current.decision_reason,
         )
-        conn.execute(
-          """
-          UPDATE approval_requests SET
-            state = :state,
-            state_version = :state_version,
-            expires_at = :expires_at,
-            decided_at = :decided_at,
-            decider_id = :decider_id,
-            decider_role = :decider_role,
-            decision = :decision,
-            decision_reason = :decision_reason
-          WHERE approval_id = :approval_id
-          """,
-          self._request_to_row(updated),
-        )
+        self._write_request_transition_locked(conn, updated)
         conn.commit()
     await self._emit(self._event_type_for_state(updated.state), updated)
     return updated
+
+  def _write_request_transition_locked(self, conn: sqlite3.Connection, updated: ApprovalRequest) -> None:
+    conn.execute(
+      """
+      UPDATE approval_requests SET
+        state = :state,
+        state_version = :state_version,
+        expires_at = :expires_at,
+        decided_at = :decided_at,
+        decider_id = :decider_id,
+        decider_role = :decider_role,
+        decision = :decision,
+        decision_reason = :decision_reason
+      WHERE approval_id = :approval_id
+      """,
+      self._request_to_row(updated),
+    )
 
   async def terminalize_pending_for_cancellation(
     self,
@@ -3414,111 +3950,73 @@ class SQLiteApprovalStore:
           conn.commit()
           return current
 
-        trusted_now_ns, trusted_now = _trusted_utc_now(conn)
-        if (
-          current.expires_at is not None
-          and trusted_now_ns >= _datetime_to_epoch_ns(current.expires_at)
-        ):
-          updated = replace(
-            current,
-            state="expired",
-            state_version=current.state_version + 1,
-            decided_at=trusted_now,
-            decision="expired",
-          )
-          cursor = conn.execute(
-            """
-            UPDATE approval_requests SET
-              state = :state,
-              state_version = :state_version,
-              decided_at = :decided_at,
-              decision = :decision
-            WHERE approval_id = :approval_id
-              AND state_version = :expected_state_version
-              AND state NOT IN (
-                'auto_approved', 'auto_denied', 'approved',
-                'denied', 'expired'
-              )
-            """,
-            {
-              **self._request_to_row(updated),
-              "expected_state_version": current.state_version,
-            },
-          )
-          if cursor.rowcount != 1:
-            conn.rollback()
-            raise RuntimeError(
-              "approval expiration compare-and-set failed"
-            )
-          terminal_event = "expired"
-        else:
-          existing = conn.execute(
-            "SELECT * FROM approval_votes WHERE approval_id = ? AND decider_id = ?",
-            (approval_id, vote.decider_id),
-          ).fetchone()
-          if existing is None:
-            conn.execute(
-              """
-              INSERT INTO approval_votes (
-                vote_id, approval_id, decider_id, decider_role, decision,
-                decision_reason, decided_at
-              ) VALUES (?, ?, ?, ?, ?, ?, ?)
-              """,
-              (
-                vote.vote_id,
-                vote.approval_id,
-                vote.decider_id,
-                vote.decider_role,
-                vote.decision,
-                vote.decision_reason,
-                _dt_to_text(vote.decided_at),
-              ),
-            )
-            emitted_vote = True
-          elif (
-            str(existing["vote_id"]) != vote.vote_id
-            or str(existing["decision"]) != vote.decision
-          ):
-            raise ValueError("approval already has a different owner decision")
-
-          terminal_state: ApprovalState = vote.decision
-          updated = replace(
-            current,
-            state=terminal_state,
-            state_version=current.state_version + 1,
-            decided_at=vote.decided_at,
-            decider_id=vote.decider_id,
-            decider_role=vote.decider_role,
-            decision=terminal_state,
-            decision_reason=vote.decision_reason,
-          )
-          terminal_event = terminal_state
-
+        existing = conn.execute(
+          "SELECT * FROM approval_votes WHERE approval_id = ? AND decider_id = ?",
+          (approval_id, vote.decider_id),
+        ).fetchone()
+        if existing is None:
           conn.execute(
             """
-            UPDATE approval_requests SET
-              state = :state,
-              state_version = :state_version,
-              decided_at = :decided_at,
-              decider_id = :decider_id,
-              decider_role = :decider_role,
-              decision = :decision,
-              decision_reason = :decision_reason
-            WHERE approval_id = :approval_id
+            INSERT INTO approval_votes (
+              vote_id, approval_id, decider_id, decider_role, decision,
+              decision_reason, decided_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            self._request_to_row(updated),
+            (
+              vote.vote_id,
+              vote.approval_id,
+              vote.decider_id,
+              vote.decider_role,
+              vote.decision,
+              vote.decision_reason,
+              _dt_to_text(vote.decided_at),
+            ),
           )
-          if (
-            normalized_delivery is not None
-            and updated.state in {"approved", "denied"}
-          ):
-            _insert_autonomous_approval_delivery_in_transaction(
-              conn,
-              request=updated,
-              delivery=normalized_delivery,
-              approved=updated.state == "approved",
-              vote=vote,
-            )
+          emitted_vote = True
+        elif (
+          str(existing["vote_id"]) != vote.vote_id
+          or str(existing["decision"]) != vote.decision
+        ):
+          raise ValueError("approval already has a different owner decision")
+
+        terminal_state: ApprovalState = vote.decision
+        updated = replace(
+          current,
+          state=terminal_state,
+          state_version=current.state_version + 1,
+          decided_at=vote.decided_at,
+          decider_id=vote.decider_id,
+          decider_role=vote.decider_role,
+          decision=terminal_state,
+          decision_reason=vote.decision_reason,
+        )
+        terminal_event = terminal_state
+
+        conn.execute(
+          """
+          UPDATE approval_requests SET
+            state = :state,
+            state_version = :state_version,
+            decided_at = :decided_at,
+            decider_id = :decider_id,
+            decider_role = :decider_role,
+            decision = :decision,
+            decision_reason = :decision_reason
+          WHERE approval_id = :approval_id
+          """,
+          self._request_to_row(updated),
+        )
+        if (
+          normalized_delivery is not None
+          and updated.state in {"approved", "denied"}
+        ):
+          _insert_autonomous_approval_delivery_in_transaction(
+            conn,
+            request=updated,
+            delivery=normalized_delivery,
+            approved=updated.state == "approved",
+            vote=vote,
+          )
         conn.commit()
     if (
       normalized_delivery is not None
@@ -3538,10 +4036,7 @@ class SQLiteApprovalStore:
     if emitted_vote:
       await self._emit("vote_recorded", updated, vote=vote)
     if terminal_event is not None:
-      if terminal_event == "expired":
-        await self._emit(terminal_event, updated)
-      else:
-        await self._emit(terminal_event, updated, vote=vote)
+      await self._emit(terminal_event, updated, vote=vote)
     return updated
 
   async def ensure_autonomous_approval_delivery_audited(
@@ -4889,51 +5384,6 @@ class SQLiteApprovalStore:
         )
         conn.commit()
 
-  def _expire_pending_requests_in_transaction(
-    self,
-    conn: sqlite3.Connection,
-    *,
-    now: datetime,
-  ) -> list[ApprovalRequest]:
-    rows = conn.execute(
-      """
-      SELECT * FROM approval_requests
-      WHERE state = 'pending_user'
-        AND expires_at IS NOT NULL
-        AND expires_at <= ?
-      """,
-      (_dt_to_text(now),),
-    ).fetchall()
-    expired: list[ApprovalRequest] = []
-    for row in rows:
-      current = self._row_to_request(row)
-      updated = replace(
-        current,
-        state="expired",
-        state_version=current.state_version + 1,
-        decided_at=now,
-        decision="expired",
-      )
-      cursor = conn.execute(
-        """
-        UPDATE approval_requests SET
-          state = :state,
-          state_version = :state_version,
-          decided_at = :decided_at,
-          decision = :decision
-        WHERE approval_id = :approval_id
-          AND state = 'pending_user'
-          AND state_version = :expected_state_version
-        """,
-        {
-          **self._request_to_row(updated),
-          "expected_state_version": current.state_version,
-        },
-      )
-      if cursor.rowcount == 1:
-        expired.append(updated)
-    return expired
-
   @staticmethod
   def _prepared_cursor_for_record(
     record: _prepared_bm.PreparedBusinessModelChange,
@@ -4992,40 +5442,9 @@ class SQLiteApprovalStore:
     conn: sqlite3.Connection,
     *,
     record: _prepared_bm.PreparedBusinessModelChange,
-    now: datetime,
   ) -> TargetedPreparedReconciliationResult:
     if record.lifecycle is not _prepared_bm.PreparedBusinessModelLifecycle.PENDING:
       return TargetedPreparedReconciliationResult(record=record)
-
-    if record.expires_at is not None:
-      expires_at = _prepared_bm._parse_timestamp(record.expires_at, "expires_at")
-      if expires_at <= now.astimezone(UTC):
-        try:
-          expired = _prepared_bm.transition(
-            conn,
-            caller_kind=record.caller_kind,
-            user_scope=record.user_scope,
-            idempotency_locator=record.idempotency_locator,
-            expected=_prepared_bm.PreparedBusinessModelLifecycle.PENDING,
-            target=_prepared_bm.PreparedBusinessModelLifecycle.EXPIRED,
-            approval_id=record.approval_id,
-            approval_chain_id=record.approval_chain_id,
-          )
-        except _prepared_bm.PreparedBusinessModelError:
-          current = _prepared_bm.get(
-            conn,
-            caller_kind=record.caller_kind,
-            user_scope=record.user_scope,
-            idempotency_locator=record.idempotency_locator,
-          )
-          return TargetedPreparedReconciliationResult(
-            record=current,
-            conflict=PreparedReconciliationConflict.CAS_CONFLICT,
-          )
-        return TargetedPreparedReconciliationResult(
-          record=expired,
-          transitioned=True,
-        )
 
     approval_row = conn.execute(
       "SELECT approval_id, approval_chain_id, state FROM approval_requests WHERE approval_id = ?",
@@ -5089,7 +5508,6 @@ class SQLiteApprovalStore:
     self,
     conn: sqlite3.Connection,
     *,
-    now: datetime,
     cursor: PreparedReconciliationCursor | None,
     page_size: int,
   ) -> PreparedReconciliationResult:
@@ -5128,7 +5546,6 @@ class SQLiteApprovalStore:
       item = self._reconcile_prepared_record_in_transaction(
         conn,
         record=record,
-        now=now,
       )
       if item.conflict is not None:
         counts[item.conflict.value] += 1
@@ -5146,46 +5563,22 @@ class SQLiteApprovalStore:
       **counts,
     )
 
-  async def expire_pending(self, *, now: datetime | None = None) -> int:
-    now_value = now or utc_now()
-    async with self._lock:
-      with self._connection() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        expired = self._expire_pending_requests_in_transaction(
-          conn,
-          now=now_value,
-        )
-        conn.commit()
-    for request in expired:
-      await self._emit("expired", request)
-    return len(expired)
-
   async def maintain_pending(
     self,
     *,
-    now: datetime | None = None,
     prepared_cursor: PreparedReconciliationCursor | None = None,
     prepared_page_size: int = 100,
   ) -> ApprovalMaintenanceResult:
-    now_value = now or utc_now()
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        expired = self._expire_pending_requests_in_transaction(
-          conn,
-          now=now_value,
-        )
         prepared = self._reconcile_prepared_page_in_transaction(
           conn,
-          now=now_value,
           cursor=prepared_cursor,
           page_size=prepared_page_size,
         )
         conn.commit()
-    for request in expired:
-      await self._emit("expired", request)
     return ApprovalMaintenanceResult(
-      approvals_expired=len(expired),
       prepared=prepared,
     )
 
@@ -5195,9 +5588,7 @@ class SQLiteApprovalStore:
     caller_kind: str,
     user_scope: str,
     idempotency_locator: str,
-    now: datetime | None = None,
   ) -> TargetedPreparedReconciliationResult:
-    now_value = now or utc_now()
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -5213,7 +5604,6 @@ class SQLiteApprovalStore:
         result = self._reconcile_prepared_record_in_transaction(
           conn,
           record=record,
-          now=now_value,
         )
         conn.commit()
         return result
@@ -5611,14 +6001,6 @@ class SQLiteApprovalStore:
         conn.commit()
         return record
 
-  async def expire_prepared_business_model_changes(self, *, now: str) -> int:
-    async with self._lock:
-      with self._connection() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        count = _prepared_bm.expire_pending(conn, now=now)
-        conn.commit()
-        return count
-
   async def resolve_raw_patch_authorization_reference(
     self,
     reference: str,
@@ -5667,7 +6049,6 @@ class SQLiteApprovalStore:
           reviewed_change_binding_digest=reviewed_change_binding_digest,
           execution_semantics_digest=execution_semantics_digest,
           prepared_payload_digest=prepared_payload_digest,
-          require_unexpired=False,
         )
         claim = _raw_patch_auth.get_claim(conn, approval_id=approval_id)
         if (
@@ -5732,7 +6113,6 @@ class SQLiteApprovalStore:
           reviewed_change_binding_digest=reviewed_change_binding_digest,
           execution_semantics_digest=execution_semantics_digest,
           prepared_payload_digest=prepared_payload_digest,
-          require_unexpired=True,
         )
         claim, _created = _raw_patch_auth.claim(
           conn,
@@ -5783,7 +6163,6 @@ class SQLiteApprovalStore:
           reviewed_change_binding_digest=reviewed_change_binding_digest,
           execution_semantics_digest=execution_semantics_digest,
           prepared_payload_digest=prepared_payload_digest,
-          require_unexpired=False,
         )
         _raw_patch_auth.release_claim(
           conn,
@@ -5829,7 +6208,6 @@ class SQLiteApprovalStore:
     reviewed_change_binding_digest: str,
     execution_semantics_digest: str,
     prepared_payload_digest: str,
-    require_unexpired: bool,
   ) -> None:
     row = conn.execute(
       "SELECT * FROM approval_requests WHERE approval_id = ?",
@@ -5867,14 +6245,6 @@ class SQLiteApprovalStore:
     ):
       raise _raw_patch_auth.RawPatchAuthorizationError(
         "approval outcome is not executable for raw patch execution"
-      )
-    if (
-      require_unexpired
-      and request.expires_at is not None
-      and request.expires_at <= datetime.now(UTC)
-    ):
-      raise _raw_patch_auth.RawPatchAuthorizationError(
-        "approval expired before raw patch execution"
       )
     prepared = _raw_patch_auth.get_prepared(conn, approval_id=approval_id)
     if (
@@ -5943,7 +6313,7 @@ class SQLiteApprovalStore:
     return _rows.row_to_delegation_grant(row)
 
 
-async def expire_pending_loop(store: ApprovalRequestStore, *, interval_seconds: float = 30.0) -> None:
+async def maintain_pending_loop(store: ApprovalRequestStore, *, interval_seconds: float = 30.0) -> None:
   prepared_cursor: PreparedReconciliationCursor | None = None
   while True:
     await asyncio.sleep(interval_seconds)
@@ -5952,7 +6322,6 @@ async def expire_pending_loop(store: ApprovalRequestStore, *, interval_seconds: 
     )
     prepared_cursor = result.prepared.cursor
     fields = {
-      "approvals_expired": result.approvals_expired,
       "prepared_scanned": result.prepared.scanned,
       "prepared_authorized": result.prepared.authorized,
       "prepared_denied": result.prepared.denied,

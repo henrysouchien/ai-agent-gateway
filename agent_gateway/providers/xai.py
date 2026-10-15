@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Mapping
 from weakref import WeakKeyDictionary
 
 import httpx
@@ -10,6 +10,8 @@ import httpx
 from model_authority.registry import AdapterRouteSupport
 from model_authority.rates import RateTable
 from model_authority.thinking import EffortResolution, ThinkingLevel
+from ..auth import ProviderCredentialFailure
+from .credential_pool import rotate_provider_credential
 from .base import (
   ModelInfo, ModelProvider, StreamEvent, _is_context_length_exception,
   authority_rate_table,
@@ -376,6 +378,18 @@ class XAIProvider(ModelProvider):
 
   def is_context_length_error(self, exc: Exception) -> bool:
     return _is_context_length_exception(exc)
+
+  def next_credential(
+    self,
+    config: Mapping[str, Any],
+    failure: ProviderCredentialFailure,
+  ) -> dict[str, Any] | None:
+    from . import xai_oauth  # noqa: F401
+
+    return rotate_provider_credential(
+      self.name, config, failure_kind=failure.kind,
+      reset_at=failure.reset_at, status_code=failure.status_code,
+    )
 
 
 __all__ = ["XAIProvider"]

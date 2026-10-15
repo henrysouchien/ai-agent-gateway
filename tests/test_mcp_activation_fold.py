@@ -31,10 +31,12 @@ class _Profile:
     self,
     *,
     core_mcp_tools=None,
+    mcp_tool_ceilings=None,
     unscoped_active_mcp_servers=frozenset(),
     denied_mcp_servers=frozenset(),
   ) -> None:
     self.core_mcp_tools = core_mcp_tools or {}
+    self.mcp_tool_ceilings = mcp_tool_ceilings or {}
     self.unscoped_active_mcp_servers = unscoped_active_mcp_servers
     self.denied_mcp_servers = denied_mcp_servers
 
@@ -203,3 +205,40 @@ def test_an_unscoped_active_server_defers_nothing() -> None:
     {"get_positions", "get_returns"}
   )
   assert "get_returns" not in surface.deferred_mcp_tools
+
+
+def test_a_registered_ceiling_bounds_every_grant_on_every_route() -> None:
+  # The invite ceiling: a profile that may reach only `get_current_model` on
+  # the portfolio server keeps that bound whether a load grant names other
+  # tools, or a run_agent activation takes the whole server. Default-visible
+  # (`core_mcp_tools`) is a different fact and grants still widen it.
+  catalog = {
+    "portfolio-reads-mcp": {"tools": ["get_current_model", "get_positions", "execute_trade"]},
+    "market-data-mcp": {"tools": ["screen_stocks", "compare_peers"]},
+  }
+  profile = _Profile(
+    core_mcp_tools={"portfolio-reads-mcp": {"get_current_model"}, "market-data-mcp": set()},
+    mcp_tool_ceilings={"portfolio-reads-mcp": {"get_current_model"}},
+  )
+  fold = McpActivationFold()
+  fold.record("portfolio-reads-mcp", tools=["execute_trade", "get_positions"], source="load_tools")
+  fold.record("market-data-mcp", tools=["screen_stocks"], source="load_tools")
+
+  surface = derive_live_surface(profile=profile, server_catalog=catalog, activation_fold=fold)
+
+  assert surface.allowed_mcp_tools_by_server == {
+    "portfolio-reads-mcp": frozenset({"get_current_model"}),
+    "market-data-mcp": frozenset({"screen_stocks"}),
+  }
+  # The load grant widened nothing past the ceiling; the granted names are
+  # visible (a granted name is never deferred) but ceilinged out of allowed,
+  # so the dispatcher refuses them even though the prompt may mention them.
+  assert surface.deferred_mcp_tools == {"compare_peers"}
+  # Ungranted default-visible truth: compare_peers is catalog-only and deferred.
+  assert "compare_peers" not in surface.allowed_mcp_tools_by_server["market-data-mcp"]
+
+  fold.record("portfolio-reads-mcp", tools=None, source="run_agent")
+  surface = derive_live_surface(profile=profile, server_catalog=catalog, activation_fold=fold)
+
+  assert surface.allowed_mcp_tools_by_server["portfolio-reads-mcp"] == frozenset({"get_current_model"})
+  assert surface.deferred_mcp_tools == {"compare_peers"}

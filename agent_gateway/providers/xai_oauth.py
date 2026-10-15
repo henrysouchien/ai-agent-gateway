@@ -4,6 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import fcntl
+import hashlib
 import json
 import logging
 import math
@@ -15,6 +16,19 @@ from typing import Any, Awaitable, Callable, Mapping, TypeAlias
 from urllib.parse import urlparse
 
 import httpx
+
+from .api_key_store import resolve_api_key_store_paths
+from .credential_pool import (
+  PoolAccountCandidate,
+  _load_pool_accounts_unlocked,
+  derive_account_identity,
+  load_pool_accounts,
+  normalize_user_scope,
+  register_provider_pool_hooks,
+  resolve_provider_store_path,
+  resolve_provider_store_paths,
+  write_pool_accounts_unlocked,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -30,8 +44,17 @@ SLOW_DOWN_INCREMENT_SECONDS = 5.0
 EXPIRY_MARGIN_SECONDS = 60
 _SAVE_ATTEMPTS = 3
 _SAVE_RETRY_DELAY_SECONDS = 0.01
+# A refresh POST whose answer was lost may already have consumed the single-use
+# refresh token, so one retry on a fresh connection is allowed, but only inside
+# this many seconds of the first send: past it a hung token endpoint is a failed
+# refresh the caller surfaces (re-login), and a retry with under the minimum
+# budget left cannot complete a round trip.
 _GRACE_HARD_BUDGET_S = 5.0
 _MIN_RETRY_BUDGET_S = 1.0
+# Bounds a hung issuer endpoint (discovery, device-code, token) so a login or
+# refresh cannot wait on it for good; the device-code poll's own expiry is the
+# issuer's `expires_in`, not this.
+_HTTP_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 _PRESEND_EXC = (
   httpx.ConnectError,
   httpx.ConnectTimeout,
@@ -75,6 +98,7 @@ def resolve_xai_oauth_settings(
   config: Mapping[str, Any] | None = None,
   *,
   environ: Mapping[str, str] | None = None,
+  user_scope: Any = None,
 ) -> XAIOAuthSettings:
   cfg = config or {}
   env = os.environ if environ is None else environ
@@ -86,17 +110,52 @@ def resolve_xai_oauth_settings(
     or env.get("XAI_OAUTH_DISCOVERY_URL")
     or f"{issuer}/.well-known/openid-configuration"
   ).strip()
-  raw_store = str(cfg.get("auth_store_path") or env.get("XAI_AUTH_STORE_PATH") or "").strip()
-  if raw_store:
-    store_path = Path(raw_store).expanduser()
-  else:
-    user_data = str(env.get("USER_DATA_DIR") or "").strip()
-    base = Path(user_data).expanduser() if user_data else Path.home() / ".agent_gateway"
-    store_path = base / "xai" / "oauth.json"
+  store_path = resolve_provider_store_path(
+    "xai", "oauth.json", cfg, environ=env, user_scope=user_scope,
+    override_config_keys=("auth_store_path",), override_env_vars=("XAI_AUTH_STORE_PATH",),
+  )
   if not issuer or not client_id or not scope:
     raise ValueError("xAI OAuth issuer, client ID, and scopes must not be blank")
   _require_trusted_endpoint(discovery_url, issuer=issuer, label="discovery URL")
   return XAIOAuthSettings(issuer, client_id, scope, discovery_url, store_path)
+
+
+def resolve_xai_store_paths(
+  config: Mapping[str, Any] | None = None,
+  *,
+  environ: Mapping[str, str] | None = None,
+  user_scope: Any = None,
+) -> tuple[Path | None, Path]:
+  return resolve_provider_store_paths(
+    "xai", "oauth.json", config, environ=environ, user_scope=user_scope,
+    override_config_keys=("auth_store_path",), override_env_vars=("XAI_AUTH_STORE_PATH",),
+  )
+
+
+def load_xai_accounts(path: Path) -> list[dict[str, Any]]:
+  return load_pool_accounts(
+    path, default_prefix="xai", required_any_keys=("refresh_token", "access_token"), strict=True,
+  )
+
+
+def _selected_xai_record(
+  stored: Mapping[str, Any] | None, identity: str,
+) -> dict[str, Any] | None:
+  if stored is None:
+    return None
+  accounts = stored.get("accounts")
+  if isinstance(accounts, list):
+    if identity:
+      return next(
+        (dict(account) for account in accounts
+         if isinstance(account, Mapping) and str(account.get("identity") or "") == identity),
+        None,
+      )
+    # No bound identity: the first account is the seat a fresh read serves. Its
+    # sibling's fields (a quarantine marker, another refresh grant) never bleed in.
+    first = next((account for account in accounts if isinstance(account, Mapping)), None)
+    return dict(first) if first is not None else None
+  return dict(stored)
 
 
 def resolve_xai_auth_mode(
@@ -115,7 +174,7 @@ def resolve_xai_auth_mode(
   return "oauth" if record and str(record.get("refresh_token") or "").strip() else "api"
 
 
-def load_xai_token_record(path: Path) -> XAIOAuthTokenRecord | None:
+def _load_xai_raw_store(path: Path) -> dict[str, Any] | None:
   try:
     raw = path.read_text(encoding="utf-8")
   except FileNotFoundError:
@@ -131,11 +190,69 @@ def load_xai_token_record(path: Path) -> XAIOAuthTokenRecord | None:
   return dict(parsed)
 
 
+def load_xai_token_record(path: Path) -> XAIOAuthTokenRecord | None:
+  parsed = _load_xai_raw_store(path)
+  if parsed is None:
+    return None
+  if isinstance(parsed.get("accounts"), list):
+    return {
+      key: value
+      for key, value in parsed.items()
+      if key not in {"accounts", "version", "identity"}
+    }
+  return parsed
+
+
+def upsert_xai_token_record(path: Path, record: Mapping[str, Any]) -> list[dict[str, Any]]:
+  required = ("access_token", "refresh_token", "expires_at", "scope", "issuer", "client_id")
+  missing = [key for key in required if record.get(key) in {None, ""}]
+  if missing:
+    raise ValueError(f"xAI OAuth token record is missing: {', '.join(missing)}")
+  accounts = _load_pool_accounts_unlocked(
+    path, default_prefix="xai", required_any_keys=("refresh_token", "access_token"),
+  )
+  entry = {key: value for key, value in record.items() if key not in {"accounts", "version"}}
+  entry["identity"] = derive_account_identity(entry, prefix="xai")
+  for index, existing in enumerate(accounts):
+    if existing["identity"] == entry["identity"]:
+      accounts[index] = entry
+      break
+  else:
+    accounts.append(entry)
+  write_pool_accounts_unlocked(path, accounts, extra_top_level=entry)
+  return accounts
+
+
 def save_xai_token_record(path: Path, record: Mapping[str, Any]) -> None:
   required = ("access_token", "refresh_token", "expires_at", "scope", "issuer", "client_id")
   missing = [key for key in required if record.get(key) in {None, ""}]
   if missing:
     raise ValueError(f"xAI OAuth token record is missing: {', '.join(missing)}")
+  existing_raw = _load_xai_raw_store(path) if path.exists() else None
+  if record.get("identity"):
+    upsert_xai_token_record(path, record)
+    return
+  if isinstance((existing_raw or {}).get("accounts"), list):
+    accounts = _load_pool_accounts_unlocked(
+      path, default_prefix="xai", required_any_keys=("refresh_token", "access_token"),
+    )
+    entry = {key: value for key, value in record.items() if key not in {"accounts", "version"}}
+    target_idx = next(
+      (
+        i for i, acc in enumerate(accounts)
+        if acc.get("refresh_token") == entry.get("refresh_token")
+        or acc.get("refresh_pending") is True
+      ),
+      0 if accounts else None,
+    )
+    if target_idx is not None and target_idx < len(accounts):
+      entry["identity"] = accounts[target_idx]["identity"]
+      accounts[target_idx] = entry
+    else:
+      entry["identity"] = derive_account_identity(entry, prefix="xai")
+      accounts.append(entry)
+    write_pool_accounts_unlocked(path, accounts, extra_top_level=entry)
+    return
   path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
   try:
     path.parent.chmod(0o700)
@@ -153,20 +270,16 @@ def save_xai_token_record(path: Path, record: Mapping[str, Any]) -> None:
     os.chmod(temp_path, 0o600)
     os.replace(temp_path, path)
     os.chmod(path, 0o600)
+    directory_fd = os.open(path.parent, os.O_RDONLY)
     try:
-      directory_fd = os.open(path.parent, os.O_RDONLY)
-      try:
-        os.fsync(directory_fd)
-      finally:
-        os.close(directory_fd)
-    except OSError:
-      pass
+      os.fsync(directory_fd)
+    finally:
+      os.close(directory_fd)
   finally:
     try:
       temp_path.unlink()
     except FileNotFoundError:
       pass
-
 
 def _save_token_record_durable(
   path: Path,
@@ -228,7 +341,10 @@ async def _store_lock(store_path: Path):
     canonical_store.parent.chmod(0o700)
   except OSError:
     pass
-  lock_path = Path(f"{canonical_store}.lock")
+  # Same lockfile convention as credential_pool.store_write_lock, so removal,
+  # enrollment and refresh serialize on the store: `.oauth.json.lock`, not
+  # `oauth.json.lock`.
+  lock_path = canonical_store.with_name(f".{canonical_store.name}.lock")
   flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
   fd = os.open(lock_path, flags, 0o600)
   acquired = False
@@ -282,7 +398,8 @@ def oauth_record_from_config(
   cfg = config or {}
   env = os.environ if environ is None else environ
   settings = resolve_xai_oauth_settings(cfg, environ=env)
-  stored = load_xai_token_record(settings.store_path) or {}
+  identity = str(cfg.get("account_identity") or "").strip()
+  stored = _selected_xai_record(_load_xai_raw_store(settings.store_path), identity) or {}
   access_token = str(cfg.get("auth_token") or env.get("XAI_AUTH_TOKEN") or stored.get("access_token") or "").strip()
   refresh_token = str(cfg.get("refresh_token") or env.get("XAI_REFRESH_TOKEN") or stored.get("refresh_token") or "").strip()
   record = {
@@ -294,6 +411,8 @@ def oauth_record_from_config(
     "issuer": str(stored.get("issuer") or settings.issuer),
     "client_id": str(stored.get("client_id") or settings.client_id),
   }
+  if identity:
+    record["identity"] = identity
   try:
     raw_expires = record["expires_at"]
     record["expires_at"] = float(raw_expires) if raw_expires not in {None, ""} else 0.0
@@ -409,7 +528,7 @@ async def login_xai_device_code(
 ) -> tuple[dict[str, Any], Path]:
   settings = resolve_xai_oauth_settings(config)
   owns_client = client is None
-  oauth_client = client or httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0))
+  oauth_client = client or httpx.AsyncClient(timeout=_HTTP_TIMEOUT)
   try:
     discovery = await discover_xai_oauth(oauth_client, settings)
     device = await request_xai_device_code(oauth_client, settings, discovery["device_authorization_endpoint"])
@@ -420,7 +539,7 @@ async def login_xai_device_code(
     record = await poll_xai_device_token(oauth_client, settings, discovery["token_endpoint"], device)
     record["device_authorization_endpoint"] = discovery["device_authorization_endpoint"]
     async with _store_lock(settings.store_path):
-      save_xai_token_record(settings.store_path, record)
+      upsert_xai_token_record(settings.store_path, record)
     return record, settings.store_path
   finally:
     if owns_client:
@@ -471,7 +590,8 @@ async def _locked_refresh(
 ) -> dict[str, Any]:
   async with _store_lock(settings.store_path):
     canonical_path = os.path.realpath(settings.store_path.expanduser())
-    on_disk = load_xai_token_record(settings.store_path)
+    identity = str(record.get("identity") or record.get("account_identity") or "").strip()
+    on_disk = _selected_xai_record(_load_xai_raw_store(settings.store_path), identity)
     if on_disk is None:
       if canonical_path in _STORE_REFRESH_CONSUMED or xai_record_requires_reauth(record):
         raise RuntimeError(_REAUTH_REQUIRED_MESSAGE)
@@ -494,9 +614,11 @@ async def _locked_refresh(
         "`python3 -m agent_gateway.cli auth login xai`"
       )
 
-    source_record = on_disk if on_disk is not None else record
+    source_record = dict(on_disk if on_disk is not None else record)
+    if identity:
+      source_record["identity"] = identity
     owns_client = client is None
-    oauth_client = client or httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0))
+    oauth_client = client or httpx.AsyncClient(timeout=_HTTP_TIMEOUT)
     try:
       token_endpoint = str(
         source_record.get("token_endpoint") or record.get("token_endpoint") or ""
@@ -586,7 +708,7 @@ async def _locked_refresh(
           token_endpoint,
           require_refresh=True,
         )
-        for key in ("device_authorization_endpoint", "token_endpoint"):
+        for key in ("identity", "device_authorization_endpoint", "token_endpoint"):
           value = source_record.get(key) or record.get(key)
           if value:
             refreshed[key] = value
@@ -596,7 +718,7 @@ async def _locked_refresh(
       if not response.is_success:
         _raise_oauth_response_error(response, payload, "xAI OAuth refresh")
       refreshed = _parse_token_response(payload, settings, token_endpoint, require_refresh=True)
-      for key in ("device_authorization_endpoint", "token_endpoint"):
+      for key in ("identity", "device_authorization_endpoint", "token_endpoint"):
         value = source_record.get(key) or record.get(key)
         if value:
           refreshed[key] = value
@@ -678,6 +800,91 @@ def _positive_int(value: Any, default: int) -> int:
   return parsed if 0 < parsed <= 86_400 else default
 
 
+def resolve_xai_pool_candidates(
+  config: Mapping[str, Any] | None = None,
+  *,
+  user_scope: Any = None,
+  environ: Mapping[str, str] | None = None,
+) -> tuple[list[PoolAccountCandidate], None]:
+  cfg = config or {}
+  env = os.environ if environ is None else environ
+  mode = str(cfg.get("auth_mode") or env.get("XAI_AUTH_MODE") or "").strip().lower()
+  mode = resolve_xai_auth_mode(cfg, environ=env) if mode else ""
+  oauth_paths = resolve_xai_store_paths(cfg, user_scope=user_scope, environ=env)
+  api_paths = resolve_api_key_store_paths("xai", cfg, user_scope=user_scope, environ=env)
+  candidates: list[PoolAccountCandidate] = []
+  seen: set[str] = set()
+  for index in (0, 1):
+    for auth_mode, path in (("oauth", oauth_paths[index]), ("api", api_paths[index])):
+      if path is None or (mode and mode != auth_mode):
+        continue
+      accounts = (
+        load_xai_accounts(path) if auth_mode == "oauth"
+        else load_pool_accounts(path, default_prefix="xai", required_any_keys=("api_key",))
+      )
+      for record in accounts:
+        key = str(record["identity"])
+        if key not in seen:
+          seen.add(key)
+          candidates.append(PoolAccountCandidate(
+            provider="xai", key=key, record=record, store_path=path,
+            is_user_store=index == 0, auth_mode=auth_mode,
+          ))
+  for auth_mode, name in (("oauth", "XAI_AUTH_TOKEN"), ("api", "XAI_API_KEY")):
+    token = str(env.get(name) or "").strip()
+    if token and (not mode or mode == auth_mode):
+      record: dict[str, Any] = {
+        "identity": f"env:{name}:{hashlib.sha256(token.encode()).hexdigest()[:12]}",
+        "access_token" if auth_mode == "oauth" else "api_key": token,
+      }
+      if auth_mode == "oauth":
+        record.update(
+          refresh_token=str(env.get("XAI_REFRESH_TOKEN") or "").strip(),
+          expires_at=env.get("XAI_TOKEN_EXPIRES_AT") or 0,
+        )
+      key = str(record["identity"])
+      if key not in seen:
+        seen.add(key)
+        candidates.append(PoolAccountCandidate(
+          provider="xai", key=key, record=record, auth_mode=auth_mode,
+        ))
+  return candidates, None
+
+
+def materialize_xai_pool_candidate(
+  selected: PoolAccountCandidate, config: Mapping[str, Any],
+) -> dict[str, Any]:
+  materialized = dict(config)
+  materialized.update(
+    api_key="", auth_token="",
+    refresh_token=str(selected.record.get("refresh_token") or "").strip(),
+    token_expires_at=selected.record.get("expires_at"),
+    auth_store_path=str(selected.store_path or ""), api_key_store_path="",
+    device_authorization_endpoint="", token_endpoint="",
+  )
+  materialized.update(
+    auth_mode=selected.auth_mode, account_identity=selected.account_identity,
+    auth_user_scope=normalize_user_scope(config.get("auth_user_scope")),
+  )
+  if selected.auth_mode == "api":
+    materialized["api_key"] = selected.token
+  else:
+    materialized["auth_token"] = selected.token
+    for source, target in (
+      ("issuer", "oauth_issuer"), ("client_id", "oauth_client_id"), ("scope", "oauth_scope"),
+      ("device_authorization_endpoint", "device_authorization_endpoint"),
+      ("token_endpoint", "token_endpoint"),
+    ):
+      if source in selected.record:
+        materialized[target] = selected.record[source]
+  return materialized
+
+
+register_provider_pool_hooks(
+  "xai", resolver=resolve_xai_pool_candidates, materializer=materialize_xai_pool_candidate,
+)
+
+
 __all__ = [
   "DEFAULT_XAI_OAUTH_CLIENT_ID",
   "DEFAULT_XAI_OAUTH_ISSUER",
@@ -687,12 +894,16 @@ __all__ = [
   "XAIOAuthTokenRecord",
   "discover_xai_oauth",
   "load_xai_token_record",
+  "load_xai_accounts",
+  "materialize_xai_pool_candidate",
   "login_xai_device_code",
   "oauth_record_from_config",
   "poll_xai_device_token",
   "refresh_xai_oauth_token",
   "resolve_xai_auth_mode",
   "resolve_xai_oauth_settings",
+  "resolve_xai_pool_candidates",
+  "resolve_xai_store_paths",
   "save_xai_token_record",
   "token_needs_refresh",
   "token_store_is_private",

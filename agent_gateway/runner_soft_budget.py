@@ -7,9 +7,9 @@ and this module owns it. The guard is a ladder, never a stop at a number:
 1. **steer** at the threshold: a wrap-up notice naming the requests made and
    the threshold rides the child's next turn; the child keeps its tools and
    keeps working.
-2. **final** at 1.5x the threshold: the loop opens its forced-final delivery
-   epoch, whose turns carry the synthesis reminder, so the partial findings
-   come back as an ordinary result.
+2. **final** at ``final_factor`` times the threshold (1.5 by default): the
+   loop opens its forced-final delivery epoch, whose turns carry the synthesis
+   reminder, so the partial findings come back as an ordinary result.
 3. **abort** only when the child has still not finished ``grace_turns`` turns
    (or continuation segments) after the forced final: the run ends
    ``interrupted`` with the counters on the event. This is the last resort.
@@ -23,35 +23,26 @@ its credits are spent (``runner_run_loop._run_chat_loop``), and a child's
 ``timeout`` is a separate owner. Deleting this stage makes a child that never
 answers unbounded.
 
-The first two stages return a result; only the third ends the run. The
-threshold has one source: ``SOFT_TURN_BUDGET``, keyed by run kind with a
-``default`` (a ``run_agent``/skill child and a learning fork are kinds; nothing
-a run declares feeds it). ``HANK_SOFT_TURN_BUDGET`` can only lower it and ``0``
-disables the guard. A primary run has no ladder. The ladder counts provider
-requests (completed turns plus completed ``max_tokens`` continuation segments),
-so a child whose provider never completes a turn still meets every stage;
-cost is a measurement on the run record, never a rung. Shape and rationale:
+The first two stages return a result; only the third ends the run. Threshold,
+final factor and grace come from ``ContainmentSettings``: the threshold is
+``soft_turn_threshold(kind)`` over its ``soft_turn_budget`` table, keyed by run
+kind with a ``default`` (a ``run_agent``/skill child and a learning fork are
+kinds; nothing a run declares feeds it); ``soft_turn_budget_cap``
+(``HANK_SOFT_TURN_BUDGET``) can only lower it and ``0`` disables the guard;
+``soft_budget_final_factor`` and ``soft_budget_grace_turns`` set the other
+two. A primary run has no ladder. The ladder counts provider requests
+(completed turns plus completed ``max_tokens`` continuation segments), so a
+child whose provider never completes a turn still meets every stage; cost is a
+measurement on the run record, never a rung. Shape and rationale:
 ``docs/engineering/soft-budget-containment-reference.md`` (oh-my-pi's subagent
 soft request budget).
 """
 
 from __future__ import annotations
 
-import logging
 import math
-import os
 from dataclasses import dataclass
 from typing import Literal
-
-logger = logging.getLogger(__name__)
-
-#: Bundled steer thresholds, in turns, keyed by run kind; a kind with no entry
-#: resolves to ``default``.
-SOFT_TURN_BUDGET: dict[str, int] = {"default": 100, "autonomous": 100, "fork": 10}
-SOFT_BUDGET_FINAL_FACTOR = 1.5
-#: Turns the child may run after the forced final before the run is aborted.
-SOFT_BUDGET_GRACE_TURNS = 2
-SOFT_TURN_BUDGET_ENV = "HANK_SOFT_TURN_BUDGET"
 
 #: The wrap-up guidance the steer carries after its numbers
 #: (``soft_budget_steer_notice``).
@@ -60,38 +51,6 @@ SOFT_BUDGET_STEER_NOTICE = (
   "work, and move toward your final answer from the evidence already "
   "produced. Your tools remain available."
 )
-
-
-def configured_soft_turn_budget() -> int | None:
-  """``HANK_SOFT_TURN_BUDGET`` as an int; unset or unreadable is ``None``."""
-
-  raw = os.environ.get(SOFT_TURN_BUDGET_ENV, "").strip()
-  if not raw:
-    return None
-  try:
-    return int(raw)
-  except ValueError:
-    logger.warning(
-      "%s=%r is not an integer; the bundled soft turn budget applies",
-      SOFT_TURN_BUDGET_ENV,
-      raw,
-    )
-    return None
-
-
-def resolve_soft_turn_budget(kind: str, configured: int | None) -> int | None:
-  """Resolve a run kind's steer threshold in turns; ``None`` means no ladder.
-
-  The table entry for ``kind`` (else ``default``) is the threshold;
-  ``configured`` can only lower it, and ``0`` (or less) disables the guard.
-  """
-
-  resolved = SOFT_TURN_BUDGET.get(kind, SOFT_TURN_BUDGET["default"])
-  if configured is None:
-    return resolved
-  if configured <= 0:
-    return None
-  return min(resolved, configured)
 
 
 @dataclass(frozen=True)
@@ -133,13 +92,14 @@ class SoftBudgetLadder:
     self,
     *,
     turn_threshold: int | None,
-    grace_turns: int = SOFT_BUDGET_GRACE_TURNS,
+    final_factor: float,
+    grace_turns: int,
   ) -> None:
     self._threshold = turn_threshold
     self._final_threshold = (
       None
       if turn_threshold is None
-      else math.ceil(turn_threshold * SOFT_BUDGET_FINAL_FACTOR)
+      else math.ceil(turn_threshold * final_factor)
     )
     self.grace_turns = grace_turns
     self._steered = False
@@ -187,14 +147,8 @@ class SoftBudgetLadder:
 
 
 __all__ = [
-  "SOFT_BUDGET_FINAL_FACTOR",
-  "SOFT_BUDGET_GRACE_TURNS",
   "SOFT_BUDGET_STEER_NOTICE",
-  "SOFT_TURN_BUDGET",
-  "SOFT_TURN_BUDGET_ENV",
   "SoftBudgetAction",
   "SoftBudgetLadder",
-  "configured_soft_turn_budget",
-  "resolve_soft_turn_budget",
   "soft_budget_steer_notice",
 ]

@@ -119,11 +119,14 @@ def test_codex_context_window_comes_from_the_authority_entry(model_id: str, cont
 
 
 def test_codex_terra_effective_compaction_trigger_is_reachable() -> None:
+  from agent_gateway.containment_settings import ContainmentSettings
   from agent_gateway.runner_limits import effective_compaction_trigger
 
   provider = CodexProvider()
 
-  trigger = effective_compaction_trigger(160_000, provider.get_model_info("gpt-5.6-terra"))
+  trigger = effective_compaction_trigger(
+    160_000, provider.get_model_info("gpt-5.6-terra"), ContainmentSettings(),
+  )
 
   assert trigger == 217_600
 
@@ -347,6 +350,33 @@ def test_convert_messages_translates_same_model_assistant_text_and_tool_history(
     "type": "function_call_output",
     "call_id": "call_1",
     "output": "{\"ok\": true}",
+  }
+
+
+def test_normalize_messages_missing_tool_result_carries_native_error() -> None:
+  provider = CodexProvider()
+  model_info = provider.get_model_info("gpt-5.6-sol")
+  messages = [
+    {
+      "role": "assistant",
+      "content": [
+        {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {}},
+      ],
+    },
+    {"role": "assistant", "content": [{"type": "text", "text": "continuing"}]},
+  ]
+
+  normalized = provider.normalize_messages(messages, model_info)
+  result = normalized[1]["content"][0]
+  assert result["is_error"] is True
+  assert result["tool_name"] == "lookup"
+  converted = _convert_messages(normalized, model_info)
+  assert json.loads(converted[1]["output"]) == {
+    "error": {
+      "code": "missing_tool_result",
+      "message": "No result provided",
+      "data": {"next_call": None},
+    },
   }
 
 

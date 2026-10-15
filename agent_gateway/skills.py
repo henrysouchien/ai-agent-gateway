@@ -289,6 +289,7 @@ def compile_agent_operation(
     evidence_ports=evidence_ports,
     resumable=profile.resumable,
     terminal_on_persist=profile.terminal_on_persist,
+    result_requires_persist=profile.result_requires_persist,
     children=profile.children,
   )
 
@@ -388,6 +389,10 @@ class SkillProfile:
   #: A persist_state-false skill ends on its first successful FMS door result unless it
   #: declares otherwise (``terminal_on_persist: false``: it persists several units, then reports).
   terminal_on_persist: bool = True
+  #: A skill that owes a persist declares ``result_requires_persist: true``: a run that ends with
+  #: no accepted terminal door result and no artifact settles blocked. Coordinators and read-only
+  #: skills leave it False and keep their narrative outcome.
+  result_requires_persist: bool = False
   mode: str = "full"
   tool_packs_enabled: bool = True
   state_class: str | None = None
@@ -602,6 +607,7 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
   raw_resumable = frontmatter.pop("resumable", None)
   raw_children = frontmatter.pop("children", None)
   raw_terminal_on_persist = frontmatter.pop("terminal_on_persist", None)
+  raw_result_requires_persist = frontmatter.pop("result_requires_persist", None)
   raw_mode = frontmatter.pop("mode", None)
   raw_state_class = frontmatter.pop("state_class", None)
   raw_mutation_mode = frontmatter.pop("mutation_mode", None)
@@ -697,6 +703,12 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
     True if raw_terminal_on_persist is None
     else _coerce_optional_bool(raw_terminal_on_persist, field_name="terminal_on_persist", path=path)
   )
+  coerced_result_requires_persist = (
+    False if raw_result_requires_persist is None
+    else _coerce_optional_bool(
+      raw_result_requires_persist, field_name="result_requires_persist", path=path
+    )
+  )
   coerced_mode = _coerce_mode(raw_mode, field_name="mode", path=path)
   coerced_state_class = _coerce_optional_state_class(
     raw_state_class,
@@ -755,6 +767,7 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
     agent_description=coerced_agent_description,
     resumable=coerced_resumable,
     terminal_on_persist=coerced_terminal_on_persist,
+    result_requires_persist=coerced_result_requires_persist,
     mode=coerced_mode,
     tool_packs_enabled=coerced_tool_packs_enabled,
     state_class=coerced_state_class,

@@ -40,7 +40,7 @@ from agent_gateway.research_file_current_projection import (
 )
 from agent_gateway.skills import SkillLoader
 from agent_gateway.sub_agent import (
-  _ordinary_admitted_task_factory,
+  ordinary_admitted_task_factory,
   _research_file_id_admitted_input,
   seal_admitted_task_payload,
 )
@@ -104,7 +104,7 @@ def _admitted_research_file_registration(
     invocation_id=task_id,
     parent_session=parent_session,
   )
-  task = _ordinary_admitted_task_factory(
+  task = ordinary_admitted_task_factory(
     operation=operation,
     execution_snapshot=build_agent_execution_snapshot(
       operation=operation,

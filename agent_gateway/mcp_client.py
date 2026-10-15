@@ -73,6 +73,12 @@ from .tool_policy_registry import (
   ToolPolicyImplementationRegistry,
   ToolPolicyResultError,
 )
+from .ttl_policy import (
+  GSHEETS_BROKER_SESSION_TTL,
+  TtlResolver,
+  default_ttl_resolver,
+  resolve_ttl_seconds,
+)
 
 log = logging.getLogger("agent_gateway.mcp_client")
 _UNSET: _config_helpers.McpConfigPathUnset = _config_helpers.UNSET
@@ -102,6 +108,10 @@ PER_USER_SESSION_TTL_SECONDS = 60 * 60
 PER_USER_EXPIRY_MARGIN_SECONDS = 5 * 60
 PER_USER_IDLE_REAP_SECONDS = 30 * 60
 PER_USER_REAPER_INTERVAL_SECONDS = 60.0
+# One stdio child process per (server, user): this bounds the host's process
+# count, a resource fact, not a policy verdict. A full pool first evicts its
+# least-recently-used idle instance; only when every instance is running a call
+# does a new user wait, and the error then carries the pool's count.
 PER_USER_INSTANCE_CAP = 32
 PER_USER_DRAIN_POLL_SECONDS = 0.05
 
@@ -641,6 +651,7 @@ class McpClientManager:
     per_user_env_resolver: Callable[
       [str, str, str | None], Mapping[str, str]
     ] | None = None,
+    ttl_resolver: TtlResolver | None = None,
     startup_timeout: int = 15,
     default_tool_timeout: int = 30,
     strip_input_fields: set[str] | None = None,
@@ -691,6 +702,9 @@ class McpClientManager:
       for server_name, env_names in dict(server_env_passthrough or {}).items()
     }
     self._per_user_env_resolver = per_user_env_resolver
+    self._ttl_resolver = (
+      ttl_resolver if ttl_resolver is not None else default_ttl_resolver
+    )
     self._per_user_binding_hmac_key = os.urandom(32)
     self._logical_tool_definitions: Dict[str, List[Dict[str, Any]]] = {}
     self._logical_alias_generation: tuple[
@@ -1953,11 +1967,19 @@ class McpClientManager:
       "user_id": subject.user_id,
       "scopes": [GSHEETS_BROKER_SCOPE],
       "request_id": uuid.uuid4().hex,
-      "ttl_s": PER_USER_SESSION_TTL_SECONDS,
+      "ttl_s": resolve_ttl_seconds(
+        self._ttl_resolver,
+        subject.user_id,
+        GSHEETS_BROKER_SESSION_TTL,
+        PER_USER_SESSION_TTL_SECONDS,
+      ),
     }
     message = str(timestamp).encode("ascii") + b"\n" + self._canonical_broker_body(payload)
     signature = hmac.new(hmac_key.encode("utf-8"), message, hashlib.sha256).hexdigest()
     try:
+      # Bounds a hung broker only: the mint happens before any child spawns, and
+      # without a bound a broker that accepts the connection and never answers
+      # would hold this user's spawn lock (and every call behind it) for good.
       async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.post(
           f"{base_url}/api/internal/google/sheets-broker-session",
@@ -2217,6 +2239,10 @@ class McpClientManager:
             ]
             if not idle:
               projected_authority = projected_env is not None
+              pool = (
+                f"({server_count} of {PER_USER_INSTANCE_CAP} instances in use); "
+                "retry when a running call finishes"
+              )
               raise _PerUserMcpError(
                 (
                   "mcp_user_authority_unavailable"
@@ -2224,9 +2250,9 @@ class McpClientManager:
                   else "sheets_unavailable"
                 ),
                 (
-                  "Per-user MCP instance capacity reached"
+                  f"Per-user MCP instance capacity reached {pool}"
                   if projected_authority
-                  else "Google Sheets per-user instance capacity reached"
+                  else f"Google Sheets per-user instance capacity reached {pool}"
                 ),
               )
             _, evict_key, evicted = min(idle)
@@ -2890,6 +2916,14 @@ class McpClientManager:
           tool_name=original_name,
           reason="abort",
         )
+        # A response that completed alongside the abort was still received.
+        if (
+          invocation_report is not None
+          and call_task.done()
+          and not call_task.cancelled()
+          and call_task.exception() is None
+        ):
+          invocation_report.certainty = "settled"
         raise asyncio.CancelledError()
       result = await call_task
       if invocation_report is not None:

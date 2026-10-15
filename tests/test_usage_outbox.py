@@ -12,10 +12,12 @@ from model_authority.bind import CapabilityBind
 from agent_gateway import usage_outbox as usage_outbox_module
 from agent_gateway.commercial_contract import canonical_usage_payload_sha256
 from agent_gateway.multi_user.billing import SessionUsageSummary
-from agent_gateway.usage_outbox import (
-  CommercialUsageOutbox,
+from hank_contracts.usage import (
   CommercialUsageOutboxConflict,
   CommercialUsageOutboxError,
+)
+from agent_gateway.usage_outbox import (
+  CommercialUsageOutbox,
 )
 from agent_gateway.usage_reconciliation import CommercialUsageReconciliationTracker
 
@@ -617,6 +619,34 @@ def test_reconciliation_reports_are_append_only_replay_safe_revisions(tmp_path) 
           "sha256:" + "c" * 64, second.report_id,
         ),
       )
+
+
+def test_reconciliation_float_residue_is_recorded_in_fixed_point(tmp_path) -> None:
+  # A float session cost (0.1 + 0.2) against a 0.3 producer estimate leaves a
+  # -4E-17 delta; exponent notation fails the evidence schema and trips the
+  # usage breaker, so the report must carry it as a plain decimal.
+  outbox = CommercialUsageOutbox(tmp_path / "usage.sqlite3")
+  tracker = CommercialUsageReconciliationTracker(
+    request_id="req_001", session_id="sess_001"
+  )
+  payload = {**_payload("evt_001"), "producer_estimated_cost_usd": "0.3"}
+  payload["source_payload_sha256"] = canonical_usage_payload_sha256(payload)
+  tracker.record_batch([payload])
+  summary = SessionUsageSummary(
+    user_id="user-001", session_id="sess_001", request_id="req_001",
+    input_tokens=100, output_tokens=20, cache_read_tokens=10,
+    cache_creation_tokens=0, cost=0.1 + 0.2, turns=1, channel="mcp",
+    started_at=NOW.timestamp() - 60, ended_at=NOW.timestamp(),
+    usage_event_count=1, usage_event_ids=("evt_001",),
+    capability_bind=_v3_payload("bind")["capability_bind"],
+  )
+
+  stored, replayed = outbox.record_reconciliation_report(
+    tracker.compare(summary), recorded_at=NOW
+  )
+
+  assert replayed is False
+  assert stored.payload["estimate_delta_usd"] == "-0.00000000000000004"
 
 
 def test_reconciliation_v2_is_validated_and_persisted_with_attempt_lineage(

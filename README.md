@@ -29,10 +29,13 @@ through the same tool-execution path used for model-issued calls.
 The required `approved_call=sub_agent.ApprovedCallRef(job_id, tool_call_id, nonce)`
 identifies that exact durable original call.
 The stored call's real result (including typed errors) replaces only its orphan
-tool result; other orphan calls remain synthetic. Registration reservations that
-have not started a worker remain retryable. Existing workers are replayed before
-credential materialization. Completion releases activity, including an
-untransferred child lease, before notifying the host.
+tool result; other orphan calls remain synthetic. Its tool-result hook extras are
+projected as for model-issued calls: event-only blocks never reach the model and
+visible extras follow every tool result in that message. Registration
+reservations that have not started a worker remain retryable, and the retry that
+starts the worker installs its own lifecycle callbacks. Existing workers are
+replayed before credential materialization. Completion releases activity,
+including an untransferred child lease, before notifying the host.
 Model-facing resume still reissues the grant and synthesizes interrupted calls.
 Callers supply `on_complete` and the required `on_park` keyword (`None` when no
 park callback is needed). Configured operation-resume bindings apply to this
@@ -47,8 +50,11 @@ successor just as they do to the other resume paths.
 | [`agent_gateway/gateway_server.py`](agent_gateway/gateway_server.py) | `run_gateway_server()` / `main()` | Privileged single-worker TCP launcher, claim-signing fd adoption, and startup-failure logging |
 | [`agent_gateway/autonomous.py`](agent_gateway/autonomous.py) | `run_autonomous()` / `run_autonomous_sync()` | A prebound headless one-shot with no HTTP server |
 | [`agent_gateway/admission.py`](agent_gateway/admission.py) | `admit()` | Shared spawn, continuation, message and handle authority |
+| [`agent_gateway/containment_settings.py`](agent_gateway/containment_settings.py) | `ContainmentSettings` / `resolve_containment_settings()` | Every containment bound (spawn depth, concurrent children, soft ladder, hung-child silence, context thresholds) as one object, resolved once at process start from its `HANK_*` env table |
 | [`agent_gateway/heartbeat.py`](agent_gateway/heartbeat.py) | `HeartbeatLoop` | Repeated prebound autonomous work with quiet windows and backoff |
 | [`agent_gateway/cli.py`](agent_gateway/cli.py) | `main()` (`agent init` / `agent run`) | Scaffold and run a package project |
+| [`agent_gateway/send_prompt.py`](agent_gateway/send_prompt.py) | `send_prompt()` / `send_prompt_sync()` | One already-bound prompt→completion call returning text. `completion_record_root` is required keyword-only: pass a directory to append one `completion_record` v1 row per provider attempt, or `None` to state the call is not captured |
+| [`agent_gateway/completion_record.py`](agent_gateway/completion_record.py) | `build_completion_record()` / `append_completion_record()` | The `completion_record` v1 row for one-shot companion-repo model calls (contract: `contracts/completion-record-v1/completion_record.schema.json`); day-sharded `<root>/<YYYY-MM-DD>.jsonl`, append-only, never fails the call it records |
 | [`agent_gateway/gateway_address.py`](agent_gateway/gateway_address.py) | `gateway_base_url()` | The origin of the gateway a process talks to: the one reader of `GATEWAY_BASE_URL` and the one place its default is spelled |
 
 `run_gateway_server()` is the serving entry on both local supported launches, not
@@ -78,11 +84,23 @@ Anthropic source generation. Fresh spawns select and materialize through the
 current scoped runner's execution resolver, so later descendants inherit the
 rotated generation. Generation-bound executions do not rotate to material
 without source-generation metadata.
+When a rate-limited pool has no unblocked account, or an outage outlasts the
+transient retry budget, `rebind_model_fallback()` binds the next eligible
+entry of the frozen selection snapshot's role chain (through the same
+resolver, with that entry's own credential) for the turn's remaining
+attempts; the runner emits `model_fallback` and the next turn binds the
+primary again.
 [`agent_gateway/providers/`](agent_gateway/providers/README.md) builds each request
 from the bound entry. Mechanism: `docs/reference/model-authority.md`.
 
 `admit(SpawnRequest(...), parent, owners=AdmissionOwners(...))` returns the
 selected context and exact `ResolvedAuthority`, without materializing credentials.
+A `SpawnRequest.model_preset` names a published preset whose frozen selection
+snapshot binds the child and rides its wire, so the child's descendants inherit it
+while siblings keep the parent's (subtree scope); a frozen bind ignores it.
+The admitted wire's `selection_provenance` records the role, its source, the
+effort source, and the preset name, scope and policy revision beside the exact
+bind, and is omitted when a frozen bind records none.
 `admit(ContinueRequest(...), parent, owners=ContinuationOwners(...))` instead
 retains the original `AdmittedTask`: no model reselection, semantic recompile, or
 replacement tool grant. Its context preserves lineage and recorded spend;
@@ -124,6 +142,15 @@ that captured scope without minting authority. A child session installs
 and cannot regain root scope.
 Sessionless control/schedule edges use `root_context_from_identity()` with their
 authenticated identity, live roster and approval owner.
+An autonomous skill launch passes its launch edge's user facts as
+`AdmissionOwners.identity` (`AdmittedChildIdentity`). A spawn admits that
+identity only as the parent tenant's owner (`user_id` is the tenant
+`storage_id`, exact `role` equal to the tenant role), else refuses
+`tenant_mismatch`, and returns it on `AdmittedContext.identity`; the wire
+carries no user identity. `AutonomousRegistry.start()` fills the run record and
+the signed session authority from that admitted identity; a launch admission
+does not run for (once/task/pack, a parentless skill, resume) keeps the launch
+edge's identity facts.
 `TaskRegistry` recovery validates the canonical task and keeps its model bind as
 execution authority. Duplicate registration/message bind receipts are optional
 observations, not prerequisites or competing authority; canonical corruption and
@@ -162,7 +189,12 @@ registration settles, including initialization left running by caller cancellati
 If STOP wins before installation, resume returns `source_terminated` and releases
 the unstarted successor reservation; a registered successor is the source's resumed
 marker. Ordinary `revive` still accepts only ordinary delegation identity and mints
-its existing ordinary successor admission.
+its existing ordinary successor admission. When the retained transcript holds no
+model turn (the attempt was interrupted before its first assistant message), the
+successor starts as a first attempt does: its admission keeps the original
+`objective`, and its model input is the `admitted_task_message_from_handles` a first attempt
+receives, followed only by unconsumed parent messages and any caller-supplied
+`additional_context`, never the default resume instruction.
 
 `make_resume_handler` requires the `operation_resume_bindings` keyword; pass
 `None` for ordinary resume wiring. An application may supply a callback from the
@@ -172,9 +204,11 @@ stock handler raises `KeyError`), selects a usage aggregator, and optionally
 awaits `on_settled(entry)` after successor completion and activity release, before
 the workflow host's completion callback. A binding's `usage_aggregator=None`
 keeps the child's own accounting and charges nothing to its parent; a callback
-returning no binding preserves ordinary parent accounting. The lower-level
+returning no binding preserves ordinary parent accounting: the resumed child
+delivers its own session summary under the parent's unit. The lower-level
 `resume_sub_agent` also requires an explicit `usage_aggregator`: pass the parent's
-aggregator to share accounting or `None` to keep it independent. The entry's
+own aggregator for that ordinary delegation, any other aggregator to share its
+accounting, or `None` to keep it independent. The entry's
 canonical `TaskResult` contains cumulative usage across attempts. Operation identity comes
 only from the parked admission; no binding is persisted.
 `await sub_agent.resume_binding_for(runner, task_id)` attaches the existing
@@ -229,13 +263,29 @@ another eligible stable `model_key`.
 
 For OpenAI, install `ai-agent-gateway[openai]` and set `OPENAI_API_KEY`.
 Managed provider login flows are available through `agent auth login
-anthropic`, `agent auth login codex`, and `agent auth login xai`. Use `agent
-auth status <provider>` for all built-ins. `agent auth login anthropic` is this
-gateway's own Claude OAuth login: run it once per Claude account to enroll
-interchangeable siblings, then `agent auth list anthropic` (masked) and `agent
-auth remove anthropic <identity>` manage them. Gateway token-store logout
-applies to Anthropic and XAI; Codex credentials are managed by the Codex CLI,
-and OpenAI uses `OPENAI_API_KEY`.
+<provider> [--api-key]`. Supported doors:
+- `gemini` (default: Antigravity Google OAuth loopback; `--api-key`: Google AI Studio key prompt)
+- `google` (Google AI Studio OAuth PKCE loopback when an OAuth client is configured, or API key prompt)
+- `kimi-code` (default: Kimi Code OAuth device-code flow; `--api-key`: Kimi Code API key prompt); seats land in `$USER_DATA_DIR/users/<risk_user_id>/kimi_code/oauth.json` (per user) or `$USER_DATA_DIR/kimi_code/oauth.json` (deployment default), API keys in `credentials.json` beside them
+- `muse` (default: Meta Muse Code device-code flow minting Model API key; `--api-key`: Meta Model API key prompt)
+- `ollama-cloud` (Ollama Cloud API key prompt)
+- `ollama` (delegated `ollama signin` on local daemon)
+- `copilot` (GitHub device-code flow)
+- `anthropic` (Claude Code OAuth enrollment)
+- `codex` (CAAM-managed ChatGPT subscription enrollment)
+- `xai` (xAI device-code flow)
+- `openai` (informational guidance to OPENAI_API_KEY / codex)
+Use `agent auth status <provider>` to inspect stored credentials without secret leakage.
+
+Repeated `agent auth login <provider>` enrollments append accounts to the
+provider's multi-account credential pool, or update an existing account by
+identity without overwriting other seats. `providers/credential_pool.py` owns
+the shared `"accounts"` store envelope, legacy single-record migration, and
+cooldowns. A scoped user's accounts lead the deployment pool; usage limits and
+refresh failures park a seat so the running request can rotate to an unblocked
+sibling, keeping that seat's token and provider-specific fields together.
+Public `google` OAuth uses PKCE S256; `gemini` Antigravity uses confidential-client
+loopback OAuth with `ANTIGRAVITY_CLIENT_SECRET`, not PKCE.
 
 The complete session-token, chat request, and SSE walkthrough is in the
 [quickstart](docs/quickstart.md).
@@ -263,6 +313,22 @@ Code execution settles native and bridged nested calls through the cell ledger.
 Their `dispatch.sources` remain in the outer result's `sources`; native computation
 provenance is projected into `computations` with its `nested_call_id`, without
 entry or byte caps. Computation JSON sidecars are no longer read or consumed.
+Each bridged nested dispatch inherits the enclosing `code_execute` call's skill
+run, step, workspace and batch context, including for background cells; the
+dispatcher supplies the request's control-run identity as for direct calls.
+
+A docker or kernel cell's `timeout_ms` bounds its compute only. The interpreter
+runner brackets each `hank` request made on the cell's own (main interpreter)
+thread with `host_wait_begin`/`host_wait_end` frames; `_run_cell` pauses the
+compute deadline while one is open, so a blocked host call never times the cell
+out or interrupts it. A `hank` call from a cell-spawned thread still works but
+sends no frames and does not pause the clock, since the cell thread may still be
+computing. Each result carries `compute_ms` (unpaused time the deadline counted)
+and `host_wait_ms` (the cell thread's summed blocked time; spawned threads' waits
+are not counted). The optional `host_wait_ms` operand
+(`CodeExecutionConfig.default_host_wait_ms`) is recorded and echoed as
+`requested_host_wait_ms`, never armed as a wait. The subprocess backend still
+bounds the whole process wall time.
 
 Native calls parked for local approval capture their original `PreparedToolCall`
 and dispatch operands privately on the route's ledger store, before publication.

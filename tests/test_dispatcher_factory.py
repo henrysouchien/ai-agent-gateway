@@ -54,8 +54,8 @@ async def _local_handler(_tool_input: object) -> ToolResult:
 
 async def _request_approval(
   _request: ApprovalRequest,
-) -> ApprovalDecision | None:
-  return None
+) -> ApprovalDecision:
+  return ApprovalDecision(approved=False)
 
 
 async def _allow_interceptor(

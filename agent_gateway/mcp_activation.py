@@ -339,14 +339,24 @@ def derive_live_surface(
   (``api/agent/shared/mcp_audience.py``), an authorization partition.
 
   A server advertises its whole tool list unless the profile registers a
-  tool ceiling for it in ``core_mcp_tools`` (and does not mark it unscoped):
-  that registration is what a profile may reach on a shared server — the
-  community profile's invite users never see the owner's portfolio reads or
-  shared-corpus writes — and only the fold's grants widen it.
+  default-visible set for it in ``core_mcp_tools`` (and does not mark it
+  unscoped); the fold's grants widen that set, which is what ``load_tools``
+  is for. Separately, a profile may register a tool **ceiling** for a server
+  in ``mcp_tool_ceilings``: what that profile may ever reach there. The
+  ceiling bounds every route that writes the fold — ``load_tools``, a
+  ``run_agent`` declared activation, stage and node admission — because they
+  all read this one derivation; no grant and no whole-server activation
+  passes it. The community profile's invite users never see the owner's
+  portfolio reads or shared-corpus writes this way, and no loader has to be
+  withheld to keep it so.
   """
 
   denied_servers = _denied_servers(profile, denied_mcp_servers)
   fold = activation_fold if activation_fold is not None else McpActivationFold()
+  default_servers = {
+    str(server_name)
+    for server_name in (getattr(profile, "mcp_default_mcp_servers", frozenset()) or frozenset())
+  }
   catalog = {
     str(server_name): payload
     for server_name, payload in server_catalog.items()
@@ -356,34 +366,52 @@ def derive_live_surface(
     str(server_name)
     for server_name in getattr(profile, "unscoped_active_mcp_servers", frozenset()) or frozenset()
   }
-  registered_ceilings: dict[str, set[str]] = {
+  registered_defaults: dict[str, set[str]] = {
     str(server_name): {str(tool_name) for tool_name in tool_names}
     for server_name, tool_names in (getattr(profile, "core_mcp_tools", {}) or {}).items()
     if str(server_name) not in unscoped_servers
   }
+  registered_ceilings: dict[str, set[str]] = {
+    str(server_name): {str(tool_name) for tool_name in tool_names}
+    for server_name, tool_names in (getattr(profile, "mcp_tool_ceilings", {}) or {}).items()
+  }
 
+  # A server the profile defers starts outside the active set and lists its
+  # tools as loadable until the fold's first grant activates it. Deferral is
+  # what a cold session is shown, never what it may reach: the allowed scope
+  # below is the authorization partition and dispatch scope
+  # (server_policies._profile_mcp_scope_denies), and is the same deferred or
+  # not.
+  cold_servers = default_servers - set(fold.activated_servers)
   withheld_names: set[str] = set()
   withheld_tool_pairs: set[tuple[str, str]] = set()
   allowed_mcp_tools_by_server: dict[str, frozenset[str]] = {}
   visible_names: set[str] = set(fold.granted_tool_names)
   for server_name, payload in catalog.items():
     server_tool_names = _catalog_tool_names(payload)
-    ceiling = registered_ceilings.get(server_name)
-    if ceiling is None or server_name in fold.whole_servers:
-      allowed = server_tool_names
+    default_visible = registered_defaults.get(server_name)
+    if default_visible is None or server_name in fold.whole_servers:
+      allowed = set(server_tool_names)
     else:
-      allowed = server_tool_names & (ceiling | set(fold.granted_tools(server_name)))
+      allowed = server_tool_names & (default_visible | set(fold.granted_tools(server_name)))
+    ceiling = registered_ceilings.get(server_name)
+    if ceiling is not None:
+      allowed &= ceiling
     allowed_mcp_tools_by_server[server_name] = frozenset(allowed)
-    visible_names |= allowed
-    for tool_name in server_tool_names - allowed:
+    withheld = server_tool_names - allowed
+    if server_name in cold_servers:
+      withheld = set(server_tool_names)
+    else:
+      visible_names |= allowed
+    for tool_name in withheld:
       withheld_names.add(tool_name)
       withheld_tool_pairs.add((server_name, tool_name))
 
-  # The withheld set is a flat name set: a name allowed on any server is
-  # visible everywhere it is advertised.
+  # The withheld set is a flat name set: a name allowed on any visible server
+  # is visible everywhere it is advertised.
   return LiveToolSurface(
     active_servers=frozenset(
-      (set(catalog) | set(fold.activated_servers)) - denied_servers
+      (set(catalog) | set(fold.activated_servers)) - denied_servers - cold_servers
     ),
     server_catalog=catalog,
     deferred_mcp_tools=frozenset(withheld_names - visible_names),
@@ -642,9 +670,10 @@ def detached_tool_surface(
 def coerce_tool_surface(value: Any) -> Any:
   """Accept a surface, or a plain collection of already-activated servers.
 
-  A surface is anything that answers the four questions the handler asks —
-  ``activation_fold``, ``deferred_mcp_tools``, ``defers_mcp_tools`` and
-  ``record_activation`` — so the autonomous runtime can supply its own
+  A surface is anything that answers the five questions the handler asks —
+  ``activation_fold``, ``deferred_mcp_tools``, ``defers_mcp_tools``,
+  ``record_activation`` and ``allowed_mcp_tools_by_server`` (what a load
+  reached) — so the autonomous runtime can supply its own
   derivation over the same fold.  ``defers_mcp_tools`` is checked here because
   ``_make_load_tools_handler`` reads it before anything else, to decide whether
   pack loads take the deferral branch at all; a surface missing it would fail
@@ -662,6 +691,7 @@ def coerce_tool_surface(value: Any) -> Any:
       "deferred_mcp_tools",
       "defers_mcp_tools",
       "record_activation",
+      "allowed_mcp_tools_by_server",
     )
   ):
     return value

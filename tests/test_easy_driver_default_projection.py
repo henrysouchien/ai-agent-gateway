@@ -15,11 +15,13 @@ from gateway_test_support import model_defaults
 def test_tier_driver_projects_packaged_identity(tmp_path: Path, monkeypatch) -> None:
   expected = model_defaults.capability_default("session.driver")
   document = yaml.safe_load((PACKAGED_AUTHORITY_DIR / "model-authority.yaml").read_text())
-  document["schema"] = "model-authority/2.2"
-  document["selection"]["tiers"] = {
+  # The narrowed `deep` ceiling below would refuse the published presets'
+  # candidates at load; this fixture tests the base projection only.
+  document["selection"].pop("presets", None)
+  document["selection"].setdefault("tiers", {}).update({
     "deep": {"default": {"models": [expected.model_key], "effort": expected.effort}, "allowed_model_keys": [expected.model_key]},
     "default": {"default": {"alias": "deep"}},
-  }
+  })
   document["selection"]["capabilities"]["session.driver"]["default"] = {
     "kind": "tier", "tier": "default",
   }

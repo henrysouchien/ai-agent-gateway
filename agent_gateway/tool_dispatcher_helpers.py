@@ -7,8 +7,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Literal, Mapping, Optional, Protocol, Sequence, Tuple, TYPE_CHECKING
 
-from . import approval_settings
-
 if TYPE_CHECKING:
   from .ui_blocks_run import UiBlocksRunContext
 
@@ -146,10 +144,6 @@ class TrustedToolPlan:
     actual = {field_name: getattr(request, field_name, None) for field_name in expected}
     if actual != expected:
       raise TrustedToolPlanError("approval row is not bound to the exact trusted plan")
-
-
-def _approval_queue_timeout_seconds(expiry_seconds: float | int | None) -> float:
-  return min(float(expiry_seconds or 600), approval_settings.approval_wait_seconds())
 
 
 def active_local_tool_schema(
@@ -425,7 +419,7 @@ class TransportApprovalResult:
   allow_tool_type: bool = False
 
 
-ApprovalCallback = Callable[[TransportApprovalRequest], Awaitable[Optional[TransportApprovalResult]]]
+ApprovalCallback = Callable[[TransportApprovalRequest], Awaitable[TransportApprovalResult]]
 LocalToolHandler = Callable[..., Awaitable[ToolResult]]
 
 # Transport-layer aliases for callback-based integrations.
@@ -451,9 +445,8 @@ class InterceptDecision:
 
   - allow: proceed normally
   - warn: proceed, but attach the message as a policy warning in the result
-  - ask: route through the dispatcher's request_approval callback before
-    executing; in headless contexts, resolves to deny unless an
-    `on_headless_ask` hook overrides
+  - ask: route through the dispatcher's approval route (or its
+    request_approval callback) before executing
   - deny: block and return an error to the model
 
   `measurement` names counts the interceptor keeps (``{name: value}``); it
@@ -485,7 +478,6 @@ ToolInterceptor = Callable[[InterceptContext], Awaitable[InterceptDecision]]
 ToolInterceptor.__doc__ = (
   "Async policy hook that receives `InterceptContext` and returns an `InterceptDecision`."
 )
-HeadlessAskCallback = Callable[[InterceptContext, InterceptDecision], Awaitable[str] | str]
 
 
 async def run_interceptors(

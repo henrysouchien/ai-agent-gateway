@@ -160,10 +160,6 @@ def insert_or_verify(
     raise PreparedBusinessModelError(
       "new prepared business-model records must start PENDING"
     )
-  if record.expires_at is None:
-    raise PreparedBusinessModelError(
-      "new prepared business-model records require finite expiry"
-    )
   row = _select(conn, record.caller_kind, record.user_scope, record.idempotency_locator)
   if row is not None:
     current = _from_row(row)
@@ -397,20 +393,6 @@ def _verify_idempotent_transition(
       )
 
 
-def expire_pending(conn: sqlite3.Connection, *, now: str) -> int:
-  _parse_timestamp(now, "expiry time")
-  cursor = conn.execute(
-    """
-    UPDATE prepared_business_model_change
-    SET lifecycle = 'EXPIRED'
-    WHERE lifecycle = 'PENDING'
-      AND expires_at IS NOT NULL AND expires_at <= ?
-    """,
-    (now,),
-  )
-  return int(cursor.rowcount)
-
-
 def _immutable_identity(record: PreparedBusinessModelChange) -> tuple[object, ...]:
   return (
     record.schema_version,
@@ -539,7 +521,6 @@ __all__ = [
   "PreparedBusinessModelError",
   "PreparedBusinessModelLifecycle",
   "ensure_schema",
-  "expire_pending",
   "get",
   "insert_or_verify",
   "transition",

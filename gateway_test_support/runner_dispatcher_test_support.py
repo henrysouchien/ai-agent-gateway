@@ -6,6 +6,7 @@ from agent_gateway.tool_dispatch_classification import (
   ToolResultSettlement,
   settle_catalogless_tool_result,
 )
+from agent_gateway.tool_dispatcher import _SpawningTurn
 from agent_gateway.tool_policy_registry import PreparedToolCall
 
 
@@ -47,3 +48,7 @@ class CataloglessDispatcherTestSupport:
       error=error,
       semantic_error=semantic_error,
     )
+
+  def capture_spawning_turn(self) -> _SpawningTurn:
+    """No admitted turn: catalogless doubles are not a spawning runner."""
+    return _SpawningTurn(context=None, root_turn=None)

@@ -9,11 +9,13 @@ import pytest
 
 from agent_gateway.commercial_contract import canonical_usage_payload_sha256
 from agent_gateway.usage_outbox import CommercialUsageOutbox
+from hank_contracts.usage import (
+  CommercialUsageCircuitOpen,
+  CommercialUsageSpoolError,
+)
 from agent_gateway.usage_resilience import (
   CommercialUsageCircuitBreaker,
-  CommercialUsageCircuitOpen,
   CommercialUsageEmergencySpool,
-  CommercialUsageSpoolError,
   ResilientCommercialUsageSink,
 )
 

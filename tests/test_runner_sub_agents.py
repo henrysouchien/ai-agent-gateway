@@ -17,6 +17,7 @@ from agent_gateway.agent_session_log_records import LogEntry as SessionLogEntry,
 from agent_gateway.mcp_activation import McpActivationFold
 from agent_gateway import AgentRunner, ToolDispatcher
 from agent_gateway.capability_execution import BoundCapabilityExecution
+from agent_gateway.containment_settings import ContainmentSettings
 from agent_gateway.event_log import EventLog
 from agent_gateway.session import GatewaySession
 from agent_gateway.providers import ModelInfo, ModelProvider
@@ -32,17 +33,22 @@ import agent_gateway.runner as gateway_runner
 import agent_gateway.runner_sub_agents as runner_sub_agents
 import agent_gateway.runner_stream_turn as runner_stream_turn
 from agent_gateway.runner_sub_agents import RunnerSubAgentMixin
+from agent_gateway.tool_dispatcher_approval_lifecycle import ApprovalPark
+from agent_gateway.tool_policy_registry import PreparedToolCall
 from agent_gateway.session_recap import compute_recap
 from agent_gateway.sub_agent_result_evidence import SubAgentResultEvidence
 from agent_gateway.task_registry import TaskEntry, TaskRegistry
+from agent_gateway.sub_agent import seal_admitted_task_payload
 from agent_workflow_contracts import (
   AgentOperationRef,
+  AdmittedTask,
   AttemptRef,
   OrdinaryDelegationTaskRef,
   OutcomeRequirement,
   ResultRequirement,
   TaskResult,
   TaskResultProvenance,
+  sha256_digest,
 )
 from gateway_test_support.admitted_authority_test_support import (
   SOURCE_TOOL_ID,
@@ -116,6 +122,10 @@ class _Dispatcher(ToolDispatcher):
     self._capability_bind = capability_bind
     self._event_log = EventLog()
     self._session_id = "parent-session"
+    # ToolDispatcher.capture_spawning_turn reads these; this stub skips its constructor.
+    self._identity = None
+    self._spawning_turn = None
+    self._session = None
 
   def get_tool_definitions(self) -> list[dict[str, Any]]:
     return [{
@@ -162,6 +172,7 @@ class _ChildRunner:
     self._task_registry = TaskRegistry()
     self.kwargs = kwargs
     self._runner_id = f"runner-{kwargs['session_id']}"
+    self._approval_park: ApprovalPark | None = None
     self.run_kwargs: dict[str, object] | None = None
     self.closed = False
     self.instances.append(self)
@@ -302,7 +313,6 @@ class _ApprovalChildRunner(_ChildRunner):
         nonce="nonce-start-quant",
         resolved_qualifier="",
         allow_persistent=False,
-        timeout_seconds=5,
       )
     )
     session = route_session(dispatcher._approval_route)
@@ -348,7 +358,12 @@ class _SessionLog(AgentSessionLog):
     })], None
 
 
-def _parent(tmp_path: Path, *, session_log: _SessionLog | AgentSessionLog | None) -> AgentRunner:
+def _parent(
+  tmp_path: Path,
+  *,
+  session_log: _SessionLog | AgentSessionLog | None,
+  containment: ContainmentSettings = ContainmentSettings(max_concurrent_children=2),
+) -> AgentRunner:
   runner = object.__new__(AgentRunner)
   runner._task_registry = TaskRegistry()
   runner._sub_agent_config = None
@@ -362,6 +377,7 @@ def _parent(tmp_path: Path, *, session_log: _SessionLog | AgentSessionLog | None
   runner._get_tool_definitions = lambda: []
   runner._on_tool_result = None
   runner._on_usage = None
+  runner._on_session_summary = None
   runner._on_late_usage_event = None
   runner._on_tool_timing = None
   runner._usage_user_id = "alice"
@@ -381,7 +397,7 @@ def _parent(tmp_path: Path, *, session_log: _SessionLog | AgentSessionLog | None
     rate_table_version="v1",
     billing_mode="metered",
   )
-  runner._max_concurrent_sub_agents = 2
+  runner._containment = containment
   runner._agent_session_log = session_log
   runner._max_resume_chain_depth = 3
   runner._spill_dir_provider = None
@@ -863,20 +879,26 @@ class _ToolInFlightChildRunner(_ChildRunner):
     await super().run(**kwargs)
 
 
+_SHORT_SILENCE = ContainmentSettings(
+  max_concurrent_children=2, child_silence_timeout_seconds=0.05,
+)
+
+
 @pytest.fixture
-def _short_activity_gap(monkeypatch: pytest.MonkeyPatch) -> None:
-  monkeypatch.setattr(runner_sub_agents, "SUB_AGENT_ACTIVITY_GAP", 0.05)
+def _short_guard_poll(monkeypatch: pytest.MonkeyPatch) -> None:
   monkeypatch.setattr(runner_sub_agents, "STREAM_GUARD_POLL_INTERVAL", 0.01)
 
 
-@pytest.mark.usefixtures("_short_activity_gap")
+@pytest.mark.usefixtures("_short_guard_poll")
 def test_wedged_child_is_cancelled_by_the_activity_guard(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
   _activity_clock: _ActivityClock,
 ) -> None:
   _ChildRunner.instances.clear()
-  parent = _parent(tmp_path, session_log=_SessionLog("never reached"))
+  parent = _parent(
+    tmp_path, session_log=_SessionLog("never reached"), containment=_SHORT_SILENCE,
+  )
   monkeypatch.setattr(gateway_runner, "AgentRunner", _WedgedChildRunner)
   monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)
 
@@ -901,7 +923,7 @@ def test_wedged_child_is_cancelled_by_the_activity_guard(
   assert [event["error_sub_code"] for event in errors] == ["stalled"]
 
 
-@pytest.mark.usefixtures("_short_activity_gap")
+@pytest.mark.usefixtures("_short_guard_poll")
 @pytest.mark.parametrize(
   "child_cls",
   [_HeartbeatOnlyChildRunner, _ToolInFlightChildRunner],
@@ -914,7 +936,9 @@ def test_live_child_outlasts_the_activity_gap(
   _activity_clock: _ActivityClock,
 ) -> None:
   _ChildRunner.instances.clear()
-  parent = _parent(tmp_path, session_log=_SessionLog("Done."))
+  parent = _parent(
+    tmp_path, session_log=_SessionLog("Done."), containment=_SHORT_SILENCE,
+  )
   monkeypatch.setattr(gateway_runner, "AgentRunner", child_cls)
   monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)
 
@@ -970,14 +994,20 @@ def test_real_child_streaming_tool_input_outlasts_the_activity_gap(
   tmp_path: Path,
   _activity_clock: _ActivityClock,
 ) -> None:
-  monkeypatch.setattr(runner_sub_agents, "SUB_AGENT_ACTIVITY_GAP", 0.1)
+  silence = ContainmentSettings(
+    max_concurrent_children=2, child_silence_timeout_seconds=0.1,
+  )
   monkeypatch.setattr(runner_sub_agents, "STREAM_GUARD_POLL_INTERVAL", 0.01)
   monkeypatch.setattr(runner_stream_turn, "STREAM_PROGRESS_LOG_INTERVAL", 0.02)
   monkeypatch.setattr(gateway_runner, "STREAM_GUARD_POLL_INTERVAL", 0.02)
   clock = _activity_clock
   heartbeat = asyncio.Event()
   guard_poll = clock.guard_poll
-  parent = _parent(tmp_path, session_log=AgentSessionLog(tmp_path / "session.jsonl"))
+  parent = _parent(
+    tmp_path,
+    session_log=AgentSessionLog(tmp_path / "session.jsonl"),
+    containment=silence,
+  )
   execution = stub_bound_capability_execution(
     provider=_ToolInputStreamingProvider(clock, heartbeat, guard_poll),
     model="child-model",
@@ -1008,7 +1038,7 @@ def test_real_child_streaming_tool_input_outlasts_the_activity_gap(
   assert observed[:first_text]
   assert set(observed[:first_text]) == {"heartbeat"}
   assert "error" not in observed
-  assert clock.now > runner_sub_agents.SUB_AGENT_ACTIVITY_GAP
+  assert clock.now > silence.child_silence_timeout_seconds
 
 
 class _RefusingChildProvider(_Provider):
@@ -1427,3 +1457,324 @@ def test_resume_settlement_derives_the_outcome_from_admitted_authority(
   assert result.outcome.assessment_source == "mechanically_derived"
   assert result.outcome.disposition == "insufficient_evidence"
   assert result.outcome.unmet_requirements == (SOURCE_TOOL_ID,)
+
+
+class _ApprovalParkProvider(_Provider):
+  def __init__(self, cleanup_failure: str) -> None:
+    self.cleanup_failure = cleanup_failure
+    self.stream_calls = 0
+    self.closed_clients: list[object] = []
+
+  def get_model_info(self, model: str) -> ModelInfo:
+    return ModelInfo(
+      id=model, provider=self.name,
+      max_output_tokens=64_000, supports_thinking=True,
+      input_cost_per_mtok=1_000_000,
+      output_cost_per_mtok=1_000_000,
+      cache_read_cost_per_mtok=1_000_000,
+    )
+
+  def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> object:
+    return object()
+
+  async def close_client(self, client: Any, timeout: float = 2.0) -> None:
+    self.closed_clients.append(client)
+    if self.cleanup_failure == "close_error":
+      raise RuntimeError("provider resource close failed")
+    if self.cleanup_failure == "close_cancel":
+      raise asyncio.CancelledError
+
+  def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
+    return kwargs
+
+  async def stream(self, client: Any, params: dict[str, Any]):
+    self.stream_calls += 1
+    yield StreamEvent(type="message_start", input_tokens=11, cache_read_tokens=4)
+    for call_id, query in (
+      ("call-completed-sibling", "completed"),
+      ("call-needs-approval", "pending"),
+      ("call-unscheduled", "later"),
+    ):
+      payload = {"query": query}
+      yield StreamEvent(
+        type="tool_use_end",
+        tool_id=call_id, tool_name=SOURCE_TOOL_ID, tool_input=payload,
+        raw_block={
+          "type": "tool_use", "id": call_id,
+          "name": SOURCE_TOOL_ID, "input": payload,
+        },
+      )
+    yield StreamEvent(type="usage_update", output_tokens=7)
+    yield StreamEvent(type="message_end", stop_reason="tool_use", request_input_tokens=15)
+
+
+class _ApprovalParkCodeResource:
+  def __init__(self, *, cancel_close: bool) -> None:
+    self.cancel_close = cancel_close
+    self.closed = False
+
+  async def aclose(self) -> None:
+    self.closed = True
+    if self.cancel_close:
+      raise asyncio.CancelledError
+
+
+def _exercise_approval_park_child(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  *,
+  resumed: bool,
+  cleanup_failure: str,
+) -> None:
+  from agent_gateway.admission import capture_job_context, root_context_from_identity
+  from agent_gateway.approval_route import NoApprovalRoute
+  from agent_workflow_contracts.models import AdmittedResearchBinding
+
+  async def case() -> None:
+    journal = AgentSessionLog(tmp_path / "native-child.jsonl")
+    provider = _ApprovalParkProvider(cleanup_failure)
+    execution = stub_bound_capability_execution(
+      provider=provider, model="child-model", effort="medium",
+      capability_id="node.explore", credential_principal="user",
+      auth_config={"api_key": "child-secret"},
+    )
+    definitions = [{
+      "name": SOURCE_TOOL_ID,
+      "description": "Read admitted evidence",
+      "input_schema": {"type": "object"},
+    }]
+    completed_inputs: list[dict[str, Any]] = []
+
+    async def handler(tool_input: dict[str, Any], **_kwargs: Any):
+      completed_inputs.append(dict(tool_input))
+      return {"value": "completed evidence"}, None
+
+    dispatcher = ToolDispatcher(
+      mcp_client=McpClientManager(config_path=None),
+      local_tool_handlers={SOURCE_TOOL_ID: handler},
+      get_tool_definitions=lambda: definitions,
+      capability_bind=execution.bind,
+      role="owner",
+      needs_approval=lambda *_args: False,
+    )
+    parent = AgentRunner(
+      event_log=EventLog(), dispatcher=dispatcher,
+      session_id="parent-session", capability_execution=execution,
+      user_id="child-owner", billing_mode="byok", rate_table_version="v1",
+      agent_session_log=journal, workspace_dir=tmp_path,
+    )
+    admitted = sealed_admitted_task(
+      logical_task=_LOGICAL_TASK, attempt=_ATTEMPT, result_requirement=_RESULT,
+    )
+    admission_payload = admitted.model_dump(mode="json")
+    admission_payload.pop("admitted_task_digest")
+    admission_payload["model_bind"] = execution.bind.model_dump(mode="json")
+    admission_payload["model_bind_digest"] = sha256_digest(execution.bind)
+    seal_admitted_task_payload(admission_payload)
+    admitted = AdmittedTask.model_validate(admission_payload)
+    entry = parent._task_registry.register(
+      "agent", task_id=admitted.attempt.physical_task_id,
+    )
+    entry.admitted_task = admitted
+    child_session = GatewaySession(
+      session_id="sub0:parent-session", api_key_hash="hash",
+      created_at=1, expires_at=2, user_id="child-owner",
+    )
+    capture_job_context(child_session, root_context_from_identity(
+      tenant=None,
+      job_id=admitted.attempt.physical_task_id,
+      tool_ids=frozenset({SOURCE_TOOL_ID}), withheld_tools=frozenset(),
+      research_binding=AdmittedResearchBinding(), approval_route=NoApprovalRoute(),
+    ))
+    kernel: Any = _ApprovalParkCodeResource(
+      cancel_close=cleanup_failure == "code_cancel",
+    )
+    reader: Any = _ApprovalParkCodeResource(cancel_close=False)
+    child_session.code_execution_kernels["test"] = kernel
+    child_session.code_execution_frame_reader = reader
+    park = ApprovalPark(
+      job_id=admitted.attempt.physical_task_id,
+      original_tool_call_id="call-needs-approval",
+      approval_id="approval-child", nonce="private-child-nonce",
+    )
+    original_dispatch = dispatcher.dispatch_prepared
+
+    async def dispatch_prepared(
+      tool_call_id: str,
+      tool_name: str,
+      prepared_call: PreparedToolCall,
+      **kwargs: Any,
+    ):
+      if tool_call_id == park.original_tool_call_id:
+        assert prepared_call.materialize_input() == {"query": "pending"}
+        raise park
+      return await original_dispatch(tool_call_id, tool_name, prepared_call, **kwargs)
+
+    monkeypatch.setattr(dispatcher, "dispatch_prepared", dispatch_prepared)
+    original_append = journal.append_sync
+
+    def append_with_fault(event: dict[str, Any]):
+      if (
+        cleanup_failure in {"commit_error", "nonawait_commit"}
+        and event.get("type") == "stream_complete"
+        and event.get("terminal_disposition") == "awaiting_approval"
+      ):
+        raise OSError("park journal unavailable")
+      if cleanup_failure == "commit_error" and event.get("type") == "run_error":
+        raise OSError("failure journal unavailable")
+      return original_append(event)
+
+    monkeypatch.setattr(journal, "append_sync", append_with_fault)
+    prior = SubAgentResultEvidence(
+      usage={
+        "input_tokens": 19, "output_tokens": 3,
+        "cache_read_input_tokens": 2, "estimated_cost": 0.25,
+      },
+      tools_used=("prior_tool",), fms_results=(),
+      artifact_events=(), warning_parts=(),
+    )
+    bound_runners: list[AgentRunner] = []
+    # Exact admission remains the result authority even if the separately
+    # supplied model/capability/grant provenance projections differ.
+    provenance = TaskResultProvenance(
+      admitted_task_digest=admitted.admitted_task_digest,
+      model_bind_digest=_DIGEST,
+      capability_binding_digest=_DIGEST,
+      tool_grant_digest=_DIGEST,
+    )
+    kwargs = {
+      "capability_execution": execution, "skill_name": "explore",
+      "logical_task": _LOGICAL_TASK, "attempt": _ATTEMPT,
+      "result_requirement": _RESULT, "result_provenance": provenance,
+      "dispatcher": dispatcher, "task_entry": entry,
+      "admitted_task": admitted, "sub_session": child_session,
+      "bind_job_runner": bound_runners.append,
+    }
+    result: TaskResult | None = None
+    try:
+      result, error = (
+        await parent.resume_sub_agent(
+          original_task_id="task:prior",
+          reconstructed_messages=[{"role": "user", "content": "resume"}],
+          parent_messages=[], prior_evidence=prior,
+          usage_aggregator=parent._aggregator, **kwargs,
+        )
+        if resumed
+        else await parent.spawn_sub_agent("research this", **kwargs)
+      )
+      assert error is None
+    except asyncio.CancelledError:
+      assert cleanup_failure in {"close_cancel", "code_cancel"}
+      result = entry.task_result
+    assert isinstance(result, TaskResult)
+    expected_status = (
+      "awaiting_approval" if cleanup_failure == "clean"
+      else "cancelled" if cleanup_failure in {"close_cancel", "code_cancel"}
+      else "failed"
+    )
+    assert result.execution.status == expected_status
+    child = bound_runners[0]
+    assert type(child) is AgentRunner
+    assert child._active_client is None
+    assert len(provider.closed_clients) == 1
+    assert provider.stream_calls == 1
+    assert completed_inputs == [{"query": "completed"}]
+    assert kernel.closed and reader.closed
+    assert child_session.code_execution_kernels == {}
+    assert child_session.code_execution_frame_reader is None
+    assert child._task_registry.owner is not None
+    assert child._task_registry.owner.job_id == admitted.attempt.physical_task_id
+    assert child._task_registry._owner_completed is (cleanup_failure != "clean")
+    assert parent._task_registry._child_registries[admitted.attempt.physical_task_id] is child._task_registry
+    durable_entries, _ = await journal.query(order="asc", runner_id=child._runner_id)
+    durable_events = [item.event for item in durable_entries]
+    awaiting = [
+      event for event in durable_events
+      if event.get("type") == "stream_complete"
+      and event.get("terminal_disposition") == "awaiting_approval"
+    ]
+    if cleanup_failure in {"commit_error", "nonawait_commit"}:
+      assert awaiting == []
+      if cleanup_failure == "commit_error":
+        assert child._terminal_closure_event is not None
+        assert child._terminal_closure_event["terminal_disposition"] == "awaiting_approval"
+        assert child._approval_park is park
+      else:
+        assert (
+          child._terminal_closure_event is None
+          or child._terminal_closure_event.get("terminal_disposition") != "awaiting_approval"
+        )
+        assert child._approval_park is None
+    else:
+      assert len(awaiting) == 1
+      assert child._terminal_closure_event is not None
+      assert child._terminal_closure_event["terminal_disposition"] == "awaiting_approval"
+      assert child._approval_park is park
+      assert awaiting[0]["usage"]["input_tokens"] == 11
+      assert awaiting[0]["usage"]["output_tokens"] == 7
+    for events in ([item.event for item in child._log.entries], durable_events):
+      assert any(
+        event.get("type") == "tool_call_complete"
+        and event.get("tool_call_id") == "call-completed-sibling"
+        for event in events
+      )
+      if cleanup_failure == "clean":
+        assert not any(
+          event.get("type") in {"tool_call_complete", "tool_call_interrupted"}
+          and event.get("tool_call_id") in {"call-needs-approval", "call-unscheduled"}
+          for event in events
+        )
+        assert not {"error", "run_error", "interrupted", "skill_result"} & {
+          event.get("type") for event in events
+        }
+    if cleanup_failure == "clean":
+      assert result.logical_task == admitted.logical_task
+      assert result.attempt == admitted.attempt
+      assert result.provenance == provenance_of(admitted)
+      assert result.observation.transcript.owner_id == admitted.attempt.physical_task_id
+      assert result.observation.activity.owner_id == admitted.attempt.physical_task_id
+      usage = result.observation.usage
+      assert usage.input_tokens == (30 if resumed else 11)
+      assert usage.output_tokens == (10 if resumed else 7)
+      assert usage.cached_input_tokens == (6 if resumed else 4)
+      assert usage.cost_usd == (22.25 if resumed else 22.0)
+      assert result.evidence.tools_used == (
+        ("prior_tool", SOURCE_TOOL_ID, SOURCE_TOOL_ID)
+        if resumed else (SOURCE_TOOL_ID, SOURCE_TOOL_ID)
+      )
+      assert result.outcome is None
+      assert result.values.terminal_narrative is None
+      assert result.values.projection is None
+      assert result.values.artifacts == ()
+      assert park.nonce not in result.model_dump_json()
+      assert not any(park.nonce in str(event) for event in durable_events)
+
+  asyncio.run(case())
+
+
+@pytest.mark.parametrize(
+  "cleanup_failure",
+  ["clean", "close_error", "close_cancel", "code_cancel", "commit_error", "nonawait_commit"],
+)
+def test_spawn_approval_park_preserves_admission_usage_and_owner(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  cleanup_failure: str,
+) -> None:
+  _exercise_approval_park_child(
+    monkeypatch, tmp_path, resumed=False, cleanup_failure=cleanup_failure,
+  )
+
+
+@pytest.mark.parametrize(
+  "cleanup_failure",
+  ["clean", "close_error", "close_cancel", "code_cancel", "commit_error", "nonawait_commit"],
+)
+def test_resume_approval_park_preserves_admission_usage_and_owner(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  cleanup_failure: str,
+) -> None:
+  _exercise_approval_park_child(
+    monkeypatch, tmp_path, resumed=True, cleanup_failure=cleanup_failure,
+  )

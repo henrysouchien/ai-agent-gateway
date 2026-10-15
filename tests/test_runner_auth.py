@@ -37,6 +37,7 @@ from agent_gateway.autonomous_runner_start import (  # noqa: E402
   _positive_autonomous_child_env,
 )
 from model_authority.binding import CredentialHandle
+from model_authority.selection import CapabilityDefault
 from agent_gateway.capability_execution import MaterializedCredential  # noqa: E402
 from agent_gateway.providers import StreamEvent  # noqa: E402
 from agent_gateway.providers.anthropic import AnthropicProvider  # noqa: E402
@@ -52,7 +53,6 @@ from agent_gateway.providers.anthropic_oauth import (  # noqa: E402
   upsert_anthropic_oauth_record,
 )
 from agent_gateway.runner_auth import merge_refreshed_auth_config  # noqa: E402
-from agent_gateway.runner_fork_agents import _bind_learning_fork_execution
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_bound_capability_execution,
 )
@@ -227,11 +227,14 @@ def test_runner_auth_wrappers_resolve_parent_module_helpers(monkeypatch: Any) ->
   ) == ["<redacted-secret>", "<redacted-secret>"]
 
 
-def test_merge_refreshed_auth_config_preserves_runtime_controls() -> None:
+@pytest.mark.parametrize("refreshed_mode", ["oauth", None])
+def test_merge_refreshed_auth_config_preserves_runtime_controls(
+  refreshed_mode: str | None,
+) -> None:
   merged = merge_refreshed_auth_config(
     {
       "api_key": "old",
-      "auth_mode": "oauth",
+      "auth_mode": "api",
       "auth_token": "old-token",
       "provider": "stub",
       "max_tokens": 4096,
@@ -240,7 +243,7 @@ def test_merge_refreshed_auth_config_preserves_runtime_controls() -> None:
     },
     {
       "api_key": "new",
-      "auth_mode": "oauth",
+      **({"auth_mode": refreshed_mode} if refreshed_mode is not None else {}),
       "auth_token": "new-token",
       "billing_mode": "byok",
       "rate_table_version": "unknown",
@@ -249,7 +252,7 @@ def test_merge_refreshed_auth_config_preserves_runtime_controls() -> None:
 
   assert merged == {
     "api_key": "new",
-    "auth_mode": "oauth",
+    "auth_mode": refreshed_mode if refreshed_mode is not None else "api",
     "auth_token": "new-token",
     "provider": "stub",
     "max_tokens": 4096,
@@ -258,20 +261,29 @@ def test_merge_refreshed_auth_config_preserves_runtime_controls() -> None:
   }
 
 
-def test_merge_refreshed_auth_config_rejects_selection_material() -> None:
-  config = {
-    "api_key": "old",
-    "auth_mode": "api",
-    "provider": "stub",
+@pytest.mark.parametrize("rotate_seat", [False, True])
+def test_merge_refreshed_gemini_auth_keeps_seat_identity_and_project_together(rotate_seat: bool) -> None:
+  original = {
+    "provider": "google_antigravity", "auth_mode": "oauth", "api_key": "",
+    "auth_token": "seat-one-token", "project_id": "seat-one-project",
+    "account_identity": "seat-one@example.com", "auth_user_scope": "42",
     "max_tokens": 4096,
   }
-
-  with pytest.raises(ValueError, match="must not contain model selection"):
-    merge_refreshed_auth_config(config, {"model": "other-model"})
-  with pytest.raises(ValueError, match="must not contain model selection"):
-    merge_refreshed_auth_config(config, {"thinking": False})
-  with pytest.raises(ValueError, match="must not contain model selection"):
-    merge_refreshed_auth_config(config, {"execution_transport": "native"})
+  refreshed = (
+    {
+      "auth_token": "seat-two-token", "project_id": "seat-two-project",
+      "account_identity": "seat-two@example.com",
+    }
+    if rotate_seat else {"auth_token": "seat-one-refreshed"}
+  )
+  merged = merge_refreshed_auth_config(original, refreshed)
+  assert merged["auth_token"] == ("seat-two-token" if rotate_seat else "seat-one-refreshed")
+  assert merged["project_id"] == ("seat-two-project" if rotate_seat else "seat-one-project")
+  assert merged["account_identity"] == ("seat-two@example.com" if rotate_seat else "seat-one@example.com")
+  assert merged["auth_user_scope"] == "42"
+  assert merged["provider"] == "google_antigravity"
+  assert merged["max_tokens"] == 4096
+  assert original["auth_token"] == "seat-one-token"
 
 
 @pytest.mark.parametrize("has_generation_metadata", [True, False])
@@ -431,8 +443,8 @@ def test_five_credential_generations_reach_the_usable_member_beyond_retry_budget
   assert len([event for event in events if event["type"] == "credential_refreshed"]) == 4
   retry_events = [event for event in events if event["type"] == "stream_retry"]
   assert [event["attempt"] for event in retry_events] == [0, 1, 2, 3]
-  assert retry_sleeps == pytest.approx([0.001, 0.002, 0.004, 0.008])
-  assert [event["backoff_s"] for event in retry_events] == retry_sleeps
+  assert retry_sleeps == [0.0, 0.0, 0.0, 0.0]
+  assert [event["backoff_s"] for event in retry_events] == [0.0, 0.0, 0.0, 0.0]
   assert not any(event["type"] == "error" for event in events)
   [completion] = [event for event in events if event["type"] == "stream_complete"]
   assert completion["terminal_disposition"] == "completed"
@@ -523,11 +535,14 @@ def test_cancellation_during_a_free_rotation_retry_cancels_the_turn(
   )
   retry_started = asyncio.Event()
   retry_delay = 45.0
+  observed_delays: list[float] = []
   monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", retry_delay)
 
   async def record_sleep(delay: float, result: Any = None) -> Any:
-    if delay == retry_delay:
+    if delay != gateway_runner.STREAM_GUARD_POLL_INTERVAL:
+      observed_delays.append(delay)
       retry_started.set()
+      return await asyncio.sleep(retry_delay, result)
     return await asyncio.sleep(delay, result)
 
   monkeypatch.setattr(
@@ -544,6 +559,7 @@ def test_cancellation_during_a_free_rotation_retry_cancels_the_turn(
 
   _run(cancel_retry())
 
+  assert observed_delays == [0.0]
   assert provider.streamed_tokens == [_TOKEN_A]
   member_b = resolve_anthropic_credentials().by_token(_TOKEN_B)
   assert member_b is not None
@@ -590,15 +606,26 @@ def test_learning_fork_rotates_runner_and_dispatcher_to_sibling(
       **entry.capabilities, "node.fork": "internal",
     }),
   })
+  fork_policy = resolver.selection_policy.capabilities["node.fork"]
   resolver = replace(
     resolver,
     registry=registry,
+    selection_policy=replace(resolver.selection_policy, capabilities={
+      **resolver.selection_policy.capabilities,
+      "node.fork": replace(
+        fork_policy,
+        default=CapabilityDefault(kind="inherit_parent"),
+        allowed_model_keys=frozenset({entry.key}),
+      ),
+    }),
     auth_context=replace(resolver.auth_context, entitled_capabilities=frozenset({
       *resolver.auth_context.entitled_capabilities, "node.fork",
     })),
   )
   parent_execution = replace(parent_execution, registry=registry, resolver=resolver)
-  fork_execution = _bind_learning_fork_execution(parent_execution)
+  fork_execution = resolver.materialize_bind(resolver.select_bind(
+    "node.fork", parent_bind=parent_execution.bind, selection_snapshot=None,
+  ))
   parent_dispatcher = _make_dispatcher(capability_bind=parent_execution.bind)
   event_log = EventLog()
   fork_dispatcher = parent_dispatcher.fork_child(
@@ -606,6 +633,9 @@ def test_learning_fork_rotates_runner_and_dispatcher_to_sibling(
     session_id="sess-learning-fork",
     capability_bind=fork_execution.bind,
     spawning_turn=parent_dispatcher.capture_spawning_turn(),
+    identity=None,
+    session=None,
+    approval_route=None,
   )
   runner = AgentRunner(
     event_log=event_log,
@@ -668,7 +698,6 @@ def test_usage_limited_enrolled_account_rotates_to_the_next_enrolled_account(
   parked one is parked by account identity, so the rejected account stays out
   of rotation even after its access token is refreshed.
   """
-
   store = tmp_path / "oauth.json"
   for identity in ("primary@example.com", "sibling@example.com"):
     upsert_anthropic_oauth_record(
@@ -703,6 +732,8 @@ def test_usage_limited_enrolled_account_rotates_to_the_next_enrolled_account(
   sibling = resolve_anthropic_credentials().by_token("sk-ant-oat01-sibling@example.com")
   assert sibling is not None
   assert rotated == {
+    "auth_mode": "oauth",
+    "api_key": "",
     "auth_token": "sk-ant-oat01-sibling@example.com",
     "credential_source": sibling.source_metadata(),
   }
@@ -944,7 +975,6 @@ def test_a_users_turn_rotates_inside_that_users_pool_and_never_onto_another(
   the org credential, and a turn for any other user must never be handed one of
   them — that is the whole reason the pool is user-scoped.
   """
-
   environ = {
     "USER_DATA_DIR": str(tmp_path),
     "ANTHROPIC_AUTH_TOKEN": _TOKEN_A,
@@ -987,11 +1017,16 @@ def test_a_users_turn_rotates_inside_that_users_pool_and_never_onto_another(
     return credential.source_metadata()
 
   assert provider.next_credential(mine_bound, failure) == {
+    "auth_mode": "oauth",
+    "api_key": "",
     "auth_token": sibling, "credential_source": source_of(sibling, 1),
   }
   assert provider.next_credential(
     {**mine_bound, "auth_token": sibling}, failure
-  ) == {"auth_token": _TOKEN_A, "credential_source": source_of(_TOKEN_A, 1)}
+  ) == {
+    "auth_mode": "oauth", "api_key": "",
+    "auth_token": _TOKEN_A, "credential_source": source_of(_TOKEN_A, 1),
+  }
   assert pool.blocked_until("henry-primary@example.com") == pytest.approx(reset_at, abs=2.0)
 
   # Another user's turn is served the org credential and nothing of user 1's,
@@ -1006,7 +1041,10 @@ def test_a_users_turn_rotates_inside_that_users_pool_and_never_onto_another(
       ANTHROPIC_USER_SCOPE_FIELD: "2",
     },
     failure,
-  ) == {"auth_token": _TOKEN_A, "credential_source": source_of(_TOKEN_A, 2)}
+  ) == {
+    "auth_mode": "oauth", "api_key": "",
+    "auth_token": _TOKEN_A, "credential_source": source_of(_TOKEN_A, 2),
+  }
 
 
 def test_autonomous_child_of_a_user_scoped_run_inherits_that_users_pool(
@@ -1186,3 +1224,106 @@ def test_dispatcher_credential_rebind_preserves_execution_authority(
   dispatcher = runner._dispatcher
   assert isinstance(dispatcher, ToolDispatcher)
   assert dispatcher._capability_bind is original
+
+
+def test_stream_loop_rotates_on_superseded_source_error_like_a_401(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+  """Regression d: a typed superseded source error rotates through the resolver.
+
+  The bound generation was retired at its owner mid-run. The stream loop
+  recognizes the typed error as a credential failure and takes the same
+  rotation path as a 401: the resolver names the next eligible generation and
+  the run continues on it. A frozen generation bind would instead fail typed at
+  materialization (materialize_frozen_bind), before any turn.
+  """
+  from agent_gateway.providers.anthropic_oauth import AnthropicSourceError
+
+  class _SupersededSourceProvider(_PooledAnthropicProvider):
+    """A is live at turn start, retired before the retry rebuilds its client.
+
+    The first `create_client(A)` succeeds and its turn raises a transient
+    (non-credential) error, so the retry loop rebuilds the same config. By then
+    A is retired at its owner, so the rebuild raises the typed source error —
+    exactly the trigger the retry-loop guard exists for. The guard rotates to
+    the live sibling B through the resolver.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+      super().__init__(**kwargs)
+      self._client_builds = 0
+
+    def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
+      _ = timeout
+      self._client_builds += 1
+      if self._client_builds > 1 and str(config.get("auth_token") or "") == _TOKEN_A:
+        raise AnthropicSourceError("superseded")
+      return {"auth_token": str(config.get("auth_token") or "")}
+
+    async def stream(self, client: Any, params: dict[str, Any]):
+      token = str(client["auth_token"])
+      self.streamed_tokens.append(token)
+      if token == _TOKEN_A:
+        raise RuntimeError("transient transport error")
+      yield StreamEvent(type="message_start", input_tokens=10)
+      yield StreamEvent(type="text_delta", text="rotated")
+      yield StreamEvent(type="text_end", raw_block={"type": "text", "text": "rotated"})
+      yield StreamEvent(type="usage_update", output_tokens=2)
+      yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+    def is_retryable_error(self, exc: Exception) -> bool:
+      return str(exc) == "transient transport error" or super().is_retryable_error(exc)
+
+  provider = _SupersededSourceProvider(limited_tokens=(), reset_at=time.time() + 3600)
+  runner, event_log = _make_rotation_budget_runner(
+    monkeypatch, tmp_path, provider, (_TOKEN_A, _TOKEN_B),
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
+
+  assert provider.streamed_tokens == [_TOKEN_A, _TOKEN_B]
+  events = [entry.event for entry in event_log.entries]
+  assert len([event for event in events if event["type"] == "credential_refreshed"]) == 1
+  assert not any(event["type"] == "error" for event in events)
+  member_b = resolve_anthropic_credentials().by_token(_TOKEN_B)
+  assert member_b is not None
+  assert runner.capability_execution.bind.credential_ref == (
+    member_b.source_metadata()["generation_ref"]
+  )
+  assert runner.capability_execution.auth_config["auth_token"] == _TOKEN_B
+
+
+def test_frozen_generation_bind_fails_typed_with_no_sibling_fallback(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """Regression d (frozen): a frozen generation bind never rotates to a sibling."""
+  from model_authority.binding import CapabilityResolutionError
+  from agent_gateway.capability_execution import materialize_frozen_bind
+  from agent_gateway.providers.anthropic_oauth import register_anthropic_static_credential
+
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  frozen = register_anthropic_static_credential(
+    "fixture-frozen-material", credential_kind="auth_token",
+    source="request:test:frozen", user_scope=7,
+  )
+  assert frozen is not None
+  generation_ref = frozen.generation_ref
+  # The generation is retired at its owner (a replacement consent).
+  register_anthropic_static_credential(
+    "fixture-replacement-material", credential_kind="auth_token",
+    source="request:test:frozen", user_scope=7,
+  )
+  execution = stub_bound_capability_execution(
+    provider=_PooledAnthropicProvider(limited_tokens=(), reset_at=0.0),
+    model="claude-pool-test", effort="none",
+    credential_ref=generation_ref,
+    auth_config={"auth_mode": "oauth", "auth_token": frozen.token, "max_tokens": 512},
+  )
+  resolver = execution.resolver
+  assert resolver is not None
+  bind = execution.bind
+  with pytest.raises(CapabilityResolutionError) as refused:
+    materialize_frozen_bind(
+      resolver, bind, user_scope=7, base_config={"max_tokens": 512},
+    )
+  assert refused.value.code == "credential_unavailable"

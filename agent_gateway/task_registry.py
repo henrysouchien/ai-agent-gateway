@@ -20,6 +20,14 @@ from agent_workflow_contracts import (
 )
 from agent_workflow_contracts.models import AdmittedTenant
 
+from .admission import (
+  AdmittedContext,
+  ContinuationOwners,
+  ContinueRequest,
+  ParentContext,
+  Refusal,
+  admit,
+)
 from .agent_session_log_records import (
   EVENT_SCHEMA_VERSION,
   is_current_event_schema_version,
@@ -28,6 +36,7 @@ from .child_result_trust import UNTRUSTED_CHILD_RESULTS_POLICY
 from .events import AgentCompletionEvent, TypedEvent, event_from_dict
 from .skill_lifecycle import (
   SKILL_RESULT_CORE_FIELDS,
+  SKILL_RESULT_OPTIONAL_FIELDS,
   SkillLifecycleArtifactIdentity,
   SkillLifecycleScope,
   TopLevelSkillLifecycleMetadata,
@@ -44,9 +53,13 @@ class TaskState(Enum):
   KILLED = "killed"
   INTERRUPTED = "interrupted"
   AWAITING_APPROVAL = "awaiting_approval"
+  IDLE = "idle"
+  PARKED = "parked"
 
 
 TerminationIntent = Literal["cancelled", "killed"]
+# ``ContinueRequest.cause`` in ``admission.py``; that module names no alias.
+ContinueCause = Literal["continuation", "revive", "placement_lost"]
 CompletionPersistenceState = Literal[
   "not_started",
   "in_flight",
@@ -182,6 +195,12 @@ class TaskResultSettlementError(ValueError):
   """The outer task completion conflicts with its embedded TaskResult."""
 
 
+# A resumable operation's exhaustion stops paid work it can continue
+# (``TaskRegistry.continue_task``); settlement emits these reasons only when
+# the admitted operation is ``resumable``.
+PARK_TERMINAL_REASONS = frozenset({"turns_exhausted", "share_spent"})
+
+
 def task_state_for_result(result: TaskResult) -> TaskState:
   status = result.execution.status
   if status in {"succeeded", "skipped"}:
@@ -189,6 +208,8 @@ def task_state_for_result(result: TaskResult) -> TaskState:
   if status == "cancelled":
     return TaskState.KILLED
   if status == "interrupted":
+    if result.execution.terminal_reason in PARK_TERMINAL_REASONS:
+      return TaskState.PARKED
     return TaskState.INTERRUPTED
   if status == "awaiting_approval":
     return TaskState.AWAITING_APPROVAL
@@ -390,7 +411,7 @@ def validate_required_skill_result_marker(
         f"{identity_field}"
       )
   missing_core_fields = (
-    SKILL_RESULT_CORE_FIELDS - set(marker)
+    SKILL_RESULT_CORE_FIELDS - SKILL_RESULT_OPTIONAL_FIELDS - set(marker)
   )
   if missing_core_fields:
     raise RequiredSkillResultMarkerValidationError(
@@ -400,6 +421,7 @@ def validate_required_skill_result_marker(
   core_event = {
     field_name: marker[field_name]
     for field_name in SKILL_RESULT_CORE_FIELDS
+    if field_name in marker
   }
   try:
     canonical_core = lifecycle_identity.normalize_result_event(core_event)
@@ -496,6 +518,7 @@ class ParentMessage:
   sender_job_id: str | None = None
   handle_refs: tuple[str, ...] = ()
   evidence: bool = False
+  origin: str | None = None
 
   @classmethod
   def from_durable_event(
@@ -532,6 +555,7 @@ class ParentMessage:
       sender_job_id=sender_job_id,
       handle_refs=tuple(raw_refs),
       evidence=evidence,
+      origin=event.get("origin"),
     )
 
 
@@ -1022,6 +1046,9 @@ class TaskLifecycleListener(Protocol):
 
 _TERMINAL_STATES = {TaskState.COMPLETED, TaskState.FAILED, TaskState.KILLED, TaskState.INTERRUPTED}
 _ADMISSION_SLOT_STATES = frozenset({TaskState.PENDING, TaskState.RUNNING})
+_ROSTER_NAME_STATES = frozenset({TaskState.RUNNING, TaskState.IDLE, TaskState.PARKED})
+# A park is not terminal, but the owner must learn of it to continue the job.
+_NOTIFYING_STATES = frozenset({*_TERMINAL_STATES, TaskState.PARKED})
 
 
 class NotificationQueue:
@@ -1435,6 +1462,10 @@ class TaskRegistry:
     owner: RegistryOwner | None = None,
   ) -> None:
     self._tasks: dict[str, TaskEntry] = {}
+    # Ids a resume successor has taken over. Recorded when the successor
+    # enters the registry, so it outlives the successor's eviction and does
+    # not depend on replay order.
+    self._superseded_task_ids: set[str] = set()
     self._seq = 0
     self._max_inflight = max_inflight
     self._max_retained = max_retained
@@ -1570,22 +1601,30 @@ class TaskRegistry:
     return jobs
 
   def find_on_roster(self, target: str) -> RosterJob | None:
-    """Resolve a job id, or a running agent name, within this tree.
+    """Resolve a job id, or a live (running, idle, parked) agent name.
 
     A job outside the tree is not on the roster (``None``); the harness
-    reports that as ``not_on_roster`` before any admission.
+    reports that as ``not_on_roster`` before any admission. A parked job a
+    resume successor has taken over stays addressable by id but is not a
+    name destination: its successor is the live attempt.
     """
 
     roster = self.roster()
     for job in roster:
       if job.job_id == target:
         return job
+    superseded = {
+      job.job_id
+      for job in roster
+      if job.job_id in job.registry._superseded_task_ids
+    }
     named = [
       job
       for job in roster
       if job.entry is not None
       and job.entry.agent_name == target
-      and job.entry.state == TaskState.RUNNING
+      and job.entry.state in _ROSTER_NAME_STATES
+      and job.job_id not in superseded
     ]
     if len(named) > 1:
       raise RosterAmbiguous(named)
@@ -1620,6 +1659,8 @@ class TaskRegistry:
       metadata=dict(metadata_kwargs),
     )
     self._tasks[task_id] = entry
+    if original_task_id is not None:
+      self._superseded_task_ids.add(original_task_id)
     self._auto_evict_completed()
     return entry
 
@@ -1758,6 +1799,11 @@ class TaskRegistry:
     ):
       return False
     self._remove_task(task_id)
+    original = current.original_task_id
+    if original is not None and not any(
+      entry.original_task_id == original for entry in self._tasks.values()
+    ):
+      self._superseded_task_ids.discard(original)
     return True
 
   def transition(
@@ -1782,12 +1828,45 @@ class TaskRegistry:
       entry.error = dict(error)
     if new_state in _TERMINAL_STATES:
       entry.completed_at = time.time()
+    if new_state in _NOTIFYING_STATES:
       entry.notification_generation += 1
     for listener in self._listeners:
       listener.on_transition(entry, old_state, new_state)
     if new_state in _TERMINAL_STATES:
       self._prune_completed_owner()
     return entry
+
+  def park(
+    self,
+    task_id: str,
+    *,
+    result: dict[str, Any] | None = None,
+  ) -> TaskEntry:
+    """Stop resumable paid work without settling it terminal."""
+    return self.transition(task_id, TaskState.PARKED, result=result)
+
+  def revive_to_running(self, task_id: str) -> TaskEntry:
+    """Return a parked job to running once its continuation is admitted."""
+    return self.transition(task_id, TaskState.RUNNING)
+
+  def continue_task(
+    self,
+    job_id: str,
+    cause: ContinueCause,
+    *,
+    parent: ParentContext,
+    owners: ContinuationOwners,
+    message: str | None = None,
+  ) -> AdmittedContext[AdmittedTask] | Refusal:
+    """Continue one job through the single continuation admission.
+
+    ``admit`` owns whether the job may continue; this does not re-check state.
+    """
+    return admit(
+      ContinueRequest(job_id=job_id, cause=cause, message=message),
+      parent,
+      owners=owners,
+    )
 
   def commit_parked_termination(
     self,
@@ -1860,12 +1939,12 @@ class TaskRegistry:
     result: dict[str, Any] | None = None,
     error: dict[str, Any] | None = None,
   ) -> TaskEntry:
-    """Finalize one replayed interrupted task after resume is abandoned."""
+    """Finalize one replayed parked or interrupted task after resume is abandoned."""
 
     entry = self._tasks.get(task_id)
     if entry is None:
       raise KeyError(f"Unknown task: {task_id}")
-    if entry.state != TaskState.INTERRUPTED:
+    if entry.state not in {TaskState.INTERRUPTED, TaskState.PARKED}:
       return entry
     if new_state not in {
       TaskState.COMPLETED,
@@ -1873,7 +1952,8 @@ class TaskRegistry:
       TaskState.KILLED,
     }:
       raise ValueError(
-        "interrupted tasks may only finalize to completed, failed, or killed"
+        "parked or interrupted tasks may only finalize to completed, failed, "
+        "or killed"
       )
 
     old_state = entry.state
@@ -1934,6 +2014,48 @@ class TaskRegistry:
       listener.on_transition(entry, old_state, entry.state)
     return entry
 
+  def restore_committed_park(
+    self,
+    task_id: str,
+    *,
+    result: dict[str, Any] | None,
+  ) -> TaskEntry:
+    """Restore a late-fsync job park from the uncertain interrupted projection;
+    the job-park counterpart of ``restore_committed_awaiting``."""
+    entry = self._tasks.get(task_id)
+    if entry is None:
+      raise KeyError(f"Unknown task: {task_id}")
+    canonical = entry.task_result
+    admitted = entry.admitted_task
+    if (
+      entry.state != TaskState.INTERRUPTED
+      or entry.completion_persistence_state != "committed"
+      or canonical is None
+      or admitted is None
+      or canonical.attempt.physical_task_id != task_id
+      or result is None
+      or result != canonical.model_dump(mode="json")
+    ):
+      raise TaskResultSettlementError(
+        "job park restoration requires an interrupted projection of the "
+        "exact committed admitted TaskResult"
+      )
+    validate_task_result_admission(canonical, admitted)
+    validate_task_result_settlement(
+      canonical,
+      final_state=TaskState.PARKED,
+      error=None,
+    )
+    old_state = entry.state
+    entry.state = TaskState.PARKED
+    entry.result = dict(result)
+    entry.error = None
+    entry.completed_at = None
+    entry.notification_generation += 1
+    for listener in self._listeners:
+      listener.on_transition(entry, old_state, entry.state)
+    return entry
+
   def adopt_reconstructed(self, entry: TaskEntry) -> TaskEntry:
     """Store a durable reconstruction, retaining the canonical live entry."""
 
@@ -1943,6 +2065,8 @@ class TaskRegistry:
     if not entry.reconstructed_from_log:
       raise ValueError("only reconstructed tasks may be adopted")
     self._tasks[entry.task_id] = entry
+    if entry.original_task_id is not None:
+      self._superseded_task_ids.add(entry.original_task_id)
     suffix = self._numeric_suffix(entry.task_id)
     if suffix is not None:
       self._seq = max(self._seq, suffix + 1)
@@ -2020,9 +2144,10 @@ class TaskRegistry:
   def load_from_events(self, events: list[dict[str, Any]]) -> None:
     """Rebuild registry from durable task events without firing listeners.
 
-    Tasks that were killed in a prior process rebuild as ``interrupted`` if no
-    durable completion event exists; the log cannot distinguish those from
-    tasks that were running when the process crashed.
+    A registration with no durable completion rebuilds ``parked``: it is paid
+    work a prior process stopped (killed, crashed, or host restarted) and its
+    transcript is on the journal, so ``continue_task`` can resume it. A
+    ``task_completed`` rebuilds its recorded final state.
 
     Current-schema registrations retain their raw metadata even without an
     optional duplicate ``capability_bind`` receipt. Executable authority comes
@@ -2119,7 +2244,7 @@ class TaskRegistry:
         events=list(bucket.get("messages") or []),
       )
 
-      state = TaskState.INTERRUPTED
+      state = TaskState.PARKED
       result = None
       task_result: TaskResult | None = None
       completion_envelope: AgentCompletionEnvelope | None = None

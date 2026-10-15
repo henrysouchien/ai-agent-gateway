@@ -115,6 +115,7 @@ def test_typed_events_round_trip_with_type_discriminator() -> None:
       proposal_ids=[],
       verdict_echo={"verdict": "SCENARIOS_BUILT", "confidence": "HIGH"},
       fms_results=[],
+      last_failed_door_answer=None,
       artifact_events=[],
       output_memory_file=None,
       cost_usd=0.12,
@@ -129,7 +130,7 @@ def test_typed_events_round_trip_with_type_discriminator() -> None:
       artifact_id="2026-05-20T120000.000-run-1",
       artifact_path="artifacts/research/PCTY/earnings-scenarios.json",
       binary_artifact_path=None,
-      contract_name="EarningsScenarios",
+      contract_name="earnings-scenarios",
       data_source="live",
       ts=3.0,
     ),
@@ -184,7 +185,7 @@ def test_typed_events_round_trip_with_type_discriminator() -> None:
       ticker="PCTY",
       skill="earnings-scenarios",
       artifact_id="2026-05-20T120000.000-run-1",
-      contract_name="EarningsScenarios",
+      contract_name="earnings-scenarios",
       partial_view_model={"scenarios": [{"name": "Base"}]},
       ts=3.5,
     ),
@@ -265,6 +266,7 @@ def test_skill_result_captured_event_round_trip() -> None:
         "artifact_ref": "notes/skills/risk-review/result.typed.json",
       }
     ],
+    last_failed_door_answer=None,
     artifact_events=[],
     output_memory_file=None,
     cost_usd=None,
@@ -436,7 +438,7 @@ def test_artifact_updated_event_contract_round_trip() -> None:
     ticker="MSFT",
     skill="earnings-scenarios",
     artifact_id="artifact-stream-1",
-    contract_name="EarningsScenarios",
+    contract_name="earnings-scenarios",
     partial_view_model={
       "base": {"label": "Base", "eps": 22.26},
       "bull": {"label": "Bull", "eps": 24.47},
@@ -453,7 +455,7 @@ def test_artifact_updated_event_contract_round_trip() -> None:
     "ticker": "MSFT",
     "skill": "earnings-scenarios",
     "artifact_id": "artifact-stream-1",
-    "contract_name": "EarningsScenarios",
+    "contract_name": "earnings-scenarios",
     "partial_view_model": {
       "base": {"label": "Base", "eps": 22.26},
       "bull": {"label": "Bull", "eps": 24.47},
@@ -472,7 +474,7 @@ def test_artifact_updated_event_rejects_malformed_partial_view_model() -> None:
     "ticker": "MSFT",
     "skill": "earnings-scenarios",
     "artifact_id": "artifact-stream-1",
-    "contract_name": "EarningsScenarios",
+    "contract_name": "earnings-scenarios",
     "partial_view_model": ["not", "a", "mapping"],
     "ts": 12.5,
   }
@@ -511,7 +513,7 @@ def test_artifact_event_still_defaults_legacy_scope() -> None:
     "artifact_id": "artifact-1",
     "artifact_path": "artifacts/research/PCTY/earnings-scenarios.json",
     "binary_artifact_path": None,
-    "contract_name": "EarningsScenarios",
+    "contract_name": "earnings-scenarios",
     "data_source": "live",
     "ts": 3.0,
   }
@@ -529,6 +531,8 @@ def test_tool_approval_decided_event_supports_all_decision_sources_and_outcomes(
     "headless_auto_deny",
     "headless_hook_approved",
     "session_cache_approved",
+    "durable_approved_binding",
+    "durable_approval_denied",
     "approval_timeout",
   ]
   outcomes = ["approved", "denied", "timeout"]
@@ -542,7 +546,7 @@ def test_tool_approval_decided_event_supports_all_decision_sources_and_outcomes(
         "timeout"
         if decision_source == "approval_timeout"
         else "denied"
-        if decision_source in {"user_denied", "relay_policy_denied", "headless_auto_deny"}
+        if decision_source in {"user_denied", "relay_policy_denied", "headless_auto_deny", "durable_approval_denied"}
         else "approved"
       ),
       "decision_source": decision_source,
@@ -683,7 +687,7 @@ def _session_recap_event(
       RecapArtifact(
         artifact_id="artifact-1",
         skill="earnings-scenarios",
-        contract_name="EarningsScenarios",
+        contract_name="earnings-scenarios",
         ticker=None,
         artifact_path="artifacts/research/PCTY/earnings-scenarios.json",
         emitted_at_seq=3,

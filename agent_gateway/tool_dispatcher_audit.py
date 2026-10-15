@@ -5,6 +5,8 @@ import time
 import inspect
 from typing import Any, Callable
 
+from .events import ApprovalDecisionSource
+
 log = logging.getLogger("agent_gateway.tool_dispatcher_audit")
 
 
@@ -77,23 +79,24 @@ def emit_approval_decided(
   tool_name: str,
   *,
   outcome: str,
-  decision_source: str,
+  decision_source: ApprovalDecisionSource,
   allow_tool_type_applied: bool,
   time_fn: Callable[[], float] = time.time,
-) -> None:
+) -> dict[str, Any] | None:
+  """Append the decision to ``event_log``; returns the appended event."""
   if event_log is None:
-    return
-  event_log.append(
-    {
-      "type": "tool_approval_decided",
-      "tool_call_id": tool_call_id,
-      "tool_name": tool_name,
-      "outcome": outcome,
-      "decision_source": decision_source,
-      "allow_tool_type_applied": allow_tool_type_applied,
-      "ts": time_fn(),
-    }
-  )
+    return None
+  event = {
+    "type": "tool_approval_decided",
+    "tool_call_id": tool_call_id,
+    "tool_name": tool_name,
+    "outcome": outcome,
+    "decision_source": decision_source,
+    "allow_tool_type_applied": allow_tool_type_applied,
+    "ts": time_fn(),
+  }
+  event_log.append(event)
+  return event
 
 
 __all__ = [

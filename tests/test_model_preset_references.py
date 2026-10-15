@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from agent_gateway import AgentRunner, McpClientManager, ToolDispatcher
 from agent_gateway.auth import AuthConfig, ResolverResult
-from agent_gateway.commercial_claims import VerifiedCommercialClaim
+from hank_contracts.commercial_claims import VerifiedCommercialClaim
 from agent_gateway.model_preferences import ModelPreferenceStore
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 from agent_gateway.server_models import ChatRequest
@@ -147,6 +147,7 @@ def test_authenticated_user_preset_doors_round_trip_and_actor_isolation(tmp_path
     bob = _headers(client, "bob-key")
     assert client.get("/api/model-presets/self", headers=alice).json() == {
       "name": None, "policy_revision": None, "updated_at": None,
+      "known_preset_names": ["base", "economy"],
     }
     put = client.put("/api/model-presets/self", headers=alice, json={"name": "economy"})
     assert put.status_code == 200, put.text
@@ -162,7 +163,10 @@ def test_authenticated_user_preset_doors_round_trip_and_actor_isolation(tmp_path
     assert bob_put.status_code == 200, bob_put.text
     deleted = client.delete("/api/model-presets/self", headers=alice)
     assert deleted.status_code == 200, deleted.text
-    assert deleted.json() == {"name": None, "policy_revision": None, "updated_at": None}
+    assert deleted.json() == {
+      "name": None, "policy_revision": None, "updated_at": None,
+      "known_preset_names": ["base", "economy"],
+    }
     assert client.get("/api/model-presets/self", headers=alice).json()["name"] is None
     assert client.get("/api/model-presets/self", headers=bob).json()["name"] == "base"
   assert store.get_user_preset(tenant_id="test-product", actor_id="101") is None
@@ -186,6 +190,24 @@ def test_unknown_preset_name_returns_existing_error_envelope_without_overwriting
     assert client.get("/api/model-presets/self", headers=headers).json() == accepted.json()
   reference = store.get_user_preset(tenant_id="test-product", actor_id="101")
   assert reference is not None and reference.name == "economy"
+
+
+def test_every_preset_door_lists_the_names_it_accepts(tmp_path: Path) -> None:
+  app, _store = _preset_app(tmp_path)
+  with TestClient(app) as client:
+    headers = _headers(client)
+    listed = client.get("/api/model-presets/self", headers=headers)
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["known_preset_names"] == ["base", "economy"]
+    selected = client.put(
+      "/api/model-presets/self", headers=headers,
+      json={"name": listed.json()["known_preset_names"][0]},
+    )
+    assert selected.status_code == 200, selected.text
+    assert selected.json()["name"] == "base"
+    assert selected.json()["known_preset_names"] == ["base", "economy"]
+    cleared = client.delete("/api/model-presets/self", headers=headers)
+    assert cleared.json()["known_preset_names"] == ["base", "economy"]
 
 
 @pytest.mark.parametrize("method", ["get", "put", "delete"])

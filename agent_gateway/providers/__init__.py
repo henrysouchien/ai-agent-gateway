@@ -8,13 +8,34 @@ from .agent_sdk import AgentSDKConfig
 from .anthropic import AnthropicProvider
 from .base import CostEstimate, ModelInfo, ModelProvider, StreamEvent, truncate_to_last_compaction
 from .codex import CodexProvider
+from .copilot import CopilotResponsesProvider
+from .google import GoogleGenerateContentProvider
+from .google_antigravity import GoogleAntigravityProvider
+from .kimi_code import KimiCodeProvider
+from .muse import MuseResponsesProvider
+from .ollama import OllamaLocalProvider
+from .ollama_cloud import OllamaCloudProvider
 from .openai import OpenAIProvider
 from .xai import XAIProvider
+from .credential_pool import (
+  ProviderCredentialPool,
+  get_provider_credential_pool,
+  get_provider_pool_hooks,
+  register_provider_pool_hooks,
+  rotate_provider_credential,
+)
 
 
 _INSTALLED_PROVIDER_CLASSES: tuple[type[ModelProvider], ...] = (
   AnthropicProvider,
   CodexProvider,
+  CopilotResponsesProvider,
+  GoogleGenerateContentProvider,
+  GoogleAntigravityProvider,
+  KimiCodeProvider,
+  MuseResponsesProvider,
+  OllamaLocalProvider,
+  OllamaCloudProvider,
   OpenAIProvider,
   XAIProvider,
 )
@@ -66,13 +87,25 @@ __all__ = [
   "AgentSDKConfig",
   "AnthropicProvider",
   "CodexProvider",
+  "CopilotResponsesProvider",
   "CostEstimate",
+  "GoogleAntigravityProvider",
+  "GoogleGenerateContentProvider",
+  "KimiCodeProvider",
   "ModelInfo",
   "ModelProvider",
+  "MuseResponsesProvider",
+  "OllamaCloudProvider",
+  "OllamaLocalProvider",
   "OpenAIProvider",
-  "XAIProvider",
+  "ProviderCredentialPool",
   "StreamEvent",
+  "XAIProvider",
+  "get_provider_credential_pool",
+  "get_provider_pool_hooks",
   "installed_adapter_providers",
   "installed_adapter_route_support",
+  "register_provider_pool_hooks",
+  "rotate_provider_credential",
   "truncate_to_last_compaction",
 ]

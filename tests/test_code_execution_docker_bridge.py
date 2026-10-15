@@ -27,7 +27,6 @@ from agent_gateway.code_execution import CodeExecutionConfig, build_code_executi
 from agent_gateway.code_execution._backends._docker import DockerBackend
 from agent_gateway.code_execution._backends._kernel import KernelState
 from agent_gateway.code_execution._frame_codec import MAX_FRAME_BYTES
-from agent_gateway.code_execution._background import OutputRingBuffer
 from agent_gateway.tool_dispatcher_helpers import ToolResult
 from test_code_execution_bridge import (
   FRED_SERIES,
@@ -39,11 +38,24 @@ from test_code_execution_bridge import (
   _CaptureMcp,
   _FILING_HANDLES,
   _bind,
+  _code_job,
   _fd_closed,
   _filings_extractor,
+  _job_runner,
   _policy,
   _record_open_cells,
 )
+from agent_gateway.session import SessionStream
+from agent_gateway.event_log import EventLog
+from agent_gateway.task_registry import TaskState
+from tests.host_timing_test_support import harness_wait_seconds
+
+
+# Loaded 12-worker gates took 45.4-46.6s to bring a container up (3-5s alone), so every
+# wait that spans a container start or a kernel exit scales its solo bound by 3.5x and
+# then by host load. These are hang guards for the test, never product latency bounds.
+def _docker_wait(solo_seconds: float) -> float:
+  return harness_wait_seconds(solo_seconds * 3.5)
 
 
 @pytest.fixture(scope="module")
@@ -79,18 +91,19 @@ def docker_runtime(docker_image: str, monkeypatch: pytest.MonkeyPatch, _policy: 
 
 
 class _BlockedMcp(_CaptureMcp):
-  """Keep a real nested dispatcher call pending until its channel cancels it."""
+  """Keep a real nested dispatcher call pending until released or cancelled."""
 
   def __init__(self, *, frame_reader: Any) -> None:
     super().__init__(frame_reader=frame_reader)
     self.entered = asyncio.Event()
     self.finished = asyncio.Event()
+    self.release = asyncio.Event()
 
   async def call_tool(self, *args: Any, **kwargs: Any) -> ToolResult:
     result = await super().call_tool(*args, **kwargs)
     self.entered.set()
     try:
-      await asyncio.Event().wait()
+      await self.release.wait()
       return result
     except asyncio.CancelledError:
       self.cancelled = True
@@ -101,7 +114,9 @@ class _BlockedMcp(_CaptureMcp):
 
 def _setup(config: CodeExecutionConfig, *, blocked: bool = False) -> tuple[Any, ...]:
   session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-  bundle = build_code_execution(session, config=config)
+  runner = _job_runner()
+  session.active_turn = SessionStream(event_log=EventLog(), runner_task=None, runtime_owner=runner)
+  bundle = build_code_execution(session, config=config, job_runner=lambda: runner)
   mcp = (_BlockedMcp if blocked else _CaptureMcp)(frame_reader=bundle.frame_reader)
   dispatcher = _bind(bundle, mcp, extract_sources=_filings_extractor)
   return session, bundle, mcp, dispatcher, _record_open_cells(bundle)
@@ -115,16 +130,13 @@ async def _run_cell(dispatcher: Any, code: str, **extra: Any) -> tuple[Any, Any]
   )
 
 
-async def _collect_background(dispatcher: Any, task_id: str) -> Any:
-  async def collect() -> Any:
-    while True:
-      result, error = await dispatcher.dispatch("toolu_status", "code_execute_status", {"task_id": task_id})
-      assert error is None, error
-      if result.get("status") != "running":
-        return result
-      await asyncio.sleep(0.05)
-
-  return await asyncio.wait_for(collect(), timeout=30)
+async def _collect_background(session: Any, task_id: str) -> Any:
+  """Await the `code` job and read it through the registry's result payload."""
+  entry = _code_job(session, task_id)
+  assert entry.asyncio_task is not None
+  await asyncio.wait_for(entry.asyncio_task, timeout=_docker_wait(30))
+  assert entry.state == TaskState.COMPLETED
+  return session.active_turn.runtime_owner._background_task_payload(entry)
 
 
 async def _assert_cell_finished(
@@ -216,8 +228,7 @@ def test_docker_nested_results_compose_and_preserve_ledger_sources(docker_runtim
       assert result["backend"] == "docker" and result["sandboxed"] is True
       if background:
         task_id = result["task_id"]
-        result = await _collect_background(dispatcher, task_id)
-        assert task_id not in session.background_tasks
+        result = await _collect_background(session, task_id)
       assert result["return_code"] == 0, result
       assert result["stdout"] == "160.7\n"
       assert result["stderr"] == ""
@@ -251,6 +262,8 @@ def test_docker_nested_results_compose_and_preserve_ledger_sources(docker_runtim
       assert session.code_execution_kernels["docker"] is state
       interrupted, error = await _run_cell(later_dispatcher, "import time\ntime.sleep(60)", timeout_ms=1000)
       assert error is None and interrupted["timed_out"] and interrupted["return_code"] == 124
+      assert "[cell interrupted after 1000 ms timeout; kernel state kept]" in interrupted["stderr"]
+      assert interrupted["compute_ms"] >= 990 and interrupted["host_wait_ms"] == 0
       resumed, error = await _run_cell(later_dispatcher, 'print(filings["filings"][0]["form"])')
       assert error is None and resumed["return_code"] == 0 and resumed["stdout"] == "10-K\n"
       assert state.container_id == container_id
@@ -340,7 +353,7 @@ def test_docker_catalog_and_calls_obey_host_grant_and_registration(docker_runtim
 
 
 @pytest.mark.parametrize("background", [False, True], ids=["foreground", "background"])
-def test_docker_timeout_cancels_blocked_nested_dispatch(docker_runtime: Any, background: bool) -> None:
+def test_docker_blocked_nested_dispatch_is_host_wait_not_compute_timeout(docker_runtime: Any, background: bool) -> None:
   async def run() -> None:
     config, handles = docker_runtime
     session, bundle, mcp, dispatcher, opened = _setup(config, blocked=True)
@@ -348,22 +361,24 @@ def test_docker_timeout_cancels_blocked_nested_dispatch(docker_runtime: Any, bac
     running = asyncio.create_task(_run_cell(dispatcher, f"""
       saved = 71
       print("calling", flush=True)
-      hank.call({FRED_SERIES!r}, series_id="CPIAUCSL")
-      print("unreachable")
-    """, background=background, timeout_ms=5000))
+      print(hank.call({FRED_SERIES!r}, series_id="CPIAUCSL")["series_id"])
+    """, background=background, timeout_ms=1000))
     try:
-      await asyncio.wait_for(mcp.entered.wait(), timeout=20)
+      await asyncio.wait_for(mcp.entered.wait(), timeout=_docker_wait(45))
       assert bundle.frame_reader.active_cells() == (OUTER_ID,)
-      result, error = await asyncio.wait_for(running, timeout=30)
+      await asyncio.sleep(2.5)  # The host call stays blocked well past the 1000 ms compute bound.
+      mcp.release.set()
+      result, error = await asyncio.wait_for(running, timeout=_docker_wait(60))
       assert error is None, error
       if background:
-        result = await _collect_background(dispatcher, result["task_id"])
-      assert result["timed_out"] is True
-      assert result["return_code"] != 0
-      assert result["stdout"] == "calling\n"
-      assert mcp.cancelled is True and mcp.finished.is_set()
-      assert [(entry["ok"], entry["error_code"]) for entry in result["nested_calls"]] == [(False, "cancelled")]
-      assert session.background_tasks == {}
+        result = await _collect_background(session, result["task_id"])
+      assert result["timed_out"] is False, result
+      assert result["return_code"] == 0, result["stderr"]
+      assert result["stdout"] == "calling\nCPIAUCSL\n"
+      assert result["host_wait_ms"] >= 2500
+      assert result["compute_ms"] < 1000
+      assert mcp.cancelled is False and mcp.finished.is_set()
+      assert [(entry["ok"], entry["error_code"]) for entry in result["nested_calls"]] == [(True, None)]
       following, error = await _run_cell(dispatcher, "print(saved)")
       assert error is None and following["return_code"] == 0 and following["stdout"] == "71\n"
       await _assert_runtime_running(handles)
@@ -389,7 +404,7 @@ def test_docker_cancel_during_nested_dispatch_releases_every_owner(docker_runtim
       background=termination != "foreground_cancel",
     ))
     try:
-      await asyncio.wait_for(mcp.entered.wait(), timeout=20)
+      await asyncio.wait_for(mcp.entered.wait(), timeout=_docker_wait(20))
       assert bundle.frame_reader.active_cells() == (OUTER_ID,)
       [(_backend, handle)] = handles
       code, stdout, stderr = await _backend._docker_exec(
@@ -399,21 +414,20 @@ def test_docker_cancel_during_nested_dispatch_releases_every_owner(docker_runtim
       if termination == "foreground_cancel":
         running.cancel()
         with pytest.raises(asyncio.CancelledError):
-          await asyncio.wait_for(running, timeout=20)
+          await asyncio.wait_for(running, timeout=_docker_wait(20))
       else:
-        started, error = await asyncio.wait_for(running, timeout=20)
+        started, error = await asyncio.wait_for(running, timeout=_docker_wait(20))
         assert error is None, error
+        job = _code_job(session, started["task_id"])
         if termination == "background_cancel":
-          result, error = await asyncio.wait_for(dispatcher.dispatch(
-            "toolu_cancel", "code_execute_status", {"task_id": started["task_id"], "cancel": True},
-          ), timeout=20)
-          assert error is None, error
-          assert result == {"status": "cancelled", "task_id": started["task_id"]}
+          assert session.active_turn.runtime_owner.cancel_background_task(job.task_id) is True
+          assert job.asyncio_task is not None
+          await asyncio.wait_for(job.asyncio_task, timeout=_docker_wait(20))
         else:
-          await asyncio.wait_for(_teardown(session, bundle, opened, handles), timeout=20)
+          await asyncio.wait_for(_teardown(session, bundle, opened, handles), timeout=_docker_wait(20))
+        assert job.state == TaskState.KILLED
       assert mcp.cancelled is True and mcp.finished.is_set()
       assert mcp.calls == [(FRED_SERIES, {"series_id": "CPIAUCSL"})]
-      assert session.background_tasks == {}
       [(cell, _original_fds)] = opened
       assert [(entry["ok"], entry["error_code"]) for entry in cell.summary()["nested_calls"]] == [(False, "cancelled")]
       if termination != "session_cleanup":
@@ -449,13 +463,13 @@ def test_docker_cell_done_cancels_pending_dispatch_without_blocking_output(docke
       print("done", flush=True)
     """, background=background, timeout_ms=5000))
     try:
-      await asyncio.wait_for(mcp.entered.wait(), timeout=20)
+      await asyncio.wait_for(mcp.entered.wait(), timeout=_docker_wait(20))
       [(_backend, handle)] = handles
       (Path(handle.work_dir) / "release-exit").touch()
-      result, error = await asyncio.wait_for(running, timeout=20)
+      result, error = await asyncio.wait_for(running, timeout=_docker_wait(20))
       assert error is None, error
       if background:
-        result = await _collect_background(dispatcher, result["task_id"])
+        result = await _collect_background(session, result["task_id"])
       assert mcp.entered.is_set()
       assert result["stdout"] == "done\n"
       assert result["return_code"] == 0 and result["timed_out"] is False, result
@@ -477,12 +491,10 @@ def test_docker_live_output_is_lines_and_tail_keeps_last_twenty(docker_runtime: 
     config, _handles = docker_runtime
     lines = [f"{i:03d} " + "x" * 36 + "\n" for i in range(300)] + ["END\n"]
     events: list[str] = []
-    ring = OutputRingBuffer()
 
     def output(stream: str, text: str) -> None:
       assert stream == "stdout"
       events.append(text)
-      ring.append(stream, text)
 
     async with _backend(config) as backend:
       result = await backend.execute(
@@ -494,7 +506,6 @@ def test_docker_live_output_is_lines_and_tail_keeps_last_twenty(docker_runtime: 
       assert result["truncated"] is True
       assert (Path(config.work_dir_root) / result["spill"]["stdout"]).read_text() == "".join(lines)
       assert events == lines
-      assert ring.tail(20) == "".join(lines[-20:])
 
   asyncio.run(run())
 

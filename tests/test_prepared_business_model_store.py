@@ -5,11 +5,11 @@ import hashlib
 import json
 import logging
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import pytest
 
-from agent_gateway.approval_policy import ApprovalRequest, RunContext, build_approval_request
+from agent_gateway.approval_policy import ApprovalRequest, ApprovalVote, RunContext, build_approval_request
 from agent_gateway import approval_store as approval_store_module
 from agent_gateway.approval_store import (
   ApprovalMaintenanceResult,
@@ -39,7 +39,7 @@ def _record(
   *,
   locator: str = "request-1",
   intent_digest: str = "1" * 64,
-  expires_at: str | None = "2099-01-01T00:00:00+00:00",
+  expires_at: str | None = None,
   approval_id: str = "approval-1",
   approval_chain_id: str = "chain-1",
 ) -> PreparedBusinessModelChange:
@@ -82,10 +82,7 @@ def _request_and_record(
     ),
     state="pending_user",
   )
-  request = replace(
-    request,
-    expires_at=approval_expires_at or request.requested_at + timedelta(minutes=15),
-  )
+  request = replace(request, expires_at=approval_expires_at)
   return request, _record(
     locator=locator,
     approval_id=request.approval_id,
@@ -133,10 +130,6 @@ async def test_approval_and_prepared_change_are_created_atomically(
     ),
     state="pending_user",
   )
-  request = replace(
-    request,
-    expires_at=request.requested_at + timedelta(minutes=15),
-  )
   record = _record(
     approval_id=request.approval_id,
     approval_chain_id=request.approval_chain_id,
@@ -174,35 +167,6 @@ async def test_approval_and_prepared_change_are_created_atomically(
       record,
     )
   assert await failing_store.get_by_tool_call_id(request.tool_call_id) is None
-
-
-@pytest.mark.asyncio
-async def test_prepared_change_without_finite_expiry_is_rejected_atomically(tmp_path) -> None:
-  request = build_approval_request(
-    tool_call_id="business-model-http:user-7:no-expiry",
-    tool_name="accept_business_model_revision",
-    tool_class="state_write",
-    tool_args_redacted={"request_id": "no-expiry"},
-    args_hash="1" * 64,
-    run_context=RunContext(
-      user_id="tenant-1:user-7",
-      request_id="no-expiry",
-      profile="research_http",
-      channel="web",
-    ),
-    state="pending_user",
-  )
-  record = _record(
-    locator="no-expiry",
-    expires_at=None,
-    approval_id=request.approval_id,
-    approval_chain_id=request.approval_chain_id,
-  )
-  store = SQLiteApprovalStore(tmp_path / "no-expiry.sqlite3")
-
-  with pytest.raises(PreparedBusinessModelError, match="finite expiry"):
-    await store.create_or_get_with_prepared_business_model_change(request, record)
-  assert await store.get_by_tool_call_id(request.tool_call_id) is None
 
 
 @pytest.mark.asyncio
@@ -324,110 +288,71 @@ async def test_prepared_lifecycle_rejects_arbitrary_edges_and_invalid_terminal_r
 
 
 @pytest.mark.asyncio
-async def test_pending_prepared_records_expire_without_changing_payload(tmp_path) -> None:
-  store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
-  expired_at = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
-  record = _record(expires_at=expired_at)
-  await store.insert_or_verify_prepared_business_model_change(record)
+@pytest.mark.parametrize(
+  "approval_expiry",
+  [None, datetime(2000, 1, 1, tzinfo=UTC)],
+)
+async def test_late_vote_authorizes_and_consumes_original_prepared_bytes(
+  tmp_path,
+  approval_expiry: datetime | None,
+) -> None:
+  path = tmp_path / "late-vote.sqlite3"
+  store = SQLiteApprovalStore(path)
+  request, record = _request_and_record(
+    locator="late-vote",
+    approval_expires_at=approval_expiry,
+  )
+  _, record, _ = await store.create_or_get_with_prepared_business_model_change(
+    request,
+    record,
+  )
 
-  assert await store.expire_prepared_business_model_changes(
-    now=datetime.now(UTC).isoformat()
-  ) == 1
-  loaded = await store.get_prepared_business_model_change(
+  await store.maintain_pending()
+  pending = await store.get(request.approval_id)
+  assert pending is not None and pending.state == "pending_user"
+  pending_record = await store.reconcile_prepared_business_model_change(
     caller_kind=record.caller_kind,
     user_scope=record.user_scope,
     idempotency_locator=record.idempotency_locator,
   )
-  assert loaded is not None
-  assert loaded.lifecycle is PreparedBusinessModelLifecycle.EXPIRED
-  assert loaded.prepared_payload == record.prepared_payload
+  assert pending_record.record == record
+  assert pending_record.transitioned is False
 
-  authorized = _record(locator="authorized", expires_at=expired_at)
-  await store.insert_or_verify_prepared_business_model_change(authorized)
-  await store.transition_prepared_business_model_change(
-    caller_kind=authorized.caller_kind,
-    user_scope=authorized.user_scope,
-    idempotency_locator=authorized.idempotency_locator,
-    expected=PreparedBusinessModelLifecycle.PENDING,
-    target=PreparedBusinessModelLifecycle.AUTHORIZED,
-    approval_id=authorized.approval_id,
-    approval_chain_id=authorized.approval_chain_id,
-  )
-  assert await store.expire_prepared_business_model_changes(
-    now=datetime.now(UTC).isoformat()
-  ) == 0
-  retained = await store.get_prepared_business_model_change(
-    caller_kind=authorized.caller_kind,
-    user_scope=authorized.user_scope,
-    idempotency_locator=authorized.idempotency_locator,
-  )
-  assert retained is not None
-  assert retained.lifecycle is PreparedBusinessModelLifecycle.AUTHORIZED
-
-
-@pytest.mark.asyncio
-async def test_targeted_reconciliation_gives_prepared_ttl_precedence_over_approval(
-  tmp_path,
-) -> None:
-  store = SQLiteApprovalStore(tmp_path / "ttl-first.sqlite3")
-  request, record = _request_and_record(
-    locator="ttl-first",
-    approval_expires_at=datetime(2026, 1, 1, tzinfo=UTC),
-  )
-  await store.create_or_get_with_prepared_business_model_change(request, record)
-  with store._connection() as conn:
-    conn.execute(
-      "UPDATE prepared_business_model_change SET expires_at = ? WHERE idempotency_locator = ?",
-      ("2026-01-01T00:00:00Z", record.idempotency_locator),
-    )
-  approved = await store.transition_state(
+  reopened = SQLiteApprovalStore(path)
+  approved = await reopened.record_vote(
     request.approval_id,
-    "approved",
-    expected_state_version=request.state_version,
+    ApprovalVote(
+      vote_id="late-owner-vote",
+      approval_id=request.approval_id,
+      decider_id="tenant-1:user-7",
+      decider_role="owner",
+      decision="approved",
+      decision_reason=None,
+      decided_at=datetime.now(UTC),
+    ),
   )
-  assert approved.state == "approved"
-
-  result = await store.reconcile_prepared_business_model_change(
-    caller_kind=record.caller_kind,
-    user_scope=record.user_scope,
-    idempotency_locator=record.idempotency_locator,
-    now=datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC),
-  )
-
-  assert result.transitioned is True
-  assert result.conflict is None
-  assert result.record is not None
-  assert result.record.lifecycle is PreparedBusinessModelLifecycle.EXPIRED
-
-
-@pytest.mark.asyncio
-async def test_maintenance_expires_approval_and_reconciles_prepared_in_one_pass(
-  tmp_path,
-) -> None:
-  store = SQLiteApprovalStore(tmp_path / "maintenance.sqlite3")
-  now = datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC)
-  request, record = _request_and_record(
-    locator="maintenance",
-    approval_expires_at=datetime(2026, 1, 1, tzinfo=UTC),
-  )
-  await store.create_or_get_with_prepared_business_model_change(request, record)
-
-  result = await store.maintain_pending(now=now)
-
-  assert result.approvals_expired == 1
-  assert result.prepared.scanned == 1
-  assert result.prepared.expired == 1
-  expired = await store.get(request.approval_id)
-  assert expired is not None
-  assert expired.state == "expired"
-  reconciled = await store.get_prepared_business_model_change(
+  assert approved.state == approved.decision == "approved"
+  authorized = await reopened.reconcile_prepared_business_model_change(
     caller_kind=record.caller_kind,
     user_scope=record.user_scope,
     idempotency_locator=record.idempotency_locator,
   )
-  assert reconciled is not None
-  assert reconciled.lifecycle is PreparedBusinessModelLifecycle.EXPIRED
-  assert await store.expire_pending(now=now) == 0
+  assert authorized.record is not None
+  assert authorized.record.lifecycle is PreparedBusinessModelLifecycle.AUTHORIZED
+  consumed = await reopened.transition_prepared_business_model_change(
+    caller_kind=record.caller_kind,
+    user_scope=record.user_scope,
+    idempotency_locator=record.idempotency_locator,
+    expected=PreparedBusinessModelLifecycle.AUTHORIZED,
+    target=PreparedBusinessModelLifecycle.CONSUMED,
+    approval_id=record.approval_id,
+    approval_chain_id=record.approval_chain_id,
+    execution_receipt=_canonical({"status": "COMMITTED"}),
+    checkpoint_id="5" * 64,
+    consumed_at=datetime.now(UTC).isoformat(),
+  )
+  assert consumed.prepared_payload == record.prepared_payload
+  assert consumed.prepared_payload_digest == record.prepared_payload_digest
 
 
 @pytest.mark.asyncio
@@ -577,7 +502,6 @@ async def test_maintenance_loop_logs_bounded_summary_and_typed_conflicts(
   class Store(SQLiteApprovalStore):
     async def maintain_pending(self, **_kwargs) -> ApprovalMaintenanceResult:
       return ApprovalMaintenanceResult(
-        approvals_expired=2,
         prepared=PreparedReconciliationResult(
           scanned=4,
           authorized=1,
@@ -595,7 +519,7 @@ async def test_maintenance_loop_logs_bounded_summary_and_typed_conflicts(
   )
   with caplog.at_level(logging.INFO, logger="agent_gateway.approval_store"):
     with pytest.raises(StopLoop):
-      await approval_store_module.expire_pending_loop(
+      await approval_store_module.maintain_pending_loop(
         Store(tmp_path / "loop.sqlite3"),
         interval_seconds=0,
       )
@@ -608,7 +532,6 @@ async def test_maintenance_loop_logs_bounded_summary_and_typed_conflicts(
     record for record in caplog.records
     if record.message == "prepared BusinessModel reconciliation conflicts"
   )
-  assert summary.__dict__["approvals_expired"] == 2
   assert summary.__dict__["prepared_scanned"] == 4
   assert summary.__dict__["prepared_cursor"] == cursor.log_token
   assert summary.__dict__["prepared_cursor_wrapped"] is True

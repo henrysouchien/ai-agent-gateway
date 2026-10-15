@@ -12,35 +12,32 @@ class ContextCapture(Protocol):
     *,
     surfaces: list[dict[str, Any]],
     rendered_system_prompt: str | list[tuple[str, bool]] | None,
-  ) -> None:
-    """Persist optional operational context without affecting execution."""
+  ) -> str | None:
+    """Persist optional operational context without affecting execution.
+
+    Returns the content-addressed system_prompt_hash if persisted.
+    """
 
 
 def _operational_surfaces(surfaces: list[dict[str, Any]]) -> list[dict[str, Any]]:
-  return [
-    {
-      key: value
-      for key, value in surface.items()
-      if key not in {"content_hash", "source_hash", "variant_hash"}
-    }
-    for surface in surfaces
-  ]
+  return [dict(surface) for surface in surfaces]
 
 
 def canonical_manifest_digest(
   surfaces: list[dict[str, Any]],
   system_prompt_hash: str | None,
 ) -> str:
-  """Return stable plain JSON for legacy callers that suppress repeat events."""
-  del system_prompt_hash
+  """Return stable plain JSON for callers that suppress repeat events."""
   return json.dumps(
-    _operational_surfaces(surfaces),
+    {
+      "system_prompt_hash": system_prompt_hash,
+      "surfaces": _operational_surfaces(surfaces),
+    },
     sort_keys=True,
     ensure_ascii=True,
     separators=(",", ":"),
     default=str,
   )
-
 
 def build_context_manifest_event(
   *,
@@ -51,12 +48,12 @@ def build_context_manifest_event(
   turn: int | None,
   invocation: int | None = None,
 ) -> dict[str, Any]:
-  del system_prompt_hash
   event: dict[str, Any] = {
     "type": "context_manifest",
     "session_id": session_id,
     "request_id": request_id,
     "turn": turn,
+    "system_prompt_hash": system_prompt_hash,
     "surfaces": _operational_surfaces(surfaces),
   }
   if invocation is not None:

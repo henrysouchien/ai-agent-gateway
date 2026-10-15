@@ -210,6 +210,30 @@ def test_stop_rule_is_omitted_at_its_default_and_digested_when_declared() -> Non
   assert declared.operation.digest != default.operation.digest
 
 
+def test_persist_expectation_is_omitted_at_its_default_and_digested_when_declared() -> None:
+  arguments: dict[str, Any] = {
+    "name": "persist-operation",
+    "version": "1.0",
+    "methodology_instructions": "Persist the model, then report.",
+    "resolved_instructions": "Persist the model, then report.",
+    "description": "Persist a model.",
+    "execution_class": "analysis",
+  }
+  default = build_agent_operation_snapshot(**arguments)
+  declared = build_agent_operation_snapshot(
+    **arguments,
+    result_requires_persist=True,
+  )
+
+  assert default.result_requires_persist is False
+  assert "result_requires_persist" not in default.model_dump(mode="json")
+  assert declared.result_requires_persist is True
+  assert declared.model_dump(mode="json")["result_requires_persist"] is True
+  assert declared.operation.digest != default.operation.digest
+  with pytest.raises(TypeError, match="result_requires_persist must be a bool"):
+    build_agent_operation_snapshot(**arguments, result_requires_persist="yes")  # type: ignore[arg-type]
+
+
 
 @pytest.mark.parametrize(
   ("overrides", "error_type", "match"),

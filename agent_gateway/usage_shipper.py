@@ -3,26 +3,34 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
 import random
 import re
-from typing import Any, Callable, Literal, Protocol
+from typing import Any, Callable
 from urllib.parse import urlparse
 from uuid import uuid4
 
 import httpx
 
-from .usage_outbox import CommercialUsageOutbox, CommercialUsageOutboxRow
-from .usage_outbox import CommercialUsageReconciliationShipmentRow
+from .usage_outbox import CommercialUsageOutbox
+from hank_contracts.usage import (
+  AcceptanceStatus,
+  MAX_SHIPPER_BATCH_SIZE,
+  CommercialUsageDeliveryError,
+  CommercialUsageResponseError,
+  CommercialUsagePermanentDeliveryError,
+  UsageAcceptance,
+  CommercialUsageBatchSender,
+  ReconciliationAcceptance,
+  CommercialUsageReconciliationBatchSender,
+  CommercialUsageShipperConfig as CommercialUsageShipperConfig,
+  CommercialUsageOutboxRow,
+  CommercialUsageReconciliationShipmentRow,
+)
 
-
-AcceptanceStatus = Literal[
-  "accepted", "duplicate", "conflict", "rejected_retryable", "rejected_terminal"
-]
 _ACCEPTANCE_STATUSES = frozenset({
   "accepted", "duplicate", "conflict", "rejected_retryable", "rejected_terminal",
 })
@@ -30,50 +38,6 @@ _KEY_ID = re.compile(r"^[a-zA-Z0-9._:-]{1,128}$")
 _NONCE = re.compile(r"^[a-zA-Z0-9._:-]{1,128}$")
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _STABLE_CODE = re.compile(r"^[a-z][a-z0-9._:-]{0,127}$")
-MAX_SHIPPER_BATCH_SIZE = 1_000
-
-
-class CommercialUsageDeliveryError(RuntimeError):
-  """Base class for delivery failures that leave leased rows retryable."""
-
-
-class CommercialUsageResponseError(CommercialUsageDeliveryError):
-  """The ingest service response was ambiguous or invalid."""
-
-
-class CommercialUsagePermanentDeliveryError(CommercialUsageDeliveryError):
-  """A deterministic local payload/batch failure that retries cannot repair."""
-
-
-@dataclass(frozen=True)
-class UsageAcceptance:
-  environment: str
-  source_event_id: str
-  status: AcceptanceStatus
-  canonical_event_id: str | None
-  reason_code: str | None
-
-
-class CommercialUsageBatchSender(Protocol):
-  async def send_batch(self, payloads: list[dict[str, Any]]) -> list[UsageAcceptance]: ...
-
-
-@dataclass(frozen=True)
-class ReconciliationAcceptance:
-  environment: str
-  source_product: str
-  request_id: str
-  session_id: str
-  evidence_revision: int
-  report_sha256: str
-  status: Literal["accepted", "duplicate", "conflict", "rejected_retryable"]
-  reason_code: str | None
-
-
-class CommercialUsageReconciliationBatchSender(Protocol):
-  async def send_batch(
-    self, reports: list[dict[str, Any]]
-  ) -> list[ReconciliationAcceptance]: ...
 
 
 def _canonical_request_body(payloads: list[dict[str, Any]]) -> bytes:
@@ -449,31 +413,6 @@ class CommercialUsageReconciliationIngestClient:
     if observed != expected:
       raise CommercialUsageResponseError("commercial reconciliation response is incomplete")
     return results
-
-
-@dataclass(frozen=True)
-class CommercialUsageShipperConfig:
-  batch_size: int = 100
-  lease_seconds: float = 30.0
-  base_backoff_seconds: float = 1.0
-  max_backoff_seconds: float = 300.0
-  jitter_ratio: float = 0.2
-  max_event_attempts: int = 12
-  poll_interval_seconds: float = 1.0
-
-  def __post_init__(self) -> None:
-    if (
-      self.batch_size <= 0
-      or self.batch_size > MAX_SHIPPER_BATCH_SIZE
-      or self.lease_seconds <= 0
-      or self.base_backoff_seconds <= 0
-      or self.max_backoff_seconds < self.base_backoff_seconds
-      or not 0 <= self.jitter_ratio <= 1
-      or self.max_event_attempts <= 0
-      or self.poll_interval_seconds <= 0
-    ):
-      raise ValueError("commercial usage shipper configuration is invalid")
-
 
 class CommercialUsageShipper:
   """Lease, deliver, and fence outbox rows without ambiguous acceptance."""

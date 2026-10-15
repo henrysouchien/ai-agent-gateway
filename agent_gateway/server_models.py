@@ -56,18 +56,19 @@ from .capability_execution import (
 )
 from model_authority.registry import ModelLifecycle, ProductModelRegistry, SelectionSource
 from model_authority.selection import ProductModelSelectionPolicy, SelectionSnapshot
+from agent_workflow_contracts.models import SelectionProvenance
 from .model_preferences import ModelPreferenceStore
 from .autonomous_capability_handoff import AutonomousCapabilityBindingResolver
 from .claim_signing_authority import GatewayClaimSigningAuthority
 from .control_skill_catalog import ControlSkillCatalog
 from .skill_limits import AutonomousSkillAdmissionPolicyResolver
 from model_authority.thinking import parse_effort
-from .commercial_work_start import (
+from hank_contracts.commercial_work import (
   COMMERCIAL_CLAIM_HEADER,
   COMMERCIAL_WORK_AUTHORIZATION_HEADER,
+  WORK_AUTHORIZATION_ISSUER,
 )
-from .commercial_claims import COMMERCIAL_CLAIM_ISSUER
-from .commercial_work_authorization import WORK_AUTHORIZATION_ISSUER
+from hank_contracts.commercial_claims import COMMERCIAL_CLAIM_ISSUER
 from .event_log import EventLog
 from .mcp_client import McpClientManager
 from .providers import ModelProvider
@@ -82,8 +83,10 @@ from .tool_redaction import get_audit_hmac_key_id, get_audit_hmac_secret
 if TYPE_CHECKING:
   from .control_plane.batches import BatchBackend
   from .control_plane.schedules import OperatorScheduleBackend
-  from .commercial_work_start import (
+  from hank_contracts.commercial_work import (
     CommercialWorkStartContext,
+  )
+  from .commercial_work_start import (
     CommercialWorkStartGate,
   )
   from .ui_blocks_run import UiBlocksRunContext
@@ -108,7 +111,7 @@ SelectedContentAdmitter = Callable[
   [GatewaySession, "ChatRequest"],
   Awaitable[SelectedContentAdmission] | SelectedContentAdmission,
 ]
-RequestApproval = Callable[[ApprovalRequest], Awaitable[Optional[ApprovalDecision]]]
+RequestApproval = Callable[[ApprovalRequest], Awaitable[ApprovalDecision]]
 
 
 class BuildRunner(Protocol):
@@ -318,10 +321,23 @@ class ChatInitRequest(BaseModel):
   capability_selections: Dict[str, "CapabilitySelection"] = Field(
     default_factory=dict
   )
+  # A published model-preset name: the authenticated run level above the
+  # user's saved preset, frozen for the session's root turns.
+  model_preset: str | None = Field(default=None, strict=True)
   resume_session_id: str | None = None
   # A log the caller owns that this new session forks from: its history is
   # the new session's starting context, its session is left alone.
   fork_from_session_id: str | None = None
+
+  @field_validator("model_preset")
+  @classmethod
+  def _non_blank_model_preset(cls, value: str | None) -> str | None:
+    if value is None:
+      return None
+    name = value.strip()
+    if not name:
+      raise ValueError("model_preset must be a non-empty preset name")
+    return name
 
   @model_validator(mode="after")
   def _resume_or_fork(self) -> "ChatInitRequest":
@@ -353,8 +369,36 @@ class CapabilitySelection(BaseModel):
     return self
 
 
+class CapabilityRateTier(BaseModel):
+  """Whole-request prices at or above a prompt-size threshold."""
+
+  model_config = ConfigDict(extra="forbid", frozen=True)
+
+  min_input_tokens: int
+  input_cost_per_mtok: float
+  output_cost_per_mtok: float
+  cache_read_cost_per_mtok: float
+  cache_write_cost_per_mtok: float
+
+
+class CapabilityRates(BaseModel):
+  """Per-million-token prices from the model authority's rate files."""
+
+  model_config = ConfigDict(extra="forbid", frozen=True)
+
+  input_cost_per_mtok: float
+  output_cost_per_mtok: float
+  cache_read_cost_per_mtok: float
+  cache_write_cost_per_mtok: float
+  tiers: List[CapabilityRateTier]
+
+
 class CapabilityChoice(BaseModel):
-  """Presentation-only session-eligible stable model choice."""
+  """Presentation-only session-eligible stable model choice.
+
+  ``rates`` is ``"unknown"`` when the authority's rate files do not price the
+  model; an unpriced model is never shown as free.
+  """
 
   model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -363,6 +407,26 @@ class CapabilityChoice(BaseModel):
   supported_efforts: List[str]
   default_effort: str
   lifecycle: ModelLifecycle
+  rates: CapabilityRates | Literal["unknown"]
+
+
+class CapabilityRoleChoice(BaseModel):
+  """What one model role binds to for this capability, at what price, or why not.
+
+  ``unavailable`` is the resolver's typed refusal code; ``model_key`` on an
+  unavailable role is the refused candidate when the refusal names one.
+  """
+
+  model_config = ConfigDict(extra="forbid", frozen=True)
+
+  role: str
+  model_key: str | None
+  label: str | None
+  route: str | None
+  effort: str | None
+  rates: CapabilityRates | Literal["unknown"]
+  unavailable: str | None = None
+  detail: str | None = None
 
 
 class CapabilityChoiceSelection(BaseModel):
@@ -392,6 +456,7 @@ class CapabilityChoiceResponse(BaseModel):
   selected: CapabilityChoiceSelection | None
   notices: List[CapabilityChoiceNotice]
   choices: List[CapabilityChoice]
+  roles: List[CapabilityRoleChoice]
 
 
 class ModelPreferenceUpdate(BaseModel):
@@ -442,6 +507,8 @@ class ModelPresetResponse(BaseModel):
   name: str | None
   policy_revision: str | None
   updated_at: int | None
+  # The preset names the door accepts, so a client can list them before selecting.
+  known_preset_names: list[str]
 
 
 class ChatInitResponse(BaseModel):
@@ -453,6 +520,9 @@ class ChatInitResponse(BaseModel):
   expires_at: int
   schema_version: int
   capability_choices: Dict[str, CapabilityChoiceResponse]
+  # Entitlements the resolver supplied that name no registered capability:
+  # they grant nothing and are reported so the operator can correct the grant.
+  unknown_model_entitled_capabilities: list[str] = Field(default_factory=list)
   resumed_from_session_id: str | None = None
   forked_from_session_id: str | None = None
 
@@ -636,10 +706,15 @@ class ChatRequest(BaseModel):
     default=None
   )
   _selection_snapshot: SelectionSnapshot | None = PrivateAttr(default=None)
+  _selection_provenance: SelectionProvenance | None = PrivateAttr(default=None)
 
   @property
   def selection_snapshot(self) -> SelectionSnapshot | None:
     return self._selection_snapshot
+
+  @property
+  def selection_provenance(self) -> SelectionProvenance | None:
+    return self._selection_provenance
 
   @model_validator(mode="before")
   @classmethod
@@ -666,8 +741,6 @@ class ChatRequest(BaseModel):
 
   @model_validator(mode="after")
   def _require_complete_explicit_selection(self) -> "ChatRequest":
-    if self.effort is not None and self.model_key is None:
-      raise ValueError("effort requires an explicit model_key")
     if self.catalog_revision is not None and self.model_key is None:
       raise ValueError("catalog_revision requires an explicit model_key")
     if len(self.attachments) > CHAT_ATTACHMENT_MAX_COUNT:
@@ -797,6 +870,13 @@ class ChatCancelRequest(BaseModel):
   session_id: str = Field(..., min_length=1)
 
 
+class ChatTodoPatchRequest(BaseModel):
+  """Request body for `PATCH /chat/todo`."""
+
+  expected_revision: int = Field(..., ge=0)
+  phases: list[dict[str, Any]]
+
+
 def _resolve_chat_profile_name(context: Mapping[str, Any] | None) -> str:
   raw_profile = None
   for key in ("profile", "profile_name", "agent_id", "agent", "system_prompt_key"):
@@ -918,6 +998,7 @@ class ChatRuntime:
   compaction_trigger: int | None = None
   compaction_instructions: str | None = None
   purpose: str | None = None
+  turn_context_message: Optional[str] = None
   _disconnect_called: bool = field(default=False, init=False, repr=False)
 
   def __post_init__(self) -> None:

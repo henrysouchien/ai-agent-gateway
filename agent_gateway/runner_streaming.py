@@ -9,8 +9,9 @@ from .rate_limit import local_queue_left_at, locally_queued
 from model_authority.thinking import EffortResolution, ThinkingLevel
 
 # The stream watchdog is the containment layer's hung-peer bound on a provider
-# stream (rule 8 of docs/engineering/fail-closed-local-guards.md), applied to
-# every run alike — no profile varies it. It fires only on *no progress* — every
+# stream (rule 8 of docs/engineering/fail-closed-local-guards.md). No profile varies
+# it; only facts about the request do (thinking, and a transport whose first event
+# follows a full local prefill). It fires only on *no progress* — every
 # non-heartbeat provider event resets the clock — never on a turn's duration,
 # so it cannot cut valid work. The turn runner retries a stalled stream up to
 # STREAM_RETRY_MAX; direct stream consumers raise StreamStallError instead.
@@ -19,6 +20,17 @@ from model_authority.thinking import EffortResolution, ThinkingLevel
 # event, every retry rides `stream_retry`, and the terminal error names attempts.
 STREAM_STALL_TIMEOUT = 60  # max seconds between stream progress events before watchdog cancels
 STREAM_THINKING_STALL_TIMEOUT = 300  # extended-thinking turns can be quiet before first visible output
+# A transport that emits nothing until its host has prefilled the whole prompt
+# (ModelInfo.first_progress_after_prefill: local Ollama) gets a bound scaled from
+# the entry's context_window, the largest prompt history_fits admits, at this floor
+# rate. Prefill slows as the prompt grows and as the host is loaded. Measured
+# 2026-10-10 on this Mac, qwen3.8:27b Q4 (Ollama server.log `prompt eval time`):
+# 394 tok/s at 25.5k tokens; at 61k, 301 tok/s idle, 262 with one merge gate
+# running and 190 with two. Per-token cost grows linearly with position, so the
+# fit gives about 130 tok/s at the full 262144-token window idle and about 80
+# under the heaviest load seen. 60 keeps margin. The cost is that a wedged local
+# daemon is detected late (qwen: about 73 minutes per attempt).
+LOCAL_PREFILL_TOKENS_PER_SECOND = 60
 
 
 def thinking_level(enabled: bool) -> ThinkingLevel:
@@ -49,8 +61,12 @@ def effective_stream_stall_timeout(
     or legacy_effective
     or observed_thinking
   ):
-    return float(stream_thinking_stall_timeout_default)
-  return float(stream_stall_timeout_default)
+    bound = float(stream_thinking_stall_timeout_default)
+  else:
+    bound = float(stream_stall_timeout_default)
+  if model_info.first_progress_after_prefill:
+    bound = max(bound, model_info.context_window / LOCAL_PREFILL_TOKENS_PER_SECOND)
+  return bound
 
 
 class StreamStallError(RuntimeError):

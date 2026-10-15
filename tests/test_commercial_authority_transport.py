@@ -209,7 +209,7 @@ def test_startup_catch_up_consumes_every_page_before_returning(tmp_path: Path) -
 
 def test_packaged_feed_schema_is_valid_and_decoder_accepts_safe_additions() -> None:
   schema_path = (
-    files("agent_gateway")
+    files("hank_contracts")
     / "contracts"
     / "commercial-authority-v1"
     / "commercial-authority-invalidation-feed-v1.schema.json"

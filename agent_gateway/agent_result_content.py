@@ -510,10 +510,55 @@ def _page_result_content(
   return page
 
 
+class ResultContentUnavailable(Exception):
+  """The durable reader could not materialize an already-admitted handle."""
+
+  def __init__(self, code: str, detail: str) -> None:
+    super().__init__(detail)
+    self.code = code
+    self.detail = detail
+
+
+async def read_admitted_result_content(
+  durable_log: Any,
+  *,
+  content_id: str,
+  workspace_dir: Any,
+) -> str:
+  """Materialize one ordinary completion the caller has already admitted.
+
+  Authority stays with ``admit(HandleRequest)``. This is the same durable
+  lookup and byte check ``get_agent_result_content`` uses after that admit.
+  """
+
+  authorized, error = await _durable_result_content(
+    durable_log,
+    content_id=content_id,
+    read_grant_id=None,
+  )
+  if error is not None or authorized is None:
+    code = error.get("code") if isinstance(error, dict) else None
+    detail = error.get("message") if isinstance(error, dict) else None
+    raise ResultContentUnavailable(
+      code if isinstance(code, str) and code else "result_content_unavailable",
+      detail if isinstance(detail, str) and detail else "Agent result content is unavailable",
+    )
+  try:
+    return _materialize_exact_content(authorized, workspace_dir=workspace_dir)
+  except (FinalNarrativeArtifactError, ValueError) as exc:
+    raise ResultContentUnavailable(
+      "result_content_unavailable",
+      "Agent result content is unavailable or failed verification",
+    ) from exc
+
+
+
 __all__ = [
   "AGENT_RESULT_CONTENT_CHUNK_MAX_BYTES",
   "AGENT_RESULT_CONTENT_PAGE_MAX_BYTES",
   "AGENT_RESULT_CONTENT_MAX_SEQUENCE",
+  "ResultContentUnavailable",
   "make_get_agent_result_content_handler",
   "make_get_agent_result_content_tool_def",
+  "read_admitted_result_content",
 ]

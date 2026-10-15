@@ -208,7 +208,7 @@ class _JobSpillBudget(SpillBudget):
   def reserve(self, root: Path, lane: str, amount: int) -> bool:
     del root
     return self._parent.budget.reserve(
-      _validated_root(Path(self._parent())),
+      _sink_root(self._parent),
       lane,
       amount,
     )
@@ -222,7 +222,7 @@ def _job_directory_name(job_id: str) -> str:
 
 
 def job_spill_sink(parent: SpillSink, job_id: str) -> SpillSink:
-  """Locate one child's spill root without creating its publication directories."""
+  """Locate one child's spill root; ``_sink_root`` validates (and on publish creates) it."""
 
   if not job_id:
     raise ValueError("job spill sink requires a job id")
@@ -270,7 +270,7 @@ def resolve_spill_producer(sink: SpillSink, spill_ref: Any) -> Path | None:
 
   pointer_ref, pointer_digest = _parse_spill_ref(spill_ref)
   try:
-    base = _validated_root(Path(sink()))
+    base = _sink_root(sink)
   except Exception:  # noqa: BLE001 - an absent root holds no spills
     return None
   for root in _job_roots(base):
@@ -329,7 +329,7 @@ async def resolve_job_spill_producer(
         roots[root] = None
   if sink is not None:
     try:
-      base = _validated_root(Path(sink.tree_root()()))
+      base = _sink_root(sink.tree_root())
     except Exception:  # noqa: BLE001 - an absent root holds no spills
       base = None
     if base is not None:
@@ -445,16 +445,23 @@ def normalize_spill_sink(value: Callable[[], str] | SpillSink | None) -> SpillSi
   )
 
 
-def _publication_root(sink: SpillSink) -> Path:
-  """Create job directories only when publishing, validating each boundary."""
+def _sink_root(sink: SpillSink, *, create: bool = False) -> Path:
+  """``sink``'s root, validating each job boundary; never reached via a symlink.
+
+  A job root is ``<parent root>/jobs/<job digest>``: the parent root, ``jobs``
+  and the job directory must each be an existing non-symlink directory. Only
+  publication (``create=True``) makes the job directories; a read locates them.
+  """
 
   if sink.job_parent is None:
     return _validated_root(Path(sink()))
-  parent_root = _publication_root(sink.job_parent)
+  parent_root = _sink_root(sink.job_parent, create=create)
   jobs = parent_root / SPILL_JOB_DIRECTORY
-  jobs.mkdir(mode=0o700, exist_ok=True)
+  if create:
+    jobs.mkdir(mode=0o700, exist_ok=True)
   root = _validated_root(jobs) / Path(sink()).name
-  root.mkdir(mode=0o700, exist_ok=True)
+  if create:
+    root.mkdir(mode=0o700, exist_ok=True)
   return _validated_root(root)
 
 
@@ -468,7 +475,7 @@ def write_spill_set(
   uuid_factory: Callable[[], Any] | None = None,
 ) -> SpillPublication:
   uuid_factory = uuid_factory or uuid.uuid4
-  root = _publication_root(sink)
+  root = _sink_root(sink, create=True)
   raw = f"{tool_name}_{tool_use_id or uuid_factory().hex}"
   base_stem = re.sub(r"[^A-Za-z0-9._-]", "_", raw)[:120]
 
@@ -794,7 +801,7 @@ def read_spill_result(
     if producer_root is not None:
       root = _validated_root(producer_root)
     elif sink is not None:
-      root = _validated_root(Path(sink()))
+      root = _sink_root(sink)
     else:
       raise SpillReadUnavailable("spill reader is unavailable for this run")
   except Exception as exc:

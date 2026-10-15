@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 import asyncio
 import copy
@@ -26,8 +26,8 @@ from agent_workflow_contracts.tool_registration import (
 
 from .admission import ParentContext
 from . import admission
+from .events import ApprovalDecisionSource
 from .providers.anthropic_oauth import is_anthropic_generation_ref
-from . import approval_settings
 from .approval_policy import (
   ApprovalConstraint,
   ApprovalConstraintError,
@@ -94,6 +94,7 @@ from .skill_context import current_skill, current_skill_admission
 from .skill_limits import reconcile_skill_admission
 from . import tool_dispatcher_audit as _audit_helpers
 from . import tool_dispatcher_approval_lifecycle as _approval_lifecycle_helpers
+from .tool_dispatcher_approval_lifecycle import ApprovalPark
 from . import tool_dispatcher_runtime as _runtime_helpers
 from . import tool_dispatcher_skill_tools as _skill_tool_helpers
 from .tool_dispatcher_helpers import (
@@ -101,7 +102,6 @@ from .tool_dispatcher_helpers import (
   ApprovalDecision as ApprovalDecision,
   ApprovalKeyQualifier as ApprovalKeyQualifier,
   ApprovalRequest as ApprovalRequest,
-  HeadlessAskCallback as HeadlessAskCallback,
   InterceptContext as InterceptContext,
   InterceptDecision as InterceptDecision,
   InterceptResult as InterceptResult,
@@ -115,7 +115,6 @@ from .tool_dispatcher_helpers import (
   ToolResult as ToolResult,
   TransportApprovalRequest as TransportApprovalRequest,
   TransportApprovalResult as TransportApprovalResult,
-  _approval_queue_timeout_seconds as _approval_queue_timeout_seconds,
   active_local_tool_schema as _active_local_tool_schema_helper,
   format_expected_type as _format_expected_type_helper,
   json_type_name as _json_type_name_helper,
@@ -136,6 +135,7 @@ from .tool_dispatch_classification import (
 if TYPE_CHECKING:
   from .approval_store import TargetedPreparedReconciliationResult
   from .mcp_client import McpClientManager
+  from .session import GatewaySession
   from .prepared_business_model_store import (
     PreparedBusinessModelChange,
     PreparedBusinessModelLifecycle,
@@ -210,7 +210,6 @@ class ToolDispatcherApprovalStore(Protocol):
     caller_kind: str,
     user_scope: str,
     idempotency_locator: str,
-    now: datetime | None = None,
   ) -> TargetedPreparedReconciliationResult: ...
 
   async def transition_prepared_business_model_change(
@@ -354,8 +353,6 @@ class ToolDispatcher:
     approval_key_qualifier: ApprovalKeyQualifier | None = None,
     interceptors: Sequence[ToolInterceptor] | None = None,
     session_id: str = "",
-    should_avoid_permission_prompts: bool = False,
-    on_headless_ask: HeadlessAskCallback | None = None,
     mcp_session_inject_servers: set[str] | None = None,
     mcp_meta_inject_servers: frozenset[str] | None = None,
     identity: DispatchIdentity | None = None,
@@ -505,8 +502,6 @@ class ToolDispatcher:
     self._approval_key_qualifier = approval_key_qualifier
     self._interceptors: Sequence[ToolInterceptor] = list(interceptors or [])
     self._session_id = session_id
-    self._should_avoid_permission_prompts = should_avoid_permission_prompts
-    self._on_headless_ask = on_headless_ask
     self._mcp_session_inject_servers = mcp_session_inject_servers or set()
     self._mcp_meta_inject_servers = mcp_meta_inject_servers or frozenset()
     if identity is not None:
@@ -667,6 +662,9 @@ class ToolDispatcher:
     session_id: str,
     capability_bind: CapabilityBind,
     spawning_turn: _SpawningTurn,
+    identity: DispatchIdentity | None,
+    session: GatewaySession | None,
+    approval_route: ApprovalRoute | None,
     local_handler_scopes: Mapping[
       str, Callable[[LocalToolHandler], LocalToolHandler]
     ] | None = None,
@@ -684,7 +682,9 @@ class ToolDispatcher:
     An independently admitted child identity takes precedence over that
     inherited scope and never links its calls to the parent's root turn.
     The fork dispatcher carries the bind of the execution the fork runs,
-    so a rotation re-binds runner and dispatcher as one object.
+    so a rotation re-binds runner and dispatcher as one object. A fork runs
+    under this dispatcher's credential mode, whatever the child identity
+    carries: it never makes a weaker MCP identity check than its parent.
     """
 
     local = dict(self._local)
@@ -700,6 +700,17 @@ class ToolDispatcher:
     clone._capability_bind = capability_bind
     clone._boundary_event_log = _BoundaryEventLogProjection(clone)
     clone._spawning_turn = spawning_turn
+    if identity is not None:
+      clone._identity = replace(
+        identity, credentials_resolver_active=self._credentials_resolver_active,
+      )
+      clone._execution_identity = identity.execution
+      clone._user_id = identity.user_id
+      clone._risk_user_id = identity.risk_user_id
+      clone._channel = identity.channel
+      clone._session = session
+      clone._source_pack_session = session
+      clone._approval_route = cast(ApprovalRoute, approval_route)
     return clone
 
   def _append_event(self, event: dict[str, Any]) -> Any | None:
@@ -1645,12 +1656,11 @@ class ToolDispatcher:
       return completed
 
     if decision.state in {"denied", "auto_denied"}:
-      self._emit_approval_decided(
+      await self._record_durable_approval_decided(
         tool_call_id,
         binding.tool_name,
         outcome="denied",
         decision_source="durable_approval_denied",
-        allow_tool_type_applied=False,
       )
       return None, self._approved_binding_error(
         "user_denied",
@@ -2024,27 +2034,13 @@ class ToolDispatcher:
     execution_result_known = False
 
     async def claim_original_call() -> ToolResult | None:
-      nonlocal executable_approval, execution_claim_token
+      nonlocal execution_claim_token
       store = self._approval_store
-      if executable_approval is None and executable_nonce is None:
+      if executable_approval is None:
         return None
       assert store is not None, "captured executable approval requires its ledger"
       claim_token = os.urandom(16).hex()
       try:
-        if executable_approval is None:
-          context = self._executing_context()
-          assert context is not None and context.job_id is not None
-          assert context.tenant is not None and executable_nonce is not None
-          binding, decision = await store._read_executable_binding_for_executor(
-            job_id=context.job_id,
-            tool_call_id=tool_call_id,
-            nonce=executable_nonce,
-            tenant_storage_id=context.tenant.storage_id,
-          )
-          executable_approval = _VerifiedExecutableApproval(
-            binding=binding,
-            decision=decision,
-          )
         completed = await store._claim_executable_binding_for_executor(
           binding=executable_approval.binding,
           decision_state_version=executable_approval.decision.state_version,
@@ -2234,7 +2230,6 @@ class ToolDispatcher:
       approval_reuse_key = registered_approval_reuse_key
     final_tool_input = tool_input
     approval_request_record: PolicyApprovalRequest | None = None
-    executable_nonce: str | None = None
     registered_prepared_authorization = (
       registered_mcp_call.prepared_authorization
       if registered_mcp_call is not None
@@ -2272,50 +2267,6 @@ class ToolDispatcher:
 
       allow_persistent = not dynamic_ask
       approval_reason = ir.pending_ask.message if ir.pending_ask is not None else ""
-      automatic_approval_reason: str | None = None
-      automatic_denial_reason: str | None = None
-      deny_user_prompt = False
-
-      # A headless run draws no card, but it does not decide the door: a static
-      # door still goes to the route's decider (the route's approval policy on a
-      # durable route), and only a `request_user` outcome there becomes the
-      # headless denial (`deny_user_prompt`).
-      if self._should_avoid_permission_prompts:
-        if static_needs_approval:
-          deny_user_prompt = True
-        elif dynamic_ask:
-          hook_result = "deny"
-          if self._on_headless_ask is not None and ir.pending_ask is not None:
-            headless_ctx = InterceptContext(
-              tool_call_id=tool_call_id,
-              tool_name=tool_name,
-              tool_input=tool_input,
-              session_id=self._session_id,
-            )
-            try:
-              raw = self._on_headless_ask(headless_ctx, ir.pending_ask)
-              if inspect.isawaitable(raw):
-                raw = await raw
-              hook_result = raw if raw in ("allow", "deny") else "deny"
-            except Exception as exc:
-              log.warning(
-                "Headless ask hook failed; auto-denying | exception_type=%s",
-                type(exc).__name__,
-              )
-          if hook_result == "allow":
-            automatic_approval_reason = (
-              "Headless approval hook authorized the exact planned identity"
-            )
-          else:
-            automatic_denial_reason = (
-              ir.pending_ask.message
-              if ir.pending_ask is not None
-              else "Approval required in headless context"
-            )
-        else:
-          automatic_approval_reason = (
-            "Autonomous tool policy authorized the exact planned identity"
-          )
 
       try:
         prepared_authorization_payload: bytes | None = None
@@ -2589,11 +2540,10 @@ class ToolDispatcher:
             resume_approval_request=resume_approval_request,
             approval_args_redacted=approval_args_redacted,
             approval_args_hash=approval_args_hash,
-            automatic_approval_reason=automatic_approval_reason,
-            automatic_denial_reason=automatic_denial_reason,
-            deny_user_prompt=deny_user_prompt,
           )
         )
+      except ApprovalPark:
+        raise
       except Exception as exc:
         log.error(
           "Durable exact-write authorization failed for %s | exception_type=%s | error=%s",
@@ -2609,7 +2559,6 @@ class ToolDispatcher:
         }
 
       approval_request_record = lifecycle.get("request")
-      executable_nonce = lifecycle.get("executable_nonce")
       if prepared_business_model_context is not None:
         prepared_business_model_store, prepared_business_model_change = (
           prepared_business_model_context
@@ -2681,8 +2630,7 @@ class ToolDispatcher:
             approval_request_record = original_request
             lifecycle["request"] = original_request
         elif (
-          not lifecycle.get("timeout")
-          and prepared_business_model_record.lifecycle
+          prepared_business_model_record.lifecycle
           is PreparedBusinessModelLifecycle.PENDING
           and prepared_business_model_record.approval_id
           == getattr(approval_request_record, "approval_id", None)
@@ -2748,26 +2696,9 @@ class ToolDispatcher:
             "submit a new invocation so the exact change can be replanned."
           ),
         }
-      if lifecycle.get("timeout"):
-        self._emit_approval_decided(
-          tool_call_id,
-          tool_name,
-          outcome="timeout",
-          decision_source="approval_timeout",
-          allow_tool_type_applied=False,
-        )
-        return None, {
-          "code": "approval_timeout",
-          "message": "User did not respond within timeout",
-        }
       if not lifecycle.get("approved"):
         decision_source = "user_denied"
         error_dict = {"code": "user_denied", "message": "User denied execution"}
-        if lifecycle.get("decision_source") == "headless_auto_deny":
-          error_dict = {
-            "code": "headless_auto_deny",
-            "message": f"Tool '{tool_name}' blocked in headless context.",
-          }
         self._emit_approval_decided(
           tool_call_id,
           tool_name,
@@ -2830,253 +2761,134 @@ class ToolDispatcher:
           **tool_input,
           "authorization_ref": encode_reference(tool_call_id),
         }
-      self._emit_approval_decided(
+      await self._record_durable_approval_decided(
         tool_call_id,
         tool_name,
         outcome="approved",
         decision_source="durable_approved_binding",
-        allow_tool_type_applied=False,
       )
 
     elif static_needs_approval or dynamic_ask:
-      # A static door on a live route is the route's to decide in every
-      # context; headless only forbids a durable route's card
-      # (`deny_user_prompt`). Without a route there is no decider but the
-      # card, so a headless run denies it.
-      route_decides_static_door = static_needs_approval and not isinstance(
-        self._approval_route,
-        NoApprovalRoute,
-      )
-      if self._should_avoid_permission_prompts and not route_decides_static_door:
-        if static_needs_approval:
-          reason_text = (
-            ir.pending_ask.message
-            if ir.pending_ask is not None
-            else f"Tool '{tool_name}' requires static approval in headless context"
-          )
-          if self._event_log is not None:
-            self._append_event(
-              {
-                "type": "headless_auto_deny",
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "reason": reason_text,
-                "source": "static",
-              }
+      if not isinstance(self._approval_route, NoApprovalRoute):
+        allow_persistent = not dynamic_ask
+        approval_reason = ir.pending_ask.message if ir.pending_ask is not None else ""
+        approval_args_redacted: dict[str, Any] | None = None
+        approval_args_hash: str | None = None
+        if registered_approval_declaration is not None:
+          assert registered_prepared_call is not None
+          approval_args_redacted, approval_args_hash = (
+            self._redact_registered_prepared_for_approval(
+              tool_name,
+              registered_prepared_call,
             )
+          )
+        execution_context = self._executing_context()
+        lifecycle = await self._run_approval_lifecycle(
+          executable_capture=_approval_lifecycle_helpers.ExecutableCapture(
+            prepared_call=original_prepared_call,
+            dispatch_context={
+              "call_index": call_index,
+              "advertised_tool_names": (
+                sorted(advertised_tool_names)
+                if advertised_tool_names is not None else None
+              ),
+              "skill_run_id": skill_run_id,
+              "step_id": step_id,
+              "workspace_dir": workspace_dir,
+              "batch_id": batch_id,
+              "capture_readable_resource_snapshot": capture_readable_resource_snapshot,
+              "allow_uncertain_mcp_replay": allow_uncertain_mcp_replay,
+            },
+            job_id=execution_context.job_id if execution_context is not None else None,
+            tenant_storage_id=(
+              execution_context.tenant.storage_id
+              if execution_context is not None and execution_context.tenant is not None
+              else None
+            ),
+            credential_generation_ref=(
+              self._capability_bind.credential_ref
+              if is_anthropic_generation_ref(self._capability_bind.credential_ref)
+              else None
+            ),
+            root_turn=self._executing_root_turn(),
+          ),
+          tool_call_id=tool_call_id,
+          tool_name=tool_name,
+          tool_input=tool_input,
+          qualifier=qualifier,
+          reason=approval_reason,
+          allow_persistent=allow_persistent,
+          approval_reuse_mode=approval_reuse_mode,
+          approval_reuse_key=approval_reuse_key,
+          approval_args_redacted=approval_args_redacted,
+          approval_args_hash=approval_args_hash,
+        )
+        approval_request_record = lifecycle.get("request")
+        if not lifecycle.get("approved"):
+          decision_source = "user_denied"
+          error_dict = {"code": "user_denied", "message": "User denied execution"}
           self._emit_approval_decided(
             tool_call_id,
             tool_name,
             outcome="denied",
-            decision_source="headless_auto_deny",
+            decision_source=decision_source,
             allow_tool_type_applied=False,
           )
+          return None, error_dict
+        final_tool_input = lifecycle["tool_input"] if "tool_input" in lifecycle else tool_input
+        approval_modified_prepared_input = final_tool_input != tool_input
+        # Same rule as the exact-plan branch: a registered prepared call cannot
+        # carry arguments the approval decision rewrote.
+        if (
+          registered_prepared_call is not None
+          and approval_modified_prepared_input
+        ):
           return None, {
-            "code": "headless_auto_deny",
-            "message": f"Tool '{tool_name}' blocked (static approval required): {reason_text}",
-          }
-
-        hook_result = "deny"
-        if self._on_headless_ask is not None and ir.pending_ask is not None:
-          headless_ctx = InterceptContext(
-            tool_call_id=tool_call_id,
-            tool_name=tool_name,
-            tool_input=tool_input,
-            session_id=self._session_id,
-          )
-          try:
-            raw = self._on_headless_ask(headless_ctx, ir.pending_ask)
-            if inspect.isawaitable(raw):
-              raw = await raw
-            hook_result = raw if raw in ("allow", "deny") else "deny"
-          except Exception as exc:
-            log.warning(
-              "Headless ask hook failed; auto-denying | exception_type=%s",
-              type(exc).__name__,
-            )
-            hook_result = "deny"
-
-        if hook_result != "allow":
-          reason_text = (
-            ir.pending_ask.message
-            if ir.pending_ask is not None
-            else "Approval required in headless context"
-          )
-          if self._event_log is not None:
-            self._append_event(
-              {
-                "type": "headless_auto_deny",
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "reason": reason_text,
-                "source": "interceptor",
-              }
-            )
-          self._emit_approval_decided(
-            tool_call_id,
-            tool_name,
-            outcome="denied",
-            decision_source="headless_auto_deny",
-            allow_tool_type_applied=False,
-          )
-          return None, {
-            "code": "headless_auto_deny",
-            "message": f"Tool '{tool_name}' blocked: {reason_text}",
+            "code": "tool_input_preparation_failed",
+            "message": (
+              f"Tool '{tool_name}' input changed after preparation; dispatch was denied."
+            ),
           }
         self._emit_approval_decided(
           tool_call_id,
           tool_name,
           outcome="approved",
-          decision_source="headless_hook_approved",
+          decision_source=(
+            "delegated_auto_approved"
+            if getattr(approval_request_record, "state", None) == "auto_approved"
+            else "user_approved"
+          ),
           allow_tool_type_applied=False,
         )
+      elif self._request_approval is None:
+        return None, {
+          "code": "approval_required",
+          "message": f"Tool '{tool_name}' requires approval but no approval handler is configured",
+        }
       else:
-        if not isinstance(self._approval_route, NoApprovalRoute):
-          allow_persistent = not dynamic_ask
-          approval_reason = ir.pending_ask.message if ir.pending_ask is not None else ""
-          approval_args_redacted: dict[str, Any] | None = None
-          approval_args_hash: str | None = None
-          if registered_approval_declaration is not None:
-            assert registered_prepared_call is not None
-            approval_args_redacted, approval_args_hash = (
-              self._redact_registered_prepared_for_approval(
-                tool_name,
-                registered_prepared_call,
-              )
-            )
-          execution_context = self._executing_context()
-          lifecycle = await self._run_approval_lifecycle(
-            executable_capture=_approval_lifecycle_helpers.ExecutableCapture(
-              prepared_call=original_prepared_call,
-              dispatch_context={
-                "call_index": call_index,
-                "advertised_tool_names": (
-                  sorted(advertised_tool_names)
-                  if advertised_tool_names is not None else None
-                ),
-                "skill_run_id": skill_run_id,
-                "step_id": step_id,
-                "workspace_dir": workspace_dir,
-                "batch_id": batch_id,
-                "capture_readable_resource_snapshot": capture_readable_resource_snapshot,
-                "allow_uncertain_mcp_replay": allow_uncertain_mcp_replay,
-              },
-              job_id=execution_context.job_id if execution_context is not None else None,
-              tenant_storage_id=(
-                execution_context.tenant.storage_id
-                if execution_context is not None and execution_context.tenant is not None
-                else None
-              ),
-              credential_generation_ref=(
-                self._capability_bind.credential_ref
-                if is_anthropic_generation_ref(self._capability_bind.credential_ref)
-                else None
-              ),
-              root_turn=self._executing_root_turn(),
-            ),
+        allow_persistent = not dynamic_ask
+        approval_reason = ir.pending_ask.message if ir.pending_ask is not None else ""
+        approval_tool_input = self._approval_transport_input(tool_name, tool_input)
+        decision = await self._request_approval(
+          ApprovalRequest(
             tool_call_id=tool_call_id,
+            nonce=os.urandom(8).hex(),
             tool_name=tool_name,
-            tool_input=tool_input,
-            qualifier=qualifier,
+            tool_input=approval_tool_input,
+            resolved_qualifier=qualifier,
             reason=approval_reason,
-            allow_persistent=allow_persistent,
-            approval_reuse_mode=approval_reuse_mode,
-            approval_reuse_key=approval_reuse_key,
-            approval_args_redacted=approval_args_redacted,
-            approval_args_hash=approval_args_hash,
-            deny_user_prompt=self._should_avoid_permission_prompts,
+            allow_persistent_approval=allow_persistent,
           )
-          approval_request_record = lifecycle.get("request")
-          executable_nonce = lifecycle.get("executable_nonce")
-          if lifecycle.get("timeout"):
-            self._emit_approval_decided(
-              tool_call_id,
-              tool_name,
-              outcome="timeout",
-              decision_source="approval_timeout",
-              allow_tool_type_applied=False,
-            )
-            return None, {"code": "approval_timeout", "message": "User did not respond within timeout"}
-          if not lifecycle.get("approved"):
-            decision_source = "user_denied"
-            error_dict = {"code": "user_denied", "message": "User denied execution"}
-            if lifecycle.get("decision_source") == "headless_auto_deny":
-              decision_source = "headless_auto_deny"
-              error_dict = {
-                "code": "headless_auto_deny",
-                "message": f"Tool '{tool_name}' blocked in headless context.",
-              }
-            self._emit_approval_decided(
-              tool_call_id,
-              tool_name,
-              outcome="denied",
-              decision_source=decision_source,
-              allow_tool_type_applied=False,
-            )
-            return None, error_dict
-          final_tool_input = lifecycle["tool_input"] if "tool_input" in lifecycle else tool_input
-          approval_modified_prepared_input = final_tool_input != tool_input
-          # Same rule as the exact-plan branch: a registered prepared call cannot
-          # carry arguments the approval decision rewrote.
-          if (
-            registered_prepared_call is not None
-            and approval_modified_prepared_input
-          ):
-            return None, {
-              "code": "tool_input_preparation_failed",
-              "message": (
-                f"Tool '{tool_name}' input changed after preparation; dispatch was denied."
-              ),
-            }
-          self._emit_approval_decided(
-            tool_call_id,
-            tool_name,
-            outcome="approved",
-            decision_source=(
-              "delegated_auto_approved"
-              if getattr(approval_request_record, "state", None) == "auto_approved"
-              else "user_approved"
-            ),
-            allow_tool_type_applied=False,
-          )
-        elif self._request_approval is None:
-          return None, {
-            "code": "approval_required",
-            "message": f"Tool '{tool_name}' requires approval but no approval handler is configured",
-          }
-        else:
-          allow_persistent = not dynamic_ask
-          approval_reason = ir.pending_ask.message if ir.pending_ask is not None else ""
-          approval_tool_input = self._approval_transport_input(tool_name, tool_input)
-          decision = await self._request_approval(
-            ApprovalRequest(
-              tool_call_id=tool_call_id,
-              nonce=os.urandom(8).hex(),
-              tool_name=tool_name,
-              tool_input=approval_tool_input,
-              resolved_qualifier=qualifier,
-              reason=approval_reason,
-              allow_persistent_approval=allow_persistent,
-            )
-          )
-          if decision is None:
-            self._emit_approval_decided(
-              tool_call_id,
-              tool_name,
-              outcome="timeout",
-              decision_source="approval_timeout",
-              allow_tool_type_applied=False,
-            )
-            return None, {"code": "approval_timeout", "message": "User did not respond within timeout"}
-          self._emit_approval_decided(
-            tool_call_id,
-            tool_name,
-            outcome="approved" if decision.approved else "denied",
-            decision_source="user_approved" if decision.approved else "user_denied",
-            allow_tool_type_applied=False,
-          )
-          if not decision.approved:
-            return None, {"code": "user_denied", "message": "User denied execution"}
+        )
+        self._emit_approval_decided(
+          tool_call_id,
+          tool_name,
+          outcome="approved" if decision.approved else "denied",
+          decision_source="user_approved" if decision.approved else "user_denied",
+          allow_tool_type_applied=False,
+        )
+        if not decision.approved:
+          return None, {"code": "user_denied", "message": "User denied execution"}
 
     result: Optional[Any]
     error: Optional[Dict[str, Any]]
@@ -3215,7 +3027,7 @@ class ToolDispatcher:
       )
       invocation_report = (
         McpInvocationReport(certainty="settled")
-        if executable_approval is not None or executable_nonce is not None
+        if executable_approval is not None
         else None
       )
       if server and server in self._mcp_meta_inject_servers:
@@ -3743,9 +3555,6 @@ class ToolDispatcher:
     resume_approval_request: PolicyApprovalRequest | None = None,
     approval_args_redacted: dict[str, Any] | None = None,
     approval_args_hash: str | None = None,
-    automatic_approval_reason: str | None = None,
-    automatic_denial_reason: str | None = None,
-    deny_user_prompt: bool = False,
   ) -> dict[str, Any]:
     return await _approval_lifecycle_helpers.run_approval_lifecycle(
       route=self._approval_route,
@@ -3768,16 +3577,12 @@ class ToolDispatcher:
       resume_approval_request=resume_approval_request,
       approval_args_redacted=approval_args_redacted,
       approval_args_hash=approval_args_hash,
-      automatic_approval_reason=automatic_approval_reason,
-      automatic_denial_reason=automatic_denial_reason,
-      deny_user_prompt=deny_user_prompt,
       resolve_run_context_fn=self._resolve_run_context,
       current_skill_admission_fn=current_skill_admission,
       redact_for_approval_request_fn=self._redact_for_approval_request,
       resolve_tool_class_fn=self._resolve_tool_class,
       effective_trade_approval_decision_fn=self._effective_trade_approval_decision,
       await_user_approval_via_pending_tools_fn=self._await_user_approval_via_pending_tools,
-      approval_queue_timeout_seconds_fn=_approval_queue_timeout_seconds,
       secret_boundary=getattr(self, "_secret_boundary", None),
     )
 
@@ -3825,7 +3630,6 @@ class ToolDispatcher:
       ),
       effective_trade_approval_decision_fn=self._effective_trade_approval_decision,
       await_user_approval_via_pending_tools_fn=self._await_user_approval_via_pending_tools,
-      approval_queue_timeout_seconds_fn=_approval_queue_timeout_seconds,
       secret_boundary=getattr(self, "_secret_boundary", None),
     )
 
@@ -3837,27 +3641,26 @@ class ToolDispatcher:
     nonce: str,
     resolved_qualifier: str,
     allow_persistent: bool,
-    timeout_seconds: float,
     batch_admission: Any | None = None,
     durable_request: dict[str, Any] | None = None,
-  ) -> dict[str, Any] | None:
+    park: ApprovalPark | None = None,
+  ) -> dict[str, Any]:
     return await _approval_lifecycle_helpers.await_user_approval_via_pending_tools(
       session=(
         batch_admission.carrier.session
         if batch_admission is not None
         else route_session(self._approval_route)
       ),
-      approval_store=self._approval_store,
       append_event_fn=self._boundary_event_log.append,
       request=request,
       decision=decision,
       nonce=nonce,
       resolved_qualifier=resolved_qualifier,
       allow_persistent=allow_persistent,
-      timeout_seconds=timeout_seconds,
       log=log,
       batch_admission=batch_admission,
       durable_request=durable_request,
+      park=park,
     )
 
   def _executing_context(self) -> ParentContext | None:
@@ -4093,7 +3896,6 @@ class ToolDispatcher:
       tool_args_redacted,
       decision,
       effective_trade_approval_expiry_seconds_fn=effective_trade_approval_expiry_seconds,
-      approval_wait_seconds_fn=approval_settings.approval_wait_seconds,
       utc_now_fn=utc_now,
     )
 
@@ -4191,10 +3993,10 @@ class ToolDispatcher:
     tool_name: str,
     *,
     outcome: str,
-    decision_source: str,
+    decision_source: ApprovalDecisionSource,
     allow_tool_type_applied: bool,
-  ) -> None:
-    _audit_helpers.emit_approval_decided(
+  ) -> dict[str, Any] | None:
+    return _audit_helpers.emit_approval_decided(
       self._boundary_event_log,
       tool_call_id,
       tool_name,
@@ -4203,3 +4005,35 @@ class ToolDispatcher:
       allow_tool_type_applied=allow_tool_type_applied,
       time_fn=time.time,
     )
+
+  async def _record_durable_approval_decided(
+    self,
+    tool_call_id: str,
+    tool_name: str,
+    *,
+    outcome: str,
+    decision_source: ApprovalDecisionSource,
+  ) -> None:
+    """Record a durable binding's decision where its ask is recorded.
+
+    The ask reaches the live log and the session's durable log at the park;
+    the decision arrives in a later Continue, whose live log the replayed
+    transcript never reads, so it is persisted to the durable log as well.
+    """
+    event = self._emit_approval_decided(
+      tool_call_id,
+      tool_name,
+      outcome=outcome,
+      decision_source=decision_source,
+      allow_tool_type_applied=False,
+    )
+    session_log = getattr(self._session, "agent_session_log", None)
+    if event is None or session_log is None:
+      return
+    try:
+      await session_log.append(event)
+    except Exception:
+      log.warning(
+        "Failed to persist approval decided event for %s | failure=true",
+        tool_call_id,
+      )

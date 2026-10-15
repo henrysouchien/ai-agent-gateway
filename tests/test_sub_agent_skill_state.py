@@ -31,6 +31,8 @@ from agent_workflow_contracts import (
   EvidenceObservation,
   ExecutionSettlement,
   OrdinaryDelegationTaskRef,
+  OutcomeRequirement,
+  ResultRequirement,
   TaskObservation,
   TaskResult,
   TaskResultProvenance,
@@ -412,6 +414,54 @@ def test_ordinary_child_without_declared_door_keeps_clean_exit() -> None:
   assert classification.succeeded is True
   assert classification.outcome == "complete"
   assert classification.execution_status == "succeeded"
+
+
+def _sealed_task(**overrides: Any) -> Any:
+  from gateway_test_support.admitted_authority_test_support import (
+    sealed_admitted_task,
+  )
+
+  operation = AgentOperationRef(
+    namespace="agent-operation",
+    name="writer-skill",
+    version="1.0",
+    digest=sha256_digest({"operation": "writer-skill"}),
+  )
+  return sealed_admitted_task(
+    logical_task=OrdinaryDelegationTaskRef(
+      delegation_id="delegation:writer-skill",
+      operation=operation,
+    ),
+    attempt=AttemptRef(
+      attempt_number=1,
+      attempt_id="attempt:writer-skill:1",
+      physical_task_id="task:writer-skill",
+    ),
+    result_requirement=ResultRequirement(
+      mode="narrative",
+      terminal_narrative="required",
+      outcome=OutcomeRequirement(required=False, source="none"),
+    ),
+    tool_id="fms_report_demo",
+    **overrides,
+  )
+
+
+def test_persist_expectation_doors_are_empty_unless_the_operation_declares_one() -> None:
+  # A coordinator carries its children's writer doors on its grant but owes no
+  # persist of its own: it keeps its narrative outcome.
+  coordinator = _sealed_task()
+  assert skill_state.terminal_result_doors(coordinator) == frozenset({"fms_report_demo"})
+  assert skill_state.persist_expectation_doors(coordinator) == frozenset()
+  assert skill_state.persist_expectation_doors(None) == frozenset()
+
+
+def test_persist_expectation_doors_are_the_terminal_doors_of_a_declared_operation() -> None:
+  writer = _sealed_task(result_requires_persist=True)
+  assert skill_state.persist_expectation_doors(writer) == frozenset({"fms_report_demo"})
+  # A declared operation that persists several units has no terminal door to owe.
+  multi_unit = _sealed_task(result_requires_persist=True, terminal_on_persist=False)
+  assert skill_state.persist_expectation_doors(multi_unit) == frozenset()
 
 
 @pytest.mark.parametrize(

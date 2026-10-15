@@ -45,16 +45,48 @@ class _PipeTransport:
 
 
 class HankBridge:
-  """Calls the current cell's granted, code-callable operations."""
+  """Calls the current cell's granted, code-callable operations.
+
+  `call`/`search`/`describe` are fixed. The host's `hello` reply registers the
+  other bridge operations (`agent`, `wait`, `completion`, `judge`, ...); each
+  becomes a method that frames its keyword arguments under the registered name,
+  so the cell never carries a hand-written copy of that catalog.
+  """
 
   def __init__(self, transport: _HankTransport | None = None, token=None):
     self._transport = transport
     self._token = token
     self._parent_call_id = None
+    self._operations = {}
     self._seq = 0
     self._nonce = _hank_secrets.token_hex(12)
     self._opened = False
     self._lock = _hank_threading.RLock()
+
+  def __getattr__(self, name):
+    if name.startswith("_"):
+      raise AttributeError(name)
+    with self._lock:
+      self._open()
+      registered = self._operations.get(name)
+    if registered is None:
+      raise AttributeError(f"hank has no operation {name!r}; registered: {sorted(self._operations)}")
+    arguments = list(registered.get("arguments") or [])
+
+    def operation(*args, **kwargs):
+      if len(args) > len(arguments):
+        raise TypeError(f"hank.{name} takes at most {len(arguments)} positional arguments")
+      frame = {"type": name}
+      frame.update(zip(arguments, args))
+      for key, value in kwargs.items():
+        if key not in arguments:
+          raise TypeError(f"hank.{name} got an unexpected argument {key!r}; accepts {arguments}")
+        frame[key] = value
+      return self._request(frame)
+
+    operation.__name__ = name
+    operation.__doc__ = registered.get("description")
+    return operation
 
   def call(self, operation, **arguments):
     """Run one code-callable operation; returns its result payload."""
@@ -87,7 +119,13 @@ class HankBridge:
     transport = self._transport
     if not self._opened:
       hello = self._exchange(transport, {"type": "hello", "protocol": 1})
-      self._parent_call_id = hello.get("parent_call_id") if isinstance(hello, dict) else None
+      if isinstance(hello, dict):
+        self._parent_call_id = hello.get("parent_call_id")
+        self._operations = {
+          str(row["name"]): row
+          for row in (hello.get("operations") or [])
+          if isinstance(row, dict) and row.get("name")
+        }
       self._opened = True
     return transport
 

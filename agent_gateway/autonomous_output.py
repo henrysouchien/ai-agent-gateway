@@ -28,7 +28,6 @@ class RunOutput:
   error: str | None
   timed_out: bool
   operator_paused: bool = False
-  max_tokens_reached: bool = False
   exit_reason: str | None = None
   post_run_guard: dict[str, Any] | None = None
   session_recap: dict[str, Any] | None = None
@@ -67,7 +66,6 @@ def collect_run_output(
   session_recap: dict[str, Any] | None = None
   error_msg: str | None = None
   operator_paused = False
-  max_tokens_reached = False
   terminal_seen = False
   exit_reason: str | None = None
   approval_refs: ApprovalReferences | None = None
@@ -112,10 +110,6 @@ def collect_run_output(
           pass
         else:
           error_msg = f"Autonomous run interrupted: {reason}"
-    elif event_type == "max_tokens_reached":
-      max_tokens_reached = True
-    elif event_type == "assistant_message" and event.get("stop_reason") == "max_tokens":
-      max_tokens_reached = True
     elif event_type == "operator_pause":
       operator_paused = True
     elif event_type == "interrupted" and event.get("reason") == "operator_pause":
@@ -134,7 +128,6 @@ def collect_run_output(
     error=error_msg,
     timed_out=timed_out,
     operator_paused=operator_paused,
-    max_tokens_reached=max_tokens_reached,
     session_recap=session_recap,
     exit_reason=exit_reason,
     approval_refs=approval_refs,
@@ -148,8 +141,6 @@ def run_output_exit_code(run_output: RunOutput) -> int:
     return 1
   if run_output.error:
     return 1
-  if run_output.max_tokens_reached:
-    return 4
   return 0
 
 
@@ -160,8 +151,6 @@ def run_output_outcome(run_output: RunOutput) -> str:
     return run_output.exit_reason
   if run_output.error:
     return "error"
-  if run_output.max_tokens_reached:
-    return "max_tokens"
   if run_output.operator_paused:
     return "operator_pause"
   return "success"
@@ -252,7 +241,6 @@ def build_state_payload(
   state["model"] = model_name
   state["briefing_file"] = briefing_file
   state["timed_out"] = run_output.timed_out
-  state["max_tokens_reached"] = run_output.max_tokens_reached
   state["operator_paused"] = run_output.operator_paused
   state["last_outcome"] = outcome
   state["connected_servers"] = connected_server_names
@@ -296,8 +284,6 @@ def format_run_summary(
     status = "post-run guard failed"
   elif run_output.error and not run_output.timed_out:
     status = "failed"
-  elif run_output.max_tokens_reached:
-    status = "max tokens reached"
   elif run_output.operator_paused:
     status = "operator paused"
 
@@ -330,8 +316,7 @@ def format_run_summary(
     if formatted_state:
       lines.extend(["", *formatted_state.splitlines()])
 
-  summary_fn = extract_summary_fn or _extract_summary
-  summary = summary_fn(run_output.response, limit=1200)
+  summary = str(run_output.response or "").strip()
   if summary:
     lines.extend(["", "Summary:", summary])
   if run_output.exit_reason:
@@ -343,10 +328,7 @@ def format_run_summary(
   if run_output.error:
     lines.extend(["", f"Error: {run_output.error}"])
 
-  message = "\n".join(lines)
-  if len(message) > 3900:
-    message = message[:3897] + "..."
-  return message
+  return "\n".join(lines)
 
 
 __all__ = [

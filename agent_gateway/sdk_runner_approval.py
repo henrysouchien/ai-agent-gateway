@@ -16,6 +16,7 @@ from .sdk_runner_helpers import (
 )
 from .skill_limits import ActiveSkillAdmission
 from . import tool_dispatcher_approval_lifecycle as _approval_lifecycle_helpers
+from .tool_result_compaction import make_error_result
 from . import tool_redaction as _redaction
 
 log = logging.getLogger("agent_gateway.sdk_runner_approval")
@@ -115,6 +116,12 @@ def approval_args_hash(tool_input: dict[str, Any]) -> str:
   )
 
 
+def _deny_message(code: str, message: str, next_call: str) -> str:
+  """A deny's model-visible text is the native error object (code, message, next_call)."""
+
+  return make_error_result("", code, message, data={"next_call": next_call})["content"]
+
+
 async def can_use_tool_callback(
   runner: Any,
   tool_name: str,
@@ -129,8 +136,9 @@ async def can_use_tool_callback(
 
   allow_cls = getattr(claude_agent_sdk, "PermissionResultAllow")
   deny_cls = getattr(claude_agent_sdk, "PermissionResultDeny")
-  if tool_name in runner._effective_disallowed_tools():
-    return deny_cls(message=f"Tool '{tool_name}' is not available in this context")
+  # No deny-by-membership here: the run's excluded set (profile, stage scope,
+  # wildcard patterns) is the `disallowed_tools` the SDK itself enforces; see
+  # AgentSDKRunner._effective_disallowed_tools.
   registered_call = None
   if is_catalogless_approval_route(runner, tool_name):
     policy_tool, tool_class = runner._resolve_sdk_approval_identity(tool_name)
@@ -168,9 +176,12 @@ async def can_use_tool_callback(
     # (`NoApprovalRoute`), so it alone is refused here.
     if tool_class in MONEY_BOUNDARY_TOOL_CLASSES:
       return deny_cls(
-        message=(
-          "[approval_route_absent] This run has no admitted approval route "
-          f"for '{tool_name}'"
+        message=_deny_message(
+          "approval_route_absent",
+          f"This run has no admitted approval route for '{tool_name}'.",
+          "A live order needs a human decider; this run has none. Report that "
+          "the order was not placed and let the owner place it from a session "
+          "that can approve it.",
         )
       )
     if prepared_authorization is None:
@@ -179,10 +190,12 @@ async def can_use_tool_callback(
     # The authorized input references a prepared row only a durable-local
     # ledger writes; without one there is nothing behind the reference.
     return deny_cls(
-      message=(
-        "[planned_write_prepared_custody_unsupported] "
+      message=_deny_message(
+        "planned_write_prepared_custody_unsupported",
         f"'{tool_name}' needs durable prepared-payload custody, which this "
-        "run's approval route does not carry"
+        "run's approval route does not carry.",
+        "Run this write from a session with a durable-local approval route; "
+        "do not retry it here.",
       )
     )
   approval_input = (
@@ -249,7 +262,6 @@ async def can_use_tool_callback(
     resolve_tool_class_fn=lambda _policy_tool: tool_class,
     effective_trade_approval_decision_fn=runner._effective_trade_approval_decision,
     await_user_approval_via_pending_tools_fn=runner._await_user_approval_via_pending_tools,
-    approval_queue_timeout_seconds_fn=runner._approval_queue_timeout_seconds,
     secret_boundary=getattr(runner, "_secret_boundary", None),
   )
   if lifecycle["approved"]:
@@ -259,18 +271,23 @@ async def can_use_tool_callback(
     return allow_cls(
       updated_input=registered_call.materialize_authorized_input(tool_call_id)
     )
-  if lifecycle.get("timeout"):
-    return deny_cls(
-      message=(
-        "[approval_timeout] approval expired; a fresh tool call and "
-        "approval are required"
-      ),
-      interrupt=True,
-    )
   request = lifecycle["request"]
   if request.state == "auto_denied":
-    return deny_cls(message=str(request.reason or ""))
-  return deny_cls(message="user denied")
+    return deny_cls(
+      message=_deny_message(
+        "approval_auto_denied",
+        str(request.reason or "The approval was settled without a human."),
+        "Do not retry this call; continue with work that needs no approval "
+        "or report that it was not run.",
+      )
+    )
+  return deny_cls(
+    message=_deny_message(
+      "user_denied",
+      "The owner denied this call.",
+      "Do not retry this call; continue without it or ask the owner how to proceed.",
+    )
+  )
 
 
 __all__ = [

@@ -105,6 +105,8 @@ async def provider_summarize(
   if requested_effort is None:
     raise ValueError("provider summarize requires an explicitly bound effort")
 
+  capability_execution.revalidate()
+
   run_config = dict(capability_execution.auth_config)
   run_config["auth_mode"] = str(run_config.get("auth_mode", "api")).strip().lower() or "api"
   if not provider.has_active_credential(run_config):

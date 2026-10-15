@@ -31,6 +31,7 @@ from .mcp_activation import McpActivationFold
 from .session_event_history import SessionEventHistory
 from .session_capabilities import normalize_session_capabilities
 from .policy_imports import require_inherited_role
+from .ttl_policy import SESSION_TTL, TtlResolver, default_ttl_resolver, resolve_ttl_seconds
 
 if TYPE_CHECKING:
   from .admission import ParentContext
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
   from .code_execution._backends._kernel import KernelState
   from .code_execution._frame_reader import FrameReader
   from .runner_fork_agents import LearningForkConfig
+  from .operation_catalog import AgentOperationCatalog
   from .multi_user.billing import SessionUsageSummary
   from .tool_result_spill import SpillSink
   from .dispatcher_factory import GatewayDispatcherDeps
@@ -166,6 +168,8 @@ class SessionStream:
   subscribers: Dict[str, StreamSubscriber] = field(default_factory=dict)
   transcript_written_seqs: set[int] = field(default_factory=set)
   cleanup_handle: asyncio.TimerHandle | None = None
+  session: GatewaySession | None = field(default=None, repr=False, compare=False)
+  client_disconnect_handle: asyncio.TimerHandle | None = None
   #: Set once this turn has released everything the next turn needs: the
   #: teardown that follows the terminal event is not the turn, and the next
   #: message waits for it instead of being refused as "already running".
@@ -185,6 +189,26 @@ class SessionStream:
     """Whether the turn is still running and has not published its terminal event."""
 
     return self.is_running and not log_has_terminal(self.event_log)
+
+
+@dataclass
+class RequestToolPrefix:
+  """The Anthropic request tool list a session keeps prefix-stable.
+
+  `anchor` is the non-deferred wire tool list the session's first Anthropic
+  request sent; later requests re-send it unchanged and carry every other tool
+  as `defer_loading`.  `exposed` holds the definitions of tools a tool_result
+  referenced (`exposed_tools`), so a tool that later leaves the advertised set
+  keeps a definition for the reference still in history.  Both live on the
+  session, not the runner: a runner serves one request, the session serves
+  every turn, and the history that carries the references spans them.  A
+  session rebuilt from durable state starts empty and re-anchors on its next
+  request.
+  """
+
+  anchor: list[dict[str, Any]] | None = None
+  exposed: dict[str, dict[str, Any]] = field(default_factory=dict)
+  framing_tool: dict[str, Any] | None = None
 
 
 @dataclass
@@ -216,6 +240,9 @@ class GatewaySession:
   capability_run_overrides: Mapping[CapabilityId, ModelSelectionIntent] = field(
     default_factory=lambda: MappingProxyType({})
   )
+  #: The authenticated run's model-preset name, frozen at init beside
+  #: ``capability_run_overrides``; it outranks saved user and firm presets.
+  model_preset: str | None = None
   channel: Optional[str] = None
   owner_user_id: str | None = None
   raw_user_id: str | None = None
@@ -226,6 +253,11 @@ class GatewaySession:
   schema_version: int = DEFAULT_SCHEMA_VERSION
   stream_active: bool = False
   active_turn: Optional[SessionStream] = None
+  #: The turn most recently cleared from ``active_turn`` whose log already
+  #: holds its terminal event. A subscriber that lost its stream during the
+  #: quiet tail and reconnects after the grace clear replays from here instead
+  #: of being refused; the next turn's attach replaces it.
+  last_completed_turn: Optional[SessionStream] = None
   #: Admitted batches running on this session's token, keyed
   #: ``(owner_user_id, batch_id)``. Written and cleared only by
   #: ``BatchTaskRegistry`` (admission, cancel, terminal). A batch is a unit of
@@ -240,6 +272,18 @@ class GatewaySession:
   # none of them can disagree with another.
   mcp_activation_fold: McpActivationFold = field(default_factory=McpActivationFold)
   loaded_local_tools: Set[str] = field(default_factory=set)
+  request_tool_prefix: RequestToolPrefix = field(
+    default_factory=RequestToolPrefix,
+    init=False,
+    repr=False,
+    compare=False,
+  )
+  last_turn_context_message: str | None = field(
+    default=None,
+    init=False,
+    repr=False,
+    compare=False,
+  )
   approval_queues: Dict[str, asyncio.Queue] = field(default_factory=dict)
   gateway_local_skill_tools: list[dict[str, Any]] = field(
     default_factory=list,
@@ -255,7 +299,6 @@ class GatewaySession:
   admitted_job_context: ParentContext | None = field(default=None, repr=False, compare=False)
   approval_store: Any | None = None
   approval_policy: Any | None = None
-  approval_expire_pending_task: asyncio.Task[Any] | None = None
   tool_sequence: int = 0
   result_queue: Optional[asyncio.Queue] = None
   code_execution_work_dir: Optional[str] = None
@@ -264,6 +307,10 @@ class GatewaySession:
   request_id: str | None = None
   run_context: RunContext | None = field(default=None, repr=False)
   agent_session_log: AgentSessionLog | None = field(default=None, repr=False)
+  # The root agent's working checklist for this session: folded from the
+  # journal's `todo_snapshot` events at runtime assembly, shared by the `todo`
+  # tool, the run loop's stop-time check and the analyst `PATCH` door.
+  todo_checklist_state: Any | None = field(default=None, repr=False, compare=False)
   # The existing interactive log an init-time resume bound this session to.
   # The session-log factory opens exactly this path instead of minting one
   # keyed by `session_id`.
@@ -301,7 +348,6 @@ class GatewaySession:
   batch_id: int | None = None
   batch_stage_run_seq: int | None = None
   tool_result_spill_sink: SpillSink | None = field(default=None, repr=False)
-  background_tasks: Dict[str, Any] = field(default_factory=dict)
   control_chat_tasks: Dict[str, asyncio.Task[Any]] = field(default_factory=dict)
   event_history: SessionEventHistory = field(default_factory=SessionEventHistory)
   initial_message: str = ""
@@ -311,6 +357,10 @@ class GatewaySession:
   learn_memory_nudge_turns: int = 0
   learn_skill_nudge_iters: int = 0
   learning_fork_config: LearningForkConfig | None = field(default=None, repr=False)
+  learning_fork_operation_catalog: AgentOperationCatalog | None = field(
+    default=None,
+    repr=False,
+  )
   learning_fork_ledger: Any | None = field(default=None, repr=False)
   learning_fork_registry: Any | None = field(default=None, repr=False)
   workflow_output_reader: WorkflowOutputReader | None = field(
@@ -425,8 +475,9 @@ def bind_session_capability_selections(
   session: GatewaySession,
   *,
   run_overrides: Mapping[CapabilityId, ModelSelectionIntent],
+  model_preset: str | None = None,
 ) -> None:
-  """Freeze normalized role selections onto one gateway session exactly once."""
+  """Freeze normalized role selections and the run preset exactly once."""
 
   if session._capability_selections_bound:
     raise ValueError("session capability selections are already bound")
@@ -442,6 +493,7 @@ def bind_session_capability_selections(
         f"{capability_id} model override must be stable-key selection intent"
       )
   session.capability_run_overrides = MappingProxyType(normalized)
+  session.model_preset = model_preset
   session._capability_selections_bound = True
 
 
@@ -522,8 +574,14 @@ class SessionStore:
   lifetime through one predicate, ``ttl_elapsed``.
   """
 
-  def __init__(self, ttl: int = 3600) -> None:
+  def __init__(
+    self,
+    ttl: int = 3600,
+    *,
+    ttl_resolver: TtlResolver = default_ttl_resolver,
+  ) -> None:
     self.ttl = ttl
+    self.ttl_resolver = ttl_resolver
     self.sessions: Dict[str, GatewaySession] = {}
     self._session_kinds: Dict[str, Literal["chat", "control"]] = {}
     self._on_expiry: OnSessionExpiry | None = None
@@ -581,9 +639,13 @@ class SessionStore:
     allow_service_for_interactive: bool = False,
   ) -> GatewaySession:
     now = int(time.time())
-    ttl = self.ttl if ttl_seconds is None else int(ttl_seconds)
     session_id = f"sess_{uuid.uuid4().hex}"
     normalized_user_id = _normalize_required_user_id(user_id)
+    ttl = (
+      resolve_ttl_seconds(self.ttl_resolver, normalized_user_id, SESSION_TTL, self.ttl)
+      if ttl_seconds is None
+      else int(ttl_seconds)
+    )
     try:
       normalized_risk_user_id = int(risk_user_id or 0)
     except (TypeError, ValueError):
@@ -1034,6 +1096,9 @@ class AuthManager:
       for value in payload["model_entitled_keys"]
       if str(value or "").strip()
     )
+    # Model entitlements are a grant the gateway recorded at issue time; a
+    # bearer cannot widen which capabilities or model keys it may run beyond
+    # the store's copy.
     if token_model_capabilities != session.model_entitled_capabilities:
       raise HTTPException(status_code=401, detail="Session model capability entitlements mismatch")
     if token_model_keys != session.model_entitled_keys:
@@ -1050,6 +1115,9 @@ class AuthManager:
     payload["is_public"] = is_public if isinstance(is_public, bool) else False
     session.channel = payload["channel"]
     session.is_public = payload["is_public"]
+    # The schema version partitions sessions minted under a different token
+    # layout: the store's recorded version, not the bearer's claim, says which
+    # layout this session's payload follows.
     token_schema_version = payload["schema_version"]
     try:
       token_schema_version = int(token_schema_version)

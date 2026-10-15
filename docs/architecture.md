@@ -217,9 +217,13 @@ Use it when you need:
 - tracks usage and estimated cost
 - retries transient stream failures
 - runs the one soft-budget ladder (`runner_soft_budget`) on a delegated run:
-  steer at `SOFT_TURN_BUDGET`, forced final at 1.5×, and an abort only when the
-  child still has not answered after the grace turns; a primary run has no
-  ladder, and cost is a measurement, never a stop
+  steer at the `ContainmentSettings.soft_turn_budget` threshold, forced final at
+  `soft_budget_final_factor` (1.5×), and an abort only when the child still has
+  not answered after `soft_budget_grace_turns`; a primary run has no ladder, and
+  cost is a measurement, never a stop
+- takes every containment bound from its `containment` argument
+  (`ContainmentSettings`, `agent_gateway/containment_settings.py`); child
+  runners inherit the parent's object
 
 ## Tool Dispatch
 
@@ -339,7 +343,9 @@ Flow:
 2. The dispatcher calls `request_approval(...)`
 3. The server appends a `tool_approval_request` event
 4. The client calls `/api/chat/tool-approval`
-5. The dispatcher resumes or returns a `user_denied` / `approval_timeout` error
+5. The dispatcher resumes on approval or returns a `user_denied` error on denial; the wait has no timer
+
+On the durable approval route, a call whose job context lets the lifecycle record its private executable binding does not wait in the turn: after the ask is published it raises `ApprovalPark`, the turn closes `awaiting_approval` with the request still `pending_user`, and the vote on `/api/chat/tool-approval` reaches the original call through the root or child Continue hook, which executes it once and continues the run. A call with no job or tenant context has no binding to continue from and waits on the live queue as above.
 
 There is no session approval cache: each approval decides one call. `allow_tool_type=true` requests a persistent grant, which only an approval policy that permits grants mints.
 
@@ -365,8 +371,8 @@ Grant lifetime and invocation lifetime are separate:
 | Record | Current time semantics |
 | --- | --- |
 | Persistent grant | `expires_at=NULL` means indefinite until revoked. Grant creation on approval writes `NULL`; a finite timestamp, when supplied, is enforced at lookup. |
-| Default human prompt | The policy requests 600 seconds for a live order. The lifecycle may reduce the effective window, notably to stay within a trade preview's lifetime, and stores the resulting expiry on the pending row. |
-| Prepared BusinessModel approval | A missing per-call expiry is replaced with a 15-minute expiry before the prepared row is stored. |
+| Default human prompt | The policy requests no expiry for a live order. A trade's request records its preview's remaining window, less dispatch margin, as `expires_at`; the timestamp is informational, and no clock expires the request or refuses its vote. |
+| Prepared BusinessModel approval | The prepared row carries the approval's expiry, `NULL` when the policy set none; elapsed time does not lapse it. |
 | Generic grant-reminted approval | May retain `expires_at=NULL`. That means no approval-row time deadline; argument/identity, exact-plan, proposal TTL, and live-base checks still apply where those contracts exist. |
 
 Adding a default TTL to grants or all reminted approvals would be a product-policy, migration, and client-UI change. It is not implied by the current schema and must not be introduced as a documentation-only hardening change. `grant_reference` provides durable approval/execution lineage to the source grant; not every projected audit-event JSON currently includes that field.
@@ -424,10 +430,7 @@ An interceptor that throws is logged and the tool proceeds; an interceptor that 
 
 ## Code Execution
 
-`build_code_execution(session, config)` injects two tools:
-
-- `code_execute`
-- `code_execute_status`
+`build_code_execution(session, config, *, job_runner=None)` injects `code_execute`.
 
 It also returns:
 
@@ -447,8 +450,8 @@ Operational details:
 
 - the working directory persists within a session
 - stdout and stderr can stream back as `tool_output_chunk`
-- background tasks are stored on the session and polled with `code_execute_status`
-- `cleanup_code_execution(session)` cancels tasks and removes the work directory
+- a `background=true` cell is a `code` job on the task registry of the runner `job_runner()` answers; it is inspected, waited on and killed through that registry, and refused (`code_execution_unavailable`) when there is no runner
+- `cleanup_code_execution(session)` kills the live turn's running `code` jobs, then releases interpreters and removes the work directory
 
 ## Skills And Sub-Agents
 

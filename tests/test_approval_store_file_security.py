@@ -18,6 +18,7 @@ import pytest
 
 from agent_gateway.approval_policy import (
   ApprovalRequest,
+  ApprovalState,
   ApprovalVote,
   RunContext,
   build_approval_request,
@@ -560,6 +561,159 @@ def test_private_binding_cannot_replace_original_approval_identity(
   asyncio.run(case())
 
 
+def _binding_identities(store: SQLiteApprovalStore) -> list[tuple[str, str, str, str]]:
+  with store._connection() as conn:
+    return [
+      (row["approval_id"], row["job_id"], row["tool_call_id"], row["nonce"])
+      for row in conn.execute(
+        "SELECT approval_id, job_id, tool_call_id, nonce FROM approval_executable_bindings",
+      )
+    ]
+
+
+@pytest.mark.parametrize(
+  ("job_id", "tool_call_id", "published_nonce"),
+  [
+    ("job-original", "call-original", "nonce-original"),
+    ("job-original", "call-pending", "nonce-repark"),
+    ("job-successor", "call-pending", "nonce-repark"),
+  ],
+)
+def test_park_binding_moves_an_undecided_approval_to_the_pending_call(
+  tmp_path: Path,
+  job_id: str,
+  tool_call_id: str,
+  published_nonce: str,
+) -> None:
+  async def case() -> None:
+    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+    request, prepared = await _persist_binding(store)
+    arguments = {
+      **_binding_arguments(request, prepared),
+      "job_id": job_id,
+      "tool_call_id": tool_call_id,
+      "nonce": "nonce-repark",
+      "dispatch_context": {"call_index": 5},
+    }
+    assert await store.park_executable_binding(**arguments) == published_nonce
+    assert _binding_identities(store) == [
+      (request.approval_id, job_id, tool_call_id, published_nonce),
+    ]
+    current = await store.get(request.approval_id)
+    assert current is not None
+    assert (current.tool_call_id, current.state, current.state_version) == (
+      tool_call_id, "pending_user", request.state_version,
+    )
+    binding, decision = await store._read_executable_binding_for_executor(
+      job_id=job_id,
+      tool_call_id=tool_call_id,
+      nonce=published_nonce,
+      tenant_storage_id="alice",
+    )
+    assert binding.dispatch_context == {"call_index": 5}
+    assert binding.prepared_input["token"] == "secret-original-operand"
+    assert decision.approval_id == request.approval_id
+    located = await store.locate_request(
+      approval_id=request.approval_id, tenant_storage_id="alice",
+    )
+    assert located is not None
+    assert (located.job_id, located.tool_call_id) == (job_id, tool_call_id)
+    if tool_call_id != request.tool_call_id:
+      with pytest.raises(ApprovalExecutableBindingError) as stale:
+        await store._read_executable_binding_for_executor(
+          job_id="job-original",
+          tool_call_id=request.tool_call_id,
+          nonce="nonce-original",
+          tenant_storage_id="alice",
+        )
+      assert stale.value.code == "missing_binding"
+
+  asyncio.run(case())
+
+
+@pytest.mark.parametrize("settled", ["approved", "claimed"])
+def test_park_binding_never_moves_a_decided_or_claimed_call(
+  tmp_path: Path,
+  settled: str,
+) -> None:
+  async def case() -> None:
+    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+    request, prepared = await _persist_binding(store)
+    if settled == "approved":
+      await store.transition_state(
+        request.approval_id, "approved", expected_state_version=request.state_version,
+      )
+    else:
+      with store._connection() as conn:
+        conn.execute(
+          "UPDATE approval_executable_bindings SET execution_state = 'claimed'",
+        )
+    with pytest.raises(ApprovalExecutableBindingError) as error:
+      await store.park_executable_binding(**{
+        **_binding_arguments(request, prepared),
+        "tool_call_id": "call-pending",
+        "nonce": "nonce-repark",
+      })
+    assert error.value.code == "call_identity_mismatch"
+    assert _binding_identities(store) == [
+      (request.approval_id, "job-original", "call-original", "nonce-original"),
+    ]
+    current = await store.get(request.approval_id)
+    assert current is not None and current.tool_call_id == "call-original"
+
+  asyncio.run(case())
+
+
+@pytest.mark.parametrize(
+  ("holder_state", "takes_call"),
+  [
+    ("denied", True),
+    ("auto_denied", True),
+    ("expired", True),
+    ("pending_user", False),
+    ("approved", False),
+  ],
+)
+def test_park_binding_takes_a_call_only_from_an_approval_that_cannot_execute(
+  tmp_path: Path,
+  holder_state: ApprovalState,
+  takes_call: bool,
+) -> None:
+  async def case() -> None:
+    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+    holder, prepared = await _persist_binding(store)
+    if holder_state != "pending_user":
+      await store.transition_state(
+        holder.approval_id, holder_state, expected_state_version=holder.state_version,
+      )
+    repark = replace(holder, approval_id="approval-repark", approval_chain_id="approval-repark")
+    await store.create(repark)
+    arguments = {**_binding_arguments(repark, prepared), "nonce": "nonce-repark"}
+    if not takes_call:
+      with pytest.raises(ApprovalExecutableBindingError) as error:
+        await store.park_executable_binding(**arguments)
+      assert error.value.code == "call_identity_mismatch"
+      assert _binding_identities(store) == [
+        (holder.approval_id, "job-original", "call-original", "nonce-original"),
+      ]
+      return
+    assert await store.park_executable_binding(**arguments) == "nonce-original"
+    assert _binding_identities(store) == [
+      ("approval-repark", "job-original", "call-original", "nonce-original"),
+    ]
+    binding, decision = await store._read_executable_binding_for_executor(
+      job_id="job-original",
+      tool_call_id="call-original",
+      nonce="nonce-original",
+      tenant_storage_id="alice",
+    )
+    assert binding.approval_id == decision.approval_id == "approval-repark"
+    assert decision.state == "pending_user"
+
+  asyncio.run(case())
+
+
+
 async def _approved_executable_binding(
   store: SQLiteApprovalStore,
 ) -> tuple[ExecutableApprovalBinding, ApprovalRequest]:
@@ -1045,11 +1199,13 @@ def test_claimed_result_completes_after_expiry_clock_without_changing_approval(
       decision_state_version=decision.state_version,
       claim_token="token-original",
     ) is None
-    # Advance the owners' clocks after the original claim, including any
-    # completion/readback eligibility checks, not only pending maintenance.
+    # Advance the owners' clock past the recorded expiry: a maintenance pass no
+    # longer relabels the row, so the authenticated decision stands and the
+    # claimed completion still works.
     clock = expires_at + timedelta(seconds=1)
-    maintenance = await store.maintain_pending(now=clock)
-    assert maintenance.approvals_expired == 0
+    await store.maintain_pending()
+    still_approved = await store.get(binding.approval_id)
+    assert still_approved is not None and still_approved.state == "approved"
     result = ({"committed": True, "secret": "secret-returned-result"}, None)
     await store._complete_executable_binding_for_executor(
       binding=binding,
@@ -1461,9 +1617,11 @@ def test_root_turn_approval_locator_derives_exact_cold_binding_and_turn(
     assert await reopened._locate_root_turn_for_approval(
       approval_id=request.approval_id, tenant_storage_id="alice",
     ) == ("job-original", request.tool_call_id, "nonce-original", "turn-original")
-    assert await reopened._locate_root_turn_for_approval(
-      approval_id=request.approval_id, tenant_storage_id="bob",
-    ) is None
+    with pytest.raises(RootTurnRecordError) as tenant_error:
+      await reopened._locate_root_turn_for_approval(
+        approval_id=request.approval_id, tenant_storage_id="bob",
+      )
+    assert tenant_error.value.code == "tenant_mismatch"
     assert await reopened._locate_root_turn_for_approval(
       approval_id="absent", tenant_storage_id="alice",
     ) is None
@@ -1794,5 +1952,50 @@ def test_safe_approval_locator_missing_capture_is_not_restorable_without_invente
     assert "nonce-sdk-original" not in json.dumps(asdict(locator))
     assert "grant-generation-original" not in json.dumps(asdict(locator))
     assert "secret-original-operand" not in json.dumps(asdict(locator))
+
+  asyncio.run(case())
+
+
+def test_approval_store_get_and_get_by_tool_call_id_are_owner_scoped(
+  tmp_path: Path,
+) -> None:
+  """Owner B gets None from get and get_by_tool_call_id for Owner A's approval."""
+  async def case() -> None:
+    store = SQLiteApprovalStore(tmp_path / "owner-scoped.sqlite3")
+    request = build_approval_request(
+      tool_call_id="call-alice-1",
+      tool_name="file_write",
+      tool_class="external_write",
+      tool_args_redacted={"path": "report.xlsx"},
+      args_hash=sha256_args({"path": "report.xlsx"}),
+      run_context=RunContext(
+        user_id="alice",
+        request_id="req-1",
+        session_id="sess-1",
+        run_id="run-1",
+        tenant_id="tenant-1",
+      ),
+      state="pending_user",
+    )
+    await store.create(request)
+
+    # Owner A gets the record:
+    record = await store.get(request.approval_id, owner_user_id="alice")
+    assert record is not None
+    assert record.approval_id == request.approval_id
+    by_call = await store.get_by_tool_call_id(
+      request.tool_call_id, owner_user_id="alice"
+    )
+    assert by_call is not None
+    assert by_call.approval_id == request.approval_id
+
+    # Owner B gets None for Owner A's approval:
+    assert await store.get(request.approval_id, owner_user_id="bob") is None
+    assert (
+      await store.get_by_tool_call_id(
+        request.tool_call_id, owner_user_id="bob"
+      )
+      is None
+    )
 
   asyncio.run(case())

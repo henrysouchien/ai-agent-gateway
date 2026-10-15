@@ -236,6 +236,7 @@ async def _start(
   pack: str | None = None,
   deliver: bool = True,
   role: str = "owner",
+  model_preset: str | None = None,
 ) -> dict:
   payload = await registry.start(
     role=role,
@@ -250,6 +251,7 @@ async def _start(
     resumed_from=resumed_from,
     schedule_id=schedule_id,
     schedule_name="Daily risk" if schedule_id else None,
+    model_preset=model_preset,
   )
   await registry.wait(payload["task_id"], timeout_sec=1)
   return payload
@@ -1473,14 +1475,14 @@ def test_admitted_node_binding_signs_projects_persists_and_resumes(monkeypatch, 
     first = await registry.start(
       role="owner", profile="analyst", mode="skill", skill="risk.scan",
       context="Investigate risk", ticker="MSFT", research_file_id=7,
-      user_id="42", user_email="owner@example.com", parent=parent,
+      user_id="42", user_email="owner@example.com", parent=parent, model_preset="quick",
     )
     await registry.wait(first["task_id"], timeout_sec=1)
     restored = _registry(tmp_path, resolver)
     record = restored._tasks[first["task_id"]]
     assert record.admitted_context == admitted.wire
     assert record.tool_authority == admitted.tool_authority
-    resumed = await _start(restored, resumed_from=first["run_id"])
+    resumed = await _start(restored, resumed_from=first["run_id"], model_preset="quick")
     return first, resumed, restored
 
   first, resumed, restored = asyncio.run(run())
@@ -1488,11 +1490,13 @@ def test_admitted_node_binding_signs_projects_persists_and_resumes(monkeypatch, 
   assert requests[0].task == "Investigate risk"
   assert requests[0].ticker == "MSFT"
   assert requests[0].research_file_id == 7
+  assert requests[0].model_preset == "quick"
   assert requests[0].env_names == frozenset(filter_child_environment(
     os.environ, purpose=AUTONOMOUS_CHILD_ENVIRONMENT,
   ))
   assert requests[1].parent is None
   assert requests[1].required_bind == bind
+  assert requests[1].model_preset is None
   for environment in environments:
     envelope = verify_autonomous_launch_envelope(_SECRET, environment[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV])
     assert envelope.admitted == (admitted.wire, admitted.tool_authority)
@@ -1516,6 +1520,21 @@ def test_binding_rejects_bind_differing_from_admitted_context() -> None:
   bind = _bind(run_mode="autonomous")
   with pytest.raises(ValueError, match="does not match admitted context"):
     replace(_service_binding(bind), admitted=_admitted(bind.model_copy(update={"capability_id": "node.verify"})))
+
+
+@pytest.mark.parametrize("model_preset, expected", [(None, None), (" quick ", "quick"), ("  ", ValueError)])
+def test_binding_request_model_preset_is_a_named_preset(model_preset, expected) -> None:
+  def request() -> AutonomousCapabilityBindingRequest:
+    return AutonomousCapabilityBindingRequest(
+      task_id="bg_1", control_run_id="run-1", owner_user_id="42", raw_user_id="42",
+      user_email=None, profile="analyst", mode="skill", skill="risk.scan",
+      channel=None, source="start", run_mode="autonomous", model_preset=model_preset,
+    )
+  if expected is ValueError:
+    with pytest.raises(ValueError):
+      request()
+  else:
+    assert request().model_preset == expected
 
 
 
@@ -1595,8 +1614,9 @@ def test_rehydrate_rejects_incomplete_or_mismatched_admitted_authority(monkeypat
   ("reason", "status"),
   [
     ("tenant_mismatch", 403), ("grant_exceeds_parent", 403),
-    ("binding_not_granted", 403), ("handle_not_granted", 403),
-    ("invite_effect_not_allowed", 403), ("session_unauthenticated", 422),
+    ("binding_not_granted", 403), ("binding_ambiguous", 403),
+    ("handle_not_granted", 403), ("invite_effect_not_allowed", 403),
+    ("session_unauthenticated", 422),
   ],
 )
 def test_launch_admission_refusal_owns_http_projection(reason, status) -> None:

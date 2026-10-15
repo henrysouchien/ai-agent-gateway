@@ -33,6 +33,51 @@ class _ReplayToolBatch:
   deferred_extras: list[dict[str, Any]]
 
 
+# What the model is shown of a ``session_recap`` on later turns. The log event is
+# the billing and audit record (it embeds ``usage.context_surfaces``, ids, clocks,
+# seq ranges); the model needs only what its own replayed messages do not already
+# say: the run's counts and failures, artifacts, verdicts, approvals and the
+# token/cost totals. The projection is a pure function of the stored event, so a
+# recap renders to identical bytes on every later turn and never perturbs the
+# cached prefix.
+_RECAP_ARTIFACT_FIELDS = ("artifact_id", "skill", "contract_name", "ticker", "artifact_path")
+_RECAP_VERDICT_FIELDS = (
+  "skill_run_id", "skill", "ticker", "verdict_token", "confidence",
+  "materiality_cushion", "one_line_summary",
+)
+_RECAP_APPROVAL_FIELDS = ("tool_name", "outcome", "decision_source", "allow_tool_type_applied")
+_RECAP_FAILURE_FIELDS = ("failure_type", "detail")
+_RECAP_TOOL_CALLS_FIELDS = ("total_calls", "successes", "errors", "by_tool_name", "measurements")
+_RECAP_USAGE_FIELDS = (
+  "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens",
+  "cost", "turns", "model",
+)
+
+
+def _pick(source: Any, fields: tuple[str, ...]) -> dict[str, Any]:
+  if not isinstance(source, dict):
+    return {}
+  return {name: source[name] for name in fields if name in source}
+
+
+def _recap_replay_projection(event: dict[str, Any]) -> dict[str, Any]:
+  projection: dict[str, Any] = {"trigger": event.get("trigger")}
+  for key, fields in (
+    ("artifacts", _RECAP_ARTIFACT_FIELDS),
+    ("verdicts", _RECAP_VERDICT_FIELDS),
+    ("approvals", _RECAP_APPROVAL_FIELDS),
+    ("failures", _RECAP_FAILURE_FIELDS),
+  ):
+    items = event.get(key)
+    if isinstance(items, list) and items:
+      projection[key] = [_pick(item, fields) for item in items]
+  projection["tool_calls_summary"] = _pick(event.get("tool_calls_summary"), _RECAP_TOOL_CALLS_FIELDS)
+  usage = _pick(event.get("usage"), _RECAP_USAGE_FIELDS)
+  if usage:
+    projection["usage"] = usage
+  return projection
+
+
 @dataclass
 class SessionContextBuilder:
   """Build replay context from a durable session log.
@@ -104,6 +149,13 @@ class SessionContextBuilder:
       **current_query,
     )
     latest_state_update = state_updates[0] if state_updates else None
+    todo_snapshots, _ = await self.agent_session_log.query_current_strict(
+      event_types={"todo_snapshot"},
+      order="desc",
+      limit=1,
+      **current_query,
+    )
+    latest_todo_snapshot = todo_snapshots[0] if todo_snapshots else None
     fork_seeds, _ = await self.agent_session_log.query_current_strict(
       event_types={"fork_seed"},
       order="desc",
@@ -134,7 +186,7 @@ class SessionContextBuilder:
     tail_entries = [
       entry
       for entry in tail_entries
-      if entry.event.get("type") not in {"summary", "state_update", "fork_seed"}
+      if entry.event.get("type") not in {"summary", "state_update", "fork_seed", "todo_snapshot"}
       and entry.event.get("role") != "sub_agent"
     ]
     if interrupted_context is not None:
@@ -166,6 +218,8 @@ class SessionContextBuilder:
       messages.append(self._summary_to_message(latest_summary))
     if latest_state_update is not None:
       messages.append(self._state_update_to_message(latest_state_update))
+    if latest_todo_snapshot is not None:
+      messages.append(self._todo_snapshot_to_message(latest_todo_snapshot))
     if interrupted_context is not None:
       messages.append(self._interrupted_run_to_message(interrupted_context, latest_state_update))
     messages.extend(tail_messages)
@@ -365,6 +419,12 @@ class SessionContextBuilder:
       "content": f"## Previous run state\n\n{body}",
     }
 
+  def _todo_snapshot_to_message(self, entry: LogEntry) -> Message:
+    from .todo_checklist import render_checklist_projection, TodoChecklist
+
+    checklist = TodoChecklist.from_payload(entry.event)
+    return {"role": "user", "content": render_checklist_projection(checklist)}
+
   def _summarize_sub_agent_work(self, entries: list[LogEntry]) -> list[dict[str, Any]]:
     by_sub_agent: dict[str, dict[str, Any]] = {}
     for entry in entries:
@@ -457,10 +517,28 @@ class SessionContextBuilder:
     groups: list[list[Message]] = []
     batches: list[_ReplayToolBatch] = []
     pending_calls: dict[str, _ReplayToolBatch] = {}
+    # A parked call has no settlement until Continue appends its real
+    # tool_call_complete. Approval asks open in the current run, by call id.
+    asked_approvals: dict[str, str] = {}
+    parked_approvals: dict[str, str] = {}
 
     for entry in entries:
       event = entry.event
       event_type = str(event.get("type") or "")
+      if event_type == "tool_approval_request":
+        asked_approvals[str(event.get("tool_call_id") or "")] = str(event.get("approval_id") or "")
+      elif event_type == "tool_approval_decided":
+        asked_approvals.pop(str(event.get("tool_call_id") or ""), None)
+      elif event_type == "stream_complete":
+        if event.get("terminal_disposition") == "awaiting_approval":
+          parked_id = event.get("original_tool_call_id")
+          if parked_id:
+            parked_approvals[str(parked_id)] = str(
+              event.get("approval_id") or asked_approvals.get(str(parked_id), "")
+            )
+          else:
+            parked_approvals.update(asked_approvals)
+        asked_approvals = {}
       rendered = self._entry_to_message(event_type, event)
       if rendered is None:
         continue
@@ -504,6 +582,17 @@ class SessionContextBuilder:
             for tool_id in tool_ids:
               pending_calls[tool_id] = batch
 
+    # Replay projection only, never written: a parked call still unsettled
+    # here reads as awaiting the user's approval rather than as orphaned.
+    for tool_id, approval_id in parked_approvals.items():
+      batch = pending_calls.pop(tool_id, None)
+      if batch is not None:
+        batch.result_blocks.append({
+          "type": "tool_result",
+          "tool_use_id": tool_id,
+          "content": json.dumps({"status": "awaiting_approval", "approval_id": approval_id}),
+        })
+
     for batch in batches:
       if batch.result_blocks:
         # Recovery may settle later in the log; replay the owning assistant
@@ -524,7 +613,7 @@ class SessionContextBuilder:
     if event_type == "session_recap":
       return {
         "role": "user",
-        "content": "## Previous turn recap\n\n" + json.dumps(event, default=str),
+        "content": "## Previous turn recap\n\n" + json.dumps(_recap_replay_projection(event), sort_keys=True, default=str),
       }
 
     if event_type == "assistant_message":

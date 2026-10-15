@@ -25,6 +25,7 @@ from agent_gateway import (  # noqa: E402
   WorkflowTaskMetadata,
 )
 import agent_gateway.runner as gateway_runner  # noqa: E402
+from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
 from agent_gateway.runner_background_lifecycle import RunnerBackgroundLifecycleMixin  # noqa: E402
 from agent_gateway.runner_background_tasks import (  # noqa: E402
   BackgroundResultRequest,
@@ -63,7 +64,7 @@ from agent_gateway.runner_background_tasks import (  # noqa: E402
   workflow_owns_terminal_notification,
   WORKFLOW_TASK_METADATA_KEY,
 )
-from agent_gateway.task_registry import TaskState  # noqa: E402
+from agent_gateway.task_registry import TaskState, task_state_for_result  # noqa: E402
 from agent_gateway.agent_session_log import AgentSessionLog  # noqa: E402
 from agent_gateway.sub_agent import seal_admitted_task_payload  # noqa: E402
 from agent_workflow_contracts import (  # noqa: E402
@@ -527,7 +528,7 @@ def test_background_timeout_and_elapsed_helpers_bound_values() -> None:
   assert background_elapsed_seconds(_task(started_at=100.0, completed_at=105.9), now=110.0) == 5
 
 
-def test_ensure_sub_agent_semaphore_creates_only_when_limit_exists() -> None:
+def test_ensure_sub_agent_semaphore_creates_once() -> None:
   created: list[int] = []
 
   def factory(limit: int) -> dict[str, int]:
@@ -536,8 +537,6 @@ def test_ensure_sub_agent_semaphore_creates_only_when_limit_exists() -> None:
 
   existing = {"limit": 2}
 
-  assert ensure_sub_agent_semaphore(None, None, semaphore_factory=factory) is None
-  assert created == []
   assert ensure_sub_agent_semaphore(existing, 5, semaphore_factory=factory) is existing
   assert created == []
   assert ensure_sub_agent_semaphore(None, 3, semaphore_factory=factory) == {"limit": 3}
@@ -852,10 +851,13 @@ def test_grace_then_kill_drain_has_hard_total_bound_for_stubborn_task() -> None:
 def test_wait_for_background_tasks_short_circuits_or_waits_for_pending_handles() -> None:
   task_a = object()
   task_b = object()
+  task_parked = object()
   entries = [
     _task(task_id="bg_1", asyncio_task=task_a),
     _task(task_id="bg_2", asyncio_task=None),
     _task(task_id="bg_3", asyncio_task=task_b, state=TaskState.COMPLETED),
+    # A parked job holds a handle but owes no completion: never waited.
+    _task(task_id="bg_5", asyncio_task=task_parked, state=TaskState.PARKED),
   ]
   calls: list[tuple[list[Any], float]] = []
 
@@ -1321,6 +1323,31 @@ def test_background_task_payload_formats_interrupted_and_killed_states() -> None
   }
 
 
+def test_background_task_payload_formats_parked_state() -> None:
+  parked = _task(
+    state=TaskState.PARKED,
+    metadata={"owner_runner_id": "runner-1", "resume_chain_depth": 0},
+  )
+
+  payload = background_task_payload(
+    parked,
+    elapsed_seconds=12,
+    resumed_task_ids=[],
+    now=120.0,
+  )
+
+  assert payload["status"] == "parked"
+  assert payload["completed"] is False
+  assert payload["owner_runner_id"] == "runner-1"
+  assert payload["resumed_as"] == []
+  assert payload["latest_resume_task_id"] is None
+  assert payload["message"] == (
+    "Background task is parked; resume_background_agent continues it from "
+    "its transcript."
+  )
+  assert "error" not in payload
+
+
 def test_background_task_reminder_text_formats_running_tasks() -> None:
   assert background_task_reminder_text([], elapsed_seconds=lambda _task: 0) == ""
 
@@ -1364,7 +1391,7 @@ def test_runner_ensure_sub_agent_semaphore_delegates_and_reuses_existing(monkeyp
 
   runner = object.__new__(AgentRunner)
   runner._sub_agent_semaphore = None
-  runner._max_concurrent_sub_agents = 2
+  runner._containment = ContainmentSettings(max_concurrent_children=2)
 
   semaphore = runner._ensure_sub_agent_semaphore()
 
@@ -1373,12 +1400,6 @@ def test_runner_ensure_sub_agent_semaphore_delegates_and_reuses_existing(monkeyp
   assert created == [2]
   assert runner._ensure_sub_agent_semaphore() is semaphore
   assert created == [2]
-
-  runner_without_limit = object.__new__(AgentRunner)
-  runner_without_limit._sub_agent_semaphore = None
-  runner_without_limit._max_concurrent_sub_agents = None
-
-  assert runner_without_limit._ensure_sub_agent_semaphore() is None
 
 
 def test_runner_resume_chain_depth_delegates_to_background_helper() -> None:
@@ -2277,5 +2298,48 @@ def test_runner_resume_successor_uses_evicted_canonical_durable_predecessors(
       await runner._is_resume_successor(successor, "bg_original")
       is durable_link_matches
     )
+
+  asyncio.run(_case())
+
+
+def test_parked_completion_commits_parked_and_journals_the_park_without_publication() -> None:
+  async def _case() -> None:
+    admitted = _resume_lineage_admission("bg_parked")
+    runner = _resume_lineage_runner(admitted)
+    entry = runner._task_registry.get("bg_parked")
+    assert entry is not None
+    runner._task_registry.transition("bg_parked", TaskState.RUNNING)
+    result = terminal_task_result(
+      admitted,
+      status="interrupted",
+      reason="turns_exhausted",
+    )
+    entry.task_result = result
+    entry.completion_persistence_state = "committed"
+    parked: list[tuple[str, str]] = []
+
+    async def append_task_parked(task_id: str, reason: str) -> None:
+      parked.append((task_id, reason))
+
+    async def settlement_not_owed(bg_task: TaskEntry) -> bool:
+      raise AssertionError("a parked job owes no completion")
+
+    async def publication_not_owed(bg_task: TaskEntry) -> None:
+      raise AssertionError("a parked job owes no completion")
+
+    runner._append_task_parked = append_task_parked
+    runner._ensure_required_skill_result_settled = settlement_not_owed
+    runner._ensure_agent_completion_published = publication_not_owed
+
+    await runner._settle_and_commit_background_completion_live(
+      entry,
+      final_state=task_state_for_result(result),
+      result=result.model_dump(mode="json"),
+      error=None,
+    )
+
+    assert entry.state is TaskState.PARKED
+    assert entry.completed is False
+    assert parked == [("bg_parked", "turns_exhausted")]
 
   asyncio.run(_case())

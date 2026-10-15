@@ -1,8 +1,10 @@
-"""Exact static dispatch semantics and their legacy gateway projection.
+"""Dispatch-semantics value types and the bare-name dispatch projection.
 
 ``agent_gateway`` never imports product policy modules — every policy read goes
-through :mod:`agent_gateway.policy_imports` explicit application binding — so the declaration
-the dispatch boundary needs lives here, beside the boundary that reads it.
+through :mod:`agent_gateway.policy_imports` explicit application binding — and
+it owns no per-tool list: the dispatch semantics of each exact registered
+route are declared by that route's registration owner and read from the bound
+policy module (``get_dispatch_semantics_overrides``).
 
 Each row declares, for one tool:
 
@@ -29,10 +31,11 @@ Each row declares, for one tool:
   retry eligibility requires ``idempotent is not False`` *and* ``effect ==
   "read"``.
 
-The immutable exact-identity map is the sole declaration source.  The existing
-bare-name ``ToolDispatchDecl`` API remains a one-way compatibility projection
-for current runtime readers until descriptor activation replaces it.  Bare
-names are verified unique before that projection is built.
+The exact-identity declarations the bound policy module returns are the sole
+declaration source.  The existing bare-name ``ToolDispatchDecl`` API remains a
+one-way compatibility projection for current runtime readers until descriptor
+activation replaces it.  Bare names are verified unique before that projection
+is built.
 """
 
 from __future__ import annotations
@@ -43,13 +46,13 @@ from types import MappingProxyType
 from typing import Any, Callable
 
 from agent_workflow_contracts.models import CatalogToolEffect
-
 from agent_workflow_contracts.tool_registration import (
-  PolicyKind,
   RegisteredToolIdentity,
   VersionedPolicyRef,
   validate_registered_tool_identity,
 )
+
+from .policy_imports import load_server_policy_module
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,325 +88,42 @@ class ToolDispatchSemantics:
       raise ValueError("source_identity_policy has the wrong policy kind")
 
 
-_STATUS_SUCCESS: Mapping[str, Any] = MappingProxyType(
-  {"kind": "status_equals", "field": "status", "values": ("success",)}
-)
-_STATUS_OK: Mapping[str, Any] = MappingProxyType(
-  {"kind": "status_equals", "field": "status", "values": ("ok",)}
-)
-
-
-def _search_hits(default_source_kind: str) -> Mapping[str, Any]:
-  return MappingProxyType(
-    {
-      "kind": "search_hits",
-      "container": "hits",
-      "default_source_kind": default_source_kind,
-    }
-  )
-
-
-def _documents(source_kind: str) -> Mapping[str, Any]:
-  return MappingProxyType(
-    {"kind": "documents", "container": "documents", "source_kind": source_kind}
-  )
-
-
-def _single_document(source_kind: str) -> Mapping[str, Any]:
-  return MappingProxyType({"kind": "single_document", "source_kind": source_kind})
-
-
-def _vendor_sources(provider: str) -> Mapping[str, Any]:
-  return MappingProxyType({"kind": "vendor_sources", "provider": provider})
-
-
-def _parser_items(container: str, default_source_kind: str) -> Mapping[str, Any]:
-  return MappingProxyType(
-    {
-      "kind": "parser_items",
-      "container": container,
-      "default_source_kind": default_source_kind,
-    }
-  )
-
-
-def _policy_ref(
-  kind: PolicyKind,
-  policy_id: str,
-  *,
-  parameters: Mapping[str, object] | None = None,
-) -> VersionedPolicyRef:
-  return VersionedPolicyRef(
-    kind=kind,
-    policy_id=policy_id,
-    version="v1",
-    parameters=parameters or {},
-  )
-
-
-_CURRENT_GENERIC_NON_ERROR = _policy_ref(
-  "outcome",
-  "current_generic_non_error",
-)
-_CURRENT_NO_GATEWAY_EXTRACTION = _policy_ref(
-  "source_identity",
-  "current_no_gateway_extraction",
-)
-_SANDBOX_COMPUTATIONS = _policy_ref(
-  "source_identity",
-  "sandbox_computations",
-)
-_FMS_COMPUTATION = _policy_ref(
-  "source_identity",
-  "fms-computation",
-)
-
 DEFAULT_TOOL_DISPATCH_SEMANTICS = ToolDispatchSemantics(
   idempotent=False,
-  outcome_policy=_CURRENT_GENERIC_NON_ERROR,
-  source_identity_policy=_CURRENT_NO_GATEWAY_EXTRACTION,
-)
-
-
-def _idempotent_semantics(
-  *,
-  success_signal: Mapping[str, Any] | None = None,
-  source_identity: Mapping[str, Any] | None = None,
-) -> ToolDispatchSemantics:
-  outcome_policy = _CURRENT_GENERIC_NON_ERROR
-  if success_signal is not None:
-    if success_signal.get("kind") != "status_equals":
-      raise ValueError("current success signal must be status_equals")
-    outcome_policy = _policy_ref(
-      "outcome",
-      "current-declared-status-equals",
-      parameters={
-        key: value
-        for key, value in success_signal.items()
-        if key != "kind"
-      },
-    )
-  source_identity_policy = _CURRENT_NO_GATEWAY_EXTRACTION
-  if source_identity is not None:
-    policy_id = source_identity.get("kind")
-    if type(policy_id) is not str:
-      raise TypeError("current source identity kind must be an exact str")
-    source_identity_policy = _policy_ref(
-      "source_identity",
-      policy_id,
-      parameters={
-        key: value
-        for key, value in source_identity.items()
-        if key != "kind"
-      },
-    )
-  return ToolDispatchSemantics(
-    idempotent=True,
-    outcome_policy=outcome_policy,
-    source_identity_policy=source_identity_policy,
-  )
-
-
-_IDEMPOTENT_GENERIC = _idempotent_semantics()
-_NON_IDEMPOTENT_SANDBOX_COMPUTATIONS = ToolDispatchSemantics(
-  idempotent=False,
-  outcome_policy=_CURRENT_GENERIC_NON_ERROR,
-  source_identity_policy=_SANDBOX_COMPUTATIONS,
-)
-_IDEMPOTENT_FMS_COMPUTATION = ToolDispatchSemantics(
-  idempotent=True,
-  outcome_policy=_policy_ref(
-    "outcome",
-    "current-declared-status-equals",
-    parameters={"field": "status", "values": ("ok",)},
+  outcome_policy=VersionedPolicyRef(
+    kind="outcome",
+    policy_id="current_generic_non_error",
+    version="v1",
+    parameters={},
   ),
-  source_identity_policy=_FMS_COMPUTATION,
-)
-
-
-def _local(logical_name: str) -> RegisteredToolIdentity:
-  return RegisteredToolIdentity(
-    route_kind="local_handler",
-    logical_name=logical_name,
-  )
-
-
-def _mcp(logical_server_id: str, logical_name: str) -> RegisteredToolIdentity:
-  return RegisteredToolIdentity(
-    route_kind="mcp",
-    logical_server_id=logical_server_id,
-    logical_name=logical_name,
-  )
-
-
-def _build_exact_dispatch_semantics_overrides(
-) -> Mapping[RegisteredToolIdentity, ToolDispatchSemantics]:
-  source_rows = (
-    (_local("web_fetch"), MappingProxyType({"kind": "web_fetch"})),
-    (_mcp("research-corpus-mcp", "filings_search"), _search_hits("filing")),
-    (
-      _mcp("research-corpus-mcp", "transcripts_search"),
-      _search_hits("transcript"),
-    ),
-    (_mcp("research-corpus-mcp", "filings_list"), _documents("filing")),
-    (
-      _mcp("research-corpus-mcp", "transcripts_list"),
-      _documents("transcript"),
-    ),
-    (_mcp("research-corpus-mcp", "filings_read"), _single_document("filing")),
-    (
-      _mcp("research-corpus-mcp", "transcripts_read"),
-      _single_document("transcript"),
-    ),
-    (
-      _mcp("research-corpus-mcp", "filings_source_excerpt"),
-      _single_document("filing"),
-    ),
-    (
-      _mcp("research-corpus-mcp", "transcripts_source_excerpt"),
-      _single_document("transcript"),
-    ),
-    (
-      _mcp("edgar-parser-mcp", "get_filings"),
-      MappingProxyType({"kind": "parser_filings"}),
-    ),
-    (
-      _mcp("edgar-parser-mcp", "get_filing_sections"),
-      MappingProxyType({"kind": "parser_filing_sections"}),
-    ),
-    (
-      _mcp("edgar-parser-mcp", "search_filing_text"),
-      _parser_items("hits", "filing"),
-    ),
-    (
-      _mcp("edgar-parser-mcp", "get_filing_evidence"),
-      _parser_items("evidence", "filing_evidence"),
-    ),
-    (
-      _mcp("edgar-parser-mcp", "cite_concept"),
-      _parser_items("citations", "concept_citation"),
-    ),
-    (
-      _mcp("edgar-parser-mcp", "get_filing_document"),
-      MappingProxyType({"kind": "parser_document"}),
-    ),
-    (
-      _mcp("edgar-parser-mcp", "get_metric"),
-      MappingProxyType({"kind": "metric_citations"}),
-    ),
-  )
-  vendor_source_rows = (
-    (_mcp("market-data-mcp", "compare_peers"), "fmp", None),
-    (_mcp("market-data-mcp", "fetch_financials"), "fmp", None),
-    (_mcp("market-data-mcp", "fetch_company_profile"), "fmp", None),
-    (_mcp("market-data-mcp", "get_economic_data"), "fmp", None),
-    (_mcp("market-data-mcp", "get_estimate_revisions"), "fmp", None),
-    (_mcp("market-data-mcp", "screen_estimate_revisions"), "fmp", None),
-    (_mcp("market-data-mcp", "get_institutional_ownership"), "fmp", None),
-    (_mcp("market-data-mcp", "get_insider_trades"), "fmp", None),
-    (_mcp("market-data-mcp", "get_market_context"), "fmp", None),
-    (_mcp("market-data-mcp", "get_price_performance_windows"), "fmp", None),
-    (_mcp("market-data-mcp", "get_sector_overview"), "fmp", None),
-    (_mcp("fred-mcp", "fred_get_multiple"), "fred", None),
-    (_mcp("fred-mcp", "fred_get_series"), "fred", None),
-    (_mcp("portfolio-reads-mcp", "get_positions"), "portfolio", None),
-    (_mcp("portfolio-reads-mcp", "get_quote"), "portfolio", None),
-    (_mcp("portfolio-reads-mcp", "get_risk_analysis"), "portfolio", None),
-    (
-      _mcp("portfolio-reads-mcp", "industry_peer_comparison"),
-      "fmp",
-      None,
-    ),
-    (_mcp("portfolio-reads-mcp", "run_whatif"), "portfolio", None),
-    (_mcp("gsheets-mcp", "gsheets_read_range"), "gsheets", _STATUS_OK),
-  )
-  generic_identities = (
-    _mcp("fred-mcp", "fred_list_series"),
-    _mcp("fred-mcp", "fred_search"),
-  )
-
-  rows: list[tuple[RegisteredToolIdentity, ToolDispatchSemantics]] = [
-    (
-      identity,
-      _idempotent_semantics(
-        success_signal=_STATUS_SUCCESS,
-        source_identity=source_identity,
-      ),
-    )
-    for identity, source_identity in source_rows
-  ]
-  rows.extend(
-    (
-      identity,
-      _idempotent_semantics(
-        success_signal=success_signal,
-        source_identity=_vendor_sources(provider),
-      ),
-    )
-    for identity, provider, success_signal in vendor_source_rows
-  )
-  rows.append((
-    _mcp("edgar-parser-mcp", "get_metric_series"),
-    _idempotent_semantics(
-      success_signal=MappingProxyType(
-        {"kind": "status_equals", "field": "status", "values": ("success", "partial")}
-      ),
-      source_identity=MappingProxyType({"kind": "metric_citations"}),
-    ),
-  ))
-  rows.append((
-    _mcp("positioning-mcp", "get_topdown_positioning"),
-    _idempotent_semantics(
-      source_identity=MappingProxyType({"kind": "positioning_filing_sources"}),
-    ),
-  ))
-  rows.extend(
-    (
-      _mcp("macro-mcp", name),
-      _idempotent_semantics(
-        source_identity=MappingProxyType({"kind": "producer_vendor_sources"}),
-      ),
-    )
-    for name in (
-      "get_macro_dashboard",
-      "get_rates_and_curves",
-      "get_economic_indicators",
-      "get_sector_analysis",
-      "get_technical_summary",
-      "get_positioning",
-    )
-  )
-  rows.extend((identity, _IDEMPOTENT_GENERIC) for identity in generic_identities)
-  rows.append((
-    _local("fms_compute_quantifying_risk"),
-    _IDEMPOTENT_FMS_COMPUTATION,
-  ))
-  rows.extend(
-    (identity, _NON_IDEMPOTENT_SANDBOX_COMPUTATIONS)
-    for identity in (
-      _local("code_execute"),
-      _local("code_execute_status"),
-    )
-  )
-
-  by_identity: dict[RegisteredToolIdentity, ToolDispatchSemantics] = {}
-  for identity, semantics in rows:
-    if identity in by_identity:
-      raise RuntimeError("duplicate exact dispatch-semantics identity")
-    by_identity[identity] = semantics
-  return MappingProxyType(by_identity)
-
-
-_TOOL_DISPATCH_SEMANTICS_OVERRIDES = (
-  _build_exact_dispatch_semantics_overrides()
+  source_identity_policy=VersionedPolicyRef(
+    kind="source_identity",
+    policy_id="current_no_gateway_extraction",
+    version="v1",
+    parameters={},
+  ),
 )
 
 
 def tool_dispatch_semantics_overrides(
 ) -> Mapping[RegisteredToolIdentity, ToolDispatchSemantics]:
-  """Return the immutable sparse exact-identity override map."""
+  """Return the exact-identity semantics the bound policy module declares.
 
-  return _TOOL_DISPATCH_SEMANTICS_OVERRIDES
+  Empty when no policy is bound: the package has no product tools of its own.
+  """
+
+  policy = load_server_policy_module()
+  resolve: Callable[
+    [],
+    Mapping[RegisteredToolIdentity, ToolDispatchSemantics],
+  ] | None = (
+    getattr(policy, "get_dispatch_semantics_overrides", None)
+    if policy is not None
+    else None
+  )
+  if resolve is None:
+    return MappingProxyType({})
+  return resolve()
 
 
 def tool_dispatch_semantics_for(
@@ -412,7 +132,7 @@ def tool_dispatch_semantics_for(
   """Return final dispatch semantics for one exact registered identity."""
 
   canonical = validate_registered_tool_identity(identity)
-  return _TOOL_DISPATCH_SEMANTICS_OVERRIDES.get(
+  return tool_dispatch_semantics_overrides().get(
     canonical,
     DEFAULT_TOOL_DISPATCH_SEMANTICS,
   )
@@ -464,7 +184,7 @@ def build_tool_dispatch_declarations(
 
   resolver = effect_resolver if effect_resolver is not None else _derive_tool_effect
   rows: dict[str, ToolDispatchDecl] = {}
-  for identity, semantics in _TOOL_DISPATCH_SEMANTICS_OVERRIDES.items():
+  for identity, semantics in tool_dispatch_semantics_overrides().items():
     tool_name = identity.logical_name
     if tool_name in rows:
       raise RuntimeError("dispatch compatibility names must be unique")
@@ -501,8 +221,9 @@ _CACHED_DECLARATIONS: Mapping[str, ToolDispatchDecl] | None = None
 def tool_dispatch_declarations() -> Mapping[str, ToolDispatchDecl]:
   """Return the process-wide declaration table, built on first use.
 
-  The build is deferred because ``effect`` derivation soft-imports the server
-  policy module, which is not importable until the host application is up.
+  The build is deferred because the rows and the ``effect`` derivation both
+  read the bound server policy module, which is not bound until the host
+  application is up.
   """
 
   global _CACHED_DECLARATIONS

@@ -25,6 +25,7 @@ export type AdmittedContextWire = {
   readonly "lineage": AdmittedLineage;
   readonly "placement": "in_process" | "local_stub" | "hosted_stub";
   readonly "research_binding": AdmittedResearchBinding;
+  readonly "selection_provenance"?: (SelectionProvenance) | (null);
   readonly "selection_snapshot"?: ({
   readonly [key: string]: JsonValue;
 }) | (null);
@@ -107,7 +108,9 @@ export type AgentExecutionSnapshot = {
   readonly "resume_instruction"?: (string) | (null);
   readonly "resume_mechanics": AgentResumeMechanics;
   readonly "system_prompt": string;
+  readonly "temperature"?: (number) | (null);
   readonly "timeout_seconds"?: (number) | (null);
+  readonly "top_p"?: (number) | (null);
 };
 
 /** Full immutable identity of an executable operation. */
@@ -132,6 +135,7 @@ export type AgentOperationSnapshot = {
   readonly "required_capabilities"?: ReadonlyArray<SemanticCapabilityRequirement>;
   readonly "required_context"?: ReadonlyArray<string>;
   readonly "result_modes": ReadonlyArray<string>;
+  readonly "result_requires_persist"?: boolean;
   readonly "resumable"?: boolean;
   readonly "role"?: (string) | (null);
   readonly "terminal_on_persist"?: boolean;
@@ -372,6 +376,7 @@ export type ExecuteTaskDisposition = {
 };
 
 export type ExecutionSettlement = {
+  readonly "next_call"?: JsonValue;
   readonly "status": "succeeded" | "failed" | "interrupted" | "cancelled" | "skipped" | "awaiting_approval";
   readonly "terminal_reason"?: (string) | (null);
 };
@@ -463,6 +468,17 @@ export type PhaseOutputSelector = {
   readonly "revision": number;
 };
 
+/** One pipeline stage attempt, a durable child of the execution that runs it.
+
+Recorded as a default where the logical-task contract was open. Revert site:
+use OrdinaryDelegationTaskRef with delegation_id set to the stage run id. */
+export type PipelineStageTaskRef = {
+  readonly "kind"?: "pipeline_stage";
+  readonly "operation": AgentOperationRef;
+  readonly "pipeline_id": string;
+  readonly "stage_id": string;
+};
+
 export type ProjectionInline = {
   readonly "complete"?: true;
   readonly "contract": ContractRef;
@@ -530,6 +546,21 @@ export type SelectedContentSelector = {
   readonly "kind"?: "selected_content_selector";
 };
 
+/** The winning preset recorded beside one bind (design §7.4). */
+export type SelectionPresetProvenance = {
+  readonly "name": string;
+  readonly "policy_revision": string;
+  readonly "scope": "user" | "firm" | "run" | "subtree";
+};
+
+/** Role, effort and preset sources beside an exact bind; every key is present. */
+export type SelectionProvenance = {
+  readonly "effort_source": ("explicit" | "spawn" | "operation") | (null);
+  readonly "preset": (SelectionPresetProvenance) | (null);
+  readonly "role": (string) | (null);
+  readonly "role_source": ("spawn" | "operation") | (null);
+};
+
 export type SemanticCapabilityRequirement = {
   readonly "binding_modes": ReadonlyArray<"typed_input" | "live_tool">;
   readonly "compatible_input_contracts"?: ReadonlyArray<ContractRef>;
@@ -573,7 +604,7 @@ export type TaskResultProvenance = {
 
 export type TaskResultRef = {
   readonly "attempt": AttemptRef;
-  readonly "logical_task": (OrdinaryDelegationTaskRef) | (WorkflowNodeTaskRef);
+  readonly "logical_task": (OrdinaryDelegationTaskRef) | (WorkflowNodeTaskRef) | (PipelineStageTaskRef);
   readonly "task_result_id": string;
 };
 
@@ -633,6 +664,7 @@ export type UsageObservation = {
   readonly "input_tokens"?: number;
   readonly "output_tokens"?: number;
   readonly "tool_calls"?: number;
+  readonly "turns"?: number;
 };
 
 export type ValidationVerdictAcceptancePolicy = {
@@ -728,10 +760,12 @@ export type WorkflowView = {
   readonly "admitted_plan_ref"?: (AdmittedPlanRef) | (null);
   readonly "author_cost_usd": number;
   readonly "cancellation_reason"?: (string) | (null);
+  readonly "capacity_deferred_count"?: number;
   readonly "continuation_accepted"?: (WorkflowContinuationAcceptedView) | (null);
   readonly "delivery_status": "pending" | "complete" | "failed" | "not_required";
   readonly "estimated_cost_usd": number;
   readonly "execution_status": "authoring" | "running" | "succeeded" | "failed" | "interrupted" | "cancelled";
+  readonly "governor_denied_count"?: number;
   readonly "latest_anomaly"?: (WorkflowAnomalyView) | (null);
   readonly "latest_author_failure"?: (WorkflowAuthorFailureView) | (null);
   readonly "legal_actions"?: ReadonlyArray<"observe" | "continue" | "finish" | "cancel">;
@@ -792,7 +826,7 @@ export type AdmittedTask = {
   readonly "execution_disposition": (ExecuteTaskDisposition) | (SettleWithoutExecutionDisposition);
   readonly "execution_snapshot": (AgentExecutionSnapshot) | (null);
   readonly "inputs"?: ReadonlyArray<AdmittedInputBinding>;
-  readonly "logical_task": (OrdinaryDelegationTaskRef) | (WorkflowNodeTaskRef);
+  readonly "logical_task": (OrdinaryDelegationTaskRef) | (WorkflowNodeTaskRef) | (PipelineStageTaskRef);
   readonly "model_bind": (CapabilityBind) | (null);
   readonly "model_bind_digest": string;
   readonly "objective": JsonValue;
@@ -823,7 +857,7 @@ export type DeliveryEnvelope = (DeliveryEnvelopeV1) | (DeliveryEnvelopeV2);
 
 export type DependencyAcceptancePolicy = (TaskSettlementAcceptancePolicy) | (ValidationVerdictAcceptancePolicy);
 
-export type LogicalTaskRef = (OrdinaryDelegationTaskRef) | (WorkflowNodeTaskRef);
+export type LogicalTaskRef = (OrdinaryDelegationTaskRef) | (WorkflowNodeTaskRef) | (PipelineStageTaskRef);
 
 export type ParentResultMaterialization = (TerminalNarrativeInlineExact) | (ProjectionInline) | (AuthoredSummaryWithResultHandle) | (ResultHandle);
 
@@ -839,7 +873,7 @@ export type TaskResult = {
   readonly "attempt": AttemptRef;
   readonly "evidence"?: EvidenceObservation;
   readonly "execution": ExecutionSettlement;
-  readonly "logical_task": (OrdinaryDelegationTaskRef) | (WorkflowNodeTaskRef);
+  readonly "logical_task": (OrdinaryDelegationTaskRef) | (WorkflowNodeTaskRef) | (PipelineStageTaskRef);
   readonly "observation": TaskObservation;
   readonly "outcome"?: (AnalyticalOutcome) | (null);
   readonly "provenance": TaskResultProvenance;

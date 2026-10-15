@@ -5,9 +5,13 @@ import inspect
 import logging
 import time
 import uuid
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Protocol, runtime_checkable
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Literal, Optional, Protocol, runtime_checkable
+from uuid import UUID
 
+from agent_workflow_contracts.models import SelectionPresetProvenance, SelectionProvenance
 from fastapi import FastAPI, HTTPException
 
 
@@ -19,16 +23,20 @@ from model_authority.binding import (
   CapabilityResolutionError,
   CredentialHandle,
   ModelSelectionIntent,
+  catalogue_rates,
   eligible_model_choices,
   resolve_capability_model,
+  role_catalogue,
   saved_preference_ineligibility,
 )
 from model_authority.capabilities import CAPABILITY_IDS, SESSION_DRIVER_CAPABILITY
-from .capability_execution import CapabilityExecutionResolver
+from model_authority.current import RATE_TABLES
+from .capability_execution import CapabilityExecutionResolver, preset_role_map
 from .control_run_lifecycle import coerce_control_run_state
 from model_authority.capabilities import GATEWAY_EXECUTED_CAPABILITY_IDS
 from model_authority.registry import ProductModelRegistry
-from model_authority.selection import ProductModelSelectionPolicy, capture_selection_snapshot
+from model_authority.selection import ProductModelSelectionPolicy, TierDefault, capture_selection_snapshot
+from .model_preferences import ModelPreferenceStore
 from .event_adapter import adapt_event
 from .event_log import EventLog, log_has_terminal
 from .events import DEFAULT_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
@@ -64,6 +72,7 @@ from .server_models import (
   CapabilityChoiceNotice,
   CapabilityChoiceResponse,
   CapabilityChoiceSelection,
+  CapabilityRoleChoice,
   CapabilitySelection,
   ChatRequest,
   ChatRuntime,
@@ -241,11 +250,47 @@ async def _maybe_await(callback: Optional[Callable[..., Any]]) -> None:
 
 
 def _cancel_active_turn_cleanup_handle(active_turn: SessionStream) -> None:
+  _chat_stream_core.cancel_client_disconnect(active_turn)
   cleanup_handle = active_turn.cleanup_handle
   if cleanup_handle is None:
     return
   cleanup_handle.cancel()
   active_turn.cleanup_handle = None
+
+
+def _bind_turn_research_file_activity(active_turn: SessionStream, runner: Any) -> None:
+  """Transfer the turn's research file activity lease to the runner that runs it."""
+
+  research_file_activity_lease = active_turn.research_file_activity_lease
+  if research_file_activity_lease is None:
+    return
+  bind_research_file_activity = getattr(
+    runner,
+    "bind_research_file_activity_lease",
+    None,
+  )
+  if not callable(bind_research_file_activity):
+    raise RuntimeError(
+      "chat runner cannot own research file activity"
+    )
+  bind_research_file_activity(research_file_activity_lease)
+  active_turn.research_file_activity_lease = None
+
+
+def _release_turn_research_file_activity(active_turn: SessionStream, runner: Any | None) -> None:
+  """Release the turn's research file activity: the runner's bound lease, or one never bound."""
+
+  release_bound_activity = getattr(
+    runner,
+    "release_research_file_activity_lease_if_owned",
+    None,
+  )
+  if callable(release_bound_activity):
+    release_bound_activity()
+  activity_lease = active_turn.research_file_activity_lease
+  active_turn.research_file_activity_lease = None
+  if activity_lease is not None:
+    activity_lease.release()
 
 
 def _clear_active_turn(session: GatewaySession, active_turn: SessionStream) -> None:
@@ -257,12 +302,13 @@ def _clear_active_turn(session: GatewaySession, active_turn: SessionStream) -> N
     if pump_task is not None and not pump_task.done():
       pump_task.cancel()
   active_turn.subscribers.clear()
-  activity_lease = active_turn.research_file_activity_lease
-  active_turn.research_file_activity_lease = None
-  if activity_lease is not None:
-    activity_lease.release()
+  _release_turn_research_file_activity(active_turn, None)
   session.active_turn = None
   session.stream_active = False
+  # A subscriber that reconnects after this clear replays the finished
+  # turn's log rather than meeting 404 (R-ETN 2026-10-13); a turn that never
+  # published its terminal has nothing to replay and is not parked.
+  session.last_completed_turn = active_turn if log_has_terminal(active_turn.event_log) else None
 
 
 def _active_turn_is_running(active_turn: SessionStream | None) -> bool:
@@ -335,7 +381,7 @@ async def _cancel_active_turn_runner(active_turn: SessionStream) -> None:
   _cancel_active_turn_cleanup_handle(active_turn)
   task = active_turn.runner_task
   if task is not None and not task.done():
-    task.cancel()
+    task.cancel("caller_aborted")
     await asyncio.gather(task, return_exceptions=True)
 
 
@@ -543,7 +589,7 @@ async def _stream_subscriber_sse(
 
 
 def _legacy_request_approval(session: GatewaySession, event_log: EventLog) -> RequestApproval:
-  async def request_approval(payload: ApprovalRequest) -> Optional[ApprovalDecision]:
+  async def request_approval(payload: ApprovalRequest) -> ApprovalDecision:
     approval_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
     session.pending_tools[payload.tool_call_id] = {
       "nonce": payload.nonce,
@@ -609,6 +655,8 @@ def _chat_turn_state_from_events(events: list[dict[str, Any]]) -> str:
         return "completed"
       if disposition == "interrupted":
         return "interrupted"
+      if disposition == "awaiting_approval":
+        return "approval_pending"
       return "failed"
   return "completed" if events else "starting"
 
@@ -650,12 +698,170 @@ _SAVED_PREFERENCE_NOT_APPLIED_DETAILS: dict[str, str] = {
 }
 
 
+_SAVED_PRESET_NOT_APPLIED_DETAILS: dict[str, str] = {
+  "preset_unpublished": "model-selection policy no longer publishes it",
+  "capability_entitlement_required": (
+    "no entitlement covers the model it selects for the session driver"
+  ),
+  "default_not_eligible": (
+    "no eligible credential covers the model it selects for the session driver"
+  ),
+  "credential_unavailable": (
+    "no eligible credential covers the model it selects for the session driver"
+  ),
+}
+
+
+def _saved_preset_not_applied(name: str, reason: str) -> CapabilityChoiceNotice:
+  detail = _SAVED_PRESET_NOT_APPLIED_DETAILS.get(
+    reason,
+    "it is currently ineligible",
+  )
+  return CapabilityChoiceNotice(
+    code="saved_preset_not_applied",
+    message=(
+      f"The saved preset {name!r} was not applied because {detail}; base "
+      "policy applies and it remains saved until replaced or cleared."
+    ),
+    reason=reason,
+  )
+
+
+@dataclass(frozen=True, slots=True)
+class RootPresetMap:
+  """The one whole winning role map a root turn captures.
+
+  ``role_map`` None means base policy; roles a preset omits always come from
+  policy, never from a lower-precedence preset.
+  """
+
+  role_map: Mapping[str, TierDefault] | None = None
+  source: Literal["saved_preference", "internal_policy"] | None = None
+  scope: Literal["run", "user", "firm"] | None = None
+  name: str | None = None
+  discarded: CapabilityChoiceNotice | None = None
+
+
+def _root_preset_map(
+  selection_policy: ProductModelSelectionPolicy,
+  *,
+  preference_store: ModelPreferenceStore | None,
+  tenant_id: str,
+  actor_id: str,
+  commercial_account_id: UUID | None = None,
+  run_preset: str | None = None,
+) -> RootPresetMap:
+  """Pick authenticated run > user saved > verified firm > policy (design R5).
+
+  The run preset is the session's frozen `/chat/init` ``model_preset``; one
+  the policy does not publish is refused, never replaced by a lower level.
+  A saved user preset the current policy no longer publishes is discarded
+  with a notice and base policy applies, never the firm's preset. A selected
+  firm preset the policy no longer publishes has no silent replacement.
+  """
+
+  if run_preset is not None:
+    return RootPresetMap(
+      preset_role_map(selection_policy, run_preset),
+      "internal_policy",
+      "run",
+      run_preset,
+    )
+  if preference_store is None:
+    return RootPresetMap()
+  user = preference_store.get_user_preset(
+    tenant_id=tenant_id,
+    actor_id=actor_id,
+  )
+  if user is not None:
+    role_map = selection_policy.presets.get(user.name)
+    if role_map is None:
+      return RootPresetMap(
+        discarded=_saved_preset_not_applied(user.name, "preset_unpublished"),
+      )
+    return RootPresetMap(role_map, "saved_preference", "user", user.name)
+  if commercial_account_id is None:
+    return RootPresetMap()
+  firm = preference_store.get_firm_preset(
+    commercial_account_id=commercial_account_id,
+  )
+  if firm is None:
+    return RootPresetMap()
+  role_map = selection_policy.presets.get(firm.name)
+  if role_map is None:
+    raise CapabilityResolutionError(
+      "capability_selection_invalid",
+      f"the firm's selected model preset {firm.name!r} is not published by "
+      f"model-selection policy revision {selection_policy.revision!r}; select "
+      "a published preset with PUT /model-presets/self, or have the firm "
+      "owner reselect one",
+      capability_id=SESSION_DRIVER_CAPABILITY,
+    )
+  return RootPresetMap(role_map, "internal_policy", "firm", firm.name)
+
+
+def _root_preset_for_session(
+  resolver: CapabilityExecutionResolver,
+  preference_store: ModelPreferenceStore | None,
+  *,
+  saved_preference: ModelSelectionIntent | None,
+  commercial_account_id: UUID | None = None,
+  run_preset: str | None = None,
+) -> RootPresetMap:
+  """The winning root map with R5's saved-preset discard applied.
+
+  The one owner both `/chat/init` and the turn read, so catalogue roles,
+  `selected` and the bound driver agree. A saved user preset whose session
+  driver cannot bind for this session is discarded with a notice when base
+  policy can bind it; when base policy cannot either, the failure is not the
+  preset's and the map stands, so the turn raises the real refusal. The
+  explicit run preset is never discarded.
+  """
+
+  preset = _root_preset_map(
+    resolver.selection_policy,
+    preference_store=preference_store,
+    tenant_id=resolver.auth_context.tenant_id,
+    actor_id=resolver.auth_context.actor_id,
+    commercial_account_id=commercial_account_id,
+    run_preset=run_preset,
+  )
+  if preset.scope != "user" or preset.name is None:
+    return preset
+
+  def _bind_driver(winner: RootPresetMap) -> None:
+    resolver.select_bind(
+      SESSION_DRIVER_CAPABILITY,
+      saved_preference=saved_preference,
+      selection_snapshot=capture_selection_snapshot(
+        resolver.selection_policy,
+        role_map=winner.role_map,
+        role_map_source=winner.source,
+      ),
+    )
+
+  try:
+    _bind_driver(preset)
+  except CapabilityResolutionError as exc:
+    try:
+      _bind_driver(RootPresetMap())
+    except CapabilityResolutionError:
+      return preset
+    return RootPresetMap(discarded=_saved_preset_not_applied(preset.name, exc.code))
+  return preset
+
+
 def build_capability_choices(
   *,
   session: GatewaySession,
   build_chat_runtime: BuildChatRuntime,
 ) -> dict[str, CapabilityChoiceResponse]:
-  """Return only authenticated, session-executable stable-key choices."""
+  """Return only authenticated, session-executable stable-key choices.
+
+  Each choice carries its authority rates; ``roles`` is the capability's
+  role catalogue from the resolver's own projection (``role_catalogue``), not
+  a widening of the driver choices.
+  """
 
   resolver = _capability_execution_resolver_for_session(
     session=session,
@@ -668,6 +874,23 @@ def build_capability_choices(
     build_chat_runtime,
     "_gateway_model_preference_store",
     None,
+  )
+  driver_preference = (
+    preference_store.get(
+      tenant_id=resolver.auth_context.tenant_id,
+      actor_id=resolver.auth_context.actor_id,
+      capability_id=SESSION_DRIVER_CAPABILITY,
+    )
+    if preference_store is not None
+    else None
+  )
+  # Init has no verified commercial claim (it arrives only with a work
+  # start), so the catalogue shows the run, user and policy levels.
+  preset = _root_preset_for_session(
+    resolver,
+    preference_store,
+    saved_preference=driver_preference,
+    run_preset=session.model_preset,
   )
   for capability_id, policy in sorted(policy_artifact.capabilities.items()):
     if capability_id != SESSION_DRIVER_CAPABILITY and not policy.allow_authenticated_run_override:
@@ -685,8 +908,22 @@ def build_capability_choices(
         "supported_efforts": list(choice.supported_efforts),
         "default_effort": choice.default_effort,
         "lifecycle": choice.lifecycle,
-      })
+        "rates": catalogue_rates(registry.require(choice.key), RATE_TABLES),
+      }, from_attributes=True)
       for choice in eligible
+    ]
+    roles = [
+      CapabilityRoleChoice.model_validate(role, from_attributes=True)
+      for role in role_catalogue(
+        capability_id,
+        registry=registry,
+        selection_policy=policy_artifact,
+        auth=resolver.auth_context,
+        rate_tables=RATE_TABLES,
+        trusted_channel=resolver.trusted_channel,
+        role_map=preset.role_map,
+        role_map_source=preset.source,
+      )
     ]
     notices: list[CapabilityChoiceNotice] = []
     selected: CapabilityChoiceSelection | None = None
@@ -696,13 +933,11 @@ def build_capability_choices(
         message=f"{capability_id} inherits the exact parent binding by default.",
       ))
     else:
-      saved_preference = None
-      if capability_id == SESSION_DRIVER_CAPABILITY and preference_store is not None:
-        saved_preference = preference_store.get(
-          tenant_id=resolver.auth_context.tenant_id,
-          actor_id=resolver.auth_context.actor_id,
-          capability_id=capability_id,
-        )
+      saved_preference = (
+        driver_preference
+        if capability_id == SESSION_DRIVER_CAPABILITY
+        else None
+      )
       try:
         bind = resolve_capability_model(
           capability_id,
@@ -711,6 +946,8 @@ def build_capability_choices(
           auth=resolver.auth_context,
           saved_preference=saved_preference,
           trusted_channel=resolver.trusted_channel,
+          role_map=preset.role_map,
+          role_map_source=preset.source,
         )
       except CapabilityResolutionError as exc:
         notices.append(CapabilityChoiceNotice(
@@ -751,6 +988,8 @@ def build_capability_choices(
             model_key=saved_preference.model_key,
             reason=reason,
           ))
+      if capability_id == SESSION_DRIVER_CAPABILITY and preset.discarded is not None:
+        notices.append(preset.discarded)
     responses[capability_id] = CapabilityChoiceResponse(
       capability=capability_id,
       catalog_revision=registry.revision,
@@ -758,6 +997,7 @@ def build_capability_choices(
       selected=selected,
       notices=notices,
       choices=choices,
+      roles=roles,
     )
   return responses
 
@@ -913,8 +1153,9 @@ def bind_init_capability_selections(
   session: GatewaySession,
   selections: dict[str, CapabilitySelection],
   build_chat_runtime: BuildChatRuntime,
+  model_preset: str | None = None,
 ) -> None:
-  """Validate, materialize, and freeze init-time role selections."""
+  """Validate, materialize, and freeze init-time role selections and preset."""
 
   normalized: dict[CapabilityId, CapabilitySelection] = {}
   for raw_capability_id, selection in selections.items():
@@ -946,9 +1187,12 @@ def bind_init_capability_selections(
   )
   for capability_id in sorted(normalized):
     resolver.resolve(capability_id)
+  if model_preset is not None:
+    preset_role_map(resolver.selection_policy, model_preset)
   bind_session_capability_selections(
     session,
     run_overrides=run_overrides,
+    model_preset=model_preset,
   )
 
 
@@ -957,8 +1201,13 @@ def prepare_session_driver_turn(
   inputs: ChatTurnInputs,
   *,
   build_chat_runtime: BuildChatRuntime,
+  commercial_account_id: UUID | None = None,
 ) -> PreparedChatTurn:
-  """Build and bind one trusted chat request before any billable side effect."""
+  """Build and bind one trusted chat request before any billable side effect.
+
+  ``commercial_account_id`` comes only from a verified commercial claim; it
+  selects the firm preset layer.
+  """
 
   request_id = (
     inputs.request_id.strip()
@@ -1006,6 +1255,10 @@ def prepare_session_driver_turn(
     else None
   )
   channel = session.channel or claimed_channel
+  # Auth partition (ruled 2026-10-08, Reading A): a session authenticated on a
+  # channel (e.g. the Discord bot's community grant) may only run the profiles
+  # that channel was admitted to, so a channel credential cannot select a
+  # profile with broader tool authority than the channel was granted.
   channel_profile_allowlist = getattr(
     build_chat_runtime,
     "_gateway_channel_profile_allowlist",
@@ -1029,10 +1282,55 @@ def prepare_session_driver_turn(
     session=session,
     build_chat_runtime=build_chat_runtime,
   )
+  preference_store = getattr(
+    build_chat_runtime,
+    "_gateway_model_preference_store",
+    None,
+  )
+  stored_preference = (
+    preference_store.get(
+      tenant_id=capability_execution_resolver.auth_context.tenant_id,
+      actor_id=capability_execution_resolver.auth_context.actor_id,
+      capability_id=SESSION_DRIVER_CAPABILITY,
+    )
+    if preference_store is not None
+    else None
+  )
+  preset = _root_preset_for_session(
+    capability_execution_resolver,
+    preference_store,
+    saved_preference=stored_preference,
+    commercial_account_id=commercial_account_id,
+    run_preset=session.model_preset,
+  )
+  if preset.discarded is not None:
+    # R5: base policy applies, never the firm's preset; init's notices carry
+    # the user-visible `saved_preset_not_applied`.
+    log.warning(
+      "Saved model preset not applied | session=%s | reason=%s",
+      session.session_id,
+      preset.discarded.reason,
+    )
   selection_snapshot = capture_selection_snapshot(
-    capability_execution_resolver.selection_policy
+    capability_execution_resolver.selection_policy,
+    role_map=preset.role_map,
+    role_map_source=preset.source,
   )
   request._selection_snapshot = selection_snapshot
+  request._selection_provenance = SelectionProvenance(
+    role=None,
+    role_source=None,
+    effort_source="explicit" if request.effort is not None else None,
+    preset=(
+      SelectionPresetProvenance(
+        name=preset.name,
+        scope=preset.scope,
+        policy_revision=selection_snapshot.policy_revision,
+      )
+      if preset.name is not None and preset.scope is not None
+      else None
+    ),
+  )
   execution_policy_resolver = getattr(
     build_chat_runtime,
     "_gateway_session_execution_policy_resolver",
@@ -1066,20 +1364,7 @@ def prepare_session_driver_turn(
     if request.model_key is not None
     else None
   )
-  preference_store = getattr(
-    build_chat_runtime,
-    "_gateway_model_preference_store",
-    None,
-  )
-  saved_preference = (
-    preference_store.get(
-      tenant_id=capability_execution_resolver.auth_context.tenant_id,
-      actor_id=capability_execution_resolver.auth_context.actor_id,
-      capability_id=SESSION_DRIVER_CAPABILITY,
-    )
-    if preference_store is not None and explicit_intent is None
-    else None
-  )
+  saved_preference = stored_preference if explicit_intent is None else None
   capability_execution = capability_execution_resolver.resolve(
     SESSION_DRIVER_CAPABILITY,
     explicit_intent=explicit_intent,
@@ -1228,8 +1513,10 @@ async def _dispatch_chat_turn_body(
   session.stream_active = True
   sid = session.session_id
   active_turn = turn
+  active_turn.session = session
   active_turn.runner_task = asyncio.current_task()
   session.active_turn = active_turn
+  session.last_completed_turn = None
   active_turn.attached.set()
 
   previous_on_event = getattr(event_log, "_on_event", None)
@@ -1287,9 +1574,10 @@ async def _dispatch_chat_turn_body(
   selected_content_activity_lease = selected_content_admission.activity_lease
   selected_content_activity_transferred = False
 
-  async def _safe_fire_disconnect() -> None:
+  async def _safe_fire_disconnect(cause: str) -> None:
     if runtime is None:
       return
+    _chat_stream_core.settle_pending_client_tools(session, cause)
     try:
       await runtime.on_disconnect()
     except Exception as exc:
@@ -1399,19 +1687,7 @@ async def _dispatch_chat_turn_body(
       if isinstance(runner_on_disconnect, _DisconnectHandler):
         runtime.disconnect_handler = runner_on_disconnect
 
-    research_file_activity_lease = active_turn.research_file_activity_lease
-    if research_file_activity_lease is not None:
-      bind_research_file_activity = getattr(
-        runner,
-        "bind_research_file_activity_lease",
-        None,
-      )
-      if not callable(bind_research_file_activity):
-        raise RuntimeError(
-          "chat runner cannot own research file activity"
-        )
-      bind_research_file_activity(research_file_activity_lease)
-      active_turn.research_file_activity_lease = None
+    _bind_turn_research_file_activity(active_turn, runner)
 
     if selected_content_activity_lease is not None:
       bind_selected_content_activity = getattr(
@@ -1425,6 +1701,20 @@ async def _dispatch_chat_turn_body(
         )
       bind_selected_content_activity(selected_content_activity_lease)
       selected_content_activity_transferred = True
+
+    turn_context_msg = getattr(runtime, "turn_context_message", None)
+    if turn_context_msg:
+      last_context = getattr(session, "last_turn_context_message", None)
+      if turn_context_msg != last_context:
+        session.last_turn_context_message = turn_context_msg
+        for msg in reversed(messages):
+          if msg.get("role") == "user":
+            content = msg.get("content")
+            if isinstance(content, str):
+              msg["content"] = f"{content}\n\n{turn_context_msg}" if content else turn_context_msg
+            elif isinstance(content, list):
+              msg["content"] = [*content, {"type": "text", "text": turn_context_msg}]
+            break
 
     async def run_agent() -> None:
       try:
@@ -1483,7 +1773,7 @@ async def _dispatch_chat_turn_body(
       )
       if fanout_failure in done:
         delivery_error = fanout_failure.result()
-        await _safe_fire_disconnect()
+        await _safe_fire_disconnect("event_delivery_failed")
         runner_task.cancel()
         await asyncio.gather(runner_task, return_exceptions=True)
         raise RuntimeError(
@@ -1497,8 +1787,11 @@ async def _dispatch_chat_turn_body(
       events = [dict(entry.event) for entry in event_log.entries]
       if _latest_chat_run_state(session, sid) != "cancelled":
         _record_event(_chat_run_state_event(sid, _chat_turn_state_from_events(events)), sid)
-  except asyncio.CancelledError:
-    await _safe_fire_disconnect()
+  except asyncio.CancelledError as exc:
+    cause = str(exc) or (
+      "pane_disconnected" if not active_turn.subscribers else "turn_cancelled"
+    )
+    await _safe_fire_disconnect(cause)
     if runner_task is not None:
       runner_task.cancel()
     await asyncio.gather(
@@ -1517,27 +1810,18 @@ async def _dispatch_chat_turn_body(
     _emit_terminal({"type": "error", "error": "stream failed"})
     raise
   finally:
-    if (
-      runner is not None
-      and (runner_task is None or runner_task.done())
-    ):
-      for release_name in (
-        "release_research_file_activity_lease_if_owned",
+    if runner_task is None or runner_task.done():
+      _release_turn_research_file_activity(active_turn, runner)
+      release_selected_content_activity = getattr(
+        runner,
         "release_selected_content_activity_lease_if_owned",
-      ):
-        release_activity = getattr(runner, release_name, None)
-        if callable(release_activity):
-          release_activity()
+        None,
+      )
+      if callable(release_selected_content_activity):
+        release_selected_content_activity()
     if not selected_content_activity_transferred:
       if selected_content_activity_lease is not None:
         selected_content_activity_lease.release()
-    if runner_task is None:
-      research_file_activity_lease = (
-        active_turn.research_file_activity_lease
-      )
-      active_turn.research_file_activity_lease = None
-      if research_file_activity_lease is not None:
-        research_file_activity_lease.release()
     if not log_has_terminal(event_log):
       _emit_terminal({"type": "error", "error": "stream closed"})
     event_log.close()

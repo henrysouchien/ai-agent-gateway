@@ -17,6 +17,7 @@ from pydantic import JsonValue, ValidationError
 
 from agent_gateway import AgentRunner, ToolDispatcher
 from agent_gateway.admission import capture_job_context, current_parent_context
+from agent_gateway.containment_settings import ContainmentSettings
 from agent_gateway.job_caller import JobScope, rebind_job_handlers
 from agent_gateway.tool_result_spill import (
   SpillCapabilities,
@@ -319,6 +320,8 @@ def _spawn_result(kwargs: dict[str, Any]) -> TaskResult:
 
 
 class _Runner:
+  _containment = ContainmentSettings()
+
   def __init__(
     self, *, capability_execution: BoundCapabilityExecution | None = None,
   ) -> None:
@@ -327,6 +330,7 @@ class _Runner:
     )
     self._full_session_id = "session-test"
     self._agent_session_log: object | None = object()
+    self._workspace_dir: str | Path | None = None
     self._spill_dir_provider: SpillSink | None = None
     self._log = EventLog()
     self.spawn_calls: list[dict[str, Any]] = []
@@ -385,6 +389,7 @@ def _handler(
   mcp_client: Any | None = None,
   declared_local_tool_definitions: Any | None = None,
   parent_sessions: list[GatewaySession] | None = None,
+  workflow_handle_membership: Any | None = None,
 ):
   handlers = {"web_search": _tool}
   handlers.update(background_handlers or {})
@@ -423,15 +428,14 @@ def _handler(
     fms_rebinder=fms_rebinder,
     trusted_research_file_id=trusted_research_file_id,
     declared_local_tool_definitions=declared_local_tool_definitions,
+    workflow_handle_membership=workflow_handle_membership,
   )
 
 
 def test_rebound_run_agent_uses_child_authority_and_runner(
   tmp_path: Path,
-  monkeypatch: pytest.MonkeyPatch,
   owner_session_host_policy: Any,
 ) -> None:
-  monkeypatch.delenv("HANK_MAX_SPAWN_DEPTH", raising=False)
   owner_session_host_policy.get_local_tool_effect = lambda _name: "read"
 
   _write_operation(tmp_path, execution_class="node.implement")
@@ -516,7 +520,6 @@ def test_run_agent_spawn_uses_current_rotated_parent_credential(
   monkeypatch: pytest.MonkeyPatch,
   owner_session_host_policy: Any,
 ) -> None:
-  monkeypatch.delenv("HANK_MAX_SPAWN_DEPTH", raising=False)
   owner_session_host_policy.get_local_tool_effect = lambda _name: "read"
   loader = _write_operation(tmp_path / "skills", execution_class="node.implement")
 
@@ -654,10 +657,8 @@ def test_run_agent_spawn_uses_current_rotated_parent_credential(
 
 def test_rebound_run_agent_admits_typed_ticker_with_child_session_tenant(
   tmp_path: Path,
-  monkeypatch: pytest.MonkeyPatch,
   owner_session_host_policy: Any,
 ) -> None:
-  monkeypatch.delenv("HANK_MAX_SPAWN_DEPTH", raising=False)
   owner_session_host_policy.get_local_tool_effect = lambda _name: "read"
 
   _write_operation(tmp_path, required_context=("ticker",), execution_class="node.implement")
@@ -850,7 +851,6 @@ def _catalog_runtime(
       state_class="producer",
       persist_state=False,
       resumable=True,
-      resume_mcp_session_reset_ok=True,
       state_dir=None,
       mutation_mode=mutation_mode,
       run_mode="full",
@@ -962,7 +962,6 @@ def delegation_tool_policy(owner_session_host_policy):
     "file_read": "read",
     "write_record": "state_write",
     "code_execute": "read",
-    "code_execute_status": "read",
   }
   corpus = _PrefixedMcpClient()
   corpus.activate()
@@ -979,6 +978,10 @@ def delegation_tool_policy(owner_session_host_policy):
       server_by_tool[policy_name] = server
       server_effects[server, policy_name] = effect
   owner_session_host_policy.get_local_tool_effect = local_effects.get
+  owner_session_host_policy.get_read_capability = lambda name, _server: {
+    "web_search": "web.read/v1",
+    "code_execute": "computation.execute/v1",
+  }.get(name)
   owner_session_host_policy.get_server_for_policy_tool = server_by_tool.get
   owner_session_host_policy.get_tool_class = (
     lambda server, name: server_effects.get((server, name))
@@ -1168,9 +1171,10 @@ def test_falsey_catalog_has_same_schema_and_handler_operation_view() -> None:
     "background": False,
   }))
 
-  assert "catalog-review@1.0" in schema["properties"]["operation"][
-    "description"
-  ]
+  description = schema["properties"]["operation"]["description"]
+  assert "catalog-review@1.0" in description
+  assert runtime.snapshot.description in description
+  assert runtime.snapshot.operation.digest not in description
   assert error is None
   assert result is not None
   assert entries == [(
@@ -1968,6 +1972,60 @@ def test_named_child_first_message_carries_the_run_binding(
   assert spawn["admitted_task"].objective == objective
 
 
+def test_a_handle_refusal_does_not_start_the_named_child(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  from agent_gateway.admission import Refusal
+  from agent_gateway import sub_agent as sub_agent_mod
+
+  async def refuse(*_args: Any, **_kwargs: Any) -> Refusal:
+    return Refusal(
+      "handle_not_granted",
+      "admission handle_grants",
+      "handle is not granted to the reader",
+    )
+
+  monkeypatch.setattr(sub_agent_mod, "resolve_handle_refs", refuse)
+  async def stage_handles(_log: Any, handles: Any) -> list[str]:
+    return [str(handle) for handle in handles]
+  monkeypatch.setattr(sub_agent_mod, "pipeline_stage_completion_handles", stage_handles)
+  loader = _write_operation(tmp_path, execution_class="node.implement")
+  (tmp_path / "spills").mkdir()
+  root_sink = SpillSink(
+    lambda: str(tmp_path / "spills"),
+    capabilities=SpillCapabilities(spill_read=True),
+  )
+  publication = write_spill_set(
+    sink=job_spill_sink(root_sink, "producer"),
+    tool_name="web_search",
+    tool_use_id="evidence",
+    content="Evidence from a durable sibling spill.\n" * 20,
+    model_max_chars=100,
+  )
+  class _WorkspaceRunner(_Runner):
+
+    def __init__(self, workspace: Path) -> None:
+      super().__init__()
+      self._workspace_dir = workspace
+
+  runner = _WorkspaceRunner(tmp_path)
+  runner._spill_dir_provider = root_sink
+  runner._agent_session_log = AgentSessionLog(tmp_path / "session.jsonl")
+  result, error = asyncio.run(_handler(runner, loader=loader)({
+    "operation": _operation(loader),
+    "objective": "Read the spilled evidence.",
+    "background": False,
+    "handles": [publication.spill_ref],
+  }))
+  assert result is None
+  assert error is not None
+  assert error["code"] == "handle_not_granted"
+  assert runner.spawn_calls == []
+  assert runner.background_calls == []
+
+
+
 @pytest.mark.parametrize("background", [True, False])
 @pytest.mark.parametrize("research_file_id", [None, 1])
 @pytest.mark.parametrize("prior_result", [
@@ -2751,7 +2809,7 @@ def test_foreground_delegation_returns_readable_completion_handle(
       self.spawn_calls.append(call)
       result = _spawn_result(call)
       reference = publish_final_narrative(
-        workspace_dir=self._workspace_dir,
+        workspace_dir=self._workspace_dir or tmp_path,
         sub_agent_id=kwargs["attempt"].physical_task_id,
         terminal_event_seq=1,
         text=terminal_text,
@@ -2868,6 +2926,7 @@ def test_spawn_passes_spill_output_without_re_rooting_nested_caller(
   )
   runner = _Runner()
   runner._agent_session_log = AgentSessionLog(tmp_path / "session.jsonl")
+  runner._workspace_dir = str(tmp_path)
   runner._spill_dir_provider = root_sink
   result, error = asyncio.run(_handler(
     runner, loader=SkillLoader(tmp_path / "skills"),
@@ -2982,6 +3041,60 @@ def test_spawn_passes_spill_output_without_re_rooting_nested_caller(
     assert current_parent_context(sessions[0]) is child_context
 
   asyncio.run(_cross_root_case())
+
+
+def test_spawn_passes_a_workflow_membership_handle_with_a_workspace(
+  tmp_path: Path,
+) -> None:
+  """A workflow output grant is not a stage-ref bag and must not block spawn."""
+
+  runner = _Runner()
+  runner._agent_session_log = AgentSessionLog(tmp_path / "session.jsonl")
+  runner._workspace_dir = str(tmp_path)
+  workflow_handle = "wout:phase:1:revision:1:report"
+
+  async def membership(_root: Any, handles: frozenset[str]) -> frozenset[str]:
+    return frozenset(handle for handle in handles if handle == workflow_handle)
+
+  result, error = asyncio.run(_handler(
+    runner, loader=SkillLoader(tmp_path / "skills"),
+    workflow_handle_membership=membership,
+  )({
+    "objective": "Read the workflow output.",
+    "background": False,
+    "handles": [workflow_handle],
+  }))
+  assert error is None, error
+  assert result is not None
+  child_context = current_parent_context(runner.spawn_calls[-1]["sub_session"])
+  assert workflow_handle in child_context.handle_grants
+
+
+def test_restart_from_objective_message_keeps_a_spill_grant(tmp_path: Path) -> None:
+  """The resume revive path reads stage completions only, not spill grants."""
+
+  from agent_gateway.agent_session_log import AgentSessionLog
+  from agent_gateway.sub_agent import admitted_task_message_from_handles
+
+  log = AgentSessionLog(tmp_path / "resume.jsonl")
+  admitted_task = SimpleNamespace(
+    objective="Read the spilled evidence.",
+    operation=SimpleNamespace(required_context=()),
+    inputs=(),
+  )
+  admitted = SimpleNamespace(
+    wire=SimpleNamespace(handle_grants=("spill:v1:evidence:abc",)),
+  )
+  message = asyncio.run(admitted_task_message_from_handles(
+    cast(Any, admitted_task),
+    admitted=cast(Any, admitted),
+    job_id="bg_spill",
+    ticker=None,
+    research_file_id=None,
+    durable_log=log,
+    workspace_dir=str(tmp_path),
+  ))
+  assert message == "Read the spilled evidence."
 
 
 def test_foreground_delegation_publishes_soft_budget_abort_without_narrative(
@@ -3382,8 +3495,7 @@ def test_registered_foreground_operation_inherits_parent_approval_lifecycle(
   dispatcher = runner.spawn_calls[0]["dispatcher"]
   # The child delegates to the parent's admitted route — the same durable
   # ledger object the parent session carries — rather than re-deriving one
-  # from handles. The headless flag is decided independently, so a background
-  # child pairs should_avoid_permission_prompts with this same live ledger.
+  # from handles.
   parent_route = dispatcher._session.approval_route
   assert isinstance(parent_route, DurableLocalApprovalRoute)
   assert isinstance(dispatcher._approval_route, InProcessDelegatedApprovalRoute)
@@ -3392,7 +3504,6 @@ def test_registered_foreground_operation_inherits_parent_approval_lifecycle(
   assert dispatcher._approval_store is approval_store
   assert dispatcher._approval_policy is approval_policy
   assert dispatcher._session is not None
-  assert dispatcher._should_avoid_permission_prompts is False
   started = next(
     event for event in runner.durable_events
     if event.get("type") == "skill_run_started"
@@ -3859,7 +3970,6 @@ class _KernelChildProvider(ModelProvider):
     self.paused = asyncio.Event()
     self.results: list[dict[str, Any]] = []
     self.available_tools: list[frozenset[str]] = []
-    self.status_task_id: str | None = None
     self.on_cells_complete = on_cells_complete
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
@@ -3905,9 +4015,6 @@ class _KernelChildProvider(ModelProvider):
       call_id = f"kernel-cell-{self.turn}"
       tool_input = {"code": code, "host": "kernel"}
       tool_name = "code_execute"
-      if self.status_task_id is not None:
-        tool_name = "code_execute_status"
-        tool_input = {"task_id": self.status_task_id}
       yield StreamEvent(
         type="tool_use_start", tool_id=call_id, tool_name=tool_name,
       )
@@ -3989,7 +4096,7 @@ Compute two cells and return their results.
     for hop in ("spawn", "resume")
     for termination in (
       "success", "error", "cancel", "binding_error",
-      "unavailable", "unavailable_status", "custom",
+      "unavailable", "custom",
     )
   ] + [
     ("resume", "success", "different"),
@@ -4045,7 +4152,7 @@ def test_child_kernel_is_isolated_and_disposed_through_real_run_lifetime(
     child_processes: list[Any] = []
 
     def record_child_process() -> None:
-      if termination in {"unavailable", "unavailable_status", "custom"}:
+      if termination in {"unavailable", "custom"}:
         return
       child_runtime = child_sessions[-1].code_execution_kernels["kernel"].runner
       assert child_runtime is not None and child_runtime.process is not None
@@ -4085,15 +4192,6 @@ def test_child_kernel_is_isolated_and_disposed_through_real_run_lifetime(
     )
     runner._runner_id = "kernel-parent"
     loader = _write_kernel_child_operation(tmp_path / "skills")
-    if termination == "unavailable_status":
-      skill_path = tmp_path / "skills" / "kernel-child.md"
-      skill_path.write_text(skill_path.read_text().replace(
-        "  - code_execute\n", "  - code_execute\n  - code_execute_status\n",
-      ).replace(
-        "      tool_id: code_execute\n",
-        "      tool_id: code_execute\n"
-        "    - kind: local\n      tool_id: code_execute_status\n",
-      ))
     operation = next(
       item.snapshot.operation.model_dump(mode="json")
       for item in loader.list_callable_operations()
@@ -4106,22 +4204,21 @@ def test_child_kernel_is_isolated_and_disposed_through_real_run_lifetime(
         if definition["name"] in requested
       ]
 
-    def build_child(session: GatewaySession):
+    def build_child(session: GatewaySession, *, job_runner: Callable[[], Any]):
       child_sessions.append(session)
-      if termination in {"unavailable", "unavailable_status"}:
+      if termination == "unavailable":
         return None
-      bundle = build_code_execution(session, config=config)
+      bundle = build_code_execution(session, config=config, job_runner=job_runner)
       child_readers.append(bundle.frame_reader)
       child_workdirs.append(Path(bundle.ensure_work_dir()))
       return bundle
 
     def bind_child(bundle: Any, dispatcher: ToolDispatcher) -> None:
-      # The fresh bundle also has a status tool. The exact operation grants
-      # only execution; building the child's bundle must not widen that grant.
+      # The exact operation grants only execution; building the child's
+      # bundle must not widen that grant.
       assert {item["name"] for item in dispatcher.get_tool_definitions()} == {
         "code_execute",
       }
-      assert "code_execute_status" not in dispatcher._local
       bundle.bind_dispatcher(
         dispatcher,
         tool_definitions=dispatcher.get_tool_definitions,
@@ -4161,15 +4258,6 @@ def test_child_kernel_is_isolated_and_disposed_through_real_run_lifetime(
       parent_runtime = parent_session.code_execution_kernels["kernel"].runner
       assert parent_runtime is not None and parent_runtime.process is not None
       parent_process = parent_runtime.process
-      if termination == "unavailable_status":
-        background, background_error = await parent_dispatcher.dispatch(
-          "parent-background",
-          "code_execute",
-          {"code": "print(parent_token)", "host": "kernel", "background": True},
-        )
-        assert background_error is None and background is not None
-        provider.status_task_id = background["task_id"]
-        await asyncio.sleep(0.05)
       if hop == "spawn":
         if termination == "unavailable":
           # This is the parent's legitimate placement qualifier; it must not
@@ -4322,7 +4410,7 @@ def test_child_kernel_is_isolated_and_disposed_through_real_run_lifetime(
         assert child_session.code_execution_work_dir is None
       assert all(not workdir.exists() for workdir in child_workdirs)
       assert all(reader._closed and not reader._cells for reader in child_readers)
-      if termination in {"unavailable", "unavailable_status"}:
+      if termination == "unavailable":
         assert provider.available_tools and all(
           not tools for tools in provider.available_tools
         )
@@ -4353,14 +4441,112 @@ def test_child_kernel_is_isolated_and_disposed_through_real_run_lifetime(
       )
       assert alive_error is None and alive is not None
       assert alive["stdout"] == f"parent-local\nFalse\n{parent_pid}\n"
-      if provider.status_task_id is not None:
-        # The child did not collect or cancel a task belonging to its parent.
-        status, status_error = await parent_dispatcher.dispatch(
-          "parent-collect", "code_execute_status",
-          {"task_id": provider.status_task_id},
-        )
-        assert status_error is None and status is not None
-        assert status["stdout"] == "parent-local\n"
+    finally:
+      await runner.force_close()
+      await cleanup_code_execution(parent_session)
+
+  asyncio.run(run())
+
+
+class _BackgroundCellChildProvider(_KernelChildProvider):
+  """The child's first turn launches one background cell; later turns end its run."""
+
+  async def stream(self, client: Any, params: dict[str, Any]):
+    self.turn += 1
+    for message in params["messages"]:
+      content = message.get("content")
+      if not isinstance(content, list):
+        continue
+      for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("tool_use_id") == "bg-cell-1":
+          result = json.loads(block["content"])
+          if result not in self.results:
+            self.results.append(result)
+    if self.turn == 1:
+      tool_input = {"code": "print('child-job')", "background": True, "host": "subprocess"}
+      yield StreamEvent(type="tool_use_start", tool_id="bg-cell-1", tool_name="code_execute")
+      yield StreamEvent(
+        type="tool_use_end", tool_id="bg-cell-1", tool_name="code_execute", tool_input=tool_input,
+        raw_block={"type": "tool_use", "id": "bg-cell-1", "name": "code_execute", "input": tool_input},
+      )
+      yield StreamEvent(type="message_end", stop_reason="tool_use")
+      return
+    text = "The background cell ran."
+    yield StreamEvent(type="text_delta", text=text)
+    yield StreamEvent(type="text_end", raw_block={"type": "text", "text": text})
+    yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+
+def test_child_background_cell_is_a_code_job_on_the_child_registry(tmp_path: Path) -> None:
+  async def run() -> None:
+    parent_session = GatewaySession(
+      session_id="parent-bg-session", api_key_hash="hash", created_at=1, expires_at=2,
+      user_id="actor-test", owner_user_id="actor-test", user_email="actor@example.com",
+      role="owner", tenant_id="tenant-test", channel="cli",
+    )
+    bind_session_approval_route(parent_session, None, None)
+    config = CodeExecutionConfig(register_docker=False, register_kernel=False, work_dir_root=str(tmp_path))
+    parent_bundle = build_code_execution(parent_session, config=config)
+    mcp_client = McpClientManager(config_path=None)
+    provider = _BackgroundCellChildProvider("success", lambda: None)
+    resolver = _kernel_child_resolver(provider)
+    execution = resolver.resolve("session.driver")
+    parent_dispatcher = ToolDispatcher(
+      capability_bind=execution.bind, mcp_client=mcp_client,
+      local_tool_handlers=parent_bundle.handlers, event_log=EventLog(),
+      session_id=parent_session.session_id, role="owner",
+      approval_key_qualifier=parent_bundle.approval_qualifier,
+      get_tool_definitions=lambda: parent_bundle.tool_definitions,
+    )
+    runner = AgentRunner(
+      event_log=EventLog(), dispatcher=parent_dispatcher, session_id=parent_session.session_id,
+      capability_execution=execution, get_tool_definitions=parent_dispatcher.get_tool_definitions,
+      agent_session_log=AgentSessionLog(path=tmp_path / "sessions" / "bg.jsonl"),
+      workspace_dir=str(tmp_path), user_id=parent_session.user_id,
+      billing_mode="byok", rate_table_version="unknown",
+    )
+    runner._runner_id = "bg-parent"
+    loader = _write_kernel_child_operation(tmp_path / "skills")
+    operation = next(
+      item.snapshot.operation.model_dump(mode="json")
+      for item in loader.list_callable_operations()
+      if item.snapshot.operation.name == "kernel-child"
+    )
+    child_job_runners: list[Callable[[], Any]] = []
+
+    def build_child(session: GatewaySession, *, job_runner: Callable[[], Any]):
+      child_job_runners.append(job_runner)
+      return build_code_execution(session, config=config, job_runner=job_runner)
+
+    def bind_child(bundle: Any, dispatcher: ToolDispatcher) -> None:
+      bundle.bind_dispatcher(dispatcher, tool_definitions=dispatcher.get_tool_definitions)
+
+    handler = make_run_agent_handler(
+      [runner],
+      parent_session=parent_session,
+      skill_loader=loader,
+      mcp_client=mcp_client,
+      local_tool_handlers=parent_bundle.handlers,
+      declared_local_tool_definitions=lambda requested: [
+        definition for definition in parent_bundle.tool_definitions if definition["name"] in requested
+      ],
+      capability_execution_resolver=resolver,
+      code_execution_factory=build_child,
+      code_execution_binder=bind_child,
+    )
+    try:
+      result, error = await handler({
+        "operation": operation, "objective": "Run one background cell.", "background": False,
+      })
+      assert error is None and result is not None
+      launched = provider.results[0]
+      assert launched.get("status") == "running", launched
+      task_id = launched["task_id"]
+      child_runner = child_job_runners[0]()
+      assert child_runner is not None and child_runner is not runner
+      child_entry = child_runner._task_registry.get(task_id)
+      assert child_entry is not None and child_entry.task_type == "code"
+      assert runner._task_registry.get(task_id) is None
     finally:
       await runner.force_close()
       await cleanup_code_execution(parent_session)

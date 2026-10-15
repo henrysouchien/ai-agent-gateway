@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from dataclasses import dataclass
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 
 from model_authority.binding import CredentialHandle
 from .capability_execution import MaterializedCredential
@@ -117,6 +117,7 @@ def read_autonomous_launch_secrets(
   expected_tenant_id: str,
   expected_actor_id: str | None,
   stream: BinaryIO | None = None,
+  validate_admission: Callable[[CredentialHandle], None] | None = None,
 ) -> AutonomousLaunchSecrets:
   """Read and validate launch secrets from the inherited stdin pipe."""
 
@@ -176,6 +177,8 @@ def read_autonomous_launch_secrets(
     raise ValueError(
       "autonomous credential handoff does not match the signed launch"
     )
+  if validate_admission is not None:
+    validate_admission(handle)
 
   auth_config = payload["auth_config"]
   if not isinstance(auth_config, dict):
@@ -214,6 +217,7 @@ def read_autonomous_credential_handoff(
   expected_tenant_id: str,
   expected_actor_id: str | None,
   stream: BinaryIO | None = None,
+  validate_admission: Callable[[CredentialHandle], None] | None = None,
 ) -> MaterializedCredential:
   """Compatibility projection for callers that only consume the credential."""
 
@@ -224,6 +228,7 @@ def read_autonomous_credential_handoff(
     expected_tenant_id=expected_tenant_id,
     expected_actor_id=expected_actor_id,
     stream=stream,
+    validate_admission=validate_admission,
   ).credential
 
 

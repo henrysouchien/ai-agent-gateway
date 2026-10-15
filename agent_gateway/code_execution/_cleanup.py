@@ -15,22 +15,16 @@ async def cleanup_code_execution(session: GatewaySession) -> None:
   Teardown is resource containment: each failure is logged with its resource,
   and the remaining processes, pipes and work directory are still released.
   Cancellation is re-raised only after that release completes.
+
+  A background cell is a `code` job on its runner's task registry; closing the
+  session's frame reader kills and awaits the jobs of its open cells, so no
+  cell runs in the work directory removed below.
   """
-  for task in list(session.background_tasks.values()):
-    try:
-      await task.safe_cancel(task.backend)
-    except Exception:
-      log.warning("code_execute background cancel failed during cleanup", exc_info=True)
-    try:
-      await task.close_bridge()
-    except Exception:
-      log.warning("code_execute background bridge close failed during cleanup", exc_info=True)
-  session.background_tasks.clear()
+  cancelled: BaseException | None = None
   kernels = tuple(session.code_execution_kernels.values())
   session.code_execution_kernels.clear()
   reader = session.code_execution_frame_reader
   session.code_execution_frame_reader = None
-  cancelled: BaseException | None = None
   try:
     outcomes = await asyncio.gather(
       *(kernel.aclose() for kernel in kernels),

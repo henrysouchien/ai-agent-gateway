@@ -2,9 +2,11 @@ from uuid import uuid4
 import json
 from threading import Event, Thread
 
-from agent_gateway.commercial_authority_cache import (
+from hank_contracts.commercial_authority import (
   CommercialAuthorityInvalidation,
   CommercialAuthoritySnapshot,
+)
+from agent_gateway.commercial_authority_cache import (
   CommercialAuthorityStateCache,
 )
 

@@ -11,7 +11,16 @@ import os
 from pathlib import Path
 import secrets
 import stat
-from typing import Any, Awaitable, BinaryIO, Callable, Literal, Mapping
+from typing import (
+  Any,
+  Awaitable,
+  BinaryIO,
+  Callable,
+  Literal,
+  Mapping,
+  TypeAlias,
+  get_args,
+)
 
 from .artifact_paths import canonicalize_ticker
 from .descriptor_paths import (
@@ -29,6 +38,18 @@ from .named_refusal import NamedRefusal
 
 
 SkillLifecycleScope = Literal["ticker", "portfolio"]
+# The FMS door outcome a skill result reports. ``fms.core.envelope``
+# (``normalize_gate_code``) produces these on every door envelope; the gateway
+# does not import the host, so this is its copy of that closed set, owned here
+# for the event type (``events.SkillResultCapturedEvent``) and its normalizer.
+GateCode: TypeAlias = Literal[
+  "PROCEED",
+  "STOP",
+  "FLAG",
+  "INSUFFICIENT_DATA",
+  "UNKNOWN",
+]
+GATE_CODES: frozenset[str] = frozenset(get_args(GateCode))
 TopLevelServerTerminalCause = Literal[
   "caller_cancellation",
   "shutdown",
@@ -81,6 +102,7 @@ SKILL_RESULT_CORE_FIELDS = frozenset({
   "proposal_ids",
   "verdict_echo",
   "fms_results",
+  "last_failed_door_answer",
   "artifact_events",
   "output_memory_file",
   "cost_usd",
@@ -92,6 +114,9 @@ SKILL_RESULT_CORE_FIELDS = frozenset({
   "approval_id",
   "approval_tool_name",
 })
+# Core fields a skill result may omit: a result written before the field
+# existed, or one with no failed context door, stays byte-identical.
+SKILL_RESULT_OPTIONAL_FIELDS = frozenset({"last_failed_door_answer"})
 _LEASE_FENCE_SCHEMA_VERSION = 1
 
 
@@ -309,6 +334,8 @@ class TopLevelSkillAdmission:
         or stat.S_IMODE(named_lease.st_mode) != 0o600
         or (named_lease.st_dev, named_lease.st_ino) != lease_identity
       ):
+        # A lease file replaced between open and lock is not the file other
+        # runners flock, so it must not authorize a writer on this log.
         raise RuntimeError(
           "Top-level skill admission lease identity changed"
         )
@@ -363,6 +390,8 @@ class TopLevelSkillAdmission:
         or (persisted_lease.st_dev, persisted_lease.st_ino)
         != lease_identity
       ):
+        # Same reason as the named-lease check above: a lease file replaced
+        # after we locked it must not authorize this writer.
         raise RuntimeError(
           "Top-level skill admission persisted lease identity changed"
         )
@@ -444,6 +473,9 @@ class TopLevelSkillAdmission:
         or (named_lease.st_dev, named_lease.st_ino)
         != self._lease_identity
       ):
+        # A replaced or swapped lease file would hold no flock another
+        # runner respects, so a second writer could append this session log
+        # beside us: the lease we locked must still be the file on disk.
         raise RuntimeError(
           "Top-level skill admission lease identity changed"
         )
@@ -922,8 +954,11 @@ class TopLevelSkillLifecycleMetadata:
     self,
     event: Mapping[str, Any],
   ) -> dict[str, Any]:
+    # A skill result that predates the door-answer field (persisted journals,
+    # writers with no failed door) may omit it and stays byte-identical; every
+    # other core field stays required.
     event_fields = set(event)
-    missing = SKILL_RESULT_CORE_FIELDS - event_fields
+    missing = (SKILL_RESULT_CORE_FIELDS - SKILL_RESULT_OPTIONAL_FIELDS) - event_fields
     if missing:
       raise RuntimeError(
         "skill_result_captured is missing required fields: "
@@ -963,6 +998,11 @@ class TopLevelSkillLifecycleMetadata:
         event[field_name],
         field_name=f"skill_result_captured.{field_name}",
       )
+    if event["gate_code"] is not None and event["gate_code"] not in GATE_CODES:
+      raise RuntimeError(
+        "skill_result_captured.gate_code must be one of "
+        + ", ".join(sorted(GATE_CODES))
+      )
     for field_name in (
       "artifact_refs",
       "proposal_ids",
@@ -981,11 +1021,12 @@ class TopLevelSkillLifecycleMetadata:
     # row in ``fms_results`` relate; this normalizer records them as produced
     # and checks only their JSON types. Downstream stages read the run's
     # exit_code and each door's own status.
-    verdict_echo = event["verdict_echo"]
-    if verdict_echo is not None and type(verdict_echo) is not dict:
-      raise RuntimeError(
-        "skill_result_captured.verdict_echo must be a mapping"
-      )
+    for field_name in ("verdict_echo", "last_failed_door_answer"):
+      value = event.get(field_name)
+      if value is not None and type(value) is not dict:
+        raise RuntimeError(
+          f"skill_result_captured.{field_name} must be a mapping"
+        )
     for field_name in ("cost_usd", "duration_s"):
       _require_nonnegative_number(
         event[field_name],
@@ -1256,6 +1297,7 @@ async def drain_owned_lifecycle_task(
 
 __all__ = [
   "SKILL_RESULT_CORE_FIELDS",
+  "SKILL_RESULT_OPTIONAL_FIELDS",
   "SkillLifecycleArtifactIdentity",
   "SkillLifecycleScope",
   "TopLevelSkillLifecycleMetadata",

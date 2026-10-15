@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+import time
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
+from agent_workflow_contracts.models import SelectionProvenance
 from model_authority.bind import CapabilityBind
 from model_authority.binding import (
   AuthContext,
@@ -19,9 +21,21 @@ from model_authority.binding import (
   require_registered_capability_bind,
   resolve_capability_model,
 )
-from model_authority.capabilities import CAPABILITY_EXECUTION_PROCESS, CAPABILITY_IDS
+from model_authority.capabilities import (
+  CAPABILITY_EXECUTION_PROCESS,
+  CAPABILITY_IDS,
+  SESSION_DRIVER_CAPABILITY,
+)
 from model_authority.registry import ProductModelRegistry
-from model_authority.selection import ProductModelSelectionPolicy, SelectionSnapshot
+from model_authority.selection import (
+  ProductModelSelectionPolicy,
+  SelectionSnapshot,
+  TierDefault,
+  TierModelsDefault,
+  TierProjectionError,
+  capture_selection_snapshot,
+  project_fallback_chain,
+)
 from .providers import ModelProvider
 
 
@@ -59,6 +73,30 @@ class MaterializedCredential:
     config = dict(self.auth_config)
     _reject_selection_auth_config(config)
     object.__setattr__(self, "auth_config", MappingProxyType(config))
+
+
+@dataclass(frozen=True, slots=True)
+class FallbackSkip:
+  """A chain entry a hop passed over, with the resolver's typed refusal code."""
+
+  model_key: str
+  code: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelFallbackHop:
+  """The next chain entry, bound and materialized for a turn's remaining attempts.
+
+  ``chain_index`` is this entry's position in the projected chain and
+  ``primary_model_key`` the model the turn was bound to; a later hop walks on
+  from the position, never by matching a model key.
+  """
+
+  execution: BoundCapabilityExecution
+  role: str
+  chain_index: int
+  skipped: tuple[FallbackSkip, ...]
+  primary_model_key: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +142,16 @@ class BoundCapabilityExecution:
       auth_config=self.auth_config,
     )
 
+  def revalidate(self) -> None:
+    """Reauthorize the binding against the live authorization context and registry.
+
+    Fails closed with CapabilityResolutionError if the credential was revoked,
+    the user has no active roster entry, or the capability's disposition no
+    longer admits the use.
+    """
+    self.validate()
+    if self.resolver is not None:
+      self.resolver.materialize_bind(self.bind)
 
 @dataclass(frozen=True, slots=True)
 class CapabilityExecutionResolver:
@@ -280,6 +328,200 @@ class CapabilityExecutionResolver:
     })
     return resolver.with_frozen_credential(bind, merged_auth_config).materialize_bind(bind)
 
+  @staticmethod
+  def rebind_model_fallback(
+    execution: BoundCapabilityExecution,
+    selection_snapshot: SelectionSnapshot,
+    *,
+    selection_provenance: SelectionProvenance | None,
+    history_fits: Callable[[BoundCapabilityExecution], bool],
+    previous: ModelFallbackHop | None = None,
+    skipped_out: list[FallbackSkip] | None = None,
+  ) -> ModelFallbackHop | None:
+    """Bind the next eligible entry of the snapshot's chain; never a reselection.
+
+    The chain is the recorded role's capture-time chain when
+    ``selection_provenance.role`` is set, otherwise the slot default role's
+    (design §6.5: a default bind and an explicit or saved concrete pick both
+    use it). A first hop with no provenance has an unknown origin and does
+    not hop. The first hop walks the chain from the start, skipping entries
+    identical to the bound primary, so an explicit or saved pick uses the
+    chain even when it names the pick; ``previous`` continues after the last
+    hop's position, so hops are finite even when a chain names a model twice.
+    Each entry resolves through ``resolve_capability_model`` as a one-model
+    assignment of that role, so qualification, both ceilings, lifecycle,
+    effort support,
+    entitlement and the entry provider's own credential all apply; a refused
+    entry is skipped with its code. An entry whose own account pool is
+    entirely parked is skipped as ``credential_pool_parked``; otherwise it
+    binds an unblocked account. The bind keeps the primary's
+    ``selection_source`` and principal. ``None`` means no entry serves (or
+    the captured role no longer projects) and the caller's existing failure
+    path stands.
+    """
+
+    resolver = execution.resolver
+    if resolver is None:
+      return None
+    bind = execution.bind
+    try:
+      if previous is None:
+        if selection_provenance is None:
+          return None
+        if selection_provenance.role is not None:
+          role = selection_provenance.role
+        else:
+          defaults = selection_snapshot.frozen_slot(bind.capability_id)
+          channel = str(resolver.trusted_channel or "").strip()
+          slot_default = defaults.by_channel.get(channel, defaults.default)
+          if slot_default.kind != "tier" or slot_default.tier is None:
+            return None
+          role = slot_default.tier
+        primary_model_key = bind.model_key
+        start = 0
+      else:
+        role = previous.role
+        primary_model_key = previous.primary_model_key
+        start = previous.chain_index + 1
+      chain = project_fallback_chain(
+        resolver.registry,
+        resolver.selection_policy,
+        bind.capability_id,
+        role,
+        selection_snapshot=selection_snapshot,
+      )
+    except TierProjectionError:
+      return None
+    skipped: list[FallbackSkip] = [] if previous is not None else [
+      FallbackSkip(omitted.entry.models[0], omitted.code)
+      for omitted in chain.omitted
+    ]
+    for index in range(start, len(chain.entries)):
+      entry = chain.entries[index]
+      if entry.model_key == primary_model_key:
+        continue
+      effort = entry.effort or bind.effort
+      try:
+        resolved = resolve_capability_model(
+          bind.capability_id,
+          registry=resolver.registry,
+          selection_policy=resolver.selection_policy,
+          auth=resolver.auth_context,
+          trusted_channel=resolver.trusted_channel,
+          requested_effort=effort,
+          requested_role=role,
+          role_map={role: TierModelsDefault((entry.model_key,), effort)},
+          role_map_source="internal_policy",
+        )
+        if (
+          resolved.credential_principal != bind.credential_principal
+          or resolved.run_mode != bind.run_mode
+        ):
+          skipped.append(FallbackSkip(entry.model_key, "credential_principal_changed"))
+          continue
+        hop_execution = CapabilityExecutionResolver._rebind_unparked_account(
+          resolver.materialize_bind(CapabilityBind.model_validate({
+            **resolved.to_json(),
+            "selection_source": bind.selection_source,
+          })),
+        )
+        if hop_execution is None:
+          skipped.append(FallbackSkip(entry.model_key, "credential_pool_parked"))
+          continue
+      except CapabilityResolutionError as exc:
+        skipped.append(FallbackSkip(entry.model_key, exc.code))
+        continue
+      if not history_fits(hop_execution):
+        # Until portable compaction (W6) carries history across providers,
+        # an entry whose context cannot hold this transcript is not used.
+        skipped.append(FallbackSkip(entry.model_key, "context_window_exceeded"))
+        continue
+      return ModelFallbackHop(hop_execution, role, index, tuple(skipped), primary_model_key)
+    if skipped_out is not None:
+      skipped_out.extend(skipped)
+    return None
+
+
+  @staticmethod
+  def _rebind_unparked_account(
+    execution: BoundCapabilityExecution,
+  ) -> BoundCapabilityExecution | None:
+    """The execution on an unblocked account of its pool; ``None`` when all are parked.
+
+    Materialization binds a member the way a turn start does, which hands
+    back a parked one when nothing else is left; a hop never serves on it.
+    Anthropic retains its generation-aware binding; other enrolled providers
+    use their registered candidate resolver and materializer.
+    """
+    from .providers import anthropic as anthropic_provider
+    from .providers.anthropic_oauth import (
+      resolve_anthropic_credentials,
+      select_anthropic_credential_source,
+    )
+    from .providers.credential_pool import (
+      get_provider_credential_pool,
+      get_provider_pool_hooks,
+      select_pool_candidate,
+    )
+
+    config = execution.auth_config
+    if execution.bind.provider != "anthropic":
+      hooks = get_provider_pool_hooks(execution.bind.provider)
+      if hooks is None:
+        return execution
+      candidate_resolver, materializer = hooks
+      pool_config = {
+        key: value for key, value in config.items()
+        if key != "credential_source"
+      }
+      candidates, refresh_fn = candidate_resolver(pool_config)
+      if not candidates:
+        # The bound credential was supplied to the run directly and no enrolled
+        # pool exists: it is valid material and nothing is parked on it.
+        return execution
+      provider_pool = get_provider_credential_pool(execution.bind.provider)
+      if candidates and not provider_pool.first_unblocked([candidate.key for candidate in candidates]):
+        return None
+      candidate = select_pool_candidate(candidates, pool=provider_pool, refresh_fn=refresh_fn)
+      if candidate is None or provider_pool.blocked_until(candidate.key) > time.time():
+        return None
+      account = materializer(candidate, config)
+      if all(config.get(key) == value for key, value in account.items()):
+        return execution
+      return CapabilityExecutionResolver.rebind_rotated_credential(
+        execution, account, merged_auth_config={**config, **account},
+      )
+    pool = anthropic_provider.ANTHROPIC_CREDENTIAL_POOL
+    pool_config = {key: value for key, value in config.items() if key != "credential_source"}
+    sources = resolve_anthropic_credentials(pool_config)
+    if not pool.first_unblocked(sources.keys):
+      return None
+    selected = select_anthropic_credential_source(sources, pool=pool)
+    if selected is None or pool.blocked_until(selected.key) > time.time():
+      # The unblocked account's refresh failed and parked it.
+      return None
+    is_api_key = selected.record is not None and selected.record.credential_kind == "api_key"
+    credential_field = "api_key" if is_api_key else "auth_token"
+    if selected.token == config.get(credential_field):
+      return execution
+    account = {
+      "auth_mode": "api" if is_api_key else "oauth",
+      "api_key": selected.token if is_api_key else "",
+      "auth_token": "" if is_api_key else selected.token,
+      "credential_source": selected.source_metadata(),
+    }
+    rebound = CapabilityExecutionResolver.rebind_rotated_credential(
+      execution, account, merged_auth_config={**config, **account},
+    )
+    if rebound is None:
+      raise CapabilityResolutionError(
+        "credential_unavailable",
+        "the unblocked Anthropic account has no credential generation",
+        capability_id=execution.bind.capability_id,
+        model_key=execution.bind.model_key,
+      )
+    return rebound
+
   def with_frozen_credential(
     self, bind: CapabilityBind, auth_config: Mapping[str, Any],
   ) -> CapabilityExecutionResolver:
@@ -417,6 +659,73 @@ class CapabilityExecutionResolver:
     )
 
 
+def preset_role_map(
+  selection_policy: ProductModelSelectionPolicy,
+  name: str,
+) -> Mapping[str, TierDefault]:
+  """The one place a ``model_preset`` name becomes a published role map.
+
+  An explicit root or subtree selection the policy does not publish fails
+  clearly (design §6.2); it is never replaced by base policy.
+  """
+  role_map = selection_policy.presets.get(name)
+  if role_map is None:
+    raise CapabilityResolutionError(
+      "capability_selection_invalid",
+      f"model preset {name!r} is not published by model-selection policy "
+      f"revision {selection_policy.revision!r}; list published names with "
+      "GET /model-presets/self",
+      capability_id=SESSION_DRIVER_CAPABILITY,
+    )
+  return role_map
+
+
+def preset_selection_snapshot(
+  selection_policy: ProductModelSelectionPolicy,
+  name: str,
+) -> SelectionSnapshot:
+  """Freeze an explicit root or subtree preset's whole map (design §7.4)."""
+  return capture_selection_snapshot(
+    selection_policy,
+    role_map=preset_role_map(selection_policy, name),
+    role_map_source="internal_policy",
+  )
+
+
+def materialize_frozen_bind(
+  resolver: CapabilityExecutionResolver,
+  bind: CapabilityBind,
+  *,
+  user_scope: Any,
+  base_config: Mapping[str, Any],
+) -> BoundCapabilityExecution:
+  """Reauthorize a durable bind on its exact frozen credential generation.
+
+  An Anthropic generation-ref bind continues on that generation, offered
+  under the current ownership facts, never on whatever the owning session
+  holds now. A generation that cannot be read is ``credential_unavailable``.
+  """
+  from .providers.anthropic_oauth import (
+    AnthropicSourceError,
+    anthropic_generation_auth_config,
+    is_anthropic_generation_ref,
+  )
+
+  if bind.provider == "anthropic" and is_anthropic_generation_ref(bind.credential_ref):
+    try:
+      exact_config = anthropic_generation_auth_config(
+        bind.credential_ref, user_scope=user_scope, base_config=base_config,
+      )
+    except AnthropicSourceError as exc:
+      raise CapabilityResolutionError(
+        "credential_unavailable",
+        "resumed Anthropic credential generation is unavailable",
+        capability_id=bind.capability_id,
+      ) from exc
+    resolver = resolver.with_frozen_credential(bind, exact_config)
+  return resolver.materialize_bind(bind)
+
+
 def derive_batch_capability_execution(
   parent_resolver: CapabilityExecutionResolver,
   parent_execution: BoundCapabilityExecution,
@@ -469,11 +778,362 @@ def derive_batch_capability_execution(
   return batch_resolver, batch_execution
 
 
+ModelCallKind = Literal["completion", "judgment"]
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCallOperation:
+  """A registered leaf model-call operation.
+
+  The registration owns execution class (capability slot id), rubric schema
+  (for judgments), system prompt, role/effort ceilings and provider constraints.
+  A cell or caller passes the operation name, never a raw slot id.
+  """
+
+  name: str
+  execution_class: CapabilityId
+  kind: ModelCallKind
+  description: str
+  rubric_schema: Mapping[str, Any] | None = None
+  system_prompt: str | None = None
+  default_role: str | None = None
+  default_effort: str | None = None
+  allowed_roles: frozenset[str] | None = None
+  provider_constraints: frozenset[str] | None = None
+
+
+_MODEL_CALL_OPERATIONS: dict[str, ModelCallOperation] = {}
+
+
+def register_model_call_operation(operation: ModelCallOperation) -> None:
+  """Register one leaf model-call operation."""
+  if not isinstance(operation, ModelCallOperation):
+    raise TypeError("operation must be an exact ModelCallOperation")
+  name = str(operation.name or "").strip()
+  if not name:
+    raise ValueError("operation name must be non-empty")
+  if name in _MODEL_CALL_OPERATIONS:
+    raise ValueError(f"model-call operation already registered: {name!r}")
+  _MODEL_CALL_OPERATIONS[name] = operation
+
+
+def lookup_model_call_operation(name: str) -> ModelCallOperation | None:
+  """Look up one registered model-call operation by name."""
+  return _MODEL_CALL_OPERATIONS.get(str(name or "").strip())
+
+
+def list_model_call_operations(
+  *,
+  kind: ModelCallKind | None = None,
+) -> tuple[ModelCallOperation, ...]:
+  """Return all registered model-call operations, optionally filtered by kind."""
+  ops = _MODEL_CALL_OPERATIONS.values()
+  if kind is not None:
+    ops = (op for op in ops if op.kind == kind)
+  return tuple(sorted(ops, key=lambda op: op.name))
+
+
+_DEFAULT_MODEL_CALL_OPERATIONS: tuple[ModelCallOperation, ...] = (
+  ModelCallOperation(
+    name="general_completion",
+    execution_class="edgar.general_completion",
+    kind="completion",
+    description="General text generation, summarization, and synthesis from supplied material.",
+    system_prompt="You are a helpful fundamental research assistant. Synthesize the provided material accurately and concisely.",
+  ),
+  ModelCallOperation(
+    name="citation_review",
+    execution_class="citation.review",
+    kind="judgment",
+    description="Evaluate citation coverage, source fidelity, and factual consistency against sources.",
+    system_prompt="You are a precise citation and evidence auditor. Evaluate the claims against the sources. Return a structured judgment.",
+    rubric_schema=MappingProxyType({
+      "type": "object",
+      "properties": {
+        "verdict": {
+          "type": "string",
+          "enum": ["supported", "unsupported", "partially_supported"],
+        },
+        "findings": {"type": "array", "items": {"type": "string"}},
+      },
+      "required": ["verdict"],
+    }),
+  ),
+  ModelCallOperation(
+    name="verification",
+    execution_class="node.verify",
+    kind="judgment",
+    description="Verify hypotheses, financial statements, and calculations against reference data.",
+    system_prompt="You are a rigorous verification evaluator. Check the state against the provided questions and rubric.",
+    rubric_schema=MappingProxyType({
+      "type": "object",
+      "properties": {
+        "valid": {"type": "boolean"},
+        "reasons": {"type": "array", "items": {"type": "string"}},
+      },
+      "required": ["valid"],
+    }),
+  ),
+)
+
+for _default_op in _DEFAULT_MODEL_CALL_OPERATIONS:
+  _MODEL_CALL_OPERATIONS[_default_op.name] = _default_op
+
+
+def reset_model_call_operations_for_tests() -> None:
+  """Reset the model-call operation registry to default operations."""
+  _MODEL_CALL_OPERATIONS.clear()
+  for op in _DEFAULT_MODEL_CALL_OPERATIONS:
+    _MODEL_CALL_OPERATIONS[op.name] = op
+
+
+async def execute_leaf_model_call(
+  operation: str,
+  *,
+  material: str | None = None,
+  state: Any | None = None,
+  questions: Any | None = None,
+  role: str | None = None,
+  effort: str | None = None,
+  evidence_handles: Iterable[str] = (),
+  runner: Any = None,
+  resolver: CapabilityExecutionResolver | None = None,
+  user_id: str | None = None,
+  session_id: str | None = None,
+  task_id: str | None = None,
+  wait: bool = False,
+  timeout: float | None = None,
+) -> dict[str, Any]:
+  """Execute one leaf model-call operation under D13 proposal.
+
+  The operation owns execution class and rubric schema. Under proposal D13
+  each leaf call registers as a P4 job on the runner's registry, so wait,
+  cancel and journal usage share one surface with agent jobs.
+  """
+  import asyncio
+  import json
+  import os
+
+  op = lookup_model_call_operation(operation)
+  if op is None:
+    registered = [o.name for o in list_model_call_operations()]
+    raise ValueError(
+      f"unknown model-call operation {operation!r}; registered: {registered}"
+    )
+
+  if op.allowed_roles is not None and role is not None:
+    if role not in op.allowed_roles:
+      raise ValueError(
+        f"role {role!r} not allowed for operation {op.name!r}; "
+        f"allowed: {sorted(op.allowed_roles)}"
+      )
+
+  effective_role = role or op.default_role
+  effective_effort = effort or op.default_effort
+
+  if resolver is None:
+    cap_exec = getattr(runner, "capability_execution", None)
+    resolver = getattr(cap_exec, "resolver", None) if cap_exec is not None else None
+  if resolver is None:
+    raise RuntimeError(
+      "execute_leaf_model_call requires a resolver or runner with capability_execution.resolver"
+    )
+
+  bound_execution = resolver.resolve(
+    op.execution_class,
+    role=effective_role,
+    effort=effective_effort,
+  )
+  if bound_execution.auth_config.get("max_tokens") is None:
+    model_info = getattr(bound_execution.adapter, "get_model_info", lambda _m: None)(
+      bound_execution.bind.upstream_model
+    )
+    default_max = getattr(model_info, "max_output_tokens", 4096) if model_info else 4096
+    config = {**bound_execution.auth_config, "max_tokens": int(default_max or 4096)}
+    bound_execution = replace(bound_execution, auth_config=MappingProxyType(config))
+
+  handles = tuple(str(h) for h in evidence_handles if str(h).strip())
+  if op.kind == "completion":
+    prompt_text = str(material or "")
+    if handles:
+      prompt_text = f"{prompt_text}\n\nEvidence handles: {', '.join(handles)}"
+    system_prompt = op.system_prompt
+  else:
+    q_str = (
+      json.dumps(questions, indent=2)
+      if isinstance(questions, (dict, list))
+      else str(questions or "")
+    )
+    s_str = (
+      json.dumps(state, indent=2)
+      if isinstance(state, (dict, list))
+      else str(state or "")
+    )
+    prompt_text = f"State:\n{s_str}\n\nQuestions/Rubric:\n{q_str}"
+    if handles:
+      prompt_text = f"{prompt_text}\n\nEvidence handles: {', '.join(handles)}"
+    system_prompt = (
+      op.system_prompt
+      or "Evaluate the provided state against the questions and rubric. Return a structured judgment."
+    )
+
+  assigned_task_id = task_id or f"mc_{os.urandom(4).hex()}"
+
+  def _usage_recorder() -> tuple[list[Any], Any]:
+    events: list[Any] = []
+    return events, events.append
+
+  def _usage_summary(events: list[Any]) -> dict[str, Any]:
+    return {
+      "input_tokens": sum(e.input_tokens or 0 for e in events),
+      "output_tokens": sum(e.output_tokens or 0 for e in events),
+      "cache_read_tokens": sum(e.cache_read_tokens or 0 for e in events),
+      "cache_creation_tokens": sum(e.cache_creation_tokens or 0 for e in events),
+      "cost_usd": sum(e.cost_usd or 0.0 for e in events),
+      "model": events[-1].model if events else None,
+      "provider": events[-1].provider if events else None,
+      "turn_count": len(events),
+    }
+
+  if runner is not None and hasattr(runner, "_register_background_task"):
+    async def _run_model_call_job(
+      _tool_input: dict[str, Any],
+      *,
+      call_index: int = 0,
+      task_entry: Any = None,
+      **_job_kwargs: Any,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+      from .send_prompt import send_prompt
+      usage_events, record_usage = _usage_recorder()
+      try:
+        text = await send_prompt(
+          prompt_text,
+          system_prompt=system_prompt,
+          capability_execution=bound_execution,
+          user_id=user_id or getattr(runner, "user_id", "anonymous"),
+          session_id=session_id or getattr(runner, "session_id", "model-call"),
+          request_id=getattr(runner, "_request_id", None),
+          rate_table_version=getattr(runner, "_rate_table_version", None),
+          billing_mode=getattr(runner, "_billing_mode", None),
+          channel=getattr(runner, "_channel", None),
+          on_usage=record_usage,
+          # send_prompt bills each attempt with its real outcome (succeeded,
+          # failed_billable, canceled); the runner's producer is the one billing
+          # door for agent and leaf usage alike.
+          commercial_usage_producer=getattr(runner, "_commercial_usage_producer", None),
+          completion_record_root=None,
+        )
+        res: dict[str, Any] = {
+          "operation": op.name,
+          "kind": op.kind,
+          "content": text,
+          "task_id": assigned_task_id,
+          "capability_id": bound_execution.bind.capability_id,
+          "model": bound_execution.bind.model_key,
+          "provider": bound_execution.bind.provider,
+          "selection_provenance": bound_execution.bind.model_dump(mode="json"),
+          "usage": _usage_summary(usage_events),
+        }
+        if op.kind == "judgment":
+          res["state"] = state
+          res["questions"] = questions
+          try:
+            res["judgment"] = json.loads(text)
+          except Exception:
+            res["judgment"] = text
+        return res, None
+      except asyncio.CancelledError:
+        raise
+      except Exception as exc:
+        return None, {"code": "model_call_failed", "message": str(exc)}
+
+    launched, error = await runner._register_background_task(
+      tool_input={
+        "operation": op.name,
+        "kind": op.kind,
+        "prompt_preview": prompt_text[:200],
+      },
+      handler=_run_model_call_job,
+      task_type=op.kind,
+      task_id_override=assigned_task_id,
+      capability_bind_receipt=bound_execution.bind.to_json(),
+      on_complete=None,
+    )
+    if error is not None:
+      raise RuntimeError(f"failed to register model call job: {error}")
+
+    job_info: dict[str, Any] = {
+      **(launched or {}),
+      "operation": op.name,
+      "kind": op.kind,
+      "task_id": assigned_task_id,
+      "bind": bound_execution.bind.to_json(),
+      "selection_provenance": bound_execution.bind.model_dump(mode="json"),
+    }
+
+    if wait:
+      registry = getattr(runner, "_task_registry", None)
+      entry = registry.get(assigned_task_id) if registry is not None else None
+      if entry is not None and entry.asyncio_task is not None:
+        if timeout is not None:
+          await asyncio.wait_for(entry.asyncio_task, timeout=timeout)
+        else:
+          await entry.asyncio_task
+      return {
+        **job_info,
+        "result": entry.result if entry is not None else None,
+        "status": entry.state.value if entry is not None else "completed",
+      }
+    return job_info
+
+  # Direct execution fallback without runner
+  from .send_prompt import send_prompt
+
+  usage_events, record_usage = _usage_recorder()
+  text = await send_prompt(
+    prompt_text,
+    system_prompt=system_prompt,
+    capability_execution=bound_execution,
+    user_id=user_id or "anonymous",
+    session_id=session_id or "model-call",
+    on_usage=record_usage,
+    completion_record_root=None,
+  )
+  res = {
+    "operation": op.name,
+    "kind": op.kind,
+    "content": text,
+    "task_id": assigned_task_id,
+    "bind": bound_execution.bind.to_json(),
+    "capability_id": bound_execution.bind.capability_id,
+    "model": bound_execution.bind.model_key,
+    "provider": bound_execution.bind.provider,
+    "selection_provenance": bound_execution.bind.model_dump(mode="json"),
+    "usage": _usage_summary(usage_events),
+  }
+  if op.kind == "judgment":
+    res["state"] = state
+    res["questions"] = questions
+    try:
+      res["judgment"] = json.loads(text)
+    except Exception:
+      res["judgment"] = text
+  return res
+
+
 __all__ = [
   "BoundCapabilityExecution",
   "CapabilityAdapterResolver",
   "CapabilityExecutionResolver",
   "CredentialMaterializer",
+  "FallbackSkip",
   "MaterializedCredential",
+  "ModelFallbackHop",
   "derive_batch_capability_execution",
+  "execute_leaf_model_call",
+  "list_model_call_operations",
+  "lookup_model_call_operation",
+  "materialize_frozen_bind",
+  "register_model_call_operation",
+  "reset_model_call_operations_for_tests",
 ]

@@ -7,10 +7,12 @@ import hmac
 import os
 from pathlib import Path
 import threading
+from typing import cast
 
 import pytest
 
 from agent_gateway import claim_signing_authority as authority_module
+from agent_gateway.autonomous_runner_claims import get_agent_api_claim_ttl_seconds
 from agent_gateway.claim_signing_authority import (
   GATEWAY_CLAIM_SIGNING_AUTHORITY_ENV,
   GATEWAY_CLAIM_SIGNING_AUTHORITY_FD_V1,
@@ -22,6 +24,7 @@ from agent_gateway.claim_signing_authority import (
   install_gateway_claim_signing_authority,
   sign_gateway_user_claim,
 )
+from agent_gateway.ttl_policy import AGENT_API_CLAIM_TTL
 
 
 _SECRET = b"claim-signing-authority-test-key-at-least-32-bytes"
@@ -124,6 +127,114 @@ def test_one_shot_fd_loader_closes_descriptor_and_signs(
   )
   assert claim["AGENT_API_CLAIM_USER_ID"] == "42"
   assert claim["AGENT_API_CLAIM_USER_EMAIL"] == "owner@example.test"
+
+
+
+def _claim_ttl(claim: dict[str, str]) -> int:
+  return (
+    int(claim["AGENT_API_CLAIM_EXPIRY"])
+    - int(claim["AGENT_API_CLAIM_ISSUED_AT"])
+  )
+
+
+def test_signing_resolves_each_users_entitlement_once(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.delenv("AGENT_API_CLAIM_TTL_SECONDS", raising=False)
+  records = {"alice": 90, "bob": 180}
+  calls: list[tuple[str, str]] = []
+
+  def resolver(user_id: str, ttl_name: str) -> int | None:
+    calls.append((user_id, ttl_name))
+    return records.get(user_id)
+
+  authority = GatewayClaimSigningAuthority(_SECRET, ttl_resolver=resolver)
+  for user_id, expected in (("alice", 90), ("bob", 180), ("missing", 300)):
+    signer = authority.bind_user(user_id=user_id, user_email=None)
+    claim = sign_gateway_user_claim(signer)
+    assert claim["AGENT_API_CLAIM_USER_ID"] == user_id
+    assert _claim_ttl(claim) == expected
+  assert calls == [
+    ("alice", AGENT_API_CLAIM_TTL),
+    ("bob", AGENT_API_CLAIM_TTL),
+    ("missing", AGENT_API_CLAIM_TTL),
+  ]
+
+
+def test_signing_preserves_environment_and_explicit_ttl_fallbacks(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setenv("AGENT_API_CLAIM_TTL_SECONDS", "432")
+  for resolver in (None, lambda user_id, ttl_name: None):
+    authority = GatewayClaimSigningAuthority(_SECRET, ttl_resolver=resolver)
+    assert _claim_ttl(authority.sign_user_claim(
+      user_id="missing", user_email=None,
+    )) == 432
+    assert _claim_ttl(authority.sign_user_claim(
+      user_id="missing", user_email=None, ttl_seconds=45,
+    )) == 45
+    with pytest.raises(ValueError, match="must be positive"):
+      authority.sign_user_claim(
+        user_id="missing", user_email=None, ttl_seconds=0,
+      )
+  monkeypatch.delenv("AGENT_API_CLAIM_TTL_SECONDS")
+  assert _claim_ttl(GatewayClaimSigningAuthority(_SECRET).sign_user_claim(
+    user_id="missing", user_email=None,
+  )) == 300
+
+
+def test_entitlement_ttl_overrides_environment_and_explicit_fallback(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setenv("AGENT_API_CLAIM_TTL_SECONDS", "432")
+  authority = GatewayClaimSigningAuthority(
+    _SECRET, ttl_resolver=lambda user_id, ttl_name: 90,
+  )
+  assert get_agent_api_claim_ttl_seconds(
+    "alice", lambda user_id, ttl_name: 90,
+  ) == 90
+  assert _claim_ttl(authority.sign_user_claim(
+    user_id="alice", user_email=None,
+  )) == 90
+  assert _claim_ttl(authority.sign_user_claim(
+    user_id="alice", user_email=None, ttl_seconds=45,
+  )) == 90
+
+
+@pytest.mark.parametrize("resolved", (None, True, False, "90", 90.5, 0, -1))
+def test_invalid_entitlement_ttl_retains_fallback_at_helper_and_signing(
+  monkeypatch: pytest.MonkeyPatch,
+  resolved: object,
+) -> None:
+  def resolver(user_id: str, ttl_name: str) -> int | None:
+    return cast(int | None, resolved)
+
+  authority = GatewayClaimSigningAuthority(_SECRET, ttl_resolver=resolver)
+  for environment, expected in (("432", 432), ("", 300)):
+    monkeypatch.setenv("AGENT_API_CLAIM_TTL_SECONDS", environment)
+    assert get_agent_api_claim_ttl_seconds("alice", resolver) == expected
+    assert _claim_ttl(authority.sign_user_claim(
+      user_id="alice", user_email=None,
+    )) == expected
+    assert _claim_ttl(authority.sign_user_claim(
+      user_id="alice", user_email=None, ttl_seconds=45,
+    )) == 45
+
+
+@pytest.mark.parametrize(
+  ("environment", "expected"),
+  (("", 300), ("not-an-int", 300), ("0", 300), ("-1", 300), (" 73 ", 73)),
+)
+def test_claim_ttl_helper_preserves_environment_fallback(
+  monkeypatch: pytest.MonkeyPatch,
+  environment: str,
+  expected: int,
+) -> None:
+  monkeypatch.setenv("AGENT_API_CLAIM_TTL_SECONDS", environment)
+  assert get_agent_api_claim_ttl_seconds() == expected
+  assert get_agent_api_claim_ttl_seconds(
+    "alice", lambda user_id, ttl_name: None,
+  ) == expected
 
 
 def test_bound_signer_is_immutable_secret_safe_and_stably_bound() -> None:

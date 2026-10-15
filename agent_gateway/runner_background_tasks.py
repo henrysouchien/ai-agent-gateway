@@ -14,6 +14,7 @@ from agent_workflow_contracts import (
   ContentHandle,
   ContentReadGrant,
   OrdinaryDelegationTaskRef,
+  PipelineStageTaskRef,
   ParentResultPolicy,
   ProjectionInline,
   ResultHandle,
@@ -352,20 +353,19 @@ _TERMINAL_TOOL_RESULT_CONTRACT = report_contract_ref(TERMINAL_TOOL_RESULT_RETURN
 
 
 def _terminal_door_refs(task_result: TaskResult) -> dict[str, Any]:
-  """The refs the child's terminal door minted, read from its canonical value.
+  """The refs a child minted, read from its canonical value.
 
   A terminal-tool-result projection is ``{tool_name, result}``: the door's own
-  answer, which the shared minter reads. Any other result names no door refs.
+  answer, which the shared minter reads. A pipeline stage has no projection;
+  its ref bag rides the narrative, not this field.
   """
   projection = task_result.values.projection
-  if (
-    projection is None
-    or projection.contract != _TERMINAL_TOOL_RESULT_CONTRACT
-    or not isinstance(projection.inline_view, Mapping)
-  ):
+  if projection is None or not isinstance(projection.inline_view, Mapping):
     return {}
-  door_result = projection.inline_view.get("result")
-  return read_back_refs(door_result) if isinstance(door_result, Mapping) else {}
+  if projection.contract == _TERMINAL_TOOL_RESULT_CONTRACT:
+    door_result = projection.inline_view.get("result")
+    return read_back_refs(door_result) if isinstance(door_result, Mapping) else {}
+  return {}
 
 
 def build_agent_completion_envelope(
@@ -390,7 +390,10 @@ def build_agent_completion_envelope(
     raise TypeError("completion materialization requires TaskResult")
   if not isinstance(policy, ParentResultPolicy):
     raise TypeError("completion materialization requires ParentResultPolicy")
-  if not isinstance(task_result.logical_task, OrdinaryDelegationTaskRef):
+  if not isinstance(
+    task_result.logical_task,
+    (OrdinaryDelegationTaskRef, PipelineStageTaskRef),
+  ):
     raise ParentResultMaterializationError(
       "workflow-node results are delivered only through workflow aggregation"
     )
@@ -644,12 +647,12 @@ def background_timeout_value(raw_timeout: Any) -> float:
 
 def ensure_sub_agent_semaphore(
   current_semaphore: Any,
-  max_concurrent_sub_agents: int | None,
+  max_concurrent_children: int,
   *,
   semaphore_factory: Callable[[int], Any],
 ) -> Any:
-  if current_semaphore is None and max_concurrent_sub_agents is not None:
-    return semaphore_factory(max_concurrent_sub_agents)
+  if current_semaphore is None:
+    return semaphore_factory(max_concurrent_children)
   return current_semaphore
 
 
@@ -707,10 +710,15 @@ def background_asyncio_tasks(running_entries: Iterable[Any]) -> list[Any]:
 
 
 def background_wait_tasks(entries: Iterable[Any]) -> list[Any]:
+  # A parked job holds no slot and owes no completion, so nothing waits on it.
   return [
     bg_task.asyncio_task
     for bg_task in entries
-    if bg_task.asyncio_task is not None and not bg_task.completed
+    if (
+      bg_task.asyncio_task is not None
+      and not bg_task.completed
+      and bg_task.state != TaskState.PARKED
+    )
   ]
 
 
@@ -726,6 +734,50 @@ async def wait_for_background_tasks(
   pending = background_wait_tasks(entries)
   if pending:
     await wait_fn(pending, timeout=timeout)
+
+
+def _job_wait_row(entry: Any) -> Dict[str, Any]:
+  """State and terminal identity only: a wait reply is one frame, and a
+  settled result can be larger than a frame. Content is delivered by the
+  result owner (the task notification, or `get_background_result` when
+  notifications are off), never carried here."""
+  row: Dict[str, Any] = {
+    "state": entry.state.value if isinstance(entry.state, TaskState) else str(entry.state),
+    "completed": bool(entry.completed),
+  }
+  if entry.completed:
+    row["error"] = entry.error
+    task_result = getattr(entry, "task_result", None)
+    row["task_result_id"] = (
+      getattr(task_result, "task_result_id", None) if task_result is not None else None
+    )
+  return row
+
+
+async def jobs_wait(
+  job_ids: Iterable[str],
+  *,
+  registry_lookup: Callable[[str], Any],
+  timeout: float,
+  wait_fn: Callable[..., Awaitable[Any]],
+) -> Dict[str, Any]:
+  """`jobs.wait`: a registry read that blocks until the named jobs settle or
+  `timeout` elapses. The observer takes no slot and owns nothing; a job it
+  stops observing keeps running. Unknown ids are reported, not refused."""
+  entries: Dict[str, Any] = {}
+  unknown: list[str] = []
+  for job_id in job_ids:
+    entry = registry_lookup(job_id)
+    if entry is None:
+      unknown.append(job_id)
+    else:
+      entries[job_id] = entry
+  await wait_for_background_tasks(entries.values(), wait=True, timeout=timeout, wait_fn=wait_fn)
+  return {
+    "jobs": {job_id: _job_wait_row(entry) for job_id, entry in entries.items()},
+    "unknown": unknown,
+    "pending": [job_id for job_id, entry in entries.items() if not entry.completed],
+  }
 
 
 async def background_result_task(
@@ -972,7 +1024,8 @@ def background_task_payload(
   if bg_task.agent_name:
     payload["agent"] = bg_task.agent_name
 
-  if getattr(bg_task, "state", None) == TaskState.INTERRUPTED:
+  state = getattr(bg_task, "state", None)
+  if state in {TaskState.INTERRUPTED, TaskState.PARKED}:
     metadata = getattr(bg_task, "metadata", {}) if isinstance(getattr(bg_task, "metadata", None), dict) else {}
     capability_bind_receipt = getattr(
       bg_task,
@@ -985,15 +1038,29 @@ def background_task_payload(
       if isinstance(getattr(bg_task, "error", None), dict)
       else None
     )
+    parked_result = getattr(bg_task, "task_result", None)
+    default_message = (
+      "Background task was interrupted by a gateway restart before completion."
+      if state == TaskState.INTERRUPTED
+      else (
+        "Background task is parked"
+        + (
+          f" ({parked_result.execution.terminal_reason})"
+          if parked_result is not None
+          else ""
+        )
+        + "; resume_background_agent continues it from its transcript."
+      )
+    )
     interrupted_message = (
       str(interrupted_error.get("message") or "")
       if interrupted_error is not None
       else ""
-    ) or "Background task was interrupted by a gateway restart before completion."
+    ) or default_message
     payload.update(
       {
-        "status": "interrupted",
-        "completed": True,
+        "status": state.value,
+        "completed": bg_task.completed,
         "elapsed_seconds": elapsed_seconds,
         "started_at": bg_task.started_at,
         "owner_runner_id": metadata.get("owner_runner_id"),

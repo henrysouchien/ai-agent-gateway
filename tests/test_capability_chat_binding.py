@@ -249,12 +249,13 @@ def test_prepare_with_stale_catalog_revision_and_eligible_key_still_binds() -> N
   assert bind.effort == "xhigh"
 
 
-def test_effort_without_model_key_is_not_a_complete_intent() -> None:
-  with pytest.raises(ValidationError, match="effort requires an explicit model_key"):
-    ChatRequest(
-      messages=[ChatMessage(role="user", content="hello")],
-      effort="high",
-    )
+def test_effort_without_model_key_is_accepted() -> None:
+  req = ChatRequest(
+    messages=[ChatMessage(role="user", content="hello")],
+    effort="high",
+  )
+  assert req.effort == "high"
+  assert req.model_key is None
 
 
 def test_context_authority_shaped_values_cannot_change_bind() -> None:
@@ -365,6 +366,7 @@ class _CompleteRunner(AgentRunner):
     self._capability_execution = execution
     self._selected_content_bindings = ()
     self._selected_content_bindings_bound = False
+    self.seen_messages: list[dict[str, Any]] = []
 
   async def run(
     self,
@@ -373,13 +375,13 @@ class _CompleteRunner(AgentRunner):
     *,
     resume_initial_messages=None,
   ) -> None:
-    _ = messages, system_prompt, resume_initial_messages
+    _ = system_prompt, resume_initial_messages
+    self.seen_messages = messages
     self._event_log.append({
       "type": "stream_complete",
       "terminal_disposition": "completed",
       "usage": {},
     })
-
 
 @pytest.mark.asyncio
 async def test_dispatch_emits_exact_complete_bind_before_runtime_work() -> None:
@@ -438,6 +440,80 @@ async def test_dispatch_emits_exact_complete_bind_before_runtime_work() -> None:
     **capability_bind.to_json(),
   }
   assert "secret" not in str(bound_events[0])
+
+
+@pytest.mark.asyncio
+async def test_dispatch_attaches_turn_context_message_on_differ_only() -> None:
+  # Excel workbook context belongs on the turn input (user message) on differ-only,
+  # not in the cached static system prompt where every selection change rewrote
+  # the entire system prompt and all conversation history.
+  current_context: list[str] = ["## Context A"]
+  last_runner: list[_CompleteRunner] = []
+
+  async def builder(session: Any, request: Any, channel: Any, auth_manager: Any, *, storage_root: Path | None = None):
+    _ = session, channel, auth_manager
+    runner = _CompleteRunner(EventLog(session_id=session.session_id), request.capability_execution)
+    last_runner.append(runner)
+    return ChatRuntime(
+      system_prompt="system",
+      build_runner=lambda event_log, *_args: runner,
+      capability_execution=request.capability_execution,
+      turn_context_message=current_context[0],
+    )
+
+  _configure_builder(builder)
+  session = _session()
+
+  # Turn 1: Context A -> attached
+  async def _noop(_: dict[str, Any]) -> None:
+    pass
+
+  # Turn 1: Context A -> attached
+  inputs1 = _inputs(context={"workbook": "wb1"})
+  inputs1.messages = [ChatMessage(role="user", content="msg 1")]
+  prepared1 = prepare_session_driver_turn(session, inputs1, build_chat_runtime=builder)
+  await _dispatch_chat_turn(
+    session, inputs1,
+    turn=SessionStream(event_log=EventLog(session_id=session.session_id), runner_task=None),
+    on_event=_noop,
+    build_chat_runtime=builder,
+    transcript_dir=None,
+    prepared_turn=prepared1,
+  )
+  assert last_runner[-1].seen_messages[-1]["content"] == "msg 1\n\n## Context A"
+  assert session.last_turn_context_message == "## Context A"
+  session.active_turn = None
+
+  # Turn 2: Context A (unchanged selection) -> NOT attached
+  inputs2 = _inputs(context={"workbook": "wb1"})
+  inputs2.messages = [ChatMessage(role="user", content="msg 2")]
+  prepared2 = prepare_session_driver_turn(session, inputs2, build_chat_runtime=builder)
+  await _dispatch_chat_turn(
+    session, inputs2,
+    turn=SessionStream(event_log=EventLog(session_id=session.session_id), runner_task=None),
+    on_event=_noop,
+    build_chat_runtime=builder,
+    transcript_dir=None,
+    prepared_turn=prepared2,
+  )
+  assert last_runner[-1].seen_messages[-1]["content"] == "msg 2"
+  session.active_turn = None
+
+  # Turn 3: Context B (selection changed) -> attached
+  current_context[0] = "## Context B"
+  inputs3 = _inputs(context={"workbook": "wb1", "selection": "B5"})
+  inputs3.messages = [ChatMessage(role="user", content="msg 3")]
+  prepared3 = prepare_session_driver_turn(session, inputs3, build_chat_runtime=builder)
+  await _dispatch_chat_turn(
+    session, inputs3,
+    turn=SessionStream(event_log=EventLog(session_id=session.session_id), runner_task=None),
+    on_event=_noop,
+    build_chat_runtime=builder,
+    transcript_dir=None,
+    prepared_turn=prepared3,
+  )
+  assert last_runner[-1].seen_messages[-1]["content"] == "msg 3\n\n## Context B"
+  assert session.last_turn_context_message == "## Context B"
 
 
 def test_session_creation_preserves_selected_anthropic_generation(tmp_path, monkeypatch):

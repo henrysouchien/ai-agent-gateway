@@ -4,8 +4,8 @@ import pytest
 
 from agent_gateway.active_skill_authority import resolve_active_skill_authority
 from agent_gateway.capability_resolution import CapabilityResolutionInputError
+from hank_contracts.investment_claims import InvestmentCapabilityGrant
 from agent_gateway.investment_capability_claim import (
-  InvestmentCapabilityGrant,
   configure_investment_capability_grants,
   investment_capability_grants,
 )

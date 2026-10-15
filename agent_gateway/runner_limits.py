@@ -5,18 +5,9 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
+from .containment_settings import ContainmentSettings
 from .providers.base import truncate_to_last_compaction
 
-MODEL_CONTEXT_LIMIT = 200_000
-CONTEXT_WARNING_PCT = 80
-CONTEXT_PRESSURE_REMINDER_PCT = 60
-CONTEXT_PRESSURE_REMINDER_STEP_PCT = 10
-# Server-side compaction fires when submitted input crosses the trigger. A fixed
-# trigger calibrated to the old 200k-window era fires on every turn once the
-# static system+tool surface alone exceeds it on a large-window model (e.g. 1M),
-# so the API re-compacts each request for no benefit. Scale the trigger and the
-# context-usage warning to the model's real window instead.
-COMPACTION_TRIGGER_PCT = 80
 _REQUEST_TOKEN_FRAMING_BASE = 1024
 _REQUEST_TOKEN_FRAMING_PER_MESSAGE = 64
 _REQUEST_TOKEN_FRAMING_PER_TOOL = 128
@@ -115,12 +106,14 @@ def context_pressure_reminder_decision(
   est_tokens: int,
   context_limit: int,
   next_threshold_pct: int,
-  initial_threshold_pct: int = CONTEXT_PRESSURE_REMINDER_PCT,
-  step_pct: int = CONTEXT_PRESSURE_REMINDER_STEP_PCT,
+  initial_threshold_pct: int,
+  step_pct: int,
 ) -> ContextPressureReminderDecision:
   """Return one model-visible reminder decision for the current context cycle.
 
-  A reminder first fires at 60%, then only after another 10 percentage points.
+  A reminder first fires at ``initial_threshold_pct``, then only after another
+  ``step_pct`` percentage points (``ContainmentSettings``
+  ``context_pressure_reminder_pct`` / ``context_pressure_reminder_step_pct``).
   Large jumps emit one reminder and require another full step from the
   delivered observation. Callers reset ``next_threshold_pct`` only after an
   actual compaction, so percentage jitter cannot re-arm a reminder.
@@ -212,20 +205,27 @@ def token_breakdown_snapshot(
   )
 
 
-def model_context_window(model_info: Any) -> int:
+def model_context_window(model_info: Any, settings: ContainmentSettings) -> int:
   window = getattr(model_info, "context_window", None)
-  return int(window) if window else MODEL_CONTEXT_LIMIT
+  return int(window) if window else settings.model_context_limit
 
 
-def effective_compaction_trigger(compaction_trigger: int | None, model_info: Any) -> int | None:
+def effective_compaction_trigger(
+  compaction_trigger: int | None,
+  model_info: Any,
+  settings: ContainmentSettings,
+) -> int | None:
   """Scale a fixed compaction trigger up to the model's real context window.
 
   Keeps the configured value as a floor (never compacts later than legacy on a
-  small window) but raises it to ``COMPACTION_TRIGGER_PCT`` of a larger window so
-  it only fires near genuine capacity instead of on every turn once the static
-  system+tool surface alone already exceeds the legacy trigger.
+  small window) but raises it to ``settings.compaction_trigger_pct`` of a
+  larger window so it only fires near genuine capacity instead of on every turn
+  once the static system+tool surface alone already exceeds the legacy trigger.
   """
   if compaction_trigger is None:
     return None
-  window_trigger = int(model_context_window(model_info) * COMPACTION_TRIGGER_PCT / 100)
+  window_trigger = int(
+    model_context_window(model_info, settings)
+    * settings.compaction_trigger_pct / 100
+  )
   return max(window_trigger, int(compaction_trigger))

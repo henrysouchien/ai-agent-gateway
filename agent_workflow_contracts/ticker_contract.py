@@ -79,6 +79,8 @@ def normalize_ticker(raw: str) -> str:
   """Normalize a boundary ticker spelling without accepting invalid syntax."""
 
   normalized = raw.strip().upper()
+  if ":" in normalized:
+    normalized = normalized.split(":", 1)[1]
   if ".." in normalized:
     return normalized
   if normalized.endswith("."):

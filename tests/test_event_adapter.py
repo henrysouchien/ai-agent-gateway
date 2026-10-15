@@ -13,11 +13,12 @@ from agent_gateway.runner_session_events import REFUSAL_GUIDANCE, build_refusal_
 
 
 def test_v1_wire_projection_covers_every_v1_type() -> None:
-  assert len(V1_WIRE_EVENT_TYPES) == 44
+  assert len(V1_WIRE_EVENT_TYPES) == 46
   assert V1_WIRE_EVENT_TYPES
   assert set(V1_FIELD_PROJECTION) == set(V1_WIRE_EVENT_TYPES)
   assert all("type" in fields for fields in V1_FIELD_PROJECTION.values())
   assert {"soft_budget_steer", "soft_budget_final"} <= V1_WIRE_EVENT_TYPES
+  assert "todo_snapshot" in V1_WIRE_EVENT_TYPES
   assert "blocked" not in V1_WIRE_EVENT_TYPES
   assert "blocked" not in V1_FIELD_PROJECTION
   assert "remediating" not in V1_WIRE_EVENT_TYPES
@@ -86,6 +87,16 @@ def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
     {"type": "interceptor_decision", "tool_call_id": "toolu_1", "tool_name": "bash", "action": "deny", "code": "blocked", "message": "blocked"},
     {"type": "stream_retry", "attempt": 1, "error": "retry"},
     {"type": "credential_refreshed", "provider": "anthropic", "kind": "auth", "status_code": 401},
+    {
+      "type": "model_fallback",
+      "from": {"model_key": "anthropic.claude-opus-5-5", "label": "Claude Opus 5.5", "provider": "anthropic", "upstream_model": "claude-opus-5-5", "effort": "high"},
+      "to": {"model_key": "codex.gpt-6-1-sol", "label": "GPT-6.1 Sol", "provider": "codex", "upstream_model": "gpt-6.1-sol", "effort": "high"},
+      "reason": "usage_limit",
+      "reset_at": 1791600000.0,
+      "role": "deep",
+      "chain_index": 0,
+      "skipped": [],
+    },
     {"type": "compaction", "chars": 123},
     {
       "type": "turn_complete",
@@ -310,6 +321,24 @@ def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
   for event in fixtures:
     allowed = V1_FIELD_PROJECTION[event["type"]]
     assert set(event) <= allowed, event["type"]
+
+
+def test_v1_adapter_delivers_model_fallback_notice_fields() -> None:
+  event = {
+    "type": "model_fallback",
+    "from": {"model_key": "anthropic.claude-opus-5-5", "label": "Claude Opus 5.5", "provider": "anthropic", "upstream_model": "claude-opus-5-5", "effort": "high"},
+    "to": {"model_key": "codex.gpt-6-1-sol", "label": "GPT-6.1 Sol", "provider": "codex", "upstream_model": "gpt-6.1-sol", "effort": "high"},
+    "reason": "usage_limit",
+    "reset_at": 1791600000.0,
+    "role": "deep",
+    "chain_index": 0,
+    "skipped": [{"model_key": "anthropic.claude-sonnet-5-5", "code": "credential_unavailable"}],
+  }
+  adapted = V1Adapter().transform({**event, "future_only": "strip-me"})
+  assert adapted == event
+  # A child's hop reaches the parent stream attributed to that child.
+  child_hop = {**event, "sub_agent_id": "sub0:sess-parent"}
+  assert adapt_event(child_hop, 1) == child_hop
 
 
 def test_v1_adapter_preserves_artifact_ready_origin() -> None:
