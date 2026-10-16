@@ -82,6 +82,31 @@ is a minor; a removal or redefinition is a major) or a capability change is a
   relock and redeploy every consumer onto it, confirm each health surface's
   `admits` range covers the minor, and only then deploy data that declares it
 
+## Releasing
+
+- [ ] **Check dependency symbols against published versions** — each dependency
+  floor must name a published version containing every symbol the gateway imports
+  from it. Review sibling in-tree distributions, including `hank-contracts` and
+  `hank-model-authority`, with `git log <last-published-source-commit>..HEAD -- <package-path>`
+  since their last publish; publish required sibling changes first and raise the
+  gateway's dependency floors accordingly. A working source checkout is not proof
+  that a fresh consumer install works.
+- [ ] **Pre-upload wheel smoke** — the publisher installs only the built gateway
+  wheel with `[all]` and the built `agent-workflow-contracts` wheel locally; every
+  other dependency resolves from PyPI, without local `--find-links`. It explicitly
+  imports `agent_gateway.runner`, imports every `agent_gateway` module with
+  `pkgutil.walk_packages`, and retains the resource/contract checks. The `[all]`
+  coverage includes the CLI's `[anthropic]` extra. Imports run in an empty temporary
+  working directory, not `/tmp` itself, in a fresh venv.
+- [ ] **Post-upload index smoke** — after upload, the publisher creates another
+  fresh venv, installs `ai-agent-gateway[all]==<NEW_VERSION>` from PyPI with
+  propagation retries, and repeats the full import sweep from an empty temporary
+  working directory. Announce the release and bump consumer pins only after it
+  prints `index smoke ok: ai-agent-gateway <version>`. If `index_smoke` fails, the
+  release must be yanked or superseded before it is announced.
+
+Incident: on 2026-10-16, 0.27.0 imported `CommercialWorkStartError` absent from every published `hank-contracts`; 0.27.1 raises the floor to `hank-contracts>=1.3,<2`, and 0.27.0 is yanked.
+
 ## Publish
 
 - [ ] **Commit** the feature + doc updates together
@@ -113,4 +138,9 @@ is a minor; a removal or redefinition is a major) or a capability change is a
 ### Publish-script notes
 
 - The script's `pip-audit` gate fails closed on any CVE. Disputed/wontfix advisories with no fix version can be added to `AUDIT_IGNORES` in `scripts/publish_guards.sh` (`check_build_integrity` function). Each entry requires the advisory ID, a one-line reason it's safe to ignore here, and the date added. Audit logs print `NOTICE: ignoring advisory <ID>` per entry so the bypass is visible.
-- If a publish run partially fails (sync_commit lands but `integrity_check` / `wheel_smoke` / `upload` fails), re-running the script is safe. `check_publish_owed` in `publish_guards.sh` detects the recovery state via last-commit-message ("not a `chore: bump version`") and skips re-running `sync_commit`, going straight to bump → build → upload → version_commit. No manual recovery needed.
+- If a publish run fails before gateway upload, inspect the retained private
+  workspace and correct the source before starting a new run. Existing contracts
+  versions are reused only when their published wheel payload and dependency
+  metadata match the selected build. After a gateway upload, an `index_smoke`
+  failure is not a successful release: yank or supersede it before announcing it;
+  immutable PyPI versions cannot be overwritten.

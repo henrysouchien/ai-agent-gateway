@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.27.1 (2026-10-16)
+
+### Fixed
+
+- 0.27.0 required `hank_contracts.commercial_work.CommercialWorkStartError`, which is absent from every published `hank-contracts` release, so installs of 0.27.0 failed at import. The dependency floor is now `hank-contracts>=1.3,<2`, which provides the symbol. 0.27.0 is yanked; install 0.27.1.
+
 ## 0.27.0 (2026-10-16)
 
 ### Breaking
