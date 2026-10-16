@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -9,7 +10,7 @@ import logging
 import os
 from pathlib import Path
 import time
-from typing import AbstractSet, TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Protocol, Tuple, runtime_checkable
+from typing import AbstractSet, TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Protocol, Tuple
 
 from agent_workflow_contracts import AgentCompletionEnvelope, TaskResult
 
@@ -79,20 +80,24 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("agent_gateway.runner")
 _ACTIVE_SKILL_ALLOW_RESULT_KEY = "_active_skill_allow"
+_SKILL_RUN_ID_RESULT_KEY = "_skill_run_id"
 _READABLE_RESOURCE_SNAPSHOT_RESULT_KEY = "_readable_resource_snapshot"
 _READABLE_RESOURCE_MAX_CONTENT_BYTES = 2_000_000
+_CURRENT_PARENT_SKILL_RUN_ID: ContextVar[str | None] = ContextVar(
+  "agent_gateway_parent_skill_run_id", default=None,
+)
 
 
-
-@runtime_checkable
-class _EffectiveToolInputResolver(Protocol):
-  def __call__(
-    self,
-    tool_name: str,
-    tool_input: Dict[str, Any],
-  ) -> Dict[str, Any]: ...
+def current_parent_skill_run_id() -> str | None:
+  return _CURRENT_PARENT_SKILL_RUN_ID.get()
 
 
+def set_current_parent_skill_run_id(value: str | None) -> Token[str | None]:
+  return _CURRENT_PARENT_SKILL_RUN_ID.set(value)
+
+
+def reset_current_parent_skill_run_id(token: Token[str | None]) -> None:
+  _CURRENT_PARENT_SKILL_RUN_ID.reset(token)
 
 
 class ApprovedBindingExecutor(Protocol):
@@ -433,6 +438,7 @@ class RunnerToolExecutionMixin:
   if TYPE_CHECKING:
     _batch_id: str | None
     _dispatcher: AgentRunnerDispatcher
+    _excluded_tools: set[str]
     _dispatcher_accepts_abort_event: bool
     _dispatcher_accepts_skill_run_context: bool
     _full_session_id: str
@@ -593,13 +599,24 @@ class RunnerToolExecutionMixin:
     time_module = _runner_attr(self, "time", time)
     asyncio_module = _runner_attr(self, "asyncio", asyncio)
     cancelled_error_type = getattr(asyncio_module, "CancelledError", asyncio.CancelledError)
+    parent_skill_run_id = (
+      getattr(self, "_parent_skill_run_id", None)
+      or getattr(getattr(self._dispatcher, "run_context", None), "parent_skill_run_id", None)
+    )
+    parent_skill_run_id = (
+      parent_skill_run_id.strip()
+      if isinstance(parent_skill_run_id, str) and parent_skill_run_id.strip()
+      else None
+    )
 
     prepared_call = PreparedToolCall(tool_input)
     preparation_failed = False
     preparation_error: Dict[str, Any] | None = None
-    prepare_tool_call = getattr(self._dispatcher, "prepare_tool_call", None)
-    dispatch_prepared = getattr(self._dispatcher, "dispatch_prepared", None)
-    if approved_call is None and callable(prepare_tool_call) and callable(dispatch_prepared):
+    if approved_call is None:
+      parent_scope_token = (
+        set_current_parent_skill_run_id(parent_skill_run_id)
+        if parent_skill_run_id is not None else None
+      )
       try:
         candidate = await self._dispatcher.prepare_tool_call_async(tool_name, tool_input)
         if type(candidate) is not PreparedToolCall:
@@ -619,23 +636,9 @@ class RunnerToolExecutionMixin:
         )
         tool_input = {}
         preparation_failed = True
-    elif approved_call is None:
-      effective_tool_input = tool_input
-      resolve_effective_tool_input = getattr(
-        self._dispatcher,
-        "resolve_effective_tool_input",
-        None,
-      )
-      if isinstance(resolve_effective_tool_input, _EffectiveToolInputResolver):
-        try:
-          effective_tool_input = resolve_effective_tool_input(
-            tool_name,
-            tool_input,
-          )
-        except Exception:
-          effective_tool_input = tool_input
-      tool_input = effective_tool_input
-      prepared_call = PreparedToolCall(tool_input)
+      finally:
+        if parent_scope_token is not None:
+          reset_current_parent_skill_run_id(parent_scope_token)
     executed_prepared_call = prepared_call
 
     def capture_executed_prepared_call(call: PreparedToolCall) -> None:
@@ -807,16 +810,14 @@ class RunnerToolExecutionMixin:
           capture_executed_prepared_call
         )
         needs_approval = approved_call is not None
-        requires_approval_fn = (
-          getattr(self._dispatcher, "requires_approval_prepared", None)
-          if callable(dispatch_prepared)
-          else getattr(self._dispatcher, "requires_approval", None)
+        requires_approval_fn = getattr(
+          self._dispatcher, "requires_approval_prepared", None
         )
         if approved_call is None and requires_approval_fn is not None:
           try:
             needs_approval = requires_approval_fn(
               tool_name,
-              prepared_call if callable(dispatch_prepared) else tool_input,
+              prepared_call,
             )
           except Exception:
             pass
@@ -858,20 +859,11 @@ class RunnerToolExecutionMixin:
               on_executed_prepared_call=capture_executed_prepared_call,
             )
             if approved_call is not None
-            else (
-              self._dispatcher.dispatch_prepared(
-                tool_id,
-                tool_name,
-                prepared_call,
-                **dispatch_kwargs,
-              )
-              if callable(dispatch_prepared)
-              else self._dispatcher.dispatch(
-                tool_id,
-                tool_name,
-                tool_input,
-                **dispatch_kwargs,
-              )
+            else self._dispatcher.dispatch_prepared(
+              tool_id,
+              tool_name,
+              prepared_call,
+              **dispatch_kwargs,
             )
           )
           expectation_timer = (
@@ -886,9 +878,15 @@ class RunnerToolExecutionMixin:
             if expected_seconds is not None
             else None
           )
+          parent_scope_token = (
+            set_current_parent_skill_run_id(parent_skill_run_id)
+            if parent_skill_run_id is not None else None
+          )
           try:
             result, error = await dispatch_coro
           finally:
+            if parent_scope_token is not None:
+              reset_current_parent_skill_run_id(parent_scope_token)
             if expectation_timer is not None:
               expectation_timer.cancel()
 
@@ -996,6 +994,16 @@ class RunnerToolExecutionMixin:
         )
         skill_allow_signal = skill_allow_key in result
         self._activate_skill_allow(result.pop(skill_allow_key, None), base_kwargs)
+        skill_run_id_key = _runner_attr(
+          self,
+          "_SKILL_RUN_ID_RESULT_KEY",
+          _SKILL_RUN_ID_RESULT_KEY,
+        )
+        popped_skill_run_id = result.pop(skill_run_id_key, None)
+        if tool_name == "invoke_skill":
+          activate_skill_run_id = getattr(self, "_activate_skill_run_id", None)
+          if callable(activate_skill_run_id):
+            activate_skill_run_id(popped_skill_run_id)
         if set(result) != result_keys_before_control_projection:
           outcome_inputs_changed = True
 

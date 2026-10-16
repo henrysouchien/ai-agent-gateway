@@ -307,7 +307,7 @@ for both versions.
 currently supported deterministic prefix policy. The wheel also includes the
 generated JSON Schemas, TypeScript declarations, frozen historical-v1 golden,
 and complete/truncated v2 goldens under
-`agent_workflow_contracts/generated/`.
+`packages/agent-workflow-contracts/agent_workflow_contracts/generated/`.
 
 ### Ordinary agent completion
 

@@ -1141,10 +1141,21 @@ def test_no_tool_final_answer_completes_in_one_provider_request_without_guard() 
   assert not any(event.get("type") == "runtime_guard" for event in durable_events)
 
 
-def test_on_usage_fires_once_per_turn_with_usage_event_fields() -> None:
+@pytest.mark.parametrize("provider_rate_version", [None, "2026-10-15"])
+def test_on_usage_fires_once_per_turn_with_usage_event_fields(
+  monkeypatch: pytest.MonkeyPatch,
+  provider_rate_version: str | None,
+) -> None:
   events: list[UsageEvent] = []
   event_log = EventLog()
   provider = _UsageProvider()
+  if provider_rate_version is not None:
+    monkeypatch.setattr(
+      provider,
+      "_rate_table",
+      SimpleNamespace(version=provider_rate_version),
+      raising=False,
+    )
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log),
@@ -1172,7 +1183,7 @@ def test_on_usage_fires_once_per_turn_with_usage_event_fields() -> None:
   assert event.cache_read_tokens == 10
   assert event.cache_creation_tokens == 5
   assert event.cost_usd == pytest.approx(0.00020875)
-  assert event.rate_table_version == "2026-04-08"
+  assert event.rate_table_version == (provider_rate_version or "2026-04-08")
   assert event.billing_mode == "metered"
   assert event.channel == "web"
   assert event.provider == "stub"

@@ -1164,7 +1164,6 @@ def spawn_learning_fork(
         entry.tool_id for entry in catalog.tools
       ).__contains__,
       resolve_tool_authority=resolve_tool_authority,
-      placement="in_process",
       containment=parent._containment,
       frozen_bind=fork_bind,
     ),

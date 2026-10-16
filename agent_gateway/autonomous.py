@@ -723,6 +723,7 @@ async def run_autonomous(
   excluded_tools: set[str] | None = None,
   interceptors: Sequence[ToolInterceptor] | None = None,
   containment: ContainmentSettings | None = None,
+  compaction_trigger: int | None = None,
   compaction_instructions: str | None = None,
   state_dir: str | Path | None = None,
   state_file: str = "state.json",
@@ -1046,7 +1047,7 @@ async def run_autonomous(
         else None
       ),
       selection_provenance=SelectionProvenance(
-        role="default",
+        role=None,
         role_source="spawn",
         effort_source="spawn",
         preset=None,
@@ -1123,6 +1124,7 @@ async def run_autonomous(
       rate_table_version=rate_table_version,
       containment=containment,
       skill_run_id=trusted_skill_run_id,
+      compaction_trigger=compaction_trigger,
       compaction_instructions=compaction_instructions,
       coordinator=coordinator,
       agent_session_log=durable_session_log,
@@ -1196,6 +1198,7 @@ def run_autonomous_sync(
   *,
   capability_execution: BoundCapabilityExecution,
   session: GatewaySession,
+  compaction_trigger: int | None = None,
   **kwargs: Any,
 ) -> RunOutput:
   """Run the prebound headless boundary from synchronous caller code.
@@ -1233,6 +1236,7 @@ def run_autonomous_sync(
           initial_message,
           capability_execution=capability_execution,
           session=session,
+          compaction_trigger=compaction_trigger,
           **kwargs,
       )
     )

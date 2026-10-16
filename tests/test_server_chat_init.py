@@ -315,11 +315,28 @@ def _stale_preference_deployment(
     )
     for name, tier in INITIAL_MODEL_SELECTION_POLICY.tiers.items()
   }
+  presets = {}
+  for preset_name, role_map in INITIAL_MODEL_SELECTION_POLICY.presets.items():
+    filtered: dict[str, Any] = {}
+    for role_name, default in role_map.items():
+      if isinstance(default, TierModelsDefault):
+        filtered[role_name] = replace(
+          default,
+          models=tuple(key for key in default.models if key != "xai.grok-4-7"),
+          fallback=(
+            None if default.fallback is None
+            else tuple(entry for entry in default.fallback if entry.model != "xai.grok-4-7")
+          ),
+        )
+      else:
+        filtered[role_name] = default
+    presets[preset_name] = filtered
   selection_policy = replace(
     INITIAL_MODEL_SELECTION_POLICY,
     revision=f"post-{lifecycle}",
     capabilities=capabilities,
     tiers=tiers,
+    presets=presets,
   )
   selection_policy.admit_registry(registry)
   return registry, selection_policy

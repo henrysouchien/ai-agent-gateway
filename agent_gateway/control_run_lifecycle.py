@@ -52,6 +52,11 @@ _INTERNAL_AUTONOMOUS_STATE_ALIASES: MappingProxyType[str, ControlRunState] = Map
     "killed": "cancelled",
     "blocked": "failed",
     "remediating": "running",
+    # A parked run has released its process and awaits a human decision: it is
+    # the approval wait, cancellable and not resumable. A continued run handed
+    # its work to the successor `resumed_as` names; it is finished, not failed.
+    "awaiting_approval": "approval_pending",
+    "continued": "completed",
   }
 )
 # Records written before 61babe3020a6 name the retired budget stop; it reads as the interrupt it was.

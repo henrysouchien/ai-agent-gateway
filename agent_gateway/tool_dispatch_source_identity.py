@@ -770,6 +770,27 @@ def _read_metric_citations(result: Mapping[str, Any]) -> list[dict[str, Any]]:
   return [identity for _match, _key, _citation, identity in metric_citation_source_rows(matches)]
 
 
+def _read_statement_citations(result: Mapping[str, Any]) -> list[dict[str, Any]]:
+  rows = result.get("rows")
+  if not isinstance(rows, list):
+    return []
+  identities: list[dict[str, Any]] = []
+  for row in rows:
+    values = row.get("values") if isinstance(row, Mapping) else None
+    items = chain((row,), values.values() if isinstance(values, dict) else ())
+    identities.extend(
+      identity for _item, _key, _citation, identity in metric_citation_source_rows(items)
+    )
+  return identities
+
+
+def _read_financials_citations(result: Mapping[str, Any]) -> list[dict[str, Any]]:
+  facts = result.get("facts")
+  if not isinstance(facts, list):
+    return []
+  return [identity for _fact, _key, _citation, identity in metric_citation_source_rows(facts)]
+
+
 def _read_positioning_filing_sources(
   result: Mapping[str, Any],
   _descriptor: Mapping[str, Any],
@@ -873,6 +894,8 @@ _READERS = {
     lambda result, descriptor: _read_parser_filing_sections(result)
   ),
   "metric_citations": lambda result, descriptor: _read_metric_citations(result),
+  "statement_citations": lambda result, descriptor: _read_statement_citations(result),
+  "financials_citations": lambda result, descriptor: _read_financials_citations(result),
   "positioning_filing_sources": _read_positioning_filing_sources,
   "producer_vendor_sources": _read_producer_vendor_sources,
   "sandbox_computations": _read_sandbox_computations,

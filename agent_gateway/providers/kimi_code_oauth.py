@@ -607,6 +607,8 @@ def resolve_kimi_code_pool_candidates(
       store_path=candidate.store_path,
       is_user_store=candidate.is_user_store,
       auth_mode=candidate.auth_mode,
+      auth_mechanism=candidate.auth_mechanism,
+      entitlement_kind=candidate.entitlement_kind,
     )
 
   return candidates, _refresh_candidate
@@ -634,6 +636,8 @@ def _materialize_kimi_code_candidate(
   materialized.update({
     "provider": "kimi_code",
     "auth_mode": "api" if is_api else "oauth",
+    "auth_mechanism": selected.auth_mechanism,
+    "entitlement_kind": selected.entitlement_kind,
     "api_key": selected.token if is_api else "",
     "auth_token": "" if is_api else selected.token,
     ACCOUNT_IDENTITY_FIELD: selected.account_identity,

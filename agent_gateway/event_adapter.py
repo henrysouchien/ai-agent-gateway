@@ -195,6 +195,8 @@ V1_FIELD_PROJECTION: dict[str, frozenset[str]] = {
     "outcome",
     "decision_source",
     "allow_tool_type_applied",
+    "approval_id",
+    "decision_reason",
     "ts",
   ),
   "approval_delivery_acknowledged": _fields(

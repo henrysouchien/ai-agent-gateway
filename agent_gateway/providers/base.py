@@ -591,6 +591,25 @@ class ModelProvider:
     del config, failure
     return None
 
+  async def prepare_credential(
+    self,
+    config: Mapping[str, Any],
+    *,
+    model: str,
+    session_id: str | None,
+  ) -> dict[str, Any] | None:
+    """Credential material to bind before the next client build.
+
+    The runner calls this before every ``create_client`` with the bound
+    upstream ``model`` and the full session id (``None`` for a stateless
+    request). A provider that selects among interchangeable credentials ranks
+    them here and returns the chosen material in ``next_credential``'s shape;
+    ``None`` means the current config stands.
+    """
+
+    del config, model, session_id
+    return None
+
   def estimate_cost(
     self,
     model: str,

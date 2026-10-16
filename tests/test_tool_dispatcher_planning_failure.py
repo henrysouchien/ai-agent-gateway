@@ -76,7 +76,7 @@ class _LineageContractError(ValueError):
   pass
 
 
-def test_uncoded_planner_error_carries_type_reason_and_a_next_call() -> None:
+def test_uncoded_planner_error_is_not_retryable_and_names_its_call() -> None:
   tool_input = {"context_ref": "facx3.abc", "judgment": {"assumptions": []}}
   result, error = _dispatch(
     _LineageContractError("artifact lineage source alias 'S3' names no issued read"),
@@ -91,7 +91,10 @@ def test_uncoded_planner_error_carries_type_reason_and_a_next_call() -> None:
   assert data["error_type"] == "_LineageContractError"
   assert data["reason"] == "artifact lineage source alias 'S3' names no issued read"
   assert data["field"] is None
-  assert data["next_call"] == {"tool_name": "planned_write", "arguments": tool_input}
+  # An implementation error with no named field cannot be repaired by repeating the call.
+  assert "next_call" not in data
+  assert data["retryable"] is False
+  assert data["tool_call_id"] == "call-plan"
 
 
 class _CodedPlannerError(RuntimeError):

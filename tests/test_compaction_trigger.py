@@ -2,6 +2,7 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = Path(__file__).resolve().parents[1]
 for path in (str(ROOT), str(PKG_DIR)):
@@ -135,16 +136,18 @@ def test_disabled_trigger_stays_none() -> None:
   assert effective_compaction_trigger(None, _model(1_000_000), _SETTINGS) is None
 
 
-def test_large_window_scales_trigger_up() -> None:
-  # 160k legacy trigger on a 1M-window model -> 80% of 1M, not 160k.
-  trig = effective_compaction_trigger(160_000, _model(1_000_000), _SETTINGS)
-  assert trig is not None
-  assert trig == int(1_000_000 * _SETTINGS.compaction_trigger_pct / 100)
-  assert trig > 160_000
+@pytest.mark.parametrize(("context_window", "expected_trigger"), [
+  (1_000_000, 250_000),
+  (1_048_576, 262_144),
+])
+def test_large_window_scales_trigger_up(context_window: int, expected_trigger: int) -> None:
+  # 160k legacy trigger on a 1M-window model -> 25% of the window, not 160k.
+  trig = effective_compaction_trigger(160_000, _model(context_window), _SETTINGS)
+  assert trig == expected_trigger
 
 
 def test_small_window_keeps_configured_floor() -> None:
-  # 200k window: 80% == 160k, equal to the configured floor.
+  # 200k window: 25% == 50k, below the configured floor.
   assert effective_compaction_trigger(160_000, _model(200_000), _SETTINGS) == 160_000
 
 
@@ -159,7 +162,8 @@ def test_missing_window_falls_back_to_default_limit() -> None:
     pass
 
   assert model_context_window(_NoWindow(), _SETTINGS) == _SETTINGS.model_context_limit
-  assert effective_compaction_trigger(160_000, _NoWindow(), _SETTINGS) == int(
+  assert effective_compaction_trigger(160_000, _NoWindow(), _SETTINGS) == 160_000
+  assert effective_compaction_trigger(10_000, _NoWindow(), _SETTINGS) == int(
     _SETTINGS.model_context_limit * _SETTINGS.compaction_trigger_pct / 100
   )
 

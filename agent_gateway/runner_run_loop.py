@@ -1019,6 +1019,7 @@ class RunnerRunLoopMixin:
     _top_level_skill_lifecycle: TopLevelSkillLifecycleMetadata | None
 
     def _append(self, event: Dict[str, Any]) -> Any | None: ...
+    def _credential_session_id(self) -> str | None: ...
     async def _execute_resume_approved_call(
       self,
       messages: List[Dict[str, Any]],
@@ -1284,6 +1285,8 @@ class RunnerRunLoopMixin:
       resume_initial_messages: List[Dict[str, Any]] | None,
     ) -> Dict[str, Any] | None: ...
 
+    async def _prepare_credential(self, config: Dict[str, Any]) -> bool: ...
+
     def _set_client(self, client: object) -> None: ...
 
     async def _stream_turn(
@@ -1418,6 +1421,29 @@ class RunnerRunLoopMixin:
       self._admitted_self_task = entry
     if resume_initial_messages is not None:
       messages = [dict(message) for message in resume_initial_messages]
+      # A parked transcript can end on an assistant turn with no pending
+      # tool call. Claude 4.5/5.x reject assistant-prefill, and the cache
+      # breakpoint requires a user-final request, so continue with the same
+      # durable user nudge a live max_tokens ladder would append.
+      if messages and messages[-1].get("role") == "assistant":
+        content = messages[-1].get("content")
+        has_pending_tool_use = isinstance(content, list) and any(
+          isinstance(block, dict)
+          and block.get("type") in {"tool_use", "server_tool_use"}
+          for block in content
+        )
+        if not has_pending_tool_use:
+          nudge_text = (
+            _runner_attr(self, "_MAX_TOKENS_NUDGE", _MAX_TOKENS_NUDGE)
+            if messages[-1].get("stop_reason") == "max_tokens"
+            else "Continue from where you left off."
+          )
+          user_turn_message = _runner_attr(
+            self, "_user_turn_message", _user_turn_message,
+          )
+          nudge_message = user_turn_message(nudge_text)
+          await self._append_user_message_event(nudge_message)
+          messages.append(nudge_message)
     elif self._context_builder is not None:
       # Autonomous / server-authoritative path: context_builder is the source
       # of truth; the incoming `messages` carries only the new user turn.
@@ -3426,6 +3452,7 @@ class RunnerRunLoopMixin:
         return
 
       try:
+        await self._prepare_credential(config)
         client = self._provider.create_client(config)
         self._set_client(client)
       except Exception as exc:
@@ -3908,6 +3935,7 @@ class RunnerRunLoopMixin:
             tools=base_kwargs.get("tools") or [],
             force=force,
             on_event=self._append,
+            session_id=self._credential_session_id(),
           )
           if compact_result.summarize_usage is not None:
             _merge_usage_totals(usage_totals, compact_result.summarize_usage)
@@ -4145,6 +4173,7 @@ class RunnerRunLoopMixin:
                   await self._close_client(client, timeout=2.0)
                 except Exception:
                   pass
+                await self._prepare_credential(config)
                 client = self._provider.create_client(config)
                 self._set_client(client)
                 continue

@@ -13,6 +13,7 @@ import time
 import pytest
 
 from agent_gateway.capability_execution import CapabilityExecutionResolver, MaterializedCredential
+from agent_gateway.providers import ModelProvider
 from agent_gateway.providers.credential_pool import (
   PoolAccountCandidate,
   ProviderCredentialPool,
@@ -29,6 +30,12 @@ from agent_gateway.providers.google_antigravity import GoogleAntigravityProvider
 from agent_gateway.providers.google_antigravity_oauth import (
   resolve_antigravity_pool_candidates,
   save_antigravity_token_record,
+)
+from agent_gateway.providers.muse import MuseResponsesProvider
+from agent_gateway.providers.muse_oauth import (
+  _materialize_muse_candidate,
+  resolve_muse_pool_candidates,
+  save_muse_token_record,
 )
 from agent_workflow_contracts.models import SelectionProvenance
 from model_authority.binding import CredentialHandle
@@ -221,6 +228,29 @@ def gemini_pool(
     pool.clear()
 
 
+@pytest.fixture
+def muse_pool(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> Iterator[tuple[ProviderCredentialPool, Path]]:
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  for name in (
+    "MUSE_AUTH_STORE_PATH", "MUSE_API_KEY_STORE_PATH", "MUSE_API_KEY", "META_API_KEY",
+  ):
+    monkeypatch.delenv(name, raising=False)
+  pool = get_provider_credential_pool("muse")
+  pool.clear()
+  store = tmp_path / "users" / "42" / "muse" / "credentials.json"
+  save_muse_token_record(store, {
+    "identity": "subscription@example.com",
+    "api_key": "muse-subscription-key",
+    "source": "subscription",
+  })
+  try:
+    yield pool, store
+  finally:
+    pool.clear()
+
+
 def _gemini_upstream_model() -> str:
   from model_authority.current import INITIAL_MODEL_REGISTRY
 
@@ -331,6 +361,205 @@ def test_model_fallback_records_fully_parked_gemini_provider_and_serves_next(gem
   assert hop is not None
   assert hop.execution.bind.model_key == backup_key
   assert [(skip.model_key, skip.code) for skip in hop.skipped] == [(gemini_key, "credential_pool_parked")]
+
+
+@pytest.mark.parametrize(
+  ("channel", "expect_gemini"),
+  [("web", False), ("excel", True), (None, True)],
+)
+def test_hosted_external_fallback_never_hops_onto_a_subscription_route(
+  gemini_pool, channel: str | None, expect_gemini: bool,
+) -> None:
+  """A web (hosted_external) turn skips the Antigravity subscription route as
+  `placement_ineligible` and serves the next commercial entry; a local
+  channel still hops onto it."""
+  _pool, store = gemini_pool
+  gemini_model = _gemini_upstream_model()
+  resolver = stub_capability_execution_resolver(
+    default_provider="openai", default_model="gpt-primary", default_effort="none",
+    extra_models=(("google_antigravity", gemini_model), ("openai", "gpt-backup")),
+  )
+  models = resolver.registry.models
+  primary_key = next(key for key, entry in models.items() if entry.upstream_model == "gpt-primary")
+  gemini_key = next(key for key, entry in models.items() if entry.upstream_model == gemini_model)
+  backup_key = next(key for key, entry in models.items() if entry.upstream_model == "gpt-backup")
+  registry = replace(resolver.registry, models={
+    **models, gemini_key: replace(models[gemini_key], route="google.antigravity"),
+  })
+  old_materializer = resolver.credential_materializer
+
+  def materialize(handle: CredentialHandle) -> MaterializedCredential:
+    if handle.provider == "google_antigravity":
+      return MaterializedCredential(handle=handle, auth_config=_gemini_config(store))
+    return old_materializer(handle)
+
+  slot = resolver.selection_policy.capabilities["session.driver"]
+  policy = replace(
+    resolver.selection_policy,
+    capabilities={
+      **resolver.selection_policy.capabilities,
+      "session.driver": replace(slot, default=CapabilityDefault(kind="tier", tier="deep")),
+    },
+    tiers={
+      "deep": TierSelectionPolicy(
+        default=TierModelsDefault((primary_key,), "none"),
+        allowed_model_keys=frozenset({primary_key, gemini_key, backup_key}),
+        fallback=(FallbackEntry(model=gemini_key), FallbackEntry(model=backup_key)),
+      ),
+    },
+  )
+  resolver = replace(
+    resolver, registry=registry, selection_policy=policy,
+    credential_materializer=materialize, trusted_channel=channel,
+  )
+  primary = resolver.resolve("session.driver")
+
+  hop = CapabilityExecutionResolver.rebind_model_fallback(
+    primary, capture_selection_snapshot(policy),
+    selection_provenance=SelectionProvenance(role=None, role_source=None, effort_source=None, preset=None),
+    history_fits=lambda _execution: True,
+  )
+  assert hop is not None
+  if expect_gemini:
+    assert hop.execution.bind.model_key == gemini_key
+    assert hop.skipped == ()
+  else:
+    assert hop.execution.bind.model_key == backup_key
+    assert [(skip.model_key, skip.code) for skip in hop.skipped] == [
+      (gemini_key, "placement_ineligible"),
+    ]
+
+
+@pytest.mark.parametrize(
+  ("channel", "include_org_key", "park_org_key", "expected_skip"),
+  [
+    pytest.param("web", True, False, None, id="web-selects-org-after-user-subscription"),
+    pytest.param("web", False, False, "placement_ineligible", id="web-subscription-only"),
+    pytest.param("excel", False, False, None, id="excel-subscription-only"),
+    pytest.param("web", True, True, "credential_pool_parked", id="web-eligible-org-key-parked"),
+  ],
+)
+def test_fallback_hop_placement_follows_the_bound_credentials_entitlement(
+  muse_pool: tuple[ProviderCredentialPool, Path],
+  monkeypatch: pytest.MonkeyPatch,
+  channel: str,
+  include_org_key: bool,
+  park_org_key: bool,
+  expected_skip: str | None,
+) -> None:
+  """The real Muse pool selects a placement-eligible member before binding a hop."""
+  pool, store = muse_pool
+  if include_org_key:
+    monkeypatch.setenv("MUSE_API_KEY", "muse-org-key")
+  config = {"provider": "muse", "auth_user_scope": "42"}
+  candidates, refresh_fn = resolve_muse_pool_candidates(config)
+  assert refresh_fn is None
+  assert all(isinstance(candidate, PoolAccountCandidate) for candidate in candidates)
+  assert [
+    (
+      candidate.token, candidate.auth_mode, candidate.auth_mechanism,
+      candidate.entitlement_kind, candidate.is_user_store, candidate.store_path,
+    )
+    for candidate in candidates
+  ] == [
+    ("muse-subscription-key", "oauth", "api_key", "consumer_subscription", True, store),
+    *(
+      [("muse-org-key", "api", "api_key", "org_commercial", False, None)]
+      if include_org_key else []
+    ),
+  ]
+  subscription = candidates[0]
+  assert subscription.account_identity == "subscription@example.com"
+  assert pool.blocked_until(subscription.key) == 0
+  if include_org_key:
+    org = candidates[1]
+    assert org.account_identity.startswith("env:MUSE_API_KEY:")
+    if park_org_key:
+      pool.block(org.key, until=time.time() + 600)
+
+  # Start with the user subscription even on web: the hop must reselect from
+  # the real pool, rather than reject the initially materialized entitlement.
+  initial_config = _materialize_muse_candidate(subscription, config)
+  assert initial_config["api_key"] == "muse-subscription-key"
+  assert initial_config["auth_user_scope"] == "42"
+  from model_authority.current import INITIAL_MODEL_REGISTRY
+
+  muse_model = next(
+    entry.upstream_model for entry in INITIAL_MODEL_REGISTRY.models.values()
+    if entry.provider == "muse"
+  )
+  resolver = stub_capability_execution_resolver(
+    default_provider="openai", default_model="gpt-primary", default_effort="none",
+    extra_models=(("muse", muse_model), ("openai", "gpt-backup")),
+  )
+  models = resolver.registry.models
+  primary_key = next(key for key, entry in models.items() if entry.upstream_model == "gpt-primary")
+  muse_key = next(key for key, entry in models.items() if entry.upstream_model == muse_model)
+  backup_key = next(key for key, entry in models.items() if entry.upstream_model == "gpt-backup")
+  registry = replace(resolver.registry, models={
+    **models, muse_key: replace(models[muse_key], adapter="muse.responses", route="muse.api"),
+  })
+  old_materializer = resolver.credential_materializer
+  old_adapter_resolver = resolver.adapter_resolver
+  muse_provider = MuseResponsesProvider()
+
+  def materialize(handle: CredentialHandle) -> MaterializedCredential:
+    if handle.provider != "muse":
+      return old_materializer(handle)
+    return MaterializedCredential(handle=handle, auth_config=initial_config)
+
+  def adapter_resolver(adapter: str) -> ModelProvider:
+    if adapter == registry.models[muse_key].adapter:
+      return muse_provider
+    return old_adapter_resolver(adapter)
+
+  slot = resolver.selection_policy.capabilities["session.driver"]
+  policy = replace(
+    resolver.selection_policy,
+    capabilities={
+      **resolver.selection_policy.capabilities,
+      "session.driver": replace(slot, default=CapabilityDefault(kind="tier", tier="deep")),
+    },
+    tiers={
+      "deep": TierSelectionPolicy(
+        default=TierModelsDefault((primary_key,), "none"),
+        allowed_model_keys=frozenset({primary_key, muse_key, backup_key}),
+        fallback=(FallbackEntry(model=muse_key, effort="high"), FallbackEntry(model=backup_key)),
+      ),
+    },
+  )
+  resolver = replace(
+    resolver, registry=registry, selection_policy=policy,
+    credential_materializer=materialize, adapter_resolver=adapter_resolver,
+    trusted_channel=channel,
+  )
+  primary = resolver.resolve("session.driver")
+
+  hop = CapabilityExecutionResolver.rebind_model_fallback(
+    primary, capture_selection_snapshot(policy),
+    selection_provenance=SelectionProvenance(role=None, role_source=None, effort_source=None, preset=None),
+    history_fits=lambda _execution: True,
+  )
+  assert hop is not None
+  assert hop.primary_model_key == primary_key
+  if expected_skip is None:
+    selected = candidates[1] if channel == "web" else subscription
+    assert hop.execution.bind.model_key == muse_key
+    assert hop.execution.bind.route == "muse.api"
+    assert hop.execution.auth_config["api_key"] == selected.token
+    assert hop.execution.auth_config["account_identity"] == selected.account_identity
+    assert hop.execution.auth_config["auth_mode"] == selected.auth_mode
+    assert hop.execution.auth_config["auth_mechanism"] == selected.auth_mechanism
+    assert hop.execution.auth_config["entitlement_kind"] == selected.entitlement_kind
+    assert hop.execution.auth_config["auth_user_scope"] == "42"
+    assert hop.skipped == ()
+  else:
+    assert hop.execution.bind.model_key == backup_key
+    assert hop.execution.auth_config["api_key"] == "test-secret"
+    assert [(skip.model_key, skip.code) for skip in hop.skipped] == [
+      (muse_key, expected_skip),
+    ]
+
 
 
 def test_two_xai_device_code_logins_preserve_both_seats(

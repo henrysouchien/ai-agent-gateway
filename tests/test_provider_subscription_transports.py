@@ -561,3 +561,54 @@ def test_both_gemini_adapters_reduce_the_fms_persist_shape_to_the_wire_subset() 
     assert refs["type"] == "object"
     assert refs["minProperties"] == 1
 
+
+
+def test_ollama_cloud_monthly_limit_429_without_retry_after_sets_24h_cooldown(
+  tmp_path: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  from agent_gateway.providers.credential_pool import (
+    get_provider_credential_pool,
+    upsert_pool_account,
+  )
+  from agent_gateway.providers.ollama_cloud import _MONTHLY_LIMIT_COOLDOWN_SECONDS
+
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  store_path = tmp_path / "ollama_cloud" / "credentials.json"
+  upsert_pool_account(
+    store_path,
+    {"identity": "ollama_cloud:monthly", "api_key": _API_KEY},
+    default_prefix="ollama_cloud",
+    required_any_keys=("api_key",),
+  )
+  pool = get_provider_credential_pool("ollama_cloud")
+  pool.clear()
+
+  before = time.time()
+  failure = _classify(
+    OllamaCloudProvider,
+    status=429,
+    body=_json_error(
+      "you (user) have reached your monthly usage limit, add usage credits: https://ollama.com/settings"
+    ),
+  )
+
+  assert failure is not None
+  assert failure.kind == "rate_limit"
+  assert failure.status_code == 429
+  assert failure.reset_at is not None
+  assert failure.reset_at == pytest.approx(before + _MONTHLY_LIMIT_COOLDOWN_SECONDS, abs=5)
+
+  rotated = OllamaCloudProvider().next_credential(
+    {
+      "provider": "ollama_cloud",
+      "auth_mode": "api",
+      "api_key": _API_KEY,
+      "account_identity": "ollama_cloud:monthly",
+      "auth_store_path": str(store_path),
+    },
+    failure,
+  )
+  assert rotated is None
+  assert pool.blocked_until("ollama_cloud:monthly") == pytest.approx(
+    failure.reset_at, abs=1,
+  )

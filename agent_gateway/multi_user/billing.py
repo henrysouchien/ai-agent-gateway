@@ -81,6 +81,7 @@ class UsageEvent:
   event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
   projection_divergence: dict[str, str] | None = None
   selection_provenance: dict[str, Any] | None = None
+  stage_id: str | None = None
 
   def __post_init__(self) -> None:
     bind = CapabilityBind.from_json(self.capability_bind)
@@ -103,6 +104,25 @@ class UsageEvent:
 
 
 @dataclass(frozen=True)
+class ProviderModelUsage:
+  """Tokens and cost for one bucket; the latest event supplies its pricing version."""
+
+  provider: str | None
+  model: str | None
+  input_tokens: int
+  output_tokens: int
+  cache_read_tokens: int
+  cache_creation_tokens: int
+  cost: float
+  turns: int
+  usage_event_count: int
+  usage_event_ids: tuple[str, ...]
+  capability_bind: dict[str, str] | None
+  provider_reported_model: str | None
+  cost_known: bool
+  rate_table_version: str | None
+
+@dataclass(frozen=True)
 class SessionUsageSummary:
   """Authoritative per-session billing total.
 
@@ -111,6 +131,8 @@ class SessionUsageSummary:
   background tasks complete before or after the main stream completes.
   Wall time includes request drain/finalizers. TTFT measures the first
   non-empty assistant text from stream start, not provider or tool activity.
+  ``provider_model_usage`` splits that total by provider, model and bind;
+  ``model`` and ``provider`` remain the last observation.
   """
 
   user_id: str
@@ -144,6 +166,8 @@ class SessionUsageSummary:
   cost_known: bool = True
   unit_kind: str = "none"
   unit_id: str | None = None
+  stage_id: str | None = None
+  provider_model_usage: tuple[ProviderModelUsage, ...] = ()
 
   @property
   def wall_time_s(self) -> float:
@@ -230,6 +254,52 @@ def normalize_identity(
   return normalized_user_id, normalized_rate_table_version, normalized_billing_mode_raw, normalized_channel
 
 
+def _capability_bind_key(capability_bind: dict[str, str] | None) -> str:
+  if not capability_bind:
+    return ""
+  return json.dumps(capability_bind, sort_keys=True, default=str)
+
+
+def _provider_model_key(
+  provider: str | None,
+  model: str | None,
+  capability_bind: dict[str, str] | None,
+) -> tuple[str | None, str | None, str]:
+  return provider, model, _capability_bind_key(capability_bind)
+
+
+def _merge_provider_model_usage(
+  parts: list[SessionUsageSummary],
+) -> tuple[ProviderModelUsage, ...]:
+  """Merge hop buckets in insertion order. Later observation metadata wins."""
+  merged: dict[tuple[str | None, str | None, str], ProviderModelUsage] = {}
+  for part in parts:
+    for entry in part.provider_model_usage:
+      key = _provider_model_key(entry.provider, entry.model, entry.capability_bind)
+      existing = merged.get(key)
+      if existing is None:
+        merged[key] = entry
+        continue
+      merged[key] = replace(
+        existing,
+        input_tokens=existing.input_tokens + entry.input_tokens,
+        output_tokens=existing.output_tokens + entry.output_tokens,
+        cache_read_tokens=existing.cache_read_tokens + entry.cache_read_tokens,
+        cache_creation_tokens=existing.cache_creation_tokens + entry.cache_creation_tokens,
+        cost=existing.cost + entry.cost,
+        turns=existing.turns + entry.turns,
+        usage_event_count=existing.usage_event_count + entry.usage_event_count,
+        usage_event_ids=existing.usage_event_ids + entry.usage_event_ids,
+        capability_bind=(
+          dict(entry.capability_bind) if entry.capability_bind else None
+        ),
+        provider_reported_model=entry.provider_reported_model,
+        rate_table_version=entry.rate_table_version,
+        cost_known=existing.cost_known and entry.cost_known,
+      )
+  return tuple(merged.values())
+
+
 class _UsageAggregator:
   """Accumulates UsageEvent objects within one asyncio event loop.
 
@@ -240,7 +310,9 @@ class _UsageAggregator:
   delegating run's: its `snapshot()` is the child's own billing row, the unit
   (`declare_unit`) is owned by the root of the tree, and the root's
   `fleet_snapshot()` is the whole dispatch tree's total. `snapshot()` of any
-  aggregator counts only the runs that recorded into it directly.
+  aggregator counts only the runs that recorded into it directly. Both also
+  keep ``provider_model_usage``, one bucket per provider, model and capability
+  bind, so a fallback hop does not erase earlier spend.
   """
 
   def __init__(
@@ -254,6 +326,7 @@ class _UsageAggregator:
     billing_mode: BillingMode | None = None,
     started_at: float | None = None,
     parent: "_UsageAggregator | None" = None,
+    stage_id: str | None = None,
   ) -> None:
     self._lock = asyncio.Lock()
     self._user_id = user_id
@@ -274,6 +347,9 @@ class _UsageAggregator:
     self._last_capability_bind: dict[str, str] | None = None
     self._last_provider_reported_model: str | None = None
     self._event_ids: list[str] = []
+    self._provider_model_buckets: dict[
+      tuple[str | None, str | None, str], ProviderModelUsage
+    ] = {}
     self._compaction_count = 0
     self._closed = False
     self._unit_kind = "none"
@@ -281,10 +357,67 @@ class _UsageAggregator:
     self._cost_known = True
     self._parent = parent
     self._children: list[_UsageAggregator] = []
+    self._stage_id = stage_id if isinstance(stage_id, str) and stage_id else None
     if parent is not None:
       parent._children.append(self)
 
+  def bind_cost_stage_id(self, stage_id: str) -> None:
+    """Key this run's cost row by an attempt id already minted at spawn.
+
+    Root and captured-pipeline aggregators leave this unset. A resumed child
+    is a new attempt, so it binds a new id and lands a separate row.
+    """
+    if not isinstance(stage_id, str) or not stage_id or stage_id != stage_id.strip():
+      return
+    self._stage_id = stage_id
+
+  def _accumulate_provider_model(self, event: UsageEvent) -> None:
+    bind = dict(event.capability_bind) if event.capability_bind else None
+    key = _provider_model_key(event.provider, event.model, bind)
+    known = bool(getattr(event, "cost_known", True))
+    existing = self._provider_model_buckets.get(key)
+    input_tokens = int(event.input_tokens or 0)
+    output_tokens = int(event.output_tokens or 0)
+    cache_read_tokens = int(event.cache_read_tokens or 0)
+    cache_creation_tokens = int(event.cache_creation_tokens or 0)
+    cost = float(event.cost_usd or 0.0)
+    if existing is None:
+      self._provider_model_buckets[key] = ProviderModelUsage(
+        provider=event.provider,
+        model=event.model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_creation_tokens=cache_creation_tokens,
+        cost=cost,
+        turns=1,
+        usage_event_count=1,
+        usage_event_ids=(event.event_id,),
+        capability_bind=bind,
+        provider_reported_model=event.provider_reported_model,
+        rate_table_version=event.rate_table_version,
+        cost_known=known,
+      )
+      return
+    self._provider_model_buckets[key] = replace(
+      existing,
+      input_tokens=existing.input_tokens + input_tokens,
+      output_tokens=existing.output_tokens + output_tokens,
+      cache_read_tokens=existing.cache_read_tokens + cache_read_tokens,
+      cache_creation_tokens=existing.cache_creation_tokens + cache_creation_tokens,
+      cost=existing.cost + cost,
+      turns=existing.turns + 1,
+      usage_event_count=existing.usage_event_count + 1,
+      usage_event_ids=existing.usage_event_ids + (event.event_id,),
+      capability_bind=bind,
+      provider_reported_model=event.provider_reported_model,
+      rate_table_version=event.rate_table_version,
+      cost_known=existing.cost_known and known,
+    )
+
   async def record(self, event: UsageEvent) -> bool:
+    if self._stage_id is not None and not getattr(event, "stage_id", None):
+      object.__setattr__(event, "stage_id", self._stage_id)
     async with self._lock:
       if self._closed:
         return False
@@ -301,6 +434,7 @@ class _UsageAggregator:
       self._event_ids.append(event.event_id)
       if not getattr(event, "cost_known", True):
         self._cost_known = False
+      self._accumulate_provider_model(event)
       return True
 
   def record_compaction_nowait(self) -> bool:
@@ -386,6 +520,8 @@ class _UsageAggregator:
         cost_known=self._cost_known,
         unit_kind=unit_kind,
         unit_id=unit_id,
+        stage_id=self._stage_id,
+        provider_model_usage=tuple(self._provider_model_buckets.values()),
       )
 
   async def fleet_snapshot(
@@ -438,6 +574,7 @@ class _UsageAggregator:
       capability_bind=observed.capability_bind,
       provider_reported_model=observed.provider_reported_model,
       projection_divergence=observed.projection_divergence,
+      provider_model_usage=_merge_provider_model_usage(parts),
     )
 
 
@@ -764,6 +901,7 @@ __all__ = [
   "default_usage_dlq_path",
   "SqliteUsageLedger",
   "SessionUsageSummary",
+  "ProviderModelUsage",
   "UsageEvent",
   "UsageLedger",
   "UsageTotal",

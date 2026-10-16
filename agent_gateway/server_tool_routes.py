@@ -113,7 +113,7 @@ async def tool_approval_response(
         decider_role=getattr(session, "role", None),
         approved=payload.approved,
         allow_tool_type=payload.allow_tool_type,
-        reason=None,
+        reason=getattr(payload, "reason", None),
         app_state=request.app.state,
       )
     except ApprovalActionError as exc:
@@ -130,7 +130,7 @@ async def tool_approval_response(
       decider_role=getattr(session, "role", None),
       approved=payload.approved,
       allow_tool_type=payload.allow_tool_type,
-      reason=None,
+      reason=getattr(payload, "reason", None),
       app_state=request.app.state,
     )
   except ApprovalActionError as exc:

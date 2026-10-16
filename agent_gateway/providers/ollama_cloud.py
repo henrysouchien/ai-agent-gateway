@@ -59,9 +59,16 @@ _CONTENT_REFUSAL_RE = re.compile(
   re.IGNORECASE,
 )
 _BILLING_NOT_USAGE_RE = re.compile(
-  r"\b(?:payment|credit(?:s)?|subscription|billing|insufficient[_\s-]+quota)\b",
+  r"\b(?:payment|credit(?:s)?|subscription|billing|insufficient[_\s-]+quota|monthly\s+(?:usage\s+)?limit)\b",
   re.IGNORECASE,
 )
+_MONTHLY_LIMIT_RE = re.compile(
+  r"\b(?:monthly\s+(?:usage\s+)?limit|add\s+usage\s+credits)\b",
+  re.IGNORECASE,
+)
+# Monthly usage-limit 429s from ollama.com carry no Retry-After header; park
+# the exhausted credential for 24h rather than the 5-minute burst default.
+_MONTHLY_LIMIT_COOLDOWN_SECONDS = 86_400.0
 _CONTENT_REFUSAL_CODES = frozenset({"content_filter", "refusal"})
 
 
@@ -112,6 +119,7 @@ def _materialize_ollama_cloud_candidate(
   materialized = dict(config)
   materialized.update(
     auth_mode="api", api_key=selected.token,
+    auth_mechanism=selected.auth_mechanism, entitlement_kind=selected.entitlement_kind,
     account_identity=selected.account_identity,
     auth_user_scope=normalize_user_scope(config.get("auth_user_scope")),
     auth_token="", auth_store_path=str(selected.store_path or ""), api_key_store_path="",
@@ -331,12 +339,15 @@ class OllamaCloudProvider(OllamaLocalProvider):
     if status == 400 or _is_context_length_exception(exc) or _is_content_refusal(exc):
       return None
     if status == 429:
+      reset_at = _retry_after_reset_at(exc)
+      if reset_at is None and _MONTHLY_LIMIT_RE.search(_exception_text(exc)):
+        reset_at = time.time() + _MONTHLY_LIMIT_COOLDOWN_SECONDS
       return _credential_failure(
         self.name,
         exc,
         kind="rate_limit",
         status_code=status,
-        reset_at=_retry_after_reset_at(exc),
+        reset_at=reset_at,
       )
     if status == 401:
       return _credential_failure(self.name, exc, kind="auth", status_code=status)

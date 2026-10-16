@@ -41,7 +41,6 @@ from .runner_session_events import (
   build_workflow_output_attached_event as _build_workflow_output_attached_event,
   durable_event_payload as _durable_event_payload,
   release_write_lease as _release_write_lease,
-  run_interrupted_reason as _run_interrupted_reason,
   shutdown_interrupted_reason as _shutdown_interrupted_reason,
   write_lease_metadata as _write_lease_metadata,
 )
@@ -2881,13 +2880,34 @@ class RunnerSessionLifecycleMixin:
     server_cause = self._top_level_server_terminal_cause()
     terminal = self._terminal_closure_event
     approval_park = self._approval_park
-    decision = terminal_closure_decision(
-      clean_detach_reason=clean_detach_reason,
-      run_error=run_error,
-      terminal_event=terminal,
-      server_terminal_cause=server_cause,
-      approval_park=approval_park,
-    )
+
+    def decide(
+      terminal_event: Dict[str, Any] | None,
+      *,
+      skill_lifecycle: TopLevelSkillLifecycleMetadata | None = None,
+      skill_result: Dict[str, Any] | None = None,
+      skill_effect: Any = None,
+    ) -> TerminalClosureDecision:
+      shutdown_reason = None
+      shutdown_fields = None
+      if run_error is not None:
+        shutdown_reason, shutdown_fields = self._shutdown_interrupted_reason()
+      return terminal_closure_decision(
+        clean_detach_reason=clean_detach_reason,
+        run_error=run_error,
+        terminal_event=terminal_event,
+        server_terminal_cause=server_cause,
+        skill_lifecycle=skill_lifecycle,
+        skill_result=skill_result,
+        skill_effect=skill_effect,
+        approval_park=approval_park,
+        role=self._role,
+        shutdown_reason=shutdown_reason,
+        shutdown_extra_fields=shutdown_fields,
+        staged_interruption=self._terminal_closure_interruption,
+      )
+
+    decision = decide(terminal)
     preparation_cancellation: asyncio.CancelledError | None = None
     if decision.disposition != "awaiting_approval":
       # The skill closure owns its failure terminal: it gets the run's own
@@ -2914,29 +2934,12 @@ class RunnerSessionLifecycleMixin:
         if self._top_level_skill_lifecycle is not None
         else self._terminal_closure_event
       )
-      decision = terminal_closure_decision(
-        clean_detach_reason=clean_detach_reason,
-        run_error=run_error,
-        terminal_event=terminal,
-        server_terminal_cause=server_cause,
+      decision = decide(
+        terminal,
         skill_lifecycle=self._top_level_skill_lifecycle,
         skill_result=self._top_level_skill_result_event,
         skill_effect=self._top_level_skill_completion_effect_plan,
-        approval_park=approval_park,
       )
-    interruption = self._terminal_closure_interruption
-    if run_error is not None:
-      shutdown_reason, shutdown_fields = self._shutdown_interrupted_reason()
-      interruption = (
-        (server_cause, {"server_terminal_cause": server_cause})
-        if server_cause is not None
-        else _run_interrupted_reason(
-          run_error=run_error, role=self._role,
-          shutdown_reason=shutdown_reason, shutdown_extra_fields=shutdown_fields,
-        )
-      )
-    elif decision.disposition == "error" and interruption is None:
-      interruption = (decision.reason, None)
     receipts = self._terminal_closure_receipts or []
 
     def project(
@@ -2965,7 +2968,7 @@ class RunnerSessionLifecycleMixin:
     committed, _ = await self._run_durable_session_settlement(
       partial(
         self._append_terminal_closure_sync,
-        decision=decision, receipts=receipts, interruption=interruption,
+        decision=decision, receipts=receipts,
       ),
       on_committed=project,
     )
@@ -2984,7 +2987,6 @@ class RunnerSessionLifecycleMixin:
     *,
     decision: TerminalClosureDecision,
     receipts: list[Dict[str, Any]],
-    interruption: tuple[str, Dict[str, Any] | None] | None,
   ) -> tuple[TerminalClosureDecision, Dict[str, Any] | None]:
     """Drain receipts, the canonical pair, interruption and detach before projection."""
     attached = self._agent_session_log is not None and self._durable_attach_emitted
@@ -2998,8 +3000,20 @@ class RunnerSessionLifecycleMixin:
     )
     interrupted_event: Dict[str, Any] | None = None
 
-    def append_failure(cause: BaseException | None, reason: str) -> None:
+    def emit_interruption(fallback_reason: str | None = None) -> None:
       nonlocal interrupted_event
+      interruption = decision.interruption
+      if interruption is None:
+        if fallback_reason is None:
+          return
+        interrupted_reason, extra_fields = fallback_reason, None
+      else:
+        interrupted_reason, extra_fields = interruption
+      interrupted_event = self._emit_interrupted_event_sync(
+        interrupted_reason, extra_fields=extra_fields,
+      )
+
+    def append_failure(cause: BaseException | None, reason: str) -> None:
       if cause is not None:
         self._append_durable_event_sync(_build_run_error_event(
           phase="run", error_type=type(cause).__name__, error=_format_exc(cause),
@@ -3010,10 +3024,7 @@ class RunnerSessionLifecycleMixin:
         and lifecycle is None
       ):
         self._append_durable_event_sync(decision.terminal)
-      interrupted_event = self._emit_interrupted_event_sync(
-        interruption[0] if decision.disposition != "error" and interruption is not None else reason,
-        extra_fields=interruption[1] if interruption is not None else None,
-      )
+      emit_interruption(reason)
       self._emit_detach_event_sync(
         "error" if decision.disposition == "error" else decision.reason,
         recap=self._recap_for_terminal_decision(decision),
@@ -3036,7 +3047,6 @@ class RunnerSessionLifecycleMixin:
         skill_lifecycle=lifecycle, skill_result=decision.skill_result,
         skill_effect=decision.skill_effect,
       )
-      interruption = ("persistence", None)
 
     if attached and lifecycle is not None:
       try:
@@ -3052,6 +3062,7 @@ class RunnerSessionLifecycleMixin:
         decision = terminal_closure_decision(
           clean_detach_reason="error", run_error=exc,
           terminal_event=decision.terminal, server_terminal_cause=None,
+          staged_interruption=decision.interruption,
         )
         try:
           append_failure(exc, "error")
@@ -3079,11 +3090,8 @@ class RunnerSessionLifecycleMixin:
             phase="run", error_type=type(decision.cause).__name__,
             error=_format_exc(decision.cause),
           ))
-        if interruption is not None:
-          interrupted_event = self._emit_interrupted_event_sync(
-            decision.reason if decision.disposition == "error" else interruption[0],
-            extra_fields=interruption[1],
-          )
+        if decision.interruption is not None:
+          emit_interruption()
         elif decision.disposition != "awaiting_approval":
           self._settle_unresolved_tool_calls_sync()
         self._emit_detach_event_sync(
@@ -3097,11 +3105,8 @@ class RunnerSessionLifecycleMixin:
         self._append_durable_event_sync(_build_run_error_event(
           phase="closure", error_type=type(exc).__name__, error=_format_exc(exc),
         ))
-        if interruption is not None:
-          interrupted_event = self._emit_interrupted_event_sync(
-            decision.reason if decision.disposition == "error" else interruption[0],
-            extra_fields=interruption[1],
-          )
+        if decision.interruption is not None:
+          emit_interruption()
         else:
           self._settle_unresolved_tool_calls_sync()
         try:
@@ -3123,6 +3128,7 @@ class RunnerSessionLifecycleMixin:
           persistence_failure_code=(
             "terminal_receipt_persistence_failed" if receipts else "terminal_persistence_failed"
           ),
+          staged_interruption=decision.interruption,
         )
       if attached:
         append_failure(decision.cause or exc, decision.reason)

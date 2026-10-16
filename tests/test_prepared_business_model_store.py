@@ -91,7 +91,9 @@ def _request_and_record(
 
 
 @pytest.mark.asyncio
-async def test_insert_or_verify_is_prepare_once_and_conflicting_intent_fails(tmp_path) -> None:
+async def test_insert_or_verify_replaces_precommit_with_new_approval_and_rejects_same_approval_conflict(
+  tmp_path,
+) -> None:
   store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
   record = _record()
 
@@ -109,7 +111,16 @@ async def test_insert_or_verify_is_prepare_once_and_conflicting_intent_fails(tmp
     await store.insert_or_verify_prepared_business_model_change(
       _record(approval_id="approval-other", approval_chain_id="chain-other")
     )
-
+  replaced, replaced_created = await store.insert_or_verify_prepared_business_model_change(
+    _record(
+      intent_digest="9" * 64,
+      approval_id="approval-other",
+      approval_chain_id="chain-other",
+    )
+  )
+  assert replaced_created is True
+  assert replaced.intent_digest == "9" * 64
+  assert replaced.approval_id == "approval-other"
 
 @pytest.mark.asyncio
 async def test_approval_and_prepared_change_are_created_atomically(

@@ -15,6 +15,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway.multi_user.billing import (  # noqa: E402
+  ProviderModelUsage,
   SessionUsageSummary,
   SqliteUsageLedger,
   UsageEvent,
@@ -682,5 +683,177 @@ def test_usage_aggregator_concurrent_record_calls() -> None:
     assert summary.turns == 25
     assert summary.input_tokens == 2500
     assert summary.output_tokens == 1250
+
+  _run(case())
+
+
+def test_snapshot_keeps_per_provider_model_buckets_and_last_identity() -> None:
+  async def case() -> None:
+    aggregator = _UsageAggregator(
+      user_id="alice", session_id="sess", request_id="req", channel="web", started_at=1.0,
+    )
+    first = _event(
+      request_id="req",
+      provider_reported_model="claude-sonnet-4-6-20260801",
+    )
+    second = UsageEvent(
+      user_id="alice",
+      session_id="sess-1",
+      request_id="req",
+      parent_turn_id=None,
+      timestamp=3.0,
+      model="claude-sonnet-4-6",
+      provider="anthropic",
+      input_tokens=20,
+      output_tokens=10,
+      cache_read_tokens=2,
+      cache_creation_tokens=1,
+      cost_usd=0.02,
+      rate_table_version="2026-10-15",
+      billing_mode="metered",
+      channel="web",
+      capability_bind=_bind_receipt(provider="anthropic", model="claude-sonnet-4-6"),
+      provider_reported_model="claude-sonnet-4-6-later",
+    )
+    unknown = UsageEvent(
+      user_id="alice",
+      session_id="sess-1",
+      request_id="req",
+      parent_turn_id=None,
+      timestamp=4.0,
+      model="gpt-5.5",
+      provider="codex",
+      input_tokens=7,
+      output_tokens=3,
+      cache_read_tokens=1,
+      cache_creation_tokens=0,
+      cost_usd=0.01,
+      rate_table_version="2026-10-16",
+      billing_mode="metered",
+      channel="web",
+      capability_bind=_bind_receipt(provider="codex", model="gpt-5.5"),
+      provider_reported_model="gpt-5.5-reported",
+      cost_known=False,
+    )
+    await aggregator.record(first)
+    await aggregator.record(second)
+    await aggregator.record(unknown)
+    summary = await aggregator.snapshot(ended_at=5.0)
+
+    assert summary.input_tokens == 127
+    assert summary.output_tokens == 63
+    assert summary.cache_read_tokens == 13
+    assert summary.cache_creation_tokens == 6
+    assert summary.cost == pytest.approx(0.155)
+    assert summary.turns == 3
+    assert summary.model == "gpt-5.5"
+    assert summary.provider == "codex"
+    assert summary.cost_known is False
+    assert summary.usage_event_ids == (first.event_id, second.event_id, unknown.event_id)
+
+    assert len(summary.provider_model_usage) == 2
+    sonnet, gpt = summary.provider_model_usage
+    assert isinstance(sonnet, ProviderModelUsage)
+    assert (sonnet.provider, sonnet.model) == ("anthropic", "claude-sonnet-4-6")
+    assert (sonnet.input_tokens, sonnet.output_tokens) == (120, 60)
+    assert (sonnet.cache_read_tokens, sonnet.cache_creation_tokens) == (12, 6)
+    assert sonnet.cost == pytest.approx(0.145)
+    assert sonnet.turns == 2
+    assert sonnet.usage_event_count == 2
+    assert sonnet.usage_event_ids == (first.event_id, second.event_id)
+    assert sonnet.cost_known is True
+    assert sonnet.capability_bind == _bind_receipt(
+      provider="anthropic", model="claude-sonnet-4-6",
+    )
+    assert sonnet.provider_reported_model == "claude-sonnet-4-6-later"
+    assert sonnet.rate_table_version == "2026-10-15"
+
+    assert (gpt.provider, gpt.model) == ("codex", "gpt-5.5")
+    assert (
+      gpt.input_tokens, gpt.output_tokens, gpt.cache_read_tokens, gpt.cache_creation_tokens,
+    ) == (7, 3, 1, 0)
+    assert gpt.cost == pytest.approx(0.01)
+    assert gpt.turns == 1
+    assert gpt.usage_event_count == 1
+    assert gpt.usage_event_ids == (unknown.event_id,)
+    assert gpt.cost_known is False
+    assert gpt.provider_reported_model == "gpt-5.5-reported"
+    assert gpt.rate_table_version == "2026-10-16"
+
+  _run(case())
+
+
+def test_fleet_snapshot_merges_provider_model_buckets() -> None:
+  async def case() -> None:
+    root = _UsageAggregator(user_id="alice", session_id="sess", request_id="req", channel="web")
+    child = _UsageAggregator(
+      user_id="alice", session_id="sub0:sess", request_id="req", channel="web", parent=root,
+    )
+    root_event = _event(
+      request_id="req",
+      provider_reported_model="claude-sonnet-4-6-root",
+    )
+    child_same = UsageEvent(
+      user_id="alice",
+      session_id="sess-1",
+      request_id="req",
+      parent_turn_id=None,
+      timestamp=3.0,
+      model="claude-sonnet-4-6",
+      provider="anthropic",
+      input_tokens=4,
+      output_tokens=2,
+      cache_read_tokens=1,
+      cache_creation_tokens=0,
+      cost_usd=0.01,
+      rate_table_version="2026-10-15",
+      billing_mode="metered",
+      channel="web",
+      capability_bind=_bind_receipt(provider="anthropic", model="claude-sonnet-4-6"),
+      provider_reported_model="claude-sonnet-4-6-child",
+      cost_known=False,
+    )
+    child_other = _event(request_id="req", model="gpt-5.5", provider="codex")
+    await root.record(root_event)
+    await child.record(child_same)
+    await child.record(child_other)
+
+    fleet = await root.fleet_snapshot()
+    assert (fleet.input_tokens, fleet.output_tokens, fleet.turns) == (204, 102, 3)
+    assert fleet.cost == pytest.approx(0.26)
+    assert fleet.model == "claude-sonnet-4-6"
+    assert fleet.provider == "anthropic"
+    assert fleet.cost_known is False
+    assert fleet.usage_event_ids == (
+      root_event.event_id, child_same.event_id, child_other.event_id,
+    )
+
+    assert len(fleet.provider_model_usage) == 2
+    sonnet, gpt = fleet.provider_model_usage
+    assert (sonnet.provider, sonnet.model) == ("anthropic", "claude-sonnet-4-6")
+    assert (sonnet.input_tokens, sonnet.output_tokens) == (104, 52)
+    assert (sonnet.cache_read_tokens, sonnet.cache_creation_tokens) == (11, 5)
+    assert sonnet.cost == pytest.approx(0.135)
+    assert sonnet.turns == 2
+    assert sonnet.usage_event_count == 2
+    assert sonnet.usage_event_ids == (root_event.event_id, child_same.event_id)
+    assert sonnet.cost_known is False
+    assert sonnet.provider_reported_model == "claude-sonnet-4-6-child"
+    assert sonnet.rate_table_version == "2026-10-15"
+    assert sonnet.capability_bind == _bind_receipt(
+      provider="anthropic", model="claude-sonnet-4-6",
+    )
+
+    assert (gpt.provider, gpt.model, gpt.cost_known, gpt.turns) == ("codex", "gpt-5.5", True, 1)
+    assert gpt.usage_event_ids == (child_other.event_id,)
+    assert gpt.rate_table_version == "2026-04-08"
+    assert gpt.input_tokens == 100
+    assert gpt.cost == pytest.approx(0.125)
+
+    root_only = await root.snapshot()
+    assert len(root_only.provider_model_usage) == 1
+    assert root_only.provider_model_usage[0].usage_event_ids == (root_event.event_id,)
+    assert root_only.provider_model_usage[0].rate_table_version == "2026-04-08"
+    assert root_only.cost_known is True
 
   _run(case())

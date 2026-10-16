@@ -864,6 +864,7 @@ def materialize_xai_pool_candidate(
   )
   materialized.update(
     auth_mode=selected.auth_mode, account_identity=selected.account_identity,
+    auth_mechanism=selected.auth_mechanism, entitlement_kind=selected.entitlement_kind,
     auth_user_scope=normalize_user_scope(config.get("auth_user_scope")),
   )
   if selected.auth_mode == "api":

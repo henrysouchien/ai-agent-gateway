@@ -11,6 +11,7 @@ import json
 import sys
 from pathlib import Path
 from typing import Any, Mapping
+from unittest.mock import Mock
 
 import pytest
 from cryptography.exceptions import InvalidSignature
@@ -34,6 +35,7 @@ from agent_gateway.investment_capability_claim import (
   INVESTMENT_CAPABILITY_CLAIM_PRIVATE_KEY_ENV,
   INVESTMENT_CAPABILITY_CLAIM_PUBLIC_KEY_ENV,
   INVESTMENT_JOB_PRINCIPAL_TOOLS,
+  INVESTMENT_READBACK_FACADE_TOOLS,
   InvestmentCapabilityGrant,
   InvestmentCapabilityClaimError,
   configure_investment_capability_grants,
@@ -52,6 +54,8 @@ from agent_gateway.skill_context import reset_current_skill, set_current_skill
 from agent_gateway.tool_dispatcher import ToolDispatcher
 from agent_gateway.session import GatewaySession
 from gateway_test_support.host_policy import owner_session_host_policy
+from investment_tools.research.capability_facade import CapabilityFacade, VerifiedSkillClaim
+from investment_tools.research.capability_identity import RequestMetadataClaimVerifier
 
 
 _PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
@@ -247,6 +251,7 @@ def _dispatch(
   tool_call_id: str,
   tool_name: str,
   tool_input: dict[str, Any] | None = None,
+  skill_run_id: str | None = "skill-run-123",
 ):
   if tool_input is None:
     tool_input = (
@@ -260,7 +265,7 @@ def _dispatch(
       tool_name,
       tool_input,
       advertised_tool_names=frozenset({tool_name}),
-      skill_run_id="skill-run-123",
+      skill_run_id=skill_run_id,
     )
   )
 
@@ -962,8 +967,18 @@ def test_quant_claim_signs_the_admitted_budget_numbers_present(
   assert payload["exp"] == 1_800_000_060
 
 
-@pytest.mark.parametrize("tool_name", sorted(INVESTMENT_CAPABILITY_FACADE_TOOLS))
-@pytest.mark.parametrize("skill", [None, "unknown-skill"])
+@pytest.mark.parametrize(
+  ("skill", "tool_name"),
+  [
+    ("unknown-skill", tool_name)
+    for tool_name in sorted(INVESTMENT_CAPABILITY_FACADE_TOOLS)
+  ] + [
+    (None, tool_name)
+    for tool_name in sorted(
+      INVESTMENT_CAPABILITY_FACADE_TOOLS - INVESTMENT_READBACK_FACADE_TOOLS
+    )
+  ],
+)
 def test_facade_dispatch_fails_closed_without_a_known_trusted_skill(
   monkeypatch: pytest.MonkeyPatch,
   skill: str | None,
@@ -987,6 +1002,220 @@ def test_facade_dispatch_fails_closed_without_a_known_trusted_skill(
     error,
     subject=f"tool '{tool_name}'",
   )
+  assert mcp.calls == []
+
+
+@pytest.mark.parametrize("tool_name", sorted(INVESTMENT_READBACK_FACADE_TOOLS))
+def test_parent_readback_claim_is_read_only(
+  monkeypatch: pytest.MonkeyPatch,
+  tool_name: str,
+) -> None:
+  _set_signing_key(monkeypatch)
+  token = issue_investment_capability_claim(
+    user_id="42",
+    tenant=_TENANT,
+    session_id="session-123",
+    skill_run_id="agent-run-123",
+    channel="excel",
+    tool_name=tool_name,
+    request_id="request-123",
+    jti="call-parent-readback",
+    admitted_skill_execution_limits=None,
+    policy_bundle_hash=_POLICY_BUNDLE_HASH,
+  )
+
+  _header, payload = _decode_claim(token)
+  assert payload["tool_name"] == tool_name
+  assert payload["skill"] == "session_readback"
+  assert payload["effect_classes"] == ["read"]
+  assert payload["allowed_capability_ids"] == [
+    "fingerprint_screen", "insider_buying", "quality_screen", "quant_research",
+  ]
+  assert payload["approved_budget"] == {
+    "max_tokens": 32_000,
+    "max_wall_clock_seconds": 5_400,
+  }
+
+
+@pytest.mark.parametrize("tool_name", sorted(INVESTMENT_READBACK_FACADE_TOOLS))
+def test_parent_readback_dispatch_without_skill_or_skill_run_id(
+  monkeypatch: pytest.MonkeyPatch,
+  tool_name: str,
+) -> None:
+  _set_signing_key(monkeypatch)
+  token = set_current_skill(None)
+  try:
+    mcp = _FakeMcpClient(tool_name=tool_name)
+    result, error = _dispatch(
+      _dispatcher(mcp, skill=None),
+      tool_call_id="call-parent-readback",
+      tool_name=tool_name,
+      skill_run_id=None,
+    )
+  finally:
+    reset_current_skill(token)
+
+  assert error is None
+  assert result == {"ok": True}
+  assert len(mcp.calls) == 1
+  _header, payload = _decode_claim(
+    mcp.calls[0]["meta"]["investment_capability_claim"]
+  )
+  assert payload["tool_name"] == tool_name
+  assert payload["skill"] == "session_readback"
+  assert payload["skill_run_id"] == "agent-run-123"
+  assert payload["effect_classes"] == ["read"]
+  assert payload["allowed_capability_ids"] == [
+    "fingerprint_screen", "insider_buying", "quality_screen", "quant_research",
+  ]
+  assert payload["approved_budget"] == {
+    "max_tokens": 32_000,
+    "max_wall_clock_seconds": 5_400,
+  }
+  assert payload["user_id"] == "42"
+  assert payload["tenant"] == _TENANT.model_dump(mode="json")
+
+
+@pytest.mark.parametrize("tool_name", sorted(INVESTMENT_READBACK_FACADE_TOOLS))
+@pytest.mark.parametrize("subject", ["42", "43"], ids=["owner", "other-user"])
+def test_parent_readback_claim_authorizes_only_owned_consumer_reads(
+  monkeypatch: pytest.MonkeyPatch,
+  tool_name: str,
+  subject: str,
+) -> None:
+  now = 1_800_000_000
+  with monkeypatch.context() as signing:
+    _set_signing_key(signing)
+    signed_claim = issue_investment_capability_claim(
+      user_id=subject,
+      tenant=_TENANT,
+      session_id="session-123",
+      skill_run_id="agent-run-123",
+      channel="excel",
+      tool_name=tool_name,
+      request_id="request-123",
+      jti=f"call-parent-readback-{tool_name}-{subject}",
+      skill=None,
+      admitted_skill_execution_limits=None,
+      policy_bundle_hash=_POLICY_BUNDLE_HASH,
+      now=now,
+    )
+  monkeypatch.delenv(INVESTMENT_CAPABILITY_CLAIM_PRIVATE_KEY_ENV, raising=False)
+  monkeypatch.setenv(
+    INVESTMENT_CAPABILITY_CLAIM_PUBLIC_KEY_ENV,
+    _PUBLIC_KEY_MATERIAL,
+  )
+  capability_ids = sorted({
+    capability_id
+    for grant in _DECLARED_GRANTS.values()
+    for capability_id in grant.capability_ids
+  })
+  task_claim = "mcp-signed-request/v1:" + json.dumps({
+    "expected_tool_name": tool_name,
+    "signed_claim": signed_claim,
+    "allowed_capability_ids": capability_ids,
+    "effect_classes": ["read"],
+  })
+  verifier = RequestMetadataClaimVerifier(
+    known_capability_ids=capability_ids,
+    clock=lambda: now,
+  )
+  verified = verifier.verify(task_claim)
+  assert isinstance(verified, VerifiedSkillClaim)
+  assert verified.subject == subject
+  assert verified.skill == "session_readback"
+  assert verified.effect_classes == frozenset({"read"})
+
+  run = {
+    "run_id": "run-alice-1",
+    "capability_id": "quality_screen",
+    "status": "queued",
+    "requester_subject": "42",
+  }
+  artifact: dict[str, Any] = {
+    "artifact_id": "artifact-alice-1",
+    "run_id": run["run_id"],
+    "artifact_type": "dataset",
+    "schema_name": "screen-result",
+    "schema_version": "v1",
+    "media_type": "application/json",
+    "content_hash": "sha256:" + "a" * 64,
+    "byte_size": 100,
+    "created_at": "2026-08-08T12:00:00Z",
+    "metadata": {},
+    "retention_class": "standard",
+  }
+  store = Mock()
+  store.get_run.return_value = run
+  store.list_artifacts.return_value = [artifact]
+  store.get_artifact.return_value = artifact
+  reader = Mock()
+  reader.available_views.return_value = ("summary",)
+  reader.read_view.return_value = {
+    "view": "summary",
+    "content": {"rows": 3},
+    "truncated": False,
+  }
+  facade = CapabilityFacade(
+    registry=Mock(),
+    store=store,
+    quant=Mock(),
+    claim_verifier=verifier,
+    artifact_reader=reader,
+  )
+  if tool_name == "get_investment_run":
+    response = facade.get_investment_run(task_claim=task_claim, run_id=run["run_id"])
+  elif tool_name == "list_investment_artifacts":
+    response = facade.list_investment_artifacts(
+      task_claim=task_claim,
+      run_id=run["run_id"],
+    )
+  else:
+    assert tool_name == "get_investment_artifact"
+    response = facade.get_investment_artifact(
+      task_claim=task_claim,
+      artifact_id=artifact["artifact_id"],
+    )
+
+  if subject == run["requester_subject"]:
+    assert response["ok"] is True
+    denied = facade.cancel_investment_run(
+      task_claim=task_claim,
+      run_id=run["run_id"],
+    )
+    assert denied["ok"] is False
+    assert denied["error"]["code"] == "unauthorized_capability"
+    assert denied["error"]["message"] == "task claim does not grant the required effect"
+    store.request_cancellation.assert_not_called()
+  else:
+    assert response["ok"] is False
+    assert response["error"]["code"] == "unauthorized_capability"
+    store.list_artifacts.assert_not_called()
+    reader.read_view.assert_not_called()
+
+
+@pytest.mark.parametrize("tool_name", sorted(INVESTMENT_READBACK_FACADE_TOOLS))
+def test_parent_readback_dispatch_fails_closed_without_declared_grants(
+  monkeypatch: pytest.MonkeyPatch,
+  tool_name: str,
+) -> None:
+  _set_signing_key(monkeypatch)
+  configure_investment_capability_grants({})
+  token = set_current_skill(None)
+  try:
+    mcp = _FakeMcpClient(tool_name=tool_name)
+    result, error = _dispatch(
+      _dispatcher(mcp, skill=None),
+      tool_call_id="call-parent-readback-unbound",
+      tool_name=tool_name,
+      skill_run_id=None,
+    )
+  finally:
+    reset_current_skill(token)
+
+  assert result is None
+  assert error is not None
+  assert error["code"] == "investment_capability_claim_unavailable"
   assert mcp.calls == []
 
 
@@ -1571,7 +1800,6 @@ def test_in_process_child_context_precedes_parent_credential_session(
       resolve_tool_authority=lambda tool_ids: resolve_operation_authority(
         replace(declaration, tool_ceiling=tool_ids), catalog=catalog,
       ),
-      placement="in_process",
       containment=ContainmentSettings(),
     ),
   )

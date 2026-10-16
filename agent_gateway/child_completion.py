@@ -18,6 +18,7 @@ from agent_workflow_contracts import (
   AgentCompletionEnvelope,
   ContentHandle,
   ContentReadGrant,
+  ParentResultPolicy,
   TaskResult,
   sha256_digest,
 )
@@ -30,6 +31,7 @@ from .runner_background_tasks import (
   task_correlation_payload,
   task_registered_event_payload,
 )
+from .final_narrative_artifact import FinalNarrativeArtifactError
 from .runner_session_events import build_agent_completion_event
 from .sub_agent_narrative_result import read_task_result_terminal_narrative
 from .task_registry import TaskEntry, task_state_for_result
@@ -58,17 +60,21 @@ def materialize_child_completion_envelope(
   *,
   workspace_dir: str,
   principal_id: str,
+  policy: ParentResultPolicy | None = None,
 ) -> AgentCompletionEnvelope:
   """Compile one child result into the same parent view a foreground child uses."""
 
-  if not principal_id or not workspace_dir:
-    raise RuntimeError(
-      "child completion requires a parent principal and workspace"
-    )
+  if not principal_id:
+    raise RuntimeError("child completion requires a parent principal")
 
-  policy = ordinary_parent_result_policy(result)
+  if policy is None:
+    policy = ordinary_parent_result_policy(result)
 
   def _read_terminal(canonical: TaskResult) -> str:
+    if not workspace_dir:
+      raise FinalNarrativeArtifactError(
+        "durable workspace root is unavailable"
+      )
     return read_task_result_terminal_narrative(
       canonical,
       workspace_dir=workspace_dir,

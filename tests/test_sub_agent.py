@@ -16,7 +16,11 @@ import pytest
 from pydantic import JsonValue, ValidationError
 
 from agent_gateway import AgentRunner, ToolDispatcher
-from agent_gateway.admission import capture_job_context, current_parent_context
+from agent_gateway.admission import (
+  ParentContext,
+  capture_job_context,
+  current_parent_context,
+)
 from agent_gateway.containment_settings import ContainmentSettings
 from agent_gateway.job_caller import JobScope, rebind_job_handlers
 from agent_gateway.tool_result_spill import (
@@ -82,6 +86,11 @@ from agent_gateway.runner_background_tasks import (
   ordinary_parent_result_policy,
 )
 from agent_gateway.final_narrative_artifact import publish_final_narrative
+from agent_gateway.runner_tool_execution import (
+  current_parent_skill_run_id,
+  reset_current_parent_skill_run_id,
+  set_current_parent_skill_run_id,
+)
 from agent_gateway.operation_catalog import (
   Effort,
   MutationMode,
@@ -92,6 +101,7 @@ from agent_gateway.operation_snapshot import WorkspaceScope, build_agent_operati
 from agent_gateway.tool_dispatcher_helpers import ToolExecutionContext
 from agent_gateway.session import GatewaySession
 from agent_gateway.skills import SkillLoader, operation_tool_ids
+from agent_gateway.task_registry import TaskRegistry, TaskState
 from agent_gateway.sub_agent import (
   _child_run_context,
   _ticker_admitted_input,
@@ -360,7 +370,9 @@ class _Runner:
     self.spawn_calls.append(call)
     return _spawn_result(call), None
 
-  async def _register_background_task(self, **kwargs: Any):
+  async def _register_background_task(
+    self, **kwargs: Any,
+  ) -> tuple[dict[str, JsonValue] | None, dict[str, JsonValue] | None]:
     self.background_calls.append(dict(kwargs))
     return {"task_id": kwargs["task_id_override"], "status": "running"}, None
 
@@ -991,10 +1003,12 @@ def delegation_tool_policy(owner_session_host_policy):
 def test_run_agent_tool_schema_is_operation_first(tmp_path: Path) -> None:
   schema = make_run_agent_tool_def(_write_operation(tmp_path, execution_class="node.implement"))["input_schema"]
 
-  assert schema["required"] == ["objective"]
+  assert not {"oneOf", "anyOf", "allOf"} & set(schema)
+  assert "required" not in schema
   assert schema["additionalProperties"] is False
   assert set(schema["properties"]) >= {
     "operation", "objective", "ticker", "research_file_id", "background",
+    "interrupt", "resume", "additional_context",
   }
   ticker = schema["properties"]["ticker"]
   assert "pattern" not in ticker
@@ -3043,6 +3057,90 @@ def test_spawn_passes_spill_output_without_re_rooting_nested_caller(
   asyncio.run(_cross_root_case())
 
 
+def test_restricted_child_derives_the_same_run_spill_reader(
+  tmp_path: Path,
+  owner_session_host_policy: Any,
+) -> None:
+  """An operation that never named the reader still reads its own spill, only its own."""
+
+  owner_session_host_policy.get_local_tool_effect = lambda _name: "read"
+  loader = _write_operation(tmp_path / "skills", execution_class="node.implement")
+  operation = _operation(loader)
+  (tmp_path / "spills").mkdir()
+  root_sink = SpillSink(
+    lambda: str(tmp_path / "spills"),
+    capabilities=SpillCapabilities(spill_read=True),
+  )
+  runner = _Runner()
+  runner._agent_session_log = AgentSessionLog(tmp_path / "session.jsonl")
+  runner._workspace_dir = str(tmp_path)
+  runner._spill_dir_provider = root_sink
+  parent_reader = make_tool_result_read_handler(
+    lambda: root_sink,
+    caller=lambda: pytest.fail("the parent's caller must not serve a child read"),
+    journal=lambda: runner._agent_session_log,
+  )
+
+  result, error = asyncio.run(_handler(
+    runner,
+    loader=loader,
+    background_handlers={"tool_result_read": parent_reader},
+  )({
+    "objective": "Review the filing.",
+    "operation": operation,
+    "background": False,
+  }))
+
+  assert error is None, error
+  assert result is not None
+  call = runner.spawn_calls[-1]
+  admitted = call["admitted_task"]
+  # The reader is a transport companion: granted, defined and routed with the
+  # declared tool, never in place of it.
+  assert [entry.tool_id for entry in admitted.tool_grant.tools] == [
+    "tool_result_read", "web_search",
+  ]
+  assert [
+    definition.name
+    for definition in admitted.execution_snapshot.provider_tool_definitions
+  ] == ["tool_result_read", "web_search"]
+  reader_route = next(
+    route for route in admitted.tool_routes if route.tool_id == "tool_result_read"
+  )
+  assert (reader_route.origin, reader_route.server_id) == ("local", None)
+  assert "tool_result_read" not in call["excluded_tools"]
+  child_handlers = call["dispatcher"].local_tool_handlers()
+  assert {"tool_result_read", "web_search"} <= set(child_handlers)
+
+  child_context = current_parent_context(call["sub_session"])
+  assert child_context.job_id is not None
+  assert child_context.job_id == admitted.attempt.physical_task_id
+  text = "Own spilled evidence.\n" * 100
+  own = write_spill_set(
+    sink=job_spill_sink(root_sink, child_context.job_id),
+    tool_name="web_search", tool_use_id="own", content=text, model_max_chars=100,
+  )
+  other = write_spill_set(
+    sink=job_spill_sink(root_sink, "other-run"),
+    tool_name="web_search", tool_use_id="other",
+    content="Another run's evidence.\n" * 100, model_max_chars=100,
+  )
+  reader = child_handlers["tool_result_read"]
+  page, page_error = asyncio.run(reader({"spill_ref": own.spill_ref}))
+  assert page_error is None and page is not None
+  assert page["content"] == text
+  again, again_error = asyncio.run(reader({"spill_ref": own.spill_ref}))
+  assert again_error is None and again == page
+  found, search_error = asyncio.run(reader({
+    "spill_ref": own.spill_ref, "query": "Own spilled",
+  }))
+  assert search_error is None and found is not None
+  assert found["matches"]
+  denied, denied_error = asyncio.run(reader({"spill_ref": other.spill_ref}))
+  assert denied is None and denied_error is not None
+  assert denied_error["code"] == "handle_not_granted"
+
+
 def test_spawn_passes_a_workflow_membership_handle_with_a_workspace(
   tmp_path: Path,
 ) -> None:
@@ -3928,6 +4026,90 @@ def test_skill_lifecycle_emitter_fails_closed_without_confirmation() -> None:
     asyncio.run(emitter.emit_started())
 
 
+@pytest.mark.parametrize("parent_source", ["runner", "tool_context", "dispatcher"])
+def test_run_agent_threads_parent_source_registry_scope(
+  tmp_path: Path,
+  parent_source: str,
+) -> None:
+  _write_operation(tmp_path, execution_class="node.implement")
+  loader = SkillLoader(tmp_path)
+  parent_run_id = "parent-source-registry-run"
+
+  class ScopeRunner(_Runner):
+    async def spawn_sub_agent(self, task: str, **kwargs: Any):
+      assert current_parent_skill_run_id() == parent_run_id
+      assert kwargs["skill_run_id"] != parent_run_id
+      dispatcher = kwargs["dispatcher"]
+      assert getattr(dispatcher.run_context, "parent_skill_run_id") == parent_run_id
+      child_runner = AgentRunner(
+        event_log=EventLog(),
+        dispatcher=dispatcher,
+        session_id="child-scope-test",
+        capability_execution=kwargs["capability_execution"],
+        get_tool_definitions=dispatcher.get_tool_definitions,
+        user_id="actor-test",
+        billing_mode="byok",
+        rate_table_version="unknown",
+      )
+      kwargs["bind_job_runner"](child_runner)
+      assert getattr(child_runner, "_parent_skill_run_id") == parent_run_id
+      prepare_tool_call = dispatcher.prepare_tool_call_async
+
+      async def prepare(tool_name: str, tool_input: dict[str, Any]):
+        assert current_parent_skill_run_id() == parent_run_id
+        return await prepare_tool_call(tool_name, tool_input)
+
+      dispatcher.prepare_tool_call_async = prepare
+      # A later task must also recover scope from the child runner/context.
+      token = set_current_parent_skill_run_id(None)
+      try:
+        await child_runner._execute_single_tool("child-read", "web_search", {}, {})
+        assert current_parent_skill_run_id() is None
+      finally:
+        reset_current_parent_skill_run_id(token)
+        await child_runner.force_close()
+      return await super().spawn_sub_agent(task, **kwargs)
+
+  runner = ScopeRunner()
+  tool_ctx = None
+  if parent_source == "tool_context":
+    tool_ctx = SimpleNamespace(skill_run_id=f" {parent_run_id} ")
+    setattr(runner, "_skill_run_id", "lower-priority-run")
+  elif parent_source == "runner":
+    setattr(runner, "_skill_run_id", f" {parent_run_id} ")
+  else:
+    setattr(runner, "_dispatcher", SimpleNamespace(
+      run_context=SimpleNamespace(run_id=f" {parent_run_id} "),
+    ))
+
+  reads: list[str | None] = []
+
+  async def scoped_read(_tool_input: dict[str, Any], **_kwargs: Any):
+    reads.append(current_parent_skill_run_id())
+    return {"ok": True}, None
+
+  async def exercise() -> None:
+    token = set_current_parent_skill_run_id("outer-scope")
+    try:
+      result, error = await _handler(
+        runner, loader=loader, background_handlers={"web_search": scoped_read},
+      )(
+        {
+          "operation": _operation(loader),
+          "objective": "Review the parent run's filing evidence.",
+          "background": False,
+        },
+        tool_ctx=tool_ctx,
+      )
+      assert error is None and result is not None
+      assert reads == [parent_run_id]
+      assert current_parent_skill_run_id() == "outer-scope"
+    finally:
+      reset_current_parent_skill_run_id(token)
+
+  asyncio.run(exercise())
+
+
 def test_child_run_context_inherits_the_calling_run_profile() -> None:
   # The authority owner reads RunContext.profile as the profile partition; a
   # child runs inside its parent's, so the skill name rides `skill` only.
@@ -4552,3 +4734,686 @@ def test_child_background_cell_is_a_code_job_on_the_child_registry(tmp_path: Pat
       await cleanup_code_execution(parent_session)
 
   asyncio.run(run())
+
+
+class _RegistryRunner(_Runner):
+  """A run_agent double whose child registry and durable identity are real."""
+
+  def __init__(self, workspace_dir: Path | None = None) -> None:
+    super().__init__()
+    self._task_registry = TaskRegistry()
+    self._gateway_session_id = "session-test"
+    self._runner_id = "parent-runner"
+    self._role = "writer"
+    if workspace_dir is not None:
+      self._workspace_dir = workspace_dir
+
+
+def _operation_named(loader: SkillLoader, name: str) -> dict[str, Any]:
+  return next(
+    item.snapshot.operation.model_dump(mode="json")
+    for item in loader.list_callable_operations()
+    if item.snapshot.operation.name == name
+  )
+
+
+def _narrative_registry_runner(tmp_path: Path) -> _RegistryRunner:
+  workspace = tmp_path / "workspace"
+  workspace.mkdir()
+  runner = _RegistryRunner(workspace)
+  spawn_sub_agent = runner.spawn_sub_agent
+
+  async def _spawn_with_narrative(task: str, **kwargs: Any):
+    result, error = await spawn_sub_agent(task, **kwargs)
+    attempt = kwargs["attempt"]
+    reference = publish_final_narrative(
+      workspace_dir=workspace,
+      sub_agent_id=attempt.physical_task_id,
+      terminal_event_seq=1,
+      text="Canonical child narrative.",
+    )
+    assert result is not None
+    result = result.model_copy(update={
+      "values": TaskResultValues(
+        terminal_narrative=terminal_narrative_content_handle(reference),
+      ),
+    })
+    return result, error
+
+  runner.spawn_sub_agent = _spawn_with_narrative
+  return runner
+
+
+def test_identical_run_agent_returns_prior_completion_without_respawn(
+  tmp_path: Path,
+) -> None:
+  loader = _write_operation(tmp_path / "skills", execution_class="node.implement")
+  runner = _narrative_registry_runner(tmp_path)
+  handler = _handler(runner, loader=loader)
+  call = {
+    "operation": _operation(loader),
+    "objective": "Review the filing evidence.",
+    "background": False,
+  }
+
+  async def exercise() -> None:
+    first, first_error = await handler(call)
+    assert first_error is None
+    first_envelope = AgentCompletionEnvelope.model_validate(first)
+    journaled = len(runner.durable_events)
+    assert len(runner.spawn_calls) == 1
+    assert runner.background_calls == []
+    assert len(runner._task_registry.list_tasks()) == 1
+    assert runner._task_registry.list_tasks()[0].spawn_task == call["objective"]
+
+    second, second_error = await handler(dict(call))
+    assert second_error is None
+    second_envelope = AgentCompletionEnvelope.model_validate(second)
+    assert second_envelope == first_envelope
+    assert len(runner.spawn_calls) == 1
+    assert runner.background_calls == []
+    assert len(runner._task_registry.list_tasks()) == 1
+    assert len(runner.durable_events) == journaled
+
+  asyncio.run(exercise())
+
+
+def test_identical_run_agent_while_running_returns_prior_task_ack(
+  tmp_path: Path,
+) -> None:
+  loader = _write_operation(tmp_path, execution_class="node.implement")
+  runner = _RegistryRunner()
+  handler = _handler(runner, loader=loader)
+  call = {
+    "operation": _operation(loader),
+    "objective": "Review the filing evidence.",
+    "background": True,
+  }
+
+  async def exercise() -> None:
+    first, first_error = await handler(call)
+    assert first_error is None
+    assert first is not None
+    entry = runner._task_registry.get(first["task_id"])
+    assert entry is not None
+    assert entry.spawn_task == call["objective"]
+    entry.state = TaskState.RUNNING
+    assert len(runner.background_calls) == 1
+    assert len(runner._task_registry.list_tasks()) == 1
+
+    second, second_error = await handler(dict(call))
+    assert second_error is None
+    assert second == {
+      "task_id": first["task_id"],
+      "status": "running",
+      "agent": "filing-review",
+    }
+    assert len(runner.background_calls) == 1
+    assert runner.spawn_calls == []
+    assert len(runner._task_registry.list_tasks()) == 1
+
+  asyncio.run(exercise())
+
+
+def test_same_skill_different_task_text_spawns_fresh(tmp_path: Path) -> None:
+  loader = _write_operation(tmp_path, execution_class="node.implement")
+  runner = _RegistryRunner()
+  handler = _handler(runner, loader=loader)
+  operation = _operation(loader)
+
+  async def exercise() -> None:
+    first, first_error = await handler({
+      "operation": operation,
+      "objective": "Review the filing evidence.",
+      "background": True,
+    })
+    second, second_error = await handler({
+      "operation": operation,
+      "objective": "Review the filing evidence!",
+      "background": True,
+    })
+    assert first_error is None and second_error is None
+    assert first is not None and second is not None
+    assert first["task_id"] != second["task_id"]
+    assert len(runner.background_calls) == 2
+    assert len(runner._task_registry.list_tasks()) == 2
+    assert {entry.spawn_task for entry in runner._task_registry.list_tasks()} == {
+      "Review the filing evidence.",
+      "Review the filing evidence!",
+    }
+
+  asyncio.run(exercise())
+
+
+def test_different_skill_same_task_spawns_fresh(tmp_path: Path) -> None:
+  skills = tmp_path / "skills"
+  _write_operation(
+    skills, execution_class="node.implement", operation_name="filing-review",
+  )
+  _write_operation(
+    skills, execution_class="node.implement", operation_name="peer-review",
+  )
+  loader = SkillLoader(skills)
+  runner = _RegistryRunner()
+  handler = _handler(runner, loader=loader)
+  objective = "Review the filing evidence."
+
+  async def exercise() -> None:
+    first, first_error = await handler({
+      "operation": _operation_named(loader, "filing-review"),
+      "objective": objective,
+      "background": True,
+    })
+    second, second_error = await handler({
+      "operation": _operation_named(loader, "peer-review"),
+      "objective": objective,
+      "background": True,
+    })
+    assert first_error is None and second_error is None
+    assert first is not None and second is not None
+    assert first["task_id"] != second["task_id"]
+    assert len(runner.background_calls) == 2
+    assert len(runner._task_registry.list_tasks()) == 2
+    assert {entry.agent_name for entry in runner._task_registry.list_tasks()} == {
+      "filing-review",
+      "peer-review",
+    }
+
+  asyncio.run(exercise())
+
+
+async def _grant_requested_handles(
+  _root: ParentContext,
+  requested: frozenset[str],
+) -> frozenset[str]:
+  return requested
+
+
+def _handle_runner(tmp_path: Path) -> _RegistryRunner:
+  runner = _RegistryRunner()
+  runner._agent_session_log = AgentSessionLog(tmp_path / "agent-session.jsonl")
+  return runner
+
+
+def test_same_task_different_handles_spawns_fresh(tmp_path: Path) -> None:
+  loader = _write_operation(tmp_path / "skills", execution_class="node.implement")
+  runner = _handle_runner(tmp_path)
+  handler = _handler(
+    runner,
+    loader=loader,
+    workflow_handle_membership=_grant_requested_handles,
+  )
+  operation = _operation(loader)
+  objective = "Analyze the attached filing."
+
+  async def exercise() -> None:
+    first, first_error = await handler({
+      "operation": operation,
+      "objective": objective,
+      "background": True,
+      "handles": ["filing-a", "filing-b"],
+    })
+    second, second_error = await handler({
+      "operation": operation,
+      "objective": objective,
+      "background": True,
+      "handles": ["filing-b", "filing-a"],
+    })
+    assert first_error is None and second_error is None, (first_error, second_error)
+    assert first is not None and second is not None
+    assert first["task_id"] != second["task_id"]
+    assert len(runner.background_calls) == 2
+    assert len(runner._task_registry.list_tasks()) == 2
+    assert [entry.spawn_handles for entry in runner._task_registry.list_tasks()] == [
+      ("filing-a", "filing-b"),
+      ("filing-b", "filing-a"),
+    ]
+
+  asyncio.run(exercise())
+
+
+def test_same_task_same_handles_reuses_prior_child(tmp_path: Path) -> None:
+  loader = _write_operation(tmp_path / "skills", execution_class="node.implement")
+  runner = _handle_runner(tmp_path)
+  handler = _handler(
+    runner,
+    loader=loader,
+    workflow_handle_membership=_grant_requested_handles,
+  )
+  call = {
+    "operation": _operation(loader),
+    "objective": "Analyze the attached filing.",
+    "background": True,
+    "handles": ["filing-a", "filing-b"],
+  }
+
+  async def exercise() -> None:
+    first, first_error = await handler(call)
+    assert first_error is None and first is not None
+    entry = runner._task_registry.get(first["task_id"])
+    assert entry is not None
+    entry.state = TaskState.RUNNING
+    second, second_error = await handler(dict(call))
+    assert second_error is None
+    assert second == {
+      "task_id": first["task_id"],
+      "status": "running",
+      "agent": "filing-review",
+    }
+    assert len(runner.background_calls) == 1
+    assert len(runner._task_registry.list_tasks()) == 1
+
+  asyncio.run(exercise())
+
+
+def test_same_task_different_role_or_effort_spawns_fresh(tmp_path: Path) -> None:
+  loader = _write_operation(tmp_path, execution_class="node.implement")
+  runner = _RegistryRunner()
+  handler = _handler(runner, loader=loader)
+  operation = _operation(loader)
+  objective = "Review the filing evidence."
+
+  async def exercise() -> None:
+    omitted, omitted_error = await handler({
+      "operation": operation,
+      "objective": objective,
+      "background": True,
+    })
+    assert omitted_error is None and omitted is not None
+    # A different role must pass admission, not return the prior child. This
+    # resolver has no role tiers, so admission refuses the unknown role.
+    refused, refused_error = await handler({
+      "operation": operation,
+      "objective": objective,
+      "background": True,
+      "role": "analyst",
+    })
+    assert refused is None
+    assert refused_error is not None
+    assert refused_error["code"] == "capability_role_unknown"
+    assert len(runner.background_calls) == 1
+    low, low_error = await handler({
+      "operation": operation,
+      "objective": objective,
+      "background": True,
+      "effort": "low",
+    })
+    high, high_error = await handler({
+      "operation": operation,
+      "objective": objective,
+      "background": True,
+      "effort": "high",
+    })
+    assert low_error is None and high_error is None
+    assert low is not None and high is not None
+    assert len({omitted["task_id"], low["task_id"], high["task_id"]}) == 3
+    assert len(runner.background_calls) == 3
+    assert {(entry.spawn_role, entry.spawn_effort) for entry in runner._task_registry.list_tasks()} == {
+      (None, None),
+      (None, "low"),
+      (None, "high"),
+    }
+
+  asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+  ("context_key", "first_context", "second_context"),
+  [("ticker", "AAPL", "MSFT"), ("research_file_id", 42, 43)],
+)
+def test_same_objective_different_subject_context_spawns_fresh(
+  tmp_path: Path,
+  context_key: str,
+  first_context: str | int,
+  second_context: str | int,
+) -> None:
+  loader = _write_operation(
+    tmp_path, execution_class="node.implement", required_context=(context_key,),
+  )
+  runner = _RegistryRunner()
+  handler = _handler(runner, loader=loader)
+  call = {
+    "operation": _operation(loader),
+    "objective": "Review the filing evidence.",
+    "background": True,
+  }
+
+  async def exercise() -> None:
+    first, first_error = await handler({**call, context_key: first_context})
+    second, second_error = await handler({**call, context_key: second_context})
+    assert first_error is None and second_error is None
+    assert first is not None and second is not None
+    assert first["task_id"] != second["task_id"]
+    assert len(runner.background_calls) == 2
+    entries = runner._task_registry.list_tasks()
+    contexts = [
+      entry.spawn_ticker if context_key == "ticker" else entry.spawn_research_file_id
+      for entry in entries
+    ]
+    assert contexts == [first_context, second_context]
+
+  asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("prior_source", ["different_runner", "rebuilt", "no_runner_id"])
+def test_prior_turn_child_is_not_reused(
+  tmp_path: Path,
+  prior_source: str,
+) -> None:
+  loader = _write_operation(tmp_path / "skills", execution_class="node.implement")
+  runner = _narrative_registry_runner(tmp_path)
+  handler = _handler(runner, loader=loader)
+  call = {
+    "operation": _operation(loader),
+    "objective": "Review the filing evidence.",
+    "background": False,
+  }
+
+  async def exercise() -> None:
+    first, first_error = await handler(call)
+    assert first_error is None
+    first_envelope = AgentCompletionEnvelope.model_validate(first)
+    if prior_source == "rebuilt":
+      runner._task_registry = TaskRegistry()
+      runner._task_registry.load_from_events([
+        {**event, "event_schema_version": 2} for event in runner.durable_events
+      ])
+      entry = runner._task_registry.get(
+        runner.spawn_calls[0]["attempt"].physical_task_id,
+      )
+      assert entry is not None and entry.reconstructed_from_log
+      assert entry.spawn_owner_runner_id is None
+    if prior_source != "rebuilt":
+      runner._runner_id = "" if prior_source == "no_runner_id" else "next-turn-runner"
+    second, second_error = await handler(dict(call))
+    assert second_error is None and second is not None
+    assert len(runner.spawn_calls) == 2
+    assert runner.spawn_calls[0]["attempt"] != runner.spawn_calls[1]["attempt"]
+
+  asyncio.run(exercise())
+
+
+def test_failed_child_allows_identical_retry(tmp_path: Path) -> None:
+  loader = _write_operation(tmp_path / "skills", execution_class="node.implement")
+  runner = _narrative_registry_runner(tmp_path)
+  spawn_sub_agent = runner.spawn_sub_agent
+
+  async def fail_once(task: str, **kwargs: Any):
+    result, error = await spawn_sub_agent(task, **kwargs)
+    assert result is not None
+    if len(runner.spawn_calls) == 1:
+      result = result.model_copy(update={
+        "execution": ExecutionSettlement(
+          status="failed", terminal_reason="Transient provider failure.",
+        ),
+        "outcome": None,
+      })
+    return result, error
+
+  runner.spawn_sub_agent = fail_once
+  handler = _handler(runner, loader=loader)
+  call = {
+    "operation": _operation(loader),
+    "objective": "Review the filing evidence.",
+    "background": False,
+  }
+
+  async def exercise() -> None:
+    first, first_error = await handler(call)
+    assert first_error is None
+    first_envelope = AgentCompletionEnvelope.model_validate(first)
+    assert first_envelope.settlement_projection.execution_status == "failed"
+    second, second_error = await handler(dict(call))
+    assert second_error is None
+    second_envelope = AgentCompletionEnvelope.model_validate(second)
+    assert second_envelope.settlement_projection.execution_status == "succeeded"
+    assert first_envelope.message_id != second_envelope.message_id
+    assert len(runner.spawn_calls) == 2
+
+  asyncio.run(exercise())
+
+
+def test_concurrent_identical_foreground_calls_join_completion(tmp_path: Path) -> None:
+  loader = _write_operation(tmp_path / "skills", execution_class="node.implement")
+  runner = _narrative_registry_runner(tmp_path)
+  spawn_sub_agent = runner.spawn_sub_agent
+  started = asyncio.Event()
+  finish = asyncio.Event()
+
+  async def wait_for_finish(task: str, **kwargs: Any):
+    started.set()
+    await finish.wait()
+    return await spawn_sub_agent(task, **kwargs)
+
+  runner.spawn_sub_agent = wait_for_finish
+  handler = _handler(runner, loader=loader)
+  call = {
+    "operation": _operation(loader),
+    "objective": "Review the filing evidence.",
+    "background": False,
+  }
+
+  async def exercise() -> None:
+    first = asyncio.create_task(handler(call))
+    await started.wait()
+    second = asyncio.create_task(handler(dict(call)))
+    await asyncio.sleep(0)
+    assert not second.done()
+    finish.set()
+    outcomes = await asyncio.gather(first, second)
+    envelopes = []
+    for result, error in outcomes:
+      assert error is None
+      envelopes.append(AgentCompletionEnvelope.model_validate(result))
+    assert envelopes[0] == envelopes[1]
+    assert len(runner.spawn_calls) == 1
+    assert runner.background_calls == []
+
+  asyncio.run(exercise())
+
+
+def test_cancelled_background_registration_keeps_shielded_setup(tmp_path: Path) -> None:
+  loader = _write_operation(tmp_path, execution_class="node.implement")
+  runner = _RegistryRunner()
+  started = asyncio.Event()
+  finish = asyncio.Event()
+  setup_tasks: list[asyncio.Task[Any]] = []
+
+  async def register_background(
+    **kwargs: Any,
+  ) -> tuple[dict[str, JsonValue] | None, dict[str, JsonValue] | None]:
+    entry = runner._task_registry.get(kwargs["task_id_override"])
+    assert entry is not None
+
+    async def initialize() -> tuple[dict[str, JsonValue], None]:
+      started.set()
+      await finish.wait()
+      runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
+      return {"task_id": entry.task_id, "status": "running"}, None
+
+    setup = asyncio.create_task(initialize())
+    setup_tasks.append(setup)
+    entry.initialization_task = setup
+    return await asyncio.shield(setup)
+
+  runner._register_background_task = register_background
+  handler = _handler(runner, loader=loader)
+
+  async def exercise() -> None:
+    caller = asyncio.create_task(handler({
+      "operation": _operation(loader),
+      "objective": "Review the filing evidence.",
+      "background": True,
+    }))
+    await started.wait()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await caller
+    entries = runner._task_registry.list_tasks()
+    assert len(entries) == 1
+    finish.set()
+    await setup_tasks[0]
+    assert entries[0].state == TaskState.RUNNING
+
+  asyncio.run(exercise())
+
+
+def test_foreground_publication_failure_allows_identical_retry(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  import agent_gateway.sub_agent as sub_agent_mod
+
+  loader = _write_operation(tmp_path / "skills", execution_class="node.implement")
+  runner = _narrative_registry_runner(tmp_path)
+  publish = sub_agent_mod._publish_foreground_completion
+  publications = 0
+
+  async def publish_once_failed(**kwargs: Any):
+    nonlocal publications
+    publications += 1
+    if publications == 1:
+      raise OSError("temporary publication failure")
+    return await publish(**kwargs)
+
+  monkeypatch.setattr(sub_agent_mod, "_publish_foreground_completion", publish_once_failed)
+  handler = _handler(runner, loader=loader)
+  call = {
+    "operation": _operation(loader),
+    "objective": "Review the filing evidence.",
+    "background": False,
+  }
+
+  async def exercise() -> None:
+    first, first_error = await handler(call)
+    assert first is None and first_error is not None
+    assert first_error["code"] == "agent_completion_materialization_failed"
+    assert runner._task_registry.list_tasks() == []
+    second, second_error = await handler(dict(call))
+    assert second_error is None
+    AgentCompletionEnvelope.model_validate(second)
+    assert len(runner.spawn_calls) == 2
+
+  asyncio.run(exercise())
+
+
+def test_background_registration_error_releases_unstarted_claim(tmp_path: Path) -> None:
+  loader = _write_operation(tmp_path, execution_class="node.implement")
+  runner = _RegistryRunner()
+
+  async def register_failed(
+    **_kwargs: Any,
+  ) -> tuple[None, dict[str, JsonValue]]:
+    return None, {"code": "registration_failed", "message": "temporary failure"}
+
+  runner._register_background_task = register_failed
+  handler = _handler(runner, loader=loader)
+  result, error = asyncio.run(handler({
+    "operation": _operation(loader),
+    "objective": "Review the filing evidence.",
+    "background": True,
+  }))
+  assert result is None and error is not None
+  assert error["code"] == "registration_failed"
+  assert runner._task_registry.list_tasks() == []
+
+
+def test_background_registration_raise_releases_unstarted_claim(tmp_path: Path) -> None:
+  loader = _write_operation(tmp_path, execution_class="node.implement")
+  runner = _RegistryRunner()
+  attempts = 0
+
+  async def register_raises_once(
+    **kwargs: Any,
+  ) -> tuple[dict[str, JsonValue] | None, dict[str, JsonValue] | None]:
+    nonlocal attempts
+    attempts += 1
+    if attempts == 1:
+      raise RuntimeError("transient durable registration failure")
+    runner.background_calls.append(dict(kwargs))
+    return {"task_id": kwargs["task_id_override"], "status": "running"}, None
+
+  runner._register_background_task = register_raises_once
+  handler = _handler(runner, loader=loader)
+  call = {
+    "operation": _operation(loader),
+    "objective": "Review the filing evidence.",
+    "background": True,
+  }
+  with pytest.raises(RuntimeError, match="transient durable registration failure"):
+    asyncio.run(handler(dict(call)))
+  assert runner._task_registry.list_tasks() == []
+
+  result, error = asyncio.run(handler(dict(call)))
+  assert error is None
+  assert isinstance(result, dict)
+  assert result["status"] == "running"
+  assert attempts == 2
+  assert len(runner.background_calls) == 1
+
+
+def test_cancelled_background_registration_failed_setup_releases_unstarted_claim(
+  tmp_path: Path,
+) -> None:
+  loader = _write_operation(tmp_path, execution_class="node.implement")
+  runner = _RegistryRunner()
+  started = asyncio.Event()
+  fail_setup = asyncio.Event()
+  setup_tasks: list[asyncio.Task[Any]] = []
+  attempts = 0
+
+  async def register_background(
+    **kwargs: Any,
+  ) -> tuple[dict[str, JsonValue] | None, dict[str, JsonValue] | None]:
+    nonlocal attempts
+    attempts += 1
+    entry = runner._task_registry.get(kwargs["task_id_override"])
+    assert entry is not None
+    if attempts == 1:
+      async def initialize_and_fail() -> tuple[dict[str, JsonValue], None]:
+        started.set()
+        await fail_setup.wait()
+        raise RuntimeError("shielded setup failed after caller cancel")
+
+      setup = asyncio.create_task(initialize_and_fail())
+      setup_tasks.append(setup)
+      entry.initialization_task = setup
+      return await asyncio.shield(setup)
+
+    runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
+    runner.background_calls.append(dict(kwargs))
+    return {"task_id": entry.task_id, "status": "running"}, None
+
+  runner._register_background_task = register_background
+  handler = _handler(runner, loader=loader)
+  call = {
+    "operation": _operation(loader),
+    "objective": "Review the filing evidence.",
+    "background": True,
+  }
+
+  async def exercise() -> None:
+    caller = asyncio.create_task(handler(dict(call)))
+    await started.wait()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await caller
+    # While shielded setup is still pending, the claim remains reserved.
+    assert len(runner._task_registry.list_tasks()) == 1
+
+    # Once shielded setup fails without starting a worker, the done callback
+    # releases the unstarted claim so a retry registers afresh.
+    fail_setup.set()
+    with pytest.raises(RuntimeError, match="shielded setup failed after caller cancel"):
+      await setup_tasks[0]
+    await asyncio.sleep(0)
+    assert runner._task_registry.list_tasks() == []
+
+    result, error = await handler(dict(call))
+    assert error is None
+    assert isinstance(result, dict)
+    assert result["status"] == "running"
+    assert attempts == 2
+    assert len(runner.background_calls) == 1
+
+  asyncio.run(exercise())

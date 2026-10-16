@@ -245,7 +245,7 @@ def build_runs_router(
             else None
           ),
           selection_provenance=SelectionProvenance(
-            role="default",
+            role=None,
             role_source="spawn",
             effort_source="spawn",
             preset=None,

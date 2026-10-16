@@ -30,7 +30,8 @@ ahead of code), and selection skips it with `provider_unavailable`
 | --- | --- | --- |
 | `base.py` | `ModelProvider`, `ModelInfo`, `model_info_from_entry()` | Adapter contract; `ModelInfo` built from the registry entry, its `compat` and rate table |
 | `anthropic.py`, `anthropic_helpers.py` | `AnthropicProvider` | Messages API (`anthropic.messages` compat) |
-| `anthropic_oauth.py` | `resolve_anthropic_credentials()`, `select_anthropic_credential_source()`, `rotate_anthropic_credential_source()` | The Anthropic OAuth credential pool Risk and Investment also draw from |
+| `anthropic_oauth.py` | `resolve_anthropic_credentials()`, `select_anthropic_credential_source()`, `rotate_anthropic_credential_source()` | The Anthropic OAuth credential store and quota-aware selection Risk and Investment also draw from |
+| `anthropic_quota.py` | `rank_candidates()`, `load_selection_state()`, `parse_rate_limit_headers()`, `probe_usage_batch()` | Quota windows, usage parsing, the pure account ranker and the per-store `<store>.selection.json` sidecar (no credential membership or refresh) |
 | `openai.py`, `openai_responses_helpers.py` | `OpenAIProvider`, `responses_compat()` | Responses API (`openai.responses` compat) |
 | `codex.py`, `codex_helpers.py` | `CodexProvider` | Codex route over the Responses family |
 | `xai.py`, `xai_helpers.py`, `xai_oauth.py` | `XAIProvider` | xAI Responses route and its OAuth |
@@ -104,3 +105,51 @@ session reopen, or a completed consumer cutover. Mutable-pool rotation remains
 a separate consumer behavior described in the authentication reference: it is
 not an exact-generation lookup fallback and does not authorize replacing a
 frozen generation binding.
+
+## Anthropic quota-aware selection
+
+`anthropic_quota.py` owns the pure ranker and the per-store sidecar,
+`<store>.selection.json` (mode `0600`): per-account policy, quota windows,
+usage-probe backoff, scoped cooldowns and session affinity, never a secret. An
+account is addressed by an `AccountLocator` (the owning store path, or `env`,
+plus the account identity) whose opaque `acct_` id keys every row; membership in
+`anthropic_oauth.py` dedupes by locator, so a private and an org record with
+the same identity are distinct. A missing or unwritable sidecar never fails a
+request.
+
+`select_anthropic_credential_source(sources, *, now, placement, model,
+session_id)` ranks private before org, keeps one hour of warm affinity (recorded
+on success by `record_anthropic_success`), then orders by reserve, the 85%
+short-window guard, measured before unknown, priority, and weekly then
+short-window drain. A refresh failure cools the account down and re-ranks; with
+every account blocked the earliest-reset one binds. `rotate_anthropic_credential_source(sources,
+*, current, until, model, scope, reason)` records a scoped cooldown for the
+current account and ranks the siblings, with no fallback.
+`anthropic_credential_blocked_until()` answers from the same ranker. There is
+no process-local pool state: cooldowns are these sidecar rows. Refresh keeps the
+store-wide `_store_lock` flock protocol used by published gateways, with a bounded
+wait and the lock held across reread → exchange → guarded write. There is no
+separate per-account lock.
+
+`ModelProvider.prepare_credential(config, *, model, session_id)` (a no-op in
+`base.py`) runs only at episode-starting client builds: the first request of a
+turn, the rebuild after a model-fallback hop, the reactive-compaction rebuild
+and the compaction summarizer. A same-model transient retry keeps its binding;
+rotated material is not re-prepared. Affinity uses the durable conversation
+identity (`undo_token_lifetime.conversation_id`), so resume keeps warm affinity;
+sub-agents use their own id. `AnthropicProvider` overrides preparation: an automatic
+resolver-issued `credential_source` is an affinity hint and re-ranks the pool;
+an exact one is honoured. It probes stale subscription
+accounts (`probe_usage_batch`; direct `api.anthropic.com` only, 2 s and four
+concurrent requests; a 401/403 makes telemetry unavailable for an hour and never
+parks inference) and `stream` ingests `anthropic-ratelimit-unified-*` headers on
+success and on a failure that carries a response.
+`AnthropicProvider.classify_credential_failure` parks a quota 429 for its scope
+(`limit_scope`, shared or a model family) until its reset; a concurrency 429 or
+a 529 backs off without parking; any other 403 keeps `billing`.
+
+Operators set policy with `python3 -m agent_gateway.cli auth policy anthropic
+--identity ACCOUNT [--user N|--store PATH] (--priority INT --reserve-pct FLOAT |
+--reset)` and read the cached view with `auth list anthropic --usage`. Mechanism
+and rules: `docs/reference/provider-authentication-and-token-methods.md`;
+design: `docs/design/anthropic-quota-aware-account-selection-spec.md`.

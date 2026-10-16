@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 import httpx
 
+from ..auth import derive_auth_mechanism_and_entitlement
 from .api_key_store import resolve_api_key_store_paths
 from .credential_pool import (
   PoolAccountCandidate,
@@ -87,7 +88,7 @@ def resolve_muse_pool_candidates(
   seen_paths: set[Path] = set()
   seen: set[str] = set()
   for index in (0, 1):
-    for auth_mode, path in (("oauth", subscription_paths[index]), ("api", api_paths[index])):
+    for path in (subscription_paths[index], api_paths[index]):
       if path is None or path in seen_paths:
         continue
       seen_paths.add(path)
@@ -95,10 +96,17 @@ def resolve_muse_pool_candidates(
         key = str(record["identity"])
         if key not in seen:
           seen.add(key)
+          is_user_store = index == 0
+          is_sub = str(record.get("source") or "").strip().lower() == "subscription"
+          cand_auth_mode = "oauth" if is_sub else "api"
+          cand_mechanism, cand_entitlement = derive_auth_mechanism_and_entitlement(
+            {**record, "provider": "muse"}, is_user_store=is_user_store,
+          )
           candidates.append(PoolAccountCandidate(
             provider="muse", key=key, record=record,
-            store_path=path, is_user_store=index == 0,
-            auth_mode="oauth" if record.get("source") == "subscription" else auth_mode,
+            store_path=path, is_user_store=is_user_store,
+            auth_mode=cand_auth_mode, auth_mechanism=cand_mechanism,
+            entitlement_kind=cand_entitlement,
           ))
   for name in ("MUSE_API_KEY", "META_API_KEY"):
     token = str(env.get(name) or "").strip()
@@ -110,6 +118,7 @@ def resolve_muse_pool_candidates(
         seen.add(key)
         candidates.append(PoolAccountCandidate(
           provider="muse", key=key, record=record, auth_mode="api",
+          auth_mechanism="api_key", entitlement_kind="org_commercial",
         ))
   return candidates, None
 
@@ -120,6 +129,7 @@ def _materialize_muse_candidate(
   materialized = dict(config)
   materialized.update(
     auth_mode=selected.auth_mode, api_key=selected.token,
+    auth_mechanism=selected.auth_mechanism, entitlement_kind=selected.entitlement_kind,
     account_identity=selected.account_identity,
     auth_user_scope=normalize_user_scope(config.get("auth_user_scope")),
     auth_token="", auth_store_path=str(selected.store_path or ""), api_key_store_path="",

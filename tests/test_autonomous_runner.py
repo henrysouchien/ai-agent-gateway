@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from itertools import count
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
@@ -1533,6 +1534,112 @@ def test_autonomous_start_keeps_approval_store_parent_only_and_inherits_channel(
   assert str(approval_store_path) not in json.dumps(env, sort_keys=True)
 
 
+_APPROVED_CONTINUATION = {
+  "approval_id": "approval-1", "job_id": "bg_7", "tool_call_id": "call-original",
+  "nonce": "nonce-1", "tenant_storage_id": USER_ID, "tool_name": "native_write",
+  "decision": "approved", "claim_token": "claim-1", "decision_state_version": 1,
+}
+
+
+@pytest.mark.parametrize("failure", ["claim_refused", "spawn_failed"])
+def test_autonomous_start_failure_before_credentials_never_commits_the_claim(
+  monkeypatch,
+  tmp_path,
+  failure: str,
+) -> None:
+  from agent_gateway import autonomous_runner
+  from agent_gateway.approval_store import ApprovalExecutableBindingError
+  from agent_gateway.control_plane import autonomous_approval_delivery
+
+  processes: list[SlowFakeProcess] = []
+  claims: list[dict[str, object]] = []
+
+  async def fake_exec(*args, **kwargs):
+    _ = args, kwargs
+    if failure == "spawn_failed":
+      raise OSError("boom")
+    processes.append(SlowFakeProcess())
+    return processes[0]
+
+  async def claim(*, store, continuation):
+    _ = store
+    claims.append(dict(continuation))
+    raise ApprovalExecutableBindingError("execution_outcome_unknown")
+
+  monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
+  monkeypatch.setattr(
+    autonomous_approval_delivery, "claim_continued_executable_attempt", claim,
+  )
+  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+  _write_manifest(tmp_path, control_run_id="run-source", state="interrupted")
+  registry = _registry(tmp_path)
+
+  async def attempt() -> None:
+    await registry.start(
+      role="owner", profile="analyst", mode="task", task="resume",
+      user_id=USER_ID, user_email=USER_EMAIL,
+      resumed_from="run-source", approval_continuation=dict(_APPROVED_CONTINUATION),
+    )
+
+  expected = (
+    ApprovalExecutableBindingError if failure == "claim_refused" else RuntimeError
+  )
+  with pytest.raises(expected):
+    asyncio.run(attempt())
+  # The approved call's one attempt is committed only where the spawned child
+  # could next run it, after which no start failure may hand it back.
+  if failure == "spawn_failed":
+    assert claims == []
+  else:
+    assert len(claims) == 1
+    assert bytes(processes[0].stdin.buffer) == b""
+  assert set(registry._tasks) == {"bg_0"}
+
+
+def test_autonomous_start_commits_the_claim_before_the_child_holds_credentials(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from agent_gateway import autonomous_runner
+  from agent_gateway.control_plane import autonomous_approval_delivery
+
+  processes: list[SlowFakeProcess] = []
+  credentials_at_claim: list[bytes] = []
+
+  async def fake_exec(*args, **kwargs):
+    _ = args, kwargs
+    processes.append(SlowFakeProcess())
+    return processes[0]
+
+  async def claim(*, store, continuation):
+    _ = store
+    assert continuation["claim_token"] == "claim-1"
+    credentials_at_claim.append(bytes(processes[0].stdin.buffer))
+
+  monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
+  monkeypatch.setattr(
+    autonomous_approval_delivery, "claim_continued_executable_attempt", claim,
+  )
+  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+  _write_manifest(tmp_path, control_run_id="run-source", state="interrupted")
+  registry = _registry(tmp_path)
+
+  async def launch() -> None:
+    payload = await registry.start(
+      role="owner", profile="analyst", mode="task", task="resume",
+      user_id=USER_ID, user_email=USER_EMAIL,
+      resumed_from="run-source", approval_continuation=dict(_APPROVED_CONTINUATION),
+    )
+    try:
+      assert credentials_at_claim == [b""]
+      assert bytes(processes[0].stdin.buffer) != b""
+    finally:
+      await registry.cancel(payload["task_id"])
+      await registry.shutdown(grace_sec=0.1)
+
+  asyncio.run(launch())
+
+
 def test_autonomous_start_signs_exact_session_authority_only(
   monkeypatch,
   tmp_path,
@@ -1767,6 +1874,7 @@ def test_autonomous_start_signs_exact_executable_workload(
   admitted_limits = workload_receipt.pop(
     "admitted_skill_execution_limits"
   )
+  assert workload_receipt.pop("approval_continuation") is None
   assert workload_receipt == expected_workload
   assert admitted_limits == (
     {"max_tokens": None}
@@ -2825,6 +2933,118 @@ def test_manifest_records_tool_surface_the_child_declared_and_rehydrates_it(tmp_
   }
 
 
+def test_manifest_records_union_of_pack_skill_tool_surfaces(tmp_path) -> None:
+  _write_manifest(tmp_path, "bg_8", state="blocked", exit_code=0, error="x", completed_at=200.0)
+  registry = _registry(tmp_path)
+  record = registry._tasks["bg_8"]
+  skill_a = {
+    "type": "tool_surface_declared",
+    "active_servers": ["s1"],
+    "allowed_mcp_tools_by_server": {"s1": ["t1"]},
+    "allowed_tools": ["t1"],
+    "visible_tool_names": ["a", "b", "c"],
+    "visible_tool_count": 3,
+  }
+  skill_b = {
+    "type": "tool_surface_declared",
+    "active_servers": ["s1", "s2"],
+    "allowed_mcp_tools_by_server": {"s1": ["t1"], "s2": ["t2"]},
+    "allowed_tools": ["t1", "t2"],
+    "visible_tool_names": ["b", "c", "d", "e"],
+    "visible_tool_count": 4,
+  }
+
+  registry._record_tool_surface(record, skill_a)
+  registry._record_tool_surface(record, skill_b)
+  registry._record_tool_surface(record, skill_b)
+
+  manifest = _read_manifest(tmp_path, "bg_8")
+  assert "s2" in manifest["active_servers"]
+  assert manifest["active_servers"] == ["s1", "s2"]
+  assert manifest["allowed_mcp_tools_by_server"] == {
+    "s1": ["t1"],
+    "s2": ["t2"],
+  }
+  assert "t2" in manifest["allowed_tools"]
+  assert manifest["allowed_tools"] == ["t1", "t2"]
+  assert manifest["visible_tool_names"] == ["a", "b", "c", "d", "e"]
+  assert manifest["visible_tool_count"] == 5
+  assert "type" not in manifest
+
+
+def test_manifest_unions_disjoint_visible_tool_names(tmp_path) -> None:
+  _write_manifest(tmp_path, "bg_8", state="blocked", exit_code=0, error="x", completed_at=200.0)
+  registry = _registry(tmp_path)
+  record = registry._tasks["bg_8"]
+  skill_a = {
+    "type": "tool_surface_declared",
+    "active_servers": ["s1"],
+    "visible_tool_names": ["a"],
+    "visible_tool_count": 1,
+  }
+  skill_b = {
+    "type": "tool_surface_declared",
+    "active_servers": ["s1"],
+    "visible_tool_names": ["b"],
+    "visible_tool_count": 1,
+  }
+
+  registry._record_tool_surface(record, skill_a)
+  registry._record_tool_surface(record, skill_b)
+
+  manifest = _read_manifest(tmp_path, "bg_8")
+  assert manifest["visible_tool_names"] == ["a", "b"]
+  assert manifest["visible_tool_count"] == 2
+
+
+@pytest.mark.parametrize("legacy_first", [False, True])
+def test_manifest_discards_visible_tool_names_after_legacy_declaration(tmp_path, legacy_first) -> None:
+  _write_manifest(tmp_path, "bg_8", state="blocked", exit_code=0, error="x", completed_at=200.0)
+  registry = _registry(tmp_path)
+  record = registry._tasks["bg_8"]
+  named_a = {"visible_tool_names": ["a"], "visible_tool_count": 1}
+  legacy = {"visible_tool_count": 1}
+  named_c = {"visible_tool_names": ["c"], "visible_tool_count": 1}
+  declarations = [legacy, named_a, named_c] if legacy_first else [named_a, legacy, named_c]
+
+  for declaration in declarations:
+    registry._record_tool_surface(record, {"type": "tool_surface_declared", **declaration})
+
+  assert record.tool_surface == {"visible_tool_count": 1}
+  manifest = _read_manifest(tmp_path, "bg_8")
+  assert manifest.get("visible_tool_names") is None
+  assert manifest["visible_tool_count"] == 1
+  assert _registry(tmp_path)._tasks["bg_8"].tool_surface == {"visible_tool_count": 1}
+
+
+def test_manifest_omits_allowed_tools_when_a_pack_skill_declares_no_ceiling(tmp_path) -> None:
+  _write_manifest(tmp_path, "bg_8", state="blocked", exit_code=0, error="x", completed_at=200.0)
+  registry = _registry(tmp_path)
+  record = registry._tasks["bg_8"]
+  skill_a = {
+    "type": "tool_surface_declared",
+    "active_servers": ["s1"],
+    "allowed_mcp_tools_by_server": {"s1": ["t1"]},
+    "visible_tool_count": 3,
+  }
+  skill_b = {
+    "type": "tool_surface_declared",
+    "active_servers": ["s1", "s2"],
+    "allowed_mcp_tools_by_server": {"s1": ["t1"], "s2": ["t2"]},
+    "visible_tool_count": 5,
+  }
+
+  registry._record_tool_surface(record, skill_a)
+  registry._record_tool_surface(record, skill_b)
+
+  manifest = _read_manifest(tmp_path, "bg_8")
+  assert "s2" in manifest["active_servers"]
+  assert manifest["active_servers"] == ["s1", "s2"]
+  assert manifest.get("allowed_tools") is None
+  assert manifest.get("allowed_tools") != []
+  assert "allowed_tools" not in (record.tool_surface or {})
+  assert manifest["visible_tool_count"] == 5
+
 def test_manifest_without_tool_surface_fields_rehydrates_with_none(tmp_path) -> None:
   _write_manifest(tmp_path, "bg_8", state="blocked", exit_code=0, error="x", completed_at=200.0)
 
@@ -3529,6 +3749,8 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
         "completed_at",
         "resumed_from",
         "resumed_as",
+        "approval_continuation",
+        "resumed_approval_id",
         "schedule_id",
         "schedule_name",
         "capability_bind",
@@ -3536,6 +3758,7 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
         "active_servers",
         "allowed_mcp_tools_by_server",
         "allowed_tools",
+        "visible_tool_names",
         "visible_tool_count",
       }
       assert manifest["manifest_version"] == 8
@@ -3543,6 +3766,7 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
       assert manifest["allowed_mcp_tools_by_server"] is None
       assert manifest["allowed_tools"] is None
       assert manifest["visible_tool_count"] is None
+      assert manifest["visible_tool_names"] is None
       assert manifest["autonomous_in_flight_at_start"] == 1
       assert type(manifest["credential_handoff_bytes"]) is int
       assert manifest["credential_handoff_bytes"] > 0
@@ -3606,6 +3830,8 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
       assert manifest["completed_at"] is None
       assert manifest["resumed_from"] is None
       assert manifest["resumed_as"] == []
+      assert manifest["approval_continuation"] is None
+      assert manifest["resumed_approval_id"] is None
       assert manifest["schedule_id"] is None
       assert manifest["schedule_name"] is None
       assert manifest["capability_bind"] == _test_capability_bind(
@@ -5252,7 +5478,6 @@ def test_autonomous_skill_start_seals_session_authority_from_admitted_identity(
     AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
     verify_autonomous_launch_envelope,
   )
-  from agent_gateway.child_environment import AUTONOMOUS_CHILD_ENVIRONMENT
   from agent_gateway.containment_settings import ContainmentSettings
   from agent_workflow_contracts import ResolvedAuthority
   from agent_workflow_contracts.models import (
@@ -5306,9 +5531,7 @@ def test_autonomous_skill_start_seals_session_authority_from_admitted_identity(
           operation_name="risk.scan",
           grant=ToolGrant(grant_id="grant-admitted", tools=(), digest="sha256:" + "0" * 64),
         ),
-        placement="local_stub",
         containment=ContainmentSettings(),
-        env_contract=AUTONOMOUS_CHILD_ENVIRONMENT,
         env_names=request.env_names,
         frozen_bind=binding.bind,
         identity=AdmittedChildIdentity(
@@ -6465,6 +6688,331 @@ def test_autonomous_cancel_survives_process_group_signal_failure(
     await registry.shutdown(grace_sec=0.1)
 
   asyncio.run(_case())
+
+
+def _private_group_record(proc: subprocess.Popen):
+  from types import SimpleNamespace
+  from typing import Any, cast
+
+  return cast(Any, SimpleNamespace(
+    proc=proc,
+    process_group_pid=proc.pid,
+    process_group_id=proc.pid,
+  ))
+
+
+@pytest.mark.skipif(
+  sys.platform != "darwin",
+  reason="killpg on an all-zombie group is EPERM only on Darwin (Linux returns 0)",
+)
+def test_signal_owned_process_group_treats_all_zombie_group_eperm_as_no_live_member(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  """Darwin killpg returns EPERM on a same-uid private group whose only
+  member is an exited-but-unreaped leader (XNU skips zombies in the group
+  walk). That is the sentinel-zombie window before asyncio's returncode
+  catches up: no live member remains, so it is not a signalling failure."""
+  from agent_gateway import autonomous_runner
+  from agent_gateway import autonomous_runner_start
+
+  proc = subprocess.Popen(
+    [sys.executable, "-c", "pass"],
+    start_new_session=True,
+  )
+  pgid = proc.pid
+  try:
+    # Confirm the leader is a zombie without reaping it, so proc.returncode
+    # stays None exactly as asyncio's lagging returncode does in production.
+    deadline = time.monotonic() + 10
+    while os.waitid(
+      os.P_PID,
+      pgid,
+      os.WEXITED | os.WNOHANG | os.WNOWAIT,
+    ) is None:
+      assert time.monotonic() < deadline, "leader did not exit"
+      time.sleep(0.01)
+    assert proc.returncode is None
+    # The kernel really does refuse to signal the all-zombie group.
+    with pytest.raises(PermissionError):
+      os.killpg(pgid, 0)
+
+    # Staged race: the live-group lookup in _signal_owned_process_group
+    # succeeded while the sentinel was still alive; the cross-check lookup
+    # after EPERM is the real getpgid (ESRCH on a Darwin zombie leader).
+    lookups = {"count": 0}
+
+    def lookup_succeeds_once_then_real(pid: int) -> int:
+      lookups["count"] += 1
+      if lookups["count"] == 1:
+        return pgid
+      return os.getpgid(pid)
+
+    monkeypatch.setattr(
+      autonomous_runner,
+      "_get_process_group_id",
+      lookup_succeeds_once_then_real,
+    )
+    monkeypatch.setattr(
+      autonomous_runner,
+      "_signal_process_group",
+      autonomous_runner_start._signal_process_group,
+    )
+    registry = _registry(tmp_path)
+
+    assert registry._signal_owned_process_group(
+      _private_group_record(proc),
+      signal.SIGTERM,
+    ) is False
+    assert lookups["count"] == 2
+  finally:
+    proc.wait(timeout=5)
+  with pytest.raises(ProcessLookupError):
+    os.killpg(pgid, 0)
+
+
+def test_signal_owned_process_group_live_leader_permission_error_stays_loud(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  """EPERM while the leader is still live is a genuine signalling failure:
+  the cross-check must not downgrade it to 'no live member'."""
+  from agent_gateway import autonomous_runner
+  from agent_gateway import autonomous_runner_start
+
+  def eperm_killpg(process_group_id: int, signal_number: int) -> None:
+    _ = process_group_id, signal_number
+    raise PermissionError(1, "Operation not permitted")
+
+  proc = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(60)"],
+    start_new_session=True,
+  )
+  try:
+    monkeypatch.setattr(
+      autonomous_runner,
+      "_get_process_group_id",
+      autonomous_runner_start._get_process_group_id,
+    )
+    monkeypatch.setattr(autonomous_runner, "_signal_process_group", eperm_killpg)
+    registry = _registry(tmp_path)
+
+    with pytest.raises(RuntimeError, match="signal failed.*Operation not permitted"):
+      registry._signal_owned_process_group(
+        _private_group_record(proc),
+        signal.SIGTERM,
+      )
+  finally:
+    proc.kill()
+    proc.wait(timeout=5)
+
+
+@pytest.mark.skipif(
+  sys.platform != "darwin",
+  reason="killpg on an all-zombie group is EPERM only on Darwin (Linux returns 0)",
+)
+def test_sentinel_startup_death_cleanup_is_terminal_and_leak_free(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  import errno
+  import select
+
+  from agent_gateway import autonomous_runner
+  from agent_gateway import autonomous_runner_start
+  from agent_gateway.autonomous_credential_handoff import (
+    AUTONOMOUS_CREDENTIAL_HANDOFF_ENV,
+    AUTONOMOUS_CREDENTIAL_HANDOFF_STDIN,
+    encode_autonomous_credential_handoff,
+  )
+  from agent_gateway.capability_execution import MaterializedCredential
+
+  handoff = encode_autonomous_credential_handoff(MaterializedCredential(
+    handle=_test_service_credential_handle(),
+    auth_config={
+      "provider": "anthropic",
+      "billing_mode": "byok",
+      "api_key": "startup-death-test-credential",
+    },
+  ))
+  grandchild_pid_path = tmp_path / "startup-death-grandchild.pid"
+  target_source = """
+import os
+from pathlib import Path
+import sys
+import time
+
+grandchild_source = (
+    "import os, pathlib, sys, time; "
+    "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+    "time.sleep(60)"
+)
+if os.fork() == 0:
+    null_fd = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(null_fd, fd)
+    os.close(null_fd)
+    os.execl(sys.executable, sys.executable, "-c", grandchild_source, sys.argv[1])
+pid_path = Path(sys.argv[1])
+deadline = time.monotonic() + 5
+while not pid_path.exists() or not pid_path.read_text():
+    if time.monotonic() >= deadline:
+        raise RuntimeError("grandchild did not publish its pid")
+    time.sleep(0.01)
+# Deliberately never read the credential handoff from stdin.
+sys.exit(3)
+"""
+  event_read, event_write = os.pipe()
+  claim_read, claim_write = os.pipe()
+  owner_read, owner_write = os.pipe()
+  lease_fd = os.open(
+    tmp_path / "startup-death.lease",
+    os.O_RDWR | os.O_CREAT | os.O_EXCL,
+    0o600,
+  )
+  env = dict(os.environ)
+  env[AUTONOMOUS_CREDENTIAL_HANDOFF_ENV] = AUTONOMOUS_CREDENTIAL_HANDOFF_STDIN
+  env["AGENT_AUTONOMOUS_EVENT_CHANNEL_FD"] = str(event_write)
+  env["AGENT_AUTONOMOUS_CLAIM_BROKER_FD"] = str(claim_write)
+  package_dir = Path(__file__).resolve().parents[1]
+  env["PYTHONPATH"] = os.pathsep.join(
+    [str(package_dir), env.get("PYTHONPATH", "")]
+  ).rstrip(os.pathsep)
+  proc = None
+  grandchild_pid = None
+  try:
+    with (tmp_path / "startup-death.log").open("wb") as log_handle:
+      proc = subprocess.Popen(
+        [
+          sys.executable,
+          "-c",
+          autonomous_runner_start._OWNED_PROCESS_SENTINEL_SOURCE,
+          str(autonomous_runner_start._CHILD_OUTPUT_LINE_MAX_BYTES),
+          str(owner_read),
+          str(lease_fd),
+          "0.01",
+          sys.executable,
+          "-c",
+          target_source,
+          str(grandchild_pid_path),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=log_handle,
+        stderr=subprocess.PIPE,
+        env=env,
+        pass_fds=(event_write, claim_write, owner_read, lease_fd),
+        start_new_session=True,
+      )
+      assert proc.stdin is not None
+      proc.stdin.write(handoff)
+      proc.stdin.close()
+      assert proc.stderr is not None
+      assert select.select([proc.stderr], [], [], 10)[0], "sentinel did not report exit"
+      assert json.loads(proc.stderr.readline()) == {
+        "kind": "exited",
+        "returncode": 3,
+        "version": 1,
+      }
+      grandchild_pid = int(grandchild_pid_path.read_text())
+      assert proc.returncode is None
+      os.kill(grandchild_pid, 0)
+
+      registry = _registry(tmp_path)
+      record = _private_group_record(proc)
+      record.process_group_pid = None
+      record.process_group_id = None
+      registry._claim_owned_process_group(record)
+      pgid = proc.pid
+      assert record.process_group_pid == record.process_group_id == pgid
+
+      real_signal_process_group = autonomous_runner_start._signal_process_group
+      lookups = 0
+      signal_errnos = []
+
+      def lookup_then_close_lifeline(pid: int) -> int:
+        nonlocal owner_write, lookups
+        genuine_pgid = os.getpgid(pid)
+        lookups += 1
+        if lookups == 1:
+          assert owner_write is not None
+          os.close(owner_write)
+          owner_write = None
+          deadline = time.monotonic() + 5
+          while os.waitid(
+            os.P_PID,
+            pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+          ) is None:
+            assert time.monotonic() < deadline, "sentinel did not become a zombie"
+            time.sleep(0.01)
+          assert proc.returncode is None
+        return genuine_pgid
+
+      def record_real_signal_errno(process_group_id: int, signal_number: int) -> None:
+        try:
+          real_signal_process_group(process_group_id, signal_number)
+        except PermissionError as exc:
+          signal_errnos.append(exc.errno)
+          raise
+
+      # Schedule event-loop lag between the genuine lookup and signal, closing
+      # the lifeline first as _terminate_owned_process does. No syscall result
+      # is fabricated: the unstaged race measured 0/40 on this host.
+      # The autouse fixture passes real pids through, but its runner overrides
+      # mask start-module patches; replace both with these call-through wrappers.
+      for module in (autonomous_runner_start, autonomous_runner):
+        monkeypatch.setattr(module, "_get_process_group_id", lookup_then_close_lifeline)
+        monkeypatch.setattr(module, "_signal_process_group", record_real_signal_errno)
+
+      assert registry._signal_owned_process_group(record, signal.SIGKILL) is False
+      assert signal_errnos == [errno.EPERM]
+      # monitor_owner -> terminate_owned_group self-kills the sentinel with
+      # SIGKILL after its grace period (autonomous_runner_start.py:444-473).
+      assert proc.wait(timeout=5) == -signal.SIGKILL
+      deadline = time.monotonic() + 5
+      while True:
+        try:
+          os.kill(grandchild_pid, 0)
+        except ProcessLookupError:
+          break
+        assert time.monotonic() < deadline, "owned grandchild survived cleanup"
+        time.sleep(0.01)
+      with pytest.raises(ProcessLookupError):
+        os.killpg(pgid, 0)
+  finally:
+    if owner_write is not None:
+      os.close(owner_write)
+    try:
+      if proc is not None:
+        try:
+          os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+          pass
+      if grandchild_pid is None and grandchild_pid_path.exists():
+        raw_pid = grandchild_pid_path.read_text()
+        if raw_pid:
+          grandchild_pid = int(raw_pid)
+      if grandchild_pid is not None:
+        try:
+          os.kill(grandchild_pid, signal.SIGKILL)
+        except ProcessLookupError:
+          pass
+      if proc is not None:
+        try:
+          proc.kill()
+        except ProcessLookupError:
+          pass
+        proc.wait(timeout=5)
+    finally:
+      if proc is not None:
+        for stream in (proc.stdin, proc.stderr):
+          if stream is not None:
+            stream.close()
+      for fd in (event_read, event_write, claim_read, claim_write, owner_read, lease_fd):
+        try:
+          os.close(fd)
+        except OSError:
+          pass
 
 
 def test_user_revocation_terminates_runs_and_disables_schedules(

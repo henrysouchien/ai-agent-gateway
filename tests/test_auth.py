@@ -49,6 +49,8 @@ def test_auth_config_round_trips_and_preserves_all_fields() -> None:
   assert config.provider == "anthropic"
   assert config.billing_mode == "byok"
   assert config.max_tokens == 16000
+  assert config.auth_mechanism == "oauth_bearer"
+  assert config.entitlement_kind == "operator_personal_subscription"
   assert config._raw["auth_mode"] == "oauth"
   assert config._raw["base_url"] == "https://example.test"
   assert config._raw["compat"] == {"beta": True}
@@ -250,7 +252,6 @@ def test_auth_exceptions_have_actionable_default_messages() -> None:
 @pytest.mark.parametrize(
   ("message", "kind"),
   [
-    ("429 Too Many Requests: rate limit exceeded", "rate_limit"),
     ("401 Unauthorized: invalid api key", "auth"),
     ("403 PermissionDeniedError: billing quota exhausted", "billing"),
     ("insufficient_quota: exceeded your current quota", "billing"),
@@ -269,6 +270,17 @@ def test_provider_classifies_credential_refresh_failures(message: str, kind: str
   assert failure.provider == "anthropic"
   assert failure.kind == kind
   assert failure.retryable_with_new_credentials is True
+
+
+@pytest.mark.parametrize(
+  "message",
+  [
+    "429 Too Many Requests: rate limit exceeded",
+    "529 Overloaded: overloaded_error",
+  ],
+)
+def test_provider_backs_off_instead_of_rotating_on_a_bare_429_or_529(message: str) -> None:
+  assert AnthropicProvider().classify_credential_failure(RuntimeError(message)) is None
 
 
 def test_anthropic_api_usage_limits_400_parses_regain_access_reset_timestamp() -> None:

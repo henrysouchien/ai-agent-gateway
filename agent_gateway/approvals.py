@@ -267,7 +267,11 @@ async def _record_vote_and_unblock_locked(
     )
     pending_entry["allow_tool_type"] = effective_allow
     pending_entry["status"] = "approval_received"
-    await approval_queue.put({"approved": approved, "allow_tool_type": effective_allow})
+    await approval_queue.put({
+      "approved": approved,
+      "allow_tool_type": effective_allow,
+      **({"reason": reason} if reason is not None else {}),
+    })
     return {"status": "ok"}
 
   if store is None or policy is None:

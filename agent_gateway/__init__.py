@@ -100,11 +100,11 @@ if TYPE_CHECKING:
     COMMERCIAL_CLAIM_HEADER,
     COMMERCIAL_WORK_AUTHORIZATION_HEADER,
     CommercialWorkStartContext,
+    CommercialWorkStartError,
     CommercialWorkStartFacts,
     PendingCommercialWorkStart,
   )
   from .commercial_work_start import (
-    CommercialWorkStartError,
     CommercialWorkStartGate,
   )
   from .context_builder import Message, SessionContextBuilder
@@ -336,7 +336,7 @@ _EXPORTS = {
   "COMMERCIAL_CLAIM_HEADER": ("agent_gateway.commercial_work_start", "COMMERCIAL_CLAIM_HEADER"),
   "COMMERCIAL_WORK_AUTHORIZATION_HEADER": ("agent_gateway.commercial_work_start", "COMMERCIAL_WORK_AUTHORIZATION_HEADER"),
   "CommercialWorkStartContext": ("agent_gateway.commercial_work_start", "CommercialWorkStartContext"),
-  "CommercialWorkStartError": ("agent_gateway.commercial_work_start", "CommercialWorkStartError"),
+  "CommercialWorkStartError": ("hank_contracts.commercial_work", "CommercialWorkStartError"),
   "CommercialWorkStartFacts": ("agent_gateway.commercial_work_start", "CommercialWorkStartFacts"),
   "CommercialWorkStartGate": ("agent_gateway.commercial_work_start", "CommercialWorkStartGate"),
   "PendingCommercialWorkStart": ("agent_gateway.commercial_work_start", "PendingCommercialWorkStart"),

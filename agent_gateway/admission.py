@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
-from typing import Any, Generic, Literal, Protocol, TypeVar, cast, overload
+from typing import Any, Generic, Literal, Protocol, TypeVar, cast, get_args, overload
 from types import MappingProxyType
 from uuid import uuid4
 
@@ -36,6 +36,7 @@ from agent_workflow_contracts.models import (
   SelectionProvenance,
 )
 from model_authority.bind import CapabilityBind
+from model_authority.binding import RunMode
 from pydantic import JsonValue
 from model_authority.selection import SelectionSnapshot
 
@@ -52,7 +53,7 @@ from .approval_route import (
   route_policy,
   session_approval_route,
 )
-from .child_environment import CHILD_ENVIRONMENT_ALLOWLISTS
+from .child_environment import AUTONOMOUS_CHILD_ENVIRONMENT, CHILD_ENVIRONMENT_ALLOWLISTS
 from .containment_settings import ContainmentSettings
 from .policy_imports import require_inherited_role, role_denied_tools_for_session
 from .role_validation import require_exact_role
@@ -430,13 +431,8 @@ class AdmissionOwners:
     [frozenset[str]],
     ResolvedAuthority | OperationUnavailable,
   ]
-  # The executor backend's facts: where the job runs and the
-  # ``child_environment`` purpose of its launch contract (``None``: the
-  # backend launches no process, so nothing is projected).
-  placement: Placement
   # The process's containment bounds; ``_admit_spawn`` reads the spawn depth.
   containment: ContainmentSettings
-  env_contract: str | None = None
   env_names: frozenset[str] = frozenset()
   outputs: frozenset[str] = frozenset()
   frozen_bind: CapabilityBind | None = None
@@ -456,8 +452,6 @@ class ContinuationOwners:
 
   task: AdmittedTask
   research_binding: AdmittedResearchBinding
-  placement: Placement = "in_process"
-  env_contract: str | None = None
   env_names: frozenset[str] = frozenset()
 
 
@@ -715,21 +709,20 @@ def _admit_spawn(
       selection_snapshot=selection_snapshot,
     )
   )
+  placement = _placement_for_run_mode(capability_bind.run_mode)
+  env_projection = _environment_projection(placement, owners.env_names)
   if owners.frozen_bind is not None:
     selection_provenance = None
   else:
     parent_provenance = parent.selection_provenance
-    effective_role = requested_role
-    if effective_role is None and parent_provenance is not None:
-      effective_role = parent_provenance.role
-    if effective_role is None and selection_snapshot is not None:
-      slot_defaults = selection_snapshot.frozen_slot(registration.execution_class)
-      if slot_defaults.default.kind == "tier" and slot_defaults.default.tier is not None:
-        effective_role = slot_defaults.default.tier
-    if effective_role is None:
-      effective_role = "default"
+    recorded_role = _tier_selected_for_bind(
+      requested_role,
+      owners.capability_execution_resolver,
+      registration.execution_class,
+      selection_snapshot,
+    )
     selection_provenance = SelectionProvenance(
-      role=effective_role,
+      role=recorded_role,
       role_source=(
         "spawn" if request.role is not None
         else "operation" if registration.role is not None
@@ -805,10 +798,10 @@ def _admit_spawn(
     tool_grant=tuple(entry.tool_id for entry in tool_authority.grant.tools),
     withheld_tools=tuple(sorted(parent.withheld)),
     budget_share=parent.remaining_usd,
-    env_projection=_environment_projection(owners.env_contract, owners.env_names),
+    env_projection=env_projection,
     approval_route=_approval_route_name(approval_route),
     handle_grants=tuple(sorted(request.handles)),
-    placement=owners.placement,
+    placement=placement,
     lineage=AdmittedLineage(parent_job_id=parent.job_id, depth=child_depth),
   )
   log.info(
@@ -831,6 +824,8 @@ def _admit_continuation(
   # snapshot, bind, routes and definitions before this pure authority step.
   assert snapshot is not None
   assert task.model_bind is not None
+  placement = _placement_for_run_mode(task.model_bind.run_mode)
+  env_projection = _environment_projection(placement, owners.env_names)
   original = snapshot.admitted_context
   if original is not None and original.tenant != parent.tenant:
     return Refusal(
@@ -851,12 +846,12 @@ def _admit_continuation(
       tool_grant=tuple(entry.tool_id for entry in task.tool_grant.tools),
       withheld_tools=tuple(sorted(parent.withheld)),
       budget_share=None,
-      env_projection=_environment_projection(owners.env_contract, owners.env_names),
+      env_projection=env_projection,
       approval_route=_approval_route_name(approval_route),
       handle_grants=tuple(sorted({
         grant.content_id for grant in task.content_read_grants
       })),
-      placement=owners.placement,
+      placement=placement,
       lineage=AdmittedLineage(parent_job_id=parent.job_id, depth=parent.depth + 1),
     )
   else:
@@ -869,10 +864,8 @@ def _admit_continuation(
       "approval_route": _approval_route_name(approval_route),
       **(
         {
-          "placement": owners.placement,
-          "env_projection": _environment_projection(
-            owners.env_contract, owners.env_names,
-          ),
+          "placement": placement,
+          "env_projection": env_projection,
         }
         if request.cause == "placement_lost"
         else {}
@@ -951,10 +944,69 @@ def _approval_route_name(
   return "parent_delegated"
 
 
+# Total over RunMode. fleet has no admit caller today.
+_PLACEMENT_BY_RUN_MODE: dict[RunMode, Placement] = {
+  "interactive": "in_process",
+  "fleet": "in_process",
+  "batch": "in_process",
+  "autonomous": "local_stub",
+  "cron": "local_stub",
+}
+assert set(_PLACEMENT_BY_RUN_MODE) == set(get_args(RunMode))
+
+
+def _placement_for_run_mode(run_mode: str) -> Placement:
+  """Subprocess for the autonomous runner's modes; every other mode stays in process."""
+  return _PLACEMENT_BY_RUN_MODE[cast(RunMode, run_mode)]
+
+
+def _env_contract_for_placement(placement: Placement) -> str | None:
+  if placement == "local_stub":
+    return AUTONOMOUS_CHILD_ENVIRONMENT
+  return None
+
+
+def _tier_selected_for_bind(
+  requested_role: str | None,
+  resolver: Any,
+  capability_id: str,
+  selection_snapshot: SelectionSnapshot | None,
+) -> str | None:
+  """The tier select_bind uses when the request names no role.
+
+  Same substitution as binding: a requested role wins; otherwise the channel
+  slot default's tier, else the slot default's tier. A concrete model default
+  selects no tier.
+  """
+  if requested_role is not None:
+    return requested_role
+  defaults: Any = None
+  if selection_snapshot is not None:
+    defaults = selection_snapshot.frozen_slot(capability_id)
+  else:
+    policy = getattr(resolver, "selection_policy", None)
+    capabilities = getattr(policy, "capabilities", None)
+    if isinstance(capabilities, Mapping):
+      defaults = capabilities.get(capability_id)
+  if defaults is None:
+    return None
+  channel = str(getattr(resolver, "trusted_channel", None) or "").strip()
+  by_channel = getattr(defaults, "by_channel", {})
+  channel_default = by_channel.get(channel) if channel else None
+  slot_default = channel_default if channel_default is not None else defaults.default
+  if (
+    getattr(slot_default, "kind", None) == "tier"
+    and getattr(slot_default, "tier", None) is not None
+  ):
+    return slot_default.tier
+  return None
+
+
 def _environment_projection(
-  env_contract: str | None,
+  placement: Placement,
   env_names: frozenset[str],
 ) -> tuple[str, ...]:
+  env_contract = _env_contract_for_placement(placement)
   if env_contract is None:
     return ()
   contract = CHILD_ENVIRONMENT_ALLOWLISTS[env_contract]

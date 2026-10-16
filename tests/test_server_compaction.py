@@ -1394,6 +1394,35 @@ def test_pending_tail_supersedes_old_anchor_and_counts_tail_once(monkeypatch) ->
   assert "UNDELIVERED_SENTINEL" in str(normalized)
 
 
+@pytest.mark.parametrize("session_id", ["sess-0123456789abcdef-full-session-id", None])
+@pytest.mark.parametrize("rendered", [False, True])
+def test_portable_compaction_hands_the_full_session_id_to_the_summary_call(
+  monkeypatch, session_id: str | None, rendered: bool,
+) -> None:
+  monkeypatch.setattr(server_compaction, "MIN_COMPACT_GAIN_TOKENS", 1)
+  monkeypatch.setattr(server_compaction, "RENDER_CHAR_BUDGET", 0 if rendered else 100_000)
+  calls: list[dict[str, Any]] = []
+
+  async def _summarize(**kwargs: Any):
+    calls.append(kwargs)
+    return SimpleNamespace(text=LONG_SUMMARY, usage={"input_tokens": 17}, saw_tool_use=False)
+
+  monkeypatch.setattr(server_compaction, "provider_summarize", _summarize)
+  messages = [{"role": "user", "content": LONG_INPUT}, {"role": "assistant", "content": "ok"}]
+  result = _run(maybe_compact_current_messages(
+    messages, None,
+    capability_execution=stub_bound_capability_execution(
+      provider=_SummaryProvider(), model="model", effort="high",
+    ),
+    trigger=1,
+    est_total_tokens=100_000,
+    session_id=session_id,
+  ))
+
+  assert result.applied
+  assert [call["session_id"] for call in calls] == [session_id]
+
+
 class _NormalizedPendingProvider(_ContextLengthProvider):
   def normalize_messages(self, messages, model_info):
     return CodexProvider().normalize_messages(messages, model_info)

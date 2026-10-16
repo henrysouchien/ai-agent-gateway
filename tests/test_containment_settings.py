@@ -52,7 +52,7 @@ def test_defaults_are_the_ratified_values() -> None:
   assert settings.context_warning_pct == 80
   assert settings.context_pressure_reminder_pct == 60
   assert settings.context_pressure_reminder_step_pct == 10
-  assert settings.compaction_trigger_pct == 80
+  assert settings.compaction_trigger_pct == 25
 
 
 @pytest.mark.parametrize(("setting", "env"), [

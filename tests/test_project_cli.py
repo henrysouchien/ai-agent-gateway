@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,11 @@ import yaml
 
 from agent_gateway import cli as agent_cli
 from agent_gateway import project
-from agent_gateway.providers import xai_oauth
+from agent_gateway.providers import anthropic_quota, xai_oauth
+from agent_gateway.providers.anthropic_oauth import (
+  AnthropicOAuthRecord,
+  upsert_anthropic_oauth_record,
+)
 
 
 def test_agent_init_writes_working_project(tmp_path: Path) -> None:
@@ -396,3 +401,249 @@ def test_launch_project_examples_have_loadable_configs() -> None:
     assert (root / "README.md").is_file()
     assert (root / "agent.py").is_file()
     assert list((root / "skills").glob("*.md"))
+
+
+def _enroll_anthropic(store: Path, identity: str) -> anthropic_quota.AccountLocator:
+  upsert_anthropic_oauth_record(
+    store,
+    AnthropicOAuthRecord(
+      identity=identity,
+      access_token=f"sk-ant-oat01-{identity}-access",
+      refresh_token=f"sk-ant-ort01-{identity}",
+      expires_at=time.time() + 3600,
+    ),
+  )
+  return anthropic_quota.locator_for_record(store, identity)
+
+
+def _run_cli(*argv: str) -> tuple[int, str, str]:
+  stdout = io.StringIO()
+  stderr = io.StringIO()
+  code = agent_cli.main(list(argv), stdout=stdout, stderr=stderr)
+  return code, stdout.getvalue(), stderr.getvalue()
+
+
+def test_anthropic_auth_policy_help_documents_flags(capsys: pytest.CaptureFixture[str]) -> None:
+  with pytest.raises(SystemExit) as exit_info:
+    agent_cli.main(["auth", "policy", "anthropic", "--help"])
+
+  assert exit_info.value.code == 0
+  help_text = capsys.readouterr().out
+  for flag in ("--identity", "--priority", "--reserve-pct", "--reset", "--store", "--user"):
+    assert flag in help_text
+
+
+def test_anthropic_auth_policy_sets_and_resets_one_account(tmp_path: Path) -> None:
+  store = tmp_path / "oauth.json"
+  locator = _enroll_anthropic(store, "a@example.com")
+  other = _enroll_anthropic(store, "b@example.com")
+
+  code, out, _err = _run_cli(
+    "auth", "policy", "anthropic", "--store", str(store),
+    "--identity", "a@example.com", "--priority", "3", "--reserve-pct", "5",
+  )
+  assert code == 0
+  assert locator.id in out
+  state = anthropic_quota.load_selection_state(store)
+  assert state.policies[locator.id] == anthropic_quota.AccountPolicy(priority=3, reserve_pct=5.0)
+  assert other.id not in state.policies
+
+  code, out, _err = _run_cli(
+    "auth", "policy", "anthropic", "--store", str(store),
+    "--identity", "a@example.com", "--reset",
+  )
+  assert code == 0
+  assert locator.id not in anthropic_quota.load_selection_state(store).policies
+
+
+def test_anthropic_auth_policy_rejects_an_unenrolled_identity(tmp_path: Path) -> None:
+  store = tmp_path / "oauth.json"
+  _enroll_anthropic(store, "a@example.com")
+
+  code, _out, err = _run_cli(
+    "auth", "policy", "anthropic", "--store", str(store),
+    "--identity", "ghost@example.com", "--priority", "1", "--reserve-pct", "10",
+  )
+
+  assert code != 0
+  assert "ghost@example.com" in err
+  assert not anthropic_quota.selection_sidecar_path(store).exists()
+
+
+@pytest.mark.parametrize(
+  "flags",
+  [
+    ["--priority", "1", "--reserve-pct", "10", "--reset"],
+    ["--reset", "--priority", "1"],
+    ["--reset", "--reserve-pct", "10"],
+    [],
+    ["--priority", "1"],
+    ["--reserve-pct", "10"],
+    ["--priority", "1", "--reserve-pct", "100.5"],
+    ["--priority", "1", "--reserve-pct", "-1"],
+    ["--priority", "1", "--reserve-pct", "nan"],
+  ],
+)
+def test_anthropic_auth_policy_rejects_malformed_input(tmp_path: Path, flags: list[str]) -> None:
+  store = tmp_path / "oauth.json"
+  _enroll_anthropic(store, "a@example.com")
+
+  code, _out, err = _run_cli(
+    "auth", "policy", "anthropic", "--store", str(store), "--identity", "a@example.com", *flags
+  )
+
+  assert code != 0
+  assert err.strip()
+  assert not anthropic_quota.selection_sidecar_path(store).exists()
+
+
+@pytest.mark.parametrize("flags", [["--priority", "high", "--reserve-pct", "10"], ["--priority", "1", "--reserve-pct", "x"]])
+def test_anthropic_auth_policy_rejects_unparseable_numbers(
+  tmp_path: Path, flags: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+  store = tmp_path / "oauth.json"
+  _enroll_anthropic(store, "a@example.com")
+
+  with pytest.raises(SystemExit) as exit_info:
+    agent_cli.main(
+      ["auth", "policy", "anthropic", "--store", str(store), "--identity", "a@example.com", *flags]
+    )
+
+  assert exit_info.value.code != 0
+  assert "invalid" in capsys.readouterr().err
+  assert not anthropic_quota.selection_sidecar_path(store).exists()
+
+
+def test_anthropic_auth_policy_keeps_two_stores_in_one_directory_independent(tmp_path: Path) -> None:
+  store_a = tmp_path / "a-oauth.json"
+  store_b = tmp_path / "b-oauth.json"
+  locator_a = _enroll_anthropic(store_a, "same@example.com")
+  locator_b = _enroll_anthropic(store_b, "same@example.com")
+  assert locator_a.id != locator_b.id
+
+  code, _out, _err = _run_cli(
+    "auth", "policy", "anthropic", "--store", str(store_a),
+    "--identity", "same@example.com", "--priority", "7", "--reserve-pct", "0",
+  )
+  assert code == 0
+
+  assert anthropic_quota.load_selection_state(store_a).policies == {
+    locator_a.id: anthropic_quota.AccountPolicy(priority=7, reserve_pct=0.0)
+  }
+  assert anthropic_quota.load_selection_state(store_b).policies == {}
+  _code, usage_b, _err = _run_cli("auth", "list", "anthropic", "--store", str(store_b), "--usage")
+  assert "priority=0" in usage_b
+  assert "policy=default" in usage_b
+  _code, usage_a, _err = _run_cli("auth", "list", "anthropic", "--store", str(store_a), "--usage")
+  assert "priority=7" in usage_a
+  assert "policy=configured" in usage_a
+
+
+def test_anthropic_auth_policy_user_pool_is_independent_of_the_org_pool(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "data"))
+  monkeypatch.delenv("ANTHROPIC_AUTH_STORE_PATH", raising=False)
+  org_store = tmp_path / "org-oauth.json"
+  user_store = tmp_path / "data" / "users" / "1" / "anthropic" / "oauth.json"
+  org_locator = _enroll_anthropic(org_store, "same@example.com")
+  user_locator = _enroll_anthropic(user_store, "same@example.com")
+
+  code, _out, _err = _run_cli(
+    "auth", "policy", "anthropic", "--user", "1",
+    "--identity", "same@example.com", "--priority", "2", "--reserve-pct", "20",
+  )
+  assert code == 0
+  assert user_locator.id in anthropic_quota.load_selection_state(user_store).policies
+  assert anthropic_quota.load_selection_state(org_store).policies == {}
+
+  code, _out, _err = _run_cli(
+    "auth", "policy", "anthropic", "--store", str(org_store),
+    "--identity", "same@example.com", "--priority", "9", "--reserve-pct", "1",
+  )
+  assert code == 0
+  assert anthropic_quota.load_selection_state(org_store).policies == {
+    org_locator.id: anthropic_quota.AccountPolicy(priority=9, reserve_pct=1.0)
+  }
+  assert anthropic_quota.load_selection_state(user_store).policies[user_locator.id].priority == 2
+
+
+def test_anthropic_auth_list_without_usage_is_unchanged(tmp_path: Path) -> None:
+  store = tmp_path / "oauth.json"
+  _enroll_anthropic(store, "a@example.com")
+  _run_cli(
+    "auth", "policy", "anthropic", "--store", str(store),
+    "--identity", "a@example.com", "--priority", "3", "--reserve-pct", "5",
+  )
+
+  code, out, _err = _run_cli("auth", "list", "anthropic", "--store", str(store))
+
+  assert code == 0
+  assert len(out.splitlines()) == 1
+  assert out.startswith("a@example.com  ")
+  assert "account=" not in out
+  assert "priority" not in out
+
+
+def test_anthropic_auth_list_usage_with_empty_sidecar_is_all_unknown(tmp_path: Path) -> None:
+  store = tmp_path / "oauth.json"
+  locator = _enroll_anthropic(store, "a@example.com")
+
+  code, out, _err = _run_cli("auth", "list", "anthropic", "--store", str(store), "--usage")
+
+  assert code == 0
+  assert out.splitlines()[0].startswith("a@example.com  ")
+  assert f"account={locator.id}" in out
+  assert "priority=0" in out
+  assert "reserve=10%" in out
+  assert "policy=default" in out
+  assert "quota=unknown" in out
+  assert "cooldown" not in out
+  assert "sk-ant-oat01-a@example.com-access" not in out
+
+
+def test_anthropic_auth_list_usage_shows_cached_windows_and_cooldowns(tmp_path: Path) -> None:
+  store = tmp_path / "oauth.json"
+  locator = _enroll_anthropic(store, "a@example.com")
+  quiet = _enroll_anthropic(store, "b@example.com")
+  now = time.time()
+  anthropic_quota.set_account_policy(store, locator, priority=3, reserve_pct=5.0)
+  anthropic_quota.record_observation(
+    store,
+    locator,
+    [
+      anthropic_quota.QuotaWindow(
+        id="five_hour",
+        scope="shared",
+        used_fraction=0.4,
+        reset_at=now + 7230,
+        duration_s=18000.0,
+        observed_at=now - 60,
+        source="usage",
+      )
+    ],
+    now=now,
+  )
+  anthropic_quota.record_cooldown(
+    store, locator, anthropic_quota.Cooldown(scope="opus", until=now + 3630, reason="quota")
+  )
+
+  code, out, _err = _run_cli("auth", "list", "anthropic", "--store", str(store), "--usage")
+
+  assert code == 0
+  assert f"account={locator.id}  priority=3  reserve=5%  policy=configured" in out
+  assert "five_hour [shared]: 40% used, resets in 2h" in out
+  assert "observed 1m" in out
+  assert "via usage" in out
+  assert "cooldown [opus]: quota, 1h" in out
+  # The other account has no cached data and keeps its defaults.
+  quiet_block = out.split(f"account={quiet.id}", 1)[1]
+  assert "priority=0" in quiet_block
+  assert "quota=unknown" in quiet_block
+
+
+def test_anthropic_auth_list_usage_is_rejected_for_other_providers(tmp_path: Path) -> None:
+  code, _out, err = _run_cli("auth", "list", "xai", "--store", str(tmp_path / "o.json"), "--usage")
+
+  assert code != 0
+  assert "--usage" in err

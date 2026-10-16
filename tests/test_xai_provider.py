@@ -432,8 +432,8 @@ def test_error_event_identifies_xai() -> None:
 @pytest.mark.parametrize(
   ("model_id", "expected_window", "expected_trigger"),
   [
-    ("grok-4.5", 500_000, 400_000),
-    ("grok-4.6", 500_000, 400_000),
+    ("grok-4.5", 500_000, 160_000),
+    ("grok-4.6", 500_000, 160_000),
   ],
 )
 def test_xai_windows_come_from_the_authority_entry(model_id: str, expected_window: int, expected_trigger: int) -> None:

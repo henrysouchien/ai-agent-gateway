@@ -86,6 +86,16 @@ AUTONOMOUS_RUN_STATE_CLASSIFICATION: MappingProxyType[
     "rehydrated_active": True,
     "terminal": False,
   },
+  "awaiting_approval": {
+    "active_process": False,
+    "rehydrated_active": False,
+    "terminal": False,
+  },
+  "continued": {
+    "active_process": False,
+    "rehydrated_active": False,
+    "terminal": True,
+  },
   "completed": {
     "active_process": False,
     "rehydrated_active": False,
@@ -135,6 +145,7 @@ _TOOL_SURFACE_FIELDS = (
   "active_servers",
   "allowed_mcp_tools_by_server",
   "allowed_tools",
+  "visible_tool_names",
   "visible_tool_count",
 )
 _RUN_SEQUENCE_CURSOR_FILE = ".autonomous-sequence.json"
@@ -157,6 +168,122 @@ def _tool_surface_from_mapping(source: dict[str, Any]) -> dict[str, Any] | None:
     if source.get(field_name) is not None
   }
   return surface or None
+
+
+def _tool_surface_names(value: Any) -> set[str]:
+  if not isinstance(value, list):
+    return set()
+  return {item for item in value if isinstance(item, str)}
+
+
+def _tool_surface_by_server(value: Any) -> dict[str, set[str]]:
+  if not isinstance(value, dict):
+    return {}
+  return {
+    server: _tool_surface_names(tools)
+    for server, tools in value.items()
+    if isinstance(server, str)
+  }
+
+
+def _declared_visible_tool_count(surface: dict[str, Any]) -> int | None:
+  value = surface.get("visible_tool_count")
+  if isinstance(value, bool) or not isinstance(value, int):
+    return None
+  return value
+
+
+def _fold_tool_surface(
+  prior: dict[str, Any],
+  incoming: dict[str, Any],
+) -> dict[str, Any]:
+  """Union a later declaration into the run's reach.
+
+  Servers and per-server tools are the sorted union. `allowed_tools` is a
+  ceiling: it is unioned only when every declaration carries the field. If any
+  declaration lacks it, the merged surface lacks it too (no ceiling) — never
+  an empty list, which would mean nothing is allowed. When both declarations
+  carry `visible_tool_names`, those names are the sorted union and
+  `visible_tool_count` is the size of that union. When either lacks names (an
+  older child or manifest), the count stays the max of the declared counts and
+  no names are invented or half-adopted. A later declaration that adds a
+  server, a tool, a name, a dropped ceiling, or a higher count, or drops names,
+  is written. One that changes nothing leaves `prior` unchanged, including
+  list order and a single declaration's verbatim count.
+  """
+
+  prior_servers = _tool_surface_names(prior.get("active_servers"))
+  prior_by_server = _tool_surface_by_server(prior.get("allowed_mcp_tools_by_server"))
+  servers = prior_servers | _tool_surface_names(incoming.get("active_servers"))
+  by_server = {
+    server: set(names)
+    for server, names in prior_by_server.items()
+  }
+  for server, names in _tool_surface_by_server(
+    incoming.get("allowed_mcp_tools_by_server")
+  ).items():
+    by_server.setdefault(server, set()).update(names)
+  prior_has_ceiling = "allowed_tools" in prior
+  incoming_has_ceiling = "allowed_tools" in incoming
+  both_have_ceiling = prior_has_ceiling and incoming_has_ceiling
+  prior_tools = _tool_surface_names(prior.get("allowed_tools"))
+  tools = prior_tools | _tool_surface_names(incoming.get("allowed_tools"))
+  prior_has_names = isinstance(prior.get("visible_tool_names"), list)
+  incoming_has_names = isinstance(incoming.get("visible_tool_names"), list)
+  both_have_names = prior_has_names and incoming_has_names
+  prior_names = _tool_surface_names(prior.get("visible_tool_names"))
+  names = prior_names | _tool_surface_names(incoming.get("visible_tool_names"))
+  prior_count = _declared_visible_tool_count(prior)
+  incoming_count = _declared_visible_tool_count(incoming)
+  if both_have_names:
+    merged_count: int | None = len(names)
+  else:
+    counts = [count for count in (prior_count, incoming_count) if count is not None]
+    merged_count = max(counts) if counts else None
+  servers_grew = servers != prior_servers
+  by_server_grew = by_server != prior_by_server
+  tools_grew = both_have_ceiling and tools != prior_tools
+  names_grew = both_have_names and names != prior_names
+  ceiling_dropped = prior_has_ceiling and not incoming_has_ceiling
+  names_dropped = prior_has_names and not incoming_has_names
+  count_grew = merged_count is not None and merged_count != prior_count
+  if not (
+    servers_grew
+    or by_server_grew
+    or tools_grew
+    or names_grew
+    or ceiling_dropped
+    or names_dropped
+    or count_grew
+  ):
+    return prior
+  folded: dict[str, Any] = {}
+  if servers or "active_servers" in prior or "active_servers" in incoming:
+    folded["active_servers"] = (
+      sorted(servers) if servers_grew else prior.get("active_servers", sorted(servers))
+    )
+  if by_server or "allowed_mcp_tools_by_server" in prior or "allowed_mcp_tools_by_server" in incoming:
+    folded["allowed_mcp_tools_by_server"] = (
+      {
+        server: sorted(tool_names)
+        for server, tool_names in sorted(by_server.items())
+      }
+      if by_server_grew
+      else prior.get("allowed_mcp_tools_by_server", {})
+    )
+  if both_have_ceiling:
+    folded["allowed_tools"] = (
+      sorted(tools) if tools_grew else prior.get("allowed_tools", sorted(tools))
+    )
+  if both_have_names:
+    folded["visible_tool_names"] = (
+      sorted(names) if names_grew else prior.get("visible_tool_names", sorted(names))
+    )
+    folded["visible_tool_count"] = len(names)
+  elif merged_count is not None:
+    folded["visible_tool_count"] = merged_count
+  return folded
+
 
 
 def _skip_warned_key(manifest_path: Path, message: str, mtime_ns: int) -> str:
@@ -444,6 +571,7 @@ class AutonomousTask:
   event_record_lock: Any = field(default_factory=lambda: _runtime_attr("asyncio", asyncio).Lock())
   approval_decision_lock: Any = field(default_factory=lambda: _runtime_attr("asyncio", asyncio).Lock())
   resume_lock: Any = field(default_factory=lambda: _runtime_attr("asyncio", asyncio).Lock())
+  launch_ready: Any = field(default_factory=lambda: _runtime_attr("asyncio", asyncio).Event())
   resumed_from: str | None = None
   resumed_as: list[str] = field(default_factory=list)
   schedule_id: str | None = None
@@ -456,6 +584,14 @@ class AutonomousTask:
   launch_nonce: str | None = None
   approval_channel: AutonomousApprovalChannelParent | None = None
   tool_surface: dict[str, Any] | None = None
+  approval_continuation: dict[str, Any] | None = None
+  # The one approval decision this run was launched to continue. Set once at
+  # launch, never rewritten: a re-delivered decision finds its successor here
+  # whatever state that successor has since reached.
+  resumed_approval_id: str | None = None
+  # The signed pre-authorized call this launch carries. The parent holds it in
+  # memory only; it is never persisted to the manifest.
+  launch_approval_continuation: dict[str, Any] | None = None
 
   def __post_init__(self) -> None:
     if self.mode not in {"once", "task", "skill", "pack"}:
@@ -1116,6 +1252,8 @@ class AutonomousRegistryStateMixin:
       "completed_at": record.completed_at,
       "resumed_from": record.resumed_from,
       "resumed_as": list(record.resumed_as),
+      "approval_continuation": record.approval_continuation,
+      "resumed_approval_id": record.resumed_approval_id,
       "schedule_id": record.schedule_id,
       "schedule_name": record.schedule_name,
       "tool_result_spill_dir": (
@@ -1493,6 +1631,8 @@ class AutonomousRegistryStateMixin:
       if event_type != "stream_complete":
         continue
       disposition = event.get("terminal_disposition")
+      if disposition == "awaiting_approval":
+        return "awaiting_approval", None, None
       if disposition == "completed":
         if terminal_reason is not None:
           return (
@@ -1535,14 +1675,14 @@ class AutonomousRegistryStateMixin:
     """
     if outcome == "interrupted":
       return "interrupted", terminal_error, terminal_reason
-    if outcome == "completed":
+    if outcome in {"completed", "awaiting_approval"}:
       if exit_code == 0:
-        return "completed", None, None
+        return outcome, None, None
       return (
         "failed",
         existing_error
         or (
-          "completed stream without a committed process exit"
+          f"{outcome} stream without a committed process exit"
           if exit_code is None
           else f"Process exited with code {exit_code}"
         ),
@@ -1576,6 +1716,8 @@ class AutonomousRegistryStateMixin:
         )
     else:
       record.state, record.error, record.terminal_reason = settlement
+    if record.state == "awaiting_approval":
+      record.completed_at = None
     return prior != (record.state, record.error, record.terminal_reason)
 
   def _coerce_manifest_str(self, manifest: dict[str, Any], field_name: str) -> str | None:
@@ -1587,18 +1729,31 @@ class AutonomousRegistryStateMixin:
     record: AutonomousTask,
     event: dict[str, Any],
   ) -> None:
-    """Keep the child's launch-time `tool_surface_declared` facts on the record.
+    """Fold every `tool_surface_declared` into the run's reachable surface.
 
-    The first declaration is the run's launch surface; later ones come from
-    session objects the same run builds again and are not a second launch.
+    Pack skills each declare their own surface. The manifest's fields answer
+    what the run could reach: servers and per-server tools are the union.
+    `allowed_tools` is unioned only when every declaration carries it; if any
+    lacks it, the run has no ceiling and the field is omitted. The first
+    declaration is stored verbatim. A later declaration that adds reach — a
+    server, a tool, a dropped ceiling, a visible-tool name, or a higher
+    `visible_tool_count` — is folded in. When both declarations carry
+    `visible_tool_names`, the merged count is the size of that name union;
+    otherwise it is the max of the declared counts and any prior names are
+    discarded. An identical retry, or a later declaration that changes nothing,
+    leaves the record unchanged.
     """
 
-    if record.tool_surface is not None:
+    incoming = _tool_surface_from_mapping(event)
+    if incoming is None:
       return
-    surface = _tool_surface_from_mapping(event)
-    if surface is None:
-      return
-    record.tool_surface = surface
+    if record.tool_surface is None:
+      record.tool_surface = incoming
+    else:
+      folded = _fold_tool_surface(record.tool_surface, incoming)
+      if folded == record.tool_surface:
+        return
+      record.tool_surface = folded
     if not self._write_task_manifest(record, checked=True):
       record.error = (
         "autonomous tool surface manifest write failed; "
@@ -1788,7 +1943,7 @@ class AutonomousRegistryStateMixin:
     terminal_outcome, terminal_error, event_terminal_reason = (
       self._terminal_event_outcome(events)
     )
-    preserved_states = {"killed", "blocked", "interrupted"}
+    preserved_states = {"killed", "blocked", "interrupted", "continued", "awaiting_approval"}
     is_active_or_unknown = (
       raw_manifest_state in rehydrated_active_states
       or raw_manifest_state not in terminal_states
@@ -1824,6 +1979,8 @@ class AutonomousRegistryStateMixin:
           _REHYDRATION_INTERRUPTED_ERROR,
         )
         terminal_reason = None
+    if raw_state == "awaiting_approval":
+      completed_at = None
 
     cmd = manifest.get("cmd")
     resumed_as = manifest.get("resumed_as")
@@ -2072,6 +2229,10 @@ class AutonomousRegistryStateMixin:
         identity_status=record_identity_status,
         resumed_from=record_resumed_from,
         resumed_as=record_resumed_as,
+        approval_continuation=manifest.get("approval_continuation"),
+        resumed_approval_id=self._coerce_manifest_str(
+          manifest, "resumed_approval_id",
+        ),
         schedule_id=record_schedule_id,
         schedule_name=record_schedule_name,
         capability_bind=capability_bind,

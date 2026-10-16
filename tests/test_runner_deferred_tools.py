@@ -24,6 +24,7 @@ from agent_gateway.multi_user.billing import UsageTotals  # noqa: E402
 from agent_gateway.providers import AnthropicProvider, CodexProvider, StreamEvent  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
 from agent_gateway.tool_dispatch_classification import settle_catalogless_tool_result  # noqa: E402
+from agent_gateway.tool_policy_registry import PreparedToolCall  # noqa: E402
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_bound_capability_execution,
 )
@@ -57,6 +58,18 @@ class _Dispatcher:
 
   async def dispatch(self, tool_id, tool_name, tool_input, **_kwargs):
     return copy.deepcopy(self.results[tool_name]), None
+
+  async def prepare_tool_call_async(self, tool_name, tool_input):
+    _ = tool_name
+    return PreparedToolCall(dict(tool_input))
+
+  async def dispatch_prepared(self, tool_id, tool_name, prepared_call, **kwargs):
+    return await self.dispatch(
+      tool_id,
+      tool_name,
+      prepared_call.materialize_input(),
+      **kwargs,
+    )
 
 
 class _Catalog:

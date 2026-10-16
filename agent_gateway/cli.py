@@ -162,6 +162,14 @@ def build_parser() -> argparse.ArgumentParser:
   )
   auth_list.add_argument("--store", default=None, help="Override the OAuth token-store path.")
   auth_list.add_argument("--user", default=None, help=_USER_SCOPE_HELP)
+  auth_list.add_argument(
+    "--usage",
+    action="store_true",
+    help=(
+      "Anthropic only: also show each account's policy, cached quota windows and "
+      "cooldowns. Reads the cached selection state only; never contacts Anthropic."
+    ),
+  )
   auth_remove = auth_sub.add_parser("remove", help="Remove one enrolled provider account.")
   auth_remove.add_argument("provider", choices=_flow_choices)
   auth_remove.add_argument("identity", help="Account identity reported by `auth list`.")
@@ -172,6 +180,38 @@ def build_parser() -> argparse.ArgumentParser:
   )
   auth_remove.add_argument("--store", default=None, help="Override the OAuth token-store path.")
   auth_remove.add_argument("--user", default=None, help=_USER_SCOPE_HELP)
+  auth_policy = auth_sub.add_parser(
+    "policy",
+    help="Set or reset one enrolled Anthropic account's selection policy.",
+  )
+  auth_policy.add_argument("provider", choices=["anthropic"])
+  auth_policy.add_argument(
+    "--identity",
+    required=True,
+    help="Account identity reported by `auth list`.",
+  )
+  auth_policy.add_argument(
+    "--priority",
+    type=int,
+    default=None,
+    help="Integer priority; a higher value is preferred. Requires --reserve-pct.",
+  )
+  auth_policy.add_argument(
+    "--reserve-pct",
+    type=float,
+    default=None,
+    help=(
+      "Soft reserve, 0-100: percent of quota kept back for sibling accounts that "
+      "have headroom; 0 disables it. Requires --priority."
+    ),
+  )
+  auth_policy.add_argument(
+    "--reset",
+    action="store_true",
+    help="Remove the account's configured policy so it uses the defaults.",
+  )
+  auth_policy.add_argument("--store", default=None, help="Override the OAuth token-store path.")
+  auth_policy.add_argument("--user", default=None, help=_USER_SCOPE_HELP)
   list_parser = subparsers.add_parser("list", help="Show the resolved project config.")
   list_parser.add_argument(
     "--config",
@@ -241,6 +281,8 @@ def main(
         return _auth_enroll(args, stdout=stdout_stream)
       if args.auth_command == "remove":
         return _auth_remove(args, stdout=stdout_stream)
+      if args.auth_command == "policy":
+        return _auth_policy(args, stdout=stdout_stream)
 
     if args.command == "list":
       return _list_project(args, stdout=stdout_stream)
@@ -583,7 +625,54 @@ def _resolve_pool_store_target(
   )
 
 
+def _format_duration(seconds: float) -> str:
+  total = max(0, int(round(seconds)))
+  days, rest = divmod(total, 86400)
+  hours, rest = divmod(rest, 3600)
+  minutes, secs = divmod(rest, 60)
+  if days:
+    return f"{days}d {hours}h"
+  if hours:
+    return f"{hours}h {minutes:02d}m"
+  if minutes:
+    return f"{minutes}m {secs:02d}s"
+  return f"{secs}s"
+
+
+def _write_anthropic_usage(
+  stdout: TextIO,
+  usage: dict[str, Any],
+) -> None:
+  """Render one `describe_account_usage` view; cached data only."""
+
+  reserve = float(usage["reserve_pct"])
+  quota = str(usage["usage"])
+  if quota == "unavailable" and usage.get("unavailable_reason"):
+    quota += f" ({usage['unavailable_reason']})"
+  stdout.write(
+    f"  account={usage['account']}  priority={usage['priority']}  "
+    f"reserve={reserve:g}%  policy={usage['policy_source']}  quota={quota}\n"
+  )
+  for window in usage["windows"]:
+    used = window["used_pct"]
+    used_text = "usage unknown" if used is None else f"{used:.0f}% used"
+    resets = window["resets_in_s"]
+    reset_text = "reset unknown" if resets is None else f"resets in {_format_duration(resets)}"
+    stale = "" if window["fresh"] else " (stale)"
+    stdout.write(
+      f"    {window['id']} [{window['scope']}]: {used_text}, {reset_text}, "
+      f"observed {_format_duration(window['age_s'])} ago via {window['source']}{stale}\n"
+    )
+  for cooldown in usage["cooldowns"]:
+    stdout.write(
+      f"    cooldown [{cooldown['scope']}]: {cooldown['reason']}, "
+      f"{_format_duration(cooldown['remaining_s'])} remaining\n"
+    )
+
+
 def _auth_list(args: argparse.Namespace, *, stdout: TextIO) -> int:
+  if args.usage and args.provider != "anthropic":
+    raise AgentProjectError("--usage is only available for the anthropic provider")
   if args.provider == "anthropic":
     from .providers.anthropic_oauth import (
       load_anthropic_oauth_store,
@@ -596,6 +685,17 @@ def _auth_list(args: argparse.Namespace, *, stdout: TextIO) -> int:
       stdout.write(f"Anthropic OAuth: no enrolled accounts ({path})\n")
       return 1
     now = time.time()
+    state = None
+    from .providers.anthropic_quota import (
+      describe_account_usage,
+      load_selection_state,
+      locator_for_record,
+    )
+
+    if args.usage:
+      state = load_selection_state(path, now=now)
+      if state.problems:
+        stdout.write(f"Selection state problems: {', '.join(state.problems)}\n")
     for record in records:
       remaining = record.expires_at - now
       if not record.refresh_token:
@@ -608,6 +708,11 @@ def _auth_list(args: argparse.Namespace, *, stdout: TextIO) -> int:
       if record.last_error:
         line += f"  last error: {record.last_error}"
       stdout.write(f"{line}\n")
+      if state is not None:
+        _write_anthropic_usage(
+          stdout,
+          describe_account_usage(state, locator_for_record(path, record.identity), now=now),
+        )
     return 0
 
   from .providers.credential_pool import load_pool_accounts
@@ -625,6 +730,50 @@ def _auth_list(args: argparse.Namespace, *, stdout: TextIO) -> int:
     if acc.get("source"):
       details.append(f"source={acc['source']}")
     stdout.write("  ".join(details) + "\n")
+  return 0
+
+
+def _auth_policy(args: argparse.Namespace, *, stdout: TextIO) -> int:
+  """Write or clear one enrolled account's selection policy in its store's sidecar."""
+
+  from .providers.anthropic_oauth import load_anthropic_oauth_store
+  from .providers.anthropic_quota import (
+    locator_for_record,
+    reset_account_policy,
+    selection_sidecar_path,
+    set_account_policy,
+  )
+
+  identity = str(args.identity or "").strip()
+  if not identity:
+    raise AgentProjectError("--identity must name an enrolled account")
+  if args.reset:
+    if args.priority is not None or args.reserve_pct is not None:
+      raise AgentProjectError("--reset cannot be combined with --priority or --reserve-pct")
+  elif args.priority is None or args.reserve_pct is None:
+    raise AgentProjectError("set a policy with both --priority and --reserve-pct, or pass --reset")
+
+  path = _anthropic_store_path(args)
+  if identity not in {record.identity for record in load_anthropic_oauth_store(path)}:
+    raise AgentProjectError(f"no enrolled Anthropic account {identity!r} in {path}")
+  locator = locator_for_record(path, identity)
+  sidecar = selection_sidecar_path(path)
+  try:
+    if args.reset:
+      reset_account_policy(path, locator)
+      stdout.write(f"Reset policy for {identity} ({locator.id}) in {sidecar}\n")
+      return 0
+    policy = set_account_policy(
+      path, locator, priority=args.priority, reserve_pct=args.reserve_pct
+    )
+  except ValueError as exc:
+    raise AgentProjectError(f"invalid policy: {exc}") from exc
+  except OSError as exc:
+    raise AgentProjectError(f"could not write policy to {sidecar}: {exc}") from exc
+  stdout.write(
+    f"Set policy for {identity} ({locator.id}): priority={policy.priority} "
+    f"reserve_pct={policy.reserve_pct:g} in {sidecar}\n"
+  )
   return 0
 
 

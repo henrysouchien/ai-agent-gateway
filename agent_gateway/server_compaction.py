@@ -433,6 +433,7 @@ async def summarize_messages(
   capability_execution: BoundCapabilityExecution,
   tools: list[dict[str, Any]] | None = None,
   on_event: Callable[[dict[str, Any]], object] | None = None,
+  session_id: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
   if not isinstance(capability_execution, BoundCapabilityExecution):
     raise TypeError(
@@ -463,6 +464,7 @@ async def summarize_messages(
       max_tokens=SUMMARY_MAX_TOKENS,
       request_kwargs=request_kwargs,
       on_event=on_event,
+      session_id=session_id,
     )
     if result.saw_tool_use:
       raise SummaryResponseRejected("Summary generation returned tool_use", usage=result.usage)
@@ -478,6 +480,7 @@ async def summarize_messages(
       tools=[],
       max_tokens=SUMMARY_MAX_TOKENS,
       on_event=on_event,
+      session_id=session_id,
     )
     if result.saw_tool_use:
       raise SummaryResponseRejected("Summary generation returned tool_use", usage=result.usage)
@@ -509,6 +512,7 @@ async def maybe_compact_current_messages(
   tools: list[dict[str, Any]] | None = None,
   force: bool = False,
   on_event: Callable[[dict[str, Any]], object] | None = None,
+  session_id: str | None = None,
 ) -> CompactResult:
   if not isinstance(capability_execution, BoundCapabilityExecution):
     raise TypeError(
@@ -565,6 +569,7 @@ async def maybe_compact_current_messages(
     capability_execution=capability_execution,
     tools=tools,
     on_event=on_event,
+    session_id=session_id,
   )
   summary = summary.strip()
   summary_chars = len(summary)

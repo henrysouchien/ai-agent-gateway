@@ -2,10 +2,15 @@ from __future__ import annotations
 
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
+import json
+import os
 from typing import Any, Mapping, Protocol
 
+from agent_gateway.approval_continuation import ContinueStatus
 from agent_gateway.approval_policy import (
+  approval_is_executable,
   approval_request_from_projection,
+  approval_request_projection,
   utc_now,
 )
 from agent_gateway.autonomous_runner import (
@@ -17,10 +22,16 @@ from agent_gateway.autonomous_approval_channel import (
   AutonomousApprovalChannelAuthority,
 )
 from agent_gateway.autonomous_claim_broker import AutonomousClaimBroker
-from agent_gateway.approval_store import ApprovalExecutableBindingError
+from agent_gateway.approval_store import (
+  ApprovalExecutableBindingError,
+  _restore_executable_result,
+)
 from agent_gateway.tool_policy_registry import PreparedToolCall
 from agent_gateway.providers.anthropic_oauth import is_anthropic_generation_ref
 from agent_gateway.admission import root_context
+from agent_gateway.agent_session_log import AgentSessionLog
+from agent_gateway.agent_session_log_records import AgentSessionRef, resolve_agent_session_id
+from agent_gateway.openai_history_fence import scope_provider_session_id
 
 
 class _EnsureAutonomousApprovalDeliveryAudited(Protocol):
@@ -58,11 +69,11 @@ class _RecordAutonomousApprovalDeliveryFailure(Protocol):
 def autonomous_run_accepts_approval_decisions(
   record: AutonomousTask,
 ) -> bool:
-  if record.state not in {"running", "approval_pending", "remediating"}:
+  if record.state not in {"running", "approval_pending", "remediating", "awaiting_approval", "continued"}:
     return False
-  if record.proc is not None and record.proc.returncode is not None:
-    return False
-  return True
+  return record.approval_continuation is not None or (
+    record.proc is None or record.proc.returncode is None
+  )
 
 
 def autonomous_decision_unavailable(
@@ -70,6 +81,8 @@ def autonomous_decision_unavailable(
 ) -> str | None:
   if not autonomous_run_accepts_approval_decisions(record):
     return "Autonomous run is not running"
+  if record.approval_continuation is not None:
+    return None
   if type(getattr(
     record,
     "approval_channel",
@@ -127,6 +140,8 @@ class DelegatedAutonomousExecutableCapture:
   credential_generation_ref: str | None
   prepared_call: PreparedToolCall
   dispatch_context: Mapping[str, object]
+  session_log_path: str | None = None
+  pack_cursor: Mapping[str, Any] | None = None
 
 
 def admit_delegated_executable_capture(
@@ -160,9 +175,10 @@ def admit_delegated_executable_capture(
     or record.event_channel.channel_id != envelope.channel_id
   ):
     raise ApprovalExecutableBindingError("call_identity_mismatch")
+  launch = record.launch_approval_continuation
   if envelope.admitted is not None:
     tenant = envelope.admitted[0].tenant
-    job_id = envelope.task_id
+    job_id = launch["job_id"] if launch is not None else envelope.task_id
   else:
     context = root_context(
       envelope.session_authority.to_gateway_session(),
@@ -170,7 +186,7 @@ def admit_delegated_executable_capture(
       research_file_id=envelope.workload.research_file_id,
     )
     tenant = context.tenant
-    job_id = context.job_id
+    job_id = launch["job_id"] if launch is not None else context.job_id
   generation_ref = (
     envelope.bind.credential_ref
     if is_anthropic_generation_ref(envelope.bind.credential_ref)
@@ -199,6 +215,30 @@ def admit_delegated_executable_capture(
     ).prepared_input
   except (KeyError, TypeError, ValueError):
     raise ApprovalExecutableBindingError("operand_mismatch") from None
+  session_log_path = payload.get("session_log_path")
+  if session_log_path is not None:
+    authority = envelope.workload.session_log_authority
+    if authority is None:
+      raise ApprovalExecutableBindingError("call_identity_mismatch")
+    if authority.layout == "v2":
+      expected_path = authority.active_path
+    else:
+      agent_id = scope_provider_session_id(
+        envelope.workload.profile,
+        provider=envelope.bind.provider,
+        durable=True,
+        openai_epoch=authority.provider_session_epoch,
+      )
+      expected_path = str(AgentSessionLog.path_for_session(
+        authority.base_path,
+        AgentSessionRef(
+          user_id=tenant.storage_id,
+          agent_id=agent_id,
+          agent_session_id=resolve_agent_session_id(tenant.storage_id, agent_id),
+        ),
+      ))
+    if session_log_path != expected_path:
+      raise ApprovalExecutableBindingError("call_identity_mismatch")
   return DelegatedAutonomousExecutableCapture(
     approval_id=payload["approval_id"],
     tool_call_id=payload["tool_call_id"],
@@ -209,6 +249,8 @@ def admit_delegated_executable_capture(
     credential_generation_ref=generation_ref,
     prepared_call=prepared_call,
     dispatch_context=dispatch_context,
+    session_log_path=session_log_path,
+    pack_cursor=payload.get("pack_cursor"),
   )
 
 
@@ -324,7 +366,146 @@ async def create_delegated_autonomous_approval(
       dispatch_context=private_executable_capture.dispatch_context,
       credential_generation_ref=private_executable_capture.credential_generation_ref,
     )
+    if private_executable_capture.session_log_path is not None:
+      record.approval_continuation = {
+        "approval_id": stored.approval_id,
+        "job_id": private_executable_capture.job_id,
+        "tool_call_id": private_executable_capture.tool_call_id,
+        "nonce": private_executable_capture.nonce,
+        "tenant_storage_id": private_executable_capture.tenant_storage_id,
+        "session_log_path": private_executable_capture.session_log_path,
+        "pack_cursor": (
+          dict(private_executable_capture.pack_cursor)
+          if private_executable_capture.pack_cursor is not None else None
+        ),
+      }
   return stored
+
+
+def decided_approval_continuation(
+  *,
+  parked: Mapping[str, Any],
+  binding: Any,
+  decision: Any,
+) -> dict[str, Any] | ContinueStatus:
+  """Sign the decided original call into the successor's launch, or say why not.
+
+  The parent alone reads the ledger. An approval carries the claim token its
+  successor's launch will commit, but nothing is claimed here: the claim is
+  the call's one execution attempt, and it is committed by
+  ``claim_continued_executable_attempt`` only once the successor can run.
+  """
+
+  claim_token: str | None = None
+  if decision.state in {"denied", "auto_denied", "expired"}:
+    verdict = "denied"
+  elif approval_is_executable(decision):
+    verdict = "approved"
+    claim_token = os.urandom(16).hex()
+  else:
+    return "not_restorable"
+  return {
+    "approval_id": binding.approval_id,
+    "job_id": binding.job_id,
+    "tool_call_id": binding.tool_call_id,
+    "nonce": binding.nonce,
+    "tenant_storage_id": binding.tenant_storage_id,
+    "tool_name": binding.tool_name,
+    "decision": verdict,
+    "decision_reason": decision.decision_reason,
+    "decision_request": approval_request_projection(decision),
+    "decision_state_version": decision.state_version,
+    "claim_token": claim_token,
+    "prepared_input": PreparedToolCall(
+      prepared_input=binding.prepared_input,
+      exact_backend=binding.exact_backend,
+    ).materialize_input(),
+    "exact_backend": binding.exact_backend,
+    "dispatch_context": PreparedToolCall(
+      prepared_input=binding.dispatch_context,
+    ).materialize_input(),
+    "credential_generation_ref": binding.credential_generation_ref,
+    "operand_digest": binding.operand_digest,
+    "session_log_path": parked["session_log_path"],
+    "pack_cursor": parked["pack_cursor"],
+  }
+
+
+async def claim_continued_executable_attempt(
+  *,
+  store: Any,
+  continuation: Mapping[str, Any],
+) -> None:
+  """Commit the approved call's one execution attempt for its successor.
+
+  The caller is the launch's final consumer frontier: the successor exists but
+  holds no credential yet, so it cannot run the call until this returns. Any
+  failure before this point leaves the ledger unclaimed and the decision
+  redeliverable; a committed claim with no recorded result reads back as
+  ``execution_outcome_unknown`` and is never released.
+  """
+
+  if continuation["decision"] != "approved":
+    return
+  binding, _decision = await store._read_executable_binding_for_executor(
+    job_id=continuation["job_id"],
+    tool_call_id=continuation["tool_call_id"],
+    nonce=continuation["nonce"],
+    tenant_storage_id=continuation["tenant_storage_id"],
+  )
+  completed = await store._claim_executable_binding_for_executor(
+    binding=binding,
+    decision_state_version=continuation["decision_state_version"],
+    claim_token=continuation["claim_token"],
+  )
+  if completed is not None:
+    raise ApprovalExecutableBindingError("execution_outcome_unknown")
+
+
+async def record_continued_executable_result(
+  *,
+  store: Any,
+  record: AutonomousTask,
+  completed: Any,
+) -> None:
+  """Record the exact result a successor returned for its parent-claimed call.
+
+  Identity comes from this run's signed launch, never from the child's frame.
+  """
+
+  launch = record.launch_approval_continuation
+  if (
+    store is None
+    or launch is None
+    or launch.get("decision") != "approved"
+    or type(completed) is not dict
+    or any(
+      completed.get(key) != launch[key]
+      for key in ("approval_id", "job_id", "tool_call_id", "nonce")
+    )
+  ):
+    raise ApprovalExecutableBindingError("call_identity_mismatch")
+  result_json = completed.get("result_json")
+  try:
+    if type(result_json) is not str:
+      raise ValueError("completed executable result is not JSON text")
+    outcome, error = json.loads(result_json)
+    tool_result = (_restore_executable_result(outcome), error)
+  except (TypeError, ValueError, ApprovalExecutableBindingError):
+    raise ApprovalExecutableBindingError("result_mismatch") from None
+  binding, _decision = await store._read_executable_binding_for_executor(
+    job_id=launch["job_id"],
+    tool_call_id=launch["tool_call_id"],
+    nonce=launch["nonce"],
+    tenant_storage_id=launch["tenant_storage_id"],
+  )
+  await store._complete_executable_binding_for_executor(
+    binding=binding,
+    decision_state_version=launch["decision_state_version"],
+    claim_token=launch["claim_token"],
+    tool_result=tool_result,
+  )
+
 
 
 def require_matching_autonomous_delivery(
@@ -477,6 +658,20 @@ async def deliver_autonomous_approval_outbox(
     )
 
   async def publish_to_child_inbox() -> Any:
+    if (
+      record.approval_continuation is not None
+      and record.approval_continuation["approval_id"] == approval_id
+    ):
+      continued = await registry.continue_approval(
+        approval_id=approval_id, tenant_storage_id=user_id,
+      )
+      if continued is None or continued.status not in {"delivered", "already_delivered"}:
+        raise RuntimeError("Autonomous approval continuation is not restorable")
+      with append_transaction(
+        approval_id, tool_call_id=tool_call_id, nonce=nonce, approved=approved,
+      ):
+        pass
+      return continued
     return await registry.send_approval_decision(
       record.control_run_id,
       user_id=user_id,
@@ -525,6 +720,9 @@ __all__ = [
   "autonomous_approval_delivery_context",
   "autonomous_decision_unavailable",
   "autonomous_run_accepts_approval_decisions",
+  "claim_continued_executable_attempt",
+  "decided_approval_continuation",
   "deliver_autonomous_approval_outbox",
+  "record_continued_executable_result",
   "require_matching_autonomous_delivery",
 ]

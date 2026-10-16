@@ -1,5 +1,97 @@
 # Changelog
 
+## 0.27.0 (2026-10-16)
+
+### Breaking
+
+- `AnthropicCredentialPool` and `ANTHROPIC_CREDENTIAL_POOL` are removed from `providers.anthropic_oauth`, with the process-local cooldowns and first-usable selection they carried. Account selection is quota-aware: `select_anthropic_credential_source()` and `rotate_anthropic_credential_source()` lose their `pool=` argument and gain `model` / `session_id` (select) and `model` / `scope` / `reason` (rotate); `anthropic_credential_blocked_until(credential, *, model)` replaces `pool.blocked_until(key)`. Cooldowns, quota windows, probe backoff, policy and warm affinity live in a per-store `<store>.selection.json` sidecar (`providers/anthropic_quota.py`), keyed by locator (`AccountLocator`, opaque `acct_` id), so a private and an org record with the same identity no longer collapse; cooldowns are visible to every process sharing the store. A caller that imported the pool or passed `pool=` must drop it: `evals`, `risk_module` and `investment_tools` consumers migrate before adopting this release. `ProviderCredentialFailure` gains `limit_scope`, and an Anthropic concurrency 429 or 529 no longer parks an account.
+
+- `AdmissionOwners` and `ContinuationOwners` no longer accept `placement` or `env_contract`. Admission derives placement and environment projection from the bind's `run_mode`; callers must stop supplying those fields.
+
+- Custom dispatchers must implement `prepare_tool_call_async()` and `dispatch_prepared()`. The runner no longer falls back to direct dispatch when a dispatcher lacks the preparation contract.
+
+### Added
+
+- Quota-aware Anthropic account selection. `ModelProvider.prepare_credential(config, *, model, session_id)` (no-op by default) runs only at episode-starting client builds: the first request of a turn, the rebuild after a model-fallback hop, the reactive-compaction rebuild and the compaction summarizer. A same-model transient retry keeps its binding, and rotated material is not re-prepared. Affinity uses the durable conversation identity (`undo_token_lifetime.conversation_id`), so resume keeps warm affinity; sub-agents keep their own id. `AnthropicProvider` ranks the pool private-first, keeps one hour of warm affinity, then orders by reserve, an 85% short-window guard, measured quota before unknown, priority, and weekly then short-window drain. It probes stale accounts at `api.anthropic.com/api/oauth/usage` (direct route only, 2 s / 4 concurrent; a 401/403 marks telemetry unavailable for an hour and never parks inference) and ingests `anthropic-ratelimit-unified-*` headers on success and failure. A quota 429 parks its scope (shared or model family) until its reset; a concurrency 429 or 529 backs off without parking; any other 403 keeps `billing`. An automatic resolver-issued `credential_source` is an affinity hint, an exact one is honoured. Refresh keeps the store-wide `_store_lock` flock protocol used by published gateway versions, now with a bounded wait, held across reread → exchange → guarded write. New CLI: `auth policy anthropic --identity ACCOUNT [--user N|--store PATH] (--priority INT --reserve-pct FLOAT | --reset)` and `auth list anthropic --usage` (cached view only).
+
+- Gateway-owned workbook undo lifetime (`UndoTokenLifetimeRegistry`, `<log_dir>/workbook-undo.sqlite3`): restore tokens stay active while an owning conversation holds them, without TTL or count eviction. `POST /workbook-undo/status` returns `unknown` / `consumed` / `active` / `terminal`; `POST /chat/close` and `DELETE /chat/conversations/{conversation}` explicitly retire the conversation. Forks share token holders; auth expiry alone does not end them.
+
+- Child-scoped background controls: `run_agent(interrupt=<task_id>)` pauses one owned child without cancelling siblings; `run_agent(resume=<task_id>, additional_context=...)` continues its durable transcript. `TaskRegistry.interrupt()` and `interrupt_background_task()` distinguish `parent_interrupted` from `user_interrupted`; the interrupt acknowledgement is not settlement.
+
+- Detached autonomous children park as `awaiting_approval` on a human ask. `AutonomousRegistry.continue_approval(approval_id=..., tenant_storage_id=...)` relaunches from the captured, signed call binding; the parent executes the decided call without granting the child access to its approval store. Continued results retain the transcript and deduplicate delivery by approval id.
+
+- Approval decisions accept an optional `reason` through HTTP, transport and in-memory approval paths. `ToolApprovalDecidedEvent` carries `approval_id` / `decision_reason`, and a denial's tool result includes the user's reason.
+
+- Offline `session_archive.archive_session()` / `ArchiveResult` and the CLI's `hank archive-session` export a self-contained session directory: transcripts, lineage-linked autonomous children, content-addressed prompts, dereferenced spills and a SHA-256 manifest. Missing or malformed inputs are warnings; the output directory must be new.
+
+- `SessionUsageSummary.provider_model_usage` exposes per-provider/model/bind `ProviderModelUsage` buckets, including the `rate_table_version` that priced each hop. `UsageEvent` and `SessionUsageSummary` also carry an optional child-attempt `stage_id`.
+
+- Code-exec provenance: `hank.input()`, `hank.derive(name, value, expression=..., inputs=...)` and `hank.carry()` retain selected inputs' issued `source_refs`; bridge replies and ledger entries carry them, and `summary()` reports derived values separately from sources. Returned dict/list subclasses carry lineage; unissued inputs produce `input_unsourced` findings.
+
+- Read-only parent-session capability claims for `get_investment_run`, `list_investment_artifacts` and `get_investment_artifact`, without an active skill admission. `issue_investment_capability_claim()` accepts `skill=None` for these reads; mutations still require their admitted skill.
+
+- Admitted children with a non-empty tool surface gain the `tool_result_read` companion for their own spilled results. A child advertises spill reads only when its dispatcher can execute them.
+
+- `decision_record.build_decision_record()` and `run_pointer_from_context()` provide a store-independent decision envelope with an open actor/verdict vocabulary and available run join keys.
+
+### Changed
+
+- `agent_workflow_contracts` moves out of the gateway wheel into the separate `agent-workflow-contracts>=1,<2` dependency; Python import names and generated contract resources stay the same. Source-checkout consumers must include the new package root. The model-authority floor is `hank-model-authority>=1.6.1,<2`.
+
+- `AuthConfig` separates `auth_mechanism` (`api_key` / `oauth_bearer` / `none`) from `entitlement_kind`; `from_dict()` preserves the raw round trip instead of injecting derived keys. Public placement helpers (`placement_for_channel()`, `evaluate_placement_eligibility()`, `filter_fallback_entries_for_placement()`) distinguish local use from `hosted_external` (currently web): hosted execution excludes local daemons and personal subscription seats, while commercial BYOK and org/platform seats retain their own billing identities.
+
+- Anthropic resolution includes user-store API keys and materializes an API-key pool member as an API key, not a bearer token. Muse subscriptions in the org store are operator-personal service/metered seats, not the requesting user's consumer subscription.
+
+- Admission records the role selected by the bind in `selection_provenance`. `autonomous` / `cron` use `local_stub` placement and the autonomous environment projection; `interactive` / `batch` / `fleet` remain in-process.
+
+- `run_agent` reuses matching successful children only within the current spawning runner, after admission, keyed by objective, handles, role, effort and resolved research inputs. A foreground concurrent duplicate waits for the same completion; a background duplicate receives its running acknowledgement. Failed, killed or interrupted children spawn fresh on retry.
+
+- Changed-argument prepared-BusinessModel retries replace only an unclaimed PENDING plan. The predecessor approval is expired through the approval transition owner with `decision_reason="superseded by <approval_id>"`; authorized, claimed or completed plans cannot be overwritten, and denied/expired originals retain their authorization error.
+
+- `ContainmentSettings.compaction_trigger_pct` defaults to 25% instead of 80% (about 250k tokens for a 1M window), retaining the configured token floor and `HANK_COMPACTION_TRIGGER_PCT` override. `run_autonomous()` / `run_autonomous_sync()` accept an optional `compaction_trigger`.
+
+- Autonomous manifests fold declared tool surfaces by union: visible names determine the union count when complete, otherwise the maximum declared count is retained; a missing `allowed_tools` ceiling stays absent, and a later legacy declaration cannot leave an incomplete name set marked complete.
+
+- The seven research context/compare doors can bind authenticated local handlers, including when loaded by autonomous agents, without changing their callable names or arguments. Forecast context returns a compact navigation index and invalid-key recovery with `valid_keys` / `next_call`. Source-identity extraction uses the producer's declared descriptor kind; `get_concept`, `get_statement` and `get_financials` gain citation readers.
+
+- Tool cards omit the internal `_workbook` session UUID, render concept/skill identifiers as readable titles, and supply labels for additional research, memory and FMS tools.
+
+- `CommercialWorkStartError` is owned by `hank_contracts.commercial_work`; the top-level gateway export resolves to that class. It is no longer listed in `commercial_work_start.__all__`.
+
+### Fixed
+
+- Fallback hops select a placement-eligible account from the pool rather than binding an ineligible first member and skipping the route. The bound credential's actual entitlement governs selection, including direct and generation-bound one-candidate pools; a fully parked eligible pool remains distinguishable from `placement_ineligible`.
+
+- Per-hop cost rows retain the pricing table version used for that hop. Sequential and resumed children get separate attempt-scoped cost rows instead of overwriting `sub0` siblings; `session.cached_usage` keeps the dispatch-tree total while summary callbacks remain per-run. `send_prompt()` completion records name the credential bind that actually served after rotation.
+
+- Anthropic refresh fallback credentials are marked prepared only after refresh preflight, so an all-blocked fallback still refreshes before use. Current-generation reads do not wait behind a refresh exchange, and preparation preserves the requested placement.
+
+- Anthropic quota updates never overwrite an unreadable selection sidecar; policy writes report the failure. Per-account `claim_usage_probe()` / `UsageProbeState.in_progress_until` prevent duplicate parent/child probes, freshness follows the jittered probe deadline, and exported `window_exhausted()` / `claim_scope()` keep exhaustion and model-family scope consistent. Overflowing telemetry numbers are ignored.
+
+- Ollama Cloud monthly-quota bodies classify as billing again; a monthly-limit / add-credits 429 without `Retry-After` parks the credential for 24 hours instead of the short default.
+
+- Kimi Code materialization preserves both OAuth and API-key store paths for later rotation. Chat-completions adapters admit `effort="none"` for off-only reasoning models, including adapters without `get_model_info()`.
+
+- Explicit `/chat/init` `model_preset` outranks a saved driver preference. Assistant-tail continuations append a durable user nudge before an Anthropic request; excluded tools do not receive request-1 deferral framing.
+
+- `run_agent` registration failures release unstarted spawn claims, including shielded setup failures; background completion honors the child's `parent_result_policy`, and terminal interruption events use the closure decision's recorded reason. A late handler cannot overwrite a task that has already settled COMPLETED, FAILED or KILLED.
+
+- Detached approval continuations claim the executable attempt after spawn and before credential handoff. A failed launch leaves the call retryable; unknown execution outcomes remain `execution_outcome_unknown`, never a fabricated completion or same-call retry.
+
+- `run_agent`'s schema no longer uses a top-level `oneOf`; an unconfigured resume handler returns `invalid_input` instead of raising `StopIteration`. Approval payload objects without `reason` remain supported.
+
+- Undo result observation unwraps `_runner` / `_inner` wrappers and chains the existing result hook. Explicit close cancels active turns, denies parked approvals with `conversation_closed`, revokes their grants, and prevents cold resume or fork from a closed conversation; token-recording failures warn without breaking the tool result.
+
+- Interactive `invoke_skill` rotates the runner's skill-run identity, and `run_agent` children inherit the parent's source-registry scope so parent-issued source handles remain resolvable.
+
+- Compaction retains noop `verdict_echo` findings, warnings, explicit nulls, empty containers, `argument_skeleton` and `next_call`. Navigation indexes preserve keys/items through projection; an oversized list degrades to a marked prefix with an elision count instead of an omission stub.
+
+- Uncoded owner failures (`planned_write_planning_failed` / `local_tool_failed`) report `retryable=false` and `tool_call_id` without manufacturing a same-call `next_call`; named-field and owner-supplied repair calls are retained.
+
+- Autonomous children receive `CANVAS_BUILD_DIR` / `CANVAS_NODE_BINARY`. `GATEWAY_SSL_VERIFY` is classified as tool environment so declared sibling MCP servers can receive it from their own dotenv.
+
+- MCP stdio shutdown retires watch tasks before taking the manager lock, avoiding the shutdown/replacement deadlock. On Darwin, `killpg` EPERM for an all-zombie group is treated as no live member rather than a cleanup failure.
+
 ## 0.26.0 (2026-10-15)
 
 ### Breaking

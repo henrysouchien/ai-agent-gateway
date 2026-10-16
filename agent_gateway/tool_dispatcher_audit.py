@@ -81,6 +81,8 @@ def emit_approval_decided(
   outcome: str,
   decision_source: ApprovalDecisionSource,
   allow_tool_type_applied: bool,
+  approval_id: str | None = None,
+  decision_reason: str | None = None,
   time_fn: Callable[[], float] = time.time,
 ) -> dict[str, Any] | None:
   """Append the decision to ``event_log``; returns the appended event."""
@@ -95,6 +97,10 @@ def emit_approval_decided(
     "allow_tool_type_applied": allow_tool_type_applied,
     "ts": time_fn(),
   }
+  if approval_id is not None:
+    event["approval_id"] = approval_id
+  if decision_reason is not None:
+    event["decision_reason"] = decision_reason
   event_log.append(event)
   return event
 

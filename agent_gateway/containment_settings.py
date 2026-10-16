@@ -107,7 +107,7 @@ class ContainmentSettings:
   context_pressure_reminder_step_pct: int = 10
   """Further percentage points before the next reminder."""
 
-  compaction_trigger_pct: int = 80
+  compaction_trigger_pct: int = 25
   """A configured compaction trigger is raised to this percent of a larger
   window (``effective_compaction_trigger``)."""
 

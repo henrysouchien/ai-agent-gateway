@@ -58,7 +58,12 @@ _DEFAULT_SYSTEM_PROMPT_TEMPLATE = (
   "Today's date: {date}"
 )
 _RUN_AGENT_DESCRIPTION = (
-  "Spawn a focused child from a registered executable operation. Pass the "
+  "Spawn, interrupt, or resume a focused child. To interrupt only one live "
+  "background child, pass interrupt=task_id; the parent and siblings keep "
+  "running. After its interrupted notification, pass resume=task_id and "
+  "optional additional_context to continue on the original capability bind "
+  "from its durable transcript. Do not mix controls with spawn arguments. "
+  "To spawn from a registered executable operation, pass the "
   "complete operation identity advertised below, or omit it to select the "
   "registered generic explore operation. The server admits model, semantic "
   "capabilities, and an exact tool grant; operation prose does not grant tools. "
@@ -225,6 +230,27 @@ def make_run_agent_tool_def(
       "type": "object",
       "additionalProperties": False,
       "properties": {
+        "interrupt": {
+          "type": "string",
+          "minLength": 1,
+          "description": (
+            "Request interruption of one live background child owned by this "
+            "job, preserving its transcript and original binding for resume. "
+            "Wait for its interrupted notification before resuming."
+          ),
+        },
+        "resume": {
+          "type": "string",
+          "minLength": 1,
+          "description": (
+            "Interrupted or parked child task_id to continue from its durable "
+            "transcript on its original model and tool grant. Returns a new task_id."
+          ),
+        },
+        "additional_context": {
+          "type": "string",
+          "description": "Optional continuation guidance; used only with resume.",
+        },
         "operation": {
           "type": "object",
           "additionalProperties": False,
@@ -303,7 +329,6 @@ def make_run_agent_tool_def(
           "default": True,
         },
       },
-      "required": ["objective"],
     },
   }
 

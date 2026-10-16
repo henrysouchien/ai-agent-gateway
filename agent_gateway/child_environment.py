@@ -103,7 +103,6 @@ _AUTONOMOUS_CHILD_PROCESS_ENV_NAMES = frozenset({
   "LOCAL_GATEWAY_RUNTIME_MANIFEST",
   "LOCAL_GATEWAY_RUNTIME_VERSION_ROOT",
   GATEWAY_BASE_URL_ENV,
-  "GATEWAY_SSL_VERIFY",
   "AGENT_API_CLAIM_TTL_SECONDS",
   "AGENT_GATEWAY_SKILLS_DIR",
   "AGENT_SESSION_LOG_BASE_DIR",
@@ -120,6 +119,8 @@ _AUTONOMOUS_CHILD_PROCESS_ENV_NAMES = frozenset({
   "RISK_CLIENT_PATH",
   "RISK_MODULE_RESOLVER_URL",
   "CODE_EXECUTE_DOCKER_IMAGE",
+  "CANVAS_BUILD_DIR",
+  "CANVAS_NODE_BINARY",
   "EDGAR_API_URL",
   "EDGAR_UPDATER_ROOT",
   # Launch references the gateway's own MCP topology names for sibling servers
@@ -162,6 +163,9 @@ AUTONOMOUS_CHILD_RUNTIME_ENV_NAMES = (
 # profile it runs as. A name the gateway does not carry may still reach the
 # declaring server from its own dotenv.
 _AUTONOMOUS_CHILD_TOOL_ENV_NAMES = frozenset({
+  # Transport configuration, not gateway authority: a sibling's declared
+  # setting supplies it only when the gateway does not already carry a value.
+  "GATEWAY_SSL_VERIFY",
   "FMP_API_KEY",
   "FMP_CACHE_DIR",
   "FRED_API_KEY",

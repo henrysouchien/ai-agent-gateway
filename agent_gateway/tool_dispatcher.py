@@ -37,11 +37,13 @@ from .approval_policy import (
   RunContext,
   ToolClass,
   approval_is_executable,
+  approval_request_from_projection,
   utc_now,
 )
 from .approval_store import (
   ApprovalExecutableBindingError,
   ExecutableApprovalBinding,
+  _executable_result_json,
 )
 from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich_trade_approval_args
 from .approval_route import (
@@ -59,6 +61,7 @@ from .execution_identity import DispatchIdentity
 from .investment_capability_claim import (
   INVESTMENT_CAPABILITY_CLAIM_SERVER,
   INVESTMENT_CAPABILITY_FACADE_TOOLS,
+  INVESTMENT_READBACK_FACADE_TOOLS,
   INVESTMENT_JOB_PRINCIPAL_TOOLS,
   InvestmentCapabilityClaimError,
   investment_capability_claim_unavailable_error,
@@ -134,6 +137,7 @@ from .tool_dispatch_classification import (
 
 if TYPE_CHECKING:
   from .approval_store import TargetedPreparedReconciliationResult
+  from .runner_tool_execution import ApprovedBindingExecutor
   from .mcp_client import McpClientManager
   from .session import GatewaySession
   from .prepared_business_model_store import (
@@ -148,12 +152,30 @@ _PORTFOLIO_SCOPE_FIELDS = frozenset({"portfolio_id", "portfolio_name"})
 _CATALOG_ACTION_UNSET = object()
 _TOOL_CLASSES = frozenset(get_args(ToolClass))
 
+@dataclass(slots=True, repr=False)
+class _ParentClaimedAttempt:
+  """What a contained child's dispatch reached for its parent-claimed call.
+
+  The parent claimed the one execution attempt in its own ledger and learns the
+  outcome only from the child's returned frame. ``may_have_executed`` is set at
+  the claim frontier, immediately before the handler runs; a call refused
+  earlier never sets it. ``result_known`` is set only when the call returned
+  an outcome the parent may record as completed.
+  """
+
+  may_have_executed: bool = False
+  result_known: bool = False
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class _VerifiedExecutableApproval:
   """Private execution authority read with the exact durable operands."""
 
   binding: ExecutableApprovalBinding
   decision: PolicyApprovalRequest
+  # A contained child holds no ledger: the parent already claimed this attempt
+  # in its own ledger and records the child's returned result there.
+  parent_attempt: _ParentClaimedAttempt | None = None
 
 
 class ToolDispatcherApprovalStore(Protocol):
@@ -930,6 +952,7 @@ class ToolDispatcher:
     exc: Exception,
     *,
     code: str,
+    tool_call_id: str,
   ) -> dict[str, Any]:
     """The owner's own failure, carried to the agent rather than renamed.
 
@@ -940,6 +963,11 @@ class ToolDispatcher:
     own schema rejected: it names the model and the dotted field of its first
     error. Absent the owner's own ``next_call``, the next call is this call again
     with the named field repaired. ``code`` names the stage that failed.
+
+    An exception that names neither a field nor a ``next_call`` is an unexpected
+    implementation failure: the same call is not offered again, the failure is marked
+    ``retryable: False`` and carries this call's ``tool_call_id``, the identity
+    ``research`` routes give as ``request_id``.
     """
     raw_data = getattr(exc, "data", None)
     data: Mapping[str, Any] = raw_data if isinstance(raw_data, Mapping) else {}
@@ -954,6 +982,16 @@ class ToolDispatcher:
     owner_code = getattr(exc, "code", None)
     fix = getattr(exc, "fix", None) or data.get("fix")
     next_call = getattr(exc, "next_call", None) or data.get("next_call")
+    field_name = field if isinstance(field, str) and field else None
+    unexpected = field_name is None and not isinstance(next_call, Mapping)
+    if isinstance(next_call, Mapping):
+      repair: dict[str, Any] = {"next_call": dict(next_call)}
+    elif field_name is not None:
+      repair = {
+        "next_call": {"tool_name": tool_name, "arguments": copy.deepcopy(dict(tool_input))}
+      }
+    else:
+      repair = {}
     return {
       "code": code,
       "message": f"Tool '{tool_name}' raised {error_type}: {reason}",
@@ -961,15 +999,12 @@ class ToolDispatcher:
       "data": {
         "error_type": error_type,
         "reason": reason,
-        "field": field if isinstance(field, str) and field else None,
+        "field": field_name,
         **({"model": model} if model else {}),
         **({"owner_code": owner_code} if isinstance(owner_code, str) else {}),
         **({"fix": self._secret_boundary.redact_text(fix)} if isinstance(fix, str) else {}),
-        "next_call": (
-          dict(next_call)
-          if isinstance(next_call, Mapping)
-          else {"tool_name": tool_name, "arguments": copy.deepcopy(dict(tool_input))}
-        ),
+        **({"retryable": False, "tool_call_id": tool_call_id} if unexpected else {}),
+        **repair,
       },
     }
 
@@ -1655,16 +1690,180 @@ class ToolDispatcher:
     if completed is not None:
       return completed
 
+    return await self._settle_decided_binding(
+      context=context,
+      binding=binding,
+      decision=decision,
+      tool_call_id=tool_call_id,
+      abort_event=abort_event,
+      on_executed_prepared_call=on_executed_prepared_call,
+      parent_attempt=None,
+    )
+
+  def parent_decided_executor(
+    self,
+    continuation: Mapping[str, Any],
+  ) -> "ApprovedBindingExecutor":
+    """Bind a signed launch continuation as the resumed call's executor."""
+
+    signed = dict(continuation)
+
+    async def execute(
+      *,
+      job_id: str,
+      tool_call_id: str,
+      nonce: str,
+      abort_event: asyncio.Event | None,
+      on_executed_prepared_call: Callable[[PreparedToolCall], None] | None,
+    ) -> ToolResult:
+      return await self.execute_parent_decided_call(
+        continuation=signed,
+        job_id=job_id,
+        tool_call_id=tool_call_id,
+        nonce=nonce,
+        abort_event=abort_event,
+        on_executed_prepared_call=on_executed_prepared_call,
+      )
+
+    return execute
+
+  async def execute_parent_decided_call(
+    self,
+    *,
+    continuation: Mapping[str, Any],
+    job_id: str,
+    tool_call_id: str,
+    nonce: str,
+    abort_event: asyncio.Event | None,
+    on_executed_prepared_call: Callable[[PreparedToolCall], None] | None,
+  ) -> ToolResult:
+    """Run the parent-decided original call from its signed launch continuation.
+
+    A contained child never opens the parent's approval ledger. The parent read
+    the decided request and executable binding from that ledger, claimed the
+    attempt there, and signed them into this launch; the child returns the
+    result over its private channel for the parent to record.
+    """
+
+    context = self._executing_context()
+    if context is None:
+      return None, self._approved_binding_error(
+        "approval_execution_context_missing",
+        "Continue the original admitted job before executing its approval.",
+      )
+    if (
+      context.tenant is None
+      or continuation.get("job_id") != job_id
+      or context.job_id != job_id
+      or continuation.get("tool_call_id") != tool_call_id
+      or continuation.get("nonce") != nonce
+      or continuation.get("tenant_storage_id") != context.tenant.storage_id
+    ):
+      return None, self._approved_binding_error(
+        "approval_binding_call_identity_mismatch",
+        "The signed continuation is not the executing job's original call.",
+      )
+    try:
+      decision = approval_request_from_projection(
+        continuation["decision_request"]
+      )
+      binding = ExecutableApprovalBinding(
+        approval_id=continuation["approval_id"],
+        job_id=job_id,
+        tool_call_id=tool_call_id,
+        nonce=nonce,
+        tenant_storage_id=continuation["tenant_storage_id"],
+        tool_name=continuation["tool_name"],
+        prepared_input=continuation["prepared_input"],
+        dispatch_context=continuation["dispatch_context"],
+        exact_backend=continuation["exact_backend"],
+        credential_generation_ref=continuation["credential_generation_ref"],
+        operand_digest=continuation["operand_digest"],
+      )
+    except (KeyError, TypeError, ValueError, ApprovalExecutableBindingError):
+      return None, self._approved_binding_error(
+        "approval_binding_operand_mismatch",
+        "The signed continuation does not carry the original call's operands.",
+      )
+    if (
+      decision.approval_id != binding.approval_id
+      or decision.tool_call_id != tool_call_id
+      or decision.tool_name != binding.tool_name
+    ):
+      return None, self._approved_binding_error(
+        "approval_binding_call_identity_mismatch",
+        "The signed decision is not the original call's approval.",
+      )
+    parent_attempt = _ParentClaimedAttempt()
+    result = await self._settle_decided_binding(
+      context=context,
+      binding=binding,
+      decision=decision,
+      tool_call_id=tool_call_id,
+      abort_event=abort_event,
+      on_executed_prepared_call=on_executed_prepared_call,
+      parent_attempt=parent_attempt,
+    )
+    route = self._approval_route
+    writer = (
+      route.private_capture_writer
+      if isinstance(route, ParentDelegatedApprovalRoute) else None
+    )
+    if (
+      continuation.get("decision") == "approved"
+      and writer is not None
+      and parent_attempt.result_known
+    ):
+      # The parent holds the claim and completes it only with an outcome the
+      # call actually returned; a refused, raised or uncertain call sends no
+      # frame, so its claim stays outcome-unknown. The child has no ledger
+      # path to record anything itself.
+      try:
+        result_json = _executable_result_json(result)
+      except (TypeError, ValueError):
+        return None, self._approved_binding_error(
+          "approval_binding_result_mismatch",
+          "The original call returned, but its exact outcome could not be retained.",
+          next_call=(
+            "Return this persistence failure to the original call's owner; "
+            "inspect its effect rather than executing the call again."
+          ),
+        )
+      await writer({
+        "completed_executable_result": {
+          "approval_id": binding.approval_id,
+          "job_id": job_id,
+          "tool_call_id": tool_call_id,
+          "nonce": nonce,
+          "result_json": result_json,
+        },
+      })
+    return result
+
+  async def _settle_decided_binding(
+    self,
+    *,
+    context: Any,
+    binding: ExecutableApprovalBinding,
+    decision: PolicyApprovalRequest,
+    tool_call_id: str,
+    abort_event: asyncio.Event | None,
+    on_executed_prepared_call: Callable[[PreparedToolCall], None] | None,
+    parent_attempt: _ParentClaimedAttempt | None,
+  ) -> ToolResult:
+    """Settle one read decision: deny it, or execute its exact prepared call."""
+
     if decision.state in {"denied", "auto_denied"}:
       await self._record_durable_approval_decided(
         tool_call_id,
         binding.tool_name,
         outcome="denied",
         decision_source="durable_approval_denied",
+        request=decision,
       )
       return None, self._approved_binding_error(
         "user_denied",
-        "The original approval was denied; the stored call was not executed.",
+        self._approval_denial_message(decision.decision_reason),
         request=decision,
         next_call="Return the denied decision to the original job without executing or retrying this call.",
       )
@@ -1709,7 +1908,11 @@ class ToolDispatcher:
       binding.prepared_input,
       binding.exact_backend,
     )
-    verified = _VerifiedExecutableApproval(binding=binding, decision=decision)
+    verified = _VerifiedExecutableApproval(
+      binding=binding,
+      decision=decision,
+      parent_attempt=parent_attempt,
+    )
     try:
       execution = self._dispatch_prepared_with_approval(
         tool_call_id,
@@ -2038,6 +2241,10 @@ class ToolDispatcher:
       store = self._approval_store
       if executable_approval is None:
         return None
+      if executable_approval.parent_attempt is not None:
+        # The parent's claim already stands; from here the call may run.
+        executable_approval.parent_attempt.may_have_executed = True
+        return None
       assert store is not None, "captured executable approval requires its ledger"
       claim_token = os.urandom(16).hex()
       try:
@@ -2061,7 +2268,13 @@ class ToolDispatcher:
       return None
 
     def note_unknown_execution(error: dict[str, Any]) -> None:
-      if execution_claim_token is not None:
+      attempt = (
+        executable_approval.parent_attempt
+        if executable_approval is not None else None
+      )
+      if execution_claim_token is not None or (
+        attempt is not None and attempt.may_have_executed
+      ):
         data = error.setdefault("data", {})
         data["execution_outcome"] = "unknown"
         data["next_call"] = (
@@ -2150,7 +2363,7 @@ class ToolDispatcher:
           type(exc).__name__,
         )
         return None, self._owner_failure_error(
-          tool_name, tool_input, exc, code="planned_write_planning_failed"
+          tool_name, tool_input, exc, code="planned_write_planning_failed", tool_call_id=tool_call_id
         )
     elif (
       registered_approval_declaration is not None
@@ -2189,7 +2402,7 @@ class ToolDispatcher:
           type(exc).__name__,
         )
         return None, self._owner_failure_error(
-          tool_name, tool_input, exc, code="planned_write_planning_failed"
+          tool_name, tool_input, exc, code="planned_write_planning_failed", tool_call_id=tool_call_id
         )
 
     registered_approval_reuse_key: str | None = None
@@ -2365,9 +2578,42 @@ class ToolDispatcher:
                 "message": "The durable BusinessModel plan is terminal and cannot execute.",
               }
             if not immutable_matches:
-              raise TrustedToolPlanError(
-                "FMS skill-run locator conflicts with its prepared BusinessModel plan"
-              )
+              if (
+                prepared_business_model_record.lifecycle
+                is PreparedBusinessModelLifecycle.PENDING
+              ):
+                prepared_business_model_record = (
+                  await reconcile_pending_business_model_record(
+                    prepared_business_model_record
+                  )
+                )
+                if (
+                  prepared_business_model_record.lifecycle
+                  is PreparedBusinessModelLifecycle.PENDING
+                ):
+                  prepared_business_model_record = None
+                elif prepared_business_model_record.lifecycle in {
+                  PreparedBusinessModelLifecycle.DENIED,
+                  PreparedBusinessModelLifecycle.EXPIRED,
+                }:
+                  return None, {
+                    "code": "planned_write_authorization_state_invalid",
+                    "message": (
+                      "The original BusinessModel approval was denied."
+                      if prepared_business_model_record.lifecycle
+                      is PreparedBusinessModelLifecycle.DENIED
+                      else "The durable BusinessModel plan expired."
+                    ),
+                  }
+                else:
+                  raise TrustedToolPlanError(
+                    "FMS skill-run locator conflicts with its prepared BusinessModel plan"
+                  )
+              else:
+                raise TrustedToolPlanError(
+                  "FMS skill-run locator conflicts with its prepared BusinessModel plan"
+                )
+          if prepared_business_model_record is not None:
             if (
               prepared_business_model_record.lifecycle
               is PreparedBusinessModelLifecycle.PENDING
@@ -2688,6 +2934,7 @@ class ToolDispatcher:
           outcome="approved",
           decision_source="planned_write_reinvocation_required",
           allow_tool_type_applied=False,
+          request=approval_request_record,
         )
         return None, {
           "code": "planned_write_reinvocation_required",
@@ -2698,13 +2945,17 @@ class ToolDispatcher:
         }
       if not lifecycle.get("approved"):
         decision_source = "user_denied"
-        error_dict = {"code": "user_denied", "message": "User denied execution"}
+        error_dict = {
+          "code": "user_denied",
+          "message": self._approval_denial_message(approval_request_record.decision_reason),
+        }
         self._emit_approval_decided(
           tool_call_id,
           tool_name,
           outcome="denied",
           decision_source=lifecycle.get("decision_source") or decision_source,
           allow_tool_type_applied=False,
+          request=approval_request_record,
         )
         return None, error_dict
 
@@ -2740,6 +2991,7 @@ class ToolDispatcher:
           )
         ),
         allow_tool_type_applied=False,
+        request=approval_request_record,
       )
 
     elif executable_approval is not None:
@@ -2766,6 +3018,7 @@ class ToolDispatcher:
         tool_name,
         outcome="approved",
         decision_source="durable_approved_binding",
+        request=approval_request_record,
       )
 
     elif static_needs_approval or dynamic_ask:
@@ -2826,13 +3079,19 @@ class ToolDispatcher:
         approval_request_record = lifecycle.get("request")
         if not lifecycle.get("approved"):
           decision_source = "user_denied"
-          error_dict = {"code": "user_denied", "message": "User denied execution"}
+          error_dict = {
+            "code": "user_denied",
+            "message": self._approval_denial_message(
+              approval_request_record.decision_reason if approval_request_record else None
+            ),
+          }
           self._emit_approval_decided(
             tool_call_id,
             tool_name,
             outcome="denied",
             decision_source=decision_source,
             allow_tool_type_applied=False,
+            request=approval_request_record,
           )
           return None, error_dict
         final_tool_input = lifecycle["tool_input"] if "tool_input" in lifecycle else tool_input
@@ -2859,6 +3118,7 @@ class ToolDispatcher:
             else "user_approved"
           ),
           allow_tool_type_applied=False,
+          request=approval_request_record,
         )
       elif self._request_approval is None:
         return None, {
@@ -2886,9 +3146,13 @@ class ToolDispatcher:
           outcome="approved" if decision.approved else "denied",
           decision_source="user_approved" if decision.approved else "user_denied",
           allow_tool_type_applied=False,
+          decision_reason=decision.reason,
         )
         if not decision.approved:
-          return None, {"code": "user_denied", "message": "User denied execution"}
+          return None, {
+            "code": "user_denied",
+            "message": self._approval_denial_message(decision.reason),
+          }
 
     result: Optional[Any]
     error: Optional[Dict[str, Any]]
@@ -2980,7 +3244,7 @@ class ToolDispatcher:
             type(exc).__name__,
           )
           result, error = None, self._owner_failure_error(
-            tool_name, final_tool_input, exc, code="local_tool_failed"
+            tool_name, final_tool_input, exc, code="local_tool_failed", tool_call_id=tool_call_id
           )
           note_unknown_execution(error)
         else:
@@ -3005,7 +3269,7 @@ class ToolDispatcher:
             type(exc).__name__,
           )
           result, error = None, self._owner_failure_error(
-            tool_name, final_tool_input, exc, code="local_tool_failed"
+            tool_name, final_tool_input, exc, code="local_tool_failed", tool_call_id=tool_call_id
           )
           note_unknown_execution(error)
         else:
@@ -3104,23 +3368,43 @@ class ToolDispatcher:
                 "the model."
               ),
             }
+          active_admission = current_skill_admission()
           try:
             reconciled_admission = reconcile_skill_admission(
               skill_name=run_context.skill,
               execution_limits=(
                 run_context.admitted_skill_execution_limits
               ),
-              active_admission=current_skill_admission(),
+              active_admission=active_admission,
             )
           except (TypeError, ValueError):
             return None, investment_capability_claim_unavailable_error(
               subject=f"tool '{lifecycle_tool_name}'",
             )
           if reconciled_admission is None:
-            return None, investment_capability_claim_unavailable_error(
-              subject=f"tool '{lifecycle_tool_name}'",
-            )
-          trusted_skill = reconciled_admission.skill_name
+            if (
+              lifecycle_tool_name in INVESTMENT_READBACK_FACADE_TOOLS
+              and run_context.skill is None
+              and active_admission is None
+            ):
+              trusted_skill = None
+              admitted_limits = None
+              effective_skill_run_id = str(
+                skill_run_id
+                or run_context.run_id
+                or self._session_id
+                or run_context.session_id
+                or run_context.request_id
+                or ""
+              )
+            else:
+              return None, investment_capability_claim_unavailable_error(
+                subject=f"tool '{lifecycle_tool_name}'",
+              )
+          else:
+            trusted_skill = reconciled_admission.skill_name
+            admitted_limits = reconciled_admission.execution_limits
+            effective_skill_run_id = str(skill_run_id or "")
           trusted_research_file_id: int | None = None
           if lifecycle_tool_name == "start_quant_research":
             trusted_research_file_id = run_context.research_file_id
@@ -3148,15 +3432,13 @@ class ToolDispatcher:
                 user_id=str(resolved_risk_user_id or ""),
                 tenant=executing_context.tenant if executing_context is not None else None,
                 session_id=str(self._session_id or run_context.session_id or ""),
-                skill_run_id=str(skill_run_id or ""),
+                skill_run_id=effective_skill_run_id,
                 channel=str(self._channel or run_context.channel or ""),
                 tool_name=lifecycle_tool_name,
                 request_id=str(run_context.request_id or ""),
                 jti=str(tool_call_id or ""),
                 skill=trusted_skill,
-                admitted_skill_execution_limits=(
-                  reconciled_admission.execution_limits
-                ),
+                admitted_skill_execution_limits=admitted_limits,
                 policy_bundle_hash=str(run_context.policy_bundle_hash or ""),
                 research_file_id=trusted_research_file_id,
               )
@@ -3348,6 +3630,12 @@ class ToolDispatcher:
       prepared_call=original_prepared_call,
     ).outcome if approval_request_record is not None else None
 
+    if (
+      executable_approval is not None
+      and executable_approval.parent_attempt is not None
+      and execution_result_known
+    ):
+      executable_approval.parent_attempt.result_known = True
     if execution_claim_token is not None and execution_result_known:
       assert executable_approval is not None
       store = self._approval_store
@@ -3987,6 +4275,10 @@ class ToolDispatcher:
   ) -> NeedsApprovalCallback:
     return _runtime_helpers.normalize_needs_approval(needs_approval)
 
+  @staticmethod
+  def _approval_denial_message(reason: str | None) -> str:
+    return f"Tool call denied by user: {reason}" if reason else "User denied execution"
+
   def _emit_approval_decided(
     self,
     tool_call_id: str,
@@ -3995,6 +4287,8 @@ class ToolDispatcher:
     outcome: str,
     decision_source: ApprovalDecisionSource,
     allow_tool_type_applied: bool,
+    request: PolicyApprovalRequest | None = None,
+    decision_reason: str | None = None,
   ) -> dict[str, Any] | None:
     return _audit_helpers.emit_approval_decided(
       self._boundary_event_log,
@@ -4003,6 +4297,8 @@ class ToolDispatcher:
       outcome=outcome,
       decision_source=decision_source,
       allow_tool_type_applied=allow_tool_type_applied,
+      approval_id=request.approval_id if request is not None else None,
+      decision_reason=request.decision_reason if request is not None else decision_reason,
       time_fn=time.time,
     )
 
@@ -4013,6 +4309,7 @@ class ToolDispatcher:
     *,
     outcome: str,
     decision_source: ApprovalDecisionSource,
+    request: PolicyApprovalRequest | None = None,
   ) -> None:
     """Record a durable binding's decision where its ask is recorded.
 
@@ -4026,6 +4323,7 @@ class ToolDispatcher:
       outcome=outcome,
       decision_source=decision_source,
       allow_tool_type_applied=False,
+      request=request,
     )
     session_log = getattr(self._session, "agent_session_log", None)
     if event is None or session_log is None:

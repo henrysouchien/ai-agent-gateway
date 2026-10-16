@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
+from dataclasses import dataclass, replace
 from typing import Any, AsyncGenerator, Dict, Literal, Mapping
 
 from ..auth import ProviderCredentialFailure
@@ -16,6 +18,9 @@ from .base import (
   ModelInfo,
   ModelProvider,
   StreamEvent,
+  _BILLING_PATTERNS,
+  _credential_reset_at,
+  _projected_epoch_seconds,
   admitted_entry,
   authority_rate_table,
   model_info_from_entry,
@@ -47,18 +52,31 @@ from .anthropic_helpers import (
   _to_plain_dict as _to_plain_dict,
   _truncate_error_detail as _truncate_error_detail,
 )
+from . import anthropic_quota
 from .anthropic_oauth import (
-  ANTHROPIC_CREDENTIAL_POOL,
   ANTHROPIC_DEPLOYMENT_API_KEY_FIELD,
+  CREDENTIAL_AFFINITY_KEY_FIELD,
+  CREDENTIAL_PREPARED_FIELD,
   UNDECLARED_LIMIT_BLOCK_SECONDS,
+  AnthropicCredential,
+  AnthropicCredentialSources,
+  AnthropicRequestBinding,
+  anthropic_request_binding,
+  anthropic_pool_config,
+  record_anthropic_success,
   ensure_fresh_anthropic_credential,
   resolve_anthropic_credentials,
   rotate_anthropic_credential_source,
+  select_anthropic_credential_source,
 )
 
 
 log = logging.getLogger("agent_gateway.providers.anthropic")
 _DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+# The model family the bound request serves ("opus", "sonnet", ...), carried in
+# the auth material `prepare_credential` returns so a rotation after a failed
+# stream ranks siblings for the same family. Opaque and not a secret.
+CREDENTIAL_MODEL_FAMILY_FIELD = "credential_model_family"
 # Failures a sibling credential can actually answer: a spent subscription window
 # and a credential this account can no longer authenticate. Billing and request
 # rejections say the same thing on every sibling, so they are not rotated.
@@ -302,6 +320,158 @@ def _bound_anthropic_base_url(config: dict[str, Any]) -> str:
   if len(configured) > 1:
     raise ValueError("conflicting Anthropic base_url and baseURL values")
   return next(iter(configured), _DEFAULT_ANTHROPIC_BASE_URL)
+
+
+# A quota 429 is a spent window; a concurrency 429 and an overload are not, and
+# neither says anything about the account's quota.
+_OVERLOAD_RE = re.compile(r"\boverloaded(?:_error)?\b", re.IGNORECASE)
+# The projected rate-limit fields (`api/credentials.py`
+# `_anthropic_rate_limit_projection`) and the response headers they come from.
+# A failure carries them as attributes when a sanitizer or `stream` projected
+# them, and as headers on the raw SDK exception's response.
+_RATE_LIMIT_PROJECTION_HEADERS = {
+  "rate_limit_representative_claim": "anthropic-ratelimit-unified-representative-claim",
+  "rate_limit_unified_status": "anthropic-ratelimit-unified-status",
+  "rate_limit_unified_reset": "anthropic-ratelimit-unified-reset",
+  "rate_limit_5h_status": "anthropic-ratelimit-unified-5h-status",
+  "rate_limit_5h_reset": "anthropic-ratelimit-unified-5h-reset",
+  "rate_limit_7d_status": "anthropic-ratelimit-unified-7d-status",
+  "rate_limit_7d_reset": "anthropic-ratelimit-unified-7d-reset",
+  "retry_after": "retry-after",
+}
+_WINDOW_STATUS_FIELDS = (
+  "rate_limit_5h_status", "rate_limit_7d_status", "rate_limit_unified_status",
+)
+_COOLDOWN_REASONS = {"rate_limit": "quota", "billing": "billing", "auth": "auth"}
+
+
+@dataclass(frozen=True)
+class _LimitEvidence:
+  """What a failed response said about an exhausted quota window."""
+
+  scope: str
+  reset_at: float | None
+
+
+def _limit_evidence(exc: Exception, *, now: float) -> _LimitEvidence | None:
+  """Quota evidence on a failure, from the projection the sanitizer attached or the raw response.
+
+  A window the limiter reports as not allowed, or a representative claim when no
+  window status is reported at all, is evidence; a response whose reported
+  windows are all allowed (a concurrency 429) is not.
+  """
+
+  response = getattr(exc, "response", None)
+  headers = getattr(response, "headers", None)
+  windows = anthropic_quota.parse_rate_limit_headers(headers, now=now) if headers is not None else ()
+  exhausted_windows = tuple(
+    window for window in windows if anthropic_quota.window_exhausted(window.status)
+  )
+  unified_status = _projected_rate_limit_field(exc, response, "rate_limit_unified_status").lower()
+  reported = [
+    _projected_rate_limit_field(exc, response, field).lower() for field in _WINDOW_STATUS_FIELDS
+  ]
+  reported.extend((window.status or "").strip().lower() for window in windows)
+  reported = [status for status in reported if status]
+  claim = _projected_rate_limit_field(exc, response, "rate_limit_representative_claim")
+  exhausted = any(anthropic_quota.window_exhausted(status) for status in reported)
+  if not exhausted and (reported or not claim):
+    return None
+  if claim:
+    # The representative claim is the limit that decided the rejection.
+    scope = anthropic_quota.claim_scope(claim)
+  else:
+    scopes = {window.scope for window in exhausted_windows}
+    scope = next(iter(scopes)) if len(scopes) == 1 else "shared"
+  candidates = [
+    _credential_reset_at(exc, now=now),
+    *(window.reset_at for window in exhausted_windows),
+  ]
+  if anthropic_quota.window_exhausted(unified_status):
+    candidates.append(_projected_epoch_seconds(
+      _projected_rate_limit_field(exc, response, "rate_limit_unified_reset"), now=now,
+    ))
+  resets = [reset for reset in candidates if reset is not None]
+  return _LimitEvidence(scope=scope, reset_at=max(resets) if resets else None)
+
+
+def _has_billing_text(failure: ProviderCredentialFailure) -> bool:
+  text = f"{failure.message} {failure.error_code or ''}"
+  return any(pattern.search(text) for pattern in _BILLING_PATTERNS)
+
+
+def _projected_rate_limit_field(exc: Exception, response: Any, field: str) -> str:
+  value = getattr(exc, field, None)
+  text = "" if value is None or isinstance(value, bool) else str(value).strip()
+  return text or _response_header(response, _RATE_LIMIT_PROJECTION_HEADERS[field]).strip()
+
+
+def _carry_rate_limit_evidence(target: Exception, source: Exception) -> None:
+  """Keep a rejected response's limit evidence on the error that replaces it.
+
+  `stream` raises a sanitized rejection in place of the SDK error, whose response
+  is what says whether a 403 or 429 was a spent quota; the classifier reads it
+  from the same projected fields.
+  """
+
+  response = getattr(source, "response", None)
+  status_code = _exception_status_code(source)
+  if status_code is not None:
+    setattr(target, "status_code", status_code)
+  for field in _RATE_LIMIT_PROJECTION_HEADERS:
+    text = _projected_rate_limit_field(source, response, field)
+    if text:
+      setattr(target, field, text)
+
+
+def _ingest_rate_limit_headers(binding: AnthropicRequestBinding | None, headers: Any) -> None:
+  """Record the quota windows a response's headers describe against its exact binding.
+
+  Telemetry only: a header or sidecar problem is logged by reason and never
+  reaches inference.
+  """
+
+  if binding is None or headers is None:
+    return
+  try:
+    now = time.time()
+    windows = anthropic_quota.parse_rate_limit_headers(headers, now=now)
+    if windows:
+      anthropic_quota.record_observation(
+        binding.sidecar_store_path, binding.locator, windows, now=now,
+      )
+  except Exception as exc:
+    log.warning("Anthropic quota header ingestion failed (%s)", type(exc).__name__)
+
+
+def _record_stream_success(binding: AnthropicRequestBinding | None) -> None:
+  """Remember which account served a completed stream for this session's affinity."""
+
+  if binding is None:
+    return
+  try:
+    record_anthropic_success(binding)
+  except Exception as exc:
+    log.warning("Anthropic affinity record failed (%s)", type(exc).__name__)
+
+
+def _credential_material(
+  selected: AnthropicCredential,
+  config: Mapping[str, Any],
+) -> dict[str, Any]:
+  """Auth material for a selected or rotated member, in the shape the runner merges."""
+
+  is_api_key = selected.record is not None and selected.record.credential_kind == "api_key"
+  material: dict[str, Any] = {
+    "auth_mode": "api" if is_api_key else "oauth",
+    "api_key": selected.token if is_api_key else "",
+    "auth_token": "" if is_api_key else selected.token,
+    "credential_source": selected.source_metadata(),
+    CREDENTIAL_PREPARED_FIELD: selected.prepared,
+  }
+  if ANTHROPIC_DEPLOYMENT_API_KEY_FIELD in config:
+    material[ANTHROPIC_DEPLOYMENT_API_KEY_FIELD] = config[ANTHROPIC_DEPLOYMENT_API_KEY_FIELD]
+  return material
 
 
 def _server_tool_unit_deltas(usage: Any) -> dict[str, int]:
@@ -653,6 +823,133 @@ class AnthropicProvider(ModelProvider):
       return bool(str(config.get("auth_token") or "").strip())
     return bool(str(config.get("api_key") or "").strip())
 
+  def classify_credential_failure(self, exc: Exception) -> ProviderCredentialFailure | None:
+    """The generic mapping, with Anthropic's quota evidence deciding what parks.
+
+    A 429 parks an account only when it reports an exhausted window; a
+    concurrency 429 and an overload are transient and keep the runner's
+    bounded backoff. A 403 is a quota signal only when it carries that same
+    evidence; any other 403 keeps the generic mapping unchanged.
+    """
+
+    failure = super().classify_credential_failure(exc)
+    if failure is None:
+      return None
+    if failure.status_code == 529 or _OVERLOAD_RE.search(
+      f"{failure.message} {failure.error_code or ''}"
+    ):
+      return None
+    evidence = _limit_evidence(exc, now=time.time())
+    if failure.kind == "rate_limit":
+      if evidence is None:
+        return None
+      return replace(failure, reset_at=evidence.reset_at, limit_scope=evidence.scope)
+    if failure.kind == "billing" and failure.status_code in {403, 429}:
+      if evidence is not None and (failure.status_code == 429 or not _has_billing_text(failure)):
+        return replace(
+          failure, kind="rate_limit", reset_at=evidence.reset_at, limit_scope=evidence.scope,
+        )
+    return failure
+
+  async def prepare_credential(
+    self,
+    config: Mapping[str, Any],
+    *,
+    model: str,
+    session_id: str | None,
+  ) -> dict[str, Any] | None:
+    """Rank the caller's authorized pool for this model and session, before the client binds.
+
+    Only a resolver-issued (automatic) `credential_source` is a hint into the
+    pool; an exact caller-supplied one, and a config with no source, keep the
+    credential they carry. Stale or cold subscription accounts are probed for
+    usage within one bounded batch; the probe is telemetry, so a failure of it
+    leaves ordered selection. A successful refresh preflight marks the returned
+    material prepared, letting `create_client` skip its own refresh. An all-blocked
+    fallback is not refresh-prepared and still refreshes at the client boundary.
+    """
+
+    source = config.get("credential_source")
+    if not isinstance(source, Mapping) or not source.get("automatic"):
+      return None
+    # The automatic source is an affinity hint, not a pin: resolve the whole
+    # pool exactly as rotation does.
+    pool_config = anthropic_pool_config(config)
+    sources = await asyncio.to_thread(resolve_anthropic_credentials, pool_config)
+    if not any(member.auth_mechanism == "oauth_bearer" for member in sources.credentials):
+      return None
+    await self._probe_usage(sources, pool_config)
+    selected = await asyncio.to_thread(
+      select_anthropic_credential_source,
+      sources,
+      placement=str(config.get("placement") or "local"),
+      model=model,
+      session_id=session_id,
+    )
+    if selected is None:
+      return None
+    material = _credential_material(selected, config)
+    material[CREDENTIAL_AFFINITY_KEY_FIELD] = anthropic_quota.affinity_key(
+      sources.user_scope, session_id,
+    )
+    family = anthropic_quota.model_family(model)
+    if family is not None:
+      material[CREDENTIAL_MODEL_FAMILY_FIELD] = family
+    if all(config.get(key) == value for key, value in material.items()):
+      return None
+    return material
+
+  async def _probe_usage(
+    self,
+    sources: AnthropicCredentialSources,
+    config: dict[str, Any],
+  ) -> None:
+    """Refresh the usage view of stale or cold subscription accounts, within the batch budget."""
+
+    base_url = _bound_anthropic_base_url(config)
+    if not anthropic_quota.usage_probe_allowed(base_url):
+      return
+    now = time.time()
+    try:
+      due: dict[str, AnthropicCredential] = {}
+      for member in sources.credentials:
+        if member.auth_mechanism != "oauth_bearer":
+          continue
+        # An access token about to expire would 401 and mark the account's
+        # usage unavailable for an hour; its own refresh comes first.
+        if member.record is not None and member.record.needs_refresh(now=now):
+          continue
+        if anthropic_quota.claim_usage_probe(
+          member.sidecar_store_path,
+          member.locator,
+          generation=member.generation_id or None,
+          now=now,
+        ):
+          due[member.locator.id] = member
+      if not due:
+        return
+      results = await anthropic_quota.probe_usage_batch(
+        [
+          anthropic_quota.ProbeTarget(
+            locator=member.locator,
+            bearer=member.token,
+            generation=member.generation_id or None,
+            base_url=base_url,
+          )
+          for member in due.values()
+        ],
+        now=now,
+      )
+      for locator_id, result in results.items():
+        member = due[locator_id]
+        if result.windows:
+          anthropic_quota.record_observation(
+            member.sidecar_store_path, member.locator, result.windows, now=now,
+          )
+        anthropic_quota.record_probe_state(member.sidecar_store_path, member.locator, result.probe)
+    except Exception as exc:
+      log.warning("Anthropic usage probe failed (%s); selecting without it", type(exc).__name__)
+
   def next_credential(
     self,
     config: Mapping[str, Any],
@@ -660,10 +957,11 @@ class AnthropicProvider(ModelProvider):
   ) -> dict[str, Any] | None:
     """The next unblocked sibling credential for the same bound model.
 
-    Limits and denials park the rejected API key or OAuth seat until the reset
-    the provider reported. The sibling retains its own authentication mode;
-    the caller rebuilds its client from that material and the same `model_key`.
-    With no sibling left the run keeps the existing rate-limit retry.
+    Limits and denials park the rejected API key or OAuth seat, for the scope
+    the limiter named, until the reset the provider reported. The sibling
+    retains its own authentication mode; the caller rebuilds its client from
+    that material and the same `model_key`. With no sibling left the run keeps
+    the existing rate-limit retry.
     """
 
     mode = str(config.get("auth_mode", "api")).strip().lower()
@@ -681,7 +979,7 @@ class AnthropicProvider(ModelProvider):
     # and the sibling the resolver names is a genuinely eligible generation.
     # This is also what lets a bound generation that was retired at its owner
     # rotate: the pool path neither raises for the stale bind nor rewrites it.
-    pool_config = {key: value for key, value in config.items() if key != "credential_source"}
+    pool_config = anthropic_pool_config(config)
     sources = resolve_anthropic_credentials(pool_config)
     if failure.reset_at is None:
       log.info(
@@ -700,7 +998,9 @@ class AnthropicProvider(ModelProvider):
       sources,
       current=current,
       until=blocked_until,
-      pool=ANTHROPIC_CREDENTIAL_POOL,
+      model=config.get(CREDENTIAL_MODEL_FAMILY_FIELD),
+      scope=failure.limit_scope or "shared",
+      reason=_COOLDOWN_REASONS.get(failure.kind, failure.kind),
     )
     if selected is None:
       log.warning(
@@ -709,15 +1009,10 @@ class AnthropicProvider(ModelProvider):
         len(sources.credentials),
       )
       return None
-    is_api_key = selected.record is not None and selected.record.credential_kind == "api_key"
-    rotated: dict[str, Any] = {
-      "auth_mode": "api" if is_api_key else "oauth",
-      "api_key": selected.token if is_api_key else "",
-      "auth_token": "" if is_api_key else selected.token,
-      "credential_source": selected.source_metadata(),
-    }
-    if ANTHROPIC_DEPLOYMENT_API_KEY_FIELD in config:
-      rotated[ANTHROPIC_DEPLOYMENT_API_KEY_FIELD] = config[ANTHROPIC_DEPLOYMENT_API_KEY_FIELD]
+    rotated = _credential_material(selected, config)
+    for field in (CREDENTIAL_AFFINITY_KEY_FIELD, CREDENTIAL_MODEL_FAMILY_FIELD):
+      if field in config:
+        rotated[field] = config[field]
     return rotated
 
   def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
@@ -732,12 +1027,18 @@ class AnthropicProvider(ModelProvider):
     credential = str(config.get(credential_field) or "").strip()
     if not credential:
       raise RuntimeError(f"No Anthropic {mode} credential configured")
-    if mode == "oauth":
+    # A prepared config carries the bearer selection just refreshed and bound;
+    # refreshing here again could send a bearer the binding does not describe.
+    if mode == "oauth" and not config.get(CREDENTIAL_PREPARED_FIELD):
       # The bound token may have been selected hours ago (a long session, a
       # captured run). An account enrolled through this product's own login
       # refreshes here, at the one boundary where the credential becomes a
       # client; an environment token has no refresh grant and is untouched.
       credential = ensure_fresh_anthropic_credential(credential, config=config)
+    # Responses and failures of this client are attributed to the bearer it
+    # actually sends, not to whatever `config` names after another process
+    # refreshes.
+    binding = anthropic_request_binding(config, credential)
 
     auth_header = "Authorization" if mode == "oauth" else "X-Api-Key"
     auth_value = f"Bearer {credential}" if mode == "oauth" else credential
@@ -745,6 +1046,7 @@ class AnthropicProvider(ModelProvider):
     class BoundAsyncAnthropic(AsyncAnthropic):
       def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        self.hank_anthropic_binding = binding
         # The SDK imports ambient headers during construction, including copies.
         # Drop auth overrides before default_headers and pre-request validation.
         self._custom_headers = {
@@ -1228,6 +1530,8 @@ class AnthropicProvider(ModelProvider):
       provider_wait_ms = round(waited_seconds * 1000)
 
     stream_params = dict(params)
+    # Attribution follows the bearer this client actually sends (see create_client).
+    binding: AnthropicRequestBinding | None = getattr(client, "hank_anthropic_binding", None)
     auth_mode = str(stream_params.pop("_provider_auth_mode", "api")).strip().lower()
     use_compaction = "context_management" in stream_params
     request_tools = stream_params.get("tools")
@@ -1279,6 +1583,9 @@ class AnthropicProvider(ModelProvider):
         stream_cm = client.messages.stream(**stream_params)
 
       async with stream_cm as stream_obj:
+        _ingest_rate_limit_headers(
+          binding, getattr(getattr(stream_obj, "response", None), "headers", None),
+        )
         async for event in stream_obj:
           event_type = getattr(event, "type", None)
 
@@ -1483,6 +1790,7 @@ class AnthropicProvider(ModelProvider):
                 provider_unit_deltas=provider_unit_deltas,
               )
     except Exception as exc:
+      _ingest_rate_limit_headers(binding, getattr(getattr(exc, "response", None), "headers", None))
       if self.is_retryable_error(exc):
         raise
       detail = _format_anthropic_rejection_detail(exc)
@@ -1495,8 +1803,11 @@ class AnthropicProvider(ModelProvider):
         betas=betas,
       )
       log.warning("Anthropic request rejected during stream: %s; %s", detail, context)
-      raise RuntimeError(f"Anthropic request rejected (stage=stream): {detail}; {context}") from None
+      rejection = RuntimeError(f"Anthropic request rejected (stage=stream): {detail}; {context}")
+      _carry_rate_limit_evidence(rejection, exc)
+      raise rejection from None
 
+    _record_stream_success(binding)
     yield StreamEvent(
       type="message_end",
       stop_reason=stop_reason,

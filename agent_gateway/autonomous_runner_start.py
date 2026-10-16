@@ -215,6 +215,7 @@ def _pinned_autonomous_child_pythonpath(
     ai_root,
     ai_root / "api",
     ai_root / "packages" / "agent-gateway",
+    ai_root / "packages" / "agent-workflow-contracts",
     ai_root / "packages" / "model-authority",
     ai_root / "packages" / "excel-mcp" / "python",
     ai_root / "packages" / "ibkr-relay-client" / "python",
@@ -1069,12 +1070,30 @@ class AutonomousRegistryStartMixin:
       )(process_group_id, signal_number)
     except ProcessLookupError:
       return False
+    except PermissionError as exc:
+      # Darwin (XNU) filters zombies out of the group walk, so killpg on a
+      # same-uid private group returns EPERM exactly when no live member
+      # remains (leader exited but unreaped, no other member). A lagging
+      # asyncio returncode is how that window is reached; getpgid on the
+      # zombie leader is then ESRCH. EPERM with a live leader stays a real
+      # signal failure. Cause: docs/qa/autonomous-reaper-killpg-eperm-root-cause-2026-10-16.md
+      try:
+        _runtime_attr(
+          "_get_process_group_id",
+          _get_process_group_id,
+        )(pid)
+      except ProcessLookupError:
+        return False
+      except OSError:
+        pass
+      raise RuntimeError(
+        f"autonomous process-group signal failed: {exc}"
+      ) from exc
     except OSError as exc:
-      # Darwin can fail kill/killpg with EPERM (PermissionError) while a
-      # group member is mid-exit. Surface OS-level signal failures through
-      # the RuntimeError contract that every reaper/cancel call site already
-      # treats as a recorded cleanup failure, instead of letting an OSError
-      # escape and kill the reaper task with the run stuck in "running".
+      # Surface other OS-level signal failures through the RuntimeError
+      # contract that every reaper/cancel call site already treats as a
+      # recorded cleanup failure, instead of letting an OSError escape and
+      # kill the reaper task with the run stuck in "running".
       raise RuntimeError(
         f"autonomous process-group signal failed: {exc}"
       ) from exc
@@ -1300,6 +1319,7 @@ class AutonomousRegistryStartMixin:
         record.admitted_skill_execution_limits
       ),
       session_log_authority=session_log_authority,
+      approval_continuation=record.launch_approval_continuation,
     )
     control_authority = record.control_authority
     if type(control_authority) is not AutonomousControlAuthority:
@@ -1348,6 +1368,7 @@ class AutonomousRegistryStartMixin:
     schedule_name: str | None = None,
     parent: ParentContext | None = None,
     model_preset: str | None = None,
+    approval_continuation: dict[str, Any] | None = None,
   ) -> dict[str, Any]:
     with self._admission_lease():
       in_flight_at_start = await self._reserve_slot()
@@ -1724,6 +1745,11 @@ class AutonomousRegistryStartMixin:
         capability_bind=capability_binding.bind,
         admitted_context=admitted_context,
         tool_authority=tool_authority,
+        launch_approval_continuation=approval_continuation,
+        resumed_approval_id=(
+          approval_continuation["approval_id"]
+          if approval_continuation is not None else None
+        ),
       )
       owner_lifeline_write_fd = -1
       self._attach_manifest_tracking(record)
@@ -1953,6 +1979,18 @@ class AutonomousRegistryStartMixin:
           "autonomous credential handoff pipe is unavailable"
         )
       try:
+        if approval_continuation is not None:
+          # The child is spawned but holds no credential, so it cannot run its
+          # approved call before this claim commits; a failure up to here
+          # leaves the call unclaimed and its decision redeliverable.
+          from .control_plane.autonomous_approval_delivery import (
+            claim_continued_executable_attempt,
+          )
+
+          await claim_continued_executable_attempt(
+            store=self._approval_store,
+            continuation=approval_continuation,
+          )
         credential_stdin.write(credential_handoff_payload)
         await credential_stdin.drain()
       finally:
@@ -1969,6 +2007,7 @@ class AutonomousRegistryStartMixin:
       if not self._write_task_manifest(record, checked=True):
         raise RuntimeError("failed to commit running autonomous task manifest")
       record.reaper_task = asyncio_module.create_task(self._reap(task_id))
+      record.launch_ready.set()
       await self._publish_run_state(record, "running")
       ownership_transferred = True
       return self._start_payload(record)
@@ -1979,6 +2018,8 @@ class AutonomousRegistryStartMixin:
         transport="internal",
       ) from exc
     finally:
+      if record is not None:
+        record.launch_ready.set()
       if not ownership_transferred:
         await self._await_cleanup(
           self._cleanup_uncommitted_start(

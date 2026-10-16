@@ -32,9 +32,11 @@ from model_authority.selection import SelectionSnapshot, TierModelsDefault
 
 OPUS = "anthropic.claude-opus-5-5"
 SONNET = "anthropic.claude-sonnet-5-5"
+SONNET_SDK = "anthropic.claude-sonnet-5-5-sdk"
 HAIKU = "anthropic.claude-haiku-5-5"
 HAIKU_SDK = "anthropic.claude-haiku-5-5-sdk"
 CODEX_SOL = "codex.gpt-6-1-sol"
+FABLE = "anthropic.claude-fable-5-1"
 FIRM = UUID("11111111-1111-4111-8111-111111111111")
 TENANT = "hank-test"
 ACTOR = "101"  # the session owner: the preference store's actor key
@@ -175,7 +177,7 @@ def _snapshot(prepared: PreparedChatTurn) -> SelectionSnapshot:
 def test_policy_applies_with_no_selection(authority: ModelAuthority, store: ModelPreferenceStore) -> None:
   prepared = _prepare(authority, store, commercial_account_id=FIRM)
 
-  assert _driver(prepared) == (OPUS, "high", "capability_default")
+  assert _driver(prepared) == (FABLE, "high", "capability_default")
   snapshot = _snapshot(prepared)
   assert snapshot.overridden == frozenset()
   assert snapshot.source is None
@@ -198,7 +200,7 @@ def test_firm_layer_needs_a_verified_commercial_account(authority: ModelAuthorit
 
   prepared = _prepare(authority, store)
 
-  assert _driver(prepared) == (OPUS, "high", "capability_default")
+  assert _driver(prepared) == (FABLE, "high", "capability_default")
   assert _snapshot(prepared).overridden == frozenset()
 
 
@@ -249,7 +251,7 @@ def test_unpublished_saved_preset_is_discarded_with_notice_and_base_policy_appli
   )
 
   # Base policy, not the firm preset (R5).
-  assert _driver(prepared) == (OPUS, "high", "capability_default")
+  assert _driver(prepared) == (FABLE, "high", "capability_default")
   assert _snapshot(prepared).overridden == frozenset()
   driver = build_capability_choices(session=_session(authority), build_chat_runtime=builder)["session.driver"]
   notice = next(notice for notice in driver.notices if notice.code == "saved_preset_not_applied")
@@ -271,7 +273,7 @@ def test_saved_preset_without_a_driver_credential_is_discarded_with_notice(
     commercial_account_id=FIRM,
   )
 
-  assert _driver(prepared) == (OPUS, "high", "capability_default")
+  assert _driver(prepared) == (FABLE, "high", "capability_default")
   assert _snapshot(prepared).overridden == frozenset()
   assert prepared.request.selection_snapshot is prepared.selection_snapshot
   driver = build_capability_choices(session=_session(authority), build_chat_runtime=builder)["session.driver"]
@@ -331,11 +333,11 @@ def test_discarded_saved_preset_leaves_init_roles_on_base_policy(
   )["session.driver"]
   prepared = _prepare(authority, store)
 
-  assert _driver(prepared) == (OPUS, "high", "capability_default")
+  assert _driver(prepared) == (FABLE, "high", "capability_default")
   snapshot = _snapshot(prepared)
   assert snapshot.overridden == frozenset()
   roles = {role.role: role for role in driver.roles}
-  assert (roles["default"].model_key, roles["default"].effort, roles["default"].unavailable) == (OPUS, "high", None)
+  assert (roles["default"].model_key, roles["default"].effort, roles["default"].unavailable) == (FABLE, "high", None)
   fast = snapshot.assignments["fast"]
   assert isinstance(fast, TierModelsDefault)
   assert fast.effort == "none"
@@ -405,6 +407,45 @@ def test_init_selected_is_what_the_turn_binds_under_a_run_preset(
   assert all(notice.code != "saved_preset_not_applied" for notice in driver.notices)
 
 
+def test_run_preset_beats_saved_concrete_driver_preference(
+  authority: ModelAuthority, store: ModelPreferenceStore,
+) -> None:
+  # A stored concrete driver row and a saved user preset both lose to an
+  # explicit /chat/init model_preset; the row stays for sessions with none.
+  store.put(
+    tenant_id=TENANT,
+    actor_id=ACTOR,
+    capability_id="session.driver",
+    model_key=OPUS,
+    effort="high",
+  )
+  _select_user(store, authority, "codex_driver")
+  session = _run_session(authority, store, "run_eval")
+  builder = _builder(authority, store)
+
+  driver = build_capability_choices(session=session, build_chat_runtime=builder)["session.driver"]
+  prepared = prepare_session_driver_turn(session, _inputs(), build_chat_runtime=builder)
+
+  selected = driver.selected
+  assert selected is not None
+  assert (selected.model_key, selected.effort, selected.reason) == (SONNET, "medium", "internal_policy")
+  assert _driver(prepared) == (SONNET, "medium", "internal_policy")
+
+  stored = store.get(tenant_id=TENANT, actor_id=ACTOR, capability_id="session.driver")
+  assert stored is not None
+  assert (stored.model_key, stored.effort) == (OPUS, "high")
+
+  plain = _session(authority)
+  plain_driver = build_capability_choices(session=plain, build_chat_runtime=builder)["session.driver"]
+  plain_prepared = prepare_session_driver_turn(plain, _inputs(), build_chat_runtime=builder)
+  plain_selected = plain_driver.selected
+  assert plain_selected is not None
+  assert (plain_selected.model_key, plain_selected.effort, plain_selected.reason) == (
+    OPUS, "high", "saved_preference",
+  )
+  assert _driver(plain_prepared) == (OPUS, "high", "saved_preference")
+
+
 def test_unpublished_run_preset_is_refused_at_init(authority: ModelAuthority, store: ModelPreferenceStore) -> None:
   session = _session(authority)
 
@@ -432,3 +473,52 @@ def test_unpublished_run_preset_fails_the_turn_without_falling_back(
     prepare_session_driver_turn(session, _inputs(), build_chat_runtime=_builder(authority, store))
 
   assert refused.value.code == "capability_selection_invalid"
+
+
+def test_packaged_hank_premium_and_hank_balanced_presets_are_selectable_at_init_and_turn(
+  tmp_path: Path, store: ModelPreferenceStore,
+) -> None:
+  # The fixture authority overwrites presets. This reads the packaged artifact.
+  authority = load_model_authority(PACKAGED_AUTHORITY_DIR)
+  assert {"hank_premium", "hank_balanced"} <= set(authority.selection_policy.presets)
+  assert "hank_premium" not in store.known_preset_names
+  packaged_store = ModelPreferenceStore(
+    tmp_path / "packaged-preferences.sqlite3",
+    known_preset_names=frozenset(authority.selection_policy.presets),
+  )
+  builder = _builder(authority, packaged_store)
+  expected = {
+    "hank_premium": {
+      "build": TierModelsDefault((OPUS,), "xhigh"),
+      "fast": TierModelsDefault((HAIKU, HAIKU_SDK), "high"),
+      "standard": TierModelsDefault((OPUS, SONNET, SONNET_SDK), "xhigh"),
+      "verify": TierModelsDefault((OPUS,), "high"),
+    },
+    "hank_balanced": {
+      "build": TierModelsDefault((SONNET,), "xhigh"),
+      "fast": TierModelsDefault((HAIKU, HAIKU_SDK), "none"),
+      "standard": TierModelsDefault((SONNET, SONNET_SDK), "high"),
+      "verify": TierModelsDefault((SONNET,), "high"),
+    },
+  }
+  for name, roles in expected.items():
+    session = _session(authority)
+    bind_init_capability_selections(
+      session=session,
+      selections={},
+      build_chat_runtime=builder,
+      model_preset=name,
+    )
+    assert session.model_preset == name
+    driver = build_capability_choices(session=session, build_chat_runtime=builder)["session.driver"]
+    prepared = prepare_session_driver_turn(session, _inputs(), build_chat_runtime=builder)
+    assert _driver(prepared) == (FABLE, "high", "internal_policy")
+    selected = driver.selected
+    assert selected is not None
+    assert (selected.model_key, selected.effort, selected.reason) == _driver(prepared)
+    snapshot = _snapshot(prepared)
+    assert snapshot.source == "internal_policy"
+    assert snapshot.assignments["default"] == TierModelsDefault((FABLE,), "high")
+    assert set(roles) <= snapshot.overridden
+    for role, assignment in roles.items():
+      assert snapshot.assignments[role] == assignment

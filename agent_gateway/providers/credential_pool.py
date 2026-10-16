@@ -23,6 +23,14 @@ import secrets
 import time
 from typing import Any, Callable, Generator, Mapping, Sequence
 
+from ..auth import (
+  AuthMechanism,
+  EntitlementKind,
+  Placement,
+  derive_auth_mechanism_and_entitlement,
+  evaluate_placement_eligibility,
+)
+
 LOGGER = logging.getLogger(__name__)
 
 CREDENTIAL_POOL_STORE_VERSION = 1
@@ -30,6 +38,7 @@ USER_SCOPE_FIELD = "auth_user_scope"
 ACCOUNT_IDENTITY_FIELD = "account_identity"
 UNDECLARED_LIMIT_BLOCK_SECONDS = 300.0
 REFRESH_FAILURE_BLOCK_SECONDS = 300.0
+_HOSTED_EXTERNAL_PLACEMENT: Placement = "hosted_external"
 
 
 def normalize_user_scope(value: Any) -> str:
@@ -485,6 +494,31 @@ class PoolAccountCandidate:
   store_path: Path | None = None
   is_user_store: bool = False
   auth_mode: str = "oauth"
+  auth_mechanism: AuthMechanism | None = None
+  entitlement_kind: EntitlementKind | None = None
+
+  def __post_init__(self) -> None:
+    mechanism = self.auth_mechanism
+    if mechanism is None:
+      if self.auth_mode == "api":
+        mechanism = "api_key"
+      elif self.auth_mode == "oauth":
+        mechanism = "oauth_bearer"
+      else:
+        mechanism = "none"
+      object.__setattr__(self, "auth_mechanism", mechanism)
+    if self.entitlement_kind is None:
+      # Mechanism is already resolved. Shared derivation then owns the kind,
+      # including subscription sources and sk-ant-oat setup tokens.
+      _, kind = derive_auth_mechanism_and_entitlement(
+        {
+          "auth_mechanism": mechanism,
+          "source": self.record.get("source"),
+          "auth_token": self.token,
+        },
+        is_user_store=self.is_user_store,
+      )
+      object.__setattr__(self, "entitlement_kind", kind)
 
   @property
   def account_identity(self) -> str:
@@ -545,8 +579,20 @@ def select_pool_candidate(
   pool: ProviderCredentialPool,
   refresh_fn: Callable[[PoolAccountCandidate], PoolAccountCandidate] | None = None,
   now: float | None = None,
+  placement: str = "local",
+  route: str | None = None,
 ) -> PoolAccountCandidate | None:
   """Select the first unblocked candidate (refreshing if needed), or fall back to candidate[0]."""
+  if placement == _HOSTED_EXTERNAL_PLACEMENT:
+    candidates = [
+      candidate for candidate in candidates
+      if evaluate_placement_eligibility(
+        provider=candidate.provider,
+        route=route,
+        entitlement_kind=candidate.entitlement_kind or "",
+        placement=_HOSTED_EXTERNAL_PLACEMENT,
+      ).eligible
+    ]
   if not candidates:
     return None
   moment = time.time() if now is None else now

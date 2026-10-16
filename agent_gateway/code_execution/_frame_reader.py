@@ -19,6 +19,10 @@ Frames, one JSON object per line. Child -> host, every frame carries
 - `tool_call{parent_call_id, operation, input}` -> `tool_result{nested_call_id}`
 - `catalog{parent_call_id, request: "search", query}` -> list of `{name, description}`
 - `catalog{parent_call_id, request: "describe", operation}` -> `{name, description, input_schema}`
+- `derive{parent_call_id, name, value, expression, inputs}` -> `derive_result` (the published row)
+
+A successful `tool_result` also carries `source_refs`, the issued keys of the
+rows the call recorded; `derive` resolves them against the session's issued rows.
 
 Host -> child replies echo `type` and `call_id` and carry `ok` plus `result` or
 `error{code, message}`.
@@ -41,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import hashlib
 import json
 import logging
 import os
@@ -150,7 +155,7 @@ BRIDGE_OPERATIONS: tuple[Dict[str, Any], ...] = (
 # one frame per registered bridge operation. A backend's frame reader routes
 # exactly these to the bridge, so a new operation needs no reader edit.
 REQUEST_FRAME_TYPES: frozenset[str] = frozenset(
-  {"hello", "catalog", "tool_call", *(str(row["name"]) for row in BRIDGE_OPERATIONS)}
+  {"hello", "catalog", "tool_call", "derive", *(str(row["name"]) for row in BRIDGE_OPERATIONS)}
 )
 DEFAULT_WAIT_TIMEOUT_S = 600.0
 # `jobs.wait` reads the executing runner's task registry; the product binds
@@ -241,7 +246,7 @@ class ActiveCell:
     if provenance is not None:
       entry["provenance"] = dict(provenance)
     if error is None and settlement.outcome == "ok":
-      cell._record_sources(operation, entry["nested_call_id"], result, settlement.sources)
+      entry["source_refs"] = cell._record_sources(operation, entry["nested_call_id"], result, settlement.sources)
 
 
 class FrameReader:
@@ -262,6 +267,10 @@ class FrameReader:
     self._catalog_metadata: CatalogMetadata | None = None
     self._job_runner: JobRunner | None = None
     self._cells: Dict[str, CellChannel] = {}
+    # Every source row this session's cells issued, by `source_refs` key. Kept
+    # with the session reader, which the session's kernel cleanup releases with
+    # it, so a retained kernel value resolves without a refetch.
+    self._issued_sources: Dict[str, Dict[str, Any]] = {}
     self._closed = False
     self._closing_cells: tuple[CellChannel, ...] = ()
     self._principal = dict(principal or {})
@@ -345,6 +354,7 @@ class FrameReader:
         job_tasks.append(entry.asyncio_task)
     await asyncio.gather(*job_tasks, return_exceptions=True)
     await asyncio.gather(*(cell.aclose() for cell in self._closing_cells))
+    self._issued_sources.clear()
 
   def is_registered(self, cell: "CellChannel") -> bool:
     return self._cells.get(cell.token) is cell and cell._active and not self._closed
@@ -404,6 +414,7 @@ class CellChannel:
     self._ordinal = 0
     self.ledger: List[Dict[str, Any]] = []
     self._sources: Dict[Any, Dict[str, Any]] = {}
+    self.derived: List[Dict[str, Any]] = []
     self._inflight: set[asyncio.Task[Any]] = set()
     self._serve_task: asyncio.Task[Any] | None = None
 
@@ -526,13 +537,14 @@ class CellChannel:
         return
 
   def summary(self) -> Dict[str, Any]:
-    """`nested_calls` and `sources` for the outer result; empty when no frame called."""
-    if not self.ledger:
-      return {}
-    return {
-      "nested_calls": [dict(entry) for entry in self.ledger],
-      "sources": list(self._sources.values()),
-    }
+    """`nested_calls`, `sources` and `derived` for the outer result; empty when nothing was called or derived."""
+    summary: Dict[str, Any] = {}
+    if self.ledger:
+      summary["nested_calls"] = [dict(entry) for entry in self.ledger]
+      summary["sources"] = list(self._sources.values())
+    if self.derived:
+      summary["derived"] = [dict(row) for row in self.derived]
+    return summary
 
   # --- frame handling --------------------------------------------------------
 
@@ -619,6 +631,8 @@ class CellChannel:
       return await self._workpool(frame)
     if frame_type == "judge_batch":
       return await self._judge_batch(frame)
+    if frame_type == "derive":
+      return self._derive(frame)
     return _error_reply(frame_type, call_id, "protocol_error", f"unknown frame type {frame_type!r}")
 
   def _granted(self) -> Dict[str, Dict[str, Any]]:
@@ -1383,13 +1397,16 @@ class CellChannel:
     # unchanged; the ledger records it as the failed call it is.
     entry["ok"] = semantic_error is None
     entry["error_code"] = str(semantic_error["code"]) if semantic_error is not None else None
+    refs: List[str] | None = None
     if settlement.outcome == "ok":
-      self._record_sources(operation, nested_call_id, result, settlement.sources)
+      refs = entry["source_refs"] = self._record_sources(operation, nested_call_id, result, settlement.sources)
     reply = _ok_reply(reply_type, call_id, result)
     reply["nested_call_id"] = nested_call_id
+    if refs is not None:
+      reply["source_refs"] = refs
     return reply
 
-  def _record_sources(self, operation: str, nested_call_id: str, result: Any, settled_sources: Any) -> None:
+  def _record_sources(self, operation: str, nested_call_id: str, result: Any, settled_sources: Any) -> List[str]:
     # Settlement owns identity; the extractor only enriches those rows with
     # citation presentation. It cannot introduce another source.
     identity_fields = ("document_id", "source_kind", "source_url", "provider", "endpoint", "key_fields")
@@ -1421,6 +1438,7 @@ class CellChannel:
     ]
     presented = {identity for identity, _presentation in presentations}
     handles.extend(source for identity, source in identities.items() if identity not in presented)
+    refs: List[str] = []
     for handle in handles:
       try:
         key = (
@@ -1433,9 +1451,61 @@ class CellChannel:
         continue
       # Provenance, not payload: the citation owner treats the handle as the
       # nested operation's partial, not `code_execute`'s.
-      self._sources.setdefault(
+      row = self._sources.setdefault(
         key, {**handle, "produced_by_tool": canonical_dispatch_tool_name(operation)},
       )
+      ref = _issued_ref(key)
+      self._reader._issued_sources.setdefault(ref, row)
+      if ref not in refs:
+        refs.append(ref)
+    return refs
+
+  def _derive(self, frame: Dict[str, Any]) -> Dict[str, Any]:
+    """`hank.derive`: publish a computed value with the inputs it was computed from.
+
+    Each input's `source_refs` resolve against the rows this session issued;
+    the published row carries those rows themselves. An input the session did
+    not issue, or a literal that carries no reference, is an `input_unsourced`
+    finding on the row. The row is never a source and never enters `sources`.
+    """
+    call_id = frame.get("call_id")
+    name, expression, inputs = frame.get("name"), frame.get("expression"), frame.get("inputs")
+    if not isinstance(name, str) or not isinstance(expression, str) or not isinstance(inputs, list):
+      return _error_reply(
+        "derive_result", call_id, "protocol_error",
+        "derive needs a string name, a value, a string expression and a list of inputs",
+      )
+    issued = self._reader._issued_sources
+    resolved: List[Dict[str, Any]] = []
+    findings: List[Dict[str, Any]] = []
+    for index, item in enumerate(inputs):
+      reference = item if isinstance(item, dict) else {"value": item}
+      raw_refs = reference.get("source_refs")
+      refs = list(dict.fromkeys(ref for ref in raw_refs if isinstance(ref, str))) if isinstance(raw_refs, list) else []
+      sources = [dict(issued[ref]) for ref in refs if ref in issued]
+      row = {
+        "nested_call_id": reference.get("nested_call_id"),
+        "path": reference.get("path"),
+        "value": reference.get("value"),
+        "sources": sources,
+      }
+      resolved.append(row)
+      if not refs:
+        reason = "the input carries no source reference; select it from a producer result with hank.input"
+      elif len(sources) != len(refs):
+        reason = "the input's source references were not issued by this session"
+      else:
+        continue
+      findings.append({
+        "code": "input_unsourced", "input": index,
+        "nested_call_id": row["nested_call_id"], "path": row["path"], "message": reason,
+      })
+    published = {
+      "name": name, "value": frame.get("value"), "expression": expression,
+      "status": "derived", "inputs": resolved, "findings": findings,
+    }
+    self.derived.append(published)
+    return _ok_reply("derive_result", call_id, published)
 
   def _catalog(self, frame: Dict[str, Any]) -> Dict[str, Any]:
     call_id = frame.get("call_id")
@@ -1517,6 +1587,12 @@ def _elapsed_ms(started: float) -> int:
 
 def _ok_reply(frame_type: Any, call_id: Any, result: Any) -> Dict[str, Any]:
   return {"type": frame_type, "call_id": call_id, "ok": True, "result": result}
+
+
+def _issued_ref(key: Any) -> str:
+  """The opaque, stable key a source's registry identity is issued under."""
+  identity = json.dumps(key, sort_keys=True, separators=(",", ":"), default=str)
+  return "src_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
 
 
 def _error_reply(frame_type: Any, call_id: Any, code: str, message: str) -> Dict[str, Any]:

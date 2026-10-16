@@ -622,6 +622,7 @@ def _legacy_request_approval(session: GatewaySession, event_log: EventLog) -> Re
     return ApprovalDecision(
       approved=bool(approval.get("approved")),
       allow_tool_type=bool(approval.get("allow_tool_type")),
+      reason=approval.get("reason"),
     )
 
   return request_approval
@@ -935,7 +936,10 @@ def build_capability_choices(
     else:
       saved_preference = (
         driver_preference
-        if capability_id == SESSION_DRIVER_CAPABILITY
+        if (
+          capability_id == SESSION_DRIVER_CAPABILITY
+          and session.model_preset is None
+        )
         else None
       )
       try:
@@ -1364,7 +1368,11 @@ def prepare_session_driver_turn(
     if request.model_key is not None
     else None
   )
-  saved_preference = stored_preference if explicit_intent is None else None
+  saved_preference = (
+    stored_preference
+    if explicit_intent is None and session.model_preset is None
+    else None
+  )
   capability_execution = capability_execution_resolver.resolve(
     SESSION_DRIVER_CAPABILITY,
     explicit_intent=explicit_intent,

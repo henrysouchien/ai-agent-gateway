@@ -36,6 +36,7 @@ from .commercial_work_start import commercial_budget_stop_fields
 from .runner import (
   ToolResultContext,
   _ACTIVE_SKILL_ALLOW_RESULT_KEY,
+  _SKILL_RUN_ID_RESULT_KEY,
   _detect_user_id_param,
 )
 from .runner_introspection import detect_keyword_param as _detect_keyword_param
@@ -1253,6 +1254,18 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       for name in candidates
       if (normalized := str(name or "").strip())
     }
+  def _activate_skill_run_id(self, skill_run_id: Any) -> None:
+    if type(skill_run_id) is not str:
+      return
+    normalized = skill_run_id.strip()
+    if not normalized or normalized != skill_run_id:
+      return
+    try:
+      carrier = RunIdentityCarrier(normalized)
+    except Exception:
+      return
+    self._skill_run_id = carrier.run_id
+    self._run_identity_carrier = carrier
 
   def _consume_private_tool_result_fields(self, result: Any, *, tool_name: str | None = None) -> Any:
     if isinstance(result, dict):
@@ -1265,8 +1278,10 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       # result reaches the model or the durable transcript.
       result.pop(_WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY, None)
       allowed_tools = result.pop(_ACTIVE_SKILL_ALLOW_RESULT_KEY, None)
+      rotated_skill_run_id = result.pop(_SKILL_RUN_ID_RESULT_KEY, None)
       if tool_name == _TRUSTED_SDK_INVOKE_SKILL_ID:
         self._activate_skill_allow(allowed_tools)
+        self._activate_skill_run_id(rotated_skill_run_id)
     return result
 
   async def _post_tool_use_hook(

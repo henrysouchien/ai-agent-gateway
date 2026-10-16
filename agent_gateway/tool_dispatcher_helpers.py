@@ -417,6 +417,7 @@ class TransportApprovalResult:
 
   approved: bool
   allow_tool_type: bool = False
+  reason: str | None = None
 
 
 ApprovalCallback = Callable[[TransportApprovalRequest], Awaitable[TransportApprovalResult]]

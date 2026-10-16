@@ -7276,6 +7276,7 @@ def test_resume_captures_actual_job_and_replay_never_reattributes_custody(
         JobScope(
           caller=lambda: current_parent_context(nested_session),
           spill_sink=lambda: None,
+          runner=lambda: runner,
         ),
       )
       handler = handlers["resume"]
@@ -7315,6 +7316,7 @@ def test_resume_captures_actual_job_and_replay_never_reattributes_custody(
     retry_handler = handler.for_job(JobScope(
       caller=lambda: retry_caller,
       spill_sink=lambda: None,
+      runner=lambda: runner,
     ))
     retry, retry_error = await retry_handler({"task_id": source.task_id})
     assert retry_error is None and retry is not None

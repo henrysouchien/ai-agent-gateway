@@ -87,14 +87,14 @@ def test_gateway_request_builder_passes_app_state_storage_root(
     **kwargs: Any,
   ) -> Any:
     captured.update(kwargs)
-    return SimpleNamespace(purpose=None)
+    return SimpleNamespace(purpose=None, build_runner=lambda *_args: None)
 
   monkeypatch.setattr(
     server_module,
     "_call_build_chat_runtime",
     fake_call,
   )
-  session = SimpleNamespace(purpose="chat")
+  session = SimpleNamespace(purpose="chat", fork_source_log_path=None)
 
   runtime = asyncio.run(
     app.state.gateway_build_chat_runtime(

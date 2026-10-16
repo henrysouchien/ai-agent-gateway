@@ -308,6 +308,8 @@ def _materialize_google_pool_candidate(
 ) -> dict[str, Any]:
   return {
     "auth_mode": selected.auth_mode,
+    "auth_mechanism": selected.auth_mechanism,
+    "entitlement_kind": selected.entitlement_kind,
     "auth_token": selected.token if selected.auth_mode == "oauth" else "",
     "api_key": selected.token if selected.auth_mode == "api" else "",
     "refresh_token": str(selected.record.get("refresh_token") or "").strip(),

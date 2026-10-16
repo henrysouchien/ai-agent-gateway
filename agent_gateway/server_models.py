@@ -948,6 +948,12 @@ class ToolApprovalRequest(BaseModel):
   nonce: str
   approved: bool
   allow_tool_type: bool = False
+  reason: str | None = None
+
+  @field_validator("reason")
+  @classmethod
+  def _normalize_reason(cls, value: str | None) -> str | None:
+    return (value.strip() or None) if value is not None else None
 
 
 def _empty_tool_definitions() -> List[Dict[str, Any]]:

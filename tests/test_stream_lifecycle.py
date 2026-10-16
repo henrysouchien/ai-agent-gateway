@@ -483,6 +483,28 @@ class _HangingDispatcher:
       raise
     raise AssertionError("a never-resolved future cannot complete")
 
+  async def prepare_tool_call_async(
+    self,
+    tool_name: str,
+    tool_input: dict[str, Any],
+  ) -> PreparedToolCall:
+    _ = tool_name
+    return PreparedToolCall(dict(tool_input))
+
+  async def dispatch_prepared(
+    self,
+    tool_call_id: str,
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+    **kwargs: Any,
+  ) -> tuple[Any, dict[str, Any] | None]:
+    return await self.dispatch(
+      tool_call_id,
+      tool_name,
+      prepared_call.materialize_input(),
+      **kwargs,
+    )
+
   def requires_approval(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
     _ = tool_name, tool_input
     return False

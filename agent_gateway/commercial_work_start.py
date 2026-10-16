@@ -16,6 +16,7 @@ from hank_contracts.commercial_work import (
   COMMERCIAL_WORK_AUTHORIZATION_HEADER,
   VerifiedWorkAuthorization,
   WorkAuthorizationError,
+  CommercialWorkStartError,
   CommercialWorkStartFacts,
   VerifiedCommercialWorkStartClaim,
   PendingCommercialWorkStart,
@@ -33,18 +34,6 @@ from .work_authorization_consumption import (
   WorkAuthorizationConsumptionRecord,
   WorkAuthorizationConsumptionStore,
 )
-
-
-class CommercialWorkStartError(RuntimeError):
-  """A commercial request cannot safely proceed to runtime construction."""
-
-  def __init__(self, code: str, message: str, *, status_code: int) -> None:
-    self.code = code
-    self.status_code = status_code
-    super().__init__(message)
-
-
-
 
 
 def require_commercial_child_account(
@@ -323,7 +312,6 @@ class CommercialWorkStartGate:
 
 
 __all__ = [
-  "CommercialWorkStartError",
   "CommercialWorkStartGate",
   "require_commercial_child_account",
   "commercial_budget_stop_fields",

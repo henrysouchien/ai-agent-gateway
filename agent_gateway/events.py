@@ -275,6 +275,8 @@ class ToolApprovalDecidedEvent:
   decision_source: ApprovalDecisionSource
   allow_tool_type_applied: bool
   ts: float
+  approval_id: str | None = None
+  decision_reason: str | None = None
   type: Literal["tool_approval_decided"] = field(default="tool_approval_decided", init=False)
 
 
@@ -618,6 +620,8 @@ def event_from_dict(payload: dict[str, Any]) -> TypedEvent:
       decision_source=_approval_decision_source(payload["decision_source"]),
       allow_tool_type_applied=bool(payload.get("allow_tool_type_applied", False)),
       ts=_event_ts(payload),
+      approval_id=_optional_str(payload.get("approval_id")),
+      decision_reason=_optional_str(payload.get("decision_reason")),
     )
   if event_type == "session_recap":
     tool_calls_summary = payload["tool_calls_summary"]

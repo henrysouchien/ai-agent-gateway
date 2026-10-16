@@ -280,6 +280,7 @@ async def generate_and_append_summary(
   prior_summary_text: str | None = None,
   summarize_fn: SummaryFn | None = None,
   prompt_char_budget: int | None = SUMMARY_PROMPT_CHAR_BUDGET,
+  session_id: str | None = None,
 ) -> LogEntry | None:
   if not isinstance(capability_execution, BoundCapabilityExecution):
     raise TypeError(
@@ -340,6 +341,7 @@ async def generate_and_append_summary(
         f"{DEFAULT_SUMMARY_SYSTEM_PROMPT}\n\n"
         f"{UNTRUSTED_CHILD_RESULTS_POLICY}"
       ),
+      session_id=session_id,
     )).strip()
 
   if not generated_summary_text:

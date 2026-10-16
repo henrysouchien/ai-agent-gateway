@@ -128,7 +128,7 @@ def test_codex_terra_effective_compaction_trigger_is_reachable() -> None:
     160_000, provider.get_model_info("gpt-5.6-terra"), ContainmentSettings(),
   )
 
-  assert trigger == 217_600
+  assert trigger == 160_000
 
 
 def test_codex_gpt56_sol_cost_estimation_is_non_zero() -> None:

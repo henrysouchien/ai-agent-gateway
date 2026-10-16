@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+import fcntl
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
+import textwrap
+import time
 from threading import Event
 
 import pytest
@@ -15,6 +21,7 @@ import pytest
 from agent_gateway import create_agent
 from agent_gateway import cli as agent_cli
 from agent_gateway.providers import anthropic_oauth
+from agent_gateway.providers import anthropic_quota as quota
 from agent_gateway.providers.anthropic_oauth import (
   ANTHROPIC_OAUTH_CLIENT_ID,
   ANTHROPIC_USER_SCOPE_FIELD,
@@ -430,14 +437,13 @@ def test_selection_refreshes_the_expired_account_it_is_about_to_bind(
     environ={"ANTHROPIC_AUTH_STORE_PATH": str(path)}
   )
 
-  pool = anthropic_oauth.AnthropicCredentialPool()
-  selected = select_anthropic_credential_source(sources, pool=pool)
+  selected = select_anthropic_credential_source(sources)
   assert selected is not None
   assert selected.token == "sk-ant-oat01-bound-fresh"
   [stored] = load_anthropic_oauth_store(path)
   assert selected.record == stored
   assert selected.store_path == path
-  assert selected.source_metadata() == stored.source_metadata()
+  assert selected.source_metadata() == {**stored.source_metadata(), "automatic": True}
 
 
 def test_failed_refresh_marks_the_account_and_serves_the_next_sibling(
@@ -454,9 +460,7 @@ def test_failed_refresh_marks_the_account_and_serves_the_next_sibling(
   sources = resolve_anthropic_credentials(
     environ={"ANTHROPIC_AUTH_STORE_PATH": str(path)}
   )
-  pool = anthropic_oauth.AnthropicCredentialPool()
-
-  selected = select_anthropic_credential_source(sources, pool=pool)
+  selected = select_anthropic_credential_source(sources)
   assert selected is not None
   assert selected.token == "sk-ant-oat01-healthy@example.com-access"
   stale, healthy = load_anthropic_oauth_store(path)
@@ -465,7 +469,13 @@ def test_failed_refresh_marks_the_account_and_serves_the_next_sibling(
   assert stale.last_error
   assert stale.refresh_token == "sk-ant-ort01-stale@example.com-refresh"
   assert healthy.last_error == ""
-  assert pool.blocked_until("stale@example.com") > 0.0
+  # The failure is a sidecar cooldown for that account, not process memory:
+  # every process that shares the store sees it, the sibling is untouched.
+  stale_credential, healthy_credential = sources.credentials
+  assert anthropic_oauth.anthropic_credential_blocked_until(stale_credential) > 0.0
+  assert anthropic_oauth.anthropic_credential_blocked_until(healthy_credential) == 0.0
+  [cooldown] = quota.load_selection_state(path).cooldowns[stale_credential.locator.id]
+  assert (cooldown.scope, cooldown.reason) == ("shared", "refresh_failed")
 
 
 def test_user_store_lives_under_that_users_private_data_root(tmp_path: Path) -> None:
@@ -569,8 +579,7 @@ def test_refresh_is_written_back_to_the_store_that_owns_the_account(
   )
 
   sources = resolve_anthropic_credentials(environ=environ, user_scope=4)
-  pool = anthropic_oauth.AnthropicCredentialPool()
-  selected = select_anthropic_credential_source(sources, pool=pool)
+  selected = select_anthropic_credential_source(sources)
   assert selected is not None
   assert selected.token == "sk-ant-oat01-user-fresh"
   assert selected.store_path == user_store
@@ -666,12 +675,10 @@ def test_exact_materialization_refreshes_material_without_changing_source_grant(
     },
   )
   sources = resolve_anthropic_credentials({"credential_source": metadata}, environ=env)
-  materialized = select_anthropic_credential_source(
-    sources, pool=anthropic_oauth.AnthropicCredentialPool(), now=1000.0,
-  )
+  materialized = select_anthropic_credential_source(sources, now=1000.0)
   assert materialized is not None
   assert materialized.token == "fixture-rotated-access"
-  assert materialized.source_metadata() == metadata
+  assert materialized.source_metadata() == {**metadata, "automatic": True}
   assert set(metadata) == {"account_identity", "grant_hash", "generation_id", "generation_ref"}
   assert original.access_token not in metadata["generation_ref"]
   assert str(path) not in metadata["generation_ref"]
@@ -679,7 +686,8 @@ def test_exact_materialization_refreshes_material_without_changing_source_grant(
   recovered = resolve_anthropic_credentials(
     {"credential_source": metadata}, environ=env,
   ).credentials[0]
-  assert recovered == materialized
+  assert not recovered.prepared
+  assert replace(recovered, automatic=True, prepared=True) == materialized
   [stored] = load_anthropic_oauth_store(path)
   assert stored.refresh_token == "fixture-rotated-refresh"
   assert stored.source_metadata() == metadata
@@ -747,7 +755,14 @@ def test_static_api_key_reobservation_and_replacement_have_exact_source_generati
   assert repeated is not None
   assert repeated.source_metadata() == original.source_metadata()
   assert load_anthropic_oauth_store(path) == ()
-  assert resolve_anthropic_credentials(environ=env, user_scope=7).credentials == ()
+  # A user's own request API key is a member of that user's pool (private
+  # tier); the deployment's environment key is never an ambient member.
+  members = resolve_anthropic_credentials(environ=env, user_scope=7).credentials
+  if source.startswith("env:"):
+    assert members == ()
+  else:
+    assert [member.generation_id for member in members] == [original.generation_id]
+    assert members[0].private
 
   env["ANTHROPIC_API_KEY"] = "fixture-api-key-replacement"
   replacement = register_anthropic_static_credential(
@@ -756,6 +771,11 @@ def test_static_api_key_reobservation_and_replacement_have_exact_source_generati
   assert replacement is not None
   assert replacement.generation_id != original.generation_id
   assert load_anthropic_oauth_store(path) == ()
+  if not source.startswith("env:"):
+    assert [
+      member.generation_id
+      for member in resolve_anthropic_credentials(environ=env, user_scope=7).credentials
+    ] == [replacement.generation_id]
   assert original.token not in path.read_text()
   assert stat.S_IMODE(path.stat().st_mode) == 0o600
   if source.startswith("env:"):
@@ -921,15 +941,19 @@ def test_concurrent_refreshers_never_reuse_a_captured_rotating_refresh_token(
 
 
 @pytest.mark.parametrize("mutation", ["consent", "remove"])
-def test_consent_and_removal_serialize_with_refresh_and_cannot_be_undone(
+def test_consent_and_removal_serialize_after_the_refresh_exchange(
   tmp_path: Path, mutation: str,
 ) -> None:
+  """Consent/removal waits for the shared refresh lock, then replaces or retires
+  the refreshed generation without leaving any of its token material active."""
+
   path = tmp_path / "oauth.json"
   env = {"ANTHROPIC_AUTH_STORE_PATH": str(path)}
   [original] = upsert_anthropic_oauth_record(path, _record("same@example.com", expires_at=0.0))
   entered = Event()
   release = Event()
   mutation_started = Event()
+  mutation_finished = Event()
 
   def post(url, body):
     entered.set()
@@ -938,22 +962,28 @@ def test_consent_and_removal_serialize_with_refresh_and_cannot_be_undone(
 
   def mutate():
     mutation_started.set()
-    if mutation == "remove":
-      return remove_anthropic_oauth_record(path, original.identity)
-    return upsert_anthropic_oauth_record(
-      path, replace(_record(original.identity), access_token="fixture-consent-access", refresh_token="fixture-consent-grant"),
-    )
+    try:
+      if mutation == "remove":
+        return remove_anthropic_oauth_record(path, original.identity)
+      return upsert_anthropic_oauth_record(
+        path, replace(_record(original.identity), access_token="fixture-consent-access", refresh_token="fixture-consent-grant"),
+      )
+    finally:
+      mutation_finished.set()
 
   with ThreadPoolExecutor(max_workers=2) as executor:
     refresh = executor.submit(refresh_anthropic_oauth_record, original, store_path=path, now=1000.0, post=post)
     try:
       assert entered.wait(5)
-      mutator = executor.submit(mutate)
+      mutation_future = executor.submit(mutate)
       assert mutation_started.wait(5)
+      assert not mutation_finished.wait(0.2)
     finally:
       release.set()
-    refresh.result(5)
-    mutator.result(5)
+    refreshed = refresh.result(5)
+    mutation_future.result(5)
+  assert refreshed.access_token == "fixture-refreshed-access"
+  assert refreshed.generation_id == original.generation_id
   active = load_anthropic_oauth_store(path)
   if mutation == "remove":
     assert active == ()
@@ -985,9 +1015,9 @@ def test_source_repr_and_refresh_failure_never_expose_credential_material(
     refresh_anthropic_oauth_record(record, store_path=path, now=1000.0, post=failure)
   monkeypatch.setattr(anthropic_oauth, "_post_token_endpoint", failure)
   caplog.set_level("INFO", logger=anthropic_oauth.__name__)
-  selected = select_anthropic_credential_source(sources, pool=anthropic_oauth.AnthropicCredentialPool(), now=1000.0)
+  selected = select_anthropic_credential_source(sources, now=1000.0)
   assert selected is not None
-  assert selected.source_metadata() == record.source_metadata()
+  assert selected.source_metadata() == {**record.source_metadata(), "automatic": True}
   assert caplog.records
   [stored] = load_anthropic_oauth_store(path)
   for material in (record.access_token, record.refresh_token):
@@ -999,7 +1029,7 @@ def test_source_repr_and_refresh_failure_never_expose_credential_material(
 def test_empty_pool_selection_returns_no_source_or_invented_generation(tmp_path: Path) -> None:
   env = {"USER_DATA_DIR": str(tmp_path)}
   sources = resolve_anthropic_credentials(environ=env, user_scope=3)
-  assert select_anthropic_credential_source(sources, pool=anthropic_oauth.AnthropicCredentialPool()) is None
+  assert select_anthropic_credential_source(sources) is None
   assert not sources.store_path.exists()
   assert sources.user_store_path is not None and not sources.user_store_path.exists()
 
@@ -1039,18 +1069,14 @@ def test_bound_environment_config_preserves_original_org_source_without_user_clo
 ) -> None:
   env = {"USER_DATA_DIR": str(tmp_path), "ANTHROPIC_AUTH_TOKEN": "fixture-org-token"}
   original_sources = resolve_anthropic_credentials(environ=env, user_scope=7)
-  original = select_anthropic_credential_source(
-    original_sources, pool=anthropic_oauth.AnthropicCredentialPool(),
-  )
+  original = select_anthropic_credential_source(original_sources)
   assert original is not None
   cfg: dict[str, object] = {"auth_token": original.token, ANTHROPIC_USER_SCOPE_FIELD: "7"}
   if with_metadata:
     cfg["credential_source"] = original.source_metadata()
 
   repeated_sources = resolve_anthropic_credentials(cfg, environ=env)
-  repeated = select_anthropic_credential_source(
-    repeated_sources, pool=anthropic_oauth.AnthropicCredentialPool(),
-  )
+  repeated = select_anthropic_credential_source(repeated_sources)
   assert repeated is not None
   assert repeated.generation_ref == original.generation_ref
   assert repeated.store_path == original_sources.store_path
@@ -1422,3 +1448,607 @@ def test_two_processes_with_different_env_tokens_do_not_retire_each_other(
       environ={**base, "ANTHROPIC_AUTH_TOKEN": env_token},
     )
     assert again.credentials[0].generation_ref == credential.generation_ref
+
+
+def _scoped_pools(
+  tmp_path: Path, *, private: tuple[str, ...] = (), org: tuple[str, ...] = (), user: int = 1,
+) -> tuple[dict[str, str], Path, Path]:
+  environ = {"USER_DATA_DIR": str(tmp_path)}
+  user_store = resolve_anthropic_auth_store_path(environ=environ, user_scope=user)
+  org_store = resolve_anthropic_auth_store_path(environ=environ)
+  for identity in private:
+    upsert_anthropic_oauth_record(user_store, _record(identity))
+  for identity in org:
+    upsert_anthropic_oauth_record(org_store, _record(identity))
+  return environ, user_store, org_store
+
+
+def _isolate_anthropic_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+  for name in (
+    "ANTHROPIC_AUTH_STORE_PATH", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKENS",
+    "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
+  ):
+    monkeypatch.delenv(name, raising=False)
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+
+
+def _forbid_exchange(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+  exchanged: list[str] = []
+
+  def post(url, body):
+    exchanged.append(body["refresh_token"])
+    raise AnthropicOAuthError("token request failed (400): invalid_grant")
+
+  monkeypatch.setattr(anthropic_oauth, "_post_token_endpoint", post)
+  return exchanged
+
+
+def test_credential_tier_and_locator_follow_the_owning_store(tmp_path: Path) -> None:
+  environ, user_store, org_store = _scoped_pools(
+    tmp_path, private=("mine@example.com",), org=("shared@example.com",),
+  )
+  environ = {**environ, "ANTHROPIC_AUTH_TOKEN": "sk-ant-oat01-env-seat"}
+  mine, env_seat, shared = resolve_anthropic_credentials(environ=environ, user_scope=1).credentials
+
+  assert [credential.tier for credential in (mine, env_seat, shared)] == ["private", "org", "org"]
+  assert mine.locator == quota.locator_for_record(user_store, "mine@example.com")
+  assert shared.locator == quota.locator_for_record(org_store, "shared@example.com")
+  # An environment member has no enrolled identity: it is named by a fingerprint
+  # of its token, in the org store's sidecar.
+  assert env_seat.locator == quota.locator_for_env_token("sk-ant-oat01-env-seat")
+  assert env_seat.sidecar_store_path == org_store
+  assert mine.sidecar_store_path == user_store
+  assert "sk-ant-oat01-env-seat" not in env_seat.locator.id
+  sources = resolve_anthropic_credentials(environ=environ, user_scope=1)
+  assert sources.affinity_store_path == user_store
+  assert resolve_anthropic_credentials(environ=environ).affinity_store_path == org_store
+
+
+def test_same_identity_under_two_users_and_the_org_are_separate_locators(tmp_path: Path) -> None:
+  environ = {"USER_DATA_DIR": str(tmp_path)}
+  stores = {
+    "user-one": resolve_anthropic_auth_store_path(environ=environ, user_scope=1),
+    "user-two": resolve_anthropic_auth_store_path(environ=environ, user_scope=2),
+    "org": resolve_anthropic_auth_store_path(environ=environ),
+  }
+  for label, path in stores.items():
+    upsert_anthropic_oauth_record(path, replace(
+      _record("same@example.com"),
+      access_token=f"sk-ant-oat01-{label}", refresh_token=f"sk-ant-ort01-{label}",
+    ))
+
+  one = resolve_anthropic_credentials(environ=environ, user_scope=1)
+  two = resolve_anthropic_credentials(environ=environ, user_scope=2)
+  # The bare identity both records share is what the old dedup collapsed on:
+  # the private record and the org record are both still members.
+  assert [credential.key for credential in one.credentials] == ["same@example.com"] * 2
+  assert [credential.tier for credential in one.credentials] == ["private", "org"]
+  assert one.tokens == ("sk-ant-oat01-user-one", "sk-ant-oat01-org")
+  assert two.tokens == ("sk-ant-oat01-user-two", "sk-ant-oat01-org")
+  ids = {credential.locator.id for credential in (*one.credentials, *two.credentials)}
+  assert len(ids) == 3
+  # The org record is one account for every user it serves.
+  assert one.credentials[1].locator == two.credentials[1].locator
+
+
+def test_private_account_leads_the_org_fallback_and_recovery_restores_precedence(
+  tmp_path: Path,
+) -> None:
+  environ, user_store, org_store = _scoped_pools(
+    tmp_path, private=("mine@example.com",), org=("shared@example.com",),
+  )
+  sources = resolve_anthropic_credentials(environ=environ, user_scope=1)
+  mine = sources.credentials[0]
+  now = time.time()
+
+  first = select_anthropic_credential_source(sources, now=now)
+  assert first is not None
+  assert (first.account_identity, first.tier) == ("mine@example.com", "private")
+
+  quota.record_cooldown(user_store, mine.locator, quota.Cooldown("shared", now + 3600, "quota"))
+  fallback = select_anthropic_credential_source(sources, now=now)
+  assert fallback is not None
+  assert (fallback.account_identity, fallback.tier) == ("shared@example.com", "org")
+  # The cooldown belongs to the sidecar of the store that owns the account.
+  assert not quota.load_selection_state(org_store).cooldowns
+  assert anthropic_oauth.anthropic_credential_blocked_until(mine, now=now) == pytest.approx(now + 3600)
+
+  recovered = select_anthropic_credential_source(sources, now=now + 3601)
+  assert recovered is not None
+  assert (recovered.account_identity, recovered.tier) == ("mine@example.com", "private")
+  assert anthropic_oauth.anthropic_credential_blocked_until(mine, now=now + 3601) == 0.0
+
+
+def test_selection_marks_its_source_automatic_and_an_exact_source_has_no_marker(
+  tmp_path: Path,
+) -> None:
+  environ, _user_store, _org_store = _scoped_pools(tmp_path, org=("shared@example.com",))
+  sources = resolve_anthropic_credentials(environ=environ)
+  selected = select_anthropic_credential_source(sources)
+  assert selected is not None
+  assert selected.source_metadata()["automatic"] is True
+  assert "automatic" not in sources.credentials[0].source_metadata()
+  exact = resolve_anthropic_credentials(
+    {"credential_source": sources.credentials[0].source_metadata()}, environ=environ,
+  )
+  assert "automatic" not in exact.credentials[0].source_metadata()
+
+
+def test_removed_automatic_bound_account_is_not_resurrected_by_its_bearer(tmp_path: Path) -> None:
+  environ, user_store, _org_store = _scoped_pools(
+    tmp_path, private=("mine@example.com",), org=("shared@example.com",),
+  )
+  selected = select_anthropic_credential_source(
+    resolve_anthropic_credentials(environ=environ, user_scope=1),
+  )
+  assert selected is not None and selected.account_identity == "mine@example.com"
+  config = {
+    "auth_token": selected.token,
+    "credential_source": selected.source_metadata(),
+    ANTHROPIC_USER_SCOPE_FIELD: "1",
+  }
+  assert remove_anthropic_oauth_record(user_store, "mine@example.com")
+
+  # The exact pin reports the removal; the automatic hint is re-resolved from
+  # the trusted scope and the current stores, and its stale bearer never
+  # re-enters membership as a request-carried token.
+  with pytest.raises(AnthropicSourceError) as removed:
+    resolve_anthropic_credentials(config, environ=environ)
+  assert removed.value.reason == "removed"
+  pooled = resolve_anthropic_credentials(
+    anthropic_oauth.anthropic_pool_config(config), environ=environ,
+  )
+  assert pooled.tokens == ("sk-ant-oat01-shared@example.com-access",)
+  assert json.loads(user_store.read_text())["static_credentials"] == []
+  after = select_anthropic_credential_source(pooled)
+  assert after is not None and after.account_identity == "shared@example.com"
+
+  # An exact (non-automatic) source keeps its bearer: it is the caller's own material.
+  assert anthropic_oauth.anthropic_pool_config(
+    {"auth_token": "x", "credential_source": {"generation_ref": "g"}},
+  ) == {"auth_token": "x"}
+  assert anthropic_oauth.anthropic_pool_config(
+    {"auth_token": "x", "credential_source": {"generation_ref": "g", "automatic": True}},
+  ) == {}
+
+
+def test_cached_affinity_for_an_account_outside_the_pool_is_ignored(tmp_path: Path) -> None:
+  environ, _user_store, _org_store = _scoped_pools(
+    tmp_path, private=("henry@example.com",), org=("org-a@example.com", "org-b@example.com"),
+  )
+  henrys = resolve_anthropic_credentials(environ=environ, user_scope=1).credentials[0]
+  sources = resolve_anthropic_credentials(environ=environ, user_scope=2)
+  assert henrys.locator.id not in {credential.locator.id for credential in sources.credentials}
+  now = time.time()
+  key = quota.affinity_key("2", "session-two")
+  assert key is not None
+  # User two's own sidecar names user one's private account as warm: membership
+  # is resolved anew, so the cached locator is not honored.
+  quota.record_success(sources.affinity_store_path, henrys.locator, key, now=now)
+
+  selected = select_anthropic_credential_source(sources, now=now, session_id="session-two")
+  assert selected is not None
+  assert selected.tier == "org"
+  assert selected.account_identity in {"org-a@example.com", "org-b@example.com"}
+  assert selected.locator != henrys.locator
+
+
+def test_request_binding_records_success_as_warm_affinity_for_that_session(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _isolate_anthropic_env(monkeypatch, tmp_path)
+  environ, _user_store, _org_store = _scoped_pools(
+    tmp_path, org=("org-a@example.com", "org-b@example.com"),
+  )
+  sources = resolve_anthropic_credentials(environ=environ, user_scope=2)
+  org_b = sources.credentials[1]
+  key = quota.affinity_key("2", "session-two")
+  now = time.time()
+  config = {
+    "auth_token": org_b.token,
+    ANTHROPIC_USER_SCOPE_FIELD: "2",
+    anthropic_oauth.CREDENTIAL_AFFINITY_KEY_FIELD: key,
+  }
+
+  binding = anthropic_oauth.anthropic_request_binding(config, org_b.token)
+  assert binding is not None
+  assert binding.locator == org_b.locator
+  assert (binding.tier, binding.generation_id) == ("org", org_b.generation_id)
+  assert binding.affinity_store_path == sources.user_store_path
+  assert binding.sidecar_store_path == org_b.sidecar_store_path
+  assert binding.affinity_key == key
+
+  anthropic_oauth.record_anthropic_success(binding, now=now)
+  warm = select_anthropic_credential_source(sources, now=now + 60, session_id="session-two")
+  assert warm is not None and warm.account_identity == "org-b@example.com"
+  # A stateless request has no affinity: resolver order stands.
+  stateless = select_anthropic_credential_source(sources, now=now + 60)
+  assert stateless is not None and stateless.account_identity == "org-a@example.com"
+
+
+def test_request_binding_follows_the_generation_and_never_raises(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _isolate_anthropic_env(monkeypatch, tmp_path)
+  path = resolve_anthropic_auth_store_path()
+  [original] = upsert_anthropic_oauth_record(path, _record("grant@example.com", expires_at=0.0))
+  refreshed = refresh_anthropic_oauth_record(
+    original, store_path=path, now=1000.0,
+    post=lambda url, body: {
+      "access_token": "fixture-bound-refreshed", "refresh_token": "fixture-bound-grant",
+      "expires_in": 28800,
+    },
+  )
+  config = {"credential_source": original.source_metadata()}
+
+  # The bearer actually sent is the refreshed one; the generation names the account.
+  binding = anthropic_oauth.anthropic_request_binding(config, refreshed.access_token)
+  assert binding is not None
+  assert binding.locator == quota.locator_for_record(path, "grant@example.com")
+  assert binding.generation_id == original.generation_id
+  assert binding.affinity_key is None
+
+  unknown = anthropic_oauth.anthropic_request_binding({}, "sk-ant-oat01-not-in-any-store")
+  assert unknown is not None
+  assert unknown.locator == quota.locator_for_env_token("sk-ant-oat01-not-in-any-store")
+  assert (unknown.tier, unknown.generation_id) == ("org", None)
+  assert anthropic_oauth.anthropic_request_binding(config, "") is None
+
+  path.write_text("{not json", encoding="utf-8")
+  assert anthropic_oauth.anthropic_request_binding(config, refreshed.access_token) is None
+
+
+def test_refresh_failure_on_the_ranked_first_candidate_falls_through_tiers(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  environ = {"USER_DATA_DIR": str(tmp_path)}
+  user_store = resolve_anthropic_auth_store_path(environ=environ, user_scope=1)
+  org_store = resolve_anthropic_auth_store_path(environ=environ)
+  upsert_anthropic_oauth_record(user_store, _record("stale-a@example.com", expires_at=0.0))
+  upsert_anthropic_oauth_record(user_store, _record("stale-b@example.com", expires_at=0.0))
+  upsert_anthropic_oauth_record(org_store, _record("shared@example.com"))
+  exchanged = _forbid_exchange(monkeypatch)
+  sources = resolve_anthropic_credentials(environ=environ, user_scope=1)
+
+  selected = select_anthropic_credential_source(sources)
+  assert selected is not None
+  # Both private accounts failed refresh, so the org tier serves.
+  assert (selected.account_identity, selected.tier) == ("shared@example.com", "org")
+  assert selected.prepared
+  assert len(exchanged) == 2
+  state = quota.load_selection_state(user_store)
+  for credential in sources.credentials[:2]:
+    [cooldown] = state.cooldowns[credential.locator.id]
+    assert cooldown.reason == "refresh_failed"
+
+  # The cooldown is shared: a later selection (another process's resolve) does
+  # not retry the failed exchanges.
+  again = select_anthropic_credential_source(resolve_anthropic_credentials(environ=environ, user_scope=1))
+  assert again is not None and again.account_identity == "shared@example.com"
+  assert len(exchanged) == 2
+
+
+def test_all_blocked_pool_binds_the_earliest_reset_account_without_refreshing(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  path = tmp_path / "oauth.json"
+  upsert_anthropic_oauth_record(path, _record("late@example.com", expires_at=0.0))
+  upsert_anthropic_oauth_record(path, _record("early@example.com", expires_at=0.0))
+  exchanged = _forbid_exchange(monkeypatch)
+  sources = resolve_anthropic_credentials(environ={"ANTHROPIC_AUTH_STORE_PATH": str(path)})
+  late, early = sources.credentials
+  now = time.time()
+  quota.record_cooldown(path, late.locator, quota.Cooldown("shared", now + 500, "quota"))
+  quota.record_cooldown(path, early.locator, quota.Cooldown("shared", now + 100, "quota"))
+
+  selected = select_anthropic_credential_source(sources, now=now)
+  assert selected is not None
+  # Never withheld: the earliest-reset account binds as it is, with no refresh.
+  assert selected.account_identity == "early@example.com"
+  assert selected.token == early.token
+  assert not selected.prepared
+  assert exchanged == []
+
+  solo_store = tmp_path / "solo.json"
+  upsert_anthropic_oauth_record(solo_store, _record("only@example.com", expires_at=0.0))
+  solo = resolve_anthropic_credentials(environ={"ANTHROPIC_AUTH_STORE_PATH": str(solo_store)})
+  only = solo.credentials[0]
+  quota.record_cooldown(solo_store, only.locator, quota.Cooldown("shared", now + 500, "quota"))
+  withheld = select_anthropic_credential_source(solo, now=now)
+  # A pool of one is never withheld, even cooling down and past its expiry.
+  assert withheld is not None and withheld.token == only.token
+  assert not withheld.prepared
+  assert exchanged == []
+
+
+def test_rotation_records_a_scoped_cooldown_and_never_circles_back(tmp_path: Path) -> None:
+  path = tmp_path / "oauth.json"
+  for identity in ("a@example.com", "b@example.com", "c@example.com"):
+    upsert_anthropic_oauth_record(path, _record(identity))
+  sources = resolve_anthropic_credentials(environ={"ANTHROPIC_AUTH_STORE_PATH": str(path)})
+  first = sources.credentials[0]
+  now = time.time()
+  opus, sonnet = "claude-opus-4-5", "claude-sonnet-4-5"
+
+  second = anthropic_oauth.rotate_anthropic_credential_source(
+    sources, current=first.token, until=now + 3600, now=now, model=opus, scope="opus", reason="quota",
+  )
+  assert second is not None and second.account_identity == "b@example.com"
+  assert second.source_metadata()["automatic"] is True
+  [row] = quota.load_selection_state(path).cooldowns[first.locator.id]
+  assert (row.scope, row.reason) == ("opus", "quota")
+  # The cooldown is scoped: Opus is blocked for that account, Sonnet is not.
+  blocked_until = anthropic_oauth.anthropic_credential_blocked_until
+  assert blocked_until(first, now=now, model=opus) == pytest.approx(now + 3600)
+  assert blocked_until(first, now=now, model=sonnet) == 0.0
+  assert blocked_until(first, now=now) == 0.0
+
+  third = anthropic_oauth.rotate_anthropic_credential_source(
+    sources, current=second.token, until=now + 3600, now=now, model=opus, scope="opus",
+  )
+  assert third is not None and third.account_identity == "c@example.com"
+  # Every sibling is cooling down: rotation yields nothing instead of circling.
+  assert anthropic_oauth.rotate_anthropic_credential_source(
+    sources, current=third.token, until=now + 3600, now=now, model=opus, scope="opus",
+  ) is None
+  # An unrelated model family is still served by the first account.
+  served = select_anthropic_credential_source(sources, now=now, model=sonnet)
+  assert served is not None and served.account_identity == "a@example.com"
+
+
+def test_corrupt_sidecar_still_binds_and_rotates(tmp_path: Path) -> None:
+  path = tmp_path / "oauth.json"
+  upsert_anthropic_oauth_record(path, _record("a@example.com"))
+  upsert_anthropic_oauth_record(path, _record("b@example.com"))
+  quota.selection_sidecar_path(path).write_text("{not json", encoding="utf-8")
+  sources = resolve_anthropic_credentials(environ={"ANTHROPIC_AUTH_STORE_PATH": str(path)})
+
+  selected = select_anthropic_credential_source(sources)
+  assert selected is not None and selected.account_identity == "a@example.com"
+  assert anthropic_oauth.anthropic_credential_blocked_until(selected) == 0.0
+  rotated = anthropic_oauth.rotate_anthropic_credential_source(
+    sources, current=selected.token, until=time.time() + 600,
+  )
+  assert rotated is not None and rotated.account_identity == "b@example.com"
+
+
+def test_distinct_custom_stores_in_one_directory_have_independent_state(tmp_path: Path) -> None:
+  first_store, second_store = tmp_path / "first.json", tmp_path / "second.json"
+  for path in (first_store, second_store):
+    upsert_anthropic_oauth_record(path, _record("same@example.com"))
+  first, second = (
+    resolve_anthropic_credentials(environ={"ANTHROPIC_AUTH_STORE_PATH": str(path)}).credentials[0]
+    for path in (first_store, second_store)
+  )
+  assert first.locator != second.locator
+  now = time.time()
+  quota.record_cooldown(first_store, first.locator, quota.Cooldown("shared", now + 600, "quota"))
+
+  assert anthropic_oauth.anthropic_credential_blocked_until(first, now=now) == pytest.approx(now + 600)
+  assert anthropic_oauth.anthropic_credential_blocked_until(second, now=now) == 0.0
+  assert quota.selection_sidecar_path(first_store).exists()
+  assert not quota.selection_sidecar_path(second_store).exists()
+
+
+_REFRESH_WORKER = textwrap.dedent('''
+  import sys, time
+  from pathlib import Path
+  from agent_gateway.providers import anthropic_oauth as oauth
+
+  store, ready, exchanges, name = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]
+  [record] = oauth.load_anthropic_oauth_store(store)
+  (ready / name).write_text("ready")
+  deadline = time.monotonic() + 30
+  while len(list(ready.iterdir())) < 2:
+    if time.monotonic() > deadline:
+      raise SystemExit("peer never became ready")
+    time.sleep(0.02)
+
+  def post(url, body):
+    with exchanges.open("a") as handle:
+      handle.write(body["refresh_token"] + "\\n")
+    time.sleep(0.5)
+    return {"access_token": "fixture-once-access", "refresh_token": "fixture-once-refresh", "expires_in": 28800}
+
+  refreshed = oauth.refresh_anthropic_oauth_record(record, store_path=store, now=1000.0, post=post)
+  print(refreshed.access_token, refreshed.refresh_token)
+''')
+
+
+def test_two_processes_refreshing_one_rotating_grant_exchange_once(tmp_path: Path) -> None:
+  path = tmp_path / "oauth.json"
+  [original] = upsert_anthropic_oauth_record(path, _record("same@example.com", expires_at=0.0))
+  ready = tmp_path / "ready"
+  ready.mkdir()
+  exchanges = tmp_path / "exchanges.txt"
+  env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+  workers = [
+    subprocess.Popen(
+      [sys.executable, "-c", _REFRESH_WORKER, str(path), str(ready), str(exchanges), name],
+      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+    )
+    for name in ("first", "second")
+  ]
+  outputs = [worker.communicate(timeout=60) for worker in workers]
+  for worker, (_stdout, stderr) in zip(workers, outputs):
+    assert worker.returncode == 0, stderr
+
+  # Both processes started from the same stale record and met at the lock: the
+  # rotating refresh token was spent once, and the waiter returned the winner.
+  assert exchanges.read_text().splitlines() == [original.refresh_token]
+  assert {stdout.strip() for stdout, _stderr in outputs} == {
+    "fixture-once-access fixture-once-refresh"
+  }
+  [stored] = load_anthropic_oauth_store(path)
+  assert stored.refresh_token == "fixture-once-refresh"
+
+
+@pytest.mark.parametrize("published_first", [True, False], ids=["old-first", "new-first"])
+def test_published_store_lock_refresh_and_new_refresher_exchange_once(
+  tmp_path: Path, published_first: bool,
+) -> None:
+  path = tmp_path / "oauth.json"
+  [original] = upsert_anthropic_oauth_record(path, _record("same@example.com", expires_at=0.0))
+  entered = Event()
+  release = Event()
+  published_started = Event()
+  published_finished = Event()
+  new_started = Event()
+  new_finished = Event()
+  posted: list[str] = []
+
+  def old_protocol_refresh() -> AnthropicOAuthRecord:
+    # Use the published lock filename/protocol, independently of the current helper.
+    try:
+      with (path.parent / f".{path.name}.lock").open("a+b") as lock:
+        published_started.set()
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+          store = anthropic_oauth._load_store_unlocked(path)
+          current = store.accounts[0]
+          posted.append(current.refresh_token)
+          entered.set()
+          assert release.wait(5)
+          refreshed = replace(
+            current, access_token="fixture-peer-access",
+            refresh_token="fixture-peer-refresh", expires_at=9_999_999_999.0,
+          )
+          store.accounts[0] = refreshed
+          anthropic_oauth._write_store_unlocked(path, store)
+          return refreshed
+        finally:
+          fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    finally:
+      published_finished.set()
+
+  def new_post(url, body):
+    posted.append(body["refresh_token"])
+    entered.set()
+    assert release.wait(5)
+    return {
+      "access_token": "fixture-new-access",
+      "refresh_token": "fixture-new-refresh",
+      "expires_in": 28800,
+    }
+
+  def new_protocol_refresh() -> AnthropicOAuthRecord:
+    new_started.set()
+    try:
+      return refresh_anthropic_oauth_record(
+        original, store_path=path, now=1000.0, post=new_post,
+      )
+    finally:
+      new_finished.set()
+
+  first_refresh, second_refresh = (
+    (old_protocol_refresh, new_protocol_refresh) if published_first
+    else (new_protocol_refresh, old_protocol_refresh)
+  )
+  second_started = new_started if published_first else published_started
+  second_finished = new_finished if published_first else published_finished
+  with ThreadPoolExecutor(max_workers=2) as executor:
+    first = executor.submit(first_refresh)
+    try:
+      assert entered.wait(5)
+      second = executor.submit(second_refresh)
+      assert second_started.wait(5)
+      assert not second_finished.wait(0.2)
+    finally:
+      release.set()
+    first_result, second_result = first.result(5), second.result(5)
+
+  old_result, new_result = (
+    (first_result, second_result) if published_first else (second_result, first_result)
+  )
+  assert posted.count(original.refresh_token) == 1
+  if published_first:
+    assert posted == [original.refresh_token]
+    assert new_result == old_result
+  else:
+    # The published peer must reread the new gateway's committed generation,
+    # not spend the original rotating grant while its exchange is in flight.
+    assert posted == [original.refresh_token, "fixture-new-refresh"]
+    assert posted[1] == new_result.refresh_token
+    assert new_result.access_token == "fixture-new-access"
+    assert old_result != new_result
+  assert old_result.access_token == "fixture-peer-access"
+  assert old_result.refresh_token == "fixture-peer-refresh"
+  assert load_anthropic_oauth_store(path) == (old_result,)
+
+
+def test_cancelled_refresh_worker_keeps_the_store_lock_until_its_exchange_ends(
+  tmp_path: Path,
+) -> None:
+  path = tmp_path / "oauth.json"
+  [original] = upsert_anthropic_oauth_record(path, _record("same@example.com", expires_at=0.0))
+  entered = Event()
+  release = Event()
+
+  def post(url, body):
+    entered.set()
+    assert release.wait(10)
+    return {"access_token": "fixture-rotated-access", "refresh_token": "fixture-rotated-refresh", "expires_in": 28800}
+
+  def second_exchange(url, body):
+    raise AssertionError("the cancelled caller's exchange is still rotating this grant")
+
+  async def scenario() -> AnthropicOAuthRecord:
+    worker = asyncio.ensure_future(asyncio.to_thread(
+      refresh_anthropic_oauth_record, original, store_path=path, now=1000.0, post=post,
+    ))
+    assert await asyncio.to_thread(entered.wait, 5)
+    worker.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await worker
+    # The awaiting caller is gone but its thread is still inside the exchange:
+    # the lock is not free for another caller.
+    with pytest.raises(anthropic_oauth.AnthropicRefreshBusy):
+      refresh_anthropic_oauth_record(
+        original, store_path=path, now=1000.0, post=second_exchange, lock_wait_seconds=0.2,
+      )
+    release.set()
+    # The lock frees only once that exchange finished; the waiter rereads its winner.
+    return await asyncio.to_thread(
+      refresh_anthropic_oauth_record, original, store_path=path, now=1000.0,
+      post=second_exchange, lock_wait_seconds=5,
+    )
+
+  winner = asyncio.run(scenario())
+  assert winner.access_token == "fixture-rotated-access"
+  assert load_anthropic_oauth_store(path) == (winner,)
+
+
+def test_selection_moves_to_a_sibling_when_the_refresh_lock_stays_busy(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  path = tmp_path / "oauth.json"
+  [stale] = upsert_anthropic_oauth_record(path, _record("stale@example.com", expires_at=0.0))
+  upsert_anthropic_oauth_record(path, _record("healthy@example.com"))
+  monkeypatch.setattr(anthropic_oauth, "REFRESH_LOCK_WAIT_SECONDS", 0.2)
+  entered = Event()
+  release = Event()
+
+  def holder_post(url, body):
+    entered.set()
+    assert release.wait(10)
+    return {"access_token": "fixture-holder-access", "refresh_token": "fixture-holder-refresh", "expires_in": 28800}
+
+  sources = resolve_anthropic_credentials(environ={"ANTHROPIC_AUTH_STORE_PATH": str(path)})
+  with ThreadPoolExecutor(max_workers=1) as executor:
+    holder = executor.submit(
+      refresh_anthropic_oauth_record, stale, store_path=path, now=1000.0, post=holder_post,
+    )
+    try:
+      assert entered.wait(5)
+      started = time.monotonic()
+      selected = select_anthropic_credential_source(sources, now=1000.0)
+      waited = time.monotonic() - started
+    finally:
+      release.set()
+    holder.result(10)
+
+  assert selected is not None and selected.account_identity == "healthy@example.com"
+  # The wait is the shared preparation budget, spent once.
+  assert waited < 5
+  # A peer mid-exchange says nothing about the account: no cooldown is recorded.
+  assert not quota.load_selection_state(path).cooldowns

@@ -15,7 +15,7 @@ import time
 import urllib.parse
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
-from .credential_pool import ProviderCredentialPool, _PROVIDER_POOLS
+from ..auth import AuthMechanism, EntitlementKind
 
 
 LOGGER = logging.getLogger(__name__)
@@ -64,6 +64,13 @@ ANTHROPIC_STORE_BASE_ENV = "USER_DATA_DIR"
 # autonomous child reading the stdin credential handoff — resolves the same
 # user's pool without having to be told again.
 ANTHROPIC_USER_SCOPE_FIELD = "auth_user_scope"
+# The credential material's own fields carrying the automatic-selection
+# context between the runner's prepare step and the Anthropic adapter. The
+# affinity key is an opaque sha256 of trusted scope + full session id, never a
+# secret; the prepared marker means selection or rotation refresh-preflighted
+# this generation, so `create_client` need not refresh it a second time.
+CREDENTIAL_AFFINITY_KEY_FIELD = "credential_affinity_key"
+CREDENTIAL_PREPARED_FIELD = "credential_prepared"
 # Only the gateway materializer enrolls the deployment key. This explicit
 # generation reference retains membership across rotation without giving
 # ambient operator credentials to other pool consumers.
@@ -85,10 +92,20 @@ REFRESH_FAILURE_BLOCK_SECONDS = 300.0
 # sibling serve, and the next attempt retries it.
 HTTP_CONNECT_TIMEOUT_SECONDS = 5.0
 HTTP_TIMEOUT_SECONDS = 10.0
+# One account's refresh lock is waited on for at most the single-exchange
+# timeout, and every refresh preflight of one selection shares that one budget
+# (`_refresh_deadline`): a peer mid-exchange costs a selection this wait once,
+# never once per account.
+REFRESH_LOCK_WAIT_SECONDS = HTTP_TIMEOUT_SECONDS
+_REFRESH_LOCK_POLL_SECONDS = 0.05
 
 JSONMapping = Mapping[str, Any]
 TokenPoster = Callable[[str, JSONMapping], JSONMapping]
 ProfileGetter = Callable[[str, str], JSONMapping]
+
+# `anthropic_quota` reads constants above from this module, so it is imported
+# only after they exist; this module touches it at call time, never at import.
+from . import anthropic_quota as quota
 
 
 class AnthropicOAuthError(RuntimeError):
@@ -126,6 +143,15 @@ class AnthropicStoreError(AnthropicOAuthError):
     self.path = path
     detail = f": {exc}" if exc is not None else ""
     super().__init__(f"Unable to access Anthropic credential store {path}{detail}")
+
+
+class AnthropicRefreshBusy(AnthropicOAuthError):
+  """Another process still holds the account's refresh lock after the bounded wait.
+
+  Not a verdict on the account: the peer is rotating its grant right now, so
+  the caller moves to a sibling without recording a cooldown.
+  """
+
 
 def _anthropic_store_base(env: Mapping[str, str]) -> Path:
   """The root every Anthropic token store of this deployment lives under."""
@@ -186,8 +212,9 @@ def resolve_anthropic_auth_store_path(
 class AnthropicOAuthRecord:
   """Current material for one immutable source grant generation.
 
-  `identity` remains the account-level parking key across OAuth refreshes.
-  Generation metadata is assigned by the store, not by a reader or consumer.
+  `identity` remains the account's stable name across OAuth refreshes; the
+  account's locator derives from it. Generation metadata is assigned by the
+  store, not by a reader or consumer.
   """
 
   identity: str
@@ -277,7 +304,7 @@ class AnthropicOAuthRecord:
 class AnthropicCredential:
   """A pool member: what to send, what to park, and who can refresh it.
 
-  `key` preserves the existing account/environment parking policy. `record`
+  `locator` owns account quota and cooldown identity across refresh. `record`
   carries the same generation that supplied `token`, including after refresh.
   `store_path` locates its owner and is never encoded into a source reference.
   """
@@ -286,6 +313,34 @@ class AnthropicCredential:
   token: str = field(repr=False)
   record: AnthropicOAuthRecord | None = None
   store_path: Path | None = field(default=None, repr=False)
+  # Source tier and the automatic-selection marker are facts of how the pool
+  # resolver or the selector produced this member, not of the stored record.
+  private: bool = field(default=False, repr=False)
+  automatic: bool = field(default=False, repr=False)
+  # Only refresh-preflighted selection/rotation can skip the client refresh.
+  prepared: bool = field(default=False, repr=False)
+
+  @property
+  def tier(self) -> str:
+    """`private` for the requesting user's own store, `org` for the deployment's."""
+    return "private" if self.private else "org"
+
+  @property
+  def locator(self) -> quota.AccountLocator:
+    """The quota/cooldown identity: stable across refresh, distinct per store.
+
+    An environment-sourced member has no enrolled identity, so it is named by a
+    fingerprint of its token; every other record by (owning store, identity).
+    """
+    record = self.record
+    if record is None or self.store_path is None or record.source.startswith("env:"):
+      return quota.locator_for_env_token(self.token)
+    return quota.locator_for_record(self.store_path, record.identity)
+
+  @property
+  def sidecar_store_path(self) -> Path:
+    """The store whose selection sidecar holds this member's policy and cooldowns."""
+    return self.store_path if self.store_path is not None else resolve_anthropic_auth_store_path()
 
   @property
   def account_identity(self) -> str:
@@ -303,10 +358,44 @@ class AnthropicCredential:
   def generation_ref(self) -> str:
     return self.record.generation_ref if self.record is not None else ""
 
-  def source_metadata(self) -> dict[str, str]:
+  @property
+  def auth_mechanism(self) -> AuthMechanism:
+    return anthropic_credential_mechanism_and_entitlement(self)[0]
+
+  @property
+  def entitlement_kind(self) -> EntitlementKind:
+    return anthropic_credential_mechanism_and_entitlement(self)[1]
+
+  def source_metadata(self) -> dict[str, Any]:
     if self.record is None:
       raise AnthropicSourceError("unregistered")
-    return self.record.source_metadata()
+    metadata: dict[str, Any] = dict(self.record.source_metadata())
+    if self.automatic:
+      metadata["automatic"] = True
+    return metadata
+
+
+def anthropic_credential_mechanism_and_entitlement(
+  cred: AnthropicCredential,
+  *,
+  user_store_path: Path | None = None,
+) -> tuple[AuthMechanism, EntitlementKind]:
+  """Classify a registered Anthropic key or subscription source."""
+  is_api_key = (
+    cred.record is not None
+    and cred.record.credential_kind == "api_key"
+    and not cred.token.startswith("sk-ant-oat")
+  )
+  is_user_store = (
+    cred.store_path == user_store_path
+    if user_store_path is not None
+    else "/users/" in str(cred.store_path or "").replace("\\", "/")
+  )
+  if is_api_key:
+    return "api_key", ("commercial_byok" if is_user_store else "org_commercial")
+  return "oauth_bearer", (
+    "consumer_subscription" if is_user_store else "operator_personal_subscription"
+  )
 
 
 @dataclass(frozen=True)
@@ -330,6 +419,13 @@ class AnthropicCredentialSources:
   @property
   def tokens(self) -> tuple[str, ...]:
     return tuple(credential.token for credential in self.credentials)
+
+  @property
+  def affinity_store_path(self) -> Path:
+    """Where session affinity lives: the requesting user's store, else the org's."""
+    if self.user_scope and self.user_store_path is not None:
+      return self.user_store_path
+    return self.store_path
 
   def by_key(self, key: str) -> AnthropicCredential | None:
     normalized = str(key or "").strip()
@@ -373,8 +469,8 @@ def mask_anthropic_token(token: str) -> str:
 
 
 @contextlib.contextmanager
-def _store_lock(path: Path) -> Iterator[None]:
-  """Serialize store mutation across processes: login and refresh both write it."""
+def _store_lock(path: Path, *, deadline: float | None = None) -> Iterator[None]:
+  """Serialize consent, removal and refresh, optionally bounding the lock wait."""
 
   try:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -390,7 +486,18 @@ def _store_lock(path: Path) -> Iterator[None]:
       os.fchmod(fd, 0o600)
     except OSError:
       pass
-    fcntl.flock(fd, fcntl.LOCK_EX)
+    if deadline is None:
+      fcntl.flock(fd, fcntl.LOCK_EX)
+    else:
+      while True:
+        try:
+          fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+          break
+        except BlockingIOError:
+          remaining = deadline - time.monotonic()
+          if remaining <= 0:
+            raise AnthropicRefreshBusy("Anthropic OAuth refresh is in progress elsewhere") from None
+          time.sleep(min(_REFRESH_LOCK_POLL_SECONDS, remaining))
     yield
   finally:
     try:
@@ -749,9 +856,8 @@ def register_anthropic_static_credential(
   tokens retain their own credential kind within the pool.
   """
 
-  path = resolve_anthropic_auth_store_path(
-    config, environ=environ, user_scope="" if source.startswith("env:") else user_scope,
-  )
+  scope = "" if source.startswith("env:") else user_scope
+  path = resolve_anthropic_auth_store_path(config, environ=environ, user_scope=scope)
   normalized = str(material or "").strip()
   with _store_lock(path):
     store = _load_store_unlocked(path)
@@ -765,6 +871,7 @@ def register_anthropic_static_credential(
       return None
     return AnthropicCredential(
       key=record.identity, token=record.access_token, record=record, store_path=path,
+      private=bool(anthropic_user_scope(scope)),
     )
 
 
@@ -966,12 +1073,15 @@ def resolve_anthropic_credentials(
   )
 
   credentials: list[AnthropicCredential] = []
-  seen_keys: set[str] = set()
+  seen_locators: set[str] = set()
 
   def _append(credential: AnthropicCredential) -> None:
-    if credential.key in seen_keys:
+    # Membership is keyed by locator: a private and an org record that share an
+    # identity are different accounts and both stay.
+    locator_id = credential.locator.id
+    if locator_id in seen_locators:
       return
-    seen_keys.add(credential.key)
+    seen_locators.add(locator_id)
     credentials.append(credential)
 
   def _append_token(token: str, *, name: str = "") -> None:
@@ -1019,6 +1129,7 @@ def resolve_anthropic_credentials(
       token=record.access_token,
       record=record,
       store_path=path,
+      private=path == user_path,
     ))
 
   def _append_records(path: Path, records: Sequence[AnthropicOAuthRecord]) -> None:
@@ -1028,6 +1139,7 @@ def resolve_anthropic_credentials(
         token=record.access_token,
         record=record,
         store_path=path,
+        private=path == user_path,
       ))
 
   bound = str(cfg.get("auth_token") or "").strip()
@@ -1035,6 +1147,15 @@ def resolve_anthropic_credentials(
     _append_token(bound)
   for path, records in stores[:-1]:
     _append_records(path, records)
+    with _store_read_lock(path):
+      user_store = _load_store_unlocked(path, migrate=False)
+    _append_records(
+      path,
+      tuple(
+        record for record in user_store.static_credentials
+        if record.credential_kind == "api_key"
+      ),
+    )
   if api_credential is not None:
     _append(api_credential)
   for name, read_form in _ENV_POOL_FORMS:
@@ -1065,7 +1186,7 @@ def _resolve_generation(
     if scope else (org_path,)
   )
   generation_id = generation_ref.removeprefix(_GENERATION_REF_PREFIX)
-  for path in paths:
+  for index, path in enumerate(paths):
     with _store_read_lock(path):
       store = _load_store_unlocked(path, migrate=False)
       try:
@@ -1091,8 +1212,27 @@ def _resolve_generation(
       )
       return AnthropicCredential(
         key=key, token=record.access_token, record=record, store_path=path,
+        private=bool(scope) and index == 0,
       )
   raise AnthropicSourceError("missing")
+
+
+def anthropic_pool_config(config: Mapping[str, Any]) -> dict[str, Any]:
+  """The config a pool re-resolution sees: the caller's whole pool, not its pin.
+
+  Rotation, a model-fallback hop and the runner's prepare step all resolve the
+  caller's whole authorized pool, so the bound `credential_source` is dropped.
+  When that source was `automatic` (issued by selection), its bearer was only an
+  affinity hint: it is dropped too, so an account removed since it was issued
+  cannot re-enter membership as a request-carried token. An exact source keeps
+  its bearer; it is the caller's own material.
+  """
+
+  pool_config = {key: value for key, value in config.items() if key != "credential_source"}
+  source = config.get("credential_source")
+  if isinstance(source, Mapping) and source.get("automatic"):
+    pool_config.pop("auth_token", None)
+  return pool_config
 
 
 def is_anthropic_generation_ref(ref: str) -> bool:
@@ -1117,6 +1257,8 @@ def anthropic_generation_auth_config(
   config.update(
     provider="anthropic",
     auth_mode="api" if is_api_key else "oauth",
+    auth_mechanism=credential.auth_mechanism,
+    entitlement_kind=credential.entitlement_kind,
     api_key=credential.token if is_api_key else "",
     auth_token="" if is_api_key else credential.token,
     credential_source=credential.source_metadata(),
@@ -1125,22 +1267,6 @@ def anthropic_generation_auth_config(
   return config
 
 
-class AnthropicCredentialPool(ProviderCredentialPool):
-  """Which sibling credential is usable right now, for this process.
-
-  The resolver owns the order; the limiter's own reset headers own the block
-  windows. Selection is a read of those two and never a decision of its own.
-  Keys are credential keys (an enrolled account's identity, or an environment
-  token), so a refreshed access token stays parked for its account's window.
-  """
-
-
-
-# Usage limits outlive a single request and a single session, so the block state
-# is process-wide: a credential the limiter rejected for the next five hours must
-# not be handed to the next session that starts.
-ANTHROPIC_CREDENTIAL_POOL = AnthropicCredentialPool()
-_PROVIDER_POOLS["anthropic"] = ANTHROPIC_CREDENTIAL_POOL
 _LOGGED_POOL_SUMMARIES: dict[str, str] = {}
 
 
@@ -1226,73 +1352,123 @@ def _identity_from_payload(payload: JSONMapping) -> str:
   return ""
 
 
+def _refresh_deadline(wait_seconds: float | None = None) -> float:
+  """The monotonic instant a refresh preflight stops waiting on a peer's lock.
+
+  Never beyond the single-exchange timeout; one selection computes this once
+  and passes it to every account it preflights, so the wait is shared.
+  """
+
+  wait = REFRESH_LOCK_WAIT_SECONDS if wait_seconds is None else min(max(wait_seconds, 0.0), REFRESH_LOCK_WAIT_SECONDS)
+  return time.monotonic() + wait
+
+
+def _replace_record(
+  store: _AnthropicStore, old: AnthropicOAuthRecord, new: AnthropicOAuthRecord,
+) -> None:
+  for records in (store.accounts, store.static_credentials):
+    for index, record in enumerate(records):
+      if record.generation_id == old.generation_id:
+        records[index] = new
+        return
+
+
+def _write_refresh_result(
+  path: Path, expected: AnthropicOAuthRecord, update: AnthropicOAuthRecord,
+) -> AnthropicOAuthRecord:
+  """Compare-and-swap `update` over `expected`; the caller holds the store lock."""
+
+  store = _load_store_unlocked(path)
+  latest = _current_generation(store, expected.generation_id)
+  if (
+    latest.access_token != expected.access_token
+    or latest.refresh_token != expected.refresh_token
+  ):
+    return latest
+  _replace_record(store, latest, update)
+  _write_store_unlocked(path, store)
+  return update
+
+
+def _refresh_generation(
+  path: Path,
+  record: AnthropicOAuthRecord,
+  *,
+  moment: float,
+  post: TokenPoster | None,
+  deadline: float,
+) -> AnthropicOAuthRecord:
+  """Refresh an exact generation while holding the shared store-wide lock.
+
+  Published consumers hold this same lock across reread, token exchange and
+  guarded write, so a rotating refresh token cannot be spent twice. The worker
+  owns the lock until its exchange finishes even if its awaiting task cancels.
+  """
+
+  with _store_lock(path, deadline=deadline):
+    current = _current_generation(_load_store_unlocked(path), record.generation_id)
+    if current.access_token != record.access_token or current.refresh_token != record.refresh_token:
+      return current
+    if not current.needs_refresh(now=moment):
+      return current
+    poster = post or _post_token_endpoint
+    try:
+      payload = poster(
+        ANTHROPIC_OAUTH_TOKEN_URL,
+        {
+          "grant_type": "refresh_token",
+          "refresh_token": current.refresh_token,
+          "client_id": ANTHROPIC_OAUTH_CLIENT_ID,
+        },
+      )
+      access_token, refresh_token, expires_in, scope = _token_payload_fields(payload)
+    except AnthropicOAuthError:
+      failed = replace(current, last_error="Anthropic OAuth refresh failed", last_error_at=moment)
+      written = _write_refresh_result(path, current, failed)
+      if written is not failed:
+        return written
+      raise AnthropicOAuthError("Anthropic OAuth refresh failed") from None
+    refreshed = replace(
+      current,
+      access_token=access_token,
+      refresh_token=refresh_token or current.refresh_token,
+      expires_at=moment + expires_in if expires_in else moment,
+      updated_at=moment,
+      scope=scope or current.scope,
+      last_error="",
+      last_error_at=0.0,
+    )
+    written = _write_refresh_result(path, current, refreshed)
+    if written is refreshed:
+      LOGGER.info(
+        "Refreshed Anthropic OAuth access token for %s (expires in %.0fs)",
+        quota.locator_for_record(path, refreshed.identity).id,
+        max(0.0, refreshed.expires_at - moment),
+      )
+    return written
+
+
 def refresh_anthropic_oauth_record(
   record: AnthropicOAuthRecord,
   *,
   store_path: Path,
   now: float | None = None,
   post: TokenPoster | None = None,
+  lock_wait_seconds: float | None = None,
 ) -> AnthropicOAuthRecord:
-  """Refresh the exact current grant under its owner's cross-process lock.
+  """Refresh the exact current grant under the store-wide cross-process lock.
 
-  Reloading before the exchange prevents reuse of a rotating refresh token.
-  Consent/removal and the entire refresh exchange+save share the same lock.
-  Captured material from a retired generation can never overwrite its successor.
+  Reread, exchange and guarded write serialize with refresh, consent and removal
+  in published consumers. A captured retired generation never overwrites its
+  successor. Waiting for a peer is bounded by `lock_wait_seconds` (default and
+  ceiling: the single-exchange timeout); a peer still holding the lock then is
+  `AnthropicRefreshBusy`.
   """
 
   moment = time.time() if now is None else now
-  with _store_lock(store_path):
-    store = _load_store_unlocked(store_path)
-    current = _current_generation(store, record.generation_id)
-    if current.access_token != record.access_token or current.refresh_token != record.refresh_token:
-      return current
-    return _refresh_record_unlocked(store_path, store, current, moment=moment, post=post)
-
-
-def _refresh_record_unlocked(
-  path: Path,
-  store: _AnthropicStore,
-  record: AnthropicOAuthRecord,
-  *,
-  moment: float,
-  post: TokenPoster | None = None,
-) -> AnthropicOAuthRecord:
-  if not record.needs_refresh(now=moment):
-    return record
-  poster = post or _post_token_endpoint
-  try:
-    payload = poster(
-      ANTHROPIC_OAUTH_TOKEN_URL,
-      {
-        "grant_type": "refresh_token",
-        "refresh_token": record.refresh_token,
-        "client_id": ANTHROPIC_OAUTH_CLIENT_ID,
-      },
-    )
-    access_token, refresh_token, expires_in, scope = _token_payload_fields(payload)
-  except AnthropicOAuthError:
-    failed = replace(record, last_error="Anthropic OAuth refresh failed", last_error_at=moment)
-    store.accounts[store.accounts.index(record)] = failed
-    _write_store_unlocked(path, store)
-    raise AnthropicOAuthError("Anthropic OAuth refresh failed") from None
-  refreshed = replace(
-    record,
-    access_token=access_token,
-    refresh_token=refresh_token or record.refresh_token,
-    expires_at=moment + expires_in if expires_in else moment,
-    updated_at=moment,
-    scope=scope or record.scope,
-    last_error="",
-    last_error_at=0.0,
+  return _refresh_generation(
+    store_path, record, moment=moment, post=post, deadline=_refresh_deadline(lock_wait_seconds),
   )
-  store.accounts[store.accounts.index(record)] = refreshed
-  _write_store_unlocked(path, store)
-  LOGGER.info(
-    "Refreshed Anthropic OAuth access token for %s (expires in %.0fs)",
-    refreshed.identity,
-    max(0.0, refreshed.expires_at - moment),
-  )
-  return refreshed
 
 
 def _current_credential(
@@ -1301,49 +1477,26 @@ def _current_credential(
   refresh: bool,
   now: float | None = None,
   post: TokenPoster | None = None,
+  deadline: float | None = None,
 ) -> AnthropicCredential:
   if credential.record is None or credential.store_path is None:
     raise AnthropicSourceError("unregistered")
   path = credential.store_path
-  with _store_lock(path):
-    store = _load_store_unlocked(path)
-    record = _current_generation(store, credential.generation_id)
-    if refresh:
-      record = _refresh_record_unlocked(
-        path, store, record, moment=time.time() if now is None else now, post=post,
-      )
-    return replace(credential, token=record.access_token, record=record)
-
-
-def _usable_credential(
-  candidates: Sequence[AnthropicCredential],
-  *,
-  pool: AnthropicCredentialPool,
-  now: float | None = None,
-) -> AnthropicCredential | None:
-  """The first unparked source, with material and metadata from the same generation."""
-
   moment = time.time() if now is None else now
-  for credential in candidates:
-    if pool.blocked_until(credential.key) > moment:
-      continue
-    try:
-      return _current_credential(credential, refresh=True, now=moment)
-    except AnthropicOAuthError as exc:
-      # Keep the existing account-level refresh-failure parking policy.
-      pool.block(credential.key, until=moment + REFRESH_FAILURE_BLOCK_SECONDS)
-      LOGGER.warning(
-        "Anthropic OAuth refresh failed for %s; parking it for %.0fs: %s",
-        credential.account_identity,
-        REFRESH_FAILURE_BLOCK_SECONDS,
-        exc,
-      )
-  return None
+  # Writers atomically replace the store. Read the current generation without
+  # waiting behind an exchange; refresh revalidates it under the bounded lock.
+  record = _current_generation(_load_store_unlocked(path, migrate=False), credential.generation_id)
+  if refresh and record.needs_refresh(now=moment):
+    record = _refresh_generation(
+      path, record, moment=moment, post=post,
+      deadline=_refresh_deadline() if deadline is None else deadline,
+    )
+  return replace(credential, token=record.access_token, record=record)
 
 
 def _log_pool_summary(sources: AnthropicCredentialSources) -> None:
   summary = ", ".join(
-    f"{credential.account_identity}"
+    f"{credential.locator.id} {credential.tier}"
     f" generation={credential.generation_id}"
     for credential in sources.credentials
   )
@@ -1360,25 +1513,161 @@ def _log_pool_summary(sources: AnthropicCredentialSources) -> None:
   )
 
 
+def _family(model: str | None) -> str | None:
+  return quota.model_family(model) if model else None
+
+
+def _rank_candidate(
+  credential: AnthropicCredential,
+  locator: quota.AccountLocator,
+  order: int,
+  state: quota.SelectionState,
+  extra: quota.Cooldown | None = None,
+) -> quota.RankCandidate:
+  cooldowns = state.cooldowns.get(locator.id, ())
+  if extra is not None:
+    cooldowns = (*cooldowns, extra)
+  return quota.RankCandidate(
+    locator=locator,
+    tier=credential.tier,
+    order=order,
+    policy=state.policies.get(locator.id, quota.AccountPolicy()),
+    observation=state.observations.get(locator.id, quota.AccountObservation()),
+    cooldowns=tuple(cooldowns),
+  )
+
+
+def _note_refresh_failure(credential: AnthropicCredential, exc: AnthropicOAuthError, moment: float) -> None:
+  """Account for a refresh that did not produce a usable credential.
+
+  A retired generation or a peer still mid-exchange says nothing about the
+  account, so only the in-memory pass skips it. A failed exchange cools the
+  account down for every process that shares its store's sidecar.
+  """
+
+  locator = credential.locator
+  if isinstance(exc, (AnthropicSourceError, AnthropicRefreshBusy)):
+    LOGGER.warning("Anthropic account %s is unavailable to this selection: %s", locator.id, type(exc).__name__)
+    return
+  quota.record_cooldown(
+    credential.sidecar_store_path,
+    locator,
+    quota.Cooldown(scope="shared", until=moment + REFRESH_FAILURE_BLOCK_SECONDS, reason="refresh_failed"),
+  )
+  LOGGER.warning(
+    "Anthropic OAuth refresh failed for %s; cooling it down for %.0fs",
+    locator.id,
+    REFRESH_FAILURE_BLOCK_SECONDS,
+  )
+
+
+def _select_ranked(
+  credentials: Sequence[AnthropicCredential],
+  *,
+  moment: float,
+  family: str | None,
+  affinity: quota.Affinity | None,
+  seed: str | None,
+  fallback: bool,
+) -> AnthropicCredential | None:
+  """Rank `credentials` and bind the best one that survives refresh preflight.
+
+  A refresh failure cools that account down and re-ranks, so the next candidate
+  is whatever the ranker now prefers (another tier when the whole tier failed;
+  a warm account kept when its would-be replacement cannot refresh). All
+  preflights share one lock-wait budget. When every candidate is blocked,
+  `fallback` binds the ranker's earliest-reset account with no refresh, so a
+  single credential is never withheld; without it there is no result.
+  """
+
+  locators = [credential.locator for credential in credentials]
+  by_id: dict[str, AnthropicCredential] = {}
+  for credential, locator in zip(credentials, locators):
+    by_id.setdefault(locator.id, credential)
+  if affinity is not None and affinity.locator_id not in by_id:
+    # A cached account this request's membership does not contain is ignored.
+    affinity = None
+  states: dict[Path, quota.SelectionState] = {}
+  failed: dict[str, quota.Cooldown] = {}
+  deadline = _refresh_deadline()
+  while True:
+    candidates = []
+    for order, (credential, locator) in enumerate(zip(credentials, locators)):
+      path = credential.sidecar_store_path
+      state = states.get(path)
+      if state is None:
+        state = states[path] = quota.load_selection_state(path, now=moment)
+      candidates.append(_rank_candidate(credential, locator, order, state, failed.get(locator.id)))
+    decision = quota.rank_candidates(
+      candidates, now=moment, family=family, affinity=affinity, session_seed=seed,
+    )
+    for candidate in decision.ordered:
+      credential = by_id[candidate.locator.id]
+      try:
+        selected = _current_credential(credential, refresh=True, now=moment, deadline=deadline)
+      except AnthropicOAuthError as exc:
+        failed[candidate.locator.id] = quota.Cooldown(
+          scope="shared", until=moment + REFRESH_FAILURE_BLOCK_SECONDS, reason="refresh_failed",
+        )
+        _note_refresh_failure(credential, exc, moment)
+        break
+      LOGGER.info(
+        "Anthropic credential selected: account=%s tier=%s reason=%s",
+        candidate.locator.id, candidate.tier, decision.reason,
+      )
+      return replace(selected, automatic=True, prepared=True)
+    else:
+      if not fallback or decision.fallback is None:
+        return None
+      credential = by_id[decision.fallback.locator.id]
+      LOGGER.info(
+        "Anthropic credential selected: account=%s tier=%s reason=%s",
+        decision.fallback.locator.id, decision.fallback.tier, decision.reason,
+      )
+      return replace(_current_credential(credential, refresh=False, now=moment), automatic=True, prepared=False)
+
+
 def select_anthropic_credential_source(
   sources: AnthropicCredentialSources,
   *,
-  pool: AnthropicCredentialPool | None = None,
   now: float | None = None,
+  placement: str = "local",
+  model: str | None = None,
+  session_id: str | None = None,
 ) -> AnthropicCredential | None:
-  """Bind a credential: the first usable one, else the first at all.
+  """Bind a credential: the best-ranked usable one, else the earliest-reset one.
 
-  A pool of one is never withheld from a run — an expired or unrefreshable
-  single credential still binds, so the turn walks into the provider's existing
-  rate-limit/auth handling instead of failing here with no request made.
+  The ranker (`anthropic_quota.rank_candidates`) owns precedence and order: the
+  private tier before the org tier, measured quota and reset timing, scoped
+  cooldowns from every process's sidecar, and warm affinity for `session_id`
+  (the full runner session id) restricted to accounts this pool contains. The
+  result is marked `automatic`. A pool of one is never withheld from a run — an
+  expired, cooled-down or unrefreshable single credential still binds, so the
+  turn walks into the provider's existing rate-limit/auth handling instead of
+  failing here with no request made.
   """
 
-  selected_pool = ANTHROPIC_CREDENTIAL_POOL if pool is None else pool
+  moment = time.time() if now is None else now
   _log_pool_summary(sources)
-  selected = _usable_credential(sources.credentials, pool=selected_pool, now=now)
-  if selected is not None:
-    return selected
-  return _current_credential(sources.credentials[0], refresh=False) if sources.credentials else None
+  credentials = sources.credentials
+  if placement == "hosted_external":
+    credentials = tuple(
+      cred for cred in credentials
+      if (
+        cred.record is not None
+        and cred.record.credential_kind == "api_key"
+        and not cred.token.startswith("sk-ant-oat")
+      )
+    )
+  if not credentials:
+    return None
+  key = quota.affinity_key(sources.user_scope, session_id)
+  affinity = None
+  if key is not None:
+    affinity = quota.load_selection_state(sources.affinity_store_path, now=moment).affinity.get(key)
+  return _select_ranked(
+    credentials, moment=moment, family=_family(model), affinity=affinity, seed=key, fallback=True,
+  )
 
 
 def rotate_anthropic_credential_source(
@@ -1386,25 +1675,124 @@ def rotate_anthropic_credential_source(
   *,
   current: str,
   until: float,
-  pool: AnthropicCredentialPool | None = None,
   now: float | None = None,
+  model: str | None = None,
+  scope: str = "shared",
+  reason: str = "rate_limit",
 ) -> AnthropicCredential | None:
-  """Park the current credential until `until` and hand back the next sibling.
+  """Cool the current credential down until `until` and hand back the next sibling.
 
+  The cooldown is the sidecar's scoped row for the current account (`scope` is
+  `shared` or the model family the limit applies to), so every process sees it.
   Unlike binding there is no fallback here: handing back a credential a limiter
   already rejected would rotate the run in circles instead of letting the
   caller's existing retry run its course.
   """
 
-  selected_pool = ANTHROPIC_CREDENTIAL_POOL if pool is None else pool
-  normalized = str(current or "").strip()
-  current_credential = sources.by_token(normalized)
-  current_key = current_credential.key if current_credential is not None else normalized
-  selected_pool.block(current_key, until=until)
-  siblings = [
-    credential for credential in sources.credentials if credential.key != current_key
-  ]
-  return _usable_credential(siblings, pool=selected_pool, now=now)
+  moment = time.time() if now is None else now
+  failed = sources.by_token(str(current or "").strip())
+  siblings = sources.credentials
+  if failed is not None:
+    failed_id = failed.locator.id
+    quota.record_cooldown(
+      failed.sidecar_store_path,
+      failed.locator,
+      quota.Cooldown(scope=scope, until=until, reason=reason),
+    )
+    siblings = tuple(credential for credential in siblings if credential.locator.id != failed_id)
+  if not siblings:
+    return None
+  return _select_ranked(
+    siblings, moment=moment, family=_family(model), affinity=None, seed=None, fallback=False,
+  )
+
+
+def anthropic_credential_blocked_until(
+  credential: AnthropicCredential,
+  *,
+  now: float | None = None,
+  model: str | None = None,
+) -> float:
+  """When `credential` becomes usable for `model`; 0.0 when it is usable now.
+
+  Reads the owning store's sidecar through the same ranker selection uses, so a
+  scoped cooldown or a fresh confirmed-exhausted window answers identically
+  here and there.
+  """
+
+  moment = time.time() if now is None else now
+  locator = credential.locator
+  state = quota.load_selection_state(credential.sidecar_store_path, now=moment)
+  decision = quota.rank_candidates(
+    [_rank_candidate(credential, locator, 0, state)],
+    now=moment, family=_family(model), affinity=None, session_seed=None,
+  )
+  return decision.blocked[0][1] if decision.blocked else 0.0
+
+
+@dataclass(frozen=True)
+class AnthropicRequestBinding:
+  """The account a request was actually sent as, captured with the bearer.
+
+  Response headers and failures are attributed to this, never to whatever
+  `auth_token` the config holds after another process refreshed it.
+  """
+
+  locator: quota.AccountLocator
+  tier: str
+  sidecar_store_path: Path
+  affinity_store_path: Path | None
+  generation_id: str | None
+  affinity_key: str | None
+
+
+def anthropic_request_binding(
+  config: Mapping[str, Any], bearer: str,
+) -> AnthropicRequestBinding | None:
+  """Bind `bearer` — the token a client actually sends — to its account.
+
+  The exact generation named by `credential_source` wins, then the pool member
+  holding this token, then an environment fingerprint of the bearer itself.
+  Attribution is telemetry: a store or resolver failure is `None`, never an
+  error on the request path.
+  """
+
+  token = str(bearer or "").strip()
+  if not token:
+    return None
+  source = config.get("credential_source")
+  generation_ref = str(source.get("generation_ref") or "") if isinstance(source, Mapping) else ""
+  try:
+    sources = resolve_anthropic_credentials(config)
+  except (AnthropicOAuthError, OSError):
+    return None
+  credential = sources.by_generation_ref(generation_ref) if generation_ref else sources.by_token(token)
+  affinity_key = str(config.get(CREDENTIAL_AFFINITY_KEY_FIELD) or "") or None
+  if credential is None:
+    return AnthropicRequestBinding(
+      locator=quota.locator_for_env_token(token),
+      tier="org",
+      sidecar_store_path=sources.store_path,
+      affinity_store_path=sources.affinity_store_path,
+      generation_id=None,
+      affinity_key=affinity_key,
+    )
+  return AnthropicRequestBinding(
+    locator=credential.locator,
+    tier=credential.tier,
+    sidecar_store_path=credential.sidecar_store_path,
+    affinity_store_path=sources.affinity_store_path,
+    generation_id=credential.generation_id or None,
+    affinity_key=affinity_key,
+  )
+
+
+def record_anthropic_success(binding: AnthropicRequestBinding, *, now: float | None = None) -> None:
+  """Renew the session's warm affinity for the account that just served it."""
+
+  if binding.affinity_store_path is None:
+    return
+  quota.record_success(binding.affinity_store_path, binding.locator, binding.affinity_key, now=now)
 
 
 def ensure_fresh_anthropic_credential(
@@ -1449,8 +1837,9 @@ def ensure_fresh_anthropic_credential(
   except AnthropicOAuthError as exc:
     # The bound credential is still handed to the request: the provider's 401
     # is what rotates the run to a sibling, and withholding it here would end
-    # the turn with no request made at all.
-    LOGGER.warning("Anthropic OAuth refresh failed for %s: %s", record.identity, exc)
+    # the turn with no request made at all. The failure still cools the account
+    # down for later selections.
+    _note_refresh_failure(credential, exc, time.time() if now is None else now)
     return credential.token
 
 
@@ -1580,9 +1969,7 @@ def setup_token_account_identity(token: str) -> str:
   A setup token carries `user:inference` only, so Anthropic's profile endpoint
   refuses to name the account it belongs to (403 `oauth_scope_insufficient`).
   The account key is therefore derived from the token itself: stable across
-  re-enrollments of the same token, printable (it is not the token), and the
-  key the process-wide block state uses — so one usage-limited account is
-  parked for every user who enrolled it.
+  re-enrollments of the same token and printable (it is not the token).
   """
 
   digest = hashlib.sha256(str(token or "").strip().encode("utf-8")).hexdigest()[:16]
@@ -1599,7 +1986,7 @@ def enroll_anthropic_setup_token(
 
   Same pool membership as a login-enrolled account, minus the refresh grant a
   setup token does not have: it is sent as-is, exactly like the environment
-  forms, and it is parked by its account key when a limiter rejects it.
+  forms, and a limiter's rejection is a cooldown recorded against its locator.
   """
 
   normalized = str(token or "").strip()
@@ -1630,9 +2017,17 @@ def anthropic_token_store_is_private(path: Path) -> bool:
 
 __all__ = [
   "ANTHROPIC_AUTH_STORE_PATH_ENV",
+  "anthropic_pool_config",
   "ANTHROPIC_AUTH_TOKEN_ENV",
   "ANTHROPIC_AUTH_TOKENS_ENV",
-  "ANTHROPIC_CREDENTIAL_POOL",
+  "AnthropicRefreshBusy",
+  "AnthropicRequestBinding",
+  "CREDENTIAL_AFFINITY_KEY_FIELD",
+  "CREDENTIAL_PREPARED_FIELD",
+  "REFRESH_LOCK_WAIT_SECONDS",
+  "anthropic_credential_blocked_until",
+  "anthropic_request_binding",
+  "record_anthropic_success",
   "ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES",
   "ANTHROPIC_DEPLOYMENT_API_KEY_FIELD",
   "ANTHROPIC_OAUTH_AUTHORIZE_URL",
@@ -1644,7 +2039,6 @@ __all__ = [
   "ANTHROPIC_USER_SCOPE_FIELD",
   "CLAUDE_CODE_OAUTH_TOKEN_ENV",
   "AnthropicCredential",
-  "AnthropicCredentialPool",
   "AnthropicCredentialSources",
   "AnthropicLoginRequest",
   "AnthropicOAuthError",
@@ -1653,6 +2047,7 @@ __all__ = [
   "REFRESH_FAILURE_BLOCK_SECONDS",
   "REFRESH_MARGIN_SECONDS",
   "UNDECLARED_LIMIT_BLOCK_SECONDS",
+  "anthropic_credential_mechanism_and_entitlement",
   "anthropic_generation_auth_config",
   "is_anthropic_generation_ref",
   "anthropic_token_store_is_private",

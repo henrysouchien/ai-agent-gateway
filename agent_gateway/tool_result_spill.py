@@ -9,7 +9,7 @@ import re
 import stat
 import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -221,8 +221,17 @@ def _job_directory_name(job_id: str) -> str:
   return hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:32]
 
 
-def job_spill_sink(parent: SpillSink, job_id: str) -> SpillSink:
-  """Locate one child's spill root; ``_sink_root`` validates (and on publish creates) it."""
+def job_spill_sink(
+  parent: SpillSink,
+  job_id: str,
+  *,
+  spill_read: bool | None = None,
+) -> SpillSink:
+  """Locate one child's spill root; ``_sink_root`` validates (and on publish creates) it.
+
+  ``spill_read`` states whether the child's own admitted surface carries the
+  reader; ``None`` inherits the parent's capability.
+  """
 
   if not job_id:
     raise ValueError("job spill sink requires a job id")
@@ -230,9 +239,12 @@ def job_spill_sink(parent: SpillSink, job_id: str) -> SpillSink:
   def _root() -> str:
     return str(Path(parent()) / SPILL_JOB_DIRECTORY / _job_directory_name(job_id))
 
+  capabilities = parent.capabilities
+  if spill_read is not None and capabilities.spill_read != spill_read:
+    capabilities = replace(capabilities, spill_read=spill_read)
   return SpillSink(
     root_provider=_root,
-    capabilities=parent.capabilities,
+    capabilities=capabilities,
     budget=_JobSpillBudget(parent),
     max_file_bytes=parent.max_file_bytes,
     after_commit=parent.after_commit,

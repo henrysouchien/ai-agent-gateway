@@ -142,3 +142,17 @@ def test_runner_skill_gate_delegates_filter_and_activate() -> None:
   unchanged_tools = base_kwargs["tools"]
   runner._activate_skill_allow({"bad": "mapping"}, base_kwargs)
   assert base_kwargs["tools"] is unchanged_tools
+
+
+def test_runner_skill_run_id_rotates_only_outside_top_level_lifecycle() -> None:
+  runner = _make_runner(["read"])
+  runner._skill_run_id = "20260607T000000Z-aaaa1111"
+  runner._activate_skill_run_id("20260607T000100Z-bbbb2222")
+  assert runner._skill_run_id == "20260607T000100Z-bbbb2222"
+
+  runner._activate_skill_run_id(" not valid ")
+  assert runner._skill_run_id == "20260607T000100Z-bbbb2222"
+
+  runner._top_level_skill_lifecycle = object()  # type: ignore[assignment]
+  runner._activate_skill_run_id("20260607T000200Z-cccc3333")
+  assert runner._skill_run_id == "20260607T000100Z-bbbb2222"

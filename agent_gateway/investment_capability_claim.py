@@ -38,6 +38,12 @@ from hank_contracts.investment_claims import (
 
 logger = logging.getLogger(__name__)
 
+INVESTMENT_READBACK_FACADE_TOOLS: Final[frozenset[str]] = frozenset({
+  "get_investment_run",
+  "list_investment_artifacts",
+  "get_investment_artifact",
+})
+
 _MAX_ID_CHARS = 256
 _MAX_CHANNEL_CHARS = 64
 _MAX_RESEARCH_FILE_ID = (1 << 63) - 1
@@ -234,7 +240,7 @@ def issue_investment_capability_claim(
   tool_name: str,
   request_id: str,
   jti: str,
-  skill: str,
+  skill: str | None = None,
   admitted_skill_execution_limits: SkillExecutionLimits | None,
   policy_bundle_hash: str | None,
   research_file_id: int | None = None,
@@ -262,7 +268,6 @@ def issue_investment_capability_claim(
   routed_tool = _required_text(tool_name, "tool_name")
   request = _required_text(request_id, "request_id")
   token_id = _required_text(jti, "jti")
-  trusted_skill = _required_text(skill, "skill")
   # The bundle hash is provenance, not authority (the grants below are). A run
   # with no approval route has no policy bundle, so the claim carries none
   # rather than refusing the gateway's own run context.
@@ -277,17 +282,40 @@ def issue_investment_capability_claim(
       policy_bundle_hash,
     )
     trusted_policy_bundle = None
-  grant = _skill_grants.get(trusted_skill)
-  if grant is None:
-    raise InvestmentCapabilityClaimError(
-      "investment capability claim cannot bind an unsupported skill"
+  if skill is None and routed_tool in INVESTMENT_READBACK_FACADE_TOOLS:
+    matching_grants = [
+      grant for grant in _skill_grants.values()
+      if routed_tool in grant.tool_names and "read" in grant.effect_classes
+    ]
+    if not matching_grants:
+      raise InvestmentCapabilityClaimError(
+        "investment capability claim cannot bind an unsupported tool"
+      )
+    capability_ids = sorted({
+      capability for grant in matching_grants for capability in grant.capability_ids
+    })
+    effect_classes = ["read"]
+    trusted_skill = "session_readback"
+  else:
+    trusted_skill = _required_text(skill, "skill")
+    grant = _skill_grants.get(trusted_skill)
+    if grant is None:
+      raise InvestmentCapabilityClaimError(
+        "investment capability claim cannot bind an unsupported skill"
+      )
+    if routed_tool not in grant.tool_names:
+      raise InvestmentCapabilityClaimError(
+        "investment capability claim cannot bind an unsupported tool"
+      )
+    capability_ids = sorted(grant.capability_ids)
+    effect_classes = sorted(grant.effect_classes)
+  if "quant_research" in capability_ids:
+    effective_limits = (
+      admitted_skill_execution_limits
+      if admitted_skill_execution_limits is not None or skill is not None
+      else SkillExecutionLimits(32_000)
     )
-  if routed_tool not in grant.tool_names:
-    raise InvestmentCapabilityClaimError(
-      "investment capability claim cannot bind an unsupported tool"
-    )
-  if "quant_research" in grant.capability_ids:
-    approved_budget = _approved_budget(admitted_skill_execution_limits)
+    approved_budget = _approved_budget(effective_limits)
   else:
     approved_budget = None
   if routed_tool == "start_quant_research":
@@ -311,10 +339,10 @@ def issue_investment_capability_claim(
     )
 
   payload: dict[str, object] = {
-    "allowed_capability_ids": sorted(grant.capability_ids),
+    "allowed_capability_ids": capability_ids,
     "aud": INVESTMENT_CAPABILITY_CLAIM_AUDIENCE,
     "channel": routed_channel,
-    "effect_classes": sorted(grant.effect_classes),
+    "effect_classes": effect_classes,
     "exp": issued_at + INVESTMENT_CAPABILITY_CLAIM_TTL_SECONDS,
     "iat": issued_at,
     "iss": INVESTMENT_CAPABILITY_CLAIM_ISSUER,
@@ -475,6 +503,7 @@ __all__ = [
   "INVESTMENT_CAPABILITY_CLAIM_TTL_SECONDS",
   "INVESTMENT_SELECTED_CONTENT_CLAIM_PURPOSE",
   "INVESTMENT_CAPABILITY_FACADE_TOOLS",
+  "INVESTMENT_READBACK_FACADE_TOOLS",
   "INVESTMENT_JOB_PRINCIPAL_CLAIM_KIND",
   "INVESTMENT_JOB_PRINCIPAL_CLAIM_VERSION",
   "INVESTMENT_JOB_PRINCIPAL_TOOLS",

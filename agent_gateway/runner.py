@@ -176,6 +176,7 @@ STREAM_RETRY_MAX = 3
 STREAM_RETRY_DELAY = 2.0
 STREAM_RETRY_BACKOFF = 2.0
 _ACTIVE_SKILL_ALLOW_RESULT_KEY = "_active_skill_allow"
+_SKILL_RUN_ID_RESULT_KEY = "_skill_run_id"
 
 
 
@@ -1083,6 +1084,21 @@ class AgentRunner(
       return
     self._active_skill_allow = allowed
     self._rebuild_filtered_tool_definitions(base_kwargs)
+
+  def _activate_skill_run_id(self, skill_run_id: Any) -> None:
+    if self._top_level_skill_lifecycle is not None:
+      return
+    if type(skill_run_id) is not str:
+      return
+    normalized = skill_run_id.strip()
+    if not normalized or normalized != skill_run_id:
+      return
+    from .run_identity import RunIdentityCarrierError, validate_run_identity
+
+    try:
+      self._skill_run_id = validate_run_identity(normalized)
+    except RunIdentityCarrierError:
+      return
 
   def _newly_exposed_tool_names(
     self,

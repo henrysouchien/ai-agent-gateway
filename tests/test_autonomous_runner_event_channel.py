@@ -1164,3 +1164,76 @@ def test_private_capture_cannot_overwrite_pending_original_call(tmp_path: Path) 
       assert conn.execute("SELECT COUNT(*) FROM approval_executable_bindings").fetchone()[0] == 0
 
   asyncio.run(case())
+
+
+_COMPLETED_RESULT_CHILD = """
+import json,os
+from agent_gateway.autonomous_event_channel import (
+  AUTONOMOUS_EVENT_CHANNEL_FD_ENV, adopt_inherited_autonomous_event_channel,
+)
+envelope=json.loads(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE"])
+launch=envelope["workload"]["approval_continuation"]
+channel=adopt_inherited_autonomous_event_channel(
+  int(os.environ[AUTONOMOUS_EVENT_CHANNEL_FD_ENV]), channel_id=envelope["channel_id"],
+)
+channel.start(timeout_seconds=20)
+channel.send_private_executable_capture({"completed_executable_result":{
+  "approval_id":launch["approval_id"],"job_id":launch["job_id"],
+  "tool_call_id":launch["tool_call_id"],"nonce":launch["nonce"],
+  "result_json":json.dumps([{"kind":"json","value":{"placed":1}},None]),
+}},timeout_seconds=20)
+channel.complete({"type":"stream_complete","terminal_disposition":"completed"},timeout_seconds=20)
+"""
+
+
+def test_successor_result_frame_is_recorded_in_the_parent_ledger_by_the_drain(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  from agent_gateway.control_plane.autonomous_approval_delivery import (
+    decided_approval_continuation,
+  )
+
+  async def case() -> None:
+    monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", _HMAC_KEY)
+    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+    first_source = _PRIVATE_CAPTURE_CHILD.replace(
+      "PRIVATE_PAYLOAD_OVERRIDE", "pass",
+    ).replace("for index in (1,2):", "for index in (1,):")
+    registry = _registry(tmp_path / "runs", child_source=first_source, approval_store=store)
+    parked = await _start(registry)
+    assert (await registry.wait(parked["task_id"], timeout_sec=60))["state"] == "completed"
+    source = registry._tasks[parked["task_id"]]
+    request = await store.get_by_tool_call_id("private-call-1")
+    assert request is not None
+    await store.transition_state(
+      request.approval_id, "approved", expected_state_version=request.state_version,
+      decider_id="owner-1", decider_role="owner",
+    )
+    binding, decision = await store._read_executable_binding_for_executor(
+      job_id=source.task_id, tool_call_id="private-call-1",
+      nonce="original-private-nonce-1", tenant_storage_id="owner-1",
+    )
+    signed = decided_approval_continuation(
+      parked={"session_log_path": None, "pack_cursor": None},
+      binding=binding, decision=decision,
+    )
+    assert isinstance(signed, dict)
+    registry._build_cmd = lambda **_kwargs: [
+      sys.executable, "-c", _CHILD_IMPORT_PREFIX + _COMPLETED_RESULT_CHILD,
+    ]
+    # start() commits the claim; the successor's returned frame completes it
+    # only through the parent's drain.
+    resumed = await registry.start(
+      role="owner", profile="analyst", mode="task",
+      task="event channel integration", user_id="owner-1",
+      user_email="owner@example.test", owner_user_id="owner-1",
+      resumed_from=source.control_run_id, approval_continuation=signed,
+    )
+    status = await registry.wait(resumed["task_id"], timeout_sec=60)
+    assert status["state"] == "completed"
+    assert await store._read_completed_executable_result_for_executor(
+      binding=binding,
+    ) == ({"placed": 1}, None)
+
+  asyncio.run(case())

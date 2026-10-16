@@ -16,7 +16,7 @@ from agent_workflow_contracts import parse_delivery_envelope
 
 
 ROOT = Path(__file__).resolve().parents[3]
-GENERATED = Path(__file__).resolve().parents[1] / "agent_workflow_contracts" / "generated"
+GENERATED = ROOT / "packages" / "agent-workflow-contracts" / "agent_workflow_contracts" / "generated"
 
 
 

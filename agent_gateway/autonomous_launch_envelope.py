@@ -78,6 +78,7 @@ _WORKLOAD_FIELDS = frozenset({
   "deliver",
   "admitted_skill_execution_limits",
   "session_log_authority",
+  "approval_continuation",
 })
 _CONTROL_AUTHORITY_FIELDS = frozenset({
   "control_mode",
@@ -401,14 +402,17 @@ class AutonomousLaunchWorkload:
   research_file_id: int | None
   dev_mode: bool
   deliver: bool
-  # Neither value is an executable CLI argument, so workload comparison ignores
-  # them. Limits are optional observations; session-log authority is verified
-  # independently before bootstrap.
+  # Host-only launch bindings are not executable CLI arguments, so workload
+  # comparison ignores them. The envelope signature authenticates them.
   admitted_skill_execution_limits: SkillExecutionLimits | None = field(
     default=None,
     compare=False,
   )
   session_log_authority: AutonomousSessionLogAuthority | None = field(
+    default=None,
+    compare=False,
+  )
+  approval_continuation: dict[str, Any] | None = field(
     default=None,
     compare=False,
   )
@@ -532,7 +536,10 @@ class AutonomousLaunchWorkload:
       value,
       field_name="workload",
       fields=_WORKLOAD_FIELDS,
-      optional_fields=frozenset({"admitted_skill_execution_limits"}),
+      optional_fields=frozenset({
+        "admitted_skill_execution_limits",
+        "approval_continuation",
+      }),
     )
     try:
       session_log_authority = AutonomousSessionLogAuthority.from_receipt(
@@ -588,6 +595,7 @@ class AutonomousLaunchWorkload:
         is AutonomousSessionLogAuthority
         else None
       ),
+      "approval_continuation": self.approval_continuation,
     }
 
 

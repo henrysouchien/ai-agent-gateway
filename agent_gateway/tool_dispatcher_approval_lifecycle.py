@@ -213,9 +213,9 @@ async def _run_delegated_approval_lifecycle(
 ) -> dict[str, Any]:
   """Author the request here; the parent records the row and decides it.
 
-  This run owns no ledger and no policy, so nothing durable is written and no
-  policy is evaluated: the request is projected onto the event frame the parent
-  drains, and the wait lasts until the parent delivers the decision.
+  This run owns no ledger or policy. The parent records its private capture and
+  public request in order. A restorable child then parks; legacy callers without
+  a durable journal retain their live decision queue.
 
   A delegated run is unattended by construction — no human sits at its decision
   channel — so every class outside the money boundary is settled here under the
@@ -255,6 +255,7 @@ async def _run_delegated_approval_lifecycle(
     allow_persistent_grant=False,
   )
   nonce = os_urandom_fn(8).hex()
+  park: ApprovalPark | None = None
   if executable_capture is not None and route.private_capture_writer is not None:
     prepared = executable_capture.prepared_call
     await route.private_capture_writer({
@@ -268,7 +269,19 @@ async def _run_delegated_approval_lifecycle(
       "job_id": executable_capture.job_id,
       "tenant_storage_id": executable_capture.tenant_storage_id,
       "credential_generation_ref": executable_capture.credential_generation_ref,
+      "session_log_path": (
+        str(route.session.agent_session_log.path)
+        if route.session.agent_session_log is not None else None
+      ),
+      "pack_cursor": getattr(route.session, "_autonomous_pack_cursor", None),
     })
+    if executable_capture.job_id is not None and route.session.agent_session_log is not None:
+      park = ApprovalPark(
+        job_id=executable_capture.job_id,
+        original_tool_call_id=request.tool_call_id,
+        approval_id=request.approval_id,
+        nonce=nonce,
+      )
   approval = await await_user_approval_via_pending_tools_fn(
     request,
     decision,
@@ -276,6 +289,7 @@ async def _run_delegated_approval_lifecycle(
     resolved_qualifier=qualifier,
     allow_persistent=False,
     durable_request=approval_request_projection(request),
+    park=park,
   )
   if approval.get("approval_id") != request.approval_id:
     raise RuntimeError(
@@ -522,6 +536,30 @@ async def _run_approval_lifecycle_impl(
       user_scope=str(prepared_business_model_change["user_scope"]),
       idempotency_locator=str(prepared_business_model_change["idempotency_locator"]),
     )
+    if existing is not None:
+      supplied_intent = str(prepared_business_model_change["intent_digest"])
+      terminal_non_executable = existing.lifecycle in {
+        PreparedBusinessModelLifecycle.DENIED,
+        PreparedBusinessModelLifecycle.EXPIRED,
+        PreparedBusinessModelLifecycle.SUPERSEDED_PRECOMMIT,
+      }
+      immutable_matches = (
+        existing.prepared_payload == prepared_bytes
+        and existing.change_set_id == str(prepared_business_model_change["change_set_id"])
+        and existing.change_hash == str(prepared_business_model_change["change_hash"])
+        and existing.base_vector_hash == str(prepared_business_model_change["base_vector_hash"])
+        and existing.prepared_payload_digest
+        == str(prepared_business_model_change["prepared_payload_digest"])
+      )
+      if (
+        existing.lifecycle is PreparedBusinessModelLifecycle.PENDING
+        and not immutable_matches
+      ):
+        existing = None
+      elif existing.intent_digest != supplied_intent or (
+        not terminal_non_executable and not immutable_matches
+      ):
+        raise RuntimeError("FMS skill-run locator conflicts with its prepared BusinessModel intent")
     if existing is None:
       request, existing, _ = await store.create_or_get_with_prepared_business_model_change(
         request,
@@ -544,24 +582,6 @@ async def _run_approval_lifecycle_impl(
         ),
       )
     else:
-      supplied_intent = str(prepared_business_model_change["intent_digest"])
-      terminal_non_executable = existing.lifecycle in {
-        PreparedBusinessModelLifecycle.DENIED,
-        PreparedBusinessModelLifecycle.EXPIRED,
-        PreparedBusinessModelLifecycle.SUPERSEDED_PRECOMMIT,
-      }
-      immutable_matches = (
-        existing.prepared_payload == prepared_bytes
-        and existing.change_set_id == str(prepared_business_model_change["change_set_id"])
-        and existing.change_hash == str(prepared_business_model_change["change_hash"])
-        and existing.base_vector_hash == str(prepared_business_model_change["base_vector_hash"])
-        and existing.prepared_payload_digest
-        == str(prepared_business_model_change["prepared_payload_digest"])
-      )
-      if existing.intent_digest != supplied_intent or (
-        not terminal_non_executable and not immutable_matches
-      ):
-        raise RuntimeError("FMS skill-run locator conflicts with its prepared BusinessModel intent")
       await store.create(request)
   elif prepared_authorization_payload is None:
     await store.create(request)

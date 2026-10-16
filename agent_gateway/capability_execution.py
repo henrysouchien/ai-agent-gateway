@@ -36,6 +36,11 @@ from model_authority.selection import (
   capture_selection_snapshot,
   project_fallback_chain,
 )
+from .auth import (
+  derive_auth_mechanism_and_entitlement,
+  filter_fallback_entries_for_placement,
+  placement_for_channel,
+)
 from .providers import ModelProvider
 
 
@@ -49,6 +54,10 @@ _SELECTION_AUTH_CONFIG_FIELDS = frozenset({
   "thinking",
   "thinking_enabled_requested",
 })
+
+
+class _PlacementIneligible(Exception):
+  """The credential selection owner found no account for the hop's placement."""
 
 
 def _reject_selection_auth_config(auth_config: Mapping[str, Any]) -> None:
@@ -396,9 +405,20 @@ class CapabilityExecutionResolver:
       FallbackSkip(omitted.entry.models[0], omitted.code)
       for omitted in chain.omitted
     ]
+    # Placement is a property of the trusted channel. Screen routes before
+    # materialization, then let pool selection choose an eligible account.
+    placement = placement_for_channel(resolver.trusted_channel)
+    placement_eligible = {
+      entry.model_key for entry in filter_fallback_entries_for_placement(
+        chain.entries, resolver.registry, placement=placement,
+      )
+    }
     for index in range(start, len(chain.entries)):
       entry = chain.entries[index]
       if entry.model_key == primary_model_key:
+        continue
+      if entry.model_key not in placement_eligible:
+        skipped.append(FallbackSkip(entry.model_key, "placement_ineligible"))
         continue
       effort = entry.effort or bind.effort
       try:
@@ -424,10 +444,15 @@ class CapabilityExecutionResolver:
             **resolved.to_json(),
             "selection_source": bind.selection_source,
           })),
+          placement=placement,
+          route=resolved.route,
         )
         if hop_execution is None:
           skipped.append(FallbackSkip(entry.model_key, "credential_pool_parked"))
           continue
+      except _PlacementIneligible:
+        skipped.append(FallbackSkip(entry.model_key, "placement_ineligible"))
+        continue
       except CapabilityResolutionError as exc:
         skipped.append(FallbackSkip(entry.model_key, exc.code))
         continue
@@ -445,20 +470,27 @@ class CapabilityExecutionResolver:
   @staticmethod
   def _rebind_unparked_account(
     execution: BoundCapabilityExecution,
+    *,
+    placement: str = "local",
+    route: str | None = None,
   ) -> BoundCapabilityExecution | None:
-    """The execution on an unblocked account of its pool; ``None`` when all are parked.
+    """Bind an eligible account; ``None`` when eligible accounts are parked.
 
-    Materialization binds a member the way a turn start does, which hands
-    back a parked one when nothing else is left; a hop never serves on it.
-    Anthropic retains its generation-aware binding; other enrolled providers
-    use their registered candidate resolver and materializer.
+    Pool selection owns candidate eligibility and may return a parked member
+    when none can serve; a hop never serves on it. Direct credentials and
+    Anthropic's generation-bound material pass through the same selector as
+    one-candidate pools.
+    No eligible candidate raises ``_PlacementIneligible`` for the fallback skip.
     """
-    from .providers import anthropic as anthropic_provider
     from .providers.anthropic_oauth import (
+      anthropic_credential_blocked_until,
+      anthropic_pool_config,
       resolve_anthropic_credentials,
       select_anthropic_credential_source,
     )
     from .providers.credential_pool import (
+      PoolAccountCandidate,
+      ProviderCredentialPool,
       get_provider_credential_pool,
       get_provider_pool_hooks,
       select_pool_candidate,
@@ -467,60 +499,77 @@ class CapabilityExecutionResolver:
     config = execution.auth_config
     if execution.bind.provider != "anthropic":
       hooks = get_provider_pool_hooks(execution.bind.provider)
-      if hooks is None:
-        return execution
-      candidate_resolver, materializer = hooks
-      pool_config = {
-        key: value for key, value in config.items()
-        if key != "credential_source"
-      }
-      candidates, refresh_fn = candidate_resolver(pool_config)
-      if not candidates:
-        # The bound credential was supplied to the run directly and no enrolled
-        # pool exists: it is valid material and nothing is parked on it.
-        return execution
-      provider_pool = get_provider_credential_pool(execution.bind.provider)
-      if candidates and not provider_pool.first_unblocked([candidate.key for candidate in candidates]):
+      if hooks is not None:
+        candidate_resolver, materializer = hooks
+        pool_config = {
+          key: value for key, value in config.items()
+          if key != "credential_source"
+        }
+        candidates, refresh_fn = candidate_resolver(pool_config)
+        if candidates:
+          provider_pool = get_provider_credential_pool(execution.bind.provider)
+          candidate = select_pool_candidate(
+            candidates, pool=provider_pool, refresh_fn=refresh_fn,
+            placement=placement, route=route,
+          )
+          if candidate is None:
+            raise _PlacementIneligible
+          if provider_pool.blocked_until(candidate.key) > time.time():
+            return None
+          account = materializer(candidate, config)
+          if all(config.get(key) == value for key, value in account.items()):
+            return execution
+          return CapabilityExecutionResolver.rebind_rotated_credential(
+            execution, account, merged_auth_config={**config, **account},
+          )
+      # Direct credentials have no enrolled pool or cooldown state; admit the
+      # supplied material through the same selector as a pool of one below.
+    else:
+      sources = resolve_anthropic_credentials(anthropic_pool_config(config))
+      if not sources.credentials:
         return None
-      candidate = select_pool_candidate(candidates, pool=provider_pool, refresh_fn=refresh_fn)
-      if candidate is None or provider_pool.blocked_until(candidate.key) > time.time():
+      model = execution.bind.upstream_model
+      selected = select_anthropic_credential_source(sources, placement=placement, model=model)
+      if selected is None:
+        raise _PlacementIneligible
+      if anthropic_credential_blocked_until(selected, model=model) > time.time():
+        # Every eligible account is cooling down for this model (the selector
+        # still binds one, as a run's own attempt would); a hop never serves on it.
         return None
-      account = materializer(candidate, config)
-      if all(config.get(key) == value for key, value in account.items()):
-        return execution
-      return CapabilityExecutionResolver.rebind_rotated_credential(
-        execution, account, merged_auth_config={**config, **account},
-      )
-    pool = anthropic_provider.ANTHROPIC_CREDENTIAL_POOL
-    pool_config = {key: value for key, value in config.items() if key != "credential_source"}
-    sources = resolve_anthropic_credentials(pool_config)
-    if not pool.first_unblocked(sources.keys):
-      return None
-    selected = select_anthropic_credential_source(sources, pool=pool)
-    if selected is None or pool.blocked_until(selected.key) > time.time():
-      # The unblocked account's refresh failed and parked it.
-      return None
-    is_api_key = selected.record is not None and selected.record.credential_kind == "api_key"
-    credential_field = "api_key" if is_api_key else "auth_token"
-    if selected.token == config.get(credential_field):
-      return execution
-    account = {
-      "auth_mode": "api" if is_api_key else "oauth",
-      "api_key": selected.token if is_api_key else "",
-      "auth_token": "" if is_api_key else selected.token,
-      "credential_source": selected.source_metadata(),
-    }
-    rebound = CapabilityExecutionResolver.rebind_rotated_credential(
-      execution, account, merged_auth_config={**config, **account},
+      is_api_key = selected.record is not None and selected.record.credential_kind == "api_key"
+      credential_field = "api_key" if is_api_key else "auth_token"
+      if selected.token != config.get(credential_field):
+        account = {
+          "auth_mode": "api" if is_api_key else "oauth",
+          "api_key": selected.token if is_api_key else "",
+          "auth_token": "" if is_api_key else selected.token,
+          "credential_source": selected.source_metadata(),
+        }
+        rebound = CapabilityExecutionResolver.rebind_rotated_credential(
+          execution, account, merged_auth_config={**config, **account},
+        )
+        if rebound is None:
+          raise CapabilityResolutionError(
+            "credential_unavailable",
+            "the unblocked Anthropic account has no credential generation",
+            capability_id=execution.bind.capability_id,
+            model_key=execution.bind.model_key,
+          )
+        execution = rebound
+    mechanism, entitlement = derive_auth_mechanism_and_entitlement(execution.auth_config)
+    candidate = PoolAccountCandidate(
+      provider=execution.bind.provider,
+      key=execution.bind.credential_ref,
+      record=dict(execution.auth_config),
+      auth_mechanism=mechanism,
+      entitlement_kind=entitlement,
     )
-    if rebound is None:
-      raise CapabilityResolutionError(
-        "credential_unavailable",
-        "the unblocked Anthropic account has no credential generation",
-        capability_id=execution.bind.capability_id,
-        model_key=execution.bind.model_key,
-      )
-    return rebound
+    if select_pool_candidate(
+      [candidate], pool=ProviderCredentialPool(),
+      placement=placement, route=route or execution.bind.route,
+    ) is None:
+      raise _PlacementIneligible
+    return execution
 
   def with_frozen_credential(
     self, bind: CapabilityBind, auth_config: Mapping[str, Any],

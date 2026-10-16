@@ -124,7 +124,6 @@ def _admit_child(
       resolve_tool_authority=lambda tool_ids: resolve_operation_authority(
         replace(declaration, tool_ceiling=tool_ids), catalog=catalog,
       ),
-      placement="in_process",
       containment=ContainmentSettings(),
     ),
   )
@@ -579,7 +578,6 @@ def _admit_explore(
       resolve_tool_authority=lambda tool_ids: resolve_operation_authority(
         replace(declaration, tool_ceiling=tool_ids), catalog=catalog,
       ),
-      placement="in_process",
       containment=ContainmentSettings(),
       frozen_bind=frozen_bind,
     ),
@@ -757,11 +755,11 @@ def test_spawn_records_role_and_effort_sources(owner_session_host_policy: Any) -
   default = _admit_explore(parent, resolver, session)
   default_provenance = default.wire.selection_provenance
   assert default_provenance == SelectionProvenance(
-    role="fast", role_source=None, effort_source=None, preset=None,
+    role="explore", role_source=None, effort_source=None, preset=None,
   )
   assert default_provenance is not None
   assert default_provenance.model_dump(mode="json") == {
-    "role": "fast", "role_source": None, "effort_source": None, "preset": None,
+    "role": "explore", "role_source": None, "effort_source": None, "preset": None,
   }
 
 

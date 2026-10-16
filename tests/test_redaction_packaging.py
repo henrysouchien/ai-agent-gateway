@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from zipfile import ZipFile
 
 
 def test_installed_wheel_runs_with_packaged_redaction_and_raw_schema_boundary(
@@ -16,12 +17,20 @@ def test_installed_wheel_runs_with_packaged_redaction_and_raw_schema_boundary(
   package_root.mkdir()
   for filename in ("pyproject.toml", "README.md", "LICENSE"):
     shutil.copy2(source_root / filename, package_root / filename)
-  for package_name in ("agent_gateway", "agent_workflow_contracts"):
-    shutil.copytree(
-      source_root / package_name,
-      package_root / package_name,
-      ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-    )
+  shutil.copytree(
+    source_root / "agent_gateway",
+    package_root / "agent_gateway",
+    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+  )
+  contracts_source = source_root.parent / "agent-workflow-contracts"
+  contracts_root = tmp_path / "agent-workflow-contracts"
+  contracts_root.mkdir()
+  shutil.copy2(contracts_source / "pyproject.toml", contracts_root / "pyproject.toml")
+  shutil.copytree(
+    contracts_source / "agent_workflow_contracts",
+    contracts_root / "agent_workflow_contracts",
+    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+  )
   wheel_dir = tmp_path / "wheel"
   wheel_dir.mkdir()
   build_env = os.environ.copy()
@@ -39,6 +48,7 @@ def test_installed_wheel_runs_with_packaged_redaction_and_raw_schema_boundary(
       "--wheel-dir",
       str(wheel_dir),
       str(package_root),
+      str(contracts_root),
     ],
     check=True,
     env=build_env,
@@ -46,6 +56,11 @@ def test_installed_wheel_runs_with_packaged_redaction_and_raw_schema_boundary(
     text=True,
   )
   wheel = next(wheel_dir.glob("ai_agent_gateway-*.whl"))
+  contracts_wheel = next(wheel_dir.glob("agent_workflow_contracts-*.whl"))
+  with ZipFile(wheel) as archive:
+    assert not any(
+      name.startswith("agent_workflow_contracts/") for name in archive.namelist()
+    )
   installed = tmp_path / "installed"
   subprocess.run(
     [
@@ -58,6 +73,7 @@ def test_installed_wheel_runs_with_packaged_redaction_and_raw_schema_boundary(
       "--target",
       str(installed),
       str(wheel),
+      str(contracts_wheel),
     ],
     check=True,
     capture_output=True,

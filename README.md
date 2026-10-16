@@ -281,11 +281,34 @@ Repeated `agent auth login <provider>` enrollments append accounts to the
 provider's multi-account credential pool, or update an existing account by
 identity without overwriting other seats. `providers/credential_pool.py` owns
 the shared `"accounts"` store envelope, legacy single-record migration, and
-cooldowns. A scoped user's accounts lead the deployment pool; usage limits and
-refresh failures park a seat so the running request can rotate to an unblocked
-sibling, keeping that seat's token and provider-specific fields together.
+cooldowns for every pool provider except Anthropic. A scoped user's accounts
+lead the deployment pool; usage limits and refresh failures park a seat so the
+running request can rotate to an unblocked sibling, keeping that seat's token
+and provider-specific fields together.
 Public `google` OAuth uses PKCE S256; `gemini` Antigravity uses confidential-client
 loopback OAuth with `ANTIGRAVITY_CLIENT_SECRET`, not PKCE.
+
+Anthropic selects by quota instead. Each store keeps a `<store>.selection.json`
+sidecar (mode `0600`) holding per-account policy, quota windows, usage-probe
+backoff, scoped cooldowns and session affinity, keyed by an opaque `acct_` locator
+id. `ModelProvider.prepare_credential` runs only at episode-starting client builds:
+the first request of a turn, the rebuild after a model-fallback hop, the
+reactive-compaction rebuild and the compaction summarizer. A same-model transient
+retry keeps its binding, and rotated material is not re-prepared. Affinity is keyed
+by the durable conversation identity (`undo_token_lifetime.conversation_id`), so
+resume keeps warm affinity; sub-agents keep their own id. Selection ranks private
+accounts before org accounts, keeps the conversation's warm account (one hour),
+then orders by reserve, the 85% short-window guard, measured quota before unknown,
+priority, and weekly then short-window drain. Quota comes from
+`anthropic-ratelimit-unified-*` response headers and a bounded
+`api.anthropic.com` usage probe (direct route only; a 401/403 makes telemetry
+unavailable for an hour and never parks inference). A quota 429 parks its scope
+(shared or model family) until its reset; a concurrency 429 or 529 backs off
+without parking. Set an account's policy with
+`python3 -m agent_gateway.cli auth policy anthropic --identity ACCOUNT
+[--user N|--store PATH] (--priority INT --reserve-pct FLOAT | --reset)`; inspect
+it with `auth list anthropic --usage` (cached view only). Mechanism:
+`docs/reference/provider-authentication-and-token-methods.md`.
 
 The complete session-token, chat request, and SSE walkthrough is in the
 [quickstart](docs/quickstart.md).

@@ -368,7 +368,9 @@ def test_run_agent_tool_schema_omits_model_selection_authority() -> None:
     schema["properties"]
   )
   assert {"role", "effort"} <= set(schema["properties"])
-  assert schema["required"] == ["objective"]
+  assert {"interrupt", "resume", "additional_context"} <= set(schema["properties"])
+  assert not {"oneOf", "anyOf", "allOf"} & set(schema)
+  assert "required" not in schema
   assert schema["additionalProperties"] is False
 
 

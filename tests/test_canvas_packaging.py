@@ -14,12 +14,11 @@ def test_canvas_resources_resolve_from_installed_wheel(tmp_path: Path) -> None:
   package_root.mkdir()
   for filename in ("pyproject.toml", "README.md", "LICENSE"):
     shutil.copy2(source_root / filename, package_root / filename)
-  for package_name in ("agent_gateway", "agent_workflow_contracts"):
-    shutil.copytree(
-      source_root / package_name,
-      package_root / package_name,
-      ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-    )
+  shutil.copytree(
+    source_root / "agent_gateway",
+    package_root / "agent_gateway",
+    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+  )
   wheel_dir = tmp_path / "wheel"
   wheel_dir.mkdir()
   build_env = os.environ.copy()
@@ -56,5 +55,6 @@ def test_canvas_resources_resolve_from_installed_wheel(tmp_path: Path) -> None:
     "agent_gateway/canvas_build/policy.mjs",
   }
   assert required <= names
+  assert not any(name.startswith("agent_workflow_contracts/") for name in names)
   assert "agent_gateway/contracts/canvas-kit-v1/digest.json" not in names
   assert not any(name.startswith("agent_gateway/canvas_build/node_modules/") for name in names)

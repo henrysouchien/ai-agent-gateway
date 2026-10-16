@@ -48,7 +48,7 @@ from .skill_limits import (
 from .control_plane import create_control_plane_router
 from .control_plane.middleware import add_control_plane_version_header_middleware
 from .control_plane.session import _resolve_control_identity
-from .commercial_work_start import CommercialWorkStartError
+from hank_contracts.commercial_work import CommercialWorkStartError
 from model_authority.binding import CapabilityResolutionError, eligible_model_choices
 from model_authority.capabilities import GATEWAY_EXECUTED_CAPABILITY_IDS
 from .event_log import EventLog, UserEventBus
@@ -76,6 +76,15 @@ from .session import (
   SessionStream,
   bind_session_credentials,
   session_owner_user_id,
+)
+from .undo_token_lifetime import (
+  UndoTokenLifetimeRegistry,
+  cancel_parked_approvals,
+  conversation_id as undo_conversation_id,
+  guard_root_continue,
+  owner_id as undo_owner_id,
+  observe_runner_results,
+  create_undo_token_router,
 )
 from .ui_blocks_metrics import snapshot as ui_blocks_metrics_snapshot
 from .launch_nonce_store import (
@@ -490,6 +499,11 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
 
   @asynccontextmanager
   async def lifespan(app: FastAPI):
+    # The product host installs its root hook on app.state after this app is built;
+    # guard whatever it installed so a closed conversation cannot be cold-restored.
+    app.state.root_continue_hook = guard_root_continue(
+      app.state.root_continue_hook, app, config.tenant_id,
+    )
     cleanup_task = asyncio.create_task(
       _cleanup_sessions_loop(
         auth.session_store,
@@ -753,6 +767,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       storage_root=app.state.autonomous_storage_root,
     )
     runtime.purpose = session.purpose
+    observe_runner_results(runtime, session, app.state.undo_token_lifetimes)
     return runtime
 
   setattr(_build_chat_runtime_for_dispatch, "_gateway_auth_manager", auth)
@@ -891,6 +906,9 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     claim_signing_authority=config.claim_signing_authority,
     autonomous_session_token_issuer=_issue_autonomous_session_token,
     autonomous_session_expirer=_expire_autonomous_session,
+  )
+  app.state.undo_token_lifetimes = UndoTokenLifetimeRegistry(
+    app.state.subprocess_registry._log_dir / "workbook-undo.sqlite3"
   )
   from .control_plane.autonomous_approval_drainer import (
     AutonomousApprovalDeliveryCoordinator,
@@ -1148,6 +1166,14 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     session.channel = resolved_channel
     session.resume_log_path = resume_log_path
     session.fork_source_log_path = fork_source_log_path
+    if app.state.undo_token_lifetimes.is_closed(
+      owner=undo_owner_id(session), conversation=undo_conversation_id(session),
+    ):
+      auth.session_store.expire_session(session.session_id)
+      return JSONResponse(
+        {"error": "session_resume_refused", "reason": "not_found"},
+        status_code=409,
+      )
     session.is_public = resolved_channel == "public"
     bind_session_approval_route(
       session,
@@ -1447,6 +1473,10 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     if isinstance(body.request_id, str):
       body.request_id = body.request_id.strip() or None
     session, claims = auth.verify_token_with_payload(token)
+    if app.state.undo_token_lifetimes.is_closed(
+      owner=undo_owner_id(session), conversation=undo_conversation_id(session),
+    ):
+      return JSONResponse({"error": "conversation_closed"}, status_code=409)
     jwt_user_id = str(claims.get("user_id") or session.user_id).strip()
     if not jwt_user_id:
       status, error_payload = _error_payload(MissingUserIdError(), session_id=session.session_id)
@@ -1871,6 +1901,30 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         },
       },
     )
+
+  async def _end_undo_conversation(session: GatewaySession, conversation: str) -> None:
+    owner = undo_owner_id(session)
+    registry = app.state.undo_token_lifetimes
+    registry.begin_close(owner=owner, conversation=conversation)
+    session_ids = registry.session_ids(owner=owner, conversation=conversation)
+    # Auth expiry is deliberately absent: only this explicit end retires holders.
+    for candidate in auth.session_store.visible_sessions_snapshot():
+      if undo_owner_id(candidate) == owner and undo_conversation_id(candidate) == conversation:
+        session_ids.add(candidate.session_id)
+        if candidate.active_turn is not None:
+          await _cancel_active_turn_runner(candidate.active_turn)
+        await auth.session_store.expire_session_async(candidate.session_id)
+    # After turns are cancelled nothing can park a new approval; deny the parked ones.
+    await cancel_parked_approvals(
+      app.state.gateway_approval_store, app.state.gateway_approval_policy,
+      tenant_storage_id=session_owner_user_id(session), session_ids=session_ids,
+    )
+    registry.close_conversation(owner=owner, conversation=conversation)
+
+  router.include_router(create_undo_token_router(
+    auth=auth, registry=app.state.undo_token_lifetimes,
+    end_conversation=_end_undo_conversation,
+  ))
 
   app.include_router(router)
   app.include_router(

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections.abc import AsyncGenerator
 import json
 import os
@@ -22,6 +23,8 @@ from agent_gateway import AgentRunner, AgentSessionLog, EventLog  # noqa: E402
 from agent_gateway.agent_session_log_records import EVENT_SCHEMA_VERSION  # noqa: E402
 import agent_gateway.skill_completion_wal as completion_wal_module  # noqa: E402
 from agent_gateway.providers import StreamEvent  # noqa: E402
+from agent_gateway.providers.anthropic import AnthropicProvider  # noqa: E402
+from agent_gateway.runner_run_loop_defaults import MAX_TOKENS_NUDGE  # noqa: E402
 from agent_gateway.runner_session_events import (  # noqa: E402
   build_skill_run_started_event,
 )
@@ -2372,6 +2375,110 @@ def test_resume_preflight_accepts_assistant_transcript_tail(tmp_path: Path) -> N
       [{"role": "system", "content": "not a turn"}],
       [{"role": "user", "content": "start"}, {"role": "system", "content": "not a turn"}],
     )
+
+
+def test_resume_assistant_tail_without_tool_use_builds_user_final_request(
+  tmp_path: Path,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  """An assistant-tail resume with no pending tool call gets a durable user
+  continuation so the Anthropic request is user-final. A tool_use tail is
+  left for normalize_messages to close with a synthetic tool_result."""
+
+  async def _case(
+    name: str,
+    tail: dict[str, Any],
+    *,
+    expect_nudge: str | None,
+  ) -> None:
+    log = AgentSessionLog(tmp_path / name / "session.jsonl")
+    runner = _runner(log=log, provider=_ScriptedProvider([]))
+    resume = [{"role": "user", "content": "start"}, tail]
+    try:
+      messages, _system, _committed = await runner._prepare_run_durable_context(
+        [tail],
+        None,
+        resume_initial_messages=resume,
+        top_level_user_input=None,
+        selected_content_committed=True,
+        runner_id=f"runner-{name}",
+      )
+    finally:
+      runner._release_write_lease()
+    if expect_nudge is None:
+      assert messages == resume
+    else:
+      assert messages[:-1] == resume
+      assert messages[-1] == {"role": "user", "content": expect_nudge}
+    caplog.clear()
+    caplog.set_level(logging.ERROR, logger="agent_gateway.providers.anthropic")
+    provider = AnthropicProvider()
+    normalized = provider.normalize_messages(
+      messages,
+      provider.get_model_info("claude-opus-5-5"),
+    )
+    params = provider.build_request_params(
+      model="claude-opus-5-5",
+      messages=normalized,
+      system_prompt="sys",
+      tools=[],
+      max_tokens=1024,
+    )
+    final = params["messages"][-1]
+    assert final["role"] == "user"
+    if expect_nudge == MAX_TOKENS_NUDGE:
+      content = final["content"]
+      text = content if isinstance(content, str) else content[0]["text"]
+      assert text == MAX_TOKENS_NUDGE
+    if expect_nudge is None:
+      content = final["content"]
+      assert isinstance(content, list)
+      assert content[0]["type"] == "tool_result"
+      assert not any(
+        isinstance(message.get("content"), str)
+        and message.get("content") in {
+          MAX_TOKENS_NUDGE,
+          "Continue from where you left off.",
+        }
+        for message in params["messages"]
+      )
+    assert "Anthropic cache breakpoint invariant failed" not in caplog.text
+
+  async def _all() -> None:
+    await _case(
+      "max-tokens",
+      {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "partial"}],
+        "stop_reason": "max_tokens",
+      },
+      expect_nudge=MAX_TOKENS_NUDGE,
+    )
+    await _case(
+      "end-turn",
+      {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "done"}],
+        "stop_reason": "end_turn",
+      },
+      expect_nudge="Continue from where you left off.",
+    )
+    await _case(
+      "tool-use",
+      {
+        "role": "assistant",
+        "content": [{
+          "type": "tool_use",
+          "id": "toolu_1",
+          "name": "lookup",
+          "input": {},
+        }],
+        "stop_reason": "tool_use",
+      },
+      expect_nudge=None,
+    )
+
+  _run(_all())
 
 
 def test_projection_flag_changes_only_after_successful_append() -> None:

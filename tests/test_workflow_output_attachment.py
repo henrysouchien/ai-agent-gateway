@@ -79,7 +79,8 @@ def _view(
 
 
 GENERATED_DIR = (
-  Path(__file__).resolve().parents[1]
+  Path(__file__).resolve().parents[2]
+  / "agent-workflow-contracts"
   / "agent_workflow_contracts"
   / "generated"
 )

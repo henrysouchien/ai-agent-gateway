@@ -1040,8 +1040,19 @@ def test_detached_park_sends_private_capture_before_public_approval(
       capture_readable_resource_snapshot=True,
       allow_uncertain_mcp_replay=False,
     ))
-    queue = await _wait_for_native_queue(session, task, "call-detached")
-    pending = session.pending_tools["call-detached"]
+    queue: asyncio.Queue | None = None
+    if with_writer:
+      with pytest.raises(lifecycle_helpers.ApprovalPark) as parked:
+        await task
+      pending = {
+        "approval_id": parked.value.approval_id,
+        "nonce": parked.value.nonce,
+      }
+      assert session.pending_tools == {}
+      assert session.approval_queues == {}
+    else:
+      queue = await _wait_for_native_queue(session, task, "call-detached")
+      pending = session.pending_tools["call-detached"]
     assert order == (["private", "public"] if with_writer else ["public"])
     if with_writer:
       assert captures == [{
@@ -1064,6 +1075,8 @@ def test_detached_park_sends_private_capture_before_public_approval(
         "job_id": "job-detached",
         "tenant_storage_id": "alice",
         "credential_generation_ref": generation_ref,
+        "session_log_path": str(session_log.path),
+        "pack_cursor": None,
       }]
     else:
       assert captures == []
@@ -1080,14 +1093,16 @@ def test_detached_park_sends_private_capture_before_public_approval(
       assert private_value not in public
     with store._connection() as conn:
       assert conn.execute("SELECT COUNT(*) FROM approval_executable_bindings").fetchone()[0] == 0
-    await queue.put({
-      "approval_id": pending["approval_id"],
-      "approved": False,
-      "allow_tool_type": False,
-    })
-    result, error = await task
-    assert result is None
-    assert error is not None and error["code"] == "user_denied"
+    if not with_writer:
+      assert queue is not None
+      await queue.put({
+        "approval_id": pending["approval_id"],
+        "approved": False,
+        "allow_tool_type": False,
+      })
+      result, error = await task
+      assert result is None
+      assert error is not None and error["code"] == "user_denied"
 
   asyncio.run(scenario())
 
@@ -1777,10 +1792,7 @@ def test_native_parks_before_and_after_rotation_capture_their_original_generatio
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   from agent_gateway.providers.anthropic import AnthropicProvider
-  import agent_gateway.providers.anthropic as anthropic_module
-  from agent_gateway.providers.anthropic_oauth import (
-    AnthropicCredentialPool, resolve_anthropic_credentials,
-  )
+  from agent_gateway.providers.anthropic_oauth import resolve_anthropic_credentials
   from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
 
   token_a = "sk-ant-oat01-capture-member-A"
@@ -1789,7 +1801,6 @@ def test_native_parks_before_and_after_rotation_capture_their_original_generatio
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([token_a, token_b]))
   monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
   monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "oauth.json"))
-  monkeypatch.setattr(anthropic_module, "ANTHROPIC_CREDENTIAL_POOL", AnthropicCredentialPool())
   sources = resolve_anthropic_credentials()
   member_a = sources.by_token(token_a)
   member_b = sources.by_token(token_b)
@@ -1798,7 +1809,9 @@ def test_native_parks_before_and_after_rotation_capture_their_original_generatio
   generation_b = member_b.source_metadata()["generation_ref"]
 
   class RateLimitedError(RuntimeError):
+    # A subscription-quota 429: only a spent window rotates the account.
     status_code = 429
+    rate_limit_unified_status = "rejected"
 
   async def scenario() -> None:
     dispatcher, store, session = _native_capture_dispatcher(tmp_path)

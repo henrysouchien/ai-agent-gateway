@@ -49,6 +49,28 @@ class CataloglessDispatcherTestSupport:
       semantic_error=semantic_error,
     )
 
+  async def prepare_tool_call_async(
+    self,
+    tool_name: str,
+    tool_input: Mapping[str, Any],
+  ) -> PreparedToolCall:
+    _ = tool_name
+    return PreparedToolCall(dict(tool_input))
+
+  async def dispatch_prepared(
+    self,
+    tool_call_id: str,
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+    **kwargs: Any,
+  ) -> Any:
+    return await self.dispatch(  # type: ignore[attr-defined]
+      tool_call_id,
+      tool_name,
+      prepared_call.materialize_input(),
+      **kwargs,
+    )
+
   def capture_spawning_turn(self) -> _SpawningTurn:
     """No admitted turn: catalogless doubles are not a spawning runner."""
     return _SpawningTurn(context=None, root_turn=None)

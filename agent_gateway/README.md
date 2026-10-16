@@ -24,4 +24,4 @@ call IDs and tool names unchanged so consumers can correlate the same call.
 Library reference: `../docs/architecture.md`, `../docs/api-reference.md`, `../docs/http-api.md`
 Operator view: the control-plane modules above and the generated OpenAPI
 document are authoritative for generic `/control` routes. Hank's schema-backed artifact routes and stores live in `api/agent/shared`, outside this library.
-Wire contracts: `../agent_workflow_contracts/README.md`
+Wire contracts: `../../agent-workflow-contracts/agent_workflow_contracts/README.md`

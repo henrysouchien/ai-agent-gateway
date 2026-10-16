@@ -18,6 +18,7 @@ from agent_gateway import (
 )
 from model_authority.binding import CredentialHandle
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY, RATE_TABLES
+from model_authority.selection import project_capability_default
 from agent_gateway.tool_dispatcher import LocalToolHandler
 from agent_gateway.server import ChatRequest, MaterializedCredential
 
@@ -25,10 +26,12 @@ from agent_gateway.server import ChatRequest, MaterializedCredential
 BASE_DIR = Path(__file__).parent
 NOTES_DIR = BASE_DIR / "approved_notes"
 NOTES_DIR.mkdir(exist_ok=True)
-DEFAULT_MODEL = INITIAL_MODEL_REGISTRY.require(
-  "anthropic.claude-opus-5-5"
-).upstream_model
-DEFAULT_EFFORT = "high"
+_SESSION_DRIVER_DEFAULT = project_capability_default(
+  INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY, "session.driver",
+)
+_SESSION_DRIVER_KEY = _SESSION_DRIVER_DEFAULT.model_key or "anthropic.claude-fable-5-1"
+DEFAULT_MODEL = INITIAL_MODEL_REGISTRY.require(_SESSION_DRIVER_KEY).upstream_model
+DEFAULT_EFFORT = _SESSION_DRIVER_DEFAULT.effort or "high"
 TENANT_ID = "example-06-tool-approval"
 SERVICE_CREDENTIAL_HANDLE = CredentialHandle(
   handle_id="example-06-anthropic-service",
@@ -139,7 +142,7 @@ def admit_demo_session(session, _api_key, _request) -> None:
   session.role = "owner"
   session.channel = "web"
   session.model_entitled_capabilities = frozenset({"session.driver"})
-  session.model_entitled_keys = frozenset({"anthropic.claude-opus-5-5"})
+  session.model_entitled_keys = frozenset({_SESSION_DRIVER_KEY})
 
 
 def materialize_service_credential(

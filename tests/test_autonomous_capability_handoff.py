@@ -730,6 +730,28 @@ def test_child_environment_is_uniform_across_profiles_and_secret_minimal() -> No
   }
 
 
+@pytest.mark.parametrize("profile", ["analyst", "advisor", "research_producer"])
+@pytest.mark.parametrize("deliver", [False, True])
+def test_canvas_toolchain_environment_reaches_research_children(
+  profile: str,
+  deliver: bool,
+) -> None:
+  source = {
+    "CANVAS_BUILD_DIR": "/opt/hank/canvas-build",
+    "CANVAS_NODE_BINARY": "/opt/hank/bin/node",
+  }
+
+  projected = _positive_autonomous_child_env(
+    source,
+    provider="anthropic",
+    profile=profile,
+    deliver=deliver,
+  )
+
+  assert projected["CANVAS_BUILD_DIR"] == source["CANVAS_BUILD_DIR"]
+  assert projected["CANVAS_NODE_BINARY"] == source["CANVAS_NODE_BINARY"]
+
+
 @pytest.mark.parametrize(
   "inherit_risk_dists",
   [False, True],
@@ -756,6 +778,7 @@ def test_pinned_autonomous_child_inherits_exact_runtime_import_roots(
     str(ai_root),
     str(ai_root / "api"),
     str(ai_root / "packages" / "agent-gateway"),
+    str(ai_root / "packages" / "agent-workflow-contracts"),
     str(ai_root / "packages" / "model-authority"),
     str(ai_root / "packages" / "excel-mcp" / "python"),
     str(ai_root / "packages" / "ibkr-relay-client" / "python"),

@@ -318,6 +318,7 @@ async def send_prompt(
         await provider.close_client(client)
         client = None
         execution = rotated_execution
+        capability_bind = execution.bind
         provider = execution.provider
         config, max_tokens, effort_resolution = _prepare_bound_execution(execution)
         text_parts.clear()

@@ -7,6 +7,7 @@ from typing import Any
 
 from model_authority.binding import validate_reported_identity
 from .capability_execution import BoundCapabilityExecution
+from .runner_hooks_lifecycle import prepare_session_id, rebind_refreshed_credential
 from model_authority.thinking import parse_effort
 from .runner_stream_turn import STREAM_PROGRESS_LOG_INTERVAL
 from .runner_streaming import _stream_with_stall_timeout
@@ -90,6 +91,7 @@ async def provider_summarize(
   max_tokens: int,
   request_kwargs: dict[str, Any] | None = None,
   on_event: Callable[[dict[str, Any]], object] | None = None,
+  session_id: str | None = None,
 ) -> ProviderSummarizeResult:
   if not isinstance(capability_execution, BoundCapabilityExecution):
     raise TypeError(
@@ -137,6 +139,17 @@ async def provider_summarize(
         f"with max_tokens={token_limit}"
       )
     )
+  prepared = await provider.prepare_credential(
+    run_config,
+    model=model,
+    session_id=prepare_session_id(session_id),
+  )
+  if prepared:
+    rebound = rebind_refreshed_credential(capability_execution, run_config, prepared)
+    if rebound is not None:
+      capability_execution = rebound
+      run_config = dict(rebound.auth_config)
+      run_config["auth_mode"] = str(run_config.get("auth_mode", "api")).strip().lower() or "api"
   client = provider.create_client(run_config)
   try:
     kwargs = dict(request_kwargs or {})
@@ -231,6 +244,7 @@ async def _provider_summarize(
   capability_execution: BoundCapabilityExecution,
   system_prompt: str | list[tuple[str, bool]] | None = DEFAULT_SUMMARY_SYSTEM_PROMPT,
   max_tokens: int = 4096,
+  session_id: str | None = None,
 ) -> str:
   result = await provider_summarize(
     capability_execution=capability_execution,
@@ -238,6 +252,7 @@ async def _provider_summarize(
     system_prompt=system_prompt,
     tools=[],
     max_tokens=max_tokens,
+    session_id=session_id,
   )
   return result.text
 

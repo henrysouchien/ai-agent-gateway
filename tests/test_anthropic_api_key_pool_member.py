@@ -13,12 +13,14 @@ from agent_gateway.auth import ProviderCredentialFailure
 from agent_gateway.providers import anthropic as anthropic_provider
 from agent_gateway.capability_execution import CapabilityExecutionResolver
 from agent_gateway.providers import anthropic_oauth
+from agent_gateway.providers.anthropic_quota import Cooldown, record_cooldown
 from agent_gateway.providers.anthropic import AnthropicProvider
 from agent_gateway.providers.anthropic_oauth import (
   ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES,
   ANTHROPIC_DEPLOYMENT_API_KEY_FIELD,
-  AnthropicCredentialPool,
+  AnthropicCredential,
   AnthropicSourceError,
+  anthropic_credential_blocked_until,
   anthropic_generation_auth_config,
   enroll_anthropic_setup_token,
   resolve_anthropic_auth_store_path,
@@ -36,14 +38,31 @@ _KEY_IDENTITY = "api-key-" + hashlib.sha256(_API_KEY.encode("utf-8")).hexdigest(
 _RESET_AT = 2_000.0
 
 
+class _Sidecar:
+  """Cooldown access through the shared selection sidecar, the one limiter store."""
+
+  @staticmethod
+  def block(credential: AnthropicCredential, *, until: float) -> None:
+    record_cooldown(
+      credential.sidecar_store_path, credential.locator, Cooldown(scope="shared", until=until, reason="rate_limit"),
+    )
+
+  @staticmethod
+  def blocked_until(credential: AnthropicCredential) -> float:
+    return anthropic_credential_blocked_until(credential)
+
+
+def _selected_source(credential: AnthropicCredential) -> dict[str, object]:
+  """The `credential_source` a selection-issued binding carries for this member."""
+  return {**credential.source_metadata(), "automatic": True}
+
+
 @pytest.fixture
 def anthropic_pool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
   # Product imports need the checkout root even in package-only pytest runs.
   monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[3]))
   credentials = importlib.import_module("api.credentials")
-  pool = AnthropicCredentialPool()
-  for module in (anthropic_provider, anthropic_oauth, credentials):
-    monkeypatch.setattr(module, "ANTHROPIC_CREDENTIAL_POOL", pool)
+  pool = _Sidecar()
   for name in ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES:
     monkeypatch.delenv(name, raising=False)
   monkeypatch.delenv("ANTHROPIC_AUTH_MODE", raising=False)
@@ -102,9 +121,9 @@ def test_config_derives_api_mode_from_first_member_not_legacy_mode(
   assert config["api_key"] == _API_KEY
   assert config["auth_token"] == ""
   key = _gateway_sources(credentials).credentials[0]
-  assert config["credential_source"] == key.source_metadata()
+  assert config["credential_source"] == _selected_source(key)
 
-  pool.block(key.key, until=_RESET_AT)
+  pool.block(key, until=_RESET_AT)
   seat_config = credentials.get_anthropic_config()
   assert seat_config["auth_mode"] == "oauth"
   assert seat_config["auth_token"] == _SEAT_A
@@ -136,12 +155,12 @@ def test_key_failure_parks_until_reset_and_rotates_first_oauth_seat(
   })
   assert _API_KEY in later_pool.tokens
   sources = _gateway_sources(credentials)
-  assert rotated["credential_source"] == sources.credentials[1].source_metadata()
+  assert rotated["credential_source"] == _selected_source(sources.credentials[1])
   assert rotated["credential_source"] != config["credential_source"]
-  assert pool.blocked_until(key.key) == _RESET_AT
-  assert pool.blocked_until(sources.credentials[1].key) == 0.0
-  before = select_anthropic_credential_source(sources, pool=pool, now=_RESET_AT - 1)
-  at_reset = select_anthropic_credential_source(sources, pool=pool, now=_RESET_AT)
+  assert pool.blocked_until(key) == _RESET_AT
+  assert pool.blocked_until(sources.credentials[1]) == 0.0
+  before = select_anthropic_credential_source(sources, now=_RESET_AT - 1)
+  at_reset = select_anthropic_credential_source(sources, now=_RESET_AT)
   assert before is not None and before.token == _SEAT_A
   assert at_reset is not None and at_reset.token == _API_KEY
 
@@ -150,7 +169,7 @@ def test_oauth_seat_failure_can_rotate_back_to_api_key(anthropic_pool) -> None:
   pool, credentials, _store = anthropic_pool
   sources = _gateway_sources(credentials)
   key, seat = sources.credentials[:2]
-  pool.block(key.key, until=999.0)
+  pool.block(key, until=999.0)
   config = {
     **credentials.get_anthropic_config(),
     "auth_mode": "oauth", "api_key": "", "auth_token": _SEAT_A,
@@ -163,9 +182,9 @@ def test_oauth_seat_failure_can_rotate_back_to_api_key(anthropic_pool) -> None:
   assert rotated["auth_mode"] == "api"
   assert rotated["api_key"] == _API_KEY
   assert rotated["auth_token"] == ""
-  assert rotated["credential_source"] == key.source_metadata()
-  assert pool.blocked_until(seat.key) == _RESET_AT
-  assert pool.blocked_until(key.key) < 1_000.0
+  assert rotated["credential_source"] == _selected_source(key)
+  assert pool.blocked_until(seat) == _RESET_AT
+  assert pool.blocked_until(key) == 0.0
 
 
 def test_absent_api_key_preserves_generation_but_empty_retires_it(
@@ -314,7 +333,7 @@ def test_gateway_pool_ranks_user_accounts_then_key_then_setup_then_org(anthropic
   config = credentials.get_anthropic_config(user_scope=1)
   assert config["auth_mode"] == "oauth"
   assert config["auth_token"] == user_token
-  assert config["credential_source"] == sources.credentials[0].source_metadata()
+  assert config["credential_source"] == _selected_source(sources.credentials[0])
   assert _gateway_sources(credentials, user_scope=3).tokens == (
     _API_KEY, _SEAT_A, _SEAT_B, org_token,
   )
@@ -335,14 +354,14 @@ def test_gateway_hop_rebind_preserves_deployment_key_membership(
     provider=AnthropicProvider(), model="claude-sonnet-5", effort="none",
     auth_config=config, credential_ref=key.generation_ref,
   )
-  pool.block(key.key, until=_RESET_AT)
+  pool.block(key, until=_RESET_AT)
   rebound = CapabilityExecutionResolver._rebind_unparked_account(execution)
   assert rebound is not None
   assert rebound.auth_config["auth_token"] == _SEAT_A
   assert rebound.auth_config["api_key"] == ""
   assert rebound.auth_config[ANTHROPIC_DEPLOYMENT_API_KEY_FIELD] == key.generation_ref
-  pool.block(_SEAT_A, until=_RESET_AT + 1_000.0)
-  pool.block(_SEAT_B, until=_RESET_AT + 1_000.0)
+  for seat in resolve_anthropic_credentials(config).credentials[1:]:
+    pool.block(seat, until=_RESET_AT + 1_000.0)
   monkeypatch.setattr(anthropic_provider.time, "time", lambda: _RESET_AT + 1.0)
   returned = CapabilityExecutionResolver._rebind_unparked_account(rebound)
   assert returned is not None
@@ -364,5 +383,5 @@ def test_non_gateway_hop_never_admits_ambient_deployment_key(anthropic_pool) -> 
     credential_ref=seat.generation_ref,
   )
   for member in sources.credentials:
-    pool.block(member.key, until=_RESET_AT)
+    pool.block(member, until=_RESET_AT)
   assert CapabilityExecutionResolver._rebind_unparked_account(execution) is None

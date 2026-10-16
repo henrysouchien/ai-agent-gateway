@@ -2095,6 +2095,7 @@ class SQLiteApprovalStore:
 
     request = revalidate_approval_request(request)
     created = False
+    expired_predecessor: ApprovalRequest | None = None
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -2130,6 +2131,12 @@ class SQLiteApprovalStore:
               raise _prepared_bm.PreparedBusinessModelError(
                 "approval tool-call identity conflicts with prepared BusinessModel intent"
               )
+          existing_prepared = _prepared_bm.get(
+            conn,
+            caller_kind=record.caller_kind,
+            user_scope=record.user_scope,
+            idempotency_locator=record.idempotency_locator,
+          )
           normalized_record = replace(
             record,
             created_at=stored_request.requested_at.astimezone(UTC).isoformat(),
@@ -2141,16 +2148,70 @@ class SQLiteApprovalStore:
             approval_id=stored_request.approval_id,
             approval_chain_id=stored_request.approval_chain_id,
           )
-          stored_record, _ = _prepared_bm.insert_or_verify(
+          if (
+            existing_prepared is not None
+            and existing_prepared.lifecycle
+            is _prepared_bm.PreparedBusinessModelLifecycle.PENDING
+            and existing_prepared.approval_id != stored_request.approval_id
+          ):
+            claimed_or_completed = conn.execute(
+              """
+              SELECT 1 FROM approval_executable_bindings
+              WHERE approval_id = ? AND execution_state != 'unclaimed'
+              """,
+              (existing_prepared.approval_id,),
+            ).fetchone()
+            if claimed_or_completed is not None:
+              raise _prepared_bm.PreparedBusinessModelError(
+                "idempotency locator is already bound to contradictory intent"
+              )
+          stored_record, replaced_or_created = _prepared_bm.insert_or_verify(
             conn,
             normalized_record,
           )
+          if (
+            replaced_or_created
+            and existing_prepared is not None
+            and existing_prepared.approval_id != stored_request.approval_id
+          ):
+            conn.execute(
+              """
+              DELETE FROM approval_executable_bindings
+              WHERE approval_id = ? AND execution_state = 'unclaimed'
+              """,
+              (existing_prepared.approval_id,),
+            )
+            predecessor_row = conn.execute(
+              "SELECT * FROM approval_requests WHERE approval_id = ?",
+              (existing_prepared.approval_id,),
+            ).fetchone()
+            if predecessor_row is not None:
+              predecessor = self._row_to_request(predecessor_row)
+              if predecessor.state in {"approved", "auto_approved"}:
+                raise _prepared_bm.PreparedBusinessModelError(
+                  "idempotency locator is already bound to contradictory intent"
+                )
+              if predecessor.state in {"created", "pending_user"}:
+                expired_predecessor = replace(
+                  predecessor,
+                  state="expired",
+                  state_version=predecessor.state_version + 1,
+                  decided_at=stored_request.requested_at.astimezone(UTC),
+                  decision="expired",
+                  decision_reason=f"superseded by {stored_request.approval_id}",
+                )
+                self._write_request_transition_locked(conn, expired_predecessor)
           conn.commit()
         except BaseException:
           conn.rollback()
           raise
     if created:
       await self._emit("request_created", stored_request)
+    if expired_predecessor is not None:
+      await self._emit(
+        self._event_type_for_state(expired_predecessor.state),
+        expired_predecessor,
+      )
     return stored_request, stored_record, created
 
   async def record_policy_generation(
@@ -3603,9 +3664,33 @@ class SQLiteApprovalStore:
     await self._emit(self._event_type_for_state(updated.state), updated)
     return updated
 
-  def _write_request_transition_locked(self, conn: sqlite3.Connection, updated: ApprovalRequest) -> None:
-    conn.execute(
-      """
+  def _write_request_transition_locked(
+    self,
+    conn: sqlite3.Connection,
+    updated: ApprovalRequest,
+    *,
+    cancellation_compare: Mapping[str, Any] | None = None,
+  ) -> sqlite3.Cursor:
+    """The only write of approval_requests.state, decision, and the decider columns.
+
+    Other callers match approval_id only. Cancellation passes cancellation_compare
+    so the identity compare-and-set is this statement's WHERE, not a second write.
+    """
+    predicate = ""
+    params = self._request_to_row(updated)
+    if cancellation_compare is not None:
+      predicate = """
+        AND state = 'pending_user'
+        AND state_version = :expected_state_version
+        AND tool_call_id = :expected_tool_call_id
+        AND user_id = :expected_user_id
+        AND request_id = :expected_request_id
+        AND run_id = :expected_run_id
+        AND session_id = :expected_session_id
+        AND LOWER(TRIM(channel)) = :expected_channel"""
+      params = {**params, **cancellation_compare}
+    return conn.execute(
+      f"""
       UPDATE approval_requests SET
         state = :state,
         state_version = :state_version,
@@ -3615,9 +3700,9 @@ class SQLiteApprovalStore:
         decider_role = :decider_role,
         decision = :decision,
         decision_reason = :decision_reason
-      WHERE approval_id = :approval_id
+      WHERE approval_id = :approval_id{predicate}
       """,
-      self._request_to_row(updated),
+      params,
     )
 
   async def terminalize_pending_for_cancellation(
@@ -3692,28 +3777,10 @@ class SQLiteApprovalStore:
           decision="denied",
           decision_reason=decision_reason,
         )
-        cursor = conn.execute(
-          """
-          UPDATE approval_requests SET
-            state = :state,
-            state_version = :state_version,
-            decided_at = :decided_at,
-            decider_id = :decider_id,
-            decider_role = :decider_role,
-            decision = :decision,
-            decision_reason = :decision_reason
-          WHERE approval_id = :approval_id
-            AND state = 'pending_user'
-            AND state_version = :expected_state_version
-            AND tool_call_id = :expected_tool_call_id
-            AND user_id = :expected_user_id
-            AND request_id = :expected_request_id
-            AND run_id = :expected_run_id
-            AND session_id = :expected_session_id
-            AND LOWER(TRIM(channel)) = :expected_channel
-          """,
-          {
-            **self._request_to_row(updated),
+        cursor = self._write_request_transition_locked(
+          conn,
+          updated,
+          cancellation_compare={
             "expected_state_version": current.state_version,
             "expected_tool_call_id": expected_tool_call_id,
             "expected_user_id": expected_user_id,
@@ -3805,18 +3872,7 @@ class SQLiteApprovalStore:
             decision="denied",
             decision_reason=decision_reason,
           )
-          conn.execute(
-            """
-            UPDATE approval_requests SET
-              state = :state,
-              state_version = :state_version,
-              decided_at = :decided_at,
-              decision = :decision,
-              decision_reason = :decision_reason
-            WHERE approval_id = :approval_id
-            """,
-            self._request_to_row(updated),
-          )
+          self._write_request_transition_locked(conn, updated)
           transitioned = True
         revoked_grant_rows = conn.execute(
           """
@@ -3992,20 +4048,7 @@ class SQLiteApprovalStore:
         )
         terminal_event = terminal_state
 
-        conn.execute(
-          """
-          UPDATE approval_requests SET
-            state = :state,
-            state_version = :state_version,
-            decided_at = :decided_at,
-            decider_id = :decider_id,
-            decider_role = :decider_role,
-            decision = :decision,
-            decision_reason = :decision_reason
-          WHERE approval_id = :approval_id
-          """,
-          self._request_to_row(updated),
-        )
+        self._write_request_transition_locked(conn, updated)
         if (
           normalized_delivery is not None
           and updated.state in {"approved", "denied"}

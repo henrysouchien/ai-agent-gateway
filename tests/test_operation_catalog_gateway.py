@@ -104,7 +104,8 @@ def test_run_agent_schema_exposes_operation_and_objective(tmp_path: Path) -> Non
 
   schema = make_run_agent_tool_def(SkillLoader(tmp_path))["input_schema"]
 
-  assert schema["required"] == ["objective"]
+  assert not {"oneOf", "anyOf", "allOf"} & set(schema)
+  assert "required" not in schema
   assert "operation" in schema["properties"]
   assert "agent" not in schema["properties"]
   assert "task" not in schema["properties"]

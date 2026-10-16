@@ -39,27 +39,62 @@ from .runner_usage import (
   usage_delta as _usage_delta,
   usage_has_tokens as _usage_has_tokens,
 )
+from .undo_token_lifetime import conversation_id
 
 if TYPE_CHECKING:
   from pathlib import Path
 
+  from .agent_session_log import AgentSessionLog
+  from .session import GatewaySession
   from .capability_execution import ModelFallbackHop
   from .event_log import EventLog
   from .multi_user.billing import _UsageAggregator
+  from .providers.base import ModelProvider
   from .runner_tool_execution import AgentRunnerDispatcher
 
 log = logging.getLogger("agent_gateway.runner")
+
+# `AgentRunner` binds a stateless request to this sentinel id.
+_NO_SESSION_ID = "no-session"
+
+
+def prepare_session_id(full_session_id: str | None) -> str | None:
+  """Normalize an affinity identity; stateless requests have none."""
+  session_id = str(full_session_id or "").strip()
+  return None if not session_id or session_id == _NO_SESSION_ID else session_id
+
+
+def rebind_refreshed_credential(
+  execution: BoundCapabilityExecution,
+  active_config: Dict[str, Any],
+  refreshed: Dict[str, Any],
+  *,
+  merge: Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]] = _merge_refreshed_auth_config,
+) -> BoundCapabilityExecution | None:
+  """Merge refreshed credential material into `execution`; None when it cannot bind.
+
+  The one owner of rotation, preparation and compaction rebinds.
+  """
+  merged = merge(active_config, refreshed)
+  return CapabilityExecutionResolver.rebind_rotated_credential(
+    execution,
+    refreshed,
+    merged_auth_config=merged,
+  )
 
 
 class RunnerHooksLifecycleMixin:
   if TYPE_CHECKING:
     _aggregator: _UsageAggregator
+    _agent_session_log: AgentSessionLog | None
     _auth_config: Dict[str, Any]
     _billing_mode: BillingMode
     _dispatcher: AgentRunnerDispatcher
     _channel: str | None
     _context_surface_records: Callable[[], List[Dict[str, Any]]]
     _full_session_id: str
+    _gateway_session: GatewaySession | None
+    _role: str
     _log: EventLog
     _on_before_stream_complete: (
       Callable[..., Awaitable[None] | None] | None
@@ -82,6 +117,8 @@ class RunnerHooksLifecycleMixin:
     _on_tool_timing_accepts_context_surfaces: bool
     _on_tool_timing_accepts_user_id: bool
     _on_usage: Callable[[UsageEvent], Awaitable[None] | None] | None
+    _capability_execution: BoundCapabilityExecution
+    _provider: ModelProvider
     _parent_turn_id: str | None
     _rate_table_version: str
     _request_id: str
@@ -163,16 +200,49 @@ class RunnerHooksLifecycleMixin:
       active_config["billing_mode"] = self._billing_mode
     if getattr(self, "_rate_table_version", None):
       active_config["rate_table_version"] = self._rate_table_version
-    merged = _runner_attr(self, "_merge_refreshed_auth_config", _merge_refreshed_auth_config)(active_config, refreshed)
-    refreshed_execution = CapabilityExecutionResolver.rebind_rotated_credential(
+    refreshed_execution = rebind_refreshed_credential(
       execution,
+      active_config,
       refreshed,
-      merged_auth_config=merged,
+      merge=_runner_attr(self, "_merge_refreshed_auth_config", _merge_refreshed_auth_config),
     )
     if refreshed_execution is None:
       return False
     self._install_capability_execution(config, refreshed_execution)
     return True
+
+  def _credential_session_id(self) -> str | None:
+    """Share affinity across resume and compaction, but not across child runs."""
+    session_id = prepare_session_id(self._full_session_id)
+    if session_id is None or self._role == "sub_agent":
+      return session_id
+    return conversation_id(
+      self._gateway_session,
+      log_path=self._agent_session_log.path if self._agent_session_log is not None else None,
+      session_id=session_id,
+    )
+
+  async def _prepare_credential(self, config: Dict[str, Any]) -> bool:
+    """Let the bound provider choose the credential at an episode boundary.
+
+    Runs before the first request, a model-fallback rebuild and compaction.
+    Same-model transient retries keep their binding; rotation already selected
+    fresh material and does not prepare again. Returned material rebinds through
+    the rotation owner (`_apply_refreshed_auth_config`); None leaves the config
+    and client as they are. A disconnected runner prepares nothing. The session
+    identity is the durable conversation's for roots, the child's full id for
+    sub-agents, and None for the stateless sentinel.
+    """
+    if getattr(self, "_disconnected", False):
+      return False
+    refreshed = await self._provider.prepare_credential(
+      self._auth_config,
+      model=self._capability_execution.bind.upstream_model,
+      session_id=self._credential_session_id(),
+    )
+    if not refreshed:
+      return False
+    return self._apply_refreshed_auth_config(config, refreshed)
 
   def _install_capability_execution(
     self,
@@ -223,6 +293,9 @@ class RunnerHooksLifecycleMixin:
 
   def _build_usage_event(self, *, model: str, usage_totals: _UsageTotals) -> UsageEvent:
     cost = self._estimate_usage_cost(model, usage_totals)
+    # Fallback can replace the provider mid-session; its pricing table owns
+    # this event's version, not the identity captured at session creation.
+    rate_table = getattr(self._provider, "_rate_table", None)
     return _runner_attr(self, "_build_usage_event", _build_usage_event)(
       user_id=self._usage_user_id,
       session_id=self._full_session_id,
@@ -233,7 +306,7 @@ class RunnerHooksLifecycleMixin:
       provider_name=getattr(self._provider, "name", None),
       usage_totals=usage_totals,
       cost_total=float(cost.total),
-      rate_table_version=self._rate_table_version,
+      rate_table_version=getattr(rate_table, "version", self._rate_table_version),
       billing_mode=self._billing_mode,
       channel=self._channel,
       selection_provenance=self._usage_selection_provenance(),

@@ -56,6 +56,8 @@ def resolve_auth_config(
   gateway credential pool only (ruling u9-hank-evals-env-fallback-ruling,
   2026-10-12), never from ``ANTHROPIC_API_KEY`` or ``ANTHROPIC_AUTH_MODE``.
 
+  Pool-selected Anthropic material retains its source generation so bound
+  executions can reauthorize an in-flight credential rotation.
   This function resolves credential and provider request-limit material only.
   Model and effort selection live exclusively in a ``CapabilityBind``.
   """
@@ -112,14 +114,23 @@ def resolve_auth_config(
   resolved_key = (api_key or "").strip() or str(result.get("api_key", "")).strip()
   resolved_token = (auth_token or "").strip() or str(result.get("auth_token", "")).strip()
 
-  if use_pool and not resolved_token:
+  if use_pool and not resolved_key and not resolved_token:
     from .providers.anthropic_oauth import (
       resolve_anthropic_credentials,
       select_anthropic_credential_source,
     )
 
-    selected = select_anthropic_credential_source(resolve_anthropic_credentials())
-    resolved_token = selected.token if selected is not None else ""
+    sources = resolve_anthropic_credentials()
+    selected = select_anthropic_credential_source(sources)
+    if selected is not None:
+      if selected.record is not None and selected.record.credential_kind == "api_key":
+        resolved_key = selected.token
+      else:
+        resolved_token = selected.token
+      if len(sources.credentials) > 1 or any(
+        os.environ.get(name, "").strip() for name in ("ANTHROPIC_AUTH_TOKENS", "ANTHROPIC_AUTH_STORE_PATH")
+      ):
+        result["credential_source"] = selected.source_metadata()
   # Resolve auth_mode with precedence chain
   explicit_mode = str(result.get("auth_mode", "")).strip().lower()
 

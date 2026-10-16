@@ -418,7 +418,12 @@ class RunnerSubAgentMixin:
     dispatcher._event_log = sub_log
     child_cost_accumulator = CostAccumulator(cost_observation_threshold_usd)
     runner_cls = _runner_attr(self, "AgentRunner", type(self))
-    child_spill_sink = _child_spill_sink(self._spill_dir_provider, attempt)
+    child_spill_sink = _child_spill_sink(
+      self._spill_dir_provider,
+      attempt,
+      dispatcher=dispatcher,
+      excluded_tools=excluded_tools,
+    )
     sub_runner = runner_cls(
       event_log=sub_log,
       dispatcher=dispatcher,
@@ -473,6 +478,7 @@ class RunnerSubAgentMixin:
       context_surfaces=self._context_surfaces_provider or self._context_surfaces_static,
       terminal_tool_result_ids=set(terminal_result_doors(resolved_admitted_task)),
     )
+    _bind_child_cost_stage(sub_runner, attempt=attempt, parent_aggregator=self._aggregator)
     _bind_child_registry(
       sub_runner,
       parent_registry=self._task_registry,
@@ -735,7 +741,12 @@ class RunnerSubAgentMixin:
       usage_aggregator is not None and usage_aggregator is self._aggregator
     )
     runner_cls = _runner_attr(self, "AgentRunner", type(self))
-    child_spill_sink = _child_spill_sink(self._spill_dir_provider, attempt)
+    child_spill_sink = _child_spill_sink(
+      self._spill_dir_provider,
+      attempt,
+      dispatcher=dispatcher,
+      excluded_tools=excluded_tools,
+    )
     sub_runner = runner_cls(
       event_log=sub_log,
       dispatcher=dispatcher,
@@ -793,6 +804,7 @@ class RunnerSubAgentMixin:
       context_surfaces=self._context_surfaces_provider or self._context_surfaces_static,
       terminal_tool_result_ids=set(terminal_result_doors(resolved_admitted_task)),
     )
+    _bind_child_cost_stage(sub_runner, attempt=attempt, parent_aggregator=self._aggregator)
     if (
       resolved_admitted_task is not None
       and resolved_admitted_task.operation.execution_class == "node.fork"
@@ -980,15 +992,48 @@ def _runtime_exception_detail(exc: Exception) -> str:
   return f"{type(exc).__name__}: {message}"
 
 
+def _bind_child_cost_stage(
+  sub_runner: Any,
+  *,
+  attempt: AttemptRef,
+  parent_aggregator: Any,
+) -> None:
+  """Stamp the child's own cost row with the attempt id minted at admission.
+
+  A shared aggregator is the parent's row; leave it unset. Session id stays
+  `sub<N>:<parent>` — only the cost stage key moves.
+  """
+  aggregator = getattr(sub_runner, "_aggregator", None)
+  if aggregator is None or aggregator is parent_aggregator:
+    return
+  bind = getattr(aggregator, "bind_cost_stage_id", None)
+  if callable(bind):
+    bind(attempt.attempt_id)
+
+
 def _child_spill_sink(
   parent_sink: SpillSink | None,
   attempt: AttemptRef,
+  *,
+  dispatcher: ToolDispatcher,
+  excluded_tools: Set[str] | None,
 ) -> SpillSink | None:
-  """The child job's own spill sink, under its parent's spill root."""
+  """The child job's own spill sink, under its parent's spill root.
+
+  The sink advertises the reader only when this child's own dispatcher can run
+  ``tool_result_read``: a published ``spill_ref`` is a promise the child can
+  keep, so the capability is the child's admitted surface, not the parent's.
+  """
 
   if parent_sink is None:
     return None
-  return job_spill_sink(parent_sink, attempt.physical_task_id)
+  has_spill_read = (
+    "tool_result_read" in dispatcher.local_tool_handlers()
+    and "tool_result_read" not in (excluded_tools or set())
+  )
+  return job_spill_sink(
+    parent_sink, attempt.physical_task_id, spill_read=has_spill_read,
+  )
 
 
 def _bind_child_registry(

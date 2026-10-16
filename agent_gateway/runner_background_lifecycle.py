@@ -14,14 +14,11 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal,
 
 from agent_workflow_contracts import (
   AdmittedTask,
-  ContentHandle,
-  ContentReadGrant,
   ParentResultPolicy,
   TaskResult,
   TaskResultProvenance,
   TaskResultRef,
   UsageObservation,
-  sha256_digest,
   terminal_task_result,
 )
 
@@ -40,11 +37,8 @@ from .runner_background_tasks import (
   drain_still_pending_background_tasks as _drain_still_pending_background_tasks,
   entry_aware_background_handler as _entry_aware_background_handler,
   ensure_sub_agent_semaphore as _ensure_sub_agent_semaphore,
-  agent_completion_message_id as _agent_completion_message_id,
-  build_agent_completion_envelope as _build_agent_completion_envelope,
   normalize_required_skill_lifecycle as _normalize_required_skill_lifecycle,
   normalize_workflow_task_metadata as _normalize_workflow_task_metadata,
-  ordinary_parent_result_policy as _ordinary_parent_result_policy,
   parse_background_result_request as _parse_background_result_request,
   prepare_background_task_registration as _prepare_background_task_registration,
   require_capability_bind_receipt as _require_capability_bind_receipt,
@@ -62,6 +56,7 @@ from .runner_background_tasks import (
   workflow_obstruction_blocks_settlement,
   workflow_owns_terminal_notification as _workflow_owns_terminal_notification,
 )
+from .child_completion import materialize_child_completion_envelope
 from .runner_introspection import (
   derive_sub_agent_id as _derive_sub_agent_id,
   mark_exception_traceback_logged,
@@ -78,13 +73,11 @@ from .runner_session_lifecycle import _exact_value_match, _runner_attr
 from .session import GatewaySession
 from .research_file_activity_lock import try_acquire_research_file_activity
 from .events import AgentCompletionEvent, TypedEvent, event_from_dict
-from .final_narrative_artifact import FinalNarrativeArtifactError
 from .skill_result_events import build_skill_result_captured_event
 from .runner_state import BackgroundTask
 from .skill_lifecycle import TopLevelSkillLifecycleMetadata
 from .sub_agent_narrative_result import (
   final_child_visible_text,
-  read_task_result_terminal_narrative,
   task_result_from_execution,
 )
 from .sub_agent_result_contract import _usage_observation
@@ -100,6 +93,7 @@ from .sub_agent_skill_state import (
 )
 from .tool_result_compaction import model_tool_result_max_chars
 from .task_registry import (
+  InterruptionReason,
   NotificationQueue,
   RequiredSkillResultMarkerValidationError,
   ResumeSuccessorConflictError,
@@ -1259,11 +1253,13 @@ class RunnerBackgroundLifecycleMixin:
           TaskState.COMPLETED,
           TaskState.FAILED,
           TaskState.KILLED,
+          TaskState.INTERRUPTED,
         }
         and bg_task.pending_final_state not in {
           TaskState.COMPLETED,
           TaskState.FAILED,
           TaskState.KILLED,
+          TaskState.INTERRUPTED,
         }
       )
     ):
@@ -1621,41 +1617,12 @@ class RunnerBackgroundLifecycleMixin:
       # would rewrite history (and needlessly require the source content).
       bg_task.completion_envelope = durable
       return
-    policy = bg_task.parent_result_policy or _ordinary_parent_result_policy(
-      task_result
-    )
-
-    def _read_terminal(result: TaskResult) -> str:
-      workspace_dir = self._workspace_dir
-      if workspace_dir is None:
-        raise FinalNarrativeArtifactError(
-          "durable workspace root is unavailable"
-        )
-      return read_task_result_terminal_narrative(
-        result,
-        workspace_dir=workspace_dir,
-      )
-
-    def _read_grant(source: ContentHandle) -> ContentReadGrant:
-      identity = sha256_digest({
-        "task_id": bg_task.task_id,
-        "content_id": source.content_id,
-        "scope": "direct_parent",
-        "principal_id": self._runner_id,
-      }).removeprefix("sha256:")
-      return ContentReadGrant(
-        grant_id=f"content-read:{identity}",
-        content_id=source.content_id,
-        scope="direct_parent",
-        principal_id=str(self._runner_id),
-      )
-
-    envelope = _build_agent_completion_envelope(
+    workspace_dir = self._workspace_dir
+    envelope = materialize_child_completion_envelope(
       task_result,
-      policy=policy,
-      terminal_narrative_reader=_read_terminal,
-      read_grant_factory=_read_grant,
-      message_id=_agent_completion_message_id(task_result),
+      workspace_dir="" if workspace_dir is None else str(workspace_dir),
+      principal_id=str(self._runner_id),
+      policy=bg_task.parent_result_policy,
     )
     await self._append_durable_event(
       _build_agent_completion_event(
@@ -1685,6 +1652,10 @@ class RunnerBackgroundLifecycleMixin:
     try:
       async with self._ensure_sub_agent_semaphore():
         handler_result, handler_error = await handler(tool_input, call_index=call_index)
+      if bg_task.interruption_reason is not None and bg_task.termination_intent is None:
+        # An accepted interrupt also wins when a handler consumes cancellation
+        # or returns before the queued cancellation callback runs.
+        raise asyncio.CancelledError(bg_task.interruption_reason)
       error = handler_error
       if isinstance(handler_result, TaskResult):
         if error is not None:
@@ -1716,26 +1687,27 @@ class RunnerBackgroundLifecycleMixin:
           TaskState.COMPLETED if error is None else TaskState.FAILED
         )
     except asyncio.CancelledError:
-      termination_intent = bg_task.termination_intent or "cancelled"
+      termination_intent = bg_task.termination_intent
+      interruption_reason = bg_task.interruption_reason
+      reason = termination_intent or interruption_reason or "cancelled"
+      interrupted = termination_intent is None and interruption_reason is not None
       canonical = _terminal_task_result(
         bg_task,
-        status="cancelled",
-        reason=termination_intent,
+        status="interrupted" if interrupted else "cancelled",
+        reason=reason,
       )
       if canonical is not None:
         bg_task.task_result = canonical
         result = canonical.model_dump(mode="json")
       else:
-        result = self._background_termination_result(bg_task, termination_intent)
+        result = self._background_termination_result(
+          bg_task, reason,
+        )
       error = None
       final_state = (
         _task_state_from_task_result(canonical)
         if canonical is not None
-        else (
-          TaskState.KILLED
-          if termination_intent in {"cancelled", "killed"}
-          else TaskState.INTERRUPTED
-        )
+        else TaskState.INTERRUPTED if interrupted else TaskState.KILLED
       )
     except Exception as exc:
       error = {"code": "background_error", "message": str(exc)}
@@ -1749,6 +1721,17 @@ class RunnerBackgroundLifecycleMixin:
         result = canonical.model_dump(mode="json")
       final_state = TaskState.FAILED
 
+    if bg_task.state not in {
+      TaskState.COMPLETED,
+      TaskState.FAILED,
+      TaskState.KILLED,
+    }:
+      # Recorded before the finalizer starts so a cancellation that races it
+      # reconciles this outcome; a task already settled by shutdown or kill
+      # keeps that settled result, which the finalizer also preserves.
+      bg_task.pending_final_state = final_state
+      bg_task.pending_result = result
+      bg_task.pending_error = error
     finalizer_task = asyncio.create_task(
       self._finalize_background_agent(
         bg_task,
@@ -1810,7 +1793,7 @@ class RunnerBackgroundLifecycleMixin:
   @staticmethod
   def _background_termination_result(
     bg_task: TaskEntry,
-    termination_intent: TerminationIntent,
+    termination_intent: TerminationIntent | InterruptionReason,
   ) -> dict[str, Any]:
     if bg_task.task_result is not None:
       return bg_task.task_result.model_dump(mode="json")
@@ -1826,9 +1809,13 @@ class RunnerBackgroundLifecycleMixin:
       return canonical.model_dump(mode="json")
     progress = bg_task.progress
     detail = (
-      "Background task was cancelled with its parent run"
-      if termination_intent == "cancelled"
-      else "Background task was killed before completion"
+      "Background task was interrupted and can be resumed"
+      if termination_intent in {"user_interrupted", "parent_interrupted"}
+      else (
+        "Background task was cancelled with its parent run"
+        if termination_intent == "cancelled"
+        else "Background task was killed before completion"
+      )
     )
     return {
       "status": "interrupted",
@@ -3419,6 +3406,20 @@ class RunnerBackgroundLifecycleMixin:
       task_id,
       termination_intent="cancelled",
     )
+
+  def interrupt_background_task(
+    self,
+    task_id: str,
+    *,
+    reason: InterruptionReason = "user_interrupted",
+  ) -> bool:
+    """Pause one owned live child without cancelling this runner or siblings.
+
+    Controls use ``user_interrupted``; a parent-agent tool uses
+    ``parent_interrupted``. The returned bool acknowledges the request, not
+    settlement; await the child's worker before resuming its durable transcript.
+    """
+    return self._task_registry.interrupt(task_id, reason=reason)
 
   async def get_background_result(
     self,

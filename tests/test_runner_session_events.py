@@ -1055,6 +1055,66 @@ def test_run_interrupted_reason_preserves_shutdown_reason_except_cancelled_sub_a
   ) == ("sub_agent_cancelled", {})
 
 
+def test_terminal_closure_decision_carries_the_interruption_the_writer_emits() -> None:
+  shutdown_extra_fields = {"shutdown": {"signal_name": "SIGTERM"}}
+  staged = ("operator_pause", {"safe_boundary": "before_turn"})
+  error = RuntimeError("boom")
+
+  failed = terminal_closure_decision(
+    clean_detach_reason="completed",
+    run_error=error,
+    terminal_event=None,
+    server_terminal_cause=None,
+    role="writer",
+    shutdown_reason="signal_SIGTERM",
+    shutdown_extra_fields=shutdown_extra_fields,
+    staged_interruption=staged,
+  )
+  assert failed.interruption == ("error", shutdown_extra_fields)
+
+  cancelled = terminal_closure_decision(
+    clean_detach_reason="completed",
+    run_error=asyncio.CancelledError(),
+    terminal_event=None,
+    server_terminal_cause=None,
+    role="sub_agent",
+    shutdown_reason="signal_SIGTERM",
+    shutdown_extra_fields=shutdown_extra_fields,
+  )
+  assert cancelled.interruption == ("sub_agent_cancelled", {})
+
+  caused = terminal_closure_decision(
+    clean_detach_reason="completed",
+    run_error=error,
+    terminal_event=None,
+    server_terminal_cause="timeout",
+    role="writer",
+    shutdown_reason="signal_SIGTERM",
+    shutdown_extra_fields=shutdown_extra_fields,
+  )
+  assert caused.interruption == ("error", {"server_terminal_cause": "timeout"})
+
+  paused = terminal_closure_decision(
+    clean_detach_reason="operator_pause",
+    run_error=None,
+    terminal_event=None,
+    server_terminal_cause=None,
+    staged_interruption=staged,
+  )
+  assert paused.interruption == staged
+
+  persisted = terminal_closure_decision(
+    clean_detach_reason="completed",
+    run_error=error,
+    terminal_event=None,
+    server_terminal_cause="timeout",
+    persistence_error=OSError("disk unavailable"),
+    shutdown_reason="signal_SIGTERM",
+    shutdown_extra_fields=shutdown_extra_fields,
+  )
+  assert persisted.interruption == ("persistence", None)
+
+
 def test_orphan_tool_call_interrupted_events_select_unresolved_starts() -> None:
   entries = [
     SimpleNamespace(event={"type": "tool_call_start", "tool_call_id": "", "tool_name": "skip"}),

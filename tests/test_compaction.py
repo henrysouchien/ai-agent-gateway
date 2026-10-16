@@ -3,6 +3,7 @@
 import asyncio
 import sys
 from dataclasses import fields, is_dataclass
+from typing import Any
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,7 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import AgentSessionLog, generate_and_append_summary
 import agent_gateway.compaction as compaction
-from agent_gateway.providers import AnthropicProvider
+from agent_gateway.providers import AnthropicProvider, StreamEvent
 from gateway_test_support.capability_execution_test_support import (
   stub_bound_capability_execution,
 )
@@ -112,6 +113,7 @@ def test_generate_summary_provider_gets_child_result_trust_system_policy(
     *,
     capability_execution,
     system_prompt: str,
+    session_id: str | None = None,
   ) -> str:
     _ = capability_execution
     captured["system_prompt"] = system_prompt
@@ -423,3 +425,77 @@ def test_generate_and_append_summary_respects_prompt_budget_boundary(tmp_path: P
   assert len(captured_prompts[0]) <= 1500
   assert "summary input truncated" in captured_prompts[0]
   assert "second " not in captured_prompts[0]
+
+
+class _PrepareRecordingProvider(AnthropicProvider):
+  """Anthropic provider whose summary stream is scripted and whose credential
+  preparation records the session id the summary path hands it."""
+
+  def __init__(self) -> None:
+    super().__init__()
+    self.prepared: list[tuple[str, str | None]] = []
+
+  async def prepare_credential(
+    self,
+    config: Any,
+    *,
+    model: str,
+    session_id: str | None,
+  ) -> dict[str, Any] | None:
+    _ = config
+    self.prepared.append((model, session_id))
+    return None
+
+  def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> object:
+    _ = config, timeout
+    return object()
+
+  async def close_client(self, client: Any, timeout: float = 2.0) -> None:
+    _ = client, timeout
+
+  def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
+    return kwargs
+
+  async def stream(self, client: Any, params: dict[str, Any]):
+    _ = client, params
+    yield StreamEvent(type="text_delta", text="Provider summary.")
+    yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+
+@pytest.mark.parametrize(
+  ("session_id", "expected"),
+  [
+    ("sess-0123456789abcdef-full-session-id", "sess-0123456789abcdef-full-session-id"),
+    ("no-session", None),
+    (None, None),
+  ],
+)
+def test_generate_and_append_summary_prepares_credential_with_the_full_session_id(
+  tmp_path: Path,
+  session_id: str | None,
+  expected: str | None,
+) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "summary-prepare.jsonl")
+  _run(log.append({"type": "user_message", "content": "Review AAPL."}))
+  provider = _PrepareRecordingProvider()
+  execution = stub_bound_capability_execution(
+    provider=provider,
+    model="claude-sonnet-5",
+    effort="none",
+    auth_config={"api_key": "test", "max_tokens": 512},
+  )
+
+  summary = _run(
+    generate_and_append_summary(
+      log,
+      from_seq=1,
+      to_seq=1,
+      prompt="Summarize the analyst session.",
+      capability_execution=execution,
+      session_id=session_id,
+    )
+  )
+
+  assert summary is not None
+  assert summary.event["text"] == "Provider summary."
+  assert provider.prepared == [("claude-sonnet-5", expected)]

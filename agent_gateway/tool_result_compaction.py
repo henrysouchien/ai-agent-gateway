@@ -44,6 +44,11 @@ _ELIDED_DEPTH_KEY = "_elided_depth"
 _ELIDED_CHARS_MARKER = "...<elided chars="
 _PROJECTION_MAX_DEPTH = 12
 
+# A navigation row keeps its scalars under this cap on the ordinary rungs: the
+# row is the producer's index entry, so its key and value-space fields are what
+# a caller navigates by.  Only the model ladder's last-resort rungs narrow it.
+_NAVIGATION_ROW_STRING_CHARS = 160
+
 # Successively harder elision settings: (max list items, max string chars, max dict
 # entries).  The first setting whose serialized payload fits the model budget wins,
 # so a result loses bulk before it loses shape.
@@ -60,7 +65,22 @@ _PROJECTION_LADDER = (
   (0, 40, 16),
 )
 
-# The live-stream projection walks the model ladder at full depth, then ends on
+# The model ladder adds two navigation caps to each rung: the string cap of a
+# compact navigation row and how many items of a preserved navigation container
+# survive (None = all).  The existing rungs keep whole containers at 160-char
+# rows; only after the bulk rungs are spent does a navigation container itself
+# narrow, so an oversized index degrades to a marked prefix instead of
+# collapsing the whole result to the omission stub.
+_MODEL_PROJECTION_LADDER = (
+  *((*rung, _NAVIGATION_ROW_STRING_CHARS, None) for rung in _PROJECTION_LADDER),
+  (0, 40, 16, 40, None),
+  (0, 40, 16, 40, 512),
+  (0, 40, 16, 40, 128),
+  (0, 40, 16, 40, 32),
+  (0, 40, 16, 40, 0),
+)
+
+# The live-stream projection walks the projection ladder at full depth, then ends on
 # a rung that keeps the top level only: a result's width and nesting can outrun
 # every full-depth rung, and the top level is where an envelope's fields live.
 # 400 entries of at most 200 characters is under 330 KB even at four UTF-8
@@ -71,6 +91,58 @@ _STREAM_PROJECTION_LADDER = (
 )
 
 
+_NAVIGATION_FALLBACK_KEYS = frozenset({"semantic_keys", "required_drivers", "valid_keys"})
+
+
+def _preserve_navigation_key(key: str) -> bool:
+  """Whether the product policy names ``key`` as a producer navigation index."""
+
+  policy = load_server_policy_module()
+  preserve = getattr(policy, "preserve_tool_result_navigation_key", None)
+  if callable(preserve):
+    return bool(preserve(key))
+  return key in _NAVIGATION_FALLBACK_KEYS
+
+
+def _project_navigation_row(
+  row: Dict[Any, Any],
+  *,
+  max_items: int,
+  max_entries: int,
+  depth: int,
+  max_depth: int,
+  row_chars: int = _NAVIGATION_ROW_STRING_CHARS,
+  max_navigation_items: int | None = None,
+) -> Dict[str, Any]:
+  """One index row of an over-long navigation list: every scalar, no bulk.
+
+  ``depth`` is the row's own depth.  Scalars (identity, unit, latest value,
+  status) survive under a short string cap; nested prose and lists are cut and
+  counted, except a nested navigation container, which is projected whole.
+  """
+
+  projected: Dict[str, Any] = {}
+  elided = 0
+  for key, item in row.items():
+    if isinstance(item, (dict, list)) and not _preserve_navigation_key(str(key)):
+      elided += 1
+      continue
+    projected[str(key)] = _project_value(
+      item,
+      max_items=max_items,
+      max_string_chars=row_chars,
+      max_entries=max_entries,
+      depth=depth + 1,
+      max_depth=max_depth,
+      preserve_list_items=True,
+      nav_row_chars=row_chars,
+      max_navigation_items=max_navigation_items,
+    )
+  if elided:
+    projected[_ELIDED_KEYS_KEY] = elided
+  return projected
+
+
 def _project_value(
   value: Any,
   *,
@@ -79,12 +151,19 @@ def _project_value(
   max_entries: int,
   depth: int,
   max_depth: int = _PROJECTION_MAX_DEPTH,
+  preserve_list_items: bool = False,
+  nav_row_chars: int = _NAVIGATION_ROW_STRING_CHARS,
+  max_navigation_items: int | None = None,
 ) -> Any:
   """Return ``value`` reshaped to the given elision settings, marking every cut.
 
   Bulk (long strings, long lists, wide dicts, deep nesting) is dropped; scalars and
   small subtrees are carried through unchanged so a caller can trust an unmarked
-  value.  This decides how *much* of a result survives, never which parts matter.
+  value.  This decides how *much* of a result survives, never which parts matter,
+  with one exception: a container the product policy names as a navigation index
+  keeps every key and every list item on every ordinary rung, because an elided
+  index entry is a key the caller can no longer name; only the model ladder's
+  last-resort rungs narrow it to a marked prefix rather than lose the outline.
   """
 
   if isinstance(value, str):
@@ -101,8 +180,16 @@ def _project_value(
   if isinstance(value, dict):
     if depth >= max_depth:
       return {_ELIDED_DEPTH_KEY: "dict", _ELIDED_KEYS_KEY: len(value)}
+    entries = list(value.items())
+    selected = entries[:max_entries]
+    if len(entries) > max_entries:
+      selected.extend(
+        (key, item)
+        for key, item in entries[max_entries:]
+        if _preserve_navigation_key(str(key))
+      )
     projected: Dict[str, Any] = {}
-    for key, item in list(value.items())[:max_entries]:
+    for key, item in selected:
       projected[str(key)] = _project_value(
         item,
         max_items=max_items,
@@ -110,13 +197,48 @@ def _project_value(
         max_entries=max_entries,
         depth=depth + 1,
         max_depth=max_depth,
+        preserve_list_items=preserve_list_items or _preserve_navigation_key(str(key)),
+        nav_row_chars=nav_row_chars,
+        max_navigation_items=max_navigation_items,
       )
-    if len(value) > max_entries:
-      projected[_ELIDED_KEYS_KEY] = len(value) - max_entries
+    if len(entries) > len(selected):
+      projected[_ELIDED_KEYS_KEY] = len(entries) - len(selected)
     return projected
   if isinstance(value, list):
     if depth >= max_depth:
       return [{_ELIDED_DEPTH_KEY: "list", _ELIDED_ITEMS_KEY: len(value)}]
+    if preserve_list_items:
+      compact_rows = len(value) > max_items
+      preserved_items = value
+      if max_navigation_items is not None and len(value) > max_navigation_items:
+        preserved_items = value[:max_navigation_items]
+      kept: list[Any] = []
+      for item in preserved_items:
+        if compact_rows and isinstance(item, dict):
+          kept.append(_project_navigation_row(
+            item,
+            max_items=max_items,
+            max_entries=max_entries,
+            depth=depth + 1,
+            max_depth=max_depth,
+            row_chars=nav_row_chars,
+            max_navigation_items=max_navigation_items,
+          ))
+          continue
+        kept.append(_project_value(
+          item,
+          max_items=max_items,
+          max_string_chars=max(max_string_chars, nav_row_chars),
+          max_entries=max_entries,
+          depth=depth + 1,
+          max_depth=max_depth,
+          preserve_list_items=True,
+          nav_row_chars=nav_row_chars,
+          max_navigation_items=max_navigation_items,
+        ))
+      if len(preserved_items) < len(value):
+        kept.append({_ELIDED_ITEMS_KEY: len(value) - len(preserved_items)})
+      return kept
     items = [
       _project_value(
         item,
@@ -152,17 +274,20 @@ def _fit_content_projection(
   # A result that is one large string (or mostly one) should still fill the budget,
   # so the first rung sizes its string cap from the space the envelope leaves free.
   text_budget = max_chars - len(json.dumps(payload, default=str)) - 64
-  ladder = _PROJECTION_LADDER
+  ladder = _MODEL_PROJECTION_LADDER
   if text_budget > _PROJECTION_LADDER[0][1]:
-    ladder = ((_PROJECTION_LADDER[0][0], text_budget, _PROJECTION_LADDER[0][2]), *ladder)
+    first = _MODEL_PROJECTION_LADDER[0]
+    ladder = ((first[0], text_budget, first[2], first[3], first[4]), *ladder)
 
-  for max_items, max_string_chars, max_entries in ladder:
+  for max_items, max_string_chars, max_entries, nav_row_chars, max_navigation_items in ladder:
     payload["content_projection"] = _project_value(
       value,
       max_items=max_items,
       max_string_chars=max_string_chars,
       max_entries=max_entries,
       depth=0,
+      nav_row_chars=nav_row_chars,
+      max_navigation_items=max_navigation_items,
     )
     serialized = json.dumps(payload, default=str)
     if len(serialized) <= max_chars:
@@ -207,6 +332,98 @@ def _business_model_data_gaps(value: Any) -> list[Any]:
     if row:
       projected.append(row)
   return projected
+
+
+_PROJECTION_DROPPED = object()
+
+
+def _bounded_projection_node(value: Any, *, depth: int = 0) -> Any:
+  """Bound a nested receipt value with the projection's existing caps.
+
+  Strings use ``_bounded_projection_text`` at the artifact_ref cap; lists and
+  dicts stop at the same 20-item cap as data gaps. A separate depth-cut sentinel
+  keeps explicit nulls and empty containers intact inside retained values.
+  """
+
+  if isinstance(value, str):
+    return _bounded_projection_text(value, limit=2_000) if value.strip() else value[:2_000]
+  if isinstance(value, bool) or value is None or isinstance(value, (int, float)):
+    return value
+  if depth >= _PROJECTION_MAX_DEPTH:
+    return _PROJECTION_DROPPED
+  if isinstance(value, list):
+    items = [
+      projected
+      for item in value[:20]
+      if (projected := _bounded_projection_node(item, depth=depth + 1)) is not _PROJECTION_DROPPED
+    ]
+    return items
+  if isinstance(value, dict):
+    row: dict[str, Any] = {}
+    for key, item in list(value.items())[:20]:
+      projected = _bounded_projection_node(item, depth=depth + 1)
+      if projected is not _PROJECTION_DROPPED:
+        row[key] = projected
+    return row
+  return _bounded_projection_text(str(value), limit=2_000)
+
+
+def _business_model_findings(value: Any) -> list[Any]:
+  if not isinstance(value, list):
+    return []
+  projected: list[Any] = []
+  for item in value[:20]:
+    if not isinstance(item, dict):
+      continue
+    row: dict[str, Any] = {}
+    if "index" in item:
+      index = item.get("index")
+      if isinstance(index, bool):
+        pass
+      elif isinstance(index, (int, float)):
+        row["index"] = index
+      else:
+        text = _bounded_projection_text(index, limit=128)
+        if text is not None:
+          row["index"] = text
+    for field, limit in (("field", 256), ("code", 128), ("message", 2_000)):
+      text = _bounded_projection_text(item.get(field), limit=limit)
+      if text is not None:
+        row[field] = text
+    if "next_call" in item:
+      call = item.get("next_call")
+      if call is None:
+        row["next_call"] = None
+      else:
+        bounded_call = _bounded_projection_node(call)
+        if bounded_call is not _PROJECTION_DROPPED:
+          row["next_call"] = bounded_call
+    if "change_template" in item:
+      template = _bounded_projection_node(item.get("change_template"))
+      if template is not _PROJECTION_DROPPED:
+        row["change_template"] = template
+    if row:
+      projected.append(row)
+  return projected
+
+
+def _business_model_warnings(value: Any) -> list[Any]:
+  if not isinstance(value, list):
+    return []
+  projected: list[Any] = []
+  for item in value[:20]:
+    if isinstance(item, str):
+      text = _bounded_projection_text(item, limit=2_000)
+      if text is not None:
+        projected.append(text)
+      continue
+    if not isinstance(item, dict):
+      continue
+    row = _bounded_projection_node(item)
+    if isinstance(row, dict) and row:
+      projected.append(row)
+  return projected
+
 
 
 def _business_model_terminal_success_projection(
@@ -285,7 +502,7 @@ def _business_model_terminal_success_projection(
     None,
   )
 
-  projection = {
+  projection: dict[str, Any] = {
     "status": status,
     "gate_code": _bounded_projection_text(result.get("gate_code"), limit=128),
     "artifact_ref": _bounded_projection_text(result.get("artifact_ref"), limit=2_000),
@@ -297,6 +514,19 @@ def _business_model_terminal_success_projection(
     "data_gaps": _business_model_data_gaps(data_gaps),
     "recommended_next_action": _bounded_projection_text(recommended_next_action, limit=2_000),
   }
+  # A structural noop carries its reason only in the selected verdict's findings
+  # and the envelope warnings. Other statuses stay the receipt above, unchanged.
+  if status == "noop":
+    findings = _business_model_findings(verdict_payload.get("findings"))
+    if findings:
+      projection["findings"] = findings
+    warnings = _business_model_warnings(result.get("warnings"))
+    if warnings:
+      projection["warnings"] = warnings
+    if isinstance(result.get("argument_skeleton"), dict):
+      projection["argument_skeleton"] = result["argument_skeleton"]
+    if isinstance(result.get("next_call"), dict):
+      projection["next_call"] = result["next_call"]
   return json.dumps(projection, default=str)
 
 

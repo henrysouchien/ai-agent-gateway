@@ -128,6 +128,8 @@ class RunnerStreamTurnMixin:
       usage_totals: _UsageTotals,
     ) -> UsageEvent: ...
 
+    async def _prepare_credential(self, config: Dict[str, Any]) -> bool: ...
+
     def _call_metric(self, name: str, value: int = 1) -> None: ...
 
     def _install_capability_execution(
@@ -150,6 +152,8 @@ class RunnerStreamTurnMixin:
     ) -> None: ...
 
     async def _emit_error_event(self, error: str) -> None: ...
+    def _effective_excluded_tools(self) -> set[str]: ...
+
 
     async def _emit_stream_retry_event(
       self,
@@ -341,6 +345,7 @@ class RunnerStreamTurnMixin:
       """
 
       nonlocal client, model_info, max_tokens, requested_effort, effort_resolution, _effective_stall_timeout
+      nonlocal prepare_credential
       # A reached reservation ends the job before the next provider request.
       # This is not a hop reason. rulings-index WA-ACCOUNT-BUDGET.
       stop = commercial_budget_stop_fields(
@@ -383,6 +388,7 @@ class RunnerStreamTurnMixin:
       await self._close_client(client, timeout=2.0)
       client = None
       self._install_capability_execution(config, hop.execution)
+      prepare_credential = True
       self._model_fallback_hop = hop
       self._model_fallback_reason = reason
       model_info = self._provider.get_model_info(hop.execution.bind.upstream_model)
@@ -460,15 +466,35 @@ class RunnerStreamTurnMixin:
                 candidates.extend(raw_default_defs)
             except Exception:
               pass
+          # The filter removes names from this request's advertised surface.
+          # Those are not deferral frames: an excluded tool is not loadable.
+          # A session catalog still carries the excluded skill set (a tool the
+          # filter removed that a later skill allow puts back). That definition
+          # is the request-1 frame when nothing unadvertised remains on the
+          # surface — the prefix must already be in deferred form before the
+          # allow lands. A runner with no session has no such set.
+          excluded_names = self._effective_excluded_tools()
+          session_catalog = getattr(self, "_gateway_session", None) is not None
+          skill_frame: dict[str, Any] | None = None
           for tool in candidates:
             if not isinstance(tool, dict):
               continue
             name = str(tool.get("name") or "").strip()
-            if name and name not in advertised_tool_names:
+            if not name or name in advertised_tool_names:
+              continue
+            if name not in excluded_names:
               prefix.framing_tool = {
                 key: value for key, value in tool.items() if key != "cache_control"
               }
+              skill_frame = None
               break
+            if session_catalog and skill_frame is None:
+              skill_frame = {
+                key: value for key, value in tool.items() if key != "cache_control"
+              }
+          else:
+            if skill_frame is not None:
+              prefix.framing_tool = skill_frame
         fork_kwargs = {
           "fork_mode": bool(getattr(self, "_fork_mode", False)),
           "fork_marker_position": getattr(
@@ -771,6 +797,9 @@ class RunnerStreamTurnMixin:
     next_retry_delay: float = 0.0
     attempt = -1
     attempt_start_mono = time_module.monotonic()
+    # The incoming client was prepared by the run loop. Only a model hop
+    # starts another ranking episode; rotation already selected fresh material.
+    prepare_credential = False
 
     def _raise_if_disconnected(exc: Exception | None = None) -> None:
       if not self._disconnected:
@@ -882,6 +911,9 @@ class RunnerStreamTurnMixin:
         _raise_if_disconnected()
         await self._close_client(client, timeout=2.0)
         try:
+          if prepare_credential:
+            prepare_credential = False
+            await self._prepare_credential(config)
           client = self._provider.create_client(config)
         except AnthropicSourceError as source_exc:
           # The bind's exact generation was retired at its owner between

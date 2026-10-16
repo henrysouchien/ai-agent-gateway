@@ -163,11 +163,59 @@ def insert_or_verify(
   row = _select(conn, record.caller_kind, record.user_scope, record.idempotency_locator)
   if row is not None:
     current = _from_row(row)
-    if _immutable_identity(current) != _immutable_identity(record):
-      raise PreparedBusinessModelError(
-        "idempotency locator is already bound to contradictory intent"
+    if _immutable_identity(current) == _immutable_identity(record):
+      return current, False
+    if (
+      current.lifecycle is PreparedBusinessModelLifecycle.PENDING
+      and current.approval_id != record.approval_id
+      and (
+        current.intent_digest != record.intent_digest
+        or current.prepared_payload != record.prepared_payload
+        or current.change_set_id != record.change_set_id
+        or current.change_hash != record.change_hash
+        or current.base_vector_hash != record.base_vector_hash
+        or current.prepared_payload_digest != record.prepared_payload_digest
       )
-    return current, False
+    ):
+      updated = conn.execute(
+        """
+        UPDATE prepared_business_model_change SET
+          schema_version = ?, intent_digest = ?, prepared_payload = ?,
+          change_set_id = ?, change_hash = ?, base_vector_hash = ?,
+          prepared_payload_digest = ?, lifecycle = ?, created_at = ?,
+          expires_at = ?, approval_id = ?, approval_chain_id = ?,
+          execution_receipt = NULL, execution_receipt_digest = NULL,
+          restoration_digest = NULL, checkpoint_id = NULL, consumed_at = NULL
+        WHERE caller_kind = ? AND user_scope = ? AND idempotency_locator = ?
+          AND lifecycle = 'PENDING' AND approval_id = ?
+        """,
+        (
+          record.schema_version,
+          record.intent_digest,
+          record.prepared_payload,
+          record.change_set_id,
+          record.change_hash,
+          record.base_vector_hash,
+          record.prepared_payload_digest,
+          record.lifecycle.value,
+          record.created_at,
+          record.expires_at,
+          record.approval_id,
+          record.approval_chain_id,
+          record.caller_kind,
+          record.user_scope,
+          record.idempotency_locator,
+          current.approval_id,
+        ),
+      )
+      if updated.rowcount != 1:
+        raise PreparedBusinessModelError(
+          "idempotency locator is already bound to contradictory intent"
+        )
+      return record, True
+    raise PreparedBusinessModelError(
+      "idempotency locator is already bound to contradictory intent"
+    )
   conn.execute(
     """
     INSERT INTO prepared_business_model_change (

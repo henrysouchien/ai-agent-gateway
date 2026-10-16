@@ -217,10 +217,9 @@ def effective_compaction_trigger(
 ) -> int | None:
   """Scale a fixed compaction trigger up to the model's real context window.
 
-  Keeps the configured value as a floor (never compacts later than legacy on a
-  small window) but raises it to ``settings.compaction_trigger_pct`` of a
-  larger window so it only fires near genuine capacity instead of on every turn
-  once the static system+tool surface alone already exceeds the legacy trigger.
+  Keeps the configured value as a floor on smaller windows while scaling
+  large-window triggers to ``settings.compaction_trigger_pct`` of the model's
+  context window so long sessions compact once context exceeds that percentage.
   """
   if compaction_trigger is None:
     return None

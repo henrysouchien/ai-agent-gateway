@@ -23,8 +23,8 @@ from agent_workflow_contracts import (
   AdmittedTask,
   AdmittedToolRoute,
   AttemptRef,
+  CatalogToolEntry,
   ContentHandle,
-  ContentReadGrant,
   ContractRef,
   ContextSourceRef,
   ExecuteTaskDisposition,
@@ -44,6 +44,8 @@ from agent_workflow_contracts import (
   ResolvedAuthority,
   TaskResult,
   TaskResultProvenance,
+  ToolGrant,
+  ToolGrantEntry,
   UsageObservation,
   WorkspaceGrant,
   WorkflowNodeTaskRef,
@@ -88,24 +90,33 @@ from .stage_ref_handles import (
   resolve_handle_refs,
 )
 from .job_caller import CallerContext, JobScope, JobScopedHandler, rebind_job_handlers
+from .runner_tool_execution import (
+  reset_current_parent_skill_run_id,
+  set_current_parent_skill_run_id,
+)
 from .tool_result_spill import (
   SPILL_REF_PREFIX,
   SpillReadError,
+  TOOL_RESULT_READ_TOOL_DEF,
   job_spill_sink,
   job_spill_output_handles,
 )
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CapabilityResolutionError
 from .capability_execution import CapabilityExecutionResolver, materialize_frozen_bind
-from .child_completion import CompletionTransport, publish_child_completion
+from .child_completion import (
+  CompletionTransport,
+  materialize_child_completion_envelope,
+  publish_child_completion,
+)
 from .code_execution import (
   CodeExecutionBundle,
   CodeExecutionConfig,
   cleanup_code_execution,
   make_code_execute_tool_def,
 )
+from hank_contracts.commercial_work import CommercialWorkStartError
 from .commercial_work_start import (
-  CommercialWorkStartError,
   require_commercial_child_account,
 )
 from .event_log import EventLog
@@ -129,16 +140,8 @@ from .research_file_current_projection import (
   ResearchFileCurrentProjectionUnavailable,
   task_registration_is_current,
 )
-from .runner_background_tasks import (
-  agent_completion_message_id,
-  build_agent_completion_envelope,
-  ordinary_parent_result_policy,
-  task_completed_event_payload,
-  task_correlation_payload,
-  task_registered_event_payload,
-)
+from .runner_background_tasks import ordinary_parent_result_policy
 from .directory_control_skill_catalog import PORTFOLIO_CONTEXT_NAMES
-from .runner_session_events import build_agent_completion_event
 from .runner_state import user_turn_message
 from .session import GatewaySession, child_gateway_session
 from .skill_limits import SkillExecutionLimits
@@ -196,10 +199,11 @@ from .sub_agent_helpers import (
 )
 from .sub_agent_background_result import make_get_background_result_handler
 from .sub_agent_messages import make_send_message_handler as _make_send_message_handler
-from .sub_agent_narrative_result import read_task_result_terminal_narrative
+
 from . import sub_agent_skill_state as _sub_agent_skill_state
 from . import sub_agent_tool_definitions as _sub_agent_tool_definitions
 from .task_registry import (
+  NotificationRetrievalCapacityError,
   ResumeSuccessorConflictError,
   TaskEntry,
   TaskState,
@@ -390,6 +394,61 @@ def _child_tool_definitions_getter(
     ]
 
   return _declared_tool_definitions
+
+
+_SPILL_READER_TOOL_ID = "tool_result_read"
+_SPILL_READER_ROUTE_ID = "transport:tool_result_read"
+
+
+def _with_spill_reader_companion(authority: ResolvedAuthority) -> ResolvedAuthority:
+  """Add the same-run spill reader to a non-empty admitted tool surface.
+
+  The reader is a transport companion, not source authority: a local read route
+  outside every semantic capability binding, so it adds no source tool or
+  workspace reach, and an empty surface stays empty.
+  """
+
+  granted = granted_tool_ids(authority)
+  if not granted or _SPILL_READER_TOOL_ID in granted:
+    return authority
+  entries = tuple(sorted(
+    (
+      *authority.grant.tools,
+      ToolGrantEntry(
+        tool_id=_SPILL_READER_TOOL_ID,
+        route_id=_SPILL_READER_ROUTE_ID,
+        effect="read",
+      ),
+    ),
+    key=lambda entry: entry.tool_id,
+  ))
+  grant = ToolGrant(
+    grant_id=authority.grant.grant_id,
+    tools=entries,
+    digest=sha256_digest({
+      "grant_id": authority.grant.grant_id,
+      "tools": [entry.model_dump(mode="json") for entry in entries],
+    }),
+  )
+  routes = tuple(sorted(
+    (
+      *authority.routes,
+      CatalogToolEntry(
+        tool_id=_SPILL_READER_TOOL_ID,
+        canonical_name=_SPILL_READER_TOOL_ID,
+        effect="read",
+        origin="local",
+      ),
+    ),
+    key=lambda route: route.tool_id,
+  ))
+  return ResolvedAuthority(
+    operation_name=authority.operation_name,
+    grant=grant,
+    bindings=authority.bindings,
+    routes=routes,
+    identity=authority.identity,
+  )
 
 
 def _admitted_tool_definitions_getter(
@@ -667,34 +726,6 @@ async def _publish_foreground_completion(
     )
 
   policy = ordinary_parent_result_policy(result)
-
-  def _read_terminal(canonical: TaskResult) -> str:
-    return read_task_result_terminal_narrative(
-      canonical,
-      workspace_dir=workspace_dir,
-    )
-
-  def _read_grant(source: ContentHandle) -> ContentReadGrant:
-    identity = sha256_digest({
-      "task_id": result.attempt.physical_task_id,
-      "content_id": source.content_id,
-      "scope": "direct_parent",
-      "principal_id": runner_id,
-    }).removeprefix("sha256:")
-    return ContentReadGrant(
-      grant_id=f"content-read:{identity}",
-      content_id=source.content_id,
-      scope="direct_parent",
-      principal_id=runner_id,
-    )
-
-  envelope = build_agent_completion_envelope(
-    result,
-    policy=policy,
-    terminal_narrative_reader=_read_terminal,
-    read_grant_factory=_read_grant,
-    message_id=agent_completion_message_id(result),
-  )
   now = datetime.datetime.now(datetime.UTC).timestamp()
   result_payload = result.model_dump(mode="json")
   entry = TaskEntry(
@@ -718,7 +749,6 @@ async def _publish_foreground_completion(
     admitted_task=admitted_task,
     task_result=result,
     parent_result_policy=policy,
-    completion_envelope=envelope,
   )
   return await publish_child_completion(
     transport=CompletionTransport(
@@ -1646,6 +1676,161 @@ async def _dispose_child_code_execution(session: GatewaySession | None) -> None:
     raise
 
 
+def _runner_task_registry(runner: Any) -> Any | None:
+  registry = getattr(runner, "_task_registry", None)
+  if registry is None or not callable(getattr(registry, "prior_child_spawn", None)):
+    return None
+  return registry
+
+
+def _background_spawn_ack(entry: TaskEntry, *, agent_name: str) -> dict[str, Any]:
+  payload: dict[str, Any] = {
+    "task_id": entry.task_id,
+    "status": "running",
+  }
+  name = entry.agent_name or agent_name
+  if name:
+    payload["agent"] = name
+  return payload
+
+
+def _materialize_prior_child(
+  runner: Any,
+  entry: TaskEntry,
+) -> AgentCompletionEnvelope | None:
+  result = entry.task_result
+  if entry.completion_envelope is not None or result is None:
+    return entry.completion_envelope
+  principal_id = str(getattr(runner, "_runner_id", "") or "")
+  if not principal_id:
+    return entry.completion_envelope
+  workspace = getattr(runner, "_workspace_dir", None)
+  try:
+    return materialize_child_completion_envelope(
+      result,
+      workspace_dir="" if workspace is None else str(workspace),
+      principal_id=principal_id,
+    )
+  except Exception:
+    log.exception(
+      "Prior child %s completion could not be materialized",
+      entry.task_id,
+    )
+    return None
+
+
+async def _reuse_prior_child_spawn(
+  runner: Any,
+  *,
+  agent_name: str,
+  spawn_task: str,
+  spawn_ticker: str | None,
+  spawn_research_file_id: int | None,
+  spawn_handles: tuple[str, ...],
+  spawn_role: str | None,
+  spawn_effort: str | None,
+) -> tuple[Any, dict[str, Any] | None] | None:
+  """Return a prior sibling's tool result, or None when this call must spawn."""
+  registry = _runner_task_registry(runner)
+  if registry is None:
+    return None
+  while True:
+    prior = registry.prior_child_spawn(
+      agent_name=agent_name,
+      owner_runner_id=str(getattr(runner, "_runner_id", "") or ""),
+      spawn_task=spawn_task,
+      spawn_ticker=spawn_ticker,
+      spawn_research_file_id=spawn_research_file_id,
+      spawn_handles=spawn_handles,
+      spawn_role=spawn_role,
+      spawn_effort=spawn_effort,
+    )
+    if prior is None:
+      return None
+    if prior.state not in {TaskState.PENDING, TaskState.RUNNING}:
+      break
+    if prior.task_type == "foreground_agent":
+      await prior.spawn_settled.wait()
+      continue
+    if prior.task_type == "background_agent":
+      return _background_spawn_ack(prior, agent_name=agent_name), None
+    return None
+  envelope = _materialize_prior_child(runner, prior)
+  if envelope is None:
+    return None, {
+      "code": "agent_completion_materialization_failed",
+      "message": (
+        "Prior child completed but its parent-readable result "
+        f"could not be materialized ({prior.task_id})"
+      ),
+    }
+  return envelope, None
+
+
+def _claim_child_spawn(
+  runner: Any,
+  *,
+  agent_name: str,
+  spawn_task: str,
+  spawn_ticker: str | None,
+  spawn_research_file_id: int | None,
+  spawn_handles: tuple[str, ...],
+  spawn_role: str | None,
+  spawn_effort: str | None,
+  task_id: str,
+  task_type: str,
+) -> TaskEntry | None:
+  registry = _runner_task_registry(runner)
+  if registry is None:
+    return None
+  if not registry.notification_retrieval_capacity_available():
+    return None
+  try:
+    entry = registry.register(
+      task_type,
+      agent_name=agent_name,
+      task_id=task_id,
+    )
+  except NotificationRetrievalCapacityError:
+    return None
+  entry.spawn_owner_runner_id = str(getattr(runner, "_runner_id", "") or "")
+  entry.spawn_task = spawn_task
+  entry.spawn_ticker = spawn_ticker
+  entry.spawn_research_file_id = spawn_research_file_id
+  entry.spawn_handles = spawn_handles
+  entry.spawn_role = spawn_role
+  entry.spawn_effort = spawn_effort
+  return entry
+
+
+def _remember_foreground_spawn(
+  claim: TaskEntry | None,
+  *,
+  result: TaskResult | None,
+  envelope: AgentCompletionEnvelope | None,
+) -> None:
+  if claim is None:
+    return
+  if result is None:
+    claim.spawn_settled.set()
+    return
+  claim.task_result = result
+  claim.result = result.model_dump(mode="json")
+  if envelope is not None:
+    claim.completion_envelope = envelope
+  claim.state = task_state_for_result(result)
+  if claim.completed_at is None and claim.completed:
+    claim.completed_at = datetime.datetime.now(datetime.UTC).timestamp()
+  claim.spawn_settled.set()
+
+
+def _release_spawn_claim(runner: Any, claim: TaskEntry) -> None:
+  registry = _runner_task_registry(runner)
+  if registry is not None:
+    registry.discard_unstarted(claim.task_id, expected=claim)
+  claim.spawn_settled.set()
+
+
 def make_run_agent_handler(
   runner_ref: list[Any],
   *,
@@ -1713,9 +1898,9 @@ def make_run_agent_handler(
 ) -> JobScopedHandler:
   """Build the local handler used by the `run_agent` tool.
 
-  The returned handler resolves a full operation identity (or the registered
-  generic ``explore`` operation), admits its exact model/tool authority, and
-  delegates execution to ``AgentRunner.spawn_sub_agent()``.
+  The returned handler interrupts one owned background child, continues a
+  durable child through the configured resume handler, or resolves an operation
+  identity and delegates its admitted execution to ``AgentRunner.spawn_sub_agent()``.
   """
   if skill_loader is not None and operation_catalog is not None:
     raise ValueError(
@@ -1769,6 +1954,9 @@ def make_run_agent_handler(
       "handles",
       "role",
       "effort",
+      "resume",
+      "interrupt",
+      "additional_context",
     })
     unknown_input_keys = sorted(set(tool_input) - allowed_input_keys)
     if unknown_input_keys:
@@ -1787,6 +1975,51 @@ def make_run_agent_handler(
           },
         },
       }
+    controls = [key for key in ("resume", "interrupt") if key in tool_input]
+    if controls:
+      control = controls[0]
+      control_fields = {control, "additional_context"} if control == "resume" else {control}
+      if len(controls) != 1 or set(tool_input) - control_fields:
+        return None, {
+          "code": "invalid_input",
+          "message": "Use interrupt or resume alone, without spawn or model overrides",
+          "next_call": {
+            "tool_name": "run_agent",
+            "arguments": {
+              key: value for key, value in tool_input.items() if key in control_fields
+            },
+          },
+        }
+      if control == "resume":
+        handler = next(
+          (
+            value for value in runner._dispatcher.local_tool_handlers().values()
+            if isinstance(value, _ResumeHandler)
+          ),
+          None,
+        )
+        if handler is None:
+          return None, {
+            "code": "invalid_input",
+            "message": "Background child resume is not configured on this runner.",
+            "next_call": None,
+          }
+        return await handler.for_job(scope)({
+          "task_id": tool_input["resume"],
+          **({"additional_context": tool_input["additional_context"]}
+             if "additional_context" in tool_input else {}),
+        }, **kwargs)
+      task_id = tool_input["interrupt"]
+      if not isinstance(task_id, str) or not task_id.strip():
+        return None, {
+          "code": "invalid_input",
+          "message": "interrupt must name a background child task_id",
+          "next_call": None,
+        }
+      requested = runner.interrupt_background_task(
+        task_id.strip(), reason="parent_interrupted",
+      )
+      return {"task_id": task_id.strip(), "interrupt_requested": requested}, None
     tool_ctx = kwargs.get("tool_ctx")
     parent_turn_id = getattr(tool_ctx, "tool_call_id", None)
 
@@ -2266,6 +2499,16 @@ def make_run_agent_handler(
       ) or context_research_file_id
 
     candidate_tools = frozenset(operation_dispatch_tool_ids)
+    # Filesystem/resource boundary plan §12 item 5: a non-empty admitted tool
+    # surface derives the reader as a same-run transport companion, so a child
+    # that receives a spill_ref of its own can call the reader on it. An
+    # operation that declares the reader itself is admitted through its ceiling.
+    spill_reader_companion = (
+      _SPILL_READER_TOOL_ID in (local_tool_handlers or {})
+      and _SPILL_READER_TOOL_ID not in declared_route_ceiling
+    )
+    if spill_reader_companion:
+      candidate_tools = candidate_tools | {_SPILL_READER_TOOL_ID}
     sub_local = {
       name: handler
       for name, handler in (local_tool_handlers or {}).items()
@@ -2361,6 +2604,11 @@ def make_run_agent_handler(
             continue
           seen.add(name)
           extra_tool_definitions.append(definition)
+    if spill_reader_companion and not any(
+      str(definition.get("name") or "") == _SPILL_READER_TOOL_ID
+      for definition in extra_tool_definitions
+    ):
+      extra_tool_definitions.append(copy.deepcopy(TOOL_RESULT_READ_TOOL_DEF))
 
     candidate_definitions_getter = _child_tool_definitions_getter(
       runner=runner,
@@ -2379,18 +2627,26 @@ def make_run_agent_handler(
     def _resolve_tool_authority(
       canonical_tool_ids: frozenset[str],
     ) -> ResolvedAuthority | OperationUnavailable:
-      return admit_operation_tools(
+      authority = admit_operation_tools(
         operation,
         grant_id=f"grant:{ordinary_task_id}",
         operation_tool_ids=(
           canonical_to_exposed_mcp_tool_ids.get(tool_id, tool_id)
           for tool_id in canonical_tool_ids
+          if not (spill_reader_companion and tool_id == _SPILL_READER_TOOL_ID)
         ),
         definitions=candidate_definitions,
         local_tool_handlers=sub_local,
         mcp_client=mcp_client,
         identity=execution_identity_from_session(parent_session),
       )
+      if (
+        spill_reader_companion
+        and _SPILL_READER_TOOL_ID in canonical_tool_ids
+        and isinstance(authority, ResolvedAuthority)
+      ):
+        return _with_spill_reader_companion(authority)
+      return authority
 
     durable_log = getattr(runner, "_agent_session_log", None)
     outputs: frozenset[str] = frozenset()
@@ -2434,7 +2690,11 @@ def make_run_agent_handler(
           operation=OperationRegistration(
             name=agent_name,
             execution_class=operation.execution_class,
-            route_ceiling=declared_route_ceiling,
+            route_ceiling=(
+              declared_route_ceiling | {_SPILL_READER_TOOL_ID}
+              if spill_reader_companion
+              else declared_route_ceiling
+            ),
             operation_routes=(
               declared_private_mcp_routes
               | (declared_route_ceiling & _ARTIFACT_EMIT_TOOLS)
@@ -2450,8 +2710,6 @@ def make_run_agent_handler(
           session=parent_session,
           route_registered=_route_registered,
           resolve_tool_authority=_resolve_tool_authority,
-          # The spawn core's executor is this process's runner.
-          placement="in_process",
           containment=runner._containment,
           outputs=outputs,
         ),
@@ -2635,6 +2893,17 @@ def make_run_agent_handler(
         ),
       )
     )
+    parent_skill_run_id = (
+      getattr(tool_ctx, "skill_run_id", None)
+      or getattr(runner, "_skill_run_id", None)
+      or getattr(getattr(getattr(runner, "_dispatcher", None), "run_context", None), "run_id", None)
+    )
+    parent_skill_run_id = (
+      parent_skill_run_id.strip()
+      if isinstance(parent_skill_run_id, str) else None
+    )
+    if not parent_skill_run_id or parent_skill_run_id == skill_run_id:
+      parent_skill_run_id = None
     async def _dispatch_sub_agent(_background_input: dict[str, Any], **background_kwargs: Any):
       background_call_index = int(background_kwargs.get("call_index", call_index) or 0)
       task_entry = background_kwargs.get("task_entry")
@@ -2662,17 +2931,25 @@ def make_run_agent_handler(
           user_email=effective_parent_user_email,
         )
         capture_job_context(sub_session, child_context)
+      parent_scope_token = set_current_parent_skill_run_id(parent_skill_run_id)
       try:
         # Without a factory, callers retain their own handler semantics.
         child_local = dict(sub_local)
         child_spill_sink = (
           job_spill_sink(
-            runner._spill_dir_provider, admitted_task.attempt.physical_task_id,
+            runner._spill_dir_provider,
+            admitted_task.attempt.physical_task_id,
+            spill_read=_SPILL_READER_TOOL_ID in child_local,
           )
           if runner._spill_dir_provider is not None
           else None
         )
         child_runner_ref: list[Any] = []
+
+        def _bind_child_runner(sub_runner: Any) -> None:
+          setattr(sub_runner, "_parent_skill_run_id", parent_skill_run_id)
+          child_runner_ref.append(sub_runner)
+
         rebind_job_handlers(child_local, JobScope(
           caller=lambda: current_parent_context(sub_session),
           spill_sink=lambda: child_spill_sink,
@@ -2746,6 +3023,8 @@ def make_run_agent_handler(
           commercial_irreversible_recheck=commercial_irreversible_recheck,
           commercial_mcp_servers=commercial_mcp_servers,
         )
+        if sub_dispatcher.run_context is not None:
+          setattr(sub_dispatcher.run_context, "parent_skill_run_id", parent_skill_run_id)
         if code_execution is not None and code_execution_binder is not None:
           code_execution_binder(code_execution, sub_dispatcher)
         try:
@@ -2763,7 +3042,7 @@ def make_run_agent_handler(
           system_prompt=system_prompt,
           dispatcher=sub_dispatcher,
           sub_session=sub_session,
-          bind_job_runner=child_runner_ref.append,
+          bind_job_runner=_bind_child_runner,
           excluded_tools=child_excluded,
           max_tokens=execution_snapshot.max_tokens,
           cost_observation_threshold_usd=(
@@ -2777,155 +3056,215 @@ def make_run_agent_handler(
           admitted_task=admitted_task,
         )
       finally:
+        reset_current_parent_skill_run_id(parent_scope_token)
         # Runner teardown owns a running child; this also covers construction
         # and durable-start failures before it can take ownership.
         await _dispose_child_code_execution(sub_session)
 
-    if background:
-      if outputs_dir is not None and agent_name:
-        today = datetime.date.today().isoformat()
-        stale_path = outputs_dir / agent_name / f"{today}.md"
-        try:
-          stale_path.unlink(missing_ok=True)
-        except OSError as exc:
-          return None, {
-            "code": "file_cleanup_failed",
-            "message": f"Failed to clean stale output {stale_path}: {exc}",
-          }
-      enriched_tool_input = dict(tool_input)
-      if "resumable" in enriched_tool_input:
-        raw_resumable = enriched_tool_input["resumable"]
-        if not isinstance(raw_resumable, bool):
-          return None, {
-            "code": "invalid_input",
-            "message": f"resumable must be a bool, got {type(raw_resumable).__name__}: {raw_resumable!r}",
-          }
-      else:
-        enriched_tool_input["resumable"] = operation.resumable
-      enriched_tool_input["result_requirement"] = (
-        admitted_result_requirement.model_dump(mode="json")
-      )
-      enriched_tool_input["cost_observation_threshold_usd"] = (
-        cost_observation_threshold_usd
-      )
-      enriched_tool_input["operation"] = operation.operation.model_dump(
-        mode="json"
-      )
-
-      async def _on_background_complete(bg_task: Any) -> None:
-        if on_background_complete is not None:
-          await on_background_complete(bg_task)
-        await _persist_skill_state(bg_task.result, bg_task.error)
-
-      def _build_background_skill_result(
-        _bg_task: Any,
-        result: dict[str, Any] | None,
-        error: dict[str, Any] | None,
-      ) -> dict[str, Any] | None:
-        if skill_event_emitter is None:
-          raise RuntimeError("background skill lifecycle is not configured")
-        return skill_event_emitter.build_result_captured_event(
-          result,
-          error,
-        )
-
-      result, error = await runner._register_background_task(
-        tool_input=enriched_tool_input,
-        handler=_dispatch_sub_agent,
-        agent_name=agent_name,
-        parent_turn_id=parent_turn_id,
-        capability_bind_receipt=execution.bind.to_json(),
-        admitted_task=admitted_task,
-        task_id_override=ordinary_task_id,
-        on_before_start=(
-          partial(on_before_background, agent_name)
-          if on_before_background is not None
-          else None
-        ),
-        on_complete=_on_background_complete if (skill_run_id or on_background_complete is not None) else None,
-        required_skill_lifecycle=(
-          skill_event_emitter.required_lifecycle_metadata()
-          if skill_event_emitter is not None
-          else None
-        ),
-        required_skill_result_event_factory=(
-          _build_background_skill_result
-          if skill_event_emitter is not None
-          else None
-        ),
-        required_skill_result_projector=(
-          skill_event_emitter.project_result_captured
-          if skill_event_emitter is not None
-          else None
-        ),
-      )
-      if error is None and isinstance(result, dict):
-        result = {
-          **result,
-          "granted_tools": list(sorted(admitted_dispatch_tools)),
-        }
-      return result, error
-    result, error = await _dispatch_sub_agent(tool_input, call_index=call_index)
-    if (
-      isinstance(error, dict)
-      and error.get("code")
-      == "durable_skill_event_persistence_failed"
-    ):
-      return result, error
-    canonical_result: TaskResult | None = None
-    if error is None:
-      try:
-        canonical_result = TaskResult.model_validate(result)
-      except ValidationError as exc:
-        # Our runner returned no TaskResult: a runner defect, raised to the
-        # dispatcher (local_tool_failed). The started run still settles; its
-        # terminal event records the defect as a failed child.
-        defect = {
-          "code": "invalid_task_result",
-          "message": (
-            "Sub-agent runner returned an invalid result: "
-            f"{exc.errors()[0]['msg']}"
-          ),
-          "next_call": None,
-        }
-        await _emit_skill_result_captured(None, defect)
-        await _persist_skill_state(None, defect)
-        raise
+    # No suspension between a fresh lookup and the reservation. A duplicate
+    # foreground call joins the first call until its claim settles.
+    reused = await _reuse_prior_child_spawn(
+      runner,
+      agent_name=agent_name,
+      spawn_task=task,
+      spawn_ticker=context_ticker,
+      spawn_research_file_id=child_research_file_id,
+      spawn_handles=handles,
+      spawn_role=role if isinstance(role, str) else None,
+      spawn_effort=effort if isinstance(effort, str) else None,
+    )
+    if reused is not None:
+      return reused
+    claim = _claim_child_spawn(
+      runner,
+      agent_name=agent_name,
+      spawn_task=task,
+      spawn_ticker=context_ticker,
+      spawn_research_file_id=child_research_file_id,
+      spawn_handles=handles,
+      spawn_role=role if isinstance(role, str) else None,
+      spawn_effort=effort if isinstance(effort, str) else None,
+      task_id=ordinary_task_id,
+      task_type="background_agent" if background else "foreground_agent",
+    )
+    spawn_kept = False
     try:
-      await _emit_skill_result_captured(result, error)
-    except DurableSkillEventPersistenceError:
-      return None, _durable_skill_event_persistence_error()
-    await _persist_skill_state(result, error)
-    if (
-      canonical_result is not None
-      and _foreground_completion_transport_ready(runner)
-    ):
-      try:
-        result = await _publish_foreground_completion(
-          runner=runner,
-          result=canonical_result,
-          admitted_task=admitted_task,
-          agent_name=agent_name,
-          capability_bind_receipt=execution.bind.to_json(),
-          parent_turn_id=parent_turn_id,
-          call_index=call_index,
-        )
-      except Exception as exc:
-        log.exception("Foreground agent completion publication failed")
-        status = canonical_result.execution.status
-        reason = canonical_result.execution.terminal_reason
-        if status != "succeeded":
-          happened = f"{status} ({reason})" if reason else status
+      if background:
+        if outputs_dir is not None and agent_name:
+          today = datetime.date.today().isoformat()
+          stale_path = outputs_dir / agent_name / f"{today}.md"
+          try:
+            stale_path.unlink(missing_ok=True)
+          except OSError as exc:
+            return None, {
+              "code": "file_cleanup_failed",
+              "message": f"Failed to clean stale output {stale_path}: {exc}",
+            }
+        enriched_tool_input = dict(tool_input)
+        if "resumable" in enriched_tool_input:
+          raw_resumable = enriched_tool_input["resumable"]
+          if not isinstance(raw_resumable, bool):
+            return None, {
+              "code": "invalid_input",
+              "message": f"resumable must be a bool, got {type(raw_resumable).__name__}: {raw_resumable!r}",
+            }
         else:
-          happened = "completed"
-        return None, {
-          "code": "agent_completion_materialization_failed",
-          "message": (
-            f"Foreground agent {happened} but its exact parent-readable result "
-            f"could not be published: {type(exc).__name__}"
+          enriched_tool_input["resumable"] = operation.resumable
+        enriched_tool_input["result_requirement"] = (
+          admitted_result_requirement.model_dump(mode="json")
+        )
+        enriched_tool_input["cost_observation_threshold_usd"] = (
+          cost_observation_threshold_usd
+        )
+        enriched_tool_input["operation"] = operation.operation.model_dump(
+          mode="json"
+        )
+
+        async def _on_background_complete(bg_task: Any) -> None:
+          if on_background_complete is not None:
+            await on_background_complete(bg_task)
+          await _persist_skill_state(bg_task.result, bg_task.error)
+
+        def _build_background_skill_result(
+          _bg_task: Any,
+          result: dict[str, Any] | None,
+          error: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+          if skill_event_emitter is None:
+            raise RuntimeError("background skill lifecycle is not configured")
+          return skill_event_emitter.build_result_captured_event(
+            result,
+            error,
+          )
+
+        # Keep the claim only when registration succeeds (or while shielded
+        # initialization is still running after caller cancellation).
+        result, error = await runner._register_background_task(
+          tool_input=enriched_tool_input,
+          handler=_dispatch_sub_agent,
+          agent_name=agent_name,
+          parent_turn_id=parent_turn_id,
+          capability_bind_receipt=execution.bind.to_json(),
+          admitted_task=admitted_task,
+          task_id_override=ordinary_task_id,
+          on_before_start=(
+            partial(on_before_background, agent_name)
+            if on_before_background is not None
+            else None
           ),
-        }
-    return result, error
+          on_complete=_on_background_complete if (skill_run_id or on_background_complete is not None) else None,
+          required_skill_lifecycle=(
+            skill_event_emitter.required_lifecycle_metadata()
+            if skill_event_emitter is not None
+            else None
+          ),
+          required_skill_result_event_factory=(
+            _build_background_skill_result
+            if skill_event_emitter is not None
+            else None
+          ),
+          required_skill_result_projector=(
+            skill_event_emitter.project_result_captured
+            if skill_event_emitter is not None
+            else None
+          ),
+        )
+        if error is None or (
+          claim is not None
+          and (claim.asyncio_task is not None or claim.state != TaskState.PENDING)
+        ):
+          spawn_kept = True
+        if error is None and isinstance(result, dict):
+          result = {
+            **result,
+            "granted_tools": list(sorted(admitted_dispatch_tools)),
+          }
+        return result, error
+      result, error = await _dispatch_sub_agent(tool_input, call_index=call_index)
+      if (
+        isinstance(error, dict)
+        and error.get("code")
+        == "durable_skill_event_persistence_failed"
+      ):
+        return result, error
+      canonical_result: TaskResult | None = None
+      if error is None:
+        try:
+          canonical_result = TaskResult.model_validate(result)
+        except ValidationError as exc:
+          # Our runner returned no TaskResult: a runner defect, raised to the
+          # dispatcher (local_tool_failed). The started run still settles; its
+          # terminal event records the defect as a failed child.
+          defect = {
+            "code": "invalid_task_result",
+            "message": (
+              "Sub-agent runner returned an invalid result: "
+              f"{exc.errors()[0]['msg']}"
+            ),
+            "next_call": None,
+          }
+          await _emit_skill_result_captured(None, defect)
+          await _persist_skill_state(None, defect)
+          raise
+      try:
+        await _emit_skill_result_captured(result, error)
+      except DurableSkillEventPersistenceError:
+        return None, _durable_skill_event_persistence_error()
+      await _persist_skill_state(result, error)
+      if (
+        canonical_result is not None
+        and _foreground_completion_transport_ready(runner)
+      ):
+        try:
+          result = await _publish_foreground_completion(
+            runner=runner,
+            result=canonical_result,
+            admitted_task=admitted_task,
+            agent_name=agent_name,
+            capability_bind_receipt=execution.bind.to_json(),
+            parent_turn_id=parent_turn_id,
+            call_index=call_index,
+          )
+        except Exception as exc:
+          log.exception("Foreground agent completion publication failed")
+          status = canonical_result.execution.status
+          reason = canonical_result.execution.terminal_reason
+          if status != "succeeded":
+            happened = f"{status} ({reason})" if reason else status
+          else:
+            happened = "completed"
+          return None, {
+            "code": "agent_completion_materialization_failed",
+            "message": (
+              f"Foreground agent {happened} but its exact parent-readable result "
+              f"could not be published: {type(exc).__name__}"
+            ),
+          }
+      if canonical_result is not None:
+        _remember_foreground_spawn(
+          claim,
+          result=canonical_result,
+          envelope=(
+            result if isinstance(result, AgentCompletionEnvelope) else None
+          ),
+        )
+        spawn_kept = True
+      return result, error
+    finally:
+      if claim is not None and not spawn_kept:
+        pending_claim = claim
+        init_task = pending_claim.initialization_task
+        if init_task is not None and not init_task.done():
+          def _release_if_unstarted(_task: asyncio.Task[Any]) -> None:
+            if (
+              pending_claim.state == TaskState.PENDING
+              and pending_claim.asyncio_task is None
+            ):
+              _release_spawn_claim(runner, pending_claim)
+
+          init_task.add_done_callback(_release_if_unstarted)
+        else:
+          _release_spawn_claim(runner, pending_claim)
 
   def _build(scope: JobScope):
     async def _scoped_run_agent(tool_input: dict[str, Any], **kwargs: Any):
@@ -3553,7 +3892,6 @@ def make_resume_handler(
             research_file_id=admitted_research_file_id,
             ticker=admitted_ticker,
           ),
-          placement="in_process",
         ),
       )
       if isinstance(continuation, Refusal):
@@ -4033,6 +4371,7 @@ def make_resume_handler(
           job_spill_sink(
             runner._spill_dir_provider,
             successor_admitted_task.attempt.physical_task_id,
+            spill_read=_SPILL_READER_TOOL_ID in child_local,
           )
           if runner._spill_dir_provider is not None
           else None
@@ -4358,7 +4697,7 @@ def make_resume_handler(
     async def _scoped_resume(tool_input: dict[str, Any], **kwargs: Any):
       # Dispatch kwargs remain data: they cannot select the trusted host path.
       return await _execute_resume(
-        runner_ref[0], tool_input, caller=scope.caller,
+        scope.runner(), tool_input, caller=scope.caller,
         supplied_on_park=None, dispatch_kwargs=kwargs,
       )
     return _scoped_resume
@@ -4368,6 +4707,8 @@ def make_resume_handler(
     JobScope(
       caller=caller if caller is not None else _current_caller,
       spill_sink=lambda: None,
+      runner=lambda: runner_ref[0],
+      session=parent_session,
     ),
     _admitted_entry,
     _approved_entry,

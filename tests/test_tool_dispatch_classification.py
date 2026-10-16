@@ -35,6 +35,7 @@ from agent_gateway.tool_dispatch_declarations import (  # noqa: E402
   build_tool_dispatch_declarations,
 )
 from agent_gateway.tool_dispatch_source_identity import (  # noqa: E402
+  UnknownSourceIdentityDescriptor,
   read_source_identities,
 )
 from agent_gateway import tool_dispatch_declarations  # noqa: E402
@@ -519,6 +520,110 @@ def test_sandbox_computation_source_reader_preserves_order_and_current_gates() -
     read_source_identities(descriptor, result) == ()
     for result in non_sources
   )
+
+
+def test_statement_citation_reader_preserves_row_and_period_cell_order() -> None:
+  row_citation = {
+    "document_id": "edgar:0000320193-24-000001",
+    "source_url": "https://www.sec.gov/Archives/row.htm",
+  }
+  current_citation = {
+    "document_id": "edgar:0000320193-24-000002",
+    "source_url": "https://www.sec.gov/Archives/current.htm",
+  }
+  prior_citation = {
+    "document_id": "edgar:0000320193-23-000001",
+    "source_url": "https://www.sec.gov/Archives/prior.htm",
+  }
+  next_row_citation = {
+    "document_id": "edgar:0000320193-23-000002",
+    "source_url": "https://www.sec.gov/Archives/next.htm",
+  }
+  payload = {
+    "rows": [
+      {
+        "citation": row_citation,
+        "values": {
+          "2024": {"value": 120, "citation": current_citation},
+          "2023": {"value": 100, "citation": prior_citation},
+          "2022": {"value": 90},
+        },
+      },
+      {"citation": next_row_citation},
+      {"values": {"2024": {"value": 42}}},
+      None,
+    ],
+  }
+
+  assert read_source_identities({"kind": "statement_citations"}, payload) == tuple(
+    {"source_kind": "xbrl_fact", **citation}
+    for citation in (
+      row_citation, current_citation, prior_citation, next_row_citation
+    )
+  )
+
+
+def test_financials_citation_reader_preserves_current_and_prior_identities() -> None:
+  current_citation = {
+    "document_id": "edgar:0000320193-24-000001",
+    "source_url": "https://www.sec.gov/Archives/current.htm",
+  }
+  prior_citation = {
+    "document_id": "edgar:0000320193-23-000001",
+    "source_url": "https://www.sec.gov/Archives/prior.htm",
+  }
+  single_citation = {
+    "document_id": "edgar:0000320193-22-000001",
+    "source_url": "https://www.sec.gov/Archives/single.htm",
+  }
+  payload = {
+    "facts": [
+      {
+        "citation": current_citation,
+        "citations": {"current": current_citation, "prior": prior_citation},
+      },
+      {"citation": single_citation},
+      {"value": 42},
+      None,
+    ],
+  }
+
+  assert read_source_identities({"kind": "financials_citations"}, payload) == tuple(
+    {"source_kind": "xbrl_fact", **citation}
+    for citation in (current_citation, prior_citation, single_citation)
+  )
+
+
+@pytest.mark.parametrize(
+  ("kind", "payload"),
+  [
+    ("statement_citations", {"rows": [{"values": {"2024": {"value": 42}}}]}),
+    ("financials_citations", {"facts": [{"value": 42}]}),
+  ],
+)
+def test_statement_and_financials_readers_ignore_uncited_items(
+  kind: str, payload: dict[str, Any],
+) -> None:
+  assert read_source_identities({"kind": kind}, payload) == ()
+
+
+@pytest.mark.parametrize(
+  ("kind", "container"),
+  [
+    ("statement_citations", "rows"),
+    ("financials_citations", "facts"),
+  ],
+)
+@pytest.mark.parametrize("items", [None, {}, "not-a-list", (), []])
+def test_statement_and_financials_readers_require_list_containers(
+  kind: str, container: str, items: Any,
+) -> None:
+  assert read_source_identities({"kind": kind}, {container: items}) == ()
+
+
+def test_source_identity_reader_rejects_unknown_kind() -> None:
+  with pytest.raises(UnknownSourceIdentityDescriptor, match="unknown source_identity"):
+    read_source_identities({"kind": "unknown_citations"}, {"facts": []})
 
 
 

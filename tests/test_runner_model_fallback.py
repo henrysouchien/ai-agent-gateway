@@ -17,7 +17,6 @@ from typing import Any, Literal
 import pytest
 
 from agent_gateway import AgentRunner, EventLog, McpClientManager, ModelInfo, ModelProvider, ToolDispatcher
-import agent_gateway.providers.anthropic as anthropic_provider_module
 import agent_gateway.runner as gateway_runner
 from agent_gateway.admission import root_context
 from agent_gateway.auth import ProviderCredentialFailure
@@ -36,9 +35,9 @@ from agent_gateway.providers import StreamEvent
 from hank_contracts.commercial_work import WorkStartSpendLedger
 from agent_gateway.providers.anthropic_oauth import (
   ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES,
-  AnthropicCredentialPool,
   resolve_anthropic_credentials,
 )
+from agent_gateway.providers.anthropic_quota import Cooldown, record_cooldown
 from agent_gateway.runner_sub_agents import _build_child_event_log, _ChildActivity
 from agent_gateway.session import GatewaySession
 from agent_gateway.tool_dispatcher_helpers import ToolResult
@@ -48,6 +47,7 @@ from model_authority.bind import CapabilityBind
 from model_authority.binding import AuthContext, CredentialHandle, ModelSelectionIntent
 from model_authority.capabilities import CAPABILITY_IDS
 from model_authority.registry import ModelRegistryEntry, ProductModelRegistry
+from model_authority.rates import ModelRates, RateTable
 from model_authority.schema import SCHEMA
 from model_authority.selection import (
   CapabilityDefault,
@@ -440,22 +440,26 @@ def _fast_retries(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
-def anthropic_pool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AnthropicCredentialPool:
-  """The real Anthropic account pool over two accounts, isolated from this machine's."""
-  pool = AnthropicCredentialPool()
-  monkeypatch.setattr(anthropic_provider_module, "ANTHROPIC_CREDENTIAL_POOL", pool)
+def _isolated_anthropic_accounts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+  """The real Anthropic account pool over two accounts, isolated from this machine's.
+
+  Parked accounts are cooldown rows in the store's selection sidecar, so a private
+  store path isolates them too.
+  """
   for name in ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES:
     monkeypatch.delenv(name, raising=False)
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", _TOKEN_A)
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([_TOKEN_A, _TOKEN_B]))
   monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "oauth.json"))
-  return pool
 
 
-def _park(pool: AnthropicCredentialPool, token: str, *, until: float) -> None:
+def _park(token: str, *, until: float) -> None:
   member = resolve_anthropic_credentials().by_token(token)
   assert member is not None
-  pool.block(member.key, until=until)
+  record_cooldown(
+    member.sidecar_store_path, member.locator,
+    Cooldown(scope="shared", until=until, reason="rate_limit"),
+  )
 
 
 def _of_type(events: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
@@ -832,6 +836,69 @@ def test_a_chain_naming_a_model_twice_hops_once_per_entry_and_ends() -> None:
   assert len(_of_type(events, "error")) == 1
 
 
+def test_fallback_usage_names_the_table_that_priced_each_hop(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  world = _World()
+  world.down = {"anthropic"}
+  world.partial_outage = True
+  resolver = _resolver(world)
+  for model_key, version, price in (
+    (OPUS, "2026-10-07", 1.0),
+    (SOL, "2026-10-15", 2.0),
+  ):
+    execution = resolver.resolve(
+      "session.driver",
+      explicit_intent=ModelSelectionIntent(
+        model_key=model_key, effort=None, source="explicit_user",
+      ),
+    )
+    provider = execution.provider
+    table = RateTable(
+      version=version,
+      source="fallback-test",
+      providers={provider.name: {execution.bind.upstream_model: ModelRates(
+        display_name=model_key,
+        input_cost_per_mtok=price,
+        output_cost_per_mtok=price,
+        cache_read_cost_per_mtok=0.0,
+        cache_write_cost_per_mtok=0.0,
+      )}},
+      _path=tmp_path / f"{provider.name}.json",
+    )
+
+    def model_info(
+      model: str, *, provider: ModelProvider = provider, table: RateTable = table,
+    ) -> ModelInfo:
+      rates = table.lookup(provider.name, model)
+      return ModelInfo(
+        id=model, provider=provider.name, max_output_tokens=4096, context_window=200_000,
+        input_cost_per_mtok=rates.input_cost_per_mtok,
+        output_cost_per_mtok=rates.output_cost_per_mtok,
+      )
+
+    monkeypatch.setattr(provider, "_rate_table", table, raising=False)
+    monkeypatch.setattr(provider, "get_model_info", model_info)
+  turn = _Turn(resolver)
+  turn.runner._rate_table_version = "2026-10-07"
+
+  events = turn.run()
+
+  assert len(_of_type(events, "model_fallback")) == 1
+  primary_usage, fallback_usage = turn.usage[:-1], turn.usage[-1]
+  assert len(primary_usage) == 1 + gateway_runner.STREAM_RETRY_MAX
+  assert all(
+    event.provider == "anthropic"
+    and event.rate_table_version == "2026-10-07"
+    and event.cost_usd == pytest.approx(10 / 1_000_000)
+    for event in primary_usage
+  )
+  assert fallback_usage.provider == "codex"
+  assert fallback_usage.rate_table_version == "2026-10-15"
+  assert fallback_usage.cost_usd == pytest.approx(24 / 1_000_000)
+
+
 def test_partial_usage_is_billed_when_the_client_disconnects_at_budget_exhaustion() -> None:
   world = _World()
   world.down = {"anthropic"}
@@ -880,14 +947,12 @@ def test_frozen_tree_hops_along_its_capture_time_chain_after_a_policy_revision()
   assert hop is not None and hop.execution.bind.model_key == SOL
 
 
-def test_entry_whose_whole_account_pool_is_parked_is_skipped_and_recorded(
-  anthropic_pool: AnthropicCredentialPool,
-) -> None:
+def test_entry_whose_whole_account_pool_is_parked_is_skipped_and_recorded() -> None:
   world = _World()
   world.limited_models = {_UPSTREAM[OPUS]}
   world.refusing_tokens = {_TOKEN_A, _TOKEN_B}
   for token in (_TOKEN_A, _TOKEN_B):
-    _park(anthropic_pool, token, until=world.reset_at)
+    _park(token, until=world.reset_at)
   turn = _Turn(_resolver(world, chain=(FallbackEntry(model=SONNET), FallbackEntry(model=SOL))))
 
   events = turn.run()
@@ -899,14 +964,12 @@ def test_entry_whose_whole_account_pool_is_parked_is_skipped_and_recorded(
   assert not _of_type(events, "error")
 
 
-def test_a_chain_of_parked_entries_exhausts_and_fails_as_today(
-  anthropic_pool: AnthropicCredentialPool,
-) -> None:
+def test_a_chain_of_parked_entries_exhausts_and_fails_as_today() -> None:
   world = _World()
   world.limited_models = {_UPSTREAM[OPUS]}
   world.refusing_tokens = {_TOKEN_A, _TOKEN_B}
   for token in (_TOKEN_A, _TOKEN_B):
-    _park(anthropic_pool, token, until=world.reset_at)
+    _park(token, until=world.reset_at)
   turn = _Turn(_resolver(world, chain=(FallbackEntry(model=SONNET),)))
 
   events = turn.run()
@@ -918,14 +981,12 @@ def test_a_chain_of_parked_entries_exhausts_and_fails_as_today(
   assert turn.runner.capability_execution is turn.primary
 
 
-def test_entry_binds_the_account_whose_block_window_has_ended(
-  anthropic_pool: AnthropicCredentialPool,
-) -> None:
+def test_entry_binds_the_account_whose_block_window_has_ended() -> None:
   world = _World()
   world.limited_models = {_UPSTREAM[OPUS]}
   world.refusing_tokens = {_TOKEN_A}
-  _park(anthropic_pool, _TOKEN_A, until=world.reset_at)
-  _park(anthropic_pool, _TOKEN_B, until=time.time() - 1)
+  _park(_TOKEN_A, until=world.reset_at)
+  _park(_TOKEN_B, until=time.time() - 1)
   turn = _Turn(_resolver(world, chain=(FallbackEntry(model=SONNET),)))
 
   events = turn.run()

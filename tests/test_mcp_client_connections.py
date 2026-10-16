@@ -990,3 +990,45 @@ def test_stdio_stability_probe_rejects_closed_transport(reconnect_transport):
       await manager.shutdown()
 
   asyncio.run(scenario())
+
+
+def test_shutdown_completes_while_stdio_watch_awaits_receive_done():
+  async def scenario():
+    manager = McpClientManager(config_path=None)
+    receive_done = asyncio.Event()
+    eof = asyncio.Event()
+    eof.set()
+    server = mcp_client_module._ServerState(
+      name="stuck",
+      session=_ListedToolsSession(["alpha"]),
+      exit_contexts=[],
+      tool_definitions=[],
+      tool_names=set(),
+      config={"command": sys.executable, "type": "stdio"},
+      stdio_eof=eof,
+      stdio_receive_done=receive_done,
+    )
+    manager._servers["stuck"] = server
+    manager._started = True
+    parked = asyncio.Event()
+    real_wait = receive_done.wait
+
+    async def marked_wait():
+      parked.set()
+      return await real_wait()
+
+    receive_done.wait = marked_wait
+    watch = asyncio.create_task(manager._replace_stdio_server("stuck", server))
+    server.stdio_watch_task = watch
+    await asyncio.wait_for(parked.wait(), timeout=1.0)
+    assert manager._lock.locked() is False
+    assert watch.done() is False
+    started = time.monotonic()
+    await asyncio.wait_for(manager.shutdown(), timeout=1.0)
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.0
+    assert watch.done()
+    assert receive_done.is_set() is False
+    assert "stuck" not in manager._servers
+
+  asyncio.run(scenario())

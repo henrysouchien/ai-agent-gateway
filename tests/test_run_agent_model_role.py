@@ -42,7 +42,8 @@ def test_public_selection_schema() -> None:
   assert set(schema["properties"]["effort"]["enum"]) == {
     "none", "minimal", "low", "medium", "high", "xhigh", "max",
   }
-  assert not {"role", "effort"} & set(schema["required"])
+  assert not {"oneOf", "anyOf", "allOf"} & set(schema)
+  assert "required" not in schema
 
 
 def test_spawn_role_and_effort_reach_selection(tmp_path: Path) -> None:

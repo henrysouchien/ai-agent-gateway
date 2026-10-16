@@ -22,6 +22,7 @@ from agent_workflow_contracts import (
 from agent_workflow_contracts.models import (
   AdmittedContextWire,
   AdmittedResearchBinding,
+  SelectionProvenance,
 )
 from agent_gateway.admission import (
   AdmittedChildIdentity,
@@ -49,7 +50,7 @@ from agent_gateway.admission import (
   root_context,
   root_context_from_identity,
 )
-from agent_gateway.child_environment import RUN_BASH_ENVIRONMENT
+from agent_gateway.child_environment import AUTONOMOUS_CHILD_ENVIRONMENT, CHILD_ENVIRONMENT_ALLOWLISTS
 from agent_gateway.containment_settings import ContainmentSettings
 from agent_gateway.approval_route import (
   NO_APPROVAL_ROUTE,
@@ -104,9 +105,19 @@ _BIND = _resolver().select_bind("node.explore")
 class _PlainResolver:
   """A plain owner object: records reads, holds no state admit could write."""
 
-  def __init__(self) -> None:
+  def __init__(self, run_mode: str = "interactive", tier: str | None = None) -> None:
     self.reads: list[str] = []
     self.selections: list[tuple[str | None, str | None]] = []
+    self.run_mode = run_mode
+    self.trusted_channel = None
+    self.selection_policy = None
+    if tier is not None:
+      self.selection_policy = SimpleNamespace(capabilities={
+        "node.explore": SimpleNamespace(
+          default=SimpleNamespace(kind="tier", tier=tier),
+          by_channel={},
+        ),
+      })
 
   def select_bind(
     self, capability_id: str, *, role: str | None = None, effort: str | None = None,
@@ -114,7 +125,9 @@ class _PlainResolver:
   ) -> Any:
     self.reads.append(capability_id)
     self.selections.append((role, effort))
-    return _BIND
+    if self.run_mode == _BIND.run_mode:
+      return _BIND
+    return _BIND.model_copy(update={"run_mode": self.run_mode})
 
 
 def _owners(
@@ -123,7 +136,6 @@ def _owners(
   ceiling: frozenset[str] = frozenset({"web_search", "file_read"}),
   operation_routes: frozenset[str] = frozenset(),
   registered: frozenset[str] | None = None,
-  env_contract: str | None = None,
   env_names: frozenset[str] = frozenset(),
   children: tuple[str, ...] = (),
   containment: ContainmentSettings = ContainmentSettings(),
@@ -160,13 +172,11 @@ def _owners(
     capability_execution_resolver=resolver,
     session=_session(),
     route_registered=lambda tool_id: tool_id in known,
-    placement="in_process",
     containment=containment,
     resolve_tool_authority=lambda tool_ids: resolve_operation_authority(
       replace(declaration, tool_ceiling=tool_ids),
       catalog=catalog,
     ),
-    env_contract=env_contract,
     env_names=env_names,
   )
 
@@ -1025,7 +1035,7 @@ def test_sessionless_root_children_carry_the_control_plane_route() -> None:
   )
   result = admit(
     _request(), parent,
-    owners=replace(_owners(_resolver()), placement="local_stub"),
+    owners=_owners(_resolver()),
   )
   assert isinstance(result, AdmittedContext)
   assert result.approval_route is control
@@ -1055,15 +1065,70 @@ def test_admit_writes_nothing_to_its_inputs() -> None:
   assert resolver.reads == ["node.explore", "node.explore"]
 
 
-def test_admit_defaults_selection_provenance_role_when_unspecified() -> None:
-  resolver = _PlainResolver()
+def test_unspecified_role_records_slot_tier_not_parent_stamp() -> None:
+  resolver = _PlainResolver(tier="fast")
   owners = _owners(resolver)
-  parent = _root()
-  request = _request(role=None)
-  admitted = admit(request, parent, owners=owners)
-  assert isinstance(admitted, AdmittedContext)
-  assert admitted.wire.selection_provenance is not None
-  assert admitted.wire.selection_provenance.role == "default"
+  for parent_role in (None, "default"):
+    parent = _root(selection_provenance=SelectionProvenance(
+      role=parent_role, role_source="spawn", effort_source="spawn", preset=None,
+    ))
+    admitted = admit(_request(role=None), parent, owners=owners)
+    assert isinstance(admitted, AdmittedContext)
+    assert admitted.wire.selection_provenance is not None
+    assert admitted.wire.selection_provenance.role == "fast"
+  assert resolver.selections == [(None, None), (None, None)]
+
+
+def test_placement_and_env_follow_bind_run_mode(
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  interactive = admit(
+    _request(), _root(),
+    owners=_owners(
+      _PlainResolver("interactive"),
+      env_names=frozenset({"FMP_API_KEY", "GATEWAY_SECRET_TOKEN"}),
+    ),
+  )
+  assert isinstance(interactive, AdmittedContext)
+  assert interactive.wire.placement == "in_process"
+  assert interactive.wire.env_projection == ()
+
+  with caplog.at_level(logging.WARNING, logger="agent_gateway.admission"):
+    autonomous = admit(
+      _request(), _root(),
+      owners=_owners(
+        _PlainResolver("autonomous"),
+        env_names=frozenset({"FMP_API_KEY", "GATEWAY_SECRET_TOKEN"}),
+      ),
+    )
+  assert isinstance(autonomous, AdmittedContext)
+  assert autonomous.wire.placement == "local_stub"
+  assert autonomous.wire.env_projection == ("FMP_API_KEY",)
+  assert "FMP_API_KEY" in CHILD_ENVIRONMENT_ALLOWLISTS[AUTONOMOUS_CHILD_ENVIRONMENT]
+  assert any(
+    "env_name_unknown" in record.getMessage()
+    and "GATEWAY_SECRET_TOKEN" in record.getMessage()
+    for record in caplog.records
+  )
+
+  cron = admit(
+    _request(), _root(),
+    owners=_owners(
+      _PlainResolver("cron"),
+      env_names=frozenset({"FMP_API_KEY", "GATEWAY_SECRET_TOKEN"}),
+    ),
+  )
+  assert isinstance(cron, AdmittedContext)
+  assert cron.wire.placement == "local_stub"
+  assert cron.wire.env_projection == ("FMP_API_KEY",)
+
+  batch = admit(
+    _request(), _root(),
+    owners=_owners(_PlainResolver("batch"), env_names=frozenset({"FMP_API_KEY"})),
+  )
+  assert isinstance(batch, AdmittedContext)
+  assert batch.wire.placement == "in_process"
+  assert batch.wire.env_projection == ()
 
 # --- (d) unknown names are logged, never refused ------------------------
 
@@ -1099,14 +1164,13 @@ def test_env_name_outside_launch_contract_is_logged_and_omitted(
       _request(),
       _root(),
       owners=_owners(
-        _PlainResolver(),
-        env_contract=RUN_BASH_ENVIRONMENT,
-        env_names=frozenset({"PATH", "GATEWAY_SECRET_TOKEN"}),
+        _PlainResolver("autonomous"),
+        env_names=frozenset({"FMP_API_KEY", "GATEWAY_SECRET_TOKEN"}),
       ),
     )
 
   assert isinstance(result, AdmittedContext)
-  assert result.wire.env_projection == ("PATH",)
+  assert result.wire.env_projection == ("FMP_API_KEY",)
   assert any(
     "env_name_unknown" in record.getMessage()
     and "GATEWAY_SECRET_TOKEN" in record.getMessage()
@@ -1148,7 +1212,7 @@ def _continuation_task(
   [
     ("continuation", "in_process", ()),
     ("revive", "in_process", ()),
-    ("placement_lost", "local_stub", ("PATH",)),
+    ("placement_lost", "in_process", ()),
   ],
 )
 def test_continuation_relocates_without_rebinding_or_regranting(
@@ -1169,8 +1233,6 @@ def test_continuation_relocates_without_rebinding_or_regranting(
     owners=ContinuationOwners(
       task=task,
       research_binding=original.research_binding,
-      placement="local_stub",
-      env_contract=RUN_BASH_ENVIRONMENT,
       env_names=frozenset({"PATH", "GATEWAY_SECRET_TOKEN"}),
     ),
   )
@@ -1191,6 +1253,48 @@ def test_continuation_relocates_without_rebinding_or_regranting(
   )
   assert tool_ids == local_ids == frozenset({"file_read", "web_search"})
   assert mcp_scope == {}
+
+
+def test_placement_lost_derives_local_stub_from_autonomous_bind(
+  caplog: pytest.LogCaptureFixture,
+  owner_session_host_policy: Any,
+) -> None:
+  owner_session_host_policy.get_local_tool_effect = lambda _name: "read"
+  task = _continuation_task(caplog, depth=9)
+  assert task.model_bind is not None
+  bind = task.model_bind.model_copy(update={"run_mode": "autonomous"})
+  payload = task.model_dump(mode="json")
+  payload["model_bind"] = bind.model_dump(mode="json")
+  payload["model_bind_digest"] = sha256_digest(bind)
+  payload.pop("admitted_task_digest")
+  seal_admitted_task_payload(payload)
+  task = AdmittedTask.model_validate(payload)
+  assert task.execution_snapshot is not None
+  original = task.execution_snapshot.admitted_context
+  assert original is not None and original.placement == "in_process"
+  parent = _root(depth=7, tool_ids=frozenset({"write_record"}))
+  names = frozenset({"FMP_API_KEY", "GATEWAY_SECRET_TOKEN"})
+  kept = admit(
+    ContinueRequest(task.attempt.physical_task_id, cause="continuation"),
+    parent,
+    owners=ContinuationOwners(
+      task=task, research_binding=original.research_binding, env_names=names,
+    ),
+  )
+  assert isinstance(kept, AdmittedContext)
+  assert kept.wire.placement == "in_process"
+  assert kept.wire.env_projection == ()
+  refreshed = admit(
+    ContinueRequest(task.attempt.physical_task_id, cause="placement_lost"),
+    parent,
+    owners=ContinuationOwners(
+      task=task, research_binding=original.research_binding, env_names=names,
+    ),
+  )
+  assert isinstance(refreshed, AdmittedContext)
+  assert refreshed.wire.placement == "local_stub"
+  assert refreshed.wire.env_projection == ("FMP_API_KEY",)
+
 
 
 @pytest.mark.parametrize("cause", ["continuation", "revive", "placement_lost"])
@@ -1315,8 +1419,6 @@ def test_continuation_preserves_exclusions_for_future_descendants(
     owners=ContinuationOwners(
       task=task,
       research_binding=admitted.wire.research_binding,
-      placement="local_stub",
-      env_contract=RUN_BASH_ENVIRONMENT,
       env_names=frozenset({"PATH"}),
     ),
   )

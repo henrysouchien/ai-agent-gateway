@@ -10,7 +10,7 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Any, Awaitable, Callable, ContextManager, Mapping, Protocol, runtime_checkable
+from typing import Any, Awaitable, Callable, ContextManager, Mapping, Protocol, cast, runtime_checkable
 
 from .autonomous_capability_handoff import AutonomousCapabilityBindingResolver
 from .autonomous_approval_channel import (
@@ -87,6 +87,8 @@ from .skill_limits import AutonomousSkillAdmissionPolicyResolver
 from .ui_blocks_metrics import record as record_package_counter
 from .session_recap import fold_run_measurements
 from .named_refusal import NamedRefusal
+from .approval_continuation import ChildContinueOutcome, ContinueStatus
+from .approval_store import ApprovalExecutableBindingError, SQLiteApprovalStore
 
 _STATUS_TAIL_LINES = 40
 _POST_EXIT_SETTLE_SECONDS = 5.0
@@ -737,6 +739,10 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
       return "interrupted"
     if record.state == "blocked":
       return "blocked"
+    if record.state == "awaiting_approval":
+      return "awaiting_approval"
+    if record.state == "continued":
+      return "continued"
     if record.state in {"completed", "finished"}:
       return "completed"
     if record.state == "failed":
@@ -867,6 +873,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     from .control_plane.autonomous_approval_delivery import (
       admit_delegated_executable_capture,
       create_delegated_autonomous_approval,
+      record_continued_executable_result,
     )
 
     pending_captures: dict[tuple[str, str, str], Any] = {}
@@ -886,6 +893,19 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
         else:
           result = await asyncio.to_thread(endpoint.receive_next)
         if isinstance(result, AutonomousPrivateExecutableCapture):
+          completed_result = result.payload.get("completed_executable_result")
+          if completed_result is not None:
+            # The successor ran its parent-claimed call; the parent alone
+            # records the exact result in its ledger.
+            try:
+              await record_continued_executable_result(
+                store=self._approval_store,
+                record=record,
+                completed=completed_result,
+              )
+            finally:
+              result.payload.clear()
+            continue
           try:
             capture = admit_delegated_executable_capture(record, result.payload)
           finally:
@@ -956,6 +976,9 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
                   event=request_event,
                   private_executable_capture=private_capture,
                 )
+                if record.approval_continuation is not None:
+                  if not self._write_task_manifest(record, checked=True):
+                    raise RuntimeError("failed to persist autonomous approval continuation")
             finally:
               del private_capture
           # The child's recap carries its own log's counts; the parent's join
@@ -1623,7 +1646,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
         and not self._has_terminal_run_state(record, terminal_state)
       ):
         await self._publish_run_state(record, terminal_state)
-      if terminal_state != "running":
+      if record.state in AUTONOMOUS_TERMINAL_STATES:
         await self._cleanup_run_buffer(record)
 
   def status(self, task_id: str) -> dict[str, Any]:
@@ -1796,6 +1819,106 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
         "message_id": resolved_message_id,
         "delivery_status": "delivered",
       }
+
+  async def continue_approval(
+    self,
+    *,
+    approval_id: str,
+    tenant_storage_id: str,
+  ) -> ChildContinueOutcome | None:
+    """Relaunch a parked process from its captured call, never its old prompt."""
+    store = cast(SQLiteApprovalStore | None, self._approval_store)
+    if store is None:
+      return None
+    located = await store._locate_request_for_decision(
+      approval_id=approval_id, tenant_storage_id=tenant_storage_id,
+    )
+    if located is None:
+      return None
+    request, locator, nonce = located
+    source = self._tasks.get(request.session_id) if request.session_id is not None else None
+    if source is None or source.approval_continuation is None:
+      return None
+    continuation = source.approval_continuation
+    if continuation["approval_id"] != approval_id:
+      return None
+    job_id, tool_call_id = locator.job_id, locator.tool_call_id
+    def outcome(status: ContinueStatus) -> ChildContinueOutcome:
+      return ChildContinueOutcome(status, job_id, tool_call_id)
+    if tenant_storage_id != _record_owner_user_id(source):
+      return outcome("tenant_mismatch")
+    assert job_id is not None and nonce is not None
+    if source.state == "starting":
+      await source.launch_ready.wait()
+    async with source.resume_lock:
+      # One decision launches one successor, whatever state that successor has
+      # since reached (it may itself have parked on a later ask or been cancelled).
+      if any(
+        task.resumed_from == source.control_run_id
+        and task.resumed_approval_id == approval_id
+        for task in self._tasks.values()
+      ):
+        return outcome("already_delivered")
+      try:
+        binding, decision = await store._read_executable_binding_for_executor(
+          job_id=job_id, tool_call_id=tool_call_id, nonce=nonce,
+          tenant_storage_id=tenant_storage_id,
+        )
+        completed = await store._read_completed_executable_result_for_executor(
+          binding=binding,
+        )
+      except ApprovalExecutableBindingError as exc:
+        return outcome(
+          "outcome_unknown"
+          if exc.code == "execution_outcome_unknown" else "not_restorable"
+        )
+      if completed is not None:
+        return outcome("already_delivered")
+      # A card can be answered immediately after publication, while the child
+      # is still flushing its terminal stream. Its reaper owns process release.
+      if source.reaper_task is not None and not source.reaper_task.done():
+        await asyncio.shield(source.reaper_task)
+      if source.state != "awaiting_approval":
+        return outcome("not_restorable")
+      from .control_plane.autonomous_approval_delivery import (
+        decided_approval_continuation,
+      )
+
+      signed = decided_approval_continuation(
+        parked=continuation, binding=binding, decision=decision,
+      )
+      if isinstance(signed, str):
+        return outcome(signed)
+      try:
+        started = await self.start(
+          profile=source.profile, mode=source.mode,
+          user_id=source.raw_user_id or source.user_id,
+          user_email=source.user_email, role=source.role,
+          owner_user_id=tenant_storage_id, user_slug=source.user_slug,
+          risk_user_id=source.risk_user_id, user_aliases=source.user_aliases,
+          identity_status=source.identity_status,
+          task=source.task, skill=source.skill, pack=source.pack,
+          deliver=source.deliver, context=source.context, ticker=source.ticker,
+          research_file_id=source.research_file_id, channel=source.channel,
+          dispatch_scope=source.dispatch_scope,
+          resumed_from=source.control_run_id,
+          approval_continuation=signed,
+        )
+      except ApprovalExecutableBindingError as exc:
+        # start() refuses when its claim finds the call already attempted or
+        # its decision moved; no successor was left running.
+        return outcome(
+          "outcome_unknown"
+          if exc.code == "execution_outcome_unknown" else "not_restorable"
+        )
+      source.resumed_as.append(started["run_id"])
+      source.state = "continued"
+      source.completed_at = time.time()
+      if not self._commit_terminal_manifest_or_fence(source):
+        raise RuntimeError("failed to persist autonomous approval successor")
+      await self._publish_run_state(source, "continued")
+      await self._cleanup_run_buffer(source)
+      return outcome("delivered")
 
   async def send_approval_decision(
     self,
@@ -2010,6 +2133,16 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
 
   async def cancel(self, task_id: str) -> dict[str, Any]:
     record = self._get(task_id)
+    async with record.resume_lock:
+      if record.state == "awaiting_approval":
+        record.cancellation_requested = True
+        record.state = "killed"
+        record.error = "Process terminated by user"
+        record.completed_at = time.time()
+        if self._commit_terminal_manifest_or_fence(record):
+          await self._publish_run_state(record, "cancelled")
+          await self._cleanup_run_buffer(record)
+        return self._status_payload(record)
     if self._is_active_process_state(record):
       if record.event_channel_ack_started:
         if record.reaper_task is None:

@@ -607,6 +607,8 @@ _PROVIDER_ERROR_PROJECTION_FIELDS = (
   "rate_limit_7d_status",
   "rate_limit_7d_utilization",
   "rate_limit_7d_reset",
+  "rate_limit_unified_status",
+  "rate_limit_unified_reset",
   "retry_after",
 )
 
@@ -804,6 +806,7 @@ class TerminalClosureDecision:
   terminal: Dict[str, Any] | None = None
   skill_result: Dict[str, Any] | None = None
   skill_effect: TopLevelSkillCompletionEffectPlan | None = None
+  interruption: tuple[str, Dict[str, Any] | None] | None = None
 
   def require_named_skill_closure(self) -> NamedSkillClosure:
     """Return the canonical named-skill pair and its completion effect."""
@@ -860,6 +863,10 @@ def terminal_closure_decision(
   skill_result: Dict[str, Any] | None = None,
   skill_effect: TopLevelSkillCompletionEffectPlan | None = None,
   approval_park: ApprovalPark | None = None,
+  role: str = "",
+  shutdown_reason: str | None = None,
+  shutdown_extra_fields: Dict[str, Any] | None = None,
+  staged_interruption: tuple[str, Dict[str, Any] | None] | None = None,
 ) -> TerminalClosureDecision:
   """Decide the canonical closure, including an unprepared escaping exception."""
   cause = run_error
@@ -957,8 +964,38 @@ def terminal_closure_decision(
       skill_effect = TopLevelSkillCompletionEffectPlan.noop()
     if terminal is not None:
       terminal = {**terminal, **skill_lifecycle.identity_fields()}
+  if persistence_error is not None:
+    interruption: tuple[str, Dict[str, Any] | None] | None = (
+      reason,
+      staged_interruption[1] if staged_interruption is not None else None,
+    )
+  else:
+    built = staged_interruption
+    if run_error is not None and shutdown_reason is not None:
+      built = (
+        (
+          server_terminal_cause,
+          {"server_terminal_cause": server_terminal_cause},
+        )
+        if server_terminal_cause is not None
+        else run_interrupted_reason(
+          run_error=run_error,
+          role=role,
+          shutdown_reason=shutdown_reason,
+          shutdown_extra_fields=shutdown_extra_fields or {},
+        )
+      )
+    elif disposition == "error" and built is None:
+      built = (reason, None)
+    if built is None:
+      interruption = None
+    elif disposition == "error":
+      interruption = (reason, built[1])
+    else:
+      interruption = (built[0], built[1])
   return TerminalClosureDecision(
     disposition, reason, cause, terminal, skill_result, skill_effect,
+    interruption,
   )
 
 

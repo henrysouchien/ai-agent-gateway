@@ -384,7 +384,9 @@ def test_registered_durable_approval_receives_exact_policy_redaction(
       return {
         "approved": True,
         "tool_input": kwargs["tool_input"],
-        "request": SimpleNamespace(state="approved"),
+        "request": SimpleNamespace(
+          state="approved", approval_id="approval-1", decision_reason=None,
+        ),
       }
 
   def redact(_reference: Any, call: Any) -> RedactionResult:
@@ -565,7 +567,9 @@ def test_registered_native_mcp_durable_approval_uses_manager_redaction(
       return {
         "approved": True,
         "tool_input": kwargs["tool_input"],
-        "request": SimpleNamespace(state="approved"),
+        "request": SimpleNamespace(
+          state="approved", approval_id="approval-1", decision_reason=None,
+        ),
       }
 
   class _RegisteredMcp(_NoMcp):

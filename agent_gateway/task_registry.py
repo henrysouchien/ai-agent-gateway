@@ -58,6 +58,7 @@ class TaskState(Enum):
 
 
 TerminationIntent = Literal["cancelled", "killed"]
+InterruptionReason = Literal["user_interrupted", "parent_interrupted"]
 # ``ContinueRequest.cause`` in ``admission.py``; that module names no alias.
 ContinueCause = Literal["continuation", "revive", "placement_lost"]
 CompletionPersistenceState = Literal[
@@ -774,6 +775,18 @@ class TaskEntry:
   task_id: str
   task_type: str
   agent_name: str | None = None
+  # Exact admitted request identity, retained only by the spawning runner.
+  # Rebuilt entries have no owner and cannot satisfy same-runner reuse.
+  spawn_owner_runner_id: str | None = field(default=None, compare=False, repr=False)
+  spawn_task: str | None = field(default=None, compare=False, repr=False)
+  spawn_ticker: str | None = field(default=None, compare=False, repr=False)
+  spawn_research_file_id: int | None = field(default=None, compare=False, repr=False)
+  spawn_handles: tuple[str, ...] | None = field(default=None, compare=False, repr=False)
+  spawn_role: str | None = field(default=None, compare=False, repr=False)
+  spawn_effort: str | None = field(default=None, compare=False, repr=False)
+  spawn_settled: asyncio.Event = field(
+    default_factory=asyncio.Event, compare=False, repr=False,
+  )
   state: TaskState = TaskState.PENDING
   asyncio_task: asyncio.Task[Any] | None = None
   started_at: float = field(default_factory=time.time)
@@ -794,6 +807,7 @@ class TaskEntry:
   original_task_id: str | None = None
   reconstructed_from_log: bool = False
   termination_intent: TerminationIntent | None = None
+  interruption_reason: InterruptionReason | None = None
   registration_persistence_state: CompletionPersistenceState = "not_started"
   registration_persistence_error: str | None = None
   initialization_task: asyncio.Task[Any] | None = field(
@@ -1049,6 +1063,7 @@ _ADMISSION_SLOT_STATES = frozenset({TaskState.PENDING, TaskState.RUNNING})
 _ROSTER_NAME_STATES = frozenset({TaskState.RUNNING, TaskState.IDLE, TaskState.PARKED})
 # A park is not terminal, but the owner must learn of it to continue the job.
 _NOTIFYING_STATES = frozenset({*_TERMINAL_STATES, TaskState.PARKED})
+_IN_FLIGHT_SPAWN_STATES = frozenset({TaskState.PENDING, TaskState.RUNNING})
 
 
 class NotificationQueue:
@@ -2081,6 +2096,92 @@ class TaskRegistry:
       tasks = (entry for entry in tasks if entry.state == state)
     return sorted(tasks, key=lambda entry: entry.started_at)
 
+  def prior_child_spawn(
+    self,
+    *,
+    agent_name: str,
+    owner_runner_id: str,
+    spawn_task: str,
+    spawn_ticker: str | None,
+    spawn_research_file_id: int | None,
+    spawn_handles: tuple[str, ...],
+    spawn_role: str | None,
+    spawn_effort: str | None,
+  ) -> TaskEntry | None:
+    """Find a matching live or successful child of this exact parent runner.
+
+    Reconstructed session history never grants reuse. In-flight matches win;
+    otherwise the latest completed, successful canonical result wins.
+    """
+
+    if not owner_runner_id or not isinstance(agent_name, str) or not agent_name:
+      return None
+    if not isinstance(spawn_task, str):
+      return None
+    if not isinstance(spawn_handles, tuple):
+      return None
+    wanted = (
+      spawn_task, spawn_ticker, spawn_research_file_id,
+      spawn_handles, spawn_role, spawn_effort,
+    )
+    in_flight: TaskEntry | None = None
+    terminal: TaskEntry | None = None
+    for entry in self._tasks.values():
+      if entry.task_id in self._superseded_task_ids:
+        continue
+      if entry.agent_name != agent_name:
+        continue
+      if entry.spawn_owner_runner_id != owner_runner_id:
+        continue
+      if (
+        entry.spawn_task, entry.spawn_ticker, entry.spawn_research_file_id,
+        entry.spawn_handles, entry.spawn_role, entry.spawn_effort,
+      ) != wanted:
+        continue
+      if entry.state in _IN_FLIGHT_SPAWN_STATES:
+        if in_flight is None or entry.started_at >= in_flight.started_at:
+          in_flight = entry
+      elif (
+        entry.state == TaskState.COMPLETED
+        and entry.task_result is not None
+        and entry.task_result.execution.status == "succeeded"
+      ):
+        if terminal is None or entry.started_at >= terminal.started_at:
+          terminal = entry
+    return in_flight or terminal
+
+  def interrupt(
+    self,
+    task_id: str,
+    *,
+    reason: InterruptionReason = "parent_interrupted",
+  ) -> bool:
+    """Interrupt one live direct child, retaining its continuation authority.
+
+    Registry membership is the ownership boundary: never search the roster or
+    another session's journal for a control target. Settlement remains with the
+    worker's durable finalizer, not this synchronous cancellation request.
+    """
+    entry = self._tasks.get(task_id)
+    if (
+      entry is None
+      or entry.state != TaskState.RUNNING
+      or entry.asyncio_task is None
+      or entry.asyncio_task.done()
+      or entry.pending_final_state is not None
+      or entry.termination_intent is not None
+      or entry.interruption_reason is not None
+    ):
+      return False
+    if reason not in {"user_interrupted", "parent_interrupted"}:
+      raise ValueError(f"Unsupported interruption reason: {reason}")
+    entry.interruption_reason = reason
+    # A just-registered worker may not have entered its cancellation handler
+    # yet. Queue cancellation behind its first step so that it can durably
+    # settle even when the parent interrupts immediately after spawning.
+    entry.asyncio_task.get_loop().call_soon(entry.asyncio_task.cancel, reason)
+    return True
+
   def kill(
     self,
     task_id: str,
@@ -2392,6 +2493,13 @@ class TaskRegistry:
           termination_intent = "cancelled"
         elif terminal_reason == "killed":
           termination_intent = "killed"
+      interruption_reason: InterruptionReason | None = None
+      if state == TaskState.INTERRUPTED and task_result is not None:
+        reason = task_result.execution.terminal_reason
+        if reason == "user_interrupted":
+          interruption_reason = "user_interrupted"
+        elif reason == "parent_interrupted":
+          interruption_reason = "parent_interrupted"
 
       required_skill_result_settled = False
       lifecycle = metadata.get("required_skill_lifecycle")
@@ -2562,6 +2670,7 @@ class TaskRegistry:
         original_task_id=registered.get("original_task_id"),
         reconstructed_from_log=True,
         termination_intent=termination_intent,
+        interruption_reason=interruption_reason,
         registration_persistence_state="committed",
         completion_persistence_state=(
           "committed"

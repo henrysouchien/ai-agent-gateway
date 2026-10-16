@@ -3053,14 +3053,24 @@ class McpClientManager:
           return current
         config = server.config
         assert config is not None
-        if (
+        receive_done = server.stdio_receive_done
+        wait_for_receive = (
           server.stdio_eof is not None
           and server.stdio_eof.is_set()
-          and server.stdio_receive_done is not None
-        ):
-          # EOF wakes this owner before ClientSession has delivered connection
-          # errors. Closing its task group now would strand the pending calls.
-          await server.stdio_receive_done.wait()
+          and receive_done is not None
+          and not receive_done.is_set()
+        )
+      if wait_for_receive:
+        # EOF wakes this owner before ClientSession has delivered connection
+        # errors. Closing its task group now would strand the pending calls.
+        # The manager lock stays free across this wait: shutdown retires the
+        # watch task, and a wait that kept the lock would deadlock that retire.
+        assert receive_done is not None
+        await receive_done.wait()
+      async with self._lock:
+        current = self._servers.get(server_name)
+        if current is not server:
+          return current
         await self._close_server(server)
       replacement = await self._connect_stdio_with_retries(server_name, config)
       try:
@@ -3090,7 +3100,26 @@ class McpClientManager:
       await asyncio.gather(watch, return_exceptions=True)
     await self._close_contexts(server.exit_contexts)
 
+  async def _retire_stdio_watch_tasks(self) -> None:
+    # Taken before self._lock. A watch in _replace_stdio_server awaits
+    # stdio_receive_done; cancelling it while this method waits on the lock
+    # the watch used to hold never runs.
+    watches = [
+      server.stdio_watch_task
+      for server in list(self._servers.values())
+      if (
+        server.stdio_watch_task is not None
+        and server.stdio_watch_task is not asyncio.current_task()
+        and not server.stdio_watch_task.done()
+      )
+    ]
+    for watch in watches:
+      watch.cancel()
+    if watches:
+      await asyncio.gather(*watches, return_exceptions=True)
+
   async def shutdown(self) -> None:
+    await self._retire_stdio_watch_tasks()
     async with self._lock:
       self._registered_mcp_descriptors_by_exposed_name = MappingProxyType({})
       if not self._started and not self._servers:

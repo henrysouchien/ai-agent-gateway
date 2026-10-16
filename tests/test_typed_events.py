@@ -555,7 +555,7 @@ def test_tool_approval_decided_event_supports_all_decision_sources_and_outcomes(
     }
     event = event_from_dict(payload)
     assert isinstance(event, ToolApprovalDecidedEvent)
-    assert event_to_dict(event) == payload
+    assert event_to_dict(event) == {**payload, "approval_id": None, "decision_reason": None}
 
   for outcome in outcomes:
     decision_source = "approval_timeout" if outcome == "timeout" else "user_denied" if outcome == "denied" else "user_approved"

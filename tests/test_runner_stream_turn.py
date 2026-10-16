@@ -1,6 +1,7 @@
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,13 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import AgentRunner, ToolDispatcher  # noqa: E402
+from agent_gateway.agent_session_log import AgentSessionLog  # noqa: E402
+from agent_gateway.auth import ProviderCredentialFailure  # noqa: E402
+from agent_gateway.capability_execution import (  # noqa: E402
+  CapabilityExecutionResolver,
+  ModelFallbackHop,
+)
+from agent_gateway.event_log import EventLog  # noqa: E402
 from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
 from agent_gateway.mcp_client import McpClientManager  # noqa: E402
 from agent_gateway.multi_user.billing import UsageTotals  # noqa: E402
@@ -20,8 +28,10 @@ from model_authority.thinking import ThinkingLevel
 from agent_gateway.providers.base import StreamEvent  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.runner_stream_turn import RunnerStreamTurnMixin  # noqa: E402
+from agent_gateway.session import GatewaySession  # noqa: E402
 from model_authority.thinking import EffortResolution
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
+  stub_bound_capability_execution,
   stub_runner_capability_execution,
 )
 
@@ -992,3 +1002,433 @@ def test_refusal_with_running_background_child_waits_for_delivery_like_end_turn(
   assert [
     event["stop_reason"] for event in durable_events if event.get("type") == "assistant_message"
   ] == ["refusal", "end_turn"]
+
+
+# --- Credential preparation at episode boundaries ----------------------------
+
+
+class _Quota429(RuntimeError):
+  """A 429 that carries quota evidence: the account is parked until its reset."""
+
+
+class _Concurrency429(RuntimeError):
+  """A 429 with no quota evidence: transient, the account is not parked."""
+
+
+class _Transient(RuntimeError):
+  pass
+
+
+def _answer(text: str = "done") -> list[StreamEvent]:
+  return [
+    StreamEvent(type="message_start", input_tokens=10),
+    StreamEvent(type="text_delta", text=text),
+    StreamEvent(type="text_end", raw_block={"type": "text", "text": text}),
+    StreamEvent(type="usage_update", output_tokens=2),
+    StreamEvent(type="message_end", stop_reason="end_turn"),
+  ]
+
+
+def _tool_turn(tool_id: str, tool_name: str) -> list[StreamEvent]:
+  return [
+    StreamEvent(type="message_start", input_tokens=10),
+    StreamEvent(type="tool_use_start", tool_id=tool_id, tool_name=tool_name),
+    StreamEvent(
+      type="tool_use_end",
+      tool_id=tool_id,
+      tool_name=tool_name,
+      tool_input={},
+      raw_block={"type": "tool_use", "id": tool_id, "name": tool_name, "input": {}},
+    ),
+    StreamEvent(type="message_end", stop_reason="tool_use"),
+  ]
+
+
+class _AccountProvider(_RefusingProvider):
+  """An account pool double: ``prepare_credential`` ranks the unparked accounts.
+
+  Each request consumes the next scripted outcome: an exception to raise, a
+  list of events to stream, or ``(events, exception)`` for a stream that fails
+  after delivering ``events``. The client is the account key it was built for.
+  """
+
+  def __init__(self, accounts: tuple[str, ...], script: list[object], *, name: str = "stub") -> None:
+    super().__init__(("end_turn",))
+    self.name = name
+    self.accounts = accounts
+    self.script = script
+    self.parked: dict[str, float] = {}
+    # (account key in the config handed to prepare, model, session id)
+    self.prepared: list[tuple[str, str, str | None]] = []
+    self.clients: list[str] = []
+    self.streamed: list[str] = []
+
+  def _first_usable(self) -> str | None:
+    return next((key for key in self.accounts if key not in self.parked), None)
+
+  async def prepare_credential(self, config, *, model, session_id) -> dict[str, object] | None:
+    self.prepared.append((str(config["api_key"]), model, session_id))
+    usable = self._first_usable() or self.accounts[0]
+    return {
+      "api_key": usable,
+      "credential_source": {"generation_ref": f"anthropic-generation-{usable}"},
+    }
+
+  def create_client(self, config, *, timeout=None):
+    _ = timeout
+    self.clients.append(str(config["api_key"]))
+    return str(config["api_key"])
+
+  def classify_credential_failure(self, exc):
+    if isinstance(exc, _Quota429):
+      return ProviderCredentialFailure(
+        provider=self.name, kind="rate_limit", status_code=429, reset_at=time.time() + 3600,
+      )
+    return None
+
+  def next_credential(self, config, failure):
+    self.parked[str(config["api_key"])] = failure.reset_at or 0.0
+    usable = self._first_usable()
+    return None if usable is None else {
+      "api_key": usable,
+      "credential_source": {"generation_ref": f"anthropic-generation-{usable}"},
+    }
+
+  def is_retryable_error(self, exc):
+    return isinstance(exc, (_Quota429, _Concurrency429, _Transient))
+
+  async def stream(self, client, params):
+    _ = params
+    self.streamed.append(client)
+    outcome = self.script.pop(0)
+    if isinstance(outcome, BaseException):
+      raise outcome
+    if isinstance(outcome, tuple):
+      events, failure = outcome
+      for event in events:
+        yield event
+      raise failure
+    for event in outcome:  # type: ignore[attr-defined]
+      yield event
+
+
+class _NoPrepareProvider(_AccountProvider):
+  async def prepare_credential(self, config, *, model, session_id):
+    self.prepared.append((str(config["api_key"]), model, session_id))
+    return None
+
+
+def _account_execution(provider: ModelProvider, api_key: str, model: str = "claude-opus-5"):
+  return stub_bound_capability_execution(
+    provider=provider, model=model, effort="none", auth_config={"api_key": api_key},
+  )
+
+
+def _account_runner(
+  execution,
+  *,
+  session_id: str = "sess-pool",
+  gateway_session: GatewaySession | None = None,
+  agent_session_log: AgentSessionLog | None = None,
+  handlers: dict | None = None,
+  tool_names: tuple[str, ...] = (),
+) -> AgentRunner:
+  event_log = EventLog()
+  return AgentRunner(
+    event_log=event_log,
+    dispatcher=ToolDispatcher(
+      capability_bind=execution.bind,
+      mcp_client=McpClientManager(config_path=None),
+      local_tool_handlers=handlers or {},
+      event_log=event_log,
+      session_id=session_id or "sess-pool",
+      role="owner",
+    ),
+    session_id=session_id,
+    gateway_session=gateway_session,
+    agent_session_log=agent_session_log,
+    capability_execution=execution,
+    get_tool_definitions=lambda: [
+      {"name": name, "description": "", "input_schema": {"type": "object", "properties": {}}}
+      for name in tool_names
+    ],
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+
+def _logged(runner: AgentRunner) -> list[dict[str, object]]:
+  return [entry.event for entry in runner._log.entries]
+
+
+def _types(events: list[dict[str, object]], *wanted: str) -> list[object]:
+  return [event["type"] for event in events if event["type"] in wanted]
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_delay(monkeypatch) -> None:
+  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0)
+
+
+@pytest.mark.parametrize(
+  ("session_id", "expected_session_id"),
+  [("sess-pool", "sess-pool"), ("", None)],
+)
+def test_prepare_runs_before_the_first_client_but_not_same_model_retries(
+  session_id, expected_session_id,
+) -> None:
+  provider = _AccountProvider(("A1",), [_Transient("transient"), _answer()])
+  runner = _account_runner(_account_execution(provider, "A0"), session_id=session_id)
+
+  asyncio.run(runner.run(messages=[{"role": "user", "content": "go"}]))
+
+  # A same-model retry keeps the first preparation's binding instead of
+  # reranking the pool at each client build.
+  assert provider.prepared == [
+    ("A0", "claude-opus-5", expected_session_id),
+  ]
+  assert provider.clients == ["A1", "A1"]
+  assert runner._auth_config["api_key"] == "A1"
+  assert _types(_logged(runner), "error") == []
+
+
+def test_resumed_runner_prepares_with_the_durable_log_identity(tmp_path: Path) -> None:
+  log = AgentSessionLog(tmp_path / "original-conversation.jsonl")
+  provider = _AccountProvider(("A",), [])
+  for runtime_id in ("original-conversation", "resumed-runtime"):
+    session = GatewaySession(
+      session_id=runtime_id, api_key_hash="hash", created_at=1, expires_at=2,
+      user_id="alice", tenant_id="test-tenant",
+      resume_log_path=tmp_path / "stale-session-log.jsonl",
+    )
+    runner = _account_runner(
+      _account_execution(provider, "A"), session_id=runtime_id,
+      gateway_session=session, agent_session_log=log,
+    )
+    asyncio.run(runner._prepare_credential(dict(runner._auth_config)))
+
+  assert [call[2] for call in provider.prepared] == [
+    "original-conversation", "original-conversation",
+  ]
+
+
+def test_sub_agent_prepares_with_its_own_identity_despite_sharing_the_parent_log(
+  tmp_path: Path,
+) -> None:
+  provider = _AccountProvider(("A",), [])
+  runner = _account_runner(
+    _account_execution(provider, "A"), session_id="sub1:parent-conversation",
+    agent_session_log=AgentSessionLog(tmp_path / "parent-conversation.jsonl"),
+  )
+
+  asyncio.run(runner._prepare_credential(dict(runner._auth_config)))
+
+  assert [call[2] for call in provider.prepared] == ["sub1:parent-conversation"]
+
+
+def test_compaction_and_prepare_share_the_resumed_conversation_identity(
+  monkeypatch, tmp_path: Path,
+) -> None:
+  provider = _AccountProvider(("A",), [_answer()])
+  session = GatewaySession(
+    session_id="resumed-runtime", api_key_hash="hash", created_at=1, expires_at=2,
+    user_id="alice", tenant_id="test-tenant",
+    resume_log_path=tmp_path / "original-conversation.jsonl",
+  )
+  runner = _account_runner(
+    _account_execution(provider, "A"), session_id=session.session_id,
+    gateway_session=session,
+  )
+  runner._compaction_trigger = 1
+  compacted_sessions: list[str | None] = []
+
+  async def compact_messages(messages, *_args, session_id=None, **_kwargs):
+    compacted_sessions.append(session_id)
+    return SimpleNamespace(
+      applied=False, messages=messages, reason="below_trigger", summarize_usage=None,
+    )
+
+  monkeypatch.setattr(
+    "agent_gateway.runner_run_loop.maybe_compact_current_messages", compact_messages,
+  )
+
+  asyncio.run(runner.run(messages=[{"role": "user", "content": "go"}]))
+
+  assert compacted_sessions == [call[2] for call in provider.prepared]
+  assert compacted_sessions == ["original-conversation"]
+
+
+
+def test_a_none_preparation_keeps_the_bound_config_and_execution() -> None:
+  provider = _NoPrepareProvider(("A1",), [_Transient("transient"), _answer()])
+  execution = _account_execution(provider, "A0")
+  runner = _account_runner(execution)
+
+  asyncio.run(runner.run(messages=[{"role": "user", "content": "go"}]))
+
+  assert [call[0] for call in provider.prepared] == ["A0"]
+  assert provider.clients == ["A0", "A0"]
+  assert runner._auth_config["api_key"] == "A0"
+  assert runner.capability_execution is execution
+
+
+def test_a_disconnected_runner_prepares_nothing() -> None:
+  provider = _AccountProvider(("A1",), [])
+  runner = _account_runner(_account_execution(provider, "A0"))
+  runner._disconnected = True
+  config = dict(runner._auth_config)
+
+  assert asyncio.run(runner._prepare_credential(config)) is False
+
+  assert provider.prepared == []
+  assert config == dict(runner._auth_config)
+
+
+def test_model_fallback_rebuild_prepares_once_on_the_fallback_provider(monkeypatch) -> None:
+  primary = _AccountProvider(("A1",), [_Quota429("usage limit")], name="stub")
+  fallback = _AccountProvider(("F1",), [_answer("from fallback")], name="stub-fallback")
+  runner = _account_runner(_account_execution(primary, "A0"))
+  fallback_execution = _account_execution(fallback, "F0", model="fallback-model")
+
+  def one_hop(execution, snapshot, **_kwargs):
+    _ = execution, snapshot
+    return ModelFallbackHop(
+      execution=fallback_execution, role="deep", chain_index=0, skipped=(),
+      primary_model_key=execution.bind.model_key,
+    )
+
+  monkeypatch.setattr(CapabilityExecutionResolver, "rebind_model_fallback", staticmethod(one_hop))
+  capture_spawning_turn = runner._dispatcher.capture_spawning_turn
+  monkeypatch.setattr(
+    runner._dispatcher,
+    "capture_spawning_turn",
+    lambda: SimpleNamespace(
+      context=SimpleNamespace(selection_snapshot=object(), selection_provenance=None),
+      root_turn=capture_spawning_turn().root_turn,
+    ),
+  )
+
+  asyncio.run(runner.run(messages=[{"role": "user", "content": "go"}]))
+
+  assert primary.prepared == [("A0", "claude-opus-5", "sess-pool")]
+  assert primary.clients == ["A1"]
+  assert fallback.prepared == [("F0", "fallback-model", "sess-pool")]
+  assert fallback.clients == ["F1"]
+  assert runner._auth_config["api_key"] == "F1"
+  events = _logged(runner)
+  assert _types(events, "model_fallback") == ["model_fallback"]
+  assert _types(events, "error") == []
+
+
+def test_quota_429_on_one_account_rotates_to_the_next_and_succeeds() -> None:
+  provider = _AccountProvider(("A", "B"), [_Quota429("usage limit"), _answer()])
+  runner = _account_runner(_account_execution(provider, "A"))
+
+  asyncio.run(runner.run(messages=[{"role": "user", "content": "go"}]))
+
+  assert provider.streamed == ["A", "B"]
+  assert provider.parked.keys() == {"A"}
+  assert [call[0] for call in provider.prepared] == ["A"]
+  assert runner._auth_config["api_key"] == "B"
+  events = _logged(runner)
+  assert _types(events, "credential_refreshed") == ["credential_refreshed"]
+  assert _types(events, "error") == []
+
+
+def test_every_account_limited_backs_off_on_the_last_account_without_cycling() -> None:
+  attempts = 3 + gateway_runner.STREAM_RETRY_MAX
+  provider = _AccountProvider(
+    ("A", "B", "C"), [_Quota429("usage limit") for _ in range(attempts)],
+  )
+  runner = _account_runner(_account_execution(provider, "A"))
+
+  asyncio.run(runner.run(messages=[{"role": "user", "content": "go"}]))
+
+  # Each sibling is visited once, then the original bounded retry budget
+  # stays on C even though preparation would rerank an all-blocked pool to A.
+  expected = ["A", "B"] + ["C"] * (1 + gateway_runner.STREAM_RETRY_MAX)
+  assert provider.streamed == expected
+  assert provider.clients == expected
+  assert [call[0] for call in provider.prepared] == ["A"]
+  assert provider.parked.keys() == {"A", "B", "C"}
+  events = _logged(runner)
+  retries = [event for event in events if event["type"] == "stream_retry"]
+  assert [event["backoff_s"] for event in retries] == [0.0] * (attempts - 1)
+  assert len(_types(events, "credential_refreshed")) == 2
+  assert _types(events, "model_fallback") == []
+  assert _types(events, "error") == ["error"]
+
+
+def test_concurrency_429_backs_off_on_the_same_account_without_rotating(monkeypatch) -> None:
+  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.25)
+  slept: list[float] = []
+
+  async def record_sleep(delay: float, result=None):
+    if delay != gateway_runner.STREAM_GUARD_POLL_INTERVAL:
+      slept.append(delay)
+    return await asyncio.sleep(0, result)
+
+  monkeypatch.setattr(
+    gateway_runner, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": record_sleep}),
+  )
+  provider = _AccountProvider(("A", "B"), [_Concurrency429("concurrent"), _answer()])
+  runner = _account_runner(_account_execution(provider, "A"))
+
+  asyncio.run(runner.run(messages=[{"role": "user", "content": "go"}]))
+
+  assert provider.streamed == ["A", "A"]
+  assert provider.parked == {}
+  assert slept == [0.25]
+  events = _logged(runner)
+  assert _types(events, "credential_refreshed") == []
+  [retry] = [event for event in events if event["type"] == "stream_retry"]
+  assert retry["backoff_s"] == 0.25
+  assert _types(events, "error") == []
+
+
+def test_partial_stream_retry_events_are_unchanged() -> None:
+  partial = [
+    StreamEvent(type="message_start", input_tokens=10),
+    StreamEvent(type="text_delta", text="par"),
+  ]
+  provider = _AccountProvider(("A",), [(partial, _Transient("transient")), _answer()])
+  runner = _account_runner(_account_execution(provider, "A"))
+
+  asyncio.run(runner.run(messages=[{"role": "user", "content": "go"}]))
+
+  events = _logged(runner)
+  assert _types(events, "text_delta", "stream_retry", "credential_refreshed") == [
+    "text_delta", "stream_retry", "text_delta",
+  ]
+  [retry] = [event for event in events if event["type"] == "stream_retry"]
+  assert set(retry) >= {"attempt", "error", "attempt_elapsed_s", "backoff_s"}
+  assert retry["attempt"] == 0
+  assert "transient" in str(retry["error"])
+  assert retry["backoff_s"] == 0
+  assert provider.streamed == ["A", "A"]
+  assert _types(events, "error") == []
+
+
+def test_a_completed_tool_call_runs_once_when_the_next_request_rotates_accounts() -> None:
+  lookups: list[dict] = []
+
+  async def lookup(tool_input, *, call_index=0, tool_ctx=None):
+    _ = call_index, tool_ctx
+    lookups.append(dict(tool_input))
+    return {"status": "success"}, None
+
+  provider = _AccountProvider(
+    ("A", "B"), [_tool_turn("tool_1", "lookup"), _Quota429("usage limit"), _answer()],
+  )
+  runner = _account_runner(
+    _account_execution(provider, "A"), handlers={"lookup": lookup}, tool_names=("lookup",),
+  )
+
+  asyncio.run(runner.run(messages=[{"role": "user", "content": "go"}]))
+
+  assert provider.streamed == ["A", "A", "B"]
+  assert lookups == [{}]
+  events = _logged(runner)
+  assert _types(events, "credential_refreshed") == ["credential_refreshed"]
+  assert _types(events, "error") == []

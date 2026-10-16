@@ -5,6 +5,7 @@ import json
 import sys
 import time
 from datetime import datetime, timezone
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -27,7 +28,6 @@ from agent_gateway import (  # noqa: E402
   ToolDispatcher,
 )
 import agent_gateway.runner as gateway_runner  # noqa: E402
-import agent_gateway.providers.anthropic as anthropic_provider_module  # noqa: E402
 from agent_gateway.auth import ProviderCredentialFailure  # noqa: E402
 from agent_gateway.autonomous_credential_handoff import (  # noqa: E402
   encode_autonomous_credential_handoff,
@@ -44,8 +44,8 @@ from agent_gateway.providers.anthropic import AnthropicProvider  # noqa: E402
 from agent_gateway.providers.anthropic_oauth import (  # noqa: E402
   ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES,
   ANTHROPIC_USER_SCOPE_FIELD,
-  AnthropicCredentialPool,
   AnthropicOAuthRecord,
+  anthropic_credential_blocked_until,
   resolve_anthropic_auth_store_path,
   resolve_anthropic_credentials,
   rotate_anthropic_credential_source,
@@ -88,6 +88,7 @@ class _PooledAnthropicProvider(AnthropicProvider):
     self._limited_tokens = limited_tokens
     self._reset_at = reset_at
     self.streamed_tokens: list[str] = []
+    self.prepared_tokens: list[str] = []
 
   def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
     _ = timeout
@@ -95,6 +96,16 @@ class _PooledAnthropicProvider(AnthropicProvider):
 
   async def close_client(self, client: Any, timeout: float = 2.0) -> None:
     _ = client, timeout
+
+  async def prepare_credential(
+    self, config: Mapping[str, Any], *, model: str, session_id: str | None,
+  ) -> dict[str, Any] | None:
+    # Ranking and probing are test_anthropic_provider's subject. Here the
+    # runner's rotation and retry accounting are under test, so the bound
+    # account stays until a failure rotates it.
+    _ = model, session_id
+    self.prepared_tokens.append(str(config["auth_token"]))
+    return None
 
   def get_model_info(self, model: str) -> ModelInfo:
     from gateway_test_support.model_defaults import compat_for_profile
@@ -167,6 +178,46 @@ class _StubProvider(ModelProvider):
 
 def _run(coro):
   return asyncio.run(coro)
+
+
+def _blocked_until(
+  token: str,
+  *,
+  environ: dict[str, str] | None = None,
+  user_scope: int | None = None,
+) -> float:
+  """When the shared selection sidecar lets `token`'s account serve again."""
+  credential = resolve_anthropic_credentials(
+    environ=environ, user_scope=user_scope,
+  ).by_token(token)
+  assert credential is not None
+  return anthropic_credential_blocked_until(credential)
+
+
+def _rotated_material(
+  credential: Any,
+  *,
+  affinity_key: str | None = None,
+  model_family: str | None = None,
+) -> dict[str, Any]:
+  """The material `next_credential` hands back for a rotated-to `credential`.
+
+  The member is marked `automatic` (selection issued it) and `credential_prepared`
+  (the client must not select or refresh it a second time); the affinity key and
+  model family ride through from the bound config only when it carried them.
+  """
+  material: dict[str, Any] = {
+    "auth_mode": "oauth",
+    "api_key": "",
+    "auth_token": credential.token,
+    "credential_source": {**credential.source_metadata(), "automatic": True},
+    "credential_prepared": True,
+  }
+  if affinity_key is not None:
+    material["credential_affinity_key"] = affinity_key
+  if model_family is not None:
+    material["credential_model_family"] = model_family
+  return material
 
 
 def _make_dispatcher(event_log: EventLog | None = None, *, capability_bind = TEST_CAPABILITY_BIND) -> ToolDispatcher:
@@ -286,13 +337,175 @@ def test_merge_refreshed_gemini_auth_keeps_seat_identity_and_project_together(ro
   assert original["auth_token"] == "seat-one-token"
 
 
+def test_merge_refreshed_auth_config_pins_bound_values_and_trusted_scope() -> None:
+  config = {
+    "provider": "anthropic",
+    "auth_mode": "oauth",
+    "auth_token": "old-token",
+    "max_tokens": 4096,
+    "model": "bound-model",
+    "effort": "high",
+    "billing_mode": "metered",
+    "rate_table_version": "2026-04-08",
+    "auth_user_scope": "7",
+  }
+  refreshed = {
+    "auth_token": "new-token",
+    "model": "refreshed-model",
+    "effort": "low",
+    "billing_mode": "byok",
+    "rate_table_version": "unknown",
+    "auth_user_scope": "99",
+    "credential_source": {"automatic": True},
+    "credential_affinity_key": "affinity",
+    "credential_prepared": True,
+  }
+
+  merged = merge_refreshed_auth_config(config, refreshed)
+
+  # Neither the bound selection nor the refreshed copy of it survives: the
+  # runner re-derives model and effort from the bind.
+  assert "model" not in merged and "effort" not in merged
+  assert merged["billing_mode"] == "metered"
+  assert merged["rate_table_version"] == "2026-04-08"
+  assert merged["auth_user_scope"] == "7"
+  # Credential material and the pool fields ride through as ordinary fields.
+  assert merged["auth_token"] == "new-token"
+  assert merged["credential_source"] == {"automatic": True}
+  assert merged["credential_affinity_key"] == "affinity"
+  assert merged["credential_prepared"] is True
+
+
+def test_merge_refreshed_auth_config_supplies_scope_only_when_none_is_bound() -> None:
+  merged = merge_refreshed_auth_config(
+    {"provider": "anthropic", "auth_mode": "oauth", "max_tokens": 512},
+    {"auth_token": "new-token", "auth_user_scope": "5"},
+  )
+
+  assert merged["auth_user_scope"] == "5"
+
+
+def test_prepared_material_cannot_change_bound_model_effort_billing_or_scope() -> None:
+  provider = _StubProvider()
+  execution = stub_bound_capability_execution(
+    provider=provider,
+    model="stub-model",
+    effort="none",
+    auth_config={"api_key": "old", "max_tokens": 512, "auth_user_scope": "7"},
+  )
+  event_log = EventLog()
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log, capability_bind=execution.bind),
+    session_id="sess-auth",
+    capability_execution=execution,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+  config = dict(execution.auth_config)
+  config.update({"model": "stub-model", "effort": "none"})
+  bound_rate_table = runner._rate_table_version
+
+  assert runner._apply_refreshed_auth_config(config, {
+    "api_key": "prepared",
+    "model": "refreshed-model",
+    "effort": "high",
+    "billing_mode": "metered",
+    "rate_table_version": "other",
+    "auth_user_scope": "99",
+  }) is True
+
+  assert config["api_key"] == "prepared"
+  assert config["model"] == "stub-model"
+  assert config["effort"] == "none"
+  assert config["billing_mode"] == "byok"
+  assert config["rate_table_version"] == bound_rate_table
+  assert config["auth_user_scope"] == "7"
+  assert runner._auth_config["auth_user_scope"] == "7"
+  assert runner.capability_execution.bind.upstream_model == "stub-model"
+
+
+class _PreparingStubProvider(_StubProvider):
+  """A provider whose preparation names an automatic account for the bearer it is given."""
+
+  def __init__(self) -> None:
+    self.prepared: list[tuple[dict[str, Any], str, str | None]] = []
+
+  async def prepare_credential(
+    self, config: Any, *, model: str, session_id: str | None,
+  ) -> dict[str, Any] | None:
+    self.prepared.append((dict(config), model, session_id))
+    return {
+      "api_key": "child-selected",
+      "auth_user_scope": "someone-else",
+      "credential_source": {"automatic": True, "locator": "acct_child"},
+    }
+
+
+def test_autonomous_child_prepares_its_first_bind_with_its_own_session_and_trusted_scope() -> None:
+  handle = CredentialHandle(
+    handle_id="handle-child-prepare",
+    provider="stub",
+    principal="service",
+    tenant_id="hank-test",
+    actor_id=None,
+  )
+  handoff = read_autonomous_credential_handoff(
+    expected_handle_id=handle.handle_id,
+    expected_provider=handle.provider,
+    expected_principal=handle.principal,
+    expected_tenant_id=handle.tenant_id,
+    expected_actor_id=handle.actor_id,
+    stream=io.BytesIO(encode_autonomous_credential_handoff(
+      MaterializedCredential(
+        handle=handle,
+        auth_config={
+          "provider": "stub",
+          "auth_mode": "api",
+          "api_key": "parent-bearer",
+          "max_tokens": 512,
+          ANTHROPIC_USER_SCOPE_FIELD: "3",
+          "credential_source": {"automatic": True, "locator": "acct_parent"},
+        },
+      ),
+    )),
+  )
+  provider = _PreparingStubProvider()
+  execution = stub_bound_capability_execution(
+    provider=provider, model="stub-model", effort="none",
+    auth_config=dict(handoff.auth_config),
+  )
+  event_log = EventLog()
+  child = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log, capability_bind=execution.bind),
+    session_id="sess-autonomous-child",
+    capability_execution=execution,
+    user_id="3",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+  config = dict(execution.auth_config)
+
+  assert _run(child._prepare_credential(config)) is True
+
+  [(seen, model, session_id)] = provider.prepared
+  assert session_id == "sess-autonomous-child"
+  assert model == "stub-model"
+  assert seen["api_key"] == "parent-bearer"
+  assert seen["credential_source"] == {"automatic": True, "locator": "acct_parent"}
+  assert config["api_key"] == "child-selected"
+  assert config["credential_source"] == {"automatic": True, "locator": "acct_child"}
+  assert config[ANTHROPIC_USER_SCOPE_FIELD] == "3"
+  assert child._auth_config[ANTHROPIC_USER_SCOPE_FIELD] == "3"
+
+
 @pytest.mark.parametrize("has_generation_metadata", [True, False])
 def test_usage_limited_credential_rotates_to_sibling_and_keeps_bound_model(
   monkeypatch: Any, tmp_path: Path, has_generation_metadata: bool,
 ) -> None:
   reset_at = time.time() + 4 * 3600
-  pool = AnthropicCredentialPool()
-  monkeypatch.setattr(anthropic_provider_module, "ANTHROPIC_CREDENTIAL_POOL", pool)
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", _TOKEN_A)
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([_TOKEN_A, _TOKEN_B]))
   monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
@@ -336,6 +549,7 @@ def test_usage_limited_credential_rotates_to_sibling_and_keeps_bound_model(
   _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
 
   event_types = [entry.event.get("type") for entry in event_log.entries]
+  assert provider.prepared_tokens == [_TOKEN_A]
   if has_generation_metadata:
     assert provider.streamed_tokens == [_TOKEN_A, _TOKEN_B]
     assert "credential_refreshed" in event_types
@@ -343,8 +557,8 @@ def test_usage_limited_credential_rotates_to_sibling_and_keeps_bound_model(
     assert runner.capability_execution.bind.credential_ref == member_b.source_metadata()["generation_ref"]
     assert runner.capability_execution.auth_config["auth_token"] == _TOKEN_B
     assert runner._auth_config["auth_token"] == _TOKEN_B
-    assert pool.blocked_until(_TOKEN_A) == pytest.approx(reset_at, abs=2.0)
-    assert pool.blocked_until(_TOKEN_B) == 0.0
+    assert _blocked_until(_TOKEN_A) == pytest.approx(reset_at, abs=2.0)
+    assert _blocked_until(_TOKEN_B) == 0.0
   else:
     assert provider.streamed_tokens == [_TOKEN_A]
     assert "credential_refreshed" not in event_types
@@ -367,9 +581,6 @@ def _make_rotation_budget_runner(
   provider: _PooledAnthropicProvider,
   tokens: tuple[str, ...],
 ) -> tuple[AgentRunner, EventLog]:
-  monkeypatch.setattr(
-    anthropic_provider_module, "ANTHROPIC_CREDENTIAL_POOL", AnthropicCredentialPool(),
-  )
   for name in ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES:
     monkeypatch.delenv(name, raising=False)
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", tokens[0])
@@ -474,6 +685,7 @@ def test_free_rotation_preserves_the_full_transient_retry_budget(
   _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
 
   assert provider.streamed_tokens == [_TOKEN_A] + [_TOKEN_B] * (1 + gateway_runner.STREAM_RETRY_MAX)
+  assert provider.prepared_tokens == [_TOKEN_A]
   events = [entry.event for entry in event_log.entries]
   assert len([event for event in events if event["type"] == "credential_refreshed"]) == 1
   retry_events = [event for event in events if event["type"] == "stream_retry"]
@@ -573,8 +785,6 @@ def test_learning_fork_rotates_runner_and_dispatcher_to_sibling(
   monkeypatch: Any, tmp_path: Path,
 ) -> None:
   reset_at = time.time() + 4 * 3600
-  pool = AnthropicCredentialPool()
-  monkeypatch.setattr(anthropic_provider_module, "ANTHROPIC_CREDENTIAL_POOL", pool)
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", _TOKEN_A)
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([_TOKEN_A, _TOKEN_B]))
   monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
@@ -660,15 +870,14 @@ def test_learning_fork_rotates_runner_and_dispatcher_to_sibling(
   assert runner.capability_execution.auth_config["auth_token"] == _TOKEN_B
   assert fork_dispatcher._capability_bind is runner.capability_execution.bind
   assert parent_dispatcher._capability_bind is parent_execution.bind
-  assert pool.blocked_until(_TOKEN_A) == pytest.approx(reset_at, abs=2.0)
-  assert pool.blocked_until(_TOKEN_B) == 0.0
+  assert _blocked_until(_TOKEN_A) == pytest.approx(reset_at, abs=2.0)
+  assert _blocked_until(_TOKEN_B) == 0.0
 
 
 def test_single_credential_pool_is_never_withheld_from_a_run(
   monkeypatch: Any, tmp_path: Path,
 ) -> None:
   reset_at = time.time() + 3600
-  pool = AnthropicCredentialPool()
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", _TOKEN_A)
   monkeypatch.delenv("ANTHROPIC_AUTH_TOKENS", raising=False)
   monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
@@ -676,16 +885,16 @@ def test_single_credential_pool_is_never_withheld_from_a_run(
   sources = resolve_anthropic_credentials()
 
   assert sources.tokens == (_TOKEN_A,)
-  selected = select_anthropic_credential_source(sources, pool=pool)
+  selected = select_anthropic_credential_source(sources)
   assert selected is not None and selected.token == _TOKEN_A
 
   # Nothing to swap in, and the only credential is still handed out: a pool of
   # one leaves the turn to the gateway's own bounded stream retry, which ends it
   # with the sanitized rate-limit error (see the pool-of-one turn test below).
   assert rotate_anthropic_credential_source(
-    sources, current=_TOKEN_A, until=reset_at, pool=pool
+    sources, current=_TOKEN_A, until=reset_at
   ) is None
-  selected = select_anthropic_credential_source(sources, pool=pool)
+  selected = select_anthropic_credential_source(sources)
   assert selected is not None and selected.token == _TOKEN_A
 
 
@@ -709,8 +918,6 @@ def test_usage_limited_enrolled_account_rotates_to_the_next_enrolled_account(
         expires_at=time.time() + 3600,
       ),
     )
-  pool = AnthropicCredentialPool()
-  monkeypatch.setattr(anthropic_provider_module, "ANTHROPIC_CREDENTIAL_POOL", pool)
   monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
   monkeypatch.delenv("ANTHROPIC_AUTH_TOKENS", raising=False)
   monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
@@ -725,20 +932,27 @@ def test_usage_limited_enrolled_account_rotates_to_the_next_enrolled_account(
   )
   provider = AnthropicProvider()
   rotated = provider.next_credential(
-    {"auth_mode": "oauth", "auth_token": "sk-ant-oat01-primary@example.com"},
+    {
+      "auth_mode": "oauth",
+      "auth_token": "sk-ant-oat01-primary@example.com",
+      "credential_affinity_key": "affinity-primary",
+      "credential_model_family": "opus",
+    },
     failure,
   )
 
   sibling = resolve_anthropic_credentials().by_token("sk-ant-oat01-sibling@example.com")
   assert sibling is not None
-  assert rotated == {
-    "auth_mode": "oauth",
-    "api_key": "",
-    "auth_token": "sk-ant-oat01-sibling@example.com",
-    "credential_source": sibling.source_metadata(),
-  }
-  assert pool.blocked_until("primary@example.com") == pytest.approx(reset_at, abs=2.0)
-  assert pool.blocked_until("sibling@example.com") == 0.0
+  assert rotated == _rotated_material(
+    sibling, affinity_key="affinity-primary", model_family="opus",
+  )
+  assert rotated is not None
+  assert rotated["credential_source"]["automatic"] is True
+  assert rotated["credential_prepared"] is True
+  assert rotated["credential_affinity_key"] == "affinity-primary"
+  assert rotated["credential_model_family"] == "opus"
+  assert _blocked_until("sk-ant-oat01-primary@example.com") == pytest.approx(reset_at, abs=2.0)
+  assert _blocked_until("sk-ant-oat01-sibling@example.com") == 0.0
   # Every account limited: no sibling is handed back, so the run cannot circle.
   assert provider.next_credential(
     {"auth_mode": "oauth", "auth_token": "sk-ant-oat01-sibling@example.com"},
@@ -747,7 +961,7 @@ def test_usage_limited_enrolled_account_rotates_to_the_next_enrolled_account(
 
 
 def test_pool_of_one_ends_the_turn_with_the_reported_reset_window(
-  monkeypatch: Any,
+  monkeypatch: Any, tmp_path: Path,
 ) -> None:
   """A 20-hour reset is reported to the analyst, not waited out.
 
@@ -756,8 +970,7 @@ def test_pool_of_one_ends_the_turn_with_the_reported_reset_window(
   limiter reported — never a stall the caller reads as a watchdog timeout.
   """
   reset_at = time.time() + 73443
-  pool = AnthropicCredentialPool()
-  monkeypatch.setattr(anthropic_provider_module, "ANTHROPIC_CREDENTIAL_POOL", pool)
+  monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "oauth.json"))
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", _TOKEN_A)
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([_TOKEN_A]))
   monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
@@ -800,11 +1013,10 @@ def test_pool_of_one_ends_the_turn_with_the_reported_reset_window(
 
 
 def test_every_credential_limited_stops_rotating_instead_of_circling(
-  monkeypatch: Any,
+  monkeypatch: Any, tmp_path: Path,
 ) -> None:
   reset_at = time.time() + 4 * 3600
-  pool = AnthropicCredentialPool()
-  monkeypatch.setattr(anthropic_provider_module, "ANTHROPIC_CREDENTIAL_POOL", pool)
+  monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "oauth.json"))
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", _TOKEN_A)
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([_TOKEN_A, _TOKEN_B]))
   monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
@@ -876,10 +1088,8 @@ def test_autonomous_child_rotates_on_the_pool_its_projection_carries(
   )
 
   # The parent selects out of the pool it resolves, as it does for every run.
-  parent_pool = AnthropicCredentialPool()
   selected = select_anthropic_credential_source(
     resolve_anthropic_credentials(environ=gateway_environ),
-    pool=parent_pool,
   )
   assert selected is not None and selected.token == _TOKEN_A
   bound_token = selected.token
@@ -919,8 +1129,6 @@ def test_autonomous_child_rotates_on_the_pool_its_projection_carries(
       monkeypatch.delenv(name, raising=False)
     else:
       monkeypatch.setenv(name, projected)
-  child_pool = AnthropicCredentialPool()
-  monkeypatch.setattr(anthropic_provider_module, "ANTHROPIC_CREDENTIAL_POOL", child_pool)
   monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.0)
 
   provider = _SanitizingPooledProvider(limited_tokens=(_TOKEN_A,), reset_at=reset_at)
@@ -949,7 +1157,7 @@ def test_autonomous_child_rotates_on_the_pool_its_projection_carries(
   assert "error" not in event_types
   assert runner._auth_config["auth_token"] == _TOKEN_B
   assert runner.capability_execution.bind.model_key == bound_model_key
-  assert child_pool.blocked_until(_TOKEN_A) == pytest.approx(reset_at, abs=2.0)
+  assert _blocked_until(_TOKEN_A) == pytest.approx(reset_at, abs=2.0)
 
 
 def _enroll(store_path: Path, identity: str) -> str:
@@ -989,8 +1197,6 @@ def test_a_users_turn_rotates_inside_that_users_pool_and_never_onto_another(
   sibling = _enroll(mine, "henry-sibling@example.com")
   _enroll(resolve_anthropic_auth_store_path(environ=environ, user_scope=2), "other@example.com")
 
-  pool = AnthropicCredentialPool()
-  monkeypatch.setattr(anthropic_provider_module, "ANTHROPIC_CREDENTIAL_POOL", pool)
   reset_at = time.time() + 4 * 3600
   failure = ProviderCredentialFailure(
     provider="anthropic",
@@ -1003,31 +1209,30 @@ def test_a_users_turn_rotates_inside_that_users_pool_and_never_onto_another(
     "auth_mode": "oauth",
     "auth_token": primary,
     ANTHROPIC_USER_SCOPE_FIELD: "1",
+    "credential_affinity_key": "affinity-henry",
+    "credential_model_family": "sonnet",
   }
 
   selected = select_anthropic_credential_source(
-    resolve_anthropic_credentials(environ=environ, user_scope=1), pool=pool
+    resolve_anthropic_credentials(environ=environ, user_scope=1)
   )
   assert selected is not None and selected.token == primary
-  def source_of(token: str, user_scope: int) -> dict[str, str]:
+  def credential_of(token: str, user_scope: int) -> Any:
     credential = resolve_anthropic_credentials(
       environ=environ, user_scope=user_scope,
     ).by_token(token)
     assert credential is not None
-    return credential.source_metadata()
+    return credential
 
-  assert provider.next_credential(mine_bound, failure) == {
-    "auth_mode": "oauth",
-    "api_key": "",
-    "auth_token": sibling, "credential_source": source_of(sibling, 1),
-  }
+  assert provider.next_credential(mine_bound, failure) == _rotated_material(
+    credential_of(sibling, 1), affinity_key="affinity-henry", model_family="sonnet",
+  )
   assert provider.next_credential(
     {**mine_bound, "auth_token": sibling}, failure
-  ) == {
-    "auth_mode": "oauth", "api_key": "",
-    "auth_token": _TOKEN_A, "credential_source": source_of(_TOKEN_A, 1),
-  }
-  assert pool.blocked_until("henry-primary@example.com") == pytest.approx(reset_at, abs=2.0)
+  ) == _rotated_material(
+    credential_of(_TOKEN_A, 1), affinity_key="affinity-henry", model_family="sonnet",
+  )
+  assert _blocked_until(primary, environ=environ, user_scope=1) == pytest.approx(reset_at, abs=2.0)
 
   # Another user's turn is served the org credential and nothing of user 1's,
   # even though user 1's accounts are the ones no limiter is holding.
@@ -1041,10 +1246,7 @@ def test_a_users_turn_rotates_inside_that_users_pool_and_never_onto_another(
       ANTHROPIC_USER_SCOPE_FIELD: "2",
     },
     failure,
-  ) == {
-    "auth_mode": "oauth", "api_key": "",
-    "auth_token": _TOKEN_A, "credential_source": source_of(_TOKEN_A, 2),
-  }
+  ) == _rotated_material(credential_of(_TOKEN_A, 2))
 
 
 def test_autonomous_child_of_a_user_scoped_run_inherits_that_users_pool(
@@ -1076,10 +1278,8 @@ def test_autonomous_child_of_a_user_scoped_run_inherits_that_users_pool(
     deliver=False,
   )
 
-  parent_pool = AnthropicCredentialPool()
   selected = select_anthropic_credential_source(
     resolve_anthropic_credentials(environ=gateway_environ, user_scope=3),
-    pool=parent_pool,
   )
   assert selected is not None and selected.token == primary
   bound_token = selected.token
@@ -1118,8 +1318,6 @@ def test_autonomous_child_of_a_user_scoped_run_inherits_that_users_pool(
       monkeypatch.delenv(name, raising=False)
     else:
       monkeypatch.setenv(name, projected)
-  child_pool = AnthropicCredentialPool()
-  monkeypatch.setattr(anthropic_provider_module, "ANTHROPIC_CREDENTIAL_POOL", child_pool)
   monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.0)
 
   provider = _SanitizingPooledProvider(limited_tokens=(primary,), reset_at=reset_at)
@@ -1145,9 +1343,7 @@ def test_autonomous_child_of_a_user_scoped_run_inherits_that_users_pool(
   assert provider.streamed_tokens == [primary, sibling]
   assert "error" not in [entry.event.get("type") for entry in event_log.entries]
   assert runner._auth_config["auth_token"] == sibling
-  assert child_pool.blocked_until("child-primary@example.com") == pytest.approx(
-    reset_at, abs=2.0
-  )
+  assert _blocked_until(primary, user_scope=3) == pytest.approx(reset_at, abs=2.0)
 
 
 def test_rotated_credential_source_matches_prepared_provider_authentication(
@@ -1162,16 +1358,16 @@ def test_rotated_credential_source_matches_prepared_provider_authentication(
   token_a = _enroll(store_path, "rotation-primary@example.com")
   token_b = _enroll(store_path, "rotation-sibling@example.com")
 
-  pool = AnthropicCredentialPool()
-  monkeypatch.setattr(anthropic_provider_module, "ANTHROPIC_CREDENTIAL_POOL", pool)
   sources = resolve_anthropic_credentials()
-  selected = select_anthropic_credential_source(sources, pool=pool)
+  selected = select_anthropic_credential_source(sources)
   assert selected is not None and selected.token == token_a
   replacement = next(source for source in sources.credentials if source.token == token_b)
   config = {
     "auth_mode": "oauth",
     "auth_token": selected.token,
     "credential_source": selected.source_metadata(),
+    "credential_affinity_key": "affinity-rotation",
+    "credential_model_family": "opus",
   }
   provider = AnthropicProvider()
   refreshed = provider.next_credential(
@@ -1185,10 +1381,17 @@ def test_rotated_credential_source_matches_prepared_provider_authentication(
   )
   assert refreshed is not None
   assert refreshed["auth_token"] == token_b
-  assert refreshed["credential_source"] == replacement.source_metadata()
+  expected_source = {**replacement.source_metadata(), "automatic": True}
+  assert refreshed["credential_source"] == expected_source
   assert refreshed["credential_source"] != selected.source_metadata()
+  assert refreshed["credential_prepared"] is True
+  assert refreshed["credential_affinity_key"] == "affinity-rotation"
+  assert refreshed["credential_model_family"] == "opus"
   merged = merge_refreshed_auth_config(config, refreshed)
-  assert merged["credential_source"] == replacement.source_metadata()
+  assert merged["credential_source"] == expected_source
+  assert merged["credential_prepared"] is True
+  assert merged["credential_affinity_key"] == "affinity-rotation"
+  assert merged["credential_model_family"] == "opus"
 
   async def prepare_request() -> None:
     client = provider.create_client(merged)

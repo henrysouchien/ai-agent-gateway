@@ -414,6 +414,50 @@ def test_truncate_tool_result_embeds_spill_pointer_only_when_provided() -> None:
   assert "spill_ref" not in plain_payload
 
 
+def test_job_spill_sink_states_the_reader_the_child_surface_carries(tmp_path: Path) -> None:
+  from agent_gateway.tool_result_spill import job_spill_sink
+
+  root = SpillSink(
+    lambda: str(tmp_path),
+    capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+  )
+
+  assert job_spill_sink(root, "child").capabilities == root.capabilities
+  assert job_spill_sink(root, "child", spill_read=True).capabilities == root.capabilities
+  readerless = job_spill_sink(root, "child", spill_read=False)
+  assert readerless.capabilities == replace(root.capabilities, spill_read=False)
+  assert root.capabilities.spill_read is True
+  assert readerless() == job_spill_sink(root, "child")()
+
+
+def test_child_spill_sink_advertises_the_reader_only_when_the_child_can_run_it(
+  tmp_path: Path,
+) -> None:
+  from agent_gateway.runner_sub_agents import _child_spill_sink
+
+  root = SpillSink(
+    lambda: str(tmp_path),
+    capabilities=SpillCapabilities(spill_read=True),
+  )
+  attempt: Any = SimpleNamespace(physical_task_id="child-1")
+  with_reader: Any = SimpleNamespace(
+    local_tool_handlers=lambda: {"tool_result_read": object(), "web_search": object()},
+  )
+  without_reader: Any = SimpleNamespace(
+    local_tool_handlers=lambda: {"web_search": object()},
+  )
+
+  sink = _child_spill_sink(root, attempt, dispatcher=with_reader, excluded_tools=None)
+  assert sink is not None and sink.capabilities.spill_read is True
+  sink = _child_spill_sink(root, attempt, dispatcher=without_reader, excluded_tools=set())
+  assert sink is not None and sink.capabilities.spill_read is False
+  sink = _child_spill_sink(
+    root, attempt, dispatcher=with_reader, excluded_tools={"tool_result_read"},
+  )
+  assert sink is not None and sink.capabilities.spill_read is False
+  assert _child_spill_sink(None, attempt, dispatcher=with_reader, excluded_tools=None) is None
+
+
 def test_runner_preserves_tool_result_utility_delegates(tmp_path: Path) -> None:
   assert gateway_runner.AgentRunner._annotate_result({"ok": True}) == annotate_result({"ok": True})
   assert gateway_runner.AgentRunner._make_error_result("tool-1", "bad", "failed") == make_error_result(
@@ -675,6 +719,220 @@ def test_business_model_terminal_success_uses_bounded_semantic_projection(
     "compacted_chars": len(live_entry["content"]),
   }
 
+
+
+def _project_business_model_terminal(content: str, tmp_path: Path) -> dict[str, Any]:
+  result_entry = {"type": "tool_result", "tool_use_id": "bm-tool-1", "content": content}
+  live_entry, durable_entry = compact_model_tool_result_entry(
+    result_entry,
+    tool_name="fms_persist_business_model",
+    spill_dir_provider=lambda: str(tmp_path),
+    log_session_id="sess-bm",
+    logger=_RecordingLogger(),
+  )
+  assert live_entry == durable_entry
+  assert result_entry["content"] == content
+  return json.loads(live_entry["content"])
+
+
+def test_business_model_noop_projection_keeps_findings_and_warnings(tmp_path: Path) -> None:
+  finding = {
+    "field": "segments",
+    "code": "structural_noop",
+    "message": "The staged model is already the current business model.",
+    "next_call": {
+      "tool_name": "fms_read_business_model",
+      "arguments": {"research_file_id": 7},
+    },
+    "index": 0,
+    "change_template": {"field": "segments", "op": "replace"},
+    "ignored": "x" * 5_000,
+  }
+  content = json.dumps(
+    {
+      "status": "noop",
+      "gate_code": "PROCEED",
+      "artifact_ref": "artifacts/PCTY/business-model.json",
+      "proposal_id": "proposal-1",
+      "error": None,
+      "verdict_echo": {
+        "verdict": "BM_STRUCTURAL_REVIEW_REQUIRED",
+        "confidence": "MEDIUM",
+        "revision": "pcty-business-model-rev-1",
+        "findings": [finding, {"field": "unused"}],
+      },
+      "warnings": [
+        {"code": "dialect_warning", "message": "Legacy dialect keys were ignored."},
+      ],
+      "readback": {
+        "verdict": {
+          "verdict": "READBACK",
+          "confidence": "HIGH",
+          "revision": "readback-rev",
+          "findings": [{"field": "readback"}],
+        }
+      },
+    }
+  )
+
+  projection = _project_business_model_terminal(content, tmp_path)
+
+  assert projection["verdict"] == "BM_STRUCTURAL_REVIEW_REQUIRED"
+  assert projection["confidence"] == "MEDIUM"
+  assert projection["revision"] == "pcty-business-model-rev-1"
+  assert projection["findings"] == [
+    {
+      "index": 0,
+      "field": "segments",
+      "code": "structural_noop",
+      "message": "The staged model is already the current business model.",
+      "next_call": {
+        "tool_name": "fms_read_business_model",
+        "arguments": {"research_file_id": 7},
+      },
+      "change_template": {"field": "segments", "op": "replace"},
+    },
+    {"field": "unused"},
+  ]
+  assert projection["warnings"] == [
+    {"code": "dialect_warning", "message": "Legacy dialect keys were ignored."},
+  ]
+
+
+def test_business_model_noop_projection_preserves_empty_resubmit_arguments(tmp_path: Path) -> None:
+  # api/fms/modules/business_model.py's _RESUBMIT is the owner's actual repair call.
+  resubmit = {"tool_name": "fms_persist_business_model", "arguments": {}}
+  finding = {
+    "field": "business_model_judgment",
+    "code": "judgment_missing",
+    "message": "Provide the economic structure for BM_CONSTRUCTED.",
+    "next_call": resubmit,
+    "change_template": {
+      "optional": None,
+      "segments": [],
+      "notes": [None, {}, []],
+    },
+  }
+  warning = {
+    "code": "structural_review",
+    "details": {"optional": None, "segments": [], "arguments": {}},
+  }
+  content = json.dumps(
+    {
+      "status": "noop",
+      "verdict_echo": {
+        "verdict": "BM_STRUCTURAL_REVIEW_REQUIRED",
+        "findings": [finding],
+      },
+      "warnings": [warning],
+    }
+  )
+
+  projection = _project_business_model_terminal(content, tmp_path)
+
+  assert projection["findings"][0]["next_call"] == {
+    "tool_name": "fms_persist_business_model",
+    "arguments": {},
+  }
+  assert projection["findings"] == [finding]
+  assert projection["warnings"] == [warning]
+
+
+@pytest.mark.parametrize("status", ["staged", "applied"])
+def test_business_model_non_noop_projection_omits_findings(
+  status: str,
+  tmp_path: Path,
+) -> None:
+  verdict = {
+    "verdict": "BM_CONSTRUCTED",
+    "confidence": "MEDIUM",
+    "revision": "pcty-business-model-rev-1",
+    "findings": [
+      {
+        "field": "segments",
+        "code": "structural_noop",
+        "message": "should not reach the parent",
+        "next_call": {"tool_name": "fms_read_business_model", "arguments": {}},
+      }
+    ],
+    "data_gaps": [
+      {
+        "key": "float_yield",
+        "text": "Average daily float yield is not disclosed.",
+        "claim_keys": ["interest_income_fy26"],
+      }
+    ],
+    "recommended_next_action": "Run forecast-assumptions.",
+  }
+  content = json.dumps(
+    {
+      "status": status,
+      "gate_code": "PROCEED",
+      "artifact_ref": "artifacts/PCTY/business-model.json",
+      "proposal_id": "proposal-1",
+      "error": None,
+      "verdict": verdict,
+      "warnings": [{"code": "dialect_warning", "message": "ignored on a write"}],
+      "readback": {
+        "typed_outputs": {
+          "business_model_stage_receipt": {"status": "accepted"},
+        }
+      },
+    }
+  )
+  expected = {
+    "status": status,
+    "gate_code": "PROCEED",
+    "artifact_ref": "artifacts/PCTY/business-model.json",
+    "proposal_id": "proposal-1",
+    "verdict": "BM_CONSTRUCTED",
+    "confidence": "MEDIUM",
+    "revision": "pcty-business-model-rev-1",
+    "stage_receipt_status": "accepted",
+    "data_gaps": [
+      {
+        "key": "float_yield",
+        "text": "Average daily float yield is not disclosed.",
+        "claim_keys": ["interest_income_fy26"],
+      }
+    ],
+    "recommended_next_action": "Run forecast-assumptions.",
+  }
+
+  result_entry = {"type": "tool_result", "tool_use_id": "bm-tool-1", "content": content}
+  live_entry, _durable_entry = compact_model_tool_result_entry(
+    result_entry,
+    tool_name="fms_persist_business_model",
+    spill_dir_provider=lambda: str(tmp_path),
+    log_session_id="sess-bm",
+    logger=_RecordingLogger(),
+  )
+
+  assert live_entry["content"] == json.dumps(expected, default=str)
+  assert "findings" not in json.loads(live_entry["content"])
+  assert "warnings" not in json.loads(live_entry["content"])
+
+
+def test_business_model_noop_without_findings_adds_no_empty_keys(tmp_path: Path) -> None:
+  content = json.dumps(
+    {
+      "status": "noop",
+      "gate_code": "PROCEED",
+      "verdict_echo": {
+        "verdict": "BM_CONSTRUCTED",
+        "confidence": "MEDIUM",
+        "revision": "pcty-business-model-rev-1",
+        "findings": [],
+      },
+      "warnings": [],
+    }
+  )
+
+  projection = _project_business_model_terminal(content, tmp_path)
+
+  assert projection["verdict"] == "BM_CONSTRUCTED"
+  assert "findings" not in projection
+  assert "warnings" not in projection
 
 def test_compact_spills_live_entry_and_keeps_durable_pointer_free(tmp_path: Path) -> None:
   content = _large_content()

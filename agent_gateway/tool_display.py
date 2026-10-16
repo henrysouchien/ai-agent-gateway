@@ -10,6 +10,14 @@ DETAIL_MAX_CHARS = 80
 
 _TEMPLATE_RE = re.compile(r"{([^{}]+)}")
 _WHITESPACE_RE = re.compile(r"\s+")
+_CAMEL_WORD_RE = re.compile(r"([a-z0-9])([A-Z])")
+_ACRONYM_WORD_RE = re.compile(r"([A-Z])([A-Z][a-z])")
+
+_METRIC_LABELS = {
+  "WeightedAverageNumberOfDilutedSharesOutstanding": "weighted average diluted shares",
+  "OperatingIncomeLoss": "operating income (loss)",
+  "EarningsPerShareDiluted": "diluted EPS",
+}
 
 
 @dataclass(frozen=True)
@@ -33,8 +41,10 @@ _SEED_MAP: dict[str, _DisplaySpec] = {
   "search_filing_text": _spec("Searching {ticker} filings", "query", "form"),
   "filings_search": _spec("Searching filings", "ticker", "query"),
   "filings_read": _spec("Reading filing excerpts", "ticker", "form"),
+  "filings_list": _spec("Finding filings", "ticker", "form"),
   # Market data.
   "check_market_cap": _spec("Checking {ticker} market cap", "symbol", "ticker"),
+  "get_quote": _spec("Pulling a market quote", "ticker"),
   "describe_market_data_endpoint": _spec("Describing market data endpoint", "endpoint"),
   "fetch_company_profile": _spec("Pulling {ticker} profile", "symbol", "ticker"),
   "fetch_financials": _spec("Pulling market data", "ticker", "statement", "period"),
@@ -67,9 +77,16 @@ _SEED_MAP: dict[str, _DisplaySpec] = {
   "get_agent_result_content": _spec("Reading agent result", "content_id"),
   "get_workflow_input_content": _spec("Reading workflow input", "input_name"),
   "session_query": _spec("Searching the session", "query"),
+  "docs_fetch": _spec("Reading documentation", "url", "file"),
+  "load_tools": _spec("Preparing research tools"),
+  "list_skills": _spec("Finding research workflows"),
+  "transcripts_read": _spec("Reading earnings transcripts", "ticker", "period"),
+  "transcripts_search": _spec("Searching earnings transcripts", "ticker", "query"),
+  "transcripts_list": _spec("Finding earnings transcripts", "ticker", "period"),
   "memory_write": _spec("Writing {file}", "mode"),
   "memory_read": _spec("Reading {file}"),
   "memory_recall": _spec("Recalling memory", "query", "ticker"),
+  "memory_store": _spec("Saving memory", "ticker"),
   "invoke_skill": _spec("Running {skill}", "ticker", "task"),
   # FMS / research and thesis workflow.
   "fms_persist_business_model": _spec("Saving business model work", "ticker"),
@@ -110,7 +127,7 @@ _ALIASES: dict[str, tuple[str, ...]] = {
   "task_id": ("task_id", "background_task_id", "run_id"),
   "ticker": ("ticker", "symbol", "company_ticker"),
   "url": ("url", "uri", "href"),
-  "workbook": ("workbook", "workbook_name", "_workbook"),
+  "workbook": ("workbook", "workbook_name"),
 }
 
 _GLOBAL_SALIENT_KEYS: tuple[str, ...] = (
@@ -133,7 +150,7 @@ def resolve_display(tool_name: str, redacted_input: Mapping[str, Any] | None) ->
     return None
 
   data = redacted_input if isinstance(redacted_input, Mapping) else {}
-  spec = _SEED_MAP.get(canonical)
+  spec = _SEED_MAP.get(canonical) or _fms_display_spec(canonical)
   if spec is not None:
     label = _clean_text(_render_template(spec.label, data))
     detail = _build_detail(data, spec.detail_keys)
@@ -158,6 +175,17 @@ def _canonical_tool_name(tool_name: str) -> str:
   return value.strip()
 
 
+def _fms_display_spec(tool_name: str) -> _DisplaySpec | None:
+  for prefix, template in (
+    ("fms_report_", "Writing {} report"),
+    ("fms_propose_", "Staging {} proposal"),
+    ("fms_persist_", "Saving {}"),
+  ):
+    if tool_name.startswith(prefix) and (slug := tool_name[len(prefix):]):
+      return _spec(template.format(slug.replace("_", "-")), "ticker")
+  return None
+
+
 def _humanize_tool_name(tool_name: str) -> str:
   leaf = tool_name.rsplit(".", 1)[-1].rsplit("/", 1)[-1]
   words = re.sub(r"[-_]+", " ", leaf).strip()
@@ -165,6 +193,17 @@ def _humanize_tool_name(tool_name: str) -> str:
     return ""
   words = words.lower()
   return words[:1].upper() + words[1:]
+
+
+def _identifier_words(value: str) -> str:
+  words = _ACRONYM_WORD_RE.sub(r"\1 \2", value)
+  words = _CAMEL_WORD_RE.sub(r"\1 \2", words)
+  return _clean_text(re.sub(r"[-_]+", " ", words)).lower()
+
+
+def _metric_label(value: str) -> str:
+  concept = value.rsplit(":", 1)[-1]
+  return _METRIC_LABELS.get(concept) or _identifier_words(concept)
 
 
 def _render_template(template: str, data: Mapping[str, Any]) -> str:
@@ -202,14 +241,16 @@ def _first_salient_detail(data: Mapping[str, Any]) -> str | None:
 def _lookup_text(data: Mapping[str, Any], key: str) -> str | None:
   if key == "quarter+year":
     return _format_quarter_year(data)
-  if key == "_workbook":
-    return _lookup_text(data, "workbook")
   aliases = _ALIASES.get(key, (key,))
   for alias in aliases:
     if alias not in data:
       continue
     value = _format_value(alias, data.get(alias))
     if value:
+      if key == "metric_name":
+        return _metric_label(value)
+      if key == "skill":
+        return _identifier_words(value)
       return value
   return None
 

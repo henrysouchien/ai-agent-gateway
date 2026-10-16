@@ -72,6 +72,7 @@ from agent_workflow_contracts import (
   OrdinaryDelegationTaskRef,
   ParentResultPolicy,
   ProjectionInline,
+  ResultHandle,
   TaskObservation,
   TaskResult,
   TaskResultProvenance,
@@ -366,8 +367,21 @@ def test_projection_only_result_derives_inline_parent_delivery() -> None:
 
 
 @pytest.mark.asyncio
-async def test_background_completion_derives_policy_from_projection_result(
+@pytest.mark.parametrize(
+  "policy",
+  [
+    None,
+    ParentResultPolicy(
+      preferred="result_handle",
+      max_inline_bytes=1,
+      on_overflow="result_handle",
+    ),
+  ],
+  ids=["derived_projection", "explicit_result_handle"],
+)
+async def test_background_completion_honors_projection_result_policy(
   tmp_path: Path,
+  policy: ParentResultPolicy | None,
 ) -> None:
   class _Harness(RunnerBackgroundLifecycleMixin):
     def __init__(self) -> None:
@@ -380,21 +394,35 @@ async def test_background_completion_derives_policy_from_projection_result(
       return await self._journal.append(event)
 
   result, value = _projection_only_result()
+  assert len(canonical_json_bytes(value)) == 88
   entry = TaskEntry(
     task_id=result.attempt.physical_task_id,
     task_type="background_agent",
     task_result=result,
     result=result.model_dump(mode="json"),
+    parent_result_policy=policy,
   )
-  assert entry.parent_result_policy is None
 
-  await _Harness()._ensure_agent_completion_published(entry)
+  runner = _Harness()
+  prior_events, _ = await runner._journal.query(event_types={"agent_completion"})
+  assert prior_events == []
+  await runner._ensure_agent_completion_published(entry)
 
   assert entry.completion_envelope is not None
   materialization = entry.completion_envelope.parent_materialization
-  assert isinstance(materialization, ProjectionInline)
-  assert materialization.kind == "projection_inline"
-  assert materialization.value == value
+  if policy is None:
+    assert isinstance(materialization, ProjectionInline)
+    assert materialization.kind == "projection_inline"
+    assert materialization.value == value
+  else:
+    assert isinstance(materialization, ResultHandle)
+    assert materialization.kind == "result_handle"
+    assert result.values.projection is not None
+    assert materialization.source == result.values.projection.content
+    assert materialization.read_grant.principal_id == "parent-runner"
+  events, _ = await runner._journal.query(event_types={"agent_completion"})
+  assert len(events) == 1
+  assert events[0].event["envelope"] == entry.completion_envelope.model_dump(mode="json")
 
 
 @pytest.mark.asyncio

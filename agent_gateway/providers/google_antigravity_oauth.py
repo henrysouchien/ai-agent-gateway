@@ -291,6 +291,8 @@ def resolve_antigravity_pool_candidates(
         store_path=candidate.store_path,
         is_user_store=candidate.is_user_store,
         auth_mode=candidate.auth_mode,
+        auth_mechanism=candidate.auth_mechanism,
+        entitlement_kind=candidate.entitlement_kind,
       )
     return candidate
 
@@ -303,6 +305,8 @@ def _materialize_antigravity_pool_candidate(
 ) -> dict[str, Any]:
   return {
     "auth_mode": "oauth",
+    "auth_mechanism": selected.auth_mechanism,
+    "entitlement_kind": selected.entitlement_kind,
     "auth_token": selected.token,
     "refresh_token": str(selected.record.get("refresh_token") or "").strip(),
     "token_expires_at": selected.record.get("expires_at"),

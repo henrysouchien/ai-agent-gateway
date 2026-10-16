@@ -1,16 +1,20 @@
 # ruff: noqa: E402
 
 import asyncio
+import importlib
 import json
 import logging
 import os
+import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Literal
 
+import httpx
 import httpx2
 import pytest
 
@@ -27,8 +31,20 @@ if str(PKG_DIR) not in sys.path:
 from agent_gateway import AnthropicProvider, ModelInfo
 from model_authority.thinking import ThinkingLevel
 import agent_gateway.providers.anthropic as anthropic_provider_module
-from agent_gateway.providers.anthropic import _format_anthropic_rejection_detail
-from agent_gateway.providers.anthropic_oauth import AnthropicCredentialPool
+from agent_gateway.providers.anthropic import (
+  CREDENTIAL_MODEL_FAMILY_FIELD,
+  _format_anthropic_rejection_detail,
+)
+from agent_gateway.providers import anthropic_oauth, anthropic_quota
+from agent_gateway.providers.anthropic_oauth import (
+  ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES,
+  ANTHROPIC_DEPLOYMENT_API_KEY_FIELD,
+  CREDENTIAL_AFFINITY_KEY_FIELD,
+  CREDENTIAL_PREPARED_FIELD,
+  AnthropicRequestBinding,
+  anthropic_credential_blocked_until,
+  resolve_anthropic_credentials,
+)
 from agent_gateway.providers import StreamEvent
 
 
@@ -320,6 +336,7 @@ def _make_anthropic_api_status_error(
   message: str,
   *,
   body: dict[str, object] | None = None,
+  headers: dict[str, str] | None = None,
 ):
   anthropic = pytest.importorskip("anthropic")
   if body is None:
@@ -328,7 +345,7 @@ def _make_anthropic_api_status_error(
   response = httpx2.Response(
     status_code,
     request=request,
-    headers={"request-id": "req_123"},
+    headers={"request-id": "req_123", **(headers or {})},
     json=body,
   )
   return anthropic.APIStatusError(
@@ -1659,8 +1676,6 @@ def test_org_refusing_oauth_parks_that_member_and_rotates_to_the_next(
 ) -> None:
   """A 403 org OAuth refusal is per credential: pool siblings in other orgs answer."""
   refused, serving = "sk-ant-oat01-refused-org", "sk-ant-oat01-serving"
-  pool = AnthropicCredentialPool()
-  monkeypatch.setattr(anthropic_provider_module, "ANTHROPIC_CREDENTIAL_POOL", pool)
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", refused)
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([refused, serving]))
   monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
@@ -1680,15 +1695,770 @@ def test_org_refusing_oauth_parks_that_member_and_rotates_to_the_next(
   failure = provider.classify_credential_failure(exc_info.value)
 
   assert failure is not None and failure.kind == "auth"
-  serving_member = anthropic_provider_module.resolve_anthropic_credentials().by_token(serving)
-  assert serving_member is not None
-  assert provider.next_credential({"auth_mode": "oauth", "auth_token": refused}, failure) == {
-    "auth_mode": "oauth",
-    "api_key": "",
-    "auth_token": serving,
-    "credential_source": serving_member.source_metadata(),
+  refused_member = resolve_anthropic_credentials().by_token(refused)
+  serving_member = resolve_anthropic_credentials().by_token(serving)
+  assert refused_member is not None and serving_member is not None
+  rotated = provider.next_credential({"auth_mode": "oauth", "auth_token": refused}, failure)
+  assert rotated is not None
+  assert rotated["auth_mode"] == "oauth"
+  assert rotated["api_key"] == ""
+  assert rotated["auth_token"] == serving
+  assert rotated["credential_source"]["generation_ref"] == serving_member.generation_ref
+  assert rotated[CREDENTIAL_PREPARED_FIELD] is True
+  # The refusal parks the member in the shared sidecar, for every model.
+  assert anthropic_credential_blocked_until(refused_member, model="claude-sonnet-5") > time.time()
+  assert anthropic_credential_blocked_until(serving_member, model="claude-sonnet-5") <= time.time()
+
+
+_QUOTA_PARAMS: dict[str, object] = {
+  "model": "claude-sonnet-5",
+  "max_tokens": 16,
+  "messages": [{"role": "user", "content": "hello"}],
+  "_provider_auth_mode": "oauth",
+}
+_UNIFIED = "anthropic-ratelimit-unified-"
+
+
+def _binding(
+  store: Path,
+  identity: str = "acct-a",
+  *,
+  generation_id: str | None = None,
+  affinity_key: str | None = "aff-key",
+) -> AnthropicRequestBinding:
+  return AnthropicRequestBinding(
+    locator=anthropic_quota.locator_for_record(store, identity),
+    tier="private",
+    sidecar_store_path=store,
+    affinity_store_path=store,
+    generation_id=generation_id or f"gen-{identity}",
+    affinity_key=affinity_key,
+  )
+
+
+def _five_hour_headers(
+  *, utilization: float, reset_at: float, status: str = "allowed"
+) -> dict[str, str]:
+  return {
+    f"{_UNIFIED}5h-status": status,
+    f"{_UNIFIED}5h-utilization": str(utilization),
+    f"{_UNIFIED}5h-reset": str(int(reset_at)),
   }
-  assert pool.blocked_until(refused) > 0
+
+
+class _HeaderStreamContext(_StaticStreamContext):
+  def __init__(self, headers: dict[str, str]):
+    super().__init__([])
+    self.response = SimpleNamespace(headers=headers)
+
+
+class _HeaderStreamingClient:
+  """A client whose stream opens with these response headers, bound as `create_client` binds it."""
+
+  def __init__(self, headers: dict[str, str], binding: AnthropicRequestBinding):
+    stream = lambda **_kwargs: _HeaderStreamContext(headers)  # noqa: E731
+    self.messages = SimpleNamespace(stream=stream)
+    self.beta = SimpleNamespace(messages=SimpleNamespace(stream=stream))
+    self.hank_anthropic_binding = binding
+
+
+def test_stream_records_a_header_only_observation_and_affinity_for_the_exact_binding(
+  tmp_path: Path,
+) -> None:
+  store = tmp_path / "oauth.json"
+  binding = _binding(store, "acct-a")
+  sibling = _binding(store, "acct-b")
+  client = _HeaderStreamingClient(
+    _five_hour_headers(utilization=0.42, reset_at=time.time() + 3600), binding,
+  )
+
+  asyncio.run(_drain_stream(AnthropicProvider(), client, dict(_QUOTA_PARAMS)))
+
+  state = anthropic_quota.load_selection_state(store)
+  windows = {window.id: window for window in state.observations[binding.locator.id].windows}
+  # The headers describe the five-hour window only: no weekly window is invented.
+  assert set(windows) == {"five_hour"}
+  assert windows["five_hour"].used_fraction == pytest.approx(0.42)
+  assert windows["five_hour"].source == "response_header"
+  assert sibling.locator.id not in state.observations
+  assert state.affinity["aff-key"].locator_id == binding.locator.id
+
+
+def test_refresh_then_429_is_attributed_to_the_refreshed_generation(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  anthropic = pytest.importorskip("anthropic")
+  store = tmp_path / "oauth.json"
+  stale = _binding(store, "acct-stale", generation_id="gen-before")
+  refreshed = _binding(store, "acct-a", generation_id="gen-after")
+  bindings = {"stale-bearer": stale, "refreshed-bearer": refreshed}
+  bound_bearers: list[str] = []
+
+  def bind(config: object, bearer: str) -> AnthropicRequestBinding:
+    bound_bearers.append(bearer)
+    return bindings[bearer]
+
+  monkeypatch.setattr(
+    anthropic_provider_module,
+    "ensure_fresh_anthropic_credential",
+    lambda token, **_kwargs: "refreshed-bearer",
+  )
+  monkeypatch.setattr(anthropic_provider_module, "anthropic_request_binding", bind)
+  reset_at = time.time() + 2 * 3600
+  provider = AnthropicProvider()
+  client = provider.create_client({"auth_mode": "oauth", "auth_token": "stale-bearer"})
+
+  def handle_request(request: httpx2.Request) -> httpx2.Response:
+    assert request.headers["authorization"] == "Bearer refreshed-bearer"
+    return httpx2.Response(
+      429,
+      headers=_five_hour_headers(utilization=1.0, reset_at=reset_at, status="rejected"),
+      json={"type": "error", "error": {"type": "rate_limit_error", "message": "limit"}},
+    )
+
+  async def send_request() -> Exception:
+    try:
+      async with httpx2.AsyncClient(transport=httpx2.MockTransport(handle_request)) as http_client:
+        async with client.with_options(http_client=http_client) as local_client:
+          with pytest.raises(anthropic.RateLimitError) as caught:
+            await _drain_stream(provider, local_client, dict(_QUOTA_PARAMS))
+      return caught.value
+    finally:
+      await provider.close_client(client)
+
+  error = asyncio.run(send_request())
+
+  assert bound_bearers == ["refreshed-bearer"]
+  assert client.hank_anthropic_binding is refreshed
+  state = anthropic_quota.load_selection_state(store)
+  assert stale.locator.id not in state.observations
+  window = state.observations[refreshed.locator.id].windows[0]
+  assert (window.id, window.used_fraction) == ("five_hour", 1.0)
+  assert not state.affinity
+  failure = provider.classify_credential_failure(error)
+  assert failure is not None
+  assert (failure.kind, failure.limit_scope) == ("rate_limit", "shared")
+  assert failure.reset_at == pytest.approx(reset_at, abs=2.0)
+
+
+def test_create_client_does_not_refresh_a_prepared_config(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  pytest.importorskip("anthropic")
+  binding = _binding(tmp_path / "oauth.json")
+  bound_bearers: list[str] = []
+
+  def refuse_refresh(token: str, **_kwargs: object) -> str:
+    raise AssertionError("a prepared config's bearer is already fresh")
+
+  def bind(config: object, bearer: str) -> AnthropicRequestBinding:
+    bound_bearers.append(bearer)
+    return binding
+
+  monkeypatch.setattr(anthropic_provider_module, "ensure_fresh_anthropic_credential", refuse_refresh)
+  monkeypatch.setattr(anthropic_provider_module, "anthropic_request_binding", bind)
+  provider = AnthropicProvider()
+  client = provider.create_client(
+    {"auth_mode": "oauth", "auth_token": "prepared-bearer", CREDENTIAL_PREPARED_FIELD: True},
+  )
+  try:
+    assert client.auth_token == "prepared-bearer"
+    assert client.hank_anthropic_binding is binding
+    assert bound_bearers == ["prepared-bearer"]
+  finally:
+    asyncio.run(provider.close_client(client))
+
+
+@pytest.mark.parametrize(
+  ("status", "headers", "body"),
+  [
+    pytest.param(429, {}, None, id="concurrency-429-without-unified-headers"),
+    pytest.param(
+      429,
+      {
+        f"{_UNIFIED}5h-status": "allowed",
+        f"{_UNIFIED}7d-status": "allowed",
+        f"{_UNIFIED}representative-claim": "five_hour",
+      },
+      None,
+      id="concurrency-429-with-every-window-allowed",
+    ),
+    pytest.param(
+      529,
+      {},
+      {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}},
+      id="overload",
+    ),
+  ],
+)
+def test_concurrency_429_and_overload_classify_as_no_credential_failure(
+  status: int,
+  headers: dict[str, str],
+  body: dict[str, object] | None,
+) -> None:
+  error = _make_anthropic_api_status_error(status, "rate limit exceeded", body=body, headers=headers)
+
+  assert AnthropicProvider().classify_credential_failure(error) is None
+
+
+@pytest.mark.parametrize(
+  "family,claim",
+  [
+    ("opus", "seven_day_opus"),
+    ("fable", "seven_day_fable"),
+    ("fable", "seven_day_oi"),
+    ("fable", "7d_oi"),
+    ("mythos", "seven_day_mythos"),
+  ],
+)
+def test_quota_429_with_a_family_claim_parks_only_that_model_family(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  family: str,
+  claim: str,
+) -> None:
+  refused, serving = f"sk-ant-oat01-{family}-spent", f"sk-ant-oat01-{family}-serving"
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", refused)
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([refused, serving]))
+  monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+  monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "absent-oauth.json"))
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  reset_at = time.time() + 5 * 24 * 3600
+  error = _make_anthropic_api_status_error(
+    429,
+    "rate limit",
+    headers={
+      f"{_UNIFIED}status": "rejected",
+      f"{_UNIFIED}representative-claim": claim,
+      f"{_UNIFIED}reset": str(int(reset_at)),
+    },
+  )
+  provider = AnthropicProvider()
+  model = f"claude-{family}-5"
+  params = {**_QUOTA_PARAMS, "model": model}
+  with pytest.raises(Exception) as exc_info:
+    asyncio.run(_drain_stream(provider, _FakeClient(error), params))
+  assert exc_info.value is error
+
+  failure = provider.classify_credential_failure(error)
+
+  assert failure is not None
+  assert (failure.kind, failure.limit_scope) == ("rate_limit", family)
+  assert failure.reset_at == pytest.approx(reset_at, abs=2.0)
+  rotated = provider.next_credential(
+    {
+      "auth_mode": "oauth",
+      "auth_token": refused,
+      CREDENTIAL_AFFINITY_KEY_FIELD: "aff-key",
+      CREDENTIAL_MODEL_FAMILY_FIELD: family,
+    },
+    failure,
+  )
+  assert rotated is not None
+  assert rotated["auth_token"] == serving
+  assert rotated[CREDENTIAL_PREPARED_FIELD] is True
+  assert rotated[CREDENTIAL_AFFINITY_KEY_FIELD] == "aff-key"
+  assert rotated[CREDENTIAL_MODEL_FAMILY_FIELD] == family
+  refused_member = resolve_anthropic_credentials().by_token(refused)
+  assert refused_member is not None
+  assert anthropic_credential_blocked_until(refused_member, model=model) > time.time()
+  for healthy_family in ("opus", "sonnet", "fable", "mythos"):
+    if healthy_family != family:
+      assert anthropic_credential_blocked_until(
+        refused_member, model=f"claude-{healthy_family}-5",
+      ) <= time.time()
+
+
+def test_an_arbitrary_403_keeps_the_generic_mapping_and_parks_no_quota(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  seat = "sk-ant-oat01-arbitrary-403-seat"
+  monkeypatch.syspath_prepend(str(ROOT))
+  credentials = importlib.import_module("api.credentials")
+  for name in ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES:
+    monkeypatch.delenv(name, raising=False)
+  for name in ("ANTHROPIC_AUTH_MODE", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_BASE_URL"):
+    monkeypatch.delenv(name, raising=False)
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "user-data"))
+  monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "oauth.json"))
+  monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-arbitrary-403-key")
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([seat]))
+  provider = AnthropicProvider()
+
+  failure = provider.classify_credential_failure(
+    _make_anthropic_api_status_error(403, "Request not allowed"),
+  )
+
+  # Not a quota signal: the generic mapping, so no scope and no quota verdict.
+  assert failure is not None
+  assert (failure.kind, failure.status_code, failure.limit_scope) == ("billing", 403, None)
+  # An API key's billing denial still rotates to its seats (Henry 2026-10-13)...
+  config = credentials.get_anthropic_config()
+  assert config["auth_mode"] == "api"
+  rotated = provider.next_credential(config, failure)
+  assert rotated is not None
+  assert (rotated["auth_mode"], rotated["auth_token"]) == ("oauth", seat)
+  key = resolve_anthropic_credentials(
+    {ANTHROPIC_DEPLOYMENT_API_KEY_FIELD: config[ANTHROPIC_DEPLOYMENT_API_KEY_FIELD]},
+  ).credentials[0]
+  state = anthropic_quota.load_selection_state(key.sidecar_store_path)
+  assert {
+    cooldown.reason for rows in state.cooldowns.values() for cooldown in rows
+  } == {"billing"}
+  # ...while a seat's 403 is the organisation refusing the client and parks nothing.
+  assert provider.next_credential({"auth_mode": "oauth", "auth_token": seat}, failure) is None
+
+
+def test_a_403_with_billing_text_keeps_its_billing_verdict() -> None:
+  failure = AnthropicProvider().classify_credential_failure(
+    _make_anthropic_api_status_error(403, "Your credit balance is too low"),
+  )
+
+  assert failure is not None
+  assert (failure.kind, failure.retryable_with_new_credentials) == ("billing", True)
+
+
+def test_a_403_reporting_an_exhausted_window_is_a_quota_signal_through_the_stream_rejection() -> None:
+  reset_at = time.time() + 3600
+  error = _make_anthropic_api_status_error(
+    403,
+    "Request not allowed",
+    headers=_five_hour_headers(utilization=1.0, reset_at=reset_at, status="rejected"),
+  )
+  provider = AnthropicProvider()
+  with pytest.raises(RuntimeError) as exc_info:
+    asyncio.run(_drain_stream(provider, _FakeClient(error), dict(_QUOTA_PARAMS)))
+  assert exc_info.value is not error
+
+  failure = provider.classify_credential_failure(exc_info.value)
+
+  assert failure is not None
+  assert (failure.kind, failure.status_code, failure.limit_scope) == ("rate_limit", 403, "shared")
+  assert failure.reset_at == pytest.approx(reset_at, abs=2.0)
+
+
+@pytest.fixture
+def pool_tokens(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[str, str]:
+  tokens = ("sk-ant-oat01-prepare-first", "sk-ant-oat01-prepare-second")
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", tokens[0])
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps(list(tokens)))
+  monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+  monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "absent-oauth.json"))
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  # Ranking breaks ties by a session-seeded digest, so resolver order alone does not decide
+  # the winner; a higher policy priority makes `first` the explicit choice.
+  preferred = resolve_anthropic_credentials().by_token(tokens[0])
+  assert preferred is not None
+  anthropic_quota.set_account_policy(preferred.sidecar_store_path, preferred.locator, priority=1)
+  return tokens
+
+
+@pytest.fixture
+def usage_probes(monkeypatch: pytest.MonkeyPatch) -> list[list[anthropic_quota.ProbeTarget]]:
+  """Replace the usage probe with a recorder: no test reaches the live usage endpoint."""
+
+  batches: list[list[anthropic_quota.ProbeTarget]] = []
+
+  async def record(targets, **_kwargs):
+    batches.append(list(targets))
+    return {}
+
+  monkeypatch.setattr(anthropic_quota, "probe_usage_batch", record)
+  return batches
+
+
+def _pool_config(token: str, *, automatic: bool, **extra: object) -> dict[str, object]:
+  member = resolve_anthropic_credentials().by_token(token)
+  assert member is not None
+  source = {key: value for key, value in member.source_metadata().items() if key != "automatic"}
+  if automatic:
+    source["automatic"] = True
+  return {"auth_mode": "oauth", "auth_token": token, "credential_source": source, **extra}
+
+
+def _prepare(config: dict[str, object], session_id: str | None = "session-1") -> dict[str, object] | None:
+  return asyncio.run(
+    AnthropicProvider().prepare_credential(config, model="claude-sonnet-5", session_id=session_id)
+  )
+
+
+def test_prepare_credential_keeps_an_exact_source_and_ranks_the_pool_for_an_automatic_one(
+  pool_tokens: tuple[str, str],
+  usage_probes: list[list[anthropic_quota.ProbeTarget]],
+) -> None:
+  first, second = pool_tokens
+  assert _prepare(_pool_config(first, automatic=False)) is None
+  assert usage_probes == []
+
+  material = _prepare(_pool_config(first, automatic=True))
+
+  assert material is not None
+  assert material["auth_token"] == first
+  assert material[CREDENTIAL_PREPARED_FIELD] is True
+  assert material[CREDENTIAL_AFFINITY_KEY_FIELD] == anthropic_quota.affinity_key("", "session-1")
+  assert material[CREDENTIAL_AFFINITY_KEY_FIELD] is not None
+  assert material[CREDENTIAL_MODEL_FAMILY_FIELD] == "sonnet"
+  # Stateless requests share no affinity.
+  stateless = _prepare(_pool_config(first, automatic=True), session_id="no-session")
+  assert stateless is not None and stateless[CREDENTIAL_AFFINITY_KEY_FIELD] is None
+
+  # The selection reads the shared sidecar: a cooled account yields to its sibling.
+  member = resolve_anthropic_credentials().by_token(first)
+  assert member is not None
+  anthropic_quota.record_cooldown(
+    member.sidecar_store_path,
+    member.locator,
+    anthropic_quota.Cooldown(scope="shared", until=time.time() + 3600, reason="quota"),
+  )
+  rerouted = _prepare(_pool_config(first, automatic=True))
+  assert rerouted is not None and rerouted["auth_token"] == second
+
+
+def test_prepare_fallback_refreshes_a_recovered_oauth_grant_on_the_first_client_build(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  usage_probes: list[list[anthropic_quota.ProbeTarget]],
+) -> None:
+  pytest.importorskip("anthropic")
+  for name in ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES:
+    monkeypatch.delenv(name, raising=False)
+  store = tmp_path / "oauth.json"
+  monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(store))
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  stale_token, fresh_token = "sk-ant-oat01-expired", "sk-ant-oat01-recovered"
+  [record] = anthropic_oauth.upsert_anthropic_oauth_record(
+    store,
+    anthropic_oauth.AnthropicOAuthRecord(
+      identity="recovering@example.com",
+      access_token=stale_token,
+      refresh_token="sk-ant-ort01-recovering",
+      expires_at=0.0,
+    ),
+  )
+  exchanges: list[str] = []
+
+  def post(url: str, body: anthropic_oauth.JSONMapping) -> anthropic_oauth.JSONMapping:
+    exchanges.append(str(body["refresh_token"]))
+    if len(exchanges) == 1:
+      raise anthropic_oauth.AnthropicOAuthError("token endpoint temporarily unavailable")
+    return {
+      "access_token": fresh_token,
+      "refresh_token": "sk-ant-ort01-recovered",
+      "expires_in": 28800,
+    }
+
+  monkeypatch.setattr(anthropic_oauth, "_post_token_endpoint", post)
+  sources = resolve_anthropic_credentials()
+  fallback = anthropic_oauth.select_anthropic_credential_source(sources)
+  assert fallback is not None and fallback.token == stale_token
+  [cooldown] = anthropic_quota.load_selection_state(store).cooldowns[fallback.locator.id]
+  assert cooldown.reason == "refresh_failed" and cooldown.until > time.time()
+  assert len(exchanges) == 1
+
+  # The endpoint has recovered, but the pool still returns its blocked fallback.
+  # Explicit False must replace a prepared flag retained from an earlier build.
+  config = _pool_config(stale_token, automatic=True, **{CREDENTIAL_PREPARED_FIELD: True})
+  material = _prepare(config)
+  assert material is not None
+  assert material["auth_token"] == stale_token
+  assert material[CREDENTIAL_PREPARED_FIELD] is False
+  assert len(exchanges) == 1
+  assert usage_probes == []
+
+  provider = AnthropicProvider()
+  client = provider.create_client({**config, **material})
+  try:
+    assert len(exchanges) == 2
+    assert client.auth_token == fresh_token
+    assert client.hank_anthropic_binding.generation_id == record.generation_id
+    [stored] = anthropic_oauth.load_anthropic_oauth_store(store)
+    assert stored.access_token == fresh_token
+  finally:
+    asyncio.run(provider.close_client(client))
+
+
+@pytest.mark.parametrize("key_blocked", [False, True])
+def test_hosted_external_prepare_never_selects_a_setup_token(
+  pool_tokens: tuple[str, str],
+  usage_probes: list[list[anthropic_quota.ProbeTarget]],
+  key_blocked: bool,
+) -> None:
+  key = anthropic_oauth.register_anthropic_static_credential("sk-ant-api03-hosted")
+  assert key is not None
+  if key_blocked:
+    anthropic_quota.record_cooldown(
+      key.sidecar_store_path,
+      key.locator,
+      anthropic_quota.Cooldown("shared", time.time() + 3600, "quota"),
+    )
+  config: dict[str, object] = {
+    "auth_mode": "api",
+    "api_key": key.token,
+    "credential_source": {**key.source_metadata(), "automatic": True},
+    ANTHROPIC_DEPLOYMENT_API_KEY_FIELD: key.generation_ref,
+    "placement": "hosted_external",
+  }
+
+  material = _prepare(config)
+
+  assert material is not None
+  assert material["auth_mode"] == "api"
+  assert material["api_key"] == key.token
+  assert material["auth_token"] == ""
+  assert material["credential_source"] == {**key.source_metadata(), "automatic": True}
+
+
+def test_prepare_credential_probes_stale_subscription_accounts_on_the_direct_route_only(
+  pool_tokens: tuple[str, str],
+  usage_probes: list[list[anthropic_quota.ProbeTarget]],
+) -> None:
+  first, second = pool_tokens
+
+  assert _prepare(_pool_config(first, automatic=True)) is not None
+
+  assert len(usage_probes) == 1
+  members = [resolve_anthropic_credentials().by_token(token) for token in (first, second)]
+  assert all(member is not None for member in members)
+  assert {target.locator.id for target in usage_probes[0]} == {
+    member.locator.id for member in members if member is not None
+  }
+  usage_probes.clear()
+
+  custom = _pool_config(first, automatic=True, baseURL="https://gateway.example.com")
+  assert _prepare(custom) is not None
+  assert usage_probes == []
+
+
+def test_concurrent_prepare_credential_claims_one_usage_probe_without_waiting(
+  monkeypatch: pytest.MonkeyPatch,
+  pool_tokens: tuple[str, str],
+) -> None:
+  first, _second = pool_tokens
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([first]))
+  member = resolve_anthropic_credentials().by_token(first)
+  assert member is not None
+  config = _pool_config(first, automatic=True)
+  real_probe = anthropic_quota.probe_usage_batch
+  requested: list[str] = []
+
+  async def exercise() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+      requested.append(request.headers["authorization"])
+      entered.set()
+      await release.wait()
+      return httpx.Response(200, json={"five_hour": {"utilization": 10}})
+
+    async def probe_through_fixture(targets, **kwargs):
+      return await real_probe(targets, transport=httpx.MockTransport(handle), **kwargs)
+
+    monkeypatch.setattr(anthropic_quota, "probe_usage_batch", probe_through_fixture)
+    started_at = time.time()
+    first_prepare = asyncio.create_task(AnthropicProvider().prepare_credential(
+      config, model="claude-sonnet-5", session_id="first-prepare",
+    ))
+    try:
+      await asyncio.wait_for(entered.wait(), timeout=1.0)
+      probe = anthropic_quota.load_selection_state(member.sidecar_store_path).observations[
+        member.locator.id
+      ].probe
+      assert probe.in_progress_until is not None
+      assert started_at < probe.in_progress_until
+      assert probe.in_progress_until <= (
+        time.time() + anthropic_quota.PROBE_BATCH_BUDGET_SECONDS + 0.75
+      )
+      second_material = await asyncio.wait_for(
+        AnthropicProvider().prepare_credential(
+          config, model="claude-sonnet-5", session_id="second-prepare",
+        ),
+        timeout=1.0,
+      )
+      assert second_material is not None and second_material["auth_token"] == first
+      assert not first_prepare.done()
+      assert requested == [f"Bearer {first}"]
+    finally:
+      release.set()
+      first_material = await asyncio.wait_for(
+        first_prepare, timeout=anthropic_quota.PROBE_BATCH_BUDGET_SECONDS + 1.0,
+      )
+    assert first_material is not None and first_material["auth_token"] == first
+
+  asyncio.run(exercise())
+
+  assert requested == [f"Bearer {first}"]
+  observation = anthropic_quota.load_selection_state(member.sidecar_store_path).observations[
+    member.locator.id
+  ]
+  assert observation.probe.in_progress_until is None
+  assert observation.probe.last_usage_at is not None
+  assert observation.windows and observation.windows[0].used_fraction == pytest.approx(0.1)
+
+
+def test_prepare_credential_probes_after_an_in_progress_marker_expires(
+  monkeypatch: pytest.MonkeyPatch,
+  pool_tokens: tuple[str, str],
+) -> None:
+  first, _second = pool_tokens
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([first]))
+  member = resolve_anthropic_credentials().by_token(first)
+  assert member is not None
+  anthropic_quota.record_probe_state(
+    member.sidecar_store_path,
+    member.locator,
+    anthropic_quota.UsageProbeState(in_progress_until=time.time() - 1.0),
+  )
+  real_probe = anthropic_quota.probe_usage_batch
+  requested: list[str] = []
+
+  def handle(request: httpx.Request) -> httpx.Response:
+    requested.append(request.headers["authorization"])
+    return httpx.Response(200, json={"five_hour": {"utilization": 20}})
+
+  async def probe_through_fixture(targets, **kwargs):
+    return await real_probe(targets, transport=httpx.MockTransport(handle), **kwargs)
+
+  monkeypatch.setattr(anthropic_quota, "probe_usage_batch", probe_through_fixture)
+
+  material = _prepare(_pool_config(first, automatic=True))
+
+  assert material is not None and material["auth_token"] == first
+  assert requested == [f"Bearer {first}"]
+  observation = anthropic_quota.load_selection_state(member.sidecar_store_path).observations[
+    member.locator.id
+  ]
+  assert observation.probe.in_progress_until is None
+  assert observation.probe.last_usage_at is not None
+  assert observation.windows and observation.windows[0].used_fraction == pytest.approx(0.2)
+
+
+def test_usage_probe_claim_in_another_process_honors_a_live_marker_without_waiting(
+  pool_tokens: tuple[str, str],
+) -> None:
+  first, _second = pool_tokens
+  member = resolve_anthropic_credentials().by_token(first)
+  assert member is not None
+  now = time.time()
+  assert anthropic_quota.claim_usage_probe(
+    member.sidecar_store_path, member.locator, generation=member.generation_id or None, now=now,
+  )
+  before = anthropic_quota.load_selection_state(member.sidecar_store_path).observations[
+    member.locator.id
+  ].probe
+  assert before.in_progress_until is not None
+  # Keep the claim's logical clock fixed across interpreter startup. The child's
+  # elapsed measurement covers only the shared-store claim, not import overhead.
+  child = subprocess.run(
+    [
+      sys.executable,
+      "-c",
+      """
+import json
+import sys
+import time
+from pathlib import Path
+from agent_gateway.providers import anthropic_quota
+
+store_path, namespace, identity, generation, now = sys.argv[1:]
+started = time.monotonic()
+claimed = anthropic_quota.claim_usage_probe(
+  Path(store_path),
+  anthropic_quota.AccountLocator(namespace=namespace, identity=identity),
+  generation=json.loads(generation),
+  now=float(now),
+)
+print(json.dumps({"claimed": claimed, "elapsed": time.monotonic() - started}))
+""",
+      str(member.sidecar_store_path),
+      member.locator.namespace,
+      member.locator.identity,
+      json.dumps(member.generation_id or None),
+      str(now),
+    ],
+    cwd=PKG_DIR,
+    check=True,
+    capture_output=True,
+    text=True,
+    timeout=10.0,
+  )
+
+  result = json.loads(child.stdout)
+  assert result["claimed"] is False
+  assert result["elapsed"] < 1.0
+  after = anthropic_quota.load_selection_state(member.sidecar_store_path).observations[
+    member.locator.id
+  ].probe
+  assert after == before
+
+
+def test_prepare_credential_still_selects_when_the_usage_probe_is_forbidden(
+  monkeypatch: pytest.MonkeyPatch,
+  pool_tokens: tuple[str, str],
+) -> None:
+  first, _second = pool_tokens
+  real_probe = anthropic_quota.probe_usage_batch
+  requested: list[str] = []
+
+  def forbidden(request: httpx.Request) -> httpx.Response:
+    requested.append(request.url.host)
+    return httpx.Response(403, json={"error": {"type": "permission_error", "message": "nope"}})
+
+  async def probe_through_fixture(targets, **kwargs):
+    return await real_probe(targets, transport=httpx.MockTransport(forbidden), **kwargs)
+
+  monkeypatch.setattr(anthropic_quota, "probe_usage_batch", probe_through_fixture)
+
+  material = _prepare(_pool_config(first, automatic=True))
+
+  assert material is not None and material["auth_token"] == first
+  assert requested == ["api.anthropic.com", "api.anthropic.com"]
+  member = resolve_anthropic_credentials().by_token(first)
+  assert member is not None
+  probe = anthropic_quota.load_selection_state(member.sidecar_store_path).observations[
+    member.locator.id
+  ].probe
+  assert probe.unavailable_reason == "http_403"
+  assert probe.unavailable_until is not None and probe.unavailable_until > time.time()
+  # The verdict holds for the credential: the next preparation does not probe again.
+  requested.clear()
+  assert _prepare(_pool_config(first, automatic=True)) is not None
+  assert requested == []
+
+
+def test_prepare_credential_selects_without_telemetry_when_the_probe_fails(
+  monkeypatch: pytest.MonkeyPatch,
+  pool_tokens: tuple[str, str],
+) -> None:
+  first, _second = pool_tokens
+
+  async def broken(targets, **_kwargs):
+    raise RuntimeError("usage telemetry exploded")
+
+  monkeypatch.setattr(anthropic_quota, "probe_usage_batch", broken)
+
+  material = _prepare(_pool_config(first, automatic=True))
+
+  assert material is not None and material["auth_token"] == first
+
+
+def test_prepare_credential_is_a_no_op_for_an_api_key_only_config(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  usage_probes: list[list[anthropic_quota.ProbeTarget]],
+) -> None:
+  for name in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKENS", "CLAUDE_CODE_OAUTH_TOKEN"):
+    monkeypatch.delenv(name, raising=False)
+  monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "absent-oauth.json"))
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+
+  assert _prepare({"auth_mode": "api", "api_key": "sk-ant-api03-only"}) is None
+
+  assert usage_probes == []
+  assert list(tmp_path.rglob("*.selection.json")) == []
 
 
 def test_stream_separates_provider_ping_from_silent_progress_metadata() -> None:
