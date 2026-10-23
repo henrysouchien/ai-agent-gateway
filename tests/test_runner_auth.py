@@ -208,6 +208,8 @@ def _rotated_material(
   """
   material: dict[str, Any] = {
     "auth_mode": "oauth",
+    "auth_mechanism": credential.auth_mechanism,
+    "entitlement_kind": credential.entitlement_kind,
     "api_key": "",
     "auth_token": credential.token,
     "credential_source": {**credential.source_metadata(), "automatic": True},

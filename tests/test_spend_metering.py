@@ -531,3 +531,108 @@ def test_a_cancelled_sdk_query_records_the_calls_observed_before_the_result() ->
   )
   assert row["api_calls"] == 1 and row["auth_kind"] == "payg_api_key"
   assert row["shadow_cost_usd"] is not None
+
+
+# ── rotation must not carry the previous credential's class ─────────────────────
+
+
+def _stamped(mechanism: str, entitlement: str, **material: Any) -> dict[str, Any]:
+  return {
+    "provider": "anthropic",
+    "max_tokens": 4096,
+    "auth_mechanism": mechanism,
+    "entitlement_kind": entitlement,
+    **material,
+  }
+
+
+SEAT = _stamped(
+  "oauth_bearer", "operator_personal_subscription",
+  auth_mode="oauth", auth_token="sk-ant-oat-seat", api_key="",
+)
+KEY = _stamped(
+  "api_key", "org_commercial", auth_mode="api", api_key="sk-ant-api-key-1", auth_token="",
+)
+
+
+def _unstamped_material(**material: Any) -> dict[str, Any]:
+  return dict(material)
+
+
+def test_a_seat_rotated_to_an_api_key_is_classified_and_refused_as_payg() -> None:
+  from agent_gateway.runner_auth import merge_refreshed_auth_config
+
+  merged = merge_refreshed_auth_config(
+    SEAT, _unstamped_material(auth_mode="api", api_key="sk-ant-api-key-1", auth_token=""),
+  )
+
+  assert (merged["auth_mechanism"], merged["entitlement_kind"]) == ("api_key", "org_commercial")
+  _freeze_payg()
+  meter = _meter(_Provider(_ok_step()), merged)
+  assert meter.credential.auth_kind == "payg_api_key"
+  assert meter.credential.fingerprint == fingerprint_credential("sk-ant-api-key-1")
+  with pytest.raises(SpendBudgetBlocked):
+    meter.enforce()
+
+
+def test_an_api_key_rotated_to_a_seat_is_classified_as_a_subscription_and_not_refused() -> None:
+  from agent_gateway.runner_auth import merge_refreshed_auth_config
+
+  merged = merge_refreshed_auth_config(
+    KEY, _unstamped_material(auth_mode="oauth", api_key="", auth_token="sk-ant-oat-seat"),
+  )
+
+  assert (merged["auth_mechanism"], merged["entitlement_kind"]) == (
+    "oauth_bearer", "operator_personal_subscription",
+  )
+  _freeze_payg()
+  meter = _meter(_Provider(_ok_step()), merged)
+  assert meter.credential.auth_kind == "oauth_subscription"
+  meter.enforce()
+  asyncio.run(_drain(meter))
+  [row] = _rows()
+  assert (row["status"], row["auth_kind"], row["payg_cost_usd"]) == ("ok", "oauth_subscription", 0.0)
+
+
+def test_a_refresh_that_restamps_its_class_keeps_the_stamp_it_supplied() -> None:
+  from agent_gateway.runner_auth import merge_refreshed_auth_config
+
+  merged = merge_refreshed_auth_config(
+    SEAT,
+    _stamped("api_key", "commercial_byok", auth_mode="api", api_key="k2", auth_token=""),
+  )
+
+  assert (merged["auth_mechanism"], merged["entitlement_kind"]) == ("api_key", "commercial_byok")
+
+
+def test_a_refresh_of_the_same_material_keeps_its_stamps() -> None:
+  from agent_gateway.runner_auth import merge_refreshed_auth_config
+
+  merged = merge_refreshed_auth_config(KEY, _unstamped_material(account_identity="acct"))
+
+  assert (merged["auth_mechanism"], merged["entitlement_kind"]) == ("api_key", "org_commercial")
+
+
+@pytest.mark.parametrize(
+  ("record_kind", "token", "expected"),
+  [
+    ("api_key", "sk-ant-api-key-1", ("api_key", "org_commercial")),
+    ("subscription", "sk-ant-oat-seat", ("oauth_bearer", "operator_personal_subscription")),
+  ],
+)
+def test_anthropic_rotation_material_stamps_the_class_of_the_member_it_names(
+  record_kind: str, token: str, expected: tuple[str, str],
+) -> None:
+  from agent_gateway.providers.anthropic import _credential_material
+
+  selected = SimpleNamespace(
+    record=SimpleNamespace(credential_kind=record_kind),
+    token=token,
+    store_path=None,
+    prepared=False,
+    source_metadata=lambda: {"account_identity": "acct"},
+  )
+
+  material = _credential_material(selected, SEAT)  # type: ignore[arg-type]
+
+  assert (material["auth_mechanism"], material["entitlement_kind"]) == expected

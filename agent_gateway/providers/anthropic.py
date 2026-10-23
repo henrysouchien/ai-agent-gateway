@@ -6,6 +6,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, Literal, Mapping
 
 from ..auth import ProviderCredentialFailure
@@ -61,6 +62,7 @@ from .anthropic_oauth import (
   AnthropicCredential,
   AnthropicCredentialSources,
   AnthropicRequestBinding,
+  anthropic_credential_mechanism_and_entitlement,
   anthropic_request_binding,
   anthropic_pool_config,
   record_anthropic_success,
@@ -458,12 +460,24 @@ def _record_stream_success(binding: AnthropicRequestBinding | None) -> None:
 def _credential_material(
   selected: AnthropicCredential,
   config: Mapping[str, Any],
+  *,
+  user_store_path: Path | None = None,
 ) -> dict[str, Any]:
-  """Auth material for a selected or rotated member, in the shape the runner merges."""
+  """Auth material for a selected or rotated member, in the shape the runner merges.
+
+  It stamps `auth_mechanism` and `entitlement_kind` for the member it names: a
+  rotation between a seat and an API key changes what the call costs, and the
+  spend ledger and placement read the stamp.
+  """
 
   is_api_key = selected.record is not None and selected.record.credential_kind == "api_key"
+  mechanism, entitlement = anthropic_credential_mechanism_and_entitlement(
+    selected, user_store_path=user_store_path,
+  )
   material: dict[str, Any] = {
     "auth_mode": "api" if is_api_key else "oauth",
+    "auth_mechanism": mechanism,
+    "entitlement_kind": entitlement,
     "api_key": selected.token if is_api_key else "",
     "auth_token": "" if is_api_key else selected.token,
     "credential_source": selected.source_metadata(),
@@ -888,7 +902,7 @@ class AnthropicProvider(ModelProvider):
     )
     if selected is None:
       return None
-    material = _credential_material(selected, config)
+    material = _credential_material(selected, config, user_store_path=sources.user_store_path)
     material[CREDENTIAL_AFFINITY_KEY_FIELD] = anthropic_quota.affinity_key(
       sources.user_scope, session_id,
     )
@@ -1009,7 +1023,7 @@ class AnthropicProvider(ModelProvider):
         len(sources.credentials),
       )
       return None
-    rotated = _credential_material(selected, config)
+    rotated = _credential_material(selected, config, user_store_path=sources.user_store_path)
     for field in (CREDENTIAL_AFFINITY_KEY_FIELD, CREDENTIAL_MODEL_FAMILY_FIELD):
       if field in config:
         rotated[field] = config[field]

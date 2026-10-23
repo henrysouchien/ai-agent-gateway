@@ -484,6 +484,7 @@ class CapabilityExecutionResolver:
     """
     from .providers.anthropic_oauth import (
       anthropic_credential_blocked_until,
+      anthropic_credential_mechanism_and_entitlement,
       anthropic_pool_config,
       resolve_anthropic_credentials,
       select_anthropic_credential_source,
@@ -539,8 +540,13 @@ class CapabilityExecutionResolver:
       is_api_key = selected.record is not None and selected.record.credential_kind == "api_key"
       credential_field = "api_key" if is_api_key else "auth_token"
       if selected.token != config.get(credential_field):
+        stamp_mechanism, stamp_entitlement = anthropic_credential_mechanism_and_entitlement(
+          selected, user_store_path=sources.user_store_path,
+        )
         account = {
           "auth_mode": "api" if is_api_key else "oauth",
+          "auth_mechanism": stamp_mechanism,
+          "entitlement_kind": stamp_entitlement,
           "api_key": selected.token if is_api_key else "",
           "auth_token": "" if is_api_key else selected.token,
           "credential_source": selected.source_metadata(),

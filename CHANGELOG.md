@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.28.1 (2026-10-23)
+
+### Fixed
+
+- A credential rotation or re-rank no longer leaves the previous credential's `auth_mechanism`/`entitlement_kind` on the auth config. `AnthropicProvider` rotation and preparation material and the model-fallback rebind now stamp the selected member's class, and `merge_refreshed_auth_config` re-derives a stamp the refresh did not supply whenever the api key, auth token or auth mode changes. Before, a PAYG API key reached from an OAuth seat was metered as `oauth_subscription` (skipping `freeze_payg` and ceilings, ledgered at $0 PAYG) and the reverse refused a seat as PAYG.
+
 ## 0.28.0 (2026-10-23)
 
 ### Breaking

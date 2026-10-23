@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+from .auth import derive_auth_mechanism_and_entitlement
+
 _SELECTION_AUTH_CONFIG_FIELDS = frozenset({
   "effort",
   "execution_transport",
@@ -10,6 +12,8 @@ _SELECTION_AUTH_CONFIG_FIELDS = frozenset({
   "thinking",
   "thinking_enabled_requested",
 })
+
+_CREDENTIAL_CLASS_FIELDS = ("auth_mechanism", "entitlement_kind")
 
 
 def merge_refreshed_auth_config(
@@ -27,6 +31,12 @@ def merge_refreshed_auth_config(
   then replace fields supplied by the new seat. `auth_user_scope` is the
   exception: an existing trusted scope is pinned.
   Selection copies are dropped and bound values overwrite the resolver.
+
+  `auth_mechanism` and `entitlement_kind` classify the serving material (the
+  spend ledger's PAYG-vs-seat decision and placement eligibility read them). A
+  rotation that changes the material without restamping them must not keep the
+  previous credential's class: each one the refresh does not supply is
+  re-derived from the merged material.
   """
 
   provider = str(config.get("provider") or "").strip().lower()
@@ -56,5 +66,20 @@ def merge_refreshed_auth_config(
       merged[key] = config[key]
   merged["api_key"] = str(merged.get("api_key", ""))
   merged["auth_token"] = str(merged.get("auth_token", ""))
+
+  def _material(source: Dict[str, Any]) -> tuple[str, str, str]:
+    return (
+      str(source.get("api_key") or ""),
+      str(source.get("auth_token") or ""),
+      str(source.get("auth_mode", "api")).strip().lower(),
+    )
+
+  stale = [field for field in _CREDENTIAL_CLASS_FIELDS if field in config and field not in refreshed]
+  if stale and _material(merged) != _material(config):
+    live = {key: value for key, value in merged.items() if key not in _CREDENTIAL_CLASS_FIELDS}
+    mechanism, entitlement = derive_auth_mechanism_and_entitlement(live)
+    derived = {"auth_mechanism": mechanism, "entitlement_kind": entitlement}
+    for field in stale:
+      merged[field] = derived[field]
   return merged
 
