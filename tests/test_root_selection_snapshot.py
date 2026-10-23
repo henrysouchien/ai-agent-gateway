@@ -231,7 +231,7 @@ def test_batch_stage_factory_captures_once_and_forwards_to_child(
     assert received_resolver is resolver
     assert catalog is operation_catalog
 
-    def admit_stage(request: SpawnRequest, _tool_ceiling: frozenset[str]):
+    def admit_stage(request: SpawnRequest):
       return _admit_child(parent, received_resolver, session, request)
 
     return admit_stage
@@ -243,7 +243,7 @@ def test_batch_stage_factory_captures_once_and_forwards_to_child(
     async def run_acquired_batch(self, _batch_id: int, _payload: dict[str, Any], **kwargs: Any):
       factory = kwargs["admit_stage_factory"]
       stage = factory(SimpleNamespace(research_file_id=42))
-      children.append(stage(SpawnRequest(operation="explore", task="Read evidence"), frozenset({"file_read"})))
+      children.append(stage(SpawnRequest(operation="explore", task="Read evidence")))
 
   async def open_context(**_kwargs: Any) -> None:
     raise AssertionError("this stage admission test does not execute a worker")

@@ -29,6 +29,7 @@ from .learning_fork_trigger import (
   successful_memory_write_from_events,
 )
 from .runner_fork_agents import fork_suffix_messages
+from .skill_lifecycle import drain_owned_lifecycle_task
 from .runner_limits import (
   ContextPressureReminderDecision,
   TokenEstimateSnapshot,
@@ -966,6 +967,18 @@ def _deliver_todo_analyst_note(
     current_messages.append(user_turn_message(note))
 
 
+
+def _anchored_compaction_estimate(
+  est_total_tokens: int,
+  last_real_input: int | None,
+  last_real_est: int | None,
+) -> int:
+  if last_real_input is None:
+    return est_total_tokens
+  est_delta = max(0, est_total_tokens - last_real_est) if last_real_est is not None else 0
+  return last_real_input + est_delta
+
+
 class RunnerRunLoopMixin:
   _stream_started_at: float | None = None
   _approval_park: ApprovalPark | None = None
@@ -1194,6 +1207,7 @@ class RunnerRunLoopMixin:
     ]
     _portable_compaction_failed_est_at: int | None
     _portable_compaction_floor_warned: bool
+    _portable_compaction_last_failed_turn: int | None
     _portable_compaction_last_turn: int | None
     _prepared_top_level_terminal_event: Dict[str, Any] | None
     _sub_agent_semaphore: asyncio.Semaphore | None
@@ -2109,6 +2123,38 @@ class RunnerRunLoopMixin:
     )
     return await self._aggregator.snapshot(**snapshot_kwargs)
 
+  async def _close_snapshot_and_emit_usage(
+    self,
+    *,
+    time_module: types.ModuleType,
+    drain_state: Any,
+    logger: logging.Logger,
+  ) -> None:
+    """Close the run's aggregator and deliver its row to `on_session_summary`.
+
+    Neither step is allowed to fail the run: a failed snapshot still marks the
+    summary emitted, with no row to deliver.
+    """
+    row_summary: SessionUsageSummary | None = None
+    try:
+      row_summary = await self._close_and_snapshot_usage(
+        time_module=time_module, drain_state=drain_state,
+      )
+    except Exception as exc:
+      logger.error(
+        "[%s] session summary snapshot failed (non-fatal) | exception_type=%s",
+        self._sid,
+        type(exc).__name__,
+      )
+    try:
+      await self._emit_session_summary(row_summary)
+    except Exception as exc:
+      logger.error(
+        "[%s] session summary emission failed (non-fatal) | exception_type=%s",
+        self._sid,
+        type(exc).__name__,
+      )
+
   async def _emit_session_summary(
     self, row_summary: SessionUsageSummary | None,
   ) -> None:
@@ -2153,20 +2199,35 @@ class RunnerRunLoopMixin:
         self._unsettled_workflow_obstruction_count()
       ),
     )
-    row_summary: SessionUsageSummary | None = None
     if self._parent_aggregator is None:
+      # Close the aggregator and deliver the row to `on_session_summary` (the
+      # cost record) before the closure settlement: a runner task that is
+      # cancelled, timed out or shut down mid-settlement never reaches a clean
+      # detach, and its row must still be written exactly once. The task is
+      # shielded so that cancelling this waiter does not abandon the write.
+      usage_task = asyncio.create_task(
+        self._close_snapshot_and_emit_usage(
+          time_module=time_module,
+          drain_state=drain_state,
+          logger=logger,
+        )
+      )
       try:
-        row_summary = await self._close_and_snapshot_usage(
-          time_module=time_module, drain_state=drain_state,
-        )
-      except BaseException as exc:
-        if isinstance(exc, asyncio.CancelledError):
-          finalizer_errors.append(exc)
-        logger.error(
-          "[%s] session summary snapshot failed (non-fatal) | exception_type=%s",
-          self._sid,
-          type(exc).__name__,
-        )
+        await asyncio.shield(usage_task)
+      except asyncio.CancelledError as exc:
+        finalizer_errors.append(exc)
+        try:
+          await drain_owned_lifecycle_task(usage_task)
+        except asyncio.CancelledError:
+          pass
+        except Exception as drain_exc:
+          logger.error(
+            "[%s] session summary emission failed (non-fatal) | exception_type=%s",
+            self._sid,
+            type(drain_exc).__name__,
+          )
+    else:
+      self._summary_emitted = True
     try:
       flush_learning_fork_events(self)
       settlement_succeeded = await self._settle_run_closure(
@@ -2183,19 +2244,6 @@ class RunnerRunLoopMixin:
       finalizer_errors.append(exc)
     finally:
       self._run_closure_deferred = False
-    if self._parent_aggregator is None:
-      try:
-        await self._emit_session_summary(row_summary)
-      except BaseException as exc:
-        if isinstance(exc, asyncio.CancelledError):
-          finalizer_errors.append(exc)
-        logger.error(
-          "[%s] session summary emission failed (non-fatal) | exception_type=%s",
-          self._sid,
-          type(exc).__name__,
-        )
-    else:
-      self._summary_emitted = True
     self_task = self._admitted_self_task
     # Only a durably registered own job has a journal entry to settle.
     if (
@@ -3639,6 +3687,9 @@ class RunnerRunLoopMixin:
       model_visible_synthesis_credits_granted = 0
       current_messages = list(messages)
       last_real_stream_input_tokens: int | None = None
+      # The local estimate of the request that produced that real count, so the
+      # next turn's growth is measured in estimate units and added to it.
+      last_real_stream_est_tokens: int | None = None
 
       def reset_logical_response_lineage() -> None:
         nonlocal logical_response_id
@@ -3876,9 +3927,11 @@ class RunnerRunLoopMixin:
         pending_notifications_at_render = (
           self._notification_queue.pending_count
         )
-        est_for_compaction = int(estimate_snapshot.est_total_tokens)
-        if last_real_stream_input_tokens is not None:
-          est_for_compaction = max(est_for_compaction, last_real_stream_input_tokens)
+        est_for_compaction = _anchored_compaction_estimate(
+          int(estimate_snapshot.est_total_tokens),
+          last_real_stream_input_tokens,
+          last_real_stream_est_tokens,
+        )
 
         turn_usage_before = usage_snapshot(usage_totals)
         turn_cost = 0.0
@@ -3920,6 +3973,7 @@ class RunnerRunLoopMixin:
           nonlocal portable_compaction_applied
           nonlocal est_for_compaction
           nonlocal last_real_stream_input_tokens
+          nonlocal last_real_stream_est_tokens
           nonlocal estimated_cost
           nonlocal turn_cost
           compact_result = await maybe_compact_current_messages(
@@ -3930,6 +3984,7 @@ class RunnerRunLoopMixin:
             est_total_tokens=est_for_compaction,
             turn_count=turn_count,
             last_compact_turn=getattr(self, "_portable_compaction_last_turn", None),
+            last_compact_failed_turn=None if force else getattr(self, "_portable_compaction_last_failed_turn", None),
             failed_est_at=None if force else getattr(self, "_portable_compaction_failed_est_at", None),
             preserve_tool_result_ids=pending_model_visible_tool_result_ids,
             tools=base_kwargs.get("tools") or [],
@@ -4006,6 +4061,7 @@ class RunnerRunLoopMixin:
               })
             est_for_compaction = compact_result.est_after
             self._portable_compaction_last_turn = turn_count
+            self._portable_compaction_last_failed_turn = None
             self._portable_compaction_failed_est_at = None
             self._append({
               "type": "compaction",
@@ -4022,9 +4078,11 @@ class RunnerRunLoopMixin:
               last_real_stream_input_tokens if last_real_stream_input_tokens is not None else "n/a",
             )
             last_real_stream_input_tokens = None
+            last_real_stream_est_tokens = None
             return True
           if compact_result.reason == "summary_too_short":
             self._portable_compaction_failed_est_at = compact_result.est_before
+            self._portable_compaction_last_failed_turn = turn_count
           if (
             compact_result.reason == "insufficient_gain"
             and est_for_compaction >= int(effective_compaction_trigger or 0)
@@ -4236,6 +4294,7 @@ class RunnerRunLoopMixin:
         stream_usage = stream_usage_state.usage
         real_stream_input = turn.request_input_tokens
         last_real_stream_input_tokens = real_stream_input
+        last_real_stream_est_tokens = int(request_est_input_tokens)
         if stream_usage_state.has_tokens:
           stream_usage_event = self._build_usage_event(
             model=upstream_model, usage_totals=stream_usage,

@@ -444,3 +444,44 @@ def test_local_tool_schema_validation_rechecks_approval_modified_args(tmp_path: 
   assert error["code"] == "invalid_tool_input_schema"
   assert error["details"]["missing"] == ["judgment"]
   assert calls == []
+
+
+def test_deferred_local_tool_missing_schema_names_pack_and_load_tools_next_call() -> None:
+  from types import SimpleNamespace
+  from agent_gateway.policy_imports import configure_server_policy, load_server_policy_module
+  from agent_gateway.tool_dispatcher_helpers import active_local_tool_schema
+
+  previous_policy = load_server_policy_module()
+  configure_server_policy(
+    SimpleNamespace(
+      deferred_local_tool_pack=lambda name, channel="cli": (
+        "fms-analysis"
+        if name == "fms_propose_critical_factors" and channel == "web"
+        else None
+      )
+    )
+  )
+  try:
+    schema, error = active_local_tool_schema(
+      lambda: [],
+      "fms_propose_critical_factors",
+      channel="web",
+    )
+  finally:
+    configure_server_policy(previous_policy)
+
+  assert schema is None
+  assert error == {
+    "code": "tool_schema_unavailable",
+    "message": (
+      "Cannot validate local tool 'fms_propose_critical_factors': "
+      "its definition is absent from the active tool catalog (deferred in pack 'fms-analysis')."
+    ),
+    "details": {
+      "tool_name": "fms_propose_critical_factors",
+      "reason": "tool_definition_missing",
+      "pack": "fms-analysis",
+    },
+    "fix": 'Load tool pack "fms-analysis" with load_tools(pack="fms-analysis") and retry.',
+    "next_call": {"tool_name": "load_tools", "arguments": {"pack": "fms-analysis"}},
+  }

@@ -2424,7 +2424,7 @@ def test_a_current_model_read_does_not_displace_a_stage_set_a_door_persisted(
   keys = (
     "model_version_ref", "forecast_assumption_set_ref", "scenario_set_ref", "valuation_policy_ref",
   )
-  loader = _write_operation(tmp_path, operation_name="valuation-policy-precompile", required_context=keys, execution_class="node.implement")
+  loader = _write_operation(tmp_path, operation_name="valuation-policy", required_context=keys, execution_class="node.implement")
   fas = {name: {"set_id": f"fas-{name}", "content_sha256": "b" * 64} for name in "ABC"}
   scenario = {name: {"set_id": f"ss-{name}", "content_sha256": "c" * 64} for name in "AB"}
   policy = {name: {"policy_id": f"vp-{name}", "content_sha256": "d" * 64} for name in "AB"}
@@ -3918,7 +3918,7 @@ def test_skill_lifecycle_result_projects_after_child_stream_closes() -> None:
 
   emitter = SkillRunEventEmitter(
     skill_run_id="skill-run-terminal-child",
-    profile=SimpleNamespace(name="valuation-policy-precompile"),
+    profile=SimpleNamespace(name="valuation-policy"),
     semantic_scope="ticker",
     context_ticker="PCTY",
     portfolio_id=None,
@@ -3964,7 +3964,7 @@ def test_skill_lifecycle_result_settles_after_parent_stream_closes() -> None:
 
   emitter = SkillRunEventEmitter(
     skill_run_id="skill-run-closed-parent",
-    profile=SimpleNamespace(name="valuation-policy-precompile"),
+    profile=SimpleNamespace(name="valuation-policy"),
     semantic_scope="ticker",
     context_ticker="PCTY",
     portfolio_id=None,

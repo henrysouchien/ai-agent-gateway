@@ -2596,7 +2596,7 @@ class McpClientManager:
       if per_user_state is not None:
         per_user_state.active_calls += 1
         per_user_state.last_used_at = time.time()
-      result = await self._call_tool_once(
+      result = await self._call_tool_once_with_loopback_retry(
         server=server,
         original_name=original_name,
         tool_input=effective_input,
@@ -2604,6 +2604,7 @@ class McpClientManager:
         abort_event=abort_event,
         expected_seconds=expected_seconds,
         invocation_report=invocation_report,
+        retry_refusals=effective_allow_uncertain_replay,
       )
     except Exception as exc:
       if per_user_state is not None:
@@ -2939,6 +2940,61 @@ class McpClientManager:
     finally:
       if abort_task is not None:
         abort_task.cancel()
+
+  async def _call_tool_once_with_loopback_retry(
+    self,
+    *,
+    server: _connection_helpers._McpCallableServerState,
+    original_name: str,
+    tool_input: Dict[str, Any],
+    meta: Dict[str, Any] | None,
+    abort_event: asyncio.Event | None,
+    expected_seconds: float,
+    invocation_report: McpInvocationReport | None = None,
+    retry_refusals: bool,
+  ) -> _connection_helpers.McpToolCallResult:
+    """One MCP call, retrying only pre-dispatch loopback refusals.
+
+    ``retry_refusals`` is the caller's idempotent-replay authority (the
+    registered semantics / ``allow_uncertain_replay`` gate in
+    ``call_tool_reporting``): a refusal means no request reached the
+    server, and only an idempotent call may be sent again. A write door
+    whose replay is forbidden gets exactly one attempt.
+    """
+
+    delays = (
+      _connection_helpers.LOOPBACK_REFUSAL_RETRY_DELAYS_SECONDS
+      if retry_refusals
+      else ()
+    )
+    attempt = 0
+    while True:
+      try:
+        return await self._call_tool_once(
+          server=server,
+          original_name=original_name,
+          tool_input=tool_input,
+          meta=meta,
+          abort_event=abort_event,
+          expected_seconds=expected_seconds,
+          invocation_report=invocation_report,
+        )
+      except Exception as exc:
+        if (
+          attempt >= len(delays)
+          or not _connection_helpers.is_loopback_connection_refused(exc)
+        ):
+          raise
+        delay = delays[attempt]
+        attempt += 1
+        log.warning(
+          "MCP tool %s loopback connection refused (Errno 61); "
+          "retrying idempotent call in %.2fs (attempt %d)",
+          original_name,
+          delay,
+          attempt + 1,
+        )
+        await asyncio.sleep(delay)
 
   @staticmethod
   async def _cancel_mcp_tool_call(

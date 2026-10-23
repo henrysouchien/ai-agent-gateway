@@ -541,19 +541,28 @@ def _metric_document_id(
 
 
 def _read_web_fetch(result: Mapping[str, Any]) -> list[dict[str, Any]]:
-  final_url = _required_str(result.get("final_url"))
-  content_hash = _required_str(result.get("content_hash"))
-  text = _optional_str(result.get("text"))
-  if not final_url or not content_hash or not text:
-    return []
-  digest = hashlib.sha256(final_url.encode("utf-8")).hexdigest()
-  record = _identity(
-    document_id=f"web:{digest}",
-    source_kind="web",
-    source_url=final_url,
+  raw_results = result.get("results")
+  items: list[Mapping[str, Any]] = (
+    [item for item in raw_results if isinstance(item, Mapping)]
+    if isinstance(raw_results, list)
+    else [result]
   )
-  return [record] if record is not None else []
-
+  records: list[dict[str, Any]] = []
+  for item in items:
+    final_url = _required_str(item.get("final_url"))
+    content_hash = _required_str(item.get("content_hash"))
+    text = _optional_str(item.get("text"))
+    if not final_url or not content_hash or not text:
+      continue
+    digest = hashlib.sha256(final_url.encode("utf-8")).hexdigest()
+    record = _identity(
+      document_id=f"web:{digest}",
+      source_kind="web",
+      source_url=final_url,
+    )
+    if record is not None:
+      records.append(record)
+  return records
 
 def _read_search_hits(
   result: Mapping[str, Any],

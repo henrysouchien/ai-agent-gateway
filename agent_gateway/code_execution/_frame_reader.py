@@ -15,8 +15,8 @@ ledger and source settlement. A non-executing token answers `bad_cell_token`.
 Frames, one JSON object per line. Child -> host, every frame carries
 `call_id` (child correlation id) and `cell_token`:
 
-- `hello{protocol}` -> `{protocol, parent_call_id}`
-- `tool_call{parent_call_id, operation, input}` -> `tool_result{nested_call_id}`
+- `hello{protocol}` -> `{protocol, parent_call_id, operations, tools}` (`tools`:
+  the granted, code-callable tool names the client binds as `hank.<tool>`)
 - `catalog{parent_call_id, request: "search", query}` -> list of `{name, description}`
 - `catalog{parent_call_id, request: "describe", operation}` -> `{name, description, input_schema}`
 - `derive{parent_call_id, name, value, expression, inputs}` -> `derive_result` (the published row)
@@ -29,8 +29,15 @@ Host -> child replies echo `type` and `call_id` and carry `ok` plus `result` or
 
 An operation is callable iff `operation ∈ owning tool_grant ∩ operations
 registered as code-callable` (execution-boundary design §8): the grant is the
-bound dispatcher's enforced catalog for the turn (`tool_definitions`), the
-code-callable set is the registration the product binds beside it. There is no
+bound dispatcher's enforced catalog for the turn (`tool_definitions`) plus
+the definitions the product binds as activatable this session
+(`activatable_tool_definitions` — the set its `load_tools` authority would
+admit, derived by that authority's owner, never a hand list here), the
+code-callable set is the registration the product binds beside it. A call to
+an activatable-but-not-yet-loaded operation first runs the bound
+`activate_tool` (the product's `load_tools` activation/binding mechanism)
+and then dispatches through the same prepared dispatcher path as any other
+nested call, so approval and authority still apply. There is no
 mutation-class filter here; the dispatcher's own policy and validation run on
 `dispatch` as for any call. Every nested call is recorded in the channel's
 ledger under the outer id (its `policy_class` is telemetry, read after the
@@ -52,7 +59,7 @@ import os
 import secrets
 import time
 import weakref
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import AbstractSet, Any, Awaitable, Callable, Dict, List, Mapping, Optional
 from agent_workflow_contracts.models import AdmittedTenant
 
 from ..policy_imports import load_server_policy_helpers, resolve_server_policy_tool_class
@@ -88,6 +95,10 @@ SourceKey = Callable[[Dict[str, Any]], Any]
 CatalogMetadata = Callable[[str], Mapping[str, object]]
 # Product-owned decision for one exact granted operation name.
 CodeCallable = Callable[[str], bool]
+# Product-owned definitions `load_tools` could activate for this session,
+# and the activation of one such operation through that same mechanism.
+ActivatableToolDefinitions = Callable[[], List[Dict[str, Any]]]
+ActivateTool = Callable[[str], Awaitable[bool]]
 
 # Catalog previews are presentation only; source identities are never capped.
 _DESCRIPTION_PREVIEW_CHARS = 300
@@ -249,6 +260,9 @@ class ActiveCell:
       entry["source_refs"] = cell._record_sources(operation, entry["nested_call_id"], result, settlement.sources)
 
 
+from ._tool_defs import CODE_EXECUTION_TOOL_NAMES
+
+
 class FrameReader:
   """Session-owned reader: turn bindings and executing cell registrations."""
 
@@ -261,11 +275,14 @@ class FrameReader:
   ) -> None:
     self._dispatcher: Any | None = None
     self._tool_definitions: Callable[[], List[Dict[str, Any]]] | None = None
+    self._activatable_tool_definitions: ActivatableToolDefinitions | None = None
+    self._activate_tool: ActivateTool | None = None
     self._extract_sources: SourceExtractor | None = None
     self._source_key: SourceKey | None = None
     self._code_callable: CodeCallable | None = None
     self._catalog_metadata: CatalogMetadata | None = None
     self._job_runner: JobRunner | None = None
+    self._host_tools: frozenset[str] = CODE_EXECUTION_TOOL_NAMES
     self._cells: Dict[str, CellChannel] = {}
     # Every source row this session's cells issued, by `source_refs` key. Kept
     # with the session reader, which the session's kernel cleanup releases with
@@ -296,22 +313,33 @@ class FrameReader:
     source_key: SourceKey | None = None,
     code_callable: CodeCallable | None = None,
     catalog_metadata: CatalogMetadata | None = None,
+    activatable_tool_definitions: ActivatableToolDefinitions | None = None,
+    activate_tool: ActivateTool | None = None,
+    host_tools: AbstractSet[str] | None = None,
   ) -> None:
     """Bind the dispatcher running this session's turn; the latest bind wins.
 
     `code_callable(operation)` is the product registration's decision for the
     exact installed route; a nested call needs it and the grant. Unbound means
     no operation is code-callable.
+    `activatable_tool_definitions()` names the not-yet-loaded operations the
+    session's `load_tools` authority would admit, and `activate_tool(name)`
+    activates/binds one through that mechanism before dispatch; neither
+    widens the grant past that authority.
     `source_key` is the citation registry's identity for an extracted handle;
     handles with equal keys are one source on the outer result.
     """
     self._dispatcher = dispatcher
     self._tool_definitions = tool_definitions
+    self._activatable_tool_definitions = activatable_tool_definitions
+    self._activate_tool = activate_tool
     self._extract_sources = extract_sources
     self._source_key = source_key
     self._code_callable = code_callable
     self._catalog_metadata = catalog_metadata
-
+    self._host_tools = (
+      frozenset(host_tools) if host_tools is not None else CODE_EXECUTION_TOOL_NAMES
+    )
   def active_cells(self) -> tuple[str, ...]:
     """Outer `tool_call_id`s of the cells currently registered."""
     return tuple(cell.outer_call_id for cell in self._cells.values())
@@ -397,11 +425,14 @@ class CellChannel:
     self._native_calls: Dict[str, tuple[float, Any, Any]] = {}
     self._dispatcher = reader._dispatcher
     self._tool_definitions = reader._tool_definitions
+    self._activatable_tool_definitions = reader._activatable_tool_definitions
+    self._activate_tool = reader._activate_tool
     self._extract_sources = reader._extract_sources
     self._source_key = reader._source_key
     self._code_callable = reader._code_callable
     self._job_runner = reader._job_runner
     self._catalog_metadata = reader._catalog_metadata
+    self._host_tools = reader._host_tools
     self._grant: Dict[str, Dict[str, Any]] | None = None
     self.budget = CellBudget()
     # host -> child, child -> host
@@ -614,6 +645,7 @@ class CellChannel:
         "protocol": BRIDGE_PROTOCOL,
         "parent_call_id": self.outer_call_id,
         "operations": [dict(row) for row in BRIDGE_OPERATIONS],
+        "tools": self._granted_code_callable_names(),
       })
     if frame_type == "tool_call":
       return await self._tool_call(frame)
@@ -635,17 +667,43 @@ class CellChannel:
       return self._derive(frame)
     return _error_reply(frame_type, call_id, "protocol_error", f"unknown frame type {frame_type!r}")
 
+  def _granted_code_callable_names(self) -> List[str]:
+    """Grant ∩ code-callable tool names, in grant order (hello's `tools`)."""
+    if self._code_callable is None:
+      return []
+    return [name for name in self._granted() if self._code_callable(name)]
+
+  def _loaded_granted(self) -> Dict[str, Dict[str, Any]]:
+    """The turn's already-loaded grant by name, read live from the bound catalog."""
+    tool_definitions = self._tool_definitions
+    definitions = tool_definitions() if tool_definitions is not None else []
+    return {
+      name: definition
+      for definition in definitions
+      if (name := str(definition.get("name") or ""))
+      and name not in self._host_tools
+    }
+
   def _granted(self) -> Dict[str, Dict[str, Any]]:
-    """The turn's grant by name: the bound catalog, read once per cell."""
+    """Loaded grant plus the product's activatable definitions, once per cell."""
     if self._grant is None:
-      tool_definitions = self._tool_definitions
-      definitions = tool_definitions() if tool_definitions is not None else []
-      self._grant = {
-        str(definition["name"]): definition
-        for definition in definitions
-        if definition.get("name")
-      }
+      grant = self._loaded_granted()
+      if self._activatable_tool_definitions is not None:
+        for definition in self._activatable_tool_definitions() or []:
+          name = str(definition.get("name") or "")
+          if name and name not in self._host_tools and name not in grant:
+            grant[name] = definition
+      self._grant = grant
     return self._grant
+
+  async def _activate_if_deferred(self, operation: str) -> bool:
+    """Activate one activatable operation through the bound mechanism.
+
+    The product callback owns activation and reports loader failures unchanged.
+    """
+    if self._activate_tool is None:
+      return False
+    return await self._activate_tool(operation)
 
   def _route_row(self, name: str, definition: Dict[str, Any]) -> Dict[str, Any]:
     return {
@@ -657,6 +715,8 @@ class CellChannel:
 
   def _refusal(self, dispatcher: Any, operation: str) -> Optional[str]:
     """Error code, or None when `operation ∈ grant ∩ code-callable` (§8)."""
+    if operation in self._host_tools:
+      return "unknown_operation"
     if operation not in self._granted():
       if dispatcher.route_origin_for_tool(operation) is None:
         return "unknown_operation"
@@ -710,6 +770,14 @@ class CellChannel:
       return _refuse(refusal, f"{operation!r} is not granted to this turn")
     if refusal is not None:
       return _refuse(refusal, f"{operation!r} is not registered as code-callable")
+    if operation not in self._loaded_granted():
+      try:
+        activated = await self._activate_if_deferred(operation)
+      except ToolInputPreparationError as exc:
+        detail = exc.materialize_error()
+        return _refuse(str(detail.get("code") or "tool_error"), str(detail.get("message") or ""))
+      if not activated:
+        return _refuse("not_granted", f"{operation!r} is not granted to this turn")
     return await self._dispatch_granted("tool_result", call_id, entry, dispatcher, operation, tool_input)
 
   async def _agent(self, frame: Dict[str, Any]) -> Dict[str, Any]:

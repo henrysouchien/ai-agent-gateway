@@ -27,6 +27,7 @@ from .._frame_reader import CELL_TOKEN_ENV, REQUEST_FRAME_TYPES, _error_reply
 from .._helpers import (
   _collect_generated_images,
   _prepare_code_execute_env,
+  _read_truncated,
   _remove_path,
   _remove_task_artifacts,
   _snapshot_image_mtimes,
@@ -417,12 +418,21 @@ class KernelBackend(ExecutionBackend):
           if not image.get("skipped") and sum(not row.get("skipped") for row in images) >= self._config.max_images:
             image = {"filename": image["filename"], "skipped": True, "reason": f"exceeds {self._config.max_images} image limit"}
           images.append(image)
-        stdout = data["stdout"].text(20)
-        stderr = data["stderr"].text(20)
+        # Ordinary output aligns with the subprocess backend: the full
+        # stdout/stderr up to the byte cap (a measurement, with the spill
+        # files below holding the complete text), not a 20-line tail. The
+        # tail fields keep their running-status meaning.
+        stdout, stdout_truncated = _read_truncated(
+          data["stdout_file"], self._config.max_output_bytes,
+        )
+        stderr, stderr_truncated = _read_truncated(
+          data["stderr_file"], self._config.max_output_bytes,
+        )
         result.update(
-          stdout=stdout, stderr=stderr, stdout_tail=stdout, stderr_tail=stderr,
+          stdout=stdout, stderr=stderr,
+          stdout_tail=data["stdout"].text(20), stderr_tail=data["stderr"].text(20),
           spill={"stdout": data["stdout_file"].name, "stderr": data["stderr_file"].name},
-          truncated=(data["stdout"].total > len(stdout.encode("utf-8")) or data["stderr"].total > len(stderr.encode("utf-8"))),
+          truncated=bool(stdout_truncated or stderr_truncated),
           duration_ms=int((time.monotonic() - started_at) * 1000),
         )
         return result

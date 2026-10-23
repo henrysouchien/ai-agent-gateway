@@ -96,7 +96,7 @@ class BatchBackend:
   open_captured_run_context: Callable[..., Any]
   stage_admitter: Callable[
     [ParentContext, CapabilityExecutionResolver, Any],
-    Callable[[SpawnRequest, frozenset[str]], AdmittedContext[ResolvedAuthority] | Refusal | OperationUnavailable],
+    Callable[[SpawnRequest], AdmittedContext[ResolvedAuthority] | Refusal | OperationUnavailable],
   ]
   terminal_event_payload: Callable[[int, dict[str, Any]], dict[str, Any]]
   active_batch_error: type[Exception]

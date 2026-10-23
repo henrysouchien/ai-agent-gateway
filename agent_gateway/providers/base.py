@@ -10,7 +10,13 @@ from typing import Any, AsyncIterator, Literal, Mapping
 from ..auth import ProviderCredentialFailure
 from model_authority.current import INITIAL_MODEL_REGISTRY, RATE_TABLES
 from model_authority.registry import AdapterRouteSupport, ModelRegistryEntry
-from model_authority.rates import ContextRateTier, RateTable, UnknownModelError, provider_rate_table
+from model_authority.rates import (
+  ContextRateTier,
+  RateTable,
+  UnknownModelError,
+  provider_rate_table,
+  token_cost_components,
+)
 from model_authority.schema import FamilyCompat
 from model_authority.thinking import EffortResolution, ThinkingLevel
 
@@ -439,15 +445,23 @@ def truncate_to_last_compaction(
   full_anchor_content = list(anchor.get("content") or [])
   anchor_content = full_anchor_content[last_block_idx:]
   if compaction_as_text:
-    summary = str(anchor_content[0].get("content") or "")
-    # Trailing separator: some providers concatenate adjacent text blocks with
-    # no delimiter when building their request payload.
-    anchor_content[0] = {
-      "type": "text",
-      "text": f"[Summary of the earlier conversation]\n{summary}\n\n",
-    }
-  anchor["content"] = anchor_content
-  truncated = [anchor, *messages[last_message_idx + 1 :]]
+    summary = str(anchor_content[0].get("content") or "").strip()
+    if summary:
+      # Trailing separator: some providers concatenate adjacent text blocks with
+      # no delimiter when building their request payload.
+      anchor_content[0] = {
+        "type": "text",
+        "text": f"[Summary of the earlier conversation]\n{summary}\n\n",
+      }
+    else:
+      anchor_content = anchor_content[1:]
+  if anchor_content:
+    anchor["content"] = anchor_content
+    truncated = [anchor, *messages[last_message_idx + 1 :]]
+    follower_idx = 1
+  else:
+    truncated = list(messages[last_message_idx + 1 :])
+    follower_idx = 0
 
   # If the anchor's dropped prefix contained tool_use blocks, their results in
   # the following user message would now be orphaned — drop those tool_results.
@@ -456,8 +470,8 @@ def truncate_to_last_compaction(
     for block in full_anchor_content[:last_block_idx]
     if isinstance(block, dict) and block.get("type") == "tool_use"
   }
-  if dropped_tool_ids and len(truncated) > 1:
-    follower = truncated[1]
+  if dropped_tool_ids and len(truncated) > follower_idx:
+    follower = truncated[follower_idx]
     follower_content = follower.get("content")
     if follower.get("role") == "user" and isinstance(follower_content, list):
       kept_blocks = [
@@ -472,10 +486,9 @@ def truncate_to_last_compaction(
       if kept_blocks:
         next_follower = dict(follower)
         next_follower["content"] = kept_blocks
-        truncated[1] = next_follower
+        truncated[follower_idx] = next_follower
       else:
-        truncated = [truncated[0], *truncated[2:]]
-
+        truncated = [*truncated[:follower_idx], *truncated[follower_idx + 1 :]]
   return truncated
 
 
@@ -619,17 +632,14 @@ class ModelProvider:
     cache_creation_tokens: int = 0,
   ) -> CostEstimate:
     info = self.get_model_info(model)
-    # Normalized input/cache counts are disjoint; tier thresholds use the full prompt.
-    prompt_tokens = input_tokens + cache_read_tokens + cache_creation_tokens
-    prices: ModelInfo | ContextRateTier = info
-    for tier in info.rate_tiers:
-      if prompt_tokens >= tier.min_input_tokens:
-        prices = tier
-        break
-    input_cost = input_tokens * prices.input_cost_per_mtok / 1_000_000
-    output_cost = output_tokens * prices.output_cost_per_mtok / 1_000_000
-    cache_read_cost = cache_read_tokens * prices.cache_read_cost_per_mtok / 1_000_000
-    cache_write_cost = cache_creation_tokens * prices.cache_write_cost_per_mtok / 1_000_000
+    input_cost, output_cost, cache_read_cost, cache_write_cost = token_cost_components(
+      info,
+      info.rate_tiers,
+      input_tokens=input_tokens,
+      output_tokens=output_tokens,
+      cache_read_tokens=cache_read_tokens,
+      cache_write_tokens=cache_creation_tokens,
+    )
     return CostEstimate(
       input_cost=input_cost,
       output_cost=output_cost,

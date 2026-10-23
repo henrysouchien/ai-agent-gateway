@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.28.0 (2026-10-23)
+
+### Breaking
+
+- Sessions no longer expire on the wall clock. `session_ttl_elapsed`, `session_admits_new_turn`, `GatewaySession.unit_of_work_in_progress` and `SessionStore.ttl_elapsed` are removed; a session token authenticates until the session is explicitly expired (session delete, `expire_session*`, run teardown). `session_ttl` / `expires_at` is an informational hint returned by `/chat/init`.
+
+- `get_background_result` returns the task's live status/result at any time; the `background_result_auto_notify` refusal and the `background_result_contract_too_large` refusal (and its character cap) are removed, and an oversized result pages to completion.
+
+- Skill-declared capabilities no longer bound tool grants: every route admitted by the operation's ceilings is granted, with a declaration only supplying binding metadata (`semantic_capabilities` no longer raises for a route targeting an undeclared, incompatible or ambiguous capability). Non-owner invite-role denial of `state_write` / `external_write` / `portfolio_config` tools is unchanged.
+
+### Changed
+
+- Every upstream LLM provider call writes one row to the machine-wide spend ledger (`model_authority.spend_ledger`): each `runner_stream_turn` attempt (retries and credential rotations included), each `send_prompt` and `provider_summarize` call, and each Agent SDK query. Rows carry the normalized tokens, the adapter's shadow cost (`NULL` when unpriced), the credential's `auth_kind` from `classify_auth_kind` over its wire mechanism (not `billing_mode`), its fingerprint, and the session/request/run/skill attribution; success, provider errors with or without usage, cancellation and watchdog stalls each write exactly one. A call that fails locally before any request could be sent writes nothing. `send_prompt` rows take their call site from an enclosing `spend_context(call_site=...)` when one is active, else `send_prompt:<channel>`; `provider_summarize` gains a `call_site` keyword (default `compaction`).
+
+- A `payg_api_key` call is checked against the shared spend ceilings (`~/.config/hank/spend-settings.json`, `python3 scripts/hank_spend.py set ...`) before it starts. A breach, or a spend ledger/settings file that cannot be read, writes a zero-token `budget_blocked` row and raises `agent_gateway.spend_metering.SpendBudgetBlocked` naming the breached ceilings; `AgentRunner` ends the turn with that error and never retries, rotates credentials or falls back on it. OAuth and local credentials are never refused.
+
+- The autonomous-child environment allowlist carries `HANK_SPEND_LEDGER_PATH`, `HANK_SPEND_SETTINGS_PATH`, `HANK_SPEND_REPO`, `HANK_SPEND_SERVICE`, `HANK_SPEND_INSTANCE_ID` and `HANK_SPEND_GIT_SHA`, so a child's rows land in the parent's ledger with the parent's labels.
+
+- Requires `hank-model-authority>=1.7,<2` (the spend ledger and settings modules).
+
+- `CodeExecutionConfig.register_kernel` defaults to `True`, providing a session-sticky host interpreter without explicit registration. Sandboxed-only deployments must set `register_kernel=False`.
+
+- `code_execute` returns a non-`None` trailing expression as a display bundle without requiring `display()`, and binds its value to `_`. Docker/kernel implicit output caps `text/plain` at 16 KiB including the truncation marker (which names `_` as the handle to the full value), copies serializable containers as `application/json` only when their encoding fits within 16 KiB and the representation is not truncated, and does not invoke rich representations. The kernel keeps `_` for the next cell; explicit `display()` is unchanged. Ordinary `print(...)` output remains on stdout.
+
+- Docker/kernel results return full stdout/stderr text up to `max_output_bytes`, rather than only a 20-line tail. `stdout_tail` retains the last 20 lines; spill files retain the complete output.
+
+- Granted code-callable tools are available directly as `hank.<tool>(**kwargs)` without prior search or describe, including deferred tools admissible through the session's `load_tools` owner. Calling a deferred tool activates it through that loader before dispatch.
+
+- Tool-argument scope defaults: an omitted `research_file_id` defaults to the session's selected file only when the tool's schema requires it, or carries an alternate selector (`model_path` / `context_ref`) that is omitted; `ticker` is filled only when required and the effective file is the binding's own. A `run_agent` child with no research binding never inherits its parent's selection. A string argument is replaced only when it parses to the schema's array/object type; anything else reaches the tool unchanged. Granted tools and declared research doors reach `run_agent` children; a missing route refuses typed with its unsatisfied capabilities and a `list_skills` next call.
+
+- Compaction and checklists: portable compaction anchors its size estimate to the last real streamed input tokens, records an empty provider summary as `summary_too_short` instead of ending the turn, places the root user deliverable first in the summary, and omits empty assistant/summary turns (Ollama and Ollama Cloud wire requests never carry `content=null`; native Anthropic compaction blocks are preserved). `todo(op="init")` from a nested skill nests its phases under the open root phases; any top-level skill replaces its own checklist when it re-plans. Compaction summary anchors are serialized as user turns for Ollama.
+
+- Shutdown, cancellation and timeout write the turn's cost rows (`_close_snapshot_and_emit_usage` is shielded; running turns drain on lifespan teardown before `on_shutdown`).
+
+- A deferred local tool absent from the active catalog names its pack and a `load_tools` next call; the deferred pack is read through `policy_imports.deferred_local_tool_pack`.
+
+- Batch `web_fetch` extracts one source identity per URL.
+
+- MCP client stdio watch tasks retire before shutdown takes the manager lock.
+
+### Fixed
+
+- `HankBridge.call()` takes its tool name positionally only, so a tool input named `operation` no longer collides with the bridge parameter (`hank.call("model_document", operation="inspect")`).
+
+- Subprocess trailing-expression capture runs on the AST rather than slicing source, so form feeds, Unicode separators and non-ASCII columns no longer break or double-run a cell; loopback refusal matches `errno.ECONNREFUSED` only; a subprocess traceback no longer carries the cell source.
+
 ## 0.27.1 (2026-10-16)
 
 ### Fixed

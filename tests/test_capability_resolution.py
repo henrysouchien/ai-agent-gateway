@@ -987,24 +987,33 @@ def test_inherited_declaration_keeps_read_write_external_and_local_routes(
   }
 
 
-def test_empty_semantic_declaration_drops_capability_bearing_inherited_routes(
+def test_ceiling_routes_are_granted_without_declared_capabilities(
   inherited_catalog: PlatformToolCatalog,
 ) -> None:
-  """A ceiling alone is not inheritance: undeclared capabilities are dropped."""
+  """Admission follows the ceilings, not the operation's capability declarations.
 
+  The operation declares nothing; its ceiling names tagged routes spanning
+  capabilities it never declared (web read, workspace write, external write).
+  Every ceiling-admitted route is granted, unbound, under a deterministic id.
+  """
+
+  ceiling = frozenset({"external_write", "memory_write", "web_fetch"})
   declaration = OperationDeclaration(
     operation_name="learning-fork",
     grant_id="grant:empty-requirements",
     workspace_scope="model_write",
     required_capabilities=(),
-    tool_ceiling=frozenset({
-      "external_write", "memory_write", "web_fetch",
-    }),
+    tool_ceiling=ceiling,
   )
   authority = resolve_operation_authority(declaration, catalog=inherited_catalog)
 
   assert isinstance(authority, ResolvedAuthority)
-  assert granted_tool_ids(authority) == frozenset()
+  assert granted_tool_ids(authority) == ceiling
+  assert authority.bindings == ()
+  assert {entry.tool_id: entry.route_id for entry in authority.grant.tools} == {
+    tool_id: f"tool:{tool_id}" for tool_id in ceiling
+  }
+  assert {route.tool_id for route in authority.routes} == ceiling
 
 
 @pytest.mark.parametrize(

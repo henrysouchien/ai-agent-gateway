@@ -1002,6 +1002,24 @@ def test_runner_portable_compact_mid_loop() -> None:
   assert CONTINUATION_NUDGE not in second_main_text
 
 
+def test_runner_turn_completes_when_the_compaction_summary_is_empty() -> None:
+  # Canary #11: an empty provider summary ended the turn; it is a skipped compaction.
+  provider = _PortableRunnerProvider(
+    main_turns=[_tool_turn(), _text_turn("complete")], summary_text="",
+  )
+  event_log = _run_runner(
+    provider,
+    messages=[{"role": "user", "content": LONG_INPUT}],
+    effort="medium",
+  )
+
+  events = [entry.event for entry in event_log.entries]
+  assert provider.summary_requests >= 1
+  assert not any(event.get("type") == "compaction" for event in events)
+  assert any(event.get("type") == "tool_call_complete" for event in events)
+  assert any(event.get("type") == "turn_complete" for event in events)
+
+
 def test_runner_haiku_uses_portable_compaction_without_native_payload() -> None:
   provider = _AnthropicRunnerProvider(main_turns=[_text_turn("complete")])
 
@@ -1534,7 +1552,7 @@ def test_child_portable_summary_cannot_replace_parent_context(tmp_path) -> None:
   _run(case())
 
 
-@pytest.mark.parametrize("summary_text", ["short", LONG_SUMMARY])
+@pytest.mark.parametrize("summary_text", ["", "short", LONG_SUMMARY])
 def test_unsummarizable_pending_work_is_never_acknowledged_or_discarded(
   monkeypatch, summary_text,
 ) -> None:
@@ -1561,7 +1579,7 @@ def test_unsummarizable_pending_work_is_never_acknowledged_or_discarded(
     capability_execution=stub_bound_capability_execution(provider=provider, model="model", effort="high"),
     trigger=1, est_total_tokens=100_000, preserve_tool_result_ids=pending,
   ))
-  if summary_text == "short":
+  if summary_text in ("", "short"):
     assert not result.applied
     assert result.reason == "summary_too_short"
     assert result.messages == with_prefix
@@ -1569,3 +1587,410 @@ def test_unsummarizable_pending_work_is_never_acknowledged_or_discarded(
     assert result.applied
     assert result.messages[1:] == messages
   assert pending == {"a"}
+
+
+@pytest.mark.parametrize("empty_summary", ["", "   \n\t  "])
+def test_apply_compaction_anchor_and_truncate_omit_empty_summary_block(empty_summary: str) -> None:
+  from agent_gateway.server_compaction import apply_compaction_anchor
+
+  tail = [{"role": "user", "content": "retained question"}]
+  assert apply_compaction_anchor(tail, empty_summary, provider="ollama_cloud", model="m") == tail
+  assert apply_compaction_anchor([], empty_summary, provider="ollama_cloud", model="m") == [
+    {"role": "user", "content": CONTINUATION_NUDGE},
+  ]
+
+  with_empty_anchor = [
+    {"role": "user", "content": "old"},
+    {"role": "assistant", "content": [{"type": "compaction", "content": empty_summary}]},
+    {"role": "user", "content": "next"},
+  ]
+  assert truncate_to_last_compaction(with_empty_anchor, compaction_as_text=False) == [
+    {"role": "assistant", "content": [{"type": "compaction", "content": empty_summary}]},
+    {"role": "user", "content": "next"},
+  ]
+  assert truncate_to_last_compaction(with_empty_anchor, compaction_as_text=True) == [
+    {"role": "user", "content": "next"},
+  ]
+
+
+def test_summarize_messages_places_root_deliverable_first_and_strips_skill_summary_narrowing() -> None:
+  narrowed_summary = (
+    "<analysis>scratch</analysis><summary>"
+    "# Task\n"
+    "Build a valuation model for **PAYC — Paycom Software, Inc.** (NYSE: PAYC). "
+    "Work is the `build-model` chain (v3.0). "
+    "The deliverable of the **current stage** is a **critical-factors judgment emitted to "
+    "`fms_propose_critical_factors`**, with a short `## Skill Summary` receipt as the *only* chat text.\n\n"
+    "## Chain state\n"
+    "- FAS accepted (`fas_cc6a7ccfa21545b7a01c44adbb75f854`), next stage scenario_set."
+    "</summary>"
+  )
+  provider = _SummaryProvider(summary_text=narrowed_summary)
+  messages = [
+    {
+      "role": "user",
+      "content": "Build me a model for PAYC.\n\n## Current Session Context\n```json\n{\"channel\": \"cli\"}\n```",
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {"type": "tool_use", "id": "call_1", "name": "invoke_skill", "input": {"skill_name": "critical-factors"}},
+      ],
+    },
+    {
+      "role": "user",
+      "content": [
+        {"type": "tool_result", "tool_use_id": "call_1", "content": "skill loaded"},
+      ],
+    },
+  ]
+  summary, _usage = _run(
+    summarize_messages(
+      messages,
+      None,
+      capability_execution=stub_bound_capability_execution(provider=provider, model="model", effort="high"),
+    )
+  )
+  assert summary.splitlines()[0] == "Root deliverable: Build me a model for PAYC."
+  assert "only* chat text" not in summary
+  assert "only chat text" not in summary
+
+  # Subsequent compaction over the compacted anchor preserves the exact root deliverable first line:
+  second_messages = [
+    {"role": "assistant", "content": [{"type": "compaction", "content": summary}], "stop_reason": "compaction"},
+    {"role": "user", "content": CONTINUATION_NUDGE},
+  ]
+  summary2, _ = _run(
+    summarize_messages(
+      second_messages,
+      None,
+      capability_execution=stub_bound_capability_execution(provider=provider, model="model", effort="high"),
+    )
+  )
+  assert summary2.splitlines()[0] == "Root deliverable: Build me a model for PAYC."
+
+
+def test_strip_analysis_salvages_an_analysis_the_output_budget_cut_off() -> None:
+  strip = server_compaction._strip_analysis_and_extract_summary
+  analysis = "Reviewed the transcript and the open obligations. " * 40
+
+  assert len(analysis) > MIN_SUMMARY_CHARS
+  assert strip(f"<analysis>{analysis}</analysis><summary>") == analysis.strip()
+  assert strip(f"<analysis>{analysis}") == analysis.strip()
+  assert strip(f"<analysis>{analysis}</analysis><summary>tail</summary>") == f"{analysis.strip()}\n\ntail"
+
+
+def test_strip_analysis_drops_scratchpad_when_the_summary_is_long_enough() -> None:
+  strip = server_compaction._strip_analysis_and_extract_summary
+  filler = "scratch " * 100
+
+  assert strip(f"<analysis>{filler}</analysis><summary>{LONG_SUMMARY}</summary>") == LONG_SUMMARY.strip()
+  assert strip(f"<summary>{LONG_SUMMARY}</summary><analysis>{filler} cut off") == LONG_SUMMARY.strip()
+  assert strip("<analysis>short</analysis><summary>tiny</summary>") == "tiny"
+
+
+def test_strip_analysis_keeps_a_literal_analysis_tag_inside_the_summary() -> None:
+  strip = server_compaction._strip_analysis_and_extract_summary
+  body = (
+    "Context: the template has an <analysis> tab the model must fill. " * 6
+    + "Next steps: finish DCF."
+  )
+  assert len(body) > MIN_SUMMARY_CHARS
+
+  assert strip(f"<summary>{body}</summary>") == body
+  assert strip(f"<analysis>scratch</analysis><summary>{body}</summary>") == body
+  assert strip(f"<analysis>cut off before the summary <summary>{body}</summary>") == body
+
+
+class _ThinkingOnlyProvider(_SummaryProvider):
+  """A reasoning model that spends its output budget thinking and is cut off."""
+
+  def __init__(self, *, thinking: str, text: str = "") -> None:
+    super().__init__()
+    self.thinking = thinking
+    self.text = text
+
+  async def stream(self, client: Any, params: dict[str, Any]):
+    _ = client, params
+    yield StreamEvent(type="message_start", input_tokens=31, cache_read_tokens=2, cache_creation_tokens=3)
+    yield StreamEvent(type="thinking_delta", thinking_text=self.thinking)
+    yield StreamEvent(type="thinking_end", raw_block={"type": "thinking", "thinking": self.thinking})
+    if self.text:
+      yield StreamEvent(type="text_delta", text=self.text)
+      yield StreamEvent(type="text_end", raw_block={"type": "text", "text": self.text})
+    yield StreamEvent(type="usage_update", output_tokens=SUMMARY_MAX_TOKENS)
+    yield StreamEvent(type="message_end", stop_reason="max_tokens")
+
+
+def test_summary_falls_back_to_thinking_when_the_model_never_writes_enough_text() -> None:
+  thinking = LONG_SUMMARY * 2
+  provider = _ThinkingOnlyProvider(thinking=thinking, text="<summary>")
+  messages = [{"role": "user", "content": LONG_INPUT}, {"role": "assistant", "content": "ok"}]
+
+  summary, usage = _run(summarize_messages(
+    messages, None,
+    capability_execution=stub_bound_capability_execution(provider=provider, model="model", effort="high"),
+  ))
+
+  assert summary == thinking.strip()
+  assert usage["output_tokens"] == SUMMARY_MAX_TOKENS
+
+
+def test_summary_prefers_written_text_over_thinking() -> None:
+  provider = _ThinkingOnlyProvider(thinking=LONG_SUMMARY * 2, text=f"<summary>{LONG_SUMMARY}</summary>")
+  messages = [{"role": "user", "content": LONG_INPUT}, {"role": "assistant", "content": "ok"}]
+
+  summary, _usage = _run(summarize_messages(
+    messages, None,
+    capability_execution=stub_bound_capability_execution(provider=provider, model="model", effort="high"),
+  ))
+
+  assert summary == LONG_SUMMARY.strip()
+
+
+def test_compaction_with_too_little_thinking_and_text_is_summary_too_short(monkeypatch) -> None:
+  monkeypatch.setattr(server_compaction, "MIN_COMPACT_GAIN_TOKENS", 1)
+  messages = [{"role": "user", "content": LONG_INPUT}, {"role": "assistant", "content": "ok"}]
+  provider = _ThinkingOnlyProvider(thinking="short reasoning", text="<summary>")
+  result = _run(maybe_compact_current_messages(
+    messages, None,
+    capability_execution=stub_bound_capability_execution(provider=provider, model="model", effort="high"),
+    trigger=1,
+    est_total_tokens=100_000,
+  ))
+  assert not result.applied
+  assert result.reason == "summary_too_short"
+  assert result.messages == messages
+
+  provider = _ThinkingOnlyProvider(thinking=LONG_SUMMARY, text="<summary>")
+  result = _run(maybe_compact_current_messages(
+    messages, None,
+    capability_execution=stub_bound_capability_execution(provider=provider, model="model", effort="high"),
+    trigger=1,
+    est_total_tokens=100_000,
+  ))
+  assert result.applied
+  assert result.anchor_block == {"type": "compaction", "content": LONG_SUMMARY.strip()}
+
+
+def _skill_turn_messages(first_request: str, skill: str) -> list[dict[str, Any]]:
+  return [
+    {"role": "user", "content": f"{first_request}\n\n## Current Session Context\n```json\n{{}}\n```"},
+    {"role": "assistant", "content": [
+      {"type": "tool_use", "id": f"call_{skill}", "name": "invoke_skill", "input": {"skill_name": skill}},
+    ]},
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"call_{skill}", "content": "skill loaded"}]},
+  ]
+
+
+def test_root_deliverable_is_the_latest_user_turns_request() -> None:
+  anchor = {
+    "role": "assistant",
+    "content": [{"type": "compaction", "content": "Root deliverable: Build me a model for PAYC.\n\n# Task\nBuild PAYC"}],
+    "stop_reason": "compaction",
+  }
+  messages = [
+    anchor,
+    *_skill_turn_messages("Build me a model for PAYC.", "build-model"),
+    {"role": "assistant", "content": "model built"},
+    {"role": "user", "content": CONTINUATION_NUDGE},
+    {"role": "user", "content": "Now draft a memo comparing ADP and PAYX margins.\n\n## Current Session Context\n```json\n{}\n```"},
+    {"role": "assistant", "content": "working"},
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_x", "content": "rows"}]},
+    {"role": "user", "content": "You stopped with 2 checklist items still open:\n- a\n- b"},
+  ]
+
+  assert server_compaction._extract_root_deliverable(messages) == "Now draft a memo comparing ADP and PAYX margins."
+  # With no user prompt left, the anchor's own header stands for the compacted request:
+  assert server_compaction._extract_root_deliverable(
+    [anchor, {"role": "user", "content": CONTINUATION_NUDGE}]
+  ) == "Build me a model for PAYC."
+
+
+def test_runner_injected_user_messages_are_not_the_analysts_request() -> None:
+  from agent_gateway.runner_run_loop_defaults import MAX_TOKENS_NUDGE
+
+  def tool_use(call_id: str) -> dict[str, Any]:
+    return {"role": "assistant", "content": [{"type": "tool_use", "id": call_id, "name": "invoke_skill", "input": {"skill_name": "build-model"}}]}
+
+  cut_off = {"role": "assistant", "content": "partial", "stop_reason": "max_tokens"}
+  messages = [
+    {"role": "user", "content": "Build a DCF for AAPL"},
+    cut_off,
+    {"role": "user", "content": MAX_TOKENS_NUDGE},
+    tool_use("call_1"),
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "ok"}]},
+  ]
+  assert server_compaction._extract_root_deliverable(messages) == "Build a DCF for AAPL"
+
+  # When a turn ends on max_tokens after exhausting continuations, the next real analyst request
+  # starts a new turn rather than being skipped as an open-turn continuation.
+  after_exhausted_max_tokens = [
+    {"role": "user", "content": "Build a DCF for AAPL"},
+    tool_use("call_1"),
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "ok"}]},
+    cut_off,
+    {"role": "user", "content": MAX_TOKENS_NUDGE},
+    cut_off,
+    {"role": "user", "content": MAX_TOKENS_NUDGE},
+    cut_off,
+    {"role": "user", "content": MAX_TOKENS_NUDGE},
+    cut_off,
+    {"role": "user", "content": "Write a short memo on MSFT margins"},
+    {"role": "assistant", "content": "draft memo", "stop_reason": "end_turn"},
+  ]
+  assert server_compaction._latest_user_prompt_index(after_exhausted_max_tokens) == 10
+  assert server_compaction._extract_root_deliverable(after_exhausted_max_tokens) == "Write a short memo on MSFT margins"
+  assert server_compaction._message_has_inline_skill_or_stage_narrowing(after_exhausted_max_tokens, "summary") is False
+  # The skill invoked before the injected message still narrows the summary.
+  with_skill_first = [
+    {"role": "user", "content": "Build a DCF for AAPL"},
+    tool_use("call_1"),
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "ok"}]},
+    {"role": "assistant", "content": "partial", "stop_reason": "max_tokens"},
+    {"role": "user", "content": "Continue from where you left off."},
+  ]
+  assert server_compaction._message_has_inline_skill_or_stage_narrowing(with_skill_first, "summary") is True
+  for text in (
+    "<background-task-result>x</background-task-result>",
+    "<operator-note>x</operator-note>",
+    "<task-notification>x</task-notification>",
+    "[System: background result]",
+  ):
+    assert server_compaction.is_runner_injected_user_text(text) is True
+  assert server_compaction.is_runner_injected_user_text("Build a DCF for AAPL") is False
+
+
+def test_earlier_turns_skill_and_header_do_not_leak_into_a_later_turns_summary() -> None:
+  messages = [
+    *_skill_turn_messages("Build me a model for PAYC.", "build-model"),
+    {"role": "assistant", "content": "model built"},
+    {"role": "user", "content": "Different question: draft a two-page memo comparing ADP and PAYX margins."},
+    {"role": "assistant", "content": "researching"},
+  ]
+  provider = _SummaryProvider(summary_text=f"<summary>{LONG_SUMMARY}</summary>")
+  execution = stub_bound_capability_execution(provider=provider, model="model", effort="high")
+
+  summary, _ = _run(summarize_messages(messages, None, capability_execution=execution))
+  assert summary == LONG_SUMMARY.strip()
+
+  # A summary that does carry a skill's narrowing is pinned to the current request, not the first:
+  narrowed = f"<summary># Task\nMemo\n\nThe current stage ends with a `## Skill Summary`.\n{LONG_SUMMARY}</summary>"
+  narrowed_provider = _SummaryProvider(summary_text=narrowed)
+  summary, _ = _run(summarize_messages(
+    messages, None,
+    capability_execution=stub_bound_capability_execution(provider=narrowed_provider, model="model", effort="high"),
+  ))
+  assert summary.splitlines()[0] == (
+    "Root deliverable: Different question: draft a two-page memo comparing ADP and PAYX margins."
+  )
+
+  # An earlier anchor's header is not carried across a new request:
+  after_anchor = [
+    {"role": "assistant", "content": [{"type": "compaction", "content": "Root deliverable: Build me a model for PAYC.\n\n# Task\nx"}]},
+    {"role": "user", "content": "Now draft the ADP memo."},
+    {"role": "assistant", "content": "ok"},
+  ]
+  summary, _ = _run(summarize_messages(after_anchor, None, capability_execution=execution))
+  assert summary == LONG_SUMMARY.strip()
+
+
+def _tool_turn_reporting_real_input(request_input_tokens: int | None) -> list[StreamEvent]:
+  turn = _tool_turn()
+  turn[-1] = StreamEvent(type="message_end", stop_reason="tool_use", request_input_tokens=request_input_tokens)
+  return turn
+
+
+@pytest.mark.parametrize(
+  ("real_input_tokens", "expected_summary_requests"),
+  [(200, 0), (None, 1)],
+)
+def test_real_provider_input_anchors_the_compaction_estimate_when_chars_overshoot(
+  monkeypatch: pytest.MonkeyPatch,
+  real_input_tokens: int | None,
+  expected_summary_requests: int,
+) -> None:
+  import agent_gateway.runner as gateway_runner
+  from agent_gateway.runner_limits import TokenEstimateSnapshot
+
+  def estimate(*, system_text: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> TokenEstimateSnapshot:
+    total = 1000 + 400 * len(messages)
+    return TokenEstimateSnapshot(
+      system_text="", messages_text="", tools_text="",
+      system_chars=0, tools_chars=0,
+      est_system_tokens=0, est_messages_tokens=total, est_tools_tokens=0,
+      est_total_tokens=total, message_count=len(messages), tool_count=len(tools),
+    )
+
+  monkeypatch.setattr(gateway_runner, "_token_estimate_snapshot", estimate)
+  # Turn 1 estimates 1400 (< trigger 1500) and the provider reports 200 real input
+  # tokens. Turn 2 estimates 2200: the old max(est, real) compacted at once; the
+  # anchored estimate is 200 + (2200 - 1400) = 1000, below the trigger.
+  provider = _PortableRunnerProvider(
+    main_turns=[_tool_turn_reporting_real_input(real_input_tokens), _text_turn("complete")],
+  )
+  _run_runner(
+    provider,
+    messages=[{"role": "user", "content": LONG_INPUT}],
+    compaction_trigger=1500,
+    effort="medium",
+  )
+
+  assert provider.summary_requests == expected_summary_requests
+
+
+def test_summary_too_short_holds_the_next_turns_back_until_the_estimate_grows(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  import agent_gateway.runner as gateway_runner
+  from agent_gateway.runner_limits import TokenEstimateSnapshot
+
+  def estimate(*, system_text: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> TokenEstimateSnapshot:
+    total = 2000 + 50 * len(messages)
+    return TokenEstimateSnapshot(
+      system_text="", messages_text="", tools_text="",
+      system_chars=0, tools_chars=0,
+      est_system_tokens=0, est_messages_tokens=total, est_tools_tokens=0,
+      est_total_tokens=total, message_count=len(messages), tool_count=len(tools),
+    )
+
+  monkeypatch.setattr(gateway_runner, "_token_estimate_snapshot", estimate)
+  results: list[Any] = []
+  real_compact = runner_run_loop.maybe_compact_current_messages
+
+  async def spy(*args: Any, **kwargs: Any) -> Any:
+    result = await real_compact(*args, **kwargs)
+    results.append(result)
+    return result
+
+  monkeypatch.setattr(runner_run_loop, "maybe_compact_current_messages", spy)
+  provider = _PortableRunnerProvider(
+    main_turns=[_tool_turn(), _tool_turn(), _tool_turn(), _text_turn("complete")],
+    summary_text="short",
+  )
+
+  _run_runner(
+    provider,
+    messages=[{"role": "user", "content": LONG_INPUT}],
+    compaction_trigger=1500,
+    effort="medium",
+  )
+
+  # Turn 1 fails with summary_too_short; each later turn grows the estimate by
+  # 200 tokens, under MIN_COMPACT_GAIN_TOKENS (500 here), so none summarizes again.
+  assert provider.summary_requests == 1
+  assert [result.reason for result in results] == [
+    "summary_too_short", "failed_cooldown", "failed_cooldown", "failed_cooldown",
+  ]
+
+
+def test_should_portable_compact_gates_on_last_compact_failed_turn() -> None:
+  should_compact, reason = server_compaction.should_portable_compact(
+    est_total_tokens=200_000,
+    est_summarize_tokens=50_000,
+    trigger=100_000,
+    native_compaction=False,
+    turn_count=4,
+    last_compact_failed_turn=4,
+  )
+  assert (should_compact, reason) == (False, "failed_cooldown")

@@ -90,10 +90,16 @@ class _Job:
     self.asyncio_task = asyncio.get_event_loop().create_task(_settle())
 
 
-async def _run_cell(dispatcher: ToolDispatcher, code: str) -> dict[str, Any]:
-  result, error = await dispatcher.dispatch(
-    OUTER_ID, "code_execute", {"code": textwrap.dedent(code), "host": "subprocess"},
-  )
+async def _run_cell(
+  dispatcher: ToolDispatcher,
+  code: str,
+  *,
+  timeout_ms: int | None = None,
+) -> dict[str, Any]:
+  tool_input: dict[str, Any] = {"code": textwrap.dedent(code), "host": "subprocess"}
+  if timeout_ms is not None:
+    tool_input["timeout_ms"] = timeout_ms
+  result, error = await dispatcher.dispatch(OUTER_ID, "code_execute", tool_input)
   assert error is None, error
   assert isinstance(result, dict)
   return result
@@ -391,7 +397,7 @@ def test_direct_host_door_and_kernel_door_produce_identical_bind_provenance_and_
   assert cell_entry.result["usage"]["output_tokens"] == 7
 
 
-def test_model_call_cancellation_settles_as_killed() -> None:
+def test_model_call_cancellation_settles_as_killed(tmp_path: Path) -> None:
   provider = _TestModelProvider()
   provider.sleep_s = 10.0  # Slow model call so we can cancel it
   execution = _test_capability_execution(provider)
@@ -403,37 +409,68 @@ def test_model_call_cancellation_settles_as_killed() -> None:
   async def run() -> dict[str, Any]:
     bundle, dispatcher = _setup(run_agent, grant_run_agent=True)
     bundle.frame_reader.bind_job_runner(lambda: runner)
-    # Start the model call in a cell, then cancel it via the registry
-    task_id_holder: list[str] = []
+    settled_path = tmp_path / "kill-settled"
+    task_id_path = tmp_path / "model-call-task-id"
+    settled: list[bool] = []
+    killed = False
 
-    async def _cancel_after_started() -> None:
-      for _ in range(200):
-        running = runner._task_registry.list_tasks(state=TaskState.RUNNING)
-        if running:
-          tid = running[0].task_id
-          task_id_holder.append(tid)
-          runner._task_registry.kill(tid, termination_intent="cancelled")
-          return
-        await asyncio.sleep(0.01)
-
-    cancel_task = asyncio.create_task(_cancel_after_started())
-    cell_res = await _run_cell(dispatcher, """
+    # The cell waits for the settlement rendezvous with no wall-clock bound of
+    # its own; its 300 s budget is the ultimate reaping net, above the
+    # test-side hang guards below.
+    cell_task = asyncio.create_task(_run_cell(dispatcher, f"""
       import json, time
+      from pathlib import Path
       c = hank.completion("general_completion", material="slow cancel test")
-      # Wait for a bit so the cancellation lands, then wait
-      time.sleep(0.2)
+      Path({str(task_id_path)!r}).write_text(c["task_id"])
+      while not Path({str(settled_path)!r}).exists():
+        time.sleep(0.01)
       w = hank.wait([c["task_id"]], timeout=5)
-      print(json.dumps({"c": c, "w": w}))
-    """)
-    await cancel_task
+      print(json.dumps({{"c": c, "w": w}}))
+    """, timeout_ms=300000))
+
+    # Synchronize on product state, never on a poll budget: the cell writes
+    # the task id the moment hank.completion registers it; kill by that id —
+    # valid for pending and running entries alike, since a pre-start kill is
+    # recorded as intent and settled as killed at pickup — and release the
+    # cell only after the killed entry reaches a terminal state.  (The silent
+    # 200-iteration RUNNING poll could return without killing — the
+    # 10-13/10-19/10-20 gate reds — and a late kill raced hank.wait's window.)
+    # The 120 s monotonic deadlines are hang guards only: they convert a true
+    # stall into the named assert failures below and always release the cell.
+    loop = asyncio.get_running_loop()
+    kill_deadline = loop.time() + 120
+    tid: str | None = None
+    while not cell_task.done() and loop.time() < kill_deadline:
+      if task_id_path.exists():
+        # write_text creates the file empty before filling it; only a
+        # non-empty read carries the id.
+        candidate = task_id_path.read_text().strip()
+        if candidate:
+          tid = candidate
+          break
+      await asyncio.sleep(0.01)
+    if tid is not None:
+      killed = runner._task_registry.kill(tid, termination_intent="cancelled")
+    settle_deadline = loop.time() + 120
+    while tid is not None and not cell_task.done() and loop.time() < settle_deadline:
+      entry = runner._task_registry.get(tid)
+      if entry is not None and entry.completed:
+        settled.append(True)
+        break
+      await asyncio.sleep(0.01)
+    settled_path.touch()
+    cell_res = await cell_task
+    assert tid is not None, "cell never reported a registered model-call task id"
+    assert killed, f"registry refused to kill reported task {tid}"
+    assert settled, f"killed task {tid} did not settle terminal while the cell ran"
     return cell_res
 
   result = asyncio.run(run())
   output = json.loads(result["stdout"].strip())
   tid = output["c"]["task_id"]
   waited = output["w"]["jobs"][tid]
-  assert waited["completed"] is True
-  assert waited["state"] == "killed"
+  assert waited["completed"] is True, waited
+  assert waited["state"] == "killed", waited
 
 
 def _commercial_producer(sink: Any) -> Any:

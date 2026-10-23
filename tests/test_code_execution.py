@@ -92,6 +92,55 @@ async def _dispatch_bundle_tool(
   return await dispatcher.dispatch(f"{tool_name}_call", tool_name, tool_input)
 
 
+def test_subprocess_large_cell_traceback_keeps_exception_line(tmp_path: Path) -> None:
+  rows = ",".join(f"'row-{index:05d}'" for index in range(5000))
+  code = f"rows = [{rows}]\nrows[10**6]\n"
+  assert len(code) > 60_000
+  result = _run(SubprocessBackend().execute(code, str(tmp_path)))
+  assert result["return_code"] == 1
+  assert "IndexError" in result["stderr"]
+  assert len(result["stderr"]) < 4096
+
+
+@pytest.mark.parametrize(
+  ("code", "expected"),
+  [
+    ('s = "page1\x0cpage2"\nlen(s)\n', "11"),
+    ('s = "page1\x85page2\u2028page3"\nlen(s)\n', "17"),
+    ('def act():\n  return 42\nlabel = "café"; act()\n', "42"),
+  ],
+)
+def test_subprocess_trailing_expression_preserves_source(
+  tmp_path: Path, code: str, expected: str,
+) -> None:
+  result = _run(SubprocessBackend().execute(code, str(tmp_path)))
+  assert result["return_code"] == 0, result["stderr"]
+  assert result["displays"] == [{"text/plain": expected}]
+
+
+def test_subprocess_trailing_expression_calls_exactly_once(tmp_path: Path) -> None:
+  result = _run(SubprocessBackend().execute(
+    "calls = []\ndef act():\n  calls.append(1)\n  return len(calls)\n"
+    'label = "éééééééééé"; act()\n',
+    str(tmp_path),
+  ))
+  assert result["return_code"] == 0, result["stderr"]
+  assert result["displays"] == [{"text/plain": "1"}]
+
+
+def test_subprocess_large_trailing_expression_is_bounded(tmp_path: Path) -> None:
+  result = _run(SubprocessBackend().execute(
+    "saved = {'payload': '雪' * (3 * 1024 * 1024)}\nsaved",
+    str(tmp_path),
+  ))
+  assert result["return_code"] == 0, result["stderr"]
+  bundle = result["displays"][0]
+  assert len(bundle["text/plain"].encode("utf-8")) <= 16 * 1024
+  assert "truncated" in bundle["text/plain"]
+  assert bundle["text/plain"].endswith("full value is bound to `_`]")
+  assert "application/json" not in bundle
+
+
 def test_code_execute_basic_execution_and_work_dir_persistence() -> None:
   async def _run_test() -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
@@ -687,7 +736,10 @@ def test_code_execute_background_cell_is_a_code_job_that_completes_and_is_killed
     runner = _job_runner()
     bundle = build_code_execution(
       session,
-      config=CodeExecutionConfig(register_docker=False),
+      # This test guards the background-job lifecycle (complete, then kill)
+      # through subprocess handles; the kernel backend's job lifecycle is
+      # the same registry path, but its handles are not subprocess handles.
+      config=CodeExecutionConfig(register_docker=False, register_kernel=False),
       job_runner=lambda: runner,
     )
 
@@ -844,7 +896,9 @@ def test_cleanup_code_execution_kills_its_cells_jobs_without_a_live_turn(
     runner = _job_runner()
     bundle = build_code_execution(
       session,
-      config=CodeExecutionConfig(register_docker=False),
+      # Subprocess handles are this cleanup test's kill witness; see the
+      # background-lifecycle test above for why the kernel is pinned off.
+      config=CodeExecutionConfig(register_docker=False, register_kernel=False),
       job_runner=lambda: runner,
     )
 
@@ -982,7 +1036,12 @@ def test_auto_host_with_missing_docker_image_reports_subprocess_and_why(tmp_path
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     bundle = build_code_execution(
       session,
-      config=CodeExecutionConfig(docker_image="hank-missing-image:latest"),
+      # The walk must reach subprocess, so the now-default kernel backend
+      # (which the walk would select first) is pinned off; Docker's skip
+      # reason is what this test guards.
+      config=CodeExecutionConfig(
+        docker_image="hank-missing-image:latest", register_kernel=False,
+      ),
     )
     try:
       with caplog.at_level("WARNING", logger="agent_gateway.code_execution._handlers"):

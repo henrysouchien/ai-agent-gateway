@@ -9,9 +9,15 @@ from ._handlers import (
   docker_backend_unavailable_reason,
 )
 from ._hooks import strip_code_execute_base64_hook
-from ._tool_defs import make_code_execute_tool_def
+from ._tool_defs import (
+  CODE_EXECUTE_TOOL_NAME,
+  CODE_EXECUTION_TOOL_NAMES,
+  make_code_execute_tool_def,
+)
 
 __all__ = [
+  "CODE_EXECUTE_TOOL_NAME",
+  "CODE_EXECUTION_TOOL_NAMES",
   "CellChannel",
   "CodeExecutionBundle",
   "CodeExecutionConfig",

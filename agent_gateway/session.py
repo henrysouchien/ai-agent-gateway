@@ -15,7 +15,7 @@ import jwt
 from fastapi import HTTPException
 
 from agent_workflow_contracts import WorkflowContentPage
-from agent_workflow_contracts.models import AdmittedTenant
+from agent_workflow_contracts.models import AdmittedResearchBinding, AdmittedTenant
 
 from .approval_route import NO_APPROVAL_ROUTE, ApprovalRoute
 from model_authority.binding import (
@@ -83,6 +83,34 @@ def session_owner_user_id(session: "GatewaySession") -> str:
   if not owner_user_id:
     raise ValueError("session owner_user_id is required")
   return owner_user_id
+
+
+def session_research_binding(
+  session: Any | None,
+  *,
+  executing_context: Any | None = None,
+) -> AdmittedResearchBinding:
+  """Resolve tool defaults from the executing job or its session's selected file.
+
+  An admitted file owns a child's scope. Ordinary chat may instead select a file
+  without starting a research turn; handler assembly records that selection on
+  the session, not in private local-tool closures. Both placements read here.
+  """
+
+  context = (
+    executing_context
+    if executing_context is not None
+    else getattr(session, "admitted_job_context", None)
+  )
+  binding = getattr(context, "research_binding", None)
+  if binding is not None and binding.research_file_id is not None:
+    return binding
+  # A child with no research binding cannot inherit its parent's selection.
+  if context is not None and getattr(context, "children", None) is not None:
+    return AdmittedResearchBinding(research_file_id=None, ticker=None)
+  return getattr(session, "tool_research_binding", None) or AdmittedResearchBinding(
+    research_file_id=None, ticker=None,
+  )
 
 
 def _normalize_required_tenant_id(tenant_id: str | None) -> str:
@@ -297,6 +325,8 @@ class GatewaySession:
   # admission; no consumer may test them to infer the run's authority.
   approval_route: ApprovalRoute = NO_APPROVAL_ROUTE
   admitted_job_context: ParentContext | None = field(default=None, repr=False, compare=False)
+  # Ordinary-chat file selection is tool context, not admitted child authority.
+  tool_research_binding: AdmittedResearchBinding | None = field(default=None, repr=False, compare=False)
   approval_store: Any | None = None
   approval_policy: Any | None = None
   tool_sequence: int = 0
@@ -396,12 +426,6 @@ class GatewaySession:
     turn = self.active_turn
     return turn is not None and turn.in_progress
 
-  @property
-  def unit_of_work_in_progress(self) -> bool:
-    """Whether a chat turn or an admitted batch is running on this session."""
-
-    return self.turn_in_progress or bool(self.admitted_batches)
-
 
 def child_gateway_session(
   parent: GatewaySession,
@@ -428,47 +452,6 @@ def child_gateway_session(
     is_public=parent.is_public,
     tenant_id=tenant.tenant_id if tenant is not None else None,
   )
-
-
-def session_ttl_elapsed(
-  session: GatewaySession | None,
-  *,
-  expires_at: int,
-  now: int,
-) -> bool:
-  """Whether a session's token has stopped authenticating at ``now``.
-
-  The TTL bounds a session between units of work, never one in progress: a
-  chat turn, or a batch admitted on this session's token. Both authenticate
-  their tool calls with the session's token, so while the session holds a turn
-  that has not published its terminal event, or a batch that has been neither
-  cancelled nor finished, the token stays valid and the work keeps its tools.
-  Whether a *new* turn may start is a separate question:
-  ``session_admits_new_turn``.
-  """
-
-  if now < expires_at:
-    return False
-  return session is None or not session.unit_of_work_in_progress
-
-
-def session_admits_new_turn(
-  session: GatewaySession,
-  *,
-  expires_at: int,
-  now: int,
-) -> bool:
-  """Whether a new chat turn may attach to ``session`` at ``now``.
-
-  Work in progress keeps its own token valid (``session_ttl_elapsed``); it
-  does not admit new work past the TTL: an admitted batch keeps the token live
-  for its stages, but a session whose turn has ended cannot start another one
-  after ``expires_at`` while that batch runs. ``_dispatch_chat_turn_body`` has
-  already refused a running turn (409) and cleared a finished one before it
-  reads this, with no await before the attach, so admission is the clock alone.
-  """
-
-  return now < expires_at
 
 
 def bind_session_capability_selections(
@@ -568,10 +551,10 @@ def attach_session_credential_handle(
 
 
 class SessionStore:
-  """In-memory session registry with TTL-based cleanup.
+  """In-memory session registry. A session lives until it is explicitly expired.
 
-  Cleanup, the visible snapshot and token verification read a session's
-  lifetime through one predicate, ``ttl_elapsed``.
+  ``expires_at`` is the token's issue-time lifetime hint for clients; nothing
+  here enforces it.
   """
 
   def __init__(
@@ -748,28 +731,13 @@ class SessionStore:
       return None
     return session
 
-  def ttl_elapsed(self, session_id: str, *, expires_at: int, now: int) -> bool:
-    """``session_ttl_elapsed`` for the session registered as ``session_id``."""
-
-    return session_ttl_elapsed(
-      self.sessions.get(session_id),
-      expires_at=expires_at,
-      now=now,
-    )
-
   def visible_sessions_snapshot(self) -> tuple[GatewaySession, ...]:
-    """Return sessions still usable at one captured wall-clock instant."""
+    """Return sessions that have not been expired."""
 
-    now = int(time.time())
     return tuple(
       session
       for session in tuple(self.sessions.values())
       if not session._expired
-      and not self.ttl_elapsed(
-        session.session_id,
-        expires_at=session.expires_at,
-        now=now,
-      )
     )
 
   def live_session_bound_to_log(self, path: Path) -> GatewaySession | None:
@@ -822,11 +790,6 @@ class SessionStore:
       )
       session._expiry_task = task
 
-  def cleanup_expired(self) -> None:
-    expired_ids = self._ttl_elapsed_ids(int(time.time()))
-    for session_id in expired_ids:
-      self.expire_session(session_id)
-
   async def expire_session_async(self, session_id: str) -> None:
     session = self.sessions.get(session_id)
     if session is None:
@@ -841,18 +804,6 @@ class SessionStore:
       session._expiry_task = task
     if task is not asyncio.current_task():
       await asyncio.shield(task)
-
-  async def cleanup_expired_async(self) -> None:
-    expired_ids = self._ttl_elapsed_ids(int(time.time()))
-    for session_id in expired_ids:
-      await self.expire_session_async(session_id)
-
-  def _ttl_elapsed_ids(self, now: int) -> list[str]:
-    return [
-      session_id
-      for session_id, session in tuple(self.sessions.items())
-      if self.ttl_elapsed(session_id, expires_at=session.expires_at, now=now)
-    ]
 
   async def _expire_session_async(self, session: GatewaySession) -> None:
     handle = session._expiry_retry_handle
@@ -1032,15 +983,6 @@ class AuthManager:
     ):
       raise HTTPException(status_code=401, detail="Invalid session payload")
 
-    # Past its TTL a bearer no longer proves the principal it was issued to.
-    if self.session_store.ttl_elapsed(
-      str(session_id),
-      expires_at=int(expires_at),
-      now=int(time.time()),
-    ):
-      self.session_store.expire_session(session_id)
-      raise HTTPException(status_code=401, detail="Session expired")
-
     session = self.session_store.get_session(session_id)
     if not session or session.api_key_hash != api_key_hash:
       raise HTTPException(status_code=401, detail="Unknown session")
@@ -1149,7 +1091,5 @@ __all__ = [
   "GatewaySession",
   "SessionStore",
   "bind_session_capability_selections",
-  "session_admits_new_turn",
   "session_owner_user_id",
-  "session_ttl_elapsed",
 ]

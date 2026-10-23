@@ -467,7 +467,7 @@ def test_reader_refuses_ungranted_non_code_callable_and_unknown_operations() -> 
     session, _bundle, mcp, dispatcher = _setup()
     try:
       result, error = await _run_cell(dispatcher, f"""
-        for op in ({SEARCH_FILINGS!r}, {REFRESH_FILINGS!r}, "file_read", "mcp__nowhere__nothing"):
+        for op in ({SEARCH_FILINGS!r}, {REFRESH_FILINGS!r}, "mcp__nowhere__nothing"):
             try:
                 hank.call(op, cik="0000320193")
             except HankBridgeError as exc:
@@ -478,14 +478,12 @@ def test_reader_refuses_ungranted_non_code_callable_and_unknown_operations() -> 
       assert result["stdout"].splitlines() == [
         f"{SEARCH_FILINGS} not_granted",
         f"{REFRESH_FILINGS} not_code_callable",
-        "file_read not_code_callable",
         "mcp__nowhere__nothing unknown_operation",
       ]
       assert mcp.calls == []
       assert [(entry["operation"], entry["ok"], entry["error_code"]) for entry in result["nested_calls"]] == [
         (SEARCH_FILINGS, False, "not_granted"),
         (REFRESH_FILINGS, False, "not_code_callable"),
-        ("file_read", False, "not_code_callable"),
         ("mcp__nowhere__nothing", False, "unknown_operation"),
       ]
       assert result["sources"] == []
@@ -779,6 +777,89 @@ def test_search_and_describe_list_only_granted_code_callable_operations() -> Non
       assert not_granted == "not_granted"
       assert mcp.calls == []
       assert "nested_calls" not in result
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(_run())
+
+def test_bridge_call_forwards_tool_arguments_named_like_bridge_parameters() -> None:
+  from agent_gateway.code_execution._bridge_client import HankBridge
+
+  frames: list[dict[str, Any]] = []
+
+  class Transport:
+    def exchange(self, payload: dict[str, Any]) -> dict[str, Any]:
+      frames.append(dict(payload))
+      if payload["type"] == "hello":
+        return {
+          "call_id": payload["call_id"], "ok": True,
+          "result": {"parent_call_id": "outer", "operations": [], "tools": ["x"]},
+        }
+      return {"call_id": payload["call_id"], "ok": True, "result": {"ok": True}}
+
+  client = HankBridge(Transport(), "token")
+  assert client.call("x", operation="inspect") == {"ok": True}
+  assert client.x(operation="inspect") == {"ok": True}
+  assert client.call("x", name="n", tool="t", operation="inspect") == {"ok": True}
+  client.describe("x")
+  tool_frames = [frame for frame in frames if frame["type"] == "tool_call"]
+  assert [frame["operation"] for frame in tool_frames] == ["x", "x", "x"]
+  assert [frame["input"] for frame in tool_frames] == [
+    {"operation": "inspect"},
+    {"operation": "inspect"},
+    {"name": "n", "tool": "t", "operation": "inspect"},
+  ]
+  describe_frames = [frame for frame in frames if frame["type"] == "catalog"]
+  assert describe_frames[0]["operation"] == "x"
+
+
+def test_deferred_tool_activates_through_bound_mechanism_and_dispatches() -> None:
+  async def _run() -> None:
+    session, bundle, mcp, dispatcher = _setup()
+    try:
+      object_schema = {"type": "object", "additionalProperties": True}
+      search_definition = {
+        "name": SEARCH_FILINGS, "description": "Search SEC filings.", "input_schema": object_schema,
+      }
+      loaded = _tool_definitions(bundle)
+      activated: list[str] = []
+
+      async def activate(operation: str) -> bool:
+        activated.append(operation)
+        loaded.append(search_definition)
+        return True
+
+      bundle.bind_dispatcher(
+        dispatcher,
+        tool_definitions=lambda: loaded,
+        code_callable=_CODE_CALLABLE,
+        activatable_tool_definitions=lambda: [search_definition],
+        activate_tool=activate,
+      )
+      result, error = await _run_cell(dispatcher, f"""
+        import json
+        print(json.dumps(sorted(row["name"] for row in hank.search(""))))
+        print(hank.call({SEARCH_FILINGS!r}, operation="inspect"))
+        print(getattr(hank, {SEARCH_FILINGS!r})(operation="inspect"))
+        for op in ({EXECUTE_TRADE!r}, "mcp__nowhere__nothing"):
+            try:
+                hank.call(op, operation="inspect")
+            except HankBridgeError as exc:
+                print(op, exc.code)
+      """)
+      assert error is None, error
+      assert result["return_code"] == 0, result["stderr"]
+      lines = result["stdout"].splitlines()
+      assert SEARCH_FILINGS in json.loads(lines[0])
+      assert activated == [SEARCH_FILINGS]
+      assert mcp.calls == [
+        (SEARCH_FILINGS, {"operation": "inspect"}),
+        (SEARCH_FILINGS, {"operation": "inspect"}),
+      ]
+      assert lines[-2:] == [
+        f"{EXECUTE_TRADE} not_code_callable",
+        "mcp__nowhere__nothing unknown_operation",
+      ]
     finally:
       await cleanup_code_execution(session)
 
@@ -1553,32 +1634,42 @@ def test_exited_cell_revokes_token_while_descendant_holds_output_pipes(
             time.sleep(0.01)
         """,
         background=True,
-        timeout_ms=3000,
+        # The cell is deliberately held alive until the release file lands, so
+        # its wall-clock budget must never bind: 60 s is a reaping safety net,
+        # not the test's synchronization (a 3 s budget raced load-stretched
+        # polls and revoked the token mid-test — gate #20b-74b).
+        timeout_ms=60000,
       )
       assert error is None, error
-      for _ in range(200):
-        if pid_path.exists():
-          break
+      # All readiness below is state-driven; the 60 s monotonic deadlines are
+      # hang guards matching the cell's reaping net, never the mechanism.
+      loop = asyncio.get_running_loop()
+      cell, = bundle.frame_reader._cells.values()
+      # Activation rides the background start task: wait for the token to
+      # become active rather than assuming the handshake completed when
+      # dispatch returned.
+      active_deadline = loop.time() + 60
+      while lookup_active_cell(cell.token) is None and loop.time() < active_deadline:
+        await asyncio.sleep(0.005)
+      assert lookup_active_cell(cell.token) is not None
+      pid_deadline = loop.time() + 60
+      while not pid_path.exists() and loop.time() < pid_deadline:
         await asyncio.sleep(0.005)
       assert pid_path.exists()
-      cell, = bundle.frame_reader._cells.values()
-      assert lookup_active_cell(cell.token) is not None
       entry = _code_job(session, started["task_id"])
       [handle] = handles
       data = handle._backend_data
       release_path.touch()
       # Observe the leader's exit without Process.wait(), which also waits for
       # the descendant's inherited stdout/stderr descriptors to reach EOF.
-      for _ in range(200):
-        if data["process"].returncode is not None:
-          break
+      exit_deadline = loop.time() + 60
+      while data["process"].returncode is None and loop.time() < exit_deadline:
         await asyncio.sleep(0.005)
       assert data["process"].returncode == 0
       # Let the backend's exit observer run, but stay inside its pending output
       # drain. The child remains alive and still holds both inherited pipes.
-      for _ in range(100):
-        if lookup_active_cell(cell.token) is None:
-          break
+      revoke_deadline = loop.time() + 60
+      while lookup_active_cell(cell.token) is not None and loop.time() < revoke_deadline:
         await asyncio.sleep(0.005)
       os.kill(int(pid_path.read_text()), 0)
       assert not data["reader_task"].done()
@@ -1599,12 +1690,15 @@ def test_exited_cell_revokes_token_while_descendant_holds_output_pipes(
   asyncio.run(run())
 
 
-def test_skills_as_code_bridge_read_path_exercises_library_and_denies_writes() -> None:
+def test_skills_as_code_bridge_read_path_exercises_library_and_reaches_approval_door() -> None:
   """Phase 3+: cell exercises new library (dilution) over bridge read path;
   asserts permitted writes like refresh_filings are code-callable;
-  proves protected money-class ops (execute_trade) are denied as not_code_callable.
+  proves money-class ops (execute_trade) are code-callable and reach the
+  dispatcher's approval door (refused with approval_required under NoApprovalRoute),
+  while code_execute itself is structurally absent from the cell grant.
   """
   from api.agent.shared.server_policies import server_tool_is_code_callable
+  from api.agent.shared.tool_policy import requires_approval
 
   def _real_code_callable(op: str) -> bool:
     if op.startswith("mcp__"):
@@ -1615,10 +1709,29 @@ def test_skills_as_code_bridge_read_path_exercises_library_and_denies_writes() -
 
   async def _run() -> None:
     session, bundle, mcp, dispatcher = _setup(code_callable=_real_code_callable)
+    dispatcher._needs_approval = lambda name, tool_input, qualifier: (
+      requires_approval(name.split("__", 2)[2], tool_input, qualifier)
+      if name.startswith("mcp__")
+      else requires_approval(name, tool_input, qualifier)
+    )
     try:
       result, error = await _run_cell(dispatcher, f"""
         from dilution.treasury_stock import OptionTranche, treasury_stock_method
         import json
+
+        # 0. Host tool (code_execute) is structurally absent from the cell grant
+        assert "code_execute" not in [row["name"] for row in hank.search("")]
+        try:
+            _ = hank.code_execute
+            raise AssertionError("hank.code_execute should not exist")
+        except AttributeError:
+            pass
+        host_err = None
+        try:
+            hank.call("code_execute", code="1+1")
+        except HankBridgeError as exc:
+            host_err = exc.code
+        print("host_tool_error:", host_err)
 
         # 1. Read path via domain-clients bridge
         filings = hank.call({GET_FILINGS!r}, cik="0000320193", limit=2)
@@ -1632,12 +1745,12 @@ def test_skills_as_code_bridge_read_path_exercises_library_and_denies_writes() -
         dilution_res = treasury_stock_method(tranches, stock_price=100.0)
         print("net_dilutive_shares:", dilution_res.net_dilutive_shares)
 
-        # 3. Permitted write (cache refresh) IS code-callable under code-callable-by-default
+        # 3. Permitted write (cache refresh) IS code-callable
         refresh_res = hank.call({REFRESH_FILINGS!r}, cik="0000320193")
         assert refresh_res["refreshed"] is True
         print("permitted_write: success")
 
-        # 4. Genuinely registered protected-category op (execute_trade, money class) is denied
+        # 4. Money-class op (execute_trade) is code-callable and reaches the approval door
         denied_error = None
         try:
             hank.call({EXECUTE_TRADE!r}, preview_id="pv-123")
@@ -1647,25 +1760,28 @@ def test_skills_as_code_bridge_read_path_exercises_library_and_denies_writes() -
       """)
       assert error is None, error
       assert result["return_code"] == 0, result["stderr"]
+      assert "host_tool_error: unknown_operation" in result["stdout"]
       assert "net_dilutive_shares: 700.0" in result["stdout"]
       assert "permitted_write: success" in result["stdout"]
-      assert "protected_write_denied: not_code_callable" in result["stdout"]
+      assert "protected_write_denied: approval_required" in result["stdout"]
 
-      # Verify bridge dispatched the read and permitted write, but NEVER the protected trade
+      # Verify bridge dispatched the read and permitted write, but NEVER executed the unattended trade
       assert mcp.calls == [
         (GET_FILINGS, {"cik": "0000320193", "limit": 2}),
         (REFRESH_FILINGS, {"cik": "0000320193"}),
       ]
       nested = result["nested_calls"]
-      assert len(nested) == 3
-      assert nested[0]["operation"] == GET_FILINGS
-      assert nested[0]["ok"] is True
-      assert nested[1]["operation"] == REFRESH_FILINGS
+      assert len(nested) == 4
+      assert nested[0]["operation"] == "code_execute"
+      assert nested[0]["ok"] is False
+      assert nested[0]["error_code"] == "unknown_operation"
+      assert nested[1]["operation"] == GET_FILINGS
       assert nested[1]["ok"] is True
-      assert nested[2]["operation"] == EXECUTE_TRADE
-      assert nested[2]["ok"] is False
-      assert nested[2]["error_code"] == "not_code_callable"
-
+      assert nested[2]["operation"] == REFRESH_FILINGS
+      assert nested[2]["ok"] is True
+      assert nested[3]["operation"] == EXECUTE_TRADE
+      assert nested[3]["ok"] is False
+      assert nested[3]["error_code"] == "approval_required"
       await cleanup_code_execution(session)
     finally:
       pass

@@ -612,3 +612,79 @@ def test_ollama_cloud_monthly_limit_429_without_retry_after_sets_24h_cooldown(
   assert pool.blocked_until("ollama_cloud:monthly") == pytest.approx(
     failure.reset_at, abs=1,
   )
+
+
+def test_ollama_cloud_compacted_and_empty_assistant_turns_never_serialize_nil_content(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(provider_base, "INITIAL_MODEL_REGISTRY", _registry())
+  provider = OllamaCloudProvider()
+  info = provider.get_model_info(_OLLAMA_MODEL)
+  effort = provider.resolve_effort(
+    requested=ThinkingLevel.NONE,
+    model=_OLLAMA_MODEL,
+    model_info=info,
+    max_tokens=16,
+  )
+  params = provider.build_request_params(
+    model=_OLLAMA_MODEL,
+    messages=[
+      {"role": "user", "content": "covered turn"},
+      {
+        "role": "assistant",
+        "content": [{"type": "compaction", "content": "Compacted prefix summary"}],
+        "stop_reason": "compaction",
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {"type": "thinking", "thinking": "planning call"},
+          {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {"q": "pcty"}},
+        ],
+      },
+      {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "ok"}],
+      },
+      {"role": "assistant", "content": [], "stop_reason": "end_turn"},
+      {
+        "role": "assistant",
+        "content": [{"type": "thinking", "thinking": "thinking only"}],
+        "stop_reason": "end_turn",
+      },
+      {"role": "user", "content": "continue"},
+    ],
+    system_prompt="sys",
+    tools=[],
+    max_tokens=256,
+    effort_resolution=effort,
+  )
+  wire = params["messages"]
+  assert all(isinstance(m.get("content"), str) for m in wire)
+  assert [m["role"] for m in wire] == ["system", "user", "assistant", "tool", "user"]
+  assert "Compacted prefix summary" in wire[1]["content"]
+  assert wire[2]["content"] == ""
+  assert wire[2]["tool_calls"][0]["id"] == "call_1"
+
+
+def test_ollama_tool_call_accumulator_preserves_repeated_brace_prefix_deltas() -> None:
+  from agent_gateway.providers.ollama import _ToolCallAccumulator
+
+  acc = _ToolCallAccumulator(0)
+  deltas = [
+    '{"',
+    'judgment": ',
+    '{"',
+    'company": ',
+    '{',
+    '"name": "PCTY"',
+    '}}}',
+  ]
+  for i, delta in enumerate(deltas):
+    raw = {
+      "id": "call_1" if i == 0 else "",
+      "function": {"name": "fms_persist_business_model" if i == 0 else "", "arguments": delta},
+    }
+    emitted = acc.apply(raw)
+    assert emitted == delta
+  assert acc.arguments == '{"judgment": {"company": {"name": "PCTY"}}}'

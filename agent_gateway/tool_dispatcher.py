@@ -135,6 +135,8 @@ from .tool_dispatch_classification import (
   settle_catalogless_tool_result,
 )
 
+from .session import session_research_binding
+
 if TYPE_CHECKING:
   from .approval_store import TargetedPreparedReconciliationResult
   from .runner_tool_execution import ApprovedBindingExecutor
@@ -770,7 +772,11 @@ class ToolDispatcher:
     self,
     tool_name: str,
   ) -> tuple[Mapping[str, Any] | None, Dict[str, Any] | None]:
-    return _active_local_tool_schema_helper(self._get_tool_definitions, tool_name)
+    return _active_local_tool_schema_helper(
+      self._get_tool_definitions,
+      tool_name,
+      channel=getattr(self._session, "channel", None),
+    )
 
   @staticmethod
   def _json_type_name(value: Any) -> str:
@@ -1146,6 +1152,9 @@ class ToolDispatcher:
     tool_input: Mapping[str, Any],
   ) -> PreparedToolCall:
     """Prepare one immutable call before redaction, approval, and retry."""
+
+    tool_input = self._coerce_stringified_json_fields(tool_name, dict(tool_input))
+    tool_input = self._apply_research_scope_default(tool_name, tool_input)
 
     if (
       tool_name not in self._local
@@ -4062,15 +4071,77 @@ class ToolDispatcher:
   def resolve_effective_tool_input(self, tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
     return self._apply_dispatch_scope_default(tool_name, tool_input)
 
+  def _apply_research_scope_default(
+    self, tool_name: str, tool_input: Dict[str, Any],
+  ) -> Dict[str, Any]:
+    """Scope a research-file workspace tool to the session's active file.
+
+    Only a tool whose schema has ``research_file_id`` is touched. An omitted id
+    defaults to the active file when the schema requires it, or when the tool
+    selects a model by ``model_path``/``context_ref`` and the caller gave no
+    ``model_path``. Elsewhere an omitted id keeps its own meaning (a child's
+    admission and a status/cancel call are not narrowed by chat selection). A
+    required ``ticker`` is filled only when the effective id is the active
+    file, so a ticker never describes another file. Explicit values are never
+    overwritten.
+    """
+
+    schema = self._tool_input_schema(tool_name)
+    properties = _schema_properties(schema)
+    if "research_file_id" not in properties:
+      return tool_input
+    required = schema.get("required", ())
+
+    def omitted(field_name: str) -> bool:
+      current = tool_input.get(field_name)
+      return current is None or (isinstance(current, str) and not current.strip())
+
+    default_file = omitted("research_file_id") and (
+      "research_file_id" in required
+      or (
+        ("model_path" in properties or "context_ref" in properties)
+        and omitted("model_path")
+      )
+    )
+    fill_ticker = "ticker" in required and omitted("ticker")
+    if not default_file and not fill_ticker:
+      return tool_input
+    binding = session_research_binding(
+      self._session, executing_context=self._executing_context(),
+    )
+    if binding.research_file_id is None:
+      return tool_input
+    additions: Dict[str, Any] = {}
+    # A caller-named ticker other than the active file's is a different
+    # company's selector: the active file is not its default.
+    stated_ticker = tool_input.get("ticker")
+    names_other_company = (
+      isinstance(stated_ticker, str)
+      and bool(stated_ticker.strip())
+      and binding.ticker is not None
+      and stated_ticker.strip().upper() != str(binding.ticker).strip().upper()
+    )
+    if default_file and not names_other_company:
+      additions["research_file_id"] = binding.research_file_id
+    effective_file_id = additions.get("research_file_id", tool_input.get("research_file_id"))
+    if (
+      fill_ticker
+      and binding.ticker is not None
+      and effective_file_id is not None
+      and str(effective_file_id).strip() == str(binding.research_file_id)
+    ):
+      additions["ticker"] = binding.ticker
+    return {**tool_input, **additions} if additions else tool_input
+
   def _apply_dispatch_scope_default(self, tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
     if tool_name in self._local:
       return tool_input
     if not self._mcp.is_mcp_tool(tool_name):
       return tool_input
+    if not isinstance(tool_input, dict):
+      return tool_input
     server = self._mcp.get_server_for_tool(tool_name)
     if not self._is_portfolio_mcp_server(server):
-      return tool_input
-    if not isinstance(tool_input, dict):
       return tool_input
     if self._has_explicit_portfolio_scope(tool_input):
       return tool_input
@@ -4140,13 +4211,25 @@ class ToolDispatcher:
       context["workspace_dir"] = workspace_dir
     return context
 
-  def _portfolio_scope_fields_for_tool(self, tool_name: str, server: str) -> set[str]:
+  def _tool_input_schema(
+    self, tool_name: str, server: str | None = None,
+  ) -> Mapping[str, Any]:
+    """The named tool's full input schema, from its live definition."""
+
+    if tool_name in self._local:
+      schema, _error = self._active_local_tool_schema(tool_name)
+      if schema is not None:
+        return schema
+    if server is None and self._mcp.is_mcp_tool(tool_name):
+      server = self._mcp.get_server_for_tool(tool_name)
     try:
       definitions = self._get_tool_definitions() if self._get_tool_definitions is not None else ()
     except Exception:
-      return set()
+      return {}
     original_name = self._original_tool_name(tool_name)
-    candidate_names = {tool_name, original_name, f"mcp__{server}__{original_name}"}
+    candidate_names = {tool_name, original_name}
+    if server:
+      candidate_names.add(f"mcp__{server}__{original_name}")
     for definition in definitions:
       if not isinstance(definition, dict):
         continue
@@ -4155,8 +4238,58 @@ class ToolDispatcher:
       schema = definition.get("input_schema")
       if schema is None:
         schema = definition.get("inputSchema")
-      return set(_schema_properties(schema)) & _PORTFOLIO_SCOPE_FIELDS
-    return set()
+      return schema if isinstance(schema, Mapping) else {}
+    return {}
+
+  def _portfolio_scope_fields_for_tool(self, tool_name: str, server: str) -> set[str]:
+    return set(_schema_properties(self._tool_input_schema(tool_name, server))) & _PORTFOLIO_SCOPE_FIELDS
+
+  def _coerce_stringified_json_fields(
+    self, tool_name: str, tool_input: Dict[str, Any],
+  ) -> Dict[str, Any]:
+    """Replace a stringified array/object argument with its parsed value.
+
+    A string that parses to the schema's expected array/object is the model's
+    stringified form of that field (the D-5 judgment evidence), so every door
+    receives the typed value. Anything else passes through untouched: the tool
+    that owns the field's validation answers it.
+    """
+
+    properties = _schema_properties(self._tool_input_schema(tool_name))
+    if not properties:
+      return tool_input
+    coerced: Dict[str, Any] | None = None
+    for field_name, field_schema in properties.items():
+      if not isinstance(field_schema, Mapping) or field_name not in tool_input:
+        continue
+      value = tool_input[field_name]
+      if not isinstance(value, str):
+        continue
+      expected_types = field_schema.get("type")
+      if isinstance(expected_types, str):
+        expected_types = [expected_types]
+      if not isinstance(expected_types, (list, tuple)):
+        continue
+      stripped = value.strip()
+      expected = next(
+        (
+          kind for kind, opener in (("array", "["), ("object", "{"))
+          if kind in expected_types and stripped.startswith(opener)
+        ),
+        None,
+      )
+      if expected is None:
+        continue
+      try:
+        parsed = json.loads(stripped)
+      except json.JSONDecodeError:
+        continue
+      if not isinstance(parsed, list if expected == "array" else dict):
+        continue
+      if coerced is None:
+        coerced = dict(tool_input)
+      coerced[field_name] = parsed
+    return coerced if coerced is not None else tool_input
 
   def _original_tool_name(self, tool_name: str) -> str:
     get_original_tool_name = getattr(self._mcp, "get_original_tool_name", None)

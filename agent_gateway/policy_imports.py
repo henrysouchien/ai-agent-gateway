@@ -194,3 +194,17 @@ def resolve_server_policy_tool_class(
     if cls is not None:
       return cls
   return default
+
+
+def deferred_local_tool_pack(
+  tool_name: str,
+  channel: str | None = None,
+) -> str | None:
+  """Return the deferred pack name for ``tool_name`` from the configured policy."""
+  policy_module = load_server_policy_module()
+  if policy_module is None:
+    return None
+  resolver = getattr(policy_module, "deferred_local_tool_pack", None)
+  if resolver is None:
+    return None
+  return resolver(tool_name, channel or "cli")

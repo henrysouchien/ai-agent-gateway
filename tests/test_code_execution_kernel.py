@@ -19,6 +19,7 @@ from agent_gateway.code_execution import CodeExecutionConfig, build_code_executi
 from agent_gateway.code_execution._frame_reader import FrameReader
 from agent_gateway.code_execution._backends._kernel import KernelBackend, KernelState
 from agent_gateway.code_execution._frame_codec import MAX_FRAME_BYTES, decode_frame
+from agent_gateway.code_execution._kernel_runner import _implicit_mime_bundle
 from agent_gateway.event_log import EventLog
 from agent_gateway.session import SessionStream
 from test_code_execution_bridge import FRED_SERIES, GET_FILINGS, _CODE_CALLABLE, _CaptureMcp, _bind, _filings_extractor, _job_runner, _policy
@@ -327,15 +328,76 @@ def test_python_native_and_descendant_output_share_ordered_capture(tmp_path: Pat
   asyncio.run(run())
 
 
-def test_explicit_display_preserves_json_and_plain_text_only(tmp_path: Path) -> None:
+def test_explicit_display_and_trailing_expression_bundles(tmp_path: Path) -> None:
   async def run() -> None:
     async with _kernel() as backend:
       result = await backend.execute("display({'a': 1})\ndisplay(6 * 7)\n{'private': 'last expression'}", str(tmp_path))
       assert result["return_code"] == 0
-      assert len(result["displays"]) == 2
+      # The two explicit displays keep their bundle shapes, and the trailing
+      # expression now returns its own bundle (the REPL contract that
+      # replaced the dropped last expression).
+      assert len(result["displays"]) == 3
       assert result["displays"][0]["application/json"] == {"a": 1}
       assert result["displays"][1]["text/plain"] == "42"
-      assert "private" not in json.dumps(result)
+      assert result["displays"][2]["application/json"] == {"private": "last expression"}
+      assert result["displays"][2]["text/plain"] == "{'private': 'last expression'}"
+      # A trailing display(...) call returns None, so it adds no bundle.
+      none_result = await backend.execute("display(1)\nprint('side')", str(tmp_path))
+      assert none_result["return_code"] == 0
+      assert len(none_result["displays"]) == 1
+      assert none_result["stdout"] == "side\n"
+
+  asyncio.run(run())
+
+
+def test_implicit_result_json_projection_stays_within_text_budget() -> None:
+  within = _implicit_mime_bundle({"rows": ["x" * 100] * 100})
+  assert within["application/json"] == {"rows": ["x" * 100] * 100}
+  over = _implicit_mime_bundle({"rows": ["x" * 100] * 200})
+  assert len(over["text/plain"].encode("utf-8")) <= 16 * 1024
+  assert "truncated" in over["text/plain"]
+  assert "application/json" not in over
+
+
+def test_implicit_result_renderer_errors_stay_in_presentation() -> None:
+  class BrokenRepr:
+    def __repr__(self) -> str:
+      raise RuntimeError("repr failed")
+
+  class BrokenJson(dict):
+    def items(self):
+      raise RuntimeError("JSON projection failed")
+
+  assert _implicit_mime_bundle(BrokenRepr()) == {
+    "text/plain": "<implicit repr unavailable: RuntimeError>",
+  }
+  assert _implicit_mime_bundle(BrokenJson(answer=42)) == {
+    "text/plain": "{'answer': 42}",
+  }
+
+
+def test_large_trailing_expression_is_bounded_and_value_stays_in_kernel(tmp_path: Path) -> None:
+  async def run() -> None:
+    async with _kernel() as backend:
+      size = 3 * 1024 * 1024
+      result = await backend.execute(
+        f"saved = {{'payload': '雪' * {size}}}\nsaved", str(tmp_path),
+      )
+      assert result["return_code"] == 0, result
+      bundle = result["displays"][0]
+      assert len(bundle["text/plain"].encode("utf-8")) <= 16 * 1024
+      assert "truncated" in bundle["text/plain"]
+      assert bundle["text/plain"].endswith("full value is bound to `_`]")
+      assert "application/json" not in bundle
+      following = await backend.execute("len(saved['payload'])", str(tmp_path))
+      assert following["return_code"] == 0
+      assert following["displays"] == [{"text/plain": str(size)}]
+      # An unassigned trailing expression is reachable as `_` in the next cell.
+      unassigned = await backend.execute(f"{{'payload': 'x' * {size}}}", str(tmp_path))
+      assert unassigned["return_code"] == 0
+      assert "truncated" in unassigned["displays"][0]["text/plain"]
+      recovered = await backend.execute("len(_['payload'])", str(tmp_path))
+      assert recovered["displays"] == [{"text/plain": str(size)}]
 
   asyncio.run(run())
 
@@ -345,8 +407,13 @@ def test_stdout_tail_and_spill_keep_partial_and_multibyte_output(tmp_path: Path)
     async with _kernel(CodeExecutionConfig(max_output_bytes=1024)) as backend:
       result = await backend.execute("import sys\nfor i in range(80):\n    print(i, '雪')\nsys.stdout.write('partial')", str(tmp_path))
       expected = "".join(f"{i} 雪\n" for i in range(80)) + "partial"
-      assert result["stdout"] == "".join(expected.splitlines(True)[-20:])
-      assert result["stdout_tail"] == result["stdout"] and result["truncated"]
+      # New ordinary-output contract: `stdout` is the full text up to
+      # `max_output_bytes` (here the whole output fits), `stdout_tail`
+      # keeps its last-20-lines meaning, and the spill file holds the
+      # complete text either way.
+      assert result["stdout"] == expected
+      assert result["stdout_tail"] == "".join(expected.splitlines(True)[-20:])
+      assert not result["truncated"]
       assert (tmp_path / result["spill"]["stdout"]).read_text() == expected
 
   asyncio.run(run())

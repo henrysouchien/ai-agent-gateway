@@ -3,6 +3,9 @@ from __future__ import annotations
 from typing import Any, Dict, Sequence
 
 from ._config import CodeExecutionConfig
+CODE_EXECUTE_TOOL_NAME = "code_execute"
+CODE_EXECUTION_TOOL_NAMES: frozenset[str] = frozenset({CODE_EXECUTE_TOOL_NAME})
+
 from ._frame_reader import BRIDGE_OPERATIONS
 
 
@@ -26,27 +29,35 @@ def make_code_execute_tool_def(
   """Build the public tool schema for `code_execute`."""
   description_suffix = f" {config.tool_description_suffix.strip()}" if config.tool_description_suffix.strip() else ""
   return {
-    "name": "code_execute",
+    "name": CODE_EXECUTE_TOOL_NAME,
     "description": (
       "Execute Python for computation and composable data analysis; return compact output and plots. "
       "Use for computation, data transformation, visualization, and analysis. "
       "Pre-installed: numpy, pandas, matplotlib, scipy. "
-      "Docker/kernel hosts retain locals and imports across cells; explicit display(value) emits "
-      "rich results, while a final expression alone does not. Subprocess starts fresh each call. "
+      "Docker/kernel hosts are session-sticky: locals and imports persist across cells and turns. "
+      "print(...) is the primary output channel and a cell's final expression returns its repr; "
+      "use display(value) only for images and rich output. Subprocess starts fresh each call. "
       "The working directory persists until session teardown. Results include a bounded stdout tail "
       "and spill paths for complete output. For an oversized tool-result preview, use tool_result_read "
       "with its opaque spill_ref.\n\n"
-      "Discovery: use code_execute when you need arithmetic verification, data wrangling, chart "
-      "generation, or repeatable Python analysis. For long-running work, set background=true: the "
+      "Use code_execute when you need arithmetic verification, data wrangling, chart "
+      "generation, or repeatable Python analysis. Make several tool calls per cell instead of "
+      "one call per turn. For long-running work, set background=true: the "
       "cell runs as a background job and its result is delivered like any background task "
       "result (task notification, or get_background_result(task_id=...) when notifications are off).\n\n"
       "Sibling tools: use run_bash for non-Python shell commands and file tools for simple file "
       "inspection.\n\n"
-      "For multi-step filing, market or portfolio analysis, use the preloaded hank client inside "
-      "the cell: hank.search(query), hank.describe(operation), hank.call(operation, **arguments); "
-      f"and to delegate from a cell, {_bridge_operation_names()}. "
+      "Inside a cell, call any tool in this session's active catalog directly — local doors and "
+      "MCP tools, reads and writes — as hank.<tool_name>(**kwargs), or hank.call(name, **kwargs) "
+      "when the name is computed or collides with a hank method; no hank.search / hank.describe "
+      "step is required first (they remain optional discovery when a name or schema is genuinely "
+      "unknown). A cell cannot recurse into code_execute itself, and money/irreversible trade "
+      "execution still goes through the human-approval door. "
+      f"To delegate from a cell, {_bridge_operation_names()}. "
       f"Registered leaf model-call operations for completion and judge: {_model_call_operation_names()}. "
-      "Use discovered names/schemas; retain fetched data in variables and display derived summaries. "
+      "Full parsed dict/list results arrive in kernel memory untruncated: retain fetched data "
+      "in Python locals across cells, filter and compute in Python, and print only compact "
+      "summaries so only the printed summary enters the transcript. "
       "To publish a computed figure with its lineage, select the producer values it came from with "
       "hank.input(container, key) (a producer result, or an object/list kept from one; kernel and Docker "
       "cells keep them across cells) and call hank.derive(name, value, expression=..., inputs=[...]); the result's `derived` rows "

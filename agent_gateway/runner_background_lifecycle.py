@@ -162,6 +162,8 @@ _BACKGROUND_CANCEL_DRAIN_TIMEOUT_SECONDS = 5.0
 _BACKGROUND_GRACE_WAIT_TIMEOUT_SECONDS = 30.0
 _BACKGROUND_KILL_DRAIN_TIMEOUT_SECONDS = 5.0
 _BACKGROUND_RESULT_PAGE_CONTENT_MAX_CHARS = 20_000
+# Typical serialized-result size; sizes the delivery-grace page credits only.
+# A larger result is delivered in more pages, never refused.
 _BACKGROUND_RESULT_SERIALIZED_MAX_CHARS = 32_768 + 4_096
 
 
@@ -3434,85 +3436,10 @@ class RunnerBackgroundLifecycleMixin:
     timeout = request.timeout
     cursor = request.cursor
 
-    def _auto_notify_error(task_ids: list[str]) -> dict[str, Any]:
-      return {
-        "code": "background_result_auto_notify",
-        "message": (
-          "Automatic notifications own current-run background delivery. "
-          "Wait for and use the task notification; get_background_result is "
-          "limited to historical or explicitly omitted payloads while "
-          "auto-notify is active."
-        ),
-        "task_ids": task_ids,
-      }
-
     await self._rebuild_task_registry_from_log()
-    current_runner_id = getattr(self, "_runner_id", None)
-
-    def _is_current_run_reconstruction(entry: TaskEntry) -> bool:
-      metadata = (
-        entry.metadata
-        if isinstance(getattr(entry, "metadata", None), dict)
-        else {}
-      )
-      return (
-        bool(entry.reconstructed_from_log)
-        and current_runner_id is not None
-        and metadata.get("owner_runner_id") == current_runner_id
-      )
-
-    selected_wildcard_entries: list[TaskEntry] | None = None
-    if self._background_notifications_enabled:
-      candidate_entries: Sequence[TaskEntry | None]
-      if task_id == "*":
-        wildcard_entries = self._task_registry.list_tasks()
-        candidate_entries = wildcard_entries
-        selected_wildcard_entries = [
-          entry
-          for entry in wildcard_entries
-          if (
-            entry.notification_delivery_state in {
-              "payload_omitted",
-              "queue_omitted",
-            }
-            or (
-              entry.reconstructed_from_log
-              and not _is_current_run_reconstruction(entry)
-            )
-          )
-        ]
-      else:
-        candidate_entries = [self._task_registry.get(task_id)]
-      blocked_task_ids = [
-        entry.task_id
-        for entry in candidate_entries
-        if (
-          entry is not None
-          and (
-            _is_current_run_reconstruction(entry)
-            or entry.notification_delivery_state in {
-              "queued",
-              "delivered",
-            }
-            or (
-              not entry.reconstructed_from_log
-              and entry.notification_delivery_state not in {
-                "payload_omitted",
-                "queue_omitted",
-              }
-            )
-          )
-        )
-      ]
-      if blocked_task_ids and not selected_wildcard_entries:
-        return None, _auto_notify_error(blocked_task_ids)
 
     if task_id == "*":
-      selected_entries = (
-        selected_wildcard_entries
-        if selected_wildcard_entries is not None
-        else self._task_registry.list_tasks()
-      )
+      selected_entries = self._task_registry.list_tasks()
       await _runner_attr(
         self,
         "_wait_for_background_tasks",
@@ -3550,11 +3477,6 @@ class RunnerBackgroundLifecycleMixin:
     )
     if error is not None or bg_task is None:
       return None, error
-    if (
-      self._background_notifications_enabled
-      and _is_current_run_reconstruction(bg_task)
-    ):
-      return None, _auto_notify_error([task_id])
 
     await _runner_attr(self, "_wait_for_background_tasks", _wait_for_background_tasks)(
       [bg_task],
@@ -3611,18 +3533,6 @@ class RunnerBackgroundLifecycleMixin:
             f"Background result {task_id} is not canonical JSON and remains "
             "retained for operator recovery."
           ),
-        }
-      if len(serialized_result) > _BACKGROUND_RESULT_SERIALIZED_MAX_CHARS:
-        return None, {
-          "code": "background_result_contract_too_large",
-          "message": (
-            f"Background result {task_id} exceeds the bounded delivery "
-            "contract and remains retained for operator recovery. Large child "
-            "evidence must be moved to a durable artifact and represented by "
-            "bounded receipts or references."
-          ),
-          "max_chars": _BACKGROUND_RESULT_SERIALIZED_MAX_CHARS,
-          "actual_chars": len(serialized_result),
         }
       if len(serialized_result) <= page_chars:
         response = dict(result)

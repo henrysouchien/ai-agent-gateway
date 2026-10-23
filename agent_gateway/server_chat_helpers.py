@@ -49,7 +49,6 @@ from .session import (
   SessionStream,
   StreamSubscriber,
   bind_session_capability_selections,
-  session_admits_new_turn,
 )
 from .session_recap import emit_recap_then_terminal
 from .selected_content import SelectedContentAdmission
@@ -234,7 +233,6 @@ async def _cleanup_sessions_loop(
 ) -> None:
   while True:
     await asyncio.sleep(300)
-    await session_store.cleanup_expired_async()
     try:
       _cleanup_old_transcripts(transcript_dir, transcript_retention_days)
     except Exception:
@@ -1476,13 +1474,6 @@ async def _dispatch_chat_turn_body(
     _clear_active_turn(session, session.active_turn)
   if session.stream_active:
     raise HTTPException(status_code=409, detail="A turn is already running; subscribe via /chat/subscribe")
-  # The request was authenticated while earlier work (a turn, or a batch it
-  # dispatched) could still hold the token valid past its TTL; admission reads
-  # its own predicate here, with no await before the attach below, so an
-  # expired session cannot start a turn: past its TTL the bearer no longer
-  # proves the principal it was issued to.
-  if not session_admits_new_turn(session, expires_at=session.expires_at, now=int(time.time())):
-    raise HTTPException(status_code=401, detail="Session expired")
 
   prepared = prepared_turn or prepare_session_driver_turn(
     session,

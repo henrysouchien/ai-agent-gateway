@@ -5,6 +5,7 @@ NDJSON; Python, native and descendant output use separate capture pipes. The
 same source runs locally and as Docker's long-lived interpreter. SIGINT ends a
 cell, not the namespace; EOF/session disposal ends the interpreter.
 """
+import ast
 import base64
 import codecs
 import importlib
@@ -146,6 +147,47 @@ def _mime_bundle(value):
       savefig = getattr(value, "savefig")
       savefig(buffer, format="png")
       bundle["image/png"] = base64.b64encode(buffer.getvalue()).decode("ascii")
+  return bundle
+
+
+def _implicit_mime_bundle(value):
+  """Summarize a cell result without turning its size into execution failure.
+
+  Only explicit display() invokes rich renderers. Implicit output has a 16 KiB
+  text budget and an independently bounded JSON projection; the value itself
+  stays untouched in the interpreter.
+  """
+  import json
+
+  limit = 16 * 1024
+  marker = "\n... [implicit result truncated at 16 KiB; full value is bound to `_`]"
+  try:
+    text = repr(value)
+  except Exception as exc:
+    text = f"<implicit repr unavailable: {type(exc).__name__}>"
+  encoded = text[:limit].encode("utf-8", errors="backslashreplace")
+  truncated = len(text) > limit or len(encoded) > limit
+  if truncated:
+    text = encoded[:limit - len(marker)].decode("utf-8", errors="ignore") + marker
+  else:
+    text = encoded.decode("utf-8")
+  bundle = {"text/plain": text}
+  if not truncated and isinstance(value, (dict, list, tuple)):
+    parts = []
+    size = 0
+    try:
+      for part in json.JSONEncoder(ensure_ascii=False).iterencode(value):
+        # Bound the copy before encoding a potentially large string segment.
+        if len(part) + size > limit:
+          break
+        size += len(part.encode("utf-8"))
+        if size > limit:
+          break
+        parts.append(part)
+      else:
+        bundle["application/json"] = json.loads("".join(parts))
+    except Exception:
+      pass
   return bundle
 
 
@@ -497,9 +539,23 @@ def main():
         os.environ.pop("AGENT_CODE_EXECUTE_CELL_TOKEN", None)
       with open(cell["script"], encoding="utf-8") as script:
         code = script.read()
-      # Only explicit display frames return values. A last hank.call expression
-      # stays in the interpreter, not implicitly in the model's result.
-      exec(compile(code, "<cell>", "exec"), user_ns)
+      # Implicit output is a bounded summary, unlike explicit display().
+      # `print(...)` remains stdout and a None result produces no bundle.
+      tree = ast.parse(code)
+      if tree.body and isinstance(tree.body[-1], ast.Expr):
+        exec(
+          compile(ast.Module(body=tree.body[:-1], type_ignores=[]), "<cell>", "exec"),
+          user_ns,
+        )
+        last_value = eval(
+          compile(ast.Expression(tree.body[-1].value), "<cell>", "eval"), user_ns,
+        )
+        if last_value is not None:
+          user_ns["_"] = last_value
+          flush_capture()
+          emit({"type": "display", "id": cell_id, "bundle": _implicit_mime_bundle(last_value)})
+      else:
+        exec(compile(tree, "<cell>", "exec"), user_ns)
     except KeyboardInterrupt as exc:
       with active_lock:
         fault = active["fault"]

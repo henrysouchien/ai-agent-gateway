@@ -25,13 +25,15 @@ from ..tool_policy_registry import PreparedToolCall, ToolInputPreparationError
 from ._backends import DockerBackend, ExecutionBackend, SubprocessBackend
 from ._backends._kernel import KernelBackend, KernelState
 from ._config import CodeExecutionConfig
-from ._frame_reader import CatalogMetadata, CodeCallable, FrameReader, SourceExtractor, SourceKey
+from ._frame_reader import (
+  ActivatableToolDefinitions, ActivateTool, CatalogMetadata, CodeCallable, FrameReader, SourceExtractor, SourceKey,
+)
 from ._helpers import (
   _boolean_input, _host_wait_ms_input, _prepare_code_execute_env, _string_input, _timeout_ms_input, code_execute,
 )
 from ._hooks import strip_code_execute_base64_content, strip_code_execute_base64_hook
 from ._provenance import AGENT_CODE_EXECUTE_WORK_DIR_ENV, collect_native_computations
-from ._tool_defs import make_code_execute_tool_def
+from ._tool_defs import CODE_EXECUTE_TOOL_NAME, make_code_execute_tool_def
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +64,8 @@ class CodeExecutionBundle:
     source_key: SourceKey | None = None,
     code_callable: CodeCallable | None = None,
     catalog_metadata: CatalogMetadata | None = None,
+    activatable_tool_definitions: ActivatableToolDefinitions | None = None,
+    activate_tool: ActivateTool | None = None,
   ) -> None:
     """Bind the dispatcher (and its tool catalog) that nested cell calls go through.
 
@@ -69,6 +73,9 @@ class CodeExecutionBundle:
     a cell keeps the binding it opened under.
     `tool_definitions` is the turn's grant and `code_callable(operation)` the
     product registration's decision for that exact route; a nested call needs both.
+    `activatable_tool_definitions` / `activate_tool` carry the product's
+    `load_tools`-activatable set and its activation mechanism for deferred
+    operations (see `FrameReader.bind_dispatcher`).
     `extract_sources(operation, result)` is the product's per-tool source-handle
     extractor; its handles for successful nested calls become the outer
     result's `sources`, alongside the canonical dispatch settlement's sources.
@@ -76,6 +83,11 @@ class CodeExecutionBundle:
     `catalog_metadata` projects the installed route's producer identities;
     it neither resolves aliases nor grants an operation.
     """
+    host_tools = frozenset(self.handlers) | frozenset(
+      str(definition["name"])
+      for definition in self.tool_definitions
+      if definition.get("name")
+    )
     self.frame_reader.bind_dispatcher(
       dispatcher,
       tool_definitions=tool_definitions,
@@ -83,6 +95,9 @@ class CodeExecutionBundle:
       source_key=source_key,
       code_callable=code_callable,
       catalog_metadata=catalog_metadata,
+      activatable_tool_definitions=activatable_tool_definitions,
+      activate_tool=activate_tool,
+      host_tools=host_tools,
     )
 
 
@@ -616,7 +631,7 @@ def build_code_execution(
   available_hosts = ("auto",) + tuple(_get_registered_backend_names())
   return CodeExecutionBundle(
     handlers={
-      "code_execute": _handle_code_execute,
+      CODE_EXECUTE_TOOL_NAME: _handle_code_execute,
     },
     tool_definitions=[
       make_code_execute_tool_def(cfg, available_hosts),

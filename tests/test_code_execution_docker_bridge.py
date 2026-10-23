@@ -319,7 +319,7 @@ def test_docker_catalog_and_calls_obey_host_grant_and_registration(docker_runtim
         print(json.dumps(sorted(row["name"] for row in hank.search(""))))
         print(hank.describe({FRED_SERIES!r})["input_schema"]["required"][0])
         print(hank.call({FRED_SERIES!r}, series_id="CPIAUCSL")["series_id"])
-        for operation in ({SEARCH_FILINGS!r}, {REFRESH_FILINGS!r}, "file_read", "mcp__nowhere__nothing"):
+        for operation in ({SEARCH_FILINGS!r}, {REFRESH_FILINGS!r}, "mcp__nowhere__nothing"):
             try:
                 hank.call(operation, cik="0000320193")
             except HankBridgeError as exc:
@@ -333,7 +333,6 @@ def test_docker_catalog_and_calls_obey_host_grant_and_registration(docker_runtim
         "series_id", "CPIAUCSL",
         f"{SEARCH_FILINGS} not_granted",
         f"{REFRESH_FILINGS} not_code_callable",
-        "file_read not_code_callable",
         "mcp__nowhere__nothing unknown_operation",
       ]
       assert mcp.calls == [(FRED_SERIES, {"series_id": "CPIAUCSL"})]
@@ -341,7 +340,6 @@ def test_docker_catalog_and_calls_obey_host_grant_and_registration(docker_runtim
         (FRED_SERIES, None),
         (SEARCH_FILINGS, "not_granted"),
         (REFRESH_FILINGS, "not_code_callable"),
-        ("file_read", "not_code_callable"),
         ("mcp__nowhere__nothing", "unknown_operation"),
       ]
       assert result["sources"] == []
@@ -502,8 +500,9 @@ def test_docker_live_output_is_lines_and_tail_keeps_last_twenty(docker_runtime: 
         config.work_dir_root, on_output=output,
       )
       assert result["return_code"] == 0, result
-      assert result["stdout"] == result["stdout_tail"] == "".join(lines[-20:])
-      assert result["truncated"] is True
+      assert result["stdout"] == "".join(lines)
+      assert result["stdout_tail"] == "".join(lines[-20:])
+      assert result["truncated"] is False
       assert (Path(config.work_dir_root) / result["spill"]["stdout"]).read_text() == "".join(lines)
       assert events == lines
 

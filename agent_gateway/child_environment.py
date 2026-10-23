@@ -80,6 +80,14 @@ _AUTONOMOUS_CHILD_PROCESS_ENV_NAMES = frozenset({
   "HANK_MODEL_AUTHORITY_DIR",
   "HANK_LOCAL_FALLBACK_ENABLED",
   "HANK_MODEL_PRESET",
+  # Spend-ledger paths and attribution: the child's provider calls write the
+  # machine-wide ledger under the parent's repo/service/instance labels.
+  "HANK_SPEND_LEDGER_PATH",
+  "HANK_SPEND_SETTINGS_PATH",
+  "HANK_SPEND_REPO",
+  "HANK_SPEND_SERVICE",
+  "HANK_SPEND_INSTANCE_ID",
+  "HANK_SPEND_GIT_SHA",
   "USER_DATA_DIR",
   "CORPUS_LOG_DIR",
   "CORPUS_STATE_DIR",

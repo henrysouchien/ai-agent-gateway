@@ -941,12 +941,6 @@ def test_interrupted_notification_delivers_canonical_recovery_payload() -> None:
     assert expected_payload["message"] == interruption_error["message"]
 
     assert runner._consume_notifications(max_count=1) == 1
-    result, error = await runner.get_background_result(
-      {"task_id": entry.task_id},
-    )
-    assert result is None
-    assert error is not None
-    assert error["code"] == "background_result_auto_notify"
 
   asyncio.run(_case())
 
@@ -1099,6 +1093,39 @@ def test_oversized_failure_message_has_bounded_inline_and_exact_payload() -> Non
       "task_id": entry.task_id,
       "notification_generation": entry.notification_generation,
     }
+
+  asyncio.run(_case())
+
+
+def test_result_beyond_the_old_delivery_ceiling_pages_to_completion() -> None:
+  async def _case() -> None:
+    runner = _make_runner()
+    entry = runner._task_registry.register("background_agent")
+    runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
+    big = _report_child_return("big")
+    big["fms_results"] = [{"blob": "x" * 120_000}]
+    runner._task_registry.transition(
+      entry.task_id,
+      TaskState.COMPLETED,
+      result=big,
+    )
+
+    response, error = await runner.get_background_result(
+      {"task_id": entry.task_id},
+    )
+    assert error is None
+    assert response is not None
+    pages = [response["content"]]
+    while response["next_cursor"] is not None:
+      response, error = await runner.get_background_result(
+        {"task_id": entry.task_id, "cursor": response["next_cursor"]},
+      )
+      assert error is None
+      assert response is not None
+      pages.append(response["content"])
+    assert response["complete"] is True
+    assert len(pages) > 2
+    assert json.loads("".join(pages))["fms_results"][0]["blob"] == "x" * 120_000
 
   asyncio.run(_case())
 
@@ -1392,7 +1419,7 @@ def test_age_eviction_preserves_notification_retrieval_ownership(
   assert registry.get(entry.task_id) is None
 
 
-def test_wildcard_retrieval_filters_to_eligible_omitted_results() -> None:
+def test_wildcard_retrieval_lists_every_task() -> None:
   async def _case() -> None:
     runner = _make_runner()
     queued = runner._task_registry.register("background_agent")
@@ -1417,6 +1444,7 @@ def test_wildcard_retrieval_filters_to_eligible_omitted_results() -> None:
     assert error is None
     assert result is not None
     assert [task["task_id"] for task in result["tasks"]] == [
+      queued.task_id,
       omitted.task_id,
     ]
     assert queued.notification_delivery_state == "queued"
@@ -1498,58 +1526,7 @@ def test_omitted_result_backpressure_has_total_wildcard_recovery() -> None:
   asyncio.run(_case())
 
 
-def test_tool_retrieval_refuses_current_run_tasks_owned_by_notifications() -> None:
-  async def _case() -> None:
-    runner = _make_runner()
-    running = runner._task_registry.register(
-      "background_agent",
-      agent_name="writer",
-    )
-    runner._task_registry.transition(running.task_id, TaskState.RUNNING)
-
-    result, error = await runner.get_background_result(
-      {"task_id": running.task_id},
-    )
-    assert result is None
-    assert error == {
-      "code": "background_result_auto_notify",
-      "message": (
-        "Automatic notifications own current-run background delivery. "
-        "Wait for and use the task notification; get_background_result is "
-        "limited to historical or explicitly omitted payloads while "
-        "auto-notify is active."
-      ),
-      "task_ids": [running.task_id],
-    }
-
-    runner._task_registry.transition(
-      running.task_id,
-      TaskState.COMPLETED,
-      result=_report_child_return(),
-    )
-    assert running.notification_delivery_state == "queued"
-    result, error = await runner.get_background_result(
-      {"task_id": "*"},
-    )
-    assert result is None
-    assert error is not None
-    assert error["code"] == "background_result_auto_notify"
-    assert error["task_ids"] == [running.task_id]
-
-    assert runner._consume_notifications(max_count=1) == 1
-    assert running.notification_delivery_state == "delivered"
-    result, error = await runner.get_background_result(
-      {"task_id": running.task_id},
-    )
-    assert result is None
-    assert error is not None
-    assert error["code"] == "background_result_auto_notify"
-    assert error["task_ids"] == [running.task_id]
-
-  asyncio.run(_case())
-
-
-def test_durable_evicted_task_preserves_run_ownership_then_becomes_historical(
+def test_durable_evicted_task_is_retrievable_in_the_owning_and_a_later_run(
   tmp_path: Path,
 ) -> None:
   async def _case() -> None:
@@ -1588,10 +1565,9 @@ def test_durable_evicted_task_preserves_run_ownership_then_becomes_historical(
       {"task_id": task_id},
     )
 
-    assert result is None
-    assert error is not None
-    assert error["code"] == "background_result_auto_notify"
-    assert error["task_ids"] == [task_id]
+    assert error is None
+    assert result is not None
+    assert result["report"]["summary"] == "durable current run"
 
     runner._runner_id = "runner-next"
     historical, historical_error = await runner.get_background_result(

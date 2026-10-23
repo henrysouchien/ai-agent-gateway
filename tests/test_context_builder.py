@@ -1090,3 +1090,22 @@ def test_fork_seed_source_read_error_is_not_suppressed(tmp_path: Path) -> None:
   with pytest.raises(RuntimeError, match="source read failed"):
     _run(SessionContextBuilder(agent_session_log=own, fork_source_log=source).build())
   assert _fork_seeds(own) == []
+
+
+@pytest.mark.parametrize("summary_kind", ["portable_compaction", "cumulative"])
+@pytest.mark.parametrize("empty_text", ["", "   "])
+def test_context_builder_omits_summary_message_when_summary_text_is_empty(
+  tmp_path: Path, summary_kind: str, empty_text: str,
+) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / f"empty-{summary_kind}.jsonl")
+  _run(log.append({"type": "user_message", "content": "Covered prefix"}))
+  _run(log.append({
+    "type": "summary",
+    "summary_kind": summary_kind,
+    "covers": {"from_seq": 1, "to_seq": 1},
+    "text": empty_text,
+  }))
+  _run(log.append({"type": "user_message", "content": "Retained tail"}))
+
+  messages = _run(SessionContextBuilder(agent_session_log=log).build())
+  assert messages == [{"role": "user", "content": "Retained tail"}]

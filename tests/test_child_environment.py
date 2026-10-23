@@ -78,3 +78,20 @@ def test_child_inherits_the_parents_default_preset() -> None:
   assert parent.selection_policy.default_preset == "kimi_dev"
   assert "HANK_MODEL_PRESET" in projected
   assert child.selection_policy.default_preset == "kimi_dev"
+
+
+def test_child_inherits_the_spend_ledger_paths_and_attribution() -> None:
+  names = (
+    "HANK_SPEND_LEDGER_PATH",
+    "HANK_SPEND_SETTINGS_PATH",
+    "HANK_SPEND_REPO",
+    "HANK_SPEND_SERVICE",
+    "HANK_SPEND_INSTANCE_ID",
+    "HANK_SPEND_GIT_SHA",
+  )
+  env = {name: f"value-of-{name}" for name in names}
+  env["HANK_SPEND_UNLISTED"] = "must-not-be-inherited"
+
+  projected = filter_child_environment(env, purpose=AUTONOMOUS_CHILD_ENVIRONMENT)
+
+  assert projected == {name: f"value-of-{name}" for name in names}

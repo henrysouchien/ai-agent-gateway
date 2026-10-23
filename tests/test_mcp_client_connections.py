@@ -1,4 +1,5 @@
 import asyncio
+import errno
 from collections import deque
 from collections.abc import Awaitable, Callable
 import json
@@ -1032,3 +1033,85 @@ def test_shutdown_completes_while_stdio_watch_awaits_receive_done():
     assert "stuck" not in manager._servers
 
   asyncio.run(scenario())
+
+
+class _LoopbackRefusingSession:
+  """Refuse the first ``refusals`` loopback connects, then answer."""
+
+  def __init__(self, refusals: int) -> None:
+    self.refusals = refusals
+    self.calls = 0
+
+  async def call_tool(self, name, arguments, **_kwargs):
+    self.calls += 1
+    if self.calls <= self.refusals:
+      raise ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
+    return SimpleNamespace(
+      is_error=False,
+      structured_content={"tool": name, "ok": True},
+      content=[],
+    )
+
+
+def _loopback_manager(session) -> McpClientManager:
+  manager = McpClientManager(config_path=None)
+  manager._servers["loopback"] = mcp_client_module._ConnectedServerState(
+    name="loopback",
+    session=session,
+    exit_contexts=[],
+    tool_definitions=[],
+    tool_names={"read_door", "write_door"},
+    config={"type": "streamable_http", "url": "http://127.0.0.1:9"},
+  )
+  manager._tool_to_server["read_door"] = "loopback"
+  manager._tool_to_server["write_door"] = "loopback"
+  return manager
+
+
+def test_loopback_connection_refused_retries_idempotent_call_then_succeeds():
+  session = _LoopbackRefusingSession(refusals=2)
+  manager = _loopback_manager(session)
+
+  result, error = asyncio.run(manager.call_tool("read_door", {}))
+
+  assert error is None
+  assert result == {"tool": "read_door", "ok": True}
+  assert session.calls == 3
+
+
+def test_loopback_connection_refused_never_retries_when_replay_forbidden():
+  session = _LoopbackRefusingSession(refusals=2)
+  manager = _loopback_manager(session)
+
+  result, error = asyncio.run(
+    manager.call_tool("write_door", {}, allow_uncertain_replay=False)
+  )
+
+  assert result is None
+  assert error is not None
+  assert session.calls == 1
+
+
+def test_loopback_connection_refused_exhaustion_returns_refusal():
+  session = _LoopbackRefusingSession(refusals=99)
+  manager = _loopback_manager(session)
+
+  result, error = asyncio.run(manager.call_tool("read_door", {}))
+
+  assert result is None
+  assert error is not None
+  assert session.calls > 1
+
+
+def test_loopback_refusal_ignores_enodata_under_linux_numbering(monkeypatch):
+  # Linux numbers ENODATA 61 and ECONNREFUSED 111 (Darwin is the reverse).
+  # The predicate must compare against errno.ECONNREFUSED alone.
+  monkeypatch.setattr(errno, "ECONNREFUSED", 111)
+  monkeypatch.setattr(errno, "ENODATA", 61)
+  no_data = OSError("no data")
+  no_data.errno = errno.ENODATA
+  refused = OSError("refused")
+  refused.errno = errno.ECONNREFUSED
+
+  assert mcp_client_connections.is_loopback_connection_refused(no_data) is False
+  assert mcp_client_connections.is_loopback_connection_refused(refused) is True

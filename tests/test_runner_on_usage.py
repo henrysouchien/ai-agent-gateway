@@ -1962,6 +1962,112 @@ def test_runner_session_summary_reports_in_flight_tasks_when_a_child_outlives_th
   _run(case())
 
 
+def test_runner_delivers_session_summary_before_closure_settlement() -> None:
+  summaries: list[SessionUsageSummary] = []
+  delivered_when_settling: list[int] = []
+  runner = AgentRunner(
+    event_log=EventLog(),
+    dispatcher=_make_dispatcher(),
+    session_id="sess-parent",
+    capability_execution=_runner_execution(_UsageProvider()),
+    user_id="alice",
+    on_session_summary=summaries.append,
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+  settle = runner._settle_run_closure
+
+  async def _settle_run_closure(**kwargs: Any) -> bool:
+    delivered_when_settling.append(len(summaries))
+    return await settle(**kwargs)
+
+  setattr(runner, "_settle_run_closure", _settle_run_closure)
+
+  _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
+
+  assert delivered_when_settling == [1]
+  assert len(summaries) == 1
+
+
+def test_runner_cancelled_while_closing_usage_still_delivers_the_session_summary_once() -> None:
+  async def case() -> None:
+    summaries: list[SessionUsageSummary] = []
+    runner = AgentRunner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(),
+      session_id="sess-parent",
+      capability_execution=_runner_execution(_UsageProvider()),
+      user_id="alice",
+      on_session_summary=summaries.append,
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    closing = asyncio.Event()
+    close_aggregator = runner._aggregator.close
+
+    async def _slow_close() -> None:
+      closing.set()
+      await asyncio.sleep(0.05)
+      await close_aggregator()
+
+    setattr(runner._aggregator, "close", _slow_close)
+    task = asyncio.create_task(runner.run(messages=[{"role": "user", "content": "hello"}]))
+    await closing.wait()
+    task.cancel()
+    [outcome] = await asyncio.gather(task, return_exceptions=True)
+
+    assert outcome is None or isinstance(outcome, asyncio.CancelledError)
+    assert len(summaries) == 1
+    assert summaries[0].input_tokens == 100
+    assert summaries[0].output_tokens == 50
+
+  _run(case())
+
+
+def test_server_shutdown_cancels_active_turns_and_each_runner_delivers_its_session_summary() -> None:
+  from fastapi.testclient import TestClient
+
+  from agent_gateway import create_agent
+  from agent_gateway.session import SessionStream
+
+  summaries: list[SessionUsageSummary] = []
+  streaming = threading.Event()
+
+  class _HangingProvider(_UsageProvider):
+    async def stream(self, client: Any, params: dict[str, Any]):
+      _ = client, params
+      yield StreamEvent(type="message_start", input_tokens=100)
+      streaming.set()
+      await asyncio.Event().wait()
+
+  app = create_agent("test")
+  with TestClient(app) as client:
+    session = app.state.auth.session_store.create_session(api_key_hash="hash", user_id="alice")
+
+    async def _start_turn() -> None:
+      event_log = EventLog()
+      runner = AgentRunner(
+        event_log=event_log,
+        dispatcher=_make_dispatcher(event_log),
+        session_id="sess-parent",
+        capability_execution=_runner_execution(_HangingProvider()),
+        user_id="alice",
+        on_session_summary=summaries.append,
+        billing_mode="byok",
+        rate_table_version="unknown",
+      )
+      task = asyncio.create_task(runner.run(messages=[{"role": "user", "content": "hello"}]))
+      session.active_turn = SessionStream(event_log=event_log, runner_task=task, session=session)
+
+    assert client.portal is not None
+    client.portal.call(_start_turn)
+    assert streaming.wait(5)
+    assert summaries == []
+
+  assert len(summaries) == 1
+  assert session.active_turn is None
+
+
 def test_runner_is_single_use() -> None:
   provider = _UsageProvider()
   runner = AgentRunner(

@@ -31,12 +31,12 @@ DEFAULT_SERVER_COMPACTION_INSTRUCTIONS = """You are compacting a long tool-using
 
 Do not call tools. Do not ask follow-up questions. Return text only.
 
-First write a private <analysis> scratchpad to make sure nothing important is lost.
+First write a brief private <analysis> scratchpad (at most a few bullet points) so the summary fits within the output budget.
 Then write the durable summary inside a <summary>...</summary> block.
 
 The summary must preserve:
-- the original user task and any later changes to it
-- current working state and unfinished work
+- the original root user deliverable on the very first line (never narrow the overall task deliverable to an in-flight invoke_skill stage's local output format such as a '## Skill Summary' receipt; an inline skill is one step inside the root deliverable)
+- current working state and unfinished work across the full root deliverable
 - open tool threads, tool names, tool call ids, and expected next tool results
 - decisions made, the rationale for those decisions, and rejected alternatives
 - errors encountered and how they were fixed
@@ -114,6 +114,7 @@ def should_portable_compact(
   failed_est_at: int | None = None,
   turn_count: int | None = None,
   last_compact_turn: int | None = None,
+  last_compact_failed_turn: int | None = None,
   force: bool = False,
 ) -> tuple[bool, str]:
   if not portable_compaction_enabled():
@@ -124,6 +125,8 @@ def should_portable_compact(
     return False, "disabled"
   if not force and est_total_tokens < trigger:
     return False, "below_trigger"
+  if not force and turn_count is not None and last_compact_failed_turn == turn_count:
+    return False, "failed_cooldown"
   if not force and failed_est_at is not None and est_total_tokens < failed_est_at + MIN_COMPACT_GAIN_TOKENS:
     return False, "failed_cooldown"
   if not force and turn_count is not None and last_compact_turn == turn_count:
@@ -131,7 +134,6 @@ def should_portable_compact(
   if est_summarize_tokens < MIN_COMPACT_GAIN_TOKENS:
     return False, "insufficient_gain"
   return True, "force" if force else "triggered"
-
 
 def _omitted_marker(value: Any) -> str:
   if isinstance(value, str):
@@ -344,6 +346,18 @@ def apply_compaction_anchor(
   provider: str,
   model: str,
 ) -> list[dict[str, Any]]:
+  retained = []
+  for message in tail:
+    message = dict(message)
+    if isinstance(message.get("content"), list):
+      message["content"] = [
+        block for block in message["content"]
+        if not isinstance(block, dict) or block.get("type") != "compaction"
+      ]
+    if message.get("content"):
+      retained.append(message)
+  if not str(summary or "").strip():
+    return retained or [{"role": "user", "content": CONTINUATION_NUDGE}]
   anchor_block = {"type": "compaction", "content": summary}
   anchor = {
     "role": "assistant",
@@ -352,33 +366,208 @@ def apply_compaction_anchor(
     "model": model,
     "stop_reason": "compaction",
   }
-  if tail:
-    # An older anchor in a retained batch must not supersede this boundary.
-    retained = []
-    for message in tail:
-      message = dict(message)
-      if isinstance(message.get("content"), list):
-        message["content"] = [
-          block for block in message["content"]
-          if not isinstance(block, dict) or block.get("type") != "compaction"
-        ]
-      if message.get("content"):
-        retained.append(message)
+  if retained:
     return [anchor, *retained]
   return [anchor, {"role": "user", "content": CONTINUATION_NUDGE}]
 
 
 _ANALYSIS_RE = re.compile(r"<analysis\b[^>]*>.*?</analysis>", re.IGNORECASE | re.DOTALL)
+_UNCLOSED_ANALYSIS_RE = re.compile(r"<analysis\b[^>]*>.*\Z", re.IGNORECASE | re.DOTALL)
+_ANALYSIS_BODY_RE = re.compile(r"<analysis\b[^>]*>(.*?)(?:</analysis>|\Z)", re.IGNORECASE | re.DOTALL)
 _SUMMARY_RE = re.compile(r"<summary\b[^>]*>(.*?)</summary>", re.IGNORECASE | re.DOTALL)
+_SUMMARY_OPEN_RE = re.compile(r"<summary\b", re.IGNORECASE)
+
+
+def _extract_summary_body(text: str) -> str:
+  match = _SUMMARY_RE.search(text)
+  if match:
+    return match.group(1).strip()
+  return re.sub(r"</?summary\b[^>]*>", "", text, flags=re.IGNORECASE).strip()
 
 
 def _strip_analysis_and_extract_summary(text: str) -> str:
-  without_analysis = _ANALYSIS_RE.sub("", str(text or "")).strip()
-  match = _SUMMARY_RE.search(without_analysis)
-  if match:
-    return match.group(1).strip()
-  return re.sub(r"</?summary\b[^>]*>", "", without_analysis, flags=re.IGNORECASE).strip()
+  """The `<summary>` body of a model response, without its `<analysis>` scratchpad.
 
+  A response the output budget cut off inside `<analysis>` (so `<summary>` is
+  absent or only just opened) would leave less than ``MIN_SUMMARY_CHARS``;
+  the analysis is then the only account of the conversation the model wrote,
+  so it is kept, ahead of whatever `<summary>` text followed it.
+  """
+  raw = str(text or "")
+  without_analysis = _ANALYSIS_RE.sub("", raw)
+  # An `<analysis>` left open ends the text, unless a `<summary>` follows it:
+  # one inside the summary body is the summary's own wording.
+  summary_open = _SUMMARY_OPEN_RE.search(without_analysis)
+  head = without_analysis if summary_open is None else without_analysis[:summary_open.start()]
+  without_analysis = (
+    _UNCLOSED_ANALYSIS_RE.sub("", head) + without_analysis[len(head):]
+  ).strip()
+  extracted = _extract_summary_body(without_analysis)
+  if len(extracted) >= MIN_SUMMARY_CHARS:
+    return extracted
+  analysis = "\n".join(body.strip() for body in _ANALYSIS_BODY_RE.findall(raw) if body.strip())
+  salvaged = "\n\n".join(part for part in (analysis, extracted) if part).strip()
+  return salvaged if len(salvaged) >= MIN_SUMMARY_CHARS else extracted
+
+
+def _summary_response_text(result: Any) -> str:
+  """The response text to extract a summary from.
+
+  A reasoning model can spend the whole output budget in thinking and stop
+  before it writes `<summary>`; its thinking is then the only account of the
+  conversation it produced, and precedes whatever text it did write.
+  """
+  text = str(getattr(result, "text", "") or "")
+  thinking = str(getattr(result, "thinking_text", "") or "").strip()
+  if len(thinking) >= MIN_SUMMARY_CHARS and len(_strip_analysis_and_extract_summary(text)) < MIN_SUMMARY_CHARS:
+    return f"{thinking}\n{text}".strip()
+  return text
+
+
+
+_ROOT_DELIVERABLE_LINE_PREFIX = "Root deliverable: "
+_STAGE_ONLY_RECEIPT_RE = re.compile(
+  r"(?i)\s*(?:final\s+|the\s+)?deliverable\s+of\s+(?:the\s+|this\s+)?(?:\*+)?current\s+stage(?:\*+)?[^.\n]*?##\s*Skill\s+Summary[^.\n]*?\.",
+)
+_TASK_HEADING_RE = re.compile(
+  r"(?:^|\n)#+\s*Task[^\n]*\n+([^\n]+)",
+  re.IGNORECASE,
+)
+
+
+_RUNNER_USER_TEXT_PREFIXES = (
+  "[System:",
+  "<background-",
+  "<operator-",
+  "<task-",
+  "[History was compacted",
+  "You stopped with ",
+  "Current checklist (",
+  "The analyst edited the checklist:",
+  "[tool_result]",
+)
+_RUNNER_USER_TEXTS = frozenset({CONTINUATION_NUDGE, "Continue from where you left off."})
+
+
+def is_runner_injected_user_text(text: str) -> bool:
+  """Whether a user message's text is the runner's own words, not the analyst's.
+
+  Owner of the text half of that fact for the compaction header and the todo
+  checklist's turn scan: the max-tokens and continue nudges, system notices,
+  background/operator/task notifications, the compaction continuation,
+  checklist reminders and analyst-edit notes.
+  """
+  stripped = text.strip()
+  return stripped in _RUNNER_USER_TEXTS or stripped.startswith(_RUNNER_USER_TEXT_PREFIXES)
+
+
+def _real_user_prompt_text(message: dict[str, Any]) -> str | None:
+  """The text of a user message that carries the analyst's request, else ``None``.
+
+  Continuation nudges, checklist reminders and analyst-edit notes are the
+  runner's own words, and a ``tool_result`` batch is a tool's.
+  """
+  if str(message.get("role") or "") != "user":
+    return None
+  content = message.get("content")
+  if isinstance(content, list) and any(
+    isinstance(block, dict) and block.get("type") == "tool_result" for block in content
+  ):
+    return None
+  text = _content_text(content).strip()
+  if not text or is_runner_injected_user_text(text):
+    return None
+  return text
+
+
+def _latest_user_prompt_index(messages: list[dict[str, Any]]) -> int | None:
+  for index in range(len(messages) - 1, -1, -1):
+    if _real_user_prompt_text(messages[index]) is not None:
+      return index
+  return None
+
+
+def _current_turn_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+  """The messages from the analyst's latest request on: an earlier request's
+  skills and compaction headers describe a task that is finished."""
+  latest = _latest_user_prompt_index(messages)
+  return messages if latest is None else messages[latest:]
+
+
+def _compaction_texts(messages: list[dict[str, Any]]) -> list[str]:
+  texts: list[str] = []
+  for message in messages:
+    content = message.get("content")
+    if not isinstance(content, list):
+      continue
+    for block in content:
+      if isinstance(block, dict) and block.get("type") == "compaction":
+        texts.append(str(block.get("content") or "").strip())
+  return texts
+
+
+def _message_has_inline_skill_or_stage_narrowing(messages: list[dict[str, Any]], summary: str) -> bool:
+  if _STAGE_ONLY_RECEIPT_RE.search(summary) is not None or "## Skill Summary" in summary:
+    return True
+  current_turn = _current_turn_messages(messages)
+  for message in current_turn:
+    content = message.get("content")
+    if not isinstance(content, list):
+      continue
+    for block in content:
+      if isinstance(block, dict) and block.get("type") in {"tool_use", "server_tool_use"} and block.get("name") == "invoke_skill":
+        return True
+  return any(
+    text.startswith(_ROOT_DELIVERABLE_LINE_PREFIX) or "## Skill Summary" in text
+    for text in _compaction_texts(current_turn)
+  )
+
+
+def _extract_root_deliverable(messages: list[dict[str, Any]]) -> str | None:
+  """The current turn's request: the latest real user prompt's first line.
+
+  Only when no user prompt survives in ``messages`` (every one was compacted
+  into an anchor) does the anchor's own ``Root deliverable:`` line, or its
+  ``Task`` heading, stand for it.
+  """
+  latest = _latest_user_prompt_index(messages)
+  current_turn = messages if latest is None else messages[latest:]
+  if latest is not None:
+    text = _real_user_prompt_text(messages[latest]) or ""
+    head = text.split("\n\n## Current Session Context", 1)[0].strip()
+    first_line = next((ln.strip() for ln in head.splitlines() if ln.strip()), "")
+    if first_line:
+      return first_line
+  compactions = _compaction_texts(current_turn)
+  for comp_text in compactions:
+    if comp_text.startswith(_ROOT_DELIVERABLE_LINE_PREFIX):
+      first = comp_text.splitlines()[0][len(_ROOT_DELIVERABLE_LINE_PREFIX):].strip()
+      if first:
+        return first
+  for comp_text in compactions:
+    match = _TASK_HEADING_RE.search(_STAGE_ONLY_RECEIPT_RE.sub("", comp_text))
+    if match:
+      task_line = match.group(1).strip()
+      if task_line:
+        return task_line
+  return None
+
+
+def _ensure_root_deliverable_header(summary: str, messages: list[dict[str, Any]]) -> str:
+  cleaned = str(summary or "").strip()
+  if not cleaned:
+    return cleaned
+  if not _message_has_inline_skill_or_stage_narrowing(messages, cleaned):
+    return cleaned
+  root_deliverable = _extract_root_deliverable(messages)
+  cleaned = _STAGE_ONLY_RECEIPT_RE.sub("", cleaned).strip()
+  if not root_deliverable:
+    return cleaned
+  lines = cleaned.splitlines()
+  if lines and lines[0].startswith(_ROOT_DELIVERABLE_LINE_PREFIX):
+    lines[0] = f"{_ROOT_DELIVERABLE_LINE_PREFIX}{root_deliverable}"
+    return "\n".join(lines).strip()
+  return f"{_ROOT_DELIVERABLE_LINE_PREFIX}{root_deliverable}\n\n{cleaned}"
 
 def _summary_tools(provider: ModelProvider, tools: list[dict[str, Any]] | None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
   if tools and getattr(provider, "supports_tool_choice_none", False) is True:
@@ -468,7 +657,7 @@ async def summarize_messages(
     )
     if result.saw_tool_use:
       raise SummaryResponseRejected("Summary generation returned tool_use", usage=result.usage)
-    return _strip_analysis_and_extract_summary(result.text), result.usage
+    return _ensure_root_deliverable_header(_strip_analysis_and_extract_summary(_summary_response_text(result)), messages), result.usage
 
   async def _summarize_rendered() -> tuple[str, dict[str, Any]]:
     rendered = render_messages_for_summary(messages)
@@ -484,7 +673,7 @@ async def summarize_messages(
     )
     if result.saw_tool_use:
       raise SummaryResponseRejected("Summary generation returned tool_use", usage=result.usage)
-    return _strip_analysis_and_extract_summary(result.text), result.usage
+    return _ensure_root_deliverable_header(_strip_analysis_and_extract_summary(_summary_response_text(result)), messages), result.usage
 
   if _json_chars(messages) <= RENDER_CHAR_BUDGET:
     try:
@@ -505,6 +694,7 @@ async def maybe_compact_current_messages(
   est_total_tokens: int,
   turn_count: int | None = None,
   last_compact_turn: int | None = None,
+  last_compact_failed_turn: int | None = None,
   failed_est_at: int | None = None,
   keep_rounds: int = KEEP_ROUNDS,
   tail_token_budget: int = TAIL_TOKEN_BUDGET,
@@ -549,6 +739,7 @@ async def maybe_compact_current_messages(
     failed_est_at=failed_est_at,
     turn_count=turn_count,
     last_compact_turn=last_compact_turn,
+    last_compact_failed_turn=last_compact_failed_turn,
     force=force,
   )
   if not should_compact:

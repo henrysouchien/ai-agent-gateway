@@ -158,9 +158,9 @@ def compile_semantic_capabilities(
 ) -> SemanticCapabilityCompilation:
   """Compile exact routes without widening or positional assignment.
 
-  Untagged tools are accepted only when exactly one required capability is
-  compatible with that route.  This keeps the convenient single-capability
-  operation case while failing closed for ambiguous multi-capability catalogs.
+  Every supplied route is granted: the operation's ceilings decided admission
+  before this call. Declarations only shape binding metadata and the verdict
+  that a required capability has a compatible route.
   """
 
   if not isinstance(registry, SemanticCapabilityRegistry):
@@ -195,23 +195,12 @@ def compile_semantic_capabilities(
       and route.effect in specs[name].live_tool_effects
       and (route.capability is None or route.capability == name)
     ]
-    if route.capability is not None and route.capability not in by_name:
-      raise SemanticCapabilityCompilationError(
-        f"tool {route.tool_id!r} targets undeclared capability "
-        f"{route.capability!r}"
-      )
-    if len(compatible) > 1:
-      raise SemanticCapabilityCompilationError(
-        f"tool {route.tool_id!r} ambiguously matches semantic capabilities: "
-        + ", ".join(sorted(compatible))
-      )
+    # A route is admitted by its operation ceiling, not by the capabilities the
+    # operation declared. Exactly one declared capability it serves takes it as
+    # binding metadata; otherwise (none, or ambiguous: never positional) it is
+    # granted unbound below.
     if len(compatible) == 1:
       assigned[compatible[0]].append(route)
-    elif route.capability is not None:
-      raise SemanticCapabilityCompilationError(
-        f"tool {route.tool_id!r} is incompatible with semantic capability "
-        f"{route.capability!r}"
-      )
 
   bindings: list[CapabilityBinding] = []
   entries: dict[str, ToolGrantEntry] = {}
@@ -264,6 +253,12 @@ def compile_semantic_capabilities(
         f"required semantic capability {name!r} has no compatible admitted route"
       )
 
+  for route in routes:
+    entries.setdefault(route.tool_id, ToolGrantEntry(
+      tool_id=route.tool_id,
+      route_id=f"tool:{route.tool_id}",
+      effect=route.effect,
+    ))
   ordered_entries = tuple(entries[name] for name in sorted(entries))
   mcp_scope: dict[str, set[str]] = {}
   for name in entries:

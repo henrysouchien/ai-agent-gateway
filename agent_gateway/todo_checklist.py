@@ -231,6 +231,16 @@ def _find_phase(checklist: TodoChecklist, name: str) -> int:
   for index, phase in enumerate(checklist.phases):
     if phase.name == name:
       return index
+  # A skill's ``init`` qualifies a phase name that collides with an existing
+  # one as ``<skill>: <name>``; that exact suffix still addresses it when only
+  # one phase carries it.
+  qualified = [
+    index
+    for index, phase in enumerate(checklist.phases)
+    if phase.name.endswith(f": {name}")
+  ]
+  if len(qualified) == 1:
+    return qualified[0]
   raise TodoError("unknown_phase", f"no checklist phase {name!r}", phase=name)
 
 
@@ -352,8 +362,7 @@ def apply_model_op(
     )
   existing_ids = {item.id for _, item in checklist.items()}
   if name == "init":
-    phases = _parse_phases(op.get("phases"), existing_ids=set(), keep_ids=False)
-    return _settle(replace(checklist, phases=()), phases)
+    return _apply_init_op(checklist, op, existing_ids=existing_ids)
   if name == "append":
     phase_name = _text(op.get("phase"), what="phase", limit=TODO_PHASE_MAX_CHARS)
     raw_items = op.get("items")
@@ -414,6 +423,94 @@ def apply_model_op(
     for phase in checklist.phases
   ]
   return _settle(checklist, phases)
+
+
+
+def _apply_init_op(
+  checklist: TodoChecklist,
+  op: Mapping[str, Any],
+  *,
+  existing_ids: set[str],
+) -> TodoChecklist:
+  """Apply ``todo(op="init")``.
+
+  ``init`` replaces the checklist with the given phases, which is how the root
+  agent plans and re-plans. A skill invoked from inside another skill (the
+  active skill is not the first one invoked this turn) is a stage of the outer
+  skill's work, so its ``init`` must not discard the outer skill's open items:
+  it nests its phases before the first open phase, and when nothing outer is
+  left open it appends one pending phase that resumes the outer skill, so the
+  stop-time reminder keeps the root deliverable in view.
+  """
+  from .skill_context import current_parent_skill, current_skill
+
+  active_skill = str(op.get("_active_skill") or current_skill() or "").strip() or None
+  parent_skill = str(op.get("_parent_skill") or current_parent_skill() or "").strip() or None
+  root_deliverable = str(op.get("_root_deliverable") or "").strip() or None
+  raw_invoked = op.get("_invoked_skills") or ()
+  invoked_skills = tuple(str(s).strip() for s in raw_invoked if str(s).strip())
+  outer_skill = parent_skill or (invoked_skills[0] if invoked_skills else None)
+  is_nested_skill = active_skill is not None and outer_skill is not None and active_skill != outer_skill
+  incoming = _parse_phases(op.get("phases"), existing_ids=set(existing_ids), keep_ids=False)
+  if not is_nested_skill:
+    return _settle(replace(checklist, phases=()), incoming)
+
+  if checklist.open_items():
+    seen_contents = {item.content for _, item in checklist.items()}
+    demoted_existing: list[TodoPhase] = [
+      replace(
+        phase,
+        items=tuple(
+          replace(item, status="pending") if item.status == "in_progress" else item
+          for item in phase.items
+        ),
+      )
+      for phase in checklist.phases
+    ]
+    existing_phase_names = {phase.name for phase in demoted_existing}
+    scoped_incoming: list[TodoPhase] = []
+    for phase in incoming:
+      new_items = tuple(item for item in phase.items if item.content not in seen_contents)
+      if not new_items:
+        continue
+      for item in new_items:
+        seen_contents.add(item.content)
+      phase_name = phase.name
+      if phase_name in existing_phase_names:
+        phase_name = f"{active_skill}: {phase_name}"[:TODO_PHASE_MAX_CHARS]
+      existing_phase_names.add(phase_name)
+      scoped_incoming.append(replace(phase, name=phase_name, items=new_items))
+    first_open_idx = next(
+      (
+        idx
+        for idx, phase in enumerate(demoted_existing)
+        if any(item.status in OPEN_STATUSES for item in phase.items)
+      ),
+      len(demoted_existing),
+    )
+    merged = [
+      *demoted_existing[:first_open_idx],
+      *scoped_incoming,
+      *demoted_existing[first_open_idx:],
+    ]
+    return _settle(checklist, merged)
+
+  incoming_text = " ".join(item.content for phase in incoming for item in phase.items).lower()
+  if outer_skill is not None and outer_skill.lower() not in incoming_text:
+    all_ids = set(existing_ids) | {item.id for phase in incoming for item in phase.items}
+    resume = (
+      f"Complete root deliverable: {root_deliverable}"
+      if root_deliverable
+      else f"Complete {outer_skill} root deliverable"
+    )[:TODO_CONTENT_MAX_CHARS]
+    incoming = [
+      *incoming,
+      TodoPhase(
+        name=f"Root — {outer_skill} continuation"[:TODO_PHASE_MAX_CHARS],
+        items=(TodoItem(id=_new_id(all_ids), content=resume, status="pending"),),
+      ),
+    ]
+  return _settle(replace(checklist, phases=()), incoming)
 
 
 def apply_analyst_edit(
@@ -561,6 +658,42 @@ def render_analyst_edit_note(checklist: TodoChecklist) -> str:
 TODO_REMINDER_BOUND = 3
 
 
+_TURN_SCAN_PAGE = 64
+
+
+def _prompt_first_line(content: Any) -> str | None:
+  """The first line of an analyst's request, or ``None`` for a message the
+  runner wrote itself (a continuation nudge, a notification) or one with no text."""
+  from .server_compaction import is_runner_injected_user_text
+
+  if isinstance(content, str):
+    text = content
+  elif isinstance(content, Sequence):
+    text = "\n".join(
+      str(block.get("text") or "")
+      for block in content
+      if isinstance(block, Mapping) and block.get("type") == "text"
+    )
+  else:
+    return None
+  text = text.strip()
+  if is_runner_injected_user_text(text):
+    return None
+  head = text.split("\n\n## Current Session Context", 1)[0].strip()
+  return next((ln.strip() for ln in head.splitlines() if ln.strip()), None)
+
+
+def _has_attachments(event: Mapping[str, Any]) -> bool:
+  """Whether an analyst ``user_message`` carries attachments (an image-only
+  message has no text but still begins a turn)."""
+  if event.get("attachments"):
+    return True
+  content = event.get("content")
+  return not isinstance(content, str) and isinstance(content, Sequence) and any(
+    isinstance(block, Mapping) and block.get("type") not in {"text", "tool_result"} for block in content
+  )
+
+
 class TodoSessionState:
   """The live checklist of one session, shared by the tool handler, the run
   loop and the analyst ``PATCH`` door.
@@ -591,28 +724,83 @@ class TodoSessionState:
     self.reminders_sent = 0
     self.moved_since_reminder = True
     self.pending_analyst_note: str | None = None
+    self.root_deliverable: str | None = None
+    self.invoked_skills: tuple[str, ...] = ()
 
   async def load(self, agent_session_log: Any | None) -> TodoChecklist:
-    """Fold the checklist from the journal once per state object."""
-    if self.loaded:
-      return self.checklist
+    """Fold the checklist from the journal once per state object, and refresh
+    the current turn's request and invoked skills on every call."""
     if agent_session_log is None:
       return self.checklist
-    entries, _ = await agent_session_log.query(
-      event_types={TODO_SNAPSHOT_EVENT_TYPE},
-      order="asc",
-    )
-    folded = fold_todo_snapshots(
-      (entry.event for entry in entries),
-      gateway_session_id=self.gateway_session_id if self.scope_to_run else None,
-    )
-    if self.checklist.revision > folded.revision:
-      await agent_session_log.append(self.snapshot_event(actor="analyst", op="patch"))
-    else:
-      self.checklist = folded
-      self.model_seen_revision = self.checklist.revision
-    self.loaded = True
+    if not self.loaded:
+      entries, _ = await agent_session_log.query(
+        event_types={TODO_SNAPSHOT_EVENT_TYPE},
+        order="asc",
+      )
+      snapshot_events: list[Mapping[str, Any]] = []
+      for entry in entries:
+        ev = getattr(entry, "event", None)
+        if isinstance(ev, Mapping) and ev.get("type") == TODO_SNAPSHOT_EVENT_TYPE:
+          snapshot_events.append(ev)
+      folded = fold_todo_snapshots(
+        snapshot_events,
+        gateway_session_id=self.gateway_session_id if self.scope_to_run else None,
+      )
+      if self.checklist.revision > folded.revision:
+        await agent_session_log.append(self.snapshot_event(actor="analyst", op="patch"))
+      else:
+        self.checklist = folded
+        self.model_seen_revision = self.checklist.revision
+      self.loaded = True
+    await self._refresh_current_turn(agent_session_log)
     return self.checklist
+
+  async def _refresh_current_turn(self, agent_session_log: Any) -> None:
+    """Set ``root_deliverable`` and ``invoked_skills`` from the current turn.
+
+    The turn starts at the latest analyst ``user_message``; the journal is
+    read backwards from its tail and the scan stops there, so the cost follows
+    the turn's length, not the session's. An earlier request's skills and
+    wording describe finished work and do not carry over.
+    """
+    invoked_newest_first: list[str] = []
+    root_deliverable: str | None = None
+    found_user_turn = False
+    cursor: Any = None
+    while not found_user_turn:
+      entries, cursor = await agent_session_log.query(
+        event_types={"user_message", "tool_call_start"},
+        order="desc",
+        limit=_TURN_SCAN_PAGE,
+        cursor=cursor,
+      )
+      for entry in entries:
+        ev = getattr(entry, "event", None)
+        if not isinstance(ev, Mapping) or ev.get("sub_agent_id") is not None:
+          continue
+        ev_type = ev.get("type")
+        if ev_type == "tool_call_start" and ev.get("tool_name") == "invoke_skill":
+          tool_input = ev.get("tool_input")
+          skill_name = str(tool_input.get("skill_name") or "").strip() if isinstance(tool_input, Mapping) else ""
+          if skill_name:
+            invoked_newest_first.append(skill_name)
+        elif ev_type == "user_message" and ev.get("client_kind") != "operator":
+          first_line = _prompt_first_line(ev.get("content"))
+          if first_line is not None:
+            root_deliverable = first_line[:TODO_CONTENT_MAX_CHARS]
+            found_user_turn = True
+            break
+          if _has_attachments(ev):
+            found_user_turn = True
+            break
+      if cursor is None:
+        break
+    invoked: list[str] = []
+    for skill_name in reversed(invoked_newest_first):
+      if skill_name not in invoked:
+        invoked.append(skill_name)
+    self.root_deliverable = root_deliverable
+    self.invoked_skills = tuple(invoked)
 
   def snapshot_event(self, *, actor: TodoActor, op: str) -> dict[str, Any]:
     return build_todo_snapshot_payload(
@@ -629,8 +817,15 @@ class TodoSessionState:
     tool result, so the model has seen that revision once the error is in
     its context; its redo applies against it.
     """
+    effective_op: Mapping[str, Any] = op
+    if op.get("op") == "init" and (self.root_deliverable or self.invoked_skills):
+      effective_op = {
+        **op,
+        "_root_deliverable": self.root_deliverable,
+        "_invoked_skills": self.invoked_skills,
+      }
     try:
-      updated = apply_model_op(self.checklist, op, base_revision=self.model_seen_revision)
+      updated = apply_model_op(self.checklist, effective_op, base_revision=self.model_seen_revision)
     except TodoError as exc:
       if exc.code == "stale_revision":
         self.model_seen_revision = self.checklist.revision

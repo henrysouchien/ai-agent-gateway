@@ -264,8 +264,7 @@ def _assistant_wire(content: Any, *, replay_reasoning: bool) -> dict[str, Any]:
   blocks = content if isinstance(content, list) else None
   if blocks is None:
     text = _sanitize_text(content)
-    message: dict[str, Any] = {"role": "assistant", "content": text or None}
-    return message
+    return {"role": "assistant", "content": text}
   for block in blocks:
     if not isinstance(block, dict):
       continue
@@ -298,9 +297,9 @@ def _assistant_wire(content: Any, *, replay_reasoning: bool) -> dict[str, Any]:
   if thinking_parts and not replay_reasoning:
     text_parts = [*thinking_parts, *text_parts]
     thinking_parts = []
-  message = {
+  message: dict[str, Any] = {
     "role": "assistant",
-    "content": "\n".join(text_parts) if text_parts else None,
+    "content": "\n".join(text_parts),
   }
   if tool_calls:
     message["tool_calls"] = tool_calls
@@ -396,7 +395,11 @@ def _convert_messages(
     if role == "assistant":
       wire = _assistant_wire(message.get("content"), replay_reasoning=replay_reasoning)
       pending_calls = list(wire.get("tool_calls") or [])
-      converted.append(wire)
+      if message.get("stop_reason") == "compaction" and wire.get("content") and not pending_calls:
+        converted.append({"role": "user", "content": wire["content"]})
+        continue
+      if wire.get("content") or pending_calls or wire.get("reasoning"):
+        converted.append(wire)
       continue
     if role == "tool":
       pending_calls = []
@@ -537,10 +540,8 @@ def _delta_text(content: Any) -> str:
 def _accumulate_arguments(current: str, fragment: str) -> str:
   if not fragment:
     return current
-  if not current or fragment.startswith(current):
+  if not current:
     return fragment
-  if current.startswith(fragment):
-    return current
   return current + fragment
 
 
@@ -562,18 +563,16 @@ class _ToolCallAccumulator:
     if name:
       self.name = name
     arguments = function.get("arguments")
-    if isinstance(arguments, dict):
-      fragment = _json_dumps(arguments)
-    elif arguments is None:
-      fragment = ""
-    else:
-      fragment = str(arguments)
     previous = self.arguments
+    if isinstance(arguments, dict):
+      self.arguments = _json_dumps(arguments)
+      if self.arguments == previous:
+        return ""
+      if self.arguments.startswith(previous) and previous:
+        return self.arguments[len(previous) :]
+      return self.arguments
+    fragment = "" if arguments is None else str(arguments)
     self.arguments = _accumulate_arguments(previous, fragment)
-    if self.arguments == previous:
-      return ""
-    if fragment.startswith(previous) and previous:
-      return self.arguments[len(previous) :]
     return fragment
 
 

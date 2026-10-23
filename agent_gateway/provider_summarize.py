@@ -11,6 +11,7 @@ from .runner_hooks_lifecycle import prepare_session_id, rebind_refreshed_credent
 from model_authority.thinking import parse_effort
 from .runner_stream_turn import STREAM_PROGRESS_LOG_INTERVAL
 from .runner_streaming import _stream_with_stall_timeout
+from .spend_metering import ProviderCallMeter
 
 
 DEFAULT_SUMMARY_SYSTEM_PROMPT = "You write cumulative narrative summaries of autonomous analyst sessions."
@@ -21,6 +22,10 @@ class ProviderSummarizeResult:
   text: str
   usage: dict[str, Any]
   saw_tool_use: bool = False
+  # Reasoning the model streamed while it produced `text`. A reasoning model
+  # can spend the whole output budget here and stop before it writes a summary;
+  # the consumer decides whether that reasoning is salvageable.
+  thinking_text: str = ""
 
 
 def _empty_usage() -> dict[str, Any]:
@@ -92,6 +97,7 @@ async def provider_summarize(
   request_kwargs: dict[str, Any] | None = None,
   on_event: Callable[[dict[str, Any]], object] | None = None,
   session_id: str | None = None,
+  call_site: str = "compaction",
 ) -> ProviderSummarizeResult:
   if not isinstance(capability_execution, BoundCapabilityExecution):
     raise TypeError(
@@ -150,6 +156,18 @@ async def provider_summarize(
       capability_execution = rebound
       run_config = dict(rebound.auth_config)
       run_config["auth_mode"] = str(run_config.get("auth_mode", "api")).strip().lower() or "api"
+  bind = capability_execution.bind
+  meter = ProviderCallMeter(
+    provider=provider,
+    provider_name=bind.provider,
+    model=model,
+    model_key=bind.model_key,
+    config=run_config,
+    call_site=call_site,
+    session_id=session_id,
+    attrs={"capability_id": bind.capability_id},
+  )
+  meter.enforce()
   client = provider.create_client(run_config)
   try:
     kwargs = dict(request_kwargs or {})
@@ -175,6 +193,8 @@ async def provider_summarize(
 
     pieces: list[str] = []
     fallback_blocks: list[str] = []
+    thinking_pieces: list[str] = []
+    thinking_blocks: list[str] = []
     usage = _empty_usage()
     bind = capability_execution.bind
     usage.update({
@@ -185,7 +205,7 @@ async def provider_summarize(
     next_heartbeat_at = stream_started_at + STREAM_PROGRESS_LOG_INTERVAL
     stream_events = 0
     async for event in _stream_with_stall_timeout(
-      provider.stream(client, params),
+      meter.stream(client, params),
       config=run_config,
       model_info=model_info,
       max_tokens=token_limit,
@@ -225,15 +245,28 @@ async def provider_summarize(
         block_text = str(event.raw_block.get("text") or "").strip()
         if block_text:
           fallback_blocks.append(block_text)
+      elif event_type == "thinking_delta":
+        thinking = str(getattr(event, "thinking_text", "") or "")
+        if thinking:
+          thinking_pieces.append(thinking)
+      elif event_type == "thinking_end" and isinstance(getattr(event, "raw_block", None), dict):
+        thinking_block = str(event.raw_block.get("thinking") or "").strip()
+        if thinking_block:
+          thinking_blocks.append(thinking_block)
       elif event_type in {"tool_use_start", "tool_use_end"}:
         saw_tool_use = True
 
     summary_text = "".join(pieces).strip()
     if not summary_text:
       summary_text = "\n".join(fallback_blocks).strip()
-    if not summary_text:
-      raise RuntimeError("Summary generation returned empty text")
-    return ProviderSummarizeResult(text=summary_text, usage=usage, saw_tool_use=saw_tool_use)
+    # An empty summary is the provider's answer, not a failure of the turn: each
+    # consumer decides (portable compaction records it as summary_too_short).
+    thinking_text = "".join(thinking_pieces).strip()
+    if not thinking_text:
+      thinking_text = "\n".join(thinking_blocks).strip()
+    return ProviderSummarizeResult(
+      text=summary_text, usage=usage, saw_tool_use=saw_tool_use, thinking_text=thinking_text
+    )
   finally:
     await provider.close_client(client, timeout=5.0)
 

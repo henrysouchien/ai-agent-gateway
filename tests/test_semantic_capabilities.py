@@ -153,9 +153,11 @@ def test_untagged_tool_is_not_bound_to_first_of_ambiguous_requirements() -> None
     for name in ("evidence.primary/v1", "evidence.secondary/v1")
   )
 
+  # The ambiguous route is granted but never positionally bound, so a required
+  # capability it cannot be uniquely assigned to is honestly unsatisfied.
   with pytest.raises(
     SemanticCapabilityCompilationError,
-    match="ambiguously matches semantic capabilities",
+    match="has no compatible admitted route",
   ):
     compile_semantic_capabilities(
       requirements,
@@ -163,3 +165,47 @@ def test_untagged_tool_is_not_bound_to_first_of_ambiguous_requirements() -> None
       tool_routes=(SemanticToolRoute(tool_id="file_read", effect="read"),),
       registry=registry,
     )
+
+  optional = tuple(
+    SemanticCapabilityRequirement(
+      name=requirement.name, required=False, binding_modes=("live_tool",),
+    )
+    for requirement in requirements
+  )
+  compiled = compile_semantic_capabilities(
+    optional,
+    grant_id="grant:ambiguous",
+    tool_routes=(SemanticToolRoute(tool_id="file_read", effect="read"),),
+    registry=registry,
+  )
+  assert compiled.capability_bindings == ()
+  assert [(entry.tool_id, entry.route_id) for entry in compiled.tool_grant.tools] == [
+    ("file_read", "tool:file_read"),
+  ]
+
+
+def test_tagged_route_for_an_undeclared_capability_is_granted_unbound() -> None:
+  registry = SemanticCapabilityRegistry((
+    SemanticCapabilitySpec(
+      name="evidence.primary/v1",
+      live_tool_effects=frozenset({"read"}),
+    ),
+  ))
+  compiled = compile_semantic_capabilities(
+    (SemanticCapabilityRequirement(
+      name="evidence.primary/v1", binding_modes=("live_tool",),
+    ),),
+    grant_id="grant:undeclared",
+    tool_routes=(
+      SemanticToolRoute(tool_id="a_read", effect="read", capability="evidence.primary/v1"),
+      SemanticToolRoute(tool_id="b_write", effect="write", capability="workspace.write/v1"),
+    ),
+    registry=registry,
+  )
+  assert {entry.tool_id: entry.route_id for entry in compiled.tool_grant.tools} == {
+    "a_read": "semantic:evidence.primary/v1",
+    "b_write": "tool:b_write",
+  }
+  assert [binding.capability for binding in compiled.capability_bindings] == [
+    "evidence.primary/v1",
+  ]

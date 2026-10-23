@@ -18,9 +18,12 @@ from gateway_test_support.app_fixtures import (  # noqa: E402, F401
 def _isolated_gateway_state(monkeypatch, tmp_path_factory):
   state = tmp_path_factory.mktemp("package-state")
   (state / "gateway").mkdir(parents=True, mode=0o700)
+  (state / "spend").mkdir(parents=True, mode=0o700)
   monkeypatch.setenv("USER_DATA_DIR", str(state))
   monkeypatch.setenv("AGENT_SESSION_LOG_BASE_DIR", str(state / "sessions"))
   monkeypatch.setenv("AGENT_GATEWAY_AUTONOMOUS_LOG_DIR", str(state / "autonomous"))
+  monkeypatch.setenv("HANK_SPEND_LEDGER_PATH", str(state / "spend" / "api_spend.sqlite"))
+  monkeypatch.setenv("HANK_SPEND_SETTINGS_PATH", str(state / "spend-settings.json"))
 
 
 @pytest.fixture(autouse=True)

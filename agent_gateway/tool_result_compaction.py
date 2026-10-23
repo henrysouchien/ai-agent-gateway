@@ -514,9 +514,10 @@ def _business_model_terminal_success_projection(
     "data_gaps": _business_model_data_gaps(data_gaps),
     "recommended_next_action": _bounded_projection_text(recommended_next_action, limit=2_000),
   }
-  # A structural noop carries its reason only in the selected verdict's findings
-  # and the envelope warnings. Other statuses stay the receipt above, unchanged.
-  if status == "noop":
+  # A structural noop or review-required verdict carries its reason only in
+  # the selected verdict's findings and the envelope warnings. An accepted
+  # BM_CONSTRUCTED receipt stays the receipt above, unchanged.
+  if status == "noop" or not verdict.upper().startswith("BM_CONSTRUCTED"):
     findings = _business_model_findings(verdict_payload.get("findings"))
     if findings:
       projection["findings"] = findings

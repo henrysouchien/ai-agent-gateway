@@ -777,10 +777,7 @@ def test_authenticated_dispatch_keeps_its_session_token_live_until_terminal(
     while task_registry.has_admitted_batch(owner_user_id="alice", batch_id=17):
       await asyncio.sleep(0)
     assert session.admitted_batches == set()
-    with pytest.raises(HTTPException) as exc_info:
-      auth.verify_token(token)
-    assert exc_info.value.status_code == 401
-    assert exc_info.value.detail == "Session expired"
+    assert auth.verify_token(token) is session
 
   asyncio.run(_run())
 

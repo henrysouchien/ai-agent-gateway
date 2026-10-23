@@ -124,6 +124,7 @@ async def send_prompt(
   returned text is unchanged and a write failure never fails the call.
   """
   from model_authority.binding import validate_reported_identity
+  from .spend_metering import ProviderCallMeter
   from .multi_user.billing import UsageEvent, UsageState, normalize_identity
   from .runner_streaming import _stream_with_stall_timeout
 
@@ -248,6 +249,18 @@ async def send_prompt(
 
   try:
     while True:
+      meter = ProviderCallMeter(
+        provider=provider,
+        provider_name=capability_bind.provider,
+        model=model,
+        model_key=capability_bind.model_key,
+        config=config,
+        call_site=f"send_prompt:{normalized_channel}" if normalized_channel else "send_prompt",
+        session_id=session_id,
+        request_id=normalized_request_id or None,
+        attrs={"capability_id": capability_bind.capability_id},
+      )
+      meter.enforce()
       client = provider.create_client(config=config)
       attempt_started_at = datetime.now(timezone.utc)
       params = provider.build_request_params(
@@ -263,7 +276,7 @@ async def send_prompt(
 
       try:
         async for event in _stream_with_stall_timeout(
-          provider.stream(client, params),
+          meter.stream(client, params),
           config=config,
           model_info=provider.get_model_info(model),
           max_tokens=max_tokens,

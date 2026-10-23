@@ -644,9 +644,6 @@ def resolve_operation_authority(
     catalog=catalog,
     exclusions=exclusions,
   )
-  declared = frozenset(
-    requirement.name for requirement in declaration.required_capabilities
-  )
   routes = tuple(
     SemanticToolRoute(
       tool_id=entry.tool_id,
@@ -655,11 +652,6 @@ def resolve_operation_authority(
       capability=entry.capability,
     )
     for entry in admitted
-    # A route serving a capability the operation never declared is not this
-    # operation's authority.  Before B-8 the effect ceiling admitted such a
-    # route and the compiler dropped it unassigned; the drop now happens where
-    # the reason is legible, and the granted set is identical either way.
-    if entry.capability is None or entry.capability in declared
   )
   try:
     compiled = compile_semantic_capabilities(

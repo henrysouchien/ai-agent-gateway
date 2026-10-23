@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import inspect
 import asyncio
+import json
 import os
 import shutil
 import signal
 import sys
+import textwrap
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .._config import CodeExecutionConfig
+from .._kernel_runner import _implicit_mime_bundle
 from .._helpers import (
   _STREAM_READER_LIMIT,
   _collect_generated_images,
@@ -44,6 +48,32 @@ async def _read_stream_to_file(
       handle.write(text)
       if on_output is not None:
         on_output(stream_name, text)
+
+
+def _with_last_expression_result(code: str, result_path: Path) -> str:
+  """Execute the original AST once and ship the shared implicit summary."""
+  summary_source = textwrap.indent(inspect.getsource(_implicit_mime_bundle), "  ")
+  return (
+    "def _hank_run_cell(_code, _result_path, _namespace):\n"
+    "  import ast\n"
+    "  import json\n"
+    "  from pathlib import Path\n"
+    f"{summary_source}\n"
+    "  tree = ast.parse(_code)\n"
+    "  if tree.body and isinstance(tree.body[-1], ast.Expr):\n"
+    "    last = tree.body.pop()\n"
+    "    exec(compile(tree, '<cell>', 'exec'), _namespace)\n"
+    "    value = eval(compile(ast.Expression(last.value), '<cell>', 'eval'), _namespace)\n"
+    "    if value is not None:\n"
+    "      _namespace['_'] = value\n"
+    "      Path(_result_path).write_text(\n"
+    "        json.dumps([_implicit_mime_bundle(value)]), encoding='utf-8')\n"
+    "  else:\n"
+    "    exec(compile(tree, '<cell>', 'exec'), _namespace)\n"
+    # The source binds on its own line so no traceback line carries the cell.
+    f"_hank_cell_source = {code!r}\n"
+    f"_hank_run_cell(_hank_cell_source, {str(result_path)!r}, globals())\n"
+  )
 
 
 async def _wait_for_process_exit(process: asyncio.subprocess.Process) -> None:
@@ -195,6 +225,8 @@ class SubprocessBackend(ExecutionBackend):
       process_env.update(bridge.child_env())
       pass_fds = bridge.child_fds()
     handle_id = uuid.uuid4().hex
+    result_file = work_dir_path / f"_code_execute_{handle_id}_result.json"
+    code = _with_last_expression_result(code, result_file)
     script_path = _write_code_execute_script(work_dir_path, code, self._config, task_id=task_id)
     stdout_file = (
       _task_stdout_path(work_dir_path, task_id)
@@ -230,6 +262,7 @@ class SubprocessBackend(ExecutionBackend):
       "task_id": task_id,
       "process": process,
       "script_path": script_path,
+      "result_file": result_file,
       "stdout_file": stdout_file,
       "stderr_file": stderr_file,
       "started_at": time.time(),
@@ -335,9 +368,20 @@ class SubprocessBackend(ExecutionBackend):
     stderr, stderr_truncated = _read_truncated(data["stderr_file"], self._config.max_output_bytes)
     if data.get("timed_out") and not stderr:
       stderr = "Process killed after timeout"
+    displays: list[Dict[str, Any]] = []
+    result_file = data.get("result_file")
+    if result_file is not None and Path(result_file).is_file():
+      try:
+        parsed = json.loads(Path(result_file).read_text(encoding="utf-8"))
+      except (OSError, ValueError):
+        parsed = None
+      if isinstance(parsed, list):
+        displays = [row for row in parsed if isinstance(row, dict)]
+      _remove_path(result_file)
     return {
       "stdout": stdout,
       "stderr": stderr,
+      "displays": displays,
       "return_code": data.get("return_code"),
       "images": _collect_generated_images(
         Path(handle.work_dir),
@@ -361,5 +405,6 @@ class SubprocessBackend(ExecutionBackend):
   def _cleanup_foreground_files(self, handle: ExecutionHandle) -> None:
     data = handle._backend_data
     _remove_path(data.get("script_path"))
+    _remove_path(data.get("result_file"))
     _remove_path(data.get("stdout_file"))
     _remove_path(data.get("stderr_file"))

@@ -13,11 +13,14 @@ class CodeExecutionConfig:
   description customization.
   """
 
-  # Backend
+  # Backend. The session kernel is registered by default so a bundle keeps
+  # locals across cells; a placement that may only run sandboxed code (a
+  # production-hosted gateway) turns it off at its own registration owner
+  # (`build_session_code_execution`), not here.
   docker_image: str = ""
   register_docker: bool = True
   register_subprocess: bool = True
-  register_kernel: bool = False
+  register_kernel: bool = True
 
   # Preamble
   preamble_suffix: str = ""

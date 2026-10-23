@@ -113,3 +113,52 @@ def test_cron_templates_render_declared_tls_setting_without_missing_env(
   for secret in authority_values.values():
     assert secret not in "\n".join(child_env.values())
     assert secret not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("gateway_origin", [
+  "https://localhost:8534",
+  "https://localhost:8000",
+])
+def test_local_topology_keeps_authenticated_child_on_its_selected_gateway(
+  gateway_origin: str,
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  template = json.loads((_ROOT / "deploy" / "mcp.local.template.json").read_text(encoding="utf-8"))
+  gateway_consumers = {
+    name for name, config in template["mcpServers"].items()
+    if "GATEWAY_URL" in config.get("env", {})
+  }
+  assert "portfolio-producers-mcp" in gateway_consumers
+  risk_root = tmp_path / "risk_module"
+  risk_root.mkdir()
+  sibling_origin = "https://wrong-gateway.example.test"
+  (risk_root / ".env").write_text(f"GATEWAY_URL={sibling_origin}\n", encoding="utf-8")
+  parent_env = {
+    "MCP_CONFIG_TEMPLATE": str(_ROOT / "deploy" / "mcp.local.template.json"),
+    "MCP_CONFIG_TMP_DIR": str(tmp_path / "mcp"),
+    "JUPYTER_ROOT": str(tmp_path),
+    "EDGAR_UPDATER_ROOT": str(tmp_path / "edgar_updater"),
+    "RISK_MODULE_DOTENV": str(risk_root / ".env"),
+    "LOCAL_GATEWAY_RUNTIME_ROOT": str(tmp_path / "runtime"),
+    "LOCAL_GATEWAY_RUNTIME_VERSION_ROOT": str(tmp_path / "runtime" / "version"),
+    "USER_DATA_DIR": str(tmp_path / "data"),
+    "GATEWAY_BASE_URL": gateway_origin,
+    "GATEWAY_URL": sibling_origin,
+  }
+  monkeypatch.setattr(server_dotenv, "_OWN_APPLICATION_ROOT", tmp_path / "ai-excel-addin")
+  child_env = _positive_autonomous_child_env(
+    parent_env, provider="anthropic", profile="analyst", deliver=False,
+  )
+  assert child_env["GATEWAY_BASE_URL"] == gateway_origin
+  assert "GATEWAY_URL" not in child_env
+  monkeypatch.setattr(os, "environ", child_env)
+  monkeypatch.setattr(mcp_config.user_identity, "resolve_storage_user_id", lambda *_: "1")
+  monkeypatch.setattr(mcp_config, "_resolve_gateway_api_key", lambda *_: "selected-mcp-key")
+  monkeypatch.setattr(mcp_config, "_PRIVATE_TMP", tmp_path / "rendered")
+  monkeypatch.setattr(mcp_config, "_local_provider_dotenv_paths", lambda *_: (risk_root / ".env",))
+  render = mcp_config._materialize_mcp_config("1", "alice@example.com", "analyst")
+  servers = json.loads(render.path.read_text(encoding="utf-8"))["mcpServers"]
+  assert {
+    name: servers[name]["env"]["GATEWAY_URL"] for name in gateway_consumers
+  } == dict.fromkeys(gateway_consumers, gateway_origin)

@@ -569,7 +569,29 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       except BaseException as exc:
         record_failure(phase, exc)
 
+    async def _drain_active_turns_on_shutdown() -> None:
+      # Cancel and await every live turn's runner (and the child runners it
+      # awaits) while the MCP client is still up, so each reaches
+      # `_finalize_run` and writes its `on_session_summary` row.
+      for session in list(auth.session_store.sessions.values()):
+        active_turn = session.active_turn
+        if active_turn is None or not _active_turn_is_running(active_turn):
+          continue
+        try:
+          await _cancel_active_turn_runner(active_turn)
+          _clear_active_turn(session, active_turn)
+        except Exception:
+          log.warning(
+            "active turn shutdown drain failed for %s",
+            session.session_id,
+            exc_info=True,
+          )
+
     async def teardown() -> None:
+      await cleanup_phase(
+        "active session turns",
+        _drain_active_turns_on_shutdown,
+      )
       if config_started:
         await cleanup_phase(
           "configured shutdown",

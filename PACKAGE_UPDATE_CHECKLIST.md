@@ -98,14 +98,7 @@ is a minor; a removal or redefinition is a major) or a capability change is a
   `pkgutil.walk_packages`, and retains the resource/contract checks. The `[all]`
   coverage includes the CLI's `[anthropic]` extra. Imports run in an empty temporary
   working directory, not `/tmp` itself, in a fresh venv.
-- [ ] **Post-upload index smoke** — after upload, the publisher creates another
-  fresh venv, installs `ai-agent-gateway[all]==<NEW_VERSION>` from PyPI with
-  propagation retries, and repeats the full import sweep from an empty temporary
-  working directory. Announce the release and bump consumer pins only after it
-  prints `index smoke ok: ai-agent-gateway <version>`. If `index_smoke` fails, the
-  release must be yanked or superseded before it is announced.
-
-Incident: on 2026-10-16, 0.27.0 imported `CommercialWorkStartError` absent from every published `hank-contracts`; 0.27.1 raises the floor to `hank-contracts>=1.3,<2`, and 0.27.0 is yanked.
+- [ ] **Post-upload index smoke** — after upload, the publisher creates a fresh venv and installs `ai-agent-gateway[all]==<NEW_VERSION>` from PyPI only, with `--no-cache-dir`, then repeats the full import sweep from an empty temporary working directory. Polling and install retries share one bounded 10-minute budget: poll `https://pypi.org/pypi/ai-agent-gateway/<version>/json` until it returns HTTP 200, then retry the PyPI-only install until it succeeds. If the version is still not visible or resolvable at the deadline, the smoke fails without a yank: rerun the index smoke later with the standalone command below; do not yank. Only a successful install followed by a failed import sweep demands a yank or supersede. Announce the release and bump consumer pins only after the smoke prints `index smoke ok: ai-agent-gateway <version>`.
 
 ## Publish
 
@@ -142,5 +135,6 @@ Incident: on 2026-10-16, 0.27.0 imported `CommercialWorkStartError` absent from 
   workspace and correct the source before starting a new run. Existing contracts
   versions are reused only when their published wheel payload and dependency
   metadata match the selected build. After a gateway upload, an `index_smoke`
-  failure is not a successful release: yank or supersede it before announcing it;
-  immutable PyPI versions cannot be overwritten.
+  failure is handled by its cause: a version not yet visible or resolvable at the
+  deadline is not a release defect, so rerun `scripts/publish_agent_gateway.sh --index-smoke-only <version>` later and do not yank; a successful install followed by a failed import sweep must be yanked or superseded before announcement. Immutable PyPI versions cannot be overwritten.
+- To verify an already-published release or retry propagation, run `scripts/publish_agent_gateway.sh --index-smoke-only <version>`. It performs no build, upload, or version-bump checks; it runs only the index smoke above and deletes its temporary smoke directory.

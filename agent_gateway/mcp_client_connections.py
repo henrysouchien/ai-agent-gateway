@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import errno
 import logging
 import os
 import threading
@@ -16,6 +17,38 @@ from mcp.types import PaginatedRequestParams
 
 from .mcp_client_config import iter_exception_tree
 from .mcp_client_oauth_storage import oauth_token_cache_path
+
+
+#: Bounded backoff between loopback reconnect attempts of one idempotent
+#: call. A loopback MCP endpoint that is transiently rebinding refuses the
+#: connect (ECONNREFUSED) before any request bytes are sent, so replaying an
+#: idempotent call inside this window cannot duplicate an effect; the
+#: window is a measurement of a local rebind, never a deadline on the work.
+LOOPBACK_REFUSAL_RETRY_DELAYS_SECONDS = (0.05, 0.15, 0.45)
+
+
+def is_loopback_connection_refused(exc: BaseException) -> bool:
+  """Whether ``exc`` is a loopback connect refused before dispatch."""
+
+  seen: set[int] = set()
+  pending: list[BaseException] = [exc]
+  while pending:
+    candidate = pending.pop()
+    if id(candidate) in seen:
+      continue
+    seen.add(id(candidate))
+    if isinstance(candidate, ConnectionRefusedError):
+      return True
+    if isinstance(candidate, OSError) and candidate.errno == errno.ECONNREFUSED:
+      return True
+    for child in iter_exception_tree(candidate):
+      if child is not candidate:
+        pending.append(child)
+    for linked in (candidate.__cause__, candidate.__context__):
+      if isinstance(linked, BaseException):
+        pending.append(linked)
+  return False
+
 
 log = logging.getLogger("agent_gateway.mcp_client")
 
@@ -744,5 +777,7 @@ __all__ = [
   "connect_stdio_with_retries",
   "connect_streamable_http",
   "initialize_session_state",
+  "LOOPBACK_REFUSAL_RETRY_DELAYS_SECONDS",
+  "is_loopback_connection_refused",
   "verify_stdio_session_stable",
 ]

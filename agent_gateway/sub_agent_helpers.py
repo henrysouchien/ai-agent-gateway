@@ -74,7 +74,7 @@ _RUN_AGENT_DESCRIPTION = (
 _RESUME_AGENT_DESCRIPTION = (
   "Resume an interrupted background sub-agent from its durable transcript; "
   "read the lineage fields from its automatic interrupted notification "
-  "(use get_background_result only for a historical or explicitly omitted notification). "
+  "(use get_background_result for a task whose notification you do not have). "
   "The exact original complete capability bind and credential authority are "
   "reused; selection overrides are not accepted. Returns new task_id."
 )
@@ -336,12 +336,12 @@ def make_run_agent_tool_def(
 def make_get_background_result_tool_def() -> dict[str, Any]:
   """Build the public tool schema for ``get_background_result``.
 
-  The tool retrieves historical or explicitly omitted results. When automatic
-  notifications are disabled, it can also perform one explicit wait for a
-  background sub-agent task launched via ``run_agent(background=true)``.
-  Pass ``task_id='*'`` to list eligible tracked task IDs without returning
-  their payloads. Oversized exact results are returned in bounded JSON-text
-  pages; pass the opaque ``cursor`` back with the same exact task ID.
+  The tool returns a background task's current status and result: a running
+  task returns its running status (``wait=true`` waits up to ``timeout``
+  seconds), a finished task returns its payload. Pass ``task_id='*'`` to list
+  tracked task IDs without returning their payloads. Oversized exact results
+  are returned in bounded JSON-text pages; pass the opaque ``cursor`` back
+  with the same exact task ID.
 
   Returns:
     A tool-definition dict suitable for inclusion in ``get_tool_definitions``.
@@ -349,11 +349,11 @@ def make_get_background_result_tool_def() -> dict[str, Any]:
   return {
     "name": "get_background_result",
     "description": (
-      "Retrieve a historical or explicitly omitted background result. When "
-      "automatic notifications are disabled, explicitly wait for a known task. "
-      "Current-run outcomes are delivered completely through notifications; "
-      "never poll them. Use task_id='*' only to list eligible tracked task IDs. "
-      "For a paged exact result, pass each returned opaque cursor unchanged."
+      "Return a background task's current status and result by task_id; "
+      "wait=true waits up to timeout seconds for completion. Completed "
+      "outcomes also arrive as task notifications. Use task_id='*' to list "
+      "tracked task IDs and statuses. For a paged exact result, pass each "
+      "returned opaque cursor unchanged."
     ),
     "input_schema": {
       "type": "object",
@@ -362,7 +362,7 @@ def make_get_background_result_tool_def() -> dict[str, Any]:
           "type": "string",
           "description": (
             "Exact task ID from run_agent(background=true), or '*' for the "
-            "bounded task-ID/status directory allowed by the active delivery mode."
+            "bounded task-ID/status directory."
           ),
         },
         "wait": {

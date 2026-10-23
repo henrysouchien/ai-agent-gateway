@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from contextlib import aclosing
 import logging
 import sys
 import time
@@ -32,6 +33,8 @@ from .runner_session_events import error_with_provider_projection
 from .runner_cleanup import attach_cleanup_failure
 from .runner_session_lifecycle import _runner_attr
 from .commercial_work_start import commercial_budget_stop_fields
+from .skill_context import current_skill
+from .spend_metering import ProviderCallMeter, SpendBudgetBlocked
 from .runner_state import StreamTurnFailure, StreamTurnResult, select_run_max_tokens
 from .runner_streaming import (
   STREAM_STALL_TIMEOUT,
@@ -584,12 +587,41 @@ class RunnerStreamTurnMixin:
       or _runner_attr(self, "_messages_require_tool_only_turns", _messages_require_tool_only_turns)(current_messages)
     )
 
-    async def _consume_stream(params: Dict[str, Any], result: StreamTurnResult) -> None:
+    def _attempt_meter() -> ProviderCallMeter:
+      """The ledger meter for the provider call this attempt is about to make.
+
+      Built per attempt from the live provider, bind and credential material:
+      rotation and model fallback replace them between attempts.
+      """
+      bind = self._capability_execution.bind
+      return ProviderCallMeter(
+        provider=self._provider,
+        provider_name=bind.provider,
+        model=config["model"],
+        model_key=bind.model_key,
+        config=config,
+        call_site="chat_turn",
+        session_id=getattr(self, "_full_session_id", None),
+        request_id=getattr(self, "_request_id", None),
+        run_id=getattr(self, "_skill_run_id", None),
+        skill=current_skill(),
+        attrs={"capability_id": bind.capability_id, "turn": turn_count},
+      )
+
+    async def _consume_metered(
+      params: Dict[str, Any], result: StreamTurnResult, meter: ProviderCallMeter,
+    ) -> None:
+      # aclosing: the ledger row is written when the metered stream finishes,
+      # so a consumer error closes it here instead of at garbage collection.
+      async with aclosing(meter.stream(client, params)) as events:
+        await _consume_stream(events, result)
+
+    async def _consume_stream(events: Any, result: StreamTurnResult) -> None:
       nonlocal last_progress_at, progress_events
       first_turn = turn_count == 1
       logger.debug("[%s] Turn %d stream open", self._sid, turn_count)
 
-      async for event in self._provider.stream(client, params):
+      async for event in events:
         event_type = event.type
         if event_type != "heartbeat":
           last_progress_at = time_module.monotonic()
@@ -940,12 +972,20 @@ class RunnerStreamTurnMixin:
       commercial_guard = getattr(commercial_producer, "assert_work_allowed", None)
       if callable(commercial_guard):
         commercial_guard(self._billing_mode)
+      meter = _attempt_meter()
+      try:
+        meter.enforce()
+      except SpendBudgetBlocked as blocked:
+        # Not a provider failure: no retry, credential rotation or fallback
+        # sees it. The turn ends with the breached ceiling named.
+        logger.error("[%s] Turn %d refused before the provider call: %s", self._sid, turn_count, blocked)
+        return await self._finish_failed_stream_turn(client, str(blocked))
       params, advertised_tool_names = _make_params()
       result = _runner_attr(self, "StreamTurnResult", StreamTurnResult)()
       result.advertised_tool_names = advertised_tool_names
       usage_before_attempt = usage_snapshot(usage_totals)
       guard_reason = None
-      stream_task = asyncio_module.create_task(_consume_stream(params, result))
+      stream_task = asyncio_module.create_task(_consume_metered(params, result, meter))
       guard_task = asyncio_module.create_task(_stream_guard(stream_task, turn_t0_mono))
       try:
         done, pending = await asyncio_module.wait({stream_task, guard_task}, return_when=first_completed)

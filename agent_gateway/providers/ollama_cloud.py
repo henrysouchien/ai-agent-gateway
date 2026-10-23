@@ -160,11 +160,19 @@ def _without_replayed_reasoning(message: dict[str, Any]) -> dict[str, Any]:
     if key not in _REPLAYED_REASONING_KEYS
   }
   content = stripped.get("content")
-  if isinstance(content, list):
+  if content is None:
+    stripped["content"] = ""
+  elif isinstance(content, list):
     stripped["content"] = [
       block for block in content if not _is_reasoning_block(block)
     ]
   return stripped
+
+
+def _has_assistant_payload(message: object) -> bool:
+  if not isinstance(message, dict) or message.get("role") != "assistant":
+    return True
+  return bool(message.get("content") or message.get("tool_calls") or message.get("reasoning"))
 
 
 def _exception_text(exc: Exception) -> str:
@@ -326,9 +334,12 @@ class OllamaCloudProvider(OllamaLocalProvider):
     )
     wire_messages = params.get("messages")
     if isinstance(wire_messages, list):
-      params["messages"] = [
+      stripped_wire = [
         _without_replayed_reasoning(message) if isinstance(message, dict) else message
         for message in wire_messages
+      ]
+      params["messages"] = [
+        message for message in stripped_wire if _has_assistant_payload(message)
       ]
     return params
 

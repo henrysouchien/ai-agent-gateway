@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable, Dict, Literal, Mapping, Optional, P
 if TYPE_CHECKING:
   from .ui_blocks_run import UiBlocksRunContext
 
+from .policy_imports import deferred_local_tool_pack as _deferred_local_tool_pack
 _log = logging.getLogger("agent_gateway.dispatcher")
 
 class EventLogWriter(Protocol):
@@ -149,6 +150,8 @@ class TrustedToolPlan:
 def active_local_tool_schema(
   get_tool_definitions: Callable[[], Sequence[Mapping[str, Any]]] | None,
   tool_name: str,
+  *,
+  channel: str | None = None,
 ) -> tuple[Mapping[str, Any] | None, Dict[str, Any] | None]:
   if get_tool_definitions is None:
     return None, None
@@ -191,6 +194,24 @@ def active_local_tool_schema(
       "fix": "Retry after the active tool definition includes its input schema.",
     }
 
+  pack = _deferred_local_tool_pack(tool_name, channel)
+  if pack is not None:
+    next_call = {"tool_name": "load_tools", "arguments": {"pack": pack}}
+    fix = f'Load tool pack "{pack}" with load_tools(pack="{pack}") and retry.'
+    return None, {
+      "code": "tool_schema_unavailable",
+      "message": (
+        f"Cannot validate local tool '{tool_name}': "
+        f"its definition is absent from the active tool catalog (deferred in pack '{pack}')."
+      ),
+      "details": {
+        "tool_name": tool_name,
+        "reason": "tool_definition_missing",
+        "pack": pack,
+      },
+      "fix": fix,
+      "next_call": next_call,
+    }
   return None, {
     "code": "tool_schema_unavailable",
     "message": (

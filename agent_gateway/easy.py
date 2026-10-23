@@ -359,7 +359,10 @@ def create_agent(
       key is accepted.
     jwt_secret: JWT signing secret for session tokens. A random secret is
       generated when omitted.
-    session_ttl: Session lifetime in seconds.
+    session_ttl: Informational `expires_at` hint (seconds) carried on the session
+      and returned by `/chat/init`. Sessions do not expire on the wall clock; a
+      token authenticates until the session is explicitly expired (session
+      delete, `expire_session*`, or run teardown).
     cors_origins: Allowed CORS origins. Defaults to `["*"]`.
     prefix: Route prefix. Defaults to `/api`.
     on_usage: Optional usage hook invoked after each completed stream turn.

@@ -913,6 +913,45 @@ def test_business_model_non_noop_projection_omits_findings(
   assert "warnings" not in json.loads(live_entry["content"])
 
 
+def test_business_model_staged_structural_review_projection_keeps_findings(tmp_path: Path) -> None:
+  finding = {
+    "field": "business_model_validation",
+    "code": "business_model_not_constructed",
+    "message": "kpi_source_metric_mismatch on interest_on_funds_held_revenue",
+    "next_call": {
+      "tool_name": "fms_persist_business_model",
+      "arguments": {"judgment": {"draft_handle": "bm_draft_payc_63a55c3a", "part": "finalize"}},
+    },
+  }
+  content = json.dumps(
+    {
+      "status": "staged",
+      "gate_code": "INSUFFICIENT_DATA",
+      "artifact_ref": "artifacts/PAYC/business-model.json",
+      "proposal_id": "proposal-1",
+      "error": None,
+      "verdict_echo": {
+        "verdict": "BM_STRUCTURAL_REVIEW_REQUIRED",
+        "confidence": "MEDIUM",
+        "revision": "payc-business-model-rev-1",
+        "findings": [finding],
+      },
+      "warnings": [{"code": "structural_review", "message": "Review required."}],
+      "next_call": finding["next_call"],
+      "readback": {"typed_outputs": {"business_model_stage_receipt": {"status": "staged"}}},
+    }
+  )
+
+  projection = _project_business_model_terminal(content, tmp_path)
+
+  assert projection["status"] == "staged"
+  assert projection["gate_code"] == "INSUFFICIENT_DATA"
+  assert projection["verdict"] == "BM_STRUCTURAL_REVIEW_REQUIRED"
+  assert projection["findings"] == [finding]
+  assert projection["warnings"] == [{"code": "structural_review", "message": "Review required."}]
+  assert projection["next_call"] == finding["next_call"]
+
+
 def test_business_model_noop_without_findings_adds_no_empty_keys(tmp_path: Path) -> None:
   content = json.dumps(
     {

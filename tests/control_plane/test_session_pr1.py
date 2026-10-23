@@ -132,11 +132,8 @@ def test_control_session_lifecycle_create_use_expire_recreate(
   assert "kind" not in claims
 
   fake_now[0] += CONTROL_SESSION_TTL_SECONDS + 1
-  with pytest.raises(HTTPException) as exc_info:
-    control_plane_app.state.auth.verify_token(payload["session_token"])
-  assert exc_info.value.status_code == 401
-  assert exc_info.value.detail == "Session expired"
-  assert control_plane_app.state.auth.session_store.get_session(payload["session_id"]) is None
+  assert control_plane_app.state.auth.verify_token(payload["session_token"]) is session
+  assert control_plane_app.state.auth.session_store.get_session(payload["session_id"]) is session
 
   second = client.post(
     control_session_url,

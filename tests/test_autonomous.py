@@ -2107,7 +2107,8 @@ def test_run_autonomous_delegated_code_handler_keeps_its_executable_route(
   if use_factory:
     assert result["return_code"] == 0, result
     assert json.loads(result["stdout"]) == {
-      "catalog": ["code_execute"], "parent_reads": [],
+      # A cell's bridge never offers the tool that hosts it.
+      "catalog": [], "parent_reads": [],
     }
   else:
     assert result["stdout"] == "caller-owned\n"

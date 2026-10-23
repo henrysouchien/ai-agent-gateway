@@ -6,7 +6,7 @@ import datetime
 import inspect
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 import secrets
 from pathlib import Path
@@ -819,6 +819,32 @@ def _required_context_next_call(
   return {
     "tool_name": "get_skill_artifact",
     "arguments": {"ticker": ticker, "skill": key.removesuffix("_ref").replace("_", "-")},
+  }
+
+
+def _operation_unavailable_error(
+  unavailable: OperationUnavailable,
+) -> dict[str, Any]:
+  """Project the semantic owner's unavailable verdict, naming what lacks a route.
+
+  The model reads repair facts from ``details``; each unsatisfied capability
+  rides there with the owner's reason. No call restores a missing route, so the
+  parent's concrete recourse is the existing ``list_skills`` read of the
+  operations it can start, to choose one the platform can authorize.
+  """
+
+  return {
+    "code": "operation_unavailable",
+    "message": unavailable.detail,
+    "details": {
+      "operation": unavailable.operation_name,
+      "reason": unavailable.code,
+      "unsatisfied": [
+        item.model_dump(mode="json", exclude={"kind"})
+        for item in unavailable.unsatisfied
+      ],
+    },
+    "next_call": {"tool_name": "list_skills", "arguments": {}},
   }
 
 
@@ -1853,6 +1879,9 @@ def make_run_agent_handler(
   declared_local_tool_definitions: (
     Callable[[frozenset[str]], Sequence[Mapping[str, Any]]] | None
   ) = None,
+  declared_research_door_handlers: (
+    Callable[[Collection[str]], Mapping[str, Any]] | None
+  ) = None,
   fms_rebinder: Callable[[dict[str, Any], int], None] | None = None,
   workflow_handle_membership: (
     Callable[[ParentContext, frozenset[str]], Awaitable[frozenset[str]]] | None
@@ -2222,6 +2251,23 @@ def make_run_agent_handler(
       if runtime_policy is not None
       else frozenset(operation_dispatch_tool_ids)
     )
+    # A declared research door is profile-gated: the profile withholds it from
+    # the parent and the parent may hold no handler for it. The injected owner
+    # grants the doors this operation declares (profile closure and ceiling)
+    # and builds their handlers, so the child admits them as a skill-declared
+    # widening, exactly as an autonomous launch does.
+    granted_doors: Mapping[str, Any] = (
+      declared_research_door_handlers(declared_route_ceiling)
+      if declared_research_door_handlers is not None
+      else {}
+    )
+    admission_root = replace(
+      root, withheld=root.withheld - frozenset(granted_doors),
+    )
+    child_local_tool_handlers = {
+      **granted_doors,
+      **(local_tool_handlers or {}),
+    }
     declared_mcp_route_tool_names = MappingProxyType(
       {
         f"mcp__{server_id}__{tool_id}": tool_id
@@ -2247,7 +2293,7 @@ def make_run_agent_handler(
 
     def _route_registered(tool_id: str) -> bool:
       if (
-        tool_id in (local_tool_handlers or {})
+        tool_id in child_local_tool_handlers
         or tool_id in _ARTIFACT_EMIT_TOOLS
         or tool_id in declared_private_mcp_routes
       ):
@@ -2422,7 +2468,7 @@ def make_run_agent_handler(
           runtime_policy,
           mcp_client=mcp_client,
           live_local_tool_ids=(
-            set(local_tool_handlers or {}) | set(_ARTIFACT_EMIT_TOOLS)
+            set(child_local_tool_handlers) | set(_ARTIFACT_EMIT_TOOLS)
           ),
         )
       except ValueError as exc:
@@ -2511,7 +2557,7 @@ def make_run_agent_handler(
       candidate_tools = candidate_tools | {_SPILL_READER_TOOL_ID}
     sub_local = {
       name: handler
-      for name, handler in (local_tool_handlers or {}).items()
+      for name, handler in child_local_tool_handlers.items()
       if name in candidate_tools
     }
     effective_parent_user_id = (
@@ -2685,7 +2731,7 @@ def make_run_agent_handler(
             ticker=resolved_context_ticker,
           ),
         ),
-        root,
+        admission_root,
         owners=AdmissionOwners(
           operation=OperationRegistration(
             name=agent_name,
@@ -2719,11 +2765,7 @@ def make_run_agent_handler(
     # The existing semantic owner returns its own unavailable authority.
     # Admission neither wraps that verdict nor publishes a wider grant.
     if isinstance(admission, OperationUnavailable):
-      return None, {
-        "code": "operation_unavailable",
-        "message": admission.detail,
-        "next_call": None,
-      }
+      return None, _operation_unavailable_error(admission)
     if isinstance(admission, Refusal):
       # Data integrity: the child is bound to the turn's verified file, so a
       # different asserted id means writes to a file the child would not
@@ -3512,6 +3554,9 @@ def make_resume_handler(
   credentials_resolver_active: bool = False,
   local_tool_handlers: dict[str, Any] | None = None,
   artifact_tools_installer: Callable[..., list[dict[str, Any]]] | None = None,
+  declared_research_door_handlers: (
+    Callable[[Collection[str]], Mapping[str, Any]] | None
+  ) = None,
   fms_rebinder: Callable[[dict[str, Any], int], None] | None = None,
   excluded_tools_resolver: ExcludedToolsResolver | None = None,
   default_max_tokens: int = 64000,
@@ -4197,6 +4242,13 @@ def make_resume_handler(
     child_excluded = set(local_tool_handlers or {}) - admitted_dispatch_tools
     child_excluded |= _ARTIFACT_EMIT_TOOLS - admitted_dispatch_tools
     sub_local = dict(local_tool_handlers or {})
+    if declared_research_door_handlers is not None:
+      # The admitted grant already names the doors; the owner supplies the
+      # handlers a profile-gated parent does not hold.
+      for door_name, door_handler in declared_research_door_handlers(
+        admitted_local_tool_ids,
+      ).items():
+        sub_local.setdefault(door_name, door_handler)
     child_needs_approval = (
       needs_approval_resolver(frozenset(child_excluded))
       if needs_approval_resolver is not None

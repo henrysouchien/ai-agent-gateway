@@ -215,7 +215,9 @@ class SessionContextBuilder:
     if fork_seed is not None:
       messages.extend(fork_seed.event["messages"])
     if latest_summary is not None:
-      messages.append(self._summary_to_message(latest_summary))
+      summary_message = self._summary_to_message(latest_summary)
+      if summary_message is not None:
+        messages.append(summary_message)
     if latest_state_update is not None:
       messages.append(self._state_update_to_message(latest_state_update))
     if latest_todo_snapshot is not None:
@@ -298,10 +300,10 @@ class SessionContextBuilder:
       covered_tail_seqs=covered_tail_seqs,
     )
 
-  def _summary_to_message(self, entry: LogEntry) -> Message:
+  def _summary_to_message(self, entry: LogEntry) -> Message | None:
     text = str(entry.event.get("text") or "").strip()
     if not text:
-      text = "(summary unavailable)"
+      return None
     if entry.event.get("summary_kind") == "portable_compaction":
       return {
         "role": "assistant",

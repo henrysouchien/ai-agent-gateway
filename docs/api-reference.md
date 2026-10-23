@@ -611,7 +611,7 @@ Read-only availability probe for the Docker backend `config` names: returns that
 Concrete execution backends of `ExecutionBackend`.
 
 - `DockerBackend` is treated as sandboxed
-- `KernelBackend` is an unsandboxed persistent host interpreter, registered explicitly
+- `KernelBackend` is an unsandboxed persistent host interpreter, registered by default (`CodeExecutionConfig.register_kernel=True`); sandboxed-only deployments must set `register_kernel=False`
 - `SubprocessBackend` is treated as unsandboxed
 - `unavailable_reason()` returns why a backend cannot run now, or `None`; `available()` derives from it, so a custom backend overrides `unavailable_reason()` only
 
@@ -626,9 +626,17 @@ aggregate bounds. Oversize requests, replies and aggregate overflow report
 `protocol_error`, not truncated success or silent source loss. Exhausting one
 cell does not grant further dispatch or destroy the session interpreter.
 
-Docker/kernel cells retain Python locals and imports. Only explicit `display()`
-emits MIME bundles; results include bounded stdout/stderr, stdout tail and
-workdir-relative spill paths. Those logs remain until session cleanup.
+Docker/kernel cells retain Python locals and imports. A non-`None` trailing
+expression returns an implicit MIME summary: `text/plain` is capped at 16 KiB
+including its truncation marker; serializable containers also receive an
+`application/json` copy only when its encoding fits within 16 KiB and the
+representation was not truncated. The value is bound to `_` (kernel: available
+in later cells; the truncation marker names it). Implicit output does not invoke rich
+representations or alter the original value. Explicit
+`display()` retains its existing rich MIME behavior and wire-frame bounds.
+Results include full stdout/stderr text up to `max_output_bytes`, a separate
+`stdout_tail` containing the last 20 lines, and workdir-relative spill paths
+holding the complete output. Those logs remain until session cleanup.
 Cell interruption cancels nested work and preserves previously assigned locals;
 session teardown awaits interpreter/container disposal. Request bundles bind
 each new cell to the current dispatcher and granted surface, so persistent
